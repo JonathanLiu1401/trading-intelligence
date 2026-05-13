@@ -16,6 +16,7 @@ Workers:
   W9  purge_worker       — cleans old data every 6h
   W10 ml_trainer_worker  — retrains ArticleNet hourly on accumulated LLM labels
   W11 price_alert_worker — alerts on >3% portfolio moves every 5min
+  W12 continuous_trainer_worker — lightweight 20-epoch GPU pass every 60s to keep RTX 3060 hot
 """
 import os
 import sys
@@ -51,18 +52,20 @@ from watchers.urgency_scorer import score_batch
 from watchers.alert_agent import send_urgent_alert
 from ml.inference import triage_articles
 from ml.trainer import train as ml_train
+from ml.trainer import train_continuous
 
 # ── Config ──────────────────────────────────────────────────────────────────
 HEARTBEAT_INTERVAL  = 5 * 3600   # 5h
-RSS_INTERVAL        = 60          # re-poll RSS every 60s
+RSS_INTERVAL        = 30          # re-poll RSS every 60s
 WEB_INTERVAL        = 90          # scrape web every 90s
-REDDIT_INTERVAL     = 90          # re-poll Reddit every 90s
-TICKER_INTERVAL     = 120         # re-fetch ticker news every 120s
-SCORE_INTERVAL      = 30          # run scoring pass every 30s
+REDDIT_INTERVAL     = 45          # re-poll Reddit every 90s
+TICKER_INTERVAL     = 60          # re-fetch ticker news every 120s
+SCORE_INTERVAL      = 15          # run scoring pass every 30s
 ALERT_CHECK         = 20          # check for urgent alerts every 20s
 PURGE_INTERVAL      = 6 * 3600   # purge old data every 6h
 GDELT_INTERVAL      = 600         # full GDELT sweep every 10min
-ML_TRAIN_INTERVAL   = 1800        # retrain ArticleNet every 30 minutes (GPU)
+ML_TRAIN_INTERVAL   = 900         # retrain ArticleNet every 30 minutes (GPU)
+CONTINUOUS_TRAIN_INTERVAL = 60   # lightweight GPU pass every 60s
 PRICE_ALERT_INTERVAL = 300        # check portfolio prices every 5min
 PRICE_ALERT_THRESHOLD = 3.0       # alert when |%| move >= this
 WORKER_HEALTH_STALE_SECS = 15 * 60  # mark worker stale in heartbeat if no success in this many seconds
@@ -94,8 +97,8 @@ def _ingest(store: ArticleStore, articles: list, source_tag: str) -> int:
         )
         art["_relevance_score"] = result["score"]
         art["_score_detail"] = result
-    # filter obvious noise before inserting (heuristic score < 1.5)
-    relevant = [a for a in articles if a["_relevance_score"] >= 1.5]
+    # filter obvious noise before inserting (heuristic score < 0.5)
+    relevant = [a for a in articles if a["_relevance_score"] >= 0.5]
     with _store_lock:
         inserted = store.insert_batch(relevant)
     if inserted:
@@ -197,7 +200,7 @@ def scorer_worker(store: ArticleStore):
     while _running:
         try:
             with _store_lock:
-                unscored = store.get_unscored(limit=500, min_kw=1.5)
+                unscored = store.get_unscored(limit=1000, min_kw=0.0)
 
             if unscored:
                 log.info(f"[scorer] Scoring {len(unscored)} articles...")
@@ -295,6 +298,28 @@ def ml_trainer_worker(store: ArticleStore):
             log.warning(f"[ml_trainer] Retrain error: {e}")
 
 
+# ── Worker W12: Continuous GPU pass — keeps RTX 3060 hot ────────────────────
+def continuous_trainer_worker(store: ArticleStore):
+    log.info("[continuous_trainer] started")
+    _sleep(45)  # let full trainer bootstrap first
+    while _running:
+        try:
+            metrics = train_continuous(store)
+            if metrics.get("status") == "skipped":
+                log.debug(f"[continuous_trainer] skipped: {metrics.get('reason')} n={metrics.get('n')}")
+            else:
+                loss = metrics.get("loss")
+                loss_str = f"{loss:.4f}" if loss is not None else "n/a"
+                log.info(f"[continuous_trainer] n={metrics.get('n')} "
+                         f"loss={loss_str} "
+                         f"gpu_mem_mb={metrics.get('gpu_mem_mb')} "
+                         f"elapsed_s={metrics.get('elapsed_s')}")
+                _worker_last_ok["continuous_trainer"] = time.time()
+        except Exception as e:
+            log.warning(f"[continuous_trainer] error: {e}")
+        _sleep(CONTINUOUS_TRAIN_INTERVAL)
+
+
 # ── Worker W7: Alert dispatcher — checks every 20s ──────────────────────────
 def alert_worker(store: ArticleStore):
     log.info("[alert_worker] started")
@@ -378,6 +403,17 @@ def stats_worker(store: ArticleStore):
     HEARTBEAT_SECS = 300
     while _running:
         _sleep(60)
+        gpu_info = ""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                 "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=2,
+            )
+            gpu_info = f" gpu={result.stdout.strip()}" if result.returncode == 0 else ""
+        except Exception:
+            pass
         try:
             s = store.stats()
             sig = (s["total"], s["urgent"], s["unscored"], s.get("below_threshold", 0))
@@ -385,7 +421,7 @@ def stats_worker(store: ArticleStore):
             if sig != last_sig or (now - last_emit) >= HEARTBEAT_SECS:
                 log.info(f"[stats] total={s['total']} urgent={s['urgent']} "
                          f"unscored={s['unscored']} low_kw={s.get('below_threshold', 0)} "
-                         f"db={s['db_mb']}MB")
+                         f"db={s['db_mb']}MB{gpu_info}")
                 last_sig = sig
                 last_emit = now
         except Exception:
@@ -435,6 +471,7 @@ def main():
         ("purge",       purge_worker),
         ("stats",       stats_worker),
         ("ml_trainer",  ml_trainer_worker),
+        ("continuous_trainer", continuous_trainer_worker),
         ("price_alert", price_alert_worker),
     ]
 

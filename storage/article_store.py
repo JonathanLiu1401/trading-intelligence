@@ -126,7 +126,7 @@ class ArticleStore:
             self.conn.execute("UPDATE articles SET urgency=2 WHERE id=?", (aid,))
             self.conn.commit()
 
-    def get_unscored(self, limit: int = 500, min_kw: float = 2) -> list:
+    def get_unscored(self, limit: int = 500, min_kw: float = 0.5) -> list:
         """Get articles that haven't been AI-scored yet."""
         cur = self.conn.execute(
             "SELECT id, url, title, source, full_text FROM articles "

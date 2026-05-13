@@ -112,3 +112,64 @@ def train(store, force: bool = False) -> dict:
         "device": metrics.get("device"),
         "elapsed_s": round(elapsed, 1),
     }
+
+
+_last_continuous_loss = float('inf')
+
+
+def train_continuous(store) -> dict:
+    """Lightweight continuous GPU training pass — 20 epochs on all scored articles."""
+    global _last_continuous_loss
+    from storage.article_store import decompress
+
+    t0 = time.time()
+
+    texts, rels, urgs = [], [], []
+    cur = store.conn.execute(
+        "SELECT title, full_text, ai_score FROM articles WHERE ai_score > 0"
+    )
+    for title, blob, ai in cur.fetchall():
+        summary = decompress(blob) if blob else ""
+        texts.append(f"{title} {summary}")
+        rels.append(float(ai))
+        urgs.append(float(ai) if ai >= 8.0 else 0.0)
+
+    n = len(texts)
+    if n < 50:
+        return {"status": "skipped", "reason": "too_few_samples", "n": n}
+
+    y_rel = np.clip(np.array(rels, dtype=np.float32), 0, 10)
+    y_urg = np.clip(np.array(urgs, dtype=np.float32), 0, 10)
+
+    emb = get_embedder()
+    if not emb.fitted:
+        X = emb.fit_transform(texts)
+    else:
+        X = emb.transform(texts)
+
+    model = get_model()
+    metrics = model.fit(X, y_rel, y_urg, epochs=20, batch_size=512, lr=1e-3)
+
+    final_loss = metrics.get("final_loss")
+    if final_loss is not None and final_loss < _last_continuous_loss:
+        if hasattr(model, "save"):
+            try:
+                model.save()
+            except Exception:
+                pass
+        _last_continuous_loss = final_loss
+
+    try:
+        import torch
+        gpu_mem_mb = round(torch.cuda.memory_allocated() / 1024 / 1024, 1) if torch.cuda.is_available() else 0.0
+    except Exception:
+        gpu_mem_mb = 0.0
+
+    elapsed = round(time.time() - t0, 1)
+    return {
+        "status": "ok",
+        "n": n,
+        "loss": final_loss,
+        "gpu_mem_mb": gpu_mem_mb,
+        "elapsed_s": elapsed,
+    }
