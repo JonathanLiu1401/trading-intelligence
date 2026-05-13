@@ -203,7 +203,6 @@ def scorer_worker(store: ArticleStore):
                 unscored = store.get_unscored(limit=1000, min_kw=0.0)
 
             if unscored:
-                log.info(f"[scorer] Scoring {len(unscored)} articles...")
                 buckets = triage_articles(unscored)
 
                 batch = []
@@ -228,7 +227,12 @@ def scorer_worker(store: ArticleStore):
                 urgent = 0
                 if llm_candidates:
                     urgent = score_batch(llm_candidates, store)
-                log.info(f"[scorer] Done: {urgent} urgent from {len(llm_candidates)} LLM candidates")
+                # Single combined line; demote to DEBUG when nothing interesting happened
+                msg = f"[scorer] scored={len(unscored)} llm={len(llm_candidates)} urgent={urgent}"
+                if urgent > 0 or len(llm_candidates) > 0:
+                    log.info(msg)
+                else:
+                    log.debug(msg)
 
             _worker_last_ok["scorer"] = time.time()
 
