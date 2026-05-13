@@ -8,12 +8,29 @@ is_disabled() to skip work).
 import logging
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger("source_health")
 
 FAILURE_THRESHOLD = 3
+
+# Suppress duplicate warning spam: same message logged at most once per window.
+_WARN_DEDUP_WINDOW_SEC = 300
+_warn_last_emitted: dict[str, float] = {}
+_warn_lock = threading.Lock()
+
+
+def _warn_dedup(msg: str) -> None:
+    """Log a warning, but suppress identical messages within the dedup window."""
+    now = time.monotonic()
+    with _warn_lock:
+        last = _warn_last_emitted.get(msg, 0.0)
+        if now - last < _WARN_DEDUP_WINDOW_SEC:
+            return
+        _warn_last_emitted[msg] = now
+    log.warning(msg)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_health (
@@ -84,7 +101,7 @@ def record_result(source: str, article_count: int) -> None:
         try:
             conn = _connect()
         except Exception as e:
-            log.warning(f"source_health DB open failed: {e}")
+            _warn_dedup(f"source_health DB open failed: {e}")
             return
         try:
             row = conn.execute(
@@ -124,7 +141,7 @@ def record_result(source: str, article_count: int) -> None:
                 )
             conn.commit()
         except Exception as e:
-            log.warning(f"source_health record_result({source}) failed: {e}")
+            _warn_dedup(f"source_health record_result failed: {e}")
         finally:
             try:
                 conn.close()
