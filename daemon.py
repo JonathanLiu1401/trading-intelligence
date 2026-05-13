@@ -203,19 +203,19 @@ def scorer_worker(store: ArticleStore):
                 log.info(f"[scorer] Scoring {len(unscored)} articles...")
                 buckets = triage_articles(unscored)
 
+                batch = []
                 for art, sc in buckets["confident"]:
                     aid = art.get("_id")
                     if aid:
                         is_urgent = sc.urgency >= 8.0
-                        # Use relevance as score (urgency is 0 until LLM confirms); floor at 0.01
-                        # so ai_score=0.0 exclusively means "not yet scored"
                         score = max(sc.relevance, sc.urgency, 0.01)
-                        store.update_ai_score(aid, score, urgency=1 if is_urgent else 0)
-
+                        batch.append((aid, score, 1 if is_urgent else 0))
                 for art, sc in buckets["noise"]:
                     aid = art.get("_id")
                     if aid:
-                        store.update_ai_score(aid, max(sc.relevance, 0.01))
+                        batch.append((aid, max(sc.relevance, 0.01), 0))
+                if batch:
+                    store.update_ai_scores_batch(batch)
 
                 llm_candidates = [art for art, _ in buckets["uncertain"]]
                 record_metric("scorer.nn_bypass_rate",

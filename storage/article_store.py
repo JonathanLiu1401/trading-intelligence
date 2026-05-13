@@ -105,6 +105,14 @@ class ArticleStore:
         )
         self.conn.commit()
 
+    def update_ai_scores_batch(self, updates: list[tuple[str, float, int]]):
+        """Bulk update: updates is list of (aid, score, urgency). Single transaction."""
+        self.conn.executemany(
+            "UPDATE articles SET ai_score=?, urgency=MAX(urgency,?) WHERE id=?",
+            [(score, urgency, aid) for aid, score, urgency in updates],
+        )
+        self.conn.commit()
+
     def mark_alerted(self, aid: str):
         self.conn.execute("UPDATE articles SET urgency=2 WHERE id=?", (aid,))
         self.conn.commit()
