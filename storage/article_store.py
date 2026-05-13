@@ -5,6 +5,7 @@ Stores article metadata + compressed full text. Auto-purges articles older than 
 import hashlib
 import os
 import sqlite3
+import threading
 import zlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -71,6 +72,10 @@ def decompress(data: bytes) -> str:
 class ArticleStore:
     def __init__(self):
         self.conn = _connect()
+        # Serializes write operations across worker threads. The connection is shared
+        # with check_same_thread=False; concurrent execute+commit pairs would otherwise
+        # race on implicit transaction starts ("cannot start a transaction within a transaction").
+        self._write_lock = threading.Lock()
         db = _get_db_path()
         print(f"[store] Using DB at {db} ({db.stat().st_size // 1024}KB)" if db.exists() else f"[store] New DB at {db}")
 
@@ -78,44 +83,48 @@ class ArticleStore:
         """Insert new articles; skip duplicates. Returns count of new insertions."""
         now = datetime.now(timezone.utc).isoformat()
         inserted = 0
-        for art in articles:
-            url = art.get("link", "")
-            title = art.get("title", "")
-            if not url or not title:
-                continue
-            aid = article_id(url, title)
-            summary = art.get("summary", "")
-            self.conn.execute(
-                "INSERT OR IGNORE INTO articles "
-                "(id, url, title, source, published, kw_score, first_seen, cycle, full_text) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (aid, url, title, art.get("source", ""), art.get("published", ""),
-                 art.get("_relevance_score", 0), now, cycle,
-                 compress(summary) if summary else None),
-            )
-            if self.conn.execute("SELECT changes()").fetchone()[0]:
-                inserted += 1
-        self.conn.commit()
+        with self._write_lock:
+            for art in articles:
+                url = art.get("link", "")
+                title = art.get("title", "")
+                if not url or not title:
+                    continue
+                aid = article_id(url, title)
+                summary = art.get("summary", "")
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO articles "
+                    "(id, url, title, source, published, kw_score, first_seen, cycle, full_text) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (aid, url, title, art.get("source", ""), art.get("published", ""),
+                     art.get("_relevance_score", 0), now, cycle,
+                     compress(summary) if summary else None),
+                )
+                if self.conn.execute("SELECT changes()").fetchone()[0]:
+                    inserted += 1
+            self.conn.commit()
         return inserted
 
     def update_ai_score(self, aid: str, score: float, urgency: int = 0):
-        self.conn.execute(
-            "UPDATE articles SET ai_score=?, urgency=MAX(urgency,?) WHERE id=?",
-            (score, urgency, aid),
-        )
-        self.conn.commit()
+        with self._write_lock:
+            self.conn.execute(
+                "UPDATE articles SET ai_score=?, urgency=MAX(urgency,?) WHERE id=?",
+                (score, urgency, aid),
+            )
+            self.conn.commit()
 
     def update_ai_scores_batch(self, updates: list[tuple[str, float, int]]):
         """Bulk update: updates is list of (aid, score, urgency). Single transaction."""
-        self.conn.executemany(
-            "UPDATE articles SET ai_score=?, urgency=MAX(urgency,?) WHERE id=?",
-            [(score, urgency, aid) for aid, score, urgency in updates],
-        )
-        self.conn.commit()
+        with self._write_lock:
+            self.conn.executemany(
+                "UPDATE articles SET ai_score=?, urgency=MAX(urgency,?) WHERE id=?",
+                [(score, urgency, aid) for aid, score, urgency in updates],
+            )
+            self.conn.commit()
 
     def mark_alerted(self, aid: str):
-        self.conn.execute("UPDATE articles SET urgency=2 WHERE id=?", (aid,))
-        self.conn.commit()
+        with self._write_lock:
+            self.conn.execute("UPDATE articles SET urgency=2 WHERE id=?", (aid,))
+            self.conn.commit()
 
     def get_unscored(self, limit: int = 500, min_kw: float = 2) -> list:
         """Get articles that haven't been AI-scored yet."""
@@ -160,12 +169,13 @@ class ArticleStore:
     def purge_old(self):
         """Delete articles older than RETENTION_DAYS and vacuum."""
         cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat()
-        cur = self.conn.execute("DELETE FROM articles WHERE first_seen < ?", (cutoff,))
-        deleted = cur.rowcount
-        self.conn.commit()
-        if deleted > 0:
-            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            print(f"[store] Purged {deleted} articles older than {RETENTION_DAYS} days")
+        with self._write_lock:
+            cur = self.conn.execute("DELETE FROM articles WHERE first_seen < ?", (cutoff,))
+            deleted = cur.rowcount
+            self.conn.commit()
+            if deleted > 0:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                print(f"[store] Purged {deleted} articles older than {RETENTION_DAYS} days")
         return deleted
 
     def stats(self) -> dict:
