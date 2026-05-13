@@ -1,45 +1,65 @@
-"""Source health monitor — tracks scrape pass results per source, auto-disables silent sources."""
-import os
+"""Source health monitor — tracks consecutive failures per data source.
+
+Uses its own SQLite DB (source_health.db) placed alongside articles.db.
+A "failure" is a pass that returned 0 articles. After FAILURE_THRESHOLD
+consecutive failures, the source is marked disabled (callers can consult
+is_disabled() to skip work).
+"""
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-USB_PATH = Path(os.environ.get("DIGITAL_INTERN_USB", "/media/zeph/projects/digital-intern/db"))
-LOCAL_PATH = Path(__file__).resolve().parent.parent / "data"
+log = logging.getLogger("source_health")
 
-FAILURE_THRESHOLD = 3  # consecutive zero-article passes before auto-disable
+FAILURE_THRESHOLD = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_health (
-    source_name           TEXT PRIMARY KEY,
-    last_success_ts       TEXT,
-    last_pass_ts          TEXT,
-    consecutive_failures  INTEGER DEFAULT 0,
-    total_passes          INTEGER DEFAULT 0,
-    total_articles        INTEGER DEFAULT 0,
-    disabled              INTEGER DEFAULT 0
+    source TEXT PRIMARY KEY,
+    last_seen TEXT,
+    consecutive_failures INTEGER DEFAULT 0,
+    total_articles INTEGER DEFAULT 0,
+    disabled INTEGER DEFAULT 0
 );
 """
 
 _lock = threading.Lock()
+_db_path_cache: Path | None = None
 
 
-def _db_path() -> Path:
-    if USB_PATH.parent.exists():
-        try:
-            USB_PATH.mkdir(parents=True, exist_ok=True)
-            return USB_PATH / "source_health.db"
-        except PermissionError:
-            pass
-    LOCAL_PATH.mkdir(parents=True, exist_ok=True)
-    return LOCAL_PATH / "source_health.db"
+def _resolve_db_path() -> Path:
+    """Place source_health.db alongside articles.db."""
+    global _db_path_cache
+    if _db_path_cache is not None:
+        return _db_path_cache
+    try:
+        from storage.article_store import _get_db_path  # type: ignore
+        articles_db = _get_db_path()
+        _db_path_cache = Path(articles_db).parent / "source_health.db"
+    except Exception:
+        # Fallback: local data dir
+        local = Path(__file__).resolve().parent.parent / "data"
+        local.mkdir(parents=True, exist_ok=True)
+        _db_path_cache = local / "source_health.db"
+    return _db_path_cache
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(_db_path()), timeout=30, check_same_thread=False)
+    db = _resolve_db_path()
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db), timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
+    # Migrate older schemas (column `source_name` -> `source`) by dropping table
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(source_health)").fetchall()]
+        if cols and "source" not in cols:
+            conn.execute("DROP TABLE IF EXISTS source_health")
+            conn.commit()
+    except Exception:
+        pass
     conn.executescript(SCHEMA)
     conn.commit()
     return conn
@@ -49,116 +69,163 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def record_result(source_name: str, article_count: int) -> None:
-    """Record a scrape pass. Increments consecutive_failures on zero, resets on success.
-    Auto-disables sources that hit FAILURE_THRESHOLD consecutive zero passes."""
+def record_result(source: str, article_count: int) -> None:
+    """Record one pass of a source.
+
+    - Resets consecutive_failures to 0 (and re-enables) when article_count > 0
+    - Increments on zero; disables when consecutive_failures >= FAILURE_THRESHOLD
+    """
+    if not source:
+        return
     now = _now()
+    article_count = max(int(article_count or 0), 0)
+
     with _lock:
-        conn = _connect()
+        try:
+            conn = _connect()
+        except Exception as e:
+            log.warning(f"source_health DB open failed: {e}")
+            return
         try:
             row = conn.execute(
-                "SELECT consecutive_failures, disabled FROM source_health WHERE source_name = ?",
-                (source_name,),
+                "SELECT consecutive_failures, disabled FROM source_health WHERE source = ?",
+                (source,),
             ).fetchone()
 
             if row is None:
-                cons_fail = 0 if article_count > 0 else 1
-                disabled = 0
-                last_success = now if article_count > 0 else None
+                if article_count > 0:
+                    cons_fail = 0
+                    disabled = 0
+                else:
+                    cons_fail = 1
+                    disabled = 0
                 conn.execute(
                     """INSERT INTO source_health
-                       (source_name, last_success_ts, last_pass_ts,
-                        consecutive_failures, total_passes, total_articles, disabled)
-                       VALUES (?, ?, ?, ?, 1, ?, ?)""",
-                    (source_name, last_success, now, cons_fail, max(article_count, 0), disabled),
+                       (source, last_seen, consecutive_failures, total_articles, disabled)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (source, now, cons_fail, article_count, disabled),
                 )
             else:
-                cur_fail, cur_disabled = row
+                cur_fail, cur_disabled = row[0], row[1]
                 if article_count > 0:
                     new_fail = 0
                     new_disabled = 0  # re-enable on any success
-                    conn.execute(
-                        """UPDATE source_health
-                           SET last_success_ts = ?, last_pass_ts = ?,
-                               consecutive_failures = ?,
-                               total_passes = total_passes + 1,
-                               total_articles = total_articles + ?,
-                               disabled = ?
-                           WHERE source_name = ?""",
-                        (now, now, new_fail, article_count, new_disabled, source_name),
-                    )
                 else:
                     new_fail = cur_fail + 1
                     new_disabled = 1 if new_fail >= FAILURE_THRESHOLD else cur_disabled
-                    conn.execute(
-                        """UPDATE source_health
-                           SET last_pass_ts = ?,
-                               consecutive_failures = ?,
-                               total_passes = total_passes + 1,
-                               disabled = ?
-                           WHERE source_name = ?""",
-                        (now, new_fail, new_disabled, source_name),
-                    )
+                conn.execute(
+                    """UPDATE source_health
+                       SET last_seen = ?,
+                           consecutive_failures = ?,
+                           total_articles = total_articles + ?,
+                           disabled = ?
+                       WHERE source = ?""",
+                    (now, new_fail, article_count, new_disabled, source),
+                )
             conn.commit()
+        except Exception as e:
+            log.warning(f"source_health record_result({source}) failed: {e}")
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def get_disabled_sources() -> list[str]:
-    """Return list of source names that are currently auto-disabled (>= FAILURE_THRESHOLD)."""
+    """Return source names currently disabled."""
     with _lock:
-        conn = _connect()
+        try:
+            conn = _connect()
+        except Exception:
+            return []
         try:
             rows = conn.execute(
-                "SELECT source_name FROM source_health "
-                "WHERE disabled = 1 OR consecutive_failures >= ?",
-                (FAILURE_THRESHOLD,),
+                "SELECT source FROM source_health WHERE disabled = 1"
             ).fetchall()
+        except Exception:
+            rows = []
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
     return [r[0] for r in rows]
 
 
 def get_health_report() -> dict:
-    """Return health status for every tracked source."""
+    """Return {source: {...status...}} for every tracked source."""
     with _lock:
-        conn = _connect()
+        try:
+            conn = _connect()
+        except Exception:
+            return {}
         try:
             rows = conn.execute(
-                """SELECT source_name, last_success_ts, last_pass_ts,
-                          consecutive_failures, total_passes, total_articles, disabled
+                """SELECT source, last_seen, consecutive_failures,
+                          total_articles, disabled
                    FROM source_health
-                   ORDER BY source_name"""
+                   ORDER BY source"""
             ).fetchall()
+        except Exception:
+            rows = []
         finally:
-            conn.close()
-
-    report = {}
+            try:
+                conn.close()
+            except Exception:
+                pass
+    report: dict[str, dict] = {}
     for r in rows:
-        name = r[0]
-        report[name] = {
-            "last_success_ts": r[1],
-            "last_pass_ts": r[2],
-            "consecutive_failures": r[3],
-            "total_passes": r[4],
-            "total_articles": r[5],
-            "disabled": bool(r[6]),
+        report[r[0]] = {
+            "last_seen": r[1],
+            "consecutive_failures": r[2],
+            "total_articles": r[3],
+            "disabled": bool(r[4]),
         }
     return report
 
 
-def reset_source(source_name: str) -> None:
+def is_disabled(source: str) -> bool:
+    if not source:
+        return False
+    with _lock:
+        try:
+            conn = _connect()
+        except Exception:
+            return False
+        try:
+            row = conn.execute(
+                "SELECT disabled FROM source_health WHERE source = ?",
+                (source,),
+            ).fetchone()
+        except Exception:
+            row = None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return bool(row and row[0])
+
+
+def reset_source(source: str) -> None:
     """Manually re-enable a source and clear its failure counter."""
     with _lock:
-        conn = _connect()
+        try:
+            conn = _connect()
+        except Exception:
+            return
         try:
             conn.execute(
-                "UPDATE source_health SET disabled = 0, consecutive_failures = 0 WHERE source_name = ?",
-                (source_name,),
+                "UPDATE source_health SET disabled = 0, consecutive_failures = 0 WHERE source = ?",
+                (source,),
             )
             conn.commit()
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

@@ -294,3 +294,33 @@
 2026-05-13 00:48:11,276 [INFO] [rss] +1 new articles (from 12 collected)
 2026-05-13 00:48:56,475 [INFO] [stats] total=1919 urgent=0 unscored=1919 db=1.1MB
 2026-05-13 00:49:56,522 [INFO] [stats] total=1919 urgent=0 unscored=1919 db=1.1MB
+2026-05-13 00:50:56,544 [INFO] [stats] total=1919 urgent=0 unscored=1919 db=1.1MB
+2026-05-13 00:51:56,563 [INFO] [stats] total=1919 urgent=0 unscored=1919 db=1.1MB
+2026-05-13 00:52:44,364 [INFO] [rss] +2 new articles (from 10 collected)
+2026-05-13 00:52:56,577 [INFO] [stats] total=1921 urgent=0 unscored=1921 db=1.1MB
+2026-05-13 00:53:37,665 [INFO] [web] +1 new articles (from 688 collected)
+2026-05-13 00:53:56,664 [INFO] [stats] total=1922 urgent=0 unscored=1922 db=1.1MB
+2026-05-13 00:54:16,769 [INFO] [ticker] +1 new articles (from 335 collected)
+2026-05-13 00:54:56,671 [INFO] [stats] total=1923 urgent=0 unscored=1923 db=1.1MB
+2026-05-13 00:55:01,100 [INFO] [rss] +1 new articles (from 2 collected)
+2026-05-13 00:55:13,039 [INFO] Signal 15 — shutting down
+2026-05-13 00:55:13,188 [INFO] [purge] DB: 1924 articles, 1.1MB
+2026-05-13 00:55:13,209 [INFO] [stats] total=1924 urgent=0 unscored=1924 db=1.1MB
+2026-05-13 00:55:15,017 [ERROR] [daemon] Worker 'gdelt' died — respawning
+2026-05-13 00:55:15,017 [INFO] [gdelt_worker] started
+2026-05-13 00:55:15,017 [ERROR] [daemon] Worker 'rss' died — respawning
+2026-05-13 00:55:15,017 [INFO] [rss_worker] started
+2026-05-13 00:55:15,017 [ERROR] [daemon] Worker 'reddit' died — respawning
+2026-05-13 00:55:15,017 [INFO] [reddit_worker] started
+2026-05-13 00:55:15,017 [ERROR] [daemon] Worker 'ticker' died — respawning
+2026-05-13 00:55:15,018 [INFO] [ticker_worker] started
+2026-05-13 00:55:15,018 [ERROR] [daemon] Worker 'scorer' died — respawning
+2026-05-13 00:55:15,018 [INFO] [scorer_worker] started
+2026-05-13 00:55:15,018 [ERROR] [daemon] Worker 'alert' died — respawning
+2026-05-13 00:55:15,018 [INFO] [alert_worker] started
+2026-05-13 00:55:15,018 [ERROR] [daemon] Worker 'heartbeat' died — respawning
+2026-05-13 00:55:15,018 [INFO] [heartbeat_worker] started
+2026-05-13 00:55:15,018 [ERROR] [daemon] Worker 'purge' died — respawning
+2026-05-13 00:55:15,018 [INFO] [purge_worker] started
+2026-05-13 00:55:15,018 [ERROR] [daemon] Worker 'stats' died — respawning
+2026-05-13 00:55:15,018 [INFO] [daemon] Shutdown complete

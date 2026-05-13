@@ -41,7 +41,7 @@ from collectors.web_scraper import scrape_web
 from collectors.stock_data import get_stock_data
 from collectors.earnings_calendar import get_earnings
 from collectors.options_monitor import get_options_data, format_options_block
-from collectors.portfolio_pnl import collect_portfolio_pnl, format_pnl_block
+from collectors.portfolio_pnl import get_portfolio_pnl, format_pnl_block
 from collectors import source_health
 from triage.heuristic_scorer import score_article as _heuristic_score_article
 from analysis.claude_analyst import analyze
@@ -103,13 +103,26 @@ def _ingest(store: ArticleStore, articles: list, source_tag: str) -> int:
     return inserted
 
 
-# ── Worker W1: GDELT — full sweep via public collect_gdelt() ────────────────
+# ── Worker W1: GDELT — full sweep, per-query health tracking ────────────────
 def gdelt_worker(store: ArticleStore):
     log.info("[gdelt_worker] started")
     while _running:
         try:
+            # Full aggregate sweep (handles cross-query dedup + seen_articles cache)
             articles = collect_gdelt()
             _ingest(store, articles, "gdelt")
+            # Per-query health tracking — count articles per query in this sweep
+            counts: dict[str, int] = {}
+            for art in articles:
+                q = art.get("_query") or ""
+                if q:
+                    counts[q] = counts.get(q, 0) + 1
+            for query in QUERY_GROUPS:
+                new = counts.get(query, 0)
+                try:
+                    source_health.record_result(f"gdelt:{query[:20]}", new)
+                except Exception as he:
+                    log.warning(f"[gdelt_worker] source_health error: {he}")
             _worker_last_ok["gdelt"] = time.time()
         except Exception as e:
             log.warning(f"[gdelt_worker] error: {e}")
@@ -313,15 +326,17 @@ def heartbeat_worker(store: ArticleStore):
                 opts_blk = format_options_block(opts)
 
                 try:
-                    pnl_data = collect_portfolio_pnl()
-                    pnl_blk = format_pnl_block(pnl_data)
+                    pnl = get_portfolio_pnl()
                 except Exception as pe:
                     log.warning(f"[heartbeat] portfolio P&L error: {pe}")
-                    pnl_blk = None
-
-                if pnl_blk and pnl_blk != "N/A":
-                    top = [{"title": "PORTFOLIO P&L", "source": "portfolio_pnl",
-                             "summary": pnl_blk, "ai_score": 10}] + top
+                    pnl = None
+                if pnl is not None:
+                    top = [{
+                        "title": "PORTFOLIO P&L SNAPSHOT",
+                        "source": "portfolio",
+                        "summary": format_pnl_block(pnl),
+                        "ai_score": 10,
+                    }] + top
 
                 if opts_blk and opts_blk != "N/A":
                     top = [{"title": "OPTIONS SNAPSHOT", "source": "options_monitor",
