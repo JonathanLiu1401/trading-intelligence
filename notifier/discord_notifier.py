@@ -30,16 +30,40 @@ def send(message: str, is_alert: bool = False) -> bool:
     chunks = _chunk(message)
     ok = True
     for i, chunk in enumerate(chunks):
-        try:
-            r = requests.post(webhook, json={"content": chunk}, timeout=15)
-            if r.status_code not in (200, 204):
-                print(f"[discord_notifier] HTTP {r.status_code}: {r.text[:200]}")
+        sent = False
+        for attempt in range(4):
+            try:
+                r = requests.post(webhook, json={"content": chunk}, timeout=15)
+                if r.status_code == 429:
+                    # Honor Discord rate limit: prefer JSON retry_after, fall back to header, then exponential backoff.
+                    retry_after = 1.0
+                    try:
+                        retry_after = float(r.json().get("retry_after", retry_after))
+                    except Exception:
+                        retry_after = float(r.headers.get("Retry-After", retry_after))
+                    retry_after = min(max(retry_after, 0.5), 30.0)
+                    print(f"[discord_notifier] 429 rate-limited, sleeping {retry_after:.2f}s (attempt {attempt + 1})")
+                    time.sleep(retry_after)
+                    continue
+                if r.status_code not in (200, 204):
+                    print(f"[discord_notifier] HTTP {r.status_code}: {r.text[:200]}")
+                    if 500 <= r.status_code < 600 and attempt < 3:
+                        time.sleep(2 ** attempt)
+                        continue
+                    ok = False
+                sent = True
+                break
+            except requests.RequestException as e:
+                print(f"[discord_notifier] Send error (attempt {attempt + 1}): {e}")
+                if attempt < 3:
+                    time.sleep(2 ** attempt)
+                    continue
                 ok = False
-            if i < len(chunks) - 1:
-                time.sleep(0.5)
-        except Exception as e:
-            print(f"[discord_notifier] Send error: {e}")
+                break
+        if not sent and ok:
             ok = False
+        if i < len(chunks) - 1:
+            time.sleep(0.5)
 
     # Fire TTS in a background thread so it doesn't block the pipeline
     if ok:
