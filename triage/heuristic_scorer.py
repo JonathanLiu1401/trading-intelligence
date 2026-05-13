@@ -18,8 +18,16 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 # ── Portfolio tickers (direct mention = highest priority) ───────────────────
-PORTFOLIO = {"lite", "mu", "msft", "axti", "orcl", "tsem", "qbts",
-             "micron", "lumentum", "microsoft", "oracle", "tower semiconductor"}
+# Short tickers must match as whole words (regex \b); naive substring match
+# was triggering false positives like "satellite"→"lite", "museum"→"mu".
+PORTFOLIO_TICKERS = {"lite", "mu", "msft", "axti", "orcl", "tsem", "qbts"}
+PORTFOLIO_NAMES = {"micron", "lumentum", "microsoft", "oracle", "tower semiconductor"}
+_PORTFOLIO_TICKER_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(t) for t in PORTFOLIO_TICKERS) + r")\b",
+    re.I,
+)
+# Back-compat alias for any external readers.
+PORTFOLIO = PORTFOLIO_TICKERS | PORTFOLIO_NAMES
 
 # ── Keyword tiers ────────────────────────────────────────────────────────────
 TIER_PORTFOLIO = {  # 4 pts each — direct portfolio/focus names
@@ -148,9 +156,16 @@ def _recency_factor(published: str) -> float:
 
 
 def _portfolio_boost(text: str) -> float:
-    """Extra additive boost if portfolio ticker is directly mentioned."""
+    """Extra additive boost if a portfolio ticker or company name is directly mentioned.
+
+    Tickers are matched on word boundaries (e.g. \"mu\" matches \"MU beats\" but
+    not \"museum\"); company names are matched as substrings (they are unique
+    enough that substring matches are safe).
+    """
     t = text.lower()
-    for name in PORTFOLIO:
+    if _PORTFOLIO_TICKER_RE.search(t):
+        return 1.5
+    for name in PORTFOLIO_NAMES:
         if name in t:
             return 1.5
     return 0.0
