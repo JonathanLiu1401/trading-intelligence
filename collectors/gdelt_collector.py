@@ -1,0 +1,202 @@
+"""GDELT 2.0 DOC API collector — 7-day window, parallel queries, SQLite deduplication."""
+import hashlib
+import requests
+import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+
+GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+MAX_RECORDS = 250       # GDELT API hard limit per query
+TIMESPAN = "10080"      # 7 days in minutes — maximise coverage; SQLite dedupes repeats
+REQUEST_TIMEOUT = 20
+MAX_WORKERS = 30
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = BASE_DIR / "data" / "seen_articles.db"
+
+# -------------------------------------------------------------------------
+# Query list — breadth > depth; each query returns up to 250 unique articles
+# -------------------------------------------------------------------------
+QUERY_GROUPS = [
+    # --- Memory core ---
+    "DRAM memory pricing", "NAND flash pricing", "HBM memory AI chips",
+    "Micron Technology DRAM", "Micron earnings revenue",
+    "SK Hynix DRAM HBM", "SK Hynix earnings",
+    "Samsung memory chips", "Samsung semiconductor",
+    "Kioxia NAND flash IPO", "Western Digital NAND storage",
+    "memory chip supply demand", "DRAM ASP pricing",
+    "memory oversupply glut", "HBM3E production",
+    "wafer starts production", "bit growth demand",
+    # --- Semis equipment ---
+    "ASML EUV lithography", "Lam Research wafer",
+    "Applied Materials AMAT earnings", "KLA Corporation KLAC",
+    "Tokyo Electron semiconductor", "TSMC N2 fab",
+    "TSMC advanced packaging", "Intel foundry IFS",
+    "semiconductor equipment orders",
+    # --- AI / GPU demand ---
+    "Nvidia GPU AI demand", "Nvidia earnings revenue",
+    "AMD AI GPU data center", "AMD earnings",
+    "Qualcomm chips mobile", "Marvell AI networking",
+    "Broadcom AI ASIC", "AI chip supply shortage",
+    "AI data center capex", "hyperscaler AI spending",
+    "Google TPU AI chip", "Microsoft Azure AI chips",
+    "Meta AI infrastructure", "Amazon AWS AI chips",
+    "generative AI semiconductor demand",
+    # --- Portfolio tickers ---
+    "Lumentum LITE photonics", "AXT semiconductor AXTI",
+    "Tower Semiconductor TSEM", "D-Wave quantum computing QBTS",
+    "Oracle cloud ORCL earnings", "Microsoft MSFT earnings cloud",
+    # --- US macro ---
+    "Federal Reserve rate decision", "FOMC minutes statement",
+    "US inflation CPI report", "PCE deflator inflation",
+    "nonfarm payroll employment", "US unemployment jobless",
+    "US GDP growth quarter", "US recession risk",
+    "US treasury yield curve", "10 year treasury bond",
+    "S&P 500 earnings season", "S&P 500 market rally selloff",
+    "Nasdaq technology stocks", "Russell 2000 small cap",
+    "VIX volatility fear index", "stock market correction",
+    # --- Fed / rates ---
+    "Fed pivot rate cuts 2026", "Fed balance sheet QT",
+    "US dollar DXY strength", "dollar index Fed",
+    # --- China / Asia ---
+    "China economy stimulus", "China GDP growth",
+    "China export controls chips", "US China trade war",
+    "China property market Evergrande", "PBOC rate cut",
+    "China consumption retail", "China manufacturing PMI",
+    "Japan Bank of Japan yield", "Japan yen dollar",
+    "Nikkei 225 Japan stocks", "Japan inflation CPI",
+    "South Korea KOSPI economy", "Korea exports semiconductor",
+    "Korea SK Hynix Samsung earnings",
+    "Taiwan semiconductor TSMC geopolitical",
+    "Taiwan strait military tension",
+    # --- Europe ---
+    "ECB rate decision Europe", "European Central Bank inflation",
+    "Germany DAX economy recession", "UK FTSE economy",
+    "European economy GDP", "Euro dollar exchange rate",
+    "France CAC 40 market", "Italy economy",
+    # --- India / Emerging ---
+    "India Nifty economy market", "India semiconductor",
+    "Brazil Bovespa economy", "emerging markets stocks",
+    "MSCI EM emerging market fund",
+    # --- Commodities / Energy ---
+    "oil price OPEC production", "crude oil WTI Brent",
+    "gold price inflation hedge", "silver commodities",
+    "natural gas LNG price", "copper demand China",
+    "lithium battery EV demand", "rare earth China export",
+    # --- Crypto ---
+    "Bitcoin price rally", "Bitcoin ETF institutional",
+    "Ethereum price DeFi", "crypto regulation SEC",
+    "stablecoin market", "crypto market correction",
+    "Solana crypto ecosystem",
+    # --- Geopolitical ---
+    "US tariff trade policy 2026", "semiconductor export ban BIS",
+    "Middle East conflict oil", "Russia sanctions economy",
+    "BRICS dollar alternatives",
+    # --- Earnings season ---
+    "tech earnings beat revenue", "earnings miss guidance cut",
+    "analyst upgrade price target", "analyst downgrade sell rating",
+    "Q1 2026 earnings results", "quarterly earnings season",
+    # --- Specific news types ---
+    "IPO listing stock market", "merger acquisition deal",
+    "stock buyback dividend", "short squeeze gamma squeeze",
+    "insider buying selling", "SEC filing 13F",
+    "private equity LBO", "venture capital AI funding",
+    # --- Options / derivatives ---
+    "options expiry gamma", "put call ratio sentiment",
+    "VIX options hedging", "implied volatility earnings",
+    # --- Global finance ---
+    "IMF World Bank global", "sovereign debt crisis",
+    "currency devaluation FX", "carry trade yen",
+    "global supply chain disruption", "shipping freight rates",
+]
+
+
+def _ensure_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS seen_articles "
+        "(id TEXT PRIMARY KEY, link TEXT, title TEXT, source TEXT, first_seen TEXT)"
+    )
+    conn.commit()
+    return conn
+
+
+def _article_id(url: str, title: str) -> str:
+    return hashlib.sha256(f"{url}||{title}".encode()).hexdigest()
+
+
+def _fetch_query(keyword_query: str) -> list:
+    params = {
+        "query": keyword_query,
+        "mode": "artlist",
+        "maxrecords": MAX_RECORDS,
+        "format": "json",
+        "timespan": TIMESPAN,
+        "sort": "DateDesc",
+    }
+    try:
+        r = requests.get(GDELT_URL, params=params, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        articles = data.get("articles") or []
+        return [
+            {
+                "title": a.get("title", "").strip(),
+                "link": a.get("url", ""),
+                "summary": f"[{a.get('sourcecountry', '')}] {a.get('seendate', '')}",
+                "published": a.get("seendate", ""),
+                "source": f"GDELT/{a.get('domain', 'unknown')}",
+                "_query": keyword_query,
+            }
+            for a in articles
+            if a.get("title") and a.get("url")
+        ]
+    except Exception:
+        return []
+
+
+def collect_gdelt() -> list:
+    """Run all queries in parallel; skip already-seen articles via SQLite."""
+    print(f"[gdelt] Starting {len(QUERY_GROUPS)} parallel queries (7-day window, max {MAX_RECORDS} each)...")
+    t0 = time.time()
+
+    conn = _ensure_db()
+    all_articles = []
+    seen_urls: set[str] = set()
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_fetch_query, q): q for q in QUERY_GROUPS}
+        for future in as_completed(futures):
+            for art in future.result():
+                url = art["link"]
+                title = art["title"]
+                if not url or url in seen_urls:
+                    continue
+                aid = _article_id(url, title)
+                cur = conn.execute("SELECT 1 FROM seen_articles WHERE id=?", (aid,))
+                if cur.fetchone():
+                    continue  # already processed in a previous cycle
+                seen_urls.add(url)
+                all_articles.append(art)
+                conn.execute(
+                    "INSERT OR IGNORE INTO seen_articles VALUES (?,?,?,?,?)",
+                    (aid, url, title, art["source"], datetime.now(timezone.utc).isoformat()),
+                )
+
+    conn.commit()
+    conn.close()
+
+    elapsed = time.time() - t0
+    print(f"[gdelt] {len(all_articles)} new unique articles in {elapsed:.1f}s")
+    return all_articles
+
+
+if __name__ == "__main__":
+    articles = collect_gdelt()
+    print(f"Total new: {len(articles)}")
+    for a in articles[:5]:
+        print(f"  [{a['source']}] {a['title'][:80]}")

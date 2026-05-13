@@ -1,0 +1,17 @@
+{
+  "_note": "Sao's trading portfolio - updated 2026-05-12",
+  "positions": [
+    {"ticker": "LITE", "type": "stock", "qty": 1.6908, "avg_cost": 887.119, "notes": "Lumentum - photonics/semis"},
+    {"ticker": "MU",   "type": "stock", "qty": 3.612,  "avg_cost": 415.28,  "notes": "Micron Technology - core DRAM/NAND position"},
+    {"ticker": "MSFT", "type": "stock", "qty": 2.2835, "avg_cost": 394.114, "notes": "Microsoft"},
+    {"ticker": "AXTI", "type": "stock", "qty": 4,      "avg_cost": 50.42,   "notes": "AXT Inc - compound semiconductors"},
+    {"ticker": "ORCL", "type": "stock", "qty": 5.3109, "avg_cost": 163.603, "notes": "Oracle"},
+    {"ticker": "TSEM", "type": "stock", "qty": 3.7,    "avg_cost": 225.789, "notes": "Tower Semiconductor"},
+    {"ticker": "QBTS", "type": "stock", "qty": 92.1658,"avg_cost": 21.70,   "notes": "D-Wave Quantum - high risk position"}
+  ],
+  "options": [
+    {"symbol": "MUU",  "notes": "Micron leveraged options - fill in strike/expiry"},
+    {"symbol": "SNDU", "notes": "Fill in strike/expiry details"}
+  ],
+  "sector_watchlist": ["LRCX", "AMAT", "KLAC", "NVDA", "AMD", "WDC", "STX", "SMH", "SOXX"]
+}

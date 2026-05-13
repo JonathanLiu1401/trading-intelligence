@@ -1,0 +1,32 @@
+{
+  "rss_feeds": [
+    {"name": "Reuters Business",      "url": "https://feeds.reuters.com/reuters/businessNews"},
+    {"name": "Reuters Markets",       "url": "https://feeds.reuters.com/reuters/financialsNews"},
+    {"name": "Reuters World",         "url": "https://feeds.reuters.com/Reuters/worldNews"},
+    {"name": "AP Business",           "url": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"},
+    {"name": "WSJ Markets",           "url": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"},
+    {"name": "MarketWatch",           "url": "https://feeds.marketwatch.com/marketwatch/topstories/"},
+    {"name": "MarketWatch Economy",   "url": "https://feeds.marketwatch.com/marketwatch/economy-politics/"},
+    {"name": "CNBC Top News",         "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html"},
+    {"name": "CNBC Finance",          "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html"},
+    {"name": "CNBC Asia",             "url": "https://www.cnbc.com/id/100727362/device/rss/rss.html"},
+    {"name": "Bloomberg Markets",     "url": "https://feeds.bloomberg.com/markets/news.rss"},
+    {"name": "Bloomberg Technology",  "url": "https://feeds.bloomberg.com/technology/news.rss"},
+    {"name": "Financial Times",       "url": "https://www.ft.com/rss/home/uk"},
+    {"name": "Seeking Alpha",         "url": "https://seekingalpha.com/market_currents.xml"},
+    {"name": "Barrons",               "url": "https://www.barrons.com/xml/rss/3_7014.xml"},
+    {"name": "Forbes Business",       "url": "https://www.forbes.com/business/feed/"},
+    {"name": "Kobeisi Letter",        "url": "https://thekobeisililetter.substack.com/feed"},
+    {"name": "Investing.com",         "url": "https://www.investing.com/rss/news.rss"},
+    {"name": "Yahoo Finance",         "url": "https://finance.yahoo.com/rss/topstories"},
+    {"name": "Zero Hedge",            "url": "https://feeds.feedburner.com/zerohedge/feed"},
+    {"name": "The Block (Crypto)",    "url": "https://www.theblock.co/rss.xml"},
+    {"name": "CoinDesk",              "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
+    {"name": "Nikkei Asia",           "url": "https://asia.nikkei.com/rss/feed/nar"},
+    {"name": "South China Morning Post", "url": "https://www.scmp.com/rss/91/feed"},
+    {"name": "Korea Herald Business", "url": "https://www.koreaherald.com/rss/business.xml"},
+    {"name": "ECB News",              "url": "https://www.ecb.europa.eu/rss/press.html"},
+    {"name": "Federal Reserve",       "url": "https://www.federalreserve.gov/feeds/press_all.xml"}
+  ],
+  "twitter_accounts": ["@KobeissiLetter", "@Forbes", "@business", "@Reuters", "@zerohedge", "@WSJmarkets"]
+}

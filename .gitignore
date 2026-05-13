@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/ml/*.pkl
+data/ml/*.pt
+logs/*.log
+logs/*.jsonl
+.venv/
+venv/
