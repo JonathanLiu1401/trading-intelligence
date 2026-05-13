@@ -380,11 +380,12 @@ def stats_worker(store: ArticleStore):
         _sleep(60)
         try:
             s = store.stats()
-            sig = (s["total"], s["urgent"], s["unscored"])
+            sig = (s["total"], s["urgent"], s["unscored"], s.get("below_threshold", 0))
             now = time.time()
             if sig != last_sig or (now - last_emit) >= HEARTBEAT_SECS:
                 log.info(f"[stats] total={s['total']} urgent={s['urgent']} "
-                         f"unscored={s['unscored']} db={s['db_mb']}MB")
+                         f"unscored={s['unscored']} low_kw={s.get('below_threshold', 0)} "
+                         f"db={s['db_mb']}MB")
                 last_sig = sig
                 last_emit = now
         except Exception:

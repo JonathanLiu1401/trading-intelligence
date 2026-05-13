@@ -178,13 +178,24 @@ class ArticleStore:
                 print(f"[store] Purged {deleted} articles older than {RETENTION_DAYS} days")
         return deleted
 
-    def stats(self) -> dict:
+    def stats(self, score_min_kw: float = 1.5) -> dict:
         total = self.conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
         urgent = self.conn.execute("SELECT COUNT(*) FROM articles WHERE urgency>=1").fetchone()[0]
-        unscored = self.conn.execute("SELECT COUNT(*) FROM articles WHERE ai_score=0").fetchone()[0]
+        # "unscored" = pending the scorer (kw_score above the scorer's threshold).
+        # Articles below the threshold are intentionally skipped, not a backlog;
+        # split them out so the metric reflects actionable work.
+        unscored = self.conn.execute(
+            "SELECT COUNT(*) FROM articles WHERE ai_score=0 AND kw_score>=?",
+            (score_min_kw,),
+        ).fetchone()[0]
+        below_threshold = self.conn.execute(
+            "SELECT COUNT(*) FROM articles WHERE ai_score=0 AND kw_score<?",
+            (score_min_kw,),
+        ).fetchone()[0]
         db = _get_db_path()
         size_mb = db.stat().st_size / 1024 / 1024 if db.exists() else 0
-        return {"total": total, "urgent": urgent, "unscored": unscored, "db_mb": round(size_mb, 1)}
+        return {"total": total, "urgent": urgent, "unscored": unscored,
+                "below_threshold": below_threshold, "db_mb": round(size_mb, 1)}
 
     def stats_since(self, hours: int) -> dict:
         since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
