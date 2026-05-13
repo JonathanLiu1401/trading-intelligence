@@ -110,6 +110,16 @@ def _build_root_logger():
     jh.setLevel(logging.DEBUG)
     root.addHandler(jh)
 
+    # Silence noisy third-party loggers that flood structured.jsonl with
+    # per-connection DEBUG chatter (urllib3 alone produces dozens of entries
+    # per Reddit poll, drowning out real signal during log audits).
+    for noisy in (
+        "urllib3", "urllib3.connectionpool", "urllib3.util.retry",
+        "requests", "asyncio", "charset_normalizer", "chardet",
+        "websockets", "websockets.client", "websockets.server",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 _build_root_logger()
 
