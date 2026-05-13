@@ -41,7 +41,11 @@ ERRORS=$(journalctl -u digital-intern --since "1 hour ago" --no-pager 2>/dev/nul
          | grep -cE "died|locked|Traceback|CRITICAL|ERROR" 2>/dev/null || echo 0)
 
 # ── 3. DB stats ──────────────────────────────────────────────────────────────
-STATS_LINE=$(grep "\[stats\]" "$PLAIN_LOG" 2>/dev/null | tail -1 || echo "")
+# Prefer structured JSON log (current), fall back to legacy plaintext daemon.log
+STATS_LINE=$(grep '\[stats\]' "$STRUCT_LOG" 2>/dev/null | tail -1 || echo "")
+if [[ -z "$STATS_LINE" ]]; then
+    STATS_LINE=$(grep "\[stats\]" "$PLAIN_LOG" 2>/dev/null | tail -1 || echo "")
+fi
 TOTAL=$(echo   "$STATS_LINE" | grep -oP 'total=\K[0-9]+'   2>/dev/null || echo "?")
 UNSCORED=$(echo "$STATS_LINE" | grep -oP 'unscored=\K[0-9]+' 2>/dev/null || echo "?")
 URGENT=$(echo  "$STATS_LINE" | grep -oP 'urgent=\K[0-9]+'   2>/dev/null || echo "?")
