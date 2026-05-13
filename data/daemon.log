@@ -260,3 +260,19 @@
 2026-05-13 00:26:47,377 [INFO] [web] +1 new articles (from 637 collected)
 2026-05-13 00:26:56,087 [INFO] [stats] total=1903 urgent=0 unscored=1903 db=1.1MB
 2026-05-13 00:27:04,478 [INFO] [rss] +1 new articles (from 4 collected)
+2026-05-13 00:27:56,099 [INFO] [stats] total=1904 urgent=0 unscored=1904 db=1.1MB
+2026-05-13 00:28:07,971 [INFO] [ticker] +1 new articles (from 340 collected)
+2026-05-13 00:28:56,115 [INFO] [stats] total=1905 urgent=0 unscored=1905 db=1.1MB
+2026-05-13 00:29:17,078 [INFO] [rss] +1 new articles (from 4 collected)
+2026-05-13 00:29:56,142 [INFO] [stats] total=1906 urgent=0 unscored=1906 db=1.1MB
+2026-05-13 00:30:08,767 [INFO] [ticker] +1 new articles (from 335 collected)
+2026-05-13 00:30:56,154 [INFO] [stats] total=1907 urgent=0 unscored=1907 db=1.1MB
+2026-05-13 00:31:30,187 [INFO] [rss] +1 new articles (from 1 collected)
+2026-05-13 00:31:56,161 [INFO] [stats] total=1908 urgent=0 unscored=1908 db=1.1MB
+2026-05-13 00:32:01,903 [INFO] [reddit] +1 new articles (from 1196 collected)
+2026-05-13 00:32:09,357 [INFO] [ticker] +1 new articles (from 335 collected)
+2026-05-13 00:32:56,169 [INFO] [stats] total=1910 urgent=0 unscored=1910 db=1.1MB
+2026-05-13 00:33:51,776 [INFO] [rss] +1 new articles (from 1 collected)
+2026-05-13 00:33:56,181 [INFO] [stats] total=1911 urgent=0 unscored=1911 db=1.1MB
+2026-05-13 00:34:09,924 [INFO] [ticker] +1 new articles (from 335 collected)
+2026-05-13 00:34:56,201 [INFO] [stats] total=1912 urgent=0 unscored=1912 db=1.1MB

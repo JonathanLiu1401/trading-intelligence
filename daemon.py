@@ -47,7 +47,7 @@ from storage.article_store import ArticleStore
 from watchers.urgency_scorer import score_batch
 from watchers.alert_agent import send_urgent_alert
 from ml.inference import triage_articles
-from ml.trainer import train as ml_train, get_model
+from ml.trainer import train as ml_train
 
 # ── Config ──────────────────────────────────────────────────────────────────
 HEARTBEAT_INTERVAL  = 5 * 3600   # 5h
@@ -185,9 +185,7 @@ def scorer_worker(store: ArticleStore):
                 unscored = store.get_unscored(limit=200, min_kw=1.5)
 
             if unscored:
-                emb = get_embedder()
-                if emb.fitted:
-                    # Route through NN first
+                    # Route through NN first; falls back to LLM-only if model not ready
                     buckets = triage_articles(unscored)
 
                     # Apply NN scores to confident articles immediately
@@ -197,20 +195,16 @@ def scorer_worker(store: ArticleStore):
                             is_urgent = sc.urgency >= 8.0
                             store.update_ai_score(aid, sc.urgency, urgency=1 if is_urgent else 0)
 
-                    # Drop noise (mark as scored with low score so they don't keep queuing)
+                    # Drop noise (mark scored so they don't keep queuing)
                     for art, sc in buckets["noise"]:
                         aid = art.get("_id")
                         if aid:
                             store.update_ai_score(aid, sc.relevance)
 
-                    # Only send uncertain articles to Sonnet
                     llm_candidates = [art for art, _ in buckets["uncertain"]]
                     record_metric("scorer.nn_bypass_rate",
                                   1.0 - len(llm_candidates) / max(len(unscored), 1),
                                   {"total": len(unscored), "to_llm": len(llm_candidates)})
-                else:
-                    # NN not fitted yet — fall back to full Sonnet scoring
-                    llm_candidates = unscored
 
                 if llm_candidates:
                     urgent = score_batch(llm_candidates, store)
