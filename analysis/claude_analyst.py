@@ -1,4 +1,5 @@
 """Bloomberg Terminal-style briefing — Claude Opus 4.7 via CLI."""
+import os
 import subprocess
 import shutil
 from datetime import datetime, timezone
@@ -158,8 +159,22 @@ def _build_payload(articles, stock_data, earnings):
     return "\n".join(parts)
 
 
+def _find_claude() -> str | None:
+    found = shutil.which("claude")
+    if found:
+        return found
+    for candidate in [
+        os.path.expanduser("~/.local/bin/claude"),
+        "/usr/local/bin/claude",
+    ]:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def analyze(articles, stock_data, earnings):
-    if not shutil.which("claude"):
+    claude_bin = _find_claude()
+    if not claude_bin:
         return "[analyst] claude CLI not found."
 
     payload = _build_payload(articles, stock_data, earnings)
@@ -167,7 +182,7 @@ def analyze(articles, stock_data, earnings):
 
     try:
         result = subprocess.run(
-            ["claude", "--model", MODEL, "--print",
+            [claude_bin, "--model", MODEL, "--print",
              "--permission-mode", "bypassPermissions", full_prompt],
             capture_output=True, text=True, timeout=180,
         )

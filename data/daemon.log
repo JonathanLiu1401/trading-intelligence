@@ -244,3 +244,19 @@
 2026-05-13 00:18:55,376 [INFO] [stats] total=1893 urgent=0 unscored=1893 db=1.1MB
 2026-05-13 00:19:55,924 [INFO] [stats] total=1893 urgent=0 unscored=1893 db=1.1MB
 2026-05-13 00:20:55,965 [INFO] [stats] total=1893 urgent=0 unscored=1893 db=1.1MB
+2026-05-13 00:21:55,979 [INFO] [stats] total=1893 urgent=0 unscored=1893 db=1.1MB
+2026-05-13 00:22:06,309 [INFO] [ticker] +1 new articles (from 344 collected)
+2026-05-13 00:22:55,992 [INFO] [stats] total=1894 urgent=0 unscored=1894 db=1.1MB
+2026-05-13 00:23:56,003 [INFO] [stats] total=1894 urgent=0 unscored=1894 db=1.1MB
+2026-05-13 00:24:06,829 [INFO] [ticker] +1 new articles (from 344 collected)
+2026-05-13 00:24:50,958 [INFO] [rss] +4 new articles (from 18 collected)
+2026-05-13 00:24:56,042 [INFO] [stats] total=1899 urgent=0 unscored=1899 db=1.1MB
+2026-05-13 00:25:06,673 [INFO] [web] +1 new articles (from 637 collected)
+2026-05-13 00:25:33,821 [INFO] [gdelt:Euro dollar exchange rate] +1 new articles (from 1 collected)
+2026-05-13 00:25:56,072 [INFO] [stats] total=1901 urgent=0 unscored=1901 db=1.1MB
+2026-05-13 00:25:57,811 [INFO] [rss] +1 new articles (from 3 collected)
+2026-05-13 00:25:59,936 [ERROR] [daemon] Worker 'gdelt' died — respawning
+2026-05-13 00:25:59,936 [INFO] [gdelt_worker] started
+2026-05-13 00:26:47,377 [INFO] [web] +1 new articles (from 637 collected)
+2026-05-13 00:26:56,087 [INFO] [stats] total=1903 urgent=0 unscored=1903 db=1.1MB
+2026-05-13 00:27:04,478 [INFO] [rss] +1 new articles (from 4 collected)

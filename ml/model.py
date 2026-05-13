@@ -9,8 +9,12 @@ Architecture: TF-IDF features → BatchNorm → [FC→ReLU→Dropout] × 3 → d
 Phase 1: TF-IDF input (fast, no GPU needed, ~0.1ms/article)
 Phase 2: swap embedder for sentence-transformers (plug-in, same MLP head)
 """
-import torch
-import torch.nn as nn
+try:
+    import torch
+    import torch.nn as nn
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 
 class ArticleNet(nn.Module):

@@ -9,8 +9,13 @@ The LLM is only consulted for articles in the grey zone (score 7-8.5) or
 where dropout variance is high — typically <15% of articles.
 """
 import numpy as np
-import torch
 from dataclasses import dataclass
+
+try:
+    import torch
+    _TORCH = True
+except ImportError:
+    _TORCH = False
 
 from ml.embedder import get_embedder
 from ml.trainer import (
@@ -38,19 +43,22 @@ def score_articles(articles: list[dict], mc_passes: int = 15) -> list[ArticleSco
     articles: list of dicts with 'title' and optionally 'summary'.
     Returns a list of ArticleScore in the same order.
     """
+    _uncertain = [ArticleScore(0, 0, 99, 99, needs_llm=True, confident_noise=False)
+                  for _ in articles]
+
+    if not _TORCH:
+        return _uncertain
+
     emb = get_embedder()
     if not emb.fitted:
-        # Model not ready yet — flag all for LLM
-        return [ArticleScore(0, 0, 99, 99, needs_llm=True, confident_noise=False)
-                for _ in articles]
+        return _uncertain
 
     texts = [f"{a.get('title', '')} {a.get('summary', '')}" for a in articles]
 
     try:
         X = emb.transform(texts)
     except Exception:
-        return [ArticleScore(0, 0, 99, 99, needs_llm=True, confident_noise=False)
-                for _ in articles]
+        return _uncertain
 
     model = get_model(input_dim=X.shape[1])
     x_t = torch.from_numpy(X)
