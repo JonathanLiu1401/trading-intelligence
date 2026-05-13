@@ -2,6 +2,7 @@
 Urgent alert agent — Bloomberg BN newswire style, immediate Discord post.
 """
 import os
+from datetime import datetime, timezone
 
 from core.claude_cli import claude_call
 
@@ -12,10 +13,12 @@ ALERT_PROMPT = """You are a Bloomberg BN terminal newswire alert system. A high-
 
 Write a Discord alert in Bloomberg newswire style — dense, exact, no filler. Max 1800 chars.
 
+Current UTC time (use this verbatim in the timestamp slot — do NOT guess): {now_utc}
+
 FORMAT (use exactly):
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🚨 BREAKING  ◈  [CATEGORY]  ◈  [HH:MM UTC]
+🚨 BREAKING  ◈  [CATEGORY]  ◈  {now_utc} UTC
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [ONE LINE HEADLINE IN CAPS — what happened]
 
@@ -48,7 +51,8 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         for a in urgent_articles[:5]
     )
 
-    prompt = ALERT_PROMPT.format(articles_text=articles_text)
+    now_utc = datetime.now(timezone.utc).strftime("%H:%M")
+    prompt = ALERT_PROMPT.format(articles_text=articles_text, now_utc=now_utc)
 
     try:
         message = claude_call(prompt, model=SONNET_MODEL, timeout=60)
