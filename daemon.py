@@ -371,14 +371,22 @@ def purge_worker(store: ArticleStore):
             log.warning(f"[purge_worker] error: {e}")
 
 
-# ── Stats reporter — every 60s ───────────────────────────────────────────────
+# ── Stats reporter — every 60s, but only emit when changed or 5min elapsed ───
 def stats_worker(store: ArticleStore):
+    last_sig = None
+    last_emit = 0.0
+    HEARTBEAT_SECS = 300
     while _running:
         _sleep(60)
         try:
             s = store.stats()
-            log.info(f"[stats] total={s['total']} urgent={s['urgent']} "
-                     f"unscored={s['unscored']} db={s['db_mb']}MB")
+            sig = (s["total"], s["urgent"], s["unscored"])
+            now = time.time()
+            if sig != last_sig or (now - last_emit) >= HEARTBEAT_SECS:
+                log.info(f"[stats] total={s['total']} urgent={s['urgent']} "
+                         f"unscored={s['unscored']} db={s['db_mb']}MB")
+                last_sig = sig
+                last_emit = now
         except Exception:
             pass
 
