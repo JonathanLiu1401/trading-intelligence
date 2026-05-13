@@ -37,8 +37,11 @@ if ! systemctl is-active --quiet digital-intern 2>/dev/null; then
 fi
 
 # ── 2. Error rate in last hour (from journalctl) ─────────────────────────────
-ERRORS=$(journalctl -u digital-intern --since "1 hour ago" --no-pager 2>/dev/null \
-         | grep -cE "died|locked|Traceback|CRITICAL|ERROR" 2>/dev/null || echo 0)
+_ERR_RAW=$(journalctl -u digital-intern --since "1 hour ago" --no-pager 2>/dev/null \
+          | grep -cE "died|locked|Traceback|CRITICAL|ERROR" 2>/dev/null || true)
+# grep -c prints "0" then exits 1 on no-match; `|| echo 0` was appending a 2nd "0\n".
+ERRORS=$(printf '%s' "$_ERR_RAW" | head -1 | tr -dc '0-9')
+ERRORS=${ERRORS:-0}
 
 # ── 3. DB stats ──────────────────────────────────────────────────────────────
 # Prefer structured JSON log (current), fall back to legacy plaintext daemon.log
