@@ -1,12 +1,11 @@
 """
-Online trainer — pulls labeled articles from the store, trains ArticleNet.
+Online trainer — pulls labeled articles from the store, trains ArticleNet on GPU.
 
 Phase 1: bootstraps on heuristic kw_score (weak labels, available immediately).
 Phase 2: retrains as Sonnet ai_score labels accumulate (stronger labels).
 
-Training schedule (managed by daemon's ml_trainer_worker):
-  - Bootstrap run on startup if no checkpoint exists
-  - Retrain every RETRAIN_INTERVAL seconds or when MIN_NEW_LABELS new LLM labels arrive
+Aggressive GPU training: 50 epochs per cycle, batch_size=256, Adam + cosine LR.
+Schedule lives in daemon.py (RETRAIN_INTERVAL drives the cadence).
 """
 import time
 import numpy as np
@@ -14,8 +13,16 @@ import numpy as np
 from ml.embedder import get_embedder
 from ml.model import get_model
 
-RETRAIN_INTERVAL = 3600     # retrain at most once per hour
+# Cadence — daemon reads this if it wants, but daemon.ML_TRAIN_INTERVAL is the
+# source of truth. Set to 30 min to keep the GPU busy.
+RETRAIN_INTERVAL = 1800     # retrain at most once every 30 minutes
 MIN_NEW_LABELS   = 200      # retrain if this many new LLM labels since last train
+
+# Training hyperparameters
+EPOCHS_PER_CYCLE = 50
+BATCH_SIZE       = 256
+LEARNING_RATE    = 1e-3
+MIN_TRAIN_SAMPLES = 100      # below this we bootstrap from kw_score weak labels
 
 # Uncertainty thresholds — articles with uncertainty above this go to LLM
 UNCERTAINTY_REL  = 1.5      # std in relevance score
@@ -26,11 +33,15 @@ LLM_ZONE_MID_HI  = 8.5
 LLM_ZONE_CLEAR_NOISE  = 3.0  # below this → clearly noise, skip LLM
 
 
-def _fetch_training_data(store) -> tuple[list[str], np.ndarray, np.ndarray]:
-    """Pull articles with scores from the store."""
+def _fetch_training_data(store) -> tuple[list[str], np.ndarray, np.ndarray, str]:
+    """
+    Pull articles with scores from the store.
+    Returns (texts, y_rel, y_urg, source) where source ∈ {"strong","weak","mixed"}.
+    """
     from storage.article_store import decompress
 
     texts, rels, urgs = [], [], []
+    source = "strong"
 
     # Strong labels: Sonnet ai_score
     cur = store.conn.execute(
@@ -43,8 +54,10 @@ def _fetch_training_data(store) -> tuple[list[str], np.ndarray, np.ndarray]:
         rels.append(float(ai))
         urgs.append(float(ai) if ai >= 8.0 else 0.0)
 
-    # Weak labels: heuristic kw_score (bootstrap when LLM labels are sparse)
-    if len(texts) < 500:
+    n_strong = len(texts)
+
+    # Bootstrap with weak labels when strong labels are sparse
+    if n_strong < MIN_TRAIN_SAMPLES:
         cur2 = store.conn.execute(
             "SELECT title, full_text, kw_score FROM articles "
             "WHERE ai_score = 0 AND kw_score > 0 ORDER BY kw_score DESC LIMIT 8000"
@@ -54,22 +67,24 @@ def _fetch_training_data(store) -> tuple[list[str], np.ndarray, np.ndarray]:
             texts.append(f"{title} {summary}")
             rels.append(float(kw))
             urgs.append(0.0)
+        source = "weak" if n_strong == 0 else "mixed"
 
     y_rel = np.clip(np.array(rels, dtype=np.float32), 0, 10)
     y_urg = np.clip(np.array(urgs, dtype=np.float32), 0, 10)
-    return texts, y_rel, y_urg
+    return texts, y_rel, y_urg, source
 
 
 def train(store, force: bool = False) -> dict:
     """Train/retrain ArticleNet on available labeled data. Returns metrics dict."""
     t0 = time.time()
-    texts, y_rel, y_urg = _fetch_training_data(store)
+    texts, y_rel, y_urg, source = _fetch_training_data(store)
 
     if len(texts) < 50:
         return {"status": "skipped", "reason": "too_few_samples", "n": len(texts)}
 
     print(f"[ml:trainer] Training on {len(texts)} samples "
-          f"({int((y_rel > 0).sum())} labeled, {int((y_urg >= 8).sum())} urgent)")
+          f"({int((y_rel > 0).sum())} labeled, {int((y_urg >= 8).sum())} urgent) "
+          f"source={source}")
 
     emb = get_embedder()
     if not emb.fitted:
@@ -78,7 +93,12 @@ def train(store, force: bool = False) -> dict:
         X = emb.transform(texts)
 
     model = get_model()
-    model.fit(X, y_rel, y_urg)
+    metrics = model.fit(
+        X, y_rel, y_urg,
+        epochs=EPOCHS_PER_CYCLE,
+        batch_size=BATCH_SIZE,
+        lr=LEARNING_RATE,
+    )
 
     elapsed = time.time() - t0
     return {
@@ -86,5 +106,9 @@ def train(store, force: bool = False) -> dict:
         "n": len(texts),
         "n_llm_labeled": int((y_rel > 0).sum()),
         "n_urgent": int((y_urg >= 8).sum()),
+        "label_source": source,
+        "final_loss": metrics.get("final_loss"),
+        "epochs": metrics.get("epochs"),
+        "device": metrics.get("device"),
         "elapsed_s": round(elapsed, 1),
     }

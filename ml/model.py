@@ -1,126 +1,207 @@
 """
-ArticleNet — sklearn MLPRegressor for financial article scoring.
+ArticleNet — PyTorch GPU model for financial article scoring.
 
-Two models (one per output head):
-  - relevance_model: predicts relevance score 0–10
-  - urgency_model:   predicts urgency score 0–10
+Architecture:
+  TF-IDF (15000) → Linear 512 → BN → ReLU → Dropout
+                 → Linear 256 → BN → ReLU → Dropout
+                 → Linear 128 → BN → ReLU → Dropout
+                 → Linear 2   (relevance, urgency)
 
-Uses sklearn MLPRegressor with warm_start for incremental training.
-Persisted as joblib files in data/ml/.
+Uncertainty via Monte Carlo Dropout: 10 stochastic forward passes at inference,
+return mean and std across passes. Higher std → route to LLM.
 
-Inference: sklearn predict → numpy → fast (~0.1ms/article).
-Uncertainty: bootstrap ensemble of 5 sub-models, measure spread.
-
-No AVX512 required — runs on any x86_64 with AVX2.
+Trains on CUDA when available, falls back to CPU. Checkpoint: data/ml/model_gpu.pt.
 """
 import os
-import pickle
 import time
-import warnings
 import numpy as np
 from pathlib import Path
 
-try:
-    from sklearn.neural_network import MLPRegressor
-    from sklearn.exceptions import ConvergenceWarning
-    warnings.filterwarnings("ignore", category=ConvergenceWarning)
-    SKLEARN_OK = True
-except ImportError:
-    SKLEARN_OK = False
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 MODEL_DIR = Path(os.environ.get("DIGITAL_INTERN_ML_DIR",
                                 Path(__file__).resolve().parent.parent / "data" / "ml"))
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-REL_MODEL_PATH = MODEL_DIR / "relevance_model.pkl"
-URG_MODEL_PATH = MODEL_DIR / "urgency_model.pkl"
+CHECKPOINT_PATH = MODEL_DIR / "model_gpu.pt"
 
-# Ensemble size for uncertainty estimation
-N_ENSEMBLE = 5
+INPUT_DIM    = 15_000
+HIDDEN       = (512, 256, 128)
+OUTPUT_DIM   = 2          # relevance, urgency
+DROPOUT      = 0.3
+MC_PASSES    = 10         # Monte Carlo Dropout passes at inference
 
-MLP_PARAMS = dict(
-    hidden_layer_sizes=(512, 256, 128),
-    activation="relu",
-    solver="adam",
-    alpha=1e-4,           # L2 regularisation
-    batch_size="auto",    # sklearn picks min(200, n_samples)
-    learning_rate_init=3e-4,
-    max_iter=15,
-    warm_start=True,      # incremental training
-    random_state=42,
-)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class ArticleNetModule(nn.Module):
+    def __init__(self, input_dim: int = INPUT_DIM, hidden=HIDDEN,
+                 output_dim: int = OUTPUT_DIM, dropout: float = DROPOUT):
+        super().__init__()
+        h1, h2, h3 = hidden
+        self.fc1 = nn.Linear(input_dim, h1)
+        self.bn1 = nn.BatchNorm1d(h1)
+        self.fc2 = nn.Linear(h1, h2)
+        self.bn2 = nn.BatchNorm1d(h2)
+        self.fc3 = nn.Linear(h2, h3)
+        self.bn3 = nn.BatchNorm1d(h3)
+        self.head = nn.Linear(h3, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.dropout(F.relu(self.bn1(self.fc1(x))))
+        x = self.dropout(F.relu(self.bn2(self.fc2(x))))
+        x = self.dropout(F.relu(self.bn3(self.fc3(x))))
+        return self.head(x)
 
 
 class ArticleNet:
-    """Ensemble of sklearn MLPs for relevance + urgency scoring with uncertainty."""
+    """PyTorch GPU model wrapping ArticleNetModule with MC-Dropout uncertainty."""
 
     def __init__(self):
-        self._rel_models: list[MLPRegressor] = []
-        self._urg_models: list[MLPRegressor] = []
+        self.device = DEVICE
+        self.net = ArticleNetModule().to(self.device)
         self._fitted = False
+        self._input_dim = INPUT_DIM
         self._load()
 
+    # ── persistence ─────────────────────────────────────────────────────────
     def _load(self):
-        if REL_MODEL_PATH.exists() and URG_MODEL_PATH.exists():
+        if CHECKPOINT_PATH.exists():
             try:
-                with open(REL_MODEL_PATH, "rb") as f:
-                    self._rel_models = pickle.load(f)
-                with open(URG_MODEL_PATH, "rb") as f:
-                    self._urg_models = pickle.load(f)
+                ckpt = torch.load(CHECKPOINT_PATH, map_location=self.device,
+                                  weights_only=False)
+                state = ckpt.get("state_dict", ckpt)
+                self._input_dim = ckpt.get("input_dim", INPUT_DIM)
+                if self._input_dim != INPUT_DIM:
+                    # Rebuild module if checkpoint used a different input dim
+                    self.net = ArticleNetModule(input_dim=self._input_dim).to(self.device)
+                self.net.load_state_dict(state)
                 self._fitted = True
-                print(f"[ml:model] Loaded ensemble ({N_ENSEMBLE} models) from {MODEL_DIR}")
+                print(f"[ml:model] Loaded GPU model from {CHECKPOINT_PATH} "
+                      f"(device={self.device}, input_dim={self._input_dim})")
             except Exception as e:
                 print(f"[ml:model] Load error: {e} — starting fresh")
                 self._fitted = False
 
     def save(self):
-        with open(REL_MODEL_PATH, "wb") as f:
-            pickle.dump(self._rel_models, f)
-        with open(URG_MODEL_PATH, "wb") as f:
-            pickle.dump(self._urg_models, f)
+        torch.save({
+            "state_dict": self.net.state_dict(),
+            "input_dim": self._input_dim,
+        }, CHECKPOINT_PATH)
 
-    def fit(self, X: np.ndarray, y_rel: np.ndarray, y_urg: np.ndarray):
-        """Train (or continue training) the ensemble. X shape: (N, features)."""
-        if not SKLEARN_OK:
-            return
-
+    # ── training ────────────────────────────────────────────────────────────
+    def fit(self, X: np.ndarray, y_rel: np.ndarray, y_urg: np.ndarray,
+            epochs: int = 50, batch_size: int = 256, lr: float = 1e-3,
+            verbose: bool = True) -> dict:
+        """
+        Train the GPU model. Returns metrics dict with final_loss, epochs, samples.
+        Keeps the same (X, y_rel, y_urg) interface as the previous sklearn model.
+        """
         t0 = time.time()
-        n = X.shape[0]
+        n, dim = X.shape
 
-        # Build ensemble — each model trained on a different bootstrap sample
-        if not self._fitted:
-            self._rel_models = [MLPRegressor(**MLP_PARAMS) for _ in range(N_ENSEMBLE)]
-            self._urg_models = [MLPRegressor(**MLP_PARAMS) for _ in range(N_ENSEMBLE)]
+        # Adapt the network if dim doesn't match what we have
+        if dim != self._input_dim:
+            self._input_dim = dim
+            self.net = ArticleNetModule(input_dim=dim).to(self.device)
+            self._fitted = False
 
-        rng = np.random.default_rng(42)
-        for i in range(N_ENSEMBLE):
-            idx = rng.integers(0, n, size=n)  # bootstrap sample
-            self._rel_models[i].fit(X[idx], y_rel[idx])
-            self._urg_models[i].fit(X[idx], y_urg[idx])
+        X_t   = torch.as_tensor(X, dtype=torch.float32)
+        y_t   = torch.stack([
+            torch.as_tensor(y_rel, dtype=torch.float32),
+            torch.as_tensor(y_urg, dtype=torch.float32),
+        ], dim=1)  # (N, 2)
 
+        ds = torch.utils.data.TensorDataset(X_t, y_t)
+        # pin_memory only helps for CUDA; keep CPU path simple
+        pin = (self.device.type == "cuda")
+        loader = torch.utils.data.DataLoader(
+            ds, batch_size=batch_size, shuffle=True,
+            pin_memory=pin, num_workers=0, drop_last=False,
+        )
+
+        opt = torch.optim.Adam(self.net.parameters(), lr=lr, weight_decay=1e-5)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
+        loss_fn = nn.SmoothL1Loss()
+
+        self.net.train()
+        final_loss = float("nan")
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            n_batches = 0
+            for xb, yb in loader:
+                xb = xb.to(self.device, non_blocking=pin)
+                yb = yb.to(self.device, non_blocking=pin)
+                opt.zero_grad(set_to_none=True)
+                pred = self.net(xb)
+                loss = loss_fn(pred, yb)
+                loss.backward()
+                opt.step()
+                epoch_loss += loss.item()
+                n_batches += 1
+            sched.step()
+            final_loss = epoch_loss / max(n_batches, 1)
+
+            if verbose and (epoch == 0 or (epoch + 1) % 5 == 0 or epoch == epochs - 1):
+                gpu_mem = ""
+                if self.device.type == "cuda":
+                    mb = torch.cuda.memory_allocated(self.device) / (1024 * 1024)
+                    peak = torch.cuda.max_memory_allocated(self.device) / (1024 * 1024)
+                    gpu_mem = f" gpu_mem={mb:.0f}MB peak={peak:.0f}MB"
+                print(f"[ml:model] epoch {epoch+1:>3}/{epochs} "
+                      f"loss={final_loss:.4f} lr={sched.get_last_lr()[0]:.2e}{gpu_mem}")
+
+        self.net.eval()
         self._fitted = True
         self.save()
         elapsed = time.time() - t0
-        print(f"[ml:model] Ensemble trained on {n} samples in {elapsed:.1f}s")
+        print(f"[ml:model] Trained {epochs} epochs on {n} samples in {elapsed:.1f}s "
+              f"(device={self.device})")
+        return {
+            "final_loss": round(final_loss, 4),
+            "epochs": epochs,
+            "samples": n,
+            "elapsed_s": round(elapsed, 1),
+            "device": str(self.device),
+        }
 
+    # ── inference ───────────────────────────────────────────────────────────
+    @torch.no_grad()
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Returns (rel_mean, rel_std, urg_mean, urg_std) — all shape (N,).
-        High std → uncertain → send to LLM.
+        Monte Carlo Dropout inference: MC_PASSES stochastic forward passes.
+        Returns (rel_mean, rel_std, urg_mean, urg_std), each shape (N,).
         """
-        if not self._fitted or not SKLEARN_OK:
-            n = X.shape[0]
+        n = X.shape[0]
+        if not self._fitted or X.shape[1] != self._input_dim:
             return (np.zeros(n), np.full(n, 99.0),
                     np.zeros(n), np.full(n, 99.0))
 
-        rel_preds = np.stack([m.predict(X) for m in self._rel_models])  # (E, N)
-        urg_preds = np.stack([m.predict(X) for m in self._urg_models])
+        # Keep dropout active for MC sampling; BatchNorm stays in eval mode.
+        self.net.eval()
+        for m in self.net.modules():
+            if isinstance(m, nn.Dropout):
+                m.train()
 
-        rel_mean = np.clip(rel_preds.mean(axis=0), 0, 10)
-        urg_mean = np.clip(urg_preds.mean(axis=0), 0, 10)
-        rel_std  = rel_preds.std(axis=0)
-        urg_std  = urg_preds.std(axis=0)
+        x = torch.as_tensor(X, dtype=torch.float32, device=self.device)
+        # Single-sample inputs break BatchNorm in train mode; we forced BN to eval
+        # above so this is safe.
+        preds = []
+        for _ in range(MC_PASSES):
+            preds.append(self.net(x).cpu().numpy())
+        stacked = np.stack(preds, axis=0)  # (P, N, 2)
 
+        rel = stacked[:, :, 0]
+        urg = stacked[:, :, 1]
+        rel_mean = np.clip(rel.mean(axis=0), 0, 10)
+        urg_mean = np.clip(urg.mean(axis=0), 0, 10)
+        rel_std  = rel.std(axis=0)
+        urg_std  = urg.std(axis=0)
+
+        self.net.eval()  # restore fully eval after MC
         return rel_mean, rel_std, urg_mean, urg_std
 
     @property

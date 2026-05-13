@@ -62,7 +62,7 @@ SCORE_INTERVAL      = 30          # run scoring pass every 30s
 ALERT_CHECK         = 20          # check for urgent alerts every 20s
 PURGE_INTERVAL      = 6 * 3600   # purge old data every 6h
 GDELT_INTERVAL      = 600         # full GDELT sweep every 10min
-ML_TRAIN_INTERVAL   = 3600        # retrain ArticleNet every hour
+ML_TRAIN_INTERVAL   = 1800        # retrain ArticleNet every 30 minutes (GPU)
 PRICE_ALERT_INTERVAL = 300        # check portfolio prices every 5min
 PRICE_ALERT_THRESHOLD = 3.0       # alert when |%| move >= this
 WORKER_HEALTH_STALE_SECS = 15 * 60  # mark worker stale in heartbeat if no success in this many seconds
