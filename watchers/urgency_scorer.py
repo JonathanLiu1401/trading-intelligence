@@ -4,8 +4,8 @@ Marks articles as urgent (score >= 8) for immediate alerting.
 """
 import json
 import re
-import shutil
-import subprocess
+
+from core.claude_cli import claude_call
 
 SONNET_MODEL = "claude-sonnet-4-6"
 BATCH_SIZE = 100  # articles per Sonnet call
@@ -39,7 +39,7 @@ Respond ONLY with a JSON array: [{{"index": 0, "score": 9, "reason": "MU earning
 
 def score_batch(articles: list, store) -> int:
     """Score a batch of articles; update store. Returns count of urgent items found."""
-    if not articles or not shutil.which("claude"):
+    if not articles:
         return 0
 
     payload = [
@@ -50,19 +50,16 @@ def score_batch(articles: list, store) -> int:
     prompt = SCORE_PROMPT.format(articles_json=json.dumps(payload, ensure_ascii=False))
 
     try:
-        result = subprocess.run(
-            ["claude", "--model", SONNET_MODEL, "--print",
-             "--permission-mode", "bypassPermissions", prompt],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode != 0:
+        raw = claude_call(prompt, model=SONNET_MODEL, timeout=120)
+        if raw is None:
             return 0
 
-        m = re.search(r"\[.*\]", result.stdout, re.DOTALL)
+        m = re.search(r"\[.*\]", raw, re.DOTALL)
         if not m:
             return 0
 
         scores = json.loads(m.group(0))
+
         urgent_count = 0
         for item in scores:
             idx = item.get("index")

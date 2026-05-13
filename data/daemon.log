@@ -276,3 +276,19 @@
 2026-05-13 00:33:56,181 [INFO] [stats] total=1911 urgent=0 unscored=1911 db=1.1MB
 2026-05-13 00:34:09,924 [INFO] [ticker] +1 new articles (from 335 collected)
 2026-05-13 00:34:56,201 [INFO] [stats] total=1912 urgent=0 unscored=1912 db=1.1MB
+2026-05-13 00:35:56,229 [INFO] [stats] total=1912 urgent=0 unscored=1912 db=1.1MB
+2026-05-13 00:36:06,671 [INFO] [rss] +1 new articles (from 1 collected)
+2026-05-13 00:36:56,239 [INFO] [stats] total=1913 urgent=0 unscored=1913 db=1.1MB
+2026-05-13 00:37:56,251 [INFO] [stats] total=1913 urgent=0 unscored=1913 db=1.1MB
+2026-05-13 00:38:56,272 [INFO] [stats] total=1913 urgent=0 unscored=1913 db=1.1MB
+2026-05-13 00:39:56,279 [INFO] [stats] total=1913 urgent=0 unscored=1913 db=1.1MB
+2026-05-13 00:40:29,864 [INFO] [gdelt:Middle East conflict oil] +5 new articles (from 32 collected)
+2026-05-13 00:40:56,322 [INFO] [stats] total=1918 urgent=0 unscored=1918 db=1.1MB
+2026-05-13 00:41:56,347 [INFO] [stats] total=1918 urgent=0 unscored=1918 db=1.1MB
+2026-05-13 00:42:56,386 [INFO] [stats] total=1918 urgent=0 unscored=1918 db=1.1MB
+2026-05-13 00:43:56,399 [INFO] [stats] total=1918 urgent=0 unscored=1918 db=1.1MB
+2026-05-13 00:44:56,417 [INFO] [stats] total=1918 urgent=0 unscored=1918 db=1.1MB
+2026-05-13 00:45:56,436 [INFO] [stats] total=1918 urgent=0 unscored=1918 db=1.1MB
+2026-05-13 00:46:56,443 [INFO] [stats] total=1918 urgent=0 unscored=1918 db=1.1MB
+2026-05-13 00:47:56,453 [INFO] [stats] total=1918 urgent=0 unscored=1918 db=1.1MB
+2026-05-13 00:48:11,276 [INFO] [rss] +1 new articles (from 12 collected)

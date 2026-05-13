@@ -46,10 +46,11 @@ def _get_db_path() -> Path:
 
 def _connect() -> sqlite3.Connection:
     db = _get_db_path()
-    conn = sqlite3.connect(str(db), timeout=30, check_same_thread=False)
+    conn = sqlite3.connect(str(db), timeout=60, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+    conn.execute("PRAGMA cache_size=-64000")   # 64MB cache
+    conn.execute("PRAGMA busy_timeout=60000")  # wait up to 60s on lock
     conn.executescript(SCHEMA)
     conn.commit()
     return conn
@@ -166,6 +167,16 @@ class ArticleStore:
         db = _get_db_path()
         size_mb = db.stat().st_size / 1024 / 1024 if db.exists() else 0
         return {"total": total, "urgent": urgent, "unscored": unscored, "db_mb": round(size_mb, 1)}
+
+    def stats_since(self, hours: int) -> dict:
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        total = self.conn.execute(
+            "SELECT COUNT(*) FROM articles WHERE first_seen >= ?", (since,)
+        ).fetchone()[0]
+        urgent = self.conn.execute(
+            "SELECT COUNT(*) FROM articles WHERE first_seen >= ? AND urgency>=1", (since,)
+        ).fetchone()[0]
+        return {"total": total, "urgent": urgent}
 
     def close(self):
         self.conn.close()

@@ -2,8 +2,8 @@
 Urgent alert agent — Bloomberg BN newswire style, immediate Discord post.
 """
 import os
-import shutil
-import subprocess
+
+from core.claude_cli import claude_call
 
 SONNET_MODEL = "claude-sonnet-4-6"
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
@@ -51,17 +51,9 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
     prompt = ALERT_PROMPT.format(articles_text=articles_text)
 
     try:
-        result = subprocess.run(
-            ["claude", "--model", SONNET_MODEL, "--print",
-             "--permission-mode", "bypassPermissions", prompt],
-            capture_output=True, text=True, timeout=60,
-        )
-        if result.returncode != 0:
-            print(f"[alert] Sonnet error: {result.stderr[:200]}")
-            return False
-
-        message = result.stdout.strip()
+        message = claude_call(prompt, model=SONNET_MODEL, timeout=60)
         if not message:
+            print("[alert] No response from Claude — skipping")
             return False
 
         # post via discord_notifier which also fires TTS

@@ -1,9 +1,8 @@
 """Triage filter — heuristic pre-filter then Claude Sonnet 4.6 batch re-ranking."""
 import json
 import re
-import subprocess
-import shutil
 
+from core.claude_cli import claude_call
 from triage.heuristic_scorer import score_article, score_and_rank
 
 KEYWORD_CANDIDATES = 200   # articles passed to Claude after heuristic pre-filter
@@ -38,10 +37,6 @@ Respond with ONLY a JSON array of objects: [{{"index": 0, "score": 7}}, ...]. No
 def _claude_batch_score(candidates: list) -> list:
     """Send up to KEYWORD_CANDIDATES articles to Sonnet for batch scoring.
     Returns articles with updated _relevance_score, sorted desc."""
-    if not shutil.which("claude"):
-        print("[local_filter] claude CLI not found — using keyword scores only")
-        return candidates
-
     payload = [
         {"index": i, "title": a.get("title", "")[:150], "summary": (a.get("summary") or "")[:200]}
         for i, a in enumerate(candidates)
@@ -49,20 +44,14 @@ def _claude_batch_score(candidates: list) -> list:
     prompt = BATCH_PROMPT.format(articles_json=json.dumps(payload, ensure_ascii=False))
 
     try:
-        result = subprocess.run(
-            ["claude", "--model", SONNET_MODEL, "--print",
-             "--permission-mode", "bypassPermissions", prompt],
-            capture_output=True, text=True, timeout=90,
-        )
-        if result.returncode != 0:
-            print(f"[local_filter] Sonnet CLI error: {result.stderr[:200]}")
+        raw = claude_call(prompt, model=SONNET_MODEL, timeout=90)
+        if raw is None:
+            print("[local_filter] Sonnet unavailable — using heuristic scores only")
             return candidates
 
-        # extract JSON array from response
-        raw = result.stdout.strip()
         m = re.search(r"\[.*\]", raw, re.DOTALL)
         if not m:
-            print("[local_filter] Could not parse Sonnet response — using keyword scores")
+            print("[local_filter] Could not parse Sonnet response — using heuristic scores")
             return candidates
 
         scores = json.loads(m.group(0))
@@ -76,8 +65,6 @@ def _claude_batch_score(candidates: list) -> list:
                 art["_relevance_score"] = round(kw * 0.2 + sonnet_score * 0.8, 1)
 
         print(f"[local_filter] Sonnet scored {len(score_map)}/{len(candidates)} articles")
-    except subprocess.TimeoutExpired:
-        print("[local_filter] Sonnet timed out — using keyword scores")
     except Exception as e:
         print(f"[local_filter] Sonnet error: {e}")
 

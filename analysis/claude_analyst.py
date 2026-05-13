@@ -1,8 +1,8 @@
 """Bloomberg Terminal-style briefing — Claude Opus 4.7 via CLI."""
 import os
-import subprocess
-import shutil
 from datetime import datetime, timezone
+
+from core.claude_cli import claude_call
 
 MODEL = "claude-opus-4-7"
 
@@ -173,26 +173,10 @@ def _find_claude() -> str | None:
 
 
 def analyze(articles, stock_data, earnings):
-    claude_bin = _find_claude()
-    if not claude_bin:
-        return "[analyst] claude CLI not found."
-
     payload = _build_payload(articles, stock_data, earnings)
     full_prompt = f"{SYSTEM_PROMPT}\n\n---\nDATA INPUT:\n{payload}"
-
-    try:
-        result = subprocess.run(
-            [claude_bin, "--model", MODEL, "--print",
-             "--permission-mode", "bypassPermissions", full_prompt],
-            capture_output=True, text=True, timeout=180,
-        )
-        if result.returncode != 0:
-            return f"[analyst] CLI error: {result.stderr[:300]}"
-        return result.stdout.strip()
-    except subprocess.TimeoutExpired:
-        return "[analyst] Timed out."
-    except Exception as e:
-        return f"[analyst] Error: {e}"
+    result = claude_call(full_prompt, model=MODEL, timeout=180)
+    return result or "[analyst] No response from Claude."
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ Architecture: independent worker threads, each running their own infinite loop.
 No global sleep. Workers run as fast as their sources allow.
 
 Workers:
-  W1  gdelt_worker       — rotates 141 GDELT queries continuously, no pause
+  W1  gdelt_worker       — full GDELT sweep via collect_gdelt() every 10min
   W2  rss_worker         — re-polls all RSS feeds every 60s
   W3  web_worker         — scrapes 60+ financial sites every 90s
   W4  reddit_worker      — re-polls Reddit every 90s
@@ -15,6 +15,7 @@ Workers:
   W8  heartbeat_worker   — posts full Opus briefing every 5h
   W9  purge_worker       — cleans old data every 6h
   W10 ml_trainer_worker  — retrains ArticleNet hourly on accumulated LLM labels
+  W11 price_alert_worker — alerts on >3% portfolio moves every 5min
 """
 import os
 import sys
@@ -58,13 +59,20 @@ TICKER_INTERVAL     = 120         # re-fetch ticker news every 120s
 SCORE_INTERVAL      = 30          # run scoring pass every 30s
 ALERT_CHECK         = 20          # check for urgent alerts every 20s
 PURGE_INTERVAL      = 6 * 3600   # purge old data every 6h
-GDELT_WORKER_SLEEP  = 0           # GDELT worker runs with no sleep between queries
+GDELT_INTERVAL      = 600         # full GDELT sweep every 10min
 ML_TRAIN_INTERVAL   = 3600        # retrain ArticleNet every hour
+PRICE_ALERT_INTERVAL = 300        # check portfolio prices every 5min
+PRICE_ALERT_THRESHOLD = 3.0       # alert when |%| move >= this
+WORKER_HEALTH_STALE_SECS = 15 * 60  # mark worker stale in heartbeat if no success in this many seconds
+
+PORTFOLIO_TICKERS = ("LITE", "MU", "MSFT", "AXTI", "ORCL", "TSEM", "QBTS")
 
 log = get_logger("daemon")
 
 _running = True
 _store_lock = threading.Lock()
+_worker_last_ok: dict[str, float] = {}
+_last_prices: dict[str, float] = {}
 
 def _handle_signal(sig, frame):
     global _running
@@ -93,38 +101,17 @@ def _ingest(store: ArticleStore, articles: list, source_tag: str) -> int:
     return inserted
 
 
-# ── Worker W1: GDELT — continuous query rotation ────────────────────────────
+# ── Worker W1: GDELT — full sweep via public collect_gdelt() ────────────────
 def gdelt_worker(store: ArticleStore):
     log.info("[gdelt_worker] started")
-    from collectors.gdelt_collector import _fetch_query, _ensure_db, _article_id
-    import sqlite3
-    from datetime import timezone as tz
-    query_idx = 0
-    conn = _ensure_db()
-
     while _running:
-        query = QUERY_GROUPS[query_idx % len(QUERY_GROUPS)]
-        query_idx += 1
-        articles = _fetch_query(query)
-        new = []
-        for art in articles:
-            url = art["link"]
-            if not url:
-                continue
-            aid = _article_id(url, art["title"])
-            cur = conn.execute("SELECT 1 FROM seen_articles WHERE id=?", (aid,))
-            if cur.fetchone():
-                continue
-            conn.execute(
-                "INSERT OR IGNORE INTO seen_articles VALUES (?,?,?,?,?)",
-                (aid, url, art["title"], art["source"],
-                 datetime.now(tz.utc).isoformat()),
-            )
-            new.append(art)
-        conn.commit()
-        if new:
-            _ingest(store, new, f"gdelt:{query[:30]}")
-        # no sleep — immediately move to next query
+        try:
+            articles = collect_gdelt()
+            _ingest(store, articles, "gdelt")
+            _worker_last_ok["gdelt"] = time.time()
+        except Exception as e:
+            log.warning(f"[gdelt_worker] error: {e}")
+        _sleep(GDELT_INTERVAL)
 
 
 # ── Worker W2: RSS — re-poll every 60s ──────────────────────────────────────
@@ -134,6 +121,7 @@ def rss_worker(store: ArticleStore):
         try:
             articles = collect_rss()
             _ingest(store, articles, "rss")
+            _worker_last_ok["rss"] = time.time()
         except Exception as e:
             log.warning(f"[rss_worker] error: {e}")
         _sleep(RSS_INTERVAL)
@@ -182,38 +170,71 @@ def scorer_worker(store: ArticleStore):
     while _running:
         try:
             with _store_lock:
-                unscored = store.get_unscored(limit=200, min_kw=1.5)
+                unscored = store.get_unscored(limit=500, min_kw=1.5)
 
             if unscored:
-                    # Route through NN first; falls back to LLM-only if model not ready
-                    buckets = triage_articles(unscored)
+                log.info(f"[scorer] Scoring {len(unscored)} articles...")
+                buckets = triage_articles(unscored)
 
-                    # Apply NN scores to confident articles immediately
-                    for art, sc in buckets["confident"]:
-                        aid = art.get("_id")
-                        if aid:
-                            is_urgent = sc.urgency >= 8.0
-                            store.update_ai_score(aid, sc.urgency, urgency=1 if is_urgent else 0)
+                for art, sc in buckets["confident"]:
+                    aid = art.get("_id")
+                    if aid:
+                        is_urgent = sc.urgency >= 8.0
+                        store.update_ai_score(aid, sc.urgency, urgency=1 if is_urgent else 0)
 
-                    # Drop noise (mark scored so they don't keep queuing)
-                    for art, sc in buckets["noise"]:
-                        aid = art.get("_id")
-                        if aid:
-                            store.update_ai_score(aid, sc.relevance)
+                for art, sc in buckets["noise"]:
+                    aid = art.get("_id")
+                    if aid:
+                        store.update_ai_score(aid, sc.relevance)
 
-                    llm_candidates = [art for art, _ in buckets["uncertain"]]
-                    record_metric("scorer.nn_bypass_rate",
-                                  1.0 - len(llm_candidates) / max(len(unscored), 1),
-                                  {"total": len(unscored), "to_llm": len(llm_candidates)})
+                llm_candidates = [art for art, _ in buckets["uncertain"]]
+                record_metric("scorer.nn_bypass_rate",
+                              1.0 - len(llm_candidates) / max(len(unscored), 1),
+                              {"total": len(unscored), "to_llm": len(llm_candidates)})
 
+                urgent = 0
                 if llm_candidates:
                     urgent = score_batch(llm_candidates, store)
-                    if urgent:
-                        log.info(f"[scorer] {urgent} urgent articles (from {len(llm_candidates)} sent to LLM)")
+                log.info(f"[scorer] Done: {urgent} urgent from {len(llm_candidates)} LLM candidates")
+
+            _worker_last_ok["scorer"] = time.time()
 
         except Exception as e:
             log.warning(f"[scorer_worker] error: {e}")
         _sleep(SCORE_INTERVAL)
+
+
+# ── Worker W11: Portfolio price alerts — every 5min ─────────────────────────
+def price_alert_worker(store: ArticleStore):
+    log.info("[price_alert_worker] started")
+    while _running:
+        try:
+            data = get_stock_data()
+            by_ticker = {row["ticker"]: row for row in data.get("equities", [])}
+            for tkr in PORTFOLIO_TICKERS:
+                row = by_ticker.get(tkr)
+                if not row:
+                    continue
+                price = row.get("price")
+                if price is None:
+                    continue
+                prev = _last_prices.get(tkr)
+                if prev is None:
+                    _last_prices[tkr] = price
+                    continue
+                pct = (price - prev) / prev * 100.0 if prev else 0.0
+                if abs(pct) >= PRICE_ALERT_THRESHOLD:
+                    sign = "+" if pct >= 0 else ""
+                    msg = (f"📈 PRICE ALERT: {tkr} {sign}{pct:.1f}% to "
+                           f"${price:.2f} (from ${prev:.2f}, "
+                           f"{PRICE_ALERT_INTERVAL // 60}min ago)")
+                    log.info(f"[price_alert] {msg}")
+                    discord_send(msg, is_alert=True)
+                _last_prices[tkr] = price
+            _worker_last_ok["price_alert"] = time.time()
+        except Exception as e:
+            log.warning(f"[price_alert_worker] error: {e}")
+        _sleep(PRICE_ALERT_INTERVAL)
 
 
 # ── Worker W10: ML trainer — retrains ArticleNet hourly ─────────────────────
@@ -282,8 +303,10 @@ def heartbeat_worker(store: ArticleStore):
                              "summary": opts_blk, "ai_score": 10}] + top
 
                 briefing = analyze(top, stocks, earnings)
-                ok = discord_send(briefing)
-                log.info(f"[heartbeat] {'sent' if ok else 'FAILED'} ({len(briefing)} chars)")
+                health_line = _build_health_line(store)
+                message = briefing.rstrip() + "\n\n" + health_line
+                ok = discord_send(message)
+                log.info(f"[heartbeat] {'sent' if ok else 'FAILED'} ({len(message)} chars)")
                 last = time.time()
             except Exception as e:
                 log.error(f"[heartbeat] error: {e}")
@@ -324,6 +347,22 @@ def _sleep(seconds: float):
         time.sleep(0.5)
 
 
+def _build_health_line(store: ArticleStore) -> str:
+    now = time.time()
+    tracked = ("gdelt", "rss", "scorer", "price_alert")
+    parts = []
+    for name in tracked:
+        last_ok = _worker_last_ok.get(name)
+        ok = last_ok is not None and (now - last_ok) < WORKER_HEALTH_STALE_SECS
+        parts.append(f"{name}={'✓' if ok else '✗'}")
+    try:
+        day = store.stats_since(24)
+        suffix = f" [{day['total']} articles today, {day['urgent']} urgent]"
+    except Exception:
+        suffix = ""
+    return "⚙ Workers: " + " ".join(parts) + suffix
+
+
 def main():
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info(" DIGITAL INTERN DAEMON — STARTING")
@@ -344,6 +383,7 @@ def main():
         ("purge",       purge_worker),
         ("stats",       stats_worker),
         ("ml_trainer",  ml_trainer_worker),
+        ("price_alert", price_alert_worker),
     ]
 
     threads = []

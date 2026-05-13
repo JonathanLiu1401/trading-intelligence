@@ -6,12 +6,13 @@ TTS pipeline:
 """
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import threading
 import wave
 from pathlib import Path
+
+from core.claude_cli import claude_call
 
 # ── Kokoro config ────────────────────────────────────────────────────────────
 KOKORO_MODEL  = Path(os.environ.get("KOKORO_MODEL",  "/home/zeph/whisper-server/kokoro-v1.0.onnx"))
@@ -58,24 +59,12 @@ Write ONLY the spoken narration, nothing else."""
 
 def _generate_script(text: str, is_alert: bool) -> str:
     """Use Claude Sonnet to write a spoken narration script."""
-    if not shutil.which("claude"):
-        return re.sub(r"[*_`~>#\[\]|━=─]", "", text)[:MAX_SCRIPT_CHARS]
-
     prompt = (NARRATION_PROMPT_ALERT if is_alert else NARRATION_PROMPT_BRIEFING).format(
         event_text=text[:1500], briefing_text=text[:2000]
     )
-
-    try:
-        result = subprocess.run(
-            ["claude", "--model", SONNET_MODEL, "--print",
-             "--permission-mode", "bypassPermissions", prompt],
-            capture_output=True, text=True, timeout=45,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()[:MAX_SCRIPT_CHARS]
-    except Exception as e:
-        print(f"[tts] Script generation error: {e}")
-
+    result = claude_call(prompt, model=SONNET_MODEL, timeout=45)
+    if result:
+        return result[:MAX_SCRIPT_CHARS]
     return re.sub(r"[*_`~>#\[\]|━=─]", "", text)[:MAX_SCRIPT_CHARS]
 
 

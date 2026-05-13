@@ -1,0 +1,14 @@
+Both fixes in place: scorer's `_worker_last_ok` now updates on every successful cycle (line 200, outside `if unscored:`), and the heartbeat now sends one combined message with briefing + health line.
+
+## Summary
+
+**Bugs fixed:**
+- **Scorer indentation** (`daemon.py:166-204`): Block was unparseable (`IndentationError`). Restructured so all NN-triage logic and the `if llm_candidates:` branch sit inside `if unscored:` at consistent indent.
+- **GDELT DB locking** (`daemon.py:104-114`): Removed raw `sqlite3` connection. Now calls public `collect_gdelt()` + `_ingest()` like the other workers, sleeping `GDELT_INTERVAL` (10min) between full sweeps.
+
+**Improvements:**
+- **Scorer batching**: `limit` bumped 200→500; added begin/end log lines.
+- **Price alert worker (W11)**: New `price_alert_worker` polls portfolio (LITE/MU/MSFT/AXTI/ORCL/TSEM/QBTS) every 5min via `get_stock_data()`, fires Discord alert on |Δ|≥3%, baseline rolls forward each cycle, registered in `main()` workers list.
+- **Heartbeat health dashboard**: Briefing now ships with a trailing `⚙ Workers: gdelt=✓ rss=✓ scorer=✓ price_alert=✓ [N articles today, M urgent]` line. Uses module-level `_worker_last_ok` dict updated by `gdelt`/`rss`/`scorer`/`price_alert` after each successful cycle. Stale threshold: 15min. New `ArticleStore.stats_since(hours)` powers the 24h counts.
+
+**Verified:** `python3 -c "import daemon"` succeeds, both edited files compile, `_build_health_line` smoke-tested with fresh/stale combinations. Not exercised end-to-end against the live daemon — to pick up these changes you'll need to clear `__pycache__/daemon.cpython-312.pyc` (the running daemon is using a stale .pyc since the on-disk file was unparseable) and restart.
