@@ -207,12 +207,15 @@ def scorer_worker(store: ArticleStore):
                     aid = art.get("_id")
                     if aid:
                         is_urgent = sc.urgency >= 8.0
-                        store.update_ai_score(aid, sc.urgency, urgency=1 if is_urgent else 0)
+                        # Use relevance as score (urgency is 0 until LLM confirms); floor at 0.01
+                        # so ai_score=0.0 exclusively means "not yet scored"
+                        score = max(sc.relevance, sc.urgency, 0.01)
+                        store.update_ai_score(aid, score, urgency=1 if is_urgent else 0)
 
                 for art, sc in buckets["noise"]:
                     aid = art.get("_id")
                     if aid:
-                        store.update_ai_score(aid, sc.relevance)
+                        store.update_ai_score(aid, max(sc.relevance, 0.01))
 
                 llm_candidates = [art for art, _ in buckets["uncertain"]]
                 record_metric("scorer.nn_bypass_rate",
