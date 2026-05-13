@@ -117,6 +117,8 @@ def _build_root_logger():
         "urllib3", "urllib3.connectionpool", "urllib3.util.retry",
         "requests", "asyncio", "charset_normalizer", "chardet",
         "websockets", "websockets.client", "websockets.server",
+        "yfinance", "peewee", "matplotlib", "matplotlib.font_manager",
+        "PIL", "PIL.PngImagePlugin",
     ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
