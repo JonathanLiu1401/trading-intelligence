@@ -174,7 +174,7 @@ def format_pnl_block(data: Optional[dict]) -> str:
     #   TKR  QTY    PRICE     VALUE     COST     PNL$    PNL%
     #   5    7      8         9         9        9       7   = 54 + 6 spaces ~ 60 — tighten
     # Use compact 56-inner layout:
-    header = f"{'TKR':<5}{'QTY':>7} {'PRICE':>8} {'VALUE':>9} {'COST':>9} {'PNL$':>9} {'PNL%':>7}"
+    header = f"{'TKR':<5}{'QTY':>6} {'PRICE':>7} {'VALUE':>8} {'COST':>8} {'PNL$':>8} {'PNL%':>6}"
     sep = "-" * len(header)
     inner_w = len(header)
     border_top = "+" + "=" * (inner_w + 2) + "+"
@@ -188,18 +188,18 @@ def format_pnl_block(data: Optional[dict]) -> str:
 
     for p in data["positions"]:
         tkr = f"{p['ticker'][:5]:<5}"
-        qty = f"{p['qty']:>7.2f}"
+        qty = f"{p['qty']:>6.2f}"
         if p["price"] is None:
-            row_text = f"{tkr}{qty} {'N/A':>8} {'N/A':>9} {p['cost']:>9.2f} {'N/A':>9} {'N/A':>7}"
+            row_text = f"{tkr}{qty} {'N/A':>7} {'N/A':>8} {p['cost']:>8.2f} {'N/A':>8} {'N/A':>6}"
             lines.append("║ " + row_text + " ║")
             continue
         pnl = p["pnl"]
         pct = p["pnl_pct"]
-        price_s = f"{p['price']:>8.2f}"
-        value_s = f"{p['value']:>9.2f}"
-        cost_s = f"{p['cost']:>9.2f}"
-        pnl_s = f"{pnl:>+9.2f}"
-        pct_s = f"{pct:>+6.1f}%"
+        price_s = f"{p['price']:>7.2f}"
+        value_s = f"{p['value']:>8.2f}"
+        cost_s = f"{p['cost']:>8.2f}"
+        pnl_s = f"{pnl:>+8.2f}"
+        pct_s = f"{pct:>+5.1f}%"
         plain = f"{tkr}{qty} {price_s} {value_s} {cost_s} {pnl_s} {pct_s}"
         # Apply color only to PNL fields (preserves column widths)
         if use_color:
@@ -213,12 +213,12 @@ def format_pnl_block(data: Optional[dict]) -> str:
     s = data["summary"]
     lines.append(sep_row)
     tot_tkr = f"{'TOTAL':<5}"
-    tot_qty = f"{'':>7}"
-    tot_price = f"{'':>8}"
-    tot_val = f"{s['total_value']:>9.2f}"
-    tot_cost = f"{s['total_cost']:>9.2f}"
-    tot_pnl = f"{s['total_pnl']:>+9.2f}"
-    tot_pct = f"{s['total_pnl_pct']:>+6.1f}%"
+    tot_qty = f"{'':>6}"
+    tot_price = f"{'':>7}"
+    tot_val = f"{s['total_value']:>8.2f}"
+    tot_cost = f"{s['total_cost']:>8.2f}"
+    tot_pnl = f"{s['total_pnl']:>+8.2f}"
+    tot_pct = f"{s['total_pnl_pct']:>+5.1f}%"
     plain = f"{tot_tkr}{tot_qty} {tot_price} {tot_val} {tot_cost} {tot_pnl} {tot_pct}"
     if use_color:
         c_pnl = _color(tot_pnl, s["total_pnl"], True)
