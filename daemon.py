@@ -41,6 +41,8 @@ from collectors.web_scraper import scrape_web
 from collectors.stock_data import get_stock_data
 from collectors.earnings_calendar import get_earnings
 from collectors.options_monitor import get_options_data, format_options_block
+from collectors.portfolio_pnl import collect_portfolio_pnl, format_pnl_block
+from collectors import source_health
 from triage.heuristic_scorer import score_article as _heuristic_score_article
 from analysis.claude_analyst import analyze
 from notifier.discord_notifier import send as discord_send
@@ -121,6 +123,10 @@ def rss_worker(store: ArticleStore):
         try:
             articles = collect_rss()
             _ingest(store, articles, "rss")
+            try:
+                source_health.record_result("rss", len(articles))
+            except Exception as he:
+                log.warning(f"[rss_worker] source_health error: {he}")
             _worker_last_ok["rss"] = time.time()
         except Exception as e:
             log.warning(f"[rss_worker] error: {e}")
@@ -134,6 +140,10 @@ def web_worker(store: ArticleStore):
         try:
             articles = scrape_web()
             _ingest(store, articles, "web")
+            try:
+                source_health.record_result("web", len(articles))
+            except Exception as he:
+                log.warning(f"[web_worker] source_health error: {he}")
         except Exception as e:
             log.warning(f"[web_worker] error: {e}")
         _sleep(WEB_INTERVAL)
@@ -146,6 +156,10 @@ def reddit_worker(store: ArticleStore):
         try:
             articles = collect_reddit()
             _ingest(store, articles, "reddit")
+            try:
+                source_health.record_result("reddit", len(articles))
+            except Exception as he:
+                log.warning(f"[reddit_worker] source_health error: {he}")
         except Exception as e:
             log.warning(f"[reddit_worker] error: {e}")
         _sleep(REDDIT_INTERVAL)
@@ -297,6 +311,17 @@ def heartbeat_worker(store: ArticleStore):
                 earnings = get_earnings()
                 opts     = get_options_data()
                 opts_blk = format_options_block(opts)
+
+                try:
+                    pnl_data = collect_portfolio_pnl()
+                    pnl_blk = format_pnl_block(pnl_data)
+                except Exception as pe:
+                    log.warning(f"[heartbeat] portfolio P&L error: {pe}")
+                    pnl_blk = None
+
+                if pnl_blk and pnl_blk != "N/A":
+                    top = [{"title": "PORTFOLIO P&L", "source": "portfolio_pnl",
+                             "summary": pnl_blk, "ai_score": 10}] + top
 
                 if opts_blk and opts_blk != "N/A":
                     top = [{"title": "OPTIONS SNAPSHOT", "source": "options_monitor",
