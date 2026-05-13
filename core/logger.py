@@ -122,6 +122,12 @@ def _build_root_logger():
     ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    # Phonemizer (used transitively by TTS deps) emits WARNINGs like
+    # "words count mismatch on 367.0% of the lines" on benign input. These
+    # are not actionable and skew our hourly error counts — silence below ERROR.
+    for tts_noisy in ("phonemizer", "phonemizer.backend", "espeak"):
+        logging.getLogger(tts_noisy).setLevel(logging.ERROR)
+
 
 _build_root_logger()
 
