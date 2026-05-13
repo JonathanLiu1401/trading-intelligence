@@ -193,7 +193,14 @@ class ArticleStore:
             (score_min_kw,),
         ).fetchone()[0]
         db = _get_db_path()
-        size_mb = db.stat().st_size / 1024 / 1024 if db.exists() else 0
+        # Include -wal and -shm sidecars so db_mb reflects true on-disk usage
+        # under WAL journaling (otherwise stats undercount during active writes).
+        size_bytes = 0
+        for suffix in ("", "-wal", "-shm"):
+            p = db.with_name(db.name + suffix)
+            if p.exists():
+                size_bytes += p.stat().st_size
+        size_mb = size_bytes / 1024 / 1024
         return {"total": total, "urgent": urgent, "unscored": unscored,
                 "below_threshold": below_threshold, "db_mb": round(size_mb, 1)}
 
