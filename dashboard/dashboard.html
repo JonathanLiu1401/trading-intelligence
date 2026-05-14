@@ -42,7 +42,19 @@
   .stat.db .value{color:var(--blue)}
   .stat.ml .value{color:var(--green)}
 
-  main{display:grid;grid-template-columns:60% 40%;height:calc(100vh - 110px);}
+  main{display:grid;grid-template-columns:60% 40%;height:calc(100vh - 110px - 36px);}
+
+  nav.topnav {
+    display: flex; gap: 0; background: #161b22; border-bottom: 1px solid #21262d;
+    padding: 0 16px;
+  }
+  nav.topnav a {
+    display: inline-block; padding: 8px 16px; font-size: 12px; letter-spacing: 1.5px;
+    text-transform: uppercase; color: #7d8590; text-decoration: none;
+    border-bottom: 2px solid transparent; transition: color .15s, border-color .15s;
+  }
+  nav.topnav a:hover { color: #e6edf3; border-bottom-color: #58a6ff; }
+  nav.topnav a.active { color: #58a6ff; border-bottom-color: #58a6ff; }
   .pane{overflow:auto;border-right:1px solid var(--line)}
   .pane:last-child{border-right:none}
   .pane h2{
@@ -115,6 +127,13 @@
     <div class="pill" id="clock">--:--:--</div>
   </div>
 </header>
+
+<nav class="topnav">
+  <a href="http://10.19.203.44:8888/">HOME</a>
+  <a href="http://10.19.203.44:8080/">INTERN</a>
+  <a href="#" class="active">OPS VIEW</a>
+  <a href="http://10.19.203.44:8090/">TRADER</a>
+</nav>
 
 <div id="critical-banner" class="critical-banner" style="display:none">⚠ CRITICAL: CORE WORKERS DOWN ⚠</div>
 

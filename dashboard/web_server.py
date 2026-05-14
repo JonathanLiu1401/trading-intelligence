@@ -14,11 +14,20 @@ from __future__ import annotations
 import os
 import json
 import sqlite3
+import subprocess
+import zlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, Response, jsonify, request
+
+try:
+    import anthropic  # type: ignore
+    _ANTHROPIC_AVAILABLE = True
+except Exception:
+    anthropic = None  # type: ignore
+    _ANTHROPIC_AVAILABLE = False
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -139,7 +148,9 @@ def create_app(store=None) -> Flask:
 
     @app.get("/")
     def index() -> Response:
-        return Response(_DASHBOARD_HTML, mimetype="text/html")
+        prefix = request.headers.get("X-Forwarded-Prefix", "").rstrip("/")
+        html = _DASHBOARD_HTML.replace("__API_PREFIX__", prefix)
+        return Response(html, mimetype="text/html")
 
     @app.get("/api/articles")
     def api_articles():
@@ -197,6 +208,194 @@ def create_app(store=None) -> Flask:
         store = _store_handle()
         return jsonify({"ok": store is not None})
 
+    @app.get("/chat")
+    def chat_page() -> Response:
+        return Response(_CHAT_HTML, mimetype="text/html")
+
+    @app.post("/api/chat")
+    def api_chat():
+        try:
+            payload = request.get_json(force=True, silent=True) or {}
+        except Exception:
+            payload = {}
+        user_msg = (payload.get("message") or "").strip()
+        history = payload.get("history") or []
+        if not user_msg:
+            return jsonify({"error": "empty message"}), 400
+
+        # Pull article context — open a fresh read-only sqlite connection so we
+        # don't clash with the daemon's writer thread.
+        articles_ctx: list[dict] = []
+        try:
+            # Resolve the actual sqlite file the daemon's ArticleStore is using
+            # (could be the USB mount at /media/zeph/projects/digital-intern/db).
+            db_path: Path | None = None
+            store = _store_handle()
+            if store is not None:
+                try:
+                    for _id, name, file in store.conn.execute("PRAGMA database_list").fetchall():
+                        if name == "main" and file:
+                            db_path = Path(file)
+                            break
+                except Exception:
+                    pass
+            if db_path is None:
+                # Fallbacks: USB mount first, then local repo path.
+                for cand in (
+                    Path("/media/zeph/projects/digital-intern/db/articles.db"),
+                    BASE_DIR / "db" / "articles.db",
+                ):
+                    if cand.exists():
+                        db_path = cand
+                        break
+            since = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+            uri = f"file:{db_path}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            try:
+                rows = conn.execute(
+                    "SELECT title, source, ai_score, full_text FROM articles "
+                    "WHERE first_seen >= ? ORDER BY ai_score DESC LIMIT 10",
+                    (since,),
+                ).fetchall()
+            finally:
+                conn.close()
+            for r in rows:
+                summary = ""
+                if r[3] is not None:
+                    try:
+                        summary = zlib.decompress(r[3]).decode("utf-8", errors="replace")[:300]
+                    except Exception:
+                        try:
+                            summary = (r[3] if isinstance(r[3], str) else r[3].decode("utf-8", "replace"))[:300]
+                        except Exception:
+                            summary = ""
+                articles_ctx.append({
+                    "title": r[0] or "",
+                    "source": r[1] or "",
+                    "ai_score": float(r[2] or 0),
+                    "summary": summary,
+                })
+        except Exception as e:
+            _logger().warning("chat: article context fetch failed: %s", e)
+
+        # Portfolio snapshot
+        portfolio = _read_json(BASE_DIR / "data" / "portfolio_pl.json") or {}
+
+        # Compact portfolio summary for the prompt
+        portfolio_lines: list[str] = []
+        try:
+            s = (portfolio.get("summary") or {}) if isinstance(portfolio, dict) else {}
+            if s:
+                portfolio_lines.append(
+                    f"Total value: ${s.get('grand_value', s.get('total_value', 'n/a'))} "
+                    f"P&L: ${s.get('grand_pnl', s.get('total_pnl', 'n/a'))} "
+                    f"({s.get('grand_pnl_pct', s.get('total_pnl_pct', 'n/a'))}%)"
+                )
+            for p in (portfolio.get("positions") or [])[:20]:
+                try:
+                    if float(p.get("qty") or 0) == 0:
+                        continue
+                except Exception:
+                    pass
+                portfolio_lines.append(
+                    f"  {p.get('ticker','?')}: qty={p.get('qty')} avg=${p.get('avg_cost')} "
+                    f"px=${p.get('price')} pnl=${p.get('pnl')} ({p.get('pnl_pct')}%)"
+                )
+            for o in (portfolio.get("options") or [])[:10]:
+                portfolio_lines.append(
+                    f"  OPT {o.get('symbol', o.get('ticker','?'))}: qty={o.get('qty')} pnl=${o.get('pnl')}"
+                )
+        except Exception:
+            pass
+        portfolio_block = "\n".join(portfolio_lines) if portfolio_lines else "(no portfolio snapshot available)"
+
+        # Articles block
+        if articles_ctx:
+            art_lines = []
+            for a in articles_ctx:
+                art_lines.append(
+                    f"{a['ai_score']:.2f} | {a['source']} | {a['title']}\n    {a['summary']}"
+                )
+            articles_block = "\n".join(art_lines)
+        else:
+            articles_block = "(no recent articles in the last 6 hours)"
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        system_prompt = (
+            "You are a market intelligence analyst with access to a real-time news feed "
+            "and portfolio data.\n"
+            f"Current date: {now_iso}\n\n"
+            "TOP NEWS SIGNALS (last 6h, ranked by ML score):\n"
+            f"{articles_block}\n\n"
+            "PORTFOLIO SNAPSHOT:\n"
+            f"{portfolio_block}\n\n"
+            "Answer questions about current market conditions, global events, specific "
+            "stocks, or portfolio analysis. Be concise and data-driven. Cite specific "
+            "articles when relevant."
+        )
+
+        # Build messages
+        msgs: list[dict] = []
+        for h in history[-20:]:
+            role = h.get("role")
+            content = (h.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                msgs.append({"role": role, "content": content})
+        msgs.append({"role": "user", "content": user_msg})
+
+        response_text = ""
+        err: str | None = None
+
+        if _ANTHROPIC_AVAILABLE and os.environ.get("ANTHROPIC_API_KEY"):
+            try:
+                client = anthropic.Anthropic()
+                resp = client.messages.create(
+                    model="claude-opus-4-7",
+                    max_tokens=2048,
+                    system=system_prompt,
+                    messages=msgs,
+                )
+                parts = []
+                for blk in resp.content or []:
+                    text = getattr(blk, "text", None)
+                    if text:
+                        parts.append(text)
+                response_text = "".join(parts).strip()
+            except Exception as e:
+                err = f"anthropic SDK error: {e}"
+                _logger().warning("chat: %s", err)
+
+        if not response_text:
+            # Subprocess fallback to the Claude CLI (uses its own auth).
+            try:
+                convo_parts = [system_prompt, "\n\n--- Conversation ---"]
+                for m in msgs:
+                    convo_parts.append(f"{m['role'].upper()}: {m['content']}")
+                convo_parts.append("ASSISTANT:")
+                prompt = "\n\n".join(convo_parts)
+                proc = subprocess.run(
+                    ["claude", "--model", "claude-opus-4-7", "--print", prompt],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if proc.returncode == 0:
+                    response_text = (proc.stdout or "").strip()
+                else:
+                    err = (err + " | " if err else "") + f"claude CLI exit {proc.returncode}: {proc.stderr.strip()[:300]}"
+            except FileNotFoundError:
+                err = (err + " | " if err else "") + "claude CLI not found and no ANTHROPIC_API_KEY"
+            except subprocess.TimeoutExpired:
+                err = (err + " | " if err else "") + "claude CLI timed out after 120s"
+            except Exception as e:
+                err = (err + " | " if err else "") + f"claude CLI error: {e}"
+
+        if not response_text:
+            return jsonify({"error": err or "no response from model"}), 502
+
+        return jsonify({
+            "response": response_text,
+            "sources": [a["title"] for a in articles_ctx],
+        })
+
     return app
 
 
@@ -240,6 +439,7 @@ _DASHBOARD_HTML = """<!doctype html>
   <a href="http://10.19.203.44:8888/trader/" style="color:#00b4d8;text-decoration:none">Paper Trader</a>
   <a href="http://10.19.203.44:8888/trader/backtests" style="color:#00b4d8;text-decoration:none">Backtests</a>
   <a href="http://10.19.203.44:8765/" style="color:#00b4d8;text-decoration:none">Ops View</a>
+  <a href="/chat" style="color:#00b4d8;text-decoration:none">Chat</a>
   <span style="margin-left:auto;color:#666;font-size:0.8em">10.19.203.44</span>
 </nav>
 <div class="container-fluid p-3">
@@ -302,13 +502,14 @@ _DASHBOARD_HTML = """<!doctype html>
 </div>
 
 <script>
+const API_PREFIX = "__API_PREFIX__";
 const params = new URLSearchParams(location.search);
 const KEY = params.get("key") || "";
 const qs = KEY ? ("?key=" + encodeURIComponent(KEY)) : "";
 
 async function getJSON(path) {
   try {
-    const r = await fetch(path + qs);
+    const r = await fetch(API_PREFIX + path + qs);
     if (!r.ok) return null;
     return await r.json();
   } catch (e) { return null; }
@@ -423,6 +624,186 @@ refresh();
 refreshPaperTrader();
 setInterval(refresh, 15000);
 setInterval(refreshPaperTrader, 15000);
+</script>
+</body>
+</html>
+"""
+
+
+_CHAT_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Market Intel — Digital Intern</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; height: 100%; }
+    body {
+      background: #0d1117; color: #e6edf3;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      font-size: 16px;
+      display: flex; flex-direction: column; height: 100vh;
+    }
+    nav {
+      background: #1a1a2e; padding: 12px 24px; display: flex; gap: 24px;
+      align-items: center; border-bottom: 1px solid #333;
+    }
+    nav .brand { color: #e94560; font-weight: bold; font-size: 1.1em; }
+    nav a { color: #00b4d8; text-decoration: none; }
+    nav a.active { color: #fff; border-bottom: 2px solid #e94560; }
+    header.page {
+      padding: 18px 24px 10px; border-bottom: 1px solid #21262d;
+      background: #0d1117;
+    }
+    header.page h1 { margin: 0; font-size: 1.4em; }
+    header.page .sub { color: #8b949e; font-size: 0.9em; margin-top: 4px; }
+    .chat-wrap {
+      flex: 1; overflow-y: auto; padding: 20px 24px;
+      display: flex; flex-direction: column; gap: 14px;
+    }
+    .msg { max-width: 760px; padding: 12px 16px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; line-height: 1.5; }
+    .msg.user { align-self: flex-end; background: #1f6feb; color: #fff; }
+    .msg.assistant { align-self: flex-start; background: #21262d; border: 1px solid #30363d; }
+    .msg.error { align-self: flex-start; background: #4a1d1d; border: 1px solid #f85149; color: #ffd6d6; }
+    .sources { align-self: flex-start; max-width: 760px; display: flex; flex-wrap: wrap; gap: 6px; margin-top: -6px; }
+    .chip {
+      background: #161b22; border: 1px solid #30363d; color: #8b949e;
+      font-size: 0.78em; padding: 3px 8px; border-radius: 10px;
+    }
+    .suggestions { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 24px 8px; }
+    .suggestion {
+      background: #161b22; border: 1px solid #30363d; color: #58a6ff;
+      padding: 8px 14px; border-radius: 18px; cursor: pointer; font-size: 0.9em;
+    }
+    .suggestion:hover { background: #21262d; }
+    form.input-bar {
+      display: flex; gap: 10px; padding: 14px 24px; border-top: 1px solid #21262d; background: #0d1117;
+    }
+    input.msg-input {
+      flex: 1; background: #161b22; border: 1px solid #30363d; color: #e6edf3;
+      padding: 12px 14px; border-radius: 8px; font-size: 16px;
+      font-family: inherit;
+    }
+    input.msg-input:focus { outline: none; border-color: #58a6ff; }
+    button.send {
+      background: #1f6feb; color: #fff; border: none; padding: 12px 22px;
+      border-radius: 8px; font-size: 16px; cursor: pointer; font-weight: 600;
+    }
+    button.send:disabled { background: #30363d; cursor: not-allowed; }
+    .spinner {
+      display: inline-block; width: 14px; height: 14px; border: 2px solid #30363d;
+      border-top-color: #58a6ff; border-radius: 50%;
+      animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 8px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .typing { color: #8b949e; font-style: italic; }
+  </style>
+</head>
+<body>
+<nav>
+  <span class="brand">◈ TRADING STACK</span>
+  <a href="http://10.19.203.44:8888/">Home</a>
+  <a href="/">Digital Intern</a>
+  <a href="http://10.19.203.44:8888/trader/">Paper Trader</a>
+  <a href="http://10.19.203.44:8765/">Ops View</a>
+  <a href="/chat" class="active">Chat</a>
+</nav>
+<header class="page">
+  <h1>Market Intel</h1>
+  <div class="sub">Powered by Claude Opus 4.7 + Live News Feed</div>
+</header>
+<div class="suggestions" id="suggestions">
+  <button class="suggestion" data-q="What's moving markets today?">What's moving markets today?</button>
+  <button class="suggestion" data-q="Nokia surge analysis">Nokia surge analysis</button>
+  <button class="suggestion" data-q="Best opportunities right now?">Best opportunities right now?</button>
+  <button class="suggestion" data-q="What should I watch in Asia overnight?">What should I watch in Asia overnight?</button>
+</div>
+<div class="chat-wrap" id="chat"></div>
+<form class="input-bar" id="form">
+  <input class="msg-input" id="input" type="text" placeholder="Ask about markets, news, or your portfolio…" autocomplete="off" autofocus>
+  <button class="send" id="send" type="submit">Send</button>
+</form>
+<script>
+const chat = document.getElementById('chat');
+const form = document.getElementById('form');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+const history = [];
+
+function scrollDown() {
+  requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
+}
+
+function addMsg(role, content, sources) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.textContent = content;
+  chat.appendChild(div);
+  if (sources && sources.length) {
+    const wrap = document.createElement('div');
+    wrap.className = 'sources';
+    for (const s of sources) {
+      const chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.textContent = s.length > 80 ? s.slice(0, 78) + '…' : s;
+      wrap.appendChild(chip);
+    }
+    chat.appendChild(wrap);
+  }
+  scrollDown();
+  return div;
+}
+
+function addLoader() {
+  const div = document.createElement('div');
+  div.className = 'msg assistant typing';
+  div.innerHTML = '<span class="spinner"></span>Thinking…';
+  chat.appendChild(div);
+  scrollDown();
+  return div;
+}
+
+async function ask(message) {
+  if (!message) return;
+  addMsg('user', message);
+  history.push({role: 'user', content: message});
+  input.value = '';
+  sendBtn.disabled = true;
+  const loader = addLoader();
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: message, history: history.slice(0, -1)}),
+    });
+    const j = await r.json();
+    loader.remove();
+    if (!r.ok || j.error) {
+      addMsg('error', 'Error: ' + (j.error || ('HTTP ' + r.status)));
+    } else {
+      addMsg('assistant', j.response, j.sources || []);
+      history.push({role: 'assistant', content: j.response});
+    }
+  } catch (e) {
+    loader.remove();
+    addMsg('error', 'Network error: ' + e.message);
+  } finally {
+    sendBtn.disabled = false;
+    input.focus();
+  }
+}
+
+form.addEventListener('submit', (e) => {
+  e.preventDefault();
+  ask(input.value.trim());
+});
+
+document.getElementById('suggestions').addEventListener('click', (e) => {
+  const b = e.target.closest('.suggestion');
+  if (!b) return;
+  ask(b.dataset.q);
+});
 </script>
 </body>
 </html>
