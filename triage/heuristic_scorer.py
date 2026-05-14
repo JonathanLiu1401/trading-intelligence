@@ -191,18 +191,25 @@ def _recency_factor(published: str) -> float:
     """Exponential decay: 1.0 at t=0, ~0.5 at 12h, ~0.25 at 24h, ~0.1 at 48h."""
     if not published:
         return 0.85  # unknown age — slight penalty
+    dt = None
     try:
         # try RFC 2822 (RSS dates)
         dt = parsedate_to_datetime(published)
-        age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
     except Exception:
+        dt = None
+    if dt is None:
         try:
             # try ISO format (GDELT seendate: 20260513T031500Z)
             s = published.replace("Z", "+00:00")
             dt = datetime.fromisoformat(s)
-            age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
         except Exception:
             return 0.85
+    # parsedate_to_datetime returns naive datetimes when the RFC string lacks
+    # tz info; treating those as UTC avoids a TypeError on subtraction that
+    # previously dropped valid recency back to the 0.85 unknown-age default.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
     if age_h < 0:
         age_h = 0
     # decay: e^(-0.06 * hours)
