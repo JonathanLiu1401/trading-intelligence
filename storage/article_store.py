@@ -60,7 +60,7 @@ def _retry_on_lock(func):
 
 USB_PATH = Path(os.environ.get("DIGITAL_INTERN_USB", "/media/zeph/projects/digital-intern/db"))
 LOCAL_PATH = Path(__file__).resolve().parent.parent / "data"
-RETENTION_DAYS = 14
+RETENTION_DAYS = 90
 
 # Global non-reentrant inference lock — prevents two callers running
 # score_pending() concurrently. Non-blocking acquire so concurrent
