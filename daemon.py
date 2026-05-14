@@ -856,25 +856,56 @@ def web_server_worker(store: ArticleStore):
     # Wait up to 60s for the port to be free before trying to bind.
     # This prevents crash-loops when a duplicate daemon holds the port briefly.
     bound = False
-    for _attempt in range(12):
-        if _port_is_free(WEB_SERVER_HOST, WEB_SERVER_PORT):
-            bound = True
-            break
+
+    # Fast-path: if the holder is a *sibling* daemon.py (different PID, same
+    # script), the 12 short attempts will never succeed — that's a persistent
+    # duplicate-process condition that needs operator action, not retries.
+    # Skip the noisy poll and go straight to the long backoff with a single
+    # WARNING per cycle instead of 13. This cuts ~700 lines/day of log noise
+    # under the dual-systemd-unit failure mode while preserving the original
+    # 60s retry loop for genuine transient TIME_WAIT contention.
+    sibling_holder = None
+    if not _port_is_free(WEB_SERVER_HOST, WEB_SERVER_PORT):
+        _holder_desc = _describe_port_holder(WEB_SERVER_PORT)
+        if "daemon.py" in _holder_desc:
+            try:
+                _holder_pid = int(_holder_desc.split("pid=")[1].split()[0])
+            except Exception:
+                _holder_pid = None
+            # Treat any daemon.py holder as a sibling (including the defensive
+            # "my own pid" case — shouldn't happen post-singleton-lock, but
+            # backing off is safer than crashing).
+            if _holder_pid != os.getpid():
+                sibling_holder = _holder_desc
+
+    if sibling_holder is not None:
         log.warning(
-            f"[web_server_worker] port {WEB_SERVER_PORT} busy — waiting 5s (attempt {_attempt+1}/12)"
+            f"[web_server_worker] port {WEB_SERVER_PORT} held by sibling daemon — "
+            f"skipping retry loop, backing off 5min. {sibling_holder}"
         )
-        time.sleep(5)
-        if not _running:
-            return
+    else:
+        for _attempt in range(12):
+            if _port_is_free(WEB_SERVER_HOST, WEB_SERVER_PORT):
+                bound = True
+                break
+            log.warning(
+                f"[web_server_worker] port {WEB_SERVER_PORT} busy — waiting 5s (attempt {_attempt+1}/12)"
+            )
+            time.sleep(5)
+            if not _running:
+                return
 
     if not bound:
         # Don't let Werkzeug crash with "Address already in use" — back off and
         # poll for the port to free up, then let the supervisor respawn us.
-        holder = _describe_port_holder(WEB_SERVER_PORT)
-        log.error(
-            f"[web_server_worker] port {WEB_SERVER_PORT} still busy after 60s — "
-            f"backing off 5min before retry. {holder}"
-        )
+        if sibling_holder is None:
+            holder = _describe_port_holder(WEB_SERVER_PORT)
+            log.error(
+                f"[web_server_worker] port {WEB_SERVER_PORT} still busy after 60s — "
+                f"backing off 5min before retry. {holder}"
+            )
+        # In sibling case, the WARNING above already explained the situation;
+        # don't add a second ERROR line per cycle.
         # Poll every 15s during the backoff so we recover quickly if the port
         # frees up (e.g. stale daemon exits) without waiting the full 5min.
         backoff_deadline = time.time() + 300
