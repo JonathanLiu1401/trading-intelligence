@@ -22,16 +22,25 @@ send_discord() {
 }
 
 # ── 1. Service health ────────────────────────────────────────────────────────
+# Brief grace re-check: avoids false-positive restarts during transient
+# "activating"/"deactivating" states (e.g. systemd Restart= flapping after
+# the singleton lock rejects a stray duplicate instance).
+if ! systemctl is-active --quiet digital-intern 2>/dev/null; then
+    sleep 8
+fi
 if ! systemctl is-active --quiet digital-intern 2>/dev/null; then
     STATUS=$(systemctl is-active digital-intern 2>/dev/null || echo "unknown")
     send_discord "🚨 **Digital Intern DOWN** (\`$STATUS\`) at $TIMESTAMP — attempting restart..."
-    sudo systemctl restart digital-intern 2>/dev/null || true
+    RESTART_ERR=$(sudo -n systemctl restart digital-intern 2>&1 >/dev/null || true)
     sleep 5
     if systemctl is-active --quiet digital-intern 2>/dev/null; then
         send_discord "✅ **Digital Intern** restarted successfully at $TIMESTAMP"
     else
-        send_discord "❌ **Digital Intern** restart FAILED at $TIMESTAMP — manual intervention needed"
-        echo "[$TIMESTAMP] CRITICAL: service restart failed" >> "$HC_LOG"
+        # Surface restart-command stderr so we can tell sudo/password failure
+        # apart from a real service crash.
+        ERR_SNIPPET=${RESTART_ERR:0:200}
+        send_discord "❌ **Digital Intern** restart FAILED at $TIMESTAMP (\`${ERR_SNIPPET:-no stderr}\`) — manual intervention needed"
+        echo "[$TIMESTAMP] CRITICAL: service restart failed err='${ERR_SNIPPET}'" >> "$HC_LOG"
         exit 1
     fi
 fi
