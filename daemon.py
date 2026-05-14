@@ -812,6 +812,18 @@ def export_worker(store: ArticleStore):
 
 # ── Worker: Public Flask web server — bind 0.0.0.0:8080 ─────────────────────
 def web_server_worker(store: ArticleStore):
+    import socket as _sock
+    # Wait up to 30s for the port to be free before trying to bind.
+    # This prevents crash-loops when a duplicate daemon holds the port briefly.
+    for _attempt in range(6):
+        try:
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            s.bind((WEB_SERVER_HOST, WEB_SERVER_PORT))
+            s.close()
+            break
+        except OSError:
+            log.warning(f"[web_server_worker] port {WEB_SERVER_PORT} busy — waiting 5s (attempt {_attempt+1}/6)")
+            time.sleep(5)
     log.info(f"[web_server_worker] starting Flask on {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
     try:
         from dashboard.web_server import run_server
