@@ -76,21 +76,32 @@ def score_batch(articles: list, store) -> int:
             return 0
 
         urgent_count = 0
+        updates: list[tuple[str, float, int]] = []
+        urgent_log: list[tuple[float, str, str]] = []
         for item in scores:
-            idx = item.get("index")
-            score = float(item.get("score", 0))
-            if idx is None or idx >= len(articles):
+            if not isinstance(item, dict):
+                continue
+            try:
+                idx = int(item.get("index"))
+                score = float(item.get("score", 0))
+            except (TypeError, ValueError):
+                continue
+            if idx < 0 or idx >= len(articles):
                 continue
             art = articles[idx]
             aid = art.get("_id")
             if not aid:
                 continue
             is_urgent = score >= URGENT_THRESHOLD
-            store.update_ai_score(aid, score, urgency=1 if is_urgent else 0)
+            updates.append((aid, score, 1 if is_urgent else 0))
             if is_urgent:
-                reason = item.get("reason", "")
-                print(f"[urgency] URGENT score={score:.0f} — {art.get('title', '')[:80]} ({reason})")
+                urgent_log.append((score, art.get("title", "")[:80], item.get("reason", "")))
                 urgent_count += 1
+        if updates:
+            # One bulk commit instead of N round-trips through the write lock.
+            store.update_ai_scores_batch(updates)
+        for score, title, reason in urgent_log:
+            print(f"[urgency] URGENT score={score:.0f} — {title} ({reason})")
 
         return urgent_count
     except Exception as e:

@@ -1,6 +1,4 @@
 """Bloomberg Terminal-style briefing — Claude Opus 4.7 via CLI."""
-import os
-import shutil
 from datetime import datetime, timezone
 
 from core.claude_cli import claude_call
@@ -110,19 +108,6 @@ def _build_payload(articles, stock_data, earnings):
             parts.append(f"  {e['ticker']}  {e['earnings_date']}")
 
     return "\n".join(parts)
-
-
-def _find_claude() -> str | None:
-    found = shutil.which("claude")
-    if found:
-        return found
-    for candidate in [
-        os.path.expanduser("~/.local/bin/claude"),
-        "/usr/local/bin/claude",
-    ]:
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return None
 
 
 def analyze(articles, stock_data, earnings):

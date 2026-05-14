@@ -3,7 +3,6 @@ Async web scraper — directly crawls 100+ financial news sites and article feed
 Never stops. Feeds URLs into a shared queue.
 """
 import asyncio
-import hashlib
 import re
 import time
 from urllib.parse import urljoin, urlparse
@@ -181,8 +180,6 @@ SCRAPE_TARGETS = [
     "https://abnormalreturns.com/",
     "https://thereformedbroker.com/",
     "https://www.thekobeissiletter.com/",
-    "https://semianalysis.com/",
-    "https://chipsandcheese.com/",
     "https://noahpinion.blog/",
     "https://www.platformer.news/",
     "https://www.bigtechnology.com/",
@@ -199,12 +196,6 @@ SCRAPE_TARGETS = [
     "https://www.eetimes.com/category/data-center/",
     "https://semiengineering.com/category/manufacturing-news/",
 ]
-
-# Finviz real-time news scraper (no API needed)
-FINVIZ_NEWS = "https://finviz.com/news.ashx"
-
-# SEC EDGAR real-time filings (8-K = material events)
-SEC_EDGAR = "https://efts.sec.gov/LATEST/search-index?q=%22memory%22+%22semiconductor%22&dateRange=custom&startdt={}&enddt={}&forms=8-K"
 
 # Patterns to skip
 SKIP_PATTERNS = re.compile(

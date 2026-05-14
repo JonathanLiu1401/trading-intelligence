@@ -7,14 +7,40 @@ Phase 2: retrains as Sonnet ai_score labels accumulate (stronger labels).
 Aggressive GPU training: 100 epochs per cycle, batch_size=256, Adam + cosine LR.
 Schedule lives in daemon.py (RETRAIN_INTERVAL drives the cadence).
 """
+import json
+import os
 import re
 import threading
 import time
+from pathlib import Path
+
 import numpy as np
 
 from ml.embedder import get_embedder
 from ml.features import extract_features_batch
 from ml.model import get_model
+
+# Per-cycle training metrics get appended here so the val_loss trend is visible
+# without grepping the daemon log. Each line is a JSON dict — `tail -n 50 |
+# jq .val_loss` shows whether the model is improving over time. Lives under the
+# ml dir to share the same lifetime as the checkpoints.
+_ML_DIR = Path(os.environ.get(
+    "DIGITAL_INTERN_ML_DIR",
+    Path(__file__).resolve().parent.parent / "data" / "ml",
+))
+TRAINING_METRICS_LOG = _ML_DIR / "training_metrics.jsonl"
+_METRICS_LOCK = threading.Lock()
+
+
+def _log_metrics(record: dict) -> None:
+    """Append one training-cycle record to TRAINING_METRICS_LOG. Best-effort."""
+    try:
+        _ML_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **record}
+        with _METRICS_LOCK, TRAINING_METRICS_LOG.open("a") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
 
 
 # ── time_sensitivity bootstrap labels ─────────────────────────────────────────
@@ -114,7 +140,11 @@ MIN_NEW_LABELS   = 50       # retrain if this many new LLM labels since last tra
 # 100 epochs per cycle for the deep multi-task net (RTX 3060 trains in <5s).
 EPOCHS_PER_CYCLE = 100
 BATCH_SIZE       = 256
-LEARNING_RATE    = 1e-3
+# Cold-start LR for a fresh model. ArticleNet.fit auto-drops to 1e-4 once the
+# model is already fitted (warm fine-tune) — pumping LR back to 1e-3 every cycle
+# was kicking weights off the basin and producing the "no upward trend" symptom.
+LEARNING_RATE       = 1e-3
+LEARNING_RATE_WARM  = 1e-4
 MIN_TRAIN_SAMPLES = 50       # below this we bootstrap from kw_score weak labels
 
 # Uncertainty thresholds — articles with uncertainty above this go to LLM
@@ -249,7 +279,7 @@ def train(store, force: bool = False) -> dict:
           f"source={source}")
 
     emb = get_embedder()
-    if not emb.fitted:
+    if emb.should_refit(len(texts)):
         X_text = emb.fit_transform(texts)
     else:
         X_text = emb.transform(texts)
@@ -271,24 +301,69 @@ def train(store, force: bool = False) -> dict:
         )
 
     elapsed = time.time() - t0
-    return {
+    result = {
         "status": "ok",
         "n": len(texts),
         "n_llm_labeled": int((y_rel > 0).sum()),
         "n_urgent": int((y_urg >= 8).sum()),
         "label_source": source,
         "final_loss": metrics.get("final_loss"),
+        "val_loss": metrics.get("val_loss"),
+        "best_in_run": metrics.get("best_in_run"),
+        "new_best": metrics.get("new_best", False),
         "epochs": metrics.get("epochs"),
         "device": metrics.get("device"),
         "elapsed_s": round(elapsed, 1),
     }
+    _log_metrics({"phase": "train", **result})
+    return result
+
+
+class Trainer:
+    """Thin class wrapper around ``train()`` for ad-hoc and scripted use.
+
+    Opens its own ``ArticleStore`` so callers can drive a one-off training
+    cycle without instantiating the daemon. Safe to call while the daemon
+    is also running — SQLite WAL mode permits concurrent readers, and
+    ArticleNet/Embedder use process-local singletons (a second Python
+    interpreter gets its own model state)."""
+
+    def __init__(self):
+        from storage.article_store import ArticleStore
+        self.store = ArticleStore()
+
+    def run_once(self, force: bool = False) -> dict:
+        return train(self.store, force=force)
+
+    def run_continuous_once(self) -> dict:
+        return train_continuous(self.store)
+
+    def health(self) -> dict:
+        """Snapshot the current ML stack — useful when the user wants to
+        confirm the model has actually learned text features."""
+        emb = get_embedder()
+        model = get_model()
+        try:
+            vocab = len(emb._vec.vocabulary_) if emb._vec is not None else 0
+        except Exception:
+            vocab = 0
+        return {
+            "embedder_fitted": emb.fitted,
+            "embedder_vocab_size": vocab,
+            "embedder_healthy": not emb.should_refit(self.store.conn.execute(
+                "SELECT COUNT(*) FROM articles WHERE ai_score > 0"
+            ).fetchone()[0]),
+            "model_fitted": model.fitted,
+            "model_input_dim": getattr(model, "_input_dim", None),
+            "model_best_val_loss": getattr(model, "_best_val_loss", None),
+        }
 
 
 _last_continuous_loss = float('inf')
 
 
 def train_continuous(store) -> dict:
-    """Lightweight continuous GPU training pass — 20 epochs on all scored articles."""
+    """Lightweight continuous GPU training pass — 40 epochs on all scored articles."""
     global _last_continuous_loss
     from storage.article_store import decompress
 
@@ -319,7 +394,7 @@ def train_continuous(store) -> dict:
     y_urg = np.clip(np.array(urgs, dtype=np.float32), 0, 10)
 
     emb = get_embedder()
-    if not emb.fitted:
+    if emb.should_refit(len(texts)):
         X_text = emb.fit_transform(texts)
     else:
         X_text = emb.transform(texts)
@@ -335,8 +410,11 @@ def train_continuous(store) -> dict:
     if not _TRAIN_LOCK.acquire(blocking=False):
         return {"status": "skipped", "reason": "trainer_busy", "n": n}
     try:
+        # Continuous trainer is always a fine-tune (the heavy trainer warm-started
+        # the model on cycle 1). Use a small LR so we don't undo progress.
         metrics = model.fit(X, y_rel, y_urg, y_time=y_time,
-                            epochs=40, batch_size=512, lr=1e-3)
+                            epochs=40, batch_size=512, lr=LEARNING_RATE_WARM,
+                            warm=True)
     finally:
         _TRAIN_LOCK.release()
 
@@ -356,10 +434,15 @@ def train_continuous(store) -> dict:
         gpu_mem_mb = 0.0
 
     elapsed = round(time.time() - t0, 1)
-    return {
+    result = {
         "status": "ok",
         "n": n,
         "loss": final_loss,
+        "val_loss": metrics.get("val_loss"),
+        "best_in_run": metrics.get("best_in_run"),
+        "new_best": metrics.get("new_best", False),
         "gpu_mem_mb": gpu_mem_mb,
         "elapsed_s": elapsed,
     }
+    _log_metrics({"phase": "continuous", **result})
+    return result

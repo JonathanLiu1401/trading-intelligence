@@ -68,6 +68,17 @@ USB_PATH = Path(os.environ.get("DIGITAL_INTERN_USB", "/media/zeph/projects/digit
 LOCAL_PATH = Path(__file__).resolve().parent.parent / "data"
 RETENTION_DAYS = 90
 
+# SQL fragment used to exclude synthetic / historical training data from the
+# live news pipeline. Backtest replays and Opus annotation runs insert rows
+# with ``backtest://`` URLs and ``backtest_*`` / ``opus_annotation*`` source
+# tags; these are valid for training but must never be re-scored, re-alerted,
+# or surfaced in heartbeat briefings as breaking news.
+_LIVE_ONLY_CLAUSE = (
+    "url NOT LIKE 'backtest://%' "
+    "AND source NOT LIKE 'backtest_%' "
+    "AND source NOT LIKE 'opus_annotation%'"
+)
+
 # Global non-reentrant inference lock — prevents two callers running
 # score_pending() concurrently. Non-blocking acquire so concurrent
 # callers no-op rather than queue.
@@ -272,10 +283,15 @@ class ArticleStore:
         ]
 
     def get_unscored(self, limit: int = 500, min_kw: float = 0.5) -> list:
-        """Get articles that haven't been AI-scored yet."""
+        """Get articles that haven't been AI-scored yet.
+
+        Excludes backtest replays and Opus annotation rows — those are training
+        artefacts, not live news, and must not enter the live scoring path.
+        """
         cur = self.conn.execute(
             "SELECT id, url, title, source, full_text FROM articles "
-            "WHERE ai_score=0 AND kw_score>=? ORDER BY kw_score DESC LIMIT ?",
+            f"WHERE ai_score=0 AND kw_score>=? AND {_LIVE_ONLY_CLAUSE} "
+            "ORDER BY kw_score DESC LIMIT ?",
             (min_kw, limit),
         )
         rows = cur.fetchall()
@@ -338,7 +354,8 @@ class ArticleStore:
         """Get articles scored urgent but not yet alerted."""
         cur = self.conn.execute(
             "SELECT id, url, title, source, ai_score FROM articles "
-            "WHERE urgency=1 ORDER BY ai_score DESC"
+            f"WHERE urgency=1 AND {_LIVE_ONLY_CLAUSE} "
+            "ORDER BY ai_score DESC"
         )
         rows = cur.fetchall()
         return [{"_id": r[0], "link": r[1], "title": r[2], "source": r[3], "ai_score": r[4]}
@@ -368,6 +385,7 @@ class ArticleStore:
             "time_sensitivity FROM articles "
             "WHERE first_seen >= ? "
             "AND (published IS NULL OR published = '' OR published >= ?) "
+            f"AND {_LIVE_ONLY_CLAUSE} "
             "ORDER BY ai_score DESC, kw_score DESC LIMIT ?",
             (since, pub_cutoff, limit),
         )

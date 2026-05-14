@@ -39,6 +39,9 @@ Urgent articles detected:
 Output ONLY the alert message."""
 
 
+ALERT_BATCH_SIZE = 5
+
+
 def send_urgent_alert(urgent_articles: list, store) -> bool:
     if not urgent_articles:
         return False
@@ -46,9 +49,13 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         print("[alert] No DISCORD_WEBHOOK_URL — skipping")
         return False
 
+    # Only the first ALERT_BATCH_SIZE feed the prompt — and only those get
+    # marked alerted. Marking the entire urgent list would silently drop the
+    # tail (it'd never be picked up on the next cycle), so we cap both ends.
+    batch = urgent_articles[:ALERT_BATCH_SIZE]
     articles_text = "\n".join(
         f"[score={a['ai_score']:.0f}] {a['title']}\nsource: {a['source']}\nurl: {a['link']}"
-        for a in urgent_articles[:5]
+        for a in batch
     )
 
     now_utc = datetime.now(timezone.utc).strftime("%H:%M")
@@ -65,9 +72,11 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         ok = discord_send(message, is_alert=True)
 
         if ok:
-            for art in urgent_articles:
+            for art in batch:
                 store.mark_alerted(art["_id"])
-            print(f"[alert] BN alert sent ({len(urgent_articles)} articles)")
+            tail = len(urgent_articles) - len(batch)
+            tail_note = f" ({tail} more queued)" if tail > 0 else ""
+            print(f"[alert] BN alert sent ({len(batch)} articles){tail_note}")
         else:
             print(f"[alert] Discord POST failed")
         return ok

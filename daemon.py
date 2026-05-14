@@ -450,6 +450,7 @@ def web_worker(store: ArticleStore):
                 source_health.record_result("web", len(articles))
             except Exception as he:
                 log.warning(f"[web_worker] source_health error: {he}")
+            _worker_last_ok["web"] = time.time()
             bo.reset()
         except Exception as e:
             log.warning(f"[web_worker] error: {e}; backing off {bo.peek():.0f}s")
@@ -470,6 +471,7 @@ def reddit_worker(store: ArticleStore):
                 source_health.record_result("reddit", len(articles))
             except Exception as he:
                 log.warning(f"[reddit_worker] source_health error: {he}")
+            _worker_last_ok["reddit"] = time.time()
             bo.reset()
         except Exception as e:
             log.warning(f"[reddit_worker] error: {e}; backing off {bo.peek():.0f}s")
@@ -486,6 +488,7 @@ def ticker_worker(store: ArticleStore):
         try:
             articles = collect_ticker_news()
             _ingest(store, articles, "ticker")
+            _worker_last_ok["ticker"] = time.time()
             bo.reset()
         except Exception as e:
             log.warning(f"[ticker_worker] error: {e}; backing off {bo.peek():.0f}s")
@@ -974,7 +977,6 @@ def scorer_worker(store: ArticleStore):
                 store.update_ai_scores_batch(batch)
             llm_used = 0
             if llm_candidates:
-                from watchers.urgency_scorer import score_batch
                 llm_used = score_batch(llm_candidates, store)
             with _store_lock:
                 remaining = len(store.get_unscored(limit=10000, min_kw=0.0))
@@ -1050,8 +1052,11 @@ def ml_trainer_worker(store: ArticleStore):
         try:
             log.info("[ml_trainer] Retraining on accumulated labels...")
             metrics = ml_train(store)
+            val = metrics.get("val_loss")
+            val_str = f"{val:.4f}" if isinstance(val, (int, float)) else "n/a"
             log.info(f"[ml_trainer] Retrain: n={metrics.get('n')} "
                      f"loss={metrics.get('final_loss', 0):.4f} "
+                     f"val_loss={val_str} "
                      f"elapsed={metrics.get('elapsed_s', 0):.0f}s")
             record_metric("ml.train.loss", metrics.get("final_loss", 0),
                           {"n": metrics.get("n", 0), "phase": "retrain"})
@@ -1074,11 +1079,17 @@ def continuous_trainer_worker(store: ArticleStore):
             else:
                 loss = metrics.get("loss")
                 loss_str = f"{loss:.4f}" if loss is not None else "n/a"
+                val = metrics.get("val_loss")
+                val_str = f"{val:.4f}" if isinstance(val, (int, float)) else "n/a"
+                best_tag = " new_best" if metrics.get("new_best") else ""
                 log.info(f"[continuous_trainer] n={metrics.get('n')} "
-                         f"loss={loss_str} "
+                         f"loss={loss_str} val_loss={val_str}{best_tag} "
                          f"gpu_mem_mb={metrics.get('gpu_mem_mb')} "
                          f"elapsed_s={metrics.get('elapsed_s')}")
-                _worker_last_ok["continuous_trainer"] = time.time()
+            # A skipped pass (busy trainer / too few samples) is still a healthy
+            # heartbeat — without this ping, quiet-data periods would flap the
+            # worker into a stale state.
+            _worker_last_ok["continuous_trainer"] = time.time()
         except MemoryError:
             _handle_memory_error("continuous_trainer")
         except Exception as e:
@@ -1219,17 +1230,22 @@ def heartbeat_worker(store: ArticleStore):
 # ── Worker W9: Purge old data every 6h ──────────────────────────────────────
 def purge_worker(store: ArticleStore):
     log.info("[purge_worker] started")
-    _last_ping = 0.0
+    # Pin liveness independently of the 6h purge cadence so the health
+    # snapshot doesn't mark this worker stale between fires. Without this
+    # split, ``min(PURGE_INTERVAL, 300)`` was capping the loop at 5 min and
+    # firing ``purge_old`` 72× more often than intended.
+    last_purge = time.time()
     while _running:
-        if time.time() - _last_ping >= 300:
-            log.debug("[purge] alive")
-            _last_ping = time.time()
-        _sleep(min(PURGE_INTERVAL, 300))
+        _worker_last_ok["purge"] = time.time()
+        _sleep(300)
+        if time.time() - last_purge < PURGE_INTERVAL:
+            continue
         try:
             with _store_lock:
                 store.purge_old()
             stats = store.stats()
             log.info(f"[purge] DB: {stats['total']} articles, {stats['db_mb']}MB")
+            last_purge = time.time()
             _worker_last_ok["purge"] = time.time()
         except Exception as e:
             log.warning(f"[purge_worker] error: {e}")
@@ -1263,6 +1279,7 @@ def stats_worker(store: ArticleStore):
                          f"db={s['db_mb']}MB{gpu_info}")
                 last_sig = sig
                 last_emit = now
+            _worker_last_ok["stats"] = now
         except Exception:
             pass
 

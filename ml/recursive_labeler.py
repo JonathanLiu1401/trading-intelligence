@@ -140,12 +140,19 @@ def _apply_labels(store, articles: list[dict], labels: list[dict]) -> int:
 
 
 def _fetch_round1_candidates(store, limit: int) -> list[dict]:
-    """Oldest unlabeled / weakly-labeled articles. Returns dicts ready for prompting."""
+    """Oldest unlabeled / weakly-labeled articles. Returns dicts ready for prompting.
+
+    Excludes backtest replays and Opus annotation rows — those carry historical
+    labels from offline runs and must not be re-scored against the live model.
+    """
     from storage.article_store import decompress
     cur = store.conn.execute(
         "SELECT id, url, title, source, full_text, ai_score "
         "FROM articles "
-        "WHERE ai_score = 0 OR ai_score < 2.0 "
+        "WHERE ai_score < 2.0 "
+        "AND url NOT LIKE 'backtest://%' "
+        "AND source NOT LIKE 'backtest_%' "
+        "AND source NOT LIKE 'opus_annotation%' "
         "ORDER BY first_seen ASC "
         "LIMIT ?",
         (limit,),

@@ -130,14 +130,16 @@ class ArticleNet:
 
     # ── persistence ─────────────────────────────────────────────────────────
     def _load(self):
-        """Prefer best_model.pt on USB; fall back to local checkpoint."""
-        for path in (BEST_MODEL_PATH, CHECKPOINT_PATH):
+        """Prefer best_model.pt on USB, then local best_model.pt, then last checkpoint."""
+        local_best = MODEL_DIR / "best_model.pt"
+        for path in (BEST_MODEL_PATH, local_best, CHECKPOINT_PATH):
             if not path.exists():
                 continue
             try:
                 ckpt = torch.load(path, map_location=self.device, weights_only=False)
                 state = ckpt.get("state_dict", ckpt)
-                self._input_dim = ckpt.get("input_dim", INPUT_DIM)
+                ckpt_dim = ckpt.get("input_dim", INPUT_DIM)
+                self._input_dim = ckpt_dim
                 if self._input_dim != INPUT_DIM:
                     self.net = ArticleNetModule(input_dim=self._input_dim).to(self.device)
                 # New 3-head module is incompatible with old 2-head checkpoints.
@@ -150,7 +152,16 @@ class ArticleNet:
                     self._fitted = False
                 else:
                     self._fitted = True
-                self._best_val_loss = ckpt.get("best_val_loss", float("inf"))
+                ckpt_best = ckpt.get("best_val_loss", float("inf"))
+                # A "best_val_loss" recorded against a tiny/broken feature space
+                # (vocab=3 → 18-dim input) is incomparable to the live feature
+                # space; clear it so refits aren't locked out of the best slot.
+                if ckpt_dim < 100:
+                    print(f"[ml:model] Ignoring legacy best_val_loss={ckpt_best:.4f} "
+                          f"from {ckpt_dim}-dim checkpoint — resetting to inf")
+                    self._best_val_loss = float("inf")
+                else:
+                    self._best_val_loss = ckpt_best
                 print(f"[ml:model] Loaded model from {path} "
                       f"(device={self.device}, input_dim={self._input_dim}, "
                       f"best_val_loss={self._best_val_loss:.4f})")
@@ -166,6 +177,29 @@ class ArticleNet:
             "input_dim": self._input_dim,
             "best_val_loss": self._best_val_loss,
         }, CHECKPOINT_PATH)
+
+    def _save_best_local(self, val_loss: float, metrics: dict) -> bool:
+        """Save weights to a local best_model.pt when val_loss improves.
+
+        Independent of USB availability so that "best" tracking works on hosts
+        where DIGITAL_INTERN_USB isn't mounted. Returns True if this run was a
+        new best."""
+        local_best = MODEL_DIR / "best_model.pt"
+        improved = val_loss < self._best_val_loss
+        if improved:
+            self._best_val_loss = val_loss
+            try:
+                torch.save({
+                    "state_dict": self.net.state_dict(),
+                    "input_dim": self._input_dim,
+                    "best_val_loss": self._best_val_loss,
+                    "metrics": metrics,
+                    "saved_at": time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
+                }, local_best)
+                print(f"[ml:model] New local best: val_loss={val_loss:.4f} → {local_best}")
+            except Exception as e:
+                print(f"[ml:model] Local best save failed: {e}")
+        return improved
 
     def _save_versioned(self, val_loss: float, metrics: dict) -> None:
         """Save a timestamped snapshot to USB; rotate to last MAX_CHECKPOINTS."""
@@ -207,7 +241,7 @@ class ArticleNet:
     def fit(self, X: np.ndarray, y_rel: np.ndarray, y_urg: np.ndarray,
             y_time: np.ndarray | None = None,
             epochs: int = 100, batch_size: int = 256, lr: float = 1e-3,
-            verbose: bool = True) -> dict:
+            verbose: bool = True, warm: bool | None = None) -> dict:
         """Multi-task GPU training. Returns metrics dict.
 
         ``y_rel`` is a 0..10 relevance score; ``y_urg`` is a 0..10 urgency
@@ -220,6 +254,19 @@ class ArticleNet:
             self._input_dim = dim
             self.net = ArticleNetModule(input_dim=dim).to(self.device)
             self._fitted = False
+            # Old best_val_loss was measured in a different feature space (e.g.
+            # tiny 18-dim TF-IDF). Keeping it here would block local/best-model
+            # promotion forever once the embedder refits to a real vocab.
+            self._best_val_loss = float("inf")
+
+        # Warm-start LR: an already-fitted model that's near a minimum gets
+        # blown off the basin if we restart Adam at LR=1e-3 every cycle. Drop
+        # to a fine-tune LR for subsequent fits so cross-run val_loss actually
+        # trends down instead of oscillating. Caller can override with warm=False.
+        if warm is None:
+            warm = self._fitted
+        if warm:
+            lr = min(lr, 1e-4)
 
         X_t      = torch.as_tensor(X, dtype=torch.float32)
         rel_t    = torch.as_tensor(y_rel, dtype=torch.float32)
@@ -237,8 +284,12 @@ class ArticleNet:
 
         # Hold out 10% for validation when we have enough samples to make it
         # meaningful (>= 100). Otherwise train on everything.
+        # Use a deterministic permutation so val_loss is comparable across
+        # successive fits on the same dataset (random splits made the metric
+        # noisy enough to mask real progress).
         if n >= 100:
-            perm = torch.randperm(n)
+            gen = torch.Generator().manual_seed(0xA17C1E)
+            perm = torch.randperm(n, generator=gen)
             n_val = max(10, n // 10)
             val_idx = perm[:n_val]
             tr_idx  = perm[n_val:]
@@ -268,6 +319,28 @@ class ArticleNet:
 
         self.net.train()
         final_loss = float("nan")
+        # Track best in-run state by validation loss (or train loss if no val).
+        # We restore this before save() so a noisy late epoch can't overwrite a
+        # good earlier checkpoint — this is what stops cross-run val_loss from
+        # trending downward.
+        best_in_run = float("inf")
+        best_state = None
+        def _eval_val_loss() -> float:
+            if X_val is None:
+                return float("inf")
+            self.net.eval()
+            with torch.no_grad():
+                xb = X_val.to(self.device)
+                rb = rel_val.to(self.device)
+                ub = urg_val.to(self.device)
+                rel_p, urg_p, _, _ = self.net(xb)
+                v_rel = F.mse_loss(rel_p.squeeze(-1), rb).item()
+                v_urg = F.binary_cross_entropy(
+                    urg_p.squeeze(-1).clamp(1e-6, 1 - 1e-6), ub
+                ).item()
+            self.net.train()
+            return v_rel + 0.5 * v_urg
+
         for epoch in range(epochs):
             epoch_loss = 0.0
             n_batches = 0
@@ -304,6 +377,17 @@ class ArticleNet:
             sched.step()
             final_loss = epoch_loss / max(n_batches, 1)
 
+            # Best-epoch tracking — cheap val pass every few epochs.
+            check_every = max(1, epochs // 20)
+            if X_val is not None and ((epoch + 1) % check_every == 0 or epoch == epochs - 1):
+                vl = _eval_val_loss()
+                if vl < best_in_run:
+                    best_in_run = vl
+                    best_state = {k: v.detach().clone() for k, v in self.net.state_dict().items()}
+            elif X_val is None and final_loss < best_in_run:
+                best_in_run = final_loss
+                best_state = {k: v.detach().clone() for k, v in self.net.state_dict().items()}
+
             if verbose and (epoch == 0 or (epoch + 1) % 10 == 0 or epoch == epochs - 1):
                 gpu_mem = ""
                 if self.device.type == "cuda":
@@ -313,10 +397,15 @@ class ArticleNet:
                 print(f"[ml:model] epoch {epoch+1:>3}/{epochs} "
                       f"loss={final_loss:.4f} lr={sched.get_last_lr()[0]:.2e}{gpu_mem}")
 
+        # Restore best-epoch weights so we save the best, not the last.
+        # Without this, late-epoch noise can overwrite a strictly-better earlier
+        # state — the main reason cross-run val_loss appeared flat.
+        if best_state is not None:
+            self.net.load_state_dict(best_state)
         self.net.eval()
         self._fitted = True
 
-        # Validation pass
+        # Validation pass (on restored best weights)
         val_loss = final_loss
         if X_val is not None:
             with torch.no_grad():
@@ -334,11 +423,16 @@ class ArticleNet:
         metrics = {
             "final_loss": round(final_loss, 4),
             "val_loss":   round(val_loss, 4),
+            "best_in_run": round(best_in_run, 4) if best_in_run != float("inf") else None,
             "epochs": epochs,
             "samples": n,
             "elapsed_s": round(elapsed, 1),
             "device": str(self.device),
+            "warm": warm,
+            "lr": lr,
         }
+        improved_best = self._save_best_local(val_loss, metrics)
+        metrics["new_best"] = improved_best
         self.save()
         self._save_versioned(val_loss, metrics)
         print(f"[ml:model] Trained {epochs} epochs on {n} samples in {elapsed:.1f}s "
