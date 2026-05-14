@@ -30,16 +30,27 @@ _PORTFOLIO_TICKER_RE = re.compile(
 PORTFOLIO = PORTFOLIO_TICKERS | PORTFOLIO_NAMES
 
 # ── Keyword tiers ────────────────────────────────────────────────────────────
-TIER_PORTFOLIO = {  # 4 pts each — direct portfolio/focus names
+# Phrase terms — safe substring matches (unique enough not to false-positive).
+TIER_PORTFOLIO_PHRASES = {  # 4 pts each — direct portfolio/focus names
     "micron", "sk hynix", "kioxia", "western digital", "lumentum", "tower semi",
-    " mu ", "wdc ", "stx ", "lrcx", "amat ", "klac", "axti", "orcl", "qbts",
     "dram asp", "nand pricing", "hbm3", "hbm2e", "lpddr5",
     "memory pricing", "dram supply", "nand oversupply",
 }
-TIER_MEMORY = {  # 3 pts each
+# Bare tickers — must match on word boundaries; substring matching produced
+# false positives ("mu"→"museum") and false negatives ("MU." at end of string
+# was missed by the old " mu " space-padded hack).
+TIER_PORTFOLIO_TICKERS = {"mu", "wdc", "stx", "lrcx", "amat", "klac", "axti", "orcl", "qbts"}
+_TIER_PORTFOLIO_TICKER_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(t) for t in TIER_PORTFOLIO_TICKERS) + r")\b",
+    re.I,
+)
+# Back-compat: legacy callers may import TIER_PORTFOLIO as a flat set.
+TIER_PORTFOLIO = TIER_PORTFOLIO_PHRASES | TIER_PORTFOLIO_TICKERS
+
+TIER_MEMORY = {  # 3 pts each — kioxia intentionally NOT here (already in TIER_PORTFOLIO)
     "dram", "nand", "hbm", "lpddr", "memory chip", "flash storage",
     "wafer start", "bit growth", "capex intensity", "memory maker",
-    "samsung memory", "samsung semiconductor", "kioxia",
+    "samsung memory", "samsung semiconductor",
 }
 TIER_SEMIS = {  # 2 pts each
     "semiconductor", "chip", "asml", "nvidia", "tsmc", "amd", "intel",
@@ -82,7 +93,7 @@ EVENT_PATTERNS = [
     (re.compile(r"\b(q[1-4] \d{4}|quarterly) (result|earning|revenue|profit)", re.I), 1.8, "earnings"),
     (re.compile(r"\b(beat|miss|exceed|below).{0,20}(estimate|expect|consensus|forecast)\b", re.I), 2.0, "earnings"),
     # Guidance
-    (re.compile(r"\b(raise|raise|cut|lower|withdraw).{0,20}(guidance|outlook|forecast)\b", re.I), 2.3, "guidance"),
+    (re.compile(r"\b(raise|cut|lower|withdraw|reaffirm).{0,20}(guidance|outlook|forecast)\b", re.I), 2.3, "guidance"),
     (re.compile(r"\b(above|below).{0,20}(consensus|street|estimate)\b", re.I), 1.9, "guidance"),
     # Analyst ratings
     (re.compile(r"\b(upgrade|downgrade).{0,30}(buy|sell|hold|neutral|outperform|underperform)\b", re.I), 2.2, "rating"),
@@ -183,9 +194,13 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
 
     # Keyword score
     kw = 0.0
-    for term in TIER_PORTFOLIO:
+    for term in TIER_PORTFOLIO_PHRASES:
         if term in text:
             kw += 4.0
+    # Bare tickers: count each unique ticker match once with word boundaries.
+    for _ in _TIER_PORTFOLIO_TICKER_RE.findall(text):
+        kw += 4.0
+        break  # one boost per article, mirroring prior single-add semantics
     for term in TIER_MEMORY:
         if term in text:
             kw += 3.0
