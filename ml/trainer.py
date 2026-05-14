@@ -208,6 +208,13 @@ def _fetch_training_data(
     light dicts (title/summary/source/published) parallel to ``texts``, used by
     ml/features.py to produce the extra numeric feature columns.
     ``source`` ∈ {"strong","weak","mixed","briefing_only"}.
+
+    Only LLM-sourced labels are pulled as "strong" — we explicitly exclude rows
+    whose score_source is 'ml' (model self-predictions) to prevent the trainer
+    from learning its own outputs. Rows predating the score_source migration are
+    distinguished by ai_score being integer-valued (Sonnet returns int score;
+    recursive_labeler does int*2.0 → still integer; briefing_boost legacy rows
+    are at most a few hundred and have negligible noise impact).
     """
     from storage.article_store import decompress
 
@@ -216,10 +223,14 @@ def _fetch_training_data(
     rels, urgs = [], []
     source = "strong"
 
-    # Strong labels: Sonnet ai_score
+    # Strong labels: ground-truth LLM-sourced ai_score only.
     cur = store.conn.execute(
         "SELECT title, full_text, ai_score, source, published "
-        "FROM articles WHERE ai_score > 0 ORDER BY first_seen DESC LIMIT 15000"
+        "FROM articles "
+        "WHERE ai_score > 0 "
+        "  AND (score_source IN ('llm','briefing_boost') "
+        "       OR (score_source IS NULL AND ai_score = CAST(ai_score AS INTEGER))) "
+        "ORDER BY first_seen DESC LIMIT 15000"
     )
     for title, blob, ai, src, published in cur.fetchall():
         summary = decompress(blob) if blob else ""
@@ -233,23 +244,37 @@ def _fetch_training_data(
 
     n_strong = len(texts)
 
-    # Bootstrap with weak labels when strong labels are sparse
-    if n_strong < MIN_TRAIN_SAMPLES:
-        cur2 = store.conn.execute(
-            "SELECT title, full_text, kw_score, source, published "
-            "FROM articles WHERE ai_score = 0 AND kw_score > 0 "
-            "ORDER BY kw_score DESC LIMIT 8000"
-        )
-        for title, blob, kw, src, published in cur2.fetchall():
-            summary = decompress(blob) if blob else ""
-            texts.append(f"{title} {summary}")
-            articles.append({
-                "title": title or "", "summary": summary,
-                "source": src or "", "published": published or "",
-            })
-            rels.append(float(kw))
-            urgs.append(0.0)
-        source = "weak" if n_strong == 0 else "mixed"
+    # Always mix in kw_score-labeled articles that lack an LLM label. The LLM
+    # corpus is heavily clustered (most rows score 3-5); kw_score has much
+    # higher variance (std≈3.3) and provides the signal the model needs to
+    # learn discriminative features. We previously only mixed when strong
+    # labels were < MIN_TRAIN_SAMPLES, which meant the trainer saw a near-flat
+    # label distribution once Sonnet had labeled enough rows. Cap the kw pool
+    # so it doesn't overwhelm the high-quality LLM signal.
+    KW_MAX_FRACTION = 0.5
+    kw_cap = max(2000, int(n_strong * KW_MAX_FRACTION))
+    cur2 = store.conn.execute(
+        "SELECT title, full_text, kw_score, source, published "
+        "FROM articles WHERE ai_score = 0 AND kw_score > 0 "
+        "  AND (score_source IS NULL OR score_source = 'ml') "
+        "ORDER BY kw_score DESC LIMIT ?",
+        (kw_cap,),
+    )
+    n_kw_added = 0
+    for title, blob, kw, src, published in cur2.fetchall():
+        summary = decompress(blob) if blob else ""
+        texts.append(f"{title} {summary}")
+        articles.append({
+            "title": title or "", "summary": summary,
+            "source": src or "", "published": published or "",
+        })
+        rels.append(float(kw))
+        urgs.append(0.0)
+        n_kw_added += 1
+    if n_strong == 0 and n_kw_added > 0:
+        source = "weak"
+    elif n_kw_added > 0:
+        source = "mixed"
 
     # Opus briefing-derived positive labels — high signal quality.
     b_texts, b_articles, b_rels, b_urgs = _fetch_briefing_samples(store)
@@ -274,9 +299,20 @@ def train(store, force: bool = False) -> dict:
     if len(texts) < 30:
         return {"status": "skipped", "reason": "too_few_samples", "n": len(texts)}
 
+    # Label-variance sanity check — if std is near zero, the model literally
+    # cannot beat predicting the mean. Surface this in the log so flat val_loss
+    # gets attributed to the right cause (label collapse, not training bug).
+    rel_std = float(np.std(y_rel)) if len(y_rel) else 0.0
+    rel_mean = float(np.mean(y_rel)) if len(y_rel) else 0.0
+    mse_baseline = float(np.var(y_rel)) if len(y_rel) else 0.0
     print(f"[ml:trainer] Training on {len(texts)} samples "
           f"({int((y_rel > 0).sum())} labeled, {int((y_urg >= 8).sum())} urgent) "
           f"source={source}")
+    print(f"[ml:trainer] label stats: y_rel mean={rel_mean:.3f} std={rel_std:.3f} "
+          f"mse_floor(predict-mean)={mse_baseline:.3f}")
+    if rel_std < 0.5:
+        print("[ml:trainer] WARNING: label std < 0.5 — model has almost no "
+              "signal to learn; expect flat val_loss until labels diversify.")
 
     emb = get_embedder()
     if emb.should_refit(len(texts)):

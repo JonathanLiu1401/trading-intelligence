@@ -96,7 +96,9 @@ CREATE TABLE IF NOT EXISTS articles (
     full_text   BLOB,               -- zlib-compressed
     first_seen  TEXT NOT NULL,
     cycle       INTEGER DEFAULT 0,  -- collection cycle number
-    time_sensitivity REAL DEFAULT NULL  -- 0..1, ML-predicted recency decay rate (NULL until scored)
+    time_sensitivity REAL DEFAULT NULL, -- 0..1, ML-predicted recency decay rate (NULL until scored)
+    ml_score    REAL DEFAULT NULL,  -- model's own prediction (separate from ai_score to avoid training-feedback contamination)
+    score_source TEXT DEFAULT NULL  -- 'llm' (Sonnet/Opus ground truth), 'ml' (model), 'briefing_boost' (Opus curation nudge); NULL=unscored
 );
 CREATE INDEX IF NOT EXISTS idx_urgency   ON articles(urgency);
 CREATE INDEX IF NOT EXISTS idx_ai_score  ON articles(ai_score DESC);
@@ -179,6 +181,65 @@ class ArticleStore:
                     # Race with another process — column may already exist.
                     if "duplicate column" not in str(e).lower():
                         raise
+            if "ml_score" not in cols:
+                try:
+                    self.conn.execute(
+                        "ALTER TABLE articles ADD COLUMN ml_score REAL DEFAULT NULL"
+                    )
+                    self.conn.commit()
+                    _log.info("[article_store] migration: added articles.ml_score column")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+            if "score_source" not in cols:
+                try:
+                    self.conn.execute(
+                        "ALTER TABLE articles ADD COLUMN score_source TEXT DEFAULT NULL"
+                    )
+                    self.conn.commit()
+                    _log.info("[article_store] migration: added articles.score_source column")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+            # One-time cleanup of training-label contamination: model predictions
+            # that were written into ai_score (the column the trainer reads as
+            # ground truth) created a feedback loop where the model trained on
+            # its own outputs. Heuristic: real LLM labels are integer-valued
+            # (Sonnet returns int "score"; recursive_labeler does int*2.0 → still
+            # integer). Anything else in ai_score is a model output. We move it
+            # to ml_score, tag score_source='ml', and zero ai_score so those
+            # articles get re-routed through Sonnet via get_unscored().
+            try:
+                # Only run when score_source has never been populated (first
+                # migration pass) — guarded by checking for any NULL rows that
+                # also have a non-integer ai_score.
+                needs_cleanup = self.conn.execute(
+                    "SELECT COUNT(*) FROM articles "
+                    "WHERE score_source IS NULL AND ai_score > 0 "
+                    "AND ai_score != CAST(ai_score AS INTEGER) LIMIT 1"
+                ).fetchone()[0]
+                if needs_cleanup:
+                    # Move suspected-model values into ml_score for visibility.
+                    self.conn.execute(
+                        "UPDATE articles SET ml_score = ai_score, "
+                        "ai_score = 0, score_source = 'ml' "
+                        "WHERE score_source IS NULL AND ai_score > 0 "
+                        "AND ai_score != CAST(ai_score AS INTEGER)"
+                    )
+                    n_cleaned = self.conn.execute("SELECT changes()").fetchone()[0]
+                    # Mark surviving integer-valued ai_score rows as LLM source.
+                    self.conn.execute(
+                        "UPDATE articles SET score_source = 'llm' "
+                        "WHERE score_source IS NULL AND ai_score > 0 "
+                        "AND ai_score = CAST(ai_score AS INTEGER)"
+                    )
+                    self.conn.commit()
+                    _log.info(
+                        f"[article_store] migration: cleaned {n_cleaned} contaminated "
+                        f"ai_score rows (moved to ml_score, ai_score=0 for re-labeling)"
+                    )
+            except sqlite3.OperationalError as e:
+                _log.warning(f"[article_store] label-cleanup migration skipped: {e}")
 
     @_retry_on_lock
     def insert_batch(self, articles: list, cycle: int = 0) -> int:
@@ -208,19 +269,44 @@ class ArticleStore:
 
     @_retry_on_lock
     def update_ai_score(self, aid: str, score: float, urgency: int = 0):
+        """Write an LLM (Sonnet/Opus) relevance label. Tags score_source='llm'
+        so the trainer treats it as ground truth."""
         with self._write_lock:
             self.conn.execute(
-                "UPDATE articles SET ai_score=?, urgency=MAX(urgency,?) WHERE id=?",
+                "UPDATE articles SET ai_score=?, urgency=MAX(urgency,?), "
+                "score_source='llm' WHERE id=?",
                 (score, urgency, aid),
             )
             self.conn.commit()
 
     @_retry_on_lock
     def update_ai_scores_batch(self, updates: list[tuple[str, float, int]]):
-        """Bulk update: updates is list of (aid, score, urgency). Single transaction."""
+        """Bulk update for LLM labels: updates is list of (aid, score, urgency).
+        Single transaction. Tags score_source='llm' so the trainer treats these
+        as ground-truth labels (not model self-predictions)."""
         with self._write_lock:
             self.conn.executemany(
-                "UPDATE articles SET ai_score=?, urgency=MAX(urgency,?) WHERE id=?",
+                "UPDATE articles SET ai_score=?, urgency=MAX(urgency,?), "
+                "score_source='llm' WHERE id=?",
+                [(score, urgency, aid) for aid, score, urgency in updates],
+            )
+            self.conn.commit()
+
+    @_retry_on_lock
+    def update_ml_scores_batch(self, updates: list[tuple[str, float, int]]):
+        """Bulk-write the *model's* own predictions to ml_score (NOT ai_score).
+        ``updates`` is a list of (aid, relevance_score, urgency_flag).
+
+        Keeping model output out of ai_score is what prevents the training-label
+        feedback loop — the trainer reads ai_score (LLM labels only). Urgent
+        items still bump urgency so the alerting path keeps working. Readers
+        that want a unified score should COALESCE(NULLIF(ai_score,0), ml_score)."""
+        if not updates:
+            return
+        with self._write_lock:
+            self.conn.executemany(
+                "UPDATE articles SET ml_score=?, urgency=MAX(urgency,?), "
+                "score_source=COALESCE(score_source, 'ml') WHERE id=?",
                 [(score, urgency, aid) for aid, score, urgency in updates],
             )
             self.conn.commit()
@@ -253,7 +339,9 @@ class ArticleStore:
         placeholders = ",".join("?" * len(urls))
         with self._write_lock:
             cur = self.conn.execute(
-                f"UPDATE articles SET ai_score = MIN(5.0, ai_score + 0.3) "
+                f"UPDATE articles SET ai_score = MIN(5.0, ai_score + 0.3), "
+                f"score_source = CASE WHEN score_source='llm' THEN 'llm' "
+                f"ELSE 'briefing_boost' END "
                 f"WHERE url IN ({placeholders})",
                 urls,
             )
@@ -342,7 +430,9 @@ class ArticleStore:
                     # the entire remaining backlog is uncertain). Stop —
                     # otherwise we'd re-fetch the same rows forever.
                     break
-                self.update_ai_scores_batch(updates)
+                # Write model predictions to ml_score (NOT ai_score) so the
+                # trainer doesn't ingest its own outputs as ground-truth labels.
+                self.update_ml_scores_batch(updates)
                 total += len(updates)
                 if total // 1000 != (total - len(updates)) // 1000:
                     print(f"[score_pending] {total} scored so far...")

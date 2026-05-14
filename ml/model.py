@@ -22,6 +22,7 @@ Checkpoints:
   - <USB>/ml_checkpoints/       — versioned snapshots, last 10 kept
   - <USB>/ml_checkpoints/best_model.pt — lowest validation loss across all runs
 """
+import logging
 import os
 import time
 import numpy as np
@@ -30,6 +31,15 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Route progress prints to the project logger so daemon.log shows training
+# progress without needing to scrape stdout. Falls back to root if the project
+# logger isn't installed in some scripts that import ml/model directly.
+try:
+    from core.logger import get_logger  # type: ignore
+    _log = get_logger("ml.model")
+except Exception:
+    _log = logging.getLogger("ml.model")
 
 MODEL_DIR = Path(os.environ.get("DIGITAL_INTERN_ML_DIR",
                                 Path(__file__).resolve().parent.parent / "data" / "ml"))
@@ -394,8 +404,21 @@ class ArticleNet:
                     mb = torch.cuda.memory_allocated(self.device) / (1024 * 1024)
                     peak = torch.cuda.max_memory_allocated(self.device) / (1024 * 1024)
                     gpu_mem = f" gpu_mem={mb:.0f}MB peak={peak:.0f}MB"
-                print(f"[ml:model] epoch {epoch+1:>3}/{epochs} "
-                      f"loss={final_loss:.4f} lr={sched.get_last_lr()[0]:.2e}{gpu_mem}")
+                # Compute current val_loss if we have a held-out set; reporting
+                # train+val side-by-side makes overfitting visible in the log.
+                vl_part = ""
+                if X_val is not None:
+                    vl_now = _eval_val_loss()
+                    vl_part = f" val={vl_now:.4f}"
+                msg = (f"[ml:model] epoch {epoch+1:>3}/{epochs} "
+                       f"loss={final_loss:.4f}{vl_part} "
+                       f"lr={sched.get_last_lr()[0]:.2e}{gpu_mem}")
+                print(msg)
+                # Mirror to the project logger so daemon.log captures progress.
+                try:
+                    _log.info(msg)
+                except Exception:
+                    pass
 
         # Restore best-epoch weights so we save the best, not the last.
         # Without this, late-epoch noise can overwrite a strictly-better earlier
