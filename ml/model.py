@@ -251,7 +251,8 @@ class ArticleNet:
     def fit(self, X: np.ndarray, y_rel: np.ndarray, y_urg: np.ndarray,
             y_time: np.ndarray | None = None,
             epochs: int = 100, batch_size: int = 256, lr: float = 1e-3,
-            verbose: bool = True, warm: bool | None = None) -> dict:
+            verbose: bool = True, warm: bool | None = None,
+            label_weight_exponent: float | None = None) -> dict:
         """Multi-task GPU training. Returns metrics dict.
 
         ``y_rel`` is a 0..10 relevance score; ``y_urg`` is a 0..10 urgency
@@ -281,6 +282,24 @@ class ArticleNet:
         X_t      = torch.as_tensor(X, dtype=torch.float32)
         rel_t    = torch.as_tensor(y_rel, dtype=torch.float32)
         urg_bin  = torch.as_tensor((y_urg >= 8.0).astype(np.float32), dtype=torch.float32)
+
+        # Per-sample loss weighting by label magnitude. Convex on (y_rel/10):
+        # exp=2 → score 10 weighted 25x stronger than score 2 (pre-norm). We
+        # normalize to mean=1 so loss scale (and effective LR) stay constant.
+        # exp=None or <=0 → uniform weights (back-compat with callers that
+        # don't pass the exponent).
+        if label_weight_exponent is not None and label_weight_exponent > 0:
+            w_np = np.power(np.clip(y_rel, 0.0, 10.0) / 10.0,
+                            float(label_weight_exponent)).astype(np.float32)
+            # Floor to avoid zero-weight rows (score=0 kw bootstrap samples
+            # would otherwise contribute nothing to gradients).
+            w_np = np.clip(w_np, 1e-3, None)
+            w_mean = float(w_np.mean()) if w_np.size else 1.0
+            if w_mean > 0:
+                w_np = w_np / w_mean
+        else:
+            w_np = np.ones_like(y_rel, dtype=np.float32)
+        weight_t = torch.as_tensor(w_np, dtype=torch.float32)
         # If caller didn't supply time_sensitivity labels, fall back to a neutral
         # 0.5 target with a near-zero loss weight (so we don't pull predictions
         # toward 0.5 when labels are absent — see ``time_loss_weight`` below).
@@ -307,13 +326,15 @@ class ArticleNet:
             rel_tr, rel_val = rel_t[tr_idx], rel_t[val_idx]
             urg_tr, urg_val = urg_bin[tr_idx], urg_bin[val_idx]
             time_tr, time_val = time_t[tr_idx], time_t[val_idx]
+            w_tr = weight_t[tr_idx]
         else:
             X_tr, X_val = X_t, None
             rel_tr, rel_val = rel_t, None
             urg_tr, urg_val = urg_bin, None
             time_tr, time_val = time_t, None
+            w_tr = weight_t
 
-        ds = torch.utils.data.TensorDataset(X_tr, rel_tr, urg_tr, time_tr)
+        ds = torch.utils.data.TensorDataset(X_tr, rel_tr, urg_tr, time_tr, w_tr)
         pin = (self.device.type == "cuda")
         # Singleton final batch breaks BatchNorm; LayerNorm handles N=1 fine,
         # but keep the guard to mirror the prior behavior.
@@ -354,11 +375,12 @@ class ArticleNet:
         for epoch in range(epochs):
             epoch_loss = 0.0
             n_batches = 0
-            for xb, rb, ub, tb in loader:
+            for xb, rb, ub, tb, wb in loader:
                 xb = xb.to(self.device, non_blocking=pin)
                 rb = rb.to(self.device, non_blocking=pin)
                 ub = ub.to(self.device, non_blocking=pin)
                 tb = tb.to(self.device, non_blocking=pin)
+                wb = wb.to(self.device, non_blocking=pin)
                 opt.zero_grad(set_to_none=True)
                 rel, urg, unc, tsens = self.net(xb)
                 rel = rel.squeeze(-1)
@@ -366,9 +388,14 @@ class ArticleNet:
                 unc = unc.squeeze(-1)
                 tsens = tsens.squeeze(-1)
 
-                rel_loss = F.mse_loss(rel, rb)
+                # Sample-weighted MSE/BCE: high-score articles dominate the
+                # gradient, mirroring the "200% trade trains harder than 150%"
+                # analogy. wb is pre-normalized to mean≈1 dataset-wide.
+                rel_loss = (F.mse_loss(rel, rb, reduction='none') * wb).mean()
                 # clamp keeps urg strictly within (eps, 1-eps) for BCE numerical safety
-                urg_loss = F.binary_cross_entropy(urg.clamp(1e-6, 1 - 1e-6), ub)
+                urg_loss = (F.binary_cross_entropy(
+                    urg.clamp(1e-6, 1 - 1e-6), ub, reduction='none'
+                ) * wb).mean()
                 # Train uncertainty to predict |error|/10 — aleatoric proxy.
                 with torch.no_grad():
                     unc_target = (rel.detach() - rb).abs().clamp(0, 10) / 10.0

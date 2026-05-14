@@ -1,138 +1,138 @@
 {
-  "as_of": "2026-05-14T05:30:17+00:00",
+  "as_of": "2026-05-14T20:17:11+00:00",
   "window_hours": 24,
   "tickers": {
-    "LITE": {
-      "count": 135,
+    "LNOK": {
+      "count": 9,
       "urgent_count": 0,
-      "avg_score": 3.44,
+      "avg_score": 4.05,
+      "max_score": 5.0
+    },
+    "NVDL": {
+      "count": 22,
+      "urgent_count": 0,
+      "avg_score": 3.6,
       "max_score": 7.0
     },
-    "LNOK": {
-      "count": 4,
-      "urgent_count": 0,
-      "avg_score": 3.09,
-      "max_score": 3.18
-    },
-    "MSFT": {
-      "count": 52,
-      "urgent_count": 0,
-      "avg_score": 3.37,
-      "max_score": 4.61
-    },
-    "MUU": {
-      "count": 15,
-      "urgent_count": 0,
-      "avg_score": 3.51,
-      "max_score": 4.48
-    },
-    "SNDU": {
-      "count": 7,
-      "urgent_count": 0,
-      "avg_score": 3.15,
-      "max_score": 3.31
-    },
-    "DRAM": {
-      "count": 152,
-      "urgent_count": 1,
-      "avg_score": 3.48,
+    "LITE": {
+      "count": 70,
+      "urgent_count": 2,
+      "avg_score": 4.24,
       "max_score": 9.0
     },
+    "MUU": {
+      "count": 31,
+      "urgent_count": 0,
+      "avg_score": 3.92,
+      "max_score": 6.0
+    },
+    "DRAM": {
+      "count": 81,
+      "urgent_count": 1,
+      "avg_score": 3.87,
+      "max_score": 8.0
+    },
     "LRCX": {
-      "count": 132,
+      "count": 66,
       "urgent_count": 0,
       "avg_score": 3.29,
       "max_score": 6.0
     },
     "AMAT": {
-      "count": 108,
+      "count": 117,
       "urgent_count": 0,
-      "avg_score": 3.27,
-      "max_score": 5.0
+      "avg_score": 2.93,
+      "max_score": 6.0
     },
     "KLAC": {
-      "count": 89,
-      "urgent_count": 0,
-      "avg_score": 3.27,
-      "max_score": 4.55
-    },
-    "NVDA": {
-      "count": 114,
-      "urgent_count": 0,
-      "avg_score": 3.34,
-      "max_score": 5.0
-    },
-    "AMD": {
-      "count": 383,
+      "count": 42,
       "urgent_count": 0,
       "avg_score": 3.35,
-      "max_score": 7.0
+      "max_score": 5.08
+    },
+    "NVDA": {
+      "count": 359,
+      "urgent_count": 2,
+      "avg_score": 3.21,
+      "max_score": 9.0
+    },
+    "AMD": {
+      "count": 447,
+      "urgent_count": 7,
+      "avg_score": 3.35,
+      "max_score": 9.0
     },
     "WDC": {
-      "count": 89,
+      "count": 57,
       "urgent_count": 0,
-      "avg_score": 3.42,
-      "max_score": 7.0
+      "avg_score": 3.15,
+      "max_score": 5.11
     },
     "STX": {
-      "count": 95,
+      "count": 71,
       "urgent_count": 0,
-      "avg_score": 3.32,
-      "max_score": 4.59
+      "avg_score": 3.41,
+      "max_score": 7.0
     },
     "SMH": {
-      "count": 41,
+      "count": 39,
       "urgent_count": 0,
-      "avg_score": 3.27,
-      "max_score": 4.32
+      "avg_score": 3.17,
+      "max_score": 4.59
     },
     "SOXX": {
-      "count": 36,
+      "count": 47,
       "urgent_count": 0,
-      "avg_score": 3.28,
-      "max_score": 4.55
+      "avg_score": 3.31,
+      "max_score": 5.0
     },
     "MU": {
-      "count": 238,
-      "urgent_count": 1,
-      "avg_score": 3.43,
+      "count": 229,
+      "urgent_count": 5,
+      "avg_score": 3.73,
       "max_score": 9.0
     },
     "AXTI": {
-      "count": 104,
+      "count": 39,
       "urgent_count": 1,
-      "avg_score": 3.47,
+      "avg_score": 4.1,
       "max_score": 8.0
     },
     "ASML": {
-      "count": 160,
-      "urgent_count": 0,
-      "avg_score": 3.32,
-      "max_score": 7.0
+      "count": 242,
+      "urgent_count": 1,
+      "avg_score": 3.28,
+      "max_score": 8.0
     },
     "TOELY": {
-      "count": 15,
+      "count": 0,
       "urgent_count": 0,
-      "avg_score": 3.6,
-      "max_score": 4.53
+      "avg_score": 0.0,
+      "max_score": 0.0
+    },
+    "MSFT": {
+      "count": 91,
+      "urgent_count": 0,
+      "avg_score": 3.33,
+      "max_score": 6.99
     },
     "ORCL": {
-      "count": 90,
+      "count": 51,
       "urgent_count": 0,
-      "avg_score": 3.32,
-      "max_score": 4.64
+      "avg_score": 3.75,
+      "max_score": 7.0
     },
     "TSEM": {
-      "count": 100,
-      "urgent_count": 0,
-      "avg_score": 3.35,
-      "max_score": 4.61
+      "count": 41,
+      "urgent_count": 4,
+      "avg_score": 3.72,
+      "max_score": 10.0
     },
     "QBTS": {
-      "count": 94,
-      "urgent_count": 1,
-      "avg_score": 3.48,
-      "max_score": 8.0
+      "count": 59,
+      "urgent_count": 0,
+      "avg_score": 3.34,
+      "max_score": 5.09
     }
   },
   "note": "avg_score is ai_score (Sonnet relevance/urgency, 0-10) \u2014 there is no dedicated sentiment model."

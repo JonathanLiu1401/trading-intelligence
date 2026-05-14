@@ -140,6 +140,14 @@ MIN_NEW_LABELS   = 50       # retrain if this many new LLM labels since last tra
 # 100 epochs per cycle for the deep multi-task net (RTX 3060 trains in <5s).
 EPOCHS_PER_CYCLE = 100
 BATCH_SIZE       = 256
+
+# Sample-weighting for label magnitude. Higher relevance scores train harder so
+# strong-signal articles (9-10 / "200% profit") dominate gradient updates over
+# borderline 5-6 noise. Convex exponent on (y_rel / 10):
+#   exp=2 → score 10 = w 1.0, score 5 = w 0.25, score 2 = w 0.04 (pre-normalize).
+# Weights are normalized to mean=1 inside ArticleNet.fit so the overall loss
+# scale (and therefore optimal LR) stays roughly invariant to label distribution.
+LABEL_WEIGHT_EXPONENT = 2.0
 # Cold-start LR for a fresh model. ArticleNet.fit auto-drops to 1e-4 once the
 # model is already fitted (warm fine-tune) — pumping LR back to 1e-3 every cycle
 # was kicking weights off the basin and producing the "no upward trend" symptom.
@@ -314,6 +322,18 @@ def train(store, force: bool = False) -> dict:
         print("[ml:trainer] WARNING: label std < 0.5 — model has almost no "
               "signal to learn; expect flat val_loss until labels diversify.")
 
+    # Preview the convex sample-weights (w = (y_rel / 10) ** EXP, normalized to
+    # mean=1 inside fit). Logging here makes label-imbalance visible per cycle.
+    _w_preview = np.power(np.clip(y_rel, 0, 10) / 10.0, LABEL_WEIGHT_EXPONENT)
+    _w_mean = float(_w_preview.mean()) if len(_w_preview) else 0.0
+    if _w_mean > 0:
+        _w_preview = _w_preview / _w_mean
+    print(f"[ml:trainer] sample weights (exp={LABEL_WEIGHT_EXPONENT}): "
+          f"min={float(_w_preview.min()):.3f} "
+          f"max={float(_w_preview.max()):.3f} "
+          f"mean={float(_w_preview.mean()):.3f} "
+          f"(higher-scoring articles train harder)")
+
     emb = get_embedder()
     if emb.should_refit(len(texts)):
         X_text = emb.fit_transform(texts)
@@ -334,6 +354,7 @@ def train(store, force: bool = False) -> dict:
             epochs=EPOCHS_PER_CYCLE,
             batch_size=BATCH_SIZE,
             lr=LEARNING_RATE,
+            label_weight_exponent=LABEL_WEIGHT_EXPONENT,
         )
 
     elapsed = time.time() - t0
@@ -450,7 +471,8 @@ def train_continuous(store) -> dict:
         # the model on cycle 1). Use a small LR so we don't undo progress.
         metrics = model.fit(X, y_rel, y_urg, y_time=y_time,
                             epochs=40, batch_size=512, lr=LEARNING_RATE_WARM,
-                            warm=True)
+                            warm=True,
+                            label_weight_exponent=LABEL_WEIGHT_EXPONENT)
     finally:
         _TRAIN_LOCK.release()
 
