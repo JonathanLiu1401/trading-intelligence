@@ -7,14 +7,21 @@ DISCORD_LIMIT = 2000
 
 
 def _chunk(text: str, limit: int = DISCORD_LIMIT):
+    """Split text into Discord-sized chunks.
+
+    Prefer splitting on newline, fall back to whitespace so we don't tear
+    a URL or word in half when long alert bodies have no line breaks.
+    """
     chunks = []
     remaining = text
     while len(remaining) > limit:
         split_at = remaining.rfind("\n", 0, limit)
         if split_at <= 0:
+            split_at = remaining.rfind(" ", 0, limit)
+        if split_at <= 0:
             split_at = limit
         chunks.append(remaining[:split_at])
-        remaining = remaining[split_at:].lstrip("\n")
+        remaining = remaining[split_at:].lstrip("\n ")
     if remaining:
         chunks.append(remaining)
     return chunks
