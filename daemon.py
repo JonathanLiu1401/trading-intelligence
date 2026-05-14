@@ -1124,6 +1124,7 @@ def alert_worker(store: ArticleStore):
             elif time.time() - _last_ping >= 300:
                 log.debug("[alert] idle — no urgent items")
                 _last_ping = time.time()
+            _worker_last_ok["alert"] = time.time()
         except Exception as e:
             log.warning(f"[alert_worker] error: {e}")
         _sleep(ALERT_CHECK)
@@ -1154,9 +1155,13 @@ def _extract_briefing_labels(briefing_text: str, articles: list) -> list[dict]:
 def heartbeat_worker(store: ArticleStore):
     log.info("[heartbeat_worker] started")
     last = time.time()  # wait full 5h interval before first briefing — don't fire on every restart
+    _worker_last_ok["heartbeat"] = time.time()
 
     while _running:
         now = time.time()
+        # Keep the worker visibly alive between the 5h fires so the dashboard
+        # health view doesn't tag it as stale on quiet days.
+        _worker_last_ok["heartbeat"] = now
         if now - last >= HEARTBEAT_INTERVAL:
             try:
                 log.info("[heartbeat] Generating Opus 4.7 briefing...")
@@ -1225,6 +1230,7 @@ def purge_worker(store: ArticleStore):
                 store.purge_old()
             stats = store.stats()
             log.info(f"[purge] DB: {stats['total']} articles, {stats['db_mb']}MB")
+            _worker_last_ok["purge"] = time.time()
         except Exception as e:
             log.warning(f"[purge_worker] error: {e}")
 
@@ -1302,37 +1308,44 @@ def _acquire_singleton_lock():
     causing the systemd-managed instance to log repeated port-busy warnings
     and never serve the dashboard. fcntl.flock on a pidfile gives us a
     kernel-enforced singleton that releases automatically on process exit.
+
+    The file is opened without O_TRUNC so a racing second daemon can still
+    read the holder's pid for the diagnostic log line. The previous "w" open
+    truncated the file before the flock check, wiping the holder pid the
+    moment a second instance tried to start.
     """
     import fcntl
     lock_path = BASE_DIR / "data" / "daemon.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "w")
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         try:
-            holder = lock_path.read_text().strip()
+            os.lseek(fd, 0, os.SEEK_SET)
+            holder = os.read(fd, 64).decode(errors="replace").strip() or "unknown"
         except Exception:
             holder = "unknown"
-        log.error(
+        finally:
+            os.close(fd)
+        log.warning(
             f"[daemon] Another daemon instance is already running (lock held by pid={holder}). "
-            f"Exiting to avoid port/db contention."
+            f"Exiting cleanly to avoid port/db contention."
         )
-        sys.exit(1)
-    fh.seek(0)
-    fh.truncate()
-    fh.write(str(os.getpid()))
-    fh.flush()
-    # Keep fh open for the process lifetime; the lock releases on exit.
-    globals()["_singleton_lock_fh"] = fh
+        sys.exit(0)
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
+    # Keep fd open for the process lifetime; the kernel releases the flock
+    # on the final close (i.e., process exit).
+    globals()["_singleton_lock_fd"] = fd
 
 
 def main():
+    _acquire_singleton_lock()
+
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info(" DIGITAL INTERN DAEMON — STARTING")
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-    _acquire_singleton_lock()
 
     store = ArticleStore()
     log.info(f"Store ready: {store.stats()}")
