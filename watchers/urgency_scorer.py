@@ -3,7 +3,6 @@ Urgency scorer — batches unscored articles to Claude Sonnet 4.6.
 Marks articles as urgent (score >= 8) for immediate alerting.
 """
 import json
-import re
 
 from core.claude_cli import claude_call
 
@@ -37,6 +36,23 @@ Articles:
 Respond ONLY with a JSON array: [{{"index": 0, "score": 9, "reason": "MU earnings beat"}}, ...]"""
 
 
+def _extract_json_array(raw: str):
+    """Robustly extract a top-level JSON array from a Sonnet response that may
+    be wrapped in prose. Tries json.JSONDecoder().raw_decode at each '[' until
+    one parses successfully. Returns the parsed list, or None on failure."""
+    decoder = json.JSONDecoder()
+    start = raw.find("[")
+    while start != -1:
+        try:
+            value, _ = decoder.raw_decode(raw[start:])
+            if isinstance(value, list):
+                return value
+        except ValueError:
+            pass
+        start = raw.find("[", start + 1)
+    return None
+
+
 def score_batch(articles: list, store) -> int:
     """Score a batch of articles; update store. Returns count of urgent items found."""
     if not articles:
@@ -54,11 +70,10 @@ def score_batch(articles: list, store) -> int:
         if raw is None:
             return 0
 
-        m = re.search(r"\[.*\]", raw, re.DOTALL)
-        if not m:
+        scores = _extract_json_array(raw)
+        if scores is None:
+            print(f"[urgency] Failed to parse JSON array from response: {raw[:200]!r}")
             return 0
-
-        scores = json.loads(m.group(0))
 
         urgent_count = 0
         for item in scores:
