@@ -1343,13 +1343,17 @@ def _acquire_singleton_lock():
             holder = os.read(fd, 64).decode(errors="replace").strip() or "unknown"
         except Exception:
             holder = "unknown"
-        finally:
-            os.close(fd)
         log.warning(
             f"[daemon] Another daemon instance is already running (lock held by pid={holder}). "
-            f"Exiting cleanly to avoid port/db contention."
+            f"Waiting for it to exit before taking over (no restart spam)."
         )
-        sys.exit(0)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except Exception as e:
+            os.close(fd)
+            log.error(f"[daemon] Blocking flock failed: {e}; exiting.")
+            sys.exit(1)
+        log.info(f"[daemon] Previous holder pid={holder} exited; this instance is now primary.")
     os.ftruncate(fd, 0)
     os.write(fd, str(os.getpid()).encode())
     # Keep fd open for the process lifetime; the kernel releases the flock
