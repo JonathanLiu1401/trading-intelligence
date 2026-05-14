@@ -12,10 +12,36 @@ Dimensions:
   5. Hard blacklist     — zero-score on irrelevant topics
   6. Portfolio boost    — direct ticker mentions get a flat boost
 """
+import math
 import re
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+
+
+# Short / ambiguous keyword tokens that need \b boundary matching to avoid
+# false positives (e.g. "intel" → "intelligence", "dram" → "dramatic",
+# "fab" → "fabric", "chip" → "chipotle", "gpu" → fine but kept here for
+# uniformity). Multi-word phrases are still matched as plain substrings
+# because they are unique enough on their own.
+_AMBIGUOUS_TOKENS = {
+    "dram", "nand", "hbm", "lpddr", "ddr5",
+    "chip", "asml", "nvidia", "tsmc", "amd", "intel", "qualcomm",
+    "marvell", "broadcom", "euv", "foundry", "fab", "packaging",
+    "gpu", "hpc", "umc",
+    "cpi", "pce", "gdp", "vix", "dxy", "ecb", "ipo", "fomc",
+    "nikkei", "kospi", "dax", "ftse",
+    "ethereum", "bitcoin",
+    "equity", "earnings", "revenue", "guidance", "buyback", "merger",
+    "acquisition",
+}
+
+
+def _term_matches(term: str, text: str) -> bool:
+    """Match phrase as substring; ambiguous short tokens require word boundaries."""
+    if term in _AMBIGUOUS_TOKENS:
+        return re.search(r"\b" + re.escape(term) + r"\b", text) is not None
+    return term in text
 
 # ── Portfolio tickers (direct mention = highest priority) ───────────────────
 # Short tickers must match as whole words (regex \b); naive substring match
@@ -180,7 +206,6 @@ def _recency_factor(published: str) -> float:
     if age_h < 0:
         age_h = 0
     # decay: e^(-0.06 * hours)
-    import math
     return max(0.1, math.exp(-0.06 * age_h))
 
 
@@ -237,16 +262,16 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
     if _TIER_PORTFOLIO_TICKER_RE.search(text):
         kw += 4.0
     for term in TIER_MEMORY:
-        if term in text:
+        if _term_matches(term, text):
             kw += 3.0
     for term in TIER_SEMIS:
-        if term in text:
+        if _term_matches(term, text):
             kw += 2.0
     for term in TIER_MACRO:
-        if term in text:
+        if _term_matches(term, text):
             kw += 1.5
     for term in TIER_GENERAL:
-        if term in text:
+        if _term_matches(term, text):
             kw += 0.5
 
     if kw == 0.0:
