@@ -811,19 +811,77 @@ def export_worker(store: ArticleStore):
 
 
 # ── Worker: Public Flask web server — bind 0.0.0.0:8080 ─────────────────────
-def web_server_worker(store: ArticleStore):
+def _port_is_free(host: str, port: int) -> bool:
     import socket as _sock
-    # Wait up to 30s for the port to be free before trying to bind.
-    # This prevents crash-loops when a duplicate daemon holds the port briefly.
-    for _attempt in range(6):
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    try:
+        s.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _describe_port_holder(port: int) -> str:
+    """Best-effort lookup of which PID/cmd is listening on `port`. Never raises."""
+    try:
+        import psutil
         try:
-            s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-            s.bind((WEB_SERVER_HOST, WEB_SERVER_PORT))
-            s.close()
+            conns = psutil.net_connections(kind="inet")
+        except (psutil.AccessDenied, PermissionError):
+            return "holder=unknown (psutil access denied — daemon lacks CAP_NET_ADMIN)"
+        for c in conns:
+            if c.laddr and c.laddr.port == port and c.status == psutil.CONN_LISTEN:
+                pid = c.pid
+                if not pid:
+                    return f"holder=pid?? (listen on :{port}, no pid visible)"
+                try:
+                    p = psutil.Process(pid)
+                    cmd = " ".join(p.cmdline())[:160]
+                    return f"holder=pid={pid} name={p.name()} cmd={cmd}"
+                except Exception:
+                    return f"holder=pid={pid}"
+        return f"holder=unknown (no LISTEN on :{port} found by psutil)"
+    except Exception as e:
+        return f"holder_lookup_failed: {e}"
+
+
+def web_server_worker(store: ArticleStore):
+    # Wait up to 60s for the port to be free before trying to bind.
+    # This prevents crash-loops when a duplicate daemon holds the port briefly.
+    bound = False
+    for _attempt in range(12):
+        if _port_is_free(WEB_SERVER_HOST, WEB_SERVER_PORT):
+            bound = True
             break
-        except OSError:
-            log.warning(f"[web_server_worker] port {WEB_SERVER_PORT} busy — waiting 5s (attempt {_attempt+1}/6)")
-            time.sleep(5)
+        log.warning(
+            f"[web_server_worker] port {WEB_SERVER_PORT} busy — waiting 5s (attempt {_attempt+1}/12)"
+        )
+        time.sleep(5)
+        if not _running:
+            return
+
+    if not bound:
+        # Don't let Werkzeug crash with "Address already in use" — back off and
+        # poll for the port to free up, then let the supervisor respawn us.
+        holder = _describe_port_holder(WEB_SERVER_PORT)
+        log.error(
+            f"[web_server_worker] port {WEB_SERVER_PORT} still busy after 60s — "
+            f"backing off 5min before retry. {holder}"
+        )
+        # Poll every 15s during the backoff so we recover quickly if the port
+        # frees up (e.g. stale daemon exits) without waiting the full 5min.
+        backoff_deadline = time.time() + 300
+        while _running and time.time() < backoff_deadline:
+            time.sleep(15)
+            if _port_is_free(WEB_SERVER_HOST, WEB_SERVER_PORT):
+                log.info(f"[web_server_worker] port {WEB_SERVER_PORT} freed — resuming")
+                bound = True
+                break
+        if not bound:
+            return  # let supervisor respawn
+
     log.info(f"[web_server_worker] starting Flask on {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
     try:
         from dashboard.web_server import run_server
