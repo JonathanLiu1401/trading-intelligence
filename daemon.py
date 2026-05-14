@@ -1259,10 +1259,44 @@ def _build_health_line(store: ArticleStore) -> str:
     return "⚙ Workers: " + " ".join(parts) + suffix
 
 
+def _acquire_singleton_lock():
+    """Prevent duplicate daemon instances.
+
+    Why: an orphaned daemon.py from a prior session can keep port 8080 bound,
+    causing the systemd-managed instance to log repeated port-busy warnings
+    and never serve the dashboard. fcntl.flock on a pidfile gives us a
+    kernel-enforced singleton that releases automatically on process exit.
+    """
+    import fcntl
+    lock_path = BASE_DIR / "data" / "daemon.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        try:
+            holder = lock_path.read_text().strip()
+        except Exception:
+            holder = "unknown"
+        log.error(
+            f"[daemon] Another daemon instance is already running (lock held by pid={holder}). "
+            f"Exiting to avoid port/db contention."
+        )
+        sys.exit(1)
+    fh.seek(0)
+    fh.truncate()
+    fh.write(str(os.getpid()))
+    fh.flush()
+    # Keep fh open for the process lifetime; the lock releases on exit.
+    globals()["_singleton_lock_fh"] = fh
+
+
 def main():
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info(" DIGITAL INTERN DAEMON — STARTING")
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    _acquire_singleton_lock()
 
     store = ArticleStore()
     log.info(f"Store ready: {store.stats()}")
