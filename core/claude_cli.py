@@ -33,9 +33,18 @@ def claude_call(
         )
         if result.returncode != 0:
             err = result.stderr.strip()[:300]
-            print(f"[claude_cli] Error (model={model}): {err}")
+            # CLI sometimes writes the failure reason to stdout instead of stderr
+            # (e.g. rate-limit / auth errors), so fall back to stdout when stderr is empty.
+            if not err:
+                err = result.stdout.strip()[:300] or "<no output>"
+            print(f"[claude_cli] Error (model={model}, rc={result.returncode}): {err}")
             return None
-        return result.stdout.strip() or None
+        out = result.stdout.strip()
+        if not out:
+            err = result.stderr.strip()[:300] or "<empty stdout, rc=0>"
+            print(f"[claude_cli] Empty result (model={model}): {err}")
+            return None
+        return out
     except subprocess.TimeoutExpired:
         print(f"[claude_cli] Timeout after {timeout}s (model={model})")
         return None
