@@ -20,8 +20,14 @@ from email.utils import parsedate_to_datetime
 # ── Portfolio tickers (direct mention = highest priority) ───────────────────
 # Short tickers must match as whole words (regex \b); naive substring match
 # was triggering false positives like "satellite"→"lite", "museum"→"mu".
-PORTFOLIO_TICKERS = {"lite", "mu", "msft", "axti", "orcl", "tsem", "qbts"}
-PORTFOLIO_NAMES = {"micron", "lumentum", "microsoft", "oracle", "tower semiconductor"}
+PORTFOLIO_TICKERS = {
+    "lite", "lnok", "muu", "dram", "sndu",
+    "mu", "msft", "axti", "orcl", "tsem", "qbts", "nvda",
+}
+PORTFOLIO_NAMES = {
+    "micron", "lumentum", "microsoft", "oracle", "tower semiconductor",
+    "nvidia", "defiance", "direxion", "t-rex",
+}
 _PORTFOLIO_TICKER_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(t) for t in PORTFOLIO_TICKERS) + r")\b",
     re.I,
@@ -39,7 +45,10 @@ TIER_PORTFOLIO_PHRASES = {  # 4 pts each — direct portfolio/focus names
 # Bare tickers — must match on word boundaries; substring matching produced
 # false positives ("mu"→"museum") and false negatives ("MU." at end of string
 # was missed by the old " mu " space-padded hack).
-TIER_PORTFOLIO_TICKERS = {"mu", "wdc", "stx", "lrcx", "amat", "klac", "axti", "orcl", "qbts"}
+TIER_PORTFOLIO_TICKERS = {
+    "mu", "wdc", "stx", "lrcx", "amat", "klac", "axti", "orcl", "qbts",
+    "lite", "lnok", "muu", "dram", "sndu", "nvda",
+}
 _TIER_PORTFOLIO_TICKER_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(t) for t in TIER_PORTFOLIO_TICKERS) + r")\b",
     re.I,
@@ -182,6 +191,23 @@ def _portfolio_boost(text: str) -> float:
     return 0.0
 
 
+# Active relevance multiplier — applies on top of the additive _portfolio_boost
+# so articles directly mentioning live positions (LITE, LNOK, MUU, DRAM, SNDU,
+# MU, NVDA, ...) cleanly outrank generic sector noise.
+PORTFOLIO_RELEVANCE_MULT = 1.5
+
+
+def portfolio_relevance_multiplier(text: str) -> float:
+    """Return PORTFOLIO_RELEVANCE_MULT when a live position is mentioned, else 1.0."""
+    t = text.lower()
+    if _PORTFOLIO_TICKER_RE.search(t):
+        return PORTFOLIO_RELEVANCE_MULT
+    for name in PORTFOLIO_NAMES:
+        if name in t:
+            return PORTFOLIO_RELEVANCE_MULT
+    return 1.0
+
+
 def score_article(title: str, summary: str, source: str = "", published: str = "") -> dict:
     """
     Score a single article. Returns dict with score and breakdown.
@@ -231,11 +257,12 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
     # Recency
     rec = _recency_factor(published)
 
-    # Portfolio boost (additive)
+    # Portfolio boost (additive + multiplicative — live positions get both)
     port_boost = _portfolio_boost(text)
+    port_mult = portfolio_relevance_multiplier(text)
 
     # Composite
-    raw = (kw * src_w * event_bonus * rec) + port_boost
+    raw = (kw * src_w * event_bonus * rec * port_mult) + port_boost
 
     # Normalise to 0-10
     score = min(10.0, round(raw / 4.0 * 10.0, 2))  # 4.0 = rough "max normal" kw
@@ -247,6 +274,7 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
         "event_bonus": event_bonus,
         "recency": round(rec, 2),
         "port_boost": port_boost,
+        "port_mult": port_mult,
         "events": events_found,
         "reason": "scored",
     }

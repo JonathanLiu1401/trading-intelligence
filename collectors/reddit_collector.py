@@ -4,22 +4,50 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 REQUEST_TIMEOUT = 10
-MAX_WORKERS = 10
+MAX_WORKERS = 24
+MIN_SCORE = 3  # very loose — capture more discussion
 
-# Financial subreddits — RSS feeds require no API key
+# Financial / tech subreddits — JSON API, no key needed
 SUBREDDITS = [
+    # Core investing
     "stocks", "investing", "wallstreetbets", "SecurityAnalysis",
     "StockMarket", "options", "algotrading", "Economics",
-    "finance", "personalfinance", "investing", "ValueInvesting",
-    "dividends", "ETFs", "CryptoCurrency", "Bitcoin", "ethereum",
+    "finance", "personalfinance", "ValueInvesting",
+    "dividends", "ETFs", "financialindependence",
+    "Bogleheads", "FinancialPlanning", "FIREyFemmes",
+    "thetagang", "Vitards", "Daytrading", "swingtrading",
+    "pennystocks", "smallstreetbets", "Forex",
+    # Macro / geopolitical
     "MacroEconomics", "GlobalMarkets", "emgmarket",
-    "technology", "hardware", "Semiconductors", "AIstocks",
-    "Micron", "nvidia", "AMD_Stock",
+    "geopolitics", "EconomicHistory", "AusEcon",
+    # Crypto
+    "CryptoCurrency", "Bitcoin", "ethereum", "CryptoMarkets",
+    "BitcoinMarkets", "ethfinance", "solana",
+    # Tech / semis / AI
+    "technology", "hardware", "Semiconductors", "Semiconductor",
+    "AIstocks", "AIComputing", "MachineLearning", "LocalLLaMA",
+    "gpu", "buildapc", "intel", "nvidia", "AMD_Stock", "amd",
+    "ASML", "MicronTechnology", "Micron", "TSMC", "AMD",
+    "singularity", "ArtificialInteligence", "OpenAI", "ChatGPT",
+    "GPT3", "Robotics", "datacenter", "selfhosted",
+    # Quant / data
+    "quant", "datascience", "DeFi",
+    # Trading / analysis
+    "TheRaceTo10Million", "Wallstreetsilver", "Superstonk",
+    "GME", "AMCSTOCK", "EVStocks", "Biotechplays",
+    "shortsqueeze", "RobinhoodPennystocks", "WallStreetbetsELITE",
+    "stockstobuytoday", "trakstocks", "RealDayTrading",
+    # Industry / professional
+    "AskEconomics", "BusinessNews", "stockmarketnews",
+    "EconomicSignals", "tradingview", "TradingEducation",
+    "FuturesTrading", "Bonds", "GoldandSilverStackers",
+    # Global / regional equity discussion
+    "EuropeanStocks", "ChinaStocks", "IndiaInvestments", "Commodities",
 ]
 
 
-def _fetch_subreddit(subreddit: str) -> list:
-    url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit=100"
+def _fetch_listing(subreddit: str, listing: str) -> list:
+    url = f"https://www.reddit.com/r/{subreddit}/{listing}.json?limit=100"
     headers = {"User-Agent": "DigitalIntern/1.0 financial-news-aggregator"}
     try:
         r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
@@ -27,14 +55,15 @@ def _fetch_subreddit(subreddit: str) -> list:
             return []
         posts = r.json().get("data", {}).get("children", [])
         results = []
+        # /new has no score gate — most "new" posts have score 1 or 0 by design.
+        min_score = MIN_SCORE if listing == "hot" else 1
         for post in posts:
             d = post.get("data", {})
             title = d.get("title", "").strip()
             link = d.get("url", "")
-            permalink = f"https://reddit.com{d.get('selftext', '')}"
             score = d.get("score", 0)
             selftext = d.get("selftext", "")[:500]
-            if title and score > 10:  # filter low-engagement posts
+            if title and score >= min_score:
                 results.append({
                     "title": title,
                     "link": link or f"https://reddit.com{d.get('permalink', '')}",
@@ -46,6 +75,13 @@ def _fetch_subreddit(subreddit: str) -> list:
         return results
     except Exception:
         return []
+
+
+def _fetch_subreddit(subreddit: str) -> list:
+    """Fetch both /hot and /new so we get both quality and freshness."""
+    out = _fetch_listing(subreddit, "hot")
+    out.extend(_fetch_listing(subreddit, "new"))
+    return out
 
 
 def collect_reddit() -> list:

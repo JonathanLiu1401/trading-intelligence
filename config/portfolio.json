@@ -1,17 +1,74 @@
 {
-  "_note": "Sao's trading portfolio - updated 2026-05-12",
+  "_note": "Sao's trading portfolio - updated 2026-05-13 (Margin Universal Account 7883)",
+  "_account": {
+    "total_assets_usd": 9710.24,
+    "market_value": 10626.44,
+    "total_position_pl": 815.87,
+    "today_pl": 1479.64,
+    "total_cash": -916.20,
+    "excess_liquidity": 649.35,
+    "max_buying_power": 526.14,
+    "risk_status": "Safe",
+    "last_updated": "2026-05-13T08:42 PDT"
+  },
   "positions": [
-    {"ticker": "LITE", "type": "stock", "qty": 1.6908, "avg_cost": 887.119, "notes": "Lumentum - photonics/semis"},
-    {"ticker": "MU",   "type": "stock", "qty": 3.612,  "avg_cost": 415.28,  "notes": "Micron Technology - core DRAM/NAND position"},
-    {"ticker": "MSFT", "type": "stock", "qty": 2.2835, "avg_cost": 394.114, "notes": "Microsoft"},
-    {"ticker": "AXTI", "type": "stock", "qty": 4,      "avg_cost": 50.42,   "notes": "AXT Inc - compound semiconductors"},
-    {"ticker": "ORCL", "type": "stock", "qty": 5.3109, "avg_cost": 163.603, "notes": "Oracle"},
-    {"ticker": "TSEM", "type": "stock", "qty": 3.7,    "avg_cost": 225.789, "notes": "Tower Semiconductor"},
-    {"ticker": "QBTS", "type": "stock", "qty": 92.1658,"avg_cost": 21.70,   "notes": "D-Wave Quantum - high risk position"}
+    {
+      "ticker": "LITE",
+      "type": "stock",
+      "qty": 0.1908,
+      "avg_cost": 887.119,
+      "notes": "Lumentum - photonics/semis"
+    },
+    {
+      "ticker": "LNOK",
+      "type": "stock",
+      "qty": 14,
+      "avg_cost": 72.48,
+      "notes": "Defiance Daily leveraged - 14 shares"
+    },
+    {
+      "ticker": "MSFT",
+      "type": "stock",
+      "qty": 0,
+      "avg_cost": 415.49,
+      "notes": "Microsoft - position closed/zero"
+    },
+    {
+      "ticker": "MUU",
+      "type": "etf_leveraged",
+      "qty": 6,
+      "avg_cost": 596.32,
+      "notes": "Direxion Daily MU Bull 2X"
+    },
+    {
+      "ticker": "SNDU",
+      "type": "etf_leveraged",
+      "qty": 0,
+      "avg_cost": 120.08,
+      "notes": "T-REX 2X Long NVDU - position zero"
+    }
   ],
   "options": [
-    {"symbol": "MUU",  "notes": "Micron leveraged options - fill in strike/expiry"},
-    {"symbol": "SNDU", "notes": "Fill in strike/expiry details"}
+    {
+      "symbol": "DRAM CALL",
+      "underlying": "DRAM",
+      "type": "call",
+      "expiry": "2026-05-29",
+      "strike": 59,
+      "qty": 21,
+      "avg_cost": 2.236,
+      "notes": "DRAM sector call, exp 260529, strike 59"
+    },
+    {
+      "symbol": "SNDU C 260515 145",
+      "underlying": "SNDU",
+      "type": "call",
+      "expiry": "2026-05-15",
+      "strike": 145,
+      "qty": 1,
+      "avg_cost": 4.70,
+      "notes": "SNDU call, exp 260515, strike 145"
+    }
   ],
-  "sector_watchlist": ["LRCX", "AMAT", "KLAC", "NVDA", "AMD", "WDC", "STX", "SMH", "SOXX"]
+  "sector_watchlist": ["LRCX", "AMAT", "KLAC", "NVDA", "AMD", "WDC", "STX", "SMH", "SOXX", "MU", "AXTI"]
 }

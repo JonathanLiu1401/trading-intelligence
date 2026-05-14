@@ -1,0 +1,102 @@
+{
+  "positions": [
+    {
+      "ticker": "LITE",
+      "qty": 0.1908,
+      "avg_cost": 887.119,
+      "price": 1030.37,
+      "value": 196.59,
+      "cost": 169.26,
+      "pnl": 27.33,
+      "pnl_pct": 16.15
+    },
+    {
+      "ticker": "LNOK",
+      "qty": 14.0,
+      "avg_cost": 72.48,
+      "price": 90.45,
+      "value": 1266.3,
+      "cost": 1014.72,
+      "pnl": 251.58,
+      "pnl_pct": 24.79
+    },
+    {
+      "ticker": "MSFT",
+      "qty": 0.0,
+      "avg_cost": 415.49,
+      "price": 405.21,
+      "value": 0.0,
+      "cost": 0.0,
+      "pnl": 0.0,
+      "pnl_pct": 0.0
+    },
+    {
+      "ticker": "MUU",
+      "qty": 6.0,
+      "avg_cost": 596.32,
+      "price": 622.86,
+      "value": 3737.16,
+      "cost": 3577.92,
+      "pnl": 159.24,
+      "pnl_pct": 4.45
+    },
+    {
+      "ticker": "SNDU",
+      "qty": 0.0,
+      "avg_cost": 120.08,
+      "price": 100.37,
+      "value": 0.0,
+      "cost": 0.0,
+      "pnl": 0.0,
+      "pnl_pct": 0.0
+    }
+  ],
+  "options": [
+    {
+      "symbol": "DRAM CALL",
+      "underlying": "DRAM",
+      "type": "call",
+      "expiry": "2026-05-29",
+      "strike": 59.0,
+      "qty": 21.0,
+      "avg_cost": 2.236,
+      "price": 2.65,
+      "value": 5565.0,
+      "cost": 4695.6,
+      "pnl": 869.4,
+      "pnl_pct": 18.52
+    },
+    {
+      "symbol": "SNDU C 260515 145",
+      "underlying": "SNDU",
+      "type": "call",
+      "expiry": "2026-05-15",
+      "strike": 145.0,
+      "qty": 1.0,
+      "avg_cost": 4.7,
+      "price": 0.8,
+      "value": 80.0,
+      "cost": 470.0,
+      "pnl": -390.0,
+      "pnl_pct": -82.98
+    }
+  ],
+  "summary": {
+    "total_value": 5200.05,
+    "total_cost": 4761.9,
+    "total_pnl": 438.15,
+    "total_pnl_pct": 9.2,
+    "priced": 5,
+    "total_positions": 5,
+    "options_value": 5645.0,
+    "options_cost": 5165.6,
+    "options_pnl": 479.4,
+    "options_priced": 2,
+    "options_count": 2,
+    "grand_value": 10845.05,
+    "grand_cost": 9927.5,
+    "grand_pnl": 917.55,
+    "grand_pnl_pct": 9.24
+  },
+  "as_of": "2026-05-14T05:30:07+00:00"
+}

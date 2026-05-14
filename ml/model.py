@@ -1,16 +1,26 @@
 """
-ArticleNet — PyTorch GPU model for financial article scoring.
+ArticleNet — Deep PyTorch GPU model for financial article scoring.
 
-Architecture:
-  TF-IDF (15000) → Linear 512 → BN → ReLU → Dropout
-                 → Linear 256 → BN → ReLU → Dropout
-                 → Linear 128 → BN → ReLU → Dropout
-                 → Linear 2   (relevance, urgency)
+Architecture (multi-task encoder + 3 heads):
+  TF-IDF + extras → Linear 512 → LayerNorm → GELU → Dropout(0.2)
+                  → Linear 512 → LayerNorm → GELU → Dropout(0.2)
+                  → Linear 256 → LayerNorm → GELU → Dropout(0.15)
+                  → Linear 128 → LayerNorm → GELU → Dropout(0.1)
+                  → relevance_head  (sigmoid * 10) — 0..10
+                  → urgency_head    (sigmoid)      — probability of urgent
+                  → uncertainty_head(sigmoid)      — predicted error magnitude
 
-Uncertainty via Monte Carlo Dropout: 10 stochastic forward passes at inference,
-return mean and std across passes. Higher std → route to LLM.
+Training: multi-task — MSE on relevance + 0.5 * BCE on urgency + 0.2 * BCE on
+uncertainty (target = detached |rel_pred - rel_target| / 10).
 
-Trains on CUDA when available, falls back to CPU. Checkpoint: data/ml/model_gpu.pt.
+Uncertainty is exposed two ways:
+  - The dedicated uncertainty head (used by recursive_labeler for active learning)
+  - MC-Dropout ensemble spread (used by inference.py for grey-zone routing)
+
+Checkpoints:
+  - data/ml/model_gpu.pt        — last-trained state, fast reload
+  - <USB>/ml_checkpoints/       — versioned snapshots, last 10 kept
+  - <USB>/ml_checkpoints/best_model.pt — lowest validation loss across all runs
 """
 import os
 import time
@@ -27,101 +37,227 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 CHECKPOINT_PATH = MODEL_DIR / "model_gpu.pt"
 
+# Versioned checkpoints on USB drive, mirroring article_store.USB_PATH layout.
+USB_PATH = Path(os.environ.get("DIGITAL_INTERN_USB", "/media/zeph/projects/digital-intern/db"))
+USB_CHECKPOINT_DIR = USB_PATH / "ml_checkpoints"
+BEST_MODEL_PATH = USB_CHECKPOINT_DIR / "best_model.pt"
+MAX_CHECKPOINTS = 10
+
 INPUT_DIM    = 15_000
-HIDDEN       = (512, 256, 128)
-OUTPUT_DIM   = 2          # relevance, urgency
-DROPOUT      = 0.3
-MC_PASSES    = 10         # Monte Carlo Dropout passes at inference
+HIDDEN_DIM   = 512
+DROPOUT      = 0.2          # used for MC-Dropout passes at inference
+MC_PASSES    = 10
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class ArticleNetModule(nn.Module):
-    def __init__(self, input_dim: int = INPUT_DIM, hidden=HIDDEN,
-                 output_dim: int = OUTPUT_DIM, dropout: float = DROPOUT):
-        super().__init__()
-        h1, h2, h3 = hidden
-        self.fc1 = nn.Linear(input_dim, h1)
-        self.bn1 = nn.BatchNorm1d(h1)
-        self.fc2 = nn.Linear(h1, h2)
-        self.bn2 = nn.BatchNorm1d(h2)
-        self.fc3 = nn.Linear(h2, h3)
-        self.bn3 = nn.BatchNorm1d(h3)
-        self.head = nn.Linear(h3, output_dim)
-        self.dropout = nn.Dropout(dropout)
+def _usb_available() -> bool:
+    """USB checkpoint dir is usable when its parent (mount point) exists."""
+    try:
+        if USB_CHECKPOINT_DIR.parent.exists():
+            USB_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+            return True
+    except Exception:
+        pass
+    return False
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.dropout(F.relu(self.bn1(self.fc1(x))))
-        x = self.dropout(F.relu(self.bn2(self.fc2(x))))
-        x = self.dropout(F.relu(self.bn3(self.fc3(x))))
-        return self.head(x)
+
+class ArticleNetModule(nn.Module):
+    """Deep transformer-style encoder for financial article scoring."""
+
+    def __init__(self, input_dim: int = INPUT_DIM, hidden_dim: int = HIDDEN_DIM):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.15),
+
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.LayerNorm(hidden_dim // 4),
+            nn.GELU(),
+            nn.Dropout(0.1),
+        )
+        head_in = hidden_dim // 4
+        # Relevance scaled to 0..10 so existing thresholds (>=8 = urgent etc.)
+        # in inference.py / scorer_worker keep working unchanged.
+        self.relevance_head        = nn.Linear(head_in, 1)
+        self.urgency_head          = nn.Linear(head_in, 1)
+        self.uncertainty_head      = nn.Linear(head_in, 1)
+        # time_sensitivity: 1.0 = highly time-sensitive (earnings, breaking price moves),
+        # 0.0 = timeless (macro thesis, secular trends). Consumed by briefing ranking
+        # to apply intelligent recency decay per-article rather than blanket decay.
+        self.time_sensitivity_head = nn.Linear(head_in, 1)
+
+    def forward(self, x):
+        h = self.encoder(x)
+        relevance        = torch.sigmoid(self.relevance_head(h)) * 10.0
+        urgency          = torch.sigmoid(self.urgency_head(h))           # 0..1 prob
+        uncertainty      = torch.sigmoid(self.uncertainty_head(h))       # 0..1
+        time_sensitivity = torch.sigmoid(self.time_sensitivity_head(h))  # 0..1
+        return relevance, urgency, uncertainty, time_sensitivity
 
 
 class ArticleNet:
-    """PyTorch GPU model wrapping ArticleNetModule with MC-Dropout uncertainty."""
+    """PyTorch GPU model wrapping ArticleNetModule with multi-task heads
+    and MC-Dropout uncertainty for the inference path."""
 
     def __init__(self):
         self.device = DEVICE
+        if self.device.type == "cuda":
+            try:
+                gpu_name = torch.cuda.get_device_name(self.device)
+            except Exception:
+                gpu_name = "CUDA"
+            print(f"[ML] Using device: cuda ({gpu_name})")
+        else:
+            print("[ML] Using device: cpu (no CUDA available)")
         self.net = ArticleNetModule().to(self.device)
         self._fitted = False
         self._input_dim = INPUT_DIM
+        self._best_val_loss = float("inf")
         self._load()
 
     # ── persistence ─────────────────────────────────────────────────────────
     def _load(self):
-        if CHECKPOINT_PATH.exists():
+        """Prefer best_model.pt on USB; fall back to local checkpoint."""
+        for path in (BEST_MODEL_PATH, CHECKPOINT_PATH):
+            if not path.exists():
+                continue
             try:
-                ckpt = torch.load(CHECKPOINT_PATH, map_location=self.device,
-                                  weights_only=False)
+                ckpt = torch.load(path, map_location=self.device, weights_only=False)
                 state = ckpt.get("state_dict", ckpt)
                 self._input_dim = ckpt.get("input_dim", INPUT_DIM)
                 if self._input_dim != INPUT_DIM:
-                    # Rebuild module if checkpoint used a different input dim
                     self.net = ArticleNetModule(input_dim=self._input_dim).to(self.device)
-                self.net.load_state_dict(state)
-                self._fitted = True
-                print(f"[ml:model] Loaded GPU model from {CHECKPOINT_PATH} "
-                      f"(device={self.device}, input_dim={self._input_dim})")
+                # New 3-head module is incompatible with old 2-head checkpoints.
+                # strict=False lets us partially load the encoder and start fresh
+                # heads when the architectures don't match.
+                missing, unexpected = self.net.load_state_dict(state, strict=False)
+                if unexpected or any("head" in k for k in missing):
+                    print(f"[ml:model] Checkpoint {path.name} has incompatible heads — "
+                          f"loaded encoder only, heads reinitialized")
+                    self._fitted = False
+                else:
+                    self._fitted = True
+                self._best_val_loss = ckpt.get("best_val_loss", float("inf"))
+                print(f"[ml:model] Loaded model from {path} "
+                      f"(device={self.device}, input_dim={self._input_dim}, "
+                      f"best_val_loss={self._best_val_loss:.4f})")
+                return
             except Exception as e:
-                print(f"[ml:model] Load error: {e} — starting fresh")
-                self._fitted = False
+                print(f"[ml:model] Load error from {path}: {e}")
+        print("[ml:model] No usable checkpoint — starting fresh")
 
     def save(self):
+        """Save the current state to the local checkpoint (fast reload)."""
         torch.save({
             "state_dict": self.net.state_dict(),
             "input_dim": self._input_dim,
+            "best_val_loss": self._best_val_loss,
         }, CHECKPOINT_PATH)
+
+    def _save_versioned(self, val_loss: float, metrics: dict) -> None:
+        """Save a timestamped snapshot to USB; rotate to last MAX_CHECKPOINTS."""
+        if not _usb_available():
+            return
+        try:
+            ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            target = USB_CHECKPOINT_DIR / f"checkpoint_{ts}.pt"
+            torch.save({
+                "state_dict": self.net.state_dict(),
+                "input_dim": self._input_dim,
+                "val_loss": val_loss,
+                "best_val_loss": self._best_val_loss,
+                "metrics": metrics,
+                "saved_at": ts,
+            }, target)
+            # Rotate — keep the newest MAX_CHECKPOINTS files.
+            snaps = sorted(USB_CHECKPOINT_DIR.glob("checkpoint_*.pt"))
+            for stale in snaps[:-MAX_CHECKPOINTS]:
+                try:
+                    stale.unlink()
+                except Exception:
+                    pass
+            # Promote to best_model.pt on improvement.
+            if val_loss < self._best_val_loss:
+                self._best_val_loss = val_loss
+                torch.save({
+                    "state_dict": self.net.state_dict(),
+                    "input_dim": self._input_dim,
+                    "best_val_loss": self._best_val_loss,
+                    "metrics": metrics,
+                    "saved_at": ts,
+                }, BEST_MODEL_PATH)
+                print(f"[ml:model] New best model: val_loss={val_loss:.4f} → {BEST_MODEL_PATH}")
+        except Exception as e:
+            print(f"[ml:model] Versioned save failed: {e}")
 
     # ── training ────────────────────────────────────────────────────────────
     def fit(self, X: np.ndarray, y_rel: np.ndarray, y_urg: np.ndarray,
-            epochs: int = 50, batch_size: int = 256, lr: float = 1e-3,
+            y_time: np.ndarray | None = None,
+            epochs: int = 100, batch_size: int = 256, lr: float = 1e-3,
             verbose: bool = True) -> dict:
-        """
-        Train the GPU model. Returns metrics dict with final_loss, epochs, samples.
-        Keeps the same (X, y_rel, y_urg) interface as the previous sklearn model.
+        """Multi-task GPU training. Returns metrics dict.
+
+        ``y_rel`` is a 0..10 relevance score; ``y_urg`` is a 0..10 urgency
+        score that gets binarized to ``>= 8.0`` for the BCE head.
         """
         t0 = time.time()
         n, dim = X.shape
 
-        # Adapt the network if dim doesn't match what we have
         if dim != self._input_dim:
             self._input_dim = dim
             self.net = ArticleNetModule(input_dim=dim).to(self.device)
             self._fitted = False
 
-        X_t   = torch.as_tensor(X, dtype=torch.float32)
-        y_t   = torch.stack([
-            torch.as_tensor(y_rel, dtype=torch.float32),
-            torch.as_tensor(y_urg, dtype=torch.float32),
-        ], dim=1)  # (N, 2)
+        X_t      = torch.as_tensor(X, dtype=torch.float32)
+        rel_t    = torch.as_tensor(y_rel, dtype=torch.float32)
+        urg_bin  = torch.as_tensor((y_urg >= 8.0).astype(np.float32), dtype=torch.float32)
+        # If caller didn't supply time_sensitivity labels, fall back to a neutral
+        # 0.5 target with a near-zero loss weight (so we don't pull predictions
+        # toward 0.5 when labels are absent — see ``time_loss_weight`` below).
+        has_time = y_time is not None
+        if has_time:
+            time_t = torch.as_tensor(np.clip(y_time, 0.0, 1.0).astype(np.float32),
+                                     dtype=torch.float32)
+        else:
+            time_t = torch.full((n,), 0.5, dtype=torch.float32)
+        time_loss_weight = 0.3 if has_time else 0.0
 
-        ds = torch.utils.data.TensorDataset(X_t, y_t)
-        # pin_memory only helps for CUDA; keep CPU path simple
+        # Hold out 10% for validation when we have enough samples to make it
+        # meaningful (>= 100). Otherwise train on everything.
+        if n >= 100:
+            perm = torch.randperm(n)
+            n_val = max(10, n // 10)
+            val_idx = perm[:n_val]
+            tr_idx  = perm[n_val:]
+            X_tr, X_val = X_t[tr_idx], X_t[val_idx]
+            rel_tr, rel_val = rel_t[tr_idx], rel_t[val_idx]
+            urg_tr, urg_val = urg_bin[tr_idx], urg_bin[val_idx]
+            time_tr, time_val = time_t[tr_idx], time_t[val_idx]
+        else:
+            X_tr, X_val = X_t, None
+            rel_tr, rel_val = rel_t, None
+            urg_tr, urg_val = urg_bin, None
+            time_tr, time_val = time_t, None
+
+        ds = torch.utils.data.TensorDataset(X_tr, rel_tr, urg_tr, time_tr)
         pin = (self.device.type == "cuda")
-        # BatchNorm1d errors out on a batch of size 1 in train mode. Drop the
-        # final partial batch whenever it would be a singleton (n % bs == 1),
-        # provided we have at least one full batch to train on.
-        drop_last = (n > batch_size) and (n % batch_size == 1)
+        # Singleton final batch breaks BatchNorm; LayerNorm handles N=1 fine,
+        # but keep the guard to mirror the prior behavior.
+        n_tr = X_tr.shape[0]
+        drop_last = (n_tr > batch_size) and (n_tr % batch_size == 1)
         loader = torch.utils.data.DataLoader(
             ds, batch_size=batch_size, shuffle=True,
             pin_memory=pin, num_workers=0, drop_last=drop_last,
@@ -129,19 +265,38 @@ class ArticleNet:
 
         opt = torch.optim.Adam(self.net.parameters(), lr=lr, weight_decay=1e-5)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
-        loss_fn = nn.SmoothL1Loss()
 
         self.net.train()
         final_loss = float("nan")
         for epoch in range(epochs):
             epoch_loss = 0.0
             n_batches = 0
-            for xb, yb in loader:
+            for xb, rb, ub, tb in loader:
                 xb = xb.to(self.device, non_blocking=pin)
-                yb = yb.to(self.device, non_blocking=pin)
+                rb = rb.to(self.device, non_blocking=pin)
+                ub = ub.to(self.device, non_blocking=pin)
+                tb = tb.to(self.device, non_blocking=pin)
                 opt.zero_grad(set_to_none=True)
-                pred = self.net(xb)
-                loss = loss_fn(pred, yb)
+                rel, urg, unc, tsens = self.net(xb)
+                rel = rel.squeeze(-1)
+                urg = urg.squeeze(-1)
+                unc = unc.squeeze(-1)
+                tsens = tsens.squeeze(-1)
+
+                rel_loss = F.mse_loss(rel, rb)
+                # clamp keeps urg strictly within (eps, 1-eps) for BCE numerical safety
+                urg_loss = F.binary_cross_entropy(urg.clamp(1e-6, 1 - 1e-6), ub)
+                # Train uncertainty to predict |error|/10 — aleatoric proxy.
+                with torch.no_grad():
+                    unc_target = (rel.detach() - rb).abs().clamp(0, 10) / 10.0
+                unc_loss = F.binary_cross_entropy(unc.clamp(1e-6, 1 - 1e-6), unc_target)
+                # time_sensitivity: BCE against soft 0..1 targets (works for both
+                # binary heuristic labels and probabilistic ones).
+                time_loss = F.binary_cross_entropy(
+                    tsens.clamp(1e-6, 1 - 1e-6), tb.clamp(0.0, 1.0)
+                )
+
+                loss = rel_loss + 0.5 * urg_loss + 0.2 * unc_loss + time_loss_weight * time_loss
                 loss.backward()
                 opt.step()
                 epoch_loss += loss.item()
@@ -149,7 +304,7 @@ class ArticleNet:
             sched.step()
             final_loss = epoch_loss / max(n_batches, 1)
 
-            if verbose and (epoch == 0 or (epoch + 1) % 5 == 0 or epoch == epochs - 1):
+            if verbose and (epoch == 0 or (epoch + 1) % 10 == 0 or epoch == epochs - 1):
                 gpu_mem = ""
                 if self.device.type == "cuda":
                     mb = torch.cuda.memory_allocated(self.device) / (1024 * 1024)
@@ -160,53 +315,92 @@ class ArticleNet:
 
         self.net.eval()
         self._fitted = True
-        self.save()
+
+        # Validation pass
+        val_loss = final_loss
+        if X_val is not None:
+            with torch.no_grad():
+                xb = X_val.to(self.device)
+                rb = rel_val.to(self.device)
+                ub = urg_val.to(self.device)
+                rel, urg, _, _ = self.net(xb)
+                rel = rel.squeeze(-1)
+                urg = urg.squeeze(-1)
+                v_rel = F.mse_loss(rel, rb).item()
+                v_urg = F.binary_cross_entropy(urg.clamp(1e-6, 1 - 1e-6), ub).item()
+                val_loss = v_rel + 0.5 * v_urg
+
         elapsed = time.time() - t0
-        print(f"[ml:model] Trained {epochs} epochs on {n} samples in {elapsed:.1f}s "
-              f"(device={self.device})")
-        return {
+        metrics = {
             "final_loss": round(final_loss, 4),
+            "val_loss":   round(val_loss, 4),
             "epochs": epochs,
             "samples": n,
             "elapsed_s": round(elapsed, 1),
             "device": str(self.device),
         }
+        self.save()
+        self._save_versioned(val_loss, metrics)
+        print(f"[ml:model] Trained {epochs} epochs on {n} samples in {elapsed:.1f}s "
+              f"(device={self.device}, val_loss={val_loss:.4f})")
+        return metrics
 
     # ── inference ───────────────────────────────────────────────────────────
     @torch.no_grad()
-    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Monte Carlo Dropout inference: MC_PASSES stochastic forward passes.
-        Returns (rel_mean, rel_std, urg_mean, urg_std), each shape (N,).
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """MC-Dropout inference for backward compat with inference.py.
+        Returns (rel_mean, rel_std, urg_mean, urg_std, time_sensitivity_mean),
+        each shape (N,). Urgency mean/std are scaled to 0..10 so existing
+        thresholds keep working. time_sensitivity stays in 0..1.
         """
         n = X.shape[0]
         if not self._fitted or X.shape[1] != self._input_dim:
             return (np.zeros(n), np.full(n, 99.0),
-                    np.zeros(n), np.full(n, 99.0))
+                    np.zeros(n), np.full(n, 99.0),
+                    np.full(n, 0.5))
 
-        # Keep dropout active for MC sampling; BatchNorm stays in eval mode.
+        # MC-Dropout: keep dropout active, LayerNorm has no train/eval split.
         self.net.eval()
         for m in self.net.modules():
             if isinstance(m, nn.Dropout):
                 m.train()
 
         x = torch.as_tensor(X, dtype=torch.float32, device=self.device)
-        # Single-sample inputs break BatchNorm in train mode; we forced BN to eval
-        # above so this is safe.
-        preds = []
+        rels, urgs, tsens_runs = [], [], []
         for _ in range(MC_PASSES):
-            preds.append(self.net(x).cpu().numpy())
-        stacked = np.stack(preds, axis=0)  # (P, N, 2)
+            rel, urg, _, tsens = self.net(x)
+            rels.append(rel.squeeze(-1).cpu().numpy())
+            urgs.append(urg.squeeze(-1).cpu().numpy())
+            tsens_runs.append(tsens.squeeze(-1).cpu().numpy())
+        rel_arr = np.stack(rels, axis=0)         # (P, N)
+        urg_arr = np.stack(urgs, axis=0) * 10.0  # scale prob → 0..10
+        tsens_arr = np.stack(tsens_runs, axis=0) # (P, N), in 0..1
 
-        rel = stacked[:, :, 0]
-        urg = stacked[:, :, 1]
-        rel_mean = np.clip(rel.mean(axis=0), 0, 10)
-        urg_mean = np.clip(urg.mean(axis=0), 0, 10)
-        rel_std  = rel.std(axis=0)
-        urg_std  = urg.std(axis=0)
+        rel_mean = np.clip(rel_arr.mean(axis=0), 0, 10)
+        urg_mean = np.clip(urg_arr.mean(axis=0), 0, 10)
+        rel_std  = rel_arr.std(axis=0)
+        urg_std  = urg_arr.std(axis=0)
+        tsens_mean = np.clip(tsens_arr.mean(axis=0), 0.0, 1.0)
 
-        self.net.eval()  # restore fully eval after MC
-        return rel_mean, rel_std, urg_mean, urg_std
+        self.net.eval()
+        return rel_mean, rel_std, urg_mean, urg_std, tsens_mean
+
+    @torch.no_grad()
+    def predict_with_uncertainty(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Single deterministic pass — returns (relevance, urgency_prob, uncertainty).
+        Used by recursive_labeler to find articles the model is unsure about."""
+        n = X.shape[0]
+        if not self._fitted or X.shape[1] != self._input_dim:
+            return np.zeros(n), np.zeros(n), np.ones(n)
+
+        self.net.eval()
+        x = torch.as_tensor(X, dtype=torch.float32, device=self.device)
+        rel, urg, unc, _tsens = self.net(x)
+        return (
+            rel.squeeze(-1).cpu().numpy(),
+            urg.squeeze(-1).cpu().numpy(),
+            unc.squeeze(-1).cpu().numpy(),
+        )
 
     @property
     def fitted(self) -> bool:

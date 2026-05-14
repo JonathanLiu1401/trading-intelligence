@@ -31,12 +31,32 @@ DASHBOARD_DIR = Path(__file__).resolve().parent
 DASHBOARD_HTML = DASHBOARD_DIR / "dashboard.html"
 STRUCTURED_LOG = ROOT / "logs" / "structured.jsonl"
 METRICS_LOG = ROOT / "logs" / "metrics.jsonl"
+# Atomic JSON snapshot written by the daemon supervisor — preferred source
+# of truth for worker state (avoids re-parsing logs).
+SUPERVISOR_STATE = ROOT / "logs" / "supervisor_state.json"
+SERVICE_NAME = os.environ.get("DIGITAL_INTERN_SERVICE", "digital-intern")
 
 WORKERS = [
     "gdelt", "rss", "web", "reddit", "ticker",
+    "sec_edgar", "sec_edgar_ft", "google_news", "nitter", "substack",
+    "finnhub", "alphavantage", "polygon", "newsapi",
+    "yahoo_ticker_rss", "wikipedia",
     "scorer", "alert", "heartbeat", "purge",
-    "stats", "ml_trainer", "price_alert",
+    "stats", "ml_trainer", "price_alert", "continuous_trainer",
+    "portfolio_pl", "sentiment_trends", "export", "web_server",
 ]
+# If all of these are stale at once the dashboard shows the CRITICAL banner.
+CORE_WORKERS = ("rss", "web", "reddit", "scorer")
+
+# Workers that are intentionally quiet — only log when they do something.
+# Don't flag as stale unless silent for >1h.
+_QUIET_WORKERS = {
+    "alert", "heartbeat", "purge", "price_alert",
+    "portfolio_pl", "sentiment_trends", "ml_trainer", "export",
+    # Rate-limited free-tier APIs that only fire every 5–30 minutes.
+    "alphavantage", "polygon", "newsapi", "wikipedia",
+    "finnhub", "substack",
+}
 WORKER_TAG_RE = re.compile(r"\[([a-z_]+?)(?:_worker)?\]")
 
 SERVER_STARTED_AT = time.time()
@@ -93,7 +113,7 @@ def _parse_ts(s: str | None) -> float | None:
         return None
 
 
-def _service_info(name: str = "digital-intern") -> dict[str, Any]:
+def _service_info(name: str = SERVICE_NAME) -> dict[str, Any]:
     try:
         active = subprocess.run(
             ["systemctl", "is-active", name],
@@ -165,6 +185,20 @@ def _ml_status() -> dict[str, Any]:
     return info
 
 
+def _read_supervisor_state() -> dict[str, Any]:
+    """Atomic JSON snapshot written every 5 min by daemon supervisor.
+
+    Returns {} when the file is missing or unparseable so callers can fall
+    back to log scraping."""
+    try:
+        if not SUPERVISOR_STATE.exists():
+            return {}
+        with SUPERVISOR_STATE.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def _worker_health(lookback: int = 2000) -> list[dict[str, Any]]:
     seen: dict[str, float] = {}
     for entry in _tail_jsonl(STRUCTURED_LOG, lookback):
@@ -176,26 +210,57 @@ def _worker_health(lookback: int = 2000) -> list[dict[str, Any]]:
             tag = m.group(1)
             if tag in WORKERS and t > seen.get(tag, 0):
                 seen[tag] = t
+    # Daemon snapshot is the authoritative source for state / crash counts.
+    sup = _read_supervisor_state()
+    sup_by_name = {w["name"]: w for w in sup.get("workers", [])}
     now = time.time()
     out: list[dict[str, Any]] = []
     for w in WORKERS:
         ts = seen.get(w)
         age = (now - ts) if ts else None
-        if age is None:
+        sup_entry = sup_by_name.get(w, {})
+        state = sup_entry.get("state", "ok")
+        crashes_5m = int(sup_entry.get("crashes_5m", 0) or 0)
+        total_crashes = int(sup_entry.get("total_crashes", 0) or 0)
+        last_exception = sup_entry.get("last_exception") or ""
+
+        stale_threshold = 3600 if w in _QUIET_WORKERS else 600
+        if state == "disabled":
+            status = "stale"
+        elif age is None:
             status = "unknown"
         elif age < 120:
             status = "ok"
-        elif age < 600:
+        elif age < stale_threshold:
             status = "warn"
         else:
             status = "stale"
+        # Degraded state from supervisor always escalates a green dot to warn
+        if state == "degraded" and status == "ok":
+            status = "warn"
+
         out.append({
             "name": w,
             "last_seen_s": age,
             "last_seen_iso": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None,
             "status": status,
+            "state": state,
+            "crashes_5m": crashes_5m,
+            "total_crashes": total_crashes,
+            "last_exception": last_exception,
         })
     return out
+
+
+def _core_workers_status(workers: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summary of CORE_WORKERS; ``critical`` is True iff all are stale."""
+    statuses = {w["name"]: w["status"] for w in workers if w["name"] in CORE_WORKERS}
+    down = [name for name, s in statuses.items() if s in ("stale", "unknown")]
+    return {
+        "core": list(CORE_WORKERS),
+        "down": down,
+        "critical": len(down) >= len(CORE_WORKERS),
+    }
 
 
 def _recent_errors(n: int = 5, scan: int = 1000) -> list[dict[str, Any]]:
@@ -326,8 +391,11 @@ async def api_logs(n: int = 50):
 
 @app.get("/api/health")
 async def api_health():
+    workers = _worker_health()
     return JSONResponse({
-        "workers": _worker_health(),
+        "service": _service_info(),
+        "workers": workers,
+        "core_status": _core_workers_status(workers),
         "errors": _recent_errors(),
         "last": _last_heartbeat_and_alert(),
     })
@@ -364,8 +432,11 @@ async def ws_endpoint(ws: WebSocket):
         # initial burst
         stats = _stats_payload()
         await ws.send_json({"type": "stats", "data": stats})
+        _workers = _worker_health()
         await ws.send_json({"type": "health", "data": {
-            "workers": _worker_health(),
+            "service": _service_info(),
+            "workers": _workers,
+            "core_status": _core_workers_status(_workers),
             "errors": _recent_errors(),
             "last": _last_heartbeat_and_alert(),
         }})

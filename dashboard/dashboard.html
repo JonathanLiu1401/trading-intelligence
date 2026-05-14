@@ -83,6 +83,21 @@
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .err-line .ts{color:var(--muted);margin-right:6px}
 
+  .critical-banner{
+    background:var(--red);color:#fff;text-align:center;
+    font-weight:bold;letter-spacing:2px;padding:14px;
+    font-size:18px;text-transform:uppercase;
+    border-bottom:1px solid #000;
+    animation:pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes pulse{0%{background:var(--red)}50%{background:#7a1f1f}100%{background:var(--red)}}
+  .health-row .meta{display:flex;gap:8px;align-items:center;font-size:10px;color:var(--muted)}
+  .health-row .badge{padding:1px 5px;border-radius:2px;background:#21262d;color:var(--text);
+    font-size:10px;letter-spacing:1px}
+  .health-row .badge.degraded{background:#5a4a1a;color:var(--yellow)}
+  .health-row .badge.disabled{background:#5a1f1f;color:var(--red)}
+  .health-row .badge.crashes{background:#332710;color:var(--yellow)}
+
   footer{
     position:fixed;bottom:0;left:0;right:0;display:flex;justify-content:space-between;
     padding:4px 16px;background:var(--card);border-top:1px solid var(--line);
@@ -100,6 +115,8 @@
     <div class="pill" id="clock">--:--:--</div>
   </div>
 </header>
+
+<div id="critical-banner" class="critical-banner" style="display:none">⚠ CRITICAL: CORE WORKERS DOWN ⚠</div>
 
 <section class="stats" id="stats">
   <div class="stat total" data-filter="all"><div class="label">TOTAL</div><div class="value" id="s-total">--</div><div class="sub">articles (14d)</div></div>
@@ -231,6 +248,28 @@ function renderArticles(arts){
 
 function renderHealth(payload){
   if(!payload) return;
+
+  // CRITICAL banner — shown when all core workers (rss/web/reddit/scorer) are stale.
+  const cs = payload.core_status || {};
+  const banner = $("critical-banner");
+  if(banner){
+    if(cs.critical){
+      banner.style.display = "block";
+      banner.textContent = "⚠ CRITICAL: CORE WORKERS DOWN — " + (cs.down || []).join(", ").toUpperCase() + " ⚠";
+    } else {
+      banner.style.display = "none";
+    }
+  }
+
+  // Service status indicator (header pill is the primary surface; refresh
+  // it here too so the health-channel update keeps it in sync).
+  const svc = payload.service || {};
+  if(svc.active){
+    const active = svc.active === "active";
+    $("service-text").textContent = active ? "ACTIVE" : svc.active.toUpperCase();
+    $("service").querySelector(".dot").className = "dot " + (active ? "green" : "red");
+  }
+
   const workers = payload.workers || [];
   const root = $("health");
   root.innerHTML = "";
@@ -240,9 +279,18 @@ function renderHealth(payload){
     for(const w of workers){
       const cls = w.status === "ok" ? "green" : w.status === "warn" ? "yellow" : w.status === "stale" ? "red" : "grey";
       const ago = w.last_seen_s != null ? Math.floor(w.last_seen_s) + "s ago" : "never";
+      const stateBadge = (w.state && w.state !== "ok")
+        ? `<span class="badge ${escapeHtml(w.state)}">${escapeHtml(w.state.toUpperCase())}</span>` : "";
+      const crashBadge = (w.crashes_5m && w.crashes_5m > 0)
+        ? `<span class="badge crashes">${w.crashes_5m}× 5m</span>` : "";
+      const totalBadge = (w.total_crashes && w.total_crashes > 0)
+        ? `<span class="badge">↻${w.total_crashes}</span>` : "";
+      const exc = w.last_exception ? ` · ${escapeHtml(w.last_exception)}` : "";
       const row = document.createElement("div");
       row.className = "health-row";
-      row.innerHTML = `<div class="name"><span class="dot ${cls}"></span>${escapeHtml(w.name)}</div><div class="ago">${ago}</div>`;
+      row.innerHTML = `
+        <div class="name"><span class="dot ${cls}"></span>${escapeHtml(w.name)}</div>
+        <div class="meta">${stateBadge}${crashBadge}${totalBadge}<span class="ago">${ago}${exc}</span></div>`;
       root.appendChild(row);
     }
   }

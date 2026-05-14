@@ -110,6 +110,48 @@ QUERY_GROUPS = [
     "IMF World Bank global", "sovereign debt crisis",
     "currency devaluation FX", "carry trade yen",
     "global supply chain disruption", "shipping freight rates",
+    # --- Global macro (expanded) ---
+    "central bank interest rates inflation global",
+    "ECB Federal Reserve BOJ rate decision",
+    "currency exchange forex dollar euro yen",
+    "oil crude gold commodity price",
+    "emerging markets GDP growth",
+    # --- Asian markets (expanded) ---
+    "Nikkei Hang Seng Shanghai stock market",
+    "TSMC Samsung ASML earnings",
+    "China economy property real estate",
+    "Japan Bank of Japan stimulus",
+    "Korea semiconductor memory",
+    # --- European markets (expanded) ---
+    "FTSE DAX CAC European stock market",
+    "ECB Draghi rate decision euro",
+    "LVMH Volkswagen ASML SAP earnings",
+    "UK economy Brexit trade",
+    # --- LatAm / MENA (expanded) ---
+    "Brazil Bovespa Petrobras commodity",
+    "Saudi Arabia oil OPEC production cut",
+    "India Sensex Nifty earnings growth",
+    # --- Crypto / macro (expanded) ---
+    "Bitcoin Ethereum crypto blockchain DeFi",
+    "stablecoin regulation SEC crypto",
+    # --- Commodities (expanded) ---
+    "gold silver copper lithium battery supply",
+    "natural gas energy price winter",
+    # --- FX (expanded) ---
+    "dollar index DXY strong weak",
+    "yuan renminbi devaluation",
+]
+
+# Multi-language queries — GDELT v2 supports sourcelang=<Language> filter.
+# Each entry: (query_string, sourcelang) — sourcelang None means English/default.
+MULTILANG_QUERIES = [
+    ("中国股市 科技股 半导体", "Chinese"),
+    ("日経 株価 決算", "Japanese"),
+    ("DAX Aktien Zinsen", "German"),
+    ("CAC bourse taux", "French"),
+    ("bolsa mercados acciones", "Spanish"),
+    ("أسواق المال النفط", "Arabic"),
+    ("주식 반도체 삼성", "Korean"),
 ]
 
 
@@ -128,7 +170,7 @@ def _article_id(url: str, title: str) -> str:
     return hashlib.sha256(f"{url}||{title}".encode()).hexdigest()
 
 
-def _fetch_query(keyword_query: str) -> list:
+def _fetch_query(keyword_query: str, sourcelang: str | None = None) -> list:
     params = {
         "query": keyword_query,
         "mode": "artlist",
@@ -137,6 +179,8 @@ def _fetch_query(keyword_query: str) -> list:
         "timespan": TIMESPAN,
         "sort": "DateDesc",
     }
+    if sourcelang:
+        params["sourcelang"] = sourcelang
     try:
         r = requests.get(GDELT_URL, params=params, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
@@ -161,7 +205,10 @@ def _fetch_query(keyword_query: str) -> list:
 
 def collect_gdelt() -> list:
     """Run all queries in parallel; skip already-seen articles via SQLite."""
-    print(f"[gdelt] Starting {len(QUERY_GROUPS)} parallel queries (7-day window, max {MAX_RECORDS} each)...")
+    total_queries = len(QUERY_GROUPS) + len(MULTILANG_QUERIES)
+    print(f"[gdelt] Starting {total_queries} parallel queries "
+          f"({len(QUERY_GROUPS)} EN + {len(MULTILANG_QUERIES)} multilang; "
+          f"7-day window, max {MAX_RECORDS} each)...")
     t0 = time.time()
 
     conn = _ensure_db()
@@ -170,6 +217,8 @@ def collect_gdelt() -> list:
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(_fetch_query, q): q for q in QUERY_GROUPS}
+        for ml_q, lang in MULTILANG_QUERIES:
+            futures[executor.submit(_fetch_query, ml_q, lang)] = f"{ml_q} [{lang}]"
         for future in as_completed(futures):
             for art in future.result():
                 url = art["link"]

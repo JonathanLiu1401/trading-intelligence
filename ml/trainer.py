@@ -4,15 +4,100 @@ Online trainer — pulls labeled articles from the store, trains ArticleNet on G
 Phase 1: bootstraps on heuristic kw_score (weak labels, available immediately).
 Phase 2: retrains as Sonnet ai_score labels accumulate (stronger labels).
 
-Aggressive GPU training: 50 epochs per cycle, batch_size=256, Adam + cosine LR.
+Aggressive GPU training: 100 epochs per cycle, batch_size=256, Adam + cosine LR.
 Schedule lives in daemon.py (RETRAIN_INTERVAL drives the cadence).
 """
+import re
 import threading
 import time
 import numpy as np
 
 from ml.embedder import get_embedder
+from ml.features import extract_features_batch
 from ml.model import get_model
+
+
+# ── time_sensitivity bootstrap labels ─────────────────────────────────────────
+# Heuristic 0..1 label fed to the time_sensitivity head. The model is expected
+# to refine these from text features over time; this is only a warm start.
+#
+#   1.0 = highly time-sensitive (earnings beats, breaking price moves, "today")
+#   0.5 = neutral / unknown
+#   0.0 = timeless (long-term thesis, secular trends, technology analysis)
+
+_HIGH_TIME_PATTERNS = re.compile(
+    r"\b(?:today|now|breaking|just|moments?\s+ago|minutes?\s+ago|hours?\s+ago|"
+    r"surges?|surged|surging|crashes?|crashed|crashing|plunges?|plunged|"
+    r"soar(?:s|ed|ing)?|tumbl(?:e|es|ed|ing)|jumps?|jumped|plummet(?:s|ed|ing)?|"
+    r"rallies|rallied|rally|spike[ds]?|nosediv(?:e|es|ed|ing)|halt(?:s|ed)?|"
+    r"earnings\s+(?:beat|miss|topped|missed)|"
+    r"beats?\s+(?:estimates?|expectations?)|misses?\s+(?:estimates?|expectations?)|"
+    r"price\s+target\s+(?:raised|cut|lowered|increased|reiterated)|"
+    r"upgrades?|downgrades?|guidance|pre[- ]?market|after[- ]?hours|"
+    r"trading\s+(?:up|down|higher|lower)|Q[1-4]\s*\d{2,4}?|"
+    r"\$\d+(?:\.\d+)?\s*(?:million|billion|m\b|b\b)?)\b",
+    re.IGNORECASE,
+)
+# Percent moves like "+5%", "down 12%", "rose 3.2%" — strong recency signal.
+_PCT_RE = re.compile(r"\b\d+(?:\.\d+)?\s*%")
+# Dollar figures with magnitude — earnings/deals are time-sensitive.
+_DOLLAR_MAG_RE = re.compile(
+    r"\$\d+(?:\.\d+)?\s*(?:k|m|b|million|billion|thousand)\b", re.IGNORECASE
+)
+
+_LOW_TIME_PATTERNS = re.compile(
+    r"\b(?:thesis|long[- ]?term|outlook|secular|trend(?:s|ing)?|technology|"
+    r"analysis|deep\s+dive|why|how\s+(?:to|the|i)|primer|guide|explained|"
+    r"explainer|fundamentals?|valuation\s+(?:case|model)|moat|tam|sam|"
+    r"the\s+case\s+for|what\s+is|introduction\s+to|overview\s+of|history\s+of|"
+    r"future\s+of|landscape|state\s+of\s+the)\b",
+    re.IGNORECASE,
+)
+
+
+def _time_sensitivity_label(title: str, summary: str = "") -> float:
+    """Heuristic 0..1 label for time-sensitivity. Bootstrap-only — model learns
+    from text features once trained on these weak labels.
+
+    Priority: high-signal recency tokens trump low-signal timeless tokens
+    (a piece titled "Why NVDA surged today" is still time-sensitive)."""
+    title_l = (title or "").strip()
+    if not title_l:
+        return 0.5
+
+    high_hits = len(_HIGH_TIME_PATTERNS.findall(title_l))
+    high_hits += len(_PCT_RE.findall(title_l))
+    high_hits += len(_DOLLAR_MAG_RE.findall(title_l))
+    low_hits  = len(_LOW_TIME_PATTERNS.findall(title_l))
+
+    # Summary contributes at half weight — title is the strongest signal.
+    if summary:
+        sum_l = summary[:500]  # cap to keep label computation cheap
+        high_hits += 0.5 * (
+            len(_HIGH_TIME_PATTERNS.findall(sum_l))
+            + len(_PCT_RE.findall(sum_l))
+            + len(_DOLLAR_MAG_RE.findall(sum_l))
+        )
+        low_hits  += 0.5 * len(_LOW_TIME_PATTERNS.findall(sum_l))
+
+    if high_hits >= 2:
+        return 0.95
+    if high_hits >= 1:
+        return 0.85
+    if low_hits >= 2:
+        return 0.15
+    if low_hits >= 1:
+        return 0.25
+    return 0.5
+
+
+def _time_sensitivity_batch(articles: list[dict]) -> np.ndarray:
+    """Compute heuristic time_sensitivity labels for a batch of articles."""
+    return np.array(
+        [_time_sensitivity_label(a.get("title", ""), a.get("summary", ""))
+         for a in articles],
+        dtype=np.float32,
+    )
 
 # Serialize all model.fit() calls. ml_trainer_worker and continuous_trainer_worker
 # both mutate the same global ArticleNet on GPU; without this lock, overlapping
@@ -21,16 +106,16 @@ from ml.model import get_model
 # the other before backward() finishes.
 _TRAIN_LOCK = threading.Lock()
 
-# Cadence — daemon reads this if it wants, but daemon.ML_TRAIN_INTERVAL is the
-# source of truth. Set to 30 min to keep the GPU busy.
-RETRAIN_INTERVAL = 1800     # retrain at most once every 30 minutes
-MIN_NEW_LABELS   = 200      # retrain if this many new LLM labels since last train
+# Cadence — daemon.ML_TRAIN_INTERVAL is the source of truth (now 3 min).
+RETRAIN_INTERVAL = 180      # retrain at most once every 3 minutes
+MIN_NEW_LABELS   = 50       # retrain if this many new LLM labels since last train
 
-# Training hyperparameters
-EPOCHS_PER_CYCLE = 50
+# Training hyperparameters — aggressive GPU usage
+# 100 epochs per cycle for the deep multi-task net (RTX 3060 trains in <5s).
+EPOCHS_PER_CYCLE = 100
 BATCH_SIZE       = 256
 LEARNING_RATE    = 1e-3
-MIN_TRAIN_SAMPLES = 100      # below this we bootstrap from kw_score weak labels
+MIN_TRAIN_SAMPLES = 50       # below this we bootstrap from kw_score weak labels
 
 # Uncertainty thresholds — articles with uncertainty above this go to LLM
 UNCERTAINTY_REL  = 1.5      # std in relevance score
@@ -41,24 +126,78 @@ LLM_ZONE_MID_HI  = 8.5
 LLM_ZONE_CLEAR_NOISE  = 3.0  # below this → clearly noise, skip LLM
 
 
-def _fetch_training_data(store) -> tuple[list[str], np.ndarray, np.ndarray, str]:
+def _fetch_briefing_samples(
+    store, limit: int = 100
+) -> tuple[list[str], list[dict], list[float], list[float]]:
+    """Pull articles mentioned in recent Opus briefings as high-quality positive labels.
+
+    Articles whose title prefix appears in any recent briefing get a strong
+    positive label (score=4.5). Briefings are generated by Opus 4.7 every 5h
+    and serve as a curation signal independent of Sonnet scoring."""
+    from storage.article_store import decompress
+
+    texts: list[str] = []
+    articles: list[dict] = []
+    rels: list[float] = []
+    urgs: list[float] = []
+    try:
+        briefings = store.get_briefings_for_training(limit=limit)
+    except Exception:
+        return texts, articles, rels, urgs
+    if not briefings:
+        return texts, articles, rels, urgs
+
+    combined = " ||| ".join((b.get("text") or "").lower() for b in briefings)
+
+    cur = store.conn.execute(
+        "SELECT title, full_text, source, published FROM articles "
+        "ORDER BY first_seen DESC LIMIT 5000"
+    )
+    for title, blob, src, published in cur.fetchall():
+        if not title or len(title) < 8:
+            continue
+        if title[:40].lower() not in combined:
+            continue
+        summary = decompress(blob) if blob else ""
+        texts.append(f"{title} {summary}")
+        articles.append({
+            "title": title, "summary": summary,
+            "source": src or "", "published": published or "",
+        })
+        rels.append(4.5)
+        urgs.append(0.0)
+    return texts, articles, rels, urgs
+
+
+def _fetch_training_data(
+    store,
+) -> tuple[list[str], list[dict], np.ndarray, np.ndarray, str]:
     """
     Pull articles with scores from the store.
-    Returns (texts, y_rel, y_urg, source) where source ∈ {"strong","weak","mixed"}.
+    Returns (texts, articles, y_rel, y_urg, source). ``articles`` is a list of
+    light dicts (title/summary/source/published) parallel to ``texts``, used by
+    ml/features.py to produce the extra numeric feature columns.
+    ``source`` ∈ {"strong","weak","mixed","briefing_only"}.
     """
     from storage.article_store import decompress
 
-    texts, rels, urgs = [], [], []
+    texts: list[str] = []
+    articles: list[dict] = []
+    rels, urgs = [], []
     source = "strong"
 
     # Strong labels: Sonnet ai_score
     cur = store.conn.execute(
-        "SELECT title, full_text, ai_score FROM articles "
-        "WHERE ai_score > 0 ORDER BY first_seen DESC LIMIT 15000"
+        "SELECT title, full_text, ai_score, source, published "
+        "FROM articles WHERE ai_score > 0 ORDER BY first_seen DESC LIMIT 15000"
     )
-    for title, blob, ai in cur.fetchall():
+    for title, blob, ai, src, published in cur.fetchall():
         summary = decompress(blob) if blob else ""
         texts.append(f"{title} {summary}")
+        articles.append({
+            "title": title or "", "summary": summary,
+            "source": src or "", "published": published or "",
+        })
         rels.append(float(ai))
         urgs.append(float(ai) if ai >= 8.0 else 0.0)
 
@@ -67,27 +206,42 @@ def _fetch_training_data(store) -> tuple[list[str], np.ndarray, np.ndarray, str]
     # Bootstrap with weak labels when strong labels are sparse
     if n_strong < MIN_TRAIN_SAMPLES:
         cur2 = store.conn.execute(
-            "SELECT title, full_text, kw_score FROM articles "
-            "WHERE ai_score = 0 AND kw_score > 0 ORDER BY kw_score DESC LIMIT 8000"
+            "SELECT title, full_text, kw_score, source, published "
+            "FROM articles WHERE ai_score = 0 AND kw_score > 0 "
+            "ORDER BY kw_score DESC LIMIT 8000"
         )
-        for title, blob, kw in cur2.fetchall():
+        for title, blob, kw, src, published in cur2.fetchall():
             summary = decompress(blob) if blob else ""
             texts.append(f"{title} {summary}")
+            articles.append({
+                "title": title or "", "summary": summary,
+                "source": src or "", "published": published or "",
+            })
             rels.append(float(kw))
             urgs.append(0.0)
         source = "weak" if n_strong == 0 else "mixed"
 
+    # Opus briefing-derived positive labels — high signal quality.
+    b_texts, b_articles, b_rels, b_urgs = _fetch_briefing_samples(store)
+    if b_texts:
+        texts.extend(b_texts)
+        articles.extend(b_articles)
+        rels.extend(b_rels)
+        urgs.extend(b_urgs)
+        if n_strong == 0 and source == "strong":
+            source = "briefing_only"
+
     y_rel = np.clip(np.array(rels, dtype=np.float32), 0, 10)
     y_urg = np.clip(np.array(urgs, dtype=np.float32), 0, 10)
-    return texts, y_rel, y_urg, source
+    return texts, articles, y_rel, y_urg, source
 
 
 def train(store, force: bool = False) -> dict:
     """Train/retrain ArticleNet on available labeled data. Returns metrics dict."""
     t0 = time.time()
-    texts, y_rel, y_urg, source = _fetch_training_data(store)
+    texts, articles, y_rel, y_urg, source = _fetch_training_data(store)
 
-    if len(texts) < 50:
+    if len(texts) < 30:
         return {"status": "skipped", "reason": "too_few_samples", "n": len(texts)}
 
     print(f"[ml:trainer] Training on {len(texts)} samples "
@@ -96,14 +250,21 @@ def train(store, force: bool = False) -> dict:
 
     emb = get_embedder()
     if not emb.fitted:
-        X = emb.fit_transform(texts)
+        X_text = emb.fit_transform(texts)
     else:
-        X = emb.transform(texts)
+        X_text = emb.transform(texts)
+
+    X_extra = extract_features_batch(articles)
+    X = np.concatenate([X_text, X_extra], axis=1).astype(np.float32)
+
+    # Bootstrap time_sensitivity labels from title/summary heuristics. The model
+    # will refine these from the underlying text features after a few cycles.
+    y_time = _time_sensitivity_batch(articles)
 
     model = get_model()
     with _TRAIN_LOCK:
         metrics = model.fit(
-            X, y_rel, y_urg,
+            X, y_rel, y_urg, y_time=y_time,
             epochs=EPOCHS_PER_CYCLE,
             batch_size=BATCH_SIZE,
             lr=LEARNING_RATE,
@@ -133,18 +294,25 @@ def train_continuous(store) -> dict:
 
     t0 = time.time()
 
-    texts, rels, urgs = [], [], []
+    texts: list[str] = []
+    articles: list[dict] = []
+    rels, urgs = [], []
     cur = store.conn.execute(
-        "SELECT title, full_text, ai_score FROM articles WHERE ai_score > 0"
+        "SELECT title, full_text, ai_score, source, published "
+        "FROM articles WHERE ai_score > 0"
     )
-    for title, blob, ai in cur.fetchall():
+    for title, blob, ai, src, published in cur.fetchall():
         summary = decompress(blob) if blob else ""
         texts.append(f"{title} {summary}")
+        articles.append({
+            "title": title or "", "summary": summary,
+            "source": src or "", "published": published or "",
+        })
         rels.append(float(ai))
         urgs.append(float(ai) if ai >= 8.0 else 0.0)
 
     n = len(texts)
-    if n < 50:
+    if n < 30:
         return {"status": "skipped", "reason": "too_few_samples", "n": n}
 
     y_rel = np.clip(np.array(rels, dtype=np.float32), 0, 10)
@@ -152,9 +320,14 @@ def train_continuous(store) -> dict:
 
     emb = get_embedder()
     if not emb.fitted:
-        X = emb.fit_transform(texts)
+        X_text = emb.fit_transform(texts)
     else:
-        X = emb.transform(texts)
+        X_text = emb.transform(texts)
+    X_extra = extract_features_batch(articles)
+    X = np.concatenate([X_text, X_extra], axis=1).astype(np.float32)
+
+    # Bootstrap time_sensitivity labels alongside relevance/urgency targets.
+    y_time = _time_sensitivity_batch(articles)
 
     model = get_model()
     # Skip rather than block: if the heavy trainer is mid-fit, just wait for the
@@ -162,7 +335,8 @@ def train_continuous(store) -> dict:
     if not _TRAIN_LOCK.acquire(blocking=False):
         return {"status": "skipped", "reason": "trainer_busy", "n": n}
     try:
-        metrics = model.fit(X, y_rel, y_urg, epochs=20, batch_size=512, lr=1e-3)
+        metrics = model.fit(X, y_rel, y_urg, y_time=y_time,
+                            epochs=40, batch_size=512, lr=1e-3)
     finally:
         _TRAIN_LOCK.release()
 

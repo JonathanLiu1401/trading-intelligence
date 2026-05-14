@@ -13,6 +13,7 @@ except Exception:  # pragma: no cover
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 PORTFOLIO_PATH = BASE_DIR / "config" / "portfolio.json"
+PNL_OUTPUT_PATH = BASE_DIR / "data" / "portfolio_pl.json"
 
 log = logging.getLogger("portfolio_pnl")
 
@@ -234,6 +235,161 @@ def format_pnl_block(data: Optional[dict]) -> str:
         lines.append(f"as of {as_of}")
 
     return "\n".join(lines)
+
+
+def _fetch_option_price(underlying: str, expiry: str, strike: float, opt_type: str) -> Optional[float]:
+    """Return mid price of an option contract from yfinance, or None on failure.
+
+    expiry is YYYY-MM-DD. opt_type is 'call' or 'put'.
+    """
+    if yf is None:
+        return None
+    try:
+        t = yf.Ticker(underlying)
+        if expiry not in (t.options or ()):
+            return None
+        chain = t.option_chain(expiry)
+        df = chain.calls if opt_type.lower() == "call" else chain.puts
+        if df is None or df.empty:
+            return None
+        row = df[df["strike"] == strike]
+        if row.empty:
+            return None
+        bid = float(row.iloc[0].get("bid") or 0)
+        ask = float(row.iloc[0].get("ask") or 0)
+        last = float(row.iloc[0].get("lastPrice") or 0)
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        if last > 0:
+            return last
+    except Exception as e:
+        log.warning(f"option chain fetch failed for {underlying} {expiry} {strike}: {e}")
+    return None
+
+
+def get_full_snapshot() -> dict:
+    """Comprehensive P&L snapshot: equities (via get_portfolio_pnl) + options.
+
+    Always returns a dict; ``positions`` and ``options`` lists may be empty.
+    Writes nothing — caller controls persistence.
+    """
+    base = get_portfolio_pnl() or {
+        "positions": [], "summary": {"total_value": 0.0, "total_cost": 0.0,
+                                      "total_pnl": 0.0, "total_pnl_pct": 0.0,
+                                      "priced": 0, "total_positions": 0},
+        "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+    try:
+        with open(PORTFOLIO_PATH, "r") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+
+    option_rows: list[dict] = []
+    opt_market = 0.0
+    opt_cost = 0.0
+    opt_priced = 0
+    for opt in cfg.get("options", []):
+        try:
+            qty = float(opt.get("qty", 0))
+            avg_cost = float(opt.get("avg_cost", 0))
+            strike = float(opt.get("strike", 0))
+        except (TypeError, ValueError):
+            continue
+        underlying = opt.get("underlying") or ""
+        expiry = opt.get("expiry") or ""
+        opt_type = opt.get("type") or "call"
+        symbol = opt.get("symbol") or f"{underlying} {opt_type.upper()} {expiry} {strike}"
+
+        # Options are quoted per share; one contract represents 100 shares.
+        cost_basis = qty * avg_cost * 100.0
+        row = {
+            "symbol": symbol,
+            "underlying": underlying,
+            "type": opt_type,
+            "expiry": expiry,
+            "strike": strike,
+            "qty": qty,
+            "avg_cost": avg_cost,
+            "price": None,
+            "value": None,
+            "cost": round(cost_basis, 2),
+            "pnl": None,
+            "pnl_pct": None,
+        }
+        price = _fetch_option_price(underlying, expiry, strike, opt_type) if (underlying and expiry) else None
+        if price is not None and price > 0:
+            value = qty * price * 100.0
+            pnl = value - cost_basis
+            pnl_pct = (pnl / cost_basis * 100.0) if cost_basis else 0.0
+            row.update({
+                "price": round(price, 4),
+                "value": round(value, 2),
+                "pnl": round(pnl, 2),
+                "pnl_pct": round(pnl_pct, 2),
+            })
+            opt_market += value
+            opt_cost += cost_basis
+            opt_priced += 1
+        option_rows.append(row)
+
+    summary = dict(base.get("summary", {}))
+    summary["options_value"] = round(opt_market, 2)
+    summary["options_cost"] = round(opt_cost, 2)
+    summary["options_pnl"] = round(opt_market - opt_cost, 2)
+    summary["options_priced"] = opt_priced
+    summary["options_count"] = len(option_rows)
+    # Grand totals across equities + options
+    eq_val = float(summary.get("total_value", 0) or 0)
+    eq_cost = float(summary.get("total_cost", 0) or 0)
+    summary["grand_value"] = round(eq_val + opt_market, 2)
+    summary["grand_cost"] = round(eq_cost + opt_cost, 2)
+    summary["grand_pnl"] = round(summary["grand_value"] - summary["grand_cost"], 2)
+    summary["grand_pnl_pct"] = (
+        round(summary["grand_pnl"] / summary["grand_cost"] * 100.0, 2)
+        if summary["grand_cost"] else 0.0
+    )
+
+    return {
+        "positions": base.get("positions", []),
+        "options": option_rows,
+        "summary": summary,
+        "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def write_pl_snapshot() -> Optional[dict]:
+    """Build a full snapshot and atomically write it to data/portfolio_pl.json.
+
+    Returns the snapshot dict on success, None on failure.
+    """
+    try:
+        snap = get_full_snapshot()
+    except Exception as e:
+        log.warning(f"write_pl_snapshot: snapshot failed: {e}")
+        return None
+    try:
+        PNL_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PNL_OUTPUT_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(snap, f, indent=2)
+        tmp.replace(PNL_OUTPUT_PATH)
+        return snap
+    except Exception as e:
+        log.warning(f"write_pl_snapshot: write failed: {e}")
+        return None
+
+
+def read_pl_snapshot() -> Optional[dict]:
+    """Read the latest portfolio_pl.json (None if missing/unreadable)."""
+    if not PNL_OUTPUT_PATH.exists():
+        return None
+    try:
+        with open(PNL_OUTPUT_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":
