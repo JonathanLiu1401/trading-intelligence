@@ -7,11 +7,19 @@ Phase 2: retrains as Sonnet ai_score labels accumulate (stronger labels).
 Aggressive GPU training: 50 epochs per cycle, batch_size=256, Adam + cosine LR.
 Schedule lives in daemon.py (RETRAIN_INTERVAL drives the cadence).
 """
+import threading
 import time
 import numpy as np
 
 from ml.embedder import get_embedder
 from ml.model import get_model
+
+# Serialize all model.fit() calls. ml_trainer_worker and continuous_trainer_worker
+# both mutate the same global ArticleNet on GPU; without this lock, overlapping
+# fits raise "variable needed for gradient computation has been modified by an
+# inplace operation" because autograd buffers from one pass get overwritten by
+# the other before backward() finishes.
+_TRAIN_LOCK = threading.Lock()
 
 # Cadence — daemon reads this if it wants, but daemon.ML_TRAIN_INTERVAL is the
 # source of truth. Set to 30 min to keep the GPU busy.
@@ -93,12 +101,13 @@ def train(store, force: bool = False) -> dict:
         X = emb.transform(texts)
 
     model = get_model()
-    metrics = model.fit(
-        X, y_rel, y_urg,
-        epochs=EPOCHS_PER_CYCLE,
-        batch_size=BATCH_SIZE,
-        lr=LEARNING_RATE,
-    )
+    with _TRAIN_LOCK:
+        metrics = model.fit(
+            X, y_rel, y_urg,
+            epochs=EPOCHS_PER_CYCLE,
+            batch_size=BATCH_SIZE,
+            lr=LEARNING_RATE,
+        )
 
     elapsed = time.time() - t0
     return {
@@ -148,7 +157,14 @@ def train_continuous(store) -> dict:
         X = emb.transform(texts)
 
     model = get_model()
-    metrics = model.fit(X, y_rel, y_urg, epochs=20, batch_size=512, lr=1e-3)
+    # Skip rather than block: if the heavy trainer is mid-fit, just wait for the
+    # next 60s tick. Avoids piling up continuous passes behind a long retrain.
+    if not _TRAIN_LOCK.acquire(blocking=False):
+        return {"status": "skipped", "reason": "trainer_busy", "n": n}
+    try:
+        metrics = model.fit(X, y_rel, y_urg, epochs=20, batch_size=512, lr=1e-3)
+    finally:
+        _TRAIN_LOCK.release()
 
     final_loss = metrics.get("final_loss")
     if final_loss is not None and final_loss < _last_continuous_loss:
