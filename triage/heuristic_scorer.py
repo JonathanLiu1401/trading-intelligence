@@ -39,8 +39,9 @@ PORTFOLIO = PORTFOLIO_TICKERS | PORTFOLIO_NAMES
 # Phrase terms — safe substring matches (unique enough not to false-positive).
 TIER_PORTFOLIO_PHRASES = {  # 4 pts each — direct portfolio/focus names
     "micron", "sk hynix", "kioxia", "western digital", "lumentum", "tower semi",
-    "dram asp", "nand pricing", "hbm3", "hbm2e", "lpddr5",
+    "dram asp", "nand pricing", "hbm3", "hbm3e", "hbm4", "hbm2e", "lpddr5", "lpddr5x",
     "memory pricing", "dram supply", "nand oversupply",
+    "gddr7", "ddr5 server",
 }
 # Bare tickers — must match on word boundaries; substring matching produced
 # false positives ("mu"→"museum") and false negatives ("MU." at end of string
@@ -57,15 +58,17 @@ _TIER_PORTFOLIO_TICKER_RE = re.compile(
 TIER_PORTFOLIO = TIER_PORTFOLIO_PHRASES | TIER_PORTFOLIO_TICKERS
 
 TIER_MEMORY = {  # 3 pts each — kioxia intentionally NOT here (already in TIER_PORTFOLIO)
-    "dram", "nand", "hbm", "lpddr", "memory chip", "flash storage",
+    "dram", "nand", "hbm", "lpddr", "ddr5", "memory chip", "flash storage",
     "wafer start", "bit growth", "capex intensity", "memory maker",
-    "samsung memory", "samsung semiconductor",
+    "samsung memory", "samsung semiconductor", "enterprise ssd", "qlc nand",
 }
 TIER_SEMIS = {  # 2 pts each
     "semiconductor", "chip", "asml", "nvidia", "tsmc", "amd", "intel",
     "qualcomm", "marvell", "broadcom", "euv", "foundry", "fab",
-    "chip equipment", "packaging", "advanced packaging",
+    "chip equipment", "packaging", "advanced packaging", "cowos", "co-wos",
     "ai chip", "gpu", "hpc", "data center chip",
+    "samsung foundry", "rapidus", "umc", "globalfoundries",
+    "chips act", "ai infrastructure", "ai factory", "hyperscaler capex",
 }
 TIER_MACRO = {  # 1.5 pts each
     "federal reserve", "fomc", "rate cut", "rate hike", "rate decision",
@@ -122,6 +125,12 @@ EVENT_PATTERNS = [
     # ASP / pricing moves
     (re.compile(r"\b(asp|average selling price).{0,20}(\d+%|rise|fall|drop|jump)\b", re.I), 2.1, "pricing"),
     (re.compile(r"\b(dram|nand|hbm).{0,20}(price|pricing).{0,20}(\d+%|up|down|surge|plunge)\b", re.I), 2.4, "pricing"),
+    # Government subsidy / industrial policy
+    (re.compile(r"\b(chips act|chips and science).{0,40}(award|grant|funding|subsid|disburs|billion)\b", re.I), 2.3, "subsidy"),
+    (re.compile(r"\b(doe|commerce dept|commerce department).{0,30}(grant|loan|award).{0,20}(semi|chip|fab)\b", re.I), 2.1, "subsidy"),
+    # Capacity expansion / new fabs (forward-looking supply signal)
+    (re.compile(r"\b(new|build|expand|break ground|groundbreaking).{0,30}(fab|foundry|wafer plant)\b", re.I), 1.9, "capex"),
+    (re.compile(r"\b(capex|capital expenditure).{0,20}(raise|increase|hike|cut|reduce).{0,15}(\d+%|billion)\b", re.I), 2.0, "capex"),
 ]
 
 # ── Source authority weights ─────────────────────────────────────────────────
@@ -223,10 +232,10 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
     for term in TIER_PORTFOLIO_PHRASES:
         if term in text:
             kw += 4.0
-    # Bare tickers: count each unique ticker match once with word boundaries.
-    for _ in _TIER_PORTFOLIO_TICKER_RE.findall(text):
+    # Bare tickers: single boost per article when any portfolio ticker is mentioned
+    # (word boundaries prevent false positives like "museum" → "mu").
+    if _TIER_PORTFOLIO_TICKER_RE.search(text):
         kw += 4.0
-        break  # one boost per article, mirroring prior single-add semantics
     for term in TIER_MEMORY:
         if term in text:
             kw += 3.0
