@@ -6,6 +6,7 @@ import functools
 import hashlib
 import logging
 import os
+import random
 import sqlite3
 import threading
 import time
@@ -24,15 +25,16 @@ except Exception:
 # ── DB lock retry helper ────────────────────────────────────────────────────
 # Even with PRAGMA busy_timeout=60000, sustained writer contention from many
 # threads occasionally surfaces ``OperationalError("database is locked")``
-# (e.g., during long PRAGMA wal_checkpoint(TRUNCATE) calls). Retry up to 3x
-# with a 1s sleep before bubbling up — and log a warning the first time so
-# we can tell if it's masking real contention.
-_LOCK_RETRY_ATTEMPTS = 3
-_LOCK_RETRY_SLEEP_S = 1.0
+# (e.g., during long PRAGMA wal_checkpoint(TRUNCATE) calls). Retry with
+# exponential backoff + jitter to avoid thundering-herd retries that would
+# just collide again at the same instant. Bubble up after the budget is spent.
+_LOCK_RETRY_ATTEMPTS = 5
+_LOCK_RETRY_BASE_S = 0.25
+_LOCK_RETRY_CAP_S = 4.0
 
 
 def _retry_on_lock(func):
-    """Decorator: retry up to 3x on 'database is locked' OperationalError."""
+    """Decorator: retry on 'database is locked' with exp backoff + jitter."""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         last = None
@@ -44,12 +46,16 @@ def _retry_on_lock(func):
                     raise
                 last = e
                 if attempt + 1 < _LOCK_RETRY_ATTEMPTS:
+                    # Exponential backoff: 0.25, 0.5, 1.0, 2.0, ... capped at 4s.
+                    # Add jitter in [0.5x, 1.5x) so concurrent retriers desync.
+                    delay = min(_LOCK_RETRY_BASE_S * (2 ** attempt), _LOCK_RETRY_CAP_S)
+                    delay *= 0.5 + random.random()
                     _log.warning(
                         f"[article_store] {func.__name__}: 'database is locked' "
                         f"(attempt {attempt + 1}/{_LOCK_RETRY_ATTEMPTS}); "
-                        f"retrying in {_LOCK_RETRY_SLEEP_S}s"
+                        f"retrying in {delay:.2f}s"
                     )
-                    time.sleep(_LOCK_RETRY_SLEEP_S)
+                    time.sleep(delay)
         assert last is not None
         _log.error(
             f"[article_store] {func.__name__}: lock retry exhausted after "
