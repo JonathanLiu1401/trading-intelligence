@@ -118,9 +118,13 @@ class ArticleNet:
         ds = torch.utils.data.TensorDataset(X_t, y_t)
         # pin_memory only helps for CUDA; keep CPU path simple
         pin = (self.device.type == "cuda")
+        # BatchNorm1d errors out on a batch of size 1 in train mode. Drop the
+        # final partial batch whenever it would be a singleton (n % bs == 1),
+        # provided we have at least one full batch to train on.
+        drop_last = (n > batch_size) and (n % batch_size == 1)
         loader = torch.utils.data.DataLoader(
             ds, batch_size=batch_size, shuffle=True,
-            pin_memory=pin, num_workers=0, drop_last=False,
+            pin_memory=pin, num_workers=0, drop_last=drop_last,
         )
 
         opt = torch.optim.Adam(self.net.parameters(), lr=lr, weight_decay=1e-5)
