@@ -58,6 +58,7 @@ from collectors.substack_collector import collect_substack
 from collectors.finnhub_collector import collect_finnhub
 from collectors.alphavantage_collector import collect_alphavantage
 from collectors.polygon_collector import collect_polygon
+from collectors.massive_collector import collect_massive
 from collectors.newsapi_collector import collect_newsapi
 from collectors.yahoo_ticker_rss import collect_yahoo_ticker_rss
 from collectors.wikipedia_collector import collect_wikipedia
@@ -99,6 +100,7 @@ SUBSTACK_INTERVAL   = 600         # Substack newsletters every 10min
 FINNHUB_INTERVAL    = 300         # Finnhub per-ticker company news every 5min
 ALPHAVANTAGE_INTERVAL = 1800      # AlphaVantage NEWS_SENTIMENT every 30min (free=25/day)
 POLYGON_INTERVAL    = 600         # Polygon news per-ticker every 10min (free=5/min)
+MASSIVE_INTERVAL    = 600         # Massive.com news per-ticker every 10min
 NEWSAPI_INTERVAL    = 1500        # NewsAPI keyword search every 25min (free=100/day)
 YAHOO_TICKER_RSS_INTERVAL = 240   # Yahoo per-ticker RSS every 4min
 WIKIPEDIA_INTERVAL  = 600         # Wikipedia recent-changes filter every 10min
@@ -148,7 +150,7 @@ SUPERVISOR_STATE_PATH = BASE_DIR / "logs" / "supervisor_state.json"
 ALL_WORKERS = (
     "gdelt", "rss", "web", "reddit", "ticker", "sec_edgar", "sec_edgar_ft",
     "google_news", "nitter", "substack",
-    "finnhub", "alphavantage", "polygon", "newsapi",
+    "finnhub", "alphavantage", "polygon", "massive", "newsapi",
     "yahoo_ticker_rss", "wikipedia",
     "scorer", "alert", "heartbeat", "purge", "stats",
     "ml_trainer", "continuous_trainer", "recursive_labeler", "price_alert",
@@ -663,6 +665,28 @@ def polygon_worker(store: ArticleStore):
         _sleep(POLYGON_INTERVAL)
 
 
+# ── Worker: Massive.com news — every 10min ─────────────────────────────────
+def massive_worker(store: ArticleStore):
+    log.info("[massive_worker] started")
+    bo = Backoff("massive", base=15.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_massive()
+            _ingest(store, articles, "massive")
+            try:
+                source_health.record_result("massive", len(articles))
+            except Exception as he:
+                log.warning(f"[massive_worker] source_health error: {he}")
+            _worker_last_ok["massive"] = time.time()
+            log.debug(f"[massive] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[massive_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(MASSIVE_INTERVAL)
+
+
 # ── Worker: NewsAPI keyword search — every 25min (quota=100/day) ────────────
 def newsapi_worker(store: ArticleStore):
     log.info("[newsapi_worker] started")
@@ -792,6 +816,16 @@ def web_server_worker(store: ArticleStore):
     try:
         from dashboard.web_server import run_server
         run_server(store, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
+        # run_server is expected to block until shutdown. A return without
+        # exception means Werkzeug exited (typically due to socket close from
+        # a duplicate process binding :8080). Surface it so the supervisor's
+        # crash counter and audit logs reflect a real failure instead of an
+        # untraceable clean_return.
+        if _running:
+            raise RuntimeError(
+                f"run_server returned unexpectedly (port {WEB_SERVER_PORT} "
+                "may be held by another process)"
+            )
     except Exception as e:
         log.error(f"[web_server_worker] crashed: {e}")
         # Sleep before letting the supervisor respawn so we don't hot-loop on
@@ -1177,6 +1211,7 @@ def main():
         ("finnhub",     finnhub_worker),
         ("alphavantage", alphavantage_worker),
         ("polygon",     polygon_worker),
+        ("massive",     massive_worker),
         ("newsapi",     newsapi_worker),
         ("yahoo_ticker_rss", yahoo_ticker_rss_worker),
         ("wikipedia",   wikipedia_worker),
