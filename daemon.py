@@ -17,11 +17,19 @@ Workers:
   W10 ml_trainer_worker  — retrains ArticleNet hourly on accumulated LLM labels
   W11 price_alert_worker — alerts on >3% portfolio moves every 5min
   W12 continuous_trainer_worker — lightweight 20-epoch GPU pass every 60s to keep RTX 3060 hot
+  W12b recursive_labeler_worker — three-tier Claude labeling (Sonnet+Opus) every 4h
+  W13 sec_edgar_worker   — SEC 8-K RSS feed for portfolio/watchlist tickers every 5min
+  W14 google_news_worker — round-robin Google News RSS per portfolio ticker every 5min
+  W15 portfolio_pl_worker — writes data/portfolio_pl.json every 5min via yfinance
+  W16 sentiment_trends_worker — writes data/sentiment_trends.json every 10min
+  W17 web_server_worker  — Flask dashboard bound to 0.0.0.0:8080
 """
+import json
 import os
 import sys
 import time
 import signal
+import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,8 +50,19 @@ from collectors.web_scraper import scrape_web
 from collectors.stock_data import get_stock_data
 from collectors.earnings_calendar import get_earnings
 from collectors.options_monitor import get_options_data, format_options_block
-from collectors.portfolio_pnl import get_portfolio_pnl, format_pnl_block
+from collectors.portfolio_pnl import get_portfolio_pnl, format_pnl_block, write_pl_snapshot
+from collectors.sec_edgar import collect_sec_edgar, collect_sec_edgar_fulltext
+from collectors.google_news import collect_google_news
+from collectors.nitter_collector import collect_nitter
+from collectors.substack_collector import collect_substack
+from collectors.finnhub_collector import collect_finnhub
+from collectors.alphavantage_collector import collect_alphavantage
+from collectors.polygon_collector import collect_polygon
+from collectors.newsapi_collector import collect_newsapi
+from collectors.yahoo_ticker_rss import collect_yahoo_ticker_rss
+from collectors.wikipedia_collector import collect_wikipedia
 from collectors import source_health
+from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
 from analysis.claude_analyst import analyze
 from notifier.discord_notifier import send as discord_send
@@ -51,26 +70,49 @@ from storage.article_store import ArticleStore
 from watchers.urgency_scorer import score_batch
 from watchers.alert_agent import send_urgent_alert
 from ml.inference import triage_articles
+from ml.sentiment_trends import write_trends as write_score_trends
 from ml.trainer import train as ml_train
 from ml.trainer import train_continuous
+from ml.recursive_labeler import run_recursive_labeling
 
 # ── Config ──────────────────────────────────────────────────────────────────
 HEARTBEAT_INTERVAL  = 5 * 3600   # 5h
-RSS_INTERVAL        = 30          # re-poll RSS every 60s
-WEB_INTERVAL        = 90          # scrape web every 90s
-REDDIT_INTERVAL     = 45          # re-poll Reddit every 90s
-TICKER_INTERVAL     = 60          # re-fetch ticker news every 120s
-SCORE_INTERVAL      = 15          # run scoring pass every 30s
+RSS_INTERVAL        = 30          # re-poll RSS every 30s (collector is parallelized)
+WEB_INTERVAL        = 60          # scrape web every 60s
+REDDIT_INTERVAL     = 45          # re-poll Reddit every 45s
+TICKER_INTERVAL     = 60          # re-fetch ticker news every 60s
+SCORE_INTERVAL      = 30          # run scoring pass every 30s
 ALERT_CHECK         = 20          # check for urgent alerts every 20s
 PURGE_INTERVAL      = 6 * 3600   # purge old data every 6h
 GDELT_INTERVAL      = 600         # full GDELT sweep every 10min
-ML_TRAIN_INTERVAL   = 900         # retrain ArticleNet every 30 minutes (GPU)
-CONTINUOUS_TRAIN_INTERVAL = 60   # lightweight GPU pass every 60s
+ML_TRAIN_INTERVAL   = 180         # full ArticleNet retrain every 3 min (GPU)
+CONTINUOUS_TRAIN_INTERVAL = 120   # lightweight GPU pass every 2 min
+RECURSIVE_LABEL_INTERVAL = 4 * 3600  # recursive Claude labeling every 4h
 PRICE_ALERT_INTERVAL = 300        # check portfolio prices every 5min
 PRICE_ALERT_THRESHOLD = 3.0       # alert when |%| move >= this
 WORKER_HEALTH_STALE_SECS = 15 * 60  # mark worker stale in heartbeat if no success in this many seconds
+SEC_EDGAR_INTERVAL  = 300         # SEC 8-K RSS sweep every 5min
+SEC_EDGAR_FT_INTERVAL = 900       # SEC full-text per-ticker every 15min
+GOOGLE_NEWS_INTERVAL = 120        # Google News per-ticker pass every 2min
+NITTER_INTERVAL     = 180         # Nitter twitter mirror every 3min
+SUBSTACK_INTERVAL   = 600         # Substack newsletters every 10min
+FINNHUB_INTERVAL    = 300         # Finnhub per-ticker company news every 5min
+ALPHAVANTAGE_INTERVAL = 1800      # AlphaVantage NEWS_SENTIMENT every 30min (free=25/day)
+POLYGON_INTERVAL    = 600         # Polygon news per-ticker every 10min (free=5/min)
+NEWSAPI_INTERVAL    = 1500        # NewsAPI keyword search every 25min (free=100/day)
+YAHOO_TICKER_RSS_INTERVAL = 240   # Yahoo per-ticker RSS every 4min
+WIKIPEDIA_INTERVAL  = 600         # Wikipedia recent-changes filter every 10min
+PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
+SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
+WEB_SERVER_PORT     = int(os.environ.get("WEB_SERVER_PORT", "8080"))
+WEB_SERVER_HOST     = os.environ.get("WEB_SERVER_HOST", "0.0.0.0")
 
-PORTFOLIO_TICKERS = ("LITE", "MU", "MSFT", "AXTI", "ORCL", "TSEM", "QBTS")
+# Active portfolio + watchlist tickers used for price alerts and relevance boosts.
+# Keep in sync with config/portfolio.json (positions + sector_watchlist).
+PORTFOLIO_TICKERS = (
+    "LITE", "LNOK", "MUU", "DRAM", "SNDU",
+    "MU", "MSFT", "AXTI", "ORCL", "TSEM", "QBTS", "NVDA",
+)
 
 log = get_logger("daemon")
 
@@ -79,6 +121,42 @@ _store_lock = threading.Lock()
 _worker_last_ok: dict[str, float] = {}
 _last_prices: dict[str, float] = {}
 
+# ── Supervisor state (one entry per worker) ─────────────────────────────────
+# Tracks crash history, current health state, and pending respawn timing so
+# the main supervisor loop can react smarter than "restart immediately".
+CRASH_WINDOW_SECS = 300           # crash counts evaluated over this window
+DEGRADED_THRESHOLD = 3            # 3+ crashes in window → degraded
+DISABLED_THRESHOLD = 10           # 10+ crashes in window → disabled
+DEGRADED_BACKOFF_SECS = 60        # respawn delay while degraded
+DISABLED_DURATION_SECS = 30 * 60  # how long a disabled worker stays off
+OOM_BACKOFF_SECS = 30             # respawn delay after a MemoryError
+HEALTH_REPORT_INTERVAL_SECS = 300 # write per-worker health entry every 5min
+
+_supervisor_lock = threading.Lock()
+_worker_crashes: dict[str, list[float]] = {}        # timestamps of recent crashes
+_worker_state: dict[str, str] = {}                  # "ok" | "degraded" | "disabled"
+_worker_disabled_until: dict[str, float] = {}       # epoch when re-enable is allowed
+_worker_respawn_at: dict[str, float] = {}           # epoch when respawn should fire
+_worker_last_exception: dict[str, str] = {}         # last exception class name
+_worker_total_crashes: dict[str, int] = {}          # cumulative crash count since daemon start
+
+SUPERVISOR_STATE_PATH = BASE_DIR / "logs" / "supervisor_state.json"
+
+# Names of all worker threads — kept in sync with `workers` in main(). Used
+# by the health reporter so dashboards know what to expect even when a worker
+# has never logged anything yet.
+ALL_WORKERS = (
+    "gdelt", "rss", "web", "reddit", "ticker", "sec_edgar", "sec_edgar_ft",
+    "google_news", "nitter", "substack",
+    "finnhub", "alphavantage", "polygon", "newsapi",
+    "yahoo_ticker_rss", "wikipedia",
+    "scorer", "alert", "heartbeat", "purge", "stats",
+    "ml_trainer", "continuous_trainer", "recursive_labeler", "price_alert",
+    "portfolio_pl", "sentiment_trends", "export", "web_server",
+)
+# If all of these are stale at once the dashboard shows the CRITICAL banner.
+CORE_WORKERS = ("rss", "web", "reddit", "scorer")
+
 def _handle_signal(sig, frame):
     global _running
     log.info(f"Signal {sig} — shutting down")
@@ -86,6 +164,207 @@ def _handle_signal(sig, frame):
 
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT,  _handle_signal)
+
+
+# ── Memory / GPU OOM handling ───────────────────────────────────────────────
+def _handle_memory_error(worker_name: str) -> None:
+    """Free GPU cache (best-effort) and log an OOM event with the worker tag.
+
+    Called by the inner exception handlers in GPU-touching workers (scorer,
+    ml_trainer, continuous_trainer) so the worker keeps running, and by the
+    wrapper as a fallback if the exception escapes."""
+    log.error(f"[{worker_name}] MemoryError — clearing GPU cache, backing off {OOM_BACKOFF_SECS}s")
+    _worker_last_exception[worker_name] = "MemoryError"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as e:
+        log.warning(f"[{worker_name}] torch.cuda.empty_cache() failed: {e}")
+    # Brief pause before the caller's loop resumes; the supervisor uses the
+    # same OOM_BACKOFF if the worker thread exits entirely.
+    _sleep(OOM_BACKOFF_SECS)
+
+
+def _wrap_worker(name: str, fn):
+    """Wrap a worker entry-point to capture escaped exceptions for the supervisor.
+
+    Each worker has its own inner ``except`` handler so most failures never
+    reach this wrapper. When something *does* escape, we record the exception
+    class so the supervisor can apply the right respawn policy (OOM backoff
+    vs normal). The wrapper does NOT re-raise — letting the thread exit is
+    what triggers the supervisor's respawn path."""
+    def _runner(store: ArticleStore):
+        try:
+            fn(store)
+        except MemoryError:
+            log.error(f"[{name}] thread exited with MemoryError")
+            _worker_last_exception[name] = "MemoryError"
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+        except Exception as e:
+            log.error(f"[{name}] thread exited with {type(e).__name__}: {e}", exc_info=True)
+            _worker_last_exception[name] = type(e).__name__
+    _runner.__name__ = f"wrapped_{name}"
+    return _runner
+
+
+# ── Supervisor crash tracking & state transitions ───────────────────────────
+def _record_crash(name: str) -> tuple[int, str, str]:
+    """Record a crash for ``name``; return (count_in_window, old_state, new_state).
+
+    State machine:
+      - >= DISABLED_THRESHOLD crashes in window → "disabled" (off for 30min)
+      - >= DEGRADED_THRESHOLD crashes in window → "degraded" (slow respawn)
+      - otherwise → "ok"
+    Discord alerts are emitted by the caller, only on transitions."""
+    now = time.time()
+    with _supervisor_lock:
+        crashes = _worker_crashes.setdefault(name, [])
+        crashes.append(now)
+        # keep only crashes within the rolling window
+        crashes[:] = [t for t in crashes if now - t < CRASH_WINDOW_SECS]
+        count = len(crashes)
+        _worker_total_crashes[name] = _worker_total_crashes.get(name, 0) + 1
+
+        old_state = _worker_state.get(name, "ok")
+        if count >= DISABLED_THRESHOLD:
+            new_state = "disabled"
+            _worker_disabled_until[name] = now + DISABLED_DURATION_SECS
+        elif count >= DEGRADED_THRESHOLD:
+            new_state = "degraded"
+        else:
+            new_state = "ok"
+        _worker_state[name] = new_state
+    return count, old_state, new_state
+
+
+def _notify_state_transition(name: str, old: str, new: str, count: int) -> None:
+    """Send Discord alert on degraded/disabled transitions. Throttled by state
+    transitions — the caller only invokes this when old != new."""
+    if new == "degraded":
+        msg = (f"⚠️ Worker `{name}` degraded — {count} crashes in last "
+               f"{CRASH_WINDOW_SECS // 60}min. Increasing backoff to "
+               f"{DEGRADED_BACKOFF_SECS}s.")
+    elif new == "disabled":
+        msg = (f"🛑 Worker `{name}` disabled — {count} crashes in last "
+               f"{CRASH_WINDOW_SECS // 60}min. Disabled for "
+               f"{DISABLED_DURATION_SECS // 60}min.")
+    elif old in ("degraded", "disabled") and new == "ok":
+        msg = f"✅ Worker `{name}` recovered (state: {old} → ok)."
+    else:
+        return
+    try:
+        discord_send(msg, is_alert=True)
+    except Exception as e:
+        log.warning(f"[supervisor] Discord notification failed: {e}")
+
+
+def _compute_respawn_delay(name: str, now: float) -> float:
+    """How long the supervisor should wait before respawning ``name``."""
+    disabled_until = _worker_disabled_until.get(name, 0.0)
+    if disabled_until > now:
+        return disabled_until - now
+    if _worker_last_exception.get(name) == "MemoryError":
+        return OOM_BACKOFF_SECS
+    if _worker_state.get(name) == "degraded":
+        return DEGRADED_BACKOFF_SECS
+    return 1.0  # tiny pause so we don't hot-loop on a flapping worker
+
+
+def _worker_health_snapshot(now: float | None = None) -> dict:
+    """Compute the current health view of all workers — used by both the
+    structured log entries and the JSON snapshot for the dashboard."""
+    if now is None:
+        now = time.time()
+    workers = []
+    workers_ok = 0
+    workers_dead = 0
+    for name in ALL_WORKERS:
+        with _supervisor_lock:
+            crashes = list(_worker_crashes.get(name, []))
+            state = _worker_state.get(name, "ok")
+            disabled_until = _worker_disabled_until.get(name, 0.0)
+            total_crashes = _worker_total_crashes.get(name, 0)
+            last_exc = _worker_last_exception.get(name, "")
+        crashes_5m = sum(1 for t in crashes if now - t < CRASH_WINDOW_SECS)
+        last_ok = _worker_last_ok.get(name)
+        age_s = (now - last_ok) if last_ok else None
+        # "alive" semantics for the rollup: state != disabled AND we've seen
+        # a success ping in the past 15min (or we have no ping yet but state ok).
+        if state == "disabled":
+            alive = False
+        elif age_s is None:
+            alive = state == "ok"
+        else:
+            alive = age_s < (15 * 60)
+        if alive:
+            workers_ok += 1
+        else:
+            workers_dead += 1
+        workers.append({
+            "name": name,
+            "state": state,
+            "crashes_5m": crashes_5m,
+            "total_crashes": total_crashes,
+            "last_exception": last_exc,
+            "last_ok_age_s": age_s,
+            "disabled_until": disabled_until if disabled_until > now else 0,
+        })
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "workers_ok": workers_ok,
+        "workers_dead": workers_dead,
+        "workers": workers,
+    }
+
+
+def _write_supervisor_state(snapshot: dict) -> None:
+    """Atomically dump the supervisor state for the dashboard to read."""
+    try:
+        SUPERVISOR_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # tempfile + rename = atomic from the reader's perspective
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=str(SUPERVISOR_STATE_PATH.parent),
+            prefix=".supervisor_state.", suffix=".tmp", delete=False,
+        ) as tf:
+            json.dump(snapshot, tf, ensure_ascii=False)
+            tmp_path = Path(tf.name)
+        os.replace(tmp_path, SUPERVISOR_STATE_PATH)
+    except Exception as e:
+        log.warning(f"[supervisor] failed to write supervisor_state.json: {e}")
+
+
+def _worker_health_report() -> None:
+    """Emit one [worker] alive entry per worker plus a rollup; persist a JSON
+    snapshot. Called every HEALTH_REPORT_INTERVAL_SECS from the main loop."""
+    snapshot = _worker_health_snapshot()
+    log.info(
+        f"[daemon] health_report ok={snapshot['workers_ok']} "
+        f"dead={snapshot['workers_dead']}",
+        extra={
+            "workers_ok": snapshot["workers_ok"],
+            "workers_dead": snapshot["workers_dead"],
+            "event": "health_report",
+        },
+    )
+    for w in snapshot["workers"]:
+        # INFO so it's visible in the rotated daemon.log and structured.jsonl
+        log.info(
+            f"[{w['name']}] alive state={w['state']} crashes_5m={w['crashes_5m']}",
+            extra={
+                "event": "worker_alive",
+                "worker": w["name"],
+                "state": w["state"],
+                "crashes_5m": w["crashes_5m"],
+                "total_crashes": w["total_crashes"],
+            },
+        )
+    _write_supervisor_state(snapshot)
 
 
 def _ingest(store: ArticleStore, articles: list, source_tag: str) -> int:
@@ -109,6 +388,7 @@ def _ingest(store: ArticleStore, articles: list, source_tag: str) -> int:
 # ── Worker W1: GDELT — full sweep, per-query health tracking ────────────────
 def gdelt_worker(store: ArticleStore):
     log.info("[gdelt_worker] started")
+    bo = Backoff("gdelt", base=5.0, cap=300.0)
     while _running:
         try:
             # Full aggregate sweep (handles cross-query dedup + seen_articles cache)
@@ -127,14 +407,18 @@ def gdelt_worker(store: ArticleStore):
                 except Exception as he:
                     log.warning(f"[gdelt_worker] source_health error: {he}")
             _worker_last_ok["gdelt"] = time.time()
+            bo.reset()
         except Exception as e:
-            log.warning(f"[gdelt_worker] error: {e}")
+            log.warning(f"[gdelt_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
         _sleep(GDELT_INTERVAL)
 
 
 # ── Worker W2: RSS — re-poll every 60s ──────────────────────────────────────
 def rss_worker(store: ArticleStore):
     log.info("[rss_worker] started")
+    bo = Backoff("rss", base=5.0, cap=300.0)
     while _running:
         try:
             articles = collect_rss()
@@ -144,14 +428,18 @@ def rss_worker(store: ArticleStore):
             except Exception as he:
                 log.warning(f"[rss_worker] source_health error: {he}")
             _worker_last_ok["rss"] = time.time()
+            bo.reset()
         except Exception as e:
-            log.warning(f"[rss_worker] error: {e}")
+            log.warning(f"[rss_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
         _sleep(RSS_INTERVAL)
 
 
 # ── Worker W3: Web scraper — 60+ sites every 90s ────────────────────────────
 def web_worker(store: ArticleStore):
     log.info("[web_worker] started")
+    bo = Backoff("web", base=5.0, cap=300.0)
     while _running:
         try:
             articles = scrape_web()
@@ -160,14 +448,18 @@ def web_worker(store: ArticleStore):
                 source_health.record_result("web", len(articles))
             except Exception as he:
                 log.warning(f"[web_worker] source_health error: {he}")
+            bo.reset()
         except Exception as e:
-            log.warning(f"[web_worker] error: {e}")
+            log.warning(f"[web_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
         _sleep(WEB_INTERVAL)
 
 
 # ── Worker W4: Reddit — re-poll every 90s ────────────────────────────────────
 def reddit_worker(store: ArticleStore):
     log.info("[reddit_worker] started")
+    bo = Backoff("reddit", base=5.0, cap=300.0)
     while _running:
         try:
             articles = collect_reddit()
@@ -176,74 +468,393 @@ def reddit_worker(store: ArticleStore):
                 source_health.record_result("reddit", len(articles))
             except Exception as he:
                 log.warning(f"[reddit_worker] source_health error: {he}")
+            bo.reset()
         except Exception as e:
-            log.warning(f"[reddit_worker] error: {e}")
+            log.warning(f"[reddit_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
         _sleep(REDDIT_INTERVAL)
 
 
 # ── Worker W5: Ticker news — re-fetch every 120s ─────────────────────────────
 def ticker_worker(store: ArticleStore):
     log.info("[ticker_worker] started")
+    bo = Backoff("ticker", base=5.0, cap=300.0)
     while _running:
         try:
             articles = collect_ticker_news()
             _ingest(store, articles, "ticker")
+            bo.reset()
         except Exception as e:
-            log.warning(f"[ticker_worker] error: {e}")
+            log.warning(f"[ticker_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
         _sleep(TICKER_INTERVAL)
+
+
+# ── Worker: SEC EDGAR 8-K — every 5min ──────────────────────────────────────
+def sec_edgar_worker(store: ArticleStore):
+    log.info("[sec_edgar_worker] started")
+    bo = Backoff("sec_edgar", base=5.0, cap=300.0)
+    while _running:
+        try:
+            articles = collect_sec_edgar()
+            _ingest(store, articles, "sec_edgar")
+            try:
+                source_health.record_result("sec_edgar", len(articles))
+            except Exception as he:
+                log.warning(f"[sec_edgar_worker] source_health error: {he}")
+            _worker_last_ok["sec_edgar"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[sec_edgar_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SEC_EDGAR_INTERVAL)
+
+
+# ── Worker: Google News per-ticker — every 5min ─────────────────────────────
+def google_news_worker(store: ArticleStore):
+    log.info("[google_news_worker] started")
+    bo = Backoff("google_news", base=5.0, cap=300.0)
+    while _running:
+        try:
+            articles = collect_google_news()
+            _ingest(store, articles, "google_news")
+            try:
+                source_health.record_result("google_news", len(articles))
+            except Exception as he:
+                log.warning(f"[google_news_worker] source_health error: {he}")
+            _worker_last_ok["google_news"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[google_news_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(GOOGLE_NEWS_INTERVAL)
+
+
+# ── Worker: SEC EDGAR full-text per-ticker — every 15min ────────────────────
+def sec_edgar_ft_worker(store: ArticleStore):
+    log.info("[sec_edgar_ft_worker] started")
+    bo = Backoff("sec_edgar_ft", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_sec_edgar_fulltext()
+            _ingest(store, articles, "sec_edgar_ft")
+            try:
+                source_health.record_result("sec_edgar_ft", len(articles))
+            except Exception as he:
+                log.warning(f"[sec_edgar_ft_worker] source_health error: {he}")
+            _worker_last_ok["sec_edgar_ft"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[sec_edgar_ft_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SEC_EDGAR_FT_INTERVAL)
+
+
+# ── Worker: Nitter / Twitter — every 3min ───────────────────────────────────
+def nitter_worker(store: ArticleStore):
+    log.info("[nitter_worker] started")
+    bo = Backoff("nitter", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_nitter()
+            _ingest(store, articles, "nitter")
+            try:
+                source_health.record_result("nitter", len(articles))
+            except Exception as he:
+                log.warning(f"[nitter_worker] source_health error: {he}")
+            _worker_last_ok["nitter"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[nitter_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(NITTER_INTERVAL)
+
+
+# ── Worker: Substack newsletters — every 10min ──────────────────────────────
+def substack_worker(store: ArticleStore):
+    log.info("[substack_worker] started")
+    bo = Backoff("substack", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_substack()
+            _ingest(store, articles, "substack")
+            try:
+                source_health.record_result("substack", len(articles))
+            except Exception as he:
+                log.warning(f"[substack_worker] source_health error: {he}")
+            _worker_last_ok["substack"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[substack_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SUBSTACK_INTERVAL)
+
+
+# ── Worker: Finnhub per-ticker company news — every 5min ────────────────────
+def finnhub_worker(store: ArticleStore):
+    log.info("[finnhub_worker] started")
+    bo = Backoff("finnhub", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_finnhub()
+            _ingest(store, articles, "finnhub")
+            try:
+                source_health.record_result("finnhub", len(articles))
+            except Exception as he:
+                log.warning(f"[finnhub_worker] source_health error: {he}")
+            _worker_last_ok["finnhub"] = time.time()
+            log.debug(f"[finnhub] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[finnhub_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(FINNHUB_INTERVAL)
+
+
+# ── Worker: Alpha Vantage NEWS_SENTIMENT — every 30min (quota=25/day) ───────
+def alphavantage_worker(store: ArticleStore):
+    log.info("[alphavantage_worker] started")
+    bo = Backoff("alphavantage", base=30.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_alphavantage()
+            _ingest(store, articles, "alphavantage")
+            try:
+                source_health.record_result("alphavantage", len(articles))
+            except Exception as he:
+                log.warning(f"[alphavantage_worker] source_health error: {he}")
+            _worker_last_ok["alphavantage"] = time.time()
+            log.debug(f"[alphavantage] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[alphavantage_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(ALPHAVANTAGE_INTERVAL)
+
+
+# ── Worker: Polygon news — every 10min ──────────────────────────────────────
+def polygon_worker(store: ArticleStore):
+    log.info("[polygon_worker] started")
+    bo = Backoff("polygon", base=15.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_polygon()
+            _ingest(store, articles, "polygon")
+            try:
+                source_health.record_result("polygon", len(articles))
+            except Exception as he:
+                log.warning(f"[polygon_worker] source_health error: {he}")
+            _worker_last_ok["polygon"] = time.time()
+            log.debug(f"[polygon] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[polygon_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(POLYGON_INTERVAL)
+
+
+# ── Worker: NewsAPI keyword search — every 25min (quota=100/day) ────────────
+def newsapi_worker(store: ArticleStore):
+    log.info("[newsapi_worker] started")
+    bo = Backoff("newsapi", base=30.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_newsapi()
+            _ingest(store, articles, "newsapi")
+            try:
+                source_health.record_result("newsapi", len(articles))
+            except Exception as he:
+                log.warning(f"[newsapi_worker] source_health error: {he}")
+            _worker_last_ok["newsapi"] = time.time()
+            log.debug(f"[newsapi] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[newsapi_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(NEWSAPI_INTERVAL)
+
+
+# ── Worker: Yahoo Finance per-ticker RSS — every 4min ───────────────────────
+def yahoo_ticker_rss_worker(store: ArticleStore):
+    log.info("[yahoo_ticker_rss_worker] started")
+    bo = Backoff("yahoo_ticker_rss", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_yahoo_ticker_rss()
+            _ingest(store, articles, "yahoo_ticker_rss")
+            try:
+                source_health.record_result("yahoo_ticker_rss", len(articles))
+            except Exception as he:
+                log.warning(f"[yahoo_ticker_rss_worker] source_health error: {he}")
+            _worker_last_ok["yahoo_ticker_rss"] = time.time()
+            log.debug(f"[yahoo_ticker_rss] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[yahoo_ticker_rss_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(YAHOO_TICKER_RSS_INTERVAL)
+
+
+# ── Worker: Wikipedia recent-changes filter — every 10min ───────────────────
+def wikipedia_worker(store: ArticleStore):
+    log.info("[wikipedia_worker] started")
+    bo = Backoff("wikipedia", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_wikipedia()
+            _ingest(store, articles, "wikipedia")
+            try:
+                source_health.record_result("wikipedia", len(articles))
+            except Exception as he:
+                log.warning(f"[wikipedia_worker] source_health error: {he}")
+            _worker_last_ok["wikipedia"] = time.time()
+            log.debug(f"[wikipedia] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[wikipedia_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(WIKIPEDIA_INTERVAL)
+
+
+# ── Worker: Portfolio P/L snapshot — every 5min ─────────────────────────────
+def portfolio_pl_worker(store: ArticleStore):
+    log.info("[portfolio_pl_worker] started")
+    bo = Backoff("portfolio_pl", base=5.0, cap=300.0)
+    while _running:
+        try:
+            snap = write_pl_snapshot()
+            if snap is not None:
+                s = snap.get("summary", {})
+                log.info(f"[portfolio_pl] grand_value=${s.get('grand_value', 0):.2f} "
+                         f"pnl=${s.get('grand_pnl', 0):+.2f} "
+                         f"({s.get('grand_pnl_pct', 0):+.2f}%)")
+                _worker_last_ok["portfolio_pl"] = time.time()
+                bo.reset()
+            else:
+                log.warning("[portfolio_pl] snapshot returned None")
+                bo.sleep(lambda: _running)
+                continue
+        except Exception as e:
+            log.warning(f"[portfolio_pl_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(PORTFOLIO_PL_INTERVAL)
+
+
+# ── Worker: Sentiment / score trends — every 10min ──────────────────────────
+def sentiment_trends_worker(store: ArticleStore):
+    log.info("[sentiment_trends_worker] started")
+    while _running:
+        try:
+            with _store_lock:
+                data = write_score_trends(store)
+            n = len(data.get("tickers", {}))
+            log.info(f"[sentiment_trends] wrote {n} tickers ({data.get('window_hours')}h window)")
+            _worker_last_ok["sentiment_trends"] = time.time()
+        except Exception as e:
+            log.warning(f"[sentiment_trends_worker] error: {e}")
+        _sleep(SENTIMENT_TRENDS_INTERVAL)
+
+
+# ── Worker: Periodic training-data export to USB drive ──────────────────────
+def export_worker(store: ArticleStore):
+    log.info("[export_worker] started")
+    EXPORT_INTERVAL = 30 * 60
+    _sleep(60)  # let collectors warm up first
+    while _running:
+        try:
+            from scripts.export_training_data import export_all
+            result = export_all()
+            log.info(f"[export] exported {result['db_count']} signals to USB drive "
+                     f"(json={result['json_count']})")
+            _worker_last_ok["export"] = time.time()
+        except Exception as e:
+            log.warning(f"[export_worker] error: {e}")
+        _sleep(EXPORT_INTERVAL)
+
+
+# ── Worker: Public Flask web server — bind 0.0.0.0:8080 ─────────────────────
+def web_server_worker(store: ArticleStore):
+    log.info(f"[web_server_worker] starting Flask on {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
+    try:
+        from dashboard.web_server import run_server
+        run_server(store, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
+    except Exception as e:
+        log.error(f"[web_server_worker] crashed: {e}")
+        # Sleep before letting the supervisor respawn so we don't hot-loop on
+        # a bind error.
+        _sleep(30)
 
 
 # ── Worker W6: NN-first scorer — NN handles bulk, Sonnet only for grey zone ──
 def scorer_worker(store: ArticleStore):
     log.info("[scorer_worker] started (NN-first mode)")
-    from ml.embedder import get_embedder
     while _running:
         try:
             with _store_lock:
                 unscored = store.get_unscored(limit=1000, min_kw=0.0)
-
-            if unscored:
-                buckets = triage_articles(unscored)
-
-                batch = []
-                for art, sc in buckets["confident"]:
-                    aid = art.get("_id")
-                    if aid:
-                        is_urgent = sc.urgency >= 8.0
-                        score = max(sc.relevance, sc.urgency, 0.01)
-                        batch.append((aid, score, 1 if is_urgent else 0))
-                for art, sc in buckets["noise"]:
-                    aid = art.get("_id")
-                    if aid:
-                        batch.append((aid, max(sc.relevance, 0.01), 0))
-                if batch:
-                    store.update_ai_scores_batch(batch)
-
-                llm_candidates = [art for art, _ in buckets["uncertain"]]
-                record_metric("scorer.nn_bypass_rate",
-                              1.0 - len(llm_candidates) / max(len(unscored), 1),
-                              {"total": len(unscored), "to_llm": len(llm_candidates)})
-
-                urgent = 0
-                if llm_candidates:
-                    urgent = score_batch(llm_candidates, store)
-                # Single combined line; demote to DEBUG when nothing interesting happened
-                msg = f"[scorer] scored={len(unscored)} llm={len(llm_candidates)} urgent={urgent}"
-                if urgent > 0 or len(llm_candidates) > 0:
-                    log.info(msg)
-                else:
-                    log.debug(msg)
-
+            if not unscored:
+                _worker_last_ok["scorer"] = time.time()
+                _sleep(SCORE_INTERVAL)
+                continue
+            from ml.inference import score_articles
+            scores = score_articles(unscored)
+            batch = []
+            llm_candidates = []
+            for art, sc in zip(unscored, scores):
+                aid = art.get("_id")
+                if not aid:
+                    continue
+                ml_score = max(sc.relevance, sc.urgency)
+                # LLM zone — only Sonnet for narrow uncertain band on ML score
+                if 3.8 <= ml_score <= 4.3 and not sc.needs_llm:
+                    # within ML zone — also send to LLM
+                    llm_candidates.append(art)
+                    continue
+                if sc.needs_llm:
+                    llm_candidates.append(art)
+                    continue
+                is_urgent = 1 if sc.urgency >= 8.0 else 0
+                final = max(sc.relevance, sc.urgency, 0.01)
+                batch.append((aid, final, is_urgent))
+            if batch:
+                store.update_ai_scores_batch(batch)
+            llm_used = 0
+            if llm_candidates:
+                from watchers.urgency_scorer import score_batch
+                llm_used = score_batch(llm_candidates, store)
+            with _store_lock:
+                remaining = len(store.get_unscored(limit=10000, min_kw=0.0))
+            log.info(f"[scorer] batch={len(unscored)} scored={len(batch)} llm_used={llm_used} remaining={remaining}")
             _worker_last_ok["scorer"] = time.time()
-
+            # Don't sleep if work remains
+            if remaining == 0:
+                _sleep(SCORE_INTERVAL)
+            # else: loop immediately
+        except MemoryError:
+            _handle_memory_error("scorer")
         except Exception as e:
             log.warning(f"[scorer_worker] error: {e}")
-        _sleep(SCORE_INTERVAL)
+            _sleep(SCORE_INTERVAL)
 
 
 # ── Worker W11: Portfolio price alerts — every 5min ─────────────────────────
 def price_alert_worker(store: ArticleStore):
     log.info("[price_alert_worker] started")
+    bo = Backoff("price_alert", base=5.0, cap=300.0)
     while _running:
         try:
             data = get_stock_data()
@@ -269,8 +880,12 @@ def price_alert_worker(store: ArticleStore):
                     discord_send(msg, is_alert=True)
                 _last_prices[tkr] = price
             _worker_last_ok["price_alert"] = time.time()
+            log.debug(f"[price_alert] checked {len(PORTFOLIO_TICKERS)} tickers")
+            bo.reset()
         except Exception as e:
-            log.warning(f"[price_alert_worker] error: {e}")
+            log.warning(f"[price_alert_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
         _sleep(PRICE_ALERT_INTERVAL)
 
 
@@ -285,6 +900,8 @@ def ml_trainer_worker(store: ArticleStore):
         log.info(f"[ml_trainer] Bootstrap done: {metrics}")
         record_metric("ml.train.loss", metrics.get("final_loss", 0),
                       {"n": metrics.get("n", 0), "phase": "bootstrap"})
+    except MemoryError:
+        _handle_memory_error("ml_trainer")
     except Exception as e:
         log.warning(f"[ml_trainer] Bootstrap error: {e}")
 
@@ -298,6 +915,9 @@ def ml_trainer_worker(store: ArticleStore):
                      f"elapsed={metrics.get('elapsed_s', 0):.0f}s")
             record_metric("ml.train.loss", metrics.get("final_loss", 0),
                           {"n": metrics.get("n", 0), "phase": "retrain"})
+            _worker_last_ok["ml_trainer"] = time.time()
+        except MemoryError:
+            _handle_memory_error("ml_trainer")
         except Exception as e:
             log.warning(f"[ml_trainer] Retrain error: {e}")
 
@@ -319,14 +939,41 @@ def continuous_trainer_worker(store: ArticleStore):
                          f"gpu_mem_mb={metrics.get('gpu_mem_mb')} "
                          f"elapsed_s={metrics.get('elapsed_s')}")
                 _worker_last_ok["continuous_trainer"] = time.time()
+        except MemoryError:
+            _handle_memory_error("continuous_trainer")
         except Exception as e:
             log.warning(f"[continuous_trainer] error: {e}")
         _sleep(CONTINUOUS_TRAIN_INTERVAL)
 
 
+# ── Worker: Recursive Claude labeling — every 4h ────────────────────────────
+def recursive_labeler_worker(store: ArticleStore):
+    log.info("[recursive_labeler] worker started")
+    # Stagger first run so we don't compete with the bootstrap ML trainer.
+    _sleep(15 * 60)
+    while _running:
+        try:
+            log.info("[recursive_labeler] starting pipeline run")
+            summary = run_recursive_labeling(store)
+            for r in summary.get("rounds", []):
+                log.info(f"[recursive_labeler] round={r['name']} "
+                         f"labeled={r['labeled']} requested={r['requested']} "
+                         f"failures={r['failures']} elapsed={r['elapsed_s']}s")
+            log.info(f"[recursive_labeler] pipeline done total_labeled="
+                     f"{summary.get('total_labeled', 0)} "
+                     f"elapsed={summary.get('elapsed_s', 0)}s")
+            _worker_last_ok["recursive_labeler"] = time.time()
+        except MemoryError:
+            _handle_memory_error("recursive_labeler")
+        except Exception as e:
+            log.warning(f"[recursive_labeler] error: {e}")
+        _sleep(RECURSIVE_LABEL_INTERVAL)
+
+
 # ── Worker W7: Alert dispatcher — checks every 20s ──────────────────────────
 def alert_worker(store: ArticleStore):
     log.info("[alert_worker] started")
+    _last_ping = 0.0
     while _running:
         try:
             with _store_lock:
@@ -334,12 +981,36 @@ def alert_worker(store: ArticleStore):
             if urgent:
                 log.info(f"[alert] {len(urgent)} urgent items → dispatching")
                 send_urgent_alert(urgent, store)
+            elif time.time() - _last_ping >= 300:
+                log.debug("[alert] idle — no urgent items")
+                _last_ping = time.time()
         except Exception as e:
             log.warning(f"[alert_worker] error: {e}")
         _sleep(ALERT_CHECK)
 
 
 # ── Worker W8: Heartbeat briefing every 5h ──────────────────────────────────
+def _extract_briefing_labels(briefing_text: str, articles: list) -> list[dict]:
+    """Parse Opus briefing to extract article-level quality labels."""
+    labels = []
+    bt_lower = briefing_text.lower()
+    for art in articles:
+        title = art.get("title", "")
+        url = art.get("url") or art.get("link", "")
+        if not url:
+            continue  # synthetic entries (P&L, options snapshot) have no url
+        prefix = title[:40].lower()
+        score_boost = 0.5 if prefix and prefix in bt_lower else 0.0
+        existing_score = art.get("ai_score") or 0.0
+        labels.append({
+            "url": url,
+            "title": title,
+            "opus_label": min(5.0, existing_score + score_boost),
+            "in_briefing": score_boost > 0,
+        })
+    return labels
+
+
 def heartbeat_worker(store: ArticleStore):
     log.info("[heartbeat_worker] started")
     last = 0.0  # trigger immediately on start
@@ -351,6 +1022,7 @@ def heartbeat_worker(store: ArticleStore):
                 log.info("[heartbeat] Generating Opus 4.7 briefing...")
                 with _store_lock:
                     top = store.get_top_for_briefing(hours=5, limit=50)
+                source_articles = list(top)  # keep originals (with urls) for labeling
 
                 stocks   = get_stock_data()
                 earnings = get_earnings()
@@ -379,6 +1051,19 @@ def heartbeat_worker(store: ArticleStore):
                 message = briefing.rstrip() + "\n\n" + health_line
                 ok = discord_send(message)
                 log.info(f"[heartbeat] {'sent' if ok else 'FAILED'} ({len(message)} chars)")
+
+                # Feed the briefing into the ML training pipeline as labeled data.
+                try:
+                    labels = _extract_briefing_labels(briefing, source_articles)
+                    boosted = store.update_scores_from_labels(labels)
+                    ts = datetime.now(timezone.utc).isoformat()
+                    store.save_briefing(ts, briefing, len(source_articles))
+                    in_briefing = sum(1 for l in labels if l["in_briefing"])
+                    log.info(f"[heartbeat] training labels: {in_briefing}/{len(labels)} "
+                             f"in briefing, boosted {boosted} ai_scores")
+                except Exception as le:
+                    log.warning(f"[heartbeat] label extraction failed: {le}")
+
                 last = time.time()
             except Exception as e:
                 log.error(f"[heartbeat] error: {e}")
@@ -389,8 +1074,12 @@ def heartbeat_worker(store: ArticleStore):
 # ── Worker W9: Purge old data every 6h ──────────────────────────────────────
 def purge_worker(store: ArticleStore):
     log.info("[purge_worker] started")
+    _last_ping = 0.0
     while _running:
-        _sleep(PURGE_INTERVAL)
+        if time.time() - _last_ping >= 300:
+            log.debug("[purge] alive")
+            _last_ping = time.time()
+        _sleep(min(PURGE_INTERVAL, 300))
         try:
             with _store_lock:
                 store.purge_old()
@@ -433,10 +1122,21 @@ def stats_worker(store: ArticleStore):
 
 
 def _sleep(seconds: float):
-    """Interruptible sleep — checks _running every 0.5s."""
+    """Interruptible sleep — checks _running every 0.5s.
+
+    For sleeps longer than 60s, emits a ``[<worker_name>] alive`` debug log
+    every 60s so health dashboards stay green even when the worker is
+    intentionally idle (heartbeat 5h, purge 6h, ml_trainer 3min, etc.). The
+    worker tag is taken from the current thread's name."""
     deadline = time.time() + seconds
+    name = threading.current_thread().name
+    emit_pings = seconds > 60 and name and name != "MainThread"
+    next_ping = time.time() + 60 if emit_pings else float("inf")
     while _running and time.time() < deadline:
         time.sleep(0.5)
+        if emit_pings and time.time() >= next_ping:
+            log.debug(f"[{name}] alive")
+            next_ping = time.time() + 60
 
 
 def _build_health_line(store: ArticleStore) -> str:
@@ -469,6 +1169,17 @@ def main():
         ("web",         web_worker),
         ("reddit",      reddit_worker),
         ("ticker",      ticker_worker),
+        ("sec_edgar",   sec_edgar_worker),
+        ("sec_edgar_ft", sec_edgar_ft_worker),
+        ("google_news", google_news_worker),
+        ("nitter",      nitter_worker),
+        ("substack",    substack_worker),
+        ("finnhub",     finnhub_worker),
+        ("alphavantage", alphavantage_worker),
+        ("polygon",     polygon_worker),
+        ("newsapi",     newsapi_worker),
+        ("yahoo_ticker_rss", yahoo_ticker_rss_worker),
+        ("wikipedia",   wikipedia_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
@@ -476,28 +1187,112 @@ def main():
         ("stats",       stats_worker),
         ("ml_trainer",  ml_trainer_worker),
         ("continuous_trainer", continuous_trainer_worker),
+        ("recursive_labeler", recursive_labeler_worker),
         ("price_alert", price_alert_worker),
+        ("portfolio_pl",    portfolio_pl_worker),
+        ("sentiment_trends", sentiment_trends_worker),
+        ("export",      export_worker),
+        ("web_server",  web_server_worker),
     ]
 
-    threads = []
+    # Map name → fn for lookup during respawn
+    worker_map = {name: fn for name, fn in workers}
+
+    threads: list[threading.Thread] = []
     for name, fn in workers:
-        t = threading.Thread(target=fn, args=(store,), name=name, daemon=True)
+        wrapped = _wrap_worker(name, fn)
+        t = threading.Thread(target=wrapped, args=(store,), name=name, daemon=True)
         t.start()
         threads.append(t)
+        _worker_state[name] = "ok"
         log.info(f"[daemon] Worker '{name}' started")
 
     log.info(f"[daemon] All {len(threads)} workers running — max throughput mode")
 
-    # Main thread just keeps process alive and monitors workers
+    # ── Supervisor loop ──────────────────────────────────────────────────────
+    # Smart respawn: per-worker crash counter, degraded/disabled states, OOM
+    # backoff, Discord alerts on state transitions only, periodic health
+    # report writes to structured.jsonl + supervisor_state.json snapshot.
+    last_health_report = 0.0
     while _running:
         time.sleep(5)
-        for t in threads:
-            if not t.is_alive():
-                log.error(f"[daemon] Worker '{t.name}' died — respawning")
-                fn = next(f for n, f in workers if n == t.name)
-                new_t = threading.Thread(target=fn, args=(store,), name=t.name, daemon=True)
-                new_t.start()
-                threads[threads.index(t)] = new_t
+        if not _running:
+            # Graceful shutdown in progress — worker threads are exiting cleanly
+            # as their own loops observe _running=False. Logging them as "died"
+            # at ERROR pollutes the error count for hourly audits.
+            break
+        now = time.time()
+        for i, t in enumerate(threads):
+            name = t.name
+            if t.is_alive():
+                continue
+            # Already detected dead and waiting for respawn window?
+            respawn_at = _worker_respawn_at.get(name)
+            if respawn_at is not None:
+                if now < respawn_at:
+                    continue
+                _worker_respawn_at.pop(name, None)
+            else:
+                # First detection of this crash: record + schedule respawn
+                count, old_state, new_state = _record_crash(name)
+                if old_state != new_state:
+                    _notify_state_transition(name, old_state, new_state, count)
+                delay = _compute_respawn_delay(name, now)
+                _worker_respawn_at[name] = now + delay
+                last_exc = _worker_last_exception.get(name, "")
+                # A thread that exited without recording an exception returned
+                # cleanly — that's abnormal for a long-running worker, but it
+                # isn't a crash with a stack trace. Log at WARNING so the
+                # hourly audit's ERROR/CRITICAL count reflects real failures.
+                msg = (
+                    f"[daemon] Worker '{name}' exited "
+                    f"(crashes_5m={count}, state={new_state}, "
+                    f"last_exc={last_exc or 'clean_return'}) — "
+                    f"respawning in {delay:.0f}s"
+                )
+                extra = {
+                    "event": "worker_died",
+                    "worker": name,
+                    "crashes_5m": count,
+                    "state": new_state,
+                    "respawn_in_s": delay,
+                    "last_exc": last_exc or "clean_return",
+                }
+                if last_exc:
+                    log.error(msg, extra=extra)
+                else:
+                    log.warning(msg, extra=extra)
+                continue
+
+            # Respawn now
+            fn = worker_map[name]
+            wrapped = _wrap_worker(name, fn)
+            new_t = threading.Thread(target=wrapped, args=(store,), name=name, daemon=True)
+            new_t.start()
+            threads[i] = new_t
+            _worker_last_exception.pop(name, None)
+            # If we passed through a disabled window cleanly, reset state to ok
+            disabled_until = _worker_disabled_until.get(name, 0.0)
+            if disabled_until and now >= disabled_until:
+                old_state = _worker_state.get(name, "disabled")
+                _worker_state[name] = "ok"
+                _worker_disabled_until.pop(name, None)
+                with _supervisor_lock:
+                    _worker_crashes[name] = []
+                if old_state != "ok":
+                    _notify_state_transition(name, old_state, "ok", 0)
+            log.info(
+                f"[daemon] Worker '{name}' respawned",
+                extra={"event": "worker_respawned", "worker": name},
+            )
+
+        # Periodic health report (every 5 minutes)
+        if now - last_health_report >= HEALTH_REPORT_INTERVAL_SECS:
+            try:
+                _worker_health_report()
+            except Exception as e:
+                log.warning(f"[supervisor] health report error: {e}")
+            last_health_report = now
 
     log.info("[daemon] Shutdown complete")
 
