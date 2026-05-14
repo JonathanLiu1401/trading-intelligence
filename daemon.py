@@ -1059,7 +1059,7 @@ def _extract_briefing_labels(briefing_text: str, articles: list) -> list[dict]:
 
 def heartbeat_worker(store: ArticleStore):
     log.info("[heartbeat_worker] started")
-    last = 0.0  # trigger immediately on start
+    last = time.time()  # wait full 5h interval before first briefing — don't fire on every restart
 
     while _running:
         now = time.time()
