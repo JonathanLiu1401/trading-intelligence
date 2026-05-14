@@ -102,6 +102,9 @@ def _articles_from_db(limit: int = 50, min_score: float = 0.0) -> list[dict]:
             "SELECT id, url, title, source, published, kw_score, ai_score, urgency, first_seen "
             "FROM articles "
             "WHERE (CASE WHEN ai_score>kw_score THEN ai_score ELSE kw_score END) >= ? "
+            "AND url NOT LIKE 'backtest://%' "
+            "AND source NOT LIKE 'backtest_%' "
+            "AND source NOT LIKE 'opus_annotation%' "
             "ORDER BY ai_score DESC, kw_score DESC, first_seen DESC LIMIT ?",
             (min_score, max(1, min(500, int(limit)))),
         ).fetchall()
@@ -238,7 +241,8 @@ def create_app(store=None) -> Flask:
 
     @app.get("/chat")
     def chat_page() -> Response:
-        return Response(_CHAT_HTML, mimetype="text/html")
+        return Response(_CHAT_HTML, mimetype="text/html",
+                        headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
     @app.post("/api/chat")
     def api_chat():
@@ -282,7 +286,11 @@ def create_app(store=None) -> Flask:
             try:
                 rows = conn.execute(
                     "SELECT title, source, ai_score, full_text FROM articles "
-                    "WHERE first_seen >= ? ORDER BY ai_score DESC LIMIT 10",
+                    "WHERE first_seen >= ? "
+                    "AND url NOT LIKE 'backtest://%' "
+                    "AND source NOT LIKE 'backtest_%' "
+                    "AND source NOT LIKE 'opus_annotation%' "
+                    "ORDER BY ai_score DESC LIMIT 10",
                     (since,),
                 ).fetchall()
             finally:
@@ -443,6 +451,7 @@ _DASHBOARD_HTML = """<!doctype html>
   <title>Digital Intern — Dashboard</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d1117'/%3E%3Cpolyline points='3,24 9,16 14,20 20,10 29,14' fill='none' stroke='%2300b4d8' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='20' cy='10' r='2.5' fill='%23e94560'/%3E%3Cline x1='3' y1='27' x2='29' y2='27' stroke='%2330363d' stroke-width='1'/%3E%3C/svg%3E">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
   <style>
     body { background:#0d1117; color:#e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; font-size: 16px; }
     .card { background:#161b22; border:1px solid #30363d; }
@@ -457,6 +466,20 @@ _DASHBOARD_HTML = """<!doctype html>
     .ticker { font-weight:600; }
     .small-muted { color:#8b949e; font-size:0.85em; }
     table { color:#e6edf3; }
+    /* Markdown in floating chat widget */
+    .md-body p { margin: 0 0 0.5em; }
+    .md-body p:last-child { margin-bottom: 0; }
+    .md-body ul, .md-body ol { margin: 0.3em 0 0.5em 1.2em; padding: 0; }
+    .md-body li { margin-bottom: 0.15em; }
+    .md-body code { background: #0d1117; border: 1px solid #30363d; padding: 1px 4px; border-radius: 3px; font-size: 0.85em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .md-body pre { background: #0d1117; border: 1px solid #30363d; padding: 8px 10px; border-radius: 5px; overflow-x: auto; margin: 0.3em 0; }
+    .md-body pre code { background: none; border: none; padding: 0; }
+    .md-body strong { color: #e6edf3; }
+    .md-body h1, .md-body h2, .md-body h3 { margin: 0.5em 0 0.25em; color: #e6edf3; font-size: 0.95em; }
+    .md-body blockquote { border-left: 3px solid #30363d; margin: 0.3em 0; padding-left: 8px; color: #8b949e; }
+    .md-body table { border-collapse: collapse; margin: 0.3em 0; width: 100%; font-size: 0.85em; }
+    .md-body th, .md-body td { border: 1px solid #30363d; padding: 3px 7px; text-align: left; }
+    .md-body th { background: #161b22; }
   </style>
 </head>
 <body>
@@ -757,13 +780,24 @@ async function savePortfolioConfig() {
   function closePanel(){ panel.style.display='none'; btn.style.display='block'; }
   btn.addEventListener('click', openPanel);
   closeBtn.addEventListener('click', closePanel);
+  function renderMd(text) {
+    if (typeof marked !== 'undefined') {
+      try { return marked.parse(text, {breaks: true, gfm: true}); } catch(e) {}
+    }
+    return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+  }
   function bubble(role, text){
     const d = document.createElement('div');
     const bg = role==='user' ? '#1565c0' : role==='error' ? '#4a1d1d' : '#21262d';
     const fg = role==='user' ? '#fff' : role==='error' ? '#ffd6d6' : '#cfd8dc';
     const align = role==='user' ? 'flex-end' : 'flex-start';
-    d.style.cssText = 'background:'+bg+';color:'+fg+';padding:8px 12px;border-radius:10px;max-width:85%;align-self:'+align+';white-space:pre-wrap;word-wrap:break-word';
-    d.textContent = text;
+    d.style.cssText = 'background:'+bg+';color:'+fg+';padding:8px 12px;border-radius:10px;max-width:85%;align-self:'+align+';word-wrap:break-word;overflow-wrap:anywhere';
+    if (role === 'user') {
+      d.textContent = text;
+    } else {
+      d.classList.add('md-body');
+      d.innerHTML = renderMd(text);
+    }
     hist.appendChild(d);
     hist.scrollTop = hist.scrollHeight;
     return d;
@@ -839,7 +873,8 @@ _CHAT_HTML = """<!doctype html>
       flex: 1; overflow-y: auto; padding: 20px 24px;
       display: flex; flex-direction: column; gap: 14px;
     }
-    .msg { max-width: 760px; padding: 12px 16px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; line-height: 1.5; }
+    .msg { max-width: 760px; padding: 12px 16px; border-radius: 12px; word-wrap: break-word; overflow-wrap: anywhere; line-height: 1.5; }
+    .msg.user { white-space: pre-wrap; }
     .msg.user { align-self: flex-end; background: #1f6feb; color: #fff; }
     .msg.assistant { align-self: flex-start; background: #21262d; border: 1px solid #30363d; }
     .msg.error { align-self: flex-start; background: #4a1d1d; border: 1px solid #f85149; color: #ffd6d6; }
@@ -875,7 +910,22 @@ _CHAT_HTML = """<!doctype html>
     }
     @keyframes spin { to { transform: rotate(360deg); } }
     .typing { color: #8b949e; font-style: italic; }
+    /* Markdown rendered content */
+    .md-body p { margin: 0 0 0.6em; }
+    .md-body p:last-child { margin-bottom: 0; }
+    .md-body ul, .md-body ol { margin: 0.3em 0 0.6em 1.2em; padding: 0; }
+    .md-body li { margin-bottom: 0.2em; }
+    .md-body code { background: #0d1117; border: 1px solid #30363d; padding: 1px 5px; border-radius: 4px; font-size: 0.87em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .md-body pre { background: #0d1117; border: 1px solid #30363d; padding: 10px 14px; border-radius: 6px; overflow-x: auto; margin: 0.4em 0; }
+    .md-body pre code { background: none; border: none; padding: 0; }
+    .md-body strong { color: #e6edf3; }
+    .md-body h1, .md-body h2, .md-body h3 { margin: 0.6em 0 0.3em; color: #e6edf3; font-size: 1em; }
+    .md-body blockquote { border-left: 3px solid #30363d; margin: 0.4em 0; padding-left: 10px; color: #8b949e; }
+    .md-body table { border-collapse: collapse; margin: 0.4em 0; width: 100%; }
+    .md-body th, .md-body td { border: 1px solid #30363d; padding: 4px 8px; text-align: left; }
+    .md-body th { background: #161b22; }
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js" async></script>
 </head>
 <body>
 <nav>
@@ -912,10 +962,21 @@ function scrollDown() {
   requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
 }
 
+function renderMd(text) {
+  if (typeof marked !== 'undefined') {
+    try { return marked.parse(text, {breaks: true, gfm: true}); } catch(e) {}
+  }
+  return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+}
 function addMsg(role, content, sources) {
   const div = document.createElement('div');
   div.className = 'msg ' + role;
-  div.textContent = content;
+  if (role === 'user') {
+    div.textContent = content;
+  } else {
+    div.classList.add('md-body');
+    div.innerHTML = renderMd(content);
+  }
   chat.appendChild(div);
   if (sources && sources.length) {
     const wrap = document.createElement('div');

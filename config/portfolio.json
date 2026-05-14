@@ -1,49 +1,62 @@
 {
-  "_note": "Sao's trading portfolio - updated 2026-05-14 (Margin Universal Account 7883)",
   "_account": {
     "last_updated": "2026-05-14T01:20 PDT"
   },
-  "positions": [
-    {
-      "ticker": "LNOK",
-      "type": "stock",
-      "qty": 14,
-      "avg_cost": 72.48,
-      "notes": "Defiance Daily leveraged - 14 shares"
-    },
-    {
-      "ticker": "NVDL",
-      "type": "etf_leveraged",
-      "qty": 38,
-      "avg_cost": 125.07,
-      "notes": "GraniteShares 2x Long NVDA Daily ETF"
-    },
-    {
-      "ticker": "LITE",
-      "type": "stock",
-      "qty": 0.1908,
-      "avg_cost": 887.119,
-      "notes": "Lumentum - photonics/semis"
-    },
-    {
-      "ticker": "MUU",
-      "type": "etf_leveraged",
-      "qty": 0,
-      "avg_cost": 596.32,
-      "notes": "Direxion Daily MU Bull 2X - position closed"
-    }
-  ],
+  "_note": "Sao's trading portfolio - updated via UI",
   "options": [
     {
-      "symbol": "DRAM CALL",
-      "underlying": "DRAM",
-      "type": "call",
-      "expiry": "2026-05-29",
-      "strike": 59,
-      "qty": 21,
       "avg_cost": 2.236,
-      "notes": "DRAM sector call, exp 260529, strike 59"
+      "expiry": "2026-05-29",
+      "notes": "DRAM sector call, exp 260529, strike 59",
+      "qty": 21,
+      "strike": 59,
+      "symbol": "DRAM CALL",
+      "type": "call",
+      "underlying": "DRAM"
     }
   ],
-  "sector_watchlist": ["LRCX", "AMAT", "KLAC", "NVDA", "AMD", "WDC", "STX", "SMH", "SOXX", "MU", "AXTI", "NVDL"]
+  "positions": [
+    {
+      "avg_cost": 72.48,
+      "notes": "Defiance Daily leveraged - 14 shares",
+      "qty": 14,
+      "ticker": "LNOK",
+      "type": "stock"
+    },
+    {
+      "avg_cost": 125.07,
+      "notes": "GraniteShares 2x Long NVDA Daily ETF",
+      "qty": 38,
+      "ticker": "NVDL",
+      "type": "etf_leveraged"
+    },
+    {
+      "avg_cost": 887.119,
+      "notes": "Lumentum - photonics/semis",
+      "qty": 0.1908,
+      "ticker": "LITE",
+      "type": "stock"
+    },
+    {
+      "avg_cost": 596.32,
+      "notes": "Direxion Daily MU Bull 2X - position closed",
+      "qty": 0,
+      "ticker": "MUU",
+      "type": "etf_leveraged"
+    }
+  ],
+  "sector_watchlist": [
+    "LRCX",
+    "AMAT",
+    "KLAC",
+    "NVDA",
+    "AMD",
+    "WDC",
+    "STX",
+    "SMH",
+    "SOXX",
+    "MU",
+    "AXTI",
+    "NVDL"
+  ]
 }
