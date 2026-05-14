@@ -169,6 +169,34 @@ def create_app(store=None) -> Flask:
             return jsonify({"error": "no snapshot yet"}), 503
         return jsonify(snap)
 
+    CONFIG_PATH = BASE_DIR / "config" / "portfolio.json"
+
+    @app.get("/api/portfolio/config")
+    def api_portfolio_config_get():
+        import json as _json
+        try:
+            data = _json.loads(CONFIG_PATH.read_text())
+        except Exception:
+            data = {"positions": [], "options": [], "sector_watchlist": []}
+        return jsonify(data)
+
+    @app.put("/api/portfolio/config")
+    def api_portfolio_config_put():
+        import json as _json
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"error": "invalid JSON"}), 400
+        # Keep _note and _account metadata if present
+        existing = {}
+        try:
+            existing = _json.loads(CONFIG_PATH.read_text())
+        except Exception:
+            pass
+        body["_note"] = f"Sao's trading portfolio - updated via UI"
+        body.setdefault("_account", existing.get("_account", {}))
+        CONFIG_PATH.write_text(_json.dumps(body, indent=2))
+        return jsonify({"ok": True})
+
     @app.get("/api/stats")
     def api_stats():
         if not _check_api_key():
@@ -461,7 +489,10 @@ _DASHBOARD_HTML = """<!doctype html>
   <div class="row g-3">
     <div class="col-12 col-lg-4">
       <div class="card mb-3">
-        <div class="card-header">Portfolio P&amp;L</div>
+        <div class="card-header d-flex justify-content-between align-items-center">
+          Portfolio P&amp;L
+          <button class="btn btn-sm btn-outline-secondary py-0 px-2" style="font-size:11px" onclick="togglePortfolioEdit()">✎ Edit</button>
+        </div>
         <div class="card-body p-2">
           <div id="pnl-summary" class="mb-2 small-muted">loading…</div>
           <div class="table-responsive scroll-pane">
@@ -472,6 +503,19 @@ _DASHBOARD_HTML = """<!doctype html>
               </tr></thead>
               <tbody id="pnl-rows"></tbody>
             </table>
+          </div>
+          <!-- Inline portfolio editor -->
+          <div id="portfolio-editor" style="display:none;margin-top:10px;">
+            <div style="font-size:11px;color:#78909c;margin-bottom:6px;">Edit positions — changes save to config and refresh live P&L</div>
+            <table class="table table-sm table-borderless mb-1" style="font-size:12px;">
+              <thead><tr style="color:#78909c;">
+                <th>TICKER</th><th>TYPE</th><th>QTY</th><th>AVG COST</th><th></th>
+              </tr></thead>
+              <tbody id="edit-pos-rows"></tbody>
+            </table>
+            <button class="btn btn-sm btn-outline-success py-0 px-2 me-1" style="font-size:11px" onclick="addEditRow()">+ Add</button>
+            <button class="btn btn-sm btn-primary py-0 px-2" style="font-size:11px" onclick="savePortfolioConfig()">Save</button>
+            <span id="edit-save-status" style="font-size:11px;color:#78909c;margin-left:8px;"></span>
           </div>
         </div>
       </div>
@@ -624,6 +668,59 @@ refresh();
 refreshPaperTrader();
 setInterval(refresh, 15000);
 setInterval(refreshPaperTrader, 15000);
+
+// ── Portfolio config editor ────────────────────────────────────────────────
+let _editConfig = null;
+async function togglePortfolioEdit() {
+  const el = document.getElementById("portfolio-editor");
+  if (el.style.display !== "none") { el.style.display = "none"; return; }
+  const cfg = await getJSON("/api/portfolio/config");
+  _editConfig = cfg;
+  renderEditRows(cfg.positions || []);
+  el.style.display = "block";
+}
+function renderEditRows(positions) {
+  const tbody = document.getElementById("edit-pos-rows");
+  tbody.innerHTML = "";
+  positions.forEach((p, i) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><input class="form-control form-control-sm p-1" style="font-size:11px;background:#0d1117;color:#e6edf3;border-color:#30363d;width:70px" value="${p.ticker||""}" data-i="${i}" data-f="ticker"></td>
+      <td><select class="form-select form-select-sm p-1" style="font-size:11px;background:#0d1117;color:#e6edf3;border-color:#30363d;width:90px" data-i="${i}" data-f="type">
+        ${["stock","etf_leveraged","etf","option"].map(t=>`<option${p.type===t?" selected":""}>${t}</option>`).join("")}
+      </select></td>
+      <td><input class="form-control form-control-sm p-1" style="font-size:11px;background:#0d1117;color:#e6edf3;border-color:#30363d;width:70px" value="${p.qty??""}" data-i="${i}" data-f="qty"></td>
+      <td><input class="form-control form-control-sm p-1" style="font-size:11px;background:#0d1117;color:#e6edf3;border-color:#30363d;width:80px" value="${p.avg_cost??""}" data-i="${i}" data-f="avg_cost"></td>
+      <td><button class="btn btn-sm btn-outline-danger py-0 px-1" style="font-size:10px" onclick="removeEditRow(${i})">✕</button></td>`;
+    tbody.appendChild(tr);
+  });
+}
+function addEditRow() {
+  if (!_editConfig) return;
+  (_editConfig.positions = _editConfig.positions || []).push({ticker:"",type:"stock",qty:0,avg_cost:0});
+  renderEditRows(_editConfig.positions);
+}
+function removeEditRow(i) {
+  _editConfig.positions.splice(i, 1);
+  renderEditRows(_editConfig.positions);
+}
+async function savePortfolioConfig() {
+  // Collect all field edits from DOM
+  document.querySelectorAll("#edit-pos-rows input, #edit-pos-rows select").forEach(el => {
+    const i = parseInt(el.dataset.i), f = el.dataset.f;
+    let v = el.value.trim();
+    if (f === "qty" || f === "avg_cost") v = parseFloat(v) || 0;
+    _editConfig.positions[i][f] = v;
+  });
+  const status = document.getElementById("edit-save-status");
+  status.textContent = "saving…";
+  try {
+    const r = await fetch("/api/portfolio/config", {method:"PUT", headers:{"Content-Type":"application/json"}, body: JSON.stringify(_editConfig)});
+    const d = await r.json();
+    status.textContent = d.ok ? "✓ saved" : "error: " + d.error;
+    if (d.ok) setTimeout(() => { refresh(); status.textContent = ""; }, 800);
+  } catch(e) { status.textContent = "error: " + e; }
+}
 </script>
 
 <!-- Floating chat widget -->
