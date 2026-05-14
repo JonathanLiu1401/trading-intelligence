@@ -1,0 +1,15 @@
+[Unit]
+Description=Paper Trader (Opus 4.7 driven)
+After=network-online.target digital-intern.service
+Wants=network-online.target
+
+[Service]
+User=zeph
+WorkingDirectory=/home/zeph/paper-trader
+ExecStart=/usr/bin/python3 /home/zeph/paper-trader/runner.py
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=-/home/zeph/digital-intern/.env
+
+[Install]
+WantedBy=multi-user.target
