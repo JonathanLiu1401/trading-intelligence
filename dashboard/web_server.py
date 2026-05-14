@@ -356,18 +356,143 @@ def create_app(store=None) -> Flask:
         else:
             articles_block = "(no recent articles in the last 6 hours)"
 
+        # Live paper-trader state — fetch from :8090/api/state. Adds positions,
+        # recent trades, recent decisions so the chat can answer "what did the
+        # paper trader do today" / "why is SOXL the position".
+        paper_trader_block = "(paper trader unreachable)"
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen("http://127.0.0.1:8090/api/state", timeout=3) as resp:
+                pt = json.loads(resp.read().decode("utf-8"))
+            pt_pf = pt.get("portfolio") or {}
+            pt_total = pt_pf.get("total_value")
+            pt_cash = pt_pf.get("cash")
+            pt_pl = (pt_total - 1000.0) if isinstance(pt_total, (int, float)) else None
+            pt_pl_pct = (pt_pl / 1000.0 * 100.0) if pt_pl is not None else None
+
+            lines = []
+            if pt_total is not None:
+                lines.append(
+                    f"Total: ${pt_total:.2f}  Cash: ${pt_cash:.2f}  "
+                    f"P/L vs $1000 start: {('+' if (pt_pl or 0)>=0 else '')}${pt_pl:.2f} "
+                    f"({pt_pl_pct:+.2f}%)"
+                )
+            sp = pt.get("sp500")
+            if sp:
+                lines.append(f"S&P 500: {sp:.2f}")
+
+            pt_positions = pt.get("positions") or []
+            if pt_positions:
+                lines.append("Open positions:")
+                for p in pt_positions[:15]:
+                    if p.get("type") in ("call", "put"):
+                        lines.append(
+                            f"  {p.get('ticker','?')} {str(p.get('type','')).upper()} "
+                            f"{p.get('strike')} {p.get('expiry')}: qty={p.get('qty')} "
+                            f"avg=${p.get('avg_cost')} mark=${p.get('current_price')} "
+                            f"P/L=${(p.get('unrealized_pl') or 0):.2f}"
+                        )
+                    else:
+                        lines.append(
+                            f"  {p.get('ticker','?')}: qty={p.get('qty')} "
+                            f"avg=${(p.get('avg_cost') or 0):.2f} mark=${(p.get('current_price') or 0):.2f} "
+                            f"P/L=${(p.get('unrealized_pl') or 0):.2f} ({(p.get('pl_pct') or 0):.1f}%)"
+                        )
+            else:
+                lines.append("Open positions: (none)")
+
+            pt_trades = pt.get("trades") or []
+            if pt_trades:
+                lines.append(f"Last {min(5, len(pt_trades))} trades:")
+                for t in pt_trades[:5]:
+                    extra = ""
+                    if t.get("option_type"):
+                        extra = f" {t.get('strike')}{t.get('option_type','')[0].upper()} {t.get('expiry')}"
+                    lines.append(
+                        f"  [{(t.get('timestamp') or '')[5:16].replace('T',' ')}] "
+                        f"{t.get('action')} {t.get('qty')} {t.get('ticker')}{extra} @ ${(t.get('price') or 0):.2f}"
+                    )
+
+            pt_decisions = pt.get("decisions") or []
+            if pt_decisions:
+                lines.append(f"Last {min(3, len(pt_decisions))} decisions:")
+                for d in pt_decisions[:3]:
+                    reasoning = ""
+                    try:
+                        j = json.loads(d.get("reasoning") or "{}")
+                        reasoning = (j.get("decision") or {}).get("reasoning") or j.get("detail") or ""
+                    except Exception:
+                        reasoning = d.get("reasoning") or ""
+                    lines.append(
+                        f"  [{(d.get('timestamp') or '')[5:16].replace('T',' ')}] "
+                        f"{d.get('action_taken','')}: {reasoning[:160]}"
+                    )
+
+            # Equity curve trend (last ~6 points spaced over recent history)
+            eq = pt.get("equity") or []
+            if len(eq) >= 6:
+                step = max(1, len(eq) // 6)
+                sample = eq[::step][-6:]
+                trend = " → ".join(f"${(p.get('total_value') or 0):.2f}" for p in sample)
+                lines.append(f"Equity trend (recent): {trend}")
+
+            paper_trader_block = "\n".join(lines) if lines else "(no paper-trader state)"
+        except Exception as e:
+            _logger().warning("chat: paper trader state fetch failed: %s", e)
+
+        # Pull portfolio analytics (sector exposure, drawdown, win rate, daily P/L)
+        analytics_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen("http://127.0.0.1:8090/api/analytics", timeout=3) as resp:
+                an = json.loads(resp.read().decode("utf-8"))
+            if not an.get("error"):
+                bits = []
+                if an.get("daily_pl_usd") is not None:
+                    bits.append(
+                        f"Today P/L: ${an['daily_pl_usd']:+.2f} ({an.get('daily_pl_pct', 0):+.2f}%)"
+                    )
+                if an.get("max_drawdown_pct"):
+                    bits.append(
+                        f"Max DD: -${an['max_drawdown_usd']:.2f} ({an['max_drawdown_pct']:.2f}%)"
+                    )
+                if an.get("sharpe_annualized") is not None:
+                    bits.append(f"Sharpe (ann.): {an['sharpe_annualized']}")
+                if an.get("win_rate_pct") is not None:
+                    bits.append(
+                        f"Win rate: {an['win_rate_pct']}% over {an.get('n_round_trips', 0)} round-trips"
+                    )
+                if an.get("realized_pl_usd"):
+                    bits.append(f"Realized P/L: ${an['realized_pl_usd']:+.2f}")
+                sectors = an.get("sector_exposure_pct") or {}
+                if sectors:
+                    top_secs = sorted(sectors.items(), key=lambda kv: -kv[1])[:5]
+                    bits.append("Sector exposure: " +
+                                ", ".join(f"{s}={p:.1f}%" for s, p in top_secs) +
+                                f", cash={an.get('cash_pct', 0):.1f}%")
+                if bits:
+                    analytics_block = "\n".join(bits)
+        except Exception as e:
+            _logger().warning("chat: analytics fetch failed: %s", e)
+
         now_iso = datetime.now(timezone.utc).isoformat()
         system_prompt = (
-            "You are a market intelligence analyst with access to a real-time news feed "
-            "and portfolio data.\n"
+            "You are a market intelligence analyst with access to a real-time news feed, "
+            "the user's real portfolio, and a separate live paper trading bot (Claude Opus 4.7) "
+            "running on a $1000 simulated portfolio.\n"
             f"Current date: {now_iso}\n\n"
             "TOP NEWS SIGNALS (last 6h, ranked by ML score):\n"
             f"{articles_block}\n\n"
-            "PORTFOLIO SNAPSHOT:\n"
+            "USER'S REAL PORTFOLIO SNAPSHOT:\n"
             f"{portfolio_block}\n\n"
-            "Answer questions about current market conditions, global events, specific "
-            "stocks, or portfolio analysis. Be concise and data-driven. Cite specific "
-            "articles when relevant."
+            "PAPER TRADER LIVE STATE (separate $1000 sim run by Opus 4.7 every 30 min):\n"
+            f"{paper_trader_block}\n\n"
+            + (f"PAPER TRADER ANALYTICS:\n{analytics_block}\n\n" if analytics_block else "")
+            + "Answer questions about current market conditions, global events, specific "
+            "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
+            "Be concise and data-driven. Cite specific articles when relevant. When the user "
+            "asks 'how am I doing', show real-portfolio first then paper-trader as separate "
+            "lines so they aren't confused."
         )
 
         # Build messages
@@ -889,7 +1014,7 @@ _CHAT_HTML = """<!doctype html>
       padding: 8px 14px; border-radius: 18px; cursor: pointer; font-size: 0.9em;
     }
     .suggestion:hover { background: #21262d; }
-    form.input-bar {
+    .input-bar {
       display: flex; gap: 10px; padding: 14px 24px; border-top: 1px solid #21262d; background: #0d1117;
     }
     input.msg-input {
@@ -947,16 +1072,18 @@ _CHAT_HTML = """<!doctype html>
   <button class="suggestion" data-q="What should I watch in Asia overnight?">What should I watch in Asia overnight?</button>
 </div>
 <div class="chat-wrap" id="chat"></div>
-<form class="input-bar" id="form">
+<div class="input-bar">
   <input class="msg-input" id="input" type="text" placeholder="Ask about markets, news, or your portfolio…" autocomplete="off" autofocus>
-  <button class="send" id="send" type="submit">Send</button>
-</form>
+  <button class="send" id="send" type="button" onclick="sendMsg()">Send</button>
+</div>
 <script>
 const chat = document.getElementById('chat');
-const form = document.getElementById('form');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
-const history = [];
+const msgs = [];
+
+function sendMsg() { ask(input.value.trim()); }
+input.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); } });
 
 function scrollDown() {
   requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
@@ -1003,9 +1130,9 @@ function addLoader() {
 }
 
 async function ask(message) {
-  if (!message) return;
+  if (!message || sendBtn.disabled) return;
   addMsg('user', message);
-  history.push({role: 'user', content: message});
+  msgs.push({role: 'user', content: message});
   input.value = '';
   sendBtn.disabled = true;
   const loader = addLoader();
@@ -1013,7 +1140,7 @@ async function ask(message) {
     const r = await fetch('/api/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message: message, history: history.slice(0, -1)}),
+      body: JSON.stringify({message: message, history: msgs.slice(0, -1)}),
     });
     const j = await r.json();
     loader.remove();
@@ -1021,7 +1148,7 @@ async function ask(message) {
       addMsg('error', 'Error: ' + (j.error || ('HTTP ' + r.status)));
     } else {
       addMsg('assistant', j.response, j.sources || []);
-      history.push({role: 'assistant', content: j.response});
+      msgs.push({role: 'assistant', content: j.response});
     }
   } catch (e) {
     loader.remove();
@@ -1032,15 +1159,9 @@ async function ask(message) {
   }
 }
 
-form.addEventListener('submit', (e) => {
-  e.preventDefault();
-  ask(input.value.trim());
-});
-
-document.getElementById('suggestions').addEventListener('click', (e) => {
-  const b = e.target.closest('.suggestion');
-  if (!b) return;
-  ask(b.dataset.q);
+document.getElementById('suggestions').addEventListener('click', function(e) {
+  var b = e.target.closest('.suggestion');
+  if (b) ask(b.dataset.q);
 });
 </script>
 </body>
