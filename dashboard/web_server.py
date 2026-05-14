@@ -625,6 +625,86 @@ refreshPaperTrader();
 setInterval(refresh, 15000);
 setInterval(refreshPaperTrader, 15000);
 </script>
+
+<!-- Floating chat widget -->
+<button id="dichat-btn" aria-label="Open chat"
+  style="position:fixed;bottom:20px;right:20px;width:56px;height:56px;border-radius:50%;background:#1565c0;color:#fff;border:none;font-size:24px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.5);z-index:9998">✦</button>
+<div id="dichat-panel"
+  style="display:none;position:fixed;bottom:88px;right:20px;width:360px;height:480px;background:#11161d;color:#cfd8dc;border:1px solid #30363d;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,0.5);z-index:9999;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif">
+  <div style="padding:12px 14px;border-bottom:1px solid #21262d;display:flex;justify-content:space-between;align-items:center">
+    <span style="font-weight:600;color:#e6edf3">Market Intel</span>
+    <a href="/chat" style="color:#8b949e;font-size:0.8em;text-decoration:none;margin-left:auto;margin-right:10px">full ↗</a>
+    <button id="dichat-close" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:20px;line-height:1;padding:0 4px">×</button>
+  </div>
+  <div id="dichat-history" style="flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px;font-size:14px;line-height:1.45"></div>
+  <form id="dichat-form" style="display:flex;gap:6px;padding:10px;border-top:1px solid #21262d">
+    <input id="dichat-input" type="text" autocomplete="off" placeholder="Ask about markets…"
+      style="flex:1;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:8px 10px;border-radius:6px;font-size:14px;font-family:inherit">
+    <button type="submit" id="dichat-send"
+      style="background:#1565c0;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-weight:600">Send</button>
+  </form>
+</div>
+<script>
+(function(){
+  const btn = document.getElementById('dichat-btn');
+  const panel = document.getElementById('dichat-panel');
+  const closeBtn = document.getElementById('dichat-close');
+  const hist = document.getElementById('dichat-history');
+  const form = document.getElementById('dichat-form');
+  const inp = document.getElementById('dichat-input');
+  const sendBtn = document.getElementById('dichat-send');
+  const convo = [];
+  let greeted = false;
+  function openPanel(){ panel.style.display='flex'; btn.style.display='none'; inp.focus();
+    if(!greeted){ bubble('assistant','Hi — ask about markets, news, or your portfolio.'); greeted=true; } }
+  function closePanel(){ panel.style.display='none'; btn.style.display='block'; }
+  btn.addEventListener('click', openPanel);
+  closeBtn.addEventListener('click', closePanel);
+  function bubble(role, text){
+    const d = document.createElement('div');
+    const bg = role==='user' ? '#1565c0' : role==='error' ? '#4a1d1d' : '#21262d';
+    const fg = role==='user' ? '#fff' : role==='error' ? '#ffd6d6' : '#cfd8dc';
+    const align = role==='user' ? 'flex-end' : 'flex-start';
+    d.style.cssText = 'background:'+bg+';color:'+fg+';padding:8px 12px;border-radius:10px;max-width:85%;align-self:'+align+';white-space:pre-wrap;word-wrap:break-word';
+    d.textContent = text;
+    hist.appendChild(d);
+    hist.scrollTop = hist.scrollHeight;
+    return d;
+  }
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const m = inp.value.trim();
+    if (!m || sendBtn.disabled) return;
+    bubble('user', m);
+    inp.value = '';
+    sendBtn.disabled = true;
+    const tmp = bubble('assistant', 'thinking…');
+    tmp.style.opacity = '0.6';
+    try {
+      const r = await fetch('/api/chat', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({message:m, history: convo.slice()})
+      });
+      const j = await r.json();
+      tmp.remove();
+      if (!r.ok || j.error) {
+        bubble('error', 'Error: ' + (j.error || ('HTTP '+r.status)));
+      } else {
+        const txt = j.response || j.reply || '(empty response)';
+        bubble('assistant', txt);
+        convo.push({role:'user', content:m});
+        convo.push({role:'assistant', content:txt});
+      }
+    } catch (err) {
+      tmp.remove();
+      bubble('error', 'Network error: ' + err.message);
+    } finally {
+      sendBtn.disabled = false;
+      inp.focus();
+    }
+  });
+})();
+</script>
 </body>
 </html>
 """
