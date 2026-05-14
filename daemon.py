@@ -814,6 +814,11 @@ def export_worker(store: ArticleStore):
 def _port_is_free(host: str, port: int) -> bool:
     import socket as _sock
     s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    # Match werkzeug's BaseWSGIServer, which sets SO_REUSEADDR before binding.
+    # Without this, the probe fails on sockets stuck in TIME_WAIT after a
+    # systemd restart even though werkzeug itself would bind successfully —
+    # causing spurious "port busy" warnings and a 5–60s startup delay.
+    s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
     try:
         s.bind((host, port))
         return True
