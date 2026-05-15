@@ -50,6 +50,23 @@ Output ONLY the alert message."""
 ALERT_BATCH_SIZE = 5
 
 
+def _is_synthetic(art: dict) -> bool:
+    """True for backtest/opus-annotation rows that must never reach the live
+    Bloomberg formatter. Mirrors storage.article_store._LIVE_ONLY_CLAUSE.
+
+    The store's get_unalerted_urgent already excludes synthetic rows, but the
+    invariant is load-bearing enough that we re-check at the formatter — a
+    future caller that bypasses the store filter (e.g., a manual replay) must
+    not leak training rows into Discord."""
+    url = (art.get("link") or art.get("url") or "")
+    source = (art.get("source") or "")
+    if url.startswith("backtest://"):
+        return True
+    if source.startswith("backtest_") or source.startswith("opus_annotation"):
+        return True
+    return False
+
+
 def send_urgent_alert(urgent_articles: list, store) -> bool:
     if not urgent_articles:
         return False
@@ -57,12 +74,24 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         _log.warning("[alert] No DISCORD_WEBHOOK_URL — skipping")
         return False
 
+    # Defense-in-depth: synthetic backtest/opus-annotation rows must never
+    # reach the live alert formatter. The store filter is the primary defense;
+    # this is a second line.
+    filtered = [a for a in urgent_articles if not _is_synthetic(a)]
+    n_dropped = len(urgent_articles) - len(filtered)
+    if n_dropped:
+        _log.warning(
+            f"[alert] dropped {n_dropped} synthetic rows leaked from upstream"
+        )
+    if not filtered:
+        return False
+
     # Collapse syndicated duplicates first: one breaking story carried by GDELT
     # + Reuters + Yahoo + RSS would otherwise eat the whole 5-slot batch and
     # show the trader the same event five times. After dedup the batch holds
     # five DISTINCT stories; each survivor knows the ids of the copies it
     # absorbed (``_dup_ids``) so all of them can still be marked alerted.
-    deduped = dedupe_urgent(urgent_articles)
+    deduped = dedupe_urgent(filtered)
 
     # Only the first ALERT_BATCH_SIZE feed the prompt — and only those (plus the
     # duplicates they absorbed) get marked alerted. Marking the entire urgent
