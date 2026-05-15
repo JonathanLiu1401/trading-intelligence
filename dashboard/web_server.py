@@ -267,10 +267,19 @@ def create_app(store=None) -> Flask:
                 ev["days_away"] = round((ed - now).total_seconds() / 86400.0, 2)
         except Exception:
             pass
-        # Drop events that have already passed once the recompute runs.
-        snap["events"] = [e for e in snap.get("events", []) or []
-                          if (e.get("days_away") or 0) >= -0.5]
+        # Drop events that have already passed once the recompute runs,
+        # then sort soonest-first so dashboards can render in order.
+        snap["events"] = sorted(
+            [e for e in snap.get("events", []) or []
+             if (e.get("days_away") or 0) >= -0.5],
+            key=lambda e: e.get("days_away") if e.get("days_away") is not None else float("inf"),
+        )
         snap["n_events"] = len(snap["events"])
+        snap["n_within_7d"] = sum(
+            1 for e in snap["events"]
+            if -0.5 <= (e.get("days_away") or 0) <= 7.0
+        )
+        snap["next_event"] = snap["events"][0] if snap["events"] else None
         # Snapshot age for staleness rendering.
         try:
             as_of = datetime.fromisoformat((snap.get("as_of") or "").replace("Z", "+00:00"))
