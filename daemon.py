@@ -1018,10 +1018,16 @@ def scorer_worker(store: ArticleStore):
                      f"llm_sent={len(llm_candidates)} llm_urgent={llm_urgent} "
                      f"remaining={remaining}")
             _worker_last_ok["scorer"] = time.time()
-            # Don't sleep if work remains
-            if remaining == 0:
+            # Loop immediately only when the ML path actually scored a batch
+            # (guaranteed forward progress) AND work remains. If this cycle
+            # produced no ML scores — model unfitted, or the whole backlog
+            # routed to Sonnet — sleep SCORE_INTERVAL. Otherwise a failing or
+            # empty LLM path leaves `remaining` unchanged and spins this worker
+            # in a tight zero-delay loop hammering the Claude CLI. This mirrors
+            # the explicit no-progress guard in ArticleStore.score_pending.
+            if remaining == 0 or not batch:
                 _sleep(SCORE_INTERVAL)
-            # else: loop immediately
+            # else: ML made progress and work remains — loop immediately
         except MemoryError:
             _handle_memory_error("scorer")
         except Exception as e:
@@ -1592,6 +1598,18 @@ def main():
             last_health_report = now
 
     log.info("[daemon] Shutdown complete")
+
+    # Hard-exit instead of falling through into normal interpreter teardown.
+    # Every worker runs as a daemon thread, and the ML trainers spend most of
+    # their time inside torch/CUDA C-extension code. If a training pass is in
+    # flight when SIGTERM lands, Py_FinalizeEx blocks trying to reclaim the GIL
+    # that the C loop still holds — the process then sits idle until systemd's
+    # TimeoutStopSec elapses and escalates to SIGKILL (observed: code=killed
+    # status=9, "Failed with result 'timeout'"). Flushing the log handlers and
+    # calling os._exit guarantees a sub-second, clean-looking stop every time.
+    import logging
+    logging.shutdown()
+    os._exit(0)
 
 
 if __name__ == "__main__":
