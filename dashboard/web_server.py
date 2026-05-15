@@ -734,8 +734,11 @@ _DASHBOARD_HTML = """<!doctype html>
   <a href="/intern/" style="color:#fff;border-bottom:2px solid #e94560;text-decoration:none">Digital Intern</a>
   <a href="/trader/" style="color:#00b4d8;text-decoration:none">Paper Trader</a>
   <a href="/trader/backtests" style="color:#00b4d8;text-decoration:none">Backtests</a>
+  <a href="/backtests/compare" style="color:#00b4d8;text-decoration:none">Compare</a>
+  <a href="/journal" style="color:#00b4d8;text-decoration:none">Journal</a>
   <a href="/ops/" style="color:#00b4d8;text-decoration:none">Ops View</a>
   <a href="/intern/chat" style="color:#00b4d8;text-decoration:none">Chat</a>
+  <a href="/system/" style="color:#00b4d8;text-decoration:none">System</a>
 </nav>
 <div class="container-fluid p-3">
   <div class="d-flex justify-content-between align-items-center mb-3">
@@ -1177,8 +1180,12 @@ _CHAT_HTML = """<!doctype html>
   <a href="/">Home</a>
   <a href="/intern/">Digital Intern</a>
   <a href="/trader/">Paper Trader</a>
+  <a href="/trader/backtests">Backtests</a>
+  <a href="/backtests/compare">Compare</a>
+  <a href="/journal">Journal</a>
   <a href="/ops/">Ops View</a>
   <a href="/intern/chat" class="active">Chat</a>
+  <a href="/system/">System</a>
 </nav>
 <header class="page">
   <h1>Market Intel</h1>
