@@ -697,7 +697,7 @@ _DASHBOARD_HTML = """<!doctype html>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Outfit:wght@400;500;600;700&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap');
     :root {
       --bg: #0c0d0f;
       --bg-panel: #111316;
@@ -724,11 +724,13 @@ _DASHBOARD_HTML = """<!doctype html>
       --pink: #f472b6;
       --font-sans: 'Outfit', system-ui, sans-serif;
       --font-mono: 'DM Mono', 'JetBrains Mono', monospace;
+      --font-display: 'Syne', system-ui, sans-serif;
       --radius: 8px;
       --radius-sm: 5px;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 14px; line-height: 1.5; }
+    body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 15px; line-height: 1.5; }
+    .brand, h1, h2, h3 { font-family: var(--font-display); }
     .topbar {
       background: var(--bg-panel);
       border-bottom: 1px solid var(--border);
@@ -792,11 +794,93 @@ _DASHBOARD_HTML = """<!doctype html>
     .md-body table { border-collapse: collapse; margin: 0.3em 0; width: 100%; font-size: 0.85em; }
     .md-body th, .md-body td { border: 1px solid var(--border-strong); padding: 3px 7px; text-align: left; }
     .md-body th { background: var(--bg-panel); }
+    /* === Mobile-first responsive additions ============================== */
+    .nav-hamburger {
+      display: none; flex-direction: column; justify-content: space-between;
+      width: 32px; height: 22px; background: none; border: none; cursor: pointer;
+      padding: 0; margin-left: auto;
+    }
+    .nav-hamburger span {
+      display: block; height: 2px; background: var(--text); border-radius: 2px;
+      transition: all 0.2s;
+    }
+    .nav-drawer {
+      position: fixed; top: 0; left: -280px; width: 280px; height: 100vh;
+      background: var(--bg-panel); border-right: 1px solid #1e2028;
+      z-index: 1000; transition: left 0.25s ease; overflow-y: auto; padding: 20px 0;
+    }
+    .nav-drawer.open { left: 0; }
+    .nav-drawer-header {
+      font-family: var(--font-display); font-weight: 700; color: var(--amber);
+      font-size: 13px; letter-spacing: 0.1em; padding: 0 20px 20px;
+      border-bottom: 1px solid #1e2028; margin-bottom: 8px;
+    }
+    .nav-drawer a {
+      display: block; padding: 12px 20px; color: var(--text-secondary);
+      text-decoration: none; font-size: 14px; transition: all 0.15s;
+    }
+    .nav-drawer a:hover, .nav-drawer a.active {
+      color: var(--text); background: var(--bg-elevated);
+    }
+    .nav-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.6); z-index: 999;
+    }
+    .nav-overlay.open { display: block; }
+    .bottom-nav {
+      display: none; position: fixed; bottom: 0; left: 0; right: 0; height: 64px;
+      background: var(--bg-panel); border-top: 1px solid #1e2028;
+      grid-template-columns: repeat(5, 1fr); z-index: 200; align-items: stretch;
+    }
+    .bottom-tab {
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; gap: 4px; color: var(--text-secondary);
+      text-decoration: none; font-size: 10px; min-height: 44px; transition: color 0.15s;
+    }
+    .bottom-tab svg { width: 20px; height: 20px; }
+    .bottom-tab.active, .bottom-tab:hover { color: var(--amber); }
+    .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .table-scroll table { min-width: 500px; }
+    @media (max-width: 768px) {
+      .topbar-nav { display: none; }
+      .nav-hamburger { display: flex; }
+      body { font-size: 14px; }
+      button, .btn, a.btn, [role="button"] { min-height: 44px; min-width: 44px; }
+    }
+    @media (max-width: 480px) {
+      body { padding-bottom: 72px; }
+      .bottom-nav { display: grid; }
+      .topbar { padding: 0 16px; }
+      .card { min-height: auto !important; padding: 14px 16px; }
+      .grid-2, .grid2 { grid-template-columns: 1fr !important; }
+      .scroll-pane { max-height: 60vh !important; }
+      table { font-size: 12px; }
+      th, td { padding: 8px 10px; }
+      #dichat-panel { width: calc(100vw - 24px) !important; right: 12px !important;
+        height: 70vh !important; bottom: 80px !important; }
+    }
   </style>
 </head>
 <body>
 <nav class="topbar">
   <span class="brand">◈ TRADING STACK</span>
+  <span class="topbar-nav" style="display:flex;align-items:center;gap:2px;">
+    <a href="/">Command Center</a>
+    <a href="/intern/" class="active">Digital Intern</a>
+    <a href="/trader/">Paper Trader</a>
+    <a href="/trader/backtests">Backtests</a>
+    <a href="/backtests/compare">Compare</a>
+    <a href="/journal">Journal</a>
+    <a href="/ops/">Ops View</a>
+    <a href="/intern/chat">Chat</a>
+    <a href="/system/">System</a>
+  </span>
+  <button class="nav-hamburger" id="navToggle" aria-label="Menu">
+    <span></span><span></span><span></span>
+  </button>
+</nav>
+<div class="nav-drawer" id="navDrawer">
+  <div class="nav-drawer-header">◈ TRADING STACK</div>
   <a href="/">Command Center</a>
   <a href="/intern/" class="active">Digital Intern</a>
   <a href="/trader/">Paper Trader</a>
@@ -806,7 +890,8 @@ _DASHBOARD_HTML = """<!doctype html>
   <a href="/ops/">Ops View</a>
   <a href="/intern/chat">Chat</a>
   <a href="/system/">System</a>
-</nav>
+</div>
+<div class="nav-overlay" id="navOverlay"></div>
 <div class="page-content">
 <div class="container-fluid p-3">
   <div class="d-flex justify-content-between align-items-center mb-3">
@@ -833,7 +918,7 @@ _DASHBOARD_HTML = """<!doctype html>
         </div>
         <div class="card-body p-2">
           <div id="pnl-summary" class="mb-2 small-muted">loading…</div>
-          <div class="table-responsive scroll-pane">
+          <div class="table-responsive scroll-pane table-scroll">
             <table class="table table-sm table-borderless mb-0">
               <thead><tr>
                 <th>TICKER</th><th class="text-end">QTY</th>
@@ -1152,6 +1237,51 @@ async function savePortfolioConfig() {
   });
 })();
 </script>
+
+<nav class="bottom-nav" id="bottomNav">
+  <a href="/" class="bottom-tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5L12 3l9 6.5V20a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1V9.5z"/></svg>
+    <span>Home</span>
+  </a>
+  <a href="/intern/" class="bottom-tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/></svg>
+    <span>Intern</span>
+  </a>
+  <a href="/trader/" class="bottom-tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M17 7h4v4"/></svg>
+    <span>Trader</span>
+  </a>
+  <a href="/intern/chat" class="bottom-tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.8-.9L3 21l1.9-5.7A8.38 8.38 0 0 1 4 11.5 8.5 8.5 0 0 1 12.5 3 8.38 8.38 0 0 1 21 11.5z"/></svg>
+    <span>Chat</span>
+  </a>
+  <a href="/trader/backtests" class="bottom-tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg>
+    <span>Backtests</span>
+  </a>
+</nav>
+<script>
+(function(){
+  const navToggle = document.getElementById('navToggle');
+  const navDrawer = document.getElementById('navDrawer');
+  const navOverlay = document.getElementById('navOverlay');
+  if (navToggle) {
+    navToggle.addEventListener('click', () => {
+      navDrawer.classList.toggle('open');
+      navOverlay.classList.toggle('open');
+    });
+    navOverlay.addEventListener('click', () => {
+      navDrawer.classList.remove('open');
+      navOverlay.classList.remove('open');
+    });
+  }
+  document.querySelectorAll('.bottom-tab').forEach(tab => {
+    if (tab.getAttribute('href') === window.location.pathname) {
+      tab.classList.add('active');
+    }
+  });
+})();
+</script>
 </body>
 </html>
 """
@@ -1164,7 +1294,7 @@ _CHAT_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Market Intel — Digital Intern</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Outfit:wght@400;500;600;700&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap');
     :root {
       --bg: #0c0d0f;
       --bg-panel: #111316;
@@ -1191,6 +1321,7 @@ _CHAT_HTML = """<!doctype html>
       --pink: #f472b6;
       --font-sans: 'Outfit', system-ui, sans-serif;
       --font-mono: 'DM Mono', 'JetBrains Mono', monospace;
+      --font-display: 'Syne', system-ui, sans-serif;
       --radius: 8px;
       --radius-sm: 5px;
     }
@@ -1199,10 +1330,11 @@ _CHAT_HTML = """<!doctype html>
     body {
       background: var(--bg); color: var(--text);
       font-family: var(--font-sans);
-      font-size: 14px;
+      font-size: 15px;
       line-height: 1.5;
       display: flex; flex-direction: column; height: 100vh;
     }
+    .brand, h1, h2, h3 { font-family: var(--font-display); }
     .topbar {
       background: var(--bg-panel);
       border-bottom: 1px solid var(--border);
@@ -1310,12 +1442,94 @@ _CHAT_HTML = """<!doctype html>
     .md-body table { border-collapse: collapse; margin: 0.4em 0; width: 100%; }
     .md-body th, .md-body td { border: 1px solid var(--border-strong); padding: 4px 8px; text-align: left; }
     .md-body th { background: var(--bg-panel); }
+    /* === Mobile-first responsive additions ============================== */
+    .nav-hamburger {
+      display: none; flex-direction: column; justify-content: space-between;
+      width: 32px; height: 22px; background: none; border: none; cursor: pointer;
+      padding: 0; margin-left: auto;
+    }
+    .nav-hamburger span {
+      display: block; height: 2px; background: var(--text); border-radius: 2px;
+      transition: all 0.2s;
+    }
+    .nav-drawer {
+      position: fixed; top: 0; left: -280px; width: 280px; height: 100vh;
+      background: var(--bg-panel); border-right: 1px solid #1e2028;
+      z-index: 1000; transition: left 0.25s ease; overflow-y: auto; padding: 20px 0;
+    }
+    .nav-drawer.open { left: 0; }
+    .nav-drawer-header {
+      font-family: var(--font-display); font-weight: 700; color: var(--amber);
+      font-size: 13px; letter-spacing: 0.1em; padding: 0 20px 20px;
+      border-bottom: 1px solid #1e2028; margin-bottom: 8px;
+    }
+    .nav-drawer a {
+      display: block; padding: 12px 20px; color: var(--text-secondary);
+      text-decoration: none; font-size: 14px; transition: all 0.15s;
+    }
+    .nav-drawer a:hover, .nav-drawer a.active {
+      color: var(--text); background: var(--bg-elevated);
+    }
+    .nav-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.6); z-index: 999;
+    }
+    .nav-overlay.open { display: block; }
+    .bottom-nav {
+      display: none; position: fixed; bottom: 0; left: 0; right: 0; height: 64px;
+      background: var(--bg-panel); border-top: 1px solid #1e2028;
+      grid-template-columns: repeat(5, 1fr); z-index: 200; align-items: stretch;
+    }
+    .bottom-tab {
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; gap: 4px; color: var(--text-secondary);
+      text-decoration: none; font-size: 10px; min-height: 44px; transition: color 0.15s;
+    }
+    .bottom-tab svg { width: 20px; height: 20px; }
+    .bottom-tab.active, .bottom-tab:hover { color: var(--amber); }
+    .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .table-scroll table { min-width: 500px; }
+    .input-bar { position: sticky; bottom: 0; }
+    @media (max-width: 768px) {
+      .topbar-nav { display: none; }
+      .nav-hamburger { display: flex; }
+      body { font-size: 14px; }
+      button, .btn, a.btn, [role="button"] { min-height: 44px; min-width: 44px; }
+    }
+    @media (max-width: 480px) {
+      .bottom-nav { display: grid; }
+      .topbar { padding: 0 16px; }
+      .msg { max-width: 90%; }
+      .chat-wrap { padding: 14px 16px 88px; }
+      .input-bar { padding: 12px 16px; margin-bottom: 64px; }
+      .suggestions { padding: 12px 16px 4px; }
+      button.send { min-height: 44px; min-width: 44px; }
+      table { font-size: 12px; }
+      th, td { padding: 8px 10px; }
+    }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js" async></script>
 </head>
 <body>
 <nav class="topbar">
   <span class="brand">◈ TRADING STACK</span>
+  <span class="topbar-nav" style="display:flex;align-items:center;gap:2px;">
+    <a href="/">Command Center</a>
+    <a href="/intern/">Digital Intern</a>
+    <a href="/trader/">Paper Trader</a>
+    <a href="/trader/backtests">Backtests</a>
+    <a href="/backtests/compare">Compare</a>
+    <a href="/journal">Journal</a>
+    <a href="/ops/">Ops View</a>
+    <a href="/intern/chat" class="active">Chat</a>
+    <a href="/system/">System</a>
+  </span>
+  <button class="nav-hamburger" id="navToggle" aria-label="Menu">
+    <span></span><span></span><span></span>
+  </button>
+</nav>
+<div class="nav-drawer" id="navDrawer">
+  <div class="nav-drawer-header">◈ TRADING STACK</div>
   <a href="/">Command Center</a>
   <a href="/intern/">Digital Intern</a>
   <a href="/trader/">Paper Trader</a>
@@ -1325,7 +1539,8 @@ _CHAT_HTML = """<!doctype html>
   <a href="/ops/">Ops View</a>
   <a href="/intern/chat" class="active">Chat</a>
   <a href="/system/">System</a>
-</nav>
+</div>
+<div class="nav-overlay" id="navOverlay"></div>
 <div class="page-content">
 <header class="page">
   <h1>Market Intel</h1>
@@ -1430,6 +1645,51 @@ document.getElementById('suggestions').addEventListener('click', function(e) {
   var b = e.target.closest('.suggestion');
   if (b) ask(b.dataset.q);
 });
+</script>
+
+<nav class="bottom-nav" id="bottomNav">
+  <a href="/" class="bottom-tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5L12 3l9 6.5V20a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1V9.5z"/></svg>
+    <span>Home</span>
+  </a>
+  <a href="/intern/" class="bottom-tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/></svg>
+    <span>Intern</span>
+  </a>
+  <a href="/trader/" class="bottom-tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M17 7h4v4"/></svg>
+    <span>Trader</span>
+  </a>
+  <a href="/intern/chat" class="bottom-tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.8-.9L3 21l1.9-5.7A8.38 8.38 0 0 1 4 11.5 8.5 8.5 0 0 1 12.5 3 8.38 8.38 0 0 1 21 11.5z"/></svg>
+    <span>Chat</span>
+  </a>
+  <a href="/trader/backtests" class="bottom-tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg>
+    <span>Backtests</span>
+  </a>
+</nav>
+<script>
+(function(){
+  const navToggle = document.getElementById('navToggle');
+  const navDrawer = document.getElementById('navDrawer');
+  const navOverlay = document.getElementById('navOverlay');
+  if (navToggle) {
+    navToggle.addEventListener('click', () => {
+      navDrawer.classList.toggle('open');
+      navOverlay.classList.toggle('open');
+    });
+    navOverlay.addEventListener('click', () => {
+      navDrawer.classList.remove('open');
+      navOverlay.classList.remove('open');
+    });
+  }
+  document.querySelectorAll('.bottom-tab').forEach(tab => {
+    if (tab.getAttribute('href') === window.location.pathname) {
+      tab.classList.add('active');
+    }
+  });
+})();
 </script>
 </body>
 </html>
