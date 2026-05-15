@@ -138,12 +138,8 @@ CREATE INDEX IF NOT EXISTS idx_briefings_ts ON briefings(ts);
 
 
 def _get_db_path() -> Path:
-    if USB_PATH.parent.exists():
-        try:
-            USB_PATH.mkdir(parents=True, exist_ok=True)
-            return USB_PATH / "articles.db"
-        except PermissionError:
-            pass
+    # Always use local path as the canonical DB.
+    # USB is used only for checkpoint backups (ml_checkpoints/), not as primary DB.
     LOCAL_PATH.mkdir(parents=True, exist_ok=True)
     return LOCAL_PATH / "articles.db"
 
