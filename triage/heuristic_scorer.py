@@ -37,10 +37,20 @@ _AMBIGUOUS_TOKENS = {
 }
 
 
+# Pre-compile per-term boundary patterns once at import time. Previously
+# _term_matches rebuilt and recompiled the regex string on every call —
+# ~18k pattern rebuilds per scorer pass (4 tiers × ~30 ambiguous terms × ~150 articles).
+_AMBIGUOUS_PATTERNS = {
+    term: re.compile(r"\b" + re.escape(term) + r"\b")
+    for term in _AMBIGUOUS_TOKENS
+}
+
+
 def _term_matches(term: str, text: str) -> bool:
     """Match phrase as substring; ambiguous short tokens require word boundaries."""
-    if term in _AMBIGUOUS_TOKENS:
-        return re.search(r"\b" + re.escape(term) + r"\b", text) is not None
+    pat = _AMBIGUOUS_PATTERNS.get(term)
+    if pat is not None:
+        return pat.search(text) is not None
     return term in text
 
 # ── Portfolio tickers (direct mention = highest priority) ───────────────────
