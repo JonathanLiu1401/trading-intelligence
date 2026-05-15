@@ -27,6 +27,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from core.claude_cli import claude_call
+from core.json_extract import extract_json_array
 from core.logger import get_logger
 
 log = get_logger("recursive_labeler")
@@ -65,21 +66,6 @@ class RoundStats:
     elapsed_s: float = 0.0
 
 
-def _extract_json_array(raw: str):
-    """Find the first top-level JSON array in a Claude response."""
-    decoder = json.JSONDecoder()
-    start = raw.find("[")
-    while start != -1:
-        try:
-            value, _ = decoder.raw_decode(raw[start:])
-            if isinstance(value, list):
-                return value
-        except ValueError:
-            pass
-        start = raw.find("[", start + 1)
-    return None
-
-
 def _articles_for_prompt(articles: list[dict]) -> str:
     payload = []
     for a in articles:
@@ -97,7 +83,7 @@ def _label_batch(articles: list[dict], model: str) -> list[dict] | None:
     raw = claude_call(prompt, model=model, timeout=LLM_TIMEOUT)
     if raw is None:
         return None
-    parsed = _extract_json_array(raw)
+    parsed = extract_json_array(raw)
     if parsed is None:
         log.warning(f"[recursive_labeler] failed to parse JSON ({len(raw)} chars) "
                     f"— first 200: {raw[:200]!r}")
