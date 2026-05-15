@@ -698,48 +698,117 @@ _DASHBOARD_HTML = """<!doctype html>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
   <style>
-    body { background:#0d1117; color:#e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; font-size: 16px; }
-    .card { background:#161b22; border:1px solid #30363d; }
-    .card-header { background:#21262d; font-weight:600; }
-    .badge-urgent { background:#da3633; }
-    .badge-score { background:#1f6feb; }
-    .pl-pos { color:#3fb950; }
-    .pl-neg { color:#f85149; }
-    a { color:#58a6ff; }
-    a:hover { color:#79c0ff; }
+    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap');
+    :root {
+      --bg: #0c0d0f;
+      --bg-panel: #111316;
+      --bg-elevated: #17191d;
+      --bg-hover: #1c1f24;
+      --bg-input: #0e1012;
+      --border: rgba(255,255,255,0.07);
+      --border-strong: rgba(255,255,255,0.13);
+      --text: #dde1e7;
+      --text-secondary: #8b929d;
+      --text-muted: #50565f;
+      --amber: #f0b429;
+      --amber-dim: rgba(240,180,41,0.12);
+      --cyan: #0acdff;
+      --cyan-dim: rgba(10,205,255,0.12);
+      --green: #00c896;
+      --green-dim: rgba(0,200,150,0.12);
+      --red: #ff4455;
+      --red-dim: rgba(255,68,85,0.12);
+      --blue: #4d9eff;
+      --blue-dim: rgba(77,158,255,0.12);
+      --yellow: #fbbf24;
+      --yellow-dim: rgba(251,191,36,0.12);
+      --pink: #f472b6;
+      --font-sans: 'Outfit', system-ui, sans-serif;
+      --font-mono: 'DM Mono', 'JetBrains Mono', monospace;
+      --radius: 8px;
+      --radius-sm: 5px;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 14px; line-height: 1.5; }
+    .topbar {
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      padding: 0 20px;
+      height: 48px;
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      margin: 0;
+    }
+    .brand {
+      font-weight: 700;
+      color: var(--amber);
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-right: 16px;
+      flex-shrink: 0;
+    }
+    .topbar a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 5px 12px;
+      border-radius: var(--radius-sm);
+      transition: color 0.15s, background 0.15s;
+      white-space: nowrap;
+    }
+    .topbar a:hover { color: var(--text); background: var(--bg-hover); }
+    .topbar a.active { color: var(--amber); background: var(--amber-dim); }
+    .page-content { padding: 16px 20px; }
+    /* Bootstrap overrides — apply our palette to the existing Bootstrap card structure */
+    .card { background: var(--bg-panel) !important; border: 1px solid var(--border) !important; border-radius: var(--radius) !important; }
+    .card-header { background: var(--bg-elevated) !important; font-weight: 600; border-bottom: 1px solid var(--border) !important; color: var(--text); }
+    .badge-urgent { background: var(--red-dim); color: var(--red); }
+    .badge-score { background: var(--blue-dim); color: var(--blue); }
+    .pl-pos { color: var(--green); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+    .pl-neg { color: var(--red); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+    a { color: var(--cyan); }
+    a:hover { color: var(--blue); }
     .scroll-pane { max-height:520px; overflow-y:auto; }
-    .ticker { font-weight:600; }
-    .small-muted { color:#8b949e; font-size:0.85em; }
-    table { color:#e6edf3; }
+    .ticker { font-weight:600; color: var(--text); }
+    .small-muted { color: var(--text-secondary); font-size: 0.85em; }
+    table { color: var(--text); }
+    .table-borderless td, .table-borderless th { color: var(--text); }
     /* Markdown in floating chat widget */
     .md-body p { margin: 0 0 0.5em; }
     .md-body p:last-child { margin-bottom: 0; }
     .md-body ul, .md-body ol { margin: 0.3em 0 0.5em 1.2em; padding: 0; }
     .md-body li { margin-bottom: 0.15em; }
-    .md-body code { background: #0d1117; border: 1px solid #30363d; padding: 1px 4px; border-radius: 3px; font-size: 0.85em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .md-body pre { background: #0d1117; border: 1px solid #30363d; padding: 8px 10px; border-radius: 5px; overflow-x: auto; margin: 0.3em 0; }
+    .md-body code { background: var(--bg-input); border: 1px solid var(--border-strong); padding: 1px 4px; border-radius: 3px; font-size: 0.85em; font-family: var(--font-mono); }
+    .md-body pre { background: var(--bg-input); border: 1px solid var(--border-strong); padding: 8px 10px; border-radius: var(--radius-sm); overflow-x: auto; margin: 0.3em 0; }
     .md-body pre code { background: none; border: none; padding: 0; }
-    .md-body strong { color: #e6edf3; }
-    .md-body h1, .md-body h2, .md-body h3 { margin: 0.5em 0 0.25em; color: #e6edf3; font-size: 0.95em; }
-    .md-body blockquote { border-left: 3px solid #30363d; margin: 0.3em 0; padding-left: 8px; color: #8b949e; }
+    .md-body strong { color: var(--text); }
+    .md-body h1, .md-body h2, .md-body h3 { margin: 0.5em 0 0.25em; color: var(--text); font-size: 0.95em; }
+    .md-body blockquote { border-left: 3px solid var(--border-strong); margin: 0.3em 0; padding-left: 8px; color: var(--text-secondary); }
     .md-body table { border-collapse: collapse; margin: 0.3em 0; width: 100%; font-size: 0.85em; }
-    .md-body th, .md-body td { border: 1px solid #30363d; padding: 3px 7px; text-align: left; }
-    .md-body th { background: #161b22; }
+    .md-body th, .md-body td { border: 1px solid var(--border-strong); padding: 3px 7px; text-align: left; }
+    .md-body th { background: var(--bg-panel); }
   </style>
 </head>
 <body>
-<nav style="background:#1a1a2e;padding:12px 24px;display:flex;gap:24px;align-items:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;border-bottom:1px solid #333;font-size:16px">
-  <span style="color:#e94560;font-weight:bold;font-size:1.1em">◈ TRADING STACK</span>
-  <a href="/" style="color:#00b4d8;text-decoration:none">Home</a>
-  <a href="/intern/" style="color:#fff;border-bottom:2px solid #e94560;text-decoration:none">Digital Intern</a>
-  <a href="/trader/" style="color:#00b4d8;text-decoration:none">Paper Trader</a>
-  <a href="/trader/backtests" style="color:#00b4d8;text-decoration:none">Backtests</a>
-  <a href="/backtests/compare" style="color:#00b4d8;text-decoration:none">Compare</a>
-  <a href="/journal" style="color:#00b4d8;text-decoration:none">Journal</a>
-  <a href="/ops/" style="color:#00b4d8;text-decoration:none">Ops View</a>
-  <a href="/intern/chat" style="color:#00b4d8;text-decoration:none">Chat</a>
-  <a href="/system/" style="color:#00b4d8;text-decoration:none">System</a>
+<nav class="topbar">
+  <span class="brand">◈ TRADING STACK</span>
+  <a href="/">Command Center</a>
+  <a href="/intern/" class="active">Digital Intern</a>
+  <a href="/trader/">Paper Trader</a>
+  <a href="/trader/backtests">Backtests</a>
+  <a href="/backtests/compare">Compare</a>
+  <a href="/journal">Journal</a>
+  <a href="/ops/">Ops View</a>
+  <a href="/intern/chat">Chat</a>
+  <a href="/system/">System</a>
 </nav>
+<div class="page-content">
 <div class="container-fluid p-3">
   <div class="d-flex justify-content-between align-items-center mb-3">
     <h2 class="mb-0">Digital Intern</h2>
@@ -776,16 +845,16 @@ _DASHBOARD_HTML = """<!doctype html>
           </div>
           <!-- Inline portfolio editor -->
           <div id="portfolio-editor" style="display:none;margin-top:10px;">
-            <div style="font-size:11px;color:#78909c;margin-bottom:6px;">Edit positions — changes save to config and refresh live P&L</div>
+            <div style="font-size:11px;color:var(--text-secondary);margin-bottom:6px;">Edit positions — changes save to config and refresh live P&L</div>
             <table class="table table-sm table-borderless mb-1" style="font-size:12px;">
-              <thead><tr style="color:#78909c;">
+              <thead><tr style="color:var(--text-secondary);">
                 <th>TICKER</th><th>TYPE</th><th>QTY</th><th>AVG COST</th><th></th>
               </tr></thead>
               <tbody id="edit-pos-rows"></tbody>
             </table>
             <button class="btn btn-sm btn-outline-success py-0 px-2 me-1" style="font-size:11px" onclick="addEditRow()">+ Add</button>
             <button class="btn btn-sm btn-primary py-0 px-2" style="font-size:11px" onclick="savePortfolioConfig()">Save</button>
-            <span id="edit-save-status" style="font-size:11px;color:#78909c;margin-left:8px;"></span>
+            <span id="edit-save-status" style="font-size:11px;color:var(--text-secondary);margin-left:8px;"></span>
           </div>
         </div>
       </div>
@@ -813,6 +882,7 @@ _DASHBOARD_HTML = """<!doctype html>
       </div>
     </div>
   </div>
+</div>
 </div>
 
 <script>
@@ -955,12 +1025,12 @@ function renderEditRows(positions) {
   positions.forEach((p, i) => {
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td><input class="form-control form-control-sm p-1" style="font-size:11px;background:#0d1117;color:#e6edf3;border-color:#30363d;width:70px" value="${p.ticker||""}" data-i="${i}" data-f="ticker"></td>
-      <td><select class="form-select form-select-sm p-1" style="font-size:11px;background:#0d1117;color:#e6edf3;border-color:#30363d;width:90px" data-i="${i}" data-f="type">
+      <td><input class="form-control form-control-sm p-1" style="font-size:11px;background:var(--bg-input);color:var(--text);border-color:var(--border-strong);width:70px" value="${p.ticker||""}" data-i="${i}" data-f="ticker"></td>
+      <td><select class="form-select form-select-sm p-1" style="font-size:11px;background:var(--bg-input);color:var(--text);border-color:var(--border-strong);width:90px" data-i="${i}" data-f="type">
         ${["stock","etf_leveraged","etf","option"].map(t=>`<option${p.type===t?" selected":""}>${t}</option>`).join("")}
       </select></td>
-      <td><input class="form-control form-control-sm p-1" style="font-size:11px;background:#0d1117;color:#e6edf3;border-color:#30363d;width:70px" value="${p.qty??""}" data-i="${i}" data-f="qty"></td>
-      <td><input class="form-control form-control-sm p-1" style="font-size:11px;background:#0d1117;color:#e6edf3;border-color:#30363d;width:80px" value="${p.avg_cost??""}" data-i="${i}" data-f="avg_cost"></td>
+      <td><input class="form-control form-control-sm p-1" style="font-size:11px;background:var(--bg-input);color:var(--text);border-color:var(--border-strong);width:70px" value="${p.qty??""}" data-i="${i}" data-f="qty"></td>
+      <td><input class="form-control form-control-sm p-1" style="font-size:11px;background:var(--bg-input);color:var(--text);border-color:var(--border-strong);width:80px" value="${p.avg_cost??""}" data-i="${i}" data-f="avg_cost"></td>
       <td><button class="btn btn-sm btn-outline-danger py-0 px-1" style="font-size:10px" onclick="removeEditRow(${i})">✕</button></td>`;
     tbody.appendChild(tr);
   });
@@ -995,20 +1065,20 @@ async function savePortfolioConfig() {
 
 <!-- Floating chat widget -->
 <button id="dichat-btn" aria-label="Open chat"
-  style="position:fixed;bottom:20px;right:20px;width:56px;height:56px;border-radius:50%;background:#1565c0;color:#fff;border:none;font-size:24px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.5);z-index:9998">✦</button>
+  style="position:fixed;bottom:20px;right:20px;width:56px;height:56px;border-radius:50%;background:var(--amber-dim);color:var(--amber);border:1px solid rgba(240,180,41,0.3);font-size:24px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.5);z-index:9998">✦</button>
 <div id="dichat-panel"
-  style="display:none;position:fixed;bottom:88px;right:20px;width:360px;height:480px;background:#11161d;color:#cfd8dc;border:1px solid #30363d;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,0.5);z-index:9999;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif">
-  <div style="padding:12px 14px;border-bottom:1px solid #21262d;display:flex;justify-content:space-between;align-items:center">
-    <span style="font-weight:600;color:#e6edf3">Market Intel</span>
-    <a href="/intern/chat" style="color:#8b949e;font-size:0.8em;text-decoration:none;margin-left:auto;margin-right:10px">full ↗</a>
-    <button id="dichat-close" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:20px;line-height:1;padding:0 4px">×</button>
+  style="display:none;position:fixed;bottom:88px;right:20px;width:360px;height:480px;background:var(--bg-panel);color:var(--text);border:1px solid var(--border);border-radius:var(--radius);box-shadow:0 8px 24px rgba(0,0,0,0.5);z-index:9999;flex-direction:column;font-family:var(--font-sans)">
+  <div style="padding:12px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+    <span style="font-weight:600;color:var(--text)">Market Intel</span>
+    <a href="/intern/chat" style="color:var(--text-secondary);font-size:0.8em;text-decoration:none;margin-left:auto;margin-right:10px">full ↗</a>
+    <button id="dichat-close" style="background:none;border:none;color:var(--text-secondary);cursor:pointer;font-size:20px;line-height:1;padding:0 4px">×</button>
   </div>
   <div id="dichat-history" style="flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px;font-size:14px;line-height:1.45"></div>
-  <form id="dichat-form" style="display:flex;gap:6px;padding:10px;border-top:1px solid #21262d">
+  <form id="dichat-form" style="display:flex;gap:6px;padding:10px;border-top:1px solid var(--border)">
     <input id="dichat-input" type="text" autocomplete="off" placeholder="Ask about markets…"
-      style="flex:1;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:8px 10px;border-radius:6px;font-size:14px;font-family:inherit">
+      style="flex:1;background:var(--bg-input);border:1px solid var(--border-strong);color:var(--text);padding:8px 10px;border-radius:var(--radius-sm);font-size:14px;font-family:inherit">
     <button type="submit" id="dichat-send"
-      style="background:#1565c0;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-weight:600">Send</button>
+      style="background:var(--amber-dim);color:var(--amber);border:1px solid rgba(240,180,41,0.3);padding:8px 14px;border-radius:var(--radius-sm);cursor:pointer;font-weight:600">Send</button>
   </form>
 </div>
 <script>
@@ -1035,8 +1105,8 @@ async function savePortfolioConfig() {
   }
   function bubble(role, text){
     const d = document.createElement('div');
-    const bg = role==='user' ? '#1565c0' : role==='error' ? '#4a1d1d' : '#21262d';
-    const fg = role==='user' ? '#fff' : role==='error' ? '#ffd6d6' : '#cfd8dc';
+    const bg = role==='user' ? 'var(--blue-dim)' : role==='error' ? 'var(--red-dim)' : 'var(--bg-elevated)';
+    const fg = role==='user' ? 'var(--blue)' : role==='error' ? 'var(--red)' : 'var(--text)';
     const align = role==='user' ? 'flex-end' : 'flex-start';
     d.style.cssText = 'background:'+bg+';color:'+fg+';padding:8px 12px;border-radius:10px;max-width:85%;align-self:'+align+';word-wrap:break-word;overflow-wrap:anywhere';
     if (role === 'user') {
@@ -1095,89 +1165,159 @@ _CHAT_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Market Intel — Digital Intern</title>
   <style>
+    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap');
+    :root {
+      --bg: #0c0d0f;
+      --bg-panel: #111316;
+      --bg-elevated: #17191d;
+      --bg-hover: #1c1f24;
+      --bg-input: #0e1012;
+      --border: rgba(255,255,255,0.07);
+      --border-strong: rgba(255,255,255,0.13);
+      --text: #dde1e7;
+      --text-secondary: #8b929d;
+      --text-muted: #50565f;
+      --amber: #f0b429;
+      --amber-dim: rgba(240,180,41,0.12);
+      --cyan: #0acdff;
+      --cyan-dim: rgba(10,205,255,0.12);
+      --green: #00c896;
+      --green-dim: rgba(0,200,150,0.12);
+      --red: #ff4455;
+      --red-dim: rgba(255,68,85,0.12);
+      --blue: #4d9eff;
+      --blue-dim: rgba(77,158,255,0.12);
+      --yellow: #fbbf24;
+      --yellow-dim: rgba(251,191,36,0.12);
+      --pink: #f472b6;
+      --font-sans: 'Outfit', system-ui, sans-serif;
+      --font-mono: 'DM Mono', 'JetBrains Mono', monospace;
+      --radius: 8px;
+      --radius-sm: 5px;
+    }
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; height: 100%; }
     body {
-      background: #0d1117; color: #e6edf3;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-      font-size: 16px;
+      background: var(--bg); color: var(--text);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.5;
       display: flex; flex-direction: column; height: 100vh;
     }
-    nav {
-      background: #1a1a2e; padding: 12px 24px; display: flex; gap: 24px;
-      align-items: center; border-bottom: 1px solid #333;
+    .topbar {
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      padding: 0 20px;
+      height: 48px;
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      margin: 0;
+      flex-shrink: 0;
     }
-    nav .brand { color: #e94560; font-weight: bold; font-size: 1.1em; }
-    nav a { color: #00b4d8; text-decoration: none; }
-    nav a.active { color: #fff; border-bottom: 2px solid #e94560; }
+    .brand {
+      font-weight: 700;
+      color: var(--amber);
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-right: 16px;
+      flex-shrink: 0;
+    }
+    .topbar a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 5px 12px;
+      border-radius: var(--radius-sm);
+      transition: color 0.15s, background 0.15s;
+      white-space: nowrap;
+    }
+    .topbar a:hover { color: var(--text); background: var(--bg-hover); }
+    .topbar a.active { color: var(--amber); background: var(--amber-dim); }
+    .page-content {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
     header.page {
-      padding: 18px 24px 10px; border-bottom: 1px solid #21262d;
-      background: #0d1117;
+      padding: 18px 24px 12px; border-bottom: 1px solid var(--border);
+      background: var(--bg);
     }
-    header.page h1 { margin: 0; font-size: 1.4em; }
-    header.page .sub { color: #8b949e; font-size: 0.9em; margin-top: 4px; }
+    header.page h1 { margin: 0; font-size: 22px; font-weight: 600; color: var(--text); }
+    header.page .sub { color: var(--text-secondary); font-size: 13px; margin-top: 4px; }
     .chat-wrap {
       flex: 1; overflow-y: auto; padding: 20px 24px;
       display: flex; flex-direction: column; gap: 14px;
     }
-    .msg { max-width: 760px; padding: 12px 16px; border-radius: 12px; word-wrap: break-word; overflow-wrap: anywhere; line-height: 1.5; }
+    .msg { max-width: 760px; padding: 12px 16px; border-radius: var(--radius); word-wrap: break-word; overflow-wrap: anywhere; line-height: 1.5; font-size: 14px; }
     .msg.user { white-space: pre-wrap; }
-    .msg.user { align-self: flex-end; background: #1f6feb; color: #fff; }
-    .msg.assistant { align-self: flex-start; background: #21262d; border: 1px solid #30363d; }
-    .msg.error { align-self: flex-start; background: #4a1d1d; border: 1px solid #f85149; color: #ffd6d6; }
+    .msg.user { align-self: flex-end; background: var(--blue-dim); color: var(--blue); border: 1px solid rgba(77,158,255,0.3); }
+    .msg.assistant { align-self: flex-start; background: var(--bg-panel); border: 1px solid var(--border); color: var(--text); }
+    .msg.error { align-self: flex-start; background: var(--red-dim); border: 1px solid var(--red); color: var(--red); }
     .sources { align-self: flex-start; max-width: 760px; display: flex; flex-wrap: wrap; gap: 6px; margin-top: -6px; }
     .chip {
-      background: #161b22; border: 1px solid #30363d; color: #8b949e;
-      font-size: 0.78em; padding: 3px 8px; border-radius: 10px;
+      background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary);
+      font-size: 11px; padding: 3px 8px; border-radius: 10px;
     }
-    .suggestions { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 24px 8px; }
+    .suggestions { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 24px 4px; }
     .suggestion {
-      background: #161b22; border: 1px solid #30363d; color: #58a6ff;
-      padding: 8px 14px; border-radius: 18px; cursor: pointer; font-size: 0.9em;
+      background: var(--bg-elevated); border: 1px solid var(--border-strong); color: var(--cyan);
+      padding: 6px 14px; border-radius: 18px; cursor: pointer; font-size: 13px;
+      font-family: var(--font-sans);
     }
-    .suggestion:hover { background: #21262d; }
+    .suggestion:hover { background: var(--bg-hover); color: var(--text); }
     .input-bar {
-      display: flex; gap: 10px; padding: 14px 24px; border-top: 1px solid #21262d; background: #0d1117;
+      display: flex; gap: 10px; padding: 14px 24px; border-top: 1px solid var(--border); background: var(--bg-panel);
     }
     input.msg-input {
-      flex: 1; background: #161b22; border: 1px solid #30363d; color: #e6edf3;
-      padding: 12px 14px; border-radius: 8px; font-size: 16px;
-      font-family: inherit;
+      flex: 1; background: var(--bg-input); border: 1px solid var(--border-strong); color: var(--text);
+      padding: 10px 14px; border-radius: var(--radius-sm); font-size: 14px;
+      font-family: var(--font-sans);
     }
-    input.msg-input:focus { outline: none; border-color: #58a6ff; }
+    input.msg-input:focus { outline: none; border-color: var(--amber); }
     button.send {
-      background: #1f6feb; color: #fff; border: none; padding: 12px 22px;
-      border-radius: 8px; font-size: 16px; cursor: pointer; font-weight: 600;
+      background: var(--amber-dim); color: var(--amber); border: 1px solid rgba(240,180,41,0.3); padding: 10px 20px;
+      border-radius: var(--radius-sm); font-size: 13px; cursor: pointer; font-weight: 600;
+      font-family: var(--font-sans);
+      transition: background 0.15s;
     }
-    button.send:disabled { background: #30363d; cursor: not-allowed; }
+    button.send:hover { background: var(--bg-hover); }
+    button.send:disabled { background: var(--bg-elevated); color: var(--text-muted); border-color: var(--border); cursor: not-allowed; }
     .spinner {
-      display: inline-block; width: 14px; height: 14px; border: 2px solid #30363d;
-      border-top-color: #58a6ff; border-radius: 50%;
-      animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 8px;
+      display: inline-block; width: 10px; height: 10px;
+      border: 2px solid var(--border-strong); border-top-color: var(--cyan);
+      border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 8px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .typing { color: #8b949e; font-style: italic; }
+    @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.5;} }
+    .typing { color: var(--text-secondary); font-style: italic; }
     /* Markdown rendered content */
     .md-body p { margin: 0 0 0.6em; }
     .md-body p:last-child { margin-bottom: 0; }
     .md-body ul, .md-body ol { margin: 0.3em 0 0.6em 1.2em; padding: 0; }
     .md-body li { margin-bottom: 0.2em; }
-    .md-body code { background: #0d1117; border: 1px solid #30363d; padding: 1px 5px; border-radius: 4px; font-size: 0.87em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .md-body pre { background: #0d1117; border: 1px solid #30363d; padding: 10px 14px; border-radius: 6px; overflow-x: auto; margin: 0.4em 0; }
+    .md-body code { background: var(--bg-input); border: 1px solid var(--border-strong); padding: 1px 5px; border-radius: 4px; font-size: 0.87em; font-family: var(--font-mono); }
+    .md-body pre { background: var(--bg-input); border: 1px solid var(--border-strong); padding: 10px 14px; border-radius: var(--radius-sm); overflow-x: auto; margin: 0.4em 0; }
     .md-body pre code { background: none; border: none; padding: 0; }
-    .md-body strong { color: #e6edf3; }
-    .md-body h1, .md-body h2, .md-body h3 { margin: 0.6em 0 0.3em; color: #e6edf3; font-size: 1em; }
-    .md-body blockquote { border-left: 3px solid #30363d; margin: 0.4em 0; padding-left: 10px; color: #8b949e; }
+    .md-body strong { color: var(--text); }
+    .md-body h1, .md-body h2, .md-body h3 { margin: 0.6em 0 0.3em; color: var(--text); font-size: 1em; }
+    .md-body blockquote { border-left: 3px solid var(--border-strong); margin: 0.4em 0; padding-left: 10px; color: var(--text-secondary); }
     .md-body table { border-collapse: collapse; margin: 0.4em 0; width: 100%; }
-    .md-body th, .md-body td { border: 1px solid #30363d; padding: 4px 8px; text-align: left; }
-    .md-body th { background: #161b22; }
+    .md-body th, .md-body td { border: 1px solid var(--border-strong); padding: 4px 8px; text-align: left; }
+    .md-body th { background: var(--bg-panel); }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js" async></script>
 </head>
 <body>
-<nav>
+<nav class="topbar">
   <span class="brand">◈ TRADING STACK</span>
-  <a href="/">Home</a>
+  <a href="/">Command Center</a>
   <a href="/intern/">Digital Intern</a>
   <a href="/trader/">Paper Trader</a>
   <a href="/trader/backtests">Backtests</a>
@@ -1187,6 +1327,7 @@ _CHAT_HTML = """<!doctype html>
   <a href="/intern/chat" class="active">Chat</a>
   <a href="/system/">System</a>
 </nav>
+<div class="page-content">
 <header class="page">
   <h1>Market Intel</h1>
   <div class="sub">Powered by Claude Opus 4.7 + Live News Feed</div>
@@ -1201,6 +1342,7 @@ _CHAT_HTML = """<!doctype html>
 <div class="input-bar">
   <input class="msg-input" id="input" type="text" placeholder="Ask about markets, news, or your portfolio…" autocomplete="off" autofocus>
   <button class="send" id="send" type="button" onclick="sendMsg()">Send</button>
+</div>
 </div>
 <script>
 const chat = document.getElementById('chat');
