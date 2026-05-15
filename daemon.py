@@ -68,9 +68,9 @@ from triage.heuristic_scorer import score_article as _heuristic_score_article
 from analysis.claude_analyst import analyze
 from notifier.discord_notifier import send as discord_send
 from storage.article_store import ArticleStore
-from watchers.urgency_scorer import score_batch
+from watchers.urgency_scorer import score_batch, BATCH_SIZE as URGENCY_BATCH_SIZE
 from watchers.alert_agent import send_urgent_alert
-from ml.inference import triage_articles, score_articles
+from ml.inference import score_articles
 from ml.sentiment_trends import write_trends as write_score_trends
 from ml.trainer import train as ml_train
 from ml.trainer import train_continuous
@@ -1003,7 +1003,14 @@ def scorer_worker(store: ArticleStore):
                 store.update_time_sensitivity_batch(ts_updates)
             llm_used = 0
             if llm_candidates:
-                llm_used = score_batch(llm_candidates, store)
+                # score_batch sends its whole input to Sonnet as a single
+                # prompt. At cold start the model is unfitted so every article
+                # is needs_llm — passing the full backlog (up to 1000) in one
+                # call produces a prompt Sonnet can't parse. Chunk it.
+                for j in range(0, len(llm_candidates), URGENCY_BATCH_SIZE):
+                    llm_used += score_batch(
+                        llm_candidates[j:j + URGENCY_BATCH_SIZE], store
+                    )
             with _store_lock:
                 remaining = store.count_unscored(min_kw=0.0)
             log.info(f"[scorer] batch={len(unscored)} scored={len(batch)} llm_used={llm_used} remaining={remaining}")

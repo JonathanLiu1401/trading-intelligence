@@ -60,10 +60,20 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
     # marked alerted. Marking the entire urgent list would silently drop the
     # tail (it'd never be picked up on the next cycle), so we cap both ends.
     batch = urgent_articles[:ALERT_BATCH_SIZE]
-    articles_text = "\n".join(
-        f"[score={a['ai_score']:.0f}] {a['title']}\nsource: {a['source']}\nurl: {a['link']}"
-        for a in batch
-    )
+
+    def _fmt(a: dict) -> str:
+        # Include the article body when available so the alert LLM grounds its
+        # CONTEXT line on real content rather than guessing from the headline.
+        block = (
+            f"[score={a['ai_score']:.0f}] {a['title']}\n"
+            f"source: {a['source']}\nurl: {a['link']}"
+        )
+        summary = (a.get("summary") or "").strip()
+        if summary:
+            block += f"\nbody: {summary[:600]}"
+        return block
+
+    articles_text = "\n\n".join(_fmt(a) for a in batch)
 
     # Full date+time so Discord history is unambiguous across day boundaries.
     # Template already appends " UTC", so don't include it here.

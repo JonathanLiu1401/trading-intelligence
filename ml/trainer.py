@@ -226,6 +226,12 @@ def _fetch_training_data(
     distinguished by ai_score being integer-valued (Sonnet returns int score;
     recursive_labeler does int*2.0 → still integer; briefing_boost legacy rows
     are at most a few hundred and have negligible noise impact).
+
+    Synthetic backtest / opus-annotation rows are intentionally included (see
+    CLAUDE.md §5 — training reads include backtest). They carry score_source
+    NULL and may have fractional ai_score (SELL=0.5, opus NEUTRAL=2.5), so the
+    integer heuristic alone would wrongly drop them — the explicit synthetic
+    clause keeps them in the pool.
     """
     from storage.article_store import decompress
 
@@ -234,13 +240,16 @@ def _fetch_training_data(
     rels, urgs = [], []
     source = "strong"
 
-    # Strong labels: ground-truth LLM-sourced ai_score only.
+    # Strong labels: ground-truth LLM-sourced ai_score, plus synthetic
+    # backtest/opus rows (legitimate fractional labels, score_source NULL).
     cur = store.conn.execute(
         "SELECT title, full_text, ai_score, source, published "
         "FROM articles "
         "WHERE ai_score > 0 "
         "  AND (score_source IN ('llm','briefing_boost') "
-        "       OR (score_source IS NULL AND ai_score = CAST(ai_score AS INTEGER))) "
+        "       OR (score_source IS NULL AND ai_score = CAST(ai_score AS INTEGER)) "
+        "       OR (score_source IS NULL AND (url LIKE 'backtest://%' "
+        "            OR source LIKE 'backtest_%' OR source LIKE 'opus_annotation%'))) "
         "ORDER BY first_seen DESC LIMIT 15000"
     )
     for title, blob, ai, src, published in cur.fetchall():
@@ -432,15 +441,18 @@ def train_continuous(store) -> dict:
     texts: list[str] = []
     articles: list[dict] = []
     rels, urgs = [], []
-    # Mirror _fetch_training_data: only LLM-sourced labels (or legacy
-    # integer-valued ai_score from before the score_source split). Never
-    # ingest score_source='ml' — that would reopen the label-feedback loop.
+    # Mirror _fetch_training_data: LLM-sourced labels, legacy integer-valued
+    # ai_score from before the score_source split, and synthetic backtest/opus
+    # rows (fractional labels, score_source NULL). Never ingest
+    # score_source='ml' — that would reopen the label-feedback loop.
     cur = store.conn.execute(
         "SELECT title, full_text, ai_score, source, published "
         "FROM articles "
         "WHERE ai_score > 0 "
         "  AND (score_source IN ('llm','briefing_boost') "
-        "       OR (score_source IS NULL AND ai_score = CAST(ai_score AS INTEGER)))"
+        "       OR (score_source IS NULL AND ai_score = CAST(ai_score AS INTEGER)) "
+        "       OR (score_source IS NULL AND (url LIKE 'backtest://%' "
+        "            OR source LIKE 'backtest_%' OR source LIKE 'opus_annotation%')))"
     )
     for title, blob, ai, src, published in cur.fetchall():
         summary = decompress(blob) if blob else ""

@@ -209,14 +209,45 @@ class ArticleStore:
             # integer). Anything else in ai_score is a model output. We move it
             # to ml_score, tag score_source='ml', and zero ai_score so those
             # articles get re-routed through Sonnet via get_unscored().
+            #
+            # CRITICAL: the integer heuristic only holds for *live news* rows.
+            # Synthetic backtest / opus-annotation rows legitimately carry
+            # fractional labels (backtest SELL=0.5, opus NEUTRAL=2.5, BAD=0.5)
+            # and are inserted by paper-trader with score_source NULL. Applying
+            # the heuristic to them destroys training data, so every clause
+            # below is scoped with _LIVE_ONLY_CLAUSE.
             try:
-                # Only run when score_source has never been populated (first
-                # migration pass) — guarded by checking for any NULL rows that
-                # also have a non-integer ai_score.
+                # Recovery: an earlier revision of the cleanup ran the integer
+                # heuristic against ALL rows, zeroing ai_score on synthetic rows
+                # and stashing the real label in ml_score. Synthetic rows never
+                # go through ML scoring (get_unscored excludes them), so a
+                # non-NULL ml_score on a synthetic row can only be that misfire.
+                # Restore the label and clear the bogus 'ml' tag. Idempotent.
+                rec = self.conn.execute(
+                    "UPDATE articles SET ai_score = ml_score, ml_score = NULL, "
+                    "score_source = NULL "
+                    "WHERE score_source = 'ml' AND ml_score IS NOT NULL "
+                    f"AND NOT ({_LIVE_ONLY_CLAUSE})"
+                )
+                n_restored = rec.rowcount
+                self.conn.commit()
+                if n_restored:
+                    _log.info(
+                        f"[article_store] migration: restored {n_restored} synthetic "
+                        f"training labels wrongly moved to ml_score"
+                    )
+            except sqlite3.OperationalError as e:
+                _log.warning(f"[article_store] synthetic-label recovery skipped: {e}")
+            try:
+                # Run only when live-news rows still need the split — guarded by
+                # checking for any score_source=NULL live row with a non-integer
+                # ai_score. Scoping to live-only also makes this idempotent: a
+                # past version re-fired on every restart because freshly
+                # injected synthetic rows kept matching.
                 needs_cleanup = self.conn.execute(
                     "SELECT EXISTS(SELECT 1 FROM articles "
                     "WHERE score_source IS NULL AND ai_score > 0 "
-                    "AND ai_score != CAST(ai_score AS INTEGER))"
+                    f"AND ai_score != CAST(ai_score AS INTEGER) AND {_LIVE_ONLY_CLAUSE})"
                 ).fetchone()[0]
                 if needs_cleanup:
                     # Move suspected-model values into ml_score for visibility.
@@ -224,14 +255,14 @@ class ArticleStore:
                         "UPDATE articles SET ml_score = ai_score, "
                         "ai_score = 0, score_source = 'ml' "
                         "WHERE score_source IS NULL AND ai_score > 0 "
-                        "AND ai_score != CAST(ai_score AS INTEGER)"
+                        f"AND ai_score != CAST(ai_score AS INTEGER) AND {_LIVE_ONLY_CLAUSE}"
                     )
                     n_cleaned = self.conn.execute("SELECT changes()").fetchone()[0]
                     # Mark surviving integer-valued ai_score rows as LLM source.
                     self.conn.execute(
                         "UPDATE articles SET score_source = 'llm' "
                         "WHERE score_source IS NULL AND ai_score > 0 "
-                        "AND ai_score = CAST(ai_score AS INTEGER)"
+                        f"AND ai_score = CAST(ai_score AS INTEGER) AND {_LIVE_ONLY_CLAUSE}"
                     )
                     self.conn.commit()
                     _log.info(
@@ -497,17 +528,23 @@ class ArticleStore:
         ``limit`` caps the result — the alerter only consumes ALERT_BATCH_SIZE
         (5) per cycle, so an unbounded query during a backlog surge would
         fetch (and decompress) thousands of rows uselessly.
+
+        ``full_text`` is decompressed into a ``summary`` field (capped at 600
+        chars) so the alert LLM can ground its CONTEXT line on real article
+        content instead of inventing background from the headline alone.
         """
         cur = self.conn.execute(
             "SELECT id, url, title, source, "
-            "COALESCE(NULLIF(ai_score, 0), ml_score, 0) AS score "
+            "COALESCE(NULLIF(ai_score, 0), ml_score, 0) AS score, full_text "
             "FROM articles "
             f"WHERE urgency=1 AND {_LIVE_ONLY_CLAUSE} "
             "ORDER BY score DESC LIMIT ?",
             (limit,),
         )
         rows = cur.fetchall()
-        return [{"_id": r[0], "link": r[1], "title": r[2], "source": r[3], "ai_score": r[4]}
+        return [{"_id": r[0], "link": r[1], "title": r[2], "source": r[3],
+                 "ai_score": r[4],
+                 "summary": (decompress(r[5])[:600] if r[5] else "")}
                 for r in rows]
 
     def get_top_for_briefing(self, hours: int = 5, limit: int = 50) -> list:
