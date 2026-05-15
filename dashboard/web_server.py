@@ -735,7 +735,7 @@ _DASHBOARD_HTML = """<!doctype html>
   <a href="/trader/" style="color:#00b4d8;text-decoration:none">Paper Trader</a>
   <a href="/trader/backtests" style="color:#00b4d8;text-decoration:none">Backtests</a>
   <a href="/ops/" style="color:#00b4d8;text-decoration:none">Ops View</a>
-  <a href="/chat" style="color:#00b4d8;text-decoration:none">Chat</a>
+  <a href="/intern/chat" style="color:#00b4d8;text-decoration:none">Chat</a>
 </nav>
 <div class="container-fluid p-3">
   <div class="d-flex justify-content-between align-items-center mb-3">
@@ -997,7 +997,7 @@ async function savePortfolioConfig() {
   style="display:none;position:fixed;bottom:88px;right:20px;width:360px;height:480px;background:#11161d;color:#cfd8dc;border:1px solid #30363d;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,0.5);z-index:9999;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif">
   <div style="padding:12px 14px;border-bottom:1px solid #21262d;display:flex;justify-content:space-between;align-items:center">
     <span style="font-weight:600;color:#e6edf3">Market Intel</span>
-    <a href="/chat" style="color:#8b949e;font-size:0.8em;text-decoration:none;margin-left:auto;margin-right:10px">full ↗</a>
+    <a href="/intern/chat" style="color:#8b949e;font-size:0.8em;text-decoration:none;margin-left:auto;margin-right:10px">full ↗</a>
     <button id="dichat-close" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:20px;line-height:1;padding:0 4px">×</button>
   </div>
   <div id="dichat-history" style="flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px;font-size:14px;line-height:1.45"></div>
@@ -1178,7 +1178,7 @@ _CHAT_HTML = """<!doctype html>
   <a href="/intern/">Digital Intern</a>
   <a href="/trader/">Paper Trader</a>
   <a href="/ops/">Ops View</a>
-  <a href="/chat" class="active">Chat</a>
+  <a href="/intern/chat" class="active">Chat</a>
 </nav>
 <header class="page">
   <h1>Market Intel</h1>
