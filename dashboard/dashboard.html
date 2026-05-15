@@ -360,7 +360,10 @@ document.querySelectorAll(".stat").forEach(el => {
 let ws = null, wsRetry = 1000;
 function connectWS(){
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  // When served through the unified proxy on :8888 the upgrade endpoint is /ops/ws.
+  // Direct connections to the FastAPI ops server (:8765) still expose /ws.
+  const wsPath = location.pathname.startsWith("/ops") ? "/ops/ws" : "/ws";
+  ws = new WebSocket(`${proto}//${location.host}${wsPath}`);
   const setState = (cls, txt) => {
     $("ws-state").querySelector(".dot").className = "dot " + cls;
     $("ws-text").textContent = txt;

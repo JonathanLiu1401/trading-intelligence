@@ -234,6 +234,53 @@ def create_app(store=None) -> Flask:
             return jsonify({"error": "unauthorized"}), 401
         return jsonify(_briefings_from_log(10))
 
+    @app.get("/api/earnings")
+    def api_earnings():
+        """Upcoming earnings within the snapshot's horizon (default 14d).
+
+        Reads ``data/earnings_calendar.json`` written by ``write_snapshot()``.
+        Also reports the snapshot age so the dashboard can render a freshness
+        indicator and trigger a background refresh when stale.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        snap = _read_json(BASE_DIR / "data" / "earnings_calendar.json")
+        if snap is None:
+            return jsonify({
+                "error": "no snapshot yet",
+                "hint": "run: python3 -m collectors.earnings_calendar",
+            }), 503
+        # Recompute days_away on each request so a stale snapshot still shows
+        # accurate counters until the daemon refreshes it.
+        now = datetime.now(timezone.utc)
+        try:
+            for ev in snap.get("events", []) or []:
+                ts = ev.get("earnings_date")
+                if not ts:
+                    continue
+                try:
+                    ed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if ed.tzinfo is None:
+                    ed = ed.replace(tzinfo=timezone.utc)
+                ev["days_away"] = round((ed - now).total_seconds() / 86400.0, 2)
+        except Exception:
+            pass
+        # Drop events that have already passed once the recompute runs.
+        snap["events"] = [e for e in snap.get("events", []) or []
+                          if (e.get("days_away") or 0) >= -0.5]
+        snap["n_events"] = len(snap["events"])
+        # Snapshot age for staleness rendering.
+        try:
+            as_of = datetime.fromisoformat((snap.get("as_of") or "").replace("Z", "+00:00"))
+            if as_of.tzinfo is None:
+                as_of = as_of.replace(tzinfo=timezone.utc)
+            snap["age_hours"] = round((now - as_of).total_seconds() / 3600.0, 2)
+        except Exception:
+            snap["age_hours"] = None
+        return jsonify(snap)
+
     @app.get("/healthz")
     def healthz():
         store = _store_handle()
@@ -440,6 +487,65 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: paper trader state fetch failed: %s", e)
 
+        # Pull options Greeks (live trader's portfolio-level delta/gamma/theta/vega).
+        # Useful when the user asks "am I overexposed?" or "what happens if NVDA drops 5%?"
+        greeks_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen("http://127.0.0.1:8090/api/greeks", timeout=3) as resp:
+                gk = json.loads(resp.read().decode("utf-8"))
+            if not gk.get("error"):
+                t = gk.get("totals") or {}
+                rows = gk.get("positions") or []
+                opt_rows = [r for r in rows if r.get("type") in ("call", "put")]
+                if opt_rows:
+                    lines = [
+                        f"Net delta: {t.get('delta', 0):+.2f} (gross $ {t.get('gross_notional', 0):.0f})",
+                        f"Net gamma: {t.get('gamma', 0):+.5f}",
+                        f"Theta / day: ${t.get('theta', 0):+.2f}",
+                        f"Vega / 1% IV: ${t.get('vega', 0):+.2f}",
+                    ]
+                    for o in opt_rows[:8]:
+                        dte = o.get("days_to_expiry")
+                        lines.append(
+                            f"  {o.get('ticker')} {str(o.get('type','')).upper()} "
+                            f"{o.get('strike')}/{o.get('expiry')} "
+                            f"({dte}d): Δ {o.get('delta'):+.2f} Θ {o.get('theta'):+.2f} "
+                            f"IV {(o.get('iv') or 0)*100:.0f}%"
+                        )
+                    greeks_block = "\n".join(lines)
+        except Exception as e:
+            _logger().warning("chat: greeks fetch failed: %s", e)
+
+        # Pull DRAM/semis sector heatmap so the chat can answer "which semis are
+        # leading today" without the user having to look at the dashboard.
+        heatmap_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen("http://127.0.0.1:8090/api/sector-heatmap", timeout=4) as resp:
+                hm = json.loads(resp.read().decode("utf-8"))
+            if not hm.get("error"):
+                ref = hm.get("reference_mom_5d")
+                bits = [f"Reference: {hm.get('reference', 'SOXX')} 5d {ref:+.2f}%" if ref is not None else "Reference: —"]
+                for b in (hm.get("buckets") or []):
+                    avg = b.get("avg_mom_5d")
+                    if avg is None:
+                        continue
+                    # Sort tickers within each bucket by mom_5d desc and keep top 3.
+                    ticks = sorted(
+                        [t for t in (b.get("tickers") or []) if t.get("mom_5d") is not None],
+                        key=lambda t: -t["mom_5d"],
+                    )
+                    head = ", ".join(
+                        f"{t['ticker']} {t['mom_5d']:+.1f}%" for t in ticks[:3]
+                    )
+                    urg = sum((t.get("urgent") or 0) for t in (b.get("tickers") or []))
+                    urg_str = f" [{urg} urgent news]" if urg else ""
+                    bits.append(f"  {b.get('name','?'):18s} avg {avg:+.2f}%{urg_str}  · top: {head}")
+                heatmap_block = "\n".join(bits)
+        except Exception as e:
+            _logger().warning("chat: heatmap fetch failed: %s", e)
+
         # Pull portfolio analytics (sector exposure, drawdown, win rate, daily P/L)
         analytics_block = ""
         try:
@@ -488,11 +594,16 @@ def create_app(store=None) -> Flask:
             "PAPER TRADER LIVE STATE (separate $1000 sim run by Opus 4.7 every 30 min):\n"
             f"{paper_trader_block}\n\n"
             + (f"PAPER TRADER ANALYTICS:\n{analytics_block}\n\n" if analytics_block else "")
+            + (f"PAPER TRADER OPTIONS GREEKS (Black-Scholes, live IV):\n{greeks_block}\n\n" if greeks_block else "")
+            + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP:\n{heatmap_block}\n\n" if heatmap_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "
             "asks 'how am I doing', show real-portfolio first then paper-trader as separate "
-            "lines so they aren't confused."
+            "lines so they aren't confused. The user's thesis-focus is DRAM/memory (MU, WDC, "
+            "STX) plus semis equipment (LRCX, AMAT, KLAC, ASML) and the HBM-ramp design "
+            "winners (NVDA, AMD, AVGO); weight your reads of the heatmap and news through "
+            "that lens unless the user asks otherwise."
         )
 
         # Build messages
@@ -610,13 +721,12 @@ _DASHBOARD_HTML = """<!doctype html>
 <body>
 <nav style="background:#1a1a2e;padding:12px 24px;display:flex;gap:24px;align-items:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;border-bottom:1px solid #333;font-size:16px">
   <span style="color:#e94560;font-weight:bold;font-size:1.1em">◈ TRADING STACK</span>
-  <a href="http://10.19.203.44:8888/" style="color:#00b4d8;text-decoration:none">Home</a>
-  <a href="http://10.19.203.44:8888/intern/" style="color:#fff;border-bottom:2px solid #e94560;text-decoration:none">Digital Intern</a>
-  <a href="http://10.19.203.44:8888/trader/" style="color:#00b4d8;text-decoration:none">Paper Trader</a>
-  <a href="http://10.19.203.44:8888/trader/backtests" style="color:#00b4d8;text-decoration:none">Backtests</a>
-  <a href="http://10.19.203.44:8765/" style="color:#00b4d8;text-decoration:none">Ops View</a>
+  <a href="/" style="color:#00b4d8;text-decoration:none">Home</a>
+  <a href="/intern/" style="color:#fff;border-bottom:2px solid #e94560;text-decoration:none">Digital Intern</a>
+  <a href="/trader/" style="color:#00b4d8;text-decoration:none">Paper Trader</a>
+  <a href="/trader/backtests" style="color:#00b4d8;text-decoration:none">Backtests</a>
+  <a href="/ops/" style="color:#00b4d8;text-decoration:none">Ops View</a>
   <a href="/chat" style="color:#00b4d8;text-decoration:none">Chat</a>
-  <span style="margin-left:auto;color:#666;font-size:0.8em">10.19.203.44</span>
 </nav>
 <div class="container-fluid p-3">
   <div class="d-flex justify-content-between align-items-center mb-3">
@@ -627,7 +737,7 @@ _DASHBOARD_HTML = """<!doctype html>
   <div class="card mb-3" id="paper-trader-card">
     <div class="card-header d-flex justify-content-between align-items-center">
       <span>Live Paper Trader</span>
-      <a href="http://10.19.203.44:8090" style="font-size:0.85em">View Full Trader →</a>
+      <a href="/trader/" style="font-size:0.85em">View Full Trader →</a>
     </div>
     <div class="card-body p-2">
       <div id="paper-trader-summary" class="small-muted">loading…</div>
@@ -797,7 +907,7 @@ async function refresh() {
 async function refreshPaperTrader() {
   const sumDiv = document.getElementById("paper-trader-summary");
   try {
-    const r = await fetch("http://10.19.203.44:8090/api/portfolio");
+    const r = await fetch("/trader/api/portfolio");
     if (!r.ok) { sumDiv.textContent = "paper trader unavailable (HTTP " + r.status + ")"; return; }
     const j = await r.json();
     const tv = j.total_value;
@@ -1055,10 +1165,10 @@ _CHAT_HTML = """<!doctype html>
 <body>
 <nav>
   <span class="brand">◈ TRADING STACK</span>
-  <a href="http://10.19.203.44:8888/">Home</a>
-  <a href="/">Digital Intern</a>
-  <a href="http://10.19.203.44:8888/trader/">Paper Trader</a>
-  <a href="http://10.19.203.44:8765/">Ops View</a>
+  <a href="/">Home</a>
+  <a href="/intern/">Digital Intern</a>
+  <a href="/trader/">Paper Trader</a>
+  <a href="/ops/">Ops View</a>
   <a href="/chat" class="active">Chat</a>
 </nav>
 <header class="page">
