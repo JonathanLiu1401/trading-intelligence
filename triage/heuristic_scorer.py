@@ -283,25 +283,29 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
     """
     text = f"{title} {summary}".lower()
 
-    # Hard blacklist
-    if BLACKLIST.search(text):
-        return {"score": 0.0, "reason": "blacklisted", "events": []}
-
-    # Keyword score
+    # Keyword score. `domain_kw` tracks only portfolio/memory/semis hits — the
+    # signals that mark an article as genuinely about our coverage universe.
+    # Macro/general terms are deliberately excluded so a sports story that
+    # happens to mention "equity" or "vix" cannot masquerade as relevant.
     kw = 0.0
+    domain_kw = 0.0
     for term in TIER_PORTFOLIO_PHRASES:
         if term in text:
             kw += 4.0
+            domain_kw += 4.0
     # Bare tickers: single boost per article when any portfolio ticker is mentioned
     # (word boundaries prevent false positives like "museum" → "mu").
     if _TIER_PORTFOLIO_TICKER_RE.search(text):
         kw += 4.0
+        domain_kw += 4.0
     for term in TIER_MEMORY:
         if _term_matches(term, text):
             kw += 3.0
+            domain_kw += 3.0
     for term in TIER_SEMIS:
         if _term_matches(term, text):
             kw += 2.0
+            domain_kw += 2.0
     for term in TIER_MACRO:
         if _term_matches(term, text):
             kw += 1.5
@@ -311,6 +315,18 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
 
     if kw == 0.0:
         return {"score": 0.0, "reason": "no_keywords", "events": []}
+
+    # Blacklist handling. Previously a blacklist hit hard-zeroed the article
+    # before keywords were even counted, which silently discarded genuine
+    # supply-chain signals — e.g. "Earthquake damage halts TSMC fab" or a
+    # hurricane disrupting a chip region. Now the blacklist only zeroes when
+    # there is no real domain signal; when a portfolio/memory/semis keyword is
+    # present the article survives with a penalty multiplier instead.
+    blacklist_penalty = 1.0
+    if BLACKLIST.search(text):
+        if domain_kw < 3.0:
+            return {"score": 0.0, "reason": "blacklisted", "events": []}
+        blacklist_penalty = 0.5
 
     # Event detection
     event_bonus = 1.0
@@ -331,7 +347,7 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
     port_mult = portfolio_relevance_multiplier(text)
 
     # Composite
-    raw = (kw * src_w * event_bonus * rec * port_mult) + port_boost
+    raw = (kw * src_w * event_bonus * rec * port_mult * blacklist_penalty) + port_boost
 
     # Normalise to 0-10
     score = min(10.0, round(raw / 4.0 * 10.0, 2))  # 4.0 = rough "max normal" kw
@@ -344,8 +360,9 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
         "recency": round(rec, 2),
         "port_boost": port_boost,
         "port_mult": port_mult,
+        "blacklist_penalty": blacklist_penalty,
         "events": events_found,
-        "reason": "scored",
+        "reason": "scored_penalized" if blacklist_penalty < 1.0 else "scored",
     }
 
 
@@ -383,6 +400,7 @@ if __name__ == "__main__":
         {"title": "SK Hynix upgrades to Buy, PT raised to $240", "summary": "Analyst cites HBM supply discipline", "source": "CNBC", "published": ""},
         {"title": "NAND flash oversupply glut worsens, Kioxia cuts wafer starts 30%", "summary": "Bit growth forecast slashed", "source": "Nikkei", "published": ""},
         {"title": "Celebrity breaks up with boyfriend", "summary": "Hollywood gossip", "source": "TMZ", "published": ""},
+        {"title": "Earthquake damage halts TSMC fab in Taiwan, DRAM supply at risk", "summary": "Wafer starts cut after quake; memory pricing expected to surge", "source": "Reuters", "published": ""},
         {"title": "S&P 500 up 0.3% on mixed data", "summary": "Stocks drift higher", "source": "MarketWatch", "published": ""},
         {"title": "Bitcoin surges 8% past $100k as ETF inflows accelerate", "summary": "Crypto rally on risk-on sentiment", "source": "CoinDesk", "published": ""},
         {"title": "China imposes new export controls on advanced memory equipment", "summary": "DRAM manufacturers face supply chain disruption", "source": "Reuters", "published": ""},
