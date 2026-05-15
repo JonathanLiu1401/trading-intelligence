@@ -160,29 +160,39 @@ EVENT_PATTERNS = [
 ]
 
 # ── Source authority weights ─────────────────────────────────────────────────
-SOURCE_WEIGHTS = {
+# Keys are matched with word boundaries to avoid substring false positives —
+# e.g. naive substring matching mapped "Snap Inc" → "ap " → Tier A (1.3) and
+# "Snapchat" → "ap " too. \bKEY\b matches "AP News", "ap.org", "ft.com" but
+# not "snap" or "wrap".
+SOURCE_WEIGHTS = [
     # Tier A — wire services and major financial press
-    "reuters": 1.4, "bloomberg": 1.4, "wsj": 1.35, "financial times": 1.35,
-    "ft.com": 1.35, "cnbc": 1.3, "associated press": 1.3, "ap ": 1.3,
-    "nikkei": 1.3, "koreaherald": 1.25, "korea herald": 1.25,
-    "scmp": 1.2, "south china morning": 1.2,
+    ("reuters", 1.4), ("bloomberg", 1.4), ("wsj", 1.35), ("financial times", 1.35),
+    ("ft.com", 1.35), ("cnbc", 1.3), ("associated press", 1.3), ("ap", 1.3),
+    ("nikkei", 1.3), ("koreaherald", 1.25), ("korea herald", 1.25),
+    ("scmp", 1.2), ("south china morning", 1.2),
     # Tier B — quality financial media
-    "marketwatch": 1.2, "barrons": 1.2, "seeking alpha": 1.15,
-    "benzinga": 1.15, "thestreet": 1.1, "investors.com": 1.15,
-    "zacks": 1.1, "finviz": 1.1, "marketbeat": 1.1,
-    "theblock": 1.15, "coindesk": 1.1,
-    "gdelt": 1.0,  # GDELT is a news aggregator — neutral
+    ("marketwatch", 1.2), ("barrons", 1.2), ("seeking alpha", 1.15),
+    ("benzinga", 1.15), ("thestreet", 1.1), ("investors.com", 1.15),
+    ("zacks", 1.1), ("finviz", 1.1), ("marketbeat", 1.1),
+    ("theblock", 1.15), ("coindesk", 1.1),
+    ("gdelt", 1.0),  # GDELT is a news aggregator — neutral
     # Tier C — social / scraped
-    "reddit": 0.75, "scraped": 0.8, "yfinance": 0.9,
-    "twitter": 0.7, "stocktwits": 0.65,
-}
+    ("reddit", 0.75), ("scraped", 0.8), ("yfinance", 0.9),
+    ("twitter", 0.7), ("stocktwits", 0.65),
+]
 DEFAULT_SOURCE_WEIGHT = 0.95
+
+_SOURCE_PATTERNS = [
+    (re.compile(r"\b" + re.escape(k) + r"\b", re.I), w)
+    for k, w in SOURCE_WEIGHTS
+]
 
 
 def _source_weight(source: str) -> float:
-    s = source.lower()
-    for key, w in SOURCE_WEIGHTS.items():
-        if key in s:
+    if not source:
+        return DEFAULT_SOURCE_WEIGHT
+    for pattern, w in _SOURCE_PATTERNS:
+        if pattern.search(source):
             return w
     return DEFAULT_SOURCE_WEIGHT
 
