@@ -676,16 +676,20 @@ class ArticleStore:
         # "unscored" = pending the scorer (kw_score above the scorer's threshold).
         # Articles below the threshold are intentionally skipped, not a backlog;
         # split them out so the metric reflects actionable work. Mirror
-        # ``get_unscored`` (ai_score=0 AND ml_score IS NULL) so the count
-        # reflects what the scorer will actually re-fetch.
+        # ``get_unscored`` exactly (ai_score=0 AND ml_score IS NULL AND
+        # live-only) so the count reflects what the scorer will actually
+        # re-fetch — without _LIVE_ONLY_CLAUSE this over-counted synthetic
+        # backtest rows that the scorer never touches.
         unscored = self.conn.execute(
             "SELECT COUNT(*) FROM articles "
-            "WHERE ai_score=0 AND ml_score IS NULL AND kw_score>=?",
+            f"WHERE ai_score=0 AND ml_score IS NULL AND kw_score>=? "
+            f"AND {_LIVE_ONLY_CLAUSE}",
             (score_min_kw,),
         ).fetchone()[0]
         below_threshold = self.conn.execute(
             "SELECT COUNT(*) FROM articles "
-            "WHERE ai_score=0 AND ml_score IS NULL AND kw_score<?",
+            f"WHERE ai_score=0 AND ml_score IS NULL AND kw_score<? "
+            f"AND {_LIVE_ONLY_CLAUSE}",
             (score_min_kw,),
         ).fetchone()[0]
         db = _get_db_path()

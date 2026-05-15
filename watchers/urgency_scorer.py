@@ -50,7 +50,7 @@ def score_batch(articles: list, store) -> int:
         return 0
 
     payload = [
-        {"index": i, "title": a.get("title", "")[:200], "summary": (a.get("summary") or "")[:300]}
+        {"index": i, "title": (a.get("title") or "")[:200], "summary": (a.get("summary") or "")[:300]}
         for i, a in enumerate(articles)
     ]
 
@@ -92,7 +92,7 @@ def score_batch(articles: list, store) -> int:
             updates.append((aid, score, 1 if is_urgent else 0))
             scored_indices.add(idx)
             if is_urgent:
-                urgent_log.append((score, art.get("title", "")[:80], item.get("reason", "")))
+                urgent_log.append((score, (art.get("title") or "")[:80], item.get("reason", "")))
                 urgent_count += 1
         # Anti-loop: articles Sonnet engaged with but omitted from its response
         # would otherwise remain ai_score=0 / ml_score=NULL and be re-routed to
