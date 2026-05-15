@@ -117,10 +117,17 @@ def _build_root_logger():
         "urllib3", "urllib3.connectionpool", "urllib3.util.retry",
         "requests", "asyncio", "charset_normalizer", "chardet",
         "websockets", "websockets.client", "websockets.server",
-        "yfinance", "peewee", "matplotlib", "matplotlib.font_manager",
+        "peewee", "matplotlib", "matplotlib.font_manager",
         "PIL", "PIL.PngImagePlugin",
     ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # yfinance logs transient upstream hiccups ("Failed to retrieve the news
+    # and received faulty response instead") at ERROR level. These are not
+    # actionable — yfinance scrapes Yahoo and frequently sees rate-limit /
+    # malformed responses that the library retries internally. Letting them
+    # through inflates hourly error counts and masks real failures.
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
     # Phonemizer (used transitively by TTS deps) emits WARNINGs like
     # "words count mismatch on 367.0% of the lines" on benign input. These
