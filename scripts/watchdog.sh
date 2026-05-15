@@ -11,8 +11,12 @@ alert() {
          -d "{\"content\": \"$1\"}" >/dev/null 2>&1 || true
 }
 
-# 1. digital-intern (root systemd — use nopasswd restart)
-if ! sudo -n systemctl is-active --quiet digital-intern 2>/dev/null; then
+# 1. digital-intern (root systemd — readable is-active without sudo; nopasswd restart).
+# Using `sudo -n systemctl is-active --quiet ...` was a self-inflicted restart loop:
+# the sudoers entry permits `is-active digital-intern` but not the `--quiet` variant,
+# so sudo -n exited non-zero ("password required"), the `!` flipped that to true,
+# and the watchdog "restarted" a healthy service every 5 min.
+if ! systemctl is-active --quiet digital-intern 2>/dev/null; then
     alert "🔄 Watchdog: restarting digital-intern at $TS"
     sudo -n systemctl restart digital-intern 2>/dev/null || true
 fi
