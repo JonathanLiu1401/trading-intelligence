@@ -54,17 +54,32 @@ def _claude_batch_score(candidates: list) -> list:
             print("[local_filter] Could not parse Sonnet response — using heuristic scores")
             return candidates
 
-        score_map = {
-            item["index"]: item["score"]
-            for item in scores
-            if isinstance(item, dict) and "index" in item and "score" in item
-        }
+        # Build score_map robustly: Sonnet occasionally returns index/score as
+        # strings ("0", "7.5") or nests them differently. Coerce to (int, float)
+        # and clamp to 0-10 so a malformed response can't push a blended score
+        # to infinity or negative territory.
+        score_map = {}
+        for item in scores:
+            if not isinstance(item, dict):
+                continue
+            idx_raw = item.get("index")
+            sc_raw = item.get("score")
+            if idx_raw is None or sc_raw is None:
+                continue
+            try:
+                idx = int(idx_raw)
+                sc = float(sc_raw)
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= idx < len(candidates)):
+                continue
+            score_map[idx] = max(0.0, min(10.0, sc))
 
         for i, art in enumerate(candidates):
             sonnet_score = score_map.get(i)
             if sonnet_score is not None:
                 # blend: keyword 20%, Sonnet 80%
-                kw = art.get("_relevance_score", 0)
+                kw = art.get("_relevance_score", 0) or 0
                 art["_relevance_score"] = round(kw * 0.2 + sonnet_score * 0.8, 1)
 
         print(f"[local_filter] Sonnet scored {len(score_map)}/{len(candidates)} articles")
