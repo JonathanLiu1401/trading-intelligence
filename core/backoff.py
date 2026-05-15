@@ -39,8 +39,15 @@ class Backoff:
 
     def peek(self) -> float:
         """Return the delay that the *next* failure will sleep for, without
-        incrementing the counter."""
-        delay = self.base * (2 ** self.failures)
+        incrementing the counter.
+
+        ``failures`` grows unbounded for a permanently-failing worker, so the
+        exponent is clamped at 32: ``base * 2**32`` already dwarfs any sane
+        ``cap``, and leaving it unclamped lets ``2 ** failures`` overflow into
+        an int too large to convert to float (``OverflowError``) after ~1024
+        failures, crashing the worker."""
+        exp = self.failures if self.failures < 32 else 32
+        delay = self.base * (2 ** exp)
         return min(self.cap, delay)
 
     def _next_delay(self) -> float:
@@ -64,3 +71,13 @@ class Backoff:
                 break
             time.sleep(min(0.5, max(0.0, deadline - time.time())))
         return delay
+
+
+if __name__ == "__main__":  # smoke test
+    bo = Backoff(name="t", base=5.0, cap=300.0, jitter=0.0)
+    assert bo.peek() == 5.0
+    bo.failures = 6
+    assert bo.peek() == 300.0  # 5 * 2**6 = 320, capped at 300
+    bo.failures = 100_000  # would OverflowError without exponent clamp
+    assert bo.peek() == 300.0
+    print("OK")
