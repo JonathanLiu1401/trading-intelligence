@@ -170,13 +170,21 @@ SOURCE_WEIGHTS = [
     ("ft.com", 1.35), ("cnbc", 1.3), ("associated press", 1.3), ("ap", 1.3),
     ("nikkei", 1.3), ("koreaherald", 1.25), ("korea herald", 1.25),
     ("scmp", 1.2), ("south china morning", 1.2),
+    # Tier A+ — specialty semiconductor/memory research (high signal in our domain)
+    ("semianalysis", 1.4), ("trendforce", 1.35), ("digitimes", 1.25),
     # Tier B — quality financial media
     ("marketwatch", 1.2), ("barrons", 1.2), ("seeking alpha", 1.15),
     ("benzinga", 1.15), ("thestreet", 1.1), ("investors.com", 1.15),
     ("zacks", 1.1), ("finviz", 1.1), ("marketbeat", 1.1),
     ("theblock", 1.15), ("coindesk", 1.1),
+    ("yahoo finance", 1.1), ("yahoofinance", 1.1), ("yahoo", 1.05),  # mostly wire republisher
+    ("investing.com", 1.05), ("tipranks", 1.0),
+    # Tier B — tech press (occasional semi/AI coverage)
+    ("anandtech", 1.1), ("tom's hardware", 1.0), ("toms hardware", 1.0),
+    ("techcrunch", 1.05), ("the verge", 1.0), ("ars technica", 1.0),
     ("gdelt", 1.0),  # GDELT is a news aggregator — neutral
-    # Tier C — social / scraped
+    # Tier C — social / scraped / low-signal
+    ("motley fool", 0.95), ("wikipedia", 0.7),
     ("reddit", 0.75), ("scraped", 0.8), ("yfinance", 0.9),
     ("twitter", 0.7), ("stocktwits", 0.65),
 ]
