@@ -4,22 +4,22 @@ Digital Intern — Maximum-throughput continuous intelligence daemon.
 Architecture: independent worker threads, each running their own infinite loop.
 No global sleep. Workers run as fast as their sources allow.
 
-Workers:
+Workers (intervals below track the *_INTERVAL constants in the Config block):
   W1  gdelt_worker       — full GDELT sweep via collect_gdelt() every 10min
-  W2  rss_worker         — re-polls all RSS feeds every 60s
-  W3  web_worker         — scrapes 60+ financial sites every 90s
-  W4  reddit_worker      — re-polls Reddit every 90s
-  W5  ticker_worker      — re-fetches yfinance news every 120s
+  W2  rss_worker         — re-polls all RSS feeds every 30s
+  W3  web_worker         — scrapes 100+ financial sites every 60s
+  W4  reddit_worker      — re-polls Reddit every 45s
+  W5  ticker_worker      — re-fetches yfinance news every 60s
   W6  scorer_worker      — NN-first urgency scoring; Sonnet only for uncertain articles
   W7  alert_worker       — fires Discord alert whenever urgent items appear
   W8  heartbeat_worker   — posts full Opus briefing every 5h
   W9  purge_worker       — cleans old data every 6h
-  W10 ml_trainer_worker  — retrains ArticleNet hourly on accumulated LLM labels
+  W10 ml_trainer_worker  — retrains ArticleNet every 3min on accumulated LLM labels
   W11 price_alert_worker — alerts on >3% portfolio moves every 5min
-  W12 continuous_trainer_worker — lightweight 20-epoch GPU pass every 60s to keep RTX 3060 hot
+  W12 continuous_trainer_worker — lightweight 40-epoch GPU pass every 2min to keep RTX 3060 hot
   W12b recursive_labeler_worker — three-tier Claude labeling (Sonnet+Opus) every 4h
   W13 sec_edgar_worker   — SEC 8-K RSS feed for portfolio/watchlist tickers every 5min
-  W14 google_news_worker — round-robin Google News RSS per portfolio ticker every 5min
+  W14 google_news_worker — round-robin Google News RSS per portfolio ticker every 2min
   W15 portfolio_pl_worker — writes data/portfolio_pl.json every 5min via yfinance
   W16 sentiment_trends_worker — writes data/sentiment_trends.json every 10min
   W17 web_server_worker  — Flask dashboard bound to 0.0.0.0:8080

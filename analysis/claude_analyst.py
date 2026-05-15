@@ -74,8 +74,11 @@ def _fmt_ticker(s):
     # width=8 (signed 7-char number + "%") so N/A rows don't break alignment.
     price = f"${s['price']:>10.2f}" if isinstance(s.get('price'), (int, float)) else f"{'N/A':>11}"
     pct   = f"{s['pct_change']:>+7.2f}%" if isinstance(s.get('pct_change'), (int, float)) else f"{'N/A':>8}"
-    ticker = s.get('ticker', '?')
-    return f"{ticker:>12}  {price}  {pct}  {s.get('name','')[:25]}"
+    # `or '?'` / `or ''` guard a present-but-None value — dict.get() only
+    # applies its default on a *missing* key, so a row carrying ticker=None
+    # would format as f"{None:>12}" and raise TypeError mid-briefing.
+    ticker = s.get('ticker') or '?'
+    return f"{ticker:>12}  {price}  {pct}  {(s.get('name') or '')[:25]}"
 
 
 def _build_payload(articles, stock_data, earnings):
@@ -111,7 +114,9 @@ def _build_payload(articles, stock_data, earnings):
         parts.append("None on calendar.")
     else:
         for e in earnings:
-            parts.append(f"  {e['ticker']}  {e['earnings_date']}")
+            # `or` (not the .get default) so a present-but-None value still
+            # renders as the placeholder rather than the literal "None".
+            parts.append(f"  {e.get('ticker') or '?'}  {e.get('earnings_date') or 'N/A'}")
 
     return "\n".join(parts)
 
