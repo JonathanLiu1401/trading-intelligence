@@ -284,6 +284,241 @@ def create_app(store=None) -> Flask:
             snap["age_hours"] = None
         return jsonify(snap)
 
+    def _ro_conn():
+        """Open a fresh read-only sqlite connection to the daemon's articles.db.
+
+        Mirrors the resolution logic used in /api/chat: prefer the path the
+        ArticleStore actually opened, then fall back to USB and local repo
+        paths. Returns ``None`` if no DB can be located.
+        """
+        db_path: Path | None = None
+        store = _store_handle()
+        if store is not None:
+            try:
+                for _id, name, file in store.conn.execute("PRAGMA database_list").fetchall():
+                    if name == "main" and file:
+                        db_path = Path(file)
+                        break
+            except Exception:
+                pass
+        if db_path is None:
+            for cand in (
+                Path("/media/zeph/projects/digital-intern/db/articles.db"),
+                BASE_DIR / "data" / "articles.db",
+                BASE_DIR / "db" / "articles.db",
+            ):
+                if cand.exists():
+                    db_path = cand
+                    break
+        if db_path is None:
+            return None
+        try:
+            uri = f"file:{db_path}?mode=ro"
+            return sqlite3.connect(uri, uri=True, timeout=5.0)
+        except sqlite3.Error:
+            return None
+
+    _LIVE_ONLY_SQL = (
+        "url NOT LIKE 'backtest://%' "
+        "AND source NOT LIKE 'backtest_%' "
+        "AND source NOT LIKE 'opus_annotation%'"
+    )
+
+    @app.get("/api/collector-health")
+    def api_collector_health():
+        """Per-source article counts for last 1h and 24h with status thresholds.
+
+        - active: ≥10 articles in the last hour
+        - slow:   1..9  articles in the last hour
+        - stale:  0 articles in the last 2 hours
+        - idle:   anything else (e.g. recently active but quiet in the past hour)
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        conn = _ro_conn()
+        if conn is None:
+            return jsonify({"sources": [], "error": "articles.db not reachable"})
+        try:
+            rows_1h = conn.execute(
+                f"SELECT source, COUNT(*) FROM articles "
+                f"WHERE first_seen >= datetime('now','-1 hour') AND {_LIVE_ONLY_SQL} "
+                f"GROUP BY source"
+            ).fetchall()
+            rows_24h = conn.execute(
+                f"SELECT source, COUNT(*) FROM articles "
+                f"WHERE first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL} "
+                f"GROUP BY source"
+            ).fetchall()
+            rows_2h = conn.execute(
+                f"SELECT source, COUNT(*) FROM articles "
+                f"WHERE first_seen >= datetime('now','-2 hours') AND {_LIVE_ONLY_SQL} "
+                f"GROUP BY source"
+            ).fetchall()
+        finally:
+            conn.close()
+        c1h = {r[0] or "?": int(r[1] or 0) for r in rows_1h}
+        c2h = {r[0] or "?": int(r[1] or 0) for r in rows_2h}
+        c24 = {r[0] or "?": int(r[1] or 0) for r in rows_24h}
+        names = set(c1h) | set(c2h) | set(c24)
+        out = []
+        for n in names:
+            h1 = c1h.get(n, 0)
+            h2 = c2h.get(n, 0)
+            h24 = c24.get(n, 0)
+            if h2 == 0:
+                status = "stale"
+            elif h1 >= 10:
+                status = "active"
+            elif h1 >= 1:
+                status = "slow"
+            else:
+                status = "idle"
+            out.append({
+                "source": n,
+                "articles_1h": h1,
+                "articles_24h": h24,
+                "status": status,
+            })
+        out.sort(key=lambda r: (-r["articles_1h"], -r["articles_24h"], r["source"]))
+        return jsonify({"sources": out, "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+
+    @app.get("/api/ml-status")
+    def api_ml_status():
+        """ArticleNet snapshot — last trained, training-set size, predictions today.
+
+        Pulls the checkpoint mtime as ``last_trained`` and grep-scans the
+        structured log for the most recent ``[ml_trainer] Bootstrap done`` line
+        to recover ``val_loss`` (the trainer logs it on every retrain, see
+        ml/trainer.py).
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        ckpt = BASE_DIR / "data" / "ml" / "model_gpu.pt"
+        last_trained = None
+        if ckpt.exists():
+            try:
+                last_trained = datetime.fromtimestamp(
+                    ckpt.stat().st_mtime, tz=timezone.utc
+                ).isoformat(timespec="seconds")
+            except Exception:
+                last_trained = None
+        training_set_size = None
+        predictions_24h = None
+        urgent_24h = None
+        conn = _ro_conn()
+        if conn is not None:
+            try:
+                # ArticleNet trains on rows with any ML/LLM-assigned score;
+                # `kw_score` is the pure-heuristic fallback we exclude here.
+                training_set_size = int(conn.execute(
+                    "SELECT COUNT(*) FROM articles WHERE ai_score > 0"
+                ).fetchone()[0] or 0)
+                # Articles scored in the past 24h are a reasonable proxy for
+                # inference throughput; there is no `score_source` column in
+                # this schema (see articles table definition).
+                predictions_24h = int(conn.execute(
+                    "SELECT COUNT(*) FROM articles WHERE ai_score > 0 "
+                    f"AND first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL}"
+                ).fetchone()[0] or 0)
+                urgent_24h = int(conn.execute(
+                    "SELECT COUNT(*) FROM articles WHERE urgency >= 1 "
+                    f"AND first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL}"
+                ).fetchone()[0] or 0)
+            except Exception:
+                pass
+            finally:
+                conn.close()
+        val_loss = None
+        try:
+            log_path = BASE_DIR / "logs" / "structured.jsonl"
+            if log_path.exists():
+                size = log_path.stat().st_size
+                with log_path.open("rb") as f:
+                    f.seek(max(0, size - 512 * 1024))
+                    data = f.read()
+                for raw in reversed(data.splitlines()):
+                    try:
+                        ln = json.loads(raw.decode("utf-8", errors="replace"))
+                    except Exception:
+                        continue
+                    msg = ln.get("msg", "")
+                    if "[ml_trainer] Bootstrap done" in msg or "val_loss" in msg:
+                        # crude extraction: find val_loss=… or 'val_loss': …
+                        import re as _re
+                        m = _re.search(r"val_loss['\":=\s]+([0-9]+\.?[0-9]*)", msg)
+                        if m:
+                            try:
+                                val_loss = float(m.group(1))
+                                break
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+        return jsonify({
+            "last_trained": last_trained,
+            "training_set_size": training_set_size,
+            "predictions_24h": predictions_24h,
+            "urgent_24h": urgent_24h,
+            "val_loss": val_loss,
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+
+    @app.get("/api/volume-history")
+    def api_volume_history():
+        """Hourly article ingest counts for the last 24 hours, live rows only."""
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        conn = _ro_conn()
+        if conn is None:
+            return jsonify({"hours": [], "error": "articles.db not reachable"})
+        try:
+            rows = conn.execute(
+                "SELECT strftime('%Y-%m-%dT%H:00', first_seen) AS hour, COUNT(*) "
+                "FROM articles "
+                f"WHERE first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL} "
+                "GROUP BY hour ORDER BY hour"
+            ).fetchall()
+        finally:
+            conn.close()
+        return jsonify({
+            "hours": [{"hour": r[0], "count": int(r[1] or 0)} for r in rows],
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+
+    @app.get("/api/invariants")
+    def api_invariants():
+        """Backtest data-isolation status.
+
+        Per the cross-system invariant (digital-intern CLAUDE.md §5): any
+        ``backtest://`` row that has been alerted is a contamination breach —
+        live alerts must only fire on live news.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        conn = _ro_conn()
+        if conn is None:
+            return jsonify({"backtest_isolation": "unknown", "error": "articles.db not reachable"})
+        try:
+            breach = int(conn.execute(
+                "SELECT COUNT(*) FROM articles "
+                "WHERE (url LIKE 'backtest://%' OR source LIKE 'backtest_%' "
+                "      OR source LIKE 'opus_annotation%') "
+                "AND urgency >= 2"
+            ).fetchone()[0] or 0)
+            n_backtest_total = int(conn.execute(
+                "SELECT COUNT(*) FROM articles "
+                "WHERE url LIKE 'backtest://%' OR source LIKE 'backtest_%' "
+                "      OR source LIKE 'opus_annotation%'"
+            ).fetchone()[0] or 0)
+        finally:
+            conn.close()
+        return jsonify({
+            "backtest_isolation": "breach" if breach > 0 else "active",
+            "breach_count": breach,
+            "backtest_rows_total": n_backtest_total,
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+
     @app.get("/healthz")
     def healthz():
         store = _store_handle()
@@ -696,6 +931,7 @@ _DASHBOARD_HTML = """<!doctype html>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d1117'/%3E%3Cpolyline points='3,24 9,16 14,20 20,10 29,14' fill='none' stroke='%2300b4d8' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='20' cy='10' r='2.5' fill='%23e94560'/%3E%3Cline x1='3' y1='27' x2='29' y2='27' stroke='%2330363d' stroke-width='1'/%3E%3C/svg%3E">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Outfit:wght@400;500;600;700&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap');
     :root {
@@ -964,6 +1200,70 @@ _DASHBOARD_HTML = """<!doctype html>
           <ul class="list-unstyled mb-0" id="articles-list"><li class="small-muted">loading…</li></ul>
         </div>
       </div>
+
+      <!-- Collector health table -->
+      <div class="card mb-3" id="collectors-card">
+        <div class="card-header d-flex justify-content-between align-items-center" id="collectors">
+          <span>Collectors <span class="small-muted ms-1">— live source pulse</span></span>
+          <button class="btn btn-sm btn-outline-secondary py-0 px-2" style="font-size:11px;" onclick="refreshCollectors()">↻ refresh</button>
+        </div>
+        <div class="card-body p-2">
+          <div class="small-muted mb-1" id="collectors-meta">loading…</div>
+          <div class="table-responsive scroll-pane table-scroll" style="max-height:280px;">
+            <table class="table table-sm table-borderless mb-0">
+              <thead><tr>
+                <th>SOURCE</th>
+                <th class="text-end">1h</th>
+                <th class="text-end">24h</th>
+                <th class="text-end">STATUS</th>
+              </tr></thead>
+              <tbody id="collectors-rows"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ML model status -->
+      <div class="card mb-3" id="ml-card">
+        <div class="card-header">ML Model Status</div>
+        <div class="card-body p-2">
+          <div class="row g-2" style="font-size:13px;">
+            <div class="col-6 col-md-3">
+              <div class="small-muted" style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">last trained</div>
+              <div id="ml-last-trained" class="ticker">—</div>
+            </div>
+            <div class="col-6 col-md-3">
+              <div class="small-muted" style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">training set</div>
+              <div id="ml-set" class="ticker">—</div>
+            </div>
+            <div class="col-6 col-md-3">
+              <div class="small-muted" style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">scored 24h</div>
+              <div id="ml-preds" class="ticker">—</div>
+            </div>
+            <div class="col-6 col-md-3">
+              <div class="small-muted" style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">val loss</div>
+              <div id="ml-val" class="ticker">—</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Article volume chart (last 24h, hourly) -->
+      <div class="card mb-3" id="volume-card">
+        <div class="card-header">Article volume — last 24h</div>
+        <div class="card-body p-2">
+          <div style="position:relative;height:180px;"><canvas id="volume-chart"></canvas></div>
+        </div>
+      </div>
+
+      <!-- Backtest isolation invariant badge -->
+      <div class="card mb-3" id="invariants-card">
+        <div class="card-header">System invariants</div>
+        <div class="card-body p-2">
+          <div id="iso-badge" class="small-muted">checking…</div>
+          <div class="small-muted mt-1" id="iso-detail" style="font-size:11px;"></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -1090,8 +1390,132 @@ async function refreshPaperTrader() {
 
 refresh();
 refreshPaperTrader();
+refreshCollectors();
+refreshMlStatus();
+refreshVolumeChart();
+refreshInvariants();
 setInterval(refresh, 15000);
 setInterval(refreshPaperTrader, 15000);
+setInterval(refreshCollectors, 60000);
+setInterval(refreshMlStatus, 120000);
+setInterval(refreshVolumeChart, 300000);
+setInterval(refreshInvariants, 60000);
+
+// ── Collector health ─────────────────────────────────────────────────────────
+async function refreshCollectors() {
+  const meta = document.getElementById("collectors-meta");
+  const tbody = document.getElementById("collectors-rows");
+  const d = await getJSON("/api/collector-health");
+  if (!d || d.error) {
+    if (meta) meta.textContent = (d && d.error) ? d.error : "loading…";
+    if (tbody) tbody.innerHTML = '<tr><td colspan="4" class="small-muted">—</td></tr>';
+    return;
+  }
+  const sources = d.sources || [];
+  const active = sources.filter(s => s.status === "active").length;
+  const slow = sources.filter(s => s.status === "slow").length;
+  const stale = sources.filter(s => s.status === "stale").length;
+  if (meta) {
+    meta.innerHTML =
+      `<span style="color:var(--green);">●</span> ${active} active · ` +
+      `<span style="color:var(--yellow);">●</span> ${slow} slow · ` +
+      `<span style="color:var(--red);">●</span> ${stale} stale ` +
+      `<span class="small-muted">(${sources.length} sources)</span>`;
+  }
+  if (!sources.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="small-muted">no sources reporting</td></tr>';
+    return;
+  }
+  tbody.innerHTML = sources.map(s => {
+    const dot = s.status === "active" ? '<span style="color:var(--green);">●</span> Active'
+              : s.status === "slow"   ? '<span style="color:var(--yellow);">●</span> Slow'
+              : s.status === "stale"  ? '<span style="color:var(--red);">●</span> Stale'
+              :                          '<span class="small-muted">●</span> Idle';
+    return `<tr>
+      <td class="ticker">${(s.source||'?').replace(/</g,'&lt;')}</td>
+      <td class="text-end">${s.articles_1h}</td>
+      <td class="text-end">${s.articles_24h}</td>
+      <td class="text-end" style="font-size:12px;">${dot}</td>
+    </tr>`;
+  }).join("");
+}
+
+// ── ML model status ──────────────────────────────────────────────────────────
+async function refreshMlStatus() {
+  const d = await getJSON("/api/ml-status");
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  if (!d || d.error) { set("ml-last-trained","—"); set("ml-set","—"); set("ml-preds","—"); set("ml-val","—"); return; }
+  let last = "—";
+  if (d.last_trained) {
+    try {
+      const t = new Date(d.last_trained);
+      const ago = Math.max(0, (Date.now() - t.getTime())/60000);
+      last = ago < 60 ? Math.round(ago) + "m ago"
+           : ago < 1440 ? (ago/60).toFixed(1) + "h ago"
+           : (ago/1440).toFixed(1) + "d ago";
+    } catch (e) { last = d.last_trained; }
+  }
+  set("ml-last-trained", last);
+  set("ml-set", d.training_set_size != null ? Number(d.training_set_size).toLocaleString() : "—");
+  set("ml-preds", d.predictions_24h != null ? Number(d.predictions_24h).toLocaleString() : "—");
+  set("ml-val", d.val_loss != null ? Number(d.val_loss).toFixed(4) : "—");
+}
+
+// ── Article volume bar chart ─────────────────────────────────────────────────
+let _volumeChart = null;
+async function refreshVolumeChart() {
+  const d = await getJSON("/api/volume-history");
+  const canvas = document.getElementById("volume-chart");
+  if (!canvas || typeof Chart === "undefined") return;
+  const rows = (d && d.hours) || [];
+  const labels = rows.map(r => (r.hour || "").slice(11, 16));
+  const counts = rows.map(r => r.count || 0);
+  if (_volumeChart) _volumeChart.destroy();
+  _volumeChart = new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [{
+        label: "articles/h",
+        data: counts,
+        backgroundColor: "rgba(10,205,255,0.55)",
+        borderColor: "#0acdff",
+        borderWidth: 1,
+      }],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: "#8b929d", maxRotation: 0, autoSkip: true, maxTicksLimit: 8 }, grid: { display: false } },
+        y: { ticks: { color: "#8b929d", precision: 0 }, grid: { color: "rgba(255,255,255,0.04)" } },
+      },
+    },
+  });
+}
+
+// ── Backtest isolation invariant ─────────────────────────────────────────────
+async function refreshInvariants() {
+  const badge = document.getElementById("iso-badge");
+  const detail = document.getElementById("iso-detail");
+  if (!badge) return;
+  const d = await getJSON("/api/invariants");
+  if (!d || d.error) {
+    badge.innerHTML = '<span class="badge badge-score">Backtest isolation: UNKNOWN</span>';
+    if (detail) detail.textContent = (d && d.error) ? d.error : "";
+    return;
+  }
+  if (d.backtest_isolation === "active") {
+    badge.innerHTML = '<span class="badge" style="background:rgba(0,200,150,0.18);color:var(--green);">Backtest isolation: ACTIVE ✓</span>';
+    if (detail) {
+      const n = d.backtest_rows_total || 0;
+      detail.textContent = `${n.toLocaleString()} synthetic rows isolated from live alerts.`;
+    }
+  } else {
+    badge.innerHTML = '<span class="badge" style="background:rgba(255,68,85,0.20);color:var(--red);">BREACH DETECTED ✗</span>';
+    if (detail) detail.textContent = `${d.breach_count} backtest row(s) alerted as urgent.`;
+  }
+}
 
 // ── Portfolio config editor ────────────────────────────────────────────────
 let _editConfig = null;
