@@ -5,7 +5,7 @@ Phase 1: bootstraps on heuristic kw_score (weak labels, available immediately).
 Phase 2: retrains as Sonnet ai_score labels accumulate (stronger labels).
 
 Aggressive GPU training: 100 epochs per cycle, batch_size=256, Adam + cosine LR.
-Schedule lives in daemon.py (RETRAIN_INTERVAL drives the cadence).
+Schedule lives in daemon.py (ML_TRAIN_INTERVAL drives the cadence).
 """
 import json
 import os

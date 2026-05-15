@@ -567,9 +567,23 @@ def create_app(store=None) -> Flask:
                     )
                 if an.get("sharpe_annualized") is not None:
                     bits.append(f"Sharpe (ann.): {an['sharpe_annualized']}")
+                if an.get("sortino_annualized") is not None:
+                    bits.append(f"Sortino (ann.): {an['sortino_annualized']}")
+                if an.get("calmar_ratio") is not None:
+                    bits.append(f"Calmar: {an['calmar_ratio']}")
                 if an.get("win_rate_pct") is not None:
                     bits.append(
                         f"Win rate: {an['win_rate_pct']}% over {an.get('n_round_trips', 0)} round-trips"
+                    )
+                if an.get("profit_factor") is not None:
+                    bits.append(f"Profit factor: {an['profit_factor']}")
+                if an.get("avg_holding_days") is not None:
+                    bits.append(f"Avg holding period: {an['avg_holding_days']}d")
+                if an.get("sp500_beta") is not None:
+                    corr = an.get("sp500_correlation")
+                    bits.append(
+                        f"S&P 500 beta: {an['sp500_beta']}"
+                        + (f" (corr {corr})" if corr is not None else "")
                     )
                 if an.get("realized_pl_usd"):
                     bits.append(f"Realized P/L: ${an['realized_pl_usd']:+.2f}")
@@ -583,6 +597,31 @@ def create_app(store=None) -> Flask:
                     analytics_block = "\n".join(bits)
         except Exception as e:
             _logger().warning("chat: analytics fetch failed: %s", e)
+
+        # Earnings radar — scheduled gap risk on the paper trader's holdings.
+        # Lets the chat warn "you hold NVDA and it prints in 4 days".
+        earnings_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/earnings-risk", timeout=3) as resp:
+                er = json.loads(resp.read().decode("utf-8"))
+            if not er.get("error") and er.get("events"):
+                e_lines = []
+                for ev in er["events"][:10]:
+                    days = ev.get("days_away")
+                    days_s = f"{days:.1f}d" if isinstance(days, (int, float)) else "?"
+                    flag = " [HELD]" if ev.get("held") else " (watchlist)"
+                    e_lines.append(
+                        f"  {ev.get('ticker')}: reports in {days_s}{flag}"
+                        + (f", ${ev.get('exposure_usd',0):.0f} exposure" if ev.get("held") else "")
+                    )
+                if e_lines:
+                    hdr = (f"{er.get('n_held_reporting',0)} holding(s) reporting soon, "
+                           f"{er.get('n_imminent',0)} within 3 days:")
+                    earnings_block = hdr + "\n" + "\n".join(e_lines)
+        except Exception as e:
+            _logger().warning("chat: earnings-risk fetch failed: %s", e)
 
         now_iso = datetime.now(timezone.utc).isoformat()
         system_prompt = (
@@ -599,6 +638,7 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER ANALYTICS:\n{analytics_block}\n\n" if analytics_block else "")
             + (f"PAPER TRADER OPTIONS GREEKS (Black-Scholes, live IV):\n{greeks_block}\n\n" if greeks_block else "")
             + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP:\n{heatmap_block}\n\n" if heatmap_block else "")
+            + (f"EARNINGS RADAR (scheduled gap risk):\n{earnings_block}\n\n" if earnings_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "

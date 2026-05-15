@@ -12,6 +12,7 @@ import threading
 import time
 import zlib
 from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 # Module logger — uses central logger if available, falls back to stdlib.
@@ -32,6 +33,21 @@ _LOCK_RETRY_ATTEMPTS = 5
 _LOCK_RETRY_BASE_S = 0.25
 _LOCK_RETRY_CAP_S = 4.0
 
+# Process-lifetime lock-contention counters. Surfaced via ArticleStore.stats()
+# so the dashboard / hourly healthcheck can quantify "database is locked"
+# pressure instead of only seeing scattered WARNING lines in the logs.
+# ``lock_retries`` counts individual retry sleeps; ``lock_failures`` counts
+# calls that exhausted the retry budget and raised.
+_lock_metrics_lock = threading.Lock()
+_lock_retries = 0
+_lock_failures = 0
+
+
+def lock_metrics() -> dict:
+    """Snapshot of process-lifetime DB lock-contention counters."""
+    with _lock_metrics_lock:
+        return {"lock_retries": _lock_retries, "lock_failures": _lock_failures}
+
 
 def _retry_on_lock(func):
     """Decorator: retry on 'database is locked' with exp backoff + jitter."""
@@ -46,6 +62,9 @@ def _retry_on_lock(func):
                     raise
                 last = e
                 if attempt + 1 < _LOCK_RETRY_ATTEMPTS:
+                    global _lock_retries
+                    with _lock_metrics_lock:
+                        _lock_retries += 1
                     # Exponential backoff: 0.25, 0.5, 1.0, 2.0, ... capped at 4s.
                     # Add jitter in [0.5x, 1.5x) so concurrent retriers desync.
                     delay = min(_LOCK_RETRY_BASE_S * (2 ** attempt), _LOCK_RETRY_CAP_S)
@@ -57,6 +76,9 @@ def _retry_on_lock(func):
                     )
                     time.sleep(delay)
         assert last is not None
+        global _lock_failures
+        with _lock_metrics_lock:
+            _lock_failures += 1
         _log.error(
             f"[article_store] {func.__name__}: lock retry exhausted after "
             f"{_LOCK_RETRY_ATTEMPTS} attempts — raising"
@@ -140,6 +162,36 @@ def _connect() -> sqlite3.Connection:
 
 def article_id(url: str, title: str) -> str:
     return hashlib.sha256(f"{url}||{title}".encode()).hexdigest()
+
+
+def _published_older_than(published: str, cutoff: datetime) -> bool:
+    """True only when ``published`` parses successfully AND is older than
+    ``cutoff``. Empty or unparseable values return False (keep the article).
+
+    The SQL pre-filter in get_top_for_briefing compares ``published`` as a raw
+    string, which is meaningless for RFC822-formatted dates ("Wed, 14 May
+    2026 ...") — their leading letter lex-sorts after any ISO cutoff, so every
+    RSS article silently bypasses the 24h staleness check. This parses both
+    RFC822 and ISO forms so the recency filter actually works. Dropping on a
+    parse failure is deliberately avoided — that risks emptying the briefing.
+    """
+    if not published:
+        return False
+    dt = None
+    try:
+        dt = parsedate_to_datetime(published)
+    except Exception:
+        dt = None
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+        except Exception:
+            return False
+    if dt is None:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt < cutoff
 
 
 def compress(text: str) -> bytes:
@@ -564,32 +616,46 @@ class ArticleStore:
         We deliberately do NOT apply that decay here — we just return ai_score
         unchanged so consumers can pick their own policy (or skip decay).
         """
-        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-        pub_cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        now = datetime.now(timezone.utc)
+        since = (now - timedelta(hours=hours)).isoformat()
+        pub_cutoff_dt = now - timedelta(hours=24)
+        pub_cutoff = pub_cutoff_dt.isoformat()
         # Sort by the effective score (LLM label if present, else model score).
         # Without the COALESCE, ML-flagged urgent articles (ai_score=0, ml_score=9)
         # land at the bottom of the briefing — even after being alerted. The
         # briefing should surface them prominently alongside LLM-vetted items.
+        #
+        # The ``published >= ?`` SQL clause is only a cheap pre-filter — it is
+        # correct for ISO-formatted dates but not for RFC822 ones (RSS), so the
+        # authoritative 24h staleness check is applied in Python below via
+        # _published_older_than. ``limit * 3`` is fetched so that dropping
+        # stale RFC822 rows still leaves enough to fill the briefing.
         cur = self.conn.execute(
             "SELECT id, url, title, source, ai_score, kw_score, full_text, first_seen, "
-            "time_sensitivity, ml_score FROM articles "
+            "time_sensitivity, ml_score, published FROM articles "
             "WHERE first_seen >= ? "
             "AND (published IS NULL OR published = '' OR published >= ?) "
             f"AND {_LIVE_ONLY_CLAUSE} "
             "ORDER BY COALESCE(NULLIF(ai_score, 0), ml_score, 0) DESC, "
             "         urgency DESC, kw_score DESC LIMIT ?",
-            (since, pub_cutoff, limit),
+            (since, pub_cutoff, limit * 3),
         )
         rows = cur.fetchall()
-        return [
-            {"_id": r[0], "link": r[1], "title": r[2], "source": r[3],
-             "ai_score": r[4] if r[4] else (r[9] or 0),
-             "_relevance_score": r[5],
-             "summary": decompress(r[6]) if r[6] else "",
-             "first_seen": r[7],
-             "time_sensitivity": r[8]}
-            for r in rows
-        ]
+        out = []
+        for r in rows:
+            if _published_older_than(r[10], pub_cutoff_dt):
+                continue  # GDELT/RSS-indexed stale article — not breaking news
+            out.append(
+                {"_id": r[0], "link": r[1], "title": r[2], "source": r[3],
+                 "ai_score": r[4] if r[4] else (r[9] or 0),
+                 "_relevance_score": r[5],
+                 "summary": decompress(r[6]) if r[6] else "",
+                 "first_seen": r[7],
+                 "time_sensitivity": r[8]}
+            )
+            if len(out) >= limit:
+                break
+        return out
 
     @_retry_on_lock
     def purge_old(self):
@@ -632,7 +698,8 @@ class ArticleStore:
                 size_bytes += p.stat().st_size
         size_mb = size_bytes / 1024 / 1024
         return {"total": total, "urgent": urgent, "unscored": unscored,
-                "below_threshold": below_threshold, "db_mb": round(size_mb, 1)}
+                "below_threshold": below_threshold, "db_mb": round(size_mb, 1),
+                **lock_metrics()}
 
     def stats_since(self, hours: int) -> dict:
         since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
