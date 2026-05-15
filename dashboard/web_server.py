@@ -1028,7 +1028,7 @@ async function savePortfolioConfig() {
     if (typeof marked !== 'undefined') {
       try { return marked.parse(text, {breaks: true, gfm: true}); } catch(e) {}
     }
-    return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+    return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\n/g,'<br>');
   }
   function bubble(role, text){
     const d = document.createElement('div');
@@ -1212,7 +1212,7 @@ function renderMd(text) {
   if (typeof marked !== 'undefined') {
     try { return marked.parse(text, {breaks: true, gfm: true}); } catch(e) {}
   }
-  return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+  return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\n/g,'<br>');
 }
 function addMsg(role, content, sources) {
   const div = document.createElement('div');
