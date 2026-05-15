@@ -47,14 +47,22 @@ class _ColourFormatter(logging.Formatter):
         return f"{colour}{ts} [{record.levelname[0]}] {name}: {record.getMessage()}{_RESET}"
 
 
-class _JSONLHandler(logging.Handler):
-    """Appends one JSON record per log line to structured.jsonl."""
-    def __init__(self, path: Path):
-        super().__init__()
-        self._path = path
-        self._lock = threading.Lock()
+class _JSONLHandler(logging.handlers.RotatingFileHandler):
+    """Appends one JSON record per log line to structured.jsonl.
 
-    def emit(self, record: logging.LogRecord):
+    Inherits size-based rotation from RotatingFileHandler so the structured
+    log can't grow unbounded (it had previously reached 72MB / ~400k lines
+    with no rotation, polluting log audits and disk). Rotation parameters
+    mirror the plain daemon.log handler (10MB x 7 backups). The parent's
+    emit() already serialises on the handler lock and handles rollover; we
+    only override format() to render the JSON line.
+    """
+    def __init__(self, path: Path):
+        super().__init__(
+            path, maxBytes=10 * 1024 * 1024, backupCount=7, encoding="utf-8"
+        )
+
+    def format(self, record: logging.LogRecord) -> str:
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
@@ -75,10 +83,7 @@ class _JSONLHandler(logging.Handler):
                     entry[k] = v
                 except (TypeError, ValueError):
                     pass
-        line = json.dumps(entry, ensure_ascii=False)
-        with self._lock:
-            with open(self._path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+        return json.dumps(entry, ensure_ascii=False)
 
 
 def _build_root_logger():

@@ -10,6 +10,9 @@ data/ml/*.pkl
 data/ml/*.pt
 logs/*.log
 logs/*.jsonl
+# Rotation backups (RotatingFileHandler appends .1, .2, …)
+logs/*.log.*
+logs/*.jsonl.*
 .venv/
 venv/
 
@@ -22,5 +25,7 @@ data/training_data.json.gz
 data/active_learning_queue.jsonl
 data/*.db-journal
 data/ml/training_metrics.jsonl
+data/ml/*.npz
+data/ml/dataset_cache_meta.json
 logs/supervisor_state.json
 data/earnings_calendar.json
