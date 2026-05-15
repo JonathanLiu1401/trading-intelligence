@@ -58,7 +58,9 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         for a in batch
     )
 
-    now_utc = datetime.now(timezone.utc).strftime("%H:%M")
+    # Full date+time so Discord history is unambiguous across day boundaries.
+    # Template already appends " UTC", so don't include it here.
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     prompt = ALERT_PROMPT.format(articles_text=articles_text, now_utc=now_utc)
 
     try:
