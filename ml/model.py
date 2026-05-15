@@ -211,8 +211,15 @@ class ArticleNet:
                 print(f"[ml:model] Local best save failed: {e}")
         return improved
 
-    def _save_versioned(self, val_loss: float, metrics: dict) -> None:
-        """Save a timestamped snapshot to USB; rotate to last MAX_CHECKPOINTS."""
+    def _save_versioned(self, val_loss: float, metrics: dict, is_new_best: bool) -> None:
+        """Save a timestamped snapshot to USB; rotate to last MAX_CHECKPOINTS.
+
+        ``is_new_best`` is decided by the caller (``fit``) and mirrors what
+        ``_save_best_local`` recorded. Recomputing the comparison here against
+        ``self._best_val_loss`` would always be False because ``_save_best_local``
+        already mutated it — that's how the USB ``best_model.pt`` promotion
+        path used to silently no-op.
+        """
         if not _usb_available():
             return
         try:
@@ -234,8 +241,7 @@ class ArticleNet:
                 except Exception:
                     pass
             # Promote to best_model.pt on improvement.
-            if val_loss < self._best_val_loss:
-                self._best_val_loss = val_loss
+            if is_new_best:
                 torch.save({
                     "state_dict": self.net.state_dict(),
                     "input_dim": self._input_dim,
@@ -484,7 +490,7 @@ class ArticleNet:
         improved_best = self._save_best_local(val_loss, metrics)
         metrics["new_best"] = improved_best
         self.save()
-        self._save_versioned(val_loss, metrics)
+        self._save_versioned(val_loss, metrics, is_new_best=improved_best)
         print(f"[ml:model] Trained {epochs} epochs on {n} samples in {elapsed:.1f}s "
               f"(device={self.device}, val_loss={val_loss:.4f})")
         return metrics

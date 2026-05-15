@@ -85,7 +85,7 @@ External callers reading articles.db:
 | `digital-intern-sudoers` | Sudoers fragment for the daemon's restart hook |
 | `dashboard.service` | systemd unit for the standalone dashboard process |
 | `requirements.txt` | pip deps |
-| `.env` / `.env.example` | API keys (`DISCORD_WEBHOOK_URL`, `ALPHA_VANTAGE_KEY`, `NEWS_API_KEY`, `POLYGON_API_KEY`, `FINNHUB_API_KEY`, `ANTHROPIC_API_KEY`) |
+| `.env` / `.env.example` | API keys (`DISCORD_WEBHOOK_URL`, `ALPHA_VANTAGE_KEY`, `NEWS_API_KEY`, `POLYGON_API_KEY`, `FINNHUB_API_KEY`) |
 | `2x` | Two-instance launcher script |
 
 ### Subpackages
@@ -115,7 +115,7 @@ External callers reading articles.db:
 | `config/portfolio.json` | Holdings + cash + sector watchlist consumed by `collectors/portfolio_pnl.py` and price-alert worker |
 | `config/watchlist.json` | Standalone watchlist (legacy) |
 | `config/sources.json` | RSS feed URLs + scraper site list |
-| `dashboard/` | Flask app — same port `:8080`. Renders article feed, urgency timeline, worker health (from `logs/supervisor_state.json`), sentiment trends, portfolio P/L. Cross-fetches paper-trader's `/api/portfolio` on `:8090` |
+| `dashboard/` | Flask app — same port `:8080`. Renders article feed, urgency timeline, worker health, sentiment trends, portfolio P/L. Cross-fetches paper-trader's `/api/portfolio` on `:8090`. `/api/chat` uses `core.claude_cli` (Claude CLI auth, no API key) |
 | `scripts/export_training_data.py` | Dumps `articles.db` to a gzipped JSONL for offline training |
 | `scripts/watchdog.sh` | Optional restart wrapper |
 | `data/` | Runtime artifacts (see below) |
@@ -429,4 +429,4 @@ bash /home/zeph/digital-intern/healthcheck.sh   # exit 0 ok, nonzero failed
 
 ---
 
-*Last revised: 2026-05-14*
+*Last revised: 2026-05-15*

@@ -3,8 +3,15 @@ Urgency scorer — batches unscored articles to Claude Sonnet 4.6.
 Marks articles as urgent (score >= 8) for immediate alerting.
 """
 import json
+import logging
 
 from core.claude_cli import claude_call
+
+try:
+    from core.logger import get_logger
+    _log = get_logger("urgency_scorer")
+except Exception:
+    _log = logging.getLogger("urgency_scorer")
 
 SONNET_MODEL = "claude-sonnet-4-6"
 BATCH_SIZE = 100  # articles per Sonnet call
@@ -72,12 +79,13 @@ def score_batch(articles: list, store) -> int:
 
         scores = _extract_json_array(raw)
         if scores is None:
-            print(f"[urgency] Failed to parse JSON array from response: {raw[:200]!r}")
+            _log.warning(f"[urgency] Failed to parse JSON array from response: {raw[:200]!r}")
             return 0
 
         urgent_count = 0
         updates: list[tuple[str, float, int]] = []
         urgent_log: list[tuple[float, str, str]] = []
+        scored_indices: set[int] = set()
         for item in scores:
             if not isinstance(item, dict):
                 continue
@@ -93,19 +101,38 @@ def score_batch(articles: list, store) -> int:
             if not aid:
                 continue
             is_urgent = score >= URGENT_THRESHOLD
+            # Floor non-urgent ai_score at 0.01 so Sonnet-scored noise (score=0)
+            # isn't picked up by get_unscored on the next pass and re-sent to
+            # the LLM forever. Clamp the upper bound to 10 defensively.
+            score = max(0.01, min(float(score), 10.0))
             updates.append((aid, score, 1 if is_urgent else 0))
+            scored_indices.add(idx)
             if is_urgent:
                 urgent_log.append((score, art.get("title", "")[:80], item.get("reason", "")))
                 urgent_count += 1
+        # Anti-loop: articles Sonnet engaged with but omitted from its response
+        # would otherwise remain ai_score=0 / ml_score=NULL and be re-routed to
+        # the LLM every cycle forever. Floor them to 0.01 (noise) so they exit
+        # the queue. Only apply when Sonnet returned at least one valid entry —
+        # a completely empty array is ambiguous (refusal vs. true zero) and we
+        # prefer a retry over mass-mislabeling 100 articles as noise.
+        if scored_indices:
+            for i, art in enumerate(articles):
+                if i in scored_indices:
+                    continue
+                aid = art.get("_id")
+                if not aid:
+                    continue
+                updates.append((aid, 0.01, 0))
         if updates:
             # One bulk commit instead of N round-trips through the write lock.
             store.update_ai_scores_batch(updates)
         for score, title, reason in urgent_log:
-            print(f"[urgency] URGENT score={score:.0f} — {title} ({reason})")
+            _log.info(f"[urgency] URGENT score={score:.0f} — {title} ({reason})")
 
         return urgent_count
-    except Exception as e:
-        print(f"[urgency] Scoring error: {e}")
+    except Exception:
+        _log.exception("[urgency] Scoring error")
         return 0
 
 
@@ -115,7 +142,7 @@ def run_scoring_pass(store, batch_size: int = BATCH_SIZE) -> int:
     if not unscored:
         return 0
 
-    print(f"[urgency] Scoring {len(unscored)} unscored articles in batches of {batch_size}...")
+    _log.info(f"[urgency] Scoring {len(unscored)} unscored articles in batches of {batch_size}...")
     total_urgent = 0
     for i in range(0, len(unscored), batch_size):
         batch = unscored[i:i + batch_size]

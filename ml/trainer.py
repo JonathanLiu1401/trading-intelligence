@@ -192,7 +192,10 @@ def _fetch_briefing_samples(
         "ORDER BY first_seen DESC LIMIT 5000"
     )
     for title, blob, src, published in cur.fetchall():
-        if not title or len(title) < 8:
+        # 12-char minimum matches heartbeat_worker._extract_briefing_labels —
+        # short generic titles ("Stocks", "Markets") otherwise false-match
+        # common briefing prose and inject noisy positive labels.
+        if not title or len(title) < 12:
             continue
         if title[:40].lower() not in combined:
             continue
@@ -429,9 +432,15 @@ def train_continuous(store) -> dict:
     texts: list[str] = []
     articles: list[dict] = []
     rels, urgs = [], []
+    # Mirror _fetch_training_data: only LLM-sourced labels (or legacy
+    # integer-valued ai_score from before the score_source split). Never
+    # ingest score_source='ml' — that would reopen the label-feedback loop.
     cur = store.conn.execute(
         "SELECT title, full_text, ai_score, source, published "
-        "FROM articles WHERE ai_score > 0"
+        "FROM articles "
+        "WHERE ai_score > 0 "
+        "  AND (score_source IN ('llm','briefing_boost') "
+        "       OR (score_source IS NULL AND ai_score = CAST(ai_score AS INTEGER)))"
     )
     for title, blob, ai, src, published in cur.fetchall():
         summary = decompress(blob) if blob else ""

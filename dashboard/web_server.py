@@ -14,7 +14,6 @@ from __future__ import annotations
 import os
 import json
 import sqlite3
-import subprocess
 import zlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -22,12 +21,7 @@ from typing import Any
 
 from flask import Flask, Response, jsonify, request
 
-try:
-    import anthropic  # type: ignore
-    _ANTHROPIC_AVAILABLE = True
-except Exception:
-    anthropic = None  # type: ignore
-    _ANTHROPIC_AVAILABLE = False
+from core.claude_cli import claude_call as _claude_cli_call
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -624,53 +618,18 @@ def create_app(store=None) -> Flask:
                 msgs.append({"role": role, "content": content})
         msgs.append({"role": "user", "content": user_msg})
 
-        response_text = ""
-        err: str | None = None
+        # Build a single prompt: system block + conversation history + final user turn.
+        # Claude CLI (core.claude_cli) handles auth via its own login — no API key needed.
+        convo_parts = [system_prompt, "\n\n--- Conversation ---"]
+        for m in msgs:
+            convo_parts.append(f"{m['role'].upper()}: {m['content']}")
+        convo_parts.append("ASSISTANT:")
+        prompt = "\n\n".join(convo_parts)
 
-        if _ANTHROPIC_AVAILABLE and os.environ.get("ANTHROPIC_API_KEY"):
-            try:
-                client = anthropic.Anthropic()
-                resp = client.messages.create(
-                    model="claude-opus-4-7",
-                    max_tokens=2048,
-                    system=system_prompt,
-                    messages=msgs,
-                )
-                parts = []
-                for blk in resp.content or []:
-                    text = getattr(blk, "text", None)
-                    if text:
-                        parts.append(text)
-                response_text = "".join(parts).strip()
-            except Exception as e:
-                err = f"anthropic SDK error: {e}"
-                _logger().warning("chat: %s", err)
+        response_text = _claude_cli_call(prompt, model="claude-opus-4-7", timeout=120) or ""
 
         if not response_text:
-            # Subprocess fallback to the Claude CLI (uses its own auth).
-            try:
-                convo_parts = [system_prompt, "\n\n--- Conversation ---"]
-                for m in msgs:
-                    convo_parts.append(f"{m['role'].upper()}: {m['content']}")
-                convo_parts.append("ASSISTANT:")
-                prompt = "\n\n".join(convo_parts)
-                proc = subprocess.run(
-                    ["claude", "--model", "claude-opus-4-7", "--print", prompt],
-                    capture_output=True, text=True, timeout=120,
-                )
-                if proc.returncode == 0:
-                    response_text = (proc.stdout or "").strip()
-                else:
-                    err = (err + " | " if err else "") + f"claude CLI exit {proc.returncode}: {proc.stderr.strip()[:300]}"
-            except FileNotFoundError:
-                err = (err + " | " if err else "") + "claude CLI not found and no ANTHROPIC_API_KEY"
-            except subprocess.TimeoutExpired:
-                err = (err + " | " if err else "") + "claude CLI timed out after 120s"
-            except Exception as e:
-                err = (err + " | " if err else "") + f"claude CLI error: {e}"
-
-        if not response_text:
-            return jsonify({"error": err or "no response from model"}), 502
+            return jsonify({"error": "claude CLI returned no response"}), 502
 
         return jsonify({
             "response": response_text,

@@ -37,7 +37,7 @@ EXTRA_FEATURE_DIM = 15
 # Source credibility — broader coverage; mirrors urgency_scorer + briefing analyst weights.
 SOURCE_CRED: dict[str, float] = {
     "reuters": 0.90, "bloomberg": 0.90, "wsj": 0.88, "financial times": 0.88,
-    "ft.com": 0.88, "cnbc": 0.85, "associated press": 0.85, "ap ": 0.85,
+    "ft.com": 0.88, "cnbc": 0.85, "associated press": 0.85, "ap": 0.85,
     "nikkei": 0.85, "koreaherald": 0.80, "korea herald": 0.80,
     "scmp": 0.78, "south china morning": 0.78,
     "marketwatch": 0.78, "barrons": 0.78, "seeking alpha": 0.72,
@@ -53,6 +53,14 @@ SOURCE_CRED: dict[str, float] = {
     "alphavantage": 0.72,
 }
 DEFAULT_SOURCE_CRED = 0.55
+
+# Precompiled word-boundary patterns for source credibility lookup.
+# Naive `if key in s` matched "ap " inside "snap " (e.g., a Snap-related source
+# tagged with AP credibility). Word boundaries eliminate that whole class of bug.
+_SOURCE_CRED_PATTERNS: list[tuple[re.Pattern, float]] = [
+    (re.compile(r"\b" + re.escape(k.strip()) + r"\b", re.IGNORECASE), v)
+    for k, v in SOURCE_CRED.items()
+]
 
 # Tickers that count as "live position" for the portfolio_relevance feature.
 LIVE_PORTFOLIO_TICKERS = {
@@ -74,9 +82,8 @@ _SENT_RE = re.compile(r"[.!?]+\s+")
 def _source_credibility(source: str) -> float:
     if not source:
         return DEFAULT_SOURCE_CRED
-    s = source.lower()
-    for key, score in SOURCE_CRED.items():
-        if key in s:
+    for pat, score in _SOURCE_CRED_PATTERNS:
+        if pat.search(source):
             return score
     return DEFAULT_SOURCE_CRED
 

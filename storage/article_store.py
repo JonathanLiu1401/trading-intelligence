@@ -214,9 +214,9 @@ class ArticleStore:
                 # migration pass) — guarded by checking for any NULL rows that
                 # also have a non-integer ai_score.
                 needs_cleanup = self.conn.execute(
-                    "SELECT COUNT(*) FROM articles "
+                    "SELECT EXISTS(SELECT 1 FROM articles "
                     "WHERE score_source IS NULL AND ai_score > 0 "
-                    "AND ai_score != CAST(ai_score AS INTEGER) LIMIT 1"
+                    "AND ai_score != CAST(ai_score AS INTEGER))"
                 ).fetchone()[0]
                 if needs_cleanup:
                     # Move suspected-model values into ml_score for visibility.
@@ -331,15 +331,40 @@ class ArticleStore:
             self.conn.commit()
 
     @_retry_on_lock
+    def mark_alerted_batch(self, aids: list[str]) -> int:
+        """Mark multiple articles alerted in one transaction. Returns rowcount."""
+        if not aids:
+            return 0
+        with self._write_lock:
+            cur = self.conn.executemany(
+                "UPDATE articles SET urgency=2 WHERE id=?",
+                [(aid,) for aid in aids],
+            )
+            n = cur.rowcount
+            self.conn.commit()
+        return n
+
+    @_retry_on_lock
     def update_scores_from_labels(self, labels: list[dict]) -> int:
-        """Boost ai_score (capped at 5.0) for articles flagged in_briefing by Opus."""
+        """Label articles flagged in_briefing by Opus as mid-tier positive (4.5).
+
+        Briefing inclusion is one of the strongest signals available (Opus
+        curated this article into the heartbeat). The previous
+        ``MIN(5.0, ai_score + 0.3)`` formula misbehaved at both ends: it
+        *downgraded* high-LLM-scored articles (8 → capped at 5.0) and
+        *under-labeled* unscored briefing mentions (0 → 0.3, which the trainer
+        then sees as "3% relevance"). Use ``MAX(ai_score, 4.5)`` so existing
+        higher-quality LLM labels are preserved and unscored articles enter
+        the training pool with the same magnitude that
+        ``trainer._fetch_briefing_samples`` already uses.
+        """
         urls = [l.get("url") for l in labels if l.get("in_briefing") and l.get("url")]
         if not urls:
             return 0
         placeholders = ",".join("?" * len(urls))
         with self._write_lock:
             cur = self.conn.execute(
-                f"UPDATE articles SET ai_score = MIN(5.0, ai_score + 0.3), "
+                f"UPDATE articles SET ai_score = MAX(ai_score, 4.5), "
                 f"score_source = CASE WHEN score_source='llm' THEN 'llm' "
                 f"ELSE 'briefing_boost' END "
                 f"WHERE url IN ({placeholders})",
@@ -370,15 +395,36 @@ class ArticleStore:
             for r in cur.fetchall()
         ]
 
+    def count_unscored(self, min_kw: float = 0.0) -> int:
+        """Count articles still pending the scorer. Mirrors ``get_unscored``'s
+        filter (ai_score=0 AND ml_score IS NULL AND kw_score>=min_kw AND
+        live-only) without fetching/decompressing the rows themselves —
+        intended for the scorer worker's "remaining backlog" status line."""
+        cur = self.conn.execute(
+            "SELECT COUNT(*) FROM articles "
+            f"WHERE ai_score=0 AND ml_score IS NULL AND kw_score>=? "
+            f"AND {_LIVE_ONLY_CLAUSE}",
+            (min_kw,),
+        )
+        return cur.fetchone()[0]
+
     def get_unscored(self, limit: int = 500, min_kw: float = 0.5) -> list:
         """Get articles that haven't been AI-scored yet.
 
         Excludes backtest replays and Opus annotation rows — those are training
         artefacts, not live news, and must not enter the live scoring path.
+
+        ``ml_score IS NULL`` excludes articles the model has already scored
+        with confidence. Without this, every 30s scorer cycle re-fetched the
+        full ML-scored backlog and re-ran inference on it, while the LLM
+        retry path (which writes ai_score, not ml_score) still works: a
+        Sonnet-failed article keeps both ai_score=0 and ml_score=NULL, so it
+        gets re-routed on the next cycle.
         """
         cur = self.conn.execute(
             "SELECT id, url, title, source, full_text FROM articles "
-            f"WHERE ai_score=0 AND kw_score>=? AND {_LIVE_ONLY_CLAUSE} "
+            f"WHERE ai_score=0 AND ml_score IS NULL AND kw_score>=? "
+            f"AND {_LIVE_ONLY_CLAUSE} "
             "ORDER BY kw_score DESC LIMIT ?",
             (min_kw, limit),
         )
@@ -440,12 +486,25 @@ class ArticleStore:
             _INFER_LOCK.release()
         return total
 
-    def get_unalerted_urgent(self) -> list:
-        """Get articles scored urgent but not yet alerted."""
+    def get_unalerted_urgent(self, limit: int = 50) -> list:
+        """Get articles scored urgent but not yet alerted.
+
+        ai_score is LLM-only; model self-predictions live in ml_score (see
+        update_ml_scores_batch). A model-flagged urgent item has ai_score=0
+        and ml_score>0, so COALESCE picks the meaningful number for the alert
+        prompt (otherwise it'd show [score=0] for every NN-detected alert).
+
+        ``limit`` caps the result — the alerter only consumes ALERT_BATCH_SIZE
+        (5) per cycle, so an unbounded query during a backlog surge would
+        fetch (and decompress) thousands of rows uselessly.
+        """
         cur = self.conn.execute(
-            "SELECT id, url, title, source, ai_score FROM articles "
+            "SELECT id, url, title, source, "
+            "COALESCE(NULLIF(ai_score, 0), ml_score, 0) AS score "
+            "FROM articles "
             f"WHERE urgency=1 AND {_LIVE_ONLY_CLAUSE} "
-            "ORDER BY ai_score DESC"
+            "ORDER BY score DESC LIMIT ?",
+            (limit,),
         )
         rows = cur.fetchall()
         return [{"_id": r[0], "link": r[1], "title": r[2], "source": r[3], "ai_score": r[4]}
@@ -470,19 +529,25 @@ class ArticleStore:
         """
         since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
         pub_cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        # Sort by the effective score (LLM label if present, else model score).
+        # Without the COALESCE, ML-flagged urgent articles (ai_score=0, ml_score=9)
+        # land at the bottom of the briefing — even after being alerted. The
+        # briefing should surface them prominently alongside LLM-vetted items.
         cur = self.conn.execute(
             "SELECT id, url, title, source, ai_score, kw_score, full_text, first_seen, "
-            "time_sensitivity FROM articles "
+            "time_sensitivity, ml_score FROM articles "
             "WHERE first_seen >= ? "
             "AND (published IS NULL OR published = '' OR published >= ?) "
             f"AND {_LIVE_ONLY_CLAUSE} "
-            "ORDER BY ai_score DESC, kw_score DESC LIMIT ?",
+            "ORDER BY COALESCE(NULLIF(ai_score, 0), ml_score, 0) DESC, "
+            "         urgency DESC, kw_score DESC LIMIT ?",
             (since, pub_cutoff, limit),
         )
         rows = cur.fetchall()
         return [
             {"_id": r[0], "link": r[1], "title": r[2], "source": r[3],
-             "ai_score": r[4], "_relevance_score": r[5],
+             "ai_score": r[4] if r[4] else (r[9] or 0),
+             "_relevance_score": r[5],
              "summary": decompress(r[6]) if r[6] else "",
              "first_seen": r[7],
              "time_sensitivity": r[8]}
@@ -507,13 +572,17 @@ class ArticleStore:
         urgent = self.conn.execute("SELECT COUNT(*) FROM articles WHERE urgency>=1").fetchone()[0]
         # "unscored" = pending the scorer (kw_score above the scorer's threshold).
         # Articles below the threshold are intentionally skipped, not a backlog;
-        # split them out so the metric reflects actionable work.
+        # split them out so the metric reflects actionable work. Mirror
+        # ``get_unscored`` (ai_score=0 AND ml_score IS NULL) so the count
+        # reflects what the scorer will actually re-fetch.
         unscored = self.conn.execute(
-            "SELECT COUNT(*) FROM articles WHERE ai_score=0 AND kw_score>=?",
+            "SELECT COUNT(*) FROM articles "
+            "WHERE ai_score=0 AND ml_score IS NULL AND kw_score>=?",
             (score_min_kw,),
         ).fetchone()[0]
         below_threshold = self.conn.execute(
-            "SELECT COUNT(*) FROM articles WHERE ai_score=0 AND kw_score<?",
+            "SELECT COUNT(*) FROM articles "
+            "WHERE ai_score=0 AND ml_score IS NULL AND kw_score<?",
             (score_min_kw,),
         ).fetchone()[0]
         db = _get_db_path()
@@ -531,10 +600,12 @@ class ArticleStore:
     def stats_since(self, hours: int) -> dict:
         since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
         total = self.conn.execute(
-            "SELECT COUNT(*) FROM articles WHERE first_seen >= ?", (since,)
+            f"SELECT COUNT(*) FROM articles WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+            (since,),
         ).fetchone()[0]
         urgent = self.conn.execute(
-            "SELECT COUNT(*) FROM articles WHERE first_seen >= ? AND urgency>=1", (since,)
+            f"SELECT COUNT(*) FROM articles WHERE first_seen >= ? AND urgency>=1 AND {_LIVE_ONLY_CLAUSE}",
+            (since,),
         ).fetchone()[0]
         return {"total": total, "urgent": urgent}
 

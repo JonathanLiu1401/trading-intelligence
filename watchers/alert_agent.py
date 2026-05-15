@@ -1,10 +1,17 @@
 """
 Urgent alert agent — Bloomberg BN newswire style, immediate Discord post.
 """
+import logging
 import os
 from datetime import datetime, timezone
 
 from core.claude_cli import claude_call
+
+try:
+    from core.logger import get_logger
+    _log = get_logger("alert_agent")
+except Exception:
+    _log = logging.getLogger("alert_agent")
 
 SONNET_MODEL = "claude-sonnet-4-6"
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
@@ -46,7 +53,7 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
     if not urgent_articles:
         return False
     if not DISCORD_WEBHOOK:
-        print("[alert] No DISCORD_WEBHOOK_URL — skipping")
+        _log.warning("[alert] No DISCORD_WEBHOOK_URL — skipping")
         return False
 
     # Only the first ALERT_BATCH_SIZE feed the prompt — and only those get
@@ -66,7 +73,7 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
     try:
         message = claude_call(prompt, model=SONNET_MODEL, timeout=60)
         if not message:
-            print("[alert] No response from Claude — skipping")
+            _log.warning("[alert] No response from Claude — skipping")
             return False
 
         # post via discord_notifier which also fires TTS
@@ -74,15 +81,16 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         ok = discord_send(message, is_alert=True)
 
         if ok:
-            for art in batch:
-                store.mark_alerted(art["_id"])
+            # Bulk-mark in one transaction; previous code took the write lock
+            # N times (5 round-trips for the default batch size).
+            store.mark_alerted_batch([art["_id"] for art in batch])
             tail = len(urgent_articles) - len(batch)
             tail_note = f" ({tail} more queued)" if tail > 0 else ""
-            print(f"[alert] BN alert sent ({len(batch)} articles){tail_note}")
+            _log.info(f"[alert] BN alert sent ({len(batch)} articles){tail_note}")
         else:
-            print(f"[alert] Discord POST failed")
+            _log.warning("[alert] Discord POST failed")
         return ok
 
-    except Exception as e:
-        print(f"[alert] Error: {e}")
+    except Exception:
+        _log.exception("[alert] Error sending urgent alert")
         return False

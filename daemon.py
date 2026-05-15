@@ -43,7 +43,7 @@ sys.path.insert(0, str(BASE_DIR))
 from core.logger import get_logger, record_metric
 
 from collectors.rss_collector import collect_rss
-from collectors.gdelt_collector import collect_gdelt, QUERY_GROUPS, _fetch_query
+from collectors.gdelt_collector import collect_gdelt, QUERY_GROUPS
 from collectors.ticker_news import collect_ticker_news
 from collectors.reddit_collector import collect_reddit
 from collectors.web_scraper import scrape_web
@@ -70,7 +70,7 @@ from notifier.discord_notifier import send as discord_send
 from storage.article_store import ArticleStore
 from watchers.urgency_scorer import score_batch
 from watchers.alert_agent import send_urgent_alert
-from ml.inference import triage_articles
+from ml.inference import triage_articles, score_articles
 from ml.sentiment_trends import write_trends as write_score_trends
 from ml.trainer import train as ml_train
 from ml.trainer import train_continuous
@@ -904,7 +904,7 @@ def web_server_worker(store: ArticleStore):
             log.warning(
                 f"[web_server_worker] port {WEB_SERVER_PORT} busy — waiting 5s (attempt {_attempt+1}/12)"
             )
-            time.sleep(5)
+            _sleep(5)
             if not _running:
                 return
 
@@ -923,7 +923,9 @@ def web_server_worker(store: ArticleStore):
         # frees up (e.g. stale daemon exits) without waiting the full 5min.
         backoff_deadline = time.time() + 300
         while _running and time.time() < backoff_deadline:
-            time.sleep(15)
+            _sleep(15)
+            if not _running:
+                return
             if _port_is_free(WEB_SERVER_HOST, WEB_SERVER_PORT):
                 log.info(f"[web_server_worker] port {WEB_SERVER_PORT} freed — resuming")
                 bound = True
@@ -963,7 +965,6 @@ def scorer_worker(store: ArticleStore):
                 _worker_last_ok["scorer"] = time.time()
                 _sleep(SCORE_INTERVAL)
                 continue
-            from ml.inference import score_articles
             scores = score_articles(unscored)
             batch = []
             llm_candidates = []

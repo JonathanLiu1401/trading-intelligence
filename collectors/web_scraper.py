@@ -239,12 +239,14 @@ def _extract_articles(html: str, base_url: str) -> list:
         soup = BeautifulSoup(html, "lxml")
         articles = []
         seen = set()
-        for tag in soup.find_all(["a", "h1", "h2", "h3"]):
+        for tag in soup.find_all("a"):
             href = tag.get("href") or ""
+            if not href:
+                continue
             text = tag.get_text(strip=True)
             if not text or len(text) < 15:
                 continue
-            url = urljoin(base_url, href) if href else ""
+            url = urljoin(base_url, href)
             if url and url not in seen and _is_article_url(url):
                 seen.add(url)
                 articles.append({
@@ -284,7 +286,7 @@ async def scrape_all_async() -> list:
     for batch in results:
         if isinstance(batch, list):
             for art in batch:
-                url = art["link"]
+                url = art.get("link") or ""
                 if url and url not in seen_urls:
                     seen_urls.add(url)
                     articles.append(art)

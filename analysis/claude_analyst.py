@@ -70,9 +70,12 @@ def _now_utc_str():
 
 
 def _fmt_ticker(s):
-    price = f"${s['price']:>10.2f}" if isinstance(s.get('price'), (int, float)) else "    N/A"
-    pct   = f"{s['pct_change']:>+7.2f}%" if isinstance(s.get('pct_change'), (int, float)) else "    N/A"
-    return f"{s['ticker']:>12}  {price}  {pct}  {s.get('name','')[:25]}"
+    # Keep the price column at width=11 ("$" + 10-char number) and pct column at
+    # width=8 (signed 7-char number + "%") so N/A rows don't break alignment.
+    price = f"${s['price']:>10.2f}" if isinstance(s.get('price'), (int, float)) else f"{'N/A':>11}"
+    pct   = f"{s['pct_change']:>+7.2f}%" if isinstance(s.get('pct_change'), (int, float)) else f"{'N/A':>8}"
+    ticker = s.get('ticker', '?')
+    return f"{ticker:>12}  {price}  {pct}  {s.get('name','')[:25]}"
 
 
 def _build_payload(articles, stock_data, earnings):
@@ -93,7 +96,10 @@ def _build_payload(articles, stock_data, earnings):
     if not articles:
         parts.append("(no high-relevance articles this cycle)")
     else:
-        for i, a in enumerate(articles[:50], 1):
+        # Cap at 60 — caller prepends up to 2 synthetic snapshot rows
+        # (portfolio P&L, options) to a 50-article top list; a [:50] cap
+        # silently truncates the last two real articles.
+        for i, a in enumerate(articles[:60], 1):
             score = a.get("ai_score") or a.get("_relevance_score", "?")
             parts.append(
                 f"{i:>2}. [score={score}] [{a.get('source','?')}] {a.get('title','')}\n"
