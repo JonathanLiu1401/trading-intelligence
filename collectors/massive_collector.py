@@ -25,7 +25,9 @@ CURSOR_PATH = BASE_DIR / "data" / "massive_cursor.json"
 DB_PATH = BASE_DIR / "data" / "seen_articles.db"
 
 API_URL = "https://api.massive.com/v2/reference/news"
-BATCH_PER_PASS = 4
+# 18 tickers per 10-min pass = ~108 polls/hour, comfortably under typical
+# 1000 req/min plans; cycles through ~50 portfolio+watchlist tickers in ~30min.
+BATCH_PER_PASS = 18
 PER_TICKER_COOLDOWN_SEC = 600
 HTTP_TIMEOUT = 10
 _KEY_WARNED = False
@@ -173,7 +175,7 @@ def collect_massive(batch: int = BATCH_PER_PASS) -> list:
 
     raw: list[list] = []
     if selected:
-        with ThreadPoolExecutor(max_workers=min(len(selected), 4)) as ex:
+        with ThreadPoolExecutor(max_workers=min(len(selected), 12)) as ex:
             futures = {ex.submit(_fetch_ticker, key, t): t for t in selected}
             for fut in as_completed(futures):
                 try:

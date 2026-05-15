@@ -43,6 +43,16 @@ SUBREDDITS = [
     "FuturesTrading", "Bonds", "GoldandSilverStackers",
     # Global / regional equity discussion
     "EuropeanStocks", "ChinaStocks", "IndiaInvestments", "Commodities",
+    # Sector / income / FIRE
+    "energyinvestors", "REITs", "fatFIRE", "HFEA", "mutualfunds",
+    "dividendgang", "passive_income", "AsianStocks",
+    # Hardware / chip engineering
+    "chipdesign", "FPGA", "ASIC_Design", "ElectricalEngineering",
+    # Macro / business news
+    "economy", "business", "Layoffs", "geoeconomics",
+    # Trading discussion (extra)
+    "WallStreetbetsCrypto", "wallstreetbetsHUZZAH", "investing_discussion",
+    "stockanalysis", "EuropeFIRE",
 ]
 
 
