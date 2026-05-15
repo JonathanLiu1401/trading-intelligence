@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timezone
 
 from core.claude_cli import claude_call
+from watchers.alert_dedup import alerted_ids, dedupe_urgent
 
 try:
     from core.logger import get_logger
@@ -56,10 +57,18 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         _log.warning("[alert] No DISCORD_WEBHOOK_URL — skipping")
         return False
 
-    # Only the first ALERT_BATCH_SIZE feed the prompt — and only those get
-    # marked alerted. Marking the entire urgent list would silently drop the
-    # tail (it'd never be picked up on the next cycle), so we cap both ends.
-    batch = urgent_articles[:ALERT_BATCH_SIZE]
+    # Collapse syndicated duplicates first: one breaking story carried by GDELT
+    # + Reuters + Yahoo + RSS would otherwise eat the whole 5-slot batch and
+    # show the trader the same event five times. After dedup the batch holds
+    # five DISTINCT stories; each survivor knows the ids of the copies it
+    # absorbed (``_dup_ids``) so all of them can still be marked alerted.
+    deduped = dedupe_urgent(urgent_articles)
+
+    # Only the first ALERT_BATCH_SIZE feed the prompt — and only those (plus the
+    # duplicates they absorbed) get marked alerted. Marking the entire urgent
+    # list would silently drop the tail (it'd never be picked up next cycle),
+    # so we cap both ends.
+    batch = deduped[:ALERT_BATCH_SIZE]
 
     def _fmt(a: dict) -> str:
         # Include the article body when available so the alert LLM grounds its
@@ -68,6 +77,11 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
             f"[score={a['ai_score']:.0f}] {a['title']}\n"
             f"source: {a['source']}\nurl: {a['link']}"
         )
+        dup_count = int(a.get("dup_count") or 1)
+        if dup_count > 1:
+            # Tell the alert LLM how broadly the story is being carried — wide
+            # syndication is itself a signal of how big the event is.
+            block += f"\nsyndication: reported by {dup_count} sources"
         summary = (a.get("summary") or "").strip()
         if summary:
             block += f"\nbody: {summary[:600]}"
@@ -92,11 +106,20 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
 
         if ok:
             # Bulk-mark in one transaction; previous code took the write lock
-            # N times (5 round-trips for the default batch size).
-            store.mark_alerted_batch([art["_id"] for art in batch])
-            tail = len(urgent_articles) - len(batch)
-            tail_note = f" ({tail} more queued)" if tail > 0 else ""
-            _log.info(f"[alert] BN alert sent ({len(batch)} articles){tail_note}")
+            # N times (5 round-trips for the default batch size). alerted_ids
+            # includes the syndicated copies merged into the batch, so they
+            # never re-fire — duplicates of still-queued stories stay urgent.
+            mark_ids = alerted_ids(batch)
+            store.mark_alerted_batch(mark_ids)
+            collapsed = len(mark_ids) - len(batch)
+            tail = len(deduped) - len(batch)
+            notes = []
+            if collapsed > 0:
+                notes.append(f"{collapsed} syndicated dupes folded in")
+            if tail > 0:
+                notes.append(f"{tail} more queued")
+            note = f" ({'; '.join(notes)})" if notes else ""
+            _log.info(f"[alert] BN alert sent ({len(batch)} distinct stories){note}")
         else:
             _log.warning("[alert] Discord POST failed")
         return ok
