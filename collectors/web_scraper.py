@@ -1,6 +1,7 @@
 """
 Async web scraper — directly crawls 100+ financial news sites and article feeds.
-Never stops. Feeds URLs into a shared queue.
+``scrape_web()`` fetches every target concurrently and returns a deduplicated
+list of article dicts; the daemon's web_worker calls it on a fixed interval.
 """
 import asyncio
 import re

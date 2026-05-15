@@ -1001,19 +1001,22 @@ def scorer_worker(store: ArticleStore):
                 store.update_ml_scores_batch(batch)
             if ts_updates:
                 store.update_time_sensitivity_batch(ts_updates)
-            llm_used = 0
+            llm_urgent = 0
             if llm_candidates:
                 # score_batch sends its whole input to Sonnet as a single
                 # prompt. At cold start the model is unfitted so every article
                 # is needs_llm — passing the full backlog (up to 1000) in one
                 # call produces a prompt Sonnet can't parse. Chunk it.
+                # score_batch returns the count of *urgent* items it found.
                 for j in range(0, len(llm_candidates), URGENCY_BATCH_SIZE):
-                    llm_used += score_batch(
+                    llm_urgent += score_batch(
                         llm_candidates[j:j + URGENCY_BATCH_SIZE], store
                     )
             with _store_lock:
                 remaining = store.count_unscored(min_kw=0.0)
-            log.info(f"[scorer] batch={len(unscored)} scored={len(batch)} llm_used={llm_used} remaining={remaining}")
+            log.info(f"[scorer] batch={len(unscored)} scored={len(batch)} "
+                     f"llm_sent={len(llm_candidates)} llm_urgent={llm_urgent} "
+                     f"remaining={remaining}")
             _worker_last_ok["scorer"] = time.time()
             # Don't sleep if work remains
             if remaining == 0:
