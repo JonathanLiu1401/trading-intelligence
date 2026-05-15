@@ -392,12 +392,15 @@ function connectWS(){
   };
 }
 
+// Derive API prefix so calls work both directly (:8765) and through proxy (/ops/)
+const API_PREFIX = location.pathname.startsWith("/ops") ? "/ops" : "";
+
 // Initial HTTP load (in case WS is slow)
 async function bootHttp(){
-  try{ applyStats(await (await fetch("/api/stats")).json()); }catch(e){}
-  try{ renderArticles(await (await fetch("/api/articles?limit=80")).json()); }catch(e){}
-  try{ renderHealth(await (await fetch("/api/health")).json()); }catch(e){}
-  try{ renderChart(await (await fetch("/api/articles_per_hour")).json()); }catch(e){}
+  try{ applyStats(await (await fetch(API_PREFIX + "/api/stats")).json()); }catch(e){}
+  try{ renderArticles(await (await fetch(API_PREFIX + "/api/articles?limit=80")).json()); }catch(e){}
+  try{ renderHealth(await (await fetch(API_PREFIX + "/api/health")).json()); }catch(e){}
+  try{ renderChart(await (await fetch(API_PREFIX + "/api/articles_per_hour")).json()); }catch(e){}
 }
 bootHttp();
 connectWS();
