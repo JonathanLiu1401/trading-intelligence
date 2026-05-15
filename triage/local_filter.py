@@ -1,8 +1,8 @@
 """Triage filter — heuristic pre-filter then Claude Sonnet 4.6 batch re-ranking."""
 import json
-import re
 
 from core.claude_cli import claude_call
+from core.json_extract import extract_json_array
 from triage.heuristic_scorer import score_article, score_and_rank
 
 KEYWORD_CANDIDATES = 200   # articles passed to Claude after heuristic pre-filter
@@ -49,13 +49,16 @@ def _claude_batch_score(candidates: list) -> list:
             print("[local_filter] Sonnet unavailable — using heuristic scores only")
             return candidates
 
-        m = re.search(r"\[.*\]", raw, re.DOTALL)
-        if not m:
+        scores = extract_json_array(raw)
+        if scores is None:
             print("[local_filter] Could not parse Sonnet response — using heuristic scores")
             return candidates
 
-        scores = json.loads(m.group(0))
-        score_map = {item["index"]: item["score"] for item in scores if "index" in item and "score" in item}
+        score_map = {
+            item["index"]: item["score"]
+            for item in scores
+            if isinstance(item, dict) and "index" in item and "score" in item
+        }
 
         for i, art in enumerate(candidates):
             sonnet_score = score_map.get(i)

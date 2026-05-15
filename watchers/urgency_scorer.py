@@ -6,6 +6,7 @@ import json
 import logging
 
 from core.claude_cli import claude_call
+from core.json_extract import extract_json_array
 
 try:
     from core.logger import get_logger
@@ -43,23 +44,6 @@ Articles:
 Respond ONLY with a JSON array: [{{"index": 0, "score": 9, "reason": "MU earnings beat"}}, ...]"""
 
 
-def _extract_json_array(raw: str):
-    """Robustly extract a top-level JSON array from a Sonnet response that may
-    be wrapped in prose. Tries json.JSONDecoder().raw_decode at each '[' until
-    one parses successfully. Returns the parsed list, or None on failure."""
-    decoder = json.JSONDecoder()
-    start = raw.find("[")
-    while start != -1:
-        try:
-            value, _ = decoder.raw_decode(raw[start:])
-            if isinstance(value, list):
-                return value
-        except ValueError:
-            pass
-        start = raw.find("[", start + 1)
-    return None
-
-
 def score_batch(articles: list, store) -> int:
     """Score a batch of articles; update store. Returns count of urgent items found."""
     if not articles:
@@ -77,7 +61,7 @@ def score_batch(articles: list, store) -> int:
         if raw is None:
             return 0
 
-        scores = _extract_json_array(raw)
+        scores = extract_json_array(raw)
         if scores is None:
             _log.warning(f"[urgency] Failed to parse JSON array from response: {raw[:200]!r}")
             return 0
