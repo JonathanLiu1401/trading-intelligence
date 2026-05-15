@@ -12,3 +12,14 @@ logs/*.log
 logs/*.jsonl
 .venv/
 venv/
+
+# Runtime state — regenerated each run, must not pollute git history
+data/*_cursor.json
+data/daemon.lock
+data/portfolio_pl.json
+data/sentiment_trends.json
+data/training_data.json.gz
+data/active_learning_queue.jsonl
+data/*.db-journal
+data/ml/training_metrics.jsonl
+logs/supervisor_state.json
