@@ -267,13 +267,23 @@ def _notify_state_transition(name: str, old: str, new: str, count: int) -> None:
 
 
 def _compute_respawn_delay(name: str, now: float) -> float:
-    """How long the supervisor should wait before respawning ``name``."""
-    disabled_until = _worker_disabled_until.get(name, 0.0)
+    """How long the supervisor should wait before respawning ``name``.
+
+    Read the three supervisor maps under ``_supervisor_lock`` so we never
+    observe a torn state (e.g., ``_worker_state`` updated to 'disabled' but
+    ``_worker_disabled_until`` not yet written by the concurrent
+    ``_record_crash`` call). The lock is held by ``_record_crash`` for the
+    duration of its updates; reading without it can race.
+    """
+    with _supervisor_lock:
+        disabled_until = _worker_disabled_until.get(name, 0.0)
+        last_exc = _worker_last_exception.get(name)
+        state = _worker_state.get(name)
     if disabled_until > now:
         return disabled_until - now
-    if _worker_last_exception.get(name) == "MemoryError":
+    if last_exc == "MemoryError":
         return OOM_BACKOFF_SECS
-    if _worker_state.get(name) == "degraded":
+    if state == "degraded":
         return DEGRADED_BACKOFF_SECS
     return 1.0  # tiny pause so we don't hot-loop on a flapping worker
 
@@ -957,10 +967,17 @@ def scorer_worker(store: ArticleStore):
             scores = score_articles(unscored)
             batch = []
             llm_candidates = []
+            ts_updates = []
             for art, sc in zip(unscored, scores):
                 aid = art.get("_id")
                 if not aid:
                     continue
+                # Persist time_sensitivity for every article the model
+                # produced a real prediction for. rel_std==99 is the
+                # sentinel score_articles returns when the model isn't
+                # fitted; skip those so we don't pollute the column.
+                if sc.rel_std < 99:
+                    ts_updates.append((aid, sc.time_sensitivity))
                 ml_score = max(sc.relevance, sc.urgency)
                 # LLM zone — only Sonnet for narrow uncertain band on ML score
                 if 3.8 <= ml_score <= 4.3 and not sc.needs_llm:
@@ -974,12 +991,20 @@ def scorer_worker(store: ArticleStore):
                 final = max(sc.relevance, sc.urgency, 0.01)
                 batch.append((aid, final, is_urgent))
             if batch:
-                store.update_ai_scores_batch(batch)
+                # Model predictions go to ml_score (NOT ai_score). Writing them
+                # to ai_score with score_source='llm' would re-feed the model's
+                # own outputs into the trainer's ground-truth pool — the exact
+                # label-feedback loop the recent fix was meant to break.
+                # See storage/article_store.py::score_pending for the canonical
+                # ML-vs-LLM separation; this worker has to match it.
+                store.update_ml_scores_batch(batch)
+            if ts_updates:
+                store.update_time_sensitivity_batch(ts_updates)
             llm_used = 0
             if llm_candidates:
                 llm_used = score_batch(llm_candidates, store)
             with _store_lock:
-                remaining = len(store.get_unscored(limit=10000, min_kw=0.0))
+                remaining = store.count_unscored(min_kw=0.0)
             log.info(f"[scorer] batch={len(unscored)} scored={len(batch)} llm_used={llm_used} remaining={remaining}")
             _worker_last_ok["scorer"] = time.time()
             # Don't sleep if work remains
@@ -1143,7 +1168,13 @@ def alert_worker(store: ArticleStore):
 
 # ── Worker W8: Heartbeat briefing every 5h ──────────────────────────────────
 def _extract_briefing_labels(briefing_text: str, articles: list) -> list[dict]:
-    """Parse Opus briefing to extract article-level quality labels."""
+    """Parse Opus briefing to extract article-level quality labels.
+
+    Returns one entry per source article with ``in_briefing=True`` when the
+    title prefix appears in the briefing prose. The 12-char minimum on the
+    prefix prevents short generic titles ("Stocks", "Markets") from
+    false-matching — it mirrors trainer._fetch_briefing_samples.
+    """
     labels = []
     bt_lower = briefing_text.lower()
     for art in articles:
@@ -1152,13 +1183,11 @@ def _extract_briefing_labels(briefing_text: str, articles: list) -> list[dict]:
         if not url:
             continue  # synthetic entries (P&L, options snapshot) have no url
         prefix = title[:40].lower()
-        score_boost = 0.5 if prefix and prefix in bt_lower else 0.0
-        existing_score = art.get("ai_score") or 0.0
+        in_briefing = len(prefix) >= 12 and prefix in bt_lower
         labels.append({
             "url": url,
             "title": title,
-            "opus_label": min(5.0, existing_score + score_boost),
-            "in_briefing": score_boost > 0,
+            "in_briefing": in_briefing,
         })
     return labels
 
@@ -1203,12 +1232,25 @@ def heartbeat_worker(store: ArticleStore):
                              "summary": opts_blk, "ai_score": 10}] + top
 
                 briefing = analyze(top, stocks, earnings)
+                # analyze() returns the placeholder string "[analyst] No
+                # response from Claude." when claude_call yields nothing.
+                # Posting that to Discord (and saving it as a briefing the
+                # trainer will later scan) is pure noise — treat it like the
+                # exception path and retry in 5min.
+                if not briefing or briefing.startswith("[analyst]"):
+                    log.warning("[heartbeat] empty/placeholder briefing — skipping post; retry in 5min")
+                    last = time.time() - HEARTBEAT_INTERVAL + 300
+                    _sleep(30)
+                    continue
+
                 health_line = _build_health_line(store)
                 message = briefing.rstrip() + "\n\n" + health_line
                 ok = discord_send(message)
                 log.info(f"[heartbeat] {'sent' if ok else 'FAILED'} ({len(message)} chars)")
 
                 # Feed the briefing into the ML training pipeline as labeled data.
+                # Always run — the briefing is valid training signal even when
+                # the Discord webhook is down (the labels feed ArticleNet, not Discord).
                 try:
                     labels = _extract_briefing_labels(briefing, source_articles)
                     boosted = store.update_scores_from_labels(labels)
@@ -1220,7 +1262,12 @@ def heartbeat_worker(store: ArticleStore):
                 except Exception as le:
                     log.warning(f"[heartbeat] label extraction failed: {le}")
 
-                last = time.time()
+                if ok:
+                    last = time.time()
+                else:
+                    # Discord delivery failed — don't skip the next 5h. Mirror the
+                    # exception path so we retry in ~5min once the webhook is back.
+                    last = time.time() - HEARTBEAT_INTERVAL + 300
             except Exception as e:
                 log.error(f"[heartbeat] error: {e}")
                 last = time.time() - HEARTBEAT_INTERVAL + 300  # retry in 5min
@@ -1280,8 +1327,10 @@ def stats_worker(store: ArticleStore):
                 last_sig = sig
                 last_emit = now
             _worker_last_ok["stats"] = now
-        except Exception:
-            pass
+        except Exception as e:
+            # Don't blanket-swallow — a stats query failure is usually a DB
+            # lock or schema issue worth seeing, even if non-fatal.
+            log.debug(f"[stats_worker] error: {e}")
 
 
 def _sleep(seconds: float):
@@ -1354,6 +1403,11 @@ def _acquire_singleton_lock():
             log.error(f"[daemon] Blocking flock failed: {e}; exiting.")
             sys.exit(1)
         log.info(f"[daemon] Previous holder pid={holder} exited; this instance is now primary.")
+    # Seek to 0 before truncate+write: the diagnostic read above advances the
+    # fd offset, and os.ftruncate does not reset it. Without this seek, the
+    # subsequent write lands past the truncated end, leaving leading NUL bytes
+    # that corrupt the pid string future instances read for diagnostics.
+    os.lseek(fd, 0, os.SEEK_SET)
     os.ftruncate(fd, 0)
     os.write(fd, str(os.getpid()).encode())
     # Keep fd open for the process lifetime; the kernel releases the flock
@@ -1423,6 +1477,8 @@ def main():
     # backoff, Discord alerts on state transitions only, periodic health
     # report writes to structured.jsonl + supervisor_state.json snapshot.
     last_health_report = 0.0
+    last_recovery_sweep = 0.0
+    RECOVERY_SWEEP_SECS = 60  # how often to age out stale degraded states
     while _running:
         time.sleep(5)
         if not _running:
@@ -1431,6 +1487,27 @@ def main():
             # at ERROR pollutes the error count for hourly audits.
             break
         now = time.time()
+
+        # Recovery sweep: a worker that crashes its way into "degraded" then
+        # stops crashing has no path back to "ok" — _record_crash only fires
+        # on new crashes. Without this sweep, the dashboard shows degraded
+        # forever. Once the rolling crash window has elapsed with zero new
+        # crashes AND the thread is currently alive, transition back to ok.
+        if now - last_recovery_sweep >= RECOVERY_SWEEP_SECS:
+            for t in threads:
+                if not t.is_alive():
+                    continue
+                name = t.name
+                with _supervisor_lock:
+                    state = _worker_state.get(name, "ok")
+                    crashes = _worker_crashes.get(name, [])
+                    recent = [x for x in crashes if now - x < CRASH_WINDOW_SECS]
+                if state == "degraded" and not recent:
+                    with _supervisor_lock:
+                        _worker_state[name] = "ok"
+                        _worker_crashes[name] = []
+                    _notify_state_transition(name, "degraded", "ok", 0)
+            last_recovery_sweep = now
         for i, t in enumerate(threads):
             name = t.name
             if t.is_alive():
