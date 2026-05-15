@@ -581,18 +581,26 @@ class ArticleStore:
         chars) so the alert LLM can ground its CONTEXT line on real article
         content instead of inventing background from the headline alone.
         """
+        cutoff_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         cur = self.conn.execute(
             "SELECT id, url, title, source, "
-            "COALESCE(NULLIF(ai_score, 0), ml_score, 0) AS score, full_text "
+            "COALESCE(NULLIF(ai_score, 0), ml_score, 0) AS score, full_text, "
+            "first_seen, published "
             "FROM articles "
             f"WHERE urgency=1 AND {_LIVE_ONLY_CLAUSE} "
+            # Primary SQL guard: only articles first collected in the last 24h.
+            # This is a fast indexed filter; the alerter re-checks published date
+            # in Python for articles whose RSS date predates first_seen.
+            "AND first_seen >= ? "
             "ORDER BY score DESC LIMIT ?",
-            (limit,),
+            (cutoff_24h, limit),
         )
         rows = cur.fetchall()
         return [{"_id": r[0], "link": r[1], "title": r[2], "source": r[3],
                  "ai_score": r[4],
-                 "summary": (decompress(r[5])[:600] if r[5] else "")}
+                 "summary": (decompress(r[5])[:600] if r[5] else ""),
+                 "first_seen": r[6],
+                 "published": r[7]}
                 for r in rows]
 
     def get_top_for_briefing(self, hours: int = 5, limit: int = 50) -> list:

@@ -3,7 +3,8 @@ Urgent alert agent — Bloomberg BN newswire style, immediate Discord post.
 """
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 from core.claude_cli import claude_call
 from watchers.alert_dedup import alerted_ids, dedupe_urgent
@@ -50,6 +51,36 @@ Output ONLY the alert message."""
 ALERT_BATCH_SIZE = 5
 
 
+def _article_age_ok(art: dict) -> bool:
+    """Return True if the article is less than 24 hours old."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    for field in ("published", "first_seen"):
+        raw = (art.get(field) or "").strip()
+        if not raw:
+            continue
+        try:
+            # Try RFC 2822 (RSS/Atom)
+            dt = parsedate_to_datetime(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt >= cutoff
+        except Exception:
+            pass
+        try:
+            # Try ISO 8601
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt >= cutoff
+        except Exception:
+            pass
+    # No parseable date in either field — block rather than risk stale alert.
+    # Articles without any date were already pre-filtered by first_seen >= 24h
+    # in get_unalerted_urgent, so reaching here means both fields are corrupt.
+    _log.warning("[alert] article has no parseable date — dropping to be safe")
+    return False
+
+
 def _is_synthetic(art: dict) -> bool:
     """True for backtest/opus-annotation rows that must never reach the live
     Bloomberg formatter. Mirrors storage.article_store._LIVE_ONLY_CLAUSE.
@@ -85,6 +116,16 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         )
     if not filtered:
         return False
+
+    # Drop articles older than 24 hours — stale news must not fire as breaking.
+    fresh = [a for a in filtered if _article_age_ok(a)]
+    n_stale = len(filtered) - len(fresh)
+    if n_stale:
+        _log.info(f"[alert] dropped {n_stale} stale article(s) (>24h old)")
+    if not fresh:
+        _log.info("[alert] all urgent articles are stale — skipping alert")
+        return False
+    filtered = fresh
 
     # Collapse syndicated duplicates first: one breaking story carried by GDELT
     # + Reuters + Yahoo + RSS would otherwise eat the whole 5-slot batch and
