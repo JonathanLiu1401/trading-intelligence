@@ -23,3 +23,4 @@ data/active_learning_queue.jsonl
 data/*.db-journal
 data/ml/training_metrics.jsonl
 logs/supervisor_state.json
+data/earnings_calendar.json
