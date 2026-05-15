@@ -54,9 +54,15 @@ ERRORS=${ERRORS:-0}
 
 # ── 3. DB stats ──────────────────────────────────────────────────────────────
 # Prefer structured JSON log (current), fall back to legacy plaintext daemon.log
-STATS_LINE=$(grep '\[stats\]' "$STRUCT_LOG" 2>/dev/null | tail -1 || echo "")
+# `-a` forces text mode: structured.jsonl can contain stray NUL bytes (from
+# raw RSS/article payloads logged at DEBUG), which makes grep silently
+# truncate to matches BEFORE the NUL — the symptom was healthcheck.log
+# frozen at a stats snapshot from when the first NUL appeared.
+# Also filter out worker_alive heartbeat lines ("[stats] alive ...") so we
+# only land on a real stats line ("[stats] total=... urgent=... unscored=...").
+STATS_LINE=$(grep -a '"\[stats\] total=' "$STRUCT_LOG" 2>/dev/null | tail -1 || echo "")
 if [[ -z "$STATS_LINE" ]]; then
-    STATS_LINE=$(grep "\[stats\]" "$PLAIN_LOG" 2>/dev/null | tail -1 || echo "")
+    STATS_LINE=$(grep -a '\[stats\] total=' "$PLAIN_LOG" 2>/dev/null | tail -1 || echo "")
 fi
 TOTAL=$(echo   "$STATS_LINE" | grep -oP 'total=\K[0-9]+'   2>/dev/null || echo "?")
 UNSCORED=$(echo "$STATS_LINE" | grep -oP 'unscored=\K[0-9]+' 2>/dev/null || echo "?")
@@ -65,7 +71,7 @@ URGENT=$(echo  "$STATS_LINE" | grep -oP 'urgent=\K[0-9]+'   2>/dev/null || echo 
 # ── 4. Heartbeat watchdog ────────────────────────────────────────────────────
 HB_AGE_H="?"
 if [[ -f "$STRUCT_LOG" ]]; then
-    LAST_HB_TS=$(grep -F '[heartbeat] sent' "$STRUCT_LOG" 2>/dev/null | tail -1 \
+    LAST_HB_TS=$(grep -aF '[heartbeat] sent' "$STRUCT_LOG" 2>/dev/null | tail -1 \
                  | python3 -c "import sys,json; r=json.loads(sys.stdin.read().strip() or '{}'); print(r.get('ts',''))" 2>/dev/null || echo "")
     if [[ -n "$LAST_HB_TS" ]]; then
         HB_AGE_H=$(python3 -c "
