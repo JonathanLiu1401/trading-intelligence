@@ -311,13 +311,106 @@ def _fetch_training_data(
     return texts, articles, y_rel, y_urg, source
 
 
+_DATASET_CACHE = _ML_DIR / "dataset_cache.npz"
+_DATASET_META  = _ML_DIR / "dataset_cache_meta.json"
+# Rebuild feature cache when labeled count drifts >5% from the cached value.
+_CACHE_DRIFT_THRESHOLD = 0.05
+
+
+def _load_dataset_cache(n_labeled: int) -> dict | None:
+    """Return cached {X, y_rel, y_urg, y_time, source, n} if still fresh, else None."""
+    if not _DATASET_CACHE.exists() or not _DATASET_META.exists():
+        return None
+    try:
+        meta = json.loads(_DATASET_META.read_text())
+        cached_n = meta.get("n_labeled", 0)
+        drift = abs(n_labeled - cached_n) / max(cached_n, 1)
+        if drift > _CACHE_DRIFT_THRESHOLD:
+            return None  # dataset has grown/shrunk enough to warrant a rebuild
+        arrays = np.load(str(_DATASET_CACHE), allow_pickle=False)
+        return {
+            "X": arrays["X"],
+            "y_rel": arrays["y_rel"],
+            "y_urg": arrays["y_urg"],
+            "y_time": arrays["y_time"],
+            "source": meta.get("source", "cached"),
+            "n": int(meta.get("n", 0)),
+        }
+    except Exception as e:
+        print(f"[ml:trainer] cache load failed ({e}), rebuilding")
+        return None
+
+
+def _save_dataset_cache(X: np.ndarray, y_rel: np.ndarray, y_urg: np.ndarray,
+                         y_time: np.ndarray, source: str, n_labeled: int, n: int) -> None:
+    """Persist feature matrix and labels to disk so the next training cycle
+    avoids re-decompressing 20k articles and re-running TF-IDF."""
+    _ML_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        np.savez_compressed(
+            str(_DATASET_CACHE),
+            X=X.astype(np.float32),
+            y_rel=y_rel.astype(np.float32),
+            y_urg=y_urg.astype(np.float32),
+            y_time=y_time.astype(np.float32),
+        )
+        _DATASET_META.write_text(json.dumps({
+            "n_labeled": n_labeled,
+            "source": source,
+            "n": n,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }))
+        size_mb = _DATASET_CACHE.stat().st_size / 1e6
+        print(f"[ml:trainer] dataset cached to disk ({size_mb:.1f} MB, n={n})")
+    except Exception as e:
+        print(f"[ml:trainer] cache save failed: {e}")
+
+
 def train(store, force: bool = False) -> dict:
     """Train/retrain ArticleNet on available labeled data. Returns metrics dict."""
     t0 = time.time()
-    texts, articles, y_rel, y_urg, source = _fetch_training_data(store)
 
-    if len(texts) < 30:
-        return {"status": "skipped", "reason": "too_few_samples", "n": len(texts)}
+    # Count current labeled articles to decide whether to use disk cache.
+    try:
+        n_labeled = store.conn.execute(
+            "SELECT COUNT(*) FROM articles WHERE ai_score > 0 "
+            "AND score_source IN ('llm','briefing_boost')"
+        ).fetchone()[0]
+    except Exception:
+        n_labeled = 0
+
+    cached = None if force else _load_dataset_cache(n_labeled)
+    if cached:
+        X      = cached["X"]
+        y_rel  = cached["y_rel"]
+        y_urg  = cached["y_urg"]
+        y_time = cached["y_time"]
+        source = cached["source"]
+        n      = cached["n"]
+        print(f"[ml:trainer] loaded dataset from disk cache (n={n}, n_labeled≈{n_labeled})")
+    else:
+        texts, articles, y_rel, y_urg, source = _fetch_training_data(store)
+        n = len(texts)
+
+        if n < 30:
+            return {"status": "skipped", "reason": "too_few_samples", "n": n}
+
+        emb = get_embedder()
+        if emb.should_refit(n):
+            X_text = emb.fit_transform(texts)
+        else:
+            X_text = emb.transform(texts)
+
+        X_extra = extract_features_batch(articles)
+        X = np.concatenate([X_text, X_extra], axis=1).astype(np.float32)
+        y_time = _time_sensitivity_batch(articles)
+
+        # Persist to disk immediately — free the raw text lists from RAM.
+        _save_dataset_cache(X, y_rel, y_urg, y_time, source, n_labeled, n)
+        del texts, articles, X_text, X_extra  # release before GPU training
+
+    if len(y_rel) < 30:
+        return {"status": "skipped", "reason": "too_few_samples", "n": len(y_rel)}
 
     # Label-variance sanity check — if std is near zero, the model literally
     # cannot beat predicting the mean. Surface this in the log so flat val_loss
