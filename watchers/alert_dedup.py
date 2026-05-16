@@ -27,20 +27,40 @@ _WORD = re.compile(r"[a-z0-9]+")
 _SOURCE_SEP = re.compile(r"\s+[-|–—]\s+")
 # Trailing attribution parenthetical: "Nvidia beats (Reuters)".
 _TRAIL_PAREN = re.compile(r"\s*\([^()]*\)\s*$")
+# Leading wire-service editorial markers. Reuters/AP/AFP republish the same
+# story as "UPDATE 2-...", "RPT-...", "EXCLUSIVE-...", "WRAPUP 1-...",
+# "BREAKING: ..." etc., and the markers stack ("RPT-UPDATE 2-..."). Without
+# stripping them the 8-token window starts on the marker, so a revision
+# ("UPDATE 3-") and the bare headline get different signatures and the most
+# heavily reposted wire stories — exactly what this module exists to collapse —
+# dedup the least. Anchored, whitelisted, and repeated so only known prefixes
+# are consumed (a real all-caps headline word is never eaten).
+_WIRE_PREFIX = re.compile(
+    r"^\s*(?:"
+    r"(?:UPDATE|WRAPUP|WRAP|RECAST|REFILE|RPT|CORRECTED|EXCLUSIVE|TABLE|"
+    r"FACTBOX|TIMELINE|ANALYSIS|INSTANT\ VIEW|PRESS\ DIGEST|BREAKINGVIEWS|"
+    r"BUZZ|GRAPHIC|POLL|SCENARIOS|EXPLAINER|HIGHLIGHTS|NEWSMAKER|COLUMN|"
+    r"BREAKING|DEVELOPING|JUST\ IN|LIVE|WATCH|ALERT)"
+    r"\s*\d*\s*[-:]\s*"
+    r")+",
+    re.IGNORECASE,
+)
 
 
 def _signature(title: str | None) -> str:
     """Lowercased first-N-alphanumeric-token signature of a headline.
 
-    Trailing source attribution is stripped first — "...blowout - Reuters" and
-    "...blowout (Bloomberg)" must reduce to the same key as the bare headline,
-    or the most heavily syndicated stories (the ones with the most attributed
-    reposts) would dedup the least. Verbatim reposts then collide outright;
-    minor suffix variants collide once attribution is gone.
+    Leading wire-service editorial markers ("UPDATE 2-", "RPT-", "BREAKING:")
+    and trailing source attribution ("...blowout - Reuters", "(Bloomberg)")
+    are both stripped first — otherwise the most heavily syndicated stories
+    (the ones with the most revisions and attributed reposts) would dedup the
+    least. Once markers and attribution are gone, verbatim reposts collide
+    outright and minor suffix/revision variants collide too.
     """
     if not title:
         return ""
-    head = _SOURCE_SEP.split(title.strip())[0]
+    head = _WIRE_PREFIX.sub("", title.strip())
+    head = _SOURCE_SEP.split(head)[0]
     head = _TRAIL_PAREN.sub("", head)
     return " ".join(_WORD.findall(head.lower())[:_DEDUP_TOKENS])
 
@@ -112,6 +132,9 @@ if __name__ == "__main__":  # smoke test
         {"_id": "a", "title": "Micron shares surge after Q3 earnings blowout", "ai_score": 7.0},
         {"_id": "b", "title": "Micron shares surge after Q3 earnings blowout", "ai_score": 8.5},
         {"_id": "c", "title": "Micron shares surge after Q3 earnings blowout - Reuters", "ai_score": 6.0},
+        # Wire revisions/markers of the same story must collapse into it too.
+        {"_id": "f", "title": "UPDATE 2-Micron shares surge after Q3 earnings blowout", "ai_score": 4.0},
+        {"_id": "g", "title": "RPT-UPDATE 3-Micron shares surge after Q3 earnings blowout (Reuters)", "ai_score": 3.0},
         {"_id": "d", "title": "Fed holds rates steady amid inflation concerns", "ai_score": 9.0},
         {"_id": "e", "title": None, "ai_score": 5.0},
     ]
@@ -120,9 +143,9 @@ if __name__ == "__main__":  # smoke test
         print(f"{a['_id']}  score={a['ai_score']}  dup_count={a['dup_count']}  dups={a['_dup_ids']}")
     print("alerted_ids(all):", alerted_ids(out))
     assert len(out) == 3, out
-    assert out[0]["_id"] == "b" and out[0]["dup_count"] == 3, out[0]
-    assert sorted(out[0]["_dup_ids"]) == ["a", "c"], out[0]
-    assert sorted(alerted_ids(out)) == ["a", "b", "c", "d", "e"]
+    assert out[0]["_id"] == "b" and out[0]["dup_count"] == 5, out[0]
+    assert sorted(out[0]["_dup_ids"]) == ["a", "c", "f", "g"], out[0]
+    assert sorted(alerted_ids(out)) == ["a", "b", "c", "d", "e", "f", "g"]
     # Marking only the batch's collapsed ids — a queued story's dups stay urgent.
-    assert sorted(alerted_ids(out[:1])) == ["a", "b", "c"]
+    assert sorted(alerted_ids(out[:1])) == ["a", "b", "c", "f", "g"]
     print("OK")
