@@ -114,6 +114,14 @@ def score_articles(articles: list[dict]) -> list[ArticleScore]:
         tsens = float(np.clip(tsens_mean[i], 0.0, 1.0))
 
         confident_noise = (rel < LLM_ZONE_CLEAR_NOISE and r_std < UNCERTAINTY_REL)
+        # Grey-zone routing keys on the URGENCY head (sigmoid prob scaled to
+        # 0..10), NOT relevance. The LLM on this path does urgent/not-urgent
+        # disambiguation, and LLM_ZONE_MID_LO..HI (7.0, 8.5) straddles the 8.0
+        # urgent threshold, so an urgency estimate near that boundary is exactly
+        # what we escalate. CLAUDE.md's glossary / ml/model.py's docstring say
+        # "relevance" — that wording is imprecise; the code is the spec.
+        # Repointing this at `rel` silently changes which articles burn a Sonnet
+        # call. Pinned by tests/test_inference_grey_zone.py.
         in_grey   = LLM_ZONE_MID_LO <= urg <= LLM_ZONE_MID_HI
         uncertain = r_std > UNCERTAINTY_REL or u_std > UNCERTAINTY_URG
         needs_llm = (in_grey or uncertain) and not confident_noise
