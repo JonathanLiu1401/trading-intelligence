@@ -13,7 +13,7 @@ import json
 import sqlite3
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import feedparser
@@ -88,7 +88,7 @@ def _mark_seen(conn, aid: str, link: str, title: str, source: str):
     conn.execute(
         "INSERT OR IGNORE INTO seen_articles (id, link, title, source, first_seen) "
         "VALUES (?, ?, ?, ?, ?)",
-        (aid, link, title, source, datetime.utcnow().isoformat()),
+        (aid, link, title, source, datetime.now(timezone.utc).isoformat()),
     )
 
 
@@ -210,8 +210,8 @@ def collect_sec_edgar_fulltext() -> list:
     if not tickers:
         return []
 
-    until = datetime.utcnow().date().isoformat()
-    since = (datetime.utcnow().date() - timedelta(days=EFTS_DAYS_BACK)).isoformat()
+    until = datetime.now(timezone.utc).date().isoformat()
+    since = (datetime.now(timezone.utc).date() - timedelta(days=EFTS_DAYS_BACK)).isoformat()
 
     conn = _ensure_db()
     new_articles: list = []

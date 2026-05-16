@@ -12,7 +12,7 @@ import json
 import os
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -199,7 +199,7 @@ def collect_alphavantage(batch: int = BATCH_PER_PASS) -> list:
             conn.execute(
                 "INSERT OR IGNORE INTO seen_articles (id, link, title, source, first_seen) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (aid, art["link"], art["title"], "AlphaVantage", datetime.utcnow().isoformat()),
+                (aid, art["link"], art["title"], "AlphaVantage", datetime.now(timezone.utc).isoformat()),
             )
 
     state["index"] = idx

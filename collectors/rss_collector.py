@@ -5,7 +5,7 @@ import sqlite3
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 import feedparser
 import requests
@@ -125,7 +125,7 @@ def collect_rss():
             conn.execute(
                 "INSERT OR IGNORE INTO seen_articles "
                 "(id, link, title, source, first_seen) VALUES (?, ?, ?, ?, ?)",
-                (aid, link, title, art["source"], datetime.utcnow().isoformat()),
+                (aid, link, title, art["source"], datetime.now(timezone.utc).isoformat()),
             )
 
     conn.commit()

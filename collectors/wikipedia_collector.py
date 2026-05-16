@@ -9,7 +9,7 @@ import hashlib
 import json
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -182,7 +182,7 @@ def collect_wikipedia() -> list:
         conn.execute(
             "INSERT OR IGNORE INTO seen_articles (id, link, title, source, first_seen) "
             "VALUES (?, ?, ?, ?, ?)",
-            (aid, dedup_key, title, "Wikipedia", datetime.utcnow().isoformat()),
+            (aid, dedup_key, title, "Wikipedia", datetime.now(timezone.utc).isoformat()),
         )
 
     conn.commit()

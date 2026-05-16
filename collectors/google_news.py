@@ -10,7 +10,7 @@ import json
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -116,7 +116,7 @@ def _mark_seen(conn, aid: str, link: str, title: str, source: str):
     conn.execute(
         "INSERT OR IGNORE INTO seen_articles (id, link, title, source, first_seen) "
         "VALUES (?, ?, ?, ?, ?)",
-        (aid, link, title, source, datetime.utcnow().isoformat()),
+        (aid, link, title, source, datetime.now(timezone.utc).isoformat()),
     )
 
 

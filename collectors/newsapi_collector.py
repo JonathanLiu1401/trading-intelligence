@@ -225,7 +225,7 @@ def collect_newsapi(batch: int = BATCH_PER_PASS) -> list:
             conn.execute(
                 "INSERT OR IGNORE INTO seen_articles (id, link, title, source, first_seen) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (aid, art["link"], art["title"], "NewsAPI", datetime.utcnow().isoformat()),
+                (aid, art["link"], art["title"], "NewsAPI", datetime.now(timezone.utc).isoformat()),
             )
 
     state["index"] = idx
