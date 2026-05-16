@@ -117,7 +117,18 @@ def _apply_labels(store, articles: list[dict], labels: list[dict]) -> int:
         except (TypeError, ValueError):
             continue
         relevance = max(0.0, min(10.0, relevance))
-        urgency = 1 if int(label.get("urgency", 0) or 0) >= 1 else 0
+        # Parse urgency defensively. Claude does not reliably return a bare
+        # int here (observed: "1", "1.0", "yes", true). An unguarded int()
+        # raised ValueError that escaped _apply_labels → _run_round →
+        # run_recursive_labeling (no inner handler on that path), aborting the
+        # rest of the 4h labeling cycle AND discarding this batch's
+        # already-collected good labels (the exception fires before
+        # update_ai_scores_batch). Mirror the relevance guard: a junk urgency
+        # degrades to 0, it never aborts and never loses the relevance label.
+        try:
+            urgency = 1 if int(float(label.get("urgency", 0) or 0)) >= 1 else 0
+        except (TypeError, ValueError):
+            urgency = 0
         updates.append((aid, relevance, urgency))
 
     if updates:
