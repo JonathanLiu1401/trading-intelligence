@@ -228,6 +228,16 @@ Suites:
   call (no wasted quota, no POST to an empty URL); that the happy path marks
   exactly the alerted id `urgency=2` (cannot re-fire); and that a failed
   Discord POST leaves the row `urgency=1` (re-queued, never silently lost).
+- `test_backoff.py` — `core/backoff.Backoff`, the retry throttle every collector
+  worker in `daemon.py` (~20 call sites) shares. First real suite (was inline
+  `__main__`-only). Pins the *actual* contract, not the prose: `peek()` is
+  non-mutating; the exponent is clamped at 32 so a permanently-failing worker
+  can't `OverflowError` on `2 ** failures`; jitter is applied **after** the cap
+  by design (anti-thundering-herd), so the realized sleep is
+  `min(cap, base*2**failures)*(1 ± jitter)` and may sit slightly *above* `cap` —
+  this is intentional, do not "fix" the code to make `cap` a hard ceiling; the
+  0.5s floor; and `sleep(should_continue)` polling out early on shutdown. The
+  module docstring was tightened to state this explicitly (code is the spec).
 
 ---
 

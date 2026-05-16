@@ -12,9 +12,13 @@ Usage::
             bo.sleep(running_check)
         time.sleep(normal_interval)
 
-After every failure ``sleep()`` waits ``base * 2**failures``, capped at ``cap``,
-and increments ``failures``. ``reset()`` zeroes the counter — the worker should
-call it after a successful pass.
+After every failure ``sleep()`` waits ``base * 2**failures`` (the *base* delay,
+capped at ``cap``), then applies jitter and increments ``failures``. Jitter is
+applied *after* the cap on purpose — it de-correlates a herd of workers that all
+failed at once — so the realized sleep is ``min(cap, base*2**failures) * (1 ±
+jitter)`` and can sit slightly *above* ``cap`` by the jitter fraction. ``cap``
+bounds the base delay, not the jittered one. ``reset()`` zeroes the counter —
+the worker should call it after a successful pass.
 """
 from __future__ import annotations
 
