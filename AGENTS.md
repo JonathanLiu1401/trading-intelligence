@@ -178,6 +178,16 @@ Suites:
 - `test_trainer.py` — `score_source='ml'` exclusion, synthetic-row inclusion, sample weighting,
   and `TestTrainOrchestration` — regression guard that `train()` runs end-to-end on both the
   fresh and disk-cache paths (see ML training pipeline note below).
+- `test_briefing_boost.py` — `ArticleStore.update_scores_from_labels`, the sole writer of
+  `score_source='briefing_boost'` (5h Opus heartbeat → strong training label). Pins the
+  `MAX(ai_score, 4.5)` formula (never downgrades a stronger LLM label, never under-labels an
+  unscored mention at 0.3), the `score_source` CASE (an `'llm'` row stays `'llm'`; a `None`/`'ml'`
+  row becomes `'briefing_boost'`), and backtest isolation on this write path. The
+  `test_model_scored_row_promoted_off_ml_into_training_pool` case specifically guards the
+  `'ml' → 'briefing_boost'` promotion: the trainer's strong pool excludes `'ml'`, so if the CASE
+  ever regressed to preserving any non-NULL source an Opus-curated model row would silently never
+  train. Every other case here uses `score_source` of `None`/`'llm'`; this is the only `'ml'`
+  exercise.
 - `test_integration_pipeline.py` — cross-module flows (ingest→score→alert, end-to-end backtest
   isolation, concurrent-writer safety).
 - `test_retrain_guard.py` — `core/retrain_guard.py` escalation policy: fires exactly at the
