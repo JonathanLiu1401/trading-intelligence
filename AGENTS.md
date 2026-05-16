@@ -86,6 +86,31 @@ use `MAX(urgency, ?)` so a fresh Sonnet rescore can never regress an alerted art
 (which would re-fire the alert). Tested in `TestAlertedMarking::test_subsequent_llm_rescore_does_not_un_alert`
 and `TestPreservesAlerted::test_rescore_does_not_unalert`.
 
+### 4. Train/serve feature parity (article age must reach the live path)
+`ArticleStore.get_unscored` MUST return `published` and `first_seen`, not just
+`id/title/source/summary`. Two live consumers derive article age from those fields and
+silently degrade if they are absent:
+
+- `ml/features.py::extract_features` builds 5 temporal features (hour/dow cyclic
+  encodings + `days_since_published`) from `published`. The trainer
+  (`_fetch_training_data`) passes the real value; if inference omits it the parser
+  falls back to `now()` and those 5 features collapse to a constant — a train/serve
+  skew on **every** scored article (not an error, just a quietly worse model).
+- `watchers/urgency_scorer.score_batch` computes each article's `age_hours`
+  (`_article_age_hours` reads `published`/`first_seen`). That value feeds *both* the
+  Sonnet prompt's staleness rule *and* the hard `STALE_HOURS`/`STALE_SCORE_CAP`
+  clamp. With every article looking 0h old, the entire staleness defense is inert on
+  the live path and >`STALE_HOURS` news can still fire urgent alerts.
+
+This was the failure: `get_unscored` had been trimmed to the minimal projection and
+the regression is invisible (no exception, model still trains, alerts still fire —
+just on stale items with skewed features). Any future edit to the `get_unscored`
+projection MUST keep both age columns. Pinned by
+`tests/test_get_unscored_age_fields.py` (drives the real `insert_batch → get_unscored`
+path, not hand-built dicts, and asserts feature-row parity between the training and
+inference dict shapes). Note `STALE_HOURS` has been retuned (24h → 48h); tests read
+the live module constants rather than hardcoding the window.
+
 ---
 
 ## Running the daemon
@@ -186,6 +211,14 @@ Suites:
   defeats: an old RFC822 date that lex-sorts *after* the ISO cutoff (so the SQL
   `published >= ?` pre-filter keeps it) is still correctly flagged stale; plus
   ISO/`Z`-suffix/naive-UTC parsing and the keep-on-unparseable policy.
+- `test_get_unscored_age_fields.py` — invariant #4 above. `get_unscored` must
+  surface `published`/`first_seen`. Drives the real `insert_batch → get_unscored`
+  path so it fails if the projection is ever trimmed again: (a) a >`STALE_HOURS`
+  article scored 9 by a mocked Sonnet is hard-capped to `STALE_SCORE_CAP` with a
+  fresh-article control; (b) the same article routed through `get_unscored` vs the
+  `_fetch_training_data` dict shape yields identical `extract_features_batch` rows
+  (catches the temporal train/serve skew). Reads `STALE_HOURS`/`STALE_SCORE_CAP`
+  from the live module so a retune doesn't false-fail it.
 
 ---
 
@@ -305,6 +338,7 @@ sentinel, which makes every article `needs_llm` and is also the value
 | Duplicate daemons fighting over port 8080 | Stale process didn't release the singleton lock. | The new daemon waits via blocking `flock`. Check `data/daemon.lock` for the holder PID. |
 | `recursive_labeler` worker logs one WARNING per 4h cycle and `total_labeled=0`, model stops gaining gold labels | A label batch from Claude carried a non-int `urgency` (`"1"`, `"1.0"`, `"yes"`, `true`). The unguarded `int()` in `_apply_labels` used to raise, unwinding the whole pipeline and discarding the in-flight batch's good labels. Now degraded to `urgency=0` so the relevance label still lands. | Fixed in `_apply_labels` (defensive `int(float(...))` with `(TypeError, ValueError)` fallback). Pinned by `tests/test_recursive_labeler.py::TestApplyLabels::test_poison_urgency_does_not_abort_or_lose_siblings`. |
 | Backtest titles/URLs visible in the standalone dashboard feed (`:8765`) or skewing the per-ticker sentiment panel, while the `:8080` daemon dashboard looks clean | **Dashboard parity.** Backtest isolation is enforced in three independent SQL spots: the store paths (`_LIVE_ONLY_CLAUSE`), `dashboard/web_server.py` (`_LIVE_ONLY_SQL`), and — newly — `dashboard/server.py` + `ml/sentiment_trends.py`. The standalone uvicorn dashboard (`dashboard.service`) and the sentiment-trends aggregator were two parallel reads of `articles` that did not filter synthetic rows, so they rendered training data as live news. | All three now use the canonical clause (`dashboard/server.py` / `ml/sentiment_trends.py` import `_LIVE_ONLY_CLAUSE` from `storage.article_store`). Any new `FROM articles` read that surfaces to a user MUST filter. Pinned by `tests/test_dashboard_backtest_isolation.py`. |
+| Stale (>`STALE_HOURS`) news still firing urgent alerts, and/or the model quietly underperforming for no obvious reason | **Article age never reached the live path.** `get_unscored` projected only `id/title/source/summary`, dropping `published`/`first_seen`. `_article_age_hours` then read 0h for every article: the Sonnet staleness rule and the hard `STALE_SCORE_CAP` clamp were both inert, and `extract_features` fell back to `now()` so 5 temporal features were train/serve-skewed. No exception, model still trained, alerts still fired — invisible. | `get_unscored` now returns both age columns (invariant #4). Verify any `get_unscored` projection edit keeps `published`/`first_seen`. Re-run `tests/test_get_unscored_age_fields.py`. |
 
 ---
 
