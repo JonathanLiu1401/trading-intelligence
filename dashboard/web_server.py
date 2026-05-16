@@ -1149,6 +1149,24 @@ _DASHBOARD_HTML = """<!doctype html>
     </div>
   </div>
 
+  <!-- News source edge — which of MY collectors actually precede the move? (new 2026-05-16, agent 4) -->
+  <div class="card mb-3" id="se-card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <span>News source edge <span class="small-muted">— which collectors' scored headlines actually precede the move (vs SPY)</span></span>
+      <span id="se-state" class="badge bg-secondary">—</span>
+    </div>
+    <div class="card-body p-2">
+      <div id="se-headline" class="small-muted mb-2">loading…</div>
+      <div class="table-responsive">
+        <table class="table table-sm table-dark mb-1" style="font-size:0.82em;">
+          <thead><tr><th>collector</th><th>abn% @ref</th><th>hit</th><th>resolved</th><th>verdict</th></tr></thead>
+          <tbody id="se-rows"><tr><td colspan="5" class="small-muted">—</td></tr></tbody>
+        </table>
+      </div>
+      <div id="se-meta" class="small-muted">—</div>
+    </div>
+  </div>
+
   <div class="row g-3">
     <div class="col-12 col-lg-4">
       <div class="card mb-3">
@@ -1392,14 +1410,64 @@ async function refreshPaperTrader() {
   }
 }
 
+// ── News source edge (cross-fetched from the trader; matures with history) ──
+// Mirrors refreshPaperTrader's exact /trader/ cross-fetch + r.ok degradation
+// (don't re-derive it). A stale trader process predates /api/source-edge and
+// 404s — surface that honestly instead of a blank card.
+async function refreshSourceEdge() {
+  const stEl = document.getElementById("se-state");
+  const hlEl = document.getElementById("se-headline");
+  const rowsEl = document.getElementById("se-rows");
+  try {
+    const r = await fetch("/trader/api/source-edge");
+    if (r.status === 404) {
+      stEl.textContent = "stale"; stEl.className = "badge bg-warning text-dark";
+      hlEl.textContent = "restart paper-trader to apply (process predates /api/source-edge)";
+      return;
+    }
+    if (!r.ok) { stEl.textContent = "n/a"; hlEl.textContent = "trader unavailable (HTTP " + r.status + ")"; return; }
+    const j = await r.json();
+    const v = j.verdict || "—";
+    const cls = v === "EDGE_FOUND" ? "bg-success"
+              : v === "NO_EDGE" ? "bg-danger"
+              : v === "INSUFFICIENT_DATA" ? "bg-warning text-dark"
+              : "bg-secondary";
+    stEl.textContent = v.replace(/_/g, " "); stEl.className = "badge " + cls;
+    hlEl.textContent = j.verdict_reason || "";
+    const ref = String(j.reference_horizon || 3);
+    const vcls = { EXPLOITABLE: "pl-pos", NEGATIVE: "pl-neg" };
+    const rows = (j.sources || []).slice(0, 10).map(s => {
+      const h = (s.horizons || {})[ref] || {};
+      const abn = h.mean_abnormal_pct, hit = h.abnormal_hit_rate;
+      return "<tr><td>" + s.source + "</td>"
+        + "<td class='" + plClass(abn) + "'>" + (abn != null ? (abn>=0?"+":"") + fmt(abn) + "%" : "—") + "</td>"
+        + "<td>" + (hit != null ? fmt(hit) + "%" : "—") + "</td>"
+        + "<td>" + (s.n_resolved != null ? s.n_resolved : "—") + "</td>"
+        + "<td class='" + (vcls[s.verdict] || "") + "'>" + (s.verdict || "—") + "</td></tr>";
+    });
+    rowsEl.innerHTML = rows.length ? rows.join("")
+      : "<tr><td colspan='5' class='small-muted'>no collector resolved a watchlist move yet</td></tr>";
+    document.getElementById("se-meta").textContent =
+      "ref " + (j.reference_horizon != null ? j.reference_horizon + "d" : "—")
+      + " · " + (j.n_resolved != null ? j.n_resolved : "—") + " resolved / "
+      + (j.n_scored != null ? j.n_scored : "—") + " scored"
+      + (j.spy_adjusted ? " · SPY-adjusted" : " · raw only")
+      + (j.lookback_days != null ? " · " + j.lookback_days + "d lookback" : "");
+  } catch (e) {
+    stEl.textContent = "n/a"; hlEl.textContent = "trader unreachable";
+  }
+}
+
 refresh();
 refreshPaperTrader();
+refreshSourceEdge();
 refreshCollectors();
 refreshMlStatus();
 refreshVolumeChart();
 refreshInvariants();
 setInterval(refresh, 15000);
 setInterval(refreshPaperTrader, 15000);
+setInterval(refreshSourceEdge, 300000);
 setInterval(refreshCollectors, 60000);
 setInterval(refreshMlStatus, 120000);
 setInterval(refreshVolumeChart, 300000);

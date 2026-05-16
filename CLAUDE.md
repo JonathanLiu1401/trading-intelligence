@@ -115,7 +115,7 @@ External callers reading articles.db:
 | `config/portfolio.json` | Holdings + cash + sector watchlist consumed by `collectors/portfolio_pnl.py` and price-alert worker |
 | `config/watchlist.json` | Standalone watchlist (legacy) |
 | `config/sources.json` | RSS feed URLs + scraper site list |
-| `dashboard/` | Flask app — same port `:8080`. Renders article feed, urgency timeline, worker health, sentiment trends, portfolio P/L. Cross-fetches paper-trader's `/api/portfolio` on `:8090`. `/api/chat` uses `core.claude_cli` (Claude CLI auth, no API key) |
+| `dashboard/` | Flask app — same port `:8080`. Renders article feed, urgency timeline, worker health, sentiment trends, portfolio P/L. Cross-fetches paper-trader's `/api/portfolio` on `:8090` (and `/api/source-edge` — a JS-only `se-card` panel mirroring the trader's per-collector predictive-edge leaderboard so the operator who manages these collectors sees which sources' scored headlines actually precede the move; 404→"restart paper-trader to apply", mirrors `refreshPaperTrader`'s `/trader/` cross-fetch verbatim). `/api/chat` uses `core.claude_cli` (Claude CLI auth, no API key) |
 | `scripts/export_training_data.py` | Dumps `articles.db` to a gzipped JSONL for offline training |
 | `scripts/watchdog.sh` | Optional restart wrapper |
 | `data/` | Runtime artifacts (see below) |
