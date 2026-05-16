@@ -8,7 +8,9 @@ Aggressive GPU training: 100 epochs per cycle, batch_size=256, Adam + cosine LR.
 Schedule lives in daemon.py (ML_TRAIN_INTERVAL drives the cadence).
 """
 import json
+import multiprocessing
 import os
+import queue
 import re
 import threading
 import time
@@ -366,8 +368,20 @@ def _save_dataset_cache(X: np.ndarray, y_rel: np.ndarray, y_urg: np.ndarray,
         print(f"[ml:trainer] cache save failed: {e}")
 
 
-def train(store, force: bool = False) -> dict:
-    """Train/retrain ArticleNet on available labeled data. Returns metrics dict."""
+def _train_impl(store, force: bool = False) -> dict:
+    """Full training cycle (original body of ``train()``): fetch labeled data,
+    build/refit the TF-IDF + extra-feature matrix, fit ArticleNet, persist
+    checkpoints + tfidf pickle to disk, return a metrics dict.
+
+    This now runs inside a spawned child process (see ``train()``) so its large
+    transient allocations — the dense ~1.35GB float32 feature matrix, the
+    pin_memory DataLoader pages, and the CUDA context — are returned to the OS
+    when the child exits. glibc never releases those large arenas back within a
+    long-lived daemon, which is what was driving the 9-21GB creep + OOM-kill.
+
+    Serialization against ``train_continuous`` is enforced by the *parent*
+    holding ``_TRAIN_LOCK`` for the whole subprocess lifetime — acquiring the
+    lock here would be a useless process-local copy in the child."""
     t0 = time.time()
 
     # Count current labeled articles to decide whether to use disk cache.
@@ -446,15 +460,18 @@ def train(store, force: bool = False) -> dict:
     # re-embedding here (the pre-cache code path) raised NameError every cycle
     # and ArticleNet silently never retrained. Train directly on the prepared
     # matrices.
+    # No _TRAIN_LOCK here: in the production path this runs in a child process
+    # (its own single training thread), and the parent holds _TRAIN_LOCK around
+    # the subprocess so train_continuous in the daemon still serializes. In the
+    # in-process test/stub fallback, train() holds _TRAIN_LOCK around this call.
     model = get_model()
-    with _TRAIN_LOCK:
-        metrics = model.fit(
-            X, y_rel, y_urg, y_time=y_time,
-            epochs=EPOCHS_PER_CYCLE,
-            batch_size=BATCH_SIZE,
-            lr=LEARNING_RATE,
-            label_weight_exponent=LABEL_WEIGHT_EXPONENT,
-        )
+    metrics = model.fit(
+        X, y_rel, y_urg, y_time=y_time,
+        epochs=EPOCHS_PER_CYCLE,
+        batch_size=BATCH_SIZE,
+        lr=LEARNING_RATE,
+        label_weight_exponent=LABEL_WEIGHT_EXPONENT,
+    )
 
     elapsed = time.time() - t0
     result = {
@@ -473,6 +490,169 @@ def train(store, force: bool = False) -> dict:
     }
     _log_metrics({"phase": "train", **result})
     return result
+
+
+def _run_training_child(db_path: str, force: bool, result_queue) -> None:
+    """Child-process entrypoint. Spawned (not forked) so it does NOT inherit the
+    parent daemon's CUDA context. Opens its own ArticleStore, runs the full
+    training cycle, then exits — at which point the OS reclaims every page the
+    cycle allocated. Puts a metrics dict on ``result_queue`` for the parent."""
+    try:
+        import sys
+        # spawn re-execs a bare interpreter; multiprocessing normally forwards
+        # the parent's sys.path, but make the repo importable defensively so a
+        # stripped-down launch environment can't break the child's imports.
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+
+        from storage.article_store import ArticleStore
+        # ArticleStore() takes no args and resolves the canonical local DB
+        # itself via _get_db_path(); db_path is passed for logging/traceability
+        # only (there is no constructor path argument or self.db_path attr).
+        print(f"[ml:trainer:child] pid={os.getpid()} opening store (db={db_path})")
+        store = ArticleStore()
+
+        metrics = _train_impl(store, force=force)
+
+        try:
+            result_queue.put(metrics)
+        finally:
+            # Best-effort: drop CUDA caching-allocator blocks before the
+            # interpreter tears down (the process exit frees them anyway).
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+        print(f"[ml:trainer:child] pid={os.getpid()} done status={metrics.get('status')}")
+    except Exception as e:
+        import traceback
+        try:
+            result_queue.put({
+                "status": "error",
+                "reason": f"child_exception: {e}",
+                "traceback": traceback.format_exc(),
+            })
+        except Exception:
+            pass
+
+
+# Production always isolates training in a spawned subprocess. The in-process
+# fallback below exists only so the TestTrainOrchestration regression guard
+# (which monkeypatches get_model/get_embedder with stubs a spawned interpreter
+# would never see) keeps exercising the real cache/embed/fit orchestration.
+import ml.embedder as _ml_embedder_mod  # noqa: E402
+import ml.model as _ml_model_mod        # noqa: E402
+
+_TRAIN_TIMEOUT_S = 600
+
+
+def _collaborators_stubbed() -> bool:
+    """True when get_model/get_embedder have been swapped out (test doubles).
+    Production never patches these, so this is False in the daemon."""
+    return (get_model is not _ml_model_mod.get_model
+            or get_embedder is not _ml_embedder_mod.get_embedder)
+
+
+def train(store, force: bool = False) -> dict:
+    """Train/retrain ArticleNet on available labeled data. Returns metrics dict.
+
+    Training runs in a spawned subprocess so the ~1.35GB dense feature matrix,
+    the pin_memory DataLoader pages and the CUDA context are fully released to
+    the OS when the child exits. The long-lived daemon was accumulating 9-21GB
+    of unreclaimed glibc heap per cycle and getting OOM-killed (then restarting
+    and repeating); an isolated process is the standard fix for large transient
+    allocations inside a persistent service. Signature is unchanged."""
+    if _collaborators_stubbed():
+        # Test/stub path: a spawned interpreter would re-import a clean
+        # ml.trainer and never see the monkeypatched stubs (and would hit the
+        # real on-disk DB instead of the test fixture). Run in-process,
+        # holding _TRAIN_LOCK to preserve the original serialization semantics.
+        with _TRAIN_LOCK:
+            return _train_impl(store, force=force)
+
+    try:
+        from storage.article_store import _get_db_path
+        db_path = str(_get_db_path())
+    except Exception:
+        db_path = "<unknown>"
+
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_run_training_child,
+        args=(db_path, force, result_queue),
+        name="ml-train-child",
+    )
+
+    t0 = time.time()
+    # Hold _TRAIN_LOCK for the entire subprocess lifetime. fit() no longer runs
+    # in this process, so this lock is now process-local — without holding it
+    # here, train_continuous (which does _TRAIN_LOCK.acquire(blocking=False) in
+    # this same daemon process) would fine-tune the in-memory net concurrently
+    # with the child and both would race on the shared model_gpu.pt /
+    # best_model.pt checkpoint writes.
+    with _TRAIN_LOCK:
+        print(f"[ml:trainer] starting training subprocess "
+              f"(db={db_path}, force={force}, timeout={_TRAIN_TIMEOUT_S}s)")
+        proc.start()
+
+        metrics = None
+        try:
+            # Drain the queue BEFORE join — join-first can deadlock if the
+            # payload ever exceeds the OS pipe buffer (tiny today, cheap
+            # insurance). This get() is itself the bounded wait for the child.
+            metrics = result_queue.get(timeout=_TRAIN_TIMEOUT_S)
+        except queue.Empty:
+            metrics = None
+
+        # The child queues its result then exits almost immediately; give it a
+        # short grace period to tear down before deciding it's hung.
+        proc.join(timeout=30)
+
+        if proc.is_alive():
+            print("[ml:trainer] subprocess still alive after result/timeout — "
+                  "terminating")
+            proc.terminate()
+            proc.join(timeout=10)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
+            elapsed = round(time.time() - t0, 1)
+            print(f"[ml:trainer] training subprocess timed out after {elapsed}s")
+            return {"status": "error", "reason": "subprocess_timeout",
+                    "elapsed_s": elapsed}
+
+        elapsed = round(time.time() - t0, 1)
+
+        if metrics is None:
+            print(f"[ml:trainer] subprocess produced no result "
+                  f"(exitcode={proc.exitcode}) after {elapsed}s")
+            return {"status": "error", "reason": "no_result",
+                    "exitcode": proc.exitcode, "elapsed_s": elapsed}
+
+        if metrics.get("status") == "ok":
+            # The child wrote fresh model checkpoints + tfidf pickle to disk.
+            # get_model()/get_embedder() are cache-once singletons with no
+            # reload, and fit() no longer mutates THIS process's net — so drop
+            # the daemon's cached singletons. The next get_model()/
+            # get_embedder() (scorer, continuous trainer) then reconstructs
+            # from the freshly-trained on-disk artifacts. Without this the
+            # daemon would score with the stale startup model forever.
+            try:
+                _ml_model_mod._net = None
+                _ml_embedder_mod._embedder = None
+                print("[ml:trainer] reset in-memory model/embedder singletons "
+                      "→ next inference reloads fresh checkpoint")
+            except Exception as e:
+                print(f"[ml:trainer] singleton reset failed (non-fatal): {e}")
+
+        print(f"[ml:trainer] training subprocess finished in {elapsed}s "
+              f"status={metrics.get('status')} "
+              f"(memory released back to OS on child exit)")
+        return metrics
 
 
 class Trainer:
