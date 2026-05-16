@@ -228,6 +228,23 @@ Suites:
   call (no wasted quota, no POST to an empty URL); that the happy path marks
   exactly the alerted id `urgency=2` (cannot re-fire); and that a failed
   Discord POST leaves the row `urgency=1` (re-queued, never silently lost).
+  `TestSyntheticDefenseInDepth` additionally pins the formatter's *own*
+  `_is_synthetic` re-filter (invariant #1 defense-in-depth): synthetic dicts
+  handed to `send_urgent_alert` directly, bypassing the store's
+  `_LIVE_ONLY_CLAUSE` — `backtest://` URL, `backtest_*` source, and
+  `opus_annotation*` source — are dropped before any Claude/Discord call and
+  never marked alerted; a mixed batch alerts only the live row.
+- `test_score_pending.py` — `storage.article_store::ArticleStore.score_pending`
+  (the in-store model-scoring driver; `daemon.scorer_worker` is the parallel
+  production path) was the only model-write path with no direct test. Pins
+  invariants #1 and #2 on it: model predictions land in `ml_score` /
+  `score_source='ml'` (never `ai_score`); a `needs_llm` row is left
+  `ai_score=0 / ml_score=NULL` for the Sonnet path; an `urgency>=8` prediction
+  bumps `urgency` to 1 via `MAX`; synthetic `backtest://` rows stay invisible
+  (excluded by `get_unscored`); and the unfitted-model `rel_std==99` sentinel
+  writes nothing (no `ml_score`, no `time_sensitivity`) and returns 0 without
+  spinning. Stubs `ml.inference.score_articles` keyed by `_id` so the result
+  is independent of `get_unscored`'s `kw_score DESC` ordering.
 - `test_backoff.py` — `core/backoff.Backoff`, the retry throttle every collector
   worker in `daemon.py` (~20 call sites) shares. First real suite (was inline
   `__main__`-only). Pins the *actual* contract, not the prose: `peek()` is
