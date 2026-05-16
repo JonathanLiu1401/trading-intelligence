@@ -448,3 +448,20 @@ authoritative copy already carried it. Re-synced (filter only) and pinned by
 `tests/test_paper_trader_signals_isolation.py`. When updating the vendored snapshot, never copy it
 wholesale — port only the change you intend, and keep the `_LIVE_ONLY_CLAUSE` filter on every
 `articles` read.
+
+---
+
+## Review log
+
+- **2026-05-16** — Full review pass over `daemon.py`, `storage/article_store.py`,
+  `watchers/alert_agent.py`, `watchers/urgency_scorer.py`, `ml/trainer.py`, `ml/model.py`,
+  `ml/features.py`, `ml/inference.py`, `collectors/web_scraper.py`, `analysis/claude_analyst.py`.
+  No new bugs. Re-verified the four load-bearing invariants hold and are pinned by tests:
+  backtest isolation (every live `FROM articles` read carries `_LIVE_ONLY_CLAUSE` or the inlined
+  equivalent; `send_urgent_alert` keeps its `_is_synthetic` defense-in-depth re-filter),
+  ml_score/ai_score separation (`update_ml_scores_batch` tags `score_source=COALESCE(...,'ml')`;
+  `update_ai_scores_batch` tags `'llm'`; trainer strong-label SQL excludes `'ml'` in both
+  `_fetch_training_data` and the `train_continuous` duplicate), the `MAX(urgency, ?)` state
+  machine, and `get_unscored` train/serve age-field parity. Suite: **261 passed**
+  (verified after a `__pycache__`/`.pytest_cache` clear — a stale assertion-rewrite
+  cache reports a lower count, the phantom hazard documented under "Running tests").
