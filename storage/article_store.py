@@ -508,9 +508,26 @@ class ArticleStore:
         retry path (which writes ai_score, not ml_score) still works: a
         Sonnet-failed article keeps both ai_score=0 and ml_score=NULL, so it
         gets re-routed on the next cycle.
+
+        ``published`` and ``first_seen`` are returned (not just id/title/body)
+        because two downstream consumers need the article's age:
+
+          - ``ml/features.py::extract_features`` derives 5 temporal features
+            (hour/dow cyclic encodings, days_since_published) from
+            ``published``. ``_fetch_training_data`` passes the real value at
+            train time; if inference omits it the parser falls back to
+            ``now()`` and those 5 features become a constant — a silent
+            train/serve skew on every scored article.
+          - ``watchers/urgency_scorer.score_batch`` derives each article's
+            ``age_hours`` via ``_article_age_hours`` (reads ``published`` /
+            ``first_seen``). That feeds both the Sonnet prompt's staleness
+            rule and the hard ``STALE_HOURS``/``STALE_SCORE_CAP`` clamp.
+            Without these fields every article looks 0h old and the entire
+            staleness system is inert on the live path.
         """
         cur = self.conn.execute(
-            "SELECT id, url, title, source, full_text FROM articles "
+            "SELECT id, url, title, source, full_text, published, first_seen "
+            "FROM articles "
             f"WHERE ai_score=0 AND ml_score IS NULL AND kw_score>=? "
             f"AND {_LIVE_ONLY_CLAUSE} "
             "ORDER BY kw_score DESC LIMIT ?",
@@ -519,7 +536,8 @@ class ArticleStore:
         rows = cur.fetchall()
         return [
             {"_id": r[0], "link": r[1], "title": r[2], "source": r[3],
-             "summary": decompress(r[4]) if r[4] else ""}
+             "summary": decompress(r[4]) if r[4] else "",
+             "published": r[5] or "", "first_seen": r[6] or ""}
             for r in rows
         ]
 
