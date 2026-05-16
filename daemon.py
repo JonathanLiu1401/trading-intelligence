@@ -1395,6 +1395,7 @@ def purge_worker(store: ArticleStore):
 def stats_worker(store: ArticleStore):
     last_sig = None
     last_emit = 0.0
+    last_down_sig = None
     HEARTBEAT_SECS = 300
     while _running:
         _sleep(60)
@@ -1422,10 +1423,36 @@ def stats_worker(store: ArticleStore):
                     stale = source_health.get_stale_sources()
                     if disabled or stale:
                         down = sorted(set(disabled) | set(stale))
-                        log.warning(
-                            f"[source_health] disabled={len(disabled)} "
-                            f"stale={len(stale)} down={down}"
-                        )
+                        down_sig = tuple(down)
+                        if down_sig != last_down_sig:
+                            # Down-set changed: emit the full list once, plus
+                            # an explicit delta so the audit can see exactly
+                            # what newly broke or recovered.
+                            prev = set(last_down_sig or ())
+                            cur = set(down)
+                            newly = sorted(cur - prev)
+                            recovered = sorted(prev - cur)
+                            delta = ""
+                            if newly:
+                                delta += f" newly_down={newly}"
+                            if recovered:
+                                delta += f" recovered={recovered}"
+                            log.warning(
+                                f"[source_health] disabled={len(disabled)} "
+                                f"stale={len(stale)} down={len(down)}"
+                                f"{delta} list={down}"
+                            )
+                            last_down_sig = down_sig
+                        else:
+                            # Unchanged: concise count only, no 6KB dump.
+                            log.info(
+                                f"[source_health] disabled={len(disabled)} "
+                                f"stale={len(stale)} down={len(down)} "
+                                f"(unchanged)"
+                            )
+                    elif last_down_sig is not None:
+                        log.warning("[source_health] all sources recovered")
+                        last_down_sig = None
                 except Exception as he:
                     log.debug(f"[stats_worker] source_health probe failed: {he}")
                 last_sig = sig
