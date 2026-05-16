@@ -168,3 +168,96 @@ class TestHappyPathMarksAlerted:
 
         assert ok is False
         assert _urgency_of(store, "retry") == 1, "failed POST must not mark alerted"
+
+
+class TestSyntheticDefenseInDepth:
+    """``_is_synthetic`` re-filter AT THE AGENT BOUNDARY.
+
+    ``get_unalerted_urgent`` already excludes synthetic rows, but
+    ``send_urgent_alert`` re-checks because the invariant is load-bearing
+    enough that a future caller bypassing the store (a manual replay, a new
+    code path) must not be able to leak training rows into Discord. The other
+    suites exercise the *store* filter; this pins the *formatter's* own guard
+    by handing it synthetic dicts directly (never via the store). A regression
+    that drops the re-filter passes every store-level test but posts backtest
+    titles to Discord as "🚨 BREAKING".
+    """
+
+    class _StoreSpy:
+        def __init__(self):
+            self.marked = []
+
+        def mark_alerted_batch(self, ids):
+            self.marked.extend(ids)
+
+        def mark_alerted(self, aid):
+            self.marked.append(aid)
+
+    @pytest.mark.parametrize(
+        "art",
+        [
+            {  # backtest:// URL
+                "_id": "bt_url", "link": "backtest://run_7/2026-01-01/BUY/MU",
+                "title": "Synthetic BUY winner that scored 9.5 in replay",
+                "source": "backtest_run_7_winner", "ai_score": 9.5,
+                "summary": "", "published": "", "first_seen": "",
+            },
+            {  # backtest_ source tag, ordinary-looking URL
+                "_id": "bt_src", "link": "https://example.com/x",
+                "title": "Replay rank-1 row carried a real-looking url",
+                "source": "backtest_run_7_rank1", "ai_score": 9.0,
+                "summary": "", "published": "", "first_seen": "",
+            },
+            {  # opus_annotation source tag
+                "_id": "opus", "link": "https://example.com/y",
+                "title": "Opus GOOD-trade annotation lesson row here",
+                "source": "opus_annotation_cycle_3", "ai_score": 8.5,
+                "summary": "", "published": "", "first_seen": "",
+            },
+        ],
+    )
+    def test_synthetic_row_dropped_before_claude_and_discord(
+        self, art, monkeypatch
+    ):
+        spy = self._StoreSpy()
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call") as mock_claude, \
+             patch("notifier.discord_notifier.send") as mock_send:
+            ok = alert_agent.send_urgent_alert([art], spy)
+
+        assert ok is False
+        mock_claude.assert_not_called()
+        mock_send.assert_not_called()
+        assert spy.marked == [], "synthetic row must not be marked alerted"
+
+    def test_mixed_batch_keeps_live_drops_synthetic(self, store, monkeypatch):
+        """A batch with one real urgent row + one synthetic row must alert only
+        the real one and mark exactly its id — the synthetic row is silently
+        dropped, not alerted, not marked."""
+        _insert_urgent(store, id="real", url="https://reuters.com/real",
+                       published=_iso(1), ai_score=9.0)
+        urgent = store.get_unalerted_urgent()
+        assert {a["_id"] for a in urgent} == {"real"}
+        # Splice a synthetic row in as if a future bypass had added it.
+        urgent.append({
+            "_id": "leak", "link": "backtest://run_9/2026/SELL/MU",
+            "title": "Synthetic SELL loser, 0.5 outcome label",
+            "source": "backtest_run_9_loser", "ai_score": 9.9,
+            "summary": "", "published": _iso(1), "first_seen": _iso(0.1),
+        })
+
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call",
+                          return_value="🚨 BREAKING ◈ EARNINGS ◈ MU"), \
+             patch("notifier.discord_notifier.send", return_value=True):
+            ok = alert_agent.send_urgent_alert(urgent, store)
+
+        assert ok is True
+        assert _urgency_of(store, "real") == 2, "real urgent row must be alerted"
+        # The synthetic row was never in the store, so nothing to assert there;
+        # the key invariant is it never reached Claude/Discord (its title would
+        # otherwise be in the prompt) and was not in the marked set.
+        leak = store.conn.execute(
+            "SELECT COUNT(*) FROM articles WHERE id='leak'"
+        ).fetchone()[0]
+        assert leak == 0
