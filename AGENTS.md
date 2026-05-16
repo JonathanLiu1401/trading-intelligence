@@ -483,3 +483,30 @@ wholesale — port only the change you intend, and keep the `_LIVE_ONLY_CLAUSE` 
   violate the no-redundant-coverage discipline). Note: a large unrelated `config/sources.json`
   working-tree delta and two `config/sources.json.bak.*` files predate this session and were
   deliberately **not** committed (config data churn, out of scope for a code-review commit).
+
+- **2026-05-16 (post-`bb1e79c`)** — Re-review covering the four production-code changes since
+  the entry above (each shipped with its own dedicated tests; all four correctness-clean):
+  `e190e99` `ml/features.py::_parse_published` now normalizes every parsed `published` datetime
+  to UTC (`dt.astimezone(timezone.utc)`, naive→UTC assumed) — kills the per-source train/serve
+  skew in the 4 cyclic temporal features (a -0500 feed previously produced a different
+  `hour_sin`/`dow_sin` for the same instant); `f1d9288` `discord_notifier.send` adds an explicit
+  "gave up on chunk … — chunk dropped" log + `_MAX_ATTEMPTS` constant (the 429-storm path now
+  reaches it; the definitive-4xx path still `sent=True`/`ok=False`-breaks by design, so no
+  re-fire); `ab62331` `heuristic_scorer` multi-catalyst compounding (`+15%`/extra distinct
+  category, capped 3.5) — verified placed **after** the `kw==0.0` and blacklist early-returns,
+  so it only ever scales an already-domain-relevant article and the `n_distinct==1 → 1.0`
+  single-event invariant holds; `76f9baa` `google_news._ensure_db` WAL + `busy_timeout=30000`
+  matching the canonical `article_store`/`source_health` hardening (no leaked connection — one
+  per `collect_google_news()`, closed in the same call). The four task-critical invariant
+  assertions re-spot-verified present and value-asserting (not no-crash): `get_unalerted_urgent`
+  `backtest://` exclusion, `update_ml_scores_batch`→`score_source='ml'`, `EXTRA_FEATURE_DIM==15`,
+  `_fetch_training_data` `score_source='ml'` exclusion. Suite: **273 passed** (clean
+  `__pycache__`/`.pytest_cache`). Known-benign deferral: `datetime.utcnow()` (deprecated in
+  modern Python) appears in **12** collector dedup-write sites including `google_news.py:119` —
+  it only writes the `seen_articles.first_seen` column, which is **write-only** (the dedup path
+  reads `WHERE id=?` exclusively, never parses `first_seen`), so it is not a correctness bug;
+  surfaced as a pytest `DeprecationWarning` only because `76f9baa`'s new test exercises the
+  write path. A 12-site sweep is cross-cutting churn out of scope for a surgical review commit
+  (same disposition as the prior config-churn deferral) — flagged here so the next reviewer
+  doesn't re-derive it. The `config/sources.json` delta + `.bak` files still predate the session
+  and remain deliberately uncommitted.
