@@ -84,9 +84,10 @@ def compute_trends(store) -> dict:
     cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
 
     try:
+        from storage.article_store import _LIVE_ONLY_CLAUSE
         rows = store.conn.execute(
             "SELECT title, ai_score, kw_score, urgency, source "
-            "FROM articles WHERE first_seen >= ?",
+            f"FROM articles WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
             (cutoff_iso,),
         ).fetchall()
     except Exception:

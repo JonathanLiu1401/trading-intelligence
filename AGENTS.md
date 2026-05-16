@@ -148,6 +148,11 @@ Suites:
   Claude must not abort the run or discard the batch's good labels), 0..5→0..10 relevance rescale,
   `score_source='llm'` on writes, and `_fetch_round1_candidates` backtest/opus exclusion (a
   separate `WHERE` filter than `_LIVE_ONLY_CLAUSE`).
+- `test_dashboard_backtest_isolation.py` — backtest isolation on the two *non-store*
+  live-facing surfaces (see "dashboard parity" below): `dashboard/server.py::_articles_payload`
+  / `_articles_per_hour_24h` (the standalone uvicorn dashboard) and
+  `ml/sentiment_trends.py::compute_trends` (the per-ticker panel) must filter synthetic rows
+  the same way the store paths and `dashboard/web_server.py` do.
 
 ---
 
@@ -237,6 +242,7 @@ in isolation from the GPU/daemon machinery; `tests/test_retrain_guard.py` pins i
 | GPU OOM | Concurrent `_inject_and_train` from paper-trader during `ml_trainer_worker` retrain. | `_TRAIN_LOCK` serializes; lower paper-trader's `RUNS_PER_CYCLE`. `_handle_memory_error` clears CUDA cache. |
 | Duplicate daemons fighting over port 8080 | Stale process didn't release the singleton lock. | The new daemon waits via blocking `flock`. Check `data/daemon.lock` for the holder PID. |
 | `recursive_labeler` worker logs one WARNING per 4h cycle and `total_labeled=0`, model stops gaining gold labels | A label batch from Claude carried a non-int `urgency` (`"1"`, `"1.0"`, `"yes"`, `true`). The unguarded `int()` in `_apply_labels` used to raise, unwinding the whole pipeline and discarding the in-flight batch's good labels. Now degraded to `urgency=0` so the relevance label still lands. | Fixed in `_apply_labels` (defensive `int(float(...))` with `(TypeError, ValueError)` fallback). Pinned by `tests/test_recursive_labeler.py::TestApplyLabels::test_poison_urgency_does_not_abort_or_lose_siblings`. |
+| Backtest titles/URLs visible in the standalone dashboard feed (`:8765`) or skewing the per-ticker sentiment panel, while the `:8080` daemon dashboard looks clean | **Dashboard parity.** Backtest isolation is enforced in three independent SQL spots: the store paths (`_LIVE_ONLY_CLAUSE`), `dashboard/web_server.py` (`_LIVE_ONLY_SQL`), and — newly — `dashboard/server.py` + `ml/sentiment_trends.py`. The standalone uvicorn dashboard (`dashboard.service`) and the sentiment-trends aggregator were two parallel reads of `articles` that did not filter synthetic rows, so they rendered training data as live news. | All three now use the canonical clause (`dashboard/server.py` / `ml/sentiment_trends.py` import `_LIVE_ONLY_CLAUSE` from `storage.article_store`). Any new `FROM articles` read that surfaces to a user MUST filter. Pinned by `tests/test_dashboard_backtest_isolation.py`. |
 
 ---
 
