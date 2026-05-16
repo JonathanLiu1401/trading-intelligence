@@ -274,6 +274,22 @@ Suites:
   this is intentional, do not "fix" the code to make `cap` a hard ceiling; the
   0.5s floor; and `sleep(should_continue)` polling out early on shutdown. The
   module docstring was tightened to state this explicitly (code is the spec).
+- `test_claude_analyst.py` — `analysis/claude_analyst.py`, the 5h heartbeat
+  payload builder (previously zero direct coverage). Pins the three bug classes
+  its source comments call out: `_fmt_ticker` must not raise on a present-but-
+  `None` ticker/price/pct (the `or` guards, since `dict.get()` only defaults a
+  *missing* key); `_build_payload`'s article cap is **60, not 50** (the caller
+  prepends up to 2 synthetic snapshot rows to a 50-item top list, so `[:50]`
+  silently truncates real articles); and `analyze` returns the
+  `[analyst] No response…` sentinel (which `heartbeat_worker` retries on) for
+  both a `None` and an empty Claude response, never `None`.
+- `test_web_scraper.py` — `collectors/web_scraper.py` pure helpers (previously
+  zero direct coverage). Pins `_is_article_url`'s SKIP_PATTERNS denylist and
+  the `len(path)>10 and path.count('/')>=2` heuristic, and `_extract_articles`'
+  15-char title floor, relative-URL resolution against the base, per-page
+  dedup, the `source = "scraped/<netloc>"` tag (ml/features credibility keys
+  on it), 200-char title truncation, and graceful `[]` on a parser failure
+  (the worker must never raise into the daemon thread).
 
 ---
 
