@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 import pytest
 
 
-def _insert(store, *, id, url, ai_score=0.0, score_source=None):
+def _insert(store, *, id, url, ai_score=0.0, score_source=None, source="rss"):
     """Insert a row bypassing the public API so a precise pre-state can be set."""
     first_seen = datetime.now(timezone.utc).isoformat()
     with store._write_lock:
@@ -36,7 +36,7 @@ def _insert(store, *, id, url, ai_score=0.0, score_source=None):
             "(id, url, title, source, published, kw_score, ai_score, urgency, "
             "first_seen, cycle, ml_score, score_source) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (id, url, f"title {id}", "rss", "", 1.0, ai_score, 0,
+            (id, url, f"title {id}", source, "", 1.0, ai_score, 0,
              first_seen, 0, None, score_source),
         )
         store.conn.commit()
@@ -114,3 +114,59 @@ class TestBriefingBoost:
 
     def test_empty_label_list_returns_zero(self, store):
         assert store.update_scores_from_labels([]) == 0
+
+
+class TestBriefingBoostBacktestIsolation:
+    """update_scores_from_labels is the only writer of 'briefing_boost', a tag
+    the trainer reads as strong ground truth (same weight as 'llm'). The label
+    list is derived from get_top_for_briefing() (already live-only) so a
+    synthetic URL cannot reach here on the production path — but the write must
+    still refuse to rewrite a synthetic row's outcome label if it ever does,
+    exactly like every other live path. A regression here silently poisons the
+    training pool: a backtest SELL-loser's 0.5 outcome label would be promoted
+    to 4.5 'briefing_boost' and the model would learn losing trades as decent.
+    """
+
+    def test_backtest_url_row_is_not_boosted(self, store):
+        row = _insert(store, id="bt", url="backtest://run_7/2026-01-01/SELL/MU",
+                      ai_score=0.5, score_source=None,
+                      source="backtest_run_7_loser")
+        n = store.update_scores_from_labels(
+            [{"url": "backtest://run_7/2026-01-01/SELL/MU", "in_briefing": True}]
+        )
+        assert n == 0, "backtest row was boosted into the briefing_boost pool"
+        ai_score, src = row()
+        assert ai_score == pytest.approx(0.5), "synthetic outcome label rewritten"
+        assert src is None, "synthetic row tag flipped to briefing_boost"
+
+    def test_opus_annotation_source_row_is_not_boosted(self, store):
+        row = _insert(store, id="opa", url="https://x.com/opa",
+                      ai_score=2.5, score_source=None,
+                      source="opus_annotation_cycle_4")
+        n = store.update_scores_from_labels(
+            [{"url": "https://x.com/opa", "in_briefing": True}]
+        )
+        assert n == 0
+        ai_score, src = row()
+        assert ai_score == pytest.approx(2.5)
+        assert src is None
+
+    def test_live_row_alongside_synthetic_still_boosts(self, store):
+        """The clause must not be over-broad: a genuine live row in the same
+        label batch as a synthetic one is still boosted normally."""
+        live = _insert(store, id="lv", url="https://reuters.com/x",
+                       ai_score=0.0, score_source=None, source="rss")
+        synth = _insert(store, id="bt2", url="backtest://run_9/d/BUY/MU",
+                        ai_score=5.0, score_source=None,
+                        source="backtest_run_9_winner")
+        n = store.update_scores_from_labels([
+            {"url": "https://reuters.com/x", "in_briefing": True},
+            {"url": "backtest://run_9/d/BUY/MU", "in_briefing": True},
+        ])
+        assert n == 1, "exactly the live row should be updated"
+        lv_ai, lv_src = live()
+        assert lv_ai == pytest.approx(4.5)
+        assert lv_src == "briefing_boost"
+        bt_ai, bt_src = synth()
+        assert bt_ai == pytest.approx(5.0), "synthetic BUY-winner label rewritten"
+        assert bt_src is None
