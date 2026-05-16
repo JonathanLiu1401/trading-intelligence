@@ -539,7 +539,8 @@ def train_continuous(store) -> dict:
         "  AND (score_source IN ('llm','briefing_boost') "
         "       OR (score_source IS NULL AND ai_score = CAST(ai_score AS INTEGER)) "
         "       OR (score_source IS NULL AND (url LIKE 'backtest://%' "
-        "            OR source LIKE 'backtest_%' OR source LIKE 'opus_annotation%')))"
+        "            OR source LIKE 'backtest_%' OR source LIKE 'opus_annotation%'))) "
+        "ORDER BY first_seen DESC LIMIT 15000"
     )
     for title, blob, ai, src, published in cur.fetchall():
         summary = decompress(blob) if blob else ""
@@ -568,6 +569,8 @@ def train_continuous(store) -> dict:
 
     # Bootstrap time_sensitivity labels alongside relevance/urgency targets.
     y_time = _time_sensitivity_batch(articles)
+
+    del texts, articles, X_text, X_extra  # release before GPU training
 
     model = get_model()
     # Skip rather than block: if the heavy trainer is mid-fit, just wait for the
