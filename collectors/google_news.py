@@ -84,7 +84,16 @@ def _save_cursor(state: dict):
 
 def _ensure_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    # Match the canonical connection hardening used by source_health.py /
+    # article_store.py. Without busy_timeout, SQLite's default is 0: any
+    # transient lock (a prior pass's connection still flushing, or the
+    # WAL checkpoint) raises OperationalError("database is locked")
+    # immediately, which aborts the whole google_news pass and trips the
+    # worker's 5-300s backoff — losing an entire fetched batch. WAL plus a
+    # 30s busy_timeout lets the write wait out the contention instead.
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS seen_articles (
             id TEXT PRIMARY KEY, link TEXT, title TEXT,
