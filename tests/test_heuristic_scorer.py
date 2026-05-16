@@ -181,3 +181,42 @@ def test_plural_supply_and_regulatory_fire():
     rg = score_article("US imposes new export controls on advanced memory chips", "", "Reuters", "")
     assert "supply" in sh["events"]
     assert "regulatory" in rg["events"]
+
+
+# ── Corporate distress / legal / governance events ───────────────────────────
+# Past gap: bankruptcy filings, SEC/DOJ probes, accounting restatements and
+# CEO/CFO departures are among the sharpest single-name re-rating catalysts,
+# yet none had an EVENT_PATTERNS entry — a "Chipmaker files for Chapter 11"
+# headline scored on keywords+source only, with no event multiplier. Events
+# are gated behind kw>0 and only ever multiply an already-relevant article
+# up, so these add signal to real semis/portfolio stories without new noise.
+
+def test_distress_bankruptcy_and_default_fire():
+    bk = score_article("Memory chipmaker files for Chapter 11 bankruptcy", "", "Reuters", "")
+    df = score_article("Chip supplier defaults on its bonds amid DRAM glut", "", "Reuters", "")
+    assert "distress" in bk["events"]
+    assert "distress" in df["events"]
+
+
+def test_legal_probe_fraud_and_restatement_fire():
+    sec = score_article("SEC opens probe into Micron revenue recognition", "", "Reuters", "")
+    rs = score_article("Semiconductor firm restates its financials after audit", "", "Reuters", "")
+    fr = score_article("DOJ charges chip executive with securities fraud", "", "Bloomberg", "")
+    assert "legal" in sec["events"]
+    assert "legal" in rs["events"]
+    assert "legal" in fr["events"]
+
+
+def test_exec_departure_fires_both_orderings():
+    a = score_article("Intel CEO steps down amid foundry turnaround struggles", "", "Reuters", "")
+    b = score_article("Micron CFO resigns abruptly ahead of earnings", "", "CNBC", "")
+    assert "exec_change" in a["events"]
+    assert "exec_change" in b["events"]
+
+
+def test_distress_is_gated_behind_domain_keywords():
+    """Events only fire after the kw>0 gate: a non-domain bankruptcy story
+    never reaches event detection (reported as no_keywords, not scored)."""
+    r = score_article("Local bakery files for Chapter 11 bankruptcy", "", "Reuters", "")
+    assert r["events"] == []
+    assert r["reason"] == "no_keywords"
