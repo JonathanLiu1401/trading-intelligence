@@ -1417,6 +1417,17 @@ def stats_worker(store: ArticleStore):
                 log.info(f"[stats] total={s['total']} urgent={s['urgent']} "
                          f"unscored={s['unscored']} low_kw={s.get('below_threshold', 0)} "
                          f"db={s['db_mb']}MB{gpu_info}")
+                try:
+                    disabled = source_health.get_disabled_sources()
+                    stale = source_health.get_stale_sources()
+                    if disabled or stale:
+                        down = sorted(set(disabled) | set(stale))
+                        log.warning(
+                            f"[source_health] disabled={len(disabled)} "
+                            f"stale={len(stale)} down={down}"
+                        )
+                except Exception as he:
+                    log.debug(f"[stats_worker] source_health probe failed: {he}")
                 last_sig = sig
                 last_emit = now
             _worker_last_ok["stats"] = now

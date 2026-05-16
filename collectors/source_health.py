@@ -170,6 +170,55 @@ def get_disabled_sources() -> list[str]:
     return [r[0] for r in rows]
 
 
+# A source whose last_seen is older than this is considered "stale": its
+# worker is no longer calling record_result at all (crashed, or the
+# collector raises before recording). This is distinct from `disabled`,
+# which means the source IS being polled but produced 0 articles for
+# FAILURE_THRESHOLD consecutive passes. Together they cover both failure
+# modes: silently-dead workers (stale) and silently-empty sources (disabled).
+DEFAULT_STALE_SECS = 3 * 3600  # 3h without a single poll
+
+
+def get_stale_sources(max_age_secs: int = DEFAULT_STALE_SECS) -> list[str]:
+    """Return tracked sources not polled within max_age_secs.
+
+    A missing or unparseable last_seen counts as stale (we cannot prove the
+    source is healthy). Returns a sorted list so callers/log lines are stable.
+    """
+    cutoff = datetime.now(timezone.utc).timestamp() - max(int(max_age_secs), 0)
+    with _lock:
+        try:
+            conn = _connect()
+        except Exception:
+            return []
+        try:
+            rows = conn.execute(
+                "SELECT source, last_seen FROM source_health"
+            ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    stale: list[str] = []
+    for source, last_seen in rows:
+        if not source:
+            continue
+        if not last_seen:
+            stale.append(source)
+            continue
+        try:
+            ts = datetime.fromisoformat(last_seen).timestamp()
+        except (ValueError, TypeError):
+            stale.append(source)
+            continue
+        if ts < cutoff:
+            stale.append(source)
+    return sorted(stale)
+
+
 def get_health_report() -> dict:
     """Return {source: {...status...}} for every tracked source."""
     with _lock:
