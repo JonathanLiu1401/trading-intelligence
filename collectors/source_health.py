@@ -289,6 +289,41 @@ def is_disabled(source: str) -> bool:
     return bool(row and row[0])
 
 
+def delete_sources(prefix: str) -> int:
+    """Delete every source_health row whose name starts with ``prefix``.
+
+    Used by purge_worker to sweep away legacy high-cardinality keys (e.g.
+    per-query ``gdelt:<query>`` rows). Those were recorded under cross-query
+    dedup, so virtually every key tripped the disable threshold while the
+    source itself was healthy — drowning the genuinely-down sources in the
+    hourly [source_health] alert. An empty prefix is a no-op (refuses to
+    wipe the whole table). Returns the number of rows removed.
+    """
+    if not prefix:
+        return 0
+    with _lock:
+        try:
+            conn = _connect()
+        except Exception as e:
+            _warn_dedup(f"source_health delete_sources open failed: {e}")
+            return 0
+        try:
+            cur = conn.execute(
+                "DELETE FROM source_health WHERE source LIKE ? ESCAPE '\\'",
+                (prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",),
+            )
+            conn.commit()
+            return cur.rowcount or 0
+        except Exception as e:
+            _warn_dedup(f"source_health delete_sources failed: {e}")
+            return 0
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def reset_source(source: str) -> None:
     """Manually re-enable a source and clear its failure counter."""
     with _lock:

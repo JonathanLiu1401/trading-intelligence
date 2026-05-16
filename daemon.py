@@ -25,6 +25,7 @@ Workers (intervals below track the *_INTERVAL constants in the Config block):
   W17 web_server_worker  — Flask dashboard bound to 0.0.0.0:8080
 """
 import json
+import logging
 import os
 import sys
 import time
@@ -470,18 +471,28 @@ def gdelt_worker(store: ArticleStore):
             # Full aggregate sweep (handles cross-query dedup + seen_articles cache)
             articles = collect_gdelt()
             _ingest(store, articles, "gdelt")
-            # Per-query health tracking — count articles per query in this sweep
-            counts: dict[str, int] = {}
-            for art in articles:
-                q = art.get("_query") or ""
-                if q:
-                    counts[q] = counts.get(q, 0) + 1
-            for query in QUERY_GROUPS:
-                new = counts.get(query, 0)
-                try:
-                    source_health.record_result(f"gdelt:{query[:20]}", new)
-                except Exception as he:
-                    log.warning(f"[gdelt_worker] source_health error: {he}")
+            # Aggregate health only. Per-query `gdelt:<query>` keys were
+            # meaningless under cross-query/persistent dedup: collect_gdelt()
+            # returns only net-new articles, so almost every query nets 0 per
+            # sweep and tripped the 3-failure disable threshold while GDELT
+            # was perfectly healthy — burying real down-sources in the hourly
+            # alert. Track one "gdelt" key like every other worker.
+            try:
+                source_health.record_result("gdelt", len(articles))
+            except Exception as he:
+                log.warning(f"[gdelt_worker] source_health error: {he}")
+            # Per-query breakdown kept as debug-only observability (which
+            # queries are still productive) without feeding the disable logic.
+            if log.isEnabledFor(logging.DEBUG):
+                counts: dict[str, int] = {}
+                for art in articles:
+                    q = art.get("_query") or ""
+                    if q:
+                        counts[q] = counts.get(q, 0) + 1
+                if counts:
+                    top = sorted(counts.items(), key=lambda kv: -kv[1])[:8]
+                    log.debug("[gdelt_worker] per-query new: "
+                              + ", ".join(f"{q[:20]}={n}" for q, n in top))
             _worker_last_ok["gdelt"] = time.time()
             bo.reset()
         except Exception as e:
@@ -1383,6 +1394,15 @@ def purge_worker(store: ArticleStore):
         try:
             with _store_lock:
                 store.purge_old()
+            # Sweep away legacy per-query gdelt:* health keys (now recorded
+            # as a single aggregate "gdelt" key). Idempotent: 0 rows after
+            # the first pass.
+            try:
+                removed = source_health.delete_sources("gdelt:")
+                if removed:
+                    log.info(f"[purge] dropped {removed} legacy gdelt:* health keys")
+            except Exception as he:
+                log.warning(f"[purge_worker] source_health cleanup error: {he}")
             stats = store.stats()
             log.info(f"[purge] DB: {stats['total']} articles, {stats['db_mb']}MB")
             last_purge = time.time()
