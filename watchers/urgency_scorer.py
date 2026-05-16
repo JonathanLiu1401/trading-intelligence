@@ -22,6 +22,16 @@ URGENT_THRESHOLD = 8.0
 # Articles older than this cannot be urgent regardless of content language
 STALE_HOURS = 24.0
 STALE_SCORE_CAP = 5.9  # max score for stale articles (below urgent threshold)
+# When Sonnet hits its output-token limit the array comes back truncated and
+# core.json_extract salvages only a leading prefix of indices. The contract
+# there (and the existing empty-array guard below) is that the *caller*
+# re-queues whatever is missing rather than burying it. Truncation has a
+# distinct fingerprint: the returned indices are a clean prefix 0..k and the
+# entire tail k+1..N-1 is absent. A model deliberately skipping an article it
+# found ambiguous drops a handful at most; a long trailing block this size is
+# truncation, so those articles are re-queued (left ai_score=0) instead of
+# floored to noise.
+MAX_TRAILING_OMISSIONS = 5
 
 SCORE_PROMPT = """You are a real-time financial news urgency classifier. Score each article 0-10.
 
@@ -143,7 +153,24 @@ def score_batch(articles: list, store) -> int:
         # the queue. Only apply when Sonnet returned at least one valid entry —
         # a completely empty array is ambiguous (refusal vs. true zero) and we
         # prefer a retry over mass-mislabeling 100 articles as noise.
+        # Truncation guard: if the response is a clean prefix (indices
+        # 0..max_idx with no internal gaps) and the missing tail is longer
+        # than a model would plausibly omit on purpose, treat it as a
+        # token-limit truncation and re-queue the tail (leave ai_score=0)
+        # instead of flooring genuine articles to noise forever.
+        truncated_tail = False
         if scored_indices:
+            max_idx = max(scored_indices)
+            is_clean_prefix = scored_indices == set(range(max_idx + 1))
+            tail_len = len(articles) - (max_idx + 1)
+            if is_clean_prefix and tail_len > MAX_TRAILING_OMISSIONS:
+                truncated_tail = True
+                _log.warning(
+                    f"[urgency] Response looks truncated: got clean prefix "
+                    f"0..{max_idx} of {len(articles)}, re-queuing {tail_len} "
+                    f"tail articles instead of flooring them to noise"
+                )
+        if scored_indices and not truncated_tail:
             for i, art in enumerate(articles):
                 if i in scored_indices:
                     continue
