@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from storage.article_store import ArticleStore  # noqa: E402
+from storage.article_store import ArticleStore, _LIVE_ONLY_CLAUSE  # noqa: E402
 
 DASHBOARD_DIR = Path(__file__).resolve().parent
 DASHBOARD_HTML = DASHBOARD_DIR / "dashboard.html"
@@ -294,7 +294,7 @@ def _articles_per_hour_24h() -> list[dict[str, Any]]:
     try:
         rows = store().conn.execute(
             "SELECT first_seen FROM articles "
-            "WHERE first_seen >= datetime('now','-24 hours')"
+            f"WHERE first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_CLAUSE}"
         ).fetchall()
     except Exception:
         return []
@@ -334,7 +334,7 @@ def _articles_payload(limit: int = 50, min_score: float = 0.0) -> list[dict[str,
     try:
         rows = store().conn.execute(
             "SELECT id, url, title, source, published, kw_score, ai_score, urgency, first_seen "
-            "FROM articles WHERE MAX(ai_score, kw_score) >= ? "
+            f"FROM articles WHERE MAX(ai_score, kw_score) >= ? AND {_LIVE_ONLY_CLAUSE} "
             "ORDER BY ai_score DESC, kw_score DESC, first_seen DESC LIMIT ?",
             (min_score, max(1, min(500, limit))),
         ).fetchall()
@@ -344,6 +344,7 @@ def _articles_payload(limit: int = 50, min_score: float = 0.0) -> list[dict[str,
             "SELECT id, url, title, source, published, kw_score, ai_score, urgency, first_seen "
             "FROM articles "
             "WHERE (CASE WHEN ai_score>kw_score THEN ai_score ELSE kw_score END) >= ? "
+            f"AND {_LIVE_ONLY_CLAUSE} "
             "ORDER BY ai_score DESC, kw_score DESC, first_seen DESC LIMIT ?",
             (min_score, max(1, min(500, limit))),
         ).fetchall()
