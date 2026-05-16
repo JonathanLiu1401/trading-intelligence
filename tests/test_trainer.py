@@ -127,6 +127,72 @@ class _StubModel:
         }
 
 
+class _CaptureModel:
+    """Stub that records the y_rel array train_continuous() hands to
+    ArticleNet.fit, so the label-sourcing SQL can be asserted without torch."""
+
+    fitted = False
+
+    def __init__(self):
+        self.captured = None
+
+    def fit(self, X, y_rel, y_urg, **kw):
+        self.captured = y_rel
+        return {
+            "final_loss": 0.10, "val_loss": 0.12, "best_in_run": 0.12,
+            "new_best": False, "epochs": kw.get("epochs", 1), "device": "cpu",
+        }
+
+
+class TestContinuousLabelSourcing:
+    """train_continuous() carries its OWN inlined copy of the strong-label
+    SQL (trainer.py ~715) — a hot-path duplicate of _fetch_training_data that
+    runs every 2 min (CONTINUOUS_TRAIN_INTERVAL=120) vs the full trainer's
+    3 min. TestLabelSourcing only pins _fetch_training_data; the duplicate is
+    unguarded. If it ever drifts to match score_source='ml' rows, the
+    continuous trainer silently re-feeds the model its own predictions as
+    ground truth — the exact label-feedback loop the ml_score/ai_score split
+    exists to prevent — with no exception and a healthy-looking daemon log.
+    Same drift class as the dashboard-parity / vendored-signals cases.
+    """
+
+    def test_excludes_ml_and_includes_synthetic_and_llm(self, store,
+                                                         monkeypatch):
+        monkeypatch.setattr(trainer, "get_embedder", lambda: _StubEmbedder())
+        cap = _CaptureModel()
+        monkeypatch.setattr(trainer, "get_model", lambda: cap)
+        monkeypatch.setattr(trainer, "_log_metrics", lambda rec: None)
+        # train_continuous mutates this module global on success; pin it so the
+        # test is order-independent (monkeypatch restores it afterward).
+        monkeypatch.setattr(trainer, "_last_continuous_loss", float("inf"))
+
+        # score_source='ml' self-predictions — must NEVER reach training.
+        for i in range(5):
+            _insert(store, id=f"ml{i}", title=f"ml self-pred row {i} here",
+                    ai_score=8.5, score_source="ml")
+        # Synthetic backtest winner — must be included (CLAUDE.md §5).
+        _insert(store, id="bt_win", title="backtest winner one entry here",
+                ai_score=5.0, score_source=None,
+                url="backtest://run_9/d/BUY/MU",
+                source="backtest_run_9_winner")
+        # LLM ground truth — must be included.
+        for i in range(30):
+            _insert(store, id=f"llm{i}", title=f"llm ground truth row {i} ok",
+                    ai_score=7.0, score_source="llm")
+
+        result = trainer.train_continuous(store)
+
+        assert result["status"] == "ok", result
+        assert cap.captured is not None, "model.fit was never reached"
+        rels = list(cap.captured)
+        assert 8.5 not in rels, \
+            "score_source='ml' row leaked into the train_continuous pool"
+        assert 5.0 in rels, "synthetic backtest winner missing"
+        assert rels.count(7.0) == 30, "llm ground-truth rows missing"
+        # n counts only the kept rows (1 synthetic + 30 llm), never the 5 ml.
+        assert result["n"] == 31, result
+
+
 class TestTrainOrchestration:
     """Regression guard for the dataset-cache bug (commit 17e414b): train()
     referenced ``texts``/``articles`` after both code paths had stopped

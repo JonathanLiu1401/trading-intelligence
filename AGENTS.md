@@ -176,8 +176,17 @@ Suites:
   not a bug), cyclic feature bounds.
 - `test_model.py` — output bounds (relevance 0..10, urgency 0..1, no NaN on zero input).
 - `test_trainer.py` — `score_source='ml'` exclusion, synthetic-row inclusion, sample weighting,
-  and `TestTrainOrchestration` — regression guard that `train()` runs end-to-end on both the
-  fresh and disk-cache paths (see ML training pipeline note below).
+  `TestTrainOrchestration` — regression guard that `train()` runs end-to-end on both the
+  fresh and disk-cache paths (see ML training pipeline note below) — and
+  `TestContinuousLabelSourcing`, which pins the **inlined duplicate** of the
+  strong-label SQL inside `train_continuous` (trainer.py ~715). `TestLabelSourcing`
+  only covers `_fetch_training_data`; the duplicate is a separate copy on the
+  *hotter* path (every 2 min vs 3 min) that can silently drift to match
+  `score_source='ml'` rows and reopen the label-feedback loop with no exception
+  and a healthy-looking daemon log. Drives the real `train_continuous` (stubbed
+  model/embedder, mutation-verified) and asserts an `'ml'` row never reaches
+  `model.fit` while synthetic-backtest and `'llm'` rows do — same drift class as
+  the dashboard-parity / vendored-`signals.py` cases.
 - `test_briefing_boost.py` — `ArticleStore.update_scores_from_labels`, the sole writer of
   `score_source='briefing_boost'` (5h Opus heartbeat → strong training label). Pins the
   `MAX(ai_score, 4.5)` formula (never downgrades a stronger LLM label, never under-labels an
@@ -305,7 +314,11 @@ The trainer concatenates TF-IDF (15k dims) + 15 extra features. Sample-weighted 
 time_sensitivity.
 
 The model writes its predictions to `ml_score`. The trainer never reads `ml_score` — that's how the
-label-feedback loop stays closed.
+label-feedback loop stays closed. **Two code paths enforce this independently:** the strong-label
+`WHERE` clause is inlined verbatim in both `_fetch_training_data` (full retrain) and
+`train_continuous` (the 2-min fine-tune). They must stay byte-identical — editing one without the
+other lets the continuous trainer ingest `score_source='ml'` rows silently. Both are now pinned
+(`TestLabelSourcing`, `TestContinuousLabelSourcing`).
 
 **Early stopping.** `ArticleNet.fit` takes `early_stop_patience` (default 6, the `ml_trainer`/
 `continuous_trainer` callers leave it at the default). It only engages when a held-out val set
