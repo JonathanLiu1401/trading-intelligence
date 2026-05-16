@@ -144,15 +144,43 @@ def _get_db_path() -> Path:
     return LOCAL_PATH / "articles.db"
 
 
+# Path for which the schema has already been ensured in *this* process.
+# `executescript(SCHEMA) + commit()` is idempotent but not free: it is parsed
+# on every connect and the commit forces a transaction boundary. The daemon,
+# the dashboard, monitor.py and — notably — every spawned ml/trainer child
+# process open their own connection, so this ran far more than necessary.
+# Mirrors the proven guard in collectors/source_health.py.
+_schema_ready_path: str | None = None
+
+
+def _schema_present(conn: sqlite3.Connection) -> bool:
+    """Read-only check (no write lock) that the core tables already exist."""
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name IN ('articles', 'briefings')"
+    ).fetchall()
+    return len({r[0] for r in rows}) == 2
+
+
 def _connect() -> sqlite3.Connection:
+    global _schema_ready_path
     db = _get_db_path()
-    conn = sqlite3.connect(str(db), timeout=60, check_same_thread=False)
+    db_key = str(db)
+    conn = sqlite3.connect(db_key, timeout=60, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=-64000")   # 64MB cache
     conn.execute("PRAGMA busy_timeout=60000")  # wait up to 60s on lock
-    conn.executescript(SCHEMA)
-    conn.commit()
+    # Skip the executescript + commit on the hot path. The cheap sqlite_master
+    # read still runs on a fresh process so a brand-new / empty DB is always
+    # bootstrapped correctly; only the redundant write-transaction boundary on
+    # an already-initialised DB is elided. NOTE: like source_health.py this is
+    # create-only — a future column addition needs an explicit migration here,
+    # it will NOT be picked up by the IF NOT EXISTS schema alone.
+    if _schema_ready_path != db_key and not _schema_present(conn):
+        conn.executescript(SCHEMA)
+        conn.commit()
+    _schema_ready_path = db_key
     return conn
 
 
