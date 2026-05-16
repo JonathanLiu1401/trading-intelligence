@@ -465,3 +465,21 @@ wholesale — port only the change you intend, and keep the `_LIVE_ONLY_CLAUSE` 
   machine, and `get_unscored` train/serve age-field parity. Suite: **261 passed**
   (verified after a `__pycache__`/`.pytest_cache` clear — a stale assertion-rewrite
   cache reports a lower count, the phantom hazard documented under "Running tests").
+
+- **2026-05-16 (post-`b0f858d`)** — Re-review covering the only production-code change since
+  the entry above: `b0f858d` added three `EVENT_PATTERNS` to `triage/heuristic_scorer.py`
+  (`distress` bankruptcy/default 2.7, `legal` SEC/DOJ/FTC probe + securities/accounting fraud +
+  restatement 2.6, `exec_change` CEO/CFO departure 2.0, both word orders). No new bugs. The
+  three regexes are correctly placed *after* the `if kw == 0.0:` early-return, so the multiplier
+  only ever scales an already-domain-relevant article up (gate pinned by
+  `test_heuristic_scorer.py::test_distress_is_gated_behind_domain_keywords`); residual heuristic
+  imprecision (`prob\w+`→"problem", `exits?`→"…exit strategy") is bounded by the `kw>0` gate and
+  the `max(event_bonus, multiplier)` ceiling and is *not* a correctness bug — per the standing
+  "code is the spec, do not tune heuristics to prose" rule. All four task-critical invariant
+  assertions spot-verified present and value-asserting (not no-crash): `get_unalerted_urgent`
+  backtest exclusion, `update_ml_scores_batch`→`score_source='ml'`, `EXTRA_FEATURE_DIM == 15`,
+  `_fetch_training_data` `score_source='ml'` exclusion. Suite: **265 passed** (`b0f858d` shipped
+  +4 dedicated pattern tests; no test gap remained, so none added — adding duplicates would
+  violate the no-redundant-coverage discipline). Note: a large unrelated `config/sources.json`
+  working-tree delta and two `config/sources.json.bak.*` files predate this session and were
+  deliberately **not** committed (config data churn, out of scope for a code-review commit).
