@@ -323,6 +323,7 @@ def _worker_health_snapshot(now: float | None = None) -> dict:
         workers.append({
             "name": name,
             "state": state,
+            "alive": alive,
             "crashes_5m": crashes_5m,
             "total_crashes": total_crashes,
             "last_exception": last_exc,
@@ -367,17 +368,33 @@ def _worker_health_report() -> None:
         },
     )
     for w in snapshot["workers"]:
-        # INFO so it's visible in the rotated daemon.log and structured.jsonl
-        log.info(
-            f"[{w['name']}] alive state={w['state']} crashes_5m={w['crashes_5m']}",
-            extra={
-                "event": "worker_alive",
-                "worker": w["name"],
-                "state": w["state"],
-                "crashes_5m": w["crashes_5m"],
-                "total_crashes": w["total_crashes"],
-            },
+        # Reflect the *computed* liveness, not the raw supervisor state. A
+        # worker can have state=ok yet be counted in dead= because it has not
+        # pinged success in >15min; logging "alive state=ok" for it made the
+        # dead workers impossible to identify from the logs.
+        is_alive = w.get("alive", True)
+        age_s = w.get("last_ok_age_s")
+        age_txt = f"{age_s:.0f}s" if isinstance(age_s, (int, float)) else "n/a"
+        liveness = "alive" if is_alive else "DEAD"
+        msg = (
+            f"[{w['name']}] {liveness} state={w['state']} "
+            f"crashes_5m={w['crashes_5m']} last_ok={age_txt}"
         )
+        extra = {
+            "event": "worker_alive" if is_alive else "worker_dead",
+            "worker": w["name"],
+            "alive": is_alive,
+            "state": w["state"],
+            "crashes_5m": w["crashes_5m"],
+            "total_crashes": w["total_crashes"],
+            "last_ok_age_s": age_s,
+        }
+        # WARNING for dead workers so they surface above the INFO heartbeat
+        # noise; INFO keeps healthy pings visible in the rotated logs.
+        if is_alive:
+            log.info(msg, extra=extra)
+        else:
+            log.warning(msg, extra=extra)
     _write_supervisor_state(snapshot)
 
 
