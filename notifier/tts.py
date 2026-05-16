@@ -77,6 +77,16 @@ def _speak_kokoro(script: str):
     try:
         from kokoro_onnx import Kokoro
         import numpy as np
+        import logging as _logging
+
+        # kokoro_onnx pulls in phonemizer lazily here, AFTER core.logger
+        # configured logging at daemon startup. phonemizer.get_logger()
+        # resets its own logger back to WARNING on import, which defeats the
+        # startup-time suppression and floods structured.jsonl with benign
+        # "words count mismatch" lines on every alert. Re-assert ERROR level
+        # at the call site so it survives the lazy import.
+        for _noisy in ("phonemizer", "phonemizer.backend", "espeak"):
+            _logging.getLogger(_noisy).setLevel(_logging.ERROR)
 
         kokoro = Kokoro(str(KOKORO_MODEL), str(KOKORO_VOICES))
         samples, sample_rate = kokoro.create(
