@@ -204,6 +204,66 @@ def test_unchanged_after_hour_redumps_as_warning():
     assert new_dump == SOURCE_HEALTH_FULL_DUMP_SECS + 5
 
 
+# ── _connect: schema init is one-time-per-DB on the hot path ─────────────────
+#
+# _connect() runs on every collector pass across ~20 worker threads. The
+# schema executescript + PRAGMA migration probe must run once per DB, not on
+# every call, while still re-initializing when the DB path changes (tests).
+
+
+def _table_exists(conn) -> bool:
+    return conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='source_health'"
+    ).fetchone() is not None
+
+
+def test_schema_init_runs_once_then_is_skipped(sh, monkeypatch):
+    """Once the guard is set, _connect() must NOT re-run the schema script.
+
+    Proven behaviorally: drop the table out-of-band, reconnect, and confirm
+    it was *not* recreated (executescript was skipped). Resetting the guard
+    makes the next connect rebuild it.
+    """
+    monkeypatch.setattr(source_health, "_schema_ready_path", None)
+
+    conn = source_health._connect()  # first connect: schema created
+    try:
+        assert _table_exists(conn)
+        assert source_health._schema_ready_path is not None
+        conn.execute("DROP TABLE source_health")
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = source_health._connect()  # guard set -> schema NOT re-run
+    try:
+        assert not _table_exists(conn)
+    finally:
+        conn.close()
+
+    # Clearing the guard restores one-time init on the next connect.
+    monkeypatch.setattr(source_health, "_schema_ready_path", None)
+    sh.record_result("rss", 3)
+    assert sh.get_health_report()["rss"]["total_articles"] == 3
+
+
+def test_schema_reinitializes_when_db_path_changes(tmp_path, monkeypatch):
+    """A new DB path re-runs schema init even after a prior path was ready."""
+    monkeypatch.setattr(source_health, "_schema_ready_path", None)
+
+    db_a = tmp_path / "a" / "source_health.db"
+    monkeypatch.setattr(source_health, "_db_path_cache", db_a)
+    source_health.record_result("rss", 1)
+    assert "rss" in source_health.get_health_report()
+
+    db_b = tmp_path / "b" / "source_health.db"
+    monkeypatch.setattr(source_health, "_db_path_cache", db_b)
+    # Fresh DB: must have its own schema created, not skipped by the guard.
+    source_health.record_result("web", 2)
+    report_b = source_health.get_health_report()
+    assert "web" in report_b and "rss" not in report_b
+
+
 def test_no_trailing_space_when_only_newly_down():
     """Concise path with only newly_down: no stray trailing/leading space."""
     line, _, _, _ = _format_source_health_line(
