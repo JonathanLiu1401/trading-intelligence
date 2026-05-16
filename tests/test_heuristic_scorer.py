@@ -220,3 +220,48 @@ def test_distress_is_gated_behind_domain_keywords():
     r = score_article("Local bakery files for Chapter 11 bankruptcy", "", "Reuters", "")
     assert r["events"] == []
     assert r["reason"] == "no_keywords"
+
+
+# ── Multi-catalyst compounding ───────────────────────────────────────────────
+# An article that fires several *distinct* event categories is a materially
+# stronger signal than any one alone; the old max()-only event_bonus scored
+# both identically. The compounding uplift gates on n_distinct>=2, so single-
+# category scoring (and every test pinned to it) is unchanged.
+
+def test_single_event_category_leaves_bonus_untouched():
+    """One distinct category → no uplift: n_events==1 and the multiplier is
+    exactly the matched pattern's value, preserving the legacy contract."""
+    r = score_article("Buyback announced amid component shortage", "", "reddit", "")
+    assert r["n_events"] == 1
+    assert r["event_bonus"] == 2.0  # the lone "supply" multiplier, un-upflifted
+
+
+def test_multi_event_categories_score_strictly_higher():
+    """Same article, mid-range (un-clamped) score: adding a second distinct
+    category (analyst downgrade) must rank it strictly above the single-
+    category version, and the n_events count must reflect the difference."""
+    single = score_article("Buyback announced amid component shortage", "", "reddit", "")
+    multi = score_article(
+        "Buyback announced amid component shortage and analyst downgrade to sell",
+        "", "reddit", "",
+    )
+    assert single["n_events"] == 1
+    assert multi["n_events"] == 2
+    assert 0.0 < single["score"] < 10.0
+    assert 0.0 < multi["score"] < 10.0
+    assert multi["score"] > single["score"]
+    assert multi["event_bonus"] > single["event_bonus"]
+
+
+def test_multi_event_bonus_is_hard_capped():
+    """Stacking many catalysts can never push event_bonus past the cap, so a
+    multi-catalyst article cannot run away above a top-tier single crisis."""
+    from triage.heuristic_scorer import MULTI_EVENT_BONUS_CAP
+    r = score_article(
+        "Chip maker earnings beat estimates, raises guidance above consensus, "
+        "analyst upgrade to buy, NAND shortage, capex increase 30% billion, "
+        "DRAM pricing up 20%, SEC investigation, CEO resigns, files for bankruptcy",
+        "", "Reuters", "",
+    )
+    assert r["n_events"] >= 4
+    assert r["event_bonus"] <= MULTI_EVENT_BONUS_CAP
