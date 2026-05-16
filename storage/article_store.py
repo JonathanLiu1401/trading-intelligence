@@ -442,11 +442,20 @@ class ArticleStore:
             return 0
         placeholders = ",".join("?" * len(urls))
         with self._write_lock:
+            # Defense-in-depth: this is a *write* of strong ground-truth labels
+            # (briefing_boost is read by the trainer with the same weight as
+            # 'llm'). The label list is derived from get_top_for_briefing()
+            # which is already live-only, so a backtest:// URL cannot reach
+            # here today — but if it ever did, MAX(ai_score, 4.5) would rewrite
+            # a synthetic row's fractional outcome label (a SELL-loser's 0.5 →
+            # 4.5) and flip its source tag, silently poisoning the training
+            # pool. Apply _LIVE_ONLY_CLAUSE so this write keeps the same
+            # backtest-isolation discipline as every other live path.
             cur = self.conn.execute(
                 f"UPDATE articles SET ai_score = MAX(ai_score, 4.5), "
                 f"score_source = CASE WHEN score_source='llm' THEN 'llm' "
                 f"ELSE 'briefing_boost' END "
-                f"WHERE url IN ({placeholders})",
+                f"WHERE url IN ({placeholders}) AND {_LIVE_ONLY_CLAUSE}",
                 urls,
             )
             n = cur.rowcount

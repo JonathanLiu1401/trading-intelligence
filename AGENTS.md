@@ -51,6 +51,13 @@ live pipeline applies it:
 - `get_unalerted_urgent` — for the alert worker
 - `get_top_for_briefing` — for the 5h Opus briefing
 - `count_unscored`, `stats` — for monitoring
+- `update_scores_from_labels` — *write* path: the only producer of
+  `score_source='briefing_boost'` (read by the trainer as strong ground truth).
+  Its label list is derived from the already-live-only `get_top_for_briefing`,
+  but it carries the clause as defense-in-depth so a future change to the
+  briefing-label path can't promote a synthetic SELL-loser's `0.5` outcome
+  label to `4.5` and poison the training pool. Pinned by
+  `tests/test_briefing_boost.py::TestBriefingBoostBacktestIsolation`.
 
 `send_urgent_alert` has a defense-in-depth re-filter so a future caller that bypasses the store
 can't leak synthetic rows into Discord. Tests in `tests/test_article_store.py::TestBacktestIsolation`
@@ -117,6 +124,15 @@ cd /home/zeph/digital-intern && python3 -m pytest tests/ -v
 Tests use in-memory-ish SQLite via a `tmp_path`-redirected store fixture (`tests/conftest.py`).
 External calls (Claude CLI, network) are patched. No GPU required for the model tests — they
 exercise the `ArticleNetModule` directly on CPU.
+
+**Phantom failures from a stale pytest cache.** pytest's assertion-rewrite
+bytecode (`**/__pycache__/*.pyc`) can lag behind an edited test file and
+surface as a failure that no longer exists in the source (observed:
+`test_source_health_stale.py` showing an old `monkeypatch.setattr` body that
+had already been replaced with a behavioral version). If a failure's traceback
+does not match the current file content, clear the caches and re-run:
+`find . -name __pycache__ -type d -exec rm -rf {} + && rm -rf .pytest_cache`.
+This is a dev-loop hazard, not a code bug — don't "fix" code chasing it.
 
 **Fixture convention — `first_seen` must be time-relative.** `get_unalerted_urgent` and
 `get_top_for_briefing` enforce a 24h `first_seen` freshness window. Test `_insert*` helpers
