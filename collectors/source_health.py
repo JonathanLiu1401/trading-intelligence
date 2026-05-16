@@ -45,6 +45,13 @@ CREATE TABLE IF NOT EXISTS source_health (
 _lock = threading.Lock()
 _db_path_cache: Path | None = None
 
+# Path whose schema + legacy-column migration has already been ensured this
+# process. _connect() runs on the hot path (every collector pass, ~20 worker
+# threads, continuously); the executescript + PRAGMA introspection only need
+# to happen once per DB. Keyed by path (not a bool) so tests that monkeypatch
+# `_db_path_cache` to a fresh tmp DB still get their schema created.
+_schema_ready_path: Path | None = None
+
 
 def _resolve_db_path() -> Path:
     """Place source_health.db alongside articles.db."""
@@ -64,21 +71,29 @@ def _resolve_db_path() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
+    global _schema_ready_path
     db = _resolve_db_path()
     db.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db), timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
-    # Migrate older schemas (column `source_name` -> `source`) by dropping table
-    try:
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(source_health)").fetchall()]
-        if cols and "source" not in cols:
-            conn.execute("DROP TABLE IF EXISTS source_health")
-            conn.commit()
-    except Exception:
-        pass
-    conn.executescript(SCHEMA)
-    conn.commit()
+    if _schema_ready_path != db:
+        # One-time-per-DB schema creation + legacy-column migration
+        # (`source_name` -> `source`, by dropping the table). CREATE TABLE
+        # IF NOT EXISTS is idempotent and the schema never changes within a
+        # process, so this is skipped on every subsequent connect on the
+        # hot path. Only set the guard after a successful commit so a
+        # failed init is retried next call.
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(source_health)").fetchall()]
+            if cols and "source" not in cols:
+                conn.execute("DROP TABLE IF EXISTS source_health")
+                conn.commit()
+        except Exception:
+            pass
+        conn.executescript(SCHEMA)
+        conn.commit()
+        _schema_ready_path = db
     return conn
 
 
