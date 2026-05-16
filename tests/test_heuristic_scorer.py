@@ -155,3 +155,29 @@ def test_score_and_rank_respects_top_n():
         for i in range(5)
     ]
     assert len(score_and_rank(arts, min_score=1.0, top_n=3)) == 3
+
+
+# ── Plural-form event detection ──────────────────────────────────────────────
+# Past gap: supply/regulatory/capex EVENT_PATTERNS ended a count-noun group
+# with ``\b``, so the singular "new fab" / "chip shortage" / "export control
+# on chips" fired the multiplier but the (more common) plural phrasing —
+# "new fabs", "chip shortages", "export controls on chips" — silently did
+# not, systematically under-scoring real supply/capex/regulatory headlines.
+# Events are gated behind kw>0 and only ever multiply already-relevant
+# articles up, so widening to plurals adds signal without new false positives.
+
+def test_plural_capex_fires_like_singular():
+    sing = score_article("TSMC breaks ground on new fab in Arizona", "", "Reuters", "")
+    plur = score_article("TSMC and Samsung break ground on new fabs in Arizona", "", "Reuters", "")
+    fnd = score_article("Intel to build new foundries amid demand", "", "Reuters", "")
+    assert "capex" in sing["events"]
+    assert "capex" in plur["events"]
+    assert "capex" in fnd["events"]
+    assert plur["score"] == sing["score"]
+
+
+def test_plural_supply_and_regulatory_fire():
+    sh = score_article("Chip shortages worsen as DRAM demand outstrips supply", "", "Reuters", "")
+    rg = score_article("US imposes new export controls on advanced memory chips", "", "Reuters", "")
+    assert "supply" in sh["events"]
+    assert "regulatory" in rg["events"]
