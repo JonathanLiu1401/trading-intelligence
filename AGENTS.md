@@ -449,6 +449,18 @@ authoritative copy already carried it. Re-synced (filter only) and pinned by
 wholesale — port only the change you intend, and keep the `_LIVE_ONLY_CLAUSE` filter on every
 `articles` read.
 
+**`_db_path()` freshness fix ported (2026-05-16).** The authoritative copy's
+`_db_path()` was existence-first (`USB-if-exists`), so when this daemon falls back to writing the
+**LOCAL** copy (USB mount unavailable for writes) the live trader silently read the day-stale USB
+mirror while every LOCAL-first surface read fresh news — a split-brain that was *detected* but
+never root-fixed. It is now freshness-aware: it picks the candidate whose newest **live** article
+(same `_LIVE_ONLY_CLAUSE` so an injected `backtest://` batch can't make a stale mirror win) is most
+recent; USB still wins a tie. The resolver (only) was ported into this vendored snapshot; behavioral
+parity — fresh-LOCAL beats stale-USB, USB-on-tie, synthetic-row exclusion — is pinned by the two new
+cases in `tests/test_paper_trader_signals_isolation.py`. Operator CLI on the authoritative side:
+`python3 -m paper_trader.signals --check-freshness` (exit 3 = a stale trader process is reading the
+old USB; RESTART it — the on-disk fix only applies on next start).
+
 ---
 
 ## Review log
