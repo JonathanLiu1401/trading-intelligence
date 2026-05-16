@@ -1391,11 +1391,76 @@ def purge_worker(store: ArticleStore):
             log.warning(f"[purge_worker] error: {e}")
 
 
+# ── Source-health line formatter (pure, unit-tested) ─────────────────────────
+SOURCE_HEALTH_FULL_DUMP_SECS = 3600
+
+
+def _format_source_health_line(
+    disabled, stale, down, last_down_sig, last_full_dump, now
+):
+    """Build the [source_health] log line + decide level and new state.
+
+    Pure function so the steady-state log-bloat behaviour can be unit-tested
+    without threads or a live logger.
+
+    Returns ``(line, level, new_last_down_sig, new_last_full_dump)`` where
+    ``level`` is one of ``"warning"`` / ``"info"``.
+
+    Behaviour:
+      * Down-set changed -> WARNING with counts + delta (newly_down /
+        recovered) only. The full ``list=`` is appended ONLY when this is the
+        first observation (``last_down_sig is None``) or the hourly safety-net
+        has elapsed.
+      * Down-set unchanged -> concise INFO ``(unchanged)``, UNLESS the hourly
+        safety net has elapsed, in which case a WARNING with the full list is
+        emitted so the audit can always reconstruct state.
+    """
+    down = list(down)
+    down_sig = tuple(down)
+    n = f"disabled={len(disabled)} stale={len(stale)} down={len(down)}"
+    new_full_dump = last_full_dump
+    full_due = (now - last_full_dump) >= SOURCE_HEALTH_FULL_DUMP_SECS
+
+    if down_sig != last_down_sig:
+        prev = set(last_down_sig or ())
+        cur = set(down)
+        newly = sorted(cur - prev)
+        recovered = sorted(prev - cur)
+        parts = [f"[source_health] {n}"]
+        if newly:
+            parts.append(f"newly_down={newly}")
+        if recovered:
+            parts.append(f"recovered={recovered}")
+        first_seen = last_down_sig is None
+        if first_seen or full_due:
+            parts.append(f"list={down}")
+            new_full_dump = now
+        line = " ".join(parts)
+        return line, "warning", down_sig, new_full_dump
+
+    # Unchanged down-set.
+    if full_due:
+        new_full_dump = now
+        return (
+            f"[source_health] {n} (unchanged) list={down}",
+            "warning",
+            down_sig,
+            new_full_dump,
+        )
+    return (
+        f"[source_health] {n} (unchanged)",
+        "info",
+        down_sig,
+        new_full_dump,
+    )
+
+
 # ── Stats reporter — every 60s, but only emit when changed or 5min elapsed ───
 def stats_worker(store: ArticleStore):
     last_sig = None
     last_emit = 0.0
     last_down_sig = None
+    last_full_dump = 0.0
     HEARTBEAT_SECS = 300
     while _running:
         _sleep(60)
@@ -1423,33 +1488,13 @@ def stats_worker(store: ArticleStore):
                     stale = source_health.get_stale_sources()
                     if disabled or stale:
                         down = sorted(set(disabled) | set(stale))
-                        down_sig = tuple(down)
-                        if down_sig != last_down_sig:
-                            # Down-set changed: emit the full list once, plus
-                            # an explicit delta so the audit can see exactly
-                            # what newly broke or recovered.
-                            prev = set(last_down_sig or ())
-                            cur = set(down)
-                            newly = sorted(cur - prev)
-                            recovered = sorted(prev - cur)
-                            delta = ""
-                            if newly:
-                                delta += f" newly_down={newly}"
-                            if recovered:
-                                delta += f" recovered={recovered}"
-                            log.warning(
-                                f"[source_health] disabled={len(disabled)} "
-                                f"stale={len(stale)} down={len(down)}"
-                                f"{delta} list={down}"
+                        line, level, last_down_sig, last_full_dump = (
+                            _format_source_health_line(
+                                disabled, stale, down,
+                                last_down_sig, last_full_dump, now,
                             )
-                            last_down_sig = down_sig
-                        else:
-                            # Unchanged: concise count only, no 6KB dump.
-                            log.info(
-                                f"[source_health] disabled={len(disabled)} "
-                                f"stale={len(stale)} down={len(down)} "
-                                f"(unchanged)"
-                            )
+                        )
+                        getattr(log, level)(line)
                     elif last_down_sig is not None:
                         log.warning("[source_health] all sources recovered")
                         last_down_sig = None
