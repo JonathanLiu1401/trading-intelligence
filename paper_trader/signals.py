@@ -83,6 +83,8 @@ def get_top_signals(n: int = 20, hours: int = 2, min_score: float = 4.0) -> list
         rows = conn.execute(
             "SELECT id, url, title, source, ai_score, urgency, first_seen, full_text "
             "FROM articles WHERE first_seen >= ? AND ai_score >= ? "
+            "AND url NOT LIKE 'backtest://%' AND source NOT LIKE 'backtest_%' "
+            "AND source NOT LIKE 'opus_annotation%' "
             "ORDER BY ai_score DESC, first_seen DESC LIMIT ?",
             (since, min_score, n),
         ).fetchall()
@@ -114,7 +116,9 @@ def get_ticker_sentiment(ticker: str, hours: int = 4) -> dict:
     try:
         rows = conn.execute(
             "SELECT title, full_text, ai_score, urgency FROM articles "
-            "WHERE first_seen >= ? AND ai_score > 0",
+            "WHERE first_seen >= ? AND ai_score > 0 "
+            "AND url NOT LIKE 'backtest://%' AND source NOT LIKE 'backtest_%' "
+            "AND source NOT LIKE 'opus_annotation%'",
             (since,),
         ).fetchall()
     finally:
@@ -149,6 +153,8 @@ def get_urgent_articles(minutes: int = 30) -> list[dict]:
         rows = conn.execute(
             "SELECT id, title, source, ai_score, urgency, first_seen, full_text "
             "FROM articles WHERE urgency >= 1 AND first_seen >= ? "
+            "AND url NOT LIKE 'backtest://%' AND source NOT LIKE 'backtest_%' "
+            "AND source NOT LIKE 'opus_annotation%' "
             "ORDER BY ai_score DESC LIMIT 20",
             (since,),
         ).fetchall()
@@ -217,7 +223,9 @@ def ticker_sentiments(tickers: list[str], hours: int = 4) -> list[dict]:
     try:
         rows = conn.execute(
             "SELECT title, full_text, ai_score, urgency FROM articles "
-            "WHERE first_seen >= ? AND ai_score > 0",
+            "WHERE first_seen >= ? AND ai_score > 0 "
+            "AND url NOT LIKE 'backtest://%' AND source NOT LIKE 'backtest_%' "
+            "AND source NOT LIKE 'opus_annotation%'",
             (since,),
         ).fetchall()
     finally:
