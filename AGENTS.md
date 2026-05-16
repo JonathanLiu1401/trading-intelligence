@@ -175,6 +175,17 @@ Suites:
   live trader; all four must inline the `_LIVE_ONLY_CLAUSE` fragment (see "Cross-system
   contract" below — the vendored copy had drifted out of sync with the authoritative
   source and was leaking synthetic rows; this suite pins it).
+- `test_inference_grey_zone.py` — `ml/inference.py::score_articles` LLM-routing
+  decision. Pins that `needs_llm` keys the grey band on the **urgency** head, not
+  relevance (see "Inference routing" below), that wide relevance variance forces
+  the LLM regardless, that `confident_noise` suppresses routing, and the
+  unfitted-model `rel_std==99` sentinel. Stubs the embedder/model so the decision
+  is deterministic without a checkpoint.
+- `test_published_staleness.py` — `storage.article_store::_published_older_than`,
+  the authoritative 24h briefing-staleness gate. Asserts the exact regression it
+  defeats: an old RFC822 date that lex-sorts *after* the ISO cutoff (so the SQL
+  `published >= ?` pre-filter keeps it) is still correctly flagged stale; plus
+  ISO/`Z`-suffix/naive-UTC parsing and the keep-on-unparseable policy.
 
 ---
 
@@ -244,6 +255,35 @@ Discord `is_alert=True` ping at the threshold (`ML_RETRAIN_FAIL_ALERT_THRESHOLD=
 every further multiple (6, 9, …) so a persistently broken trainer can't go stale silently again
 without flooding the channel. `core/retrain_guard.py` owns the policy precisely so it stays testable
 in isolation from the GPU/daemon machinery; `tests/test_retrain_guard.py` pins it.
+
+---
+
+## Inference routing (grey zone)
+
+`ml/inference.py::score_articles` decides per article whether the local model's
+score stands or the article is escalated to Sonnet (`needs_llm=True`). The
+decision is:
+
+```
+confident_noise = rel < LLM_ZONE_CLEAR_NOISE and rel_std < UNCERTAINTY_REL
+in_grey         = LLM_ZONE_MID_LO <= urg <= LLM_ZONE_MID_HI      # URGENCY head
+uncertain       = rel_std > UNCERTAINTY_REL or urg_std > UNCERTAINTY_URG
+needs_llm       = (in_grey or uncertain) and not confident_noise
+```
+
+**`in_grey` keys on the urgency head, not relevance.** The urgency head is a
+sigmoid probability scaled to 0..10; `LLM_ZONE_MID_LO..HI` (7.0, 8.5) straddles
+the 8.0 urgent threshold, so an urgency estimate near the alert boundary is what
+gets escalated for an urgent/not-urgent call. CLAUDE.md's glossary and
+`ml/model.py`'s docstring loosely call this the "relevance grey zone" — that
+wording is imprecise; **the code is the spec.** Repointing `in_grey` at `rel`
+silently changes which articles burn a Sonnet call. Pinned by
+`tests/test_inference_grey_zone.py`; do not "fix" the code to match the prose.
+
+`scorer_worker` also force-routes a narrow `3.8 <= max(rel,urg) <= 4.3` band to
+the LLM independently of this. The unfitted model returns the `rel_std==99`
+sentinel, which makes every article `needs_llm` and is also the value
+`scorer_worker` checks before persisting `time_sensitivity`.
 
 ---
 
