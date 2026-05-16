@@ -32,6 +32,11 @@ def test_real_message_posts_once_and_fires_tts(monkeypatch):
         assert discord_notifier.send("Micron raises DRAM guidance") is True
         post.assert_called_once()
         tts.assert_called_once()
+        # A custom User-Agent must be sent: Discord 403-filters bare default
+        # library UAs, so a missing/empty header would silently drop alerts.
+        headers = post.call_args.kwargs.get("headers") or {}
+        ua = headers.get("User-Agent", "")
+        assert ua and "python-requests" not in ua.lower()
 
 
 def test_empty_message_skips_before_webhook_lookup(monkeypatch):
