@@ -27,7 +27,8 @@ from datetime import datetime, timezone
 import pytest
 
 
-def _insert(store, *, id, url, ai_score=0.0, score_source=None, source="rss"):
+def _insert(store, *, id, url, ai_score=0.0, score_source=None, source="rss",
+            ml_score=None):
     """Insert a row bypassing the public API so a precise pre-state can be set."""
     first_seen = datetime.now(timezone.utc).isoformat()
     with store._write_lock:
@@ -37,7 +38,7 @@ def _insert(store, *, id, url, ai_score=0.0, score_source=None, source="rss"):
             "first_seen, cycle, ml_score, score_source) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (id, url, f"title {id}", source, "", 1.0, ai_score, 0,
-             first_seen, 0, None, score_source),
+             first_seen, 0, ml_score, score_source),
         )
         store.conn.commit()
 
@@ -90,6 +91,40 @@ class TestBriefingBoost:
         ai_score, src = row()
         assert ai_score == pytest.approx(4.5)
         assert src == "llm"
+
+    def test_model_scored_row_promoted_off_ml_into_training_pool(self, store):
+        """A row the local model scored (``score_source='ml'``, ``ai_score=0``,
+        ``ml_score`` set) that Opus then curates into the briefing MUST be
+        promoted to ``ai_score=4.5`` / ``score_source='briefing_boost'`` — it
+        must NOT stay tagged ``'ml'``.
+
+        Why this is load-bearing and not covered above: the trainer's strong
+        pool is ``score_source IN ('llm','briefing_boost')`` — it deliberately
+        ignores ``'ml'`` to keep the label-feedback loop closed. The CASE in
+        ``update_scores_from_labels`` is ``WHEN score_source='llm' THEN 'llm'
+        ELSE 'briefing_boost'`` precisely so an Opus-curated model row crosses
+        into the trained-on pool. Every existing TestBriefingBoost case uses
+        ``score_source`` of ``None`` or ``'llm'``; none exercises the ``'ml'``
+        branch. If the CASE ever regressed to preserving any non-NULL source
+        (``WHEN score_source IS NOT NULL THEN score_source ...``), an 'ml' row
+        would stay 'ml' and Opus's strongest curation signal would be silently
+        dropped from training with no test failing. ``ml_score`` is left
+        untouched (the row keeps its model prediction)."""
+        row = _insert(store, id="ml1", url="https://x.com/ml1",
+                      ai_score=0.0, ml_score=7.2, score_source="ml")
+        n = store.update_scores_from_labels(
+            [{"url": "https://x.com/ml1", "in_briefing": True}]
+        )
+        assert n == 1
+        ai_score, src = row()
+        assert ai_score == pytest.approx(4.5), "model row not promoted to 4.5"
+        assert src == "briefing_boost", (
+            "model-scored row stayed 'ml' — Opus curation lost to the trainer"
+        )
+        ml_score = store.conn.execute(
+            "SELECT ml_score FROM articles WHERE id=?", ("ml1",)
+        ).fetchone()[0]
+        assert ml_score == pytest.approx(7.2), "model prediction clobbered"
 
     def test_not_in_briefing_is_ignored(self, store):
         """Labels with in_briefing=False must not touch the row at all —
