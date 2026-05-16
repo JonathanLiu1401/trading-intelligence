@@ -965,6 +965,8 @@ _DASHBOARD_HTML = """<!doctype html>
       --radius-sm: 5px;
     }
     * { box-sizing: border-box; }
+    html { overflow-x: hidden; max-width: 100%; }
+    body { overflow-x: hidden; }
     body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 15px; line-height: 1.5; }
     .brand, h1, h2, h3 { font-family: var(--font-display); }
     .topbar {
@@ -979,6 +981,8 @@ _DASHBOARD_HTML = """<!doctype html>
       top: 0;
       z-index: 100;
       margin: 0;
+      overflow: hidden;
+      max-width: 100%;
     }
     .brand {
       font-weight: 700;
@@ -1001,7 +1005,7 @@ _DASHBOARD_HTML = """<!doctype html>
     }
     .topbar a:hover { color: var(--text); background: var(--bg-hover); }
     .topbar a.active { color: var(--amber); background: var(--amber-dim); }
-    .page-content { padding: 16px 20px; }
+    .page-content { padding: 16px 20px; width: 100%; }
     /* Bootstrap overrides — apply our palette to the existing Bootstrap card structure */
     .card { background: var(--bg-panel) !important; border: 1px solid var(--border) !important; border-radius: var(--radius) !important; }
     .card-header { background: var(--bg-elevated) !important; font-weight: 600; border-bottom: 1px solid var(--border) !important; color: var(--text); }
@@ -1750,6 +1754,8 @@ _CHAT_HTML = """<!doctype html>
       --radius-sm: 5px;
     }
     * { box-sizing: border-box; }
+    html { overflow-x: hidden; max-width: 100%; }
+    body { overflow-x: hidden; }
     html, body { margin: 0; padding: 0; height: 100%; }
     body {
       background: var(--bg); color: var(--text);
@@ -1772,6 +1778,8 @@ _CHAT_HTML = """<!doctype html>
       z-index: 100;
       margin: 0;
       flex-shrink: 0;
+      overflow: hidden;
+      max-width: 100%;
     }
     .brand {
       font-weight: 700;
@@ -1799,6 +1807,7 @@ _CHAT_HTML = """<!doctype html>
       display: flex;
       flex-direction: column;
       min-height: 0;
+      width: 100%;
     }
     header.page {
       padding: 18px 24px 12px; border-bottom: 1px solid var(--border);
