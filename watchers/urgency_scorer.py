@@ -19,9 +19,11 @@ except Exception:
 SONNET_MODEL = "claude-sonnet-4-6"
 BATCH_SIZE = 100  # articles per Sonnet call
 URGENT_THRESHOLD = 8.0
-# Articles older than this cannot be urgent regardless of content language
-STALE_HOURS = 24.0
-STALE_SCORE_CAP = 5.9  # max score for stale articles (below urgent threshold)
+# Hard cap kicks in only for clearly stale articles (>48h).
+# Timeless content (structural supply shifts, filings) can still be urgent within this window.
+# The prompt instructs Claude to apply tighter judgment at >24h for time-sensitive language.
+STALE_HOURS = 48.0
+STALE_SCORE_CAP = 5.9  # max score for hard-capped stale articles (below urgent threshold of 8)
 # When Sonnet hits its output-token limit the array comes back truncated and
 # core.json_extract salvages only a leading prefix of indices. The contract
 # there (and the existing empty-array guard below) is that the *caller*
@@ -53,9 +55,12 @@ RELEVANT (5-7): Important but not immediately actionable:
 
 NOISE (0-4): Not relevant to this portfolio
 
-STALENESS RULE: Each article includes age_hours (how old it is). If age_hours > 24, the article \
-is stale — cap your score at 5 even if the text says "today", "breaking", "just announced", or \
-"this week". Time-sensitive language in old articles is misleading; do not reward it.
+STALENESS RULE: Each article includes age_hours. Use judgment:
+- If the article uses time-sensitive language ("today", "breaking", "just announced", "this week", \
+"yesterday") AND age_hours > 24 → the temporal claim is stale; cap your score at 5.
+- If the content is fundamentally timeless (structural supply-chain shift, regulatory ruling, \
+major SEC filing, long-term analyst thesis on tracked stocks) → score on merit regardless of age.
+- If age_hours > 72 and urgency depends entirely on the event being recent → score ≤ 3.
 
 Articles:
 {articles_json}
