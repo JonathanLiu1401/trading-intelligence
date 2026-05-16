@@ -139,6 +139,11 @@ Suites:
   fresh and disk-cache paths (see ML training pipeline note below).
 - `test_integration_pipeline.py` — cross-module flows (ingest→score→alert, end-to-end backtest
   isolation, concurrent-writer safety).
+- `test_retrain_guard.py` — `core/retrain_guard.py` escalation policy: fires exactly at the
+  consecutive-failure threshold and on every multiple after, never below it, never on a
+  non-positive count or misconfigured threshold (see ML pipeline note below).
+- `test_alert_dedup.py` / `test_logger_rotation.py` — syndication dedup signature/merge rules and
+  size-rotation of `logs/structured.jsonl`.
 
 ---
 
@@ -189,6 +194,16 @@ Anything after that point operates on `X / y_rel / y_urg / y_time` only — re-e
 pre-cache code shape) raises `NameError` on every cycle and ArticleNet silently stops retraining
 while the daemon log still looks healthy. `TestTrainOrchestration` covers both branches.
 
+**Retrain-failure escalation (safety net for the above).** The `NameError` blind spot was invisible
+because `ml_trainer_worker` swallows retrain exceptions as `WARNING`, and the hourly healthcheck only
+greps `ERROR`/`CRITICAL`. `ml_trainer_worker` now keeps a `consec_fail` counter (reset on any
+successful or *skipped* train — a too-few-samples skip is not a failure) and routes the
+escalate-or-not decision to the pure, unit-tested `core/retrain_guard.py::should_alert`. It fires a
+Discord `is_alert=True` ping at the threshold (`ML_RETRAIN_FAIL_ALERT_THRESHOLD=3`) and re-pings on
+every further multiple (6, 9, …) so a persistently broken trainer can't go stale silently again
+without flooding the channel. `core/retrain_guard.py` owns the policy precisely so it stays testable
+in isolation from the GPU/daemon machinery; `tests/test_retrain_guard.py` pins it.
+
 ---
 
 ## Common failure modes
@@ -201,6 +216,7 @@ while the daemon log still looks healthy. `TestTrainOrchestration` covers both b
 | Backtest articles leaking into Discord | A new query forgot `_LIVE_ONLY_CLAUSE`. | Grep for `FROM articles WHERE` in the store; verify every live-read path filters. Re-run `tests/test_article_store.py::TestBacktestIsolation`. |
 | Model trains on its own predictions | A new write path put model output into `ai_score`. | Use `update_ml_scores_batch` for predictions, `update_ai_scores_batch` for LLM labels. Re-run `tests/test_article_store.py::TestScoreSourceSeparation`. |
 | `val_loss` flat forever, model never improves, `[ml_trainer] Retrain error: name 'texts' is not defined` in `daemon.log` | A code path after dataset prep re-references `texts`/`articles` (deleted/never-built). `train()` raises every cycle but the worker swallows it as a WARNING, so the daemon looks alive. | Keep all post-prep code on `X/y_rel/y_urg/y_time`. Re-run `tests/test_trainer.py::TestTrainOrchestration`. |
+| Discord `🚨 ML TRAINER STUCK: N consecutive retrain failures` | Any persistent `ml_train` exception (the `texts` NameError above, a corrupt `dataset_cache.npz`, GPU driver fault). `core/retrain_guard.py` escalates so the WARNING-only blind spot can't recur silently. | Read the `Last error:` in the alert; tail `[ml_trainer] Retrain error (#N)` in `daemon.log` for the full traceback. Counter resets on the next successful/skipped cycle. |
 | Heartbeat briefing posts placeholder text | `claude_analyst.analyze` returned `[analyst] No response from Claude.` | `heartbeat_worker` detects this and retries in 5 min instead of waiting the full 5 h. |
 | Articles permanently stuck unscored | Sonnet returned an empty or partial response | `score_batch` floors unscored items at 0.01 when Sonnet returned at least one valid entry; the queue must drain over 1–2 cycles. |
 | GPU OOM | Concurrent `_inject_and_train` from paper-trader during `ml_trainer_worker` retrain. | `_TRAIN_LOCK` serializes; lower paper-trader's `RUNS_PER_CYCLE`. `_handle_memory_error` clears CUDA cache. |
