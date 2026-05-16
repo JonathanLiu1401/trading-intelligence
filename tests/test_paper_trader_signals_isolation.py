@@ -97,3 +97,64 @@ def test_ticker_sentiments_bulk_ignores_synthetic(signals_db):
     mu = next(r for r in res if r["ticker"] == "MU")
     assert mu["n"] == 1, f"synthetic rows inflated bulk ticker count: {mu}"
     assert mu["avg_score"] == pytest.approx(9.0)
+
+
+# ───────────────────── vendored DB-resolver parity ─────────────────────────
+# The authoritative paper-trader copy gained a freshness-aware `_db_path()`
+# (root-fix for the USB-stale split-brain — the daemon falls back to writing
+# LOCAL, leaving a stale USB mirror the live trader kept reading). The
+# Cross-system contract says port only the intended change into this vendored
+# snapshot. This is the parity guard: the vendored resolver must pick the
+# freshest *live* DB (ignoring a newer synthetic row on the stale mirror),
+# not blindly prefer USB-if-exists — exactly like the authoritative copy.
+from datetime import timedelta
+
+
+def _build_db_at(path, live_first_seen: str, backtest_first_seen: str | None = None):
+    conn = sqlite3.connect(str(path))
+    conn.executescript(SCHEMA)
+    rows = [("live", "https://reuters.com/x", "MU live wire", "rss", "",
+             1.0, 9.0, 0, live_first_seen, 0, None, "llm")]
+    if backtest_first_seen is not None:
+        rows.append(("bt", "backtest://run_1/2026-01-01/BUY/MU",
+                     "synthetic newer row", "backtest_run_1_winner", "",
+                     1.0, 5.0, 0, backtest_first_seen, 0, None, None))
+    conn.executemany(
+        "INSERT INTO articles (id, url, title, source, published, kw_score, "
+        "ai_score, urgency, first_seen, cycle, ml_score, score_source) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    conn.commit()
+    conn.close()
+
+
+def test_vendored_resolver_picks_fresh_local_over_stale_usb(tmp_path, monkeypatch):
+    usb = tmp_path / "usb" / "articles.db"
+    local = tmp_path / "local" / "articles.db"
+    usb.parent.mkdir()
+    local.parent.mkdir()
+    now = datetime.now(timezone.utc)
+    stale = (now - timedelta(hours=30)).isoformat()
+    fresh = (now - timedelta(hours=1)).isoformat()
+    # USB: live row 30h old + a NEWER synthetic row the live-only freshness
+    # probe must ignore (else the stale mirror falsely wins).
+    _build_db_at(usb, live_first_seen=stale,
+                 backtest_first_seen=(now - timedelta(minutes=5)).isoformat())
+    _build_db_at(local, live_first_seen=fresh)
+    monkeypatch.setattr(signals, "USB_DB", usb)
+    monkeypatch.setattr(signals, "LOCAL_DB", local)
+    signals._reset_resolver_cache()
+    assert signals._db_path() == local
+
+
+def test_vendored_resolver_prefers_usb_on_tie(tmp_path, monkeypatch):
+    usb = tmp_path / "usb" / "articles.db"
+    local = tmp_path / "local" / "articles.db"
+    usb.parent.mkdir()
+    local.parent.mkdir()
+    ts = datetime.now(timezone.utc).isoformat()
+    _build_db_at(usb, live_first_seen=ts)
+    _build_db_at(local, live_first_seen=ts)
+    monkeypatch.setattr(signals, "USB_DB", usb)
+    monkeypatch.setattr(signals, "LOCAL_DB", local)
+    signals._reset_resolver_cache()
+    assert signals._db_path() == usb     # USB-canonical default preserved

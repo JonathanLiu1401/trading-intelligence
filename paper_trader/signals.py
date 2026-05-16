@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import sqlite3
+import time
 import zlib
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -12,15 +13,120 @@ DIGITAL_INTERN = "/home/zeph/digital-intern"
 if DIGITAL_INTERN not in sys.path:
     sys.path.insert(0, DIGITAL_INTERN)
 
-# Discover the article DB the same way digital-intern does.
+# ── Article-DB resolution ────────────────────────────────────────────────
+# Vendored from /home/zeph/paper-trader/paper_trader/signals.py — ported here
+# (resolver only) so this snapshot can't reintroduce the USB-stale split-brain.
+# The original returned the USB copy whenever it merely ``exists()``; once the
+# daemon falls back to writing LOCAL, that USB file keeps existing while going
+# stale and the live trader silently reads day-old news. Now picks the
+# candidate whose newest *live* article is most recent; USB still preferred on
+# a tie / when freshness is indeterminate. Data-sourcing fix, not a risk limit.
 USB_DB = Path(os.environ.get("DIGITAL_INTERN_USB", "/media/zeph/projects/digital-intern/db")) / "articles.db"
 LOCAL_DB = Path(DIGITAL_INTERN) / "data" / "articles.db"
 
+_LIVE_ONLY_SQL = (
+    "url NOT LIKE 'backtest://%' "
+    "AND source NOT LIKE 'backtest_%' "
+    "AND source NOT LIKE 'opus_annotation%'"
+)
+
+_DB_RESOLVE_TTL_S = 120.0
+_STALE_FEED_WARN_HOURS = 6.0
+_SPLIT_BRAIN_GAP_H = 6.0
+
+_db_resolve_cache: tuple[tuple[Path, ...], float, Path] | None = None
+_STALE_WARNED: set[str] = set()
+
+
+def _candidates() -> tuple[Path, ...]:
+    """Candidates in preference order (USB first). Read from module globals at
+    call time so tests can monkeypatch ``USB_DB`` / ``LOCAL_DB``."""
+    return (USB_DB, LOCAL_DB)
+
+
+def _age_hours(first_seen: str | None) -> float | None:
+    if not first_seen:
+        return None
+    try:
+        dt = datetime.fromisoformat(first_seen.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+
+
+def _live_newest_first_seen(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            row = conn.execute(
+                f"SELECT MAX(first_seen) FROM articles WHERE {_LIVE_ONLY_SQL}"
+            ).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _db_freshness() -> dict[Path, str | None]:
+    return {p: _live_newest_first_seen(p) for p in _candidates() if p.exists()}
+
+
+def _choose(freshness: dict[Path, str | None]) -> Path:
+    existing = [p for p in _candidates() if p in freshness]
+    if not existing:
+        return LOCAL_DB
+    if len(existing) == 1:
+        return existing[0]
+    best: Path | None = None
+    best_ts: str | None = None
+    for p in existing:
+        ts = freshness.get(p)
+        if ts is not None and (best_ts is None or ts > best_ts):
+            best, best_ts = p, ts
+    return best if best is not None else existing[0]
+
+
+def _maybe_warn_stale(chosen: Path, freshness: dict[Path, str | None]) -> None:
+    key = str(chosen)
+    if key in _STALE_WARNED:
+        return
+    age = _age_hours(freshness.get(chosen))
+    if age is None or age < _STALE_FEED_WARN_HOURS:
+        return
+    _STALE_WARNED.add(key)
+    print(
+        f"[signals] WARNING reading STALE feed {chosen} — newest live article "
+        f"is {age:.1f}h old; live trader may be blind.",
+        file=sys.stderr,
+    )
+
 
 def _db_path() -> Path:
-    if USB_DB.exists():
-        return USB_DB
-    return LOCAL_DB
+    global _db_resolve_cache
+    cands = _candidates()
+    now = time.monotonic()
+    if (
+        _db_resolve_cache is not None
+        and _db_resolve_cache[0] == cands
+        and now - _db_resolve_cache[1] < _DB_RESOLVE_TTL_S
+    ):
+        return _db_resolve_cache[2]
+    freshness = _db_freshness()
+    chosen = _choose(freshness)
+    _maybe_warn_stale(chosen, freshness)
+    _db_resolve_cache = (cands, now, chosen)
+    return chosen
+
+
+def _reset_resolver_cache() -> None:
+    global _db_resolve_cache
+    _db_resolve_cache = None
+    _STALE_WARNED.clear()
 
 
 _TICKER_RE = re.compile(r"\b([A-Z]{1,5})\b")
