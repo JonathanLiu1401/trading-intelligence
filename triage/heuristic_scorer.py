@@ -167,6 +167,15 @@ EVENT_PATTERNS = [
     # Capacity expansion / new fabs (forward-looking supply signal)
     (re.compile(r"\b(new|build|expand|break ground|groundbreaking).{0,30}(fabs?|foundr(?:y|ies)|wafer plants?)\b", re.I), 1.9, "capex"),
     (re.compile(r"\b(capex|capital expenditure).{0,20}(raise|increase|hike|cut|reduce).{0,15}(\d+%|billion)\b", re.I), 2.0, "capex"),
+    # Corporate distress — bankruptcy / default / restructuring. One of the
+    # sharpest single-name re-ratings; previously caught only via keywords.
+    (re.compile(r"\b(files?|filed|filing) for (chapter\s*1[13]|bankruptcy)\b|\bchapter\s*1[13]\b|\b(debt|bond|loan) default\b|\bdefaults? on (its |their )?(debt|bonds?|loans?)\b|\bdebt restructuring\b", re.I), 2.7, "distress"),
+    # Legal / regulatory action — SEC/DOJ/FTC probe, securities/accounting
+    # fraud, financial restatement. Material, often gap-down catalysts.
+    (re.compile(r"\b(sec|doj|ftc)\b.{0,25}\b(prob\w+|investigat\w+|charges?|subpoena|lawsuit|settlement)\b|\b(securities|accounting|earnings) fraud\b|\b(financial|earnings)s? restatement\b|\brestates? (its |their )?(financials?|earnings|results)\b", re.I), 2.6, "legal"),
+    # C-suite departure — CEO/CFO resignation/ouster. Material governance
+    # signal; either word order ("CEO resigns" / "resignation of CEO").
+    (re.compile(r"\b(ceo|cfo|chief executive|chief financial officer)\b.{0,30}\b(resign\w*|steps? down|stepping down|ouster|ousted|fired|departs?|to leave|exits?)\b|\b(resign\w*|steps? down|ouster|ousted)\b.{0,20}\b(ceo|cfo|chief executive)\b", re.I), 2.0, "exec_change"),
 ]
 
 # ── Source authority weights ─────────────────────────────────────────────────
