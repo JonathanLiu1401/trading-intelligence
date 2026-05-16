@@ -75,6 +75,8 @@ from ml.sentiment_trends import write_trends as write_score_trends
 from ml.trainer import train as ml_train
 from ml.trainer import train_continuous
 from ml.recursive_labeler import run_recursive_labeling
+from core.retrain_guard import should_alert as _ml_retrain_should_alert
+from core.retrain_guard import alert_message as _ml_retrain_alert_message
 
 # ── Config ──────────────────────────────────────────────────────────────────
 HEARTBEAT_INTERVAL  = 5 * 3600   # 5h
@@ -1089,6 +1091,11 @@ def ml_trainer_worker(store: ArticleStore):
     except Exception as e:
         log.warning(f"[ml_trainer] Bootstrap error: {e}")
 
+    # Back-to-back retrain failures. A silent UnboundLocalError once kept
+    # ArticleNet from retraining for a whole daemon lifetime while these logs
+    # stayed at WARNING (invisible to the ERROR/CRITICAL healthcheck grep).
+    # Escalate to Discord once the failures persist so it can't recur silently.
+    consec_fail = 0
     while _running:
         _sleep(ML_TRAIN_INTERVAL)
         try:
@@ -1103,10 +1110,18 @@ def ml_trainer_worker(store: ArticleStore):
             record_metric("ml.train.loss", metrics.get("final_loss", 0),
                           {"n": metrics.get("n", 0), "phase": "retrain"})
             _worker_last_ok["ml_trainer"] = time.time()
+            consec_fail = 0
         except MemoryError:
             _handle_memory_error("ml_trainer")
         except Exception as e:
-            log.warning(f"[ml_trainer] Retrain error: {e}")
+            consec_fail += 1
+            log.warning(f"[ml_trainer] Retrain error (#{consec_fail}): {e}")
+            if _ml_retrain_should_alert(consec_fail):
+                try:
+                    discord_send(_ml_retrain_alert_message(consec_fail, str(e)),
+                                 is_alert=True)
+                except Exception as alert_err:
+                    log.warning(f"[ml_trainer] failed to send stuck alert: {alert_err}")
 
 
 # ── Worker W12: Continuous GPU pass — keeps RTX 3060 hot ────────────────────
