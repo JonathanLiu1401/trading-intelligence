@@ -4,6 +4,8 @@ Marks articles as urgent (score >= 8) for immediate alerting.
 """
 import json
 import logging
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from core.claude_cli import claude_call
 from core.json_extract import extract_json_array
@@ -17,6 +19,9 @@ except Exception:
 SONNET_MODEL = "claude-sonnet-4-6"
 BATCH_SIZE = 100  # articles per Sonnet call
 URGENT_THRESHOLD = 8.0
+# Articles older than this cannot be urgent regardless of content language
+STALE_HOURS = 24.0
+STALE_SCORE_CAP = 5.9  # max score for stale articles (below urgent threshold)
 
 SCORE_PROMPT = """You are a real-time financial news urgency classifier. Score each article 0-10.
 
@@ -38,10 +43,36 @@ RELEVANT (5-7): Important but not immediately actionable:
 
 NOISE (0-4): Not relevant to this portfolio
 
+STALENESS RULE: Each article includes age_hours (how old it is). If age_hours > 24, the article \
+is stale — cap your score at 5 even if the text says "today", "breaking", "just announced", or \
+"this week". Time-sensitive language in old articles is misleading; do not reward it.
+
 Articles:
 {articles_json}
 
 Respond ONLY with a JSON array: [{{"index": 0, "score": 9, "reason": "MU earnings beat"}}, ...]"""
+
+
+def _article_age_hours(article: dict) -> float:
+    """Return age in hours from published date. Returns 0.0 if unknown (treat as fresh)."""
+    published = article.get("published") or article.get("first_seen") or ""
+    if not published:
+        return 0.0
+    dt = None
+    try:
+        dt = parsedate_to_datetime(published)
+    except Exception:
+        pass
+    if dt is None:
+        try:
+            s = published.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+        except Exception:
+            return 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+    return max(0.0, age_h)
 
 
 def score_batch(articles: list, store) -> int:
@@ -49,8 +80,14 @@ def score_batch(articles: list, store) -> int:
     if not articles:
         return 0
 
+    age_hours_map: dict[int, float] = {i: _article_age_hours(a) for i, a in enumerate(articles)}
     payload = [
-        {"index": i, "title": (a.get("title") or "")[:200], "summary": (a.get("summary") or "")[:300]}
+        {
+            "index": i,
+            "age_hours": round(age_hours_map[i], 1),
+            "title": (a.get("title") or "")[:200],
+            "summary": (a.get("summary") or "")[:300],
+        }
         for i, a in enumerate(articles)
     ]
 
@@ -84,6 +121,12 @@ def score_batch(articles: list, store) -> int:
             aid = art.get("_id")
             if not aid:
                 continue
+            # Hard staleness cap: articles older than STALE_HOURS cannot be urgent
+            # regardless of time-sensitive language in their text ("today", "breaking").
+            age_h = age_hours_map.get(idx, 0.0)
+            if age_h > STALE_HOURS and score > STALE_SCORE_CAP:
+                _log.debug(f"[urgency] Capping stale article (age={age_h:.1f}h) score {score:.1f}→{STALE_SCORE_CAP}")
+                score = STALE_SCORE_CAP
             is_urgent = score >= URGENT_THRESHOLD
             # Floor non-urgent ai_score at 0.01 so Sonnet-scored noise (score=0)
             # isn't picked up by get_unscored on the next pass and re-sent to
