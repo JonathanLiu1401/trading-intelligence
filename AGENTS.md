@@ -573,3 +573,26 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   rss test exercising the dedup write — same disposition as the documented 12-site sweep, not
   a correctness bug). `config/sources.json` delta + `.bak` files still predate the session and
   remain deliberately uncommitted (config churn, out of scope for a code-review commit).
+
+- **2026-05-16 (datetime.utcnow() deferral retired)** — The standing `datetime.utcnow()`
+  write-only deferral (re-derived and re-shelved across the two prior entries) is now
+  **resolved as its own focused commit**, which is the correct vehicle for it (it was only
+  ever "out of scope for a *review* commit", never wrong to do). All 12 sites across 10
+  collector modules (`yahoo_ticker_rss`, `google_news`, `polygon`, `massive`, `alphavantage`,
+  `rss`, `wikipedia`, `finnhub`, `newsapi`, `sec_edgar` ×3 incl. the 2 non-DB EFTS date-range
+  params) migrated `datetime.utcnow()` → `datetime.now(timezone.utc)`; `timezone` added to the
+  8 imports that lacked it (`finnhub`/`newsapi` already had it). Safety re-verified
+  *independently of the prior AGENTS claim*: a full-tree `first_seen` grep confirms
+  `seen_articles.first_seen` has **zero** read/parse sites (every reference is `CREATE TABLE`
+  or `INSERT`; dedup is `WHERE id=?` only) — the parsed `first_seen` consumers
+  (`paper_trader/signals.py:51`, dashboard `>= datetime('now',…)`, SQL range filters) all read
+  `articles.first_seen`, written by `storage/article_store.py`, untouched here. The new
+  `+00:00`-bearing aware ISO format is therefore unobservable to any consumer; pinned anyway
+  via `tests/test_collector_tz_aware.py` (10 parametrized static no-`utcnow` guards + a
+  round-trip format assertion through the canonical `signals._age_hours` parse expression).
+  `sec_edgar`'s `.date().isoformat()` EFTS params verified format-identical
+  (`datetime.now(timezone.utc).date()` == `datetime.utcnow().date()`). Concrete pass
+  criterion met: the `DeprecationWarning` the prior entry flagged from
+  `test_rss_collector.py`'s dedup-write path is **gone** under `-W error::DeprecationWarning`.
+  Suite: **313 passed** (302 prior + 11 new). This deferral is now closed — a future reviewer
+  should *not* re-derive it.

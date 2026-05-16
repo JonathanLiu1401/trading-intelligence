@@ -12,7 +12,7 @@ import os
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -200,7 +200,7 @@ def collect_polygon(batch: int = BATCH_PER_PASS) -> list:
             conn.execute(
                 "INSERT OR IGNORE INTO seen_articles (id, link, title, source, first_seen) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (aid, art["link"], art["title"], "Polygon", datetime.utcnow().isoformat()),
+                (aid, art["link"], art["title"], "Polygon", datetime.now(timezone.utc).isoformat()),
             )
 
     state["index"] = idx
