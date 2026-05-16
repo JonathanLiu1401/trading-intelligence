@@ -290,6 +290,28 @@ Suites:
   dedup, the `source = "scraped/<netloc>"` tag (ml/features credibility keys
   on it), 200-char title truncation, and graceful `[]` on a parser failure
   (the worker must never raise into the daemon thread).
+- `test_seen_db_hardening.py` — fleet-wide parity pin: all **11**
+  `data/seen_articles.db` writers (`rss`, `gdelt`, `finnhub`, `polygon`,
+  `newsapi`, `sec_edgar`, `massive`, `yahoo_ticker_rss`, `wikipedia`,
+  `alphavantage`, `google_news`) must open the connection with the canonical
+  `timeout=30` + `PRAGMA journal_mode=WAL` + `PRAGMA busy_timeout=30000`
+  hardening (see "shared seen_articles.db" below). Parameterized over every
+  collector so the pattern can't silently drift back out on any single one;
+  `google_news` is included as the canonical reference (the 76f9baa origin)
+  so this file is the single source of truth. Also re-asserts the dedup
+  contract survives the change (a written `seen_articles` row is durable
+  across connections). Same drift class as the backtest-isolation parity
+  suites.
+- `test_rss_collector.py` — `collectors/rss_collector.py`, two concerns,
+  previously zero direct coverage. (a) The unbounded-hang fix: `_fetch_feed`
+  now routes through `requests.get(url, timeout=FETCH_TIMEOUT, headers={UA})`
+  + `feedparser.parse(resp.content)` instead of `feedparser.parse(url)`
+  (which fetched with **no timeout** — one hung feed pinned a worker
+  forever). Pins that the bounded timeout + browser UA are actually passed,
+  and that an HTTP error / network exception / missing url degrade to `[]`
+  (never raise into the daemon thread). (b) The dedup contract: `collect_rss`
+  collapses duplicate `(link,title)` within a pass (`seen_in_run`) and across
+  passes (persistent `seen_articles`).
 
 ---
 
@@ -399,7 +421,8 @@ sentinel, which makes every article `needs_llm` and is also the value
 
 | Symptom | Likely cause | Fix |
 |--------|--------------|-----|
-| `database is locked` retries | High writer contention with `purge_worker`'s `wal_checkpoint(TRUNCATE)`. | `_retry_on_lock` decorator handles 5 attempts with jitter. Persistent failures → check `lock_metrics()`. |
+| `database is locked` retries (on `articles.db`) | High writer contention with `purge_worker`'s `wal_checkpoint(TRUNCATE)`. | `_retry_on_lock` decorator handles 5 attempts with jitter. Persistent failures → check `lock_metrics()`. |
+| `[<collector>_worker] error: database is locked; backing off Ns` (on `seen_articles.db`) — a whole collector pass lost per event | **Shared seen_articles.db.** All 11 dedup collectors write the *same* `data/seen_articles.db` file from their own worker threads. A bare `sqlite3.connect()` defaults `busy_timeout=0`, so any transient cross-writer lock raises `OperationalError` immediately; the collector's broad `except` then returns `[]` and the worker trips its 5–300s backoff, dropping the entire fetched batch. `google_news` was hardened first (76f9baa); the other 10 carried the identical bug. | All 11 `_ensure_db` now use the canonical `timeout=30` + `PRAGMA journal_mode=WAL` + `PRAGMA busy_timeout=30000` (mirrors `article_store`/`source_health`). Any new `seen_articles.db` writer MUST copy it. Pinned fleet-wide by `tests/test_seen_db_hardening.py`. |
 | `score_pending` returns 0 in a loop | `_INFER_LOCK` held, or model not yet fitted. | Wait for first `ml_trainer` cycle; then `[score_pending] N scored so far...` should appear. |
 | Sonnet alerts missing | `DISCORD_WEBHOOK_URL` empty, or `claude` CLI not authenticated. | Check `.env`; run `claude --version`. |
 | Backtest articles leaking into Discord | A new query forgot `_LIVE_ONLY_CLAUSE`. | Grep for `FROM articles WHERE` in the store; verify every live-read path filters. Re-run `tests/test_article_store.py::TestBacktestIsolation`. |
@@ -522,3 +545,31 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   (same disposition as the prior config-churn deferral) — flagged here so the next reviewer
   doesn't re-derive it. The `config/sources.json` delta + `.bak` files still predate the session
   and remain deliberately uncommitted.
+
+- **2026-05-16 (seen_articles.db fleet hardening)** — Full review pass over `daemon.py`,
+  `storage/article_store.py`, `watchers/alert_agent.py`, `watchers/urgency_scorer.py`,
+  `ml/trainer.py`, `ml/model.py`, `ml/features.py`, `ml/inference.py`,
+  `collectors/web_scraper.py`, `analysis/claude_analyst.py`. The four load-bearing invariants
+  re-verified present and value-asserting (backtest isolation, ml_score/ai_score separation,
+  `MAX(urgency,?)` state machine, `get_unscored` age-field parity) — no new bugs in those.
+  **One real systemic bug found and fixed:** the working-tree `rss_collector.py` change
+  (`feedparser.parse(url)` → `requests.get(timeout=FETCH_TIMEOUT, UA)` + `parse(resp.content)`,
+  a correct unbounded-hang fix) drew attention to `_ensure_db`, which was still the **bare**
+  `sqlite3.connect()` pattern. Audit showed **10 of 11** collectors that share the single
+  `data/seen_articles.db` file (`rss`, `gdelt`, `finnhub`, `polygon`, `newsapi`, `sec_edgar`,
+  `massive`, `yahoo_ticker_rss`, `wikipedia`, `alphavantage`) carried the identical
+  `busy_timeout=0` bug that 76f9baa fixed for `google_news` alone — i.e. the canonical
+  hardening was applied to one collector while the *shared-file contention* it defends against
+  is fleet-wide (rss is the hottest writer at 30s). This is **not** the `datetime.utcnow()`
+  12-site deferral class (that was write-only, benign): this drops whole fetched batches on any
+  transient cross-writer lock and trips the worker backoff. Ported the canonical `timeout=30` +
+  `WAL` + `busy_timeout=30000` verbatim to all 10 (no happy-path behavior change; external
+  reader sweep confirmed nothing outside `collectors/` reads `seen_articles.db`). Added
+  `tests/test_seen_db_hardening.py` (parameterized fleet-wide pin, all 11 incl. google_news as
+  source-of-truth reference) and `tests/test_rss_collector.py` (the requests/UA/timeout fix +
+  the in-run/cross-run dedup contract — both previously zero-coverage). Suite: **302 passed**
+  (275 prior + 27 new; clean `__pycache__`/`.pytest_cache`). Known-benign deferral unchanged:
+  `datetime.utcnow()` write-only sites (now surfaced as a `DeprecationWarning` from the new
+  rss test exercising the dedup write — same disposition as the documented 12-site sweep, not
+  a correctness bug). `config/sources.json` delta + `.bak` files still predate the session and
+  remain deliberately uncommitted (config churn, out of scope for a code-review commit).
