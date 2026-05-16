@@ -219,6 +219,15 @@ Suites:
   `_fetch_training_data` dict shape yields identical `extract_features_batch` rows
   (catches the temporal train/serve skew). Reads `STALE_HOURS`/`STALE_SCORE_CAP`
   from the live module so a retune doesn't false-fail it.
+- `test_alert_agent.py` — the live alert formatter's own guards
+  (`watchers/alert_agent.py::send_urgent_alert`), asserted at the agent
+  boundary rather than only end-to-end. Pins that a >24h `published` row
+  returned by `get_unalerted_urgent` (whose SQL filters `first_seen`, not
+  `published`) is dropped before Claude/Discord; that an unparseable-date
+  batch and a missing-webhook config both short-circuit *before* the Sonnet
+  call (no wasted quota, no POST to an empty URL); that the happy path marks
+  exactly the alerted id `urgency=2` (cannot re-fire); and that a failed
+  Discord POST leaves the row `urgency=1` (re-queued, never silently lost).
 
 ---
 
