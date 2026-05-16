@@ -153,6 +153,12 @@ Suites:
   / `_articles_per_hour_24h` (the standalone uvicorn dashboard) and
   `ml/sentiment_trends.py::compute_trends` (the per-ticker panel) must filter synthetic rows
   the same way the store paths and `dashboard/web_server.py` do.
+- `test_paper_trader_signals_isolation.py` — cross-system backtest isolation on the
+  vendored `paper_trader/signals.py` snapshot. `get_top_signals`, `get_urgent_articles`,
+  `get_ticker_sentiment` and `ticker_sentiments` read the shared `articles.db` for the
+  live trader; all four must inline the `_LIVE_ONLY_CLAUSE` fragment (see "Cross-system
+  contract" below — the vendored copy had drifted out of sync with the authoritative
+  source and was leaking synthetic rows; this suite pins it).
 
 ---
 
@@ -268,3 +274,12 @@ read/write from `run_continuous_backtests.py::_inject_and_train`.
 If a paper-trader read query is added against `articles.db`, it MUST inline the same SQL fragment
 as `_LIVE_ONLY_CLAUSE`. Symptom of a violation: backtest titles appearing in the live trader's
 prompt context.
+
+`paper_trader/` here is a **vendored snapshot** of `/home/zeph/paper-trader/paper_trader/`; the
+authoritative file is the one the live trader actually runs. The snapshot can silently drift —
+`paper_trader/signals.py` was found missing the backtest filter on all four live-read queries
+(`get_top_signals`, `get_urgent_articles`, `get_ticker_sentiment`, `ticker_sentiments`) while the
+authoritative copy already carried it. Re-synced (filter only) and pinned by
+`tests/test_paper_trader_signals_isolation.py`. When updating the vendored snapshot, never copy it
+wholesale — port only the change you intend, and keep the `_LIVE_ONLY_CLAUSE` filter on every
+`articles` read.
