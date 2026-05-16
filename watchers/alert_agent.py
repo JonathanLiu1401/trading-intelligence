@@ -140,12 +140,30 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
     # so we cap both ends.
     batch = deduped[:ALERT_BATCH_SIZE]
 
-    def _fmt(a: dict) -> str:
-        # Include the article body when available so the alert LLM grounds its
-        # CONTEXT line on real content rather than guessing from the headline.
+    def _fmt(a: dict) -> str | None:
+        # Defensive field access. The rest of this pipeline (_is_synthetic,
+        # dedupe_urgent) reads every key through .get(); _fmt used to be the
+        # one place with hard subscripts (a['link'], a['ai_score'], ...). A
+        # single dict from a non-canonical caller (manual replay, or a row
+        # carrying `url` instead of `link` — the exact alias _is_synthetic
+        # already tolerates) raised KeyError, the broad except below swallowed
+        # it, the WHOLE batch was dropped, nothing was marked alerted, and
+        # urgent alerts silently failed every cycle. Skip one bad row instead
+        # of unwinding the batch; only the headline is truly required.
+        title = (a.get("title") or "").strip()
+        if not title:
+            _log.warning("[alert] skipping urgent row with no title (id=%s)",
+                         a.get("_id"))
+            return None
+        try:
+            score = float(a.get("ai_score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        link = a.get("link") or a.get("url") or ""
+        source = (a.get("source") or "unknown").strip() or "unknown"
         block = (
-            f"[score={a['ai_score']:.0f}] {a['title']}\n"
-            f"source: {a['source']}\nurl: {a['link']}"
+            f"[score={score:.0f}] {title}\n"
+            f"source: {source}\nurl: {link}"
         )
         dup_count = int(a.get("dup_count") or 1)
         if dup_count > 1:
@@ -157,7 +175,15 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
             block += f"\nbody: {summary[:600]}"
         return block
 
-    articles_text = "\n\n".join(_fmt(a) for a in batch)
+    # Filter the batch to formattable rows BEFORE building the prompt AND
+    # before alerted_ids(batch) — marking a skipped row alerted would silently
+    # drop it forever; keeping it in batch would re-fire the whole cycle.
+    formatted = [(a, _fmt(a)) for a in batch]
+    batch = [a for a, t in formatted if t is not None]
+    if not batch:
+        _log.warning("[alert] no formattable urgent rows in batch — skipping")
+        return False
+    articles_text = "\n\n".join(t for _, t in formatted if t is not None)
 
     # Full date+time so Discord history is unambiguous across day boundaries.
     # Template already appends " UTC", so don't include it here.

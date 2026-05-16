@@ -261,3 +261,104 @@ class TestSyntheticDefenseInDepth:
             "SELECT COUNT(*) FROM articles WHERE id='leak'"
         ).fetchone()[0]
         assert leak == 0
+
+
+class TestFormatterRobustness:
+    """``_fmt`` must not let one malformed urgent dict unwind the whole batch.
+
+    Every other hop in this pipeline (``_is_synthetic``, ``dedupe_urgent``)
+    reads its keys through ``.get()``; ``_fmt`` used to be the lone place with
+    hard subscripts (``a['link']``, ``a['ai_score']``...). A single dict from a
+    non-canonical caller — a manual replay, or a row carrying ``url`` instead
+    of ``link`` (the exact alias ``_is_synthetic`` already tolerates) — raised
+    KeyError, the broad ``except`` in ``send_urgent_alert`` swallowed it, the
+    ENTIRE batch was dropped, nothing was marked alerted, and urgent alerts
+    silently failed every 20s cycle. This is the project's recurring
+    "one poison row unwinds the pipeline, invisibly" failure class; these
+    tests pin that one bad row is skipped, not fatal.
+    """
+
+    class _StoreSpy:
+        def __init__(self):
+            self.marked = []
+
+        def mark_alerted_batch(self, ids):
+            self.marked.extend(ids)
+
+        def mark_alerted(self, aid):
+            self.marked.append(aid)
+
+    def test_url_alias_is_accepted_not_a_keyerror(self, monkeypatch):
+        """A row carrying ``url`` (not ``link``) — what a manual replay or a
+        non-canonical collector path produces — must still alert, with the url
+        grounded into the Sonnet prompt, instead of KeyError-aborting the
+        whole batch."""
+        spy = self._StoreSpy()
+        art = {
+            "_id": "u1", "url": "https://reuters.com/breaking-mu",
+            "title": "MU guides Q4 revenue sharply above the Street",
+            "source": "rss", "ai_score": 9.0,
+            "summary": "", "published": _iso(1), "first_seen": _iso(0.1),
+        }
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call",
+                          return_value="🚨 BREAKING ◈ EARNINGS ◈ MU") as mock_claude, \
+             patch("notifier.discord_notifier.send", return_value=True) as mock_send:
+            ok = alert_agent.send_urgent_alert([art], spy)
+
+        assert ok is True
+        mock_claude.assert_called_once()
+        mock_send.assert_called_once()
+        prompt = mock_claude.call_args.args[0]
+        assert "https://reuters.com/breaking-mu" in prompt, \
+            "url alias must be grounded into the prompt, not dropped"
+        assert spy.marked == ["u1"]
+
+    def test_one_titleless_row_is_skipped_batch_still_alerts(self, monkeypatch):
+        """Mixed batch: a real urgent row + a corrupt row with no title. The
+        corrupt row is skipped (never marked alerted, so it cannot re-fire
+        forever) while the real row still alerts in the same cycle."""
+        spy = self._StoreSpy()
+        good = {
+            "_id": "good", "link": "https://reuters.com/x",
+            "title": "AXTI signs multi-year InP wafer supply agreement",
+            "source": "rss", "ai_score": 9.0,
+            "summary": "", "published": _iso(1), "first_seen": _iso(0.1),
+        }
+        poison = {  # title is the only truly-required field; this has none
+            "_id": "poison", "link": "https://example.com/y", "title": "",
+            "source": "rss", "ai_score": "not-a-number",
+            "summary": "", "published": _iso(1), "first_seen": _iso(0.1),
+        }
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call",
+                          return_value="🚨 BREAKING ◈ SUPPLY CHAIN ◈ AXTI") as mock_claude, \
+             patch("notifier.discord_notifier.send", return_value=True) as mock_send:
+            ok = alert_agent.send_urgent_alert([good, poison], spy)
+
+        assert ok is True
+        mock_claude.assert_called_once()
+        mock_send.assert_called_once()
+        prompt = mock_claude.call_args.args[0]
+        assert "AXTI signs multi-year" in prompt
+        assert spy.marked == ["good"], \
+            "only the formattable row may be marked; poison must stay unmarked"
+
+    def test_all_rows_unformattable_skips_before_claude(self, monkeypatch):
+        """If every row in the batch is unformattable, short-circuit BEFORE
+        burning a Claude call (and never post an empty prompt to Discord)."""
+        spy = self._StoreSpy()
+        poison = {
+            "_id": "p", "link": "https://example.com/z", "title": "   ",
+            "source": "rss", "ai_score": 9.0,
+            "summary": "", "published": _iso(1), "first_seen": _iso(0.1),
+        }
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call") as mock_claude, \
+             patch("notifier.discord_notifier.send") as mock_send:
+            ok = alert_agent.send_urgent_alert([poison], spy)
+
+        assert ok is False
+        mock_claude.assert_not_called()
+        mock_send.assert_not_called()
+        assert spy.marked == []
