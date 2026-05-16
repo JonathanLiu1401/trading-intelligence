@@ -150,13 +150,13 @@ EVENT_PATTERNS = [
     # M&A
     (re.compile(r"\b(acqui|merger|buyout|takeover|bid for|deal with).{0,30}(billion|million|\$\d)\b", re.I), 2.4, "m&a"),
     # Supply chain / production
-    (re.compile(r"\b(shortage|glut|oversupply|capacity cut|production halt|fab delay)\b", re.I), 2.0, "supply"),
-    (re.compile(r"\b(wafer|bit|chip).{0,15}(shortage|surplus|cut|increase)\b", re.I), 2.2, "supply"),
+    (re.compile(r"\b(shortages?|gluts?|oversupply|oversupplies|capacity cuts?|production halts?|fab delays?)\b", re.I), 2.0, "supply"),
+    (re.compile(r"\b(wafer|bit|chip)s?.{0,15}(shortages?|surplus(?:es)?|cuts?|increases?)\b", re.I), 2.2, "supply"),
     # Macro shocks
     (re.compile(r"\b(emergency|surprise|unexpected|shock).{0,20}(rate|cut|hike|decision)\b", re.I), 2.8, "macro_shock"),
     (re.compile(r"\b(circuit breaker|trading halt|market crash|flash crash)\b", re.I), 3.0, "crisis"),
     # Export controls / sanctions
-    (re.compile(r"\b(export (ban|control|restrict)|entity list|blacklist).{0,30}(chip|semi|memory)\b", re.I), 2.5, "regulatory"),
+    (re.compile(r"\b(export (bans?|controls?|restrict\w*)|entity list|blacklist).{0,30}(chips?|semis?|memory|memories)\b", re.I), 2.5, "regulatory"),
     (re.compile(r"\b(sanction|restrict).{0,20}(china|huawei|smic|yangtze)\b", re.I), 2.3, "regulatory"),
     # ASP / pricing moves
     (re.compile(r"\b(asp|average selling price).{0,20}(\d+%|rise|fall|drop|jump)\b", re.I), 2.1, "pricing"),
@@ -165,7 +165,7 @@ EVENT_PATTERNS = [
     (re.compile(r"\b(chips act|chips and science).{0,40}(award|grant|funding|subsid|disburs|billion)\b", re.I), 2.3, "subsidy"),
     (re.compile(r"\b(doe|commerce dept|commerce department).{0,30}(grant|loan|award).{0,20}(semi|chip|fab)\b", re.I), 2.1, "subsidy"),
     # Capacity expansion / new fabs (forward-looking supply signal)
-    (re.compile(r"\b(new|build|expand|break ground|groundbreaking).{0,30}(fab|foundry|wafer plant)\b", re.I), 1.9, "capex"),
+    (re.compile(r"\b(new|build|expand|break ground|groundbreaking).{0,30}(fabs?|foundr(?:y|ies)|wafer plants?)\b", re.I), 1.9, "capex"),
     (re.compile(r"\b(capex|capital expenditure).{0,20}(raise|increase|hike|cut|reduce).{0,15}(\d+%|billion)\b", re.I), 2.0, "capex"),
 ]
 
