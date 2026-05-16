@@ -418,7 +418,7 @@ def train(store, force: bool = False) -> dict:
     rel_std = float(np.std(y_rel)) if len(y_rel) else 0.0
     rel_mean = float(np.mean(y_rel)) if len(y_rel) else 0.0
     mse_baseline = float(np.var(y_rel)) if len(y_rel) else 0.0
-    print(f"[ml:trainer] Training on {len(texts)} samples "
+    print(f"[ml:trainer] Training on {n} samples "
           f"({int((y_rel > 0).sum())} labeled, {int((y_urg >= 8).sum())} urgent) "
           f"source={source}")
     print(f"[ml:trainer] label stats: y_rel mean={rel_mean:.3f} std={rel_std:.3f} "
@@ -439,19 +439,13 @@ def train(store, force: bool = False) -> dict:
           f"mean={float(_w_preview.mean()):.3f} "
           f"(higher-scoring articles train harder)")
 
-    emb = get_embedder()
-    if emb.should_refit(len(texts)):
-        X_text = emb.fit_transform(texts)
-    else:
-        X_text = emb.transform(texts)
-
-    X_extra = extract_features_batch(articles)
-    X = np.concatenate([X_text, X_extra], axis=1).astype(np.float32)
-
-    # Bootstrap time_sensitivity labels from title/summary heuristics. The model
-    # will refine these from the underlying text features after a few cycles.
-    y_time = _time_sensitivity_batch(articles)
-
+    # X / y_rel / y_urg / y_time were produced above by exactly one of the two
+    # branches (disk cache hit, or fresh _fetch_training_data + embed + cache
+    # write). The fresh branch ``del``s ``texts``/``articles`` to free RAM
+    # before GPU training, and the cache branch never builds them at all — so
+    # re-embedding here (the pre-cache code path) raised NameError every cycle
+    # and ArticleNet silently never retrained. Train directly on the prepared
+    # matrices.
     model = get_model()
     with _TRAIN_LOCK:
         metrics = model.fit(
@@ -465,7 +459,7 @@ def train(store, force: bool = False) -> dict:
     elapsed = time.time() - t0
     result = {
         "status": "ok",
-        "n": len(texts),
+        "n": n,
         "n_llm_labeled": int((y_rel > 0).sum()),
         "n_urgent": int((y_urg >= 8).sum()),
         "label_source": source,

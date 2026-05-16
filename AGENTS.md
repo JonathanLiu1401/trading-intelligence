@@ -118,15 +118,27 @@ Tests use in-memory-ish SQLite via a `tmp_path`-redirected store fixture (`tests
 External calls (Claude CLI, network) are patched. No GPU required for the model tests — they
 exercise the `ArticleNetModule` directly on CPU.
 
+**Fixture convention — `first_seen` must be time-relative.** `get_unalerted_urgent` and
+`get_top_for_briefing` enforce a 24h `first_seen` freshness window. Test `_insert*` helpers
+default `first_seen` to ~5 min ago (`datetime.now(timezone.utc) - timedelta(minutes=5)`), not a
+hardcoded date. A literal date silently breaks every backtest-isolation test 24h later — a
+green-looking invariant test that fails on a calendar boundary, not on a real regression. Pass an
+explicit `first_seen=` only when a test specifically targets the staleness cutoff.
+
 Suites:
 
 - `test_article_store.py` — backtest isolation, alerted-marking, ml/llm score separation, CRUD.
 - `test_urgency_scorer.py` — classification at the 8.0 threshold, partial Sonnet responses,
   alerted-state preservation.
-- `test_features.py` — exactly 15 extra dims, ticker density, days-since-published normalization,
-  cyclic feature bounds.
+- `test_features.py` — exactly 15 extra dims, ticker density, days-since-published normalization
+  (`min(age,30)/30` → ~1/30 at 24h, saturates 1.0 at ≥30d; this is intended ML feature scaling,
+  not a bug), cyclic feature bounds.
 - `test_model.py` — output bounds (relevance 0..10, urgency 0..1, no NaN on zero input).
-- `test_trainer.py` — `score_source='ml'` exclusion, synthetic-row inclusion, sample weighting.
+- `test_trainer.py` — `score_source='ml'` exclusion, synthetic-row inclusion, sample weighting,
+  and `TestTrainOrchestration` — regression guard that `train()` runs end-to-end on both the
+  fresh and disk-cache paths (see ML training pipeline note below).
+- `test_integration_pipeline.py` — cross-module flows (ingest→score→alert, end-to-end backtest
+  isolation, concurrent-writer safety).
 
 ---
 
@@ -169,6 +181,14 @@ time_sensitivity.
 The model writes its predictions to `ml_score`. The trainer never reads `ml_score` — that's how the
 label-feedback loop stays closed.
 
+**Dataset prep is single-pass.** `train()` builds the feature matrix exactly once, via one of two
+branches: a disk-cache hit (`data/ml/dataset_cache.npz`, reused while the labeled count drifts
+<5%), or a fresh `_fetch_training_data` → embed → cache-write. The fresh branch `del`s the raw
+`texts`/`articles` lists to cap peak RAM before GPU training; the cache branch never builds them.
+Anything after that point operates on `X / y_rel / y_urg / y_time` only — re-embedding there (the
+pre-cache code shape) raises `NameError` on every cycle and ArticleNet silently stops retraining
+while the daemon log still looks healthy. `TestTrainOrchestration` covers both branches.
+
 ---
 
 ## Common failure modes
@@ -180,6 +200,7 @@ label-feedback loop stays closed.
 | Sonnet alerts missing | `DISCORD_WEBHOOK_URL` empty, or `claude` CLI not authenticated. | Check `.env`; run `claude --version`. |
 | Backtest articles leaking into Discord | A new query forgot `_LIVE_ONLY_CLAUSE`. | Grep for `FROM articles WHERE` in the store; verify every live-read path filters. Re-run `tests/test_article_store.py::TestBacktestIsolation`. |
 | Model trains on its own predictions | A new write path put model output into `ai_score`. | Use `update_ml_scores_batch` for predictions, `update_ai_scores_batch` for LLM labels. Re-run `tests/test_article_store.py::TestScoreSourceSeparation`. |
+| `val_loss` flat forever, model never improves, `[ml_trainer] Retrain error: name 'texts' is not defined` in `daemon.log` | A code path after dataset prep re-references `texts`/`articles` (deleted/never-built). `train()` raises every cycle but the worker swallows it as a WARNING, so the daemon looks alive. | Keep all post-prep code on `X/y_rel/y_urg/y_time`. Re-run `tests/test_trainer.py::TestTrainOrchestration`. |
 | Heartbeat briefing posts placeholder text | `claude_analyst.analyze` returned `[analyst] No response from Claude.` | `heartbeat_worker` detects this and retries in 5 min instead of waiting the full 5 h. |
 | Articles permanently stuck unscored | Sonnet returned an empty or partial response | `score_batch` floors unscored items at 0.01 when Sonnet returned at least one valid entry; the queue must drain over 1–2 cycles. |
 | GPU OOM | Concurrent `_inject_and_train` from paper-trader during `ml_trainer_worker` retrain. | `_TRAIN_LOCK` serializes; lower paper-trader's `RUNS_PER_CYCLE`. `_handle_memory_error` clears CUDA cache. |

@@ -2,13 +2,26 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 
+def _recent_iso(minutes_ago: int = 5) -> str:
+    """A first_seen value inside the 24h freshness window enforced by
+    get_unalerted_urgent / get_top_for_briefing. Hardcoding an absolute date
+    (the prior fixture) silently broke every backtest-isolation test the
+    moment wall-clock passed it by 24h — a Saturday-morning rerun would fail
+    on a real production invariant that was actually intact."""
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
+
 def _insert_raw(store, *, id, url, title, source, urgency=0, ai_score=0.0,
-                ml_score=None, score_source=None, kw_score=1.0):
+                ml_score=None, score_source=None, kw_score=1.0,
+                first_seen=None):
     """Insert a row bypassing the public API so tests can build any state."""
+    if first_seen is None:
+        first_seen = _recent_iso()
     with store._write_lock:
         store.conn.execute(
             "INSERT INTO articles "
@@ -16,7 +29,7 @@ def _insert_raw(store, *, id, url, title, source, urgency=0, ai_score=0.0,
             "first_seen, cycle, ml_score, score_source) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (id, url, title, source, "", kw_score, ai_score, urgency,
-             "2026-05-15T00:00:00+00:00", 0, ml_score, score_source),
+             first_seen, 0, ml_score, score_source),
         )
         store.conn.commit()
 
