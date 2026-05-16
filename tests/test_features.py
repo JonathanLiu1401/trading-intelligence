@@ -111,6 +111,37 @@ def test_temporal_cyclic_features_bounded():
         assert -1.0 <= feats[i] <= 1.0
 
 
+def test_temporal_features_timezone_invariant():
+    """The SAME publishing instant expressed in different feed timezones must
+    produce identical hour/dow cyclic features (indices 2..5).
+
+    Regression: feeds emit their publish time in their own tz (Nikkei +0900,
+    US wires -0500, most others UTC). Without UTC normalisation in
+    _parse_published the same instant scattered across the cyclic encoding —
+    a -0500 feed even landed on the previous weekday — injecting pure noise
+    into 4 of 15 features and a train/serve skew (trainer + inference both
+    pass raw `published` strings)."""
+    # 2026-05-13 03:15:00 UTC, expressed three ways for the same instant.
+    variants = [
+        "Tue, 13 May 2026 03:15:00 +0000",   # UTC wire
+        "Mon, 12 May 2026 22:15:00 -0500",   # US EST feed (prev local day)
+        "Tue, 13 May 2026 12:15:00 +0900",   # Nikkei JST feed
+        "2026-05-13T03:15:00+00:00",         # ISO 8601 UTC
+        "2026-05-13T03:15:00",               # naive → assumed UTC
+    ]
+    ref = features.extract_features({
+        "title": "x", "summary": "y", "source": "rss", "published": variants[0],
+    })
+    for v in variants[1:]:
+        feats = features.extract_features({
+            "title": "x", "summary": "y", "source": "rss", "published": v,
+        })
+        for i in (2, 3, 4, 5):
+            assert feats[i] == pytest.approx(ref[i], abs=1e-6), (
+                f"feature {i} differs for {v!r}: {feats[i]} != {ref[i]}"
+            )
+
+
 def test_source_credibility_known_high():
     """reuters should score significantly higher than reddit."""
     a = features.extract_features({
