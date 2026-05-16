@@ -258,11 +258,18 @@ class ArticleNet:
             y_time: np.ndarray | None = None,
             epochs: int = 100, batch_size: int = 256, lr: float = 1e-3,
             verbose: bool = True, warm: bool | None = None,
-            label_weight_exponent: float | None = None) -> dict:
+            label_weight_exponent: float | None = None,
+            early_stop_patience: int = 6) -> dict:
         """Multi-task GPU training. Returns metrics dict.
 
         ``y_rel`` is a 0..10 relevance score; ``y_urg`` is a 0..10 urgency
         score that gets binarized to ``>= 8.0`` for the BCE head.
+
+        ``early_stop_patience`` is the number of consecutive validation
+        checks without improvement after which training halts (only active
+        when a held-out val set exists, i.e. n >= 100). Best-epoch weights
+        are restored regardless, so this only trims wasted, overfitting
+        epochs — it never changes which checkpoint is saved.
         """
         t0 = time.time()
         n, dim = X.shape
@@ -362,6 +369,13 @@ class ArticleNet:
         # trending downward.
         best_in_run = float("inf")
         best_state = None
+        # Early-stopping bookkeeping. A val check must beat the running best by
+        # at least ``min_delta`` to count as progress, so val-loss jitter near
+        # a plateau doesn't keep training alive indefinitely.
+        no_improve_checks = 0
+        stopped_early = False
+        epochs_run = 0
+        es_min_delta = 1e-4
         def _eval_val_loss() -> float:
             if X_val is None:
                 return float("inf")
@@ -419,14 +433,28 @@ class ArticleNet:
                 n_batches += 1
             sched.step()
             final_loss = epoch_loss / max(n_batches, 1)
+            epochs_run = epoch + 1
 
             # Best-epoch tracking — cheap val pass every few epochs.
             check_every = max(1, epochs // 20)
             if X_val is not None and ((epoch + 1) % check_every == 0 or epoch == epochs - 1):
                 vl = _eval_val_loss()
-                if vl < best_in_run:
+                if vl < best_in_run - es_min_delta:
                     best_in_run = vl
                     best_state = {k: v.detach().clone() for k, v in self.net.state_dict().items()}
+                    no_improve_checks = 0
+                else:
+                    # Still keep the strictly-best state even on a sub-min_delta
+                    # nudge, but count this check as "no real progress".
+                    if vl < best_in_run:
+                        best_in_run = vl
+                        best_state = {k: v.detach().clone()
+                                      for k, v in self.net.state_dict().items()}
+                    no_improve_checks += 1
+                    if (early_stop_patience > 0
+                            and no_improve_checks >= early_stop_patience
+                            and epoch < epochs - 1):
+                        stopped_early = True
             elif X_val is None and final_loss < best_in_run:
                 best_in_run = final_loss
                 best_state = {k: v.detach().clone() for k, v in self.net.state_dict().items()}
@@ -452,6 +480,18 @@ class ArticleNet:
                     _log.info(msg)
                 except Exception:
                     pass
+
+            if stopped_early:
+                es_msg = (f"[ml:model] early stop at epoch {epoch+1}/{epochs} "
+                          f"(no val improvement for {no_improve_checks} checks, "
+                          f"best_val={best_in_run:.4f})")
+                if verbose:
+                    print(es_msg)
+                try:
+                    _log.info(es_msg)
+                except Exception:
+                    pass
+                break
 
         # Restore best-epoch weights so we save the best, not the last.
         # Without this, late-epoch noise can overwrite a strictly-better earlier
@@ -481,6 +521,8 @@ class ArticleNet:
             "val_loss":   round(val_loss, 4),
             "best_in_run": round(best_in_run, 4) if best_in_run != float("inf") else None,
             "epochs": epochs,
+            "epochs_run": epochs_run,
+            "stopped_early": stopped_early,
             "samples": n,
             "elapsed_s": round(elapsed, 1),
             "device": str(self.device),
@@ -491,8 +533,9 @@ class ArticleNet:
         metrics["new_best"] = improved_best
         self.save()
         self._save_versioned(val_loss, metrics, is_new_best=improved_best)
-        print(f"[ml:model] Trained {epochs} epochs on {n} samples in {elapsed:.1f}s "
-              f"(device={self.device}, val_loss={val_loss:.4f})")
+        print(f"[ml:model] Trained {epochs_run}/{epochs} epochs on {n} samples "
+              f"in {elapsed:.1f}s (device={self.device}, val_loss={val_loss:.4f}"
+              f"{', early-stopped' if stopped_early else ''})")
         return metrics
 
     # ── inference ───────────────────────────────────────────────────────────

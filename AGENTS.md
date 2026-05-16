@@ -186,6 +186,16 @@ time_sensitivity.
 The model writes its predictions to `ml_score`. The trainer never reads `ml_score` — that's how the
 label-feedback loop stays closed.
 
+**Early stopping.** `ArticleNet.fit` takes `early_stop_patience` (default 6, the `ml_trainer`/
+`continuous_trainer` callers leave it at the default). It only engages when a held-out val set
+exists (`n >= 100`): after that many consecutive val checks fail to beat the running best by
+`min_delta` (1e-4), training halts. Best-epoch weights are restored regardless, so early stop only
+trims wasted overfitting epochs — it never changes which checkpoint is saved or the reported
+`val_loss`. The metrics dict gains `epochs_run` (actual) and `stopped_early` (bool); `epochs`
+stays the configured budget. `patience=0` disables it (fixed-budget back-compat). Pinned by
+`tests/test_model.py::test_early_stop_triggers_on_plateau` /
+`test_early_stop_disabled_runs_full_budget`.
+
 **Dataset prep is single-pass.** `train()` builds the feature matrix exactly once, via one of two
 branches: a disk-cache hit (`data/ml/dataset_cache.npz`, reused while the labeled count drifts
 <5%), or a fresh `_fetch_training_data` → embed → cache-write. The fresh branch `del`s the raw

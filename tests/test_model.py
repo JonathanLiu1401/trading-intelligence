@@ -77,3 +77,54 @@ def test_forward_batch_shape():
     assert urg.shape == (7, 1)
     assert unc.shape == (7, 1)
     assert ts.shape == (7, 1)
+
+
+def _isolated_model(monkeypatch):
+    """An ArticleNet whose persistence side-effects are stubbed out, so fit()
+    never touches the real checkpoint files on disk."""
+    from ml.model import ArticleNet
+
+    m = ArticleNet()
+    monkeypatch.setattr(m, "save", lambda: None)
+    monkeypatch.setattr(m, "_save_best_local", lambda *a, **k: False)
+    monkeypatch.setattr(m, "_save_versioned", lambda *a, **k: None)
+    return m
+
+
+def _noise_dataset(n=120, dim=24, seed=7):
+    """Pure-noise features/labels: the net can memorize train but val loss
+    plateaus fast, which is exactly the regime early stopping must catch."""
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((n, dim)).astype(np.float32)
+    y_rel = rng.uniform(0, 10, n).astype(np.float32)
+    y_urg = rng.uniform(0, 10, n).astype(np.float32)
+    return X, y_rel, y_urg
+
+
+def test_early_stop_triggers_on_plateau(monkeypatch):
+    """With a small patience and unlearnable val signal, fit() must halt
+    before the configured epoch budget and flag it in the metrics."""
+    torch.manual_seed(0)
+    m = _isolated_model(monkeypatch)
+    X, y_rel, y_urg = _noise_dataset()
+    metrics = m.fit(X, y_rel, y_urg, epochs=80, batch_size=32,
+                    verbose=False, warm=False, early_stop_patience=2)
+    assert metrics["stopped_early"] is True
+    assert metrics["epochs_run"] < metrics["epochs"]
+    # Best-epoch weights are still restored, so the reported val_loss must
+    # match the best seen in-run (not a worse late epoch).
+    assert metrics["best_in_run"] is not None
+    assert np.isfinite(metrics["val_loss"])
+    assert metrics["val_loss"] <= metrics["best_in_run"] + 1e-3
+
+
+def test_early_stop_disabled_runs_full_budget(monkeypatch):
+    """patience=0 disables early stopping — back-compat for callers that
+    want a fixed epoch budget regardless of the val curve."""
+    torch.manual_seed(0)
+    m = _isolated_model(monkeypatch)
+    X, y_rel, y_urg = _noise_dataset()
+    metrics = m.fit(X, y_rel, y_urg, epochs=15, batch_size=32,
+                    verbose=False, warm=False, early_stop_patience=0)
+    assert metrics["stopped_early"] is False
+    assert metrics["epochs_run"] == metrics["epochs"] == 15
