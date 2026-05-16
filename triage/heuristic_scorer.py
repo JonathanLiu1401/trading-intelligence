@@ -134,6 +134,14 @@ BLACKLIST = re.compile(
     re.I
 )
 
+# Multi-catalyst compounding: when N distinct event categories fire on one
+# article, the event multiplier is uplifted by MULTI_EVENT_UPLIFT per extra
+# category, hard-capped at MULTI_EVENT_BONUS_CAP. A single category leaves the
+# multiplier untouched (uplift gate is n>=2), so single-event scoring — and
+# every test pinned to it — is unchanged.
+MULTI_EVENT_UPLIFT = 0.15
+MULTI_EVENT_BONUS_CAP = 3.5
+
 # ── Event pattern detection — multiplier bonuses ────────────────────────────
 EVENT_PATTERNS = [
     # Earnings
@@ -337,13 +345,28 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
             return {"score": 0.0, "reason": "blacklisted", "events": []}
         blacklist_penalty = 0.5
 
-    # Event detection
+    # Event detection. Take the single strongest multiplier as the base, then
+    # apply a small compounding uplift when *distinct* event categories
+    # co-occur. An article that is simultaneously an earnings beat AND a
+    # guidance raise AND an analyst upgrade is a materially stronger
+    # multi-catalyst signal than any one of those alone, yet the old
+    # max()-only logic scored it identically to a single-catalyst story.
+    # Duplicate category names (several "earnings" regexes firing on one
+    # headline) are collapsed via set() so single-category articles are
+    # unaffected — preserving the n_distinct==1 → factor 1.0 invariant the
+    # existing single-event tests rely on.
     event_bonus = 1.0
     events_found = []
     for pattern, multiplier, event_name in EVENT_PATTERNS:
         if pattern.search(text):
             event_bonus = max(event_bonus, multiplier)
             events_found.append(event_name)
+    n_distinct_events = len(set(events_found))
+    if n_distinct_events >= 2:
+        # +15% per extra distinct category, capped so it can never exceed the
+        # sharpest single-event multiplier (crisis=3.0) by more than ~17%.
+        uplift = 1.0 + MULTI_EVENT_UPLIFT * (n_distinct_events - 1)
+        event_bonus = min(event_bonus * uplift, MULTI_EVENT_BONUS_CAP)
 
     # Source authority
     src_w = _source_weight(source)
@@ -371,6 +394,7 @@ def score_article(title: str, summary: str, source: str = "", published: str = "
         "port_mult": port_mult,
         "blacklist_penalty": blacklist_penalty,
         "events": events_found,
+        "n_events": n_distinct_events,
         "reason": "scored_penalized" if blacklist_penalty < 1.0 else "scored",
     }
 
