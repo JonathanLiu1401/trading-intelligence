@@ -5,6 +5,15 @@ import requests
 
 DISCORD_LIMIT = 2000
 
+# Discord rejects requests from some default library User-Agents (it has
+# historically returned HTTP 403 for bare urllib/python-requests UAs as part
+# of its anti-abuse filtering). Sending an explicit, descriptive UA — the
+# format Discord documents for bots/webhooks — keeps this resilient even if
+# the bare `python-requests/X.Y` UA gets filtered in the future.
+_HEADERS = {
+    "User-Agent": "DigitalIntern-Notifier/1.0 (+https://github.com/openclaw/digital-intern)"
+}
+
 
 def _chunk(text: str, limit: int = DISCORD_LIMIT):
     """Split text into Discord-sized chunks.
@@ -47,7 +56,7 @@ def send(message: str, is_alert: bool = False) -> bool:
         sent = False
         for attempt in range(4):
             try:
-                r = requests.post(webhook, json={"content": chunk}, timeout=15)
+                r = requests.post(webhook, json={"content": chunk}, headers=_HEADERS, timeout=15)
                 if r.status_code == 429:
                     # Honor Discord rate limit: prefer JSON retry_after, fall back to header, then exponential backoff.
                     retry_after = 1.0
