@@ -90,3 +90,93 @@ class TestSampleWeights:
         assert w[3] > w[2] > w[1] > w[0]
         # exp=2 → 9.0 weighs ~20x more than 2.0 pre-normalization.
         assert w[2] / w[0] > 10.0
+
+
+class _StubEmbedder:
+    """Deterministic, torch-free stand-in for the global TF-IDF embedder so
+    train() orchestration can be exercised without fitting a real vectorizer
+    or mutating the process-global singleton."""
+
+    fitted = True
+
+    def should_refit(self, n):
+        return False
+
+    def transform(self, texts):
+        return np.zeros((len(texts), 8), dtype=np.float32)
+
+    def fit_transform(self, texts):
+        return np.zeros((len(texts), 8), dtype=np.float32)
+
+
+class _StubModel:
+    """Captures the X/y arrays train() hands to ArticleNet.fit and returns a
+    plausible metrics dict, so the test asserts the orchestration (not torch)."""
+
+    fitted = False
+
+    def __init__(self):
+        self.fit_calls = []
+
+    def fit(self, X, y_rel, y_urg, **kw):
+        self.fit_calls.append((X.shape, len(y_rel)))
+        return {
+            "final_loss": 0.12, "val_loss": 0.15, "best_in_run": 0.15,
+            "new_best": True, "epochs": kw.get("epochs", 1),
+            "device": "cpu",
+        }
+
+
+class TestTrainOrchestration:
+    """Regression guard for the dataset-cache bug (commit 17e414b): train()
+    referenced ``texts``/``articles`` after both code paths had stopped
+    defining them — a NameError on EVERY cycle, so ArticleNet silently never
+    retrained in production while the daemon log looked healthy. These two
+    cases cover both branches; the second is the one that always raised."""
+
+    def _patch(self, monkeypatch, tmp_path):
+        model = _StubModel()
+        monkeypatch.setattr(trainer, "get_embedder", lambda: _StubEmbedder())
+        monkeypatch.setattr(trainer, "get_model", lambda: model)
+        monkeypatch.setattr(trainer, "_log_metrics", lambda rec: None)
+        # Redirect the on-disk dataset cache into the test's tmp dir so the
+        # two calls genuinely exercise the write-then-reload path in isolation.
+        monkeypatch.setattr(trainer, "_ML_DIR", tmp_path)
+        monkeypatch.setattr(trainer, "_DATASET_CACHE", tmp_path / "dataset_cache.npz")
+        monkeypatch.setattr(trainer, "_DATASET_META", tmp_path / "dataset_cache_meta.json")
+        return model
+
+    def test_fresh_path_does_not_raise_and_trains(self, store, monkeypatch,
+                                                  tmp_path):
+        """No cache on disk → _fetch_training_data → embed → train. Pre-fix
+        this raised NameError on the leftover re-embed block."""
+        model = self._patch(monkeypatch, tmp_path)
+        for i in range(40):
+            _insert(store, id=f"llm{i}", title=f"llm article number {i} here",
+                    ai_score=7.0, score_source="llm")
+
+        result = trainer.train(store)
+
+        assert result["status"] == "ok", result
+        assert result["n"] == 40
+        # X = TF-IDF stub (8) + extra features (15) = 23 columns, 40 rows.
+        assert model.fit_calls == [((40, 23), 40)]
+        assert (tmp_path / "dataset_cache.npz").exists(), "cache not persisted"
+
+    def test_cached_path_does_not_raise(self, store, monkeypatch, tmp_path):
+        """Second call loads the freshly-written disk cache. This is the exact
+        production path that NameError'd every 3 minutes pre-fix — the cache
+        branch never binds ``texts``/``articles`` at all."""
+        model = self._patch(monkeypatch, tmp_path)
+        for i in range(40):
+            _insert(store, id=f"llm{i}", title=f"llm article number {i} here",
+                    ai_score=7.0, score_source="llm")
+
+        first = trainer.train(store)            # writes cache
+        second = trainer.train(store)           # reads cache (the bug path)
+
+        assert first["status"] == "ok"
+        assert second["status"] == "ok", second
+        assert second["n"] == 40
+        # Both calls reached model.fit with the same (n, dim) shape.
+        assert model.fit_calls == [((40, 23), 40), ((40, 23), 40)]

@@ -28,10 +28,20 @@ from watchers import alert_agent, urgency_scorer
 # ───────────────────────── helpers ──────────────────────────
 
 
+def _recent_iso(minutes_ago: int = 5) -> str:
+    """first_seen inside the 24h freshness window that get_unalerted_urgent /
+    get_top_for_briefing enforce. A hardcoded absolute date made these tests
+    fail once wall-clock moved past it — masking that the invariant under
+    test was actually fine."""
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
+
 def _insert_raw(store, *, id, url, title, source="rss", urgency=0,
                 ai_score=0.0, ml_score=None, score_source=None,
-                kw_score=1.0, published="", full_text=None):
+                kw_score=1.0, published="", full_text=None, first_seen=None):
     """Insert a row bypassing the public API for arbitrary state setup."""
+    if first_seen is None:
+        first_seen = _recent_iso()
     with store._write_lock:
         store.conn.execute(
             "INSERT INTO articles "
@@ -39,7 +49,7 @@ def _insert_raw(store, *, id, url, title, source="rss", urgency=0,
             " first_seen, cycle, ml_score, score_source, full_text) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (id, url, title, source, published, kw_score, ai_score, urgency,
-             "2026-05-15T00:00:00+00:00", 0, ml_score, score_source, full_text),
+             first_seen, 0, ml_score, score_source, full_text),
         )
         store.conn.commit()
 

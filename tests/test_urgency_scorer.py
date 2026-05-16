@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -10,14 +11,18 @@ from watchers import urgency_scorer
 
 
 def _insert(store, *, id, url="https://x.com/1", title="t", source="rss",
-            kw_score=1.0, urgency=0):
+            kw_score=1.0, urgency=0, first_seen=None):
+    # Keep first_seen inside the 24h freshness window so TestPreservesAlerted
+    # (which calls get_unalerted_urgent) doesn't go stale on a later rerun.
+    if first_seen is None:
+        first_seen = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     with store._write_lock:
         store.conn.execute(
             "INSERT INTO articles "
             "(id, url, title, source, published, kw_score, ai_score, urgency, "
             "first_seen, cycle) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (id, url, title, source, "", kw_score, 0.0, urgency,
-             "2026-05-15T00:00:00+00:00", 0),
+             first_seen, 0),
         )
         store.conn.commit()
 
