@@ -8,17 +8,30 @@ from pathlib import Path
 from datetime import datetime
 
 import feedparser
+import requests
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 SOURCES_PATH = BASE_DIR / "config" / "sources.json"
 DB_PATH = BASE_DIR / "data" / "seen_articles.db"
 
-MAX_WORKERS = 24  # parallel feed fetches
+MAX_WORKERS = 32  # parallel feed fetches
+FETCH_TIMEOUT = 8  # seconds; bounds dead/slow feeds so they don't starve workers
+_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
 
 def _ensure_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    # Hardened seen_articles.db connection — mirrors google_news._ensure_db /
+    # source_health.py / article_store.py. 11 collectors share this one file;
+    # SQLite's default busy_timeout=0 turns any transient cross-writer lock
+    # into an immediate OperationalError that aborts the whole pass and drops
+    # the fetched batch. WAL + 30s timeout lets the write wait out contention.
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS seen_articles (
@@ -49,7 +62,11 @@ def _fetch_feed(feed: dict) -> list:
     if not url:
         return []
     try:
-        parsed = feedparser.parse(url)
+        resp = requests.get(
+            url, timeout=FETCH_TIMEOUT, headers={"User-Agent": _UA}
+        )
+        resp.raise_for_status()
+        parsed = feedparser.parse(resp.content)
     except Exception as e:
         print(f"[rss_collector] Error fetching {name}: {e}")
         return []

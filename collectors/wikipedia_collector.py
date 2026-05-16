@@ -96,7 +96,14 @@ def _is_relevant(title: str, tickers: set[str]) -> bool:
 
 def _ensure_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    # Hardened seen_articles.db connection — mirrors google_news._ensure_db /
+    # source_health.py / article_store.py. 11 collectors share this one file;
+    # SQLite's default busy_timeout=0 turns any transient cross-writer lock
+    # into an immediate OperationalError that aborts the whole pass and drops
+    # the fetched batch. WAL + 30s timeout lets the write wait out contention.
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS seen_articles (
             id TEXT PRIMARY KEY, link TEXT, title TEXT,
