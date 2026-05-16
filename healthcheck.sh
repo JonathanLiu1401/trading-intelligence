@@ -69,20 +69,40 @@ UNSCORED=$(echo "$STATS_LINE" | grep -oP 'unscored=\K[0-9]+' 2>/dev/null || echo
 URGENT=$(echo  "$STATS_LINE" | grep -oP 'urgent=\K[0-9]+'   2>/dev/null || echo "?")
 
 # ── 4. Heartbeat watchdog ────────────────────────────────────────────────────
-HB_AGE_H="?"
-if [[ -f "$STRUCT_LOG" ]]; then
-    LAST_HB_TS=$(grep -aF '[heartbeat] sent' "$STRUCT_LOG" 2>/dev/null | tail -1 \
-                 | python3 -c "import sys,json; r=json.loads(sys.stdin.read().strip() or '{}'); print(r.get('ts',''))" 2>/dev/null || echo "")
-    if [[ -n "$LAST_HB_TS" ]]; then
-        HB_AGE_H=$(python3 -c "
+# The "[heartbeat] sent" briefing event is infrequent (≈hourly), so a single
+# size-rotation of structured.jsonl (RotatingFileHandler, 10MB) can leave the
+# current file with no marker until the next briefing fires. Scanning only the
+# current file then blanked HB_AGE_H to "?" AND silently disabled the >6h
+# stale-scorer alert below (it was gated on a non-empty timestamp). Scan the
+# current file plus the most recent rotated backup (.1) and take the latest ts.
+HB_AGE_H=$(python3 - "$STRUCT_LOG" "${STRUCT_LOG}.1" <<'PY' 2>/dev/null || echo "?"
+import sys, json
 from datetime import datetime, timezone
-dt = datetime.fromisoformat('${LAST_HB_TS}'.replace('Z','+00:00'))
-print(f'{(datetime.now(timezone.utc)-dt).total_seconds()/3600:.1f}')
-" 2>/dev/null || echo "?")
-        if python3 -c "exit(0 if float('${HB_AGE_H}') > 6 else 1)" 2>/dev/null; then
-            send_discord "⚠️ **Digital Intern**: no heartbeat briefing in ${HB_AGE_H}h — scorer may be stuck"
-        fi
-    fi
+latest = None
+for path in sys.argv[1:]:
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if "[heartbeat] sent" not in line:
+                    continue
+                try:
+                    ts = json.loads(line).get("ts", "")
+                except Exception:
+                    continue
+                if ts and (latest is None or ts > latest):
+                    latest = ts
+    except FileNotFoundError:
+        continue
+if not latest:
+    print("?")
+else:
+    dt = datetime.fromisoformat(latest.replace("Z", "+00:00"))
+    print(f"{(datetime.now(timezone.utc) - dt).total_seconds() / 3600:.1f}")
+PY
+)
+HB_AGE_H=${HB_AGE_H:-?}
+if [[ "$HB_AGE_H" != "?" ]] && python3 -c "exit(0 if float('${HB_AGE_H}') > 6 else 1)" 2>/dev/null; then
+    send_discord "⚠️ **Digital Intern**: no heartbeat briefing in ${HB_AGE_H}h — scorer may be stuck"
 fi
 
 # ── 5. Alert on high error count or scorer backlog ───────────────────────────
