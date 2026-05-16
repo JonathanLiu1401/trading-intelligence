@@ -39,6 +39,31 @@ def test_real_message_posts_once_and_fires_tts(monkeypatch):
         assert ua and "python-requests" not in ua.lower()
 
 
+def test_persistent_429_exhausts_retries_and_logs_giveup(monkeypatch, capsys):
+    # A 429 storm that never clears must NOT be a silent drop: after
+    # _MAX_ATTEMPTS the chunk is abandoned, send() returns False, TTS does
+    # not fire, and an explicit "gave up" line is printed so the failure is
+    # visible in journalctl during a rate-limit incident.
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://example.invalid/webhook")
+    rate_limited = mock.Mock(
+        status_code=429,
+        text="rate limited",
+        headers={"Retry-After": "0"},
+    )
+    rate_limited.json.return_value = {"retry_after": 0}
+    with mock.patch.object(discord_notifier.requests, "post",
+                           return_value=rate_limited) as post, \
+            mock.patch.object(discord_notifier.time, "sleep") as sleep, \
+            mock.patch("notifier.tts.speak_async") as tts:
+        assert discord_notifier.send("Micron DRAM alert") is False
+        assert post.call_count == discord_notifier._MAX_ATTEMPTS
+        tts.assert_not_called()
+        sleep.assert_called()  # honored the retry_after each attempt
+    out = capsys.readouterr().out
+    assert "gave up on chunk 1/1" in out
+    assert f"after {discord_notifier._MAX_ATTEMPTS} attempts" in out
+
+
 def test_empty_message_skips_before_webhook_lookup(monkeypatch):
     # Even with no webhook configured, the empty guard short-circuits first
     # and the return is still a clean False (not an exception).
