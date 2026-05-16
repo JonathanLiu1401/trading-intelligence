@@ -29,6 +29,13 @@ def _chunk(text: str, limit: int = DISCORD_LIMIT):
 
 def send(message: str, is_alert: bool = False) -> bool:
     """Send message to Discord; splits if > 2000 chars. Also fires TTS. Returns True on success."""
+    # An empty or whitespace-only body is a no-op: Discord rejects empty
+    # "content" with HTTP 400, and firing TTS on "" just wastes an API call
+    # while the old code returned True (a silent false success).
+    if not message or not message.strip():
+        print("[discord_notifier] empty message — skipping.")
+        return False
+
     webhook = os.environ.get("DISCORD_WEBHOOK_URL")
     if not webhook:
         print("[discord_notifier] DISCORD_WEBHOOK_URL not set — skipping.")
