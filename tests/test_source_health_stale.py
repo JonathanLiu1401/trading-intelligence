@@ -93,3 +93,125 @@ def test_disabled_but_recently_polled_is_not_stale(sh):
         sh.record_result("finnhub", 0)
     assert "finnhub" in sh.get_disabled_sources()
     assert sh.get_stale_sources() == []
+
+
+# ── _format_source_health_line: steady-state log-bloat behaviour ─────────────
+#
+# A single flaky source (reddit/nitter) flapping must NOT dump the full
+# ~258-item down-list on every change. The full list is reserved for the
+# first observation after restart and an hourly safety-net re-dump.
+
+from daemon import _format_source_health_line, SOURCE_HEALTH_FULL_DUMP_SECS
+
+# Simulated "mostly permanently down" gdelt-style universe.
+BIG = sorted(f"gdelt_q{i}" for i in range(258))
+
+
+def test_steady_state_change_has_no_full_list():
+    """(a) A changed-set warning in steady state omits `list=`."""
+    prev = tuple(BIG)
+    cur = sorted(BIG + ["reddit"])
+    line, level, new_sig, new_dump = _format_source_health_line(
+        disabled=cur, stale=[], down=cur,
+        last_down_sig=prev,
+        last_full_dump=1000.0,
+        now=1000.0,  # full dump just happened -> not due
+    )
+    assert level == "warning"
+    assert "list=" not in line
+    assert "newly_down=['reddit']" in line
+    assert new_sig == tuple(cur)
+    assert new_dump == 1000.0  # untouched, no full dump emitted
+
+
+def test_first_observation_emits_full_list():
+    """(b) last_down_sig is None -> full list IS emitted."""
+    line, level, new_sig, new_dump = _format_source_health_line(
+        disabled=BIG, stale=[], down=BIG,
+        last_down_sig=None,
+        last_full_dump=0.0,
+        now=5000.0,
+    )
+    assert level == "warning"
+    assert f"list={BIG}" in line
+    assert new_sig == tuple(BIG)
+    assert new_dump == 5000.0  # full-dump timestamp reset
+
+
+def test_recovered_and_newly_down_tokens():
+    """(c) recovered=[...] when sources come back, newly_down=[...] when broken."""
+    prev = tuple(sorted(BIG + ["reddit"]))
+    cur = sorted(BIG + ["nitter"])  # reddit recovered, nitter broke
+    line, level, _, _ = _format_source_health_line(
+        disabled=cur, stale=[], down=cur,
+        last_down_sig=prev,
+        last_full_dump=9999.0,
+        now=9999.0,
+    )
+    assert level == "warning"
+    assert "newly_down=['nitter']" in line
+    assert "recovered=['reddit']" in line
+    assert "list=" not in line
+    # Both tokens present, exactly one space between, no stray whitespace.
+    assert "newly_down=['nitter'] recovered=['reddit']" in line
+    assert line == line.strip()
+    assert "  " not in line
+
+
+def test_hourly_safety_net_redumps_on_change():
+    """Changed set + >1h since last full dump -> full list re-emitted."""
+    prev = tuple(BIG)
+    cur = sorted(BIG + ["reddit"])
+    line, level, _, new_dump = _format_source_health_line(
+        disabled=cur, stale=[], down=cur,
+        last_down_sig=prev,
+        last_full_dump=0.0,
+        now=SOURCE_HEALTH_FULL_DUMP_SECS + 1,  # safety net due
+    )
+    assert level == "warning"
+    assert f"list={cur}" in line
+    assert new_dump == SOURCE_HEALTH_FULL_DUMP_SECS + 1
+
+
+def test_unchanged_within_hour_is_concise_info():
+    """Unchanged set, <1h since dump -> concise INFO, no list."""
+    sig = tuple(BIG)
+    line, level, new_sig, new_dump = _format_source_health_line(
+        disabled=BIG, stale=[], down=BIG,
+        last_down_sig=sig,
+        last_full_dump=100.0,
+        now=200.0,
+    )
+    assert level == "info"
+    assert "(unchanged)" in line
+    assert "list=" not in line
+    assert new_sig == sig
+    assert new_dump == 100.0  # untouched
+
+
+def test_unchanged_after_hour_redumps_as_warning():
+    """Unchanged set, >1h since dump -> safety-net WARNING with full list."""
+    sig = tuple(BIG)
+    line, level, _, new_dump = _format_source_health_line(
+        disabled=BIG, stale=[], down=BIG,
+        last_down_sig=sig,
+        last_full_dump=0.0,
+        now=SOURCE_HEALTH_FULL_DUMP_SECS + 5,
+    )
+    assert level == "warning"
+    assert "(unchanged)" in line
+    assert f"list={BIG}" in line
+    assert new_dump == SOURCE_HEALTH_FULL_DUMP_SECS + 5
+
+
+def test_no_trailing_space_when_only_newly_down():
+    """Concise path with only newly_down: no stray trailing/leading space."""
+    line, _, _, _ = _format_source_health_line(
+        disabled=["reddit"], stale=[], down=["reddit"],
+        last_down_sig=(),  # not None, not changed-from-None first-seen path
+        last_full_dump=1e9,
+        now=1e9,
+    )
+    assert "list=" not in line
+    assert line == line.strip()
+    assert "  " not in line
