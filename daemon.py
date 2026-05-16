@@ -108,6 +108,7 @@ YAHOO_TICKER_RSS_INTERVAL = 240   # Yahoo per-ticker RSS every 4min
 WIKIPEDIA_INTERVAL  = 600         # Wikipedia recent-changes filter every 10min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
+EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
 WEB_SERVER_PORT     = int(os.environ.get("WEB_SERVER_PORT", "8080"))
 WEB_SERVER_HOST     = os.environ.get("WEB_SERVER_HOST", "0.0.0.0")
 
@@ -160,6 +161,49 @@ ALL_WORKERS = (
 )
 # If all of these are stale at once the dashboard shows the CRITICAL banner.
 CORE_WORKERS = ("rss", "web", "reddit", "scorer")
+
+# Expected seconds between consecutive `_worker_last_ok` pings for each worker,
+# i.e. its natural poll cadence. Liveness is judged relative to THIS, not a
+# single global window: a fixed 15min deadline wrongly flagged every slow
+# worker DEAD forever (alphavantage 30min, newsapi 25min, recursive_labeler 4h)
+# — pure log/dashboard noise that also inflated the `dead=N` rollup. Workers
+# absent from this map (e.g. web_server, which never pings) fall back to the
+# floor, preserving the previous behaviour for them.
+WORKER_POLL_INTERVAL_SECS = {
+    "gdelt": GDELT_INTERVAL, "rss": RSS_INTERVAL, "web": WEB_INTERVAL,
+    "reddit": REDDIT_INTERVAL, "ticker": TICKER_INTERVAL,
+    "sec_edgar": SEC_EDGAR_INTERVAL, "sec_edgar_ft": SEC_EDGAR_FT_INTERVAL,
+    "google_news": GOOGLE_NEWS_INTERVAL, "nitter": NITTER_INTERVAL,
+    "substack": SUBSTACK_INTERVAL, "finnhub": FINNHUB_INTERVAL,
+    "alphavantage": ALPHAVANTAGE_INTERVAL, "polygon": POLYGON_INTERVAL,
+    "massive": MASSIVE_INTERVAL, "newsapi": NEWSAPI_INTERVAL,
+    "yahoo_ticker_rss": YAHOO_TICKER_RSS_INTERVAL,
+    "wikipedia": WIKIPEDIA_INTERVAL, "scorer": SCORE_INTERVAL,
+    "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
+    "ml_trainer": ML_TRAIN_INTERVAL,
+    "continuous_trainer": CONTINUOUS_TRAIN_INTERVAL,
+    "recursive_labeler": RECURSIVE_LABEL_INTERVAL,
+    "price_alert": PRICE_ALERT_INTERVAL,
+    "portfolio_pl": PORTFOLIO_PL_INTERVAL,
+    "sentiment_trends": SENTIMENT_TRENDS_INTERVAL,
+    "export": EXPORT_INTERVAL,
+}
+# A worker is DEAD only after missing well over one full cycle, so a single
+# slow upstream poll never trips it. Floor keeps the old 15min minimum so a
+# fast worker (30s cadence) silent for 15min is still correctly flagged.
+LIVENESS_MULTIPLIER  = 2.5
+LIVENESS_FLOOR_SECS  = 15 * 60
+
+
+def _worker_liveness_deadline(name: str) -> float:
+    """Max seconds a worker may go without a success ping before it is DEAD.
+
+    Scales with the worker's own poll cadence (``LIVENESS_MULTIPLIER`` cycles)
+    but never drops below ``LIVENESS_FLOOR_SECS``."""
+    interval = WORKER_POLL_INTERVAL_SECS.get(name)
+    if interval is None:
+        return float(LIVENESS_FLOOR_SECS)
+    return max(float(LIVENESS_FLOOR_SECS), LIVENESS_MULTIPLIER * float(interval))
 
 def _handle_signal(sig, frame):
     global _running
@@ -308,14 +352,15 @@ def _worker_health_snapshot(now: float | None = None) -> dict:
         crashes_5m = sum(1 for t in crashes if now - t < CRASH_WINDOW_SECS)
         last_ok = _worker_last_ok.get(name)
         age_s = (now - last_ok) if last_ok else None
-        # "alive" semantics for the rollup: state != disabled AND we've seen
-        # a success ping in the past 15min (or we have no ping yet but state ok).
+        # "alive" semantics for the rollup: state != disabled AND we've seen a
+        # success ping within this worker's own liveness deadline (scaled to
+        # its poll cadence), or we have no ping yet but state is ok.
         if state == "disabled":
             alive = False
         elif age_s is None:
             alive = state == "ok"
         else:
-            alive = age_s < (15 * 60)
+            alive = age_s < _worker_liveness_deadline(name)
         if alive:
             workers_ok += 1
         else:
@@ -828,7 +873,6 @@ def sentiment_trends_worker(store: ArticleStore):
 # ── Worker: Periodic training-data export to USB drive ──────────────────────
 def export_worker(store: ArticleStore):
     log.info("[export_worker] started")
-    EXPORT_INTERVAL = 30 * 60
     _sleep(60)  # let collectors warm up first
     while _running:
         try:
