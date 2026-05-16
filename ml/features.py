@@ -89,16 +89,35 @@ def _source_credibility(source: str) -> float:
 
 
 def _parse_published(published: str) -> datetime | None:
+    """Parse a published-date string and normalise it to UTC.
+
+    Feeds emit their publish instant in their own timezone — Nikkei in JST
+    (``+0900``), US wires in EST (``-0500``), most others in UTC. The hour /
+    day-of-week cyclic features (indices 2..5) derive from ``dt.hour`` and
+    ``dt.weekday()``; without normalisation the *same* publishing instant
+    produces a different ``hour_sin``/``dow_sin`` per source (a -0500 feed
+    can even land on the previous weekday). That is pure noise injected into
+    4 of 15 extra features and a train/serve skew, since the trainer and
+    live inference both feed raw ``published`` strings. Converting every
+    parsed datetime to UTC here makes "hour of day" a stable signal the
+    model can actually learn. A naive datetime (RFC string without an
+    offset) is assumed UTC — same convention as the rest of the pipeline
+    (``urgency_scorer``, ``alert_agent``, ``heuristic_scorer``)."""
     if not published:
         return None
+    dt: datetime | None = None
     try:
-        return parsedate_to_datetime(published)
+        dt = parsedate_to_datetime(published)
     except Exception:
-        pass
-    try:
-        return datetime.fromisoformat(published.replace("Z", "+00:00"))
-    except Exception:
-        return None
+        dt = None
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _ticker_density(text: str) -> tuple[float, int, float]:
