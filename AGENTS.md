@@ -144,6 +144,10 @@ Suites:
   non-positive count or misconfigured threshold (see ML pipeline note below).
 - `test_alert_dedup.py` / `test_logger_rotation.py` — syndication dedup signature/merge rules and
   size-rotation of `logs/structured.jsonl`.
+- `test_recursive_labeler.py` — `_apply_labels` defensive urgency parse (a non-int urgency from
+  Claude must not abort the run or discard the batch's good labels), 0..5→0..10 relevance rescale,
+  `score_source='llm'` on writes, and `_fetch_round1_candidates` backtest/opus exclusion (a
+  separate `WHERE` filter than `_LIVE_ONLY_CLAUSE`).
 
 ---
 
@@ -232,6 +236,7 @@ in isolation from the GPU/daemon machinery; `tests/test_retrain_guard.py` pins i
 | Articles permanently stuck unscored | Sonnet returned an empty or partial response | `score_batch` floors unscored items at 0.01 when Sonnet returned at least one valid entry; the queue must drain over 1–2 cycles. |
 | GPU OOM | Concurrent `_inject_and_train` from paper-trader during `ml_trainer_worker` retrain. | `_TRAIN_LOCK` serializes; lower paper-trader's `RUNS_PER_CYCLE`. `_handle_memory_error` clears CUDA cache. |
 | Duplicate daemons fighting over port 8080 | Stale process didn't release the singleton lock. | The new daemon waits via blocking `flock`. Check `data/daemon.lock` for the holder PID. |
+| `recursive_labeler` worker logs one WARNING per 4h cycle and `total_labeled=0`, model stops gaining gold labels | A label batch from Claude carried a non-int `urgency` (`"1"`, `"1.0"`, `"yes"`, `true`). The unguarded `int()` in `_apply_labels` used to raise, unwinding the whole pipeline and discarding the in-flight batch's good labels. Now degraded to `urgency=0` so the relevance label still lands. | Fixed in `_apply_labels` (defensive `int(float(...))` with `(TypeError, ValueError)` fallback). Pinned by `tests/test_recursive_labeler.py::TestApplyLabels::test_poison_urgency_does_not_abort_or_lose_siblings`. |
 
 ---
 
