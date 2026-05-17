@@ -108,6 +108,7 @@ review:
 | `test_loser_autopsy.py` | `build_loser_autopsy`: `_classify` failure-mode precedence (KNIFE_CATCH wins over the fast/shallow WHIPSAW arm, `< FAST_HOLD_DAYS` strict & `>= SLOW_HOLD_DAYS` inclusive boundaries, `None` hold/pnl_pct never raises and defaults); strict `pnl_usd < 0` loser convention (a `pnl==0` wash is **not** a loss — invariant #10); verbatim entry/exit reason joined by trade `id` (first BUY / last SELL; blank/whitespace → `None`, missing-id → `None`, never NLP-parsed); aggregates exact (total/avg, median odd **and** even count, ticker-bleed sorted most-negative-$ first, `repeat_offenders` n≥2, deterministic dominant-mode severity tie-break); P&L/cost/proceeds **consumed from `build_round_trips`** on a partial-then-full close (not recomputed); verdict withheld until `STABLE` (n_losers≥`STABLE_MIN_LOSERS`); NO_DATA/NO_LOSSES/EMERGING honesty; never raises on garbage rows |
 | `test_correlation.py` | `build_correlation`: `_returns` chain (a `0`/NaN/non-numeric bar **breaks then continues** — one bad yfinance bar must not zero the series; `pytest.approx` for the float-division results); `_pearson` exact `±1.0` under a positive/negative affine map, the hand-computed `0.6` fixture, flat-series → `None` (never a fabricated 0), length-mismatch/too-short → `None`; options flagged & skipped; single-name **and** sub-`MIN_RETURNS` series → `INSUFFICIENT` (verdict withheld, numerics where possible); `CONCENTRATED` (identical returns ρ=+1 → `effective_independent_bets`=1.0) / `DIVERSIFIED` (ρ=−1 → eff_bets `None` honest-undefined; constructed ρ=0 → eff_bets 2.0) / `SINGLE_NAME_RISK` overrides correlation when top weight ≥ `DOMINANT_WEIGHT` / `MODERATE` band; `weight_hhi` & `effective_positions_naive` exact (60/40 → HHI 0.52); unequal-length series aligned to the common tail; never raises on garbage |
 | `test_dashboard_threaded.py` | invariant #7 dashboard-concurrency lock. `test_run_passes_threaded` regression-locks the `dashboard.run` call site (monkeypatched `app.run`): `threaded=True` is passed **and** the existing `debug=False`/`use_reloader=False` hardening is preserved (RED before the 2026-05-17 fix — the kwarg was absent, so the in-process Werkzeug dev server served one request at a time and a single slow yfinance-backed endpoint head-of-line-blocked every concurrent panel / `/api/chat` fan-out / `:8080→:8090` cross-fetch). `test_threaded_server_parallelizes` is the behavioural lock: an independent ephemeral-port `make_server(..., threaded=True)` with a 0.4s route serves 4 concurrent requests in well under the serial 1.6s — so a future swap to a non-threaded WSGI entry point that silently drops the property is caught even though the monkeypatch lock still passes. Offline, deterministic, no real `:8090` bind. Found by user-perspective testing, not code review |
+| `test_core_state_swr.py` | `/api/state` stale-while-revalidate + the main-page `refresh()` guard (2026-05-17). End-to-end through the real Flask view on a fresh temp `Store`: cold build returns the full shape + `cached:false`/`cache_age_s` honesty keys; a warm hit within the 15s TTL serves the **stale** payload and does **not** re-read the store even after the underlying portfolio/trades change (the latency win, asserted as behaviour); the documented "inert under pytest unless `_SWR_TEST_FORCE`" contract holds (no honesty keys, live reflection — keeps the other `/api/state`-shaped exact-value tests isolated). `TestRefreshGuard` is a static lock on `dashboard.TEMPLATE` (the `TestTemplateIdsUnique` discipline, comments stripped so it reasons about executable JS): the `/api/state` fetch is wrapped in try/catch and the `!r.portfolio`/`r.warming`/`r.error` early-return precedes the first `r.portfolio.total_value` deref — RED before the fix, when `refresh()` was the lone `refresh*` fn with no guard and any transient `/api/state` body (it has 500'd 28× in prod — the `store.get_portfolio` shared-connection note) froze the whole page |
 
 ### Key invariants and constraints
 
@@ -174,15 +175,19 @@ review:
    `threaded=False`, so the dev server served one request at a time and a
    single slow endpoint head-of-line-blocked every concurrent panel fetch,
    the `/api/chat` ~15-way fan-out, and the `:8080→:8090` cross-fetch behind
-   it). Locked by `tests/test_dashboard_threaded.py`. **Remaining genuine
-   concern (separate, untreated — do NOT bundle it into a threading change):**
-   `threaded=True` removes *cross-request* head-of-line blocking but does not
-   bound *per-endpoint* latency — `/api/correlation`, `/api/news-edge`,
-   `/api/source-edge`, `/api/feed-health`, `/api/sector-heatmap` do
-   unbounded yfinance / cross-DB I/O and can each still take many seconds in
-   isolation. A future surgical pass should give those a tight network
-   timeout + a short result cache; that is its own commit with its own
-   evidence and tests.
+   it). Locked by `tests/test_dashboard_threaded.py`. **Per-endpoint latency
+   (largely treated):** `threaded=True` removed *cross-request* head-of-line
+   blocking; the *per-endpoint* latency concern is now closed by
+   `swr_cached` — every slow network endpoint (`/api/correlation`,
+   `/api/news-edge`, `/api/source-edge`, `/api/feed-health`,
+   `/api/sector-heatmap`, `/api/briefing`, `/api/suggestions`,
+   `/api/thesis-drift`, `/api/scorer-predictions`, `/api/data-feed`) **and,
+   2026-05-17, the heaviest pure-DB endpoint `/api/state`** (the trader-page
+   lifeline — observed 8.7s under concurrent load, the last high-traffic
+   gap) is now behind stale-while-revalidate with a bounded cold path. Each
+   such cache is its own commit with its own evidence + tests (the
+   `/api/state` one is `tests/test_core_state_swr.py`, which also locks the
+   `refresh()` warming/error-body guard).
 
 8. **Position uniqueness** — the `positions` table has a *table-wide* UNIQUE
    constraint on `(ticker, type, expiry, strike)` (it is **not** scoped to
@@ -387,7 +392,7 @@ Digital Intern dashboard on `:8080` can cross-fetch.
 |----------|---------|
 | `GET /` | HTML — live trader page (portfolio + trades + chart) |
 | `GET /backtests` | HTML — backtest grid + equity overlay |
-| `GET /api/state` | Portfolio + positions + last 40 trades + last 20 decisions + equity curve |
+| `GET /api/state` | Portfolio + positions + last 40 trades + last 20 decisions + equity curve. **`swr_cached("state", 15.0)` (2026-05-17):** this is the trader page's lifeline (polled every 15s by `refresh()`, cross-fetched, observed bursting 2–5 req/s) and the heaviest pure-DB read — six lock-held `Store` reads + a ~145KB body (eq 5000 + 500 trades). It was measured at **8.7s under concurrent load** and was the *only* high-traffic core endpoint not behind `swr_cached` while every slow network endpoint already was (the invariant #7 gap). The portfolio only changes on a decision cycle (`OPEN_INTERVAL_S` ≥ 1800s) so a 15s stale-while-revalidate window is invisible to a trader, serves instantly from the last good payload, single-flight-refreshes in the background, and the runner already pushes every fill to Discord immediately. Injected `cached`/`cache_age_s` honesty keys. `refresh()` tolerates the SWR cold `{"warming":true}` placeholder (skips the tick, self-heals next poll). Locked by `tests/test_core_state_swr.py` |
 | `GET /api/portfolio` | Compact portfolio read (consumed by Digital Intern at :8080) |
 | `GET /api/data-feed` | Live news-collector pulse — proxies digital-intern's `articles.db` (live-only filter): articles in last 1h / 24h + top active sources. Returns zeros (with `error`) if the article DB is unreachable so the widget still renders |
 | `GET /api/validation` | Signal-integrity validation history (permutation tests + label audits) read from `data/validation_results.json`, appended by the continuous loop's background validation runner (capped 50 on the writer side); UI renders the most recent entry |
