@@ -1,0 +1,13 @@
+# Monorepo root gitignore
+# Subproject data directories — large, volatile, never committed
+digital-intern/data/
+paper-trader/backtest.db
+paper-trader/backtest.db-wal
+paper-trader/backtest.db-shm
+paper-trader/logs/
+paper-trader/state/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
