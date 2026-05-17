@@ -184,3 +184,92 @@ class TestInsertCrud:
         s = store.stats()
         assert s["total"] == 1
         assert "urgent" in s and "unscored" in s
+
+
+# ── shared-connection cursor-collision retry ─────────────────────────────────
+class _FlakyConn:
+    """Delegates to a real sqlite connection but raises the shared-connection
+    cursor-collision (``sqlite3.DatabaseError: another row available``) on the
+    first ``executemany``, then behaves normally — the exact transient
+    interleave observed 48x in one production ``daemon.log`` window when a
+    lockless reader cursor on the shared ``self.conn`` raced a writer's
+    ``executemany`` (``check_same_thread=False``, ~30 daemon threads)."""
+
+    def __init__(self, real):
+        self._real = real
+        self.em_calls = 0
+
+    def executemany(self, sql, seq):
+        self.em_calls += 1
+        if self.em_calls == 1:
+            raise sqlite3.DatabaseError("another row available")
+        return self._real.executemany(sql, seq)
+
+    def __getattr__(self, name):  # delegate execute/commit/cursor/…
+        return getattr(self._real, name)
+
+
+class TestCursorCollisionRetry:
+    """``_retry_on_lock`` must also absorb the transient cursor-collision
+    DatabaseError (idempotent UPDATE/INSERT-OR-IGNORE ops), not only
+    'database is locked' — otherwise a whole Sonnet-labeled batch is dropped
+    and the articles re-enter the LLM queue forever (wasted quota + genuinely
+    urgent items never get urgency=1 → missed alerts)."""
+
+    def test_retry_on_another_row_available_then_succeeds(self, store,
+                                                          monkeypatch):
+        from storage import article_store as A
+        # No real backoff sleeps — keep the test instant + deterministic.
+        monkeypatch.setattr(A.time, "sleep", lambda *a, **k: None)
+
+        store.insert_batch([
+            {"title": "MU earnings beat Q3", "link": "https://reuters.com/mu",
+             "source": "rss", "published": "", "summary": "",
+             "_relevance_score": 2.0},
+        ])
+        aid = A.article_id("https://reuters.com/mu", "MU earnings beat Q3")
+
+        flaky = _FlakyConn(store.conn)
+        store.conn = flaky
+
+        before = A.lock_metrics()["lock_retries"]
+        # Must NOT raise — the decorator retries the idempotent UPDATE.
+        store.update_ai_scores_batch([(aid, 7.5, 1)])
+        after = A.lock_metrics()["lock_retries"]
+
+        assert flaky.em_calls == 2, "executemany should be retried exactly once"
+        assert after == before + 1, "collision must increment the retry counter"
+        row = store.conn.execute(
+            "SELECT ai_score, urgency, score_source FROM articles WHERE id=?",
+            (aid,),
+        ).fetchone()
+        assert row[0] == pytest.approx(7.5)
+        assert row[1] == 1
+        assert row[2] == "llm"
+
+    def test_non_retryable_databaseerror_still_propagates(self, store,
+                                                          monkeypatch):
+        """Tight discrimination: an IntegrityError (also a DatabaseError
+        subclass) must propagate, never be silently retried/swallowed."""
+        from storage import article_store as A
+        monkeypatch.setattr(A.time, "sleep", lambda *a, **k: None)
+
+        store.insert_batch([
+            {"title": "Y title long enough", "link": "https://x.com/y",
+             "source": "rss", "published": "", "summary": "",
+             "_relevance_score": 1.0},
+        ])
+        aid = A.article_id("https://x.com/y", "Y title long enough")
+
+        class _IntegrityConn:
+            def __init__(self, real):
+                self._real = real
+            def executemany(self, *a, **k):
+                raise sqlite3.IntegrityError(
+                    "UNIQUE constraint failed: articles.id")
+            def __getattr__(self, n):
+                return getattr(self._real, n)
+
+        store.conn = _IntegrityConn(store.conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            store.update_ai_scores_batch([(aid, 5.0, 0)])
