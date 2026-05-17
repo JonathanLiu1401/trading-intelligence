@@ -1855,14 +1855,40 @@ def _acquire_singleton_lock():
             holder = "unknown"
         log.warning(
             f"[daemon] Another daemon instance is already running (lock held by pid={holder}). "
-            f"Waiting for it to exit before taking over (no restart spam)."
+            f"Sending SIGTERM and waiting for it to exit."
         )
+        # Actively terminate the holder so we don't block indefinitely.
+        # (systemd restart only kills its own MainPID; orphans from prior
+        # crash cycles are outside the cgroup and survive restart.)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except Exception as e:
-            os.close(fd)
-            log.error(f"[daemon] Blocking flock failed: {e}; exiting.")
-            sys.exit(1)
+            holder_pid = int(holder)
+            os.kill(holder_pid, signal.SIGTERM)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass  # already dead or not ours
+
+        # Poll the flock for up to 30s for the graceful release; if the
+        # holder is still alive after that, force-kill it then acquire.
+        acquired = False
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                time.sleep(0.5)
+        if not acquired:
+            try:
+                os.kill(int(holder), signal.SIGKILL)
+                log.warning(f"[daemon] Holder pid={holder} did not exit in 30s; sent SIGKILL.")
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except Exception as e:
+                os.close(fd)
+                log.error(f"[daemon] Blocking flock failed after SIGKILL: {e}; exiting.")
+                sys.exit(1)
         log.info(f"[daemon] Previous holder pid={holder} exited; this instance is now primary.")
     # Seek to 0 before truncate+write: the diagnostic read above advances the
     # fd offset, and os.ftruncate does not reset it. Without this seek, the
