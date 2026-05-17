@@ -19,11 +19,11 @@ notify "🔄 Hourly review cycle started ($TS) — 4 Opus 4.7 agents launching i
 
 # ── Agent 1: paper-trader core ────────────────────────────────────────────────
 (
-cd /home/zeph/paper-trader
+cd /home/zeph/trading-intelligence/paper-trader
 claude --model claude-opus-4-7 --permission-mode bypassPermissions --print \
-'BEFORE STARTING: Read AGENTS.md if it exists in /home/zeph/paper-trader. Read every file listed below in full before touching anything.
+'BEFORE STARTING: Read AGENTS.md if it exists in /home/zeph/trading-intelligence/paper-trader. Read every file listed below in full before touching anything.
 
-You are doing a systematic code review, bug-fix, test suite, and documentation pass on /home/zeph/paper-trader core.
+You are doing a systematic code review, bug-fix, test suite, and documentation pass on /home/zeph/trading-intelligence/paper-trader core.
 
 ## Files to read in full first:
 - AGENTS.md (if exists)
@@ -55,15 +55,15 @@ Coverage required:
 
 Mock external APIs (yfinance, Discord, HTTP) with pytest monkeypatch or unittest.mock. Use in-memory SQLite for store tests.
 
-Run tests: cd /home/zeph/paper-trader && python3 -m pytest tests/ -v 2>&1 | tail -30
+Run tests: cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/ -v 2>&1 | tail -30
 
 Fix any test failures before proceeding.
 
 ## Step 3 — Write/update AGENTS.md
-Create or update /home/zeph/paper-trader/AGENTS.md with:
+Create or update /home/zeph/trading-intelligence/paper-trader/AGENTS.md with:
 - Architecture overview (what each file does, data flow)
 - How to run the paper trader
-- How to run tests: "cd /home/zeph/paper-trader && python3 -m pytest tests/ -v"
+- How to run tests: "cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/ -v"
 - Key invariants and constraints (e.g. no env key in openclaw.json, live trader uses Opus 4.7)
 - Common failure modes and how to debug them
 - All API endpoints the dashboard exposes
@@ -94,11 +94,11 @@ A1=$!
 
 # ── Agent 2: paper-trader ML + backtests ─────────────────────────────────────
 (
-cd /home/zeph/paper-trader
+cd /home/zeph/trading-intelligence/paper-trader
 claude --model claude-opus-4-7 --permission-mode bypassPermissions --print \
-'BEFORE STARTING: Read AGENTS.md if it exists in /home/zeph/paper-trader. Read every file listed below in full before touching anything.
+'BEFORE STARTING: Read AGENTS.md if it exists in /home/zeph/trading-intelligence/paper-trader. Read every file listed below in full before touching anything.
 
-You are doing a systematic code review, bug-fix, test suite, and documentation pass on /home/zeph/paper-trader ML and backtest files.
+You are doing a systematic code review, bug-fix, test suite, and documentation pass on /home/zeph/trading-intelligence/paper-trader ML and backtest files.
 
 ## Files to read in full first:
 - AGENTS.md (if exists)
@@ -119,12 +119,12 @@ Create or update tests/ with pytest tests that assert specific expected values a
 
 Mock yfinance and DB reads. All tests must run offline.
 
-Run tests: cd /home/zeph/paper-trader && python3 -m pytest tests/ -v -k "ml or backtest or scorer" 2>&1 | tail -30
+Run tests: cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/ -v -k "ml or backtest or scorer" 2>&1 | tail -30
 
 Fix any failures before proceeding.
 
 ## Step 3 — Update AGENTS.md
-Add or update ML/backtest section in /home/zeph/paper-trader/AGENTS.md:
+Add or update ML/backtest section in /home/zeph/trading-intelligence/paper-trader/AGENTS.md:
 - How the ML decision scorer works
 - How to run backtests manually
 - How to interpret backtest results
@@ -155,11 +155,11 @@ A2=$!
 
 # ── Agent 3: digital-intern full codebase ────────────────────────────────────
 (
-cd /home/zeph/digital-intern
+cd /home/zeph/trading-intelligence/digital-intern
 claude --model claude-opus-4-7 --permission-mode bypassPermissions --print \
-'BEFORE STARTING: Read AGENTS.md if it exists in /home/zeph/digital-intern. Read every file listed below in full before touching anything.
+'BEFORE STARTING: Read AGENTS.md if it exists in /home/zeph/trading-intelligence/digital-intern. Read every file listed below in full before touching anything.
 
-You are doing a systematic code review, bug-fix, test suite, and documentation pass on /home/zeph/digital-intern.
+You are doing a systematic code review, bug-fix, test suite, and documentation pass on /home/zeph/trading-intelligence/digital-intern.
 
 ## Files to read in full first:
 - AGENTS.md (if exists)
@@ -193,16 +193,16 @@ Create or update tests/ with pytest tests that would catch real bugs:
 
 Use in-memory SQLite for store tests. Mock all external calls.
 
-Run tests: cd /home/zeph/digital-intern && python3 -m pytest tests/ -v 2>&1 | tail -30
+Run tests: cd /home/zeph/trading-intelligence/digital-intern && python3 -m pytest tests/ -v 2>&1 | tail -30
 
 Fix any failures before proceeding.
 
 ## Step 3 — Write/update AGENTS.md
-Create or update /home/zeph/digital-intern/AGENTS.md with:
+Create or update /home/zeph/trading-intelligence/digital-intern/AGENTS.md with:
 - Architecture overview (workers, data flow from collection to alert)
 - Critical invariants (backtest isolation, ml_score vs ai_score separation)
 - How to run the daemon
-- How to run tests: "cd /home/zeph/digital-intern && python3 -m pytest tests/ -v"
+- How to run tests: "cd /home/zeph/trading-intelligence/digital-intern && python3 -m pytest tests/ -v"
 - Worker descriptions and their roles
 - How the ML training pipeline works (label flow, weighting)
 - Common failure modes and debugging
@@ -239,19 +239,19 @@ A3=$!
 (
 cd /home/zeph
 claude --model claude-opus-4-7 --permission-mode bypassPermissions --print \
-'BEFORE STARTING: Read AGENTS.md in both /home/zeph/paper-trader and /home/zeph/digital-intern if they exist. Then read the dashboards, strategy, and ML files to build a complete mental model of the system BEFORE implementing anything.
+'BEFORE STARTING: Read AGENTS.md in both /home/zeph/trading-intelligence/paper-trader and /home/zeph/trading-intelligence/digital-intern if they exist. Then read the dashboards, strategy, and ML files to build a complete mental model of the system BEFORE implementing anything.
 
 You are a senior product engineer taking full ownership of this trading stack. Your job is creative feature development and user-perspective testing.
 
 Repos:
-- /home/zeph/paper-trader   (paper trading engine, ML scorer, backtests, Flask dashboard :8090)
-- /home/zeph/digital-intern (news collector, AI scorer, Bloomberg alerts, chat API :8080)
+- /home/zeph/trading-intelligence/paper-trader   (paper trading engine, ML scorer, backtests, Flask dashboard :8090)
+- /home/zeph/trading-intelligence/digital-intern (news collector, AI scorer, Bloomberg alerts, chat API :8080)
 - /home/zeph/unified_dashboard.py (reverse proxy :8888 — /intern/, /trader/, /ops/)
 
 ## Step 1 — READ ALL DOCUMENTATION FIRST
 Before writing a single line of code:
-- Read /home/zeph/paper-trader/AGENTS.md (if exists)
-- Read /home/zeph/digital-intern/AGENTS.md (if exists)
+- Read /home/zeph/trading-intelligence/paper-trader/AGENTS.md (if exists)
+- Read /home/zeph/trading-intelligence/digital-intern/AGENTS.md (if exists)
 - Read unified_dashboard.py
 - Read paper_trader/dashboard.py and paper_trader/strategy.py
 - Read digital-intern/dashboard/web_server.py
@@ -285,8 +285,8 @@ For every change made:
 5. DO NOT skip or weaken existing tests to make them pass — fix the underlying code
 
 Test commands:
-- paper-trader: cd /home/zeph/paper-trader && python3 -m pytest tests/ -v
-- digital-intern: cd /home/zeph/digital-intern && python3 -m pytest tests/ -v
+- paper-trader: cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/ -v
+- digital-intern: cd /home/zeph/trading-intelligence/digital-intern && python3 -m pytest tests/ -v
 
 ## Step 6 — Update docs
 Update AGENTS.md with any new features, endpoints, or architecture changes.
@@ -304,7 +304,7 @@ wait $A1 $A2 $A3 $A4
 notify "✅ Hourly review cycle $TS complete — all 4 agents finished"
 
 # Append run log entry
-RUN_LOG="/home/zeph/paper-trader/data/run_log.md"
+RUN_LOG="/home/zeph/trading-intelligence/paper-trader/data/run_log.md"
 echo "" >> "$RUN_LOG"
 echo "## $TS" >> "$RUN_LOG"
 echo "- Agents: core, ML+backtests, digital-intern, feature-dev" >> "$RUN_LOG"

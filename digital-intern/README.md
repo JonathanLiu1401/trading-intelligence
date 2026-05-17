@@ -12,23 +12,53 @@ Collectors (17+ sources) → Heuristic triage → SQLite (articles.db)
        → Alert agent (Discord) / Heartbeat briefing (Opus 4.7)
 ```
 
-## Sources
+## Sources (21 collectors)
 
-| Category | Sources |
-|---|---|
-| News feeds | RSS (100+ feeds), Google News, Yahoo RSS, NewsAPI |
-| Financial data | GDELT v2, Finnhub, Alpha Vantage, Polygon |
-| Social | Reddit (r/investing, r/stocks, etc.), Nitter (Twitter/X), Substack |
-| SEC filings | EDGAR 8-K real-time RSS |
-| Web | 100+ financial sites scraped every 60s, Wikipedia |
-| Data enrichment | Web scraper, Massive API |
+Every file in `collectors/` is one source adapter. The full set:
+
+| Collector | Source | What it pulls |
+|---|---|---|
+| `rss_collector` | 100+ financial RSS feeds | Reuters, WSJ, MarketWatch, CNBC, Bloomberg, etc. every 30s |
+| `google_news` | Google News RSS | Per-ticker query feeds, every 2 min |
+| `yahoo_ticker_rss` | Yahoo Finance RSS | Per-ticker company news |
+| `ticker_news` | yfinance `.news` | Ticker-attached headlines, every 60s |
+| `newsapi_collector` | NewsAPI.org | Keyword + business-category articles |
+| `gdelt_collector` | GDELT v2 DOC API | Global news event stream, sweep every 10 min |
+| `finnhub_collector` | Finnhub company-news | Per-ticker news, 50 req/min |
+| `alphavantage_collector` | Alpha Vantage NEWS_SENTIMENT | News + sentiment scores |
+| `polygon_collector` | Polygon.io | Market news + ticker reference |
+| `reddit_collector` | Reddit (r/investing, r/stocks, r/wallstreetbets, …) | Top/new posts every 45s |
+| `nitter_collector` | Nitter (Twitter/X mirror) | Finance accounts / cashtags |
+| `substack_collector` | Substack finance newsletters | New posts |
+| `sec_edgar` | SEC EDGAR | Real-time 8-K filing RSS, every 5 min |
+| `wikipedia_collector` | Wikipedia | Company/event page change signals |
+| `web_scraper` | 100+ financial sites | Full-text scrape every 60s |
+| `massive_collector` | Massive API | Bulk article enrichment |
+| `stock_data` | yfinance | Price/quote context for scoring |
+| `options_monitor` | Options chains | Unusual options activity signals |
+| `earnings_calendar` | Earnings calendar feed | Upcoming earnings dates |
+| `portfolio_pnl` | yfinance + `config/portfolio.json` | Portfolio P&L snapshots |
+| `source_health` | Internal | Per-source freshness/error tracking |
 
 ## ML Pipeline
 
-- **ArticleNet** — PyTorch MLP trained on LLM-labeled examples; outputs relevance (0–5) and urgency (0–1) per article
-- **Recursive labeler** — Three-tier LLM labeling: heuristics → Sonnet 4.6 → Opus 4.7 for the hardest cases
-- **Continuous training** — Model retrains every 2–3 minutes on GPU (RTX 3060) as new labels accumulate
-- **Grey-zone routing** — Articles where the model is uncertain (`needs_llm=True`) are escalated to Sonnet 4.6
+### ArticleNet architecture
+- PyTorch MLP over a 512-dim text feature vector (`ml/embedder.py` → `ml/features.py`)
+- Hidden layers with ReLU + dropout; two heads: a relevance head (0–5 regression) and an urgency head (0–1 sigmoid)
+- Trained with MSE/BCE on LLM-labeled examples; runs batched GPU inference (RTX 3060) in `ml/inference.py`
+
+### Training loop
+- `ml/trainer.py` runs the full retrain on accumulated labels every ~3 min (worker W10)
+- `continuous_trainer` (W12) does a lightweight 40-epoch GPU pass every ~2 min for fast adaptation
+- `core/retrain_guard.py` is a circuit breaker: if labeling/training fails repeatedly (e.g., Claude org usage limit), it backs off instead of hot-looping. A run of `failures=N labeled=0` from the recursive labeler indicates the Claude CLI usage cap, not a code bug.
+
+### Recursive labeling (three tiers)
+1. **Heuristics** — `triage/heuristic_scorer.py` keyword scoring (0–5), cheap, runs on every article
+2. **Sonnet 4.6** — grey-zone articles (`needs_llm=1`, model uncertain) batch-escalated via `watchers/urgency_scorer.py`
+3. **Opus 4.7** — hardest/ambiguous cases via `ml/recursive_labeler.py`, every ~4h
+
+### Calibration
+- Predicted urgency is calibrated against realized LLM labels so the alert threshold maps to a stable precision; the alert agent fires only above the calibrated urgency cutoff.
 
 ## Architecture
 
@@ -116,20 +146,69 @@ python3 scripts/gdelt_gkg_bulk.py 2018
 python3 scripts/sec_edgar_bulk.py 2015
 ```
 
-All scripts are checkpoint-resumable (JSON files in `data/`).
+### Expected counts & timing
+
+| Window | Source | Approx. articles | Wall time (this host) |
+|---|---|---|---|
+| 1 year, all 4 in parallel | `bulk_collect.sh` | ~250K–500K | ~6–12 h |
+| 2015–present GKG | `gdelt_gkg_bulk.py` | ~1.5M–2M | multi-day (resumable) |
+| 2018–present, 54 tickers | `finnhub_historical_news.py` | ~150K–300K | ~3–6 h (50 req/min cap) |
+| 1994–present 8-Ks | `sec_edgar_bulk.py` | ~400K–600K | ~8–16 h (5 req/s cap) |
+
+The live `articles.db` on this host is ~1.8M+ rows. All scripts are checkpoint-resumable (JSON checkpoint files in `data/`, atomic writes) — safe to kill and restart.
+
+## API Endpoints (dashboard :8080)
+
+Flask dashboard served by worker W17 (`dashboard/`):
+
+| Endpoint | Returns |
+|---|---|
+| `GET /healthz` | Liveness probe |
+| `GET /api/health` | Component health summary |
+| `GET /api/stats` | Aggregate counts (articles, sources, labels) |
+| `GET /api/articles?limit=N` | Most recent scored articles |
+| `GET /api/articles_per_hour` | Ingest rate histogram |
+| `GET /api/volume-history` | Article volume over time |
+| `GET /api/briefings` | Recent Opus 4.7 heartbeat briefings |
+| `GET /api/trends` | Sentiment trend series |
+| `GET /api/metrics` | Internal metrics (worker timings, queue depths) |
+| `GET /api/ml-status` | ArticleNet training state, last loss, label counts |
+| `GET /api/collector-health` | Per-source freshness / error rates |
+| `GET /api/portfolio` | Current portfolio P&L snapshot |
+| `GET /api/portfolio/config` | Portfolio + watchlist config |
+| `GET /api/earnings` | Upcoming earnings calendar |
+| `GET /api/invariants` | Runtime invariant checks |
+| `GET /api/logs` | Recent structured log lines |
+| `POST /api/chat` | Chat-with-the-daemon endpoint (`/chat` UI) |
+| `POST /api/restart` | Trigger a graceful daemon restart |
 
 ## Configuration
 
-Copy `.env.example` to `.env` (or set env vars directly):
+Environment is loaded from `.env` (also consumed by paper-trader via systemd `EnvironmentFile`).
 
-```env
-FINNHUB_API_KEY=...
-ALPHA_VANTAGE_KEY=...
-SEC_USER_AGENT=YourApp contact@yourapp.com
-DISCORD_WEBHOOK_URL=...
-```
+| Variable | Purpose |
+|---|---|
+| `FINNHUB_API_KEY` | Finnhub company-news collector |
+| `ALPHA_VANTAGE_KEY` | Alpha Vantage NEWS_SENTIMENT collector |
+| `POLYGON_API_KEY` | Polygon.io collector |
+| `NEWSAPI_KEY` | NewsAPI.org collector |
+| `SEC_USER_AGENT` | Required UA string for SEC EDGAR (`App contact@domain`) |
+| `DISCORD_WEBHOOK_URL` | Alert + briefing webhook (watchdog also reads this) |
+| `ANTHROPIC_API_KEY` / Claude CLI auth | Sonnet/Opus labeling + briefings |
 
-Portfolio positions and watchlist live in `config/portfolio.json` and `config/watchlist.json`.
+Portfolio positions and watchlist live in `config/portfolio.json` and `config/watchlist.json`. Source list (the "blitz" feed set) lives in `config/sources.json`.
+
+## Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---|---|
+| Daemon won't start, exits immediately | USB mount not ready. The `usb.conf` drop-in requires `/media/zeph/projects`. Check `mount \| grep projects`; the symlink `data/articles.db` must resolve. |
+| `recursive_labeler: failures=25 labeled=0` | Claude CLI org usage limit reached (not a code bug). `retrain_guard` circuit-breaks; resumes when quota resets. |
+| Disk space warnings / large `logs/` | `daemon.log.{1,2,3,4}` and `structured.jsonl.*` are RotatingFileHandler backups (gitignored). Safe to truncate old `.log.N` / `.jsonl.N`. |
+| ML trainer not advancing (`/api/ml-status` flat loss) | No new labels accumulating — check labeler tier 2/3 (quota) and that articles have `needs_llm` set. |
+| Rate-limit / 429 from a source | Per-collector backoff (`core/backoff.py`) handles this; persistent failures show in `/api/collector-health`. |
+| High memory (multi-GB peak) | Expected during GPU retrain bursts; the watchdog restarts if the process dies. Memory peak ~2–5 GB is normal on this host. |
+| Daemon orphaned after restart | A previous `daemon.py` may survive a systemd restart. Kill any non-MainPID `daemon.py` (`pgrep -af daemon.py`). |
 
 ## Running
 
@@ -176,5 +255,6 @@ pytest tests/ -x -q
 
 ## Related
 
-- **paper-trader** at `/home/zeph/paper-trader/` — reads `articles.db` (read-only) to drive trading decisions
+- **paper-trader** at `../paper-trader/` (monorepo sibling) — reads `articles.db` (read-only) to drive trading decisions
+- Monorepo root: [`../README.md`](../README.md)
 - Dashboard: `http://localhost:8080`

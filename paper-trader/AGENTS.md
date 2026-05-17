@@ -106,6 +106,7 @@ review:
 | `test_thesis_drift.py` | `build_thesis_drift`: `NO_DATA` empty; INTACT when up & signals benign; BROKEN via −8% pain line regardless of signals **and** via MACD-flip+negative-mom+loss; WEAKENING via soft −3% loss (no signals), hot RSI while green, cold-catalyst heuristic; **opener selection nearest `opened_at` picks the re-entry lot's BUY not the prior closed lot's** (invariant #8); entry reason surfaced **verbatim** (long string equality); missing ledger → reason `None`, `entry_price` falls back to `avg_cost`, no error; cards sorted worst-first with exact counts |
 | `test_loser_autopsy.py` | `build_loser_autopsy`: `_classify` failure-mode precedence (KNIFE_CATCH wins over the fast/shallow WHIPSAW arm, `< FAST_HOLD_DAYS` strict & `>= SLOW_HOLD_DAYS` inclusive boundaries, `None` hold/pnl_pct never raises and defaults); strict `pnl_usd < 0` loser convention (a `pnl==0` wash is **not** a loss — invariant #10); verbatim entry/exit reason joined by trade `id` (first BUY / last SELL; blank/whitespace → `None`, missing-id → `None`, never NLP-parsed); aggregates exact (total/avg, median odd **and** even count, ticker-bleed sorted most-negative-$ first, `repeat_offenders` n≥2, deterministic dominant-mode severity tie-break); P&L/cost/proceeds **consumed from `build_round_trips`** on a partial-then-full close (not recomputed); verdict withheld until `STABLE` (n_losers≥`STABLE_MIN_LOSERS`); NO_DATA/NO_LOSSES/EMERGING honesty; never raises on garbage rows |
 | `test_correlation.py` | `build_correlation`: `_returns` chain (a `0`/NaN/non-numeric bar **breaks then continues** — one bad yfinance bar must not zero the series; `pytest.approx` for the float-division results); `_pearson` exact `±1.0` under a positive/negative affine map, the hand-computed `0.6` fixture, flat-series → `None` (never a fabricated 0), length-mismatch/too-short → `None`; options flagged & skipped; single-name **and** sub-`MIN_RETURNS` series → `INSUFFICIENT` (verdict withheld, numerics where possible); `CONCENTRATED` (identical returns ρ=+1 → `effective_independent_bets`=1.0) / `DIVERSIFIED` (ρ=−1 → eff_bets `None` honest-undefined; constructed ρ=0 → eff_bets 2.0) / `SINGLE_NAME_RISK` overrides correlation when top weight ≥ `DOMINANT_WEIGHT` / `MODERATE` band; `weight_hhi` & `effective_positions_naive` exact (60/40 → HHI 0.52); unequal-length series aligned to the common tail; never raises on garbage |
+| `test_dashboard_threaded.py` | invariant #7 dashboard-concurrency lock. `test_run_passes_threaded` regression-locks the `dashboard.run` call site (monkeypatched `app.run`): `threaded=True` is passed **and** the existing `debug=False`/`use_reloader=False` hardening is preserved (RED before the 2026-05-17 fix — the kwarg was absent, so the in-process Werkzeug dev server served one request at a time and a single slow yfinance-backed endpoint head-of-line-blocked every concurrent panel / `/api/chat` fan-out / `:8080→:8090` cross-fetch). `test_threaded_server_parallelizes` is the behavioural lock: an independent ephemeral-port `make_server(..., threaded=True)` with a 0.4s route serves 4 concurrent requests in well under the serial 1.6s — so a future swap to a non-threaded WSGI entry point that silently drops the property is caught even though the monkeypatch lock still passes. Offline, deterministic, no real `:8090` bind. Found by user-perspective testing, not code review |
 
 ### Key invariants and constraints
 
@@ -154,15 +155,33 @@ review:
 7. **`paper_trader.db` uses WAL** — any external reader must use
    `PRAGMA journal_mode=WAL` or open the file as `file:...?mode=ro` to avoid
    lock contention with the live writer.
-   *Known concern (not fixed here — too invasive for a surgical pass):* the
-   in-process Flask dashboard runs in a daemon thread but shares the **same**
-   `Store` singleton (and thus the same `sqlite3.Connection`,
-   `check_same_thread=False`) as the runner. Writes are serialized by
-   `Store._lock`; reads (`get_portfolio`, `recent_trades`, `open_positions`,
-   `recent_decisions`, `equity_curve`) are **not**. Concurrent dashboard reads
-   during a runner write are tolerated by WAL but are not strictly
-   connection-safe. A proper fix would give the dashboard its own read-only
-   connection rather than reworking locking on the live writer.
+   *Dashboard concurrency (doc-truth correction, 2026-05-17 — the prior text
+   here said dashboard reads were unlocked / "not strictly connection-safe" /
+   "a proper fix would give the dashboard its own read-only connection"; the
+   code has since superseded that):* the in-process Flask dashboard runs in a
+   daemon thread (`runner._start_dashboard`) and shares the **same** `Store`
+   singleton (`sqlite3.Connection`, `check_same_thread=False`) as the runner —
+   but **every read now holds `Store._lock`**, not just writes. See the
+   load-bearing NOTE at `store.py::Store.get_portfolio` ("every read below
+   MUST hold self._lock … shared between the runner's writer thread and the
+   Flask dashboard **thread(s)**" — plural). The shared connection is never
+   used by two threads at once because `_lock` brackets every `.execute()`;
+   the slow yfinance-backed endpoints use their own per-request
+   `sqlite3.connect(file:…?mode=ro)`. The store is therefore already hardened
+   for a multi-threaded dashboard. **`dashboard.run` now passes
+   `threaded=True`** (it previously did not — `app.run` defaults
+   `threaded=False`, so the dev server served one request at a time and a
+   single slow endpoint head-of-line-blocked every concurrent panel fetch,
+   the `/api/chat` ~15-way fan-out, and the `:8080→:8090` cross-fetch behind
+   it). Locked by `tests/test_dashboard_threaded.py`. **Remaining genuine
+   concern (separate, untreated — do NOT bundle it into a threading change):**
+   `threaded=True` removes *cross-request* head-of-line blocking but does not
+   bound *per-endpoint* latency — `/api/correlation`, `/api/news-edge`,
+   `/api/source-edge`, `/api/feed-health`, `/api/sector-heatmap` do
+   unbounded yfinance / cross-DB I/O and can each still take many seconds in
+   isolation. A future surgical pass should give those a tight network
+   timeout + a short result cache; that is its own commit with its own
+   evidence and tests.
 
 8. **Position uniqueness** — the `positions` table has a *table-wide* UNIQUE
    constraint on `(ticker, type, expiry, strike)` (it is **not** scoped to
