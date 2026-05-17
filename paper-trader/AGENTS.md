@@ -7,13 +7,13 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 ## Repository layout (quick reference)
 
 - `paper_trader/runner.py` — live trader main loop. Auto-recovery circuit breaker scoped to its own child claude subprocesses (`pkill -P os.getpid()`, invariant #18). Hourly / daily-close markers are restart-durable via the atomic `data/runner_state.json` sidecar (invariant #6)
-- `paper_trader/strategy.py` — live Opus decision engine + watchlist (now injects the behavioural self-review mirror into the prompt)
+- `paper_trader/strategy.py` — live Opus decision engine + watchlist (now injects the behavioural self-review mirror into the prompt). `_portfolio_snapshot` emits `stale_mark` per position and `_build_payload` annotates a `[STALE MARK …]` suffix so a missing-price mark (`current_price==avg_cost`, P/L $0.00) is not read by Opus as a genuine flat position (commit `f834c93`, review pass #4; advisory only, invariants #2/#12)
 - `paper_trader/analytics/self_review.py` — canonical behavioural mirror; composes trade_asymmetry + capital_paralysis + open_attribution, fed into the live prompt **and** served at `/api/self-review`
 - `paper_trader/analytics/risk_mirror.py` — third advisory mirror (after self_review + track_record): composes `build_churn` + `build_correlation` **verbatim** (single source of truth #10) into a compact `prompt_block` on the trader's *structural* risk — how concentrated the book is and how much it churns (the 2026-05-17 live pathology: ~$973 / 16.7% win-rate, 60%+ one-sector, 0.52-day median hold). No price history is fetched on the hot decision path (a per-position yfinance call is a live-cycle latency/flake risk); without it `build_correlation` is `INSUFFICIENT` and its headline is the bare "verdict withheld" sentence, so the mirror surfaces the weight-based concentration (`top_weight_pct`/`weight_hhi`/`effective_positions_naive`, computed from `market_value` unconditionally) and only uses the richer ρ headline when a caller supplies `price_history`. Observational only, never gates (invariants #2/#12 — the self_review precedent); `_safe`-wrapped so a builder fault is "no block this cycle", never "no decision". Wired into `decide()` + `_build_payload(... risk_mirror_block=)` (rendered after the track-record section); applies on next paper-trader restart. Locked by `tests/test_risk_mirror.py`
 - `paper_trader/signals.py` — live news signal queries against digital-intern's articles.db
 - `paper_trader/market.py` — yfinance wrapper + NYSE session calendar
 - `paper_trader/store.py` — SQLite store (portfolio, trades, positions, decisions, equity_curve)
-- `paper_trader/reporter.py` — Discord output via openclaw. `send_hourly_summary` / `send_daily_close` now append `_behavioural_block()` — the `build_trader_scorecard` verdict-alignment synthesis composed **verbatim** (single source of truth, invariant #10; same store reads as `/api/scorecard`) so the operator who lives in Discord sees the ~24 builders' synthesis without opening the (stale) dashboard. Observational only, no caps (invariants #2/#12 — the `self_review`/`scorecard` precedent). NO_DATA/ERROR suppressed; a builder/store fault degrades to *no block*, **never** *no summary* (the reporter failure contract). Applies on next paper-trader restart (the documented pattern for every recent feature). **Also appends `_session_block(store, window_h, label)`** (2026-05-17) — a compact "what the desk actually did this 1h / 24h" block: the decision-activity mix (`filled / hold / no-dec / blocked`, classified from the free-text `decisions.action_taken` via `_classify_decision_outcome` — bucket order is load-bearing so a `→ FILLED`/`→ BLOCKED` verb line is not misread as `hold`), the best/worst open mover by `unrealized_pl` (`_movers`; single position → one line via object identity), and the portfolio-vs-SPY window delta (`_window_delta`; `alpha_pct` only when both legs resolve, missing `sp500_price` degrades to port-only). All composed from existing store reads — no new state, observational only, same failure contract (store/compute fault → `""`, never an exception). The cutoff is a lexically-comparable UTC isoformat string (the `signals.py` `first_seen` pattern). Answers the trader's "did the bot do anything, and am I beating SPY this window?" from Discord without opening the (often slow/stale) dashboard. Locked by `tests/test_core_reporter.py` (`TestClassifyDecisionOutcome` / `TestActivityCounts` cutoff-inclusive boundary / `TestMovers` identity / `TestWindowDelta` exact port/spy/alpha + spy-missing degrade / `TestSessionBlock` end-to-end on a real temp Store + hourly-summary integration). **Also (2026-05-17): `send_daily_close` emits an *additive* true-realized-P/L line** — `Realized P/L (today, N round-trip(s) closed, WW/LL)  $±X` — driven by `_realized_pl_today()`, which consumes `build_round_trips` (invariant #10, no re-derived P&L) filtered to round-trips whose `exit_ts` is today (UTC). It answers "what did I actually lock in today?", distinct from the pre-existing **cash-flow-basis** line (a BUY-only day reads as a large negative there — correct-by-disclosure, so that line is left untouched, not reinterpreted). Same failure contract: any fault drops just this one line (`None`), never the report. A position merely opened today does not count; an old-open/today-close trip is attributed to today because `build_round_trips` pairs BUY→SELL in ledger order (deep `recent_trades(5000)` window passed so the open leg is in scope). Locked by `tests/test_core_reporter.py::TestSendDailyCloseRealizedRoundTrips` (exact `$+70.00` on a 2-closed/1-open NVDA+MU+AMD ledger with `1W/1L`; no-line-when-nothing-closed; singular-grammar)
+- `paper_trader/reporter.py` — Discord output via openclaw. `send_hourly_summary` / `send_daily_close` now append `_behavioural_block()` — the `build_trader_scorecard` verdict-alignment synthesis composed **verbatim** (single source of truth, invariant #10; same store reads as `/api/scorecard`) so the operator who lives in Discord sees the ~24 builders' synthesis without opening the (stale) dashboard. Observational only, no caps (invariants #2/#12 — the `self_review`/`scorecard` precedent). NO_DATA/ERROR suppressed; a builder/store fault degrades to *no block*, **never** *no summary* (the reporter failure contract). Applies on next paper-trader restart (the documented pattern for every recent feature). **Also appends `_session_block(store, window_h, label)`** (2026-05-17) — a compact "what the desk actually did this 1h / 24h" block: the decision-activity mix (`filled / hold / no-dec / blocked`, classified from the free-text `decisions.action_taken` via `_classify_decision_outcome` — bucket order is load-bearing so a `→ FILLED`/`→ BLOCKED` verb line is not misread as `hold`), the best/worst open mover by `unrealized_pl` (`_movers`; single position → one line via object identity), and the portfolio-vs-SPY window delta (`_window_delta`; `alpha_pct` only when both legs resolve, missing `sp500_price` degrades to port-only). All composed from existing store reads — no new state, observational only, same failure contract (store/compute fault → `""`, never an exception). The cutoff is a lexically-comparable UTC isoformat string (the `signals.py` `first_seen` pattern). Answers the trader's "did the bot do anything, and am I beating SPY this window?" from Discord without opening the (often slow/stale) dashboard. Locked by `tests/test_core_reporter.py` (`TestClassifyDecisionOutcome` / `TestActivityCounts` cutoff-inclusive boundary / `TestMovers` identity / `TestWindowDelta` exact port/spy/alpha + spy-missing degrade / `TestSessionBlock` end-to-end on a real temp Store + hourly-summary integration). **Also (2026-05-17): `send_daily_close` emits an *additive* true-realized-P/L line** — `Realized P/L (today, N round-trip(s) closed, WW/LL)  $±X` — driven by `_realized_pl_today()`, which consumes `build_round_trips` (invariant #10, no re-derived P&L) filtered to round-trips whose `exit_ts` is today (UTC). It answers "what did I actually lock in today?", distinct from the pre-existing **cash-flow-basis** line (a BUY-only day reads as a large negative there — correct-by-disclosure, so that line is left untouched, not reinterpreted). Same failure contract: any fault drops just this one line (`None`), never the report. A position merely opened today does not count; an old-open/today-close trip is attributed to today because `build_round_trips` pairs BUY→SELL in ledger order (deep `recent_trades(5000)` window passed so the open leg is in scope). Locked by `tests/test_core_reporter.py::TestSendDailyCloseRealizedRoundTrips` (exact `$+70.00` on a 2-closed/1-open NVDA+MU+AMD ledger with `1W/1L`; no-line-when-nothing-closed; singular-grammar). **Also (2026-05-17, review pass #4): `_portfolio_lines` appends `⚠ STALE` when a position carries `stale_mark=True`** — additive only, `open_positions()` table rows lack the key so the existing Discord path is byte-identical (a genuinely flat $0.00 is never falsely flagged). Locked by `tests/test_core_reporter.py::TestPortfolioLines`
 - `paper_trader/dashboard.py` — Flask dashboard on :8090
 - `paper_trader/backtest.py` — backtest engine, `_ml_decide`, indicators
 - `paper_trader/ml/decision_scorer.py` — MLP that gates trade conviction
@@ -1270,6 +1270,77 @@ findings.
   with the same DFEN 2.10% per-ticker split concentration. Backtests are
   healthy (485–490 complete, 0 null/NaN finals, `completed_at` fresh to
   the current hour).
+
+### 2026-05-17 review pass #4 (stale-mark surfacing · core hybrid pass)
+
+- **Feature shipped (commit `f834c93`): stale price marks are now
+  surfaced, not silent.** `_portfolio_snapshot` (strategy.py) already
+  fell back to `avg_cost` when a live price was unavailable, so
+  `current_price == avg_cost` and `unrealized_pl == $0.00` — **visually
+  identical to a genuinely flat position**. Seen live this pass: `MU`
+  held at `avg == mark == 724.12`, P/L `$0.00`, which Opus and the
+  operator both read as "flat" when the mark was actually *unknown*. The
+  snapshot now emits a `stale_mark: bool` on every enriched position
+  (`True` only when the live stock/option-chain lookup returned `None`
+  and we fell back; **`False` for a deliberate expired-option intrinsic
+  settlement** — that is a real mark, not a missing price). `_build_payload`
+  appends `[STALE MARK: live price unavailable — shown at cost, P/L
+  unreliable]` to the PORTFOLIO line Opus reads (advisory text only — no
+  gating, invariants #2/#12), and `reporter._portfolio_lines` appends an
+  additive `⚠ STALE` tag. The reporter change is **byte-identical for the
+  existing Discord path**: `store.open_positions()` table rows carry no
+  `stale_mark` key, so a genuinely-flat `$0.00` is never falsely flagged;
+  only a missing-price mark is. `stale_mark` also rides into
+  `portfolio.positions_json` (via `update_portfolio`) so any `/api/state`
+  / `/api/portfolio` consumer gets it for free. Applies on next
+  paper-trader restart (the documented pattern for every recent feature).
+  Locked by `tests/test_core_strategy.py::TestStaleMarkFlag` (stock
+  no-price → flagged + behaviour preserved; stock with price → not stale;
+  live option `None` → flagged + still avg_cost; expired-option intrinsic
+  → NOT stale; `_build_payload` annotates the stale name and not the
+  fresh one) and `tests/test_core_reporter.py::TestPortfolioLines`
+  (annotated when flagged; absent/`False` key → no annotation).
+
+- **No core bug fixed (bugs_fixed = 0, no Phase-1 commit).** The 7
+  in-scope core files (`runner`, `reporter`, `signals`, `strategy`,
+  `dashboard`, `market`, `store`) were re-audited for logic / race /
+  comparison / off-by-one / state-transition errors against fresh eyes;
+  none found. The `core_*` suite is green (293 passed incl. the 9 new
+  tests; +165 in snapshot/payload-adjacent modules). Per the Phase-1
+  commit guard, no bug was fabricated.
+
+- **Live findings (operator action, NOT code bugs).**
+  (1) **Claude org monthly usage limit hit** — runner.log shows repeated
+  `claude err (rc=1): "You've hit your org's monthly usage limit"`;
+  `/api/decision-health` reads **NO_DECISION 59% all-time / ~27% last
+  24h**, FILLED only 3.2%, `hours_since_fill ≈ 9`. The trader degrades
+  gracefully (Opus→Sonnet fallback→retry→`NO_DECISION` recorded with the
+  raw excerpt; circuit breaker can't help a quota wall) but is mostly
+  *not trading*. Operator must address billing.
+  (2) **Hourly Discord summaries failing to send** — `[runner] hourly
+  send returned False` recurring since ~16:54 UTC; the summary composes
+  correctly (format verified: Equity/Cash/P&L/S&P/Positions/Recent/SESSION/
+  BEHAVIOURAL) but `openclaw` fails during the quota window. Auto-retries
+  next cycle (correct behaviour, not a bug).
+  (3) **Running process is stale/behind** — `/api/build-info`
+  `stale:true`, `boot_sha 92fcd2f` vs `head f834c93` (`behind:3`); the
+  on-disk fixes incl. this pass's feature do **not** apply until an
+  operator restart of `paper_trader.runner` (by design, surfaced
+  correctly).
+  (4) **Extreme concentration** — `/api/risk` `HIGH`: LITE 60.9% / top3
+  98.1% / cash 1.9% ($18.49). By design (no hard limits, invariant #12)
+  but a live-desk red flag worth the operator's eye.
+  (5) **LITE/MU marked ~10× plausible levels** (LITE ~$970–1006, MU
+  ~$724–803 vs real-world ~$80–130). The system is internally consistent
+  (buy & mark from the same yfinance source) and yfinance returns `None`
+  for them right now so it is unverifiable from here — but **position
+  sizing runs on these marks**; the operator should verify
+  `yfinance.fast_info` is not returning a wrong-instrument price.
+  (6) **Dashboard intermittent multi-second stalls / `CLOSE-WAIT`
+  pileup under concurrent sibling-agent load** (recovered to 1–11 ms on
+  isolated requests). Documented fragility (`dashboard.py:176-187` —
+  `yfinance`/`requests` has no socket timeout, a hung call pins an SWR
+  worker). No safe in-scope fix; reported.
 
 ### When to bump model versions
 
