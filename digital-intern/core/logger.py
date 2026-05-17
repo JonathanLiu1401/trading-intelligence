@@ -86,6 +86,28 @@ class _JSONLHandler(logging.handlers.RotatingFileHandler):
         return json.dumps(entry, ensure_ascii=False)
 
 
+def _plain_file_formatter() -> logging.Formatter:
+    """Formatter for the plain ``logs/daemon.log`` sink.
+
+    ``%(asctime)s`` MUST be real UTC to match the literal ``Z`` in ``datefmt``
+    and stay consistent with every other timestamp sink — the console
+    (``_ColourFormatter``), ``structured.jsonl`` (``_JSONLHandler``), the
+    ``briefings`` table and Discord alerts all use
+    ``datetime.now(timezone.utc)``. ``logging.Formatter`` defaults
+    ``converter`` to ``time.localtime``, which silently rendered local time
+    tagged ``Z`` — a host-TZ-dependent constant skew (observed: -7h on a PDT
+    host) that breaks any correlation between ``daemon.log`` (greped by
+    ``healthcheck.sh``, tailed by operators) and the UTC-correct sinks while
+    each line still looks individually plausible. Pinning ``converter`` to
+    ``time.gmtime`` makes the ``Z`` honest."""
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    )
+    fmt.converter = time.gmtime
+    return fmt
+
+
 def _build_root_logger():
     root = logging.getLogger()
     if root.handlers:
@@ -104,10 +126,7 @@ def _build_root_logger():
         _PLAIN_LOG, maxBytes=10 * 1024 * 1024, backupCount=7, encoding="utf-8"
     )
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%SZ",
-    ))
+    fh.setFormatter(_plain_file_formatter())
     root.addHandler(fh)
 
     # Structured JSONL
