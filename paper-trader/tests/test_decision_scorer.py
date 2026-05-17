@@ -36,9 +36,27 @@ class _FixedModel:
         return np.array([self.value], dtype=np.float64)
 
 
+class _RaisingModel:
+    """A stand-in model whose predict() raises — emulates the real failure
+    the codebase comment calls out: a feature added to build_features without
+    a retrain makes MLPRegressor.predict raise a shape/dtype ValueError."""
+
+    def predict(self, X):
+        raise ValueError("shapes (1,17) and (10,) not aligned")
+
+
 def _trained_scorer_returning(value: float) -> DecisionScorer:
     s = DecisionScorer()
     s._model = _FixedModel(value)
+    s._scaler = None
+    s._trained = True
+    s._n_train = 1000
+    return s
+
+
+def _trained_scorer_raising() -> DecisionScorer:
+    s = DecisionScorer()
+    s._model = _RaisingModel()
     s._scaler = None
     s._trained = True
     s._n_train = 1000
@@ -118,6 +136,27 @@ class TestPredictionClamp:
             clamped = max(-PRED_CLAMP_PCT, min(PRED_CLAMP_PCT, raw))
             assert _gate_bucket(clamped) == _gate_bucket(raw), (
                 f"raw={raw} bucket changed under clamp -> {clamped}")
+
+    def test_predict_exception_is_flagged_low_trust(self):
+        # Honesty bug: when model.predict() raises (e.g. a build_features
+        # feature was added without retraining the pickle — the exact
+        # scenario the predict() handler's comment calls out), the meta
+        # dict reported off_distribution=False, i.e. a model that CANNOT
+        # score the input looked identical to one confidently predicting a
+        # flat 0.0. Panels reading off_distribution (/api/scorer-predictions,
+        # the conviction board) then render a broken scorer as gospel. A
+        # failed prediction is the maximally-untrustworthy case and must be
+        # flagged, mirroring the non-finite branch precedent.
+        s = _trained_scorer_raising()
+        m = s.predict_with_meta(ml_score=0.0, rsi=50, macd=0.0, mom5=0.0,
+                                mom20=0.0, regime_mult=1.0, ticker="NVDA")
+        assert m["pred"] == 0.0          # safe scalar fallback unchanged
+        assert math.isfinite(m["pred"])
+        assert m["off_distribution"] is True
+        assert m["clamped"] is True
+        # predict()'s float contract is unchanged — still the safe 0.0.
+        assert s.predict(ml_score=0.0, rsi=50, macd=0.0, mom5=0.0,
+                         mom20=0.0, regime_mult=1.0, ticker="NVDA") == 0.0
 
     def test_untrained_scorer_meta_is_safe(self):
         # Regression guard: the untrained short-circuit must run BEFORE the
