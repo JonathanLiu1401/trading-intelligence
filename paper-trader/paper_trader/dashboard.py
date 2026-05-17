@@ -917,8 +917,8 @@ TEMPLATE = r"""
       <div class="stat-row" style="margin-bottom:14px;">
         <div class="stat"><div class="l">current equity</div><div class="v" id="dd-current">—</div></div>
         <div class="stat"><div class="l">peak equity</div><div class="v" id="dd-peak">—</div></div>
-        <div class="stat"><div class="l">drawdown</div><div class="v" id="dd-pct">—</div></div>
-        <div class="stat"><div class="l">trough</div><div class="v" id="dd-trough">—</div></div>
+        <div class="stat"><div class="l">current drawdown from peak</div><div class="v" id="dd-pct">—</div></div>
+        <div class="stat"><div class="l">max drawdown (trough)</div><div class="v" id="dd-trough">—</div></div>
         <div class="stat"><div class="l">time in DD</div><div class="v" id="dd-hours">—</div></div>
         <div class="stat"><div class="l">recovered</div><div class="v" id="dd-rec">—</div></div>
       </div>
@@ -1006,6 +1006,11 @@ TEMPLATE = r"""
         <div class="stat"><div class="l">avg confidence</div><div class="v" id="dh-conf">—</div></div>
         <div class="stat"><div class="l">since last fill</div><div class="v" id="dh-lastfill">—</div></div>
         <div class="stat"><div class="l">signals / cycle</div><div class="v" id="dh-sigs">—</div></div>
+      </div>
+      <div class="stat-row" style="margin-bottom:14px;">
+        <div class="stat"><div class="l">cycles (all-time)</div><div class="v" id="dh-total-all">—</div></div>
+        <div class="stat"><div class="l">parse-fail (all-time)</div><div class="v" id="dh-fail-all">—</div></div>
+        <div class="stat"><div class="l">fills (all-time)</div><div class="v" id="dh-fills-all">—</div></div>
       </div>
       <div style="font-size:12px;color:#dde1e7;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">Action mix (all-time)</div>
       <div id="dh-mix" style="margin-bottom:14px;"><div class="muted">loading…</div></div>
@@ -1157,7 +1162,7 @@ TEMPLATE = r"""
       <h2>Portfolio analytics</h2>
       <div class="stat-row" style="margin-bottom:18px;">
         <div class="stat"><div class="l">today's P/L</div><div class="v" id="an-daily">—</div></div>
-        <div class="stat"><div class="l">max drawdown</div><div class="v" id="an-dd">—</div></div>
+        <div class="stat"><div class="l">max drawdown (all-time)</div><div class="v" id="an-dd">—</div></div>
         <div class="stat"><div class="l">sharpe (ann.)</div><div class="v" id="an-sharpe">—</div></div>
         <div class="stat"><div class="l">win rate</div><div class="v" id="an-winrate">—</div></div>
         <div class="stat"><div class="l">avg winner</div><div class="v" id="an-avgw">—</div></div>
@@ -1295,6 +1300,7 @@ TEMPLATE = r"""
         <span id="cp-state" style="font-size:12px;padding:3px 10px;border-radius:4px;background:#1f2126;color:#8b929d;">—</span>
       </h2>
       <div class="muted" id="cp-headline" style="font-size:12px;margin-bottom:12px;">loading…</div>
+      <div id="cp-banner" style="display:none;font-size:13px;font-weight:600;padding:8px 12px;border-radius:5px;margin-bottom:12px;background:rgba(255,145,0,0.14);color:#ff9100;border:1px solid rgba(255,145,0,0.4);"></div>
       <div class="stat-row" style="margin-bottom:14px;">
         <div class="stat"><div class="l">cash</div><div class="v" id="cp-cash">—</div></div>
         <div class="stat"><div class="l">deployed</div><div class="v" id="cp-dep">—</div></div>
@@ -1602,7 +1608,7 @@ TEMPLATE = r"""
           <div class="progress-wrap" style="margin:8px 0 14px"><div class="progress-bar" id="bt-progress-bar" style="width:0%"></div></div>
           <div class="bt-headline">
             <div class="stat"><div class="l">avg annualized</div><div class="v" id="bt-avg-ann">—</div></div>
-            <div class="stat"><div class="l">avg total %</div><div class="v" id="bt-avg">—</div></div>
+            <div class="stat"><div class="l">total % (mean / median)</div><div class="v" id="bt-avg">—</div></div>
             <div class="stat"><div class="l">best</div><div class="v" id="bt-best">—</div></div>
             <div class="stat"><div class="l">worst</div><div class="v" id="bt-worst">—</div></div>
             <div class="stat"><div class="l">beat SPY</div><div class="v" id="bt-beat">—</div></div>
@@ -2203,6 +2209,12 @@ function renderBacktests() {
   document.getElementById("bt-filtered-count").textContent = vis.length ? `${vis.length}` : "—";
   if (vis.length) {
     const avg = vis.reduce((a,b) => a + (b.total_return_pct||0), 0) / vis.length;
+    // B10: median alongside mean — mean is skewed by a few extreme windows
+    // (e.g. a single 2008/2020 run), median is the typical-run truth.
+    const _ret = vis.map(b => b.total_return_pct || 0).sort((a,b) => a-b);
+    const _m = _ret.length;
+    const med = _m === 0 ? 0
+      : (_m % 2 ? _ret[(_m-1)/2] : (_ret[_m/2-1] + _ret[_m/2]) / 2);
     const annVals = vis.map(r => r.annualized_return_pct).filter(v => v != null);
     const avgAnn = annVals.length ? annVals.reduce((a,b)=>a+b,0)/annVals.length : null;
     const best = vis.reduce((a,b) => (b.annualized_return_pct||0) > (a.annualized_return_pct||0) ? b : a);
@@ -2211,8 +2223,10 @@ function renderBacktests() {
     const wins = vis.filter(x => (x.total_return_pct||0) > 0).length;
 
     const avgEl = document.getElementById("bt-avg");
-    avgEl.textContent = (avg >= 0 ? "+" : "") + fmt(avg) + "%";
-    avgEl.className = "v " + (avg >= 0 ? "pos" : "neg");
+    avgEl.innerHTML = `<span class="${avg>=0?'pos':'neg'}">${(avg>=0?"+":"")+fmt(avg)}%</span>`
+      + ` <span class="muted" style="font-size:12px;">/</span> `
+      + `<span class="${med>=0?'pos':'neg'}">${(med>=0?"+":"")+fmt(med)}%</span>`;
+    avgEl.className = "v";
 
     const avgAnnEl = document.getElementById("bt-avg-ann");
     if (avgAnn != null) {
@@ -2464,6 +2478,27 @@ async function drawBacktestChart() {
       fill: false,
       order: -1,
     });
+    // B5: QQQ baseline alongside SPY. The backtest store only tracks
+    // spy_return_pct (no qqq column), so — like the SPY avg line above —
+    // draw a long-run constant-rate reference (Nasdaq-100 ~13%/yr) rather
+    // than adding a yfinance call to this hot list endpoint.
+    const qqqAnnPct = 13.0;
+    const qqqData = labels.map(d => {
+      const yrs = d / 365.25;
+      return ((1 + qqqAnnPct/100)**yrs - 1) * 100;
+    });
+    datasets.push({
+      label: `QQQ avg (~${qqqAnnPct}%/yr)`,
+      data: qqqData,
+      kind: "benchmark",
+      borderColor: hasSelection ? "rgba(122,162,247,0.18)" : "rgba(122,162,247,0.6)",
+      borderWidth: 2,
+      borderDash: [2, 3],
+      pointRadius: 0,
+      tension: 0,
+      fill: false,
+      order: -1,
+    });
   }
 
   if (btChart) { btChart.destroy(); btChart = null; }
@@ -2625,6 +2660,11 @@ async function drawAggregateChart() {
   const medSpyAnn = spyAnns.length ? spyAnns[Math.floor(spyAnns.length/2)] : 0.107;
   const spyLine = labels.map(d => ({ x: d, y: (Math.pow(1 + medSpyAnn, d/365.25) - 1) * 100 }));
   const spyPctLabel = (medSpyAnn * 100).toFixed(1);
+  // B5: QQQ baseline. The store tracks no per-run qqq_return_pct, so use a
+  // long-run Nasdaq-100 constant-rate reference (~13%/yr) — consistent with
+  // the SPY-avg reference in the per-run chart.
+  const qqqAnnAgg = 0.13;
+  const qqqLine = labels.map(d => ({ x: d, y: (Math.pow(1 + qqqAnnAgg, d/365.25) - 1) * 100 }));
 
   // Zero line
   const zeroLine = labels.map(d => ({ x: d, y: 0 }));
@@ -2685,6 +2725,8 @@ async function drawAggregateChart() {
           { label: "Median", data: P50, borderColor:"#0acdff", backgroundColor:"transparent", pointRadius:0, showLine:true, fill:false, borderWidth:2.5, tension:0.15 },
           // SPY actual median
           { label: `SPY (${spyPctLabel}%/yr actual median)`, data: spyLine, borderColor:"rgba(200,200,200,0.65)", backgroundColor:"transparent", pointRadius:0, showLine:true, fill:false, borderWidth:1.5, borderDash:[6,3], tension:0 },
+          // QQQ baseline (constant-rate ~13%/yr — store has no qqq per-run)
+          { label: "QQQ (~13%/yr)", data: qqqLine, borderColor:"rgba(122,162,247,0.55)", backgroundColor:"transparent", pointRadius:0, showLine:true, fill:false, borderWidth:1.5, borderDash:[2,3], tension:0 },
           // Zero reference
           { label: "0%", data: zeroLine, borderColor:"rgba(255,255,255,0.08)", backgroundColor:"transparent", pointRadius:0, showLine:true, fill:false, borderWidth:1, borderDash:[2,4], showInTooltip:false },
         ],
@@ -3692,7 +3734,7 @@ async function refreshDrawdown() {
         : `<span class="muted">—</span>`;
       return `<tr>
         <td><strong>${p.ticker}</strong> <span class="muted" style="font-size:10px;">${p.type||""}</span></td>
-        <td class="num">${p.qty}</td>
+        <td class="num">${p.qty != null ? fmt(p.qty, 4) : "—"}</td>
         <td class="num">$${fmt(p.avg_cost,2)}</td>
         <td class="num">$${fmt(p.current_price,2)}</td>
         <td class="num" style="color:${color};font-weight:bold;">${pl>=0?"+":""}$${fmt(pl,2)}</td>
@@ -3792,14 +3834,33 @@ async function refreshDecisionHealth() {
       CRITICAL: ["#b71c1c", "#ffffff"],
       NO_DATA:  ["#1f2126", "#8b929d"],
     };
-    const [bg, fg] = vmap[r.verdict] || vmap.NO_DATA;
+    // B9: dual-window — show 24h AND all-time, and make the headline
+    // verdict the WORSE of the two so a clean recent window can't mask a
+    // chronically broken all-time pipeline (and vice-versa). Verdict from
+    // parse_fail_pct using the same thresholds as the analytics module
+    // (>=50 CRITICAL, >=25 DEGRADED, else HEALTHY; <10 samples → NO_DATA).
+    const w   = (r.windows && r.windows["24h"]) || {};
+    const wAll = (r.windows && r.windows["all"]) || {};
+    const rank = { CRITICAL: 3, DEGRADED: 2, HEALTHY: 1, NO_DATA: 0 };
+    const windowVerdict = (win) => {
+      if (!win || (win.total || 0) < 10) return "NO_DATA";
+      const f = win.parse_fail_pct || 0;
+      return f >= 50 ? "CRITICAL" : f >= 25 ? "DEGRADED" : "HEALTHY";
+    };
+    const v24 = windowVerdict(w), vAll = windowVerdict(wAll);
+    // worst non-NO_DATA wins; if both NO_DATA fall back to server verdict.
+    let worst = (rank[v24] >= rank[vAll]) ? v24 : vAll;
+    if (worst === "NO_DATA" && r.verdict) worst = r.verdict;
+    const [bg, fg] = vmap[worst] || vmap.NO_DATA;
     const vEl = document.getElementById("dh-verdict");
-    vEl.textContent = r.verdict + (r.verdict_window ? ` (${r.verdict_window})` : "");
+    vEl.textContent = `${worst} (24h: ${v24} · all-time: ${vAll})`;
     vEl.style.background = bg;
     vEl.style.color = fg;
-    document.getElementById("dh-reason").textContent = r.verdict_reason || "";
+    document.getElementById("dh-reason").textContent =
+      (worst === v24 || worst === vAll || !r.verdict_reason)
+        ? `worst of 24h (${v24}) and all-time (${vAll}) windows`
+        : (r.verdict_reason || "");
 
-    const w = (r.windows && r.windows["24h"]) || {};
     document.getElementById("dh-total").textContent = w.total != null ? w.total : "—";
     const failEl = document.getElementById("dh-fail");
     failEl.textContent = w.parse_fail_pct != null ? fmt(w.parse_fail_pct, 0) + "%" : "—";
@@ -3807,6 +3868,18 @@ async function refreshDecisionHealth() {
                        : (w.parse_fail_pct || 0) >= 25 ? "#ffa726" : "#4caf50";
     document.getElementById("dh-fills").textContent =
       (w.filled != null ? w.filled : "—") + (w.fill_pct != null ? ` (${fmt(w.fill_pct,1)}%)` : "");
+
+    // all-time window stats (B9)
+    const setAll = (id, t) => { const e = document.getElementById(id); if (e) e.textContent = t; };
+    setAll("dh-total-all", wAll.total != null ? wAll.total : "—");
+    const failAllEl = document.getElementById("dh-fail-all");
+    if (failAllEl) {
+      failAllEl.textContent = wAll.parse_fail_pct != null ? fmt(wAll.parse_fail_pct, 0) + "%" : "—";
+      failAllEl.style.color = (wAll.parse_fail_pct || 0) >= 50 ? "#ff4455"
+                            : (wAll.parse_fail_pct || 0) >= 25 ? "#ffa726" : "#4caf50";
+    }
+    setAll("dh-fills-all",
+      (wAll.filled != null ? wAll.filled : "—") + (wAll.fill_pct != null ? ` (${fmt(wAll.fill_pct,1)}%)` : ""));
     const c = r.confidence || {};
     const trendArrow = {rising:" ↑", falling:" ↓", flat:""}[c.trend] || "";
     document.getElementById("dh-conf").textContent =
@@ -4081,7 +4154,9 @@ async function refreshNewsEdge() {
       r.reference_horizon != null ? r.reference_horizon + "d" : "—";
 
     const cell = (h) => {
-      if (!h || h.mean_abnormal_pct == null) return '<span class="muted">—</span>';
+      // B8: no observations (n=0/missing) → greyed em-dash, never a
+      // misleading 0% / NaN. h carries n alongside mean_abnormal_pct.
+      if (!h || !h.n || h.mean_abnormal_pct == null) return '<span class="muted">—</span>';
       const v = h.mean_abnormal_pct;
       const col = v > 0 ? "#4caf50" : v < 0 ? "#ff4455" : "#8b929d";
       const raw = h.mean_raw_pct != null ? ` <span class="muted">(${fmt(h.mean_raw_pct,1)})</span>` : "";
@@ -4098,20 +4173,23 @@ async function refreshNewsEdge() {
       const hr = h[refH] || {};
       const nRef = hr.n || 0;
       const hit = hr.abnormal_hit_rate;
+      // B8: zero-observation band → greyed em-dash for n and hit-rate
+      // rather than a misleading "0" / "—%".
       return `<tr>
         <td><b>${b.band}</b></td>
-        <td class="num">${nRef}</td>
+        <td class="num">${nRef ? nRef : '<span class="muted">—</span>'}</td>
         <td class="num">${cell(h["1"])}</td>
         <td class="num">${cell(h["3"])}</td>
         <td class="num">${cell(h["5"])}</td>
-        <td class="num">${hit!=null?fmt(hit,0)+'%':'—'}</td>
+        <td class="num">${(nRef && hit!=null) ? fmt(hit,0)+'%' : '<span class="muted">—</span>'}</td>
       </tr>`;
     }).join("") : `<tr><td colspan="6" class="muted">no priced articles in window</td></tr>`;
 
     const u = r.by_urgency || {};
     const ur = (u.urgent||{})["3"] || {}, no = (u.normal||{})["3"] || {};
-    const fmtAbn = (x) => x.mean_abnormal_pct != null
-      ? `${fmt(x.mean_abnormal_pct,2)}% (n=${x.n||0})` : "—";
+    const fmtAbn = (x) => (x && x.n && x.mean_abnormal_pct != null)
+      ? `${fmt(x.mean_abnormal_pct,2)}% (n=${x.n})`
+      : '<span class="muted">—</span>';
     document.getElementById("ne-urg").innerHTML =
       `urgent: <b style="color:#ffd479;">${fmtAbn(ur)}</b> &nbsp;·&nbsp; normal: <b>${fmtAbn(no)}</b>`;
   } catch (e) { console.error("news-edge:", e); }
@@ -4175,14 +4253,30 @@ async function refreshScorerConfidence() {
     if (!buckets.length) {
       cb.innerHTML = `<tr><td colspan="6" class="muted">not enough samples</td></tr>`;
     } else {
-      cb.innerHTML = buckets.map(b => `<tr>
+      cb.innerHTML = buckets.map(b => {
+        // B7: mae/bias are in percentage points (verified in
+        // analytics/scorer_confidence.py — residual = pred-target return %),
+        // NOT 0-1 decimals; task's 0.15/0.1 thresholds were decimal-scale
+        // and rescale to pp as 5 / 3. Red the MAE cell when either the
+        // absolute error (>5pp) or systematic bias (>3pp) shows the bucket
+        // is materially miscalibrated.
+        const miscal = (b.mae != null && b.mae > 5)
+                       || (b.bias != null && Math.abs(b.bias) > 3);
+        const maeStyle = miscal
+          ? 'background:rgba(255,68,85,0.16);color:#ff4455;font-weight:bold;'
+          : '';
+        const maeTitle = miscal
+          ? ` title="miscalibrated — MAE ${fmt(b.mae,1)}pp${b.bias!=null?', bias '+(b.bias>=0?'+':'')+fmt(b.bias,1)+'pp':''}"`
+          : '';
+        return `<tr>
         <td>${(b.pred_lo>=0?"+":"") + fmt(b.pred_lo,1)}% … ${(b.pred_hi>=0?"+":"") + fmt(b.pred_hi,1)}%</td>
         <td class="num">${b.n}</td>
         <td class="num" style="color:${scorerColor(b.mean_actual)};">${(b.mean_actual>=0?"+":"") + fmt(b.mean_actual,2)}%</td>
         <td class="num muted">${fmt(b.resid_p10,1)} / +${fmt(b.resid_p90,1)}</td>
-        <td class="num">±${fmt(b.mae,1)}</td>
+        <td class="num" style="${maeStyle}"${maeTitle}>±${fmt(b.mae,1)}</td>
         <td class="num" style="color:${b.directional_accuracy_pct>=65?"#4caf50":b.directional_accuracy_pct>=55?"#ffa726":"#ff4455"};">${fmt(b.directional_accuracy_pct,0)}%</td>
-      </tr>`).join("");
+      </tr>`;
+      }).join("");
     }
   } catch (e) { console.error("scorer-confidence:", e); }
 }
@@ -4196,15 +4290,22 @@ async function refreshValidation() {
     if (!latest) return;
 
     const pv = latest.permutation_test || {};
+    // verdict may be a compound string like "UNDERPOWERED — too few valid
+    // permutations"; key the color map on the leading token.
+    const rawVerdict = pv.verdict || "—";
+    const verdictKey = String(rawVerdict).split(/[\s—-]/)[0];
     const verdictColor = {
       SIGNIFICANT: "#00c896",
       INCONCLUSIVE: "#fbbf24",
+      UNDERPOWERED: "#fbbf24",
       WORSE_THAN_RANDOM: "#ff4455",
+      NO_EDGE: "#ff4455",
       UNKNOWN: "#8b929d",
-    }[pv.verdict] || "#8b929d";
+    }[verdictKey] || "#8b929d";
     const verdictEl = document.getElementById("val-perm-verdict");
     if (verdictEl) {
-      verdictEl.textContent = pv.verdict || "—";
+      verdictEl.textContent = verdictKey === "UNDERPOWERED"
+        ? "⚠ underpowered" : rawVerdict;
       verdictEl.style.color = verdictColor;
     }
     const setText = (id, t) => { const el = document.getElementById(id); if (el) el.textContent = t; };
@@ -4212,25 +4313,42 @@ async function refreshValidation() {
     setText("val-perm-zscore", pv.z_score != null ? `z=${Number(pv.z_score).toFixed(2)}` : "z=—");
     setText("val-perm-original",
       pv.original_return != null ? `Strategy: ${Number(pv.original_return).toFixed(1)}%` : "");
+    // A3: surface successful vs attempted permutations so a confident pill
+    // off ~5 valid shuffles is visible (n_successful/n_attempted from
+    // validation.run_permutation_test).
+    const nSucc = pv.n_successful != null ? pv.n_successful : (pv.n_permutations || 0);
+    const nAtt = pv.n_attempted != null ? pv.n_attempted : nSucc;
     setText("val-perm-shuffled",
       pv.permuted_mean != null
-        ? `Shuffled mean: ${Number(pv.permuted_mean).toFixed(1)}%  (n=${pv.n_permutations || 0})`
+        ? `Shuffled mean: ${Number(pv.permuted_mean).toFixed(1)}%  (${nSucc}/${nAtt} successful)`
         : "");
 
     const audit = latest.label_audit || {};
     const rate = audit.contamination_rate;
-    const contamColor = rate == null ? "#8b929d"
+    const auditVerdict = audit.verdict || "";
+    // A2: RETROACTIVE_COLLECTION is architectural (historical articles are
+    // all scraped in 2026 → trivially "stale"), NOT a validity threat.
+    // Render it as a neutral grey info badge, not a red contamination
+    // alarm. Only llm-hindsight (HIGH_CONTAMINATION) is genuinely red.
+    const isRetro = auditVerdict === "RETROACTIVE_COLLECTION";
+    const contamColor = isRetro ? "#8b929d"
+      : rate == null ? "#8b929d"
+      : auditVerdict === "HIGH_CONTAMINATION" ? "#ff4455"
       : rate > 0.5 ? "#ff4455"
       : rate > 0.2 ? "#fbbf24"
       : "#00c896";
     const contamEl = document.getElementById("val-contam-rate");
     if (contamEl) {
-      contamEl.textContent = rate == null ? "—" : `${(rate * 100).toFixed(0)}%`;
+      contamEl.textContent = isRetro ? "retroactive"
+        : rate == null ? "—" : `${(rate * 100).toFixed(0)}%`;
       contamEl.style.color = contamColor;
     }
+    const llmN = audit.llm_contaminated_count;
     setText("val-contam-detail",
       audit.total_articles != null
-        ? `${audit.contaminated_count}/${audit.total_articles} articles · verdict: ${audit.verdict || "—"}`
+        ? (isRetro
+            ? `${audit.contaminated_count}/${audit.total_articles} collected late · ${llmN != null ? llmN : 0} Claude-labeled · architectural, not a backtest-validity threat`
+            : `${audit.contaminated_count}/${audit.total_articles} articles · verdict: ${auditVerdict || "—"}`)
         : "");
 
     setText("val-last-cycle", latest.cycle != null ? `cycle ${latest.cycle}` : "—");
@@ -4356,10 +4474,21 @@ async function refreshTradeAsymmetry() {
   exp.style.color = _plColor(r.expectancy_usd);
   document.getElementById("ta-payoff").textContent = r.payoff_ratio != null ? fmt(r.payoff_ratio) : "—";
   const wr = document.getElementById("ta-wr");
-  wr.textContent = r.actual_win_rate_pct != null ? fmt(r.actual_win_rate_pct, 1) + "%" : "—";
-  // Red when the actual win-rate cannot carry the payoff ratio (the trap).
-  wr.style.color = (r.actual_win_rate_pct != null && r.breakeven_win_rate_pct != null
-                    && r.actual_win_rate_pct < r.breakeven_win_rate_pct) ? "#ff4455" : "#dde1e7";
+  const belowBreakeven = (r.actual_win_rate_pct != null && r.breakeven_win_rate_pct != null
+                          && r.actual_win_rate_pct < r.breakeven_win_rate_pct);
+  // B3: show the denominator (n round-trips) next to the win-rate %.
+  // B4: explicit ⚠ below-breakeven badge, not just a red number, when the
+  // actual win-rate cannot carry the payoff ratio (the trap).
+  if (r.actual_win_rate_pct != null) {
+    const nrt = r.n_round_trips != null ? r.n_round_trips : "?";
+    wr.innerHTML = fmt(r.actual_win_rate_pct, 1) + "% <span class=\"muted\" style=\"font-size:11px;\">(n=" + nrt + ")</span>"
+      + (belowBreakeven
+          ? ' <span style="background:#b71c1c;color:#fff;border-radius:3px;padding:1px 5px;font-size:10px;font-weight:bold;">⚠ below breakeven</span>'
+          : "");
+  } else {
+    wr.textContent = "—";
+  }
+  wr.style.color = belowBreakeven ? "#ff4455" : "#dde1e7";
   document.getElementById("ta-be").textContent = r.breakeven_win_rate_pct != null ? fmt(r.breakeven_win_rate_pct, 1) + "%" : "—";
   const real = document.getElementById("ta-real");
   real.textContent = r.realized_pl_usd != null ? _sgn(r.realized_pl_usd) + "$" + fmt(Math.abs(r.realized_pl_usd)) : "—";
@@ -4367,9 +4496,17 @@ async function refreshTradeAsymmetry() {
   document.getElementById("ta-n").textContent =
     r.n_round_trips + " (" + r.n_wins + "W/" + r.n_losses + "L" + (r.n_washes ? "/" + r.n_washes + "≈" : "") + ")";
   const aw = document.getElementById("ta-avgw");
-  aw.textContent = r.avg_winner_usd != null ? "+$" + fmt(r.avg_winner_usd) : "—"; aw.style.color = "#4caf50";
+  // (B3) winner denominator
+  if (r.avg_winner_usd != null) {
+    aw.innerHTML = "+$" + fmt(r.avg_winner_usd) + " <span class=\"muted\" style=\"font-size:11px;\">(n=" + (r.n_wins != null ? r.n_wins : "?") + ")</span>";
+  } else { aw.textContent = "—"; }
+  aw.style.color = "#4caf50";
   const al = document.getElementById("ta-avgl");
-  al.textContent = r.avg_loser_usd != null ? "-$" + fmt(Math.abs(r.avg_loser_usd)) : "—"; al.style.color = "#ff4455";
+  // B3: show the loser denominator next to avg loser.
+  if (r.avg_loser_usd != null) {
+    al.innerHTML = "-$" + fmt(Math.abs(r.avg_loser_usd)) + " <span class=\"muted\" style=\"font-size:11px;\">(n=" + (r.n_losses != null ? r.n_losses : "?") + ")</span>";
+  } else { al.textContent = "—"; }
+  al.style.color = "#ff4455";
   document.getElementById("ta-hold").textContent =
     (r.avg_winner_hold_days != null ? fmt(r.avg_winner_hold_days, 2) + "d" : "—") + " / " +
     (r.avg_loser_hold_days != null ? fmt(r.avg_loser_hold_days, 2) + "d" : "—");
@@ -4755,6 +4892,28 @@ async function refreshCapitalParalysis() {
   const sEl = document.getElementById("cp-state");
   sEl.textContent = r.state || "—"; sEl.style.background = bg; sEl.style.color = fg;
   document.getElementById("cp-headline").textContent = r.headline || "";
+  // B1: prominent banner at the cash extremes — over-invested (<5% cash,
+  // can't act on any new signal) or under-deployed (>80% idle cash,
+  // dragging vs the benchmark).
+  const cpBanner = document.getElementById("cp-banner");
+  if (cpBanner) {
+    const cpct = r.cash_pct;
+    if (cpct != null && cpct < 5) {
+      cpBanner.style.display = "";
+      cpBanner.style.background = "rgba(255,68,85,0.14)";
+      cpBanner.style.color = "#ff4455";
+      cpBanner.style.borderColor = "rgba(255,68,85,0.4)";
+      cpBanner.textContent = `⚠ OVER-INVESTED: only ${fmt(cpct, 1)}% cash remaining — cannot act on a new signal without selling first`;
+    } else if (cpct != null && cpct > 80) {
+      cpBanner.style.display = "";
+      cpBanner.style.background = "rgba(255,145,0,0.14)";
+      cpBanner.style.color = "#ff9100";
+      cpBanner.style.borderColor = "rgba(255,145,0,0.4)";
+      cpBanner.textContent = `⚠ UNDER-DEPLOYED: ${fmt(cpct, 1)}% idle cash — capital sitting out of the market`;
+    } else {
+      cpBanner.style.display = "none";
+    }
+  }
   document.getElementById("cp-cash").textContent =
     r.cash != null ? "$" + fmt(r.cash) + " (" + fmt(r.cash_pct, 1) + "%)" : "—";
   document.getElementById("cp-dep").textContent = r.deployed_pct != null ? fmt(r.deployed_pct, 1) + "%" : "—";
