@@ -160,6 +160,7 @@ import os as _os
 import threading as _threading
 import time as _time
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FuturesTimeout
 from functools import wraps as _wraps
 
 _SWR_LOCK = _threading.Lock()
@@ -167,6 +168,51 @@ _SWR_STATE: dict = {}
 _SWR_EXEC = _ThreadPoolExecutor(max_workers=6, thread_name_prefix="dash-swr")
 _SWR_COLD_BUDGET_S = 6.0
 _SWR_TEST_FORCE = False  # dedicated SWR tests flip this; never set in prod
+
+# ──────────────────────────────────────────────────────────────────────────
+# Bounded network I/O — the second half of AGENTS.md invariant #7's
+# "remaining genuine concern". SWR (above) addressed the *cache* half: a
+# slow endpoint serves its last good payload instantly. But the SWR
+# background rebuild still calls yfinance, and yfinance/`requests` has **no
+# total timeout** — a stalled HTTPS socket blocks for minutes (or until the
+# OS TCP timeout). That hung call sits inside an `_SWR_EXEC` worker (only 6
+# of them); a handful of simultaneous hangs exhausts the pool and *every*
+# SWR panel goes permanently dark on `{"warming": true}` — the future never
+# completes, so the single-flight guard never kicks a fresh rebuild either.
+#
+# `_bounded_call` submits the blocking network fn to a *separate* pool and
+# `.result(timeout=…)`s it. On timeout the caller (and its SWR worker) is
+# freed with a safe default after `timeout_s`; the hung yfinance thread
+# leaks in the *net* pool only — never the SWR pool — so panels keep
+# serving stale/`warming` and self-heal once the network recovers, instead
+# of the whole dashboard dying. Python threads can't be force-killed, so a
+# leaked worker is unavoidable; isolating the leak to a dedicated, larger
+# pool is the robust mitigation (mirrors the SWR cold-path `fut.result`
+# timeout idiom already in this module).
+# ──────────────────────────────────────────────────────────────────────────
+_NET_EXEC = _ThreadPoolExecutor(max_workers=8, thread_name_prefix="dash-net")
+_NET_TIMEOUT_S = 8.0
+
+
+def _bounded_call(fn, *, timeout_s: float = _NET_TIMEOUT_S, default=None,
+                  label: str = ""):
+    """Run a blocking network `fn` under a hard wall-clock bound.
+
+    Returns ``fn()``'s value, or ``default`` if it raises or does not
+    finish within ``timeout_s``. Never raises. See the block comment above
+    for why the work runs in a dedicated pool, not inline."""
+    try:
+        fut = _NET_EXEC.submit(fn)
+    except Exception:
+        return default
+    try:
+        return fut.result(timeout=timeout_s)
+    except _FuturesTimeout:
+        print(f"[dashboard] bounded net call timed out after "
+              f"{timeout_s:g}s ({label or fn})")
+        return default
+    except Exception:
+        return default
 
 
 def _swr_active() -> bool:
@@ -7406,13 +7452,23 @@ def _daily_history_cached(ticker: str, period: str = "3mo") -> list[tuple[str, f
     hit = _NEWS_EDGE_PX_CACHE.get(ticker)
     if hit and _t.time() - hit[1] < _NEWS_EDGE_PX_TTL:
         return hit[0]
-    try:
+
+    def _fetch() -> list[tuple[str, float]]:
         import yfinance as yf
         h = yf.Ticker(ticker).history(period=period, auto_adjust=False)
-        bars = [(idx.strftime("%Y-%m-%d"), float(c))
+        return [(idx.strftime("%Y-%m-%d"), float(c))
                 for idx, c in zip(h.index, h["Close"]) if c == c]
-    except Exception:
-        bars = []
+
+    # Hard wall-clock bound on the yfinance call. Without it a stalled
+    # HTTPS socket pins an _SWR_EXEC worker indefinitely (correlation /
+    # news-edge / source-edge / signal-followthrough all route here), and a
+    # few simultaneous hangs dark every SWR panel forever. `default=[]`
+    # keeps the pre-existing failure semantics identical to the old bare
+    # `except Exception: bars = []` path (a transient failure is cached
+    # empty for the TTL exactly as before — the *only* behavioural change
+    # is that a hang now degrades in _NET_TIMEOUT_S instead of never).
+    bars = _bounded_call(_fetch, timeout_s=_NET_TIMEOUT_S, default=[],
+                          label=f"daily-history {ticker}")
     _NEWS_EDGE_PX_CACHE[ticker] = (bars, _t.time())
     return bars
 
