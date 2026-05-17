@@ -7733,6 +7733,52 @@ def scorecard_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/desk-pulse")
+def desk_pulse_api():
+    """The single pure-DB "is the desk OK right now?" digest — money +
+    loop-liveness + code-staleness + the one behavioural flag to look at
+    first, in one fast dependency-free call.
+
+    /api/scorecard is behavioural-only (no money KPIs); /api/state is the
+    heavy everything-dump and the slowest endpoint here; :8888's
+    /api/command-center gets its trader half by cross-fetching :8090 so it
+    blanks exactly when :8090 is slow/wedged (observed live 2026-05-17).
+    This composes only the network-free single-source-of-truth builders
+    (build_round_trips — the same strict >0 win split as /api/analytics;
+    build_runner_heartbeat; trader_scorecard.focus) plus the build-info
+    SHA — no yfinance, no articles.db, no scorer — so it answers in
+    milliseconds even when every yfinance-backed panel is timing out, and
+    `python -m paper_trader.analytics.desk_pulse` prints the same digest
+    from a terminal when the process itself is wedged. Router, not a
+    grader: mints no opinion, NOT injected into the live prompt — advisory
+    only, never gates Opus, adds no caps (AGENTS.md #2/#12/#10)."""
+    try:
+        from .analytics.desk_pulse import build_desk_pulse
+        from . import market as _mkt
+        store = get_store()
+        head, behind = _head_sha_and_behind()
+        build_info = {
+            "boot_sha": _BOOT_SHA,
+            "head_sha": head,
+            "behind": behind,
+            "stale": bool(_BOOT_SHA and head and head != _BOOT_SHA),
+        }
+        now_utc = datetime.now(timezone.utc)
+        return jsonify(build_desk_pulse(
+            store.get_portfolio(),
+            store.open_positions(),
+            store.recent_trades(2000),
+            store.recent_decisions(limit=3000),
+            store.equity_curve(limit=5000),
+            build_info=build_info,
+            market_open=_mkt.is_market_open(now_utc),
+            initial_cash=INITIAL_CASH,
+            now=now_utc,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # Daily-bar history cache for the news-edge endpoint. Keyed by ticker; daily
 # bars don't change intraday in a way that matters for forward-return analysis
 # of *past* articles, so a generous TTL keeps the endpoint snappy after the
