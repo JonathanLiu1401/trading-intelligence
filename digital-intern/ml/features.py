@@ -119,23 +119,21 @@ _DOMAIN_CRED: dict[str, float] = {
 # wires syndicated through GKG). Corroboration is still the escape valve: the
 # same story carried by ≥2 sources (dup_count>1) fires regardless, and any
 # unlisted host stays at DEFAULT (never auto-gated).
+# Every host below was directly observed in the 24h live top-40 (counts are
+# from that one snapshot). The list is deliberately tight and evidence-only —
+# the *mechanism* is the value; same-class siblings are added when actually
+# observed, never speculatively.
 _LOW_AUTHORITY_DOMAINS: dict[str, float] = {
-    # Algorithmic 13F / short-interest / "shares bought by" stock-mention
-    # press mills — pure SEO filler that saturates finance keywords.
-    "wkrb13.com": 0.25,
-    "dailypolitical.com": 0.25,
-    "themarketsdaily.com": 0.25,
-    "tickerreport.com": 0.25,
-    "transcriptdaily.com": 0.25,
-    "modernreaders.com": 0.25,
-    "thelincolnianonline.com": 0.25,
-    "dakotafinancialnews.com": 0.25,
+    # Algorithmic 13F / "shares bought by" stock-mention press mills — pure
+    # SEO filler that saturates finance keywords.
+    "wkrb13.com": 0.25,          # 3.6k/24h
+    "dailypolitical.com": 0.25,  # 4.6k/24h
     # Non-news / non-financial high-volume hosts (radio, registrars).
-    "iheart.com": 0.30,         # iHeartRadio — entertainment, 63k/24h
-    "joker.com": 0.30,          # domain registrar, 13k/24h
+    "iheart.com": 0.30,          # iHeartRadio — entertainment, 63k/24h
+    "joker.com": 0.30,           # domain registrar, 13k/24h
     # Hyperlocal community networks — real journalism, not market signal.
-    "wickedlocal.com": 0.40,
-    "gwdtoday.com": 0.40,
+    "wickedlocal.com": 0.40,     # Gannett hyperlocal, 6.1k/24h
+    "gwdtoday.com": 0.40,        # 3.4k/24h
 }
 
 
