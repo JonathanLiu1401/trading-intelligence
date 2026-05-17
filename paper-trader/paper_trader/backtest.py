@@ -586,7 +586,29 @@ class PriceCache:
                 if (meta.get("start") == self.start.isoformat()
                         and meta.get("end") == self.end.isoformat()
                         and set(meta.get("tickers", [])) >= set(self.tickers)):
-                    self.prices = {k: v for k, v in cached.items() if k != "_meta"}
+                    candidate = {k: v for k, v in cached.items() if k != "_meta"}
+                    # Benchmark-integrity guard. yfinance intermittently fails
+                    # to return SPY at cache-build time; the old code persisted
+                    # (and then re-accepted) a payload with an EMPTY SPY series
+                    # because SPY was still listed in _meta.tickers. Verified
+                    # live: 34/177 per-window caches are poisoned this way.
+                    # Accepting one makes _build_trading_days silently fall back
+                    # to another ticker's calendar and returns_pct("SPY",…)
+                    # return 0.0 → vs_spy_pct is fabricated (== total_return),
+                    # which then poisons the live trader's _ml_is_qualified
+                    # median-alpha gate (CLAUDE.md §15) every cycle this window
+                    # is redrawn. SPY has data back to its 1993 inception
+                    # (== EARLIEST_WINDOW_START), so an empty SPY series is
+                    # ALWAYS a transient fetch failure, never a real
+                    # data-availability gap. Reject the poisoned cache and fall
+                    # through to a fresh download (which self-heals the file on
+                    # success; see the write-side guard below).
+                    if "SPY" in self.tickers and not candidate.get("SPY"):
+                        print(f"[price_cache] {cache_path.name} has an empty "
+                              f"SPY series — rejecting poisoned cache, "
+                              f"re-downloading")
+                        continue
+                    self.prices = candidate
                     self._build_trading_days()
                     print(f"[price_cache] loaded {len(self.prices)} tickers from "
                           f"{cache_path.name} ({len(self.trading_days)} trading days)")
@@ -619,6 +641,22 @@ class PriceCache:
                 print(f"[price_cache]   {t} failed: {e}")
                 self.prices[t] = {}
 
+        self._build_trading_days()
+        # Write-side benchmark-integrity guard (paired with the cache-read
+        # guard above). If SPY was requested but the download yielded an
+        # empty series, this run hit the same transient yfinance failure.
+        # Persisting it would re-poison the per-window cache permanently —
+        # every future redraw of this window would fabricate vs_spy_pct.
+        # Skip the write so the next draw retries the download fresh. The
+        # run still completes off the fallback-ticker calendar built above;
+        # run_one then writes the honest `benchmark_unavailable` note
+        # (locked by test_integration_backtest.py::TestBenchmarkUnavailableNote).
+        if "SPY" in self.tickers and not self.prices.get("SPY"):
+            print(f"[price_cache] SPY series empty after download for "
+                  f"{self.start} → {self.end} — NOT caching (transient "
+                  f"yfinance failure; retry on next draw rather than "
+                  f"poisoning the cache)")
+            return
         payload = {"_meta": {
             "start": self.start.isoformat(),
             "end": self.end.isoformat(),
@@ -628,7 +666,6 @@ class PriceCache:
         payload.update(self.prices)
         out_path = self.cache_path
         out_path.write_text(json.dumps(payload))
-        self._build_trading_days()
         print(f"[price_cache] saved → {out_path} "
               f"({len(self.trading_days)} trading days)")
 
