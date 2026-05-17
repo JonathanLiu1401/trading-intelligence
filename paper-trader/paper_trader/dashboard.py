@@ -1980,7 +1980,29 @@ function drawEquityChart(eq, trades) {
 }
 
 async function refresh() {
-  const r = await fetch(API_PREFIX + "/api/state").then(r => r.json());
+  // /api/state is the main page's lifeline. It has 500'd transiently in
+  // prod (the get_portfolio() shared-connection note in store.py) and, once
+  // SWR-cached, its cold path returns a valid-shaped {"warming":true}
+  // placeholder. The old code did `r.portfolio.total_value` with no guard,
+  // so any of those bodies threw an unhandled TypeError mid-tick and the
+  // whole page froze with no visible reason until the next poll. Every
+  // *other* refresh* fn already guards (`if(!r.ok)return` / `if(!a||a.error)
+  // return`); this — the most important fetch — was the lone outlier. Match
+  // the established pattern: on a bad/warming/error body, show "updating…"
+  // and bail; the 15s setInterval self-heals on the next tick.
+  let r;
+  try {
+    r = await fetch(API_PREFIX + "/api/state").then(x => x.json());
+  } catch (e) {
+    const _hb = document.getElementById("hb");
+    if (_hb) _hb.textContent = "updating…";
+    return;
+  }
+  if (!r || !r.portfolio || r.warming || r.error) {
+    const _hb = document.getElementById("hb");
+    if (_hb) _hb.textContent = "updating…";
+    return;
+  }
   document.getElementById("hb").textContent = "updated " + (r.now || "");
   document.getElementById("tv").textContent = dollar(r.portfolio.total_value);
   document.getElementById("cash").textContent = dollar(r.portfolio.cash);
@@ -5262,7 +5284,23 @@ def backtests_page():
 
 
 @app.route("/api/state")
+@swr_cached("state", 15.0)
 def state():
+    """Main trader-page payload (portfolio + positions + trades + 5000-point
+    equity curve + decisions). This is the page's lifeline, polled every 15s
+    by `refresh()` AND cross-fetched, and it is the heaviest pure-DB read:
+    six lock-held `Store` reads and a ~145KB body (eq 5000 + 500 trades).
+    Live-user testing on 2026-05-17 measured it at 8.7s under concurrent
+    load — it head-of-line-blocked the whole page because it was the only
+    high-traffic core endpoint NOT behind `swr_cached` (every slow network
+    endpoint already is). The portfolio only changes on a decision cycle
+    (`runner.OPEN_INTERVAL_S` ≥ 1800s), so a 15s stale-while-revalidate
+    window is invisible to a trader while it serves instantly from the last
+    good payload and single-flight-refreshes in the background — and the
+    runner already pushes every fill to Discord immediately regardless. The
+    injected `cached`/`cache_age_s` keys make staleness explicit (the
+    command-center honesty contract); `refresh()` tolerates the SWR cold
+    `{"warming":true}` placeholder (it skips the tick and self-heals)."""
     store = get_store()
     pf = store.get_portfolio()
     positions = store.open_positions()
