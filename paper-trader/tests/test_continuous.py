@@ -623,3 +623,11 @@ class TestCycleWiringRegression:
         import inspect
         src = inspect.getsource(rcb.main)
         assert "_trim_winner_jsonl(" in src
+
+    def test_main_reaps_orphans_per_cycle_not_only_at_startup(self):
+        # Live finding: 15 rows stuck 'running' for 35h because the reaper
+        # was startup-only. main() must now call _reap_orphaned_runs() both
+        # before the loop AND inside each cycle (≥2 call sites).
+        import inspect
+        src = inspect.getsource(rcb.main)
+        assert src.count("_reap_orphaned_runs()") >= 2
