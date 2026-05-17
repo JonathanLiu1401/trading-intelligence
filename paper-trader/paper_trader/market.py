@@ -28,6 +28,30 @@ NYSE_HOLIDAYS_2026 = {
 _PRICE_CACHE: dict[str, tuple[float, float]] = {}  # ticker -> (price, ts)
 _PRICE_TTL = 30.0  # seconds
 
+# Negative cache: symbols that returned no data recently (delisted/invalid like
+# METAU/GOOGU, or futures closed on weekends like ES=F). Without this, every
+# decision cycle re-requests these from yfinance, failing every time and
+# spamming the log. TTL is short (5 min) so legitimately-transient outages
+# (e.g. futures over a weekend) recover quickly once data returns.
+_DEAD_CACHE: dict[str, float] = {}  # ticker -> ts when marked dead
+_DEAD_TTL = 300.0  # seconds
+
+
+def _is_dead(ticker: str) -> bool:
+    ts = _DEAD_CACHE.get(ticker)
+    return ts is not None and time.time() - ts < _DEAD_TTL
+
+
+def _mark_dead(ticker: str):
+    # Only log the first time a symbol goes dead within a TTL window, not every cycle.
+    if not _is_dead(ticker):
+        print(f"[market] no data for {ticker}; suppressing re-fetch for {int(_DEAD_TTL)}s")
+    _DEAD_CACHE[ticker] = time.time()
+
+
+def _clear_dead(ticker: str):
+    _DEAD_CACHE.pop(ticker, None)
+
 
 def is_market_open(now: datetime | None = None) -> bool:
     now = (now or datetime.now(UTC)).astimezone(NY)
@@ -55,6 +79,8 @@ def get_price(ticker: str) -> float | None:
     cached = _cached_price(ticker)
     if cached is not None:
         return cached
+    if _is_dead(ticker):
+        return None
     try:
         t = yf.Ticker(ticker)
         fast = t.fast_info
@@ -65,9 +91,11 @@ def get_price(ticker: str) -> float | None:
                 price = float(hist["Close"].iloc[-1])
         if price and price > 0:
             _store_price(ticker, float(price))
+            _clear_dead(ticker)
             return float(price)
     except Exception as e:
         print(f"[market] price fetch failed {ticker}: {e}")
+    _mark_dead(ticker)
     return None
 
 
@@ -81,6 +109,8 @@ def get_prices(tickers: list[str]) -> dict[str, float | None]:
         c = _cached_price(t)
         if c is not None:
             out[t] = c
+        elif _is_dead(t):
+            out[t] = None  # known-dead: skip the yfinance round-trip this cycle
         else:
             missing.append(t)
     if missing:
@@ -99,9 +129,10 @@ def get_prices(tickers: list[str]) -> dict[str, float | None]:
                 except Exception:
                     price = None
                 if price is None:
-                    price = get_price(t)
+                    price = get_price(t)  # also handles dead-marking
                 if price is not None:
                     _store_price(t, price)
+                    _clear_dead(t)
                 out[t] = price
         except Exception:
             for t in missing:
