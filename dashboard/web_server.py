@@ -1313,6 +1313,29 @@ function fmt(n) {
 
 function plClass(v) { if (v === null || v === undefined) return ""; return v >= 0 ? "pl-pos" : "pl-neg"; }
 
+function parseDate(ts) {
+    if (!ts && ts !== 0) return null;
+    // Unix epoch as string or number (10+ digit seconds, optional fractional)
+    if (/^\\d{10,}(\\.\\d+)?$/.test(String(ts).trim())) return new Date(parseFloat(ts) * 1000);
+    // Try direct parse (handles ISO8601 and RFC822)
+    const d = new Date(ts);
+    return isNaN(d.getTime()) ? null : d;
+}
+function relativeTime(ts) {
+    const d = parseDate(ts);
+    if (!d) return '';
+    const diffMs = Date.now() - d.getTime();
+    if (diffMs < 0) return 'just now';
+    const diffM = Math.floor(diffMs / 60000);
+    if (diffM < 1) return 'just now';
+    if (diffM < 60) return diffM + 'm ago';
+    const diffH = Math.floor(diffM / 60);
+    if (diffH < 24) return diffH + 'h ago';
+    const diffD = Math.floor(diffH / 24);
+    if (diffD < 7) return diffD + 'd ago';
+    return d.toLocaleDateString();
+}
+
 async function refresh() {
   const [pnl, articles, briefings, stats] = await Promise.all([
     getJSON("/api/portfolio"),
@@ -1356,7 +1379,7 @@ async function refresh() {
       li.className = "mb-1";
       li.innerHTML = `<span class="badge ${urgent?'badge-urgent':'badge-score'} me-1">${urgent?'URG':fmt(a.score)}</span>` +
         `<a href="${a.url}" target="_blank" rel="noopener">${a.title}</a>` +
-        `<div class="small-muted">${a.source || ''} · ${a.published || ''}</div>`;
+        `<div class="small-muted">${a.source || ''} · ${relativeTime(a.published)}</div>`;
       sigs.appendChild(li);
     }
   } else {
@@ -1371,7 +1394,7 @@ async function refresh() {
       li.className = "mb-2";
       li.innerHTML = `<div><span class="badge badge-score me-1">${fmt(a.score)}</span>` +
         `<a href="${a.url}" target="_blank" rel="noopener">${a.title}</a></div>` +
-        `<div class="small-muted">${a.source || ''} · ${a.published || ''}</div>`;
+        `<div class="small-muted">${a.source || ''} · ${relativeTime(a.published)}</div>`;
       arts.appendChild(li);
     }
   }
