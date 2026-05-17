@@ -740,3 +740,120 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   *Pre-existing, not this work:* the `logs/.supervisor_state.*.tmp`
   deletions and `paper-trader/*` working-tree changes predate the session
   and were deliberately left unstaged.
+
+- **2026-05-17 (Agent 3, hybrid debug+feature+live-validation, v2)** —
+  Inspection of the nine task-critical files + `ml/inference.py` /
+  `alert_dedup.py` again surfaced **no new bug in the heavily-reviewed
+  core** (the four load-bearing invariants re-traced and hold). Per the
+  established pattern, **live validation was the discovery engine** and
+  produced both Phase 1 fixes:
+
+  **Phase 1 — two real bugs, both invisible to inspection-only review:**
+  1. `db9635e` **`core/logger.py` daemon.log timestamps were local time
+     mislabeled `Z` (UTC).** The plain `daemon.log` `RotatingFileHandler`
+     used `logging.Formatter(datefmt="%Y-%m-%dT%H:%M:%SZ")` but left
+     `Formatter.converter` at the Python default `time.localtime`; the
+     literal `Z` *asserted* UTC while `%(asctime)s` rendered local — a
+     host-TZ-dependent constant skew (reproduced: **-7h** on this PDT host;
+     a briefing logged `06:26:38Z` whose `briefings.ts` row said
+     `13:26:38`). `healthcheck.sh` greps this file and operators/prior
+     agents correlate it against the UTC-correct `structured.jsonl` /
+     `briefings` table / Discord alerts, so every cross-sink time
+     correlation was silently wrong while each line looked plausible. The
+     console (`_ColourFormatter`) and `structured.jsonl` (`_JSONLHandler`)
+     sinks already used `datetime.now(timezone.utc)` and were unaffected —
+     this is why prior reviews (which read the UTC-correct sinks and never
+     hit `core/logger.py`, not in the 9-file list, bug only manifests when
+     host TZ ≠ UTC) missed it. Fix: extracted `_plain_file_formatter()`
+     with `converter=time.gmtime`. Pinned by
+     `tests/test_logger_utc_timestamp.py` (fixed-epoch + converter-identity,
+     host-clock-independent).
+  2. `b4be1ca` **`dashboard/web_server.py::_articles_from_db` raced the
+     shared writer connection.** `run_server` runs `app.run(threaded=True)`
+     but the endpoint queried `store.conn` — the *single*
+     `sqlite3.Connection` the daemon's ~30 writer threads share
+     (`check_same_thread=False`). sqlite3 connections are not safe for
+     concurrent use: a dashboard read racing a writer's implicit
+     `conn.execute("SELECT changes()")` inside `insert_batch` returned a
+     wrong-shaped 1-tuple where the 9-column row was expected, so
+     `ai = float(r[6] or 0)` raised `IndexError`. `IndexError` is not a
+     `sqlite3.Error`, so the endpoint's `except sqlite3.Error: return []`
+     did not absorb it and `/api/articles` 500'd — **observed 10× in
+     `logs/daemon.log`** (the threaded Flask server, `d5b8eac`, made it
+     manifest). Fix: read via a dedicated short-lived `mode=ro` connection
+     (`_ro_query`) — lock-free WAL reads fully isolated from the writer
+     connection's cursor state, one connection per call (inherently
+     thread-safe, sub-ms to open), never competes for the daemon write
+     lock. Backtest isolation + effective-score derivation preserved.
+     Pinned by `tests/test_dashboard_articles_conn_isolation.py` (poisons
+     `store.conn` with the exact interleave shape; reproduces the prod
+     traceback line-for-line on the unfixed code). NOTE for the next
+     reviewer: the *same* shared-connection race exists on every other
+     `store.conn.execute()` read in `dashboard/web_server.py` (`api_stats`
+     → `store.stats()`; the two `PRAGMA database_list` reads — the latter
+     two are `except Exception`-guarded so they degrade silently, not
+     crash). Only `_articles_from_db` was *observed* crashing (raises
+     `IndexError`, uncaught); the architectural fix for the rest is the
+     same `_ro_query` pattern but was left out of this surgical commit.
+
+  **Phase 2 — adaptive briefing lookback + coverage-gap banner
+  (`79a4553`).** Directly motivated by the Phase 3 finding below
+  (briefing starvation). Three pure helpers (`_briefing_gap_hours`,
+  `_briefing_lookback_hours`, `_coverage_gap_banner`) +
+  `heartbeat_worker` wiring: a restart-starved briefing now widens its
+  article lookback from a stale 5h to span the real gap (hard-capped at
+  24h == the ceiling `get_top_for_briefing` already enforces via the
+  published-staleness filter, so no new stale-news risk) and prepends a
+  one-line "⚠ COVERAGE GAP: first briefing in Nh …" warning so the analyst
+  knows the digest covers a backlog, not the usual 5h window. **Healthy
+  cadence is byte-identical to before** (gap ≤ 5h or unknown → 5h window,
+  empty banner). Banner is Discord-only — never folded into the saved
+  briefing text, so it can't reach the trainer's title-prefix label scan
+  (same discipline as the source-health line). All four invariants
+  untouched (this path writes no articles / ai_score / ml_score /
+  score_source; reads only the `briefings` table). Pinned by
+  `tests/test_briefing_coverage_gap.py` (7 cases, live constants).
+
+  **Phase 3 — live findings (read-only DB probes + log forensics):**
+  1. **Briefing starvation persists.** `briefings` table: id20→21 = 41.2h,
+     id21→22 = 31.9h gaps vs the 5h target; latest pair id22→id23 ≈ 6.3h
+     (partially recovered post-`ef839a8`). The heartbeat *code* fix is
+     correct; the residual cause is OOM-restart churn (24 `DAEMON —
+     STARTING` in one log window) + the USB-DB I/O saturation below —
+     operational, out of surgical scope. Phase 2 mitigates the *consumer
+     impact* (honest + full-backlog coverage), not the churn root cause.
+  2. **USB `articles.db` I/O saturation is severe and active.** The DB is
+     1.40 GB with a ~1.44M-row `gdelt_gkg/*` bulk-backfill spike (organic
+     live rate is healthy ~235/h, diverse sources). Read-only probes —
+     even *indexed* `COUNT(urgency=?)` — block in `D` state and time out
+     >90s. **57 of 71 `daemon.log` ERRORs are `lock retry exhausted`**
+     (`insert_batch` 46, `update_ml_scores_batch` 6,
+     `update_time_sensitivity_batch` 2, `update_ai_scores_batch` 2,
+     `purge_old` 1) → whole collected batches silently dropped during
+     contention. Same documented operational issue; still unresolved.
+  3. **6 collectors disabled:** `sec_edgar`, `sec_edgar_ft`, `polygon`,
+     `newsapi`, `massive`, `nitter` (`source_health`, `stale`=∅).
+     `sec_edgar`/`sec_edgar_ft` are high-signal (8-K material-event
+     filings) — correctly surfaced in the 5h briefing via the prior
+     agent's source-health line (feature working as intended). Upstream /
+     rate-limit driven; operational.
+  4. **Duplicate `daemon.py` processes** (pid 1161902 active; pid 1163179
+     ppid=1 blocked on the singleton `flock`). This is the *designed*
+     duplicate-handling (blocking flock), not a bug, but the duplicate-
+     launch condition recurs (documented dual-systemd-unit / restart-churn
+     interaction).
+  5. **Positive validation.** Latest briefing (id=23) read end-to-end is a
+     genuinely accurate, dense, actionable Bloomberg-style digest (sharp
+     LEAD, real MACRO/PORTFOLIO/SEMIS numbers, specific DESK NOTE levels);
+     the 4 urgent classifications + 6 BN alerts in the 24h window are all
+     legitimate and portfolio-relevant (HBM4/Samsung 50k-worker strike,
+     NVDA 8-K, MU premarket) with **no Wikipedia/Reddit low-authority
+     noise** (the prior agent's open concern did not reproduce this
+     window); backtest isolation holding on every live surface checked.
+
+  Suite: **343 passed** (333 prior + 2 logger + 1 dashboard + 7
+  coverage-gap; clean run), imports OK. *Pre-existing, not this work:* the
+  `logs/.supervisor_state.*.tmp` deletions and `paper-trader/*` working-tree
+  changes (incl. concurrently-staged paper-trader commits from a sibling
+  agent) predate / are outside this session and were never staged by it —
+  every commit here was pathspec-scoped to exactly its 2 intended files.
