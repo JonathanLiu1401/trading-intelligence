@@ -325,15 +325,21 @@ def _realized_pl_today(trades_newest_first: list[dict], today: str
 def _portfolio_lines(positions: list[dict]) -> list[str]:
     lines = []
     for p in positions:
+        # Additive: only positions carrying an explicit ``stale_mark`` True
+        # (the enriched snapshot shape) get the flag. ``open_positions()``
+        # table rows have no such key, so output is byte-identical to before
+        # for the existing Discord path — a genuinely flat $0.00 P/L is not
+        # falsely flagged; only a *missing-price* mark is.
+        stale = "  ⚠ STALE (price unavailable; marked at cost)" if p.get("stale_mark") else ""
         if p["type"] in ("call", "put"):
             lines.append(
                 f"  {p['ticker']} {p['type'].upper()}{p['strike']} {p['expiry']}  "
-                f"qty {p['qty']}  P/L ${(p.get('unrealized_pl') or 0):+.2f}"
+                f"qty {p['qty']}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{stale}"
             )
         else:
             lines.append(
                 f"  {p['ticker']:<6} qty {p['qty']:<8} avg ${p['avg_cost']:.2f} "
-                f"now ${(p.get('current_price') or 0):.2f}  P/L ${(p.get('unrealized_pl') or 0):+.2f}"
+                f"now ${(p.get('current_price') or 0):.2f}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{stale}"
             )
     return lines
 

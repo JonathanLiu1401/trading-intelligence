@@ -460,6 +460,14 @@ def _portfolio_snapshot(store: Store) -> dict:
     enriched = []
     open_value = 0.0
     for p in positions:
+        # `stale_mark` is True when the *live* price lookup returned nothing
+        # and we fell back to avg_cost: current_price == avg_cost and
+        # unrealized_pl == 0.0 then look exactly like a genuinely *flat*
+        # position, so a trader (and Opus) silently treats an UNKNOWN mark as
+        # FLAT. This was seen live (MU: avg_cost == current_price == 724.12,
+        # P/L $0.00). An expired-option intrinsic settlement is a *deliberate*
+        # real mark, not a missing price, so it is never flagged stale.
+        stale = False
         if p["type"] in ("call", "put"):
             multiplier = 100
             # An expired contract has no live chain — yfinance returns nothing,
@@ -469,8 +477,10 @@ def _portfolio_snapshot(store: Store) -> dict:
                 cur = _expired_intrinsic(p["ticker"], p["type"], p["strike"])
             else:
                 cur = market.get_option_price(p["ticker"], p["expiry"], p["strike"], p["type"])
+                stale = cur is None
         else:
             cur = prices.get(p["ticker"])
+            stale = cur is None
             multiplier = 1
         # `is not None`, not `or`: a legitimate 0.0 (expired worthless option)
         # must survive — `cur or avg_cost` would clobber it back to premium.
@@ -479,7 +489,8 @@ def _portfolio_snapshot(store: Store) -> dict:
         pl_pct = ((cur - p["avg_cost"]) / p["avg_cost"]) * 100 if p["avg_cost"] else 0.0
         marks[p["id"]] = (cur, pl)
         enriched.append({**p, "current_price": cur, "unrealized_pl": pl, "pl_pct": pl_pct,
-                         "market_value": cur * p["qty"] * multiplier})
+                         "market_value": cur * p["qty"] * multiplier,
+                         "stale_mark": stale})
         open_value += cur * p["qty"] * multiplier
 
     if marks:
@@ -527,16 +538,24 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     now = datetime.now(timezone.utc).isoformat()
     pos_lines = []
     for p in snapshot["positions"]:
+        # When the live price was unavailable the position is marked at cost,
+        # so mark==avg and P/L reads $0.00 — indistinguishable from a genuinely
+        # flat position. Tell Opus explicitly so it does not size a trade
+        # against a phantom-flat mark (advisory text only; invariants #2/#12).
+        stale_suffix = (
+            "  [STALE MARK: live price unavailable — shown at cost, P/L unreliable]"
+            if p.get("stale_mark") else ""
+        )
         if p["type"] in ("call", "put"):
             pos_lines.append(
                 f"  {p['ticker']} {p['type'].upper()} {p['strike']} {p['expiry']}: "
                 f"qty={p['qty']} avg={p['avg_cost']:.2f} mark={p['current_price']:.2f} "
-                f"P/L=${p['unrealized_pl']:.2f} ({p['pl_pct']:.1f}%)"
+                f"P/L=${p['unrealized_pl']:.2f} ({p['pl_pct']:.1f}%){stale_suffix}"
             )
         else:
             pos_lines.append(
                 f"  {p['ticker']} {p['type']}: qty={p['qty']} avg={p['avg_cost']:.2f} "
-                f"mark={p['current_price']:.2f} P/L=${p['unrealized_pl']:.2f} ({p['pl_pct']:.1f}%)"
+                f"mark={p['current_price']:.2f} P/L=${p['unrealized_pl']:.2f} ({p['pl_pct']:.1f}%){stale_suffix}"
             )
 
     sig_lines = []
