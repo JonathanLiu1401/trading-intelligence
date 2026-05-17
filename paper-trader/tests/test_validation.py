@@ -220,7 +220,15 @@ class TestLabelContaminationAudit:
         assert result["total_articles"] == 10
         assert result["contaminated_count"] == 10
         assert result["contamination_rate"] == 1.0
-        assert result["verdict"] == "HIGH_CONTAMINATION"
+        # The fixture's articles table has no `score_source` column, so the
+        # audit cannot classify any row as Claude-labeled (`is_llm` is always
+        # False) and HIGH_CONTAMINATION (which requires llm_rate > 0.1) is
+        # structurally unreachable. Full first_seen-vs-published lag with no
+        # Claude labels is architectural retroactive collection — exactly the
+        # documented RETROACTIVE_COLLECTION verdict that _run_validation_async
+        # deliberately does NOT alarm on. This locks in that distinction.
+        assert result["llm_contaminated_count"] == 0
+        assert result["verdict"] == "RETROACTIVE_COLLECTION"
 
     def test_handles_rfc822_published_dates(self, tmp_path):
         # `published` is sometimes stored as RFC822 ("Wed, 14 May 2026 13:00:00 +0000").
