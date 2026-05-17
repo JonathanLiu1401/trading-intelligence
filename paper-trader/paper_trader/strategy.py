@@ -504,6 +504,14 @@ def _mark_to_market(
                          "stale_mark": stale})
         open_value += cur * p["qty"] * multiplier
 
+    return enriched, open_value, marks
+
+
+def _portfolio_snapshot(store: Store) -> dict:
+    """Mark-to-market every open position, write back to DB, return summary."""
+    positions = store.open_positions()
+    enriched, open_value, marks = _mark_to_market(positions)
+
     if marks:
         store.update_position_marks(marks)
 
@@ -515,6 +523,29 @@ def _mark_to_market(
     return {
         "cash": pf["cash"],
         "total_value": total,
+        "open_value": open_value,
+        "positions": enriched,
+    }
+
+
+def portfolio_snapshot_readonly(store: Store) -> dict:
+    """Same mark-to-market as ``_portfolio_snapshot`` but **never writes to
+    the store**.
+
+    Used by ``/api/decision-context`` (and its CLI) so an operator can see
+    exactly what ``decide()`` would feed Opus *right now* without the
+    dashboard thread mutating the live trader's persisted marks /
+    equity_curve. Shares ``_mark_to_market`` with the live path so the
+    inspector's positions can never drift from the real ones (single source
+    of truth, invariant #10). Read-only: ``open_positions()`` +
+    ``get_portfolio()`` only — no ``update_position_marks`` /
+    ``update_portfolio``."""
+    positions = store.open_positions()
+    enriched, open_value, _marks = _mark_to_market(positions)
+    pf = store.get_portfolio()
+    return {
+        "cash": pf["cash"],
+        "total_value": pf["cash"] + open_value,
         "open_value": open_value,
         "positions": enriched,
     }

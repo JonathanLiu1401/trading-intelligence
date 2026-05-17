@@ -513,7 +513,11 @@ TEMPLATE = r"""
     .bt-headline .stat .v { font-size: 22px; }
     .bt-layout {
       display: grid; grid-template-columns: 240px 1fr; gap: 14px; align-items: start;
+      min-width: 0;
     }
+    /* Let grid items shrink below their content so a long run name can't
+       blow the 1fr track past the viewport on mobile (agent6 frontend audit). */
+    .bt-layout > * { min-width: 0; }
     @media (max-width: 980px) { .bt-layout { grid-template-columns: 1fr; } }
     .bt-sidebar { position: sticky; top: 62px; max-height: calc(100vh - 78px); overflow-y: auto; }
     .bt-sidebar h2 { margin: 0; }
@@ -529,7 +533,8 @@ TEMPLATE = r"""
     .bt-swatch {
       width: 12px; height: 12px; border-radius: 3px; flex: 0 0 12px;
     }
-    .bt-legend-row .name { flex: 1; font-size: 13px; color: var(--text); }
+    .bt-legend-row .name { flex: 1; font-size: 13px; color: var(--text);
+      min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .bt-legend-row .ret { font-size: 11px; font-variant-numeric: tabular-nums; font-family: var(--font-mono); }
     .bt-btn {
       background: var(--bg-elevated); color: var(--text);
@@ -8253,6 +8258,63 @@ def session_delta_api():
             since_dt,
             now,
         ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/mark-integrity")
+def mark_integrity_api():
+    """How much of the displayed book value is *fictional* right now?
+
+    When yfinance returns nothing for a held name, strategy._mark_to_market
+    falls back to avg_cost and flags the row stale_mark=True (the live
+    2026-05-17 pathology: MU 0.5 @ 724.12, current_price == avg_cost, P/L
+    $0.00). That flag is surfaced *per position* to Opus & Discord, but no
+    panel answers the aggregate: what share of total book value is marked at
+    cost, so /api/analytics Sharpe, /api/drawdown, the equity curve and the
+    headline P&L are all quietly partially false? Uses the **read-only**
+    snapshot (strategy.portfolio_snapshot_readonly — shares _mark_to_market
+    with the live path so it can't drift, AGENTS.md #10; never writes from
+    the dashboard thread). Advisory only — never gates Opus, adds no caps
+    (AGENTS.md #2/#12). Pure core: analytics/mark_integrity.py."""
+    try:
+        from .analytics.mark_integrity import build_mark_integrity
+        from .strategy import portfolio_snapshot_readonly
+        store = get_store()
+        snap = portfolio_snapshot_readonly(store)
+        return jsonify(build_mark_integrity(snap.get("positions") or []))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/decision-context")
+@swr_cached("decision-context", 30.0)
+def decision_context_api():
+    """What is the live trader actually being shown right now?
+
+    The single biggest blind spot on the desk: `decisions` stores only
+    action_taken + reasoning, and the only raw capture is 1000 chars of the
+    *response* on a parse failure. When the trader spends cycle after cycle
+    on NO_DECISION (timeout/empty) / flat HOLD (the dominant 2026-05-17 live
+    pattern) an operator cannot see the decision **input**. This rebuilds it
+    on demand: the prompt rendered through the *same* strategy._build_payload
+    decide() uses (byte-identical given identical inputs, single source of
+    truth AGENTS.md #10), plus an input summary (signal counts, watchlist
+    prices resolved/missing — surfaces the yfinance starvation behind the
+    timeout storms), the advisory-block presence, embedded mark-integrity,
+    and a BLIND/DEGRADED/OK feed_state. **_claude_call is never invoked.**
+    Read-only snapshot (cannot mutate the live trader). Advisory only,
+    NOT injected into the decision prompt — dashboard/chat/CLI only (the
+    desk_pulse precedent; AGENTS.md #2/#12). SWR-cached (the assemble fetch
+    is multi-second). Also `python -m paper_trader.analytics.decision_context
+    [--full|--json]`. Pure core: analytics/decision_context.py."""
+    try:
+        from .analytics.decision_context import (
+            assemble_inputs,
+            build_decision_context,
+        )
+        store = get_store()
+        return jsonify(build_decision_context(**assemble_inputs(store)))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
