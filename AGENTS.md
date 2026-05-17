@@ -596,3 +596,38 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   `test_rss_collector.py`'s dedup-write path is **gone** under `-W error::DeprecationWarning`.
   Suite: **313 passed** (302 prior + 11 new). This deferral is now closed — a future reviewer
   should *not* re-derive it.
+
+- **2026-05-16 (independent full re-review @ `d847789`)** — Fresh end-to-end pass over the
+  nine task-critical files (`daemon.py`, `storage/article_store.py`, `watchers/alert_agent.py`,
+  `watchers/urgency_scorer.py`, `ml/trainer.py`, `ml/model.py`, `ml/features.py`,
+  `collectors/web_scraper.py`, `analysis/claude_analyst.py`) plus `ml/inference.py`. **No
+  bugs found.** HEAD is `d847789` — *identical* to the commit the entry above closed, i.e.
+  **zero production-code delta** since the last review (`git diff d847789` is only
+  `config/sources.json` data churn + `logs/daemon.log.*` rotation; the standing config/`.bak`
+  deferral is unchanged and remains deliberately uncommitted — config data, out of scope for
+  a code-review commit). All four load-bearing invariants independently re-traced and hold:
+  (1) backtest isolation — every live `FROM articles` read carries `_LIVE_ONLY_CLAUSE` or its
+  inlined twin (`article_store` get_unscored/get_unalerted_urgent/get_top_for_briefing/
+  count_unscored/stats/stats_since/update_scores_from_labels; `recursive_labeler._fetch_round1_candidates`
+  separate-WHERE form; `dashboard/server.py`; vendored `paper_trader/signals.py`), and
+  `alert_agent._is_synthetic` keeps its defense-in-depth re-filter; training paths
+  (`_fetch_training_data`, `train_continuous`, `_fetch_briefing_samples`) intentionally omit
+  it; (2) ml_score/ai_score separation — no code path routes model output into `ai_score`
+  (`scorer_worker` + `score_pending` → `update_ml_scores_batch`; Sonnet/Opus →
+  `update_ai_scores_batch`/`update_scores_from_labels`); (3) `MAX(urgency, ?)` state machine
+  intact on every score-write; (4) `get_unscored` train/serve age-field parity intact. The
+  task-specified test assertions were checked present **and value-asserting** (not no-crash)
+  and **already exist** — no tests added (adding duplicates would violate the standing
+  no-redundant-coverage discipline): `test_article_store.py`
+  (`test_get_unalerted_urgent_excludes_backtest_urls`, `test_mark_alerted_removes_from_unalerted`,
+  `TestScoreSourceSeparation` ml-vs-llm, CRUD), `test_urgency_scorer.py` (score 9.5 urgent /
+  3.0 not / alerted-state preserved), `test_features.py` (`EXTRA_FEATURE_DIM == 15`, zero
+  ticker density, days-since-published), `test_model.py` (relevance∈[0,10], urgency∈[0,1], no
+  NaN on zero input), `test_trainer.py` (`score_source='ml'` excluded, high-rel weighted
+  harder). **Spec-vs-prose note for the next reviewer:** the brief asks for
+  `days_since_published` ≈ "1 for one published 24h ago" — that contradicts the *intended* ML
+  scaling. Feature 6 is `min(age_days,30)/30`, so 24h ≈ **1/30 ≈ 0.033**, saturating 1.0 only
+  at ≥30d. `test_days_since_published_grows_with_age` correctly asserts ~1/30; this is
+  documented scaling, **not a bug — do not "fix" code or test to the prose** (standing
+  "code is the spec" rule). Suite: **313 passed** (clean `__pycache__`/`.pytest_cache`),
+  imports OK.
