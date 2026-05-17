@@ -1600,6 +1600,41 @@ def _sleep(seconds: float):
             next_ping = time.time() + 60
 
 
+def _format_source_health_summary(
+    disabled, stale, max_names: int = 4, max_chars: int = 110
+) -> str:
+    """Compact 'collectors down' line for the heartbeat briefing.
+
+    A disabled SEC-EDGAR / wire collector means the 5h digest is silently
+    missing that source's news — the briefing prose alone never reveals the
+    blind spot, and the existing health line only reports four worker threads'
+    liveness, not source_health's disabled/stale set. Surfacing it lets the
+    analyst know which part of their coverage universe went dark.
+
+    Pure + deterministic for unit testing: ``disabled`` (hard-down collectors)
+    are de-duplicated against ``stale`` (collectors with no fresh data in the
+    staleness window), each set is sorted, the union is listed disabled-first
+    (the harder failure), then truncated to ``max_names`` with a ``+N``
+    overflow marker and a hard ``max_chars`` cap. Returns "" when nothing is
+    down so a healthy briefing stays clean.
+    """
+    d = sorted(set(disabled or ()))
+    s = sorted(set(stale or ()) - set(d))
+    total = len(d) + len(s)
+    if total == 0:
+        return ""
+    names = d + s  # disabled first — the harder failure
+    shown = names[:max_names]
+    label = ", ".join(shown)
+    overflow = total - len(shown)
+    if overflow > 0:
+        label += f", +{overflow}"
+    line = f"⚠ Sources down ({total}): {label}"
+    if len(line) > max_chars:
+        line = line[: max_chars - 1].rstrip(", ") + "…"
+    return line
+
+
 def _build_health_line(store: ArticleStore) -> str:
     now = time.time()
     tracked = ("gdelt", "rss", "scorer", "price_alert")
@@ -1613,7 +1648,17 @@ def _build_health_line(store: ArticleStore) -> str:
         suffix = f" [{day['total']} articles today, {day['urgent']} urgent]"
     except Exception:
         suffix = ""
-    return "⚙ Workers: " + " ".join(parts) + suffix
+    base = "⚙ Workers: " + " ".join(parts) + suffix
+    # Append the source-health blind-spot line so a disabled collector is
+    # visible in the Discord briefing, not just the daemon log.
+    try:
+        sh = _format_source_health_summary(
+            source_health.get_disabled_sources(),
+            source_health.get_stale_sources(),
+        )
+    except Exception:
+        sh = ""
+    return base + ("\n" + sh if sh else "")
 
 
 def _acquire_singleton_lock():
