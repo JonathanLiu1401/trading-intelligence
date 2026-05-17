@@ -59,23 +59,38 @@ class TestPhase1IsStrictlyAdditive:
         for host, cred in _DOMAIN_CRED.items():
             assert cred >= DEFAULT_SOURCE_CRED, f"{host}={cred} < DEFAULT"
 
-    def test_low_authority_tier_empty_in_phase1(self):
-        """Junk tier (< DEFAULT, tightens the alert gate) is a Phase-2
-        behaviour change — empty after Phase 1 so this commit is provably
-        gate-neutral."""
-        assert _LOW_AUTHORITY_DOMAINS == {}
+    def test_tier_signs_never_overlap(self):
+        """Durable separation invariant: the rescue tier is strictly >= DEFAULT
+        and the junk tier is strictly < DEFAULT, with no host in both. If a
+        future edit puts a junk host >= DEFAULT it would silently stop being
+        gated; a rescue host < DEFAULT would wrongly suppress a real wire."""
+        for host, cred in _LOW_AUTHORITY_DOMAINS.items():
+            assert cred < DEFAULT_SOURCE_CRED, f"junk {host}={cred} >= DEFAULT"
+        assert not (set(_DOMAIN_CRED) & set(_LOW_AUTHORITY_DOMAINS)), (
+            "a host must not be in both the rescue and junk tiers"
+        )
 
     def test_no_already_differentiated_tag_moves(self):
-        """The load-bearing safety property: for every reference tag that was
-        already non-default, the new grade is IDENTICAL; for the rest it never
-        decreases. Phase 1 may only LIFT defaulting tags."""
+        """The load-bearing safety property (holds across Phase 1 AND 2): every
+        tag that was ALREADY non-default keeps its EXACT grade. Only tags that
+        used to silently default may be re-tiered — upward via the rescue tier,
+        or downward only if their host is explicitly junk-listed."""
         for source, old in PRE_FIX.items():
             new = _source_credibility(source)
             if old != DEFAULT_SOURCE_CRED:
                 assert new == pytest.approx(old), (
-                    f"{source}: {old} -> {new} (must not change)"
+                    f"{source}: {old} -> {new} (already-differentiated, frozen)"
                 )
-            assert new >= old - 1e-9, f"{source}: {old} -> {new} (regressed)"
+                continue
+            # old == DEFAULT: a downward move is allowed ONLY for an
+            # explicitly junk-listed host (the Phase-2 noise-gate feature).
+            host_is_junk = any(
+                h in source for h in _LOW_AUTHORITY_DOMAINS
+            )
+            if not host_is_junk:
+                assert new >= old - 1e-9, (
+                    f"{source}: {old} -> {new} (unexpected un-listed regression)"
+                )
 
     def test_domain_tier_agrees_with_verbatim_where_they_overlap(self):
         """If a bare domain ALSO matches the legacy word-boundary scan, the
