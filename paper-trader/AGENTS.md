@@ -977,6 +977,61 @@ For automated review agents that touch ML / backtest code:
   `is_trained = False`. Locked by
   `tests/test_ml_backtest_seams.py::TestDecisionScorerDummyFallback`.
 
+### 2026-05-17 review pass (GDELT coverage · run reaper · OOS dir-skill)
+
+- **GDELT permanent-vs-transient errors (`backtest.py::GDELTFetcher.fetch`,
+  committed `8899c16`).** GDELT DOC 2.0 only indexes ~2017-onward; a
+  pre-coverage date raises a *deterministic* `ValueError` ("The query was
+  not valid … Invalid query start date"). The fetcher previously treated
+  this as transient — 3 retries with 20+40+60s backoff **and no cache
+  write**, so the continuous loop (windows back to 1993) re-attempted it
+  every cycle for hours (`continuous.log` was wall-to-wall these). Now a
+  permanent message (`"not valid"` / `"invalid query"`, matched on text not
+  type) breaks with **zero backoff** and **negative-caches `[]`** so the
+  warm-cache `exists()`-filter and the tier-3 disk lookup skip it forever
+  after. Transient errors (rate-limit / connection drop) keep the full
+  retry+backoff and are **never** cached (caching a transient failure would
+  poison a temporarily-failing date for the loop's life). A
+  legitimately-empty result on a *covered* date is still cached (unchanged).
+  Locked by `tests/test_gdelt_coverage_20260517.py`.
+
+- **Orphaned-run reaper (`run_continuous_backtests.py::_reap_orphaned_runs`,
+  called once at `main()` startup; committed `05b4df2`).** A run thread
+  hard-killed by OOM/SIGKILL never reaches `finalize_run` *or* the
+  `run_all` wrapper's `upsert_run("failed")` (that fallback only fires on a
+  *caught* exception), so the `backtest_runs` row stays `status='running'`
+  forever — the CLAUDE.md §11 "Backtest dashboard shows running forever"
+  symptom (15 such stale rows were live in `backtest.db`). On a fresh loop
+  start any pre-existing `running` row is orphaned (prior process is gone);
+  the `max_age_hours=6.0` guard is defensive (no real run exceeds minutes).
+  Runs single-threaded before any new run launches — no race. Best-effort:
+  a DB hiccup never blocks loop start. Locked by
+  `tests/test_continuous_review_20260517.py::TestReapOrphanedRuns`.
+
+- **OOS directional skill in the continuous-loop status line
+  (`_oos_rank_metrics`, appended to `_train_decision_scorer`'s string as
+  `oos_diracc=` / `oos_ic=`; committed `05b4df2`).** `oos_rmse` answers
+  *how big is the error* but the `_ml_decide` gate only acts on the
+  prediction's **sign/bucket** (±10/±5/0), so a scorer with
+  `oos_rmse ≳ σ(target)` (the documented current state) can still be
+  gate-useful **iff it gets direction right**. `oos_diracc` = held-out
+  sign-match fraction (zeros excluded — no directional truth); `oos_ic` =
+  tie-aware Spearman(pred, realized) **reusing `ml.calibration._spearman`**
+  (single source of truth — the tie-awareness is load-bearing because the
+  scorer clamps to ±50 and a naïve argsort fabricates rank skill there; a
+  constant predictor must read `oos_ic=+0.00`, not +1.00). Mirrors
+  `validation.evaluate_scorer_oos`'s exact 11-kwarg predict signature +
+  SELL sign-flip so it describes the **same** path the gate uses. Guarded
+  *separately* from the `oos_rmse` block (own try/except → `n/a`) so a
+  post-train diagnostic crash can't mask a successful train (the
+  "scorer-train status must stay truthful" discipline). **Interpretation:**
+  read `oos_diracc` next to `oos_rmse` — `oos_diracc ≤ 0.5` with
+  `oos_rmse ≳ σ` means the BUY-conviction gate is riding noise;
+  `oos_diracc` materially > 0.5 is the only evidence the gate's sign
+  decision carries edge despite the poor RMSE. Diagnostic only — changes no
+  model/gate (training-dynamics is out of scope; CLAUDE.md §6). Locked by
+  `tests/test_continuous_review_20260517.py::TestOosRankMetrics`.
+
 ### When to bump model versions
 
 The scorer model has no explicit version field. Treat a change to
