@@ -450,9 +450,20 @@ def _expired_intrinsic(ticker: str, otype: str, strike: float) -> float:
     return max(0.0, und - k) if otype == "call" else max(0.0, k - und)
 
 
-def _portfolio_snapshot(store: Store) -> dict:
-    """Mark-to-market every open position, write back to DB, return summary."""
-    positions = store.open_positions()
+def _mark_to_market(
+    positions: list[dict],
+) -> tuple[list[dict], float, dict[int, tuple[float, float]]]:
+    """Pure mark-to-market over the given open-position rows.
+
+    Returns ``(enriched, open_value, marks)``; performs **no** store writes.
+    Single source of truth for the mark math (invariant #10): the
+    write-through ``_portfolio_snapshot`` and the read-only
+    ``portfolio_snapshot_readonly`` both call it, so the live trader and the
+    ``/api/decision-context`` inspector can never disagree on a mark — incl.
+    the expired-option intrinsic settlement (invariant #13) and the
+    ``stale_mark`` flag. yfinance lookups happen here exactly as before
+    (behaviour-preserving extraction, locked by
+    ``tests/test_core_strategy.py::TestPortfolioSnapshot*``)."""
     stock_tickers = sorted({p["ticker"] for p in positions if p["type"] == "stock"})
     prices = market.get_prices(stock_tickers) if stock_tickers else {}
 
@@ -916,7 +927,18 @@ def _ml_live_opinion(
             if raw_score < 1.0:
                 continue
             title = (a.get("title") or "").lower()
-            words = set(title.split())
+            # Tokenize on word boundaries, not raw str.split(). A sentiment
+            # word that is sentence-final or comma-trailed ("surges," "rally."
+            # "beats!") keeps its punctuation under .split(), so `w in SET`
+            # exact-membership never matched it — silently zeroing the
+            # news-sentiment half of this advisory for the majority of real
+            # headlines (a headline almost always ends on or commas around its
+            # catalyst verb). CLAUDE.md §15 requires this to mirror the
+            # backtest scorer, whose `_sentiment` is punctuation-tolerant;
+            # re.findall on [a-z]+ strips the punctuation while preserving the
+            # deliberate exact-form vocab (so "mission"/"missile" still do NOT
+            # read as the bearish "miss" — exact match, not prefix match).
+            words = set(re.findall(r"[a-z]+", title))
             bull = sum(1 for w in words if w in _BULLISH_WORDS_LIVE)
             bear = sum(1 for w in words if w in _BEARISH_WORDS_LIVE)
             total_sent = bull + bear
