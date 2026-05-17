@@ -1049,3 +1049,80 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   51 `logs/.supervisor_state.*.tmp` deletions. Every commit here was
   pathspec-scoped to exactly its intended .py + test files (4 distinct
   files across 3 commits); never `git add -A`.
+
+- **2026-05-17 (Agent 3, hybrid debug+feature+live-validation, source-cred
+  pass)** — Read pass over the nine task-critical files + `ml/inference.py`,
+  `ml/embedder.py`, `collectors/source_health.py`,
+  `scripts/gdelt_gkg_bulk.py`. No new bug *by inspection* in the
+  heavily-reviewed core (5+ prior passes). Phase 3 live validation
+  (`articles.db` 1.92M rows; read-only `file:…?mode=ro`) was again the
+  discovery engine and surfaced one real, undocumented correctness gap that
+  the file-inspection loop cannot see because it only manifests against the
+  *production source-tag shape*:
+
+  **Phase 1 — `29247b3` `ml/features.py::_source_credibility` silently
+  returned `DEFAULT_SOURCE_CRED` for ~86% of the live top-40 source tags.**
+  ~95% of the corpus arrives aggregator-prefixed (`gdelt_gkg/<host>` from
+  `scripts/gdelt_gkg_bulk.py`, `GDELT/<host>`, `scraped/<host>`,
+  `SEC-EDGAR/<form>`). The verbatim word-boundary scan only matched a
+  `SOURCE_CRED` key when it literally appeared in the tag, so the embedded
+  publisher was ignored: `gdelt_gkg/seekingalpha.com`→0.55 (key "seeking
+  alpha" has a space), `SEC-EDGAR/8-K`→0.55 despite SEC=0.95. Net effect:
+  ML `feature[0]` is a near-constant for 95% of training rows (dead signal),
+  and the alert authority gate can't see the real publisher. Fix resolves
+  the embedded host first via a rescue tier (`_DOMAIN_CRED`, every value
+  `>= DEFAULT` and equal to the publisher's existing grade) + a `sec-edgar`
+  alias, falling back to the unchanged verbatim scan. **Strictly additive:
+  no already-differentiated tag moves and the 0.45 lone-alert gate is
+  byte-identical** (pinned by `test_source_credibility_domains.py`).
+
+  **Phase 2 — `e3fa0dd` `_LOW_AUTHORITY_DOMAINS` junk tier.** The 24h
+  alerted set (n=7) carried analyst-noise the gate missed because junk GKG
+  hosts defaulted to 0.55 (> 0.45): a lone, un-syndicated urgent row from an
+  algorithmic stock-mention press mill (`wkrb13.com`,
+  `dailypolitical.com`, …), a radio network (`iheart.com`, 63k/24h) or a
+  hyperlocal feed fired a standalone Bloomberg BREAKING push. The new tier
+  grades *only these explicitly-named hosts* below the gate so
+  `_filter_low_authority_lone` suppresses them when lone; corroboration
+  (`dup_count>1`) and any credible/unknown host still fire. **Honors the
+  prior standing call: the `gdelt`/`scraped`/`GDELT` *channels* are NOT
+  down-rated** (a channel-wide bar would catch wires syndicated through
+  GKG) — only specific publisher hosts. Pinned end-to-end through
+  `send_urgent_alert` by `test_low_authority_domain_gate.py`.
+
+  **Phase 3 findings (analyst lens):** (1) ~95% of `articles.db` is
+  `gdelt_gkg/<domain>` — a one-time bulk *historical training-corpus*
+  backfill (`gdelt_gkg_bulk.py`), NOT a live ingestion rate; live add-rate
+  was ~83/h in the quiet hour sampled. (2) Latest briefing (id 24,
+  ~25 min old) is high-quality: tight Bloomberg format, exact CPI/yield/
+  semis numbers, actionable DESK NOTE; cadence ~6–7h (slightly over the 5h
+  interval — consistent with the restart-warmup logic). (3) Portfolio
+  tickers `MUU`/`LNOK` have no live quotes ("no live quote in feed") — a
+  `config/portfolio.json` data gap, briefing degrades gracefully; not a
+  code bug. (4) `score_source` dist: 1.66M NULL / 264k `ml` / 3.7k `llm`
+  — heavy reliance on model self-predictions with sparse LLM ground truth
+  (observation). (5) `ai_score>0 AND score_source='ml'` = **0** — the
+  ml/ai separation invariant holds in production. (6) `daemon.log`: only
+  transient `database is locked` WARNs (absorbed by `_retry_on_lock` /
+  worker backoff) + designed singleton-lock restart churn; no tracebacks.
+  **Chronic stale-daemon caveat persists:** the running daemon predates
+  these commits; `29247b3`/`e3fa0dd` take effect only after
+  `systemctl --user restart digital-intern` (not done — out of scope,
+  live system + sibling agents). **Feature-cache note:** Phase 2 shifts ML
+  `feature[0]` for `iheart.com` (63k rows) / `joker.com` (13k) /
+  `wickedlocal.com` (6k) from 0.55→0.30–0.40; the next 2–3 ArticleNet
+  retrains absorb it, but `data/ml/dataset_cache.npz` only rebuilds when
+  labeled-count drifts >5% (`_CACHE_DRIFT_THRESHOLD`) — delete it to force
+  the corrected feature in immediately, or let the natural drift trigger.
+
+  Suite: **388 passed** (371 prior baseline + 11 Phase-1 + 6 Phase-2),
+  `storage`/`ml`/`features` imports OK. *Pre-existing, not this work —
+  deliberately never staged:* `collectors/rss_collector.py`,
+  `storage/article_store.py`, `tests/test_article_store.py`,
+  `scripts/export_training_data.py` edits + untracked
+  `collectors/fred_collector.py` / `scripts/stale_source_alerter.py` /
+  `tests/test_export_training_data.py`, all `paper-trader/*` (sibling
+  repo/agents), and the `logs/.supervisor_state.*.tmp` deletions. Every
+  commit pathspec-scoped to exactly its intended `ml/features.py` + test
+  files (`29247b3` Phase 1, `e3fa0dd` Phase 2, plus a follow-up trimming
+  `_LOW_AUTHORITY_DOMAINS` to live-observed hosts only); never `git add -A`.
