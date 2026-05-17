@@ -29,3 +29,6 @@ data/ml/*.npz
 data/ml/dataset_cache_meta.json
 logs/supervisor_state.json
 data/earnings_calendar.json
+
+# Ad-hoc / "blitz" backups of the live source list — must not pollute git history
+config/sources.json.bak.*
