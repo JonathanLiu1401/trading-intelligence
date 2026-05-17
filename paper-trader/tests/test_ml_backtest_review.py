@@ -290,6 +290,77 @@ class TestMlDecideScorerGate:
         assert qty == pytest.approx(162.5)          # 0.25×1.3=0.325
 
 
+class _FakeMetaScorer:
+    """Stand-in that implements the predict_with_meta trust contract so the
+    off-distribution gate-abstention can be exercised deterministically."""
+
+    def __init__(self, pred: float, off_distribution: bool,
+                 n_train: int = 1000, trained: bool = True) -> None:
+        self._pred = pred
+        self._off = off_distribution
+        self._n_train = n_train
+        self.is_trained = trained
+
+    def predict_with_meta(self, **_kw) -> dict:
+        return {"pred": self._pred, "raw": self._pred,
+                "clamped": self._off, "off_distribution": self._off}
+
+    def predict(self, **_kw) -> float:  # parity with the real scorer's API
+        return self._pred
+
+
+class TestMlDecideOffDistributionGate:
+    """Phase-2 behaviour: when the scorer flags the prediction
+    off_distribution (the unbounded MLP head extrapolated past the empirical
+    label support), the conviction gate must ABSTAIN — leave the
+    quant-derived conviction untouched — instead of acting on clamped noise.
+    Baseline (no modulation) qty for this fixture is 125.0 (conv 0.25)."""
+
+    def test_off_distribution_skips_modulation_despite_catastrophic_pred(
+            self, synthetic_prices, monkeypatch):
+        # pred = -50 (a clamped extrapolation) would normally hit the
+        # `p < -10 → ×0.6` arm and slash qty to 75.0. off_distribution=True
+        # ⇒ the gate abstains ⇒ conviction stays 0.25 ⇒ qty stays 125.0.
+        qty = _buy_qty_with_scorer(
+            synthetic_prices, monkeypatch,
+            _FakeMetaScorer(-50.0, off_distribution=True))
+        assert qty == pytest.approx(125.0)
+
+    def test_in_distribution_meta_path_still_modulates(
+            self, synthetic_prices, monkeypatch):
+        # Same meta scorer but off_distribution=False ⇒ the -20 prediction
+        # must still fire the strong-headwind arm (×0.6 → 75.0). Proves the
+        # meta path has identical in-distribution behaviour to predict().
+        qty = _buy_qty_with_scorer(
+            synthetic_prices, monkeypatch,
+            _FakeMetaScorer(-20.0, off_distribution=False))
+        assert qty == pytest.approx(75.0)
+
+    def test_off_distribution_is_surfaced_in_reasoning(
+            self, synthetic_prices, monkeypatch):
+        monkeypatch.setattr(
+            bt, "_DECISION_SCORER",
+            _FakeMetaScorer(-50.0, off_distribution=True), raising=False)
+        p = SimPortfolio(cash=100_000.0)
+        d = synthetic_prices.trading_days[-1]
+        articles = [{"title": "Nvidia beats earnings, guidance raised, "
+                              "semiconductor surge",
+                     "score": 10.0, "tickers": ["NVDA"]}]
+        decision = _ml_decide(d, p, articles, synthetic_prices,
+                              run_id=1, rng=random.Random(42))
+        assert decision["action"] == "BUY"
+        assert "off-dist,gate-skipped" in decision["reasoning"]
+
+    def test_off_distribution_below_500_still_inactive(
+            self, synthetic_prices, monkeypatch):
+        # Defensive: the n_train<500 gate and the off_dist abstention are
+        # independent guards; with both tripped conviction is still 0.25.
+        qty = _buy_qty_with_scorer(
+            synthetic_prices, monkeypatch,
+            _FakeMetaScorer(-50.0, off_distribution=True, n_train=100))
+        assert qty == pytest.approx(125.0)
+
+
 # ───────────────────── _compute_decision_outcomes logic ─────────────────────
 
 def _engine_with_decision(tmp_path, synthetic_prices, *, action, ticker,

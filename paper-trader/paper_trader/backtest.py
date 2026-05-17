@@ -1543,7 +1543,7 @@ def _ml_decide(
         buy_news_count = ticker_article_count.get(buy_ticker, 0)
         buy_news_urg = ticker_max_urgency.get(buy_ticker, 0.0)
         _scorer = _get_decision_scorer()
-        scorer_pred = _scorer.predict(
+        _feat = dict(
             ml_score=best_score,
             rsi=q_buy.get("rsi"),
             macd=q_buy.get("macd_signal"),
@@ -1556,8 +1556,30 @@ def _ml_decide(
             news_urgency=buy_news_urg if buy_news_count else None,
             news_article_count=float(buy_news_count) if buy_news_count else None,
         )
+        # Prefer predict_with_meta so we can see the scorer's own trust flag.
+        # The MLP head is unbounded; AGENTS.md documents it extrapolating to
+        # nonsense off-distribution (observed -89% then +32% for the SAME
+        # LITE vector across two retrain cycles). predict() clamps to
+        # ±PRED_CLAMP_PCT so a fabricated -89 surfaces as exactly -50 — which
+        # still lands in the `p < -10 → ×0.6` arm and silently halves
+        # conviction on pure extrapolation noise. `off_distribution` is True
+        # exactly when the raw output exceeded the empirical label support
+        # (or the predict call failed / went non-finite); in that case the
+        # point estimate carries no information, so we leave the quant-derived
+        # conviction untouched rather than modulate on noise. Fall back to the
+        # plain predict() scalar for any scorer without the meta sibling (the
+        # _Dummy init-failure stub and predict-only test fakes) — treated as
+        # in-distribution so existing gate behaviour is unchanged there.
+        _pwm = getattr(_scorer, "predict_with_meta", None)
+        if callable(_pwm):
+            _meta = _pwm(**_feat)
+            scorer_pred = float(_meta.get("pred", 0.0))
+            scorer_off_dist = bool(_meta.get("off_distribution", False))
+        else:
+            scorer_pred = float(_scorer.predict(**_feat))
+            scorer_off_dist = False
         _scorer_n = getattr(_scorer, "_n_train", 0)
-        if _scorer.is_trained and _scorer_n >= 500:
+        if _scorer.is_trained and _scorer_n >= 500 and not scorer_off_dist:
             # Scorer adjusts conviction only — never cancels the trade.
             # The LLM already chose this ticker via ML score + quant analysis.
             # Blocking based on 5d forward-return predictions sabotages leveraged
@@ -1577,7 +1599,15 @@ def _ml_decide(
         if qty < 0.01:
             return {"action": "HOLD", "ticker": buy_ticker, "qty": 0,
                     "reasoning": f"ML score={best_score:.2f} but notional too small"}
-        scorer_note = f" scorer={scorer_pred:+.1f}%" if _scorer.is_trained else ""
+        if not _scorer.is_trained:
+            scorer_note = ""
+        elif scorer_off_dist:
+            # Surfaced so the dashboard / a reading quant can see the gate
+            # deliberately abstained on an off-distribution extrapolation
+            # rather than silently treating a clamped ±50 as a real signal.
+            scorer_note = f" scorer={scorer_pred:+.1f}%(off-dist,gate-skipped)"
+        else:
+            scorer_note = f" scorer={scorer_pred:+.1f}%"
         return {
             "action": "BUY", "ticker": buy_ticker, "qty": qty,
             "stop_loss": round(price * 0.92, 2),
