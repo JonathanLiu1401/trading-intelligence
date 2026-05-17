@@ -1018,6 +1018,29 @@ TEMPLATE = r"""
       </table>
     </div>
 
+    <!-- ─── Winner autopsy (per-closed-winning-trade post-mortem) ─── -->
+    <div class="card" id="wautopsy-card" style="margin-bottom:18px;">
+      <h2 style="display:flex;justify-content:space-between;align-items:center;">
+        <span>Winner autopsy <span class="muted" style="font-size:11px;text-transform:none;letter-spacing:normal;font-weight:normal;">— why each closed trade won: verbatim thesis, hold, success mode</span></span>
+        <span id="wautopsy-state" style="font-size:12px;padding:3px 10px;border-radius:4px;background:#1f2126;color:#8b929d;">—</span>
+      </h2>
+      <div class="muted" id="wautopsy-headline" style="font-size:12px;margin-bottom:12px;">loading…</div>
+      <div class="stat-row" style="margin-bottom:14px;">
+        <div class="stat"><div class="l">total realised gain</div><div class="v" id="wautopsy-total">—</div></div>
+        <div class="stat"><div class="l">winning round-trips</div><div class="v" id="wautopsy-n">—</div></div>
+        <div class="stat"><div class="l">avg gain</div><div class="v" id="wautopsy-avg">—</div></div>
+        <div class="stat"><div class="l">median hold</div><div class="v" id="wautopsy-hold">—</div></div>
+        <div class="stat"><div class="l">dominant mode</div><div class="v" id="wautopsy-mode">—</div></div>
+      </div>
+      <table id="wautopsy-tbl" style="font-size:12px;width:100%;">
+        <thead><tr>
+          <th>ticker</th><th class="num">P/L $</th><th class="num">P/L %</th>
+          <th class="num">hold d</th><th>mode</th><th>opening thesis</th>
+        </tr></thead>
+        <tbody><tr><td colspan="6" class="muted">loading…</td></tr></tbody>
+      </table>
+    </div>
+
     <!-- ─── Concentration honesty (do the held names move together?) ─── -->
     <div class="card" id="pcorr-card" style="margin-bottom:18px;">
       <h2 style="display:flex;justify-content:space-between;align-items:center;">
@@ -4158,6 +4181,60 @@ async function refreshLoserAutopsy() {
   }
 }
 
+const _WA_MODE_COLOR = {
+  HOME_RUN:   ["#1b5e20", "#ffffff"],
+  SLOW_GRIND: ["#2e7d32", "#ffffff"],
+  TARGET_HIT: ["#1f2126", "#dde1e7"],
+  SCALP:      ["#3a2a00", "#ffd479"],
+};
+async function refreshWinnerAutopsy() {
+  const r = await fetchMaybeStale("/api/winner-autopsy");
+  if (r.__unavailable) { markStale("wautopsy-state", "wautopsy-headline", "Winner-autopsy endpoint"); return; }
+  if (r.error) { document.getElementById("wautopsy-headline").textContent = "error: " + r.error; return; }
+  const sEl = document.getElementById("wautopsy-state");
+  if (r.state === "STABLE" && r.verdict) {
+    const [bg, fg] = _WA_MODE_COLOR[r.verdict] || _WA_MODE_COLOR.TARGET_HIT;
+    sEl.textContent = r.verdict.replace(/_/g, " ");
+    sEl.style.background = bg; sEl.style.color = fg;
+  } else {
+    const sb = { EMERGING: ["#3a2a00", "#ffd479"], NO_DATA: ["#1f2126", "#8b929d"], NO_WINS: ["#b71c1c", "#ffffff"] };
+    const [bg, fg] = sb[r.state] || sb.NO_DATA;
+    sEl.textContent = r.state || "—";
+    sEl.style.background = bg; sEl.style.color = fg;
+  }
+  document.getElementById("wautopsy-headline").textContent = r.headline || "";
+  const tot = document.getElementById("wautopsy-total");
+  tot.textContent = r.total_gain_usd != null ? _sgn(r.total_gain_usd) + "$" + fmt(Math.abs(r.total_gain_usd)) : "—";
+  tot.style.color = _plColor(r.total_gain_usd);
+  document.getElementById("wautopsy-n").textContent = r.n_winners != null ? (r.n_winners + " / " + r.n_round_trips + " RT") : "—";
+  const avg = document.getElementById("wautopsy-avg");
+  avg.textContent = r.avg_gain_usd != null ? _sgn(r.avg_gain_usd) + "$" + fmt(Math.abs(r.avg_gain_usd)) : "—";
+  avg.style.color = _plColor(r.avg_gain_usd);
+  document.getElementById("wautopsy-hold").textContent = r.median_winner_hold_days != null ? fmt(r.median_winner_hold_days, 2) + "d" : "—";
+  document.getElementById("wautopsy-mode").textContent = r.dominant_success_mode ? r.dominant_success_mode.replace(/_/g, " ") : "—";
+  const tb = document.querySelector("#wautopsy-tbl tbody");
+  tb.replaceChildren();
+  const cards = r.best_winners || [];
+  if (!cards.length) {
+    const tr = document.createElement("tr");
+    const td = _cell(r.state === "NO_WINS" ? "no winning round-trips" : "no data", "muted");
+    td.colSpan = 6; tr.appendChild(td); tb.appendChild(tr);
+  } else {
+    for (const c of cards) {
+      const tr = document.createElement("tr");
+      tr.appendChild(_cell(c.ticker));
+      const pl = _cell((c.pnl_usd >= 0 ? "+" : "") + "$" + fmt(Math.abs(c.pnl_usd)), "num");
+      pl.style.color = _plColor(c.pnl_usd);
+      tr.appendChild(pl);
+      tr.appendChild(_cell(c.pnl_pct != null ? (c.pnl_pct >= 0 ? "+" : "") + fmt(c.pnl_pct, 1) + "%" : "—", "num"));
+      tr.appendChild(_cell(c.hold_days != null ? fmt(c.hold_days, 2) : "—", "num"));
+      tr.appendChild(_cell(c.success_mode ? c.success_mode.replace(/_/g, " ") : "—"));
+      tr.appendChild(_cell(c.entry_reason || "—"));
+      tb.appendChild(tr);
+    }
+  }
+}
+
 async function refreshCorrelation() {
   const r = await fetchMaybeStale("/api/correlation");
   if (r.__unavailable) { markStale("pcorr-state", "pcorr-headline", "Concentration-honesty endpoint"); return; }
@@ -4747,6 +4824,7 @@ refreshSignalFollowThrough();
 refreshChurn();
 refreshThesisDrift();
 refreshLoserAutopsy();
+refreshWinnerAutopsy();
 refreshCorrelation();
 refreshSourceEdge();
 refreshScorecard();
@@ -4786,6 +4864,7 @@ setInterval(refreshSignalFollowThrough, 300_000);
 setInterval(refreshChurn, 60_000);
 setInterval(refreshThesisDrift, 60_000);
 setInterval(refreshLoserAutopsy, 60_000);
+setInterval(refreshWinnerAutopsy, 60_000);
 setInterval(refreshCorrelation, 120_000);
 setInterval(refreshSourceEdge, 300_000);
 setInterval(refreshScorecard, 60_000);
@@ -6851,6 +6930,34 @@ def loser_autopsy_api():
         # oldest → newest (build_round_trips reads in sequence).
         trades = list(reversed(store.recent_trades(2000)))
         return jsonify(build_loser_autopsy(trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/winner-autopsy")
+def winner_autopsy_api():
+    """Per-closed-winning-round-trip post-mortem — the positive mirror of
+    /api/loser-autopsy. Every behavioural builder reflects a pathology
+    (/api/loser-autopsy narrates losses, /api/trade-asymmetry flags
+    DISPOSITION_BLEED, /api/churn counts overtrading, /api/self-review feeds
+    only the failures back into the prompt). None tell the desk *which
+    winning behaviour to repeat*. This composes the single source of truth
+    (build_round_trips, AGENTS.md #10) and joins the verbatim entry/exit
+    reason back from the contributing trade rows, classifies each win into
+    an objective success mode (HOME_RUN / SCALP / SLOW_GRIND / TARGET_HIT —
+    SLOW_GRIND = let a winner run, the good disposition behaviour; SCALP =
+    cut one fast, the disposition effect surfaced per-trade), and rolls up
+    which name is the engine + which mode dominates. The pattern verdict is
+    withheld until n≥8 winners (trade_asymmetry/loser_autopsy STABLE idiom).
+    Advisory only — never gates Opus, never injected into the decision
+    prompt, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.winner_autopsy import build_winner_autopsy
+        store = get_store()
+        # Same trades convention as /api/analytics & /api/loser-autopsy:
+        # oldest → newest (build_round_trips reads in sequence).
+        trades = list(reversed(store.recent_trades(2000)))
+        return jsonify(build_winner_autopsy(trades))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
