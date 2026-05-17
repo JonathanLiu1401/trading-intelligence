@@ -1064,6 +1064,7 @@ class GDELTFetcher:
 
         articles: list[dict] = []
         success = False
+        permanent = False
         for attempt in range(3):
             err: str | None = None
             with self._request_lock:
@@ -1085,18 +1086,41 @@ class GDELTFetcher:
                 except Exception as e:
                     self._last_request_ts = time.time()
                     err = f"{type(e).__name__}: {e}"
-            if success:
+                    # GDELT DOC 2.0 only indexes ~2017-onward. A pre-coverage
+                    # date raises a deterministic ValueError ("The query was
+                    # not valid … Invalid query start date") that can NEVER
+                    # succeed on retry. The continuous loop picks windows back
+                    # to 1993, so without this short-circuit every such
+                    # (date,keyword) burned 20+40+60s of backoff AND was never
+                    # cached, so it was re-attempted every cycle for hours
+                    # (see continuous.log). Treat it as permanent: stop
+                    # retrying and negative-cache an empty result so the
+                    # warm-cache exists()-filter and the tier-3 disk lookup
+                    # skip it forever after.
+                    _m = str(e).lower()
+                    if "not valid" in _m or "invalid query" in _m:
+                        permanent = True
+            if success or permanent:
                 break
             backoff = GDELT_RETRY_BACKOFF_S * (attempt + 1)
             print(f"[gdelt] {err} {d} {keywords[:30]!r} "
                   f"attempt {attempt+1}/3 — sleeping {backoff:.0f}s")
             time.sleep(backoff)
 
-        if success:
+        # Cache on success (a legitimately-empty result for a covered date is
+        # the correct answer and SHOULD be cached) OR on a permanent coverage
+        # error (an empty list IS the correct, immutable answer for a date
+        # GDELT will never index). NEVER cache a transient failure — that
+        # would poison a temporarily rate-limited/disconnected date for the
+        # rest of the loop's lifetime.
+        if success or permanent:
             try:
                 path.write_text(json.dumps(articles))
             except Exception:
                 pass
+        if permanent:
+            print(f"[gdelt] permanent: {d} outside GDELT coverage — "
+                  f"cached empty, no retry")
         return articles
 
 
