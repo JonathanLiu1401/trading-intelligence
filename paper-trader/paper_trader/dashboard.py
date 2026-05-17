@@ -7492,7 +7492,14 @@ def session_delta_api():
 
 
 def run(host: str = "0.0.0.0", port: int = 8090):
-    app.run(host=host, port=port, debug=False, use_reloader=False)
+    # threaded=True: the dashboard's real load is concurrent (the unified
+    # :8888 page fires ~25 panel fetches in parallel, /api/chat fans out ~15
+    # sub-fetches, the :8080 dashboard cross-fetches us mid-runner-cycle).
+    # A single-threaded server head-of-line-blocks every fast pure-DB panel
+    # behind one slow yfinance-backed endpoint. Safe: store.py serializes
+    # every read on Store._lock and is explicitly hardened for "the Flask
+    # dashboard thread(s)"; slow endpoints use their own mode=ro connections.
+    app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":
