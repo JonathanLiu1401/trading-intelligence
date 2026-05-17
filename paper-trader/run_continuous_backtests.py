@@ -52,6 +52,17 @@ MAX_OUTCOMES_FOR_TRAINING = 5000  # cap decision_outcomes.jsonl tail used per re
 COOLDOWN_SECONDS = 60
 DISCORD_CHANNEL = "channel:1496099475838603324"
 WINNER_JSONL = ROOT / "data" / "winner_training.jsonl"
+# winner_training.jsonl is append-only across the whole loop lifetime
+# (`_append_top_decisions` + `_opus_annotate` both append, nothing trimmed).
+# It had grown to ~320 MB / 860k lines on disk. `_inject_and_train` already
+# only ever consumes the last `_MAX_INJECT_RECORDS` (10k) lines — older rows
+# are already idempotently in articles.db (INSERT OR IGNORE) — so an unbounded
+# file is pure disk waste and a latent disk-full risk (the same OSError
+# [Errno 28] class of failure documented in decision_scorer.py). Trim to this
+# many most-recent records, well above the 10k inject tail so the consumer is
+# never starved, using the same atomic tmp+`.replace` idiom as the
+# decision_outcomes / scorer_skill_log trims.
+WINNER_JSONL_KEEP = 50000
 # digital-intern's article DB that `_inject_and_train` writes winner rows into.
 # Module-level (not a function local) so it can be redirected in tests.
 DIGITAL_INTERN_ARTICLES_DB = "/home/zeph/digital-intern/data/articles.db"
@@ -72,6 +83,18 @@ VALIDATION_EVERY_N_CYCLES = 10
 VALIDATION_PERMUTATIONS = 250   # statistically valid floor (smoothed p ≥ 1/(n+1))
 VALIDATION_RESULTS_PATH = ROOT / "data" / "validation_results.json"
 VALIDATION_RESULTS_KEEP = 50    # cap file growth
+
+# Per-cycle scorer-skill ledger. `_train_decision_scorer` already computes
+# val_rmse / oos_rmse / oos_diracc / oos_ic every cycle but only *prints* them
+# to continuous.log — an ephemeral, rotated, hard-to-trend sink. A skeptical
+# quant needs to see whether the scorer's out-of-sample skill is improving
+# with more outcomes, holding at the documented negative-skill plateau
+# (AGENTS.md: oos_rmse 13–17 > σ(target) ≈ 11.7), or degrading. This appends
+# one structured JSONL row per cycle so that trend is durable and queryable.
+# Module-level (not a function local) so tests can redirect it — mirrors the
+# AGENTS.md "hardcoded paths must be module-level for testability" rule.
+SCORER_SKILL_LOG = ROOT / "data" / "scorer_skill_log.jsonl"
+SCORER_SKILL_LOG_KEEP = 2000    # cap file growth (≈ one row per cycle)
 
 EARLIEST_WINDOW_START = date(1993, 2, 1)  # SPY inception — ~30+ years of history
 WINDOW_END_BUFFER_DAYS = 180  # never end a window within 6 months of today
@@ -242,6 +265,52 @@ def _append_top_decisions(engine: BacktestEngine, top_runs: list[BacktestRun],
                 written += 1
     print(f"[continuous] appended {written} records from top {len(top_runs)} runs → {WINNER_JSONL}")
     return written
+
+
+def _trim_winner_jsonl(keep: int = WINNER_JSONL_KEEP) -> int:
+    """Bound winner_training.jsonl growth — keep only the last `keep` records.
+
+    Mirrors the decision_outcomes / scorer_skill_log trim idiom exactly: only
+    pay the rewrite when the file is well past the cap (> 2× `keep`), and write
+    a temp file then atomically `.replace` so a process kill mid-truncate can
+    never leave a torn/empty training file. Older rows are already idempotently
+    in articles.db (`_inject_and_train` INSERT OR IGNORE) and `_inject_and_train`
+    only ever reads the last 10k lines, so dropping the prefix is lossless for
+    every consumer.
+
+    Best-effort and never raises (a trim must not break the loop — same
+    discipline as `_append_scorer_skill_log`). The trim runs in the main loop
+    thread; a previous cycle's `_opus_annotate` daemon may still be appending
+    via its own file handle, so the rare rewrite (≈ once per `keep`/cycle-yield
+    cycles) can lose the handful of annotation lines written during the
+    sub-second tmp-write+replace window. That is an acceptable cost for a
+    gitignored, already-DB-deduped training-augmentation file — the same
+    best-effort tradeoff the sibling JSONL trims accept.
+
+    Returns the number of lines dropped (0 if no trim was needed or on fault).
+    """
+    try:
+        if not WINNER_JSONL.exists():
+            return 0
+        with WINNER_JSONL.open("r") as fh:
+            n = sum(1 for ln in fh if ln.strip())
+        if n <= keep * 2:
+            return 0
+        # Stream the tail through a bounded deque so peak memory is capped at
+        # `keep` lines, not the whole (hundreds-of-MB) file.
+        from collections import deque
+        with WINNER_JSONL.open("r") as fh:
+            kept = list(deque((ln for ln in fh if ln.strip()), maxlen=keep))
+        tmp = WINNER_JSONL.with_suffix(".jsonl.tmp")
+        tmp.write_text("\n".join(ln.rstrip("\n") for ln in kept) + "\n")
+        tmp.replace(WINNER_JSONL)
+        dropped = n - len(kept)
+        print(f"[continuous] trimmed winner_training.jsonl {n} → {len(kept)} "
+              f"lines (dropped {dropped})")
+        return dropped
+    except Exception as e:
+        print(f"[continuous] winner_training trim failed: {e}")
+        return 0
 
 
 def _compute_decision_outcomes(engine: "BacktestEngine",
@@ -557,6 +626,153 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
     return (f"scorer {result['status']} train_n={result['n']} "
             f"val_rmse={val_s} oos_n={len(oos_records)} oos_rmse={oos_rmse_s} "
             f"oos_diracc={oos_diracc_s} oos_ic={oos_ic_s}")
+
+
+def _parse_scorer_status(status: str) -> dict:
+    """Parse the formatted string `_train_decision_scorer` returns into a
+    structured dict for the skill ledger.
+
+    The status string is a stable, test-locked contract
+    (`tests/test_continuous.py::TestTrainDecisionScorer` asserts the exact
+    `scorer ok`/`train_n=`/`oos_rmse=` tokens), so parsing it is robust and
+    avoids changing `_train_decision_scorer`'s return type (which `main()`
+    prints verbatim and existing tests assert on as a string).
+
+    Numeric tokens are captured up to the next whitespace, then float-parsed:
+    a real metric (`12.45`, `+0.03`, `-0.12`) parses; every "n/a" form —
+    including the `oos_rmse=n/a (oos-eval err: KeyError)` parenthetical the
+    error path emits — has `n/a` as its first token, fails the float parse,
+    and degrades to `None`. Never raises: a parse fault yields a row with
+    `status="unparseable"` and `None` metrics rather than killing the loop.
+
+    Returns ``{status, train_n, val_rmse, oos_n, oos_rmse, oos_dir_acc,
+    oos_ic}`` — ints for the two counts, floats or None for the four metrics.
+    """
+    out: dict = {
+        "status": "unparseable", "train_n": None, "val_rmse": None,
+        "oos_n": None, "oos_rmse": None, "oos_dir_acc": None, "oos_ic": None,
+    }
+    try:
+        s = str(status or "").strip()
+        if not s:
+            return out
+        # `no outcome records` is the only non-`scorer …` sentinel
+        # `_train_decision_scorer` returns; normalise it explicitly.
+        if s.startswith("no outcome records"):
+            out["status"] = "no_outcome_records"
+            return out
+        m = re.match(r"scorer\s+([A-Za-z_]+)", s)
+        out["status"] = m.group(1) if m else "unknown"
+
+        def _num(key: str):
+            mm = re.search(rf"(?:^|\s){re.escape(key)}=(\S+)", s)
+            if not mm:
+                return None
+            try:
+                return float(mm.group(1))
+            except (TypeError, ValueError):
+                return None
+
+        tn = _num("train_n")
+        on = _num("oos_n")
+        out["train_n"] = int(tn) if tn is not None else None
+        out["oos_n"] = int(on) if on is not None else None
+        out["val_rmse"] = _num("val_rmse")
+        out["oos_rmse"] = _num("oos_rmse")
+        out["oos_dir_acc"] = _num("oos_diracc")
+        out["oos_ic"] = _num("oos_ic")
+    except Exception:
+        return {
+            "status": "unparseable", "train_n": None, "val_rmse": None,
+            "oos_n": None, "oos_rmse": None, "oos_dir_acc": None,
+            "oos_ic": None,
+        }
+    return out
+
+
+def _append_scorer_skill_log(status: str, cycle: int,
+                             win_start: date, win_end: date,
+                             n_train_hint: int | None = None) -> bool:
+    """Append one structured row to the per-cycle scorer-skill ledger.
+
+    Best-effort and idempotent-safe: every fault is swallowed (a ledger
+    write must NEVER break the continuous loop — same discipline as
+    `_post_discord` / the validation persister). Bounded growth: when the
+    file exceeds 2× `SCORER_SKILL_LOG_KEEP` it is atomically rewritten to the
+    last `SCORER_SKILL_LOG_KEEP` rows (the decision_outcomes trim idiom — a
+    torn truncate would lose skill history, so write tmp then `.replace`).
+
+    `n_train_hint` lets `main()` pass the deployed pickle's `n_train` (the
+    gate-relevant count, ≥500 ⇒ gate active) when the status string itself
+    omits it (e.g. `no outcome records`); the parsed `train_n` still wins
+    when present.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        parsed = _parse_scorer_status(status)
+        if parsed.get("train_n") is None and n_train_hint is not None:
+            try:
+                parsed["train_n"] = int(n_train_hint)
+            except (TypeError, ValueError):
+                pass
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            # Surfaces the gate state a quant cares about without re-reading
+            # the pickle: the gate engages only at train_n >= 500 (#5).
+            "gate_active": (parsed.get("train_n") is not None
+                            and parsed["train_n"] >= 500),
+            **parsed,
+        }
+        SCORER_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with SCORER_SKILL_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in SCORER_SKILL_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > SCORER_SKILL_LOG_KEEP * 2:
+                kept = lines[-SCORER_SKILL_LOG_KEEP:]
+                tmp = SCORER_SKILL_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(SCORER_SKILL_LOG)
+        except Exception as e:
+            print(f"[continuous] scorer-skill-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] scorer-skill-log append failed: {e}")
+        return False
+
+
+def _deployed_scorer_n_train() -> int | None:
+    """Best-effort read of the *currently deployed* pickle's `n_train`.
+
+    Used as the `n_train_hint` for skill-ledger rows on cycles that did NOT
+    retrain (no outcome records / no winner): the status string carries no
+    `train_n=` token there, but the gate state a quant cares about
+    (`gate_active` ⇔ deployed `n_train >= 500`, invariant #5) is still
+    knowable from the on-disk pickle. Never raises — a fault yields `None`
+    and the ledger row simply records `train_n=None` (the documented
+    acceptable degradation), exactly the discipline `_append_scorer_skill_log`
+    itself follows.
+    """
+    try:
+        from paper_trader.ml.decision_scorer import DecisionScorer
+        ds = DecisionScorer()
+        # An untrained scorer (no pickle on disk yet) reports n_train==0; that
+        # is "no deployed model", not "a model trained on 0 rows". Return None
+        # so the ledger row records train_n=None / gate_active=False honestly
+        # rather than a misleading concrete 0.
+        if not ds.is_trained:
+            return None
+        n = ds.n_train
+        return int(n) if n is not None else None
+    except Exception:
+        return None
 
 
 def _parse_published_date(published) -> date | None:
@@ -1241,6 +1457,10 @@ def main() -> None:
 
         winner = None
         top_runs: list[BacktestRun] = []
+        # Set only when the scorer is actually retrained this cycle; left None
+        # otherwise so exactly one skill-ledger row is written per cycle below
+        # (real status when trained, "no outcome records" sentinel when not).
+        scorer_status: str | None = None
         if results:
             sorted_results = sorted(results, key=lambda r: r.total_return_pct, reverse=True)
             # Only include runs that beat a flat 0% return (filter out pure losers)
@@ -1337,8 +1557,33 @@ def main() -> None:
                 daemon=True, name=f"opus-annotate-{cycle}"
             ).start()
 
+        # Durable per-cycle scorer-skill ledger. `_train_decision_scorer`
+        # already computes val_rmse / oos_rmse / oos_diracc / oos_ic every
+        # cycle but only *printed* them to continuous.log (ephemeral, rotated,
+        # un-trendable). Append exactly one structured JSONL row per cycle so a
+        # skeptical quant can trend whether OOS skill is improving, holding at
+        # the documented negative-skill plateau, or degrading. When the scorer
+        # was NOT retrained this cycle (no results / no outcome records),
+        # `scorer_status` is None — record the "no outcome records" sentinel
+        # with a deployed-pickle `n_train` hint so the row's `gate_active`
+        # (invariant #5) stays truthful even on a non-training cycle.
+        # `_append_scorer_skill_log` is best-effort by construction — a ledger
+        # write must never break the loop.
+        if scorer_status is not None:
+            _append_scorer_skill_log(scorer_status, cycle, win_start, win_end)
+        else:
+            _append_scorer_skill_log(
+                "no outcome records", cycle, win_start, win_end,
+                n_train_hint=_deployed_scorer_n_train(),
+            )
+
         ml_status = _try_train_ml() if winner else "no winner"
         print(f"[continuous] ml: {ml_status}")
+
+        # Bound winner_training.jsonl disk growth. Runs AFTER `_try_train_ml`
+        # (which has finished reading the tail it needs) and after this cycle's
+        # `_append_top_decisions`, so the trim never races the consumer.
+        _trim_winner_jsonl()
 
         # Backtest results are silent — check the dashboard at :8090
 
