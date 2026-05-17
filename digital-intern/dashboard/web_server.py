@@ -87,12 +87,37 @@ def _briefings_from_log(limit: int = 10) -> list[dict]:
     return out
 
 
-def _articles_from_db(limit: int = 50, min_score: float = 0.0) -> list[dict]:
-    store = _store_handle()
-    if store is None:
-        return []
+def _ro_query(sql: str, params: tuple = ()) -> list[tuple]:
+    """Run a read-only query on a dedicated short-lived sqlite connection.
+
+    The dashboard runs threaded (``run_server`` → ``app.run(threaded=True)``)
+    but the daemon's ``ArticleStore.conn`` is a *single* ``sqlite3.Connection``
+    shared across ~30 writer threads (``check_same_thread=False``). sqlite3
+    connections are not safe for concurrent use: a dashboard read racing a
+    writer's implicit ``conn.execute("SELECT changes()")`` inside
+    ``insert_batch`` returned a wrong-shaped 1-tuple where the 9-column row
+    was expected, crashing ``/api/articles`` with ``IndexError`` (observed
+    10× in production; ``IndexError`` is not a ``sqlite3.Error`` so the
+    caller's ``except`` did not absorb it and the request 500'd).
+
+    A separate ``mode=ro`` connection does lock-free WAL reads fully isolated
+    from the writer connection's cursor state. One connection per call is
+    inherently thread-safe and sub-millisecond to open; it also never
+    competes for the daemon's write lock, so the dashboard cannot add to the
+    documented USB write-contention pressure."""
+    from storage.article_store import _get_db_path
+
+    db = _get_db_path()
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=15)
     try:
-        rows = store.conn.execute(
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+
+def _articles_from_db(limit: int = 50, min_score: float = 0.0) -> list[dict]:
+    try:
+        rows = _ro_query(
             "SELECT id, url, title, source, published, kw_score, ai_score, urgency, first_seen "
             "FROM articles "
             "WHERE (CASE WHEN ai_score>kw_score THEN ai_score ELSE kw_score END) >= ? "
@@ -101,7 +126,7 @@ def _articles_from_db(limit: int = 50, min_score: float = 0.0) -> list[dict]:
             "AND source NOT LIKE 'opus_annotation%' "
             "ORDER BY ai_score DESC, kw_score DESC, first_seen DESC LIMIT ?",
             (min_score, max(1, min(500, int(limit)))),
-        ).fetchall()
+        )
     except sqlite3.Error:
         return []
     out = []
