@@ -1435,6 +1435,24 @@ def main() -> None:
             # Pre-warmer is best-effort — failure must not stop a cycle.
             print(f"[continuous] prewarm dispatch failed: {e}")
 
+        # Reap orphaned 'running' rows every cycle, not only at startup. A run
+        # thread hard-killed mid-cycle (OOM / SIGKILL) never reaches
+        # finalize_run OR run_all's caught-exception 'failed' marker, so its
+        # row stays 'running' forever — observed live: 15 rows stuck 'running'
+        # for 35h while ~170 newer runs completed (the exact "dashboard shows
+        # running forever" symptom, CLAUDE.md §11). The startup-only reap never
+        # fires for a long-lived loop. `_reap_orphaned_runs` is idempotent,
+        # best-effort, and 6h-age-guarded — no real run exceeds minutes even on
+        # a 10-yr window, so this can never touch a live run from the current
+        # or previous cycle (both << 6h old). Cheap (one short-lived UPDATE).
+        try:
+            mid_reaped = _reap_orphaned_runs()
+            if mid_reaped:
+                print(f"[continuous] mid-loop reaped {mid_reaped} orphaned "
+                      f"'running' run(s) → failed")
+        except Exception as e:
+            print(f"[continuous] mid-loop reap failed: {e}")
+
         start_id = _next_run_id(engine)
         t0 = time.time()
         print(f"[continuous] cycle {cycle} runs {start_id}..{start_id + RUNS_PER_CYCLE - 1}")

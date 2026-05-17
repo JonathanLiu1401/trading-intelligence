@@ -2387,8 +2387,32 @@ class BacktestEngine:
             })
 
         spy_return = self.prices.returns_pct("SPY", self.prices.trading_days[0], final_day)
+        # Benchmark-honesty guard. When yfinance fails to return SPY for a
+        # window the cache persists an EMPTY SPY series (observed live: 80 of
+        # 485 complete runs / 16 windows, e.g. prices_2021-08-02_2025-08-01.json
+        # had SPY_rows={} while 116 other tickers loaded). `_build_trading_days`
+        # silently falls back to another ticker's calendar so the run still
+        # completes, but `returns_pct("SPY", …)` then returns 0.0 — so
+        # `vs_spy_pct` (the documented skill metric, and the live trader's
+        # `_ml_is_qualified` median-alpha gate input) becomes a fabricated
+        # `total_return - 0` with NO real benchmark. The NOT NULL DEFAULT 0
+        # schema (invariant #13) makes a true NULL impossible without an
+        # ALTER, so flag it honestly in the additive nullable `notes` column
+        # instead: purely informational, zero behaviour change to returns /
+        # winner selection / the gate, but a reading quant (and the dashboard)
+        # can now SEE that this run's alpha is not benchmarked.
+        benchmark_note = ""
+        if not (self.prices.prices.get("SPY") or {}):
+            benchmark_note = (
+                "benchmark_unavailable: SPY price series empty for this window "
+                "(yfinance fetch failed); spy_return_pct/vs_spy_pct are NOT a "
+                "valid SPY benchmark — equals raw return, do not read as alpha"
+            )
+            print(f"[run {run_id}] WARNING: SPY series empty for "
+                  f"{self.start}→{self.end} — vs_spy_pct is not a real benchmark")
         self.store.finalize_run(run_id, final_value, spy_return, n_trades,
-                                n_decisions, equity_curve, status="complete")
+                                n_decisions, equity_curve, status="complete",
+                                notes=benchmark_note)
 
         ret_pct = (final_value - INITIAL_CASH) / INITIAL_CASH * 100
         print(f"[run {run_id}] DONE  final=${final_value:.2f}  return={ret_pct:+.2f}%  "

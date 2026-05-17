@@ -156,6 +156,53 @@ class TestBacktestRunOne:
         assert result.end_date == prices.trading_days[-1].isoformat()
 
 
+class TestBenchmarkUnavailableNote:
+    """Live finding: yfinance intermittently fails to return SPY for a
+    window; the cache then persists an EMPTY SPY series, the run still
+    completes off another ticker's calendar, and `returns_pct('SPY',…)`
+    silently returns 0.0 — so `vs_spy_pct` becomes a fabricated `total-0`
+    with no real benchmark (80/485 complete runs live). run_one must flag
+    this honestly in the nullable `notes` column (no behaviour change to
+    returns / winner selection / the live gate)."""
+
+    def _drive(self, engine):
+        def fake_signals(d, seed, rng, portfolio=None):
+            return [{"title": f"n {d}", "url": "", "score": 1.0,
+                     "tickers": ["NVDA"]}]
+
+        def fake_ml_decide(sim_date, portfolio, articles, prices_, run_id,
+                            rng, exclude_tickers=None):
+            return {"action": "HOLD", "ticker": "", "qty": 0,
+                    "reasoning": "hold"}
+
+        with patch.object(engine, "_fetch_signals", side_effect=fake_signals), \
+             patch.object(bt, "_ml_decide", side_effect=fake_ml_decide):
+            return engine.run_one(run_id=1, seed=1)
+
+    def test_empty_spy_series_is_flagged_in_notes(self, tmp_path):
+        prices = _build_synthetic_prices(rise_pct=50.0, days=21)
+        prices.prices["SPY"] = {}            # simulate the failed SPY fetch
+        engine = _make_engine(prices, tmp_path)
+        result = self._drive(engine)
+        # The run still completes (trading_days came from the seq, NVDA has data)
+        assert result.status == "complete"
+        # spy_return is the silent 0.0; the note makes that explicit.
+        detail = engine.store.run_detail(1)
+        assert detail is not None
+        assert "benchmark_unavailable" in (detail["notes"] or "")
+        assert detail["spy_return_pct"] == pytest.approx(0.0)
+
+    def test_populated_spy_leaves_notes_empty(self, tmp_path):
+        prices = _build_synthetic_prices(rise_pct=50.0, days=21)
+        engine = _make_engine(prices, tmp_path)
+        self._drive(engine)
+        detail = engine.store.run_detail(1)
+        assert detail is not None
+        # SPY rose 50% over the window → a real, non-fabricated benchmark.
+        assert (detail["notes"] or "") == ""
+        assert detail["spy_return_pct"] == pytest.approx(50.0, abs=1.0)
+
+
 # ─────────────────── Test B: DecisionScorer train/predict cycle ─────────────
 
 
