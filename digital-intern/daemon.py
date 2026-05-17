@@ -27,6 +27,7 @@ Workers (intervals below track the *_INTERVAL constants in the Config block):
 import json
 import logging
 import os
+import re
 import sys
 import time
 import signal
@@ -1475,6 +1476,12 @@ def heartbeat_worker(store: ArticleStore):
                     continue
 
                 health_line = _build_health_line(store)
+                # Book-coverage map of THIS digest's articles (source_articles
+                # is the pre-snapshot real-article list). Discord-only, like
+                # health_line / banner — never folded into the saved
+                # `briefing` text, so it can't reach the trainer's
+                # title-prefix label scan.
+                coverage_line = _format_portfolio_coverage(source_articles)
                 # Coverage-gap banner is Discord-only — NOT folded into the
                 # saved `briefing` text, so it can't reach the trainer's
                 # title-prefix label scan (same discipline as health_line).
@@ -1482,6 +1489,7 @@ def heartbeat_worker(store: ArticleStore):
                 message = (
                     (banner + "\n\n" if banner else "")
                     + briefing.rstrip() + "\n\n" + health_line
+                    + ("\n" + coverage_line if coverage_line else "")
                 )
                 if banner:
                     log.warning(
@@ -1718,6 +1726,79 @@ def _format_source_health_summary(
     line = f"⚠ Sources down ({total}): {label}"
     if len(line) > max_chars:
         line = line[: max_chars - 1].rstrip(", ") + "…"
+    return line
+
+
+_COVERAGE_TICKER_CACHE: dict[tuple[str, ...], "re.Pattern"] = {}
+
+
+def _format_portfolio_coverage(
+    articles, tickers=PORTFOLIO_TICKERS, max_chars: int = 150
+) -> str:
+    """One-line book-coverage map of the 5h digest for the analyst.
+
+    The Opus briefing prose never states which of the operator's *positions*
+    the digest actually touches. A 5h window with zero mentions of a held
+    name (AXTI/QBTS/SNDU are thin-coverage) is a silent blind spot — the
+    analyst cannot tell "nothing happened" from "the pipeline missed it" and
+    has money at risk either way. This converts that into one explicit signal.
+
+    Pure + deterministic for unit testing (mirrors
+    ``_format_source_health_summary``). Matching reuses the established
+    case-sensitive word-boundary convention from ``ml.features._LIVE_RE``
+    (financial copy writes tickers uppercase; ``\\bMU\\b`` won't match inside
+    "MUSEUM" and "MUU" stays distinct from "MU"). ``covered`` preserves the
+    ``tickers`` order so the line is stable cycle-to-cycle; the ``silent``
+    tail is truncated with a ``+N`` overflow marker under a hard
+    ``max_chars`` cap. Returns "" only when there are no articles to assess
+    (degrade clean, same as the other briefing-augmentation helpers).
+
+    Discord-only — the caller appends it to the posted message, NEVER folds
+    it into the saved ``briefing`` text, so it cannot reach the trainer's
+    title-prefix label scan (same discipline as the source-health line and
+    the coverage-gap banner). Read-only: touches no articles row, no
+    ai_score/ml_score/score_source — all four load-bearing invariants intact.
+    """
+    tickers = tuple(tickers)
+    if not articles or not tickers:
+        return ""
+    pat = _COVERAGE_TICKER_CACHE.get(tickers)
+    if pat is None:
+        # Longest-first so the alternation prefers \bMUU\b over \bMU\b.
+        alts = sorted({t for t in tickers if t}, key=len, reverse=True)
+        pat = re.compile(r"\b(?:" + "|".join(re.escape(t) for t in alts) + r")\b")
+        _COVERAGE_TICKER_CACHE[tickers] = pat
+    seen: set[str] = set()
+    for a in articles:
+        blob = f"{a.get('title') or ''} {a.get('summary') or ''}"
+        if not blob.strip():
+            continue
+        for m in pat.findall(blob):
+            seen.add(m)
+    n = len(tickers)
+    covered = [t for t in tickers if t in seen]   # stable: tickers order
+    silent = [t for t in tickers if t not in seen]
+    head = "·".join(covered) if covered else "none"
+    line = f"📊 Book in digest: {head} ({len(covered)}/{n})"
+    if silent:
+        line += " — silent: " + " ".join(silent)
+    if len(line) > max_chars:
+        # Trim the silent tail token-wise, leaving a +N overflow marker.
+        if " — silent: " in line:
+            prefix, tail = line.split(" — silent: ", 1)
+            toks = tail.split(" ")
+            kept: list[str] = []
+            for tok in toks:
+                trial = prefix + " — silent: " + " ".join(kept + [tok])
+                if len(trial) + 4 > max_chars:
+                    break
+                kept.append(tok)
+            overflow = len(silent) - len(kept)
+            line = prefix + " — silent: " + " ".join(kept)
+            if overflow > 0:
+                line += f" +{overflow}"
+        else:
+            line = line[: max_chars - 1].rstrip() + "…"
     return line
 
 
