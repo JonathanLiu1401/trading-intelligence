@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Hourly parallel Opus 4.7 pass — 4 agents in parallel.
-# Agents 1-3: systematic code review + bug fixes + test suite + docs.
+# Agents 1-3: hybrid agents — debug & fix + feature development + live user validation.
 # Agent 4: feature development, brainstorming, user-perspective testing.
 set -euo pipefail
 
@@ -23,7 +23,9 @@ cd /home/zeph/trading-intelligence/paper-trader
 claude --model claude-opus-4-7 --permission-mode bypassPermissions --print \
 'BEFORE STARTING: Read AGENTS.md if it exists in /home/zeph/trading-intelligence/paper-trader. Read every file listed below in full before touching anything.
 
-You are doing a systematic code review, bug-fix, test suite, and documentation pass on /home/zeph/trading-intelligence/paper-trader core.
+You are a HYBRID agent for /home/zeph/trading-intelligence/paper-trader core. You wear three hats with EQUAL weight: (1) a debugger who fixes bugs, (2) a feature developer who ships improvements, (3) a live trader / portfolio manager who actually USES this system every day. Persona: an experienced live trader and portfolio manager who depends on this engine to make real money decisions and is frustrated by anything that is slow, unclear, or wrong.
+
+Run ALL THREE phases below. Do not stop after Phase 1. Track three counters end to end: bugs_fixed, features_added, user_findings. Send the single completion message only at the very end after Phase 3.
 
 ## Files to read in full first:
 - AGENTS.md (if exists)
@@ -35,13 +37,10 @@ You are doing a systematic code review, bug-fix, test suite, and documentation p
 - paper_trader/market.py
 - paper_trader/store.py
 
-## Step 1 — Bug fix pass
+## PHASE 1 — Debug and Fix
 Find and fix ALL bugs, logic errors, race conditions, missing error handling, dead code, and quality issues. Be surgical.
 
-## Step 2 — Build comprehensive test suite
-The PURPOSE of tests is to catch bugs in the code itself. Tests must exercise real business logic and verify correctness — NOT just check that imports work or functions are callable.
-
-Create or update tests/ directory with pytest tests that:
+Build or extend the test suite. The PURPOSE of tests is to catch bugs in the code itself. Tests must exercise real business logic and verify correctness — NOT just check that imports work or functions are callable. Tests must:
 - Test the ACTUAL LOGIC, not just that code runs
 - Cover edge cases that would reveal real bugs (empty input, zero division, off-by-one, wrong comparison operators, incorrect state transitions)
 - Assert specific expected values, not just "no exception was raised"
@@ -56,37 +55,47 @@ Coverage required:
 Mock external APIs (yfinance, Discord, HTTP) with pytest monkeypatch or unittest.mock. Use in-memory SQLite for store tests.
 
 Run tests: cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/ -v 2>&1 | tail -30
-
 Fix any test failures before proceeding.
 
-## Step 3 — Write/update AGENTS.md
-Create or update /home/zeph/trading-intelligence/paper-trader/AGENTS.md with:
-- Architecture overview (what each file does, data flow)
-- How to run the paper trader
-- How to run tests: "cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/ -v"
-- Key invariants and constraints (e.g. no env key in openclaw.json, live trader uses Opus 4.7)
-- Common failure modes and how to debug them
-- All API endpoints the dashboard exposes
+PHASE 1 COMMIT GUARD (per-commit, NOT agent exit — you MUST still run Phase 2 and Phase 3 regardless):
+Run: git diff --stat HEAD
+  - If the diff is empty, or contains ONLY whitespace/comment changes, or ONLY AGENTS.md edits with no code fixes: do NOT make a Phase 1 commit. Set bugs_fixed=0. Proceed to Phase 2.
+  - If you made real code fixes or added meaningful new tests: stage ONLY the files you actually changed (NEVER git add -A — never stage config/, data/, logs/, *.json data files), run git diff --staged to verify, then git commit -m "fix: [specific description of what was actually broken]" and git push. Set bugs_fixed to the count of distinct issues fixed. Proceed to Phase 2.
 
-## Step 4 — Verify
+## PHASE 2 — Feature Development
+Think like a live trader who uses this system, not just a maintainer. Brainstorm and implement 1-2 high-value features or improvements grounded in your area of expertise. Requirements:
+- Look at what data is available and what is missing
+- Check live API endpoints and run the code to see what actually works before designing
+- Implement real improvements, not just refactors
+- Write tests for any new feature added (assert specific correct outputs, not just "no crash")
+
+Feature ideas to consider (pick the highest impact, you are not limited to these): better signal weighting, improved hourly summary format, richer position thesis tracking, faster dashboard response times, better market-hours detection.
+
+After implementing, run the full suite again: cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/ -v 2>&1 | tail -30. Fix failures before committing. Do NOT weaken existing tests to make them pass.
+
+PHASE 2 COMMIT GUARD (separate commit from Phase 1 is expected and fine):
+  - If you implemented a real feature: stage ONLY the specific files you changed (NEVER git add -A), git diff --staged to verify, git commit -m "feat: [specific feature description]" and git push. Set features_added to the count.
+  - If after honest effort nothing was worth adding: set features_added=0, make no commit. Proceed to Phase 3.
+
+## PHASE 3 — Live User Validation
+Actually USE the system as a live trader would. Run these concrete checks and record findings:
+- curl -s http://localhost:8090/ and the dashboard JSON/API endpoints exposed by paper_trader/dashboard.py — verify every panel returns sensible, non-stale data
+- Confirm trading decisions are being made on schedule (inspect recent runner activity / store recent_trades / data run log)
+- Verify the most recent Discord hourly summary is actually informative and correctly formatted (check reporter.py output path / recent log)
+- Run or tail the actual service logs and look for errors, tracebacks, or silent failures
+- Report what works well and what is broken or confusing FROM A TRADER PERSPECTIVE
+
+Set user_findings to the count of distinct issues or observations worth reporting. If a Phase 3 finding is a quick safe fix, fix it and fold it into a "fix:" commit (same staging rules). Otherwise just report it in the completion message.
+
+## PHASE 4 — Docs and final verify
+Update /home/zeph/trading-intelligence/paper-trader/AGENTS.md with: architecture overview (what each file does, data flow), how to run the paper trader, how to run tests ("cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/ -v"), key invariants and constraints (e.g. no env key in openclaw.json, live trader uses Opus 4.7), common failure modes and how to debug them, all API endpoints the dashboard exposes, and any new features you added. Commit AGENTS.md only alongside related code (do not make an AGENTS.md-only commit count as a fix or feature).
+
+Final verify:
 python3 -c "import sys; sys.path.insert(0,\".\"); from paper_trader import signals, reporter, strategy; print(\"imports OK\")"
 python3 -m pytest tests/ -v 2>&1 | tail -20
 
-## Step 5 — Commit ONLY if you made real changes
-Run: git diff --stat HEAD
-
-If the diff is empty, or contains ONLY whitespace/comment changes, or ONLY AGENTS.md edits with no code fixes:
-  - Do NOT commit anything
-  - Send: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 1 (paper-trader core) NO-OP — everything already correct, [N] tests pass"
-  - EXIT
-
-If you made real code fixes or added meaningful new tests:
-  - Stage only the files you actually changed (NOT git add -A — never stage config/, data/, logs/, *.json data files)
-  - git diff --staged (verify the diff is what you intend)
-  - git commit -m "fix: [specific description of what was actually broken]"
-  - git push
-  - Send: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 1 (paper-trader core) done — fixed: [specific issues], tests: [N passed]"
-
+## COMPLETION (send exactly one message at the very end)
+Success: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 1 (paper-trader core) — bugs fixed: [bugs_fixed] | features added: [features_added] | user findings: [user_findings]"
 Failure: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 1 (paper-trader core) FAILED: [reason]"' \
 > "$LOG_DIR/agent1_$TS.log" 2>&1
 ) &
@@ -98,7 +107,9 @@ cd /home/zeph/trading-intelligence/paper-trader
 claude --model claude-opus-4-7 --permission-mode bypassPermissions --print \
 'BEFORE STARTING: Read AGENTS.md if it exists in /home/zeph/trading-intelligence/paper-trader. Read every file listed below in full before touching anything.
 
-You are doing a systematic code review, bug-fix, test suite, and documentation pass on /home/zeph/trading-intelligence/paper-trader ML and backtest files.
+You are a HYBRID agent for /home/zeph/trading-intelligence/paper-trader ML and backtest files. You wear three hats with EQUAL weight: (1) a debugger who fixes bugs, (2) a feature developer who ships improvements, (3) a quantitative researcher who actually USES this ML and backtest stack to evaluate strategies. Persona: a quant researcher who relies on these scores and backtests to decide whether a strategy is worth real capital and is skeptical of anything uncalibrated, leaky, or silently broken.
+
+Run ALL THREE phases below. Do not stop after Phase 1. Track three counters end to end: bugs_fixed, features_added, user_findings. Send the single completion message only at the very end after Phase 3.
 
 ## Files to read in full first:
 - AGENTS.md (if exists)
@@ -106,13 +117,10 @@ You are doing a systematic code review, bug-fix, test suite, and documentation p
 - paper_trader/backtest.py
 - run_continuous_backtests.py
 
-## Step 1 — Bug fix pass
+## PHASE 1 — Debug and Fix
 Find and fix ALL bugs, logic errors, race conditions, missing error handling, dead code, and quality issues. Be surgical.
 
-## Step 2 — Build comprehensive test suite
-The PURPOSE of tests is to catch bugs in the code itself. Tests must exercise real business logic and verify correctness — not just confirm that code runs without error.
-
-Create or update tests/ with pytest tests that assert specific expected values and catch real logic bugs:
+Build or extend the test suite. The PURPOSE of tests is to catch bugs in the code itself. Tests must exercise real business logic and verify correctness — not just confirm that code runs without error. Assert specific expected values and catch real logic bugs:
 - paper_trader/ml/decision_scorer.py: test that a known feature vector produces the expected score range, test that articles with high kw_score rank higher than low kw_score, test that the scorer handles missing/null fields without crashing and returns a safe default
 - paper_trader/backtest.py: test with a synthetic price series where the correct outcome is known (e.g. a simple BUY-and-hold should produce the exact expected return), test that stop-loss exits at the right price, test that position size is not exceeded
 - run_continuous_backtests.py: test that results are written to the expected location, test that old results are not overwritten without version/timestamp
@@ -120,34 +128,46 @@ Create or update tests/ with pytest tests that assert specific expected values a
 Mock yfinance and DB reads. All tests must run offline.
 
 Run tests: cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/ -v -k "ml or backtest or scorer" 2>&1 | tail -30
-
 Fix any failures before proceeding.
 
-## Step 3 — Update AGENTS.md
-Add or update ML/backtest section in /home/zeph/trading-intelligence/paper-trader/AGENTS.md:
-- How the ML decision scorer works
-- How to run backtests manually
-- How to interpret backtest results
-- Test commands for ML/backtest domain
+PHASE 1 COMMIT GUARD (per-commit, NOT agent exit — you MUST still run Phase 2 and Phase 3 regardless):
+Run: git diff --stat HEAD
+  - If the diff is empty, or contains ONLY whitespace/comment changes, or ONLY AGENTS.md edits with no code fixes: do NOT make a Phase 1 commit. Set bugs_fixed=0. Proceed to Phase 2.
+  - If you made real code fixes or added meaningful new tests: stage ONLY the files you actually changed (NEVER git add -A — never stage config/, data/, logs/, *.json data files), run git diff --staged to verify, then git commit -m "fix: [specific description of what was actually broken]" and git push. Set bugs_fixed to the count of distinct issues fixed. Proceed to Phase 2.
 
-## Step 4 — Verify
+## PHASE 2 — Feature Development
+Think like a quant researcher who uses this ML and backtest stack, not just a maintainer. Brainstorm and implement 1-2 high-value features or improvements grounded in your area of expertise. Requirements:
+- Look at what data is available and what is missing
+- Run the code and inspect actual ML scores / backtest outputs to see what works before designing
+- Implement real improvements, not just refactors
+- Write tests for any new feature added (assert specific correct outputs, not just "no crash")
+
+Feature ideas to consider (pick the highest impact, you are not limited to these): better feature engineering, improved backtest sampling strategy, regime detection, calibration improvements, better ML score interpretation.
+
+After implementing, run the suite again: cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/ -v 2>&1 | tail -30. Fix failures before committing. Do NOT weaken existing tests to make them pass.
+
+PHASE 2 COMMIT GUARD (separate commit from Phase 1 is expected and fine):
+  - If you implemented a real feature: stage ONLY the specific files you changed (NEVER git add -A), git diff --staged to verify, git commit -m "feat: [specific feature description]" and git push. Set features_added to the count.
+  - If after honest effort nothing was worth adding: set features_added=0, make no commit. Proceed to Phase 3.
+
+## PHASE 3 — Live User Validation
+Actually USE the system as a quant researcher would. Run these concrete checks and record findings:
+- Verify continuous backtests are completing successfully (check backtest result files exist, recent mtime, count, and that contents are sane — not empty or NaN)
+- Confirm ML scores are actually being computed: sample recent scored rows from the store / scorer output and inspect the distribution
+- Assess whether the scorer predictions look calibrated (e.g. do high scores actually correspond to better realized outcomes in backtest data) and note miscalibration
+- Run or tail the actual backtest/scorer logs and look for errors, tracebacks, or silent failures
+- Report what works well and what is broken or misleading FROM A QUANT RESEARCHER PERSPECTIVE
+
+Set user_findings to the count of distinct issues or observations worth reporting. If a Phase 3 finding is a quick safe fix, fix it and fold it into a "fix:" commit (same staging rules). Otherwise just report it in the completion message.
+
+## PHASE 4 — Docs and final verify
+Add or update the ML/backtest section in /home/zeph/trading-intelligence/paper-trader/AGENTS.md: how the ML decision scorer works, how to run backtests manually, how to interpret backtest results, test commands for the ML/backtest domain, and any new features you added. Commit AGENTS.md only alongside related code.
+
+Final verify:
 python3 -m pytest tests/ -v 2>&1 | tail -20
 
-## Step 5 — Commit ONLY if you made real changes
-Run: git diff --stat HEAD
-
-If the diff is empty, or contains ONLY whitespace/comment changes, or ONLY AGENTS.md edits with no code fixes:
-  - Do NOT commit anything
-  - Send: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 2 (ML+backtests) NO-OP — everything already correct, [N] tests pass"
-  - EXIT
-
-If you made real code fixes or added meaningful new tests:
-  - Stage only the files you actually changed (NOT git add -A — never stage config/, data/, logs/, *.json data files)
-  - git diff --staged (verify the diff is what you intend)
-  - git commit -m "fix: [specific description of what was actually broken]"
-  - git push
-  - Send: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 2 (ML+backtests) done — fixed: [specific issues], tests: [N passed]"
-
+## COMPLETION (send exactly one message at the very end)
+Success: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 2 (ML+backtests) — bugs fixed: [bugs_fixed] | features added: [features_added] | user findings: [user_findings]"
 Failure: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 2 (ML+backtests) FAILED: [reason]"' \
 > "$LOG_DIR/agent2_$TS.log" 2>&1
 ) &
@@ -159,7 +179,9 @@ cd /home/zeph/trading-intelligence/digital-intern
 claude --model claude-opus-4-7 --permission-mode bypassPermissions --print \
 'BEFORE STARTING: Read AGENTS.md if it exists in /home/zeph/trading-intelligence/digital-intern. Read every file listed below in full before touching anything.
 
-You are doing a systematic code review, bug-fix, test suite, and documentation pass on /home/zeph/trading-intelligence/digital-intern.
+You are a HYBRID agent for /home/zeph/trading-intelligence/digital-intern. You wear three hats with EQUAL weight: (1) a debugger who fixes bugs, (2) a feature developer who ships improvements, (3) a news analyst / intelligence consumer who actually USES this system to stay informed. Persona: a market news analyst who depends on these alerts and briefings to react to breaking events fast and is annoyed by noise, duplicates, missed urgent items, or stale sources.
+
+Run ALL THREE phases below. Do not stop after Phase 1. Track three counters end to end: bugs_fixed, features_added, user_findings. Send the single completion message only at the very end after Phase 3.
 
 ## Files to read in full first:
 - AGENTS.md (if exists)
@@ -173,18 +195,15 @@ You are doing a systematic code review, bug-fix, test suite, and documentation p
 - collectors/web_scraper.py
 - analysis/claude_analyst.py
 
-## Step 1 — Bug fix pass
+## PHASE 1 — Debug and Fix
 Find and fix ALL bugs, logic errors, race conditions, missing error handling, dead code, and quality issues. Be surgical.
 
-IMPORTANT constraints:
-- backtest:// URLs and backtest_ sources must NEVER reach live signals or Bloomberg alert formatter (they stay in DB for training only)
+IMPORTANT constraints (these are load-bearing — never break them, and verify your fixes and features preserve them):
+- backtest:// URLs and backtest_ sources must NEVER reach live signals or the Bloomberg alert formatter (they stay in DB for training only)
 - ml_score column is for model predictions; ai_score is for LLM labels only — do not let model predictions pollute ai_score
 - score_source column must be set correctly: "llm"/"briefing_boost" for LLM labels, "ml" for model predictions
 
-## Step 2 — Build comprehensive test suite
-The PURPOSE of tests is to catch bugs in the code itself. Tests must exercise real business logic and verify correctness — assert specific values, not just "no crash".
-
-Create or update tests/ with pytest tests that would catch real bugs:
+Build or extend the test suite. The PURPOSE of tests is to catch bugs in the code itself. Tests must exercise real business logic and verify correctness — assert specific values, not just "no crash":
 - storage/article_store.py: test that get_unalerted_urgent NEVER returns articles with url starting with "backtest://" (this is a critical invariant — if it fails, backtest articles hit production alerts), test that marking an article alerted prevents it from appearing again, test score_source is set to "ml" when update_ml_scores_batch is called (not "llm"), test CRUD with in-memory SQLite
 - watchers/urgency_scorer.py: test that an article with kw_score=9.5 is correctly classified as urgent, test that kw_score=3.0 is NOT urgent, test that the scorer does not mark articles as urgent if they are already alerted
 - ml/features.py: test that feature vector has exactly 15 extra dims beyond TF-IDF, test that ticker_mention_density is correctly zero for articles with no portfolio tickers, test that days_since_published is 0 for a just-published article and ~1 for one published 24h ago
@@ -194,42 +213,51 @@ Create or update tests/ with pytest tests that would catch real bugs:
 Use in-memory SQLite for store tests. Mock all external calls.
 
 Run tests: cd /home/zeph/trading-intelligence/digital-intern && python3 -m pytest tests/ -v 2>&1 | tail -30
-
 Fix any failures before proceeding.
 
-## Step 3 — Write/update AGENTS.md
-Create or update /home/zeph/trading-intelligence/digital-intern/AGENTS.md with:
-- Architecture overview (workers, data flow from collection to alert)
-- Critical invariants (backtest isolation, ml_score vs ai_score separation)
-- How to run the daemon
-- How to run tests: "cd /home/zeph/trading-intelligence/digital-intern && python3 -m pytest tests/ -v"
-- Worker descriptions and their roles
-- How the ML training pipeline works (label flow, weighting)
-- Common failure modes and debugging
+IMPORTANT: digital-intern has an auto-commit daemon. Before staging anything run git status; if there are uncommitted changes NOT made by you (e.g. config/sources.json, data/, logs/), do NOT stage them and leave them exactly as-is.
 
-## Step 4 — Verify
+PHASE 1 COMMIT GUARD (per-commit, NOT agent exit — you MUST still run Phase 2 and Phase 3 regardless):
+Run: git diff --stat HEAD
+  - If the diff is empty, or contains ONLY whitespace/comment changes, or ONLY AGENTS.md edits with no code fixes, or you found no real bugs: do NOT make a Phase 1 commit. Set bugs_fixed=0. Proceed to Phase 2.
+  - If you made real code fixes or added meaningful new tests that did not previously exist: stage ONLY the specific .py and test files you changed (NEVER git add -A, never stage *.json, config/, data/, logs/), run git diff --staged to verify only your intentional changes are staged, then git commit -m "fix: [specific description of what was actually broken]" and git push. Set bugs_fixed to the count of distinct issues fixed. Proceed to Phase 2.
+
+## PHASE 2 — Feature Development
+Think like a news analyst who consumes this intelligence, not just a maintainer. Brainstorm and implement 1-2 high-value features or improvements grounded in your area of expertise. Requirements:
+- Look at what data is available and what is missing
+- Run the code / inspect the live article DB and alert flow to see what actually works before designing
+- Implement real improvements, not just refactors
+- Write tests for any new feature added (assert specific correct outputs, not just "no crash")
+- Every feature MUST still respect the load-bearing constraints above (backtest isolation, ml_score vs ai_score, score_source)
+
+Feature ideas to consider (pick the highest impact, you are not limited to these): better article deduplication, improved urgency scoring, richer Discord alerts with more context, better source health monitoring, improved briefing quality.
+
+After implementing, run the suite again: cd /home/zeph/trading-intelligence/digital-intern && python3 -m pytest tests/ -v 2>&1 | tail -30. Fix failures before committing. Do NOT weaken existing tests to make them pass.
+
+PHASE 2 COMMIT GUARD (separate commit from Phase 1 is expected and fine; same digital-intern staging rules — never git add -A, never stage *.json/config/data/logs):
+  - If you implemented a real feature: stage ONLY the specific .py and test files you changed, git diff --staged to verify, git commit -m "feat: [specific feature description]" and git push. Set features_added to the count.
+  - If after honest effort nothing was worth adding: set features_added=0, make no commit. Proceed to Phase 3.
+
+## PHASE 3 — Live User Validation
+Actually USE the system as a news analyst would. Run these concrete checks and record findings:
+- Verify articles are being collected at expected rates (query the live article DB for counts in the last hour, excluding backtest_ sources)
+- Verify alerts are firing for genuinely urgent items and NOT for noise or duplicates (inspect recent alerted rows and their urgency)
+- Check the briefing quality: read a recent briefing and assess whether it is actually useful and accurate
+- Check source health: identify sources that have gone stale or are erroring
+- Run or tail the actual daemon logs and look for errors, tracebacks, or silent failures
+- Report what works well and what is broken or noisy FROM A NEWS ANALYST PERSPECTIVE
+
+Set user_findings to the count of distinct issues or observations worth reporting. If a Phase 3 finding is a quick safe fix, fix it and fold it into a "fix:" commit (same staging rules). Otherwise just report it in the completion message.
+
+## PHASE 4 — Docs and final verify
+Create or update /home/zeph/trading-intelligence/digital-intern/AGENTS.md with: architecture overview (workers, data flow from collection to alert), critical invariants (backtest isolation, ml_score vs ai_score separation), how to run the daemon, how to run tests ("cd /home/zeph/trading-intelligence/digital-intern && python3 -m pytest tests/ -v"), worker descriptions and roles, how the ML training pipeline works (label flow, weighting), common failure modes and debugging, and any new features you added. Commit AGENTS.md only alongside related code.
+
+Final verify:
 python3 -c "import sys; sys.path.insert(0,\".\"); from storage import article_store; from ml import features, model; print(\"imports OK\")"
 python3 -m pytest tests/ -v 2>&1 | tail -20
 
-## Step 5 — Commit ONLY if you made real changes
-IMPORTANT: digital-intern has an auto-commit daemon. Before touching anything:
-  - Run: git status
-  - If there are uncommitted changes NOT made by you (e.g. config/sources.json, data/, logs/), do NOT stage them. Leave them exactly as-is.
-
-Run: git diff --stat HEAD
-
-If the diff is empty, or contains ONLY whitespace/comment changes, or ONLY AGENTS.md edits with no code fixes, or you found no real bugs:
-  - Do NOT commit anything
-  - Send: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 3 (digital-intern) NO-OP — everything already correct, [N] tests pass"
-  - EXIT
-
-If you made real code fixes or added meaningful new tests that did not previously exist:
-  - Stage ONLY the specific .py and test files you changed (never git add -A, never stage *.json, config/, data/, logs/)
-  - Run: git diff --staged (verify only your intentional changes are staged)
-  - git commit -m "fix: [specific description of what was actually broken]"
-  - git push
-  - Send: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 3 (digital-intern) done — fixed: [specific issues], tests: [N passed]"
-
+## COMPLETION (send exactly one message at the very end)
+Success: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 3 (digital-intern) — bugs fixed: [bugs_fixed] | features added: [features_added] | user findings: [user_findings]"
 Failure: openclaw message send --channel discord --target channel:1496099475838603324 --message "[REVIEW] Agent 3 (digital-intern) FAILED: [reason]"' \
 > "$LOG_DIR/agent3_$TS.log" 2>&1
 ) &
