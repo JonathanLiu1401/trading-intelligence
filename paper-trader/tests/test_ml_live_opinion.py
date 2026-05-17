@@ -92,6 +92,68 @@ class TestNewsKeyRegression:
         assert op["action"] == "HOLD"
 
 
+class TestPunctuationTokenization:
+    """The 2026-05-17 bug: raw str.split() left punctuation on tokens, so a
+    sentence-final / comma-trailed sentiment word never exact-matched the
+    vocab and the news-sentiment half of the advisory silently zeroed for
+    the majority of real headlines (which almost always end on their catalyst
+    verb). Fixed by tokenizing on [a-z]+ word boundaries (CLAUDE.md §15 —
+    mirror the punctuation-tolerant backtest scorer)."""
+
+    def test_trailing_punctuation_bullish_still_scores(self):
+        # Every bullish word here carries trailing punctuation. Pre-fix:
+        # {"nvda","surges,","hits","record."} → 0 vocab hits → sentiment 0.0
+        # → score 0.0 ≤ threshold → HOLD. Post-fix: surges + record → BUY.
+        articles = [{
+            "id": 10,
+            "title": "NVDA surges, hits record.",
+            "ai_score": 8.0,
+            "urgency": 0,
+            "tickers": ["NVDA"],
+        }]
+        op = strategy._ml_live_opinion(
+            articles, quant_sigs={}, snap=_snap(), watch_px={"NVDA": 900.0},
+        )
+        assert op is not None
+        assert op["action"] == "BUY"
+        assert op["ticker"] == "NVDA"
+
+    def test_trailing_punctuation_bearish_is_respected(self):
+        # Mirror image: punctuation-trailed bearish words must now register a
+        # negative sentiment so the name stays below the buy threshold.
+        articles = [{
+            "id": 11,
+            "title": "AMD plunges! Guidance disappoints, analysts warn.",
+            "ai_score": 8.0,
+            "urgency": 0,
+            "tickers": ["AMD"],
+        }]
+        op = strategy._ml_live_opinion(
+            articles, quant_sigs={}, snap=_snap(), watch_px={"AMD": 150.0},
+        )
+        assert op is not None
+        assert op["action"] == "HOLD"
+
+    def test_exact_match_not_prefix_no_false_positive(self):
+        # The fix tokenizes but keeps EXACT membership (not the backtest's
+        # prefix match), so "mission"/"missionary" must NOT read as the
+        # bearish "miss". A bullish-punctuated NVDA headline with such a word
+        # still nets bullish → BUY (mission did not cancel it as bearish).
+        articles = [{
+            "id": 12,
+            "title": "NVDA surges; mission-critical AI wins, record demand!",
+            "ai_score": 8.0,
+            "urgency": 0,
+            "tickers": ["NVDA"],
+        }]
+        op = strategy._ml_live_opinion(
+            articles, quant_sigs={}, snap=_snap(), watch_px={"NVDA": 900.0},
+        )
+        assert op is not None
+        assert op["action"] == "BUY"
+        assert op["ticker"] == "NVDA"
+
+
 class TestRobustness:
     def test_empty_articles_no_quant_holds_with_regime(self):
         op = strategy._ml_live_opinion(
