@@ -6,7 +6,7 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ## Repository layout (quick reference)
 
-- `paper_trader/runner.py` — live trader main loop. Auto-recovery circuit breaker scoped to its own child claude subprocesses (`pkill -P os.getpid()`, invariant #18). Hourly / daily-close markers are restart-durable via the atomic `data/runner_state.json` sidecar (invariant #6)
+- `paper_trader/runner.py` — live trader main loop. **Single-instance guard** (`_acquire_singleton_lock`, `fcntl.flock` on `data/paper_trader.runner.lock`, invariant #19) refuses to boot a second trader on the same paper book — `main()` exits before the store/dashboard/ONLINE-ping when the lock is held by a live process; fails OPEN (degraded → continue) if the lock plumbing is unusable. Auto-recovery circuit breaker scoped to its own child claude subprocesses (`pkill -P os.getpid()`, invariant #18). Hourly / daily-close markers are restart-durable via the atomic `data/runner_state.json` sidecar (invariant #6)
 - `paper_trader/strategy.py` — live Opus decision engine + watchlist (now injects the behavioural self-review mirror into the prompt). `_portfolio_snapshot` emits `stale_mark` per position and `_build_payload` annotates a `[STALE MARK …]` suffix so a missing-price mark (`current_price==avg_cost`, P/L $0.00) is not read by Opus as a genuine flat position (commit `f834c93`, review pass #4; advisory only, invariants #2/#12)
 - `paper_trader/analytics/self_review.py` — canonical behavioural mirror; composes trade_asymmetry + capital_paralysis + open_attribution, fed into the live prompt **and** served at `/api/self-review`
 - `paper_trader/analytics/risk_mirror.py` — third advisory mirror (after self_review + track_record): composes `build_churn` + `build_correlation` **verbatim** (single source of truth #10) into a compact `prompt_block` on the trader's *structural* risk — how concentrated the book is and how much it churns (the 2026-05-17 live pathology: ~$973 / 16.7% win-rate, 60%+ one-sector, 0.52-day median hold). No price history is fetched on the hot decision path (a per-position yfinance call is a live-cycle latency/flake risk); without it `build_correlation` is `INSUFFICIENT` and its headline is the bare "verdict withheld" sentence, so the mirror surfaces the weight-based concentration (`top_weight_pct`/`weight_hhi`/`effective_positions_naive`, computed from `market_value` unconditionally) and only uses the richer ρ headline when a caller supplies `price_history`. Observational only, never gates (invariants #2/#12 — the self_review precedent); `_safe`-wrapped so a builder fault is "no block this cycle", never "no decision". Wired into `decide()` + `_build_payload(... risk_mirror_block=)` (rendered after the track-record section); applies on next paper-trader restart. Locked by `tests/test_risk_mirror.py`
@@ -94,7 +94,7 @@ review:
 | `test_core_market.py` | weekend / pre-open / after-close / holiday gating, price-cache TTL, option chain lookup, futures 30s bucket lru_cache, **`get_prices` bulk-download seam** (previously **zero** coverage of the actual `yf.download` branch — only empty/full-cache short-circuits were tested): the load-bearing `len(missing)==1` switch between yfinance's flat-columns single-ticker frame (`data["Close"]`) and the multi-ticker per-ticker MultiIndex (`data[t]["Close"]`) with **real `pandas` frames** (a `MagicMock` would pass even if the branches were swapped), all-NaN-Close → per-ticker `get_price` fallback, missing-ticker-column KeyError → per-ticker fallback, whole-`download`-raises → per-ticker fallback, unresolvable → key present/`None` value, partial-cache fetches only the uncached symbol, full-cache never calls `download`; **`get_options_chain` nearest-DTE seam** (zero prior coverage) — picks the expiry with minimum `abs(date−(today+target_dte))` **even when it is not first listed**, `.head(30)` caps each side, no-expiries → `None`, yfinance-raises → `None` |
 | `test_core_signals.py` | top-signal score threshold + sort order, backtest-row filter, urgent ai_score=NULL coercion, ticker regex word-boundary, **single-ticker `get_ticker_sentiment` seam** (a DISTINCT path from the covered bulk `ticker_sentiments` — its own compiled `(?:\$|\b)TKR\b` regex + avg/max/n/urgent aggregation, **zero** prior coverage): no-DB → zeroed dict (never raises), exact `avg_score`/`max_score`/`n`, `urgent` counts only `urgency≥1`, unmentioned ticker → zeroed dict, **"AMDOCS" must not match "AMD"** (the substring-leak regression the bulk path also locks via "MUSE"≠"MU"), `$AMD`-in-body matches, live-only clause excludes `backtest://`/`backtest_*` rows; **`get_ml_predictions` seam** (zero prior coverage; `ml.inference` faked via `sys.modules`, fully offline): import-fail → `[]`, explicit empty input short-circuits before scoring, `None` → `get_top_signals(30,h=6,min=0)` default (sentinel-identity asserted) → empty default → `[]`, `score_articles` raising → `[]`, the `zip(articles, scores)` body **truncates to the shorter** (2 articles + 1 score → 1 row), absent `tickers` key → `[]`, exact field mapping; **`get_historical_signals` gzip-fallback reader** (missing-file → `[]`; strict `< min_score` threshold incl. the `== min_score` KEPT boundary; `score`/`ai_score` `or`-fallback incl. `score:0` → ai_score; `limit` caps the moment `len(out) ≥ limit`; corrupt-JSON / non-numeric-score / blank lines skipped while reading **continues** — a `<`→`<=` or `continue`→`break` regression fails loudly); **freshness-aware `_db_path()` resolver (invariant #15)** — `TestChoosePure` (tie→LOCAL, fresher-local/fresher-usb wins, single-candidate, both-unreadable→LOCAL-first, neither→LOCAL — 6227cd5 LOCAL-first flip), `TestDbPathFreshness` (stale-USB loses to fresh-LOCAL **and** a newer `backtest://` row on USB is excluded from the freshness probe, both-fresh→USB, USB-only, LOCAL-only, candidate-keyed TTL cache), `TestAgeHours` (offset/`Z`/naive/garbage), `TestFeedStatusAndWarn` (split-brain restart signal, all-stale≠split-brain, one-shot WARN dedup), `TestCheckFreshnessCLI` (exit 3/2/0) |
 | `test_core_strategy.py` | JSON parse w/ fences + trailing prose, RSI/EMA/MACD math, SELL-exceeds-held blocking, BUY insufficient cash blocking, **ambiguous option close blocking**, **expired-option settlement** (`_option_expired` boundary incl. expiry-day-still-live; `_expired_intrinsic` ITM/OTM/no-underlying; `_portfolio_snapshot` marks expired contracts to intrinsic/0 not premium; live-option transient-None still → avg_cost; `SELL_CALL` on a dead contract settles at intrinsic; **`_portfolio_snapshot` total_value = cash + Σ position market_value across a mixed stock+option book**), **`_stdev_live` population-stdev seam** (`n < 2` → exact `0.0` the `if sd20 > 0` caller-guard relies on; `n=2` computes ÷n not ÷(n-1); constant series → `0.0` via the full variance path; textbook set → exact `2.0` locking `/n` against a `/(n-1)` regression that would silently shift every `bb_position`), **`_format_quant_signals` prompt-block seam** (empty dict → the `(no quant signals available)` sentinel; `_pct` vs `_v` field coercion — momentum/52w use `_pct` "{x}%"/"?", rsi/macd/etc use `_v` no-%; rows `sorted` by ticker so a `.items()` regression can't reorder the prompt non-deterministically) |
-| `test_core_runner.py` | `_maybe_daily_close` weekend/time gating + once-per-day flag + retry-on-failure, `_maybe_hourly` 3600s gating + retry-on-failure; **`TestKillStaleClaude`** circuit-breaker pkill is `-P os.getpid()`-scoped (host-wide-broadcast regression lock, invariant #18) **and** still model-anchors Opus+Sonnet; **`TestRunnerStatePersistence`** restart-durable markers (invariant #6) — sidecar IO contract + the no-double-close / no-starved-hourly exact-behaviour locks |
+| `test_core_runner.py` | `_maybe_daily_close` weekend/time gating + once-per-day flag + retry-on-failure, `_maybe_hourly` 3600s gating + retry-on-failure; **`TestKillStaleClaude`** circuit-breaker pkill is `-P os.getpid()`-scoped (host-wide-broadcast regression lock, invariant #18) **and** still model-anchors Opus+Sonnet; **`TestRunnerStatePersistence`** restart-durable markers (invariant #6) — sidecar IO contract + the no-double-close / no-starved-hourly exact-behaviour locks; **`TestSingletonLock`** single-instance guard (invariant #19) — real `fcntl.flock` acquire/busy/release-on-death/degraded-open + the `main()` busy⇒`SystemExit(1)`-before-`get_store` / degraded⇒continue wiring locks |
 | `test_core_runner_cycle.py` | **`_cycle()` report-dispatch fan-out** — previously **zero** direct coverage despite real branching: FILLED gates BOTH trade-alert AND decision-log; HOLD/NO_DECISION/BLOCKED/missing-`status` stay silent **and never query the store** (outer-guard short-circuit asserted via a recording `_FakeStore`); `auto_exits` is an orthogonal `_send` channel independent of the FILLED gate (dead-today-on-purpose per invariant #12 — locked so re-enabling is deliberate, kept per the "do not delete as unreachable" note); the `if trades and status==FILLED` guard (empty `recent_trades(1)` → no alert but decision-log still fires); every reporter fault swallowed (daemon-loop survival, via `monkeypatch` so `boom` can't leak into other modules' reporter import) |
 | `test_core_reporter.py` | openclaw missing → False, timeout/nonzero exit → False, trade alert + decision log + portfolio line formatting, **daily-close P/L baseline label tracks `_INITIAL_EQUITY` not a hardcoded `$1000`**, **`send_daily_close` `pnl_real` cash-flow sign (SELL\* credits / BUY\* debits) incl. the option ×100 multiplier via `store.record_trade`** (exact `$-400.00` on a mixed stock+option same-day ledger — a sign flip → `+400.00`, a dropped ×100 → `-449.50`), **`_behavioural_block` composes the scorecard state/headline/focus/concordance verbatim** (no re-derived verdict), suppresses NO_DATA, **returns `""` (never raises) when the builder faults — and `send_hourly_summary`/`send_daily_close` still send the summary regardless** (the "no block, never no summary" failure contract) |
 | `test_round_trips.py` | `build_round_trips` arithmetic: simple/partial/re-entry round-trips, option ×100, distinct (ticker,type,strike,expiry) keys, open-lot exclusion, orphan SELL, zero-cost `pnl_pct=None`, negative/unparseable `hold_days`, sub-cent rounding |
@@ -433,6 +433,42 @@ review:
    bug, corrected not weakened, the invariant-#16 precedent;
    pattern-anchoring Opus+Sonnet assertions kept verbatim).
 
+19. **One runner per paper book — the single-instance guard.** Two
+   concurrent `runner.py` processes on the same `paper_trader.db` is a
+   real, *observed* live pathology (2026-05-17: an orphaned manual launch
+   under PID 1 **and** the systemd-managed instance both cycling, so a
+   trader saw 2–3 decisions clustered inside a minute then an hour of
+   nothing — double-trades, doubled concurrent-`claude` RAM, a raced
+   decision/equity log). Nothing in `runner.py` prevented it
+   (digital-intern's daemon has a singleton lock; this was the missing
+   twin). `main()` now calls `_acquire_singleton_lock()` **first** —
+   before `get_store()`, the dashboard thread, or the ONLINE ping — an
+   `fcntl.flock(LOCK_EX|LOCK_NB)` advisory lock on
+   `data/paper_trader.runner.lock`. `flock` is the robust primitive: the
+   **kernel releases it when the holder dies** (crash / SIGKILL / normal
+   exit), so a restart never trips over a stale PID file — the exact
+   failure a naive pid-file guard introduces. The locked fd is retained
+   in the module global `_SINGLETON_LOCK_FH` for process life (closing it
+   frees the lock). Three outcomes: `acquired` (hold it, write our PID
+   into the file for `cat`-ability), `busy` (another **live** process
+   holds it → log the holder PID and `sys.exit(1)` — the *only*
+   fail-closed path; a second trader must not even mark-to-market the
+   shared book), `degraded` (no `fcntl` / unwritable dir / USB unmounted →
+   **continue WITHOUT the guard** and warn — never take down the *sole*
+   runner over lock plumbing, the `_save_runner_state` best-effort
+   philosophy). **This is a safety guard, not a risk limit** — it gates
+   *process startup*, not trading decisions; invariants #2/#12 untouched
+   (same reasoning as #13/#15). Like every recent feature it **applies on
+   the next paper-trader restart** — it does NOT kill an already-running
+   duplicate (an operator must stop the orphan; the guard prevents
+   *recurrence*). Locked by `tests/test_core_runner.py::TestSingletonLock`
+   (real `fcntl.flock` on a tmp lockfile — a second `open()`+`flock` in
+   the same process contends exactly as a second process would: first
+   acquire writes the PID; second is `busy` with the holder PID;
+   close→reacquire proves no stale-lock-blocks-restart; a file-as-parent
+   path degrades open-not-closed; and the two `main()` wiring locks —
+   `busy`⇒`SystemExit(1)` *before* `get_store`, `degraded`⇒continues).
+
 ### Dashboard API endpoints (port 8090)
 
 All endpoints serve `application/json`. CORS is wide open (`*`) so the
@@ -505,6 +541,9 @@ Digital Intern dashboard on `:8080` can cross-fetch.
 | Equity / P/L looks too high and won't come down; an option position never closes | Pre-fix `_portfolio_snapshot` marked an expired contract at avg_cost forever (no live chain past expiry). Fixed — see invariant #13. If you see this on an old `:8090` process, check `/api/build-info` `stale` and restart | `strategy._option_expired` / `_expired_intrinsic`; `SELECT * FROM positions WHERE type IN ('call','put') AND closed_at IS NULL AND expiry < date('now')` |
 | `logs/runner.log` has no `[runner]`/`[strategy]` lines, only `"GET /api/… HTTP/1.1"` | **`logs/runner.log` captures only the Werkzeug HTTP access log, NOT the runner's own stdout** (live-finding 2026-05-17). Every "tail runner stdout / runner.log for `[strategy] claude err`" instruction above & in `CLAUDE.md` §11 is *blind* against that file — the NO_DECISION/timeout/circuit-breaker `print()`s go to the runner's real stdout (a terminal / launcher), not here. This is a launcher/logging-infra gap, not a code bug (deliberately not "fixed" in a surgical core pass — changing logging perturbs the live process) | Find the runner's true stdout: `tr '\0' ' ' </proc/$(pgrep -f 'paper_trader.runner\|paper-trader/runner.py' | head -1)/cmdline`; check the launcher's redirection / `journalctl`. Decision-level history is reliable via `/api/decision-forensics` + `recent_decisions` (DB), which *do* capture the failure taxonomy |
 | Decisions ~hourly (not every `OPEN_INTERVAL_S`=1800s) while open; new endpoints 404; self-review maybe not injected | The running `:8090`/runner is **stale** — booted ≥1 commit ago (`/api/build-info` `stale:true`, `behind:N`). It runs pre-fix resolvers/cadence and 404s endpoints added since boot (live-finding 2026-05-17: `behind:33`, `/api/runner-heartbeat` 404). A long NO_DECISION run also inflates effective cadence (Opus 180s + Sonnet 60s + retry 45s per failed cycle). The on-disk fixes do **not** apply until restart | `curl -s localhost:8090/api/build-info`; restart `paper_trader.runner` to apply HEAD (also applies the invariant #6/#18 fixes). NO_DECISION cause → `/api/decision-forensics` |
+
+| 2–3 decisions clustered inside a minute, then ~1h of nothing; equity/decision log looks raced; doubled `claude` RAM | **Two `runner.py` processes on the same paper book** — e.g. an orphaned manual launch (parent PID 1) *and* the systemd unit, each on its own cadence (live-finding 2026-05-17: PID 1255030 orphan + PID 1317545 systemd). The single-instance guard (invariant #19) prevents *recurrence* but only **on the next restart of each** — it does not kill an already-running duplicate | `ps -eo pid,ppid,etime,cmd | grep '[r]unner.py'` — if >1, stop the orphan (keep the systemd one); after each restarts, `cat data/paper_trader.runner.lock` shows the single live holder PID. A second start now self-exits with `[runner] another paper trader is already running (pid=…)` |
+| Live trader makes decisions with `signal_count=0` for many cycles though `articles.db` is fresh | Upstream: digital-intern's scorer degraded — articles are *collected* (fresh `first_seen`) but `ai_score` stays `0.0`/`urgency 0`, so `get_top_signals(min_score=4.0)` + `get_urgent_articles` both return `[]`. **Not a paper-trader core bug** — `/api/feed-health` correctly reports `BLIND` with `resolved_live_2h>0`; the headline spells out the paradox. A paper-trader restart will NOT help (the fix is in digital-intern's scoring daemon) | `/api/feed-health` (`verdict:BLIND`, `resolved_live_2h`); `SELECT MAX(ai_score) FROM articles WHERE first_seen>=<2h-ago> AND <live-only>` → if `0.0`, the digital-intern scorer is down |
 
 For ML / backtest-side failures, see the ML section below and `CLAUDE.md` §11.
 
@@ -1448,6 +1487,96 @@ findings.
   isolated requests). Documented fragility (`dashboard.py:176-187` —
   `yfinance`/`requests` has no socket timeout, a hung call pins an SWR
   worker). No safe in-scope fix; reported.
+
+### 2026-05-17 review pass #5 (ML+backtest hybrid · poison-cache fix · skill-trend reader)
+
+- **Bug fixed (commit `6e3fa55`): poisoned per-window price caches.**
+  `PriceCache._load` accepted ANY cached `prices_*.json` whose `_meta`
+  matched and tickers were a superset — **including the 34 of 177 (19%)
+  live per-window caches whose SPY series is `{}`** from a transient
+  yfinance failure at build time. `_build_trading_days` fell back to
+  another ticker's calendar so the run completed, but
+  `returns_pct("SPY",…)` then returned 0.0 → `vs_spy_pct` was fabricated
+  (`== total_return`) with no real benchmark, and that feeds the live
+  trader's `_ml_is_qualified` median-alpha gate (CLAUDE.md §15) every
+  cycle the window is redrawn. The "Continuous-loop durability & honesty"
+  note above flagged this "Still open … out of surgical scope" by bundling
+  it with a strategy-side gate fix; the **cache-side half is surgical and
+  in-domain**, so it was taken (the gate-side half stays in
+  core/strategy.py — reported there, not actioned here).
+  A paired benchmark-integrity guard in `_load` now (1) rejects a cached
+  payload whose SPY series is empty when SPY is requested (SPY has data to
+  its 1993 inception ⇒ an empty series is ALWAYS a transient fetch
+  failure, never a real gap) and re-downloads, and (2) skips persisting a
+  fresh download whose SPY series is still empty so the next draw retries
+  rather than re-poisoning. Guard inert when SPY ∉ watchlist. The run
+  still completes off the fallback calendar; `run_one` keeps writing the
+  honest `benchmark_unavailable` note. The 34 on-disk poisoned files
+  **self-heal on next redraw once the loop restarts on this code** (inert
+  until restart — the documented restart-required pattern). Locked by
+  `tests/test_pricecache_benchmark_poison.py` (both guard halves +
+  healthy-cache-accepted + SPY-not-requested no-op);
+  `test_integration_backtest.py::TestBenchmarkUnavailableNote` still green.
+
+- **Feature shipped (commit `6a9eb66`): scorer-skill trend reader.**
+  AGENTS.md called `data/scorer_skill_log.jsonl` *"the canonical
+  instrument for the negative-OOS-skill question"* but there was **no
+  reader** — a quant had to `tail` JSONL and eyeball it.
+  `paper_trader/ml/skill_trend.py` answers it with an exact verdict
+  (`INSUFFICIENT_DATA` / `BEATS_MEAN_PREDICTOR` / `NEGATIVE_OOS_SKILL` /
+  `DIRECTIONAL_BUT_HIGH_ERROR` / `BORDERLINE`) plus `trend`
+  (IMPROVING/DEGRADING/STABLE) and `gate_active_fraction`. The comparator
+  baseline is computed **fresh** from the current `decision_outcomes.jsonl`
+  temporal-OOS slice (reusing `validation.split_outcomes_temporal` + the
+  SELL sign-flip) — NOT the regime-stale σ≈11.7 literal. RMSE of a
+  constant mean-predictor == population σ of the OOS targets, so it is the
+  exact regime-current comparator for the ledger's `oos_rmse`. Same
+  discipline as `ml/calibration.py`: read-only, no train/pickle/feature/
+  trade touch, never raises — safe against the live loop.
+  ```bash
+  cd /home/zeph/paper-trader && python3 -m paper_trader.ml.skill_trend
+  cd /home/zeph/paper-trader && python3 -m pytest tests/test_skill_trend.py -v
+  ```
+  17 exact-value verdict locks in `tests/test_skill_trend.py`.
+
+- **Quant finding: the documented σ≈11.7 OOS baseline is regime-stale.**
+  The fresh mean-predictor baseline on the *current* `decision_outcomes.jsonl`
+  is **6.24** (temporal-OOS slice); the full 5000-row tail's realized 5d
+  std is **7.49** — both far below the AGENTS.md σ≈11.7. The 3 ledger
+  cycles since the loop restarted show `oos_rmse` ≈ 7.85/7.87/10.36 with
+  `oos_ic` ≈ −0.0/0.10/−0.03. So the **relative** conclusion holds (oos
+  error ≥ a mean predictor, ~zero rank-IC ⇒ no demonstrated OOS skill) but
+  every **absolute** figure in the "negative-OOS-skill" note above is
+  outdated — read `skill_trend` for the live numbers, not the literals.
+
+- **Quant finding: scorer overfits (in-sample optimistic).** Live pkl
+  `n_train=3283`, gate active. Calibration in-sample is `WELL_CALIBRATED`
+  (spearman 0.48, monotone deciles, 1.59pp mean decile err) and sampled
+  in-sample sign accuracy is **0.61**, but the ledger's OOS `dir_acc` ≈
+  0.50 and `oos_ic` ≈ 0 — the in-sample/OOS gap is the overfitting
+  signature. Decile tails over-predict by ~6pp (d10 pred +12.7 vs
+  realized +6.9). The gate modulates real BUY conviction on a signal with
+  near-zero demonstrated OOS edge; trust sign modestly, distrust the
+  predicted magnitude. Reported, not actioned (model-dynamics change is
+  out of surgical scope — CLAUDE.md §6).
+
+- **Quant finding: pre-2020 windows trade a drastically narrowed
+  universe.** Every 2x/3x single-stock leveraged ETF
+  (NVDU/MSFU/AMZU/TSLT/CONL/TSLL/PLTU/BITU/BITX/ETHU/LNOK) and crypto-lev
+  name returns `possibly delisted; no price data` for windows before its
+  inception — handled gracefully (`prices[t]={}`), **not a code bug**, but
+  a backtest-realism caveat: an old-window persona's return reflects a
+  smaller, less-levered universe than the live watchlist, so its
+  `_PERSONA_BOOSTS` leveraged-ETF tilts are partly inert there.
+
+- **Live health.** 480 complete / 15 failed (all `[reaped: orphaned
+  running row]` — the per-cycle reaper works) / 5 running (1.6h, under the
+  6h guard). 0 NaN/null finals, 0 currently `benchmark_unavailable`-flagged
+  (trimmed window). avg `vs_spy` +97.4% over 480 runs with same-window
+  spread −39%→+40%+ (runs 6181–6185, 2009–2013) — leveraged-beta
+  dispersion, not alpha, exactly as documented. Continuous loop is on
+  stale code (predates this session's commits) — both shipped changes are
+  inert until `run_continuous_backtests.py` restart.
 
 ### When to bump model versions
 
