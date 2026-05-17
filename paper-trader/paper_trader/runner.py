@@ -1,6 +1,7 @@
 """Main loop — drives the paper trader, runs the dashboard, dispatches Discord reports."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import threading
@@ -11,7 +12,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from . import market, reporter, strategy
-from .store import get_store
+from .store import DB_PATH, get_store
 
 NY = ZoneInfo("America/New_York")
 OPEN_INTERVAL_S = 1800      # decide every 30 min when market is open
@@ -31,6 +32,86 @@ _last_hourly: datetime | None = None
 _consecutive_no_decisions = 0
 
 
+# ── Restart-durable report markers ───────────────────────────────────────
+# `_daily_close_sent_for` / `_last_hourly` are module globals — lost on every
+# process restart, and the runner restarts often (a `/api/build-info` stale
+# restart to apply a committed fix, systemd, the circuit breaker, an operator
+# bounce). Two trader-visible failures result:
+#
+#   1. Hourly STARVATION. `main()` deliberately anchors `_last_hourly` to boot
+#      so the first summary lands ~1h in (not alongside the online ping). But
+#      a runner that bounces more often than hourly *never* sends an hourly
+#      summary at all — every boot resets the 1h clock. ("I haven't gotten an
+#      hourly in hours.")
+#   2. Daily-close DUPLICATION. `_daily_close_sent_for` resets to None on
+#      restart, so a bounce after 16:05 NY on a day the close already fired
+#      re-posts a second "DAILY CLOSE" with the same numbers.
+#
+# A tiny JSON sidecar next to paper_trader.db makes both markers survive a
+# restart. Deliberately NOT a new store.py table: SCHEMA is load-bearing
+# (invariant #13) and this needs no WAL/locking — it is single-writer,
+# best-effort, and a lost/corrupt file must degrade to "behave like today
+# (in-memory only)", never crash the daemon loop.
+_STATE_PATH = DB_PATH.parent / "runner_state.json"
+
+
+def _load_runner_state() -> dict:
+    """Best-effort read of the persisted report markers. Returns {} on a
+    missing/corrupt/unreadable file — never raises (the daemon must boot
+    even if the sidecar is garbage)."""
+    try:
+        with open(_STATE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_runner_state() -> None:
+    """Atomically persist the current markers. Atomic (tmp + os.replace) so a
+    kill mid-write — the circuit breaker / systemd / SIGKILL — can never leave
+    a torn JSON that then reads back as {} and re-arms the duplicate-close
+    bug. Best-effort: any IO error is swallowed (a read-only data dir must not
+    take down the trade loop)."""
+    payload = {
+        "daily_close_sent_for": _daily_close_sent_for,
+        "last_hourly_iso": (_last_hourly.isoformat()
+                            if _last_hourly is not None else None),
+    }
+    try:
+        _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f"{_STATE_PATH}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, _STATE_PATH)
+    except Exception as e:
+        print(f"[runner] could not persist runner state: {e}")
+
+
+def _restore_runner_state() -> None:
+    """Rehydrate `_daily_close_sent_for` / `_last_hourly` from the sidecar at
+    boot. Called by `main()` *before* the loop. No persisted marker → leave the
+    global as-is (fresh-boot behaviour: the daily flag stays None; `main()`
+    still anchors `_last_hourly` to boot so a first-ever start doesn't fire an
+    hourly immediately). A persisted `last_hourly` that is already >1h old
+    correctly lets the first cycle send the overdue summary instead of
+    swallowing another hour."""
+    global _daily_close_sent_for, _last_hourly
+    st = _load_runner_state()
+    dcs = st.get("daily_close_sent_for")
+    if isinstance(dcs, str) and dcs:
+        _daily_close_sent_for = dcs
+    lh = st.get("last_hourly_iso")
+    if isinstance(lh, str) and lh:
+        try:
+            dt = datetime.fromisoformat(lh)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            _last_hourly = dt
+        except ValueError:
+            pass
+
+
 def _maybe_hourly():
     global _last_hourly
     now = datetime.now(timezone.utc)
@@ -41,6 +122,7 @@ def _maybe_hourly():
         # then retries next cycle instead of silently skipping the hour.
         if reporter.send_hourly_summary():
             _last_hourly = now
+            _save_runner_state()  # survive a restart — don't starve the hour
         else:
             print("[runner] hourly send returned False, will retry next cycle")
     except Exception as e:
@@ -69,6 +151,7 @@ def _maybe_daily_close():
         # permanently suppress today's close.
         if reporter.send_daily_close():
             _daily_close_sent_for = today
+            _save_runner_state()  # survive a post-16:05 restart — no dup close
         else:
             print("[runner] daily close: send returned False, will retry next cycle")
     except Exception as e:
@@ -171,9 +254,15 @@ def main():
     store = get_store()
     pf = store.get_portfolio()
     print(f"[runner] portfolio: cash=${pf['cash']:.2f} total=${pf['total_value']:.2f}")
-    # Anchor the hourly clock to boot so the first summary lands ~1h in,
-    # rather than firing immediately alongside the online ping.
+    # Anchor the hourly clock to boot so a *first-ever* start's first summary
+    # lands ~1h in, rather than firing immediately alongside the online ping.
     _last_hourly = datetime.now(timezone.utc)
+    # Then rehydrate from the sidecar: on a *restart* this restores the real
+    # last-hourly instant (an overdue summary fires this cycle instead of the
+    # boot-anchor swallowing yet another hour) and the daily-close-sent date
+    # (a post-16:05 bounce won't re-post the close). No sidecar → globals keep
+    # their fresh-boot values, behaviour identical to before this change.
+    _restore_runner_state()
     _start_dashboard()
     try:
         reporter._send("**PAPER TRADER ONLINE** ◈ engine booted, decision loop starting")
