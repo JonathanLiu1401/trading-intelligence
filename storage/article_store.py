@@ -138,8 +138,12 @@ CREATE INDEX IF NOT EXISTS idx_briefings_ts ON briefings(ts);
 
 
 def _get_db_path() -> Path:
-    # Always use local path as the canonical DB.
-    # USB is used only for checkpoint backups (ml_checkpoints/), not as primary DB.
+    # Prefer USB drive when mounted — it has far more capacity than the root NVMe.
+    # Falls back to local data/ if USB is not available.
+    usb_db = USB_PATH / "articles.db"
+    if USB_PATH.exists() and (usb_db.exists() or USB_PATH.is_mount()):
+        USB_PATH.mkdir(parents=True, exist_ok=True)
+        return usb_db
     LOCAL_PATH.mkdir(parents=True, exist_ok=True)
     return LOCAL_PATH / "articles.db"
 
