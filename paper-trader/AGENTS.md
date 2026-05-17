@@ -1037,6 +1037,100 @@ For automated review agents that touch ML / backtest code:
   model/gate (training-dynamics is out of scope; CLAUDE.md §6). Locked by
   `tests/test_continuous_review_20260517.py::TestOosRankMetrics`.
 
+### 2026-05-17 review pass #2 (label-hygiene audit · live findings)
+
+Hybrid quant pass (debug + feature + live validation). **Zero code bugs
+found** — 10th consecutive no-new-bug review of the ML/backtest core.
+One read-only diagnostic added; the rest is reported live findings, not
+silent fixes (every actionable item is a training-dynamics change the
+doc repeatedly scopes out).
+
+- **Training-label hygiene audit (`paper_trader/ml/label_audit.py`,
+  committed `9c844c9`).** The exact read-only sibling of
+  `ml/calibration.py`: no train, no pickle, no `decision_outcomes.jsonl`
+  rewrite, no `build_features`/`N_FEATURES` touch — safe against the
+  unattended loop. `PriceCache` fetches `yf.history(auto_adjust=False)`,
+  so a reverse split (DFEN's 2024-06 1:5) injects a step discontinuity
+  recorded as a `forward_return_5d` of **+180.04%** (`mom5=-64.04` — a
+  textbook split signature). The inference head is clamped to
+  `PRED_CLAMP_PCT`, but **nothing measured how many *labels* sit past
+  that bound**, and `train_scorer`'s run-quality oversampling up-weights
+  them 2–4×. The audit reports the extreme-label rate (`|fwd| >
+  EXTREME_RETURN_PCT`, imported `== PRED_CLAMP_PCT` — single source of
+  truth, the `_oos_rank_metrics`-reuses-`_spearman` precedent) vs the
+  documented ~0.5% real baseline, plus per-ticker worst offenders and an
+  *informational-only* directional-anomaly subcount (it also fires on
+  genuine 2020-03 COVID mean-reversions, so it never drives the verdict).
+  Verdicts `CLEAN`/`ELEVATED`/`CONTAMINATED` are exact-testable module
+  constants; the `CONTAMINATED` hint points at the **documented**
+  remediation (delete the pkl, let the loop retrain) and explicitly says
+  *do NOT winsorize `y` in `train_scorer`* — that is the out-of-scope
+  training-dynamics change this tool exists to inform, not perform.
+
+  ```bash
+  # Label hygiene of the accumulated outcomes tail (read-only).
+  # Exit 0 = CLEAN/INSUFFICIENT, 2 = ELEVATED/CONTAMINATED.
+  cd /home/zeph/paper-trader && python3 -m paper_trader.ml.label_audit
+  cd /home/zeph/paper-trader && python3 -m pytest tests/test_label_audit_20260517.py -v
+  ```
+
+  **Interpreting it (live finding).** On the current 5000-row corpus the
+  aggregate is `CLEAN` (25/5000 = 0.500%, dead-on the documented
+  baseline) — but the per-ticker view is the payoff: **DFEN 11/523 =
+  2.10%** (4× the corpus rate), FAS 1.20%, MSTR 1.36%, all concentrated
+  on reverse-split / COVID-crash dates. A corpus-wide `CLEAN` masks a
+  per-name concentration the scorer's DFEN/FAS tail predictions ride on.
+  Read this next to the `calibration` verdict, exactly like `oos_rmse`.
+  Locked by `tests/test_label_audit_20260517.py` (exact verdict
+  boundaries · strict `|fwd|>PRED_CLAMP_PCT` · single-source-of-truth ·
+  non-finite drop · per-ticker sort · directional-anomaly-informational ·
+  `_load_outcomes` corrupt-line skip).
+
+- **Live finding — the running continuous loop is stale (NOT a code
+  bug; operator action).** PID `1086675` started `02:21:35`; the GDELT
+  permanent-error short-circuit (`8899c16`, `06:52`) and the
+  orphaned-run reaper (`05b4df2`, `06:57`) were committed *after* it
+  booted. Evidence it is running pre-fix code: `continuous.log` shows
+  `Invalid query start date` errors still doing the full 3-retry
+  20+40+60s backoff (the exact pathology `8899c16` removes), its
+  `scorer ok …` lines lack the `oos_diracc=`/`oos_ic=` fields `05b4df2`
+  adds, and `backtest.db` has **19 orphaned `running` rows** the
+  startup reaper would have swept. Remediation is the documented
+  `/api/build-info`-`stale` protocol: a clean SIGTERM between cycles +
+  restart. Left for the operator — restarting a user-owned production
+  loop is outward-facing and out of an automated pass's remit.
+
+- **Live finding — `_llm_annotate_outcomes` has been structurally inert
+  since deployment.** The `anthropic` SDK is importable but no
+  `ANTHROPIC_API_KEY`/auth is configured (the whole system is `claude`
+  CLI-subprocess-authed, not SDK), so every cycle logs
+  `LLM annotation failed: Could not resolve authentication method` and
+  `LLM labels: 0 endorsed, 0 condemned`. **All 5000 rows in
+  `decision_outcomes.jsonl` carry `llm_quality_label: 0`** — the
+  `{1: 3.0, -1: 0.1, 0: 1.0}` training-weight multiplier in
+  `train_scorer` (a documented load-bearing training feature — see the
+  "Run-return weight" pitfall) has *never once been live*. Not fixed
+  here: routing it through the `claude` CLI like `_opus_annotate`
+  activates a 3×/0.1× sample-weight on the unattended loop — a
+  training-dynamics change requiring an explicit decision + pkl bump,
+  not a surgical edit. Reported for that decision.
+
+- **Live finding — in-sample calibration is optimistic vs OOS.**
+  `python3 -m paper_trader.ml.calibration` on the live pkl
+  (`n_train=3876`) reports `WELL_CALIBRATED` (spearman 0.51, monotone
+  deciles, 1.85pp decile error) — but the continuous loop's
+  trustworthy temporal-holdout `oos_rmse` is **14.62** on the latest
+  matching cycle (range 8.18–17.36 across recent cycles), straddling /
+  exceeding the documented σ(aligned target) ≈ 11.7. The scorer's
+  out-of-sample RMSE is at or worse than predicting the mean even
+  though it gates BUY conviction once `_n_train ≥ 500`. Always pair the
+  in-sample `WELL_CALIBRATED` with `oos_rmse` (and now `label_audit`) —
+  the in-sample verdict alone overstates the edge. Backtests themselves
+  are healthy (486 complete, 0 null/NaN finals, fresh `completed_at`),
+  but the per-cycle "best run +1294% / vs_spy +1202%" line sits next to
+  a same-regime "+12% / vs_spy −80%" — the documented leveraged-beta
+  dispersion, not repeatable alpha.
+
 ### When to bump model versions
 
 The scorer model has no explicit version field. Treat a change to
