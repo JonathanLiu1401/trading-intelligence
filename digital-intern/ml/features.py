@@ -44,7 +44,7 @@ SOURCE_CRED: dict[str, float] = {
     "benzinga": 0.72, "thestreet": 0.68, "investors.com": 0.72,
     "zacks": 0.68, "finviz": 0.68, "marketbeat": 0.68,
     "theblock": 0.72, "coindesk": 0.68, "decrypt": 0.62,
-    "sec edgar": 0.95, "sec_edgar": 0.95, "googlenews": 0.62,
+    "sec edgar": 0.95, "sec_edgar": 0.95, "sec-edgar": 0.95, "googlenews": 0.62,
     "google_news": 0.62, "yahoo": 0.65, "yfinance": 0.65,
     "gdelt": 0.58, "scraped": 0.50, "rss": 0.65,
     "reddit": 0.40, "twitter": 0.35, "stocktwits": 0.30,
@@ -79,9 +79,78 @@ _NER_RE = re.compile(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b")
 _SENT_RE = re.compile(r"[.!?]+\s+")
 
 
+# ── Publisher-domain credibility ────────────────────────────────────────────
+# ~95% of the production corpus arrives as aggregator-prefixed tags whose REAL
+# publisher is the embedded host: ``gdelt_gkg/iheart.com``,
+# ``GDELT/techtimes.com``, ``scraped/finance.yahoo.com``,
+# ``gdelt_historical/reuters.com``. The verbatim word-boundary SOURCE_CRED scan
+# only catches a publisher when its map key happens to appear in the tag, so on
+# a 1.4M-row live snapshot 86% of the top-40 source tags silently fell through
+# to DEFAULT_SOURCE_CRED — flattening feature[0] into a near-constant for the
+# model and blinding the alert authority gate to the actual publisher.
+#
+# _DOMAIN_CRED is the Phase-1 *rescue* tier: every value is >= DEFAULT and
+# equals the publisher's existing SOURCE_CRED grade, so it ONLY lifts tags that
+# were defaulting — already-differentiated tags and the 0.45 lone-alert gate
+# are byte-for-byte unchanged.
+_DOMAIN_CRED: dict[str, float] = {
+    "reuters.com": 0.90, "bloomberg.com": 0.90, "wsj.com": 0.88,
+    "ft.com": 0.88, "cnbc.com": 0.85, "apnews.com": 0.85,
+    "nikkei.com": 0.85, "asia.nikkei.com": 0.85,
+    "koreaherald.com": 0.80, "scmp.com": 0.78,
+    "marketwatch.com": 0.78, "barrons.com": 0.78,
+    "seekingalpha.com": 0.72, "benzinga.com": 0.72, "investors.com": 0.72,
+    "zacks.com": 0.68, "marketbeat.com": 0.68, "thestreet.com": 0.68,
+    "theblock.co": 0.72, "coindesk.com": 0.68,
+    "finance.yahoo.com": 0.65, "yahoo.com": 0.65,
+}
+
+# _LOW_AUTHORITY_DOMAINS is the Phase-2 *junk* tier: high-volume
+# non-financial / SEO / press-release-mill hosts observed flooding the GDELT
+# GKG firehose. Values are < DEFAULT (several < ALERT_MIN_LONE_SOURCE_CRED
+# 0.45) so a lone, un-syndicated urgent row from one is suppressed by
+# watchers.alert_agent._filter_low_authority_lone instead of firing a
+# standalone Bloomberg "🚨 BREAKING" push. Populated in Phase 2; empty here so
+# Phase 1 stays strictly >= DEFAULT and gate-neutral.
+_LOW_AUTHORITY_DOMAINS: dict[str, float] = {}
+
+
+def _domain_candidates(source: str) -> list[str]:
+    """Progressively-shortened host candidates from an aggregator-prefixed tag.
+
+    ``gdelt_gkg/finance.yahoo.com`` -> ``['finance.yahoo.com', 'yahoo.com']``;
+    ``reddit/r/Daytrading`` -> ``[]`` (no dotted host — the publisher IS the
+    'reddit' prefix, which the verbatim scan still resolves). Only dot-bearing
+    components of length >= 4 are treated as hosts; the public-suffix label
+    itself ('com') is never emitted as a candidate."""
+    out: list[str] = []
+    for part in re.split(r"[\s/:|]+", source.strip().lower()):
+        part = part.strip().strip(".")
+        if "." not in part or len(part) < 4:
+            continue
+        if part.startswith("www."):
+            part = part[4:]
+        labels = part.split(".")
+        for i in range(len(labels) - 1):  # stop before the bare TLD
+            cand = ".".join(labels[i:])
+            if cand and cand not in out:
+                out.append(cand)
+    return out
+
+
 def _source_credibility(source: str) -> float:
     if not source:
         return DEFAULT_SOURCE_CRED
+    # Resolve the embedded publisher host first — this is what makes the
+    # aggregator-prefixed firehose (gdelt_gkg/…, GDELT/…, scraped/…) resolve to
+    # a real grade. Junk tier wins over rescue tier when both somehow match.
+    for cand in _domain_candidates(source):
+        if cand in _LOW_AUTHORITY_DOMAINS:
+            return _LOW_AUTHORITY_DOMAINS[cand]
+        if cand in _DOMAIN_CRED:
+            return _DOMAIN_CRED[cand]
+    # Fall back to the verbatim word-boundary scan — unchanged behaviour, and
+    # the only path for non-dotted publisher tokens (reddit, nitter, rss, …).
     for pat, score in _SOURCE_CRED_PATTERNS:
         if pat.search(source):
             return score
