@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 User=zeph
-WorkingDirectory=/home/zeph/paper-trader
-ExecStart=/usr/bin/python3 /home/zeph/paper-trader/runner.py
+WorkingDirectory=/home/zeph/trading-intelligence/paper-trader
+ExecStart=/usr/bin/python3 /home/zeph/trading-intelligence/paper-trader/runner.py
 Restart=on-failure
 RestartSec=10
-EnvironmentFile=-/home/zeph/digital-intern/.env
+EnvironmentFile=-/home/zeph/trading-intelligence/digital-intern/.env
 
 [Install]
 WantedBy=multi-user.target

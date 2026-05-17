@@ -2,7 +2,7 @@
 # Trading Stack Watchdog — ensures all services run 24/7
 set -euo pipefail
 
-WEBHOOK=$(grep DISCORD_WEBHOOK_URL /home/zeph/digital-intern/.env 2>/dev/null | cut -d= -f2-)
+WEBHOOK=$(grep DISCORD_WEBHOOK_URL /home/zeph/trading-intelligence/digital-intern/.env 2>/dev/null | cut -d= -f2-)
 TS=$(date '+%Y-%m-%d %H:%M')
 
 alert() {

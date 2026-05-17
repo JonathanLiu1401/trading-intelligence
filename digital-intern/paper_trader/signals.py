@@ -9,7 +9,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-DIGITAL_INTERN = "/home/zeph/digital-intern"
+DIGITAL_INTERN = "/home/zeph/trading-intelligence/digital-intern"
 if DIGITAL_INTERN not in sys.path:
     sys.path.insert(0, DIGITAL_INTERN)
 

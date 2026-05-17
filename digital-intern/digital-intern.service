@@ -6,10 +6,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=zeph
-WorkingDirectory=/home/zeph/digital-intern
-EnvironmentFile=/home/zeph/digital-intern/.env
+WorkingDirectory=/home/zeph/trading-intelligence/digital-intern
+EnvironmentFile=/home/zeph/trading-intelligence/digital-intern/.env
 Environment="PATH=/home/zeph/.local/bin:/home/zeph/.nvm/versions/node/v24.15.0/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/usr/bin/python3 /home/zeph/digital-intern/daemon.py
+ExecStart=/usr/bin/python3 /home/zeph/trading-intelligence/digital-intern/daemon.py
 Restart=always
 RestartSec=30
 StandardOutput=journal

@@ -5,13 +5,13 @@
 
 set -euo pipefail
 
-WEBHOOK_URL=$(grep DISCORD_WEBHOOK_URL /home/zeph/digital-intern/.env 2>/dev/null | cut -d= -f2-)
-PLAIN_LOG="/home/zeph/digital-intern/data/daemon.log"
-STRUCT_LOG="/home/zeph/digital-intern/logs/structured.jsonl"
-HC_LOG="/home/zeph/digital-intern/logs/healthcheck.log"
+WEBHOOK_URL=$(grep DISCORD_WEBHOOK_URL /home/zeph/trading-intelligence/digital-intern/.env 2>/dev/null | cut -d= -f2-)
+PLAIN_LOG="/home/zeph/trading-intelligence/digital-intern/data/daemon.log"
+STRUCT_LOG="/home/zeph/trading-intelligence/digital-intern/logs/structured.jsonl"
+HC_LOG="/home/zeph/trading-intelligence/digital-intern/logs/healthcheck.log"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M')
 
-mkdir -p /home/zeph/digital-intern/logs
+mkdir -p /home/zeph/trading-intelligence/digital-intern/logs
 
 send_discord() {
     [[ -z "${WEBHOOK_URL:-}" ]] && return 0

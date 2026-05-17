@@ -10,7 +10,7 @@
 # What a heartbeat should actually do: probe the dashboard's /healthz endpoint
 # and log the result. No collector calls, no LLM calls, no DB writes.
 
-cd /home/zeph/digital-intern
+cd /home/zeph/trading-intelligence/digital-intern
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8080/healthz}"
 mkdir -p logs
 ts=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
