@@ -1,6 +1,7 @@
 """Main loop — drives the paper trader, runs the dashboard, dispatches Discord reports."""
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 import time
@@ -84,11 +85,12 @@ def _start_dashboard():
 
 
 def _kill_stale_claude():
-    """Kill any lingering claude subprocess. strategy._claude_call() launches
-    `claude --model <model> --print ...`; a wedged child that survives its
-    Python-side timeout keeps holding resources and can re-starve the next
-    cycle. Match the live (Opus) model first, then the Sonnet fallback model
-    so a wedged fallback zombie is also reaped.
+    """Kill the runner's *own* lingering claude subprocess. strategy._claude_call()
+    launches `claude --model <model> --print ...` as a direct child of this
+    process; a wedged child that survives its Python-side timeout keeps holding
+    resources and can re-starve the next cycle. Match the live (Opus) model
+    first, then the Sonnet fallback model so a wedged fallback zombie is also
+    reaped.
 
     Both patterns are anchored on `claude --model <family>` because the CLI
     is always invoked as `claude --model <model> --print …` — the `--model`
@@ -96,17 +98,31 @@ def _kill_stale_claude():
     pattern is never a contiguous substring of the real command line and
     would silently match nothing (the exact bug this once had: a wedged
     Sonnet fallback survived the breaker, defeating auto-recovery in the
-    very Opus-timeout→Sonnet-fallback path the breaker exists for)."""
+    very Opus-timeout→Sonnet-fallback path the breaker exists for).
+
+    SCOPED TO OUR OWN CHILDREN (`pkill -P os.getpid()`). A bare host-wide
+    `pkill -f "claude --model claude-opus"` is catastrophic collateral
+    damage: this box also runs the hourly self-review agents
+    (`scripts/hourly_review.sh` spawns 3× `claude --model claude-opus-4-7`),
+    sibling automated-review agents, and possibly an operator's interactive
+    `claude` session — all of which match the same pattern. A wedged trader
+    recovering by SIGTERM-ing every Claude process on the machine (including
+    the review agents that keep the system healthy, and the agent that may
+    have just deployed a fix) is a cure far worse than the disease. The
+    decision subprocess is always a *direct* child of the runner, so `-P`
+    restricts the sweep to exactly the processes this breaker is meant to
+    reap and nothing else."""
+    own_pid = os.getpid()
     for pattern in ("claude --model claude-opus", "claude --model claude-sonnet"):
         try:
             killed = subprocess.run(
-                ["pkill", "-f", pattern],
+                ["pkill", "-P", str(own_pid), "-f", pattern],
                 capture_output=True,
             )
             # pkill rc: 0 = killed something, 1 = nothing matched, >1 = error.
             print(
-                f"[runner] circuit breaker: pkill -f {pattern!r} "
-                f"returned {killed.returncode}"
+                f"[runner] circuit breaker: pkill -P {own_pid} -f "
+                f"{pattern!r} returned {killed.returncode}"
             )
         except Exception as e:
             print(f"[runner] circuit breaker: pkill {pattern!r} failed: {e}")

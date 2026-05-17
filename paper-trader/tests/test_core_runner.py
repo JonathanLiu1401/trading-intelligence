@@ -210,6 +210,18 @@ class TestKillStaleClaude:
     Sonnet fallback — otherwise a wedged Sonnet-fallback child survives the
     breaker and keeps starving the decision loop in exactly the
     Opus-timeout → Sonnet-fallback path the breaker exists to recover.
+
+    The sweep is ALSO scoped to the runner's own child processes
+    (``pkill -P os.getpid()``). A host-wide ``pkill -f "claude --model
+    claude-opus"`` is catastrophic collateral damage on this box: it would
+    SIGTERM the hourly self-review agents, sibling review agents, and any
+    operator interactive `claude` session — all of which match the same
+    pattern. The decision subprocess is always a *direct* child of the
+    runner, so ``-P <our pid>`` restricts the kill to exactly what the
+    breaker is meant to reap. (The old argv ``["pkill", "-f", pattern]``
+    that the prior assertion codified WAS the host-wide-broadcast bug — the
+    AGENTS.md invariant-#16 "a test that literally codified the bug" /
+    correction-not-weakening precedent.)
     """
 
     @staticmethod
@@ -221,13 +233,13 @@ class TestKillStaleClaude:
              "--permission-mode", "bypassPermissions"]
         )
 
-    def _captured_patterns(self, monkeypatch) -> list[str]:
-        seen: list[str] = []
+    def _captured_calls(self, monkeypatch) -> list[list[str]]:
+        """Capture the full pkill argv list of every breaker invocation."""
+        seen: list[list[str]] = []
 
         def _fake_run(argv, *a, **k):
-            # argv == ["pkill", "-f", <pattern>]
-            assert argv[:2] == ["pkill", "-f"]
-            seen.append(argv[2])
+            assert argv[0] == "pkill"
+            seen.append(list(argv))
 
             class _R:
                 returncode = 1  # "nothing matched" — harmless
@@ -237,6 +249,14 @@ class TestKillStaleClaude:
         monkeypatch.setattr(runner.subprocess, "run", _fake_run)
         runner._kill_stale_claude()
         return seen
+
+    def _captured_patterns(self, monkeypatch) -> list[str]:
+        # The `-f` pattern is the argv token immediately after "-f".
+        pats: list[str] = []
+        for argv in self._captured_calls(monkeypatch):
+            assert "-f" in argv, f"breaker pkill argv has no -f pattern: {argv}"
+            pats.append(argv[argv.index("-f") + 1])
+        return pats
 
     def test_patterns_match_both_opus_and_sonnet_cmdlines(self, monkeypatch):
         from paper_trader import strategy
@@ -265,6 +285,32 @@ class TestKillStaleClaude:
         # The shipped breaker MUST match it.
         patterns = self._captured_patterns(monkeypatch)
         assert any(re.search(p, sonnet_cmdline) for p in patterns)
+
+    def test_kill_is_scoped_to_own_child_processes(self, monkeypatch):
+        """Regression lock for the host-wide-broadcast bug.
+
+        Every breaker pkill MUST be scoped with ``-P <our pid>`` so it can
+        only reap the runner's own direct claude children — never the
+        hourly-review agents, sibling review agents, or an operator's
+        interactive `claude` session that match the same `-f` pattern.
+        A regression back to a host-wide ``["pkill", "-f", pattern]`` (no
+        ``-P``) fails here.
+        """
+        import os as _os
+
+        calls = self._captured_calls(monkeypatch)
+        assert calls, "circuit breaker issued no pkill calls"
+        own_pid = str(_os.getpid())
+        for argv in calls:
+            assert "-P" in argv, (
+                f"breaker pkill is NOT scoped to its own children "
+                f"(host-wide broadcast bug regressed): {argv}"
+            )
+            assert argv[argv.index("-P") + 1] == own_pid, (
+                f"breaker pkill -P target is not this process: {argv}"
+            )
+            # `-f` (full-cmdline match) must still be present alongside `-P`.
+            assert "-f" in argv, f"breaker lost its -f pattern match: {argv}"
 
     def test_breaker_swallows_pkill_failure(self, monkeypatch):
         # The breaker runs inside the daemon loop — a pkill OSError must
