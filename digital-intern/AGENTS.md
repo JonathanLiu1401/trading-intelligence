@@ -312,6 +312,18 @@ Suites:
   (never raise into the daemon thread). (b) The dedup contract: `collect_rss`
   collapses duplicate `(link,title)` within a pass (`seen_in_run`) and across
   passes (persistent `seen_articles`).
+- `test_chat_session_delta.py` — `dashboard/web_server.py::api_chat`'s
+  session-delta context block (previously zero chat coverage). Every other
+  context stream the chat assembles is a current-state snapshot; this is the
+  one "what materially changed since you last looked" view (sub-fetched from
+  paper-trader `:8090/api/session-delta`, 4s). Pins via the Flask test client
+  (memory: not a `__main__` smoke against a different DB): an ACTIVE payload
+  is injected after the PAPER TRADER LIVE STATE block (headline + ranked
+  event summaries); an unreachable `:8090` degrades silently — the section is
+  omitted and the chat still answers 200 (the sibling sub-fetch contract,
+  never raises into chat); a QUIET/NO_DATA window is suppressed (ACTIVE-only,
+  matching the unified `:8888` chat's `_fetch_session_delta` so the two
+  conversational surfaces stay consistent).
 
 ---
 
@@ -631,3 +643,31 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   documented scaling, **not a bug — do not "fix" code or test to the prose** (standing
   "code is the spec" rule). Suite: **313 passed** (clean `__pycache__`/`.pytest_cache`),
   imports OK.
+
+- **2026-05-17 (Agent 4, feature-dev — session-delta surfaced on chat + landing)** —
+  Shipped the two deferred high-value increments from
+  `docs/superpowers/specs/2026-05-16-session-delta-design.md`'s "Out of scope" list.
+  Both reuse the already-tested `paper_trader/analytics/session_delta.py` builder +
+  its `:8090/api/session-delta` endpoint (no core change), additive, never gate Opus.
+  **(B, this repo)** `dashboard/web_server.py::api_chat` gained a `session_delta_block`
+  sub-fetch (`:8090/api/session-delta?minutes=360`, 4s) injected after the PAPER
+  TRADER LIVE STATE block — the only temporal-change stream in an otherwise
+  all-current-state context. Mirrors the existing greeks/analytics/heatmap/earnings
+  siblings *verbatim* (network-guarded, never raises into chat; a missing-webhook /
+  unreachable `:8090` degrades to section-omitted). ACTIVE-only, matching the unified
+  `:8888` chat's `_fetch_session_delta` so the two conversational surfaces stay
+  consistent. New `tests/test_chat_session_delta.py` (4 cases, Flask test client) —
+  the chat had zero prior coverage. **(A, local-only `/home/zeph` repo)** the
+  `:8888` command-center landing card (the spec's named follow-up) — `/api/session-delta`
+  added to `_build_command_center`'s fan-out + SWR payload, a `#sess-card` mirroring
+  the `:8090` palette, degraded-upstream surfaced honestly (never a faked QUIET).
+  Suite: **317 passed** (313 prior + 4 new; clean caches), imports OK.
+  *Operational:* digital-intern `:8080` will not serve the chat block until
+  `systemctl --user restart digital-intern` (the chronic-stale pattern); `:8090`
+  `/api/session-delta` is current so the `:8888` card renders live now.
+  *Pre-existing, not this work:* the `/home/zeph` `tests/test_unified_dashboard.py`
+  suite has 2 failures (`test_decision_health_alerts_above_threshold`,
+  `test_aq_decision_health_alert_exact_numbers`) — the decision-health `", 24h window"`
+  string is committed at HEAD but those 2 tests were not updated by whoever shipped
+  it; my session-delta diff contains zero decision-health hunks (verified). Left for
+  that change's owner per the standing "don't weaken another change's tests" rule.
