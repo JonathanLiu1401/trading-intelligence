@@ -344,6 +344,28 @@ Suites:
   `+N` overflow truncation, the hard `max_chars` cap with `…`; and that
   `_build_health_line` appends the line only when something is down and
   degrades to workers-only (never raises) on a `source_health` probe error.
+- `test_alert_source_authority.py` — the **third** formatter-side
+  defense-in-depth filter on `watchers/alert_agent.py::send_urgent_alert`
+  (after `_is_synthetic` and `_article_age_ok`): `_filter_low_authority_lone`.
+  A LONE, un-corroborated social/forum row — `cred <
+  ALERT_MIN_LONE_SOURCE_CRED` (0.45) via the **reused**
+  `ml.features._source_credibility` word-boundary map (reddit/nitter 0.40,
+  twitter 0.35, stocktwits 0.30) and `dup_count<=1` — is suppressed: no
+  Claude/Discord call, marked `urgency=2` UNCONDITIONALLY (a separate call,
+  before the Discord attempt, regardless of its outcome) so it exits the
+  urgent queue instead of re-firing every 20s, and `send_urgent_alert`
+  returns False. The **corroboration escape valve** is pinned at both the
+  pure-helper and end-to-end level (a refactor that moves the gate *before*
+  `dedupe_urgent` loses it and is caught): a story syndicated across ≥2
+  sources (`dup_count>1`) **or** any credible/UNKNOWN source
+  (`DEFAULT_SOURCE_CRED=0.55` ≥ threshold) still fires. The mixed-batch
+  Discord-failure case pins that suppressed noise stays marked while a kept
+  row stays `urgency=1` (the existing re-queue-on-failure contract is
+  preserved alongside the new gate). Same `_is_synthetic`-class discipline;
+  none of the four load-bearing invariants are touched (read-only on the
+  alert path — `ai_score`/`ml_score`/`score_source`/backtest isolation all
+  unchanged; `urgency=2` is only ever otherwise read by the synthetic-breach
+  detector, which is scoped to synthetic rows this gate never reaches).
 
 ---
 
@@ -857,3 +879,63 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   changes (incl. concurrently-staged paper-trader commits from a sibling
   agent) predate / are outside this session and were never staged by it —
   every commit here was pathspec-scoped to exactly its 2 intended files.
+
+- **2026-05-17 (Agent 3, hybrid debug+feature+live-validation)** — Full
+  read pass over the nine task-critical files + `ml/inference.py`,
+  `alert_dedup`, `source_health`. **Phase 1: bugs_fixed=0 (honest, not a
+  miss).** The four load-bearing invariants re-traced and hold; the
+  task-specified test assertions already exist and value-assert (per the
+  prior log entries + an independent advisor confirmation) — adding
+  duplicates would violate the standing no-redundant-coverage discipline.
+  No Phase 1 commit (correctly per the guard). **Phase 2 feature
+  (`31dea26`):** `watchers/alert_agent.py::_filter_low_authority_lone` — a
+  source-authority gate so a LONE, un-corroborated social/forum post
+  (reddit/nitter/twitter/stocktwits, `cred<0.45`) the ML urgency head
+  over-scored can no longer fire a standalone Bloomberg "🚨 BREAKING"
+  alert. Formatter-side defense-in-depth (same shape as `_is_synthetic`/
+  `_article_age_ok`, **not** an ML-threshold change — distinct from the
+  prior agent's "thresholds out of scope" deferral); runs after
+  `dedupe_urgent` so `dup_count>1` corroboration / any credible-or-unknown
+  source is the escape valve; suppressed rows stay in `articles.db`
+  (training/scoring untouched) and remain Opus-briefing-eligible — only the
+  noisy push is dropped, and they are marked `urgency=2` unconditionally so
+  they leave the urgent queue. All four invariants preserved. +7 tests
+  (`test_alert_source_authority.py`, pure-helper + end-to-end + the
+  Discord-failure re-queue contract). Clean full suite **343 passed** (no
+  regressions; the new tests offset the excluded count). **Phase 3 findings
+  (reported, not fixed):** (a) the live noise this targets is **confirmed**
+  — reddit/r/Daytrading + reddit/r/ValueInvesting fired BREAKING solo in a
+  24h window; **partial-fix honesty:** the gate captures the social tier
+  (<0.45) but Wikipedia (0.60) and `yfinance/Insider Monkey` (0.65) are
+  *above* the threshold and also fired solo in that window — still ungated
+  (raising the bar to catch them would also catch gdelt 0.58 / scraped
+  0.50, a more debatable call deliberately left out of this surgical
+  commit). (b) **`export_worker: database disk image is malformed`** —
+  recurring every ~30 min in the live daemon (06:41Z, 07:11Z); the USB
+  `training_data.json.gz` (paper-trader's backtest fallback) is going
+  stale. Also surfaces as 2 failing tests in *pre-existing, not-mine*
+  in-flight work (`scripts/export_training_data.py` modified + untracked
+  `tests/test_export_training_data.py`):
+  `test_export_self_heals_corrupt_destination` shows the modified export
+  script raises instead of self-healing a corrupt destination — a real bug
+  in a sibling agent's uncommitted change, left untouched per the
+  don't-stage-others'-work rule. (c) **~17 RSS feeds permanently dead**
+  (404/403) including the portfolio-relevant semiconductor IR feeds
+  (ASML/Lam/KLA/Qualcomm/TSMC) — config churn, out of surgical scope.
+  (d) 6 collectors disabled in production (polygon, newsapi, sec_edgar,
+  sec_edgar_ft, nitter, massive) — `sec_edgar`/`_ft` are high-signal 8-K
+  filings; surfaced to the analyst via the prior agent's source-health
+  briefing line (working as intended), upstream/operational. (e) restart
+  churn persists (operational; symptom addressed by `ef839a8` + the
+  in-flight briefing-coverage-gap change). **Positive:** the latest 5h
+  briefing (2026-05-17 13:41 UTC) read end-to-end is a genuinely accurate,
+  dense, actionable Bloomberg digest (sharp LEAD, real numbers, MU $700
+  DESK-NOTE level); recent cadence healthy (~6.3h); backtest isolation
+  holding (429k synthetic rows excluded from every live count/alert);
+  score_source separation intact (ml=172k predictions, llm=3.7k labels,
+  never co-mingled). *Pre-existing, not this work:* the modified
+  `daemon.py` (briefing-coverage-gap), `scripts/export_training_data.py`,
+  `paper-trader/*`, the untracked `tests/test_briefing_coverage_gap.py` /
+  `tests/test_export_training_data.py`, and the `logs/*.tmp` deletions all
+  predate this session and were deliberately never staged — the one feature
+  commit was pathspec-scoped to exactly its 2 intended files.
