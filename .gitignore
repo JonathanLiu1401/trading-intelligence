@@ -1,0 +1,36 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/ml/*.pkl
+data/ml/*.pt
+logs/*.log
+logs/*.jsonl
+# Rotation backups (RotatingFileHandler appends .1, .2, …)
+logs/*.log.*
+logs/*.jsonl.*
+.venv/
+venv/
+
+# Runtime state — regenerated each run, must not pollute git history
+data/*_cursor.json
+data/daemon.lock
+data/portfolio_pl.json
+data/sentiment_trends.json
+data/training_data.json.gz
+data/active_learning_queue.jsonl
+data/*.db-journal
+data/ml/training_metrics.jsonl
+data/ml/*.npz
+data/ml/dataset_cache_meta.json
+logs/supervisor_state.json
+data/earnings_calendar.json
+data/*_checkpoint.json
+data/*_checkpoint.tmp
+
+# Ad-hoc / "blitz" backups of the live source list — must not pollute git history
+config/sources.json.bak.*

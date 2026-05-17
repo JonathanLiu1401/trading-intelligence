@@ -1,0 +1,13 @@
+# Allows Claude/daemon to manage digital-intern services without password or TTY
+Defaults:zeph !requiretty
+
+zeph ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart digital-intern
+zeph ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart dashboard
+zeph ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop digital-intern
+zeph ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop dashboard
+zeph ALL=(ALL) NOPASSWD: /usr/bin/systemctl start digital-intern
+zeph ALL=(ALL) NOPASSWD: /usr/bin/systemctl start dashboard
+zeph ALL=(ALL) NOPASSWD: /usr/bin/systemctl status digital-intern
+zeph ALL=(ALL) NOPASSWD: /usr/bin/systemctl status dashboard
+zeph ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active digital-intern
+zeph ALL=(ALL) NOPASSWD: /usr/bin/systemctl is-active dashboard
