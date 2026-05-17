@@ -630,11 +630,14 @@ module constants; verdicts are exact-value test-locked in
 > (spearman ≈ 0.51, monotone deciles, ≈1.9pp decile error) — but that is
 > **in-sample**: the scorer was trained on most of those rows. The
 > trustworthy generalization metric is the temporal-holdout `oos_rmse`
-> the continuous loop logs (`scorer ok … oos_rmse=…`). Observed
-> `oos_rmse` runs **13–17**, while the forward-return target's own σ is
-> ≈10.9 — i.e. OOS error ≳ σ(target), so the scorer has **no
-> demonstrated out-of-sample edge** even though it gates BUY conviction
-> once `_n_train ≥ 500`. The in-sample `WELL_CALIBRATED` is optimistic;
+> the continuous loop logs (`scorer ok … oos_rmse=…`). The correct
+> comparator is the *trivial baseline on the same temporal-holdout
+> slice*: the latest-20%-by-sim_date OOS slice has σ(aligned target)
+> ≈ 11.7, so a model that just predicts the mean scores RMSE ≈ 11.7
+> there. Observed `oos_rmse` runs **13–17** — i.e. *worse than
+> predicting the mean*, so the scorer has **negative demonstrated
+> out-of-sample skill** on the holdout even though it gates BUY
+> conviction once `_n_train ≥ 500`. The in-sample `WELL_CALIBRATED` is optimistic;
 > always read it next to `oos_rmse`. The decile tails over-predict
 > (d1 pred −15.7 vs realized −10.7; d10 +15.4 vs +11.9) even in-sample —
 > the same extrapolation the `predict_with_meta` `off_distribution` flag
@@ -672,8 +675,10 @@ assertions deliberately.
 ### Tests (ML + backtest section)
 
 ```bash
-# ML + backtest only
-cd /home/zeph/paper-trader && python3 -m pytest tests/ -v -k "ml or backtest or scorer"
+# ML + backtest only — keep "calibration" in the filter: test_calibration.py
+# has none of "ml"/"backtest"/"scorer" in its node ids and is silently
+# missed by the older 3-term filter.
+cd /home/zeph/paper-trader && python3 -m pytest tests/ -v -k "ml or backtest or scorer or calibration"
 
 # Core (live trader) only
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_core_*.py -v
