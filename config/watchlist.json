@@ -1,0 +1,16 @@
+{
+  "indices": ["^GSPC", "^IXIC", "^DJI", "^RUT", "^VIX", "^FTSE", "^GDAXI", "^N225", "^HSI", "000001.SS"],
+  "crypto": ["BTC-USD", "ETH-USD", "SOL-USD"],
+  "commodities": ["GC=F", "CL=F", "SI=F", "NG=F"],
+  "bonds": ["^TNX", "^TYX"],
+  "forex": ["EURUSD=X", "JPY=X", "CNY=X"],
+  "memory_core": ["MU", "WDC", "STX"],
+  "semis_equipment": ["LRCX", "AMAT", "KLAC", "ASML", "TOELY"],
+  "broader_semis": ["NVDA", "AMD", "INTC", "QCOM", "TSM", "MRVL", "ON"],
+  "memory_options_focus": ["MU"],
+  "korean": ["005930.KS", "000660.KS"],
+  "japanese": ["6758.T", "9984.T", "6501.T", "6752.T"],
+  "etfs": ["SMH", "SOXX", "PSI", "SPY", "QQQ", "IWM"],
+  "portfolio": ["LITE", "MU", "MSFT", "AXTI", "ORCL", "TSEM", "QBTS"],
+  "keywords": ["DRAM", "NAND", "HBM", "memory", "semiconductor", "Micron", "SK Hynix", "Samsung", "Kioxia", "Western Digital", "LPDDR", "Fed", "inflation", "CPI", "earnings", "recession", "GDP", "interest rate", "tariff", "China", "export controls", "AI chips"]
+}

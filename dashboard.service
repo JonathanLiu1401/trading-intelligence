@@ -1,0 +1,15 @@
+[Unit]
+Description=Digital Intern Web Dashboard
+After=network.target digital-intern.service
+
+[Service]
+Type=simple
+User=zeph
+WorkingDirectory=/home/zeph/digital-intern
+Environment="PATH=/home/zeph/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/python3 -m uvicorn dashboard.server:app --host 0.0.0.0 --port 8765 --reload
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

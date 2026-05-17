@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Digital Intern — Terminal</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap');
+
+  :root {
+    --bg: #0c0d0f;
+    --bg-panel: #111316;
+    --bg-elevated: #17191d;
+    --bg-hover: #1c1f24;
+    --bg-input: #0e1012;
+
+    --border: rgba(255,255,255,0.07);
+    --border-strong: rgba(255,255,255,0.13);
+
+    --text: #dde1e7;
+    --text-secondary: #8b929d;
+    --text-muted: #50565f;
+
+    --amber: #f0b429;
+    --amber-dim: rgba(240,180,41,0.12);
+    --cyan: #0acdff;
+    --cyan-dim: rgba(10,205,255,0.12);
+    --green: #00c896;
+    --green-dim: rgba(0,200,150,0.12);
+    --red: #ff4455;
+    --red-dim: rgba(255,68,85,0.12);
+    --blue: #4d9eff;
+    --blue-dim: rgba(77,158,255,0.12);
+    --yellow: #fbbf24;
+    --yellow-dim: rgba(251,191,36,0.12);
+    --pink: #f472b6;
+
+    --font-sans: 'Outfit', system-ui, sans-serif;
+    --font-mono: 'DM Mono', 'JetBrains Mono', monospace;
+
+    --radius: 8px;
+    --radius-sm: 5px;
+
+    /* aliases for legacy var names used in this file */
+    --card: var(--bg-panel);
+    --line: var(--border);
+    --accent: var(--cyan);
+    --muted: var(--text-secondary);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+    font-family:var(--font-sans);font-size:13px;
+    height:100%;overflow:hidden;}
+  body{padding:0;}
+  a{color:var(--blue);text-decoration:none}
+  a:hover{text-decoration:underline}
+
+  .topbar {
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
+    padding: 0 20px;
+    height: 48px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    margin: 0;
+  }
+  .brand {
+    font-weight: 700;
+    color: var(--amber);
+    font-size: 13px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-right: 16px;
+    flex-shrink: 0;
+  }
+  .topbar a {
+    color: var(--text-secondary);
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 5px 12px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s, background 0.15s;
+    white-space: nowrap;
+  }
+  .topbar a:hover { color: var(--text); background: var(--bg-hover); }
+  .topbar a.active { color: var(--amber); background: var(--amber-dim); }
+
+  header{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:10px 16px;background:var(--bg-panel);border-bottom:1px solid var(--border);
+  }
+  header .brand-h{font-weight:bold;letter-spacing:1px;color:var(--text);
+    font-size:13px;text-transform:uppercase;}
+  header .brand-h .diamond{color:var(--cyan);margin-right:6px}
+  header .meta{display:flex;gap:14px;align-items:center;color:var(--text-secondary)}
+  header .meta .pill{padding:3px 10px;border:1px solid var(--border);border-radius:3px;
+    background:var(--bg);color:var(--text);font-size:12px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .dot.green{background:var(--green);box-shadow:0 0 8px var(--green)}
+  .dot.yellow{background:var(--yellow);box-shadow:0 0 8px var(--yellow)}
+  .dot.red{background:var(--red);box-shadow:0 0 8px var(--red)}
+  .dot.grey{background:var(--text-muted)}
+
+  .stats{display:grid;grid-template-columns:repeat(6,1fr);gap:1px;background:var(--border)}
+  .stat{background:var(--bg-panel);padding:14px 16px;cursor:pointer;transition:background .15s}
+  .stat:hover{background:var(--bg-hover)}
+  .stat.active{background:var(--bg-elevated);border-bottom:2px solid var(--amber)}
+  .stat .label{font-size:10px;color:var(--text-muted);letter-spacing:1.5px;text-transform:uppercase}
+  .stat .value{font-size:24px;font-weight:bold;margin-top:4px;font-family:var(--font-mono);
+    font-variant-numeric:tabular-nums;}
+  .stat .sub{font-size:10px;color:var(--text-muted);margin-top:2px}
+  .stat.urgent .value{color:var(--red)}
+  .stat.unscored .value{color:var(--yellow)}
+  .stat.db .value{color:var(--blue)}
+  .stat.ml .value{color:var(--green)}
+
+  main{display:grid;grid-template-columns:60% 40%;height:calc(100vh - 48px - 60px - 36px);}
+
+  .pane{overflow:auto;border-right:1px solid var(--border)}
+  .pane:last-child{border-right:none}
+  .pane h2{
+    margin:0;padding:10px 16px;font-size:11px;letter-spacing:2px;color:var(--text-muted);
+    background:var(--bg-panel);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:2;
+    text-transform:uppercase;
+  }
+  .article{
+    display:grid;grid-template-columns:46px 90px 1fr 60px;
+    gap:10px;padding:8px 16px;border-bottom:1px solid var(--border);
+    align-items:baseline;cursor:pointer;
+  }
+  .article:hover{background:var(--bg-hover)}
+  .article.flash{animation:flash 2s ease-out}
+  @keyframes flash{0%{background:var(--green-dim)}100%{background:transparent}}
+  .article .score{font-weight:bold;text-align:right;font-family:var(--font-mono);
+    font-variant-numeric:tabular-nums}
+  .article .src{color:var(--text-secondary);font-size:11px;text-transform:uppercase;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .article .title{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .article .age{color:var(--text-muted);font-size:11px;text-align:right;
+    font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+  .article.red .score{color:var(--red)}
+  .article.yellow .score{color:var(--yellow)}
+  .article.grey .score{color:var(--text-muted)}
+
+  .chart{display:flex;align-items:flex-end;gap:2px;height:48px;padding:6px 16px 0}
+  .chart .bar{flex:1;background:var(--cyan);opacity:.75;min-height:1px;border-radius:1px 1px 0 0}
+  .chart .bar:hover{opacity:1}
+
+  .health-list{padding:8px 16px}
+  .health-row{display:flex;justify-content:space-between;align-items:center;
+    padding:6px 0;border-bottom:1px dashed var(--border)}
+  .health-row .name{text-transform:uppercase;letter-spacing:1px;font-size:11px}
+  .health-row .ago{color:var(--text-muted);font-size:11px;font-family:var(--font-mono);
+    font-variant-numeric:tabular-nums}
+  .err-block{padding:8px 16px;border-top:1px solid var(--border)}
+  .err-block h3{margin:0 0 6px;font-size:11px;letter-spacing:2px;color:var(--red);
+    text-transform:uppercase}
+  .err-line{font-size:11px;color:var(--text);padding:3px 0;border-bottom:1px dashed var(--border);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:var(--font-mono);}
+  .err-line .ts{color:var(--text-muted);margin-right:6px}
+
+  .critical-banner{
+    background:var(--red);color:var(--text);text-align:center;
+    font-weight:bold;letter-spacing:2px;padding:14px;
+    font-size:18px;text-transform:uppercase;
+    border-bottom:1px solid var(--border-strong);
+    animation:critpulse 1.5s ease-in-out infinite;
+  }
+  @keyframes critpulse{0%{background:var(--red)}50%{background:var(--red-dim)}100%{background:var(--red)}}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.5;}}
+  .health-row .meta{display:flex;gap:8px;align-items:center;font-size:10px;color:var(--text-muted)}
+  .health-row .badge{padding:1px 5px;border-radius:2px;background:var(--bg-elevated);color:var(--text);
+    font-size:10px;letter-spacing:1px}
+  .health-row .badge.degraded{background:var(--yellow-dim);color:var(--yellow)}
+  .health-row .badge.disabled{background:var(--red-dim);color:var(--red)}
+  .health-row .badge.crashes{background:var(--yellow-dim);color:var(--yellow)}
+
+  footer{
+    position:fixed;bottom:0;left:0;right:0;display:flex;justify-content:space-between;
+    padding:4px 16px;background:var(--bg-panel);border-top:1px solid var(--border);
+    font-size:10px;color:var(--text-muted);letter-spacing:1px;text-transform:uppercase;z-index:5;
+    font-family:var(--font-mono);
+  }
+  .empty{padding:20px 16px;color:var(--text-secondary);font-style:italic}
+</style>
+</head>
+<body>
+<nav class="topbar">
+  <span class="brand">&#x25C8; TRADING STACK</span>
+  <a href="/">Command Center</a>
+  <a href="/intern/" class="active">Digital Intern</a>
+  <a href="/trader/">Paper Trader</a>
+  <a href="/trader/backtests">Backtests</a>
+  <a href="/backtests/compare">Compare</a>
+  <a href="/journal">Journal</a>
+  <a href="/ops/">Ops View</a>
+  <a href="/intern/chat">Chat</a>
+  <a href="/system/">System</a>
+</nav>
+
+<header>
+  <div class="brand-h"><span class="diamond">&#x25C8;</span>DIGITAL INTERN</div>
+  <div class="meta">
+    <div class="pill" id="service">SERVICE: <span class="dot grey"></span><span id="service-text">...</span></div>
+    <div class="pill" id="ws-state"><span class="dot grey"></span><span id="ws-text">CONNECTING</span></div>
+    <div class="pill" id="clock">--:--:--</div>
+  </div>
+</header>
+
+<div id="critical-banner" class="critical-banner" style="display:none">⚠ CRITICAL: CORE WORKERS DOWN ⚠</div>
+
+<section class="stats" id="stats">
+  <div class="stat total" data-filter="all"><div class="label">TOTAL</div><div class="value" id="s-total">--</div><div class="sub">articles (14d)</div></div>
+  <div class="stat urgent" data-filter="urgent"><div class="label">URGENT</div><div class="value" id="s-urgent">--</div><div class="sub">score &ge; 8</div></div>
+  <div class="stat unscored" data-filter="unscored"><div class="label">UNSCORED</div><div class="value" id="s-unscored">--</div><div class="sub">queued ML</div></div>
+  <div class="stat db" data-filter="all"><div class="label">DB MB</div><div class="value" id="s-db">--</div><div class="sub">sqlite size</div></div>
+  <div class="stat ml" data-filter="all"><div class="label">ML</div><div class="value" id="s-ml">--</div><div class="sub">model state</div></div>
+  <div class="stat rate" data-filter="all"><div class="label">ARTICLES/HR</div><div class="value" id="s-rate">--</div><div class="sub">last hour</div></div>
+</section>
+
+<main>
+  <section class="pane">
+    <h2>LIVE ARTICLE FEED</h2>
+    <div id="articles"></div>
+  </section>
+  <section class="pane">
+    <h2>SYSTEM HEALTH</h2>
+    <div class="chart" id="chart" title="Articles per hour, last 24h"></div>
+    <div class="health-list" id="health"></div>
+    <div class="err-block">
+      <h3>ERRORS</h3>
+      <div id="errors"></div>
+    </div>
+    <div class="err-block">
+      <h3>RECENT EVENTS</h3>
+      <div id="events"></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div>PORT 8765 &middot; FASTAPI &middot; SQLITE</div>
+  <div id="foot-info">--</div>
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let currentFilter = "all";
+let knownIds = new Set();
+let lastArticles = [];
+let firstLoad = true;
+
+function fmtUptime(s){
+  s = Math.max(0, s|0);
+  const h = (s/3600)|0, m = ((s%3600)/60)|0, sec = s%60;
+  if(h) return `${h}h ${m}m`;
+  if(m) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+function ageStr(iso){
+  if(!iso) return "";
+  const t = new Date(iso).getTime();
+  if(isNaN(t)) return "";
+  const d = (Date.now() - t)/1000;
+  if(d < 60) return Math.floor(d)+"s";
+  if(d < 3600) return Math.floor(d/60)+"m";
+  if(d < 86400) return Math.floor(d/3600)+"h";
+  return Math.floor(d/86400)+"d";
+}
+function scoreClass(s){
+  if(s >= 8) return "red";
+  if(s >= 5) return "yellow";
+  return "grey";
+}
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function tickClock(){
+  $("clock").textContent = new Date().toTimeString().slice(0,8);
+}
+setInterval(tickClock, 1000); tickClock();
+
+function applyStats(data){
+  if(!data) return;
+  $("s-total").textContent    = (data.total ?? "--").toLocaleString();
+  $("s-urgent").textContent   = (data.urgent ?? "--").toLocaleString();
+  $("s-unscored").textContent = (data.unscored ?? "--").toLocaleString();
+  $("s-db").textContent       = (data.db_mb ?? "--");
+  const ml = data.ml || {};
+  const mlOk = ml.trained || data.ml_fitted;
+  $("s-ml").textContent = mlOk ? "OK" : "OFF";
+  $("s-ml").style.color = mlOk ? "var(--green)" : "var(--red)";
+  $("s-rate").textContent = (data.articles_last_hour ?? "--");
+
+  const svc = data.service || {};
+  const active = (svc.active === "active") || data.service_active === true;
+  $("service-text").textContent = active ? "ACTIVE" : (svc.active || "UNKNOWN").toUpperCase();
+  $("service").querySelector(".dot").className = "dot " + (active ? "green" : "red");
+
+  const upt = svc.uptime_s ?? data.uptime_s ?? data.server_uptime_s ?? 0;
+  $("foot-info").textContent = `DB ${data.db_mb||0} MB · ${data.total||0} articles · up ${fmtUptime(upt)}`;
+}
+
+function renderArticles(arts){
+  lastArticles = arts || [];
+  const filtered = arts.filter(a => {
+    if(currentFilter === "urgent") return (a.urgency >= 1) || (a.score >= 8);
+    if(currentFilter === "unscored") return !a.ai_score;
+    return true;
+  });
+  const root = $("articles");
+  if(!filtered.length){
+    root.innerHTML = '<div class="empty">no articles match filter</div>';
+    knownIds = new Set(); return;
+  }
+  const newIds = new Set();
+  const frag = document.createDocumentFragment();
+  for(const a of filtered){
+    newIds.add(a.id);
+    const sc = scoreClass(a.score || 0);
+    const fresh = !firstLoad && !knownIds.has(a.id);
+    const row = document.createElement("div");
+    row.className = "article " + sc + (fresh ? " flash" : "");
+    row.title = a.title || "";
+    row.innerHTML = `
+      <div class="score">${(a.score||0).toFixed(1)}</div>
+      <div class="src">${escapeHtml((a.source||"?").slice(0,12))}</div>
+      <div class="title"><a href="${a.url}" target="_blank" rel="noopener">${escapeHtml(a.title||"")}</a></div>
+      <div class="age">${ageStr(a.published || a.first_seen)}</div>
+    `;
+    frag.appendChild(row);
+  }
+  root.innerHTML = "";
+  root.appendChild(frag);
+  knownIds = newIds;
+  firstLoad = false;
+}
+
+function renderHealth(payload){
+  if(!payload) return;
+
+  // CRITICAL banner — shown when all core workers (rss/web/reddit/scorer) are stale.
+  const cs = payload.core_status || {};
+  const banner = $("critical-banner");
+  if(banner){
+    if(cs.critical){
+      banner.style.display = "block";
+      banner.textContent = "⚠ CRITICAL: CORE WORKERS DOWN — " + (cs.down || []).join(", ").toUpperCase() + " ⚠";
+    } else {
+      banner.style.display = "none";
+    }
+  }
+
+  // Service status indicator (header pill is the primary surface; refresh
+  // it here too so the health-channel update keeps it in sync).
+  const svc = payload.service || {};
+  if(svc.active){
+    const active = svc.active === "active";
+    $("service-text").textContent = active ? "ACTIVE" : svc.active.toUpperCase();
+    $("service").querySelector(".dot").className = "dot " + (active ? "green" : "red");
+  }
+
+  const workers = payload.workers || [];
+  const root = $("health");
+  root.innerHTML = "";
+  if(!workers.length){
+    root.innerHTML = '<div class="empty">no worker activity</div>';
+  } else {
+    for(const w of workers){
+      const cls = w.status === "ok" ? "green" : w.status === "warn" ? "yellow" : w.status === "stale" ? "red" : "grey";
+      const ago = w.last_seen_s != null ? Math.floor(w.last_seen_s) + "s ago" : "never";
+      const stateBadge = (w.state && w.state !== "ok")
+        ? `<span class="badge ${escapeHtml(w.state)}">${escapeHtml(w.state.toUpperCase())}</span>` : "";
+      const crashBadge = (w.crashes_5m && w.crashes_5m > 0)
+        ? `<span class="badge crashes">${w.crashes_5m}× 5m</span>` : "";
+      const totalBadge = (w.total_crashes && w.total_crashes > 0)
+        ? `<span class="badge">↻${w.total_crashes}</span>` : "";
+      const exc = w.last_exception ? ` · ${escapeHtml(w.last_exception)}` : "";
+      const row = document.createElement("div");
+      row.className = "health-row";
+      row.innerHTML = `
+        <div class="name"><span class="dot ${cls}"></span>${escapeHtml(w.name)}</div>
+        <div class="meta">${stateBadge}${crashBadge}${totalBadge}<span class="ago">${ago}${exc}</span></div>`;
+      root.appendChild(row);
+    }
+  }
+  const errRoot = $("errors");
+  const errs = payload.errors || [];
+  errRoot.innerHTML = errs.length
+    ? errs.map(e => {
+        const ts = (e.ts||"").slice(11,19);
+        return `<div class="err-line" title="${escapeHtml(e.msg||"")}"><span class="ts">${ts}</span>[${escapeHtml(e.level||"")}] ${escapeHtml((e.msg||"").slice(0,160))}</div>`;
+      }).join("")
+    : '<div class="empty">no errors</div>';
+
+  const evRoot = $("events");
+  const last = payload.last || {};
+  const items = [];
+  if(last.heartbeat) items.push({ts:last.heartbeat.ts, msg:"[heartbeat] "+last.heartbeat.msg});
+  if(last.alert) items.push({ts:last.alert.ts, msg:"[alert] "+last.alert.msg});
+  evRoot.innerHTML = items.length
+    ? items.map(e => {
+        const ts = (e.ts||"").slice(11,19);
+        return `<div class="err-line" title="${escapeHtml(e.msg)}"><span class="ts">${ts}</span>${escapeHtml(e.msg.slice(0,180))}</div>`;
+      }).join("")
+    : '<div class="empty">no recent events</div>';
+}
+
+function renderChart(buckets){
+  const root = $("chart");
+  if(!buckets || !buckets.length){ root.innerHTML = ""; return; }
+  const max = Math.max(1, ...buckets.map(b => b.count));
+  root.innerHTML = buckets.map(b => {
+    const h = Math.max(1, Math.round((b.count / max) * 44));
+    return `<div class="bar" style="height:${h}px" title="${b.count} articles"></div>`;
+  }).join("");
+}
+
+// Stat card filters
+document.querySelectorAll(".stat").forEach(el => {
+  el.addEventListener("click", () => {
+    document.querySelectorAll(".stat").forEach(s => s.classList.remove("active"));
+    el.classList.add("active");
+    currentFilter = el.dataset.filter || "all";
+    firstLoad = true;
+    renderArticles(lastArticles);
+  });
+});
+
+// WebSocket with auto-reconnect
+let ws = null, wsRetry = 1000;
+function connectWS(){
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  // When served through the unified proxy on :8888 the upgrade endpoint is /ops/ws.
+  // Direct connections to the FastAPI ops server (:8765) still expose /ws.
+  const wsPath = location.pathname.startsWith("/ops") ? "/ops/ws" : "/ws";
+  ws = new WebSocket(`${proto}//${location.host}${wsPath}`);
+  const setState = (cls, txt) => {
+    $("ws-state").querySelector(".dot").className = "dot " + cls;
+    $("ws-text").textContent = txt;
+  };
+  setState("yellow", "CONNECTING");
+  ws.onopen = () => { setState("green", "LIVE"); wsRetry = 1000; };
+  ws.onclose = () => {
+    setState("red", "OFFLINE");
+    setTimeout(connectWS, wsRetry);
+    wsRetry = Math.min(wsRetry * 2, 15000);
+  };
+  ws.onerror = () => { try{ ws.close(); }catch(e){} };
+  ws.onmessage = (ev) => {
+    try{
+      const m = JSON.parse(ev.data);
+      if(m.type === "stats")    applyStats(m.data);
+      else if(m.type === "articles") renderArticles(m.data || []);
+      else if(m.type === "health")   renderHealth(m.data || {});
+      else if(m.type === "chart")    renderChart(m.data || []);
+      else if(m.type === "alert"){
+        const u = (m.data && (m.data.urgent_total ?? m.data.urgent));
+        if(u != null) document.title = `(${u}!) Digital Intern`;
+      }
+    }catch(e){}
+  };
+}
+
+// Derive API prefix so calls work both directly (:8765) and through proxy (/ops/)
+const API_PREFIX = location.pathname.startsWith("/ops") ? "/ops" : "";
+
+// Initial HTTP load (in case WS is slow)
+async function bootHttp(){
+  try{ applyStats(await (await fetch(API_PREFIX + "/api/stats")).json()); }catch(e){}
+  try{ renderArticles(await (await fetch(API_PREFIX + "/api/articles?limit=80")).json()); }catch(e){}
+  try{ renderHealth(await (await fetch(API_PREFIX + "/api/health")).json()); }catch(e){}
+  try{ renderChart(await (await fetch(API_PREFIX + "/api/articles_per_hour")).json()); }catch(e){}
+}
+bootHttp();
+connectWS();
+</script>
+</body>
+</html>
