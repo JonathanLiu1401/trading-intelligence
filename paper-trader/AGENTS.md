@@ -703,6 +703,33 @@ module constants; verdicts are exact-value test-locked in
 > change: altering the model/gate is a training-dynamics change out of
 > scope for a surgical review (CLAUDE.md §6, AGENTS.md "When to bump
 > model versions").
+>
+> **Update (2026-05-17 second pass).** The negative-skill picture is no
+> longer uniform: the last 8 logged statuses show `oos_rmse` of
+> 8.18 / 17.36 / 14.62 / 10.56 / 11.73 / 11.78 / 10.51 / 9.36 — i.e.
+> recent cycles cluster *around* the σ≈11.7 mean-predictor baseline rather
+> than uniformly above it, so OOS skill is now borderline/regime-dependent,
+> not flatly negative. In-sample re-measured the same day: spearman 0.50,
+> monotone deciles, 1.60 pp mean decile error, but the tails still
+> over-predict (d10 pred +11.76 vs realized +6.64; d1 −8.05 vs −4.47) —
+> exactly the extrapolation the new off-distribution gate-abstention guards.
+> The grep-the-log method is fragile; the **wired
+> `data/scorer_skill_log.jsonl` ledger is now the durable trend source** —
+> use it to judge whether this borderline state is improving as
+> `decision_outcomes.jsonl` accumulates.
+>
+> **Operational note (2026-05-17).** The *running* continuous-loop process
+> predates all of the above commits, so it is still on stale code: no
+> `oos_diracc`/`oos_ic`, no `scorer_skill_log.jsonl`, no
+> `winner_training.jsonl` trim (file ~322 MB), no off-distribution gate,
+> startup-only orphan reap. **Restart `run_continuous_backtests.py` to
+> deploy these fixes** — they are inert until then. Separately,
+> `_inject_and_train` has been logging `trainer timeout` on ~4 of every 5
+> recent cycles (digital-intern's `ml.trainer.train(force=True)` exceeds the
+> 120 s cap, likely GPU contention) — the winner→ArticleNet feedback loop
+> (CLAUDE.md §5 step 5) is effectively non-functional; injection still
+> succeeds, training does not. Reported, not fixed (root cause is
+> GPU-side / out of this domain's surgical scope).
 
 ### Position sizing invariant (`_ml_decide`)
 
@@ -730,13 +757,93 @@ qty (`p<-10 → 75.0`, `-10≤p<0 → 106.25`, `0≤p≤5 → 125.0`, `5<p≤10 
 #5). Any change to the gate thresholds or multipliers must update these
 assertions deliberately.
 
+**Off-distribution gate abstention (2026-05-17).** `_ml_decide` now calls
+`_scorer.predict_with_meta()` (falling back to the plain `predict()` scalar
+for the `_Dummy` stub / predict-only test fakes, treated as in-distribution).
+When the scorer flags `off_distribution=True` — the unbounded MLP head
+extrapolated beyond `±PRED_CLAMP_PCT`, or `predict` raised / went non-finite
+— the five conviction arms are **skipped entirely**: the quant-derived
+conviction is left untouched rather than modulated on a clamped ±50 that
+carries no information (AGENTS.md already documents the head emitting −89→+32
+for the *same* LITE vector across retrains). In-distribution behaviour is
+byte-identical to before (`predict()` delegates to
+`predict_with_meta()["pred"]`), so every exact-value `TestMlDecideScorerGate`
+assertion is unchanged. The abstention is surfaced in the decision
+`reasoning` as `scorer=…%(off-dist,gate-skipped)`. Locked by
+`tests/test_ml_backtest_review.py::TestMlDecideOffDistributionGate`
+(catastrophic −50 off-dist → conviction unchanged; in-dist meta path still
+modulates identically; reasoning surfaces the skip; independent of the
+`n_train<500` guard).
+
+### Continuous-loop durability & honesty (2026-05-17)
+
+- **Scorer-skill ledger now wired in.** `_append_scorer_skill_log` /
+  `_parse_scorer_status` existed but were **never called** — the durable
+  per-cycle OOS-skill audit trail was dead code; the metrics only reached
+  the ephemeral, rotated `continuous.log`. `main()` now appends exactly one
+  structured row per cycle to `data/scorer_skill_log.jsonl`
+  (`{cycle, timestamp, window_*, status, train_n, val_rmse, oos_n, oos_rmse,
+  oos_dir_acc, oos_ic, gate_active}`). On a non-training cycle (no outcome
+  records) it writes the `no outcome records` sentinel with a
+  `_deployed_scorer_n_train()` hint so `gate_active` (⇔ deployed
+  `n_train ≥ 500`, invariant #5) stays truthful. Bounded at
+  `SCORER_SKILL_LOG_KEEP=2000` via the atomic tmp+`.replace` idiom.
+  **This is the canonical instrument for the negative-OOS-skill question
+  below — query it, not grep'd log lines.** Locked by
+  `tests/test_continuous.py::TestParseScorerStatus` /
+  `TestAppendScorerSkillLog` / `TestDeployedScorerNTrain` /
+  `TestCycleWiringRegression`.
+
+- **`winner_training.jsonl` is now bounded.** It had grown to ~322 MB /
+  860 k lines, unbounded, while every sibling JSONL is trimmed — a latent
+  disk-full risk (the OSError [Errno 28] class noted in
+  `decision_scorer.py`). `_trim_winner_jsonl()` (called once per cycle from
+  `main()`) keeps the last `WINNER_JSONL_KEEP=50000` records via the same
+  atomic tmp+`.replace` idiom; far above the 10 k `_inject_and_train` tail so
+  the consumer is never starved (older rows are already idempotently in
+  `articles.db`). Locked by `TestTrimWinnerJsonl`.
+
+- **Per-cycle orphan reap.** `_reap_orphaned_runs()` was startup-only, so a
+  run thread hard-killed mid-cycle (OOM/SIGKILL — never reaches
+  `finalize_run` or `run_all`'s caught-`failed` marker) stayed
+  `status='running'` forever for a long-lived loop (observed live: 15 rows
+  stuck 35 h while ~170 newer runs completed — the "dashboard shows running
+  forever" symptom, CLAUDE.md §11). `main()` now also reaps once per cycle;
+  the reaper is idempotent, best-effort and 6 h-age-guarded so it can never
+  touch a live run. Locked by
+  `TestCycleWiringRegression::test_main_reaps_orphans_per_cycle_not_only_at_startup`.
+
+- **`vs_spy_pct` benchmark-honesty flag.** yfinance intermittently fails to
+  return SPY for a window; `PriceCache` then persists an **empty SPY series**
+  (verified: `prices_2021-08-02_2025-08-01.json` had `SPY_rows={}` while 116
+  other tickers loaded). `_build_trading_days` falls back to another ticker's
+  calendar so the run still completes, but `returns_pct("SPY",…)` returns
+  `0.0` → `vs_spy_pct == total_return` with **no real benchmark** (80/485
+  complete runs / 16 windows live). The NOT NULL DEFAULT 0 schema
+  (invariant #13) blocks a true NULL, so `run_one` now writes a
+  `benchmark_unavailable: …` string into the additive nullable `notes`
+  column + a stderr WARNING. **Purely informational — zero change to
+  returns, winner selection, or the live `_ml_is_qualified` gate.** Locked by
+  `tests/test_integration_backtest.py::TestBenchmarkUnavailableNote`.
+  > **Still open (reported, not fixed — out of surgical scope):** the
+  > poisoned per-window price cache re-fabricates this every cycle the
+  > window is drawn (the cache-validity check accepts an empty SPY series
+  > because SPY is still listed in `_meta.tickers`), and the live trader's
+  > `_ml_is_qualified` median-alpha gate (CLAUDE.md §15) counts these
+  > `notes`-flagged runs because it filters on `vs_spy_pct IS NOT NULL`
+  > (always true under NOT NULL). Treat any `vs_spy_pct` skeptically until a
+  > cache-validity / gate-side fix lands. Read `notes` before trusting a
+  > run's alpha.
+
 ### Tests (ML + backtest section)
 
 ```bash
-# ML + backtest only — keep "calibration" in the filter: test_calibration.py
-# has none of "ml"/"backtest"/"scorer" in its node ids and is silently
-# missed by the older 3-term filter.
-cd /home/zeph/paper-trader && python3 -m pytest tests/ -v -k "ml or backtest or scorer or calibration"
+# ML + backtest only — keep "calibration" AND "continuous" in the filter:
+# test_calibration.py and test_continuous.py have none of "ml"/"backtest"/
+# "scorer" in their node ids and are silently missed by the older filters
+# (test_continuous.py holds the continuous-loop + scorer-skill-ledger +
+# winner-trim + reaper-wiring locks).
+cd /home/zeph/paper-trader && python3 -m pytest tests/ -v -k "ml or backtest or scorer or calibration or continuous"
 
 # Core (live trader) only
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_core_*.py -v
