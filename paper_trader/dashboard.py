@@ -995,6 +995,49 @@ TEMPLATE = r"""
       </div>
     </div>
 
+    <!-- ─── Loser autopsy (per-closed-losing-trade post-mortem) ─── -->
+    <div class="card" id="lautopsy-card" style="margin-bottom:18px;">
+      <h2 style="display:flex;justify-content:space-between;align-items:center;">
+        <span>Loser autopsy <span class="muted" style="font-size:11px;text-transform:none;letter-spacing:normal;font-weight:normal;">— why each closed trade lost: verbatim thesis, hold, failure mode</span></span>
+        <span id="lautopsy-state" style="font-size:12px;padding:3px 10px;border-radius:4px;background:#1f2126;color:#8b929d;">—</span>
+      </h2>
+      <div class="muted" id="lautopsy-headline" style="font-size:12px;margin-bottom:12px;">loading…</div>
+      <div class="stat-row" style="margin-bottom:14px;">
+        <div class="stat"><div class="l">total realised loss</div><div class="v" id="lautopsy-total">—</div></div>
+        <div class="stat"><div class="l">losing round-trips</div><div class="v" id="lautopsy-n">—</div></div>
+        <div class="stat"><div class="l">avg loss</div><div class="v" id="lautopsy-avg">—</div></div>
+        <div class="stat"><div class="l">median hold</div><div class="v" id="lautopsy-hold">—</div></div>
+        <div class="stat"><div class="l">dominant mode</div><div class="v" id="lautopsy-mode">—</div></div>
+      </div>
+      <table id="lautopsy-tbl" style="font-size:12px;width:100%;">
+        <thead><tr>
+          <th>ticker</th><th class="num">P/L $</th><th class="num">P/L %</th>
+          <th class="num">hold d</th><th>mode</th><th>opening thesis</th>
+        </tr></thead>
+        <tbody><tr><td colspan="6" class="muted">loading…</td></tr></tbody>
+      </table>
+    </div>
+
+    <!-- ─── Concentration honesty (do the held names move together?) ─── -->
+    <div class="card" id="pcorr-card" style="margin-bottom:18px;">
+      <h2 style="display:flex;justify-content:space-between;align-items:center;">
+        <span>Concentration honesty <span class="muted" style="font-size:11px;text-transform:none;letter-spacing:normal;font-weight:normal;">— pairwise return ρ &amp; effective independent bets</span></span>
+        <span id="pcorr-state" style="font-size:12px;padding:3px 10px;border-radius:4px;background:#1f2126;color:#8b929d;">—</span>
+      </h2>
+      <div class="muted" id="pcorr-headline" style="font-size:12px;margin-bottom:12px;">loading…</div>
+      <div class="stat-row" style="margin-bottom:14px;">
+        <div class="stat"><div class="l">mean pairwise ρ</div><div class="v" id="pcorr-meanrho">—</div></div>
+        <div class="stat"><div class="l">effective bets</div><div class="v" id="pcorr-effbets">—</div></div>
+        <div class="stat"><div class="l">naive eff. positions</div><div class="v" id="pcorr-effnaive">—</div></div>
+        <div class="stat"><div class="l">top weight</div><div class="v" id="pcorr-topw">—</div></div>
+        <div class="stat"><div class="l">most-coupled pair</div><div class="v" id="pcorr-maxpair">—</div></div>
+      </div>
+      <table id="pcorr-tbl" style="font-size:12px;width:100%;">
+        <thead><tr><th>pair</th><th class="num">ρ</th></tr></thead>
+        <tbody><tr><td colspan="2" class="muted">loading…</td></tr></tbody>
+      </table>
+    </div>
+
     <!-- ─── Capital Paralysis & Unlock Ladder (wired 2026-05-16, agent 4) ─── -->
     <div class="card" id="cp-card" style="margin-bottom:18px;">
       <h2 style="display:flex;justify-content:space-between;align-items:center;">
@@ -4049,6 +4092,123 @@ async function refreshTradeAsymmetry() {
   dg.style.color = (r.disposition_gap_days != null && r.disposition_gap_days < 0) ? "#ff4455" : _plColor(r.disposition_gap_days);
 }
 
+// ───────── Loser autopsy + concentration honesty (new, agent 4) ─────────
+// Same /api/build-info `stale` degrade contract as the behavioural cluster:
+// a process that booted before these endpoints' commit 404s them → explicit
+// "restart to apply" instead of a silent console error. Table bodies are
+// built with DOM nodes + textContent (never innerHTML) so a verbatim
+// entry-reason string can't inject markup.
+const _LA_MODE_COLOR = {
+  KNIFE_CATCH: ["#b71c1c", "#ffffff"],
+  SLOW_BLEED:  ["#b8860b", "#000000"],
+  STOPPED_OUT: ["#1f2126", "#dde1e7"],
+  WHIPSAW:     ["#1f3a5f", "#9ec5ff"],
+};
+function _cell(text, cls) {
+  const td = document.createElement("td");
+  if (cls) td.className = cls;
+  td.textContent = (text == null ? "—" : String(text));
+  return td;
+}
+async function refreshLoserAutopsy() {
+  const r = await fetchMaybeStale("/api/loser-autopsy");
+  if (r.__unavailable) { markStale("lautopsy-state", "lautopsy-headline", "Loser-autopsy endpoint"); return; }
+  if (r.error) { document.getElementById("lautopsy-headline").textContent = "error: " + r.error; return; }
+  const sEl = document.getElementById("lautopsy-state");
+  if (r.state === "STABLE" && r.verdict) {
+    const [bg, fg] = _LA_MODE_COLOR[r.verdict] || _LA_MODE_COLOR.STOPPED_OUT;
+    sEl.textContent = r.verdict.replace(/_/g, " ");
+    sEl.style.background = bg; sEl.style.color = fg;
+  } else {
+    const sb = { EMERGING: ["#3a2a00", "#ffd479"], NO_DATA: ["#1f2126", "#8b929d"], NO_LOSSES: ["#1b5e20", "#a5d6a7"] };
+    const [bg, fg] = sb[r.state] || sb.NO_DATA;
+    sEl.textContent = r.state || "—";
+    sEl.style.background = bg; sEl.style.color = fg;
+  }
+  document.getElementById("lautopsy-headline").textContent = r.headline || "";
+  const tot = document.getElementById("lautopsy-total");
+  tot.textContent = r.total_loss_usd != null ? _sgn(r.total_loss_usd) + "$" + fmt(Math.abs(r.total_loss_usd)) : "—";
+  tot.style.color = _plColor(r.total_loss_usd);
+  document.getElementById("lautopsy-n").textContent = r.n_losers != null ? (r.n_losers + " / " + r.n_round_trips + " RT") : "—";
+  const avg = document.getElementById("lautopsy-avg");
+  avg.textContent = r.avg_loss_usd != null ? _sgn(r.avg_loss_usd) + "$" + fmt(Math.abs(r.avg_loss_usd)) : "—";
+  avg.style.color = _plColor(r.avg_loss_usd);
+  document.getElementById("lautopsy-hold").textContent = r.median_loser_hold_days != null ? fmt(r.median_loser_hold_days, 2) + "d" : "—";
+  document.getElementById("lautopsy-mode").textContent = r.dominant_failure_mode ? r.dominant_failure_mode.replace(/_/g, " ") : "—";
+  const tb = document.querySelector("#lautopsy-tbl tbody");
+  tb.replaceChildren();
+  const cards = r.worst_losers || [];
+  if (!cards.length) {
+    const tr = document.createElement("tr");
+    const td = _cell(r.state === "NO_LOSSES" ? "no losing round-trips" : "no data", "muted");
+    td.colSpan = 6; tr.appendChild(td); tb.appendChild(tr);
+  } else {
+    for (const c of cards) {
+      const tr = document.createElement("tr");
+      tr.appendChild(_cell(c.ticker));
+      const pl = _cell((c.pnl_usd >= 0 ? "+" : "") + "$" + fmt(Math.abs(c.pnl_usd)), "num");
+      pl.style.color = _plColor(c.pnl_usd);
+      tr.appendChild(pl);
+      tr.appendChild(_cell(c.pnl_pct != null ? (c.pnl_pct >= 0 ? "+" : "") + fmt(c.pnl_pct, 1) + "%" : "—", "num"));
+      tr.appendChild(_cell(c.hold_days != null ? fmt(c.hold_days, 2) : "—", "num"));
+      tr.appendChild(_cell(c.failure_mode ? c.failure_mode.replace(/_/g, " ") : "—"));
+      tr.appendChild(_cell(c.entry_reason || "—"));
+      tb.appendChild(tr);
+    }
+  }
+}
+
+async function refreshCorrelation() {
+  const r = await fetchMaybeStale("/api/correlation");
+  if (r.__unavailable) { markStale("pcorr-state", "pcorr-headline", "Concentration-honesty endpoint"); return; }
+  if (r.error) { document.getElementById("pcorr-headline").textContent = "error: " + r.error; return; }
+  const vmap = {
+    SINGLE_NAME_RISK: ["#b71c1c", "#ffffff"],
+    CONCENTRATED:     ["#b8860b", "#000000"],
+    MODERATE:         ["#1f3a5f", "#9ec5ff"],
+    DIVERSIFIED:      ["#1b5e20", "#a5d6a7"],
+  };
+  const sEl = document.getElementById("pcorr-state");
+  if (r.state === "OK" && r.verdict) {
+    const [bg, fg] = vmap[r.verdict] || vmap.MODERATE;
+    sEl.textContent = r.verdict.replace(/_/g, " ");
+    sEl.style.background = bg; sEl.style.color = fg;
+  } else {
+    const sb = { INSUFFICIENT: ["#3a2a00", "#ffd479"], NO_DATA: ["#1f2126", "#8b929d"] };
+    const [bg, fg] = sb[r.state] || sb.NO_DATA;
+    sEl.textContent = r.state || "—";
+    sEl.style.background = bg; sEl.style.color = fg;
+  }
+  document.getElementById("pcorr-headline").textContent = r.headline || "";
+  const mr = document.getElementById("pcorr-meanrho");
+  mr.textContent = r.mean_pairwise_corr != null ? (r.mean_pairwise_corr >= 0 ? "+" : "") + fmt(r.mean_pairwise_corr, 2) : "—";
+  // High co-movement is the risk → red as ρ climbs.
+  mr.style.color = (r.mean_pairwise_corr != null && r.mean_pairwise_corr >= 0.7) ? "#ff4455"
+                 : (r.mean_pairwise_corr != null && r.mean_pairwise_corr >= 0.4) ? "#ffd479" : "#dde1e7";
+  document.getElementById("pcorr-effbets").textContent = r.effective_independent_bets != null ? fmt(r.effective_independent_bets, 2) : "—";
+  document.getElementById("pcorr-effnaive").textContent = r.effective_positions_naive != null ? fmt(r.effective_positions_naive, 2) : "—";
+  document.getElementById("pcorr-topw").textContent = r.top_weight_pct != null ? fmt(r.top_weight_pct, 1) + "% " + (r.top_weight_ticker || "") : "—";
+  document.getElementById("pcorr-maxpair").textContent = (r.max_pair && r.max_pair.tickers)
+    ? r.max_pair.tickers.join("/") + " " + (r.max_pair.corr >= 0 ? "+" : "") + fmt(r.max_pair.corr, 2) : "—";
+  const tb = document.querySelector("#pcorr-tbl tbody");
+  tb.replaceChildren();
+  const pairs = (r.pairs || []).slice().sort((a, b) => (b.corr ?? -2) - (a.corr ?? -2));
+  if (!pairs.length) {
+    const tr = document.createElement("tr");
+    const td = _cell(r.state === "NO_DATA" ? "no stock positions" : "not enough overlapping history", "muted");
+    td.colSpan = 2; tr.appendChild(td); tb.appendChild(tr);
+  } else {
+    for (const p of pairs) {
+      const tr = document.createElement("tr");
+      tr.appendChild(_cell(p.a + " / " + p.b));
+      const c = _cell(p.corr != null ? (p.corr >= 0 ? "+" : "") + fmt(p.corr, 2) : "n/a", "num");
+      c.style.color = (p.corr != null && p.corr >= 0.7) ? "#ff4455" : (p.corr != null && p.corr >= 0.4) ? "#ffd479" : "#dde1e7";
+      tr.appendChild(c);
+      tb.appendChild(tr);
+    }
+  }
+}
+
 // ───────── Overtrading/churn + thesis-drift (new 2026-05-16, agent 4) ─────────
 // Same stale-degrade contract as the behavioural cluster above: a process
 // that booted before these endpoints' commit 404s them → explicit
@@ -4586,6 +4746,8 @@ refreshFundedSuggestions();
 refreshSignalFollowThrough();
 refreshChurn();
 refreshThesisDrift();
+refreshLoserAutopsy();
+refreshCorrelation();
 refreshSourceEdge();
 refreshScorecard();
 refreshSessionDelta();
@@ -4623,6 +4785,8 @@ setInterval(refreshFundedSuggestions, 45_000);
 setInterval(refreshSignalFollowThrough, 300_000);
 setInterval(refreshChurn, 60_000);
 setInterval(refreshThesisDrift, 60_000);
+setInterval(refreshLoserAutopsy, 60_000);
+setInterval(refreshCorrelation, 120_000);
 setInterval(refreshSourceEdge, 300_000);
 setInterval(refreshScorecard, 60_000);
 setInterval(refreshSessionDelta, 60_000);
@@ -6662,6 +6826,71 @@ def trade_asymmetry_api():
         # Same trades convention as /api/analytics: oldest → newest.
         trades = list(reversed(store.recent_trades(2000)))
         return jsonify(build_trade_asymmetry(trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/loser-autopsy")
+def loser_autopsy_api():
+    """Per-closed-losing-round-trip post-mortem — the desk question no panel
+    answers. /api/thesis-drift re-tests *open* positions against their
+    opening rationale; /api/trade-asymmetry gives *aggregate* payoff math;
+    /api/churn counts re-entry *cadence*. None tell the story of *why each
+    closed trade lost*. This composes the single source of truth
+    (build_round_trips, AGENTS.md #10) and joins the verbatim entry/exit
+    reason back from the contributing trade rows, classifies each loss into
+    an objective failure mode (KNIFE_CATCH / WHIPSAW / SLOW_BLEED /
+    STOPPED_OUT), and rolls up which name is the bleed + which mode
+    dominates. The pattern verdict is withheld until n≥8 losers
+    (trade_asymmetry STABLE idiom). Advisory only — never gates Opus, adds
+    no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.loser_autopsy import build_loser_autopsy
+        store = get_store()
+        # Same trades convention as /api/analytics & /api/trade-asymmetry:
+        # oldest → newest (build_round_trips reads in sequence).
+        trades = list(reversed(store.recent_trades(2000)))
+        return jsonify(build_loser_autopsy(trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/correlation")
+def correlation_api():
+    """Concentration honesty — do the held names actually move together?
+    /api/risk reports name-level concentration + a single SPY-shock; it
+    cannot see whether the book is really one *factor* bet. This computes
+    pairwise return correlation among held stock positions, the
+    weight-Herfindahl effective-position count, and the
+    correlation-adjusted effective number of *independent* bets (collapses
+    toward 1 as the names co-move however many tickers are on the book).
+    Options are flagged & skipped (the open_attribution "stocks only"
+    carve-out). The builder is pure; the yfinance fetch lives here (the
+    thesis_drift split) and degrades to INSUFFICIENT, never an error.
+    Advisory only — never gates Opus, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.correlation import build_correlation
+        store = get_store()
+        positions = store.open_positions()
+        poss, price_history = [], {}
+        for p in positions:
+            ptype = p.get("type")
+            kind = ptype if ptype in ("call", "put") else "stock"
+            mult = 100 if kind in ("call", "put") else 1
+            price = p.get("current_price") or p.get("avg_cost") or 0.0
+            qty = float(p.get("qty") or 0.0)
+            poss.append({
+                "ticker": p.get("ticker"),
+                "market_value": round(float(price) * qty * mult, 2),
+                "type": kind,
+            })
+            if kind == "stock" and p.get("ticker") not in price_history:
+                try:
+                    bars = _daily_history_cached(p["ticker"], "3mo")
+                    price_history[p["ticker"]] = [c for _, c in bars]
+                except Exception:
+                    price_history[p["ticker"]] = []
+        return jsonify(build_correlation(poss, price_history))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
