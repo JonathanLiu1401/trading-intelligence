@@ -320,7 +320,11 @@ Test commands:
 Update AGENTS.md with any new features, endpoints, or architecture changes.
 
 ## Step 7 — Commit
-git add -A && git commit -m "feature: [description]" && git push
+COMMIT GUARD (apply per repo you touched — paper-trader and/or digital-intern):
+In whichever repo you changed files in, run: git diff --stat HEAD
+  - If the diff is empty, or contains ONLY whitespace/comment changes, or ONLY AGENTS.md edits with no real feature work: do NOT commit in that repo.
+  - If you implemented a real feature or change: stage ONLY the specific files you actually changed (NEVER git add -A — never stage config/, data/, logs/, *.json data files), run git diff --staged to verify only your intentional changes are staged, then git commit -m "feature: [specific description]" and git push.
+If after honest effort nothing meaningful changed in any repo, make no commit and still send the completion message below with built: none.
 
 Completion: openclaw message send --channel discord --target channel:1496099475838603324 --message "[FEATURE] Agent 4 (feature-dev) done — built: [specific list], tests: [N passed]"
 Failure: openclaw message send --channel discord --target channel:1496099475838603324 --message "[FEATURE] Agent 4 (feature-dev) FAILED: [reason]"' \
