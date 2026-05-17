@@ -522,7 +522,8 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    sp500: float | None, market_open: bool,
                    quant_signals: dict[str, dict] | None = None,
                    self_review_block: str | None = None,
-                   track_record_block: str | None = None) -> str:
+                   track_record_block: str | None = None,
+                   risk_mirror_block: str | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
     pos_lines = []
     for p in snapshot["positions"]:
@@ -576,6 +577,11 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # aggregate mirror so the trader sees its concrete history on the exact
     # names in play before market data biases it.
     track_section = f"{track_record_block}\n" if track_record_block else ""
+    # Concentration + churn mirror — same observational/advisory contract as
+    # the two mirrors above (invariants #2/#12). Placed last in the
+    # behavioural stack so the trader sees its structural risk (book shape +
+    # turnover) right after its history and before market data biases it.
+    risk_section = f"{risk_mirror_block}\n" if risk_mirror_block else ""
 
     return f"""TIME (UTC): {now}
 MARKET_OPEN: {market_open}
@@ -587,7 +593,7 @@ PORTFOLIO:
   total value: ${snapshot['total_value']:.2f}
   positions:
 {chr(10).join(pos_lines) if pos_lines else '  (none)'}
-{review_section}{track_section}
+{review_section}{track_section}{risk_section}
 WATCHLIST PRICES:
 {chr(10).join(px_lines)}
 
@@ -1052,6 +1058,27 @@ def decide() -> dict:
     except Exception as e:
         print(f"[strategy] track-record failed (non-fatal): {e}")
 
+    # Concentration + churn mirror — the trader's *structural* risk (how
+    # bunched the book is + how much it churns), composed verbatim from the
+    # correlation/churn builders (single source of truth, invariant #10).
+    # No price history is fetched here on purpose: a per-position yfinance
+    # call is a latency/flake risk on a live cycle, and the weight-based
+    # concentration (top weight / HHI / effective names) still fires without
+    # it. Observational only (the self-review precedent); wrapped so a
+    # diagnostics fault is "no risk-mirror block this cycle", never "no
+    # decision this cycle". `recent_trades` is passed store-native
+    # (newest-first); build_risk_mirror reverses it for build_churn itself.
+    risk_mirror_block: str | None = None
+    try:
+        from .analytics.risk_mirror import build_risk_mirror
+        rm = build_risk_mirror(
+            store.recent_trades(2000),
+            snap.get("positions") or [],
+        )
+        risk_mirror_block = rm.get("prompt_block")
+    except Exception as e:
+        print(f"[strategy] risk-mirror failed (non-fatal): {e}")
+
     # ML advisor: when model consistently beats SPY, include its opinion in prompt
     ml_opinion_block: str | None = None
     ml_qualified, ml_qual_reason = _ml_is_qualified()
@@ -1073,7 +1100,8 @@ def decide() -> dict:
     payload = _build_payload(snap, merged, sents, watch_px, fut_px, sp500, market_open,
                              quant_signals=quant_sigs,
                              self_review_block=self_review_block,
-                             track_record_block=track_record_block)
+                             track_record_block=track_record_block,
+                             risk_mirror_block=risk_mirror_block)
     prompt = f"{SYSTEM_PROMPT}\n\n---\nCONTEXT:\n{payload}"
     if ml_opinion_block:
         prompt += f"\n\n---\nML ADVISOR:\n{ml_opinion_block}"
