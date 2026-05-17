@@ -498,12 +498,31 @@ def _portfolio_snapshot(store: Store) -> dict:
     }
 
 
+def _names_in_play(positions: list[dict], top_signals: list[dict],
+                   watchlist: list[str]) -> set[str]:
+    """Tickers that are actionable *this cycle*: held, mentioned in the top-10
+    signals, or top-5 watchlist priority (list order is the priority signal —
+    first entries are the current real-account interests).
+
+    Single source of truth for "what matters this cycle": the quant-block
+    filter and the track-record block both call this so the two prompt
+    sections can never disagree on which names are in play.
+    """
+    held = {p["ticker"] for p in positions}
+    mentioned = {
+        t for s in top_signals[:10] for t in (s.get("tickers") or [])
+    }
+    priority = set(watchlist[:5])
+    return held | mentioned | priority
+
+
 def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dict],
                    watch_prices: dict[str, float | None],
                    futures_prices: dict[str, float | None],
                    sp500: float | None, market_open: bool,
                    quant_signals: dict[str, dict] | None = None,
-                   self_review_block: str | None = None) -> str:
+                   self_review_block: str | None = None,
+                   track_record_block: str | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
     pos_lines = []
     for p in snapshot["positions"]:
@@ -533,12 +552,7 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # tickers that aren't actionable this cycle. Mirrors the existing n>0
     # sentiment filter below — shrink the rendered string, not the fetch.
     if quant_signals:
-        held = {p["ticker"] for p in snapshot["positions"]}
-        mentioned = {
-            t for s in top_signals[:10] for t in (s.get("tickers") or [])
-        }
-        priority = set(WATCHLIST[:5])
-        keep = held | mentioned | priority
+        keep = _names_in_play(snapshot["positions"], top_signals, WATCHLIST)
         quant_signals = {
             tk: q for tk, q in quant_signals.items() if tk in keep
         }
@@ -557,6 +571,11 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # right after PORTFOLIO so the trader sees its own track record next to its
     # current book, before market data biases it.
     review_section = f"\n{self_review_block}\n" if self_review_block else ""
+    # Per-name closed-trade memory — observational only, same advisory contract
+    # as the self-review mirror (invariants #2/#12). Placed right after the
+    # aggregate mirror so the trader sees its concrete history on the exact
+    # names in play before market data biases it.
+    track_section = f"{track_record_block}\n" if track_record_block else ""
 
     return f"""TIME (UTC): {now}
 MARKET_OPEN: {market_open}
@@ -568,7 +587,7 @@ PORTFOLIO:
   total value: ${snapshot['total_value']:.2f}
   positions:
 {chr(10).join(pos_lines) if pos_lines else '  (none)'}
-{review_section}
+{review_section}{track_section}
 WATCHLIST PRICES:
 {chr(10).join(px_lines)}
 
@@ -1013,6 +1032,26 @@ def decide() -> dict:
     except Exception as e:
         print(f"[strategy] self-review failed (non-fatal): {e}")
 
+    # Per-name closed-trade memory — the trader's *concrete* outcome on the
+    # exact names in play this cycle (verbatim entry/exit reason + objective
+    # failure/success mode), composed verbatim from the loser/winner autopsy
+    # builders (single source of truth, invariant #10). Filtered to the SAME
+    # "names in play" set the quant block uses so the two prompt sections
+    # never disagree. Observational only (the self-review precedent); wrapped
+    # so a diagnostics failure is "no track-record block this cycle", never
+    # "no decision this cycle".
+    track_record_block: str | None = None
+    try:
+        from .analytics.track_record import build_track_record
+        tr = build_track_record(
+            list(reversed(store.recent_trades(2000))),
+            names=_names_in_play(snap.get("positions") or [], merged,
+                                  WATCHLIST),
+        )
+        track_record_block = tr.get("prompt_block")
+    except Exception as e:
+        print(f"[strategy] track-record failed (non-fatal): {e}")
+
     # ML advisor: when model consistently beats SPY, include its opinion in prompt
     ml_opinion_block: str | None = None
     ml_qualified, ml_qual_reason = _ml_is_qualified()
@@ -1033,7 +1072,8 @@ def decide() -> dict:
 
     payload = _build_payload(snap, merged, sents, watch_px, fut_px, sp500, market_open,
                              quant_signals=quant_sigs,
-                             self_review_block=self_review_block)
+                             self_review_block=self_review_block,
+                             track_record_block=track_record_block)
     prompt = f"{SYSTEM_PROMPT}\n\n---\nCONTEXT:\n{payload}"
     if ml_opinion_block:
         prompt += f"\n\n---\nML ADVISOR:\n{ml_opinion_block}"

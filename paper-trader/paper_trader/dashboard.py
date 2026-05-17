@@ -1246,6 +1246,28 @@ TEMPLATE = r"""
       </table>
     </div>
 
+    <!-- ─── Track record in play (per-name closed-trade memory; fed to the prompt) ─── -->
+    <div class="card" id="trec-card" style="margin-bottom:18px;">
+      <h2 style="display:flex;justify-content:space-between;align-items:center;">
+        <span>Track record <span class="muted" style="font-size:11px;text-transform:none;letter-spacing:normal;font-weight:normal;">— per-name closed-trade memory: the verbatim history the trader now sees in its own prompt</span></span>
+        <span id="trec-state" style="font-size:12px;padding:3px 10px;border-radius:4px;background:#1f2126;color:#8b929d;">—</span>
+      </h2>
+      <div class="muted" id="trec-headline" style="font-size:12px;margin-bottom:12px;">loading…</div>
+      <div class="stat-row" style="margin-bottom:14px;">
+        <div class="stat"><div class="l">names traded</div><div class="v" id="trec-n">—</div></div>
+        <div class="stat"><div class="l">closed round-trips</div><div class="v" id="trec-rt">—</div></div>
+        <div class="stat"><div class="l">worst name (net)</div><div class="v" id="trec-worst">—</div></div>
+        <div class="stat"><div class="l">best name (net)</div><div class="v" id="trec-best">—</div></div>
+      </div>
+      <table id="trec-tbl" style="font-size:12px;width:100%;">
+        <thead><tr>
+          <th>ticker</th><th class="num">W-L</th><th class="num">net $</th>
+          <th class="num">closed</th><th>last mode</th><th>last opening thesis</th>
+        </tr></thead>
+        <tbody><tr><td colspan="6" class="muted">loading…</td></tr></tbody>
+      </table>
+    </div>
+
     <!-- ─── Concentration honesty (do the held names move together?) ─── -->
     <div class="card" id="pcorr-card" style="margin-bottom:18px;">
       <h2 style="display:flex;justify-content:space-between;align-items:center;">
@@ -4455,6 +4477,49 @@ async function refreshWinnerAutopsy() {
   }
 }
 
+async function refreshTrackRecord() {
+  const r = await fetchMaybeStale("/api/track-record");
+  if (r.__unavailable) { markStale("trec-state", "trec-headline", "Track-record endpoint"); return; }
+  if (r.error) { document.getElementById("trec-headline").textContent = "error: " + r.error; return; }
+  const sEl = document.getElementById("trec-state");
+  const sb = { OK: ["#1f3a5f", "#9ec5ff"], NO_DATA: ["#1f2126", "#8b929d"] };
+  const [bg, fg] = sb[r.state] || sb.NO_DATA;
+  sEl.textContent = r.state || "—";
+  sEl.style.background = bg; sEl.style.color = fg;
+  document.getElementById("trec-headline").textContent = r.summary || "";
+  const names = r.names || [];
+  document.getElementById("trec-n").textContent = names.length ? String(names.length) : "—";
+  document.getElementById("trec-rt").textContent = r.n_round_trips != null ? String(r.n_round_trips) : "—";
+  // names is sorted worst-net-first → first = worst, last = best.
+  const worst = names.length ? names[0] : null;
+  const best = names.length ? names[names.length - 1] : null;
+  const wEl = document.getElementById("trec-worst");
+  if (worst) { wEl.textContent = worst.ticker + " " + _sgn(worst.net_usd) + "$" + fmt(Math.abs(worst.net_usd)); wEl.style.color = _plColor(worst.net_usd); } else { wEl.textContent = "—"; }
+  const bEl = document.getElementById("trec-best");
+  if (best) { bEl.textContent = best.ticker + " " + _sgn(best.net_usd) + "$" + fmt(Math.abs(best.net_usd)); bEl.style.color = _plColor(best.net_usd); } else { bEl.textContent = "—"; }
+  const tb = document.querySelector("#trec-tbl tbody");
+  tb.replaceChildren();
+  if (!names.length) {
+    const tr = document.createElement("tr");
+    const td = _cell("no closed round-trips yet", "muted");
+    td.colSpan = 6; tr.appendChild(td); tb.appendChild(tr);
+  } else {
+    for (const e of names) {
+      const tr = document.createElement("tr");
+      tr.appendChild(_cell(e.ticker));
+      tr.appendChild(_cell(e.n_win + "-" + e.n_loss, "num"));
+      const pl = _cell(_sgn(e.net_usd) + "$" + fmt(Math.abs(e.net_usd)), "num");
+      pl.style.color = _plColor(e.net_usd);
+      tr.appendChild(pl);
+      tr.appendChild(_cell(String(e.n_closed), "num"));
+      const last = (e.recent && e.recent.length) ? e.recent[0] : null;
+      tr.appendChild(_cell(last && last.mode ? last.mode.replace(/_/g, " ") : "—"));
+      tr.appendChild(_cell(last && last.entry_reason ? last.entry_reason : "—"));
+      tb.appendChild(tr);
+    }
+  }
+}
+
 async function refreshCorrelation() {
   const r = await fetchMaybeStale("/api/correlation");
   if (r.__unavailable) { markStale("pcorr-state", "pcorr-headline", "Concentration-honesty endpoint"); return; }
@@ -5081,6 +5146,7 @@ refreshChurn();
 refreshThesisDrift();
 refreshLoserAutopsy();
 refreshWinnerAutopsy();
+refreshTrackRecord();
 refreshCorrelation();
 refreshSourceEdge();
 refreshScorecard();
@@ -5122,6 +5188,7 @@ setInterval(refreshChurn, 60_000);
 setInterval(refreshThesisDrift, 60_000);
 setInterval(refreshLoserAutopsy, 60_000);
 setInterval(refreshWinnerAutopsy, 60_000);
+setInterval(refreshTrackRecord, 60_000);
 setInterval(refreshCorrelation, 120_000);
 setInterval(refreshSourceEdge, 300_000);
 setInterval(refreshScorecard, 60_000);
@@ -7235,6 +7302,30 @@ def winner_autopsy_api():
         # oldest → newest (build_round_trips reads in sequence).
         trades = list(reversed(store.recent_trades(2000)))
         return jsonify(build_winner_autopsy(trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/track-record")
+def track_record_api():
+    """Per-name closed-trade memory — the same verbatim loser/winner-autopsy
+    narrative the live decision prompt now sees, surfaced for the operator &
+    chat. /api/loser-autopsy & /api/winner-autopsy narrate the book's losses
+    and wins separately and book-wide; this groups *both* by ticker so "how
+    have we actually done on NVDA?" is one row — and it is the *same builder*
+    strategy._build_payload injects (there filtered to the names in play this
+    cycle) so the dashboard, chat and the in-prompt block can never drift
+    (single source of truth, AGENTS.md #10; the /api/self-review precedent).
+    names=None here ⇒ every traded name. Composes build_loser_autopsy +
+    build_winner_autopsy verbatim — no re-derived P&L. Advisory only — never
+    gates Opus, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.track_record import build_track_record
+        store = get_store()
+        # Same trades convention as /api/loser-autopsy & /api/winner-autopsy:
+        # oldest → newest (build_round_trips reads in sequence).
+        trades = list(reversed(store.recent_trades(2000)))
+        return jsonify(build_track_record(trades))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
