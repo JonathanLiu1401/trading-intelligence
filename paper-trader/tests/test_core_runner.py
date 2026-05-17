@@ -473,3 +473,106 @@ class TestRunnerStatePersistence:
         _patch_now(monkeypatch, _ny(2026, 5, 14, 10, 20))
         runner._maybe_hourly()
         assert calls == [1], "fired an early hourly <1h after the last one"
+
+
+class TestSingletonLock:
+    """`_acquire_singleton_lock` — the single-instance guard added 2026-05-17
+    after observing TWO concurrent runner.py processes (an orphaned manual
+    launch + the systemd unit) double-trading the same paper book.
+
+    Exercises the real fcntl.flock primitive on a tmp lockfile (no fork: a
+    second open()+flock from the same process gets a distinct open-file
+    description, so LOCK_NB contends exactly as a second process would)."""
+
+    def test_first_acquire_succeeds_and_writes_pid(self, tmp_path):
+        lp = tmp_path / "pt.lock"
+        lk = runner._acquire_singleton_lock(lp)
+        try:
+            assert lk.status == "acquired"
+            assert lk.handle is not None
+            import os
+            assert lk.holder_pid == os.getpid()
+            assert lp.read_text().strip() == str(os.getpid())
+        finally:
+            lk.handle.close()
+
+    def test_second_acquire_is_busy_with_holder_pid(self, tmp_path):
+        import os
+        lp = tmp_path / "pt.lock"
+        first = runner._acquire_singleton_lock(lp)
+        try:
+            assert first.status == "acquired"
+            # A would-be second runner.
+            second = runner._acquire_singleton_lock(lp)
+            assert second.status == "busy"
+            assert second.handle is None
+            # It must surface the live holder's PID for an actionable log.
+            assert second.holder_pid == os.getpid()
+        finally:
+            first.handle.close()
+
+    def test_lock_is_released_on_holder_death_then_reacquirable(self, tmp_path):
+        """Robust-across-restart: closing the fd (== the holder process dying)
+        frees the kernel flock, so the next start re-acquires cleanly. This is
+        exactly the stale-PID-file failure a naive guard would introduce."""
+        lp = tmp_path / "pt.lock"
+        first = runner._acquire_singleton_lock(lp)
+        assert first.status == "acquired"
+        # Simulate the prior process exiting.
+        first.handle.close()
+        second = runner._acquire_singleton_lock(lp)
+        try:
+            assert second.status == "acquired", "stale lock blocked a restart"
+            assert second.handle is not None
+        finally:
+            second.handle.close()
+
+    def test_unwritable_lock_dir_degrades_open_not_closed(self, tmp_path):
+        """Fail-OPEN: if the lock plumbing is unusable the sole runner must
+        still start. A path whose parent component is a regular file makes
+        `.parent.mkdir` raise → status 'degraded', never 'busy'."""
+        afile = tmp_path / "afile"
+        afile.write_text("x")
+        lp = afile / "sub" / "pt.lock"   # afile is a file, not a dir
+        lk = runner._acquire_singleton_lock(lp)
+        assert lk.status == "degraded"
+        assert lk.handle is None
+
+    def test_main_exits_before_store_when_busy(self, monkeypatch):
+        """The wiring lock: a 'busy' result must `sys.exit(1)` BEFORE the
+        store / dashboard / ONLINE ping are touched (a second runner must not
+        even mark-to-market the shared book)."""
+        called = {"store": False}
+
+        def _no_store():
+            called["store"] = True
+            raise AssertionError("get_store() reached despite busy lock")
+
+        monkeypatch.setattr(runner, "get_store", _no_store)
+        monkeypatch.setattr(
+            runner, "_acquire_singleton_lock",
+            lambda *a, **k: runner.SingletonLock(None, "busy", 4242),
+        )
+        with pytest.raises(SystemExit) as ei:
+            runner.main()
+        assert ei.value.code == 1
+        assert called["store"] is False
+
+    def test_main_degraded_continues_past_lock(self, monkeypatch):
+        """A 'degraded' lock must NOT exit — it proceeds (fail-open). We stop
+        it right after the guard by making get_store raise a sentinel."""
+        class _Sentinel(Exception):
+            pass
+
+        def _boom():
+            raise _Sentinel()
+
+        monkeypatch.setattr(runner, "get_store", _boom)
+        monkeypatch.setattr(
+            runner, "_acquire_singleton_lock",
+            lambda *a, **k: runner.SingletonLock(None, "degraded", None),
+        )
+        # Reached get_store → it did NOT sys.exit on degraded. SystemExit
+        # would mean the fail-open contract broke.
+        with pytest.raises(_Sentinel):
+            runner.main()

@@ -4,9 +4,11 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import traceback
+from collections import namedtuple
 from datetime import datetime, timezone
 
 from zoneinfo import ZoneInfo
@@ -53,6 +55,104 @@ _consecutive_no_decisions = 0
 # best-effort, and a lost/corrupt file must degrade to "behave like today
 # (in-memory only)", never crash the daemon loop.
 _STATE_PATH = DB_PATH.parent / "runner_state.json"
+
+
+# ── Single-instance guard ────────────────────────────────────────────────
+# Two concurrent runners on the same $1000 paper book is a real, *observed*
+# live pathology (2026-05-17: an orphaned manual launch under PID 1 AND a
+# systemd-managed instance both cycling `runner.py`, double-trading the same
+# `paper_trader.db`, doubling the concurrent `claude` RAM, and racing the
+# decision/equity log so a trader sees 2–3 decisions clustered inside a
+# minute then nothing for an hour). Nothing in `runner.py` prevented it —
+# digital-intern's daemon has a singleton lock; this is the missing twin.
+#
+# An `fcntl.flock` advisory lock on a lockfile next to the DB is the robust
+# primitive: the kernel releases it automatically when the holder *dies*
+# (crash / SIGKILL / normal exit), so a restart never trips over a stale
+# PID file — the exact failure a naive pid-file guard introduces. Held for
+# the life of the process via a module-global handle (closing the fd frees
+# the lock, so it MUST NOT be GC'd). Fail-OPEN by construction: if the lock
+# infrastructure itself is unusable (non-POSIX, unwritable data dir, USB
+# unmounted) we degrade to "run without the guard" and warn, never refuse
+# to start the *only* trader — same philosophy as `_save_runner_state`'s
+# best-effort sidecar. Fail-CLOSED only on the one signal we can trust:
+# another live process is holding the lock → exit before booting anything.
+_LOCK_PATH = DB_PATH.parent / "paper_trader.runner.lock"
+
+# (handle, status, holder_pid). status ∈ {"acquired","busy","degraded"}.
+SingletonLock = namedtuple("SingletonLock", ("handle", "status", "holder_pid"))
+
+# Process-lifetime reference to the locked file object. Module-global so the
+# fd stays open (and the flock held) for as long as the runner lives.
+_SINGLETON_LOCK_FH = None
+
+
+def _acquire_singleton_lock(path=_LOCK_PATH) -> SingletonLock:
+    """Try to take the exclusive runner lock.
+
+    Returns a ``SingletonLock``:
+      • ``status="acquired"`` — we hold it; ``handle`` is the open locked
+        file (caller must keep it alive), ``holder_pid`` is our PID.
+      • ``status="busy"``     — another live process holds it; ``handle`` is
+        None, ``holder_pid`` is the PID read from the lockfile (or None if
+        unreadable). The caller must NOT start a second trader.
+      • ``status="degraded"`` — the lock primitive is unavailable (no fcntl,
+        unwritable dir, …). ``handle`` is None. The caller continues WITHOUT
+        the guard (fail-open: never take down the sole runner over lock
+        plumbing). Never raises.
+    """
+    try:
+        import fcntl  # POSIX only; ImportError → degrade (fail-open)
+    except Exception as e:
+        print(f"[runner] singleton lock unavailable (no fcntl: {e}); "
+              f"running WITHOUT the single-instance guard")
+        return SingletonLock(None, "degraded", None)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # r+ if it exists else create; never truncate (a truncate would wipe
+        # the holder's PID out from under a running instance).
+        fh = open(path, "a+", encoding="utf-8")
+    except Exception as e:
+        print(f"[runner] could not open lockfile {path} ({e}); "
+              f"running WITHOUT the single-instance guard")
+        return SingletonLock(None, "degraded", None)
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # Held by another live process. Best-effort read of its PID for a
+        # human-actionable log line; never let a read error mask "busy".
+        holder = None
+        try:
+            fh.seek(0)
+            txt = fh.read().strip()
+            holder = int(txt) if txt.isdigit() else None
+        except Exception:
+            holder = None
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return SingletonLock(None, "busy", holder)
+    except Exception as e:
+        # flock raised something other than the contended OSError — treat as
+        # infrastructure failure and fail-open rather than wedge the runner.
+        print(f"[runner] flock failed unexpectedly ({e}); "
+              f"running WITHOUT the single-instance guard")
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return SingletonLock(None, "degraded", None)
+    # Acquired. Record our PID for operator visibility (best-effort — failing
+    # to write it does not relinquish the kernel-held lock).
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{os.getpid()}\n")
+        fh.flush()
+    except Exception:
+        pass
+    return SingletonLock(fh, "acquired", os.getpid())
 
 
 def _load_runner_state() -> dict:
@@ -249,8 +349,23 @@ def _cycle():
 
 
 def main():
-    global _last_hourly
+    global _last_hourly, _SINGLETON_LOCK_FH
     print("[runner] starting paper trader")
+    # Single-instance guard FIRST — before the store, the dashboard thread,
+    # or the ONLINE ping. A second runner must not even mark-to-market the
+    # shared book, let alone trade it. "busy" is the only fail-closed path;
+    # "degraded" (lock plumbing unusable) continues so the sole runner is
+    # never taken down by lock infrastructure.
+    _lock = _acquire_singleton_lock()
+    if _lock.status == "busy":
+        who = f"pid={_lock.holder_pid}" if _lock.holder_pid else "pid unknown"
+        print(f"[runner] another paper trader is already running ({who}); "
+              f"refusing to start a second trader on the same paper book — "
+              f"exiting. (kill the duplicate, or stop this launcher.)")
+        sys.exit(1)
+    if _lock.status == "acquired":
+        _SINGLETON_LOCK_FH = _lock.handle  # keep the flock held for our life
+        print(f"[runner] single-instance lock acquired (pid={_lock.holder_pid})")
     store = get_store()
     pf = store.get_portfolio()
     print(f"[runner] portfolio: cash=${pf['cash']:.2f} total=${pf['total_value']:.2f}")
