@@ -513,6 +513,20 @@ the ML axis toward a 0.3 trust floor once `|pred| > 20%` instead of letting a
 clamped floor read as full ±1.0 conviction). Locked by
 `tests/test_decision_scorer.py::TestPredictionClamp`.
 
+**Honesty on a *failed* prediction (2026-05-17 fix).** When
+`model.predict()` itself *raises* — the exact scenario the handler's
+"silenced after first" log guards (a `build_features` feature added
+without retraining the pickle ⇒ shape/dtype mismatch) —
+`predict_with_meta()` now returns `clamped: True, off_distribution:
+True` (was `False`/`False`). A scorer that *cannot score the input at
+all* must not look identical to one confidently predicting a flat 0.0:
+the honesty panels above read `off_distribution`, so the old value
+rendered a broken scorer as gospel. This mirrors the non-finite branch
+precedent and keeps the documented `off_distribution`-is-an-alias-of-
+`clamped` invariant. `predict()`'s scalar contract is unchanged (still
+the safe `0.0`) — only the meta trust flags move. Locked by
+`tests/test_decision_scorer.py::TestPredictionClamp::test_predict_exception_is_flagged_low_trust`.
+
 **Concurrency invariant (`backtest.py`):** the module-global
 `_VOLUME_CACHE` is shared across the parallel run threads. Every read
 *and* every iteration of it must hold `_VOLUME_CACHE_LOCK` — iterating it
@@ -571,6 +585,64 @@ If `scorer insufficient_after_dedup n=...` keeps appearing, the
 `data/decision_outcomes.jsonl` tail is too small or too duplicated — more
 cycles need to accumulate before the scorer can train.
 
+> **Read `vs_spy_pct` skeptically on leveraged windows.** A single
+> persona routinely posts `+1000%+ / vs_spy +1200%` over a 6–10yr window
+> heavy in 3× ETFs (SOXL/TQQQ), while a *different* persona on the **same
+> window** posts `+12% / vs_spy −80%`. That spread is leveraged-beta
+> dispersion through a cherry-able bull window, **not** repeatable alpha.
+> The "best run +N%" cycle line is the max of a high-variance leverage
+> draw — never read it as strategy skill. The permutation/label-audit
+> validation suite (`data/validation_results.json`) is the real
+> skill-vs-luck arbiter; the per-run number is not.
+
+### Scorer calibration diagnostic
+
+`paper_trader/ml/calibration.py` is a **read-only** quant diagnostic
+(no train, no pickle/`build_features`/`N_FEATURES` touch, no trade path —
+safe to run against the live unattended loop). It answers *"does a high
+predicted 5d return actually precede a high realized one?"* by separating
+the two failure modes a single RMSE hides:
+
+- **rank skill** — tie-aware Spearman over every `(pred, realized)` pair.
+  Tie-awareness is load-bearing: the scorer clamps to ±`PRED_CLAMP_PCT`,
+  so off-distribution predictions tie at exactly ±50 — plain
+  `argsort(argsort)` fabricates rank skill there (a constant predictor
+  would score 1.0).
+- **magnitude bias** — per-decile `mean_pred` vs `mean_realized`.
+
+```bash
+# Calibration of the live pickle vs the accumulated outcomes tail
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.calibration
+```
+
+Verdicts: `INSUFFICIENT_DATA` (< `MIN_PAIRS`), `MISCALIBRATED`
+(spearman < `SPEARMAN_MIN` or decile curve not mostly monotone),
+`DIRECTIONAL_BUT_BIASED` (rank-skilled but mean decile error >
+`BIAS_TOL_PCT` — trust the *sign/ordering*, discount the predicted %),
+`WELL_CALIBRATED`, `WEAK_SIGNAL`. `scorer_calibration()` flips the SELL
+target sign (`-forward_return_5d`) exactly like `train_scorer`, so a
+rank-skilled SELL model is not a false `MISCALIBRATED`. Thresholds are
+module constants; verdicts are exact-value test-locked in
+`tests/test_calibration.py`.
+
+> **Interpreting the verdict (2026-05-17 quant finding).** Pointed at the
+> full `decision_outcomes.jsonl` the tool reports `WELL_CALIBRATED`
+> (spearman ≈ 0.51, monotone deciles, ≈1.9pp decile error) — but that is
+> **in-sample**: the scorer was trained on most of those rows. The
+> trustworthy generalization metric is the temporal-holdout `oos_rmse`
+> the continuous loop logs (`scorer ok … oos_rmse=…`). Observed
+> `oos_rmse` runs **13–17**, while the forward-return target's own σ is
+> ≈10.9 — i.e. OOS error ≳ σ(target), so the scorer has **no
+> demonstrated out-of-sample edge** even though it gates BUY conviction
+> once `_n_train ≥ 500`. The in-sample `WELL_CALIBRATED` is optimistic;
+> always read it next to `oos_rmse`. The decile tails over-predict
+> (d1 pred −15.7 vs realized −10.7; d10 +15.4 vs +11.9) even in-sample —
+> the same extrapolation the `predict_with_meta` `off_distribution` flag
+> exists to surface. This is a reported observation, **not** a code
+> change: altering the model/gate is a training-dynamics change out of
+> scope for a surgical review (CLAUDE.md §6, AGENTS.md "When to bump
+> model versions").
+
 ### Position sizing invariant (`_ml_decide`)
 
 A backtest BUY's notional is `min(total_val * conviction, cash * 0.95)`.
@@ -609,6 +681,9 @@ cd /home/zeph/paper-trader && python3 -m pytest tests/test_core_*.py -v
 # Full suite
 cd /home/zeph/paper-trader && python3 -m pytest tests/ -v
 
+# Scorer calibration diagnostic (exact-value verdict locks)
+cd /home/zeph/paper-trader && python3 -m pytest tests/test_calibration.py -v
+
 # A single class
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_decision_scorer.py::TestTrainScorer -v
 
@@ -621,7 +696,12 @@ ML/backtest test files (all offline, all deterministic):
 `test_backtest.py` (PriceCache / SimPortfolio / risk-exits / indicators /
 heuristic scorer / `_ml_decide` smoke + position-size caps / store
 isolation), `test_decision_scorer.py` (`_to_float`, `build_features`,
-`train_scorer`, prediction clamp / honesty), `test_continuous.py`
+`train_scorer`, prediction clamp / honesty incl. the failed-predict
+`off_distribution` lock), `test_calibration.py` (the calibration
+diagnostic — exact metrics + exact verdicts on deterministic synthetic
+data: perfect / 0.2× biased / anti-correlated / weak-band / constant-
+predictor / non-finite-drop / SELL-sign-flip / predict-exception-skip),
+`test_continuous.py`
 (`_pick_window`, `_trim_history`, `_append_top_decisions`,
 `_compute_decision_outcomes`, `_query_news_context`, `_train_decision_scorer`),
 `test_validation.py` (temporal split / OOS / permutation),
