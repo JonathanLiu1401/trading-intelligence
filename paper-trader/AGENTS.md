@@ -694,6 +694,9 @@ cd /home/zeph/paper-trader && python3 -m pytest tests/ -v
 # Scorer calibration diagnostic (exact-value verdict locks)
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_calibration.py -v
 
+# Per-persona strategy-quality leaderboard (exact-value verdict locks)
+cd /home/zeph/paper-trader && python3 -m pytest tests/test_persona_leaderboard_20260517.py -v
+
 # A single class
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_decision_scorer.py::TestTrainScorer -v
 
@@ -1130,6 +1133,90 @@ doc repeatedly scopes out).
   but the per-cycle "best run +1294% / vs_spy +1202%" line sits next to
   a same-regime "+12% / vs_spy −80%" — the documented leveraged-beta
   dispersion, not repeatable alpha.
+
+### 2026-05-17 review pass #3 (per-persona strategy-quality leaderboard)
+
+Hybrid quant pass (debug + feature + live validation). **Zero code bugs
+found in the existing ML/backtest core** — 11th consecutive no-new-bug
+review. One read-only diagnostic added (the third in the
+`calibration.py` / `label_audit.py` family); the rest is reported live
+findings.
+
+- **Per-persona strategy-quality leaderboard
+  (`paper_trader/ml/persona_leaderboard.py`).** The exact read-only
+  sibling of `ml/calibration.py` and `ml/label_audit.py`: no train, no
+  pickle, no `decision_outcomes.jsonl`/`backtest.db` write (opens
+  `backtest.db` strictly `mode=ro`), no `build_features`/`N_FEATURES`
+  touch — safe against the unattended loop. Two prior diagnostics
+  measure **scorer** quality; nothing measured **strategy/persona**
+  quality, despite `backtest.db` holding ~490 `complete` runs each
+  mapped to one of 10 personas. It **imports `backtest.persona_for`**
+  (single source of truth — the `_oos_rank_metrics`-reuses-`_spearman`
+  precedent), so a `PERSONAS` reorder can never silently desync the
+  historical aggregates. Per persona it reports the **median** vs_spy
+  (the honest central tendency — the per-cycle "best run +1294%" line is
+  the max of a leveraged-beta draw; the *mean* is dominated by a few 3×
+  bull-window rips), win-rate vs SPY, median total return, and
+  risk-shape from the stored `equity_curve_json` (max drawdown,
+  annualised Sharpe-equivalent, %-time-underwater — none surfaced
+  anywhere before). Per-persona verdicts `EDGE` / `FLAT` / `DRAG` /
+  `INSUFFICIENT` and overall `HEALTHY` / `HAS_DRAG_PERSONA` are
+  exact-testable module constants; the `HAS_DRAG_PERSONA` hint points
+  at the *separate, explicit* prune/re-tune decision and explicitly says
+  **do NOT** change `PERSONAS`/`_PERSONA_BOOSTS` from the read-only
+  audit (the out-of-scope strategy-dynamics change this tool exists to
+  inform, not perform — same discipline as `label_audit`'s
+  do-not-winsorize hint).
+
+  A **numerical-robustness gap in the new module itself** was caught by
+  its own exact-value test before commit: a flat/cash-parked or
+  constant-return equity stretch has a returns std of pure
+  float-representation noise (~1e-16, because `0.1` is not exactly
+  representable), which sails past a naïve `sd > 0` and divides a real
+  mean by ~1e-17 → a ~1e16 "Sharpe" that would dominate the per-persona
+  median. Fixed with a `sd > 1e-9` floor (any genuine daily-variance
+  curve is ≫1e-9; the floor cleanly separates degenerate from real).
+
+  ```bash
+  # Per-persona strategy-quality leaderboard over the live backtest.db.
+  # Exit 0 = HEALTHY/INSUFFICIENT_DATA, 2 = HAS_DRAG_PERSONA.
+  cd /home/zeph/paper-trader && python3 -m paper_trader.ml.persona_leaderboard
+  cd /home/zeph/paper-trader && python3 -m pytest tests/test_persona_leaderboard_20260517.py -v
+  ```
+
+  **Interpreting it (live finding).** On the current ~490-run corpus the
+  verdict is **`HAS_DRAG_PERSONA`**: 9 of 10 personas have a positive
+  median alpha (Global Macro / Pure Speculator ≈ +96–101pp median, but
+  with ~44–45% median max-drawdown and >90% time underwater — leveraged
+  beta, not low-risk skill; Value Investor is the best risk-adjusted at
+  Sharpe ≈ 0.79 / 27% maxDD / 92% win-rate), but **`Sector Rotator`
+  (persona 7) is a `DRAG`: median vs_spy ≈ −1.9pp, mean ≈ −3.6pp,
+  win-rate 45%, Sharpe ≈ 0.34 across 49 runs** — it does not beat SPY at
+  the median and is contributing variance, not alpha. Its
+  `_PERSONA_BOOSTS[7]` row (`FAS 2.5, DFEN 2.0, LABU 2.0, BOIL 1.5,
+  XLE 2.0, XLF 2.0, XLI 1.5`) is the prime candidate for a future
+  (separate, explicit, pkl/strategy-dynamics-aware) prune or re-tune —
+  **reported, not actioned**, exactly like the pass #2 `_llm_annotate`
+  finding. `ESG / Thematic` is the only other sub-EDGE persona (`FLAT`,
+  median +16pp, below the +20pp strong bar). Read this next to the
+  `calibration` and `label_audit` verdicts — it is the missing
+  strategy-side measurement.
+
+- **Live findings reconfirmed (operator action, NOT code bugs).** The
+  pass #2 findings still hold on the running loop: `backtest.db` has
+  **16 orphaned `running` rows** (the loop, PID 1086675 started 02:21,
+  predates the `05b4df2` startup reaper — same documented `stale`
+  protocol: clean SIGTERM + restart, left for the operator);
+  `decision_outcomes.jsonl` is at the **5000-row cap** with **every row
+  `llm_quality_label: 0`** (the `_llm_annotate_outcomes` SDK-auth
+  finding from pass #2 — the 3×/0.1× training-weight multiplier has
+  still never been live); calibration on the live pkl (`n_train=3876`)
+  is `WELL_CALIBRATED` in-sample (spearman 0.51) while the decile tails
+  over-predict (d1 −15.7 vs −10.7; d10 +15.4 vs +11.9) — pair with
+  `oos_rmse` as documented; `label_audit` is `CLEAN` aggregate (0.500%)
+  with the same DFEN 2.10% per-ticker split concentration. Backtests are
+  healthy (485–490 complete, 0 null/NaN finals, `completed_at` fresh to
+  the current hour).
 
 ### When to bump model versions
 
