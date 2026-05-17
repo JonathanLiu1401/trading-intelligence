@@ -58,10 +58,18 @@ DIGITAL_INTERN_ARTICLES_DB = "/home/zeph/digital-intern/data/articles.db"
 
 # How often to run the validation suite (label audit + permutation test) on the
 # current cycle's engine. Validation is *expensive* (one full backtest per
-# permutation × ~5 perms = ~25 min total), so it runs in a background thread —
-# every 10 cycles is enough to catch regressions without dominating compute.
+# permutation), so it runs in a background thread — every 10 cycles is enough
+# to catch regressions without dominating compute.
+#
+# n=250: with the smoothed permutation p-value (k+1)/(n+1) the minimum
+# achievable p is 1/(n+1). At n=5 that floor is 0.167 (a "p=0.000" is
+# mathematically impossible / meaningless); at n=250 the floor is ~0.004,
+# which is the first count low enough to ever clear a real p<0.05 bar with
+# headroom. The validation runner already tolerates per-permutation crashes
+# and now reports n_attempted vs n_successful, so a high N degrades
+# gracefully instead of silently shrinking to ~5 successes.
 VALIDATION_EVERY_N_CYCLES = 10
-VALIDATION_PERMUTATIONS = 5     # background-thread budget — keep this low
+VALIDATION_PERMUTATIONS = 250   # statistically valid floor (smoothed p ≥ 1/(n+1))
 VALIDATION_RESULTS_PATH = ROOT / "data" / "validation_results.json"
 VALIDATION_RESULTS_KEEP = 50    # cap file growth
 
@@ -127,6 +135,54 @@ def _trim_history(engine: BacktestEngine, keep: int = KEEP_LAST_RUNS) -> int:
         cur = conn.execute("DELETE FROM backtest_runs WHERE run_id <= ?", (cutoff_id,))
         conn.commit()
         return cur.rowcount or 0
+
+
+def _reap_orphaned_runs(max_age_hours: float = 6.0) -> int:
+    """Mark long-stale ``status='running'`` backtest rows as ``failed``.
+
+    A run thread killed by OOM / SIGKILL never reaches ``finalize_run`` *or*
+    the ``run_all`` wrapper's ``upsert_run("failed")`` — that fallback only
+    fires on a *caught* Python exception, not a hard kill — so the row stays
+    ``running`` forever. That is exactly the documented "Backtest dashboard
+    shows running forever" symptom (CLAUDE.md §11): the dashboard renders a
+    dead run as in-flight indefinitely and `/api/backtests` is polluted.
+
+    On a fresh continuous-loop start any pre-existing ``running`` row is by
+    definition orphaned (the previous process is gone). The age guard is
+    defensive belt-and-braces: no real run exceeds minutes (a 10-yr window
+    still finishes well under the cycle budget), so a row ``running`` for
+    >``max_age_hours`` cannot be a live run even if a second loop ever ran.
+    Best-effort and idempotent — a DB hiccup must never stop the loop from
+    starting, and a row already ``failed`` is not matched again.
+
+    Resolves ``BACKTEST_DB`` at call time (the AGENTS.md call-time-resolution
+    rule) so the conftest tmp redirect is honoured under test.
+    """
+    from paper_trader.backtest import BACKTEST_DB
+    if not Path(BACKTEST_DB).exists():
+        return 0
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(hours=max_age_hours)).isoformat()
+    conn = None
+    try:
+        conn = sqlite3.connect(str(BACKTEST_DB), timeout=15)
+        cur = conn.execute(
+            "UPDATE backtest_runs SET status='failed', "
+            "notes=COALESCE(notes,'')||' [reaped: orphaned running row]' "
+            "WHERE status='running' AND started_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+        return cur.rowcount or 0
+    except Exception as e:
+        print(f"[continuous] orphaned-run reap failed: {e}")
+        return 0
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _append_top_decisions(engine: BacktestEngine, top_runs: list[BacktestRun],
@@ -339,6 +395,85 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
     return outcomes
 
 
+def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
+    """Out-of-sample *directional* skill of the scorer on the temporal holdout.
+
+    ``oos_rmse`` answers "how big is the error", but the ``_ml_decide``
+    conviction gate only ever acts on the prediction's *sign / bucket*
+    (±10 / ±5 / 0 — CLAUDE.md §6). A scorer whose OOS RMSE exceeds σ(target)
+    (the documented current state) can still be gate-useful **iff it gets the
+    direction right**. RMSE alone cannot tell a skeptical quant whether the
+    gate carries any real edge; these two metrics measure exactly that:
+
+    - ``dir_acc`` — fraction of held-out decisions where ``sign(pred) ==
+      sign(realized)`` (a zero on either side carries no directional truth
+      and is excluded).
+    - ``rank_ic`` — tie-aware Spearman(pred, realized), **reusing
+      ``calibration._spearman``** so this OOS metric and the in-sample
+      ``ml.calibration`` diagnostic can never drift (single source of truth,
+      AGENTS.md invariant #10 spirit). Tie-awareness is load-bearing: the
+      scorer clamps to ±``PRED_CLAMP_PCT``, so off-distribution predictions
+      tie at exactly ±50 and a naïve ``argsort(argsort)`` would fabricate
+      rank skill there (a constant predictor would read 1.0).
+
+    Mirrors ``validation.evaluate_scorer_oos``'s exact 11-kwarg ``predict``
+    signature and SELL sign-flip so it describes the **same** prediction path
+    the gate uses. Never raises — returns ``{dir_acc, rank_ic, n}`` with
+    ``None`` metrics on any fault so a post-train diagnostic crash can't mask
+    a successful train (the AGENTS.md "scorer-train status must stay
+    truthful" discipline, mirrored from the separate ``oos_rmse`` guard).
+    """
+    out = {"dir_acc": None, "rank_ic": None, "n": 0}
+    try:
+        if not oos_records or not getattr(scorer, "is_trained", False):
+            return out
+        import numpy as _np
+        from paper_trader.ml.decision_scorer import _to_float
+        from paper_trader.ml.calibration import _spearman
+
+        preds: list[float] = []
+        actuals: list[float] = []
+        for r in oos_records:
+            try:
+                p = scorer.predict(
+                    ml_score=_to_float(r.get("ml_score"), 0.0),
+                    rsi=r.get("rsi"), macd=r.get("macd"),
+                    mom5=r.get("mom5"), mom20=r.get("mom20"),
+                    regime_mult=_to_float(r.get("regime_mult"), 1.0),
+                    ticker=str(r.get("ticker") or ""),
+                    vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
+                    news_urgency=r.get("news_urgency"),
+                    news_article_count=r.get("news_article_count"),
+                )
+                a = _to_float(r.get("forward_return_5d"), 0.0)
+                # Mirror train_scorer / evaluate_scorer_oos: a SELL's realized
+                # target sign is flipped so "good" has one consistent meaning.
+                if str(r.get("action") or "BUY").upper() == "SELL":
+                    a = -a
+                p = float(p)
+                if p == p and a == a:  # drop non-finite defensively
+                    preds.append(p)
+                    actuals.append(a)
+            except Exception:
+                continue
+
+        n = len(preds)
+        out["n"] = n
+        if n >= 2:
+            ic = _spearman(_np.asarray(preds, dtype=float),
+                           _np.asarray(actuals, dtype=float))
+            if ic == ic:  # not NaN
+                out["rank_ic"] = round(float(ic), 4)
+        dir_pairs = [(p, a) for p, a in zip(preds, actuals)
+                     if p != 0.0 and a != 0.0]
+        if dir_pairs:
+            hits = sum(1 for p, a in dir_pairs if (p > 0) == (a > 0))
+            out["dir_acc"] = round(hits / len(dir_pairs), 4)
+    except Exception:
+        return {"dir_acc": None, "rank_ic": None, "n": 0}
+    return out
+
+
 def _train_decision_scorer(outcome_records: list[dict]) -> str:
     """Train DecisionScorer on the historical 80% of outcomes; report OOS RMSE
     on the most recent 20% (true temporal holdout — never seen during training).
@@ -402,8 +537,26 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
         except Exception as exc:
             oos_rmse_s = f"n/a (oos-eval err: {type(exc).__name__})"
 
+    # OOS directional skill — guarded SEPARATELY from the rmse block (and from
+    # the train block) so a crash here also degrades to n/a rather than a
+    # false "scorer err" (the AGENTS.md "scorer-train status must stay
+    # truthful" discipline). Reloads the freshly-pickled model from disk so
+    # the metric describes the exact serialized state the next cycle deploys.
+    oos_diracc_s = "n/a"
+    oos_ic_s = "n/a"
+    if result.get("status") == "ok" and oos_records:
+        try:
+            m = _oos_rank_metrics(DecisionScorer(), oos_records)
+            if m["dir_acc"] is not None:
+                oos_diracc_s = f"{m['dir_acc']:.2f}"
+            if m["rank_ic"] is not None:
+                oos_ic_s = f"{m['rank_ic']:+.2f}"
+        except Exception as exc:
+            oos_diracc_s = oos_ic_s = f"n/a ({type(exc).__name__})"
+
     return (f"scorer {result['status']} train_n={result['n']} "
-            f"val_rmse={val_s} oos_n={len(oos_records)} oos_rmse={oos_rmse_s}")
+            f"val_rmse={val_s} oos_n={len(oos_records)} oos_rmse={oos_rmse_s} "
+            f"oos_diracc={oos_diracc_s} oos_ic={oos_ic_s}")
 
 
 def _parse_published_date(published) -> date | None:
@@ -909,11 +1062,18 @@ def _run_validation_async(engine, cycle: int, win_start: date, win_end: date,
         if articles_db:
             audit = audit_label_contamination(articles_db, win_start, win_end)
             out["label_audit"] = audit
-            if audit.get("contamination_rate", 0.0) > 0.5:
+            # Only alert on real Claude-label hindsight risk. A purely
+            # RETROACTIVE_COLLECTION verdict is architectural (historical
+            # articles are always scraped long after publication) and uses
+            # ML/heuristic scores, not Claude labels — alerting on it would
+            # spam every historical window with a false alarm.
+            if audit.get("verdict") == "HIGH_CONTAMINATION":
+                llm_n = audit.get("llm_contaminated_count", 0)
+                total_n = audit.get("total_articles", 0)
                 _post_discord(
-                    f"WARN: high label contamination "
-                    f"({audit['contamination_rate']:.0%}) "
-                    f"in window {win_start}→{win_end}. "
+                    f"WARN: high label contamination — "
+                    f"{llm_n}/{total_n} Claude-labeled articles collected "
+                    f"with hindsight in window {win_start}→{win_end}. "
                     f"Backtest returns may be inflated."
                 )
     except Exception as e:
@@ -930,6 +1090,26 @@ def _run_validation_async(engine, cycle: int, win_start: date, win_end: date,
                 n_permutations=VALIDATION_PERMUTATIONS,
                 isolated_db_path=Path(tmp) / "perm.db",
             )
+        # Policy override: if the label audit shows the window's articles
+        # were >=50% collected with hindsight, the permutation test ran on
+        # contaminated inputs and its verdict (however significant) is not
+        # trustworthy — the "signal" may just be future leakage. Keep this
+        # in the policy layer (run_permutation_test stays pure math).
+        try:
+            _la = out.get("label_audit") or {}
+            _cr = _la.get("contamination_rate")
+            if (
+                isinstance(perm, dict)
+                and _cr is not None
+                and float(_cr) >= 0.5
+            ):
+                perm["verdict_raw"] = perm.get("verdict")
+                perm["verdict"] = (
+                    "CONTAMINATED_DATA — permutation result invalid"
+                )
+                perm["contamination_rate"] = float(_cr)
+        except Exception:
+            pass
         out["permutation_test"] = perm
         v = perm.get("verdict")
         if v == "WORSE_THAN_RANDOM":
@@ -989,6 +1169,19 @@ def main() -> None:
           f"({RUNS_PER_CYCLE} runs/cycle, keep last {KEEP_LAST_RUNS}, "
           f"cooldown {COOLDOWN_SECONDS}s, variable {MIN_WINDOW_YEARS}–{MAX_WINDOW_YEARS}yr "
           f"windows in {EARLIEST_WINDOW_START}–present)")
+
+    # A fresh process means any pre-existing 'running' row is orphaned from a
+    # dead prior process (hard-killed before finalize_run / the failed-marker).
+    # Sweep them once at startup so the dashboard stops rendering dead runs
+    # as in-flight (CLAUDE.md §11). Runs before any new run is launched —
+    # single-threaded, no race with this process's own runs.
+    try:
+        reaped = _reap_orphaned_runs()
+        if reaped:
+            print(f"[continuous] reaped {reaped} orphaned 'running' "
+                  f"run(s) → failed")
+    except Exception as e:
+        print(f"[continuous] reap dispatch failed: {e}")
 
     cycle = 0
     while not _STOP:
