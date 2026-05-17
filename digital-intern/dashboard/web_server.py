@@ -858,6 +858,34 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: earnings-risk fetch failed: %s", e)
 
+        # "What materially changed since you last looked" — the one temporal-
+        # change view. Every sub-fetch above is a current-state snapshot; this
+        # lets the chat answer "what happened while I was away / since I last
+        # asked?" without the user scanning the dashboard. Restates
+        # /api/session-delta's own ranked headline + top events (a restatement
+        # of event fields, no re-derivation). ACTIVE-only — a QUIET/NO_DATA
+        # window is silence, matching the unified :8888 chat's
+        # _fetch_session_delta so the two conversational surfaces stay
+        # consistent. Network guarded like every sibling (never raises into
+        # chat); only appears once :8090 is restarted onto the endpoint.
+        session_delta_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/session-delta?minutes=360",
+                    timeout=4) as resp:
+                sd = json.loads(resp.read().decode("utf-8"))
+            if (not sd.get("error") and sd.get("state") == "ACTIVE"
+                    and sd.get("headline")):
+                sd_lines = [sd["headline"]]
+                for ev in (sd.get("events") or [])[:6]:
+                    s = ev.get("summary")
+                    if s:
+                        sd_lines.append(f"  • {s}")
+                session_delta_block = "\n".join(sd_lines)
+        except Exception as e:
+            _logger().warning("chat: session-delta fetch failed: %s", e)
+
         now_iso = datetime.now(timezone.utc).isoformat()
         system_prompt = (
             "You are a market intelligence analyst with access to a real-time news feed, "
@@ -870,6 +898,7 @@ def create_app(store=None) -> Flask:
             f"{portfolio_block}\n\n"
             "PAPER TRADER LIVE STATE (separate $1000 sim run by Opus 4.7 every 30 min):\n"
             f"{paper_trader_block}\n\n"
+            + (f"PAPER TRADER — WHAT MATERIALLY CHANGED SINCE YOU LAST LOOKED (ranked, last 6h):\n{session_delta_block}\n\n" if session_delta_block else "")
             + (f"PAPER TRADER ANALYTICS:\n{analytics_block}\n\n" if analytics_block else "")
             + (f"PAPER TRADER OPTIONS GREEKS (Black-Scholes, live IV):\n{greeks_block}\n\n" if greeks_block else "")
             + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP:\n{heatmap_block}\n\n" if heatmap_block else "")
