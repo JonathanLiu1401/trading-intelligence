@@ -467,6 +467,31 @@ class TestPortfolioLines:
         assert "2026-12-19" in out[0]
         assert "+400.00" in out[0]
 
+    def test_stale_mark_annotated_when_flagged(self):
+        # A position whose live price was unavailable (stale_mark True) must
+        # be visibly flagged so the operator does not read the $0.00 P/L as a
+        # genuine flat position (the MU live case).
+        positions = [{
+            "ticker": "MU", "type": "stock", "qty": 0.5,
+            "avg_cost": 724.12, "current_price": 724.12, "unrealized_pl": 0.0,
+            "stale_mark": True,
+        }]
+        line = reporter._portfolio_lines(positions)[0]
+        assert "STALE" in line.upper()
+
+    def test_no_stale_annotation_when_absent_or_false(self):
+        # Backward-compat: open_positions() table rows carry no stale_mark
+        # key — output must be byte-identical to before (no annotation).
+        rows = [
+            {"ticker": "AMD", "type": "stock", "qty": 5, "avg_cost": 100.0,
+             "current_price": 110.0, "unrealized_pl": 50.0},  # key absent
+            {"ticker": "LITE", "type": "stock", "qty": 1, "avg_cost": 90.0,
+             "current_price": 95.0, "unrealized_pl": 5.0,
+             "stale_mark": False},  # key present but False
+        ]
+        out = reporter._portfolio_lines(rows)
+        assert all("STALE" not in ln.upper() for ln in out)
+
 
 class TestClassifyDecisionOutcome:
     """`decisions.action_taken` is free text (AGENTS.md invariant #11).

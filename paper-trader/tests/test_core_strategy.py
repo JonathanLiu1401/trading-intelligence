@@ -626,3 +626,82 @@ class TestExecuteCloseExpiredOption:
         assert status == "FILLED"
         # Worthless settlement → no cash credit (NOT the $500 avg_cost breakeven).
         assert fresh_store.get_portfolio()["cash"] == pytest.approx(100.0)
+
+
+# ─────────────────────── stale-mark surfacing (Phase 2) ───────────────────────
+
+class TestStaleMarkFlag:
+    """A held position whose live price is unavailable is silently marked at
+    avg_cost (current_price == avg_cost, unrealized_pl == 0.0). To a trader
+    that reads as a *flat* position when it is really *unknown* — exactly the
+    MU case seen live (avg_cost == current_price == 724.12, P/L $0.00). The
+    `stale_mark` flag distinguishes "genuinely flat" from "price missing"."""
+
+    def test_stock_no_price_is_flagged_stale(self, fresh_store, monkeypatch):
+        # The live MU scenario: get_prices returns nothing for the ticker.
+        monkeypatch.setattr(market, "get_prices", lambda tks: {})
+        fresh_store.upsert_position("MU", "stock", qty=0.5, avg_cost=724.12)
+        snap = strategy._portfolio_snapshot(fresh_store)
+        pos = snap["positions"][0]
+        assert pos["stale_mark"] is True
+        # Behaviour preserved: still falls back to avg_cost, P/L still 0.0 —
+        # the flag is the ONLY thing that changed.
+        assert pos["current_price"] == pytest.approx(724.12)
+        assert pos["unrealized_pl"] == pytest.approx(0.0)
+
+    def test_stock_with_price_is_not_stale(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_prices", lambda tks: {"AMD": 130.0})
+        fresh_store.upsert_position("AMD", "stock", qty=2, avg_cost=100.0)
+        snap = strategy._portfolio_snapshot(fresh_store)
+        pos = snap["positions"][0]
+        assert pos["stale_mark"] is False
+        assert pos["current_price"] == pytest.approx(130.0)
+        assert pos["unrealized_pl"] == pytest.approx((130.0 - 100.0) * 2)
+
+    def test_live_option_none_price_is_flagged_stale(self, fresh_store, monkeypatch):
+        # A non-expired option whose chain price is momentarily unavailable
+        # still falls back to avg_cost (existing behaviour) but is now flagged.
+        monkeypatch.setattr(market, "get_option_price", lambda *a, **k: None)
+        fresh_store.upsert_position("NVDA", "call", qty=1, avg_cost=5.0,
+                                    expiry="2026-12-19", strike=600.0)
+        snap = strategy._portfolio_snapshot(fresh_store)
+        pos = snap["positions"][0]
+        assert pos["stale_mark"] is True
+        assert pos["current_price"] == pytest.approx(5.0)  # behaviour preserved
+
+    def test_expired_option_intrinsic_is_not_stale(self, fresh_store, monkeypatch):
+        # An expired option settled at intrinsic is a DELIBERATE, real mark —
+        # not a missing price. It must NOT be flagged stale even though no
+        # live chain price exists.
+        monkeypatch.setattr(market, "get_price", lambda t: 650.0)  # ITM vs 600
+        fresh_store.upsert_position("NVDA", "call", qty=1, avg_cost=5.0,
+                                    expiry="2020-01-17", strike=600.0)
+        snap = strategy._portfolio_snapshot(fresh_store)
+        pos = snap["positions"][0]
+        assert pos["stale_mark"] is False
+        assert pos["current_price"] == pytest.approx(50.0)  # 650 - 600
+
+    def test_build_payload_annotates_stale_position(self):
+        # The core value: Opus must SEE that a $0.00 P/L is unreliable, not a
+        # genuine flat position, before sizing a trade against it.
+        snap = {
+            "cash": 100.0, "open_value": 362.0, "total_value": 462.0,
+            "positions": [
+                {"ticker": "MU", "type": "stock", "qty": 0.5,
+                 "avg_cost": 724.12, "current_price": 724.12,
+                 "unrealized_pl": 0.0, "pl_pct": 0.0, "market_value": 362.06,
+                 "stale_mark": True},
+                {"ticker": "LITE", "type": "stock", "qty": 0.61,
+                 "avg_cost": 980.90, "current_price": 970.71,
+                 "unrealized_pl": -6.21, "pl_pct": -1.04, "market_value": 592.13,
+                 "stale_mark": False},
+            ],
+        }
+        body = strategy._build_payload(
+            snap, [], [], {}, {}, None, False, quant_signals={},
+        )
+        lines = [ln for ln in body.splitlines() if ln.strip().startswith(("MU", "LITE"))]
+        mu_line = next(ln for ln in lines if ln.strip().startswith("MU"))
+        lite_line = next(ln for ln in lines if ln.strip().startswith("LITE"))
+        assert "STALE MARK" in mu_line
+        assert "STALE MARK" not in lite_line
