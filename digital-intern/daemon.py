@@ -1311,6 +1311,69 @@ def _extract_briefing_labels(briefing_text: str, articles: list) -> list[dict]:
 # intentional and strictly better trade than the restart-churn starvation.
 HEARTBEAT_RESTART_WARMUP_SECS = 120
 
+# Adaptive briefing coverage. When restart-churn / DB-contention starves the
+# 5h cadence (observed live: 31.9h and 41.2h gaps in the `briefings` table),
+# a recovered briefing used to pull only the last 5h of articles and gave the
+# consuming analyst no signal they had been dark — the "last 5h" framing
+# silently understated a 30h+ coverage hole. We widen the article lookback to
+# cover the real gap (hard-capped at the 24h published-staleness ceiling
+# get_top_for_briefing already enforces, so no new stale-news risk) and prepend
+# a one-line warning when materially overdue. Healthy cadence is unchanged.
+BRIEFING_GAP_WARN_HOURS = 7.0          # warn when the last briefing is older than this
+BRIEFING_MAX_LOOKBACK_HOURS = 24       # == get_top_for_briefing's pub-staleness ceiling
+
+
+def _briefing_gap_hours(prev_ts: str | None, now: datetime | None = None) -> float | None:
+    """Hours since the last persisted briefing ``prev_ts``.
+
+    Returns ``None`` when there is no prior briefing, the ts is unparseable,
+    or it is in the future (clock skew / bad row) — every ``None`` path
+    degrades to the original 5h behaviour. A naive ts is assumed UTC, same
+    convention as ``_initial_heartbeat_last`` and the rest of the pipeline."""
+    if not prev_ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(prev_ts.strip().replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    gap = (now - dt).total_seconds() / 3600.0
+    return gap if gap >= 0 else None
+
+
+def _briefing_lookback_hours(gap_hours: float | None) -> int:
+    """Article-lookback window (hours) for the next briefing.
+
+    On a healthy cadence (gap unknown or within the 5h target) this is the
+    unchanged 5h window — the common path has zero behaviour change. When
+    overdue it widens to span the real gap so a late briefing isn't
+    artificially narrowed to 5h, clamped to ``BRIEFING_MAX_LOOKBACK_HOURS``
+    (the same 24h ceiling get_top_for_briefing already enforces via the
+    published-staleness filter — no new stale-news exposure)."""
+    target_h = HEARTBEAT_INTERVAL / 3600.0
+    if gap_hours is None or gap_hours <= target_h:
+        return int(target_h)
+    return int(max(target_h, min(round(gap_hours), BRIEFING_MAX_LOOKBACK_HOURS)))
+
+
+def _coverage_gap_banner(gap_hours: float | None) -> str:
+    """One-line analyst warning prepended to a materially-overdue briefing.
+
+    Empty string on a healthy cadence (or unknown gap) so an on-time briefing
+    stays clean. Discord-only — never part of the saved briefing text, so it
+    can't reach the trainer's title-prefix label scan (same discipline as the
+    source-health line)."""
+    if gap_hours is None or gap_hours < BRIEFING_GAP_WARN_HOURS:
+        return ""
+    target_h = HEARTBEAT_INTERVAL // 3600
+    return (
+        f"⚠ COVERAGE GAP: first briefing in {gap_hours:.1f}h "
+        f"(target {target_h}h) — this digest spans the backlog, "
+        f"not the usual {target_h}h window"
+    )
+
 
 def _initial_heartbeat_last(store: ArticleStore, now: float | None = None) -> float:
     """Seed heartbeat_worker's ``last`` clock from the most recent persisted
@@ -1362,8 +1425,19 @@ def heartbeat_worker(store: ArticleStore):
         if now - last >= HEARTBEAT_INTERVAL:
             try:
                 log.info("[heartbeat] Generating Opus 4.7 briefing...")
+                # Gap since the LAST persisted briefing (before we save this
+                # one). Drives an adaptive lookback so a restart-starved
+                # briefing covers the real backlog instead of a stale 5h
+                # window, and a one-line analyst warning when overdue.
+                try:
+                    _prev = store.get_briefings_for_training(limit=1)
+                    _prev_ts = _prev[0].get("ts") if _prev else None
+                except Exception:
+                    _prev_ts = None
+                gap_h = _briefing_gap_hours(_prev_ts)
+                lookback_h = _briefing_lookback_hours(gap_h)
                 with _store_lock:
-                    top = store.get_top_for_briefing(hours=5, limit=50)
+                    top = store.get_top_for_briefing(hours=lookback_h, limit=50)
                 source_articles = list(top)  # keep originals (with urls) for labeling
 
                 stocks   = get_stock_data()
@@ -1401,7 +1475,19 @@ def heartbeat_worker(store: ArticleStore):
                     continue
 
                 health_line = _build_health_line(store)
-                message = briefing.rstrip() + "\n\n" + health_line
+                # Coverage-gap banner is Discord-only — NOT folded into the
+                # saved `briefing` text, so it can't reach the trainer's
+                # title-prefix label scan (same discipline as health_line).
+                banner = _coverage_gap_banner(gap_h)
+                message = (
+                    (banner + "\n\n" if banner else "")
+                    + briefing.rstrip() + "\n\n" + health_line
+                )
+                if banner:
+                    log.warning(
+                        f"[heartbeat] overdue briefing: gap={gap_h:.1f}h "
+                        f"lookback={lookback_h}h (cadence starved)"
+                    )
                 ok = discord_send(message)
                 log.info(f"[heartbeat] {'sent' if ok else 'FAILED'} ({len(message)} chars)")
 
