@@ -2123,9 +2123,20 @@ function filteredRuns() {
 async function ensureCurves(runIds, callback) {
   const missing = runIds.filter(id => !btCurvesCache[id]);
   if (missing.length) {
+    // Server caps at 100 run_ids per request; chunk to stay under the limit.
+    const CHUNK = 100;
+    const chunks = [];
+    for (let i = 0; i < missing.length; i += CHUNK) {
+      chunks.push(missing.slice(i, i + CHUNK));
+    }
     try {
-      const data = await fetch(API_PREFIX + "/api/backtests/curves?run_ids=" + missing.join(",")).then(r => r.json());
-      Object.keys(data).forEach(k => { btCurvesCache[parseInt(k)] = data[k]; });
+      const results = await Promise.all(chunks.map(chunk =>
+        fetch(API_PREFIX + "/api/backtests/curves?run_ids=" + chunk.join(","))
+          .then(r => r.json())
+      ));
+      results.forEach(data => {
+        Object.keys(data).forEach(k => { btCurvesCache[parseInt(k)] = data[k]; });
+      });
     } catch(e) { console.error("curves fetch:", e); }
   }
   if (callback) callback();
@@ -5606,6 +5617,72 @@ def backtest_curves_api():
         curves = store.run_curves(ids)
         # keyed by string for JSON compatibility
         return jsonify({str(k): v for k, v in curves.items()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/backtests/leaderboard")
+@swr_cached("backtests-leaderboard", 30.0)
+def backtest_leaderboard_api():
+    """Top backtest runs ranked by a selectable metric.
+
+    Query:
+      ?metric=vs_spy_pct|total_return_pct|annualized_return_pct|final_value|n_trades
+      ?limit=N            (default 20, capped at 200)
+      ?min_trades=N       (default 1 — excludes runs that never traded)
+    Returns: {"metric": ..., "count": N, "runs": [ {run_id, metric, ...}, ... ]}
+    Ranked descending; the strategy's edge over SPY (vs_spy_pct) is the default.
+    """
+    ALLOWED = {
+        "vs_spy_pct", "total_return_pct", "annualized_return_pct",
+        "final_value", "n_trades",
+    }
+    try:
+        metric = (request.args.get("metric") or "vs_spy_pct").strip()
+        if metric not in ALLOWED:
+            return jsonify({"error": f"metric must be one of {sorted(ALLOWED)}"}), 400
+        try:
+            limit = max(1, min(200, int(request.args.get("limit", 20))))
+        except ValueError:
+            limit = 20
+        try:
+            min_trades = max(0, int(request.args.get("min_trades", 1)))
+        except ValueError:
+            min_trades = 1
+
+        from .backtest import BacktestStore
+        store = BacktestStore()
+        runs = store.all_runs(include_curves=False)
+        completed = [
+            r for r in runs
+            if r.get("status") == "complete"
+            and (r.get("n_trades") or 0) >= min_trades
+            and r.get(metric) is not None
+        ]
+        completed.sort(key=lambda r: r.get(metric), reverse=True)
+        top = completed[:limit]
+        return jsonify({
+            "metric": metric,
+            "limit": limit,
+            "min_trades": min_trades,
+            "count": len(top),
+            "total_eligible": len(completed),
+            "runs": [
+                {
+                    "run_id": r.get("run_id"),
+                    "metric": r.get(metric),
+                    "total_return_pct": r.get("total_return_pct"),
+                    "vs_spy_pct": r.get("vs_spy_pct"),
+                    "annualized_return_pct": r.get("annualized_return_pct"),
+                    "final_value": r.get("final_value"),
+                    "n_trades": r.get("n_trades"),
+                    "start_date": r.get("start_date"),
+                    "end_date": r.get("end_date"),
+                    "seed": r.get("seed"),
+                }
+                for r in top
+            ],
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
