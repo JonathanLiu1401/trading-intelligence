@@ -186,11 +186,17 @@ def run(start_year: int = 1994):
         done.add(qkey)
 
         if (i + 1) % 10 == 0:
-            CHECKPOINT_PATH.write_text(json.dumps({"done": list(done)}))
+            # Atomic write — write_text() truncates first, so an OOM-kill
+            # mid-write would empty the checkpoint and restart the sweep.
+            _tmp = CHECKPOINT_PATH.with_suffix(".tmp")
+            _tmp.write_text(json.dumps({"done": list(done)}))
+            os.replace(_tmp, CHECKPOINT_PATH)
             print(f"[edgar_bulk] {i+1}/{len(quarters)} quarters | "
                   f"+{inserted_total} filings | Q{year}Q{q}: {len(filings)} 8-Ks → {inserted} new")
 
-    CHECKPOINT_PATH.write_text(json.dumps({"done": list(done)}))
+    _tmp = CHECKPOINT_PATH.with_suffix(".tmp")
+    _tmp.write_text(json.dumps({"done": list(done)}))
+    os.replace(_tmp, CHECKPOINT_PATH)
     print(f"[edgar_bulk] DONE — {inserted_total} new 8-K filings inserted")
 
 
