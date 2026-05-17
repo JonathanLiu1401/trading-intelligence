@@ -98,6 +98,7 @@ review:
 | `test_core_reporter.py` | openclaw missing → False, timeout/nonzero exit → False, trade alert + decision log + portfolio line formatting, **daily-close P/L baseline label tracks `_INITIAL_EQUITY` not a hardcoded `$1000`**, **`send_daily_close` `pnl_real` cash-flow sign (SELL\* credits / BUY\* debits) incl. the option ×100 multiplier via `store.record_trade`** (exact `$-400.00` on a mixed stock+option same-day ledger — a sign flip → `+400.00`, a dropped ×100 → `-449.50`), **`_behavioural_block` composes the scorecard state/headline/focus/concordance verbatim** (no re-derived verdict), suppresses NO_DATA, **returns `""` (never raises) when the builder faults — and `send_hourly_summary`/`send_daily_close` still send the summary regardless** (the "no block, never no summary" failure contract) |
 | `test_round_trips.py` | `build_round_trips` arithmetic: simple/partial/re-entry round-trips, option ×100, distinct (ticker,type,strike,expiry) keys, open-lot exclusion, orphan SELL, zero-cost `pnl_pct=None`, negative/unparseable `hold_days`, sub-cent rounding |
 | `test_core_analytics.py` | `/api/analytics` end-to-end via Flask test client: exact `win_rate_pct` / `profit_factor` / `avg_holding_days` / `realized_pl_usd` / `n_round_trips` for a fixed ledger; open positions excluded; empty ledger → null metrics |
+| `test_core_dashboard_articles_db.py` | Regression lock for invariant #17: `dashboard._articles_db_path()` must resolve through the freshness-aware `signals._db_path()`, not its legacy USB-first existence probe — the discriminating stale-USB-loses-to-fresh-LOCAL assertion, fresher-USB-still-wins, `backtest://`-row excluded from the freshness probe, `None`-when-no-DB (caller contract), and `== signals._db_path()` no-drift |
 | `test_core_dashboard_helpers.py` | Pure dashboard helpers with no prior coverage: `_scorer_verdict` 5-way boundary bucketing; `_position_ages_from_trades` open-lot state machine (partial-sell keeps entry, full-sell→re-buy resets, option trades ignored); `_next_market_open` open/close/weekend/holiday arithmetic; `_classify_action` co-pilot selection incl. the **EXIT-before-TRIM** ordering regression and "never BUY without a technical confirm"; **`TestTemplateIdsUnique` — no duplicate static `id="..."` in `dashboard.TEMPLATE`** (regression lock for the `dd-`/`drought-` card-id collision, invariant #14) |
 | `test_decision_drought.py` | `build_decision_drought` segmentation: `_classify` fill/block/hold/no-decision; two-drought scenario with exact portfolio/SPY/alpha %; PARALYSIS vs DELIBERATE_HOLD split; ongoing drought detection; `involuntary_alpha_bleed_pct` counts PARALYSIS-only negative alpha; min-reportable-cycles filter; NEVER_TRADED / NO_DATA verdicts; alpha=None when SPY missing |
 | `test_news_edge.py` | `build_news_edge`: `_index_at_or_after` exact/gap/overflow; EDGE_CONFIRMED with exact raw means; **SPY-abnormal subtraction is applied** (raw 2.0, spy +1.0 → abnormal 1.0); NO_EDGE on a falling top-band ticker; INSUFFICIENT_DATA under `_MIN_BAND_N`; `$TK`/word-boundary resolution incl. "AMDOCS" must not match AMD; **adaptive reference horizon degrades to 1d when only a 1d forward window exists** (the live-data early-history case) |
@@ -354,6 +355,28 @@ review:
    `resolved_path.endswith("usb_…")` literally codified the bug; corrected to
    the post-fix fresh `local_…` + the new `legacy_*` fields (a correction,
    not a weakened test).
+
+17. **`dashboard._articles_db_path()` delegates to `signals._db_path()`.** It
+   was the last un-fixed instance of the #15 split-brain: its own legacy
+   USB-first existence probe (`if usb.exists(): return usb`) while its
+   docstring *claimed* to "Match how paper_trader.signals discovers the
+   digital-intern articles.db". So `/api/news-edge`, `/api/source-edge`,
+   `/api/signal-followthrough`, `/api/sector-pulse` (via `_ticker_news_pulse`)
+   read the **stale USB mirror** while the live trader read the fresh LOCAL
+   one — the same documented split-brain, surviving in this one helper. It now
+   calls `signals._db_path()` (the freshness-aware single source of truth) and
+   returns `None` when the resolved DB does not exist, **preserving the caller
+   contract** (`if path is None: <graceful>`) — `signals._db_path()` returns
+   LOCAL_DB as its tie/fallback even when nothing exists, so the `.exists()`
+   gate is load-bearing. Data-sourcing fix, not a risk limit (invariants
+   #2/#12 untouched — same reasoning as #15). Like #15 it does **not** rescue
+   a running process: a stale `:8090` keeps the old probe until restart
+   (`/api/build-info` `stale`). Locked by
+   `tests/test_core_dashboard_articles_db.py`
+   (`TestArticlesDbPathIsFreshnessAware` — the discriminating
+   stale-USB-loses-to-fresh-LOCAL assertion, fresher-USB-still-wins,
+   backtest-row-excluded, `None`-when-missing, and the
+   `== signals._db_path()` no-drift lock).
 
 ### Dashboard API endpoints (port 8090)
 

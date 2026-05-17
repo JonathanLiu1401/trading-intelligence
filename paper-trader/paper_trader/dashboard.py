@@ -5493,16 +5493,31 @@ def analytics_api():
 
 
 def _articles_db_path() -> Path | None:
-    """Match how paper_trader.signals discovers the digital-intern articles.db."""
-    import os
-    usb = Path(os.environ.get("DIGITAL_INTERN_USB",
-                              "/media/zeph/projects/digital-intern/db")) / "articles.db"
-    if usb.exists():
-        return usb
-    local = Path("/home/zeph/digital-intern/data/articles.db")
-    if local.exists():
-        return local
-    return None
+    """Resolve the digital-intern articles.db through the SAME freshness-aware
+    single source of truth the live trader uses (``signals._db_path()``).
+
+    The legacy USB-first existence probe this replaced returned the USB mirror
+    whenever it merely ``exists()`` — but the digital-intern daemon falls back
+    to writing the LOCAL copy when the USB mount is unavailable, leaving a USB
+    mirror that keeps ``exists()``-ing while going day-stale. That made every
+    news-analytics endpoint here (``/api/news-edge``, ``/api/source-edge``,
+    ``/api/signal-followthrough``, ``/api/sector-pulse``, ``/api/thesis-drift``)
+    read a STALE feed while the live trader (``signals._db_path()``,
+    freshness-aware) read the FRESH one — the documented split-brain, fixed
+    everywhere in signals.py but left here. Delegating to ``signals._db_path()``
+    closes that gap so the dashboard and the trader never disagree on which
+    feed is canonical.
+
+    Caller contract preserved: callers do ``if path is None: <graceful>``, so a
+    resolved-but-nonexistent DB still surfaces as ``None`` rather than a Path to
+    a missing file (``signals._db_path()`` returns LOCAL_DB as its tie/fallback
+    even when nothing exists)."""
+    try:
+        from . import signals as _sig
+        path = _sig._db_path()
+    except Exception:
+        return None
+    return path if path and path.exists() else None
 
 
 def _ticker_news_pulse(tickers: list[str], hours: int = 24) -> dict[str, dict]:
