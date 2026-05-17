@@ -230,6 +230,65 @@ class TestSendDailyClosePnlReal:
         assert "$-449.50" not in body      # option ×100 not dropped
 
 
+class TestSendDailyCloseRealizedRoundTrips:
+    """`send_daily_close` now also emits a *true* realized-P/L line driven by
+    the `build_round_trips` single source of truth (AGENTS.md invariant #10):
+    only round-trips that *closed today* count, paired BUY→SELL, so it answers
+    "what did I lock in today?" — distinct from the existing cash-flow line.
+
+    The asserted values pin the contract exactly:
+      * NVDA 10@100 → 10@112  : closed today, +$120.00, a WIN
+      * MU   5@80   → 5@70    : closed today, -$50.00,  a LOSS
+      * AMD  4@50             : opened today, NOT closed — must NOT count
+    Net realized = +120 - 50 = +$70.00 over 2 closed trips (1W/1L). A
+    regression that counted open positions, dropped the win/loss split, or
+    re-derived P&L instead of consuming build_round_trips fails here.
+    """
+
+    def _wire(self, fresh_store, monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: None)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        return captured
+
+    def test_realized_roundtrip_line_value_and_winloss(
+            self, fresh_store, monkeypatch):
+        captured = self._wire(fresh_store, monkeypatch)
+        fresh_store.record_trade("NVDA", "BUY", 10, 100.0)
+        fresh_store.record_trade("NVDA", "SELL", 10, 112.0)   # +120 win
+        fresh_store.record_trade("MU", "BUY", 5, 80.0)
+        fresh_store.record_trade("MU", "SELL", 5, 70.0)       # -50 loss
+        fresh_store.record_trade("AMD", "BUY", 4, 50.0)       # still open
+        assert reporter.send_daily_close() is True
+        body = captured[0]
+        assert ("Realized P/L (today, 2 round-trips closed, 1W/1L)  "
+                "$+70.00") in body
+        # The cash-flow line is untouched and still present alongside it.
+        assert "Realized P/L (today, cash flow basis)" in body
+
+    def test_no_line_when_nothing_closed_today(
+            self, fresh_store, monkeypatch):
+        captured = self._wire(fresh_store, monkeypatch)
+        # Only opens — nothing returns to flat, so no round-trip closes.
+        fresh_store.record_trade("NVDA", "BUY", 3, 100.0)
+        assert reporter.send_daily_close() is True
+        body = captured[0]
+        assert "round-trip" not in body
+        # Cash-flow line still renders (it counts opens too).
+        assert "Realized P/L (today, cash flow basis)" in body
+
+    def test_singular_round_trip_grammar(self, fresh_store, monkeypatch):
+        captured = self._wire(fresh_store, monkeypatch)
+        fresh_store.record_trade("LITE", "BUY", 2, 50.0)
+        fresh_store.record_trade("LITE", "SELL", 2, 55.0)     # +10 win
+        assert reporter.send_daily_close() is True
+        body = captured[0]
+        assert ("Realized P/L (today, 1 round-trip closed, 1W/0L)  "
+                "$+10.00") in body
+
+
 class TestBehaviouralBlock:
     """`reporter._behavioural_block()` composes `build_trader_scorecard`
     *verbatim* (single source of truth, AGENTS.md invariant #10 — it must
