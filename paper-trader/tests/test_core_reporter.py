@@ -407,3 +407,179 @@ class TestPortfolioLines:
         assert "NVDA CALL600" in out[0] or "NVDA CALL 600" in out[0] or "600" in out[0]
         assert "2026-12-19" in out[0]
         assert "+400.00" in out[0]
+
+
+class TestClassifyDecisionOutcome:
+    """`decisions.action_taken` is free text (AGENTS.md invariant #11).
+    The bucket order is load-bearing: a FILLED/BLOCKED verb line also
+    contains its own BUY/SELL verb and must NOT be misread as `hold`."""
+
+    def test_filled_not_misread_as_hold(self):
+        # 'BUY NVDA → FILLED' must be filled, never other/hold.
+        assert reporter._classify_decision_outcome("BUY NVDA → FILLED") == "filled"
+        assert reporter._classify_decision_outcome("SELL LITE → FILLED") == "filled"
+
+    def test_hold(self):
+        assert reporter._classify_decision_outcome("HOLD MU → HOLD") == "hold"
+        # REBALANCE is treated as HOLD by _execute — still classified hold.
+        assert reporter._classify_decision_outcome("REBALANCE X → HOLD") == "hold"
+
+    def test_no_decision_has_no_arrow(self):
+        assert reporter._classify_decision_outcome("NO_DECISION") == "no_decision"
+
+    def test_blocked(self):
+        assert reporter._classify_decision_outcome("SELL X → BLOCKED") == "blocked"
+
+    def test_none_and_empty_and_unknown_are_other(self):
+        assert reporter._classify_decision_outcome(None) == "other"
+        assert reporter._classify_decision_outcome("") == "other"
+        assert reporter._classify_decision_outcome("WAT") == "other"
+
+    def test_case_insensitive(self):
+        assert reporter._classify_decision_outcome("buy nvda → filled") == "filled"
+
+
+class TestActivityCounts:
+    """At-or-after a lexically-comparable ISO cutoff (the store's own
+    UTC isoformat). A row whose ts == cutoff is INCLUDED (`< since` excludes
+    only strictly-older rows); strictly-older rows are dropped."""
+
+    _DECISIONS = [  # newest-first, as store.recent_decisions() returns
+        {"timestamp": "2026-05-17T09:30:00+00:00", "action_taken": "BUY NVDA → FILLED"},
+        {"timestamp": "2026-05-17T09:00:00+00:00", "action_taken": "HOLD MU → HOLD"},
+        {"timestamp": "2026-05-17T08:30:00+00:00", "action_taken": "NO_DECISION"},
+        {"timestamp": "2026-05-17T08:00:00+00:00", "action_taken": "SELL X → BLOCKED"},
+        {"timestamp": "2026-05-17T06:00:00+00:00", "action_taken": "HOLD Y → HOLD"},
+    ]
+
+    def test_window_excludes_strictly_older(self):
+        c = reporter._activity_counts(self._DECISIONS, "2026-05-17T08:15:00+00:00")
+        # 09:30 filled, 09:00 hold, 08:30 no_decision in window;
+        # 08:00 blocked and 06:00 hold are strictly older → excluded.
+        assert c == {"filled": 1, "hold": 1, "no_decision": 1,
+                     "blocked": 0, "other": 0}
+
+    def test_cutoff_equal_timestamp_is_included(self):
+        # since == an 08:00 row's ts: it is NOT < since, so it counts.
+        c = reporter._activity_counts(self._DECISIONS, "2026-05-17T08:00:00+00:00")
+        assert c == {"filled": 1, "hold": 1, "no_decision": 1,
+                     "blocked": 1, "other": 0}
+
+    def test_all_in_window(self):
+        c = reporter._activity_counts(self._DECISIONS, "2026-05-17T00:00:00+00:00")
+        assert c == {"filled": 1, "hold": 2, "no_decision": 1,
+                     "blocked": 1, "other": 0}
+
+    def test_empty(self):
+        assert reporter._activity_counts([], "2026-05-17T00:00:00+00:00") == {
+            "filled": 0, "hold": 0, "no_decision": 0, "blocked": 0, "other": 0}
+
+
+class TestMovers:
+    def test_best_and_worst_picked_by_pl(self):
+        positions = [
+            {"ticker": "NVDA", "unrealized_pl": -12.5},
+            {"ticker": "LITE", "unrealized_pl": 30.0},
+            {"ticker": "MU", "unrealized_pl": 4.0},
+            {"ticker": "AMD", "unrealized_pl": None},  # non-numeric → filtered
+        ]
+        best, worst = reporter._movers(positions)
+        assert best["ticker"] == "LITE" and best["unrealized_pl"] == 30.0
+        assert worst["ticker"] == "NVDA" and worst["unrealized_pl"] == -12.5
+
+    def test_single_position_best_is_worst_identity(self):
+        positions = [{"ticker": "X", "unrealized_pl": 5.0}]
+        best, worst = reporter._movers(positions)
+        assert best is worst  # callers use identity to render one line
+
+    def test_no_numeric_positions(self):
+        assert reporter._movers([]) == (None, None)
+        assert reporter._movers([{"ticker": "X", "unrealized_pl": None}]) == (None, None)
+
+
+class TestWindowDelta:
+    _CURVE = [
+        {"timestamp": "2026-05-17T07:00:00+00:00", "total_value": 1000.0, "sp500_price": 5000.0},
+        {"timestamp": "2026-05-17T08:00:00+00:00", "total_value": 1010.0, "sp500_price": 5050.0},
+        {"timestamp": "2026-05-17T09:00:00+00:00", "total_value": 1030.0, "sp500_price": 5100.0},
+    ]
+
+    def test_exact_port_spy_alpha(self):
+        d = reporter._window_delta(self._CURVE, "2026-05-17T08:00:00+00:00")
+        # base = 08:00 (1010/5050), last = 09:00 (1030/5100)
+        assert d["port_pct"] == pytest.approx((1030 / 1010 - 1) * 100)
+        assert d["spy_pct"] == pytest.approx((5100 / 5050 - 1) * 100)
+        assert d["alpha_pct"] == pytest.approx(d["port_pct"] - d["spy_pct"])
+
+    def test_too_few_points(self):
+        assert reporter._window_delta(self._CURVE[:1], "2026-05-17T00:00:00+00:00") is None
+
+    def test_base_is_last_returns_none(self):
+        # since after every point but the last → only in-window point is last.
+        assert reporter._window_delta(self._CURVE, "2026-05-17T09:00:00+00:00") is None
+
+    def test_missing_spy_degrades_to_port_only(self):
+        curve = [
+            {"timestamp": "2026-05-17T07:00:00+00:00", "total_value": 1000.0, "sp500_price": None},
+            {"timestamp": "2026-05-17T09:00:00+00:00", "total_value": 1100.0, "sp500_price": None},
+        ]
+        d = reporter._window_delta(curve, "2026-05-17T00:00:00+00:00")
+        assert d == {"port_pct": pytest.approx(10.0)}
+        assert "spy_pct" not in d and "alpha_pct" not in d
+
+
+class TestSessionBlock:
+    """End-to-end on a real temp Store: the SESSION block reports the exact
+    decision-activity mix, the correct best/worst mover, and the exact
+    portfolio-vs-SPY window delta — and degrades to '' (never raises) on a
+    store fault, the reporter failure contract."""
+
+    def test_composed_block_exact(self, fresh_store):
+        fresh_store.record_decision(True, 5, "BUY NVDA → FILLED", "x", 1000, 500)
+        fresh_store.record_decision(True, 5, "HOLD MU → HOLD", "x", 1000, 500)
+        fresh_store.record_decision(True, 5, "NO_DECISION", "x", 1000, 500)
+        fresh_store.upsert_position("NVDA", "stock", 2, 100.0)
+        fresh_store.upsert_position("LITE", "stock", 1, 50.0)
+        ids = {p["ticker"]: p["id"] for p in fresh_store.open_positions()}
+        fresh_store.update_position_marks({
+            ids["NVDA"]: (110.0, 20.0),   # +20 → best
+            ids["LITE"]: (40.0, -10.0),   # -10 → worst
+        })
+        fresh_store.record_equity_point(1000.0, 500.0, 5000.0)
+        fresh_store.record_equity_point(1030.0, 470.0, 5100.0)
+
+        block = reporter._session_block(fresh_store, 24.0, "24h")
+        assert "**SESSION** ◈ last 24h" in block
+        assert ("Decisions   3   filled 1  hold 1  no-dec 1  blocked 0"
+                in block)
+        assert "Best `NVDA` $+20.00  ·  Worst `LITE` $-10.00" in block
+        # (1030/1000-1)*100 = +3.00, (5100/5000-1)*100 = +2.00, alpha +1.00
+        assert "Δ port `+3.00%`  spy `+2.00%`  alpha `+1.00%`" in block
+
+    def test_single_position_one_mover_line(self, fresh_store):
+        fresh_store.upsert_position("NVDA", "stock", 1, 100.0)
+        pid = fresh_store.open_positions()[0]["id"]
+        fresh_store.update_position_marks({pid: (115.0, 15.0)})
+        block = reporter._session_block(fresh_store, 1.0, "1h")
+        assert "Only open mover `NVDA` $+15.00" in block
+        assert "Worst" not in block
+
+    def test_store_fault_degrades_to_empty(self):
+        boom = MagicMock()
+        boom.recent_decisions.side_effect = RuntimeError("db gone")
+        assert reporter._session_block(boom, 1.0, "1h") == ""
+
+    def test_hourly_summary_includes_session_block(self, fresh_store, monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        fresh_store.record_decision(True, 5, "BUY NVDA → FILLED", "x", 1000, 500)
+        fresh_store.record_decision(True, 5, "NO_DECISION", "x", 1000, 500)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**SESSION** ◈ last 1h" in body
+        assert "filled 1" in body and "no-dec 1" in body
+        # The pre-existing summary is still intact alongside the new block.
+        assert "**HOURLY**" in body and "Equity" in body

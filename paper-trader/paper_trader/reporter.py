@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import market
 from .store import INITIAL_CASH, get_store
@@ -140,6 +140,141 @@ def _behavioural_block() -> str:
         return ""
 
 
+def _classify_decision_outcome(action_taken: str | None) -> str:
+    """Coarse bucket for a free-text ``decisions.action_taken`` value.
+
+    The column is free text (AGENTS.md invariant #11): ``"BUY NVDA → FILLED"``,
+    ``"HOLD MU → HOLD"``, ``"NO_DECISION"``, ``"SELL X → BLOCKED"``. Check
+    order is load-bearing: a ``NO_DECISION`` row has no arrow, and a
+    ``→ FILLED`` / ``→ BLOCKED`` verb line also contains its own verb — it
+    must not be misread as ``hold`` because the buy/sell verb happened to
+    precede the arrow.
+    """
+    s = (action_taken or "").upper()
+    if "NO_DECISION" in s:
+        return "no_decision"
+    if "FILLED" in s:
+        return "filled"
+    if "BLOCKED" in s:
+        return "blocked"
+    if "HOLD" in s:
+        return "hold"
+    return "other"
+
+
+def _activity_counts(decisions: list[dict], since_iso: str) -> dict[str, int]:
+    """Tally decision outcomes whose timestamp is at-or-after ``since_iso``.
+
+    ``decisions`` are ``store.recent_decisions()`` rows (newest-first). Both
+    the row timestamp and ``since_iso`` are the store's own
+    ``datetime.now(timezone.utc).isoformat()`` strings — fixed-offset UTC, so
+    a lexical ``<`` orders them correctly (the same comparison pattern
+    ``signals.py`` documents and relies on for ``first_seen``).
+    """
+    counts = {"filled": 0, "hold": 0, "no_decision": 0, "blocked": 0, "other": 0}
+    for d in decisions:
+        if (d.get("timestamp") or "") < since_iso:
+            continue
+        counts[_classify_decision_outcome(d.get("action_taken"))] += 1
+    return counts
+
+
+def _movers(positions: list[dict]) -> tuple[dict | None, dict | None]:
+    """``(best, worst)`` open position by ``unrealized_pl``.
+
+    Both ``None`` when no position carries a numeric mark. With a single
+    position ``best is worst`` (same object) — callers use object identity
+    to decide whether to render one line or two.
+    """
+    scored = [p for p in positions
+              if isinstance(p.get("unrealized_pl"), (int, float))]
+    if not scored:
+        return None, None
+    best = max(scored, key=lambda p: p["unrealized_pl"])
+    worst = min(scored, key=lambda p: p["unrealized_pl"])
+    return best, worst
+
+
+def _window_delta(equity_asc: list[dict], since_iso: str) -> dict | None:
+    """Portfolio %Δ and SPY %Δ from the first equity point at-or-after
+    ``since_iso`` to the latest point.
+
+    ``equity_asc`` is ``store.equity_curve()`` (ascending). Returns ``None``
+    when there is no usable baseline (< 2 points, or the only point in-window
+    is the latest one). ``alpha_pct`` is only set when both legs resolve, so
+    a missing ``sp500_price`` degrades to portfolio-only, never a crash.
+    """
+    if len(equity_asc) < 2:
+        return None
+    last = equity_asc[-1]
+    base = next((p for p in equity_asc
+                 if (p.get("timestamp") or "") >= since_iso), None)
+    if base is None or base is last:
+        return None
+    out: dict[str, float] = {}
+    b_tv, l_tv = base.get("total_value"), last.get("total_value")
+    if b_tv and b_tv > 0 and l_tv is not None:
+        out["port_pct"] = (l_tv / b_tv - 1.0) * 100.0
+    b_sp, l_sp = base.get("sp500_price"), last.get("sp500_price")
+    if b_sp and b_sp > 0 and l_sp:
+        out["spy_pct"] = (l_sp / b_sp - 1.0) * 100.0
+    if "port_pct" in out and "spy_pct" in out:
+        out["alpha_pct"] = out["port_pct"] - out["spy_pct"]
+    return out or None
+
+
+def _session_block(store, window_hours: float, label: str) -> str:
+    """Compact "what the desk actually did this <label>" block for the
+    hourly / daily-close report: the decision-activity mix (did the bot
+    *do* anything, or sit on its hands?), the best/worst open mover, and
+    the portfolio-vs-SPY delta over the window.
+
+    Composed purely from existing store reads — no new state, no caps,
+    observational only (the `_behavioural_block` precedent; invariants
+    #2/#12). Failure contract mirrors the rest of ``reporter``: any
+    store/compute fault degrades to ``""`` ("no session block this
+    report"), **never** an exception ("no Discord summary this report").
+    """
+    try:
+        since = (datetime.now(timezone.utc)
+                 - timedelta(hours=window_hours)).isoformat()
+        counts = _activity_counts(store.recent_decisions(limit=500), since)
+        n_dec = sum(counts.values())
+        lines = [
+            f"**SESSION** ◈ last {label}",
+            "```\n"
+            f"Decisions {n_dec:>3}   filled {counts['filled']}  "
+            f"hold {counts['hold']}  no-dec {counts['no_decision']}  "
+            f"blocked {counts['blocked']}\n"
+            "```",
+        ]
+        best, worst = _movers(store.open_positions())
+        if best is not None:
+            if worst is not None and worst is not best:
+                lines.append(
+                    f"Best `{best['ticker']}` "
+                    f"${best['unrealized_pl']:+.2f}  ·  "
+                    f"Worst `{worst['ticker']}` "
+                    f"${worst['unrealized_pl']:+.2f}"
+                )
+            else:
+                lines.append(
+                    f"Only open mover `{best['ticker']}` "
+                    f"${best['unrealized_pl']:+.2f}"
+                )
+        d = _window_delta(store.equity_curve(limit=5000), since)
+        if d and "port_pct" in d:
+            seg = f"Δ port `{d['port_pct']:+.2f}%`"
+            if "spy_pct" in d:
+                seg += (f"  spy `{d['spy_pct']:+.2f}%`  "
+                        f"alpha `{d['alpha_pct']:+.2f}%`")
+            lines.append(seg)
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[reporter] session block skipped: {e}")
+        return ""
+
+
 def _portfolio_lines(positions: list[dict]) -> list[str]:
     lines = []
     for p in positions:
@@ -186,6 +321,9 @@ def send_hourly_summary() -> bool:
         + "\n".join(trade_lines)
         + "\n```"
     )
+    sx = _session_block(store, 1.0, "1h")
+    if sx:
+        body += "\n" + sx
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx
@@ -226,6 +364,9 @@ def send_daily_close() -> bool:
         + ("\n".join(_portfolio_lines(positions)) or "  (none)")
         + "\n```"
     )
+    sx = _session_block(store, 24.0, "24h")
+    if sx:
+        body += "\n" + sx
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx
