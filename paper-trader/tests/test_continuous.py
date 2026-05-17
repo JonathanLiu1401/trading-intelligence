@@ -423,3 +423,203 @@ class TestTrainDecisionScorer:
         # The model the next cycle reloads is genuinely trained and pickled.
         from paper_trader.ml.decision_scorer import DecisionScorer
         assert DecisionScorer().is_trained is True
+
+
+# ──────────────────── scorer-skill ledger ───────────────────────
+
+class TestParseScorerStatus:
+    def test_parses_a_full_ok_status_row(self):
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=708 "
+             "oos_rmse=12.40 oos_diracc=0.55 oos_ic=+0.03")
+        p = rcb._parse_scorer_status(s)
+        assert p["status"] == "ok"
+        assert p["train_n"] == 3540          # int, not float
+        assert p["oos_n"] == 708
+        assert p["val_rmse"] == pytest.approx(5.20)
+        assert p["oos_rmse"] == pytest.approx(12.40)
+        assert p["oos_dir_acc"] == pytest.approx(0.55)
+        assert p["oos_ic"] == pytest.approx(0.03)
+
+    def test_na_tokens_degrade_to_none_not_crash(self):
+        # The error path emits `oos_rmse=n/a (oos-eval err: KeyError)` — the
+        # first token after `=` is `n/a`, which must float-fail to None and
+        # NOT swallow the parenthetical into a bad parse.
+        s = ("scorer ok train_n=600 val_rmse=n/a oos_n=0 "
+             "oos_rmse=n/a (oos-eval err: KeyError) oos_diracc=n/a oos_ic=n/a")
+        p = rcb._parse_scorer_status(s)
+        assert p["status"] == "ok"
+        assert p["train_n"] == 600
+        assert p["val_rmse"] is None
+        assert p["oos_rmse"] is None
+        assert p["oos_dir_acc"] is None
+        assert p["oos_ic"] is None
+
+    def test_no_outcome_records_sentinel(self):
+        p = rcb._parse_scorer_status("no outcome records")
+        assert p["status"] == "no_outcome_records"
+        assert p["train_n"] is None
+
+    def test_garbage_is_unparseable_never_raises(self):
+        p = rcb._parse_scorer_status("")
+        assert p["status"] == "unparseable"
+        p2 = rcb._parse_scorer_status(None)  # type: ignore[arg-type]
+        assert p2["status"] == "unparseable"
+
+
+class TestAppendScorerSkillLog:
+    def test_trained_row_has_accurate_gate_active_flag(self, tmp_path, monkeypatch):
+        log = tmp_path / "scorer_skill_log.jsonl"
+        monkeypatch.setattr(rcb, "SCORER_SKILL_LOG", log)
+        ok = rcb._append_scorer_skill_log(
+            "scorer ok train_n=3540 val_rmse=5.2 oos_n=700 "
+            "oos_rmse=12.4 oos_diracc=0.55 oos_ic=+0.03",
+            cycle=7, win_start=date(2015, 1, 2), win_end=date(2016, 1, 2),
+        )
+        assert ok is True
+        row = json.loads(log.read_text().strip())
+        assert row["cycle"] == 7
+        assert row["status"] == "ok"
+        assert row["train_n"] == 3540
+        assert row["oos_rmse"] == pytest.approx(12.4)
+        assert row["window_start"] == "2015-01-02"
+        # train_n >= 500 ⇒ the conviction gate is live (invariant #5).
+        assert row["gate_active"] is True
+
+    def test_below_threshold_gate_is_inactive(self, tmp_path, monkeypatch):
+        log = tmp_path / "skill.jsonl"
+        monkeypatch.setattr(rcb, "SCORER_SKILL_LOG", log)
+        rcb._append_scorer_skill_log(
+            "scorer ok train_n=120 val_rmse=5.2 oos_n=0 oos_rmse=n/a "
+            "oos_diracc=n/a oos_ic=n/a",
+            cycle=1, win_start=date(2010, 1, 4), win_end=date(2011, 1, 4),
+        )
+        row = json.loads(log.read_text().strip())
+        assert row["train_n"] == 120
+        assert row["gate_active"] is False
+
+    def test_n_train_hint_used_when_status_omits_train_n(self, tmp_path, monkeypatch):
+        # The "no outcome records" cycle has no train_n token; the deployed
+        # pickle's n_train hint must drive an accurate gate_active flag.
+        log = tmp_path / "skill.jsonl"
+        monkeypatch.setattr(rcb, "SCORER_SKILL_LOG", log)
+        rcb._append_scorer_skill_log(
+            "no outcome records", cycle=2,
+            win_start=date(2009, 1, 2), win_end=date(2010, 1, 2),
+            n_train_hint=900,
+        )
+        row = json.loads(log.read_text().strip())
+        assert row["status"] == "no_outcome_records"
+        assert row["train_n"] == 900
+        assert row["gate_active"] is True
+
+    def test_bounded_trim_rewrites_when_past_2x_keep(self, tmp_path, monkeypatch):
+        log = tmp_path / "skill.jsonl"
+        monkeypatch.setattr(rcb, "SCORER_SKILL_LOG", log)
+        monkeypatch.setattr(rcb, "SCORER_SKILL_LOG_KEEP", 5)
+        # Pre-seed 11 rows (> 2×5) so the next append triggers a rewrite.
+        log.write_text("\n".join(json.dumps({"cycle": i}) for i in range(11)) + "\n")
+        rcb._append_scorer_skill_log(
+            "scorer ok train_n=500 val_rmse=1 oos_n=0 oos_rmse=n/a "
+            "oos_diracc=n/a oos_ic=n/a",
+            cycle=99, win_start=date(2012, 1, 3), win_end=date(2013, 1, 3),
+        )
+        lines = [l for l in log.read_text().splitlines() if l.strip()]
+        assert len(lines) == 5  # trimmed to SCORER_SKILL_LOG_KEEP
+        # The freshly-appended cycle-99 row must survive the trim (it's newest).
+        assert json.loads(lines[-1])["cycle"] == 99
+
+    def test_never_raises_on_unwritable_path(self, tmp_path, monkeypatch):
+        # Parent dir does not exist and cannot be created (path is a file).
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x")
+        monkeypatch.setattr(rcb, "SCORER_SKILL_LOG", blocker / "sub" / "skill.jsonl")
+        assert rcb._append_scorer_skill_log("no outcome records", 1,
+                                            date(2000, 1, 3), date(2001, 1, 3)) is False
+
+
+class TestDeployedScorerNTrain:
+    def test_none_when_no_pickle(self):
+        # conftest redirects SCORER_PATH into an empty tmp dir — no pickle yet.
+        assert rcb._deployed_scorer_n_train() is None
+
+    def test_reads_n_train_from_a_trained_pickle(self):
+        import random as _rnd
+        from paper_trader.ml.decision_scorer import train_scorer
+        rng = _rnd.Random(5)
+        records = [{
+            "ticker": "NVDA" if i % 2 else "AMD",
+            "sim_date": f"2024-{1 + i % 12:02d}-{1 + i // 12:02d}",
+            "action": "BUY",
+            "ml_score": rng.uniform(0, 5), "rsi": rng.uniform(20, 80),
+            "macd": rng.uniform(-1, 1), "mom5": rng.uniform(-3, 3),
+            "mom20": rng.uniform(-5, 5), "regime_mult": 1.0,
+            "forward_return_5d": rng.uniform(-3, 3), "return_pct": 10.0,
+        } for i in range(60)]
+        res = train_scorer(records)
+        assert res["status"] == "ok"
+        assert rcb._deployed_scorer_n_train() == res["n"]
+
+
+# ──────────────── winner_training.jsonl bounded trim ────────────
+
+class TestTrimWinnerJsonl:
+    def test_absent_file_is_a_noop(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(rcb, "WINNER_JSONL", tmp_path / "nope.jsonl")
+        assert rcb._trim_winner_jsonl() == 0
+
+    def test_under_2x_keep_is_untouched(self, tmp_path, monkeypatch):
+        f = tmp_path / "winner_training.jsonl"
+        monkeypatch.setattr(rcb, "WINNER_JSONL", f)
+        # keep=10 ⇒ threshold is 20; 15 lines must NOT trigger a rewrite.
+        original = "\n".join(json.dumps({"i": i}) for i in range(15)) + "\n"
+        f.write_text(original)
+        assert rcb._trim_winner_jsonl(keep=10) == 0
+        assert f.read_text() == original  # byte-for-byte unchanged
+
+    def test_past_2x_keep_trims_to_last_keep_records(self, tmp_path, monkeypatch):
+        f = tmp_path / "winner_training.jsonl"
+        monkeypatch.setattr(rcb, "WINNER_JSONL", f)
+        # 25 lines, keep=10 ⇒ threshold 20 exceeded ⇒ trim to last 10.
+        f.write_text("\n".join(json.dumps({"i": i}) for i in range(25)) + "\n")
+        dropped = rcb._trim_winner_jsonl(keep=10)
+        assert dropped == 15
+        kept = [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+        assert len(kept) == 10
+        # The TAIL is what's preserved (newest records) — i=15..24.
+        assert [r["i"] for r in kept] == list(range(15, 25))
+
+    def test_kept_lines_remain_valid_json(self, tmp_path, monkeypatch):
+        f = tmp_path / "winner_training.jsonl"
+        monkeypatch.setattr(rcb, "WINNER_JSONL", f)
+        f.write_text("\n".join(
+            json.dumps({"run_id": i, "label": "BUY", "ticker": "NVDA"})
+            for i in range(30)) + "\n")
+        rcb._trim_winner_jsonl(keep=5)
+        for l in f.read_text().splitlines():
+            if l.strip():
+                json.loads(l)  # must not raise — no torn final line
+
+    def test_default_keep_is_well_above_inject_tail(self):
+        # _inject_and_train consumes the last 10k lines; the trim floor must
+        # never starve it.
+        assert rcb.WINNER_JSONL_KEEP >= 10000
+
+
+# ─────── regression: the ledger / trim must stay wired into main() ───────
+
+class TestCycleWiringRegression:
+    """The scorer-skill ledger and winner-jsonl trim were both implemented
+    but the ledger was never called from `main()` (dead code) until this
+    fix. Lock the wiring with a source-level assertion so a future refactor
+    that drops the call fails loudly instead of silently disabling a
+    quant-facing audit trail again."""
+
+    def test_main_invokes_scorer_skill_ledger(self):
+        import inspect
+        src = inspect.getsource(rcb.main)
+        assert "_append_scorer_skill_log(" in src
+
+    def test_main_invokes_winner_jsonl_trim(self):
+        import inspect
+        src = inspect.getsource(rcb.main)
+        assert "_trim_winner_jsonl(" in src
