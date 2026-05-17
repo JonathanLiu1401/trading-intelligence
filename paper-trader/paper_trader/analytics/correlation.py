@@ -47,6 +47,17 @@ MOD_CORR = 0.40    # ≥ ⇒ partially diversified
 # A single name this share of the book is single-name risk first; the
 # correlation read is secondary context.
 DOMINANT_WEIGHT = 0.60
+# "DIVERSIFIED" must mean diversified by *weight* too, not just by low
+# pairwise correlation. A 2-name book with 59% in one ticker (top_weight
+# below DOMINANT_WEIGHT, so not SINGLE_NAME_RISK) used to fall straight
+# through to DIVERSIFIED whenever mean ρ was low — directly contradicting
+# /api/risk reporting concentration_severity="HIGH" on the same book. If
+# one name is more than half the book it is concentrated by weight; only
+# books where no single name dominates earn the DIVERSIFIED label. 0.50
+# sits strictly below DOMINANT_WEIGHT (0.60) so the two bands never
+# overlap, and an equal-weight 2-name book (top_weight == 0.50, the most
+# diversified a 2-name book can be) is still DIVERSIFIED.
+DIVERSIFIED_MAX_TOP_WEIGHT = 0.50
 
 
 def _returns(closes: list[float]) -> list[float]:
@@ -185,6 +196,12 @@ def build_correlation(positions: list[dict],
         elif mean_corr >= HIGH_CORR:
             verdict = "CONCENTRATED"
         elif mean_corr >= MOD_CORR:
+            verdict = "MODERATE"
+        elif top_weight is not None and top_weight > DIVERSIFIED_MAX_TOP_WEIGHT:
+            # Low pairwise ρ alone is not "diversified" — a 59/41 book is
+            # concentrated by weight even when the two names are
+            # uncorrelated. One name being more than half the book ⇒
+            # MODERATE, consistent with /api/risk's concentration_severity.
             verdict = "MODERATE"
         else:
             verdict = "DIVERSIFIED"
