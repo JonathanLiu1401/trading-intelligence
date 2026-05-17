@@ -6,7 +6,7 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ## Repository layout (quick reference)
 
-- `paper_trader/runner.py` — live trader main loop
+- `paper_trader/runner.py` — live trader main loop. Auto-recovery circuit breaker scoped to its own child claude subprocesses (`pkill -P os.getpid()`, invariant #18). Hourly / daily-close markers are restart-durable via the atomic `data/runner_state.json` sidecar (invariant #6)
 - `paper_trader/strategy.py` — live Opus decision engine + watchlist (now injects the behavioural self-review mirror into the prompt)
 - `paper_trader/analytics/self_review.py` — canonical behavioural mirror; composes trade_asymmetry + capital_paralysis + open_attribution, fed into the live prompt **and** served at `/api/self-review`
 - `paper_trader/analytics/risk_mirror.py` — third advisory mirror (after self_review + track_record): composes `build_churn` + `build_correlation` **verbatim** (single source of truth #10) into a compact `prompt_block` on the trader's *structural* risk — how concentrated the book is and how much it churns (the 2026-05-17 live pathology: ~$973 / 16.7% win-rate, 60%+ one-sector, 0.52-day median hold). No price history is fetched on the hot decision path (a per-position yfinance call is a live-cycle latency/flake risk); without it `build_correlation` is `INSUFFICIENT` and its headline is the bare "verdict withheld" sentence, so the mirror surfaces the weight-based concentration (`top_weight_pct`/`weight_hhi`/`effective_positions_naive`, computed from `market_value` unconditionally) and only uses the richer ρ headline when a caller supplies `price_history`. Observational only, never gates (invariants #2/#12 — the self_review precedent); `_safe`-wrapped so a builder fault is "no block this cycle", never "no decision". Wired into `decide()` + `_build_payload(... risk_mirror_block=)` (rendered after the track-record section); applies on next paper-trader restart. Locked by `tests/test_risk_mirror.py`
@@ -94,7 +94,7 @@ review:
 | `test_core_market.py` | weekend / pre-open / after-close / holiday gating, price-cache TTL, option chain lookup, futures 30s bucket lru_cache, **`get_prices` bulk-download seam** (previously **zero** coverage of the actual `yf.download` branch — only empty/full-cache short-circuits were tested): the load-bearing `len(missing)==1` switch between yfinance's flat-columns single-ticker frame (`data["Close"]`) and the multi-ticker per-ticker MultiIndex (`data[t]["Close"]`) with **real `pandas` frames** (a `MagicMock` would pass even if the branches were swapped), all-NaN-Close → per-ticker `get_price` fallback, missing-ticker-column KeyError → per-ticker fallback, whole-`download`-raises → per-ticker fallback, unresolvable → key present/`None` value, partial-cache fetches only the uncached symbol, full-cache never calls `download`; **`get_options_chain` nearest-DTE seam** (zero prior coverage) — picks the expiry with minimum `abs(date−(today+target_dte))` **even when it is not first listed**, `.head(30)` caps each side, no-expiries → `None`, yfinance-raises → `None` |
 | `test_core_signals.py` | top-signal score threshold + sort order, backtest-row filter, urgent ai_score=NULL coercion, ticker regex word-boundary, **single-ticker `get_ticker_sentiment` seam** (a DISTINCT path from the covered bulk `ticker_sentiments` — its own compiled `(?:\$|\b)TKR\b` regex + avg/max/n/urgent aggregation, **zero** prior coverage): no-DB → zeroed dict (never raises), exact `avg_score`/`max_score`/`n`, `urgent` counts only `urgency≥1`, unmentioned ticker → zeroed dict, **"AMDOCS" must not match "AMD"** (the substring-leak regression the bulk path also locks via "MUSE"≠"MU"), `$AMD`-in-body matches, live-only clause excludes `backtest://`/`backtest_*` rows; **`get_ml_predictions` seam** (zero prior coverage; `ml.inference` faked via `sys.modules`, fully offline): import-fail → `[]`, explicit empty input short-circuits before scoring, `None` → `get_top_signals(30,h=6,min=0)` default (sentinel-identity asserted) → empty default → `[]`, `score_articles` raising → `[]`, the `zip(articles, scores)` body **truncates to the shorter** (2 articles + 1 score → 1 row), absent `tickers` key → `[]`, exact field mapping; **`get_historical_signals` gzip-fallback reader** (missing-file → `[]`; strict `< min_score` threshold incl. the `== min_score` KEPT boundary; `score`/`ai_score` `or`-fallback incl. `score:0` → ai_score; `limit` caps the moment `len(out) ≥ limit`; corrupt-JSON / non-numeric-score / blank lines skipped while reading **continues** — a `<`→`<=` or `continue`→`break` regression fails loudly); **freshness-aware `_db_path()` resolver (invariant #15)** — `TestChoosePure` (tie→LOCAL, fresher-local/fresher-usb wins, single-candidate, both-unreadable→LOCAL-first, neither→LOCAL — 6227cd5 LOCAL-first flip), `TestDbPathFreshness` (stale-USB loses to fresh-LOCAL **and** a newer `backtest://` row on USB is excluded from the freshness probe, both-fresh→USB, USB-only, LOCAL-only, candidate-keyed TTL cache), `TestAgeHours` (offset/`Z`/naive/garbage), `TestFeedStatusAndWarn` (split-brain restart signal, all-stale≠split-brain, one-shot WARN dedup), `TestCheckFreshnessCLI` (exit 3/2/0) |
 | `test_core_strategy.py` | JSON parse w/ fences + trailing prose, RSI/EMA/MACD math, SELL-exceeds-held blocking, BUY insufficient cash blocking, **ambiguous option close blocking**, **expired-option settlement** (`_option_expired` boundary incl. expiry-day-still-live; `_expired_intrinsic` ITM/OTM/no-underlying; `_portfolio_snapshot` marks expired contracts to intrinsic/0 not premium; live-option transient-None still → avg_cost; `SELL_CALL` on a dead contract settles at intrinsic; **`_portfolio_snapshot` total_value = cash + Σ position market_value across a mixed stock+option book**), **`_stdev_live` population-stdev seam** (`n < 2` → exact `0.0` the `if sd20 > 0` caller-guard relies on; `n=2` computes ÷n not ÷(n-1); constant series → `0.0` via the full variance path; textbook set → exact `2.0` locking `/n` against a `/(n-1)` regression that would silently shift every `bb_position`), **`_format_quant_signals` prompt-block seam** (empty dict → the `(no quant signals available)` sentinel; `_pct` vs `_v` field coercion — momentum/52w use `_pct` "{x}%"/"?", rsi/macd/etc use `_v` no-%; rows `sorted` by ticker so a `.items()` regression can't reorder the prompt non-deterministically) |
-| `test_core_runner.py` | `_maybe_daily_close` weekend/time gating + once-per-day flag + retry-on-failure, `_maybe_hourly` 3600s gating + retry-on-failure |
+| `test_core_runner.py` | `_maybe_daily_close` weekend/time gating + once-per-day flag + retry-on-failure, `_maybe_hourly` 3600s gating + retry-on-failure; **`TestKillStaleClaude`** circuit-breaker pkill is `-P os.getpid()`-scoped (host-wide-broadcast regression lock, invariant #18) **and** still model-anchors Opus+Sonnet; **`TestRunnerStatePersistence`** restart-durable markers (invariant #6) — sidecar IO contract + the no-double-close / no-starved-hourly exact-behaviour locks |
 | `test_core_runner_cycle.py` | **`_cycle()` report-dispatch fan-out** — previously **zero** direct coverage despite real branching: FILLED gates BOTH trade-alert AND decision-log; HOLD/NO_DECISION/BLOCKED/missing-`status` stay silent **and never query the store** (outer-guard short-circuit asserted via a recording `_FakeStore`); `auto_exits` is an orthogonal `_send` channel independent of the FILLED gate (dead-today-on-purpose per invariant #12 — locked so re-enabling is deliberate, kept per the "do not delete as unreachable" note); the `if trades and status==FILLED` guard (empty `recent_trades(1)` → no alert but decision-log still fires); every reporter fault swallowed (daemon-loop survival, via `monkeypatch` so `boom` can't leak into other modules' reporter import) |
 | `test_core_reporter.py` | openclaw missing → False, timeout/nonzero exit → False, trade alert + decision log + portfolio line formatting, **daily-close P/L baseline label tracks `_INITIAL_EQUITY` not a hardcoded `$1000`**, **`send_daily_close` `pnl_real` cash-flow sign (SELL\* credits / BUY\* debits) incl. the option ×100 multiplier via `store.record_trade`** (exact `$-400.00` on a mixed stock+option same-day ledger — a sign flip → `+400.00`, a dropped ×100 → `-449.50`), **`_behavioural_block` composes the scorecard state/headline/focus/concordance verbatim** (no re-derived verdict), suppresses NO_DATA, **returns `""` (never raises) when the builder faults — and `send_hourly_summary`/`send_daily_close` still send the summary regardless** (the "no block, never no summary" failure contract) |
 | `test_round_trips.py` | `build_round_trips` arithmetic: simple/partial/re-entry round-trips, option ×100, distinct (ticker,type,strike,expiry) keys, open-lot exclusion, orphan SELL, zero-cost `pnl_pct=None`, negative/unparseable `hold_days`, sub-cent rounding |
@@ -155,6 +155,30 @@ review:
    the next real trading day still gets its close report. Locked by
    `tests/test_core_runner.py::TestMaybeDailyClose` (incl.
    `test_does_not_fire_on_nyse_holiday`).
+
+   **Restart-durable (2026-05-17).** `_daily_close_sent_for` /
+   `_last_hourly` were module globals lost on every restart, and the
+   runner restarts often (a `/api/build-info` `stale` bounce, systemd,
+   the circuit breaker). That broke this invariant *across* a restart in
+   two trader-visible ways: a runner bouncing more often than hourly
+   **never** sent an hourly summary (every boot re-anchored the 1h
+   clock), and a post-16:05 NY restart **double-posted** the DAILY CLOSE.
+   Both markers now persist to an **atomic** `data/runner_state.json`
+   sidecar (tmp + `os.replace`, every IO swallowed) written on each
+   successful send; `main()` rehydrates them *after* the boot-anchor
+   default, so a fresh first-ever start is byte-for-byte unchanged while
+   a restart restores the real last-hourly instant (an overdue summary
+   fires this cycle; a recent one still waits) and the close-sent date
+   (no dup). Deliberately a sidecar, **not** a `store.py` table — SCHEMA
+   is load-bearing (#13) and this is single-writer best-effort that must
+   degrade to today's in-memory-only behaviour, never crash the loop.
+   Locked by `tests/test_core_runner.py::TestRunnerStatePersistence`
+   (11 tests: IO contract missing/corrupt/non-dict→{}, atomic
+   no-leftover-tmp, IO-error swallowed; rehydrate no-sidecar/both/
+   corrupt-skip; and the two exact-behaviour bug locks — restart-after-
+   close does not double-post, an overdue hourly fires post-restart, a
+   <1h one does not). The autouse fixture redirects `_STATE_PATH` to tmp
+   so no runner test writes the real sidecar (offline invariant).
 
 7. **`paper_trader.db` uses WAL** — any external reader must use
    `PRAGMA journal_mode=WAL` or open the file as `file:...?mode=ro` to avoid
@@ -385,6 +409,30 @@ review:
    backtest-row-excluded, `None`-when-missing, and the
    `== signals._db_path()` no-drift lock).
 
+18. **The auto-recovery circuit breaker is scoped to the runner's own
+   children.** `runner._kill_stale_claude()` (fired after
+   `CONSECUTIVE_NO_DECISION_LIMIT`=5 NO_DECISION cycles) used to run a
+   **host-wide** `pkill -f "claude --model claude-opus"` /
+   `claude-sonnet`. On this multi-agent box that ERE also matches the
+   hourly self-review agents (`scripts/hourly_review.sh` spawns 3×
+   `claude --model claude-opus-4-7`), sibling automated-review agents,
+   and any operator interactive `claude` session — so a wedged trader
+   recovering would SIGTERM **every** Claude process on the machine,
+   including the agents that keep the system healthy and one that may
+   have just deployed a fix. It is now scoped with
+   `pkill -P os.getpid()`: the decision subprocess is always a *direct*
+   child of the runner, so `-P` restricts the sweep to exactly what the
+   breaker is meant to reap. The model-anchored `claude --model <family>`
+   pattern (Opus first, Sonnet fallback — never a bare `claude --print`
+   that matches nothing) is **preserved unchanged**. This is a
+   collateral-damage fix, not a risk limit (invariants #2/#12 untouched).
+   Locked by `tests/test_core_runner.py::TestKillStaleClaude`
+   (`test_kill_is_scoped_to_own_child_processes` — RED on a regression
+   back to host-wide `["pkill","-f",pattern]`; the prior
+   `assert argv[:2]==["pkill","-f"]` literally codified the broadcast
+   bug, corrected not weakened, the invariant-#16 precedent;
+   pattern-anchoring Opus+Sonnet assertions kept verbatim).
+
 ### Dashboard API endpoints (port 8090)
 
 All endpoints serve `application/json`. CORS is wide open (`*`) so the
@@ -454,6 +502,8 @@ Digital Intern dashboard on `:8080` can cross-fetch.
 | Live cross-dashboard (`:8080` → `:8090`) shows blanks | CORS or paper-trader process down | `curl http://localhost:8090/api/portfolio` |
 | Strategy returns `HOLD` constantly even with strong signals | Opus is being conservative — by design, no threshold gating to override | Inspect the prompt context in `strategy.py::_build_payload`; if the watchlist has stale prices yfinance is rate-limited |
 | Equity / P/L looks too high and won't come down; an option position never closes | Pre-fix `_portfolio_snapshot` marked an expired contract at avg_cost forever (no live chain past expiry). Fixed — see invariant #13. If you see this on an old `:8090` process, check `/api/build-info` `stale` and restart | `strategy._option_expired` / `_expired_intrinsic`; `SELECT * FROM positions WHERE type IN ('call','put') AND closed_at IS NULL AND expiry < date('now')` |
+| `logs/runner.log` has no `[runner]`/`[strategy]` lines, only `"GET /api/… HTTP/1.1"` | **`logs/runner.log` captures only the Werkzeug HTTP access log, NOT the runner's own stdout** (live-finding 2026-05-17). Every "tail runner stdout / runner.log for `[strategy] claude err`" instruction above & in `CLAUDE.md` §11 is *blind* against that file — the NO_DECISION/timeout/circuit-breaker `print()`s go to the runner's real stdout (a terminal / launcher), not here. This is a launcher/logging-infra gap, not a code bug (deliberately not "fixed" in a surgical core pass — changing logging perturbs the live process) | Find the runner's true stdout: `tr '\0' ' ' </proc/$(pgrep -f 'paper_trader.runner\|paper-trader/runner.py' | head -1)/cmdline`; check the launcher's redirection / `journalctl`. Decision-level history is reliable via `/api/decision-forensics` + `recent_decisions` (DB), which *do* capture the failure taxonomy |
+| Decisions ~hourly (not every `OPEN_INTERVAL_S`=1800s) while open; new endpoints 404; self-review maybe not injected | The running `:8090`/runner is **stale** — booted ≥1 commit ago (`/api/build-info` `stale:true`, `behind:N`). It runs pre-fix resolvers/cadence and 404s endpoints added since boot (live-finding 2026-05-17: `behind:33`, `/api/runner-heartbeat` 404). A long NO_DECISION run also inflates effective cadence (Opus 180s + Sonnet 60s + retry 45s per failed cycle). The on-disk fixes do **not** apply until restart | `curl -s localhost:8090/api/build-info`; restart `paper_trader.runner` to apply HEAD (also applies the invariant #6/#18 fixes). NO_DECISION cause → `/api/decision-forensics` |
 
 For ML / backtest-side failures, see the ML section below and `CLAUDE.md` §11.
 
