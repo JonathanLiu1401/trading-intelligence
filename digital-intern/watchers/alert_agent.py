@@ -7,6 +7,11 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 from core.claude_cli import claude_call
+# Reuse the *well-tested* word-boundary source-credibility lookup (pins the
+# "ap matched inside snap" class of bug — tests/test_features.py) rather than
+# duplicating the 40-entry SOURCE_CRED map here, which would silently drift
+# (the recurring dashboard-parity / vendored-signals.py failure class).
+from ml.features import _source_credibility
 from watchers.alert_dedup import alerted_ids, dedupe_urgent
 
 try:
@@ -49,6 +54,56 @@ Output ONLY the alert message."""
 
 
 ALERT_BATCH_SIZE = 5
+
+# Minimum source credibility for a LONE (un-syndicated) article to fire a
+# standalone urgent Bloomberg "🚨 BREAKING" alert. Below this is the
+# social/forum tier the ML urgency head demonstrably over-scores:
+#   reddit 0.40 · nitter 0.40 · twitter 0.35 · stocktwits 0.30
+# (per ml.features.SOURCE_CRED). DEFAULT_SOURCE_CRED is 0.55, so an unknown /
+# brand-new source is NEVER gated — only the explicitly-known low tier is.
+# Everything legitimate clears it: rss 0.65, scraped 0.50, gdelt 0.58,
+# wikipedia 0.60, google/yahoo 0.62-0.65, reuters/bloomberg 0.90, sec 0.95.
+# Corroboration is the escape valve — a story syndicated across ≥2 sources
+# (dedup ``dup_count`` > 1) bypasses this entirely. See
+# ``_filter_low_authority_lone``. Observed live (24h): reddit/r/Daytrading and
+# reddit/r/ValueInvesting each fired a BREAKING alert solo — exactly the noise
+# this gate removes from the analyst's push channel.
+ALERT_MIN_LONE_SOURCE_CRED = 0.45
+
+
+def _filter_low_authority_lone(
+    deduped: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Partition a *post-dedup* urgent list into ``(kept, suppressed)``.
+
+    ``suppressed`` = a single, un-corroborated copy (``dup_count`` <= 1) from a
+    known low-credibility social/forum source
+    (``cred < ALERT_MIN_LONE_SOURCE_CRED``). Everything else is kept:
+
+      - anything syndicated across ≥2 sources (``dup_count`` > 1) — independent
+        corroboration is itself the signal the event is real;
+      - anything from a credible *or unknown* source (≥ the threshold).
+
+    Pure function — no DB / IO. Must run AFTER ``dedupe_urgent`` so
+    ``dup_count`` reflects cross-source corroboration; running it before would
+    suppress a genuinely breaking story that a low-cred feed merely happened to
+    surface first."""
+    kept: list[dict] = []
+    suppressed: list[dict] = []
+    for a in deduped:
+        try:
+            dup_count = int(a.get("dup_count") or 1)
+        except (TypeError, ValueError):
+            dup_count = 1
+        if dup_count > 1:
+            kept.append(a)
+            continue
+        cred = _source_credibility(a.get("source") or "")
+        if cred < ALERT_MIN_LONE_SOURCE_CRED:
+            suppressed.append(a)
+        else:
+            kept.append(a)
+    return kept, suppressed
 
 
 def _article_age_ok(art: dict) -> bool:
@@ -133,6 +188,41 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
     # five DISTINCT stories; each survivor knows the ids of the copies it
     # absorbed (``_dup_ids``) so all of them can still be marked alerted.
     deduped = dedupe_urgent(filtered)
+
+    # Source-authority gate (defense-in-depth, same shape as _is_synthetic /
+    # _article_age_ok — a formatter-side drop, NOT an ML-threshold change). A
+    # lone, un-corroborated social/forum post the urgency head over-scored must
+    # not fire a standalone Bloomberg "🚨 BREAKING" alert: that is the single
+    # biggest noise complaint from the analyst consuming this channel. A
+    # syndicated story (dup_count>1) or any credible/unknown source still
+    # fires. Suppressed rows are NOT lost — they stay in articles.db (training
+    # reads ai_score, untouched; score_source/ml_score untouched) and Opus can
+    # still surface them in the curated 5h briefing — only the noisy *push* is
+    # dropped. They are marked alerted UNCONDITIONALLY (separate call, before
+    # the Discord attempt, regardless of its outcome) so they exit the urgent
+    # queue instead of being re-fetched and re-evaluated every 20s cycle.
+    deduped, suppressed = _filter_low_authority_lone(deduped)
+    if suppressed:
+        try:
+            store.mark_alerted_batch(alerted_ids(suppressed))
+        except Exception:
+            _log.exception(
+                "[alert] failed to mark suppressed low-authority rows alerted"
+            )
+        srcs = ", ".join(
+            f"{(a.get('source') or '?')}:{(a.get('title') or '')[:40]}"
+            for a in suppressed[:5]
+        )
+        _log.info(
+            f"[alert] suppressed {len(suppressed)} lone low-authority urgent "
+            f"row(s) (cred<{ALERT_MIN_LONE_SOURCE_CRED}, no syndication) — "
+            f"{srcs}"
+        )
+    if not deduped:
+        _log.info(
+            "[alert] all urgent rows were lone low-authority noise — skipping"
+        )
+        return False
 
     # Only the first ALERT_BATCH_SIZE feed the prompt — and only those (plus the
     # duplicates they absorbed) get marked alerted. Marking the entire urgent
