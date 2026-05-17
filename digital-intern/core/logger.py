@@ -17,6 +17,7 @@ import os
 import sys
 import time
 import threading
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -70,7 +71,18 @@ class _JSONLHandler(logging.handlers.RotatingFileHandler):
             "msg": record.getMessage(),
         }
         if record.exc_info:
-            entry["exc"] = self.formatException(record.exc_info)
+            # NOTE: _JSONLHandler is a logging.Handler, NOT a Formatter —
+            # ``self.formatException`` does not exist here (it is a
+            # logging.Formatter method). Calling it raised AttributeError
+            # inside emit()->shouldRollover()->format() for EVERY record
+            # carrying exc_info (every log.exception(...) in the daemon),
+            # dropping the whole structured record before it was written and
+            # spamming a secondary "Logging error" traceback. Format the
+            # traceback ourselves — exactly what Formatter.formatException
+            # does internally — so the structured error stream is intact.
+            entry["exc"] = "".join(
+                traceback.format_exception(*record.exc_info)
+            ).rstrip()
         # copy any extra fields attached by the caller
         for k, v in record.__dict__.items():
             if k not in ("msg", "args", "levelname", "name", "pathname",
