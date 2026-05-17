@@ -5394,7 +5394,13 @@ def data_feed_api():
 
 
 @app.route("/api/backtests")
+@swr_cached("backtests-list", 30.0)
 def backtests_api():
+    # 30s stale-while-revalidate TTL: ~20 concurrent backtest *writer*
+    # threads otherwise starve this reader (the metadata-only list is cheap
+    # but the underlying sqlite is write-contended). SWR serves the last
+    # good payload instantly and single-flight-refreshes in the background,
+    # the established pattern in this module (see swr_cached docstring).
     from datetime import datetime, timezone
     try:
         from .backtest import BacktestStore
