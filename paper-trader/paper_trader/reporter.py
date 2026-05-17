@@ -275,6 +275,53 @@ def _session_block(store, window_hours: float, label: str) -> str:
         return ""
 
 
+def _realized_pl_today(trades_newest_first: list[dict], today: str
+                       ) -> tuple[float, int, int] | None:
+    """True realized P/L from round-trips that *closed* today (UTC).
+
+    The existing "Realized P/L (today, cash flow basis)" line is a net-cash
+    figure: a day where the desk only *deploys* cash (BUYs, no closes) reads
+    as a large negative even though nothing was actually realized. That number
+    is correct-by-disclosure (it says "cash flow basis") so it stays — this is
+    an *additive* second line that answers the question a trader actually
+    asks at the close: "what did I lock in today?"
+
+    Consumes the ``build_round_trips`` single source of truth (AGENTS.md
+    invariant #10) so the figure reconciles with ``/api/trade-asymmetry``,
+    ``/api/churn``, ``session_delta`` and the scorecard — never a second
+    hand-rolled P&L. ``build_round_trips`` reads the ledger in sequence and
+    pairs BUYs→SELLs, so a round-trip that *opened* days ago but *closes*
+    today is attributed to today correctly; a position merely opened today
+    (still held) does not count.
+
+    Args:
+        trades_newest_first: ``store.recent_trades(N)`` (newest-first); this
+            helper reverses it to the oldest→newest order build_round_trips
+            requires. Pass a deep window so an old-open/today-close trip pairs.
+        today: ``datetime.now(timezone.utc).date().isoformat()`` — the same
+            UTC date string ``send_daily_close`` already computes.
+
+    Returns ``(pnl_usd, n_closed, n_wins)``, or ``None`` when nothing closed
+    today or on any failure (additive contract: a fault drops this one line,
+    never the whole report — the ``_session_block`` / ``_behavioural_block``
+    precedent).
+    """
+    try:
+        from .analytics.round_trips import build_round_trips
+        rts = [
+            rt for rt in build_round_trips(list(reversed(trades_newest_first)))
+            if (rt.get("exit_ts") or "").startswith(today)
+        ]
+        if not rts:
+            return None
+        pnl = sum(float(rt.get("pnl_usd") or 0.0) for rt in rts)
+        wins = sum(1 for rt in rts if (rt.get("pnl_usd") or 0.0) > 0)
+        return pnl, len(rts), wins
+    except Exception as e:
+        print(f"[reporter] realized-pl-today skipped: {e}")
+        return None
+
+
 def _portfolio_lines(positions: list[dict]) -> list[str]:
     lines = []
     for p in positions:
@@ -348,6 +395,20 @@ def send_daily_close() -> bool:
         for t in todays_trades
     )
 
+    # True realized P/L from round-trips closed today (additive — the
+    # cash-flow line above stays). Deep window so an old-open/today-close
+    # trip pairs correctly inside build_round_trips.
+    rt = _realized_pl_today(store.recent_trades(5000), today)
+    if rt is not None:
+        rt_pnl, rt_n, rt_w = rt
+        realized_rt_line = (
+            f"Realized P/L (today, {rt_n} round-trip"
+            f"{'' if rt_n == 1 else 's'} closed, {rt_w}W"
+            f"/{rt_n - rt_w}L)  ${rt_pnl:+.2f}\n"
+        )
+    else:
+        realized_rt_line = ""
+
     sp_line = f"S&P 500: {sp:.2f}" if sp else "S&P 500: N/A"
 
     body = (
@@ -357,6 +418,7 @@ def send_daily_close() -> bool:
         f"Cash           ${pf['cash']:.2f}\n"
         f"Total P/L      ${pl:+.2f} ({pl_pct:+.2f}%)  vs ${_INITIAL_EQUITY:.0f} start\n"
         f"Realized P/L (today, cash flow basis)  ${pnl_real:+.2f}\n"
+        f"{realized_rt_line}"
         f"Trades today   {n_trades}\n"
         f"{sp_line}\n"
         f"```\n"
