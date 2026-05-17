@@ -89,11 +89,27 @@ def audit_label_contamination(
     window_end: date,
     staleness_days: int = 60,
 ) -> dict:
-    """Audit how many articles in a window had hindsight-contaminated labels.
+    """Audit how many articles in a window were collected with hindsight.
 
-    "Contaminated" means `first_seen - published > staleness_days`: the
-    article was collected long after publication, so any Claude-assigned
-    `ai_score` may reflect knowledge of what happened next.
+    "Contaminated" means ``first_seen - published > staleness_days``: the
+    article was collected long after publication. This is almost always an
+    *architectural* artefact, not a labeling defect — historical articles
+    (e.g. the 2002–2011 era used by long backtest windows) are all scraped
+    retroactively in 2026, so they trivially score ~100% on this metric.
+    Those rows are scored by ``kw_score`` / ML, **not** Claude.
+
+    Real hindsight risk only exists when an article was *both* collected
+    late *and* labeled by Claude (``score_source = 'llm'``) — only then can
+    the assigned ``ai_score`` reflect knowledge of what happened next. That
+    subset is counted separately as ``llm_contaminated_count``.
+
+    Verdict:
+      * ``HIGH_CONTAMINATION`` — ``llm_contaminated_count / total > 0.1``:
+        a material share of *Claude-labeled* articles carry hindsight.
+      * ``RETROACTIVE_COLLECTION`` — retroactive-collection lag exists but
+        no (or negligible) Claude labels: architectural, not a labeling
+        issue, and not a backtest-validity threat.
+      * ``LOW`` — no meaningful collection lag in the window.
 
     Returns a dict with overall stats and a per-source breakdown so callers
     can identify which collectors are responsible for most of the leakage.
@@ -102,14 +118,23 @@ def audit_label_contamination(
     if not p.exists():
         return {"error": f"DB not found: {articles_db_path}",
                 "total_articles": 0, "contaminated_count": 0,
+                "llm_contaminated_count": 0,
                 "contamination_rate": 0.0, "verdict": "UNKNOWN", "sources": {}}
 
     conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=10.0)
     try:
+        # `score_source` distinguishes Claude/LLM labels from kw/ML scores.
+        # It only exists on current digital-intern DBs — older DBs (and the
+        # test fixture) may lack it, so probe before selecting it.
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(articles)").fetchall()}
+        has_score_source = "score_source" in cols
+        score_source_sel = "score_source" if has_score_source else "NULL"
         # Fetch *all* candidates and filter dates in Python — see
         # `_parse_published_date` for why a SQL BETWEEN cannot be trusted.
         rows = conn.execute(
-            "SELECT url, published, first_seen, ai_score, kw_score, source "
+            f"SELECT url, published, first_seen, ai_score, kw_score, source, "
+            f"{score_source_sel} "
             "FROM articles "
             "WHERE published IS NOT NULL AND first_seen IS NOT NULL "
             "AND (url IS NULL OR url NOT LIKE 'backtest://%') "
@@ -124,9 +149,10 @@ def audit_label_contamination(
 
     total = 0
     contaminated = 0
+    llm_contaminated = 0
     source_stats: dict[str, dict] = {}
 
-    for url, published, first_seen, ai_score, kw_score, source in rows:
+    for url, published, first_seen, ai_score, kw_score, source, score_src in rows:
         pub_d = _parse_published_date(published)
         if pub_d is None:
             continue
@@ -138,29 +164,42 @@ def audit_label_contamination(
         if seen_d is not None:
             days_lag = (seen_d - pub_d).days
             is_hindsight = days_lag > staleness_days
+        is_llm = (score_src or "").strip().lower() == "llm"
         if is_hindsight:
             contaminated += 1
+            if is_llm:
+                llm_contaminated += 1
         src_key = (source or "unknown").split("/")[0]
         s = source_stats.setdefault(
-            src_key, {"total": 0, "contaminated": 0, "has_ai_score": 0}
+            src_key,
+            {"total": 0, "contaminated": 0, "llm_contaminated": 0,
+             "has_ai_score": 0},
         )
         s["total"] += 1
         if is_hindsight:
             s["contaminated"] += 1
+            if is_llm:
+                s["llm_contaminated"] += 1
         if ai_score is not None and float(ai_score) > 0:
             s["has_ai_score"] += 1
 
     rate = contaminated / total if total else 0.0
-    verdict = (
-        "HIGH_CONTAMINATION" if rate > 0.5
-        else "MODERATE" if rate > 0.2
-        else "LOW"
-    )
+    llm_rate = llm_contaminated / total if total else 0.0
+    # Real Claude-hindsight risk is the only thing that should raise an
+    # alarm. Pure first_seen lag with no LLM labels is architectural.
+    if llm_rate > 0.1:
+        verdict = "HIGH_CONTAMINATION"
+    elif contaminated > 0:
+        verdict = "RETROACTIVE_COLLECTION"
+    else:
+        verdict = "LOW"
 
     return {
         "total_articles": total,
         "contaminated_count": contaminated,
+        "llm_contaminated_count": llm_contaminated,
         "contamination_rate": rate,
+        "llm_contamination_rate": llm_rate,
         "clean_rate": 1.0 - rate,
         "sources": source_stats,
         "verdict": verdict,
@@ -231,6 +270,7 @@ def run_permutation_test(
 
     permuted_returns: list[float] = []
     original_return: float | None = None
+    n_attempted = 0
 
     try:
         # 1. Real run with original news
@@ -241,6 +281,7 @@ def run_permutation_test(
         for i in range(n_permutations):
             engine._local_news = _shuffle_news_dates(original_news, rng)
             run_id = _PERM_RUN_ID_BASE - 1 - i
+            n_attempted += 1
             try:
                 run = engine.run_one(run_id, seed=seed)
                 permuted_returns.append(float(run.total_return_pct))
@@ -255,13 +296,24 @@ def run_permutation_test(
             "error": "all permutations failed",
             "original_return": original_return,
             "n_permutations": 0,
+            "n_attempted": n_attempted,
+            "n_successful": 0,
             "verdict": "UNKNOWN",
         }
 
     arr = np.array(permuted_returns, dtype=np.float64)
     mean = float(arr.mean())
     std = float(arr.std())
-    p_value = float(np.mean(arr >= original_return))
+    # Standard permutation-test p-value with the (+1) correction
+    # (North et al. 2002): p = (#{perm >= observed} + 1) / (N + 1).
+    # Without the +1 a strategy that "beats every shuffle" reports an
+    # impossible p=0.000 — with N=5 the true minimum achievable p is
+    # 1/6 ≈ 0.167, so an unsmoothed 0.0 is meaningless. The +1 also
+    # accounts for the observed statistic itself being one valid
+    # arrangement under the null.
+    n_succ = len(permuted_returns)
+    k = int(np.sum(arr >= original_return))
+    p_value = (k + 1) / (n_succ + 1)
     z_score = float((original_return - mean) / (std + 1e-9))
 
     if original_return < mean:
@@ -271,6 +323,13 @@ def run_permutation_test(
     else:
         verdict = "INCONCLUSIVE"
 
+    # Small-sample guard: a "SIGNIFICANT" verdict from <20 successful
+    # permutations cannot have a smoothed p < 0.05 (min p = 1/21 ≈ 0.048
+    # only at N=20), so flag anything thinner as UNDERPOWERED rather than
+    # letting the dashboard render a confident green pill off ~5 shuffles.
+    if verdict == "SIGNIFICANT" and n_succ < 20:
+        verdict = "UNDERPOWERED — too few valid permutations"
+
     return {
         "original_return": original_return,
         "permuted_mean": mean,
@@ -279,7 +338,9 @@ def run_permutation_test(
         "permuted_max": float(arr.max()),
         "p_value": p_value,
         "z_score": z_score,
-        "n_permutations": len(permuted_returns),
+        "n_permutations": n_succ,
+        "n_attempted": n_attempted,
+        "n_successful": n_succ,
         "verdict": verdict,
     }
 
