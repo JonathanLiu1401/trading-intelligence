@@ -7,6 +7,7 @@ reporter so each test deterministically reaches a single decision branch.
 """
 from __future__ import annotations
 
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -195,3 +196,81 @@ class TestMaybeHourly:
         # Must not raise; the runner is a daemon loop.
         runner._maybe_hourly()
         assert runner._last_hourly is None
+
+
+class TestKillStaleClaude:
+    """The auto-recovery circuit breaker reaps wedged `claude` subprocesses.
+
+    `strategy._claude_call` always invokes the CLI as
+    ``claude --model <model> --print …`` — the `--model <model>` argument
+    sits *between* `claude` and `--print`. So a `pkill -f` pattern of bare
+    ``claude --print`` is never a contiguous substring of the real command
+    line and silently matches nothing. The breaker must therefore anchor on
+    ``claude --model <family>`` for *both* the live Opus model and the
+    Sonnet fallback — otherwise a wedged Sonnet-fallback child survives the
+    breaker and keeps starving the decision loop in exactly the
+    Opus-timeout → Sonnet-fallback path the breaker exists to recover.
+    """
+
+    @staticmethod
+    def _real_cmdline(model: str) -> str:
+        # Mirrors the argv strategy._claude_call builds, joined the way
+        # `pkill -f` matches (against the space-joined command line).
+        return " ".join(
+            ["claude", "--model", model, "--print",
+             "--permission-mode", "bypassPermissions"]
+        )
+
+    def _captured_patterns(self, monkeypatch) -> list[str]:
+        seen: list[str] = []
+
+        def _fake_run(argv, *a, **k):
+            # argv == ["pkill", "-f", <pattern>]
+            assert argv[:2] == ["pkill", "-f"]
+            seen.append(argv[2])
+
+            class _R:
+                returncode = 1  # "nothing matched" — harmless
+
+            return _R()
+
+        monkeypatch.setattr(runner.subprocess, "run", _fake_run)
+        runner._kill_stale_claude()
+        return seen
+
+    def test_patterns_match_both_opus_and_sonnet_cmdlines(self, monkeypatch):
+        from paper_trader import strategy
+
+        patterns = self._captured_patterns(monkeypatch)
+        assert patterns, "circuit breaker issued no pkill patterns"
+
+        for model in (strategy.MODEL, strategy.FALLBACK_MODEL):
+            cmdline = self._real_cmdline(model)
+            # `pkill -f` treats the pattern as an ERE matched against the
+            # full command line; our literal patterns contain no regex
+            # metacharacters, so re.search faithfully models it.
+            assert any(re.search(p, cmdline) for p in patterns), (
+                f"no breaker pattern matches the real command line for "
+                f"{model!r}: {cmdline!r} (patterns={patterns})"
+            )
+
+    def test_regression_bare_claude_print_would_miss_sonnet(self, monkeypatch):
+        # Locks the actual bug: the OLD second pattern `claude --print`
+        # never matches the Sonnet-fallback command line, so a regression
+        # back to it leaves the fallback zombie un-reaped.
+        from paper_trader import strategy
+
+        sonnet_cmdline = self._real_cmdline(strategy.FALLBACK_MODEL)
+        assert re.search("claude --print", sonnet_cmdline) is None
+        # The shipped breaker MUST match it.
+        patterns = self._captured_patterns(monkeypatch)
+        assert any(re.search(p, sonnet_cmdline) for p in patterns)
+
+    def test_breaker_swallows_pkill_failure(self, monkeypatch):
+        # The breaker runs inside the daemon loop — a pkill OSError must
+        # never propagate and kill the runner.
+        def _boom(argv, *a, **k):
+            raise OSError("pkill not found")
+
+        monkeypatch.setattr(runner.subprocess, "run", _boom)
+        runner._kill_stale_claude()  # must not raise
