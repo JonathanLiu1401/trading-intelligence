@@ -271,8 +271,16 @@ class DecisionScorer:
             if not self._predict_err_logged:
                 print(f"[decision_scorer] predict error (silenced after first): {e}")
                 self._predict_err_logged = True
-            return {"pred": 0.0, "raw": 0.0, "clamped": False,
-                    "off_distribution": False}
+            # A prediction that could not be computed at all (shape/dtype
+            # mismatch from a build_features change without a retrain — the
+            # exact case the log above guards) is the maximally-untrustworthy
+            # result. Flag it low-trust like the non-finite branch does, so
+            # honesty panels (/api/scorer-predictions, the conviction board)
+            # never render a broken scorer's safe-fallback 0.0 as a confident
+            # in-distribution call. predict()'s scalar contract is unchanged
+            # (still 0.0); only the meta trust flags move.
+            return {"pred": 0.0, "raw": 0.0, "clamped": True,
+                    "off_distribution": True}
 
         # A non-finite model output (inf/nan from a pathological feature
         # vector) is unusable — treat it as a 0% / off-distribution result
