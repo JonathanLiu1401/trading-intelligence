@@ -23,12 +23,39 @@ except Exception:
     _log = logging.getLogger("article_store")
 
 
-# ── DB lock retry helper ────────────────────────────────────────────────────
-# Even with PRAGMA busy_timeout=60000, sustained writer contention from many
-# threads occasionally surfaces ``OperationalError("database is locked")``
-# (e.g., during long PRAGMA wal_checkpoint(TRUNCATE) calls). Retry with
-# exponential backoff + jitter to avoid thundering-herd retries that would
-# just collide again at the same instant. Bubble up after the budget is spent.
+# ── DB lock / cursor-collision retry helper ─────────────────────────────────
+# Two distinct transient DB errors are retried here; both are recoverable and
+# every method this decorates is idempotent (``UPDATE … WHERE id=?``,
+# ``INSERT OR IGNORE``, ``DELETE … WHERE``), so a clean re-run is safe:
+#
+#  1. ``OperationalError("database is locked")`` — even with
+#     PRAGMA busy_timeout=60000, sustained writer contention from many threads
+#     (e.g. during a long PRAGMA wal_checkpoint(TRUNCATE)) still surfaces it.
+#  2. ``DatabaseError("another row available"/"another row pending")`` — the
+#     shared ``self.conn`` is opened ``check_same_thread=False`` and used by
+#     ~30 daemon threads. ``_write_lock`` serialises *writers*, but the many
+#     LOCKLESS readers (get_unscored, get_top_for_briefing, trainer's
+#     ``store.conn.execute``, the dashboard) iterate a cursor on the SAME
+#     connection; a reader still mid-fetch corrupts the connection's statement
+#     state when a writer's ``executemany`` runs, raising this. It was
+#     observed 48x in one production ``daemon.log`` window — each one dropped a
+#     whole collected/Sonnet-labeled batch (urgent items then never got
+#     urgency=1 → missed alerts; articles re-queued to the LLM forever). The
+#     colliding reader's ``.fetchall()`` completes well within the first
+#     backoff tick, so the retried op succeeds. (A future full fix is per-call
+#     write-connection isolation, mirroring dashboard ``_ro_query``; this is
+#     the surgical, idempotent-safe stopgap.)
+#
+# Retry with exponential backoff + jitter to avoid thundering-herd retries
+# that would just collide again at the same instant. Bubble up after the
+# budget is spent. The substring filter keeps this tight — other
+# ``DatabaseError`` flavors (e.g. ``IntegrityError`` "UNIQUE constraint
+# failed") must still propagate, never be silently swallowed.
+_RETRYABLE_DB_ERRORS = (
+    "database is locked",
+    "another row available",
+    "another row pending",
+)
 _LOCK_RETRY_ATTEMPTS = 5
 _LOCK_RETRY_BASE_S = 0.25
 _LOCK_RETRY_CAP_S = 4.0
@@ -50,15 +77,21 @@ def lock_metrics() -> dict:
 
 
 def _retry_on_lock(func):
-    """Decorator: retry on 'database is locked' with exp backoff + jitter."""
+    """Decorator: retry transient DB errors (``database is locked`` /
+    shared-connection ``another row available``) with exp backoff + jitter.
+    Non-retryable ``DatabaseError`` flavors (IntegrityError, etc.) propagate.
+    See ``_RETRYABLE_DB_ERRORS`` for the full rationale."""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         last = None
         for attempt in range(_LOCK_RETRY_ATTEMPTS):
             try:
                 return func(*args, **kwargs)
-            except sqlite3.OperationalError as e:
-                if "database is locked" not in str(e).lower():
+            except sqlite3.DatabaseError as e:
+                # DatabaseError is the base of OperationalError AND
+                # IntegrityError; discriminate on the message so only the
+                # known-transient classes retry and everything else raises.
+                if not any(s in str(e).lower() for s in _RETRYABLE_DB_ERRORS):
                     raise
                 last = e
                 if attempt + 1 < _LOCK_RETRY_ATTEMPTS:
@@ -70,7 +103,8 @@ def _retry_on_lock(func):
                     delay = min(_LOCK_RETRY_BASE_S * (2 ** attempt), _LOCK_RETRY_CAP_S)
                     delay *= 0.5 + random.random()
                     _log.warning(
-                        f"[article_store] {func.__name__}: 'database is locked' "
+                        f"[article_store] {func.__name__}: transient DB error "
+                        f"{str(e)[:60]!r} "
                         f"(attempt {attempt + 1}/{_LOCK_RETRY_ATTEMPTS}); "
                         f"retrying in {delay:.2f}s"
                     )
