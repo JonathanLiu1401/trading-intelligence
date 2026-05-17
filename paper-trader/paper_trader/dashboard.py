@@ -128,6 +128,165 @@ def _cors(resp):
     return resp
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Stale-while-revalidate response cache for the slow yfinance/cross-DB
+# endpoints (resolves AGENTS.md invariant #7's "remaining genuine concern").
+#
+# `dashboard.run(threaded=True)` (d5b8eac) removed *cross-request* head-of-line
+# blocking, but several handlers still do unbounded yfinance / cross-DB I/O and
+# each take many seconds *in isolation*: live user-perspective testing on
+# 2026-05-17 measured /api/suggestions 5.2s, /api/data-feed 16s, /api/briefing
+# & /api/feed-health >35s, and /api/thesis-drift outright hung (curl -m15 →
+# 000). The panels are effectively dead in production and the /api/chat fan-out
+# + the :8080→:8090 cross-fetch pay the full latency every poll.
+#
+# This mirrors unified_dashboard.py's /api/command-center SWR exactly: serve
+# the last good payload instantly and, once it ages past the per-endpoint TTL,
+# kick a single-flight background rebuild. It additionally *bounds the cold
+# path* — command-center's cold build is ~6s so it builds inline; these can
+# hang 35s+, so the first caller waits at most _SWR_COLD_BUDGET_S and then gets
+# a fast valid-shaped {"warming": true} 200 while the build finishes for the
+# next (auto-refresh) poll. Mirrors command-center's `cached`/`cache_age_s`
+# honesty keys so a stale serve is never silent.
+#
+# Inert under pytest (PYTEST_CURRENT_TEST): a module-global response cache
+# would leak one test's fixture DB into the next test's exact-value assertion
+# (test_thesis_drift / test_correlation / test_feed_health_endpoint / …), so
+# existing endpoint tests run the handler directly exactly as before. The SWR
+# machinery itself is covered by dedicated tests that opt in via
+# `_SWR_TEST_FORCE`.
+# ──────────────────────────────────────────────────────────────────────────
+import os as _os
+import threading as _threading
+import time as _time
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+from functools import wraps as _wraps
+
+_SWR_LOCK = _threading.Lock()
+_SWR_STATE: dict = {}
+_SWR_EXEC = _ThreadPoolExecutor(max_workers=6, thread_name_prefix="dash-swr")
+_SWR_COLD_BUDGET_S = 6.0
+_SWR_TEST_FORCE = False  # dedicated SWR tests flip this; never set in prod
+
+
+def _swr_active() -> bool:
+    """SWR is inert under pytest unless a dedicated test opts in — see the
+    block comment (cross-test cache-leak isolation)."""
+    if _SWR_TEST_FORCE:
+        return True
+    return not _os.environ.get("PYTEST_CURRENT_TEST")
+
+
+def _swr_entry(key: str) -> dict:
+    st = _SWR_STATE.get(key)
+    if st is None:
+        st = {"data": None, "status": 200,
+              "ct": "application/json", "ts": 0.0, "fut": None}
+        _SWR_STATE[key] = st
+    return st
+
+
+def _swr_serialize(rv):
+    """Normalize a handler return value to (bytes, status, content_type,
+    cacheable). Every completed build is *returned* (so a cold caller gets the
+    handler's real result — including a 4xx/5xx degrade), but only a 200 JSON
+    body is *cacheable* — an error must not be pinned for the whole TTL."""
+    resp = app.make_response(rv)
+    ct = resp.headers.get("Content-Type", "") or ""
+    cacheable = resp.status_code == 200 and "application/json" in ct
+    return resp.get_data(), resp.status_code, ct, cacheable
+
+
+def _swr_make(data, status: int, ct: str, age, cached: bool):
+    """Build a Response from cached/just-built bytes, injecting the
+    command-center honesty keys into a 200 JSON object body (an error body or
+    a list/scalar body is served verbatim)."""
+    body = data
+    if status == 200:
+        try:
+            obj = json.loads(body)
+            if isinstance(obj, dict):
+                obj["cached"] = cached
+                obj["cache_age_s"] = round(age, 1) if age is not None else None
+                body = json.dumps(obj)
+        except Exception:
+            pass
+    return app.response_class(body, status=status, content_type=ct)
+
+
+def _swr_refresh(key: str, fn, args, kwargs, qs: str):
+    """Single-flight background rebuild. Runs the wrapped handler inside a
+    synthesized request context so request.args still resolves for the
+    parametrized endpoints (news-edge / source-edge / sector-heatmap)."""
+    st = _swr_entry(key)
+    with _SWR_LOCK:
+        fut = st["fut"]
+        if fut is not None and not fut.done():
+            return fut
+
+        def _run():
+            try:
+                with app.test_request_context(query_string=qs):
+                    rv = fn(*args, **kwargs)
+                    snap = _swr_serialize(rv)
+            except Exception:
+                return None
+            data, status, ct, cacheable = snap
+            if cacheable:
+                with _SWR_LOCK:
+                    st["data"], st["status"], st["ct"] = data, status, ct
+                    st["ts"] = _time.time()
+            return snap
+
+        fut = _SWR_EXEC.submit(_run)
+        st["fut"] = fut
+        return fut
+
+
+def swr_cached(name: str, ttl: float):
+    """Decorate a slow read-only JSON endpoint with stale-while-revalidate +
+    a bounded cold path. Apply *below* @app.route."""
+    def deco(fn):
+        @_wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not _swr_active():
+                return fn(*args, **kwargs)
+            # str, not bytes: werkzeug's test_request_context(query_string=…)
+            # raises TypeError on bytes (the synthesized-context replay path).
+            qs = (request.query_string or b"").decode("latin-1")
+            key = name + "?" + qs
+            st = _swr_entry(key)
+            now = _time.time()
+            with _SWR_LOCK:
+                have = st["data"] is not None
+                age = (now - st["ts"]) if have else None
+                snap = (st["data"], st["status"], st["ct"]) if have else None
+            if have and age is not None and age < ttl:
+                return _swr_make(*snap, age, True)
+            fut = _swr_refresh(key, fn, args, kwargs, qs)
+            if have:  # stale → serve the last good copy immediately
+                return _swr_make(*snap, age, True)
+            try:  # cold start → wait a bounded time for the build itself
+                res = fut.result(timeout=_SWR_COLD_BUDGET_S)
+            except Exception:
+                res = None
+            if res is not None:  # build finished in budget — serve it directly
+                data, status, ct, _cacheable = res
+                return _swr_make(data, status, ct, 0.0, False)
+            # build still running (or raised): serve stale if it appeared,
+            # else a fast valid-shaped placeholder the panels self-heal from.
+            with _SWR_LOCK:
+                have = st["data"] is not None
+                age = (_time.time() - st["ts"]) if have else None
+                snap = (st["data"], st["status"], st["ct"]) if have else None
+            if have:
+                return _swr_make(*snap, age, False)
+            return jsonify({"warming": True, "cached": False,
+                            "error": "computing — retry shortly"})
+        return wrapper
+    return deco
+
+
 TEMPLATE = r"""
 <!doctype html>
 <html lang="en">
@@ -1161,6 +1320,21 @@ TEMPLATE = r"""
         <div class="stat"><div class="l">split-brain DB</div><div class="v" id="fh-split">—</div></div>
       </div>
       <div class="muted" id="fh-path" style="font-size:12px;word-break:break-all;">—</div>
+    </div>
+
+    <!-- ─── Runner heartbeat — is the trading loop itself alive? (new 2026-05-17) ─── -->
+    <div class="card" id="rhb-card" style="margin-bottom:18px;">
+      <h2 style="display:flex;justify-content:space-between;align-items:center;">
+        <span>Runner heartbeat <span class="muted" style="font-size:11px;text-transform:none;letter-spacing:normal;font-weight:normal;">— is the decision loop still cycling, or has it wedged/died?</span></span>
+        <span id="rhb-state" style="font-size:12px;padding:3px 10px;border-radius:4px;background:#1f2126;color:#8b929d;">—</span>
+      </h2>
+      <div class="muted" id="rhb-headline" style="font-size:12px;margin-bottom:12px;">loading…</div>
+      <div class="stat-row" style="margin-bottom:4px;">
+        <div class="stat"><div class="l">since last decision</div><div class="v" id="rhb-age">—</div></div>
+        <div class="stat"><div class="l">intervals elapsed</div><div class="v" id="rhb-intervals">—</div></div>
+        <div class="stat"><div class="l">expected cadence</div><div class="v" id="rhb-cadence">—</div></div>
+        <div class="stat"><div class="l">market</div><div class="v" id="rhb-market">—</div></div>
+      </div>
     </div>
 
     <!-- ─── Decision reliability — true current-regime parse-fail rate (new 2026-05-16, agent 4) ─── -->
@@ -4567,6 +4741,41 @@ async function refreshFeedHealth() {
       : "no resolved article DB";
 }
 
+async function refreshRunnerHeartbeat() {
+  const r = await fetchMaybeStale("/api/runner-heartbeat");
+  if (r.__unavailable) { markStale("rhb-state", "rhb-headline", "Runner-heartbeat endpoint"); return; }
+  if (r.error) { document.getElementById("rhb-headline").textContent = "error: " + r.error; return; }
+  const smap = {
+    STALLED: ["#b71c1c", "#ffffff"],
+    LAGGING: ["#b8860b", "#000000"],
+    HEALTHY: ["#1b5e20", "#a5d6a7"],
+    NO_DATA: ["#1f2126", "#8b929d"],
+  };
+  const [bg, fg] = smap[r.verdict] || smap.NO_DATA;
+  const sEl = document.getElementById("rhb-state");
+  sEl.textContent = (r.verdict || "—").replace(/_/g, " ");
+  sEl.style.background = bg; sEl.style.color = fg;
+  document.getElementById("rhb-headline").textContent =
+    (r.restart_recommended ? "⚠ RESTART RECOMMENDED — " : "") + (r.headline || "");
+  const ag = document.getElementById("rhb-age");
+  const secs = r.secs_since_last_decision;
+  ag.textContent = secs == null ? "never"
+    : secs < 90 ? Math.round(secs) + "s"
+    : secs < 5400 ? Math.round(secs / 60) + "m"
+    : fmt(secs / 3600, 1) + "h";
+  ag.style.color = r.verdict === "STALLED" ? "#ff4455"
+                 : r.verdict === "LAGGING" ? "#ffa726"
+                 : r.verdict === "HEALTHY" ? "#4caf50" : "#8b929d";
+  const iv = document.getElementById("rhb-intervals");
+  iv.textContent = r.intervals_elapsed != null ? fmt(r.intervals_elapsed, 2) + "×" : "—";
+  iv.style.color = (r.intervals_elapsed || 0) >= (r.stalled_mult || 2)  ? "#ff4455"
+                 : (r.intervals_elapsed || 0) >= (r.lagging_mult || 1.25) ? "#ffa726"
+                 : "#8b929d";
+  document.getElementById("rhb-cadence").textContent =
+    r.expected_interval_s != null ? Math.round(r.expected_interval_s / 60) + "m" : "—";
+  document.getElementById("rhb-market").textContent = r.market_open ? "open" : "closed";
+}
+
 async function refreshDecisionReliability() {
   const r = await fetchMaybeStale("/api/decision-reliability");
   if (r.__unavailable) { markStale("dr-state", "dr-headline", "Decision-reliability endpoint"); return; }
@@ -4818,6 +5027,7 @@ refreshTradeAsymmetry();
 refreshCapitalParalysis();
 refreshOpenAttribution();
 refreshFeedHealth();
+refreshRunnerHeartbeat();
 refreshDecisionReliability();
 refreshFundedSuggestions();
 refreshSignalFollowThrough();
@@ -4858,6 +5068,7 @@ setInterval(refreshTradeAsymmetry, 60_000);
 setInterval(refreshCapitalParalysis, 45_000);
 setInterval(refreshOpenAttribution, 60_000);
 setInterval(refreshFeedHealth, 60_000);
+setInterval(refreshRunnerHeartbeat, 60_000);
 setInterval(refreshDecisionReliability, 60_000);
 setInterval(refreshFundedSuggestions, 45_000);
 setInterval(refreshSignalFollowThrough, 300_000);
@@ -4973,6 +5184,7 @@ def portfolio_api():
 
 
 @app.route("/api/data-feed")
+@swr_cached("data-feed", 30.0)
 def data_feed_api():
     """Live news collector pulse — proxies digital-intern's articles.db.
 
@@ -5856,6 +6068,7 @@ def _next_market_open() -> tuple[datetime | None, int | None]:
 
 
 @app.route("/api/briefing")
+@swr_cached("briefing", 90.0)
 def briefing_api():
     """Pre-market / live briefing card. Combines market-open status, futures,
     top urgent overnight news, and a one-line summary string. Designed to be the
@@ -6003,6 +6216,7 @@ def _classify_action(ticker: str, held_qty: float, quant: dict, news_score: floa
 
 
 @app.route("/api/suggestions")
+@swr_cached("suggestions", 45.0)
 def suggestions_api():
     """Trade-idea co-pilot. Ranked list of BUY / ADD / TRIM / EXIT / WATCH cards.
 
@@ -6179,6 +6393,7 @@ def _scorer_verdict(pred: float) -> str:
 
 
 @app.route("/api/scorer-predictions")
+@swr_cached("scorer-predictions", 60.0)
 def scorer_predictions_api():
     """DecisionScorer prediction per currently-held stock position.
 
@@ -6283,6 +6498,7 @@ def scorer_predictions_api():
 
 
 @app.route("/api/sector-heatmap")
+@swr_cached("sector-heatmap", 90.0)
 def sector_heatmap_api():
     """DRAM / semis sector heatmap. Buckets: memory_core, semis_equipment, foundry,
     design, memory_leveraged, optical, etf. Each ticker carries mom_5d, mom_20d,
@@ -6978,6 +7194,7 @@ def winner_autopsy_api():
 
 
 @app.route("/api/correlation")
+@swr_cached("correlation", 90.0)
 def correlation_api():
     """Concentration honesty — do the held names actually move together?
     /api/risk reports name-level concentration + a single SPY-shock; it
@@ -7017,6 +7234,33 @@ def correlation_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/runner-heartbeat")
+def runner_heartbeat_api():
+    """Is the trading loop itself alive? — the upstream liveness question.
+
+    decision-drought/-reliability/feed-health all reason over rows that
+    *exist* in `decisions`; build-info catches a stale code SHA. None close
+    a verdict on `now - max(decisions.timestamp)` vs the runner's expected
+    cadence, so a dead/wedged `paper_trader.runner` is invisible (the
+    ongoing-drought duration just freezes). This compares the newest
+    decision's age to OPEN_INTERVAL_S (market open) / CLOSED_INTERVAL_S
+    (closed) and verdicts NO_DATA / STALLED / LAGGING / HEALTHY. Network is
+    in the endpoint (the thesis_drift split); the builder is pure & never
+    raises. Advisory only — never gates Opus, adds no caps (AGENTS.md
+    #2/#12)."""
+    try:
+        from .analytics.runner_heartbeat import build_runner_heartbeat
+        from . import market as _mkt
+        store = get_store()
+        decs = store.recent_decisions(1)
+        last_ts = decs[0].get("timestamp") if decs else None
+        now_utc = datetime.now(timezone.utc)
+        return jsonify(build_runner_heartbeat(
+            last_ts, _mkt.is_market_open(now_utc), now=now_utc))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/churn")
 def churn_api():
     """Overtrading & same-name re-entry churn — the turnover question.
@@ -7043,6 +7287,7 @@ def churn_api():
 
 
 @app.route("/api/thesis-drift")
+@swr_cached("thesis-drift", 60.0)
 def thesis_drift_api():
     """Entry-thesis vs current-reality, per open position.
 
@@ -7173,6 +7418,7 @@ def _daily_history_cached(ticker: str, period: str = "3mo") -> list[tuple[str, f
 
 
 @app.route("/api/news-edge")
+@swr_cached("news-edge", 120.0)
 def news_edge_api():
     """Does digital-intern's scored news actually predict moves?
 
@@ -7382,6 +7628,7 @@ def signal_followthrough_api():
 
 
 @app.route("/api/source-edge")
+@swr_cached("source-edge", 120.0)
 def source_edge_api():
     """Which of digital-intern's ~17 collectors is worth trusting?
 
@@ -7490,6 +7737,7 @@ def _feed_db_probe(db_path: str, want_counts: bool = False) -> dict:
 
 
 @app.route("/api/feed-health")
+@swr_cached("feed-health", 60.0)
 def feed_health_api():
     """Is the live trader actually *seeing* any news, or flying blind?
 
