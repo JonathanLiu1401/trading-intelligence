@@ -1296,9 +1296,62 @@ def _extract_briefing_labels(briefing_text: str, articles: list) -> list[dict]:
     return labels
 
 
+# Briefing-cadence resilience across daemon restarts. The daemon restarts far
+# more often than the 5h HEARTBEAT_INTERVAL under the documented OOM-restart
+# churn (observed: hundreds of starts/day in the rotated logs; actual briefing
+# gaps of 30-40h in the `briefings` table vs the 5h target). heartbeat_worker
+# used to reset its clock to ``time.time()`` on every start, so any restart
+# < 5h after launch silently pushed the next briefing out another full
+# interval — the analyst's scheduled digest was being starved for 30+h at a
+# time. We seed the clock from the last *persisted* briefing instead so the
+# cadence survives restarts. NOTE: save_briefing() runs even when the Discord
+# POST fails (the extracted labels are training signal regardless), so a DB ts
+# means "briefing generated", not strictly "delivered" — a Discord outage now
+# costs at most one skipped 5-min retry instead of many starved briefings, an
+# intentional and strictly better trade than the restart-churn starvation.
+HEARTBEAT_RESTART_WARMUP_SECS = 120
+
+
+def _initial_heartbeat_last(store: ArticleStore, now: float | None = None) -> float:
+    """Seed heartbeat_worker's ``last`` clock from the most recent persisted
+    briefing so a daemon restart does not reset the 5h cadence.
+
+    Returns an epoch such that:
+      - no briefing row / unparseable / future ts → ``now`` (original
+        behaviour: wait a full HEARTBEAT_INTERVAL before the first briefing);
+      - last briefing < 5h ago → that ts (worker waits only the remainder);
+      - last briefing ≥ 5h ago (overdue) → clamped so the next briefing fires
+        after a short warm-up, not instantly (let collectors/scorer catch up
+        post-restart) and not a full interval later.
+    """
+    if now is None:
+        now = time.time()
+    try:
+        rows = store.get_briefings_for_training(limit=1)
+    except Exception:
+        return now
+    if not rows:
+        return now
+    ts_raw = (rows[0].get("ts") or "").strip()
+    try:
+        dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+    except Exception:
+        return now
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    last_epoch = dt.timestamp()
+    # Overdue → fire after a brief warm-up, not instantly. Future ts (clock
+    # skew / bad row) → clamp to now (degrade to the original behaviour).
+    earliest = now - HEARTBEAT_INTERVAL + HEARTBEAT_RESTART_WARMUP_SECS
+    return min(now, max(earliest, last_epoch))
+
+
 def heartbeat_worker(store: ArticleStore):
     log.info("[heartbeat_worker] started")
-    last = time.time()  # wait full 5h interval before first briefing — don't fire on every restart
+    # Seed from the last persisted briefing so restart-churn cannot starve the
+    # 5h cadence (see _initial_heartbeat_last). Falls back to "wait a full
+    # interval" when there is no prior briefing or the ts is unusable.
+    last = _initial_heartbeat_last(store)
     _worker_last_ok["heartbeat"] = time.time()
 
     while _running:
