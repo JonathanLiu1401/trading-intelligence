@@ -87,9 +87,17 @@ def _kill_stale_claude():
     """Kill any lingering claude subprocess. strategy._claude_call() launches
     `claude --model <model> --print ...`; a wedged child that survives its
     Python-side timeout keeps holding resources and can re-starve the next
-    cycle. Match the live (Opus) model first, then fall back to any stray
-    `claude --print` so a fallback-model zombie is also cleaned up."""
-    for pattern in ("claude --model claude-opus", "claude --print"):
+    cycle. Match the live (Opus) model first, then the Sonnet fallback model
+    so a wedged fallback zombie is also reaped.
+
+    Both patterns are anchored on `claude --model <family>` because the CLI
+    is always invoked as `claude --model <model> --print …` — the `--model`
+    arg sits between `claude` and `--print`, so a bare `claude --print`
+    pattern is never a contiguous substring of the real command line and
+    would silently match nothing (the exact bug this once had: a wedged
+    Sonnet fallback survived the breaker, defeating auto-recovery in the
+    very Opus-timeout→Sonnet-fallback path the breaker exists for)."""
+    for pattern in ("claude --model claude-opus", "claude --model claude-sonnet"):
         try:
             killed = subprocess.run(
                 ["pkill", "-f", pattern],
