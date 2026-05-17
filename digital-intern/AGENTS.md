@@ -939,3 +939,113 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   `tests/test_export_training_data.py`, and the `logs/*.tmp` deletions all
   predate this session and were deliberately never staged — the one feature
   commit was pathspec-scoped to exactly its 2 intended files.
+
+- **2026-05-17 (Agent 3, hybrid debug+feature+live-validation)** —
+  Read pass over the nine task-critical files + `ml/inference.py`. The
+  four load-bearing invariants re-traced and hold; no new bug *by
+  inspection* in the heavily-reviewed core. Per the established pattern,
+  **live validation (Phase 3, run first) was the discovery engine** and
+  produced both Phase 1 fixes — both invisible to the 9-file inspection
+  loop, both undocumented in this failure-mode table, both in `daemon.log`
+  forensics.
+
+  **Phase 1 — two real, undocumented, production-observed bugs:**
+  1. `d0d54dd` **`core/logger.py::_JSONLHandler.format` called
+     `self.formatException`.** `_JSONLHandler` subclasses
+     `RotatingFileHandler` (a `logging.Handler`); `formatException` is a
+     `logging.Formatter` method, absent on a Handler. EVERY record carrying
+     `exc_info` (every `log.exception(...)` in the daemon) raised
+     `AttributeError` inside `emit()->shouldRollover()->format()`.
+     `format()` raises *before* `emit` writes, so the **whole** structured
+     record was lost (not just the `exc` field) and a secondary
+     `--- Logging error ---` traceback was spammed into `daemon.log`
+     (observed: 48 collateral tracebacks in one window; every
+     `[urgency] Scoring error` absent from `structured.jsonl` — the sink
+     the dashboard/healthcheck read). Same blind-spot class as the prior
+     logger-UTC bug (`core/logger.py` not in the 9-file list). Fix:
+     `traceback.format_exception` (what `Formatter.formatException` does
+     internally). Pinned by `tests/test_logger_exc_info.py`.
+  2. `ef7fbe4` **`storage/article_store.py::_retry_on_lock` only caught
+     `OperationalError('database is locked')`.** The shared `self.conn`
+     (`check_same_thread=False`, ~30 threads) is read locklessly by
+     `get_unscored`/`get_top_for_briefing`/the trainer/the dashboard while
+     `_write_lock` only serialises *writers*; a reader mid-`fetchall`
+     corrupts the connection statement state when a writer's `executemany`
+     runs → `sqlite3.DatabaseError: another row available`. **Observed 48x
+     in one `daemon.log` window**, hitting `insert_batch` (whole collected
+     batches dropped, collector backs off) and `update_ai_scores_batch`
+     (whole Sonnet-labeled batch lost → urgent items never get `urgency=1`
+     → **missed alerts**; articles re-queued to the LLM forever → wasted
+     quota). Every decorated op is idempotent and the colliding reader's
+     `.fetchall()` completes within the first backoff tick, so a retry
+     succeeds. Fix: catch `sqlite3.DatabaseError` (base of OperationalError
+     AND IntegrityError) but discriminate on a tight `_RETRYABLE_DB_ERRORS`
+     substring allowlist so IntegrityError etc. still propagate. Surgical
+     idempotent-safe stopgap; the full fix is per-call write-connection
+     isolation (mirrors dashboard `_ro_query`, deferred there too). Pinned
+     by `tests/test_article_store.py::TestCursorCollisionRetry`
+     (retry-then-succeed + non-retryable-propagates control).
+
+  **Phase 2 — book-coverage line in the 5h briefing (`2cc1250`).**
+  `daemon._format_portfolio_coverage(source_articles)` appends one
+  deterministic Discord-only line — `📊 Book in digest: MU·NVDA (2/12) —
+  silent: …` — so the analyst sees which tracked positions the digest
+  actually touches. A 5h window with zero mentions of a held/watched name
+  (AXTI/QBTS/SNDU are thin-coverage) was a silent blind spot (real digests
+  routinely cover only 2-4 of 12). Pure + char-capped with `+N` overflow,
+  mirroring `_format_source_health_summary`; case-sensitive word-boundary
+  match reusing the `ml.features._LIVE_RE` convention (`\bMU\b` ≠ MUSEUM,
+  MUU distinct from MU); covered list in stable `tickers` order. Appended
+  to `message`, NEVER folded into the saved `briefing` text (can't reach
+  the trainer's title-prefix label scan — same discipline as the
+  source-health line / coverage-gap banner). Read-only: no articles row,
+  no `ai_score`/`ml_score`/`score_source` — all four invariants intact.
+  +12 exact-string tests (`tests/test_portfolio_coverage_briefing.py`).
+
+  **Phase 3 — live findings (read-only `immutable=1` DB probes + log
+  forensics):**
+  1. **Briefing cadence recovered.** `briefings` id22→id23 ≈ **6.3h** vs
+     5h target — the `ef839a8` heartbeat-clock fix held. The 41h/32h gaps
+     (id20→21→22) all predate that fix. Latest briefing (id=23) read
+     end-to-end is a genuinely accurate, dense, actionable Bloomberg
+     digest (sharp inflation-shock LEAD with real 10Y/VIX/SMH numbers,
+     PORTFOLIO with C59-call impairment + NVDL 2x-leverage risk, DESK NOTE
+     "watch MU $700"). **Positive validation.**
+  2. **`export_worker: database disk image is malformed`** still recurring
+     every ~30 min (06:21Z, 06:41Z, 07:11Z) — torn read of the 1.40 GB USB
+     `articles.db` under heavy concurrent write; paper-trader's
+     `training_data.json.gz` fallback going stale. A sibling agent's
+     **uncommitted** in-flight fix is present (`scripts/export_training_data.py`
+     `+import os`, untracked `tests/test_export_training_data.py`); those 2
+     tests are **flaky** — fail in the cold full suite under USB I/O
+     contention (`assert 1 == 0`), pass in isolation. Left untouched per
+     the don't-stage-others'-work rule.
+  3. **USB `articles.db` I/O saturation** severe and active — even indexed
+     read probes block in `D` and time out >85s; **57 of 71 `daemon.log`
+     ERRORs are `lock retry exhausted`** (`insert_batch`/
+     `update_ml_scores_batch`/etc.). Documented operational issue;
+     unchanged.
+  4. **Restart churn persists** — 24 `DAEMON — STARTING` in the current
+     log; duplicate `daemon.py` (active + flock-blocked) is the designed
+     handling. Operational.
+  5. **`dashboard /api/articles` 500s 10x** — the `b4be1ca` `_ro_query`
+     fix is committed but the running daemon is stale (chronic
+     stale-daemon: code fixes need `systemctl --user restart
+     digital-intern`).
+  6. **Alerted-rows (24h):** legitimate breaking items (Samsung 50k-worker
+     HBM4 strike, NVDA 8-K, MU premarket) plus lone reddit/Wikipedia
+     low-authority rows — the source-authority gate (`31dea26`) is
+     committed but the stale daemon predates it; Wikipedia 0.60 is the
+     prior agent's deliberately-deferred above-threshold case, **not
+     reopened** (raising the bar would also catch gdelt/scraped — their
+     standing call honored).
+
+  Suite: **368 passed** (350 prior-non-export + 4 Phase-1 + 12 Phase-2;
+  clean `__pycache__`/`.pytest_cache`), `daemon`/`storage`/`ml` imports
+  OK. *Pre-existing, not this work — deliberately never staged:* the
+  sibling `scripts/export_training_data.py` edit + untracked
+  `tests/test_export_training_data.py` / `collectors/fred_collector.py`,
+  all `paper-trader/*` changes (separate repo / sibling agents), and the
+  51 `logs/.supervisor_state.*.tmp` deletions. Every commit here was
+  pathspec-scoped to exactly its intended .py + test files (4 distinct
+  files across 3 commits); never `git add -A`.
