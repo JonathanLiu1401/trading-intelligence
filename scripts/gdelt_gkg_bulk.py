@@ -37,6 +37,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import os
 import re
 import sys
 import threading
@@ -269,11 +270,18 @@ def run(start_year: int = 2015):
                         f"ETA {eta_min:.0f}min"
                     )
                     if completed % 500 == 0:
-                        CHECKPOINT_PATH.write_text(json.dumps({"done": list(done)}))
+                        # Atomic write — write_text() truncates first, so an
+                        # OOM-kill mid-write would empty the checkpoint and
+                        # restart the whole multi-hour sweep from scratch.
+                        _tmp = CHECKPOINT_PATH.with_suffix(".tmp")
+                        _tmp.write_text(json.dumps({"done": list(done)}))
+                        os.replace(_tmp, CHECKPOINT_PATH)
         except KeyboardInterrupt:
             print("\n[gkg_bulk] interrupted — saving checkpoint")
 
-    CHECKPOINT_PATH.write_text(json.dumps({"done": list(done)}))
+    _tmp = CHECKPOINT_PATH.with_suffix(".tmp")
+    _tmp.write_text(json.dumps({"done": list(done)}))
+    os.replace(_tmp, CHECKPOINT_PATH)
     elapsed = time.time() - start_time
     print(f"\n[gkg_bulk] DONE — {inserted_total:,} new articles "
           f"from {total} files in {elapsed/60:.1f} min")

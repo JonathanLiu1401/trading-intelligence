@@ -85,7 +85,12 @@ def _load_checkpoint() -> set[str]:
 
 
 def _save_checkpoint(done: set[str]):
-    CHECKPOINT_PATH.write_text(json.dumps({"done": list(done)}))
+    # Atomic write: write_text() truncates first, so an OOM-kill (this box
+    # peaks ~8G / 6G swap) between truncate and flush would leave an empty
+    # checkpoint and silently restart the whole multi-hour sweep.
+    tmp = CHECKPOINT_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"done": list(done)}))
+    os.replace(tmp, CHECKPOINT_PATH)
 
 
 def run():

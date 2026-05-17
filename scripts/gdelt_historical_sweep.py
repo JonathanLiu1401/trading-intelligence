@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import threading
 import time
@@ -82,12 +83,21 @@ def _mark_done(tid: str):
     with _ckpt_lock:
         _done_ids.add(tid)
         if len(_done_ids) % 200 == 0:
-            CHECKPOINT_PATH.write_text(json.dumps({"done": list(_done_ids)}))
+            _atomic_write_ckpt()
+
+
+def _atomic_write_ckpt():
+    # Caller must hold _ckpt_lock. write_text() truncates first, so an
+    # OOM-kill (this box peaks ~8G / 6G swap) between truncate and flush
+    # would leave an empty checkpoint and silently restart the whole sweep.
+    tmp = CHECKPOINT_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"done": list(_done_ids)}))
+    os.replace(tmp, CHECKPOINT_PATH)
 
 
 def _flush_checkpoint():
     with _ckpt_lock:
-        CHECKPOINT_PATH.write_text(json.dumps({"done": list(_done_ids)}))
+        _atomic_write_ckpt()
 
 
 def _fetch_window(query: str, start_dt: str, end_dt: str) -> list[dict]:
