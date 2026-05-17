@@ -32,10 +32,16 @@ def _ny(year, month, day, hour, minute):
 
 
 @pytest.fixture(autouse=True)
-def _reset_runner_state(monkeypatch):
-    """Each test starts with a fresh module state — no prior hourly/daily fired."""
+def _reset_runner_state(monkeypatch, tmp_path):
+    """Each test starts with a fresh module state — no prior hourly/daily fired.
+
+    Also redirect the restart-durability sidecar into tmp so a test that
+    drives `_maybe_hourly`/`_maybe_daily_close` to success can never write the
+    real ``data/runner_state.json`` (offline / side-effect-free invariant).
+    """
     monkeypatch.setattr(runner, "_daily_close_sent_for", None)
     monkeypatch.setattr(runner, "_last_hourly", None)
+    monkeypatch.setattr(runner, "_STATE_PATH", tmp_path / "runner_state.json")
 
 
 def _patch_now(monkeypatch, when):
@@ -320,3 +326,150 @@ class TestKillStaleClaude:
 
         monkeypatch.setattr(runner.subprocess, "run", _boom)
         runner._kill_stale_claude()  # must not raise
+
+
+class TestRunnerStatePersistence:
+    """Restart-durable report markers (2026-05-17 feature).
+
+    `_daily_close_sent_for` / `_last_hourly` were module globals lost on
+    every process restart, so a frequently-bounced runner either never sent
+    an hourly summary (boot kept resetting the 1h clock) or double-posted
+    the DAILY CLOSE after a post-16:05 restart. These lock the JSON-sidecar
+    persistence + rehydrate that fixes both, asserting the exact restart
+    behaviour — not merely "no crash".
+    """
+
+    # ── sidecar IO contract: never raises, round-trips ──
+    def test_load_missing_file_returns_empty(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(runner, "_STATE_PATH", tmp_path / "nope.json")
+        assert runner._load_runner_state() == {}
+
+    def test_load_corrupt_json_returns_empty(self, monkeypatch, tmp_path):
+        p = tmp_path / "runner_state.json"
+        p.write_text("{ this is not json")
+        monkeypatch.setattr(runner, "_STATE_PATH", p)
+        assert runner._load_runner_state() == {}  # never raises
+
+    def test_load_non_dict_json_returns_empty(self, monkeypatch, tmp_path):
+        p = tmp_path / "runner_state.json"
+        p.write_text("[1, 2, 3]")  # valid JSON, wrong shape
+        monkeypatch.setattr(runner, "_STATE_PATH", p)
+        assert runner._load_runner_state() == {}
+
+    def test_save_then_load_round_trips(self, monkeypatch, tmp_path):
+        p = tmp_path / "runner_state.json"
+        monkeypatch.setattr(runner, "_STATE_PATH", p)
+        when = _ny(2026, 5, 14, 11, 0)
+        monkeypatch.setattr(runner, "_daily_close_sent_for", "2026-05-14")
+        monkeypatch.setattr(runner, "_last_hourly", when)
+        runner._save_runner_state()
+        loaded = runner._load_runner_state()
+        assert loaded["daily_close_sent_for"] == "2026-05-14"
+        assert loaded["last_hourly_iso"] == when.isoformat()
+        # No leftover temp file from the atomic write.
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_save_swallows_io_error(self, monkeypatch, tmp_path):
+        # _STATE_PATH under a *file* (not dir) → mkdir/replace raise; the
+        # daemon loop must survive a read-only data dir.
+        bad_parent = tmp_path / "afile"
+        bad_parent.write_text("x")
+        monkeypatch.setattr(runner, "_STATE_PATH", bad_parent / "runner_state.json")
+        monkeypatch.setattr(runner, "_daily_close_sent_for", "2026-05-14")
+        runner._save_runner_state()  # must not raise
+
+    # ── rehydrate contract ──
+    def test_restore_no_sidecar_leaves_globals(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(runner, "_STATE_PATH", tmp_path / "nope.json")
+        monkeypatch.setattr(runner, "_daily_close_sent_for", None)
+        sentinel = _ny(2026, 5, 14, 9, 30)
+        monkeypatch.setattr(runner, "_last_hourly", sentinel)
+        runner._restore_runner_state()
+        assert runner._daily_close_sent_for is None
+        assert runner._last_hourly is sentinel  # untouched
+
+    def test_restore_rehydrates_both_markers(self, monkeypatch, tmp_path):
+        p = tmp_path / "runner_state.json"
+        monkeypatch.setattr(runner, "_STATE_PATH", p)
+        when = _ny(2026, 5, 14, 11, 0)
+        monkeypatch.setattr(runner, "_daily_close_sent_for", "2026-05-14")
+        monkeypatch.setattr(runner, "_last_hourly", when)
+        runner._save_runner_state()
+        # Simulate a fresh process: globals back to boot defaults.
+        monkeypatch.setattr(runner, "_daily_close_sent_for", None)
+        monkeypatch.setattr(runner, "_last_hourly", None)
+        runner._restore_runner_state()
+        assert runner._daily_close_sent_for == "2026-05-14"
+        assert runner._last_hourly == when
+
+    def test_restore_corrupt_last_hourly_left_unchanged(self, monkeypatch, tmp_path):
+        p = tmp_path / "runner_state.json"
+        p.write_text('{"daily_close_sent_for": "2026-05-14", '
+                      '"last_hourly_iso": "not-a-timestamp"}')
+        monkeypatch.setattr(runner, "_STATE_PATH", p)
+        monkeypatch.setattr(runner, "_daily_close_sent_for", None)
+        monkeypatch.setattr(runner, "_last_hourly", None)
+        runner._restore_runner_state()  # must not raise
+        # The good field still rehydrates; the bad one is just skipped.
+        assert runner._daily_close_sent_for == "2026-05-14"
+        assert runner._last_hourly is None
+
+    # ── the two trader-visible bugs this fixes ──
+    def test_restart_after_close_does_not_double_post(self, monkeypatch, tmp_path):
+        """A bounce after 16:05 NY on a day the close already fired must NOT
+        re-post the DAILY CLOSE (the duplication bug)."""
+        monkeypatch.setattr(runner, "_STATE_PATH", tmp_path / "runner_state.json")
+        calls = []
+        monkeypatch.setattr(runner.reporter, "send_daily_close",
+                            lambda: calls.append(1) or True)
+        # Process A: fires the close at 16:10 NY and persists.
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 16, 10))
+        runner._maybe_daily_close()
+        assert calls == [1]
+        # Process B (restart 50 min later, still the same NY day):
+        monkeypatch.setattr(runner, "_daily_close_sent_for", None)  # fresh proc
+        runner._restore_runner_state()
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 17, 0))
+        runner._maybe_daily_close()
+        assert calls == [1], "DAILY CLOSE double-posted after a restart"
+
+    def test_restart_does_not_starve_overdue_hourly(self, monkeypatch, tmp_path):
+        """An overdue hourly (>1h since the last real send) must fire on the
+        first post-restart cycle — a restart must not reset the clock and
+        swallow another hour."""
+        monkeypatch.setattr(runner, "_STATE_PATH", tmp_path / "runner_state.json")
+        calls = []
+        monkeypatch.setattr(runner.reporter, "send_hourly_summary",
+                            lambda: calls.append(1) or True)
+        # Process A sends an hourly at 10:00 NY, persists.
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 10, 0))
+        runner._last_hourly = None
+        runner._maybe_hourly()
+        assert calls == [1]
+        # Process B restarts 2h later. main() would boot-anchor _last_hourly
+        # to *now* (which alone would starve the hourly forever under frequent
+        # restarts); _restore_runner_state must override it with the real
+        # 10:00 marker so the overdue summary fires this cycle.
+        monkeypatch.setattr(runner, "_last_hourly", _ny(2026, 5, 14, 12, 0))  # boot anchor
+        runner._restore_runner_state()
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 12, 0))
+        runner._maybe_hourly()
+        assert calls == [1, 1], "overdue hourly starved by the restart"
+
+    def test_restart_within_hour_does_not_early_fire(self, monkeypatch, tmp_path):
+        """The mirror of the above: a restart <1h after the last real hourly
+        must NOT fire an early summary on boot."""
+        monkeypatch.setattr(runner, "_STATE_PATH", tmp_path / "runner_state.json")
+        calls = []
+        monkeypatch.setattr(runner.reporter, "send_hourly_summary",
+                            lambda: calls.append(1) or True)
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 10, 0))
+        runner._last_hourly = None
+        runner._maybe_hourly()
+        assert calls == [1]
+        # Restart only 20 min later.
+        monkeypatch.setattr(runner, "_last_hourly", _ny(2026, 5, 14, 10, 20))
+        runner._restore_runner_state()
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 10, 20))
+        runner._maybe_hourly()
+        assert calls == [1], "fired an early hourly <1h after the last one"
