@@ -324,6 +324,26 @@ Suites:
   never raises into chat); a QUIET/NO_DATA window is suppressed (ACTIVE-only,
   matching the unified `:8888` chat's `_fetch_session_delta` so the two
   conversational surfaces stay consistent).
+- `test_heartbeat_cadence.py` — `daemon._initial_heartbeat_last`, the
+  restart-resilient briefing-clock seed (see "5h heartbeat briefing posts
+  30–40h apart" failure mode). Drives the real `save_briefing →
+  get_briefings_for_training` path (not hand-built dicts) and reads
+  `HEARTBEAT_INTERVAL`/`HEARTBEAT_RESTART_WARMUP_SECS` from the live module so
+  a retune can't false-fail it: no-briefing/unparseable/future-ts → `now`
+  (original wait-a-full-interval behaviour preserved on first-ever launch);
+  a 1h-ago briefing → waits the remainder (no immediate fire on restart); a
+  40h-ago overdue briefing → seeded to fire after the warm-up, asserted
+  exactly `now - last == HB - WARMUP` (neither instant nor a full interval);
+  id-DESC newest-row-wins; store-raises → `now` (never crashes the worker at
+  startup).
+- `test_source_health_briefing.py` — `daemon._format_source_health_summary`
+  + the `_build_health_line` integration (the new "Sources down (N): …" line
+  in the 5h Discord briefing). Exact-string pins on the compact deterministic
+  formatter: empty when healthy, disabled sorted, stale de-duplicated against
+  disabled, disabled-listed-before-stale (the union is NOT globally sorted),
+  `+N` overflow truncation, the hard `max_chars` cap with `…`; and that
+  `_build_health_line` appends the line only when something is down and
+  degrades to workers-only (never raises) on a `source_health` probe error.
 
 ---
 
@@ -449,6 +469,8 @@ sentinel, which makes every article `needs_llm` and is also the value
 | `recursive_labeler` worker logs one WARNING per 4h cycle and `total_labeled=0`, model stops gaining gold labels | A label batch from Claude carried a non-int `urgency` (`"1"`, `"1.0"`, `"yes"`, `true`). The unguarded `int()` in `_apply_labels` used to raise, unwinding the whole pipeline and discarding the in-flight batch's good labels. Now degraded to `urgency=0` so the relevance label still lands. | Fixed in `_apply_labels` (defensive `int(float(...))` with `(TypeError, ValueError)` fallback). Pinned by `tests/test_recursive_labeler.py::TestApplyLabels::test_poison_urgency_does_not_abort_or_lose_siblings`. |
 | Backtest titles/URLs visible in the standalone dashboard feed (`:8765`) or skewing the per-ticker sentiment panel, while the `:8080` daemon dashboard looks clean | **Dashboard parity.** Backtest isolation is enforced in three independent SQL spots: the store paths (`_LIVE_ONLY_CLAUSE`), `dashboard/web_server.py` (`_LIVE_ONLY_SQL`), and — newly — `dashboard/server.py` + `ml/sentiment_trends.py`. The standalone uvicorn dashboard (`dashboard.service`) and the sentiment-trends aggregator were two parallel reads of `articles` that did not filter synthetic rows, so they rendered training data as live news. | All three now use the canonical clause (`dashboard/server.py` / `ml/sentiment_trends.py` import `_LIVE_ONLY_CLAUSE` from `storage.article_store`). Any new `FROM articles` read that surfaces to a user MUST filter. Pinned by `tests/test_dashboard_backtest_isolation.py`. |
 | Stale (>`STALE_HOURS`) news still firing urgent alerts, and/or the model quietly underperforming for no obvious reason | **Article age never reached the live path.** `get_unscored` projected only `id/title/source/summary`, dropping `published`/`first_seen`. `_article_age_hours` then read 0h for every article: the Sonnet staleness rule and the hard `STALE_SCORE_CAP` clamp were both inert, and `extract_features` fell back to `now()` so 5 temporal features were train/serve-skewed. No exception, model still trained, alerts still fired — invisible. | `get_unscored` now returns both age columns (invariant #4). Verify any `get_unscored` projection edit keeps `published`/`first_seen`. Re-run `tests/test_get_unscored_age_fields.py`. |
+| 5h heartbeat briefing posts 30–40h apart (or never) while the daemon looks healthy | **Restart-churn reset the briefing clock.** `heartbeat_worker` seeded `last = time.time()` on every start; under the documented OOM-restart churn (hundreds of starts/day) any restart < 5h after launch pushed the next briefing out another full interval, starving the analyst's scheduled digest. No error — the worker pings healthy the whole time. | `_initial_heartbeat_last` now seeds `last` from the most recent persisted `briefings.ts` (with a startup warm-up clamp); a restart no longer resets the cadence. Falls back to the original "wait a full interval" when no briefing exists / ts unusable. Pinned by `tests/test_heartbeat_cadence.py`. Note this is a *symptom* of the OOM-restart churn (1.4 GB USB DB + bulk `gdelt_historical` backfill + WAL-checkpoint contention → frequent `insert_batch: lock retry exhausted` ERRORs and OOM-kills); the churn root cause is operational, out of scope for a code fix. |
+| Whole collected batches silently lost; `[article_store] insert_batch: lock retry exhausted after 5 attempts — raising` ERRORs (also `update_ml_scores_batch`/`update_ai_scores_batch`) | Sustained writer contention on the 1.4 GB USB `articles.db` (many collector threads + a ~1.3M-row `gdelt_historical` bulk backfill draining through the scorer + `purge`'s `wal_checkpoint(TRUNCATE)`) outlasts the 5-attempt / ~10s `_retry_on_lock` budget. `_ingest` propagates the raise → the collector worker's broad `except` drops the entire fetched batch and backs off. | Operational, not a clean surgical fix (retry-then-raise is the intended contract; bumping `_LOCK_RETRY_ATTEMPTS`/`_CAP_S` has no correctness story). Mitigations: reduce the bulk-backfill insert rate, move `articles.db` off the USB spindle, or lower `purge` checkpoint contention. Tracked as a Phase 3 finding. |
 
 ---
 
@@ -671,3 +693,50 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   string is committed at HEAD but those 2 tests were not updated by whoever shipped
   it; my session-delta diff contains zero decision-health hunks (verified). Left for
   that change's owner per the standing "don't weaken another change's tests" rule.
+
+- **2026-05-17 (Agent 3, hybrid debug+feature+live-validation)** — Full read
+  pass over the nine task-critical files + `ml/inference.py` and the small
+  core modules (`json_extract`, `retrain_guard`, `backoff`, `alert_dedup`,
+  `embedder`, `heuristic_scorer`). The four load-bearing invariants re-traced
+  and hold; no new bug found *by inspection* in the heavily-reviewed core
+  paths. **Live validation surfaced the real defect:** the `briefings` table
+  showed actual 32h and 41h gaps between heartbeat posts vs the 5h target,
+  and the rotated logs showed the daemon restarting every 7–28 min (427
+  starts in one log) under OOM-restart churn. Root cause: `heartbeat_worker`
+  seeded its clock to `time.time()` on every start, so restart-churn starved
+  the analyst's scheduled digest for 30+h at a time — healthy-looking the
+  whole time (no error; the worker pings alive). **Phase 1 fix (`ef839a8`):**
+  `daemon._initial_heartbeat_last` seeds `last` from the most recent
+  persisted `briefings.ts` with a startup warm-up clamp; original
+  wait-a-full-interval behaviour preserved on first-ever launch / unusable
+  ts. The `save_briefing`-runs-even-on-Discord-failure path means a webhook
+  outage now costs one skipped 5-min retry instead of many starved briefings
+  — an intentional, strictly-better trade (commented in-code). +7 tests
+  (`test_heartbeat_cadence.py`, real store path, live constants). **Phase 2
+  feature (`c2fa61a`):** `_format_source_health_summary` adds a compact,
+  deterministic, char-capped "⚠ Sources down (N): …" line to the 5h Discord
+  briefing — 6 collectors incl. `sec_edgar` (8-K filings, high signal) were
+  observed disabled in production while the briefing health line, which only
+  reported four worker threads' liveness, said nothing. Additive, read-only,
+  zero `articles`-table / `ai_score`/`ml_score`/`score_source` impact (all
+  four invariants preserved). +9 tests (`test_source_health_briefing.py`,
+  exact strings). **Phase 3 findings reported (not fixed — operational /
+  out of surgical scope):** (a) DB write-lock exhaustion — 46 `insert_batch:
+  lock retry exhausted` tracebacks/log dropping whole fresh-article batches
+  under 1.4 GB-USB-DB + ~1.3M-row `gdelt_historical` backfill + checkpoint
+  contention; (b) low-authority urgent alerts — Wikipedia recent-change
+  ("[Wikipedia] Nvidia RTX", `ml_score=8.63`) and Reddit posts fired as
+  urgent Bloomberg alerts (model over-scores; urgency thresholds are
+  well-pinned, changing them is out of surgical scope); (c) `gdelt_historical`
+  bulk backfill counts as live (1.29M-row unscored backlog) but is defused
+  for briefings/alerts by the staleness filters and `kw_score DESC` scoring
+  order — observation, not a code bug. **Positive:** the actual latest
+  briefing read end-to-end is a genuinely accurate, coherent Bloomberg-style
+  digest; scorer keeps up (batch=1000 scored=1000/cycle, high-kw first);
+  ml_trainer healthy (n=22500, val_loss ≈ 2.75–2.80); alert syndication
+  dedup working; backtest isolation holding (429k synthetic rows correctly
+  excluded from every live count/alert checked). Suite: **333 passed**
+  (317 prior + 7 + 9 new; clean `__pycache__`/`.pytest_cache`), imports OK.
+  *Pre-existing, not this work:* the `logs/.supervisor_state.*.tmp`
+  deletions and `paper-trader/*` working-tree changes predate the session
+  and were deliberately left unstaged.
