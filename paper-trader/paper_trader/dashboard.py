@@ -8353,8 +8353,29 @@ def correlation_api():
 
 
 @app.route("/api/runner-heartbeat")
+@swr_cached("runner-heartbeat", 20.0)
 def runner_heartbeat_api():
     """Is the trading loop itself alive? — the upstream liveness question.
+
+    **SWR-cached (20s), 2026-05-18.** This is the surface a trader checks
+    *first* and the dashboard JS polls it every 60s, yet it was the last
+    high-traffic core endpoint NOT behind ``swr_cached`` (the invariant #7
+    gap that ``/api/state`` closed). Measured **9.45s** under load avg 23
+    (host-load storm — the documented #1 pathology) versus ~1ms warm: a pure
+    DB+module-global read with no network, so the latency is pure CPU
+    starvation, exactly what SWR exists to absorb. The runner cadence is
+    ≥1800s (open) / 3600s (closed) with ≥1.25x/2.0x verdict multipliers, so
+    a ≤20s stale window can never flip HEALTHY↔LAGGING↔STALLED nor the
+    IDLE_STORM efficacy verdict (≥5 cycles × ≥1800s) — the staleness is
+    invisible to the verdict while the trader gets an instant answer instead
+    of a 9s block. The dashboard thread is independent of the runner thread:
+    a dead runner still gets a fresh background recompute of
+    ``secs_since_last_decision`` from the frozen ``last_decision_ts`` → it
+    correctly goes STALLED, so SWR never masks the very death this detects.
+    Inert under pytest unless ``_SWR_TEST_FORCE`` (the ``/api/state``
+    contract — the existing ``tests/test_runner_heartbeat.py`` endpoint
+    tests stay green on the live path). Locked by
+    ``tests/test_runner_heartbeat_swr.py``.
 
     decision-drought/-reliability/feed-health all reason over rows that
     *exist* in `decisions`; build-info catches a stale code SHA. None close
