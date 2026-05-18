@@ -228,6 +228,138 @@ def _coverage_gap_lines(report: dict, now: datetime | None = None) -> list[str]:
     return [line for _, _, line in rows[:_MAX_COVERAGE_LINES]]
 
 
+# ── Throughput-degradation early warning ─────────────────────────────────────
+# COVERAGE GAP only surfaces sources the FAILURE_THRESHOLD has already pushed
+# to ``disabled`` — a binary, late signal. A live source can be silently
+# collapsing in throughput (RSS feed that delivered 40/h yesterday, 3/h now)
+# without ever hitting that bar; the analyst's "stale sources" complaint
+# applies equally to a still-marginally-alive source as to a fully dark one.
+#
+# ``ArticleStore.source_throughput`` already computes recent-vs-prior counts
+# per ``source`` column key (CLAUDE.md §6 / tests/test_source_throughput.py)
+# but until now NO consumer used it. This is the missing read-side:
+# pure-functional rendering of its rows into an analyst-facing block,
+# surfaced to Opus exactly like COVERAGE GAP — same shape, same "reproduced"
+# discipline, same anti-noise capping. Pure: no DB write, no
+# ai_score/ml_score/score_source/urgency touch, never mutates source_articles
+# — all four load-bearing invariants intact by construction.
+#
+# Thresholds tuned conservatively (the analyst persona's top complaint is
+# noise, so a tiny baseline must never produce a wall-of-text alarm):
+#
+#   * ``prior >= 10``: a 5→0 drop is 100% deceleration but only a 5-row loss
+#     of signal in an hour; ignored. ``prior >= 10`` ensures the source was
+#     materially productive in the baseline window so a slowdown is real.
+#   * ``decel_pct >= 60``: 40+% drop from prior → recent is "halved or
+#     worse", a magnitude the analyst would notice and care about.
+#
+# Sort order: largest absolute loss first (``prior - recent``), tiebreak on
+# higher ``prior`` — a 50→0 source matters more than a 20→0 source even
+# though both are 100% deceleration. Capped at ``_MAX_DEGRADATION_LINES`` so
+# this section can never itself become noise.
+_THROUGHPUT_MIN_PRIOR = 10
+_THROUGHPUT_MIN_DECEL_PCT = 60.0
+_MAX_DEGRADATION_LINES = 6
+
+
+def _collect_source_throughput(window_min: int = 60) -> list[dict]:
+    """Best-effort read of per-source throughput. ``[]`` on ANY failure
+    (missing/locked articles.db, import error) — a degradation-hint read
+    must NEVER break or delay the 5h briefing it annotates (identical
+    discipline to ``_collect_source_health`` / ``_recent_briefing_digest``).
+    Opens a fresh short-lived ``mode=ro`` connection (never the daemon's
+    shared ``self.conn`` — the documented cursor-collision hazard)."""
+    try:
+        import sqlite3
+        from storage.article_store import _get_db_path, _LIVE_ONLY_CLAUSE
+        from datetime import timedelta as _td
+        now = datetime.now(timezone.utc)
+        recent_cut = (now - _td(minutes=window_min)).isoformat()
+        prior_cut = (now - _td(minutes=2 * window_min)).isoformat()
+        conn = sqlite3.connect(
+            f"file:{_get_db_path()}?mode=ro", uri=True, timeout=5,
+        )
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            rows = conn.execute(
+                "SELECT source, "
+                "SUM(CASE WHEN first_seen >= ? THEN 1 ELSE 0 END) AS recent, "
+                "SUM(CASE WHEN first_seen >= ? AND first_seen < ? "
+                "         THEN 1 ELSE 0 END) AS prior "
+                f"FROM articles WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE} "
+                "GROUP BY source",
+                (recent_cut, prior_cut, recent_cut, prior_cut),
+            ).fetchall()
+        finally:
+            conn.close()
+        out: list[dict] = []
+        for source, recent, prior in rows:
+            recent = int(recent or 0)
+            prior = int(prior or 0)
+            if recent == 0 and prior == 0:
+                continue
+            decel_pct = (
+                round((prior - recent) / prior * 100.0, 1)
+                if prior > 0 else None
+            )
+            out.append({"source": source or "", "recent": recent,
+                        "prior": prior, "delta": recent - prior,
+                        "decel_pct": decel_pct})
+        return out
+    except Exception:
+        return []
+
+
+def _throughput_degradation_lines(
+    throughput: list[dict],
+    min_prior: int = _THROUGHPUT_MIN_PRIOR,
+    min_decel_pct: float = _THROUGHPUT_MIN_DECEL_PCT,
+    max_lines: int = _MAX_DEGRADATION_LINES,
+) -> list[str]:
+    """Pure: render ``source_throughput`` rows into ranked degradation lines.
+
+    A source qualifies when its baseline (``prior``) was materially
+    productive AND it lost most of that flow in the recent window. The
+    accepted-baseline / accepted-drop bars are deliberately conservative so
+    the section is signal, not noise.
+
+    ``decel_pct=None`` (no baseline) or non-decelerating sources are
+    omitted — they are either brand-new (no signal yet) or accelerating
+    (the opposite of what this section reports). Sorted by absolute loss
+    desc, prior desc. Capped at ``max_lines``.
+    """
+    if not isinstance(throughput, list) or not throughput:
+        return []
+    candidates: list[tuple[int, int, dict]] = []
+    for r in throughput:
+        if not isinstance(r, dict):
+            continue
+        prior = int(r.get("prior") or 0)
+        recent = int(r.get("recent") or 0)
+        decel_pct = r.get("decel_pct")
+        if not isinstance(decel_pct, (int, float)):
+            continue
+        if prior < min_prior:
+            continue
+        if decel_pct < min_decel_pct:
+            continue
+        abs_loss = prior - recent
+        candidates.append((-abs_loss, -prior, r))
+    if not candidates:
+        return []
+    candidates.sort()
+    out: list[str] = []
+    for _abs_loss_neg, _prior_neg, r in candidates[:max_lines]:
+        src = (r.get("source") or "").strip() or "unknown"
+        decel = r.get("decel_pct")
+        decel_str = f"{decel:.0f}%" if isinstance(decel, (int, float)) else "?"
+        out.append(
+            f"{src} — {r['recent']} in last 60min "
+            f"(vs {r['prior']} prior; -{decel_str})"
+        )
+    return out
+
+
 # ── Prior-digest continuity (anti-rehash) ────────────────────────────────────
 # A news analyst reading consecutive 5h heartbeats complains most about
 # repetition: the briefing re-LEADS with the SAME story it led with last time.
@@ -372,6 +504,7 @@ RULES:
 - If a "BOOK HEAT" block is present, it ranks the analyst's held names by how many DISTINCT stories this window touched each one. Concentration on a single held name is itself a magnitude signal, independent of any one row's score: strongly prefer the most-concentrated held name for the LEAD when it has any material story, rank its stories up in TOP SIGNALS, and give that ticker a concrete forward-looking implication in the PORTFOLIO table. This is a ranking/weighting hint only — do NOT echo a literal "BOOK HEAT" section in the output (unlike COVERAGE GAP).
 - If an "AGING TOP ROWS" block is present, it names the highest-ranked digest rows whose deterministic wall-clock age (time since the story hit our wire) is several hours old — a ground-truth recency cross-check, independent of any row's score or decay rank. An aging top row is a developing/continued story, NOT one that just broke: do NOT make it the LEAD as if it were fresh when a comparably-important newer row exists, frame it explicitly as developing in the LEAD and TOP SIGNALS, and never imply a multi-hour-old item happened moments ago. This is a ranking/framing hint only — do NOT echo a literal "AGING TOP ROWS" section in the output (same as BOOK HEAT, unlike COVERAGE GAP).
 - If a "COVERAGE GAP" block is present in the data input, reproduce it as a **COVERAGE GAP** section (one bullet per dark channel, verbatim). These are intel channels the system could NOT collect from this window — the analyst must know what they are blind to, not assume silence means calm. Omit the section entirely if no gap block is provided.
+- If a "THROUGHPUT DEGRADATION" block is present in the data input, reproduce it as a **THROUGHPUT DEGRADATION** section directly under the COVERAGE GAP bullets (one bullet per source, verbatim). These sources are still alive but have lost most of their recent flow — partial blind spots an analyst must know about (the early-warning complement to COVERAGE GAP: a marginally-alive source has not crossed the disable threshold yet, but the briefing has materially less coverage from it than the prior window). Omit the section entirely if no degradation block is provided.
 - If a "PRIOR DIGEST" block is present, it is the LEAD and TOP SIGNALS YOU YOURSELF published in your previous 5h briefing — the analyst just read that one. Re-leading the SAME story as if it were new is the single most-cited "repetitive digest" complaint. If the dominant story is materially unchanged, do NOT restate it as the LEAD: lead instead with what has CHANGED since (a new level/print/catalyst, a reversal, or a genuinely different top story that now outranks it), and frame any necessarily-carried theme explicitly as continuation/development ("rout now easing", "follows this morning's selloff"), never as a fresh break. This is a framing/selection hint only — do NOT echo a literal "PRIOR DIGEST" section in the output (same as BOOK HEAT / AGING TOP ROWS, unlike COVERAGE GAP).
 
 OUTPUT FORMAT — use EXACTLY this, filled with real data:
@@ -420,6 +553,9 @@ AMD   $xxx  +x.xx%  |  AMAT $xxx +x.xx%  |  SMH  $xxx  +x.xx%
 
 **COVERAGE GAP** (only if a gap block is provided — else omit this whole section)
 - [dark channel verbatim from the COVERAGE GAP data block]
+
+**THROUGHPUT DEGRADATION** (only if a degradation block is provided — else omit this whole section)
+- [degrading source verbatim from the THROUGHPUT DEGRADATION data block]
 
 **DESK NOTE:** [1-2 sentences. One thesis. One level to watch.]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -894,7 +1030,7 @@ def _aging_top_rows(
 
 
 def _build_payload(articles, stock_data, earnings, source_health_report=None,
-                   prior_digest=None):
+                   prior_digest=None, source_throughput=None):
     parts = [f"BRIEFING TIME: {_now_utc_str()}\n"]
 
     macro_data   = stock_data.get("macro", [])   if isinstance(stock_data, dict) else []
@@ -1090,6 +1226,23 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None,
             for gl in gap_lines:
                 parts.append(f"  - {gl}")
 
+    # Throughput-degradation block — partial blind spots, the early-warning
+    # complement to COVERAGE GAP. Only emitted when an explicit throughput
+    # report is supplied (analyze() fetches it live). When None, the section
+    # is omitted entirely so the prompt's "omit if no degradation block"
+    # rule fires and callers/tests that build a payload without throughput
+    # context stay deterministic — exact same shape as the source_health_report
+    # block above (the documented anti-drift discipline).
+    if source_throughput is not None:
+        deg_lines = _throughput_degradation_lines(source_throughput)
+        if deg_lines:
+            parts.append(
+                "\n=== THROUGHPUT DEGRADATION (live sources still up but "
+                "delivering far less this window — partial blind spots) ==="
+            )
+            for dl in deg_lines:
+                parts.append(f"  - {dl}")
+
     # Prior-digest continuity block — anti-rehash. Only emitted when an
     # explicit prior digest is supplied (analyze() reads it best-effort);
     # ``None`` ⇒ the section is omitted entirely and the 4-arg path stays
@@ -1122,6 +1275,7 @@ def analyze(articles, stock_data, earnings):
         articles, stock_data, earnings,
         source_health_report=_collect_source_health(),
         prior_digest=_recent_briefing_digest(),
+        source_throughput=_collect_source_throughput(),
     )
     full_prompt = f"{SYSTEM_PROMPT}\n\n---\nDATA INPUT:\n{payload}"
     result = claude_call(full_prompt, model=MODEL, timeout=180)
