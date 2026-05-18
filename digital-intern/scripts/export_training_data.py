@@ -7,6 +7,7 @@ Streams rows from the source DB to keep memory bounded.
 """
 import gzip
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -71,6 +72,21 @@ def export_all() -> dict:
         "SELECT id, title, source, ai_score, full_text, first_seen "
         "FROM articles WHERE ai_score > 0"
     )
+
+    # paper_trader_signals.db is a fully-derived artifact rebuilt from the
+    # source DB on every run (the JSON.gz already has rebuild-from-scratch
+    # semantics via gzip.open(..., "wt")). Tearing the destination down first
+    # makes the export both idempotent — rows whose ai_score fell below the
+    # 4.0 threshold (or that were deleted at source) do NOT linger and pollute
+    # the backtester's signal set — and self-healing: a corrupt/malformed
+    # destination is replaced instead of raising "database disk image is
+    # malformed" and crashing the whole export. Sidecars must go too or a
+    # stale -wal can resurrect dropped rows.
+    for _suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            os.unlink(f"{db_out_path}{_suffix}")
+        except OSError:
+            pass
 
     # Open destination SQLite
     dst = sqlite3.connect(str(db_out_path), timeout=30)
