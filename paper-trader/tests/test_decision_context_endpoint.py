@@ -108,6 +108,24 @@ class TestDecisionContextEndpoint:
         # pytest-inert SWR by default → no honesty keys (cross-test isolation)
         assert "cached" not in j
 
+    def test_buying_power_block_reaches_reconstructed_prompt(self, client_store,
+                                                             monkeypatch):
+        """assemble_inputs must build the buying_power / event_calendar
+        blocks decide() builds — else the inspector under-reports what Opus
+        sees. buying_power.build_buying_power ALWAYS returns a non-empty
+        prompt_block (even NO_PRICED_NAMES under full yfinance starvation),
+        so a faithful reconstruction MUST surface it. Before the fix,
+        assemble_inputs never built it and the endpoint silently dropped it."""
+        client, _s = client_store
+        _offline(monkeypatch)  # all watch prices None → NO_PRICED_NAMES
+        j = client.get("/api/decision-context").get_json()
+        assert "error" not in j, j
+        assert j["advisory_blocks"].get("buying_power") is True
+        assert "BUYING POWER" in j["prompt"]
+        # the event_calendar flag key must exist regardless of disk state —
+        # a trader auditing the block set must never hit a missing key.
+        assert "event_calendar" in j["advisory_blocks"]
+
     def test_degraded_feed_when_half_prices_missing(self, client_store,
                                                     monkeypatch):
         client, _s = client_store

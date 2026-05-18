@@ -1,6 +1,8 @@
 """Bloomberg Terminal-style briefing — Claude Opus 4.7 via CLI."""
+import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
 
 from core.claude_cli import claude_call
 # Reuse the *single* well-tested headline-canonicalisation primitive
@@ -441,6 +443,78 @@ def _fmt_ticker(s):
     return f"{ticker:>12}  {price}  {pct}  {(s.get('name') or '')[:25]}"
 
 
+# ── Quote-widget noise gate (defense-in-depth, briefing path) ────────────────
+# Yahoo/Bloomberg/Seeking-Alpha list pages embed a live ticker-tape sidebar
+# whose every entry is an <a href="/quote/NVDA"> wrapping the rendered quote
+# string with NO inter-field spaces, e.g.
+# "NVDANVIDIA Corporation227.13-8.61(-3.65%)". Because the price changes every
+# poll, the title (hence the article id) is unique each cycle, so one widget
+# manufactures an unbounded stream of fake "breaking news". Live evidence
+# (2026-05-18): 3,476 of 5,847 sampled scraped/* rows were these and the ML
+# relevance head scored them up to 9.99 — the consuming analyst's single
+# biggest noise complaint.
+#
+# collectors.web_scraper rejects these at ingestion and
+# watchers.alert_agent._filter_quote_widget_noise drops them on the *alert*
+# path, but the 5h Opus heartbeat digest — the analyst's PRIMARY consumed
+# product — had NO such gate: a widget pseudo-article entering via a non-
+# web_scraper path (yahoo_ticker_rss, finnhub, a manual replay) and ML-scored
+# high still landed in the top-60 newswire Opus reads, surfacing as a fake
+# "[HH:MM] [score] TOP SIGNAL". This is the same formatter-side, layered-
+# defense shape as the alert path: a read-side text drop at the single
+# chokepoint the briefing funnels through, NOT an ML-threshold change and NOT
+# a DB write. The two title fingerprints + Yahoo /quote/ landing-path regex
+# are byte-identical to alert_agent / web_scraper so the three gates stay in
+# lockstep. The helper is duplicated rather than cross-imported from
+# alert_agent: that module pulls the ml.features (numpy) import graph and the
+# analysis layer must not (same documented anti-import-cycle discipline as
+# _collapse_syndicated reusing alert_dedup._signature, and
+# article_store._briefing_domain_key duplicating ml.features).
+_QW_PRICE_GLUE = re.compile(r"[A-Za-z]\$?\d{1,4}[.,]\d{2,3}")
+_QW_PCT_PAREN = re.compile(r"\([+-]?\d{1,3}(?:\.\d+)?%\)")
+_QW_QUOTE_PATH = re.compile(r"/quote/[^/]+/?$", re.I)
+
+
+def _looks_like_quote_widget(article: dict) -> bool:
+    """True for a live quote-tape entry masquerading as a digest article.
+
+    Two independent title fingerprints (a letter glued directly to a decimal
+    price; a parenthesised signed % change) plus a Yahoo /quote/ landing path.
+    All anchored so real prose with $/%/comma numbers ("rises 22% to $35.1
+    billion", "5,123.41 record high") and real quote-scoped article URLs
+    ("/quote/NVDA/news/headline-123") are never caught. Byte-identical logic
+    to watchers.alert_agent._looks_like_quote_widget and
+    collectors.web_scraper._looks_like_quote_widget. The synthetic
+    PORTFOLIO/OPTIONS snapshot rows the daemon prepends ("PORTFOLIO P&L
+    SNAPSHOT" / "OPTIONS SNAPSHOT", no url) never match either fingerprint, so
+    they always pass through untouched."""
+    title = article.get("title") or ""
+    if _QW_PRICE_GLUE.search(title) or _QW_PCT_PAREN.search(title):
+        return True
+    url = article.get("link") or article.get("url") or ""
+    try:
+        if _QW_QUOTE_PATH.search(urlparse(url).path):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _filter_quote_widget_noise(articles: list) -> tuple[list, list]:
+    """Partition digest rows into ``(kept, suppressed)``; ``suppressed`` is the
+    quote-tape pseudo-articles. Pure, order-preserving, side-effect-free —
+    returns NEW lists and never mutates the caller's ``source_articles`` (which
+    heartbeat_worker feeds to the briefing-label / training path), so all four
+    load-bearing invariants (backtest isolation, ml_score≠ai_score,
+    score_source, urgency state machine) are intact by construction: this only
+    ever reshapes the text Opus reads."""
+    kept: list = []
+    suppressed: list = []
+    for a in articles:
+        (suppressed if _looks_like_quote_widget(a) else kept).append(a)
+    return kept, suppressed
+
+
 def _build_payload(articles, stock_data, earnings, source_health_report=None):
     parts = [f"BRIEFING TIME: {_now_utc_str()}\n"]
 
@@ -456,6 +530,17 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None):
         parts.append(_fmt_ticker(s))
 
     parts.append("\n=== NEWSWIRE (scored, ranked) ===")
+    # Quote-widget noise gate FIRST — drop live ticker-tape pseudo-articles
+    # before dedup/decay/cap so the analyst's primary Opus digest never
+    # surfaces "NVDANVIDIA Corporation227.13-8.61(-3.65%)" as a TOP SIGNAL
+    # (the documented #1 noise complaint; the alert path and web_scraper
+    # already gate it, the briefing path did not). Pure read-side reshape:
+    # returns NEW lists, never mutates the caller's source_articles, so the
+    # training-label / backtest-isolation invariants are untouched. An empty
+    # input (or an all-widget cycle with no prepended snapshots) degrades to
+    # the same "(no high-relevance ...)" line as before — behaviour-preserving
+    # for the common path, strictly cleaner for the widget path.
+    articles, _qw_suppressed = _filter_quote_widget_noise(articles or [])
     if not articles:
         parts.append("(no high-relevance articles this cycle)")
     else:
