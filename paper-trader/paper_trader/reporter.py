@@ -449,6 +449,33 @@ def _portfolio_lines(positions: list[dict]) -> list[str]:
     return lines
 
 
+def _singleton_lock_line() -> str:
+    """Loud one-liner when THIS runner booted WITHOUT the single-instance
+    guard (degraded — invariant #19 fail-open). A guard-less runner can be
+    double-trading the same $1000 book against a properly-locked instance
+    (observed live 2026-05-17/18) and was previously invisible from every
+    operator surface. The operator lives in Discord, so the hourly / daily
+    summary is the right surface.
+
+    Returns ``""`` when this runner holds the lock (the normal case — no
+    noise) or on ANY failure. Same additive failure contract as the other
+    reporter blocks: a fault drops this one line, never the whole summary.
+    The ``runner`` import is lazy (``runner`` imports ``reporter`` at module
+    load — a top-level import here would be circular)."""
+    try:
+        from . import runner
+        st = runner.singleton_lock_state()
+        if not isinstance(st, dict) or not st.get("degraded"):
+            return ""
+        return ("⚠️ **RUNNER DEGRADED** ◈ this trader booted WITHOUT the "
+                "single-instance guard — another runner may be double-trading "
+                "the same paper book. Restart paper-trader so one guarded "
+                "instance owns the lock.")
+    except Exception as e:
+        print(f"[reporter] singleton-lock line skipped: {e}")
+        return ""
+
+
 def send_hourly_summary() -> bool:
     store = get_store()
     pf = store.get_portfolio()
@@ -479,6 +506,9 @@ def send_hourly_summary() -> bool:
         + "\n".join(trade_lines)
         + "\n```"
     )
+    lk = _singleton_lock_line()
+    if lk:
+        body += "\n" + lk
     sx = _session_block(store, 1.0, "1h")
     if sx:
         body += "\n" + sx
@@ -540,6 +570,9 @@ def send_daily_close() -> bool:
         + ("\n".join(_portfolio_lines(positions)) or "  (none)")
         + "\n```"
     )
+    lk = _singleton_lock_line()
+    if lk:
+        body += "\n" + lk
     sx = _session_block(store, 24.0, "24h")
     if sx:
         body += "\n" + sx

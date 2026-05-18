@@ -7822,8 +7822,35 @@ def runner_heartbeat_api():
         decs = store.recent_decisions(1)
         last_ts = decs[0].get("timestamp") if decs else None
         now_utc = datetime.now(timezone.utc)
-        return jsonify(build_runner_heartbeat(
-            last_ts, _mkt.is_market_open(now_utc), now=now_utc))
+        hb = build_runner_heartbeat(
+            last_ts, _mkt.is_market_open(now_utc), now=now_utc)
+        # Additive: the single-instance-lock state of THE PROCESS SERVING
+        # THIS DASHBOARD (the dashboard runs in a runner thread). A runner
+        # that booted degraded (no flock — invariant #19 fail-open) may be
+        # double-trading the shared book until it upgrades or exits
+        # (runner._recheck_singleton_lock). That pathology was previously
+        # invisible from every operator surface; surface it next to the
+        # loop-liveness verdict. The builder stays pure (the process read is
+        # owned by the endpoint — the thesis_drift split); this never
+        # overrides the existing verdict (a different, test-locked concern).
+        try:
+            from . import runner as _runner
+            lock = _runner.singleton_lock_state()
+        except Exception:
+            lock = None
+        if isinstance(lock, dict):
+            if lock.get("degraded"):
+                lock["headline"] = (
+                    "DEGRADED — this runner booted WITHOUT the single-"
+                    "instance guard; another trader may be double-trading "
+                    "the same paper book. Restart paper-trader so one "
+                    "guarded instance owns the flock.")
+            else:
+                lock["headline"] = (
+                    "OK — this runner holds the single-instance lock "
+                    f"(pid={lock.get('holder_pid')}).")
+            hb["singleton_lock"] = lock
+        return jsonify(hb)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

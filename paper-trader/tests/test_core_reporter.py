@@ -673,3 +673,68 @@ class TestSessionBlock:
         assert "filled 1" in body and "no-dec 1" in body
         # The pre-existing summary is still intact alongside the new block.
         assert "**HOURLY**" in body and "Equity" in body
+
+
+class TestSingletonLockLine:
+    """`_singleton_lock_line` + its hourly-summary wiring — the 2026-05-18
+    feature that makes a guard-less (degraded) runner self-report. A
+    degraded runner double-trading the shared book was previously invisible
+    from every operator surface; the operator lives in Discord."""
+
+    def test_empty_when_lock_acquired(self, monkeypatch):
+        from paper_trader import runner
+        monkeypatch.setattr(runner, "singleton_lock_state", lambda: {
+            "status": "acquired", "holder_pid": 1, "have_lock": True,
+            "degraded": False})
+        assert reporter._singleton_lock_line() == ""
+
+    def test_warns_when_degraded(self, monkeypatch):
+        from paper_trader import runner
+        monkeypatch.setattr(runner, "singleton_lock_state", lambda: {
+            "status": "degraded", "holder_pid": None, "have_lock": False,
+            "degraded": True})
+        line = reporter._singleton_lock_line()
+        assert "RUNNER DEGRADED" in line
+        assert "double-trading" in line
+        assert "Restart paper-trader" in line
+
+    def test_degrades_to_empty_on_runner_fault(self, monkeypatch):
+        from paper_trader import runner
+
+        def _boom():
+            raise RuntimeError("runner introspection blew up")
+
+        monkeypatch.setattr(runner, "singleton_lock_state", _boom)
+        # Additive failure contract: a fault drops THIS line, never raises.
+        assert reporter._singleton_lock_line() == ""
+
+    def test_hourly_summary_includes_degraded_warning(self, fresh_store,
+                                                      monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        from paper_trader import runner
+        monkeypatch.setattr(runner, "singleton_lock_state", lambda: {
+            "status": "degraded", "holder_pid": None, "have_lock": False,
+            "degraded": True})
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "RUNNER DEGRADED" in body
+        # Pre-existing summary intact alongside the new warning.
+        assert "**HOURLY**" in body and "Equity" in body
+
+    def test_hourly_summary_no_warning_when_acquired(self, fresh_store,
+                                                     monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        from paper_trader import runner
+        monkeypatch.setattr(runner, "singleton_lock_state", lambda: {
+            "status": "acquired", "holder_pid": 99, "have_lock": True,
+            "degraded": False})
+        assert reporter.send_hourly_summary() is True
+        assert "RUNNER DEGRADED" not in captured[0]

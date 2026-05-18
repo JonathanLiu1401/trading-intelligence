@@ -204,3 +204,36 @@ def test_endpoint_healthy_on_fresh_decision(client):
     d = r.get_json()
     assert d["verdict"] == "HEALTHY"
     assert d["restart_recommended"] is False
+
+
+def test_endpoint_surfaces_degraded_singleton_lock(client, monkeypatch):
+    """Additive (2026-05-18): /api/runner-heartbeat exposes the lock state of
+    the runner serving the dashboard so a guard-less (degraded) runner —
+    double-trade risk — is no longer invisible. The pre-existing liveness
+    verdict is unchanged (a different, test-locked concern)."""
+    c, s = client
+    s.record_decision(True, 3, "BUY NVDA → FILLED", "{}", 1000.0, 100.0)
+    from paper_trader import runner as _runner
+    monkeypatch.setattr(_runner, "singleton_lock_state", lambda: {
+        "status": "degraded", "holder_pid": None,
+        "have_lock": False, "degraded": True})
+    r = c.get("/api/runner-heartbeat")
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["verdict"] == "HEALTHY"  # unchanged
+    assert d["singleton_lock"]["degraded"] is True
+    assert d["singleton_lock"]["headline"].startswith("DEGRADED")
+
+
+def test_endpoint_singleton_lock_ok_when_acquired(client, monkeypatch):
+    c, s = client
+    s.record_decision(True, 3, "BUY NVDA → FILLED", "{}", 1000.0, 100.0)
+    from paper_trader import runner as _runner
+    monkeypatch.setattr(_runner, "singleton_lock_state", lambda: {
+        "status": "acquired", "holder_pid": 4242,
+        "have_lock": True, "degraded": False})
+    r = c.get("/api/runner-heartbeat")
+    d = r.get_json()
+    assert d["singleton_lock"]["degraded"] is False
+    assert d["singleton_lock"]["headline"].startswith("OK")
+    assert "4242" in d["singleton_lock"]["headline"]
