@@ -5309,3 +5309,71 @@ features_added = 1 · user_findings = 5.**
   byte-parity + reporter suppression/surfacing).
 
 *Review pass #22 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 review pass #20 (ML+backtest hybrid · realized-gate measurement from captured decision · live findings)
+
+- **Phase 1 — no new bug (bugs_fixed = 0; no Phase-1 commit, the commit
+  guard explicitly permits it).** Re-traced the core trio
+  (`decision_scorer.py`, `backtest.py`, `run_continuous_backtests.py`)
+  plus the newest/least-reviewed diagnostics — `overfit_gap.py`,
+  `baseline_trend.py`, `gate_pnl.py`, `horizon_audit.py`,
+  `corpus_audit.py`, `response_audit.py` — and shared deps
+  `validation.split_outcomes_temporal` / `evaluate_scorer_oos` /
+  `calibration._spearman`. All defensive, all exact-value locked.
+  Consistent with the 18 prior no-new-bug ML/backtest passes (#5–#19).
+  **438 ML/backtest tests green before** the feature.
+
+- **Feature shipped (Phase 2, `feat(ml):`): `paper_trader/ml/gate_realized.py`
+  — the gate's REALIZED arm effect from its *captured then-deployed*
+  decision, ZERO re-prediction.** `gate_audit`/`gate_pnl` call
+  `scorer.predict()` with **today's** pickle — a counterfactual their own
+  docstrings disclaim. Commit `60b20d9` added
+  `gate_scorer_pred`/`gate_off_dist` to make the gate's true call
+  measurable; nothing consumed it. This buckets realized 5d/10d/20d by
+  the gate's *actual historical* arm with no predict/pickle, and routes
+  `gate_off_dist=True` rows to a separate `abstained` bucket excluded
+  from the verdict — the honesty re-prediction structurally cannot
+  replicate. Reuses `gate_audit.gate_arm` (SSOT) +
+  `validation.split_outcomes_temporal`; read-only, never raises; names
+  the deploy-stale state `GATE_CAPTURE_NOT_YET_POPULATED`. CLI exits 2 on
+  `GATE_HARMFUL`. **24 exact-value offline locks** in
+  `tests/test_gate_realized.py`. Commit `377c6f7`.
+  ```bash
+  python3 -m pytest tests/test_gate_realized.py -q   # 24 green
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.gate_realized
+  ```
+
+- **Quant findings (Phase 3, live — 6 distinct, reported / out of
+  surgical scope).** (1) **`gate_audit`'s live `GATE_EFFECTIVE`
+  (+4.41pp) is a re-predicted counterfactual, NOT proof the deployed
+  gate helped** — `gate_realized`=`GATE_CAPTURE_NOT_YET_POPULATED`
+  (loop predates `60b20d9`, 0 captured rows), so the honest verdict is
+  currently unmeasurable. (2) **Scorer has zero durable OOS skill while
+  gating 100% of cycles** — `scorer_skill_log` oos_ic median ≈0.02,
+  oos_dir_acc ≈0.5, `gate_active=true` every cycle; `skill_trend`
+  oos_rmse recent **13.0 > mean-predictor 8.46**, `DEGRADING`;
+  `baseline_compare --oos`=`MLP_NO_BETTER_THAN_TRIVIAL`. (3) **Pass-#19
+  anti-overfit fix (`5a0af2d`) shipped but NOT deployed; gap widening**
+  — `overfit_gap`=`MILD_OVERFIT`, oos/val ratio **1.38 DEGRADING**;
+  running loop still gates on the memorizing `(64,32,16)` net. (4)
+  **winner→ArticleNet loop broken WORSE than the documented "~4/5"** —
+  ~7/8 recent cycles `inject err: database locked after 4 attempts` /
+  `trainer rc=-15` / `trainer timeout` (CLAUDE.md §5 step 5
+  non-functional; digital-intern-side lock). (5) **Backtest dispersion
+  is pure leverage-beta** — run 6234 vs_spy +165% beside 6236 vs_spy
+  −52%; 476 complete/24 failed, 0 NaN, orphan-reap + empty-SPY guards
+  working, loop healthy. (6) **`calibration` in-sample `WELL_CALIBRATED`
+  (spearman 0.355) optimistic, contradicted by OOS ledger.**
+  `baseline_skill_log.jsonl` still absent (loop predates `6ade72d`,
+  wiring correct/inert). **Decisive operator action: restart
+  `run_continuous_backtests.py`** — deploys the regularized net,
+  gate-decision capture (then `gate_realized` becomes measurable), the
+  baseline ledger, and multi-horizon outcomes at once.
+
+- **Concurrency note.** 3+ sibling agents on the shared monorepo tree;
+  never `git add -A`; exactly two path-scoped files staged for the
+  feature, AGENTS.md appended-only & committed separately.
+
+*Review pass #20 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
