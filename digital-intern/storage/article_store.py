@@ -1166,5 +1166,66 @@ class ArticleStore:
         )
         return out
 
+    @_retry_on_lock
+    def source_throughput(self, window_min: int = 60) -> list[dict]:
+        """Per live source: article count in the most-recent ``window_min``
+        minutes vs the immediately-preceding equal window, and the
+        deceleration between them.
+
+        ``source_freshness`` answers "how stale is each source's NEWEST
+        item"; this answers the *leading-indicator* question "which
+        collectors are SLOWING DOWN right now". A source can be
+        decelerating sharply while its newest item is still only minutes old
+        (e.g. an RSS feed that dropped from 40/h to 3/h but is not yet dark),
+        so a rate delta surfaces a degrading collector well before
+        ``source_freshness`` reads it as fully stale — earlier warning, same
+        one-query-instead-of-eyeballing-the-log ergonomics.
+
+        Built over the canonical live-only set (``_LIVE_ONLY_CLAUSE`` —
+        synthetic backtest/opus rows are excluded so an injection burst can
+        never mask, or fake, a real collector's rate, CLAUDE.md §5).
+        ``first_seen`` (insert time — never the back-datable ``published``)
+        is the clock, and the ``first_seen >= prior_cut`` predicate bounds
+        the scan to the last two windows via ``idx_first_seen``.
+
+        ``decel_pct`` is the percentage drop from ``prior`` to ``recent``
+        (positive = slowing, negative = accelerating). It is ``None`` when
+        ``prior`` is 0 — a brand-new or just-recovered source has no
+        baseline, which is not a measurable deceleration. Rows are ordered
+        most-decelerated-first so the worst-degrading collector is at the
+        top; a ``None`` decel sorts last so it never jumps a real slowdown.
+        Sources idle in BOTH windows are omitted (no signal to report).
+        """
+        now = datetime.now(timezone.utc)
+        recent_cut = (now - timedelta(minutes=window_min)).isoformat()
+        prior_cut = (now - timedelta(minutes=2 * window_min)).isoformat()
+        rows = self.conn.execute(
+            "SELECT source, "
+            "SUM(CASE WHEN first_seen >= ? THEN 1 ELSE 0 END) AS recent, "
+            "SUM(CASE WHEN first_seen >= ? AND first_seen < ? THEN 1 ELSE 0 END) AS prior "
+            f"FROM articles WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE} "
+            "GROUP BY source",
+            (recent_cut, prior_cut, recent_cut, prior_cut),
+        ).fetchall()
+        out: list[dict] = []
+        for source, recent, prior in rows:
+            recent = int(recent or 0)
+            prior = int(prior or 0)
+            if recent == 0 and prior == 0:
+                continue  # idle in both windows — nothing to report
+            decel_pct = (
+                round((prior - recent) / prior * 100.0, 1)
+                if prior > 0 else None
+            )
+            out.append({"source": source or "", "recent": recent,
+                        "prior": prior, "delta": recent - prior,
+                        "decel_pct": decel_pct})
+        out.sort(
+            key=lambda r: r["decel_pct"] if r["decel_pct"] is not None
+            else float("-inf"),
+            reverse=True,
+        )
+        return out
+
     def close(self):
         self.conn.close()

@@ -976,17 +976,38 @@ def create_app(store=None) -> Flask:
         store = _store_handle()
         if store is None:
             return jsonify({"error": "store unavailable"}), 503
+        # ``store.stats()`` is the core gauge (total/urgent/backlog). If it
+        # exhausts the @_retry_on_lock budget under a sustained writer-
+        # contention / shared-conn cursor-collision storm it genuinely means
+        # the store is unreachable this instant → 500.
         try:
             s = dict(store.stats())
-            s["last_hour"] = store.stats_since(1)
-            s["last_24h"] = store.stats_since(24)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        # ``last_hour``/``last_24h`` are SUPPLEMENTARY window tiles. Each is its
+        # own @_retry_on_lock call; before this split, a transient retry-
+        # exhaustion on EITHER of these blanked the entire /api/stats payload
+        # with a 500 — the whole dashboard went dark over a slow supplementary
+        # count while the core gauge was perfectly healthy. Degrade them
+        # independently: keep the keys present (so a client doing ``s.last_hour``
+        # gets null, never an undefined-property crash) and flag ``degraded``.
+        degraded = False
+        for key, hours in (("last_hour", 1), ("last_24h", 24)):
+            try:
+                s[key] = store.stats_since(hours)
+            except Exception:
+                s[key] = None
+                degraded = True
+        if degraded:
+            s["degraded"] = True
+        try:
             trends = _read_json(BASE_DIR / "data" / "sentiment_trends.json")
             if trends:
                 s["trends_as_of"] = trends.get("as_of")
                 s["trends_tracked"] = len(trends.get("tickers", {}))
-            return jsonify(s)
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+        except Exception:
+            pass
+        return jsonify(s)
 
     @app.get("/api/trends")
     def api_trends():
