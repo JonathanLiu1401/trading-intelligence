@@ -860,6 +860,20 @@ def _append_scorer_skill_log(status: str, cycle: int,
                 parsed["train_n"] = int(n_train_hint)
             except (TypeError, ValueError):
                 pass
+        # Is the gate acting on the architecture the source endorses?
+        # `deploy_audit.is_deploy_stale` compares the just-(re)written
+        # pickle's fitted-model hyper-params against decision_scorer.
+        # MLP_CONFIG: True ⇒ the running loop predates the anti-overfit
+        # retune and is gating real conviction on the memorizing net (the
+        # single most-repeated documented finding); False ⇒ the deployed net
+        # matches source; None ⇒ unknowable (no pickle / lstsq fallback /
+        # unreadable). Best-effort — never raises (a ledger field must not
+        # break the loop, same discipline as the rest of this function).
+        try:
+            from paper_trader.ml.deploy_audit import is_deploy_stale
+            deploy_stale = is_deploy_stale()
+        except Exception:
+            deploy_stale = None
         row = {
             "cycle": cycle,
             "timestamp": _now(),
@@ -869,6 +883,8 @@ def _append_scorer_skill_log(status: str, cycle: int,
             # the pickle: the gate engages only at train_n >= 500 (#5).
             "gate_active": (parsed.get("train_n") is not None
                             and parsed["train_n"] >= 500),
+            # True ⇒ gate is live on a stale (pre-retune) net — see above.
+            "deploy_stale": deploy_stale,
             **parsed,
         }
         SCORER_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
