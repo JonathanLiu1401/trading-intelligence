@@ -1,5 +1,6 @@
 """Bloomberg Terminal-style briefing — Claude Opus 4.7 via CLI."""
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from core.claude_cli import claude_call
 # Reuse the *single* well-tested headline-canonicalisation primitive
@@ -265,6 +266,51 @@ def _now_utc_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _seen_utc_str(first_seen) -> str | None:
+    """Compact ``HH:MM`` UTC clock time the article hit our wire, or ``None``.
+
+    ``SYSTEM_PROMPT``'s TOP SIGNALS line asks Opus for ``[HH:MM] [score]
+    [TICKER] headline`` per signal, but ``_build_payload`` historically fed
+    zero per-article time data — so Opus had to fabricate or omit every
+    timestamp on the analyst's primary digest. This surfaces the real one.
+
+    ``first_seen`` (collection instant, ISO-8601 written by
+    ``article_store.insert_batch``) is used rather than ``published``: it is
+    what ``get_top_for_briefing`` already returns in the row dict (no
+    storage-layer change), and "when this hit our desk" is the relevant clock
+    for a newswire digest. ``get_top_for_briefing`` already clamps every real
+    row to the last 24h via ``_published_older_than``, and the briefing header
+    carries the date — so a bare ``HH:MM`` is unambiguous, no date needed.
+
+    RFC822 + ISO (``Z``-suffix tolerated), naive→UTC — the exact convention
+    ``alert_agent._article_age_hours`` / ``urgency_scorer`` use, so the time
+    shown here is consistent with the rest of the pipeline. ``None`` (unparseable
+    or absent) makes the caller omit the token silently — the synthetic
+    PORTFOLIO/OPTIONS snapshot rows the daemon prepends carry no ``first_seen``
+    and must pass through cleanly (never a fabricated ``00:00``).
+    """
+    if not first_seen:
+        return None
+    raw = str(first_seen).strip()
+    if not raw:
+        return None
+    dt = None
+    try:
+        dt = parsedate_to_datetime(raw)
+    except Exception:
+        dt = None
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%H:%M")
+
+
 def _fmt_ticker(s):
     # Keep the price column at width=11 ("$" + 10-char number) and pct column at
     # width=8 (signed 7-char number + "%") so N/A rows don't break alignment.
@@ -308,8 +354,14 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None):
             # surface it verbatim so Opus can weight a 6-wire story over a
             # lone mention in TOP SIGNALS / LEAD.
             tag = f" [syndicated x{corro}]" if corro > 1 else ""
+            # Real wire-arrival clock so Opus fills the SYSTEM_PROMPT
+            # TOP SIGNALS "[HH:MM]" slot from data, not invention. Omitted
+            # for the synthetic PORTFOLIO/OPTIONS snapshot rows (no
+            # first_seen) — see _seen_utc_str.
+            seen = _seen_utc_str(a.get("first_seen"))
+            seen_tag = f" [seen {seen} UTC]" if seen else ""
             parts.append(
-                f"{i:>2}. [score={score}]{tag} [{a.get('source','?')}] {a.get('title','')}\n"
+                f"{i:>2}. [score={score}]{seen_tag}{tag} [{a.get('source','?')}] {a.get('title','')}\n"
                 f"    {(a.get('summary') or '')[:300]}"
             )
 
