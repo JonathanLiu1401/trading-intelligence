@@ -88,16 +88,28 @@ def _finite(v):
 
 
 def _equity_risk(curve) -> dict:
-    """Max drawdown %, annualised Sharpe-equivalent, and %-time-underwater
-    from an equity curve (list of ``{"value": ...}`` points).
+    """Max drawdown %, annualised Sharpe-equivalent, %-time-underwater,
+    annualised Sortino, and Calmar from an equity curve (list of
+    ``{"value": ...}`` points).
 
-    Returns ``{max_drawdown_pct, sharpe, pct_time_underwater}`` with
-    ``None`` for any metric that cannot be computed (too few points, a
-    flat series, non-positive values). Never raises — a malformed curve
-    degrades to all-``None`` so the return aggregates still stand.
+    Returns ``{max_drawdown_pct, sharpe, pct_time_underwater, sortino,
+    calmar}`` with ``None`` for any metric that cannot be computed (too
+    few points, a flat series, non-positive values, no measurable
+    downside / drawdown). Never raises — a malformed curve degrades to
+    all-``None`` so the return aggregates still stand.
+
+    Why Sortino + Calmar (2026-05-18). Sharpe divides excess return by
+    *total* volatility, so it penalises a persona for the large UPSIDE
+    variance leveraged ETFs are bought for — exactly the wrong lens for
+    this book (AGENTS.md "leveraged-beta dispersion through a cherry-able
+    bull window"). Sortino divides by downside deviation only; Calmar by
+    the single worst peak→trough loss the persona actually inflicted —
+    the two metrics that separate a smooth leveraged compounder from a
+    lucky volatile rip. Both share Sharpe's 252-day annualisation base
+    and its degenerate-→-``None`` discipline.
     """
     out = {"max_drawdown_pct": None, "sharpe": None,
-           "pct_time_underwater": None}
+           "pct_time_underwater": None, "sortino": None, "calmar": None}
     try:
         vals = []
         for p in curve or []:
@@ -141,13 +153,44 @@ def _equity_risk(curve) -> dict:
             # dominate the per-persona median. Any equity curve with genuine
             # daily variance has std ≫ 1e-9; the floor cleanly separates a
             # degenerate series (→ Sharpe undefined) from a real one.
+            mean_r = float(arr.mean())
             if sd > 1e-9:
-                sharpe = float(arr.mean()) / sd * np.sqrt(_TRADING_DAYS_PER_YEAR)
+                sharpe = mean_r / sd * np.sqrt(_TRADING_DAYS_PER_YEAR)
                 if np.isfinite(sharpe):
                     out["sharpe"] = round(sharpe, 4)
+            # Sortino: Sharpe's downside-only sibling. Downside deviation
+            # is the MAR=0 convention sqrt(mean(min(r,0)^2)) over ALL
+            # observations (not the std of just the negative subset), so a
+            # persona with zero realised downside has an UNDEFINED Sortino
+            # → None, exactly parallel to the zero-std Sharpe None case
+            # (an "infinite" ratio must not silently dominate the
+            # per-persona median). Same 1e-9 degenerate floor as Sharpe.
+            downside = np.minimum(arr, 0.0)
+            dd_dev = float(np.sqrt(np.mean(downside ** 2)))
+            if dd_dev > 1e-9:
+                sortino = mean_r / dd_dev * np.sqrt(_TRADING_DAYS_PER_YEAR)
+                if np.isfinite(sortino):
+                    out["sortino"] = round(sortino, 4)
+
+        # Calmar: annualised return / worst peak→trough drawdown. Uses the
+        # UNROUNDED `max_dd` fraction for precision. Undefined (None) when
+        # there was no drawdown to divide by, the start value is
+        # non-positive, or the curve lost everything (growth ≤ 0 — a real
+        # power is undefined) — the same degenerate-→-None discipline as
+        # Sharpe/Sortino. 252-day annualisation matches Sharpe so the three
+        # ratios share one time base.
+        if max_dd > 1e-9 and vals[0] > 0:
+            growth = vals[-1] / vals[0]
+            years = (len(vals) - 1) / _TRADING_DAYS_PER_YEAR
+            if growth > 0 and years > 0:
+                ann_return = growth ** (1.0 / years) - 1.0
+                calmar = ann_return / max_dd
+                if np.isfinite(calmar):
+                    out["calmar"] = round(calmar, 4)
     except Exception:
         return {"max_drawdown_pct": None, "sharpe": None,
-                "pct_time_underwater": None}
+                "pct_time_underwater": None, "sortino": None,
+                "calmar": None}
     return out
 
 
@@ -171,7 +214,8 @@ def persona_leaderboard(runs) -> dict:
     Returns a JSON-safe dict:
     ``{status, verdict, n_runs, n_personas, leaderboard:[{persona, n,
        median_vs_spy, mean_vs_spy, median_return, win_rate, median_sharpe,
-       median_max_drawdown_pct, median_pct_time_underwater, verdict}],
+       median_sortino, median_max_drawdown_pct, median_calmar,
+       median_pct_time_underwater, verdict}],
        drag_personas:[...], hint}``. The ``leaderboard`` is sorted by
     ``median_vs_spy`` descending (``INSUFFICIENT`` personas last).
     """
@@ -192,7 +236,8 @@ def persona_leaderboard(runs) -> dict:
         n_qualifying += 1
         b = buckets.setdefault(
             persona,
-            {"vs": [], "ret": [], "sharpe": [], "mdd": [], "uw": []},
+            {"vs": [], "ret": [], "sharpe": [], "mdd": [], "uw": [],
+             "sortino": [], "calmar": []},
         )
         b["vs"].append(vs)
         tr = _finite(r.get("total_return_pct"))
@@ -205,6 +250,10 @@ def persona_leaderboard(runs) -> dict:
             b["mdd"].append(risk["max_drawdown_pct"])
         if risk["pct_time_underwater"] is not None:
             b["uw"].append(risk["pct_time_underwater"])
+        if risk["sortino"] is not None:
+            b["sortino"].append(risk["sortino"])
+        if risk["calmar"] is not None:
+            b["calmar"].append(risk["calmar"])
 
     if n_qualifying < MIN_RECORDS:
         return {
@@ -242,7 +291,9 @@ def persona_leaderboard(runs) -> dict:
             "median_return": _median_opt(b["ret"]),
             "win_rate": win_rate,
             "median_sharpe": _median_opt(b["sharpe"]),
+            "median_sortino": _median_opt(b["sortino"]),
             "median_max_drawdown_pct": _median_opt(b["mdd"]),
+            "median_calmar": _median_opt(b["calmar"]),
             "median_pct_time_underwater": _median_opt(b["uw"]),
             "verdict": verdict,
         })
@@ -331,8 +382,8 @@ def _cli() -> int:
     print(f"VERDICT: {rep['verdict']}  ({rep['hint']})")
     if rep["leaderboard"]:
         print(f"  {'persona':<34} {'n':>3} {'med_vs':>8} {'mean_vs':>9} "
-              f"{'win%':>6} {'med_ret':>9} {'sharpe':>7} {'maxDD%':>7} "
-              f"{'uw%':>6}  verdict")
+              f"{'win%':>6} {'med_ret':>9} {'sharpe':>7} {'sortino':>8} "
+              f"{'maxDD%':>7} {'calmar':>7} {'uw%':>6}  verdict")
         for e in rep["leaderboard"]:
             def _f(v, w=8, p=1):
                 return f"{'n/a':>{w}}" if v is None else f"{v:>{w}.{p}f}"
@@ -340,7 +391,9 @@ def _cli() -> int:
                   f"{_f(e['median_vs_spy'])} {_f(e['mean_vs_spy'],9)} "
                   f"{e['win_rate']*100:>5.0f}% {_f(e['median_return'],9)} "
                   f"{_f(e['median_sharpe'],7,2)} "
+                  f"{_f(e['median_sortino'],8,2)} "
                   f"{_f(e['median_max_drawdown_pct'],7)} "
+                  f"{_f(e['median_calmar'],7,2)} "
                   f"{_f(e['median_pct_time_underwater'],5,0)}%  "
                   f"{e['verdict']}")
     return 0 if rep["verdict"] in ("HEALTHY", "INSUFFICIENT_DATA") else 2
