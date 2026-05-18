@@ -532,4 +532,11 @@ Constants and code live in `paper_trader/strategy.py`: `ML_QUALIFY_MIN_RUNS`,
 
 ---
 
-*Last revised: 2026-05-16*
+> **2026-05-18 ops session:** dashboard cosmetics (`b49114c`), continuous-backtest
+> throttle (`bf23133`), git-watcher deferred restart (`cf516c0`), `/api/stats`
+> fast path (`5265d8e`), and stale-code service restarts. Full context, service
+> commands, and the outstanding NO_DECISION/load to-do are in
+> `AGENTS.md` → "2026-05-18 ops session". This system reference is otherwise
+> unchanged.
+
+*Last revised: 2026-05-18*
