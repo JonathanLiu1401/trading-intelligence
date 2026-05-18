@@ -7246,6 +7246,30 @@ def earnings_risk_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/event-calendar")
+def event_calendar_api():
+    """The exact upcoming-earnings awareness block the live trader now sees
+    in its decision prompt (the `risk_mirror` / `tail_risk` prompt↔endpoint
+    parity discipline). Reads digital-intern's `earnings_calendar.json`
+    snapshot directly from disk — no `:8080` hop — and tiers it against the
+    held book + watchlist exactly as `/api/earnings-risk` does (single source
+    of truth, AGENTS.md #10). Observational only; never gates Opus."""
+    try:
+        from .analytics.event_calendar import build_event_calendar
+        store = get_store()
+        positions = store.open_positions()
+        try:
+            from .strategy import WATCHLIST as _WATCHLIST
+            watch = {t.upper() for t in _WATCHLIST}
+        except Exception:
+            watch = set()
+        held = {(p.get("ticker") or "").upper()
+                for p in positions if p.get("ticker")}
+        return jsonify(build_event_calendar(positions, held | watch))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ───────── Feature-dev additions (2026-05-15, agent 4) ─────────
 # /api/scorer-confidence — empirical ± bands + directional hit-rate for the
 #                          DecisionScorer, so its point predictions can be
