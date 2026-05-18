@@ -3990,3 +3990,115 @@ two-entries-per-number convention, e.g. the dual #11/#14 passes.)*
   baseline-ledger wiring lock.
 
 *Review pass #17 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+## Review pass #17 — paper-trader CORE hybrid (2026-05-18)
+
+**bugs_fixed = 1 · features_added = 1 · user_findings = 3.** Full suite is
+not run end-to-end here (it times out >400s under concurrent sibling-agent
+pytest load); a bounded representative sweep of every touched + adjacent
+module is the evidence: **312 green** across `test_runner_heartbeat`,
+`test_decision_context{,_endpoint}`, `test_sector_exposure{,_endpoint}`,
+`test_core_runner`, `test_core_strategy`, `test_core_reporter`,
+`test_decision_forensics`, `test_core_dashboard_helpers`.
+
+- **Phase 1 — bug (`6cfcf46`, this agent's own clean commit).
+  `analytics/decision_context.py` silently dropped the
+  `sector_exposure_block`.** Commit `b471188` added `sector_exposure_block`
+  to `strategy._build_payload` + wired it into the live `decide()` call but
+  never updated `decision_context.py` — so `/api/decision-context` (and the
+  CLI) reconstructed a prompt **missing the entire SECTOR EXPOSURE block**
+  while its docstring still promised a string "byte-identical to the live
+  prompt given identical inputs". A trader auditing *"did Opus see that
+  this BUY piles onto an already-61%-semis book?"* got a false NO. **This
+  is the exact `event_calendar`/`buying_power` regression class closed in
+  pass #16, reintroduced one block later** — the recurring failure mode is
+  "a new advisory block is threaded into `decide()`→`_build_payload` but
+  the parallel `decision_context.assemble_inputs`/`build_decision_context`
+  reconstruction is forgotten". `assemble_inputs` now builds
+  `sector_exposure_block` exactly as `decide()` does (same read-only
+  snapshot + lean `_names_in_play` set); `build_decision_context` threads
+  it through `_build_payload` (which owns render order, so byte-fidelity is
+  preserved) and reports it in `advisory_blocks` + the CLI summary. Locked
+  by `tests/test_decision_context.py`
+  (`TestNewAdvisoryBlocksReachPrompt::test_sector_exposure_block_reaches_prompt_verbatim_and_flagged`
+  — verbatim text + flag + the exact `risk<sector<event<bp<WATCHLIST`
+  ordering; `test_advisory_block_flags`/`…_omitted` updated to the
+  now-7-key dict) and `tests/test_decision_context_endpoint.py`
+  (`test_sector_exposure_block_reaches_reconstructed_prompt` — end-to-end
+  via `assemble_inputs`). **Guidance for the next agent: any future
+  `_build_payload` advisory block MUST be added to `decision_context.py`
+  in the same commit — there is now a 3rd instance of this exact bug
+  class; treat it as a standing checklist item.**
+
+- **Phase 2 — feature. `runner_heartbeat` NO_DECISION-storm awareness so a
+  brain-dead loop is no longer flat green** (this agent's code, swept into
+  `4bd6610` by the auto-push daemon — muddied attribution, content verified
+  on `origin/master` by symbol grep, the pass-#16 shared-index-race reality
+  accepted not fought). `build_runner_heartbeat` measured only loop
+  *cadence* (`now − last_decision_ts`); a loop cycling perfectly on
+  schedule but emitting `NO_DECISION` every cycle — the documented live
+  regime — reported `HEALTHY … restart_recommended:false`. The heartbeat
+  is the surface a trader checks **first**, so it was actively reassuring
+  them while the engine was wedged, suppressing the exact restart signal
+  the runner's own auto-recovery breaker fires on. Additive overlay: the
+  endpoint now passes `recent_actions` (`store.recent_decisions(20)`
+  newest-first — the thesis_drift network/builder split); the builder
+  computes a `decision_efficacy` sub-block (`PRODUCING`/`DEGRADED`/
+  `IDLE_STORM`/`NO_DATA`) and on a genuine idle-storm
+  (`>= NO_DECISION_STORM_THRESHOLD=5` consecutive — mirrors
+  `runner.CONSECUTIVE_NO_DECISION_LIMIT`, drift-locked by test) folds it
+  into the top-level `headline` + `restart_recommended`. **The liveness
+  `verdict` enum is deliberately untouched** (the documented
+  liveness/efficacy separation; every verdict-string lock stays green) and
+  omitting `recent_actions` is **byte-identical** to before. The
+  NO_DECISION predicate is a drift-locked verbatim mirror of the canonical
+  `decision_forensics._is_no_decision` (invariant #10), inlined to keep
+  this endpoint-path leaf import-cycle-free (the `OPEN_INTERVAL_S`
+  precedent). 12 new tests in `tests/test_runner_heartbeat.py`.
+
+- **Phase 3 — live findings (validated on the running `:8090` /
+  pid-1819043 trader; both Phase-1 & Phase-2 changes confirmed *deployed*
+  — git-watcher rebooted the runner onto the new SHA, `build-info`
+  `stale:false`).**
+  1. **Live IDLE_STORM, ongoing (HIGH).** `/api/runner-heartbeat`
+     (now, via the Phase-2 feature) reports
+     `decision_efficacy:IDLE_STORM consecutive_no_decision:17 (95% of
+     last 20) restart_recommended:true` — and the last *FILLED* trade was
+     `2026-05-17T09:38 BUY MU`, **>24h ago**, while the book is ~98%
+     deployed in MU/LITE. Involuntary alpha bleed, real and current. Root
+     cause is the documented host-load timeout storm (CLAUDE.md §11)
+     **aggravated by git-watcher restart-thrash**: with N sibling agents
+     committing every few minutes this session, the deferred-restart
+     watcher bounces the runner repeatedly, and each restart abandons the
+     in-flight Opus call mid-cycle. Not a code-fixable defect (host/ops
+     lever) — but pass #17's Phase-2 is precisely what makes it *visible*
+     instead of a lying green light.
+  2. **Runner relaunch-and-refuse churn (MEDIUM, ops).** `logs/runner.log`
+     shows ~49 `refusing to start a second trader` lines per 200 — the
+     single-instance guard (invariant #19) is working **correctly** (exactly
+     one trading pid 1819043 holds the flock; **no double-trade**), but a
+     supervisor keeps attempting relaunches in the restart gaps. Confirms
+     the pass-#16 "unsupervised / externally relaunched" ops state, still
+     present. Reported, not fixed — touching the systemd unit / live
+     process is out of scope and high-risk for a code pass.
+  3. **Positive validation (LOW).** `/api/decision-context` now serves
+     `advisory_blocks.sector_exposure:true` and `"SECTOR EXPOSURE"` is in
+     the reconstructed prompt (7/7 blocks; the Phase-1 fix is live, proven
+     via both the endpoint and the `__main__` CLI). All probed endpoints
+     sub-100ms (`/` 0.035s, `/api/state` 0.004s, `/api/risk` 0.002s,
+     `/api/sector-exposure` 0.002s, `/api/scorecard` 0.059s — SWR
+     healthy); Discord delivery `notify:HEALTHY`. The data/dashboard layer
+     is operationally sound; the system's real problem is finding #1.
+
+- **Run the core suite (bounded, the full one times out under concurrent
+  load):** `cd /home/zeph/trading-intelligence/paper-trader && python3 -m
+  pytest tests/test_runner_heartbeat.py tests/test_decision_context.py
+  tests/test_decision_context_endpoint.py tests/test_sector_exposure.py
+  tests/test_sector_exposure_endpoint.py tests/test_core_runner.py
+  tests/test_core_strategy.py tests/test_core_reporter.py
+  tests/test_decision_forensics.py tests/test_core_dashboard_helpers.py -q`
+  (312 green).
+
+*Review pass #17 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
