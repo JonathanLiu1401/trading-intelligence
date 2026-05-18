@@ -207,9 +207,18 @@ def _worker_liveness_deadline(name: str) -> float:
         return float(LIVENESS_FLOOR_SECS)
     return max(float(LIVENESS_FLOOR_SECS), LIVENESS_MULTIPLIER * float(interval))
 
+_shutdown_signal = 0  # set by _handle_signal, logged from the main thread
+
 def _handle_signal(sig, frame):
-    global _running
-    log.info(f"Signal {sig} — shutting down")
+    # Async-signal-safe ONLY. Do NOT call logging here: the signal can land
+    # mid-write inside a log handler's BufferedWriter, and re-entering logging
+    # from the handler raises "RuntimeError: reentrant call inside
+    # <_io.BufferedWriter>", which crashed the shutdown path and pushed the
+    # service onto the SIGTERM-timeout -> SIGKILL escalation (orphaned flock
+    # holder + sqlite corruption risk). Only touch module globals here; the
+    # main supervisor thread logs the signal once it observes the flag.
+    global _running, _shutdown_signal
+    _shutdown_signal = sig
     _running = False
 
 signal.signal(signal.SIGTERM, _handle_signal)
@@ -1153,6 +1162,8 @@ def ml_trainer_worker(store: ArticleStore):
     log.info("[ml_trainer] started")
     # Bootstrap on first run
     _sleep(30)  # let collectors gather some data first
+    if not _running:
+        return
     try:
         log.info("[ml_trainer] Running initial bootstrap training...")
         metrics = ml_train(store)
@@ -1201,9 +1212,18 @@ def ml_trainer_worker(store: ArticleStore):
 def continuous_trainer_worker(store: ArticleStore):
     log.info("[continuous_trainer] started")
     _sleep(45)  # let full trainer bootstrap first
+
+    # A single pass (data-load + 40-epoch fit) can legitimately run >900s
+    # under GPU contention — longer than the supervisor's staleness deadline.
+    # Without an in-flight ping the worker only reports healthy when the pass
+    # *returns*, so a slow-but-working pass gets false-flagged DEAD. Hand
+    # train_continuous a heartbeat it calls after data-load and per-epoch.
+    def _heartbeat():
+        _worker_last_ok["continuous_trainer"] = time.time()
+
     while _running:
         try:
-            metrics = train_continuous(store)
+            metrics = train_continuous(store, heartbeat=_heartbeat)
             if metrics.get("status") == "skipped":
                 log.debug(f"[continuous_trainer] skipped: {metrics.get('reason')} n={metrics.get('n')}")
             else:
@@ -1844,7 +1864,14 @@ def _acquire_singleton_lock():
     import fcntl
     lock_path = BASE_DIR / "data" / "daemon.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    # O_CLOEXEC is critical: ml/trainer.py runs training in a multiprocessing
+    # "spawn" child (fork+exec). Without close-on-exec, that child inherits and
+    # holds this flock. When the daemon main process hard-exits via os._exit(0)
+    # on SIGTERM, the kernel does NOT release the flock until the orphaned
+    # spawn child also exits — so the next instance sees the lock "held by
+    # pid=<dead main>", SIGTERMs a corpse, then stalls 20-30s polling the
+    # flock. That stall is a primary driver of the restart flap.
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -1972,6 +1999,8 @@ def main():
             # Graceful shutdown in progress — worker threads are exiting cleanly
             # as their own loops observe _running=False. Logging them as "died"
             # at ERROR pollutes the error count for hourly audits.
+            # Safe to log here: normal thread context, not a signal handler.
+            log.info(f"Signal {_shutdown_signal} — shutting down")
             break
         now = time.time()
 
