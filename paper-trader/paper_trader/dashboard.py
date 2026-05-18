@@ -6428,6 +6428,8 @@ def analytics_api():
         # option legs of the same ticker stay distinct. pnl_usd is rounded to
         # 4dp there; the win/loss split below uses strict `> 0`, so a sub-cent
         # rounding artefact reads as a non-win (pinned by test_round_trips).
+        from .analytics.drawdown import compute_drawdown
+        from .analytics.recovery import build_recovery
         from .analytics.round_trips import build_round_trips
         from .analytics.stress_scenarios import build_stress_scenarios
         from .analytics.tail_risk import build_tail_risk
@@ -6519,6 +6521,12 @@ def analytics_api():
                 daily_pl = round(cur_val - open_val, 2)
                 daily_pl_pct = round(daily_pl / open_val * 100, 2)
 
+        # Compute the tail-risk + drawdown SSOT objects ONCE so the
+        # tail_risk and recovery folds below share the exact same inputs
+        # /api/recovery does (no double-compute, no cross-fold drift).
+        _tr = build_tail_risk(eq)
+        _dd = compute_drawdown(eq, positions, starting_equity=INITIAL_CASH)
+
         payload = {
             "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "total_value": round(total_value, 2),
@@ -6547,7 +6555,17 @@ def analytics_api():
             # whole-dict equality — so the digital-intern analyst chat
             # (which fetches /api/analytics) inherits VaR/CVaR/skew for
             # free. eq is the same day-resampled series used above.
-            "tail_risk": build_tail_risk(eq),
+            "tail_risk": _tr,
+            # Forward "path back to even": per-position breakeven + the book
+            # rally to the $1000 start / high-water peak, scaled by THIS
+            # book's own realized daily vol. Additive top-level key (keyed
+            # asserts, not whole-dict equality) so the digital-intern analyst
+            # chat that fetches /api/analytics inherits it for free. Composed
+            # from the SAME _dd/_tr objects the endpoint uses — no drift
+            # (AGENTS.md #10): the recovery fold and /api/recovery cannot
+            # disagree because both consume one compute_drawdown + one
+            # build_tail_risk per request.
+            "recovery": build_recovery(_dd, _tr, INITIAL_CASH),
             # Forward beta/concentration shock — the day-one complement to
             # tail_risk above (which reads INSUFFICIENT on a young book).
             # Additive top-level key (test_stress_scenarios uses keyed
@@ -6635,6 +6653,39 @@ def tail_risk_api():
         from .analytics.tail_risk import build_tail_risk
         store = get_store()
         result = build_tail_risk(store.equity_curve(5000))
+        mt = _mark_trust_block(store)
+        if mt is not None:
+            result["mark_trust"] = mt
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/recovery")
+def recovery_api():
+    """Path back to even: per-position breakeven %/$ + the book rally
+    required to return to the $1000 start and the running high-water peak,
+    scaled by this book's own realized daily volatility.
+
+    The *forward* complement to /api/drawdown (which owns the *backward*
+    "% of trough clawed back"). Composes ``compute_drawdown`` (current/peak
+    + per-lot P&L SSOT) and ``build_tail_risk`` (realized-vol SSOT) verbatim
+    — a drift fails the no-drift test. The σ figure is a dispersion scale,
+    not a time forecast, and is withheld until tail_risk reads OK (the
+    young-book honesty precedent). Pure & DB-only — no network (the
+    ``drawdown``/``tail_risk`` builder/endpoint split); ``initial_equity``
+    is the module ``INITIAL_CASH`` (invariant #12, never a literal 1000).
+    Observational only — never gates Opus, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.drawdown import compute_drawdown
+        from .analytics.recovery import build_recovery
+        from .analytics.tail_risk import build_tail_risk
+        store = get_store()
+        eq = store.equity_curve(limit=2000)
+        positions = store.open_positions()
+        dd = compute_drawdown(eq, positions, starting_equity=INITIAL_CASH)
+        tr = build_tail_risk(eq)
+        result = build_recovery(dd, tr, INITIAL_CASH)
         mt = _mark_trust_block(store)
         if mt is not None:
             result["mark_trust"] = mt

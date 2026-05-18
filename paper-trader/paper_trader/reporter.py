@@ -660,6 +660,49 @@ def _stress_line(store) -> str:
         return ""
 
 
+def _recovery_line(store) -> str:
+    """One-line "what does it take to get back to even?" for the hourly /
+    daily report.
+
+    ``/api/drawdown`` owns the *backward* "% of trough clawed back";
+    nothing told the operator — who lives in Discord — the *forward*
+    rally required to return to the $1000 start (the baseline every P/L
+    line here is measured against) and the high-water peak, per name and
+    for the book. ``build_recovery`` answers exactly that, scaled by THIS
+    book's own realized daily vol (withheld until ``tail_risk`` reads OK
+    — the young-book honesty precedent).
+
+    Composes ``build_recovery`` over ``compute_drawdown`` +
+    ``build_tail_risk`` **verbatim** (single source of truth, AGENTS.md
+    invariant #10 — the headline is the builder's, never re-derived, so
+    this Discord line, ``/api/recovery`` and the ``/api/analytics``
+    ``recovery`` fold can never drift). **Pure store reads only — NO
+    network** (the Discord-path discipline; the ``_stress_line`` /
+    ``_drawdown_line`` precedent). Observational only, no caps, never
+    gates (invariants #2/#12). Failure contract: any builder/store fault
+    → ``""`` ("no recovery line this report"), **never** an exception
+    ("no Discord summary this report"). ``NO_DATA`` (no priced book) and
+    ``ABOVE_WATER`` (already at/above the start — nothing to recover) are
+    suppressed (the ``_drawdown_line`` at-high-water precedent — the
+    summary must never become its own lying green light)."""
+    try:
+        from .analytics.drawdown import compute_drawdown
+        from .analytics.recovery import build_recovery
+        from .analytics.tail_risk import build_tail_risk
+        eq = store.equity_curve(limit=2000)
+        dd = compute_drawdown(eq, store.open_positions(),
+                              starting_equity=_INITIAL_EQUITY)
+        rec = build_recovery(dd, build_tail_risk(eq), _INITIAL_EQUITY)
+        if (not isinstance(rec, dict)
+                or rec.get("state") in (None, "NO_DATA", "ABOVE_WATER")):
+            return ""
+        return ("**RECOVERY** ◈ the rally back to even\n"
+                f"{rec['headline']}")
+    except Exception as e:
+        print(f"[reporter] recovery line skipped: {e}")
+        return ""
+
+
 def _capital_pulse_line(store) -> str:
     """One-line "is the desk capital-paralysed right now?" for the hourly /
     daily report.
@@ -1342,6 +1385,9 @@ def send_hourly_summary() -> bool:
     stx = _stress_line(store)
     if stx:
         body += "\n" + stx
+    rcx = _recovery_line(store)
+    if rcx:
+        body += "\n" + rcx
     hp = _host_pulse_line()
     if hp:
         body += "\n" + hp
@@ -1433,6 +1479,9 @@ def send_daily_close() -> bool:
     stx = _stress_line(store)
     if stx:
         body += "\n" + stx
+    rcx = _recovery_line(store)
+    if rcx:
+        body += "\n" + rcx
     hp = _host_pulse_line()
     if hp:
         body += "\n" + hp
