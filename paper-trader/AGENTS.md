@@ -4737,3 +4737,110 @@ staged-diff verified, and pushed fast-forward onto `origin/master`.
   `TestCapitalParalysisSwr` are the new pass-#19 locks.
 
 *Review pass #19 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+## Review pass #20 — paper-trader core hybrid (2026-05-18)
+
+Repo HEAD cycled `b387414`→`542446d`→`d888261` during the session (this
+pass's two commits, plus auto-commit-daemon / concurrent-agent churn — at
+least three other `claude --model claude-opus-4-7` review agents were live
+on the same tree; verify attribution by **content** on `origin/master`, not
+by message — the recurring pass-#18/#19 concern).
+
+- **Phase 1 — bug fixed (1): `_swr_prewarm` omitted 6 of 22 `@swr_cached`
+  endpoints (`542446d`).** `dashboard._swr_prewarm`'s docstring promises it
+  pre-builds *"every slow SWR cache once at boot"*, but its `targets` list
+  carried only 16 of the 22 `@swr_cached` endpoints. The 6 omitted —
+  `risk`, `benchmark`, `capital-paralysis`, `decision-health`,
+  `runner-heartbeat`, `scorer-confidence` (the first four SWR-wrapped in the
+  immediately-prior commit `9bfbbf8`) — alone paid the full cold path after
+  **every** restart: a bounded stall then `{"warming": true}`, real data
+  only on the frontend's next auto-refresh poll. Five of them are precisely
+  the panels a trader opens FIRST to triage "why is the bot frozen?", so the
+  freeze-triage surface was the last to populate — **this directly resolves
+  pass-#19 Phase-3 finding #4**, which observed exactly this on
+  `/api/runner-heartbeat` and explicitly deferred it ("Noted, not fixed — a
+  cold-start prewarm is a larger design question"). Fix adds the 6 tuples +
+  `tests/test_swr_prewarm_coverage.py`, a regression-lock asserting the
+  prewarm list stays `== {@swr_cached names}` so a future SWR-wrapped
+  endpoint can never silently re-rot the contract. Confirmed empirically
+  before/after: `/api/risk` & `/api/runner-heartbeat` resolve on the 2nd
+  poll; all 22 are now prewarmed.
+
+- **Phase 2 — feature added (1): `/api/equity-integrity` — time-series P&L
+  trust audit (`d888261`).** `mark_integrity` answers "is my book stale
+  RIGHT NOW" (point-in-time). Nothing audited the recorded `equity_curve`
+  *over time*, yet `/api/drawdown`, `/api/benchmark`, `/api/analytics`
+  Sharpe and the hourly Discord P/L line are all derived from it — a silent
+  corruption there poisons every P&L surface with nothing saying so. New
+  pure builder `paper_trader/analytics/equity_integrity.py` +
+  `equity_integrity_api` (EOF, lowest-collision insertion point) flags:
+  **NEGATIVE_CASH** (the no-hard-cap book physically over-drawing —
+  AGENTS.md #12), **NONPOSITIVE_EQUITY**, and **SUSPECT** no-trade jumps
+  (|Δtotal|≥8% with no trade in the window — the mismark / stale-price
+  unfreeze / option-settlement signature; a jump *with* a trade in-window is
+  explained away). Pure store reads only (no network → no SWR wrap needed);
+  advisory/read-only, gates nothing, adds no caps (the `mark_integrity`
+  contract). 10 tests assert exact verdicts/values incl. the half-open
+  `(lo, hi]` window boundary and the never-raises-on-garbage degrade.
+  Verified live: **CLEAN across 787 points, min cash $2.61** — confirms the
+  no-cap book has never over-drawn and the P&L history is trustworthy.
+
+- **Phase 3 — live findings (running `:8090`, runner orphan PID 1866235
+  on current code).**
+  1. **Runner is an UNSUPERVISED ORPHAN (HIGH, ops, not code-fixable).**
+     `journalctl --user -u paper-trader`: the systemd unit *failed* at
+     01:46 (`status=1/FAILURE`, the invariant-#19 guard correctly refused
+     to start while an older manual launch held the lock) and stayed
+     **inactive/disabled**. The live trader is a bare `python3 runner.py`
+     with PPID 1. `/api/supervision` correctly returns
+     `verdict=UNSUPERVISED orphan=True`. The git-watcher's whole
+     deferred-restart/deadman design relies on `systemd Restart=always`;
+     with the unit down, the **next** git-watcher restart or deadman
+     `os._exit(0)` (and commits keep landing, so it *will* fire) leaves the
+     trader permanently DOWN. Operator action: `systemctl --user enable
+     --now paper-trader` once the orphan is stopped.
+  2. **Live trader frozen — IDLE_STORM (HIGH, host-saturation, not a
+     code/prompt bug).** 60% lifetime `NO_DECISION` (473/785); the current
+     ongoing `PARALYSIS` drought is 24.9h / 73 cycles / 53 `NO_DECISION`
+     (`/api/decision-drought`). Last real fill `2026-05-17T09:38 BUY MU`
+     (>26h ago). `/api/runner-heartbeat`: liveness `HEALTHY` but
+     `decision_efficacy=IDLE_STORM`, `restart_recommended=true` (the
+     instrumentation is correct). Root cause is the documented host
+     starvation: load avg 13–21, ~356 MB free RAM, with 4+ concurrent
+     `claude --model claude-opus-4-7` review agents **plus**
+     `run_continuous_backtests.py` — every live Opus decision call times
+     out (`claude returned no response (timeout/empty)`). The review
+     harness induces the very freeze it observes.
+  3. **Discord delivery seen failing `env: 'node': No such file`
+     (MEDIUM).** `logs/runner.log` (stale, from the 01:46 failed systemd
+     attempts) shows the documented openclaw shebang/PATH outage —
+     operator's primary surface was dark for those attempts. `reporter._send`
+     already has the `bin_dir`-onto-PATH fix; the current orphan is on
+     patched code, but Discord health for the orphan could not be confirmed
+     (it logs to a detached stdout; the unit journal is empty). Watch
+     `notify_health.restart_recommended`.
+  4. **Capital paralysis persists (HIGH, host/ops, correctly surfaced).**
+     `/api/state` cash $18.49 / total $972.69 (~98% deployed); LITE held
+     3.7d at **7.0× the empirical median losing hold**, −$6.21 disposition
+     drag (`/api/hold-discipline`). Documented #1 pathology; instrumentation
+     (`hold-discipline`, `capital-paralysis`, the Discord `_capital_pulse_
+     line`) all fire correctly — nothing to fix in code.
+  5. **`/api/position-thesis` not SWR-wrapped, intermittently slow (LOW).**
+     One probe 200 in 1.56s, an earlier one >12s under the load spike. Not
+     consistently broken; a candidate for the same `swr_cached` treatment
+     the other slow endpoints got. Noted, not fixed (collision risk with
+     concurrent agents; marginal under current load).
+
+- **Run the touched/adjacent locks (bounded — the full suite is ~25 min and
+  load-flakes `test_dashboard_threaded::test_threaded_server_parallelizes`,
+  a pure timing assertion, under load avg >10):** `python3 -m pytest
+  tests/test_swr_prewarm_coverage.py tests/test_equity_integrity.py
+  tests/test_dashboard_swr.py tests/test_mark_integrity.py
+  tests/test_core_dashboard_helpers.py -q`. The pass-#20 locks are
+  `test_swr_prewarm_coverage.py` (prewarm == @swr_cached set, the
+  regression-lock for the fix) and `test_equity_integrity.py` (exact-value
+  verdicts incl. the half-open window boundary).
+
+*Review pass #20 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
