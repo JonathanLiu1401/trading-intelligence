@@ -82,6 +82,7 @@ def build_decision_context(
     self_review_block: str | None = None,
     track_record_block: str | None = None,
     risk_mirror_block: str | None = None,
+    sector_exposure_block: str | None = None,
     ml_opinion_block: str | None = None,
     event_calendar_block: str | None = None,
     buying_power_block: str | None = None,
@@ -93,16 +94,21 @@ def build_decision_context(
     # positional is the *merged* signal list (urgent-not-in-top + top), so we
     # pass merged_signals there — identical to strategy.decide().
     # event_calendar_block (forward earnings) + buying_power_block
-    # (deployable cash) are threaded through here because decide() now passes
-    # BOTH to _build_payload; omitting them silently dropped 2 of 6 advisory
+    # (deployable cash) + sector_exposure_block (live-book sector
+    # concentration) are threaded through here because decide() now passes
+    # ALL THREE to _build_payload; omitting any silently dropped advisory
     # blocks from this "byte-identical reconstruction", so a trader auditing
-    # whether Opus saw the buying-power / earnings awareness got a false NO.
+    # whether Opus saw the buying-power / earnings / sector-concentration
+    # awareness got a false NO. (sector_exposure was added by commit b471188
+    # AFTER the event_calendar/buying_power gap was closed in pass #16 —
+    # the same regression class, reintroduced one block later.)
     payload = strategy._build_payload(
         snapshot, merged_signals, sentiments, watch_prices, futures_prices,
         sp500, market_open, quant_signals=quant_signals,
         self_review_block=self_review_block,
         track_record_block=track_record_block,
         risk_mirror_block=risk_mirror_block,
+        sector_exposure_block=sector_exposure_block,
         event_calendar_block=event_calendar_block,
         buying_power_block=buying_power_block,
     )
@@ -145,6 +151,7 @@ def build_decision_context(
             "self_review": bool(self_review_block),
             "track_record": bool(track_record_block),
             "risk_mirror": bool(risk_mirror_block),
+            "sector_exposure": bool(sector_exposure_block),
             "ml_opinion": bool(ml_opinion_block),
             "event_calendar": bool(event_calendar_block),
             "buying_power": bool(buying_power_block),
@@ -230,6 +237,22 @@ def assemble_inputs(store) -> dict:
     except Exception:
         pass
 
+    # Live-book SECTOR concentration — built EXACTLY as decide() builds it
+    # (same read-only snapshot + the same lean _names_in_play set the
+    # quant / track-record / buying-power blocks use). decide() renders it
+    # after risk_mirror and before event_calendar; _build_payload owns that
+    # ordering so passing it as a kwarg is sufficient for byte-fidelity.
+    sector_exposure_block = None
+    try:
+        from .sector_exposure import build_sector_exposure
+        sector_exposure_block = build_sector_exposure(
+            snap,
+            strategy._names_in_play(
+                snap.get("positions") or [], merged, strategy.WATCHLIST),
+        ).get("prompt_block")
+    except Exception:
+        pass
+
     # Forward scheduled-event awareness — built EXACTLY as decide() builds it
     # (scope = held ∪ the full WATCHLIST, not the lean _names_in_play set —
     # narrowing it would re-blind the reconstruction the same way it would
@@ -285,6 +308,7 @@ def assemble_inputs(store) -> dict:
         self_review_block=self_review_block,
         track_record_block=track_record_block,
         risk_mirror_block=risk_mirror_block,
+        sector_exposure_block=sector_exposure_block,
         ml_opinion_block=ml_opinion_block,
         event_calendar_block=event_calendar_block,
         buying_power_block=buying_power_block,
@@ -314,7 +338,9 @@ if __name__ == "__main__":  # works even when :8090 is wedged (desk_pulse preced
         a = ctx["advisory_blocks"]
         print(f"  blocks: self_review={a['self_review']} "
               f"track_record={a['track_record']} "
-              f"risk_mirror={a['risk_mirror']} ml={a['ml_opinion']} "
+              f"risk_mirror={a['risk_mirror']} "
+              f"sector_exposure={a['sector_exposure']} "
+              f"ml={a['ml_opinion']} "
               f"event_calendar={a['event_calendar']} "
               f"buying_power={a['buying_power']}")
         mi = ctx["mark_integrity"]
