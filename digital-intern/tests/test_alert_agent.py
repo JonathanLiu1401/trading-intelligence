@@ -14,12 +14,20 @@ the store-level isolation tests), never asserted at the agent boundary:
      Sonnet call — otherwise every cycle burns a Claude call and risks posting
      to a ``None`` webhook.
 
-These tests pin the agent's own contract: when it drops a batch it must touch
-neither Claude nor Discord nor the store, and when it sends it must mark
-exactly the alerted ids so the article cannot re-fire. A regression that
-weakens the staleness guard (or removes the webhook check) passes every other
-suite but resurfaces stale alerts in production — exactly the class of bug this
-file exists to catch.
+These tests pin the agent's own contract: a dropped batch must never reach
+Claude or Discord, and when it sends it must mark exactly the alerted ids so
+the article cannot re-fire. A regression that weakens the staleness guard (or
+removes the webhook check) passes every other suite but resurfaces stale alerts
+in production — exactly the class of bug this file exists to catch.
+
+Note the store-touch contract is deliberately asymmetric and mirrors the
+production code: a *noise-suppression* drop (stale / quote-widget /
+low-authority / cross-cycle) MARKS the dropped rows alerted (urgency=2) so they
+exit the urgent queue instead of being re-fetched and re-dropped every 20s
+cycle forever (a stale-by-`published` row only ages further — it can never
+become a valid fresh alert). Only the synthetic-defense-in-depth re-filter and
+the all-unformattable / no-webhook early-outs touch nothing. These tests pin
+that exact split.
 """
 from __future__ import annotations
 
@@ -61,11 +69,21 @@ def _urgency_of(store, aid):
 
 
 class TestStalenessGuard:
-    def test_stale_published_article_is_not_alerted(self, store, monkeypatch):
+    def test_stale_published_article_is_dropped_and_exits_queue(self, store, monkeypatch):
         """A live urgent row whose ``published`` is 72h old is returned by
         ``get_unalerted_urgent`` (its ``first_seen`` is recent) but the agent
-        MUST drop it: no Claude call, no Discord post, urgency stays 1."""
-        _insert_urgent(store, id="stale", published=_iso(72), first_seen=_iso(0.1))
+        MUST drop it as breaking news: no Claude call, no Discord post.
+
+        It MUST also be marked alerted (urgency 1 → 2) so it exits the urgent
+        queue — identical to the quote-widget / low-authority / cross-cycle
+        suppression paths. Leaving it urgency=1 would re-fetch and re-drop it
+        every 20s cycle until its first_seen ages out, then strand it as a
+        permanent urgency=1 residue (the live bug this contract now guards:
+        a stale-by-`published` row only ages further, so marking it loses no
+        delivery). Store side-effect is urgency-only — ai_score/ml_score/
+        score_source untouched."""
+        _insert_urgent(store, id="stale", published=_iso(72), first_seen=_iso(0.1),
+                       ai_score=9.0)
         urgent = store.get_unalerted_urgent()
         assert len(urgent) == 1, "precondition: store returns the recent-first_seen row"
 
@@ -77,12 +95,28 @@ class TestStalenessGuard:
         assert ok is False
         mock_claude.assert_not_called()
         mock_send.assert_not_called()
-        assert _urgency_of(store, "stale") == 1, "stale row was wrongly marked alerted"
+        # Marked alerted so it exits the queue (was urgency=1, now 2) — the
+        # corrected contract: stale suppression mirrors quote-widget.
+        assert _urgency_of(store, "stale") == 2, "stale row must exit the urgent queue"
+        assert store.get_unalerted_urgent() == [], "stale row must not re-fire next cycle"
+        # ai_score / score_source must be untouched (urgency-only side-effect).
+        row = store.conn.execute(
+            "SELECT ai_score, score_source, ml_score FROM articles WHERE id='stale'"
+        ).fetchone()
+        assert row == (9.0, "llm", None), "only urgency may change for a stale drop"
 
-    def test_unparseable_dates_block_the_alert(self, monkeypatch):
+    def test_unparseable_dates_block_the_alert_and_exit_queue(self, monkeypatch):
         """Neither field parses → the agent blocks rather than risk a stale
-        alert (documented 'no parseable date — dropping to be safe' path).
-        Driven directly so the branch is isolated from store SQL quirks."""
+        alert (documented 'no parseable date — dropping to be safe' path): no
+        Claude call, no Discord post. Driven directly so the branch is isolated
+        from store SQL quirks.
+
+        It is ALSO marked alerted: a row with no parseable date in either field
+        can never pass ``_article_age_ok``, so leaving it urgency=1 would have
+        it re-fetched and re-dropped every 20s cycle forever (its corrupt
+        first_seen string can still satisfy the store's ``first_seen >= cutoff``
+        lexical compare). Exiting the queue is the corrected contract — same as
+        every other noise-suppression drop."""
         art = {
             "_id": "junk", "link": "https://reuters.com/junk",
             "title": "Totally real urgent headline about MU here",
@@ -91,7 +125,8 @@ class TestStalenessGuard:
         }
 
         class _StoreSpy:
-            marked = []
+            def __init__(self):
+                self.marked = []
 
             def mark_alerted_batch(self, ids):
                 self.marked.extend(ids)
@@ -105,7 +140,43 @@ class TestStalenessGuard:
         assert ok is False
         mock_claude.assert_not_called()
         mock_send.assert_not_called()
-        assert spy.marked == []
+        assert spy.marked == ["junk"], "undatable row must exit the urgent queue"
+
+    def test_mixed_fresh_and_stale_alerts_fresh_and_evicts_stale(
+        self, store, monkeypatch
+    ):
+        """The discriminating regression: a batch with one fresh urgent row +
+        one stale-published one. The fresh row must alert (Claude+Discord, its
+        title in the prompt); the stale row must be excluded from the prompt
+        AND marked alerted so it exits the queue. After the cycle the queue is
+        fully drained (neither row re-fires). Guards against a fix that evicts
+        stale rows but accidentally also drops the fresh one, or vice-versa."""
+        _insert_urgent(store, id="fresh", url="https://reuters.com/fresh",
+                       title="MU guides Q4 revenue sharply above the Street",
+                       published=_iso(1), first_seen=_iso(0.1), ai_score=9.0)
+        _insert_urgent(store, id="old", url="https://reuters.com/old",
+                       title="AXTI three-day-old re-syndicated supply headline",
+                       published=_iso(72), first_seen=_iso(0.1), ai_score=9.0)
+        urgent = store.get_unalerted_urgent()
+        assert {a["_id"] for a in urgent} == {"fresh", "old"}
+
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call",
+                          return_value="🚨 BREAKING ◈ EARNINGS ◈ MU") as mock_claude, \
+             patch("notifier.discord_notifier.send",
+                   return_value=True) as mock_send:
+            ok = alert_agent.send_urgent_alert(urgent, store)
+
+        assert ok is True
+        mock_claude.assert_called_once()
+        mock_send.assert_called_once()
+        prompt = mock_claude.call_args.args[0]
+        assert "MU guides Q4 revenue" in prompt, "fresh row must reach the prompt"
+        assert "three-day-old re-syndicated" not in prompt, \
+            "stale row must never reach the alert prompt"
+        assert _urgency_of(store, "fresh") == 2
+        assert _urgency_of(store, "old") == 2, "stale row must exit the queue too"
+        assert store.get_unalerted_urgent() == [], "queue fully drained, no re-fire"
 
 
 class TestWebhookEarlyOut:

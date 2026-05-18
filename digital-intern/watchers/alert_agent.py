@@ -302,10 +302,38 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         return False
 
     # Drop articles older than 24 hours — stale news must not fire as breaking.
-    fresh = [a for a in filtered if _article_age_ok(a)]
-    n_stale = len(filtered) - len(fresh)
-    if n_stale:
-        _log.info(f"[alert] dropped {n_stale} stale article(s) (>24h old)")
+    # Suppressed (stale / un-datable) rows are marked alerted UNCONDITIONALLY
+    # here — identical shape to the quote-widget gate above and the
+    # low-authority / cross-cycle gates below — so a row get_unalerted_urgent
+    # legitimately returns (recent first_seen) but whose `published` is >24h
+    # old EXITS the urgent queue instead of being re-fetched and re-dropped
+    # every 20s cycle until its first_seen ages out, then lingering forever as
+    # a permanent urgency=1 residue (observed live 2026-05-18: 26 such rows
+    # stuck 5 days, inflating the dashboard `urgent` tile and re-decompressed
+    # every cycle). A stale-by-`published` row only ages further — it can
+    # never become a valid fresh alert — so marking it loses no delivery; a
+    # no-parseable-date row likewise can never pass _article_age_ok, so it too
+    # must exit rather than churn forever. articles.db ai_score / ml_score /
+    # score_source are untouched (mark_alerted_batch only sets urgency=2) and
+    # synthetic rows were already filtered above — all four load-bearing
+    # invariants intact. Best-effort mark (a store failure must never block a
+    # genuine fresh alert in the same batch).
+    fresh: list[dict] = []
+    stale: list[dict] = []
+    for a in filtered:
+        (fresh if _article_age_ok(a) else stale).append(a)
+    if stale:
+        try:
+            store.mark_alerted_batch(alerted_ids(stale))
+        except Exception:
+            _log.exception("[alert] failed to mark stale rows alerted")
+        srcs = ", ".join(
+            f"{(a.get('source') or '?')}:{(a.get('title') or '')[:40]}"
+            for a in stale[:5]
+        )
+        _log.info(
+            f"[alert] dropped {len(stale)} stale article(s) (>24h old) — {srcs}"
+        )
     if not fresh:
         _log.info("[alert] all urgent articles are stale — skipping alert")
         return False
