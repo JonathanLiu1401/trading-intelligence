@@ -227,6 +227,136 @@ def _coverage_gap_lines(report: dict, now: datetime | None = None) -> list[str]:
     rows.sort(key=lambda r: (r[0], r[1], r[2]))
     return [line for _, _, line in rows[:_MAX_COVERAGE_LINES]]
 
+
+# ── Prior-digest continuity (anti-rehash) ────────────────────────────────────
+# A news analyst reading consecutive 5h heartbeats complains most about
+# repetition: the briefing re-LEADS with the SAME story it led with last time.
+# Confirmed live 2026-05-18: briefing id26 (07:13Z) LEAD = "Global bond rout
+# deepens … dragging Nasdaq -1.54% … two days before NVDA earnings"; id27
+# (12:51Z, 5.6h later) LEAD = "Iran-war inflation scare drives a global bond
+# rout … semis dump into NVDA earnings Wed" — the same story led twice, the
+# analyst's documented #1 noise complaint, on the primary consumed product.
+#
+# The alert path already has alert↔briefing parity (the [ALERTED] tag reads
+# alert_recency.db); the briefing path never saw its OWN previous output. A
+# per-article-title match against the rendered prior briefing was measured at
+# 0% recall (Opus paraphrases every headline, so a raw title prefix never
+# appears verbatim in the prose) — so the robust mechanism is to parse the
+# prior briefing's OWN deterministic SYSTEM_PROMPT format (the literal
+# ``**LEAD:**`` line + ``**TOP SIGNALS**`` fenced block) and feed it back as a
+# framing hint so OPUS does the semantic "is this the same story" comparison
+# (its strength), exactly as it already does for BOOK HEAT / AGING TOP ROWS.
+#
+# Read-only and best-effort, mirroring _collect_source_health /
+# _recent_alert_signatures EXACTLY: a lazy fresh ``mode=ro`` connection (never
+# the daemon's shared self.conn — the documented cursor-collision hazard), one
+# O(log N) indexed read of the tiny ``briefings`` table, ANY failure → None so
+# the 5h briefing is never broken or delayed. The ``briefings`` table holds
+# only Opus-rendered briefing rows (synthetic backtest rows live in
+# ``articles``, NEVER here) so backtest isolation holds by construction; no
+# articles.db write, no ai_score/ml_score/score_source/urgency touch, the
+# ``source_articles`` newswire list is never read or mutated by this path —
+# all four load-bearing invariants intact by construction.
+_PRIOR_DIGEST_MAX_SIGNALS = 6
+# Heartbeat retry can persist the "[analyst] No response from Claude." sentinel
+# into ``briefings`` (live: 3 of 27 rows). The prior-digest read MUST skip
+# those — a sentinel "prior briefing" carries no LEAD/signals and would
+# silently disable the hint. Filtered in SQL so the newest *real* digest wins.
+_PRIOR_DIGEST_SENTINEL_SQL = (
+    "text NOT LIKE '%[analyst] No response%' "
+    "AND text NOT LIKE '%No response from Claude%'"
+)
+
+
+def _parse_prior_digest(text: str) -> dict:
+    """Pure: extract ``{"lead": str, "top_signals": [str, ...]}`` from a prior
+    briefing's text by parsing OUR OWN deterministic SYSTEM_PROMPT output
+    format (the ``**LEAD:**`` line and the ``**TOP SIGNALS**`` fenced block).
+
+    Deliberately NOT a fuzzy headline match (that was measured at 0% recall —
+    Opus paraphrases every title). Garbage / missing sections degrade to empty
+    strings/lists, never raise."""
+    out = {"lead": "", "top_signals": []}
+    if not text or not isinstance(text, str):
+        return out
+    m = re.search(r"\*\*LEAD:\*\*\s*(.+)", text)
+    if m:
+        out["lead"] = m.group(1).strip()
+    ts_idx = text.find("**TOP SIGNALS**")
+    if ts_idx != -1:
+        rest = text[ts_idx:]
+        fences = [mm.start() for mm in re.finditer(r"```", rest)]
+        if len(fences) >= 2:
+            block = rest[fences[0] + 3:fences[1]]
+            lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+            out["top_signals"] = lines[:_PRIOR_DIGEST_MAX_SIGNALS]
+    return out
+
+
+def _prior_digest_lines(prior: dict | None) -> list[str]:
+    """Pure: render the PRIOR DIGEST input-block body lines from a parsed
+    prior-digest dict. ``[]`` when nothing usable (so the caller omits the
+    whole block — the deterministic, BOOK-HEAT/AGING-shaped contract)."""
+    if not isinstance(prior, dict):
+        return []
+    lead = (prior.get("lead") or "").strip()
+    sigs = [s for s in (prior.get("top_signals") or []) if str(s).strip()]
+    if not lead and not sigs:
+        return []
+    out: list[str] = []
+    if lead:
+        out.append(f"LEAD (last briefing): {lead}")
+    for s in sigs[:_PRIOR_DIGEST_MAX_SIGNALS]:
+        out.append(f"TOP SIGNAL (last briefing): {str(s).strip()}")
+    return out
+
+
+def _recent_briefing_digest(now: datetime | None = None) -> dict | None:
+    """Best-effort: the LEAD + TOP SIGNALS of the most recent NON-sentinel
+    prior briefing, plus its age in hours. ``None`` on ANY failure (missing /
+    locked DB, no real prior briefing, unparseable) — an anti-rehash read must
+    NEVER break or delay the 5h briefing it annotates (identical discipline to
+    ``_collect_source_health`` / ``_recent_alert_signatures``).
+
+    Opens a fresh short-lived ``mode=ro`` connection (never the daemon's shared
+    ``self.conn``); the ``briefings`` table is tiny and PK-ordered so
+    ``ORDER BY id DESC LIMIT 1`` is an O(log N) rightmost-leaf walk."""
+    try:
+        import sqlite3
+        from storage.article_store import _get_db_path
+        conn = sqlite3.connect(f"file:{_get_db_path()}?mode=ro",
+                               uri=True, timeout=5)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            row = conn.execute(
+                "SELECT ts, text FROM briefings "
+                f"WHERE {_PRIOR_DIGEST_SENTINEL_SQL} "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row[1]:
+            return None
+        ts, text = row
+        parsed = _parse_prior_digest(text)
+        if not parsed["lead"] and not parsed["top_signals"]:
+            return None
+        age_h: float | None = None
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            now = now or datetime.now(timezone.utc)
+            a = (now - dt.astimezone(timezone.utc)).total_seconds() / 3600.0
+            age_h = a if a > 0 else 0.0
+        except Exception:
+            age_h = None
+        return {"age_h": age_h, "lead": parsed["lead"],
+                "top_signals": parsed["top_signals"]}
+    except Exception:
+        return None
+
+
 SYSTEM_PROMPT = """You are a financial intelligence briefing engine. Output is posted directly to Discord. Format must render cleanly there.
 
 RULES:
@@ -242,6 +372,7 @@ RULES:
 - If a "BOOK HEAT" block is present, it ranks the analyst's held names by how many DISTINCT stories this window touched each one. Concentration on a single held name is itself a magnitude signal, independent of any one row's score: strongly prefer the most-concentrated held name for the LEAD when it has any material story, rank its stories up in TOP SIGNALS, and give that ticker a concrete forward-looking implication in the PORTFOLIO table. This is a ranking/weighting hint only — do NOT echo a literal "BOOK HEAT" section in the output (unlike COVERAGE GAP).
 - If an "AGING TOP ROWS" block is present, it names the highest-ranked digest rows whose deterministic wall-clock age (time since the story hit our wire) is several hours old — a ground-truth recency cross-check, independent of any row's score or decay rank. An aging top row is a developing/continued story, NOT one that just broke: do NOT make it the LEAD as if it were fresh when a comparably-important newer row exists, frame it explicitly as developing in the LEAD and TOP SIGNALS, and never imply a multi-hour-old item happened moments ago. This is a ranking/framing hint only — do NOT echo a literal "AGING TOP ROWS" section in the output (same as BOOK HEAT, unlike COVERAGE GAP).
 - If a "COVERAGE GAP" block is present in the data input, reproduce it as a **COVERAGE GAP** section (one bullet per dark channel, verbatim). These are intel channels the system could NOT collect from this window — the analyst must know what they are blind to, not assume silence means calm. Omit the section entirely if no gap block is provided.
+- If a "PRIOR DIGEST" block is present, it is the LEAD and TOP SIGNALS YOU YOURSELF published in your previous 5h briefing — the analyst just read that one. Re-leading the SAME story as if it were new is the single most-cited "repetitive digest" complaint. If the dominant story is materially unchanged, do NOT restate it as the LEAD: lead instead with what has CHANGED since (a new level/print/catalyst, a reversal, or a genuinely different top story that now outranks it), and frame any necessarily-carried theme explicitly as continuation/development ("rout now easing", "follows this morning's selloff"), never as a fresh break. This is a framing/selection hint only — do NOT echo a literal "PRIOR DIGEST" section in the output (same as BOOK HEAT / AGING TOP ROWS, unlike COVERAGE GAP).
 
 OUTPUT FORMAT — use EXACTLY this, filled with real data:
 
@@ -742,7 +873,8 @@ def _aging_top_rows(
     return out
 
 
-def _build_payload(articles, stock_data, earnings, source_health_report=None):
+def _build_payload(articles, stock_data, earnings, source_health_report=None,
+                   prior_digest=None):
     parts = [f"BRIEFING TIME: {_now_utc_str()}\n"]
 
     macro_data   = stock_data.get("macro", [])   if isinstance(stock_data, dict) else []
@@ -938,6 +1070,30 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None):
             for gl in gap_lines:
                 parts.append(f"  - {gl}")
 
+    # Prior-digest continuity block — anti-rehash. Only emitted when an
+    # explicit prior digest is supplied (analyze() reads it best-effort);
+    # ``None`` ⇒ the section is omitted entirely and the 4-arg path stays
+    # byte-deterministic (exact discipline as source_health_report above —
+    # callers/tests that don't pass it are unaffected). A framing/selection
+    # hint, NOT a reproduced section (the SYSTEM_PROMPT rule forbids echoing
+    # it, like BOOK HEAT / AGING TOP ROWS). Pure read-side: reads only the
+    # separately-fetched prior-briefing dict, never the newswire/source_articles
+    # list, never the DB here — all four invariants intact by construction.
+    if prior_digest is not None:
+        pd_lines = _prior_digest_lines(prior_digest)
+        if pd_lines:
+            age = prior_digest.get("age_h") if isinstance(prior_digest, dict) \
+                else None
+            age_str = (f"~{age:.1f}h ago"
+                       if isinstance(age, (int, float)) else "earlier")
+            parts.append(
+                f"\n=== PRIOR DIGEST (the LEAD/TOP SIGNALS you published "
+                f"{age_str} — do NOT simply re-lead the same story; lead "
+                f"with what materially CHANGED since) ==="
+            )
+            for pl in pd_lines:
+                parts.append(f"  - {pl}")
+
     return "\n".join(parts)
 
 
@@ -945,6 +1101,7 @@ def analyze(articles, stock_data, earnings):
     payload = _build_payload(
         articles, stock_data, earnings,
         source_health_report=_collect_source_health(),
+        prior_digest=_recent_briefing_digest(),
     )
     full_prompt = f"{SYSTEM_PROMPT}\n\n---\nDATA INPUT:\n{payload}"
     result = claude_call(full_prompt, model=MODEL, timeout=180)
