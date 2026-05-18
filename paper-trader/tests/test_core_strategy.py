@@ -705,3 +705,38 @@ class TestStaleMarkFlag:
         lite_line = next(ln for ln in lines if ln.strip().startswith("LITE"))
         assert "STALE MARK" in mu_line
         assert "STALE MARK" not in lite_line
+
+
+class TestWatchlistHygiene:
+    """The live universe must not advertise permanently-delisted tickers.
+
+    GOOGU / METAU (single-stock 2x ETFs) were liquidated and return a
+    yfinance 404 with no quote. Listing them in WATCHLIST told Opus two
+    untradeable names were available (it can never fill — market.get_price
+    returns None → _execute BLOCKS) and made market.get_prices(WATCHLIST)
+    re-404 every _DEAD_TTL window, cluttering runner.log. WATCHLIST and the
+    SYSTEM_PROMPT 'LEVERAGE INSTRUMENTS AVAILABLE' text must stay in lockstep
+    so the prompt never re-introduces what the universe drops (the recurring
+    pass-#18 inconsistency concern).
+    """
+
+    DELISTED = ("GOOGU", "METAU")
+
+    def test_watchlist_excludes_delisted(self):
+        for t in self.DELISTED:
+            assert t not in strategy.WATCHLIST, (
+                f"{t} is permanently delisted; remove from WATCHLIST")
+
+    def test_system_prompt_excludes_delisted(self):
+        for t in self.DELISTED:
+            assert t not in strategy.SYSTEM_PROMPT, (
+                f"{t} is delisted; remove from the LEVERAGE INSTRUMENTS text")
+
+    def test_watchlist_and_prompt_leverage_list_agree(self):
+        # Every WATCHLIST leveraged ETF that the prompt is supposed to name
+        # must actually appear in the prompt, and vice-versa for the ones we
+        # kept — a divergence is how a delisted name silently survives in one
+        # place. Spot-check the still-live 2x single-stock names.
+        for t in ("NVDU", "MSFU", "AMZU", "TSLL"):
+            assert t in strategy.WATCHLIST
+            assert t in strategy.SYSTEM_PROMPT
