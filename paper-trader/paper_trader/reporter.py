@@ -496,6 +496,95 @@ def _benchmark_line(store) -> str:
         return ""
 
 
+def _drawdown_line(store) -> str:
+    """One-line "how far below my own high-water mark am I, and for how
+    long?" for the hourly / daily report.
+
+    The hourly/daily already show ``P/L  $X (Y%)`` — but that is P/L *vs the
+    $1000 start*, which silently conflates two states a portfolio manager
+    must never confuse: "never made money" and "made money then gave a chunk
+    back". Drawdown-from-*peak* is the distinct, top-of-mind risk number
+    every desk reads next to absolute P&L: how deep is the hole, how long
+    underwater, how much already clawed back, and which name is dragging.
+    ``/api/drawdown`` (+ its ``python -m paper_trader.analytics.drawdown``
+    CLI) made this auditable on the *dashboard* — but the operator lives in
+    Discord and never opens it (the exact dashboard→Discord gap
+    ``_benchmark_line`` / ``_equity_integrity_line`` / ``_heartbeat_line``
+    each closed, one dimension over: vs-index, then vs-own-peak, the two
+    reference points a PM reads together).
+
+    Consumes ``compute_drawdown``'s OWN computed fields verbatim — it
+    re-derives no drawdown math (the ``_pos_pct_weight`` precedent: pure
+    formatting of a builder's already-computed numbers; invariant #10
+    governs verdict/headline single-sourcing and ``compute_drawdown`` emits
+    none, so suppression keys off the builder's OWN ``at_high_water``
+    boolean — never an invented threshold). Feeds it the EXACT same store
+    reads ``drawdown_api`` uses (``equity_curve(limit=2000)`` +
+    ``open_positions()``) and the same ``_INITIAL_EQUITY`` (==
+    ``INITIAL_CASH``, invariant #12) so the Discord line and
+    ``/api/drawdown`` are byte-aligned. **Pure store reads only — NO
+    network** (the Discord-path discipline; adds zero latency).
+    Observational only, never gates, adds no caps (invariants #2/#12 — the
+    ``_benchmark_line`` precedent). Failure contract mirrors the rest of
+    ``reporter``: any builder/store fault degrades to ``""`` ("no drawdown
+    line this report"), **never** an exception ("no Discord summary this
+    report").
+
+    Suppression — surface ONLY when the book is off its high, so a book at a
+    fresh high adds no hourly noise (the summary must never become its own
+    lying green light — the ``_equity_integrity_line`` CLEAN-suppression
+    precedent): ``at_high_water`` True (the builder's own
+    within-1bp-of-peak flag) OR a non-dict / unusable result → silent.
+    """
+    try:
+        from .analytics.drawdown import compute_drawdown
+        dd = compute_drawdown(
+            store.equity_curve(limit=2000),
+            store.open_positions(),
+            starting_equity=_INITIAL_EQUITY,
+        )
+        if not isinstance(dd, dict) or dd.get("at_high_water"):
+            return ""
+        try:
+            dd_pct = float(dd.get("drawdown_pct") or 0.0)
+            dd_abs = float(dd.get("drawdown_abs") or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        seg = f"`{dd_pct:+.2f}%` (${dd_abs:+.2f}) from peak"
+        hrs = dd.get("hours_in_dd")
+        try:
+            if hrs is not None:
+                seg += f" · {_ago(float(hrs) * 3600.0)} in DD"
+        except (TypeError, ValueError):
+            pass
+        # Trough + the builder's own claw-back %, shown only when there was a
+        # strictly deeper trough than the current draw (else it is just
+        # "still at the lows" and recovery is 0 — nothing to add).
+        try:
+            tr_pct = float(dd.get("trough_pct") or 0.0)
+            rec_pct = float(dd.get("recovery_pct") or 0.0)
+        except (TypeError, ValueError):
+            tr_pct = rec_pct = 0.0
+        if tr_pct < dd_pct - 0.01:
+            seg += f" · trough `{tr_pct:+.2f}%` (recovered {rec_pct:.0f}%)"
+        # Top drag — the builder already sorted contributors most-negative
+        # first; surface it only when the worst open name is actually a drag
+        # (a book in DD purely from a *realized* loss has no open drag).
+        contribs = dd.get("contributors") or []
+        if (contribs and isinstance(contribs[0], dict)
+                and contribs[0].get("drag")):
+            c = contribs[0]
+            try:
+                seg += (f" · top drag {c.get('ticker')} "
+                        f"${float(c.get('unrealized_pl') or 0.0):+.2f}")
+            except (TypeError, ValueError):
+                pass
+        return "**DRAWDOWN** ◈ off the high-water mark\n" f"> {seg}"
+    except Exception as e:
+        print(f"[reporter] drawdown line skipped: {e}")
+        return ""
+
+
 def _hold_discipline_line(store) -> str:
     """One-line "am I sitting on a loser past my own cut-time?" for the
     daily close.
@@ -1244,6 +1333,9 @@ def send_hourly_summary() -> bool:
     mx = _benchmark_line(store)
     if mx:
         body += "\n" + mx
+    dd = _drawdown_line(store)
+    if dd:
+        body += "\n" + dd
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx
@@ -1329,6 +1421,9 @@ def send_daily_close() -> bool:
     mx = _benchmark_line(store)
     if mx:
         body += "\n" + mx
+    dd = _drawdown_line(store)
+    if dd:
+        body += "\n" + dd
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx
