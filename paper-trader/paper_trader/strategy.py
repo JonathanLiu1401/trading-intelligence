@@ -631,6 +631,7 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    track_record_block: str | None = None,
                    risk_mirror_block: str | None = None,
                    sector_exposure_block: str | None = None,
+                   stress_block: str | None = None,
                    event_calendar_block: str | None = None,
                    macro_calendar_block: str | None = None,
                    buying_power_block: str | None = None) -> str:
@@ -708,6 +709,17 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # before the forward event block — the trader sees its structural risk by
     # name, then by sector, then what is *coming*, before prices bias it.
     sector_section = f"{sector_exposure_block}\n" if sector_exposure_block else ""
+    # Forward beta/concentration STRESS — the natural sibling of the two
+    # concentration blocks above, one dimension over: not *how* concentrated
+    # the book is (name/sector) but what a routine adverse move *costs* it in
+    # dollars, given that concentration. It is the day-one complement to the
+    # dashboard-only tail_risk (which reads INSUFFICIENT until the book has
+    # ≥20 daily returns). Same observational/advisory contract as the mirrors
+    # above (invariants #2/#12 — the sector_exposure precedent). Placed
+    # immediately after the structural concentration view and before the
+    # forward event block: the trader sees its book shape, then what that
+    # shape loses on a shock, then what is *coming*, before prices bias it.
+    stress_section = f"{stress_block}\n" if stress_block else ""
     # Forward scheduled-event awareness (earnings) — same observational/
     # advisory contract as the three mirrors above (invariants #2/#12). Placed
     # right after the backward-looking behavioural stack and before market
@@ -740,7 +752,7 @@ PORTFOLIO:
   total value: ${snapshot['total_value']:.2f}
   positions:
 {chr(10).join(pos_lines) if pos_lines else '  (none)'}
-{review_section}{track_section}{risk_section}{sector_section}{event_section}{macro_section}{bp_section}
+{review_section}{track_section}{risk_section}{sector_section}{stress_section}{event_section}{macro_section}{bp_section}
 WATCHLIST PRICES:
 {chr(10).join(px_lines)}
 
@@ -1261,6 +1273,34 @@ def decide() -> dict:
     except Exception as e:
         print(f"[strategy] sector-exposure failed (non-fatal): {e}")
 
+    # Forward beta/concentration STRESS — risk_mirror/sector_exposure tell the
+    # trader HOW concentrated the book is; this tells it what a routine
+    # adverse move COSTS that book in dollars, on day one (tail_risk needs
+    # ≥20 daily returns and is dark on a young book). Pure arithmetic over the
+    # already-marked snapshot + the pinned sector→beta SSOT (NO extra store
+    # read / NO network — the risk_mirror hot-path discipline). classify is
+    # sector_exposure's test-pinned copy and _LEVERAGE_BETA is stress's, so
+    # neither pulls the ~9k-line dashboard onto the decision hot path yet both
+    # are CI-pinned to /api/risk. Observational only (invariants #2/#12 — the
+    # sector_exposure precedent); wrapped so a diagnostics fault is "no stress
+    # block this cycle", never "no decision this cycle".
+    stress_block: str | None = None
+    try:
+        from .analytics.sector_exposure import classify as _sx_classify
+        from .analytics.stress_scenarios import (
+            _LEVERAGE_BETA as _ss_beta,
+            build_stress_scenarios,
+        )
+        st = build_stress_scenarios(
+            snap.get("positions") or [],
+            snap.get("total_value") or 0.0,
+            _sx_classify,
+            _ss_beta,
+        )
+        stress_block = st.get("prompt_block")
+    except Exception as e:
+        print(f"[strategy] stress-scenarios failed (non-fatal): {e}")
+
     # Forward scheduled-event awareness — the #1 thing a discretionary desk
     # tracks that the engine was fully blind to: upcoming EARNINGS on the
     # names in play. Reads digital-intern's earnings_calendar.json snapshot
@@ -1356,6 +1396,7 @@ def decide() -> dict:
                              track_record_block=track_record_block,
                              risk_mirror_block=risk_mirror_block,
                              sector_exposure_block=sector_exposure_block,
+                             stress_block=stress_block,
                              event_calendar_block=event_calendar_block,
                              macro_calendar_block=macro_calendar_block,
                              buying_power_block=buying_power_block)

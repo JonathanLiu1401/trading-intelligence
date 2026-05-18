@@ -6237,6 +6237,7 @@ def analytics_api():
         # 4dp there; the win/loss split below uses strict `> 0`, so a sub-cent
         # rounding artefact reads as a non-win (pinned by test_round_trips).
         from .analytics.round_trips import build_round_trips
+        from .analytics.stress_scenarios import build_stress_scenarios
         from .analytics.tail_risk import build_tail_risk
         _rts = build_round_trips(trades)
         round_trips: list[float] = [rt["pnl_usd"] for rt in _rts]
@@ -6355,6 +6356,16 @@ def analytics_api():
             # (which fetches /api/analytics) inherits VaR/CVaR/skew for
             # free. eq is the same day-resampled series used above.
             "tail_risk": build_tail_risk(eq),
+            # Forward beta/concentration shock — the day-one complement to
+            # tail_risk above (which reads INSUFFICIENT on a young book).
+            # Additive top-level key (test_stress_scenarios uses keyed
+            # asserts, not whole-dict equality) so the digital-intern analyst
+            # chat that fetches /api/analytics inherits the $-at-risk view
+            # for free. Same _classify/_LEVERAGE_BETA SSOT as /api/risk.
+            "stress_scenarios": build_stress_scenarios(
+                positions, float(total_value or 0.0),
+                _classify, _LEVERAGE_BETA,
+            ),
         }
         # Same single-source-of-truth honesty fold as /api/tail-risk &
         # /api/drawdown — mark_integrity's docstring names THIS endpoint's
@@ -6435,6 +6446,31 @@ def tail_risk_api():
         mt = _mark_trust_block(store)
         if mt is not None:
             result["mark_trust"] = mt
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/stress-scenarios")
+@swr_cached("stress_scenarios", 30.0)
+def stress_scenarios_api():
+    """Forward beta/concentration shock estimate — the day-one complement to
+    /api/tail-risk (which reads INSUFFICIENT until the book has ≥20 daily
+    returns). Pure ``Σ weight×beta×shock`` over the CURRENT marked book, so
+    it produces a real dollar figure with no return history. The −3 % market
+    line is byte-identical to /api/risk's ``shock_usd`` (single source of
+    truth, AGENTS.md #10 — both use ``_classify`` + ``_LEVERAGE_BETA``).
+    Observational only — never gates Opus, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.stress_scenarios import build_stress_scenarios
+        store = get_store()
+        pf = store.get_portfolio()
+        result = build_stress_scenarios(
+            store.open_positions(),
+            float(pf.get("total_value") or 0.0),
+            _classify,
+            _LEVERAGE_BETA,
+        )
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
