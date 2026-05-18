@@ -295,18 +295,50 @@ def _restore_runner_state() -> None:
     still anchors `_last_hourly` to boot so a first-ever start doesn't fire an
     hourly immediately). A persisted `last_hourly` that is already >1h old
     correctly lets the first cycle send the overdue summary instead of
-    swallowing another hour."""
+    swallowing another hour.
+
+    FUTURE-marker hardening: a persisted marker can never *legitimately* be in
+    the future — both are written as `datetime.now()` at save time. A
+    future-dated marker means the wall clock stepped BACKWARD after the save
+    (an NTP correction / VM time-sync — this box has documented clock+load
+    stress). Restoring it verbatim is silently trader-visible:
+      • a future `_last_hourly` makes `(now - _last_hourly) < 3600` true for up
+        to (skew + 1h), so `_maybe_hourly` MUTES the hourly Discord summary —
+        the operator's primary monitoring surface goes dark with no signal,
+        the exact "Hourly STARVATION" class this sidecar exists to prevent;
+      • a `daily_close_sent_for` strictly after today (NY) suppresses THAT
+        day's close once the clock reaches it (the `== today` gate then
+        matches a date for which nothing was ever sent).
+    So clamp a future `_last_hourly` back to now (normal 1h cadence resumes,
+    never muted longer than intended) and drop a future `daily_close_sent_for`
+    (treat as "not sent" — fresh-boot behaviour, never suppress a real close).
+    """
     global _daily_close_sent_for, _last_hourly
     st = _load_runner_state()
+    now = datetime.now(timezone.utc)
     dcs = st.get("daily_close_sent_for")
     if isinstance(dcs, str) and dcs:
-        _daily_close_sent_for = dcs
+        # `daily_close_sent_for` is a NY-date isoformat (set from
+        # `now_ny.date().isoformat()` in `_maybe_daily_close`); ISO dates
+        # compare lexically. A value strictly after today (NY) is non-physical.
+        today_ny = now.astimezone(NY).date().isoformat()
+        if dcs <= today_ny:
+            _daily_close_sent_for = dcs
+        else:
+            print(f"[runner] ignoring future daily_close_sent_for={dcs!r} "
+                  f"(today NY={today_ny}); clock stepped back — treating as "
+                  f"not-sent so today's close is not suppressed")
     lh = st.get("last_hourly_iso")
     if isinstance(lh, str) and lh:
         try:
             dt = datetime.fromisoformat(lh)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
+            if dt > now:
+                print(f"[runner] persisted last_hourly_iso={lh!r} is in the "
+                      f"future (now={now.isoformat()}); clock stepped back — "
+                      f"clamping to now so the hourly summary is not muted")
+                dt = now
             _last_hourly = dt
         except ValueError:
             pass
