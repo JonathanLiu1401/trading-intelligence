@@ -145,6 +145,38 @@ def _retry_on_lock(func):
         raise last
     return wrapper
 
+def _expect_row(cur):
+    """``cur.fetchone()`` for an aggregate (``MAX(...)`` / ``COUNT(*)``) that
+    SQL guarantees yields EXACTLY one row — so a ``None`` here is never a
+    legitimate empty result.
+
+    It is the SAME shared-``self.conn`` cursor-collision documented at length
+    on ``_retry_on_lock`` (a concurrent writer's ``executemany`` resets the
+    connection's statement state while this lockless reader is mid-fetch),
+    just surfacing as a corrupted ``fetchone()`` that returns ``None`` instead
+    of raising the ``another row available`` / ``no more rows available``
+    ``DatabaseError`` variant. The caller does ``.fetchone()[0]``, so a ``None``
+    became ``TypeError: 'NoneType' object is not subscriptable`` — which is NOT
+    a ``sqlite3.DatabaseError``, so ``_retry_on_lock`` never caught it and it
+    bubbled to the worker's broad ``except`` EVERY contended cycle. Live
+    evidence (2026-05-18 daemon.log): ``[stats_worker] error: 'NoneType'
+    object is not subscriptable`` recurred 12+×/h, exactly correlated with the
+    concurrent ``database is locked`` writer-contention storm.
+
+    Re-raise it as the same retryable signal the decorator already handles for
+    the ``DatabaseError`` flavour of this identical collision, so the
+    ``@_retry_on_lock``-decorated idempotent reader simply retries and the
+    next attempt — past the writer's ``executemany`` — succeeds. Safe by
+    construction: every call site is a ``MAX``/``COUNT`` aggregate, which
+    SQLite ALWAYS returns one row for, so this can never mask a real empty
+    result (mirrors the ``_retry_on_lock`` rationale: this only ever means
+    cursor-state corruption)."""
+    row = cur.fetchone()
+    if row is None:
+        raise sqlite3.OperationalError("another row available")
+    return row
+
+
 USB_PATH = Path(os.environ.get("DIGITAL_INTERN_USB", "/media/zeph/projects/digital-intern/db"))
 LOCAL_PATH = Path(__file__).resolve().parent.parent / "data"
 RETENTION_DAYS = 90
@@ -688,7 +720,7 @@ class ArticleStore:
             f"AND {_LIVE_ONLY_CLAUSE}",
             (min_kw,),
         )
-        return cur.fetchone()[0]
+        return _expect_row(cur)[0]
 
     @_retry_on_lock
     def get_unscored(self, limit: int = 500, min_kw: float = 0.5) -> list:
@@ -940,15 +972,15 @@ class ArticleStore:
         # purged out of the RETENTION_DAYS window — an acceptable, order-of-
         # magnitude-correct figure for a dashboard tile. ``fetchone()`` is
         # ``(None,)`` on an empty table, hence ``or 0``.
-        total = self.conn.execute(
-            "SELECT MAX(rowid) FROM articles").fetchone()[0] or 0
+        total = _expect_row(self.conn.execute(
+            "SELECT MAX(rowid) FROM articles"))[0] or 0
         # idx_urgency makes this O(log N); the LIMIT 10000 subquery is a belt-
         # and-braces cap so a missing/disabled index can never reintroduce a
         # full-table scan on the request path.
-        urgent = self.conn.execute(
+        urgent = _expect_row(self.conn.execute(
             "SELECT COUNT(*) FROM "
             "(SELECT 1 FROM articles WHERE urgency>=1 LIMIT 10000)"
-        ).fetchone()[0]
+        ))[0]
         # "unscored" = pending the scorer (kw_score above the scorer's
         # threshold); "below_threshold" = intentionally skipped, not a backlog.
         # Both mirror ``get_unscored`` exactly (ai_score=0 AND ml_score IS NULL
@@ -988,14 +1020,14 @@ class ArticleStore:
     @_retry_on_lock
     def stats_since(self, hours: int) -> dict:
         since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-        total = self.conn.execute(
+        total = _expect_row(self.conn.execute(
             f"SELECT COUNT(*) FROM articles WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
             (since,),
-        ).fetchone()[0]
-        urgent = self.conn.execute(
+        ))[0]
+        urgent = _expect_row(self.conn.execute(
             f"SELECT COUNT(*) FROM articles WHERE first_seen >= ? AND urgency>=1 AND {_LIVE_ONLY_CLAUSE}",
             (since,),
-        ).fetchone()[0]
+        ))[0]
         return {"total": total, "urgent": urgent}
 
     def close(self):
