@@ -6362,3 +6362,153 @@ features_added = 1 · user_findings = 5.**
   as the feature).
 
 *Review pass #28 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 review pass #29 (ML+backtest hybrid · linear-probe: feature-set vs model-class · live findings)
+
+**bugs_fixed=0 · features_added=1 · user_findings=4**
+
+- **Phase 1 — bugs_fixed=0 (mature).** Full read of the three named files
+  (`paper_trader/ml/decision_scorer.py` 595 L, `paper_trader/backtest.py`
+  2622 L, `run_continuous_backtests.py` 1976 L). Re-traced `train_scorer`
+  dedup/split-before-scale/oversample, `_to_float` np.number/inf guards,
+  the atomic pickle write, `_ml_decide`'s conviction gate +
+  off-distribution abstention, `_compute_decision_outcomes`'s
+  `score=`/`scorer=` first-match disambiguation, `_parse_gate_decision`,
+  `_inject_and_train`'s 11-col INSERT + lock-retry, `_train_decision_scorer`
+  separated OOS guards. No real bug, race, or dead-code defect — consistent
+  with the 17+ prior mature ML/backtest passes (#5–#22) and the advisor's
+  read; the heavy in-code comments record bugs already removed by those
+  passes. **718 ML/backtest focused tests green at baseline**
+  (`-k "ml or backtest or scorer or continuous or gate or baseline or
+  calib or deploy or valid or horizon or regime or persona or skill or
+  overfit or feature"`, 0 failed, 8m45s under review-swarm load). The
+  task's "stop-loss exits / position-size not exceeded" cases are already
+  locked in `test_backtest.py` / `test_integration_backtest.py`; the
+  scorer null/known-vector cases in `test_decision_scorer.py`. No Phase-1
+  commit (the commit guard explicitly permits this).
+
+- **Feature shipped (Phase 2, `feat(ml):` — commit `9f8f54d`, pushed).**
+  `paper_trader/ml/linear_probe.py` — the missing **discriminator** for the
+  single most-repeated ML/backtest finding. `baseline_compare` =
+  `MLP_NO_BETTER_THAN_TRIVIAL` has been on record ~10 passes but is
+  *structurally ambiguous to a quant deciding what to do*: it cannot tell
+  apart (1) **MLP-architecture failure** — the features carry a combinable
+  linear signal the regularized/clamped net (or its sector-one-hot
+  memorization `feature_importance` flags) wastes ⇒ *a linear head would
+  beat the net*; from (2) **feature-set ceiling** — no model class helps ⇒
+  *stop tuning the model*. `baseline_compare` (single-feature one-liners),
+  `overfit_gap` (the MLP's own val/oos ratio), `feature_importance`
+  (which input the MLP leans on) — none fit a *multi-feature model of a
+  different class*. `linear_probe` does exactly that: a numpy closed-form
+  L2 ridge on the **10 numeric features the MLP sees** (sector one-hot
+  deliberately excluded — it is the documented memorization vector, not
+  quant signal; sourced via `build_features()[:10]`, no re-listing → zero
+  drift), **fit on the temporal-train slice** of
+  `validation.split_outcomes_temporal` with standardization stats from
+  **train only** (the "split before scale" no-leakage discipline), scored
+  on the IDENTICAL temporal-OOS slice `baseline_compare`/`_train_decision_
+  scorer` use. The deployed MLP is *data-advantaged* (trained in
+  production on the full 5000-tail; the probe sees only this file's train
+  slice) so **a probe win is conservative** — stated in the docstring so a
+  skeptic reads it as a floor. Reuses `baseline_compare._skill` /
+  `_aligned_pred_target` / `IC_MARGIN` / `MIN_PAIRS` / `MLP_IC_MIN` and
+  `calibration._spearman` verbatim (single source of truth — the MLP
+  rank-IC equals `baseline_compare`'s / `calibration --oos`'s by
+  construction; a no-drift test locks it). Verdict ladder
+  `INSUFFICIENT_DATA` / `LINEAR_PROBE_RECOVERS_SIGNAL` /
+  `NO_COMBINABLE_SIGNAL` / `LINEAR_MATCHES_MLP`. Read-only — never trains
+  the deployed model, never touches `decision_scorer.pkl` /
+  `decision_outcomes.jsonl` / `_ml_decide` / `build_features` /
+  `N_FEATURES` (same discipline as `baseline_compare`/`gate_audit`); CLI
+  exit 2 on the two actionable verdicts. **20 known-answer tests**
+  (`tests/test_linear_probe.py`): `_fit_ridge` recovers a noiseless
+  `y=2x₀−3x₄` (rank-IC>0.99) where a single column cannot; the four-way
+  ladder with Spearman fixed ±1/0 by construction; an end-to-end
+  combinable `0.3·mom20+0.6·mom5` signal a noise-MLP can't model →
+  RECOVERS; pure noise at the realistic n (n_oos≈320) →
+  NO_COMBINABLE_SIGNAL (the `MLP_IC_MIN` floor is the small-sample
+  buffer — locked); a **no-leakage lock** (signal only in OOS, train is
+  noise ⇒ must NOT be RECOVERS); the SELL `−forward_return_5d` flip
+  learned by the fitted probe; RIDGE_ALPHA robustness across 0.1–10;
+  MLP-IC no-drift cross-check vs `baseline_compare`; never-raises.
+  ```bash
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest \
+    tests/test_linear_probe.py -q                       # 20 green
+  cd /home/zeph/trading-intelligence/paper-trader && \
+    python3 -m paper_trader.ml.linear_probe             # CLI, exit 2 actionable
+  ```
+
+- **Phase 3 — live findings (read-only diagnostics on the running loop;
+  box under the concurrent review-swarm + backtest committee load this
+  pass's own siblings contribute to). 4 distinct + positive.**
+  1. **DECISIVE — the new feature resolves the 10-pass ambiguity live:
+     `linear_probe` = `NO_COMBINABLE_SIGNAL` (HIGH, quant-grade).** On the
+     live `decision_outcomes.jsonl` (n_oos=1981, n_train_fit=7928,
+     deployed n=3799): an honest no-leakage ridge on ALL 10 numeric
+     features reaches rank_ic **+0.071** — *not better than `ml_score`
+     alone* (+0.072; gap −0.001). The MLP's near-zero OOS skill is a
+     **feature-set ceiling, not a model-class bug**: the anti-overfit
+     retune (#19) and the deploy-staleness redeploy (#21) cannot lift the
+     conviction gate (invariant #5, active at deployed n≥500) because
+     there is no combinable signal for *any* linear model to extract. The
+     probe does beat the deployed MLP (+0.071 vs +0.051) — consistent
+     with #21's stale `(64,32,16)` net — but by < `IC_MARGIN` and below
+     the `MLP_IC_MIN` floor, so not independently actionable.
+  2. **`calibration --oos` = MISCALIBRATED with a top-decile inversion
+     (HIGH, corroborating).** spearman 0.051; decile-10 (highest
+     predictions, mean_pred **+12.49**) realizes only **+0.99%** —
+     *below* decile-9 (+1.81%) and decile-8 (+1.71%). The gate's ×1.3
+     strong-tailwind arm upsizes exactly the bucket that realizes worst
+     among the top half. Independent corroboration of finding 1 from the
+     calibration axis.
+  3. **The recent instrumentation chain is INERT in production
+     (HIGH, continuity — recalled `pt-stale-manual-daemon` class).**
+     `deploy_audit` = `DEPLOYED_STALE_CONFIG` (6/8 hyper-params drifted:
+     `(64,32,16)≠(32,16)`, `alpha=1e-4≠1e-2`, `early_stopping=False≠True`,
+     …); `gate_realized` = `GATE_CAPTURE_NOT_YET_POPULATED` (0 rows carry
+     `gate_scorer_pred` — the loop predates commit `60b20d9`). The
+     long-lived `run_continuous_backtests.py` retrains every cycle but
+     imports the *pre-retune* module, so the gate sizes real backtest
+     capital on the memorizing net AND none of #19–#22's instrumentation
+     measures the live gate. Ops, not code — the source is correct;
+     restart redeploys. Not a code bug.
+  4. **`_llm_annotate_outcomes` fails EVERY cycle in the live loop
+     (MEDIUM, ops/auth — dead training-weight feature).** `continuous.log`
+     repeats `[continuous] LLM annotation failed: "Could not resolve
+     authentication method…"` — the `anthropic` Python SDK path has no
+     API key in the continuous process (unlike `_opus_annotate`, which
+     uses the authenticated `claude` CLI). Effect: `llm_quality_label`
+     never set, so `train_scorer`'s documented 3×-endorse/0.1×-condemn
+     sample-weight multiplier silently never applies — every sample is
+     1.0×. The code degrades correctly (caught, non-fatal, returns
+     records unchanged) so this is an environment/auth gap, **not a code
+     defect**; no fix folded in (the graceful-degrade is the right
+     behavior; the fix is ops-side credential config).
+  - **POSITIVE — data flow healthy.** `decision_outcomes.jsonl` ≈9.9k
+    rows and growing, scorer pickle re-written across runs (n 3799→3997),
+    continuous loop progressing (`gdelt_weekly 50/5055`), backtests
+    recorded. The system is alive and accumulating — it is running stale
+    code, not broken. (Aside: `backtest.db`/`data/` are symlinked to a
+    `/media` external drive; under the review-swarm load read-only
+    diagnostics against them queued for minutes — a blind-spot for
+    go/no-go reads during exactly the high-load windows.)
+
+  Findings 1+2 are the quant payoff (the shipped feature + an independent
+  corroboration that the gate's ceiling is the inputs); 3 is the dominant
+  continuity reality; 4 is a real silently-dead training feature. No
+  Phase-3 fix folded in (the only in-scope code change is the Phase-2
+  feature; 3 and 4 are ops/auth, not code).
+
+- **Concurrency / staging discipline.** Heavy concurrent siblings on the
+  shared monorepo tree (core pass #28 appended mid-pass: AGENTS.md grew
+  6232→6364 L; `../digital-intern/` dirty). Never `git add -A`. Staged
+  exactly the two path-scoped new files
+  (`paper_trader/ml/linear_probe.py`, `tests/test_linear_probe.py`);
+  `git diff --staged --name-only` filtered to those two returned CLEAN
+  (zero sibling tokens) before commit `9f8f54d`. AGENTS.md re-read at the
+  tail immediately before this append, appended-only, committed
+  separately (not counted as the feature).
+
+*Review pass #29 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
