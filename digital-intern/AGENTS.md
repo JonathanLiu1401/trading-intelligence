@@ -3109,3 +3109,112 @@ expected; this entry was appended, not rewritten).
   leakage; never `git add -A`; both on origin/master. A concurrent sibling
   hybrid agent edited this repo throughout; this entry was appended, not
   rewritten.
+
+- **2026-05-18 (hybrid pass 24 — Agent 3, debug + feature + analyst-validation)** —
+  Required-file-set pass (24th; codebase exceptionally mature, 23 prior
+  passes). Advisor-reviewed before substantive work AND on the empirical
+  match-rate pivot. All 9 required files read in full + `ml/inference.py`
+  context. Bare daemon `pid 1702195` still up, started **2026-05-18 07:29Z**,
+  predating EVERY recent fix (`8180055`/`84bc881`/`50c1052`/`05b406e`/
+  `b20cbae`) — the consistent stale-daemon caveat (fixes ship on next
+  restart). Concurrent sibling agent + auto-commit/push daemon on the shared
+  monorepo index (memory `di-shared-repo-concurrency`) → strict per-commit
+  pathspec staging; HEAD advanced under me (`9cb7a2e`→`ecafe10` paper-trader
+  AGENTS sweeps) but my commit captured zero foreign files (`git show --stat`
+  verified).
+
+  **Phase 1 — bugs_fixed=0, NO Phase-1 commit (commit guard honoured —
+  honest, not a miss).** Every load-bearing invariant re-traced and multiply
+  defended; the full requested test list already exists and value-asserts.
+  Live `daemon.log` forensics surfaced only KNOWN issues, none a genuine new
+  bug in clean scope: the 37 `[stats_worker] 'NoneType'` + 1
+  `[recursive_labeler] not an error` are stale-daemon manifestations of
+  HEAD-present fixes (`_expect_row` `05b406e`; `_RETRYABLE_DB_ERRORS` already
+  contains `"not an error"` `8180055` — both verified at HEAD); the 30
+  `insert_batch`/`update_ml_scores_batch` `lock retry exhausted` ERRORs are
+  the chronic DB-lock contention (memory `di-insert-batch-lock-contention`;
+  per-call connection isolation is substantial + `daemon.py`/store
+  sibling-touched → out of clean scope, advisor/precedent-confirmed not
+  chased — precedent passes 19/20/21/22/23). Manufacturing a fix would revert
+  a load-bearing prior decision → bugs_fixed honestly 0 (precedent passes
+  15/16/17/21/22).
+
+  **Phase 2 — features_added=1, commit `aebcbbd`** (`analysis/claude_analyst.py`
+  +159/−1 + new `tests/test_briefing_prior_digest.py`, +30 tests).
+  **PRIOR DIGEST continuity hint — anti-rehash on the 5h heartbeat.** A news
+  analyst reading consecutive heartbeats complains most about repetition
+  (documented #1 noise complaint). **Confirmed live this pass:** briefing id26
+  (07:13Z) and id27 (12:51Z, 5.6h later) BOTH LED with the
+  global-bond-rout-into-NVDA-earnings story (MACRO table rows byte-identical
+  between them). The alert path has alert↔briefing parity (`[ALERTED]`); the
+  briefing path never saw its OWN previous output. **Empirical pivot
+  (advisor-gated):** a per-article-title match vs the rendered prior briefing
+  was measured at **0% recall** (400 recent titles, 0 hits — Opus paraphrases
+  every headline), so the per-row-tag mechanism is dead. Pivoted (the advisor
+  pre-authorised this exact direction) to parsing the prior briefing's OWN
+  deterministic `SYSTEM_PROMPT` format (the literal `**LEAD:**` line +
+  `**TOP SIGNALS**` fenced block) and feeding it back as a framing hint — Opus
+  does the semantic "same story?" comparison (its strength), the established
+  BOOK-HEAT/AGING shape (separate input block, never a per-row token so the
+  pinned `test_briefing_seen_timestamp.py:69` contiguity assertion is
+  untouched, never echoed). New `_parse_prior_digest` (pure),
+  `_prior_digest_lines` (pure), `_recent_briefing_digest` (best-effort, lazy
+  fresh `mode=ro` connection — NEVER the shared `self.conn`; one O(log N)
+  read of the tiny `briefings` table; ANY failure → None; the
+  `[analyst] No response` sentinel rows — **3 of 27 live** — filtered in SQL
+  so the newest *real* digest wins), `_build_payload(..., prior_digest=None)`
+  (None ⇒ omitted, deterministic, 4-arg path byte-unchanged — exact
+  `source_health_report` discipline; `analyze()` signature unchanged so
+  `daemon.py:1477` still works), one new `SYSTEM_PROMPT` rule (existing
+  BOOK HEAT/AGING/[ALERTED]/COVERAGE-GAP rules byte-unchanged, pinned by an
+  anti-regression test). The `briefings` table holds only Opus-rendered rows
+  (synthetic backtest rows live in `articles`, NEVER here) so backtest
+  isolation holds by construction; no `articles.db` write, no
+  ai_score/ml_score/score_source/urgency touch, `source_articles` never
+  read/mutated — **all four load-bearing invariants intact by construction**
+  (same safety class as `_collect_source_health`/`_recent_alert_signatures`).
+  Ships on next `systemctl restart digital-intern` (stale-daemon caveat).
+
+  **Phase 3 — analyst-lens live validation, user_findings=7.** (1)
+  **Briefing repetition CONFIRMED LIVE** — id26 & id27 both LEAD
+  bond-rout→NVDA (the Phase-2 driver; fix ships on restart). (2) **Briefing
+  quality EXCELLENT (positive)** — id27 read end-to-end: dense, exact,
+  decisively-actionable (Iran-war inflation/bond-rout LEAD, 30Y 5.13%
+  post-2023 high, S&P −1.24% / SMH −3.80% into NVDA Wed, "tape already cooling
+  WTI −4.15%" nuance, precise MACRO/PORTFOLIO/SEMIS/RISK/DESK-NOTE, COVERAGE
+  GAP present). (3) **Invariants HOLD live** — `0` synthetic `urgency>=1`;
+  `0` `ai_score>0 AND score_source='ml'` in the prod DB. (4) **Collection
+  healthy** — 4170 live articles last 1h. (5) **Alert path** — 2 legit
+  high-value `Benzinga Economics` geopolitical alerts (UAE-drone/Brent ai=9,
+  futures-drop ai=8) + SEC-EDGAR NVDA 8-K (ai=8); lone `reddit/r/ValueInvesting`
+  (ml=9.76) / `reddit/r/Daytrading` (ai=8) / `Wikipedia` (ml=8.63) residue
+  predate the deployed `_filter_low_authority_lone`/quote-widget gates
+  (stale-daemon — reddit 0.40 gated post-restart; Wikipedia 0.60 above the
+  0.45 bar = the standing deferred contested tuning, NOT chased — precedent
+  passes 15/16/21/22). (6) **26 phantom `urgency=1` rows** — `reap_stale_urgent`
+  (`50c1052`) present at HEAD; stale daemon hasn't run a post-fix purge;
+  inflates the dashboard urgent tile. (7) **7 collectors disabled**
+  (`massive, newsapi, nitter, polygon, sec_edgar, sec_edgar_ft, wikipedia`);
+  `sec_edgar`/`_ft` = analyst blind to 8-K filings (priority-0) — correctly
+  surfaced verbatim by the COVERAGE GAP briefing block (working as intended);
+  upstream/rate-limit, operational. None of 5/6/7 is a quick safe fix in
+  clean scope (stale-daemon-with-HEAD-fix / contested-test-pinned tuning /
+  upstream) → no Phase-3 fold-in; bugs_fixed stays 0, features_added 1.
+
+  **Verify:** `storage.article_store` / `ml.features` / `ml.model` /
+  `analysis.claude_analyst` imports OK; suite **845 passed / 5 failed** (the 5
+  are the pre-existing sibling `M collectors/rss_collector.py`
+  `'_FakeResp' object has no attribute 'status_code'` 4-tuple WIP — not ours,
+  never staged; floor held exactly 5, never 6+; my 30 new tests all pass;
+  briefing+claude_analyst suites 249 passed, zero regressions vs the 213
+  pre-change baseline). *Pre-existing, deliberately never staged* (consistent
+  with every prior entry): `collectors/rss_collector.py`, `daemon.py`,
+  `dashboard/server.py`, `scripts/export_training_data.py`,
+  `tests/test_article_store.py`, untracked `collectors/fred_collector.py` /
+  `scripts/stale_source_alerter.py` / `storage/story_corroboration.py` /
+  `tests/test_alert_history.py` / `tests/test_export_training_data.py` /
+  `tests/test_story_corroboration.py`, all `paper-trader/*`, `logs/*`. Commit
+  `aebcbbd` pathspec-scoped via `git commit -F … -- <2 explicit paths>`;
+  `git diff --staged --name-only` + `git show --stat` verified no sibling
+  leakage; never `git add -A`; on origin/master. A concurrent sibling hybrid
+  agent edited this repo throughout; this entry was appended, not rewritten.
