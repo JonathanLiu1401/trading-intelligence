@@ -1291,6 +1291,45 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   four files were clean before edit; commits pathspec-scoped, never
   `git add -A`.
 
+- **2026-05-18 (Agent 4, feature-dev — analyst-chat: factor-concentration / correlation honesty)** —
+  Advisor-spirit; gap falsified by grep first (`correlation` returned **nothing**
+  in the chat path — the chat surfaced `/api/risk`'s NAME-level concentration
+  via the analytics block but was **blind** to the FACTOR-level companion,
+  though `paper-trader/.../analytics/correlation.py` + `/api/correlation`
+  already exist). The hole: a 59/41 two-name book is `concentration_severity=
+  HIGH` in `/api/risk`, but if both names are high-β semis the book is one
+  bet wearing two tickers — `/api/correlation` is the diagnostic that says
+  so, and the analyst never saw it. One additive feature, **this repo only**
+  (no cross-repo restart coupling beyond the chronic-stale sibling
+  contract), never gates Opus (invariants #2/#12 — chat context only).
+  `dashboard/web_server.py::api_chat` gains the pure helper
+  **`_correlation_chat_lines(corr)`** (the `_baseline_compare_chat_lines`
+  precedent — total/pure, degrade to `[]`, never raise into chat). SSOT
+  (invariant #10): the builder's own `headline` is the **verbatim** chat
+  line — no chat-side re-derived verdict (the verdict label, mean ρ,
+  effective-bets count, and the optional most-coupled-pair clause all
+  already live inside `headline`). State ladder: `NO_DATA` (no stock
+  positions) → `[]` silence; `INSUFFICIENT` (need ≥2 correlatable names
+  with ≥10 aligned daily returns) → ONE verbatim withheld-line; `OK` with
+  a real verdict (`SINGLE_NAME_RISK`/`CONCENTRATED`/`MODERATE`/`DIVERSIFIED`)
+  → the verbatim headline; any other state or unknown verdict on `OK` →
+  silence (degrade rather than parrot an unvalidatable label).
+  Wired as a sibling cross-fetch block (own guarded
+  `urllib.urlopen(:8090/api/correlation, timeout=3)`, degrade-to-`""`),
+  injected into `system_prompt` right after the `ML GATE HONESTY` block
+  via the existing `if block else ""` idiom. New
+  `tests/test_chat_correlation_enrichment.py` (**19 tests**, pure helper,
+  no Flask/DB/cross-fetch — incl. the SSOT verbatim-headline lock across
+  all 4 real verdicts via parametrize, the `NO_DATA`-is-silence lock, the
+  two `INSUFFICIENT` variant locks, the `OK`-with-unknown-verdict-is-
+  silence lock, and the single-chat-line lock). Suites: **19 new passed**;
+  the chat-enrichment regression slice **62 passed** (incl. the 19 new +
+  baseline + macro + behavioural sets); no import breakage. *Operational:*
+  additive — needs `systemctl --user restart digital-intern` to take
+  effect; `:8090` already serves `/api/correlation` (no waiting on a
+  trader restart). Commit pathspec-scoped (`web_server.py` + new test +
+  this `AGENTS.md`), never `git add -A`.
+
 - **2026-05-18 (Agent 4, feature-dev — analyst-chat: forward FOMC / macro-calendar awareness)** —
   Advisor-reviewed; gap falsified by grep first (`macro|fomc|rate.decision`
   returned **nothing** in the chat path — the chat carried ~15 BACKWARD

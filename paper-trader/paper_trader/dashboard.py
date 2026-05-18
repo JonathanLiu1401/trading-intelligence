@@ -8955,6 +8955,120 @@ def correlation_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/trade-attribution")
+@swr_cached("trade-attribution", 60.0)
+def trade_attribution_api():
+    """News-to-trade attribution — which articles plausibly preceded each
+    recent FILLED trade?
+
+    The symmetric question to ``/api/news-edge`` / ``/api/source-edge``
+    (do scored signals precede the SPY-abnormal move across the BOOK?):
+    here, per-fill, what was the news landscape in the
+    ``window_hours`` (default 4h, query-overridable 0.5..24) preceding
+    each trade? *Implied* attribution — the bot's literal context isn't
+    stored row-by-row, so we honestly reconstruct only the highest-scored
+    live-only articles mentioning the traded ticker in the pre-trade
+    window. A trade with zero matches surfaces ``n_attributed: 0`` (the
+    ``recovery`` / ``loser_autopsy`` precedent — no-fabrication negative
+    space is data too).
+
+    Live-only by construction (invariant #1): the canonical
+    backtest-strip clause is applied to ``articles.db`` here in the
+    endpoint, mirroring ``_ticker_news_pulse``. The builder is pure; the
+    I/O lives here (the ``thesis_drift`` / ``correlation`` split).
+    Advisory only — never gates Opus, adds no caps (AGENTS.md #2/#12).
+
+    Query params (all optional):
+      ``hours_back`` — trade lookback (default 24, clamp 1..168)
+      ``window_hours`` — per-trade article window (default 4.0, clamp 0.5..24)
+      ``max_per_trade`` — top-N articles per trade (default 3, clamp 1..10)
+      ``min_ai_score`` — article cutoff (default 2.0, clamp 0..10)
+    """
+    try:
+        from .analytics.trade_attribution import build_trade_attribution
+
+        def _qf(name: str, default: float, lo: float, hi: float) -> float:
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        hours_back = _qf("hours_back", 24.0, 1.0, 168.0)
+        window_hours = _qf("window_hours", 4.0, 0.5, 24.0)
+        max_per_trade = int(_qf("max_per_trade", 3.0, 1.0, 10.0))
+        min_ai_score = _qf("min_ai_score", 2.0, 0.0, 10.0)
+
+        store = get_store()
+        # Read-only fetch of recent FILLED trades; the store's own lock
+        # serialises with the writer (invariant #7).
+        with store._lock:  # noqa: SLF001 — same access pattern dashboard uses elsewhere
+            cur = store.conn.execute(
+                "SELECT id, timestamp, ticker, action, qty, price, value, "
+                "reason, option_type FROM trades "
+                "WHERE timestamp >= datetime('now', ?) "
+                "ORDER BY timestamp DESC LIMIT 200",
+                (f"-{hours_back:.1f} hours",),
+            )
+            rows = cur.fetchall()
+        trades = [{
+            "id": r[0], "timestamp": r[1], "ticker": r[2], "action": r[3],
+            "qty": r[4], "price": r[5], "value": r[6], "reason": r[7],
+            "type": r[8],
+        } for r in rows]
+
+        # Live-only articles in the broadest needed window (oldest trade
+        # minus the per-trade window, with a small slack). One query covers
+        # every fill rather than N queries.
+        articles: list[dict] = []
+        if trades:
+            oldest_iso = trades[-1]["timestamp"]
+            oldest_dt = datetime.fromisoformat(
+                oldest_iso.replace("Z", "+00:00")) if oldest_iso else (
+                datetime.now(timezone.utc) - timedelta(hours=hours_back))
+            if oldest_dt.tzinfo is None:
+                oldest_dt = oldest_dt.replace(tzinfo=timezone.utc)
+            since = (oldest_dt - timedelta(hours=window_hours)).isoformat()
+
+            path = _articles_db_path()
+            if path is not None:
+                conn = None
+                try:
+                    conn = sqlite3.connect(
+                        f"file:{path}?mode=ro", uri=True, timeout=5)
+                    art_rows = conn.execute(
+                        "SELECT title, url, source, ai_score, urgency, "
+                        "first_seen FROM articles "
+                        "WHERE first_seen >= ? AND ai_score >= ? "
+                        "AND url NOT LIKE 'backtest://%' "
+                        "AND source NOT LIKE 'backtest_%' "
+                        "AND source NOT LIKE 'opus_annotation%' "
+                        "ORDER BY ai_score DESC LIMIT 5000",
+                        (since, min_ai_score),
+                    ).fetchall()
+                    articles = [{
+                        "title": r[0], "url": r[1], "source": r[2],
+                        "ai_score": r[3], "urgency": r[4], "first_seen": r[5],
+                    } for r in art_rows]
+                except Exception:
+                    articles = []
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+        return jsonify(build_trade_attribution(
+            trades, articles,
+            window_hours=window_hours,
+            max_per_trade=max_per_trade,
+            min_ai_score=min_ai_score,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR"}), 500
+
+
 @app.route("/api/runner-heartbeat")
 @swr_cached("runner-heartbeat", 20.0)
 def runner_heartbeat_api():
