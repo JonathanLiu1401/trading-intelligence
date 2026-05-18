@@ -8,6 +8,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 
 from . import market
+from .analytics.hold_discipline import build_hold_discipline
 from .store import INITIAL_CASH, get_store
 
 DISCORD_CHANNEL = "channel:1496099475838603324"
@@ -380,6 +381,39 @@ def _benchmark_line(store) -> str:
         return ""
 
 
+def _hold_discipline_line(store) -> str:
+    """One-line "am I sitting on a loser past my own cut-time?" for the
+    daily close.
+
+    The desk's documented pathology is the disposition effect (16.7% win
+    rate, ~0.52d median hold). ``/api/loser-autopsy`` only post-mortems
+    *closed* trades; nothing tells the operator — who lives in Discord —
+    that a *currently open* losing position has run past the desk's own
+    empirical median losing hold *while it is still happening*. Composes
+    ``build_hold_discipline`` **verbatim** (single source of truth,
+    AGENTS.md invariant #10 — the headline is the builder's, never
+    re-derived here, so the Discord line and ``/api/hold-discipline`` can
+    never drift). Observational only, no caps (invariants #2/#12; the
+    ``_benchmark_line`` / ``_session_block`` precedent). Failure contract
+    mirrors the rest of ``reporter``: any store/compute fault degrades to
+    ``""`` ("no hold-discipline line this report"), **never** an exception
+    ("no Discord summary this report"). ``NO_DATA`` (no open book) and
+    ``INSUFFICIENT`` (no empirical reference yet) are suppressed — there
+    is nothing actionable to say (the ``_behavioural_block`` NO_DATA
+    precedent)."""
+    try:
+        trades = list(reversed(store.recent_trades(2000)))
+        h = build_hold_discipline(store.open_positions(), trades)
+        if h.get("state") in ("NO_DATA", "INSUFFICIENT"):
+            return ""
+        tag = h.get("verdict") or h.get("state")
+        return ("**HOLD DISCIPLINE** ◈ losers held past your own cut-time\n"
+                f"`{tag}`  {h['headline']}")
+    except Exception as e:
+        print(f"[reporter] hold-discipline line skipped: {e}")
+        return ""
+
+
 def _realized_pl_today(trades_newest_first: list[dict], today: str
                        ) -> tuple[float, int, int] | None:
     """True realized P/L from round-trips that *closed* today (UTC).
@@ -582,4 +616,7 @@ def send_daily_close() -> bool:
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx
+    hx = _hold_discipline_line(store)
+    if hx:
+        body += "\n" + hx
     return _send(body)

@@ -7736,6 +7736,34 @@ def winner_autopsy_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/hold-discipline")
+def hold_discipline_api():
+    """The disposition trap, caught *while it is still happening* on the
+    OPEN book. /api/loser-autopsy & /api/trade-asymmetry post-mortem
+    trades already closed; /api/thesis-drift re-tests an open position
+    against its *thesis*; /api/capital-paralysis is about cash drag;
+    /api/position-thesis shows days-held but has no empirical reference.
+    None answer the forward discipline question: *which open position am
+    I, right now, holding at a loss past my own historical losing-cut
+    time?* This anchors on the desk's OWN behaviour — the empirical
+    median losing hold consumed verbatim from build_loser_autopsy →
+    build_round_trips (single source of truth, AGENTS.md #10) — and the
+    per-position $ read directly from positions.unrealized_pl (the option
+    ×100 is already baked in there). Verdict withheld until ≥
+    MIN_REFERENCE_LOSERS closed losers (the loser_autopsy sample-size
+    honesty idiom). Advisory only — never gates Opus, never injected into
+    the decision prompt, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.hold_discipline import build_hold_discipline
+        store = get_store()
+        # Same trades convention as /api/loser-autopsy & /api/analytics:
+        # oldest → newest (build_round_trips reads in sequence).
+        trades = list(reversed(store.recent_trades(2000)))
+        return jsonify(build_hold_discipline(store.open_positions(), trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/track-record")
 def track_record_api():
     """Per-name closed-trade memory — the same verbatim loser/winner-autopsy
