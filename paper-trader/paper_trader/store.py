@@ -118,16 +118,32 @@ class Store:
                 "SELECT cash, total_value, positions_json, last_updated FROM portfolio WHERE id=1"
             ).fetchone()
         # The shared connection (see the note above) intermittently hands back
-        # a None row or a row whose columns read back NULL even though the
-        # stored values are well-formed. get_portfolio() backs /api/state,
+        # a None row OR a present row whose columns read back NULL even though
+        # the stored values are well-formed. get_portfolio() backs /api/state,
         # polled every few seconds — a raw subscript / json.loads(None) here
-        # 500s the whole dashboard (28x in runner.log over 2 days). Absorb
-        # both failure modes instead of crashing; never retry under the lock.
-        if row is None:
-            # Either a transient blip or the id=1 row is genuinely gone.
-            # _init_portfolio() re-inserts only if missing and takes self._lock
-            # itself, so it must be called WITHOUT the lock held. One re-read.
-            print("[store] get_portfolio: row=None — re-initializing portfolio row",
+        # 500s the whole dashboard (28x in runner.log over 2 days). Worse: a
+        # NULL `cash`/`total_value` flows into strategy._portfolio_snapshot as
+        # `None + open_value`, a TypeError that aborts the WHOLE decide() cycle
+        # (no decision row, no equity point). Both modes must be absorbed; the
+        # original code only handled `row is None` and silently dropped the
+        # equally-documented NULL-column mode straight into the live loop.
+        def _bad(r) -> bool:
+            # `positions_json` is recovered separately below (NULL → "[]"); a
+            # NULL `last_updated` is cosmetic. Only a missing row or a NULL
+            # numeric cash/total_value is unrecoverable as-is.
+            return (r is None
+                    or r["cash"] is None
+                    or r["total_value"] is None)
+
+        if _bad(row):
+            # Either a transient corrupt read (the common case — the re-read
+            # below recovers the real well-formed values) or the id=1 row is
+            # genuinely gone. _init_portfolio() re-INSERTs only when the row is
+            # missing (a live book whose read merely came back NULL is never
+            # reset) and takes self._lock itself, so it must be called WITHOUT
+            # the lock held. One re-read.
+            why = "row=None" if row is None else "NULL cash/total_value"
+            print(f"[store] get_portfolio: bad row ({why}) — re-reading",
                   flush=True)
             self._init_portfolio()
             with self._lock:
@@ -135,7 +151,7 @@ class Store:
                     "SELECT cash, total_value, positions_json, last_updated "
                     "FROM portfolio WHERE id=1"
                 ).fetchone()
-            if row is None:
+            if _bad(row):
                 return {"cash": INITIAL_CASH, "total_value": INITIAL_CASH,
                         "positions": [], "last_updated": _now()}
         pj = row["positions_json"]

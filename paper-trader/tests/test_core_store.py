@@ -326,6 +326,96 @@ class TestGetPortfolioResilience:
         assert pf["total_value"] == 980.0
         assert pf["positions"] == []
 
+    def test_transient_null_cash_recovers_real_values(self, fresh_store,
+                                                      monkeypatch):
+        # The OTHER documented corruption mode the docstring promises to
+        # absorb but the original code silently dropped: a present row whose
+        # `cash`/`total_value` read back NULL on a transient shared-connection
+        # blip. The re-read must recover the real, well-formed values — NOT
+        # return None (which TypeErrors strategy._portfolio_snapshot's
+        # `None + open_value` and aborts the whole decide() cycle).
+        corrupt = {"cash": None, "total_value": None,
+                   "positions_json": "[]",
+                   "last_updated": "2026-05-16T00:00:00Z"}
+        good = {"cash": 712.34, "total_value": 905.10,
+                "positions_json": '[{"ticker": "MU"}]',
+                "last_updated": "2026-05-16T00:01:00Z"}
+
+        class _SeqCursor:
+            def __init__(self, row):
+                self._row = row
+
+            def fetchone(self):
+                return self._row
+
+        class _SeqConn:
+            """Returns a truthy row for _init_portfolio's `SELECT id` (so it
+            never INSERT/resets a live book) and pops the queued cash-row
+            sequence for get_portfolio's read + re-read."""
+            def __init__(self, rows):
+                self._rows = list(rows)
+
+            def execute(self, sql, *a, **k):
+                if "SELECT id FROM portfolio" in sql:
+                    return _SeqCursor({"id": 1})
+                row = self._rows.pop(0) if self._rows else good
+                return _SeqCursor(row)
+
+            def commit(self):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(fresh_store, "conn",
+                            _SeqConn([corrupt, good]))
+        pf = fresh_store.get_portfolio()
+        assert pf["cash"] == 712.34          # recovered, not None
+        assert pf["total_value"] == 905.10
+        assert pf["positions"] == [{"ticker": "MU"}]
+        # The exact arithmetic that aborted the cycle pre-fix:
+        assert isinstance(pf["cash"] + 0.0, float)
+
+    def test_persistent_null_cash_degrades_safely(self, fresh_store,
+                                                  monkeypatch):
+        # If the corruption never clears, get_portfolio must still return an
+        # arithmetic-safe portfolio (the documented "degrade to in-memory
+        # default, never crash" contract — same terminal fallback as the
+        # row-is-None path), never None cash/total_value.
+        corrupt = {"cash": None, "total_value": None,
+                   "positions_json": None,
+                   "last_updated": None}
+
+        class _AlwaysCursor:
+            def __init__(self, row):
+                self._row = row
+
+            def fetchone(self):
+                return self._row
+
+        class _AlwaysConn:
+            def __init__(self, row):
+                self._row = row
+
+            def execute(self, sql, *a, **k):
+                if "SELECT id FROM portfolio" in sql:
+                    return _AlwaysCursor({"id": 1})
+                return _AlwaysCursor(self._row)
+
+            def commit(self):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(fresh_store, "conn", _AlwaysConn(corrupt))
+        pf = fresh_store.get_portfolio()  # must NOT raise
+        assert pf["cash"] == INITIAL_CASH
+        assert pf["total_value"] == INITIAL_CASH
+        assert pf["positions"] == []
+        # Proves the live-loop symptom is gone: pre-fix this was `None + x`.
+        assert isinstance(pf["total_value"] + 1.0, float)
+
 
 class TestReadWriteThreadSafety:
     """Regression lock: every public read must serialize on Store._lock.
