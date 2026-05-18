@@ -13,7 +13,7 @@ from core.claude_cli import claude_call
 # "ap matched inside snap" class of bug — tests/test_features.py) rather than
 # duplicating the 40-entry SOURCE_CRED map here, which would silently drift
 # (the recurring dashboard-parity / vendored-signals.py failure class).
-from ml.features import _source_credibility
+from ml.features import _source_credibility, LIVE_PORTFOLIO_TICKERS, _LIVE_RE
 from watchers import alert_recency
 from watchers.alert_dedup import alerted_ids, dedupe_urgent
 
@@ -53,6 +53,8 @@ Categories: EARNINGS | RATING CHANGE | MACRO SHOCK | SUPPLY CHAIN | REGULATORY |
 RECENCY: Each article below carries `age` = elapsed time since publication. Reflect it honestly — an item several hours old is a developing/continued story, NOT one that "just" broke; never imply a multi-hour-old item happened moments ago. {now_utc} is the alert send time, not the event time. If an item is materially old (≳3h), make that explicit in CONTEXT (e.g. "first reported ~Nh ago").
 
 CONTINUITY: If an article carries a `related:` line, a standalone 🚨 BREAKING alert on a related developing story ALREADY fired to this analyst within the last few hours — they have already been told the headline event. Frame THIS alert explicitly as a continuation/update of it: lead the HEADLINE with a development verb (ESCALATES / EXTENDS / WIDENS / FOLLOWS), and in CONTEXT state it follows the earlier alert (e.g. "follows ~Nh-ago alert on <prior event>"). Do NOT present it as the first time this story broke. This is what stops the analyst seeing what reads as a duplicate BREAKING for an event they are already tracking.
+
+BOOK: If an article carries a `book:` line, it names live portfolio/watchlist positions the analyst actually has money in (LITE/LNOK/MUU/DRAM/SNDU/MU/MSFT/AXTI/ORCL/TSEM/QBTS/NVDA). That event is directly actionable for the analyst's open risk: the PORTFOLIO line MUST name the listed held ticker(s) and give a concrete directional implication for each, and weight this article's IMPACT above generic macro colour of similar magnitude. Absence of a `book:` line means the event does not touch the held book — keep PORTFOLIO short (sector read-through only, no invented position).
 
 Urgent articles detected:
 {articles_text}
@@ -238,6 +240,43 @@ def _filter_quote_widget_noise(
     for a in arts:
         (suppressed if _looks_like_quote_widget(a) else kept).append(a)
     return kept, suppressed
+
+
+# ── Held-book relevance (the analyst's open positions) ───────────────────────
+# The 🚨 BREAKING alert is the analyst's most time-critical product, and the
+# persona is explicitly "I depend on this to react to events affecting MY
+# positions". Yet the prompt's mandatory PORTFOLIO line relied entirely on
+# Sonnet *inferring* held-ticker relevance from the raw headline — a lone
+# "Lumentum guides Q4 down" with no "LITE" in the text got a generic PORTFOLIO
+# line, and a real held-name break read identically to generic macro colour.
+# This surfaces the held tickers explicitly in the alert input, exactly like
+# the briefing's well-tested ``[BOOK: ...]`` tag (tests/test_briefing_book_tag),
+# so the two consumed products judge "touches the book" the same way (the
+# documented cross-product anti-drift discipline). Reuses ml.features'
+# LIVE_PORTFOLIO_TICKERS / _LIVE_RE verbatim — alert_agent already imports
+# _source_credibility from that module, so this is a single source of truth
+# with the model's own ticker features and can never drift from a local copy.
+# Pure read-side: no DB write, no ai_score/ml_score/score_source/urgency touch,
+# backtest rows already filtered by _is_synthetic / the store — only the prompt
+# text Sonnet reads is enriched. All four load-bearing invariants intact.
+def _book_tickers(art: dict) -> list[str]:
+    """Held/watchlist tickers mentioned in an urgent row's title+summary.
+
+    Sorted (deterministic, stable cycle-to-cycle), de-duplicated; ``[]`` when
+    the row touches no held name. Matches on ``title + summary`` — the SAME
+    surface as the briefing's ``_book_tickers`` and ml.features ticker density,
+    so an alert and the 5h digest never disagree about whether a wire touches
+    the book. Pure, side-effect-free; reads only ``title``/``summary`` via
+    ``.get()`` and never mutates the article."""
+    blob = f"{art.get('title') or ''} {art.get('summary') or ''}"
+    if not blob.strip():
+        return []
+    hits = {m.upper() for m in _LIVE_RE.findall(blob)}
+    if not hits:
+        return []
+    # hits ⊆ LIVE_PORTFOLIO_TICKERS by construction (the regex only matches
+    # those literals); sorted() gives a stable, test-pinnable order.
+    return sorted(hits)
 
 
 def _is_synthetic(art: dict) -> bool:
@@ -499,6 +538,18 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
             # Tell the alert LLM how broadly the story is being carried — wide
             # syndication is itself a signal of how big the event is.
             block += f"\nsyndication: reported by {dup_count} sources"
+        # Held-book relevance — drives the prompt's BOOK rule so the mandatory
+        # PORTFOLIO line names the analyst's actual open risk instead of Sonnet
+        # guessing ticker relevance from the headline alone. Same shape as the
+        # additive age/syndication/related lines; same concept as the briefing's
+        # [BOOK:] tag (cross-product parity). Read-only — see _book_tickers.
+        book = _book_tickers(a)
+        if book:
+            block += (
+                f"\nbook: {','.join(book)} — analyst HOLDS/watches these; "
+                f"the PORTFOLIO line MUST give a concrete directional "
+                f"implication for them"
+            )
         rel = a.get("_related_prior")
         if isinstance(rel, dict) and (rel.get("title") or "").strip():
             # Drives the prompt's CONTINUITY rule — a related 🚨 alert already
