@@ -1,6 +1,7 @@
 """Flask dashboard at :8090 — portfolio chart, trade log, positions, decisions, backtests."""
 from __future__ import annotations
 
+import gzip
 import json
 import re
 import sqlite3
@@ -128,6 +129,41 @@ def _cors(resp):
     return resp
 
 
+@app.after_request
+def _gzip_local_json(resp):
+    # Compress only locally-generated JSON. Streamed / direct_passthrough /
+    # non-200 bodies (e.g. SWR {"warming": true} or streaming responses) are
+    # skipped by the guards below — rely on them, nothing extra needed.
+    try:
+        if "gzip" not in request.headers.get("Accept-Encoding", ""):
+            return resp
+        if resp.status_code != 200:
+            return resp
+        if resp.direct_passthrough:
+            return resp
+        if resp.is_streamed:
+            return resp
+        if resp.headers.get("Content-Encoding"):
+            return resp
+        if not resp.headers.get("Content-Type", "").startswith("application/json"):
+            return resp
+        body = resp.get_data()
+        if len(body) < 1024:
+            return resp
+        gzipped = gzip.compress(body)
+        resp.set_data(gzipped)
+        resp.headers["Content-Encoding"] = "gzip"
+        vary = resp.headers.get("Vary")
+        if vary:
+            if "accept-encoding" not in vary.lower():
+                resp.headers["Vary"] = vary + ", Accept-Encoding"
+        else:
+            resp.headers["Vary"] = "Accept-Encoding"
+        return resp
+    except Exception:
+        return resp
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Stale-while-revalidate response cache for the slow yfinance/cross-DB
 # endpoints (resolves AGENTS.md invariant #7's "remaining genuine concern").
@@ -166,7 +202,7 @@ from functools import wraps as _wraps
 _SWR_LOCK = _threading.Lock()
 _SWR_STATE: dict = {}
 _SWR_EXEC = _ThreadPoolExecutor(max_workers=6, thread_name_prefix="dash-swr")
-_SWR_COLD_BUDGET_S = 6.0
+_SWR_COLD_BUDGET_S = 2.0
 _SWR_TEST_FORCE = False  # dedicated SWR tests flip this; never set in prod
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -8807,6 +8843,53 @@ def model_reliability_api():
         return jsonify({"error": str(e)}), 500
 
 
+def _swr_prewarm():
+    """Pre-build every slow SWR cache once at boot.
+
+    On a service restart every ``@swr_cached`` cache is empty, so the first
+    poll of each endpoint pays the full cold path: it blocks
+    ``_SWR_COLD_BUDGET_S``, returns ``{"warming": true}``, and the real data
+    only lands on the *next* auto-refresh poll — a multi-second dead page
+    after every restart. This enqueues a single-flight background rebuild for
+    each endpoint's default (no-query-string) variant the instant the server
+    boots, so the caches are populated before the first user poll.
+
+    Enqueues via ``_swr_refresh`` (not the decorated wrapper) so it returns
+    immediately: every job is handed to ``_SWR_EXEC``'s workers, which grind
+    through them concurrently. ``name + "?"`` is exactly the cache key the
+    wrapper builds for an empty query string, so the warmed entry is the one
+    a real request hits. ``wrapper.__wrapped__`` is the undecorated handler
+    (set by functools.wraps) — ``_swr_refresh`` expects the raw handler, not
+    the SWR wrapper. Staggered to avoid a startup thundering-herd on the
+    USB-backed store / yfinance. Daemon thread — never blocks ``app.run()``."""
+    _time.sleep(2.0)  # let the WSGI server bind and the store settle first
+    targets = [
+        ("state", state),
+        ("data-feed", data_feed_api),
+        ("backtests-list", backtests_api),
+        ("backtests-leaderboard", backtest_leaderboard_api),
+        ("backtests-stats", backtest_stats_api),
+        ("briefing", briefing_api),
+        ("suggestions", suggestions_api),
+        ("scorer-predictions", scorer_predictions_api),
+        ("sector-heatmap", sector_heatmap_api),
+        ("game_plan", game_plan_api),
+        ("correlation", correlation_api),
+        ("thesis-drift", thesis_drift_api),
+        ("news-edge", news_edge_api),
+        ("source-edge", source_edge_api),
+        ("feed-health", feed_health_api),
+        ("decision-context", decision_context_api),
+    ]
+    for name, wrapper in targets:
+        try:
+            raw = getattr(wrapper, "__wrapped__", wrapper)
+            _swr_refresh(name + "?", raw, (), {}, "")
+        except Exception as e:
+            print(f"[dashboard] SWR prewarm enqueue {name} failed: {e}")
+        _time.sleep(0.5)
+
+
 def run(host: str = "0.0.0.0", port: int = 8090):
     # threaded=True: the dashboard's real load is concurrent (the unified
     # :8888 page fires ~25 panel fetches in parallel, /api/chat fans out ~15
@@ -8815,6 +8898,13 @@ def run(host: str = "0.0.0.0", port: int = 8090):
     # behind one slow yfinance-backed endpoint. Safe: store.py serializes
     # every read on Store._lock and is explicitly hardened for "the Flask
     # dashboard thread(s)"; slow endpoints use their own mode=ro connections.
+    # Pre-warm the SWR caches in the background so the first poll after a
+    # restart serves real data instead of a cold-stall + {"warming": true}.
+    # Guarded by _swr_active(): inert under pytest (no 16 background builds
+    # during the test suite). Daemon thread — does not block app.run().
+    if _swr_active():
+        _threading.Thread(target=_swr_prewarm, name="dash-swr-prewarm",
+                           daemon=True).start()
     app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
 
 
