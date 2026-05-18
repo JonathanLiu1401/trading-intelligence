@@ -3057,6 +3057,86 @@ wrong unit (this has historically caused duplicate-runner double-trading; the
 
 ---
 
+### 2026-05-18 feature-dev pass — SWR cold-path failure observability + scorer-confidence bounded
+
+**User-perspective testing surfaced a real production defect, not a missing
+feature.** The `:8090` analytics surface is already very mature (~64 routes;
+sector-heatmap / drawdown / calibration / suggestions / correlation / Calmar
+all exist). The high-impact gap is **reliability/observability**, reproduced
+live (read-only HTTP probes against the running service):
+
+- **Observed (empirical, not inferred):** `/api/briefing` returned
+  `{"warming":true}` on **8+ consecutive polls over 60s+**, never serving
+  real data in-window; `news-edge` / `source-edge` / `decision-context`
+  same. `/api/scorer-confidence` — the **one** expensive-replay endpoint
+  **not** `@swr_cached` — hung the request thread `>30s` (curl code 000).
+  `runner.log` carried **zero** SWR exception traces.
+- **Root cause of the observability hole (proven):** `_swr_refresh._run`
+  did `except Exception: return None`. A background rebuild that *raises*
+  (vs. merely slow) populated the cache **never**, recorded the exception
+  **nowhere** (no log, no counter, no placeholder field), and every poll
+  re-served the same opaque `{"warming":true}` **forever**. 16 endpoints
+  are exposed to this. An operator could not distinguish "slow, will
+  self-heal" from "raising every cycle, will NEVER self-heal".
+- **Deliberately NOT claimed:** whether briefing's specific never-warming
+  is a raising handler vs. chronic `>TTL` slowness vs. pool starvation was
+  *not* isolated (a fresh standalone import of `dashboard` blocks >70s, so
+  the handler could not be cleanly bench-called out-of-process). The
+  diagnostic surface is useful in all three cases; this commit is framed
+  as *"add the diagnostic surface"*, not *"fixed briefing"*.
+
+**Built (this commit — `paper_trader/dashboard.py` +
+`tests/test_swr_failure_observability.py`):**
+
+1. **SWR failure observability.** `_swr_entry` carries
+   `fail_count / last_error / last_error_ts / last_ok_ts`. `_run` on
+   exception increments the consecutive-failure count, records
+   `Type: msg` (≤200 chars), and prints a **throttled** `[swr]` stderr
+   line — the 1st failure (early warning) and every
+   `_SWR_FAIL_LOG_EVERY=10`th (sustained), never once-per-poll. A
+   successful build **resets** the streak (a transient blip is not
+   reported forever). The cold placeholder now carries
+   `attempts / last_error / stale_for_s` — `attempts==0 & last_error==None`
+   ⇒ *slow but healthy* ("be patient"); `attempts>0` ⇒ *raising, will not
+   self-heal* (actionable). Purely additive to the `{"warming":true}` body
+   (verified: no exact-keyset consumer in tests/ or the template); the
+   happy path is byte-identical.
+2. **`/api/scorer-confidence` is now `@swr_cached("scorer-confidence",
+   90.0)`** (TTL matches briefing / sector-heatmap / correlation — the
+   other expensive ones). A cold scorer replay can no longer wedge a Flask
+   request thread; it returns the bounded warming placeholder and
+   self-heals. SWR is pytest-inert, so the existing exact-value
+   `test_scorer_honesty.py` path is unchanged.
+
+**Known upstream follow-up (NOT addressed here — different change,
+different risk; flagged not silently fixed):** `_SWR_EXEC` has
+`max_workers=6` but **16** `@swr_cached` endpoints, all cold-fetched on a
+single dashboard load → guaranteed queue thrash under the documented load
+avg ~23. If briefing's never-warming is mostly this, `attempts` will
+correctly read `0` ("slow, not broken") indefinitely and the panel still
+stays blank — the *observability is honest*, but the real lever is pool
+sizing / cold-fetch fan-out, not this commit. `_SWR_COLD_BUDGET_S` and
+`max_workers` were **deliberately left unchanged** (tuned for current
+load; bumping them is a separate, riskier change that would muddy this
+one).
+
+**Operator action required:** live `:8090` runs stale code (chronic — see
+CLAUDE.md §11 / project memory). The new diagnostic is inert until
+`systemctl --user daemon-reload && systemctl --user restart paper-trader`.
+
+**Tests:** `+5` in `tests/test_swr_failure_observability.py` (raising →
+`attempts`/`last_error` surfaced & growing; slow → `attempts==0`/no error;
+success resets then a fresh failure restarts at 1; consecutive failure
+logs `[swr]` to stderr; scorer-confidence stays swr-wrapped — TDD,
+RED→GREEN confirmed). Full suite **1613 passed** (+5 net), zero
+regressions; SWR-adjacent set (`test_dashboard_swr`, `test_core_state_swr`,
+`test_decision_context_endpoint`, `test_scorer_honesty`,
+`test_core_dashboard_bounded_net`) 31 passed.
+
+*Feature-dev pass appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
 ### 2026-05-18 review pass #15 (ML+backtest hybrid · gate economic counterfactual · decisive news-feature-deadness finding)
 
 - **Phase 1 — no new bugs (bugs_fixed = 0; no Phase-1 commit).** Full
