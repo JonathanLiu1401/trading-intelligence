@@ -269,6 +269,44 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def closed_positions(self, limit: int = 100) -> list[dict]:
+        """Closed position lots with realized P&L summed from trades that ran
+        against the same (ticker,type,expiry,strike) tuple inside the lot's
+        [opened_at, closed_at] window. SELL/CLOSE legs add to realized; BUY/OPEN
+        legs subtract. Returns newest-closed first."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM positions WHERE closed_at IS NOT NULL "
+                "ORDER BY closed_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            out: list[dict] = []
+            for r in rows:
+                d = dict(r)
+                ptype = (d.get("type") or "").lower()
+                opt = ptype if ptype in ("call", "put") else None
+                trades = self.conn.execute(
+                    "SELECT action, value FROM trades "
+                    "WHERE ticker=? AND IFNULL(option_type,'')=IFNULL(?,'') "
+                    "AND IFNULL(expiry,'')=IFNULL(?,'') "
+                    "AND IFNULL(strike,0)=IFNULL(?,0) "
+                    "AND timestamp >= ? AND timestamp <= ?",
+                    (d["ticker"], opt, d.get("expiry"),
+                     d.get("strike"), d["opened_at"], d["closed_at"]),
+                ).fetchall()
+                realized = 0.0
+                for t in trades:
+                    act = (t["action"] or "").upper()
+                    val = float(t["value"] or 0.0)
+                    if act in ("SELL", "CLOSE", "SELL_TO_CLOSE"):
+                        realized += val
+                    elif act in ("BUY", "OPEN", "BUY_TO_OPEN"):
+                        realized -= val
+                d["realized_pl"] = round(realized, 2)
+                d["n_trades"] = len(trades)
+                out.append(d)
+            return out
+
     def update_position_marks(self, marks: dict):
         """marks: {position_id: (current_price, unrealized_pl)}"""
         with self._lock:

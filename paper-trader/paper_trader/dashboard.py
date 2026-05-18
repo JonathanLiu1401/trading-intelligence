@@ -5847,6 +5847,36 @@ def portfolio_api():
     })
 
 
+@app.route("/api/closed-positions")
+def closed_positions_api():
+    """Closed position lots with realized P&L computed from matching trades
+    inside each lot's [opened_at, closed_at] window. Supports `?limit=N`
+    (1..1000, default 100). Returns newest-closed first plus a rollup
+    summary (total realized, win count, loss count, win rate)."""
+    try:
+        limit = max(1, min(int(request.args.get("limit", 100)), 1000))
+    except (TypeError, ValueError):
+        limit = 100
+    store = get_store()
+    lots = store.closed_positions(limit=limit)
+    wins = sum(1 for p in lots if (p.get("realized_pl") or 0) > 0)
+    losses = sum(1 for p in lots if (p.get("realized_pl") or 0) < 0)
+    total_realized = round(sum((p.get("realized_pl") or 0.0) for p in lots), 2)
+    decided = wins + losses
+    win_rate = round(100.0 * wins / decided, 2) if decided else None
+    return jsonify({
+        "positions": lots,
+        "summary": {
+            "n": len(lots),
+            "wins": wins,
+            "losses": losses,
+            "flat": len(lots) - wins - losses,
+            "total_realized_pl": total_realized,
+            "win_rate_pct": win_rate,
+        },
+    })
+
+
 @app.route("/api/data-feed")
 @swr_cached("data-feed", 30.0)
 def data_feed_api():
