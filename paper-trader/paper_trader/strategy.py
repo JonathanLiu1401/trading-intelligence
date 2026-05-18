@@ -1259,6 +1259,7 @@ def decide() -> dict:
     decision = _parse_decision(raw) if raw else None
     retried = False
     fallback_used = False
+    fb_prompt = None
 
     # True timeout (raw is None, so _should_retry_parse is False): Opus blew
     # past its budget. Retrying the full prompt on Opus would just stall again,
@@ -1291,6 +1292,18 @@ def decide() -> dict:
             # operators see what the retry looked like.
             if retry_raw:
                 raw = retry_raw
+
+    # JSON nudge retry for Sonnet fallback parse failure
+    elif not decision and fallback_used and _should_retry_parse(raw) and fb_prompt is not None:
+        retried = True
+        print("[strategy] Sonnet fallback parse failed; retrying with JSON-only nudge")
+        retry_raw = _claude_call(fb_prompt + _RETRY_SUFFIX, timeout_s=RETRY_TIMEOUT_S,
+                                 model=FALLBACK_MODEL)
+        retry_decision = _parse_decision(retry_raw) if retry_raw else None
+        if retry_decision:
+            raw, decision = retry_raw, retry_decision
+        elif retry_raw:
+            raw = retry_raw
 
     summary = {
         "market_open": market_open,
