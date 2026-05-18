@@ -52,6 +52,8 @@ Categories: EARNINGS | RATING CHANGE | MACRO SHOCK | SUPPLY CHAIN | REGULATORY |
 
 RECENCY: Each article below carries `age` = elapsed time since publication. Reflect it honestly — an item several hours old is a developing/continued story, NOT one that "just" broke; never imply a multi-hour-old item happened moments ago. {now_utc} is the alert send time, not the event time. If an item is materially old (≳3h), make that explicit in CONTEXT (e.g. "first reported ~Nh ago").
 
+CONTINUITY: If an article carries a `related:` line, a standalone 🚨 BREAKING alert on a related developing story ALREADY fired to this analyst within the last few hours — they have already been told the headline event. Frame THIS alert explicitly as a continuation/update of it: lead the HEADLINE with a development verb (ESCALATES / EXTENDS / WIDENS / FOLLOWS), and in CONTEXT state it follows the earlier alert (e.g. "follows ~Nh-ago alert on <prior event>"). Do NOT present it as the first time this story broke. This is what stops the analyst seeing what reads as a duplicate BREAKING for an event they are already tracking.
+
 Urgent articles detected:
 {articles_text}
 
@@ -433,6 +435,33 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
     # so we cap both ends.
     batch = deduped[:ALERT_BATCH_SIZE]
 
+    # Continuation context (non-suppressing). Cross-cycle suppression above
+    # already dropped EXACT-signature repeats; what survives can still be a
+    # *different* headline about a story the analyst was already pushed (live:
+    # the UAE-strike alert at 01:55 then a Brent/markets follow-up — distinct
+    # signatures, correctly NOT collapsed). With no hint the LLM writes the
+    # follow-up as if it just broke → the analyst's top "duplicate alerts"
+    # complaint, on the one product (the standalone push) that never got the
+    # mitigation the briefing's [ALERTED] tag gave. Annotate (never drop) each
+    # survivor with the related prior alert so the prompt's CONTINUITY rule
+    # frames it as a developing update. Best-effort: a recency-store failure
+    # yields [] → no annotation → exact pre-feature behaviour (a genuine alert
+    # must always still fire). Read-only: alert_recency.db only, NEVER
+    # articles.db — no ai_score/ml_score/score_source/urgency touch, backtest
+    # already filtered above. All four invariants intact by construction.
+    try:
+        _recent = alert_recency.recent_alerts()
+    except Exception:
+        _recent = []
+    if _recent:
+        for a in batch:
+            try:
+                rel = alert_recency.related_prior_alert(a.get("title"), _recent)
+            except Exception:
+                rel = None
+            if rel:
+                a["_related_prior"] = rel
+
     def _fmt(a: dict) -> str | None:
         # Defensive field access. The rest of this pipeline (_is_synthetic,
         # dedupe_urgent) reads every key through .get(); _fmt used to be the
@@ -470,6 +499,22 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
             # Tell the alert LLM how broadly the story is being carried — wide
             # syndication is itself a signal of how big the event is.
             block += f"\nsyndication: reported by {dup_count} sources"
+        rel = a.get("_related_prior")
+        if isinstance(rel, dict) and (rel.get("title") or "").strip():
+            # Drives the prompt's CONTINUITY rule — a related 🚨 alert already
+            # fired, so this is a developing update, not a fresh break.
+            rh = float(rel.get("age_hours") or 0.0)
+            if rh < 1.0:
+                rage = f"{int(round(rh * 60))}m"
+            elif rh < 10.0:
+                rage = f"{rh:.1f}h"
+            else:
+                rage = f"{int(round(rh))}h"
+            block += (
+                f"\nrelated: a 🚨 BREAKING alert fired ~{rage} ago on a "
+                f"related developing story — \"{rel['title'][:140]}\" "
+                f"(frame THIS as a continuation/update, not a fresh break)"
+            )
         summary = (a.get("summary") or "").strip()
         if summary:
             block += f"\nbody: {summary[:600]}"

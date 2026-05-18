@@ -139,6 +139,124 @@ def recent_signatures(
                 pass
 
 
+def recent_alerts(
+    ttl_hours: float = ALERT_RECENCY_TTL_HOURS,
+    now: datetime | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict]:
+    """Recently-fired alerts within ``ttl_hours`` as
+    ``[{"sig","title","age_hours"}, ...]``, newest first.
+
+    The richer sibling of ``recent_signatures``: it also returns the stored
+    headline and how long ago it fired, so the alert prompt can surface a
+    *continuation* hint (see ``related_prior_alert`` /
+    ``alert_agent._fmt``). Best-effort — any failure yields ``[]`` (the
+    pre-feature behaviour: no hint), identical safety contract to
+    ``recent_signatures``. Never raises into the alert path.
+    """
+    cutoff_dt = _now(now) - timedelta(hours=ttl_hours)
+    cutoff = cutoff_dt.isoformat()
+    own = conn is None
+    try:
+        conn = conn or _connect()
+    except Exception as e:  # pragma: no cover - defensive
+        _log.warning(f"[alert_recency] open failed (degrading to no-op): {e}")
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT sig, title, last_ts FROM alerted_sig "
+            "WHERE last_ts >= ? ORDER BY last_ts DESC",
+            (cutoff,),
+        ).fetchall()
+    except Exception as e:
+        _log.warning(f"[alert_recency] recent_alerts failed: {e}")
+        return []
+    finally:
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    out: list[dict] = []
+    base = _now(now)
+    for sig, title, last_ts in rows:
+        if not sig:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(last_ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_h = (base - dt).total_seconds() / 3600.0
+        except Exception:
+            continue
+        if age_h < 0:
+            age_h = 0.0
+        out.append({"sig": sig, "title": title or "", "age_hours": age_h})
+    return out
+
+
+# Generic finance/English tokens that carry no event identity — excluded from
+# the relatedness overlap so two structurally-similar but unrelated headlines
+# ("Stock Market Today ...", "Stock Market Wrap ...") are NOT called a
+# continuation. Deliberately small and high-precision: this gate only ever
+# ADDS prompt context (never suppresses an alert), but the consuming analyst's
+# top complaint is noise, so a false "developing" framing is still worth
+# avoiding. Conservative by design — under-claim rather than over-claim.
+_REL_STOPWORDS = frozenset({
+    "the", "a", "an", "of", "to", "in", "on", "for", "and", "as", "at",
+    "is", "are", "be", "by", "with", "from", "after", "amid", "over",
+    "stock", "stocks", "market", "markets", "today", "news", "update",
+    "report", "live", "us", "u", "s", "say", "says", "said", "new",
+})
+
+
+def related_prior_alert(
+    title: str | None,
+    recent: list[dict],
+    *,
+    min_shared: int = 3,
+) -> dict | None:
+    """Pure: is ``title`` a *continuation* of an alert already fired?
+
+    Returns the best ``{"title","age_hours","shared"}`` match or ``None``.
+    No DB / IO so the decision is unit-testable in isolation, mirroring the
+    ``(kept, suppressed)`` shape of the other gates.
+
+    A match requires the two canonical ``_signature`` token sets to share at
+    least ``min_shared`` *salient* tokens (``_REL_STOPWORDS`` removed) while
+    NOT being identical — an exact-signature repeat is a true duplicate and is
+    already dropped upstream by ``partition_already_alerted``; this only fires
+    for a genuinely *different* headline about the same developing event (the
+    case cross-cycle suppression deliberately does NOT collapse, so the analyst
+    gets a second standalone 🚨 BREAKING with zero continuity framing). Among
+    qualifying priors the one sharing the most salient tokens wins; ties break
+    to the more recent (``recent`` is newest-first, so first qualifying wins a
+    tie). NON-suppressing by contract: the caller only adds a prompt line.
+    """
+    sig_cur = _signature(title)
+    if not sig_cur:
+        return None
+    cur = {t for t in sig_cur.split() if t not in _REL_STOPWORDS}
+    if len(cur) < min_shared:
+        return None
+    best: dict | None = None
+    best_n = min_shared - 1
+    for r in recent:
+        sig_prev = r.get("sig") or ""
+        if not sig_prev or sig_prev == sig_cur:
+            continue  # missing, or exact dup (already suppressed upstream)
+        prev = {t for t in sig_prev.split() if t not in _REL_STOPWORDS}
+        shared = cur & prev
+        if len(shared) > best_n:
+            best_n = len(shared)
+            best = {
+                "title": r.get("title") or "",
+                "age_hours": float(r.get("age_hours") or 0.0),
+                "shared": sorted(shared),
+            }
+    return best
+
+
 def partition_already_alerted(
     articles: list[dict], recent_sigs: set[str]
 ) -> tuple[list[dict], list[dict]]:
