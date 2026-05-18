@@ -2531,3 +2531,127 @@ deletion is safe even if a backtest thread is mid-read.
   tests/test_feature_importance.py tests/test_skill_trend.py
   tests/test_regime_audit.py tests/test_baseline_compare.py -q`
   (289 fast offline tests, green).
+
+---
+
+### 2026-05-18 ops session (dashboard polish · backtest throttle · stale-code restarts · live findings)
+
+Not a review pass — an operator-driven maintenance + deploy session. Every
+commit hash below was verified on disk (`git show`), and the throttle / runner
+changes were re-read in `run_continuous_backtests.py` and `paper_trader/runner.py`
+at write time. A future agent picking this up should treat the "outstanding"
+list as the live to-do.
+
+**What was fixed / changed this session**
+
+- **Dashboard cosmetics (commit `b49114c`, on disk).**
+  - Removed the stray leading `→ ` from the **position thesis cards** — the
+    JS template in `refreshThesis()` (`paper_trader/dashboard.py` ~L3708) was
+    `<div …>→ ${c.thesis||"—"}</div>`; the arrow rendered as "random arrows on
+    the left side" of every thesis card. Now `${c.thesis||"—"}` with no prefix.
+  - **Last Validation** timestamp now human-readable: `refreshValidation()`
+    (~L4376) sets `val-last-when` via
+    `new Date(latest.timestamp).toLocaleString()` instead of dumping the raw
+    ISO string. Pure front-end string formatting — no API/contract change.
+  - This was a large diff (+162/−2) because the same commit also carried the
+    `/api/hold-discipline` + `runner_heartbeat` work; the two one-line UI
+    fixes are the lines quoted above.
+
+- **Continuous-backtest throttle (commit `bf23133`, on disk).**
+  `run_continuous_backtests.py`: `RUNS_PER_CYCLE` now **`1`** (the dispatching
+  operator recalled it as `3→1`; the commit message and on-disk comment only
+  assert "throttled to 1" — CLAUDE.md §7 documents the historical default as
+  `5`, so the *current* value `1` is the load-bearing fact, not the "from"),
+  `COOLDOWN_SECONDS` `300→600` (confirmed by the on-disk comment "throttled
+  from 300s"), and `TOP_RUNS_TO_TRAIN` also dropped to `1` (only the single
+  best run trains when throttled). Driven by a sustained load average of
+  **37+**.
+  **Treat these as a floor, not a default — do NOT raise them back without an
+  explicit decision.** This mirrors and is consistent with the standing
+  `continuous-backtests OOM` operating note (the box is RAM/load-constrained;
+  `_CLAUDE_SEM=3`, `nice 10`, single run-cycle are all deliberate governors).
+  Current on-disk values confirmed: `RUNS_PER_CYCLE = 1`,
+  `TOP_RUNS_TO_TRAIN = 1`, `COOLDOWN_SECONDS = 600` (lines 48/49/52).
+
+- **Git-watcher deferred restart (commit `cf516c0`, on disk, applied).**
+  `paper_trader/runner.py::_git_watcher` records git HEAD at boot, sleeps 120s
+  for startup, then re-polls every 180s. On a HEAD change it pings Discord,
+  sets `_restart_requested`, and returns; the **main loop** performs the actual
+  `os._exit(0)` at the next cycle boundary (or interrupts the inter-cycle
+  sleep via `_restart_requested.wait()`), so a committed fix is auto-applied
+  without ever killing a mid-Opus decision call. systemd `Restart=always`
+  brings the process back on the new code. Fail-open: any git/subprocess error
+  just skips that poll. Already committed and applied via the service restart
+  below.
+
+- **DB-count fast path (commit `5265d8e`, on disk, applied).**
+  `/api/stats` is now O(log N): total via `MAX(rowid)` plus cached backlog
+  counts instead of a full `COUNT(*)` over the large WAL DB. Already committed;
+  applied via the service restart.
+
+- **Stale-code service restarts (operator action, this session).**
+  `paper-trader` and `unified-proxy` were running code older than HEAD
+  (`/api/build-info` `stale:true`) so the committed fixes above were on disk
+  but not live. Both were restarted via `systemctl --user restart` to pick up
+  HEAD. After any commit to this repo, confirm the running process is current
+  with `curl -s localhost:8090/api/build-info` (look for `stale:false`); the
+  in-process git-watcher (`cf516c0`) now does this automatically within ~3 min,
+  but a manual restart is the immediate remedy.
+
+**Outstanding / known issues (live to-do for the next agent)**
+
+- **NO_DECISION rate ~54%.** This session's working diagnosis was *Opus
+  returning a valid decision wrapped in a markdown fence the parser missed*,
+  and a fix agent was dispatched (fix pending, not yet landed at session end).
+  **Important context for whoever picks this up:** the standing, repeatedly
+  documented finding (CLAUDE.md §11; AGENTS.md ML/backtest passes #6–#12; the
+  operator memory note "paper-trader NO_DECISION = quota, not JSON") is that a
+  high NO_DECISION rate is most often **Claude org usage-limit/quota
+  exhaustion plus concurrent-agent contention**, *not* a parser bug — the
+  `_parse_decision` path already strips ```json fences and `raw_decode`s the
+  first object, has a Sonnet fallback, and a JSON-only retry. Before "fixing
+  the parser", verify with `/api/decision-forensics` and the runner stdout
+  whether the failures are `quota_exhausted` (the runner sets that flag and
+  fires `send_quota_alert`) vs genuinely-unparseable non-empty text. Do not
+  re-fix an already-robust parser if the real cause is quota.
+- **System load still elevated (~25).** Partly the parallel review/fix agents
+  running the pytest suites; partly the box's baseline. The backtest throttle
+  above is the main lever already pulled. Watch `uptime` / the
+  `continuous-backtests` cooldown before adding any new concurrent workload.
+
+**Service management (all user units — note `--user`)**
+
+```bash
+systemctl --user {start,stop,restart,status} paper-trader
+systemctl --user {start,stop,restart,status} continuous-backtests
+systemctl --user {start,stop,restart,status} unified-proxy
+```
+
+`paper-trader` is the live trader (`python3 -m paper_trader.runner`),
+`continuous-backtests` is the training loop (`run_continuous_backtests.py`),
+`unified-proxy` is the tailscale-funnel'd reverse proxy on `:8888`. These run
+as **user** services — a `sudo systemctl` / system-unit invocation targets the
+wrong unit (this has historically caused duplicate-runner double-trading; the
+`runner.py` single-instance flock, invariant #19, is the guard).
+
+**Key file locations**
+
+| Path | Role |
+|------|------|
+| `paper_trader/dashboard.py` | Single-file Flask app on `:8090`, ~7–8k lines — HTML `TEMPLATE` + inline JS (`refreshThesis`, `refreshValidation`, …) + ~45 `/api/*` routes |
+| `paper_trader/runner.py` | Live trading loop — cycle, single-instance flock, git-watcher, circuit breaker, restart-durable report markers |
+| `run_continuous_backtests.py` | ML training loop (the `continuous-backtests` service) — throttle constants at lines 48–52 |
+| `paper_trader/store.py` | SQLite store, `data/paper_trader.db` (WAL) — live portfolio/positions/trades/decisions/equity_curve |
+| `backtest.db` | SQLite, `backtest_runs` / `_trades` / `_decisions` (run history, equity curves) |
+| `data/decision_outcomes.jsonl` | DecisionScorer training data (forward 5d returns) |
+| `data/ml/decision_scorer.pkl` | Trained MLP pickle |
+
+**Architecture reminder (ports)**
+
+- `paper-trader` dashboard → **`:8090`**
+- `digital-intern` dashboard/API → **`:8080`** (paper-trader reads its
+  `articles.db` read-only; digital-intern cross-fetches `:8090/api/portfolio`)
+- `unified-proxy` (tailscale funnel front door) → **`:8888`** — single public
+  ingress; both dashboards are reached through it
+
+*Ops session appended 2026-05-18. Prior content above is unmodified.*
