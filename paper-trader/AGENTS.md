@@ -4383,3 +4383,138 @@ pass #16/#17 shared-index-race lesson applied).
   pass-#18 locks.
 
 *Review pass #18 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 review pass #18 (ML+backtest hybrid · gate-decision capture · live findings)
+
+- **Phase 1 — no new bug (bugs_fixed = 0; no Phase-1 commit, commit guard
+  explicitly permits).** Full re-trace of `decision_scorer.py`,
+  `backtest.py`, `run_continuous_backtests.py` plus the newest, least-
+  reviewed diagnostic modules (`baseline_trend.py`, `horizon_audit.py`,
+  `gate_pnl.py`, `response_audit.py`, `corpus_audit.py`) and coupled
+  `validation.split_outcomes_temporal` / `evaluate_scorer_oos`:
+  the `_aligned` SELL `-forward_return` flip is applied to **both** probe
+  and target uniformly in `horizon_audit._horizon_skill` (no spurious
+  anti-correlation on the SELL subset); `baseline_trend` correctly
+  excludes non-`ok`/null-`ic_gap` rows and never divides by zero on the
+  small live slice (verified live: returns `INSUFFICIENT_DATA` on the
+  *absent* `baseline_skill_log.jsonl`, no crash — the AGENTS.md claim
+  holds); `_horizon_skill` drops non-finite/`nan` labels rather than
+  zero-coercing them and guards `np.std==0` before `_spearman`;
+  `_fwd_ret_h` gates on `price_on() is None` exactly like the byte-
+  identical 5d path (no fabricated-zero asymmetry between the 5d and
+  10d/20d windows); `split_outcomes_temporal` is deterministic and
+  stable. Consistent with the documented 16+ prior no-new-bug
+  ML/backtest passes. No test-hardening commit either — the Phase-1
+  checklist items are already exact-value locked; a redundant test would
+  be churn, not hardening (the pass-#17 precedent). ML/backtest
+  regression 363/363 green before the feature, 372/372 after.
+
+- **Feature shipped (commit `60b20d9`, `feat(continuous):`): the gate's
+  ACTUAL then-deployed decision is now captured in
+  `decision_outcomes.jsonl`.** `run_continuous_backtests.py::
+  _parse_gate_decision` (pure/total/never-raises — the
+  `_parse_scorer_status` discipline) + additive `gate_scorer_pred` /
+  `gate_off_dist` keys in `_compute_decision_outcomes`. **The gap it
+  fills:** `_compute_decision_outcomes` already parsed `score=` /
+  `news_urg=` / `news_count=` out of each decision's reasoning but
+  **discarded the gate's own `scorer=±X%` token** (and the
+  `(off-dist,gate-skipped)` abstention marker `_ml_decide` emits). Every
+  gate diagnostic (`gate_audit`, `gate_pnl`) therefore had to RE-predict
+  with **today's** deployed pickle on the stored features — a
+  counterfactual ("what would the current model say"), provably **not**
+  what the gate did at decision time with that cycle's *own* model;
+  `gate_pnl` itself documents the resulting reconstruction residual is
+  explicitly *NOT in its verdict*. Capturing the true historical
+  prediction + abstention makes the gate's realized effect *measurable*
+  instead of reconstructed. **Zero training/gate/trade impact:**
+  `train_scorer` reads ONLY `forward_return_5d`, so the new keys are
+  inert — exactly the additive `forward_return_10d/20d` precedent (pass
+  #18 multi-horizon). NOT a new diagnostic module (no treadmill); a
+  data-fidelity fix to the existing outcomes pipeline. `None` on SELL
+  rows (gate is BUY-only) and untrained/sub-gate cycles (no `scorer=`
+  emitted). 9 exact-value locks + a 5d-byte-identity regression anchor
+  in `tests/test_gate_decision_capture.py` (pure-helper matrix:
+  in-dist / off-dist / `+0.0%` boundary / untrained / SELL /
+  `score=`-vs-`scorer=` disambiguation / garbage-never-raises; +
+  end-to-end through `_compute_decision_outcomes` proving the keys land
+  and `forward_return_5d` is unperturbed). **Applies on next
+  `run_continuous_backtests.py` restart** — the running loop predates it
+  (the documented deploy-stale pattern; ledger lives at the gitignored
+  `data/decision_outcomes.jsonl`).
+  ```bash
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/test_gate_decision_capture.py -v
+  ```
+
+- **Quant finding (decisive, reconfirmed fresh — the gate underwrites
+  pure sizing variance).** Live deployed pickle `n_train=3860`, gate
+  active. **Five independent OOS arbiters agree on the same temporal-OOS
+  slice:** `baseline_compare` = **`MLP_NO_BETTER_THAN_TRIVIAL`** (MLP
+  rank_ic **+0.069** vs raw `ml_score` one-liner **+0.111**, ic_gap
+  −0.042 — the net carries *less* OOS rank skill than feature slot 0
+  alone); `calibration --oos` = in-sample **`WELL_CALIBRATED`** (spearman
+  0.458, decile err 2.30pp) collapsing to OOS **`MISCALIBRATED`**
+  (spearman **0.069**, decile err **8.67pp** — the tool prints its own
+  optimism-gap warning); `skill_trend` = **`NEGATIVE_OOS_SKILL`**
+  (oos_rmse **11.30** ≥ fresh mean-predictor baseline **9.51**, median
+  oos_ic 0.04, trend STABLE, `gate_active=1.0`); `gate_pnl` =
+  **`GATE_RETURN_NEUTRAL`** (gate-on +0.76% vs gate-off +0.58%,
+  equal-weight contribution **+0.18pp**, within ±1.0pp — "reallocates
+  capital with no net realized effect: pure added sizing variance");
+  `scorer_skill_log.jsonl` last cycles `oos_ic ∈ {0.01,0.19,0.02,0.02,
+  −0.01,0.07}`, `oos_dir_acc ≈ 0.50`, `val_rmse ≈9 ≪ oos_rmse ≈10–17`
+  (textbook overfit). The conviction gate (invariant #5, active every
+  cycle) sizes real backtest positions on a 17-feature net with
+  demonstrably zero/negative OOS skill. **Reported, not actioned** —
+  turning the gate off / retraining is a training-dynamics change out of
+  surgical scope (CLAUDE.md §6); the contribution of this pass is making
+  the gate's *actual* historical decision durably measurable for the
+  first time, not changing the model.
+
+- **Quant findings (corroborating).** (1) **Running loop is stale code**
+  — PID `1734916` predates the pass-#17 baseline-ledger commit
+  (`6ade72d`), the pass-#18 multi-horizon capture, AND this pass's
+  gate-decision capture: `data/baseline_skill_log.jsonl` does **not
+  exist**, live `decision_outcomes.jsonl` rows carry only the 17 base
+  keys (no `forward_return_10d/20d` / `gate_scorer_pred`). All three
+  durability features are inert until the operator restarts
+  `run_continuous_backtests.py` — the documented deploy-stale
+  operational state, **not a code bug** (`baseline_trend` correctly
+  returns `INSUFFICIENT_DATA`). (2) **Winner→ArticleNet feedback loop
+  dead both ways** — 48 `inject err: database locked after 4 attempts` /
+  `trainer timeout` / `trainer rc=` lines in the last 4000 log lines
+  (digital-intern GPU + `articles.db` write-contention on the symlinked
+  volume — matches passes #6–#17; the scorer itself retrains cleanly
+  every cycle). (3) **Backtest dispersion is pure leverage-beta** — same
+  recent batch: run 6230 +484.8%/vs_spy +396.7% beside run 6231
+  −49.4%/vs_spy −12.4%; 476 complete / 24 failed, **no NaN**, max
+  complete run_id 6234 (last completed 10:35 UTC — the loop is
+  progressing). The "best run" cycle line must never be read as strategy
+  skill. All reported observations, out of surgical scope.
+
+- **Concurrency note.** This pass ran with **3 sibling agents executing
+  the identical task prompt concurrently** (`ps`: PIDs 1752314 / 1824143
+  / 1839361, same `claude --model claude-opus-4-7` HYBRID prompt) plus a
+  swarm of dirty `../digital-intern/` working-tree files. **Never
+  `git add -A`.** The two changed files (`run_continuous_backtests.py`
+  with verified 0 sibling tokens, new exclusively-mine
+  `tests/test_gate_decision_capture.py`) were path-scoped `git add`-ed,
+  staged diff verified additions-only (`+224/-0`, 2 files, 0
+  sibling-token grep hits), the index committed (NO pathspec — the
+  pass-#16 `git commit -- <path>` re-snapshot lesson applied
+  pre-emptively), and the deliverable confirmed on `origin/master` **by
+  content** (`git cat-file -e origin/master:<test>` +
+  `_parse_gate_decision` symbol grep), not by assuming it sits in this
+  agent's commit message.
+
+- **Run the ML/backtest suite:** `cd
+  /home/zeph/trading-intelligence/paper-trader && python3 -m pytest
+  tests/ -q -k "ml or backtest or scorer or calibration or continuous or
+  horizon"`. `tests/test_gate_decision_capture.py` holds the new
+  gate-decision-capture locks; it has none of "ml"/"backtest"/"scorer"
+  in its node ids — add it explicitly like `test_calibration.py` /
+  `test_horizon_audit.py` (it is picked up by the `continuous` keyword
+  via `_compute_decision_outcomes`, but list it for clarity).
+
+*Review pass #18 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
