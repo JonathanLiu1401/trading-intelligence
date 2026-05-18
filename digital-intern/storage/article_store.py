@@ -26,8 +26,11 @@ except Exception:
 
 # ── DB lock / cursor-collision retry helper ─────────────────────────────────
 # Two distinct transient DB errors are retried here; both are recoverable and
-# every method this decorates is idempotent (``UPDATE … WHERE id=?``,
-# ``INSERT OR IGNORE``, ``DELETE … WHERE``), so a clean re-run is safe:
+# every method this decorates is idempotent — the writers
+# (``UPDATE … WHERE id=?``, ``INSERT OR IGNORE``, ``DELETE … WHERE``) AND the
+# pure-SELECT readers (``get_unscored``, ``get_unalerted_urgent``,
+# ``get_top_for_briefing``, ``count_unscored``, ``stats``, ``stats_since``,
+# ``get_briefings_for_training``) — so a clean re-run is always safe:
 #
 #  1. ``OperationalError("database is locked")`` — even with
 #     PRAGMA busy_timeout=60000, sustained writer contention from many threads
@@ -35,17 +38,23 @@ except Exception:
 #  2. ``DatabaseError("another row available"/"another row pending")`` — the
 #     shared ``self.conn`` is opened ``check_same_thread=False`` and used by
 #     ~30 daemon threads. ``_write_lock`` serialises *writers*, but the many
-#     LOCKLESS readers (get_unscored, get_top_for_briefing, trainer's
-#     ``store.conn.execute``, the dashboard) iterate a cursor on the SAME
-#     connection; a reader still mid-fetch corrupts the connection's statement
-#     state when a writer's ``executemany`` runs, raising this. It was
-#     observed 48x in one production ``daemon.log`` window — each one dropped a
-#     whole collected/Sonnet-labeled batch (urgent items then never got
-#     urgency=1 → missed alerts; articles re-queued to the LLM forever). The
-#     colliding reader's ``.fetchall()`` completes well within the first
-#     backoff tick, so the retried op succeeds. (A future full fix is per-call
-#     write-connection isolation, mirroring dashboard ``_ro_query``; this is
-#     the surgical, idempotent-safe stopgap.)
+#     LOCKLESS readers (get_unscored, get_unalerted_urgent,
+#     get_top_for_briefing, count_unscored, stats, …) iterate a cursor on the
+#     SAME connection; a reader still mid-fetch corrupts the connection's
+#     statement state when a writer's ``executemany`` runs, raising this. It
+#     was observed 48x in one production ``daemon.log`` window — each one
+#     dropped a whole collected/Sonnet-labeled batch (urgent items then never
+#     got urgency=1 → missed alerts; articles re-queued to the LLM forever).
+#     ``ef7fbe4`` decorated the writers but left these named reader victims
+#     undecorated, so a collision on ``get_unalerted_urgent`` still bubbled
+#     to ``alert_worker``'s broad except (urgent items unfetched that 20s
+#     cycle → delayed alerts) and ``stats`` still 500'd ``/api/stats``. The
+#     readers are now decorated too — the colliding reader's ``.fetchall()``
+#     completes well within the first backoff tick, so the retried SELECT
+#     succeeds. (The remaining uncovered path is the trainer's *direct*
+#     ``store.conn.execute`` in train_continuous; it is exception-swallowed
+#     and retried next cycle. A future full fix is per-call connection
+#     isolation, mirroring dashboard ``_ro_query``.)
 #
 # Retry with exponential backoff + jitter to avoid thundering-herd retries
 # that would just collide again at the same instant. Bubble up after the
@@ -135,6 +144,64 @@ _LIVE_ONLY_CLAUSE = (
     "AND source NOT LIKE 'backtest_%' "
     "AND source NOT LIKE 'opus_annotation%'"
 )
+
+# ── stats() backlog-count cache ─────────────────────────────────────────────
+# ``stats()`` is called by the /api/stats dashboard endpoint. Its ``total`` and
+# ``urgent`` counts are O(log N) (MAX(rowid) and the idx_urgency lookup), but
+# ``unscored``/``below_threshold`` filter on ``ai_score=0 AND ml_score IS NULL
+# AND <kw_score cmp> AND <live LIKE clauses>`` for which no index is selective:
+# SQLite full-scans the ~1.9M-row table, reading every row's compressed
+# ``full_text`` BLOB pages off the slow USB drive. Measured ~115 s for
+# ``unscored`` alone — a ``LIMIT`` does NOT bound this because matches
+# (~34k) are far fewer than any sane cap, so the scan never short-circuits.
+# That single query made /api/stats time out (>30 s) so the dashboard rendered
+# "0 Total in DB". These two counts are a slowly-changing backlog gauge, not a
+# realtime figure, so they are served from a short-TTL cache that is refreshed
+# OFF the request path by one background thread on its own transient
+# connection (never ``self.conn`` — see the cursor-collision hazard documented
+# on the ``_retry_on_lock`` decorator above). A cold cache returns 0 for one
+# poll cycle and is filled within a couple of minutes; ``stats()`` itself never
+# blocks on the scan again.
+_STATS_BACKLOG_TTL_SECS = 300
+_STATS_BACKLOG_LOCK = threading.Lock()
+_STATS_BACKLOG_CACHE: dict = {"ts": 0.0, "unscored": 0,
+                              "below_threshold": 0, "refreshing": False}
+
+
+def _refresh_backlog_counts(score_min_kw: float) -> None:
+    """Recompute the expensive unscored/below_threshold counts on a private,
+    short-lived connection and update the module cache. Runs in a daemon
+    background thread; exceptions are swallowed (next cycle retries)."""
+    conn = None
+    try:
+        conn = sqlite3.connect(str(_get_db_path()), timeout=60,
+                               check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout=60000")
+        unscored = conn.execute(
+            "SELECT COUNT(*) FROM articles "
+            f"WHERE ai_score=0 AND ml_score IS NULL AND kw_score>=? "
+            f"AND {_LIVE_ONLY_CLAUSE}",
+            (score_min_kw,),
+        ).fetchone()[0]
+        below = conn.execute(
+            "SELECT COUNT(*) FROM articles "
+            f"WHERE ai_score=0 AND ml_score IS NULL AND kw_score<? "
+            f"AND {_LIVE_ONLY_CLAUSE}",
+            (score_min_kw,),
+        ).fetchone()[0]
+        with _STATS_BACKLOG_LOCK:
+            _STATS_BACKLOG_CACHE.update(ts=time.time(), unscored=unscored,
+                                        below_threshold=below)
+    except Exception as e:  # pragma: no cover - best-effort cache refresh
+        _log.warning("backlog count refresh failed: %s", e)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        with _STATS_BACKLOG_LOCK:
+            _STATS_BACKLOG_CACHE["refreshing"] = False
 
 # Max rows any single resolved publisher domain may occupy in one heartbeat
 # briefing. Live evidence (2026-05-18): one scrape channel
@@ -582,6 +649,7 @@ class ArticleStore:
             self.conn.commit()
             return cur.lastrowid
 
+    @_retry_on_lock
     def get_briefings_for_training(self, limit: int = 100) -> list[dict]:
         cur = self.conn.execute(
             "SELECT id, ts, text, article_count FROM briefings "
@@ -593,6 +661,7 @@ class ArticleStore:
             for r in cur.fetchall()
         ]
 
+    @_retry_on_lock
     def count_unscored(self, min_kw: float = 0.0) -> int:
         """Count articles still pending the scorer. Mirrors ``get_unscored``'s
         filter (ai_score=0 AND ml_score IS NULL AND kw_score>=min_kw AND
@@ -606,6 +675,7 @@ class ArticleStore:
         )
         return cur.fetchone()[0]
 
+    @_retry_on_lock
     def get_unscored(self, limit: int = 500, min_kw: float = 0.5) -> list:
         """Get articles that haven't been AI-scored yet.
 
@@ -702,6 +772,7 @@ class ArticleStore:
             _INFER_LOCK.release()
         return total
 
+    @_retry_on_lock
     def get_unalerted_urgent(self, limit: int = 50) -> list:
         """Get articles scored urgent but not yet alerted.
 
@@ -740,6 +811,7 @@ class ArticleStore:
                  "published": r[7]}
                 for r in rows]
 
+    @_retry_on_lock
     def get_top_for_briefing(self, hours: int = 5, limit: int = 50) -> list:
         """Get highest-scoring articles from last N hours for the heartbeat briefing.
 
@@ -827,28 +899,49 @@ class ArticleStore:
                 print(f"[store] Purged {deleted} articles older than {RETENTION_DAYS} days")
         return deleted
 
+    @_retry_on_lock
     def stats(self, score_min_kw: float = 1.5) -> dict:
-        total = self.conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-        urgent = self.conn.execute("SELECT COUNT(*) FROM articles WHERE urgency>=1").fetchone()[0]
-        # "unscored" = pending the scorer (kw_score above the scorer's threshold).
-        # Articles below the threshold are intentionally skipped, not a backlog;
-        # split them out so the metric reflects actionable work. Mirror
-        # ``get_unscored`` exactly (ai_score=0 AND ml_score IS NULL AND
-        # live-only) so the count reflects what the scorer will actually
+        # ``total``: MAX(rowid) is an O(log N) B-tree walk to the rightmost
+        # leaf; a bare COUNT(*) over the ~1.9M-row table on the slow USB drive
+        # is O(N) and was the >30 s blocker that made /api/stats time out (the
+        # dashboard then showed "0 Total in DB"). rowid is monotonic here (TEXT
+        # primary key, no AUTOINCREMENT, purge only deletes the OLDEST/lowest
+        # rowids) so MAX(rowid) over-counts vs the live row count by the volume
+        # purged out of the RETENTION_DAYS window — an acceptable, order-of-
+        # magnitude-correct figure for a dashboard tile. ``fetchone()`` is
+        # ``(None,)`` on an empty table, hence ``or 0``.
+        total = self.conn.execute(
+            "SELECT MAX(rowid) FROM articles").fetchone()[0] or 0
+        # idx_urgency makes this O(log N); the LIMIT 10000 subquery is a belt-
+        # and-braces cap so a missing/disabled index can never reintroduce a
+        # full-table scan on the request path.
+        urgent = self.conn.execute(
+            "SELECT COUNT(*) FROM "
+            "(SELECT 1 FROM articles WHERE urgency>=1 LIMIT 10000)"
+        ).fetchone()[0]
+        # "unscored" = pending the scorer (kw_score above the scorer's
+        # threshold); "below_threshold" = intentionally skipped, not a backlog.
+        # Both mirror ``get_unscored`` exactly (ai_score=0 AND ml_score IS NULL
+        # AND live-only) so the count reflects what the scorer will actually
         # re-fetch — without _LIVE_ONLY_CLAUSE this over-counted synthetic
-        # backtest rows that the scorer never touches.
-        unscored = self.conn.execute(
-            "SELECT COUNT(*) FROM articles "
-            f"WHERE ai_score=0 AND ml_score IS NULL AND kw_score>=? "
-            f"AND {_LIVE_ONLY_CLAUSE}",
-            (score_min_kw,),
-        ).fetchone()[0]
-        below_threshold = self.conn.execute(
-            "SELECT COUNT(*) FROM articles "
-            f"WHERE ai_score=0 AND ml_score IS NULL AND kw_score<? "
-            f"AND {_LIVE_ONLY_CLAUSE}",
-            (score_min_kw,),
-        ).fetchone()[0]
+        # backtest rows the scorer never touches. No index is selective for
+        # that predicate, so each is a ~115 s full scan of BLOB pages on USB —
+        # far too slow for the request path. They change slowly, so serve them
+        # from a short-TTL cache refreshed by ONE background thread (private
+        # connection); a cold cache reads 0 for one poll then self-fills.
+        with _STATS_BACKLOG_LOCK:
+            cache_age = time.time() - _STATS_BACKLOG_CACHE["ts"]
+            unscored = _STATS_BACKLOG_CACHE["unscored"]
+            below_threshold = _STATS_BACKLOG_CACHE["below_threshold"]
+            need_refresh = (cache_age > _STATS_BACKLOG_TTL_SECS
+                            and not _STATS_BACKLOG_CACHE["refreshing"])
+            if need_refresh:
+                _STATS_BACKLOG_CACHE["refreshing"] = True
+        if need_refresh:
+            threading.Thread(
+                target=_refresh_backlog_counts, args=(score_min_kw,),
+                name="stats-backlog-refresh", daemon=True,
+            ).start()
         db = _get_db_path()
         # Include -wal and -shm sidecars so db_mb reflects true on-disk usage
         # under WAL journaling (otherwise stats undercount during active writes).
@@ -862,6 +955,7 @@ class ArticleStore:
                 "below_threshold": below_threshold, "db_mb": round(size_mb, 1),
                 **lock_metrics()}
 
+    @_retry_on_lock
     def stats_since(self, hours: int) -> dict:
         since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
         total = self.conn.execute(
