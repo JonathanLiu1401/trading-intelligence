@@ -1122,5 +1122,49 @@ class ArticleStore:
         ))[0]
         return {"total": total, "urgent": urgent}
 
+    @_retry_on_lock
+    def source_freshness(self) -> list[dict]:
+        """Per-source liveness view: for every live source, its live-row count
+        and how long ago its most recent article landed.
+
+        Built purely from ``articles.db`` over the canonical live-only set
+        (``_LIVE_ONLY_CLAUSE`` — synthetic backtest/opus rows are excluded so a
+        gone-dark *collector* is never masked by backtest injections that share
+        the table). Ordered most-stale-first so a caller sees dark collectors at
+        the top of the list. ``newest_age_s`` is seconds since the newest
+        ``first_seen`` (insert time — never the back-datable ``published``);
+        it is ``None`` only when a source has no parseable timestamp.
+
+        Turns the "which collectors went dark?" question (previously only
+        answerable by eyeballing the daemon log) into one queryable call for
+        the dashboard / healthcheck.
+        """
+        now = datetime.now(timezone.utc)
+        rows = self.conn.execute(
+            "SELECT source, COUNT(*) AS n, MAX(first_seen) AS newest "
+            f"FROM articles WHERE {_LIVE_ONLY_CLAUSE} "
+            "GROUP BY source"
+        ).fetchall()
+        out: list[dict] = []
+        for source, n, newest in rows:
+            age_s = None
+            if newest:
+                try:
+                    ts = datetime.fromisoformat(newest)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    age_s = round((now - ts).total_seconds(), 1)
+                except (ValueError, TypeError):
+                    age_s = None
+            out.append({"source": source or "", "count": n,
+                        "newest_age_s": age_s})
+        # Most-stale-first; an unparseable/unknown age sorts last (treated as
+        # -1 so reverse-sort pushes it below every real age).
+        out.sort(
+            key=lambda r: r["newest_age_s"] if r["newest_age_s"] is not None else -1.0,
+            reverse=True,
+        )
+        return out
+
     def close(self):
         self.conn.close()
