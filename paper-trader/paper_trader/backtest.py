@@ -454,9 +454,20 @@ class BacktestStore:
         # is shared (check_same_thread=False) and an unlocked read interleaved
         # with a run thread's write corrupts cursor state.
         with self._lock:
-            rows = self.conn.execute(
-                "SELECT * FROM backtest_runs ORDER BY run_id ASC"
-            ).fetchall()
+            if include_curves:
+                rows = self.conn.execute(
+                    "SELECT * FROM backtest_runs ORDER BY run_id ASC"
+                ).fetchall()
+            else:
+                # Exclude equity_curve_json (25MB total) when not needed —
+                # reading and discarding it was the main cause of 9s load times.
+                rows = self.conn.execute(
+                    "SELECT run_id, seed, start_date, end_date, start_value,"
+                    " final_value, total_return_pct, spy_return_pct,"
+                    " vs_spy_pct, n_trades, n_decisions, status,"
+                    " started_at, completed_at, notes"
+                    " FROM backtest_runs ORDER BY run_id ASC"
+                ).fetchall()
         out = []
         from datetime import date as _date
         for r in rows:
