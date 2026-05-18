@@ -886,7 +886,22 @@ class ArticleStore:
                     "_relevance_score": r[5],
                     "summary": decompress(r[6]) if r[6] else "",
                     "first_seen": r[7],
-                    "time_sensitivity": r[8]}
+                    "time_sensitivity": r[8],
+                    # True iff this row carries a real LLM ground-truth label
+                    # (raw ai_score > 0). Model self-predictions go to
+                    # ml_score and NEVER to ai_score (invariant #2), so a
+                    # falsy raw ai_score means the displayed score above came
+                    # from ml_score — an UNVERIFIED local-model estimate. The
+                    # ML relevance head demonstrably over-scores
+                    # forum/wiki/social rows (recurring live finding), and the
+                    # COALESCE above otherwise erases the distinction, so the
+                    # briefing consumer can't tell an Opus/Sonnet-vetted 9 from
+                    # a raw-model 9.8. Additive key; the displayed ``ai_score``
+                    # field and all ordering/diversity/decay logic are
+                    # unchanged. Read-only — no DB write, no ai_score/ml_score/
+                    # score_source mutation, backtest already excluded by
+                    # _LIVE_ONLY_CLAUSE above: all four invariants intact.
+                    "_llm_vetted": bool(r[4])}
             key = _briefing_domain_key(r[3] or "")
             if per_domain.get(key, 0) >= BRIEFING_MAX_PER_DOMAIN:
                 overflow.append(item)
