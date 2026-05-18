@@ -6690,9 +6690,16 @@ def _next_market_open() -> tuple[datetime | None, int | None]:
     now_ny = now_utc.astimezone(_mkt.NY)
     open_min = 9 * 60 + 30
     cur_min = now_ny.hour * 60 + now_ny.minute
-    # If currently open, return next close.
+    # If currently open, return next close. Use market.close_minute so a NYSE
+    # early-close half-day (13:00 ET — the day after Thanksgiving / Christmas
+    # Eve, enforced in market.is_market_open since b6a1934) reports the real
+    # close, not a hardcoded 16:00. A stale 16:00 here made the briefing card
+    # ("Market OPEN — closes in 5h00m") and /api/game-plan's next_open_seconds
+    # 3h wrong on those two sessions — the exact thing a trader times exits on.
     if _mkt.is_market_open(now_utc):
-        close_dt = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
+        close_min = _mkt.close_minute(now_ny.date())
+        ch, cm = divmod(close_min, 60)
+        close_dt = now_ny.replace(hour=ch, minute=cm, second=0, microsecond=0)
         return close_dt.astimezone(timezone.utc), int((close_dt - now_ny).total_seconds())
     # Walk forward day-by-day to find the next open day. The outer guard
     # `(not is_today or cur_min < open_min)` already excludes "today, past
