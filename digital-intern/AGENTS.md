@@ -1280,3 +1280,64 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   `scripts/export_training_data.py`, `tests/test_article_store.py`,
   `paper-trader/paper_trader/backtest.py`, `logs/*.tmp`. Commits
   pathspec-scoped, never `git add -A`.
+
+---
+
+### Agent pass 2026-05-18 — COVERAGE GAP briefing intel (digital-intern)
+
+**Feature (this repo, clean file only).** `analysis/claude_analyst.py`: the
+5h Opus heartbeat silently omitted any down source, so a dark high-value
+channel read as "no news" instead of "blind here". Live inspection found
+`sec_edgar`/`sec_edgar_ft` with 900+ consecutive empty polls and **0 8-K
+filings delivered**, with no signal anywhere in the briefing. Added
+`_collect_source_health()` (best-effort read of `collectors.source_health`
+— its own read-only SQLite; **no `articles.db` write, no backtest/ml_score/
+score_source surface**; any failure ⇒ `{}` so the briefing never breaks),
+`_coverage_gap_lines(report, now)` (pure: curated analyst-meaningful
+channels only — per-query gdelt junk excluded — ranked filings-first then
+longest-dark, "0 delivered all session" annotation, capped at 8), a
+SYSTEM_PROMPT rule + `**COVERAGE GAP**` output section so Opus reproduces
+it to Discord, and `_build_payload(..., source_health_report=None)` (None
+⇒ section omitted, deterministic, no live DB read — the 3-arg path is
+unchanged; `analyze()` signature unchanged so `daemon.py:1477` still works).
+New `tests/test_coverage_gap_briefing.py` (16, specific-value asserts; no
+LLM/network). Suite: **446 passed**, imports OK. Ships on next
+`systemctl --user restart digital-intern` (running daemon holds old code).
+
+**bugs_fixed=0 (honest).** The clean readable files are exceptionally
+mature (detailed prior-fix comments, layered defenses); no genuine bug
+found that was both real and in a file safe to stage. Guard explicitly
+permits 0.
+
+**Phase 3 findings (news-analyst view).**
+1. *RSS collector broken in working tree (NOT fixed — not ours).* A
+   concurrent agent's incomplete `_fetch_feed`→4-tuple refactor left
+   `collect_rss` iterating tuples as dicts → `TypeError` at
+   `rss_collector.py:175`; 5 `test_rss_collector.py` failures. Running
+   daemon (started 18:12, before the 19:19 edit) holds old code so live
+   RSS still ingests; the on-disk code is broken and will fail on next
+   restart. File has concurrent uncommitted edits — left exactly as-is.
+2. *8 sources DOWN:* `sec_edgar, sec_edgar_ft, finnhub, polygon,
+   newsapi, alphavantage, nitter, massive`. `sec_edgar*`/`polygon`/
+   `newsapi`/`nitter` show `total_articles=0` — the analyst is fully
+   blind to 8-K filings. (This is precisely what the new feature
+   surfaces.)
+3. *Writer-side lock exhaustion under GKG bulk dumps:* `insert_batch` /
+   `update_ml_scores_batch` exhaust the 5-retry budget during the ~1.4M-row
+   GKG bulk load (1,401,062 rows in one hour, 2026-05-17T02), dropping
+   batches. Per-connection isolation is the documented future fix.
+4. *Briefing quality is high* (accurate macro/portfolio/semis, NVDA
+   catalyst) but cadence slipped to ~6.5h and a ~32h gap (05-15→05-17)
+   from the restart-flap the in-flight `daemon.py` O_CLOEXEC/signal-safety
+   change targets.
+5. *Lone low-authority alerts* (`reddit/r/ValueInvesting`,
+   `reddit/r/Daytrading`, a Moomoo quote-widget) fired BREAKING pushes —
+   the `_filter_low_authority_lone` gate (0.45) is in place and will
+   suppress these after the next daemon restart.
+
+*Pre-existing, never staged:* `collectors/rss_collector.py`, `daemon.py`,
+`storage/article_store.py`, `scripts/export_training_data.py`,
+`tests/test_article_store.py`, `collectors/fred_collector.py`,
+`scripts/stale_source_alerter.py`, `logs/*`, all `paper-trader/*`.
+Commit pathspec-scoped; my feature landed durably (shared monorepo index
+race folded it into the concurrent `dd9af44`, already on `origin/master`).
