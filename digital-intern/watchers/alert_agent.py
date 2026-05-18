@@ -50,6 +50,8 @@ Then on a new line after the code block: [article url]
 
 Categories: EARNINGS | RATING CHANGE | MACRO SHOCK | SUPPLY CHAIN | REGULATORY | FED | CRYPTO | M&A | GEOPOLITICAL
 
+RECENCY: Each article below carries `age` = elapsed time since publication. Reflect it honestly — an item several hours old is a developing/continued story, NOT one that "just" broke; never imply a multi-hour-old item happened moments ago. {now_utc} is the alert send time, not the event time. If an item is materially old (≳3h), make that explicit in CONTEXT (e.g. "first reported ~Nh ago").
+
 Urgent articles detected:
 {articles_text}
 
@@ -137,6 +139,51 @@ def _article_age_ok(art: dict) -> bool:
     # in get_unalerted_urgent, so reaching here means both fields are corrupt.
     _log.warning("[alert] article has no parseable date — dropping to be safe")
     return False
+
+
+def _article_age_hours(art: dict) -> float | None:
+    """Hours since the article was published — ``published`` preferred, else
+    ``first_seen``. ``None`` when neither field parses (the caller then simply
+    omits the age line; this NEVER blocks an alert — >24h staleness is already
+    enforced by ``_article_age_ok``). First parseable field wins, RFC822 + ISO,
+    naive→UTC: the exact convention ``_article_age_ok``/``urgency_scorer`` use,
+    so the displayed age is consistent with the staleness gate."""
+    now = datetime.now(timezone.utc)
+    for field in ("published", "first_seen"):
+        raw = (art.get(field) or "").strip()
+        if not raw:
+            continue
+        dt = None
+        try:
+            dt = parsedate_to_datetime(raw)
+        except Exception:
+            dt = None
+        if dt is None:
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except Exception:
+                dt = None
+        if dt is None:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (now - dt).total_seconds() / 3600.0)
+    return None
+
+
+def _article_age_str(art: dict) -> str | None:
+    """Compact, analyst-readable freshness label for an urgent row —
+    ``4m`` / ``3.2h`` / ``16h``. ``None`` when the age is unknown so the
+    caller omits the line entirely (silent, never a fabricated "0m")."""
+    h = _article_age_hours(art)
+    if h is None:
+        return None
+    if h < 1.0:
+        m = int(round(h * 60))
+        return f"{m}m" if m >= 1 else "<1m"
+    if h < 10.0:
+        return f"{h:.1f}h"
+    return f"{int(round(h))}h"
 
 
 # ── Quote-widget noise gate (defense-in-depth) ───────────────────────────────
@@ -383,6 +430,13 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
             f"[score={score:.0f}] {title}\n"
             f"source: {source}\nurl: {link}"
         )
+        # Freshness context: a news analyst reacting to "🚨 BREAKING" must be
+        # able to tell a 4-minute-old 8-K (act now) from a 16-hour-old reused
+        # headline (already priced in). The 0..24h band reaching here is wide
+        # — the Sonnet prompt's RECENCY rule turns this into honest framing.
+        age = _article_age_str(a)
+        if age:
+            block += f"\nage: {age} (time since publication)"
         dup_count = int(a.get("dup_count") or 1)
         if dup_count > 1:
             # Tell the alert LLM how broadly the story is being carried — wide
