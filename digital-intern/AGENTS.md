@@ -1291,6 +1291,47 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   four files were clean before edit; commits pathspec-scoped, never
   `git add -A`.
 
+- **2026-05-18 (Agent 4, feature-dev — analyst-chat: forward FOMC / macro-calendar awareness)** —
+  Advisor-reviewed; gap falsified by grep first (`macro|fomc|rate.decision`
+  returned **nothing** in the chat path — the chat carried ~15 BACKWARD
+  analytics blocks + an earnings radar but **zero** forward MACRO-event
+  awareness, though the live trader's own decision prompt already gets it
+  via `paper_trader/analytics/macro_calendar.py`). One additive feature,
+  **this repo only** (no cross-repo restart coupling beyond the chronic-
+  stale sibling contract), never gates Opus (invariants #2/#12 — chat
+  context only). `dashboard/web_server.py::api_chat` gains the pure helper
+  **`_macro_calendar_chat_lines(mc)`** (the `_baseline_compare_chat_lines`
+  precedent — total/pure, degrade to `[]`, never raise into chat). SSOT
+  (invariant #10): the builder's own `summary` string is the **verbatim**
+  headline — no chat-side re-derived verdict. Key design lock: the builder
+  sets `events: []` for EVERY non-actionable branch (no-FOMC-in-horizon,
+  schedule-not-loaded, builder-error), so all three collapse to `[]` —
+  "no FOMC within 14d" / error filler never becomes chat noise (the
+  `_behavioural_chat_lines` NO_DATA-omit precedent: silence, not noise).
+  An imminent event emits the verbatim summary + one restated detail line
+  (when_et / tier / day-or-hour timing from the builder's own fields, the
+  `earnings_block` precedent — a within-24h `IMMINENT_HOURS` event surfaces
+  the HOUR figure so a 6h-away decision is not rounded to a misleading
+  0.2d); a malformed row is skipped, never raises
+  (`_paper_trader_position_lines` precedent). Wired as a sibling cross-fetch
+  block (own guarded `urllib.urlopen(:8090/api/macro-calendar, timeout=3)`,
+  degrade-to-`""`), injected into `system_prompt` right after
+  `EARNINGS RADAR` (the forward-scheduled-event cluster) via the existing
+  `if block else ""` idiom. New `tests/test_chat_macro_calendar_enrichment.py`
+  (15, pure helper, no Flask/DB/cross-fetch — incl. the SSOT verbatim-
+  headline lock, the no-FOMC-is-silence lock, and the IMMINENT_HOURS
+  hour-not-day lock). Suites: **15 new passed**; the web_server/dashboard/
+  chat regression slice **309 passed** (88 of those the full chat-enrichment
+  set incl. the 15 new); full `tests/` collects clean at **820** (no
+  import breakage). Verified live: against the real `:8090/api/macro-calendar`
+  ("no FOMC within 14d") the helper correctly returns `[]` (silent), and a
+  simulated imminent payload yields the verbatim SSOT headline.
+  *Operational:* additive — needs `systemctl --user restart digital-intern`
+  to take effect; `:8090` already serves `/api/macro-calendar` (probed live),
+  so unlike the game-plan/hold-discipline blocks there is no waiting on a
+  trader restart. Commit pathspec-scoped (`web_server.py` + new test + this
+  `AGENTS.md` + `CLAUDE.md`), never `git add -A`.
+
 - **2026-05-18 (Agent 4, feature-dev — analyst-chat: marked-positions fix + action-plan tier)** —
   Advisor-reviewed. Additive, **this repo only** (no cross-repo restart
   coupling — the fix consumes data the trader already emits), never gates
