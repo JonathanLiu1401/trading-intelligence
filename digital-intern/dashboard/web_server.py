@@ -249,6 +249,62 @@ def _baseline_compare_chat_lines(rep) -> list[str]:
     return lines
 
 
+_CORR_REAL_VERDICTS = (
+    "SINGLE_NAME_RISK", "CONCENTRATED", "MODERATE", "DIVERSIFIED",
+)
+
+
+def _correlation_chat_lines(corr) -> list[str]:
+    """Render paper-trader's ``/api/correlation`` (the diagnostic that exposes
+    *factor* concentration — do the held names actually move together?) as
+    compact chat-context lines.
+
+    ``/api/risk`` reports name-level concentration honestly (already surfaced
+    upstream by ``analytics_block``), but a 2-position 59/41 book can be
+    either two uncorrelated bets or — if both names are high-β semis that
+    move as one — a single bet wearing two tickers. The chat carried the
+    name-level view but was blind to the FACTOR view; this closes the gap
+    exactly as ``_baseline_compare_chat_lines`` closed the ML-honesty one.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+    composed **verbatim** — no chat-side re-derived verdict that could drift
+    from the trader endpoint (the verdict label, mean ρ, effective-bets
+    count, and the optional most-coupled-pair clause all already live inside
+    the ``headline`` string).
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict, missing ``state``, or ``state`` ``NO_DATA`` (no stock
+      positions — concentration is undefined) → ``[]`` (silence, not noise;
+      the ``_behavioural_chat_lines`` NO_DATA-omit precedent)
+    - ``INSUFFICIENT`` → ONE honest withheld line; the builder's own
+      headline already names what is missing (e.g. "Only 1 correlatable
+      stock name(s) — correlation verdict withheld"), so it passes through
+      verbatim
+    - a real verdict (``SINGLE_NAME_RISK`` / ``CONCENTRATED`` / ``MODERATE``
+      / ``DIVERSIFIED``) → the builder's verbatim headline (which the unit
+      tests for ``build_correlation`` already pin in shape)
+    - any other ``state`` or unknown verdict on an ``OK`` row → ``[]`` (the
+      never-raises builder must never have manufactured this; degrade
+      silently rather than parrot a label the chat cannot validate)
+    """
+    if not isinstance(corr, dict):
+        return []
+    state = corr.get("state")
+    if state == "NO_DATA":
+        return []
+    headline = corr.get("headline")
+    if not isinstance(headline, str) or not headline.strip():
+        return []
+    if state == "INSUFFICIENT":
+        return [f"Correlation: {headline}"]
+    if state != "OK":
+        return []
+    if corr.get("verdict") not in _CORR_REAL_VERDICTS:
+        return []
+    return [f"Correlation: {headline}"]
+
+
 def _behavioural_chat_lines(scorecard, paralysis, churn) -> list[str]:
     """Render the paper-trader's own self-review verdicts
     (``/api/scorecard``, ``/api/capital-paralysis``, ``/api/churn``) as
@@ -1840,6 +1896,30 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: baseline-compare fetch failed: %s", e)
 
+        # Correlation / factor concentration — does the held book move as
+        # ONE bet however many tickers are on it? /api/risk (carried in the
+        # analytics block above) reports NAME-level concentration; this is
+        # the FACTOR-level companion (pairwise return correlation among the
+        # held stocks, the weight-Herfindahl effective-position count, and
+        # the correlation-adjusted effective number of *independent* bets).
+        # A 2-name 59/41 book that /api/risk grades CONCENTRATED-by-name can
+        # still hide single-factor risk: both names high-β semis → the
+        # diversification claim is illusory. Composed verbatim by the pure
+        # _correlation_chat_lines helper (unit-tested; SSOT — no re-derived
+        # verdict). Guarded 3s sub-fetch like every sibling; a stale/absent
+        # trader silently omits the block.
+        correlation_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/correlation",
+                    timeout=3) as resp:
+                _corr = json.loads(resp.read().decode("utf-8"))
+            correlation_block = "\n".join(
+                _correlation_chat_lines(_corr))
+        except Exception as e:
+            _logger().warning("chat: correlation fetch failed: %s", e)
+
         # Earnings radar — scheduled gap risk on the paper trader's holdings.
         # Lets the chat warn "you hold NVDA and it prints in 4 days".
         earnings_block = ""
@@ -1969,6 +2049,7 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER ANALYTICS:\n{analytics_block}\n\n" if analytics_block else "")
             + (f"PAPER TRADER — BEHAVIOURAL DIAGNOSIS (the bot's own self-review verdicts):\n{behavioural_block}\n\n" if behavioural_block else "")
             + (f"PAPER TRADER — ML GATE HONESTY (does the DecisionScorer that modulates the bot's live position sizing beat a one-line rule OUT OF SAMPLE? the analytics above report the flattering in-sample story; this is the generalization-relevant verdict):\n{baseline_compare_block}\n\n" if baseline_compare_block else "")
+            + (f"PAPER TRADER — FACTOR CONCENTRATION (the held book's pairwise return correlation + effective-independent-bets count; complements /api/risk's NAME-level view — a 59/41 book that is concentrated by weight may STILL be a single FACTOR bet if both names move as one):\n{correlation_block}\n\n" if correlation_block else "")
             + (f"PAPER TRADER — PRIORITISED ACTION PLAN (the bot's own next-session game plan):\n{game_plan_block}\n\n" if game_plan_block else "")
             + (f"PAPER TRADER — HOLD-DISCIPLINE ALERT (a losing position overstayed past the desk's own median losing-cut):\n{hold_discipline_block}\n\n" if hold_discipline_block else "")
             + (f"PAPER TRADER OPTIONS GREEKS (Black-Scholes, live IV):\n{greeks_block}\n\n" if greeks_block else "")
