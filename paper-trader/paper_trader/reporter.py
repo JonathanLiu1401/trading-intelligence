@@ -5,6 +5,7 @@ import glob
 import os
 import shutil
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 
 from . import market
@@ -15,6 +16,91 @@ DISCORD_CHANNEL = "channel:1496099475838603324"
 # Single source of truth — keep P/L baselines in lockstep with the store.
 # A hardcoded copy silently desyncs every reported P/L% if INITIAL_CASH moves.
 _INITIAL_EQUITY = INITIAL_CASH
+
+
+# ── Discord delivery health ──────────────────────────────────────────────
+# EVERY operator-facing notification (hourly, daily-close, trade alert, quota
+# alarm, ONLINE ping, degraded-runner warning) flows through `_send()`. When
+# `_send` silently fails — the 2026-05-17 `env node` PATH outage being the
+# canonical case: openclaw resolved but its `#!/usr/bin/env node` shebang
+# could not find `node` under systemd's minimal PATH — the trader looks fully
+# alive (decisions log, dashboard up, equity ticks) while the operator's only
+# real monitoring surface is DARK and there is no way to know from inside
+# Discord (the failing channel can't report its own failure). This in-memory
+# tracker records the outcome of recent `_send` attempts so a dead channel is
+# *visible* on `/api/runner-heartbeat` instead of silent. Best-effort, never
+# raises, intentionally NOT persisted — channel health is a property of the
+# running process; a fresh process re-establishes it on its first send.
+_notify_lock = threading.Lock()
+_notify_state: dict = {
+    "last_attempt_ts": None,    # ISO — most recent _send() call
+    "last_ok_ts": None,         # ISO — most recent successful send
+    "last_result": None,        # True / False / None (never attempted)
+    "consecutive_failures": 0,
+    "last_error": "",           # short reason for the most recent failure
+}
+
+
+def _record_send_outcome(ok: bool, error: str = "") -> None:
+    """Best-effort update of the delivery-health tracker. Never raises — a
+    monitoring side-channel must not be able to break the send path."""
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        with _notify_lock:
+            _notify_state["last_attempt_ts"] = now
+            _notify_state["last_result"] = bool(ok)
+            if ok:
+                _notify_state["last_ok_ts"] = now
+                _notify_state["consecutive_failures"] = 0
+                _notify_state["last_error"] = ""
+            else:
+                _notify_state["consecutive_failures"] += 1
+                _notify_state["last_error"] = (error or "")[:300]
+    except Exception:
+        pass
+
+
+def notify_health() -> dict:
+    """Operator snapshot of Discord delivery health. Pure read, never raises.
+
+    ``verdict``:
+      * ``UNKNOWN``  — no send attempted yet this process
+      * ``HEALTHY``  — the most recent send succeeded
+      * ``DEGRADED`` — the most recent send failed (the channel is dark)
+
+    ``restart_recommended`` is True once failures persist (≥3 in a row) —
+    the canonical openclaw/PATH outage is fixed only by a relaunch on the
+    corrected code, so this points the operator at the actionable lever."""
+    try:
+        with _notify_lock:
+            st = dict(_notify_state)
+    except Exception:
+        st = {"last_result": None, "consecutive_failures": 0,
+              "last_ok_ts": None, "last_attempt_ts": None, "last_error": ""}
+    res = st.get("last_result")
+    n = st.get("consecutive_failures", 0) or 0
+    if res is None:
+        verdict = "UNKNOWN"
+        headline = "no Discord message attempted yet this process"
+    elif res:
+        verdict = "HEALTHY"
+        headline = "last Discord send succeeded"
+    else:
+        last_ok = st.get("last_ok_ts") or "never"
+        verdict = "DEGRADED"
+        headline = (
+            f"Discord channel DARK — {n} consecutive send "
+            f"failure{'' if n == 1 else 's'}, last OK {last_ok}; "
+            f"last error: {st.get('last_error') or 'unknown'}")
+    return {
+        "verdict": verdict,
+        "headline": headline,
+        "consecutive_failures": n,
+        "last_ok_ts": st.get("last_ok_ts"),
+        "last_attempt_ts": st.get("last_attempt_ts"),
+        "last_error": st.get("last_error") or "",
+        "restart_recommended": (res is False and n >= 3),
+    }
 
 
 def _openclaw_fallback_candidates() -> list[str]:
@@ -69,24 +155,51 @@ def _send(message: str) -> bool:
     bin_ = _resolve_openclaw()
     if not bin_:
         print(f"[reporter] openclaw not installed; would send:\n{message}")
+        _record_send_outcome(False, "openclaw binary not resolvable")
         return False
+    # openclaw is an npm-global Node script whose shebang is
+    # ``#!/usr/bin/env node``. The live runner is launched by
+    # ``paper-trader.service`` with systemd's minimal PATH (no nvm node bin),
+    # so ``env node`` fails with
+    # ``/usr/bin/env: 'node': No such file or directory`` — the openclaw
+    # process exits non-zero and EVERY Discord message (hourly, daily-close,
+    # trade alert, quota alarm, ONLINE ping, degraded-runner warning) is
+    # silently dropped. This was the live failure on 2026-05-17: the binary
+    # resolved fine (commit 64502ec) but its own ``node`` interpreter did
+    # not. nvm / npm-global colocate ``node`` in the SAME bin/ directory as
+    # the resolved ``openclaw``, so prepending that directory to PATH for the
+    # subprocess makes the shebang resolve regardless of how the daemon was
+    # launched. Best-effort: a binary with no usable dirname just runs with
+    # the inherited PATH (today's behaviour), never raises.
+    env = os.environ.copy()
+    bin_dir = os.path.dirname(bin_)
+    if bin_dir:
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
     try:
         r = subprocess.run(
             [bin_, "message", "send",
              "--channel", "discord",
              "--target", DISCORD_CHANNEL,
              "--message", message],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, env=env,
         )
         if r.returncode != 0:
-            print(f"[reporter] openclaw failed: {r.stderr.strip()[:300]}")
+            # The CLI sometimes writes the real error to stdout with an empty
+            # stderr (the shebang/PATH failure does land on stderr, but be
+            # defensive so the health tracker always has a usable reason).
+            err = (r.stderr or "").strip() or (r.stdout or "").strip()
+            print(f"[reporter] openclaw failed: {err[:300]}")
+            _record_send_outcome(False, f"rc={r.returncode}: {err}")
             return False
+        _record_send_outcome(True)
         return True
     except subprocess.TimeoutExpired:
         print("[reporter] openclaw timeout")
+        _record_send_outcome(False, "openclaw timeout (60s)")
         return False
     except Exception as e:
         print(f"[reporter] openclaw exception: {e}")
+        _record_send_outcome(False, f"exception: {e}")
         return False
 
 
@@ -414,6 +527,81 @@ def _hold_discipline_line(store) -> str:
         return ""
 
 
+def _capital_pulse_line(store) -> str:
+    """One-line "is the desk capital-paralysed right now?" for the hourly /
+    daily report.
+
+    The **#2 documented live pathology** (AGENTS.md pass #14 #4; the
+    ``capital_paralysis`` → ``buying_power`` lineage): a ~$972 book pinned
+    near 98% deployed with ~$18 free, unable to act on a fresh signal for a
+    day while involuntary NO_DECISION-storm droughts quietly bleed alpha.
+    ``capital_paralysis`` synthesises this on the **dashboard** and
+    ``buying_power`` now reaches the **Opus prompt** — but the operator,
+    who lives in Discord, still gets hourly/daily summaries that never say
+    the desk is frozen and bleeding. This routes the existing builder's own
+    verdict to the surface the operator actually reads (the same
+    dashboard→prompt→Discord trajectory ``buying_power`` followed).
+
+    Composes ``build_capital_paralysis`` **verbatim** (single source of
+    truth, AGENTS.md invariant #10 — the headline / unlock / verdict are
+    the builder's, never re-derived here, so this Discord line,
+    ``/api/capital-paralysis`` and the prompt-side ``buying_power`` can
+    never drift). **Pure store reads only — NO network** (the Discord-path
+    discipline; unlike ``_benchmark_line`` it adds zero latency).
+    Observational only, no caps, never gates (invariants #2/#12; the
+    ``_hold_discipline_line`` / ``_benchmark_line`` precedent). Failure
+    contract mirrors the rest of ``reporter``: any builder/store fault
+    degrades to ``""`` ("no capital pulse this report"), **never** an
+    exception ("no Discord summary this report").
+
+    Suppression — there must be nothing actionable to say:
+      * ``NO_DATA`` (no book yet) → silent;
+      * a genuinely ``FREE`` book whose involuntary-drought verdict is NOT
+        ``BLEEDING`` → silent (it can act and is not losing alpha to the
+        NO_DECISION storm — the ``_hold_discipline_line`` NO_DATA
+        precedent);
+      * ``PINNED`` / ``EMPTY`` are ALWAYS surfaced (the desk literally
+        can't act), and a ``FREE`` book that is nonetheless ``BLEEDING``
+        alpha through involuntary droughts IS surfaced (that is the whole
+        point — the live 2026-05-18 state)."""
+    try:
+        from .analytics.capital_paralysis import build_capital_paralysis
+        cp = build_capital_paralysis(
+            store.get_portfolio(),
+            store.open_positions(),
+            store.recent_trades(5000),
+            store.recent_decisions(limit=5000),
+            store.equity_curve(limit=5000),
+        )
+        if not isinstance(cp, dict):
+            return ""
+        state = cp.get("state")
+        if state in (None, "NO_DATA"):
+            return ""
+        para = cp.get("paralysis") or {}
+        bleeding = para.get("verdict") == "BLEEDING"
+        if state == "FREE" and not bleeding:
+            return ""
+        headline = cp.get("headline") or ""
+        if not headline:
+            return ""
+        lines = [f"**CAPITAL** ◈ {state}", f"> {headline}"]
+        rec = cp.get("recommended_unlock")
+        if isinstance(rec, dict) and rec.get("ticker"):
+            try:
+                frees = float(rec.get("frees_usd") or 0.0)
+            except (TypeError, ValueError):
+                frees = 0.0
+            lines.append(
+                f"> unlock — sell {rec['ticker']} frees ${frees:.2f}")
+        if bleeding and para.get("verdict_reason"):
+            lines.append(f"> {para['verdict_reason']}")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[reporter] capital-pulse line skipped: {e}")
+        return ""
+
+
 def _realized_pl_today(trades_newest_first: list[dict], today: str
                        ) -> tuple[float, int, int] | None:
     """True realized P/L from round-trips that *closed* today (UTC).
@@ -552,6 +740,9 @@ def send_hourly_summary() -> bool:
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx
+    cp = _capital_pulse_line(store)
+    if cp:
+        body += "\n" + cp
     return _send(body)
 
 
@@ -619,4 +810,7 @@ def send_daily_close() -> bool:
     hx = _hold_discipline_line(store)
     if hx:
         body += "\n" + hx
+    cp = _capital_pulse_line(store)
+    if cp:
+        body += "\n" + cp
     return _send(body)
