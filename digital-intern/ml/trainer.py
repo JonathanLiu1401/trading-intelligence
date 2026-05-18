@@ -711,8 +711,15 @@ class Trainer:
 _last_continuous_loss = float('inf')
 
 
-def train_continuous(store) -> dict:
-    """Lightweight continuous GPU training pass — 40 epochs on all scored articles."""
+def train_continuous(store, heartbeat=None) -> dict:
+    """Lightweight continuous GPU training pass — 40 epochs on all scored articles.
+
+    ``heartbeat``: optional zero-arg callable. It is invoked once after the
+    (potentially slow) data-load phase and once per training epoch so the
+    continuous_trainer worker can prove liveness during a pass that legitimately
+    runs longer than the supervisor's staleness deadline. Exceptions raised by
+    the callback are swallowed — a monitoring ping must never break training.
+    """
     global _last_continuous_loss
     from storage.article_store import decompress
 
@@ -762,6 +769,14 @@ def train_continuous(store) -> dict:
     del texts, articles, X_text, X_extra  # release before GPU training
 
     model = get_model()
+    # Data-load phase (SELECT 15k + decompress + TF-IDF) is now done; ping
+    # before the fit so the worst-case ping gap is max(load, per-epoch) rather
+    # than load + first-epoch.
+    if heartbeat is not None:
+        try:
+            heartbeat()
+        except Exception:
+            pass
     # Skip rather than block: if the heavy trainer is mid-fit, just wait for the
     # next 60s tick. Avoids piling up continuous passes behind a long retrain.
     if not _TRAIN_LOCK.acquire(blocking=False):
@@ -772,7 +787,8 @@ def train_continuous(store) -> dict:
         metrics = model.fit(X, y_rel, y_urg, y_time=y_time,
                             epochs=40, batch_size=512, lr=LEARNING_RATE_WARM,
                             warm=True,
-                            label_weight_exponent=LABEL_WEIGHT_EXPONENT)
+                            label_weight_exponent=LABEL_WEIGHT_EXPONENT,
+                            heartbeat=heartbeat)
     finally:
         _TRAIN_LOCK.release()
 

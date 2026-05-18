@@ -259,7 +259,7 @@ class ArticleNet:
             epochs: int = 100, batch_size: int = 256, lr: float = 1e-3,
             verbose: bool = True, warm: bool | None = None,
             label_weight_exponent: float | None = None,
-            early_stop_patience: int = 6) -> dict:
+            early_stop_patience: int = 6, heartbeat=None) -> dict:
         """Multi-task GPU training. Returns metrics dict.
 
         ``y_rel`` is a 0..10 relevance score; ``y_urg`` is a 0..10 urgency
@@ -270,6 +270,12 @@ class ArticleNet:
         when a held-out val set exists, i.e. n >= 100). Best-epoch weights
         are restored regardless, so this only trims wasted, overfitting
         epochs — it never changes which checkpoint is saved.
+
+
+        ``heartbeat``: optional zero-arg callable invoked once per epoch
+        (exceptions swallowed). The continuous_trainer worker passes a
+        liveness ping here so a slow-but-healthy pass isn't false-flagged
+        DEAD by the supervisor (see ``train_continuous``).
         """
         t0 = time.time()
         n, dim = X.shape
@@ -434,6 +440,18 @@ class ArticleNet:
             sched.step()
             final_loss = epoch_loss / max(n_batches, 1)
             epochs_run = epoch + 1
+
+            # Per-epoch liveness ping. The continuous_trainer worker only marks
+            # itself healthy once train_continuous() returns, but a 40-epoch
+            # pass under GPU contention can exceed the supervisor's 900 s
+            # staleness deadline (observed 920–961 s elapsed_s), false-flagging
+            # a working thread DEAD. Pinging per epoch proves progress; if the
+            # fit genuinely hangs the pings stop and DEAD still fires correctly.
+            if heartbeat is not None:
+                try:
+                    heartbeat()
+                except Exception:
+                    pass
 
             # Best-epoch tracking — cheap val pass every few epochs.
             check_every = max(1, epochs // 20)
