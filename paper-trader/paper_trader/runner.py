@@ -20,7 +20,13 @@ from .store import DB_PATH, get_store
 NY = ZoneInfo("America/New_York")
 OPEN_INTERVAL_S = 1800      # decide every 30 min when market is open
 CLOSED_INTERVAL_S = 3600    # every 1 hour when closed
-DAILY_CLOSE_HOUR_NY = 16    # report after 16:00 NY
+# Grace after the NYSE session close before the daily-close report fires. The
+# trigger is anchored to the *actual* session close (market.close_minute):
+# 16:00 ET on a regular day → fires 16:05 ET (unchanged), but 13:00 ET on a
+# NYSE early-close half-day (day-after-Thanksgiving / Christmas Eve) → fires
+# 13:05 ET instead of sitting on a frozen, post-close book for three extra
+# hours waiting for a hardcoded 16:05 that no longer matches the bell.
+DAILY_CLOSE_GRACE_MIN = 5
 
 # Git-watcher deadman: once a deferred restart is requested, the MAIN LOOP is
 # the graceful actor (it exits at the next cycle boundary so a mid-Opus call
@@ -388,7 +394,14 @@ def _maybe_daily_close():
         # weekend guard: bail before touching _daily_close_sent_for so the flag
         # stays where it was.
         return
-    if now_ny.hour < DAILY_CLOSE_HOUR_NY or (now_ny.hour == DAILY_CLOSE_HOUR_NY and now_ny.minute < 5):
+    # Anchor the trigger to the *actual* NYSE session close, not a hardcoded
+    # 16:00. close_minute() is 16:00 ET on a regular day (gate < 16:05 ET —
+    # byte-identical to the old behaviour) and 13:00 ET on a known half-day
+    # (gate < 13:05 ET) so the close report lands right after the early bell
+    # instead of three hours late against a frozen post-close book.
+    close_min = market.close_minute(now_ny.date())
+    now_min = now_ny.hour * 60 + now_ny.minute
+    if now_min < close_min + DAILY_CLOSE_GRACE_MIN:
         return
     if _daily_close_sent_for == today:
         return

@@ -151,6 +151,88 @@ class TestMaybeDailyClose:
         assert runner._daily_close_sent_for is None
 
 
+class TestMaybeDailyCloseHalfDay:
+    """The daily close fires after the *actual* NYSE session close.
+
+    On a regular day that is still 16:05 ET (byte-identical to before). On a
+    NYSE early-close half-day (day-after-Thanksgiving 2026-11-27, Christmas
+    Eve 2026-12-24) the bell is 13:00 ET, so the close report must fire at
+    13:05 ET — not sit three hours on a frozen post-close book waiting for a
+    hardcoded 16:05 that no longer matches the session.
+
+    Both half-day dates are ordinary weekdays (Fri / Thu) and are NOT in
+    NYSE_HOLIDAYS_2026, so only the new session-close-aware gate decides.
+    """
+
+    HALF = (2026, 11, 27)   # Fri, day after Thanksgiving — 13:00 ET close
+    HALF2 = (2026, 12, 24)  # Thu, Christmas Eve — 13:00 ET close
+
+    def _arm(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(runner.reporter, "send_daily_close",
+                            lambda: calls.append(1) or True)
+        return calls
+
+    def test_half_day_does_not_fire_before_early_close(self, monkeypatch):
+        # 12:59 ET on a half-day — session still open, nothing to close yet.
+        _patch_now(monkeypatch, _ny(*self.HALF, 12, 59))
+        calls = self._arm(monkeypatch)
+        runner._maybe_daily_close()
+        assert calls == []
+        assert runner._daily_close_sent_for is None
+
+    def test_half_day_does_not_fire_at_1304_ET(self, monkeypatch):
+        # 13:04 ET — one minute inside the 5-min grace, still too early.
+        _patch_now(monkeypatch, _ny(*self.HALF, 13, 4))
+        calls = self._arm(monkeypatch)
+        runner._maybe_daily_close()
+        assert calls == []
+        assert runner._daily_close_sent_for is None
+
+    def test_half_day_fires_at_1305_ET(self, monkeypatch):
+        # 13:05 ET on the early-close half-day — fires right after the bell.
+        _patch_now(monkeypatch, _ny(*self.HALF, 13, 5))
+        calls = self._arm(monkeypatch)
+        runner._maybe_daily_close()
+        assert calls == [1]
+        assert runner._daily_close_sent_for == "2026-11-27"
+
+    def test_christmas_eve_half_day_fires_at_1305_ET(self, monkeypatch):
+        _patch_now(monkeypatch, _ny(*self.HALF2, 13, 5))
+        calls = self._arm(monkeypatch)
+        runner._maybe_daily_close()
+        assert calls == [1]
+        assert runner._daily_close_sent_for == "2026-12-24"
+
+    def test_half_day_fires_only_once(self, monkeypatch):
+        _patch_now(monkeypatch, _ny(*self.HALF, 14, 0))
+        calls = self._arm(monkeypatch)
+        runner._maybe_daily_close()
+        runner._maybe_daily_close()
+        runner._maybe_daily_close()
+        assert calls == [1]
+
+    def test_regular_day_does_not_fire_at_1305_ET(self, monkeypatch):
+        # The half-day 13:05 trigger must NOT leak into an ordinary weekday:
+        # 2026-05-14 (Thu) at 13:05 ET is mid-session — no close report.
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 13, 5))
+        calls = self._arm(monkeypatch)
+        runner._maybe_daily_close()
+        assert calls == []
+        assert runner._daily_close_sent_for is None
+
+    def test_regular_day_unchanged_1604_no_fire_1605_fires(self, monkeypatch):
+        # Backward-compat: a regular weekday is still exactly 16:05 ET.
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 16, 4))
+        calls = self._arm(monkeypatch)
+        runner._maybe_daily_close()
+        assert calls == []
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 16, 5))
+        runner._maybe_daily_close()
+        assert calls == [1]
+        assert runner._daily_close_sent_for == "2026-05-14"
+
+
 class TestMaybeHourly:
     def test_fires_when_last_hourly_none(self, monkeypatch):
         _patch_now(monkeypatch, _ny(2026, 5, 14, 10, 0))
