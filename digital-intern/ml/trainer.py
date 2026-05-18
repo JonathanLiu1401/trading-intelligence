@@ -165,6 +165,23 @@ LLM_ZONE_MID_LO  = 7.0
 LLM_ZONE_MID_HI  = 8.5
 LLM_ZONE_CLEAR_NOISE  = 3.0  # below this → clearly noise, skip LLM
 
+# SSOT for the trainer's "strong label" row predicate (the WHERE body, no
+# leading "WHERE"). Both _fetch_training_data and train_continuous select on
+# this exact clause, and ml/label_audit.py imports it so the training-pool
+# integrity audit can never drift from what the model actually trains on.
+# Semantics (see _fetch_training_data docstring): ground-truth LLM-sourced
+# ai_score, plus legacy pre-migration integer ai_score (score_source NULL),
+# plus synthetic backtest/opus rows (score_source NULL, CLAUDE.md §5).
+# score_source='ml' (the model's own predictions) is deliberately excluded —
+# ingesting it would reopen the label-feedback loop.
+STRONG_LABEL_WHERE = (
+    "ai_score > 0 "
+    "AND (score_source IN ('llm','briefing_boost') "
+    "     OR (score_source IS NULL AND ai_score = CAST(ai_score AS INTEGER)) "
+    "     OR (score_source IS NULL AND (url LIKE 'backtest://%' "
+    "          OR source LIKE 'backtest_%' OR source LIKE 'opus_annotation%')))"
+)
+
 
 def _fetch_briefing_samples(
     store, limit: int = 100
@@ -247,11 +264,7 @@ def _fetch_training_data(
     cur = store.conn.execute(
         "SELECT title, full_text, ai_score, source, published "
         "FROM articles "
-        "WHERE ai_score > 0 "
-        "  AND (score_source IN ('llm','briefing_boost') "
-        "       OR (score_source IS NULL AND ai_score = CAST(ai_score AS INTEGER)) "
-        "       OR (score_source IS NULL AND (url LIKE 'backtest://%' "
-        "            OR source LIKE 'backtest_%' OR source LIKE 'opus_annotation%'))) "
+        f"WHERE {STRONG_LABEL_WHERE} "
         "ORDER BY first_seen DESC LIMIT 15000"
     )
     for title, blob, ai, src, published in cur.fetchall():
@@ -715,11 +728,7 @@ def train_continuous(store) -> dict:
     cur = store.conn.execute(
         "SELECT title, full_text, ai_score, source, published "
         "FROM articles "
-        "WHERE ai_score > 0 "
-        "  AND (score_source IN ('llm','briefing_boost') "
-        "       OR (score_source IS NULL AND ai_score = CAST(ai_score AS INTEGER)) "
-        "       OR (score_source IS NULL AND (url LIKE 'backtest://%' "
-        "            OR source LIKE 'backtest_%' OR source LIKE 'opus_annotation%'))) "
+        f"WHERE {STRONG_LABEL_WHERE} "
         "ORDER BY first_seen DESC LIMIT 15000"
     )
     for title, blob, ai, src, published in cur.fetchall():
