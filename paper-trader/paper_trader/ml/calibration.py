@@ -240,10 +240,77 @@ def scorer_calibration(scorer, records, n_buckets: int = 10) -> dict:
     return calibration_report(pairs, n_buckets=n_buckets)
 
 
-def _cli() -> int:
-    """`python3 -m paper_trader.ml.calibration` — calibration of the live
-    pickled scorer against the accumulated outcomes tail. Read-only."""
+def scorer_calibration_oos(scorer, records, oos_fraction: float = 0.2,
+                           n_buckets: int = 10) -> dict:
+    """Calibration on the **temporal out-of-sample holdout only**.
+
+    ``scorer_calibration`` over the full ``decision_outcomes.jsonl`` is an
+    *in-sample* view — the scorer trained on most of those rows — so its
+    ``WELL_CALIBRATED`` verdict is optimistic (AGENTS.md: "the in-sample
+    `WELL_CALIBRATED` is optimistic; always read it next to ``oos_rmse``").
+    There was no out-of-sample *decile* view: ``skill_trend.py`` trends the
+    ledger's scalar ``oos_rmse``/``oos_ic`` and ``gate_audit.py`` buckets by
+    the 5 economic gate arms — neither shows the magnitude-bias decile curve
+    and crisp verdict on data the scorer never saw.
+
+    This runs the SAME ``scorer_calibration`` report on only the most-recent
+    ``oos_fraction`` of records by ``sim_date``, reusing
+    ``paper_trader.validation.split_outcomes_temporal`` — the EXACT split
+    ``run_continuous_backtests._train_decision_scorer`` uses for
+    ``oos_rmse``/``oos_ic``. That single source of truth guarantees this
+    decile view and the ledger's scalar OOS metrics describe the *same*
+    holdout, so a quant can read them together without a split mismatch.
+
+    Returns ``scorer_calibration``'s dict with three extra keys:
+    ``oos_n`` (holdout pairs fed to the report), ``train_n`` (rows withheld
+    as training history), ``oos_fraction``. Same operational discipline as
+    the rest of this module: read-only, no train / pickle / ``build_features``
+    / ``N_FEATURES`` / trade-path touch, and it never raises — a split
+    failure degrades to "no holdout" (``INSUFFICIENT_DATA``), never a crash
+    in the unattended loop's vicinity.
+    """
+    try:
+        from paper_trader.validation import split_outcomes_temporal
+        train_recs, oos_recs = split_outcomes_temporal(
+            list(records or []), oos_fraction=oos_fraction
+        )
+    except Exception:
+        # Mirror split_outcomes_temporal's own degradation: everything to
+        # training, empty holdout → the report below reads INSUFFICIENT_DATA
+        # rather than misrepresenting an in-sample slice as OOS.
+        train_recs, oos_recs = list(records or []), []
+    rep = scorer_calibration(scorer, oos_recs, n_buckets=n_buckets)
+    rep["oos_n"] = len(oos_recs)
+    rep["train_n"] = len(train_recs)
+    rep["oos_fraction"] = oos_fraction
+    return rep
+
+
+def _print_report(tag: str, rep: dict) -> None:
+    print(f"[{tag}] VERDICT: {rep['verdict']}  ({rep['hint']})")
+    print(f"  n={rep['n']} spearman={rep['spearman']} "
+          f"pearson={rep['pearson']} monotone={rep['monotone_fraction']} "
+          f"mean_abs_decile_err={rep['mean_abs_decile_error']}pp")
+    for b in rep["buckets"]:
+        print(f"  d{b['idx']:>2} pred[{b['pred_lo']:+8.2f},{b['pred_hi']:+8.2f}] "
+              f"mean_pred={b['mean_pred']:+7.2f}  "
+              f"mean_realized={b['mean_realized']:+7.2f}  n={b['n']}")
+
+
+def _cli(argv: list[str] | None = None) -> int:
+    """`python3 -m paper_trader.ml.calibration [--oos]` — calibration of the
+    live pickled scorer against the accumulated outcomes tail. Read-only.
+
+    Default: the in-sample report (unchanged byte-for-byte). With ``--oos``
+    it ALSO prints the temporal-holdout report so the in-sample-optimism gap
+    (a WELL_CALIBRATED in-sample verdict next to a degraded OOS one) is
+    visible in one invocation — the exact comparison AGENTS.md prescribes.
+    """
+    import sys
     from .decision_scorer import DecisionScorer
+
+    args = sys.argv[1:] if argv is None else argv
+    want_oos = "--oos" in args
 
     root = Path(__file__).resolve().parent.parent.parent
     out_path = root / "data" / "decision_outcomes.jsonl"
@@ -265,6 +332,8 @@ def _cli() -> int:
         return 1
     rep = scorer_calibration(scorer, records)
     print(f"scorer n_train={scorer.n_train}  outcomes={len(records)}")
+    # Default block kept identical (no "[in-sample]" tag) so existing
+    # operators / any output scraper see an unchanged report.
     print(f"VERDICT: {rep['verdict']}  ({rep['hint']})")
     print(f"  n={rep['n']} spearman={rep['spearman']} "
           f"pearson={rep['pearson']} monotone={rep['monotone_fraction']} "
@@ -273,6 +342,16 @@ def _cli() -> int:
         print(f"  d{b['idx']:>2} pred[{b['pred_lo']:+8.2f},{b['pred_hi']:+8.2f}] "
               f"mean_pred={b['mean_pred']:+7.2f}  "
               f"mean_realized={b['mean_realized']:+7.2f}  n={b['n']}")
+    if want_oos:
+        oos = scorer_calibration_oos(scorer, records)
+        print(f"\n── temporal OUT-OF-SAMPLE holdout "
+              f"(train_n={oos['train_n']} oos_n={oos['oos_n']}, "
+              f"frac={oos['oos_fraction']}) ──")
+        _print_report("oos", oos)
+        if rep["verdict"] == "WELL_CALIBRATED" and oos["verdict"] != "WELL_CALIBRATED":
+            print("  ⚠ in-sample WELL_CALIBRATED but OOS is "
+                  f"{oos['verdict']} — the in-sample verdict is optimistic; "
+                  "trust the OOS view (matches the ledger's oos_rmse/oos_ic).")
     return 0
 
 

@@ -7,6 +7,8 @@ dataset here is hand-constructed with a known-correct answer.
 """
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 import pytest
 
 from paper_trader.ml.calibration import (
@@ -16,6 +18,7 @@ from paper_trader.ml.calibration import (
     SPEARMAN_MIN,
     calibration_report,
     scorer_calibration,
+    scorer_calibration_oos,
 )
 
 
@@ -160,4 +163,82 @@ class TestScorerCalibration:
                     "action": "BUY"}])
         rep = scorer_calibration(_FakeScorer(), recs)
         assert rep["n"] == 40   # the None-forward_return row is excluded
+
+
+def _dated_recs(realized_fn, n=200, start=date(2020, 1, 1)):
+    """n BUY records with strictly-increasing sim_date so the temporal split
+    is deterministic. ml_score = i; forward_return_5d = realized_fn(i)."""
+    return [
+        {"ml_score": float(i),
+         "forward_return_5d": float(realized_fn(i)),
+         "action": "BUY",
+         "ticker": "NVDA",
+         "sim_date": (start + timedelta(days=i)).isoformat()}
+        for i in range(n)
+    ]
+
+
+class TestScorerCalibrationOOS:
+    """The temporal out-of-sample calibration view. The discriminating
+    property: it must report ONLY the most-recent `oos_fraction` slice (by
+    sim_date) — the exact holdout `_train_decision_scorer` uses for
+    oos_rmse/oos_ic — so an in-sample-only problem stays hidden while an
+    out-of-sample one surfaces."""
+
+    def test_split_sizes_and_metadata(self):
+        # 200 globally-perfect records, 20% holdout → 40 OOS / 160 train.
+        recs = _dated_recs(lambda i: i, n=200)
+        rep = scorer_calibration_oos(_FakeScorer(), recs, oos_fraction=0.2)
+        assert rep["oos_n"] == 40
+        assert rep["train_n"] == 160
+        assert rep["oos_fraction"] == 0.2
+        # The report is computed on the 40-row holdout, not all 200.
+        assert rep["n"] == 40
+        # Holdout is itself perfectly calibrated here.
         assert rep["verdict"] == "WELL_CALIBRATED"
+        assert rep["spearman"] == 1.0
+
+    def test_operates_on_recent_slice_only(self):
+        # Equivalence lock: OOS report core == scorer_calibration on exactly
+        # the most-recent 40 records (recs already sim_date-ascending).
+        recs = _dated_recs(lambda i: i, n=200)
+        oos = scorer_calibration_oos(_FakeScorer(), recs, oos_fraction=0.2)
+        direct = scorer_calibration(_FakeScorer(), recs[160:200])
+        for k in ("n", "verdict", "spearman", "pearson",
+                  "monotone_fraction", "mean_abs_decile_error"):
+            assert oos[k] == direct[k], k
+
+    def test_oos_surfaces_problem_the_history_view_conceals(self):
+        # The scorer fits its training era perfectly (old 160: pred==realized)
+        # but the held-out era is anti-correlated (recent 40: realized=-pred)
+        # — the textbook overfit signature the wired oos_rmse/oos_ic ledger
+        # exists to catch. Both slice verdicts are *exactly* computable:
+        #   • history (train) slice  → spearman +1.0 → WELL_CALIBRATED
+        #   • temporal OOS holdout   → spearman -1.0 → MISCALIBRATED
+        # so the holdout view crisply reveals what a history-only look hides.
+        recs = _dated_recs(lambda i: i if i < 160 else -i, n=200)
+        history = scorer_calibration(_FakeScorer(), recs[:160])
+        oos = scorer_calibration_oos(_FakeScorer(), recs, oos_fraction=0.2)
+        assert history["verdict"] == "WELL_CALIBRATED"
+        assert history["spearman"] == 1.0
+        assert oos["oos_n"] == 40
+        assert oos["train_n"] == 160
+        assert oos["n"] == 40
+        assert oos["spearman"] == -1.0
+        assert oos["verdict"] == "MISCALIBRATED"
+
+    def test_too_few_records_degrades_to_insufficient(self):
+        # < 5 rows → split_outcomes_temporal gives all to train, empty
+        # holdout → INSUFFICIENT_DATA, never a crash or a mislabeled
+        # in-sample slice.
+        recs = _dated_recs(lambda i: i, n=3)
+        rep = scorer_calibration_oos(_FakeScorer(), recs)
+        assert rep["oos_n"] == 0
+        assert rep["train_n"] == 3
+        assert rep["verdict"] == "INSUFFICIENT_DATA"
+
+    def test_empty_records_safe(self):
+        rep = scorer_calibration_oos(_FakeScorer(), [])
+        assert rep["oos_n"] == 0
+        assert rep["train_n"] == 0
+        assert rep["verdict"] == "INSUFFICIENT_DATA"
