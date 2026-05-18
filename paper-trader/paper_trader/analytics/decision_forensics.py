@@ -61,6 +61,18 @@ _HINTS = {
 
 _EXCERPT_CAP = 280  # display cap; strategy.py already capped the stored text
 
+# ── Decision-loss clock ──────────────────────────────────────────────────────
+# Minimum decisions in a UTC-hour bucket before it can be named a "worst hour"
+# or drive the actionable hint. Mirrors decision_reliability.MIN_CURRENT's
+# sample-honesty convention so a 1/1 = 100% bucket can never trigger a (wrong)
+# "reschedule the cron" recommendation. Tests read this constant so a retune
+# can't silently false-fail them.
+HOUR_MIN_SAMPLE = 6
+# A worst hour only earns an actionable clock_hint when its parse-fail rate
+# exceeds the window-wide current-regime rate by at least this margin (pp) —
+# a recurring concentration, not ambient noise.
+CLOCK_HINT_MARGIN_PP = 15.0
+
 
 def _parse_ts(ts: str | None) -> datetime | None:
     if not ts:
@@ -171,6 +183,117 @@ def _bucket_hourly(failrows: list[tuple[datetime, bool]],
     return out
 
 
+def _regime_boundary(decisions: list[dict]) -> datetime | None:
+    """Newest timestamp of a *legacy* (pre-diagnostics) parse failure, or None.
+
+    ``strategy.py`` tags pre-diagnostics NO_DECISION rows with the legacy string
+    ``"claude returned no parseable JSON"`` (``classify_failure`` → tag
+    ``legacy``). Once the runner restarts onto diagnostic code those rows stop
+    accruing — a fixed historical mass. The hour-of-day clock MUST be windowed
+    past it: a clock-hour failure-rate computed over that dead mass would be
+    skewed by *when those rows happened to land in UTC*, not by current host
+    load, producing a confidently wrong "shift your cron" recommendation.
+
+    This is the **same regime contract** ``decision_reliability`` partitions on:
+    both derive ``boundary = max(ts where classify_failure(reasoning).tag ==
+    'legacy')`` from *this module's* ``classify_failure`` / ``_parse_ts``, so
+    the clock window and the reliability headline can never tell different
+    stories on the same data. ``None`` ⇒ no dead legacy mass ⇒ the clock spans
+    the full history.
+    """
+    legacy_ts: list[datetime] = []
+    for d in decisions:
+        if not _is_no_decision(d.get("action_taken")):
+            continue
+        if classify_failure(d.get("reasoning"))["tag"] == "legacy":
+            ts = _parse_ts(d.get("timestamp"))
+            if ts is not None:
+                legacy_ts.append(ts)
+    return max(legacy_ts) if legacy_ts else None
+
+
+def _hour_of_day_clock(
+    decisions: list[dict], boundary: datetime | None
+) -> tuple[list[dict], int, int, list[dict], str]:
+    """Current-regime parse-fail rate aggregated by UTC clock hour (0–23).
+
+    The existing ``hourly`` series is a sparse 24h *calendar* timeline — it can
+    show that today spiked at 14:00 but not that 14:00 spikes *every* day. This
+    folds the whole current-regime history onto a 24-hour clock so a recurring
+    host-load window becomes visible and actionable. That window is the system's
+    dominant unsolved problem: TIMEOUT_EMPTY failures from the ``claude`` CLI
+    contending for the 3-subprocess OOM cap whenever the hourly self-review and
+    continuous-backtest loops fire — knowing *which UTC hours* lets the operator
+    deconflict the cron instead of just watching the bleed.
+
+    Returns ``(hour_of_day, window_n, window_failures, worst_hours,
+    clock_hint)``. Window = rows with a parsed ts and
+    ``(boundary is None or ts > boundary)`` — strictly ``>``, identical to
+    ``decision_reliability``'s current-regime partition. Sparse (only hours with
+    ≥1 decision), matching ``_bucket_hourly``'s convention. Pure; never raises.
+    """
+    tot: dict[int, int] = {}
+    fail: dict[int, int] = {}
+    win_n = win_fail = 0
+    for d in decisions:
+        ts = _parse_ts(d.get("timestamp"))
+        if ts is None:
+            continue
+        if boundary is not None and ts <= boundary:
+            continue
+        h = ts.hour
+        tot[h] = tot.get(h, 0) + 1
+        win_n += 1
+        if _is_no_decision(d.get("action_taken")):
+            fail[h] = fail.get(h, 0) + 1
+            win_fail += 1
+
+    hod = [
+        {
+            "hour": h,
+            "total": tot[h],
+            "failures": fail.get(h, 0),
+            "fail_pct": round(fail.get(h, 0) / tot[h] * 100, 1) if tot[h] else 0.0,
+        }
+        for h in sorted(tot)
+    ]
+
+    # Worst hours: only buckets with enough samples to not be 1/1 = 100% noise.
+    eligible = [b for b in hod if b["total"] >= HOUR_MIN_SAMPLE]
+    worst = sorted(
+        eligible, key=lambda b: (-b["fail_pct"], -b["failures"], b["hour"])
+    )[:3]
+    overall = round(win_fail / win_n * 100, 1) if win_n else 0.0
+
+    hint = ""
+    if worst and worst[0]["fail_pct"] - overall >= CLOCK_HINT_MARGIN_PP:
+        w = worst[0]
+        others = [
+            b
+            for b in worst[1:]
+            if b["fail_pct"] - overall >= CLOCK_HINT_MARGIN_PP
+        ]
+        extra = ""
+        if others:
+            tags = ", ".join("%02d:00" % b["hour"] for b in others)
+            extra = " (also %s)" % tags
+        hint = (
+            "Parse-failures concentrate at %02d:00–%02d:00 UTC — %.0f%% fail "
+            "vs %.0f%% window-wide (n=%d)%s. Shift host-heavy jobs (hourly "
+            "self-review, continuous backtests) off this UTC hour to relieve "
+            "the claude-subprocess contention."
+            % (
+                w["hour"],
+                (w["hour"] + 1) % 24,
+                w["fail_pct"],
+                overall,
+                w["total"],
+                extra,
+            )
+        )
+    return hod, win_n, win_fail, worst, hint
+
+
 def build_decision_forensics(decisions: list[dict],
                              now: datetime | None = None) -> dict:
     """Forensic breakdown of NO_DECISION cycles (newest-first row list).
@@ -192,6 +315,13 @@ def build_decision_forensics(decisions: list[dict],
         "retry_exhausted": 0,
         "by_market": {},
         "hourly": [],
+        "regime_boundary": None,
+        "hour_of_day": [],
+        "hour_of_day_window_n": 0,
+        "hour_of_day_window_failures": 0,
+        "hour_of_day_min_sample": HOUR_MIN_SAMPLE,
+        "worst_hours": [],
+        "clock_hint": "",
         "recent_failures": [],
         "dominant_mode": None,
         "hint": "",
@@ -265,6 +395,20 @@ def build_decision_forensics(decisions: list[dict],
     out["by_market"] = by_mkt
 
     out["hourly"] = _bucket_hourly(failrows, allrows, now)
+
+    # Decision-loss clock: fold the *current-regime* history onto a 24h UTC
+    # clock so a recurring host-load window is visible/actionable (additive —
+    # the legacy-inclusive `hourly`/`by_market`/verdict above are untouched).
+    boundary = _regime_boundary(decisions)
+    hod, hod_n, hod_fail, worst_hours, clock_hint = _hour_of_day_clock(
+        decisions, boundary)
+    out["regime_boundary"] = boundary.isoformat() if boundary else None
+    out["hour_of_day"] = hod
+    out["hour_of_day_window_n"] = hod_n
+    out["hour_of_day_window_failures"] = hod_fail
+    out["hour_of_day_min_sample"] = HOUR_MIN_SAMPLE
+    out["worst_hours"] = worst_hours
+    out["clock_hint"] = clock_hint
 
     if out["mode_mix"]:
         dom = out["mode_mix"][0]["mode"]

@@ -4102,3 +4102,52 @@ module is the evidence: **312 green** across `test_runner_heartbeat`,
   (312 green).
 
 *Review pass #17 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+## Feature: decision-loss clock (feature-dev agent, 2026-05-18)
+
+**Gap.** Every pass since #6 documents the same #1 unsolved problem —
+NO_DECISION ~60% driven by `TIMEOUT_EMPTY` (the `claude` CLI starving
+under host load when the hourly self-review + continuous-backtest loops
+contend for the 3-subprocess OOM cap). It is exhaustively *measured*
+(`decision_health`/`_forensics`/`_drought`/`_reliability`/
+`capital_paralysis`) and AGENTS.md repeats "the lever is host load" —
+but nothing told the operator **which clock hours to deconflict**.
+`decision_forensics.hourly` is a sparse 24h *calendar* timeline: it shows
+*today* spiked at 14:00, never that 14:00 spikes *every* day.
+
+**What shipped.** Purely-additive extension of
+`analytics/decision_forensics.py` — folds the **current-regime** decision
+history onto a 24h UTC clock:
+
+- New keys on `build_decision_forensics` (and the existing
+  `/api/decision-forensics` route, no new endpoint): `regime_boundary`,
+  `hour_of_day` (sparse 0–23, `{hour,total,failures,fail_pct}`),
+  `hour_of_day_window_n/_failures`, `hour_of_day_min_sample`,
+  `worst_hours` (top-3, min-sample-gated), `clock_hint` (actionable, only
+  when a worst hour beats the window rate by ≥`CLOCK_HINT_MARGIN_PP`).
+- `_regime_boundary()` derives `max(ts where classify_failure().tag ==
+  'legacy')` from *this module's* own `classify_failure`/`_parse_ts` —
+  the **identical regime contract** `decision_reliability` partitions on
+  (no circular import; no touch to that contested file). Verified on the
+  live DB: forensics `regime_boundary` == the live
+  `/api/decision-reliability` boundary (`2026-05-15T17:42:42…`) —
+  the clock and the reliability headline can never tell different
+  stories. The legacy-inflated `hourly`/`by_market`/verdict are
+  byte-unchanged (additive only; observational, never gates — invariants
+  #2/#12).
+- Dashboard: a 24h clock mini-chart + hint line added to the existing
+  Decision-failure-forensics card (`#df-clock*`).
+- **Live-validated** (Flask test client, the live DB): 133 current-regime
+  cycles, recurring morning-UTC storm — 06:00 87% (n=8), 10:00 100%
+  (n=7) vs 42% window-wide; 12:00–14:00/17:00/23:00 clean. The 11:00
+  100%/n=2 bucket is correctly min-sample-suppressed.
+
+**Tests.** New `tests/test_decision_loss_clock.py` (16, behaviour-
+asserting incl. the regime-window property test + same-story parity vs
+`build_decision_reliability`). Full suite green: 1690→1717 (0 failed;
+baseline taken at HEAD before the change for concurrent-agent noise
+isolation).
+
+*Decision-loss-clock feature appended 2026-05-18. Prior content above is unmodified.*
