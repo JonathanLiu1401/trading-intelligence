@@ -541,3 +541,70 @@ class TestQuoteWidgetGate:
         assert ok is False
         mock_claude.assert_not_called()
         assert sorted(spy.marked) == ["y1", "y2"]
+
+    # ── Quote-listing share-card fingerprint (_QW_LISTING) ──────────────────
+    # "$NVIDIA (NVDA.US)$ - Moomoo" — a Google-News-indexed Moomoo/Futu/Webull
+    # quote SHARE-CARD landing page, ML-relevance over-scored (live: 9.77,
+    # ai_score 0) and fired urgency=2 🚨 BREAKING; recurring ≥6 prior passes.
+    # A DISTINCT surface the two price/% fingerprints don't catch.
+    def test_helper_rejects_quote_listing_share_card(self):
+        f = alert_agent._looks_like_quote_widget
+        for junk in (
+            "$NVIDIA (NVDA.US)$ - Moomoo",          # the exact live row
+            "$Tesla (TSLA.US)$ - Moomoo",
+            "$Tencent (00700.HK)$ - Futu",          # HK numeric symbol
+            "$Samsung Electronics (005930.KS)$ - Webull",
+            "  $NIO Inc. (NIO.US)$",                # leading ws, no provider
+        ):
+            assert f({"title": junk}) is True, junk
+        # Real "$TICKER ..." prose and $+paren headlines must SURVIVE — the
+        # close ".EXCH)$" is the share-card-only discriminator.
+        for good in (
+            "$NVDA breaks out ahead of earnings (NYSE)",
+            "$MU upgraded to Buy (price target $150.00)",
+            "$TSLA: why I am buying the dip (analysis)",
+            "Zscaler (NASDAQ:ZS) Price Target Cut to $223.00 by Analysts",
+            "Nvidia (NVDA) Q1 preview: all eyes on data center",
+        ):
+            assert f({"title": good, "link": "https://x.com/a/b"}) is False, good
+
+    def test_quote_listing_share_card_suppressed_before_claude(self, monkeypatch):
+        """The exact live row ($NVIDIA (NVDA.US)$ - Moomoo, GN: Nvidia,
+        ml=9.77 → urgency=2) must NOT fire 🚨 BREAKING: no Claude call, no
+        Discord, marked alerted so it exits the urgent queue."""
+        spy = self._StoreSpy()
+        row = self._row(
+            _id="ql", source="GN: Nvidia", link="https://news.google.com/x",
+            title="$NVIDIA (NVDA.US)$ - Moomoo", ai_score=9.77,
+        )
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call") as mock_claude, \
+             patch("notifier.discord_notifier.send") as mock_send:
+            ok = alert_agent.send_urgent_alert([row], spy)
+        assert ok is False
+        mock_claude.assert_not_called()
+        mock_send.assert_not_called()
+        assert spy.marked == ["ql"]
+
+    def test_quote_listing_mixed_batch_only_real_reaches_prompt(self, monkeypatch):
+        spy = self._StoreSpy()
+        listing = self._row(_id="ql", source="GN: Nvidia",
+                             link="https://news.google.com/x",
+                             title="$NVIDIA (NVDA.US)$ - Moomoo", ai_score=9.77)
+        real = {
+            "_id": "r", "link": "https://reuters.com/mu-q3",
+            "title": "MU earnings blow past Q3 estimates sharply",
+            "source": "rss", "ai_score": 9.5, "summary": "",
+            "published": _iso(1), "first_seen": _iso(0.1),
+        }
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call",
+                          return_value="🚨 BREAKING ◈ EARNINGS ◈ MU") as mock_claude, \
+             patch("notifier.discord_notifier.send",
+                   return_value=True) as mock_send:
+            ok = alert_agent.send_urgent_alert([listing, real], spy)
+        assert ok is True
+        prompt = mock_claude.call_args.args[0]
+        assert "MU earnings blow past Q3 estimates" in prompt
+        assert "$NVIDIA (NVDA.US)$" not in prompt
+        assert sorted(spy.marked) == ["ql", "r"]

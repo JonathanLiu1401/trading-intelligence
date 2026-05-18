@@ -175,3 +175,31 @@ class TestQuoteWidgetRejection:
         titles = [a["title"] for a in arts]
         assert titles == ["Nvidia tops Q3 estimates on AI demand, raises guidance"]
         assert not any(web_scraper._QW_PRICE_GLUE.search(t) for t in titles)
+
+    # ── Quote-listing share-card fingerprint (_QW_LISTING, lockstep) ────────
+    # "$NVIDIA (NVDA.US)$ - Moomoo" — a Moomoo/Futu/Webull quote share-card
+    # landing page. web_scraper does not normally ingest these (they arrive via
+    # the Google News collector), but the third fingerprint is carried here
+    # byte-identically so the three gates stay in lockstep.
+    QUOTE_LISTING_TITLES = [
+        "$NVIDIA (NVDA.US)$ - Moomoo",
+        "$Tesla (TSLA.US)$ - Moomoo",
+        "$Tencent (00700.HK)$ - Futu",
+        "$Samsung Electronics (005930.KS)$ - Webull",
+        "  $NIO Inc. (NIO.US)$",
+    ]
+
+    def test_quote_listing_share_card_rejected(self):
+        for t in self.QUOTE_LISTING_TITLES:
+            assert web_scraper._looks_like_quote_widget(t, "") is True, t
+
+    def test_real_dollar_ticker_headlines_accepted(self):
+        # Real "$TICKER ..." prose / $+paren headlines must still pass — the
+        # discriminator is the glued "(SYM.EXCH)$" share-card close.
+        for t in (
+            "$NVDA breaks out ahead of earnings (NYSE)",
+            "$MU upgraded to Buy (price target $150.00)",
+            "Zscaler (NASDAQ:ZS) Price Target Cut to $223.00 by Analysts",
+        ):
+            assert web_scraper._looks_like_quote_widget(
+                t, "https://x.com/a/b") is False, t
