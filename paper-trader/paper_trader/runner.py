@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import threading
@@ -39,6 +40,10 @@ _consecutive_no_decisions = 0
 # and re-alarms, which is the correct behaviour (a fresh process SHOULD tell
 # the operator it is still frozen).
 _quota_alert_active = False
+
+# Set by the git-watcher thread; checked by the main loop between cycles so
+# a restart never kills a mid-Opus decision call.
+_restart_requested = threading.Event()
 
 
 # ── Restart-durable report markers ───────────────────────────────────────
@@ -353,6 +358,75 @@ def _maybe_daily_close():
         print(f"[runner] daily close failed: {e}")
 
 
+# ── Git-staleness self-restart ───────────────────────────────────────────
+# The trading-intelligence repo auto-commits/pushes operator fixes; systemd
+# runs this unit with Restart=always. Without a self-check, a running runner
+# keeps executing the OLD code until something else bounces it — a committed
+# fix can sit unapplied for hours. This watcher records git HEAD at boot and
+# re-checks every 10 min; on a HEAD change it logs, pings Discord, sets
+# `_restart_requested`, and returns — the MAIN LOOP performs the actual
+# os._exit(0) at the next cycle boundary so a restart never kills a mid-Opus
+# decision call. systemd (Restart=always) brings us back on the new code.
+# REPO_ROOT is the paper-trader dir (a child of the trading-intelligence work
+# tree); `git rev-parse` walks up to the repo, so this resolves HEAD
+# correctly. Fail-OPEN by construction: ANY git/subprocess error just skips
+# that iteration — the watcher must never crash the trade loop, and never
+# exits the process itself (it only ever flags the deferred restart).
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _git_watcher():
+    """Daemon-thread body: restart the process when new commits land."""
+    try:
+        old_head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT
+        ).decode().strip()
+    except Exception as e:
+        # Can't establish a baseline → nothing to compare against ever.
+        # Degrade to a no-op watcher rather than crash the thread.
+        print(f"[runner] git-watcher disabled (no baseline HEAD: {e})")
+        return
+    # Let the service fully start before the first check.
+    time.sleep(120)
+    while True:
+        try:
+            new_head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT
+            ).decode().strip()
+        except Exception:
+            # git transiently unavailable (mid-rebase, USB unmounted, …):
+            # skip this iteration, never crash the watcher.
+            time.sleep(600)
+            continue
+        if new_head != old_head:
+            print(
+                f"[runner] WARNING: git HEAD changed "
+                f"(old={old_head[:7]}, new={new_head[:7]}) — new commits "
+                f"detected; scheduling deferred restart after current cycle"
+            )
+            try:
+                reporter._send(
+                    f"paper-trader restart pending: new commits detected "
+                    f"(old={old_head[:7]}, new={new_head[:7]}); "
+                    f"will restart between cycles"
+                )
+            except Exception as e:
+                print(f"[runner] git-watcher Discord notice failed: {e}")
+            _restart_requested.set()
+            return  # watcher job is done; main loop handles the actual exit
+        time.sleep(600)
+
+
+def _start_git_watcher():
+    try:
+        threading.Thread(
+            target=_git_watcher, daemon=True, name="git-watcher"
+        ).start()
+        print("[runner] git-watcher thread started (auto-restart on new commits)")
+    except Exception as e:
+        print(f"[runner] git-watcher disabled: {e}")
+
+
 def _start_dashboard():
     try:
         from . import dashboard
@@ -516,6 +590,7 @@ def main():
     # (a post-16:05 bounce won't re-post the close). No sidecar → globals keep
     # their fresh-boot values, behaviour identical to before this change.
     _restore_runner_state()
+    _start_git_watcher()
     _start_dashboard()
     try:
         reporter._send("**PAPER TRADER ONLINE** ◈ engine booted, decision loop starting")
@@ -537,10 +612,26 @@ def main():
         _maybe_hourly()
         _maybe_daily_close()
 
+        # Deferred restart: exit between cycles so we never kill a mid-Opus call.
+        if _restart_requested.is_set():
+            print("[runner] deferred restart — exiting between cycles (new commits detected)")
+            try:
+                reporter._send("paper-trader restarting now: applying new commits")
+            except Exception:
+                pass
+            os._exit(0)
+
         market_open = market.is_market_open()
         sleep_s = OPEN_INTERVAL_S if market_open else CLOSED_INTERVAL_S
         print(f"[runner] sleeping {sleep_s}s (market_open={market_open})")
-        time.sleep(sleep_s)
+        _restart_requested.wait(timeout=sleep_s)
+        if _restart_requested.is_set():
+            print("[runner] deferred restart triggered during sleep")
+            try:
+                reporter._send("paper-trader restarting now: applying new commits")
+            except Exception:
+                pass
+            os._exit(0)
 
 
 if __name__ == "__main__":
