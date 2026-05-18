@@ -98,3 +98,63 @@ class TestDedupeMerge:
         out = dedupe_urgent(arts)
         batch = [a for a in out if a["_id"] == "b"]
         assert sorted(alerted_ids(batch)) == ["a", "b"]
+
+
+class TestWinnerBranchIdRobustness:
+    """Regression: the winner branch promoted the *new* higher-scored copy and
+    carried the displaced representative's id forward via the hard subscript
+    ``cur["_id"]``. The loser branch and alerted_ids() both guard with .get(),
+    but this branch did not, so:
+
+      * a displaced representative dict with no ``_id`` key → KeyError, which
+        send_urgent_alert's broad ``except`` swallows → the WHOLE urgent batch
+        is dropped and nothing is marked alerted → urgent alerts silently fail
+        that cycle (the exact failure class the _fmt defensive-access comment
+        in alert_agent.py documents for non-canonical / manual-replay rows);
+      * a displaced representative with ``_id=None`` → a literal None leaks
+        into _dup_ids → alerted_ids → mark_alerted_batch's ``WHERE id=?``.
+
+    Both must not happen; canonical input behaviour must be byte-identical.
+    """
+
+    def test_displaced_representative_missing_id_does_not_raise(self):
+        # First (lower-scored) copy has NO _id key at all; the second copy is
+        # higher-scored so it wins and must carry the displaced one forward.
+        arts = [
+            {"title": "Micron shares surge after Q3 earnings blowout", "ai_score": 6.0},
+            {"_id": "b", "title": "UPDATE 2-Micron shares surge after Q3 earnings blowout", "ai_score": 9.0},
+        ]
+        out = dedupe_urgent(arts)              # pre-fix: raised KeyError('_id')
+        assert len(out) == 1
+        assert out[0]["_id"] == "b"
+        assert out[0]["dup_count"] == 2
+        # The displaced copy had no id, so there is nothing to mark — but the
+        # winner itself must still be returned for marking.
+        assert out[0]["_dup_ids"] == []
+        assert alerted_ids(out) == ["b"]
+
+    def test_displaced_representative_none_id_not_injected(self):
+        arts = [
+            {"_id": None, "title": "Micron shares surge after Q3 earnings blowout", "ai_score": 6.0},
+            {"_id": "b", "title": "RPT-Micron shares surge after Q3 earnings blowout", "ai_score": 9.0},
+        ]
+        out = dedupe_urgent(arts)
+        assert out[0]["_id"] == "b"
+        assert out[0]["dup_count"] == 2
+        assert None not in out[0]["_dup_ids"], "None leaked into _dup_ids"
+        assert None not in alerted_ids(out), "None would hit mark_alerted's WHERE id=?"
+
+    def test_canonical_input_behaviour_unchanged(self):
+        # Same scenario as the module __main__ smoke test — every row has an
+        # _id; the fix must not alter the established merge bookkeeping.
+        arts = [
+            {"_id": "a", "title": "Micron shares surge after Q3 earnings blowout", "ai_score": 7.0},
+            {"_id": "b", "title": "Micron shares surge after Q3 earnings blowout", "ai_score": 8.5},
+            {"_id": "c", "title": "Micron shares surge after Q3 earnings blowout - Reuters", "ai_score": 6.0},
+            {"_id": "f", "title": "UPDATE 2-Micron shares surge after Q3 earnings blowout", "ai_score": 4.0},
+            {"_id": "g", "title": "RPT-UPDATE 3-Micron shares surge after Q3 earnings blowout (Reuters)", "ai_score": 3.0},
+        ]
+        out = dedupe_urgent(arts)
+        assert len(out) == 1
+        assert out[0]["_id"] == "b" and out[0]["dup_count"] == 5
+        assert sorted(out[0]["_dup_ids"]) == ["a", "c", "f", "g"]
