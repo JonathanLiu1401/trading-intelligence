@@ -544,7 +544,8 @@ Digital Intern dashboard on `:8080` can cross-fetch.
 | `signals.get_top_signals` returns `[]` | `articles.db` not at `USB_DB` (USB unmounted) or `LOCAL_DB`; live-only filter is correct so backtest contamination is *not* the cause | `signals._db_path()`; run `python3 -m paper_trader.signals` |
 | `paper_trader.db is locked` | Another writer attached without `?mode=ro`; or a long-running query inside `_lock` | Check for ad-hoc scripts; only the runner should write |
 | Dashboard `/api/scorer-predictions` shows `is_trained: false` | `data/decision_outcomes.jsonl` has < 500 rows — scorer hasn't trained enough yet | `wc -l data/decision_outcomes.jsonl` |
-| Discord posts stop entirely | `openclaw` binary missing / auth expired | `which openclaw`; `openclaw message send --channel discord ...` manually |
+| Discord posts stop entirely (`[reporter] openclaw not installed; would send:` spam, every report dropped) | **`openclaw` is an npm-global under the nvm node bin; the systemd unit launches `runner.py` with a minimal PATH that excludes it, so `shutil.which('openclaw')` returned `None`** (live-finding 2026-05-17 — `openclaw` *was* installed at `~/.nvm/versions/node/<v>/bin/openclaw`, just unreachable). **Root-fixed (review pass #10):** `reporter._resolve_openclaw()` now tries `OPENCLAW_BIN` env override → `PATH` → well-known fallbacks (`~/.local/bin`, `/usr/local/bin`, `/usr/bin`, `~/.nvm/.../bin`). Applies on next runner restart. If it *still* fails: auth expired, or set `OPENCLAW_BIN=/abs/path/openclaw` in the unit | `which openclaw` (may be on *your* PATH but not the unit's — compare `tr '\0' '\n' </proc/<runner-pid>/environ \| grep ^PATH`); `python3 -c "from paper_trader.reporter import _resolve_openclaw; print(_resolve_openclaw())"` |
+| Trader frozen — `NO_DECISION` every cycle for hours, equity flat, **no Discord alert** | **Claude CLI quota/usage-limit exhausted** — `claude` exits rc=1 with stdout `You've hit your org's monthly usage limit` (Opus *and* the Sonnet fallback). The circuit-breaker pkill is futile (the process already exited). **Surfaced (review pass #10):** `strategy._is_quota_exhausted` flags it → `summary["quota_exhausted"]` → `runner._cycle` fires ONE `reporter.send_quota_alert` (deduped; re-armed + a `RECOVERED` notice when a real decision lands) and skips the futile breaker. The alert only reaches Discord once the openclaw-resolution fix above is also live | `grep -a 'QUOTA EXHAUSTED' logs/runner.log`; `/api/decision-reliability` (`TIMEOUT_EMPTY` 100% of current failures with a fresh feed = quota, not a feed outage); resolve the Anthropic quota / upgrade the plan — a runner restart will NOT help |
 | Live cross-dashboard (`:8080` → `:8090`) shows blanks | CORS or paper-trader process down | `curl http://localhost:8090/api/portfolio` |
 | Strategy returns `HOLD` constantly even with strong signals | Opus is being conservative — by design, no threshold gating to override | Inspect the prompt context in `strategy.py::_build_payload`; if the watchlist has stale prices yfinance is rate-limited |
 | Equity / P/L looks too high and won't come down; an option position never closes | Pre-fix `_portfolio_snapshot` marked an expired contract at avg_cost forever (no live chain past expiry). Fixed — see invariant #13. If you see this on an old `:8090` process, check `/api/build-info` `stale` and restart | `strategy._option_expired` / `_expired_intrinsic`; `SELECT * FROM positions WHERE type IN ('call','put') AND closed_at IS NULL AND expiry < date('now')` |
@@ -2007,3 +2008,100 @@ deletion is safe even if a backtest thread is mid-read.
   (the 6 core files + the new drawdown lock = 303 fast offline tests; the
   full `tests/ -v` sweep is correct but slow under a concurrent pytest —
   the core subset is the meaningful core-domain proof).
+
+### 2026-05-18 review pass #10 (paper-trader core hybrid · data-feed resolver fix · quota-exhaustion guard + robust openclaw · live findings)
+
+- **Phase 1 — 1 bug fixed (commit `203bca4`).**
+  **`/api/data-feed` bypassed the freshness-aware DB resolver and pinned a
+  pre-migration path.** `data_feed_api()` resolved digital-intern's
+  `articles.db` via its own hardcoded candidate list
+  (`/home/zeph/digital-intern/data/articles.db` LOCAL first, USB fallback)
+  instead of `_articles_db_path()` → `signals._db_path()`. Two real
+  defects: (a) **invariant #17 violation** — every other news-analytics
+  endpoint routes through the freshness-aware single source of truth so the
+  dashboard and the live trader never disagree on which feed is canonical;
+  this one didn't, so the live news-pulse panel could read a stale USB
+  mirror while the trader read fresh LOCAL (the exact split-brain #17
+  closed everywhere else); (b) the "LOCAL" literal is the **pre-migration**
+  path — the repo now lives under `/home/zeph/trading-intelligence/`; it
+  only resolves on the original box via a legacy migration symlink, so on a
+  clean checkout the endpoint silently zeroes the panel with
+  `error: articles.db not found`. Fix is surgical: `db_path =
+  _articles_db_path()`; the None-graceful shape + live-only SQL filter are
+  unchanged. New `tests/test_core_dashboard_data_feed.py` (5 tests) drives
+  the real Flask view: the discriminating stale-USB-loses-to-fresh-LOCAL
+  assertion (FAILS pre-fix — old code read the box's real 1.4 GB prod DB,
+  not the test tmp DBs), fresher-USB-still-wins, backtest/opus row
+  exclusion, graceful-zero-when-no-DB, independent 1h/24h window boundary.
+
+- **Phase 2 — 2 features shipped (commit pending): quota-exhaustion guard
+  + robust openclaw resolution.** Both motivated by Phase-3 live findings,
+  not invented.
+  1. **Quota-exhaustion alarm.** `strategy._is_quota_exhausted(text)` (tight
+     marker set — `usage limit`/`quota exceeded`/`quota exhausted`/`out of
+     credit`/`insufficient credit`, case-insensitive, no false alarms on a
+     timeout/parse-miss) flags the observed live failure (`claude` rc=1,
+     stdout `You've hit your org's monthly usage limit`). `_claude_call`
+     sets a per-cycle module flag; `decide()` resets it each cycle and
+     surfaces `summary["quota_exhausted"]` (+ a quota-specific
+     `decisions.reasoning` instead of the generic `parse_failed`).
+     `runner._cycle` fires **one** `reporter.send_quota_alert()` per outage
+     (dedupe latch `_quota_alert_active`), **skips the futile
+     circuit-breaker pkill** (the CLI already exited — nothing to kill — and
+     holds the breaker counter at 0 so a quota outage can never trip it),
+     and on recovery (a real non-NO_DECISION) sends a `RECOVERED` notice and
+     re-arms. A non-quota timeout after an outage holds the alarmed state
+     (not premature "recovered") and the ordinary breaker still counts it.
+  2. **Robust openclaw resolution.** `reporter._resolve_openclaw()`:
+     `OPENCLAW_BIN` env override → `PATH` (`shutil.which`) → well-known
+     fallbacks (`~/.local/bin`, `/usr/local/bin`, `/usr/bin`, glob
+     `~/.nvm/versions/node/*/bin/openclaw`, newest node first). Closes the
+     live failure where the systemd unit's minimal PATH excluded the nvm
+     bin so `shutil.which` returned `None` and **every** Discord message
+     (incl. the new quota alert) was silently dropped. Verified live:
+     resolves `/home/zeph/.nvm/versions/node/v24.15.0/bin/openclaw` with an
+     empty PATH. New `tests/test_quota_guard.py` (29 tests) locks the full
+     chain (marker precision, `_claude_call` flag wiring, `decide()`
+     surface + per-cycle reset, resolver 4-way order, alert body,
+     `_cycle` dedupe/recovery/re-arm/breaker-skip); one existing
+     `test_core_reporter.py::test_returns_false_when_openclaw_missing`
+     **adapted** (not weakened) to the new resolver seam — same assertions
+     (False + logged would-send), now exercising all three resolver steps
+     returning None.
+
+- **Phase 3 — live findings (trader perspective, 2026-05-18 ~04:40 UTC).**
+  1. **TWO live `runner.py` processes on the same $1000 book.** PID
+     1255030 (started 11:30, running **pre-singleton-lock** in-memory code
+     — no lock line in its boot log) and PID 1465599 (17:28, holds
+     `data/paper_trader.runner.lock`). Both cycle `paper_trader.db` →
+     double NO_DECISION rows 4 s apart (03:57:13 + 03:57:17, 02:39 + 02:42,
+     01:39 + 01:41). The invariant #19 guard works for the code it's *in*;
+     it cannot retroactively stop a process that never took the lock.
+     **Operator action:** `kill 1255030` (keep the lock holder 1465599),
+     then restart that one to pick up today's fixes. Not a code bug — a
+     code "fix" that hunts sibling `runner.py` PIDs is exactly the
+     host-wide-scan footgun the `_kill_stale_claude` comment forbids.
+  2. **Claude quota exhausted** (`You've hit your org's monthly usage
+     limit`) — the live trigger for the Phase-2 guard. Trader frozen on
+     NO_DECISION/flat-HOLD for hours; `/api/decision-reliability`
+     `current_failure_rate_pct 27.1%`, 100% `TIMEOUT_EMPTY`, with a
+     **fresh feed** (`/api/feed-health` HEALTHY, newest live article 0.1h)
+     — so it is the quota, not a feed outage. Operator action: resolve /
+     upgrade the Anthropic quota; a restart will not help.
+  3. **Every Discord report silently dropped** — `[reporter] openclaw not
+     installed; would send:` on every hourly/daily/trade send (the live
+     trigger for the Phase-2 openclaw fix). `openclaw` is installed at the
+     nvm path but the runner's PATH excludes it.
+  4. **Running :8090 is `behind:24 stale:true`** (`build-info`
+     `boot_sha 310d16e`). All of today's fixes (data-feed, quota guard,
+     openclaw) are inert until the (deduplicated) runner is restarted.
+  - Decision loop **healthy & on-cadence** otherwise (heartbeat HEALTHY,
+    last decision 46 min ago within the 60 min closed cadence);
+    `/api/risk` correctly flags **HIGH** concentration (LITE 60.9% top-1,
+    top-3 98.1%); `/api/portfolio` $972.69 / $18.49 cash;
+    `/api/benchmark` `−2.25pp` vs SPY — all sensible, non-stale.
+
+- **Run the core suite:** `cd /home/zeph/trading-intelligence/paper-trader
+  && python3 -m pytest tests/test_core_*.py tests/test_quota_guard.py -q`
+  (full `tests/` is 1361 tests, green, but slow under a concurrent pytest;
+  the core subset + the new quota lock is the meaningful core-domain proof).

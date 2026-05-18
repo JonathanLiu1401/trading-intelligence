@@ -42,6 +42,32 @@ _ml_qualify_cache: tuple[bool, str, float] | None = None
 # (decision → retry → Sonnet fallback, or this cycle's call vs. the next).
 _active_claude_proc: subprocess.Popen | None = None
 
+# Set True by _claude_call when the CLI rejects an attempt with a quota /
+# usage-limit error (a *distinct* failure from a timeout or a parse miss — it
+# never self-recovers within the cycle, and the auto-recovery circuit breaker's
+# pkill is futile against it because the CLI already exited). decide() resets it
+# at the top of every cycle and surfaces it as summary["quota_exhausted"] so
+# runner._cycle can fire ONE Discord alarm per outage. _claude_call is called
+# only from decide(), so a single module global is race-free here.
+_quota_exhausted = False
+
+# Tight marker set — matched case-insensitively against the claude CLI's
+# stdout/stderr ONLY on a non-zero exit. Kept precise so an unrelated failure
+# (network blip, transient 5xx, parse miss) does NOT trip the trader-facing
+# alarm. The observed live string is: "You've hit your org's monthly usage
+# limit" (rc=1, empty stderr, message on stdout).
+_QUOTA_MARKERS = ("usage limit", "quota exceeded", "quota exhausted",
+                  "out of credit", "insufficient credit")
+
+
+def _is_quota_exhausted(text: str | None) -> bool:
+    """True if `text` looks like a quota / usage-limit rejection (not a
+    transient error). See `_QUOTA_MARKERS`."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(m in low for m in _QUOTA_MARKERS)
+
 WATCHLIST = [
     "LITE", "LNOK", "MUU", "DRAM", "SNDU",  # current real-account interests
     "NVDA", "AMD", "MU", "AMAT", "LRCX", "KLAC", "TSM", "ASML", "MRVL",  # semis
@@ -322,7 +348,7 @@ def _format_quant_signals(sigs: dict[str, dict]) -> str:
 
 def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
                  model: str = MODEL) -> str | None:
-    global _active_claude_proc
+    global _active_claude_proc, _quota_exhausted
     if not shutil.which("claude"):
         print("[strategy] claude CLI not found")
         return None
@@ -367,7 +393,14 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
             err = (stderr or "").strip()[:300]
             if not err:
                 err = f"(empty stderr) stdout={(stdout or '').strip()[:200]!r}"
-            print(f"[strategy] claude err (rc={proc.returncode}): {err}")
+            # Quota / usage-limit rejection is a distinct, non-self-recovering
+            # failure: flag it so decide() can surface it and runner._cycle
+            # can alarm the operator once (the bot is silently frozen).
+            if _is_quota_exhausted(f"{stdout or ''}\n{stderr or ''}"):
+                _quota_exhausted = True
+                print(f"[strategy] claude QUOTA EXHAUSTED (rc={proc.returncode}): {err}")
+            else:
+                print(f"[strategy] claude err (rc={proc.returncode}): {err}")
             return None
         return (stdout or "").strip() or None
     except Exception as e:
@@ -1071,6 +1104,8 @@ def _ml_live_opinion(
 
 def decide() -> dict:
     """Run one decision cycle. Returns summary dict for logging."""
+    global _quota_exhausted
+    _quota_exhausted = False  # per-cycle: reflects only THIS cycle's claude attempts
     store = get_store()
     market_open = market.is_market_open()
 
@@ -1268,13 +1303,19 @@ def decide() -> dict:
         "detail": "",
         "retried": retried,
         "fallback_used": fallback_used,
+        # True only when every claude attempt this cycle was rejected with a
+        # quota/usage-limit error (a frozen-trader signal, not a transient
+        # miss). runner._cycle dedupes the Discord alarm off this.
+        "quota_exhausted": bool(_quota_exhausted and not decision),
     }
 
     if not decision:
         # Capture an excerpt of what Claude actually returned so we can
         # diagnose parse failures from the dashboard / DB instead of staring
         # at a generic "no parseable JSON" line.
-        if raw:
+        if _quota_exhausted:
+            reason_text = "claude quota/usage limit exhausted (no decision)"
+        elif raw:
             excerpt = raw[:RAW_CAPTURE_CHARS].replace("\x00", "")
             tag = "retry_failed" if retried else "parse_failed"
             reason_text = f"{tag}: {excerpt}"

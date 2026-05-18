@@ -32,6 +32,13 @@ CONSECUTIVE_NO_DECISION_LIMIT = 5
 _daily_close_sent_for: str | None = None
 _last_hourly: datetime | None = None
 _consecutive_no_decisions = 0
+# Dedupe latch for the "Claude quota exhausted" Discord alarm. Set True after
+# the alarm is sent; cleared (re-armed) only when a real decision confirms the
+# quota is back. Module global — deliberately NOT persisted to the runner_state
+# sidecar: on a restart the next cycle's decide() re-detects an ongoing outage
+# and re-alarms, which is the correct behaviour (a fresh process SHOULD tell
+# the operator it is still frozen).
+_quota_alert_active = False
 
 
 # ── Restart-durable report markers ───────────────────────────────────────
@@ -312,27 +319,63 @@ def _kill_stale_claude():
 
 
 def _cycle():
-    global _consecutive_no_decisions
+    global _consecutive_no_decisions, _quota_alert_active
     summary = strategy.decide()
 
-    # Auto-recovery circuit breaker. strategy.decide() returns a dict whose
-    # top-level "status" is "NO_DECISION" whenever Claude failed (timeout /
-    # empty / unparseable, after the Sonnet fallback and JSON-only retry).
-    # A genuine HOLD comes back as status="HOLD", not "NO_DECISION", so a
-    # quiet market does NOT trip the breaker — only repeated Claude failures.
     status = summary.get("status", "NO_DECISION")
-    if status == "NO_DECISION":
-        _consecutive_no_decisions += 1
-        if _consecutive_no_decisions >= CONSECUTIVE_NO_DECISION_LIMIT:
-            print(
-                f"[runner] WARNING: {_consecutive_no_decisions} consecutive "
-                f"NO_DECISION cycles — Claude appears wedged; killing stale "
-                f"claude processes to auto-recover"
-            )
-            _kill_stale_claude()
-            _consecutive_no_decisions = 0  # reset after intervention
-    else:
+    quota = bool(summary.get("quota_exhausted"))
+
+    if quota:
+        # Quota / usage-limit exhaustion is a DISTINCT failure from a wedged
+        # CLI: the claude process already exited (non-zero, fast), so the
+        # circuit-breaker pkill is futile — running it just spams the log and
+        # could reap an unrelated sibling. The actionable response is to
+        # alarm the operator ONCE (the bot is silently frozen — no trades
+        # will execute until the quota resets). Keep the breaker counter at 0
+        # so a quota outage can never trip it.
         _consecutive_no_decisions = 0
+        if not _quota_alert_active:
+            try:
+                detail = ""
+                d = summary.get("decision")
+                if not d:
+                    detail = "Opus + Sonnet fallback both rejected with a usage/quota limit."
+                if reporter.send_quota_alert(detail):
+                    _quota_alert_active = True  # dedupe until recovery
+            except Exception as e:
+                print(f"[runner] quota alert failed: {e}")
+    else:
+        # Auto-recovery circuit breaker. strategy.decide() returns a dict whose
+        # top-level "status" is "NO_DECISION" whenever Claude failed (timeout /
+        # empty / unparseable, after the Sonnet fallback and JSON-only retry).
+        # A genuine HOLD comes back as status="HOLD", not "NO_DECISION", so a
+        # quiet market does NOT trip the breaker — only repeated Claude failures.
+        if status == "NO_DECISION":
+            _consecutive_no_decisions += 1
+            if _consecutive_no_decisions >= CONSECUTIVE_NO_DECISION_LIMIT:
+                print(
+                    f"[runner] WARNING: {_consecutive_no_decisions} consecutive "
+                    f"NO_DECISION cycles — Claude appears wedged; killing stale "
+                    f"claude processes to auto-recover"
+                )
+                _kill_stale_claude()
+                _consecutive_no_decisions = 0  # reset after intervention
+        else:
+            _consecutive_no_decisions = 0
+        # Quota recovered → tell the operator once, then re-arm the alarm so a
+        # *future* outage alerts again. Only confirm on an actual claude
+        # response (status != NO_DECISION); a non-quota timeout is not proof
+        # the quota is back, so we hold the alarmed state until a real
+        # decision lands rather than crying "recovered" prematurely.
+        if _quota_alert_active and status != "NO_DECISION":
+            try:
+                reporter._send(
+                    "✅ **CLAUDE QUOTA RECOVERED** ◈ decision engine responding "
+                    "again — live trader resumed"
+                )
+            except Exception as e:
+                print(f"[runner] quota recovery notice failed: {e}")
+            _quota_alert_active = False
 
     try:
         if summary.get("auto_exits") or summary.get("status") == "FILLED":

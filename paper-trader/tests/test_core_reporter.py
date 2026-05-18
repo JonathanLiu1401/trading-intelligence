@@ -39,7 +39,13 @@ def fresh_store(tmp_path, monkeypatch):
 
 class TestSend:
     def test_returns_false_when_openclaw_missing(self, monkeypatch, capsys):
+        # "Genuinely unresolvable" now means all three resolver steps fail:
+        # no OPENCLAW_BIN override, not on PATH, and no fallback candidate on
+        # disk. (Before the robust-resolver feature this was just which→None;
+        # the assertions below — False + logged would-send — are unchanged.)
+        monkeypatch.delenv("OPENCLAW_BIN", raising=False)
         monkeypatch.setattr(reporter.shutil, "which", lambda name: None)
+        monkeypatch.setattr(reporter, "_openclaw_fallback_candidates", lambda: [])
         ok = reporter._send("hello")
         assert ok is False
         # And it logs what it would have sent so we can debug offline.
