@@ -496,6 +496,160 @@ class TestTrainDecisionScorer:
         assert DecisionScorer().is_trained is True
 
 
+# ──────────────────── _oos_rank_metrics direct ────────────────────
+
+class TestOosRankMetrics:
+    """Direct coverage of `_oos_rank_metrics`. Previously this function had
+    no targeted tests — only end-to-end coverage via the `_train_decision_scorer`
+    status string. The NaN-sentinel fix (a missing `forward_return_5d` must
+    be DROPPED, not coerced to 0.0 which fabricates flat-target ties) is
+    locked here.
+    """
+
+    @staticmethod
+    def _scorer_returning(predictions: list[float]):
+        """Build a minimal scorer stub that yields the next prediction in
+        sequence per call. Mirrors how DecisionScorer.predict is consumed.
+        """
+        class _Stub:
+            is_trained = True
+
+            def __init__(self, preds):
+                self._it = iter(preds)
+
+            def predict(self, **_kw):
+                return next(self._it)
+
+        return _Stub(predictions)
+
+    def test_untrained_scorer_returns_zeroed_metrics(self):
+        class _Untrained:
+            is_trained = False
+
+            def predict(self, **_kw):
+                return 0.0
+
+        out = rcb._oos_rank_metrics(_Untrained(), [
+            {"forward_return_5d": 1.0, "action": "BUY", "ticker": "NVDA"}
+        ])
+        assert out == {"dir_acc": None, "rank_ic": None, "n": 0}
+
+    def test_records_missing_forward_return_are_dropped_not_zeroed(self):
+        """A `forward_return_5d=None` (or missing key) MUST be dropped.
+        Pre-fix the function defaulted the missing value to 0.0 via _to_float,
+        which then passed the `a == a` finite check and poisoned rank_ic with
+        a fabricated 0.0 actual. After the NaN-sentinel fix the same record is
+        explicitly excluded.
+        """
+        scorer = self._scorer_returning([0.5, 1.0, -0.5])
+        records = [
+            {"forward_return_5d": 1.5, "action": "BUY", "ticker": "NVDA"},
+            # This null actual would silently bias rank_ic if coerced to 0.0:
+            {"forward_return_5d": None, "action": "BUY", "ticker": "AMD"},
+            {"forward_return_5d": -0.8, "action": "BUY", "ticker": "MU"},
+        ]
+        out = rcb._oos_rank_metrics(scorer, records)
+        # Only the 2 non-null records contribute.
+        assert out["n"] == 2
+        # rank_ic computable on 2 pairs (preds=[0.5,-0.5], actuals=[1.5,-0.8])
+        # — both move in the same direction so IC must be +1.0.
+        assert out["rank_ic"] == pytest.approx(1.0)
+        # Both pairs have non-zero p and a, so dir_acc = 2/2 = 1.0.
+        assert out["dir_acc"] == pytest.approx(1.0)
+
+    def test_missing_forward_return_key_entirely_is_dropped(self):
+        """The key being entirely absent (not just None) is also dropped —
+        the NaN sentinel path catches both equivalently. Locks the contract
+        for a future schema that omits the field for some rows.
+        """
+        scorer = self._scorer_returning([0.5, 1.0, -0.5])
+        records = [
+            {"forward_return_5d": 1.5, "action": "BUY", "ticker": "NVDA"},
+            {"action": "BUY", "ticker": "AMD"},  # forward_return_5d absent
+            {"forward_return_5d": -0.8, "action": "BUY", "ticker": "MU"},
+        ]
+        out = rcb._oos_rank_metrics(scorer, records)
+        assert out["n"] == 2
+
+    def test_sell_action_flips_actual_sign_not_prediction(self):
+        """Mirror train_scorer's SELL convention: realized goodness of a
+        SELL is -forward_return_5d. The prediction is NOT flipped (the model
+        was trained on flipped targets so its output already encodes the
+        action-aligned goodness). A drop after a SELL should read as a
+        positive contribution to rank_ic.
+        """
+        # Scorer predicts +1.0 for both records.
+        scorer = self._scorer_returning([1.0, 1.0])
+        records = [
+            # BUY that went up — predicted +1, realized +2 → both positive
+            {"forward_return_5d": 2.0, "action": "BUY", "ticker": "NVDA"},
+            # SELL that went DOWN (a good SELL) — predicted +1, realized -3,
+            # but the SELL flip turns the actual into +3 → still positive
+            {"forward_return_5d": -3.0, "action": "SELL", "ticker": "AMD"},
+        ]
+        out = rcb._oos_rank_metrics(scorer, records)
+        assert out["n"] == 2
+        # Both actions have action-aligned positives — dir_acc must be 1.0
+        # not 0.5 (which would be the case if the SELL flip were missing).
+        assert out["dir_acc"] == pytest.approx(1.0)
+
+    def test_dir_acc_skips_zero_predictions_and_zero_actuals(self):
+        """A 0.0 prediction or 0.0 actual carries no directional truth and
+        must be excluded from dir_acc — but it still contributes to rank_ic
+        (zero is a legitimate rank).
+        """
+        scorer = self._scorer_returning([0.0, 1.0, -1.0])
+        records = [
+            # p=0 → excluded from dir_acc
+            {"forward_return_5d": 2.0, "action": "BUY", "ticker": "NVDA"},
+            # both non-zero, same sign → hit
+            {"forward_return_5d": 0.5, "action": "BUY", "ticker": "AMD"},
+            # both non-zero, opposite sign → miss
+            {"forward_return_5d": 0.5, "action": "BUY", "ticker": "MU"},
+        ]
+        out = rcb._oos_rank_metrics(scorer, records)
+        assert out["n"] == 3
+        # 1 hit out of 2 non-zero pairs
+        assert out["dir_acc"] == pytest.approx(0.5)
+
+    def test_predict_exception_skips_that_record(self):
+        """A scorer that raises on one input must NOT poison the whole
+        report — that record is dropped and the rest still contribute.
+        """
+        class _PartialRaiser:
+            is_trained = True
+
+            def __init__(self):
+                self.calls = 0
+
+            def predict(self, **_kw):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("simulated transient predict fault")
+                return 0.5 if self.calls == 1 else -0.5
+
+        records = [
+            {"forward_return_5d": 1.0, "action": "BUY", "ticker": "NVDA"},
+            {"forward_return_5d": 2.0, "action": "BUY", "ticker": "AMD"},
+            {"forward_return_5d": -1.0, "action": "BUY", "ticker": "MU"},
+        ]
+        out = rcb._oos_rank_metrics(_PartialRaiser(), records)
+        # 2 of 3 records survive.
+        assert out["n"] == 2
+
+    def test_single_record_yields_rank_ic_none(self):
+        """rank_ic requires n>=2 pairs; a single record reports n=1 with
+        rank_ic=None (never NaN, never a fabricated +1.0)."""
+        scorer = self._scorer_returning([0.7])
+        out = rcb._oos_rank_metrics(scorer, [
+            {"forward_return_5d": 1.2, "action": "BUY", "ticker": "NVDA"},
+        ])
+        assert out["n"] == 1
+        assert out["rank_ic"] is None
+        # Single pair both non-zero → dir_acc is computable
+        assert out["dir_acc"] == pytest.approx(1.0)
+
+
 # ──────────────────── scorer-skill ledger ───────────────────────
 
 class TestParseScorerStatus:
