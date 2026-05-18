@@ -44,8 +44,14 @@ def compute_drawdown(
             "contributors": [],
             "trough_value": starting_equity,
             "trough_ts": None,
+            # Shape parity with the populated branch below: a fresh/empty book
+            # must return the SAME keys as a book with history, or a consumer
+            # (the dashboard card, /api/decision-context, the chat fold) reads
+            # `undefined` for trough_pct / starting_equity on day one.
+            "trough_pct": 0.0,
             "recovery_pct": 0.0,
             "history": [],
+            "starting_equity": round(starting_equity, 2),
         }
 
     # Walk forward finding running peak and trough since peak.

@@ -7126,13 +7126,18 @@ def drawdown_api():
 
     Returns a structured 0% when the portfolio is at a fresh high so the UI
     can show a green high-water badge. ``recovery_pct`` measures how much of
-    the trough has been clawed back."""
+    the trough has been clawed back. ``starting_equity`` is the module
+    ``INITIAL_CASH`` (invariant #12, never a literal 1000 — the
+    ``benchmark_api``/``analytics_api`` single-source-of-truth pattern; the
+    builder's own 1000.0 default would silently desync the empty-curve
+    fallback + the echoed ``starting_equity`` if ``INITIAL_CASH`` ever moves)."""
     try:
         from .analytics.drawdown import compute_drawdown
         store = get_store()
         eq = store.equity_curve(limit=2000)
         positions = store.open_positions()
-        return jsonify(compute_drawdown(eq, positions))
+        return jsonify(compute_drawdown(eq, positions,
+                                        starting_equity=INITIAL_CASH))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
