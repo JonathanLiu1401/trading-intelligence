@@ -208,6 +208,7 @@ RULES:
 - Total output must fit in 1800 characters. Be ruthlessly concise. Cut low-signal rows.
 - No nested backticks. No backtick dividers. Dividers are plain ━━━ lines outside code blocks.
 - A newswire row tagged "[syndicated xN]" was independently carried by N sources — treat higher N as stronger corroboration/magnitude when choosing the LEAD and ordering TOP SIGNALS; a lone (untagged) item is single-sourced and less confirmed.
+- A newswire row tagged "[model]" carries a score set by the local relevance model ONLY, with NO LLM verification; that model demonstrably over-scores forum/wiki/social rows. Treat an untagged (LLM-vetted) row as materially more trustworthy than a "[model]" row of equal or near-equal score: prefer untagged rows for the LEAD and rank them above "[model]" rows of similar score in TOP SIGNALS. NEVER make a lone "[model]" row the LEAD when an untagged row of comparable score exists.
 - If a "COVERAGE GAP" block is present in the data input, reproduce it as a **COVERAGE GAP** section (one bullet per dark channel, verbatim). These are intel channels the system could NOT collect from this window — the analyst must know what they are blind to, not assume silence means calm. Omit the section entirely if no gap block is provided.
 
 OUTPUT FORMAT — use EXACTLY this, filled with real data:
@@ -570,8 +571,21 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None):
             # first_seen) — see _seen_utc_str.
             seen = _seen_utc_str(a.get("first_seen"))
             seen_tag = f" [seen {seen} UTC]" if seen else ""
+            # Verified-vs-model-only calibration tag. `_llm_vetted` is set by
+            # article_store.get_top_for_briefing: True = a real Opus/Sonnet
+            # ai_score, False = the displayed score came from ml_score only
+            # (an UNVERIFIED local-model estimate; the relevance head
+            # demonstrably over-scores forum/wiki/social rows). Only an
+            # explicit False tags — the prepended PORTFOLIO/OPTIONS snapshot
+            # rows carry no `_llm_vetted` key (.get → None, `is False` →
+            # False) so they are never tagged, and an LLM-vetted row (True)
+            # is not tagged either. Survives _collapse_syndicated's shallow
+            # copy; reflects the cluster representative (the highest-scored
+            # copy — i.e. the score actually shown — by design, NOT OR-ed
+            # across siblings, so the tag always matches the rendered number).
+            model_tag = " [model]" if a.get("_llm_vetted") is False else ""
             parts.append(
-                f"{i:>2}. [score={score}]{seen_tag}{tag} [{a.get('source','?')}] {a.get('title','')}\n"
+                f"{i:>2}. [score={score}]{model_tag}{seen_tag}{tag} [{a.get('source','?')}] {a.get('title','')}\n"
                 f"    {(a.get('summary') or '')[:300]}"
             )
 
