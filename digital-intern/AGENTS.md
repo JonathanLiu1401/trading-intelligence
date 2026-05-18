@@ -2074,3 +2074,91 @@ pathspec-scoped to exactly their intended `.py` + test files
 `AGENTS.md`); `git diff --staged` verified each; never `git add -A`. A
 concurrent sibling hybrid agent edited this repo throughout (worktree churn
 expected; this entry was appended, not rewritten).
+
+- **2026-05-18 (hybrid pass 15 — Agent 3, debug + feature + analyst-validation)** —
+  Required-file-set pass. **Phase 1: bugs_fixed=0, no commit.** The codebase
+  is exceptionally mature (14 prior hybrid passes). Every probe came back
+  clean or intentionally pinned: backtest isolation verified **live** (0
+  `urgency>=1` synthetic rows in the 1.96M-row prod DB); the quote-widget
+  regexes empirically have zero false positives on real `$`/`%`/comma
+  headlines incl. "Apple's $1.50EPS beat" (the space after `'s` defeats the
+  glue pattern) and catch all widget pseudo-titles; `STALE_SCORE_CAP` is
+  pinned by `test_get_unscored_age_fields.py`; `ml/inference.py` grey-zone
+  keys on the urgency head by design (pinned); `score_source`/`ml_score`
+  separation and the `'ml'→'briefing_boost'` promotion are correct by design.
+  No fabricated change — same call as pass 1.
+  **Phase 2: features_added=1, commit `35479f5`** (auto-commit daemon swept
+  the 2 pathspec-staged files into its own auto-titled commit; `git show
+  --stat` confirms exactly `analysis/claude_analyst.py` +197/test, 322
+  insertions, 0 deletions — no sibling leakage; pushed to origin/master).
+  **Apply the ML `time_sensitivity` head to the briefing ranker** — it was
+  trained, persisted per-row, and returned by `get_top_for_briefing` whose
+  docstring specifies the exact decay curve, but **no consumer ever applied
+  it** (the docstring explicitly defers the policy to a consumer; none
+  existed). `analysis/claude_analyst.py` now stable-reranks the collapsed
+  digest by `effective = base * 0.5 ** (age_h * ts / 12)` after
+  `_collapse_syndicated`, before the 60-row cap. Stability is load-bearing:
+  the prepended PORTFOLIO/OPTIONS snapshots carry no `first_seen` → age 0 →
+  no decay → effective == max, and a stable desc sort keeps them pinned
+  ahead of any real article that ties at 10. Pure read-side: no DB write, no
+  ai_score/ml_score/score_source/urgency touch, backtest rows already
+  excluded upstream by `_LIVE_ONLY_CLAUSE` — all four invariants intact by
+  construction. Unscored `time_sensitivity` → `BRIEFING_DEFAULT_TS=0.5`
+  (matches `ml.inference.ArticleScore` default); NaN/bool/future-date all
+  guarded. +23 tests (`tests/test_briefing_recency_decay.py`), incl. exact
+  half-life arithmetic, the snapshot-pinning stability property, purity
+  (no input mutation, same objects returned), and a `_build_payload`
+  integration assertion. Suite: **566 passed**, the same 5
+  `test_rss_collector.py` failures are the pre-existing sibling
+  `M collectors/rss_collector.py` 4-tuple WIP (`_FakeResp` lacks
+  `status_code`; not ours, never staged) — zero regressions.
+  **Phase 3 findings (analyst lens), user_findings=6:**
+  (1) **Briefing quality EXCELLENT (positive)** — id=26 (07:13Z) is a
+  dense, accurate, decisively-actionable Bloomberg digest (bond-rout LEAD,
+  10Y +13bp→4.59%, Nasdaq −1.54% two days before NVDA earnings; RISK tied
+  to NVDA 05-20 print + MU DRAM C59 05-22 expiry). Consumer experience is
+  strong when the pipeline is healthy. (2) **Collection healthy but
+  GDELT-GKG-junk-dominated** — 1,871 live/h, 1.44M/24h, but the top sources
+  are SEO/entertainment firehose (`gdelt_gkg/iheart.com` 63k/24h,
+  `joker.com` registrar 13k); `_LOW_AUTHORITY_DOMAINS` already down-rates
+  the worst, but the firehose still drives the 1.45GB DB size and the lock
+  contention in (4). (3) **CRITICAL coverage-gap contradiction** — briefing
+  id=26 reports "SEC 8-K filings — DARK 0.0h (932 empty polls, 0 delivered
+  all session)" while the live DB shows **26,268 `SEC-EDGAR/8-K` rows in
+  24h** (the #2 source). The analyst's single most market-critical channel
+  is reported blind when it is in fact the highest-volume filing feed —
+  the exact inverse of the COVERAGE GAP feature's purpose. The `fails ×
+  cadence` dark-duration fix is in HEAD; the running daemon predates it
+  (stale-daemon caveat) and/or `source_health` keys `sec_edgar` distinctly
+  from the delivering worker. Operational / `collectors/source_health.py`
+  (outside the clean-file scope); reported, not chased. (4) **`insert_batch:
+  lock retry exhausted` recurring ~13×** (00:10, 08:01–08:50) → whole
+  collected batches silently dropped = missed news. A plain
+  `COUNT(*)`+`first_seen`+LIKE scan on the 1.45GB USB DB measured **23.6s**.
+  Sibling-agent in-flight territory (reader-`_retry_on_lock`); deliberately
+  untouched. (5) **Lone low-cred push noise** — `reddit/r/ValueInvesting`
+  9.8, `reddit/r/Daytrading` 8.0, `Wikipedia` 8.6, `yfinance/Insider
+  Monkey` 8.0, `GN "$NVIDIA (NVDA.US)$ - Moomoo"` 9.8 alerted as urgency=2.
+  The `_filter_low_authority_lone` (cred<0.45) and quote-widget gates exist
+  and are test-pinned in HEAD; reddit (0.40) is gated but Wikipedia (0.60)
+  / yfinance (0.65) / GN (0.62) sit above the bar, and these rows predate
+  the deployed gates (stale daemon). Tuning question, not a clear bug;
+  noted, not chased. (6) **Recurring logging-handler flush traceback**
+  (`self.stream.flush()`) — non-fatal log noise, the documented
+  signal/BufferedWriter class. None of the findings were a quick safe fix
+  inside the clean-file scope (the noise gates already exist & are pinned;
+  lock-exhaustion + source_health are sibling/out-of-scope), so no Phase-3
+  fold-in — bugs_fixed stays 0.
+  Final verify: `storage`/`ml.features`/`ml.model`/`analysis.claude_analyst`
+  imports OK; decay helpers present. *Pre-existing, deliberately never
+  staged* (consistent with every prior entry): `collectors/rss_collector.py`,
+  `daemon.py`, `dashboard/server.py`, `scripts/export_training_data.py`,
+  `tests/test_article_store.py`, untracked `collectors/fred_collector.py` /
+  `scripts/stale_source_alerter.py` / `storage/story_corroboration.py` /
+  `tests/test_alert_history.py` / `tests/test_export_training_data.py` /
+  `tests/test_story_corroboration.py`, all `paper-trader/*`, `logs/*.tmp`
+  deletions. `analysis/claude_analyst.py` was clean on HEAD; the commit was
+  purely additive (no deletions), pathspec-scoped to the 2 intended files,
+  `git diff --staged` verified, never `git add -A`. A concurrent sibling
+  hybrid agent edited this repo throughout; this entry was appended, not
+  rewritten.
