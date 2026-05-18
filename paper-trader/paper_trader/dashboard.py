@@ -1863,8 +1863,15 @@ function drawEquityChart(eq, trades) {
     const ts = tr.timestamp.replace("T"," ").slice(0,16);
     let idx = labels.indexOf(ts);
     if (idx < 0) {
-      // Find closest label
-      idx = labels.reduce((best, lbl, i) => Math.abs(lbl.localeCompare(ts)) < Math.abs(labels[best].localeCompare(ts)) ? i : best, 0);
+      // Find chronologically nearest label (labels are sorted ascending ISO strings)
+      const tMs = +new Date(ts.replace(' ', 'T') + ':00Z');
+      let best = 0, bestDist = Infinity;
+      for (let i = 0; i < labels.length; i++) {
+        const d = Math.abs(+new Date(labels[i].replace(' ', 'T') + ':00Z') - tMs);
+        if (d < bestDist) { bestDist = d; best = i; }
+        else if (d > bestDist) break;  // sorted: getting farther, stop early
+      }
+      idx = best;
     }
     const isBuy = tr.action && tr.action.startsWith("BUY");
     if (isBuy) { buyX.push(idx); buyY.push(portPct[idx] ?? 0); }
