@@ -1893,3 +1893,74 @@ and `M daemon.py` in the worktree are sibling WIP and were **never staged** —
 and the push was left to the auto-commit daemon (manual push races it; see the
 project memory on auto-commit). If you append here, re-read the last ~40 lines
 immediately before editing: the file races.
+
+---
+
+- **2026-05-18 (Agent 3, hybrid debug+feature+live-validation)** — Read pass
+  over the nine task-critical files + `ml/inference.py`,
+  `collectors/source_health.py`. Four load-bearing invariants re-traced and
+  hold (backtest isolation; ml/ai separation — live `ai_score>0 AND
+  score_source='ml'` = **0**; `MAX(urgency,?)`; `get_unscored` age parity).
+  Live validation was the discovery engine.
+
+  **Phase 1 — `b20cbae` real live-confirmed bug.**
+  `claude_analyst._coverage_gap_lines` derived the briefing COVERAGE GAP
+  "DARK X.Xh" from `(now - source_health.last_seen)`, but
+  `source_health.record_result` rewrites `last_seen = now` on **every** poll
+  incl. the empty polls of a disabled channel (it is *last poll*, not *last
+  delivery* — `get_stale_sources` legitimately needs that, so the fix is
+  scoped to claude_analyst, NOT source_health). For any actively-polled
+  disabled source the value was structurally ≈0: the live briefing read
+  "SEC 8-K filings — DARK 0.0h (932 empty polls, 0 delivered all session)",
+  telling the analyst a channel blind the *entire* session was negligible.
+  Fixed by estimating from `consecutive_failures × poll cadence` (new
+  `_COVERAGE_POLL_SECS`, mirrors daemon `*_INTERVAL`, superset of
+  `_COVERAGE_LABELS`), `~`-prefixed. Live report now honestly yields
+  "SEC 8-K — DARK ~78h", "NewsAPI — ~255h", "Polygon — ~137h". The prior
+  `test_coverage_gap_briefing.py` *pinned the buggy contract* (modelled
+  `last_seen` as last-delivery, a shape source_health never produces — why
+  it shipped invisibly); corrected to the production-accurate contract +
+  added the missing discriminating regression (`last_seen≈now` & high fails
+  → long dark, not 0.0h) and a `_COVERAGE_POLL_SECS ⊇ _COVERAGE_LABELS`
+  parity test (a strengthened, not weakened, suite).
+
+  **Phase 2 — `0792a57` freshness context in the 🚨 BREAKING alert.** The
+  whole 0..24h band fired with zero recency signal (store SQL guarantees
+  < 24h only by `first_seen`; `_article_age_ok` only drops > 24h). Added
+  pure `_article_age_hours`/`_article_age_str` (RFC822+ISO,
+  published-preferred, naive→UTC — the `_article_age_ok` convention) → a
+  compact `age: 4m / 3.2h / 16h (time since publication)` line per urgent
+  row + a RECENCY rule in `ALERT_PROMPT` (FORMAT block untouched). Unknown
+  age omits silently. Read-only on the alert path (runs after
+  synthetic/quote-widget/low-authority/dedup; changes only prompt text,
+  never which rows alert) — all four invariants intact. +21 tests
+  (`tests/test_alert_age_context.py`); adjacent alert suites unregressed.
+
+  **Phase 3 — live findings:** (1) **scorer wedged ~18.5 min** (08:01→08:20
+  batch gap > 900s liveness → flagged DEAD `state=ok`, recovered 08:20:40)
+  under USB-DB contention — the documented "alive-but-blocked, supervisor
+  can't respawn a live thread" gap; `alert_pipeline_watchdog.py` is the
+  mitigation. (2) **9 `lock retry exhausted` ERRORs**
+  (`insert_batch`/`update_ml_scores_batch`, cluster 08:21–22) → batches
+  dropped; operational, unchanged. (3) **5 high-value collectors disabled**
+  (sec_edgar ~78h, sec_edgar_ft ~46h, polygon ~137h, newsapi ~255h, nitter
+  ~63h) — now surfaced honestly by the Phase-1 fix; effective after
+  `restart digital-intern` (chronic stale-daemon caveat — running daemon
+  predates `b20cbae`). (4) **Alert path NOT noisy this window** — exactly 1
+  `BN alert sent` (03:03, 1 distinct story); reddit/Wikipedia `urgency=2`
+  rows are prior-instance residue, no live noise reproduced. (5) **Briefing
+  GOOD** — id26 accurate/dense/actionable (bond-rout LEAD, portfolio P&L,
+  semis pulse, sharp DESK NOTE); cadence 01:54→07:13 ≈ 5.3h (healthy). (6)
+  **Collection healthy** — ~1300 live articles/h, backtest isolation holds.
+
+  Suite (excluding the sibling-broken untracked `tests/test_alert_history.py`
+  collection-error + the 5 pre-existing sibling `test_rss_collector.py`
+  failures from the dirty `M collectors/rss_collector.py`): **521 passed**,
+  imports OK. *Pre-existing, deliberately never staged:*
+  `collectors/rss_collector.py`, `daemon.py`, `dashboard/server.py`,
+  `scripts/export_training_data.py`, `tests/test_article_store.py`, untracked
+  `collectors/fred_collector.py` / `scripts/stale_source_alerter.py` /
+  `tests/test_alert_history.py` / `tests/test_export_training_data.py`, all
+  `paper-trader/*`, `logs/*.tmp`. Both commits pathspec-scoped to exactly
+  their intended .py + test files; never `git add -A`. A concurrent sibling
+  hybrid agent edited this repo throughout (worktree churn expected).
