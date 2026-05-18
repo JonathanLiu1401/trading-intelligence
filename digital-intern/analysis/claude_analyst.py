@@ -231,6 +231,7 @@ RULES:
 - A newswire row tagged "[syndicated xN]" was independently carried by N sources — treat higher N as stronger corroboration/magnitude when choosing the LEAD and ordering TOP SIGNALS; a lone (untagged) item is single-sourced and less confirmed.
 - A newswire row tagged "[model]" carries a score set by the local relevance model ONLY, with NO LLM verification; that model demonstrably over-scores forum/wiki/social rows. Treat an untagged (LLM-vetted) row as materially more trustworthy than a "[model]" row of equal or near-equal score: prefer untagged rows for the LEAD and rank them above "[model]" rows of similar score in TOP SIGNALS. NEVER make a lone "[model]" row the LEAD when an untagged row of comparable score exists.
 - A newswire row tagged "[ALERTED]" ALREADY fired a standalone 🚨 BREAKING push to the analyst within the last few hours — it is a developing/continued story the analyst has ALREADY been told about, NOT new news. Do NOT make an "[ALERTED]" row the LEAD when any untagged story of comparable importance exists; rank a fresh untagged story above an "[ALERTED]" one of similar score in TOP SIGNALS; and frame any "[ALERTED]" item explicitly as continuation (e.g. "follows the earlier alert", "developing") — never as if it just broke. This is what separates new desk intel from a rehash of an alert already delivered.
+- A newswire row tagged "[BOOK: TICKER,...]" names live portfolio/watchlist positions the analyst actually holds money in (LITE, LNOK, MUU, DRAM, MU, NVDA, MSFT, AXTI, ORCL, TSEM, QBTS). A "[BOOK:...]" row is directly actionable for the analyst's open risk: weight it ABOVE a same-score untagged general-market row when choosing the LEAD and ordering TOP SIGNALS, always reflect its named ticker(s) in the PORTFOLIO table with a concrete implication, and never bury a "[BOOK:...]" item below generic macro colour of similar magnitude. Absence of the tag means the row does not touch the held book.
 - If a "COVERAGE GAP" block is present in the data input, reproduce it as a **COVERAGE GAP** section (one bullet per dark channel, verbatim). These are intel channels the system could NOT collect from this window — the analyst must know what they are blind to, not assume silence means calm. Omit the section entirely if no gap block is provided.
 
 OUTPUT FORMAT — use EXACTLY this, filled with real data:
@@ -538,6 +539,61 @@ def _filter_quote_widget_noise(articles: list) -> tuple[list, list]:
     return kept, suppressed
 
 
+# ── Held-book relevance tag (the analyst's open positions) ───────────────────
+# The 5h Opus digest tells the analyst what is *important*, but never which
+# rows touch money they actually have at risk RIGHT NOW. The Discord-only
+# ``daemon._format_portfolio_coverage`` line is appended AFTER the briefing —
+# Opus never sees it while composing the LEAD / TOP SIGNALS / PORTFOLIO table,
+# so a held-position story scoring 8.0 is ranked identically to an 8.0 generic
+# macro item. For an analyst whose persona is "I depend on this to react to
+# events affecting MY positions", that is a real prioritisation miss. This
+# surfaces the held tickers in the newswire text Opus reads, exactly like the
+# established ``[syndicated xN]`` / ``[model]`` / ``[ALERTED]`` tags: a pure
+# read-side annotation — no DB write, no ai_score/ml_score/score_source/urgency
+# touch, no row mutation, backtest already excluded upstream by
+# get_top_for_briefing's _LIVE_ONLY_CLAUSE — all four load-bearing invariants
+# intact by construction.
+#
+# _BOOK_TICKERS is mirrored verbatim from daemon.PORTFOLIO_TICKERS (positions +
+# sector watchlist). Kept a local literal rather than importing daemon — the
+# analysis layer must not pull the daemon/collectors import graph (same
+# documented anti-import-cycle discipline as _collapse_syndicated reusing
+# alert_dedup._signature and article_store._briefing_domain_key duplicating
+# ml.features). Parity with the daemon source is pinned by
+# tests/test_briefing_book_tag.py so the two can never silently drift.
+_BOOK_TICKERS: tuple[str, ...] = (
+    "LITE", "LNOK", "MUU", "DRAM", "SNDU",
+    "MU", "MSFT", "AXTI", "ORCL", "TSEM", "QBTS", "NVDA",
+)
+# Longest-first alternation so the regex prefers \bMUU\b over \bMU\b and the
+# word boundaries keep "MU" from matching inside "Micron"/"MUSEUM" — the exact
+# case-sensitive convention daemon._format_portfolio_coverage and
+# ml.features._LIVE_RE already use (financial copy writes tickers uppercase).
+_BOOK_RE = re.compile(
+    r"\b(?:"
+    + "|".join(re.escape(t) for t in sorted(set(_BOOK_TICKERS),
+                                             key=len, reverse=True))
+    + r")\b"
+)
+
+
+def _book_tickers(article: dict) -> list[str]:
+    """Held/watchlist tickers mentioned in a digest row's title+summary.
+
+    Returns them in canonical ``_BOOK_TICKERS`` order (stable cycle-to-cycle),
+    de-duplicated. Empty list when the row touches no held name. Pure and
+    side-effect-free — reads only ``title``/``summary`` via .get(), never
+    mutates the article (heartbeat_worker feeds the same dicts onward to the
+    briefing-label / training path, so read-only is load-bearing)."""
+    blob = f"{article.get('title') or ''} {article.get('summary') or ''}"
+    if not blob.strip():
+        return []
+    hits = set(_BOOK_RE.findall(blob))
+    if not hits:
+        return []
+    return [t for t in _BOOK_TICKERS if t in hits]
+
+
 def _build_payload(articles, stock_data, earnings, source_health_report=None):
     parts = [f"BRIEFING TIME: {_now_utc_str()}\n"]
 
@@ -633,8 +689,21 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None):
             if alerted_sigs and (a.get("link") or a.get("url")):
                 if _signature(a.get("title")) in alerted_sigs:
                     pushed = " [ALERTED]"
+            # Held-book relevance tag. Guarded on a real url for the SAME
+            # reason [ALERTED] is: the prepended PORTFOLIO/OPTIONS snapshot
+            # rows carry no link/url (and their P&L body legitimately lists
+            # held tickers — e.g. "MU -6.6%"), so without this guard every
+            # snapshot row would falsely render "[BOOK: MU,...]". Same
+            # snapshot-exclusion discipline as _extract_briefing_labels.
+            # Survives _collapse_syndicated's shallow copy and reflects the
+            # cluster representative (the row actually rendered) by design.
+            book_tag = ""
+            if a.get("link") or a.get("url"):
+                _bk = _book_tickers(a)
+                if _bk:
+                    book_tag = f" [BOOK: {','.join(_bk)}]"
             parts.append(
-                f"{i:>2}. [score={score}]{model_tag}{seen_tag}{tag}{pushed} [{a.get('source','?')}] {a.get('title','')}\n"
+                f"{i:>2}. [score={score}]{model_tag}{seen_tag}{tag}{pushed}{book_tag} [{a.get('source','?')}] {a.get('title','')}\n"
                 f"    {(a.get('summary') or '')[:300]}"
             )
 
