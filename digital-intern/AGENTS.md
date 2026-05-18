@@ -1324,10 +1324,11 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   `if block else ""` idiom. New `tests/test_chat_actionable_enrichment.py`
   (15, pure helpers, no Flask/DB/cross-fetch — incl. the always-(0.0%)
   bug lock and the stale-mark misread lock). Suites: digital-intern
-  **515 passed** (15/15 this feature; the 5 `test_rss_collector.py`
-  failures are another agent's dirty `M collectors/rss_collector.py` —
-  proven by an isolated HEAD-file swap: committed HEAD makes all 5 pass;
-  not mine, never staged). *Operational:* the marked-positions fix needs
+  **500 passed, 5 failed** (the full `tests/` count already includes the
+  15 new; 505 with committed-HEAD `rss_collector`). The 5
+  `test_rss_collector.py` failures are another agent's dirty
+  `M collectors/rss_collector.py` — proven by an isolated HEAD-file swap:
+  committed HEAD makes all 5 pass; not mine, never staged. *Operational:* the marked-positions fix needs
   only `systemctl --user restart digital-intern` (it reads data `:8090`
   already serves); the game-plan/hold-discipline blocks additionally need
   `:8090` to expose those routes (chronic-stale pattern — they
