@@ -1476,12 +1476,40 @@ def decide() -> dict:
     fallback_used = False
     fb_prompt = None
 
+    # Mid-call host-saturation re-probe. The pre-flight guard above is a single
+    # point-in-time check taken *before* a ~180s Opus window. The continuous
+    # backtest committee (_CLAUDE_SEM=3), the hourly-review/HYBRID agents and
+    # _opus_annotate spawn `claude --model claude-opus` subprocesses out of
+    # band, so a cycle routinely passes pre-flight (<=4 concurrent) and then
+    # the box saturates *during* the call — the Opus subprocess is OOM-starved,
+    # returns empty, and we would otherwise spawn a doomed +1.5GB Sonnet
+    # fallback into the very storm that just killed the first call AND record
+    # it as "claude returned no response" (the model-timeout bucket), hiding a
+    # host problem from /api/empty-claude-rate. Observed live 2026-05-18: the
+    # dominant NO_DECISION reason was the empty-response signature, not the
+    # pre-flight skip. When the first call came back empty and the box is NOW
+    # saturated, treat it exactly like the pre-flight skip. Degrade-safe: any
+    # probe error falls through to the existing Sonnet-fallback path (the
+    # genuine model-timeout case is unchanged).
+    if raw is None and not host_sat:
+        try:
+            now_sat, now_reason = host_saturated()
+        except Exception as e:
+            print(f"[strategy] mid-call host_saturated probe failed (ignoring): {e}")
+            now_sat = False
+        if now_sat:
+            host_sat = True
+            host_sat_reason = ("host saturated mid-call: "
+                               + now_reason.split("host saturated: ", 1)[-1])
+            print(f"[strategy] skipping Sonnet fallback — {host_sat_reason}")
+
     # True timeout (raw is None, so _should_retry_parse is False): Opus blew
     # past its budget. Retrying the full prompt on Opus would just stall again,
     # so fall back to a faster model with a condensed prompt instead of
     # recording a NO_DECISION. Skipped entirely when the host-saturation guard
-    # already declined the call this cycle — spawning the Sonnet fallback would
-    # just add another 1.5GB subprocess to the storm we are trying to dodge.
+    # (pre-flight OR the mid-call re-probe just above) declined this cycle —
+    # spawning the Sonnet fallback would just add another 1.5GB subprocess to
+    # the storm we are trying to dodge.
     if raw is None and not host_sat:
         print("[strategy] Opus timeout — trying Sonnet fallback")
         fb_payload = _build_fallback_payload(snap, merged, quant_sigs)

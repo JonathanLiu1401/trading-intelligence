@@ -91,6 +91,51 @@ class TestClassifyFailure:
         c = classify_failure(big)
         assert len(c["excerpt"]) <= 280
 
+    # ── host-saturation / quota: operational (non-model) failure classes ──
+    # strategy.decide() records these as distinct "skipped claude call — …" /
+    # "claude quota/usage limit exhausted …" rows. They are NOT a prompt or
+    # model fault, but classify_failure used to dump them in OTHER, so the one
+    # endpoint whose job is the *why* taxonomy hid the dominant live failure.
+    def test_host_saturated_preflight_skip(self):
+        c = classify_failure(
+            "skipped claude call — host saturated: 7 concurrent Opus (>4)")
+        assert c["mode"] == "HOST_SATURATED_SKIP"
+        assert c["tag"] == "host_skip"
+        assert c["excerpt"] == ""
+
+    def test_host_starved_midcall(self):
+        c = classify_failure(
+            "skipped claude call — host saturated mid-call: 9 concurrent Opus (>4)")
+        assert c["mode"] == "HOST_STARVED_MIDCALL"
+        assert c["tag"] == "host_starved_midcall"
+        assert c["excerpt"] == ""
+
+    def test_midcall_outranks_generic_skip(self):
+        # The mid-call row also contains "host saturated"; the more specific
+        # bucket must win (precedence pinned, like truncation>fence above).
+        c = classify_failure(
+            "skipped claude call — host saturated mid-call: 5 concurrent Opus (>4)")
+        assert c["mode"] == "HOST_STARVED_MIDCALL"
+
+    def test_quota_exhausted(self):
+        c = classify_failure("claude quota/usage limit exhausted (no decision)")
+        assert c["mode"] == "QUOTA_EXHAUSTED"
+        assert c["tag"] == "quota"
+        assert c["excerpt"] == ""
+
+    def test_host_skip_is_not_model_timeout(self):
+        # Telemetry contract: a host-saturation skip must never read as
+        # TIMEOUT_EMPTY (that bucket means *model* fault and drives the
+        # "raise DECISION_TIMEOUT_S" hint — wrong remediation for an overloaded
+        # box). Mirrors strategy.py keeping these out of the
+        # "claude returned no response" empty-rate bucket.
+        for r in (
+            "skipped claude call — host saturated: 6 concurrent Opus (>4)",
+            "skipped claude call — host saturated mid-call: 6 concurrent Opus (>4)",
+            "claude quota/usage limit exhausted (no decision)",
+        ):
+            assert classify_failure(r)["mode"] != "TIMEOUT_EMPTY"
+
 
 class TestBuildForensicsBasics:
     def test_empty_list(self):
@@ -127,6 +172,19 @@ class TestBuildForensicsBasics:
         assert r["mode_mix"][0]["mode"] == "TIMEOUT_EMPTY"
         assert r["dominant_mode"] == "TIMEOUT_EMPTY"
         assert r["hint"]  # actionable hint is non-empty
+
+    def test_host_saturation_dominant_gets_host_hint(self):
+        # A storm of pre-flight skips must surface as the dominant mode with a
+        # host-load hint — not silently absorbed into OTHER's generic hint.
+        rows = [_dec(reasoning="skipped claude call — host saturated: "
+                               "8 concurrent Opus (>4)", mins_ago=i + 1)
+                for i in range(8)]
+        r = build_decision_forensics(rows, now=NOW)
+        modes = {m["mode"]: m for m in r["mode_mix"]}
+        assert modes["HOST_SATURATED_SKIP"]["n"] == 8
+        assert r["dominant_mode"] == "HOST_SATURATED_SKIP"
+        assert "Opus" in r["hint"]   # points at concurrent subprocesses
+        assert r["tag_mix"].get("host_skip") == 8
 
     def test_retry_exhausted_count(self):
         rows = [

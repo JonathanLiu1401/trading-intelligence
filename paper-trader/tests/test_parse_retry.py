@@ -121,6 +121,83 @@ def test_no_retry_when_first_response_is_none(stub_decide_inputs):
     assert "timeout/empty" in reason or "no response" in reason
 
 
+def test_midcall_saturation_skips_doomed_sonnet_fallback(stub_decide_inputs,
+                                                          monkeypatch):
+    """Root-cause fix for the dominant live NO_DECISION reason.
+
+    The pre-flight host-saturation guard is a single point-in-time check taken
+    *before* a ~180s Opus window. Out-of-band Opus agents (backtest committee,
+    hourly review / HYBRID, _opus_annotate) routinely let a cycle pass
+    pre-flight (<=4 concurrent) and then saturate the box *during* the call —
+    the Opus subprocess is OOM-starved → empty → and decide() used to spawn a
+    doomed +1.5GB Sonnet fallback into that very storm, then mislabel the
+    result as a model timeout ("claude returned no response …"), polluting
+    /api/empty-claude-rate with what is really a host problem.
+
+    Contract: pre-flight clear → Opus call → empty → re-probe says saturated →
+    NO Sonnet fallback (exactly one _claude_call), and the recorded reason is
+    the host-guard bucket, NOT the model-timeout bucket.
+    """
+    probes: list[str] = []
+
+    def fake_host_saturated(*a, **k):
+        # 1st call = pre-flight (clear); 2nd = mid-call re-probe (saturated).
+        probes.append("x")
+        if len(probes) == 1:
+            return (False, "host clear")
+        return (True, "host saturated: 9 concurrent Opus (>4)")
+
+    monkeypatch.setattr(strategy, "host_saturated", fake_host_saturated)
+
+    calls = []
+
+    def fake_claude(prompt, **kwargs):
+        calls.append(prompt)
+        return None  # Opus came back empty (starved mid-call)
+
+    with mock.patch.object(strategy, "_claude_call", side_effect=fake_claude):
+        result = strategy.decide()
+
+    # Exactly the Opus attempt — the Sonnet fallback must be skipped because
+    # the box saturated during the call (don't feed the storm +1.5GB).
+    assert len(calls) == 1, "Sonnet fallback must NOT spawn into a live storm"
+    assert result["fallback_used"] is False
+    assert result["host_saturated"] is True
+    assert result["status"] == "NO_DECISION"
+
+    fake_store = stub_decide_inputs
+    args, _ = fake_store.record_decision.call_args
+    reason = args[3]
+    # Host-guard bucket (/api/host-guard keys off this prefix) — and crucially
+    # NOT the model-timeout bucket (/api/empty-claude-rate keys off
+    # "claude returned no response"); misattribution is the bug.
+    assert reason.startswith("skipped claude call")
+    assert "mid-call" in reason
+    assert not reason.startswith("claude returned no response")
+
+
+def test_no_midcall_skip_when_box_stays_clear(stub_decide_inputs, monkeypatch):
+    """Guard against over-blocking: if the re-probe still says clear, the
+    Sonnet fallback path is unchanged (this is the existing behaviour and the
+    fix must not regress the genuine-model-timeout case)."""
+    monkeypatch.setattr(strategy, "host_saturated",
+                        lambda *a, **k: (False, "host clear"))
+    calls = []
+
+    def fake_claude(prompt, **kwargs):
+        calls.append(prompt)
+        return None
+
+    with mock.patch.object(strategy, "_claude_call", side_effect=fake_claude):
+        result = strategy.decide()
+
+    assert len(calls) == 2, "clear box → Opus + Sonnet fallback as before"
+    assert result["host_saturated"] is False
+    fake_store = stub_decide_inputs
+    args, _ = fake_store.record_decision.call_args
+    assert "timeout/empty" in args[3] or "no response" in args[3]
+
+
 def test_no_retry_when_first_response_parses_cleanly(stub_decide_inputs):
     """Happy path — single Claude call is enough."""
     calls = []
