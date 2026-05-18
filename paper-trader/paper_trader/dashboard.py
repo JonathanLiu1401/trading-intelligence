@@ -193,6 +193,7 @@ def _gzip_local_json(resp):
 # `_SWR_TEST_FORCE`.
 # ──────────────────────────────────────────────────────────────────────────
 import os as _os
+import sys as _sys
 import threading as _threading
 import time as _time
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
@@ -204,6 +205,13 @@ _SWR_STATE: dict = {}
 _SWR_EXEC = _ThreadPoolExecutor(max_workers=6, thread_name_prefix="dash-swr")
 _SWR_COLD_BUDGET_S = 2.0
 _SWR_TEST_FORCE = False  # dedicated SWR tests flip this; never set in prod
+# A background rebuild that *raises* (vs. merely slow) used to vanish into
+# `except Exception: return None` — the cache never populated and every poll
+# re-served an opaque {"warming": true} forever, the exception recorded
+# nowhere. We now count consecutive failures per key and log a throttled
+# stderr line (operator signal, no template change): the 1st failure (early
+# warning) and every Nth thereafter (sustained breakage), never once-per-poll.
+_SWR_FAIL_LOG_EVERY = 10
 
 # ──────────────────────────────────────────────────────────────────────────
 # Bounded network I/O — the second half of AGENTS.md invariant #7's
@@ -263,7 +271,10 @@ def _swr_entry(key: str) -> dict:
     st = _SWR_STATE.get(key)
     if st is None:
         st = {"data": None, "status": 200,
-              "ct": "application/json", "ts": 0.0, "fut": None}
+              "ct": "application/json", "ts": 0.0, "fut": None,
+              # failure observability — see _SWR_FAIL_LOG_EVERY
+              "fail_count": 0, "last_error": None,
+              "last_error_ts": 0.0, "last_ok_ts": 0.0}
         _SWR_STATE[key] = st
     return st
 
@@ -311,11 +322,27 @@ def _swr_refresh(key: str, fn, args, kwargs, qs: str):
                 with app.test_request_context(query_string=qs):
                     rv = fn(*args, **kwargs)
                     snap = _swr_serialize(rv)
-            except Exception:
+            except Exception as e:
+                # Single-flight guarantees one _run per key at a time, so
+                # mutating st here is uncontended w.r.t. other builds.
+                with _SWR_LOCK:
+                    st["fail_count"] = st.get("fail_count", 0) + 1
+                    st["last_error"] = f"{type(e).__name__}: {e}"[:200]
+                    st["last_error_ts"] = _time.time()
+                    n = st["fail_count"]
+                    msg = st["last_error"]
+                if n == 1 or n % _SWR_FAIL_LOG_EVERY == 0:
+                    print(f"[swr] background build for {key!r} failed "
+                          f"(consecutive #{n}): {msg}",
+                          file=_sys.stderr, flush=True)
                 return None
             data, status, ct, cacheable = snap
-            if cacheable:
-                with _SWR_LOCK:
+            with _SWR_LOCK:
+                if st.get("fail_count"):       # a good build clears the streak
+                    st["fail_count"] = 0
+                    st["last_error"] = None
+                st["last_ok_ts"] = _time.time()
+                if cacheable:
                     st["data"], st["status"], st["ct"] = data, status, ct
                     st["ts"] = _time.time()
             return snap
@@ -363,8 +390,19 @@ def swr_cached(name: str, ttl: float):
                 snap = (st["data"], st["status"], st["ct"]) if have else None
             if have:
                 return _swr_make(*snap, age, False)
+            with _SWR_LOCK:
+                fc = st.get("fail_count", 0)
+                le = st.get("last_error")
+                let = st.get("last_error_ts") or 0.0
+            # attempts==0 / last_error==None ⇒ slow but healthy ("be
+            # patient"); attempts>0 ⇒ the build keeps raising and will NOT
+            # self-heal — the operator-facing broken-vs-slow discriminator.
             return jsonify({"warming": True, "cached": False,
-                            "error": "computing — retry shortly"})
+                            "error": "computing — retry shortly",
+                            "attempts": fc,
+                            "last_error": le,
+                            "stale_for_s": (round(_time.time() - let, 1)
+                                            if let else None)})
         return wrapper
     return deco
 
@@ -6243,7 +6281,7 @@ def analytics_api():
                 daily_pl = round(cur_val - open_val, 2)
                 daily_pl_pct = round(daily_pl / open_val * 100, 2)
 
-        return jsonify({
+        payload = {
             "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "total_value": round(total_value, 2),
             "cash_pct": cash_pct,
@@ -6272,7 +6310,15 @@ def analytics_api():
             # (which fetches /api/analytics) inherits VaR/CVaR/skew for
             # free. eq is the same day-resampled series used above.
             "tail_risk": build_tail_risk(eq),
-        })
+        }
+        # Same single-source-of-truth honesty fold as /api/tail-risk &
+        # /api/drawdown — mark_integrity's docstring names THIS endpoint's
+        # Sharpe as the first victim of a stale book. Additive, _safe
+        # (omitted on fault so the payload is byte-identical), AGENTS.md #10.
+        mt = _mark_trust_block(store)
+        if mt is not None:
+            payload["mark_trust"] = mt
+        return jsonify(payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -7517,6 +7563,7 @@ def _load_decision_outcomes(max_rows: int = 4000) -> list[dict]:
 
 
 @app.route("/api/scorer-confidence")
+@swr_cached("scorer-confidence", 90.0)
 def scorer_confidence_api():
     """Empirical prediction intervals + reliability for the DecisionScorer.
 
@@ -9006,6 +9053,143 @@ def run(host: str = "0.0.0.0", port: int = 8090):
         _threading.Thread(target=_swr_prewarm, name="dash-swr-prewarm",
                            daemon=True).start()
     app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# /api/supervision — "if this trader exits, will anything bring it back?"
+#
+# Placed just before the EOF __main__ guard deliberately: this repo's
+# operating model is many concurrent agents committing the shared tree
+# (CLAUDE.md §1 / scripts/hourly_review.sh), so co-resident uncommitted edits
+# to dashboard.py are the norm and mid-file line numbers shift under us. This
+# is the lowest-collision insertion point; the @app.route decorator still
+# registers at import (runner imports the module, then calls run() — the
+# guard below stays False on import).
+#
+# Live evidence motivating this (2026-05-18 ~02:11 PDT): the trader was
+# running as an orphaned `python3 runner.py` (PPID 1) with the systemd unit
+# `disabled`/`inactive` AND /api/build-info reporting behind:1 stale:true —
+# i.e. running old code with NO restart safety net. /api/build-info shows the
+# stale SHA and /api/runner-heartbeat shows loop liveness + singleton-lock,
+# but NOTHING answered "is the auto-restart safety net (systemd
+# Restart=always) actually in force, or is this an unsupervised orphan that
+# stays DOWN the instant its git-watcher / deadman does os._exit(0)?". This
+# closes that operator blind spot. Advisory / read-only only: observes
+# process + unit state, never gates Opus, never restarts anything, never
+# adds a position cap (AGENTS.md #2/#12 — same contract as runner-heartbeat).
+@app.route("/api/supervision")
+def supervision_api():
+    """Deployment-recovery health: is this trader supervised?
+
+    Returns {pid, ppid, orphan, systemd:{active,enabled}, boot_sha,
+    head_sha, behind, stale, supervised, verdict, recommendation}.
+
+    verdict (advisory only — never gates or restarts anything):
+      HEALTHY            — supervised and running current code
+      STALE              — supervised but on old code (restart to deploy;
+                            safety net present so it will recover)
+      UNSUPERVISED       — no restart safety net: a clean exit (git-watcher
+                            restart / deadman / crash) leaves the trader DOWN
+      UNSUPERVISED_STALE — worst: unsupervised AND already on old code
+      UNKNOWN            — could not determine (degrade-safe; never raises)
+
+    Primary signal is PPID==1 (deterministic 'this process is orphaned and
+    nothing will revive it', independent of dbus/XDG state). systemctl
+    --user is supplementary context only; an unreadable user bus degrades
+    to 'unknown' WITHOUT flipping a confident orphan verdict."""
+    try:
+        pid = _os.getpid()
+        try:
+            ppid = _os.getppid()
+        except Exception:
+            ppid = None
+        # PPID==1 ⇒ reparented to init ⇒ not tracked by any service manager
+        # that would restart THIS process. The dashboard runs inside the
+        # runner process, so getppid() is the trader's own parent.
+        orphan = (ppid == 1)
+
+        def _systemctl(verb: str) -> str:
+            try:
+                r = subprocess.run(
+                    ["systemctl", "--user", verb, "paper-trader"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                return ((r.stdout or "").strip()
+                        or (r.stderr or "").strip() or "unknown")
+            except Exception:
+                return "unknown"
+
+        unit_active = _systemctl("is-active")    # active|inactive|failed|unknown
+        unit_enabled = _systemctl("is-enabled")  # enabled|disabled|static|unknown
+
+        head, behind = _head_sha_and_behind()
+        stale = bool(_BOOT_SHA and head and head != _BOOT_SHA)
+
+        # "supervised" = this process WILL be auto-restarted if it exits.
+        # An orphan (PPID 1) never will, whatever the unit says. Otherwise
+        # require the unit active AND enabled (Restart=always in force).
+        # Unreadable systemctl on a non-orphan ⇒ supervision indeterminate.
+        if orphan:
+            supervised: bool | None = False
+        elif unit_active == "unknown" or unit_enabled == "unknown":
+            supervised = None
+        else:
+            supervised = (unit_active == "active"
+                          and unit_enabled == "enabled")
+
+        if supervised is None:
+            verdict = "UNKNOWN"
+            recommendation = (
+                "Could not read systemd user state from inside the process "
+                "(user bus may be unreachable). Verify manually: "
+                "`systemctl --user is-active paper-trader; "
+                "systemctl --user is-enabled paper-trader`.")
+        elif supervised:
+            if stale:
+                verdict = "STALE"
+                recommendation = (
+                    f"Supervised but running old code (boot {_BOOT_SHA} vs "
+                    f"head {head}, behind {behind}). `systemctl --user "
+                    "restart paper-trader` to deploy the committed fixes.")
+            else:
+                verdict = "HEALTHY"
+                recommendation = "Supervised and current — no action."
+        else:
+            if stale:
+                verdict = "UNSUPERVISED_STALE"
+                recommendation = (
+                    f"NO restart safety net AND on old code (boot "
+                    f"{_BOOT_SHA} vs head {head}, behind {behind}). This is "
+                    "an orphan / un-managed run; the moment its git-watcher "
+                    "or deadman does os._exit(0) the trader stays DOWN. "
+                    "Re-attach supervision: `systemctl --user enable --now "
+                    "paper-trader` (it boots on current code).")
+            else:
+                verdict = "UNSUPERVISED"
+                recommendation = (
+                    "Running current code but with NO restart safety net "
+                    "(orphan / unit not active+enabled). A clean exit "
+                    "(git-watcher restart, deadman) or crash leaves the "
+                    "trader DOWN. `systemctl --user enable --now "
+                    "paper-trader`.")
+
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "pid": pid,
+            "ppid": ppid,
+            "orphan": orphan,
+            "systemd": {"active": unit_active, "enabled": unit_enabled},
+            "boot_sha": _BOOT_SHA,
+            "head_sha": head,
+            "behind": behind,
+            "stale": stale,
+            "supervised": supervised,
+            "verdict": verdict,
+            "recommendation": recommendation,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "UNKNOWN"}), 500
 
 
 if __name__ == "__main__":
