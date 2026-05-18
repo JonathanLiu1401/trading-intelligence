@@ -184,8 +184,12 @@ class TestEquityRisk:
         for bad in (None, [], [{"value": "x"}], [{"nope": 1}], "junk",
                     [{"value": None}]):
             r = _equity_risk(bad)
+            # Strengthened (2026-05-18): garbage must degrade ALL FIVE
+            # risk metrics to None — the additive sortino/calmar keys are
+            # part of the contract too.
             assert r == {"max_drawdown_pct": None, "sharpe": None,
-                         "pct_time_underwater": None}
+                         "pct_time_underwater": None, "sortino": None,
+                         "calmar": None}
 
     def test_risk_aggregates_survive_when_some_curves_missing(self):
         # Half the runs have a usable curve, half have none. Return
@@ -198,6 +202,87 @@ class TestEquityRisk:
         assert e["n"] == 40                       # all runs counted
         assert e["median_vs_spy"] == 10.0
         assert e["median_max_drawdown_pct"] == 20.0   # only the 20 curved
+
+
+# ───────────────── sortino + calmar (2026-05-18 ML/backtest pass) ──────────
+
+class TestSortinoCalmar:
+    """Exact-value locks for the downside-deviation Sortino and the
+    drawdown-normalised Calmar added to `_equity_risk`. Sharpe alone
+    punishes the upside variance leveraged ETFs are bought for; these two
+    are the metrics that separate a smooth leveraged compounder from a
+    lucky volatile rip (AGENTS.md 'leveraged-beta dispersion')."""
+
+    def test_sortino_zero_when_mean_return_is_zero(self):
+        # rets = [+0.10, -0.10] → mean exactly 0.0 → Sortino numerator 0
+        # → Sortino == 0.0 (downside dev is non-zero so it's defined, not
+        # None). Sharpe is also 0-ish here but std≈0.14 keeps it defined.
+        r = _equity_risk([{"value": v} for v in (100, 110, 99)])
+        assert r["sortino"] == 0.0
+
+    def test_sortino_negative_on_choppy_down(self):
+        # Net-down choppy path → negative mean, real downside → Sortino<0,
+        # and (unlike the zero-downside monotone case) it is DEFINED.
+        r = _equity_risk([{"value": v} for v in (1000, 900, 850, 800)])
+        assert r["sortino"] is not None and r["sortino"] < 0
+        assert r["sharpe"] is not None and r["sharpe"] < 0
+
+    def test_sortino_calmar_none_when_no_downside_no_drawdown(self):
+        # Monotone-up constant-return curve: no negative return ⇒ downside
+        # deviation 0 ⇒ Sortino undefined (None, parallel to the zero-std
+        # Sharpe None); no peak→trough ⇒ max_dd 0 ⇒ Calmar undefined.
+        r = _equity_risk([{"value": v} for v in (100, 110, 121, 133.1)])
+        assert r["sharpe"] is None
+        assert r["sortino"] is None
+        assert r["calmar"] is None
+
+    def test_calmar_exact_unit_on_constructed_curve(self):
+        # Drop 1000→800 (max drawdown from peak 1000 = exactly 20%), then
+        # a monotone rise over exactly 251 further steps to 1200.0 — so
+        # n_steps = 252 ⇒ years = 252/252 = 1.0 ⇒ annualised return is just
+        # the total return 1200/1000 − 1 = 0.20. Calmar = 0.20 / 0.20 = 1.0
+        # EXACTLY. The monotone tail introduces no deeper drawdown and the
+        # pre-recovery values (800→1000) stay shallower than the 20% dip,
+        # so max_dd is pinned at 0.20.
+        tail = [800.0 + (1200.0 - 800.0) * i / 251 for i in range(1, 252)]
+        curve = [{"value": v} for v in ([1000.0, 800.0] + tail)]
+        r = _equity_risk(curve)
+        assert r["max_drawdown_pct"] == 20.0
+        assert r["calmar"] == 1.0
+
+    def test_calmar_sign_tracks_net_pnl(self):
+        # Net loss with a real drawdown ⇒ negative Calmar; net gain with a
+        # real drawdown ⇒ positive Calmar. Sign, not magnitude (the 252-day
+        # annualisation makes a short-curve magnitude literal meaningless —
+        # the same reason Sharpe is never literal-pinned here).
+        loss = _equity_risk([{"value": v} for v in (1000, 1100, 900)])
+        gain = _equity_risk([{"value": v} for v in (1000, 900, 1300)])
+        assert loss["calmar"] is not None and loss["calmar"] < 0
+        assert gain["calmar"] is not None and gain["calmar"] > 0
+
+    def test_calmar_none_when_start_value_nonpositive(self):
+        # A zero/negative first equity point makes the growth ratio
+        # undefined — Calmar must degrade to None, not raise or inf.
+        r = _equity_risk([{"value": v} for v in (0.0, 100.0, 50.0)])
+        assert r["calmar"] is None
+
+    def test_persona_aggregate_exposes_median_sortino_and_calmar(self):
+        # Every run in this persona shares the constructed 20%-dd→recover
+        # curve (Calmar 1.0); the per-persona aggregate must surface a
+        # finite median_sortino and median_calmar == 1.0.
+        tail = [800.0 + (1200.0 - 800.0) * i / 251 for i in range(1, 252)]
+        curve = [{"value": v} for v in ([1000.0, 800.0] + tail)]
+        rep = persona_leaderboard(_runs_for(4, [5.0] * 30,
+                                            equity_curve=curve))
+        e = rep["leaderboard"][0]
+        assert e["median_calmar"] == 1.0
+        assert e["median_sortino"] is not None
+        # No-curve runs must not poison the medians (parallel to the
+        # existing missing-curve aggregate test).
+        nocurve = _runs_for(4, [5.0] * 10, equity_curve=None)
+        rep2 = persona_leaderboard(_runs_for(4, [5.0] * 30,
+                                             equity_curve=curve) + nocurve)
+        assert rep2["leaderboard"][0]["median_calmar"] == 1.0
 
 
 # ───────────────────────── overall guards & ordering ──────────────────────
