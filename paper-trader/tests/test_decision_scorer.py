@@ -599,3 +599,86 @@ class TestSectorMapping:
             if s == "other":
                 continue
             assert s in mapped_sectors, f"sector {s!r} has zero ticker mappings"
+
+
+# ──────────────────── anti-overfit MLP config (2026-05-18) ────────────────────
+
+class TestAntiOverfitConfig:
+    """Locks the regularized DecisionScorer architecture and proves the
+    regularization actually suppresses noise memorization.
+
+    Motivation: the prior unregularized (64,32,16)/600-iter net memorised the
+    noisy training fold — measured on the live 5000-outcome temporal holdout it
+    posted val_rmse≈10.7 but oos_rmse≈16.7 (the textbook overfit the per-cycle
+    scorer-skill ledger records every cycle). The current config is
+    (32,16) + L2 alpha=1e-2 + early_stopping; this class would fail RED on an
+    accidental revert to the memorizing config.
+    """
+
+    def test_pickled_model_uses_regularized_config(self, tmp_path, monkeypatch):
+        """Config-lock: the pipeline must pickle the regularized architecture
+        (catches a silent revert to the overfit (64,32,16)/600-iter net)."""
+        import paper_trader.ml.decision_scorer as ds
+        monkeypatch.setattr(ds, "SCORER_PATH", tmp_path / "cfg.pkl")
+        recs = [_synthetic_outcome(sim_date=f"2025-04-{i+1:02d}",
+                                   mom5=(i - 17), fwd=(i - 17) * 1.1)
+                for i in range(35)]
+        assert train_scorer(recs)["status"] == "ok"
+        m = DecisionScorer()._model
+        assert m.hidden_layer_sizes == (32, 16)
+        assert m.alpha == pytest.approx(1e-2)
+        assert m.early_stopping is True
+        assert m.validation_fraction == pytest.approx(0.15)
+        assert m.n_iter_no_change == 25
+
+    def test_regularization_suppresses_pure_noise_memorization(
+            self, tmp_path, monkeypatch):
+        """On a target that is PURE noise uncorrelated with every feature, a
+        well-regularized model must regress toward the mean (low prediction
+        spread) instead of memorizing the noise.
+
+        Measured discriminating evidence (seed 12345, 300 records):
+          • OLD (64,32,16)/600-iter, no reg:  pred_std/target_std ≈ 1.00
+            (memorizes the noise almost perfectly — the overfit signature)
+          • NEW (32,16)+alpha1e-2+early_stop:  ratio ≈ 0.40
+        The 0.65 bound sits with wide margin on both sides, so this is
+        non-flaky AND a genuine regression detector — it fails RED if the
+        config reverts to an unregularized memorizing net.
+        """
+        import paper_trader.ml.decision_scorer as ds
+        monkeypatch.setattr(ds, "SCORER_PATH", tmp_path / "noise.pkl")
+
+        rng = np.random.RandomState(12345)
+        tickers = ["NVDA", "XOM", "JPM", "LLY", "GLD", "COIN", "SPY"]
+        recs = []
+        for i in range(300):
+            recs.append({
+                "ticker": tickers[i % len(tickers)], "action": "BUY",
+                "ml_score": float(rng.uniform(-5, 5)),
+                "rsi": float(rng.uniform(20, 80)),
+                "macd": float(rng.uniform(-1, 1)),
+                "mom5": float(rng.uniform(-10, 10)),
+                "mom20": float(rng.uniform(-15, 15)),
+                "regime_mult": 1.0,
+                "vol_ratio": float(rng.uniform(0.5, 2.0)),
+                "bb_position": float(rng.uniform(-2, 2)),
+                "news_urgency": 50.0, "news_article_count": 1.0,
+                # Pure noise — uncorrelated with every feature above.
+                "forward_return_5d": float(rng.normal(0, 10)),
+                "return_pct": 10.0,
+                "sim_date": f"2025-{(i % 12) + 1:02d}-{(i % 27) + 1:02d}",
+            })
+        assert train_scorer(recs)["status"] == "ok"
+        s = DecisionScorer()
+        targ = np.array([r["forward_return_5d"] for r in recs])
+        preds = np.array([
+            s.predict(ml_score=r["ml_score"], rsi=r["rsi"], macd=r["macd"],
+                      mom5=r["mom5"], mom20=r["mom20"], regime_mult=1.0,
+                      ticker=r["ticker"], vol_ratio=r["vol_ratio"],
+                      bb_pos=r["bb_position"], news_urgency=50.0,
+                      news_article_count=1.0)
+            for r in recs])
+        ratio = float(preds.std() / targ.std())
+        assert ratio < 0.65, (
+            f"model memorized noise (pred/target std ratio={ratio:.3f} "
+            f"≥ 0.65) — regularization not effective")
