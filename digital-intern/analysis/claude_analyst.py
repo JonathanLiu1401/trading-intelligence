@@ -11,8 +11,29 @@ from core.claude_cli import claude_call
 # it, and alert_agent reuses ml.features._source_credibility). alert_dedup is
 # pure stdlib+re (no DB / ml / aiohttp import graph), so this adds no cycle.
 from watchers.alert_dedup import _signature
+# Cross-cycle alert-recency store (pure stdlib+sqlite+re — NO ml/numpy/aiohttp
+# graph, same import-safety profile as alert_dedup above). Used read-only to
+# tag digest rows that already fired a standalone 🚨 BREAKING alert this
+# window, so the briefing LEAD/TOP-SIGNALS don't re-surface a story the
+# analyst was already pushed (their top "duplicate alerts" complaint).
+from watchers import alert_recency
 
 MODEL = "claude-opus-4-7"
+
+
+def _recent_alert_signatures() -> set:
+    """Best-effort set of canonical headline signatures that fired a
+    standalone 🚨 BREAKING alert within ``alert_recency.ALERT_RECENCY_TTL_HOURS``.
+
+    Returns ``set()`` on ANY failure (missing/locked alert_recency.db, import
+    error) — an alert↔briefing parity read must NEVER break or delay the 5h
+    briefing it annotates (identical discipline to ``_collect_source_health``;
+    ``alert_recency.recent_signatures`` is itself already best-effort and
+    never raises, this wrapper is belt-and-braces + the documented shape)."""
+    try:
+        return alert_recency.recent_signatures()
+    except Exception:
+        return set()
 
 
 def _collapse_syndicated(articles: list) -> list:
@@ -209,6 +230,7 @@ RULES:
 - No nested backticks. No backtick dividers. Dividers are plain ━━━ lines outside code blocks.
 - A newswire row tagged "[syndicated xN]" was independently carried by N sources — treat higher N as stronger corroboration/magnitude when choosing the LEAD and ordering TOP SIGNALS; a lone (untagged) item is single-sourced and less confirmed.
 - A newswire row tagged "[model]" carries a score set by the local relevance model ONLY, with NO LLM verification; that model demonstrably over-scores forum/wiki/social rows. Treat an untagged (LLM-vetted) row as materially more trustworthy than a "[model]" row of equal or near-equal score: prefer untagged rows for the LEAD and rank them above "[model]" rows of similar score in TOP SIGNALS. NEVER make a lone "[model]" row the LEAD when an untagged row of comparable score exists.
+- A newswire row tagged "[ALERTED]" ALREADY fired a standalone 🚨 BREAKING push to the analyst within the last few hours — it is a developing/continued story the analyst has ALREADY been told about, NOT new news. Do NOT make an "[ALERTED]" row the LEAD when any untagged story of comparable importance exists; rank a fresh untagged story above an "[ALERTED]" one of similar score in TOP SIGNALS; and frame any "[ALERTED]" item explicitly as continuation (e.g. "follows the earlier alert", "developing") — never as if it just broke. This is what separates new desk intel from a rehash of an alert already delivered.
 - If a "COVERAGE GAP" block is present in the data input, reproduce it as a **COVERAGE GAP** section (one bullet per dark channel, verbatim). These are intel channels the system could NOT collect from this window — the analyst must know what they are blind to, not assume silence means calm. Omit the section entirely if no gap block is provided.
 
 OUTPUT FORMAT — use EXACTLY this, filled with real data:
@@ -558,6 +580,17 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None):
         # older equal-base one — exactly what a "what is moving NOW" newswire
         # wants. Done before the [:60] cap so decay decides what survives it.
         deduped = _rank_by_decayed_score(deduped)
+        # Alert↔briefing parity. Canonical signatures that fired a standalone
+        # 🚨 BREAKING push within alert_recency.ALERT_RECENCY_TTL_HOURS (6h ≈
+        # the 5h briefing window). Fetched ONCE per briefing (single read of a
+        # separate alert_recency.db — never articles.db), best-effort → set()
+        # on failure so the digest is unaffected. A digest row whose headline
+        # signature is in this set is a story the analyst was ALREADY pushed —
+        # the LEAD must not re-surface it as fresh (their top duplicate-alert
+        # complaint). Pure read-side: no DB write, no ai_score/ml_score/
+        # score_source/urgency touch, backtest excluded upstream by
+        # get_top_for_briefing's _LIVE_ONLY_CLAUSE — four invariants intact.
+        alerted_sigs = _recent_alert_signatures()
         for i, a in enumerate(deduped[:60], 1):
             score = a.get("ai_score") or a.get("_relevance_score", "?")
             corro = a.get("_corroboration", 1)
@@ -584,8 +617,24 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None):
             # copy — i.e. the score actually shown — by design, NOT OR-ed
             # across siblings, so the tag always matches the rendered number).
             model_tag = " [model]" if a.get("_llm_vetted") is False else ""
+            # Already-pushed parity tag. The row's canonical headline signature
+            # (alert_dedup._signature — the SAME primitive the cross-cycle
+            # alert-suppression uses, so this tag and that gate agree by
+            # construction) is in the recent fired-alert set ⇒ the analyst was
+            # already pushed this exact story as 🚨 BREAKING. Guarded on a real
+            # url so the prepended PORTFOLIO/OPTIONS snapshot rows (no link/url
+            # — same guard as _extract_briefing_labels) are NEVER tagged; an
+            # empty/untitled signature is never in the set (recent_signatures
+            # filters falsy sigs, mirroring partition_already_alerted's
+            # "untitled rows never suppressed" policy). Survives
+            # _collapse_syndicated's shallow copy; reflects the cluster
+            # representative's title — the one actually rendered.
+            pushed = ""
+            if alerted_sigs and (a.get("link") or a.get("url")):
+                if _signature(a.get("title")) in alerted_sigs:
+                    pushed = " [ALERTED]"
             parts.append(
-                f"{i:>2}. [score={score}]{model_tag}{seen_tag}{tag} [{a.get('source','?')}] {a.get('title','')}\n"
+                f"{i:>2}. [score={score}]{model_tag}{seen_tag}{tag}{pushed} [{a.get('source','?')}] {a.get('title','')}\n"
                 f"    {(a.get('summary') or '')[:300]}"
             )
 
