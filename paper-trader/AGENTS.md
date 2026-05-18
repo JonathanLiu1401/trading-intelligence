@@ -1402,6 +1402,18 @@ cd /home/zeph/paper-trader && python3 -m pytest tests/test_regime_audit.py -v
 cd /home/zeph/paper-trader && python3 -m paper_trader.ml.regime_audit          # OOS slice
 cd /home/zeph/paper-trader && python3 -m paper_trader.ml.regime_audit --all    # full in-sample
 
+# Per-action scorer-skill diagnostic (the action-conditional sibling of
+# persona_skill / regime_audit — answers "is the scorer's OOS edge on the
+# BUY half (the gate-relevant slice, invariant #5), the SELL half, or
+# both?"). The aggregate _oos_rank_metrics hides this asymmetry; an
+# ASYMMETRIC_SELL_EDGE verdict means the aggregate OVERSTATES what the
+# gate actually uses. Live read: ASYMMETRIC_BUY_EDGE (BUY rank_ic
+# +0.214 / EDGE, SELL +0.088 / WEAK_EDGE on the 20% OOS holdout) — the
+# gate IS on the skilled slice. Exit 2 only on HAS_INVERTED_ACTION (an
+# anti-predictive slice). 26 exact-value verdict & threshold locks.
+cd /home/zeph/paper-trader && python3 -m pytest tests/test_action_skill.py -v
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.action_skill          # OOS slice (read-only)
+
 # Multi-horizon outcome capture + forward-return-horizon predictability
 # audit (exact-value verdict + IC locks; the only file with "horizon" in
 # its node ids — silently missed by the older "ml/backtest/scorer" filter)
