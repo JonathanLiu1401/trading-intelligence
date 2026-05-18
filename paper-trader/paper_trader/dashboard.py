@@ -5651,15 +5651,49 @@ def backtests_api():
         # /api/backtests/curves when needed. This cuts payload from ~5MB to ~50KB.
         runs = store.all_runs(include_curves=False)
         completed = [r for r in runs if r.get("status") == "complete"]
+        # spy_baseline is computed over the *full* completed set so it stays
+        # stable regardless of which page is requested.
         spy_baseline = completed[0].get("spy_return_pct") if completed else None
+        total_count = len(runs)
 
-        return jsonify({
+        # Backward-compatible pagination: only paginate when the client
+        # explicitly asks (?page=). The default (no page param) still returns
+        # every run — the dashboard's scatter chart, era heatmap, aggregate
+        # stats and table all consume the full client-side list, so silently
+        # capping it at 50 would regress the page this change speeds up.
+        # ?page= callers get the most-recent runs first (run_id desc), which
+        # is what a "showing 50 of 501" UI implies.
+        page_arg = request.args.get("page")
+        paginated = page_arg is not None
+        page = limit = None
+        if paginated:
+            try:
+                page = max(1, int(page_arg))
+            except (TypeError, ValueError):
+                page = 1
+            try:
+                limit = int(request.args.get("limit", 50))
+            except (TypeError, ValueError):
+                limit = 50
+            limit = max(1, min(limit, 500))
+            ordered = sorted(runs, key=lambda r: r.get("run_id") or 0,
+                             reverse=True)
+            start = (page - 1) * limit
+            runs = ordered[start:start + limit]
+
+        payload = {
             "runs": runs,
-            "total_runs": len(runs),
+            "total_runs": total_count,
+            "total_count": total_count,
             "spy_baseline": spy_baseline,
             "qqq_baseline": None,
             "last_updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        })
+        }
+        if paginated:
+            payload["page"] = page
+            payload["limit"] = limit
+            payload["paginated"] = True
+        return jsonify(payload)
     except Exception as e:
         return jsonify({"runs": [], "error": str(e)})
 
