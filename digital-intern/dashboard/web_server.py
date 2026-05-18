@@ -279,6 +279,148 @@ def _partition_thesis_articles(
     return out
 
 
+def _paper_trader_position_lines(pt: Any) -> list[str]:
+    """Render the live trader's OPEN book for the chat prompt.
+
+    Reads the **marked** ``portfolio.positions`` array from :8090
+    ``/api/state`` — it carries a real ``pl_pct`` and the ``stale_mark``
+    flag — instead of the raw top-level ``positions`` array, which has
+    neither (``store.open_positions()`` is an unenriched row read). Two
+    correctness wins over the prior inline code:
+
+    * the raw array has no ``pl_pct`` key, so ``(p.get('pl_pct') or 0)``
+      printed ``(0.0%)`` for **every** stock regardless of actual P/L —
+      the marked array surfaces the true percentage;
+    * a position whose live price lookup failed (``stale_mark=True``,
+      ``current_price == avg_cost``, P/L $0.00) is indistinguishable from
+      a genuinely flat position. The chat is the user's primary surface;
+      it now annotates it, mirroring the trader prompt's ``[STALE MARK …]``
+      suffix (strategy.py) and the reporter's ``⚠ STALE`` line — both
+      shipped for this exact live MU pathology.
+
+    Falls back to the raw top-level array when the marked one is empty (a
+    degraded ``get_portfolio()`` returns ``positions=[]`` while
+    ``open_positions()`` still has rows) so a transient store blip never
+    *loses* the book — it just shows it without a fabricated %.
+
+    Pure / total — the ``_tail_risk_chat_lines`` contract: any bad shape
+    degrades to the honest ``"Open positions: (none)"`` placeholder, never
+    an exception into the chat handler.
+    """
+    if not isinstance(pt, dict):
+        return ["Open positions: (none)"]
+    pf = pt.get("portfolio")
+    marked = pf.get("positions") if isinstance(pf, dict) else None
+    rows = marked if isinstance(marked, list) and marked else None
+    if rows is None:
+        raw = pt.get("positions")
+        rows = raw if isinstance(raw, list) and raw else None
+    if not rows:
+        return ["Open positions: (none)"]
+
+    lines = ["Open positions:"]
+    for p in rows[:15]:
+        try:
+            if not isinstance(p, dict):
+                continue
+            tk = p.get("ticker", "?")
+            stale = " [STALE MARK: shown at cost, P/L unreliable]" if p.get(
+                "stale_mark") else ""
+            upl = p.get("unrealized_pl") or 0.0
+            pl_pct = p.get("pl_pct")
+            pct = f" ({pl_pct:+.1f}%)" if isinstance(
+                pl_pct, (int, float)) else ""
+            if p.get("type") in ("call", "put"):
+                lines.append(
+                    f"  {tk} {str(p.get('type', '')).upper()} "
+                    f"{p.get('strike')} {p.get('expiry')}: "
+                    f"qty={p.get('qty')} avg=${p.get('avg_cost')} "
+                    f"mark=${p.get('current_price')} "
+                    f"P/L=${upl:.2f}{pct}{stale}"
+                )
+            else:
+                lines.append(
+                    f"  {tk}: qty={p.get('qty')} "
+                    f"avg=${(p.get('avg_cost') or 0):.2f} "
+                    f"mark=${(p.get('current_price') or 0):.2f} "
+                    f"P/L=${upl:.2f}{pct}{stale}"
+                )
+        except Exception:  # noqa: BLE001 — a chat block must never raise
+            continue
+    return lines
+
+
+def _game_plan_chat_lines(gp: Any) -> list[str]:
+    """Render the trader's own prioritised next-session action plan
+    (``/api/game-plan``) as compact chat-context lines.
+
+    Composed **verbatim** (paper-trader invariant #10 — single source of
+    truth): the builder's ``headline`` and each HIGH ``portfolio_directives``
+    ``text`` pass through UNCHANGED. The chat is the surface the operator
+    actually asks "what should I do" on; before this it had to re-derive
+    the answer from the raw analytics blocks.
+
+    Pure / total — the ``_behavioural_chat_lines`` contract: a non-dict, an
+    ``error`` key, a missing ``state``, or a ``NO_DATA`` gate → ``[]`` (the
+    block is omitted, never an exception into the chat handler).
+    """
+    if (not isinstance(gp, dict) or "error" in gp
+            or "state" not in gp or gp.get("state") == "NO_DATA"):
+        return []
+    hl = gp.get("headline")
+    if not hl:
+        return []
+    lines = [f"Game plan: {hl}"]
+    for c in (gp.get("position_actions") or []):
+        if not isinstance(c, dict):
+            continue
+        act = str(c.get("action") or "").upper()
+        if act in ("", "HOLD"):
+            continue
+        try:
+            lines.append(
+                f"  {act} {c.get('ticker')} "
+                f"(conv {float(c.get('conviction') or 0):.2f}, "
+                f"${float(c.get('unrealized_pl') or 0):+.2f}, "
+                f"{float(c.get('pct_port') or 0):.1f}% port)"
+            )
+        except Exception:  # noqa: BLE001
+            continue
+    for d in (gp.get("portfolio_directives") or []):
+        if isinstance(d, dict) and d.get("severity") == "HIGH" and d.get(
+                "text"):
+            lines.append(f"  • {d['text']}")
+    opps = [o for o in (gp.get("opportunities") or [])
+            if isinstance(o, dict) and o.get("ticker")]
+    if opps:
+        lines.append(
+            "  opportunities: " + ", ".join(
+                f"{o['ticker']}({str(o.get('action') or '').upper()} "
+                f"{float(o.get('conviction') or 0):.2f})"
+                for o in opps[:5]
+            )
+        )
+    return lines
+
+
+def _hold_discipline_chat_lines(hd: Any) -> list[str]:
+    """Render the disposition-trap verdict (``/api/hold-discipline``).
+
+    Mirrors ``reporter._hold_discipline_line`` exactly: emit the builder's
+    ``headline`` **verbatim** (invariant #10) ONLY on ``DISPOSITION_DRAG``;
+    ``DISCIPLINED`` / ``INSUFFICIENT`` / ``NO_DATA`` / error / bad shape →
+    ``[]``. A "you're holding within discipline" verdict is not chat-worthy
+    noise — the operator only needs to hear it when a losing position is
+    being overstayed past the desk's own empirical losing-cut time.
+    """
+    if not isinstance(hd, dict) or "error" in hd:
+        return []
+    if hd.get("state") != "DISPOSITION_DRAG":
+        return []
+    hl = hd.get("headline")
+    return [f"Hold discipline: {hl}"] if hl else []
+
+
 def create_app(store=None) -> Flask:
     """Build the Flask app. ``store`` is the shared ArticleStore from daemon.py."""
     global _store
@@ -866,25 +1008,9 @@ def create_app(store=None) -> Flask:
             if sp:
                 lines.append(f"S&P 500: {sp:.2f}")
 
-            pt_positions = pt.get("positions") or []
-            if pt_positions:
-                lines.append("Open positions:")
-                for p in pt_positions[:15]:
-                    if p.get("type") in ("call", "put"):
-                        lines.append(
-                            f"  {p.get('ticker','?')} {str(p.get('type','')).upper()} "
-                            f"{p.get('strike')} {p.get('expiry')}: qty={p.get('qty')} "
-                            f"avg=${p.get('avg_cost')} mark=${p.get('current_price')} "
-                            f"P/L=${(p.get('unrealized_pl') or 0):.2f}"
-                        )
-                    else:
-                        lines.append(
-                            f"  {p.get('ticker','?')}: qty={p.get('qty')} "
-                            f"avg=${(p.get('avg_cost') or 0):.2f} mark=${(p.get('current_price') or 0):.2f} "
-                            f"P/L=${(p.get('unrealized_pl') or 0):.2f} ({(p.get('pl_pct') or 0):.1f}%)"
-                        )
-            else:
-                lines.append("Open positions: (none)")
+            # Marked snapshot (real pl_pct + stale_mark) via the pure
+            # helper; falls back to the raw array if the store is degraded.
+            lines += _paper_trader_position_lines(pt)
 
             pt_trades = pt.get("trades") or []
             if pt_trades:
@@ -1123,6 +1249,40 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: session-delta fetch failed: %s", e)
 
+        # The system's OWN actionable synthesis — the prioritised
+        # next-session plan (/api/game-plan: fuses the co-pilot verb,
+        # disposition trap, concentration and earnings into one ranked
+        # list) and the open-book disposition-trap verdict
+        # (/api/hold-discipline). Every other block above is descriptive
+        # state; this is the one "what should I actually do" surface, and
+        # the chat is where the operator asks exactly that. Composed
+        # verbatim by the pure _game_plan_chat_lines / _hold_discipline_
+        # chat_lines helpers (invariant #10 — no re-derived verdicts).
+        # Each is its own guarded read (one upstream fault degrades that
+        # input to silence, never sinks the block or the chat). Only
+        # appears once :8090 is restarted onto these endpoints — a
+        # stale/absent trader silently omits the block (sibling contract).
+        game_plan_block = ""
+        hold_discipline_block = ""
+        try:
+            import urllib.request as _urllib
+
+            def _afetch(path: str):
+                try:
+                    with _urllib.urlopen(
+                            f"http://127.0.0.1:8090{path}", timeout=4) as resp:
+                        return json.loads(resp.read().decode("utf-8"))
+                except Exception as e:
+                    _logger().warning("chat: %s fetch failed: %s", path, e)
+                    return None
+
+            game_plan_block = "\n".join(
+                _game_plan_chat_lines(_afetch("/api/game-plan")))
+            hold_discipline_block = "\n".join(
+                _hold_discipline_chat_lines(_afetch("/api/hold-discipline")))
+        except Exception as e:
+            _logger().warning("chat: action-plan fetch failed: %s", e)
+
         now_iso = datetime.now(timezone.utc).isoformat()
         system_prompt = (
             "You are a market intelligence analyst with access to a real-time news feed, "
@@ -1139,6 +1299,8 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — WHAT MATERIALLY CHANGED SINCE YOU LAST LOOKED (ranked, last 6h):\n{session_delta_block}\n\n" if session_delta_block else "")
             + (f"PAPER TRADER ANALYTICS:\n{analytics_block}\n\n" if analytics_block else "")
             + (f"PAPER TRADER — BEHAVIOURAL DIAGNOSIS (the bot's own self-review verdicts):\n{behavioural_block}\n\n" if behavioural_block else "")
+            + (f"PAPER TRADER — PRIORITISED ACTION PLAN (the bot's own next-session game plan):\n{game_plan_block}\n\n" if game_plan_block else "")
+            + (f"PAPER TRADER — HOLD-DISCIPLINE ALERT (a losing position overstayed past the desk's own median losing-cut):\n{hold_discipline_block}\n\n" if hold_discipline_block else "")
             + (f"PAPER TRADER OPTIONS GREEKS (Black-Scholes, live IV):\n{greeks_block}\n\n" if greeks_block else "")
             + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP:\n{heatmap_block}\n\n" if heatmap_block else "")
             + (f"EARNINGS RADAR (scheduled gap risk):\n{earnings_block}\n\n" if earnings_block else "")

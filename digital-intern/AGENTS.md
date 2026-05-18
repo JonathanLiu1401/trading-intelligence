@@ -358,6 +358,34 @@ Suites:
   that input drops, all three absent → `[]`, never an exception into
   chat — the `_tail_risk_chat_lines` sibling contract). 12 cases, no
   Flask/DB/cross-fetch needed.
+- `test_chat_actionable_enrichment.py` — three more pure `/api/chat`
+  helpers in `dashboard/web_server.py` (2026-05-18, Agent 4 feature-dev).
+  **`_paper_trader_position_lines`** fixes the live-trader position block:
+  it now reads the **marked** `portfolio.positions` array (real `pl_pct`
+  + `stale_mark`) instead of the raw top-level `positions` array
+  (`store.open_positions()`, neither key). Two discriminating locks: the
+  **always-(0.0%) bug** — the raw array has no `pl_pct`, so the prior
+  inline `(p.get('pl_pct') or 0)` printed `(0.0%)` for every stock
+  regardless of P/L (a real `-1.04%` must surface); and the **stale-mark
+  misread** — a failed price lookup (`stale_mark=True`, `current_price ==
+  avg_cost`, P/L $0.00) looks identical to a flat position, so the chat
+  (the user's primary surface) now annotates it, mirroring the trader
+  prompt's `[STALE MARK …]` suffix (strategy.py) and the reporter's
+  `⚠ STALE` — both already shipped for this exact live MU pathology;
+  falls back to the raw array when the marked one is empty (degraded
+  `get_portfolio()`) so a store blip never loses the book.
+  **`_game_plan_chat_lines`** surfaces the trader's own prioritised
+  next-session plan (`/api/game-plan`) and **`_hold_discipline_chat_lines`**
+  the disposition-trap verdict (`/api/hold-discipline`) — the chat's first
+  "what should I actually do" inputs (every prior block is descriptive
+  state). Both compose the builder `headline` / HIGH-directive `text`
+  **verbatim** (invariant #10 — an inline re-derivation that drifts from
+  the trader endpoint fails loud); `_hold_discipline_chat_lines` mirrors
+  `reporter._hold_discipline_line` exactly (emit only on
+  `DISPOSITION_DRAG`; `DISCIPLINED`/`INSUFFICIENT`/`NO_DATA` → silence).
+  All three obey the `_tail_risk_chat_lines` total/pure degrade contract
+  (non-dict / `{"error":…}` / missing-`state` / `NO_DATA` → that input
+  drops, never an exception into chat). 15 cases, no Flask/DB/cross-fetch.
 - `test_heartbeat_cadence.py` — `daemon._initial_heartbeat_last`, the
   restart-resilient briefing-clock seed (see "5h heartbeat briefing posts
   30–40h apart" failure mode). Drives the real `save_briefing →
@@ -1262,6 +1290,49 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   `scripts/stale_source_alerter.py`, all `paper-trader/*`, `logs/*.tmp`. My
   four files were clean before edit; commits pathspec-scoped, never
   `git add -A`.
+
+- **2026-05-18 (Agent 4, feature-dev — analyst-chat: marked-positions fix + action-plan tier)** —
+  Advisor-reviewed. Additive, **this repo only** (no cross-repo restart
+  coupling — the fix consumes data the trader already emits), never gates
+  Opus (chat context only). `dashboard/web_server.py::api_chat` gains
+  three pure helpers (the `_tail_risk_chat_lines`/`_behavioural_chat_lines`
+  precedent — total/pure, degrade to `[]`/placeholder, never raise into
+  chat):
+  **(1) `_paper_trader_position_lines`** — the live-trader position block
+  now reads the **marked** `portfolio.positions` array (real `pl_pct` +
+  `stale_mark`) instead of the raw top-level `positions`
+  (`store.open_positions()`, neither key). Fixes a real pre-existing bug:
+  the raw array has no `pl_pct`, so the prior inline
+  `(p.get('pl_pct') or 0)` rendered **`(0.0%)` for every stock** in the
+  chat regardless of P/L; and it now annotates a stale mark
+  (`stale_mark=True` — failed price lookup, `current_price == avg_cost`,
+  P/L $0.00, indistinguishable from genuinely flat) with `[STALE MARK …]`,
+  mirroring the trader prompt suffix (strategy.py) + reporter `⚠ STALE` —
+  both already shipped for this exact live MU pathology. The user's
+  primary chat surface was the one place it still leaked as a confident
+  "MU flat, $0.00". Falls back to the raw array when the marked one is
+  empty (degraded `get_portfolio()`) so a store blip never loses the
+  book.
+  **(2) `_game_plan_chat_lines`** (`/api/game-plan`) + **(3)
+  `_hold_discipline_chat_lines`** (`/api/hold-discipline`) — the chat's
+  first *actionable* inputs (every prior block is descriptive state);
+  composed **verbatim** (invariant #10); `_hold_discipline_chat_lines`
+  mirrors `reporter._hold_discipline_line` (emit only on
+  `DISPOSITION_DRAG`). Wired as a fifth sibling cross-fetch block (own
+  guarded `urllib.urlopen(... timeout=4)` reads, degrade-to-`None`),
+  injected into `system_prompt` after `BEHAVIOURAL DIAGNOSIS` via the
+  `if block else ""` idiom. New `tests/test_chat_actionable_enrichment.py`
+  (15, pure helpers, no Flask/DB/cross-fetch — incl. the always-(0.0%)
+  bug lock and the stale-mark misread lock). Suites: digital-intern
+  **515 passed** (15/15 this feature; the 5 `test_rss_collector.py`
+  failures are another agent's dirty `M collectors/rss_collector.py` —
+  proven by an isolated HEAD-file swap: committed HEAD makes all 5 pass;
+  not mine, never staged). *Operational:* the marked-positions fix needs
+  only `systemctl --user restart digital-intern` (it reads data `:8090`
+  already serves); the game-plan/hold-discipline blocks additionally need
+  `:8090` to expose those routes (chronic-stale pattern — they
+  degrade-to-skip until then). Commit pathspec-scoped (`web_server.py` +
+  new test + this `AGENTS.md`), never `git add -A`.
 
 - **2026-05-18 (Agent 4, feature-dev — analyst-chat behavioural-diagnosis enrichment)** —
   Spec: `~/docs/superpowers/specs/2026-05-18-chat-behavioural-diagnosis-design.md`
