@@ -3054,3 +3054,145 @@ wrong unit (this has historically caused duplicate-runner double-trading; the
   future-marker-clamp + deadman-predicate locks (50 tests).
 
 *Review pass #14 appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 review pass #15 (ML+backtest hybrid · gate economic counterfactual · decisive news-feature-deadness finding)
+
+- **Phase 1 — no new bugs (bugs_fixed = 0; no Phase-1 commit).** Full
+  re-trace of `decision_scorer.py`, `backtest.py`,
+  `run_continuous_backtests.py` plus coupled `validation.py` /
+  `calibration.py` / `gate_audit.py`: the `predict_with_meta`
+  off-distribution gate-abstention path, the universal SELL
+  `-forward_return_5d` sign-flip (train↔inference↔calibration↔gate↔
+  `_oos_rank_metrics`↔`evaluate_scorer_oos`), the `(ticker,sim_date,
+  action)` dedup key (correctly includes `action` so a BUY/SELL pair on
+  one name/day with opposite labels both survive), the 5-trading-day
+  forward-window guard, the `score=`/`scorer=` first-match
+  disambiguation, the numpy-lstsq fallback weighted-LS scaler, the
+  unlocked `_VOLUME_CACHE` membership read (safe: GIL-atomic `in`/`[]`,
+  nothing ever deletes — the AGENTS.md concurrency invariant is about
+  *iteration*), the `train_scorer` 80/20 split-before-scale, every
+  module-global lock — all re-verified correct and exact-value
+  test-locked. The temporal-boundary duplicate-straddle in
+  `split_outcomes_temporal` is the **already-documented**
+  `OOS_NOT_HELD_OUT` corpus-construction limitation (corpus_audit
+  verdict), not a surgical code bug — and per CLAUDE.md §6 the split
+  mechanism is training-dynamics, out of scope. Consistent with the
+  documented 13+ prior no-new-bug ML/backtest passes — not a fabricated
+  fix. ML/backtest regression 255/255 green before the feature, 280/280
+  after.
+
+- **Feature shipped (commit `35479f5`): gate economic counterfactual.**
+  `paper_trader/ml/gate_pnl.py`. The gap it fills: `gate_audit` reports
+  each arm's mean realized return and a verdict driven **solely** by
+  `strong_tailwind_mean − strong_headwind_mean` — by construction it
+  ignores the three middle arms (`mild_headwind` ×0.85, `neutral` ×1.00,
+  `mild_tailwind` ×1.15) and how *often* each arm fires. A gate can read
+  `GATE_EFFECTIVE`/`GATE_INEFFECTIVE` on the two-extreme spread while the
+  **portfolio-level** effect is entirely different, because most of the
+  reweighting happens in the populous middle arms. This computes the
+  single economic number a quant deciding *whether to keep the gate*
+  actually needs: the **assumption-free** equal-weight contribution
+  `Σmᵢrᵢ/Σmᵢ − mean(rᵢ)` (gate-on minus gate-off realized mean, every
+  base bet held equal — no conviction reconstruction needed, since the
+  gate only *resizes* trades `_ml_decide` already picked) on the
+  temporal-OOS slice. A base-conviction-weighted `sized_*` number
+  (reconstructing `_ml_decide`'s `min(cap, ml_score/divisor)` incl. the
+  leveraged-ETF/regime branch) is reported **informationally only —
+  never folded into the verdict** (the `gate_audit` arm-monotone honesty
+  pattern), because `ml_score` is the reasoning's 2-dp `score=` and the
+  bull-vs-"unknown" regime at `regime_mult==1.0` is irreducible from the
+  outcome row (cross-checked live: reconstructed base ≠ the reasoning's
+  post-gate `conviction=` precisely *because* the latter already carries
+  the multiplier — the formula structure is right, the residual is the
+  gate itself + 2-dp rounding). Reuses `gate_audit.gate_arm` and
+  `validation.split_outcomes_temporal` (single source of truth — the
+  arms / OOS slice can never drift between the two gate diagnostics).
+  Read-only, no train/pickle/`build_features`/`N_FEATURES`/trade touch,
+  never raises, CLI exits 2 on `GATE_SUBTRACTS_RETURN`. **NOT wired into
+  `main()` — zero deploy-stale impact, no loop restart needed.** 25
+  exact-value locks in `tests/test_gate_pnl.py` (full verdict matrix at
+  hand-computed `±3.6842`/`0.0` contributions; the SELL-sign-flip
+  regression — without it GATE_ADDS reads GATE_RETURN_NEUTRAL; exact
+  `1.9310` sized contribution; `_reconstruct_base_conviction` cap/divisor
+  /leveraged/regime branches; OOS-slice restriction; `gate_arm is
+  gate_audit.gate_arm` SSOT; never-raises).
+  ```bash
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.gate_pnl
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.gate_pnl --all
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/test_gate_pnl.py -v
+  ```
+
+- **Quant finding (NEW, headline — the gate's economic impact is
+  ~0pp, not the +0.86pp the extreme-arm spread suggests).** Live pickle
+  `n_train=3870`, gate active. **OOS slice (1418 fills):
+  `GATE_RETURN_NEUTRAL`, equal-weight contribution +0.02pp** (gate-on
+  +0.55% vs gate-off +0.53%, avg multiplier 0.96). The sibling
+  `gate_audit` on the *same* slice reads `GATE_INEFFECTIVE` with a
+  `strong_tailwind − strong_headwind` spread of **+0.86pp** — close
+  enough to the ±1.0pp tolerance to look marginal — but rolled up across
+  all five arms weighted by fire-frequency (`mild_headwind` n=570 @
+  +0.68%, `neutral` n=505 @ +0.18%, `mild_tailwind` n=161 @ +1.27%,
+  `strong_tailwind` n=115 @ +0.71%, `strong_headwind` n=67 @ −0.16%) the
+  net portfolio contribution is **+0.02pp ≈ 0**. This is the decisive
+  economic statement of the documented near-zero OOS skill: the gate
+  (invariant #5, `gate_active` every cycle) underwrites **pure sizing
+  variance with no compensating realized edge** — now quantified in
+  realized-return pp, not rank-IC. In-sample `--all` reads +0.39pp
+  (still NEUTRAL); the in-sample→OOS collapse mirrors the textbook
+  overfit every prior pass documents. Cross-tool consistency confirms no
+  drift: `calibration --oos` MISCALIBRATED (spearman 0.012 vs in-sample
+  0.36), `gate_audit` GATE_INEFFECTIVE, `scorer_skill_log.jsonl`
+  `oos_ic ≈ 0`. Reported, **not actioned** — turning the gate off is a
+  training-dynamics change out of surgical scope (CLAUDE.md §6).
+
+- **Quant finding (NEW, decisive — 2 of the 17 scorer features are
+  constant noise in training).** `decision_outcomes.jsonl` (7093 rows):
+  **98.1% have `news_article_count = NULL`** → `news_urgency` /
+  `news_article_count` sit at their `build_features` defaults (50.0 /
+  1.0) for 98% of training rows. The continuous loop draws deep
+  historical windows (current corpus sim_dates **1996–2018**) where
+  `digital-intern/articles.db` has effectively zero coverage, so almost
+  every backtest decision is pure-quant. ~12% of the MLP's input
+  dimensionality is therefore a near-constant the network can only
+  memorize around — a concrete mechanism contributing to the
+  `baseline_compare` "the net destroys the signal it is fed" finding.
+  Reported, not actioned (feeding news into deep-history backtests, or
+  pruning the dead features, is an architecture/training-dynamics change
+  out of surgical scope, CLAUDE.md §6).
+
+- **Quant findings (corroborating, not new).** Training tail = **5
+  distinct run_ids (6227–6232)** spanning sim_date 1996–2018 — exactly
+  `corpus_audit`'s `OOS_NOT_HELD_OUT`/`SINGLE_DRAW` (the temporal-OOS
+  holdout is the late slice of the same ~5 runs, not an unseen draw).
+  `forward_return_5d`: mean +1.26%, std 7.14, p1 −18.53, p99 +21.68,
+  **only 0.08% exceed |50%|** — re-confirms `PRED_CLAMP_PCT=50` is amply
+  load-bearing-safe (tighter than the AGENTS.md ~0.4% on the older 9k
+  corpus). Action mix BUY 5526 / SELL 1567. `forward_return_10d` present
+  on 0/7093 rows — the multi-horizon capture is still uncommitted
+  in-flight work; legacy rows have no 10d/20d keys, as documented.
+
+- **Operational (reconfirmed, out of scope):** winner→ArticleNet
+  feedback loop still dead both ways — `continuous.log`: `[continuous]
+  ml: trainer rc=-15 injected=10000` and `inject err: database locked
+  after 4 attempts`. Matches passes #6–#13 (digital-intern GPU +
+  `articles.db` write contention on the `/media/...` symlinked volume) —
+  the loop is **not** "training on its winners". The scorer itself
+  retrains cleanly every cycle (`scorer ok` every cycle, train_n growing
+  3234→3485→3870, `val_rmse ≪ oos_rmse`). `backtest.db.local_backup` is
+  a stale 2026-05-17 snapshot (max complete run_id=5) — the live symlink
+  still times out per pass #13; `continuous.log` is fresh & mid-cycle.
+
+- **Run the ML/backtest suite (now 280):** `cd
+  /home/zeph/trading-intelligence/paper-trader && python3 -m pytest
+  tests/test_decision_scorer.py tests/test_backtest.py
+  tests/test_calibration.py tests/test_validation.py tests/test_continuous.py
+  tests/test_gate_audit.py tests/test_gate_pnl.py tests/test_skill_trend.py
+  tests/test_baseline_compare.py tests/test_ml_backtest_review.py -q`
+  (280 fast offline tests, green). `test_gate_pnl.py` holds the gate
+  economic-counterfactual locks; it has none of "ml"/"backtest"/"scorer"
+  in its node ids, so add it explicitly like `test_calibration.py` /
+  `test_gate_audit.py`.
+
+*Review pass #15 appended 2026-05-18. Prior content above is unmodified.*
