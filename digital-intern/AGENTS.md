@@ -2933,3 +2933,138 @@ expected; this entry was appended, not rewritten).
   `git show --stat` verified no sibling/`paper-trader` leakage despite the
   racing shared index; never `git add -A`; on origin/master. Entry appended,
   not rewritten.
+
+- **2026-05-18 (hybrid pass 23 — Agent 3, debug + feature + analyst-validation)** —
+  Required-file-set pass (23rd; codebase exceptionally mature, 22 prior
+  passes). Advisor-reviewed before each substantive phase. Live evidence was
+  the discovery engine (proven pattern of passes 14/16/17/18/19/20). `sqlite3`
+  CLI absent → `python3` `mode=ro` probes (timed out >90s under live daemon
+  contention, the documented USB-I/O saturation; one short-window probe later
+  succeeded). Bare daemon `pid 1702195` still up, started **2026-05-18
+  07:29Z**, predating EVERY recent fix incl. `8180055`/`84bc881`/`50c1052`/
+  `b20cbae` (the consistent stale-daemon caveat — fixes ship on next restart).
+  Concurrent sibling agent + auto-commit/push daemon on the shared monorepo
+  index (memory `di-shared-repo-concurrency`) → strict per-commit pathspec
+  staging; the shared index advanced between my two pushes (`6e9c5d8`→…,
+  `d714dcb`→`84bc881`) but neither commit captured a foreign file
+  (`git show --stat` verified).
+
+  **Phase 1 — bugs_fixed=1, commit `8180055`** (`storage/article_store.py` +
+  new `tests/test_retry_on_lock_not_an_error.py`). **Live-log discovery →
+  root-caused → fixed.** `daemon.log`: `[recursive_labeler] error: not an
+  error` at 12:09:20Z landed exactly at the onset of a `database is locked`
+  writer-contention storm (insert_batch/update_ml_scores_batch exhausting
+  12:09:24-32Z). `_retry_on_lock`'s `_RETRYABLE_DB_ERRORS` covered `database
+  is locked` / `another row available` / `another row pending` / `no more rows
+  available` but NOT `not an error` — the `pysqlite` `SQLITE_OK` (errno-0)
+  default message, surfaced when a concurrent writer on the shared
+  `check_same_thread=False` `self.conn` resets the statement state mid-call:
+  the SAME shared-connection cursor-collision class as `bec95ea` (pass 14,
+  "no more rows available") and `05b406e` (pass 19, `_expect_row`
+  `'NoneType'`), just a different surfaced string. **Advisor's
+  verification gate corrected an initial misdiagnosis:** the colliding call is
+  NOT `_fetch_round1_candidates` (a raw uncovered `store.conn.execute`) — the
+  log shows `round=1 candidates=500` SUCCEEDED before BOTH the 08:01
+  ("no more rows available", pre-`bec95ea` on the stale daemon) and 12:09
+  ("not an error") errors, so the collision hit the `@_retry_on_lock`-decorated
+  `update_ai_scores_batch.executemany` inside round-1's `_apply_labels`. So the
+  fix is minimal — add the string to the allowlist + a documenting comment
+  item 4 (the colliding op is already decorated and idempotent; NO store-method
+  refactor, the gate prevented a wrong-shaped change). Impact: the
+  recursive_labeler had **ZERO successful runs since the 07:29Z daemon start**
+  (`last_ok=n/a`; last success 03:33Z `total_labeled=418` on the *previous*
+  daemon) — each collision aborted the entire 4h Sonnet/Opus gold-label
+  cycle, the model's strongest active-learning signal. Genuine HEAD bug (the
+  string is absent from HEAD's allowlist); ships on next `systemctl restart
+  digital-intern`. +5 tests mirroring `tests/test_retry_on_lock_no_more_rows.py`
+  (retry-then-succeed, substring-embed, IntegrityError still propagates,
+  budget-exhaust+`lock_failures`, tuple anti-drift). `tests/test_article_store.py`
+  left untouched (sibling-WIP).
+
+  **Phase 2 — features_added=1, commit `84bc881`**
+  (`analysis/claude_analyst.py` + new `tests/test_briefing_aging_rows.py`).
+  **AGING TOP ROWS — deterministic wall-clock recency cross-check.** The
+  model-estimated `time_sensitivity` decay rerank demotes stale time-bound
+  rows only as far as the ts head scored them; an under-scored row stays
+  time-bound yet barely decays and a sparse 5h window floats a 5-6h-old item
+  to #1. Opus then has only the per-row `[seen HH:MM UTC]` clock + the
+  `BRIEFING TIME` header, and LLM clock subtraction across a bare-HH:MM 24h
+  window is unreliable — so a multi-hour-old developing story can be written
+  into the LEAD as if it just broke (the recurring stale-framing complaint, on
+  the analyst's primary product). New pure `_aging_top_rows()` emits a
+  deterministic wall-clock age for the highest-ranked digest rows (an
+  INDEPENDENT ground-truth cross-check on the model decay, NOT a
+  re-expression). **Design note for future passes:** a per-row `[age N]`
+  token (mirroring the alert path's `0792a57`) was explicitly rejected —
+  `tests/test_briefing_seen_timestamp.py:69` pins the EXACT contiguous
+  render-line prefix `"[score=9.0] [seen 14:32 UTC] [rss]"`, so ANY new
+  inline per-row token breaks that tracked assertion and the task forbids
+  weakening existing tests. The correct shape is the established BOOK-HEAT /
+  COVERAGE-GAP one: a separate `=== AGING TOP ROWS ===` input block (zero
+  render-line change → contiguity intact), never echoed (a framing hint, like
+  BOOK HEAT, unlike COVERAGE GAP), computed over the same `deduped[:60]` Opus
+  reads, + a SYSTEM_PROMPT rule. 3.0h threshold mirrors the alert path's
+  documented "materially old (≳3h)" RECENCY bar (cross-product parity); only
+  the top `_AGING_TOP_SCAN=10` rows scanned (Opus leads from the top), capped
+  at 6; `_seen_age_hours` reused verbatim (anti-drift); real-url snapshot
+  guard mirrors `[BOOK:]`. Pure read-side: no DB write, no
+  ai_score/ml_score/score_source/urgency touch, no `source_articles`
+  mutation, backtest excluded upstream — **all four invariants intact by
+  construction**. +14 specific-value tests (exact 3.0h boundary, rank/cap,
+  snapshot+unknown-age exclusion, non-mutation, `_build_payload` emission
+  gate, verbatim SYSTEM_PROMPT rule). All 143 briefing-suite tests pass
+  (incl. the unchanged `test_briefing_seen_timestamp` contiguity assertion).
+
+  **Phase 3 — analyst-lens live validation, user_findings=7.** (1)
+  **recursive_labeler ZERO successful runs since 07:29Z** — the Phase-1
+  finding; 08:01 "no more rows available" (pre-`bec95ea`, stale daemon),
+  12:09 "not an error" (the HEAD bug, fixed in `8180055`); ships on restart.
+  (2) **Chronic DB lock-retry exhaustion** — 32 `lock retry exhausted` in the
+  current `daemon.log` + many `database is locked` worker backoffs (finnhub/
+  reddit/scorer/ticker/web/yahoo_ticker_rss/google_news/wikipedia clusters
+  12:09, 12:28-34, 12:49-13:06) → whole collected/scored batches silently
+  dropped = missed news (memory `di-insert-batch-lock-contention`). Root fix
+  (per-call connection isolation) substantial + daemon.py/store sibling-touched
+  → out of clean scope (advisor/precedent-confirmed); my Phase-1 removes ONE
+  symptom of this exact storm. (3) **6 collectors disabled** (`source_health`
+  `disabled=6 stale=0 down=6` unchanged through 13:24Z) — analyst blind to
+  those channels; the COVERAGE GAP briefing block surfaces it (working as
+  intended); upstream/operational. (4) **Alert path CLEAN & quiet
+  (positive)** — exactly 2 BN alerts in 24h (03:03Z, 09:26Z, 1 distinct
+  story each); zero noise/suppression churn; the full noise-suppression stack
+  behaving on a quiet window. (5) **Briefing cadence HEALTHY (positive)** —
+  heartbeats 01:54Z (2280 ch) → 07:13Z (2315 ch) → 12:51Z (2777 ch),
+  gaps ≈ 5.3h / 5.6h vs the 5h target (the `ef839a8` heartbeat-clock fix
+  holding; no 30h+ gaps), all delivered OK. (6) **Briefing quality EXCELLENT
+  (positive, direct read)** — id=27 (12:51Z, 50 arts) read end-to-end: dense,
+  exact, decisively-actionable Bloomberg LEAD ("Iran-war inflation scare →
+  global bond rout, US 30Y 5.13% post-2023 high, S&P -1.24% / SMH -3.80%
+  into NVDA Wed earnings — but the live tape is already cooling, WTI -4.15%,
+  bond selloff easing"); precise MACRO table. (7) **Collection HEALTHY
+  (positive)** — gdelt per-query ingestion diverse & current through 13:24Z
+  (Middle East conflict=43, Italy economy=53, Samsung semis=15, DRAM memory
+  pricing, NVDA earnings, SEC 13F); newest sweep ~min-fresh. None of 2/3 is a
+  new safe quick fix in clean scope (2 operational+sibling-touched, advisor-
+  confirmed not chased; 3 upstream) → no extra Phase-3 fold-in; bugs_fixed
+  stays 1, features_added 1.
+
+  **Verify:** `storage.article_store` / `ml.features` / `ml.model` /
+  `analysis.claude_analyst` imports OK; suite **786 passed / 5 failed** (the 5
+  are the pre-existing sibling `M collectors/rss_collector.py` 4-tuple WIP,
+  `'_FakeResp' object has no attribute 'status_code'` — not ours, never
+  staged; floor held exactly 5, never 6+; my 19 new tests all pass; the >757
+  prior-baseline delta includes concurrent-sibling test files). *Pre-existing,
+  deliberately never staged* (consistent with every prior entry):
+  `collectors/rss_collector.py`, `daemon.py`, `dashboard/server.py`,
+  `scripts/export_training_data.py`, `tests/test_article_store.py`, untracked
+  `collectors/fred_collector.py` / `scripts/stale_source_alerter.py` /
+  `storage/story_corroboration.py` / `tests/test_alert_history.py` /
+  `tests/test_export_training_data.py` / `tests/test_story_corroboration.py`,
+  all `paper-trader/*`, `logs/*.tmp`. Both commits pathspec-scoped to exactly
+  their 2 intended files (`8180055`: `storage/article_store.py` +
+  `tests/test_retry_on_lock_not_an_error.py`; `84bc881`:
+  `analysis/claude_analyst.py` + `tests/test_briefing_aging_rows.py`);
+  `git diff --staged --name-only` + `git show --stat` verified no sibling
+  leakage; never `git add -A`; both on origin/master. A concurrent sibling
+  hybrid agent edited this repo throughout; this entry was appended, not
+  rewritten.
