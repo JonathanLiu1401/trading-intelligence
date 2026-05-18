@@ -8195,17 +8195,22 @@ def host_guard_api():
     """Live host-saturation verdict + the NEW 'skipped claude call' bucket.
 
     The recurring NO_DECISION storms are host saturation, not a prompt/parser
-    bug (paper_trader/host_guard.py). strategy.decide() now pre-flight-skips
-    the Opus call when host_guard.host_saturated() trips, recording a distinct
-    ``skipped claude call — …`` reason instead of spawning a doomed ~1.5GB
-    subprocess into the storm. /api/empty-claude-rate keys off the OLD
+    bug (paper_trader/host_guard.py). strategy.decide() declines the Opus call
+    in TWO host-saturation cases, both recorded with the ``skipped claude
+    call — …`` prefix this endpoint counts: (1) the pre-flight guard trips
+    (``host saturated: …``), and (2) the call passed pre-flight but the box
+    saturated *during* it and the doomed Sonnet fallback was skipped
+    (``host saturated mid-call: …``). /api/empty-claude-rate keys off the OLD
     ``claude returned no response`` prefix, so once the guard is live an
     operator would see the empty rate fall and wrongly conclude it's fixed —
-    when really the skip bucket merely replaced it. This endpoint surfaces
-    both: the raw saturation snapshot (host_guard.snapshot — verdict + /proc
-    probe + empty-rate) AND the recent deliberate-skip rate, so 'box
-    overloaded' stays visible after the fix. Read-only, degrade-safe — never
-    raises into the dashboard (mirrors /api/empty-claude-rate's contract)."""
+    when really the skip bucket merely absorbed it (the mid-call case used to
+    misreport as an empty/model timeout). This endpoint surfaces both: the raw
+    saturation snapshot (host_guard.snapshot — verdict + /proc probe +
+    empty-rate) AND the recent skip rate (pre-flight + mid-call combined), so
+    'box overloaded' stays visible after the fix. /api/decision-forensics
+    splits the two via its HOST_SATURATED_SKIP / HOST_STARVED_MIDCALL modes.
+    Read-only, degrade-safe — never raises into the dashboard (mirrors
+    /api/empty-claude-rate's contract)."""
     try:
         from . import host_guard
         snap = host_guard.snapshot()

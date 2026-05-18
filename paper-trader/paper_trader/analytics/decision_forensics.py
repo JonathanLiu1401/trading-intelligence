@@ -8,6 +8,11 @@ into ``decisions.reasoning`` for every failed cycle:
 * ``"parse_failed: <up-to-1000-char excerpt>"`` — Opus replied, first parse failed
 * ``"retry_failed: <excerpt>"``                 — the JSON-only retry *also* failed
 * ``"claude returned no response (timeout/empty)"`` — CLI timeout / empty stdout
+* ``"skipped claude call — host saturated: …"``      — pre-flight guard declined
+* ``"skipped claude call — host saturated mid-call: …"`` — box saturated *during*
+  the call; the doomed Sonnet fallback was skipped (root-cause-attributed, not a
+  model timeout — kept out of the empty-response bucket on purpose)
+* ``"claude quota/usage limit exhausted (no decision)"`` — CLI usage-limit reject
 * legacy ``"claude returned no parseable JSON"``    — pre-diagnostics code path
   (no excerpt; still present in older rows)
 
@@ -27,6 +32,9 @@ from datetime import datetime, timedelta, timezone
 # Failure *modes* — what an operator can act on. Ordered by display priority.
 MODES = [
     "TIMEOUT_EMPTY",    # CLI timed out or returned nothing — retry can't help
+    "HOST_SATURATED_SKIP",   # pre-flight guard declined the call (box overloaded)
+    "HOST_STARVED_MIDCALL",  # box saturated *during* the call; fallback skipped
+    "QUOTA_EXHAUSTED",       # claude CLI hit a usage/quota limit
     "TRUNCATED",        # response cut off mid-object (unbalanced braces)
     "NO_JSON",          # no '{' at all — refusal or pure prose
     "FENCED",            # wrapped in ``` fences and still unparseable
@@ -42,6 +50,20 @@ _HINTS = {
     "TIMEOUT_EMPTY": ("Opus is timing out or returning empty stdout — check "
                       "`claude` CLI auth and the 3-concurrent subprocess cap; "
                       "consider raising DECISION_TIMEOUT_S."),
+    "HOST_SATURATED_SKIP": ("Host was saturated at pre-flight — the Opus call "
+                            "was deliberately skipped so it wouldn't feed the "
+                            "storm. Reduce concurrent out-of-band Opus "
+                            "subprocesses (hourly review / HYBRID agents / the "
+                            "backtest committee) or stagger them; NOT a prompt "
+                            "or model bug — raising the timeout won't help."),
+    "HOST_STARVED_MIDCALL": ("Host passed pre-flight but saturated *during* "
+                             "the Opus call (out-of-band Opus agents); the "
+                             "doomed Sonnet fallback was skipped. Same fix as "
+                             "HOST_SATURATED_SKIP — fewer concurrent Opus "
+                             "subprocesses, not a longer DECISION_TIMEOUT_S."),
+    "QUOTA_EXHAUSTED": ("The `claude` CLI hit a usage/quota limit — no decision "
+                        "will succeed until the quota window resets. Not a host "
+                        "or prompt issue; runner._cycle alarms this once."),
     "TRUNCATED": ("Opus responses are being cut off mid-JSON — raise "
                   "DECISION_TIMEOUT_S or shorten the prompt payload."),
     "NO_JSON": ("Opus is replying with prose / a refusal and no JSON object — "
@@ -142,6 +164,22 @@ def classify_failure(reasoning: str | None) -> dict:
         }
     if "no response" in low and ("timeout" in low or "empty" in low):
         return {"mode": "TIMEOUT_EMPTY", "tag": "no_response", "excerpt": ""}
+    # Operational (non-model) classes. strategy.py records these as
+    # "skipped claude call — host saturated[ mid-call]: …" (host-saturation
+    # guard) and "claude quota/usage limit exhausted …" (CLI usage cap). They
+    # are NOT a prompt/model fault — keep them OUT of TIMEOUT_EMPTY so the
+    # "raise DECISION_TIMEOUT_S" hint can't fire on an overloaded box, and so
+    # the dominant live failure stops hiding in OTHER. The mid-call variant is
+    # checked first: it also contains "host saturated", and the more specific
+    # bucket must win (precedence pinned by tests).
+    if raw.startswith("skipped claude call"):
+        if "mid-call" in low:
+            return {"mode": "HOST_STARVED_MIDCALL",
+                    "tag": "host_starved_midcall", "excerpt": ""}
+        return {"mode": "HOST_SATURATED_SKIP",
+                "tag": "host_skip", "excerpt": ""}
+    if "quota" in low and ("exhaust" in low or "usage limit" in low):
+        return {"mode": "QUOTA_EXHAUSTED", "tag": "quota", "excerpt": ""}
     if "no parseable json" in low:  # legacy pre-diagnostics rows
         return {"mode": "LEGACY_UNKNOWN", "tag": "legacy", "excerpt": ""}
     # Non-failure rows store decision JSON ({"decision": {...}, ...}).
