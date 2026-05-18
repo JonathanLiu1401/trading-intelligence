@@ -7588,6 +7588,104 @@ def scorer_attribution_api():
         return jsonify({"error": str(e), "attribution": {"contributions": []}}), 500
 
 
+@app.route("/api/scorer-opportunities")
+@swr_cached("scorer-opportunities", 90.0)
+def scorer_opportunities_api():
+    """DecisionScorer-ranked watchlist names we do NOT currently own.
+
+    /api/watchlist-opportunities ranks unowned names by *news heat*;
+    /api/scorer-predictions runs the trained quant scorer only on *held*
+    positions. Neither answers "what does the model say we should buy?" — the
+    quantitative complement of the missed-opportunity radar. This endpoint
+    runs predict_with_meta over every unowned WATCHLIST ticker and returns the
+    top-N by predicted 5-day forward return, with the same off-distribution
+    trust flag scorer-predictions surfaces."""
+    try:
+        from .ml.decision_scorer import DecisionScorer
+        from .strategy import WATCHLIST as _WATCHLIST, get_quant_signals_live
+        from . import signals as _sig
+
+        try:
+            n_top = max(1, min(50, int(request.args.get("n", 12))))
+        except (TypeError, ValueError):
+            n_top = 12
+
+        scorer = DecisionScorer()
+        store = get_store()
+        held = {str(p.get("ticker") or "").upper()
+                for p in store.open_positions() if (p.get("qty") or 0) > 0}
+        candidates = sorted({t.upper() for t in _WATCHLIST} - held)
+
+        result = {
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "is_trained": scorer.is_trained,
+            "n_train": scorer.n_train,
+            "gate_threshold": 500,
+            "n_candidates": len(candidates),
+            "n_held_excluded": len(held),
+            "opportunities": [],
+        }
+        if not candidates or not scorer.is_trained:
+            return jsonify(result)
+
+        quant = get_quant_signals_live(candidates) or {}
+        sent_list = _sig.ticker_sentiments(candidates, hours=4) or []
+        sent_by_tk = {s["ticker"]: s for s in sent_list}
+
+        regime_mult = 1.0
+        try:
+            spy_q = (get_quant_signals_live(["SPY"]) or {}).get("SPY") or {}
+            spy_mom = spy_q.get("mom_5d")
+            if isinstance(spy_mom, (int, float)):
+                regime_mult = max(0.7, min(1.3, 1.0 + spy_mom * 0.075))
+        except Exception:
+            pass
+
+        rows: list[dict] = []
+        for tk in candidates:
+            q = quant.get(tk)
+            if not q:
+                continue
+            sent = sent_by_tk.get(tk) or {}
+            ml_score = float(sent.get("max_score") or 0.0)
+            meta = scorer.predict_with_meta(
+                ml_score=ml_score,
+                rsi=q.get("rsi"),
+                macd=q.get("macd_signal"),
+                mom5=q.get("mom_5d"),
+                mom20=q.get("mom_20d"),
+                regime_mult=regime_mult,
+                ticker=tk,
+                vol_ratio=q.get("vol_ratio"),
+                bb_pos=q.get("bb_position"),
+            )
+            pred = float(meta["pred"])
+            row = {
+                "ticker": tk,
+                "pred_5d_return_pct": round(pred, 3),
+                "verdict": _scorer_verdict(pred),
+                "rsi": q.get("RSI"),
+                "macd": q.get("MACD"),
+                "mom_5d": q.get("mom_5d"),
+                "mom_20d": q.get("mom_20d"),
+                "ml_news_score": round(ml_score, 2),
+                "news_count": sent.get("n", 0),
+                "news_urgent": sent.get("urgent", 0),
+                "off_distribution": bool(meta["off_distribution"]),
+            }
+            if meta["off_distribution"]:
+                row["raw_pred_5d_return_pct"] = round(float(meta["raw"]), 3)
+            rows.append(row)
+
+        rows.sort(key=lambda r: -(r["pred_5d_return_pct"] or 0))
+        result["n_scored"] = len(rows)
+        result["regime_mult"] = round(regime_mult, 3)
+        result["opportunities"] = rows[:n_top]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "opportunities": []}), 500
+
+
 @app.route("/api/sector-heatmap")
 @swr_cached("sector-heatmap", 90.0)
 def sector_heatmap_api():
