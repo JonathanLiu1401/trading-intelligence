@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import sqlite3
 import zlib
 from datetime import datetime, timezone, timedelta
@@ -421,6 +422,252 @@ def _hold_discipline_chat_lines(hd: Any) -> list[str]:
     return [f"Hold discipline: {hl}"] if hl else []
 
 
+def _coverage_gap_chat_lines(report: Any) -> list[str]:
+    """Render the news-coverage-gap block for the chat prompt.
+
+    A news analyst's most dangerous failure is a *silent* one: a high-value
+    intel channel goes dark and the chat simply contains nothing from it, so
+    the absence reads as "calm" rather than "blind here". The 5h Opus briefing
+    already surfaces this; the chat — the operator's primary interactive
+    surface — did not, so it would confidently answer "nothing notable on
+    filings" while SEC 8-K had been dark all session.
+
+    Composed from ``analysis.claude_analyst._coverage_gap_lines`` **verbatim**
+    (the same single source of truth the briefing reproduces — invariant #10:
+    no re-derived gap logic that can drift from the briefing the operator also
+    reads); each SSOT line is wrapped as one bullet, ordering/cap unchanged.
+
+    Pure / total — the ``_behavioural_chat_lines`` contract: a non-dict, an
+    empty report, an import failure, or no curated channel disabled → ``[]``
+    (the block is omitted, never an exception into the chat handler).
+    """
+    if not isinstance(report, dict) or not report:
+        return []
+    try:
+        from analysis.claude_analyst import _coverage_gap_lines
+        lines = _coverage_gap_lines(report)
+    except Exception:  # noqa: BLE001 — a chat block must never raise
+        return []
+    return [f"• {ln}" for ln in lines] if lines else []
+
+
+def _rerank_chat_news(rows: Any, limit: int, now=None) -> list:
+    """Recency-decay rerank of chat news candidates, truncated to ``limit``.
+
+    The chat news tiers were ordered by raw ``ai_score DESC``, so a stale
+    high-score "SURGED TODAY" outranked a fresh slightly-lower one on the
+    operator's primary surface. ArticleNet already trains a
+    ``time_sensitivity`` head and the 5h briefing already decays by it;
+    this applies that **same single source of truth**
+    (``analysis.claude_analyst._rank_by_decayed_score`` /  ``_effective_score``:
+    ``effective = ai_score * 0.5 ** (age_h * ts / 12h)``) so the chat and the
+    briefing rank consistently instead of forking a second decay curve. The
+    system-wide NULL policy (unscored ``time_sensitivity`` → mild default
+    decay; unparseable ``first_seen`` → age 0 → no decay) lives in
+    ``_effective_score`` and is locked by this module's tests.
+
+    Pure / total: ``limit <= 0`` → ``[]``; on any failure (import error,
+    malformed row) it degrades to the incoming order truncated to ``limit``
+    — recency decay may only ever *help* the chat ranking, never sink the
+    block or raise into the chat handler.
+    """
+    if limit <= 0:
+        return []
+    try:
+        from analysis.claude_analyst import _rank_by_decayed_score
+        return _rank_by_decayed_score(list(rows), now=now)[:limit]
+    except Exception:  # noqa: BLE001 — decay can only help; never sink chat
+        return list(rows)[:limit]
+
+
+# ── Native news-density SECTOR PULSE ────────────────────────────────────────
+# The only sector heatmap in the stack is cross-fetched from paper-trader
+# (:8090/api/sector-heatmap — pure price momentum), so it blanks exactly when
+# the trader is down/stale (its documented chronic state). digital-intern owns
+# ~1000+ live scored articles/h; this derives a sector view *natively* from
+# the wire — which slices of the book the news is lighting up right now,
+# weighted toward fresh items — with zero dependence on paper-trader uptime.
+#
+# This is an explicit, test-locked taxonomy (NOT heuristic_scorer's keyword
+# scoring tiers — those are not a sector map). It deliberately covers the
+# user's stated universe: DRAM/memory, semis-equipment, the HBM-ramp design
+# winners, and the leveraged semis ETFs the trader actually uses.
+_SECTOR_MAP: dict[str, str] = {
+    # DRAM / NAND / storage-media
+    "MU": "DRAM/Memory", "WDC": "DRAM/Memory", "STX": "DRAM/Memory",
+    # Wafer-fab equipment & materials
+    "ASML": "Semis Equipment", "LRCX": "Semis Equipment",
+    "AMAT": "Semis Equipment", "KLAC": "Semis Equipment",
+    "TER": "Semis Equipment", "ENTG": "Semis Equipment",
+    # GPU / accelerated-compute / HBM-design winners
+    "NVDA": "GPU/AI Compute", "AMD": "GPU/AI Compute",
+    "AVGO": "GPU/AI Compute",
+    # Foundry / logic
+    "TSM": "Foundry/Logic", "INTC": "Foundry/Logic", "GFS": "Foundry/Logic",
+    # Mega-cap tech (hyperscaler demand)
+    "AAPL": "Mega-Cap Tech", "MSFT": "Mega-Cap Tech",
+    "GOOGL": "Mega-Cap Tech", "GOOG": "Mega-Cap Tech",
+    "META": "Mega-Cap Tech", "AMZN": "Mega-Cap Tech",
+    # Optical / networking (the trader holds LITE)
+    "LITE": "Networking/Optical", "COHR": "Networking/Optical",
+    "CIEN": "Networking/Optical",
+    # EDA / IP
+    "SNPS": "EDA/IP", "CDNS": "EDA/IP",
+    # Semis index / leveraged ETFs the trader uses
+    "SOXX": "Semis Index/ETF", "SMH": "Semis Index/ETF",
+    "SOXL": "Semis Index/ETF", "SOXS": "Semis Index/ETF",
+}
+# Case-SENSITIVE, word-bounded. Tickers in real headlines are uppercase;
+# a case-insensitive match would false-positive on ordinary prose ("mu"
+# meson, "amd" in a URL). \b stops substring hits (EMU/SAMUEL → no MU).
+# Longest-first alternation so GOOGL can't be shadowed by GOOG.
+_SECTOR_TICKER_RE = re.compile(
+    r"\b(?:" + "|".join(
+        re.escape(t) for t in sorted(_SECTOR_MAP, key=len, reverse=True)
+    ) + r")\b"
+)
+_SECTOR_PULSE_HALFLIFE_H = 6.0  # a sector's "velocity" halves every 6h dark
+_SECTOR_PULSE_MAX_CHAT_LINES = 6
+
+
+def _extract_tickers(text: Any) -> set:
+    """Pure: the set of known watchlist tickers literally present (uppercase,
+    word-bounded) in ``text``. Non-str / empty → ``set()`` (never raises)."""
+    if not isinstance(text, str) or not text:
+        return set()
+    return {t for t in _SECTOR_TICKER_RE.findall(text) if t in _SECTOR_MAP}
+
+
+def _aggregate_sector_pulse(
+    articles: Any, window_hours=None, now=None
+) -> dict:
+    """Pure: roll a list of live article dicts into a per-sector news pulse.
+
+    Each article maps (via its title) to zero or more sectors; per sector we
+    track article count, mean/max ai_score, max urgency, the freshest
+    timestamp, the highest-scored headline, and a **recency-weighted
+    velocity** (``Σ 0.5 ** (age_h / 6h)``) so a sector lit by fresh wire
+    outranks one with the same count of stale items — that recency tilt is
+    the whole point of a *pulse* vs a flat count. Age uses the shared
+    ``claude_analyst._seen_age_hours`` parser (same convention as the chat
+    decay / alert pipeline); if that import fails every age degrades to 0
+    (→ no recency tilt, velocity == count) rather than raising.
+
+    Total: a non-list, or rows that aren't dicts / lack a usable title, are
+    skipped — the result is always the well-formed skeleton, never an
+    exception into the endpoint or chat handler.
+    """
+    out = {
+        "generated_at": (now or datetime.now(timezone.utc)).isoformat(),
+        "window_hours": window_hours,
+        "n_scanned": 0,
+        "n_mapped": 0,
+        "sectors": [],
+    }
+    if not isinstance(articles, list):
+        return out
+    try:
+        from analysis.claude_analyst import _seen_age_hours
+    except Exception:  # noqa: BLE001
+        def _seen_age_hours(_fs, now=None):  # type: ignore
+            return 0.0
+
+    agg: dict[str, dict] = {}
+    n_scanned = 0
+    n_mapped = 0
+    for art in articles:
+        if not isinstance(art, dict):
+            continue
+        n_scanned += 1
+        title = art.get("title")
+        if not isinstance(title, str) or not title.strip():
+            continue
+        tks = _extract_tickers(title)
+        sectors = {_SECTOR_MAP[t] for t in tks}
+        if not sectors:
+            continue
+        n_mapped += 1
+        try:
+            ai = float(art.get("ai_score") or 0.0)
+        except (TypeError, ValueError):
+            ai = 0.0
+        try:
+            urg = int(art.get("urgency") or 0)
+        except (TypeError, ValueError):
+            urg = 0
+        fs = art.get("first_seen")
+        age_h = _seen_age_hours(fs, now=now)
+        weight = 0.5 ** (age_h / _SECTOR_PULSE_HALFLIFE_H)
+        for sec in sectors:
+            s = agg.setdefault(sec, {
+                "n": 0, "scores": [], "max_urg": 0, "vel": 0.0,
+                "last_seen": None, "top": ("", -1.0), "tickers": set(),
+            })
+            s["n"] += 1
+            s["scores"].append(ai)
+            s["max_urg"] = max(s["max_urg"], urg)
+            s["vel"] += weight
+            if fs and (s["last_seen"] is None or str(fs) > str(s["last_seen"])):
+                s["last_seen"] = fs
+            if ai > s["top"][1]:
+                s["top"] = (title, ai)
+            s["tickers"] |= {t for t in tks if _SECTOR_MAP[t] == sec}
+
+    sectors_out = []
+    for sec, s in agg.items():
+        scores = s["scores"] or [0.0]
+        sectors_out.append({
+            "sector": sec,
+            "n_articles": s["n"],
+            "avg_score": round(sum(scores) / len(scores), 2),
+            "max_score": round(max(scores), 2),
+            "max_urgency": s["max_urg"],
+            "velocity": round(s["vel"], 4),
+            "last_seen": s["last_seen"],
+            "top_headline": s["top"][0],
+            "tickers": sorted(s["tickers"]),
+        })
+    sectors_out.sort(
+        key=lambda d: (-d["velocity"], -d["n_articles"], d["sector"]))
+    out["n_scanned"] = n_scanned
+    out["n_mapped"] = n_mapped
+    out["sectors"] = sectors_out
+    return out
+
+
+def _sector_pulse_chat_lines(pulse: Any) -> list:
+    """Render the native sector pulse as compact chat-context lines.
+
+    One line per hottest sector (cap ``_SECTOR_PULSE_MAX_CHAT_LINES``), in the
+    aggregator's velocity order, surfacing count, velocity, avg score, an
+    URGENT flag, and the sector's lead headline so the analyst sees where the
+    wire is concentrated even when paper-trader's price heatmap is dark.
+
+    Pure / total — the ``_tail_risk_chat_lines`` contract: non-dict / no
+    sectors → ``[]`` (block omitted, never an exception into the handler).
+    """
+    if not isinstance(pulse, dict):
+        return []
+    sectors = pulse.get("sectors")
+    if not isinstance(sectors, list) or not sectors:
+        return []
+    lines = []
+    for s in sectors[:_SECTOR_PULSE_MAX_CHAT_LINES]:
+        if not isinstance(s, dict):
+            continue
+        urgent = " URGENT" if (s.get("max_urgency") or 0) >= 1 else ""
+        try:
+            lines.append(
+                f"{s.get('sector', '?')}: {int(s.get('n_articles') or 0)} "
+                f"arts (vel {float(s.get('velocity') or 0):.1f}, avg "
+                f"{float(s.get('avg_score') or 0):.1f}{urgent}) · "
+                f"{s.get('top_headline', '')}"
+            )
+        except Exception:  # noqa: BLE001 — a chat block must never raise
+            continue
+    return lines
+
+
 def create_app(store=None) -> Flask:
     """Build the Flask app. ``store`` is the shared ArticleStore from daemon.py."""
     global _store
@@ -626,6 +873,39 @@ def create_app(store=None) -> Flask:
         "AND source NOT LIKE 'backtest_%' "
         "AND source NOT LIKE 'opus_annotation%'"
     )
+
+    @app.get("/api/sector-pulse")
+    def api_sector_pulse():
+        """Native news-density sector heatmap — which slices of the book the
+        wire is lighting up right now, recency-weighted, computed purely from
+        ``articles.db`` (independent of paper-trader's price heatmap, which
+        blanks when the trader is down/stale). ``?hours=`` clamped 1..168.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            hours = int(request.args.get("hours", 24))
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(168, hours))
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT title, ai_score, urgency, first_seen FROM articles "
+                f"WHERE first_seen >= ? AND {_LIVE_ONLY_SQL} "
+                "ORDER BY first_seen DESC LIMIT 4000",
+                (since,),
+            )
+        except sqlite3.Error:
+            rows = []
+        arts = [
+            {"title": r[0] or "", "ai_score": float(r[1] or 0),
+             "urgency": int(r[2] or 0), "first_seen": r[3]}
+            for r in rows
+        ]
+        return jsonify(_aggregate_sector_pulse(arts, window_hours=hours))
 
     @app.get("/api/collector-health")
     def api_collector_health():
@@ -876,26 +1156,34 @@ def create_app(store=None) -> Flask:
             uri = f"file:{db_path}?mode=ro"
             conn = sqlite3.connect(uri, uri=True, timeout=5.0)
             try:
+                # Pull a WIDER candidate set than we ultimately show (10 / 8)
+                # and order by ai_score DESC so the recency-decay rerank below
+                # can actually promote a fresh slightly-lower row over a stale
+                # high one — and so the degrade path (rerank import/parse
+                # failure) still hands back the old ai_score-DESC order.
                 rows = conn.execute(
-                    "SELECT title, source, ai_score, full_text FROM articles "
+                    "SELECT title, source, ai_score, full_text, "
+                    "time_sensitivity, first_seen FROM articles "
                     "WHERE first_seen >= ? "
                     "AND url NOT LIKE 'backtest://%' "
                     "AND source NOT LIKE 'backtest_%' "
                     "AND source NOT LIKE 'opus_annotation%' "
-                    "ORDER BY ai_score DESC LIMIT 10",
+                    "ORDER BY ai_score DESC LIMIT 40",
                     (since,),
                 ).fetchall()
                 # Wider 48h "thesis context" tier — multi-day narrative the
-                # single 6h/10 breaking window cannot carry. Same live-only
+                # single 6h breaking window cannot carry. Same live-only
                 # filter (invariant: backtest/opus rows must never reach a
-                # live surface); deduped against `breaking` below.
+                # live surface); recency-reranked then deduped against
+                # `breaking` below.
                 thesis_rows = conn.execute(
-                    "SELECT title, source, ai_score, full_text FROM articles "
+                    "SELECT title, source, ai_score, full_text, "
+                    "time_sensitivity, first_seen FROM articles "
                     "WHERE first_seen >= ? "
                     "AND url NOT LIKE 'backtest://%' "
                     "AND source NOT LIKE 'backtest_%' "
                     "AND source NOT LIKE 'opus_annotation%' "
-                    "ORDER BY ai_score DESC LIMIT 25",
+                    "ORDER BY ai_score DESC LIMIT 60",
                     (since_thesis,),
                 ).fetchall()
             finally:
@@ -913,25 +1201,69 @@ def create_app(store=None) -> Flask:
                     except Exception:
                         return ""
 
-            for r in rows:
-                articles_ctx.append({
+            def _mk(r) -> dict:
+                # `time_sensitivity` / `first_seen` feed the shared recency
+                # decay (analysis.claude_analyst._effective_score); they are
+                # ranking inputs only and are NOT rendered into the prompt.
+                return {
                     "title": r[0] or "",
                     "source": r[1] or "",
                     "ai_score": float(r[2] or 0),
                     "summary": _decode_summary(r[3]),
-                })
-            thesis_all = [
-                {
-                    "title": r[0] or "",
-                    "source": r[1] or "",
-                    "ai_score": float(r[2] or 0),
-                    "summary": _decode_summary(r[3]),
+                    "time_sensitivity": r[4],
+                    "first_seen": r[5],
                 }
-                for r in thesis_rows
-            ]
-            thesis_ctx = _partition_thesis_articles(articles_ctx, thesis_all, 8)
+
+            # Recency-decay rerank both tiers with the SAME curve the 5h Opus
+            # briefing uses, then cut to the displayed 10 / 8. A stale 9.0 no
+            # longer outranks a fresh 8.6 on the operator's primary surface.
+            articles_ctx = _rerank_chat_news([_mk(r) for r in rows], 10)
+            thesis_ranked = _rerank_chat_news(
+                [_mk(r) for r in thesis_rows], len(thesis_rows))
+            thesis_ctx = _partition_thesis_articles(
+                articles_ctx, thesis_ranked, 8)
         except Exception as e:
             _logger().warning("chat: article context fetch failed: %s", e)
+
+        # News-coverage gap — which curated intel channels were dark this
+        # window. Without it the chat answers "nothing notable on filings"
+        # when SEC 8-K has been blind all session. Same SSOT the 5h briefing
+        # uses; best-effort, a read failure simply omits the block.
+        coverage_gap_block = ""
+        try:
+            from analysis.claude_analyst import _collect_source_health
+            coverage_gap_block = "\n".join(
+                _coverage_gap_chat_lines(_collect_source_health()))
+        except Exception as e:  # noqa: BLE001 — never sink the chat
+            _logger().warning("chat: coverage-gap fetch failed: %s", e)
+
+        # Native news-density sector pulse — computed from articles.db, so it
+        # answers "where is the wire concentrated" even when paper-trader's
+        # price heatmap (fetched below) is dark. Best-effort; a read failure
+        # simply omits the block.
+        sector_pulse_block = ""
+        try:
+            sp_since = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            sp_rows = _ro_query(
+                "SELECT title, ai_score, urgency, first_seen FROM articles "
+                "WHERE first_seen >= ? "
+                "AND url NOT LIKE 'backtest://%' "
+                "AND source NOT LIKE 'backtest_%' "
+                "AND source NOT LIKE 'opus_annotation%' "
+                "ORDER BY first_seen DESC LIMIT 4000",
+                (sp_since,),
+            )
+            sp = _aggregate_sector_pulse(
+                [{"title": r[0] or "", "ai_score": float(r[1] or 0),
+                  "urgency": int(r[2] or 0), "first_seen": r[3]}
+                 for r in sp_rows],
+                window_hours=24,
+            )
+            sector_pulse_block = "\n".join(_sector_pulse_chat_lines(sp))
+        except Exception as e:  # noqa: BLE001 — never sink the chat
+            _logger().warning("chat: sector-pulse fetch failed: %s", e)
 
         # Portfolio snapshot
         portfolio = _read_json(BASE_DIR / "data" / "portfolio_pl.json") or {}
@@ -1289,9 +1621,10 @@ def create_app(store=None) -> Flask:
             "the user's real portfolio, and a separate live paper trading bot (Claude Opus 4.7) "
             "running on a $1000 simulated portfolio.\n"
             f"Current date: {now_iso}\n\n"
-            "TOP NEWS SIGNALS (last 6h, ranked by ML score):\n"
+            "TOP NEWS SIGNALS (last 6h, ranked by ML score recency-decayed by the time-sensitivity head — a fresher item can outrank a higher-scored stale one):\n"
             f"{articles_block}\n\n"
-            + (f"THESIS CONTEXT (last 48h, ranked by ML score, deduped vs the 6h set above):\n{thesis_block}\n\n" if thesis_block else "")
+            + (f"THESIS CONTEXT (last 48h, same recency-decayed ML ranking, deduped vs the 6h set above):\n{thesis_block}\n\n" if thesis_block else "")
+            + (f"NEWS COVERAGE GAP — these curated intel channels could NOT be collected this window. Absence of news here is BLINDNESS, not calm: do NOT infer 'nothing happened' on these; if the user asks about one, say it is dark and why:\n{coverage_gap_block}\n\n" if coverage_gap_block else "")
             + "USER'S REAL PORTFOLIO SNAPSHOT:\n"
             f"{portfolio_block}\n\n"
             "PAPER TRADER LIVE STATE (separate $1000 sim run by Opus 4.7 every 30 min):\n"
@@ -1302,7 +1635,8 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — PRIORITISED ACTION PLAN (the bot's own next-session game plan):\n{game_plan_block}\n\n" if game_plan_block else "")
             + (f"PAPER TRADER — HOLD-DISCIPLINE ALERT (a losing position overstayed past the desk's own median losing-cut):\n{hold_discipline_block}\n\n" if hold_discipline_block else "")
             + (f"PAPER TRADER OPTIONS GREEKS (Black-Scholes, live IV):\n{greeks_block}\n\n" if greeks_block else "")
-            + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP:\n{heatmap_block}\n\n" if heatmap_block else "")
+            + (f"NEWS SECTOR PULSE (native — where the wire is concentrated right now, recency-weighted, last 24h; independent of the price heatmap below so it survives a stale/down paper-trader):\n{sector_pulse_block}\n\n" if sector_pulse_block else "")
+            + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP (paper-trader price momentum):\n{heatmap_block}\n\n" if heatmap_block else "")
             + (f"EARNINGS RADAR (scheduled gap risk):\n{earnings_block}\n\n" if earnings_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
