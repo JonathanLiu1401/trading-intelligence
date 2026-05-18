@@ -146,3 +146,143 @@ def test_snapshot_and_main_are_degrade_safe():
     assert isinstance(snap["saturated"], bool)
     rc = hg.main(["--json"])
     assert rc in (0, 1)
+
+
+# ── recent_starvation_rate — must count BOTH prefixes ────────────────────────
+# This is the discriminating regression: `recent_empty_rate` counts only the
+# old "claude returned no response" prefix, so once the pre-flight guard is
+# live (writing "skipped claude call …") it under-reports a storm. This test
+# fails if recent_starvation_rate ever narrows back to the empty-only prefix.
+
+def test_recent_starvation_rate_counts_both_prefixes(tmp_path):
+    db = tmp_path / "pt.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE decisions (id INTEGER PRIMARY KEY, "
+        "action_taken TEXT, reasoning TEXT)"
+    )
+    rows = [
+        ("NO_DECISION", "claude returned no response (timeout/empty)"),  # old
+        ("NO_DECISION", "skipped claude call — host saturated: 7 conc"),  # new
+        ("NO_DECISION", "skipped claude call — host saturated mid-call"),  # new
+        ("NO_DECISION", "parse_failed: {garbage"),    # NOT starvation
+        ("HOLD", "no edge"),                          # NOT NO_DECISION
+        ("BUY NVDA → FILLED", "skipped claude call"),  # NOT NO_DECISION
+    ]
+    conn.executemany(
+        "INSERT INTO decisions (action_taken, reasoning) VALUES (?, ?)", rows
+    )
+    conn.commit()
+    conn.close()
+
+    out = hg.recent_starvation_rate(db, limit=120)
+    assert out["ok"] is True
+    assert out["n"] == 6
+    # 1 old-prefix + 2 new-prefix NO_DECISION = 3 (parse_failed and the two
+    # non-NO_DECISION rows excluded). recent_empty_rate would see only 1.
+    assert out["starved"] == 3
+    assert out["rate"] == pytest.approx(0.5, abs=1e-6)
+    assert hg.recent_empty_rate(db)["empty"] == 1  # proves the divergence
+
+
+def test_recent_starvation_rate_missing_db_is_safe_default():
+    out = hg.recent_starvation_rate("/nonexistent/path/to/pt.db")
+    assert out == {"n": 0, "starved": 0, "rate": 0.0, "ok": False}
+
+
+# ── pulse() — the operator-facing freeze-cause SSOT ──────────────────────────
+
+def _snap(saturated, reason, opus=1):
+    return {"saturated": saturated, "reason": reason,
+            "probe": {"opus_count": opus}, "recent_empty_rate": {}}
+
+
+def _starv(rate, n=120, ok=True):
+    return {"n": n, "starved": int(round(rate * n)), "rate": rate, "ok": ok}
+
+
+class TestPulse:
+    def test_saturated_wins_regardless_of_log_rate(self):
+        # Probe trips now → SATURATED even if the log rate is 0 (the storm
+        # only just started; no damage recorded yet).
+        out = hg.pulse(
+            _snapshot=_snap(True, "host saturated: 7 concurrent Opus (>4)",
+                            opus=7),
+            _starv=_starv(0.0))
+        assert out["state"] == "SATURATED"
+        # reason carried VERBATIM into the headline (no-drift lock).
+        assert "host saturated: 7 concurrent Opus (>4)" in out["headline"]
+        assert out["opus_count"] == 7
+        assert hg._OPS_ACTION in out["headline"]
+
+    def test_starved_when_probe_clear_but_log_rate_high(self):
+        out = hg.pulse(
+            _snapshot=_snap(False, "host clear"),
+            _starv=_starv(0.40))
+        assert out["state"] == "STARVED"
+        assert "40" in out["headline"] and "never reached" in out["headline"]
+        assert hg._OPS_ACTION in out["headline"]
+
+    def test_clear_when_probe_clear_and_rate_below_floor(self):
+        out = hg.pulse(
+            _snapshot=_snap(False, "host clear"),
+            _starv=_starv(hg.STARVATION_RATE_FLOOR - 0.01))
+        assert out["state"] == "CLEAR"
+        assert out["headline"] == ""
+
+    def test_floor_boundary_is_inclusive(self):
+        # rate == floor → STARVED (>= comparison, locked).
+        out = hg.pulse(
+            _snapshot=_snap(False, "host clear"),
+            _starv=_starv(hg.STARVATION_RATE_FLOOR))
+        assert out["state"] == "STARVED"
+
+    def test_unreadable_log_never_cries_wolf(self):
+        # Probe clear + starvation probe failed (DB unreadable) → CLEAR, even
+        # though rate reads as 0.0 it must not be trusted as "high" nor as a
+        # false STARVED. ok=False is the gate.
+        out = hg.pulse(
+            _snapshot=_snap(False, "host clear"),
+            _starv={"n": 0, "starved": 0, "rate": 0.0, "ok": False})
+        assert out["state"] == "CLEAR"
+        assert out["headline"] == ""
+
+    def test_saturated_survives_unreadable_log(self):
+        # A live probe trip must still report SATURATED even when the decision
+        # log is unreadable (the most important case: dashboard/DB wedged).
+        out = hg.pulse(
+            _snapshot=_snap(True, "host saturated: swap 95% (>90%)"),
+            _starv={"n": 0, "starved": 0, "rate": 0.0, "ok": False})
+        assert out["state"] == "SATURATED"
+        assert "swap 95% (>90%)" in out["headline"]
+
+    def test_degrade_safe_never_raises(self):
+        class Boom(dict):
+            def get(self, *a, **k):
+                raise RuntimeError("probe blew up")
+
+        out = hg.pulse(_snapshot=Boom(), _starv=_starv(0.0))
+        assert out["state"] == "CLEAR"
+        assert out["headline"] == ""
+
+    def test_real_path_is_inert_under_pytest(self):
+        # No injectors + running under pytest → deterministic, offline CLEAR
+        # (the _swr_active offline-invariant precedent). This is what the
+        # broad reporter integration tests rely on so a saturated CI box
+        # can't inject a host-state-dependent line into asserted bodies.
+        out = hg.pulse(db_path="/nonexistent/pt.db")
+        assert set(out) == {
+            "state", "headline", "saturated", "reason",
+            "starvation_rate_pct", "starvation_n", "starvation_ok",
+            "opus_count"}
+        assert out["state"] == "CLEAR"
+        assert out["headline"] == ""
+
+    def test_force_flag_overrides_pytest_inertness(self, monkeypatch):
+        # A dedicated test can opt back into the real path via the force
+        # flag (the _SWR_TEST_FORCE precedent); with a nonexistent DB the
+        # probe still degrades safely and never raises.
+        monkeypatch.setattr(hg, "_PULSE_TEST_FORCE", True)
+        out = hg.pulse(db_path="/nonexistent/pt.db")
+        assert out["state"] in ("CLEAR", "STARVED", "SATURATED")
+        assert out["starvation_ok"] is False  # nonexistent DB → safe default

@@ -8398,6 +8398,15 @@ def host_guard_api():
         except Exception:
             pass
         snap["recent_skip_rate"] = skip
+        # Additive `pulse` key — the operator-facing freeze-cause SSOT
+        # (host_guard.pulse). The SAME dict the Discord _host_pulse_line
+        # reads, so the dashboard panel / analyst can never drift from the
+        # Discord verdict (the tail_risk / stress_scenarios additive-key
+        # precedent). Degrade-safe by construction; the outer try still guards.
+        try:
+            snap["pulse"] = host_guard.pulse()
+        except Exception:
+            snap["pulse"] = {"state": "CLEAR", "headline": ""}
         return jsonify(snap)
     except Exception as e:
         return jsonify({"error": str(e)}), 500

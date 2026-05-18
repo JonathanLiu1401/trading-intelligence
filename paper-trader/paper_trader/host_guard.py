@@ -62,6 +62,38 @@ DEFAULT_MIN_MEM_AVAIL_MB = 400
 DEFAULT_MAX_SWAP_USED_PCT = 90.0
 DEFAULT_LOAD_PER_CPU = 4.0
 
+# `pulse()` state floor: fraction of recent decisions that must be a
+# starvation NO_DECISION (timeout/empty *or* deliberately-skipped) for the
+# verdict to read STARVED while the live /proc probe itself reads clear (an
+# intermittent storm — the box has calmed but the decision log still carries
+# the damage). Healthy is ~0.0; 25% is unambiguously abnormal. A module
+# constant so tests read it instead of hardcoding the window (the
+# digital-intern "tests read live module constants" discipline).
+STARVATION_RATE_FLOOR = 0.25
+
+# The two reasoning prefixes that mean "this cycle never produced an Opus
+# decision because the host was overloaded". They are DISTINCT and counting
+# only the first silently under-reports the live pathology:
+#   * the OLD prefix is written by strategy.decide() when the Opus call ran
+#     but returned empty / timed out (the box saturated mid-call);
+#   * the NEW prefix is written when the pre-flight / mid-call host-saturation
+#     guard *declined* the call (paper_trader/host_guard.host_saturated). Once
+#     that guard is live a storm produces FEWER "no response" rows and MORE
+#     "skipped" rows — so `recent_empty_rate` (old prefix only) collapses
+#     toward zero precisely when saturation is worst. `pulse()` must key off
+#     BOTH (see /api/host-guard's docstring on the same trap).
+_STARVATION_PREFIXES = ("claude returned no response", "skipped claude call")
+
+# `pulse()` is inert under pytest unless a dedicated test opts in — the
+# `dashboard._swr_active()` / runner `_STATE_PATH` offline-invariant precedent.
+# The real path reads live /proc + the live WAL `paper_trader.db`; if it ran
+# during the broad reporter integration tests it would (a) inject a
+# host-state-dependent line into asserted Discord bodies and (b) break the
+# "all tests offline & deterministic" invariant. Dedicated tests pass the
+# `_snapshot`/`_starv` injectors (deterministic by construction — not gated)
+# or flip `_PULSE_TEST_FORCE`; everything else gets a clean CLEAR.
+_PULSE_TEST_FORCE = False  # dedicated pulse tests flip this; never in prod
+
 
 def _read_text(path: str) -> str:
     try:
@@ -241,6 +273,44 @@ def recent_empty_rate(db_path: str | os.PathLike | None = None,
     return out
 
 
+def recent_starvation_rate(db_path: str | os.PathLike | None = None,
+                            limit: int = 120) -> dict:
+    """Read-only: fraction of the last ``limit`` live decisions that were a
+    host-starvation NO_DECISION — counting **both** the timeout/empty signature
+    AND the new deliberately-skipped signature (see ``_STARVATION_PREFIXES``).
+
+    This is the figure ``pulse()`` keys its STARVED verdict off. It deliberately
+    supersedes ``recent_empty_rate`` (old prefix only) because once the
+    pre-flight guard is live the empty-only rate falls toward zero exactly when
+    the box is most saturated — the skip bucket merely absorbs it. Same
+    degrade-safe contract: ``ok=False`` on any error so a caller still gets a
+    verdict (the ``recent_empty_rate`` precedent)."""
+    path = str(db_path) if db_path is not None else str(_DEFAULT_DB)
+    out = {"n": 0, "starved": 0, "rate": 0.0, "ok": False}
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = conn.execute(
+                "SELECT action_taken, reasoning FROM decisions "
+                "ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return out
+    n = len(rows)
+    starved = sum(
+        1
+        for a, r in rows
+        if (a or "") == "NO_DECISION"
+        and (r or "").startswith(_STARVATION_PREFIXES)
+    )
+    out.update(n=n, starved=starved,
+               rate=round(starved / n, 3) if n else 0.0, ok=True)
+    return out
+
+
 def snapshot(db_path: str | os.PathLike | None = None) -> dict:
     """Full degrade-safe report: probe + verdict + recent empty-rate."""
     p = probe()
@@ -251,6 +321,108 @@ def snapshot(db_path: str | os.PathLike | None = None) -> dict:
         "probe": p,
         "recent_empty_rate": recent_empty_rate(db_path),
     }
+
+
+# Action discriminator appended to every non-CLEAR pulse headline. It names
+# the *opposite class* of remediation from _capital_pulse_line's
+# ``unlock — sell {ticker}``: capital-paralysis the bot can fix by trading;
+# host-saturation it provably cannot — the fix is reducing the out-of-band
+# Opus load (review / backtest agents). Stacking the two Discord lines without
+# this discriminator invites the operator to read a host freeze as "the bot
+# needs to sell something", the exact misattribution this feature closes.
+_OPS_ACTION = ("ops — reduce concurrent Opus (review/backtest agents); "
+               "the bot cannot resolve this by trading")
+
+
+def pulse(db_path: str | os.PathLike | None = None,
+          *,
+          _snapshot: dict | None = None,
+          _starv: dict | None = None) -> dict:
+    """Single source of truth for "is the desk frozen because the *box* is
+    overloaded right now?" — the operator-facing fusion of the live /proc
+    probe and the observed starvation rate.
+
+    Distinct from ``snapshot()`` (raw signals) and from ``capital_paralysis``
+    (the desk can't act because it's ~98% deployed — a *trading* fix). This
+    answers the question those two can't: a 27 h NO_DECISION drought bleeding
+    alpha can be host-saturation (Opus never ran — an OPS fix the bot cannot
+    take) even while the book also reads capital-pinned. Surfacing only the
+    capital story sends the operator to sell a position when the real fix is
+    killing the parallel Opus jobs.
+
+    State ladder (the discriminating logic, all test-locked):
+      * ``SATURATED`` — the live /proc probe trips now (storm in flight);
+        wins regardless of the decision-log rate.
+      * ``STARVED``   — probe reads clear now BUT ≥ ``STARVATION_RATE_FLOOR``
+        of recent decisions never reached Opus (intermittent storm; the
+        damage is in the log even though the box just calmed).
+      * ``CLEAR``     — neither (nothing actionable → the caller suppresses).
+
+    ``reason`` is carried **verbatim** from ``snapshot()`` (single source of
+    truth — the SATURATED headline embeds it, so this surface, the CLI and
+    ``/api/host-guard`` can never drift). Probe-failure reads as "unknown →
+    not saturated" and a DB-unreadable starvation probe (``ok=False``) never
+    trips STARVED — the ``host_saturated`` mem==0 / ``recent_empty_rate``
+    safe-default precedent (never cry wolf on a probe failure). Fully
+    degrade-safe: any internal fault → a CLEAR/empty verdict, never raises
+    (the module-wide contract). ``_snapshot``/``_starv`` inject deterministic
+    readings for tests (the ``host_saturated(_probe=…)`` precedent)."""
+    base = {
+        "state": "CLEAR",
+        "headline": "",
+        "saturated": False,
+        "reason": "",
+        "starvation_rate_pct": 0.0,
+        "starvation_n": 0,
+        "starvation_ok": False,
+        "opus_count": 0,
+    }
+    # Inert under pytest on the real path (no injectors, not force-flagged):
+    # the broad reporter integration tests call _host_pulse_line() →
+    # pulse() with no injectors and MUST see a deterministic, offline CLEAR
+    # (the _swr_active precedent). Injector-driven and force-flagged calls
+    # are deterministic by construction and proceed.
+    if (_snapshot is None and _starv is None and not _PULSE_TEST_FORCE
+            and os.environ.get("PYTEST_CURRENT_TEST")):
+        return base
+
+    try:
+        snap = _snapshot if _snapshot is not None else snapshot(db_path)
+        starv = _starv if _starv is not None else recent_starvation_rate(
+            db_path)
+
+        sat = bool(snap.get("saturated"))
+        reason = str(snap.get("reason") or "")
+        opus = int((snap.get("probe") or {}).get("opus_count", 0) or 0)
+        s_ok = bool(starv.get("ok"))
+        s_rate = float(starv.get("rate", 0.0) or 0.0)
+        s_n = int(starv.get("n", 0) or 0)
+        s_pct = round(s_rate * 100.0, 1)
+
+        base.update(saturated=sat, reason=reason, opus_count=opus,
+                    starvation_rate_pct=s_pct, starvation_n=s_n,
+                    starvation_ok=s_ok)
+
+        if sat:
+            base["state"] = "SATURATED"
+            tail = ""
+            if s_ok and s_n:
+                tail = (f"; {s_pct:.0f}% of the last {s_n} decisions never "
+                        f"reached Opus")
+            base["headline"] = (
+                f"Opus is starved by the box — {reason}{tail}. The desk is "
+                f"frozen by host load, not the market or capital — "
+                f"{_OPS_ACTION}.")
+        elif s_ok and s_rate >= STARVATION_RATE_FLOOR:
+            base["state"] = "STARVED"
+            base["headline"] = (
+                f"{s_pct:.0f}% of the last {s_n} decisions never reached "
+                f"Opus (timeout/skip) though the box reads clear now — "
+                f"intermittent host starvation, {_OPS_ACTION}.")
+        # else: CLEAR — base already correct, headline stays "".
+        return base
+    except Exception:
+        return base
 
 
 def main(argv: list[str] | None = None) -> int:

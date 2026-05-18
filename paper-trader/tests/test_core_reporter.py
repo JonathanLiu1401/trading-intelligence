@@ -630,6 +630,90 @@ class TestPortfolioLines:
         out = reporter._portfolio_lines(rows)
         assert all("STALE" not in ln.upper() for ln in out)
 
+    def test_pct_weight_appended_when_total_value_passed(self):
+        # The live hourly/daily callers pass pf['total_value']; the position
+        # line must then carry the position's own return % AND its book
+        # weight, without dropping any of the prior raw fields.
+        positions = [{
+            "ticker": "AMD", "type": "stock", "qty": 5,
+            "avg_cost": 100.0, "current_price": 110.0, "unrealized_pl": 50.0,
+        }]
+        line = reporter._portfolio_lines(positions, total_value=1000.0)[0]
+        # raw fields still present (backward compat)
+        assert "AMD" in line and "100.00" in line and "+50.00" in line
+        # +10% return, 5*110/1000 = 55% of book
+        assert "+10.0%" in line
+        assert "55% bk" in line
+
+    def test_pct_only_when_no_total_value(self):
+        # Default (no total) → return % only, no weight token (keeps the
+        # existing unit-test callers byte-compatible on the weight axis).
+        positions = [{
+            "ticker": "AMD", "type": "stock", "qty": 5,
+            "avg_cost": 100.0, "current_price": 110.0, "unrealized_pl": 50.0,
+        }]
+        line = reporter._portfolio_lines(positions)[0]
+        assert "+10.0%" in line
+        assert "bk" not in line
+
+
+class TestPosPctWeight:
+    """`_pos_pct_weight` — pure per-position return% + book-weight token."""
+
+    def test_canonical_format_locked(self):
+        p = {"ticker": "AMD", "type": "stock", "qty": 5,
+             "avg_cost": 100.0, "current_price": 110.0}
+        assert reporter._pos_pct_weight(p, 1000.0) == "  (+10.0% · 55% bk)"
+
+    def test_negative_return_live_lite_shape(self):
+        # The live 2026-05-18 LITE position: 0.61 @ 980.90, mark 872.77,
+        # book $900.84 → −11.0% and 59% of the entire book.
+        p = {"ticker": "LITE", "type": "stock", "qty": 0.61,
+             "avg_cost": 980.8971727591637, "current_price": 872.77001953125}
+        tok = reporter._pos_pct_weight(p, 900.8433966064453)
+        assert "-11.0%" in tok
+        assert "59% bk" in tok
+
+    def test_stale_mark_suppresses_pct_but_keeps_weight(self):
+        # stale ⇒ mark == cost; a "+0.0%" next to the STALE flag would lie.
+        p = {"ticker": "MU", "type": "stock", "qty": 5,
+             "avg_cost": 100.0, "current_price": 100.0, "stale_mark": True}
+        tok = reporter._pos_pct_weight(p, 1000.0)
+        assert "%" in tok and "+0.0%" not in tok and "-0.0%" not in tok
+        assert "50% bk" in tok  # 5*100/1000
+
+    def test_zero_avg_cost_suppresses_pct(self):
+        p = {"ticker": "X", "type": "stock", "qty": 1,
+             "avg_cost": 0.0, "current_price": 10.0}
+        assert reporter._pos_pct_weight(p, None) == ""
+
+    def test_option_weight_uses_100x_multiplier(self):
+        # 2 calls @ $5 → mark $7: +40% premium move, notional 7*2*100=1400.
+        p = {"ticker": "NVDA", "type": "call", "qty": 2,
+             "avg_cost": 5.0, "current_price": 7.0,
+             "strike": 600.0, "expiry": "2026-12-19"}
+        tok = reporter._pos_pct_weight(p, 2000.0)
+        assert "+40.0%" in tok
+        assert "70% bk" in tok  # 1400/2000
+
+    def test_nonpositive_total_drops_weight(self):
+        p = {"ticker": "AMD", "type": "stock", "qty": 5,
+             "avg_cost": 100.0, "current_price": 110.0}
+        assert reporter._pos_pct_weight(p, 0.0) == "  (+10.0%)"
+        assert reporter._pos_pct_weight(p, -5.0) == "  (+10.0%)"
+
+    def test_nan_current_price_degrades_to_empty(self):
+        p = {"ticker": "AMD", "type": "stock", "qty": 5,
+             "avg_cost": 100.0, "current_price": float("nan")}
+        assert reporter._pos_pct_weight(p, 1000.0) == ""
+
+    def test_sub_one_percent_weight_keeps_one_decimal(self):
+        # A tiny tail position must not round to "0% bk" (invisible).
+        p = {"ticker": "T", "type": "stock", "qty": 1,
+             "avg_cost": 4.0, "current_price": 5.0}
+        tok = reporter._pos_pct_weight(p, 1000.0)  # 5/1000 = 0.5%
+        assert "0.5% bk" in tok
+
 
 class TestClassifyDecisionOutcome:
     """`decisions.action_taken` is free text (AGENTS.md invariant #11).
@@ -1473,3 +1557,102 @@ class TestFmtTradeStamp:
         # 2-day-old fill can no longer be misread as today's.
         assert "05-16 09:38 · 2d ago" in body
         assert "BUY 0.5 MU @ $724.12" in body
+
+
+class TestHostPulseLine:
+    """`_host_pulse_line` + its hourly/daily wiring — the #1 live-pathology
+    operator surface. A 27 h host-saturation NO_DECISION drought bleeding
+    -5.87% alpha was invisible from Discord, and the capital-pulse line that
+    DID reach Discord misframed it as a sell-to-unfreeze problem. The
+    operator lives in Discord."""
+
+    _SAT = {
+        "state": "SATURATED",
+        "headline": ("Opus is starved by the box — host saturated: 7 "
+                     "concurrent Opus (>4). The desk is frozen by host "
+                     "load, not the market or capital — ops — reduce "
+                     "concurrent Opus (review/backtest agents); the bot "
+                     "cannot resolve this by trading."),
+    }
+    _CLEAR = {"state": "CLEAR", "headline": ""}
+
+    def test_empty_when_clear(self, monkeypatch):
+        from paper_trader import host_guard
+        monkeypatch.setattr(host_guard, "pulse", lambda *a, **k: self._CLEAR)
+        assert reporter._host_pulse_line() == ""
+
+    def test_surfaces_saturated_verbatim(self, monkeypatch):
+        from paper_trader import host_guard
+        monkeypatch.setattr(host_guard, "pulse", lambda *a, **k: self._SAT)
+        line = reporter._host_pulse_line()
+        assert line.startswith("**HOST** ◈ SATURATED")
+        # Headline carried VERBATIM (single source of truth — no re-derive).
+        assert self._SAT["headline"] in line
+        # The OPS discriminator that stops the operator conflating this with
+        # a capital-paralysis "sell something" fix.
+        assert "the bot cannot resolve this by trading" in line
+
+    def test_surfaces_starved(self, monkeypatch):
+        from paper_trader import host_guard
+        monkeypatch.setattr(host_guard, "pulse", lambda *a, **k: {
+            "state": "STARVED", "headline": "44% never reached Opus, ops fix"})
+        line = reporter._host_pulse_line()
+        assert line == "**HOST** ◈ STARVED\n> 44% never reached Opus, ops fix"
+
+    def test_degrades_to_empty_on_pulse_fault(self, monkeypatch):
+        from paper_trader import host_guard
+
+        def _boom(*a, **k):
+            raise RuntimeError("host_guard.pulse blew up")
+
+        monkeypatch.setattr(host_guard, "pulse", _boom)
+        # Additive failure contract: a fault drops THIS line, never raises.
+        assert reporter._host_pulse_line() == ""
+
+    def test_hourly_summary_host_before_capital(self, fresh_store,
+                                                monkeypatch):
+        """The load-bearing ORDER: a top-down Discord read must hit the
+        non-trading-fixable HOST cause before the CAPITAL one (both can be
+        independently true; neither suppresses the other)."""
+        from paper_trader import host_guard
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse", lambda *a, **k: self._SAT)
+        # Force the capital line to also emit so the ordering is observable.
+        monkeypatch.setattr(reporter, "_capital_pulse_line",
+                            lambda store: "**CAPITAL** ◈ PINNED\n> ~98% deployed")
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**HOST** ◈ SATURATED" in body
+        assert "**CAPITAL** ◈ PINNED" in body
+        assert body.index("**HOST**") < body.index("**CAPITAL**")
+        # Pre-existing summary intact alongside the new line.
+        assert "**HOURLY**" in body and "Equity" in body
+
+    def test_hourly_summary_silent_when_clear(self, fresh_store, monkeypatch):
+        from paper_trader import host_guard
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse", lambda *a, **k: self._CLEAR)
+        assert reporter.send_hourly_summary() is True
+        assert "**HOST**" not in captured[0]
+
+    def test_daily_close_includes_host(self, fresh_store, monkeypatch):
+        from paper_trader import host_guard
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse", lambda *a, **k: self._SAT)
+        assert reporter.send_daily_close() is True
+        assert "**HOST** ◈ SATURATED" in captured[0]
