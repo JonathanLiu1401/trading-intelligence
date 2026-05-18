@@ -134,7 +134,23 @@ bash /home/zeph/digital-intern/healthcheck.sh
 
 The daemon takes a singleton lock at `data/daemon.lock` — a second process waits for the first to
 exit. Workers are supervised: 3+ crashes in 5 min → degraded (slow respawn); 10+ → disabled for 30
-min. Discord alerts fire on state transitions only.
+min. Discord alerts fire on state transitions only. **Caveat (load-bearing):** the supervisor only
+*respawns* threads that have **exited** (`if t.is_alive(): continue`). A worker that is *alive but
+wedged* (blocked indefinitely on the shared `_store_lock` / sqlite `busy_timeout` under heavy
+lock-contention) is flagged DEAD in `logs/supervisor_state.json` but is **never respawned and only
+WARNING-logged** — observed live 2026-05-18 (the `alert` worker hung 25+ min, daemon otherwise
+healthy, analyst got zero indication breaking-news delivery had stopped).
+
+External watchdog (independent of the daemon, so it survives a wedged supervisor):
+```sh
+python3 scripts/alert_pipeline_watchdog.py            # check once + escalate to Discord
+python3 scripts/alert_pipeline_watchdog.py --dry-run  # print, do not post
+```
+It reads only `logs/supervisor_state.json` (+ its own throttle file — DB-free, no invariant
+surface) and pages Discord when a critical worker (`alert`/`scorer`/`heartbeat`) is DEAD/hung or
+the snapshot itself is missing/stale (daemon down or crash-looping). Run it on a ~2-5 min cron /
+systemd-timer cadence. Pure `evaluate()` core is unit-tested in
+`tests/test_alert_pipeline_watchdog.py`.
 
 Dashboard runs on `:8080` (Flask). `WEB_SERVER_PORT` env overrides the bind port.
 
@@ -1173,3 +1189,58 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   reader-decoration work is excluded from the commit yet preserved, unstaged,
   in the working tree); pathspec-scoped to exactly the two intended files,
   never `git add -A`.
+
+- **2026-05-18 (hybrid pass 2)** — debug + feature + analyst-validation.
+  **Phase 1: bugs_fixed=1, commit `ff80e65`** — `watchers/alert_dedup.py`
+  `dedupe_urgent` winner branch carried the displaced representative's id via
+  the hard subscript `cur["_id"]` while the loser branch and `alerted_ids()`
+  both guard with `.get()`. A non-canonical urgent row (manual replay, or a
+  dict carrying `url` not `link` — the alias `_fmt`/`_is_synthetic` already
+  tolerate) with no `_id` raised `KeyError`; `send_urgent_alert`'s broad
+  `except` then swallowed it, dropping the WHOLE urgent batch and marking
+  nothing alerted — urgent alerts silently fail that cycle (same failure class
+  the `_fmt` defensive-access comment documents). A present `_id=None` leaked
+  `None` into `_dup_ids`→`alerted_ids`→`mark_alerted_batch`'s `WHERE id=?`.
+  Fixed symmetrically; canonical behaviour byte-identical; pre-fix
+  `KeyError('_id')` empirically reproduced. +3 tests
+  (`TestWinnerBranchIdRobustness` in clean `tests/test_alert_dedup.py`).
+  **Phase 2: feature, commit `9014fa5`** — `scripts/alert_pipeline_watchdog.py`,
+  an independent process that converts the silent hung-worker outage into a
+  Discord page. Grounded in live evidence: the `alert` worker pinged once at
+  the 01:15 daemon boot then never again for 25+ min while 29 other workers
+  stayed healthy; the supervisor cannot respawn a still-`is_alive()` wedged
+  thread, so the analyst's breaking-news channel went silent with only one
+  WARNING line. Watchdog reads only `logs/supervisor_state.json` (+ own
+  throttle file) → pages when `alert`/`scorer`/`heartbeat` are DEAD/hung or
+  the snapshot is missing/stale (daemon down / crash-looping); survives a
+  wedged in-process supervisor (today's exact failure). Throttled (anchored to
+  incident start), recovery notices, pure `evaluate()` core. DB-free → all
+  four invariants intact by construction. `--dry-run` validated live: it
+  correctly detected the real wedged `alert` worker. +12 tests
+  (`tests/test_alert_pipeline_watchdog.py`). Suite: **420 passed** (405
+  baseline + 3 + 12); `storage`/`ml.features`/`ml.model` imports OK.
+  **Phase 3 findings (analyst lens):** (1) **CRITICAL — hung `alert` worker /
+  no recovery / no escalation** (the Phase-2 driver; supervisor `is_alive()`
+  gap is architectural, not a single fixable line). (2) **Daemon restart
+  crash-loop** — ~18 restarts in 26 min (00:49–01:15 UTC, documented OOM
+  churn) then stabilised; each restart resets worker liveness and starves the
+  5h heartbeat cadence. (3) **DB lock-retry exhaustion** —
+  `update_ml_scores_batch` + `insert_batch` exhausted the 5-retry budget at
+  00:10 UTC → a scored batch and a collected batch dropped; corroborates the
+  sibling agents' in-flight reader-`_retry_on_lock` work (left unstaged). A
+  read-only `SELECT COUNT(*)` also blocked >15 s — severe contention on the
+  1.4 GB DB. (4) **Alert noise** — recent `urgency=2` rows include legit
+  signals (SEC 8-K NVIDIA, GDELT Samsung HBM4) but also lone
+  `reddit/r/Daytrading` "Trading ideas for Monday – LITE or MU?" (score 8.0)
+  and `reddit/r/ValueInvesting` (9.8) that the `cred<0.45` lone gate should
+  have suppressed — possible gap or pre-gate rows; noted, not chased. (5)
+  **Briefing quality: GOOD** — the 20:31 UTC digest is exact, well-formed and
+  genuinely actionable (CPI/10Y/semis LEAD, portfolio P&L, semis pulse); the
+  consumer experience is strong when the pipeline is healthy. *Pre-existing,
+  deliberately never staged* (consistent with prior entries):
+  `collectors/rss_collector.py`, `daemon.py`, `storage/article_store.py`
+  reader-`_retry_on_lock`, `scripts/export_training_data.py`,
+  `tests/test_article_store.py`, untracked `collectors/fred_collector.py` /
+  `scripts/stale_source_alerter.py`, all `paper-trader/*`, `logs/*.tmp`. My
+  four files were clean before edit; commits pathspec-scoped, never
+  `git add -A`.
