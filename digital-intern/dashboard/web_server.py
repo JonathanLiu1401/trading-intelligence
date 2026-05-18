@@ -186,6 +186,69 @@ def _tail_risk_chat_lines(an: dict) -> list[str]:
     ]
 
 
+_BC_REAL_VERDICTS = (
+    "MLP_ADDS_SKILL", "MLP_NO_BETTER_THAN_TRIVIAL", "MLP_WORSE_THAN_TRIVIAL",
+)
+
+
+def _baseline_compare_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/baseline-compare` (the read-only OOS-skill
+    diagnostic — does the 17-feature DecisionScorer beat a one-line rule out
+    of sample, or is its sizing nudge noise?) as compact chat-context lines.
+
+    SSOT (paper-trader invariant #10): the module's own ``hint`` string is
+    composed **verbatim** — no chat-side re-derived verdict that could drift
+    from the trader endpoint.
+
+    Pure / total — exactly the ``_tail_risk_chat_lines`` contract:
+
+    - non-dict, missing/unknown ``verdict`` → ``[]`` (block omitted, never
+      an exception into the chat handler)
+    - ``INSUFFICIENT_DATA`` → ONE honest withheld line; ``hint`` is **not**
+      surfaced (the never-raises trader endpoint stuffs an exception/stack
+      string into ``hint`` on fault — that must never reach the analyst)
+    - a real verdict → the verdict headline + the module's verbatim ``hint``
+      + (when finite) the scale-invariant rank-IC race a quant checks; any
+      missing numeric simply drops that one line, never raises
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    if verdict == "INSUFFICIENT_DATA":
+        return [
+            "ML gate skill (OOS): insufficient out-of-sample history — "
+            "verdict withheld."
+        ]
+    if verdict not in _BC_REAL_VERDICTS:
+        return []
+
+    def _num(v):
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    n = rep.get("n")
+    n_s = f", n={n}" if isinstance(n, int) else ""
+    lines = [f"ML gate skill (OOS{n_s}): {verdict}"]
+
+    hint = rep.get("hint")
+    if isinstance(hint, str) and hint.strip():
+        lines.append(f"  {hint}")          # verbatim SSOT — invariant #10
+
+    mlp = rep.get("mlp") if isinstance(rep.get("mlp"), dict) else {}
+    mlp_ic = _num(mlp.get("rank_ic"))
+    best_ic = _num(rep.get("best_baseline_ic"))
+    gap = _num(rep.get("ic_gap"))
+    if mlp_ic is not None and best_ic is not None and gap is not None:
+        best = rep.get("best_baseline") or "?"
+        n_train = rep.get("n_train")
+        nt = (f"; scorer n_train={n_train}"
+              if isinstance(n_train, int) else "")
+        lines.append(
+            f"  MLP rank_ic {mlp_ic:+.3f} vs best one-liner "
+            f"'{best}' {best_ic:+.3f} (gap {gap:+.3f}){nt}"
+        )
+    return lines
+
+
 def _behavioural_chat_lines(scorecard, paralysis, churn) -> list[str]:
     """Render the paper-trader's own self-review verdicts
     (``/api/scorecard``, ``/api/capital-paralysis``, ``/api/churn``) as
@@ -1672,6 +1735,29 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: behavioural fetch failed: %s", e)
 
+        # ML-gate honesty — does the 17-feature DecisionScorer that modulates
+        # the bot's live position sizing (invariant #5) actually beat a
+        # one-line rule OUT OF SAMPLE, or is its nudge noise? Previously this
+        # truth lived only in `python3 -m paper_trader.ml.baseline_compare`
+        # (a CLI no operator runs) — the analytics endpoints the chat already
+        # pulls report the IN-SAMPLE story that flatters the net. Surfacing
+        # it here lets the analyst answer "is the bot's ML edge real?"
+        # honestly. Composed verbatim by the pure _baseline_compare_chat_lines
+        # helper (unit-tested; SSOT — no re-derived verdict). Guarded 3s read
+        # like every sibling; only appears once :8090 is restarted onto the
+        # endpoint — a stale/absent trader silently omits the block.
+        baseline_compare_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/baseline-compare",
+                    timeout=3) as resp:
+                _bc = json.loads(resp.read().decode("utf-8"))
+            baseline_compare_block = "\n".join(
+                _baseline_compare_chat_lines(_bc))
+        except Exception as e:
+            _logger().warning("chat: baseline-compare fetch failed: %s", e)
+
         # Earnings radar — scheduled gap risk on the paper trader's holdings.
         # Lets the chat warn "you hold NVDA and it prints in 4 days".
         earnings_block = ""
@@ -1776,6 +1862,7 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — WHAT MATERIALLY CHANGED SINCE YOU LAST LOOKED (ranked, last 6h):\n{session_delta_block}\n\n" if session_delta_block else "")
             + (f"PAPER TRADER ANALYTICS:\n{analytics_block}\n\n" if analytics_block else "")
             + (f"PAPER TRADER — BEHAVIOURAL DIAGNOSIS (the bot's own self-review verdicts):\n{behavioural_block}\n\n" if behavioural_block else "")
+            + (f"PAPER TRADER — ML GATE HONESTY (does the DecisionScorer that modulates the bot's live position sizing beat a one-line rule OUT OF SAMPLE? the analytics above report the flattering in-sample story; this is the generalization-relevant verdict):\n{baseline_compare_block}\n\n" if baseline_compare_block else "")
             + (f"PAPER TRADER — PRIORITISED ACTION PLAN (the bot's own next-session game plan):\n{game_plan_block}\n\n" if game_plan_block else "")
             + (f"PAPER TRADER — HOLD-DISCIPLINE ALERT (a losing position overstayed past the desk's own median losing-cut):\n{hold_discipline_block}\n\n" if hold_discipline_block else "")
             + (f"PAPER TRADER OPTIONS GREEKS (Black-Scholes, live IV):\n{greeks_block}\n\n" if greeks_block else "")

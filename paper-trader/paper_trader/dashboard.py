@@ -1511,6 +1511,22 @@ TEMPLATE = r"""
       <div class="muted" id="dr-mode" style="font-size:12px;">—</div>
     </div>
 
+    <!-- ─── ML gate edge — does the 17-feature DecisionScorer beat a one-liner OUT OF SAMPLE? (new 2026-05-18, agent 4 / feature-dev) ─── -->
+    <div class="card" id="bc-card" style="margin-bottom:18px;">
+      <h2 style="display:flex;justify-content:space-between;align-items:center;">
+        <span>ML gate edge <span class="muted" style="font-size:11px;text-transform:none;letter-spacing:normal;font-weight:normal;">— does the DecisionScorer earn its complexity OUT OF SAMPLE, or would a one-line rule do?</span></span>
+        <span id="bc-state" style="font-size:12px;padding:3px 10px;border-radius:4px;background:#1f2126;color:#8b929d;">—</span>
+      </h2>
+      <div class="muted" id="bc-headline" style="font-size:12px;margin-bottom:12px;">loading…</div>
+      <div class="stat-row" style="margin-bottom:14px;">
+        <div class="stat"><div class="l">MLP rank-IC (OOS)</div><div class="v" id="bc-mlp">—</div></div>
+        <div class="stat"><div class="l">best one-liner</div><div class="v" id="bc-best">—</div></div>
+        <div class="stat"><div class="l">IC gap (MLP − best)</div><div class="v" id="bc-gap">—</div></div>
+        <div class="stat"><div class="l">OOS pairs / scorer n_train</div><div class="v" id="bc-n">—</div></div>
+      </div>
+      <div class="muted" id="bc-note" style="font-size:11px;">a read-only honesty diagnostic — the gate stays live at n_train ≥ 500 regardless (invariant #5); the value is <em>knowing</em> whether it is modulating real position sizing on signal or on noise.</div>
+    </div>
+
     <!-- ─── Funded suggestions — which idea is fundable, and the sale that funds it (new 2026-05-16, agent 4) ─── -->
     <div class="card" id="fund-card" style="margin-bottom:18px;">
       <h2 style="display:flex;justify-content:space-between;align-items:center;">
@@ -5268,6 +5284,38 @@ async function refreshDecisionReliability() {
                             : "no current-regime failures recorded");
 }
 
+async function refreshBaselineCompare() {
+  const r = await fetchMaybeStale("/api/baseline-compare");
+  if (r.__unavailable) { markStale("bc-state", "bc-headline", "Baseline-compare endpoint"); return; }
+  if (r.error && !r.verdict) { document.getElementById("bc-headline").textContent = "error: " + r.error; return; }
+  const smap = {
+    MLP_ADDS_SKILL:             ["#1b5e20", "#a5d6a7"],
+    MLP_NO_BETTER_THAN_TRIVIAL: ["#b8860b", "#000000"],
+    MLP_WORSE_THAN_TRIVIAL:     ["#b71c1c", "#ffffff"],
+    INSUFFICIENT_DATA:          ["#1f2126", "#8b929d"],
+  };
+  const [bg, fg] = smap[r.verdict] || smap.INSUFFICIENT_DATA;
+  const sEl = document.getElementById("bc-state");
+  sEl.textContent = (r.verdict || "—").replace(/_/g, " ");
+  sEl.style.background = bg; sEl.style.color = fg;
+  document.getElementById("bc-headline").textContent = r.hint || "";
+  const mlp = (r.mlp || {});
+  const mEl = document.getElementById("bc-mlp");
+  mEl.textContent = mlp.rank_ic != null ? fmt(mlp.rank_ic, 3) : "—";
+  // green only once it clears its own real-skill floor (0.10, MLP_IC_MIN)
+  mEl.style.color = mlp.rank_ic == null ? "#8b929d"
+                    : (mlp.rank_ic >= 0.10) ? "#4caf50"
+                    : (mlp.rank_ic > 0) ? "#ffa726" : "#ff4455";
+  document.getElementById("bc-best").textContent =
+    r.best_baseline ? r.best_baseline + " " + (r.best_baseline_ic != null ? fmt(r.best_baseline_ic, 3) : "—") : "—";
+  const gEl = document.getElementById("bc-gap");
+  gEl.textContent = r.ic_gap != null ? (r.ic_gap >= 0 ? "+" : "") + fmt(r.ic_gap, 3) : "—";
+  gEl.style.color = r.ic_gap == null ? "#8b929d" : (r.ic_gap > 0 ? "#4caf50" : "#ff4455");
+  document.getElementById("bc-n").textContent =
+    (r.n != null ? r.n : "—") + " " + (r.slice ? "(" + r.slice + ")" : "") +
+    " / " + (r.n_train != null ? r.n_train : "—");
+}
+
 async function refreshFundedSuggestions() {
   const r = await fetchMaybeStale("/api/funded-suggestions");
   if (r.__unavailable) { markStale("fund-state", "fund-headline", "Funded-suggestions endpoint"); return; }
@@ -5483,6 +5531,7 @@ refreshOpenAttribution();
 refreshFeedHealth();
 refreshRunnerHeartbeat();
 refreshDecisionReliability();
+refreshBaselineCompare();
 refreshFundedSuggestions();
 refreshSignalFollowThrough();
 refreshChurn();
@@ -5516,6 +5565,7 @@ setInterval(refreshDecisionForensics, 60_000);
 setInterval(refreshDecisionDrought, 60_000);
 setInterval(refreshNewsEdge, 300_000);
 setInterval(refreshScorerConfidence, 120_000);
+setInterval(refreshBaselineCompare, 120_000);
 setInterval(refreshDisagreement, 60_000);
 setInterval(refreshDataFeed, 60_000);
 setInterval(refreshValidation, 120_000);
@@ -7860,6 +7910,54 @@ def scorer_confidence_api():
         return jsonify({"error": str(e), "buckets": [], "positions": []}), 500
 
 
+@app.route("/api/baseline-compare")
+@swr_cached("baseline-compare", 90.0)
+def baseline_compare_api():
+    """Does the 17-feature DecisionScorer earn its complexity OUT OF SAMPLE?
+
+    A read-only trust diagnostic (never trains, never touches the pickle or a
+    trade path) that scores the deployed MLP and a handful of one-line rules
+    (raw `ml_score`, momentum carry, RSI/Bollinger mean-reversion) over the
+    scorer's own outcome history, on the **temporal-OOS slice**
+    (`oos_only=True` — the generalization-relevant view, NOT the in-sample
+    one that flatters the net). Two scale-invariant primitives — tie-aware
+    Spearman `rank_ic` and `dir_acc` — decide the verdict:
+
+      MLP_ADDS_SKILL              the net beats every one-liner AND clears its
+                                  own rank-skill floor — complexity justified
+      MLP_NO_BETTER_THAN_TRIVIAL  a single feature carries the same edge —
+                                  the gate's sizing variance (invariant #5)
+                                  is unjustified by anything the MLP uniquely
+                                  contributes
+      MLP_WORSE_THAN_TRIVIAL      a one-liner beats the net outright
+      INSUFFICIENT_DATA           untrained, or < MIN_PAIRS OOS pairs
+
+    This surfaces, on the dashboard and (via the digital-intern chat
+    cross-fetch) in the analyst's mouth, the honesty signal that was
+    previously only reachable through `python3 -m
+    paper_trader.ml.baseline_compare` — a CLI no operator runs. It is a
+    diagnostic, not a recommendation: invariant #5 keeps the gate live at
+    n_train ≥ 500 regardless of this verdict; the value is *knowing* the
+    gate is modulating real position sizing on noise."""
+    try:
+        from .ml.decision_scorer import DecisionScorer
+        from .ml.baseline_compare import scorer_baseline_compare
+
+        scorer = DecisionScorer()
+        outcomes = _load_decision_outcomes()
+        rep = scorer_baseline_compare(scorer, outcomes, oos_only=True)
+        rep.setdefault("n_train", getattr(scorer, "n_train", None))
+        return jsonify(rep)
+    except Exception as e:
+        return jsonify({"error": str(e), "status": "error",
+                        "verdict": "INSUFFICIENT_DATA", "baselines": [],
+                        "mlp": {"rank_ic": None, "dir_acc": None, "n": 0},
+                        "best_baseline": None, "best_baseline_ic": None,
+                        "ic_gap": None, "hint": f"endpoint fault: {e}",
+                        "slice": "oos", "n_records_considered": 0,
+                        "n_train": None}), 200
+
+
 def _parse_action_ticker(action_taken: str) -> tuple[str, str | None]:
     """Pull the (verb, ticker) out of a decisions.action_taken string.
 
@@ -9486,6 +9584,12 @@ def _swr_prewarm():
         ("decision-health", decision_health_api),
         ("runner-heartbeat", runner_heartbeat_api),
         ("scorer-confidence", scorer_confidence_api),
+        ("baseline-compare", baseline_compare_api),
+        # stress-scenarios + watchlist-opportunities were @swr_cached but
+        # never prewarmed (commits 737a2d2 / 6e9c5d8) — same freeze-triage
+        # cold-stall blind spot test_swr_prewarm_coverage.py locks against.
+        ("stress_scenarios", stress_scenarios_api),
+        ("watchlist-opportunities", watchlist_opportunities_api),
     ]
     for name, wrapper in targets:
         try:
