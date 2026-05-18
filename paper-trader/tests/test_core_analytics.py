@@ -183,3 +183,78 @@ class TestCalmarBaseline:
         expected_calmar = round((total_return_pct / years) / 25.0, 2)
         assert expected_calmar == 54.98  # sanity-pin the literal too
         assert data["calmar_ratio"] == expected_calmar
+
+
+class TestTailRiskIntegration:
+    """The /api/analytics payload must carry an additive `tail_risk`
+    block that is byte-identical to calling build_tail_risk on the same
+    day-resampled equity series — the endpoint must not re-derive or
+    drift from the single source of truth, and the additive key must not
+    disturb the existing keyed round-trip assertions.
+    """
+
+    def test_no_equity_history_is_no_data(self, tmp_path, monkeypatch):
+        db = tmp_path / "tr_empty.db"
+        monkeypatch.setattr(store_mod, "DB_PATH", db)
+        monkeypatch.setattr(store_mod, "_singleton", None)
+        s = Store()
+        from paper_trader import dashboard
+        try:
+            with dashboard.app.test_client() as client:
+                data = client.get("/api/analytics").get_json()
+            assert "error" not in data, data
+            # Additive key present; existing metrics untouched.
+            assert "tail_risk" in data
+            assert data["n_round_trips"] == 0
+            tr = data["tail_risk"]
+            assert tr["state"] == "NO_DATA"
+            assert tr["var_95_pct"] is None
+            assert tr["return_skew"] is None
+        finally:
+            s.close()
+
+    def test_endpoint_does_not_drift_from_builder(self, tmp_path, monkeypatch):
+        db = tmp_path / "tr_ok.db"
+        monkeypatch.setattr(store_mod, "DB_PATH", db)
+        monkeypatch.setattr(store_mod, "_singleton", None)
+        s = Store()
+
+        # 22 distinct UTC days → 21 daily returns → tail-risk OK state.
+        values = [1000, 1010, 995, 1005, 980, 1020, 1000, 1030, 1015, 1040,
+                  1025, 1050, 1035, 1060, 1045, 1070, 1055, 1080, 1065, 1090,
+                  1075, 1100]
+        rows = [
+            (f"2026-02-{day:02d}T20:00:00+00:00", float(v), float(v), None)
+            for day, v in enumerate(values, start=1)
+        ]
+        s.conn.executemany(
+            "INSERT INTO equity_curve (timestamp, total_value, cash, sp500_price)"
+            " VALUES (?,?,?,?)",
+            rows,
+        )
+        s.conn.commit()
+        s.update_portfolio(cash=1100.0, total_value=1100.0, positions=[])
+
+        from paper_trader import dashboard
+        from paper_trader.analytics.tail_risk import build_tail_risk
+
+        try:
+            with dashboard.app.test_client() as client:
+                data = client.get("/api/analytics").get_json()
+                tr_endpoint = client.get("/api/tail-risk").get_json()
+            eq = s.equity_curve(5000)
+        finally:
+            s.close()
+
+        assert "error" not in data, data
+        ref = build_tail_risk(eq)
+        # The endpoint payload and the /api/analytics block must both equal
+        # the builder output except for the wall-clock `as_of` field.
+        for got in (data["tail_risk"], tr_endpoint):
+            assert got["state"] == "OK" == ref["state"]
+            assert got["n_returns"] == 21 == ref["n_returns"]
+            for k in ("var_95_pct", "var_99_pct", "cvar_95_pct",
+                      "annualized_vol_pct", "downside_deviation_pct",
+                      "return_skew", "worst_day_pct",
+                      "max_consecutive_down_days", "ulcer_index_pct"):
+                assert got[k] == ref[k], (k, got[k], ref[k])
