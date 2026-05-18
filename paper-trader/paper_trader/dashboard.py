@@ -9379,10 +9379,6 @@ def supervision_api():
             ppid = _os.getppid()
         except Exception:
             ppid = None
-        # PPID==1 ⇒ reparented to init ⇒ not tracked by any service manager
-        # that would restart THIS process. The dashboard runs inside the
-        # runner process, so getppid() is the trader's own parent.
-        orphan = (ppid == 1)
 
         def _systemctl(verb: str) -> str:
             try:
@@ -9399,71 +9395,19 @@ def supervision_api():
         unit_enabled = _systemctl("is-enabled")  # enabled|disabled|static|unknown
 
         head, behind = _head_sha_and_behind()
-        stale = bool(_BOOT_SHA and head and head != _BOOT_SHA)
 
-        # "supervised" = this process WILL be auto-restarted if it exits.
-        # An orphan (PPID 1) never will, whatever the unit says. Otherwise
-        # require the unit active AND enabled (Restart=always in force).
-        # Unreadable systemctl on a non-orphan ⇒ supervision indeterminate.
-        if orphan:
-            supervised: bool | None = False
-        elif unit_active == "unknown" or unit_enabled == "unknown":
-            supervised = None
-        else:
-            supervised = (unit_active == "active"
-                          and unit_enabled == "enabled")
-
-        if supervised is None:
-            verdict = "UNKNOWN"
-            recommendation = (
-                "Could not read systemd user state from inside the process "
-                "(user bus may be unreachable). Verify manually: "
-                "`systemctl --user is-active paper-trader; "
-                "systemctl --user is-enabled paper-trader`.")
-        elif supervised:
-            if stale:
-                verdict = "STALE"
-                recommendation = (
-                    f"Supervised but running old code (boot {_BOOT_SHA} vs "
-                    f"head {head}, behind {behind}). `systemctl --user "
-                    "restart paper-trader` to deploy the committed fixes.")
-            else:
-                verdict = "HEALTHY"
-                recommendation = "Supervised and current — no action."
-        else:
-            if stale:
-                verdict = "UNSUPERVISED_STALE"
-                recommendation = (
-                    f"NO restart safety net AND on old code (boot "
-                    f"{_BOOT_SHA} vs head {head}, behind {behind}). This is "
-                    "an orphan / un-managed run; the moment its git-watcher "
-                    "or deadman does os._exit(0) the trader stays DOWN. "
-                    "Re-attach supervision: `systemctl --user enable --now "
-                    "paper-trader` (it boots on current code).")
-            else:
-                verdict = "UNSUPERVISED"
-                recommendation = (
-                    "Running current code but with NO restart safety net "
-                    "(orphan / unit not active+enabled). A clean exit "
-                    "(git-watcher restart, deadman) or crash leaves the "
-                    "trader DOWN. `systemctl --user enable --now "
-                    "paper-trader`.")
-
-        return jsonify({
-            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "service": "paper_trader",
-            "pid": pid,
-            "ppid": ppid,
-            "orphan": orphan,
-            "systemd": {"active": unit_active, "enabled": unit_enabled},
-            "boot_sha": _BOOT_SHA,
-            "head_sha": head,
-            "behind": behind,
-            "stale": stale,
-            "supervised": supervised,
-            "verdict": verdict,
-            "recommendation": recommendation,
-        })
+        # Single source of truth for the verdict/recommendation strings and
+        # the orphan/stale/supervised derivation (invariant #10): the pure
+        # builder is also composed verbatim by the hourly/daily Discord
+        # `_supervision_line`, so the two operator surfaces can never drift.
+        # The impure probes (pid/ppid/systemctl/git) stay here — the
+        # established "network in the caller, builder is pure" split.
+        from .analytics.supervision import build_supervision
+        return jsonify(build_supervision(
+            pid=pid, ppid=ppid,
+            unit_active=unit_active, unit_enabled=unit_enabled,
+            boot_sha=_BOOT_SHA, head_sha=head, behind=behind,
+        ))
     except Exception as e:
         return jsonify({"error": str(e), "verdict": "UNKNOWN"}), 500
 

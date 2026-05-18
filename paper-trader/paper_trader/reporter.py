@@ -698,6 +698,92 @@ def _singleton_lock_line() -> str:
         return ""
 
 
+def _systemctl_user(verb: str) -> str:
+    """``systemctl --user <verb> paper-trader`` → its one-word status, or
+    ``"unknown"`` on any failure (unreadable user bus, no systemctl, …).
+    Mirrors ``dashboard.supervision_api``'s probe exactly so the Discord line
+    and ``/api/supervision`` feed the SAME builder identical inputs."""
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", verb, "paper-trader"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return ((r.stdout or "").strip()
+                or (r.stderr or "").strip() or "unknown")
+    except Exception:
+        return "unknown"
+
+
+def _supervision_line() -> str:
+    """Loud one-liner when this trader has NO restart safety net and/or is on
+    stale code — the **#1 recurring HIGH operational finding** across review
+    passes (an orphaned ``runner.py``, PPID 1, systemd unit
+    ``disabled``/``inactive``, behind HEAD: the moment its git-watcher /
+    deadman does ``os._exit(0)`` the trader stays DOWN permanently).
+
+    ``/api/supervision`` made this visible on the *dashboard* — but the
+    operator lives in Discord and never opens it (the exact dashboard→Discord
+    gap ``_capital_pulse_line`` / ``_heartbeat_line`` / ``_singleton_lock_line``
+    each closed, one dimension over). This routes the supervision builder's
+    OWN verdict + recommendation to the surface the operator actually reads.
+
+    Composes ``build_supervision`` **verbatim** (single source of truth,
+    AGENTS.md invariant #10 — the verdict / recommendation strings are the
+    builder's, never re-derived here, so this Discord line and
+    ``/api/supervision`` can never tell different stories). The impure probes
+    (pid/ppid, ``systemctl --user``, git HEAD/behind) live here — the
+    established "process/network in the caller, builder is pure" split. The
+    git boot/head SHAs are read from the already-imported ``dashboard``
+    module so there is ONE boot-SHA source per process (``runner`` starts the
+    dashboard thread at boot, so by the time an hourly/daily fires ≥1h later
+    ``dashboard._BOOT_SHA`` is populated). Observational only, never gates,
+    adds no caps (invariants #2/#12 — the ``_singleton_lock_line`` precedent).
+
+    Suppression — surface ONLY when the operator must act, so a healthy
+    supervised trader adds no hourly noise (the summary must never become its
+    own lying green light). The actionable set is the builder's own
+    ``actionable`` flag (single-sourced — the reporter never re-derives which
+    verdicts matter): everything **except** HEALTHY is surfaced, incl.
+    UNKNOWN (an unreadable user bus is closer to "no safety net" than to
+    "healthy" — the recommendation already names the exact verify commands).
+
+    Failure contract mirrors the rest of ``reporter``: any probe/builder/
+    import fault degrades to ``""`` ("no supervision line this report"),
+    **never** an exception ("no Discord summary this report"). The
+    ``dashboard`` import is lazy (a top-level import would be circular —
+    ``dashboard`` is heavy and ``runner`` imports ``reporter`` first)."""
+    try:
+        from .analytics.supervision import build_supervision
+        try:
+            ppid = os.getppid()
+        except Exception:
+            ppid = None
+        boot_sha = head_sha = None
+        behind = 0
+        try:
+            from . import dashboard
+            boot_sha = dashboard._BOOT_SHA
+            head_sha, behind = dashboard._head_sha_and_behind()
+        except Exception as e:
+            print(f"[reporter] supervision git probe skipped: {e}")
+        sup = build_supervision(
+            pid=os.getpid(), ppid=ppid,
+            unit_active=_systemctl_user("is-active"),
+            unit_enabled=_systemctl_user("is-enabled"),
+            boot_sha=boot_sha, head_sha=head_sha, behind=behind,
+        )
+        if not isinstance(sup, dict) or not sup.get("actionable"):
+            return ""
+        verdict = sup.get("verdict") or "UNKNOWN"
+        rec = sup.get("recommendation") or ""
+        if not rec:
+            return ""
+        return (f"⚠️ **SUPERVISION** ◈ {verdict}\n> {rec}")
+    except Exception as e:
+        print(f"[reporter] supervision line skipped: {e}")
+        return ""
+
+
 def _heartbeat_line(store) -> str:
     """One-line "is the decision loop actually deciding, or wedged?" for the
     hourly / daily report.
@@ -852,6 +938,9 @@ def send_hourly_summary() -> bool:
     lk = _singleton_lock_line()
     if lk:
         body += "\n" + lk
+    sv = _supervision_line()
+    if sv:
+        body += "\n" + sv
     hb = _heartbeat_line(store)
     if hb:
         body += "\n" + hb
@@ -922,6 +1011,9 @@ def send_daily_close() -> bool:
     lk = _singleton_lock_line()
     if lk:
         body += "\n" + lk
+    sv = _supervision_line()
+    if sv:
+        body += "\n" + sv
     hb = _heartbeat_line(store)
     if hb:
         body += "\n" + hb
