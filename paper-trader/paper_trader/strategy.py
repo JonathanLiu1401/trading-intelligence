@@ -484,6 +484,44 @@ def _option_expired(expiry: str | None, today: date | None = None) -> bool:
     return exp < (today or datetime.now(timezone.utc).date())
 
 
+def _hold_age_str(opened_at: str | None, now: datetime | None = None) -> str:
+    """Compact hold age for a position: ``"42m"`` / ``"5h"`` / ``"3d"``.
+
+    Opus's prompt position lines historically showed only qty/avg/mark/P/L —
+    *how long* a position has been held was invisible to the decision engine,
+    yet the desk's #1 documented pathology is the disposition effect (riding
+    losers, cutting winners early; live: LITE held ~3.8d at a loss, 7.12× the
+    empirical median losing hold, with Opus blind to the age). ``opened_at`` is
+    already carried on every ``snap["positions"]`` row (it is reset to the
+    re-entry instant when a fully-closed lot is reactivated — see
+    ``store.upsert_position`` — so it is the correct "current holding period",
+    not the all-time first touch).
+
+    Pure and degrade-safe (the ``stale_mark`` precedent — invariants #2/#12):
+    a missing / unparseable ``opened_at`` returns ``""`` (the caller renders no
+    token, byte-identical to today for any snapshot without the field, e.g. the
+    handcrafted test snapshots). Day flooring matches ``dashboard.
+    _position_ages_from_trades`` / ``/api/risk`` so the two surfaces never
+    disagree by a day. A future ``opened_at`` (wall-clock stepped back — the
+    documented clock-skew hazard) clamps to ``"0m"`` rather than rendering a
+    negative age. ``now`` is injectable for deterministic tests."""
+    if not opened_at:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(opened_at).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    secs = max(0.0, (now - dt).total_seconds())
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h"
+    return f"{int(secs // 86400)}d"
+
+
 def _expired_intrinsic(ticker: str, otype: str, strike: float) -> float:
     """Cash-settlement value (per share) of an *expired* option: its intrinsic
     value against the current underlying. 0.0 when out-of-the-money or the
@@ -646,16 +684,24 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
             "  [STALE MARK: live price unavailable — shown at cost, P/L unreliable]"
             if p.get("stale_mark") else ""
         )
+        # How long this lot has been held. Observational only (the stale_mark
+        # precedent; invariants #2/#12) — surfaces the raw fact the decision
+        # engine was blind to so Opus can self-check the disposition effect
+        # (the #1 documented pathology). Degrade-safe: no opened_at → no token,
+        # byte-identical to before for any snapshot lacking the field.
+        age = _hold_age_str(p.get("opened_at"))
+        age_token = f" held={age}" if age else ""
         if p["type"] in ("call", "put"):
             pos_lines.append(
                 f"  {p['ticker']} {p['type'].upper()} {p['strike']} {p['expiry']}: "
                 f"qty={p['qty']} avg={p['avg_cost']:.2f} mark={p['current_price']:.2f} "
-                f"P/L=${p['unrealized_pl']:.2f} ({p['pl_pct']:.1f}%){stale_suffix}"
+                f"P/L=${p['unrealized_pl']:.2f} ({p['pl_pct']:.1f}%){age_token}{stale_suffix}"
             )
         else:
             pos_lines.append(
                 f"  {p['ticker']} {p['type']}: qty={p['qty']} avg={p['avg_cost']:.2f} "
-                f"mark={p['current_price']:.2f} P/L=${p['unrealized_pl']:.2f} ({p['pl_pct']:.1f}%){stale_suffix}"
+                f"mark={p['current_price']:.2f} P/L=${p['unrealized_pl']:.2f} "
+                f"({p['pl_pct']:.1f}%){age_token}{stale_suffix}"
             )
 
     sig_lines = []
