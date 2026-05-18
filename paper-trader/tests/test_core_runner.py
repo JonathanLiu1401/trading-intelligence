@@ -576,3 +576,100 @@ class TestSingletonLock:
         # would mean the fail-open contract broke.
         with pytest.raises(_Sentinel):
             runner.main()
+
+
+class TestRecheckSingletonLock:
+    """`_recheck_singleton_lock` — the degraded-runner upgrade/exit retry
+    added 2026-05-18 after observing a degraded runner (PID 1255030, lock
+    plumbing unusable at boot) and a properly-locked runner (PID 1465599)
+    BOTH cycling the same $1000 paper book for ~12h. The boot-time guard
+    fails open by design (invariant #19); without a periodic re-check the
+    two-runner window stays open forever.
+
+    Exercises the real fcntl.flock primitive on a tmp lockfile (a second
+    open()+flock from the same process contends exactly as a 2nd process)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_lock_globals(self, monkeypatch):
+        monkeypatch.setattr(runner, "_lock_status", "degraded")
+        monkeypatch.setattr(runner, "_lock_holder_pid", None)
+        monkeypatch.setattr(runner, "_SINGLETON_LOCK_FH", None)
+        monkeypatch.setattr(runner, "_degraded_recheck_warned", False)
+
+    def test_noop_when_already_acquired(self, tmp_path):
+        """The load-bearing guard: once we hold the lock, recheck must NOT
+        re-open+re-flock the same file — a 2nd fd in the same process is
+        denied by our OWN flock and would mis-read as `busy`, exiting the
+        real holder. So `_lock_status == "acquired"` is an early no-op even
+        when the path's flock is held."""
+        lp = tmp_path / "pt.lock"
+        held = runner._acquire_singleton_lock(lp)
+        try:
+            assert held.status == "acquired"
+            runner._lock_status = "acquired"
+            # Must return without raising SystemExit and without flipping state.
+            runner._recheck_singleton_lock(lp)
+            assert runner._lock_status == "acquired"
+        finally:
+            held.handle.close()
+
+    def test_still_degraded_does_not_exit(self, tmp_path):
+        """Plumbing STILL unusable (parent is a regular file → mkdir/open
+        raise → degraded). Invariant #19: a degraded re-check must keep the
+        sole trader running, never exit."""
+        afile = tmp_path / "afile"
+        afile.write_text("x")
+        lp = afile / "sub" / "pt.lock"  # afile is a file, not a dir
+        runner._lock_status = "degraded"
+        runner._recheck_singleton_lock(lp)  # must not raise SystemExit
+        assert runner._lock_status == "degraded"
+        assert runner._SINGLETON_LOCK_FH is None
+
+    def test_upgrades_when_lock_becomes_free(self, tmp_path):
+        """Plumbing recovered and NO other trader holds it → upgrade in
+        place: status flips to acquired and the handle is retained so the
+        flock is held for life."""
+        import os
+        lp = tmp_path / "pt.lock"
+        runner._lock_status = "degraded"
+        runner._recheck_singleton_lock(lp)
+        try:
+            assert runner._lock_status == "acquired"
+            assert runner._SINGLETON_LOCK_FH is not None
+            assert runner._lock_holder_pid == os.getpid()
+            assert lp.read_text().strip() == str(os.getpid())
+        finally:
+            if runner._SINGLETON_LOCK_FH is not None:
+                runner._SINGLETON_LOCK_FH.close()
+
+    def test_exits_when_another_trader_acquired_lock(self, tmp_path):
+        """The bug this closes: plumbing recovered and ANOTHER live trader
+        now holds the lock → the degraded runner is double-trading the
+        shared book and must exit(1) so the locked instance is sole writer."""
+        import os
+        lp = tmp_path / "pt.lock"
+        other = runner._acquire_singleton_lock(lp)  # the legit locked trader
+        try:
+            assert other.status == "acquired"
+            runner._lock_status = "degraded"
+            with pytest.raises(SystemExit) as ei:
+                runner._recheck_singleton_lock(lp)
+            assert ei.value.code == 1
+            # We must NOT have stolen/altered the holder's state.
+            assert runner._lock_status == "degraded"
+            assert other.handle is not None
+            assert lp.read_text().strip() == str(os.getpid())
+        finally:
+            other.handle.close()
+
+    def test_singleton_lock_state_accessor(self, monkeypatch):
+        monkeypatch.setattr(runner, "_lock_status", "degraded")
+        monkeypatch.setattr(runner, "_lock_holder_pid", None)
+        st = runner.singleton_lock_state()
+        assert st == {"status": "degraded", "holder_pid": None,
+                      "have_lock": False, "degraded": True}
+        monkeypatch.setattr(runner, "_lock_status", "acquired")
+        monkeypatch.setattr(runner, "_lock_holder_pid", 4242)
+        st = runner.singleton_lock_state()
+        assert st == {"status": "acquired", "holder_pid": 4242,
+                      "have_lock": True, "degraded": False}
