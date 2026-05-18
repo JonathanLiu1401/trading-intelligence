@@ -8435,6 +8435,35 @@ def decision_drought_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/position-attention")
+def position_attention_api():
+    """Per-open-position last-real-Opus-look freshness — which held names has
+    the model gone hours without examining?
+
+    decision-health/decision-drought aggregate NO_DECISION cost portfolio-wide;
+    thesis-drift re-tests a thesis against current state; hold-discipline
+    measures hold time vs the desk's losing-cut history. None answer the
+    per-ticker question. When the documented #1 pathology (host-saturation
+    NO_DECISION storms) drags on, the live trader silently defaults to holding
+    every open lot — but those lots are no longer being *evaluated*. This
+    surfaces, per held ticker, when it was last named in a real (non-
+    NO_DECISION, non-BLOCKED) decision row, classifies the freshness
+    (FRESH ≤2h, MONITORED ≤6h, STALE ≤24h, NEGLECTED >24h or never), and
+    rolls up to a NEGLECTED_BOOK/STALE_BOOK/OK verdict. Pure read of
+    open_positions + recent_decisions — no network, no Opus invocation.
+    Advisory only — never gates Opus, never injected into the decision
+    prompt, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.position_attention import build_position_attention
+        store = get_store()
+        return jsonify(build_position_attention(
+            store.open_positions(),
+            store.recent_decisions(limit=3000),
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/empty-claude-rate")
 def empty_claude_rate_api():
     """Live-trader 'claude returned no response (timeout/empty)' rate vs the
