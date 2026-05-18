@@ -28,14 +28,19 @@ _ACTIONABLE = {"BUY", "ADD"}
 
 
 def _headline(state, can_act, actionable, top, pairing,
-              n_funded, n_unlockable, n_unfundable) -> str:
+              n_funded, n_unlockable, n_unfundable,
+              n_partial=0, cash=0.0) -> str:
     if not actionable:
         return "No actionable BUY/ADD ideas in the current suggestion set."
     t = (f"{top['action']} {top['ticker']} (conv {top['conviction']:.2f})"
          if top else "—")
-    if can_act:
+    if can_act and n_partial == 0:
         return (f"FREE — {n_funded} BUY/ADD idea(s) fundable from cash now; "
                 f"best: {t}.")
+    if can_act:
+        return (f"CASH-LIGHT — ${cash:.2f} cash: {n_funded} fully fundable, "
+                f"{n_partial} need a top-up sale to reach the advisory "
+                f"notional; best: {t}.")
     if state == "PINNED" and pairing:
         return (f"PINNED — best idea {t}; sell {pairing['sell']} → free "
                 f"${pairing['frees_usd']:.2f} → can act.")
@@ -60,6 +65,7 @@ def build_funded_suggestions(suggestions: list[dict],
     state = p.get("state") or "NO_DATA"
     can_act = bool(p.get("can_act_on_signal"))
     total_value = float(p.get("total_value") or 0.0)
+    cash = float(p.get("cash") or 0.0)
     ladder = list(p.get("unlock_ladder") or [])
     recommended_unlock = p.get("recommended_unlock")
 
@@ -79,9 +85,39 @@ def build_funded_suggestions(suggestions: list[dict],
         conv = float(s.get("conviction") or 0.0)
         notional = round(conv * total_value, 2) if total_value > 0 else 0.0
 
-        if can_act:
+        if can_act and (notional <= 0 or cash >= notional):
             fund, by, frees, enough = "FUNDED", [], 0.0, True
             note = "cash available now — no sale required"
+        elif can_act:
+            # `can_act_on_signal` only means cash cleared a tiny act-floor
+            # (≥ $1 and ≥ 1% of book) — NOT that cash covers this idea's
+            # advisory notional. Honest answer is PARTIAL: cash funds part,
+            # the shortfall needs a sale. Walk the same desk-cut-priority
+            # ladder for the minimum sale prefix that, *added to cash*,
+            # reaches the notional. enough=False ⇒ even the whole ladder
+            # plus cash still falls short (still PARTIAL — cash funds some).
+            shortfall = round(notional - cash, 2)
+            by, frees, enough = [], 0.0, False
+            for r in ladder:
+                by.append(str(r.get("ticker")))
+                cum = round(r.get("cumulative_freed_usd") or 0.0, 2)
+                if cash + cum >= notional:
+                    frees, enough = cum, True
+                    break
+            else:  # ladder exhausted (or empty) without covering the gap
+                by = list(ladder_tickers)
+                frees, enough = ladder_total, False
+            fund = "PARTIAL"
+            if enough:
+                note = (f"${cash:.2f} cash + sell {', '.join(by)} → "
+                        f"+${frees:.2f} covers the ${notional:.2f} advisory "
+                        f"notional (${shortfall:.2f} short on cash alone)")
+            elif by:
+                note = (f"${cash:.2f} cash + whole ladder (+${frees:.2f}) "
+                        f"still < ${notional:.2f} advisory notional")
+            else:
+                note = (f"${cash:.2f} cash < ${notional:.2f} advisory "
+                        f"notional; ${shortfall:.2f} short, nothing to unlock")
         elif state == "PINNED" and ladder:
             by, frees, enough = [], ladder_total, False
             if notional > 0:
@@ -122,6 +158,7 @@ def build_funded_suggestions(suggestions: list[dict],
         })
 
     n_funded = sum(1 for i in ideas if i["fundability"] == "FUNDED")
+    n_partial = sum(1 for i in ideas if i["fundability"] == "PARTIAL")
     n_unlockable = sum(1 for i in ideas if i["fundability"] == "UNLOCKABLE")
     n_unfundable = sum(1 for i in ideas if i["fundability"] == "UNFUNDABLE")
 
@@ -150,11 +187,13 @@ def build_funded_suggestions(suggestions: list[dict],
         "can_act": can_act,
         "n_actionable": len(actionable),
         "n_funded": n_funded,
+        "n_partial": n_partial,
         "n_unlockable": n_unlockable,
         "n_unfundable": n_unfundable,
         "ideas": ideas,
         "top_actionable": top,
         "recommended_pairing": pairing,
         "headline": _headline(state, can_act, actionable, top, pairing,
-                              n_funded, n_unlockable, n_unfundable),
+                              n_funded, n_unlockable, n_unfundable,
+                              n_partial, cash),
     }
