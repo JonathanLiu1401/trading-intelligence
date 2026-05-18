@@ -1075,52 +1075,99 @@ def _inject_and_train() -> str:
             pass
 
     now = datetime.now(timezone.utc).isoformat()
-    aconn = None
-    try:
-        aconn = sqlite3.connect(DB_PATH, timeout=15)
-        inserted = 0
-        for rec in records:
-            # `.get(k, default)` only substitutes the default when the key is
-            # ABSENT — an explicit JSON `null` value still returns None, and
-            # `float(None)` raises TypeError. A single such line in
-            # winner_training.jsonl would abort the whole injection batch via
-            # the outer `except` (returning "inject err: …"), so ArticleNet
-            # never retrains that cycle. `or` coerces None/0/"" to the safe
-            # default, matching the hardening idiom already used in
-            # backtest._ml_decide and _opus_annotate.
-            ai = float(rec.get("ai_score") or 0.0)
-            w = float(rec.get("weight") or 1.0)
-            eff = min(10.0, ai * w)
-            title = rec.get("title", "")
-            ticker = rec.get("ticker", "")
-            reasoning = rec.get("reasoning", "")
-            sim_date = rec.get("sim_date", "")
-            label = rec.get("label", "")
-            run_id = rec.get("run_id", 0)
-            if not title:
-                continue
-            url = f"backtest://run_{run_id}/{sim_date}/{label}/{ticker}"
-            aid = _aid(url, title)
-            full_text = f"[{ticker}] {title}. {reasoning}"
-            aconn.execute(
-                "INSERT OR IGNORE INTO articles "
-                "(id,url,title,source,published,kw_score,ai_score,urgency,first_seen,cycle,full_text) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (aid, url, title, f"backtest_run_{run_id}", sim_date or now[:10],
-                 eff, eff, 0, now, rec.get("cycle", 0),
-                 _compress(full_text)),
-            )
-            if aconn.execute("SELECT changes()").fetchone()[0]:
-                inserted += 1
-        aconn.commit()
-    except Exception as e:
-        return f"inject err: {e}"
-    finally:
-        if aconn is not None:
-            try:
-                aconn.close()
-            except Exception:
-                pass
+
+    # Build the INSERT param tuples up front — a PURE pass with no DB handle
+    # so it cannot fail on a lock and need not be replayed on a retry.
+    prepared: list[tuple] = []
+    for rec in records:
+        # `.get(k, default)` only substitutes the default when the key is
+        # ABSENT — an explicit JSON `null` value still returns None, and
+        # `float(None)` raises TypeError. A single such line in
+        # winner_training.jsonl would abort the whole injection batch via
+        # the outer `except` (returning "inject err: …"), so ArticleNet
+        # never retrains that cycle. `or` coerces None/0/"" to the safe
+        # default, matching the hardening idiom already used in
+        # backtest._ml_decide and _opus_annotate.
+        ai = float(rec.get("ai_score") or 0.0)
+        w = float(rec.get("weight") or 1.0)
+        eff = min(10.0, ai * w)
+        title = rec.get("title", "")
+        ticker = rec.get("ticker", "")
+        reasoning = rec.get("reasoning", "")
+        sim_date = rec.get("sim_date", "")
+        label = rec.get("label", "")
+        run_id = rec.get("run_id", 0)
+        if not title:
+            continue
+        url = f"backtest://run_{run_id}/{sim_date}/{label}/{ticker}"
+        aid = _aid(url, title)
+        full_text = f"[{ticker}] {title}. {reasoning}"
+        prepared.append(
+            (aid, url, title, f"backtest_run_{run_id}", sim_date or now[:10],
+             eff, eff, 0, now, rec.get("cycle", 0), _compress(full_text)))
+
+    # digital-intern's daemon is a heavy concurrent writer to this same
+    # ~1.4 GB articles.db. Observed live (continuous.log: 7 cycles): the
+    # daemon held the write lock longer than sqlite3 connect `timeout=`, so
+    # `execute(INSERT…)`/`commit()` raised `OperationalError: database is
+    # locked` and the WHOLE ArticleNet feedback batch (CLAUDE.md §5 step 5)
+    # was dropped for that cycle with NO retry. Retry connect→write→commit a
+    # few times with backoff on a *transient* lock only; INSERT OR IGNORE
+    # makes the replay idempotent (an uncommitted partial attempt is rolled
+    # back on close and `inserted` is recomputed from scratch each attempt).
+    # A non-lock OperationalError or any other exception falls through to
+    # the original single-shot "inject err:" path immediately — no pointless
+    # backoff on a real bug.
+    _LOCK_RETRY_SLEEPS = (3.0, 8.0, 15.0)  # one initial try + 3 retries
+    inserted = 0
+    last_lock_err: Exception | None = None
+    for _attempt in range(len(_LOCK_RETRY_SLEEPS) + 1):
+        aconn = None
+        try:
+            aconn = sqlite3.connect(DB_PATH, timeout=15)
+            # Explicit busy handler — defensive belt-and-braces over the
+            # connect `timeout=` (a write-lock wait on a WAL db is governed
+            # by busy_timeout; some builds honour only the PRAGMA form).
+            aconn.execute("PRAGMA busy_timeout=15000")
+            inserted = 0
+            for row in prepared:
+                aconn.execute(
+                    "INSERT OR IGNORE INTO articles "
+                    "(id,url,title,source,published,kw_score,ai_score,"
+                    "urgency,first_seen,cycle,full_text) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    row,
+                )
+                if aconn.execute("SELECT changes()").fetchone()[0]:
+                    inserted += 1
+            aconn.commit()
+            last_lock_err = None
+            break
+        except sqlite3.OperationalError as e:
+            _m = str(e).lower()
+            if "locked" not in _m and "busy" not in _m:
+                return f"inject err: {e}"
+            last_lock_err = e
+            if aconn is not None:
+                try:
+                    aconn.rollback()
+                except Exception:
+                    pass
+        except Exception as e:
+            return f"inject err: {e}"
+        finally:
+            if aconn is not None:
+                try:
+                    aconn.close()
+                except Exception:
+                    pass
+        # Sleep+retry only while attempts remain; the final iteration falls
+        # straight through to the post-loop lock-error return (no dead wait).
+        if _attempt < len(_LOCK_RETRY_SLEEPS):
+            time.sleep(_LOCK_RETRY_SLEEPS[_attempt])
+    else:
+        return (f"inject err: database locked after "
+                f"{len(_LOCK_RETRY_SLEEPS) + 1} attempts ({last_lock_err})")
 
     # Now trigger actual training
     try:

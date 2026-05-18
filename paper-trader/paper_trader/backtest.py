@@ -488,13 +488,22 @@ class BacktestStore:
         """Return equity_curve lists for specific run_ids (lightweight lookup)."""
         if not run_ids:
             return {}
-        placeholders = ",".join("?" * len(run_ids))
-        with self._lock:
-            rows = self.conn.execute(
-                f"SELECT run_id, start_date, start_value, equity_curve_json "
-                f"FROM backtest_runs WHERE run_id IN ({placeholders})",
-                run_ids,
-            ).fetchall()
+        # Dedupe and batch the IN-clause: a single query with hundreds of
+        # bound params risks SQLite's host-parameter limit (999 on older
+        # builds), so chunk it. Each chunk takes the lock independently,
+        # mirroring the short read-lock idiom used by other read methods.
+        unique_ids = list(dict.fromkeys(run_ids))
+        rows: list = []
+        BATCH = 500
+        for i in range(0, len(unique_ids), BATCH):
+            chunk = unique_ids[i:i + BATCH]
+            placeholders = ",".join("?" * len(chunk))
+            with self._lock:
+                rows.extend(self.conn.execute(
+                    f"SELECT run_id, start_date, start_value, equity_curve_json "
+                    f"FROM backtest_runs WHERE run_id IN ({placeholders})",
+                    chunk,
+                ).fetchall())
         out = {}
         from datetime import date as _date
         for row in rows:
