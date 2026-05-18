@@ -232,6 +232,7 @@ RULES:
 - A newswire row tagged "[model]" carries a score set by the local relevance model ONLY, with NO LLM verification; that model demonstrably over-scores forum/wiki/social rows. Treat an untagged (LLM-vetted) row as materially more trustworthy than a "[model]" row of equal or near-equal score: prefer untagged rows for the LEAD and rank them above "[model]" rows of similar score in TOP SIGNALS. NEVER make a lone "[model]" row the LEAD when an untagged row of comparable score exists.
 - A newswire row tagged "[ALERTED]" ALREADY fired a standalone 🚨 BREAKING push to the analyst within the last few hours — it is a developing/continued story the analyst has ALREADY been told about, NOT new news. Do NOT make an "[ALERTED]" row the LEAD when any untagged story of comparable importance exists; rank a fresh untagged story above an "[ALERTED]" one of similar score in TOP SIGNALS; and frame any "[ALERTED]" item explicitly as continuation (e.g. "follows the earlier alert", "developing") — never as if it just broke. This is what separates new desk intel from a rehash of an alert already delivered.
 - A newswire row tagged "[BOOK: TICKER,...]" names live portfolio/watchlist positions the analyst actually holds money in (LITE, LNOK, MUU, DRAM, MU, NVDA, MSFT, AXTI, ORCL, TSEM, QBTS). A "[BOOK:...]" row is directly actionable for the analyst's open risk: weight it ABOVE a same-score untagged general-market row when choosing the LEAD and ordering TOP SIGNALS, always reflect its named ticker(s) in the PORTFOLIO table with a concrete implication, and never bury a "[BOOK:...]" item below generic macro colour of similar magnitude. Absence of the tag means the row does not touch the held book.
+- If a "BOOK HEAT" block is present, it ranks the analyst's held names by how many DISTINCT stories this window touched each one. Concentration on a single held name is itself a magnitude signal, independent of any one row's score: strongly prefer the most-concentrated held name for the LEAD when it has any material story, rank its stories up in TOP SIGNALS, and give that ticker a concrete forward-looking implication in the PORTFOLIO table. This is a ranking/weighting hint only — do NOT echo a literal "BOOK HEAT" section in the output (unlike COVERAGE GAP).
 - If a "COVERAGE GAP" block is present in the data input, reproduce it as a **COVERAGE GAP** section (one bullet per dark channel, verbatim). These are intel channels the system could NOT collect from this window — the analyst must know what they are blind to, not assume silence means calm. Omit the section entirely if no gap block is provided.
 
 OUTPUT FORMAT — use EXACTLY this, filled with real data:
@@ -594,6 +595,62 @@ def _book_tickers(article: dict) -> list[str]:
     return [t for t in _BOOK_TICKERS if t in hits]
 
 
+# ── Held-book concentration ("BOOK HEAT") ────────────────────────────────────
+# The per-row [BOOK: ...] tag tells Opus WHICH rows touch the analyst's open
+# positions, but never that a single held name is the window's centre of
+# gravity. A held ticker carried by ONE story scoring 7 may not lead; the SAME
+# ticker spread across 6 *distinct* (post-syndication-collapse) stories in the
+# 5h window is a magnitude signal in its own right — concentration the analyst
+# persona ("I depend on this to react to events affecting MY positions") needs
+# surfaced, yet Opus cannot infer it from per-row tags alone (it would have to
+# mentally tally 60 rows). This emits it as ONE ranked input hint, the exact
+# pure read-side shape of the [syndicated xN] / [BOOK:] tags: no DB write, no
+# ai_score/ml_score/score_source/urgency touch, no row mutation, backtest
+# excluded upstream by get_top_for_briefing's _LIVE_ONLY_CLAUSE, returns a NEW
+# list and never mutates source_articles — all four load-bearing invariants
+# intact by construction.
+#
+# Counted over the ALREADY-collapsed+capped digest the model actually reads, so
+# "N distinct stories" is honest (6 syndicated copies of one wire = 1 story,
+# not 6 — reuses _collapse_syndicated's output, never the raw pre-dedup list)
+# and verifiable against the rendered newswire. The same real-url snapshot
+# guard as [BOOK:] excludes the prepended PORTFOLIO/OPTIONS rows (whose P&L
+# body legitimately lists held tickers). Conservative threshold (>=3) keeps
+# this signal, not noise — the analyst's top complaint.
+BOOK_HEAT_MIN_STORIES = 3
+_BOOK_HEAT_MAX_LINES = 6
+
+
+def _book_heat_lines(
+    articles: list, min_stories: int = BOOK_HEAT_MIN_STORIES
+) -> list[str]:
+    """Pure: rank held names by how many DISTINCT digest rows mention them.
+
+    ``articles`` must be the post-``_collapse_syndicated``, post-cap list the
+    newswire actually renders (so syndicated copies of one event count once).
+    A row with no real ``link``/``url`` (the prepended PORTFOLIO/OPTIONS
+    snapshots) is skipped — identical guard to the ``[BOOK:]`` tag, so a
+    snapshot P&L body listing held tickers can never manufacture phantom heat.
+    Returns ``["MU — 6 distinct stories", ...]`` for tickers at/above
+    ``min_stories``, ordered by count desc then canonical ``_BOOK_TICKERS``
+    order (stable cycle-to-cycle, same tie-break discipline as
+    ``_book_tickers``), capped at ``_BOOK_HEAT_MAX_LINES``. ``[]`` when nothing
+    is concentrated. No DB / IO / mutation."""
+    counts: dict[str, int] = {}
+    for a in articles:
+        if not (a.get("link") or a.get("url")):
+            continue  # snapshot/synthetic row — same guard as the [BOOK:] tag
+        for t in _book_tickers(a):
+            counts[t] = counts.get(t, 0) + 1
+    rank = {t: i for i, t in enumerate(_BOOK_TICKERS)}
+    hot = sorted(
+        ((t, n) for t, n in counts.items() if n >= min_stories),
+        key=lambda tn: (-tn[1], rank.get(tn[0], len(rank))),
+    )
+    return [f"{t} — {n} distinct stories"
+            for t, n in hot[:_BOOK_HEAT_MAX_LINES]]
+
+
 def _build_payload(articles, stock_data, earnings, source_health_report=None):
     parts = [f"BRIEFING TIME: {_now_utc_str()}\n"]
 
@@ -706,6 +763,21 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None):
                 f"{i:>2}. [score={score}]{model_tag}{seen_tag}{tag}{pushed}{book_tag} [{a.get('source','?')}] {a.get('title','')}\n"
                 f"    {(a.get('summary') or '')[:300]}"
             )
+        # Held-book concentration hint. Computed over the SAME collapsed+capped
+        # rows rendered above (deduped[:60]) so "distinct stories" is honest and
+        # verifiable against the newswire. Pure read-side: NEW list, no mutation
+        # of source_articles, no DB / ai_score / ml_score / score_source /
+        # urgency touch, backtest already excluded upstream — four invariants
+        # intact. An input ranking hint, NOT a reproduced section (unlike
+        # COVERAGE GAP) — see the SYSTEM_PROMPT BOOK HEAT rule.
+        heat_lines = _book_heat_lines(deduped[:60])
+        if heat_lines:
+            parts.append(
+                "\n=== BOOK HEAT (analyst's held names by distinct-story "
+                "concentration this window — a magnitude signal) ==="
+            )
+            for hl in heat_lines:
+                parts.append(f"  - {hl}")
 
     parts.append("\n=== EARNINGS CALENDAR (next 48h) ===")
     if not earnings:
