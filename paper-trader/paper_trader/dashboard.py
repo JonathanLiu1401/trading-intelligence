@@ -9712,6 +9712,11 @@ def _swr_prewarm():
         ("decision-health", decision_health_api),
         ("runner-heartbeat", runner_heartbeat_api),
         ("scorer-confidence", scorer_confidence_api),
+        # scorer-attribution was @swr_cached but never prewarmed — the same
+        # freeze-triage cold-stall blind spot (a trader opening the scorer
+        # attribution panel right after a restart got {"warming": true});
+        # test_swr_prewarm_coverage.py locks the prewarm==@swr_cached set.
+        ("scorer-attribution", scorer_attribution_api),
         ("baseline-compare", baseline_compare_api),
         # stress-scenarios + watchlist-opportunities were @swr_cached but
         # never prewarmed (commits 737a2d2 / 6e9c5d8) — same freeze-triage
