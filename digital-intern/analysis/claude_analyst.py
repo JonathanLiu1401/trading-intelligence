@@ -311,6 +311,124 @@ def _seen_utc_str(first_seen) -> str | None:
     return dt.astimezone(timezone.utc).strftime("%H:%M")
 
 
+# ── Per-article recency decay (the ML time_sensitivity head, finally used) ───
+# ArticleNet trains a dedicated time_sensitivity head (0..1: 1.0 = decays fast
+# — earnings beats, price moves, "today"; 0.0 = timeless — macro thesis,
+# secular trend) and the store persists it per row, but until now NO consumer
+# applied it. ``article_store.get_top_for_briefing`` documents the exact decay
+# curve ("ts=1.0 halves the score every 12h, ts=0.0 disables decay entirely")
+# yet deliberately returns ai_score unchanged so a consumer can pick the
+# policy — and no consumer ever did. The 5h Opus digest therefore ranked an
+# 18h-old "STOCK SURGED TODAY" item identically to a fresh same-score one, the
+# consuming analyst's exact complaint (a newswire must lead with what is
+# moving NOW, not a half-day-old time-bound headline that already played out).
+#
+# This applies that documented curve, here, where it belongs — purely on the
+# text Opus reads (read-side rerank of the already-fetched, already-live-only
+# digest). No DB write, no ai_score/ml_score/score_source/urgency touch,
+# backtest rows already excluded upstream by get_top_for_briefing's
+# _LIVE_ONLY_CLAUSE — all four load-bearing invariants intact by construction.
+BRIEFING_DECAY_HALFLIFE_H = 12.0  # ts=1.0 → score halves every 12h (per the
+                                  # get_top_for_briefing docstring contract)
+# Unscored rows (no time_sensitivity yet — rare; most are ML-scored within the
+# 30s scorer cadence) get a mild middle decay, matching the
+# ml.inference.ArticleScore default so behaviour is consistent system-wide.
+BRIEFING_DEFAULT_TS = 0.5
+
+
+def _seen_age_hours(first_seen, now: datetime | None = None) -> float:
+    """Hours since the article hit our wire (``first_seen``), else ``0.0``.
+
+    Returns ``0.0`` (→ no decay) when ``first_seen`` is absent, unparseable,
+    or in the future (clock skew / bad row) — every uncertain path degrades
+    to "do not decay" so the rerank can only ever *help*, never bury a row on
+    a parse failure. Crucially the synthetic PORTFOLIO/OPTIONS snapshot rows
+    the daemon prepends carry no ``first_seen``, so they get age 0 → factor 1
+    → stay pinned at the top of the digest (see _rank_by_decayed_score).
+
+    RFC822 + ISO (``Z``-suffix tolerated), naive→UTC — the exact convention
+    ``_seen_utc_str`` / ``alert_agent._article_age_hours`` / ``urgency_scorer``
+    use, kept a small local parser rather than cross-imported (same
+    anti-import-cycle discipline as _collapse_syndicated reusing _signature)."""
+    if not first_seen:
+        return 0.0
+    raw = str(first_seen).strip()
+    if not raw:
+        return 0.0
+    dt = None
+    try:
+        dt = parsedate_to_datetime(raw)
+    except Exception:
+        dt = None
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return 0.0
+    if dt is None:
+        return 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    age_h = (now - dt.astimezone(timezone.utc)).total_seconds() / 3600.0
+    return age_h if age_h > 0 else 0.0
+
+
+def _effective_score(article: dict, now: datetime | None = None) -> float:
+    """Recency-decayed ranking score for one digest row.
+
+        effective = base * 0.5 ** (age_hours * time_sensitivity / 12h)
+
+    ``base`` is ``ai_score`` else ``_relevance_score`` — the SAME fallback
+    ``_collapse_syndicated._score`` and the render line use, so a row's
+    ranking number stays consistent with what it displays. A non-positive /
+    unparseable base returns 0.0 (sorts last). ``time_sensitivity`` None or
+    junk → BRIEFING_DEFAULT_TS, clamped 0..1. age 0 (snapshots / unparseable
+    first_seen) or ts 0 (timeless) → factor 1 → base returned unchanged."""
+    base = 0.0
+    for key in ("ai_score", "_relevance_score"):
+        v = article.get(key)
+        if isinstance(v, bool):
+            continue  # never let a stray bool read as 1.0
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv:
+            base = fv
+            break
+    if base <= 0:
+        return 0.0
+    ts = article.get("time_sensitivity")
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        ts = BRIEFING_DEFAULT_TS
+    if ts != ts:  # NaN guard (float('nan') is the one value != itself)
+        ts = BRIEFING_DEFAULT_TS
+    ts = min(1.0, max(0.0, ts))
+    age_h = _seen_age_hours(article.get("first_seen"), now=now)
+    if age_h <= 0.0 or ts <= 0.0:
+        return base
+    return base * (0.5 ** (age_h * ts / BRIEFING_DECAY_HALFLIFE_H))
+
+
+def _rank_by_decayed_score(articles: list, now: datetime | None = None) -> list:
+    """Stable rerank of a collapsed digest by recency-decayed effective score
+    (desc). Pure, side-effect-free, returns the same dicts (no copy).
+
+    Stability is load-bearing: the prepended synthetic PORTFOLIO/OPTIONS
+    snapshot rows have no ``first_seen`` → age 0 → factor 1 → effective ==
+    base == their ai_score (10, the digest max, which decay can only lower
+    for everyone else), and ``_collapse_syndicated`` already put them first;
+    a *stable* descending sort therefore keeps them pinned ahead of any
+    real article that merely ties at 10. Same-effective real rows keep their
+    incoming (score-then-collapse) order — the rerank only ever *promotes* a
+    fresher item over an older equal-base one, never reshuffles ties."""
+    return sorted(articles, key=lambda a: _effective_score(a, now=now),
+                  reverse=True)
+
+
 def _fmt_ticker(s):
     # Keep the price column at width=11 ("$" + 10-char number) and pct column at
     # width=8 (signed 7-char number + "%") so N/A rows don't break alignment.
@@ -347,6 +465,13 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None):
         # prepends up to 2 synthetic snapshot rows (P&L, options) to a
         # 50-article top list; a [:50] cap silently truncates real articles.
         deduped = _collapse_syndicated(articles)
+        # Apply the documented per-article recency decay (the ML
+        # time_sensitivity head). A stable sort keeps the prepended
+        # PORTFOLIO/OPTIONS snapshots pinned at the top (age 0 → no decay →
+        # effective == 10, the max) and only promotes a fresher item above an
+        # older equal-base one — exactly what a "what is moving NOW" newswire
+        # wants. Done before the [:60] cap so decay decides what survives it.
+        deduped = _rank_by_decayed_score(deduped)
         for i, a in enumerate(deduped[:60], 1):
             score = a.get("ai_score") or a.get("_relevance_score", "?")
             corro = a.get("_corroboration", 1)
