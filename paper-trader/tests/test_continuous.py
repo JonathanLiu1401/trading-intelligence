@@ -199,6 +199,77 @@ class TestComputeDecisionOutcomes:
             assert o["sim_date"] != last_day
 
 
+# ──────────── training-integrity: only FILLED trades train the scorer ────────
+
+class TestFilledOnlyTrainingIntegrity:
+    """Regression lock: a BUY/SELL decision that did NOT execute
+    (`status != 'FILLED'`) must never reach `winner_training.jsonl`
+    (ArticleNet) or `decision_outcomes.jsonl` (DecisionScorer).
+
+    `run_one` records a terminal non-FILLED decision row for the last
+    intraday decision when nothing filled that day. If that decision was a
+    BUY/SELL `_execute_decision` rejected, training on its 5d forward return
+    is a phantom outcome for a position that never moved capital — and its
+    blocking reason (out of cash / no price) is regime-correlated, so it is
+    biased contamination, not noise. Both training-pipeline queries filter
+    `status = 'FILLED'`; these tests fail if either filter is dropped.
+    """
+
+    def test_append_top_decisions_skips_blocked(self, tmp_path, monkeypatch):
+        eng = _make_engine_with_runs(tmp_path, n_runs=1)
+        # Fixture already added a FILLED BUY NVDA on 2025-01-01 for run 1.
+        # Add a BLOCKED BUY that must NOT be written to winner_training.jsonl.
+        eng.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "status, reasoning) VALUES (?, ?, ?, ?, ?, ?)",
+            (1, "2025-01-02", "BUY", "TQQQ", "BLOCKED",
+             "score=9.99 regime=bull (insufficient cash)"),
+        )
+        eng.store.conn.commit()
+        jsonl_path = tmp_path / "winners.jsonl"
+        monkeypatch.setattr(rcb, "WINNER_JSONL", jsonl_path)
+        runs = [BacktestRun(run_id=1, seed=1, start_date="2025-01-01",
+                             end_date="2025-12-31", total_return_pct=12.0)]
+        written = rcb._append_top_decisions(eng, runs, cycle=9)
+        # Only the FILLED NVDA decision survives the status filter.
+        assert written == 1
+        recs = [json.loads(l) for l in jsonl_path.read_text().splitlines()]
+        assert [r["ticker"] for r in recs] == ["NVDA"]
+        assert all(r["ticker"] != "TQQQ" for r in recs)
+
+    def test_compute_decision_outcomes_skips_blocked(self, tmp_path,
+                                                     synthetic_prices):
+        eng = _make_engine_with_runs(tmp_path, n_runs=1)
+        eng.prices = synthetic_prices
+        day0 = synthetic_prices.trading_days[0].isoformat()  # has 5d future
+        # FILLED NVDA (must produce an outcome) + BLOCKED SPY (must NOT).
+        # Both tickers have synthetic prices, so the ONLY thing excluding
+        # SPY is the status filter — a faithful discriminating test.
+        eng.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "status, reasoning) VALUES (?, ?, ?, ?, ?, ?)",
+            (1, day0, "BUY", "NVDA", "FILLED",
+             "ML+quant: NVDA score=3.00 regime=bull news_count=0 news_urg=0.0"),
+        )
+        eng.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "status, reasoning) VALUES (?, ?, ?, ?, ?, ?)",
+            (1, day0, "BUY", "SPY", "BLOCKED",
+             "ML+quant: SPY score=8.00 regime=bull news_count=0 news_urg=0.0"),
+        )
+        eng.store.conn.commit()
+        runs = [BacktestRun(run_id=1, seed=1, start_date="2025-01-01",
+                             end_date="2025-12-31")]
+        outs = rcb._compute_decision_outcomes(eng, runs)
+        day0_outs = [o for o in outs if o["sim_date"] == day0]
+        assert [o["ticker"] for o in day0_outs] == ["NVDA"]
+        assert all(o["ticker"] != "SPY" for o in outs)
+        # The surviving outcome carries the parsed ml_score (sanity that it is
+        # the real FILLED record, not an empty default).
+        assert day0_outs[0]["ml_score"] == 3.00
+        assert day0_outs[0]["action"] == "BUY"
+
+
 # ─────────────────────── _parse_published_date ───────────────────────────
 
 class TestParsePublishedDate:

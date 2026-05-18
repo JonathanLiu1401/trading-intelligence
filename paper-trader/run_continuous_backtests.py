@@ -230,10 +230,23 @@ def _append_top_decisions(engine: BacktestEngine, top_runs: list[BacktestRun],
                 # Hold the store lock — the background _opus_annotate thread
                 # may share this sqlite3 connection across threads.
                 with engine.store._lock:
+                    # Training-integrity invariant: only decisions that actually
+                    # EXECUTED (status='FILLED') may seed winner_training.jsonl /
+                    # ArticleNet. `run_one` records a terminal non-FILLED row
+                    # (status='BLOCKED'/'NO_DECISION') for the last intraday
+                    # decision when nothing filled that day; if that last
+                    # decision was a BUY/SELL that `_execute_decision` rejected
+                    # (e.g. a future position cap, a no-price ticker), it would
+                    # otherwise be injected as a phantom training trade that
+                    # never moved capital. Empirically 0 such rows exist today
+                    # (`_ml_decide` only emits executable decisions), but the
+                    # filter makes the "trained only on real fills" invariant
+                    # explicit and refactor-proof rather than emergent.
                     rows = engine.store.conn.execute(
                         "SELECT action, ticker, sim_date, reasoning, qty, confidence "
                         "FROM backtest_decisions "
-                        "WHERE run_id = ? AND action IS NOT NULL AND action != 'HOLD'",
+                        "WHERE run_id = ? AND action IS NOT NULL AND action != 'HOLD' "
+                        "AND status = 'FILLED'",
                         (run.run_id,),
                     ).fetchall()
             except Exception as e:
@@ -348,11 +361,21 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
             # Hold the store lock — the background _opus_annotate thread may
             # share this sqlite3 connection across threads.
             with engine.store._lock:
+                # Training-integrity invariant (mirrors _append_top_decisions):
+                # the DecisionScorer must learn the 5d outcome of trades that
+                # ACTUALLY EXECUTED, never of a BUY/SELL that `_execute_decision`
+                # blocked. A blocked decision is recorded only as `run_one`'s
+                # terminal non-FILLED marker when nothing filled that day;
+                # without `status='FILLED'` its forward return would be trained
+                # on as if the position had been taken (a phantom outcome whose
+                # blocking reason — e.g. out of cash — is itself regime-
+                # correlated, so it is biased contamination, not noise).
                 rows = engine.store.conn.execute(
                     "SELECT action, ticker, sim_date, reasoning "
                     "FROM backtest_decisions "
                     "WHERE run_id=? AND action IN ('BUY','SELL') "
-                    "AND ticker IS NOT NULL AND ticker != ''",
+                    "AND ticker IS NOT NULL AND ticker != '' "
+                    "AND status = 'FILLED'",
                     (run.run_id,),
                 ).fetchall()
         except Exception as exc:
