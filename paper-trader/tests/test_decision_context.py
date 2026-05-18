@@ -73,6 +73,8 @@ def _ctx(**over):
         track_record_block=None,
         risk_mirror_block=None,
         ml_opinion_block=None,
+        event_calendar_block=None,
+        buying_power_block=None,
     )
     base.update(over)
     return build_decision_context(**base)
@@ -123,7 +125,46 @@ class TestInputSummary:
         r = _ctx(track_record_block="TR", risk_mirror_block=None)
         a = r["advisory_blocks"]
         assert a == {"self_review": True, "track_record": True,
-                     "risk_mirror": False, "ml_opinion": False}
+                     "risk_mirror": False, "ml_opinion": False,
+                     "event_calendar": False, "buying_power": False}
+
+
+class TestNewAdvisoryBlocksReachPrompt:
+    """Regression lock: ``event_calendar`` (commit ccc4d31-era) and
+    ``buying_power`` (b739a14) are threaded into the real
+    ``strategy.decide()`` ``_build_payload`` call, but the
+    ``/api/decision-context`` reconstruction never passed them — so the
+    inspector silently dropped 2 of 6 advisory blocks while its docstring
+    still promised a string "byte-identical to the live prompt given
+    identical inputs". A trader auditing "did Opus see the buying-power /
+    upcoming-earnings awareness this cycle?" got a false NO. These lock the
+    two blocks back into the reconstruction (verbatim text + flags +
+    _build_payload byte-faithful ordering)."""
+
+    def test_both_blocks_reach_prompt_verbatim_and_flagged(self):
+        r = _ctx(
+            event_calendar_block="EARNINGS WITHIN 14D: NVDA reports 2026-05-28",
+            buying_power_block="BUYING POWER: $18.49 free cash (98.1% deployed)",
+        )
+        p = r["prompt"]
+        assert "EARNINGS WITHIN 14D: NVDA reports 2026-05-28" in p
+        assert "BUYING POWER: $18.49 free cash (98.1% deployed)" in p
+        a = r["advisory_blocks"]
+        assert a["event_calendar"] is True
+        assert a["buying_power"] is True
+        # byte-faithful to _build_payload: the behavioural/advisory stack
+        # renders event_calendar then buying_power, both before WATCHLIST
+        # PRICES (the exact order strategy.decide() emits).
+        assert p.index("EARNINGS WITHIN 14D") < p.index("BUYING POWER")
+        assert p.index("BUYING POWER") < p.index("WATCHLIST PRICES:")
+
+    def test_flags_false_and_absent_text_when_blocks_omitted(self):
+        r = _ctx()
+        a = r["advisory_blocks"]
+        assert a["event_calendar"] is False
+        assert a["buying_power"] is False
+        assert "EARNINGS WITHIN 14D" not in r["prompt"]
+        assert "BUYING POWER" not in r["prompt"]
 
     def test_embeds_mark_integrity_verbatim(self):
         snap = _snapshot([

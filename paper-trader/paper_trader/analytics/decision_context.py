@@ -83,6 +83,8 @@ def build_decision_context(
     track_record_block: str | None = None,
     risk_mirror_block: str | None = None,
     ml_opinion_block: str | None = None,
+    event_calendar_block: str | None = None,
+    buying_power_block: str | None = None,
     max_prompt_chars: int = MAX_PROMPT_CHARS,
 ) -> dict:
     """Reconstruct the live decision prompt + an input summary. Pure; the
@@ -90,12 +92,19 @@ def build_decision_context(
     # The exact same render the live decide() performs. _build_payload's 2nd
     # positional is the *merged* signal list (urgent-not-in-top + top), so we
     # pass merged_signals there — identical to strategy.decide().
+    # event_calendar_block (forward earnings) + buying_power_block
+    # (deployable cash) are threaded through here because decide() now passes
+    # BOTH to _build_payload; omitting them silently dropped 2 of 6 advisory
+    # blocks from this "byte-identical reconstruction", so a trader auditing
+    # whether Opus saw the buying-power / earnings awareness got a false NO.
     payload = strategy._build_payload(
         snapshot, merged_signals, sentiments, watch_prices, futures_prices,
         sp500, market_open, quant_signals=quant_signals,
         self_review_block=self_review_block,
         track_record_block=track_record_block,
         risk_mirror_block=risk_mirror_block,
+        event_calendar_block=event_calendar_block,
+        buying_power_block=buying_power_block,
     )
     prompt = f"{strategy.SYSTEM_PROMPT}\n\n---\nCONTEXT:\n{payload}"
     if ml_opinion_block:
@@ -137,6 +146,8 @@ def build_decision_context(
             "track_record": bool(track_record_block),
             "risk_mirror": bool(risk_mirror_block),
             "ml_opinion": bool(ml_opinion_block),
+            "event_calendar": bool(event_calendar_block),
+            "buying_power": bool(buying_power_block),
         },
         "mark_integrity": build_mark_integrity(snapshot.get("positions") or []),
         "feed_state": feed_state,
@@ -219,6 +230,37 @@ def assemble_inputs(store) -> dict:
     except Exception:
         pass
 
+    # Forward scheduled-event awareness — built EXACTLY as decide() builds it
+    # (scope = held ∪ the full WATCHLIST, not the lean _names_in_play set —
+    # narrowing it would re-blind the reconstruction the same way it would
+    # re-blind the live desk; see the strategy.decide() comment).
+    event_calendar_block = None
+    try:
+        from .event_calendar import build_event_calendar
+        ec_positions = snap.get("positions") or []
+        ec_held = {(p.get("ticker") or "").upper()
+                   for p in ec_positions if p.get("ticker")}
+        event_calendar_block = build_event_calendar(
+            ec_positions,
+            ec_held | {t.upper() for t in strategy.WATCHLIST},
+        ).get("prompt_block")
+    except Exception:
+        pass
+
+    # Deployable-cash awareness — built EXACTLY as decide() builds it (same
+    # snapshot + already-fetched watch_px, scoped to the same _names_in_play
+    # set the quant / track-record blocks use).
+    buying_power_block = None
+    try:
+        from .buying_power import build_buying_power
+        buying_power_block = build_buying_power(
+            snap, watch_px,
+            strategy._names_in_play(
+                snap.get("positions") or [], merged, strategy.WATCHLIST),
+        ).get("prompt_block")
+    except Exception:
+        pass
+
     ml_opinion_block = None
     try:
         ml_qualified, ml_qual_reason = strategy._ml_is_qualified()
@@ -244,6 +286,8 @@ def assemble_inputs(store) -> dict:
         track_record_block=track_record_block,
         risk_mirror_block=risk_mirror_block,
         ml_opinion_block=ml_opinion_block,
+        event_calendar_block=event_calendar_block,
+        buying_power_block=buying_power_block,
     )
 
 
@@ -270,7 +314,9 @@ if __name__ == "__main__":  # works even when :8090 is wedged (desk_pulse preced
         a = ctx["advisory_blocks"]
         print(f"  blocks: self_review={a['self_review']} "
               f"track_record={a['track_record']} "
-              f"risk_mirror={a['risk_mirror']} ml={a['ml_opinion']}")
+              f"risk_mirror={a['risk_mirror']} ml={a['ml_opinion']} "
+              f"event_calendar={a['event_calendar']} "
+              f"buying_power={a['buying_power']}")
         mi = ctx["mark_integrity"]
         print(f"  marks: [{mi['verdict']}] {mi['headline']}")
         print(f"  prompt: {ctx['prompt_chars']} chars"
