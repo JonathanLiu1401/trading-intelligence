@@ -2720,3 +2720,89 @@ expected; this entry was appended, not rewritten).
   `17d8df9`: 3 files); `git diff --staged --name-only` + `git show --stat`
   verified no sibling leakage; never `git add -A`; on origin/master. Entry
   appended, not rewritten.
+
+- **2026-05-18 (hybrid pass 21 — Agent 3, debug + feature + analyst-validation)** —
+  Required-file-set pass (21st; codebase exceptionally mature, 20 prior
+  passes). Advisor-reviewed before substantive work and again before declaring
+  done. `sqlite3` CLI absent → all probes via `python3` `sqlite3` `mode=ro`,
+  index-friendly predicates only (no USB full-scan COUNT). Bare daemon
+  `pid 1702195` still up, started **2026-05-18 07:29:24Z**, predating EVERY
+  recent fix incl. `05b406e`/`b20cbae`/`50c1052` (the consistent stale-daemon
+  caveat — committed fixes ship on next restart). Concurrent sibling agent +
+  auto-commit/push daemon on the shared monorepo index (memory
+  `di-shared-repo-concurrency`) → strict per-commit pathspec staging.
+
+  **Phase 1 — bugs_fixed=0, NO Phase-1 commit (commit guard honoured).**
+  Reviewed the full non-off-limits bug-hunt surface — required 9 files +
+  `ml/inference.py` + `core/json_extract.py` + `watchers/alert_dedup.py` +
+  `triage/heuristic_scorer.py` + `watchers/alert_recency.py` + `ml/embedder.py`.
+  All uniformly hardened by the 20 prior passes; the requested storage/
+  urgency_scorer/features/model/trainer tests already exist (verified, not
+  duplicated). No genuine bug in clean scope. The recurring
+  `[stats_worker] error: 'NoneType' object is not subscriptable` (12+×/h, last
+  12:02:12Z) is **NOT a HEAD bug** — `_expect_row` (commit `05b406e`,
+  2026-05-18 **11:23:06Z**) already fixes it; the running daemon started
+  07:29Z, ~4h before the fix → executes pre-fix `article_store.py`. Confirmed
+  by stashing the sibling-WIP `rss_collector.py` and re-running its tests
+  (HEAD clean: 5/5 pass). Manufacturing a fix here would revert a load-bearing
+  prior decision (advisor-confirmed) → bugs_fixed honestly 0.
+
+  **Phase 2 — features_added=1, commit `097f912`** (`analysis/claude_analyst.py`
+  +72, new `tests/test_briefing_book_heat.py`, 14 tests). **BOOK HEAT**: the
+  5h Opus digest tells the analyst WHICH rows touch held positions (`[BOOK:]`
+  tag) but never that a single held name is the window's centre of gravity —
+  one MU story at 7.0 may not lead, but MU across 6 *distinct*
+  (post-`_collapse_syndicated`) stories is a magnitude signal Opus cannot
+  infer from per-row tags (it would have to tally 60 rows). Pure
+  `_book_heat_lines()` counts distinct digest rows per held ticker over the
+  already-collapsed+capped list Opus reads (syndicated copies of one event
+  count once — honest + verifiable against the rendered newswire; snapshot
+  rows with no url excluded, same guard as `[BOOK:]`), ranked count-desc then
+  canonical `_BOOK_TICKERS` order, capped at 6. Emitted as a `=== BOOK HEAT
+  ===` input block + a SYSTEM_PROMPT ranking-hint rule (LEAD/TOP-SIGNALS/
+  PORTFOLIO consequence; explicitly NOT echoed, unlike COVERAGE GAP).
+  Threshold ≥3 (conservative — analyst's top complaint is noise). Pure
+  read-side: returns NEW lists, never mutates `source_articles`, no DB write,
+  no ai_score/ml_score/score_source/urgency touch, backtest excluded upstream
+  by `get_top_for_briefing`'s `_LIVE_ONLY_CLAUSE` — **all four load-bearing
+  invariants intact by construction**. Mirrors the established `[syndicated
+  xN]`/`[BOOK:]`/COVERAGE-GAP shape and anti-import-cycle discipline.
+
+  **Phase 3 — user_findings=6 (analyst seat).** (1) **Stale daemon** (pid
+  1702195, 07:29Z) predates `05b406e` *and* `reap_stale_urgent`: NoneType
+  12+×/h still, plus `insert_batch`/`update_ml_scores_batch` *lock-retry
+  exhausted* ERRORs at 11:11:15Z → a whole scored batch silently dropped
+  (missed news from the analyst seat). Remedy: daemon restart applies all
+  pending committed fixes. (2) **26 phantom `urgency=1` rows**, ALL dated
+  2026-05-13 (5 days stale) — matches the `reap_stale_urgent` comment exactly;
+  HEAD reaper present, stale daemon hasn't run it (purge every 6h; restart
+  applies). Inflates the dashboard urgent tile with items never pushable. (3)
+  **Alert noise (analyst-annoying)**: `[Wikipedia] Nvidia RTX` (8.6),
+  `$NVIDIA (NVDA.US)$ - Moomoo` (9.8, quote-listing-page-like), and reddit
+  forum posts (`r/ValueInvesting` 9.8, `r/Daytrading` 8.0) fired 🚨 BREAKING.
+  Mostly pre-fix (stale daemon predates the lone-low-authority/quote-widget
+  gates). Residual gap even post-restart: `wikipedia` cred 0.60 clears the
+  0.45 lone gate — left as a finding, NOT fixed (the cred map is a
+  deliberately tight, contested area prior reviews kept evidence-only; a
+  unilateral pass-21 change risks reverting a load-bearing decision). (4)
+  **Briefing quality high** (2026-05-18T07:13): crisp actionable LEAD (bond
+  rout → semis selloff into NVDA print), RISK/CATALYST tied to held LITE/LNOK/
+  NVDL/MU with the DRAM C59 expiry, COVERAGE GAP surfacing SEC-8-K dark —
+  exactly the consumption BOOK HEAT augments. (5) **Collection healthy** —
+  3166 live art/last-hour, ~1.45M/24h; briefing cadence ~5–7h (within the
+  documented restart-churn tolerance; adaptive lookback + banner handle it).
+  (6) **Sibling `M collectors/rss_collector.py`** is a concurrent agent's
+  mid-edit (per-feed backoff WIP) that breaks its own 5 tests while HEAD is
+  clean — ops-only, never staged, left exactly as-is. None of 1/2/3/6 is a
+  quick safe fix in clean scope → no Phase-3 fold-in; bugs_fixed stays 0.
+
+  **Verify:** `storage.article_store` / `ml.features` / `ml.model` /
+  `analysis.claude_analyst` imports OK; suite **729 passed** (715 baseline +
+  14 new), the same 5 `test_rss_collector.py` failures are the pre-existing
+  sibling WIP (not ours, never staged; floor held exactly 5, never 6+; my 14
+  tests all pass). *Pre-existing, deliberately never staged* (consistent with
+  every prior entry): `collectors/rss_collector.py`, `daemon.py`,
+  `dashboard/server.py`, untracked sibling files, all `paper-trader/*`,
+  `logs/*.tmp`. Commit `097f912` pathspec-scoped to exactly 2 files;
+  `git diff --staged --name-only` verified no sibling leakage; never
+  `git add -A`; on origin/master. Entry appended, not rewritten.
