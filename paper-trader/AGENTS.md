@@ -4518,3 +4518,90 @@ pass #16/#17 shared-index-race lesson applied).
   via `_compute_decision_outcomes`, but list it for clarity).
 
 *Review pass #18 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+## Feature: macro calendar — forward FOMC rate-decision awareness (feature-dev agent, 2026-05-18)
+
+**Gap.** Across 47 analytics modules the live Opus decision prompt had
+exactly **one** forward-looking block: `event_calendar` (single-name
+**earnings**). **Zero** macro-event awareness existed anywhere — yet this
+watchlist is leveraged-ETF heavy (SOXL/TQQQ/NVDL/SOXS), exactly the
+instruments that gap hardest on a Fed surprise, and the system's own 5h
+Opus briefings repeatedly *lead* with macro (bond rout, 10Y, FOMC). A
+leveraged book entering the rate-decision instant blind is the macro
+analog of the exact "added the day before an earnings print, blind"
+mistake `event_calendar` was built to close — the same gap, one dimension
+over.
+
+**What shipped.** New `paper_trader/analytics/macro_calendar.py` —
+`build_macro_calendar(now=None, horizon_days=14.0)`:
+
+- **FOMC-only, by verifiability discipline.** The 2026 FOMC schedule is
+  fully verified from federalreserve.gov (all 8 meetings, fetched
+  2026-05-18). BLS CPI/Employment-Situation forward dates are *not*
+  reliably verifiable (bls.gov hard-blocks every fetch HTTP 403;
+  archive-URL dates conflict with summaries by ±2d; Jul–Dec unreleased).
+  Encoding an unverified date on the live decision path would mislead Opus
+  — declined. CPI/NFP are a documented future extension *pending a
+  verifiable source*, NOT an oversight (a parallel table behind the same
+  honesty bound).
+- **Pure static table + date math** — NO file I/O, NO network, no import
+  beyond stdlib (even safer than `event_calendar`'s disk read; the
+  `risk_mirror` hot-path discipline). `now` injectable, deterministic,
+  `_safe` (never raises — a top-level guard returns an honest dict).
+- **Honesty bound (landmine guard).** `SCHEDULE_VALID_THROUGH` is exactly
+  the last encoded instant; `now` past it degrades to one honest
+  "schedule not loaded" line — never a fabricated event. Locked by a
+  table↔bound **no-drift** test (extending one without the other fails
+  RED) — the test written first.
+- **Time-precision tiers** (the material differentiator vs
+  `event_calendar`'s date-only granularity): `IMMINENT_HOURS` (<24h,
+  rendered "in Xh") > `IMMINENT` (≤3d) > `UPCOMING` (≤horizon). Each FOMC
+  statement instant is the 2nd-day 14:00 ET policy release, ET→UTC
+  resolved across the 2026 DST boundary (Jan/Dec 19:00Z EST, Mar–Oct
+  18:00Z EDT) so there is no tz-library dependency on the hot path.
+- **Market-wide, not per-ticker** (the structural difference from
+  `event_calendar`): no positions/names arg — an FOMC decision is
+  relevant to a flat book too; always rendered.
+- **Observational, never prescriptive** (invariants #2/#12 — the
+  `event_calendar` contract): autonomy-preserving preamble, no directive
+  verb, no cap, never gates Opus.
+
+**Wiring (all one commit — the standing checklist item).**
+`strategy._build_payload` gained a `macro_calendar_block` kwarg rendered
+**between `event_calendar` and `buying_power`** (forward blocks stay
+adjacent: earnings then macro) — the prompt order is now
+`risk < sector < event < macro < bp < WATCHLIST PRICES`. `strategy.decide()`
+builds it `_safe` after `event_calendar_block`. Per the AGENTS.md pass-#17
+standing checklist item (3rd documented instance of "a new `_build_payload`
+advisory block forgotten in `decision_context.py`"), **the same commit**
+threads it through `decision_context.build_decision_context` +
+`assemble_inputs` + the `advisory_blocks` dict + the `__main__` CLI line.
+New endpoint **`GET /api/macro-calendar`** serves the same builder
+(prompt↔endpoint parity — the `event_calendar`/`risk_mirror` discipline);
+pure static-table, no store read.
+
+**Tests.** New `tests/test_macro_calendar.py` (18, behaviour-asserting):
+honesty-bound degrade (written first) + table↔bound no-drift; the 8
+encoded instants == the federalreserve.gov-verified 2026 set; ET→UTC DST
+correctness; IMMINENT_HOURS/IMMINENT/UPCOMING + exact 24h/3d/horizon
+boundaries; past-event grace; soonest-first sort; observational/no-directive;
+never-raises; `_build_payload` render position + None-renders-nothing;
+`/api/macro-calendar` Flask parity. Plus `test_decision_context.py`
+(updated exact `advisory_blocks` dict + new
+`test_macro_calendar_block_reaches_prompt_verbatim_and_flagged` —
+the full `risk<sector<event<macro<bp<WATCHLIST` ordering lock) and
+`test_decision_context_endpoint.py` (assemble_inputs-builds-it discriminating
+lock). Bounded sweep **330 green** across `test_macro_calendar`,
+`test_decision_context{,_endpoint}`, `test_event_calendar`,
+`test_core_strategy`, `test_buying_power`, `test_sector_exposure`,
+`test_core_dashboard_helpers`, `test_core_runner`, `test_core_reporter`,
+`test_core_state_swr`, `test_dashboard_threaded` (the full suite times out
+>400s under concurrent sibling-agent load — the documented host state).
+
+Like every recent feature this **applies on the next paper-trader restart**
+— the live `:8090` is `stale` / `behind:2`, so it keeps the old prompt
+(no macro block) until the runner reboots onto the new SHA.
+
+*Macro-calendar feature appended 2026-05-18. Prior content above is unmodified.*

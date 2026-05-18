@@ -7522,6 +7522,20 @@ def event_calendar_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/macro-calendar")
+def macro_calendar_api():
+    """The exact forward FOMC rate-decision awareness block the live trader
+    now sees in its decision prompt (the `event_calendar` / `risk_mirror`
+    prompt↔endpoint parity discipline). Pure static-table builder — no disk,
+    no `:8080` hop, no store read (it is market-wide, not per-ticker).
+    Observational only; never gates Opus."""
+    try:
+        from .analytics.macro_calendar import build_macro_calendar
+        return jsonify(build_macro_calendar())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/sector-exposure")
 def sector_exposure_api():
     """The exact live-book sector-concentration block the live trader now

@@ -126,8 +126,8 @@ class TestInputSummary:
         a = r["advisory_blocks"]
         assert a == {"self_review": True, "track_record": True,
                      "risk_mirror": False, "ml_opinion": False,
-                     "event_calendar": False, "buying_power": False,
-                     "sector_exposure": False}
+                     "event_calendar": False, "macro_calendar": False,
+                     "buying_power": False, "sector_exposure": False}
 
 
 class TestNewAdvisoryBlocksReachPrompt:
@@ -163,9 +163,11 @@ class TestNewAdvisoryBlocksReachPrompt:
         r = _ctx()
         a = r["advisory_blocks"]
         assert a["event_calendar"] is False
+        assert a["macro_calendar"] is False
         assert a["buying_power"] is False
         assert a["sector_exposure"] is False
         assert "EARNINGS WITHIN 14D" not in r["prompt"]
+        assert "MACRO CAL MARKER" not in r["prompt"]
         assert "BUYING POWER" not in r["prompt"]
         assert "SECTOR EXPOSURE" not in r["prompt"]
 
@@ -194,6 +196,37 @@ class TestNewAdvisoryBlocksReachPrompt:
         assert p.index("RISK MIRROR") < p.index("SECTOR EXPOSURE")
         assert p.index("SECTOR EXPOSURE") < p.index("EARNINGS WITHIN 14D")
         assert p.index("EARNINGS WITHIN 14D") < p.index("BUYING POWER")
+        assert p.index("BUYING POWER") < p.index("WATCHLIST PRICES:")
+
+    def test_macro_calendar_block_reaches_prompt_verbatim_and_flagged(self):
+        """Regression lock (macro-calendar feature): a 4th forward advisory
+        block (scheduled FOMC rate decisions) is threaded into the real
+        ``strategy.decide()`` → ``_build_payload`` call. Per the AGENTS.md
+        standing checklist item (3rd documented instance of this exact bug
+        class — event_calendar/buying_power in pass #16, sector_exposure in
+        pass #17), it MUST be wired into this reconstruction in the SAME
+        commit or ``/api/decision-context`` silently drops it and a trader
+        auditing "did Opus see the FOMC decision was 2 days out?" gets a
+        false NO. This is the comprehensive ordering lock:
+        ``risk < sector < event < macro < bp < WATCHLIST PRICES`` — the
+        exact byte-faithful order ``strategy.decide()`` emits."""
+        r = _ctx(
+            risk_mirror_block="RISK MIRROR: top weight 61%",
+            sector_exposure_block="SECTOR EXPOSURE: SEMIS 61.0% of book",
+            event_calendar_block="EARNINGS WITHIN 14D: NVDA reports 2026-05-28",
+            macro_calendar_block="MACRO CAL MARKER: FOMC in 2.0d (IMMINENT)",
+            buying_power_block="BUYING POWER: $18.49 free cash",
+        )
+        p = r["prompt"]
+        assert "MACRO CAL MARKER: FOMC in 2.0d (IMMINENT)" in p
+        assert r["advisory_blocks"]["macro_calendar"] is True
+        # forward blocks stay adjacent (earnings then macro) and the whole
+        # advisory stack precedes market data — byte-faithful to
+        # _build_payload's {risk}{sector}{event}{macro}{bp} render order.
+        assert p.index("RISK MIRROR") < p.index("SECTOR EXPOSURE")
+        assert p.index("SECTOR EXPOSURE") < p.index("EARNINGS WITHIN 14D")
+        assert p.index("EARNINGS WITHIN 14D") < p.index("MACRO CAL MARKER")
+        assert p.index("MACRO CAL MARKER") < p.index("BUYING POWER")
         assert p.index("BUYING POWER") < p.index("WATCHLIST PRICES:")
 
     def test_embeds_mark_integrity_verbatim(self):

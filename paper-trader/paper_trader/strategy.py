@@ -77,7 +77,13 @@ WATCHLIST = [
     "SOXL", "TECL", "FNGU", "CURE", "LABU",
     "NAIL", "DFEN", "DPST", "FAS", "TNA", "UTSL",
     # Leveraged ETFs — 2x Bull
-    "QLD", "SSO", "NVDU", "MSFU", "AMZU", "GOOGU", "METAU",
+    # GOOGU / METAU removed 2026-05-18: both single-stock 2x ETFs are
+    # permanently delisted (yfinance 404, no quote). Keeping them here only
+    # told Opus two untradeable names were available and made
+    # market.get_prices(WATCHLIST) re-404 every _DEAD_TTL window. Resolves
+    # AGENTS.md review-pass-#18 core finding #3 (live side only — backtest.py's
+    # historical universe is the ML-domain owner's call, deliberately untouched).
+    "QLD", "SSO", "NVDU", "MSFU", "AMZU",
     "TSLL", "CONL", "BITU", "ETHU",
     # Leveraged Bear / Hedge
     "SQQQ", "SPXS", "SOXS", "TECS", "FNGD",
@@ -102,7 +108,7 @@ risk, leverage, and timing. There are NO enforced limits. You can:
 
 LEVERAGE INSTRUMENTS AVAILABLE:
 - Leveraged ETFs 3x Bull: TQQQ (QQQ), UPRO/SPXL (SPY), UDOW (Dow), URTY (Russell), SOXL (semis), TECL (tech), FNGU (FANGs), CURE (healthcare), LABU (biotech), NAIL (homebuilders), DPST (banks), FAS (financials), DFEN (defense), TNA (small-cap), UTSL (utilities)
-- Leveraged ETFs 2x Bull: QLD (QQQ 2x), SSO (SPY 2x), NVDU (NVDA), MSFU (MSFT), AMZU (AMZN), GOOGU (GOOG), METAU (META), TSLL (TSLA), CONL (COIN), LNOK (Nokia), BITU (BTC), ETHU (ETH)
+- Leveraged ETFs 2x Bull: QLD (QQQ 2x), SSO (SPY 2x), NVDU (NVDA), MSFU (MSFT), AMZU (AMZN), TSLL (TSLA), CONL (COIN), LNOK (Nokia), BITU (BTC), ETHU (ETH)
 - Leveraged Bear/Hedge: SQQQ/SPXS (3x short index), SOXS (3x short semis), TECS (3x short tech), FNGD (3x short FANGs)
 - For high-conviction directional trades, consider 2-3x leveraged ETFs instead of the underlying
 - For options-equivalent exposure: buy deep ITM LEAPS calls (delta >0.80) to simulate leveraged long
@@ -612,6 +618,7 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    risk_mirror_block: str | None = None,
                    sector_exposure_block: str | None = None,
                    event_calendar_block: str | None = None,
+                   macro_calendar_block: str | None = None,
                    buying_power_block: str | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
     pos_lines = []
@@ -693,6 +700,15 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # data: the trader sees its structural risk and then what is *coming* on
     # the names in play, before watchlist prices bias it.
     event_section = f"{event_calendar_block}\n" if event_calendar_block else ""
+    # Forward MACRO awareness (scheduled FOMC rate decisions) — the macro
+    # sibling of event_calendar, one dimension over: a rate-decision surprise
+    # moves the WHOLE book in one instant (leveraged ETFs most violently),
+    # so unlike the per-name earnings block this is market-wide and always
+    # rendered. Same observational/advisory contract as the blocks above
+    # (invariants #2/#12 — the event_calendar precedent). Placed immediately
+    # after the per-name forward block so the two forward blocks stay
+    # adjacent (earnings then macro) and before deployable-cash / prices.
+    macro_section = f"{macro_calendar_block}\n" if macro_calendar_block else ""
     # Deployable-cash awareness — the lean prompt-facing complement to the
     # dashboard-only capital_paralysis (AGENTS.md #2/#12, the event_calendar
     # precedent). Placed last in the advisory stack, immediately before
@@ -710,7 +726,7 @@ PORTFOLIO:
   total value: ${snapshot['total_value']:.2f}
   positions:
 {chr(10).join(pos_lines) if pos_lines else '  (none)'}
-{review_section}{track_section}{risk_section}{sector_section}{event_section}{bp_section}
+{review_section}{track_section}{risk_section}{sector_section}{event_section}{macro_section}{bp_section}
 WATCHLIST PRICES:
 {chr(10).join(px_lines)}
 
@@ -1265,6 +1281,23 @@ def decide() -> dict:
     except Exception as e:
         print(f"[strategy] event-calendar failed (non-fatal): {e}")
 
+    # Forward MACRO awareness — scheduled FOMC rate decisions. The macro
+    # sibling of event_calendar, one dimension over: a rate-decision surprise
+    # moves the WHOLE book in one instant (this watchlist is leveraged-ETF
+    # heavy — SOXL/TQQQ/NVDL — exactly what gaps hardest on a Fed surprise),
+    # so it is market-wide (no positions arg) and always built. A pure
+    # static-table call: NO store read, NO file / network I/O (even safer
+    # than event_calendar's disk read — the risk_mirror hot-path discipline).
+    # Observational only (invariants #2/#12 — the event_calendar precedent);
+    # wrapped so a diagnostics fault is "no macro block this cycle", never
+    # "no decision this cycle".
+    macro_calendar_block: str | None = None
+    try:
+        from .analytics.macro_calendar import build_macro_calendar
+        macro_calendar_block = build_macro_calendar().get("prompt_block")
+    except Exception as e:
+        print(f"[strategy] macro-calendar failed (non-fatal): {e}")
+
     # Deployable-cash awareness — the lean, prompt-facing complement to the
     # dashboard-only capital_paralysis. Pure arithmetic over the already-marked
     # snapshot + the already-fetched watch prices (NO extra store read / NO
@@ -1310,6 +1343,7 @@ def decide() -> dict:
                              risk_mirror_block=risk_mirror_block,
                              sector_exposure_block=sector_exposure_block,
                              event_calendar_block=event_calendar_block,
+                             macro_calendar_block=macro_calendar_block,
                              buying_power_block=buying_power_block)
     prompt = f"{SYSTEM_PROMPT}\n\n---\nCONTEXT:\n{payload}"
     if ml_opinion_block:
