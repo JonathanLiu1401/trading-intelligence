@@ -884,6 +884,71 @@ modulates identically; reasoning surfaces the skip; independent of the
   > cache-validity / gate-side fix lands. Read `notes` before trusting a
   > run's alpha.
 
+### Out-of-sample calibration view + training-integrity filter (2026-05-18)
+
+- **Only FILLED trades feed scorer/ArticleNet training (fix).**
+  `_compute_decision_outcomes` and `_append_top_decisions` read
+  `backtest_decisions` for BUY/SELL rows but did **not** filter on execution
+  status. `run_one` records a terminal non-FILLED decision row for the last
+  intraday decision when nothing filled that day; had that decision been a
+  BUY/SELL `_execute_decision` rejected, its 5d forward return would have
+  trained the DecisionScorer (and `winner_training.jsonl`→ArticleNet) as a
+  *phantom outcome for a position that never moved capital* — and the
+  blocking reason (out of cash / no price) is regime-correlated, so it is
+  biased contamination, not noise. Both pipeline queries now require
+  `status = 'FILLED'`. **Latent, not active**: an audit of the live
+  `backtest.db.local_backup` showed BUY/SELL decisions are *100% FILLED*
+  (5393 FILLED, 0 non-FILLED; HOLD is the only other status) — `_ml_decide`
+  only ever emits executable decisions today. The filter makes the
+  "trained only on real fills" invariant explicit and refactor-proof (one
+  position-cap commit away from silently corrupting the scorer). Locked by
+  `tests/test_continuous.py::TestFilledOnlyTrainingIntegrity` (FILLED
+  survives, BLOCKED excluded, on *both* pipelines).
+
+- **OOS calibration view (`calibration.py --oos`, feature).**
+  `scorer_calibration` over the full `decision_outcomes.jsonl` is an
+  *in-sample* read (the scorer trained on most of those rows), so its
+  `WELL_CALIBRATED` verdict is optimistic — AGENTS.md already warned of
+  this but there was no out-of-sample *decile* view (`skill_trend.py`
+  trends the ledger's scalar `oos_rmse`/`oos_ic`; `gate_audit.py` buckets
+  by the 5 economic gate arms — neither shows the magnitude-bias decile
+  curve + crisp verdict on unseen data). `scorer_calibration_oos()` reuses
+  `paper_trader.validation.split_outcomes_temporal` — the **exact** split
+  `_train_decision_scorer` uses for `oos_rmse`/`oos_ic`, so this decile
+  view and the ledger's scalar OOS metrics describe the *same* holdout —
+  and runs the same `scorer_calibration` report on only the most-recent
+  `oos_fraction` (default 0.2) by `sim_date`. Returns the report plus
+  `{oos_n, train_n, oos_fraction}`. `python3 -m paper_trader.ml.calibration
+  --oos` prints the in-sample report (byte-identical default), then the
+  temporal-holdout report, then an explicit optimism-gap line when
+  in-sample is `WELL_CALIBRATED` but OOS is not. Read-only, never raises
+  (degrades to `INSUFFICIENT_DATA` — same operational discipline as the
+  rest of the module). Exact-value locked by
+  `tests/test_calibration.py::TestScorerCalibrationOOS` (split sizes &
+  metadata, slice-equivalence to `scorer_calibration(recs[-oos:])`,
+  history-`WELL_CALIBRATED` vs OOS-`MISCALIBRATED` overfit signature,
+  `< 5`-row and empty degradation).
+
+  > **Quant finding (2026-05-18, decisive).** Run live on the deployed
+  > pickle (`n_train=3830`, 5000 outcomes): **in-sample `WELL_CALIBRATED`**
+  > (spearman 0.51, monotone deciles, 2.08 pp decile error) vs **temporal
+  > OOS `MISCALIBRATED`** on the 1000-row holdout (spearman **0.013**,
+  > monotone 0.556, decile error 7.6 pp). The OOS decile-realized column is
+  > flat noise across the whole prediction range — d1 (mean_pred −21.34)
+  > realized −1.05 vs d10 (mean_pred +21.43) realized −0.27: the most
+  > bearish and most bullish predicted buckets have *statistically
+  > identical* realized outcomes. The scorer’s `WELL_CALIBRATED` is purely
+  > a training artifact; out-of-sample it has **~zero rank skill**, yet it
+  > gates BUY conviction every cycle (`gate_active=true`, `n_train ≥ 500`,
+  > invariant #5). This corroborates `skill_trend`’s `NEGATIVE_OOS_SKILL`
+  > verdict and the wired `scorer_skill_log.jsonl` (`oos_dir_acc` ≈ 0.47–
+  > 0.55, `oos_ic` ≈ 0, `val_rmse` ≪ `oos_rmse` — textbook overfit). This
+  > is a **reported observation, not a model change** — altering the MLP /
+  > gate is a training-dynamics change out of surgical scope (CLAUDE.md §6).
+  > A skeptical quant should treat the conviction gate as adding sizing
+  > variance with no demonstrated compensating edge until OOS skill clears
+  > the mean-predictor baseline (`skill_trend` / `--oos` are the arbiters).
+
 ### Tests (ML + backtest section)
 
 ```bash
@@ -900,8 +965,16 @@ cd /home/zeph/paper-trader && python3 -m pytest tests/test_core_*.py -v
 # Full suite
 cd /home/zeph/paper-trader && python3 -m pytest tests/ -v
 
-# Scorer calibration diagnostic (exact-value verdict locks)
+# Scorer calibration diagnostic (exact-value verdict locks; incl. the
+# TestScorerCalibrationOOS temporal-holdout view added 2026-05-18)
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_calibration.py -v
+
+# In-sample vs temporal-OOS calibration of the LIVE pickle (read-only;
+# surfaces the in-sample-optimism gap in one command)
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.calibration --oos
+
+# Training-integrity (only FILLED trades train scorer/ArticleNet)
+cd /home/zeph/paper-trader && python3 -m pytest tests/test_continuous.py::TestFilledOnlyTrainingIntegrity -v
 
 # Per-persona strategy-quality leaderboard (exact-value verdict locks)
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_persona_leaderboard_20260517.py -v
