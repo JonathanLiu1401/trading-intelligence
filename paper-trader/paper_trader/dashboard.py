@@ -8331,11 +8331,19 @@ def runner_heartbeat_api():
         from .analytics.runner_heartbeat import build_runner_heartbeat
         from . import market as _mkt
         store = get_store()
-        decs = store.recent_decisions(1)
+        # Window (not just the newest row) so the additive decision-efficacy
+        # overlay can see a NO_DECISION storm: a loop cycling on cadence but
+        # emitting NO_DECISION every cycle is alive-but-brain-dead and the
+        # bare cadence verdict alone would mislabel it HEALTHY. The builder
+        # owns interpretation; the endpoint owns the store read (the
+        # thesis_drift split). recent_decisions is newest-first.
+        decs = store.recent_decisions(20)
         last_ts = decs[0].get("timestamp") if decs else None
+        recent_actions = [d.get("action_taken") for d in decs]
         now_utc = datetime.now(timezone.utc)
         hb = build_runner_heartbeat(
-            last_ts, _mkt.is_market_open(now_utc), now=now_utc)
+            last_ts, _mkt.is_market_open(now_utc), now=now_utc,
+            recent_actions=recent_actions)
         # Additive: the single-instance-lock state of THE PROCESS SERVING
         # THIS DASHBOARD (the dashboard runs in a runner thread). A runner
         # that booted degraded (no flock — invariant #19 fail-open) may be

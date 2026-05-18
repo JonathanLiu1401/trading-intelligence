@@ -237,3 +237,200 @@ def test_endpoint_singleton_lock_ok_when_acquired(client, monkeypatch):
     assert d["singleton_lock"]["degraded"] is False
     assert d["singleton_lock"]["headline"].startswith("OK")
     assert "4242" in d["singleton_lock"]["headline"]
+
+
+def test_endpoint_surfaces_degraded_discord_delivery(client, monkeypatch):
+    """Additive (2026-05-18): /api/runner-heartbeat exposes Discord delivery
+    health so the silent-channel class of failure (the 2026-05-17 `env node`
+    PATH outage — loop alive, operator surface dark) is visible. The pre-
+    existing liveness verdict is unchanged."""
+    c, s = client
+    s.record_decision(True, 3, "BUY NVDA → FILLED", "{}", 1000.0, 100.0)
+    from paper_trader import reporter as _reporter
+    monkeypatch.setattr(_reporter, "_notify_state", {
+        "last_attempt_ts": None, "last_ok_ts": None, "last_result": None,
+        "consecutive_failures": 0, "last_error": "",
+    })
+    for _ in range(3):
+        _reporter._record_send_outcome(False, "/usr/bin/env: 'node' not found")
+    r = c.get("/api/runner-heartbeat")
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["verdict"] == "HEALTHY"  # loop liveness unchanged
+    assert d["notify"]["verdict"] == "DEGRADED"
+    assert d["notify"]["consecutive_failures"] == 3
+    assert d["notify"]["restart_recommended"] is True
+
+
+def test_endpoint_discord_delivery_healthy(client, monkeypatch):
+    c, s = client
+    s.record_decision(True, 3, "BUY NVDA → FILLED", "{}", 1000.0, 100.0)
+    from paper_trader import reporter as _reporter
+    monkeypatch.setattr(_reporter, "_notify_state", {
+        "last_attempt_ts": None, "last_ok_ts": None, "last_result": None,
+        "consecutive_failures": 0, "last_error": "",
+    })
+    _reporter._record_send_outcome(True)
+    r = c.get("/api/runner-heartbeat")
+    d = r.get_json()
+    assert d["notify"]["verdict"] == "HEALTHY"
+    assert d["notify"]["restart_recommended"] is False
+
+
+# ═════════════ decision-efficacy overlay (additive, 2026-05-18) ═════════════
+#
+# Why this exists: the bare cadence verdict calls a loop that cycles
+# perfectly but emits NO_DECISION every cycle "HEALTHY, restart_recommended:
+# false" — the exact live regime (~60% lifetime NO_DECISION, 5-in-a-row
+# under host-load storms). A trader reading the heartbeat (its primary use)
+# is then actively reassured the engine is fine while it is brain-dead.
+# These pin the additive overlay: byte-identical when omitted, IDLE_STORM
+# folds restart+headline but NEVER the liveness verdict enum, the
+# elevated/producing/no-data bands, the exact storm-threshold boundary, and
+# the canonical-predicate drift lock.
+
+from paper_trader.analytics.runner_heartbeat import (  # noqa: E402
+    NO_DECISION_STORM_THRESHOLD,
+    _is_no_decision,
+)
+
+ND = "NO_DECISION"
+
+
+def test_storm_threshold_constant_is_the_spec():
+    # Retune-proof (the OPEN_INTERVAL_S precedent) AND must mirror the
+    # runner's auto-recovery breaker so the heartbeat recommends a restart
+    # at the same wedge the breaker actually fires on.
+    assert NO_DECISION_STORM_THRESHOLD == 5
+    from paper_trader import runner as _runner
+    assert NO_DECISION_STORM_THRESHOLD == _runner.CONSECUTIVE_NO_DECISION_LIMIT
+
+
+def test_is_no_decision_mirrors_forensics():
+    """Drift lock (single source of truth, invariant #10): the inlined
+    predicate must stay byte-equivalent to the canonical
+    decision_forensics._is_no_decision across every shape it sees."""
+    from paper_trader.analytics.decision_forensics import (
+        _is_no_decision as canonical,
+    )
+    for s in (ND, "NO_DECISION", "", "  ", None, "HOLD MU → HOLD",
+              "BUY NVDA → FILLED", "SELL X → BLOCKED", "no_decision",
+              " NO_DECISION ", "NO_DECISIONX"):
+        assert _is_no_decision(s) == canonical(s), repr(s)
+
+
+def test_recent_actions_omitted_is_byte_identical():
+    """The additive contract: with recent_actions omitted the output is
+    exactly what it was before the parameter existed — no decision_efficacy
+    key, headline/verdict/restart untouched."""
+    base = build_runner_heartbeat(_ago(600), market_open=True, now=NOW)
+    assert "decision_efficacy" not in base
+    assert base["verdict"] == "HEALTHY"
+    assert base["restart_recommended"] is False
+    # Passing recent_actions=None is identical to omitting it.
+    assert build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW, recent_actions=None) == base
+
+
+def test_idle_storm_folds_restart_and_headline_not_verdict():
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * 5 + ["BUY NVDA → FILLED"])
+    # liveness verdict enum untouched (the separation contract)
+    assert out["verdict"] == "HEALTHY"
+    # but the trader-facing signals now reflect the brain-dead engine
+    assert out["restart_recommended"] is True
+    assert "NO_DECISION" in out["headline"] and "restart" in out["headline"]
+    eff = out["decision_efficacy"]
+    assert eff["verdict"] == "IDLE_STORM"
+    assert eff["consecutive_no_decision"] == 5
+    assert eff["window"] == 6
+    assert eff["no_decision_pct"] == round(5 / 6 * 100.0, 1)
+
+
+def test_storm_threshold_boundary_off_by_one():
+    """threshold-1 consecutive is NOT a storm; exactly threshold IS — locks
+    the `>=` against a `>` regression that would mute a real 5-run wedge."""
+    k = NO_DECISION_STORM_THRESHOLD
+    just_under = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * (k - 1) + ["HOLD MU → HOLD"])
+    assert just_under["decision_efficacy"]["verdict"] != "IDLE_STORM"
+    assert just_under["restart_recommended"] is False
+    exactly = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW, recent_actions=[ND] * k)
+    assert exactly["decision_efficacy"]["verdict"] == "IDLE_STORM"
+    assert exactly["restart_recommended"] is True
+
+
+def test_elevated_but_not_storm_is_degraded_no_restart():
+    """Latest cycle produced a decision (consec=0) but the window is mostly
+    NO_DECISION → DEGRADED: informational, NO restart, verdict/headline of
+    the liveness layer untouched."""
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=["BUY NVDA → FILLED"] + [ND] * 3)  # 75% ND, consec=0
+    assert out["verdict"] == "HEALTHY"
+    assert out["restart_recommended"] is False
+    assert "NO_DECISION" not in out["headline"]  # liveness headline unchanged
+    eff = out["decision_efficacy"]
+    assert eff["verdict"] == "DEGRADED"
+    assert eff["consecutive_no_decision"] == 0
+    assert eff["no_decision_pct"] == 75.0
+
+
+def test_producing_when_engine_actually_decides():
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=["BUY NVDA → FILLED", "HOLD MU → HOLD",
+                        ND, "SELL MU → FILLED"])  # 25% ND, consec=0
+    assert out["restart_recommended"] is False
+    assert out["decision_efficacy"]["verdict"] == "PRODUCING"
+    assert "decision_efficacy" in out and "NO_DECISION" not in out["headline"]
+
+
+def test_empty_recent_actions_is_no_data_efficacy():
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW, recent_actions=[])
+    assert out["decision_efficacy"]["verdict"] == "NO_DATA"
+    assert out["restart_recommended"] is False
+    assert out["verdict"] == "HEALTHY"
+
+
+def test_stalled_with_storm_stays_stalled_and_restart():
+    """A STALLED loop that is ALSO storming: verdict stays STALLED (cadence),
+    restart already True, efficacy still reports the storm so the operator
+    sees both root causes."""
+    out = build_runner_heartbeat(
+        _ago(4 * 3600), market_open=True, now=NOW,
+        recent_actions=[ND] * 8)
+    assert out["verdict"] == "STALLED"
+    assert out["restart_recommended"] is True
+    assert out["decision_efficacy"]["verdict"] == "IDLE_STORM"
+
+
+def test_endpoint_idle_storm_surfaces_restart_keeps_verdict(client):
+    """End-to-end: a fresh-cadence loop (HEALTHY) whose recent decisions are
+    all NO_DECISION must surface restart_recommended + the storm in
+    decision_efficacy while the liveness verdict stays HEALTHY."""
+    c, s = client
+    for _ in range(6):
+        s.record_decision(False, 0, "NO_DECISION",
+                          "claude returned no response (timeout/empty)",
+                          972.0, 6.0)
+    r = c.get("/api/runner-heartbeat")
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["verdict"] == "HEALTHY"            # cadence is fine
+    assert d["restart_recommended"] is True     # but engine is wedged
+    assert d["decision_efficacy"]["verdict"] == "IDLE_STORM"
+    assert d["decision_efficacy"]["consecutive_no_decision"] == 6
+
+
+def test_endpoint_producing_when_recent_decision_real(client):
+    c, s = client
+    s.record_decision(True, 3, "BUY NVDA → FILLED", "{}", 1000.0, 100.0)
+    d = c.get("/api/runner-heartbeat").get_json()
+    assert d["verdict"] == "HEALTHY"
+    assert d["restart_recommended"] is False
+    assert d["decision_efficacy"]["verdict"] == "PRODUCING"
