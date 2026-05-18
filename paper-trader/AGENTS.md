@@ -981,15 +981,86 @@ modulates identically; reasoning surfaces the skip; independent of the
   > variance with no demonstrated compensating edge until OOS skill clears
   > the mean-predictor baseline (`skill_trend` / `--oos` are the arbiters).
 
+### Multi-horizon outcome capture + horizon audit (2026-05-18)
+
+- **`_compute_decision_outcomes` now additively records
+  `forward_return_10d` / `forward_return_20d`** alongside the unchanged
+  `forward_return_5d`. The DecisionScorer still trains **only** on the 5d
+  label (`train_scorer` reads `forward_return_5d` exclusively) and the gate
+  is untouched — the extra horizons are pure read-only research signal. The
+  helper `_fwd_ret_h(ticker, sim_d, idx, h)` (defined beside `_td_index`)
+  is best-effort: a horizon whose window runs past cached price history
+  yields `None` and **never** skips or zeroes the 5d row training depends
+  on (the 5d path is byte-identical — locked by
+  `tests/test_horizon_audit.py::TestComputeDecisionOutcomesMultiHorizon`,
+  exact `8.3333 / 16.6667 / 33.3333` on the synthetic curve + the
+  5d-present/10d-20d-`None` tail case). Legacy rows in
+  `decision_outcomes.jsonl` have no 10d/20d keys; they populate as the
+  continuous loop runs the new code.
+
+- **`paper_trader/ml/horizon_audit.py` (new read-only diagnostic).** Every
+  pre-existing OOS arbiter (calibration / gate_audit / skill_trend /
+  baseline_compare / regime_audit) can *only* measure skill against the 5d
+  label — none can answer the decisive question that follows from their
+  shared `oos_ic ≈ 0` finding: **is the scorer near-blind because the
+  features carry no signal, or because the 5-trading-day target is just too
+  noisy** (AGENTS.md already notes leveraged ETFs have "noisy 5d windows
+  but strong 3-12 month returns"). On the temporal-OOS slice (the *same*
+  `validation.split_outcomes_temporal` every other OOS tool uses) it
+  rank-ICs the two signals that actually drive `_ml_decide` — `ml_score`
+  (feature slot 0) and `mom20` — against each of 5d/10d/20d, reusing
+  `calibration._spearman` and the codebase-universal SELL sign-flip
+  (applied to probe *and* target, the `baseline_compare._aligned`
+  precedent). Verdicts (exact-value test-locked in
+  `tests/test_horizon_audit.py`, module constants `MIN_PAIRS=30`,
+  `IC_MARGIN=0.05`, `EDGE_FLOOR=0.10`): `INSUFFICIENT_DATA` →
+  `INSUFFICIENT_LONG_HORIZON` (5d sampled but 10d/20d not yet accumulated —
+  the honest pre-population state) → `NO_HORIZON_HAS_EDGE` (best
+  \|rank-IC\| < `EDGE_FLOOR` at *every* horizon — dead feature set, not a
+  horizon problem) → `LONGER_HORIZON_MORE_PREDICTABLE` (a longer horizon
+  beats 5d by > `IC_MARGIN` — the 5d target is the handicap) → `5D_ADEQUATE`.
+  Read-only, never raises (same operational discipline as the rest of the
+  module). CLI: `python3 -m paper_trader.ml.horizon_audit [--all]`.
+
+  > **Quant finding (2026-05-18, this pass).** Live OOS arbiters on the
+  > deployed pickle (`n_train=3485`, 1109-row temporal-OOS slice):
+  > `skill_trend` = **`NEGATIVE_OOS_SKILL`** (recent median `oos_rmse`
+  > 11.30 vs the fresh mean-predictor baseline **5.56**, `oos_ic` 0.02,
+  > `oos_dir_acc` 0.505, **trend DEGRADING**, `gate_active=1.0`);
+  > `calibration --oos` = **`MISCALIBRATED`** (spearman 0.039; the
+  > OOS decile-realized column is flat noise — d1 realized +0.06 vs d10
+  > +1.36); `regime_audit` = **`REGIME_UNIFORM_NULL`** (≈0 skill in every
+  > measurable regime — not a regime-mix artifact). The decisive one:
+  > `baseline_compare` = **`MLP_WORSE_THAN_TRIVIAL`** — the raw `ml_score`
+  > one-liner scores OOS rank-IC **+0.204** while the 17-feature MLP scores
+  > **+0.039** (gap −0.165): *the network destroys the signal it is fed*.
+  > The new `horizon_audit` **independently reproduces `ml_score`'s 5d OOS
+  > rank-IC at exactly +0.2038** (byte-identical to `baseline_compare`'s
+  > number — a built-in cross-check confirming it is wired to the same
+  > slice / sign-flip / Spearman), and currently returns
+  > `INSUFFICIENT_LONG_HORIZON` (the outcomes file predates the 10d/20d
+  > capture; the horizon question becomes answerable as the loop
+  > accumulates rows). One nuanced counterpoint: `gate_audit` reads
+  > **`GATE_EFFECTIVE`** on *this* OOS window (strong_tailwind +1.44% vs
+  > strong_headwind −0.21%, spread +1.65 pp) — but `arm_monotone`=0.75
+  > (the neutral arm +0.07% sits *below* mild_headwind +0.57%) and
+  > `skill_trend` shows the edge is regime-contingent and degrading, so it
+  > is a fragile, non-monotone, window-specific artifact, not a stable
+  > edge. **All reported observations, not model changes** — altering the
+  > MLP/gate is a training-dynamics change out of surgical scope
+  > (CLAUDE.md §6). The actionable thread: the signal demonstrably *exists*
+  > in raw `ml_score` (+0.20 OOS); the MLP is the lossy component.
+
 ### Tests (ML + backtest section)
 
 ```bash
-# ML + backtest only — keep "calibration" AND "continuous" in the filter:
-# test_calibration.py and test_continuous.py have none of "ml"/"backtest"/
-# "scorer" in their node ids and are silently missed by the older filters
-# (test_continuous.py holds the continuous-loop + scorer-skill-ledger +
-# winner-trim + reaper-wiring locks).
-cd /home/zeph/paper-trader && python3 -m pytest tests/ -v -k "ml or backtest or scorer or calibration or continuous"
+# ML + backtest only — keep "calibration", "continuous" AND "horizon" in
+# the filter: test_calibration.py / test_continuous.py / test_horizon_audit.py
+# have none of "ml"/"backtest"/"scorer" in their node ids and are silently
+# missed by the older filters (test_continuous.py holds the continuous-loop +
+# scorer-skill-ledger + winner-trim + reaper-wiring locks;
+# test_horizon_audit.py holds the multi-horizon-capture + horizon-audit locks).
+cd /home/zeph/paper-trader && python3 -m pytest tests/ -v -k "ml or backtest or scorer or calibration or continuous or horizon"
 
 # Core (live trader) only
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_core_*.py -v
@@ -1023,6 +1094,14 @@ cd /home/zeph/paper-trader && python3 -m pytest tests/test_regime_audit.py -v
 cd /home/zeph/paper-trader && python3 -m paper_trader.ml.regime_audit          # OOS slice
 cd /home/zeph/paper-trader && python3 -m paper_trader.ml.regime_audit --all    # full in-sample
 
+# Multi-horizon outcome capture + forward-return-horizon predictability
+# audit (exact-value verdict + IC locks; the only file with "horizon" in
+# its node ids — silently missed by the older "ml/backtest/scorer" filter)
+cd /home/zeph/paper-trader && python3 -m pytest tests/test_horizon_audit.py -v
+# Is the scorer's ~0 OOS skill a 5d-target-noise artifact? (read-only):
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.horizon_audit          # OOS slice
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.horizon_audit --all    # full in-sample
+
 # Training-corpus & OOS-construction audit (exact-value verdict locks)
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_corpus_audit.py -v
 # Is the loop's temporal-OOS holdout a real generalization test? (read-only;
@@ -1046,6 +1125,17 @@ isolation), `test_decision_scorer.py` (`_to_float`, `build_features`,
 diagnostic — exact metrics + exact verdicts on deterministic synthetic
 data: perfect / 0.2× biased / anti-correlated / weak-band / constant-
 predictor / non-finite-drop / SELL-sign-flip / predict-exception-skip),
+`test_horizon_audit.py` (2026-05-18 pass — the additive multi-horizon
+capture in `_compute_decision_outcomes`: exact `8.3333/16.6667/33.3333`
+5d/10d/20d returns on the synthetic curve + the 5d-present /
+10d-20d-`None` past-history tail; and `horizon_audit` — exact verdict
+locks via a symmetric-palindrome target that scores Spearman **exactly
+0.0** against a monotone probe: `NO_HORIZON_HAS_EDGE` /
+`LONGER_HORIZON_MORE_PREDICTABLE` (5d/10d noise, 20d IC 1.0) /
+`5D_ADEQUATE` / `INSUFFICIENT_LONG_HORIZON` legacy-row shape /
+`INSUFFICIENT_DATA` / SELL sign-flip makes a correct bearish call read
++1.0 not −1.0 / never-raises-on-garbage / `analyze` OOS-slice + missing
+file / constant echo),
 `test_continuous.py`
 (`_pick_window`, `_trim_history`, `_append_top_decisions`,
 `_compute_decision_outcomes`, `_query_news_context`, `_train_decision_scorer`),
