@@ -313,6 +313,67 @@ def _behavioural_chat_lines(scorecard, paralysis, churn) -> list[str]:
     return lines
 
 
+def _macro_calendar_chat_lines(mc) -> list[str]:
+    """Render paper-trader's `/api/macro-calendar` (the forward FOMC
+    rate-decision awareness already fed into the live trader's OWN decision
+    prompt) as compact chat-context lines. FOMC is the single biggest
+    market-wide event for this leveraged-ETF-heavy book; the chat carried
+    rich BACKWARD analytics but zero FORWARD macro-event awareness — this
+    closes that gap, exactly as `_baseline_compare_chat_lines` closed the
+    ML-gate-honesty one.
+
+    SSOT (paper-trader invariant #10): the builder's own ``summary`` string
+    is the verbatim headline — no chat-side re-derived verdict that could
+    drift from the trader endpoint.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never an exception into the chat
+      handler)
+    - no events → ``[]``: the builder sets ``events: []`` for EVERY
+      non-actionable branch (no FOMC within horizon, schedule-not-loaded,
+      builder error), so a "no FOMC within 14d" / error string never
+      becomes chat filler (the ``_behavioural_chat_lines`` NO_DATA-omit
+      precedent — silence, not noise)
+    - events present → the builder's verbatim ``summary`` headline (only
+      when a usable string) + one restated detail line per event (when_et /
+      tier / day-or-hour timing restated from the builder's OWN fields —
+      the ``earnings_block`` precedent, never a recomputation); a within-24h
+      ``IMMINENT_HOURS`` event surfaces the HOUR figure (a day figure rounds
+      a 6h-away decision to a misleading 0.2d); a malformed row is skipped,
+      never raises (the ``_paper_trader_position_lines`` precedent)
+    """
+    if not isinstance(mc, dict):
+        return []
+    events = mc.get("events")
+    if not isinstance(events, list) or not events:
+        return []
+
+    def _num(v):
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    lines: list[str] = []
+    summary = mc.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        lines.append(summary)              # verbatim SSOT — invariant #10
+
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        label = e.get("label") or e.get("event") or "FOMC rate decision"
+        when_et = e.get("when_et") or "?"
+        tier = e.get("tier") or "?"
+        if tier == "IMMINENT_HOURS":
+            ha = _num(e.get("hours_away"))
+            timing = f"in {ha:.1f}h" if ha is not None else "imminent"
+        else:
+            da = _num(e.get("days_away"))
+            timing = f"in {da:.1f}d" if da is not None else "upcoming"
+        lines.append(f"  {label} {timing} — {when_et} [{tier}]")
+
+    return lines
+
+
 def _norm_title(t: Any) -> str:
     return str(t or "").strip().casefold()
 
@@ -1783,6 +1844,30 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: earnings-risk fetch failed: %s", e)
 
+        # Macro calendar — the forward FOMC rate-decision awareness already
+        # fed into the live trader's OWN decision prompt (macro_calendar.py).
+        # The chat carried rich BACKWARD analytics + earnings, but was blind
+        # to the single biggest MARKET-WIDE event — a rate decision that
+        # moves the whole book (leveraged ETFs most violently, and this
+        # watchlist is full of them). Surfacing it lets the analyst answer
+        # "is the Fed about to move everything?" honestly. Composed verbatim
+        # by the pure _macro_calendar_chat_lines helper (unit-tested; SSOT —
+        # the builder's own `summary` is the headline, no re-derived
+        # verdict). Guarded 3s read like every sibling; a no-FOMC / error /
+        # not-loaded payload (all events:[]) silently omits the block; only
+        # appears once :8090 is restarted onto the endpoint.
+        macro_calendar_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/macro-calendar",
+                    timeout=3) as resp:
+                _mc = json.loads(resp.read().decode("utf-8"))
+            macro_calendar_block = "\n".join(
+                _macro_calendar_chat_lines(_mc))
+        except Exception as e:
+            _logger().warning("chat: macro-calendar fetch failed: %s", e)
+
         # "What materially changed since you last looked" — the one temporal-
         # change view. Every sub-fetch above is a current-state snapshot; this
         # lets the chat answer "what happened while I was away / since I last
@@ -1869,6 +1954,7 @@ def create_app(store=None) -> Flask:
             + (f"NEWS SECTOR PULSE (native — where the wire is concentrated right now, recency-weighted, last 24h; independent of the price heatmap below so it survives a stale/down paper-trader):\n{sector_pulse_block}\n\n" if sector_pulse_block else "")
             + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP (paper-trader price momentum):\n{heatmap_block}\n\n" if heatmap_block else "")
             + (f"EARNINGS RADAR (scheduled gap risk):\n{earnings_block}\n\n" if earnings_block else "")
+            + (f"MACRO CALENDAR — FOMC RATE DECISION (the single biggest MARKET-WIDE event; it moves the whole book at once, leveraged ETFs most violently — surfaced only when one is actually within the 14d horizon):\n{macro_calendar_block}\n\n" if macro_calendar_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "
