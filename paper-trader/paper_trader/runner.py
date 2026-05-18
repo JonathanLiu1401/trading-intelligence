@@ -93,6 +93,37 @@ SingletonLock = namedtuple("SingletonLock", ("handle", "status", "holder_pid"))
 # fd stays open (and the flock held) for as long as the runner lives.
 _SINGLETON_LOCK_FH = None
 
+# Current single-instance lock state of THIS process.
+#   "acquired" — we hold the flock (the only legitimate writer)
+#   "degraded" — the lock plumbing was unusable at boot (fail-open, invariant
+#                #19): a guard-less runner that keeps retrying each cycle and
+#                exits the moment it confirms another live trader holds the
+#                lock — the exact 2026-05-17 double-trade pathology, observed
+#                live again (PID 1255030 degraded + PID 1465599 locked, both
+#                cycling the same $1000 book for ~12h with clustered
+#                NO_DECISION rows). Exposed via singleton_lock_state() so a
+#                guard-less runner is no longer invisible from every operator
+#                surface (/api/runner-heartbeat + the hourly Discord summary).
+_lock_status: str = "degraded"
+_lock_holder_pid: int | None = None
+_degraded_recheck_warned = False
+
+
+def singleton_lock_state() -> dict:
+    """Best-effort snapshot of THIS process's single-instance lock status.
+
+    Pure read of module globals — never raises, safe from any thread (the
+    dashboard reads it from its request thread). ``degraded`` True means this
+    runner booted without the guard and may be double-trading the shared
+    paper book until it either upgrades or exits (see
+    ``_recheck_singleton_lock``)."""
+    return {
+        "status": _lock_status,
+        "holder_pid": _lock_holder_pid,
+        "have_lock": _lock_status == "acquired",
+        "degraded": _lock_status == "degraded",
+    }
+
 
 def _acquire_singleton_lock(path=_LOCK_PATH) -> SingletonLock:
     """Try to take the exclusive runner lock.
@@ -160,6 +191,63 @@ def _acquire_singleton_lock(path=_LOCK_PATH) -> SingletonLock:
     except Exception:
         pass
     return SingletonLock(fh, "acquired", os.getpid())
+
+
+def _recheck_singleton_lock(path=_LOCK_PATH) -> None:
+    """Re-attempt the single-instance lock when running degraded.
+
+    A runner that booted while the lock plumbing was unusable (e.g. the
+    USB-backed ``data/`` mount was transiently unavailable) runs fail-open
+    *forever* (invariant #19 — never refuse the sole trader over plumbing).
+    But once the plumbing recovers, a SECOND runner can cleanly acquire the
+    flock — and now two runners double-trade the same $1000 book (observed
+    live 2026-05-17/18: PID 1255030 degraded + PID 1465599 locked, ~12h of
+    clustered NO_DECISION rows from each killing the other's claude). This
+    closes that window by retrying each cycle:
+
+      • still ``degraded`` — plumbing *still* unusable. Keep running
+        (invariant #19 preserved: we only ever exit on a CONFIRMED other
+        holder, never on plumbing failure). Warn once.
+      • ``acquired``       — plumbing recovered, no other trader holds it.
+        Upgrade in place: keep the handle so the flock is held for life.
+        We are now the legitimate singleton.
+      • ``busy``           — plumbing recovered and ANOTHER live trader
+        already holds the lock. We are the redundant degraded runner
+        double-trading the book → exit cleanly so the locked instance is
+        the sole writer.
+
+    No-op once we hold the lock: a second ``open()``+``flock`` on the same
+    file from the same process gets a *distinct* open-file description and
+    is denied by our OWN lock (flock fds are independent), which would
+    mis-read as ``busy`` and make the real holder exit. Only ever
+    re-attempt from the degraded state. Never raises (except the
+    deliberate ``SystemExit`` on a confirmed duplicate)."""
+    global _SINGLETON_LOCK_FH, _lock_status, _lock_holder_pid
+    global _degraded_recheck_warned
+    if _lock_status != "degraded":
+        return
+    lk = _acquire_singleton_lock(path)
+    if lk.status == "acquired":
+        _SINGLETON_LOCK_FH = lk.handle  # keep the flock held for our life
+        _lock_status = "acquired"
+        _lock_holder_pid = lk.holder_pid
+        print(f"[runner] single-instance lock RECOVERED — upgraded from "
+              f"degraded to locked (pid={lk.holder_pid}); this is now the "
+              f"sole guarded trader")
+        return
+    if lk.status == "busy":
+        who = f"pid={lk.holder_pid}" if lk.holder_pid else "pid unknown"
+        print(f"[runner] another paper trader now holds the single-instance "
+              f"lock ({who}); THIS instance booted WITHOUT the guard "
+              f"(degraded) and has been double-trading the shared paper "
+              f"book — exiting so the locked instance is the only writer.")
+        sys.exit(1)
+    # Still degraded — lock plumbing remains unusable. Keep running (#19);
+    # warn once so the operator sees it without flooding the cycle log.
+    if not _degraded_recheck_warned:
+        _degraded_recheck_warned = True
+        print("[runner] still running WITHOUT the single-instance guard "
+              "(lock plumbing still unusable); retrying every cycle")
 
 
 def _load_runner_state() -> dict:
@@ -392,7 +480,7 @@ def _cycle():
 
 
 def main():
-    global _last_hourly, _SINGLETON_LOCK_FH
+    global _last_hourly, _SINGLETON_LOCK_FH, _lock_status, _lock_holder_pid
     print("[runner] starting paper trader")
     # Single-instance guard FIRST — before the store, the dashboard thread,
     # or the ONLINE ping. A second runner must not even mark-to-market the
@@ -406,9 +494,16 @@ def main():
               f"refusing to start a second trader on the same paper book — "
               f"exiting. (kill the duplicate, or stop this launcher.)")
         sys.exit(1)
+    _lock_status = _lock.status
+    _lock_holder_pid = _lock.holder_pid
     if _lock.status == "acquired":
         _SINGLETON_LOCK_FH = _lock.handle  # keep the flock held for our life
         print(f"[runner] single-instance lock acquired (pid={_lock.holder_pid})")
+    else:  # degraded — fail-open (#19); the loop re-attempts every cycle.
+        print("[runner] WARNING: started WITHOUT the single-instance guard "
+              "(lock plumbing unusable). Running fail-open (invariant #19); "
+              "will retry the lock each cycle and exit if another live "
+              "trader acquires it.")
     store = get_store()
     pf = store.get_portfolio()
     print(f"[runner] portfolio: cash=${pf['cash']:.2f} total=${pf['total_value']:.2f}")
@@ -428,6 +523,11 @@ def main():
         pass
 
     while True:
+        # If we booted degraded (no guard), keep trying to acquire the lock.
+        # Exits the process if another live trader has since acquired it
+        # (confirmed double-trade) — outside the try so the deliberate
+        # SystemExit is never swallowed by `except Exception`.
+        _recheck_singleton_lock()
         try:
             _cycle()
         except Exception:
