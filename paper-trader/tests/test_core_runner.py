@@ -414,6 +414,100 @@ class TestRunnerStatePersistence:
         assert runner._daily_close_sent_for == "2026-05-14"
         assert runner._last_hourly is None
 
+    # ── future-marker hardening (clock stepped backward after a save) ──
+    def test_restore_clamps_future_last_hourly_so_hourly_is_not_muted(
+        self, monkeypatch, tmp_path
+    ):
+        """A clock step BACKWARD after a `_save_runner_state` leaves
+        `last_hourly_iso` in the future. Restoring it verbatim makes
+        `(now - _last_hourly) < 3600` true for up to (skew + 1h), so
+        `_maybe_hourly` MUTES the operator's primary monitoring surface with
+        zero signal. The restore must clamp a future marker back to now so the
+        normal 1h cadence resumes."""
+        p = tmp_path / "runner_state.json"
+        monkeypatch.setattr(runner, "_STATE_PATH", p)
+        # Persist a marker 2h in the future relative to the (patched) boot now.
+        future = _ny(2026, 5, 14, 14, 0)
+        p.write_text(f'{{"last_hourly_iso": "{future.isoformat()}"}}')
+        monkeypatch.setattr(runner, "_last_hourly", None)
+
+        boot_now = _ny(2026, 5, 14, 12, 0)
+        _patch_now(monkeypatch, boot_now)
+        runner._restore_runner_state()
+        # Clamped to now — NOT left 2h in the future.
+        assert runner._last_hourly == boot_now
+
+        calls = []
+        monkeypatch.setattr(runner.reporter, "send_hourly_summary",
+                            lambda: calls.append(1) or True)
+        # 30 min after boot: still inside the hour — must NOT fire.
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 12, 30))
+        runner._maybe_hourly()
+        assert calls == []
+        # 1h01m after boot: WITHOUT the clamp _last_hourly would be 14:00 and
+        # this would still be muted (12:01 < 14:00). With the clamp it fires.
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 13, 1))
+        runner._maybe_hourly()
+        assert calls == [1], "hourly stayed muted — future marker not clamped"
+
+    def test_restore_drops_future_daily_close_sent_for(
+        self, monkeypatch, tmp_path
+    ):
+        """A `daily_close_sent_for` strictly after today (NY) is non-physical
+        (you cannot have sent a close for a future calendar day). Restoring it
+        would suppress that day's real close once the clock reaches it — drop
+        it (treat as not-sent)."""
+        p = tmp_path / "runner_state.json"
+        # Boot "today" (NY) is 2026-05-14 (Thu); sidecar claims a close for
+        # 05-15 (Fri — a real trading day, so the "fires when it arrives"
+        # leg isn't masked by the weekend guard).
+        p.write_text('{"daily_close_sent_for": "2026-05-15"}')
+        monkeypatch.setattr(runner, "_STATE_PATH", p)
+        monkeypatch.setattr(runner, "_daily_close_sent_for", None)
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 12, 0))
+        runner._restore_runner_state()
+        assert runner._daily_close_sent_for is None, \
+            "future daily_close_sent_for restored — would suppress a real close"
+
+        # And the close for that future day must actually fire when it arrives.
+        calls = []
+        monkeypatch.setattr(runner.reporter, "send_daily_close",
+                            lambda: calls.append(1) or True)
+        _patch_now(monkeypatch, _ny(2026, 5, 15, 16, 10))
+        runner._maybe_daily_close()
+        assert calls == [1]
+
+    def test_restore_keeps_today_and_past_daily_close(
+        self, monkeypatch, tmp_path
+    ):
+        """The dedup behaviour must NOT regress: a `daily_close_sent_for` that
+        is today (NY) or in the past is a legitimate marker and is restored
+        verbatim (today → still suppresses today's duplicate close)."""
+        p = tmp_path / "runner_state.json"
+        p.write_text('{"daily_close_sent_for": "2026-05-14"}')
+        monkeypatch.setattr(runner, "_STATE_PATH", p)
+        monkeypatch.setattr(runner, "_daily_close_sent_for", None)
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 17, 0))
+        runner._restore_runner_state()
+        assert runner._daily_close_sent_for == "2026-05-14"
+        calls = []
+        monkeypatch.setattr(runner.reporter, "send_daily_close",
+                            lambda: calls.append(1) or True)
+        runner._maybe_daily_close()
+        assert calls == [], "today's close double-posted (dedup regressed)"
+
+    def test_restore_past_last_hourly_unchanged(self, monkeypatch, tmp_path):
+        """A non-future (overdue) `last_hourly_iso` is restored verbatim — the
+        clamp must only touch genuinely future markers, never an old one."""
+        p = tmp_path / "runner_state.json"
+        past = _ny(2026, 5, 14, 9, 0)
+        p.write_text(f'{{"last_hourly_iso": "{past.isoformat()}"}}')
+        monkeypatch.setattr(runner, "_STATE_PATH", p)
+        monkeypatch.setattr(runner, "_last_hourly", None)
+        _patch_now(monkeypatch, _ny(2026, 5, 14, 12, 0))
+        runner._restore_runner_state()
+        assert runner._last_hourly == past
+
     # ── the two trader-visible bugs this fixes ──
     def test_restart_after_close_does_not_double_post(self, monkeypatch, tmp_path):
         """A bounce after 16:05 NY on a day the close already fired must NOT
