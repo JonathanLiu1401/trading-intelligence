@@ -2806,3 +2806,130 @@ expected; this entry was appended, not rewritten).
   `logs/*.tmp`. Commit `097f912` pathspec-scoped to exactly 2 files;
   `git diff --staged --name-only` verified no sibling leakage; never
   `git add -A`; on origin/master. Entry appended, not rewritten.
+
+- **2026-05-18 (hybrid pass 22 — Agent 3, debug + feature + analyst-validation)** —
+  Required-file-set pass (22nd; codebase exceptionally mature, 21 prior
+  passes). Advisor-reviewed before substantive work, again on a load-bearing
+  test-fixture judgement call, and again before declaring done. All 9 required
+  files + `ml/dedup.py` read in full; `sqlite3` CLI absent → all probes via
+  `python3` `mode=ro`. Bare daemon `pid 1702195` still up, started
+  **2026-05-18 07:29Z** (≈5h elapsed), predating every recent commit incl.
+  `50c1052`/`b20cbae`/`097f912`/`c69560c` (the consistent stale-daemon caveat
+  — committed fixes ship on next restart). Concurrent sibling agent +
+  auto-commit/push daemon on the shared monorepo index (memory
+  `di-shared-repo-concurrency`) → strict per-commit pathspec staging; the
+  shared index raced (6 `paper-trader/*` files appeared staged between my two
+  `git add` calls — `git commit -- <4 explicit paths>` committed exactly my
+  4, zero sibling leakage, verified by `git show --stat`).
+
+  **Phase 1 — bugs_fixed=0, NO Phase-1 commit (commit guard honoured).**
+  Reviewed the full non-off-limits surface (9 required files +
+  `ml/dedup.py` + the newest commits). All uniformly hardened by the 21 prior
+  passes; the requested storage/urgency_scorer/features/model/trainer tests
+  already exist (verified by name, not duplicated — `test_article_store.py`,
+  `test_urgency_scorer.py`, `test_features.py`, `test_model.py`,
+  `test_trainer.py`). Live evidence surfaced only KNOWN issues, none a genuine
+  new bug in clean scope: chronic `insert_batch`/`update_ml_scores_batch`
+  *lock retry exhausted* ERRORs (advisor-confirmed no-go: per-call connection
+  isolation is substantial + daemon.py/store sibling-touched), 26 stuck
+  `urgency=1` rows + historical alert noise + COVERAGE-GAP "DARK 0.0h" (all
+  stale-daemon manifestations of fixes already at HEAD —
+  `50c1052`/gate fixes/`b20cbae`). Manufacturing a fix would revert a
+  load-bearing prior decision → bugs_fixed honestly 0 (precedent: passes
+  15/16/17/21).
+
+  **Phase 2 — features_added=1, commit `c69560c`** (`analysis/claude_analyst.py`
+  +52, new `tests/test_briefing_near_dup_collapse.py` +181, +8 tests; 2
+  fixture repairs). **Order-independent near-dup collapse wired into the Opus
+  briefing.** `ml/dedup.py` (added `b4dfd48`, separately unit-tested, pure
+  stdlib — `ml/__init__.py` empty so no numpy/torch pulled; its own docstring
+  names "briefing pre-filter" as the intended integration) was built for
+  exactly this gap but left **unwired**. `_collapse_syndicated` only merges an
+  exact first-8-token prefix signature, so a word-reordered /
+  source-attribution-suffixed copy of the SAME wire survives it and reaches
+  the analyst's primary Opus digest as a duplicate TOP SIGNAL — their #1 noise
+  complaint, on the one consumed product with no order-independent gate (live:
+  the 07:13Z window carried 5 residual dups — bond-rout ×3, Trump-Intel ×1 —
+  at sim 0.60-0.73, a full pairwise audit of that window found ZERO
+  semantically-opposite pairs ≥0.60). Wired as a 2nd collapse stage
+  (`_dedupe_near_duplicates`) after `_collapse_syndicated`, before
+  `_rank_by_decayed_score`, threshold **0.7** (`BRIEFING_NEAR_DUP_THRESHOLD`).
+  0.7 is conservative by design: a single-token ANTONYM flip in a 4-5 token
+  headline ("Fed raises rates 25bp" vs "Fed cuts…" J=0.60; "…beat Q3" vs
+  "…miss…" J=0.667) stays strictly below it, so opposite-direction stories
+  are provably never merged — `tests/test_briefing_near_dup_collapse.py` pins
+  this and the threshold value as defense-in-depth. Pure read-side, the SAME
+  shape as `_collapse_syndicated`: returns the original dict objects, never
+  mutates `source_articles`, no DB write, no
+  ai_score/ml_score/score_source/urgency touch, backtest excluded upstream by
+  `get_top_for_briefing`'s `_LIVE_ONLY_CLAUSE` — **all four load-bearing
+  invariants intact by construction**. `dedupe_articles` reused verbatim (not
+  forked) — a further-merged survivor keeps its OWN pre-merge `[syndicated
+  xN]` count (conservative under-count, never over-stated), the documented
+  anti-drift discipline. **Two existing cap-60 regression fixtures repaired
+  (assertions UNCHANGED, advisor-confirmed this is fixture-defect repair, NOT
+  test-weakening):** `test_claude_analyst.py::_articles` and
+  `test_briefing_syndication_collapse.py` distinguished rows by a bare digit
+  (`headline {i}`) — a len-1 token dropped by `ml.dedup`'s
+  `_MIN_TOKEN_LEN=2`, so every "distinct" title normalized to the same token
+  set and the new stage correctly collapsed them (latent fixture defect the
+  feature exposes, not a feature bug). Genuinely-distinct `alpha{i}`/`topic{i}`
+  tokens (J≈0.43/0.50 < 0.7) restore each test's stated intent; the cap-60
+  contract is re-validated, not weakened.
+
+  **Phase 3 — analyst-lens live validation, user_findings=8.** (1)
+  **Collection healthy** — 447 live art/last-hour, newest ~0min fresh
+  (GoogleNews round-robin / Benzinga / GlobeNewswire / scraped-yahoo / Seeking
+  Alpha / Bloomberg dominant). (2) **Briefing cadence healthy** — last 5 gaps
+  5.3/5.4/6.8/6.3h (target 5h, within documented restart-churn tolerance; the
+  old 31.9h gap predates the heartbeat-cadence fix). (3) **Briefing quality
+  EXCELLENT** (07:13Z, read end-to-end): decisive LEAD (bond rout 10Y
+  +13bp→4.59% dragging Nasdaq −1.54% two days before NVDA earnings), exact
+  MACRO, PORTFOLIO tied to the live held book (LITE/LNOK/NVDL/MU + DRAM C59
+  05-22 / NVDA 05-20), specific RISK (watch 10Y>4.60%), sharp DESK NOTE,
+  COVERAGE GAP present — exactly the consumption the Phase-2 dedup cleans up.
+  (4) **Invariants HOLD live** — `0` synthetic `urgency>=1`; `0` `ai_score>0
+  AND score_source='ml'` in the 1.39 GB prod DB. (5) **Alert path CLEAN
+  post-fix** — the 2 most recent alerts (2026-05-18 01:55 ai=9.0 UAE-drone/
+  Iran, 09:19 ai=8.0 futures-drop, both Benzinga Economics geopolitical) are
+  legit, no reddit/wiki/quote-widget noise in-window; the 09:19 is an
+  unframed continuation of 01:55 (the exact gap `17d8df9` fixes, ships on
+  restart). Historical noise (reddit r/ValueInvesting 9.8, r/Daytrading 8.0,
+  Wikipedia 8.6, quote-widget "NVDANVIDIA Corporation227.13…") all
+  05-15..05-17, predating the lone-low-authority/quote-widget gates —
+  stale-daemon. (6) **8 collectors DARK** — `sec_edgar` (968 fails, 0
+  delivered — analyst BLIND to 8-K filings, priority-0), `nitter` (1283, 0),
+  `polygon` (841, 0), `newsapi` (621, 0), `sec_edgar_ft` (197, 3);
+  massive/wikipedia transient net-new-dedup false-disable (high delivered).
+  COVERAGE GAP surfaces them; the 07:13 briefing showed "DARK 0.0h" because
+  the running daemon predates `b20cbae` (HEAD uses fails×cadence; ships on
+  restart). Operational/upstream/key, not code bugs. (7) **Chronic DB-lock
+  contention** — recurring `insert_batch`/`update_ml_scores_batch` *lock
+  retry exhausted* ERRORs (latest 12:09Z) → whole batches silently dropped =
+  missed news from the analyst seat (memory
+  `di-insert-batch-lock-contention`); real fix out of clean scope
+  (advisor-confirmed not chased). (8) **26 phantom `urgency=1` rows** all
+  dated 2026-05-13 (5 days stale), inflating the dashboard urgent tile with
+  never-pushable items — `reap_stale_urgent` (`50c1052`) present at HEAD, the
+  stale daemon hasn't run a post-fix purge. None of 5/6/7/8 is a quick safe
+  fix in clean scope (stale-daemon-with-HEAD-fix / operational-upstream /
+  advisor-confirmed no-go) → no Phase-3 fold-in; bugs_fixed stays 0,
+  features_added stays 1.
+
+  **Verify:** `storage.article_store` / `ml.features` / `ml.model` /
+  `analysis.claude_analyst` / `ml.dedup` imports OK; suite **757 passed**
+  (749 baseline + 8 new), the same 5 `test_rss_collector.py` failures are the
+  pre-existing sibling `M collectors/rss_collector.py` WIP
+  (`'_FakeResp' object has no attribute 'status_code'` — not ours, never
+  staged; floor held exactly 5, never 6+; my 8 tests + the 2 repaired
+  existing tests all pass). *Pre-existing, deliberately never staged*
+  (consistent with every prior entry): `collectors/rss_collector.py`,
+  `daemon.py`, `dashboard/server.py`, `scripts/export_training_data.py`,
+  `tests/test_article_store.py`, untracked sibling files, all
+  `paper-trader/*`, `logs/*.tmp`. Commit `c69560c` pathspec-scoped via
+  `git commit -- <4 explicit paths>` to exactly
+  `analysis/claude_analyst.py` + `tests/test_briefing_near_dup_collapse.py` +
+  `tests/test_claude_analyst.py` + `tests/test_briefing_syndication_collapse.py`;
+  `git show --stat` verified no sibling/`paper-trader` leakage despite the
+  racing shared index; never `git add -A`; on origin/master. Entry appended,
+  not rewritten.
