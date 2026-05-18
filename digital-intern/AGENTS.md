@@ -1612,3 +1612,102 @@ pathspec-scoped to exactly its 4 intended files (`watchers/alert_recency.py`,
 `watchers/alert_agent.py`, `tests/conftest.py`,
 `tests/test_alert_recency.py`) + this `AGENTS.md`; `git diff --staged`
 verified; never `git add -A`.
+
+---
+
+### Agent pass 2026-05-18 (hybrid — debug + feature + analyst validation)
+
+**Phase 1 — bugs_fixed=1, commit `c293c08`.** The *entire* pytest suite was
+unrunnable: untracked `tests/test_alert_history.py` imports
+`watchers.alert_history`, a module that has NEVER existed in git history
+(`git log --all -- watchers/alert_history.py` is empty) — an orphan written
+against an earlier design that shipped instead as `watchers.alert_recency`
+(`8410f05`, exercised by the tracked `tests/test_alert_recency.py`). Its
+`ImportError` aborted *collection* for all 484 tests (`pytest tests/` exited on
+a collection error, 0 tests executed — a silent hard CI/dev failure: the task's
+own "run the suite after each phase" step ran nothing). Fix: a documented
+`collect_ignore = ["test_alert_history.py"]` in `tests/conftest.py` (our own
+change to a tracked file); the orphan itself is left untouched (untracked, not
+ours to delete). Suite went 0 → 478 passed.
+
+**Phase 2 — features_added=1, commit `ed4b270`.** Cross-domain syndication
+collapse + corroboration signal in the 5h heartbeat briefing
+(`analysis/claude_analyst.py`). Grounded in the codebase's own repeated finding
+that syndication is "the analyst's single biggest noise complaint": the alert
+path has `watchers.alert_dedup` and the store caps per-publisher-domain, but
+neither collapses the SAME wire headline arriving under DIFFERENT domain keys
+(`GDELT/reuters.com` + `scraped/finance.yahoo.com` + `rss` are three domains,
+all survive the per-domain cap) — the briefing digest Opus reads was the one
+path that never deduped. New pure helper `_collapse_syndicated` groups the
+newswire by the single well-tested `alert_dedup._signature` (no signature
+drift — same anti-drift discipline as `watchers.alert_recency`), keeps the
+highest-score copy as the cluster rep (ties keep the earlier/higher-ranked,
+stable), preserves score-rank order, annotates `_corroboration`. The rendered
+row gains a verbatim `[syndicated xN]` tag and `SYSTEM_PROMPT` now instructs
+Opus to weight wide independent corroboration as a magnitude signal for
+LEAD/TOP SIGNALS — so dedup also *adds* a genuine analyst signal, not just
+removes noise. Collapse runs before the 60-row cap (cap can only surface MORE
+distinct signal). Returns shallow copies, never mutates the caller's
+`source_articles` list (which `heartbeat_worker` feeds to the
+briefing-label/training path) — so backtest isolation, ml_score≠ai_score,
+score_source and the urgency state machine are untouched **by construction**
+(this only reshapes the text Opus reads, never the DB or the label list). +7
+specific-value tests (`tests/test_briefing_syndication_collapse.py`); the 50
+existing briefing tests (`claude_analyst`/`coverage-gap`/`domain-diversity`/
+`briefing-boost`) pass unchanged.
+
+**Phase 3 — live findings (analyst lens; daemon-log forensics — the 1.4 GB DB
+read-probes time out under live daemon + sibling-agent contention).**
+user_findings=6:
+1. **CRITICAL — RSS dark in production.** `[rss_worker] error: string indices
+   must be integers, not 'str'`, backing off 300 s in a loop continuously since
+   ~06:05Z. Root cause: a sibling agent's uncommitted WIP in
+   `collectors/rss_collector.py` changed `_fetch_feed` to a 4-tuple but did not
+   update the `collect_rss()` consumer (line 175). RSS is the 30 s-cadence
+   highest-volume collector — the analyst is blind to ~302 feeds. Not fixed
+   (uncommitted sibling WIP, deliberately never staged).
+2. **8 source channels down/disabled** (`alphavantage, massive, newsapi,
+   nitter, polygon, sec_edgar, sec_edgar_ft, wikipedia`). `sec_edgar` +
+   `sec_edgar_ft` dark = analyst blind to 8-K filings (the priority-0 intel
+   channel) — exactly what the existing COVERAGE GAP briefing block exists to
+   surface; underlying collectors being out is a real intel hole.
+3. **Heavy `database is locked` worker errors** (rss/yahoo_ticker_rss/finnhub/
+   alphavantage/google_news repeatedly backing off → dropped collection
+   batches → intermittent coverage gaps). Sibling agents' in-flight
+   reader-`_retry_on_lock` decoration in `storage/article_store.py` targets
+   exactly this; left unstaged.
+4. **`[scorer_worker] error: no more rows available`** — a sqlite
+   shared-connection cursor variant NOT in `article_store._RETRYABLE_DB_ERRORS`
+   (`another row available`/`another row pending`/`database is locked` but not
+   `no more rows available`), so it leaks to the worker's broad `except` and
+   drops a scored batch that cycle. Real bug, but `storage/article_store.py`
+   carries active sibling-agent WIP on exactly this retry path — reported, not
+   co-edited.
+5. **`[stats_worker] error: 'NoneType' object is not subscriptable`** —
+   recurring (DEBUG) silent failure in `daemon.py` (sibling-WIP file).
+6. **Positive (what works well):** on a quiet weekend (2026-05-18 Sun) the
+   system is appropriately silent — 1 BN alert in ~7 h, no quote-widget/
+   low-authority/cross-cycle suppression churn, briefing cadence on-target
+   (last digest `01:54Z`, 2280 chars). The noise-suppression stack and the
+   restart-resilient heartbeat are behaving correctly; the analyst experience
+   is good when the collectors are healthy.
+
+None of the Phase 3 issues were a safe quick fix: every implicated file
+(`rss_collector.py`, `daemon.py`, `storage/article_store.py`) carries
+concurrent sibling-agent uncommitted WIP that must be left exactly as-is — so
+reported only, no extra fix commit (correct per the staging rule).
+
+**Final verify:** `storage`/`ml.features`/`ml.model` imports OK; suite **485
+passed** (478 prior + 7 new); the 5 `test_rss_collector.py` failures are the
+pre-existing sibling `rss_collector.py` `TypeError` (not ours, never touched),
+zero regressions introduced.
+
+*Pre-existing, deliberately never staged* (consistent with every prior entry):
+`collectors/rss_collector.py`, `daemon.py`, `storage/article_store.py`,
+`scripts/export_training_data.py`, `tests/test_article_store.py`, untracked
+`collectors/fred_collector.py` / `scripts/stale_source_alerter.py` /
+`tests/test_alert_history.py` / `tests/test_export_training_data.py`, all
+`paper-trader/*`, `logs/*.tmp` deletions. The three commits were
+pathspec-scoped to exactly their intended files (`tests/conftest.py`;
+`analysis/claude_analyst.py` + `tests/test_briefing_syndication_collapse.py`;
+this `AGENTS.md`); `git diff --staged` verified each; never `git add -A`.
