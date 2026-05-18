@@ -1244,3 +1244,39 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   `scripts/stale_source_alerter.py`, all `paper-trader/*`, `logs/*.tmp`. My
   four files were clean before edit; commits pathspec-scoped, never
   `git add -A`.
+
+- **2026-05-17 (Agent 4, feature-dev — analyst-chat enrichment: tail-risk + 48h thesis tier)** —
+  Spec: `~/docs/superpowers/specs/2026-05-17-tailrisk-and-chat-enrichment-design.md`.
+  Two additive, advisor-reviewed features; neither gates Opus.
+  **(A, paper-trader repo)** new `paper_trader/analytics/tail_risk.py::build_tail_risk`
+  (historical 95/99% VaR, positional expected-shortfall CVaR, population
+  ann.vol/downside-dev, Fisher-Pearson skew, worst day, max down-streak,
+  Ulcer index) — daily series resampled byte-identically to
+  `dashboard.analytics_api`'s `by_day` loop; honesty-gated
+  `NO_DATA`/`INSUFFICIENT(<20)`/`OK` (live book is 5d → correctly
+  INSUFFICIENT until it matures). New `/api/tail-risk` + additive
+  `tail_risk` key in `/api/analytics`. `tests/test_tail_risk.py` (21) +
+  `test_core_analytics.py::TestTailRiskIntegration` (2).
+  **(B, this repo)** `dashboard/web_server.py::api_chat` enriched via two
+  extracted pure helpers: `_tail_risk_chat_lines` (surfaces A's
+  VaR/CVaR/skew in the existing `PAPER TRADER ANALYTICS` block — degrades
+  to `[]` on NO_DATA/missing/error so a stale `:8090` is invisible, not
+  broken) and `_partition_thesis_articles` (dedup/cap), backing a new
+  48h `THESIS CONTEXT` news tier (second RO query, same live-only
+  filter, `LIMIT 25`, deduped vs the 6h breaking set) injected after the
+  6h block — multi-day narrative the single 6h/10 window couldn't carry.
+  Network/exception-guarded exactly like the greeks/analytics/heatmap
+  siblings. New `tests/test_chat_enrichment.py` (14, pure helpers, no
+  Flask/DB needed). Suites: paper-trader **1317 passed**, digital-intern
+  **434 passed** (clean caches), imports OK.
+  *Operational:* `:8090` is `stale: true, behind: 4` — `/api/tail-risk`
+  and the `/api/analytics` `tail_risk` key only render after
+  `systemctl --user restart paper-trader` (the chronic-stale pattern);
+  the chat block degrades gracefully until then. digital-intern `:8080`
+  serves the new chat context only after `systemctl --user restart
+  digital-intern`.
+  *Pre-existing, never staged* (consistent with prior entries):
+  `collectors/rss_collector.py`, `daemon.py`, `storage/article_store.py`,
+  `scripts/export_training_data.py`, `tests/test_article_store.py`,
+  `paper-trader/paper_trader/backtest.py`, `logs/*.tmp`. Commits
+  pathspec-scoped, never `git add -A`.

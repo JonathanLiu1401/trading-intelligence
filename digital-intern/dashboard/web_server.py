@@ -143,6 +143,78 @@ def _articles_from_db(limit: int = 50, min_score: float = 0.0) -> list[dict]:
     return out
 
 
+def _tail_risk_chat_lines(an: dict) -> list[str]:
+    """Render the paper-trader tail-risk block (added to /api/analytics by
+    the trader's analytics endpoint) as compact chat-context lines.
+
+    Pure / total: any missing key, a NO_DATA gate, an upstream error, or a
+    non-dict payload yields ``[]`` (the block is simply omitted, never an
+    exception into the chat handler). INSUFFICIENT collapses to one honest
+    "still building history" line — a 5-day VaR must not read as a verdict.
+    """
+    if not isinstance(an, dict):
+        return []
+    tr = an.get("tail_risk")
+    if not isinstance(tr, dict):
+        return []
+    state = tr.get("state")
+    if state == "INSUFFICIENT":
+        return [
+            f"Tail risk: still building history "
+            f"({tr.get('n_returns', 0)}/{tr.get('min_returns', 20)} "
+            f"daily observations — verdict withheld)."
+        ]
+    if state != "OK":
+        return []
+
+    def _p(key: str) -> str:
+        v = tr.get(key)
+        return f"{v:.2f}%" if isinstance(v, (int, float)) else "n/a"
+
+    skew = tr.get("return_skew")
+    skew_s = f"{skew:+.2f}" if isinstance(skew, (int, float)) else "n/a"
+    return [
+        f"95% 1-day VaR {_p('var_95_pct')} / CVaR {_p('cvar_95_pct')}, "
+        f"99% VaR {_p('var_99_pct')} "
+        f"(historical, {tr.get('n_returns', 0)} daily obs)",
+        f"ann.vol {_p('annualized_vol_pct')}, downside-dev "
+        f"{_p('downside_deviation_pct')}, skew {skew_s}, worst day "
+        f"{_p('worst_day_pct')}, max down-streak "
+        f"{tr.get('max_consecutive_down_days', 'n/a')}d, Ulcer "
+        f"{_p('ulcer_index_pct')}",
+    ]
+
+
+def _norm_title(t: Any) -> str:
+    return str(t or "").strip().casefold()
+
+
+def _partition_thesis_articles(
+    breaking: list[dict], thesis: list[dict], max_thesis: int
+) -> list[dict]:
+    """Pick up-to-``max_thesis`` wider-window 'thesis context' articles,
+    excluding any whose (case-insensitive, trimmed) title already appears
+    in the short-window ``breaking`` set or earlier in ``thesis`` itself.
+
+    Pure, deterministic, order-preserving. The dedup is what makes the
+    second news tier additive rather than a near-duplicate of the first.
+    """
+    if max_thesis <= 0:
+        return []
+    seen = {_norm_title(a.get("title")) for a in breaking}
+    seen.discard("")
+    out: list[dict] = []
+    for a in thesis:
+        key = _norm_title(a.get("title"))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(a)
+        if len(out) >= max_thesis:
+            break
+    return out
+
+
 def create_app(store=None) -> Flask:
     """Build the Flask app. ``store`` is the shared ArticleStore from daemon.py."""
     global _store
@@ -568,6 +640,7 @@ def create_app(store=None) -> Flask:
         # Pull article context — open a fresh read-only sqlite connection so we
         # don't clash with the daemon's writer thread.
         articles_ctx: list[dict] = []
+        thesis_ctx: list[dict] = []
         try:
             # Resolve the actual sqlite file the daemon's ArticleStore is using
             # (could be the USB mount at /media/zeph/projects/digital-intern/db).
@@ -591,6 +664,9 @@ def create_app(store=None) -> Flask:
                         db_path = cand
                         break
             since = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+            since_thesis = (
+                datetime.now(timezone.utc) - timedelta(hours=48)
+            ).isoformat()
             uri = f"file:{db_path}?mode=ro"
             conn = sqlite3.connect(uri, uri=True, timeout=5.0)
             try:
@@ -603,24 +679,51 @@ def create_app(store=None) -> Flask:
                     "ORDER BY ai_score DESC LIMIT 10",
                     (since,),
                 ).fetchall()
+                # Wider 48h "thesis context" tier — multi-day narrative the
+                # single 6h/10 breaking window cannot carry. Same live-only
+                # filter (invariant: backtest/opus rows must never reach a
+                # live surface); deduped against `breaking` below.
+                thesis_rows = conn.execute(
+                    "SELECT title, source, ai_score, full_text FROM articles "
+                    "WHERE first_seen >= ? "
+                    "AND url NOT LIKE 'backtest://%' "
+                    "AND source NOT LIKE 'backtest_%' "
+                    "AND source NOT LIKE 'opus_annotation%' "
+                    "ORDER BY ai_score DESC LIMIT 25",
+                    (since_thesis,),
+                ).fetchall()
             finally:
                 conn.close()
-            for r in rows:
-                summary = ""
-                if r[3] is not None:
+
+            def _decode_summary(blob) -> str:
+                if blob is None:
+                    return ""
+                try:
+                    return zlib.decompress(blob).decode("utf-8", errors="replace")[:300]
+                except Exception:
                     try:
-                        summary = zlib.decompress(r[3]).decode("utf-8", errors="replace")[:300]
+                        return (blob if isinstance(blob, str)
+                                else blob.decode("utf-8", "replace"))[:300]
                     except Exception:
-                        try:
-                            summary = (r[3] if isinstance(r[3], str) else r[3].decode("utf-8", "replace"))[:300]
-                        except Exception:
-                            summary = ""
+                        return ""
+
+            for r in rows:
                 articles_ctx.append({
                     "title": r[0] or "",
                     "source": r[1] or "",
                     "ai_score": float(r[2] or 0),
-                    "summary": summary,
+                    "summary": _decode_summary(r[3]),
                 })
+            thesis_all = [
+                {
+                    "title": r[0] or "",
+                    "source": r[1] or "",
+                    "ai_score": float(r[2] or 0),
+                    "summary": _decode_summary(r[3]),
+                }
+                for r in thesis_rows
+            ]
+            thesis_ctx = _partition_thesis_articles(articles_ctx, thesis_all, 8)
         except Exception as e:
             _logger().warning("chat: article context fetch failed: %s", e)
 
@@ -665,6 +768,14 @@ def create_app(store=None) -> Flask:
             articles_block = "\n".join(art_lines)
         else:
             articles_block = "(no recent articles in the last 6 hours)"
+
+        # Wider 48h thesis-context tier (deduped vs the 6h breaking set).
+        thesis_block = ""
+        if thesis_ctx:
+            thesis_block = "\n".join(
+                f"{a['ai_score']:.2f} | {a['source']} | {a['title']}\n    {a['summary']}"
+                for a in thesis_ctx
+            )
 
         # Live paper-trader state — fetch from :8090/api/state. Adds positions,
         # recent trades, recent decisions so the chat can answer "what did the
@@ -853,6 +964,11 @@ def create_app(store=None) -> Flask:
                     bits.append("Sector exposure: " +
                                 ", ".join(f"{s}={p:.1f}%" for s, p in top_secs) +
                                 f", cash={an.get('cash_pct', 0):.1f}%")
+                # Left-tail view (VaR/CVaR/skew/Ulcer) — the trader's
+                # /api/analytics now carries a `tail_risk` block; surface
+                # it so the analyst can answer "what's a realistic bad
+                # day" not just "what was the worst drawdown".
+                bits += _tail_risk_chat_lines(an)
                 if bits:
                     analytics_block = "\n".join(bits)
         except Exception as e:
@@ -919,7 +1035,8 @@ def create_app(store=None) -> Flask:
             f"Current date: {now_iso}\n\n"
             "TOP NEWS SIGNALS (last 6h, ranked by ML score):\n"
             f"{articles_block}\n\n"
-            "USER'S REAL PORTFOLIO SNAPSHOT:\n"
+            + (f"THESIS CONTEXT (last 48h, ranked by ML score, deduped vs the 6h set above):\n{thesis_block}\n\n" if thesis_block else "")
+            + "USER'S REAL PORTFOLIO SNAPSHOT:\n"
             f"{portfolio_block}\n\n"
             "PAPER TRADER LIVE STATE (separate $1000 sim run by Opus 4.7 every 30 min):\n"
             f"{paper_trader_block}\n\n"
