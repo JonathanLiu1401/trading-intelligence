@@ -1790,7 +1790,21 @@ TEMPLATE = r"""
 <script>
 const fmt = (n, d=2) => (n == null ? "—" : Number(n).toLocaleString(undefined, {minimumFractionDigits:d, maximumFractionDigits:d}));
 const dollar = n => (n == null ? "—" : "$" + fmt(n));
-const dt = s => s ? s.replace("T", " ").slice(0,16) : "";
+// Human-readable LOCAL time. mode: undefined→"May 18 13:11",
+// "sec"→"…13:11:02", "time"→"13:11". API timestamps carry +00:00; a
+// naive (offset-less) string is treated as UTC. Bad/empty input → "—"
+// (the dashboard's universal no-value marker) so callers can drop their
+// own `? … : "—"` ternaries.
+function fmtTs(s, mode) {
+  if (s == null || s === "") return "—";
+  const str = String(s);
+  const d = new Date(/([zZ]|[+-]\d\d:?\d\d)$/.test(str) ? str : str + "Z");
+  if (isNaN(d.getTime())) return str;
+  if (mode === "sec")  return d.toLocaleString(undefined, {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false});
+  if (mode === "time") return d.toLocaleTimeString(undefined, {hour:"2-digit", minute:"2-digit", hour12:false});
+  return d.toLocaleString(undefined, {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit", hour12:false});
+}
+const dt = s => fmtTs(s);
 
 const INITIAL_TAB = "{{ initial_tab }}";
 const API_PREFIX = "{{ api_prefix }}";
@@ -1857,8 +1871,13 @@ function drawEquityChart(eq, trades) {
   const t1 = filtered[filtered.length-1].timestamp;
   const visibleTrades = (trades||[]).filter(t => t.timestamp >= t0 && t.timestamp <= t1);
 
-  // Map each trade to nearest label index for scatter overlay
-  const buyX = [], sellX = [], buyY = [], sellY = [];
+  // Map each trade to its nearest label index. Markers go into sparse
+  // arrays aligned 1:1 with `labels` (null elsewhere) — NOT a scatter
+  // {x,y} dataset: on a Chart.js category axis a scatter point is placed
+  // by its position in the dataset array, not its x value, which
+  // collapsed every marker onto the chart's far-left edge.
+  const buyMarks  = new Array(labels.length).fill(null);
+  const sellMarks = new Array(labels.length).fill(null);
   visibleTrades.forEach(tr => {
     const ts = tr.timestamp.replace("T"," ").slice(0,16);
     let idx = labels.indexOf(ts);
@@ -1873,9 +1892,9 @@ function drawEquityChart(eq, trades) {
       }
       idx = best;
     }
-    const isBuy = tr.action && tr.action.startsWith("BUY");
-    if (isBuy) { buyX.push(idx); buyY.push(portPct[idx] ?? 0); }
-    else { sellX.push(idx); sellY.push(portPct[idx] ?? 0); }
+    const base = portPct[idx] ?? 0;
+    if (tr.action && tr.action.startsWith("BUY")) buyMarks[idx]  = base + 0.5;
+    else                                          sellMarks[idx] = base - 0.5;
   });
 
   // Summary stats
@@ -1894,16 +1913,17 @@ function drawEquityChart(eq, trades) {
   const depEl = document.getElementById("live-deployed");
   if (depEl) depEl.textContent = deployed.toFixed(1)+"%";
 
-  const mkDataset = (xs, ys, color, label, offset) => ({
-    type: "scatter",
+  const mkMarkers = (arr, color, label, down) => ({
     label,
-    data: xs.map((x,i) => ({ x, y: ys[i] + offset })),
+    data: arr,
     backgroundColor: color,
     borderColor: color,
-    pointRadius: 7,
-    pointStyle: label.includes("Buy") ? "triangle" : "triangle",
-    rotation: label.includes("Sell") ? 180 : 0,
+    pointRadius:      arr.map(v => v == null ? 0 : 7),
+    pointHoverRadius: arr.map(v => v == null ? 0 : 9),
+    pointStyle: "triangle",
+    rotation: down ? 180 : 0,
     showLine: false,
+    spanGaps: false,
     order: 0,
   });
 
@@ -1925,8 +1945,8 @@ function drawEquityChart(eq, trades) {
       pointRadius: 0, fill: false, order: 3,
     },
   ];
-  if (buyX.length)  datasets.push(mkDataset(buyX,  buyY,  "#00c896", "Buy ↑", 0.5));
-  if (sellX.length) datasets.push(mkDataset(sellX, sellY, "#ff4455", "Sell ↓", -0.5));
+  if (buyMarks.some(v => v != null))  datasets.push(mkMarkers(buyMarks,  "#00c896", "Buy ↑", false));
+  if (sellMarks.some(v => v != null)) datasets.push(mkMarkers(sellMarks, "#ff4455", "Sell ↓", true));
 
   if (!chart) {
     chart = new Chart(document.getElementById("eq"), {
@@ -1943,7 +1963,7 @@ function drawEquityChart(eq, trades) {
             titleColor: "#dde1e7", bodyColor: "#dde1e7", padding: 8, boxPadding: 3,
             callbacks: {
               label: ctx => {
-                if (ctx.dataset.type === "scatter") return null;
+                if (ctx.dataset.type === "scatter" || ctx.dataset.showLine === false) return null;
                 const v = ctx.parsed.y;
                 return `${ctx.dataset.label}: ${v>=0?"+":""}${v.toFixed(2)}%`;
               },
@@ -2021,7 +2041,7 @@ async function refresh() {
     if (_hb) _hb.textContent = "updating…";
     return;
   }
-  document.getElementById("hb").textContent = "updated " + (r.now || "");
+  document.getElementById("hb").textContent = "updated " + fmtTs(r.now, "sec");
   document.getElementById("tv").textContent = dollar(r.portfolio.total_value);
   document.getElementById("cash").textContent = dollar(r.portfolio.cash);
   const startVal = (r.equity && r.equity[0]) ? r.equity[0].total_value : 1000;
@@ -3228,7 +3248,7 @@ async function refreshSectorPulse() {
   if (!r || !r.tickers) return;
   const grid = document.getElementById("sp-grid");
   if (!grid) return;
-  document.getElementById("sp-asof").textContent = r.as_of ? "as of " + r.as_of.replace("T"," ").slice(0,16) + " UTC" : "";
+  document.getElementById("sp-asof").textContent = r.as_of ? "as of " + fmtTs(r.as_of) : "";
   grid.innerHTML = r.tickers.map(t => {
     const rsi = t.rsi;
     const rsiCls = rsi == null ? "muted" :
@@ -3272,7 +3292,7 @@ async function refreshBriefing() {
     const dot = document.getElementById("briefing-dot");
     if (dot) dot.style.background = r.market_open ? "#00c896" : "#ff4455";
     document.getElementById("briefing-status").textContent = r.status_line || "";
-    document.getElementById("briefing-asof").textContent = (r.as_of || "").replace("T"," ").slice(0,19);
+    document.getElementById("briefing-asof").textContent = fmtTs(r.as_of, "sec");
     // Futures row
     const futWrap = document.getElementById("briefing-futures");
     const futNames = {"ES=F":"S&P fut","NQ=F":"NQ fut","CL=F":"WTI","GC=F":"Gold"};
@@ -3311,7 +3331,7 @@ async function refreshSuggestions() {
     const counts = r.action_counts || {};
     const summary = Object.entries(counts).map(([a,n]) => `${n} ${a}`).join(" · ") || "no actionable candidates";
     document.getElementById("sug-summary").textContent = `${r.n_candidates} candidates from ${r.n_signals_used} signals — ${summary}`;
-    document.getElementById("sug-meta").textContent = (r.as_of || "").replace("T"," ").slice(0,19);
+    document.getElementById("sug-meta").textContent = fmtTs(r.as_of, "sec");
     const tbody = document.querySelector("#sug-tbl tbody");
     const items = r.suggestions || [];
     if (!items.length) {
@@ -3403,7 +3423,7 @@ async function refreshEarningsRisk() {
   const asof = document.getElementById("er-asof");
   if (!list) return;
   if (!r || r.error) { list.innerHTML = `<li class="muted">unavailable</li>`; return; }
-  if (asof && r.as_of) asof.textContent = r.as_of.slice(11, 16) + " UTC";
+  if (asof && r.as_of) asof.textContent = fmtTs(r.as_of, "time");
   const evs = r.events || [];
   if (!r.source_ok) {
     meta.textContent = "earnings calendar (:8080) unreachable";
@@ -3443,7 +3463,7 @@ async function refreshGreeks() {
     if (positions.length === 0) { card.style.display = "none"; return; }
     card.style.display = "block";
     const t = r.totals || {};
-    document.getElementById("gk-asof").textContent = r.as_of ? r.as_of.replace("T"," ").slice(0,16) : "—";
+    document.getElementById("gk-asof").textContent = fmtTs(r.as_of);
     const dElem = document.getElementById("gk-delta");
     dElem.textContent = fmt(t.delta, 2);
     dElem.className = "v " + ((t.delta || 0) >= 0 ? "pos" : "neg");
@@ -3493,7 +3513,7 @@ async function refreshHeatmap() {
         `<div class="muted">heatmap error: ${r.error}</div>`;
       return;
     }
-    document.getElementById("hm-asof").textContent = r.as_of ? r.as_of.replace("T"," ").slice(0,16) : "—";
+    document.getElementById("hm-asof").textContent = fmtTs(r.as_of);
     const bench = r.reference_mom_5d;
     const benchStr = bench != null ? `${r.reference} 5d ${bench >= 0 ? "+" : ""}${fmt(bench, 2)}%` : `${r.reference} —`;
     document.getElementById("hm-bench").textContent = "Benchmark: " + benchStr;
@@ -3564,7 +3584,7 @@ async function refreshScorer() {
       document.getElementById("sc-meta").textContent = "scorer error: " + r.error;
       return;
     }
-    document.getElementById("sc-asof").textContent = r.as_of ? r.as_of.replace("T"," ").slice(0,16) : "—";
+    document.getElementById("sc-asof").textContent = fmtTs(r.as_of);
     const meta = r.is_trained
       ? `trained (n=${r.n_train}) · regime mult ${fmt(r.regime_mult, 2)} · gate ≥ ${r.gate_threshold}`
       : `not trained yet (n=${r.n_train}/${r.gate_threshold}) — predictions will be 0.00 until threshold reached`;
@@ -3603,7 +3623,7 @@ async function refreshDedupedNews() {
       document.getElementById("nd-list").innerHTML = `<li class="muted">${r.error}</li>`;
       return;
     }
-    document.getElementById("nd-asof").textContent = r.as_of ? r.as_of.replace("T"," ").slice(0,16) : "—";
+    document.getElementById("nd-asof").textContent = fmtTs(r.as_of);
     const meta = `${r.n_after_dedup} unique signals from ${r.n_raw} raw articles (compression ${fmt(r.compression_ratio, 1)}x) · halflife ${r.halflife_hours}h`;
     document.getElementById("nd-meta").textContent = meta;
     const items = (r.articles || []).slice(0, 15);
@@ -3626,7 +3646,7 @@ async function refreshDedupedNews() {
         `<span style="background:#1f2126;color:#0acdff;font-size:10px;padding:1px 5px;border-radius:3px;margin-left:4px;">${t}</span>`
       ).join("");
       const title = (a.title || "").replace(/</g, "&lt;");
-      const ts = a.first_seen ? a.first_seen.replace("T", " ").slice(5, 16) : "";
+      const ts = fmtTs(a.first_seen);
       return `<li style="padding:6px 0;border-bottom:1px solid #1f2126;">
         ${urgBadge}<span style="color:#dde1e7;">${title}</span>${dups}
         <div class="muted" style="font-size:11px;margin-top:3px;">
@@ -3654,7 +3674,7 @@ async function refreshThesis() {
   try {
     const r = await fetch(API_PREFIX + "/api/position-thesis").then(r => r.json());
     document.getElementById("th-asof").textContent =
-      r.as_of ? r.as_of.replace("T"," ").slice(0,16) : "—";
+      fmtTs(r.as_of);
     if (r.error) {
       document.getElementById("th-meta").textContent = "error: " + r.error;
       document.getElementById("th-grid").innerHTML = "";
@@ -3721,7 +3741,7 @@ async function refreshDrawdown() {
   try {
     const r = await fetch(API_PREFIX + "/api/drawdown").then(r => r.json());
     document.getElementById("dd-asof").textContent =
-      r.as_of ? r.as_of.replace("T"," ").slice(0,16) : "—";
+      fmtTs(r.as_of);
     if (r.error) {
       document.getElementById("dd-pct").textContent = "err";
       return;
@@ -3773,7 +3793,7 @@ async function refreshCalibration() {
   try {
     const r = await fetch(API_PREFIX + "/api/calibration").then(r => r.json());
     document.getElementById("cal-asof").textContent =
-      r.as_of ? r.as_of.replace("T"," ").slice(0,16) : "—";
+      fmtTs(r.as_of);
     if (r.error) {
       document.getElementById("cal-meta").textContent = "error: " + r.error;
       return;
@@ -3826,8 +3846,8 @@ async function refreshCalibration() {
         const ret = t.return_pct;
         const color = ret >= 0 ? "#00c896" : "#ff4455";
         const sign = ret >= 0 ? "+" : "";
-        const buyTs = (t.buy_ts || "").replace("T", " ").slice(5, 16);
-        const sellTs = (t.sell_ts || "").replace("T", " ").slice(5, 16);
+        const buyTs = fmtTs(t.buy_ts);
+        const sellTs = fmtTs(t.sell_ts);
         const conf = t.confidence != null ? fmt(t.confidence, 2) : "—";
         const reason = (t.reasoning_excerpt || "").replace(/</g, "&lt;");
         return `<tr>
@@ -3940,7 +3960,7 @@ async function refreshDecisionHealth() {
     } else {
       tb.innerHTML = tape.map(d => {
         const col = mixColors[d.category] || "#8b929d";
-        const t = d.timestamp ? d.timestamp.replace("T", " ").slice(5, 16) : "—";
+        const t = fmtTs(d.timestamp);
         return `<tr>
           <td class="muted">${t}</td>
           <td><span style="color:${col};font-weight:bold;">${d.category}</span></td>
@@ -4062,7 +4082,7 @@ async function refreshDecisionForensics() {
       hEl.innerHTML = hrs.map(h => {
         const ph = Math.max(4, Math.round((h.fail_pct||0) * 0.42));
         const col = (h.fail_pct||0) >= 50 ? "#ff4455" : (h.fail_pct||0) >= 25 ? "#ffa726" : "#4caf50";
-        const lbl = (h.hour||"").slice(11,16);
+        const lbl = fmtTs(h.hour, "time");
         return `<div title="${lbl}  ${h.failures}/${h.total} failed (${fmt(h.fail_pct,0)}%)"
           style="flex:1;min-width:5px;height:${ph}px;background:${col};border-radius:2px 2px 0 0;"></div>`;
       }).join("");
@@ -4071,7 +4091,7 @@ async function refreshDecisionForensics() {
     const tape = r.recent_failures || [];
     const tb = document.querySelector("#df-tape tbody");
     tb.innerHTML = tape.length ? tape.map(d => {
-      const t = d.timestamp ? d.timestamp.replace("T"," ").slice(5,16) : "—";
+      const t = fmtTs(d.timestamp);
       const col = modeColors[d.mode] || "#8b929d";
       const ex = (d.excerpt || "—").replace(/</g,"&lt;").slice(0,200);
       return `<tr>
@@ -4132,7 +4152,7 @@ async function refreshDecisionDrought() {
     const tape = r.droughts || [];
     const tb = document.querySelector("#dd-tape tbody");
     tb.innerHTML = tape.length ? tape.map(d => {
-      const t = d.start ? d.start.replace("T"," ").slice(5,16) : "—";
+      const t = fmtTs(d.start);
       const a = d.alpha_pct;
       const acol = a == null ? "#8b929d" : a < 0 ? "#ff4455" : "#4caf50";
       return `<tr>
@@ -4227,7 +4247,7 @@ async function refreshScorerConfidence() {
       return;
     }
     document.getElementById("scrl-asof").textContent =
-      r.as_of ? r.as_of.replace("T", " ").slice(0, 16) : "—";
+      fmtTs(r.as_of);
     const o = r.overall;
     if (!o) {
       document.getElementById("scrl-meta").textContent =
@@ -4390,7 +4410,7 @@ async function refreshDisagreement() {
       return;
     }
     document.getElementById("dis-asof").textContent =
-      r.as_of ? r.as_of.replace("T", " ").slice(0, 16) : "—";
+      fmtTs(r.as_of);
     const c = r.counts || {};
     const setC = (id, v, col) => {
       const e = document.getElementById(id);
@@ -4839,7 +4859,7 @@ async function refreshSessionDelta() {
   };
   tb.innerHTML = evs.map(e => {
     const c = sevC[e.severity] || "#8b929d";
-    const when = (e.ts || "").slice(11, 16);
+    const when = fmtTs(e.ts, "time");
     const lbl = kindLabel[e.kind] || e.kind;
     const txt = (e.summary || "").replace(/</g, "&lt;");
     return '<tr><td class="muted">' + when + '</td><td style="color:' + c +
