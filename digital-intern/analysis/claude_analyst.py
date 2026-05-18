@@ -2,8 +2,91 @@
 from datetime import datetime, timezone
 
 from core.claude_cli import claude_call
+# Reuse the *single* well-tested headline-canonicalisation primitive
+# (tests/test_alert_dedup.py) instead of re-deriving a signature here — the
+# documented anti-drift discipline (same reason watchers.alert_recency imports
+# it, and alert_agent reuses ml.features._source_credibility). alert_dedup is
+# pure stdlib+re (no DB / ml / aiohttp import graph), so this adds no cycle.
+from watchers.alert_dedup import _signature
 
 MODEL = "claude-opus-4-7"
+
+
+def _collapse_syndicated(articles: list) -> list:
+    """Collapse syndicated copies of one story in the briefing newswire.
+
+    A breaking wire item is carried within minutes by GDELT, Reuters, Yahoo,
+    RSS and half a dozen scrapers. Each lands as its own row and each can score
+    high, so the top-50 digest Opus sees is dominated by 5-8 near-identical
+    headlines — the consuming analyst's single biggest noise complaint, applied
+    to the one path that never deduped it. ``watchers.alert_dedup`` collapses
+    syndication on the *alert* path and ``article_store`` caps per-publisher in
+    the briefing, but neither collapses the SAME wire headline arriving under
+    DIFFERENT domain keys (``GDELT/reuters.com`` + ``scraped/finance.yahoo.com``
+    + ``rss`` are three domains, all survive the per-domain cap).
+
+    Pure, order-preserving, side-effect-free:
+
+      * groups by ``alert_dedup._signature`` (the shared canonicalisation —
+        wire markers / source attribution stripped, first-8-token key);
+      * an empty signature (untitled / snapshot rows whose title is all
+        stop-stripped) is NEVER merged — unique key per copy, identical policy
+        to ``dedupe_urgent``, so the prepended PORTFOLIO/OPTIONS snapshot rows
+        and titleless items always pass through untouched and keep their
+        leading position;
+      * the highest-score copy represents the cluster (score = ai_score, else
+        _relevance_score; ties keep the earlier/ higher-ranked one — stable);
+      * survivors keep their input order (the caller already score-ranked);
+      * each survivor gains ``_corroboration`` = total copies it represents.
+        N>1 is itself a real analyst signal (independent corroboration ⇒ the
+        event is bigger), surfaced verbatim to Opus.
+
+    Returns NEW dicts (shallow copies) so the caller's ``source_articles``
+    list — which heartbeat_worker feeds to the briefing-label / training path —
+    is never mutated. This keeps the load-bearing invariants (backtest
+    isolation, ml_score≠ai_score, score_source, the urgency state machine)
+    untouched here *by construction*: this function only ever reshapes the
+    text Opus reads, never the DB or the label list.
+    """
+    def _score(a: dict) -> float:
+        # Mirror the display logic exactly: ``ai_score or _relevance_score``.
+        # A falsy ai_score (0 / 0.0 — neither LLM nor model has scored yet)
+        # falls through to the kw _relevance_score, so the cluster
+        # representative is chosen on the SAME number the row will render
+        # with (no rank/display mismatch).
+        for key in ("ai_score", "_relevance_score"):
+            v = a.get(key)
+            if isinstance(v, (int, float)) and v:
+                return float(v)
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv:
+                return fv
+        return 0.0
+
+    keep: dict[str, dict] = {}
+    order: list[str] = []
+    for idx, art in enumerate(articles):
+        sig = _signature(art.get("title"))
+        if not sig:
+            sig = f"__uniq__{idx}"
+        cur = keep.get(sig)
+        if cur is None:
+            rep = dict(art)
+            rep["_corroboration"] = 1
+            keep[sig] = rep
+            order.append(sig)
+            continue
+        cur["_corroboration"] += 1
+        # Strictly-greater so ties keep the earlier (already higher-ranked)
+        # representative — deterministic and stable.
+        if _score(art) > _score(cur):
+            merged = dict(art)
+            merged["_corroboration"] = cur["_corroboration"]
+            keep[sig] = merged
+    return [keep[s] for s in order]
 
 # ── Coverage-gap intelligence ────────────────────────────────────────────────
 # A news analyst's most dangerous failure is a *silent* one: a high-value intel
@@ -95,6 +178,7 @@ RULES:
 - Each table in its own code block. Section headers as plain **bold** outside code blocks.
 - Total output must fit in 1800 characters. Be ruthlessly concise. Cut low-signal rows.
 - No nested backticks. No backtick dividers. Dividers are plain ━━━ lines outside code blocks.
+- A newswire row tagged "[syndicated xN]" was independently carried by N sources — treat higher N as stronger corroboration/magnitude when choosing the LEAD and ordering TOP SIGNALS; a lone (untagged) item is single-sourced and less confirmed.
 - If a "COVERAGE GAP" block is present in the data input, reproduce it as a **COVERAGE GAP** section (one bullet per dark channel, verbatim). These are intel channels the system could NOT collect from this window — the analyst must know what they are blind to, not assume silence means calm. Omit the section entirely if no gap block is provided.
 
 OUTPUT FORMAT — use EXACTLY this, filled with real data:
@@ -185,13 +269,21 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None):
     if not articles:
         parts.append("(no high-relevance articles this cycle)")
     else:
-        # Cap at 60 — caller prepends up to 2 synthetic snapshot rows
-        # (portfolio P&L, options) to a 50-article top list; a [:50] cap
-        # silently truncates the last two real articles.
-        for i, a in enumerate(articles[:60], 1):
+        # Collapse cross-domain syndication FIRST, then cap at 60. Dedup only
+        # frees slots for *distinct* stories, so the cap can only ever surface
+        # MORE unique signal, never less. Cap is 60 (not 50) because the caller
+        # prepends up to 2 synthetic snapshot rows (P&L, options) to a
+        # 50-article top list; a [:50] cap silently truncates real articles.
+        deduped = _collapse_syndicated(articles)
+        for i, a in enumerate(deduped[:60], 1):
             score = a.get("ai_score") or a.get("_relevance_score", "?")
+            corro = a.get("_corroboration", 1)
+            # Wide independent syndication is itself a magnitude signal —
+            # surface it verbatim so Opus can weight a 6-wire story over a
+            # lone mention in TOP SIGNALS / LEAD.
+            tag = f" [syndicated x{corro}]" if corro > 1 else ""
             parts.append(
-                f"{i:>2}. [score={score}] [{a.get('source','?')}] {a.get('title','')}\n"
+                f"{i:>2}. [score={score}]{tag} [{a.get('source','?')}] {a.get('title','')}\n"
                 f"    {(a.get('summary') or '')[:300]}"
             )
 
