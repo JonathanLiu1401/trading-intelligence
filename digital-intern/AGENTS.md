@@ -1486,3 +1486,129 @@ all `paper-trader/*`, `logs/.supervisor_state.*.tmp` deletions. My two
 code files were clean on HEAD before edit; both commits pathspec-scoped
 to exactly their `.py` + test file, `git diff --staged` verified, never
 `git add -A`. Durable on `origin/master`.
+
+---
+
+### Agent pass 2026-05-18 (hybrid — debug + feature + analyst validation)
+
+**Phase 1: bugs_fixed=0 (honest, per the commit guard — not a miss).**
+Read pass over the nine task-critical files + `ml/inference.py`,
+`alert_dedup`, `source_health`. The four load-bearing invariants
+re-traced and hold; ~20 prior passes have exhausted by-inspection
+bug-hunting on the heavily-reviewed core, and **live validation
+(Phase 3, run first) was again the discovery engine** — but this pass it
+surfaced a *feature* gap, not a fixable-in-committed-code bug. Committed
+HEAD is clean (467 pass excluding the broken sibling test). Daemon
+`pid 1491857` log: **0 ERRORs / 0 tracebacks** in the last 2000 lines,
+only 23 transient `database is locked` WARNs absorbed by `_retry_on_lock`
+(healthier than the 57/71-lock-exhausted prior passes — the committed
+logger/retry fixes are holding). Production invariant #2 verified live:
+`ai_score>0 AND score_source='ml'` = **0**. No Phase 1 commit (correct
+per the guard).
+
+**Phase 2: features_added=1, commit `<feat>`** (`watchers/alert_recency.py`
+new + `watchers/alert_agent.py` + `tests/conftest.py` +
+`tests/test_alert_recency.py` new). **Cross-cycle (cross-time)
+syndication suppression** — the analyst's single most-cited complaint
+(duplicate BREAKING pushes), now closed at the root. `dedupe_urgent`
+only collapses copies *inside one `get_unalerted_urgent()` batch*; once a
+story is alerted it goes `urgency=2` and is excluded from every future
+batch, so a slower feed (GDELT 10-min sweep / `gdelt_gkg` backfill /
+Google-News round-robin / Substack 10-min) that re-collects the **same
+event** as a NEW `urgency=1` row had nothing to be deduped against and
+fired a SECOND standalone "🚨 BREAKING" push. **Live evidence (Phase 3):
+the "US clears/approves H200 chip sales to 10 China firms" story fired
+two separate alerts ~1.5 h apart** (`reddit/r/technology` 07:42,
+`reddit/r/wallstreetbets` 09:11 — different rows, same event). The new
+module records the canonical signature (`alert_dedup._signature`
+*verbatim* — single source of truth, no drift) of every story that
+actually fired into a **separate** hardened `data/alert_recency.db`
+(canonical `timeout=30`+WAL+`busy_timeout=30000`; NEVER touches
+`articles.db`, so the four invariants are untouched *by construction*)
+and suppresses a later urgent row whose signature was alerted within
+`ALERT_RECENCY_TTL_HOURS` (6 h, tunable). Same formatter-side
+defense-in-depth shape as `_is_synthetic` / `_filter_quote_widget_noise`
+/ `_filter_low_authority_lone` (runs after `dedupe_urgent` and the
+low-authority gate, before batching); best-effort (a recency-store
+failure → empty set → the pre-feature behaviour: a genuine breaking
+story must still reach the analyst); suppressed rows marked `urgency=2`
+unconditionally so they exit the queue; signatures recorded only on a
+*successful* Discord send. Paraphrase-distinct headlines deliberately
+still fire (their 8-token signatures differ — errs toward NOT muting a
+distinct development; the analyst-safe direction). +11 tests
+(`test_alert_recency.py`: pure-partition, `_signature` reuse, DB
+round-trip + TTL expiry + prune + hits-upsert, best-effort degradation,
+and the **end-to-end** pin — first cycle fires & records, a second
+cycle's same-event NEW-id row is cross-suppressed with no Claude/Discord
+call and `urgency=2`, while a distinct headline still fires). An autouse
+`tests/conftest.py` fixture redirects `alert_recency.DB_PATH` per-test
+(exact analogue of `store_factory`'s article-DB redirect — isolates the
+new *persistent* store, weakens **no** existing test's assertions; caught
+6 state-leak regressions in the alert suites before commit and fixed them
+the right way, not by weakening tests).
+
+**Phase 3 — live findings (read-only `mode=ro&immutable=1` probes + log
+forensics). user_findings=7:**
+1. *Cross-cycle duplicate alerts — CONFIRMED LIVE* (the H200/China
+   double-fire above). Root cause now fixed by the Phase 2 feature.
+2. *Broken sibling test halts the WHOLE suite* — untracked
+   `tests/test_alert_history.py` imports a nonexistent
+   `watchers.alert_history` → pytest **collection error** that
+   interrupts the entire run (not one failure — zero tests execute).
+   Incomplete prior-run work; not mine; left exactly as-is; standard
+   run is now `pytest tests/ --ignore=tests/test_alert_history.py`. I did
+   **not** create `watchers/alert_history.py` (that would be guessing a
+   sibling's unfinished spec) — my module is the distinctly-named
+   `alert_recency` precisely so the sibling test stays untouched.
+3. *Uncommitted sibling `collectors/rss_collector.py` is BROKEN and
+   higher-risk than prior passes noted* — its per-feed-backoff refactor
+   makes `_fetch_feed` return a 4-tuple `(name, articles, outcome,
+   retry_after)` but `collect_rss` still iterates each result as an
+   article list (`for art in batch: art["link"]` → `TypeError: string
+   indices must be integers`). RSS is the **hottest** collector (302
+   feeds, 30 s cadence); if the auto-commit daemon ships this it
+   **silently drops every RSS batch forever**. Causes the 5
+   `test_rss_collector.py` failures. Not mine; left untouched per the
+   don't-stage-others'-work discipline; flagged loud here.
+4. *8 collectors disabled* (`alphavantage, massive, newsapi, nitter,
+   polygon, sec_edgar, sec_edgar_ft, wikipedia`); 4 **zero-delivered all
+   session** (`newsapi, nitter, polygon, sec_edgar`). `sec_edgar`/`_ft`
+   are high-signal 8-K material filings — analyst is blind to filings;
+   correctly surfaced by the existing COVERAGE GAP briefing feature
+   (working as intended). Upstream/rate-limit; operational.
+5. *USB `articles.db` I/O saturation severe* — full-table scans block
+   in `D` and time out >90 s even with `immutable=1`. Documented
+   operational issue; unchanged.
+6. *Pre-restart noise still in the alerted history* (one
+   `scraped/finance.yahoo.com` quote-widget tick, several lone
+   reddit/Wikipedia rows). The committed quote-widget / low-authority /
+   domain-cred gates suppress these post-restart; the running daemon
+   predates them (chronic stale-daemon — code fixes need `systemctl
+   --user restart digital-intern`). The Phase 2 feature compounds these
+   on restart by also killing their *cross-time* repeats.
+7. *Positive validation.* Briefing cadence **recovered**: id23→24→25 =
+   ~6.3h / ~6.8h / ~5.4h vs the 5h target (the `ef839a8` heartbeat-clock
+   fix is holding); the 41h/32h gaps all predate it. Latest briefing
+   (id25, 2026-05-18T01:54, 50 articles) read end-to-end is a genuinely
+   accurate, dense Bloomberg digest (Iran/UAE drone-strike oil/inflation
+   LEAD, real semis de-rate two days before NVDA earnings). The 24h
+   alerted set's genuinely-valuable items (Benzinga UAE-strike ai=9,
+   SEC-EDGAR NVDA 8-K, GDELT Samsung-HBM4-strike ai=9) are all real and
+   portfolio-relevant — the pipeline is strong when healthy.
+
+Final verify: `storage`/`ml.features`/`ml.model` imports OK; suite
+**478 passed** (467 prior + 11 new; `--ignore=tests/test_alert_history.py`),
+the 5 `test_rss_collector.py` failures are the pre-existing sibling
+`rss_collector.py` `TypeError` (excluded, not mine), zero regressions
+introduced.
+
+*Pre-existing, deliberately never staged* (consistent with every prior
+entry): `collectors/rss_collector.py`, `daemon.py`,
+`scripts/export_training_data.py`, `storage/article_store.py`,
+`tests/test_article_store.py`, untracked `collectors/fred_collector.py` /
+`scripts/stale_source_alerter.py` / `tests/test_alert_history.py`, all
+`paper-trader/*`, `logs/*.tmp` deletions. The one feat commit was
+pathspec-scoped to exactly its 4 intended files (`watchers/alert_recency.py`,
+`watchers/alert_agent.py`, `tests/conftest.py`,
+`tests/test_alert_recency.py`) + this `AGENTS.md`; `git diff --staged`
+verified; never `git add -A`.

@@ -40,3 +40,26 @@ def store_factory(tmp_path, monkeypatch):
 def store(store_factory):
     """Most tests want a single store — provide it directly."""
     return store_factory()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_alert_recency(tmp_path, monkeypatch):
+    """Redirect watchers.alert_recency to a per-test SQLite file.
+
+    ``send_urgent_alert`` records the canonical signature of every fired
+    story to a *persistent* ``data/alert_recency.db`` for cross-cycle
+    duplicate suppression (intended in production). Without this redirect,
+    every alert-path test would write to that one real file and the next
+    test reusing a default headline would be cross-suppressed — a state leak
+    across tests and into the repo's data dir. This is the exact analogue of
+    ``store_factory`` redirecting ``article_store._get_db_path``; it isolates
+    the new persistent store and changes no test's assertions. Autouse so
+    suites that never heard of alert_recency are still isolated.
+    """
+    try:
+        from watchers import alert_recency
+    except Exception:
+        return
+    monkeypatch.setattr(
+        alert_recency, "DB_PATH", tmp_path / "alert_recency.db"
+    )
