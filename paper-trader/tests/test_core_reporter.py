@@ -1068,6 +1068,167 @@ class TestHeartbeatLine:
         assert "**RUNNER** ◈" not in body
 
 
+class TestEquityIntegrityLine:
+    """`_equity_integrity_line` + its hourly/daily wiring — routes the
+    equity-curve integrity verdict (CORRUPT/SUSPECT) to Discord so a silent
+    P&L-history corruption is no longer invisible to the operator who lives
+    in Discord (it was dashboard-only via /api/equity-integrity).
+
+    Composes ``build_equity_integrity`` verbatim (single source of truth,
+    invariant #10); surfaces only when actionable; a builder/store fault
+    drops the line, never the summary (the reporter failure contract)."""
+
+    def _patch_builder(self, monkeypatch, ret=None, raises=False):
+        import paper_trader.analytics.equity_integrity as eim
+
+        def fake(*a, **k):
+            if raises:
+                raise RuntimeError("equity-integrity builder boom")
+            return ret
+
+        monkeypatch.setattr(eim, "build_equity_integrity", fake)
+        fake_store = MagicMock()
+        fake_store.equity_curve.return_value = []
+        fake_store.recent_trades.return_value = []
+        return fake_store
+
+    def test_corrupt_surfaces_headline_verbatim(self, monkeypatch):
+        ei = {
+            "verdict": "CORRUPT",
+            "headline": ("Recorded equity is CORRUPT across 9 points: 1 "
+                         "negative-cash point(s) (min $-5.0) — the book was "
+                         "over-drawn; P&L history (drawdown, benchmark, "
+                         "Sharpe, hourly P/L) is unreliable."),
+        }
+        store = self._patch_builder(monkeypatch, ret=ei)
+        line = reporter._equity_integrity_line(store)
+        assert "⚠️ **EQUITY INTEGRITY** ◈ CORRUPT" in line
+        # Builder headline forwarded verbatim, never re-derived (invariant #10).
+        assert ei["headline"] in line
+
+    def test_suspect_surfaces_headline_verbatim(self, monkeypatch):
+        ei = {
+            "verdict": "SUSPECT",
+            "headline": ("1 unexplained equity jump(s) >=8% with no trade in "
+                         "the window across 5 points; largest +20.00% "
+                         "($+200.00) — likely a mismark."),
+        }
+        store = self._patch_builder(monkeypatch, ret=ei)
+        line = reporter._equity_integrity_line(store)
+        assert "⚠️ **EQUITY INTEGRITY** ◈ SUSPECT" in line
+        assert ei["headline"] in line
+
+    def test_clean_is_suppressed(self, monkeypatch):
+        ei = {"verdict": "CLEAN",
+              "headline": "Equity curve consistent across 40 points."}
+        store = self._patch_builder(monkeypatch, ret=ei)
+        # A trustworthy curve adds no hourly noise (lying-green-light guard).
+        assert reporter._equity_integrity_line(store) == ""
+
+    def test_no_data_is_suppressed(self, monkeypatch):
+        ei = {"verdict": "NO_DATA", "headline": "Only 1 usable point."}
+        store = self._patch_builder(monkeypatch, ret=ei)
+        assert reporter._equity_integrity_line(store) == ""
+
+    def test_error_and_nondict_are_suppressed(self, monkeypatch):
+        store = self._patch_builder(
+            monkeypatch, ret={"verdict": "ERROR", "headline": "boom"})
+        assert reporter._equity_integrity_line(store) == ""
+        store2 = self._patch_builder(monkeypatch, ret=None)
+        assert reporter._equity_integrity_line(store2) == ""
+
+    def test_degrades_to_empty_when_builder_raises(self, monkeypatch):
+        store = self._patch_builder(monkeypatch, raises=True)
+        # Never raises — failure mode is 'no line', never 'no summary'.
+        assert reporter._equity_integrity_line(store) == ""
+
+    def test_no_drift_real_builder_corrupt(self, fresh_store):
+        """End-to-end on the REAL builder + a real Store: a negative-cash
+        equity point → CORRUPT, and the Discord headline must equal the
+        builder's own headline verbatim (no re-derivation — invariant #10)."""
+        fresh_store.record_equity_point(1000.0, 500.0, None)
+        fresh_store.record_equity_point(1000.0, -5.0, None)   # over-drawn
+        fresh_store.record_equity_point(1000.0, 500.0, None)
+        from paper_trader.analytics.equity_integrity import (
+            build_equity_integrity)
+        expected = build_equity_integrity(
+            fresh_store.equity_curve(limit=5000),
+            fresh_store.recent_trades(5000))
+        assert expected["verdict"] == "CORRUPT"
+        line = reporter._equity_integrity_line(fresh_store)
+        assert "⚠️ **EQUITY INTEGRITY** ◈ CORRUPT" in line
+        assert expected["headline"] in line          # verbatim, no drift
+
+    def test_no_drift_real_builder_suspect(self, fresh_store):
+        """A no-trade +20% jump on a real Store → SUSPECT, headline verbatim.
+        fresh_store has zero trades so the jump is genuinely unexplained."""
+        fresh_store.record_equity_point(1000.0, 100.0, None)
+        fresh_store.record_equity_point(1000.0, 100.0, None)  # flat
+        fresh_store.record_equity_point(1200.0, 100.0, None)  # +20%, no trade
+        from paper_trader.analytics.equity_integrity import (
+            build_equity_integrity)
+        expected = build_equity_integrity(
+            fresh_store.equity_curve(limit=5000),
+            fresh_store.recent_trades(5000))
+        assert expected["verdict"] == "SUSPECT"
+        line = reporter._equity_integrity_line(fresh_store)
+        assert "⚠️ **EQUITY INTEGRITY** ◈ SUSPECT" in line
+        assert expected["headline"] in line
+
+    def test_hourly_summary_includes_corrupt_line(self, fresh_store,
+                                                  monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5100.0)
+        monkeypatch.setattr(reporter.market, "is_market_open", lambda: False)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        fresh_store.record_equity_point(1000.0, 500.0, None)
+        fresh_store.record_equity_point(1000.0, -5.0, None)
+        fresh_store.record_equity_point(1000.0, 500.0, None)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**EQUITY INTEGRITY** ◈ CORRUPT" in body
+        # Pre-existing summary intact alongside the new block.
+        assert "**HOURLY**" in body and "Equity" in body
+
+    def test_daily_close_includes_corrupt_line(self, fresh_store, monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5100.0)
+        monkeypatch.setattr(reporter.market, "is_market_open", lambda: False)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        fresh_store.record_equity_point(1000.0, 500.0, None)
+        fresh_store.record_equity_point(1000.0, -5.0, None)
+        fresh_store.record_equity_point(1000.0, 500.0, None)
+        assert reporter.send_daily_close() is True
+        body = captured[0]
+        assert "**EQUITY INTEGRITY** ◈ CORRUPT" in body
+        assert "**DAILY CLOSE**" in body
+
+    def test_summary_still_sends_when_integrity_builder_faults(
+            self, fresh_store, monkeypatch):
+        """An integrity-builder fault drops only its block — the hourly
+        summary itself must still send (the reporter 'no block, never no
+        summary' contract)."""
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        import paper_trader.analytics.equity_integrity as eim
+
+        def _boom(*a, **k):
+            raise RuntimeError("builder boom")
+
+        monkeypatch.setattr(eim, "build_equity_integrity", _boom)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**HOURLY**" in body and "Equity" in body
+        assert "**EQUITY INTEGRITY**" not in body
+
+
 class TestAgo:
     """`_ago` bucket boundaries — minutes < 1h, hours < 1d, days beyond."""
 
