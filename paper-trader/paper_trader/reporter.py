@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 
 from . import market
 from .analytics.hold_discipline import build_hold_discipline
+from .analytics.sector_exposure import classify as _sector_classify
+from .analytics.stress_scenarios import _LEVERAGE_BETA, build_stress_scenarios
 from .store import INITIAL_CASH, get_store
 
 DISCORD_CHANNEL = "channel:1496099475838603324"
@@ -527,6 +529,48 @@ def _hold_discipline_line(store) -> str:
         return ""
 
 
+def _stress_line(store) -> str:
+    """One-line "what does a routine bad tape cost this book right now?"
+    for the hourly / daily report.
+
+    ``/api/tail-risk`` is the desk's downside number, but on a young book it
+    correctly reads ``INSUFFICIENT`` (``<20`` daily returns) and the
+    operator — who lives in Discord — gets summaries that never say what a
+    −3 % tape or a single-name gap costs the *current* concentrated book.
+    ``build_stress_scenarios`` answers that with **zero return history**
+    (pure weight×beta arithmetic), so this is the between-history read.
+
+    Composes ``build_stress_scenarios`` **verbatim** (single source of
+    truth, AGENTS.md invariant #10 — the headline is the builder's, never
+    re-derived here, so this Discord line and ``/api/stress-scenarios`` can
+    never drift). Uses the **pinned** ``sector_exposure.classify`` /
+    ``stress_scenarios._LEVERAGE_BETA`` copies (both CI-pinned to
+    ``/api/risk``) so the Discord path never imports the ~9k-line
+    dashboard. **Pure store reads only — NO network** (the Discord-path
+    discipline; adds zero latency). Observational only, no caps, never
+    gates (invariants #2/#12; the ``_hold_discipline_line`` precedent).
+    Failure contract mirrors the rest of ``reporter``: any builder/store
+    fault degrades to ``""`` ("no stress line this report"), **never** an
+    exception ("no Discord summary this report"). ``NO_DATA`` (no priced
+    book) is suppressed — nothing to say (the ``_hold_discipline_line``
+    NO_DATA precedent)."""
+    try:
+        pf = store.get_portfolio()
+        st = build_stress_scenarios(
+            store.open_positions(),
+            float(pf.get("total_value") or 0.0),
+            _sector_classify,
+            _LEVERAGE_BETA,
+        )
+        if not isinstance(st, dict) or st.get("state") in (None, "NO_DATA"):
+            return ""
+        return ("**FORWARD STRESS** ◈ what a routine bad tape costs this book\n"
+                f"{st['headline']}")
+    except Exception as e:
+        print(f"[reporter] stress line skipped: {e}")
+        return ""
+
+
 def _capital_pulse_line(store) -> str:
     """One-line "is the desk capital-paralysed right now?" for the hourly /
     daily report.
@@ -953,6 +997,9 @@ def send_hourly_summary() -> bool:
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx
+    stx = _stress_line(store)
+    if stx:
+        body += "\n" + stx
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
@@ -1029,6 +1076,9 @@ def send_daily_close() -> bool:
     hx = _hold_discipline_line(store)
     if hx:
         body += "\n" + hx
+    stx = _stress_line(store)
+    if stx:
+        body += "\n" + stx
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
