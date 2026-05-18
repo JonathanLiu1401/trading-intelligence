@@ -1556,6 +1556,16 @@ def _ml_decide(
                     best_score = adj_s
                     break
 
+    # 52-week-high gate: suppress buys when the ticker is at an extended high.
+    # Prevents buying into bubble peaks where news clusters at market tops
+    # (e.g. dot-com 2000) causing underperformance vs shuffled baselines.
+    if buy_ticker:
+        _w52 = quant.get(buy_ticker, {}).get("wk52_pos")
+        if isinstance(_w52, (int, float)) and _w52 > 0.80:
+            _peak_penalty = (_w52 - 0.80) * 20.0
+            if best_score - _peak_penalty < buy_threshold:
+                buy_ticker = None
+
     # Track the score that actually triggered the sell. Default is the worst-held
     # score from step 4; the CONTRARIAN swap (below) overrides with best_score
     # because that's what tagged the ticker as overbought in the first place.
