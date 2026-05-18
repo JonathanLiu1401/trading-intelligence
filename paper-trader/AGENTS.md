@@ -527,6 +527,7 @@ Digital Intern dashboard on `:8080` can cross-fetch.
 | `GET /api/correlation` | **Concentration honesty — do the held names actually move *together*?** `/api/risk` reports **name-level** concentration (`concentration_top1_pct`/`top3_pct`) and a single 3% SPY-shock; it cannot see **factor** concentration — a "2-position 59/41" book reads as merely concentrated, but if both names co-move the operator is running a *single bet* and the SPY-shock understates the tail. Computes pairwise Pearson **return** correlation among the held **stock** positions (deterministic ticker-sorted pairs; a flat series → `None`, never a fabricated 0), the most-coupled pair, the weight-Herfindahl `effective_positions_naive` (1/HHI), and the **correlation-adjusted `effective_independent_bets`** = `n / (1 + (n−1)·mean_ρ)` clamped to [1, n] — which collapses toward 1 as the names co-move however many tickers are on the book (mean ρ=−1 with n=2 → denominator 0 → honest `None`, never a fabricated number). Options are flagged & skipped (correlating a Greeks payoff against a linear return is meaningless — the `open_attribution`/`/api/backtests/compare` "stocks only" carve-out, #10 spirit). **The builder is pure; the yfinance daily-bar fetch lives in the endpoint** via the shared `_daily_history_cached` (3mo, the existing 30-min `_NEWS_EDGE_PX_CACHE`) — exactly the `thesis_drift` "network in the endpoint, builder takes the dicts" split, so the core is offline & deterministically testable and a fetch failure degrades to `INSUFFICIENT`, never an error. Sample-size honesty mirrors `news_edge`/`trade_asymmetry`: `NO_DATA` (no stock positions) → `INSUFFICIENT` (<2 correlatable names, or series < `MIN_RETURNS`=10 aligned daily returns — numerics where computable, verdict withheld) → `OK` with verdict precedence `SINGLE_NAME_RISK` (top weight ≥ `DOMINANT_WEIGHT`=60% — single-name risk reads first, correlation is secondary) > `CONCENTRATED` (mean ρ ≥ `HIGH_CORR`=0.70 — the book moves as one) > `MODERATE` (≥ `MOD_CORR`=0.40) > `DIVERSIFIED`. Pairs are measured over a **common aligned tail** so every ρ uses the same window. Advisory only — never gates Opus, adds no caps (invariants #2/#12). Pure core: `analytics/correlation.py::build_correlation` (never raises). Locked by `tests/test_correlation.py`. **UI:** `pcorr-card` panel on the `:8090` trader page (fresh id prefix per invariant #14); JS degrades via the `/api/build-info` `stale` contract |
 | `GET /api/decision-context` | **What is the live trader actually being *shown* right now?** — the decision *input* every one of the ~45 output-diagnostic endpoints presupposes. `decisions` stores only `action_taken`+`reasoning`; the only raw capture is `RAW_CAPTURE_CHARS`=1000 of the *response* on a parse failure. When the trader spends cycle after cycle on `NO_DECISION (timeout/empty)` / flat `HOLD` (the dominant 2026-05-17 live pattern — `$972.69`, `$18.49` cash, MU stale-marked) an operator has no way to see *what Opus was fed*. This reconstructs it on demand: the prompt rendered through the **same `strategy._build_payload`** the live `decide()` uses (+ the identical `SYSTEM_PROMPT`/`ML ADVISOR` framing) so it is **byte-identical to the live prompt given identical inputs** (single source of truth, invariant #10 — no re-implemented prompt), bounded to `MAX_PROMPT_CHARS`=40000 with `prompt_chars`/`prompt_truncated` honesty keys; an `input_summary` (top/urgent/merged counts — `signal_count` is the *exact* value `decide()` writes to `decisions.signal_count` — watchlist/futures resolved-vs-missing, quant tickers, sentiment mentions); `advisory_blocks` presence (self-review/track-record/risk-mirror/ml); the embedded `/api/mark-integrity`; and a `feed_state` ∈ `BLIND` (0 merged signals — a HOLD this cycle is *forced* by an empty feed, not chosen) / `DEGRADED` (≥`DEGRADED_MISSING_RATIO`=50% of watchlist prices missing — the yfinance starvation behind the timeout storms) / `OK`. **`_claude_call` is never invoked** (`claude_invoked:false`; locked by an endpoint test that monkeypatches it to raise and still expects 200). The snapshot is the new write-free `strategy.portfolio_snapshot_readonly`, which shares the extracted pure `strategy._mark_to_market` with the live `_portfolio_snapshot` so the inspector's marks (incl. expired-option intrinsic #13 + `stale_mark`) can never drift from the real ones (invariant #10) and the dashboard thread never mutates the live trader's persisted marks/equity. Orchestration (`assemble_inputs`, mirrors `decide()`'s pre-`_claude_call` assembly with each advisory builder wrapped non-fatally exactly as `decide()` wraps it) is shared by the endpoint **and** `python -m paper_trader.analytics.decision_context [--full|--json]` (works when `:8090` is wedged — the `desk_pulse`/`signals --check-freshness` precedent) so the two can't drift. SWR-cached 30s (the assemble fetch is multi-second; the `/api/state` precedent). Advisory only, **NOT** injected into the decision prompt — dashboard/chat/CLI only (invariants #2/#12; `strategy.decide()` untouched). Pure core: `analytics/decision_context.py::build_decision_context`. Locked by `tests/test_decision_context.py` (prompt section-header fidelity, exact input counts incl. `signal_count`, ML-advisor gating, feed_state boundaries, truncation honesty, embedded mark-integrity verbatim, and the `portfolio_snapshot_readonly` *marks-identically-but-never-writes* contract vs `_portfolio_snapshot`) + `tests/test_decision_context_endpoint.py` (Flask test client: never-calls-Opus 200, BLIND/DEGRADED, read-only, SWR honesty keys + warm-hit). Applies on next paper-trader restart (`/api/build-info` `stale`) |
 | `GET /api/mark-integrity` | **How much of the displayed book value is *fictional* right now?** — the mark-trust meta-metric no panel surfaces. When yfinance returns nothing for a held name `strategy._mark_to_market` falls back to `avg_cost` and flags `stale_mark=True` (the live 2026-05-17 pathology: `MU 0.5 @ 724.12`, `current_price==avg_cost`, `P/L $0.00` — indistinguishable from a genuinely flat row). That flag is surfaced *per position* to Opus & Discord, but nothing answers the **aggregate**: what share of gross book value is marked at cost, so `/api/analytics` Sharpe, `/api/drawdown`, the equity curve and the headline P&L are all quietly partially false. Reports `n_stale`, `stale_value_usd`, `stale_value_pct` of gross, per-name rows, `stale_tickers`, and a verdict `NO_DATA`→`CLEAN`→`DEGRADED` (0<pct<`UNTRUSTWORTHY_PCT`=50, or gross 0 with stale rows so the share is unquantifiable) →`UNTRUSTWORTHY` (≥50% — treat every displayed P/L as substantially fictional until the feed recovers / runner restarts). Reads the write-free `strategy.portfolio_snapshot_readonly` (never mutates the live trader). Pure, never raises (garbage rows degrade to zero value — the behavioural-builder `_safe` contract). Advisory only — never gates Opus, adds no caps (invariants #2/#12). Also embedded inside `/api/decision-context`. Pure core: `analytics/mark_integrity.py::build_mark_integrity`. Locked by `tests/test_mark_integrity.py` (the exact live MU-stale shape `stale_value_pct`=37.94 off the raw gross, `>=50`→UNTRUSTWORTHY inclusive boundary, zero-gross no-divide-by-zero, option ×100, never-raises-on-garbage) + `tests/test_decision_context_endpoint.py` (Flask test client read-only + UNTRUSTWORTHY-when-price-missing). Applies on next paper-trader restart |
+| `GET /api/model-reliability` | **Which model actually made each live decision — full Opus vs the degraded Sonnet fallback — and how often the cycle produced nothing.** The stack is tuned end-to-end around Opus's reasoning depth (invariant #3), but `strategy.decide()` has a degrade ladder Opus→(timeout)Sonnet-on-condensed-prompt→NO_DECISION and **no panel was blind-spot-free here**: `/api/decision-health` buckets by *outcome* (a Sonnet-on-a-stripped-prompt FILLED is counted identically to a full-Opus FILLED), `/api/decision-forensics` only dissects the *NO_DECISION* excerpts. This reads the authoritative `fallback_used` flag in each made-decision's `reasoning` JSON (rows predating that flag read back `None` — verified live, a large pre-instrumentation tail — and are bucketed `legacy_unknown` and **excluded from the ratio** so a stale history can't fake a healthy/unhealthy number) and the NO_DECISION reason-prefix (`timeout`/`parse_failed`/`retry_failed`, mirroring strategy.py's exact strings). Reports per 24h/7d/all: `opus`/`sonnet_fallback`/`legacy_unknown` counts, `opus_share_pct` (of *attributable*), `no_decision_pct`, and the money cut `filled_fallback`/`filled_total`/`filled_fallback_pct` (how many *executed trades* the degraded model placed); plus a recent-vs-older `trend` (improving/worsening/flat) and a verdict `NO_DATA`→`INSUFFICIENT` (<`_MIN_ATTRIBUTABLE`=10 attributable, verdict withheld — the sample-size-honesty precedent)→`OPUS_HEALTHY` (≥90% Opus) / `DEGRADED` (≥70%) / `FAILING`. Pure, never raises (non-str rows degrade, not raise). Observational only — never gates Opus, adds no caps (invariants #2/#12; the `decision_health`/`self_review` precedent). Also `python -m paper_trader.analytics.model_reliability [--json]` (works when `:8090` is wedged). Pure core: `analytics/model_reliability.py::build_model_reliability`. Locked by `tests/test_model_reliability.py` (legacy-`None`-not-counted-as-Opus, outcome-prefix parsing, verdict bands, FILLED-from-fallback only-counts-fills, 24h windowing, worsening-trend ordering, never-raises-on-garbage). Applies on next paper-trader restart |
 
 ### Common failure modes (live trader)
 
@@ -1683,6 +1684,110 @@ findings.
   500s, `GOOGU` yfinance 404 (`prices[t]={}`) — all graceful. Both shipped
   changes are inert until `run_continuous_backtests.py` restart (the
   documented restart-required pattern).
+
+### 2026-05-18 review pass #7 (ML+backtest hybrid · conviction-gate effectiveness audit · live findings)
+
+- **Phase 1 — no new bugs.** Full re-trace of `decision_scorer.py`,
+  `backtest.py`, `run_continuous_backtests.py`, plus the coupled
+  `validation.py` / `calibration.py` / `skill_trend.py`: regex `ml_score`
+  parse (no `scorer=` false-match), `(ticker,sim_date,action)` dedup key,
+  the universal SELL `-forward_return_5d` sign-flip, the 5-trading-day
+  forward window guard, the off-distribution gate abstention, the WLS
+  numpy-fallback math, and every module-global lock were all re-verified
+  correct and exact-value test-locked. Consistent with the documented 9+
+  prior no-new-bug passes. **bugs_fixed = 0; no Phase-1 commit** (commit
+  guard honoured).
+
+- **Feature shipped: conviction-gate effectiveness audit.**
+  `paper_trader/ml/gate_audit.py`. The gap it fills: `calibration.py`
+  answers a *statistical* question (is pred monotone with realized, bucketed
+  by 10 quantile deciles) and `skill_trend.py` answers an *error-trend*
+  question (oos_rmse vs a mean predictor) — **neither answers the economic
+  one a quant asks before risking capital: do the five FIXED conviction
+  multipliers `_ml_decide` applies (×0.60 / ×0.85 / ×1.00 / ×1.15 / ×1.30
+  at FIXED prediction thresholds) actually buy realized edge?** A
+  `WELL_CALIBRATED` decile curve can coexist with a gate whose ×1.30 arm
+  realizes no more than its ×0.60 arm. `gate_audit` buckets every
+  `decision_outcomes.jsonl` row by the exact `_ml_decide` gate arm the
+  deployed scorer's prediction triggers (the if/elif chain reproduced
+  byte-for-byte, boundary operators included — duplicated as `GATE_ARMS`
+  module constants exactly as `calibration`/`skill_trend` avoid the
+  `backtest.py` circular import), applies the codebase-universal SELL
+  sign-flip, restricts to the **temporal-OOS slice** by default
+  (`validation.split_outcomes_temporal` — the trustworthy view), and
+  verdicts on the realized spread the 1.30/0.60 ratio is implicitly
+  underwriting: `INSUFFICIENT_DATA` / `GATE_HARMFUL` (spread < −1pp — gate
+  sizes UP the losers) / `GATE_INEFFECTIVE` (|spread| ≤ 1pp) /
+  `GATE_EFFECTIVE` (spread > +1pp). Same discipline as `ml/calibration.py`:
+  read-only, no train / pickle / `build_features` / `N_FEATURES` / trade
+  touch, never raises — safe against the live unattended loop.
+  ```bash
+  cd /home/zeph/paper-trader && python3 -m paper_trader.ml.gate_audit
+  cd /home/zeph/paper-trader && python3 -m pytest tests/test_gate_audit.py -v
+  ```
+  25 exact-value verdict/boundary locks in `tests/test_gate_audit.py`
+  (gate-arm boundary operators mirror `_ml_decide`; SELL-flip regression
+  lock; OOS-slice restriction; non-finite/missing-field hardening).
+
+- **Quant finding: the live conviction gate is economically inert (and
+  partially inverted).** `gate_audit` on the live pkl (`n_train=3446`,
+  gate active) over the temporal-OOS slice (n=1000):
+
+  | arm | mult | n | mean realized 5d |
+  |-----|------|---|------------------|
+  | strong_headwind | ×0.60 | 59 | **+2.09%** |
+  | mild_headwind | ×0.85 | 483 | −0.12% |
+  | neutral | ×1.00 | 304 | +0.79% |
+  | mild_tailwind | ×1.15 | 109 | +1.88% |
+  | strong_tailwind | ×1.30 | 45 | +3.07% |
+
+  Verdict `GATE_INEFFECTIVE`: strong_tailwind − strong_headwind = **+0.98pp**
+  (inside the ±1pp band) — a >2× capital swing buys ≈1pp of edge, noise
+  against σ≈7–17 on 5d returns. Worse, the **tailwind half is monotone
+  (0.79 → 1.88 → 3.07) but the headwind half is inverted**: the gate's
+  *smallest* bet (strong_headwind ×0.60) realized the *second-highest*
+  return (+2.09%), above neutral and mild_headwind. The ×0.60 down-sizing
+  arm fires on the over-predicted d1 tail (calibration: d1 pred −9.63 vs
+  realized −3.74 in-sample) and is mis-sizing names that don't deserve it.
+  This is the missing economic complement to the existing split:
+  `calibration` = `WELL_CALIBRATED` (in-sample, optimistic),
+  `skill_trend` = `NEGATIVE_OOS_SKILL`, `gate_audit` = `GATE_INEFFECTIVE`.
+  Reported, not actioned — re-sizing the multipliers or gate thresholds is
+  a model-dynamics change out of surgical scope (CLAUDE.md §6; the gate is
+  invariant #5).
+
+- **Quant finding: the winner→ArticleNet feedback loop (CLAUDE.md §5
+  step 5) is dead, now two ways.** Recent `continuous.log` `[continuous]
+  ml:` lines are uniformly `trainer timeout (injected N)` **or**
+  `inject err: database is locked`. AGENTS.md already documented the 120 s
+  `ml.trainer.train(force=True)` timeout; the **`database is locked`** on
+  the `_inject_and_train` write is a second, distinct failure (the live
+  digital-intern daemon and the injector contend on `articles.db` — the
+  injector opens a plain `sqlite3.connect(DB_PATH, timeout=15)` with no WAL
+  pragma, unlike the read paths). Net: injection partially lands or is lost,
+  ArticleNet never retrains from winners. Root cause is digital-intern-side
+  (GPU contention + write contention) — reported, out of this domain's
+  surgical scope, but the loop should not be read as "training on its
+  winners" — it is not.
+
+- **Quant finding: `[price_cache] XLI failed: 'Response' object has no
+  attribute 'get'`** — an intermittent yfinance internal error during the
+  per-window price-cache build leaves `prices["XLI"] = {}` (handled by the
+  `except` — **not a code bug**). Consequence: `_sector_rotation` silently
+  drops XLI from that cycle's rotation ranking and the XLI quant features
+  no-op. Transient/network, self-heals on next redraw; noted as a
+  data-realism caveat, not actioned.
+
+- **Operational finding: hourly review agents are stacking.** Three
+  identical-prompt ML+backtest review processes were observed running
+  concurrently (started 06:00 / 06:30 + this pass), each taking >1 h, so
+  `scripts/hourly_review.sh` overlaps itself. The working tree already
+  carried another agent's uncommitted `run_curves` IN-clause chunking edit
+  to `backtest.py`; to avoid sweeping it into this pass's commit, this pass
+  touched **only new files** (`paper_trader/ml/gate_audit.py`,
+  `tests/test_gate_audit.py`) plus this AGENTS.md section. Consider a
+  lockfile / `flock` in `hourly_review.sh` so a still-running review skips
+  rather than stacks.
 
 ### When to bump model versions
 
