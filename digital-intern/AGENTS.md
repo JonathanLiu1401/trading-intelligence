@@ -1506,7 +1506,7 @@ logger/retry fixes are holding). Production invariant #2 verified live:
 `ai_score>0 AND score_source='ml'` = **0**. No Phase 1 commit (correct
 per the guard).
 
-**Phase 2: features_added=1, commit `<feat>`** (`watchers/alert_recency.py`
+**Phase 2: features_added=1, commit `8410f05`** (`watchers/alert_recency.py`
 new + `watchers/alert_agent.py` + `tests/conftest.py` +
 `tests/test_alert_recency.py` new). **Cross-cycle (cross-time)
 syndication suppression** — the analyst's single most-cited complaint
