@@ -294,6 +294,27 @@ class TestPermutationTestIsolation:
         assert len(rows) == 1
         assert rows[0][0] == -1
 
+    def test_empty_window_returns_inconclusive(self):
+        """A backtest window with zero in-window articles must short-circuit
+        to INCONCLUSIVE, not run permutations against modern articles
+        accidentally mapped onto a pre-DB historical window."""
+        from paper_trader.validation import run_permutation_test
+
+        class _StubEngine:
+            # _local_news spans only 2024-2025; window is 2000-2001 → no overlap.
+            _local_news = {
+                "2024-06-15": [{"score": 3.0}],
+                "2025-01-02": [{"score": 4.0}],
+            }
+            start = date(2000, 1, 1)
+            end = date(2001, 1, 1)
+
+        engine = _StubEngine()
+        result = run_permutation_test(engine)
+        assert result["verdict"] == "INCONCLUSIVE"
+        assert result["n_permutations"] == 0
+        assert "no articles in backtest window" in result["note"]
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Walk-forward validation — fold counting
