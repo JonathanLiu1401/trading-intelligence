@@ -206,18 +206,40 @@ def _article_age_str(art: dict) -> str | None:
 _QW_PRICE_GLUE = re.compile(r"[A-Za-z]\$?\d{1,4}[.,]\d{2,3}")
 _QW_PCT_PAREN = re.compile(r"\([+-]?\d{1,3}(?:\.\d+)?%\)")
 _QW_QUOTE_PATH = re.compile(r"/quote/[^/]+/?$", re.I)
+# Quote-aggregator share-card / listing-page pseudo-article — a DISTINCT
+# surface the two title fingerprints above don't catch. Google News indexes
+# the Moomoo/Futu/Webull "share this quote" landing pages whose title is the
+# rendered card: "$NVIDIA (NVDA.US)$ - Moomoo" / "$Tencent (00700.HK)$ - Futu".
+# Live evidence (2026-05-18, recurring across ≥6 prior passes): the exact row
+# "$NVIDIA (NVDA.US)$ - Moomoo" from the `GN: Nvidia` collector was
+# ML-relevance-scored 9.77 (ai_score 0) and fired a 🚨 BREAKING urgent alert
+# (urgency=2) — the consuming analyst's recurring noise complaint, never
+# fingerprint-gated (only the cred-bar approach was deferred as contested
+# tuning; a fingerprint gate is the accepted quote-widget precedent). The
+# fingerprint = leading "$" share-card lead glued to a "(SYMBOL.EXCH)$" close;
+# bounded ({0,60}) so no catastrophic backtracking; validated zero false
+# positives on the live $+paren headline corpus
+# ("$NVDA breaks out (NYSE)", "Zscaler (NASDAQ:ZS) ... $223.00").
+# Byte-identical to collectors.web_scraper / analysis.claude_analyst (lockstep).
+_QW_LISTING = re.compile(
+    r"^\s*\$[^$\n]{0,60}\([A-Za-z0-9.\-]{1,8}\.[A-Za-z]{1,4}\)\$"
+)
 
 
 def _looks_like_quote_widget(art: dict) -> bool:
-    """True for a live quote-tape entry masquerading as an urgent article.
+    """True for a live quote-tape / quote-listing entry masquerading as an
+    urgent article.
 
-    Two independent title fingerprints (a letter glued to a decimal price; a
-    parenthesised signed % change) plus a Yahoo /quote/ landing path. All are
-    anchored so real headlines with $/%/comma numbers ("rises 22% to $35.1
-    billion", "5,123.41 record high") and real quote-scoped article URLs are
-    never caught. Mirrors collectors.web_scraper._looks_like_quote_widget."""
+    Three independent title fingerprints (a letter glued to a decimal price; a
+    parenthesised signed % change; a "$NAME (SYMBOL.EXCH)$" share-card listing
+    page) plus a Yahoo /quote/ landing path. All are anchored so real headlines
+    with $/%/comma numbers ("rises 22% to $35.1 billion", "5,123.41 record
+    high"), real "$TICKER ..." prose ("$MU upgraded to Buy") and real
+    quote-scoped article URLs are never caught. Mirrors
+    collectors.web_scraper._looks_like_quote_widget."""
     title = art.get("title") or ""
-    if _QW_PRICE_GLUE.search(title) or _QW_PCT_PAREN.search(title):
+    if (_QW_PRICE_GLUE.search(title) or _QW_PCT_PAREN.search(title)
+            or _QW_LISTING.search(title)):
         return True
     url = art.get("link") or art.get("url") or ""
     try:

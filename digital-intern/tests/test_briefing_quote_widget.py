@@ -71,6 +71,52 @@ def test_url_alias_and_missing_fields_safe():
     assert _looks_like_quote_widget({}) is False
 
 
+# ── Quote-listing share-card fingerprint (_QW_LISTING) ──────────────────────
+# "$NVIDIA (NVDA.US)$ - Moomoo" — a Google-News-indexed Moomoo/Futu/Webull
+# quote share-card landing page (NOT an article). ML-relevance over-scored
+# (live: 9.77) so it reaches the top-60 newswire and renders as a fake
+# "[HH:MM] [score] TOP SIGNAL" — recurring across ≥6 prior passes. A distinct
+# surface the price-glue / parenthesised-% fingerprints don't catch.
+
+@pytest.mark.parametrize("title", [
+    "$NVIDIA (NVDA.US)$ - Moomoo",                  # the exact live row
+    "$Tesla (TSLA.US)$ - Moomoo",
+    "$Tencent (00700.HK)$ - Futu",                  # HK numeric symbol
+    "$Samsung Electronics (005930.KS)$ - Webull",
+    "  $NIO Inc. (NIO.US)$",                         # leading ws, no provider
+])
+def test_quote_listing_share_card_detected(title):
+    assert _looks_like_quote_widget({"title": title, "link": ""}) is True
+
+
+@pytest.mark.parametrize("title", [
+    "$NVDA breaks out ahead of earnings (NYSE)",     # real $TICKER prose
+    "$MU upgraded to Buy (price target $150.00)",
+    "$TSLA: why I am buying the dip (analysis)",
+    "Zscaler (NASDAQ:ZS) Price Target Cut to $223.00 by Analysts",
+    "Nvidia (NVDA) Q1 preview: all eyes on data center",
+])
+def test_real_dollar_ticker_headlines_not_flagged(title):
+    # The share-card-only discriminator is the glued "(SYM.EXCH)$" close;
+    # real "$TICKER ..." headlines must survive the gate.
+    assert _looks_like_quote_widget({"title": title, "link": ""}) is False
+
+
+def test_build_payload_excludes_quote_listing_keeps_real():
+    articles = [
+        {"title": "Micron shares surge after Q3 earnings blowout",
+         "source": "rss", "ai_score": 9, "summary": "DRAM pricing up",
+         "link": "https://example.com/micron-q3"},
+        {"title": "$NVIDIA (NVDA.US)$ - Moomoo",
+         "source": "GN: Nvidia", "ai_score": 9.77, "summary": "",
+         "link": "https://news.google.com/x"},
+    ]
+    payload = _build_payload(articles, {}, [])
+    section = payload.split("=== NEWSWIRE (scored, ranked) ===", 1)[1]
+    assert "Micron shares surge after Q3 earnings blowout" in section
+    assert "$NVIDIA (NVDA.US)$" not in payload
+
+
 # ── _filter_quote_widget_noise — pure partition, order, no mutation ──────────
 
 def test_partition_keeps_real_drops_widgets_in_order():

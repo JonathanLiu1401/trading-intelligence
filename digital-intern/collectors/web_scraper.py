@@ -231,13 +231,35 @@ _QW_PCT_PAREN = re.compile(r"\([+-]?\d{1,3}(?:\.\d+)?%\)")
 # own href. Anchored to end-of-path so real quote-scoped articles
 # ("/quote/NVDA/news/some-headline-123") are NOT caught.
 _QW_QUOTE_PATH = re.compile(r"/quote/[^/]+/?$", re.I)
+# Quote-aggregator *share-card / listing-page* pseudo-article. Google News (and
+# other aggregators) index the Moomoo/Futu/Webull "share this quote" landing
+# pages whose <title> is the rendered share card: "$NVIDIA (NVDA.US)$ - Moomoo"
+# / "$Tencent (00700.HK)$ - Futu". These are NOT articles — they are a live
+# quote page, the same pseudo-article class as the ticker-tape widget above
+# (same noise complaint), but with a distinct surface the two fingerprints
+# above don't catch (no glued price, no parenthesised % change, no Yahoo
+# /quote/ URL). Live evidence (2026-05-18 + recurring across ≥6 prior passes):
+# "$NVIDIA (NVDA.US)$ - Moomoo" arrived via the `GN: Nvidia` collector,
+# ML-relevance-scored 9.77, and fired a 🚨 BREAKING urgent alert (urgency=2).
+# The fingerprint is the leading "$" share-card lead glued to a
+# "(SYMBOL.EXCH)$" close — real prose never ends a parenthetical with
+# ".EXCH)$", and a real "$TICKER ..." headline ("$NVDA breaks out (NYSE)",
+# "$MU upgraded to Buy (price target $150.00)") has no such close. Bounded
+# ({0,60}) so there is no catastrophic backtracking. Validated zero false
+# positives against the live $+paren headline corpus
+# (e.g. "Zscaler (NASDAQ:ZS) Price Target Cut to $223.00").
+_QW_LISTING = re.compile(
+    r"^\s*\$[^$\n]{0,60}\([A-Za-z0-9.\-]{1,8}\.[A-Za-z]{1,4}\)\$"
+)
 
 
 def _looks_like_quote_widget(title: str, url: str) -> bool:
-    """True for live quote-tape entries masquerading as articles. See the
-    block comment above for the live evidence and the two title fingerprints."""
+    """True for live quote-tape / quote-listing entries masquerading as
+    articles. See the block comment above for the live evidence and the three
+    title fingerprints (price-glue, parenthesised %, share-card listing)."""
     t = title or ""
-    if _QW_PRICE_GLUE.search(t) or _QW_PCT_PAREN.search(t):
+    if (_QW_PRICE_GLUE.search(t) or _QW_PCT_PAREN.search(t)
+            or _QW_LISTING.search(t)):
         return True
     try:
         if _QW_QUOTE_PATH.search(urlparse(url or "").path):

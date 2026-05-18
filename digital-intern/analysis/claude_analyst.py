@@ -656,23 +656,43 @@ def _fmt_ticker(s):
 _QW_PRICE_GLUE = re.compile(r"[A-Za-z]\$?\d{1,4}[.,]\d{2,3}")
 _QW_PCT_PAREN = re.compile(r"\([+-]?\d{1,3}(?:\.\d+)?%\)")
 _QW_QUOTE_PATH = re.compile(r"/quote/[^/]+/?$", re.I)
+# Quote-aggregator share-card / listing-page pseudo-article — a DISTINCT
+# surface the two title fingerprints above miss. Google News indexes the
+# Moomoo/Futu/Webull "share this quote" landing pages whose title is the
+# rendered card: "$NVIDIA (NVDA.US)$ - Moomoo" / "$Tencent (00700.HK)$ - Futu".
+# These are a live quote page, not news — the same pseudo-article class as the
+# ticker-tape widget, and (ML-relevance over-scored, e.g. live 9.77) they reach
+# the top-60 newswire Opus reads and render as a fake "[HH:MM] [score] TOP
+# SIGNAL", the analyst's recurring noise complaint. The alert path also gates
+# this now; the briefing — the analyst's PRIMARY consumed product — must too
+# (the pass-16 precedent: every consumed product gets the quote-widget gate).
+# Fingerprint = leading "$" share-card lead glued to a "(SYMBOL.EXCH)$" close;
+# bounded ({0,60}) so no catastrophic backtracking; validated zero false
+# positives on the live $+paren headline corpus. Byte-identical to
+# watchers.alert_agent / collectors.web_scraper (the documented lockstep).
+_QW_LISTING = re.compile(
+    r"^\s*\$[^$\n]{0,60}\([A-Za-z0-9.\-]{1,8}\.[A-Za-z]{1,4}\)\$"
+)
 
 
 def _looks_like_quote_widget(article: dict) -> bool:
-    """True for a live quote-tape entry masquerading as a digest article.
+    """True for a live quote-tape / quote-listing entry masquerading as a
+    digest article.
 
-    Two independent title fingerprints (a letter glued directly to a decimal
-    price; a parenthesised signed % change) plus a Yahoo /quote/ landing path.
-    All anchored so real prose with $/%/comma numbers ("rises 22% to $35.1
-    billion", "5,123.41 record high") and real quote-scoped article URLs
+    Three independent title fingerprints (a letter glued directly to a decimal
+    price; a parenthesised signed % change; a "$NAME (SYMBOL.EXCH)$" share-card
+    listing page) plus a Yahoo /quote/ landing path. All anchored so real prose
+    with $/%/comma numbers ("rises 22% to $35.1 billion", "5,123.41 record
+    high"), real "$TICKER ..." headlines and real quote-scoped article URLs
     ("/quote/NVDA/news/headline-123") are never caught. Byte-identical logic
     to watchers.alert_agent._looks_like_quote_widget and
     collectors.web_scraper._looks_like_quote_widget. The synthetic
     PORTFOLIO/OPTIONS snapshot rows the daemon prepends ("PORTFOLIO P&L
-    SNAPSHOT" / "OPTIONS SNAPSHOT", no url) never match either fingerprint, so
+    SNAPSHOT" / "OPTIONS SNAPSHOT", no url) never match any fingerprint, so
     they always pass through untouched."""
     title = article.get("title") or ""
-    if _QW_PRICE_GLUE.search(title) or _QW_PCT_PAREN.search(title):
+    if (_QW_PRICE_GLUE.search(title) or _QW_PCT_PAREN.search(title)
+            or _QW_LISTING.search(title)):
         return True
     url = article.get("link") or article.get("url") or ""
     try:
