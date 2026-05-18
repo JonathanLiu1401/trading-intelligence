@@ -3354,3 +3354,115 @@ expected; this entry was appended, not rewritten).
   del), no sibling leakage; never `git add -A`; on origin/master. A
   concurrent sibling hybrid agent edited this repo throughout; this entry
   was appended, not rewritten.
+
+- **2026-05-18 (hybrid pass 27 — Agent 3, debug + feature + analyst-validation)** —
+  Required-file-set pass (27th; codebase exceptionally mature, 26 prior
+  passes). Advisor-reviewed before substantive work. All 9 required files +
+  AGENTS.md read in full. Bare daemon `pid 1702195` started **2026-05-18
+  ~07:30Z** (etimes ~28.3k s), predating EVERY recent HEAD fix — the
+  consistent stale-daemon caveat. A concurrent sibling hybrid agent
+  (`pid 1979386`, the EXACT same prompt) + auto-commit/push daemon edited the
+  shared monorepo throughout → strict per-commit pathspec staging (memory
+  `di-shared-repo-concurrency`).
+
+  **Phase 1 — bugs_fixed=0, NO Phase-1 commit (commit guard honoured —
+  honest, not a miss; advisor-confirmed).** Every error in live `daemon.log`
+  forensics maps to (a) **fixed-at-HEAD on the stale daemon** —
+  `[stats_worker] 'NoneType' object is not subscriptable` ×65 (`_expect_row`
+  `05b406e`), `[scorer_worker] no more rows available` ×3 (`bec95ea`), 26
+  stuck `urgency=1` rows (`reap_stale_urgent` `50c1052`), COVERAGE-GAP "0.0h"
+  (`b20cbae`) — (b) **sibling WIP** — `rss_collector.py` 4-tuple
+  (`string indices must be integers` ×19) — or (c) the **chronic
+  shared-conn lock-exhaustion** (44 `lock retry exhausted` + an
+  `update_ai_scores_batch`-retry-exhausted Traceback at
+  `urgency_scorer.py:188` → a whole Sonnet-labelled batch dropped =
+  potential missed urgent classification); per-call connection isolation is
+  substantial + `daemon.py`/store sibling-touched → out of clean scope
+  (advisor/precedent-confirmed, passes 19–26). The `[ticker_worker] another
+  row available` ×1 is already in `_RETRYABLE_DB_ERRORS` (budget-exhausted,
+  same class as the 44). Invariants verified LIVE: `0` synthetic
+  `urgency>=1`, `0` `ai_score>0 AND score_source='ml'` in the ~1.46 GB prod
+  DB. No genuine new bug in clean scope; the full requested Phase-1 test list
+  already exists and value-asserts (precedent passes 15/16/17/21/22/24/26).
+
+  **Phase 2 — features_added=1, commit `3135718`** (3 src + 3 test, +224/−19,
+  pathspec-scoped, `git show --stat` verified no sibling leak, on
+  origin/master). **Quote-listing share-card fingerprint** added byte-
+  identically (`_QW_LISTING`) to the THREE lockstep `_looks_like_quote_widget`
+  gates (`collectors/web_scraper.py`, `watchers/alert_agent.py`,
+  `analysis/claude_analyst.py`). **Live + recurring evidence:** the row
+  `$NVIDIA (NVDA.US)$ - Moomoo` (a Moomoo/Futu/Webull "share this quote"
+  landing page, NOT an article) from the `GN: Nvidia` collector, ML-relevance
+  over-scored `ml_score=9.77`/`ai_score=0`, fired a `urgency=2` 🚨 BREAKING
+  push AND reaches the top-60 Opus newswire as a fake TOP SIGNAL — documented
+  as a noise complaint across ≥6 prior passes but never fingerprint-gated
+  (only the *cred-bar* approach was deferred as contested tuning; a
+  fingerprint gate is the accepted quote-widget precedent, passes 14/16). The
+  two existing fingerprints (letter-glued price, parenthesised signed %) +
+  Yahoo `/quote/` path miss this distinct surface. Fingerprint =
+  `^\s*\$[^$\n]{0,60}\(SYM.EXCH\)\$` (leading "$" share-card lead glued to a
+  `(SYMBOL.EXCH)$` close); bounded so no catastrophic backtracking; **offline-
+  and live-validated ZERO false positives** against the real $+paren headline
+  corpus (`$NVDA breaks out (NYSE)`, `$MU upgraded to Buy (price target
+  $150.00)`, `Zscaler (NASDAQ:ZS) … $223.00`). Ships to BOTH consumed
+  products (alert push + 5h Opus digest; the pass-16 "every consumed product
+  gets the gate" precedent — advisor-directed not to scope alert-only),
+  reusing the existing `_filter_quote_widget_noise` suppression machinery
+  (suppressed rows marked `urgency=2`, kept in `articles.db` for training).
+  Pure read-side: no DB write, no ai_score/ml_score/score_source/urgency
+  mutation, backtest already filtered upstream — **all four load-bearing
+  invariants intact by construction**. +23 specific-value tests across the 3
+  lockstep gate test files (helper True/False incl. the FP corpus,
+  end-to-end suppression, mixed-batch, `_build_payload` integration). Ships
+  on next `systemctl restart digital-intern` (stale-daemon caveat).
+
+  **Phase 3 — analyst-lens live validation, user_findings=8.** (1) **Phase-2
+  driver CONFIRMED LIVE** — `$NVIDIA (NVDA.US)$ - Moomoo` (GN: Nvidia,
+  ml=9.77, ai=0) in the live `urgency=2` set (fixed by `3135718`, ships on
+  restart). (2) **Stale daemon predates ALL recent HEAD fixes** (the
+  meta-finding: an operator `systemctl restart digital-intern` ships passes
+  19–27's accumulated fixes incl. this one). (3) **26 phantom `urgency=1`
+  rows** dated 2026-05-13 (5 days) — `reap_stale_urgent` at HEAD, stale
+  daemon hasn't run a post-fix purge; inflates the dashboard urgent tile.
+  (4) **Chronic DB-lock contention** — 44 `lock retry exhausted` + an
+  `update_ai_scores_batch`-retry-exhausted Traceback (whole Sonnet batch
+  dropped = potential missed urgent classification); memory
+  `di-insert-batch-lock-contention`; advisor/precedent-confirmed out of
+  clean scope. (5) **RSS dark in production** — sibling-WIP
+  `collectors/rss_collector.py` 4-tuple bug (`string indices must be
+  integers` ×19; the 5 `test_rss_collector.py` `_FakeResp` failures); not
+  mine, never staged. (6) **6 collectors disabled** (`sec_edgar`/`_ft`,
+  `polygon`, `newsapi`, `nitter`, `massive`) — analyst blind to 8-K filings
+  (priority-0); COVERAGE GAP surfaces it; upstream/operational
+  (`di-chronic-dark-collectors`). (7) **Alert path otherwise CLEAN & quiet
+  (positive)** — exactly 2 legit BN alerts/24h (Benzinga geopolitical
+  ai=9/8); recurring reddit/Wikipedia `urgency=2` residue is
+  pre-deployed-gate (stale daemon); Wikipedia 0.60 above the 0.45 lone bar =
+  the standing deferred contested *cred-map* tuning, NOT chased (distinct
+  from this pass's *fingerprint* gate). (8) **Briefing EXCELLENT + cadence
+  HEALTHY (positive)** — id27 (12:51Z, 50 arts) read end-to-end: dense,
+  accurate, decisively-actionable (Iran-war/bond-rout LEAD 30Y 5.13%, exact
+  MACRO/PORTFOLIO/SEMIS, syndication `[x2]` tags, COVERAGE GAP present);
+  cadence gaps 5.3/5.4/5.7/6.8/6.3h vs 5h target (the `ef839a8`
+  heartbeat-clock fix holding). None of 2–8 is a quick safe fix in clean
+  scope (stale-daemon-with-HEAD-fix / advisor-confirmed out-of-scope /
+  upstream / contested-cred-tuning) → no Phase-3 fold-in; bugs_fixed stays 0,
+  features_added 1.
+
+  **Verify:** `storage.article_store` / `ml.features` / `ml.model` /
+  `watchers.alert_agent` / `analysis.claude_analyst` /
+  `collectors.web_scraper` imports OK; suite **886 passed / 5 failed**
+  (`--ignore=tests/test_alert_history.py`; the 5 are the pre-existing
+  sibling `M collectors/rss_collector.py` `'_FakeResp' object has no
+  attribute 'status_code'` 4-tuple WIP — not ours, never staged; floor held
+  exactly 5, never 6+; my +23 new tests all pass; the 405-test alert/
+  briefing/analyst/web_scraper slice green, zero regressions). *Pre-existing,
+  deliberately never staged* (consistent with every prior entry):
+  `collectors/rss_collector.py`, `daemon.py`, `dashboard/server.py`,
+  `scripts/export_training_data.py`, `tests/test_article_store.py`, untracked
+  sibling files, all `paper-trader/*`, `logs/*`. Commit `3135718`
+  pathspec-scoped via `git commit -F … -- <6 explicit paths>`;
+  `git diff --staged --name-only` + `git show --stat` verified EXACTLY 6
+  files, no sibling leakage; never `git add -A`; pushed to origin/master
+  (`318dfe4..3135718`). A concurrent sibling hybrid agent edited this repo
+  throughout; this entry was appended, not rewritten.
