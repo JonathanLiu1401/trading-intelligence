@@ -240,6 +240,7 @@ RULES:
 - A newswire row tagged "[ALERTED]" ALREADY fired a standalone 🚨 BREAKING push to the analyst within the last few hours — it is a developing/continued story the analyst has ALREADY been told about, NOT new news. Do NOT make an "[ALERTED]" row the LEAD when any untagged story of comparable importance exists; rank a fresh untagged story above an "[ALERTED]" one of similar score in TOP SIGNALS; and frame any "[ALERTED]" item explicitly as continuation (e.g. "follows the earlier alert", "developing") — never as if it just broke. This is what separates new desk intel from a rehash of an alert already delivered.
 - A newswire row tagged "[BOOK: TICKER,...]" names live portfolio/watchlist positions the analyst actually holds money in (LITE, LNOK, MUU, DRAM, MU, NVDA, MSFT, AXTI, ORCL, TSEM, QBTS). A "[BOOK:...]" row is directly actionable for the analyst's open risk: weight it ABOVE a same-score untagged general-market row when choosing the LEAD and ordering TOP SIGNALS, always reflect its named ticker(s) in the PORTFOLIO table with a concrete implication, and never bury a "[BOOK:...]" item below generic macro colour of similar magnitude. Absence of the tag means the row does not touch the held book.
 - If a "BOOK HEAT" block is present, it ranks the analyst's held names by how many DISTINCT stories this window touched each one. Concentration on a single held name is itself a magnitude signal, independent of any one row's score: strongly prefer the most-concentrated held name for the LEAD when it has any material story, rank its stories up in TOP SIGNALS, and give that ticker a concrete forward-looking implication in the PORTFOLIO table. This is a ranking/weighting hint only — do NOT echo a literal "BOOK HEAT" section in the output (unlike COVERAGE GAP).
+- If an "AGING TOP ROWS" block is present, it names the highest-ranked digest rows whose deterministic wall-clock age (time since the story hit our wire) is several hours old — a ground-truth recency cross-check, independent of any row's score or decay rank. An aging top row is a developing/continued story, NOT one that just broke: do NOT make it the LEAD as if it were fresh when a comparably-important newer row exists, frame it explicitly as developing in the LEAD and TOP SIGNALS, and never imply a multi-hour-old item happened moments ago. This is a ranking/framing hint only — do NOT echo a literal "AGING TOP ROWS" section in the output (same as BOOK HEAT, unlike COVERAGE GAP).
 - If a "COVERAGE GAP" block is present in the data input, reproduce it as a **COVERAGE GAP** section (one bullet per dark channel, verbatim). These are intel channels the system could NOT collect from this window — the analyst must know what they are blind to, not assume silence means calm. Omit the section entirely if no gap block is provided.
 
 OUTPUT FORMAT — use EXACTLY this, filled with real data:
@@ -677,6 +678,70 @@ def _book_heat_lines(
             for t, n in hot[:_BOOK_HEAT_MAX_LINES]]
 
 
+# ── Aging-top-row recency cross-check ────────────────────────────────────────
+# A news analyst whose persona is "react to BREAKING events fast" is misled
+# worst by a stale story dressed as fresh. The model-estimated time_sensitivity
+# decay rerank (_rank_by_decayed_score) already demotes stale time-bound rows —
+# but only as far as the model's ts head scored them: a row the ts head
+# under-scored stays time-bound yet barely decays, and in a sparse 5h window an
+# already-decayed 5-6h-old item can still float to #1. Opus then has only the
+# per-row [seen HH:MM UTC] absolute clock and the BRIEFING TIME header, and LLM
+# clock subtraction across a bare-HH:MM 24h window is unreliable — so it can
+# write a multi-hour-old developing story into the LEAD as if it just broke
+# (the recurring duplicate/stale-framing complaint, on the analyst's primary
+# product). This surfaces a DETERMINISTIC wall-clock age for the rows Opus
+# actually leads with — an independent ground-truth cross-check on the
+# model-estimated decay, NOT a re-expression of it. Same pure read-side,
+# BOOK-HEAT-shaped contract (separate input block, never a per-row token, never
+# echoed): no DB write, no ai_score/ml_score/score_source/urgency touch, no row
+# mutation, backtest excluded upstream by get_top_for_briefing's
+# _LIVE_ONLY_CLAUSE, returns a NEW list and never mutates source_articles —
+# all four load-bearing invariants intact by construction. The wall-clock age
+# reuses _seen_age_hours verbatim (the file's own wire-age primitive — the
+# documented anti-drift discipline, same reason _collapse_syndicated reuses
+# alert_dedup._signature).
+#
+# 3.0h mirrors the alert path's documented "materially old (≳3h)" RECENCY
+# threshold (ALERT_PROMPT) so the two consumed products judge "stale" the same
+# way. Only the first _AGING_TOP_SCAN rows are considered — Opus draws the
+# LEAD / TOP SIGNALS from the very top, so flagging that row #40 is old is
+# noise, not signal (the analyst's #1 complaint). Capped like _book_heat_lines.
+BRIEFING_AGING_MIN_HOURS = 3.0
+_AGING_TOP_SCAN = 10
+_AGING_MAX_LINES = 6
+
+
+def _aging_top_rows(
+    articles: list, now: datetime | None = None,
+    min_age_h: float = BRIEFING_AGING_MIN_HOURS,
+) -> list[str]:
+    """Pure: of the highest-ranked digest rows, which are several hours old.
+
+    ``articles`` must be the post-collapse/dedup/decay/cap list Opus actually
+    reads (``deduped[:60]``) so "rank #N" matches the rendered newswire. A row
+    with no real ``link``/``url`` (the prepended PORTFOLIO/OPTIONS snapshots) is
+    skipped — identical guard to the ``[BOOK:]`` tag / ``_book_heat_lines`` (a
+    snapshot has no wire-arrival clock). Age is the deterministic
+    ``_seen_age_hours`` (reused verbatim — its 0.0 sentinel for
+    absent/unparseable/future ``first_seen`` is < ``min_age_h`` so an unknown
+    age is correctly never flagged, and snapshots are url-guarded out anyway).
+    Returns ``["#1 ~6.2h — <title>", ...]`` for the aged top rows in rank
+    order, capped at ``_AGING_MAX_LINES``. ``[]`` when every top row is fresh.
+    No DB / IO / mutation."""
+    out: list[str] = []
+    for rank, a in enumerate(articles[:_AGING_TOP_SCAN], 1):
+        if not (a.get("link") or a.get("url")):
+            continue  # snapshot/synthetic row — same guard as the [BOOK:] tag
+        age_h = _seen_age_hours(a.get("first_seen"), now=now)
+        if age_h < min_age_h:
+            continue
+        title = ((a.get("title") or "").strip()[:60]) or "(untitled)"
+        out.append(f"#{rank} ~{age_h:.1f}h — {title}")
+        if len(out) >= _AGING_MAX_LINES:
+            break
+    return out
+
+
 def _build_payload(articles, stock_data, earnings, source_health_report=None):
     parts = [f"BRIEFING TIME: {_now_utc_str()}\n"]
 
@@ -830,6 +895,25 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None):
             )
             for hl in heat_lines:
                 parts.append(f"  - {hl}")
+
+        # Deterministic wall-clock recency cross-check on the rows Opus leads
+        # with. Computed over the SAME collapsed+decayed+capped list rendered
+        # above (deduped[:60]) so "#N" matches the newswire rank. Independent
+        # of the model-estimated ts decay (a row the ts head under-scored can
+        # still be stale; a sparse window floats an aged item to #1). Pure
+        # read-side: NEW list, no mutation of source_articles, no DB /
+        # ai_score / ml_score / score_source / urgency touch, backtest already
+        # excluded upstream — four invariants intact. A framing hint, NOT a
+        # reproduced section (unlike COVERAGE GAP) — see the SYSTEM_PROMPT
+        # AGING TOP ROWS rule.
+        aging_lines = _aging_top_rows(deduped[:60])
+        if aging_lines:
+            parts.append(
+                "\n=== AGING TOP ROWS (high-ranked digest rows several hours "
+                "old — developing, NOT fresh breaks) ==="
+            )
+            for al in aging_lines:
+                parts.append(f"  - {al}")
 
     parts.append("\n=== EARNINGS CALENDAR (next 48h) ===")
     if not earnings:
