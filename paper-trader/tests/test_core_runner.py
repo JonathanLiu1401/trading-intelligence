@@ -204,6 +204,52 @@ class TestMaybeHourly:
         assert runner._last_hourly is None
 
 
+class TestDeferredRestartOverdue:
+    """The git-watcher deadman predicate. The watcher requests a graceful
+    deferred restart, then force-exits if the main loop is wedged and never
+    honors it (observed live: a 3-day-uptime runner still on stale code with
+    a committed fix never deployed). `_deferred_restart_overdue` is the pure
+    decision over monotonic clocks."""
+
+    def test_not_overdue_before_request(self):
+        # No restart requested yet → never overdue, whatever the clock says.
+        assert runner._deferred_restart_overdue(None, 1e9) is False
+
+    def test_not_overdue_within_grace(self):
+        # Requested at t=100; only 599s elapsed (< 600 grace) → wait, the
+        # main loop may still honor it gracefully.
+        assert runner._deferred_restart_overdue(100.0, 100.0 + 599.0,
+                                                grace_s=600.0) is False
+
+    def test_overdue_at_exactly_grace(self):
+        # Boundary is inclusive: exactly grace_s elapsed → force-exit (the
+        # loop has had its full healthy-cycle budget and then some).
+        assert runner._deferred_restart_overdue(100.0, 100.0 + 600.0,
+                                                grace_s=600.0) is True
+
+    def test_overdue_well_past_grace(self):
+        assert runner._deferred_restart_overdue(100.0, 100.0 + 5000.0,
+                                                grace_s=600.0) is True
+
+    def test_default_grace_is_module_constant(self):
+        # Just under the real default → not overdue; at it → overdue. Guards
+        # against the constant being silently dropped/renamed.
+        g = runner.RESTART_GRACE_S
+        assert runner._deferred_restart_overdue(0.0, g - 0.01) is False
+        assert runner._deferred_restart_overdue(0.0, g) is True
+
+    def test_grace_exceeds_worst_case_healthy_cycle(self):
+        """The grace must be safely above the longest *healthy* cycle so a
+        slow-but-live loop is never force-killed. Worst case ≈ the strategy
+        claude budgets (180 + 45 + 60) + the 180s watcher poll cadence."""
+        from paper_trader import strategy
+        worst_healthy = (strategy.DECISION_TIMEOUT_S
+                         + strategy.RETRY_TIMEOUT_S
+                         + strategy.FALLBACK_TIMEOUT_S
+                         + 180)
+        assert runner.RESTART_GRACE_S > worst_healthy
+
+
 class TestKillStaleClaude:
     """The auto-recovery circuit breaker reaps wedged `claude` subprocesses.
 
