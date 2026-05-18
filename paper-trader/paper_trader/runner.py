@@ -22,6 +22,21 @@ OPEN_INTERVAL_S = 1800      # decide every 30 min when market is open
 CLOSED_INTERVAL_S = 3600    # every 1 hour when closed
 DAILY_CLOSE_HOUR_NY = 16    # report after 16:00 NY
 
+# Git-watcher deadman: once a deferred restart is requested, the MAIN LOOP is
+# the graceful actor (it exits at the next cycle boundary so a mid-Opus call
+# is never killed). But under heavy host load (observed live: load avg ~23,
+# a 3-day-uptime runner still on stale code with a committed fix never
+# deployed) the loop can be wedged so long the boundary never arrives — the
+# fix sits unapplied for days. A *healthy* cycle is hard-bounded by the
+# strategy claude budgets (DECISION_TIMEOUT_S 180 + RETRY 45 + FALLBACK 60
+# ≈ 5 min) plus the 180s poll cadence; if the deferred restart is still
+# unhonored this long after it was requested the loop is genuinely wedged,
+# not healthily mid-decision, so the watcher force-exits as a last resort
+# (systemd Restart=always reboots onto fresh code). 600s leaves comfortable
+# margin above the worst-case healthy cycle so a slow-but-live loop is never
+# force-killed.
+RESTART_GRACE_S = 600
+
 # Auto-recovery circuit breaker: after this many consecutive cycles that
 # produced no decision (Opus + Sonnet fallback both timed out / unparseable),
 # kill any lingering claude subprocess so a wedged CLI can't keep starving the
@@ -395,16 +410,38 @@ def _maybe_daily_close():
 # runs this unit with Restart=always. Without a self-check, a running runner
 # keeps executing the OLD code until something else bounces it — a committed
 # fix can sit unapplied for hours. This watcher records git HEAD at boot and
-# re-checks every 3 min; on a HEAD change it logs, pings Discord, sets
-# `_restart_requested`, and returns — the MAIN LOOP performs the actual
-# os._exit(0) at the next cycle boundary so a restart never kills a mid-Opus
-# decision call. systemd (Restart=always) brings us back on the new code.
-# REPO_ROOT is the paper-trader dir (a child of the trading-intelligence work
-# tree); `git rev-parse` walks up to the repo, so this resolves HEAD
-# correctly. Fail-OPEN by construction: ANY git/subprocess error just skips
-# that iteration — the watcher must never crash the trade loop, and never
-# exits the process itself (it only ever flags the deferred restart).
+# re-checks every 3 min; on a HEAD change it logs, pings Discord, and sets
+# `_restart_requested` — the MAIN LOOP performs the graceful os._exit(0) at
+# the next cycle boundary so a restart never kills a mid-Opus decision call.
+# systemd (Restart=always) brings us back on the new code. REPO_ROOT is the
+# paper-trader dir (a child of the trading-intelligence work tree);
+# `git rev-parse` walks up to the repo, so this resolves HEAD correctly.
+# Fail-OPEN by construction: ANY git/subprocess error just skips that
+# iteration — the watcher must never crash the trade loop.
+#
+# DEADMAN SAFETY-NET: the watcher no longer `return`s after requesting the
+# restart. It keeps polling and, if the graceful exit is still unhonored
+# `RESTART_GRACE_S` after it was requested (the main loop is wedged — see the
+# RESTART_GRACE_S note), it force-exits the process itself. This is the
+# observed-live failure this closes: a deferred restart that the main loop
+# never reaches leaves a committed fix undeployed indefinitely. The grace
+# window preserves the "never kill a healthy mid-Opus call" intent — only a
+# loop wedged well past any legitimate cycle is force-killed.
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _deferred_restart_overdue(requested_monotonic: float | None,
+                              now_monotonic: float,
+                              grace_s: float = RESTART_GRACE_S) -> bool:
+    """True when a deferred restart was requested and the main loop has NOT
+    honored it within ``grace_s`` seconds (so the watcher must force-exit).
+
+    Pure predicate over monotonic clocks (immune to the wall-clock step-back
+    the Phase-1 sidecar fix hardens against). ``requested_monotonic`` is None
+    until a restart has been requested → never overdue."""
+    if requested_monotonic is None:
+        return False
+    return (now_monotonic - requested_monotonic) >= grace_s
 
 
 def _git_watcher():
@@ -445,7 +482,35 @@ def _git_watcher():
             except Exception as e:
                 print(f"[runner] git-watcher Discord notice failed: {e}")
             _restart_requested.set()
-            return  # watcher job is done; main loop handles the actual exit
+            # Deadman: the main loop is the graceful actor, but if it is
+            # wedged it may never reach the boundary. Keep watching; if the
+            # restart is still unhonored RESTART_GRACE_S later, the loop is
+            # genuinely stuck — force the exit ourselves so the committed fix
+            # actually deploys (systemd Restart=always reboots on new code).
+            requested_at = time.monotonic()
+            while True:
+                time.sleep(180)
+                if _deferred_restart_overdue(requested_at, time.monotonic()):
+                    print(
+                        f"[runner] WARNING: deferred restart still unhonored "
+                        f">{int(RESTART_GRACE_S)}s after request — main loop "
+                        f"appears wedged; force-exiting from the git-watcher "
+                        f"so the committed fix deploys"
+                    )
+                    try:
+                        reporter._send(
+                            "paper-trader FORCE restart: deferred restart was "
+                            f"not honored within {int(RESTART_GRACE_S)}s "
+                            f"(main loop wedged under load); restarting now to "
+                            f"apply new commits (old={old_head[:7]}, "
+                            f"new={new_head[:7]})"
+                        )
+                    except Exception as e:
+                        print(f"[runner] git-watcher force-exit notice "
+                              f"failed: {e}")
+                    os._exit(0)
+                # else: main loop honored it (process already gone) or the
+                # grace window has not elapsed yet — keep waiting.
         time.sleep(180)
 
 
