@@ -705,6 +705,138 @@ class TestStaleMarkFlag:
         lite_line = next(ln for ln in lines if ln.strip().startswith("LITE"))
         assert "STALE MARK" in mu_line
         assert "STALE MARK" not in lite_line
+        # Regression guard for the hold-age feature: these handcrafted
+        # snapshots carry NO opened_at, so NO held= token must be rendered
+        # (degrade-safe — byte-identical to pre-feature for this shape).
+        assert "held=" not in mu_line
+        assert "held=" not in lite_line
+
+
+class TestHoldAgeStr:
+    """`_hold_age_str` — the pure hold-age primitive surfaced into the Opus
+    prompt so the decision engine can self-check the disposition effect."""
+
+    from datetime import datetime, timedelta, timezone
+    _NOW = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_minutes_bucket(self):
+        opened = (self._NOW - self.timedelta(minutes=42)).isoformat()
+        assert strategy._hold_age_str(opened, now=self._NOW) == "42m"
+
+    def test_sub_minute_is_zero_m(self):
+        opened = (self._NOW - self.timedelta(seconds=30)).isoformat()
+        assert strategy._hold_age_str(opened, now=self._NOW) == "0m"
+
+    def test_hours_bucket_floors(self):
+        # 5h 59m must read "5h" (floor), not round up to 6h.
+        opened = (self._NOW - self.timedelta(hours=5, minutes=59)).isoformat()
+        assert strategy._hold_age_str(opened, now=self._NOW) == "5h"
+
+    def test_days_bucket_floors(self):
+        # 3d 23h must read "3d" — matches dashboard._position_ages_from_trades
+        # / /api/risk day flooring so the two surfaces never disagree.
+        opened = (self._NOW - self.timedelta(days=3, hours=23)).isoformat()
+        assert strategy._hold_age_str(opened, now=self._NOW) == "3d"
+
+    def test_exactly_one_hour_is_1h(self):
+        opened = (self._NOW - self.timedelta(hours=1)).isoformat()
+        assert strategy._hold_age_str(opened, now=self._NOW) == "1h"
+
+    def test_exactly_one_day_is_1d(self):
+        opened = (self._NOW - self.timedelta(days=1)).isoformat()
+        assert strategy._hold_age_str(opened, now=self._NOW) == "1d"
+
+    def test_missing_returns_empty(self):
+        assert strategy._hold_age_str(None, now=self._NOW) == ""
+        assert strategy._hold_age_str("", now=self._NOW) == ""
+
+    def test_unparseable_returns_empty(self):
+        assert strategy._hold_age_str("not-a-date", now=self._NOW) == ""
+
+    def test_future_clamps_to_zero(self):
+        # Wall clock stepped back (documented skew hazard) — never render a
+        # negative age; clamp to "0m".
+        opened = (self._NOW + self.timedelta(hours=5)).isoformat()
+        assert strategy._hold_age_str(opened, now=self._NOW) == "0m"
+
+    def test_naive_timestamp_treated_as_utc(self):
+        # store writes tz-aware ISO, but a naive value must not crash the
+        # subtraction (offset-naive vs offset-aware TypeError); treat as UTC.
+        naive = (self._NOW - self.timedelta(days=2)).replace(tzinfo=None).isoformat()
+        assert strategy._hold_age_str(naive, now=self._NOW) == "2d"
+
+
+class TestHoldAgeInPrompt:
+    """`_build_payload` must surface `held=<age>` per position when opened_at
+    is present, and stay byte-identical when it is absent."""
+
+    from datetime import datetime, timedelta, timezone
+
+    def _snap(self, positions):
+        return {"cash": 100.0, "open_value": 0.0, "total_value": 100.0,
+                "positions": positions}
+
+    def test_stock_line_shows_hold_age(self):
+        opened = (self.datetime.now(self.timezone.utc)
+                  - self.timedelta(days=3, hours=2)).isoformat()
+        snap = self._snap([
+            {"ticker": "LITE", "type": "stock", "qty": 0.61,
+             "avg_cost": 980.90, "current_price": 970.71,
+             "unrealized_pl": -6.21, "pl_pct": -1.04,
+             "market_value": 592.13, "stale_mark": False,
+             "opened_at": opened},
+        ])
+        body = strategy._build_payload(snap, [], [], {}, {}, None, False,
+                                       quant_signals={})
+        line = next(ln for ln in body.splitlines()
+                    if ln.strip().startswith("LITE"))
+        assert "held=3d" in line
+
+    def test_option_line_shows_hold_age(self):
+        opened = (self.datetime.now(self.timezone.utc)
+                  - self.timedelta(hours=4)).isoformat()
+        snap = self._snap([
+            {"ticker": "NVDA", "type": "call", "qty": 1, "strike": 600.0,
+             "expiry": "2026-12-19", "avg_cost": 5.0, "current_price": 6.0,
+             "unrealized_pl": 100.0, "pl_pct": 20.0, "market_value": 600.0,
+             "stale_mark": False, "opened_at": opened},
+        ])
+        body = strategy._build_payload(snap, [], [], {}, {}, None, False,
+                                       quant_signals={})
+        line = next(ln for ln in body.splitlines()
+                    if ln.strip().startswith("NVDA"))
+        assert "held=4h" in line
+
+    def test_no_opened_at_renders_no_token(self):
+        snap = self._snap([
+            {"ticker": "MU", "type": "stock", "qty": 0.5, "avg_cost": 724.12,
+             "current_price": 724.12, "unrealized_pl": 0.0, "pl_pct": 0.0,
+             "market_value": 362.06, "stale_mark": False},
+        ])
+        body = strategy._build_payload(snap, [], [], {}, {}, None, False,
+                                       quant_signals={})
+        line = next(ln for ln in body.splitlines()
+                    if ln.strip().startswith("MU"))
+        assert "held=" not in line
+
+    def test_hold_age_does_not_displace_stale_marker(self):
+        # held= sits before the STALE MARK suffix; both must coexist so the
+        # disposition signal never masks the unreliable-P/L warning.
+        opened = (self.datetime.now(self.timezone.utc)
+                  - self.timedelta(days=1)).isoformat()
+        snap = self._snap([
+            {"ticker": "MU", "type": "stock", "qty": 0.5, "avg_cost": 724.12,
+             "current_price": 724.12, "unrealized_pl": 0.0, "pl_pct": 0.0,
+             "market_value": 362.06, "stale_mark": True,
+             "opened_at": opened},
+        ])
+        body = strategy._build_payload(snap, [], [], {}, {}, None, False,
+                                       quant_signals={})
+        line = next(ln for ln in body.splitlines()
+                    if ln.strip().startswith("MU"))
+        assert "held=1d" in line
+        assert "STALE MARK" in line
+        assert line.index("held=1d") < line.index("STALE MARK")
 
 
 class TestWatchlistHygiene:
