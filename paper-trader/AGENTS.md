@@ -5792,3 +5792,143 @@ features_added = 1 · user_findings = 5.**
   (not counted as the feature).
 
 *Review pass #24 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+### 2026-05-18 review pass #22 (ML+backtest hybrid · bootstrap gate-arm stability · live findings)
+
+- **Phase 1 — no new bug (bugs_fixed = 0; no Phase-1 commit, the commit
+  guard explicitly permits it).** Re-traced the core trio
+  (`decision_scorer.py`, `backtest.py`, `run_continuous_backtests.py`) end
+  to end: `train_scorer` dedup-key-includes-action + split-before-scale +
+  weight-oversample; `_ml_decide` scorer-gate arms + off-dist abstention +
+  the `score=`/`scorer=`/`news_urg=`/`news_count=` first-match regex
+  disambiguation; `_compute_decision_outcomes` 5d-window guards + gate
+  capture; `_enforce_risk_exits` SL-before-TP; `_train_decision_scorer`'s
+  three independently-guarded OOS blocks; `predict_with_meta` clamp /
+  off-distribution honesty path. The required Phase-1 test scenarios
+  already have comprehensive exact-value coverage
+  (`tests/test_backtest.py::TestBuyAndHold::test_buy_and_hold_exact_return`,
+  `TestRiskExits` stop-loss/TP at exact close + cash, `TestSimPortfolio`
+  position-cap; `tests/test_decision_scorer.py`
+  `test_scorer_ranks_high_ml_score_above_low`, `test_handles_null_/
+  non_finite_forward_return`, `test_predict_safe_with_garbage_features`).
+  Consistent with the 20 prior no-new-bug ML/backtest passes (#5–#21).
+  **Sole training-dynamics observation (reported, not fixed — the
+  prior-pass precedent for in-scope-but-not-surgical):** `train_scorer`
+  oversamples by weight (`np.repeat`) *before* `MLPRegressor`'s internal
+  `early_stopping` split, so a duplicated row can land in BOTH the
+  internal train and validation folds → optimistic `val_rmse` in the
+  regularized (`early_stopping=True`) config. Inert today (deployed net
+  has `early_stopping=False`); a real fix is a training-pipeline change
+  out of surgical scope (CLAUDE.md §6).
+
+- **Feature shipped (Phase 2, `feat(ml):`):
+  `paper_trader/ml/gate_stability.py` — bootstrap-retrain stability of the
+  conviction-gate ARM decision.** Closes the one question the saturated
+  diagnostic suite structurally could not answer. Every sibling
+  (`calibration`/`gate_audit`/`gate_pnl`/`gate_realized`/`skill_trend`/
+  `baseline_compare`/`regime_audit`/`feature_importance`/`horizon_audit`)
+  is a *point-estimate* tool on **one** model; `overfit_gap` trends the
+  val/oos RMSE *ratio*; `deploy_audit` compares hyper-params. None can see
+  the AGENTS.md-documented smoking gun — *"−89% then +32% for the same
+  LITE vector across two retrain cycles"*, i.e. prediction instability
+  *across* retrains. This bootstrap-resamples the temporal-train slice,
+  fits K throwaway scorers with the **exact** `decision_scorer.MLP_CONFIG`
+  + `build_features` pipeline `train_scorer` uses (SSOT imports; dedup +
+  weight-oversample mirror `train_scorer` line-for-line the way
+  `gate_pnl._reconstruct_base_conviction` mirrors `_ml_decide`), predicts
+  the fixed OOS slice with each, and reports — at the five real gate arms
+  (`gate_audit.gate_arm`, imported SSOT) — `gate_arm_flip_rate`,
+  cross-bootstrap pred σ, modal-arm agreement. Verdicts
+  `GATE_ARM_STABLE` / `GATE_ARM_BORDERLINE` / `GATE_ARM_UNSTABLE` /
+  `INSUFFICIENT_DATA`; pure/total, never raises; seeded ⇒ reproducible;
+  CLI exits 2 on UNSTABLE. **Safety-critical & test-locked: it never
+  calls `train_scorer`, so it never writes the deployed
+  `decision_scorer.pkl` the live gate consumes.** 13 exact-value offline
+  locks in `tests/test_gate_stability.py` (strong-signal→STABLE,
+  noisy-signal→UNSTABLE, consistent-offdist→STABLE [the non-obvious
+  correctness lock: off-distribution *magnitude* alone is NOT
+  instability], determinism, never-raises-on-garbage, SSOT identity, the
+  no-pickle-write invariant, CLI exit-code/`--all` contract). Commit
+  `69a6c94`.
+  ```bash
+  python3 -m pytest tests/test_gate_stability.py -q          # 13 green
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.gate_stability
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.gate_stability --all --bootstraps 16
+  ```
+
+- **Quant findings (Phase 3, live — 8 distinct, reported / out of
+  surgical scope).** (1) **DECISIVE & NEW — the gate's economic spread is
+  ~97% resample-luck.** `gate_stability` on the live
+  `decision_outcomes.jsonl` (n_train=5460, n_eval=1507, K=10):
+  `GATE_ARM_UNSTABLE`, **`gate_arm_flip_rate=0.9675`**, mean
+  cross-bootstrap pred σ **5.5pp** (median 3.7), modal_agreement 0.586.
+  This *reconciles the standing paradox* the AGENTS.md notes circle:
+  `gate_audit --oos` reads **`GATE_EFFECTIVE`** on the deployed pickle
+  (strong_tailwind +2.43% vs strong_headwind −0.85%, **spread +3.28pp**,
+  arm_monotone 0.75) — looking economically justified — yet
+  `skill_trend`/`baseline_compare` say ≈0 OOS skill. Resolution: that
+  +3.28pp arm spread is **not a stable property of the features** —
+  retrain on a different bootstrap of the *same* outcomes and 96.7% of
+  decisions get a different conviction multiplier. The gate sizes capital
+  on one pickle's training lottery; `gate_audit`'s single-model view
+  structurally cannot see it. (2) **DECISIVE & NEW — `gate_pnl`'s
+  documented "the floor effectively never binds" is empirically false: it
+  binds on ~34% of BUY-intent.** Direct `backtest.db` count over recent
+  runs 6208–6237: 20,613 `action='HOLD'` rows whose reasoning is
+  `"ML score=… but notional too small"` vs 39,773 filled BUYs ⇒
+  **floor-bind = 34.1% of BUY-intent** (samples are low-`ml_score`≈1.5
+  signals silenced once the portfolio is fully invested / cash≈0). So
+  *every* gate diagnostic (`gate_audit`/`gate_pnl`/`gate_realized`) and
+  `decision_outcomes.jsonl` itself carries a **~34% selection bias** —
+  they only ever see BUY-intent that survived the floor. `gate_pnl.py`'s
+  Scope docstring ("base conviction ≥ ~5% so the floor effectively never
+  binds") should be corrected to "binds on ≈⅓ of BUY-intent
+  (cash-saturation, not the ×0.6 arm)". Reported not patched: a docstring
+  edit to a sibling-owned module mid-flight on a 3+-agent shared tree is
+  exactly the cross-agent contention the concurrency discipline warns
+  against (prior passes likewise reported `gate_pnl`/`calibration`
+  caveats rather than editing siblings); a DB-scanning tool to surface it
+  durably is infeasible here (a 3-run scan of the USB-mounted
+  `backtest.db` times out >45s). (3) **Deployed scorer still STALE** —
+  `deploy_audit=DEPLOYED_STALE_CONFIG`, 6/8 drifted (`(64,32,16)≠(32,16)`,
+  `alpha=1e-4≠1e-2`, `early_stopping=False≠True`, …); running loop
+  predates the retune (continuity #15–#21). (4) **`baseline_compare`
+  DEGRADED to `MLP_NO_BETTER_THAN_TRIVIAL`** — MLP OOS rank_ic **+0.060 <
+  best one-liner `mom20` +0.082** (gap −0.023, dir_acc 0.508, n=1507).
+  Pass #21 had MLP **+0.115 > mom20 +0.072** (explicitly NOT
+  worse-than-trivial); the stale net's modest OOS rank edge has **eroded
+  below a single momentum feature** as outcomes accumulated — a fresh
+  degradation, same root cause as (1)/(3). (5) **Scorer OOS skill
+  borderline-negative while gating 100% of cycles** —
+  `scorer_skill_log.jsonl` (19 cycles): recent oos_rmse 10.2–16.7
+  straddling the σ≈11.7 mean-predictor baseline, oos_dir_acc 0.47–0.56
+  (coin-flip), oos_ic ≈ 0, `gate_active=true` every cycle. (6)
+  **winner→ArticleNet loop still non-functional** — continuous.log:
+  `inject err: database locked after 4 attempts` and `trainer timeout
+  (injected 5276)`; CLAUDE.md §5 step 5 dead (continuity #21·6). (7)
+  **Gate-decision capture still 0/7538 + 10d/20d absent** —
+  `gate_scorer_pred` populated in 0 of 7538 rows, `forward_return_10d/20d`
+  keys absent: running loop predates `60b20d9`/multi-horizon capture, so
+  `gate_realized`/`horizon_audit` stay unmeasurable until restart.
+  `decision_outcomes.jsonl` clean (7538 rows, **0 non-finite**, p1=−19.1 /
+  med=0.5 / p99=26.7 / sd=7.95). (8) **Backtest health good; dispersion is
+  leverage-beta** — 500 runs / 476 complete / 24 failed / **0 running**
+  (orphan-reap + empty-SPY guards healthy); run 6234 vs_spy **+165%**
+  beside 6236 vs_spy **−52%** on adjacent runs = 3×-ETF beta draw, not
+  repeatable alpha. **Decisive operator action (unchanged across 8
+  passes, now with a new instrument that *quantifies why it matters*):
+  restart `run_continuous_backtests.py`** — the regularized net deploys,
+  gate/horizon capture becomes measurable, and a post-restart
+  `gate_stability` re-run measures whether the regularized (`alpha=1e-2`,
+  `early_stopping`) net actually shrinks the 0.97 flip rate the
+  memorizing net produces.
+
+- **Concurrency note.** 3+ sibling agents on the shared monorepo tree
+  (core-hybrid passes #22–#24 + AGENTS.md touches appeared between my
+  read and write — re-read the bottom and used a race-immune append);
+  never `git add -A`; exactly two path-scoped files staged for the
+  feature (`paper_trader/ml/gate_stability.py`,
+  `tests/test_gate_stability.py`); no domain file modified (Phase-1
+  zero-diff); AGENTS.md append-only & committed separately.
+
+*Review pass #22 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
