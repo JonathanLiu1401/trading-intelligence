@@ -668,6 +668,107 @@ def _sector_pulse_chat_lines(pulse: Any) -> list:
     return lines
 
 
+_PORTFOLIO_SIGNALS_MAX_HEADLINES = 5
+
+
+def build_portfolio_signals(articles: list, now: datetime | None = None) -> dict:
+    """Deterministic, always-fresh per-held-ticker live-news digest.
+
+    The 5h Opus heartbeat briefing (``/api/briefings``) is the synthesised
+    "what matters" view but is up to 5h stale AND skipped entirely whenever the
+    Claude org usage limit is exhausted — a chronic, repeatedly-documented
+    failure mode (paper-trader CLAUDE.md §11). ``/api/articles`` is the raw
+    unbucketed feed; ``/api/sector-pulse`` is sector-level density;
+    ``/api/trends`` is aggregate sentiment over time. None answers the held-book
+    trader's between-briefings question: *"what fresh news touches MY exact
+    positions right now, ranked, with the one headline to read first?"* — and
+    none answers it WITHOUT a Claude call, so they are all dark on quota
+    exactly when the trader most needs a read.
+
+    This composes the briefing SSOT helpers verbatim
+    (``_filter_quote_widget_noise`` + ``_book_tickers`` +
+    ``_rank_by_decayed_score`` from ``analysis.claude_analyst``) so the held
+    universe and the recency decay can NEVER drift from what the 5h Opus
+    digest itself uses. Pure: no LLM, no subprocess, no network — feed it the
+    DB rows; ``now`` is injectable for deterministic tests.
+
+    The held universe is ``claude_analyst._BOOK_TICKERS`` (daemon-parity,
+    parity-pinned by ``tests/test_briefing_book_tag.py``), **not** a live
+    ``config/portfolio.json`` read — a name added via
+    ``PUT /api/portfolio/config`` will not appear here until ``_BOOK_TICKERS``
+    updates. That SSOT-with-the-briefing tradeoff is deliberate: this panel and
+    the Opus digest must always agree on what "the book" is.
+
+    Every held ticker is returned (even with zero fresh articles — a pinned
+    book explicitly wants to see "no news on LITE in 24h"), sorted by top
+    recency-decayed score desc, canonical ``_BOOK_TICKERS`` order breaking ties.
+    """
+    from analysis.claude_analyst import (
+        _BOOK_TICKERS,
+        _book_tickers,
+        _effective_score,
+        _filter_quote_widget_noise,
+        _rank_by_decayed_score,
+    )
+
+    now = now or datetime.now(timezone.utc)
+    kept, suppressed = _filter_quote_widget_noise(list(articles or []))
+
+    buckets: dict[str, list] = {tk: [] for tk in _BOOK_TICKERS}
+    for a in kept:
+        for tk in _book_tickers(a):
+            if tk in buckets:
+                buckets[tk].append(a)
+
+    out_tickers: list[dict] = []
+    for tk in _BOOK_TICKERS:
+        arts = _rank_by_decayed_score(buckets[tk], now=now)
+        if arts:
+            top = arts[0]
+            out_tickers.append({
+                "ticker": tk,
+                "n_articles": len(arts),
+                "top_score": round(
+                    max(_effective_score(x, now=now) for x in arts), 4),
+                "max_urgency": max(int(x.get("urgency") or 0) for x in arts),
+                "top_headline": top.get("title"),
+                "top_source": top.get("source"),
+                "top_first_seen": top.get("first_seen"),
+                "headlines": [
+                    {
+                        "title": x.get("title"),
+                        "source": x.get("source"),
+                        "ai_score": float(x.get("ai_score") or 0.0),
+                        "urgency": int(x.get("urgency") or 0),
+                        "first_seen": x.get("first_seen"),
+                    }
+                    for x in arts[:_PORTFOLIO_SIGNALS_MAX_HEADLINES]
+                ],
+            })
+        else:
+            out_tickers.append({
+                "ticker": tk,
+                "n_articles": 0,
+                "top_score": 0.0,
+                "max_urgency": 0,
+                "top_headline": None,
+                "top_source": None,
+                "top_first_seen": None,
+                "headlines": [],
+            })
+
+    book_index = {tk: i for i, tk in enumerate(_BOOK_TICKERS)}
+    out_tickers.sort(key=lambda r: (-r["top_score"], book_index[r["ticker"]]))
+
+    return {
+        "as_of": now.isoformat(),
+        "n_articles_scanned": len(kept),
+        "n_quote_widget_suppressed": len(suppressed),
+        "n_tickers_with_news": sum(1 for r in out_tickers if r["n_articles"]),
+        "tickers": out_tickers,
+    }
+
+
 def create_app(store=None) -> Flask:
     """Build the Flask app. ``store`` is the shared ArticleStore from daemon.py."""
     global _store
@@ -906,6 +1007,49 @@ def create_app(store=None) -> Flask:
             for r in rows
         ]
         return jsonify(_aggregate_sector_pulse(arts, window_hours=hours))
+
+    @app.get("/api/portfolio-signals")
+    def api_portfolio_signals():
+        """Deterministic, always-fresh per-held-ticker live-news digest —
+        the between-briefings read that survives Claude-quota exhaustion.
+
+        The 5h Opus briefing is stale up to 5h and is skipped entirely when
+        the org usage limit is hit; ``/api/articles`` is raw/unbucketed;
+        ``/api/sector-pulse`` is sector-level. This buckets fresh live
+        articles onto the exact held book (``_BOOK_TICKERS`` daemon-parity),
+        recency-decay-ranks them with the briefing's own SSOT curve, and
+        surfaces the one headline to read first per position — with NO LLM
+        call. ``?hours=`` clamped 1..168 (default 24).
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            hours = int(request.args.get("hours", 24))
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(168, hours))
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT title, ai_score, urgency, first_seen, "
+                "time_sensitivity, source FROM articles "
+                f"WHERE first_seen >= ? AND {_LIVE_ONLY_SQL} "
+                "ORDER BY first_seen DESC LIMIT 4000",
+                (since,),
+            )
+        except sqlite3.Error:
+            rows = []
+        arts = [
+            {"title": r[0] or "", "ai_score": float(r[1] or 0),
+             "urgency": int(r[2] or 0), "first_seen": r[3],
+             "time_sensitivity": r[4], "source": r[5] or ""}
+            for r in rows
+        ]
+        out = build_portfolio_signals(arts)
+        out["window_hours"] = hours
+        return jsonify(out)
 
     @app.get("/api/collector-health")
     def api_collector_health():
