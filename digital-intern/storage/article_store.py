@@ -25,7 +25,7 @@ except Exception:
 
 
 # ── DB lock / cursor-collision retry helper ─────────────────────────────────
-# Two distinct transient DB errors are retried here; both are recoverable and
+# Three distinct transient DB errors are retried here; all are recoverable and
 # every method this decorates is idempotent — the writers
 # (``UPDATE … WHERE id=?``, ``INSERT OR IGNORE``, ``DELETE … WHERE``) AND the
 # pure-SELECT readers (``get_unscored``, ``get_unalerted_urgent``,
@@ -55,6 +55,20 @@ except Exception:
 #     ``store.conn.execute`` in train_continuous; it is exception-swallowed
 #     and retried next cycle. A future full fix is per-call connection
 #     isolation, mirroring dashboard ``_ro_query``.)
+#  3. ``DatabaseError("no more rows available")`` — the SAME shared-connection
+#     cursor-collision class as (2): a writer's ``executemany`` resets the
+#     connection's statement state while a lockless reader (``get_unscored``,
+#     ``recursive_labeler``'s scan) is mid-iteration, and the corrupted
+#     cursor surfaces this variant instead of "another row …". Live evidence
+#     (2026-05-18 daemon.log): ``[scorer_worker] error: no more rows
+#     available`` recurred ~hourly (06:05, 08:43) plus ``[recursive_labeler]``
+#     08:01 — each leaked to the worker's broad ``except`` (the substring was
+#     absent from this tuple) and dropped that cycle's scored batch, so
+#     urgent items went un-scored → delayed BREAKING alerts: exactly the (2)
+#     failure mode, on the scoring path. Same idempotent-retry remedy. It is
+#     never a legitimate end-of-results signal inside these methods —
+#     ``fetchall()`` returns ``[]`` on an empty result, so this string only
+#     ever means the cursor-state corruption above.
 #
 # Retry with exponential backoff + jitter to avoid thundering-herd retries
 # that would just collide again at the same instant. Bubble up after the
@@ -65,6 +79,7 @@ _RETRYABLE_DB_ERRORS = (
     "database is locked",
     "another row available",
     "another row pending",
+    "no more rows available",
 )
 _LOCK_RETRY_ATTEMPTS = 5
 _LOCK_RETRY_BASE_S = 0.25
