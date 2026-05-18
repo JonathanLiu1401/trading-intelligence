@@ -1964,3 +1964,113 @@ immediately before editing: the file races.
   `paper-trader/*`, `logs/*.tmp`. Both commits pathspec-scoped to exactly
   their intended .py + test files; never `git add -A`. A concurrent sibling
   hybrid agent edited this repo throughout (worktree churn expected).
+
+---
+
+### Agent pass 2026-05-18 (hybrid 14 — debug + feature + analyst validation)
+
+Read pass over the nine task-critical files + `ml/inference.py`,
+`watchers/alert_dedup.py`, `watchers/alert_recency.py`, `tests/conftest.py`.
+The four load-bearing invariants re-traced and hold; live validation (Phase 3)
+was again the discovery engine — it surfaced the Phase-1 bug.
+
+**Phase 1 — bugs_fixed=1, commit `bec95ea`** (`storage/article_store.py` +
+new `tests/test_retry_on_lock_no_more_rows.py`). `_retry_on_lock`'s
+`_RETRYABLE_DB_ERRORS` tuple covered `database is locked` / `another row
+available` / `another row pending` but NOT `no more rows available` — the
+**same** shared-`self.conn` cursor-state corruption (a writer `executemany`
+resets the connection statement while a lockless reader is mid-fetch), just a
+different surfaced string. A colliding `get_unscored` raised it, the decorator
+declined to retry (substring absent), it bubbled to the worker's broad
+`except` and that cycle's scored batch was **silently dropped → urgent items
+un-scored → delayed BREAKING alerts** (exactly the documented (2) failure
+mode, on the scoring path). **Live evidence (this session's daemon.log):**
+`[scorer_worker] error: no more rows available` recurred ~hourly (06:05,
+08:43) + `[recursive_labeler]` 08:01. A prior pass (#1690) diagnosed this
+exact bug but could not fix it — `article_store.py` carried sibling WIP then;
+it is **clean on HEAD now** (last touched `5265d8e`). Fix: add the substring
+(idempotent retry; never a legitimate end-of-results signal inside these
+methods — `fetchall()` returns `[]` on empty) + the documenting comment item
+(3). New regression file (`test_article_store.py` left untouched — it carries
+unrelated sibling WIP): retries→succeeds, `IntegrityError` still propagates
+unretried, exhausts exactly `_LOCK_RETRY_ATTEMPTS` then re-raises +bumps
+`lock_failures`, and a tuple-membership anti-drift guard. +4 tests.
+
+**Phase 2 — features_added=1, commit `3b09f87`** (`analysis/claude_analyst.py`
++ new `tests/test_briefing_seen_timestamp.py`). `SYSTEM_PROMPT`'s TOP SIGNALS
+line asks Opus for `[HH:MM] [score] [TICKER] headline` per signal, but
+`_build_payload` fed **zero** per-article time data — so Opus fabricated or
+omitted every timestamp on the analyst's primary 5h digest (same "prompt asks
+for X, payload omits X" class `0792a57` closed on the *alert* path). New
+`_seen_utc_str` surfaces the real `first_seen` clock — already returned by
+`get_top_for_briefing` (**no storage-layer change**), RFC822+ISO/`Z`/offset →
+UTC `HH:MM`, naive→UTC (the `alert_agent._article_age_hours` convention);
+`None` for absent/unparseable so the synthetic PORTFOLIO/OPTIONS snapshot rows
+the daemon prepends pass through with **no fabricated `00:00`**. Rendered as
+`[seen HH:MM UTC]` between score and source; survives `_collapse_syndicated`'s
+shallow copy. Read-only — no DB write, input dicts unmutated (the heartbeat
+worker feeds that same list to the briefing-label / training path), backtest
+isolation / ml_score≠ai_score / score_source untouched **by construction**
+(only the text Opus reads is reshaped). `SYSTEM_PROMPT` deliberately NOT
+modified (it already requests `[HH:MM]`). +12 specific-value tests.
+
+**Phase 3 — live findings (news-analyst lens; daemon `pid 1702195`,
+read-only `mode=ro&immutable=1` DB probes + log forensics). user_findings=7:**
+1. **DB lock-retry exhaustion still drops batches (recurring, CRITICAL).**
+   `insert_batch` `lock retry exhausted` ×11 in 24h (clusters 08:01,
+   08:21×3, 08:22, 08:29, 08:43×3) + `update_ml_scores_batch` 00:10 +
+   `web_worker`/`gdelt_worker` `database is locked` backoffs. Each
+   exhaustion silently drops a collected/scored batch → missed news. Root:
+   ~2 GB USB `articles.db` I/O saturation + ~30 threads on one shared
+   connection. Architectural fix (per-connection isolation) is NOT a
+   surgical-safe change for this pass — reported, not co-edited.
+2. **`no more rows available` scorer/recursive_labeler batch-drop — FIXED**
+   this pass (Phase 1; the Phase-3 finding folded into `bec95ea`).
+3. **6 collectors disabled** (`massive, newsapi, nitter, polygon,
+   sec_edgar, sec_edgar_ft`); `sec_edgar`/`_ft` = analyst blind to 8-K
+   filings (priority-0). Correctly surfaced verbatim by the COVERAGE GAP
+   briefing block (working as intended). Upstream/rate-limit; operational.
+4. **Worker flagged DEAD then recovered under USB contention** (health
+   line `DEAD state=ok last_ok=938s` 08:30 → recovered 08:35) — the
+   documented alive-but-blocked / supervisor-can't-respawn-a-live-thread
+   gap. Operational.
+5. **Alert path clean & CORRECT (positive).** Exactly 1 genuine `BN alert
+   sent` in 24h (`Benzinga Economics` UAE-nuclear-plant drone strike /
+   Trump Iran warning / Brent >$110, `ai=9`, portfolio-relevant via
+   semi supply chain). The lone `reddit/r/ValueInvesting` MSFT row
+   (`ml=9.76, ai=0` — model over-scored) was correctly **suppressed** by
+   `_filter_low_authority_lone` (marked `urgency=2`, NOT pushed — only 1
+   Discord send in the log). No quote-widget / duplicate / cross-cycle
+   noise. The noise-suppression stack is behaving exactly as designed.
+6. **Briefing quality EXCELLENT (positive).** Latest (07:13Z, header
+   07:04 UTC, 2315 chars, 50 articles) read end-to-end: accurate dense
+   Bloomberg digest — bond-rout LEAD (10Y +13bp → 4.59% on oil-fed
+   inflation, Nasdaq −1.54% semis-led two days before NVDA earnings),
+   precise MACRO/PORTFOLIO-P&L/TOP-SIGNALS, RISK tied to NVDA 05-20 print
+   + MU DRAM C59 05-22 expiry, decisive DESK NOTE, COVERAGE GAP block
+   present. Cadence 07:26→13:44→20:31→01:54→07:13 ≈ 5.3–6.8h vs the 5h
+   target (acceptable; the heartbeat-clock fix is holding — no 30h+ gaps).
+7. **Collection healthy when not lock-blocked (positive).** ~347 live
+   articles/h; `rss +67/+77/+26`, `web` (731/1544 collected), `reddit`,
+   `gdelt` all ingesting; live `mode=ro` probe with the `_LIVE_ONLY`
+   filter confirms backtest isolation holds on the read path.
+
+Final verify: `storage`/`ml.features`/`ml.model` imports OK; suite **544
+passed** (529 baseline + 12 Phase-2 + 4 Phase-1 − net), the 5
+`test_rss_collector.py` failures are the pre-existing sibling
+`collectors/rss_collector.py` 4-tuple WIP (excluded, not ours), zero
+regressions introduced.
+
+*Pre-existing, deliberately never staged* (consistent with every prior
+entry): `collectors/rss_collector.py`, `daemon.py`, `dashboard/server.py`,
+`scripts/export_training_data.py`, `tests/test_article_store.py`, untracked
+`collectors/fred_collector.py` / `scripts/stale_source_alerter.py` /
+`storage/story_corroboration.py` / `tests/test_alert_history.py` /
+`tests/test_export_training_data.py` / `tests/test_story_corroboration.py`,
+all `paper-trader/*`, `logs/*.tmp` deletions. The three commits were
+pathspec-scoped to exactly their intended `.py` + test files
+(`analysis/claude_analyst.py`+`tests/test_briefing_seen_timestamp.py`;
+`storage/article_store.py`+`tests/test_retry_on_lock_no_more_rows.py`; this
+`AGENTS.md`); `git diff --staged` verified each; never `git add -A`. A
+concurrent sibling hybrid agent edited this repo throughout (worktree churn
+expected; this entry was appended, not rewritten).
