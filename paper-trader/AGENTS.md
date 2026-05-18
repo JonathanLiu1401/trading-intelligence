@@ -1200,6 +1200,66 @@ modulates identically; reasoning surfaces the skip; independent of the
   > memorized net (`gate_active=1.0` every cycle). **Reported observation,
   > not a model change** (CLAUDE.md §6 scope).
 
+### Feature-coverage audit (2026-05-18)
+
+- **`paper_trader/ml/feature_coverage.py` (new read-only diagnostic).** Every
+  existing skill arbiter (`calibration` / `skill_trend` / `baseline_compare` /
+  `feature_importance` / `regime_audit`) measures whether the *model* extracts
+  skill from its inputs; **none ask whether the inputs carry any variation in
+  the training data at all**. This is the upstream, decisive data-pipeline
+  question — and `feature_importance` *structurally cannot* answer it: you
+  cannot permute a near-constant column into measurable importance, so a dead
+  feature reads as `0.0` importance identically to one the model merely
+  ignores. `feature_coverage` disentangles "the model ignores a real signal"
+  from "the signal was never in the data". Each `decision_outcomes.jsonl`
+  record is pushed through the **exact** `build_features` call shape
+  `train_scorer` uses (same kwargs, same clamps), and the per-slot default
+  vector is derived by calling `build_features` with every numeric source
+  `None` (single source of truth — a default change in `decision_scorer.py`
+  cannot silently desync it; the `baseline_trend`-imports-`baseline_compare`
+  precedent). Per numeric feature it reports `default_fraction` (rows whose
+  post-`build_features` value equals the default), `distinct`, and a `dead`
+  flag. Verdicts (exact-value test-locked, module constants `MIN_ROWS=30`,
+  `DEAD_FLOOR=0.90`, `DEGRADED_FLOOR=0.50`): `INSUFFICIENT_DATA` →
+  `DEAD_FEATURES_PRESENT` (≥1 feature default-substituted in ≥90% of rows OR
+  constant <2 distinct) → `DEGRADED_COVERAGE` (no dead but ≥1 ≥50%) →
+  `FULL_COVERAGE`. The 7-way sector one-hot is excluded (sparse *by
+  construction* — exactly one hot per row — so a default fraction is
+  meaningless there; `feature_importance` permutes it jointly for the same
+  reason). Read-only, never raises (same operational discipline as the rest
+  of the module). CLI exit mirrors the sibling diagnostics so a cron can
+  branch on "the gate's MLP is being fed dead inputs right now": `0` on
+  `FULL_COVERAGE` / `INSUFFICIENT_DATA`, `2` on `DEAD_FEATURES_PRESENT` /
+  `DEGRADED_COVERAGE`. CLI: `python3 -m paper_trader.ml.feature_coverage`.
+  Locked by `tests/test_feature_coverage.py` (17 exact-value cases:
+  single-source default identity · missing/corrupt JSONL load · all four
+  verdict boundaries · constant-non-default dead rule · dead-overrides-
+  degraded · never-raises on garbage field types · CLI exit codes · the live
+  news-feature shape).
+
+  > **Quant finding (2026-05-18, decisive).** Live on
+  > `data/decision_outcomes.jsonl` (7538 rows): verdict
+  > **`DEAD_FEATURES_PRESENT`**, **effective numeric dim ≈ 7/10**.
+  > `news_urgency` is default-substituted in **97.3%** of rows and its
+  > remaining 2.7% are *all `0.0`* (backtest articles structurally carry
+  > `urgency=0` — CLAUDE.md invariant #2), so it is a 2-value
+  > near-constant; `news_article_count` is at its `1.0` default in
+  > **99.3%** of rows. The price/quant features are healthy
+  > (`ml_score` 0.0, `rsi`/`macd`/`mom5`/`mom20`/`vol_ratio`/`bb_pos` all
+  > ≈4–5% default), and `regime_mult` is degraded-not-dead (78.9% at the
+  > `1.0` bull/unknown default). **Why this matters:** the documented
+  > "17-feature MLP" is really an ~8-numeric + 7-sparse-one-hot model with
+  > **two pure noise dimensions** the net must spend capacity fitting —
+  > a concrete, upstream mechanism behind the repeatedly-documented
+  > `MLP_WORSE_THAN_TRIVIAL` (raw `ml_score` out-ranks the net OOS) and the
+  > `feature_importance` ≈0 readings for the news slots (it could never have
+  > distinguished "dead input" from "ignored input" — this can). The
+  > actionable thread for a future *training-dynamics* change (out of
+  > surgical scope here, CLAUDE.md §6): the news features cannot help until
+  > the backtest news pipeline supplies non-constant urgency/count for
+  > historical windows; until then they are removable at zero skill cost.
+  > **Reported observation, not a model change.**
+
 ### Tests (ML + backtest section)
 
 ```bash
@@ -1266,6 +1326,14 @@ cd /home/zeph/paper-trader && python3 -m pytest tests/test_overfit_gap.py -v
 # Is the scorer still memorizing its training fold? (read-only; exit 2 on
 # MILD/SEVERE_OVERFIT, 0 on WELL_GENERALIZED/INSUFFICIENT):
 cd /home/zeph/paper-trader && python3 -m paper_trader.ml.overfit_gap
+
+# Feature-coverage audit — how many of the 10 numeric MLP features actually
+# carry variation in the training data (the upstream question feature_importance
+# structurally cannot answer; 17 exact-value verdict locks)
+cd /home/zeph/paper-trader && python3 -m pytest tests/test_feature_coverage.py -v
+# Is the gate's MLP being fed dead/constant noise dimensions right now?
+# (read-only; exit 2 on DEAD/DEGRADED, 0 on FULL_COVERAGE/INSUFFICIENT):
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.feature_coverage
 
 # Training-corpus & OOS-construction audit (exact-value verdict locks)
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_corpus_audit.py -v
