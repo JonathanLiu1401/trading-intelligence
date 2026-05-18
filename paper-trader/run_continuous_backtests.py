@@ -658,7 +658,13 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
                     news_urgency=r.get("news_urgency"),
                     news_article_count=r.get("news_article_count"),
                 )
-                a = _to_float(r.get("forward_return_5d"), 0.0)
+                # NaN sentinel default so a missing/non-finite forward return
+                # is *dropped* by the `a == a` guard below, not silently
+                # coerced to 0.0 (which would poison rank_ic with fabricated
+                # flat-target ties). Mirrors persona_skill._aligned's NaN-
+                # sentinel discipline so this OOS metric and that diagnostic
+                # treat unparseable targets the same way.
+                a = _to_float(r.get("forward_return_5d"), float("nan"))
                 # Mirror train_scorer / evaluate_scorer_oos: a SELL's realized
                 # target sign is flipped so "good" has one consistent meaning.
                 if str(r.get("action") or "BUY").upper() == "SELL":
