@@ -6062,3 +6062,89 @@ features_added = 1 · user_findings = 5.**
   feature).
 
 *Review pass #25 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+## Review pass #27 — paper-trader core hybrid (2026-05-18)
+
+**bugs_fixed=0 · features_added=1 · user_findings=4**
+
+- **Phase 1 — bugs_fixed=0 (mature).** Full read of the 7 core files
+  (`runner.py`, `reporter.py`, `signals.py`, `strategy.py`, `dashboard.py`,
+  `market.py`, `store.py`). No real bug, race, or dead-code defect found;
+  389 focused-core tests green at baseline. The task's named coverage
+  already exists with *specific-value* asserts (verified, not just
+  imported): `test_core_store.py` (cash-after-BUY, recent_trades
+  same-µs `id DESC` tie-break, equity ascending), `test_core_market.py` +
+  `test_market_half_day.py` (weekend / pre-9:30 / 16:00-exclusive / 10:00
+  / holiday / 13:00 half-day close), `test_core_runner.py`
+  (`_maybe_daily_close` once-per-day, weekend, holiday, <16:05, half-day
+  via `close_minute`). The template's "max_position / stop-loss" cases do
+  NOT apply — invariant #12 (no hard limits; Opus full autonomy). No
+  Phase-1 commit (guard-compliant).
+
+- **Phase 2 — feature (committed `155f857`, pushed).**
+  `reporter._pos_pct_weight()` + `_portfolio_lines(total_value=None)`:
+  the Discord hourly/daily **Positions block now shows each position's own
+  return % and its book weight %** (` (-11.0% · 59% bk)`), previously only
+  raw `qty/avg/now/P/L$`. Closes a real operator gap — the live book sat
+  **97.9% in 2 names (LITE 59% @ −11.0%, MU 39% @ −3.3%)** and the
+  operator's primary surface rendered it identically to a balanced book
+  (single-name concentration is the desk's #1 documented pathology). Pure
+  position arithmetic (the same `pl_pct` `strategy._mark_to_market`
+  already feeds Opus — NOT a re-derived builder verdict; invariant #10
+  safe), additive/degrade-safe (stale/garbage/zero-cost/non-positive-total
+  drops the offending token, never raises; the `stale_mark` precedent,
+  invariants #2/#12). Default `total_value=None` keeps the existing
+  unit-test callers byte-compatible. 11 new tests (canonical-format lock,
+  live-LITE shape, stale suppression, option-100x weight,
+  NaN/zero-cost/non-positive degrade, sub-1% precision); validated
+  live-rendered against the real book.
+  ```bash
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest \
+    tests/test_core_reporter.py -q   # 121 green incl. TestPosPctWeight
+  ```
+
+- **Phase 3 — live findings (`:8090`; box under the review-swarm load
+  this pass's own siblings contribute to). 4 distinct + positive.**
+  1. **Live trader frozen — IDLE_STORM (HIGH, host-saturation, NOT a
+     code bug — continuity, recalled `pt-no-decision-host-saturation`).**
+     `/api/runner-heartbeat`: 20/20 cycles NO_DECISION,
+     `decision_efficacy=IDLE_STORM`, `restart_recommended:true`.
+     Architectural reality of the 15GB box under the concurrent Opus
+     review swarm + backtest committee; self-clears when the swarm ends.
+  2. **Dashboard `/api/state` and `/` hang >30s** under that same load
+     while lightweight endpoints (`/api/portfolio`,
+     `/api/runner-heartbeat`) stay instant — swap-thrash starving even
+     the SWR cold path, not a code defect (SWR mitigation already in
+     place; symptom of #1).
+  3. **Capital paralysis live (the #2 documented pathology, surfaced):**
+     cash $18.49 (2.1%), ~98% deployed in 2 names, total ~$900.84
+     (≈−9.9%). The Phase-2 feature now makes the per-name % +
+     concentration visible directly in the Discord positions block.
+  4. **Concurrent same-role-agent collision (process risk).** A *second*
+     "paper-trader core" HYBRID agent (pid 1958253) edited the same files
+     simultaneously; its whole-file `git add` swept its
+     `_host_pulse_line`/`host_guard.py` work into this pass's commit
+     `155f857` *despite* a hunk-filtered `git apply --cached` that staged
+     cleanly. **No work lost** (all committed + pushed) but attribution is
+     imperfect — `155f857` bundles two features. Running multiple
+     same-role agents on one shared monorepo tree is the root risk.
+  - **POSITIVE.** Book/data trust intact: `/api/portfolio` reconciles,
+    benchmark/freshness wiring intact, openclaw send healthy, continuous
+    backtest loop progressing. The freeze is isolated to the Opus call
+    (host load), not a blind feed / corrupt book / dark channel.
+
+- **Concurrency / staging discipline.** Built a my-only patch by parsing
+  `git diff` and dropping every hunk containing sibling tokens
+  (`_host_pulse`/`TestHostPulseLine`/`**HOST**`), `git apply --cached`'d
+  it (staged exactly 2 path-scoped files, `git diff --staged` verified
+  zero sibling tokens). A concurrent same-role sibling's whole-file
+  `git add` between stage and commit still bundled its work into
+  `155f857`; chose NOT to `git reset` (rewriting in-flight shared history
+  under a concurrent committer risks destroying the sibling's work — the
+  destructive race is worse than an imperfect message). Surfaced
+  transparently here and in the completion ping. AGENTS.md appended-only,
+  single trailing hunk, committed separately (not counted as the feature).
+
+*Review pass #27 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
