@@ -125,6 +125,12 @@ class TestDecisionContextEndpoint:
         # the event_calendar flag key must exist regardless of disk state —
         # a trader auditing the block set must never hit a missing key.
         assert "event_calendar" in j["advisory_blocks"]
+        # macro_calendar is a pure static-table builder (no disk/network) so
+        # it ALWAYS returns a non-empty prompt_block — a faithful
+        # reconstruction MUST surface it (the standing-checklist regression
+        # lock: assemble_inputs forgetting to build it fails RED here).
+        assert j["advisory_blocks"].get("macro_calendar") is True
+        assert "MACRO CALENDAR" in j["prompt"]
 
     def test_sector_exposure_block_reaches_reconstructed_prompt(
             self, client_store, monkeypatch):

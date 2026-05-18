@@ -85,6 +85,7 @@ def build_decision_context(
     sector_exposure_block: str | None = None,
     ml_opinion_block: str | None = None,
     event_calendar_block: str | None = None,
+    macro_calendar_block: str | None = None,
     buying_power_block: str | None = None,
     max_prompt_chars: int = MAX_PROMPT_CHARS,
 ) -> dict:
@@ -93,15 +94,17 @@ def build_decision_context(
     # The exact same render the live decide() performs. _build_payload's 2nd
     # positional is the *merged* signal list (urgent-not-in-top + top), so we
     # pass merged_signals there — identical to strategy.decide().
-    # event_calendar_block (forward earnings) + buying_power_block
-    # (deployable cash) + sector_exposure_block (live-book sector
-    # concentration) are threaded through here because decide() now passes
-    # ALL THREE to _build_payload; omitting any silently dropped advisory
-    # blocks from this "byte-identical reconstruction", so a trader auditing
-    # whether Opus saw the buying-power / earnings / sector-concentration
-    # awareness got a false NO. (sector_exposure was added by commit b471188
-    # AFTER the event_calendar/buying_power gap was closed in pass #16 —
-    # the same regression class, reintroduced one block later.)
+    # event_calendar_block (forward earnings) + macro_calendar_block
+    # (forward FOMC rate decisions) + buying_power_block (deployable cash) +
+    # sector_exposure_block (live-book sector concentration) are threaded
+    # through here because decide() now passes ALL of them to _build_payload;
+    # omitting any silently drops an advisory block from this "byte-identical
+    # reconstruction", so a trader auditing whether Opus saw the
+    # buying-power / earnings / macro / sector-concentration awareness got a
+    # false NO. (This is the documented recurring regression class —
+    # event_calendar/buying_power closed in pass #16, sector_exposure
+    # reintroduced it one block later in pass #17; macro_calendar is wired
+    # here in the SAME commit per the AGENTS.md standing checklist item.)
     payload = strategy._build_payload(
         snapshot, merged_signals, sentiments, watch_prices, futures_prices,
         sp500, market_open, quant_signals=quant_signals,
@@ -110,6 +113,7 @@ def build_decision_context(
         risk_mirror_block=risk_mirror_block,
         sector_exposure_block=sector_exposure_block,
         event_calendar_block=event_calendar_block,
+        macro_calendar_block=macro_calendar_block,
         buying_power_block=buying_power_block,
     )
     prompt = f"{strategy.SYSTEM_PROMPT}\n\n---\nCONTEXT:\n{payload}"
@@ -154,6 +158,7 @@ def build_decision_context(
             "sector_exposure": bool(sector_exposure_block),
             "ml_opinion": bool(ml_opinion_block),
             "event_calendar": bool(event_calendar_block),
+            "macro_calendar": bool(macro_calendar_block),
             "buying_power": bool(buying_power_block),
         },
         "mark_integrity": build_mark_integrity(snapshot.get("positions") or []),
@@ -270,6 +275,18 @@ def assemble_inputs(store) -> dict:
     except Exception:
         pass
 
+    # Forward MACRO awareness (scheduled FOMC rate decisions) — built EXACTLY
+    # as decide() builds it: a pure static-table call, market-wide (no
+    # positions / names arg — a rate surprise moves the whole book). decide()
+    # renders it after event_calendar and before buying_power; _build_payload
+    # owns that ordering so passing the kwarg is sufficient for byte-fidelity.
+    macro_calendar_block = None
+    try:
+        from .macro_calendar import build_macro_calendar
+        macro_calendar_block = build_macro_calendar().get("prompt_block")
+    except Exception:
+        pass
+
     # Deployable-cash awareness — built EXACTLY as decide() builds it (same
     # snapshot + already-fetched watch_px, scoped to the same _names_in_play
     # set the quant / track-record blocks use).
@@ -311,6 +328,7 @@ def assemble_inputs(store) -> dict:
         sector_exposure_block=sector_exposure_block,
         ml_opinion_block=ml_opinion_block,
         event_calendar_block=event_calendar_block,
+        macro_calendar_block=macro_calendar_block,
         buying_power_block=buying_power_block,
     )
 
@@ -342,6 +360,7 @@ if __name__ == "__main__":  # works even when :8090 is wedged (desk_pulse preced
               f"sector_exposure={a['sector_exposure']} "
               f"ml={a['ml_opinion']} "
               f"event_calendar={a['event_calendar']} "
+              f"macro_calendar={a['macro_calendar']} "
               f"buying_power={a['buying_power']}")
         mi = ctx["mark_integrity"]
         print(f"  marks: [{mi['verdict']}] {mi['headline']}")
