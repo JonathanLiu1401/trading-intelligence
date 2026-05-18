@@ -7850,6 +7850,106 @@ def decision_drought_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/empty-claude-rate")
+def empty_claude_rate_api():
+    """Live-trader 'claude returned no response (timeout/empty)' rate vs the
+    number of concurrent Opus `claude` subprocesses on the host.
+
+    decision-health/-forensics classify *parse* failures generically; this
+    endpoint isolates the one NO_DECISION signature that means the model
+    subprocess produced **nothing** (timeout / OOM-kill / starvation) and
+    correlates it with the current concurrent-Opus process count — the actual
+    root cause when out-of-band review agents + the backtest loop saturate the
+    box and starve the live trader's claude call. Nothing else surfaces this
+    link, so an operator can tell 'bad prompt' apart from 'host overloaded'."""
+    try:
+        decisions = get_store().recent_decisions(limit=2000)
+
+        def _is_empty(d):
+            r = (d.get("reasoning") or "")
+            return d.get("action_taken") == "NO_DECISION" and \
+                r.startswith("claude returned no response")
+
+        recent = decisions[:200]
+        empty_recent = [d for d in recent if _is_empty(d)]
+
+        # 6h time-window slice (timestamps are tz-aware ISO 8601).
+        from datetime import datetime, timezone, timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
+        win, win_empty, last_ts = 0, 0, None
+        for d in decisions:
+            try:
+                ts = datetime.fromisoformat(str(d.get("timestamp")))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if ts < cutoff:
+                continue
+            win += 1
+            if _is_empty(d):
+                win_empty += 1
+                if last_ts is None or ts > last_ts:
+                    last_ts = ts
+
+        mins_since = None
+        if last_ts is not None:
+            mins_since = round(
+                (datetime.now(timezone.utc) - last_ts).total_seconds() / 60.0, 1)
+
+        # Best-effort: count concurrent Opus `claude` subprocesses (the root
+        # cause of the empty responses). Never raises — degrades to None.
+        concurrent_opus = None
+        try:
+            import os
+            n = 0
+            for pid in os.listdir("/proc"):
+                if not pid.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                        cl = fh.read().replace(b"\x00", b" ").decode(
+                            "utf-8", "ignore")
+                except (OSError, IOError):
+                    continue
+                if "claude" in cl and "claude-opus" in cl:
+                    n += 1
+            concurrent_opus = n
+        except Exception:
+            concurrent_opus = None
+
+        rate_recent = round(100.0 * len(empty_recent) / len(recent), 1) \
+            if recent else 0.0
+        rate_6h = round(100.0 * win_empty / win, 1) if win else 0.0
+
+        # Verdict: tie the empty rate to host saturation when both are high.
+        if win < 5:
+            verdict = "INSUFFICIENT_DATA"
+        elif rate_6h >= 50.0 and (concurrent_opus or 0) >= 4:
+            verdict = "HOST_SATURATED — live trader starved by concurrent Opus"
+        elif rate_6h >= 50.0:
+            verdict = "HIGH_EMPTY_RATE — model timing out / returning nothing"
+        elif rate_6h >= 15.0:
+            verdict = "ELEVATED — intermittent empty responses"
+        else:
+            verdict = "HEALTHY"
+
+        return jsonify({
+            "rate_recent_pct": rate_recent,
+            "empty_recent": len(empty_recent),
+            "n_recent": len(recent),
+            "rate_6h_pct": rate_6h,
+            "empty_6h": win_empty,
+            "n_6h": win,
+            "last_empty_ts": last_ts.isoformat() if last_ts else None,
+            "minutes_since_last_empty": mins_since,
+            "concurrent_opus_processes": concurrent_opus,
+            "verdict": verdict,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/capital-paralysis")
 def capital_paralysis_api():
     """Trap + cost + unlock — why the book is stuck and the way out.
