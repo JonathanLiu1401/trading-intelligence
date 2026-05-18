@@ -4844,3 +4844,109 @@ by message — the recurring pass-#18/#19 concern).
   verdicts incl. the half-open window boundary).
 
 *Review pass #20 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 review pass #19 (ML+backtest hybrid · anti-overfit scorer config · live findings)
+
+- **Phase 1 — no new bug (bugs_fixed = 0; no Phase-1 commit, the commit
+  guard explicitly permits it).** Full re-trace of `decision_scorer.py`,
+  `backtest.py`, `run_continuous_backtests.py` plus the newest
+  least-reviewed `baseline_trend.py`: `_inject_and_train`'s 11-col INSERT
+  matches its 11-tuple and the `for…else` lock-retry returns the honest
+  error after exhausting `_LOCK_RETRY_SLEEPS`; `_ml_decide`'s
+  `scorer_off_dist` gate-skip + `getattr(_scorer,"_n_train",0)` dummy
+  fallback are sound; `_fwd_ret_h` gates on `price_on() is None` exactly
+  like the byte-identical 5d path; `PriceCache._build_trading_days`
+  empty-SPY fallback is paired with the honest `benchmark_unavailable`
+  note. Consistent with the documented 17 prior no-new-bug ML/backtest
+  passes (#5–#18) — the core trio is exhaustively exact-value locked. No
+  redundant test-hardening commit (the pass-#17/#18 churn-avoidance
+  precedent). ML/backtest regression **368 green before** the feature.
+
+- **Feature shipped (Phase 2, `feat(ml):`): the DecisionScorer MLP is now
+  regularized — `(32,16)` + L2 `alpha=1e-2` + `early_stopping` (was an
+  unregularized `(64,32,16)`/600-iter net).** `paper_trader/ml/
+  decision_scorer.py::train_scorer`, the exact location CLAUDE.md §12
+  points to ("Train the DecisionScorer differently") and explicitly **in
+  scope** (it is not the gate-threshold change CLAUDE.md §6 marks
+  out-of-scope). **The gap it closes:** the per-cycle
+  `scorer_skill_log.jsonl` records the overfit every cycle
+  (`val_rmse ≈ 9–11 ≪ oos_rmse ≈ 12–17`) and this pass's fresh read
+  reconfirmed it (cyc4 `val 10.74 / oos 16.68`, cyc5 `9.01 / 14.04`). A
+  faithful A/B replaying `train_scorer`'s exact preprocessing on the
+  **live** `decision_outcomes.jsonl` 5000-row tail under
+  `validation.split_outcomes_temporal(0.2)` (the honest holdout
+  `_train_decision_scorer` itself uses), across **4 MLP seeds**, showed
+  the new config uniformly lowers temporal-OOS RMSE (**mean ≈14.97→≈12.58,
+  up to 16.68→10.46** on the worst prior seed), closes the val/oos gap
+  from ~6pp to **<1pp**, and leaves OOS rank-IC / dir-acc within ±0.04 /
+  coin-flip noise. **Honest scope:** this removes the *magnitude* overfit;
+  it does **not** create rank skill — the MLP stays
+  `MLP_NO_BETTER_THAN_TRIVIAL` (a deeper data-signal limitation, unchanged
+  by hyperparameters, still tracked by the baseline ledger / pass #18).
+  The `_ml_decide` conviction gate acts on the prediction's MAGNITUDE
+  bucket (±10/±5/0), so a uniformly lower-error, less-extrapolating head
+  makes those bucket assignments materially less noisy. **Zero schema
+  impact:** gate arms, the `±PRED_CLAMP_PCT` clamp, `build_features`,
+  `SECTORS`, `N_FEATURES`, the `{model,scaler,n_train}` pickle, and the
+  numpy-lstsq sklearn-absent fallback are all untouched — a drop-in the
+  next retrain cycle picks up. Realigns the code with CLAUDE.md §3's
+  long-documented "MLPRegressor 32→16" architecture (the code had
+  silently drifted to `(64,32,16)`). 2 behaviour-asserting locks in
+  `tests/test_decision_scorer.py::TestAntiOverfitConfig`: a config-lock
+  (pickled `hidden_layer_sizes==(32,16)`, `alpha==1e-2`,
+  `early_stopping`, `validation_fraction==0.15`, `n_iter_no_change==25`)
+  and a **discriminating** noise-memorization test — on a pure-noise
+  target the regularized net's `pred_std/target_std` ratio is **≈0.40**
+  vs the old config's measured **≈1.00** (memorizes noise almost
+  perfectly), asserted `< 0.65` with wide both-sided margin so it is
+  non-flaky AND fails RED on a revert to the memorizing net. **370 green
+  after** (368 + 2). **Applies on the next `run_continuous_backtests.py`
+  restart** — the running loop (PID predates this) keeps the old config
+  until the operator reboots it (the documented deploy-stale pattern;
+  pickle at the gitignored `data/ml/decision_scorer.pkl`).
+  ```bash
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/test_decision_scorer.py::TestAntiOverfitConfig -v
+  ```
+
+- **Quant findings (Phase 3, live).** (1) **Overfit reconfirmed fresh and
+  now actioned** — `scorer_skill_log.jsonl` last cycles all show
+  `val_rmse ≪ oos_rmse`, `oos_ic ≈ 0`, `oos_dir_acc ≈ 0.49–0.56`; the
+  shipped config is the first pass to *act* on it rather than only
+  re-measure it. (2) **Zero OOS rank skill persists** —
+  `oos_ic ∈ {0.19,0.02,0.02,−0.01,0.07,0.04}`; the MLP carries no durable
+  rank edge over the raw `ml_score` one-liner (data-signal limitation, out
+  of surgical scope, unchanged by this pass). (3) **Running loop is stale
+  code** — the live `decision_outcomes.jsonl` tail rows carry only the 17
+  base keys (no `forward_return_10d/20d`, no `gate_scorer_pred`), and this
+  config change is likewise inert until restart; documented deploy-stale
+  operational state, not a code bug. (4) **Backtest dispersion is pure
+  leverage-beta** — run 6230 +484.8%/vs_spy +396.7% beside run 6231
+  −49.4%/vs_spy −12.4% same recent batch; **477 complete / 24 failed, no
+  NaN**, max completed run_id 6235 at 11:46 UTC (loop healthy and
+  progressing). The "best run +N%" cycle line must never be read as
+  strategy skill. The only `continuous.log` "errors" are external GDELT
+  rate-limit/connection-reset noise (handled by the retry+backoff+
+  permanent-cache path) and the documented winner→ArticleNet
+  `database locked`/`trainer timeout` contention — no core-code traceback.
+  Findings 2–4 reported, out of surgical scope.
+
+- **Concurrency note.** Ran with **3+ sibling agents on the identical
+  task** in the shared monorepo working tree (core-hybrid siblings
+  committed their own `pass #19`/`#20` to `AGENTS.md` mid-pass) plus a
+  swarm of dirty `../digital-intern/` + sibling-untracked
+  `paper_trader/ml/gate_pnl.py` / `analytics/game_plan.py` files. **Never
+  `git add -A`.** Exactly three path-scoped files staged
+  (`paper_trader/ml/decision_scorer.py`, `tests/test_decision_scorer.py`,
+  `AGENTS.md`), `git diff --staged` verified additions-only with zero
+  sibling-token hits, committed via the index (no pathspec — the pass-#16
+  re-snapshot lesson), deliverable confirmed on `origin/master` by content.
+
+- **Run the ML/backtest suite:** `cd
+  /home/zeph/trading-intelligence/paper-trader && python3 -m pytest
+  tests/ -q -k "ml or backtest or scorer or calibration or continuous or
+  horizon"` (370 green; `TestAntiOverfitConfig` is picked up by the
+  `scorer` keyword).
+
+*Review pass #19 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
