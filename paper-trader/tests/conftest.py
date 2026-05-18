@@ -62,6 +62,23 @@ def _isolate_data_dir(tmp_path, monkeypatch):
     if hasattr(bt, "_VOLUME_CACHE_DISK_LOADED"):
         bt._VOLUME_CACHE_DISK_LOADED = set()
 
+    # Unit tests must be deterministic regardless of the *real* host load.
+    # strategy.decide() now runs a pre-flight host-saturation guard
+    # (paper_trader/host_guard.host_saturated) that skips the claude call when
+    # the box is overloaded — true on CI / a busy dev box, where it would
+    # non-deterministically short-circuit every decide() test before the
+    # monkeypatched _claude_call runs. Neutralise the ambient probe here, in
+    # the same autouse fixture that already isolates ambient state. The
+    # guard's own logic is covered by tests/test_host_guard.py and the wired
+    # skip is exercised explicitly in tests/test_quota_guard.py. raising=False
+    # so this never breaks a test that doesn't import strategy.
+    import paper_trader.strategy as _strat
+    monkeypatch.setattr(
+        _strat, "host_saturated",
+        lambda *a, **k: (False, "test: host guard neutralised"),
+        raising=False,
+    )
+
     yield data_dir
 
 

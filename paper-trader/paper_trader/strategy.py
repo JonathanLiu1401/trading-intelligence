@@ -15,6 +15,20 @@ from pathlib import Path
 from . import market, signals
 from .store import Store, get_store
 
+# Pre-flight host-saturation guard (see paper_trader/host_guard.py). Imported
+# at module level so it is a monkeypatchable seam — `decide()` calls the
+# module global, exactly like `_claude_call`, so tests can neutralise the
+# ambient host probe deterministically (conftest does this autouse) and the
+# wired skip can be exercised explicitly. Degrade-safe: host_guard is
+# stdlib-only and should never fail to import, but if it does the trader must
+# still run (fall back to "never saturated"), mirroring the file's
+# non-fatal-by-construction contract.
+try:
+    from .host_guard import host_saturated
+except Exception:  # pragma: no cover - stdlib-only module, import can't fail
+    def host_saturated(*_a, **_k):
+        return (False, "host_guard unavailable")
+
 MODEL = "claude-opus-4-7"
 FALLBACK_MODEL = "claude-sonnet-4-6"
 FALLBACK_TIMEOUT_S = 60
@@ -1349,7 +1363,27 @@ def decide() -> dict:
     if ml_opinion_block:
         prompt += f"\n\n---\nML ADVISOR:\n{ml_opinion_block}"
 
-    raw = _claude_call(prompt)
+    # Pre-flight host-saturation guard. The recurring live-trader NO_DECISION
+    # storms are host saturation (out-of-band parallel Opus review/HYBRID
+    # agents + the backtest committee starving the 15GB box), NOT a prompt or
+    # parser bug — see paper_trader/host_guard.py. Spawning a doomed 180s Opus
+    # subprocess (and its Sonnet fallback) during a storm just OOM-thrashes the
+    # box (+1.5GB each) and still records NO_DECISION. Skip every claude call
+    # this cycle and record a distinct, honest reason instead. Degrade-safe:
+    # any probe failure falls through to the normal path (never blocks a
+    # decision — "non-fatal by construction", like the rest of decide()).
+    host_sat, host_sat_reason = False, ""
+    try:
+        host_sat, host_sat_reason = host_saturated()
+    except Exception as e:
+        print(f"[strategy] host_saturated probe failed (ignoring): {e}")
+        host_sat = False
+
+    if host_sat:
+        print(f"[strategy] skipping claude call — {host_sat_reason}")
+        raw = None
+    else:
+        raw = _claude_call(prompt)
     decision = _parse_decision(raw) if raw else None
     retried = False
     fallback_used = False
@@ -1358,8 +1392,10 @@ def decide() -> dict:
     # True timeout (raw is None, so _should_retry_parse is False): Opus blew
     # past its budget. Retrying the full prompt on Opus would just stall again,
     # so fall back to a faster model with a condensed prompt instead of
-    # recording a NO_DECISION.
-    if raw is None:
+    # recording a NO_DECISION. Skipped entirely when the host-saturation guard
+    # already declined the call this cycle — spawning the Sonnet fallback would
+    # just add another 1.5GB subprocess to the storm we are trying to dodge.
+    if raw is None and not host_sat:
         print("[strategy] Opus timeout — trying Sonnet fallback")
         fb_payload = _build_fallback_payload(snap, merged, quant_sigs)
         fb_prompt = f"{SYSTEM_PROMPT}\n\n---\nCONTEXT (condensed):\n{fb_payload}"
@@ -1414,6 +1450,12 @@ def decide() -> dict:
         # quota/usage-limit error (a frozen-trader signal, not a transient
         # miss). runner._cycle dedupes the Discord alarm off this.
         "quota_exhausted": bool(_quota_exhausted and not decision),
+        # True when the pre-flight guard skipped the claude call(s) this cycle
+        # because the host was saturated. Distinct from a real model timeout —
+        # no subprocess was spawned. runner._cycle still counts this as a
+        # NO_DECISION for the auto-recovery breaker (reaping stale claude procs
+        # is the right response to a saturated box either way).
+        "host_saturated": host_sat,
     }
 
     if not decision:
@@ -1422,6 +1464,12 @@ def decide() -> dict:
         # at a generic "no parseable JSON" line.
         if _quota_exhausted:
             reason_text = "claude quota/usage limit exhausted (no decision)"
+        elif host_sat:
+            # Distinct prefix on purpose: /api/empty-claude-rate and
+            # model_reliability key off "claude returned no response" — a
+            # deliberate skip is NOT a model timeout and must not inflate the
+            # empty/timeout rate. /api/host-guard surfaces this bucket.
+            reason_text = f"skipped claude call — {host_sat_reason}"
         elif raw:
             excerpt = raw[:RAW_CAPTURE_CHARS].replace("\x00", "")
             tag = "retry_failed" if retried else "parse_failed"
