@@ -7469,6 +7469,74 @@ def scorer_predictions_api():
         return jsonify({"error": str(e), "predictions": []}), 500
 
 
+@app.route("/api/scorer-attribution")
+@swr_cached("scorer-attribution", 60.0)
+def scorer_attribution_api():
+    """Per-feature signed attribution for the DecisionScorer's prediction on
+    one ticker — opens the otherwise black-box scorer so the operator can see
+    WHICH input (RSI, momentum, news, sector) drives a given EXIT/HOLD verdict.
+
+    ``?ticker=SYM`` (default: first held stock, else SPY). Same live feature
+    plumbing as /api/scorer-predictions; read-only, never touches the trade
+    path."""
+    try:
+        from .ml.decision_scorer import DecisionScorer
+        from .strategy import get_quant_signals_live
+        from . import signals as _sig
+
+        scorer = DecisionScorer()
+        store = get_store()
+
+        req_tk = (request.args.get("ticker") or "").strip().upper()
+        if not req_tk:
+            held = [p["ticker"] for p in store.open_positions()
+                    if p.get("type") == "stock" and (p.get("qty") or 0) > 0]
+            req_tk = sorted(held)[0] if held else "SPY"
+
+        result = {
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ticker": req_tk,
+            "is_trained": scorer.is_trained,
+            "n_train": scorer.n_train,
+            "gate_threshold": 500,
+        }
+        if not scorer.is_trained:
+            result["attribution"] = {"trained": False, "contributions": []}
+            return jsonify(result)
+
+        q = (get_quant_signals_live([req_tk]) or {}).get(req_tk) or {}
+        sent_list = _sig.ticker_sentiments([req_tk], hours=4) or []
+        sent = (sent_list[0] if sent_list else {}) or {}
+        ml_score = float(sent.get("max_score") or 0.0)
+
+        regime_mult = 1.0
+        try:
+            spy_q = (get_quant_signals_live(["SPY"]) or {}).get("SPY") or {}
+            spy_mom = spy_q.get("mom_5d")
+            if isinstance(spy_mom, (int, float)):
+                regime_mult = max(0.7, min(1.3, 1.0 + spy_mom * 0.075))
+        except Exception:
+            pass
+
+        attr = scorer.feature_contributions(
+            ml_score=ml_score,
+            rsi=q.get("rsi"),
+            macd=q.get("macd_signal"),
+            mom5=q.get("mom_5d"),
+            mom20=q.get("mom_20d"),
+            regime_mult=regime_mult,
+            ticker=req_tk,
+            vol_ratio=q.get("vol_ratio"),
+            bb_pos=q.get("bb_position"),
+        )
+        result["regime_mult"] = round(regime_mult, 3)
+        result["ml_news_score"] = round(ml_score, 2)
+        result["attribution"] = attr
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "attribution": {"contributions": []}}), 500
+
+
 @app.route("/api/sector-heatmap")
 @swr_cached("sector-heatmap", 90.0)
 def sector_heatmap_api():

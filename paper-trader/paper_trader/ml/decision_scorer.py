@@ -83,6 +83,16 @@ SECTOR_MAP: dict[str, str] = {
 
 N_FEATURES = 10 + len(SECTORS)  # 10 base (quant + news_urgency + news_article_count) + 7 sector one-hot = 17
 
+# Human-readable name per build_features() output slot, in order. Single
+# source of truth shared by feature_contributions() (and any future
+# attribution consumer) so a feature reorder can't silently mislabel an
+# attribution panel. Kept in lockstep with build_features()'s return list.
+FEATURE_NAMES = [
+    "ml_score", "rsi", "macd", "mom5", "mom20", "regime_mult",
+    "vol_ratio", "bb_pos", "news_urgency", "news_article_count",
+] + [f"sector_{s}" for s in SECTORS]
+assert len(FEATURE_NAMES) == N_FEATURES, "FEATURE_NAMES drifted from build_features()"
+
 # A 5-trading-day forward return is physically bounded. Across the 9,000+
 # real outcomes in data/decision_outcomes.jsonl the distribution is
 # p1=-25%, p99=+32%, and only ~0.4% of samples exceed |50%| (those are
@@ -340,6 +350,90 @@ class DecisionScorer:
             vol_ratio=vol_ratio, bb_pos=bb_pos, news_urgency=news_urgency,
             news_article_count=news_article_count,
         )["pred"]
+
+    def feature_contributions(
+        self,
+        ml_score: float,
+        rsi: float | None,
+        macd: float | None,
+        mom5: float | None,
+        mom20: float | None,
+        regime_mult: float,
+        ticker: str,
+        vol_ratio: float | None = None,
+        bb_pos: float | None = None,
+        news_urgency: float | None = None,
+        news_article_count: float | None = None,
+    ) -> dict:
+        """Per-feature signed attribution for one prediction.
+
+        Answers "WHY does the scorer predict this?" — the model is otherwise a
+        black box and an operator can't tell whether a -50 EXIT verdict is
+        driven by RSI, momentum, news, or a sector bias.
+
+        Ablation-from-baseline: the scaler centres every feature on its
+        training mean, so the all-zeros standardized vector is the "neutral"
+        input. ``contribution[i]`` is how far moving feature *i alone* from
+        that neutral baseline to its live value moves the raw prediction.
+        ``interaction_residual = pred_full - pred_baseline - sum(contrib)``
+        is ~0 for the linear fallback (exactly additive) and captures genuine
+        MLP non-linearity / feature interactions for the sklearn model — it is
+        surfaced rather than hidden so the attribution stays honest.
+
+        Returns a JSON-safe dict; ``trained=False`` (no model) yields an empty
+        ``contributions`` list. Every failure degrades to an ``error`` field,
+        never an exception (mirrors ``predict_with_meta``)."""
+        if not self._trained or self._model is None:
+            return {"trained": False, "contributions": [], "pred": 0.0,
+                    "pred_baseline": 0.0, "interaction_residual": 0.0,
+                    "off_distribution": False}
+        try:
+            raw_feat = build_features(
+                ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
+                vol_ratio=vol_ratio, bb_pos=bb_pos, news_urgency=news_urgency,
+                news_article_count=news_article_count,
+            )
+            x = np.array([raw_feat], dtype=np.float32)
+            if self._scaler is not None:
+                xs = np.asarray(self._scaler.transform(x), dtype=np.float32)[0]
+            else:
+                xs = x[0]
+            n = xs.shape[0]
+            baseline = np.zeros(n, dtype=np.float32)
+            # Batch one predict: [full, baseline, then feature-i-only-active].
+            batch = np.vstack([xs, baseline,
+                               baseline + np.eye(n, dtype=np.float32) * xs])
+            out = np.asarray(self._model.predict(batch), dtype=np.float64)
+            if not np.all(np.isfinite(out)):
+                return {"trained": True, "contributions": [], "pred": 0.0,
+                        "pred_baseline": 0.0, "interaction_residual": 0.0,
+                        "off_distribution": True}
+            pred_full = float(out[0])
+            pred_base = float(out[1])
+            contribs = out[2:] - pred_base  # marginal effect of each feature
+            rows = [
+                {"feature": FEATURE_NAMES[i],
+                 "raw_value": round(float(raw_feat[i]), 4),
+                 "contribution": round(float(contribs[i]), 4)}
+                for i in range(n)
+            ]
+            rows.sort(key=lambda r: -abs(r["contribution"]))
+            residual = pred_full - pred_base - float(contribs.sum())
+            clamped = abs(pred_full) > PRED_CLAMP_PCT
+            return {
+                "trained": True,
+                "pred": round(max(-PRED_CLAMP_PCT,
+                                  min(PRED_CLAMP_PCT, pred_full)), 4),
+                "pred_raw": round(pred_full, 4),
+                "pred_baseline": round(pred_base, 4),
+                "interaction_residual": round(residual, 4),
+                "off_distribution": bool(clamped),
+                "contributions": rows,
+            }
+        except Exception as e:
+            return {"trained": True, "contributions": [], "pred": 0.0,
+                    "pred_baseline": 0.0, "interaction_residual": 0.0,
+                    "off_distribution": True, "error": str(e)}
 
     @property
     def is_trained(self) -> bool:
