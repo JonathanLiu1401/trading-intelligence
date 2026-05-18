@@ -592,3 +592,121 @@ def train_scorer(records: list[dict]) -> dict:
     _tmp.replace(SCORER_PATH)
 
     return {"status": "ok", "n": len(records), "val_rmse": val_rmse}
+
+
+# ---------------------------------------------------------------------------
+# CLI: `python3 -m paper_trader.ml.decision_scorer --explain --ticker NVDA ...`
+#
+# Until now the only way to ask the scorer "what would you predict for THIS
+# input, and WHY" was the Flask dashboard (/api/scorer-predictions,
+# /api/scorer-attribution). On a box where the 78%-NO_DECISION operational
+# reality means an operator is usually on a shell triaging, not in a browser,
+# there was no way to interrogate the model directly. This exposes the already
+# existing honesty machinery — predict_with_meta() (clamp / off-distribution
+# trust flags) and feature_contributions() (per-feature signed attribution) —
+# as a read-only command. It adds NO new model behaviour, touches NO existing
+# function, imports stdlib lazily inside the entrypoints (module import cost
+# stays zero, mirroring train_scorer's local sklearn import), and never
+# trains or writes the pickle. Pattern (int return + --json + SystemExit)
+# matches paper_trader/host_guard.py's CLI so operators get one muscle memory.
+# ---------------------------------------------------------------------------
+
+def _build_arg_parser():
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="python3 -m paper_trader.ml.decision_scorer",
+        description="Explain one DecisionScorer prediction: predicted 5-day "
+                    "forward return (%) plus per-feature signed attribution. "
+                    "Loads the pickled model at data/ml/decision_scorer.pkl; "
+                    "read-only — never trains or writes.",
+    )
+    p.add_argument("--explain", action="store_true",
+                   help="(Accepted for clarity; explain is the only mode.)")
+    p.add_argument("--ticker", default="",
+                   help="Ticker symbol — drives the 7-way sector one-hot.")
+    p.add_argument("--ml-score", type=float, default=0.0, dest="ml_score",
+                   help="ArticleNet ai_score for the name (default 0).")
+    p.add_argument("--rsi", type=float, default=None)
+    p.add_argument("--macd", type=float, default=None)
+    p.add_argument("--mom5", type=float, default=None,
+                   help="5-day momentum %%.")
+    p.add_argument("--mom20", type=float, default=None,
+                   help="20-day momentum %%.")
+    p.add_argument("--regime-mult", type=float, default=1.0,
+                   dest="regime_mult", help="Market-regime multiplier.")
+    p.add_argument("--vol-ratio", type=float, default=None, dest="vol_ratio")
+    p.add_argument("--bb-pos", type=float, default=None, dest="bb_pos",
+                   help="Bollinger-band position 0..1.")
+    p.add_argument("--news-urgency", type=float, default=None,
+                   dest="news_urgency")
+    p.add_argument("--news-article-count", type=float, default=None,
+                   dest="news_article_count")
+    p.add_argument("--json", action="store_true",
+                   help="Emit machine-readable JSON instead of a table.")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Explain a single prediction. Returns 0 when a trusted prediction was
+    produced, 1 when the model is untrained or the result is off-distribution
+    (low-trust) — so shell callers can gate on `$?` like host_guard's CLI."""
+    import sys
+
+    args = _build_arg_parser().parse_args(
+        sys.argv[1:] if argv is None else argv)
+
+    scorer = DecisionScorer()
+    common = dict(
+        ml_score=args.ml_score, rsi=args.rsi, macd=args.macd,
+        mom5=args.mom5, mom20=args.mom20, regime_mult=args.regime_mult,
+        ticker=args.ticker, vol_ratio=args.vol_ratio, bb_pos=args.bb_pos,
+        news_urgency=args.news_urgency,
+        news_article_count=args.news_article_count,
+    )
+    meta = scorer.predict_with_meta(**common)
+    contrib = scorer.feature_contributions(**common)
+
+    if args.json:
+        import json
+
+        print(json.dumps({
+            "trained": scorer.is_trained,
+            "n_train": scorer.n_train,
+            "ticker": args.ticker,
+            "prediction": meta,
+            "attribution": contrib,
+        }, indent=2, sort_keys=True))
+        return 0 if (scorer.is_trained
+                     and not meta.get("off_distribution")) else 1
+
+    if not scorer.is_trained:
+        print("[decision_scorer] model NOT trained — no pickle at "
+              f"{SCORER_PATH} or load failed. predict() is a no-op 0.0%; "
+              "accumulate >=30 deduped outcomes then retrain.")
+        return 1
+
+    off = bool(meta.get("off_distribution"))
+    flag = "  [OFF-DISTRIBUTION — extrapolated past label support, low trust]" \
+        if off else ""
+    print(f"[decision_scorer] {args.ticker or '(no ticker)'}  "
+          f"n_train={scorer.n_train}")
+    print(f"  predicted 5d forward return: {meta['pred']:+.2f}%  "
+          f"(raw {meta['raw']:+.2f}%){flag}")
+    rows = contrib.get("contributions") or []
+    if rows:
+        print(f"  baseline={contrib.get('pred_baseline', 0.0):+.2f}%   "
+              "interaction_residual="
+              f"{contrib.get('interaction_residual', 0.0):+.2f}%")
+        print("  per-feature attribution (sorted by |impact|):")
+        print(f"    {'feature':<22}{'value':>12}{'contribution':>16}")
+        for r in rows:
+            print(f"    {r['feature']:<22}{r['raw_value']:>12.4f}"
+                  f"{r['contribution']:>+16.4f}")
+    elif contrib.get("error"):
+        print(f"  attribution unavailable: {contrib['error']}")
+    return 1 if off else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
