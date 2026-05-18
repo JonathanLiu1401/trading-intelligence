@@ -3276,3 +3276,134 @@ regressions; SWR-adjacent set (`test_dashboard_swr`, `test_core_state_swr`,
   `test_gate_audit.py`.
 
 *Review pass #15 appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 review pass #15 (paper-trader core hybrid · NYSE half-day close fix · deployable-cash prompt block · live findings)
+
+*(Numbered #15 alongside the ML/backtest #15 above — the established
+two-entries-per-number convention, e.g. the dual #11/#14 passes.)*
+
+- **Phase 1 — 1 bug fixed (commit `e556606`).**
+  `dashboard._next_market_open()` computed the "next close" as a hardcoded
+  `now_ny.replace(hour=16, …)`. But `market.is_market_open()` has enforced
+  13:00 ET **early-close half-days** since `b6a1934` (`NYSE_HALF_DAYS_2026`
+  = day-after-Thanksgiving 2026-11-27, Christmas Eve 2026-12-24), exposing
+  `market.close_minute(d)` (780 half-day / 960 regular, minutes past ET
+  midnight). So on those two sessions — while `is_market_open` correctly
+  returned True 09:30–13:00 — the `/api/briefing` card ("Market OPEN —
+  closes in 5h00m", *the first thing a trader sees on the pane each
+  morning*) and `/api/game-plan`'s `next_open_seconds` reported the close
+  **3h late**, exactly the figure a trader times exits on. Fix: derive the
+  close from `market.close_minute(now_ny.date())` (`divmod` → hour/minute);
+  regular sessions byte-identical. Locked by 2 new tests in
+  `tests/test_core_dashboard_helpers.py::TestNextMarketOpen`
+  (half-day → 13:00/2h; regular-day → 16:00/5h no-perturbation). RED
+  before the fix.
+
+- **Phase 2 — 1 feature (commit `b739a14`).** `analytics/buying_power.py`
+  + `build_buying_power` — a **deployable-cash advisory block in the live
+  Opus prompt**, the lean prompt-facing complement to the dashboard-only
+  `capital_paralysis`. The mirrors (`self_review`/`track_record`/
+  `risk_mirror`) + `event_calendar` all reach the prompt; the one
+  *operational* fact still omitted is what a desk checks before every
+  order — how much can I deploy, and if pinned what unlocks me? This is
+  the **#2 documented live pathology** (pass #14 #4): a $972 book with
+  ~$18 free across two underwater names, where Opus saw only a raw
+  `cash: $18.49` line. `/api/capital-paralysis` synthesises it on the
+  **dashboard**, but the decision engine never saw it — the
+  `event_calendar` gap, one dimension over. Pure arithmetic over the
+  **already-marked snapshot + already-fetched `watch_px`** `decide()`
+  holds (NO extra store read, NO network — the `risk_mirror` hot-path
+  discipline), scoped to the same `_names_in_play` set the quant /
+  track-record blocks use. States: `DEPLOYABLE` (affordable whole-share
+  counts, ≤6 names), `CASH_CONSTRAINED` (below every in-play price → only
+  fractional / SELL / HOLD actionable + the most-underwater position whose
+  exit frees the most cash, the `capital_paralysis` "biggest-loser-first"
+  cut-priority), `NO_PRICED_NAMES`/`NO_DATA`/`ERROR` honest fallbacks.
+  Observational only — autonomy preamble, **no directive verb**, no cap,
+  never gates (invariants #2/#12, the `event_calendar` precedent);
+  `_safe`-wrapped so a fault is "no block this cycle", **never** "no
+  decision". Wired into `_build_payload(... buying_power_block=)`
+  (rendered **last in the advisory stack — after `event_calendar`, before
+  `WATCHLIST PRICES`**) + `decide()` (`_safe` try/except, after the
+  `event_calendar` block); applies on next paper-trader restart. **No
+  parity endpoint deliberately** — `/api/capital-paralysis` already serves
+  this concern on the dashboard, so a `/api/buying-power` twin would
+  duplicate it and add a concurrent-edit surface to the contested
+  `dashboard.py` for no operator gain. Smoke-tested live on the real
+  pinned book: `CASH_CONSTRAINED · $18.49 free (98.1% deployed) · cheapest
+  in-play SOXL @ $28 · most-underwater LITE ($-6.21) frees ≈$592`. Locked
+  by `tests/test_buying_power.py` (17 tests: live pinned-book shape;
+  strict `int(cash//px)` floor + `cash==price` boundary;
+  zero/negative/None price excluded; not-in-play excluded; unlock
+  loser-vs-largest-mark pick; `_position_mark_value` consumes the enriched
+  `market_value` and never re-derives the option ×100; observational
+  voice; `_build_payload` last-in-stack placement + `None`-no-stray;
+  never-raises-on-garbage).
+
+- **Phase 3 — live findings (1–5; none a quick safe code fix).**
+  1. **`/api/liquidity` field/headline semantic inconsistency.** For the
+     live $18.49 (1.9%) book the endpoint returns `can_act_on_signal:
+     true` *next to* a headline reading "Pinned … **no room to act**".
+     Root cause: `can_act = cash>=1.0 and cash_pct>=1.0` but the
+     `NO_DRY_POWDER`/"no room to act" headline triggers at `cash_pct<2.0`
+     — the thresholds disagree in the `[1%,2%)` band, exactly where the
+     live book sits. Each number is individually correct (a fractional
+     order *is* possible at $18); only the prose overstates. **Reported,
+     not fixed:** `liquidity.py` is a deliberately-designed,
+     heavily-tested builder `capital_paralysis` composes verbatim
+     (single-source-of-truth) and sibling agents are actively editing —
+     churning its field semantics for a wording nit risks the composition
+     + a merge collision (the "deliberately weird, leave it" category). A
+     future pass that *does* touch it should align the two thresholds (or
+     soften the headline to "minimal room") and re-pin the
+     `capital_paralysis` composition.
+  2. **NO_DECISION ~59% lifetime / 60% (24h)** — confirmed unchanged,
+     uniformly `"claude returned no response (timeout/empty)"` under host
+     load ~17 (`/api/decision-health`: `no_decision_rate_24h 60.3`,
+     `last_fill_ts` 23.7h ago). NOT a parser bug, NOT quota
+     (`quota_exhausted` unset) — the long-standing contention diagnosis
+     (CLAUDE.md §11; passes #6–#14). The lever is host load, not code; the
+     Phase-2 block does not fix timeouts but makes the cycles that *do*
+     complete materially more decision-useful on the pinned book.
+  3. **Capital paralysis active & bleeding alpha (the Phase-2
+     justification).** `/api/capital-paralysis`: 98.1% deployed, "inaction
+     has cost **-2.21% alpha** (6 paralysis drought(s))",
+     `cycles_since_last_fill 55`, last fill ~24h ago, LITE 60.9% of book.
+     Real, ongoing, measurably costly.
+  4. **`/api/build-info` `behind:1 stale:true`** at session start, but the
+     sole missing commit was docs-only (a pass-#14 `AGENTS.md` entry); the
+     git-watcher auto-fast-forwards (observed in `runner.log`:
+     "fast-forwarding your working tree from commit 3b09f87"). Self-healing
+     — no action. The runner-restart churn ("another paper trader is
+     already running … exiting") is the singleton flock **working** during
+     the concurrent-deploy storm (pass #14 #3.2) — noisy, safe.
+  5. **Positives verified:** `/` 200 in **38 ms**; `/api/state` SWR-served
+     (`cached:true`, age 34s — by design) with the full correct shape;
+     `runner-heartbeat` HEALTHY, singleton **acquired** (not degraded),
+     Discord delivery **HEALTHY**; `/api/feed-health` HEALTHY (566 live
+     articles/2h, not split-brain); decisions on cadence (last 79s ago).
+     The system is operationally sound; its two real problems (host-load
+     timeouts, data-corruption paralysis) are documented ops/data issues,
+     not core code defects.
+
+- **Concurrency note for the next agent.** This pass ran with ≥3 sibling
+  agents committing in parallel (observed: `reporter.py`, the
+  `analytics_api` `mark_trust` block in `dashboard.py`, `/api/supervision`,
+  `feat(ml) gate economic counterfactual`, a parallel `AGENTS.md` #15
+  append). `git add <file>` restages the **whole** working tree — it
+  silently captures a sibling's in-progress hunk. The safe pattern used
+  here: extract only your own hunk (`git diff` → filter → `git apply
+  --cached --recount`) for any file a sibling also touched (`dashboard.py`,
+  `AGENTS.md`), and only `git add` whole files exclusively yours (new
+  modules, new test files, `strategy.py` here). Verify with `git diff
+  --cached -- <file> | grep -c <sibling-token>` == 0 before every commit.
+
+- **Run the suite:** `cd /home/zeph/trading-intelligence/paper-trader &&
+  python3 -m pytest tests/ -v` (full). Fast subset for this pass:
+  `python3 -m pytest tests/test_buying_power.py
+  tests/test_core_dashboard_helpers.py tests/test_core_strategy.py
+  tests/test_event_calendar.py -q`.
+
+*Review pass #15 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
