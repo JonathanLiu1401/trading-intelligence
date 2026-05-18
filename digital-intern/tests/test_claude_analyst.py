@@ -56,9 +56,18 @@ class TestFmtTicker:
 
 class TestBuildPayload:
     def _articles(self, n):
+        # Each title must be genuinely distinct under the briefing's
+        # order-independent near-dup collapse (ml.dedup, token-set Jaccard).
+        # The original `f"headline {i}"` was NOT: the bare digit is a len-1
+        # token dropped by `_MIN_TOKEN_LEN=2`, so all N normalized to the
+        # identical token set {headline} and collapsed to one row — a latent
+        # fixture defect (the helper's whole purpose is N *distinct* rows).
+        # `alpha{i}`/`topic{i}` are alphanumeric len>=2 tokens kept verbatim,
+        # so row i's set differs from row j's (J~0.43 < the 0.7 threshold).
+        # Assertions and the cap-60 contract they pin are unchanged.
         return [
-            {"title": f"headline {i}", "source": "rss", "ai_score": 7.0,
-             "summary": "body"}
+            {"title": f"headline alpha{i} bravo desk topic{i}", "source": "rss",
+             "ai_score": 7.0, "summary": "body"}
             for i in range(n)
         ]
 

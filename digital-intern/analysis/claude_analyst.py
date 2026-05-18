@@ -17,6 +17,13 @@ from watchers.alert_dedup import _signature
 # window, so the briefing LEAD/TOP-SIGNALS don't re-surface a story the
 # analyst was already pushed (their top "duplicate alerts" complaint).
 from watchers import alert_recency
+# Order-independent near-duplicate collapse. ml.dedup is pure stdlib+re —
+# despite its package path it imports NO numpy/torch (ml/__init__.py is empty;
+# verified import-clean), so this carries the SAME import-safety profile as
+# alert_dedup/alert_recency above and adds no cycle. It is the purpose-built
+# complement to _collapse_syndicated below (its own docstring names the
+# "briefing pre-filter" as the intended integration); see _build_payload.
+from ml.dedup import dedupe_articles as _dedupe_near_duplicates
 
 MODEL = "claude-opus-4-7"
 
@@ -362,6 +369,25 @@ BRIEFING_DECAY_HALFLIFE_H = 12.0  # ts=1.0 → score halves every 12h (per the
 # ml.inference.ArticleScore default so behaviour is consistent system-wide.
 BRIEFING_DEFAULT_TS = 0.5
 
+# ── Second-stage near-duplicate collapse threshold ──────────────────────────
+# Jaccard token-set similarity at/above which two digest headlines are the
+# SAME story. _collapse_syndicated (above) only merges an exact first-8-token
+# prefix signature, so a word-reordered or source-attribution-suffixed copy of
+# one wire ("Apple beats Q2" vs "Q2 beaten by Apple"; "...inflation fears" vs
+# "...inflation fears | Daily Star") survives it and reaches the analyst's
+# primary Opus digest as a duplicate TOP SIGNAL — the consuming analyst's #1
+# noise complaint, on the one consumed product that had no order-independent
+# gate. 0.7 is deliberately conservative: it collapses genuine paraphrase /
+# attribution variants while a single-token ANTONYM flip in a short (4-5
+# token) headline — "Fed raises rates 25bp" vs "Fed cuts rates 25bp" (J=0.60),
+# "NVDA earnings beat Q3 estimates" vs "...miss..." (J=0.667) — stays strictly
+# below it, so opposite-direction stories are provably never merged. Evidence:
+# the live 2026-05-18 07:13Z briefing window carried 5 such residual dups
+# (bond-rout ×3, Trump-Intel-stake ×1, ...) at sim 0.60-0.73, ALL genuine
+# same-story paraphrases (a full pairwise audit of that window found zero
+# semantically-opposite pairs ≥0.60).
+BRIEFING_NEAR_DUP_THRESHOLD = 0.7
+
 
 def _seen_age_hours(first_seen, now: datetime | None = None) -> float:
     """Hours since the article hit our wire (``first_seen``), else ``0.0``.
@@ -686,6 +712,32 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None):
         # prepends up to 2 synthetic snapshot rows (P&L, options) to a
         # 50-article top list; a [:50] cap silently truncates real articles.
         deduped = _collapse_syndicated(articles)
+        # Second-stage ORDER-INDEPENDENT near-dup collapse. _collapse_syndicated
+        # only merges an exact first-8-token prefix signature; a word-reordered
+        # or source-attribution-suffixed copy of the SAME wire survives it and
+        # reaches the analyst's primary Opus digest as a duplicate TOP SIGNAL
+        # (their #1 noise complaint — the live 07:13Z window carried 5 such
+        # residual dups). ml.dedup.dedupe_articles (pure stdlib, separately
+        # unit-tested in tests/test_dedup.py; its own docstring names the
+        # "briefing pre-filter" as the intended integration) is the
+        # purpose-built complement. Threshold 0.7 is conservative enough that a
+        # single-token antonym flip never merges opposite stories — see
+        # BRIEFING_NEAR_DUP_THRESHOLD. score_key='ai_score' keeps the
+        # highest-LLM-scored copy as the survivor, mirroring
+        # _collapse_syndicated's _score tie-break intent. Pure read-side, the
+        # SAME shape as _collapse_syndicated: returns the original dict objects,
+        # never mutates the caller's source_articles (heartbeat_worker feeds
+        # those onward to the briefing-label / training path), no DB write, no
+        # ai_score/ml_score/score_source/urgency touch, backtest already
+        # excluded upstream by get_top_for_briefing's _LIVE_ONLY_CLAUSE — all
+        # four load-bearing invariants intact by construction. The rare
+        # further-merged survivor keeps its OWN pre-merge [syndicated xN] count
+        # (a conservative under-count, never over-stated): dedupe_articles is
+        # reused verbatim, not forked, the documented anti-drift discipline
+        # (same reason _collapse_syndicated reuses alert_dedup._signature).
+        deduped = _dedupe_near_duplicates(
+            deduped, threshold=BRIEFING_NEAR_DUP_THRESHOLD
+        )
         # Apply the documented per-article recency decay (the ML
         # time_sensitivity head). A stable sort keeps the prepended
         # PORTFOLIO/OPTIONS snapshots pinned at the top (age 0 → no decay →
