@@ -340,6 +340,24 @@ Suites:
   never raises into chat); a QUIET/NO_DATA window is suppressed (ACTIVE-only,
   matching the unified `:8888` chat's `_fetch_session_delta` so the two
   conversational surfaces stay consistent).
+- `test_chat_behavioural_enrichment.py` — `dashboard/web_server.py::`
+  `_behavioural_chat_lines`, the pure helper backing the `/api/chat`
+  behavioural-diagnosis block. The chat already surfaced the trader's
+  **raw** `/api/analytics` stats; this composes the bot's **synthesized
+  self-review verdicts** (`/api/scorecard` + `/api/capital-paralysis` +
+  `/api/churn`) so a "why is my bot losing money?" question gets the
+  diagnosis the bot itself produced. The discriminating lock is
+  **verbatim composition** (paper-trader invariant #10 — single source
+  of truth): each builder's own `headline` / `focus["headline"]` /
+  `flags[i]` / `recommended_unlock["reason"]` must appear UNCHANGED in
+  the output (an inline re-derivation that drifts from the trader
+  endpoint fails loud — the `test_risk_mirror` precedent). Also pins the
+  `▶ PRIORITY` precedence (paralysis-unlock ≻ scorecard-focus ≻
+  churn-CHURNING ≻ none), the 3-flag cap, and the total/pure degrade
+  contract (non-dict / `{"error":…}` / missing-`state` / `NO_DATA` →
+  that input drops, all three absent → `[]`, never an exception into
+  chat — the `_tail_risk_chat_lines` sibling contract). 12 cases, no
+  Flask/DB/cross-fetch needed.
 - `test_heartbeat_cadence.py` — `daemon._initial_heartbeat_last`, the
   restart-resilient briefing-clock seed (see "5h heartbeat briefing posts
   30–40h apart" failure mode). Drives the real `save_briefing →
@@ -1244,6 +1262,43 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   `scripts/stale_source_alerter.py`, all `paper-trader/*`, `logs/*.tmp`. My
   four files were clean before edit; commits pathspec-scoped, never
   `git add -A`.
+
+- **2026-05-18 (Agent 4, feature-dev — analyst-chat behavioural-diagnosis enrichment)** —
+  Spec: `~/docs/superpowers/specs/2026-05-18-chat-behavioural-diagnosis-design.md`
+  (advisor-reviewed). One additive feature, this repo only, never gates
+  Opus (invariants #2/#12 — chat context only). `dashboard/web_server.py`
+  gains the pure helper `_behavioural_chat_lines(scorecard, paralysis,
+  churn)` (mirrors the `_tail_risk_chat_lines` precedent: total/pure,
+  degrades to `[]`), composing the trader's **own synthesized
+  self-review verdicts verbatim** — `/api/scorecard` headline + flagged
+  `focus`, `/api/capital-paralysis` headline + first-3 `flags`,
+  `/api/churn` headline, plus one derived `▶ PRIORITY` line
+  (paralysis-unlock ≻ scorecard-focus ≻ churn-CHURNING). Wired into
+  `api_chat` as a fourth sibling cross-fetch block (three guarded
+  `urllib.urlopen(... timeout=3)` reads of `:8090/api/{scorecard,
+  capital-paralysis,churn}`, each independently degrade-to-`None`),
+  injected into `system_prompt` right after `PAPER TRADER ANALYTICS`
+  via the existing `if block else ""` idiom. The chat already surfaced
+  the raw stats (16.67% win rate, 0.04 PF, −$15 realized, 0.52d hold);
+  it now surfaces the *diagnosis* — why. New
+  `tests/test_chat_behavioural_enrichment.py` (12, pure helper, no
+  Flask/DB). Suites: digital-intern **458 passed** (this feature 12/12;
+  caches cleared per the phantom-failure note). *Not mine, untracked/
+  uncommitted concurrent-agent WIP, deliberately never staged:* the 5
+  `test_rss_collector.py` failures (a `collectors/rss_collector.py:175`
+  `TypeError` in another agent's dirty `M` change — committed-HEAD
+  `rss_collector.py` makes all 5 pass, proven by an isolated HEAD-file
+  swap), `daemon.py` `M`, untracked `tests/test_alert_history.py`
+  (imports a nonexistent `watchers.alert_history`). My two files were
+  clean on HEAD; commit pathspec-scoped (`web_server.py` + the new
+  test), never `git add -A`.
+  *Operational:* `:8090` is `stale: true, behind: 18` — `/api/scorecard`
+  /`-capital-paralysis`/`-churn` already exist on the committed code, so
+  the block renders once `systemctl --user restart paper-trader`; until
+  then the three cross-fetches degrade-to-skip and the block is silently
+  omitted (the chronic-stale pattern, identical to the tail-risk sibling).
+  digital-intern `:8080` serves the new chat context only after
+  `systemctl --user restart digital-intern`.
 
 - **2026-05-17 (Agent 4, feature-dev — analyst-chat enrichment: tail-risk + 48h thesis tier)** —
   Spec: `~/docs/superpowers/specs/2026-05-17-tailrisk-and-chat-enrichment-design.md`.
