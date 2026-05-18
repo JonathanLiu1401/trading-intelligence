@@ -96,6 +96,25 @@ VALIDATION_RESULTS_KEEP = 50    # cap file growth
 SCORER_SKILL_LOG = ROOT / "data" / "scorer_skill_log.jsonl"
 SCORER_SKILL_LOG_KEEP = 2000    # cap file growth (≈ one row per cycle)
 
+# Per-cycle trivial-baseline ledger. `scorer_skill_log.jsonl` (read by
+# `skill_trend`) trends the scorer's `oos_rmse` against a *constant*
+# mean-predictor. The single most economically decisive documented finding
+# across ~10 ML/backtest review passes is a *different* question entirely:
+# `baseline_compare` shows a one-line rule (raw `ml_score`) carries higher OOS
+# rank-IC than the 17-feature MLP — `MLP_WORSE_THAN_TRIVIAL` — so the
+# conviction gate (invariant #5, active every cycle once n_train≥500)
+# underwrites pure sizing variance with no compensating edge. That verdict was
+# only ever observable by an operator manually running
+# `python3 -m paper_trader.ml.baseline_compare` — there was NO durable,
+# trendable signal an unattended loop could surface, exactly the gap the
+# pass-#15 `_append_scorer_skill_log` wiring fix closed for the scorer ledger.
+# This appends one structured row per cycle so a skeptical quant can see
+# whether the net stays net-negative-complexity, recovers, or worsens as
+# `decision_outcomes.jsonl` accumulates. Module-level (not a function local)
+# so tests can redirect it — the same testability rule as SCORER_SKILL_LOG.
+BASELINE_SKILL_LOG = ROOT / "data" / "baseline_skill_log.jsonl"
+BASELINE_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 EARLIEST_WINDOW_START = date(1993, 2, 1)  # SPY inception — ~30+ years of history
 WINDOW_END_BUFFER_DAYS = 180  # never end a window within 6 months of today
 MIN_WINDOW_YEARS = 1
@@ -826,6 +845,97 @@ def _deployed_scorer_n_train() -> int | None:
         return int(n) if n is not None else None
     except Exception:
         return None
+
+
+def _append_baseline_skill_log(cycle: int, win_start: date, win_end: date,
+                               outcomes_path: "Path | str | None" = None) -> bool:
+    """Append one structured row to the per-cycle trivial-baseline ledger.
+
+    Answers, durably and per-cycle, the single most decisive documented
+    ML/backtest question: *does a one-line rule (raw ``ml_score``) carry more
+    out-of-sample rank skill than the 17-feature MLP the conviction gate
+    relies on?* Reuses ``baseline_compare.analyze`` verbatim — the EXACT
+    read-only path `python3 -m paper_trader.ml.baseline_compare` uses (which
+    in turn shares `validation.split_outcomes_temporal` + the universal SELL
+    sign-flip with `calibration --oos` and the scorer ledger's OOS metrics),
+    so the persisted ``mlp_rank_ic`` equals the CLI's / `calibration --oos`'s
+    by construction — a built-in no-drift cross-check, never a re-derivation.
+
+    Best-effort and idempotent-safe: every fault is swallowed (a ledger write
+    must NEVER break the continuous loop — the exact discipline of the sibling
+    ``_append_scorer_skill_log`` / ``_post_discord`` / the validation
+    persister). An untrained scorer or a missing/short outcomes file is
+    persisted **honestly** as a ``status='error' verdict='INSUFFICIENT_DATA'``
+    row (the "no outcome records" sentinel precedent) rather than skipped, so
+    a gap in the trend is visible, not silent. Bounded growth: when the file
+    exceeds 2× ``BASELINE_SKILL_LOG_KEEP`` it is atomically rewritten to the
+    last ``BASELINE_SKILL_LOG_KEEP`` rows (the decision_outcomes trim idiom —
+    a torn truncate would lose skill history, so write tmp then ``.replace``).
+
+    ``gate_active`` mirrors the scorer ledger: the conviction gate engages
+    only at deployed ``n_train >= 500`` (invariant #5), so a row with
+    ``verdict='MLP_WORSE_THAN_TRIVIAL'`` AND ``gate_active=True`` is the
+    quant-decisive "the loop is sizing on a net the data says is worse than a
+    free one-liner, right now" state.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        try:
+            from paper_trader.ml import baseline_compare as _bc
+            rep = _bc.analyze(outcomes_path, oos_only=True)
+        except Exception as exc:
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA",
+                   "hint": f"baseline_compare unavailable: {type(exc).__name__}"}
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA"}
+
+        mlp = rep.get("mlp") or {}
+        n_train = rep.get("n_train")
+        try:
+            gate_active = (n_train is not None and int(n_train) >= 500)
+        except (TypeError, ValueError):
+            gate_active = False
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": rep.get("verdict"),
+            "slice": rep.get("slice"),
+            "n": rep.get("n"),
+            "n_train": n_train,
+            "mlp_rank_ic": mlp.get("rank_ic"),
+            "mlp_dir_acc": mlp.get("dir_acc"),
+            "best_baseline": rep.get("best_baseline"),
+            "best_baseline_ic": rep.get("best_baseline_ic"),
+            # MLP − best one-liner rank-IC. Negative ⇒ the net is
+            # net-negative complexity OOS (the documented finding).
+            "ic_gap": rep.get("ic_gap"),
+            "gate_active": gate_active,
+        }
+        BASELINE_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with BASELINE_SKILL_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in BASELINE_SKILL_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > BASELINE_SKILL_LOG_KEEP * 2:
+                kept = lines[-BASELINE_SKILL_LOG_KEEP:]
+                tmp = BASELINE_SKILL_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(BASELINE_SKILL_LOG)
+        except Exception as e:
+            print(f"[continuous] baseline-skill-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] baseline-skill-log append failed: {e}")
+        return False
 
 
 def _parse_published_date(published) -> date | None:
@@ -1694,6 +1804,16 @@ def main() -> None:
                 "no outcome records", cycle, win_start, win_end,
                 n_train_hint=_deployed_scorer_n_train(),
             )
+
+        # Durable per-cycle trivial-baseline ledger (the decisive
+        # MLP_WORSE_THAN_TRIVIAL question). Wired here for the same reason —
+        # and in the same place — as the scorer-skill ledger above: it was a
+        # CLI-only signal with no durable trend an unattended operator could
+        # see. Exactly one row per cycle, best-effort by construction (it
+        # never raises), reading the just-retrained deployed pickle vs the
+        # accumulated outcomes tail — the same view `baseline_compare`'s CLI
+        # and `calibration --oos` report, so the numbers can never drift.
+        _append_baseline_skill_log(cycle, win_start, win_end)
 
         ml_status = _try_train_ml() if winner else "no winner"
         print(f"[continuous] ml: {ml_status}")
