@@ -5604,6 +5604,148 @@ def backtests_page():
     return render_template_string(TEMPLATE, initial_tab="backtests", api_prefix=_api_prefix())
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Per-ticker drill-down + missed-opportunity radar
+#
+# A trader inspecting one name (e.g. "MU") otherwise has to cross three
+# surfaces by hand: the live lot + marks, the closed round-trip history, the
+# Opus reasoning that touched it, and the live news flow. /api/ticker/<sym>
+# fuses them via the pure analytics.ticker_dossier SSOT; /ticker/<sym> is the
+# standalone page on top of it (self-contained — deliberately NOT a new tab
+# in the 9k-line SPA TEMPLATE, so it can't merge-conflict that file).
+# /api/watchlist-opportunities is the orthogonal panel: watchlist names with
+# live news heat that the book has NO exposure to.
+# ─────────────────────────────────────────────────────────────────────────
+_TICKER_TEMPLATE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/>
+<title>{{ symbol }} · Paper Trader</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+ :root{color-scheme:dark}
+ *{box-sizing:border-box;margin:0;padding:0}
+ body{background:#0c0d0f;color:#e8eaed;font:14px/1.5 "Outfit",system-ui,sans-serif;padding:20px;max-width:1080px;margin:0 auto}
+ h1{font:700 26px/1.1 "Syne",sans-serif;letter-spacing:-.5px}
+ h2{font:600 13px/1 "Syne",sans-serif;text-transform:uppercase;letter-spacing:1.5px;color:#7d828c;margin:26px 0 10px}
+ a{color:#00d4ff;text-decoration:none}a:hover{text-decoration:underline}
+ .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
+ input{background:#0e1012;border:1px solid rgba(255,255,255,.13);color:#e8eaed;padding:8px 12px;border-radius:7px;font:500 14px "DM Mono",monospace;width:130px;text-transform:uppercase}
+ button{background:#00d4ff;color:#04222b;border:0;padding:8px 16px;border-radius:7px;font:600 13px "Outfit";cursor:pointer}
+ .card{background:#111316;border:1px solid rgba(255,255,255,.07);border-radius:12px;padding:16px 18px;margin-bottom:14px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+ .kpi .v{font:600 22px "DM Mono",monospace}.kpi .l{font-size:11px;color:#7d828c;text-transform:uppercase;letter-spacing:1px}
+ .pos{color:#00ff9f}.neg{color:#ff3c4c}.muted{color:#7d828c}
+ table{width:100%;border-collapse:collapse;font:13px "DM Mono",monospace}
+ th{text-align:left;color:#7d828c;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.1)}
+ td{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.05);vertical-align:top}
+ .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;background:#17191d}
+ .err{color:#ff3c4c;padding:30px;text-align:center}
+ .news h4{font:600 14px "Outfit";margin-bottom:2px}.news .meta{font-size:11px;color:#7d828c;margin-bottom:10px}
+ .reason{color:#b9bdc6;font-size:12px;margin-top:3px;white-space:pre-wrap}
+</style></head><body>
+<div class="bar">
+ <h1 id="sym">…</h1>
+ <span style="flex:1"></span>
+ <input id="q" placeholder="TICKER" autocomplete="off"/>
+ <button onclick="go()">Open</button>
+ <a href="{{ api_prefix }}/" style="margin-left:8px">← dashboard</a>
+</div>
+<div id="root"><div class="muted">loading…</div></div>
+<script>
+const API_PREFIX={{ api_prefix|tojson }}, SYMBOL={{ symbol|tojson }};
+function go(){const v=document.getElementById('q').value.trim().toUpperCase();if(v)location.href=API_PREFIX+'/ticker/'+encodeURIComponent(v);}
+document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')go();});
+const fmtUsd=n=>(n==null?'—':(n<0?'-$':'$')+Math.abs(n).toFixed(2));
+const cls=n=>n==null?'muted':(n>0?'pos':(n<0?'neg':''));
+const esc=s=>(s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+async function load(){
+ document.getElementById('sym').textContent=SYMBOL;
+ let d;try{const r=await fetch(API_PREFIX+'/api/ticker/'+encodeURIComponent(SYMBOL));d=await r.json();}
+ catch(e){document.getElementById('root').innerHTML='<div class="err">failed to load</div>';return;}
+ if(d.error){document.getElementById('root').innerHTML='<div class="err">'+esc(d.error)+'</div>';return;}
+ const R=d.realized||{}, P=d.position, NW=(d.news||{}), S=NW.sentiment||{};
+ let h='';
+ if(!d.has_coverage){h+='<div class="card muted">No position, trades, decisions or live news on file for '+esc(d.symbol)+'.</div>';}
+ if(P){let lg=P.legs.map(l=>'<tr><td>'+esc(l.type)+(l.strike?(' '+l.strike+(l.expiry?(' '+esc(l.expiry)):'')):'')+'</td><td>'+l.qty+'</td><td>'+fmtUsd(l.avg_cost)+'</td><td>'+fmtUsd(l.current_price)+'</td><td class="'+cls(l.unrealized_pl)+'">'+fmtUsd(l.unrealized_pl)+'</td></tr>').join('');
+  h+='<div class="card"><h2 style="margin-top:0">Open position</h2><table><tr><th>type</th><th>qty</th><th>avg cost</th><th>mark</th><th>unreal P/L</th></tr>'+lg+'</table><div style="margin-top:8px">Total unrealized: <span class="'+cls(P.unrealized_pl_total)+'">'+fmtUsd(P.unrealized_pl_total)+'</span></div></div>';}
+ else if(d.has_coverage){h+='<div class="card muted">Not currently held.</div>';}
+ h+='<h2>Realized (this name)</h2><div class="card grid">'
+  +'<div class="kpi"><div class="v">'+(R.n_round_trips||0)+'</div><div class="l">round-trips</div></div>'
+  +'<div class="kpi"><div class="v '+cls(R.total_pnl_usd)+'">'+fmtUsd(R.total_pnl_usd)+'</div><div class="l">total P/L</div></div>'
+  +'<div class="kpi"><div class="v">'+(R.win_rate_pct==null?'—':R.win_rate_pct+'%')+'</div><div class="l">win rate</div></div>'
+  +'<div class="kpi"><div class="v">'+(R.avg_hold_days==null?'—':R.avg_hold_days+'d')+'</div><div class="l">avg hold</div></div></div>';
+ if((d.round_trips||[]).length){h+='<h2>Round-trips</h2><div class="card"><table><tr><th>entry</th><th>exit</th><th>qty</th><th>P/L $</th><th>P/L %</th><th>days</th></tr>'
+  +d.round_trips.map(rt=>'<tr><td>'+esc((rt.entry_ts||'').slice(0,10))+'</td><td>'+esc((rt.exit_ts||'').slice(0,10))+'</td><td>'+(rt.qty??'')+'</td><td class="'+cls(rt.pnl_usd)+'">'+fmtUsd(rt.pnl_usd)+'</td><td class="'+cls(rt.pnl_pct)+'">'+(rt.pnl_pct==null?'—':rt.pnl_pct.toFixed(1)+'%')+'</td><td>'+(rt.hold_days==null?'—':rt.hold_days)+'</td></tr>').join('')+'</table></div>';}
+ if((d.decisions||[]).length){h+='<h2>Opus decision trail</h2>'+d.decisions.map(x=>'<div class="card"><span class="pill">'+esc(x.verb)+'</span> <span class="muted">'+esc((x.timestamp||'').slice(0,16).replace("T"," "))+'</span><div class="reason">'+esc(x.reasoning)+'</div></div>').join('');}
+ h+='<h2>Live news — '+(S.n||0)+' mentions · avg '+(S.avg_score||0).toFixed(1)+' · '+(S.urgent||0)+' urgent</h2>';
+ if((NW.articles||[]).length){h+='<div class="card news">'+NW.articles.map(a=>'<div style="margin-bottom:14px"><h4>'+(a.url?'<a href="'+esc(a.url)+'" target="_blank" rel="noopener">'+esc(a.title)+'</a>':esc(a.title))+'</h4><div class="meta">'+esc(a.source)+' · ai '+(a.ai_score==null?'—':a.ai_score.toFixed(1))+' · '+esc((a.first_seen||'').slice(0,16).replace("T"," "))+'</div><div class="reason">'+esc(a.summary)+'</div></div>').join('')+'</div>';}
+ else{h+='<div class="card muted">No live articles mention '+esc(d.symbol)+' in the last 24h.</div>';}
+ h+='<div class="muted" style="margin:18px 0;font-size:11px">generated '+esc(d.generated_at)+'</div>';
+ document.getElementById('root').innerHTML=h;
+}
+load();
+</script></body></html>"""
+
+
+@app.route("/ticker/<sym>")
+def ticker_page(sym):
+    """Standalone per-ticker drill-down page (self-contained; consumes
+    /api/ticker/<sym> client-side). Kept off the SPA TEMPLATE on purpose."""
+    return render_template_string(_TICKER_TEMPLATE,
+                                  symbol=(sym or "").upper().strip(),
+                                  api_prefix=_api_prefix())
+
+
+@app.route("/api/ticker/<sym>")
+def ticker_api(sym):
+    """Cross-system dossier for one name: live lot + marks, closed round-trip
+    P&L (this name only), the Opus decision trail that touched it, and the
+    live news flow + sentiment.
+
+    Intentionally NOT @swr_cached: that decorator keys on the query string
+    only (`name + "?" + qs`), so a <sym> *path* param would collide across
+    tickers and serve MU's dossier for NVDA. This endpoint is also lighter
+    than the un-cached `/api/portfolio` peer — only stored marks + two
+    read-only sqlite reads the `signals` layer already self-degrades on, no
+    yfinance and no HTTP — so the hot path stays bounded without SWR."""
+    try:
+        from .analytics.ticker_dossier import build_ticker_dossier
+        from . import signals as _sig
+        store = get_store()
+        symu = (sym or "").upper().strip()
+        positions = store.open_positions()
+        trades = store.recent_trades(500)
+        decisions = store.recent_decisions(120)
+        sigs = _sig.get_top_signals(n=80, hours=24, min_score=0.0)
+        sentiment = _sig.get_ticker_sentiment(symu, hours=24)
+        out = build_ticker_dossier(
+            symu, positions=positions, trades=trades, decisions=decisions,
+            signals_list=sigs, sentiment=sentiment,
+            parse_action_ticker=_parse_action_ticker)
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e), "symbol": (sym or "").upper().strip()}), 500
+
+
+@app.route("/api/watchlist-opportunities")
+@swr_cached("watchlist-opportunities", 60.0)
+def watchlist_opportunities_api():
+    """Watchlist names with live news heat that the book has NO position in —
+    the missed-opportunity radar (orthogonal to every position-centric panel).
+    One signals fetch; the pure SSOT tallies per ticker (no N-query fan-out)."""
+    try:
+        from .analytics.watchlist_opportunities import build_watchlist_opportunities
+        from .strategy import WATCHLIST as _WATCHLIST
+        from . import signals as _sig
+        store = get_store()
+        held = {str(p.get("ticker") or "").upper()
+                for p in store.open_positions() if (p.get("qty") or 0) > 0}
+        sigs = _sig.get_top_signals(n=300, hours=24, min_score=0.0)
+        out = build_watchlist_opportunities(_WATCHLIST, held, sigs)
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e), "opportunities": []}), 500
+
+
 @app.route("/api/state")
 @swr_cached("state", 15.0)
 def state():
