@@ -575,8 +575,8 @@ TEMPLATE = r"""
     }
     th.sortable-h { cursor: pointer; user-select: none; }
     th.sortable-h:hover { color: var(--text); }
-    th.sortable-h.sort-asc::after  { content: " ▲"; font-size: 9px; }
-    th.sortable-h.sort-desc::after { content: " ▼"; font-size: 9px; }
+    th.sortable-h.sort-asc::after  { content: " ▲"; font-size: 11px; }
+    th.sortable-h.sort-desc::after { content: " ▼"; font-size: 11px; }
     select, input[type="text"], input[type="number"] {
       background: var(--bg-input); color: var(--text);
       border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
@@ -5610,8 +5610,12 @@ def backtest_curves_api():
         ids = [int(x.strip()) for x in raw_ids.split(",") if x.strip().isdigit()]
         if not ids:
             return jsonify({"error": "missing run_ids"}), 400
-        if len(ids) > 100:
-            return jsonify({"error": "max 100 run_ids per request"}), 400
+        # Degrade gracefully instead of 400-ing the whole request: a stale
+        # client (cached pre-chunking JS) still gets a usable chart rather
+        # than an empty one. run_curves() batches the DB query internally,
+        # so large id lists are safe; we only clamp absurd payloads.
+        if len(ids) > 1000:
+            ids = ids[:1000]
         from .backtest import BacktestStore
         store = BacktestStore()
         curves = store.run_curves(ids)
@@ -5682,6 +5686,69 @@ def backtest_leaderboard_api():
                 }
                 for r in top
             ],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/backtests/stats")
+@swr_cached("backtests-stats", 30.0)
+def backtest_stats_api():
+    """Aggregate distribution across all completed backtest runs.
+
+    Gives a quant a one-glance read on whether the strategy has a real edge:
+    how many runs completed, the central tendency of return / vs-SPY, and
+    the share of runs that actually beat SPY.
+
+    Query: ?min_trades=N   (default 1 — excludes runs that never traded)
+    """
+    def _stats(vals: list[float]) -> dict:
+        vals = sorted(v for v in vals if v is not None)
+        n = len(vals)
+        if n == 0:
+            return {"n": 0, "mean": None, "median": None,
+                    "min": None, "max": None}
+        mid = n // 2
+        median = vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+        return {
+            "n": n,
+            "mean": round(sum(vals) / n, 3),
+            "median": round(median, 3),
+            "min": round(vals[0], 3),
+            "max": round(vals[-1], 3),
+        }
+
+    try:
+        try:
+            min_trades = max(0, int(request.args.get("min_trades", 1)))
+        except ValueError:
+            min_trades = 1
+
+        from .backtest import BacktestStore
+        store = BacktestStore()
+        runs = store.all_runs(include_curves=False)
+        completed = [
+            r for r in runs
+            if r.get("status") == "complete"
+            and (r.get("n_trades") or 0) >= min_trades
+        ]
+        vs_spy = [r.get("vs_spy_pct") for r in completed
+                  if r.get("vs_spy_pct") is not None]
+        beat_spy = sum(1 for v in vs_spy if v > 0)
+        return jsonify({
+            "min_trades": min_trades,
+            "total_runs": len(runs),
+            "completed_runs": len(completed),
+            "beat_spy_count": beat_spy,
+            "beat_spy_rate": round(beat_spy / len(vs_spy), 4) if vs_spy else None,
+            "vs_spy_pct": _stats(vs_spy),
+            "total_return_pct": _stats(
+                [r.get("total_return_pct") for r in completed]),
+            "annualized_return_pct": _stats(
+                [r.get("annualized_return_pct") for r in completed]),
+            "n_trades": _stats(
+                [float(r["n_trades"]) for r in completed
+                 if r.get("n_trades") is not None]),
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -7042,6 +7109,27 @@ def drawdown_api():
         eq = store.equity_curve(limit=2000)
         positions = store.open_positions()
         return jsonify(compute_drawdown(eq, positions))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/benchmark")
+def benchmark_api():
+    """Whole-account return vs an equal-capital S&P 500 buy-and-hold since
+    inception — the "is this bot worth running vs just buying the index?" KPI.
+
+    Distinct from ``/api/open-attribution`` (per-open-lot since entry) and
+    ``/api/analytics`` ``sp500_beta`` (a regression, ``null`` for days): this
+    is the full account (cash + open + every realised round-trip + unrealised
+    mark) since the first equity write vs the same starting capital invested
+    once in the index. Pure & DB-only — the network lives nowhere here
+    (``drawdown.py`` builder/endpoint split); ``starting_equity`` is
+    the module ``INITIAL_CASH`` (invariant #12, never a literal 1000)."""
+    try:
+        from .analytics.benchmark import build_benchmark
+        store = get_store()
+        eq = store.equity_curve(limit=5000)
+        return jsonify(build_benchmark(eq, starting_equity=INITIAL_CASH))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

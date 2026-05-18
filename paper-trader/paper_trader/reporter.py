@@ -275,6 +275,37 @@ def _session_block(store, window_hours: float, label: str) -> str:
         return ""
 
 
+def _benchmark_line(store) -> str:
+    """One-line "am I beating the index?" for the hourly / daily report.
+
+    The dashboard has ``/api/benchmark`` but the operator lives in Discord;
+    this answers the *first* question every trader asks of an automated
+    strategy — "would I have more money if I'd just bought the S&P and done
+    nothing?" — without opening the (often slow/stale) dashboard. Composes
+    ``build_benchmark`` **verbatim** (single source of truth, AGENTS.md
+    invariant #10 — the headline string is the builder's, never re-derived
+    here, so the Discord line, ``/api/benchmark`` and the CLI can never
+    drift). Observational only, no caps (invariants #2/#12; the
+    ``_session_block`` / ``_behavioural_block`` precedent). Failure contract
+    mirrors the rest of ``reporter``: any store/compute fault degrades to
+    ``""`` ("no benchmark line this report"), **never** an exception ("no
+    Discord summary this report"). ``NO_DATA`` is suppressed (a zero-history
+    book has nothing to say yet — the ``_behavioural_block`` NO_DATA
+    precedent)."""
+    try:
+        from .analytics.benchmark import build_benchmark
+        b = build_benchmark(store.equity_curve(limit=5000),
+                             starting_equity=_INITIAL_EQUITY)
+        if b.get("state") == "NO_DATA":
+            return ""
+        tag = b.get("verdict") or b.get("state")
+        return ("**BENCHMARK** ◈ vs S&P 500 buy-and-hold\n"
+                f"`{tag}`  {b['headline']}")
+    except Exception as e:
+        print(f"[reporter] benchmark line skipped: {e}")
+        return ""
+
+
 def _realized_pl_today(trades_newest_first: list[dict], today: str
                        ) -> tuple[float, int, int] | None:
     """True realized P/L from round-trips that *closed* today (UTC).
@@ -377,6 +408,9 @@ def send_hourly_summary() -> bool:
     sx = _session_block(store, 1.0, "1h")
     if sx:
         body += "\n" + sx
+    mx = _benchmark_line(store)
+    if mx:
+        body += "\n" + mx
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx
@@ -435,6 +469,9 @@ def send_daily_close() -> bool:
     sx = _session_block(store, 24.0, "24h")
     if sx:
         body += "\n" + sx
+    mx = _benchmark_line(store)
+    if mx:
+        body += "\n" + mx
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx

@@ -500,6 +500,7 @@ Digital Intern dashboard on `:8080` can cross-fetch.
 | `GET /api/position-thesis` | Per-position cards combining scorer + technicals + news + last decision. Each card carries `off_distribution` + `raw_pred_5d_return_pct` so the unified conviction board can decay its ML axis off the explicit flag (not a re-derived magnitude heuristic) |
 | `GET /api/calibration` | Confidence-bucket win rate + signal-source attribution |
 | `GET /api/drawdown` | Drawdown anatomy: peak/trough, time-in-DD, per-position contribution |
+| `GET /api/benchmark` | **"Is this bot worth running vs just buying the index?"** — the trader's *first* question, with no home until now. Whole-account return (cash + open + every realised round-trip + unrealised mark) since the first equity write vs the **identical starting capital invested once in the S&P 500 at that same instant and held untouched**. The figure is the `^GSPC` *index level* recorded on every `equity_curve` write from cycle one (~7400 — **not** the SPY ETF; the module says "S&P 500" everywhere, never "SPY", so a 7400 mark is never mislabelled $620). **Distinct from its neighbours — do not "consolidate" (invariant #10):** `/api/open-attribution` is per-**open**-lot alpha *since each lot's entry* (blind to realised P&L / cash drag, resets per re-opened lot, invariant #8); `/api/analytics` `sp500_beta` is a *statistical regression* needing many daily points (`null` on the live book). This is the full-account dollar answer, defined from cycle 1, no regression, no per-lot windowing. Outputs `port_return_pct`/`sp500_return_pct`/`alpha_pp`, `sp500_equivalent_usd`, `usd_vs_sp500`, `pct_cycles_ahead`, running best-lead/worst-lag extremes + a down-sampled (≤200, last point always pinned — strictly bounded, unlike `drawdown.py`'s `+[hist[-1]]` which can overshoot to 201) cumulative-alpha `history`. Sample-size honest like `news_edge`/`trade_asymmetry`: `NO_DATA` (no row with both a value and an S&P mark) → `INSUFFICIENT` (< `_MIN_SPAN_HOURS`=24h **or** < `_MIN_POINTS`=12 benchmarkable points — numerics emitted, **verdict withheld**) → `OK` with verdict `BEATING`/`LAGGING`/`TRACKING` (`\|alpha\|` ≤ `_TRACK_BAND_PP`=0.5pp → TRACKING). The inception anchor is the **first row carrying both a value and an S&P mark** (yfinance cold-start robustness), not blindly `equity_curve[0]`. `headline` is the single source of truth the endpoint, the **`python -m paper_trader.analytics.benchmark [--json]` CLI** (the `desk_pulse`/`signals --check-freshness` precedent — answers from a terminal when `:8090` is wedged/slow; verified live while `/api/state` was timing out) and the Discord line all render verbatim so they can never drift. Endpoint passes the module `INITIAL_CASH` (invariant #12, never a literal 1000). Advisory only — never gates Opus, adds no caps, **not** injected into the decision prompt (invariants #2/#12; the `desk_pulse`/`self_review` observational precedent). Pure core: `analytics/benchmark.py::build_benchmark` (never raises — a malformed row degrades, the contract is "no benchmark this cycle", never an exception). Locked by `tests/test_benchmark.py` (hand-computed BEATING/LAGGING/TRACKING + the **real 2026-05-17 live-book shape** `^GSPC 7444.88→7409.18`, $1000→$972.69 → `−2.25pp / −$22.52` arithmetic lock; NO_DATA/INSUFFICIENT honesty; first-usable-anchor robustness; invariant #12 init=2000 lock; never-raises-on-garbage; history strictly ≤200; reporter line composes the headline verbatim & a builder fault drops only its line while the hourly summary still sends; endpoint e2e via the Flask test client cross-checked equal to the builder on the same store). **Reporter:** `reporter._benchmark_line` appends a `**BENCHMARK** ◈ vs S&P 500 buy-and-hold` block to the hourly + daily-close summaries (composed verbatim, `NO_DATA` suppressed, same "no block, never no summary" failure contract as `_session_block`/`_behavioural_block`). Applies on next paper-trader restart (the documented pattern for every recent feature) |
 | `GET /api/earnings-risk` | Upcoming earnings ⨯ held positions / watchlist, tiered |
 | `GET /api/scorer-confidence` | Empirical residual bands + directional hit-rate for DecisionScorer |
 | `GET /api/decision-health` | Action mix, NO_DECISION parse-failure rate, confidence trend |
@@ -897,6 +898,9 @@ cd /home/zeph/paper-trader && python3 -m pytest tests/test_calibration.py -v
 
 # Per-persona strategy-quality leaderboard (exact-value verdict locks)
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_persona_leaderboard_20260517.py -v
+
+# Per-persona decision-signal-skill diagnostic (exact-value verdict locks)
+cd /home/zeph/paper-trader && python3 -m pytest tests/test_persona_skill.py -v
 
 # A single class
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_decision_scorer.py::TestTrainScorer -v
@@ -1579,6 +1583,106 @@ findings.
   dispersion, not alpha, exactly as documented. Continuous loop is on
   stale code (predates this session's commits) — both shipped changes are
   inert until `run_continuous_backtests.py` restart.
+
+### 2026-05-17 review pass #6 (ML+backtest hybrid · per-persona decision-signal skill · live findings)
+
+- **Feature shipped: per-persona decision-signal-skill diagnostic.**
+  `paper_trader/ml/persona_leaderboard.py` answers persona quality at the
+  *run-return* level — but AGENTS.md is emphatic that the per-run number is
+  leveraged-beta luck, not skill. There was **no decision-level**
+  per-persona view: does a persona's own signal (`ml_score`) actually
+  rank-predict the realized 5d outcome it acted on, or is its return pure
+  beta noise? `paper_trader/ml/persona_skill.py` answers exactly that.
+  For each persona (run_id→persona via the single-source-of-truth
+  `backtest.persona_for`) it computes `score_ic` = tie-aware
+  Spearman(action-aligned `ml_score`, action-aligned `forward_return_5d`),
+  reusing `calibration._spearman` (single source of truth — cannot drift
+  from the in-sample calibration metric; tie-awareness load-bearing because
+  reasoning-parsed `ml_score` ties heavily at the persona buy threshold).
+  The SELL convention is the codebase-universal target sign-flip applied
+  **symmetrically** to the signal too, so "higher signal ⇒ higher realized
+  goodness" is monotone across BUY/SELL. Verdicts per persona:
+  `INSUFFICIENT` / `NO_SIGNAL_EDGE` / `WEAK_SIGNAL_EDGE` / `SIGNAL_EDGE` /
+  `INVERTED_SIGNAL`; overall `INSUFFICIENT_DATA` / `NO_PERSONA_EDGE` /
+  `HAS_INVERTED_PERSONA` / `HEALTHY`. Same discipline as
+  `ml/calibration.py` / `ml/skill_trend.py` / `ml/persona_leaderboard.py`:
+  read-only, no train / pickle / `build_features` / `N_FEATURES` / trade
+  touch, never raises; it does **not** prune `PERSONAS` or re-tune
+  `_PERSONA_BOOSTS` (a strategy-dynamics decision it only *informs*). CLI
+  exits 2 if any persona is `INVERTED_SIGNAL` (operator/cron branchable,
+  like `persona_leaderboard._cli`).
+  ```bash
+  cd /home/zeph/paper-trader && python3 -m paper_trader.ml.persona_skill
+  cd /home/zeph/paper-trader && python3 -m pytest tests/test_persona_skill.py -v
+  ```
+  16 exact-value verdict/arithmetic locks in `tests/test_persona_skill.py`.
+
+- **Quant finding (live, actionable): 4 of 8 personas have no decision-
+  signal edge.** Run against the live `decision_outcomes.jsonl` (6782
+  aligned outcomes): GARP `score_ic +0.24` and Value Investor `+0.15`
+  carry real `SIGNAL_EDGE`; Sector Rotator (n=1470) `+0.11` and ESG
+  (n=2158) `+0.08` are only `WEAK_SIGNAL_EDGE`; **Small/Mid Cap (n=1372)
+  `-0.01`, Contrarian `-0.05`, Momentum `-0.06`, Global Macro `-0.09` are
+  `NO_SIGNAL_EDGE`** — i.e. the two highest-*volume* personas have weak
+  edge and four personas' returns are pure leveraged-beta dispersion, not
+  signal skill (overall verdict `HEALTHY` only because ≥1 persona has edge
+  and none is inverted). This is the decision-level confirmation of the
+  repeatedly-documented "read `vs_spy_pct` skeptically" thesis. Reported,
+  **not actioned** — pruning/re-tuning `_PERSONA_BOOSTS` is a
+  strategy-dynamics decision out of surgical scope (CLAUDE.md §6).
+
+- **Bug audit: bugs_fixed = 0, no Phase-1 commit.** `decision_scorer.py`,
+  `backtest.py`, `run_continuous_backtests.py` re-audited (math:
+  `_rsi`/`_macd`/`_ema` offsets, MACD signal alignment, BB/momentum
+  windows; `train_scorer` dedup/sign-flip/oversampling; outcome
+  parsing/regex; locking; atomic writes). No new safe surgical bug found
+  after five prior passes — per the commit guard, none fabricated.
+
+- **Quant finding (live, reported — not a surgical fix): `_llm_annotate_
+  outcomes` has NEVER worked in production.** `continuous.log` shows
+  `[continuous] LLM annotation failed: "Could not resolve authentication
+  method…"` on **20/20** cycles, paired with `LLM labels: 0 endorsed, 0
+  condemned`. Root cause: the function constructs `anthropic.Anthropic()`
+  (needs `ANTHROPIC_API_KEY`, unset — the box authenticates the `claude`
+  CLI via a user session, not an SDK key), while **every other LLM call in
+  the codebase** (`_opus_annotate` 100 lines below, `backtest._claude_call`)
+  uses `subprocess.run(["claude","--model",…,"--print","--permission-mode",
+  "bypassPermissions"])` which works. Consequence: `llm_quality_label` is
+  `0` on **all 6782** rows of `decision_outcomes.jsonl` — the documented
+  3×-endorse / 0.1×-condemn `train_scorer` sample-weighting
+  (AGENTS.md "Common pitfalls") has applied **zero** times in this
+  dataset's history; the feature is dead. **Recommended fix (operator
+  decision, deliberately NOT actioned here):** port `_llm_annotate_
+  outcomes` to the proven `subprocess claude --print` transport like
+  `_opus_annotate`. It is left as a finding because enabling a dormant
+  3×/0.1× reweight on the live unattended scorer is a training-dynamics
+  change — it would create a mixed-regime training set (6782 historic
+  label-0 rows + newly-labeled rows) and warrants a deliberate decision +
+  pickle reset, exactly the "report, don't action model dynamics in a
+  surgical pass" discipline this file applies to the trainer-timeout and
+  negative-OOS-skill findings.
+
+- **Quant finding (reconfirmed live): scorer gates real conviction on a
+  near-zero-edge signal.** `skill_trend` = `BORDERLINE` (recent median
+  `oos_rmse` 10.96 vs fresh mean-predictor baseline 10.18; `oos_ic` ≈
+  0.02, `oos_dir_acc` ≈ 0.51 — a coin flip), yet `gate_active=1.0` across
+  all 7 ledger cycles (`n_train` 2972–3852 ≥ 500). In-sample calibration
+  `DIRECTIONAL_BUT_BIASED` (spearman 0.38, monotone, decile error 3.0pp):
+  the tails massively over-predict — d1 pred −18.3 vs realized −7.8, d10
+  pred +14.9 vs +8.4 (~2× magnitude inflation, the documented
+  extrapolation the `off_distribution` gate-abstention guards). Reported,
+  not actioned (model-dynamics, out of surgical scope).
+
+- **Live health.** backtest.db: 480 complete / 15 failed (all
+  `[reaped: orphaned running row]` — per-cycle reaper works) / 10 running.
+  0 NaN/null finals, 0 `benchmark_unavailable`-flagged. 7 scorer-skill
+  ledger cycles all `status=ok`. Runs 6166–6170 stuck `running` ~4h
+  (orphaned by a loop restart; **within** the 6h reap guard, will be
+  reaped — not a new bug). External-only noise in `continuous.log`: GDELT
+  `ConnectTimeout`/`ConnectionReset` (handled w/ backoff), SEC EDGAR HTTP
+  500s, `GOOGU` yfinance 404 (`prices[t]={}`) — all graceful. Both shipped
+  changes are inert until `run_continuous_backtests.py` restart (the
+  documented restart-required pattern).
 
 ### When to bump model versions
 
