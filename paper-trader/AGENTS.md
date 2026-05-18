@@ -1260,6 +1260,87 @@ modulates identically; reasoning surfaces the skip; independent of the
   > historical windows; until then they are removable at zero skill cost.
   > **Reported observation, not a model change.**
 
+### Per-persona Sortino + Calmar (2026-05-18)
+
+- **`persona_leaderboard._equity_risk` now also returns `sortino` and
+  `calmar`** (commit `35735d9`). The module already computed a per-persona
+  median **Sharpe**, max drawdown, and %-time-underwater off
+  `equity_curve_json` — but Sharpe divides excess return by *total*
+  volatility, so it penalises a persona for the large **upside** variance
+  leveraged ETFs are bought for. That is precisely the wrong risk lens for
+  this book: AGENTS.md repeatedly warns that "a single persona routinely
+  posts +1000% … leveraged-beta dispersion through a cherry-able bull
+  window, **not** repeatable alpha". Sharpe alone cannot tell a smooth
+  leveraged compounder from a lucky volatile rip. The two metrics that can:
+  - **Sortino** — `mean(daily_ret) / downside_dev × √252`, where
+    `downside_dev` is the MAR=0 convention `sqrt(mean(min(r,0)²))` over
+    **all** observations (not the std of just the negative subset). Only
+    realised downside is penalised, so the leveraged right tail no longer
+    counts against a persona.
+  - **Calmar** — annualised return / worst peak→trough drawdown (the
+    unrounded `max_dd` fraction). Return-per-unit-of-worst-pain — the
+    metric a capital allocator actually cares about ("did +1000% earn its
+    70% drawdown, or just ride a bull window?").
+  Both share Sharpe's 252-day annualisation base and its
+  degenerate-→-`None` discipline: no measurable downside ⇒ Sortino `None`
+  (parallel to the zero-std Sharpe `None`); no drawdown / non-positive
+  start / total wipe-out (`growth ≤ 0`) ⇒ Calmar `None` — an "infinite"
+  ratio must never silently dominate the per-persona median.
+  `persona_leaderboard` surfaces `median_sortino` / `median_calmar` per
+  persona; the CLI gains both columns. **Read-only and additive** — no
+  train, no `decision_scorer.pkl` / `decision_outcomes.jsonl` /
+  `build_features` / trade-path touch; the DRAG/FLAT/EDGE verdict logic is
+  **byte-identical** (Sortino/Calmar are informational like
+  `sharpe`/`mdd`/`uw`, never verdict inputs — so every existing
+  exact-value verdict lock is unchanged). Exact-value locked by
+  `tests/test_persona_leaderboard_20260517.py::TestSortinoCalmar`
+  (Sortino == 0.0 on a mean-zero curve; Sortino < 0 choppy-down;
+  Sortino/Calmar `None` on no-downside / no-drawdown; **Calmar == 1.0
+  exactly** on a constructed 20%-dd→recover 252-step curve where
+  years = 252/252 = 1.0; Calmar sign tracks net P&L; Calmar `None` on a
+  non-positive start; per-persona median aggregation incl. missing-curve
+  robustness). The garbage-input exact-dict lock was strengthened to all
+  five metrics.
+
+  > **Quant finding (2026-05-18, this pass — decisive operational
+  > state).** The running continuous loop is on **stale code**: (a)
+  > `data/baseline_skill_log.jsonl` does **not exist** on disk although
+  > `_append_baseline_skill_log` is wired unconditionally into `main()`
+  > (run_continuous_backtests.py:1904) and writes correctly when invoked
+  > manually; (b) **0 / 2000** recent `decision_outcomes.jsonl` rows carry
+  > `forward_return_10d` or `gate_scorer_pred` despite commits `ccc4d31`
+  > (multi-horizon capture) and `60b20d9` (gate-decision capture). So the
+  > multi-horizon capture, the gate-decision capture, the trivial-baseline
+  > ledger, **and** the regularised-MLP commit `5a0af2d` are all inert
+  > until the operator restarts `run_continuous_backtests.py`. This is the
+  > documented stale-process pattern, **not a code bug** — but a quant
+  > relying on `baseline_trend` / `horizon_audit` / `gate_realized` should
+  > know those instruments are not accumulating live data yet.
+  >
+  > The OOS picture is unchanged and consistent across every live arbiter
+  > (deployed pickle `n_train=3997`, 1507-row temporal-OOS slice):
+  > `baseline_compare` = **`MLP_NO_BETTER_THAN_TRIVIAL`** (MLP rank_ic
+  > +0.060 vs one-line `mom20` +0.082, gap −0.023; raw `ml_score` alone
+  > +0.0525 / dir_acc 0.54); `overfit_gap` = **`MILD_OVERFIT`** with
+  > **trend=DEGRADING** (recent median oos/val ratio **1.38**, older 1.18,
+  > overall 1.21, 18/18 cycles `gate_active=1.0`) — a *sharper* statement
+  > than prior passes' STABLE ~1.28; `scorer_skill_log` `oos_ic` ≈
+  > 0.02–0.08, `oos_dir_acc` ≈ 0.47–0.56 (coin-flip). The conviction gate
+  > (invariant #5) sizes real position variance on this every cycle.
+  > **Reported observation, not a model change** (CLAUDE.md §6 scope).
+  >
+  > **Operational note.** `python3 -m paper_trader.ml.persona_leaderboard`
+  > (and any full `_load_runs` read of `backtest.db`) is effectively
+  > unusable against the *live* writer: `backtest.db` is symlinked to a
+  > slow external mount and `_load_runs` eagerly JSON-parses every
+  > `complete` run's full multi-year `equity_curve_json` under the
+  > continuous loop's WAL write contention — even a bounded
+  > `ORDER BY run_id DESC LIMIT 12` read timed out at 60 s. This is a
+  > **pre-existing** scalability characteristic, NOT introduced by the
+  > Sortino/Calmar change (both are O(n) over the already-parsed `vals`).
+  > Correctness is proven by the 26 exact-value unit tests; run the
+  > leaderboard off a `backtest.db` snapshot, not against the live loop.
+
 ### Tests (ML + backtest section)
 
 ```bash
@@ -1288,7 +1369,8 @@ cd /home/zeph/paper-trader && python3 -m paper_trader.ml.calibration --oos
 # Training-integrity (only FILLED trades train scorer/ArticleNet)
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_continuous.py::TestFilledOnlyTrainingIntegrity -v
 
-# Per-persona strategy-quality leaderboard (exact-value verdict locks)
+# Per-persona strategy-quality leaderboard (exact-value verdict locks;
+# incl. TestSortinoCalmar — the 2026-05-18 Sortino/Calmar risk-metric add)
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_persona_leaderboard_20260517.py -v
 
 # Per-persona decision-signal-skill diagnostic (exact-value verdict locks)
