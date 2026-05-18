@@ -345,6 +345,62 @@ def _trim_winner_jsonl(keep: int = WINNER_JSONL_KEEP) -> int:
         return 0
 
 
+def _parse_gate_decision(reasoning: str | None) -> tuple[float | None, bool | None]:
+    """Extract the conviction gate's **actual historical decision** from a
+    backtest decision's ``reasoning`` string.
+
+    ``backtest._ml_decide`` ends a BUY's reasoning with one of:
+
+      * `` scorer=±X.X%``                          — the *then-deployed*
+        pickle's predicted 5d return the gate actually modulated conviction on
+      * `` scorer=±X.X%(off-dist,gate-skipped)``   — the off-distribution
+        guard fired, so the gate **abstained** (conviction left untouched)
+      * *(nothing)*                                — the cycle's scorer was
+        untrained / ``n_train < 500``; no gate acted at all
+
+    SELL/HOLD reasoning never carries ``scorer=`` (the gate is BUY-only).
+
+    Returns ``(gate_scorer_pred, gate_off_dist)``:
+      * ``gate_scorer_pred`` — the float % the gate saw, or ``None`` when no
+        ``scorer=`` token was emitted (untrained / sub-gate cycle, or SELL)
+      * ``gate_off_dist``    — ``True`` if the off-distribution abstention
+        marker followed it, ``False`` if a real prediction was acted on,
+        ``None`` when there was no gate decision to characterize
+
+    Why this matters: every existing gate diagnostic (``gate_audit``,
+    ``gate_pnl``) must RE-PREDICT with **today's** deployed pickle on the
+    stored features — a counterfactual ("what would the current model say"),
+    provably **not** what the gate did at decision time with that cycle's own
+    model (``gate_pnl`` documents the resulting reconstruction residual is
+    explicitly *NOT in its verdict*). Capturing the true historical prediction
+    + abstention makes the gate's realized effect *measurable* rather than
+    reconstructed. Pure, total, never raises (a ledger/diagnostic-feeding
+    parser must not be able to break the cycle — the ``_parse_scorer_status``
+    discipline).
+    """
+    if not reasoning:
+        return None, None
+    try:
+        # `\bscorer=` (NOT `score=`) — the existing `ml_score` regex relies on
+        # `score=` not being a substring of `scorer=`; this is the dual side
+        # of that documented first-match disambiguation. The `:+.1f` format in
+        # `_ml_decide` always emits an explicit sign, so `[+-]?` + digits/dot
+        # captures `+5.2` / `-50.0` / `+0.0` exactly.
+        m = re.search(r"\bscorer=([+-]?[0-9.]+)%", reasoning)
+        if not m:
+            return None, None
+        try:
+            pred: float | None = float(m.group(1))
+        except (TypeError, ValueError):
+            pred = None
+        # The abstention marker only ever trails a `scorer=` token, so it is
+        # only meaningful once one was emitted.
+        off_dist = "(off-dist" in reasoning
+        return pred, off_dist
+    except Exception:
+        return None, None
+
+
 def _compute_decision_outcomes(engine: "BacktestEngine",
                                top_runs: list["BacktestRun"]) -> list[dict]:
     """Compute actual 5-trading-day forward returns for BUY/SELL decisions.
@@ -506,6 +562,16 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
                 news_urgency = None
                 news_article_count = None
 
+            # Additive gate-decision capture (read-only research signal,
+            # 2026-05-18 feature — the `forward_return_10d/20d` precedent).
+            # `train_scorer` reads ONLY `forward_return_5d`, so these keys are
+            # inert to training and to the gate/trade path. Records the gate's
+            # TRUE then-deployed prediction + off-distribution abstention so
+            # future analysis can measure its realized effect instead of
+            # re-predicting with today's pickle (the documented `gate_pnl`
+            # reconstruction residual). None on SELL / untrained-cycle rows.
+            gate_scorer_pred, gate_off_dist = _parse_gate_decision(reasoning)
+
             outcomes.append({
                 "run_id": run.run_id,
                 "sim_date": sim_date_str,
@@ -530,6 +596,12 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
                 # only one the scorer trains on and is unchanged.
                 "forward_return_10d": _fwd_ret_h(ticker, sim_d, idx, 10),
                 "forward_return_20d": _fwd_ret_h(ticker, sim_d, idx, 20),
+                # Additive — the gate's actual then-deployed decision (see the
+                # comment above + `_parse_gate_decision`). None when the
+                # cycle's scorer was untrained / sub-gate (no `scorer=` in
+                # reasoning) or on SELL (the gate modulates BUY only).
+                "gate_scorer_pred": gate_scorer_pred,
+                "gate_off_dist": gate_off_dist,
                 "return_pct": run.total_return_pct,
             })
 
