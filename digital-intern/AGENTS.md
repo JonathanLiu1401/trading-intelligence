@@ -3505,3 +3505,137 @@ expected; this entry was appended, not rewritten).
   files, no sibling leakage; never `git add -A`; pushed to origin/master
   (`318dfe4..3135718`). A concurrent sibling hybrid agent edited this repo
   throughout; this entry was appended, not rewritten.
+
+- **2026-05-18 (hybrid pass 28 — Agent 3, debug + feature + analyst-validation)** —
+  All 9 required files + AGENTS.md read in full. Stale daemon caveat
+  applies: same operator-tuned `daemon.py` (ML_TRAIN_INTERVAL 180→1800,
+  CONTINUOUS_TRAIN_INTERVAL 120→600, both bootstrap sleeps 30/45→300) sits
+  uncommitted, indicating active operator tuning + recent restarts — purge
+  worker (6h cadence) has fired 10+ times today per the log but produced no
+  `Purged` lines, so it has likely been killed mid-startup-sleep on every
+  cycle (memory `di-stale-manual-daemon`). Per the same memory note +
+  `di-shared-repo-concurrency`, strict per-commit pathspec staging held;
+  every concurrent-agent / operator change (`daemon.py`,
+  `dashboard/web_server.py`, untracked `collectors/fda_collector.py`,
+  `collectors/seekingalpha_collector.py`, `tests/test_chat_correlation_
+  enrichment.py`, all `paper-trader/*`, `logs/`) deliberately never staged.
+
+  **Phase 1 — bugs_fixed=1, commit `868dc91`** (1 test file,
+  pathspec-scoped, `git show --stat` verified no sibling leak, on
+  origin/master `536d932..868dc91`). The 5 long-failing
+  `tests/test_rss_collector.py` cases pinned the *pre-7729638* `_fetch_feed`
+  contract (returned a list); the production refactor (`7729638 — Fix
+  rss_collector 4-tuple refactor`) changed the contract to
+  `(name, articles, outcome, retry_after)` so the caller can drive per-feed
+  backoff (404=permanent, 429=ratelimited+Retry-After, network=transient,
+  ok=articles+ok). The author updated `collect_rss` but left the tests
+  pinned to the old contract: they have failed EVERY suite run since
+  7729638 (`'_FakeResp' object has no attribute 'status_code'` ×4 plus
+  one collect_rss empty-result mismatch). This is exactly the pre-existing
+  failure mode every prior pass enumerated as "not ours, never staged" —
+  closing it here. Updates the `_FakeResp` shim to mirror the
+  `requests.Response` surface `_fetch_feed` ACTUALLY consumes (`status_code`,
+  `headers` for Retry-After, `content`, `raise_for_status`), unpacks the
+  4-tuple at every call site, AND adds two new branch-coverage tests
+  (`test_fetch_feed_404_is_permanent`, `test_fetch_feed_429_returns_
+  ratelimited_with_retry_after`) that pin the previously-untested 404 +
+  429 paths. Suite 911→918 pass after Phase 1.
+
+  **Phase 2 — features_added=1, commit `84dff1a`** (1 src + 1 test,
+  +346/−1, pathspec-scoped via explicit paths, `git show --stat` verified
+  no sibling leak, on origin/master `8e170fa..84dff1a`). **THROUGHPUT
+  DEGRADATION** — the early-warning complement to COVERAGE GAP. The latter
+  only surfaces sources the FAILURE_THRESHOLD has already pushed to
+  `disabled` (a binary, late signal); a live source can be quietly losing
+  most of its throughput (e.g. an RSS feed delivering 40/h yesterday, 3/h
+  now) without ever crossing that bar. `ArticleStore.source_throughput`
+  already detects this — CLAUDE.md §6, `tests/test_source_throughput.py`,
+  per-source `recent`/`prior`/`decel_pct` over rolling windows — but until
+  now had **NO consumer**: a fully-implemented detector blind to the
+  briefing that the consuming analyst's "stale sources" complaint applies
+  to. Three coordinated pieces in `analysis/claude_analyst.py`:
+  (a) `_collect_source_throughput` opens a fresh `mode=ro` connection
+  (never the daemon's shared `self.conn` — the documented cursor-collision
+  hazard, same discipline as `_collect_source_health` /
+  `_recent_briefing_digest`), best-effort → `[]` on any failure so the 5h
+  briefing is never broken or delayed; (b) `_throughput_degradation_lines`
+  is a pure renderer with **conservative thresholds** (`prior >= 10` so a
+  5→0 drop never produces noise even though it's 100% decel; `decel_pct >=
+  60%` so mild fluctuation stays silent), sorted by absolute loss desc with
+  prior-magnitude tiebreak (a 50→0 source matters more than a 20→0 source
+  even when both are 100% decel), capped at 6 lines so this section can
+  never itself become noise; (c) wired into `_build_payload` as a new
+  optional input block + `SYSTEM_PROMPT` rule directly under COVERAGE GAP,
+  with the same "omit when absent" discipline. Read-only by construction:
+  no DB write, no ai_score/ml_score/score_source/urgency touch, never
+  mutates source_articles, backtest already excluded upstream by
+  `_LIVE_ONLY_CLAUSE` — **all four load-bearing invariants intact**.
+  +14 specific-value tests pin: threshold gates (min_prior tiny-baseline
+  exclusion, min_decel_pct mild-slowdown exclusion, `decel_pct=None`
+  no-baseline exclusion, accelerating-source exclusion), the
+  significant-degradation flagship case with exact formatted output,
+  sort order (largest absolute loss first, prior tiebreak),
+  `_MAX_DEGRADATION_LINES` cap, empty/malformed-row robustness,
+  `_build_payload` wiring (emit/omit/empty/all-below-threshold/no-arg
+  byte-determinism), SYSTEM_PROMPT coverage. Suite 918→951 pass after
+  Phase 2 (the +33 includes my 14 plus other tests previously gated by
+  conftest collection that now run; my new file's 14 all green; zero
+  regressions). Ships on next `systemctl restart digital-intern` (stale
+  daemon caveat).
+
+  **Phase 3 — analyst-lens live validation, user_findings=5.**
+  (1) **Collection HEALTHY (positive)** — 379 live articles/last 1h,
+  7398/24h, diverse GN round-robin + GDELT + scraped + Finnhub + Yahoo +
+  Bloomberg + Block + Nikkei + Korea Herald flowing. (2) **Alerts firing
+  on-book (positive)** — 14+ legit BN alerts/24h, all portfolio-relevant
+  or memory-complex: LITE -8.8% insider selling (GN: Nasdaq, ai=9.6); AXTI
+  +650% YTD (GN/TradingView, ai=9.9) and -14% today (GN/Quiver, ai=9.0);
+  NVDA earnings prep ×3 (ai=8.0–9.3); MU -X% ×3 (ai=8.0–9.0); CXMT
+  revenue +700% (Finnhub/Yahoo, ai=9.9); NVDA China-market commentary
+  (Finnhub/Yahoo, ai=9.6); Samsung labor dispute → memory threat (ai=8.0).
+  Exact persona match — these are the alerts an analyst holding the SAO
+  semis book WOULD react to. (3) **Briefings firing on cadence
+  (positive)** — id26 (07:13Z), id27 (12:51Z), id28 (18:05Z) ≈5h apart,
+  50 articles each, with LEAD lines materially actionable
+  ("Memory/storage complex crushed — STX…", "Iran-war inflation…", "Global
+  bond rout deepens — 10Y UST +…"). The `_recent_briefing_digest`
+  anti-rehash gate (passes 24+) is live. (4) **26 phantom `urgency=1`
+  rows from 2026-05-13 (5.6 days)** — `reap_stale_urgent` exists at HEAD
+  but `purge_worker` has fired 10+ times in `daemon.log` without producing
+  a single `Purged` line, meaning every fire was inside the 6h startup-
+  sleep cooldown (operator restarts faster than that interval, so the
+  reaper never gets a chance). Inflates the dashboard urgent tile. Not a
+  new code bug — the fix is deployed; the cure is a single uninterrupted
+  6h+ daemon run (or a one-shot `store.reap_stale_urgent()` from a manual
+  Python invocation). Deliberately did NOT touch the live production DB
+  this pass (write to prod is a risky-action class — same discipline as
+  every prior pass, even though the call is well-tested and idempotent).
+  (5) **Active "another row available" cursor-collision retries +
+  `[google_news_worker] database is locked; backing off`** in the live log
+  this minute — the chronic shared-`self.conn` lock contention (memory
+  `di-insert-batch-lock-contention`); the retry decorator absorbed the
+  reader collisions successfully (`stats: transient DB error …; retrying
+  in 0.29s` ×N → no exception escape), so the dashboard `/api/stats`
+  endpoint did NOT 500. The google_news write path is on Backoff/5s →
+  10s, recoverable. Per-call connection isolation is substantial +
+  `daemon.py`/store sibling-touched → out of clean scope
+  (advisor/precedent-confirmed across passes 19–27). 6 disabled channels
+  observed (`alphavantage`, `newsapi`, `nitter`, `polygon`, `sec_edgar`,
+  `sec_edgar_ft`) — chronic external/rate-limit gap (memory
+  `di-chronic-dark-collectors`), correctly surfaced by COVERAGE GAP in the
+  briefing; not in scope. None of 4/5 is a quick safe fix in clean scope
+  → no Phase-3 fold-in; bugs_fixed stays 1, features_added 1.
+
+  **Verify:** `from storage import article_store; from ml import features,
+  model; from analysis import claude_analyst` imports OK; suite **951
+  passed** (`tests/`, my 14 new throughput tests + 7 RSS tests all green,
+  zero regressions). Commits `868dc91` (Phase 1) and `84dff1a` (Phase 2)
+  pathspec-scoped via explicit `git add <files>`; `git diff --staged
+  --stat` + `git show --stat` verified EXACTLY the intended files
+  (1 + 2 respectively), zero sibling leakage; never `git add -A`; both
+  pushed to origin/master. A concurrent sibling hybrid agent + operator
+  edited this repo throughout the session (uncommitted `daemon.py`,
+  `dashboard/web_server.py`, untracked `collectors/fda_collector.py`,
+  `collectors/seekingalpha_collector.py`,
+  `tests/test_chat_correlation_enrichment.py`); this AGENTS.md entry was
+  appended, not rewritten.
