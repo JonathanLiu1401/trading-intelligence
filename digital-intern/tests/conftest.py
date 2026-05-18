@@ -12,6 +12,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+# tests/test_alert_history.py is an orphan: it imports ``watchers.alert_history``
+# which has NEVER existed in git history (``git log --all -- watchers/alert_history.py``
+# is empty). It was written against an earlier design that shipped instead as
+# ``watchers.alert_recency`` (committed 8410f05) and is exercised by the tracked
+# ``tests/test_alert_recency.py``. Left in place, its import error aborts
+# collection of the ENTIRE suite (484 tests silently never run). Ignore the
+# orphan so the real suite collects; the file itself is left untouched.
+collect_ignore = ["test_alert_history.py"]
+
+
 @pytest.fixture
 def store_factory(tmp_path, monkeypatch):
     """Return a callable that builds a fresh ArticleStore backed by tmp_path.
