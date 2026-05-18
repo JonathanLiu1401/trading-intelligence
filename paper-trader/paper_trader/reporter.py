@@ -828,6 +828,67 @@ def _supervision_line() -> str:
         return ""
 
 
+def _equity_integrity_line(store) -> str:
+    """One-line "can I trust the recorded P&L history?" for the hourly /
+    daily report.
+
+    Every headline P&L surface the operator reads — the hourly Equity/P/L
+    block, ``_benchmark_line``, the dashboard ``/api/drawdown`` /
+    ``/api/benchmark`` / ``/api/analytics`` Sharpe — is derived from
+    ``equity_curve``. A silent corruption there (a negative-cash over-draw on
+    the no-hard-cap book — invariant #12; a non-positive-equity row; a
+    no-trade mismark / stale-price-unfreeze / option-settlement jump) poisons
+    *all* of them with nothing in Discord saying so. ``/api/equity-integrity``
+    made this auditable on the *dashboard* — but the operator lives in
+    Discord and never opens it (the exact dashboard→Discord gap
+    ``_heartbeat_line`` / ``_capital_pulse_line`` / ``_singleton_lock_line``
+    each closed, one dimension over). This routes the integrity builder's own
+    verdict to the surface the operator actually reads.
+
+    Composes ``build_equity_integrity`` **verbatim** (single source of truth,
+    AGENTS.md invariant #10 — the headline / verdict are the builder's, never
+    re-derived here, so this Discord line and ``/api/equity-integrity`` can
+    never tell different stories) and feeds it the EXACT same store reads the
+    endpoint does (``equity_curve(limit=5000)`` + ``recent_trades(5000)``) so
+    the two surfaces are byte-aligned. **Pure store reads only — NO network**
+    (the Discord-path discipline; adds zero latency). Observational only,
+    never gates, adds no caps (invariants #2/#12 — the ``_heartbeat_line``
+    precedent). Failure contract mirrors the rest of ``reporter``: any
+    builder/store fault degrades to ``""`` ("no integrity line this report"),
+    **never** an exception ("no Discord summary this report").
+
+    Suppression — surface ONLY when the recorded P&L history is NOT
+    trustworthy, so a clean curve adds no hourly noise (the summary must
+    never become its own lying green light — the ``_heartbeat_line``
+    HEALTHY-suppression precedent):
+      * ``CORRUPT`` (negative-cash / non-positive-equity) → ALWAYS surfaced
+        (the headline P&L is unreliable — the whole point);
+      * ``SUSPECT`` (>=1 unexplained no-trade jump) → surfaced (a likely
+        mismark / settlement artifact the operator should sanity-check);
+      * ``CLEAN`` / ``NO_DATA`` (and ERROR / any non-verdict) → silent
+        (nothing actionable — the ``_hold_discipline_line`` NO_DATA /
+        ``_heartbeat_line`` HEALTHY suppression precedent).
+    """
+    try:
+        from .analytics.equity_integrity import build_equity_integrity
+        ei = build_equity_integrity(
+            store.equity_curve(limit=5000),
+            store.recent_trades(5000),
+        )
+        if not isinstance(ei, dict):
+            return ""
+        verdict = ei.get("verdict")
+        if verdict not in ("SUSPECT", "CORRUPT"):
+            return ""
+        headline = ei.get("headline") or ""
+        if not headline:
+            return ""
+        return (f"⚠️ **EQUITY INTEGRITY** ◈ {verdict}\n> {headline}")
+    except Exception as e:
+        print(f"[reporter] equity-integrity line skipped: {e}")
+        return ""
+
+
 def _heartbeat_line(store) -> str:
     """One-line "is the decision loop actually deciding, or wedged?" for the
     hourly / daily report.
@@ -988,6 +1049,9 @@ def send_hourly_summary() -> bool:
     hb = _heartbeat_line(store)
     if hb:
         body += "\n" + hb
+    ei = _equity_integrity_line(store)
+    if ei:
+        body += "\n" + ei
     sx = _session_block(store, 1.0, "1h")
     if sx:
         body += "\n" + sx
@@ -1064,6 +1128,9 @@ def send_daily_close() -> bool:
     hb = _heartbeat_line(store)
     if hb:
         body += "\n" + hb
+    ei = _equity_integrity_line(store)
+    if ei:
+        body += "\n" + ei
     sx = _session_block(store, 24.0, "24h")
     if sx:
         body += "\n" + sx
