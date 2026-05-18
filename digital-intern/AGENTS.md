@@ -2162,3 +2162,110 @@ expected; this entry was appended, not rewritten).
   `git diff --staged` verified, never `git add -A`. A concurrent sibling
   hybrid agent edited this repo throughout; this entry was appended, not
   rewritten.
+- **2026-05-18 (hybrid pass 16 — Agent 3, debug + feature + analyst-validation)** —
+  Required-file-set pass (16th; codebase exceptionally mature, 15 prior
+  passes). **Phase 1: bugs_fixed=0, no commit** (per COMMIT GUARD). Read all
+  clean-scope files in full — `storage/article_store.py`,
+  `watchers/urgency_scorer.py`, `watchers/alert_agent.py`,
+  `watchers/alert_dedup.py`, `ml/features.py`, `ml/model.py`, `ml/trainer.py`,
+  `ml/inference.py`, `collectors/web_scraper.py`,
+  `analysis/claude_analyst.py`, `core/json_extract.py` — plus the test map.
+  Every candidate (the briefing `_score`/`_effective_score` bool guard
+  asymmetry; RFC822-vs-ISO SQL pre-filter in `get_top_for_briefing`; the
+  collapse-keeps-highest-raw-score-then-decay ordering subtlety; the
+  features `days_since_published` /30 normalisation vs the task's loose "~1
+  at 24h" wording) resolved to correct-by-design / documented / test-pinned.
+  No fabricated change — same honest call as passes 1 and 15. Sibling-WIP
+  `M collectors/rss_collector.py` (+ its 5 `test_rss_collector.py` 4-tuple
+  failures), `M daemon.py`, `M dashboard/server.py`,
+  `M scripts/export_training_data.py`, `M tests/test_article_store.py` and
+  the untracked sibling files were left **exactly as-is** (never read-staged).
+  **Phase 2: features_added=1, commit `5f40009`.** **Quote-widget noise gate
+  on the Opus heartbeat digest.** `web_scraper` (ingestion) and
+  `alert_agent._filter_quote_widget_noise` (alert path) both reject live
+  ticker-tape pseudo-articles ("NVDANVIDIA Corporation227.13-8.61(-3.65%)"),
+  but the **5h Opus briefing — the analyst's primary consumed product — had
+  no such gate**: a widget row entering via a non-`web_scraper` path
+  (`yahoo_ticker_rss`/`finnhub`/replay) and ML-scored high (live: up to 9.99)
+  still surfaced as a fake `[HH:MM] [score] TOP SIGNAL`. Added
+  `_looks_like_quote_widget` + `_filter_quote_widget_noise` to
+  `analysis/claude_analyst.py`, wired as the FIRST step of `_build_payload`'s
+  newswire section (before collapse/decay/cap). Fingerprints byte-identical
+  to the other two gates so all three stay in lockstep; helper duplicated
+  (not cross-imported from `alert_agent`) per the documented
+  anti-import-cycle discipline (the analysis layer must not pull
+  `ml.features`/numpy/aiohttp — same rule as `_collapse_syndicated` reusing
+  `alert_dedup._signature`). Pure read-side reshape: returns NEW lists, never
+  mutates the caller's `source_articles` (the training-label path), no DB
+  write, backtest already excluded upstream — all four load-bearing
+  invariants intact by construction. Prepended PORTFOLIO/OPTIONS snapshot
+  rows pass through (neither fingerprint matches, no url). +21 tests
+  (`tests/test_briefing_quote_widget.py`): both title fingerprints, the
+  Yahoo `/quote/` landing-path vs a real `/quote/NVDA/news/...` article,
+  url-alias/blank safety, order-preserving partition, **input non-mutation**,
+  and four `_build_payload` integration assertions (widget excluded / real
+  kept with score / all-widget degrades to the "(no high-relevance…)" line /
+  snapshot pass-through). Suite: **587 passed**; the only 5 failures are the
+  pre-existing sibling `M collectors/rss_collector.py` 4-tuple WIP
+  (`_FakeResp` lacks `status_code`; not ours, never staged) — zero
+  regressions vs the 566-pass baseline (+21 = exactly the new cases).
+  **Staging-race note:** `git add` was pathspec-scoped to exactly the 2
+  intended files and `git diff --staged --name-only` verified ONLY those 2
+  immediately before commit, yet commit `5f40009` captured 3 extra coherent
+  `paper-trader/` files (`analytics/decision_context.py` + its 2 tests, all
+  additive) — a concurrent sibling/auto-commit-daemon staged them into the
+  shared monorepo index in the sub-second window between the verify and the
+  commit (the documented shared-index race; memory
+  `di-shared-repo-concurrency`). The 3 files are an intact, complete sibling
+  unit that was staged and would have committed regardless; my 2 files are
+  byte-correct in the commit (85 + 171 insertions, 0 deletions). Rewriting
+  pushed history on a shared `master` with active concurrent writers would
+  destroy the sibling's intact work — deliberately NOT done; documented here
+  instead, consistent with pass 15's identical auto-commit-sweep note.
+  **Phase 3 findings (analyst lens), user_findings=5:** (1) **Briefing
+  quality EXCELLENT (positive)** — id=26 (07:13Z) is a dense, accurate,
+  decisively-actionable Bloomberg digest: bond-rout LEAD (10Y +13bp→4.59%
+  dragging Nasdaq −1.54% two days before NVDA earnings), exact macro table,
+  PORTFOLIO tied to live positions + DRAM C59 05-22 expiry / NVDA 05-20
+  print, RISK at specific levels (watch 10Y > 4.60%). The pass-14
+  `time_sensitivity` decay rerank is visibly working (fresh high-impact TOP
+  SIGNALS). Consumer experience is strong when the pipeline is healthy.
+  (2) **Lone low-authority BREAKING noise persists** — last 24h alerted
+  (urgency=2): `reddit/r/ValueInvesting` 9.8, `reddit/r/Daytrading` 8.0,
+  `Wikipedia "[Wikipedia] Nvidia RTX"` 8.6, `GN "$NVIDIA (NVDA.US)$ -
+  Moomoo"` 9.8. reddit (0.40) is gated by `_filter_low_authority_lone` in
+  HEAD but the running daemon predates the deployed gate (stale-daemon);
+  Wikipedia (0.60) / GN-ticker-page (0.62) sit ABOVE the 0.45
+  `ALERT_MIN_LONE_SOURCE_CRED` bar so they fire even in HEAD. Recurring
+  tuning observation (identical to pass-15 finding 5) — raising the bar
+  risks gating legit `rss` 0.65 / `scraped` 0.50 / `gdelt` 0.58; the gates
+  are heavily test-pinned. Not a clear bug; reported, not chased. The
+  genuine urgent items in the same window were excellent (NVDA 8-K filing
+  8.0, UAE-nuclear-drone/Brent shock 9.0, Samsung HBM4 9.0) and 0 urgent
+  rows were stuck (urgency=1 backlog empty → pipeline drains). (3)
+  **`insert_batch: lock retry exhausted` recurring ~10×** (09:44Z burst
+  across `rss`/`google_news`) → whole collected batches silently dropped =
+  missed news; matches memory `di-insert-batch-lock-contention.md`. Even a
+  `mode=ro` analyst `COUNT(*)` scan timed out >150s on the 1.4 GB USB DB,
+  corroborating sustained ~30-thread shared-connection contention. The
+  store's own comment names the real fix (per-call connection isolation à
+  la dashboard `_ro_query`) — substantial + `daemon.py`/store are
+  sibling-touched → out of safe surgical scope; reported, not chased. (4)
+  **COVERAGE GAP "DARK 0.0h" in the running daemon** — briefing id=26 reads
+  "SEC 8-K filings — DARK 0.0h (932 empty polls, 0 delivered all session)";
+  8 sources disabled (`sec_edgar`, `sec_edgar_ft`, `polygon`, `newsapi`,
+  `finnhub`, `massive`, `nitter`, `wikipedia`). The `fails × cadence`
+  dark-duration fix is in HEAD; the live daemon predates it (stale-daemon).
+  The COVERAGE GAP feature itself fires correctly (analyst IS told they're
+  blind to SEC filings — the highest-value channel), only the duration
+  display understates it. Operational / `source_health` (out of clean
+  scope); reported. (5) **The Phase-2 gap itself** — confirmed by
+  inspection that the briefing path lacked the quote-widget gate the other
+  two paths have; now closed. None was a quick safe fix inside clean scope
+  (1 positive; 2 contentious test-pinned tuning; 3 architectural +
+  sibling-touched; 4 already fixed in HEAD + source_health out of scope; 5
+  fixed by Phase 2) → no Phase-3 fold-in, bugs_fixed stays 0. Final verify:
+  `storage.article_store` / `ml.features` / `ml.model` /
+  `analysis.claude_analyst` imports OK; quote-widget helpers present. A
+  concurrent sibling hybrid agent edited this repo throughout; this entry
+  was appended, not rewritten.
