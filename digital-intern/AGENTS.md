@@ -2387,3 +2387,123 @@ expected; this entry was appended, not rewritten).
   confirmed no sibling leakage; never `git add -A`; pushed to
   origin/master. A concurrent sibling hybrid agent (`pid 1807306`, same
   task) edited this repo throughout; this entry was appended, not rewritten.
+
+- **2026-05-18 (hybrid pass 18 — Agent 3, debug + feature + analyst-validation)** —
+  Required-file-set pass (18th; codebase exceptionally mature, 17 prior
+  passes). Advisor-reviewed before each phase. Live evidence was the
+  discovery engine (the proven pattern of passes 14/16/17), not pre-emptive
+  re-reading. Daemon `pid 1702195` (system unit `active`) confirmed healthy
+  & writing live (newest `first_seen` 10:35:40Z, ≈3 min before probe);
+  `sqlite3` CLI absent → all probes via `python3 -m sqlite3 …?mode=ro`.
+
+  **Phase 1 — bugs_fixed=1, commit `d5918e3`** (`watchers/alert_agent.py` +
+  `tests/test_alert_agent.py`). **Live discovery:** a `mode=ro` probe found
+  **26 `urgency=1` rows stuck from 2026-05-13** (5 days old, never alerted),
+  contradicting passes 14/16/17's "no urgency=1 backlog stuck". Root-caused
+  in `send_urgent_alert`: it has four noise-suppression gates — quote-widget,
+  low-authority-lone, cross-cycle, **and stale-published**. The first three
+  each `store.mark_alerted_batch(alerted_ids(...))` so dropped rows EXIT the
+  urgent queue ("instead of being re-fetched and re-evaluated every 20s
+  cycle" — their own comments); the stale `_article_age_ok` drop was the
+  ONLY one that dropped WITHOUT marking. A recently-collected row with an
+  old `published` (returned by `get_unalerted_urgent` on recent
+  `first_seen`) was re-fetched + re-dropped every 20s for up to 24h, then —
+  once `first_seen` aged past the store's 24h cutoff — stranded as a
+  permanent `urgency=1` residue (inflating the `stats()` `urgent` tile,
+  re-decompressed every cycle). A stale-by-`published` row only ages further
+  — it can never become a valid fresh alert — so marking it loses no
+  delivery. Fixed by mirroring the established pattern verbatim (partition
+  fresh/stale, best-effort `mark_alerted_batch(alerted_ids(stale))`, log
+  line, pre-dedup like the quote-widget gate). Invariants: only `urgency=2`
+  via `mark_alerted_batch` (ai_score/ml_score/score_source untouched),
+  synthetic already filtered above — all four intact. The two prior tests
+  (`test_stale_published_article_is_not_alerted`,
+  `test_unparseable_dates_block_the_alert`) **pinned the buggy contract**
+  (`urgency==1` / `spy.marked==[]`); corrected to the production-accurate
+  contract — STILL assert no-Claude/no-Discord, ADD `urgency==2` + queue
+  drained + ai_score/score_source untouched — and added a mixed fresh+stale
+  discriminating regression (a strengthened, not weakened, suite; pass-14
+  precedent). Ships only on next `systemctl restart digital-intern`
+  (stale-daemon caveat — running daemon predates HEAD).
+
+  **Phase 2 — features_added=1, commit `ad0bb56`** (`analysis/claude_analyst.py`
+  + new `tests/test_briefing_alert_parity.py`). **`[ALERTED]` alert↔briefing
+  parity tag.** A news analyst reading the 5h Opus digest could not tell a
+  genuinely new LEAD from a rehash of a story already pushed as a standalone
+  🚨 BREAKING alert hours ago (the recurring duplicate-alert complaint, on
+  the one product that never mitigated it). `watchers.alert_recency` already
+  persists the canonical `alert_dedup._signature` of every fired alert (TTL
+  6h ≈ the 5h window) and uses it for cross-cycle suppression; the briefing
+  path never consulted it. `_build_payload` now reads the recent fired-alert
+  signature set ONCE per briefing (`_recent_alert_signatures` — best-effort,
+  `set()` on any failure, single read of a separate `alert_recency.db`,
+  NEVER `articles.db`) and tags matching digest rows ` [ALERTED]`;
+  `SYSTEM_PROMPT` rule forbids leading an `[ALERTED]` row over a comparable
+  untagged one and mandates continuation framing. Reuses
+  `alert_dedup._signature` verbatim (the documented anti-drift discipline —
+  the tag and the cross-cycle gate agree by construction; `_signature` is a
+  normalised first-8-token prefix, verified to discriminate distinct
+  same-ticker events e.g. "MU surges…" ≠ "MU drops…", so no false-positive
+  silencing). Snapshot rows (no link/url) never tagged — same guard as
+  `_extract_briefing_labels`. Pure read-side: no DB write, no
+  ai_score/ml_score/score_source/urgency mutation, backtest excluded
+  upstream by `_LIVE_ONLY_CLAUSE` — all four invariants intact by
+  construction. +10 specific-value tests (tag presence/absence, wire-marker
+  variant collapse, distinct same-ticker non-collision, snapshot
+  pass-through, empty-set degrade, broken-DB swallowed, input non-mutation,
+  SYSTEM_PROMPT LEAD/continuation rule). Ships on next restart.
+
+  **Phase 3 — analyst-lens live validation, user_findings=8.** (1)
+  **Briefing EXCELLENT (positive)** — id 07:13Z read end-to-end: dense,
+  accurate, decisively-actionable (bond-rout LEAD 10Y +13bp→4.59% / Nasdaq
+  −1.54% two days before NVDA earnings; exact macro table; PORTFOLIO
+  LITE/LNOK/NVDL/MU tied to live book + DRAM C59 05-22 / NVDA 05-20; RISK at
+  10Y>4.60%; sharp DESK NOTE; COVERAGE GAP present). (2) **Alert path CLEAN
+  recent 24h (positive)** — exactly 2 alerts since 5/17 09:38, both legit
+  high-value `Benzinga Economics` geopolitical/oil (01:55 ai=9.0 UAE
+  nuclear-plant drone/Brent; 09:19 ai=8.0 Dow/S&P-futures-drop follow-up);
+  zero reddit/wiki/quote-widget noise in-window (earlier 5/15–17 noise is
+  pre-deployed-gate residue, stale-daemon). (3) **Invariants HOLD LIVE** —
+  `0` synthetic rows with `urgency>=1`; `0` `ai_score>0 AND
+  score_source='ml'` in the ~1.45 GB prod DB. (4) **Collection healthy** —
+  newest live row ≈3 min fresh; ~1300+ live art/h (GN round-robin dominant,
+  scraped/finance.yahoo.com ~98/h, reddit ~58/h). (5) **The Phase-1 26
+  stuck-urgent rows** — found here, fixed in `d5918e3`. (6) **Chronic
+  `insert_batch: lock retry exhausted`** — ~22 ERRORs last 3h (clusters
+  08:01–08:50, 09:42–44, 10:41–42) + one `update_ml_scores_batch` 00:10 →
+  whole batches silently dropped = missed news; memory
+  `di-insert-batch-lock-contention`; real fix (per-call connection
+  isolation) is substantial + `daemon.py`/store sibling-touched → out of
+  clean scope; reported, not chased (advisor-confirmed). (7) **8 collectors
+  DARK** — COVERAGE GAP correctly lists SEC 8-K (priority-0, analyst blind
+  to filings), SEC-FT, Polygon, NewsAPI, AlphaVantage, Yahoo-ticker-RSS,
+  Massive, Nitter ("0 delivered all session" for SEC/Polygon/NewsAPI/Nitter);
+  upstream/rate-limit/key, operational; "DARK 0.0h" understatement fixed in
+  HEAD (`b20cbae`), ships on restart (stale-daemon). (8) **Shutdown
+  reentrant-logging Traceback** — one `RuntimeError: reentrant call inside
+  BufferedWriter` at `daemon.py:2077` during a restart; the EXACT hazard the
+  signal-handler comment documents, benign (os._exit cleanup), an
+  OOM-restart-churn symptom — not a new bug, daemon.py sibling-touched →
+  out of scope. None of 6/7/8 is a quick safe fix in clean scope → no extra
+  Phase-3 fold-in; bugs_fixed stays 1 (the Phase-1 fix). Final verify:
+  `storage.article_store` / `ml.features` / `ml.model` /
+  `analysis.claude_analyst` imports OK; suite **631 passed** (+10 mine over
+  the 621 sibling-inflated baseline), the same 5 `test_rss_collector.py`
+  failures are the pre-existing sibling `M collectors/rss_collector.py`
+  4-tuple WIP (not ours, never staged); `tests/test_sector_pulse.py`
+  collection error is sibling-WIP (`?? test_sector_pulse.py` +
+  `M dashboard/server.py`/`web_server.py`), excluded via `--ignore`, not
+  ours. *Pre-existing, deliberately never staged* (consistent with every
+  prior entry): `collectors/rss_collector.py`, `daemon.py`,
+  `dashboard/server.py`, `dashboard/web_server.py`,
+  `scripts/export_training_data.py`, `tests/test_article_store.py`,
+  untracked sibling files (`tests/test_sector_pulse.py`, etc.), all
+  `paper-trader/*`, `logs/*.tmp`. Both commits pathspec-scoped to exactly
+  their 2 intended files; `git diff --staged --name-only` verified
+  immediately before each commit; `git show --stat` confirmed no sibling
+  leakage (the shared-index auto-commit race did NOT fire this pass — the
+  remote advanced between the two pushes from sibling/auto-commit activity
+  but neither of my commits captured a foreign file); never `git add -A`;
+  pushed to origin/master. A concurrent sibling hybrid agent (`pid
+  1824145`, same task) edited this repo throughout; this entry was
+  appended, not rewritten.
