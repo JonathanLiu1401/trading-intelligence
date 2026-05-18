@@ -493,6 +493,7 @@ sentinel, which makes every article `needs_llm` and is also the value
 | Stale (>`STALE_HOURS`) news still firing urgent alerts, and/or the model quietly underperforming for no obvious reason | **Article age never reached the live path.** `get_unscored` projected only `id/title/source/summary`, dropping `published`/`first_seen`. `_article_age_hours` then read 0h for every article: the Sonnet staleness rule and the hard `STALE_SCORE_CAP` clamp were both inert, and `extract_features` fell back to `now()` so 5 temporal features were train/serve-skewed. No exception, model still trained, alerts still fired — invisible. | `get_unscored` now returns both age columns (invariant #4). Verify any `get_unscored` projection edit keeps `published`/`first_seen`. Re-run `tests/test_get_unscored_age_fields.py`. |
 | 5h heartbeat briefing posts 30–40h apart (or never) while the daemon looks healthy | **Restart-churn reset the briefing clock.** `heartbeat_worker` seeded `last = time.time()` on every start; under the documented OOM-restart churn (hundreds of starts/day) any restart < 5h after launch pushed the next briefing out another full interval, starving the analyst's scheduled digest. No error — the worker pings healthy the whole time. | `_initial_heartbeat_last` now seeds `last` from the most recent persisted `briefings.ts` (with a startup warm-up clamp); a restart no longer resets the cadence. Falls back to the original "wait a full interval" when no briefing exists / ts unusable. Pinned by `tests/test_heartbeat_cadence.py`. Note this is a *symptom* of the OOM-restart churn (1.4 GB USB DB + bulk `gdelt_historical` backfill + WAL-checkpoint contention → frequent `insert_batch: lock retry exhausted` ERRORs and OOM-kills); the churn root cause is operational, out of scope for a code fix. |
 | Whole collected batches silently lost; `[article_store] insert_batch: lock retry exhausted after 5 attempts — raising` ERRORs (also `update_ml_scores_batch`/`update_ai_scores_batch`) | Sustained writer contention on the 1.4 GB USB `articles.db` (many collector threads + a ~1.3M-row `gdelt_historical` bulk backfill draining through the scorer + `purge`'s `wal_checkpoint(TRUNCATE)`) outlasts the 5-attempt / ~10s `_retry_on_lock` budget. `_ingest` propagates the raise → the collector worker's broad `except` drops the entire fetched batch and backs off. | Operational, not a clean surgical fix (retry-then-raise is the intended contract; bumping `_LOCK_RETRY_ATTEMPTS`/`_CAP_S` has no correctness story). Mitigations: reduce the bulk-backfill insert rate, move `articles.db` off the USB spindle, or lower `purge` checkpoint contention. Tracked as a Phase 3 finding. |
+| 5h Opus briefing reads as a repetitive low-signal digest — one scrape channel monopolises it (live: 10/50 slots `scraped/finance.yahoo.com` price-quote widget pages, `ETH-USDEthereum USD2,169.83` ML-scored 9.96 = #1 slot) | A single high-volume publisher domain dominates `get_top_for_briefing`'s score-ordered top-N because the ML relevance head over-scores ticker-dense quote-widget scrape pages. | `get_top_for_briefing` caps any one resolved publisher domain at `BRIEFING_MAX_PER_DOMAIN` (6) via `_briefing_domain_key`, backfilling from score-ordered overflow so the digest is **never shrunk** (low-diversity windows still fill). Pure read-side; `_LIVE_ONLY_CLAUSE` intact. Pinned by `tests/test_briefing_domain_diversity.py`. NOTE the underlying cause — `collectors/web_scraper.py` ingesting Yahoo/Finviz quote pages as articles, and the alert path resolving lone `scraped/finance.yahoo.com` to cred ~0.65 (> the 0.45 lone-alert gate) so it can still fire a real BREAKING — is a separate, unaddressed concern. |
 
 ---
 
@@ -1126,3 +1127,49 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   commit pathspec-scoped to exactly its intended `ml/features.py` + test
   files (`29247b3` Phase 1, `e3fa0dd` Phase 2, plus a follow-up trimming
   `_LOW_AUTHORITY_DOMAINS` to live-observed hosts only); never `git add -A`.
+
+- **2026-05-18** — Hybrid pass (debug + feature + analyst-validation) over the
+  required file set. **Phase 1: bugs_fixed=0, no commit.** The codebase is
+  exceptionally mature; every task-listed test already exists and value-asserts
+  (backtest exclusion, `update_ml_scores_batch`→`'ml'`, `EXTRA_FEATURE_DIM==15`,
+  zero-input no-NaN, `_fetch_training_data` `'ml'` exclusion, sample-weight
+  monotonicity). Behaviours initially flagged — all-unformattable alert
+  short-circuit (`test_all_rows_unformattable_skips_before_claude`),
+  `_published_older_than` RFC822 SQL pre-filter handled in Python, ML-urgent
+  firing without an LLM re-verify — are intentional and pinned. No fabricated
+  change. **Phase 2: feature `3fe9eb5`** — per-publisher-domain diversity cap in
+  `get_top_for_briefing` (`BRIEFING_MAX_PER_DOMAIN=6` + local `_briefing_domain_key`;
+  score-ordered overflow backfill so the digest is never shrunk). Evidence: the
+  live top-50 briefing input had 10 slots from `scraped/finance.yahoo.com`
+  quote-widget pages (`ETH-USDEthereum USD2,169.83` ML-scored 9.96 = #1 slot);
+  the cap lifts the live digest from heavy single-domain concentration to 28
+  distinct domains / 50 slots. Pure read-side, all four invariants intact, +4
+  tests (`tests/test_briefing_domain_diversity.py`). Suite: **405 passed** (401
+  baseline + 4); `storage`/`ml`/`features` imports OK. **Phase 3 findings
+  (analyst lens):** (1) scrape-quality root cause — `web_scraper.py` ingests
+  Yahoo/Finviz price-quote widgets as articles and the ML relevance head
+  over-scores them; the diversity cap bounds the *briefing* damage but the
+  *alert* path is unprotected (a lone `scraped/finance.yahoo.com` resolves to
+  cred ~0.65 > the 0.45 lone-alert gate → can fire a real BREAKING; observed
+  urgency=2 row `NVDANVIDIA Corporation227.13-8.61`). (2) `_format_portfolio_coverage`
+  (`daemon.py`) matches `\bDRAM\b` against any DRAM-memory article → false
+  "covered" for the *DRAM ETF position*, masking a true coverage blind-spot;
+  not fixed — `daemon.py` carries unrelated sibling-agent uncommitted edits
+  that must not be staged. (3) `daemon.log` `insert_batch` /
+  `update_ml_scores_batch: lock retry exhausted` ERRORs at 00:10 → whole
+  collected batches lost (missed news); operational, and the sibling agents'
+  in-flight reader-`_retry_on_lock` decoration targets exactly this class.
+  (4) one dead RSS feed (`Notebookcheck` 404) — minor source-health noise.
+  (5) the latest briefing (id 24) is genuinely high-quality and actionable —
+  the consumer experience is good when the pipeline is healthy. **Stale-daemon
+  caveat:** the running daemon (restarted 00:35) predates `3fe9eb5`; the cap
+  takes effect only after `restart digital-intern` (not done — live system,
+  sibling agents). *Pre-existing, deliberately never staged* (consistent with
+  the 2026-05-16 entries): `collectors/rss_collector.py`, `daemon.py`,
+  `storage/article_store.py` reader-`_retry_on_lock` decoration,
+  `tests/test_article_store.py`, all `paper-trader/*`, `logs/*.tmp` deletions.
+  `3fe9eb5` was kept clean by reconstructing `storage/article_store.py` from
+  `git show HEAD:` and re-applying only the 4 feature edits (so the sibling
+  reader-decoration work is excluded from the commit yet preserved, unstaged,
+  in the working tree); pathspec-scoped to exactly the two intended files,
+  never `git add -A`.
