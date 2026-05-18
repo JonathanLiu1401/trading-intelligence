@@ -36,10 +36,20 @@ FRED_SERIES = {
     "CPIAUCSL": "CPI (all urban consumers, SA)",
     "UNRATE": "Unemployment rate",
     "DFF": "Effective federal funds rate",
+    "DGS2": "2-year Treasury constant maturity",
     "DGS10": "10-year Treasury constant maturity",
     "GDPC1": "Real GDP (chained 2017 $)",
     "PAYEMS": "Total nonfarm payrolls",
 }
+
+# Yield-curve spread emitted as a separate synthetic article series. The
+# 10Y-2Y spread is the canonical recession-leading-indicator (inversions in
+# 1978/1989/2000/2006/2019 each preceded a US recession within ~6-24 months).
+# Computed from the two underlying series we already fetch; no extra network
+# call. Source tag intentionally distinct (``fred/10y2y_spread``) so the
+# operator can see it as its own signal in the dashboard's source view.
+YIELD_CURVE_SOURCE = "fred/10y2y_spread"
+YIELD_CURVE_SERIES = "DGS10_MINUS_DGS2"
 
 FREDGRAPH_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
 RECENT_N = 3  # most recent observations to synthesise per series
@@ -121,6 +131,84 @@ def _fetch_series(series: str) -> list[tuple[str, float]]:
     return rows
 
 
+def _yield_curve_articles(conn, dgs10: list[tuple[str, float]],
+                          dgs2: list[tuple[str, float]]) -> list[dict]:
+    """Emit synthetic 10Y-2Y spread articles for the most recent N dates where
+    BOTH DGS10 and DGS2 have a published value.
+
+    The spread is the canonical recession signal — every US recession since
+    1955 was preceded by an inversion (10Y < 2Y). A standalone article series
+    lets the briefing / alert layer surface "yield curve inverted today" the
+    same way it does a CPI print, without recomputing from per-series rows.
+
+    Dedup key is the obs_date alone (``fred:DGS10_MINUS_DGS2:<date>``), so a
+    later FRED revision of either input never re-emits the same date.
+
+    Returns standard collector dicts (title/link/summary/published/source).
+    All ``zip``-able input shape: oldest→newest per ``_fetch_series`` contract.
+    """
+    if not dgs10 or not dgs2:
+        return []
+    by_date_10 = dict(dgs10)
+    by_date_2 = dict(dgs2)
+    common_dates = sorted(set(by_date_10) & set(by_date_2))
+    if not common_dates:
+        return []
+    surfaced = common_dates[-RECENT_N:]
+    # FRED's two-series graph URL — clickable evidence link rather than the
+    # single-series page used by the underlying observations.
+    url = (
+        "https://fred.stlouisfed.org/graph/?g=fredgraph"
+        f"&id={','.join(['DGS10', 'DGS2'])}"
+    )
+    out: list[dict] = []
+    for d in surfaced:
+        v10 = by_date_10[d]
+        v2 = by_date_2[d]
+        spread = v10 - v2  # percentage points
+        sid = _seen_id(YIELD_CURVE_SERIES, d)
+        if _is_seen(conn, sid):
+            continue
+        # Prior observation in the OVERLAP set is the meaningful comparator —
+        # a Δ vs the previous *common* date answers "did the curve steepen or
+        # flatten today" rather than vs an arbitrary holiday-skipped row.
+        prev_idx = common_dates.index(d) - 1
+        if prev_idx >= 0:
+            pd = common_dates[prev_idx]
+            prev_spread = by_date_10[pd] - by_date_2[pd]
+            d_spread = spread - prev_spread
+            # Inversion *direction* is what moves markets, not just sign.
+            direction = "flattening" if d_spread < 0 else "steepening"
+            change = f"prev {_fmt_num(prev_spread)} ({direction} {d_spread:+.2f})"
+        else:
+            change = "no prior obs"
+        # Spread sign is THE recession-signal headline tag; "INVERTED" reads
+        # like the wire-headline analyst would scan for.
+        regime = "INVERTED" if spread < 0 else "positive"
+        title = (
+            f"FRED 10Y-2Y spread {d}: {_fmt_num(spread)} ({regime}, "
+            f"10Y={_fmt_num(v10)} 2Y={_fmt_num(v2)}; {change})"
+        )
+        body = (
+            f"FRED-derived 10-year minus 2-year Treasury spread for {d}: "
+            f"{spread:+.2f} percentage points "
+            f"(10Y={_fmt_num(v10)}, 2Y={_fmt_num(v2)}). "
+            f"Spread regime: {regime} (negative spread = inverted yield "
+            f"curve, a leading recession indicator). "
+            f"Source: FRED (Federal Reserve Economic Data), St. Louis Fed."
+        )
+        out.append({
+            "title": title,
+            "link": url,
+            "summary": body,
+            "published": d,
+            "source": YIELD_CURVE_SOURCE,
+            "_series": YIELD_CURVE_SERIES,
+        })
+        _mark_seen(conn, sid, url, title, YIELD_CURVE_SOURCE)
+    return out
+
+
 def collect_fred() -> list[dict]:
     """Collect deduplicated synthetic macro articles from FRED.
 
@@ -130,6 +218,9 @@ def collect_fred() -> list[dict]:
     """
     conn = _ensure_db()
     new_articles: list[dict] = []
+    # Cache per-series rows so the derived 10Y-2Y spread reuses the same fetch
+    # rather than hitting FRED twice.
+    fetched: dict[str, list[tuple[str, float]]] = {}
 
     for series in FRED_SERIES:
         try:
@@ -140,6 +231,7 @@ def collect_fred() -> list[dict]:
         if not rows:
             print(f"[fred_collector] {series}: no usable observations")
             continue
+        fetched[series] = rows
 
         url = FREDGRAPH_CSV.format(series=series)
         # Need one extra older obs to compute the change for the oldest of the
@@ -189,6 +281,18 @@ def collect_fred() -> list[dict]:
                 "_series": series,
             })
             _mark_seen(conn, sid, url, title, f"fred/{series}")
+
+    # Derived 10Y-2Y spread — runs after per-series fetches so both inputs
+    # are cached. Quietly skipped if either DGS10 or DGS2 failed to fetch
+    # (covered by the empty-rows branch above) so a transient FRED hiccup on
+    # one leg never re-uses a stale value for the other.
+    try:
+        spread_items = _yield_curve_articles(
+            conn, fetched.get("DGS10", []), fetched.get("DGS2", [])
+        )
+        new_articles.extend(spread_items)
+    except Exception as e:  # pragma: no cover - belt+braces; live insertion
+        print(f"[fred_collector] yield-curve spread synth failed: {e}")
 
     conn.commit()
     conn.close()
