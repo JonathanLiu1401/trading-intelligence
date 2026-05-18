@@ -183,6 +183,62 @@ class TestRiskExits:
         assert _enforce_risk_exits(p, synthetic_prices, days[0], days[-1], 1, store) == 0
         store.record_trade.assert_not_called()
 
+    # ── Exact-trigger-price / exact-cash regression locks ──────────────────
+    # The tests above only assert "an exit happened" (n_exits == 1). They do
+    # NOT pin the price the exit fired at or the resulting cash, so an
+    # off-by-one in the daily scan boundary — `cur = from_day +
+    # timedelta(days=1)` (the scan deliberately starts the day AFTER the
+    # sample, not on it), or `px <= sl` flipped to `px < sl`, or selling a
+    # partial instead of the whole position — would still leave n_exits == 1
+    # and slip through `triggered_price >= 120.0`. The synthetic series is
+    # exactly SPY[days[i]] == 100.0 + i, so every quantity below is a hand-
+    # computed exact value, not a range.
+
+    def test_take_profit_fires_at_exact_close_and_cash(self, synthetic_prices):
+        """TP=120 on SPY[i]=100+i must fire at days[20] (price EXACTLY 120.0),
+        sell the whole 5-share position, and leave cash EXACTLY 600.0."""
+        p = SimPortfolio(cash=500.0)
+        _buy(p, "SPY", 5.0, 100.0, stop_loss=None, take_profit=120.0)
+        assert p.cash == pytest.approx(0.0)  # 500 - 5*100
+        store = MagicMock()
+        days = synthetic_prices.trading_days
+        n_exits = _enforce_risk_exits(p, synthetic_prices, days[0], days[-1],
+                                      run_id=1, store=store)
+        assert n_exits == 1
+        assert "SPY" not in p.positions
+        store.record_trade.assert_called_once()
+        # positional: run_id, sim_date, ticker, action, qty, price, reason
+        rid, sim_date, ticker, action, qty, price, _reason = \
+            store.record_trade.call_args[0]
+        assert ticker == "SPY"
+        assert action == "SELL"
+        assert qty == pytest.approx(5.0)            # whole position, not a slice
+        assert price == pytest.approx(120.0)        # EXACT first close >= TP
+        assert sim_date == days[20].isoformat()     # i=20 → 100+20 == 120
+        assert p.cash == pytest.approx(600.0)       # 0 + 5*120
+
+    def test_stop_loss_fires_on_day_after_from_day(self, synthetic_prices):
+        """Entry 200, SL=180. The series opens at 100 (days[0]) but the scan
+        starts at `from_day + 1 day`, so the stop must fire at days[1]
+        (price EXACTLY 101.0) — NOT days[0]/100.0. Asserting 101.0 pins the
+        deliberate one-day scan offset that `n_exits == 1` cannot catch."""
+        p = SimPortfolio(cash=1000.0)
+        _buy(p, "SPY", 1.0, 200.0, stop_loss=180.0, take_profit=None)
+        assert p.cash == pytest.approx(800.0)  # 1000 - 1*200
+        store = MagicMock()
+        days = synthetic_prices.trading_days
+        n_exits = _enforce_risk_exits(p, synthetic_prices, days[0], days[-1],
+                                      run_id=1, store=store)
+        assert n_exits == 1
+        assert "SPY" not in p.positions
+        _rid, sim_date, _tk, action, qty, price, _r = \
+            store.record_trade.call_args[0]
+        assert action == "SELL"
+        assert qty == pytest.approx(1.0)
+        assert price == pytest.approx(101.0)        # days[1], NOT days[0]==100
+        assert sim_date == days[1].isoformat()
+        assert p.cash == pytest.approx(901.0)       # 800 + 1*101
+
 
 # ─────────────────────── Buy-and-hold sanity ───────────────────────────
 
