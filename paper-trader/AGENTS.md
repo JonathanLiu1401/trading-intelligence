@@ -5377,3 +5377,120 @@ features_added = 1 · user_findings = 5.**
   feature, AGENTS.md appended-only & committed separately.
 
 *Review pass #20 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 review pass #23 (paper-trader core hybrid · per-position hold-age in the Opus prompt · live findings)
+
+- **Phase 1 — no new bug (bugs_fixed = 0; no Phase-1 commit, the commit
+  guard explicitly permits it).** Re-read the seven core files in full
+  (`runner.py`, `reporter.py`, `signals.py`, `strategy.py`,
+  `market.py`, `store.py`) plus a structured sweep of the 9.5k-line
+  `dashboard.py` (70 `@app.route`s; read `_position_ages_from_trades`,
+  `risk_api`, `supervision_api`, `equity_integrity_api` in full).
+  Traced the full `decide()` claude/fallback/retry state machine, the
+  host-saturation skip arms, the singleton-lock degrade/recheck path,
+  the runner-state sidecar future-clamp, and the `_mark_to_market`
+  expired-option intrinsic / `stale_mark` logic. All defensive, all
+  exact-value locked, no genuine defect — consistent with the 22 prior
+  mature core passes. Baseline green before the feature
+  (`test_core_market /_store /_runner /_signals` 190, plus
+  `test_core_runner_cycle /_parse_retry /_decision_context*` 230).
+
+- **Feature shipped (Phase 2, `feat(strategy):`, commit `ab710a3`):
+  per-position HOLD AGE in the Opus decision prompt.** The prompt's
+  position lines rendered `qty/avg/mark/P/L` but never *how long* a lot
+  had been held — leaving the decision engine structurally blind to the
+  desk's **#1 documented pathology, the disposition effect** (riding
+  losers / cutting winners). This was live and visible this pass:
+  `/api/hold-discipline` `DISPOSITION_DRAG`, LITE held **3.8d** at a
+  loss = **7.12× the empirical median losing hold**, yet the prompt gave
+  Opus no age signal. New pure `strategy._hold_age_str(opened_at,
+  now=None)` → compact `42m`/`5h`/`3d` (day-flooring **aligned with
+  `dashboard._position_ages_from_trades` / `/api/risk`** so the two
+  surfaces never disagree by a day), derived from the `opened_at`
+  already carried on every `snap["positions"]` row (it is reset to the
+  re-entry instant when a fully-closed lot reactivates — see
+  `store.upsert_position` — so it is the correct *current* holding
+  period, not the all-time first touch). `_build_payload` renders a
+  ` held=<age>` token on every stock **and** option line, placed
+  **before** the `[STALE MARK …]` suffix so the disposition signal
+  never masks the unreliable-P/L warning. Observational only — surfaces
+  the raw fact, never gates/caps (the `stale_mark` precedent;
+  invariants #2/#12). **Degrade-safe:** missing/unparseable `opened_at`
+  → no token, **byte-identical to pre-feature** for any snapshot lacking
+  the field (incl. the handcrafted test snapshots — a regression guard
+  asserts this on the existing stale-position test). Future `opened_at`
+  (clock stepped back — the documented skew hazard) clamps to `0m`.
+  Verified live offline against the real book:
+  `LITE … P/L=$-6.21 (-1.0%) held=3d`, `MU … held=1d`. **14 exact-value
+  locks** in `tests/test_core_strategy.py`
+  (`TestHoldAgeStr` + `TestHoldAgeInPrompt`: bucket flooring incl. the
+  1h/1d boundaries, sub-minute→`0m`, missing/empty/unparseable→`""`,
+  future-clamp, naive-tz-as-UTC, stock+option render, no-opened_at→no
+  token, token-precedes-STALE-MARK ordering). 87 `test_core_strategy`
+  green after.
+  ```bash
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest \
+    tests/test_core_strategy.py -q   # 87 green (14 new)
+  ```
+
+- **Phase 3 — live findings (running `:8090`, orphan PID 1901379,
+  2026-05-18 ~13:12 UTC; host under the review-swarm load this pass's
+  own siblings contribute to). 5 distinct, none a new quick code fix.**
+  1. **Live trader frozen — IDLE_STORM (HIGH, host-saturation, NOT a
+     code/prompt bug — continuity + recalled
+     `pt-no-decision-host-saturation`).** Last 8 `decisions` all
+     `NO_DECISION`; `/api/runner-heartbeat`
+     `decision_efficacy=IDLE_STORM`, `consecutive_no_decision=20`
+     (100%), `restart_recommended=true`. The review harness induces the
+     freeze it observes; instrumentation is correct.
+  2. **POSITIVE — the pass-#22 host-guard skip (`9c14c96`) is now
+     DEPLOYED and visibly correct in production.** Prior pass #22
+     reported it deploy-stale/inert on the orphan; this pass the
+     `decisions` log carries genuine `skipped claude call — host
+     saturated: 5/6 concurrent Opus (>4)` rows **distinct from**
+     `claude returned no response (timeout/empty)` model-timeout rows —
+     the distinct-reason instrumentation validated live (it is dodging
+     the +1.5GB doomed Opus subprocess during the storm exactly as
+     designed).
+  3. **Runner UNSUPERVISED_STALE (HIGH, ops, not code-fixable —
+     continuity of the #1 recurring finding).** `/api/supervision`:
+     `verdict=UNSUPERVISED_STALE`, `orphan=true`, `ppid=1`, systemd bus
+     `No medium found`, `boot_sha=871795e` vs `head_sha=ab710a3`
+     (`behind:1` — this pass's own commit). No `Restart=always` net.
+     Decisive action: `systemctl --user enable --now paper-trader`.
+  4. **POSITIVE — data + P&L trust intact.** `/api/feed-health`
+     HEALTHY (newest live article 0.0h, 915 live/2h, 5184/24h, both
+     candidate DBs in lockstep, **no split-brain**);
+     `/api/equity-integrity` `CLEAN` (794 points, cash never negative,
+     0 suspect jumps); `/api/runner-heartbeat.notify` `HEALTHY` (last
+     Discord send OK, 0 consecutive failures — openclaw PATH/shebang
+     resolution working). The freeze is **isolated to the Opus call**
+     (host timeout), not a blind feed / corrupt book / dark channel.
+     `continuous.log` 0 tracebacks (GDELT backoff only; backtest loop
+     healthy at run 6237).
+  5. **This pass's hold-age feature is deploy-stale on the running
+     orphan (continuity, expected).** The runner booted on `871795e`
+     before `ab710a3`; verified working offline against the live
+     snapshot. Activates on the next runner restart (the documented
+     deploy-stale pattern; restarting per #3 also resolves 1, 5 and
+     activates this feature).
+
+  1 + 3 are ops/host-saturation continuity; 2 + 4 are positive
+  production confirmations; 5 is the expected deploy-stale pattern. No
+  Phase-3 fix folded in.
+
+- **Concurrency / staging discipline.** Ran with heavy concurrent
+  siblings on the shared monorepo tree (sibling-modified
+  `paper_trader/ml/decision_scorer.py`, untracked sibling
+  `analytics/{game_plan,ticker_dossier}.py`,
+  `ml/{deploy_audit,gate_pnl}.py`, `preflight.py`, dirty
+  `../digital-intern/`). Never `git add -A`. Staged exactly the two
+  path-scoped files I changed (`paper_trader/strategy.py`,
+  `tests/test_core_strategy.py`); `git diff --staged` verified **zero
+  sibling tokens** and both staged blobs were `ast.parse`-clean before
+  commit. AGENTS.md committed separately alongside (not counted as the
+  feature).
+
+*Review pass #23 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
