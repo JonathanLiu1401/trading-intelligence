@@ -142,10 +142,19 @@ def test_payload_renders_syndication_tag_only_when_corroborated():
 
 def test_cap_60_contract_still_holds_with_distinct_titles():
     """65 distinct headlines ⇒ no collapse ⇒ line 60 present, 61 absent
-    (the existing test_claude_analyst regression, re-pinned post-feature)."""
+    (the existing test_claude_analyst regression, re-pinned post-feature).
+
+    Titles carry a per-row `alpha{i}`/`topic{i}` token: the original
+    `f"...headline {i}..."` distinguisher was a bare digit, a len-1 token
+    dropped by ml.dedup's `_MIN_TOKEN_LEN=2`, so every "distinct" title
+    normalized to the SAME token set and the order-independent near-dup
+    stage correctly collapsed them — a latent fixture defect, not a feature
+    bug. Genuinely-distinct tokens (J~0.5 < the 0.7 threshold) restore the
+    test's stated intent; the cap-60 assertions are unchanged.
+    """
     arts = [
-        {"title": f"unique chip headline {i} for the desk", "source": "rss",
-         "ai_score": 7.0, "summary": "body"}
+        {"title": f"unique chip headline alpha{i} for the desk topic{i}",
+         "source": "rss", "ai_score": 7.0, "summary": "body"}
         for i in range(65)
     ]
     payload = claude_analyst._build_payload(
