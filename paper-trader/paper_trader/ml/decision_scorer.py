@@ -97,6 +97,28 @@ N_FEATURES = 10 + len(SECTORS)  # 10 base (quant + news_urgency + news_article_c
 # a clamped -50 is still in the "p < -10 → ×0.6" bucket, exactly as -89 was.
 PRED_CLAMP_PCT = 50.0
 
+# Single source of truth for the sklearn MLPRegressor hyper-parameters.
+# `train_scorer` builds the model with `MLPRegressor(**MLP_CONFIG)`, and the
+# read-only `paper_trader.ml.deploy_audit` diagnostic introspects a deployed
+# pickle's fitted model attributes against THIS dict to answer the single
+# most-repeated ML/backtest finding: "the running loop predates the
+# anti-overfit retune — it is still gating real conviction on the memorizing
+# (64,32,16)/alpha=1e-4/early_stopping=False net while the source says
+# (32,16)/alpha=1e-2/early_stopping=True". Keeping the kwargs here (not inline
+# in train_scorer) makes that comparison a true no-drift check rather than a
+# hand-maintained mirror. Anti-overfit config (2026-05-18); see the
+# train_scorer comment for the OOS-RMSE evidence behind each value.
+MLP_CONFIG: dict = {
+    "hidden_layer_sizes": (32, 16),
+    "activation": "relu",
+    "max_iter": 1000,
+    "random_state": 42,
+    "alpha": 1e-2,
+    "early_stopping": True,
+    "validation_fraction": 0.15,
+    "n_iter_no_change": 25,
+}
+
 
 class _LstsqScaler:
     """Pickle-safe stand-in for sklearn's StandardScaler, used in the numpy fallback."""
@@ -444,16 +466,10 @@ def train_scorer(records: list[dict]) -> dict:
         # the code with CLAUDE.md §3's long-documented "MLPRegressor 32→16"
         # architecture (the code had silently drifted to (64,32,16)). The
         # numpy-lstsq fallback (sklearn-absent hosts) is unaffected.
-        model = MLPRegressor(
-            hidden_layer_sizes=(32, 16),
-            activation="relu",
-            max_iter=1000,
-            random_state=42,
-            alpha=1e-2,
-            early_stopping=True,
-            validation_fraction=0.15,
-            n_iter_no_change=25,
-        )
+        # Hyper-parameters live in the module-level MLP_CONFIG so the
+        # deploy_audit diagnostic can compare a deployed pickle's fitted
+        # model against the exact values used here (single source of truth).
+        model = MLPRegressor(**MLP_CONFIG)
         model.fit(X_tr_w, y_tr_w)
         y_pred = model.predict(X_v)
         val_rmse = float(np.sqrt(np.mean((y_pred - y_v) ** 2)))
