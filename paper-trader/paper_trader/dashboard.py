@@ -1123,6 +1123,10 @@ TEMPLATE = r"""
       <div id="df-mix" style="margin-bottom:12px;"><div class="muted">loading…</div></div>
       <div style="font-size:12px;color:#dde1e7;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">Hourly parse-fail (last 24h)</div>
       <div id="df-hourly" style="display:flex;align-items:flex-end;gap:3px;height:46px;margin-bottom:14px;"><div class="muted">—</div></div>
+      <div style="font-size:12px;color:#dde1e7;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">Decision-loss clock — parse-fail by UTC hour <span class="muted" style="text-transform:none;letter-spacing:normal;">(current regime; folds every day onto one 24h clock so a recurring host-load window shows)</span></div>
+      <div id="df-clock-hint" style="font-size:12px;color:#ffd479;margin-bottom:6px;"></div>
+      <div id="df-clock" style="display:flex;align-items:flex-end;gap:2px;height:46px;margin-bottom:4px;"><div class="muted">—</div></div>
+      <div id="df-clock-axis" style="display:flex;gap:2px;margin-bottom:14px;font-size:9px;color:#5c6470;"></div>
       <div style="font-size:12px;color:#dde1e7;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">Recent failures — raw Opus excerpt</div>
       <table id="df-tape" style="font-size:12px;">
         <thead><tr>
@@ -4160,6 +4164,41 @@ async function refreshDecisionForensics() {
         return `<div title="${lbl}  ${h.failures}/${h.total} failed (${fmt(h.fail_pct,0)}%)"
           style="flex:1;min-width:5px;height:${ph}px;background:${col};border-radius:2px 2px 0 0;"></div>`;
       }).join("");
+    }
+
+    // Decision-loss clock — fold the current-regime history onto 24 UTC hours.
+    const chEl = document.getElementById("df-clock-hint");
+    if (chEl) chEl.textContent = r.clock_hint || "";
+    const hod = r.hour_of_day || [];
+    const byHour = {};
+    hod.forEach(b => { byHour[b.hour] = b; });
+    const worstSet = new Set((r.worst_hours || []).map(b => b.hour));
+    const ckEl = document.getElementById("df-clock");
+    const axEl = document.getElementById("df-clock-axis");
+    if (ckEl) {
+      if (!hod.length) {
+        ckEl.innerHTML = '<div class="muted">no current-regime cycles yet</div>';
+        if (axEl) axEl.innerHTML = "";
+      } else {
+        let bars = "", axis = "";
+        for (let h = 0; h < 24; h++) {
+          const b = byHour[h];
+          if (b) {
+            const fp = b.fail_pct || 0;
+            const ph = Math.max(4, Math.round(fp * 0.42));
+            const col = fp >= 50 ? "#ff4455" : fp >= 25 ? "#ffa726" : "#4caf50";
+            const ring = worstSet.has(h) ? "outline:2px solid #ffd479;outline-offset:-1px;" : "";
+            bars += `<div title="${String(h).padStart(2,'0')}:00 UTC  ${b.failures}/${b.total} failed (${fmt(fp,0)}%)"
+              style="flex:1;min-width:4px;height:${ph}px;background:${col};${ring}border-radius:2px 2px 0 0;"></div>`;
+          } else {
+            bars += `<div title="${String(h).padStart(2,'0')}:00 UTC  no cycles"
+              style="flex:1;min-width:4px;height:3px;background:#2a2d34;border-radius:2px 2px 0 0;"></div>`;
+          }
+          axis += `<div style="flex:1;min-width:4px;text-align:center;">${h % 6 === 0 ? h : ""}</div>`;
+        }
+        ckEl.innerHTML = bars;
+        if (axEl) axEl.innerHTML = axis;
+      }
     }
 
     const tape = r.recent_failures || [];
