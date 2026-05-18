@@ -257,6 +257,28 @@ def run_permutation_test(
 
     # Snapshot original state we'll need to restore.
     original_news = engine._local_news
+    # Only shuffle dates that fall inside the backtest window. engine._local_news
+    # is the entire articles.db (dates up to the present). Shuffling all keys
+    # would map modern articles onto pre-DB historical windows (e.g. 2000-2001),
+    # giving permuted runs phantom signal the real run never had and producing
+    # false WORSE_THAN_RANDOM verdicts.
+    window_s = engine.start.isoformat()
+    window_e = engine.end.isoformat()
+    window_news = {k: v for k, v in original_news.items()
+                   if window_s <= k <= window_e}
+    if not window_news:
+        return {
+            "original_return": None,
+            "permuted_mean": None,
+            "permuted_std": None,
+            "p_value": None,
+            "z_score": None,
+            "n_permutations": 0,
+            "n_attempted": 0,
+            "n_successful": 0,
+            "verdict": "INCONCLUSIVE",
+            "note": "no articles in backtest window — permutation test requires article coverage",
+        }
     original_store = engine.store
 
     # Use a temp DB for all permutation writes — never pollute the live dashboard.
@@ -279,7 +301,7 @@ def run_permutation_test(
 
         # 2. Permutations
         for i in range(n_permutations):
-            engine._local_news = _shuffle_news_dates(original_news, rng)
+            engine._local_news = _shuffle_news_dates(window_news, rng)
             run_id = _PERM_RUN_ID_BASE - 1 - i
             n_attempted += 1
             try:
