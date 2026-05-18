@@ -6277,6 +6277,57 @@ def analytics_api():
         return jsonify({"error": str(e)}), 500
 
 
+def _mark_trust_block(store):
+    """Single source of truth (AGENTS.md #10): the existing
+    ``build_mark_integrity`` verdict, computed from the SAME write-free
+    ``strategy.portfolio_snapshot_readonly`` snapshot ``/api/mark-integrity``
+    uses, folded into the equity-derived risk endpoints (``/api/tail-risk``,
+    ``/api/drawdown``) as an additive ``mark_trust`` key.
+
+    Rationale: ``mark_integrity``'s own docstring names these surfaces as
+    silently fictional when the book is stale-marked ("/api/analytics
+    Sharpe, /api/drawdown, the equity curve ... all quietly partially false,
+    with nothing saying so"), yet a grep shows ``stale_mark`` only ever
+    reached mark_integrity/strategy/dashboard/reporter — never the tail-risk
+    or drawdown maths. A stale cycle records a cost-frozen flat equity point;
+    those flats deflate vol & drawdown, inflate Sharpe, and truncate the VaR
+    tail. This wires the canonical trust verdict in so the numbers self-flag.
+
+    Additive, observational only — never gates Opus, adds no caps, not
+    injected into the decision prompt, no schema change (AGENTS.md #2/#12).
+    Composes ``build_mark_integrity`` verbatim — no re-derived staleness.
+    ``_safe``: any fault → ``None`` so the caller omits the key; the
+    endpoint's pre-existing risk payload/behaviour is byte-identical and it
+    never 500s for this reason (the behavioural-builder failure contract)."""
+    try:
+        from .analytics.mark_integrity import build_mark_integrity
+        from .strategy import portfolio_snapshot_readonly
+        snap = portfolio_snapshot_readonly(store)
+        mi = build_mark_integrity(snap.get("positions") or [])
+        verdict = mi.get("verdict")
+        note = None
+        if verdict not in (None, "CLEAN", "NO_DATA"):
+            note = (
+                "Risk metrics here are derived from the equity curve; the "
+                f"current book is {mi.get('stale_value_pct')}% marked at "
+                "cost (stale price feed), so the most recent equity points "
+                "— and the live tail of these metrics — are at cost-basis, "
+                "not true value. Treat the figures as a floor on risk until "
+                "the feed recovers / the runner restarts."
+            )
+        return {
+            "verdict": verdict,
+            "n_positions": mi.get("n_positions"),
+            "n_stale": mi.get("n_stale"),
+            "stale_value_pct": mi.get("stale_value_pct"),
+            "stale_tickers": mi.get("stale_tickers"),
+            "headline": mi.get("headline"),
+            "note": note,
+        }
+    except Exception:
+        return None
+
+
 @app.route("/api/tail-risk")
 def tail_risk_api():
     """Historical 95/99% 1-day VaR, expected shortfall, annualised vol &
@@ -6289,7 +6340,11 @@ def tail_risk_api():
     try:
         from .analytics.tail_risk import build_tail_risk
         store = get_store()
-        return jsonify(build_tail_risk(store.equity_curve(5000)))
+        result = build_tail_risk(store.equity_curve(5000))
+        mt = _mark_trust_block(store)
+        if mt is not None:
+            result["mark_trust"] = mt
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -7237,8 +7292,12 @@ def drawdown_api():
         store = get_store()
         eq = store.equity_curve(limit=2000)
         positions = store.open_positions()
-        return jsonify(compute_drawdown(eq, positions,
-                                        starting_equity=INITIAL_CASH))
+        result = compute_drawdown(eq, positions,
+                                  starting_equity=INITIAL_CASH)
+        mt = _mark_trust_block(store)
+        if mt is not None:
+            result["mark_trust"] = mt
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
