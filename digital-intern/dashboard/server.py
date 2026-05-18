@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -315,18 +316,40 @@ def _articles_per_hour_24h() -> list[dict[str, Any]]:
     ]
 
 
+_STATS_SINCE_TTL_SECS = 60
+_STATS_SINCE_LOCK = threading.Lock()
+_STATS_SINCE_CACHE: dict = {"ts": 0.0, "total": 0, "urgent": 0, "refreshing": False}
+
+
+def _refresh_stats_since() -> None:
+    try:
+        result = store().stats_since(1)
+        with _STATS_SINCE_LOCK:
+            _STATS_SINCE_CACHE.update(ts=time.time(), total=result["total"], urgent=result["urgent"])
+    except Exception:
+        pass
+    finally:
+        with _STATS_SINCE_LOCK:
+            _STATS_SINCE_CACHE["refreshing"] = False
+
+
 def _stats_payload() -> dict[str, Any]:
     s = store().stats()
     s["service"] = _service_info()
     s["ml"] = _ml_status()
     s["server_uptime_s"] = int(time.time() - SERVER_STARTED_AT)
-    try:
-        last_hour = store().stats_since(1)
-        s["articles_last_hour"] = last_hour["total"]
-        s["urgent_last_hour"] = last_hour["urgent"]
-    except Exception:
-        s["articles_last_hour"] = 0
-        s["urgent_last_hour"] = 0
+    with _STATS_SINCE_LOCK:
+        cache_age = time.time() - _STATS_SINCE_CACHE["ts"]
+        s["articles_last_hour"] = _STATS_SINCE_CACHE["total"]
+        s["urgent_last_hour"] = _STATS_SINCE_CACHE["urgent"]
+        need_refresh = (cache_age > _STATS_SINCE_TTL_SECS
+                        and not _STATS_SINCE_CACHE["refreshing"])
+        if need_refresh:
+            _STATS_SINCE_CACHE["refreshing"] = True
+    if need_refresh:
+        threading.Thread(
+            target=_refresh_stats_since, name="stats-since-refresh", daemon=True,
+        ).start()
     return s
 
 

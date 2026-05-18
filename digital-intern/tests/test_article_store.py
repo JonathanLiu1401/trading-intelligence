@@ -273,3 +273,101 @@ class TestCursorCollisionRetry:
         store.conn = _IntegrityConn(store.conn)
         with pytest.raises(sqlite3.IntegrityError):
             store.update_ai_scores_batch([(aid, 5.0, 0)])
+
+
+class _FlakyReadConn:
+    """Raises the shared-connection cursor-collision DatabaseError on the
+    FIRST ``execute`` call, then delegates normally. Models a lockless reader
+    cursor on the shared ``self.conn`` colliding with a concurrent writer's
+    ``executemany`` — the exact interleave the ``ef7fbe4`` decorator absorbs
+    for writers, but which it was NOT applied to for the named reader victims
+    (get_unalerted_urgent / stats / get_unscored / …)."""
+
+    def __init__(self, real):
+        self._real = real
+        self.exec_calls = 0
+
+    def execute(self, sql, params=()):
+        self.exec_calls += 1
+        if self.exec_calls == 1:
+            raise sqlite3.DatabaseError("another row available")
+        return self._real.execute(sql, params)
+
+    def __getattr__(self, name):  # delegate commit/cursor/executemany/…
+        return getattr(self._real, name)
+
+
+class TestReadPathCursorCollisionRetry:
+    """Regression pin: the pure-SELECT readers must ALSO retry the transient
+    cursor-collision, not only the writers. ``ef7fbe4`` decorated the writers
+    but left ``get_unalerted_urgent`` / ``stats`` / ``get_unscored`` /
+    ``count_unscored`` / ``get_top_for_briefing`` / ``stats_since`` /
+    ``get_briefings_for_training`` undecorated — so a reader colliding with a
+    writer's ``executemany`` bubbled to ``alert_worker``'s broad except
+    (urgent items unfetched that 20s cycle → DELAYED ALERTS) and 500'd the
+    dashboard ``/api/stats``. If the decorator is ever removed from a reader
+    this fails with an uncaught ``DatabaseError``."""
+
+    def test_get_unalerted_urgent_retries_then_succeeds(self, store,
+                                                        monkeypatch):
+        from storage import article_store as A
+        monkeypatch.setattr(A.time, "sleep", lambda *a, **k: None)
+
+        _insert_raw(store, id="u1", url="https://reuters.com/mu-beat",
+                    title="MU smashes Q3 DRAM guidance", source="rss",
+                    urgency=1, ai_score=9.0)
+
+        flaky = _FlakyReadConn(store.conn)
+        store.conn = flaky
+        before = A.lock_metrics()["lock_retries"]
+
+        # Must NOT raise — the decorator retries the idempotent SELECT. An
+        # undecorated reader would propagate DatabaseError here and the alert
+        # worker would silently skip the urgent item this cycle.
+        rows = store.get_unalerted_urgent()
+        after = A.lock_metrics()["lock_retries"]
+
+        assert flaky.exec_calls >= 2, "the SELECT must be retried after collision"
+        assert after == before + 1, "collision must increment the retry counter"
+        assert [r["_id"] for r in rows] == ["u1"]
+        assert rows[0]["ai_score"] == pytest.approx(9.0)
+
+    def test_stats_retries_then_succeeds(self, store, monkeypatch):
+        """The observed-class bug: ``/api/stats`` 500'd because ``store.stats``
+        raced the shared writer connection with no retry."""
+        from storage import article_store as A
+        monkeypatch.setattr(A.time, "sleep", lambda *a, **k: None)
+
+        _insert_raw(store, id="s1", url="https://x.com/a",
+                    title="Title long enough here", source="rss",
+                    urgency=1, ai_score=4.0)
+
+        flaky = _FlakyReadConn(store.conn)
+        store.conn = flaky
+        before = A.lock_metrics()["lock_retries"]
+
+        s = store.stats()  # must not raise
+        after = A.lock_metrics()["lock_retries"]
+
+        assert after == before + 1
+        assert s["total"] == 1
+        assert s["urgent"] == 1
+
+    def test_read_collision_non_retryable_propagates(self, store, monkeypatch):
+        """Tight discrimination on the read path too: a non-allowlisted
+        DatabaseError (IntegrityError) must still propagate, never be
+        silently retried/swallowed by the now-decorated readers."""
+        from storage import article_store as A
+        monkeypatch.setattr(A.time, "sleep", lambda *a, **k: None)
+
+        class _IntegrityReadConn:
+            def __init__(self, real):
+                self._real = real
+            def execute(self, *a, **k):
+                raise sqlite3.IntegrityError("UNIQUE constraint failed")
+            def __getattr__(self, n):
+                return getattr(self._real, n)
+
+        store.conn = _IntegrityReadConn(store.conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            store.stats()

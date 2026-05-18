@@ -6,6 +6,8 @@ paper-trader/backtest.db-wal
 paper-trader/backtest.db-shm
 paper-trader/logs/
 paper-trader/state/
+digital-intern/logs/
+digital-intern/.supervisor_state.*.tmp
 __pycache__/
 *.pyc
 *.pyo
