@@ -27,9 +27,10 @@ def _ladder(*rungs):
     return out
 
 
-def _paralysis(state, *, can_act, total_value, ladder=None, recommended=None):
+def _paralysis(state, *, can_act, total_value, cash=6.23, ladder=None,
+               recommended=None):
     return {"state": state, "can_act_on_signal": can_act,
-            "total_value": total_value, "cash": 6.23, "cash_pct": 0.6,
+            "total_value": total_value, "cash": cash, "cash_pct": 0.6,
             "deployed_pct": 99.4, "min_actionable_usd": 9.73,
             "unlock_ladder": ladder or [],
             "recommended_unlock": recommended}
@@ -39,7 +40,11 @@ def test_free_all_actionable_funded_no_unlock_chain():
     sg = [_sugg("NVDA", "BUY", 0.70), _sugg("AMD", "ADD", 0.30),
           _sugg("MSFT", "HOLD", 0.0), _sugg("T", "WATCH", 0.1),
           _sugg("X", "TRIM", 0.4), _sugg("Z", "EXIT", 0.9)]
-    p = _paralysis("FREE", can_act=True, total_value=1000.0)
+    # cash genuinely covers every advisory notional → still all FUNDED.
+    # (Originally cash was left at the helper default 6.23, which is an
+    #  under-specified FREE fixture: a FREE book with $6 cash can't actually
+    #  fund a $700 notional. Specifying cash makes the FUNDED claim honest.)
+    p = _paralysis("FREE", can_act=True, total_value=1000.0, cash=1000.0)
     out = build_funded_suggestions(sg, p)
 
     assert out["state"] == "FREE"
@@ -146,10 +151,80 @@ def test_conviction_tie_break_is_deterministic():
     # Same conviction → alphabetical ticker wins (stable, reproducible).
     sg = [_sugg("ZZZ", "BUY", 0.60), _sugg("AAA", "BUY", 0.60),
           _sugg("MMM", "ADD", 0.60)]
-    p = _paralysis("FREE", can_act=True, total_value=1000.0)
+    p = _paralysis("FREE", can_act=True, total_value=1000.0, cash=1000.0)
     out = build_funded_suggestions(sg, p)
     assert [i["ticker"] for i in out["ideas"]] == ["AAA", "MMM", "ZZZ"]
     assert out["top_actionable"]["ticker"] == "AAA"
+
+
+# ── Honest buying-power: can_act only means cash ≥ a tiny floor, NOT that cash
+#    covers the advisory notional. The panel must not paint a $856 idea green
+#    "FUNDED — no sale required" on $18 cash. (live repro 2026-05-18) ──────────
+
+def test_free_but_cash_below_notional_is_partial_with_unlock_chain():
+    # Live repro: $973 book, $18.49 cash, BUY NVDA conv 0.88 → $856 notional.
+    sg = [_sugg("NVDA", "BUY", 0.88)]
+    lad = _ladder(("LITE", 592.13), ("MU", 362.06))   # cum: 592.13, 954.19
+    p = _paralysis("FREE", can_act=True, total_value=973.0, cash=18.49,
+                   ladder=lad, recommended={"ticker": "LITE"})
+    out = build_funded_suggestions(sg, p)
+
+    idea = out["ideas"][0]
+    assert idea["suggested_notional_usd"] == round(0.88 * 973.0, 2)  # 856.24
+    assert idea["fundability"] == "PARTIAL"          # NOT the old green FUNDED
+    # minimum sale prefix s.t. cash + cumulative_freed covers the notional
+    assert idea["funded_by"] == ["LITE", "MU"]
+    assert idea["frees_usd"] == 954.19
+    assert idea["enough"] is True
+    assert out["n_partial"] == 1
+    assert out["n_funded"] == 0
+    # headline must not keep claiming it is "fundable from cash now"
+    assert "fundable from cash now" not in out["headline"]
+    assert "NVDA" in out["headline"]
+
+
+def test_free_cash_covers_notional_stays_fully_funded():
+    sg = [_sugg("AMD", "BUY", 0.50)]                  # notional = 500
+    p = _paralysis("FREE", can_act=True, total_value=1000.0, cash=1000.0)
+    out = build_funded_suggestions(sg, p)
+
+    idea = out["ideas"][0]
+    assert idea["fundability"] == "FUNDED"            # cash truly covers it
+    assert idea["funded_by"] == []
+    assert idea["frees_usd"] == 0.0
+    assert idea["enough"] is True
+    assert out["n_funded"] == 1
+    assert out["n_partial"] == 0
+
+
+def test_free_cash_below_notional_ladder_insufficient_is_partial_not_enough():
+    sg = [_sugg("TQQQ", "BUY", 0.95)]                 # notional = 950
+    lad = _ladder(("A", 100.0), ("B", 50.0))          # cum max 150
+    p = _paralysis("FREE", can_act=True, total_value=1000.0, cash=10.0,
+                   ladder=lad)
+    out = build_funded_suggestions(sg, p)
+
+    idea = out["ideas"][0]
+    # cash funds *part* of it → still PARTIAL (better than UNFUNDABLE: there
+    # IS cash), but selling the whole ladder still can't reach the notional.
+    assert idea["fundability"] == "PARTIAL"
+    assert idea["funded_by"] == ["A", "B"]            # full ladder, best effort
+    assert idea["frees_usd"] == 150.0
+    assert idea["enough"] is False
+    assert out["n_partial"] == 1
+
+
+def test_free_cash_below_notional_no_ladder_is_partial_not_enough():
+    sg = [_sugg("NVDA", "BUY", 0.50)]                 # notional = 500
+    p = _paralysis("FREE", can_act=True, total_value=1000.0, cash=20.0,
+                   ladder=[])
+    out = build_funded_suggestions(sg, p)
+
+    idea = out["ideas"][0]
+    assert idea["fundability"] == "PARTIAL"
+    assert idea["funded_by"] == []
+    assert idea["frees_usd"] == 0.0
+    assert idea["enough"] is False
 
 
 def test_non_buy_actions_never_funding_checked():

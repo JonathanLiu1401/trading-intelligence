@@ -1521,6 +1521,7 @@ TEMPLATE = r"""
       <div class="stat-row" style="margin-bottom:14px;">
         <div class="stat"><div class="l">actionable ideas</div><div class="v" id="fund-n">—</div></div>
         <div class="stat"><div class="l">funded now</div><div class="v" id="fund-funded">—</div></div>
+        <div class="stat"><div class="l">partial (cash + sale)</div><div class="v" id="fund-partial">—</div></div>
         <div class="stat"><div class="l">unlockable via sale</div><div class="v" id="fund-unlock">—</div></div>
         <div class="stat"><div class="l">unfundable</div><div class="v" id="fund-unfund">—</div></div>
         <div class="stat"><div class="l">pairing</div><div class="v" id="fund-pair">—</div></div>
@@ -5285,6 +5286,11 @@ async function refreshFundedSuggestions() {
   const fF = document.getElementById("fund-funded");
   fF.textContent = r.n_funded != null ? r.n_funded : "—";
   fF.style.color = (r.n_funded || 0) > 0 ? "#4caf50" : "#8b929d";
+  const fP = document.getElementById("fund-partial");
+  if (fP) {
+    fP.textContent = r.n_partial != null ? r.n_partial : "—";
+    fP.style.color = (r.n_partial || 0) > 0 ? "#ffd54f" : "#8b929d";
+  }
   const fU = document.getElementById("fund-unlock");
   fU.textContent = r.n_unlockable != null ? r.n_unlockable : "—";
   fU.style.color = (r.n_unlockable || 0) > 0 ? "#ffa726" : "#8b929d";
@@ -5294,7 +5300,7 @@ async function refreshFundedSuggestions() {
   const pr = r.recommended_pairing;
   document.getElementById("fund-pair").textContent =
     pr ? ("sell " + pr.sell + " → buy " + pr.buy) : "—";
-  const fmap = { FUNDED: "#4caf50", UNLOCKABLE: "#ffa726", UNFUNDABLE: "#ff4455" };
+  const fmap = { FUNDED: "#4caf50", PARTIAL: "#ffd54f", UNLOCKABLE: "#ffa726", UNFUNDABLE: "#ff4455" };
   const rows = r.ideas || [];
   const tb = document.querySelector("#fund-rows tbody");
   tb.innerHTML = rows.length ? rows.map(i => `<tr>
@@ -8002,6 +8008,48 @@ def empty_claude_rate_api():
             "concurrent_opus_processes": concurrent_opus,
             "verdict": verdict,
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/host-guard")
+def host_guard_api():
+    """Live host-saturation verdict + the NEW 'skipped claude call' bucket.
+
+    The recurring NO_DECISION storms are host saturation, not a prompt/parser
+    bug (paper_trader/host_guard.py). strategy.decide() now pre-flight-skips
+    the Opus call when host_guard.host_saturated() trips, recording a distinct
+    ``skipped claude call — …`` reason instead of spawning a doomed ~1.5GB
+    subprocess into the storm. /api/empty-claude-rate keys off the OLD
+    ``claude returned no response`` prefix, so once the guard is live an
+    operator would see the empty rate fall and wrongly conclude it's fixed —
+    when really the skip bucket merely replaced it. This endpoint surfaces
+    both: the raw saturation snapshot (host_guard.snapshot — verdict + /proc
+    probe + empty-rate) AND the recent deliberate-skip rate, so 'box
+    overloaded' stays visible after the fix. Read-only, degrade-safe — never
+    raises into the dashboard (mirrors /api/empty-claude-rate's contract)."""
+    try:
+        from . import host_guard
+        snap = host_guard.snapshot()
+
+        # Recent deliberate-skip rate — the bucket strategy.decide() now
+        # writes when the guard declines the call. Mirrors host_guard's
+        # recent_empty_rate shape; degrade-safe (ok=False on any error).
+        skip = {"n": 0, "skipped": 0, "rate": 0.0, "ok": False}
+        try:
+            rows = get_store().recent_decisions(limit=120)
+            n = len(rows)
+            sk = sum(
+                1 for d in rows
+                if (d.get("action_taken") or "") == "NO_DECISION"
+                and (d.get("reasoning") or "").startswith("skipped claude call")
+            )
+            skip.update(n=n, skipped=sk,
+                        rate=round(sk / n, 3) if n else 0.0, ok=True)
+        except Exception:
+            pass
+        snap["recent_skip_rate"] = skip
+        return jsonify(snap)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
