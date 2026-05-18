@@ -11,7 +11,7 @@ import yfinance as yf
 NY = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 
-# 2026 NYSE holidays (full closes). Half-days not enforced — we'll trade through them.
+# 2026 NYSE holidays (full closes).
 NYSE_HOLIDAYS_2026 = {
     date(2026, 1, 1),    # New Year's Day
     date(2026, 1, 19),   # MLK Day
@@ -24,6 +24,38 @@ NYSE_HOLIDAYS_2026 = {
     date(2026, 11, 26),  # Thanksgiving
     date(2026, 12, 25),  # Christmas
 }
+
+# 2026 NYSE early-close half-days — the regular session ends at 1:00 p.m. ET,
+# not 4:00 p.m. Previously "not enforced — we'll trade through them", which
+# meant the engine believed the market was open 13:00–16:00 ET on these days:
+# it ran the fast 30-min OPEN cadence and *executed trades against frozen
+# post-close yfinance marks* for three hours of a CLOSED market, twice a year.
+# Enforcing the early close makes is_market_open() — and therefore the runner
+# sleep cadence, the prompt's MARKET_OPEN flag, and every market-hours gate —
+# correct on these days. An unknown half-day still falls through to the 16:00
+# close (same conservative "trade through what we don't know" default the
+# holiday calendar uses).
+NYSE_HALF_DAYS_2026 = {
+    date(2026, 11, 27),  # Day after Thanksgiving — 1:00 p.m. ET close
+    date(2026, 12, 24),  # Christmas Eve — 1:00 p.m. ET close
+}
+
+_REGULAR_CLOSE_MIN = 16 * 60       # 16:00 ET, minutes since ET midnight
+_EARLY_CLOSE_MIN = 13 * 60         # 13:00 ET half-day close
+_OPEN_MIN = 9 * 60 + 30            # 09:30 ET open
+
+
+def is_half_day(d: date) -> bool:
+    """True if ``d`` is a known NYSE early-close (1:00 p.m. ET) session."""
+    return d in NYSE_HALF_DAYS_2026
+
+
+def close_minute(d: date) -> int:
+    """NYSE regular-session close for ``d`` as minutes since ET midnight:
+    13:00 on a known half-day, otherwise the regular 16:00 close. A weekend
+    or full holiday has no session — callers gate that separately via
+    ``is_market_open``; this only answers 'when does the bell ring'."""
+    return _EARLY_CLOSE_MIN if d in NYSE_HALF_DAYS_2026 else _REGULAR_CLOSE_MIN
 
 _PRICE_CACHE: dict[str, tuple[float, float]] = {}  # ticker -> (price, ts)
 _PRICE_TTL = 30.0  # seconds
@@ -60,7 +92,7 @@ def is_market_open(now: datetime | None = None) -> bool:
     if now.date() in NYSE_HOLIDAYS_2026:
         return False
     minutes = now.hour * 60 + now.minute
-    return 9 * 60 + 30 <= minutes < 16 * 60
+    return _OPEN_MIN <= minutes < close_minute(now.date())
 
 
 def _cached_price(ticker: str) -> float | None:
