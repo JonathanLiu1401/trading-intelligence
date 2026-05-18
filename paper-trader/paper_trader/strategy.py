@@ -610,6 +610,7 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    self_review_block: str | None = None,
                    track_record_block: str | None = None,
                    risk_mirror_block: str | None = None,
+                   sector_exposure_block: str | None = None,
                    event_calendar_block: str | None = None,
                    buying_power_block: str | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
@@ -678,6 +679,14 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # behavioural stack so the trader sees its structural risk (book shape +
     # turnover) right after its history and before market data biases it.
     risk_section = f"{risk_mirror_block}\n" if risk_mirror_block else ""
+    # Live-book SECTOR concentration — the natural sibling of the risk-mirror
+    # (name concentration), one dimension over: how the book clusters by
+    # sector + which in-play names would pile onto an already-heavy sector.
+    # Same observational/advisory contract as the mirrors above (invariants
+    # #2/#12). Placed immediately after the name-concentration mirror and
+    # before the forward event block — the trader sees its structural risk by
+    # name, then by sector, then what is *coming*, before prices bias it.
+    sector_section = f"{sector_exposure_block}\n" if sector_exposure_block else ""
     # Forward scheduled-event awareness (earnings) — same observational/
     # advisory contract as the three mirrors above (invariants #2/#12). Placed
     # right after the backward-looking behavioural stack and before market
@@ -701,7 +710,7 @@ PORTFOLIO:
   total value: ${snapshot['total_value']:.2f}
   positions:
 {chr(10).join(pos_lines) if pos_lines else '  (none)'}
-{review_section}{track_section}{risk_section}{event_section}{bp_section}
+{review_section}{track_section}{risk_section}{sector_section}{event_section}{bp_section}
 WATCHLIST PRICES:
 {chr(10).join(px_lines)}
 
@@ -1200,6 +1209,28 @@ def decide() -> dict:
     except Exception as e:
         print(f"[strategy] risk-mirror failed (non-fatal): {e}")
 
+    # Live-book SECTOR concentration — risk_mirror closed *name*-level
+    # concentration; the documented #3 pathology is one dimension over,
+    # *sector* clustering ("the book 60.9% in one name's sector ... the
+    # decision engine itself never saw [it]"). Pure arithmetic over the
+    # already-marked snapshot + a static SECTOR_MAP (NO extra store read / NO
+    # network — the risk_mirror hot-path discipline). Scoped to the SAME
+    # `_names_in_play` set the quant / track-record / buying-power blocks use
+    # so the marginal "what would I be adding to" view matches "what matters
+    # this cycle". Observational only (invariants #2/#12 — the buying_power
+    # precedent); wrapped so a diagnostics fault is "no sector block this
+    # cycle", never "no decision this cycle".
+    sector_exposure_block: str | None = None
+    try:
+        from .analytics.sector_exposure import build_sector_exposure
+        sx = build_sector_exposure(
+            snap,
+            _names_in_play(snap.get("positions") or [], merged, WATCHLIST),
+        )
+        sector_exposure_block = sx.get("prompt_block")
+    except Exception as e:
+        print(f"[strategy] sector-exposure failed (non-fatal): {e}")
+
     # Forward scheduled-event awareness — the #1 thing a discretionary desk
     # tracks that the engine was fully blind to: upcoming EARNINGS on the
     # names in play. Reads digital-intern's earnings_calendar.json snapshot
@@ -1277,6 +1308,7 @@ def decide() -> dict:
                              self_review_block=self_review_block,
                              track_record_block=track_record_block,
                              risk_mirror_block=risk_mirror_block,
+                             sector_exposure_block=sector_exposure_block,
                              event_calendar_block=event_calendar_block,
                              buying_power_block=buying_power_block)
     prompt = f"{SYSTEM_PROMPT}\n\n---\nCONTEXT:\n{payload}"
