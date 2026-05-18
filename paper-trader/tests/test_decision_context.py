@@ -126,7 +126,8 @@ class TestInputSummary:
         a = r["advisory_blocks"]
         assert a == {"self_review": True, "track_record": True,
                      "risk_mirror": False, "ml_opinion": False,
-                     "event_calendar": False, "buying_power": False}
+                     "event_calendar": False, "buying_power": False,
+                     "sector_exposure": False}
 
 
 class TestNewAdvisoryBlocksReachPrompt:
@@ -163,8 +164,37 @@ class TestNewAdvisoryBlocksReachPrompt:
         a = r["advisory_blocks"]
         assert a["event_calendar"] is False
         assert a["buying_power"] is False
+        assert a["sector_exposure"] is False
         assert "EARNINGS WITHIN 14D" not in r["prompt"]
         assert "BUYING POWER" not in r["prompt"]
+        assert "SECTOR EXPOSURE" not in r["prompt"]
+
+    def test_sector_exposure_block_reaches_prompt_verbatim_and_flagged(self):
+        """Regression lock (this pass): commit b471188 threaded a
+        ``sector_exposure_block`` into the real ``strategy.decide()`` →
+        ``_build_payload`` call but never updated this reconstruction —
+        so ``/api/decision-context`` silently dropped a 7th advisory block
+        while its docstring still promised a string "byte-identical to the
+        live prompt". A trader auditing "did Opus see that this BUY piles
+        onto an already-61%-semis book?" got a false NO. This locks the
+        block back in: verbatim text + flag + the exact ``_build_payload``
+        ordering (sector renders AFTER risk_mirror and BEFORE event_calendar
+        / buying_power, all before WATCHLIST PRICES)."""
+        r = _ctx(
+            risk_mirror_block="RISK MIRROR: top weight 61%",
+            sector_exposure_block="SECTOR EXPOSURE: SEMIS 61.0% of book",
+            event_calendar_block="EARNINGS WITHIN 14D: NVDA reports 2026-05-28",
+            buying_power_block="BUYING POWER: $18.49 free cash",
+        )
+        p = r["prompt"]
+        assert "SECTOR EXPOSURE: SEMIS 61.0% of book" in p
+        assert r["advisory_blocks"]["sector_exposure"] is True
+        # byte-faithful to _build_payload's
+        # {risk}{sector}{event}{bp} render order
+        assert p.index("RISK MIRROR") < p.index("SECTOR EXPOSURE")
+        assert p.index("SECTOR EXPOSURE") < p.index("EARNINGS WITHIN 14D")
+        assert p.index("EARNINGS WITHIN 14D") < p.index("BUYING POWER")
+        assert p.index("BUYING POWER") < p.index("WATCHLIST PRICES:")
 
     def test_embeds_mark_integrity_verbatim(self):
         snap = _snapshot([

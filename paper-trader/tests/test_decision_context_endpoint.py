@@ -126,6 +126,22 @@ class TestDecisionContextEndpoint:
         # a trader auditing the block set must never hit a missing key.
         assert "event_calendar" in j["advisory_blocks"]
 
+    def test_sector_exposure_block_reaches_reconstructed_prompt(
+            self, client_store, monkeypatch):
+        """assemble_inputs must also build the sector_exposure block
+        decide() builds (commit b471188) — else the inspector under-reports
+        what Opus sees, exactly like the buying_power gap above.
+        sector_exposure.build_sector_exposure ALWAYS returns a non-empty
+        prompt_block (even NO_DATA), so a faithful reconstruction MUST
+        surface it. Before this pass, assemble_inputs never built it and
+        the endpoint silently dropped a 7th advisory block."""
+        client, _s = client_store
+        _offline(monkeypatch)
+        j = client.get("/api/decision-context").get_json()
+        assert "error" not in j, j
+        assert j["advisory_blocks"].get("sector_exposure") is True
+        assert "SECTOR EXPOSURE" in j["prompt"]
+
     def test_degraded_feed_when_half_prices_missing(self, client_store,
                                                     monkeypatch):
         client, _s = client_store
