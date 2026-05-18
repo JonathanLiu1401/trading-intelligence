@@ -5932,3 +5932,133 @@ features_added = 1 · user_findings = 5.**
   zero-diff); AGENTS.md append-only & committed separately.
 
 *Review pass #22 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 review pass #25 (paper-trader core hybrid · EQUITY FRESHNESS builder+endpoint+Discord line · live findings)
+
+- **Phase 1 — no new bug (bugs_fixed = 0; no Phase-1 commit, the commit
+  guard explicitly permits it).** Read the seven core files in full
+  (`runner.py`, `reporter.py`, `signals.py`, `strategy.py`, `market.py`,
+  `store.py`) + targeted `dashboard.py` sweep. Re-traced `decide()`'s
+  claude/fallback/retry + host-saturation pre-flight/mid-call-reprobe state
+  machine, the singleton degrade/recheck path, `_mark_to_market`
+  expired-option/`stale_mark`, `_maybe_daily_close` half-day anchoring,
+  `store.upsert_position` reactivate/blend, `get_prices` bulk fallback.
+  **Advisor-directed live forensic discriminator:**
+  `grep -n "_portfolio_snapshot\|update_portfolio\|update_position_marks\|
+  upsert_position\|record_equity_point" paper_trader/dashboard.py`
+  returned **zero matches** — the dashboard never writes `portfolio` /
+  `equity_curve`, so the live `/api/portfolio`($924.13) vs
+  `/api/benchmark`($928.92) gap is the documented *mid-cycle slow snapshot*
+  (only `decide()` writes equity, paired with the decision), **not** a
+  hidden-writer bug. Memory `pt-portfolio-equity-divergence` still holds;
+  Phase-1 `bugs_fixed=0` is the honest call, consistent with the 24 prior
+  mature core passes. Focused-core baseline green before the feature (370:
+  `test_core_{market,store,runner,strategy,signals,reporter}`).
+
+- **Feature shipped (Phase 2, `feat(analytics):`): EQUITY FRESHNESS — the
+  portfolio-vs-latest-equity-point divergence builder, the explicitly-
+  deferred pass-#24 finding #2.** Pass #24 logged "A 'portfolio vs latest
+  equity-point divergence' builder would close this; out of scope for a
+  lean pass" — this ships it. New pure core
+  `paper_trader/analytics/equity_freshness.py::build_equity_freshness`
+  compares the live `portfolio` table total against the **latest recorded
+  `equity_curve` point**. Under a host-saturation NO_DECISION storm the
+  portfolio table re-marks every cycle while the curve lags a whole cycle
+  behind, so `/api/benchmark` + the hourly `_benchmark_line`,
+  `/api/drawdown`, `/api/analytics` Sharpe and the hourly P/L (all derived
+  from `equity_curve`) silently misstate the true account by the
+  divergence — `equity_integrity` reads CLEAN (the gap is
+  portfolio-vs-curve, not *within* recorded points) so it does NOT cover
+  this dimension. Verdict ladder `NO_DATA` / `FRESH` / `STALE_CURVE` /
+  `DIVERGED`; **the actionable `DIVERGED` requires BOTH staleness AND
+  >`divergence_pct` value gap** (advisor-directed — single-condition
+  triggers spam on the by-construction ~1-cycle lag every healthy book
+  carries). Cadence-aware stale threshold (2×`OPEN_INTERVAL_S` open /
+  2×`CLOSED_INTERVAL_S` closed) selected from a `market_open` bool param
+  (the `build_runner_heartbeat` precedent). Pure/total, never raises
+  (non-iterable / garbage → degrades), future-`curve_ts` clamps age to 0
+  (the `_hold_age_str` clock-skew precedent), anchors to the newest
+  *positive* recorded point (skips corruption `equity_integrity` owns).
+  Deliberately does **not** recompute a "corrected" benchmark (the
+  `equity_integrity` reports-but-never-repairs precedent; AGENTS.md
+  invariants #2/#12 — observational, never gates, no caps). `__main__` CLI
+  (exit 2 on `DIVERGED`) for when :8090 is wedged (the `benchmark.py` CLI
+  precedent). Wired `/api/equity-freshness` (mirrors `equity_integrity_api`
+  exactly, EOF lowest-collision insertion) and
+  `reporter._equity_freshness_line` into **both** `send_hourly_summary` and
+  `send_daily_close` immediately after `_equity_integrity_line`
+  (data-integrity grouped, before the P&L/session blocks); composes the
+  builder **verbatim** (invariant #10) with the **identical** store reads
+  the endpoint uses, surfaces only `DIVERGED`/`STALE_CURVE`
+  (`FRESH`/`NO_DATA`/`ERROR` suppressed — the `_equity_integrity_line`
+  lying-green-light precedent). **NOT** added to the Opus prompt
+  (advisor-directed — operator-facing benchmark headlines, Opus never reads
+  the hourly back). **32 new exact-assert tests** (`tests/
+  test_equity_freshness.py` — builder verdicts/values, the strict-`>` band
+  edge, cadence-aware open/closed threshold, corrupt-point skipping,
+  clock-stepped-back clamp, never-raises, + Flask-client endpoint
+  faithful-thin-wrapper/CORS/never-500s; `tests/test_core_reporter.py::
+  TestEquityFreshnessLine` — verbatim-surface/suppression/degrade +
+  real-builder no-drift on a backdated temp-Store row + hourly/daily
+  wiring). 437 focused-core+related green.
+  ```bash
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest \
+    tests/test_equity_freshness.py tests/test_core_reporter.py -q   # green
+  cd /home/zeph/trading-intelligence/paper-trader && \
+    python3 -m paper_trader.analytics.equity_freshness            # CLI
+  ```
+
+- **Phase 3 — live findings (running `:8090`, runner pid 1946523, host
+  under the review-swarm load this pass's own siblings contribute to —
+  IDLE_STORM live). 3 distinct + positive confirmation.**
+  1. **Live trader frozen — IDLE_STORM (HIGH, host-saturation, NOT a
+     code/prompt bug — continuity, recalled
+     `pt-no-decision-host-saturation`).** Last 6+ `decisions` all
+     `NO_DECISION`; `/api/runner-heartbeat` `decision_efficacy=IDLE_STORM`,
+     `restart_recommended=true`. Architectural reality of the 15GB box
+     under the concurrent Opus review swarm + backtest committee;
+     self-clears when the swarm ends. Not actionable in code.
+  2. **NEW feature deployed & validated live.** The git-watcher
+     auto-restarted the runner (pid 1946523, 68s uptime) onto the new
+     on-disk code, so `/api/equity-freshness` serves **200** with the
+     correct shape. Live state caught the gap precisely: `portfolio
+     $926.95` vs frozen `curve $921.04` = **+0.64%** (over the 0.5% band)
+     but correctly **`FRESH`** because the curve was only ~4m old (< the
+     60m open stale threshold) — the "both stale AND diverged" gate
+     suppressing normal mid-cycle drift exactly as the advisor prescribed;
+     it flips to `DIVERGED` (and into Discord) only when a storm freezes
+     the curve past threshold. The earlier-observed `$924.13` vs `$928.92`
+     ($4.79 benchmark-headline overstatement) is the `DIVERGED` case this
+     feature now closes — confirmed reachable.
+  3. **Benchmark headline still computes off the curve (MEDIUM,
+     by-design).** `/api/benchmark` "LAGGING 6.86pp / $928.92" is off the
+     `equity_curve` latest point, not the live `portfolio` table — exactly
+     the silent-misstatement this feature now makes *visible* in Discord
+     (it does not, and by invariant #2/#12 must not, "fix" the benchmark
+     math itself). Working as intended: surface, don't repair.
+  4. **POSITIVE — data + book trust intact.** `/api/equity-integrity`
+     `CLEAN` (800 points, cash never negative), `/api/mark-integrity`
+     `CLEAN` (all marks live), `continuous.log` healthy (GDELT backoff
+     only, backtest loop progressing). The freeze is isolated to the Opus
+     call, not a blind feed / corrupt book / dark channel.
+
+  1 is host/ops continuity; 2 is the shipped-and-validated feature; 3 is
+  the real trader-perspective gap the feature now closes (surface, not
+  repair — deliberate, per invariants #2/#12); 4 is positive confirmation.
+  No Phase-3 fix folded in (the only code change in scope is the Phase-2
+  feature).
+
+- **Concurrency / staging discipline.** Heavy concurrent siblings on the
+  shared monorepo tree (sibling ML/backtest HYBRID active, dirty
+  `../digital-intern/`; AGENTS.md grew 5726→5934 lines mid-pass from
+  sibling appends). Never `git add -A`. Staged exactly the five
+  path-scoped files (`paper_trader/analytics/equity_freshness.py`,
+  `paper_trader/dashboard.py`, `paper_trader/reporter.py`,
+  `tests/test_equity_freshness.py`, `tests/test_core_reporter.py`);
+  `git diff --staged` verified zero sibling tokens before commit. AGENTS.md
+  appended-only & committed separately alongside (not counted as the
+  feature).
+
+*Review pass #25 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
