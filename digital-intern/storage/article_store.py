@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -135,6 +136,17 @@ _LIVE_ONLY_CLAUSE = (
     "AND source NOT LIKE 'opus_annotation%'"
 )
 
+# Max rows any single resolved publisher domain may occupy in one heartbeat
+# briefing. Live evidence (2026-05-18): one scrape channel
+# (``scraped/finance.yahoo.com`` price-quote widget pages, ML-scored ~9.9)
+# took 10 of the top-50 briefing slots, several near-identical, crowding out
+# diverse real headlines — the consuming analyst's top noise complaint. The
+# cap re-prioritises the digest for source diversity; it NEVER shrinks it
+# (a low-diversity window backfills from score-ordered overflow). Tuned so a
+# single publisher can hold at most ~⅓ of a 20-slot digest yet a genuinely
+# active wire is still well represented.
+BRIEFING_MAX_PER_DOMAIN = 6
+
 # Global non-reentrant inference lock — prevents two callers running
 # score_pending() concurrently. Non-blocking acquire so concurrent
 # callers no-op rather than queue.
@@ -254,6 +266,38 @@ def _published_older_than(published: str, cutoff: datetime) -> bool:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt < cutoff
+
+
+def _briefing_domain_key(source: str) -> str:
+    """Resolve a ``source`` tag to a diversity-grouping key for the briefing cap.
+
+    Aggregator-prefixed tags carry the real publisher as an embedded host:
+    ``scraped/finance.yahoo.com`` → ``finance.yahoo.com``,
+    ``GDELT/techtimes.com`` → ``techtimes.com``. When a dotted host is present
+    that host (verbatim, not eTLD+1 — avoids the ``co.uk`` public-suffix trap)
+    is the key, so the live failure mode (the same scrape host repeated 10×)
+    collapses to one bucket. Tags with no dotted host (``GoogleNews/MSN``,
+    ``AlphaVantage/Seeking Alpha``, ``Reuters Markets GN``) fall back to the
+    full normalised tag, so distinct publishers under one aggregator stay
+    distinct and only exact-duplicate tags are capped — deliberately
+    conservative.
+
+    Intentionally a small local helper rather than reusing
+    ``ml.features._domain_candidates``: the storage layer must not pull the
+    ml/numpy import graph (and risk an import cycle) for a pure string key,
+    and the diversity key does not need to match credibility resolution
+    byte-for-byte — it only needs to group obvious same-publisher repetition.
+    """
+    if not source:
+        return ""
+    s = source.strip().lower()
+    for part in re.split(r"[\s/:|]+", s):
+        part = part.strip().strip(".")
+        if part.startswith("www."):
+            part = part[4:]
+        if "." in part and len(part) >= 4 and not part.replace(".", "").isdigit():
+            return part
+    return s
 
 
 def compress(text: str) -> bytes:
@@ -738,20 +782,36 @@ class ArticleStore:
             (since, pub_cutoff, limit * 3),
         )
         rows = cur.fetchall()
+        # Per-publisher-domain diversity cap. ``rows`` is already score-ordered
+        # (SQL ORDER BY), so the FIRST up-to-cap rows of any domain are its
+        # highest-scored ones; weaker same-domain rows spill to ``overflow``.
+        # The cap is then backfilled from that score-ordered overflow so the
+        # digest is NEVER shorter than the pre-cap behaviour — it is only
+        # re-prioritised for source diversity. See BRIEFING_MAX_PER_DOMAIN.
         out = []
+        overflow = []
+        per_domain: dict[str, int] = {}
         for r in rows:
             if _published_older_than(r[10], pub_cutoff_dt):
                 continue  # GDELT/RSS-indexed stale article — not breaking news
-            out.append(
-                {"_id": r[0], "link": r[1], "title": r[2], "source": r[3],
-                 "ai_score": r[4] if r[4] else (r[9] or 0),
-                 "_relevance_score": r[5],
-                 "summary": decompress(r[6]) if r[6] else "",
-                 "first_seen": r[7],
-                 "time_sensitivity": r[8]}
-            )
+            item = {"_id": r[0], "link": r[1], "title": r[2], "source": r[3],
+                    "ai_score": r[4] if r[4] else (r[9] or 0),
+                    "_relevance_score": r[5],
+                    "summary": decompress(r[6]) if r[6] else "",
+                    "first_seen": r[7],
+                    "time_sensitivity": r[8]}
+            key = _briefing_domain_key(r[3] or "")
+            if per_domain.get(key, 0) >= BRIEFING_MAX_PER_DOMAIN:
+                overflow.append(item)
+                continue
+            per_domain[key] = per_domain.get(key, 0) + 1
+            out.append(item)
             if len(out) >= limit:
-                break
+                return out
+        # Cap left us short of `limit` (low-diversity window): backfill from the
+        # highest-scored overflow so a sparse window still yields a full digest.
+        if len(out) < limit and overflow:
+            out.extend(overflow[: limit - len(out)])
         return out
 
     @_retry_on_lock
