@@ -7483,6 +7483,35 @@ def event_calendar_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/sector-exposure")
+def sector_exposure_api():
+    """The exact live-book sector-concentration block the live trader now
+    sees in its decision prompt (the `risk_mirror` / `event_calendar`
+    prompt↔endpoint parity discipline). Pure arithmetic over the same store
+    snapshot + the verbatim-copied SECTOR_MAP, so this is numerically
+    identical to `/api/analytics` `sector_exposure_pct` (single source of
+    truth, AGENTS.md #10). Observational only; never gates Opus."""
+    try:
+        from .analytics.sector_exposure import build_sector_exposure
+        store = get_store()
+        pf = store.get_portfolio()
+        positions = store.open_positions()
+        snap = {
+            "cash": float(pf.get("cash") or 0.0),
+            "total_value": float(pf.get("total_value") or 0.0),
+            "positions": positions,
+        }
+        try:
+            from .strategy import WATCHLIST as _WATCHLIST, _names_in_play
+            names = _names_in_play(positions, [], _WATCHLIST)
+        except Exception:
+            names = {(p.get("ticker") or "").upper()
+                     for p in positions if p.get("ticker")}
+        return jsonify(build_sector_exposure(snap, names))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ───────── Feature-dev additions (2026-05-15, agent 4) ─────────
 # /api/scorer-confidence — empirical ± bands + directional hit-rate for the
 #                          DecisionScorer, so its point predictions can be

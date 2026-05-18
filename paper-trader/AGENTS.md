@@ -3407,3 +3407,106 @@ two-entries-per-number convention, e.g. the dual #11/#14 passes.)*
   tests/test_event_calendar.py -q`.
 
 *Review pass #15 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 feature-dev pass (Agent 4) — live-book SECTOR concentration in the decision prompt
+
+- **1 feature.** `paper_trader/analytics/sector_exposure.py` +
+  `build_sector_exposure` — **the live book's sector concentration + the
+  marginal in-play sector impact, fed into the live Opus decision prompt.**
+  `risk_mirror` (pass 2026-05-17) closed *name*-level concentration (top
+  weight / HHI by ticker). The book's documented **#3 pathology is exactly
+  one dimension over** — *sector* clustering: `risk_mirror.py`'s own
+  docstring names it ("the book 60.9% in one name's **sector** … the
+  dashboard already exposes both … but the decision engine itself never saw
+  them"). `/api/analytics` computes `sector_exposure_pct` and `/api/risk`
+  per-position sector, but **the decision path had zero sector awareness**
+  (`grep sector paper_trader/strategy.py` prompt path → 0 hits). The marginal
+  question a desk checks before every order — *does this trade pile onto my
+  single most concentrated sector?* — was invisible at decision time. This is
+  the lean, prompt-facing complement to the dashboard-only sector breakdown,
+  the same gap `risk_mirror`/`event_calendar`/`buying_power` each closed one
+  dimension over. Smoke on the documented ~$973 book: `CONCENTRATED · top
+  OPTICAL 60.7% · HHI 0.46 · 3 sector(s)`, and the marginal line correctly
+  flags `LITE→OPTICAL (60.7% — your heaviest sector)` while tagging
+  `TQQQ→BROAD_LEV (0.0% — diversifying)`.
+
+- **Single source of truth.** The book-sector % mirrors `dashboard.py`'s
+  `analytics_api` formula **verbatim** (`price = current_price or avg_cost;
+  val = price*qty*(100 if option else 1); pct = val/total*100`, classified by
+  `SECTOR_MAP`), so `/api/sector-exposure` is *numerically identical* to
+  `/api/analytics` `sector_exposure_pct` for the same store. `SECTOR_MAP` /
+  `classify` are a **test-pinned verbatim copy** of
+  `dashboard.SECTOR_MAP`/`_classify` — duplicated **deliberately** (the
+  `strategy._ml_live_opinion` precedent: importing the ~9k-line Flask
+  `dashboard` onto the live decision hot path is a fragility a `_safe`
+  wrapper should never have to catch, and a sibling edit that broke that
+  import would silently re-blind the desk; the existing test suite already
+  imports `dashboard` universally, so the drift test pays no *new* Flask
+  cost). `tests/test_sector_exposure.py::TestDriftLocks` asserts byte-equality
+  with `dashboard.SECTOR_MAP`, that `classify == dashboard._classify`, and
+  that `SECTOR_HEAVY_PCT == game_plan._SECTOR_HEAVY_PCT == 60.0` — any drift
+  fails CI. (Distinct from `buying_power`, which matches
+  `/api/capital-paralysis` and prefers enriched `market_value`; this matches
+  `/api/analytics`, a different SSoT — keeping the formula identical is what
+  makes the parity test exact.)
+
+- **Observational only, never gates** (invariants #2/#12 — the
+  `risk_mirror`/`buying_power` contract). The preamble disclaims directive/
+  limit and reaffirms full autonomy; the block states facts (per-sector %,
+  sector-HHI + label, which in-play names sit in an already-heavy sector) and
+  issues **no fabricated fill-size projection** (Opus chooses size — the
+  honest deterministic fact is "MU is SEMIS, SEMIS is already 61% of your
+  book", not an invented "would take 61%→73%"). States `NO_DATA`
+  (no priced book — the `buying_power` fallback) → `DIVERSIFIED` →
+  `CONCENTRATED` (top sector ≥ the drift-locked 60.0% heavy mark). Pure,
+  deterministic, never raises (the `_safe` contract; the `decide()` caller
+  also wraps it → a fault is "no sector block this cycle", never "no
+  decision this cycle").
+
+- **Wiring.** `decide()` (try/except, after `risk_mirror`, before
+  `event_calendar`) + `_build_payload(... sector_exposure_block=)` rendered
+  **immediately after `risk_section`, before `event_section`** (structural
+  risk by name → by sector → then what is *coming*). Scoped to the same lean
+  `_names_in_play(positions, merged, WATCHLIST)` set the quant /
+  track-record / buying-power blocks use (the marginal view matches "what
+  matters this cycle"). Served at **`/api/sector-exposure`** (prompt↔endpoint
+  parity — `/api/analytics` and `/api/risk` left untouched, different
+  concerns, already tested).
+
+- **Tests — 24, all green; full suite 1640 passed, 0 failed, 0
+  regressions.** `tests/test_sector_exposure.py` (22): SECTOR_MAP /
+  threshold / classify drift-locks; **every WATCHLIST ticker is classified**
+  (a future watchlist add missing a SECTOR_MAP entry fails here, not silently
+  becomes "% other"); hand-computed exposure %, top-sector, and sector-HHI
+  (0.4321 on a known book); option ×100; avg_cost fallback; CONCENTRATED
+  flips exactly at 60.0 (>=, not 60.01); deterministic tie-break (top ==
+  breakdown[0]); **parity** (builder `sector_pct` == an independent
+  `analytics_api`-formula recompute); marginal heavy/diversifying flags +
+  riskiest-first sort; NO_DATA / None-snapshot; never-raises-on-garbage;
+  observational voice (no directive verb, autonomy preamble); `_build_payload`
+  wiring + None-renders-nothing + after-risk-mirror placement.
+  `tests/test_sector_exposure_endpoint.py` (2): the real `/api/sector-exposure`
+  Flask view on a fresh temp `Store` returns the expected concentrated shape,
+  **and `/api/sector-exposure` `sector_pct` == `/api/analytics`
+  `sector_exposure_pct`** end-to-end (the SSoT promise proven through the app,
+  not a `__main__` smoke — the paper-trader-analytics-verification note).
+
+- **Deploy caveat (the chronic-stale pattern).** The live trader runs many
+  commits behind until a manual restart (CLAUDE.md / passes #6–#15); this
+  feature is **committed but inert until the next paper-trader restart** —
+  `/api/build-info` will read `behind`/`stale` until then. Not restarted here
+  (documented dual-systemd-scope footgun). "Shipped" ≠ "deployed".
+
+- **Concurrency.** Ran with ≥3 sibling agents committing in parallel (HEAD
+  moved `f29e134`→`5f40009` mid-pass; sibling-dirty `reporter.py` /
+  `test_core_reporter.py` / `test_runner_heartbeat.py` and untracked
+  `game_plan.py` / `gate_pnl.py` / … are **not mine — never staged**). New
+  module + 2 new test files + the brainstorm doc are exclusively mine
+  (`git add` whole). `strategy.py` / `dashboard.py` / `AGENTS.md` are
+  contested → only my own hunks staged by path, `git diff --cached` verified
+  to contain zero sibling tokens before commit. Brainstorm/decision recorded
+  in `docs/feature-dev-sector-exposure-2026-05-18.md`.
+
+*Feature-dev pass appended 2026-05-18 (Agent 4). Prior content above is unmodified.*
