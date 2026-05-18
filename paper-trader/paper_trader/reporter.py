@@ -646,6 +646,61 @@ def _capital_pulse_line(store) -> str:
         return ""
 
 
+def _host_pulse_line() -> str:
+    """One-line "is the desk frozen because the *box* is overloaded?" for the
+    hourly / daily report — the **#1 documented live pathology's** missing
+    operator surface.
+
+    The recurring multi-hour ``NO_DECISION`` PARALYSIS droughts (observed
+    2026-05-18: a 27 h drought, 70/90 cycles NO_DECISION, **-5.87% alpha
+    bleed**) are host saturation — the live trader's Opus call OOM-starved by
+    out-of-band parallel Opus (review / backtest agents). ``host_guard``,
+    ``/api/host-guard`` and ``/api/decision-drought`` all *diagnose* it, but
+    the operator who lives in Discord gets hourly/daily summaries that never
+    say it. Worse: ``_capital_pulse_line`` (which DOES reach Discord) reports
+    the same freeze as ``CAPITAL ◈ PINNED`` — sending the operator to *sell a
+    position* when the real, provable fix is killing the parallel Opus jobs
+    (an OPS action; selling frees cash but the next decision still won't
+    happen because Opus is still starved). This routes ``host_guard.pulse()``
+    to the surface the operator actually reads — the same dashboard→Discord
+    trajectory ``_capital_pulse_line`` / ``_stress_line`` each followed.
+
+    Composes ``host_guard.pulse()`` **verbatim** (single source of truth,
+    AGENTS.md invariant #10 — the state/headline are the builder's, never
+    re-derived, so this line, ``/api/host-guard`` and the CLI can never
+    drift). It is appended **before** ``_capital_pulse_line`` in both send
+    paths so a top-down read matches the precedence (host saturation is the
+    dominant, non-trading-fixable cause); both lines can be independently true
+    and neither suppresses the other — the ``_OPS_ACTION`` discriminator in
+    the headline is what stops the operator conflating them. Observational
+    only, no caps, never gates (invariants #2/#12; the ``_capital_pulse_line``
+    / ``_stress_line`` precedent). Pure ``host_guard`` reads — its own
+    read-only DB probe, NO network (the Discord-path discipline).
+
+    Suppression — there must be nothing actionable to say: ``CLEAR`` (the box
+    is fine, or the probe couldn't tell — never cry wolf) → silent (the
+    ``_capital_pulse_line`` ``FREE``-and-not-bleeding / ``_hold_discipline_line``
+    NO_DATA precedent). ``SATURATED`` / ``STARVED`` are ALWAYS surfaced (the
+    desk literally cannot get a decision out). Failure contract mirrors the
+    rest of ``reporter``: any fault degrades to ``""`` ("no host pulse this
+    report"), **never** an exception ("no Discord summary this report")."""
+    try:
+        from . import host_guard
+        pl = host_guard.pulse()
+        if not isinstance(pl, dict):
+            return ""
+        state = pl.get("state")
+        if state in (None, "CLEAR"):
+            return ""
+        headline = pl.get("headline") or ""
+        if not headline:
+            return ""
+        return f"**HOST** ◈ {state}\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] host-pulse line skipped: {e}")
+        return ""
+
+
 def _realized_pl_today(trades_newest_first: list[dict], today: str
                        ) -> tuple[float, int, int] | None:
     """True realized P/L from round-trips that *closed* today (UTC).
@@ -693,7 +748,63 @@ def _realized_pl_today(trades_newest_first: list[dict], today: str
         return None
 
 
-def _portfolio_lines(positions: list[dict]) -> list[str]:
+def _pos_pct_weight(p: dict, total_value: float | None) -> str:
+    """Compact ``  (-11.0% · 59% bk)`` annotation for a Discord position line.
+
+    The two numbers a portfolio manager reads *before* raw qty/avg/mark: the
+    position's own return % and its weight as a share of total equity. The
+    Discord summary is the operator's primary surface, yet it historically
+    showed only ``qty/avg/now/P/L$`` — so a frozen book sitting e.g. 59% in a
+    single −11% name (the live 2026-05-18 LITE state; single-name
+    concentration is the desk's #1 documented pathology) looked the same as a
+    balanced one. This surfaces both, on the surface the operator actually
+    reads.
+
+    Pure arithmetic on the position row + the portfolio total the caller
+    already holds — NOT a re-derived builder verdict (invariant #10 governs
+    verdict/headline single-sourcing; this is the *same* ``pl_pct`` formula
+    ``strategy._mark_to_market`` already feeds Opus). Additive / degrade-safe
+    (the ``stale_mark`` precedent, invariants #2/#12): any missing/garbage
+    field, a stale (cost-fallback) mark, or a non-positive cost/total drops
+    the offending token (or the whole annotation) — it never raises and never
+    emits a misleading number.
+
+      * P/L % is suppressed when the mark is stale (``stale_mark`` True ⇒
+        mark == cost, so a "+0.0%" would lie next to the STALE flag) or when
+        ``avg_cost`` / ``current_price`` is not a usable positive number.
+      * weight % is shown only when ``total_value`` is a positive number and
+        the position carries a usable mark — so the existing test callers
+        that pass no total stay byte-compatible with the no-weight asserts.
+    """
+    def _num(x):
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            return None
+        if x != x:  # NaN
+            return None
+        return float(x)
+
+    parts: list[str] = []
+    avg = _num(p.get("avg_cost"))
+    cur = _num(p.get("current_price"))
+    qty = _num(p.get("qty"))
+    is_opt = p.get("type") in ("call", "put")
+
+    if (not p.get("stale_mark") and avg is not None and avg > 0
+            and cur is not None and cur > 0):
+        parts.append(f"{(cur - avg) / avg * 100.0:+.1f}%")
+
+    tv = _num(total_value)
+    if (tv is not None and tv > 0 and cur is not None and cur > 0
+            and qty is not None):
+        mv = cur * qty * (100.0 if is_opt else 1.0)
+        w = mv / tv * 100.0
+        parts.append(f"{w:.0f}% bk" if w >= 1.0 else f"{w:.1f}% bk")
+
+    return f"  ({' · '.join(parts)})" if parts else ""
+
+
+def _portfolio_lines(positions: list[dict],
+                     total_value: float | None = None) -> list[str]:
     lines = []
     for p in positions:
         # Additive: only positions carrying an explicit ``stale_mark`` True
@@ -702,15 +813,21 @@ def _portfolio_lines(positions: list[dict]) -> list[str]:
         # for the existing Discord path — a genuinely flat $0.00 P/L is not
         # falsely flagged; only a *missing-price* mark is.
         stale = "  ⚠ STALE (price unavailable; marked at cost)" if p.get("stale_mark") else ""
+        # Per-position return % + book weight %. ``total_value`` defaults to
+        # None so any caller that does not pass it (the existing unit-test
+        # callers) gets the no-weight form — byte-compatible with the prior
+        # substring assertions; only the live hourly/daily callers, which
+        # already hold ``pf['total_value']``, opt into the weight token.
+        pw = _pos_pct_weight(p, total_value)
         if p["type"] in ("call", "put"):
             lines.append(
                 f"  {p['ticker']} {p['type'].upper()}{p['strike']} {p['expiry']}  "
-                f"qty {p['qty']}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{stale}"
+                f"qty {p['qty']}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{stale}"
             )
         else:
             lines.append(
                 f"  {p['ticker']:<6} qty {p['qty']:<8} avg ${p['avg_cost']:.2f} "
-                f"now ${(p.get('current_price') or 0):.2f}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{stale}"
+                f"now ${(p.get('current_price') or 0):.2f}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{stale}"
             )
     return lines
 
@@ -1101,7 +1218,7 @@ def send_hourly_summary() -> bool:
         f"{sp_line}\n"
         f"```\n"
         f"**Positions**\n```\n"
-        + ("\n".join(_portfolio_lines(positions)) or "  (none)")
+        + ("\n".join(_portfolio_lines(positions, pf["total_value"])) or "  (none)")
         + "\n```\n**Recent trades**\n```\n"
         + "\n".join(trade_lines)
         + "\n```"
@@ -1133,6 +1250,9 @@ def send_hourly_summary() -> bool:
     stx = _stress_line(store)
     if stx:
         body += "\n" + stx
+    hp = _host_pulse_line()
+    if hp:
+        body += "\n" + hp
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
@@ -1185,7 +1305,7 @@ def send_daily_close() -> bool:
         f"{sp_line}\n"
         f"```\n"
         f"**Open positions**\n```\n"
-        + ("\n".join(_portfolio_lines(positions)) or "  (none)")
+        + ("\n".join(_portfolio_lines(positions, pf["total_value"])) or "  (none)")
         + "\n```"
     )
     lk = _singleton_lock_line()
@@ -1218,6 +1338,9 @@ def send_daily_close() -> bool:
     stx = _stress_line(store)
     if stx:
         body += "\n" + stx
+    hp = _host_pulse_line()
+    if hp:
+        body += "\n" + hp
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
