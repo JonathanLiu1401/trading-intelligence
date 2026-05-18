@@ -6512,3 +6512,47 @@ features_added = 1 · user_findings = 5.**
   separately (not counted as the feature).
 
 *Review pass #29 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### Review pass #28 — AMENDMENT (paper-trader core hybrid, 2026-05-18)
+
+**Revised tally: bugs_fixed=1 · features_added=1 · user_findings=4**
+(supersedes the `bugs_fixed=0` headline of pass #28 above — appended after a
+sibling's pass #29; prior content is unmodified, append-only discipline
+preserved.)
+
+The full 2117-test suite (run to completion in 16m08s under the host-load
+storm — **2116 passed, 1 failed**) surfaced one real, pre-existing,
+in-scope defect the focused-core baseline does not cover:
+`tests/test_swr_prewarm_coverage.py::test_every_swr_cached_endpoint_is_prewarmed`
+**failed on master** — `scorer_attribution_api` carries
+`@swr_cached("scorer-attribution", 60.0)` but the tuple
+`("scorer-attribution", scorer_attribution_api)` was never added to
+`dashboard._swr_prewarm.targets`. Consequence (the exact freeze-triage
+blind spot that regression test exists to lock): the `/api/scorer-attribution`
+panel cold-stalls with `{"warming": true}` on the first poll after **every**
+restart, while every other `@swr_cached` panel is warmed at boot — so a
+trader opening the scorer-attribution panel right after a restart (exactly
+when triaging "why is the engine acting strange?") gets a dead placeholder.
+Not introduced by this pass (the Phase-2 feature touched only
+`reporter.py`); a prior commit added the decorator without the matching
+prewarm target — the precise contract-rot the test guards against.
+
+- **Fix (committed `99053ff`, pushed):** one missing target tuple +
+  freeze-triage comment added to `_swr_prewarm.targets`, restoring the
+  `prewarm == @swr_cached` set invariant. All 3
+  `test_swr_prewarm_coverage.py` tests green
+  (`test_prewarm_handlers_resolve_to_callables` independently confirms the
+  `scorer_attribution_api` symbol resolves to a callable). 50
+  SWR/dashboard-helper tests green, no regression. Surgical: 5 insertions,
+  `dashboard.py` only — staged path-scoped, `git diff --staged` verified
+  zero sibling tokens (only the `+++` header) before commit.
+- **Process note:** the failure was only visible because the full suite was
+  run to completion rather than substituting the focused-core gate — the
+  honest-verification payoff. `pt-test-suite-timing` holds (16m under load;
+  the focused gate is fast but does NOT cover `test_swr_prewarm_coverage`).
+  The two prior pass-#28 commits (`aedda33` feature, `d83f756` AGENTS) and
+  this fix (`99053ff`) are three separate path-scoped commits.
+
+*Review pass #28 AMENDMENT (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
