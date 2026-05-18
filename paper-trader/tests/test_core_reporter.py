@@ -20,6 +20,8 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from datetime import datetime, timezone
+
 from paper_trader import reporter
 from paper_trader import store as store_mod
 from paper_trader.store import Store
@@ -1064,3 +1066,95 @@ class TestHeartbeatLine:
         body = captured[0]
         assert "**HOURLY**" in body and "Equity" in body
         assert "**RUNNER** ◈" not in body
+
+
+class TestAgo:
+    """`_ago` bucket boundaries — minutes < 1h, hours < 1d, days beyond."""
+
+    def test_sub_minute_reads_zero_minutes(self):
+        assert reporter._ago(0) == "0m"
+        assert reporter._ago(59) == "0m"
+
+    def test_minute_and_hour_boundaries(self):
+        assert reporter._ago(60) == "1m"
+        assert reporter._ago(3599) == "59m"
+        assert reporter._ago(3600) == "1h"
+        assert reporter._ago(86399) == "23h"
+
+    def test_day_boundary(self):
+        assert reporter._ago(86400) == "1d"
+        assert reporter._ago(200000) == "2d"
+
+    def test_negative_clamps_to_zero(self):
+        assert reporter._ago(-500) == "0m"
+
+
+class TestFmtTradeStamp:
+    """The hourly recent-trade label: today stays bare HH:MM (unchanged),
+    older trades gain the date + a relative age so a frozen-but-active-looking
+    book is unmissable (the desk's #1 documented pathology)."""
+
+    NOW = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_today_is_bare_hhmm(self):
+        assert reporter._fmt_trade_stamp(
+            "2026-05-18T09:38:08.435126+00:00", now=self.NOW) == "09:38"
+
+    def test_yesterday_gets_date_and_day_age(self):
+        # 2026-05-18T12:00 − 2026-05-17T09:38 ≈ 26h → "1d"
+        assert reporter._fmt_trade_stamp(
+            "2026-05-17T09:38:08+00:00", now=self.NOW) == "05-17 09:38 · 1d ago"
+
+    def test_recent_but_not_today_gets_hour_age(self):
+        now = datetime(2026, 5, 18, 1, 0, 0, tzinfo=timezone.utc)
+        assert reporter._fmt_trade_stamp(
+            "2026-05-17T23:30:00+00:00", now=now) == "05-17 23:30 · 1h ago"
+
+    def test_naive_timestamp_treated_as_utc(self):
+        assert reporter._fmt_trade_stamp(
+            "2026-05-17T09:38:08", now=self.NOW) == "05-17 09:38 · 1d ago"
+
+    def test_future_different_day_has_no_negative_age(self):
+        # Clock skew: a future-dated trade must not render "· -1d ago".
+        assert reporter._fmt_trade_stamp(
+            "2026-05-19T13:00:00+00:00", now=self.NOW) == "05-19 13:00"
+
+    def test_malformed_degrades_to_clean_sentinel_never_raises(self):
+        # store always writes a valid ISO timestamp, so a parse failure is
+        # genuinely corrupt data: a clean "??:??" sentinel beats the old
+        # raw[11:16] slice (which rendered garbage like "tamp"), and must
+        # never raise (the reporter additive-line contract).
+        assert reporter._fmt_trade_stamp("not-a-timestamp",
+                                         now=self.NOW) == "??:??"
+        assert reporter._fmt_trade_stamp(None, now=self.NOW) == "??:??"
+
+    def test_hourly_summary_dates_a_stale_trade(self, fresh_store, monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5000.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        # A trade whose ISO timestamp is two days before "now". record_trade
+        # stamps _now(), so inject the row shape send_hourly_summary consumes.
+        stale_ts = "2026-05-16T09:38:08+00:00"
+        monkeypatch.setattr(fresh_store, "recent_trades", lambda n=5: [
+            {"timestamp": stale_ts, "action": "BUY", "qty": 0.5,
+             "ticker": "MU", "price": 724.12},
+        ])
+        # Freeze "now" so the assertion is deterministic regardless of when
+        # the suite runs.
+        import paper_trader.reporter as rep
+        real_dt = rep.datetime
+
+        class _FrozenDT(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return real_dt(2026, 5, 18, 12, 0, 0, tzinfo=tz)
+
+        monkeypatch.setattr(rep, "datetime", _FrozenDT)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        # The trade line now carries the date AND a "Nd ago" age, so a
+        # 2-day-old fill can no longer be misread as today's.
+        assert "05-16 09:38 · 2d ago" in body
+        assert "BUY 0.5 MU @ $724.12" in body

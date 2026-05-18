@@ -775,6 +775,50 @@ def _heartbeat_line(store) -> str:
         return ""
 
 
+def _ago(seconds: float) -> str:
+    """Compact human age: `45m` / `3h` / `2d`. Sub-minute reads `0m`."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+def _fmt_trade_stamp(ts_iso: str | None, now: datetime | None = None) -> str:
+    """Bracket label for a recent-trade line in the hourly summary.
+
+    The block historically showed only `HH:MM` (UTC) with no date. The
+    desk's #1 documented pathology is a book that freezes for many hours
+    while still *looking* active — a 25h-old "BUY MU" rendered as `[09:38]`
+    is read as today's fill. This makes staleness unmissable at a glance:
+
+      * trade is on today's UTC date → ``HH:MM``                (unchanged)
+      * older                        → ``MM-DD HH:MM · Nd ago``
+
+    Pure; ``now`` injectable for tests. Any parse failure degrades to the
+    original ``ts[11:16]`` slice (never raises — the reporter additive
+    contract: a bad field drops detail from one line, never the report)."""
+    raw = (ts_iso or "")
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        # store always writes datetime.now(utc).isoformat(), so a parse
+        # failure means genuinely corrupt data — a clean sentinel beats the
+        # old raw[11:16] slice (which rendered garbage like "tamp").
+        return "??:??"
+    now = now or datetime.now(timezone.utc)
+    dt_u = dt.astimezone(timezone.utc)
+    hm = dt_u.strftime("%H:%M")
+    if dt_u.date() == now.astimezone(timezone.utc).date():
+        return hm
+    stamp = f"{dt_u.strftime('%m-%d')} {hm}"
+    delta = (now - dt_u).total_seconds()
+    return f"{stamp} · {_ago(delta)} ago" if delta > 0 else stamp
+
+
 def send_hourly_summary() -> bool:
     store = get_store()
     pf = store.get_portfolio()
@@ -785,7 +829,7 @@ def send_hourly_summary() -> bool:
 
     recent_trades = store.recent_trades(5)
     trade_lines = [
-        f"  [{t['timestamp'][11:16]}] {t['action']} {t['qty']} {t['ticker']} @ ${t['price']:.2f}"
+        f"  [{_fmt_trade_stamp(t['timestamp'])}] {t['action']} {t['qty']} {t['ticker']} @ ${t['price']:.2f}"
         for t in recent_trades
     ] or ["  (no trades yet)"]
 
