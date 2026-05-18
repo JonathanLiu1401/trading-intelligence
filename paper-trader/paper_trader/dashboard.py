@@ -8717,6 +8717,30 @@ def winner_autopsy_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/streak")
+def streak_api():
+    """Win/loss streak structure on closed round-trips — current run, longest
+    historical extremes, and last-N W/L sequence. /api/trade-asymmetry gives
+    payoff math; /api/winner-autopsy and /api/loser-autopsy narrate per-trade
+    outcomes; /api/churn counts re-entry cadence. None surface *am I on a hot
+    hand or a cold streak right now*. This consumes the single source of
+    truth (build_round_trips, AGENTS.md #10), counts consecutive same-sign
+    closes backward from the most recent exit (flats skipped, never block a
+    streak), and emits a HOT_HAND / TILT_RISK / NEUTRAL verdict only when
+    STABLE (n_round_trips >= 8 — the winner/loser_autopsy honesty idiom).
+    Advisory only — never gates Opus, never injected into the decision
+    prompt, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.streak import build_streak
+        store = get_store()
+        # Same trades convention as /api/winner-autopsy & /api/loser-autopsy:
+        # oldest → newest (build_round_trips reads in sequence).
+        trades = list(reversed(store.recent_trades(2000)))
+        return jsonify(build_streak(trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/hold-discipline")
 def hold_discipline_api():
     """The disposition trap, caught *while it is still happening* on the
