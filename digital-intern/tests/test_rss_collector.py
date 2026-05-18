@@ -38,8 +38,17 @@ _RSS_ONE_ITEM = b"""<?xml version="1.0" encoding="UTF-8"?>
 
 
 class _FakeResp:
-    def __init__(self, content=b"", raise_exc=None):
+    """Mirrors the requests.Response surface `_fetch_feed` actually consumes:
+    ``status_code`` (checked for 404/410/429 BEFORE raise_for_status), the
+    raw ``content`` bytes, ``headers`` (Retry-After lookup on 429), and
+    ``raise_for_status``. Pre-7729638 ``_fetch_feed`` only used
+    raise_for_status; the 4-tuple refactor added the per-status branches."""
+
+    def __init__(self, content=b"", status_code=200, headers=None,
+                 raise_exc=None):
         self.content = content
+        self.status_code = status_code
+        self.headers = headers or {}
         self._raise_exc = raise_exc
 
     def raise_for_status(self):
@@ -60,7 +69,7 @@ def test_fetch_feed_passes_timeout_and_user_agent(monkeypatch):
 
     monkeypatch.setattr(rss_collector.requests, "get", fake_get)
 
-    out = rss_collector._fetch_feed(
+    name, arts, outcome, retry_after = rss_collector._fetch_feed(
         {"name": "TestFeed", "url": "http://example.com/rss"}
     )
 
@@ -71,8 +80,11 @@ def test_fetch_feed_passes_timeout_and_user_agent(monkeypatch):
     assert "User-Agent" in headers and "Mozilla" in headers["User-Agent"]
 
     # And the parsed result is well-formed (resp.content → feedparser).
-    assert len(out) == 1
-    art = out[0]
+    assert name == "TestFeed"
+    assert outcome == "ok"
+    assert retry_after is None
+    assert len(arts) == 1
+    art = arts[0]
     assert art["title"] == "Hello World Headline"
     assert art["link"] == "http://example.com/article-a"
     assert art["summary"] == "Body text for the article."
@@ -81,26 +93,78 @@ def test_fetch_feed_passes_timeout_and_user_agent(monkeypatch):
 
 
 def test_fetch_feed_returns_empty_on_http_error(monkeypatch):
-    """A non-200 (raise_for_status raises) must degrade to [] — the worker
-    must never take an exception into the daemon thread."""
+    """A non-200 (raise_for_status raises) must degrade to no articles +
+    transient outcome — the worker must never take an exception into the
+    daemon thread."""
     def fake_get(url, **kwargs):
-        return _FakeResp(raise_exc=rss_collector.requests.HTTPError("404"))
+        # status_code=500 routes past the 404/410/429 branches into
+        # raise_for_status, which raises the HTTPError caught by the bare
+        # except → transient outcome.
+        return _FakeResp(
+            status_code=500,
+            raise_exc=rss_collector.requests.HTTPError("500"),
+        )
 
     monkeypatch.setattr(rss_collector.requests, "get", fake_get)
-    assert rss_collector._fetch_feed({"name": "X", "url": "http://x"}) == []
+    name, arts, outcome, retry_after = rss_collector._fetch_feed(
+        {"name": "X", "url": "http://x"}
+    )
+    assert arts == []
+    assert outcome == "transient"
+
+
+def test_fetch_feed_404_is_permanent(monkeypatch):
+    """A 404 (or 410) is parked as ``permanent`` so the backoff layer
+    re-probes weekly instead of every poll cycle."""
+    def fake_get(url, **kwargs):
+        return _FakeResp(status_code=404)
+
+    monkeypatch.setattr(rss_collector.requests, "get", fake_get)
+    name, arts, outcome, retry_after = rss_collector._fetch_feed(
+        {"name": "X", "url": "http://x"}
+    )
+    assert arts == []
+    assert outcome == "permanent"
+
+
+def test_fetch_feed_429_returns_ratelimited_with_retry_after(monkeypatch):
+    """A 429 must surface the Retry-After hint (parsed as a float) so the
+    backoff layer can honor the server's wait request."""
+    def fake_get(url, **kwargs):
+        return _FakeResp(status_code=429, headers={"Retry-After": "180"})
+
+    monkeypatch.setattr(rss_collector.requests, "get", fake_get)
+    name, arts, outcome, retry_after = rss_collector._fetch_feed(
+        {"name": "X", "url": "http://x"}
+    )
+    assert arts == []
+    assert outcome == "ratelimited"
+    assert retry_after == pytest.approx(180.0)
 
 
 def test_fetch_feed_no_url_is_empty():
-    assert rss_collector._fetch_feed({"name": "no-url"}) == []
+    """Missing-url is shaped like a successful empty fetch — the worker
+    keeps going."""
+    name, arts, outcome, retry_after = rss_collector._fetch_feed(
+        {"name": "no-url"}
+    )
+    assert name == "no-url"
+    assert arts == []
+    assert outcome == "ok"
 
 
 def test_fetch_feed_network_exception_is_swallowed(monkeypatch):
-    """A raised requests exception (timeout, DNS, conn reset) → [] not crash."""
+    """A raised requests exception (timeout, DNS, conn reset) → transient
+    outcome with no articles, not a crash."""
     def boom(url, **kwargs):
         raise rss_collector.requests.ConnectionError("dns fail")
 
     monkeypatch.setattr(rss_collector.requests, "get", boom)
-    assert rss_collector._fetch_feed({"name": "X", "url": "http://x"}) == []
+    name, arts, outcome, retry_after = rss_collector._fetch_feed(
+        {"name": "X", "url": "http://x"}
+    )
+    assert arts == []
+    assert outcome == "transient"
 
 
 def test_collect_rss_dedups_within_run_and_across_runs(tmp_path, monkeypatch):
