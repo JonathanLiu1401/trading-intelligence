@@ -9242,6 +9242,19 @@ def _swr_prewarm():
         ("source-edge", source_edge_api),
         ("feed-health", feed_health_api),
         ("decision-context", decision_context_api),
+        # Freeze-triage panels (risk / capital-paralysis / decision-health /
+        # runner-heartbeat) + benchmark + scorer-confidence were @swr_cached
+        # but never added here, so they alone cold-stalled with
+        # {"warming": true} after every restart — exactly the panels a trader
+        # opens FIRST when the bot looks frozen. _swr_prewarm's contract is
+        # "pre-build EVERY slow SWR cache"; keep this list == the set of
+        # @swr_cached endpoints (tests/test_swr_prewarm_coverage.py locks it).
+        ("risk", risk_api),
+        ("benchmark", benchmark_api),
+        ("capital-paralysis", capital_paralysis_api),
+        ("decision-health", decision_health_api),
+        ("runner-heartbeat", runner_heartbeat_api),
+        ("scorer-confidence", scorer_confidence_api),
     ]
     for name, wrapper in targets:
         try:
