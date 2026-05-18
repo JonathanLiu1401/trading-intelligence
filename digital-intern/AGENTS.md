@@ -2606,3 +2606,117 @@ expected; this entry was appended, not rewritten).
   three commits pathspec-scoped to exactly their intended files;
   `git diff --staged --stat` verified before each commit; never `git add
   -A`; pushed to origin/master. Entry appended, not rewritten.
+
+- **2026-05-18 (hybrid pass 20 — Agent 3, debug + feature + analyst-validation)** —
+  Required-file-set pass (20th; codebase exceptionally mature, 19 prior
+  passes). Advisor-reviewed before substantive work. Live evidence was the
+  discovery engine (proven pattern of passes 14/16/17/18/19), not pre-emptive
+  re-reading. `sqlite3` CLI absent → all probes via `python3` `sqlite3`
+  `mode=ro`. Bare daemon `pid 1702195` started **2026-05-18 07:29:24Z**,
+  predating EVERY recent fix incl. d5918e3/05b406e/b20cbae and both of mine
+  (the consistent stale-daemon caveat — fixes ship on next restart).
+  Concurrent sibling agent + auto-commit/push daemon on the shared monorepo
+  index (memory `di-shared-repo-concurrency`) → strict per-commit pathspec
+  staging throughout; the shared-index auto-push raced (a rejected push then
+  surfaced my exact commit hash already on origin/master — verified, not
+  re-pushed).
+
+  **Phase 1 — bugs_fixed=1, commit `50c1052`** (`storage/article_store.py` +
+  new `tests/test_stale_urgent_reaper.py`). **Live discovery → root-caused →
+  fixed:** a `mode=ro` probe found **26 `urgency=1` rows stuck since
+  2026-05-13** (5 days). Root cause: `get_unalerted_urgent` filters
+  `first_seen >= now-24h`, so the instant a still-pending `urgency=1` row's
+  `first_seen` crosses 24h it becomes permanently invisible to `alert_worker`
+  — never alerted, and (still `1`, not `2`) never cleared. It lingers until
+  the 90-day purge, the whole time inflating `stats()`'s `urgent>=1` tile (no
+  time filter) → the dashboard shows phantom urgent items the analyst is
+  never pushed. This is the STRUCTURAL counterpart to the pass-18 alert_agent
+  stale-drop fix (`d5918e3`), NOT a duplicate: that marks *in-window* rows
+  `urgency=2` (formatter actively declined delivery — truthful + blocks
+  re-fetch); these *aged-out* rows the alert worker NEVER saw, so `urgency=2`
+  would be a lie AND keep inflating the very tile this fixes — `urgency=0` is
+  the only honest+corrective state; the two must NOT be "harmonized" (advisor
+  point, encoded in the code comment). Added
+  `ArticleStore.reap_stale_urgent(max_age_hours=24)` (demote `1→0` for
+  aged-out rows; demotion provably loses zero delivery — a >24h row is never
+  returned by `get_unalerted_urgent` again) wired into `purge_old()` BEFORE
+  its `_write_lock` block (the method takes that same non-reentrant lock
+  itself; nesting would deadlock — advisor point). Only `urgency` written
+  (ai_score/ml_score/score_source untouched); `_LIVE_ONLY_CLAUSE`
+  defense-in-depth (synthetic rows are urgency=0 by construction → no-op,
+  matches `update_scores_from_labels` precedent). +10 specific-value tests
+  (aged-out demoted / in-window kept / alerted-2 never un-alerted / scores
+  byte-unchanged / idempotent / synthetic untouched / custom window /
+  alert-path-unreachability / purge_old wiring).
+
+  **Phase 2 — features_added=1, commit `17d8df9`** (`watchers/alert_recency.py`
+  + `watchers/alert_agent.py` + new `tests/test_alert_continuation_context.py`).
+  **Alert continuation context.** Cross-cycle suppression drops only
+  EXACT-signature repeats; a *different* headline about the same developing
+  event (live: 01:55 UAE-strike alert → 09:19 Brent/markets follow-up,
+  distinct signatures, correctly NOT collapsed) still fires a fresh
+  standalone 🚨 BREAKING with zero continuity framing — the analyst's top
+  duplicate-alerts complaint, on the one product (the push) that never got
+  the mitigation the briefing's `[ALERTED]` tag added. Added
+  `alert_recency.recent_alerts()` (richer sibling of `recent_signatures` —
+  also returns stored title + age) + pure unit-tested `related_prior_alert()`
+  (≥3 shared SALIENT signature tokens, stopword-filtered, exact-sig excluded).
+  `send_urgent_alert` ANNOTATES (never drops) each survivor; `_fmt` renders a
+  `related:` line; `ALERT_PROMPT` gains a CONTINUITY rule (Sonnet leads
+  ESCALATES/EXTENDS/FOLLOWS, frames CONTEXT as a follow-up). Non-suppressing
+  by contract: a recency-store failure → `[]` → no annotation → exact
+  pre-feature behaviour (a genuine alert must always still fire). Reads
+  `alert_recency.db` only, NEVER `articles.db` — four invariants intact by
+  construction. +14 tests incl. the live UAE-vs-futures no-false-link,
+  recent_alerts TTL/degrade, integration (prompt carries hint AND alert still
+  fires, scores untouched). NOTE: the `-m` body's backticked `` `related:` ``
+  was eaten by bash command-substitution → commit body lost two words in one
+  sentence (cosmetic, meaning intact); NOT force-fixed — a force-push to a
+  shared branch with concurrent agents to repair a typo is not worth the race
+  risk.
+
+  **Phase 3 — analyst-lens live validation, user_findings=8.** (1)
+  **Briefing EXCELLENT (positive)** — 07:13Z read end-to-end: decisive LEAD
+  (bond rout 10Y+13bp→4.59% / Nasdaq −1.54% two days before NVDA earnings),
+  exact MACRO, PORTFOLIO tied to live book (LITE/LNOK/NVDL/MU + DRAM C59
+  05-22 / NVDA 05-20), specific RISK (watch 10Y>4.60%), sharp DESK NOTE,
+  COVERAGE GAP present. (2) **Collection healthy** — 469 live art/h, newest
+  ~3.5min fresh; web/reddit/substack/rss/google_news dominant. (3)
+  **Invariants HOLD live** — `0` synthetic `urgency>=1`; `0` `ai_score>0 AND
+  score_source='ml'` in the 1.45 GB prod DB. (4) **Alert path CLEAN** —
+  exactly 2 alerts/24h, both legit `Benzinga Economics` geopolitical (01:55
+  ai=9.0 UAE-drone/Brent; 09:19 ai=8.0 futures-drop); zero
+  reddit/wiki/quote-widget noise in-window. The 09:19 is a continuation of
+  01:55 with no framing — the exact gap the Phase-2 feature fixes (ships on
+  restart). (5) **The 26 stuck urgency=1 rows** — Phase-1 finding, fixed in
+  `50c1052`; live count still 26 (stale-daemon — reaped on the next 6h purge
+  tick after a restart). (6) **8 collectors DARK** — `nitter` (1277 fails, 0
+  delivered all session), `sec_edgar` (962, 0 — analyst BLIND to 8-K
+  filings, priority-0), `polygon` (836, 0), `newsapi` (619, 0),
+  `sec_edgar_ft` (194), `finnhub`/`gdelt` net-new-dedup false-disables
+  (1957/7270 lifetime). COVERAGE GAP surfaces them but shows misleading
+  "DARK 0.0h" — the `b20cbae` fix is committed, ships on restart
+  (stale-daemon). Operational/upstream/key, not code bugs. (7) **Chronic
+  DB-lock contention** — 22 `insert_batch: lock retry exhausted` + 2
+  `update_ml_scores_batch` exhausted ERRORs → whole batches silently dropped
+  = missed news from the analyst seat (memory
+  `di-insert-batch-lock-contention`); real fix (per-call connection
+  isolation) is substantial + daemon.py/store sibling-touched → out of clean
+  scope, advisor-confirmed not chased. (8) **stats_worker NoneType recurring**
+  (29×, latest 11:39Z) + one benign shutdown reentrant-logging Traceback —
+  both stale-daemon symptoms of already-committed fixes (`05b406e`; the
+  documented os._exit cleanup hazard), not new bugs. None of 6/7/8 is a
+  quick safe fix in clean scope → no extra Phase-3 fold-in; bugs_fixed stays
+  1, features_added 1. Final verify: `storage.article_store` / `ml.features`
+  / `ml.model` / `watchers.alert_agent` / `watchers.alert_recency` imports
+  OK; suite **715 passed**, the same 5 `test_rss_collector.py` failures are
+  the pre-existing sibling `M collectors/rss_collector.py` WIP (not ours,
+  never staged; floor held exactly 5, never 6+ every run; my 24 tests pass).
+  *Pre-existing, deliberately never staged* (consistent with every prior
+  entry): `collectors/rss_collector.py`, `daemon.py`, `dashboard/server.py`,
+  `scripts/export_training_data.py`, `tests/test_article_store.py`, untracked
+  sibling files, all `paper-trader/*`, `logs/*.tmp`. Both commits
+  pathspec-scoped to exactly their intended files (`50c1052`: 2 files;
+  `17d8df9`: 3 files); `git diff --staged --name-only` + `git show --stat`
+  verified no sibling leakage; never `git add -A`; on origin/master. Entry
+  appended, not rewritten.
