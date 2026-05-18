@@ -203,6 +203,26 @@ class TestNextMarketOpen:
         assert nxt == _ny(2026, 5, 14, 16, 0)
         assert secs == 5 * 3600  # 11:00 → 16:00
 
+    def test_market_open_on_half_day_returns_1300_not_1600(self, patch_clock):
+        """Regression: on a NYSE early-close half-day the session ends 13:00
+        ET, not 16:00. market.is_market_open enforces this (b6a1934) but
+        _next_market_open hardcoded 16:00, so the briefing card and
+        /api/game-plan reported the close 3h late — exactly what a trader
+        times exits on. 2026-12-24 (Christmas Eve) is a NYSE_HALF_DAYS_2026
+        entry; at 11:00 ET the market is open and closes in 2h, not 5h."""
+        patch_clock(_ny(2026, 12, 24, 11, 0))
+        nxt, secs = dashboard._next_market_open()
+        assert nxt == _ny(2026, 12, 24, 13, 0)
+        assert secs == 2 * 3600  # 11:00 → 13:00 early close
+
+    def test_regular_day_close_unchanged_by_half_day_fix(self, patch_clock):
+        """The half-day fix must not perturb a normal session: 2026-12-23 is
+        a regular Wednesday → still a 16:00 ET close."""
+        patch_clock(_ny(2026, 12, 23, 11, 0))
+        nxt, secs = dashboard._next_market_open()
+        assert nxt == _ny(2026, 12, 23, 16, 0)
+        assert secs == 5 * 3600
+
 
 # ─────────────────────────── _classify_action ───────────────────────────
 
