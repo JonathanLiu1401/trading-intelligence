@@ -4950,3 +4950,138 @@ by message — the recurring pass-#18/#19 concern).
   `scorer` keyword).
 
 *Review pass #19 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+## Review pass #21 — paper-trader core hybrid (2026-05-18)
+
+Repo HEAD at boot `5a0af2d`; this pass's single commit is `b0ac368`. Ran
+alongside ≥1 live sibling `claude --model claude-opus-4-7` ML/backtest
+agent (PID 1752314 on the identical task, ML files) — verify attribution
+by **content** on `origin/master`, not message. **bugs_fixed = 0 ·
+features_added = 1 · user_findings = 5.**
+
+- **Phase 1 — no new bug (bugs_fixed = 0; no Phase-1 commit, the commit
+  guard explicitly permits it).** Full re-trace of `runner.py`,
+  `reporter.py`, `signals.py`, `strategy.py`, `market.py`, `store.py` plus
+  the `dashboard.py` SWR/helper surface (`_swr_prewarm`,
+  `_parse_action_ticker`, `_classify_disagreement`). Every candidate was
+  considered and dismissed with a concrete reason: `is_market_open`
+  boundaries (`570 ≤ m < close_minute`) are exact incl. the half-day
+  exclusive 13:00 close; `signals._choose` LOCAL-first strict-`>`
+  tie-break matches its docstring on every None/equal permutation;
+  `strategy._execute` runs once per live cycle so the snapshot-cash read
+  has no intra-cycle staleness; `_mark_to_market`'s `is not None`
+  expired-option settlement preserves a legitimate 0.0; `store`'s
+  closed-option-row reactivation + shared-connection NULL-row recovery are
+  sound; `reporter._classify_decision_outcome` check order is
+  arrow-safe. Consistent with the 20 prior core passes — the listed core
+  files are exhaustively reviewed and exact-value locked. **338 core tests
+  green in 4s before** the feature (`test_core_runner /_market /_store
+  /_signals /_strategy /_reporter`); no churn-only test commit (the
+  pass-#17/#19 churn-avoidance precedent).
+
+- **Phase 2 — feature shipped (`feat(runner):`, commit `b0ac368`): the
+  daily-close report now fires after the *actual* NYSE bell, not a
+  hardcoded 16:05 ET.** `runner._maybe_daily_close` gated on
+  `DAILY_CLOSE_HOUR_NY = 16` regardless of the session. On a NYSE
+  early-close half-day (day-after-Thanksgiving `2026-11-27`, Christmas Eve
+  `2026-12-24`) the bell is 13:00 ET, so the close report sat **three
+  hours on a frozen post-close book** waiting for a 16:05 that no longer
+  matched the session — twice a year the trader's end-of-day summary was
+  emitted late against stale 13:00 marks with no signal that the session
+  had already ended. Fix replaces the hardcoded hour gate with
+  `market.close_minute(now_ny.date()) + DAILY_CLOSE_GRACE_MIN` (the
+  existing half-day infra `is_market_open` already uses, single source of
+  truth): **byte-identical 16:05 ET on every regular day** (`close_minute
+  → 960`, gate `< 965`), **13:05 ET on a half-day** (`close_minute → 780`,
+  gate `< 785`). Weekend + full-holiday guards untouched (half-days are
+  weekdays not in `NYSE_HOLIDAYS_2026`, so only the new gate decides).
+  Surgical: 2 hunks in `runner.py` (constant + gate), zero behaviour
+  change off half-days. 8 new exact-minute locks in
+  `tests/test_core_runner.py::TestMaybeDailyCloseHalfDay`: half-day
+  no-fire at 12:59 / 13:04 → fire at 13:05 (both half-day dates),
+  fires-once, **plus a regression lock that a regular weekday does NOT
+  fire at 13:05** (the early-close shift must never leak into a normal
+  day) and the 16:04→no / 16:05→yes backward-compat pin. **382 green
+  after** (`test_core_runner /_runner_cycle /_market /_store /_signals
+  /_strategy /_reporter /_runner_heartbeat`). **Applies on the next
+  runner restart** — the running orphan (boot `5a0af2d`) keeps the old
+  16:05 gate until rebooted (the documented deploy-stale pattern; see
+  finding #1).
+
+- **Phase 3 — live findings (running `:8090`, runner orphan PID 1868409,
+  2026-05-18 ~12:07 UTC; the host is under the review-swarm load this
+  pass's own siblings contribute to).**
+  1. **Runner is UNSUPERVISED_STALE (HIGH, ops, not code-fixable —
+     continuity of pass #20 #1).** `/api/supervision`:
+     `verdict=UNSUPERVISED_STALE`, `orphan=true`, `ppid=1`, systemd bus
+     unreadable (`Failed to connect to bus: No medium found`).
+     `boot_sha=5a0af2d` vs `head_sha=b0ac368`, `behind:1` — the running
+     trader is one commit stale and **that commit is this pass's own
+     half-day fix**, which therefore will not deploy until the operator
+     restarts. With no `Restart=always` net, the next git-watcher /
+     deadman `os._exit(0)` leaves the trader DOWN. Operator action:
+     `systemctl --user enable --now paper-trader`.
+  2. **Live trader frozen — IDLE_STORM (HIGH, host-saturation, not a
+     code/prompt bug — continuity of pass #20 #2 + recalled
+     `pt-no-decision-host-saturation`).** `/api/runner-heartbeat`:
+     liveness `HEALTHY` (last decision 8m ago) but
+     `decision_efficacy=IDLE_STORM`, `consecutive_no_decision=20` (100% of
+     last 20), `restart_recommended=true`. The last 6 `decisions` rows are
+     **all** `NO_DECISION | claude returned no response (timeout/empty)`
+     (a *timeout*, NOT quota — `_quota_exhausted` would tag it
+     differently). Host **load avg 19.5**, ~1.7 GB free RAM, with the
+     concurrent `claude` review agents + `run_continuous_backtests.py`
+     starving every live Opus call past `DECISION_TIMEOUT_S` + Sonnet
+     fallback. `/api/decision-drought`: ongoing PARALYSIS 25.3h / 76
+     cycles / 56 NO_DECISION (73.7%). The review harness induces the very
+     freeze it observes; instrumentation is correct.
+  3. **Capital-paralysis BLEEDING (HIGH, downstream of #2, correctly
+     surfaced — continuity of pass #20 #4).** `/api/capital-paralysis`:
+     98.1% deployed, $18.49 cash, LITE 61% of book,
+     `paralysis.verdict=BLEEDING`, `involuntary_alpha_bleed_pct=-2.21%`
+     across 6 parse-failure droughts; last fill `2026-05-17T09:38 BUY MU`
+     (>26h ago). `can_act_on_signal=true` (state FREE — `min_actionable
+     $9.73 < $18.49`) yet BLEEDING because the NO_DECISION storm, not lack
+     of dry powder, is the bind. Nothing to fix in code.
+  4. **Data trust is intact — positive finding.** `/api/feed-health`
+     HEALTHY (newest live article 0.1h old, 863 live/2h, 4939/24h, no
+     split-brain) and `/api/equity-integrity` **CLEAN across 789 points,
+     min cash $2.61, 0 negative-cash / 0 unexplained jumps**. This
+     *isolates* the freeze: it is a host-timeout on the Opus call, NOT a
+     blind feed or a corrupt book — the no-cap book has still never
+     over-drawn and the P&L history feeding every Discord/`drawdown`/
+     `benchmark` surface is trustworthy. The pass-#20 `equity-integrity`
+     feature is paying off as a standing trust audit.
+  5. **Discord delivery HEALTHY (continuity, fix holding).**
+     `runner-heartbeat.notify`: `verdict=HEALTHY`, 0 consecutive failures,
+     last OK 2026-05-18T11:55:39. The openclaw/PATH `bin_dir`-onto-PATH
+     fix holds on the orphan (it is on patched `reporter` code even though
+     `runner` is stale) — the operator's primary surface is live.
+
+  None of 1–5 is a new quick safe code fix: 1–3 + 5 are
+  ops/host/continuity, 4 is a positive confirmation. No Phase-3 fix
+  folded in.
+
+- **Concurrency / staging discipline.** Never `git add -A`. Exactly two
+  path-scoped files staged for the feature commit
+  (`paper_trader/runner.py`, `tests/test_core_runner.py`); AGENTS.md
+  committed separately alongside this entry. `git diff --staged` verified
+  additions-only with zero sibling-token hits before the commit; the dirty
+  `../digital-intern/` tree, sibling-untracked `paper_trader/ml/
+  gate_pnl.py` / `analytics/game_plan.py` / `preflight.py`, and the live
+  ML sibling's files were never touched (the pass-#16/#19 re-snapshot
+  lesson). Deliverable confirmed on `origin/master` as `b0ac368` by
+  content.
+
+- **Run the touched/adjacent locks (bounded — the full suite is ~25 min
+  and load-flakes timing-assertion tests above load avg ~10):** `cd
+  /home/zeph/trading-intelligence/paper-trader && python3 -m pytest
+  tests/test_core_runner.py tests/test_market_half_day.py
+  tests/test_core_market.py -q` (104 green). The pass-#21 lock is
+  `tests/test_core_runner.py::TestMaybeDailyCloseHalfDay` (exact-minute
+  half-day fire/no-fire boundaries + the regular-day non-leak
+  regression).
+
+*Review pass #21 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
