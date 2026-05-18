@@ -1783,3 +1783,113 @@ zero regressions introduced.
 pathspec-scoped to exactly their intended files (`tests/conftest.py`;
 `analysis/claude_analyst.py` + `tests/test_briefing_syndication_collapse.py`;
 this `AGENTS.md`); `git diff --staged` verified each; never `git add -A`.
+
+---
+
+### Agent pass 2026-05-18 (docs — session-state + known-issues consolidation)
+
+Documentation-only pass. No code changed. Purpose: hand the next agent the
+operational ground truth verified live this session (the running-unit state in
+particular contradicts the "Running the daemon" head section — read this entry
+first).
+
+**Architecture (re-verified live, not from prose):**
+- `daemon.py` is the single production process. Confirmed bound to `:8080`
+  (Flask dashboard) — `ss -ltnp` shows one listener, PID 1702195,
+  `/usr/bin/python3 .../digital-intern/daemon.py`. Singleton lock at
+  `data/daemon.lock`; a second start blocks on `flock`.
+- Article store: `/media/zeph/projects/digital-intern/db/articles.db` —
+  **1,445,425,152 B (~1.35 GB)** SQLite, USB-mounted spindle. `full_text`
+  column is **zlib-compressed** (decompress on read; never `SELECT full_text`
+  for scanning). The 1.4 GB size + USB I/O is the root of every timeout/lock
+  finding below.
+- `logs/` is a symlink → `/media/zeph/projects/digital-intern/logs` (same USB
+  filesystem, different mount than the repo). `find -P` will not descend it;
+  use `readlink -f .../digital-intern/logs` then operate on the real path.
+
+**Committed change this session — `5265d8e` `fix(stats): O(log N) /api/stats`.**
+`ArticleStore.stats()` (the `/api/stats` backend) ran `SELECT COUNT(*)` plus
+two predicate full-table scans over compressed-BLOB pages on the 1.46M-row USB
+DB — the endpoint blocked >30 s and the dashboard rendered "0 Total in DB". Fix
+(already on `origin`, no action needed): `total` is now `SELECT MAX(rowid)`
+(O(log N) rightmost-leaf walk; rowid is monotonic here — TEXT PK, no
+AUTOINCREMENT, purge deletes only lowest rowids — so it over-counts the live
+window by the purged volume, ~33 % high and slowly growing: an acceptable
+dashboard-tile order-of-magnitude, vastly better than the broken "0"). `urgent`
+wrapped in a `LIMIT 10000` subquery. `unscored`/`below_threshold` (no selective
+index, each a ~115 s BLOB scan) are now served from a 300 s-TTL cache refreshed
+off the request path by a daemon background thread on its own private
+connection (never `self.conn` — respects the cursor-collision hazard). Verified
+`stats()` 0.371 s (was >30 s). Return-dict shape unchanged. Generalisable rule:
+**`COUNT(*)` on the `articles` table times out under live load — never use it.**
+For a fast total use `MAX(rowid)`; for a recency/liveness probe use a
+`LIMIT 200` scan on `idx_first_seen` (not a full COUNT), and report `n/a`
+rather than `0` when a count can't complete.
+
+**Known operational hazards (latent — not code bugs; do not "fix" blindly):**
+
+1. **systemd dual-unit hazard — live state ≠ the head section.** `digital-intern`
+   exists as *both* a system unit and a `--user` unit. **Verified 2026-05-18:**
+   the **system** unit is `active` + `disabled`; the **user** unit is
+   `inactive` + `disabled`. So exactly one daemon is running and it is the
+   **system** unit (PID 1702195) — the "Running the daemon" section above which
+   says `systemctl --user start digital-intern` is **wrong for the current
+   deployment**; use `systemctl {start,stop,restart,status} digital-intern`
+   (system scope) to control the live process, and
+   `journalctl -fu digital-intern`. The hazard is *latent*: running
+   `systemctl --user start digital-intern` while the system unit is active
+   spawns a second daemon that contends for `:8080` and the single USB
+   `articles.db` (corrupting counts / WAL). The historically-prescribed remedy
+   `systemctl --user disable --now digital-intern` is moot right now (the user
+   unit is already inactive+disabled) and **must not be run without confirming
+   with the user first** — only the system unit should ever be active; never
+   start the user unit on this host.
+
+2. **rss_worker 4-tuple bug — fixed on disk, NOT live.** A sibling agent's
+   `_fetch_feed`→4-tuple refactor previously left `collect_rss()` iterating
+   tuples as dicts → `string indices must be integers` → `[rss_worker]`
+   300 s-backoff loop, RSS (the 30 s-cadence highest-volume collector, ~300
+   feeds) dark. As of this session `collectors/rss_collector.py:173` carries a
+   defensive `(_name, arts, _outcome, _retry_after) = result` unpack with a
+   `(ValueError, TypeError)` skip-this-feed fallback and a regression-guard
+   comment — i.e. **the fix is on disk but UNCOMMITTED** and the running daemon
+   (PID 1702195, started before the edit) still holds the broken code. RSS will
+   stay dark in production until `systemctl restart digital-intern`. The file
+   has concurrent sibling-agent WIP; per the staging discipline it is left
+   exactly as-is and **never staged by a docs/review commit**.
+
+3. **Hourly audit "urgent: 0 / 0 rows" is a FALSE NEGATIVE, not an outage.**
+   The healthcheck compares `first_seen` (stored ISO-8601 with a literal `T`,
+   e.g. `2026-05-18T01:54:00`) against SQLite `datetime()` output (space
+   separator, `2026-05-18 01:54:00`); the string compare never matches so the
+   24 h urgent count returns 0 even when the pipeline is healthy. Normalise
+   both sides before comparing: `replace(first_seen,'T',' ')`. Do **not** file
+   "pipeline down" off a bare 0 here — corroborate with `journalctl` liveness
+   first. (Companion of the stats finding above: a true 24 h `COUNT(*)` also
+   just times out on the 1.4 GB USB DB — use the `LIMIT 200` `idx_first_seen`
+   scan and report `n/a` if it can't complete, never `0`.)
+
+**Operational quick-reference (this deployment, 2026-05-18):**
+- Control the live daemon: `systemctl {start,stop,restart,status} digital-intern`
+  (system scope — the active unit); `journalctl -fu digital-intern` for logs.
+  `systemctl --user ... digital-intern` controls the *inactive* user unit —
+  do not start it (hazard #1).
+- DB: `/media/zeph/projects/digital-intern/db/articles.db` (~1.35 GB, USB,
+  zlib `full_text`).
+- Logs (real path): `readlink -f /home/zeph/trading-intelligence/digital-intern/logs`
+  → `/media/zeph/projects/digital-intern/logs`.
+- Tests: `cd /home/zeph/trading-intelligence/digital-intern && python3 -m pytest tests/ -v`
+  (clear `__pycache__`/`.pytest_cache` first if the count looks low — stale
+  assertion-rewrite cache, documented under "Running tests"; the 5
+  `test_rss_collector.py` failures are the pre-existing sibling refactor, not
+  a regression).
+
+**Concurrency note for the next agent:** during this pass a hybrid
+debug/feature agent (PID 1725883) was actively editing this same repo and this
+same `AGENTS.md`, and the repo's auto-commit/linter daemon pushes on its own
+cadence. This entry was appended (not rewritten); the commit was pathspec-scoped
+to `digital-intern/AGENTS.md` only — the foreign `M collectors/rss_collector.py`
+and `M daemon.py` in the worktree are sibling WIP and were **never staged** —
+and the push was left to the auto-commit daemon (manual push races it; see the
+project memory on auto-commit). If you append here, re-read the last ~40 lines
+immediately before editing: the file races.
