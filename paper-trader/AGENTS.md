@@ -4605,3 +4605,135 @@ Like every recent feature this **applies on the next paper-trader restart**
 (no macro block) until the runner reboots onto the new SHA.
 
 *Macro-calendar feature appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+## Review pass #19 — paper-trader CORE hybrid (2026-05-18)
+
+**bugs_fixed = 1 · features_added = 2 · user_findings = 4.** Bounded
+representative sweep (the full suite times out under concurrent
+sibling-agent + auto-commit-daemon load — the documented host state):
+**503 green** across `test_core_{reporter,store,strategy,runner,runner_cycle,market,signals,dashboard_helpers}`,
+`test_market_negcache`, `test_capital_paralysis{,_swr}`, `test_benchmark`,
+`test_runner_heartbeat{,_swr}`, `test_core_state_swr`,
+`test_dashboard_threaded`, `test_ml_live_opinion`, `test_parse_retry`,
+`test_quota_guard`. Three+ sibling agents and the auto-push daemon were
+active; commits were path-scoped (`git add <file>`, never `-A`),
+staged-diff verified, and pushed fast-forward onto `origin/master`.
+
+- **Phase 1 — bug (`b92b9c2`). `Store.get_portfolio()` only absorbed the
+  `row is None` shared-connection corruption mode; the *equally documented*
+  "row whose columns read back NULL" mode fell straight through.** The
+  function's own docstring promised to absorb **both** modes (28x
+  `/api/state` 500s over 2 days), but the code self-healed only `row is
+  None`. A transient NULL `cash`/`total_value` was returned verbatim and
+  then hit `strategy._portfolio_snapshot` as `None + open_value` — a
+  `TypeError` that **aborts the entire `decide()` cycle** (no decision
+  row, no equity point) until the next clean read, on top of 500ing
+  `/api/state`. Fix: the self-heal guard now also fires on
+  `row["cash"] is None or row["total_value"] is None`, routing through the
+  same `_init_portfolio()`+re-read path — which recovers the real
+  well-formed values on a transient corrupt read and never resets a live
+  book (`_init_portfolio` only INSERTs a *missing* row). Existing
+  resilience tests unchanged (no regression); 2 new
+  `tests/test_core_store.py::TestGetPortfolioResilience` tests cover
+  transient-recovery and persistent-degrade-arithmetic-safe. Distinct
+  from the sibling's `05b406e` (cursor-collision `fetchone()==None`
+  retry) — a different corruption mode on the same shared connection.
+
+- **Phase 2 — feature 1 (`9bfbbf8`). SWR-cache `/api/risk`,
+  `/api/benchmark`, `/api/capital-paralysis`, `/api/decision-health`.**
+  Live probing (fresh runner = cold caches, host load avg ~16–23) found
+  these four were the only remaining high-traffic **pure-store-read**
+  core panels not behind `swr_cached`: each ran its heavy multi-read
+  handler (`recent_trades(2000)` / `equity_curve(5000)` /
+  `recent_decisions(3000)`) inline with no bounded cold path and **hung
+  >15s (curl → 000)** under CPU starvation, while every already-cached
+  endpoint served a fast `{"warming":true}` placeholder. Four core trader
+  panels ("am I beating the index?", "why is my book stuck?") were
+  effectively dead under load. All four verified pure store reads (no
+  market/yfinance/network) — the latency is pure lock-contention, exactly
+  what SWR absorbs (the pass-#18 runner-heartbeat precedent, invariant
+  #7). `@swr_cached(.., 30.0)`: 30s ≪ the ≥1800s decision cadence so a
+  ≤30s stale window can never flip a verdict. SWR is pytest-inert unless
+  `_SWR_TEST_FORCE`, so the existing exact-value
+  `test_capital_paralysis.py` / `test_benchmark.py` stay green. Locked by
+  `tests/test_capital_paralysis_swr.py` (cold full-payload+honesty-keys,
+  warm-served-stale, pytest-inert-default — mirrors
+  `test_core_state_swr.py`). **Applies on the next paper-trader restart.**
+
+- **Phase 2 — feature 2 (`2e8c60e`). `reporter._fmt_trade_stamp` — date +
+  relative age on stale hourly recent-trades.** The hourly summary
+  rendered every recent trade as a bare `HH:MM` (UTC) with no date; the
+  desk's #1 documented pathology is a book frozen for many hours that
+  still *looks* active — a 25h-old `BUY MU` shown as `[09:38]` reads as
+  today's fill (the "unclear" the trader persona is frustrated by).
+  Today's trades stay byte-identical `HH:MM`; older ones render
+  `MM-DD HH:MM · Nd ago` so staleness is unmissable. Pure,
+  now-injectable; future-skew guarded; a corrupt timestamp degrades to a
+  clean `??:??` sentinel (the reporter additive-line contract — never
+  raises). Locked by `tests/test_core_reporter.py::TestAgo` +
+  `TestFmtTradeStamp` (bucket boundaries, today/stale/future/naive/corrupt,
+  hourly-integration on a frozen clock).
+
+- **Phase 3 finding-fix (`dbcc6e6`, folded into a `fix:` — NOT counted as
+  a bug).** Resolved AGENTS.md review-pass-#18 core finding #3:
+  permanently-delisted **GOOGU / METAU** removed from `strategy.WATCHLIST`
+  *and* the `SYSTEM_PROMPT` "LEVERAGE INSTRUMENTS AVAILABLE" text (verified
+  live: yfinance 404 / no quote, vs NVDU/MSFU/AMZU still trading). They
+  could never fill (`market.get_price` → None → `_execute` BLOCKS) and
+  re-404'd `runner.log` every `_DEAD_TTL` window. The code change merged
+  via the repo's auto-commit daemon; `dbcc6e6` adds the missing regression
+  lock (`test_core_strategy.py::TestWatchlistHygiene`) so neither the
+  universe nor the mirrored prompt text can silently re-introduce a
+  delisted name (the recurring "fix one place, not the other" concern).
+  **Live side only** — `backtest.py`'s historical universe is the
+  ML-domain owner's call, deliberately untouched.
+
+- **Phase 3 — live findings (running `:8090`, build-info cycled
+  `b92b9c2`→`548437a` during the session via relaunch churn).**
+  1. **Dashboard `:8090` transiently unreachable during singleton-guard
+     relaunch churn (MEDIUM, ops, pass-#18 finding #4 recurring).** A
+     supervisor keeps relaunching `runner.py` in restart gaps; the
+     invariant-#19 guard correctly refuses duplicates (no double-trade)
+     but `:8090` is dead for the ~10–30s relaunch window (observed:
+     curl exit 7 at ~04:13, 200 again seconds later on the fresh PID).
+     Out of code scope.
+  2. **A rogue/generic concurrent agent is committing to the shared repo
+     (MEDIUM, ops).** PID 1845436 runs an outdated prompt referencing
+     non-existent `paper_trader/scorer.py` / `trader.py` and targeting the
+     `/home/zeph/paper-trader` symlink, with "Commit and push" — opaque
+     pushes onto the same `master`. Combined with the auto-commit daemon
+     that swept this pass's `strategy.py` change into a generic
+     `feature(pt)` commit, scoped-commit attribution is unreliable; verify
+     by **content** on `origin/master`, not by commit message.
+  3. **Book still capital-paralysed (HIGH, host/ops, not code-fixable).**
+     `/api/state`: cash $18.49 / total $972.69, ~98% deployed in MU/LITE,
+     MU P/L $0.00 (stale-mark flat), no new fill since
+     `2026-05-17T09:38 BUY MU`. The documented #1 pathology persists; this
+     pass's feature 2 is precisely what now makes that staleness visible
+     in the Discord hourly instead of a dateless `[09:38]`.
+  4. **`/api/runner-heartbeat` returns all-None `{"warming":true}
+     cached:false` on a cold call under load (LOW, expected SWR
+     behaviour).** The check-first panel is uninformative for the first
+     ~budget seconds after a relaunch — exactly when a trader most wants
+     it. Inherent to the cold-start gap (no stale copy yet); the SWR-4
+     feature does not change this (heartbeat was already cached). Noted,
+     not fixed — a cold-start prewarm is a larger design question.
+  - **Positive validation.** `/api/state` 0.004s, `/api/feed-health` /
+    `/api/source-edge` 200 in ~2s (SWR cold budget honoured); after the
+    SWR-4 fix the four previously-hung panels inherit the same bounded
+    cold path. Phase-1 store fix + 503-green bounded sweep confirm the
+    decision loop's portfolio read is no longer a `None`-propagation
+    abort risk.
+
+- **Run the core suite (bounded — the full one times out under concurrent
+  load):** `python3 -m
+  pytest tests/test_core_store.py tests/test_core_reporter.py
+  tests/test_core_strategy.py tests/test_capital_paralysis_swr.py
+  tests/test_core_state_swr.py tests/test_runner_heartbeat_swr.py -q`.
+  `TestGetPortfolioResilience` (store), `TestWatchlistHygiene` (strategy),
+  `TestAgo`/`TestFmtTradeStamp` (reporter) and
+  `TestCapitalParalysisSwr` are the new pass-#19 locks.
+
+*Review pass #19 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
