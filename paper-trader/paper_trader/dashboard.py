@@ -6656,6 +6656,7 @@ def _concentration_severity(top1_pct: float, top3_pct: float) -> tuple[str, bool
 
 
 @app.route("/api/risk")
+@swr_cached("risk", 30.0)
 def risk_api():
     """Risk-focused portfolio panel. Fields are intentionally disjoint from
     /api/analytics: concentration, leveraged exposure, position age, stale flags,
@@ -7395,6 +7396,7 @@ def drawdown_api():
 
 
 @app.route("/api/benchmark")
+@swr_cached("benchmark", 30.0)
 def benchmark_api():
     """Whole-account return vs an equal-capital S&P 500 buy-and-hold since
     inception — the "is this bot worth running vs just buying the index?" KPI.
@@ -7812,6 +7814,7 @@ def validation_api():
 
 
 @app.route("/api/decision-health")
+@swr_cached("decision-health", 30.0)
 def decision_health_api():
     """Health of the live decision pipeline — action mix, parse-failure rate,
     confidence trend, cadence. Surfaces NO_DECISION ('claude returned no
@@ -8004,6 +8007,7 @@ def empty_claude_rate_api():
 
 
 @app.route("/api/capital-paralysis")
+@swr_cached("capital-paralysis", 30.0)
 def capital_paralysis_api():
     """Trap + cost + unlock — why the book is stuck and the way out.
 
