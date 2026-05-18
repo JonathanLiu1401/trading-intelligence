@@ -3825,3 +3825,168 @@ two-entries-per-number convention, e.g. the dual #11/#14 passes.)*
   tests/test_core_reporter.py -q`.
 
 *Review pass #16 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 review pass #17 (ML+backtest hybrid · durable trivial-baseline ledger · live findings)
+
+- **Phase 1 — no new bug (bugs_fixed = 0; no Phase-1 commit, commit guard
+  explicitly permits).** Full re-trace of `decision_scorer.py`,
+  `backtest.py`, `run_continuous_backtests.py` plus coupled
+  `validation.py` / `calibration.py` / `baseline_compare.py` /
+  `skill_trend.py`: the `predict_with_meta` off-distribution abstention,
+  the universal SELL `-forward_return_5d` flip
+  (train↔inference↔calibration↔gate↔`_oos_rank_metrics`↔
+  `evaluate_scorer_oos`↔`baseline_compare`), the `(ticker,sim_date,
+  action)` dedup key, the 5-trading-day forward-window guard, the
+  `score=`/`scorer=`/`news_urg=`/`news_count=` reasoning regexes, the
+  numpy-lstsq weighted-LS fallback (fits scaler on full X with
+  `val_rmse=nan` — by-design fallback, locked by
+  `test_ml_backtest_coverage.py`, not a leak bug), the atomic
+  tmp+`.replace` JSONL/pickle trims, the `_inject_and_train` 11-col
+  INSERT tuple + lock-retry, the singleton-reset under
+  `_DECISION_SCORER_LOCK`, the `_LOAD_CACHE` (path,mtime_ns,size) key
+  (atomic replace ⇒ key changes ⇒ per-cycle pickup), every module-global
+  lock — all re-verified correct and exact-value test-locked. Consistent
+  with the documented 15+ prior no-new-bug ML/backtest passes. No
+  test-hardening commit either: the Phase-1 checklist items (known
+  feature-vector score range / kw-rank ordering / null-safe defaults;
+  synthetic BUY-and-hold + exact SL/TP price+cash — the latter freshly
+  pinned by pass-#16 `b82f09e`; results-location + no-silent-overwrite)
+  are already exact-value locked; a redundant test would be churn, not
+  hardening. ML/backtest regression 374/374 green before the feature,
+  380/380 after.
+
+- **Feature shipped (commit `6ade72d`, `feat(continuous):`): durable
+  per-cycle trivial-baseline ledger.** `run_continuous_backtests.py::
+  _append_baseline_skill_log` + `BASELINE_SKILL_LOG`/`_KEEP` constants,
+  wired into `main()` immediately after the scorer-skill-ledger block.
+  **The gap it fills:** `baseline_compare`'s `MLP_WORSE_THAN_TRIVIAL`
+  (raw `ml_score` carries higher OOS rank-IC than the 17-feature MLP the
+  conviction gate relies on) is the single most economically decisive
+  documented ML/backtest finding (~10 prior passes) — yet it was *only*
+  observable by an operator manually running
+  `python3 -m paper_trader.ml.baseline_compare`. There was **no durable,
+  trendable signal** an unattended loop surfaced — the *exact*
+  dead-audit-trail gap the pass-#15 `_append_scorer_skill_log` wiring fix
+  closed for the scorer ledger (`scorer_skill_log.jsonl`/`skill_trend`),
+  applied to the sibling decisive question. `scorer_skill_log` only ever
+  trends `oos_rmse` vs a **constant** mean-predictor; *nothing* durably
+  trended "does a one-liner beat the net this cycle". The new ledger row
+  is `{cycle, timestamp, window_*, status, verdict, slice, n, n_train,
+  mlp_rank_ic, mlp_dir_acc, best_baseline, best_baseline_ic, ic_gap,
+  gate_active}`. **SSOT, never a re-derivation:** it calls
+  `baseline_compare.analyze` *verbatim* — the same
+  `validation.split_outcomes_temporal` slice + universal SELL sign-flip
+  as `calibration --oos` and the scorer ledger's OOS metrics — so the
+  persisted `mlp_rank_ic` equals the CLI's / `calibration --oos`'s **by
+  construction** (a built-in no-drift cross-check, exact-value
+  test-locked). `gate_active` mirrors invariant #5 (deployed
+  `n_train ≥ 500`), so a `MLP_WORSE_THAN_TRIVIAL` + `gate_active=True`
+  row is the quant-decisive *"the loop is sizing on a net the data says
+  is worse than a free one-liner, right now"* state. Best-effort by
+  construction (never raises — an untrained scorer / missing-or-short
+  outcomes file / a raising `analyze` all degrade to an **honest**
+  `status='error' verdict='INSUFFICIENT_DATA'` row so a trend gap is
+  *visible*, never a silently-skipped cycle), atomic bounded trim at
+  `BASELINE_SKILL_LOG_KEEP=2000` (the decision_outcomes idiom). **Applies
+  on next `run_continuous_backtests.py` restart** (the running loop
+  predates this commit — inert until restart, exactly the documented
+  deploy-stale pattern). Ledger lives at `data/baseline_skill_log.jsonl`
+  (gitignored-by-symlink like every sibling ledger — never staged). 6
+  exact-value locks in `tests/test_continuous.py`
+  (`TestAppendBaselineSkillLog`: SSOT cross-check vs
+  `scorer_baseline_compare` — `mlp_rank_ic`/`best_baseline`/`ic_gap`/
+  `verdict` must be byte-identical; honest untrained-`INSUFFICIENT_DATA`
+  row; `analyze`-raises → honest error row + still returns True;
+  past-2×-keep atomic trim with newest-survives; never-raises on
+  unwritable path; + `TestCycleWiringRegression::
+  test_main_invokes_baseline_skill_ledger` source-level wiring lock so a
+  refactor can't silently re-orphan it the way the scorer ledger was
+  until pass #15).
+  ```bash
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/test_continuous.py -v -k "Baseline or CycleWiring"
+  # the CLI the ledger records, for ad-hoc reads:
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.baseline_compare
+  ```
+
+- **Quant finding (decisive — the gate underwrites pure sizing variance,
+  now durably trended).** Live deployed pickle `n_train=3894`, gate
+  active. The new ledger's first live row (smoke-tested on the real
+  `decision_outcomes.jsonl`): **`MLP_WORSE_THAN_TRIVIAL`**, MLP OOS
+  rank-IC **+0.0876** vs raw `ml_score` **+0.141** (`ic_gap −0.0534`,
+  `n=1571`, `gate_active=true`) — byte-identical to the
+  `baseline_compare` CLI (the SSOT cross-check holding live). Four
+  independent OOS arbiters agree on the same slice: `gate_pnl`
+  **`GATE_RETURN_NEUTRAL`** (gate-on +0.38% vs gate-off +0.26%,
+  equal-weight contribution **+0.11pp** — "pure added sizing variance"),
+  `calibration --oos` **MISCALIBRATED** (spearman 0.088, decile err
+  5.4pp, OOS decile-realized flat noise), `skill_trend`
+  **`NEGATIVE_OOS_SKILL`** (recent median oos_rmse 11.30 ≥ fresh
+  mean-predictor baseline 8.20, **trend DEGRADING**, `gate_active=1.0`).
+  Fresh `scorer_skill_log` cycles 1–3 today corroborate the textbook
+  overfit: `train_n` 3485→3870→3894 growing, `val_rmse ≪ oos_rmse`
+  (9.0 vs 12.76), `oos_ic` {0.02, 0.02, −0.01}, `oos_dir_acc ≈ 0.50`.
+  **Reported, not actioned** — turning the gate off / retraining is a
+  training-dynamics change out of surgical scope (CLAUDE.md §6). The
+  feature's contribution is making this decisive finding *durable and
+  per-cycle trendable* for the first time, not changing the model.
+
+- **Quant findings (corroborating, fresh live numbers).**
+  `decision_outcomes.jsonl` now **7858 rows** (BUY 5978 / SELL 1880),
+  `forward_return_5d` mean +1.35 std 7.47, **0 non-finite rows** — the
+  `_to_float` poison-row guard (load-bearing: one non-finite
+  `forward_return_5d` wedges retraining indefinitely) is holding clean.
+  **98.3% have `news_article_count = NULL`** → `news_urgency`/
+  `news_article_count` pinned at their constant `build_features`
+  defaults (the deep-history 1996–2018 windows pre-date
+  `digital-intern/articles.db` coverage) — 2 of 17 inputs carry **zero
+  training variance**, a concrete mechanism for the documented "the net
+  destroys the signal it is fed". Backtest dispersion stays
+  **leverage-beta, not skill**: same-recent-cycle run 6230
+  +484.8%/vs_spy +396.7% beside run 6231 −49.4%/vs_spy −12.4% — the
+  "best run" cycle line must never be read as strategy skill (the
+  ledgers / permutation suite are the arbiters). 476 complete / 24
+  failed runs; continuous loop process live, `continuous.log` fresh
+  (mid-cycle), scorer retrains cleanly every cycle.
+
+- **Operational (reconfirmed, out of scope).** Winner→ArticleNet
+  feedback loop still **dead both ways**: `continuous.log` shows
+  `[continuous] ml: inject err: database is locked after [4 attempts]`
+  and `trainer timeout` / `trainer rc=-15` (digital-intern GPU +
+  `articles.db` write-contention on the symlinked `/media` volume —
+  matches passes #6–#16; the loop is **not** training ArticleNet on its
+  winners; the scorer itself retrains cleanly). Exactly **one** Python
+  traceback in the entire log — a transient
+  `sqlite3.OperationalError: locking protocol` on `PRAGMA
+  journal_mode=WAL` during a `BacktestStore()` init at *yesterday's*
+  cycle-1 startup — and it is **correctly handled**: `main()`'s engine-
+  init `try/except` caught it, logged `engine init failed … locking
+  protocol`, slept 30s and continued; cycle 2 proceeded normally
+  immediately after. Same symlinked-volume lock-contention class as the
+  feedback-loop failure, not a code defect, not in this domain's
+  surgical scope.
+
+- **Concurrency note for the next agent.** This pass ran with ≥1 sibling
+  agent active (a parallel `claude --model claude-opus-4-7` process
+  observed in `ps`). The two changed files (`run_continuous_backtests.py`,
+  `tests/test_continuous.py`) were path-scoped `git add`-ed (never
+  `git add -A`), staged diff verified additions-only (`+280 / -0`, 2
+  files), and the deliverable confirmed on `origin/master` **by content**
+  (`git cat-file -e origin/master:<path>` + symbol grep), not by
+  assuming it sits in this agent's commit message — the pass-#16
+  shared-index-race lesson applied pre-emptively.
+
+- **Run the ML/backtest suite (now 380 in the listed subset):** `cd
+  /home/zeph/trading-intelligence/paper-trader && python3 -m pytest
+  tests/test_decision_scorer.py tests/test_backtest.py
+  tests/test_calibration.py tests/test_validation.py tests/test_continuous.py
+  tests/test_gate_audit.py tests/test_gate_pnl.py tests/test_skill_trend.py
+  tests/test_baseline_compare.py tests/test_ml_backtest_review.py
+  tests/test_feature_importance.py tests/test_response_audit.py
+  tests/test_horizon_audit.py tests/test_corpus_audit.py
+  tests/test_regime_audit.py -q`. `test_continuous.py` holds the new
+  `TestAppendBaselineSkillLog` + the extended `TestCycleWiringRegression`
+  baseline-ledger wiring lock.
+
+*Review pass #17 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
