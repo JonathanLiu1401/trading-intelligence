@@ -2507,3 +2507,102 @@ expected; this entry was appended, not rewritten).
   pushed to origin/master. A concurrent sibling hybrid agent (`pid
   1824145`, same task) edited this repo throughout; this entry was
   appended, not rewritten.
+
+- **2026-05-18 (hybrid pass 19 — Agent 3, debug + feature + analyst-validation)** —
+  Required-file-set pass (19th; codebase exceptionally mature, 18 prior
+  passes). Advisor-reviewed before substantive work. Live evidence was the
+  discovery engine (proven pattern of passes 14/16/17/18), not pre-emptive
+  re-reading. `sqlite3` CLI absent → all probes via `python3` `sqlite3`
+  `mode=ro`. Concurrent sibling agent + auto-commit daemon active on the
+  shared monorepo index (memory `di-shared-repo-concurrency`) → strict
+  per-commit pathspec staging throughout.
+
+  **Phase 1 — bugs_fixed=0, no Phase-1 commit (honest, per the guard).**
+  Read all 9 required files in full + the alert-dedup/recency/inference/
+  json-extract paths. Found **no genuine bug** — every load-bearing invariant
+  is multiply defended and the entire requested test list
+  (`backtest://` exclusion in `get_unalerted_urgent`, `mark_alerted`
+  idempotence, `score_source='ml'` on `update_ml_scores_batch`, 15 feature
+  dims / zero ticker-density / days-since-published, model `[0,10]`/`[0,1]`/
+  no-NaN, trainer `score_source='ml'` exclusion + label weighting, urgency
+  9.5-urgent / 3.0-not / already-alerted-not-regressed) **already exists and
+  is comprehensive** (advisor-confirmed: extend real gaps, never duplicate).
+  Baseline 647 passed / 5 failed; the 5 are the pre-existing sibling-WIP
+  `M collectors/rss_collector.py` per-feed-backoff change (its new
+  `resp.status_code` branch vs the test's `_FakeResp`) — **not ours, never
+  staged, left exactly as-is**; the floor "still exactly 5, never 6+" held
+  every run.
+
+  **Phase 2 — features_added=1, commit `257057d`**
+  (`analysis/claude_analyst.py` + new `tests/test_briefing_book_tag.py`).
+  **`[BOOK: TICKER]` held-book relevance tag.** The 5h Opus digest ranked an
+  8.0 held-position story identically to an 8.0 generic-macro one — Opus
+  never saw which newswire rows touch the analyst's open book while composing
+  LEAD/TOP SIGNALS/PORTFOLIO (the Discord-only `_format_portfolio_coverage`
+  line is appended *after* the briefing). Adds `_book_tickers()` + a pure
+  read-side ` [BOOK: …]` tag in the exact shape of `[syndicated xN]` /
+  `[model]` / `[ALERTED]`, real-url-guarded so prepended PORTFOLIO/OPTIONS
+  snapshots are never tagged (same discipline as `_extract_briefing_labels`),
+  plus a `SYSTEM_PROMPT` rule to weight held-book rows for the LEAD and the
+  PORTFOLIO table. `_BOOK_TICKERS` is a local mirror of
+  `daemon.PORTFOLIO_TICKERS` (anti-import-cycle discipline) pinned by a
+  parity test. No DB write, no ai_score/ml_score/score_source/urgency touch,
+  no row mutation, backtest excluded upstream — four invariants intact by
+  construction. +14 specific-value tests (word-boundary MU≠MUU, no match in
+  "Micron", canonical dedup ordering, url-alias, snapshot pass-through,
+  non-mutation, daemon parity, SYSTEM_PROMPT consequence). All 86
+  briefing-suite tests (mine + every existing `_build_payload` assertion)
+  pass — the tag insertion broke no contiguity contract. Ships on next
+  `systemctl restart digital-intern` (stale-daemon caveat).
+
+  **Phase 3 — user_findings=6; one folded into bugs_fixed (total
+  bugs_fixed=1, commit `05b406e`).** (1) **Live-log discovery → FIXED:**
+  `[stats_worker] error: 'NoneType' object is not subscriptable` recurred
+  12+×/h in `daemon.log`, exactly correlated with the concurrent `database
+  is locked` writer-contention storm. Root cause: the SAME shared-`self.conn`
+  cursor collision `_retry_on_lock` documents can corrupt the fetch so
+  `cur.fetchone()` returns `None` (not raise the retryable `DatabaseError`
+  variant); the aggregate readers did `.fetchone()[0]` → `TypeError`, NOT a
+  `sqlite3.DatabaseError`, so the decorator never retried it and it bubbled
+  every contended cycle (`stats`/`count_unscored`/`stats_since` silently
+  failing → scorer-backlog gauge + `/api/stats` blind). Fixed with
+  `_expect_row()` — converts the `None` aggregate fetch (MAX/COUNT always
+  yield one row, so `None` is unambiguously the collision, never a legit
+  empty) into the same retryable signal the decorator already handles;
+  applied to all 5 vulnerable sites. +8 specific tests (helper unit,
+  decorator compose, stats/count_unscored/stats_since recover). (2)
+  **Briefing GOOD (positive)** — id 07:13Z read end-to-end: accurate,
+  decisively actionable (bond-rout LEAD 10Y+13bp→4.59% / Nasdaq −1.54% two
+  days before NVDA earnings; PORTFOLIO LITE/LNOK/NVDL/MU tied to live book +
+  DRAM C59 05-22; COVERAGE GAP present); cadence healthy (~5–7h gaps) after
+  the documented 5/14–15 31.9h/41.2h restart-starvation (now mitigated by
+  `_initial_heartbeat_last`). (3) **Alert path CLEAN** — exactly 2 alerts /
+  24h, both legit `Benzinga Economics` UAE-drone/Brent geopolitical
+  (01:55 ai=9.0, 09:19 ai=8.0); zero reddit/wiki/quote-widget noise
+  in-window. **Observation:** the 09:19 "Stock Market Today…Drop Following
+  Drone Strike" is a market-reaction *continuation* of the 01:55 "Drone
+  Attack On UAE Nuclear Plant" but has a distinct `alert_dedup._signature`
+  (first-8-token) so cross-cycle suppression does NOT collapse the same
+  catalyst surfacing under a materially different headline — borderline
+  duplicate from the analyst's seat; low severity at this volume, not chased
+  (signature widening risks false-silencing distinct same-ticker events,
+  which `test_briefing_alert_parity` explicitly pins). (4) **No stuck
+  urgent queue** — `urgency=1` count 0 / 24h: the pass-18 `d5918e3`
+  stale-drop fix is holding live, no permanent residue. (5) **Collection
+  healthy** — 407 live art/h, 4780/24h, GN round-robin dominant; newest
+  row ≈min-fresh. (6) **Chronic DB-lock contention (pre-existing,
+  reported not chased)** — frequent `database is locked` WARNINGs across
+  ~10 workers backing off 5–20s (memory `di-insert-batch-lock-contention`);
+  the real fix (per-call connection isolation) is substantial and
+  `daemon.py`/store sibling-touched → out of clean scope; the Phase-3 fix
+  above removes one *symptom* (the TypeError leak) of this same storm.
+  Final verify: `storage.article_store` / `ml.features` / `ml.model` /
+  `analysis.claude_analyst` imports OK; suite **677 passed**, the same 5
+  `test_rss_collector.py` failures are the pre-existing sibling
+  `M collectors/rss_collector.py` WIP (not ours, never staged). *Pre-existing,
+  deliberately never staged* (consistent with every prior entry):
+  `collectors/rss_collector.py`, `daemon.py`, `dashboard/server.py`,
+  `tests/test_article_store.py`, all `paper-trader/*`, `logs/*.tmp`. All
+  three commits pathspec-scoped to exactly their intended files;
+  `git diff --staged --stat` verified before each commit; never `git add
+  -A`; pushed to origin/master. Entry appended, not rewritten.
