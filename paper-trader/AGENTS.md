@@ -1051,6 +1051,79 @@ modulates identically; reasoning surfaces the skip; independent of the
   > (CLAUDE.md §6). The actionable thread: the signal demonstrably *exists*
   > in raw `ml_score` (+0.20 OOS); the MLP is the lossy component.
 
+### Baseline-trend reader (2026-05-18)
+
+- **`paper_trader/ml/baseline_trend.py` (new read-only diagnostic).**
+  `_append_baseline_skill_log` (committed `6ade72d`) writes one row per
+  cycle to `data/baseline_skill_log.jsonl` carrying the decisive
+  `ic_gap = MLP_rank_ic − best_one_liner_rank_ic` column — but **nothing
+  read it**. `skill_trend.py` trends the *scorer-skill* ledger
+  (`oos_rmse` vs a constant mean-predictor); the baseline ledger, which
+  captures the single most economically-decisive recurring finding
+  (`MLP_WORSE_THAN_TRIVIAL` — a one-liner out-ranks the 17-feature MLP
+  the conviction gate sizes on), had no trender. This is the exact
+  ledger-wired-but-unread gap the pass-#17 `skill_trend` addition closed
+  for the sibling ledger; `baseline_trend` is its counterpart. It loads
+  the baseline ledger, takes the **median** `ic_gap` over the recent
+  window (window-specific `ic_gap` noise is large — median, not mean),
+  and returns an exact verdict. `IC_MARGIN` / `MLP_IC_MIN` are
+  **imported from `baseline_compare`** (single source of truth — this
+  trends *that* tool's per-cycle verdict, so the margins must match by
+  construction; the `_oos_rank_metrics`-reuses-`_spearman` precedent).
+  Verdicts (exact-value test-locked, `MIN_CYCLES=5`,
+  `RECENT_CYCLES=10`): `INSUFFICIENT_DATA` (< 5 usable rows — a row is
+  usable iff `status=="ok"` AND `ic_gap` is finite, so a scorer-untrained
+  `INSUFFICIENT_DATA` cycle with `ic_gap=None` is correctly excluded,
+  mirroring `skill_trend`'s null-`oos_rmse` skip) → `MLP_WORSE_THAN_TRIVIAL`
+  (recent median `ic_gap ≤ −IC_MARGIN`) → `MLP_ADDS_SKILL` (recent median
+  `ic_gap ≥ +IC_MARGIN` AND recent median `mlp_rank_ic > MLP_IC_MIN` —
+  the same dual gate `baseline_compare.MLP_ADDS_SKILL` uses) →
+  `MLP_NO_BETTER_THAN_TRIVIAL` (otherwise). `trend`
+  `IMPROVING/DEGRADING/STABLE/UNKNOWN` is recent-vs-older median `ic_gap`
+  (higher = better). Also surfaces `most_common_best_baseline` (which
+  one-liner keeps winning — on the live corpus this is `ml_score`, the
+  decisive detail: the net destroys the signal it is fed),
+  `gate_active_fraction`, and recent medians of `mlp_rank_ic` /
+  `best_baseline_ic` / `n_train`. Read-only, never raises (same
+  operational discipline as the rest of the module). CLI exit mirrors
+  the sibling whose verdict it trends (`baseline_compare`): `0` on
+  `MLP_ADDS_SKILL` / `INSUFFICIENT_DATA`, `2` on
+  `MLP_WORSE_THAN_TRIVIAL` / `MLP_NO_BETTER_THAN_TRIVIAL`, so a cron can
+  branch on "the net *persistently* fails to earn its complexity". CLI:
+  `python3 -m paper_trader.ml.baseline_trend`. Locked by
+  `tests/test_baseline_trend.py` (24 exact-value cases: single-source
+  margin identity · inclusive/strict verdict boundaries at
+  `±IC_MARGIN`/`MLP_IC_MIN` · null-`ic_gap` & non-`ok` usable-filter ·
+  even-length median arithmetic · `most_common_best_baseline` ·
+  trend axis independent of verdict axis · CLI exit codes).
+
+  > **Quant finding (2026-05-18, this pass).** `baseline_trend` itself
+  > reports `INSUFFICIENT_DATA` live — `data/baseline_skill_log.jsonl`
+  > does **not exist on disk**: the running continuous loop (PID
+  > `1734916`, booted `01:11 UTC`) predates `6ade72d` (the
+  > `_append_baseline_skill_log` wiring, `10:11 UTC`), so it writes
+  > `scorer_skill_log.jsonl` (14 rows, up to cycle 09:42 UTC) but **not**
+  > the baseline ledger. This is the documented stale-loop operational
+  > state, **not a code bug** — the trender is correct and will populate
+  > a verdict once the operator restarts the loop. The point-in-time
+  > picture (deployed pickle `n_train≈3860`, 1000-row temporal-OOS
+  > slice) is unchanged and consistent across every arbiter:
+  > `baseline_compare` = **`MLP_NO_BETTER_THAN_TRIVIAL`** (MLP rank_ic
+  > +0.069 vs `ml_score` +0.111, gap −0.042); `skill_trend` =
+  > **`NEGATIVE_OOS_SKILL`** (oos_rmse 11.30 ≥ fresh baseline 9.51,
+  > median oos_ic 0.02, **trend DEGRADING**, `gate_active=1.0`);
+  > `calibration --oos` = **`MISCALIBRATED`** (in-sample
+  > `WELL_CALIBRATED` but OOS spearman 0.069, decile-realized column flat
+  > noise — d1 mean_pred −34.49 realized −2.73 vs d10 mean_pred +22.49
+  > realized +1.64; textbook overfit). One window-specific counterpoint:
+  > `regime_audit` read **`REGIME_UNIFORM_EDGE`** on *this* draw
+  > (sideways rank_ic +0.129, bull_or_unknown +0.063) — but the larger
+  > bull bucket sits below `baseline_compare`'s `MLP_IC_MIN=0.10` floor,
+  > so it is a fragile borderline artifact, not a stable edge,
+  > consistent with `skill_trend`'s DEGRADING. **All reported
+  > observations, not model changes** — altering the MLP/gate is a
+  > training-dynamics change out of surgical scope (CLAUDE.md §6).
+
 ### Tests (ML + backtest section)
 
 ```bash
@@ -1101,6 +1174,15 @@ cd /home/zeph/paper-trader && python3 -m pytest tests/test_horizon_audit.py -v
 # Is the scorer's ~0 OOS skill a 5d-target-noise artifact? (read-only):
 cd /home/zeph/paper-trader && python3 -m paper_trader.ml.horizon_audit          # OOS slice
 cd /home/zeph/paper-trader && python3 -m paper_trader.ml.horizon_audit --all    # full in-sample
+
+# Baseline-trend reader — trends the per-cycle baseline ledger's ic_gap
+# (MLP − best one-liner OOS rank-IC). The counterpart to skill_trend for
+# the baseline ledger; the canonical durable instrument for the
+# MLP_WORSE_THAN_TRIVIAL question (24 exact-value verdict locks)
+cd /home/zeph/paper-trader && python3 -m pytest tests/test_baseline_trend.py -v
+# Is the MLP STILL net-negative complexity, and improving or worsening?
+# (read-only; exit 2 on MLP_WORSE/NO_BETTER, 0 on ADDS_SKILL/INSUFFICIENT):
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.baseline_trend
 
 # Training-corpus & OOS-construction audit (exact-value verdict locks)
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_corpus_audit.py -v
@@ -1261,6 +1343,22 @@ locked by `test_store_runid_partial_seams.py`'s `upsert_run`
 INSERT-vs-UPDATE seam above (a 2nd call for the same run_id changes
 **only** `status`, preserving `seed`/`start_date`/`end_date`/
 `start_value`/`started_at`)).
+
+`test_baseline_trend.py` (2026-05-18 pass — the baseline-ledger trend
+reader `paper_trader/ml/baseline_trend.py`: 24 exact-value cases —
+`IC_MARGIN`/`MLP_IC_MIN` are the *same object* as `baseline_compare`'s
+(single-source-of-truth identity assert, not just value equality);
+inclusive `ic_gap ≤ −IC_MARGIN` WORSE boundary vs the −0.04 just-inside
+case; the `MLP_ADDS_SKILL` dual gate (`ic_gap ≥ +IC_MARGIN` AND
+`mlp_rank_ic > MLP_IC_MIN`) with the strict-floor `mlp_rank_ic == 0.10`
+→ NO_BETTER case; the usable-row filter excluding both non-`ok` rows and
+`status=="ok"` rows with `ic_gap=None` — the scorer-untrained
+`INSUFFICIENT_DATA` cycle shape, mirroring `skill_trend`'s
+null-`oos_rmse` skip; even-length `np.median` arithmetic pinned exactly
+on a mixed `ic_gap`/`mlp_rank_ic`/`best_baseline_ic` set;
+`most_common_best_baseline`; the trend axis proven independent of the
+verdict axis (`MLP_WORSE_THAN_TRIVIAL` + `trend=IMPROVING`); CLI exit
+codes 0/2 via monkeypatched `analyze`).
 
 > A non-network collection error from an *untracked, out-of-scope* test
 > file (e.g. one a parallel review agent left mid-flight that imports a
@@ -4151,3 +4249,137 @@ baseline taken at HEAD before the change for concurrent-agent noise
 isolation).
 
 *Decision-loss-clock feature appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+## Review pass #18 — paper-trader CORE hybrid (2026-05-18)
+
+**bugs_fixed = 0 · features_added = 2 · user_findings = 4.** Bounded
+representative sweep (the full suite times out >280s under concurrent
+sibling-agent pytest load — the documented host state): **433 green**
+across `test_core_reporter`, `test_runner_heartbeat{,_swr}`,
+`test_core_state_swr`, `test_dashboard_threaded`, `test_core_runner{,_cycle}`,
+`test_core_strategy`, `test_core_signals`, `test_core_store`,
+`test_core_market`, `test_decision_forensics`,
+`test_core_dashboard_helpers`. Two sibling ML+backtest agents and the
+auto-push daemon were active; both feature commits were path-scoped
+(`git add <file>`, never `-A`), staged-diff verified additions-only, and
+confirmed on `origin/master` **by content** (`git show
+origin/master:<path> | grep <symbol>`), not by commit attribution (the
+pass #16/#17 shared-index-race lesson applied).
+
+- **Phase 1 — no bug (honest `bugs_fixed = 0`).** A full read of
+  `runner.py` / `reporter.py` / `signals.py` / `strategy.py` /
+  `market.py` / `store.py` plus targeted `dashboard.py` probes found no
+  genuine logic defect — consistent with 17 prior polished passes (pass
+  #17 core found 1, a self-introduced regression; pass #17 ML found 0).
+  Per the Phase-1 commit guard, no Phase-1 commit was made. Manufacturing
+  a cosmetic "fix" to pad the counter was explicitly declined.
+
+- **Phase 2 — feature 1 (`b7e0b5c`). `reporter._heartbeat_line` —
+  runner-heartbeat verdict in the hourly/daily Discord summary.** Pass #17
+  made a host-load NO_DECISION storm visible on `/api/runner-heartbeat`
+  (the *dashboard*), but the operator **lives in Discord** and the
+  hourly/daily summary still looked flat-green while the engine was wedged
+  (the live 2026-05-18 state: 19/20 cycles NO_DECISION,
+  `restart_recommended:true`). `send_quota_alert` covers only the
+  *distinct* quota-exhaustion freeze (a specific `quota_exhausted` flag);
+  a host-load idle storm had **no Discord surface at all**. The new line
+  composes `build_runner_heartbeat` **verbatim** (single source of truth,
+  invariant #10 — same `store.recent_decisions(20)` read +
+  `market.is_market_open` split the endpoint uses, so the Discord line and
+  `/api/runner-heartbeat` can never tell different stories), appended to
+  `send_hourly_summary` + `send_daily_close` right after
+  `_singleton_lock_line`. Surfaces **only when actionable**
+  (`restart_recommended` / STALLED / LAGGING liveness / DEGRADED
+  efficacy) so a healthy deciding loop adds no hourly noise (the summary
+  must not become its own lying green light); IDLE_STORM detail is already
+  folded into the builder's top-level headline so only DEGRADED gets an
+  additive `efficacy —` sub-line. Observational only, never gates, no caps
+  (invariants #2/#12 — the `_capital_pulse_line`/`_singleton_lock_line`
+  precedent); a builder/store fault drops the line, **never** the summary
+  (the reporter "no block, never no summary" failure contract). Locked by
+  `tests/test_core_reporter.py::TestHeartbeatLine` (11 tests: verbatim-
+  headline + restart-prefix on IDLE_STORM/STALLED, LAGGING-without-prefix,
+  DEGRADED efficacy sub-line, HEALTHY+PRODUCING suppressed, builder-raises
+  → `""`, a **no-drift real-builder** lock on a real Store seeded with an
+  18-deep NO_DECISION storm, and the hourly+daily integration +
+  fault-still-sends contract).
+
+- **Phase 2 — feature 2 (`784201f`). SWR-cache `/api/runner-heartbeat`.**
+  The surface a trader checks *first*, polled every 60s by the dashboard
+  JS, was the **last high-traffic core endpoint not behind `swr_cached`**
+  (the invariant #7 gap `/api/state` closed). Measured **9.45s under load
+  avg 23** (the documented host-load storm) versus ~1ms warm — a pure DB +
+  module-global read with no network, so the latency is pure CPU
+  starvation, exactly what SWR absorbs. `@swr_cached("runner-heartbeat",
+  20.0)`: runner cadence is ≥1800s/3600s with ≥1.25x/2x verdict
+  multipliers and IDLE_STORM needs ≥5 cycles × ≥1800s, so a ≤20s stale
+  window can **never** flip the verdict; the dashboard thread is
+  independent of the runner thread, so a dead runner still gets a fresh
+  background recompute of `secs_since_last_decision` from the frozen
+  `last_decision_ts` and correctly goes STALLED — **SWR never masks the
+  death it detects**. Inert under pytest unless `_SWR_TEST_FORCE`, so the
+  existing `tests/test_runner_heartbeat.py` endpoint tests stay green on
+  the live path. Locked by `tests/test_runner_heartbeat_swr.py` (mirrors
+  `test_core_state_swr.py`: cold full-verdict + honesty keys; warm hit
+  serves the **stale alarming** payload after the storm cleared — the
+  discriminating "not silently recomputed every poll" lock;
+  pytest-inert-by-default isolation). Like every recent feature, **applies
+  on the next paper-trader restart** — a stale `:8090` keeps the old
+  uncached path until then (`/api/build-info` `stale`).
+
+- **Phase 3 — live findings (running `:8090`, build-info `stale`,
+  `behind:2`, boot `18b40ec`).**
+  1. **Live IDLE_STORM, ~25h since last trade (HIGH, host/ops, not
+     code-fixable).** `/api/runner-heartbeat` reports `verdict=HEALTHY
+     restart_recommended=true decision_efficacy=IDLE_STORM
+     consecutive_no_decision=19`; the last *FILLED* trade was
+     `2026-05-17T09:38 BUY MU`, **>25h ago**, the book ~98% deployed
+     (cash $18.49 / total $972.69) in MU/LITE and frozen. Documented
+     host-load timeout storm aggravated by git-watcher restart-thrash
+     (the runner pid bounced 1822266→1827108 within this session). **This
+     pass's feature 1 is precisely what now makes this visible in Discord
+     instead of a flat-green hourly summary; feature 2 keeps the
+     diagnostic surface instant under the same load.**
+  2. **Running process is 2 commits stale (MEDIUM, documented).**
+     `build-info` `boot 18b40ec / head 784201f / stale:true / behind:2`;
+     the live heartbeat curl returns `cached:null` (old uncached path) —
+     proof both new features are on disk but **not yet live**; they
+     activate on the next restart (the invariant #7/#11 "does not rescue
+     a running process" pattern, flagged so the operator restarts to
+     arm the Discord heartbeat line + endpoint SWR).
+  3. **`GOOGU` & `METAU` are permanently delisted but still in
+     `strategy.WATCHLIST` *and* the SYSTEM_PROMPT "LEVERAGE INSTRUMENTS
+     AVAILABLE" list (LOW, data hygiene).** Recurring yfinance 404s every
+     `market._DEAD_TTL` window clutter `runner.log`; `_mark_dead`
+     suppresses re-fetch so there is **no functional harm**, but Opus is
+     still told two dead names are tradeable. **Reported, not fixed** —
+     the trading universe + its mirrored prompt text is a judgment call
+     outside a surgical pass (a WATCHLIST-only edit that left the prompt
+     inconsistent would be worse); flagged per the task's "otherwise
+     just report it".
+  4. **Singleton-guard relaunch churn continues (MEDIUM, ops,
+     pre-existing).** A supervisor keeps relaunching in restart gaps;
+     the invariant-#19 guard correctly refuses every duplicate (**no
+     double-trade**, `singleton_lock:acquired degraded:false`). Pass #17
+     finding #2, still present; out of code scope.
+  - **Positive validation.** Dashboard/data layer operationally sound:
+    every probed panel (`/api/state` 0.004s, `/api/risk` 0.001s,
+    `/api/decision-health` 0.012s, `/api/benchmark` 0.004s,
+    `/api/capital-paralysis` 0.009s) HTTP 200 sub-13ms; Discord delivery
+    `notify:HEALTHY` (0 consecutive failures, last OK recent) — the new
+    heartbeat line WILL deliver on the next hourly. The system's only
+    real problem is finding #1 (host load), not the code.
+
+- **Run the core suite (bounded — the full one times out under concurrent
+  load):** `cd /home/zeph/trading-intelligence/paper-trader && python3 -m
+  pytest tests/test_core_reporter.py tests/test_runner_heartbeat_swr.py
+  tests/test_runner_heartbeat.py tests/test_core_state_swr.py
+  tests/test_dashboard_threaded.py tests/test_core_runner.py
+  tests/test_core_strategy.py tests/test_core_signals.py
+  tests/test_core_store.py tests/test_core_market.py -q`.
+  `TestHeartbeatLine` (reporter) + `TestRunnerHeartbeatSwr` are the new
+  pass-#18 locks.
+
+*Review pass #18 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
