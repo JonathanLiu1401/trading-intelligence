@@ -9420,5 +9420,35 @@ def supervision_api():
         return jsonify({"error": str(e), "verdict": "UNKNOWN"}), 500
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# /api/equity-integrity — "can I trust the recorded P&L history?"
+#
+# Time-series sibling of /api/mark-integrity (which is point-in-time: "is my
+# book stale RIGHT NOW"). Audits the recorded equity_curve for negative-cash
+# points (the no-hard-cap book over-drawing — AGENTS.md #12), non-positive
+# equity, and no-trade jumps that signal a mismark / stale-price unfreeze /
+# option-settlement artifact rather than a real move. Everything downstream
+# (/api/drawdown, /api/benchmark, /api/analytics Sharpe, the hourly P/L line)
+# is derived from equity_curve, so a silent corruption there poisons every
+# P&L surface with nothing saying so. Pure store reads only — NO network, so
+# fast enough to need no SWR wrap. Advisory / read-only: never gates Opus,
+# adds no caps (AGENTS.md #2/#12 — same contract as mark-integrity). Pure
+# core: analytics/equity_integrity.py. Placed at EOF for the documented
+# lowest-collision insertion point (concurrent-agent operating model).
+@app.route("/api/equity-integrity")
+def equity_integrity_api():
+    try:
+        from .analytics.equity_integrity import build_equity_integrity
+        store = get_store()
+        out = build_equity_integrity(
+            store.equity_curve(limit=5000),
+            store.recent_trades(5000),
+        )
+        out["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR"}), 500
+
+
 if __name__ == "__main__":
     run()
