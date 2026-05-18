@@ -3656,3 +3656,172 @@ two-entries-per-number convention, e.g. the dual #11/#14 passes.)*
   `test_gate_pnl.py`.
 
 *Review pass #16 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 review pass #16 (paper-trader core hybrid · decision-context advisory-block omission · capital-paralysis Discord pulse · live findings)
+
+- **Phase 1 — 1 bug fixed (in HEAD via commit `5f40009`; see Concurrency
+  note).** `analytics/decision_context.py` — `/api/decision-context`
+  (the operator's **only** window into "what is the live trader actually
+  shown right now?", whose docstring promises a string "byte-identical to
+  the live prompt given identical inputs", single-source-of-truth
+  invariant #10) reconstructed the prompt via `strategy._build_payload`
+  but **never threaded `event_calendar_block` (forward earnings) or
+  `buying_power_block` (deployable cash)** — both wired into the real
+  `decide()` (`buying_power` since `b739a14`; `event_calendar` earlier).
+  The inspector silently dropped **2 of 6 advisory blocks**: a trader
+  curl-ing the endpoint to audit "did Opus get the buying-power /
+  upcoming-earnings awareness this cycle?" got a false **NO**, and
+  `advisory_blocks` lacked both keys entirely (a `KeyError` for any
+  consumer iterating the documented set). Root cause: the inspector was
+  built before those two blocks were added to `decide()` and never
+  updated — exactly the class of regression that escapes a per-file
+  review. Fix: add both kwargs to `build_decision_context`, pass them to
+  `_build_payload`, report them in `advisory_blocks`, update the
+  `__main__` CLI line, and build them in `assemble_inputs` **mirroring
+  `decide()` byte-for-byte** (`event_calendar` scope = held ∪ the FULL
+  `WATCHLIST` — *not* the lean `_names_in_play` set, which would
+  re-blind the reconstruction the same way it would re-blind the live
+  desk; `buying_power` scoped to `_names_in_play`). **Verified live:** the
+  reconstructed prompt grew `8984→10002` chars (exactly the two omitted
+  blocks) and the CLI now reports `event_calendar=True buying_power=True`.
+  Locked by 5 RED-before regression tests
+  (`test_decision_context.py::TestNewAdvisoryBlocksReachPrompt` — verbatim
+  text + flags + `_build_payload` byte-faithful ordering;
+  `TestInputSummary::test_advisory_block_flags` updated to the 6-key
+  contract; `test_decision_context_endpoint.py::…test_buying_power_block_
+  reaches_reconstructed_prompt` — the `assemble_inputs` wiring).
+
+- **Phase 2 — 1 feature.** `reporter._capital_pulse_line` — a
+  **capital-paralysis pulse in the hourly / daily-close Discord
+  summary**. The #2 documented live pathology (pass #14 #4): a book
+  pinned near 98% deployed with ~$18 free, unable to act for a day while
+  involuntary NO_DECISION droughts bleed alpha. `capital_paralysis`
+  serves this on the **dashboard** and `buying_power` now reaches the
+  **Opus prompt** — but the operator, who lives in **Discord**, still got
+  hourly/daily summaries that never said the desk was frozen and bleeding.
+  This routes the existing builder's own verdict to the surface the
+  operator actually reads (the exact dashboard→prompt→Discord trajectory
+  `buying_power` followed, one surface over). Composes
+  `build_capital_paralysis` **verbatim** (single source of truth,
+  invariant #10 — headline / unlock / verdict are the builder's, never
+  re-derived, so this line, `/api/capital-paralysis` and the prompt-side
+  `buying_power` can never drift). **Pure store reads, NO network** (the
+  Discord-path discipline — unlike `_benchmark_line` it adds zero
+  latency). Observational only, no caps, never gates (invariants #2/#12;
+  the `_hold_discipline_line` / `_benchmark_line` precedent). Suppression:
+  `NO_DATA` and a healthy `FREE`-not-bleeding book are silent (nothing
+  actionable); `PINNED`/`EMPTY` are **always** surfaced, and — the key
+  subtlety — a `FREE` book whose involuntary-drought verdict is
+  `BLEEDING` IS surfaced. That is the **live 2026-05-18 state**:
+  `can_act_on_signal:true` (→ state `FREE`) masks that the desk has bled
+  **-2.21% alpha across 6 involuntary droughts**; the verbatim live
+  render is `**CAPITAL** ◈ FREE / > FREE — $18.49 cash (1.9%) available …
+  / > 2.21% of alpha lost across 6 involuntary (parse-failure) droughts —
+  the NO_DECISION problem is costing real performance`. Wired into both
+  `send_hourly_summary` and `send_daily_close` (after the existing
+  behavioural / hold-discipline blocks). Locked by 14 tests in
+  `tests/test_capital_pulse.py` (suppression × NO_DATA/missing-state/
+  FREE-healthy/non-dict/empty-headline; surfaced × PINNED-verbatim-with-
+  unlock-and-reason / FREE-but-BLEEDING-live-state / minimal-no-unlock /
+  garbage-frees_usd-no-crash; failure contract × builder-raises /
+  store-raises → "" never raises; end-to-end × hourly + daily wiring +
+  healthy-book-adds-no-noise regression).
+
+- **Phase 3 — live findings (1–6; none a new quick safe code fix —
+  finding 1 *became* the Phase-1 fix).**
+  1. **`/api/decision-context` under-reported what Opus sees** — the
+     Phase-1 bug, found by curl-ing the endpoint as a trader and diffing
+     it against the `buying_power` smoke test (HAS BUYING POWER: False on
+     the endpoint, fully rendered by the builder). Fixed this pass.
+  2. **The live trader is UNSUPERVISED.** `/api/supervision` (the brand-
+     new `dde6ee5`-era endpoint) correctly reports `orphan:true ppid:1
+     supervised:false verdict:UNSUPERVISED`: the running pid (booted on
+     `b82f09e`, current) is parented to init, **not** under
+     `systemd --user` (`Failed to connect to bus: No medium found`). The
+     git-watcher's deferred-restart + deadman force-exit logic
+     **assumes** `systemd Restart=always` brings the process back on new
+     code; an orphan with no supervisor that cleanly exits to apply a
+     commit (or hits the deadman) just **dies**. Something external is
+     currently relaunching it (boot_sha advanced `f29e134→b82f09e`
+     mid-session) but there is no durable safety net. Real ops risk;
+     **reported, not fixed** — touching the live process / systemd unit
+     is out of scope and high-risk for a code pass. The new
+     `/api/supervision` endpoint itself works correctly and is the right
+     surface for this.
+  3. **NO_DECISION ~59.5% lifetime / ~50% (24h)** — 458/770 lifetime,
+     43/85 in 24h, uniformly `"claude returned no response
+     (timeout/empty)"`; `quota_exhausted` unset. Unchanged, the
+     long-standing host-load contention diagnosis (CLAUDE.md §11; passes
+     #6–#15). Not a code defect; the lever is host load.
+  4. **Capital paralysis active & bleeding (the Phase-2 justification).**
+     `/api/capital-paralysis`: $18.49 cash (1.9%), 98.1% deployed, LITE
+     61% of book, `cycles_since_last_fill 58`, last fill ~24h ago,
+     `involuntary_alpha_bleed_pct -2.213` across 6 droughts, verdict
+     `BLEEDING`. Real, ongoing, measurably costly — now visible in
+     Discord (Phase 2).
+  5. **`/api/capital-paralysis` self-contradiction in the [1%,2%) band,
+     still present.** `can_act_on_signal:true` + `liquidity_status:
+     NO_DRY_POWDER` + a `FREE — …the book can act…` headline while 98.1%
+     deployed and `flags:["98.1% of book deployed", …]`. This is the
+     **pass #15 finding #1** (the `liquidity.py` `can_act` vs
+     `NO_DRY_POWDER` threshold disagreement in `cash_pct∈[1,2)`),
+     **confirmed unchanged** at `cash_pct 1.9`. Still the
+     "deliberately-weird, contested-builder, leave-it" category — a
+     future pass that *does* touch `liquidity.py` should align the two
+     thresholds and re-pin the `capital_paralysis` composition. NB: the
+     Phase-2 pulse intentionally keys off the *paralysis* verdict
+     (`BLEEDING`), **not** `can_act`, so it correctly surfaces this book
+     despite the headline saying "FREE … can act".
+  6. **MU position phantom-flat (stale mark, known/handled).** Live book:
+     `MU stock qty=0.5 avg=724.12 now=724.12 P/L $+0.00` — the documented
+     stale-mark case (yfinance returned no price → marked at cost,
+     `stale_mark` flag set; surfaced as `[STALE MARK …]` in the prompt
+     and `⚠ STALE` in `_portfolio_lines`). Working as designed; noted so
+     a future agent does not misread the $0.00 P/L as a genuinely flat
+     position.
+  7. **Positives verified:** `/` 200 in 0.85s; `/api/runner-heartbeat`
+     HEALTHY, singleton **acquired** (pid 1786434, not degraded),
+     notify/Discord **HEALTHY**; `/api/build-info` not stale (boot==head);
+     decisions on the 60m closed-market cadence (last 8m ago);
+     `buying_power` smoke test renders the correct `CASH_CONSTRAINED`
+     block verbatim on the live pinned book. The system is operationally
+     sound; its real problems (host-load timeouts, data-corruption
+     paralysis, no supervisor) are documented ops/data issues, not core
+     code defects.
+
+- **Concurrency note for the next agent — `git commit -- <pathspec>`
+  defeats partial staging.** This pass ran with ≥3 sibling agents
+  committing in parallel (observed: `feat(briefing)` `5f40009`,
+  `notify_health`/`_record_send_outcome` in `reporter.py`, `dashboard.py`
+  mark-trust/supervision, `sector_exposure.py`, parallel `AGENTS.md`
+  appends). **Two attribution swaps happened, neither lost code:** (a)
+  Phase-1's `decision_context.py` + 2 test files, after a clean
+  `git add`, were swept into a sibling's `5f40009 feat(briefing)` commit
+  before this agent's own commit landed; (b) Phase-2 carefully extracted
+  *only* its `reporter.py` hunks into the index via `git diff | filter |
+  git apply --cached --recount` (verified `git diff --cached |
+  grep -c <sibling-token>` == 0) — but the subsequent
+  `git commit -m … -- paper_trader/reporter.py …` **commits the
+  working-tree file, not the index**, so the sibling's complete (and
+  separately tested) `notify_health` work rode along under the Phase-2
+  message. **Lesson:** the index-extraction discipline only holds if you
+  commit the **index** (`git commit` with NO pathspec, after staging
+  exactly your hunks and confirming `git diff --cached --name-only` +
+  zero sibling tokens) — adding `-- <pathspec>` silently re-snapshots the
+  whole working-tree file and re-imports sibling hunks. In this repo's
+  trunk-based + auto-push-daemon model the *code* is never lost (every
+  full-suite run stayed green: 1613→1640→1682) and history rewrite on
+  `master` against the daemon is far more dangerous than muddied
+  attribution — so accept it, verify HEAD parses + tests green, and move
+  on (this pass did: `python3 -c "import ast; ast.parse(...)"` on
+  `HEAD:reporter.py`, 94 targeted + 1682 full green).
+
+- **Run the suite:** `cd /home/zeph/trading-intelligence/paper-trader &&
+  python3 -m pytest tests/ -v` (full; ~50–200s). Fast subset for this
+  pass: `python3 -m pytest tests/test_capital_pulse.py
+  tests/test_decision_context.py tests/test_decision_context_endpoint.py
+  tests/test_core_reporter.py -q`.
+
+*Review pass #16 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
