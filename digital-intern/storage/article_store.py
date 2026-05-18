@@ -69,6 +69,29 @@ except Exception:
 #     never a legitimate end-of-results signal inside these methods —
 #     ``fetchall()`` returns ``[]`` on an empty result, so this string only
 #     ever means the cursor-state corruption above.
+#  4. ``DatabaseError("not an error")`` — the SAME shared-connection
+#     cursor-collision class as (2)/(3), but it can corrupt a *writer's*
+#     ``executemany`` too, not only a lockless reader. ``pysqlite`` returns
+#     "not an error" as the ``SQLITE_OK`` (errno 0) default message when the
+#     connection's statement state was reset out from under the in-flight
+#     call by a concurrent writer on the SAME shared ``self.conn`` — there is
+#     no other sqlite message that contains this exact substring. Live
+#     evidence (2026-05-18 daemon.log): ``[recursive_labeler] error: not an
+#     error`` at 12:09:20Z landed exactly at the onset of a ``database is
+#     locked`` writer-contention storm (insert_batch/update_ml_scores_batch
+#     exhausting at 12:09:24-32Z). It surfaced from the
+#     ``@_retry_on_lock``-decorated ``update_ai_scores_batch.executemany``
+#     inside the recursive-labeler's round 1 (the ``round=1 candidates=500``
+#     line preceded it; ``round=1 labeled=…`` was never logged) — the
+#     substring was absent from THIS tuple so the decorator re-raised instead
+#     of retrying the idempotent ``UPDATE … WHERE id=?``, bubbling to the
+#     worker's broad ``except`` and aborting the entire 4h Sonnet/Opus
+#     gold-label cycle (every remaining batch's labels discarded). The
+#     recursive_labeler had ZERO successful runs since the 07:29Z daemon
+#     start (08:01 "no more rows available" pre-(3)-fix on a stale daemon,
+#     12:09 "not an error" — a HEAD bug until this entry). Same
+#     idempotent-retry remedy; safe by construction (every decorated op is
+#     idempotent and only the errno-0 default carries this string).
 #
 # Retry with exponential backoff + jitter to avoid thundering-herd retries
 # that would just collide again at the same instant. Bubble up after the
@@ -80,6 +103,7 @@ _RETRYABLE_DB_ERRORS = (
     "another row available",
     "another row pending",
     "no more rows available",
+    "not an error",
 )
 _LOCK_RETRY_ATTEMPTS = 5
 _LOCK_RETRY_BASE_S = 0.25
