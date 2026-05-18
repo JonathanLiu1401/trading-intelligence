@@ -362,3 +362,111 @@ class TestFormatterRobustness:
         mock_claude.assert_not_called()
         mock_send.assert_not_called()
         assert spy.marked == []
+
+
+class TestQuoteWidgetGate:
+    """Defense-in-depth: a spaceless live ticker-tape title
+    ("NVDANVIDIA Corporation227.13-8.61(-3.65%)") that the urgency head
+    over-scored must NOT fire a 🚨 BREAKING push, even if it reached the
+    alerter from a non-web_scraper path. Suppressed rows must be marked
+    alerted (exit the urgent queue) and must never burn a Claude call.
+    """
+
+    class _StoreSpy:
+        def __init__(self):
+            self.marked = []
+
+        def mark_alerted_batch(self, ids):
+            self.marked.extend(ids)
+
+        def mark_alerted(self, aid):
+            self.marked.append(aid)
+
+    def _row(self, **kw):
+        base = {
+            "_id": "x", "link": "https://finance.yahoo.com/quote/NVDA/",
+            "title": "NVDANVIDIA Corporation227.13-8.61(-3.65%)",
+            "source": "scraped/finance.yahoo.com", "ai_score": 9.0,
+            "summary": "", "published": _iso(0.2), "first_seen": _iso(0.1),
+        }
+        base.update(kw)
+        return base
+
+    def test_helper_rejects_widgets_accepts_real(self):
+        f = alert_agent._looks_like_quote_widget
+        # price glued to a decimal, parenthesised % change, /quote/ landing
+        assert f({"title": "NVDANVIDIA Corporation227.13-8.61(-3.65%)"}) is True
+        assert f({"title": "ETH-USDEthereum USD2,169.83"}) is True
+        assert f({"title": "Some name (-3.65%)"}) is True
+        assert f({"title": "NVIDIA Corporation overview",
+                  "link": "https://finance.yahoo.com/quote/NVDA/"}) is True
+        # `url` alias (the exact alias _is_synthetic/_fmt already tolerate)
+        assert f({"title": "Nokia Oyj",
+                  "url": "https://finance.yahoo.com/quote/NOK"}) is True
+        # real headlines with $/%/comma numbers must survive
+        for good in (
+            "Nvidia Q3 revenue rises 22% to $35.1 billion, beats estimates",
+            "Fed holds rates steady at 4.25%-4.50% as expected",
+            "S&P 500 closes at 5,123.41 record high",
+            "MU earnings blow past Q3 estimates sharply",
+        ):
+            assert f({"title": good, "link": "https://x.com/a/b"}) is False, good
+        # a genuine article *under* a quote path is not the widget itself
+        assert f({"title": "Nvidia tops Q3 estimates on AI demand",
+                  "link": "https://finance.yahoo.com/quote/NVDA/news/nv-123"}
+                 ) is False
+
+    def test_all_widget_batch_suppressed_before_claude(self, monkeypatch):
+        spy = self._StoreSpy()
+        batch = [self._row(_id="a"),
+                 self._row(_id="b", title="NOKNokia Oyj13.98-0.48(-3.35%)")]
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call") as mock_claude, \
+             patch("notifier.discord_notifier.send") as mock_send:
+            ok = alert_agent.send_urgent_alert(batch, spy)
+        assert ok is False
+        mock_claude.assert_not_called()
+        mock_send.assert_not_called()
+        # both marked alerted so they exit the urgent queue, not re-fetched
+        assert sorted(spy.marked) == ["a", "b"]
+
+    def test_mixed_batch_only_real_reaches_prompt(self, monkeypatch):
+        spy = self._StoreSpy()
+        widget = self._row(_id="w")
+        real = {
+            "_id": "r", "link": "https://reuters.com/mu-q3",
+            "title": "MU earnings blow past Q3 estimates sharply",
+            "source": "rss", "ai_score": 9.5, "summary": "",
+            "published": _iso(1), "first_seen": _iso(0.1),
+        }
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call",
+                          return_value="🚨 BREAKING ◈ EARNINGS ◈ MU") as mock_claude, \
+             patch("notifier.discord_notifier.send",
+                   return_value=True) as mock_send:
+            ok = alert_agent.send_urgent_alert([widget, real], spy)
+        assert ok is True
+        mock_claude.assert_called_once()
+        mock_send.assert_called_once()
+        prompt = mock_claude.call_args.args[0]
+        assert "MU earnings blow past Q3 estimates" in prompt
+        assert "NVDANVIDIA Corporation" not in prompt
+        # widget suppressed-marked AND real alerted on success
+        assert sorted(spy.marked) == ["r", "w"]
+
+    def test_syndicated_widget_caught_before_dedup(self, monkeypatch):
+        """Two copies of the same price tick from different collectors. The
+        gate runs BEFORE dedupe_urgent, so BOTH ids are marked alerted — if
+        it ran after dedup only the surviving representative's id would be."""
+        spy = self._StoreSpy()
+        batch = [
+            self._row(_id="y1", source="scraped/finance.yahoo.com"),
+            self._row(_id="y2", source="finnhub"),
+        ]
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call") as mock_claude, \
+             patch("notifier.discord_notifier.send") as mock_send:
+            ok = alert_agent.send_urgent_alert(batch, spy)
+        assert ok is False
+        mock_claude.assert_not_called()
+        assert sorted(spy.marked) == ["y1", "y2"]

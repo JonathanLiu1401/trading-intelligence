@@ -3,8 +3,10 @@ Urgent alert agent — Bloomberg BN newswire style, immediate Discord post.
 """
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
 
 from core.claude_cli import claude_call
 # Reuse the *well-tested* word-boundary source-credibility lookup (pins the
@@ -136,6 +138,58 @@ def _article_age_ok(art: dict) -> bool:
     return False
 
 
+# ── Quote-widget noise gate (defense-in-depth) ───────────────────────────────
+# collectors/web_scraper now rejects Yahoo/Bloomberg live ticker-tape entries
+# ("NVDANVIDIA Corporation227.13-8.61(-3.65%)") at ingestion, but web_scraper
+# is not the only path a spaceless price-tick title can enter on
+# (yahoo_ticker_rss, finnhub, a manual replay), and the urgency head
+# demonstrably over-scores them (live: ml up to 9.99; one was Sonnet-scored
+# 8.0 and fired a real 🚨 BREAKING push — the analyst's single biggest noise
+# complaint). This is the same layered-defense shape as _is_synthetic /
+# _article_age_ok / _filter_low_authority_lone: a formatter-side drop, NOT an
+# ML-threshold change, at the single chokepoint every alert funnels through.
+# The helper is duplicated from web_scraper rather than cross-imported — the
+# watchers layer must not pull the collectors/aiohttp import graph (same
+# rationale as article_store._briefing_domain_key duplicating ml.features).
+_QW_PRICE_GLUE = re.compile(r"[A-Za-z]\$?\d{1,4}[.,]\d{2,3}")
+_QW_PCT_PAREN = re.compile(r"\([+-]?\d{1,3}(?:\.\d+)?%\)")
+_QW_QUOTE_PATH = re.compile(r"/quote/[^/]+/?$", re.I)
+
+
+def _looks_like_quote_widget(art: dict) -> bool:
+    """True for a live quote-tape entry masquerading as an urgent article.
+
+    Two independent title fingerprints (a letter glued to a decimal price; a
+    parenthesised signed % change) plus a Yahoo /quote/ landing path. All are
+    anchored so real headlines with $/%/comma numbers ("rises 22% to $35.1
+    billion", "5,123.41 record high") and real quote-scoped article URLs are
+    never caught. Mirrors collectors.web_scraper._looks_like_quote_widget."""
+    title = art.get("title") or ""
+    if _QW_PRICE_GLUE.search(title) or _QW_PCT_PAREN.search(title):
+        return True
+    url = art.get("link") or art.get("url") or ""
+    try:
+        if _QW_QUOTE_PATH.search(urlparse(url).path):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _filter_quote_widget_noise(
+    arts: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Partition urgent rows into ``(kept, suppressed)``. ``suppressed`` is the
+    quote-tape pseudo-articles; everything else is kept. Pure — no DB / IO.
+    Runs BEFORE dedup so a price tick syndicated across two collectors
+    (yahoo + finnhub surfacing the same NVDA tick) is still caught."""
+    kept: list[dict] = []
+    suppressed: list[dict] = []
+    for a in arts:
+        (suppressed if _looks_like_quote_widget(a) else kept).append(a)
+    return kept, suppressed
+
+
 def _is_synthetic(art: dict) -> bool:
     """True for backtest/opus-annotation rows that must never reach the live
     Bloomberg formatter. Mirrors storage.article_store._LIVE_ONLY_CLAUSE.
@@ -170,6 +224,33 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
             f"[alert] dropped {n_dropped} synthetic rows leaked from upstream"
         )
     if not filtered:
+        return False
+
+    # Quote-widget noise gate (defense-in-depth, same shape as the synthetic
+    # re-filter above). Runs before dedup. Suppressed rows are marked alerted
+    # UNCONDITIONALLY here — regardless of whether Discord later fires — so a
+    # spaceless price-tick that the urgency head over-scored exits the urgent
+    # queue instead of being re-fetched and re-evaluated every 20s cycle. They
+    # stay in articles.db untouched (training reads ai_score; ml_score /
+    # score_source unchanged) — only the noisy push is dropped.
+    filtered, qw_suppressed = _filter_quote_widget_noise(filtered)
+    if qw_suppressed:
+        try:
+            store.mark_alerted_batch(alerted_ids(qw_suppressed))
+        except Exception:
+            _log.exception(
+                "[alert] failed to mark quote-widget rows alerted"
+            )
+        srcs = ", ".join(
+            f"{(a.get('source') or '?')}:{(a.get('title') or '')[:40]}"
+            for a in qw_suppressed[:5]
+        )
+        _log.info(
+            f"[alert] suppressed {len(qw_suppressed)} quote-widget pseudo-"
+            f"article(s) (live ticker-tape, not breaking news) — {srcs}"
+        )
+    if not filtered:
+        _log.info("[alert] all urgent rows were quote-widget noise — skipping")
         return False
 
     # Drop articles older than 24 hours — stale news must not fire as breaking.
