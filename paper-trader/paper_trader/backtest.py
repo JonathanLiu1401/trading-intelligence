@@ -47,8 +47,8 @@ GDELT_WARM_WORKERS = 1        # single worker — parallel workers share rate-li
 GDELT_MAX_WARM_REQUESTS = 150  # cap per warm cycle — full window warming takes hours; not worth it
 OPUS_TIMEOUT_S = 150
 # Global semaphore: caps concurrent claude CLI subprocesses to prevent OOM kills.
-# 10 parallel runs × ~1.5 GB/process = OOM on 14 GB RAM. Cap at 3 concurrent.
-_CLAUDE_SEM = threading.Semaphore(3)
+# 10 parallel runs × ~1.5 GB/process = OOM on 14 GB RAM. Cap at 2 concurrent.
+_CLAUDE_SEM = threading.Semaphore(2)
 
 WATCHLIST = [
     # Core US large-cap + semis (kept from v1 watchlist)
@@ -1825,7 +1825,7 @@ def _claude_call(prompt: str, retries: int = 1) -> str | None:
     if not shutil.which("claude"):
         print("[backtest] claude CLI not found")
         return None
-    with _CLAUDE_SEM:  # max 3 concurrent claude processes to avoid OOM
+    with _CLAUDE_SEM:  # max 2 concurrent claude processes to avoid OOM
         for attempt in range(retries + 1):
             try:
                 r = subprocess.run(

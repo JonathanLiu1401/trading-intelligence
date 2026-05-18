@@ -363,7 +363,7 @@ def _maybe_daily_close():
 # runs this unit with Restart=always. Without a self-check, a running runner
 # keeps executing the OLD code until something else bounces it — a committed
 # fix can sit unapplied for hours. This watcher records git HEAD at boot and
-# re-checks every 10 min; on a HEAD change it logs, pings Discord, sets
+# re-checks every 3 min; on a HEAD change it logs, pings Discord, sets
 # `_restart_requested`, and returns — the MAIN LOOP performs the actual
 # os._exit(0) at the next cycle boundary so a restart never kills a mid-Opus
 # decision call. systemd (Restart=always) brings us back on the new code.
@@ -396,7 +396,7 @@ def _git_watcher():
         except Exception:
             # git transiently unavailable (mid-rebase, USB unmounted, …):
             # skip this iteration, never crash the watcher.
-            time.sleep(600)
+            time.sleep(180)
             continue
         if new_head != old_head:
             print(
@@ -414,7 +414,7 @@ def _git_watcher():
                 print(f"[runner] git-watcher Discord notice failed: {e}")
             _restart_requested.set()
             return  # watcher job is done; main loop handles the actual exit
-        time.sleep(600)
+        time.sleep(180)
 
 
 def _start_git_watcher():
