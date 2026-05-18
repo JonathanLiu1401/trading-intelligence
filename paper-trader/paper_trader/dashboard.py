@@ -8484,6 +8484,30 @@ def decision_context_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/model-reliability")
+def model_reliability_api():
+    """Which model actually made each live decision — Opus vs the degraded
+    Sonnet fallback — and how often the cycle produced nothing at all.
+
+    The live trader is tuned end-to-end around Opus's reasoning depth
+    (AGENTS.md invariant #3). decision-health buckets by *outcome* and
+    decision-forensics only dissects the *NO_DECISION* excerpts; neither
+    can tell the operator a reasoning-depth-tuned book is quietly being run
+    by the fallback. This reports the Opus/fallback split over 24h/7d/all,
+    the *share of executed trades* placed by the fallback, an
+    improving/worsening trend, and a verdict. Legacy rows predating the
+    ``fallback_used`` flag are excluded from the ratio (verified live: a
+    large pre-instrumentation tail). Observational only — never gates Opus
+    (AGENTS.md #2/#12). Also ``python -m
+    paper_trader.analytics.model_reliability [--json]``."""
+    try:
+        from .analytics.model_reliability import build_model_reliability
+        decisions = get_store().recent_decisions(limit=3000)
+        return jsonify(build_model_reliability(decisions))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def run(host: str = "0.0.0.0", port: int = 8090):
     # threaded=True: the dashboard's real load is concurrent (the unified
     # :8888 page fires ~25 panel fetches in parallel, /api/chat fans out ~15
