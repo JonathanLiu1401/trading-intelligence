@@ -104,3 +104,74 @@ class TestExtractArticles:
         never raise into the daemon thread."""
         assert web_scraper._extract_articles("<<<not html", "https://x.com/") == []
         assert web_scraper._extract_articles("", "https://x.com/") == []
+
+
+class TestQuoteWidgetRejection:
+    """Yahoo/Bloomberg list pages embed a live ticker-tape sidebar whose every
+    <a href="/quote/TICKER"> entry is a price string with no spaces. Each price
+    poll mints a new unique title → unbounded fake breaking news (3,476/5,847
+    live scraped rows; one fired a real 🚨 BREAKING push). _looks_like_quote_widget
+    must reject these without ever dropping a real headline."""
+
+    # Live-observed quote-tape entries — every price tick is a distinct title.
+    JUNK_TITLES = [
+        "NVDANVIDIA Corporation227.13-8.61(-3.65%)",
+        "NVDANVIDIA Corporation225.32-10.42(-4.42%)",
+        "NVDANVIDIA Corporation226.97-8.77(-3.72%)",
+        "NOKNokia Oyj13.98-0.48(-3.35%)",
+        "ETH-USDEthereum USD2,169.83",
+    ]
+    # Real headlines, including ones with $/%/comma numbers that a naive
+    # "contains a number" filter would wrongly drop.
+    REAL_TITLES = [
+        "The Top 5 Analyst Questions From Motorola Solutions's Q1 Earnings Call",
+        "Oil jumps as Trump warns 'Clock is Ticking' for Iran",
+        "Stock futures fall after record-setting week for Wall Street",
+        "Fed holds rates steady at 4.25%-4.50% as expected",
+        "Nvidia Q3 revenue rises 22% to $35.1 billion, beats estimates",
+        "Tesla stock up 3.2% after delivery beat",
+        "S&P 500 closes at 5,123.41 record high",
+        "Apple unveils iPhone 16 with A18 chip",
+    ]
+
+    def test_price_glue_titles_rejected(self):
+        for t in self.JUNK_TITLES:
+            assert web_scraper._looks_like_quote_widget(t, "") is True, t
+
+    def test_real_headlines_accepted(self):
+        for t in self.REAL_TITLES:
+            assert web_scraper._looks_like_quote_widget(t, "https://x.com/a/b") is False, t
+
+    def test_quote_landing_url_rejected_even_without_price_in_text(self):
+        # Anchor text alone is clean (no glued price) — the /quote/ landing
+        # path is the second independent fingerprint.
+        assert web_scraper._looks_like_quote_widget(
+            "NVIDIA Corporation overview", "https://finance.yahoo.com/quote/NVDA/"
+        ) is True
+        assert web_scraper._looks_like_quote_widget(
+            "Nokia Oyj summary page", "https://finance.yahoo.com/quote/NOK"
+        ) is True
+
+    def test_real_quote_scoped_article_url_accepted(self):
+        # A genuine article *under* a quote path must still pass — the URL
+        # rule is anchored to end-of-path so deeper paths are not caught.
+        assert web_scraper._looks_like_quote_widget(
+            "Nvidia beats Q3 estimates on data-center demand",
+            "https://finance.yahoo.com/quote/NVDA/news/nvidia-beats-q3-123",
+        ) is False
+
+    def test_extract_filters_every_price_tick_keeps_real(self):
+        # Sidebar: 3 distinct NVDA price ticks (distinct hrefs+titles, each
+        # would have minted its own article id) + 1 real article.
+        html = """
+        <html><body>
+          <a href="/quote/NVDA/?p=1">NVDANVIDIA Corporation227.13-8.61(-3.65%)</a>
+          <a href="/quote/NVDA/?p=2">NVDANVIDIA Corporation226.06-9.68(-4.11%)</a>
+          <a href="/quote/NOK/?p=3">NOKNokia Oyj13.98-0.48(-3.35%)</a>
+          <a href="/news/2026/nvidia-earnings-beat-the-street-q3">Nvidia tops Q3 estimates on AI demand, raises guidance</a>
+        </body></html>
+        """
+        arts = web_scraper._extract_articles(html, "https://finance.yahoo.com/news/")
+        titles = [a["title"] for a in arts]
+        assert titles == ["Nvidia tops Q3 estimates on AI demand, raises guidance"]
+        assert not any(web_scraper._QW_PRICE_GLUE.search(t) for t in titles)

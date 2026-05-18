@@ -204,6 +204,48 @@ SKIP_PATTERNS = re.compile(
     re.I
 )
 
+# ── Quote-widget pseudo-article rejection ────────────────────────────────────
+# Yahoo Finance / Bloomberg / Seeking Alpha list pages embed a live ticker-tape
+# sidebar whose every entry is an <a href="/quote/NVDA"> wrapping the rendered
+# quote string with no inter-field spaces, e.g.
+# "NVDANVIDIA Corporation227.13-8.61(-3.65%)". The generic anchor scan in
+# _extract_articles treated each of those as a fresh "article"; because the
+# price changes on every poll the title (and therefore the article id) is
+# unique every cycle, so a single widget manufactured an unbounded stream of
+# fake breaking news. Live evidence (2026-05-18): 3,476 of 5,847 sampled
+# scraped/* rows were these, the ML relevance head scored them up to 9.99, and
+# one ("NVDANVIDIA Corporation227.13-8.61(-3.65%)") was Sonnet-scored 8.0 and
+# fired a "🚨 BREAKING" Discord push — the consuming analyst's single biggest
+# noise complaint. Two independent fingerprints (either is sufficient):
+#   1. a letter glued directly to a multi-digit decimal price — real prose
+#      always has a space ("rises 22% to $35.1 billion" / "5,123.41 record
+#      high" do NOT match; "Corporation227.13" / "USD2,169.83" do);
+#   2. a parenthesised signed percent change "(-3.65%)" — the quote-tape
+#      change column; real headlines write percentages without the parens.
+# A defense-in-depth twin lives in watchers.alert_agent._looks_like_quote_widget
+# (kept duplicated rather than cross-imported — collectors must not pull the
+# watchers/ml import graph, same rationale as article_store._briefing_domain_key).
+_QW_PRICE_GLUE = re.compile(r"[A-Za-z]\$?\d{1,4}[.,]\d{2,3}")
+_QW_PCT_PAREN = re.compile(r"\([+-]?\d{1,3}(?:\.\d+)?%\)")
+# A Yahoo quote *landing* page ("/quote/NVDA" or "/quote/NVDA/") — the widget's
+# own href. Anchored to end-of-path so real quote-scoped articles
+# ("/quote/NVDA/news/some-headline-123") are NOT caught.
+_QW_QUOTE_PATH = re.compile(r"/quote/[^/]+/?$", re.I)
+
+
+def _looks_like_quote_widget(title: str, url: str) -> bool:
+    """True for live quote-tape entries masquerading as articles. See the
+    block comment above for the live evidence and the two title fingerprints."""
+    t = title or ""
+    if _QW_PRICE_GLUE.search(t) or _QW_PCT_PAREN.search(t):
+        return True
+    try:
+        if _QW_QUOTE_PATH.search(urlparse(url or "").path):
+            return True
+    except Exception:
+        pass
+    return False
+
 
 def _is_article_url(url: str) -> bool:
     if SKIP_PATTERNS.search(url):
@@ -248,7 +290,8 @@ def _extract_articles(html: str, base_url: str) -> list:
             if not text or len(text) < 15:
                 continue
             url = urljoin(base_url, href)
-            if url and url not in seen and _is_article_url(url):
+            if (url and url not in seen and _is_article_url(url)
+                    and not _looks_like_quote_widget(text, url)):
                 seen.add(url)
                 articles.append({
                     "title": text[:200],
