@@ -116,6 +116,28 @@ _COVERAGE_LABELS: dict[str, tuple[str, int]] = {
     "nitter":           ("Nitter/X feed", 3),
     "massive":          ("Massive aggregator", 3),
 }
+# Per-channel poll cadence (seconds), mirroring daemon.py's *_INTERVAL
+# constants for the curated coverage set. Used to estimate how long a channel
+# has been dark from ``consecutive_failures`` instead of from ``last_seen``.
+#
+# Why not ``last_seen``: ``source_health.record_result`` rewrites
+# ``last_seen = now`` on EVERY poll, including the empty polls of a disabled
+# channel (it is "last poll", not "last delivery" — and `get_stale_sources`
+# legitimately relies on that for wedged-worker detection). So
+# ``now - last_seen`` is ≈0 for ANY actively-polled disabled source: the live
+# 5h briefing read "SEC 8-K filings — DARK 0.0h (932 empty polls, 0 delivered
+# all session)", telling the analyst a channel blind the *entire* session was
+# negligible — defeating the whole purpose of this section.
+# ``consecutive_failures × cadence`` is the honest, data-available estimate.
+# Keys MUST stay a superset of _COVERAGE_LABELS (a labelled channel without a
+# cadence silently degrades to "DARK unknown"); pinned by the parity test.
+_COVERAGE_POLL_SECS: dict[str, int] = {
+    "sec_edgar": 300, "sec_edgar_ft": 900, "finnhub": 300, "polygon": 600,
+    "gdelt": 600, "rss": 30, "web": 60, "alphavantage": 1800,
+    "newsapi": 1500, "google_news": 120, "yahoo_ticker_rss": 240,
+    "reddit": 45, "nitter": 180, "massive": 600,
+}
+
 # Never surface more than this many gap lines — a fully-degraded host should
 # not produce a wall of text that itself becomes noise.
 _MAX_COVERAGE_LINES = 8
@@ -137,12 +159,16 @@ def _coverage_gap_lines(report: dict, now: datetime | None = None) -> list[str]:
 
     A channel is a gap when it is ``disabled`` (FAILURE_THRESHOLD consecutive
     empty polls) AND it is one of the curated high-value channels. Lines are
-    sorted by criticality (filings first), then by how long it's been dark.
-    Returns [] when nothing curated is down.
+    sorted by criticality (filings first), then by the estimated dark-duration
+    (``consecutive_failures × poll cadence``; see _COVERAGE_POLL_SECS for why
+    not ``last_seen``). Returns [] when nothing curated is down.
+
+    ``now`` is accepted for signature/back-compat stability (callers and tests
+    pass it); it is unused since dark-duration no longer derives from a
+    wall-clock delta.
     """
     if not isinstance(report, dict) or not report:
         return []
-    now = now or datetime.now(timezone.utc)
     rows: list[tuple[int, float, str]] = []
     for key, info in report.items():
         if key not in _COVERAGE_LABELS or not isinstance(info, dict):
@@ -150,22 +176,22 @@ def _coverage_gap_lines(report: dict, now: datetime | None = None) -> list[str]:
         if not info.get("disabled"):
             continue
         label, priority = _COVERAGE_LABELS[key]
-        last_seen = info.get("last_seen")
-        dark_h: float | None = None
-        if last_seen:
-            try:
-                dt = datetime.fromisoformat(str(last_seen))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                dark_h = max(0.0, (now - dt).total_seconds() / 3600.0)
-            except (ValueError, TypeError):
-                dark_h = None
         fails = int(info.get("consecutive_failures") or 0)
         delivered = int(info.get("total_articles") or 0)
-        dark_str = f"{dark_h:.1f}h" if dark_h is not None else "unknown"
+        # Estimate dark-duration from consecutive empty polls × the channel's
+        # poll cadence — NOT from ``last_seen`` (see _COVERAGE_POLL_SECS: it is
+        # last-*poll* time, always ≈now for an actively-polled disabled
+        # channel, so it reported a misleading "DARK 0.0h" for a source blind
+        # all session). ``~`` prefix flags it as an estimate. None when the
+        # cadence is unknown or it has not failed yet → "DARK unknown".
+        poll_secs = _COVERAGE_POLL_SECS.get(key)
+        dark_h: float | None = None
+        if poll_secs and fails > 0:
+            dark_h = fails * poll_secs / 3600.0
+        dark_str = f"~{dark_h:.1f}h" if dark_h is not None else "unknown"
         extra = ", 0 delivered all session" if delivered == 0 else ""
         line = f"{label} — DARK {dark_str} ({fails} empty polls{extra})"
-        # Sort key: priority asc, then longest-dark first (None sorts last).
+        # Sort key: priority asc, then longest-dark first (unknown sorts last).
         rows.append((priority, -(dark_h if dark_h is not None else -1.0), line))
     rows.sort(key=lambda r: (r[0], r[1], r[2]))
     return [line for _, _, line in rows[:_MAX_COVERAGE_LINES]]
