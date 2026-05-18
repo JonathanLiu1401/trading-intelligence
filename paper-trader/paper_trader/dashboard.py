@@ -3708,7 +3708,7 @@ async function refreshThesis() {
           <span>RSI ${rsi}</span><span>mom5 ${m5}</span><span>mom20 ${m20}</span>
           <span>news ${newsPulse}</span>
         </div>
-        <div style="font-size:11px;color:#dde1e7;font-style:italic;margin-top:6px;">→ ${c.thesis||"—"}</div>
+        <div style="font-size:11px;color:#dde1e7;font-style:italic;margin-top:6px;">${c.thesis||"—"}</div>
         ${headHtml}
         ${ldHtml}
       </div>`;
@@ -4376,7 +4376,7 @@ async function refreshValidation() {
 
     setText("val-last-cycle", latest.cycle != null ? `cycle ${latest.cycle}` : "—");
     setText("val-last-window", latest.window || "");
-    setText("val-last-when", latest.timestamp || "");
+    setText("val-last-when", latest.timestamp ? new Date(latest.timestamp).toLocaleString() : "");
   } catch (e) {
     console.error("validation:", e);
   }
@@ -7771,6 +7771,151 @@ def hold_discipline_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/game-plan")
+@swr_cached("game_plan", 45.0)
+def game_plan_api():
+    """The single prioritised, trader-facing action plan for the next session.
+
+    The ingredients already exist as separate panels — the co-pilot verb
+    (/api/suggestions via _classify_action), the disposition trap
+    (/api/hold-discipline), concentration / single-name risk (/api/risk) and
+    the earnings calendar (/api/event-calendar). Before this, a trader had to
+    open four panels and fuse them by hand. This route does the data-gathering
+    and reuses _classify_action (no forked verb logic); analytics.game_plan
+    does the pure prioritisation. Distinct from unified's /api/action-queue,
+    which is *operator* triage (stale process, decision-parse health) — this
+    is the *trade* plan. Observational — it reorders/annotates existing
+    signals; it never sizes a trade, never gates Opus, adds no caps
+    (AGENTS.md #2/#12)."""
+    try:
+        from . import signals as _sig, market as _mkt
+        from .strategy import (get_quant_signals_live, WATCHLIST,
+                               _names_in_play)
+        from .analytics.hold_discipline import build_hold_discipline
+        from .analytics.event_calendar import build_event_calendar
+        from .analytics.game_plan import build_game_plan
+
+        store = get_store()
+        pf = store.get_portfolio()
+        positions = store.open_positions()
+        total_value = float(pf.get("total_value") or 0.0)
+        cash = float(pf.get("cash") or 0.0)
+
+        # Held qty (stock) — mirrors /api/suggestions data plumbing exactly.
+        held: dict[str, float] = {}
+        for p in positions:
+            if p.get("type") == "stock":
+                held[p["ticker"]] = held.get(p["ticker"], 0.0) + float(
+                    p.get("qty") or 0)
+
+        try:
+            top_signals = _sig.get_top_signals(n=30, hours=6, min_score=5.0)
+        except Exception:
+            top_signals = []
+        try:
+            universe = {t.upper() for t in WATCHLIST}
+        except Exception:
+            universe = set()
+        universe |= {t.upper() for t in held}
+
+        news: dict[str, dict] = {}
+        for art in top_signals:
+            for tk in (art.get("tickers") or []):
+                if not tk or len(tk) > 6 or tk.upper() not in universe:
+                    continue
+                rec = news.setdefault(tk, {
+                    "news_max_score": 0.0, "news_urgent": False})
+                if (art.get("ai_score") or 0) > rec["news_max_score"]:
+                    rec["news_max_score"] = float(art.get("ai_score") or 0)
+                if (art.get("urgency") or 0) >= 1:
+                    rec["news_urgent"] = True
+        for tk in held:
+            news.setdefault(tk, {"news_max_score": 0.0, "news_urgent": False})
+
+        tickers = list(news.keys())
+        try:
+            quant = get_quant_signals_live(tickers) if tickers else {}
+        except Exception:
+            quant = {}
+        try:
+            prices = _mkt.get_prices(tickers) if tickers else {}
+        except Exception:
+            prices = {}
+
+        classified: dict[str, dict] = {}
+        for tk, nrec in news.items():
+            q = quant.get(tk, {})
+            action, conviction, notes = _classify_action(
+                tk, held.get(tk, 0.0), q,
+                nrec["news_max_score"], nrec["news_urgent"])
+            classified[tk] = {
+                "action": action, "conviction": conviction, "reasons": notes,
+                "held_qty": held.get(tk, 0.0),
+                "news_max_score": nrec["news_max_score"],
+                "news_urgent": nrec["news_urgent"],
+                "price": prices.get(tk),
+            }
+
+        try:
+            trades_oldest_first = list(reversed(store.recent_trades(2000)))
+            hd = build_hold_discipline(positions, trades_oldest_first)
+        except Exception:
+            hd = {}
+        try:
+            keep = _names_in_play(positions, top_signals, WATCHLIST)
+        except Exception:
+            keep = set(held)
+        try:
+            ec = build_event_calendar(positions, keep)
+        except Exception:
+            ec = {}
+
+        # Concentration — reuse the /api/risk math (_classify +
+        # _concentration_severity) so the two panels never disagree.
+        rows = []
+        sector_val: dict[str, float] = {}
+        for p in positions:
+            mlt = 100 if p["type"] in ("call", "put") else 1
+            price = p.get("current_price") or p.get("avg_cost") or 0.0
+            val = float(price) * float(p.get("qty") or 0) * mlt
+            sec = _classify(p["ticker"])
+            sector_val[sec] = sector_val.get(sec, 0.0) + val
+            rows.append((p["ticker"],
+                         (val / total_value * 100) if total_value else 0.0))
+        rows.sort(key=lambda r: -r[1])
+        top1_pct = round(rows[0][1], 2) if rows else 0.0
+        top3_pct = round(sum(r[1] for r in rows[:3]), 2)
+        sev, warn = _concentration_severity(top1_pct, top3_pct)
+        concentration = {
+            "severity": sev, "warning": warn,
+            "top1_ticker": rows[0][0] if rows else "",
+            "top1_pct": top1_pct, "top3_pct": top3_pct,
+            "cash_pct": round((cash / total_value * 100)
+                              if total_value else 0.0, 2),
+            "sector_pct": ({s: round(v / total_value * 100, 2)
+                            for s, v in sector_val.items()}
+                           if total_value else {}),
+        }
+
+        plan = build_game_plan(
+            positions=positions, total_value=total_value, cash=cash,
+            hold_discipline=hd, concentration=concentration,
+            earnings_events=(ec.get("events") or []),
+            classified=classified)
+        try:
+            nd, secs = _next_market_open()
+            plan["market_open"] = _mkt.is_market_open(
+                datetime.now(timezone.utc))
+            plan["next_open_seconds"] = secs
+        except Exception:
+            pass
+        return jsonify(plan)
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR",
+                        "position_actions": [], "portfolio_directives": [],
+                        "opportunities": []}), 500
+
+
 @app.route("/api/track-record")
 def track_record_api():
     """Per-name closed-trade memory — the same verbatim loser/winner-autopsy
@@ -7885,6 +8030,21 @@ def runner_heartbeat_api():
                     "OK — this runner holds the single-instance lock "
                     f"(pid={lock.get('holder_pid')}).")
             hb["singleton_lock"] = lock
+        # Additive (2026-05-18): Discord delivery health. EVERY operator
+        # notification flows through reporter._send; when it silently fails
+        # (the 2026-05-17 `env node` PATH outage) the loop looks perfectly
+        # alive while the operator's only surface is dark and the failing
+        # channel cannot report its own failure. Surface it next to the
+        # loop-liveness verdict so a dead channel is visible. Pure read,
+        # never overrides the existing verdict (a different concern); a
+        # fault degrades to no block (the singleton_lock precedent).
+        try:
+            from . import reporter as _reporter
+            nh = _reporter.notify_health()
+            if isinstance(nh, dict):
+                hb["notify"] = nh
+        except Exception:
+            pass
         return jsonify(hb)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
