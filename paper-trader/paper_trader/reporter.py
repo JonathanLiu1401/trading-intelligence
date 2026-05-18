@@ -1,6 +1,8 @@
 """Discord reporter — pushes trades, hourly summaries, and daily close to the channel."""
 from __future__ import annotations
 
+import glob
+import os
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -14,13 +16,62 @@ DISCORD_CHANNEL = "channel:1496099475838603324"
 _INITIAL_EQUITY = INITIAL_CASH
 
 
+def _openclaw_fallback_candidates() -> list[str]:
+    """Well-known on-disk locations for the ``openclaw`` binary when it is NOT
+    on ``PATH``.
+
+    Live failure (2026-05-17): ``openclaw`` is an npm-global living under the
+    nvm node bin (``~/.nvm/versions/node/<ver>/bin/openclaw``). The live
+    runner is launched by ``paper-trader.service`` as
+    ``/usr/bin/python3 runner.py`` with systemd's minimal PATH
+    (``~/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:…``) —
+    which does NOT include the nvm bin. So ``shutil.which('openclaw')``
+    returned ``None`` and **every** Discord message (trade alerts, hourly,
+    daily-close, the new quota alert) was silently dropped with only a
+    ``[reporter] openclaw not installed; would send:`` log line nobody reads.
+    The Discord channel is the operator's primary surface; a PATH quirk in
+    how the daemon happens to be launched must not blind it.
+    """
+    home = os.path.expanduser("~")
+    cands = [
+        os.path.join(home, ".local", "bin", "openclaw"),
+        "/usr/local/bin/openclaw",
+        "/usr/bin/openclaw",
+    ]
+    # npm-global under any installed nvm node version; newest version first.
+    cands += sorted(
+        glob.glob(os.path.join(home, ".nvm", "versions", "node", "*", "bin", "openclaw")),
+        reverse=True,
+    )
+    return cands
+
+
+def _resolve_openclaw() -> str | None:
+    """Resolve the ``openclaw`` executable robustly, independent of how the
+    runner was launched. Order: explicit ``OPENCLAW_BIN`` override (operator
+    escape hatch) → ``PATH`` (``shutil.which``) → well-known fallback
+    locations. Returns an absolute path or ``None`` when genuinely
+    unresolvable (caller degrades to a logged no-op, never raises)."""
+    env = os.environ.get("OPENCLAW_BIN")
+    if env and os.path.isfile(env) and os.access(env, os.X_OK):
+        return env
+    p = shutil.which("openclaw")
+    if p:
+        return p
+    for c in _openclaw_fallback_candidates():
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
 def _send(message: str) -> bool:
-    if not shutil.which("openclaw"):
+    bin_ = _resolve_openclaw()
+    if not bin_:
         print(f"[reporter] openclaw not installed; would send:\n{message}")
         return False
     try:
         r = subprocess.run(
-            ["openclaw", "message", "send",
+            [bin_, "message", "send",
              "--channel", "discord",
              "--target", DISCORD_CHANNEL,
              "--message", message],
@@ -79,6 +130,29 @@ def send_decision_log(summary: dict) -> bool:
     if reasoning:
         parts.append(f"> {reasoning[:600]}")
     return _send("\n".join(parts))
+
+
+def send_quota_alert(detail: str = "") -> bool:
+    """One-shot alarm: the Claude CLI is rejecting every decision with a
+    quota / usage-limit error, so the live trader is making NO trades and
+    the portfolio is frozen at its last marks.
+
+    This is the worst *silent* failure mode for a live trader — "I thought
+    the bot was running; it hasn't traded in hours and nobody told me." The
+    hourly/daily reports are independent of Claude so they keep flowing
+    (often reading flat), which makes the freeze even easier to miss. The
+    caller (`runner._cycle`) dedupes so this fires once per outage, not
+    every cycle."""
+    body = (
+        "🛑 **CLAUDE QUOTA EXHAUSTED** ◈ live trader is FROZEN\n"
+        "The decision engine (Opus 4.7 + Sonnet fallback) is being rejected "
+        "with a usage/quota limit error. **No new trades will execute** until "
+        "the quota resets or the plan is upgraded. Open positions are still "
+        "marked-to-market; the book is otherwise idle."
+    )
+    if detail:
+        body += f"\n_{detail[:300]}_"
+    return _send(body)
 
 
 def _behavioural_block() -> str:
