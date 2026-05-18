@@ -356,6 +356,31 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
             return i
         return -1
 
+    def _fwd_ret_h(ticker: str, sim_d: date, idx: int, h: int) -> float | None:
+        """Forward return over `h` trading days from `sim_d` (idx in
+        trading_days), or None when the window runs past cached price history
+        or either endpoint price is missing.
+
+        Additive multi-horizon instrumentation (feature, 2026-05-18). The
+        DecisionScorer trains ONLY on `forward_return_5d` (unchanged); the
+        extra 10d/20d horizons are pure read-only research signal so a
+        skeptical quant can ask whether the scorer's ~0 OOS skill is a
+        5d-target-noise artifact — AGENTS.md notes leveraged ETFs have noisy
+        5d windows but strong multi-month returns, and every existing OOS
+        diagnostic (calibration/gate_audit/skill_trend/baseline_compare) can
+        only ever see the 5d label. This is best-effort: a None here NEVER
+        skips or zeroes the 5d row that training depends on (the 5d path
+        below is left byte-identical on purpose).
+        """
+        ti = idx + h
+        if ti < 0 or ti >= len(trading_days):
+            return None
+        ed = trading_days[ti]
+        if (engine.prices.price_on(ticker, sim_d) is None
+                or engine.prices.price_on(ticker, ed) is None):
+            return None
+        return round(engine.prices.returns_pct(ticker, sim_d, ed), 4)
+
     for run in top_runs:
         try:
             # Hold the store lock — the background _opus_annotate thread may
@@ -481,6 +506,11 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
                 "news_urgency": news_urgency,
                 "news_article_count": news_article_count,
                 "forward_return_5d": round(fwd_ret, 4),
+                # Additive — see _fwd_ret_h. Best-effort None when the horizon
+                # window exceeds cached history; the 5d field above is the
+                # only one the scorer trains on and is unchanged.
+                "forward_return_10d": _fwd_ret_h(ticker, sim_d, idx, 10),
+                "forward_return_20d": _fwd_ret_h(ticker, sim_d, idx, 20),
                 "return_pct": run.total_return_pct,
             })
 
