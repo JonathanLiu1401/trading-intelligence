@@ -516,6 +516,9 @@ Digital Intern dashboard on `:8080` can cross-fetch.
 | `GET /api/state` | Portfolio + positions + last 40 trades + last 20 decisions + equity curve. **`swr_cached("state", 15.0)` (2026-05-17):** this is the trader page's lifeline (polled every 15s by `refresh()`, cross-fetched, observed bursting 2–5 req/s) and the heaviest pure-DB read — six lock-held `Store` reads + a ~145KB body (eq 5000 + 500 trades). It was measured at **8.7s under concurrent load** and was the *only* high-traffic core endpoint not behind `swr_cached` while every slow network endpoint already was (the invariant #7 gap). The portfolio only changes on a decision cycle (`OPEN_INTERVAL_S` ≥ 1800s) so a 15s stale-while-revalidate window is invisible to a trader, serves instantly from the last good payload, single-flight-refreshes in the background, and the runner already pushes every fill to Discord immediately. Injected `cached`/`cache_age_s` honesty keys. `refresh()` tolerates the SWR cold `{"warming":true}` placeholder (skips the tick, self-heals next poll). Locked by `tests/test_core_state_swr.py` |
 | `GET /api/portfolio` | Compact portfolio read (consumed by Digital Intern at :8080) |
 | `GET /api/data-feed` | Live news-collector pulse — proxies digital-intern's `articles.db` (live-only filter): articles in last 1h / 24h + top active sources. Returns zeros (with `error`) if the article DB is unreachable so the widget still renders |
+| `GET /ticker/<sym>` | HTML — **standalone per-ticker drill-down page** (2026-05-18). Deliberately NOT a new tab in the 9k-line SPA `TEMPLATE` (so it can't merge-conflict that file); a self-contained dark page that fetches `/api/ticker/<sym>` client-side. Has a ticker box to jump between names; links honour `X-Forwarded-Prefix` so it works behind the `:8888` proxy. |
+| `GET /api/ticker/<sym>` | **Cross-system dossier for one name** — fuses the live lot + marks, the closed round-trip P&L *for that name only*, the Opus decision trail that touched it, and the live news flow + sentiment. Closes the "inspecting MU means crossing three surfaces by hand" gap. Pure SSOT `analytics/ticker_dossier.py::build_ticker_dossier` (no DB handle / no network / no yfinance — only stored marks + the read-only `signals` reads that already self-degrade on a locked feed). **Intentionally NOT `@swr_cached`:** that decorator keys on the query string only, so a `<sym>` *path* param would collide across tickers (serve MU's dossier for NVDA); the endpoint is lighter than the un-cached `/api/portfolio` peer so the hot path stays bounded without SWR. `has_coverage:false` ⇒ nothing on file anywhere (typo'd ticker shows a clean empty state, not an error). Locked by `tests/test_ticker_dossier.py` (exact aggregates) + `tests/test_ticker_endpoint.py` (Flask test client, incl. a two-ticker no-collision regression) |
+| `GET /api/watchlist-opportunities` | **Missed-opportunity radar** (2026-05-18) — watchlist names with live news heat that the book has **no position in**. Orthogonal to every existing position-centric panel (drawdown / track-record / thesis-drift all describe what's held; this answers "what is the news screaming about that I have zero exposure to?"). One `get_top_signals` fetch; the pure SSOT `analytics/watchlist_opportunities.py::build_watchlist_opportunities` tallies per ticker (no N-query fan-out). `heat = max_score·(1+ln(1+n)/3)·(1+0.25·urgent)`. `@swr_cached("watchlist-opportunities", 60.0)` (no path param, safe to cache). Locked by `tests/test_watchlist_opportunities.py` (exact heat arithmetic + held-exclusion) |
 | `GET /api/validation` | Signal-integrity validation history (permutation tests + label audits) read from `data/validation_results.json`, appended by the continuous loop's background validation runner (capped 50 on the writer side); UI renders the most recent entry |
 | `GET /api/backtests` | Full backtest run list with SPY/QQQ baselines |
 | `GET /api/backtests/<run_id>` | Single backtest detail (trades, decisions, equity) |
@@ -5494,3 +5497,94 @@ features_added = 1 · user_findings = 5.**
   feature).
 
 *Review pass #23 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+### 2026-05-18 review pass #21 (ML+backtest hybrid · deployed-model staleness audit · live findings)
+
+- **Phase 1 — no new bug (bugs_fixed = 0; no Phase-1 commit, the commit
+  guard explicitly permits it).** Re-traced the core trio
+  (`decision_scorer.py`, `backtest.py`, `run_continuous_backtests.py`) end
+  to end: `_ml_decide` scorer-gate arms + off-dist abstention, the
+  `score=`/`scorer=` first-match regex disambiguation,
+  `_compute_decision_outcomes` 5d-window guards, `_enforce_risk_exits`
+  SL-before-TP semantics, `train_scorer` dedup-keyed-by-action +
+  split-before-scale, `_train_decision_scorer`'s three independently
+  guarded OOS blocks. The advisor-flagged `sell_score = best_score` in the
+  CONTRARIAN branch is cosmetic-only (the documented contrarian design —
+  it sells *because* the name scored overbought-high; feeds only the
+  reasoning string's `score=` token, which is the intended ml_score
+  feature for that SELL). All defensive, all exact-value locked.
+  Consistent with the 19 prior no-new-bug ML/backtest passes (#5–#20).
+  **371 ML/backtest tests green before** the feature (394 after, incl. the
+  new `deploy` filter).
+
+- **Feature shipped (Phase 2, `feat(ml):`): `paper_trader/ml/deploy_audit.py`
+  — a durable signal that the conviction gate is running on a stale net,
+  the single most-repeated finding of passes #15–#20.** Every prior pass
+  rediscovered "the running loop predates the retune; the deployed pickle
+  is the memorizing `(64,32,16)` net, not the regularized `(32,16)` one;
+  restart to redeploy" by ad-hoc `pickle.load` inspection — there was **no
+  durable, trendable instrument** for it. This extracts the MLPRegressor
+  kwargs to `decision_scorer.MLP_CONFIG` (single source of truth;
+  `train_scorer` now builds `MLPRegressor(**MLP_CONFIG)`) and introspects a
+  deployed pickle's *fitted-model attributes* against it. Verdicts
+  `DEPLOYED_MATCHES_SOURCE` / `DEPLOYED_STALE_CONFIG` (names every drifted
+  key with deployed≠expected values) / `LSTSQ_FALLBACK` / `UNREADABLE_PICKLE`
+  / `INSUFFICIENT_DATA`; pure/total, never raises; CLI exits 2 on STALE.
+  Distinct from `/api/build-info` (git-SHA / process level) — this measures
+  the **model artifact the gate actually consumes**, which a git SHA cannot
+  see (a pickle can lag the source even on a fresh process). `deploy_stale`
+  (True/False/None) is wired into `_append_scorer_skill_log` so the state
+  is trendable per-cycle, not only a CLI. **18 exact-value offline locks**
+  in `tests/test_deploy_audit.py`. Commit `eb02c9f`.
+  ```bash
+  python3 -m pytest tests/test_deploy_audit.py -q          # 18 green
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.deploy_audit
+  ```
+
+- **Quant findings (Phase 3, live — 6 distinct, reported / out of surgical
+  scope).** (1) **DECISIVE — the deployed scorer is provably stale:
+  `deploy_audit` = `DEPLOYED_STALE_CONFIG`, 6/8 hyper-params drifted**
+  (`hidden_layer_sizes=(64,32,16)≠(32,16)`, `max_iter=600≠1000`,
+  `alpha=1e-4≠1e-2`, `early_stopping=False≠True`,
+  `validation_fraction=0.1≠0.15`, `n_iter_no_change=10≠25`). The running
+  loop keeps the old kwargs resident and re-pickles the memorizing net
+  every cycle. (2) **Scorer has NEGATIVE OOS skill while gating 100% of
+  cycles** — `skill_trend`=`NEGATIVE_OOS_SKILL`: oos_rmse recent 13.00 ≥
+  mean-predictor baseline 8.46, median oos_ic 0.03, oos_dir_acc 0.505
+  (coin-flip), `gate_active=1.0` every cycle, **trend DEGRADING**. (3)
+  **Overfit gap real and widening** — `overfit_gap`=`MILD_OVERFIT`, recent
+  median oos/val ratio **1.38** (older 1.17 → recent 1.38, DEGRADING); the
+  regularized net that closes it is not deployed (same root cause as #1).
+  (4) **Magnitude wildly miscalibrated at the top decile (OOS)** —
+  `calibration --oos` d10 mean_pred **+17.92%** vs mean_realized **+1.07%**
+  (16.8pp over-predict), d9 +4.93 vs +1.69; in-sample `WELL_CALIBRATED`
+  but OOS `DIRECTIONAL_BUT_BIASED`. The gate's `p>10 → ×1.3` arm up-sizes
+  conviction hardest exactly where prediction is least reliable. Nuance:
+  `baseline_compare --oos` is **not** `MLP_WORSE_THAN_TRIVIAL` right now
+  (MLP rank_ic 0.115 > best one-liner `mom20` 0.072, ic_gap +0.043 over
+  n=1385) — but the gate acts on miscalibrated *magnitude buckets*, not
+  rank, so the modest rank edge is unexploited. (5) **Gate-decision
+  capture still 0/6927** — `gate_scorer_pred` populated in 0 of 6927
+  `decision_outcomes.jsonl` rows ⇒ `gate_realized` =
+  `GATE_CAPTURE_NOT_YET_POPULATED` (all buckets n=0); the honest realized-
+  gate effect remains structurally unmeasurable until restart.
+  `decision_outcomes.jsonl` itself is clean (6927 rows, **0 non-finite**,
+  p1=−18.9 / med=0.4 / p99=27.0 / sd=8.07). (6) **winner→ArticleNet loop
+  non-functional + dispersion is leverage-beta** — `_inject_and_train` =
+  `inject err: database locked after 4 attempts` every recent cycle
+  (digital-intern-side write-lock; CLAUDE.md §5 step 5 dead); 500 runs /
+  476 complete / 24 failed / 0 running (orphan-reap + empty-SPY guards
+  healthy, 0 NaN); run 6234 vs_spy **+165%** beside 6236 vs_spy **−52%** =
+  pure 3×-ETF beta draw, not repeatable alpha. `baseline_skill_log.jsonl`
+  still absent (loop predates `6ade72d`). **Decisive operator action
+  (unchanged across 7 passes, now durably surfaced): restart
+  `run_continuous_backtests.py`** — `deploy_audit` flips to
+  `DEPLOYED_MATCHES_SOURCE`, the regularized net deploys, `gate_realized`
+  becomes measurable, and the baseline ledger populates.
+
+- **Concurrency note.** 3+ sibling agents on the shared monorepo tree;
+  never `git add -A`; exactly four path-scoped files staged for the
+  feature, AGENTS.md appended-only & committed separately (re-read after a
+  sibling appended pass #22/#23 between my read and write).
+
+*Review pass #21 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
