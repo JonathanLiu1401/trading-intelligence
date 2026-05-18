@@ -1396,3 +1396,93 @@ permits 0.
 `scripts/stale_source_alerter.py`, `logs/*`, all `paper-trader/*`.
 Commit pathspec-scoped; my feature landed durably (shared monorepo index
 race folded it into the concurrent `dd9af44`, already on `origin/master`).
+
+---
+
+### Agent pass 2026-05-18 (hybrid 3 — debug + feature + analyst validation)
+
+**Phase 1: bugs_fixed=1, commit `111378b`** (`collectors/web_scraper.py`
++ `tests/test_web_scraper.py`). Root-cause fix for the codebase's
+longest-standing analyst noise complaint, repeatedly flagged in prior
+passes but never fixed because it lived in the (clean, stageable)
+scraper. `_extract_articles`'s generic anchor scan treated every entry
+of Yahoo/Bloomberg's embedded live ticker-tape sidebar
+(`<a href="/quote/NVDA">NVDANVIDIA Corporation227.13-8.61(-3.65%)</a>`)
+as a fresh article; the price changes each poll so the title — and thus
+the sha256 article id — is unique every cycle, manufacturing an
+unbounded stream of fake breaking news. **Live evidence: 3,476 of 5,847
+sampled `scraped/*` rows were these; ML relevance scored them up to
+9.99; one (`NVDANVIDIA Corporation227.13-8.61(-3.65%)`) was Sonnet-scored
+8.0 and fired a real 🚨 BREAKING Discord push.** New
+`_looks_like_quote_widget(title, url)` rejects them via two independent,
+anchored title fingerprints (a letter glued to a multi-digit decimal
+price; a parenthesised signed `%` change) plus a Yahoo `/quote/`
+landing-path check — validated so `"rises 22% to $35.1 billion"`,
+`"4.25%-4.50%"`, `"5,123.41 record high"` and real
+`/quote/NVDA/news/...` article URLs all still pass. +5 tests.
+
+**Phase 2: features_added=1, commit `7e97e2d`** (`watchers/alert_agent.py`
++ `tests/test_alert_agent.py`). Defense-in-depth twin
+`_looks_like_quote_widget` / `_filter_quote_widget_noise` at the single
+alert chokepoint — web_scraper is not the only path a spaceless
+price-tick title can enter on (yahoo_ticker_rss, finnhub, manual
+replay). Same layered-defense shape as `_is_synthetic` /
+`_article_age_ok` / `_filter_low_authority_lone`: a formatter-side drop,
+NOT an ML-threshold change, applied right after the synthetic re-filter
+and BEFORE dedup (so a tick syndicated across two collectors is still
+caught). Helper duplicated, not cross-imported (watchers must not pull
+collectors/aiohttp — same rationale as `article_store._briefing_domain_key`).
+Suppressed rows are `mark_alerted_batch`'d unconditionally so they exit
+the urgent queue instead of re-firing every 20s; `articles.db`
+`ai_score`/`ml_score`/`score_source` untouched — **all four invariants
+intact by construction** (no synthetic leak, no ml/ai cross-write, no
+score_source flip, no urgency regression). +4 tests.
+
+**Phase 3 findings (news-analyst lens). user_findings=7.**
+1. *Quote-widget noise still live until restart* — running daemon
+   predates `111378b`/`7e97e2d`; `scraped/finance.yahoo.com` still #1
+   source/last-hour. Both fixes ship on `systemctl --user restart
+   digital-intern` (not done — live system + sibling agents).
+2. *Lone low-authority Reddit alerts dominate the push channel* — of 3
+   alerted rows in 24h, **2 are noise**: `reddit/r/ValueInvesting`
+   (ai=0, ml=9.76 — model over-scored) and `reddit/r/Daytrading`
+   "Trading ideas for Monday – LITE or MU?" (ai=8.0); only `Benzinga`
+   "Drone Attack On UAE Nuclear Plant / Trump Iran warning" (ai=9.0) is
+   genuinely valuable. The already-committed `_filter_low_authority_lone`
+   (cred<0.45) suppresses these after restart. No near-dup alerted sigs.
+3. *7 collector channels DOWN, 4 with ZERO articles all session*
+   (`newsapi, nitter, polygon, sec_edgar` = 0; `alphavantage, massive,
+   sec_edgar_ft` disabled) — analyst fully blind to SEC 8-K filings
+   (sec_edgar: 922 empty polls). Exactly what the shipped COVERAGE GAP
+   briefing feature surfaces; underlying collectors broken/rate-limited
+   (operational).
+4. *DB writer lock-retry exhaustion* — `update_ml_scores_batch` +
+   `insert_batch` exhausted the 5-retry budget at 2026-05-18T00:10 →
+   a scored and a collected batch silently dropped (missed news).
+   Recurring; sibling-agent reader-`_retry_on_lock` / per-connection
+   isolation targets it (left unstaged).
+5. *Benign shutdown traceback* — `RuntimeError: reentrant call inside
+   BufferedWriter` during `log.info("[daemon] Shutdown complete")`;
+   exit-path only, non-fatal.
+6. *Pre-existing broken test in tree (NOT mine)* — untracked
+   `tests/test_alert_history.py` imports nonexistent
+   `watchers.alert_history` → pytest collection error; left as-is.
+7. *Briefing quality: EXCELLENT* — #25 (2026-05-18T01:54) exact and
+   actionable (10Y 4.59% multi-year high, Iran/Hormuz oil-inflation,
+   4%+ semis de-rate two days before NVDA earnings; full MACRO/
+   PORTFOLIO-P&L/SEMIS/TOP-SIGNALS). Cadence ~5.4–6.8h. Consumer
+   experience is strong when the pipeline is healthy.
+
+Final verify: `storage`/`ml.features`/`ml.model` imports OK; suite
+**467 passed**, +9 this work (5 web_scraper + 4 alert_agent), broke
+nothing. The 5 `test_rss_collector.py` failures are the pre-existing
+sibling-agent `collectors/rss_collector.py:175` `TypeError` (committed
+HEAD is clean) — excluded, not mine.
+
+*Pre-existing, deliberately never staged* (consistent with prior
+entries): `collectors/rss_collector.py`, `daemon.py`,
+`tests/test_article_store.py`, untracked `tests/test_alert_history.py`,
+all `paper-trader/*`, `logs/.supervisor_state.*.tmp` deletions. My two
+code files were clean on HEAD before edit; both commits pathspec-scoped
+to exactly their `.py` + test file, `git diff --staged` verified, never
+`git add -A`. Durable on `origin/master`.
