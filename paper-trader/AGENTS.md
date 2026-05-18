@@ -5588,3 +5588,138 @@ features_added = 1 · user_findings = 5.**
   sibling appended pass #22/#23 between my read and write).
 
 *Review pass #21 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 review pass #24 (paper-trader core hybrid · EQUITY INTEGRITY Discord line · live findings)
+
+- **Phase 1 — no new bug (bugs_fixed = 0; no Phase-1 commit, the commit
+  guard explicitly permits it).** Read the seven core files in full
+  (`runner.py`, `reporter.py`, `signals.py`, `strategy.py`, `market.py`,
+  `store.py`) + a targeted sweep of `dashboard.py` (70 `@app.route`s; read
+  `equity_integrity_api` in full). Traced `decide()`'s
+  claude/fallback/retry + host-saturation pre-flight/mid-call-reprobe
+  state machine, the singleton degrade/recheck path, `_mark_to_market`
+  expired-option/`stale_mark`, `_maybe_daily_close` half-day anchoring,
+  and `store.upsert_position` reactivate/blend. **Live forensics, not just
+  a read:** confirmed the live portfolio↔equity_curve divergence is a
+  *mid-cycle slow snapshot under load* (only `decide()` writes equity,
+  paired with the decision; `buying_power.py:233`/`sector_exposure.py:296`
+  `_portfolio_snapshot` are `__main__`-only smoke tests, NOT dashboard
+  writers) and that real curve corruption is already covered by
+  `equity_integrity`. Consistent with the 23 prior mature core passes.
+  Focused-core baseline green before the feature (359:
+  `test_core_{market,store,runner,strategy,signals,reporter}`).
+
+- **Feature shipped (Phase 2, `feat(reporter):`, commit `1f72230`):
+  EQUITY INTEGRITY Discord line.** `build_equity_integrity` was
+  **dashboard-only** (`/api/equity-integrity`, pass #18) — yet its
+  docstring states every headline P&L surface the operator reads
+  (hourly Equity/P/L, `_benchmark_line`, `/api/drawdown`,
+  `/api/analytics` Sharpe) derives from `equity_curve`, so a silent
+  negative-cash over-draw (#12) / non-positive-equity / no-trade
+  mismark-jump poisons all of them with nothing in Discord saying so.
+  This is the exact dashboard→Discord gap `_heartbeat_line` /
+  `_capital_pulse_line` / `_singleton_lock_line` each closed, one
+  dimension over. New `reporter._equity_integrity_line(store)` composes
+  `build_equity_integrity` **verbatim** (single source of truth,
+  invariant #10) feeding it the **identical** store reads the endpoint
+  uses (`equity_curve(limit=5000)` + `recent_trades(5000)`) so the two
+  surfaces can never drift. Surfaces only `CORRUPT`/`SUSPECT`;
+  `CLEAN`/`NO_DATA`/`ERROR`/non-dict suppressed (the `_heartbeat_line`
+  lying-green-light precedent — a clean curve adds no hourly noise).
+  Observational only, never gates, no caps (invariants #2/#12). Any
+  builder/store fault drops the line, never the summary (the reporter
+  failure contract). Wired into `send_hourly_summary` **and**
+  `send_daily_close` immediately after `_heartbeat_line` (operational +
+  data-integrity grouped, before the P&L/session blocks — "can you trust
+  the number?" before the numbers). Applies on next paper-trader restart
+  (the documented deploy-stale pattern). **11 new exact-assert tests** in
+  `tests/test_core_reporter.py::TestEquityIntegrityLine` (CORRUPT/SUSPECT
+  verbatim-headline surface, CLEAN/NO_DATA/ERROR/None suppression,
+  builder-raises→`""`, **real-builder no-drift** on a temp Store for
+  both a negative-cash CORRUPT and a no-trade-+20% SUSPECT, hourly+daily
+  wiring, summary-still-sends-when-builder-faults). 93
+  `test_core_reporter` green, 380 focused-core+`equity_integrity` green.
+  ```bash
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest \
+    tests/test_core_reporter.py -q   # 93 green (11 new)
+  ```
+
+- **Phase 3 — live findings (running `:8090`, runner pid 1921870 holds
+  the singleton lock, 2026-05-18 ~13:5x UTC; host under the review-swarm
+  load this pass's own siblings contribute to — load avg ~23, 9
+  concurrent Opus, 210 MB free). 6 distinct, none a new quick code fix.**
+  1. **Live trader frozen — IDLE_STORM (HIGH, host-saturation, NOT a
+     code/prompt bug — continuity + recalled
+     `pt-no-decision-host-saturation`).** 20/20 recent `decisions`
+     `NO_DECISION`, `/api/runner-heartbeat`
+     `decision_efficacy=IDLE_STORM`, `restart_recommended=true`. Of the
+     last 22: 4 are the honest `skipped claude call — host saturated`
+     (host-guard `9c14c96` deployed & correct), 18 are
+     `claude returned no response (timeout/empty)` — the storm hits
+     *during* the 180s call after pre-flight passed and the mid-call
+     re-probe (`strategy.py:1494`) misses the window. Architectural
+     reality of this box, self-clears when the review swarm ends.
+  2. **Stale `equity_curve` poisons benchmark/alpha during the storm
+     (MEDIUM, no integrity alarm covers it).** `/api/portfolio`
+     **$928.92** but `/api/benchmark` computes off the frozen
+     `equity_curve` (**$972.69**) → headline "lagging by 2.27pp"
+     understates the true ~6.7pp gap (928.92 vs 995.43 buy-and-hold).
+     During saturation yfinance is also starved so LITE/MU stale-mark
+     and a run of equity points freezes at the stale total.
+     `equity_integrity` reads `CLEAN` because the divergence is
+     portfolio-vs-curve (and the recovery delta < the 8 % jump gate),
+     **not within recorded points** — so the new EQUITY INTEGRITY line
+     correctly stays silent here too. A "portfolio vs latest
+     equity-point divergence" builder would close this; out of scope for
+     a lean pass (a deliberate new-builder decision, not a surgical fix).
+  3. **`/api/capital-paralysis` verdict `FREE` is misleading at $18.49
+     (MEDIUM, trader-perspective).** "FREE — $18.49 cash (2.0 %)
+     available; the book can act on a new signal without selling" — but
+     $18.49 cannot fund the cheapest watchlist name (MU $728, NVDA $224,
+     SPY $738); the book is *functionally* paralysed. `_capital_pulse_
+     line` suppresses `FREE`-non-bleeding so the operator gets **no
+     Discord signal** they are stuck. The affordability-aware
+     `buying_power` builder is the right lens but is not the verdict
+     driver. Changing the `FREE` threshold touches a documented builder
+     with its own tests/precedent — a deliberate decision, not a quick
+     fix.
+  4. **`logs/runner.log` is stale/misleading (MEDIUM, operability).**
+     Last `**HOURLY**` body is `2026-05-17 16:54 UTC`; the tail is a
+     loop of `another paper trader is already running … exiting` failed
+     launch attempts — **not** the live runner's (pid 1921870) output
+     (its real stdout is the systemd journal). A trader tailing
+     `runner.log` to answer "is my bot alive?" is badly misled (it looks
+     dead). Recalled `pt-no-decision-host-saturation` ("runner.log often
+     stale"); canonical live surface is `/api/runner-heartbeat`, not the
+     file.
+  5. **A launcher repeatedly attempts duplicate runners (LOW, info).**
+     The single-instance `fcntl.flock` guard (invariant #19) is working
+     **correctly** — it refuses every duplicate — but something (a
+     systemd unit losing the lock race, or a wrapper) keeps trying. Not
+     harmful (fail-closed by design); indicates launcher misconfig worth
+     an operator note.
+  6. **POSITIVE — data + channel trust intact.** `/api/mark-integrity`
+     `CLEAN` ("All 2 marks live"), `/api/equity-integrity` `CLEAN` (797
+     points, cash never negative, 0 suspect jumps),
+     `/api/runner-heartbeat.notify` `HEALTHY` (last Discord send OK,
+     0 failures — openclaw PATH/shebang fix holding; the `node`-not-found
+     lines in `runner.log` are stale 2026-05-17). `continuous.log`
+     healthy (GDELT backoff only, backtest loop progressing). The freeze
+     is isolated to the Opus call, not a blind feed / corrupt book /
+     dark channel.
+
+  1+4+5 are host/ops continuity; 2+3 are real trader-perspective gaps
+  (deliberate-decision, not surgical); 6 is positive confirmation. No
+  Phase-3 fix folded in.
+
+- **Concurrency / staging discipline.** Ran with heavy concurrent
+  siblings on the shared monorepo tree (sibling ML/backtest HYBRID agent
+  active, dirty `../digital-intern/`). Never `git add -A`. Staged exactly
+  the two path-scoped files changed (`paper_trader/reporter.py`,
+  `tests/test_core_reporter.py`); `git diff --staged` verified zero
+  sibling tokens before commit. AGENTS.md committed separately alongside
+  (not counted as the feature).
+
+*Review pass #24 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
