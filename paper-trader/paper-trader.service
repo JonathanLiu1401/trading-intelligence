@@ -7,7 +7,16 @@ Wants=network-online.target
 User=zeph
 WorkingDirectory=/home/zeph/trading-intelligence/paper-trader
 ExecStart=/usr/bin/python3 /home/zeph/trading-intelligence/paper-trader/runner.py
-Restart=on-failure
+# MUST be `always`, not `on-failure`. runner.py's self-restart contract
+# (git-watcher deferred restart, the deadman safety-net, the deliberate
+# duplicate-instance exit) all use os._exit(0) — a CLEAN exit. Under
+# `on-failure` systemd treats exit 0 as success and does NOT restart, so a
+# committed fix never deploys and the trader stays down (observed live:
+# /api/build-info behind:1 / stale for days). runner.py and CLAUDE.md both
+# explicitly assert "systemd Restart=always brings us back on the new code";
+# this makes that true. Exit 1 (singleton-lock busy) is still restarted, but
+# that path is correct and self-heals to a single trader.
+Restart=always
 RestartSec=10
 EnvironmentFile=-/home/zeph/trading-intelligence/digital-intern/.env
 
