@@ -185,6 +185,70 @@ def _tail_risk_chat_lines(an: dict) -> list[str]:
     ]
 
 
+def _behavioural_chat_lines(scorecard, paralysis, churn) -> list[str]:
+    """Render the paper-trader's own self-review verdicts
+    (``/api/scorecard``, ``/api/capital-paralysis``, ``/api/churn``) as
+    compact chat-context lines.
+
+    Composes builder verdicts **verbatim** (paper-trader invariant #10 —
+    single source of truth: no re-derived metrics; each builder's own
+    ``headline`` / ``focus`` / ``flags`` / ``recommended_unlock.reason``
+    string passes through unchanged). One derived ``▶ PRIORITY`` line by
+    precedence: a paralysis unlock beats a scorecard focus beats a
+    CHURNING state; none-applicable → no priority line.
+
+    Pure / total — exactly the ``_tail_risk_chat_lines`` contract: an
+    input that is not a dict, carries an ``error`` key, lacks a ``state``,
+    or is gated ``NO_DATA`` contributes nothing; all three contributing
+    nothing → ``[]`` (the block is simply omitted, never an exception
+    into the chat handler).
+    """
+    def _ok(d) -> bool:
+        return (
+            isinstance(d, dict)
+            and "error" not in d
+            and "state" in d
+            and d.get("state") != "NO_DATA"
+        )
+
+    sc_ok, cp_ok, ch_ok = _ok(scorecard), _ok(paralysis), _ok(churn)
+    lines: list[str] = []
+
+    if sc_ok:
+        hl = scorecard.get("headline")
+        if hl:
+            lines.append(f"Scorecard: {hl}")
+        focus = scorecard.get("focus")
+        if isinstance(focus, dict) and focus.get("headline"):
+            lines.append(f"  focus: {focus['headline']}")
+
+    if cp_ok:
+        hl = paralysis.get("headline")
+        if hl:
+            lines.append(f"Capital: {hl}")
+        flags = paralysis.get("flags")
+        if isinstance(flags, list):
+            for fl in flags[:3]:
+                lines.append(f"  • {fl}")
+
+    if ch_ok:
+        hl = churn.get("headline")
+        if hl:
+            lines.append(f"Churn: {hl}")
+
+    # One derived priority line, by precedence (verbatim reason/headline).
+    unlock = paralysis.get("recommended_unlock") if cp_ok else None
+    focus = scorecard.get("focus") if sc_ok else None
+    if isinstance(unlock, dict) and unlock.get("ticker") and unlock.get("reason"):
+        lines.append(f"▶ PRIORITY: sell {unlock['ticker']} — {unlock['reason']}")
+    elif isinstance(focus, dict) and focus.get("theme") and focus.get("headline"):
+        lines.append(f"▶ PRIORITY: {focus['theme']} — {focus['headline']}")
+    elif ch_ok and churn.get("state") == "CHURNING" and churn.get("headline"):
+        lines.append(f"▶ PRIORITY: overtrading — {churn['headline']}")
+
+    return lines
+
+
 def _norm_title(t: Any) -> str:
     return str(t or "").strip().casefold()
 
@@ -974,6 +1038,38 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: analytics fetch failed: %s", e)
 
+        # Behavioural diagnosis — the paper trader's OWN self-review
+        # verdicts (scorecard / capital-paralysis / churn), not just the
+        # raw stats /api/analytics already gave us. Lets the chat answer
+        # "why is my bot losing money / what should it do?" with the
+        # diagnosis the bot itself produced. Each is its own guarded
+        # 3s-timeout read (one upstream fault degrades that input to
+        # None, never sinks the block or the chat). Composed verbatim by
+        # the pure _behavioural_chat_lines helper (unit-tested). Only
+        # appears once :8090 is restarted onto these endpoints — a
+        # stale/absent trader silently omits the block (sibling contract).
+        behavioural_block = ""
+        try:
+            import urllib.request as _urllib
+
+            def _bfetch(path: str):
+                try:
+                    with _urllib.urlopen(
+                            f"http://127.0.0.1:8090{path}", timeout=3) as resp:
+                        return json.loads(resp.read().decode("utf-8"))
+                except Exception as e:
+                    _logger().warning("chat: %s fetch failed: %s", path, e)
+                    return None
+
+            _sc = _bfetch("/api/scorecard")
+            _cp = _bfetch("/api/capital-paralysis")
+            _ch = _bfetch("/api/churn")
+            behavioural_block = "\n".join(
+                _behavioural_chat_lines(_sc, _cp, _ch)
+            )
+        except Exception as e:
+            _logger().warning("chat: behavioural fetch failed: %s", e)
+
         # Earnings radar — scheduled gap risk on the paper trader's holdings.
         # Lets the chat warn "you hold NVDA and it prints in 4 days".
         earnings_block = ""
@@ -1042,6 +1138,7 @@ def create_app(store=None) -> Flask:
             f"{paper_trader_block}\n\n"
             + (f"PAPER TRADER — WHAT MATERIALLY CHANGED SINCE YOU LAST LOOKED (ranked, last 6h):\n{session_delta_block}\n\n" if session_delta_block else "")
             + (f"PAPER TRADER ANALYTICS:\n{analytics_block}\n\n" if analytics_block else "")
+            + (f"PAPER TRADER — BEHAVIOURAL DIAGNOSIS (the bot's own self-review verdicts):\n{behavioural_block}\n\n" if behavioural_block else "")
             + (f"PAPER TRADER OPTIONS GREEKS (Black-Scholes, live IV):\n{greeks_block}\n\n" if greeks_block else "")
             + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP:\n{heatmap_block}\n\n" if heatmap_block else "")
             + (f"EARNINGS RADAR (scheduled gap risk):\n{earnings_block}\n\n" if earnings_block else "")
