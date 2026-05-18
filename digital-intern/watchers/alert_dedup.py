@@ -99,7 +99,23 @@ def dedupe_urgent(articles: list[dict]) -> list[dict]:
         if new_score > cur_score:
             winner = dict(art)
             winner["dup_count"] = cur["dup_count"] + 1
-            winner["_dup_ids"] = cur["_dup_ids"] + [cur["_id"]]
+            # The displaced representative's id must be carried forward so it
+            # is still marked alerted — but only when it actually has one.
+            # ``cur["_id"]`` (a hard subscript) raised KeyError, and a present
+            # ``_id=None`` injected a None into _dup_ids → alerted_ids →
+            # mark_alerted_batch's ``WHERE id=?``. The loser branch below and
+            # alerted_ids() both already guard with .get(); this branch did
+            # not. A single non-canonical row (manual replay / a dict carrying
+            # `url` not `link` — the exact alias _fmt/_is_synthetic tolerate)
+            # would raise here, send_urgent_alert's broad except would swallow
+            # it, the WHOLE batch was dropped and nothing marked alerted →
+            # urgent alerts silently fail that cycle. Same failure class the
+            # _fmt defensive-access comment documents.
+            displaced = cur.get("_id")
+            winner["_dup_ids"] = (
+                cur["_dup_ids"] + [displaced]
+                if displaced is not None else list(cur["_dup_ids"])
+            )
             keep[sig] = winner
         else:
             cur["dup_count"] += 1
