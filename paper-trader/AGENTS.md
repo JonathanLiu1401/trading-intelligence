@@ -1108,6 +1108,16 @@ cd /home/zeph/paper-trader && python3 -m pytest tests/test_corpus_audit.py -v
 # exits 2 on OOS_NOT_HELD_OUT — the corpus is one cycle's single window):
 cd /home/zeph/paper-trader && python3 -m paper_trader.ml.corpus_audit
 
+# Scorer response-shape / monotonicity audit (exact-value verdict locks;
+# test_response_audit.py has none of "ml"/"backtest"/"scorer" in its node
+# ids — add it explicitly like test_calibration.py / test_gate_pnl.py)
+cd /home/zeph/paper-trader && python3 -m pytest tests/test_response_audit.py -v
+# ICE-then-average: which way (and how hard) does the model bend each
+# feature? Complements feature_importance (importance vs response-shape).
+# exits 2 on FLAT_NO_RESPONSE / RESPONSIVE_JAGGED (read-only):
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.response_audit          # OOS slice
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.response_audit --all    # full in-sample
+
 # A single class
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_decision_scorer.py::TestTrainScorer -v
 
@@ -3510,3 +3520,139 @@ two-entries-per-number convention, e.g. the dual #11/#14 passes.)*
   in `docs/feature-dev-sector-exposure-2026-05-18.md`.
 
 *Feature-dev pass appended 2026-05-18 (Agent 4). Prior content above is unmodified.*
+
+---
+
+### 2026-05-18 review pass #16 (ML+backtest hybrid · scorer response-shape audit · decisive rsi-inversion finding)
+
+- **Phase 1 — no new production bug (bugs_fixed = 0).** Full re-trace of
+  `decision_scorer.py`, `backtest.py`, `run_continuous_backtests.py` plus
+  coupled `validation.py` / `calibration.py`: the `predict_with_meta`
+  off-distribution abstention, the universal SELL `-forward_return_5d`
+  flip (train↔inference↔calibration↔gate↔`_oos_rank_metrics`↔
+  `evaluate_scorer_oos`), the `(ticker,sim_date,action)` dedup key, the
+  5-trading-day forward-window guard, the `score=`/`scorer=` first-match
+  disambiguation, the numpy-lstsq weighted-LS fallback, the atomic
+  tmp+`.replace` JSONL/pickle trims, the `_inject_and_train` 11-col
+  INSERT tuple, every module-global lock — all re-verified correct and
+  exact-value test-locked. Consistent with the documented 14+ prior
+  no-new-bug ML/backtest passes. **Phase 1 deliverable (commit
+  `b82f09e`, `test:`):** the existing `TestRiskExits` cases only asserted
+  *an exit happened* (`n_exits==1`, `triggered_price >= 120.0`) — they did
+  not pin the price/day the SL/TP daily scan fires at, so an off-by-one in
+  the scan boundary (`cur = from_day + timedelta(days=1)`, `px <= sl` vs
+  `px < sl`, partial- vs whole-position sell) slipped through. Added two
+  exact-value regression locks against the deterministic synthetic series
+  (`SPY[days[i]] == 100.0 + i`): TP fires at `days[20]`/**120.0** with cash
+  exactly **600.0**; SL fires at `days[1]`/**101.0** (NOT `days[0]`/100.0 —
+  locking the deliberate one-day scan offset) with cash exactly **901.0**.
+  Additive; existing tests untouched. ML/backtest regression 280→321 green.
+
+- **Feature shipped (`paper_trader/ml/response_audit.py`; landed in commit
+  `b471188` via the shared-index race — see concurrency note).** Every
+  documented inertness verdict (`skill_trend` ≈0 OOS, `gate_audit`
+  GATE_INEFFECTIVE, `gate_pnl` ≈+0.1pp, `calibration --oos`
+  MISCALIBRATED) is a **statistical summary**. `feature_importance`
+  reports *how much* skill scrambling a feature costs but is **sign-blind**
+  — it cannot say a feature the model relies on is bent the economically
+  *backwards* way. `response_audit` is the missing **geometric**
+  complement: **ICE-then-average** (per-record curves over the OOS slice's
+  empirical p5..p95, all other features kept REAL then averaged — NOT
+  PDP-at-median, which would fabricate off-distribution combos and measure
+  the clamped-±50 head instead of learned structure). Primary verdict is
+  **sign-agnostic** (`FLAT_NO_RESPONSE` / `RESPONSIVE_MONOTONE` /
+  `RESPONSIVE_JAGGED` / `INSUFFICIENT_DATA`); the economic-sign tally is
+  **informational only, never in the verdict** (the SELL flip makes the
+  target a BUY/SELL blend, so a "wrong" sign is not provably a defect —
+  the `gate_audit` arm-monotone honesty pattern). Reuses
+  `calibration._spearman` (tie-aware — load-bearing at the ±`PRED_CLAMP_PCT`
+  clamp) and `validation.split_outcomes_temporal` (SSOT — same OOS slice as
+  every sibling tool). Read-only: no train/pickle/`build_features`/
+  `N_FEATURES`/trade touch, never raises, CLI exit 2 on FLAT/JAGGED.
+  **NOT wired into `main()` — zero deploy-stale impact, no loop restart
+  needed.** 26 exact-value locks in `tests/test_response_audit.py`
+  (ICE-vs-PDP mean≠median lock, monotone-but-wrong-sign still
+  RESPONSIVE_MONOTONE, constant→FLAT, symmetric-U→JAGGED, FLAT_TOL
+  boundary, degenerate-feature handling, SSOT identity, never-raises on
+  raising/NaN/untrained/garbage, full CLI exit-code matrix).
+  ```bash
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.response_audit
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.response_audit --all
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/test_response_audit.py -v
+  ```
+
+- **Quant finding (NEW, decisive — the geometric mechanism for the
+  documented near-zero OOS skill).** Live pickle `n_train=3894`, gate
+  active. The scorer is **NOT flat-noise** — it moves materially (max
+  response ~6.9pp) — but its single **largest** learned lever is
+  **economically inverted**: `rsi` has the biggest response range of any
+  feature (~6.9pp OOS / ~6.8pp in-sample) and the model bends it
+  **spearman +0.82 OOS / +0.95 in-sample** — *higher* predicted 5d return
+  for *higher/overbought* RSI (momentum-on-RSI, the **opposite** of the
+  mean-reversion prior). Only `bb_position` is consistently coherent
+  (spearman −1.0 OOS / −0.82 in-sample, sign ✓ both slices). Verdict
+  degrades **RESPONSIVE_MONOTONE in-sample (4/7 sign-consistent) →
+  RESPONSIVE_JAGGED OOS (3/7 monotone, 2/6 sign-consistent)**: `mom5`/
+  `mom20` flip slope sign across the temporal split — the textbook overfit
+  signature, now shown geometrically rather than as another scalar IC.
+  No prior tool localized *which* learned relationship drives the ~0 OOS
+  skill; this does: the model's dominant signal is backwards and its
+  momentum response is sign-unstable. **Reported, not actioned** —
+  retraining/feature surgery is training-dynamics, out of surgical scope
+  (CLAUDE.md §6).
+
+- **Quant findings (corroborating, fresh live numbers).**
+  `decision_outcomes.jsonl` now **7858 rows** (BUY 5978 / SELL 1880),
+  `forward_return_5d` mean +1.35 std 7.47 p1 −18.0 p99 +23.9, only
+  **0.10% exceed |50%|** — re-confirms `PRED_CLAMP_PCT=50` is amply
+  load-bearing-safe. **98.3% have `news_article_count = NULL`** →
+  `response_audit` independently flags BOTH news features `degenerate` on
+  every slice **and additionally `regime_mult` degenerate on the deep-
+  history OOS slice** (the 1996–2018 corpus is uniformly "unknown→1.0"
+  regime) — 2–3 of 17 inputs carry no training variance, sharpening pass
+  #15's "2 dead features". `calibration --oos` MISCALIBRATED (spearman
+  0.088, decile err 5.4pp) vs in-sample DIRECTIONAL_BUT_BIASED (spearman
+  0.289) — the textbook in-sample→OOS collapse. `gate_pnl` OOS
+  GATE_RETURN_NEUTRAL, equal-weight contribution **+0.11pp** (gate-on
+  +0.38% vs gate-off +0.26%) — the gate underwrites pure sizing variance.
+  `scorer_skill_log` last 6 cycles oos_ic ∈ {0.07,0.01,0.19,0.02,0.02,
+  −0.01}, oos_dir_acc ≈ 0.50. Backtest dispersion stays leverage-driven
+  (run 6230 +484.75%/vs_spy +396.7% beside run 6231 −49.44%).
+
+- **Operational (reconfirmed, out of scope).** Continuous loop healthy:
+  476 complete / 20 failed / 4 running, cycles 13–27 min, `scorer ok`
+  every cycle (train_n 3234→3894). Winner→ArticleNet feedback loop still
+  **dead both ways**: `continuous.log` shows `inject err: database locked
+  after 4 attempts` and `trainer timeout (injected 2994)` — matches
+  passes #6–#15 (digital-intern GPU + `articles.db` write contention on
+  the symlinked volume). The scorer itself retrains cleanly; the loop is
+  **not** training ArticleNet on its winners.
+
+- **Concurrency note for the next agent.** This pass ran with ≥3 sibling
+  agents committing in parallel. Observed concretely: a sibling's
+  whole-index commit (`b471188 feat(strategy): … sector-exposure`) swept
+  this pass's *already-staged* `response_audit.py` + `test_response_audit.py`
+  into THAT commit before this agent's path-scoped `git commit -- <paths>`
+  ran (which then found "no changes"). **The code/tests are durably on
+  `origin/master` and 26/26 green** — only the commit-message attribution
+  is the sibling's, not this agent's. Rewriting shared history with live
+  concurrent agents is more dangerous than the misattribution, so it was
+  left as-is. Lesson: in this monorepo a brand-new file is NOT safe from
+  the shared index either — a sibling's `git add -A`/whole-tree commit
+  captures anything staged. There is no fully race-free path short of a
+  per-agent worktree; verify your deliverable is on `origin` by content
+  (`git cat-file -e origin/master:<path>` + line-count), not by assuming
+  it sits in your own commit.
+
+- **Run the ML/backtest suite (now 321 in the listed subset):** `cd
+  /home/zeph/trading-intelligence/paper-trader && python3 -m pytest
+  tests/test_decision_scorer.py tests/test_backtest.py
+  tests/test_calibration.py tests/test_validation.py tests/test_continuous.py
+  tests/test_gate_audit.py tests/test_gate_pnl.py tests/test_skill_trend.py
+  tests/test_baseline_compare.py tests/test_ml_backtest_review.py
+  tests/test_feature_importance.py tests/test_response_audit.py -q`.
+  `test_response_audit.py` has none of "ml"/"backtest"/"scorer" in its
+  node ids — add it explicitly like `test_calibration.py` /
+  `test_gate_pnl.py`.
+
+*Review pass #16 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
