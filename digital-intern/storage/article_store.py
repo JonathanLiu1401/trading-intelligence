@@ -949,8 +949,76 @@ class ArticleStore:
         return out
 
     @_retry_on_lock
+    def reap_stale_urgent(self, max_age_hours: int = 24) -> int:
+        """Demote ``urgency=1`` rows that aged out of the alert-fetch window
+        back to ``urgency=0``. Returns the number of rows demoted.
+
+        ``get_unalerted_urgent`` only ever returns rows with
+        ``first_seen >= now - 24h``. So the instant a still-pending
+        ``urgency=1`` row's ``first_seen`` crosses that boundary it becomes
+        permanently invisible to the alert worker: it can never be alerted and
+        — because it is still ``urgency=1``, not ``2`` — nothing ever clears
+        it. It then lingers until the 90-day purge, the whole time inflating
+        ``stats()``'s ``urgent`` tile (which counts ``urgency>=1`` with no time
+        filter), so the dashboard shows phantom "urgent" items the analyst will
+        never actually be pushed. Live evidence (2026-05-18): 26 rows stuck at
+        ``urgency=1`` since 2026-05-13 — 5 days, never alerted.
+
+        This is the structural counterpart to the ``alert_agent`` pass-18
+        stale-drop fix (``d5918e3``), NOT a duplicate of it:
+
+          - That fix marks *in-window* rows ``urgency=2`` (mark_alerted) — for
+            a row the formatter actively *decided* not to deliver, "alerted"
+            is both truthful and blocks re-fetch.
+          - These rows are *aged-out* — the alert worker NEVER saw them, so
+            ``urgency=2`` would be a lie (no analyst was ever pushed) AND
+            would keep inflating the ``urgency>=1`` tile this method exists to
+            fix. ``urgency=0`` is the only state that is both honest and
+            corrective. The two fixes must NOT be "harmonized".
+
+        Demotion loses zero delivery: a row older than the 24h window is
+        provably never returned by ``get_unalerted_urgent`` again, so it could
+        never have fired regardless (identical reasoning to pass-18's "a stale
+        row only ages further — it can never become a valid fresh alert").
+
+        Invariants: only ``urgency`` is written — ``ai_score`` / ``ml_score``
+        / ``score_source`` are untouched (label/score-source separation
+        intact). ``_LIVE_ONLY_CLAUSE`` is applied as defense-in-depth (same
+        discipline as ``update_scores_from_labels``): synthetic rows are
+        inserted ``urgency=0`` by construction so the clause is a no-op here,
+        but it guarantees a future invariant violation elsewhere can't make
+        this path mutate a training row.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        ).isoformat()
+        with self._write_lock:
+            cur = self.conn.execute(
+                "UPDATE articles SET urgency=0 "
+                f"WHERE urgency=1 AND first_seen < ? AND {_LIVE_ONLY_CLAUSE}",
+                (cutoff,),
+            )
+            n = cur.rowcount
+            self.conn.commit()
+        if n > 0:
+            _log.info(
+                f"[article_store] reaped {n} stale urgency=1 row(s) "
+                f"(first_seen older than {max_age_hours}h, never alerted — "
+                f"unreachable by the alert worker, demoted to urgency=0)"
+            )
+        return n
+
+    @_retry_on_lock
     def purge_old(self):
-        """Delete articles older than RETENTION_DAYS and vacuum."""
+        """Delete articles older than RETENTION_DAYS and vacuum.
+
+        Also reaps stale ``urgency=1`` residue first (see
+        ``reap_stale_urgent``) — ``purge_worker`` is the periodic maintenance
+        sweep, so this is its natural home. Called before acquiring
+        ``_write_lock`` because ``reap_stale_urgent`` takes that same
+        non-reentrant lock itself; nesting it inside the block below would
+        deadlock."""
+        self.reap_stale_urgent()
         cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat()
         with self._write_lock:
             cur = self.conn.execute("DELETE FROM articles WHERE first_seen < ?", (cutoff,))
