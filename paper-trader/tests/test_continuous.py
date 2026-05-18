@@ -631,6 +631,157 @@ class TestDeployedScorerNTrain:
         assert rcb._deployed_scorer_n_train() == res["n"]
 
 
+def _synthetic_outcome_records(n: int = 200, seed: int = 11) -> list[dict]:
+    """A deterministic outcome corpus with STRICTLY INCREASING sim_date (so
+    `split_outcomes_temporal`'s late-fraction holdout is clean) and varied
+    features (so the trivial baselines are non-degenerate and the scorer
+    trains). Shared by the baseline-ledger SSOT + verdict tests."""
+    import random as _rnd
+    rng = _rnd.Random(seed)
+    base = date(2023, 1, 1)
+    recs = []
+    for i in range(n):
+        recs.append({
+            "ticker": "NVDA" if i % 2 else "AMD",
+            "sim_date": (base + timedelta(days=i)).isoformat(),
+            "action": "BUY" if i % 3 else "SELL",
+            "ml_score": rng.uniform(-5, 5),
+            "rsi": rng.uniform(20, 80),
+            "macd": rng.uniform(-1, 1),
+            "mom5": rng.uniform(-3, 3),
+            "mom20": rng.uniform(-5, 5),
+            "regime_mult": 1.0,
+            "vol_ratio": rng.uniform(0.5, 2.0),
+            "bb_position": rng.uniform(-2, 2),
+            "forward_return_5d": rng.uniform(-8, 8),
+            "return_pct": 10.0,
+        })
+    return recs
+
+
+class TestAppendBaselineSkillLog:
+    """The per-cycle trivial-baseline ledger — the decisive
+    MLP_WORSE_THAN_TRIVIAL signal, made durable & trendable. Mirrors the
+    `_append_scorer_skill_log` discipline (best-effort, honest gap rows,
+    atomic bounded trim, never breaks the loop)."""
+
+    def test_row_schema_and_ssot_cross_check(self, tmp_path, monkeypatch):
+        # A real trained pickle (conftest redirects SCORER_PATH to tmp) +
+        # a real outcomes file routed through the SAME `baseline_compare`
+        # path the CLI / `calibration --oos` use.
+        from paper_trader.ml.decision_scorer import train_scorer, DecisionScorer
+        from paper_trader.ml import baseline_compare as bc
+
+        records = _synthetic_outcome_records(200)
+        assert train_scorer(records)["status"] == "ok"
+
+        outcomes = tmp_path / "decision_outcomes.jsonl"
+        outcomes.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+        log = tmp_path / "baseline_skill_log.jsonl"
+        monkeypatch.setattr(rcb, "BASELINE_SKILL_LOG", log)
+
+        ok = rcb._append_baseline_skill_log(
+            cycle=7, win_start=date(2015, 1, 2), win_end=date(2016, 1, 2),
+            outcomes_path=outcomes)
+        assert ok is True
+
+        rows = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["cycle"] == 7
+        assert row["window_start"] == "2015-01-02"
+        assert row["window_end"] == "2016-01-02"
+        assert row["status"] == "ok"
+        assert row["slice"] == "oos"
+        assert row["verdict"] in {
+            "MLP_WORSE_THAN_TRIVIAL", "MLP_NO_BETTER_THAN_TRIVIAL",
+            "MLP_ADDS_SKILL", "INSUFFICIENT_DATA",
+        }
+        # gate_active ⇔ deployed n_train >= 500 (invariant #5). This synthetic
+        # corpus dedups to < 500 distinct → the gate is NOT live; the flag
+        # must say so honestly.
+        assert row["n_train"] is not None and row["n_train"] < 500
+        assert row["gate_active"] is False
+
+        # SSOT no-drift: the persisted mlp_rank_ic / ic_gap MUST equal the
+        # value the canonical `scorer_baseline_compare` returns on the exact
+        # same scorer + records (the documented built-in cross-check — the
+        # ledger is a recorder, never a re-derivation).
+        rep = bc.scorer_baseline_compare(DecisionScorer(), records,
+                                         oos_only=True)
+        assert row["mlp_rank_ic"] == rep["mlp"]["rank_ic"]
+        assert row["best_baseline"] == rep["best_baseline"]
+        assert row["best_baseline_ic"] == rep["best_baseline_ic"]
+        assert row["ic_gap"] == rep["ic_gap"]
+        assert row["verdict"] == rep["verdict"]
+
+    def test_untrained_scorer_persists_honest_insufficient_row(
+            self, tmp_path, monkeypatch):
+        # conftest gives an empty SCORER_PATH (no pickle). A gap in the trend
+        # must be a visible honest row, not a silently-skipped cycle.
+        outcomes = tmp_path / "decision_outcomes.jsonl"
+        outcomes.write_text("\n".join(
+            json.dumps(r) for r in _synthetic_outcome_records(8)) + "\n")
+        log = tmp_path / "baseline_skill_log.jsonl"
+        monkeypatch.setattr(rcb, "BASELINE_SKILL_LOG", log)
+
+        assert rcb._append_baseline_skill_log(
+            cycle=3, win_start=date(2009, 1, 2), win_end=date(2010, 1, 2),
+            outcomes_path=outcomes) is True
+        row = json.loads(log.read_text().strip())
+        assert row["verdict"] == "INSUFFICIENT_DATA"
+        assert row["cycle"] == 3
+        assert row["gate_active"] is False  # no pickle ⇒ gate not live
+        assert row["mlp_rank_ic"] is None
+
+    def test_analyze_exception_degrades_to_honest_row_not_crash(
+            self, tmp_path, monkeypatch):
+        # If baseline_compare.analyze itself raises, the inner guard must
+        # degrade to an honest INSUFFICIENT_DATA row (the trend stays
+        # continuous) — and STILL return True (handled, persisted).
+        log = tmp_path / "baseline_skill_log.jsonl"
+        monkeypatch.setattr(rcb, "BASELINE_SKILL_LOG", log)
+
+        def _boom(*a, **k):
+            raise RuntimeError("simulated baseline_compare failure")
+
+        import paper_trader.ml.baseline_compare as bc
+        monkeypatch.setattr(bc, "analyze", _boom)
+
+        assert rcb._append_baseline_skill_log(
+            cycle=5, win_start=date(2012, 1, 3), win_end=date(2013, 1, 3),
+            outcomes_path=tmp_path / "missing.jsonl") is True
+        row = json.loads(log.read_text().strip())
+        assert row["status"] == "error"
+        assert row["verdict"] == "INSUFFICIENT_DATA"
+        assert row["cycle"] == 5
+
+    def test_bounded_trim_rewrites_when_past_2x_keep(self, tmp_path,
+                                                     monkeypatch):
+        log = tmp_path / "baseline_skill_log.jsonl"
+        monkeypatch.setattr(rcb, "BASELINE_SKILL_LOG", log)
+        monkeypatch.setattr(rcb, "BASELINE_SKILL_LOG_KEEP", 5)
+        # 11 pre-seeded rows (> 2×5) ⇒ the next append triggers a rewrite.
+        log.write_text("\n".join(json.dumps({"cycle": i}) for i in range(11))
+                       + "\n")
+        # No pickle/outcomes needed — the append still writes a (degraded) row.
+        rcb._append_baseline_skill_log(
+            cycle=99, win_start=date(2012, 1, 3), win_end=date(2013, 1, 3),
+            outcomes_path=tmp_path / "nope.jsonl")
+        lines = [l for l in log.read_text().splitlines() if l.strip()]
+        assert len(lines) == 5  # trimmed to BASELINE_SKILL_LOG_KEEP
+        assert json.loads(lines[-1])["cycle"] == 99  # newest survives
+
+    def test_never_raises_on_unwritable_path(self, tmp_path, monkeypatch):
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x")
+        monkeypatch.setattr(rcb, "BASELINE_SKILL_LOG",
+                            blocker / "sub" / "baseline.jsonl")
+        assert rcb._append_baseline_skill_log(
+            1, date(2000, 1, 3), date(2001, 1, 3),
+            outcomes_path=tmp_path / "nope.jsonl") is False
+
+
 # ──────────────── winner_training.jsonl bounded trim ────────────
 
 class TestTrimWinnerJsonl:
@@ -694,6 +845,15 @@ class TestCycleWiringRegression:
         import inspect
         src = inspect.getsource(rcb.main)
         assert "_trim_winner_jsonl(" in src
+
+    def test_main_invokes_baseline_skill_ledger(self):
+        # The trivial-baseline ledger surfaces the decisive
+        # MLP_WORSE_THAN_TRIVIAL finding. It was a CLI-only signal until this
+        # wiring; lock the call so a refactor can't silently re-orphan it
+        # (the exact failure mode the scorer ledger suffered until pass #15).
+        import inspect
+        src = inspect.getsource(rcb.main)
+        assert "_append_baseline_skill_log(" in src
 
     def test_main_reaps_orphans_per_cycle_not_only_at_startup(self):
         # Live finding: 15 rows stuck 'running' for 35h because the reaper
