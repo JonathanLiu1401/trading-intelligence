@@ -169,6 +169,32 @@ class TestDecideSurfacesQuota:
         assert summary["quota_exhausted"] is False
         assert summary["status"] == "HOLD"
 
+    def test_host_saturation_skips_claude_call(self, stub_decide_inputs,
+                                               monkeypatch, reset_quota_flag):
+        """The pre-flight host-saturation guard must SKIP the claude call(s)
+        entirely (no doomed 1.5GB subprocess into the storm) and record a
+        distinct reason — kept separate from the 'claude returned no response'
+        empty/timeout bucket so /api/empty-claude-rate stays accurate."""
+        called = {"n": 0}
+
+        def spy_claude(*a, **k):
+            called["n"] += 1
+            return '{"action":"BUY","ticker":"NVDA","reasoning":"x"}'
+
+        # Override the conftest autouse neutralisation: simulate a saturated box.
+        monkeypatch.setattr(strategy, "host_saturated",
+                            lambda *a, **k: (True, "host saturated: 9 concurrent Opus (>4)"))
+        monkeypatch.setattr(strategy, "_claude_call", spy_claude)
+        summary = strategy.decide()
+
+        assert called["n"] == 0, "claude must NOT be spawned when host saturated"
+        assert summary["status"] == "NO_DECISION"
+        assert summary["host_saturated"] is True
+        assert summary["quota_exhausted"] is False
+        reason = stub_decide_inputs.record_decision.call_args[0][3]
+        assert reason.startswith("skipped claude call —")
+        assert not reason.startswith("claude returned no response")
+
 
 # ───────────────────────── reporter._resolve_openclaw ──────────────────────
 class TestResolveOpenclaw:
