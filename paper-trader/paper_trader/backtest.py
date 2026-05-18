@@ -2009,6 +2009,7 @@ class BacktestRun:
     vs_spy_pct: float = 0.0
     n_trades: int = 0
     n_decisions: int = 0
+    bubble_gate_suppressions: int = 0
     status: str = "pending"
     trades: list[dict] = field(default_factory=list)
     decisions: list[dict] = field(default_factory=list)
@@ -2331,6 +2332,17 @@ class BacktestEngine:
             return "BLOCKED", f"no price for {ticker} on {sim_date}"
 
         if action == "BUY":
+            # Bubble gate: suppress buys when price is more than 2x SMA200.
+            # Skip the gate if fewer than 200 prior closes are available.
+            pairs = _series_up_to(self.prices, ticker, sim_date, max_points=220)
+            if len(pairs) >= 200:
+                last200 = [v for _, v in pairs[-200:]]
+                sma200 = sum(last200) / 200.0
+                if price > 2.0 * sma200:
+                    return (
+                        "BUBBLE_GATE_SUPPRESSED",
+                        f"bubble_gate_suppressed: {ticker} price={price:.2f} > 2.0x sma200={sma200:.2f}",
+                    )
             notional = qty * price
             if portfolio.cash - notional < 0:
                 return "BLOCKED", f"insufficient cash (have ${portfolio.cash:.2f}, need ${notional:.2f})"
@@ -2367,6 +2379,7 @@ class BacktestEngine:
         portfolio = SimPortfolio()
         equity_curve: list[dict] = []
         n_trades = 0
+        n_bubble_suppressed = 0
         n_decisions = 0
         prev_sample = self.prices.trading_days[0] - timedelta(days=1)
 
@@ -2404,6 +2417,8 @@ class BacktestEngine:
 
                 status, detail = self._execute_decision(run_id, sim_date, decision, portfolio)
                 ticker_acted = decision.get("ticker") or ""
+                if status == "BUBBLE_GATE_SUPPRESSED":
+                    n_bubble_suppressed += 1
                 if status == "FILLED":
                     n_trades += 1
                     day_filled += 1
@@ -2494,6 +2509,7 @@ class BacktestEngine:
             spy_return_pct=round(spy_return, 2),
             vs_spy_pct=round(ret_pct - spy_return, 2),
             n_trades=n_trades, n_decisions=n_decisions,
+            bubble_gate_suppressions=n_bubble_suppressed,
             equity_curve=equity_curve, status="complete",
         )
 

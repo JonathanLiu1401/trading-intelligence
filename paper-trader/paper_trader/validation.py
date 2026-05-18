@@ -338,8 +338,13 @@ def run_permutation_test(
     p_value = (k + 1) / (n_succ + 1)
     z_score = float((original_return - mean) / (std + 1e-9))
 
+    note = ""
     if original_return < mean:
-        verdict = "WORSE_THAN_RANDOM"
+        if n_succ < 50:
+            verdict = "INCONCLUSIVE"
+            note = "too few permutations to distinguish from noise"
+        else:
+            verdict = "WORSE_THAN_RANDOM"
     elif p_value < 0.05:
         verdict = "SIGNIFICANT"
     else:
@@ -364,6 +369,7 @@ def run_permutation_test(
         "n_attempted": n_attempted,
         "n_successful": n_succ,
         "verdict": verdict,
+        "note": note,
     }
 
 
