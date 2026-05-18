@@ -45,11 +45,11 @@ from paper_trader.backtest import (
     _market_regime,
 )
 
-RUNS_PER_CYCLE = 5  # reduced from 10 — 5 runs × 3 max-concurrent claude = safe on 14 GB RAM
-TOP_RUNS_TO_TRAIN = 3  # aggregate top-N runs per cycle into training data
+RUNS_PER_CYCLE = 1  # throttled to 1 — load avg 37+, reduce system pressure
+TOP_RUNS_TO_TRAIN = 1  # only keep best single run per cycle when throttled
 KEEP_LAST_RUNS = 500
 MAX_OUTCOMES_FOR_TRAINING = 5000  # cap decision_outcomes.jsonl tail used per retrain
-COOLDOWN_SECONDS = 60
+COOLDOWN_SECONDS = 600  # throttled from 300s — 10 min cooldown to give box breathing room
 DISCORD_CHANNEL = "channel:1496099475838603324"
 WINNER_JSONL = ROOT / "data" / "winner_training.jsonl"
 # winner_training.jsonl is append-only across the whole loop lifetime
@@ -1731,4 +1731,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    try:
+        os.nice(10)
+    except Exception:
+        pass
     main()
