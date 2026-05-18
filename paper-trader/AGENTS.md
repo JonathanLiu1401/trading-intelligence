@@ -11,7 +11,7 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 - `paper_trader/analytics/self_review.py` — canonical behavioural mirror; composes trade_asymmetry + capital_paralysis + open_attribution, fed into the live prompt **and** served at `/api/self-review`
 - `paper_trader/analytics/risk_mirror.py` — third advisory mirror (after self_review + track_record): composes `build_churn` + `build_correlation` **verbatim** (single source of truth #10) into a compact `prompt_block` on the trader's *structural* risk — how concentrated the book is and how much it churns (the 2026-05-17 live pathology: ~$973 / 16.7% win-rate, 60%+ one-sector, 0.52-day median hold). No price history is fetched on the hot decision path (a per-position yfinance call is a live-cycle latency/flake risk); without it `build_correlation` is `INSUFFICIENT` and its headline is the bare "verdict withheld" sentence, so the mirror surfaces the weight-based concentration (`top_weight_pct`/`weight_hhi`/`effective_positions_naive`, computed from `market_value` unconditionally) and only uses the richer ρ headline when a caller supplies `price_history`. Observational only, never gates (invariants #2/#12 — the self_review precedent); `_safe`-wrapped so a builder fault is "no block this cycle", never "no decision". Wired into `decide()` + `_build_payload(... risk_mirror_block=)` (rendered after the track-record section); applies on next paper-trader restart. Locked by `tests/test_risk_mirror.py`
 - `paper_trader/analytics/tail_risk.py` — left-tail / downside-shape diagnostic (the upside-heavy surface had none): historical 95/99% 1-day VaR (nearest-rank), positional expected-shortfall CVaR (float-robust — a value-threshold filter silently drops float-equal `-0.10` ties and halves the tail), population annualised vol & downside deviation, Fisher-Pearson population skew, worst/best day, max consecutive down-day streak, Ulcer index. Daily series resampled **byte-identically** to `dashboard.analytics_api`'s `by_day` loop (single-source-of-truth #10 spirit; vol `/n` matches its Sharpe, downside-dev `/n` matches its Sortino). Honesty-gated `NO_DATA`/`INSUFFICIENT`(<`MIN_RETURNS`=20)/`OK` (the `build_correlation` precedent — live book is 5 days so it correctly reads INSUFFICIENT until history matures). Served at `/api/tail-risk` **and** folded into `/api/analytics` as an additive `tail_risk` key so the digital-intern analyst chat inherits it. Observational only — never gates Opus, never injected into the decision prompt (invariants #2/#12). Locked by `tests/test_tail_risk.py` (hand-pinned discrete metrics + independent-impl cross-check for vol/skew) and `tests/test_core_analytics.py::TestTailRiskIntegration` (endpoint↔builder no-drift, additive-key contract)
-- `paper_trader/analytics/event_calendar.py` — **forward** scheduled-event awareness fed into the live prompt (the mirrors above are all *backward*-looking; this is the one thing a discretionary desk tracks that the engine was fully blind to: upcoming **earnings**). `build_event_calendar(positions, names_in_play, calendar_path=None, now=None, horizon_days=14)` reads digital-intern's `data/earnings_calendar.json` snapshot **directly from disk** — explicitly **not** the `:8080 /api/earnings` endpoint (a network hop on the 60s decision cycle is the documented hang/latency hazard; the `signals.py` filesystem precedent). `_pick_freshest` selects the newest-`as_of` readable candidate across USB/repo/legacy paths (the `signals._db_path` freshness discipline, invariant #15). `days_away` is **recomputed** from `earnings_date` vs `now` (a stale snapshot still yields accurate timing — the digital-intern `api_earnings` rule mirrored verbatim, single source of truth #10), past events (`< -0.5d`) dropped, and each is tiered against the held book exactly as `/api/earnings-risk`: `HELD_IMMINENT` (held & ≤3d), `HELD_SOON` (held & within horizon), `WATCH` (in-play, not held; dropped beyond `horizon_days` as prompt noise — a *held* name's print is never hidden regardless of distance). Observational only, never gates (invariants #2/#12 — the self_review/risk_mirror precedent); `_safe`-style end-to-end so a missing/stale/corrupt/unparseable snapshot degrades to one honest line, **never** an exception that sinks a trading cycle. Served at `/api/event-calendar` (prompt↔endpoint parity — the existing network-sourced `/api/earnings-risk` left untouched, a different concern). Wired into `decide()` + `_build_payload(... event_calendar_block=)` (rendered after `risk_mirror`, before `WATCHLIST PRICES`); applies on next paper-trader restart. Locked by `tests/test_event_calendar.py`
+- `paper_trader/analytics/event_calendar.py` — **forward** scheduled-event awareness fed into the live prompt (the mirrors above are all *backward*-looking; this is the one thing a discretionary desk tracks that the engine was fully blind to: upcoming **earnings**). `build_event_calendar(positions, names_in_play, calendar_path=None, now=None, horizon_days=14)` reads digital-intern's `data/earnings_calendar.json` snapshot **directly from disk** — explicitly **not** the `:8080 /api/earnings` endpoint (a network hop on the 60s decision cycle is the documented hang/latency hazard; the `signals.py` filesystem precedent). `_pick_freshest` selects the newest-`as_of` readable candidate across USB/repo/legacy paths (the `signals._db_path` freshness discipline, invariant #15). `days_away` is **recomputed** from `earnings_date` vs `now` (a stale snapshot still yields accurate timing — the digital-intern `api_earnings` rule mirrored verbatim, single source of truth #10), past events (`< -0.5d`) dropped, and each is tiered against the held book exactly as `/api/earnings-risk`: `HELD_IMMINENT` (held & ≤3d), `HELD_SOON` (held & within horizon), `WATCH` (in-play, not held; dropped beyond `horizon_days` as prompt noise — a *held* name's print is never hidden regardless of distance). Observational only, never gates (invariants #2/#12 — the self_review/risk_mirror precedent); `_safe`-style end-to-end so a missing/stale/corrupt/unparseable snapshot degrades to one honest line, **never** an exception that sinks a trading cycle. Served at `/api/event-calendar` (prompt↔endpoint parity — the existing network-sourced `/api/earnings-risk` left untouched, a different concern). Wired into `decide()` + `_build_payload(... event_calendar_block=)` (rendered after `risk_mirror`, before `WATCHLIST PRICES`); applies on next paper-trader restart. **Load-bearing scope:** `decide()` passes held ∪ the **full WATCHLIST** — deliberately **not** the lean `_names_in_play` set the quant / track-record blocks trim to. Those blocks are large per-ticker so they bound prompt length; an earnings event within the 14d horizon is rare (≈0–3 across all 50 names) so there is no bloat to bound, and `WATCHLIST[:5]` excludes most names (e.g. NVDA) — narrowing to `_names_in_play` would silently re-create the exact blind spot this closes (Opus buying a watchlist name the day before its print) **and** break the `/api/event-calendar` parity claim. Do not "consistency-fix" it to `_names_in_play`. Locked by `tests/test_event_calendar.py`
 - `paper_trader/signals.py` — live news signal queries against digital-intern's articles.db
 - `paper_trader/market.py` — yfinance wrapper + NYSE session calendar
 - `paper_trader/store.py` — SQLite store (portfolio, trades, positions, decisions, equity_curve)
@@ -1918,3 +1918,92 @@ breaking change: delete `data/ml/decision_scorer.pkl` and let the next
 continuous cycle retrain from `data/decision_outcomes.jsonl`. The pickle
 auto-recreates atomically (`.pkl.tmp` → `replace`) so a fresh-start
 deletion is safe even if a backtest thread is mid-read.
+
+### 2026-05-18 review pass #9 (paper-trader core hybrid · /api/drawdown invariant-#12 + drawdown CLI · live findings)
+
+- **Phase 1 — 2 bugs fixed (commit `d5d00fe`).**
+  1. **`drawdown_api()` did not thread `INITIAL_CASH`.** It called
+     `compute_drawdown(eq, positions)` with no `starting_equity`, silently
+     relying on the builder's hardcoded `1000.0` default — the exact
+     invariant-#12 violation `benchmark_api`/`analytics_api`/
+     `reporter._INITIAL_EQUITY` are explicitly written to avoid (the
+     `analytics_api` "a literal here silently desyncs Calmar if
+     INITIAL_CASH" comment). On a fresh/empty equity curve `/api/drawdown`
+     reported peak/trough/current at a literal 1000 and always echoed a
+     wrong `starting_equity` if `INITIAL_CASH` ever moved. Fixed:
+     `compute_drawdown(eq, positions, starting_equity=INITIAL_CASH)`.
+  2. **`compute_drawdown` empty-curve fallback omitted `starting_equity`
+     + `trough_pct`** that the populated branch returns — an inconsistent
+     response shape that hands the dashboard card / decision-context fold
+     `undefined` on a day-one book. Surfaced *by writing the real-logic
+     test*, not by inspection. Both keys added for shape parity.
+  - New `tests/test_drawdown.py` (`drawdown.py` previously had **no**
+    test file): hand-computed peak/trough/recovery math,
+    trough-resets-on-new-peak, at-high-water 1bp boundary, contributor
+    sort + zero-cost-basis guard, history tail-pin, and the endpoint
+    regression lock (FAILS against pre-fix code). 12 tests; 327-test core
+    suite green.
+
+- **Phase 2 — feature shipped (commit `dd9af44`): `python -m
+  paper_trader.analytics.drawdown [--json]`.** Drawdown — depth, time
+  underwater, what's dragging, how much clawed back — is a top-of-mind
+  live-trader risk question with no terminal access, while every peer risk
+  module (`benchmark`, `desk_pulse`, `model_reliability`,
+  `decision_context`, `signals --check-freshness`) ships a CLI for exactly
+  the case that is **live right now**: `/api/build-info` `stale:true
+  behind:11`, so `/api/drawdown` serves *pre-fix* code until a runner
+  restart. Thin read-only `__main__` (the `benchmark.py` precedent
+  verbatim — `?mode=ro`, `INITIAL_CASH` threaded so the CLI honours
+  invariant #12 too, `--json` | one-screen human digest with badge +
+  peak/trough/recovery + top draggers). Verified live: `IN DRAWDOWN
+  −3.46% / −$34.90, 84.8h in DD, LITE drag`. 2 subprocess end-to-end
+  locks (skipped where no live DB).
+  - **Concurrency note:** `dd9af44` also contains 2 `digital-intern`
+    files a *sibling agent staged into the shared git index* between this
+    agent's `git add` and `git commit` — `git commit` commits the whole
+    index, not just what you `git add`. The per-commit "stage only your
+    files" guard is **insufficient under a concurrent writer**; use
+    pathspec-limited `git commit -- <files>` (race-immune). No code lost;
+    the sibling's work is valid and intact, just bundled under this
+    message.
+
+- **Phase 3 — live findings (trader perspective, 2026-05-18 ~02:40 UTC).**
+  1. **Running :8090 is 11 commits stale** (`build-info` `behind:11
+     stale:true`). Concrete cost: `/api/model-reliability` 404s and every
+     fix/endpoint committed today (incl. the drawdown invariant-#12 fix)
+     is inert until **the runner is restarted**. The dominant operator
+     action item.
+  2. **Capital paralysis live & severe:** cash $18.49 (1.9% of $972.69),
+     ~25 cycles since last fill, deployed ~98%, top-1 concentration 60.8%
+     (LITE) `severity HIGH`. ~17h of `HOLD LITE`; Opus cannot act on a new
+     signal without first selling. (Already surfaced by
+     `capital_paralysis`/`funded_suggestions`.)
+  3. **Decision-reliability degraded:** `/api/decision-reliability`
+     `current_failure_rate_pct 24.7%` (23 current `TIMEOUT_EMPTY`
+     failures) — ~1 in 4 live cycles produces no decision (Opus wedged/
+     slow). Matches the `NO_DECISION (timeout/empty)` rows in the
+     decisions table.
+  4. **Persisted-vs-live mark discrepancy:** the stored `positions` row
+     for MU is `current_price==avg_cost==724.12, P/L $0.00` (a stale mark
+     persisted from the last cycle MU was unfetchable), while a fresh
+     read-only recompute (`/api/mark-integrity`) reports "All 2 marks
+     live, n_stale 0". The `stale_mark` flag is **not persisted between
+     cycles**, so the Discord hourly summary (reads persisted
+     `open_positions()`) shows MU as a misleading flat $0.00 until the
+     next decision cycle re-marks. Behavioural, not a core-code bug — left
+     as a finding (persisting the flag would change the live mark path).
+  5. **`logs/runner.log` is ~7h stale** (mtime 05-17 19:40) while the
+     trader is demonstrably live (decision 1.5 min ago, equity point 1
+     min ago). An operator tailing the documented health log sees a frozen
+     file — log-based monitoring is blind to current activity/errors;
+     there is no fresh tailable runner stdout at the documented path.
+  - Decision loop itself **healthy and on-cadence** (fresh decision +
+    equity point); dashboard endpoints return sensible non-stale JSON
+    (`/api/risk` top1 60.8%, `/api/benchmark` `alpha_pp −2.25`,
+    `/api/scorecard`/`/api/desk-pulse` 200).
+
+- **Run the core suite:** `cd /home/zeph/trading-intelligence/paper-trader
+  && python3 -m pytest tests/test_core_*.py tests/test_drawdown.py -q`
+  (the 6 core files + the new drawdown lock = 303 fast offline tests; the
+  full `tests/ -v` sweep is correct but slow under a concurrent pytest —
+  the core subset is the meaningful core-domain proof).
