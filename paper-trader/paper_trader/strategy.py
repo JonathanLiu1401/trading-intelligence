@@ -610,7 +610,8 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    self_review_block: str | None = None,
                    track_record_block: str | None = None,
                    risk_mirror_block: str | None = None,
-                   event_calendar_block: str | None = None) -> str:
+                   event_calendar_block: str | None = None,
+                   buying_power_block: str | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
     pos_lines = []
     for p in snapshot["positions"]:
@@ -683,6 +684,12 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # data: the trader sees its structural risk and then what is *coming* on
     # the names in play, before watchlist prices bias it.
     event_section = f"{event_calendar_block}\n" if event_calendar_block else ""
+    # Deployable-cash awareness — the lean prompt-facing complement to the
+    # dashboard-only capital_paralysis (AGENTS.md #2/#12, the event_calendar
+    # precedent). Placed last in the advisory stack, immediately before
+    # WATCHLIST PRICES: the trader sees what its cash can actually fund right
+    # before it sees the prices it would fund against. Observational only.
+    bp_section = f"{buying_power_block}\n" if buying_power_block else ""
 
     return f"""TIME (UTC): {now}
 MARKET_OPEN: {market_open}
@@ -694,7 +701,7 @@ PORTFOLIO:
   total value: ${snapshot['total_value']:.2f}
   positions:
 {chr(10).join(pos_lines) if pos_lines else '  (none)'}
-{review_section}{track_section}{risk_section}{event_section}
+{review_section}{track_section}{risk_section}{event_section}{bp_section}
 WATCHLIST PRICES:
 {chr(10).join(px_lines)}
 
@@ -1227,6 +1234,26 @@ def decide() -> dict:
     except Exception as e:
         print(f"[strategy] event-calendar failed (non-fatal): {e}")
 
+    # Deployable-cash awareness — the lean, prompt-facing complement to the
+    # dashboard-only capital_paralysis. Pure arithmetic over the already-marked
+    # snapshot + the already-fetched watch prices (NO extra store read / NO
+    # network — the risk_mirror hot-path discipline). Scoped to the SAME
+    # `_names_in_play` set the quant / track-record blocks use so the
+    # affordability sizing matches "what matters this cycle". Observational
+    # only (invariants #2/#12 — the event_calendar precedent); wrapped so a
+    # diagnostics fault is "no buying-power block this cycle", never "no
+    # decision this cycle".
+    buying_power_block: str | None = None
+    try:
+        from .analytics.buying_power import build_buying_power
+        bp = build_buying_power(
+            snap, watch_px,
+            _names_in_play(snap.get("positions") or [], merged, WATCHLIST),
+        )
+        buying_power_block = bp.get("prompt_block")
+    except Exception as e:
+        print(f"[strategy] buying-power failed (non-fatal): {e}")
+
     # ML advisor: when model consistently beats SPY, include its opinion in prompt
     ml_opinion_block: str | None = None
     ml_qualified, ml_qual_reason = _ml_is_qualified()
@@ -1250,7 +1277,8 @@ def decide() -> dict:
                              self_review_block=self_review_block,
                              track_record_block=track_record_block,
                              risk_mirror_block=risk_mirror_block,
-                             event_calendar_block=event_calendar_block)
+                             event_calendar_block=event_calendar_block,
+                             buying_power_block=buying_power_block)
     prompt = f"{SYSTEM_PROMPT}\n\n---\nCONTEXT:\n{payload}"
     if ml_opinion_block:
         prompt += f"\n\n---\nML ADVISOR:\n{ml_opinion_block}"
