@@ -6053,6 +6053,7 @@ def analytics_api():
         # 4dp there; the win/loss split below uses strict `> 0`, so a sub-cent
         # rounding artefact reads as a non-win (pinned by test_round_trips).
         from .analytics.round_trips import build_round_trips
+        from .analytics.tail_risk import build_tail_risk
         _rts = build_round_trips(trades)
         round_trips: list[float] = [rt["pnl_usd"] for rt in _rts]
         holding_days: list[float] = [
@@ -6164,7 +6165,30 @@ def analytics_api():
             "sp500_correlation": sp500_corr,
             "daily_pl_usd": daily_pl,
             "daily_pl_pct": daily_pl_pct,
+            # Left-tail / downside-shape diagnostic. Additive top-level
+            # key — test_core_analytics uses keyed assertions, not
+            # whole-dict equality — so the digital-intern analyst chat
+            # (which fetches /api/analytics) inherits VaR/CVaR/skew for
+            # free. eq is the same day-resampled series used above.
+            "tail_risk": build_tail_risk(eq),
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tail-risk")
+def tail_risk_api():
+    """Historical 95/99% 1-day VaR, expected shortfall, annualised vol &
+    downside deviation, return skew, worst day, max consecutive down-day
+    streak and Ulcer index — the left-tail view the upside-heavy
+    analytics surface was missing. Honesty-gated
+    (NO_DATA/INSUFFICIENT/OK, mirrors build_correlation); observational
+    only — never gates Opus, never injected into the decision prompt
+    (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.tail_risk import build_tail_risk
+        store = get_store()
+        return jsonify(build_tail_risk(store.equity_curve(5000)))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
