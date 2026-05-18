@@ -2269,3 +2269,121 @@ expected; this entry was appended, not rewritten).
   `analysis.claude_analyst` imports OK; quote-widget helpers present. A
   concurrent sibling hybrid agent edited this repo throughout; this entry
   was appended, not rewritten.
+
+- **2026-05-18 (hybrid pass 17 — Agent 3, debug + feature + analyst-validation)** —
+  Required-file-set pass (17th; codebase exceptionally mature, 16 prior
+  passes). Advisor-reviewed before substantive work. **Phase 1: bugs_fixed=0,
+  no commit** (per COMMIT GUARD — honest, not a miss). Read all nine
+  task-critical files + `daemon.py` in full. Every candidate resolved to
+  correct-by-design / documented / test-pinned: the `get_top_for_briefing`
+  diversity-cap + overflow backfill, the `_collapse_syndicated` → decay →
+  `[:60]` order, `urgency_scorer` STALE clamp + truncation guard, the
+  `_briefing_domain_key` non-dotted-tag fallback, `update_ml_scores_batch`'s
+  `COALESCE(score_source,'ml')`, the trainer strong-label SQL (`'ml'`
+  excluded, synthetic included). Live probe corroborated: backtest isolation
+  holds (`0` synthetic rows with `urgency>=1` in the ~1.45 GB prod DB);
+  alert set clean; briefing id26 excellent. No fabricated change — same
+  honest call as passes 1, 15, 16. Sibling-WIP `M collectors/rss_collector.py`
+  (+ its 5 `test_rss_collector.py` 4-tuple failures), `M daemon.py`,
+  `M dashboard/server.py`, `M scripts/export_training_data.py`,
+  `M tests/test_article_store.py` and the untracked sibling files left
+  **exactly as-is** (never read-staged).
+  **Phase 2: features_added=1, commit `66c349f`.** **LLM-vetted vs
+  model-only score calibration tag in the 5h Opus digest.**
+  `get_top_for_briefing` ranks the newswire by
+  `COALESCE(NULLIF(ai_score,0), ml_score, 0)` — so an Opus/Sonnet-vetted 9
+  and a raw local-model 9.8 render with an identical `[score=...]` and the
+  COALESCE erases which is which. The relevance head demonstrably
+  over-scores forum/wiki/social rows (the recurring pass-15/16 finding #5:
+  reddit `ml=9.76`, wikipedia `8.6`, `ai_score=0`); the alert path gates
+  that noise (`_filter_low_authority_lone`) but the **briefing newswire Opus
+  reads exposed the distinction nowhere**, so neither Opus nor the consuming
+  analyst could down-weight a raw-model 9.8 against a vetted 9. Added
+  additive `_llm_vetted = bool(raw ai_score)` to the `get_top_for_briefing`
+  row dict (model output only ever writes `ml_score`, NEVER `ai_score` —
+  invariant #2 — so a falsy raw `ai_score` exactly means "displayed score
+  came from `ml_score`, unverified"); `_build_payload` renders a ` [model]`
+  token when `_llm_vetted is False` (an explicit-False test — the prepended
+  PORTFOLIO/OPTIONS snapshot rows carry no key → `.get` → `None`,
+  `None is False` → False → never tagged; an LLM-vetted `True` row also
+  untagged); and a `SYSTEM_PROMPT` rule states the **LEAD/TOP-SIGNALS
+  consequence** (prefer untagged rows; never lead a lone `[model]` row over
+  a comparable untagged one). Tag reflects the cluster representative (the
+  highest-scored copy `_collapse_syndicated` keeps — i.e. the score actually
+  shown — deliberately NOT OR-ed across siblings, pinned by a test). Pure
+  read-side: no DB write, no `ai_score`/`ml_score`/`score_source`/`urgency`
+  mutation, displayed `ai_score` field + all ordering/diversity/decay logic
+  byte-unchanged, backtest excluded upstream by `_LIVE_ONLY_CLAUSE` — all
+  four load-bearing invariants intact by construction. **Calibration signal
+  for a documented failure mode — explicitly NOT a claim it changes any
+  particular healthy briefing** (id26's actual TOP SIGNALS were all clean
+  LLM-vetted lines; the value is in the windows where a model-only forum
+  9.8 would otherwise out-rank a vetted 9). +10 specific-value tests
+  (`tests/test_briefing_model_score_marker.py`: store-layer `_llm_vetted`
+  for llm/model-only/briefing_boost/Sonnet-floored-0.01 rows, render
+  presence/absence, snapshot pass-through, mixed-cluster representative
+  pin, input-non-mutation, SYSTEM_PROMPT consequence). No exact-key
+  assertion exists on the briefing dict (only `set(id(x) …)` object-identity
+  — verified before adding the key). Suite: **606 passed** (587 baseline +
+  10 mine + 9 from a concurrent sibling agent's added test files), the same
+  5 `test_rss_collector.py` failures are the pre-existing sibling
+  `M collectors/rss_collector.py` 4-tuple WIP (`_FakeResp` lacks
+  `status_code`; not ours, never staged) — zero regressions; the 114
+  briefing/store suites pass unchanged.
+  **Phase 3 findings (news-analyst lens; daemon `pid 1702195` started
+  00:29, read-only `mode=ro` DB probes — `immutable=1` hit "database disk
+  image is malformed" under the live torn-write, the documented USB
+  contention). user_findings=7:** (1) **Briefing quality EXCELLENT
+  (positive)** — id26 (07:13Z, 50 art) read end-to-end: dense accurate
+  decisively-actionable Bloomberg digest (bond-rout LEAD 10Y +13bp→4.59%
+  dragging Nasdaq −1.54% two days before NVDA earnings; exact macro table;
+  PORTFOLIO LITE/LNOK/NVDL/MU tied to live book + DRAM C59 05-22 / NVDA
+  05-20; RISK at 10Y>4.60%; decisive DESK NOTE; COVERAGE GAP present).
+  Cadence id22→26 ≈ 6.3/6.8/5.4/5.3h vs the 5h target — the `ef839a8`
+  heartbeat-clock fix is holding, no 30h+ gaps. (2) **Alert path CLEAN &
+  CORRECT (positive)** — exactly **2** alerts in 24h, both legit high-value
+  `Benzinga Economics` geopolitical-oil shocks (UAE nuclear-plant drone
+  strike / Trump Iran warning / Brent spike `ai=9.0`; Dow/S&P-futures-drop
+  follow-up `ai=8.0`). **Zero** reddit/wikipedia/quote-widget noise; no
+  `urgency=1` backlog stuck. The full noise-suppression stack (quote-widget
+  ×3, low-authority-lone, cross-cycle recency, syndication collapse) is
+  behaving exactly as designed. (3) **Invariants hold LIVE** — `0`
+  synthetic rows with `urgency>=1`; paper-trader actively injecting
+  `backtest_run_6233` synthetic training rows (133 of newest 200 first_seen)
+  — correctly tagged + isolated by `_LIVE_ONLY_CLAUSE`. (4) **`insert_batch:
+  lock retry exhausted` recurring** — 16 ERRORs in last 6000 log lines
+  (clusters 08:50, 09:42–09:44Z) → whole collected batches silently dropped
+  = missed news; matches memory `di-insert-batch-lock-contention.md`.
+  Architectural fix (per-connection isolation) is substantial +
+  `daemon.py`/store partly sibling-touched → out of safe surgical scope;
+  reported, not chased. (5) **~1.12M unscored backlog** — scorer keeps full
+  pace (batch=1000 scored=1000/cycle) but the gdelt_gkg + backtest bulk
+  injection outpaces the drain (`remaining≈1,122,267`, ~5k/37min). Defused
+  for briefings/alerts by the staleness filters + kw-DESC scoring order;
+  operational observation, not a code bug. (6) **Stale-daemon caveat** —
+  the running daemon predates HEAD: COVERAGE GAP shows "DARK 0.0h" (the
+  `b20cbae` fails×cadence fix is in HEAD) and TOP SIGNALS lack the
+  `[HH:MM]` token (`3b09f87`); both correct in HEAD. The Phase-2 `[model]`
+  tag likewise ships only on next `systemctl restart digital-intern`. (7)
+  **8 collectors disabled** (sec_edgar/_ft, polygon, newsapi, alphavantage,
+  massive, nitter, +) — analyst blind to 8-K filings (priority-0);
+  correctly surfaced verbatim by the existing COVERAGE GAP briefing block
+  (working as intended). Upstream/rate-limit; operational. None of 1-7 was
+  a quick safe fix inside clean scope (1-2-3 positive/invariant-holds; 4
+  architectural+sibling; 5 operational; 6 already-fixed-in-HEAD; 7
+  upstream) → no Phase-3 fold-in, bugs_fixed stays 0. Final verify:
+  `storage.article_store` / `ml.features` / `ml.model` /
+  `analysis.claude_analyst` imports OK. *Pre-existing, deliberately never
+  staged* (consistent with every prior entry): `collectors/rss_collector.py`,
+  `daemon.py`, `dashboard/server.py`, `scripts/export_training_data.py`,
+  `tests/test_article_store.py`, untracked `collectors/fred_collector.py` /
+  `scripts/stale_source_alerter.py` / `storage/story_corroboration.py` /
+  `tests/test_alert_history.py` / `tests/test_export_training_data.py` /
+  `tests/test_story_corroboration.py`, all `paper-trader/*`, `logs/*.tmp`.
+  Commit `66c349f` was pathspec-scoped to exactly its 3 intended files
+  (`storage/article_store.py`, `analysis/claude_analyst.py`,
+  `tests/test_briefing_model_score_marker.py`); `git diff --staged
+  --name-only` verified immediately before commit; `git show --stat`
+  confirmed no sibling leakage; never `git add -A`; pushed to
+  origin/master. A concurrent sibling hybrid agent (`pid 1807306`, same
+  task) edited this repo throughout; this entry was appended, not rewritten.
