@@ -6230,3 +6230,133 @@ features_added = 1 · user_findings = 5.**
   single trailing hunk, committed separately (not counted as the feature).
 
 *Review pass #27 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+## Review pass #28 — paper-trader core hybrid (2026-05-18)
+
+**bugs_fixed=0 · features_added=1 · user_findings=4**
+
+- **Phase 1 — bugs_fixed=0 (mature).** Full read of the 7 core files
+  (`runner.py`, `reporter.py`, `signals.py`, `strategy.py`, `market.py`,
+  `store.py`) + `dashboard.py` surveyed by its 80+ `/api/*` route table
+  (9.8k lines — endpoint-survey, not full read; stated honestly).
+  Re-traced `decide()`'s claude / fallback / retry + pre-flight &
+  mid-call host-saturation state machine, the singleton degrade/recheck
+  path, `_mark_to_market` expired-option/`stale_mark`,
+  `store.upsert_position` reactivate/blend, `_maybe_daily_close`
+  half-day anchoring, the ~16 reporter conditional Discord lines. No
+  real bug, race, or dead-code defect found — consistent with the 5+
+  prior mature core passes (#23–#27 all bugs_fixed=0). Baseline green:
+  423 focused-core+reporter+drawdown tests
+  (`test_core_{market,store,signals,runner,strategy,reporter}` +
+  `test_drawdown`) pass before the feature. The task template's
+  "max_position / stop-loss" coverage does NOT apply — invariant #12
+  (no hard limits; Opus full autonomy). No Phase-1 commit
+  (guard-compliant — the guard explicitly permits this).
+
+- **Phase 2 — feature (committed `aedda33`, pushed):
+  `reporter._drawdown_line` — drawdown-from-peak in the hourly + daily.**
+  The hourly/daily showed only `P/L $X (Y%)` **vs the $1000 start**,
+  which silently conflates "never made money" with "made money then
+  gave a chunk back". `compute_drawdown` existed (`/api/drawdown` + a
+  `python -m paper_trader.analytics.drawdown` CLI) but had **no Discord
+  surface** — the exact dashboard→Discord gap `_benchmark_line` /
+  `_equity_integrity_line` / `_equity_freshness_line` each closed, one
+  dimension over (vs-index → vs-own-peak, the two reference points a PM
+  reads together). The new line consumes `compute_drawdown`'s OWN
+  computed fields **verbatim** (the `_pos_pct_weight` precedent: pure
+  formatting of a builder's already-computed numbers — invariant #10
+  governs verdict/headline single-sourcing and `compute_drawdown` emits
+  none, so suppression keys off the builder's OWN `at_high_water`
+  boolean, never an invented threshold), feeds it the **byte-identical**
+  store reads `drawdown_api` uses (`equity_curve(limit=2000)` +
+  `open_positions()`, `starting_equity=_INITIAL_EQUITY`), is
+  observational only / never gates / no caps (invariants #2/#12), pure
+  store reads / NO network (the Discord-path discipline), and degrades
+  to `""` on any fault (never an exception — the reporter additive
+  contract). Renders depth (`-10.96% ($-110.39) from peak`),
+  time-underwater via `_ago` (`4d in DD`), trough + the builder's own
+  claw-back % (gated off when still at the lows), and the single worst
+  open drag name. Suppressed at a fresh high (no hourly noise — the
+  lying-green-light precedent). Wired immediately after `_benchmark_line`
+  in **both** `send_hourly_summary` and `send_daily_close`. **13 new
+  exact-assert tests** (`tests/test_core_reporter.py::TestDrawdownLine`
+  — real-builder numbers `-5.00%/-10.00%/recovered 50%`, trough-gating,
+  top-drag value, green-worst-name omits drag, `hours→_ago` backdated,
+  non-dict/raises suppression, hourly+daily wiring, summary-still-sends
+  on builder fault). 423 focused green, no regressions.
+  ```bash
+  python3 -m pytest \
+    tests/test_core_reporter.py tests/test_drawdown.py -q   # green
+  cd /home/zeph/trading-intelligence/paper-trader && \
+    python3 -m paper_trader.analytics.drawdown               # CLI
+  ```
+
+- **Phase 3 — live findings (`:8090`, runner deciding but frozen; box
+  under the review-swarm load this pass's own siblings contribute to).
+  4 distinct + positive.**
+  1. **IDLE_STORM / NO_DECISION host-saturation storm (HIGH,
+     host-saturation, NOT a code bug — continuity, recalled
+     `pt-no-decision-host-saturation`).** `/api/host-guard`: load1
+     19.11 / 16 CPU, 7 concurrent Opus, swap 65%, "66% of the last 120
+     decisions never reached Opus". `decisions` alternate
+     `skipped claude call — host saturated: 6–11 concurrent Opus (>4)`
+     and `claude returned no response (timeout/empty)`; last fill
+     2026-05-17 09:38 (~30 h ago), 93 cycles since.
+     `/api/runner-heartbeat` `IDLE_STORM`, `restart_recommended:true`.
+     Architectural reality of the 15 GB box under the concurrent Opus
+     review swarm + backtest committee; self-clears when the swarm ends.
+     The pre-flight guard + mid-call re-probe are working correctly
+     (distinct, honest reasons recorded). Not actionable in code.
+  2. **Deep multi-day drawdown the operator was blind to in Discord —
+     the gap THIS pass's feature closes, validated live.** Book peaked
+     **$1007.59 (+0.76%)** 2026-05-14, now **-10.96% / -$110.39 from
+     peak, 97.66 h (4 d) underwater, recovered only 3.2%, LITE -$64.90
+     the anchor**. `/api/benchmark`: `best_alpha +0.31pp` at the 05-14
+     peak, now **-9.71pp**. The hourly's "P/L -$103 vs $1000 start"
+     hides that the strategy *made* money then bled and has been stuck
+     4 days — a profoundly more actionable picture. The new
+     `_drawdown_line` surfaces exactly this; confirmed reachable on the
+     real book.
+  3. **Capital paralysis (the #2 documented pathology, continuity).**
+     `/api/capital-paralysis`: 97.95% deployed, $18.49 cash (2.0%), both
+     open names underwater, LITE 59% of book, **-10.31% alpha cost over
+     6 paralysis droughts**. Verdict reads `FREE` (technically can act
+     with $18) but flags every structural problem. Continuity (pass #27
+     #3); the Phase-2 DRAWDOWN line + pass-#27 per-name %/weight now make
+     it visible in Discord.
+  4. **Dashboard latency under host saturation (MEDIUM, symptom of #1,
+     by-design).** `/api/host-guard` timed out at 6 s, returned correctly
+     at 20 s; lightweight endpoints (`/api/portfolio`,
+     `/api/benchmark`, `/api/mark-integrity`) stayed instant. Swap-thrash
+     starving the SWR cold path, not a code defect (continuity, pass #27
+     #2).
+  - **POSITIVE — data/book/feed trust intact.**
+    `/api/equity-integrity` `CLEAN` (806 points, cash never negative,
+    min $2.61), `/api/mark-integrity` "All 2 marks live" (0 stale),
+    `/api/feed-health` fresh (0.19 h, no split-brain, blind_streak 0),
+    `continuous.log` only graceful external GDELT backoff
+    (`attempt 1/3 — sleeping 20s`; no tracebacks / no engine CRASH),
+    Discord send healthy. The freeze is isolated to the Opus call (host
+    load), not a blind feed / corrupt book / dark channel.
+
+  No Phase-3 fix folded in — every finding is host/ops continuity or
+  the deliberate observe-don't-repair contract (invariants #2/#12); the
+  only in-scope code change is the Phase-2 feature.
+
+- **Concurrency / staging discipline.** Two concurrent same-role-ish
+  HYBRID siblings live this pass (a second paper-trader-core agent pid
+  1979382 + an ML/backtest agent pid 1979384; dirty `../digital-intern/`
+  tree) — recalled `pt-concurrent-samerole-staging-race`. Never
+  `git add -A`. Staged exactly the two path-scoped files
+  (`paper_trader/reporter.py`, `tests/test_core_reporter.py`);
+  `git diff --staged | grep` for sibling tokens (`digital-intern`,
+  `decision_scorer`, `backtest.py`, `_host_pulse`, `persona_leaderboard`,
+  `sortino`) returned **only the two `+++` headers of my own files** —
+  zero sibling tokens — before commit `aedda33`. AGENTS.md re-read at the
+  tail immediately before this append (still ended at pass #27, no
+  sibling append yet), appended-only, committed separately (not counted
+  as the feature).
+
+*Review pass #28 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
