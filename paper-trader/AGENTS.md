@@ -1023,6 +1023,12 @@ cd /home/zeph/paper-trader && python3 -m pytest tests/test_regime_audit.py -v
 cd /home/zeph/paper-trader && python3 -m paper_trader.ml.regime_audit          # OOS slice
 cd /home/zeph/paper-trader && python3 -m paper_trader.ml.regime_audit --all    # full in-sample
 
+# Training-corpus & OOS-construction audit (exact-value verdict locks)
+cd /home/zeph/paper-trader && python3 -m pytest tests/test_corpus_audit.py -v
+# Is the loop's temporal-OOS holdout a real generalization test? (read-only;
+# exits 2 on OOS_NOT_HELD_OUT — the corpus is one cycle's single window):
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.corpus_audit
+
 # A single class
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_decision_scorer.py::TestTrainScorer -v
 
@@ -2531,6 +2537,202 @@ deletion is safe even if a backtest thread is mid-read.
   tests/test_feature_importance.py tests/test_skill_trend.py
   tests/test_regime_audit.py tests/test_baseline_compare.py -q`
   (289 fast offline tests, green).
+
+### 2026-05-18 review pass #13 (ML+backtest hybrid · training-corpus & OOS-construction audit · decisive live finding)
+
+- **Phase 1 — no new bugs (bugs_fixed = 0; no Phase-1 commit).** Full
+  re-trace of `decision_scorer.py`, `backtest.py`,
+  `run_continuous_backtests.py` plus coupled `validation.py` /
+  `calibration.py` / `gate_audit.py`: the BUY-path scorer-feature
+  construction in `_ml_decide` vs the training-side reconstruction in
+  `_compute_decision_outcomes` (`ml_score`=`best_score` regime-multiplied
+  parsed from reasoning vs full-precision at inference — consistent to
+  rounding; `regime_mult` recomputed identically off the same `engine.prices`;
+  the news-default symmetry `buy_news_count==0 → None → build_features
+  urg=50/cnt=1` on BOTH sides), the `score=` first-match regex vs `scorer=`
+  (no `score=` substring inside `scorer=`), the universal SELL
+  `-forward_return_5d` sign-flip (train↔inference↔calibration↔gate↔
+  `_oos_rank_metrics`↔`evaluate_scorer_oos`), the off-distribution gate
+  abstention, the 11-column `_inject_and_train` INSERT alignment, the
+  separately-guarded `_train_decision_scorer` train/oos-rmse/oos-rank blocks,
+  the numpy-lstsq fallback scaler, every module-global lock — all re-verified
+  correct and exact-value test-locked. Consistent with the documented 12+
+  prior no-new-bug ML/backtest passes — not a fabricated fix. ML/backtest
+  subset 290/290 green before the feature, 309/309 after.
+
+- **Feature shipped (commit `e109f88`): training-corpus & OOS-construction
+  audit.** `paper_trader/ml/corpus_audit.py`. The gap it fills: every
+  sibling diagnostic (`calibration` deciles, `gate_audit` arms, `skill_trend`
+  ledger-trend, `feature_importance` attribution, `regime_audit` regime
+  buckets, `baseline_compare` trivial one-liners) takes the corpus **as
+  given** and measures the scorer's skill on the temporal-OOS slice
+  `validation.split_outcomes_temporal` carves out. **None validate that the
+  slice is a genuine held-out draw.** That matters because of how the corpus
+  is produced: `MAX_OUTCOMES_FOR_TRAINING=5000` caps
+  `decision_outcomes.jsonl`; each cycle runs `RUNS_PER_CYCLE=5` backtests
+  over **one random multi-year window** emitting ≈1000 outcomes/run ≈ 5000
+  rows — so the cap ≈ **one cycle's one window**; and each backtest run emits
+  decisions across the whole window, so when the split sorts by `sim_date`
+  and holds out the latest fraction, every run contributing to OOS (its late
+  `sim_date` rows) **also contributed to train** (its early rows). The
+  loop's "temporal OOS holdout" is therefore the late slice of the *same*
+  runs over the *same* window — a within-window front/back split, **not** a
+  generalization test against an unseen window/regime. The tool applies the
+  EXACT `split_outcomes_temporal` (single source of truth — a split mismatch
+  would describe a different slice than every other OOS tool) and verdicts on
+  the train↔OOS run-set relationship: `INSUFFICIENT_DATA` /
+  `OOS_NOT_HELD_OUT` (run-subset **and** ≤`NARROW_MAX_RUNS=10` distinct
+  runs — the decisive alarm) / `OOS_OVERLAPS_TRAIN` (run-subset but
+  many-window corpus — milder) / `OOS_HELD_OUT` (≥1 OOS run absent from
+  train — genuine separation). `corpus_breadth`/`regime_mix` are
+  informational, NOT folded into the verdict (the `gate_audit`
+  arm-monotone honesty pattern), so the verdict stays crisply exact-value
+  testable. Read-only, no train/pickle/`build_features`/`N_FEATURES`/trade
+  touch, never raises, CLI exits 2 on `OOS_NOT_HELD_OUT`. NOT wired into
+  `main()` — zero deploy-stale impact. 19 exact-value locks in
+  `tests/test_corpus_audit.py`.
+  ```bash
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.corpus_audit
+  cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/test_corpus_audit.py -v
+  ```
+
+- **Quant finding (NEW, decisive): the trustworthy OOS metric is not a
+  generalization test.** Live `decision_outcomes.jsonl`: **5000 rows, 5
+  distinct run_ids (6226–6230), one cycle, one window 2013-01-22 →
+  2018-01-11** (`OOS_NOT_HELD_OUT`, breadth `SINGLE_DRAW`,
+  `likely_single_cycle=True`, regime mix **80.9% bull_or_unknown**). The
+  loop's `oos_rmse`/`oos_ic` and `calibration --oos` / `regime_audit` /
+  `baseline_compare` OOS verdicts are computed on train sim_date ≤
+  2017-04-07 vs OOS sim_date ≥ 2017-04-10 of the **same 5 backtest runs**
+  (`oos_run_ids in_train=5, not_in_train=0, shares_all=True`). This refines
+  every prior pass's "textbook overfit / negative OOS skill": that collapse
+  is measured on the **most favorable possible holdout** — same runs, same
+  window, one contiguous low-vol bull regime — and the scorer **still**
+  collapses (`calibration --oos` MISCALIBRATED spearman 0.19, decile-realized
+  flat d1 −0.39 vs d10 +2.27; `skill_trend` NEGATIVE_OOS_SKILL oos_rmse
+  11.30 ≫ 5.67 mean-predictor baseline, **trend DEGRADING**, `gate_active=1.0`
+  on all 11 ledger cycles; `baseline_compare` MLP OOS rank_ic 0.19 ≈ raw
+  `ml_score` 0.20, `ic_gap −0.007` — the 17-dim net adds **nothing** over
+  its own input feature OOS). A true held-out window would be *worse*, not
+  better — so the no-edge conclusion is strengthened, and the conviction
+  gate (invariant #5, active every cycle) is underwriting sizing variance
+  against a model whose only measurable "OOS" number is itself a
+  within-window artifact. Reported, **not actioned** — neither the
+  `MAX_OUTCOMES_FOR_TRAINING` cap nor the gate is in surgical scope
+  (model-/training-dynamics, CLAUDE.md §6).
+
+- **Operational (durable, NEW — out of surgical ML scope, reported):**
+  `backtest.db` (now **278 MB**, on the `/media/zeph/projects` symlinked
+  volume, with a **stale 4.2 MB WAL not checkpointed since 2026-05-17
+  01:58** though the loop is actively writing) cannot service a `mode=ro`
+  `SELECT COUNT(*)` within 30 s even with `busy_timeout=8000` (`rc=124`,
+  reproduced twice). The dashboard's `/api/backtests*` endpoints read this
+  DB **per HTTP request**, and digital-intern's `:8080` dashboard
+  cross-fetches them — so those panels are effectively unresponsive under
+  this condition. Root cause is infra (volume latency / WAL-checkpoint
+  starvation / 278 MB DB), not ML logic; surfaced here because a skeptical
+  quant reading the backtest dashboard would see hangs, not data.
+
+- **Operational (reconfirmed, out of scope):** winner→ArticleNet feedback
+  loop still dead — `continuous.log`: `[continuous] ml: trainer rc=-15
+  injected=10000` (SIGTERM on digital-intern's 120 s-capped
+  `ml.trainer.train(force=True)`; injection succeeds, training does not).
+  Matches passes #6/#7/#8/#11/#12 — the loop is not "training on its
+  winners". digital-intern GPU + `articles.db` write contention; reported,
+  not actioned.
+
+- **Live health.** `backtest.db` (read via the static `.local_backup`
+  snapshot, since the live symlink times out): 486 complete / 20 failed /
+  4 running; 0 NaN finals; 1 `benchmark_unavailable`. `total_return_pct`
+  median **+63.1%**; `vs_spy_pct` median **+40.0%** — leveraged-beta
+  dispersion, not alpha, exactly as every prior pass documents. Scorer
+  pickle `n_train=3234`, `gate_active=True`. `continuous.log` fresh,
+  mid-cycle (run 6231); only handled external GDELT `ConnectionReset`/
+  `RemoteDisconnected` noise (backoff 20/40/60 s) — no Python tracebacks,
+  no `[engine] RUN N CRASHED`, no `scorer err` / `inject err`.
+
+- **Run the ML/backtest suite (now 309):** `cd
+  /home/zeph/trading-intelligence/paper-trader && python3 -m pytest
+  tests/test_decision_scorer.py tests/test_backtest.py
+  tests/test_calibration.py tests/test_validation.py tests/test_continuous.py
+  tests/test_ml_backtest_review.py tests/test_gate_audit.py
+  tests/test_feature_importance.py tests/test_skill_trend.py
+  tests/test_regime_audit.py tests/test_baseline_compare.py
+  tests/test_corpus_audit.py -q` (309 fast offline tests, green).
+
+---
+
+### 2026-05-18 review pass #13 (paper-trader core hybrid · news-DB lock no longer aborts the cycle · NYSE half-day enforcement · live findings)
+
+- **Phase 1 — 1 bug fixed (commit `fe5881d`).** `signals.py`'s four
+  decision-path readers (`get_top_signals`, `get_urgent_articles`,
+  `get_ticker_sentiment`, `ticker_sentiments`) wrapped the query in
+  `try: conn.execute(...) finally: conn.close()` with **no `except`**. A
+  transient `sqlite3.OperationalError: database is locked` from the
+  digital-intern `articles.db` (the daemon mid-WAL-checkpoint — observed live
+  in `runner.log`, `get_top_signals` line 294) propagated out of
+  `strategy.decide()`, which `runner._cycle` only catches generically — so
+  the **entire decision cycle was lost**: no decision, no equity point, for a
+  *news* DB hiccup. All four readers now `except sqlite3.Error`, log once, and
+  degrade to the **same safe default the `if not conn` arm returns**
+  (identical to a missing DB) so trading continues on quant + portfolio
+  context. `sqlite3.Error` only — a non-sqlite bug still surfaces. Locked by
+  `tests/test_signals_lock_degrade.py` (per-reader degraded value + the
+  connection is still closed, no fd leak + the `decide()` merge survives) and
+  an exact-value P&L regression guard `tests/test_round_trips_pnl.py` for
+  `build_round_trips` (the realized-today single source of truth: scale-in /
+  partial-close / fractional-residue / option ×100 — no bug found, pinned).
+
+- **Phase 2 — 1 feature (commit see below).** `market.py` had **no NYSE
+  early-close handling** ("Half-days not enforced — we'll trade through
+  them"). On the day after Thanksgiving (2026-11-27) and Christmas Eve
+  (2026-12-24) NYSE closes at **1:00 p.m. ET**; the engine believed the
+  market was open 13:00–16:00 ET, ran the fast 30-min OPEN cadence and
+  *executed trades against frozen post-close yfinance marks* for three hours
+  of a CLOSED market, twice a year. Added `NYSE_HALF_DAYS_2026`,
+  `is_half_day(d)`, `close_minute(d)` (13:00 on a known half-day, else the
+  regular 16:00); `is_market_open` now gates on `close_minute(date)`. Fully
+  backward-compatible — an unknown half-day still falls through to the 16:00
+  close (same conservative default as the holiday calendar), and an
+  exhaustive per-minute test proves every regular weekday is byte-identical
+  to the old `9:30 ≤ m < 16:00` rule. Locked by
+  `tests/test_market_half_day.py` (11 tests, + 36 existing `test_core_market`
+  green). This corrects the runner sleep cadence, the prompt `MARKET_OPEN`
+  flag, and every market-hours gate on those two days.
+
+- **Phase 3 — live findings (reported, not all in-domain to fix):**
+  1. **NO_DECISION rate 58.9% lifetime / 51.9% in 24h** (`/api/decision-health`)
+     — the dominant failure mode; the live trader produces no decision more
+     than half the time. Owned by the concurrent JSON-parse agent; the Phase 1
+     fix at least stops a locked news DB *adding* to this count.
+  2. **Strategy lagging buy-and-hold S&P by 2.25pp** ($972.69 vs $995.20),
+     ahead in only **0.5% of 755 cycles** (`/api/benchmark`) — strategy
+     underperformance, not a code defect.
+  3. **Discord delivery DEGRADED** (`/api/runner-heartbeat` → `notify`):
+     `verdict DEGRADED`, `last_ok_ts null`, `openclaw timeout (60s)`. The
+     operator's only alarm channel is dark this process. Root cause is
+     environmental — load avg **~23 on 16 cores** (the parallel review agents
+     + continuous backtests + the test suite saturate the box; the
+     `node`/PATH resolution itself is fixed and verified `rc 0`). The 60s
+     `reporter._send` timeout is too tight under that load, but `reporter.py`
+     was being concurrently edited by another agent so it was left untouched
+     to avoid a collision.
+  4. **Suspicious cost basis** (`/api/risk`): MU marked ≈ $724/sh, LITE ≈
+     $970/sh — ~10× real prices; the open book appears to have been entered at
+     corrupted yfinance prices at some past point. Equity accounting is
+     internally consistent (cash + Σ market_value = total_value) but built on
+     bad marks. Historical data corruption, not a live code path to patch
+     surgically — flagged for an operator DB review.
+  5. Dashboard endpoints all 200 and sub-10 ms (SWR cache healthy) even under
+     load avg 23, though `/api/*` occasionally exceeds an 8 s client timeout
+     at that saturation (environmental).
+
+- **Run the core suite:** `cd /home/zeph/trading-intelligence/paper-trader &&
+  python3 -m pytest tests/ -v` (full ~1491). Fast core subset for this pass:
+  `python3 -m pytest tests/test_core_signals.py tests/test_core_strategy.py
+  tests/test_core_store.py tests/test_core_market.py tests/test_core_runner.py
+  tests/test_signals_lock_degrade.py tests/test_round_trips_pnl.py
+  tests/test_market_half_day.py -q`.
 
 ---
 
