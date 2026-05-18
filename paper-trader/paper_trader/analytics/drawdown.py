@@ -139,3 +139,66 @@ def compute_drawdown(
         "history": history,
         "starting_equity": round(starting_equity, 2),
     }
+
+
+if __name__ == "__main__":  # one-screen answer, usable when :8090 is wedged
+    # CLI parity with `python -m paper_trader.analytics.benchmark` /
+    # `desk_pulse` / `signals --check-freshness`: the live trader's
+    # drawdown is a top-of-mind risk question ("how deep is the hole,
+    # how long, what's dragging, how much clawed back") and the dashboard
+    # is regularly `/api/build-info` `stale` (a fix is committed but the
+    # running :8090 predates it) or seconds-slow under the panel storm —
+    # exactly when the operator most needs the answer from a terminal.
+    # Read-only (invariant #7 `?mode=ro`); the builder default 1000.0 is
+    # never relied on — INITIAL_CASH is threaded (invariant #12, the
+    # /api/drawdown endpoint's own contract).
+    import json
+    import sqlite3
+    import sys
+    from pathlib import Path
+
+    from paper_trader.store import INITIAL_CASH
+
+    db = Path(__file__).resolve().parents[2] / "data" / "paper_trader.db"
+    try:
+        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        eq = [
+            {"timestamp": r[0], "total_value": r[1], "cash": r[2],
+             "sp500_price": r[3]}
+            for r in c.execute(
+                "SELECT timestamp,total_value,cash,sp500_price FROM "
+                "equity_curve ORDER BY timestamp ASC, id ASC").fetchall()
+        ]
+        positions = [
+            {"ticker": r[0], "type": r[1], "qty": r[2], "avg_cost": r[3],
+             "current_price": r[4], "unrealized_pl": r[5]}
+            for r in c.execute(
+                "SELECT ticker,type,qty,avg_cost,current_price,unrealized_pl "
+                "FROM positions WHERE closed_at IS NULL AND qty > 0").fetchall()
+        ]
+        c.close()
+    except Exception as e:  # the benchmark / signals --check-freshness CLI precedent
+        print(f"drawdown: cannot read {db}: {e}")
+        sys.exit(2)
+
+    rep = compute_drawdown(eq, positions, starting_equity=INITIAL_CASH)
+    if "--json" in sys.argv:
+        print(json.dumps(rep, indent=2, default=str))
+    else:
+        badge = "AT HIGH-WATER" if rep["at_high_water"] else "IN DRAWDOWN"
+        print(f"DRAWDOWN  [{badge}]  vs ${rep['starting_equity']} start")
+        print(f"  now    ${rep['current_value']}   "
+              f"peak ${rep['peak_value']}  @ {rep['peak_ts'] or 'n/a'}")
+        if not rep["at_high_water"]:
+            print(f"  draw   {rep['drawdown_pct']:+}%  "
+                  f"(${rep['drawdown_abs']:+})   "
+                  f"{rep['hours_in_dd']}h in DD")
+            print(f"  trough ${rep['trough_value']}  "
+                  f"({rep['trough_pct']:+}%)  @ {rep['trough_ts'] or 'n/a'}   "
+                  f"recovered {rep['recovery_pct']}%")
+        drags = [c for c in rep["contributors"] if c["drag"]][:5]
+        if drags:
+            print("  dragging:")
+            for d in drags:
+                print(f"    {d['ticker']:<6} "
+                      f"${d['unrealized_pl']:+.2f}  ({d['pl_pct']:+.1f}%)")

@@ -182,5 +182,54 @@ def test_endpoint_threads_initial_cash_not_literal_1000(tmp_path, monkeypatch):
         store_mod._singleton = None
 
 
+# ── CLI end-to-end lock (the benchmark/desk_pulse terminal precedent) ──────
+# The __main__ block is a thin read-only shell over the (exhaustively tested)
+# builder; this locks its contract: exit 0, valid JSON, full documented key
+# set, INITIAL_CASH threaded at the CLI layer too (not the 1000.0 default),
+# and the human header. Read-only against the live DB (the CLI's whole point
+# is safe operator access while :8090 is stale); skipped where no live DB.
+import json as _json
+import subprocess
+
+_LIVE_DB = _ROOT / "data" / "paper_trader.db"
+_REQUIRED_KEYS = {
+    "as_of", "current_value", "peak_value", "peak_ts", "drawdown_pct",
+    "drawdown_abs", "hours_in_dd", "at_high_water", "trough_value",
+    "trough_ts", "trough_pct", "recovery_pct", "contributors", "history",
+    "starting_equity",
+}
+
+
+@pytest.mark.skipif(not _LIVE_DB.exists(), reason="no live paper_trader.db")
+def test_cli_json_contract_and_threads_initial_cash():
+    from paper_trader.store import INITIAL_CASH
+
+    r = subprocess.run(
+        [sys.executable, "-m", "paper_trader.analytics.drawdown", "--json"],
+        cwd=str(_ROOT), capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, r.stderr
+    rep = _json.loads(r.stdout)                       # must be valid JSON
+    assert _REQUIRED_KEYS.issubset(rep.keys())        # full documented shape
+    # invariant #12 at the CLI layer: the builder 1000.0 default is NOT relied
+    # on — the CLI threads the module INITIAL_CASH exactly like the endpoint.
+    assert rep["starting_equity"] == round(float(INITIAL_CASH), 2)
+    assert isinstance(rep["contributors"], list)
+    assert isinstance(rep["at_high_water"], bool)
+
+
+@pytest.mark.skipif(not _LIVE_DB.exists(), reason="no live paper_trader.db")
+def test_cli_human_mode_header():
+    r = subprocess.run(
+        [sys.executable, "-m", "paper_trader.analytics.drawdown"],
+        cwd=str(_ROOT), capture_output=True, text=True, timeout=60,
+    )
+    assert r.returncode == 0, r.stderr
+    # Either badge is valid depending on live state; the header must render.
+    assert r.stdout.startswith("DRAWDOWN  [")
+    assert ("AT HIGH-WATER" in r.stdout) or ("IN DRAWDOWN" in r.stdout)
+    assert "vs $" in r.stdout and "start" in r.stdout
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
