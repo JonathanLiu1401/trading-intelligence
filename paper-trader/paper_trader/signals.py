@@ -299,6 +299,16 @@ def get_top_signals(n: int = 20, hours: int = 2, min_score: float = 4.0) -> list
             "ORDER BY ai_score DESC, first_seen DESC LIMIT ?",
             (since, min_score, n),
         ).fetchall()
+    except sqlite3.Error as e:
+        # A transient `database is locked` (the digital-intern daemon mid-WAL-
+        # checkpoint) was propagating out of `decide()` and aborting the WHOLE
+        # decision cycle — no decision, no equity point — for a *news* DB
+        # hiccup (observed live, runner.log). A locked/unreadable feed must
+        # degrade to "no signals this cycle" (identical to the `if not conn`
+        # arm), exactly as a missing DB already does. sqlite3.Error only —
+        # never mask a real bug behind a bare Exception.
+        print(f"[signals] get_top_signals query failed (degrading to []): {e}")
+        return []
     finally:
         conn.close()
     out = []
@@ -332,6 +342,12 @@ def get_ticker_sentiment(ticker: str, hours: int = 4) -> dict:
             "AND source NOT LIKE 'opus_annotation%'",
             (since,),
         ).fetchall()
+    except sqlite3.Error as e:
+        # See get_top_signals: a transient lock on the news DB must not abort
+        # the decision cycle. Degrade to the same zero-sentiment default the
+        # `if not conn` arm returns.
+        print(f"[signals] get_ticker_sentiment query failed (degrading): {e}")
+        return {"ticker": ticker, "avg_score": 0.0, "max_score": 0.0, "n": 0, "urgent": 0}
     finally:
         conn.close()
     scores = []
@@ -370,6 +386,11 @@ def get_urgent_articles(minutes: int = 30) -> list[dict]:
             "ORDER BY ai_score DESC LIMIT 20",
             (since,),
         ).fetchall()
+    except sqlite3.Error as e:
+        # See get_top_signals: a transient news-DB lock must degrade to "no
+        # urgent items this cycle", never abort decide().
+        print(f"[signals] get_urgent_articles query failed (degrading to []): {e}")
+        return []
     finally:
         conn.close()
     out = []
@@ -442,6 +463,12 @@ def ticker_sentiments(tickers: list[str], hours: int = 4) -> list[dict]:
             "AND source NOT LIKE 'opus_annotation%'",
             (since,),
         ).fetchall()
+    except sqlite3.Error as e:
+        # See get_top_signals: a transient news-DB lock must degrade to the
+        # same zero-sentiment-per-ticker default the `if not conn` arm
+        # returns, never abort decide().
+        print(f"[signals] ticker_sentiments query failed (degrading): {e}")
+        return [{"ticker": t, "avg_score": 0.0, "max_score": 0.0, "n": 0, "urgent": 0} for t in tickers]
     finally:
         conn.close()
     agg = defaultdict(lambda: {"scores": [], "urgent": 0})
