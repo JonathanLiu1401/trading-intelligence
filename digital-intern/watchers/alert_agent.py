@@ -14,6 +14,7 @@ from core.claude_cli import claude_call
 # duplicating the 40-entry SOURCE_CRED map here, which would silently drift
 # (the recurring dashboard-parity / vendored-signals.py failure class).
 from ml.features import _source_credibility
+from watchers import alert_recency
 from watchers.alert_dedup import alerted_ids, dedupe_urgent
 
 try:
@@ -305,6 +306,52 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         )
         return False
 
+    # Cross-cycle syndication suppression (defense-in-depth, same
+    # formatter-side shape as _is_synthetic / _filter_quote_widget_noise /
+    # _filter_low_authority_lone — NOT an ML-threshold change). dedupe_urgent
+    # only collapses copies *inside this batch*; a slower feed re-collecting
+    # an already-alerted event as a NEW row (urgency=1, the old copies are
+    # urgency=2 and excluded from get_unalerted_urgent) would otherwise fire a
+    # second standalone BREAKING push for an event the analyst was already
+    # told about, possibly hours later (live: the H200/China story alerted
+    # twice ~1.5h apart from different sources). Runs AFTER dedupe_urgent so a
+    # signature is computed once per collapsed survivor, and after the
+    # low-authority gate so a row suppressed there is never recorded. Best-
+    # effort: a recency-store failure yields an empty set → no-op (the old
+    # behaviour) — a genuine breaking story must still reach the analyst.
+    # Suppressed rows are marked alerted UNCONDITIONALLY (separate call,
+    # before any Discord attempt) so they leave the urgent queue instead of
+    # being re-fetched every 20s. articles.db ai_score/ml_score/score_source
+    # are untouched — only the noisy duplicate push is dropped.
+    try:
+        recent_sigs = alert_recency.recent_signatures()
+    except Exception:
+        recent_sigs = set()
+    deduped, cross_suppressed = alert_recency.partition_already_alerted(
+        deduped, recent_sigs
+    )
+    if cross_suppressed:
+        try:
+            store.mark_alerted_batch(alerted_ids(cross_suppressed))
+        except Exception:
+            _log.exception(
+                "[alert] failed to mark cross-cycle duplicate rows alerted"
+            )
+        srcs = ", ".join(
+            f"{(a.get('source') or '?')}:{(a.get('title') or '')[:40]}"
+            for a in cross_suppressed[:5]
+        )
+        _log.info(
+            f"[alert] suppressed {len(cross_suppressed)} cross-cycle "
+            f"duplicate(s) (signature alerted within "
+            f"{alert_recency.ALERT_RECENCY_TTL_HOURS:.0f}h) — {srcs}"
+        )
+    if not deduped:
+        _log.info(
+            "[alert] all urgent rows were cross-cycle duplicates — skipping"
+        )
+        return False
+
     # Only the first ALERT_BATCH_SIZE feed the prompt — and only those (plus the
     # duplicates they absorbed) get marked alerted. Marking the entire urgent
     # list would silently drop the tail (it'd never be picked up next cycle),
@@ -378,6 +425,15 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
             # never re-fire — duplicates of still-queued stories stay urgent.
             mark_ids = alerted_ids(batch)
             store.mark_alerted_batch(mark_ids)
+            # Record the canonical signature of every story that actually
+            # fired so a later slower-feed copy of the same event is
+            # cross-cycle-suppressed above. Best-effort — a failure here only
+            # means a future duplicate is not muted (never worse than the
+            # pre-feature behaviour); it must never undo a sent alert.
+            try:
+                alert_recency.record_alerted(batch)
+            except Exception:
+                _log.exception("[alert] alert_recency.record_alerted failed")
             collapsed = len(mark_ids) - len(batch)
             tail = len(deduped) - len(batch)
             notes = []
