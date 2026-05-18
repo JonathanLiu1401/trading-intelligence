@@ -5518,14 +5518,18 @@ def data_feed_api():
     exclude backtest synthetic rows (per the live-only invariant — see CLAUDE.md
     §5 in digital-intern). Returns zeros if the article DB isn't reachable so
     the widget can render gracefully on the live trader page.
+
+    Resolves the DB through the freshness-aware ``_articles_db_path()`` (→
+    ``signals._db_path()``, invariant #17) — the SAME single source of truth
+    the live trader and every other news-analytics endpoint use. The old
+    hardcoded candidate list both (a) bypassed the split-brain-safe resolver
+    (so this panel could read a stale USB mirror while the trader read fresh
+    LOCAL — the exact failure invariant #17 closed everywhere else) and (b)
+    pinned the **pre-migration** path ``/home/zeph/digital-intern/...``, which
+    only resolves on this box via a legacy symlink; on a clean checkout it
+    silently zeroed the live news-pulse panel with "articles.db not found".
     """
-    # Prefer the LOCAL DB (the live daemon writes here), fall back to the
-    # USB-mounted copy.
-    candidates = [
-        Path("/home/zeph/digital-intern/data/articles.db"),      # LOCAL first (live daemon writes here)
-        Path("/media/zeph/projects/digital-intern/db/articles.db"),  # USB fallback
-    ]
-    db_path = next((p for p in candidates if p.exists()), None)
+    db_path = _articles_db_path()
     if db_path is None:
         return jsonify({"articles_1h": 0, "articles_24h": 0, "top_sources": [],
                         "error": "articles.db not found"})
