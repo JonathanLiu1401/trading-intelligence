@@ -3218,3 +3218,139 @@ expected; this entry was appended, not rewritten).
   `git diff --staged --name-only` + `git show --stat` verified no sibling
   leakage; never `git add -A`; on origin/master. A concurrent sibling hybrid
   agent edited this repo throughout; this entry was appended, not rewritten.
+
+- **2026-05-18 (hybrid pass 26 — Agent 3, debug + feature + analyst-validation)** —
+  Required-file-set pass (codebase exceptionally mature, 25 prior passes).
+  All 9 required files read in full + `ml/label_audit.py` (HEAD `c4339b7`),
+  `ml/inference.py`, `collectors/source_health.py`. Advisor-reviewed before
+  substantive work. Bare daemon `pid 1702195` started **2026-05-18 07:29Z**
+  (00:29 local -0700), predating EVERY recent fix incl. HEAD `c4339b7`
+  (14:30Z), `b20cbae` COVERAGE-GAP cadence fix (08:16Z), `50c1052`
+  reap_stale_urgent, `8180055`/`05b406e` cursor-collision retries — the
+  consistent stale-daemon caveat (all ship on next `systemctl restart
+  digital-intern`). A concurrent sibling hybrid agent (`pid 1958258`, same
+  prompt) + auto-commit/push daemon edited this shared monorepo throughout;
+  strict per-commit pathspec staging held (memory `di-shared-repo-concurrency`).
+
+  **Phase 1 — bugs_fixed=0, NO Phase-1 commit (commit guard honoured —
+  honest, not a miss).** Every load-bearing invariant re-traced and verified
+  live (`synth_urgent_LEAK=0`, `ml_in_aiscore_LEAK=0` in the prod DB). The
+  full requested Phase-1 test list already exists and value-asserts
+  (`test_article_store` backtest:// + `update_ml_scores_batch` score_source,
+  `test_trainer` ml-exclusion + sample-weight, `test_urgency_scorer`
+  9.5-urgent/3.0-not/rescore-does-not-unalert, `test_features` 15-dim/density/
+  age, `test_model` head bounds/NaN). Live `daemon.log` forensics surfaced
+  only KNOWN issues, none a genuine new bug in clean scope: the recurring
+  `[stats_worker] 'NoneType' object is not subscriptable` + the 14:34:46Z
+  `update_ai_scores_batch: lock retry exhausted` → `[urgency] Scoring error`
+  traceback are the chronic shared-conn DB-lock contention (memory
+  `di-insert-batch-lock-contention`) and a stale-daemon manifestation of the
+  HEAD-present `_expect_row`/`_RETRYABLE_DB_ERRORS` fixes; the line-427
+  `reentrant call inside BufferedWriter` traceback is the PRIOR daemon's
+  23:42Z shutdown logging artifact, not the live process. Root fix (per-call
+  connection isolation) is substantial + `daemon.py`/`article_store.py`
+  sibling-touched → out of clean scope (advisor/precedent-confirmed, passes
+  19-24). Manufacturing a fix would revert a load-bearing prior decision →
+  bugs_fixed honestly 0 (precedent passes 15/16/17/21/22/24).
+
+  **Phase 2 — features_added=1, commit `56974f8`** (`watchers/alert_agent.py`
+  +52/−1 + new `tests/test_alert_book_tag.py`, +14 tests).
+  **Held-book relevance line on the 🚨 BREAKING urgent alert.** The alert is
+  the analyst's most time-critical product and the persona is explicitly "I
+  react to events affecting MY positions", yet the mandatory `PORTFOLIO:`
+  line relied entirely on Sonnet *inferring* held-ticker relevance from the
+  raw headline — a real held-name break read identically to generic macro
+  colour, and a "Lumentum guides down" with no `LITE` token got a generic
+  PORTFOLIO line. The briefing path already has the well-tested `[BOOK:]`
+  tag; the alert path (the more urgent product) had no held-book signal at
+  all. New pure `_book_tickers(art)` (title+summary surface, sorted/dedup,
+  reuses `ml.features.LIVE_PORTFOLIO_TICKERS`/`_LIVE_RE` **verbatim** —
+  alert_agent already imports `_source_credibility` from that module, so
+  single-source-of-truth with the model's own ticker features and the
+  briefing tag, zero drift) emits an additive `book: TICKER,...` line in
+  `_fmt` (exact shape of the established additive `age:`/`syndication:`/
+  `related:` lines — membership-tested, no pinned contiguity, verified via
+  grep before writing) + one BOOK rule in `ALERT_PROMPT` so Sonnet MUST name
+  the held ticker(s) with a concrete directional implication and weight IMPACT
+  above generic macro. **Design note for future passes:** the briefing's
+  `_BOOK_TICKERS` is a *local literal* (analysis layer must not pull
+  ml/numpy); alert_agent is the OPPOSITE — it ALREADY pulls the ml.features
+  numpy graph, so reusing that module's set is the correct drift-free choice
+  here (a `test_alert_book_tag` drift-guard pins set-equality with
+  `LIVE_PORTFOLIO_TICKERS`). `ALERT_PROMPT` text is NOT pinned by any test
+  (grepped `FORMAT (use exactly)`/`PORTFOLIO:`/`LITE/MU/MSFT` → no test
+  hits), so the new rule is safe. The hardcoded 7-ticker list in the prompt
+  FORMAT block (`LITE/MU/MSFT/AXTI/ORCL/TSEM/QBTS`, missing LNOK/MUU/DRAM/
+  SNDU/NVDA) was deliberately NOT widened in this commit — separate concern,
+  the `book:` data line carries the full 12-name truth to Sonnet anyway.
+  Pure read-side: no DB write, no ai_score/ml_score/score_source/urgency
+  touch, backtest already filtered by `_is_synthetic`/the store before
+  `_fmt` — **all four load-bearing invariants intact by construction**.
+  +14 specific-value tests (pure helper: single/multi-sorted, summary
+  surface, `MUU` not swallowed by `\bMU\b`, `MU` not matched inside
+  "Micron", dedup, empty-safe, non-portfolio AAPL excluded, ml.features
+  single-source-of-truth set-equality; end-to-end: `book:` line + BOOK rule
+  reach the Sonnet prompt, multi-ticker sorted, no-position row emits NO
+  `book:` line — no fabrication; read-only `spy.marked` contract). All 112
+  alert-suite tests pass (incl. the unchanged continuation/age/dedup/
+  source-authority assertions). Ships on next daemon restart (stale caveat).
+
+  **Phase 3 — analyst-lens live validation, user_findings=8.** (1)
+  **Briefing quality EXCELLENT (positive, direct read)** — id27 (12:51Z, 50
+  arts) read end-to-end: dense, exact, decisively-actionable LEAD ("Iran-war
+  inflation scare → global bond rout, US 30Y 5.13% post-2023 high, S&P
+  −1.24%/SMH −3.80% into NVDA Wed — but the live tape is already cooling, WTI
+  −4.15%"), precise MACRO/PORTFOLIO/SEMIS tables, RISK tied to specific
+  levels (10Y >4.65%, NVDA $225 pivot), syndication `[x2]` tags in TOP
+  SIGNALS, COVERAGE GAP present. (2) **Collection HEALTHY (positive)** —
+  4,449 live articles last 1h, 1.45M/24h; diverse GN round-robin + scraped +
+  Benzinga, current. (3) **Invariants HOLD live (positive)** — `0` synthetic
+  `urgency>=1`, `0` `ai_score>0 AND score_source='ml'`. (4) **Alert path
+  CLEAN & quiet (positive)** — `[alert] idle — no urgent items`, `state=ok
+  crashes_5m=0`, zero noise/suppression churn this window; recent legit
+  alerts only (Benzinga geopolitical ai=9/8, SEC-EDGAR NVDA 8-K ai=8). (5)
+  **COVERAGE GAP shows "DARK 0.0h"** for session-long-blind channels (SEC
+  8-K 968 empty polls, Polygon 841, NewsAPI 621, Nitter 1283) — misleading
+  to the analyst (reads as negligible), but a STALE-DAEMON manifestation of
+  HEAD-present `b20cbae` (daemon 07:29Z predates the 08:16Z fix); ships
+  correct (cadence-based `~Nh`) on restart, NOT a new bug. (6) **7 collectors
+  disabled** (`massive, newsapi, nitter, polygon, sec_edgar, sec_edgar_ft,
+  wikipedia`); `sec_edgar`/`_ft` = analyst blind to 8-K filings (priority-0);
+  chronic external/rate-limit gap (memory `di-chronic-dark-collectors`),
+  correctly surfaced verbatim by the COVERAGE GAP block (working as
+  intended); upstream/operational. (7) **Chronic DB lock-retry exhaustion**
+  — `update_ai_scores_batch: lock retry exhausted after 5 attempts` at
+  14:34:46Z → `[urgency] Scoring error` dropped that cycle's Sonnet labels =
+  potential missed urgent classification (memory
+  `di-insert-batch-lock-contention`); root fix substantial +
+  daemon.py/store sibling-touched → out of clean scope (advisor/precedent-
+  confirmed). (8) **Stale daemon predates ALL recent HEAD fixes** + 26
+  phantom `urgency=1` rows (reap_stale_urgent `50c1052` present at HEAD,
+  un-run on the stale process; inflates the dashboard urgent tile) — the
+  meta-finding: an operator `systemctl restart digital-intern` ships pass
+  19-26's accumulated fixes + this pass's `book:` line. None of 5/6/7/8 is a
+  new safe quick fix in clean scope (stale-daemon-with-HEAD-fix / upstream /
+  chronic-out-of-scope / operational) → no Phase-3 fold-in; bugs_fixed stays
+  0, features_added 1.
+
+  **Verify:** `storage.article_store` / `ml.features` / `ml.model` /
+  `watchers.alert_agent` imports OK; `_book_tickers` set-parity with
+  `ml.features.LIVE_PORTFOLIO_TICKERS` True; suite **863 passed / 5 failed**
+  (`--ignore=tests/test_alert_history.py`, an untracked sibling-WIP file
+  importing a nonexistent `watchers.alert_history`; the 5 failures are the
+  pre-existing sibling `M collectors/rss_collector.py` `'_FakeResp' object
+  has no attribute 'status_code'` 4-tuple WIP — not ours, never staged;
+  floor held exactly 5, never 6+; my 14 new tests all pass, 112/112
+  alert-suite green, zero regressions). *Pre-existing, deliberately never
+  staged* (consistent with every prior entry): `collectors/rss_collector.py`,
+  `daemon.py`, `dashboard/server.py`, `scripts/export_training_data.py`,
+  `tests/test_article_store.py`, untracked `collectors/fred_collector.py` /
+  `scripts/stale_source_alerter.py` / `storage/story_corroboration.py` /
+  `tests/test_alert_history.py` / `tests/test_export_training_data.py` /
+  `tests/test_story_corroboration.py`, all `paper-trader/*`, `logs/*`.
+  Commit `56974f8` pathspec-scoped via `git commit -F … -- watchers/
+  alert_agent.py tests/test_alert_book_tag.py`; `git diff --staged
+  --name-only` + `git show --stat` verified EXACTLY 2 files (213 ins / 1
+  del), no sibling leakage; never `git add -A`; on origin/master. A
+  concurrent sibling hybrid agent edited this repo throughout; this entry
+  was appended, not rewritten.
