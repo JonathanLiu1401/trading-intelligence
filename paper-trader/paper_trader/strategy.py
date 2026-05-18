@@ -576,7 +576,8 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    quant_signals: dict[str, dict] | None = None,
                    self_review_block: str | None = None,
                    track_record_block: str | None = None,
-                   risk_mirror_block: str | None = None) -> str:
+                   risk_mirror_block: str | None = None,
+                   event_calendar_block: str | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
     pos_lines = []
     for p in snapshot["positions"]:
@@ -643,6 +644,12 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # behavioural stack so the trader sees its structural risk (book shape +
     # turnover) right after its history and before market data biases it.
     risk_section = f"{risk_mirror_block}\n" if risk_mirror_block else ""
+    # Forward scheduled-event awareness (earnings) — same observational/
+    # advisory contract as the three mirrors above (invariants #2/#12). Placed
+    # right after the backward-looking behavioural stack and before market
+    # data: the trader sees its structural risk and then what is *coming* on
+    # the names in play, before watchlist prices bias it.
+    event_section = f"{event_calendar_block}\n" if event_calendar_block else ""
 
     return f"""TIME (UTC): {now}
 MARKET_OPEN: {market_open}
@@ -654,7 +661,7 @@ PORTFOLIO:
   total value: ${snapshot['total_value']:.2f}
   positions:
 {chr(10).join(pos_lines) if pos_lines else '  (none)'}
-{review_section}{track_section}{risk_section}
+{review_section}{track_section}{risk_section}{event_section}
 WATCHLIST PRICES:
 {chr(10).join(px_lines)}
 
@@ -1151,6 +1158,40 @@ def decide() -> dict:
     except Exception as e:
         print(f"[strategy] risk-mirror failed (non-fatal): {e}")
 
+    # Forward scheduled-event awareness — the #1 thing a discretionary desk
+    # tracks that the engine was fully blind to: upcoming EARNINGS on the
+    # names in play. Reads digital-intern's earnings_calendar.json snapshot
+    # *directly from disk* (the signals.py filesystem precedent) — NOT a
+    # :8080 hop, which is a documented hang/latency hazard on the live cycle.
+    #
+    # Scope is held ∪ the FULL WATCHLIST — deliberately NOT the lean
+    # `_names_in_play` set the quant / track-record blocks use. Those blocks
+    # are per-ticker and large, so they trim to top-5 + signals to bound
+    # prompt length; an earnings event within the 14d horizon is rare (≈0–3
+    # across the whole 50-name watchlist) so there is no bloat to bound, and
+    # narrowing it would re-create the exact blind spot this feature closes:
+    # Opus could BUY a watchlist name (e.g. NVDA — not in WATCHLIST[:5]) the
+    # day before its print with no idea it was coming. This also keeps the
+    # decision-path scope identical to `/api/event-calendar` so the endpoint
+    # truly shows "the block the trader saw". Do not narrow to
+    # `_names_in_play` for "consistency" — that silently re-blinds the desk.
+    # Observational only (invariants #2/#12 — the self-review precedent);
+    # wrapped so a missing/stale/corrupt snapshot is "no event block this
+    # cycle", never "no decision this cycle".
+    event_calendar_block: str | None = None
+    try:
+        from .analytics.event_calendar import build_event_calendar
+        positions = snap.get("positions") or []
+        held = {(p.get("ticker") or "").upper()
+                for p in positions if p.get("ticker")}
+        ec = build_event_calendar(
+            positions,
+            held | {t.upper() for t in WATCHLIST},
+        )
+        event_calendar_block = ec.get("prompt_block")
+    except Exception as e:
+        print(f"[strategy] event-calendar failed (non-fatal): {e}")
+
     # ML advisor: when model consistently beats SPY, include its opinion in prompt
     ml_opinion_block: str | None = None
     ml_qualified, ml_qual_reason = _ml_is_qualified()
@@ -1173,7 +1214,8 @@ def decide() -> dict:
                              quant_signals=quant_sigs,
                              self_review_block=self_review_block,
                              track_record_block=track_record_block,
-                             risk_mirror_block=risk_mirror_block)
+                             risk_mirror_block=risk_mirror_block,
+                             event_calendar_block=event_calendar_block)
     prompt = f"{SYSTEM_PROMPT}\n\n---\nCONTEXT:\n{payload}"
     if ml_opinion_block:
         prompt += f"\n\n---\nML ADVISOR:\n{ml_opinion_block}"
