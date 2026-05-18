@@ -502,3 +502,108 @@ class TestInjectAndTrain:
     def test_missing_jsonl_returns_sentinel(self, tmp_path, monkeypatch):
         monkeypatch.setattr(rcb, "WINNER_JSONL", tmp_path / "nope.jsonl")
         assert rcb._inject_and_train() == "no jsonl"
+
+    # ── transient-lock retry (2026-05-18 fix) ────────────────────────────
+    # digital-intern's daemon is a heavy concurrent writer to the SAME
+    # ~1.4 GB articles.db. Observed live (continuous.log: 7 cycles) the
+    # daemon held the write lock past sqlite3's `timeout=`, so
+    # `OperationalError: database is locked` aborted the WHOLE ArticleNet
+    # feedback batch (CLAUDE.md §5 step 5) with no retry. `_inject_and_train`
+    # now retries connect→write→commit on a *transient* lock with backoff
+    # (INSERT OR IGNORE makes the replay idempotent).
+
+    def _winners_one(self, tmp_path, monkeypatch, empty_articles_db):
+        jsonl = tmp_path / "winners.jsonl"
+        rec = {"title": "BUY NVDA on 2025-01-01", "ai_score": 4.0,
+               "weight": 1.0, "ticker": "NVDA", "reasoning": "r",
+               "sim_date": "2025-01-01", "label": "BUY", "run_id": 1,
+               "cycle": 3}
+        jsonl.write_text(json.dumps(rec) + "\n")
+        monkeypatch.setattr(rcb, "WINNER_JSONL", jsonl)
+        monkeypatch.setattr(rcb, "DIGITAL_INTERN_ARTICLES_DB",
+                            str(empty_articles_db))
+        monkeypatch.setattr(rcb.subprocess, "run",
+                            lambda *a, **k: self._fake_trainer_ok())
+        sleeps: list[float] = []
+        monkeypatch.setattr(rcb.time, "sleep", lambda s: sleeps.append(s))
+        return sleeps
+
+    def test_transient_lock_is_retried_then_succeeds(
+            self, tmp_path, empty_articles_db, monkeypatch):
+        sleeps = self._winners_one(tmp_path, monkeypatch, empty_articles_db)
+        real_connect = sqlite3.connect
+        state = {"calls": 0}
+
+        class _LockedConn:
+            def execute(self, *a, **k):
+                raise sqlite3.OperationalError("database is locked")
+            def rollback(self): pass
+            def commit(self): pass
+            def close(self): pass
+
+        def fake_connect(*a, **k):
+            state["calls"] += 1
+            # First TWO attempts hit the daemon's write lock; the 3rd
+            # finds the lock released and writes for real.
+            if state["calls"] <= 2:
+                return _LockedConn()
+            return real_connect(*a, **k)
+
+        monkeypatch.setattr(rcb.sqlite3, "connect", fake_connect)
+        status = rcb._inject_and_train()
+
+        assert not status.startswith("inject err"), status
+        assert status.startswith("injected 1 new"), status
+        # Two failed attempts → exactly the first two backoff sleeps, then
+        # the 3rd attempt succeeds (no 3rd sleep).
+        assert sleeps == [3.0, 8.0], sleeps
+        conn = real_connect(str(empty_articles_db))
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
+        finally:
+            conn.close()
+        assert n == 1  # row landed exactly once (idempotent replay)
+
+    def test_persistent_lock_exhausts_retries_with_honest_status(
+            self, tmp_path, empty_articles_db, monkeypatch):
+        sleeps = self._winners_one(tmp_path, monkeypatch, empty_articles_db)
+
+        class _LockedConn:
+            def execute(self, *a, **k):
+                raise sqlite3.OperationalError("database is locked")
+            def rollback(self): pass
+            def close(self): pass
+
+        monkeypatch.setattr(rcb.sqlite3, "connect",
+                            lambda *a, **k: _LockedConn())
+        status = rcb._inject_and_train()
+
+        # 1 initial + 3 retries = 4 attempts, then an honest lock status —
+        # NOT a generic "inject err: <exc>" and NOT a false success.
+        assert status.startswith("inject err: database locked after 4 "
+                                 "attempts"), status
+        assert sleeps == [3.0, 8.0, 15.0], sleeps
+
+    def test_non_lock_operational_error_fails_fast_no_backoff(
+            self, tmp_path, empty_articles_db, monkeypatch):
+        sleeps = self._winners_one(tmp_path, monkeypatch, empty_articles_db)
+        state = {"calls": 0}
+
+        class _BrokenConn:
+            def execute(self, *a, **k):
+                raise sqlite3.OperationalError("disk I/O error")
+            def rollback(self): pass
+            def close(self): pass
+
+        def fake_connect(*a, **k):
+            state["calls"] += 1
+            return _BrokenConn()
+
+        monkeypatch.setattr(rcb.sqlite3, "connect", fake_connect)
+        status = rcb._inject_and_train()
+
+        # A non-lock OperationalError is a real bug, not contention — return
+        # immediately, exactly one attempt, ZERO pointless backoff.
+        assert status == "inject err: disk I/O error", status
+        assert sleeps == [], sleeps
+        assert state["calls"] == 1, state["calls"]
