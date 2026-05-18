@@ -698,6 +698,83 @@ def _singleton_lock_line() -> str:
         return ""
 
 
+def _heartbeat_line(store) -> str:
+    """One-line "is the decision loop actually deciding, or wedged?" for the
+    hourly / daily report.
+
+    The operator lives in Discord. ``/api/runner-heartbeat`` (pass #17) made
+    a brain-dead loop visible on the *dashboard* — but the hourly/daily
+    summary, the surface the operator actually reads, still looked flat-green
+    while the engine sat in a host-load NO_DECISION storm (the live
+    2026-05-18 state: 18/20 cycles NO_DECISION, ``restart_recommended:true``,
+    surfaced nowhere in Discord). ``send_quota_alert`` covers only the
+    *distinct* quota-exhaustion freeze (a specific ``quota_exhausted`` flag);
+    a host-load IDLE_STORM had no Discord surface at all. This routes the
+    heartbeat builder's own verdict to the surface the operator reads (the
+    same dashboard→Discord trajectory ``_capital_pulse_line`` /
+    ``_singleton_lock_line`` followed).
+
+    Composes ``build_runner_heartbeat`` **verbatim** (single source of truth,
+    AGENTS.md invariant #10 — the headline / verdict / restart flag are the
+    builder's, never re-derived here, so this Discord line and
+    ``/api/runner-heartbeat`` can never tell different stories). The reporter
+    owns the ``store.recent_decisions(20)`` read + ``market.is_market_open``
+    + wall clock and passes the dicts to the pure builder — the exact
+    "network in the caller, builder is pure" split the endpoint uses, so the
+    two surfaces stay byte-aligned. Observational only, never gates, adds no
+    caps (invariants #2/#12 — the ``_capital_pulse_line`` precedent). Failure
+    contract mirrors the rest of ``reporter``: any builder/store fault
+    degrades to ``""`` ("no heartbeat line this report"), **never** an
+    exception ("no Discord summary this report").
+
+    Suppression — surface ONLY when there is something the operator should
+    act on, so a healthy deciding loop adds no hourly noise (the summary must
+    never become its own lying green light):
+      * ``restart_recommended`` True (STALLED liveness, or an IDLE_STORM
+        decision-efficacy storm) → ALWAYS surfaced (the engine is dead or
+        wedged — the whole point);
+      * ``LAGGING`` liveness or ``DEGRADED`` decision-efficacy → surfaced
+        (impaired throughput, the operator should know);
+      * HEALTHY + PRODUCING / NO_DATA → silent (nothing actionable — the
+        ``_hold_discipline_line`` DISCIPLINED/NO_DATA suppression precedent).
+    """
+    try:
+        from .analytics.runner_heartbeat import build_runner_heartbeat
+        decs = store.recent_decisions(20)
+        last_ts = decs[0].get("timestamp") if decs else None
+        recent_actions = [d.get("action_taken") for d in decs]
+        hb = build_runner_heartbeat(
+            last_ts, market.is_market_open(), recent_actions=recent_actions)
+        if not isinstance(hb, dict):
+            return ""
+        verdict = hb.get("verdict")
+        eff = hb.get("decision_efficacy")
+        eff_verdict = eff.get("verdict") if isinstance(eff, dict) else None
+        restart = bool(hb.get("restart_recommended"))
+        actionable = (
+            restart
+            or verdict in ("STALLED", "LAGGING")
+            or eff_verdict in ("IDLE_STORM", "DEGRADED")
+        )
+        if not actionable:
+            return ""
+        headline = hb.get("headline") or ""
+        if not headline:
+            return ""
+        prefix = "⚠️ RESTART RECOMMENDED — " if restart else ""
+        lines = [f"**RUNNER** ◈ {verdict}", f"> {prefix}{headline}"]
+        # The top-level headline already folds in the IDLE_STORM clause
+        # (build_runner_heartbeat appends it); only DEGRADED carries
+        # additive detail not already in `headline`.
+        if (isinstance(eff, dict) and eff_verdict == "DEGRADED"
+                and eff.get("headline")):
+            lines.append(f"> efficacy — {eff['headline']}")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[reporter] heartbeat line skipped: {e}")
+        return ""
+
+
 def send_hourly_summary() -> bool:
     store = get_store()
     pf = store.get_portfolio()
@@ -731,6 +808,9 @@ def send_hourly_summary() -> bool:
     lk = _singleton_lock_line()
     if lk:
         body += "\n" + lk
+    hb = _heartbeat_line(store)
+    if hb:
+        body += "\n" + hb
     sx = _session_block(store, 1.0, "1h")
     if sx:
         body += "\n" + sx
@@ -798,6 +878,9 @@ def send_daily_close() -> bool:
     lk = _singleton_lock_line()
     if lk:
         body += "\n" + lk
+    hb = _heartbeat_line(store)
+    if hb:
+        body += "\n" + hb
     sx = _session_block(store, 24.0, "24h")
     if sx:
         body += "\n" + sx

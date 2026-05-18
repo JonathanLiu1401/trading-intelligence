@@ -8,6 +8,7 @@ contains the right fields.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -88,6 +89,135 @@ class TestSend:
         monkeypatch.setattr(reporter.subprocess, "run", _raise)
         assert reporter._send("hi") is False
         assert "exception" in capsys.readouterr().out
+
+    def test_subprocess_env_path_includes_openclaw_bin_dir(self, monkeypatch):
+        """Regression lock for the 2026-05-17 silent-Discord outage: openclaw
+        is a Node script (`#!/usr/bin/env node`); under systemd's minimal
+        PATH `env node` fails and every message is dropped. `_send` must run
+        the subprocess with PATH prefixed by the resolved binary's directory
+        (where nvm colocates `node`)."""
+        bin_path = "/home/zeph/.nvm/versions/node/v24.15.0/bin/openclaw"
+        monkeypatch.setattr(reporter, "_resolve_openclaw", lambda: bin_path)
+        # Simulate the systemd-minimal PATH that does NOT include the nvm bin.
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        captured = {}
+
+        def _fake_run(*a, **k):
+            captured["env"] = k.get("env")
+            fake = MagicMock()
+            fake.returncode = 0
+            fake.stderr = ""
+            return fake
+
+        monkeypatch.setattr(reporter.subprocess, "run", _fake_run)
+        assert reporter._send("hi") is True
+        env = captured["env"]
+        assert env is not None, "subprocess.run must be given an explicit env"
+        path_entries = env["PATH"].split(os.pathsep)
+        assert path_entries[0] == "/home/zeph/.nvm/versions/node/v24.15.0/bin"
+        # The original entries are preserved after the prepended bin dir.
+        assert "/usr/bin" in path_entries and "/bin" in path_entries
+
+    def test_subprocess_env_path_handles_empty_inherited_path(self, monkeypatch):
+        """A missing/empty inherited PATH must not crash or produce a stray
+        leading separator-only entry."""
+        monkeypatch.setattr(reporter, "_resolve_openclaw", lambda: "/opt/oc/bin/openclaw")
+        monkeypatch.delenv("PATH", raising=False)
+        captured = {}
+
+        def _fake_run(*a, **k):
+            captured["env"] = k.get("env")
+            fake = MagicMock()
+            fake.returncode = 0
+            fake.stderr = ""
+            return fake
+
+        monkeypatch.setattr(reporter.subprocess, "run", _fake_run)
+        assert reporter._send("hi") is True
+        assert captured["env"]["PATH"].split(os.pathsep)[0] == "/opt/oc/bin"
+
+
+@pytest.fixture
+def fresh_notify_state(monkeypatch):
+    """Isolate the module-global delivery-health tracker per test."""
+    monkeypatch.setattr(reporter, "_notify_state", {
+        "last_attempt_ts": None, "last_ok_ts": None, "last_result": None,
+        "consecutive_failures": 0, "last_error": "",
+    })
+    return reporter
+
+
+class TestNotifyHealth:
+    """Discord delivery-health tracker — turns the silent-channel class of
+    failure (the 2026-05-17 `env node` outage) into a visible verdict."""
+
+    def test_unknown_before_any_send(self, fresh_notify_state):
+        h = reporter.notify_health()
+        assert h["verdict"] == "UNKNOWN"
+        assert h["consecutive_failures"] == 0
+        assert h["restart_recommended"] is False
+        assert h["last_ok_ts"] is None
+
+    def test_success_marks_healthy_and_resets_failures(self, fresh_notify_state):
+        reporter._record_send_outcome(False, "boom")
+        reporter._record_send_outcome(False, "boom")
+        assert reporter.notify_health()["consecutive_failures"] == 2
+        reporter._record_send_outcome(True)
+        h = reporter.notify_health()
+        assert h["verdict"] == "HEALTHY"
+        assert h["consecutive_failures"] == 0
+        assert h["last_error"] == ""
+        assert h["last_ok_ts"] is not None
+        assert h["restart_recommended"] is False
+
+    def test_failure_marks_degraded_and_counts(self, fresh_notify_state):
+        reporter._record_send_outcome(False, "/usr/bin/env: 'node': No such file")
+        h = reporter.notify_health()
+        assert h["verdict"] == "DEGRADED"
+        assert h["consecutive_failures"] == 1
+        assert "node" in h["last_error"]
+        assert h["restart_recommended"] is False  # <3 failures
+        assert "1 consecutive send failure," in h["headline"]
+
+    def test_restart_recommended_after_three_consecutive_failures(self, fresh_notify_state):
+        for _ in range(3):
+            reporter._record_send_outcome(False, "rc=1")
+        h = reporter.notify_health()
+        assert h["verdict"] == "DEGRADED"
+        assert h["consecutive_failures"] == 3
+        assert h["restart_recommended"] is True
+        assert "3 consecutive send failures," in h["headline"]
+
+    def test_send_failure_path_updates_tracker(self, fresh_notify_state, monkeypatch):
+        """Driving the real _send failure path (nonzero exit) must flip the
+        tracker to DEGRADED with the CLI error captured."""
+        monkeypatch.setattr(reporter, "_resolve_openclaw", lambda: "/usr/bin/openclaw")
+        fake = MagicMock()
+        fake.returncode = 1
+        fake.stderr = "/usr/bin/env: 'node': No such file or directory"
+        fake.stdout = ""
+        monkeypatch.setattr(reporter.subprocess, "run", lambda *a, **k: fake)
+        assert reporter._send("x") is False
+        h = reporter.notify_health()
+        assert h["verdict"] == "DEGRADED"
+        assert "node" in h["last_error"]
+
+    def test_send_success_path_updates_tracker(self, fresh_notify_state, monkeypatch):
+        monkeypatch.setattr(reporter, "_resolve_openclaw", lambda: "/usr/bin/openclaw")
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stderr = ""
+        fake.stdout = ""
+        monkeypatch.setattr(reporter.subprocess, "run", lambda *a, **k: fake)
+        assert reporter._send("x") is True
+        assert reporter.notify_health()["verdict"] == "HEALTHY"
+
+    def test_unresolvable_binary_path_updates_tracker(self, fresh_notify_state, monkeypatch):
+        monkeypatch.setattr(reporter, "_resolve_openclaw", lambda: None)
+        assert reporter._send("x") is False
+        h = reporter.notify_health()
+        assert h["verdict"] == "DEGRADED"
+        assert "not resolvable" in h["last_error"]
 
 
 class TestSendTradeAlert:
@@ -738,3 +868,199 @@ class TestSingletonLockLine:
             "degraded": False})
         assert reporter.send_hourly_summary() is True
         assert "RUNNER DEGRADED" not in captured[0]
+
+
+class TestHeartbeatLine:
+    """`_heartbeat_line` + its hourly/daily wiring — the 2026-05-18 feature
+    that routes the runner-heartbeat verdict to Discord so a host-load
+    NO_DECISION storm (IDLE_STORM, ``restart_recommended:true``) is no longer
+    invisible to the operator who lives in Discord (pass #17 finding #1).
+
+    Composes ``build_runner_heartbeat`` verbatim (single source of truth,
+    invariant #10); surfaces only when actionable; a builder/store fault
+    drops the line, never the summary (the reporter failure contract)."""
+
+    def _patch_builder(self, monkeypatch, ret=None, raises=False):
+        import paper_trader.analytics.runner_heartbeat as rhb
+
+        def fake(*a, **k):
+            if raises:
+                raise RuntimeError("heartbeat builder boom")
+            return ret
+
+        monkeypatch.setattr(rhb, "build_runner_heartbeat", fake)
+        fake_store = MagicMock()
+        fake_store.recent_decisions.return_value = [
+            {"timestamp": "2026-05-18T10:00:00+00:00",
+             "action_taken": "NO_DECISION"}
+        ]
+        monkeypatch.setattr(reporter.market, "is_market_open", lambda: False)
+        return fake_store
+
+    def test_idle_storm_surfaces_headline_verbatim_with_restart_prefix(
+            self, monkeypatch):
+        hb = {
+            "verdict": "HEALTHY",
+            "restart_recommended": True,
+            "headline": ("HEALTHY — last decision 11m ago, within the 60m "
+                         "market-closed cadence. ⚠ but the last 18 cycles "
+                         "were ALL NO_DECISION — the engine is cycling, not "
+                         "deciding; a restart may clear a wedged Claude CLI."),
+            "decision_efficacy": {"verdict": "IDLE_STORM",
+                                  "headline": "IDLE_STORM — the last 18 "
+                                  "cycles were ALL NO_DECISION (90% of the "
+                                  "last 20)."},
+        }
+        store = self._patch_builder(monkeypatch, ret=hb)
+        line = reporter._heartbeat_line(store)
+        assert "**RUNNER** ◈ HEALTHY" in line
+        assert "⚠️ RESTART RECOMMENDED — " in line
+        # Builder headline forwarded verbatim, not re-summarised.
+        assert hb["headline"] in line
+        # IDLE_STORM detail is already in the top-level headline → not
+        # duplicated as a separate efficacy line.
+        assert "efficacy —" not in line
+
+    def test_healthy_producing_is_suppressed(self, monkeypatch):
+        hb = {
+            "verdict": "HEALTHY",
+            "restart_recommended": False,
+            "headline": "HEALTHY — last decision 2m ago, within cadence.",
+            "decision_efficacy": {"verdict": "PRODUCING",
+                                  "headline": "PRODUCING — 18/20 decided."},
+        }
+        store = self._patch_builder(monkeypatch, ret=hb)
+        # Nothing actionable → no hourly noise (the lying-green-light guard).
+        assert reporter._heartbeat_line(store) == ""
+
+    def test_stalled_surfaces_with_restart_prefix(self, monkeypatch):
+        hb = {
+            "verdict": "STALLED",
+            "restart_recommended": True,
+            "headline": ("STALLED — no decision in 3h (>2x the 1h expected "
+                         "market-open cadence); the trading loop appears "
+                         "dead. Restart paper-trader."),
+            "decision_efficacy": None,
+        }
+        store = self._patch_builder(monkeypatch, ret=hb)
+        line = reporter._heartbeat_line(store)
+        assert "**RUNNER** ◈ STALLED" in line
+        assert "⚠️ RESTART RECOMMENDED — " in line
+        assert hb["headline"] in line
+
+    def test_lagging_surfaces_without_restart_prefix(self, monkeypatch):
+        hb = {
+            "verdict": "LAGGING",
+            "restart_recommended": False,
+            "headline": ("LAGGING — last decision 80m ago (>1.25x the 60m "
+                         "market-closed cadence); the loop is slow."),
+            "decision_efficacy": {"verdict": "PRODUCING", "headline": "x"},
+        }
+        store = self._patch_builder(monkeypatch, ret=hb)
+        line = reporter._heartbeat_line(store)
+        assert "**RUNNER** ◈ LAGGING" in line
+        assert "RESTART RECOMMENDED" not in line  # LAGGING ≠ restart
+        assert hb["headline"] in line
+
+    def test_degraded_efficacy_surfaces_with_efficacy_subline(
+            self, monkeypatch):
+        hb = {
+            "verdict": "HEALTHY",
+            "restart_recommended": False,
+            "headline": "HEALTHY — last decision 5m ago, within cadence.",
+            "decision_efficacy": {
+                "verdict": "DEGRADED",
+                "headline": ("DEGRADED — 60% of the last 20 cycles were "
+                             "NO_DECISION (latest still produced a "
+                             "decision); throughput is impaired."),
+            },
+        }
+        store = self._patch_builder(monkeypatch, ret=hb)
+        line = reporter._heartbeat_line(store)
+        assert "**RUNNER** ◈ HEALTHY" in line
+        assert "RESTART RECOMMENDED" not in line
+        # DEGRADED detail is NOT in the top-level headline → surfaced as its
+        # own additive line.
+        assert "efficacy — DEGRADED — 60% of the last 20 cycles" in line
+
+    def test_degrades_to_empty_when_builder_raises(self, monkeypatch):
+        store = self._patch_builder(monkeypatch, raises=True)
+        # Never raises — failure mode is 'no line', never 'no summary'.
+        assert reporter._heartbeat_line(store) == ""
+
+    def test_no_drift_real_builder_idle_storm(self, fresh_store, monkeypatch):
+        """End-to-end on the REAL builder + a real Store: 18 NO_DECISION rows
+        with a fresh newest timestamp → liveness HEALTHY, efficacy
+        IDLE_STORM, restart_recommended. The Discord headline must equal the
+        builder's own headline verbatim (no re-derivation — invariant #10)."""
+        monkeypatch.setattr(reporter.market, "is_market_open", lambda: False)
+        for _ in range(18):
+            fresh_store.record_decision(False, 0, "NO_DECISION",
+                                        "claude timeout", 1000.0, 1000.0)
+        from paper_trader.analytics.runner_heartbeat import (
+            build_runner_heartbeat)
+        decs = fresh_store.recent_decisions(20)
+        expected = build_runner_heartbeat(
+            decs[0]["timestamp"], False,
+            recent_actions=[d["action_taken"] for d in decs])
+        assert expected["restart_recommended"] is True
+        assert expected["decision_efficacy"]["verdict"] == "IDLE_STORM"
+
+        line = reporter._heartbeat_line(fresh_store)
+        assert expected["headline"] in line          # verbatim, no drift
+        assert "⚠️ RESTART RECOMMENDED — " in line
+        assert "**RUNNER** ◈ HEALTHY" in line
+
+    def test_hourly_summary_includes_idle_storm(self, fresh_store,
+                                                monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5100.0)
+        monkeypatch.setattr(reporter.market, "is_market_open", lambda: False)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        for _ in range(18):
+            fresh_store.record_decision(False, 0, "NO_DECISION",
+                                        "claude timeout", 1000.0, 1000.0)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**RUNNER** ◈" in body
+        assert "RESTART RECOMMENDED" in body
+        # Pre-existing summary intact alongside the new block.
+        assert "**HOURLY**" in body and "Equity" in body
+
+    def test_daily_close_includes_idle_storm(self, fresh_store, monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5100.0)
+        monkeypatch.setattr(reporter.market, "is_market_open", lambda: False)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        for _ in range(18):
+            fresh_store.record_decision(False, 0, "NO_DECISION",
+                                        "claude timeout", 1000.0, 1000.0)
+        assert reporter.send_daily_close() is True
+        body = captured[0]
+        assert "**RUNNER** ◈" in body and "RESTART RECOMMENDED" in body
+        assert "**DAILY CLOSE**" in body
+
+    def test_summary_still_sends_when_heartbeat_builder_faults(
+            self, fresh_store, monkeypatch):
+        """A heartbeat fault drops only its block — the hourly summary itself
+        must still send (the reporter 'no block, never no summary' contract).
+        """
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        import paper_trader.analytics.runner_heartbeat as rhb
+
+        def _boom(*a, **k):
+            raise RuntimeError("builder boom")
+
+        monkeypatch.setattr(rhb, "build_runner_heartbeat", _boom)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**HOURLY**" in body and "Equity" in body
+        assert "**RUNNER** ◈" not in body
