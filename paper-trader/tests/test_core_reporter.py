@@ -1467,6 +1467,176 @@ class TestEquityFreshnessLine:
         assert "**EQUITY FRESHNESS**" not in body
 
 
+class TestDrawdownLine:
+    """`_drawdown_line` + its hourly/daily wiring — routes drawdown-from-peak
+    (depth / time-underwater / claw-back / top drag) to Discord so the
+    operator who lives in Discord sees the risk number that
+    P/L-vs-$1000-start silently hides (it was dashboard-only via
+    /api/drawdown). Consumes compute_drawdown's OWN fields verbatim; surfaces
+    only when off the high; a builder/store fault drops the line, never the
+    summary (the reporter failure contract)."""
+
+    def _seed(self, store, values):
+        """Append equity points with the given total_values (chronological)."""
+        for v in values:
+            store.record_equity_point(float(v), 500.0, 5000.0)
+
+    def test_at_high_water_is_suppressed(self, fresh_store):
+        # Single point == peak == current → at_high_water True → silent.
+        self._seed(fresh_store, [1000.0])
+        assert reporter._drawdown_line(fresh_store) == ""
+
+    def test_empty_curve_is_suppressed(self, fresh_store):
+        # compute_drawdown on no history returns at_high_water True.
+        assert reporter._drawdown_line(fresh_store) == ""
+
+    def test_recovered_drawdown_exact_numbers_from_real_builder(
+            self, fresh_store):
+        # peak 1000 → trough 900 → back to 950: dd -5.00%/-$50.00,
+        # trough -10.00%, recovered 50% — all the builder's own numbers.
+        self._seed(fresh_store, [1000.0, 900.0, 950.0])
+        from paper_trader.analytics.drawdown import compute_drawdown
+        exp = compute_drawdown(fresh_store.equity_curve(limit=2000),
+                               fresh_store.open_positions(),
+                               starting_equity=reporter._INITIAL_EQUITY)
+        assert exp["drawdown_pct"] == -5.0
+        assert exp["trough_pct"] == -10.0
+        assert exp["recovery_pct"] == 50.0
+        line = reporter._drawdown_line(fresh_store)
+        assert line.startswith("**DRAWDOWN** ◈ off the high-water mark\n> ")
+        assert "`-5.00%` ($-50.00) from peak" in line
+        assert "in DD" in line
+        assert "trough `-10.00%` (recovered 50%)" in line
+
+    def test_at_trough_omits_recovery_segment(self, fresh_store):
+        # Still at the lows (current == trough): recovery is 0 and there is
+        # no deeper trough to report — the trough/recovered segment is gated
+        # off, but the headline draw is still surfaced.
+        self._seed(fresh_store, [1000.0, 900.0])
+        line = reporter._drawdown_line(fresh_store)
+        assert "`-10.00%` ($-100.00) from peak" in line
+        assert "trough" not in line
+        assert "recovered" not in line
+
+    def test_top_drag_position_surfaces_with_value(self, fresh_store):
+        self._seed(fresh_store, [1000.0, 940.0])
+        fresh_store.upsert_position("LITE", "stock", 10, 50.0)
+        fresh_store.upsert_position("MU", "stock", 5, 80.0)
+        ids = {p["ticker"]: p["id"] for p in fresh_store.open_positions()}
+        # LITE marked −$58.40 (the worst), MU −$10.00.
+        fresh_store.update_position_marks({
+            ids["LITE"]: (44.16, -58.40),
+            ids["MU"]: (78.0, -10.00),
+        })
+        line = reporter._drawdown_line(fresh_store)
+        assert "top drag LITE $-58.40" in line
+        assert "MU" not in line  # only the single worst name
+
+    def test_no_drag_token_when_worst_open_name_is_green(self, fresh_store):
+        # Drawdown from a realized loss; the only open name is profitable →
+        # no open position is dragging → no "top drag" token.
+        self._seed(fresh_store, [1000.0, 930.0])
+        fresh_store.upsert_position("NVDA", "stock", 2, 100.0)
+        ids = {p["ticker"]: p["id"] for p in fresh_store.open_positions()}
+        fresh_store.update_position_marks({ids["NVDA"]: (120.0, 40.0)})
+        line = reporter._drawdown_line(fresh_store)
+        assert "from peak" in line
+        assert "top drag" not in line
+
+    def test_hours_underwater_formatted_through_ago(self, fresh_store):
+        # Backdate the peak row ~2h05m into the past so the builder's
+        # hours_in_dd → _ago → "2h in DD" (the established age format);
+        # the extra 5m margin keeps the int-hour bucket stable against
+        # sub-second test-execution drift around the 7200s boundary.
+        past = (datetime.now(timezone.utc).timestamp() - 7500)
+        iso = datetime.fromtimestamp(past, timezone.utc).isoformat()
+        fresh_store.conn.execute(
+            "INSERT INTO equity_curve (timestamp, total_value, cash, "
+            "sp500_price) VALUES (?,?,?,?)", (iso, 1000.0, 500.0, 5000.0))
+        fresh_store.conn.commit()
+        fresh_store.record_equity_point(900.0, 500.0, 5000.0)
+        line = reporter._drawdown_line(fresh_store)
+        assert "2h in DD" in line
+
+    def test_nondict_result_is_suppressed(self, fresh_store, monkeypatch):
+        import paper_trader.analytics.drawdown as ddm
+        monkeypatch.setattr(ddm, "compute_drawdown", lambda *a, **k: None)
+        assert reporter._drawdown_line(fresh_store) == ""
+
+    def test_degrades_to_empty_when_builder_raises(self, fresh_store,
+                                                   monkeypatch):
+        import paper_trader.analytics.drawdown as ddm
+
+        def _boom(*a, **k):
+            raise RuntimeError("drawdown builder boom")
+
+        monkeypatch.setattr(ddm, "compute_drawdown", _boom)
+        assert reporter._drawdown_line(fresh_store) == ""
+
+    def test_hourly_summary_includes_drawdown_when_off_high(
+            self, fresh_store, monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        self._seed(fresh_store, [1000.0, 880.0])
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**HOURLY**" in body and "Equity" in body
+        assert "**DRAWDOWN** ◈ off the high-water mark" in body
+        assert "`-12.00%` ($-120.00) from peak" in body
+
+    def test_daily_close_includes_drawdown_when_off_high(
+            self, fresh_store, monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        self._seed(fresh_store, [1000.0, 880.0])
+        assert reporter.send_daily_close() is True
+        body = captured[0]
+        assert "**DAILY CLOSE**" in body
+        assert "**DRAWDOWN** ◈ off the high-water mark" in body
+
+    def test_hourly_summary_omits_drawdown_at_high_water(
+            self, fresh_store, monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        self._seed(fresh_store, [1000.0])  # at the high
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**HOURLY**" in body
+        assert "**DRAWDOWN**" not in body
+
+    def test_summary_still_sends_when_drawdown_builder_faults(
+            self, fresh_store, monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        self._seed(fresh_store, [1000.0, 900.0])
+        import paper_trader.analytics.drawdown as ddm
+
+        def _boom(*a, **k):
+            raise RuntimeError("builder boom")
+
+        monkeypatch.setattr(ddm, "compute_drawdown", _boom)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**HOURLY**" in body and "Equity" in body
+        assert "**DRAWDOWN**" not in body
+
+
 class TestAgo:
     """`_ago` bucket boundaries — minutes < 1h, hours < 1d, days beyond."""
 
