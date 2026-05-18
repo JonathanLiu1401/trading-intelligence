@@ -1229,6 +1229,160 @@ class TestEquityIntegrityLine:
         assert "**EQUITY INTEGRITY**" not in body
 
 
+class TestEquityFreshnessLine:
+    """`_equity_freshness_line` + its hourly/daily wiring — routes the
+    live-portfolio-vs-latest-equity-point divergence (DIVERGED/STALE_CURVE)
+    to Discord so a benchmark/P&L headline silently computed off a frozen
+    curve under a NO_DECISION storm is no longer invisible to the operator
+    who lives in Discord (it was dashboard-only via /api/equity-freshness).
+
+    Composes ``build_equity_freshness`` verbatim (single source of truth,
+    invariant #10); surfaces only when actionable; a builder/store fault
+    drops the line, never the summary (the reporter failure contract)."""
+
+    def _patch_builder(self, monkeypatch, ret=None, raises=False):
+        import paper_trader.analytics.equity_freshness as efm
+
+        def fake(*a, **k):
+            if raises:
+                raise RuntimeError("equity-freshness builder boom")
+            return ret
+
+        monkeypatch.setattr(efm, "build_equity_freshness", fake)
+        monkeypatch.setattr(reporter.market, "is_market_open", lambda: True)
+        fake_store = MagicMock()
+        fake_store.get_portfolio.return_value = {"total_value": 924.13}
+        fake_store.equity_curve.return_value = []
+        return fake_store
+
+    def test_diverged_surfaces_headline_verbatim(self, monkeypatch):
+        efd = {"verdict": "DIVERGED",
+               "headline": ("Recorded equity point is STALE *and* materially "
+                            "off the live book — live $924.13 vs recorded "
+                            "$928.92; misstates the true account by $4.79.")}
+        store = self._patch_builder(monkeypatch, ret=efd)
+        line = reporter._equity_freshness_line(store)
+        assert "⚠️ **EQUITY FRESHNESS** ◈ DIVERGED" in line
+        assert efd["headline"] in line          # verbatim, invariant #10
+
+    def test_stale_curve_surfaces_headline_verbatim(self, monkeypatch):
+        efd = {"verdict": "STALE_CURVE",
+               "headline": "Recorded equity point is stale (90m old) ..."}
+        store = self._patch_builder(monkeypatch, ret=efd)
+        line = reporter._equity_freshness_line(store)
+        assert "⚠️ **EQUITY FRESHNESS** ◈ STALE_CURVE" in line
+        assert efd["headline"] in line
+
+    def test_fresh_is_suppressed(self, monkeypatch):
+        efd = {"verdict": "FRESH", "headline": "current and agrees."}
+        store = self._patch_builder(monkeypatch, ret=efd)
+        assert reporter._equity_freshness_line(store) == ""
+
+    def test_no_data_is_suppressed(self, monkeypatch):
+        efd = {"verdict": "NO_DATA", "headline": "nothing to reconcile."}
+        store = self._patch_builder(monkeypatch, ret=efd)
+        assert reporter._equity_freshness_line(store) == ""
+
+    def test_error_and_nondict_are_suppressed(self, monkeypatch):
+        store = self._patch_builder(
+            monkeypatch, ret={"verdict": "ERROR", "headline": "boom"})
+        assert reporter._equity_freshness_line(store) == ""
+        store2 = self._patch_builder(monkeypatch, ret=None)
+        assert reporter._equity_freshness_line(store2) == ""
+
+    def test_degrades_to_empty_when_builder_raises(self, monkeypatch):
+        store = self._patch_builder(monkeypatch, raises=True)
+        assert reporter._equity_freshness_line(store) == ""
+
+    def _backdate_equity_point(self, store, secs_ago, total, cash=18.49):
+        """Insert an equity_curve row timestamped ``secs_ago`` in the past so
+        the wall-clock-age-dependent builder sees a genuinely stale point
+        (record_equity_point always stamps 'now')."""
+        ts = datetime.now(timezone.utc).timestamp() - secs_ago
+        iso = datetime.fromtimestamp(ts, timezone.utc).isoformat()
+        store.conn.execute(
+            "INSERT INTO equity_curve (timestamp, total_value, cash, "
+            "sp500_price) VALUES (?,?,?,?)", (iso, total, cash, 7400.0))
+        store.conn.commit()
+
+    def test_no_drift_real_builder_diverged(self, fresh_store, monkeypatch):
+        """End-to-end on the REAL builder + a real Store: a 2h-old recorded
+        point materially off the live portfolio → DIVERGED, and the Discord
+        headline must equal the builder's own headline verbatim."""
+        monkeypatch.setattr(reporter.market, "is_market_open", lambda: True)
+        self._backdate_equity_point(fresh_store, 7200, 928.92)
+        fresh_store.update_portfolio(18.49, 924.13, [])
+        from paper_trader.analytics.equity_freshness import (
+            build_equity_freshness)
+        expected = build_equity_freshness(
+            fresh_store.get_portfolio(),
+            fresh_store.equity_curve(limit=5000),
+            True)
+        assert expected["verdict"] == "DIVERGED"
+        line = reporter._equity_freshness_line(fresh_store)
+        assert "⚠️ **EQUITY FRESHNESS** ◈ DIVERGED" in line
+        assert expected["headline"] in line          # verbatim, no drift
+
+    def test_no_drift_real_builder_fresh_suppressed(self, fresh_store,
+                                                    monkeypatch):
+        """A just-recorded equity point that agrees with the book → FRESH →
+        suppressed (no hourly noise on a trustworthy curve)."""
+        monkeypatch.setattr(reporter.market, "is_market_open", lambda: True)
+        fresh_store.record_equity_point(1000.0, 500.0, 7400.0)
+        fresh_store.update_portfolio(500.0, 1000.0, [])
+        assert reporter._equity_freshness_line(fresh_store) == ""
+
+    def test_hourly_summary_includes_diverged_line(self, fresh_store,
+                                                   monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5100.0)
+        monkeypatch.setattr(reporter.market, "is_market_open", lambda: True)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        self._backdate_equity_point(fresh_store, 7200, 928.92)
+        fresh_store.update_portfolio(18.49, 924.13, [])
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**EQUITY FRESHNESS** ◈ DIVERGED" in body
+        assert "**HOURLY**" in body and "Equity" in body
+
+    def test_daily_close_includes_diverged_line(self, fresh_store,
+                                                monkeypatch):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5100.0)
+        monkeypatch.setattr(reporter.market, "is_market_open", lambda: True)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        self._backdate_equity_point(fresh_store, 7200, 928.92)
+        fresh_store.update_portfolio(18.49, 924.13, [])
+        assert reporter.send_daily_close() is True
+        body = captured[0]
+        assert "**EQUITY FRESHNESS** ◈ DIVERGED" in body
+        assert "**DAILY CLOSE**" in body
+
+    def test_summary_still_sends_when_freshness_builder_faults(
+            self, fresh_store, monkeypatch):
+        """A freshness-builder fault drops only its block — the hourly
+        summary itself must still send (the reporter contract)."""
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        import paper_trader.analytics.equity_freshness as efm
+
+        def _boom(*a, **k):
+            raise RuntimeError("builder boom")
+
+        monkeypatch.setattr(efm, "build_equity_freshness", _boom)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**HOURLY**" in body and "Equity" in body
+        assert "**EQUITY FRESHNESS**" not in body
+
+
 class TestAgo:
     """`_ago` bucket boundaries — minutes < 1h, hours < 1d, days beyond."""
 

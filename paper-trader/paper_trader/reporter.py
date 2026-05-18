@@ -889,6 +889,72 @@ def _equity_integrity_line(store) -> str:
         return ""
 
 
+def _equity_freshness_line(store) -> str:
+    """One-line "is the equity point my benchmark/P&L headline is computed
+    from still current, or frozen behind a fresher book under load?" for the
+    hourly / daily report.
+
+    ``_equity_integrity_line`` answers "can I trust the recorded P&L history"
+    (corruption *within* recorded points). This is the orthogonal,
+    repeatedly-observed-live question one dimension over: under a
+    host-saturation NO_DECISION storm the live ``portfolio`` table re-marks
+    every cycle while the latest ``equity_curve`` point lags a whole cycle
+    behind, so ``_benchmark_line`` / the hourly P/L (both derived from
+    ``equity_curve``) silently misstate the true account by the divergence
+    with nothing in Discord saying so (observed live 2026-05-18:
+    ``/api/portfolio`` $924.13 vs ``/api/benchmark`` $928.92). The operator
+    lives in Discord and never opens ``/api/equity-freshness`` — the exact
+    dashboard→Discord gap ``_equity_integrity_line`` / ``_heartbeat_line`` /
+    ``_capital_pulse_line`` each closed.
+
+    Composes ``build_equity_freshness`` **verbatim** (single source of truth,
+    AGENTS.md invariant #10 — the headline / verdict are the builder's, never
+    re-derived here, so this Discord line and ``/api/equity-freshness`` can
+    never tell different stories) and feeds it the EXACT same store reads the
+    endpoint does (``get_portfolio()`` + ``equity_curve(limit=5000)``) plus
+    the same ``market.is_market_open()`` cadence probe so the two surfaces are
+    byte-aligned. **Pure store reads only — NO network beyond the same
+    market-hours check the rest of reporter already does.** Observational
+    only, never gates, adds no caps (invariants #2/#12 — the
+    ``_equity_integrity_line`` precedent). Failure contract mirrors the rest
+    of ``reporter``: any builder/store fault degrades to ``""`` ("no
+    freshness line this report"), **never** an exception ("no Discord summary
+    this report").
+
+    Suppression — surface ONLY when the curve the headline KPIs are computed
+    from is not current, so a fresh book adds no hourly noise (the summary
+    must never become its own lying green light — the
+    ``_equity_integrity_line`` HEALTHY-suppression precedent):
+      * ``DIVERGED``    — stale AND materially off the live book → ALWAYS
+        surfaced (every benchmark/drawdown/Sharpe/P&L headline is wrong by
+        the divergence — the whole point);
+      * ``STALE_CURVE`` — curve lagging but the book has barely moved →
+        surfaced (the operator should know the loop is behind);
+      * ``FRESH`` / ``NO_DATA`` (and ERROR / any non-verdict) → silent
+        (nothing actionable — the ``_equity_integrity_line``
+        CLEAN/NO_DATA suppression precedent).
+    """
+    try:
+        from .analytics.equity_freshness import build_equity_freshness
+        ef = build_equity_freshness(
+            store.get_portfolio(),
+            store.equity_curve(limit=5000),
+            market.is_market_open(),
+        )
+        if not isinstance(ef, dict):
+            return ""
+        verdict = ef.get("verdict")
+        if verdict not in ("DIVERGED", "STALE_CURVE"):
+            return ""
+        headline = ef.get("headline") or ""
+        if not headline:
+            return ""
+        return (f"⚠️ **EQUITY FRESHNESS** ◈ {verdict}\n> {headline}")
+    except Exception as e:
+        print(f"[reporter] equity-freshness line skipped: {e}")
+        return ""
+
+
 def _heartbeat_line(store) -> str:
     """One-line "is the decision loop actually deciding, or wedged?" for the
     hourly / daily report.
@@ -1052,6 +1118,9 @@ def send_hourly_summary() -> bool:
     ei = _equity_integrity_line(store)
     if ei:
         body += "\n" + ei
+    ef = _equity_freshness_line(store)
+    if ef:
+        body += "\n" + ef
     sx = _session_block(store, 1.0, "1h")
     if sx:
         body += "\n" + sx
@@ -1131,6 +1200,9 @@ def send_daily_close() -> bool:
     ei = _equity_integrity_line(store)
     if ei:
         body += "\n" + ei
+    ef = _equity_freshness_line(store)
+    if ef:
+        body += "\n" + ef
     sx = _session_block(store, 24.0, "24h")
     if sx:
         body += "\n" + sx

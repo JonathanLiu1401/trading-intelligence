@@ -9729,5 +9729,43 @@ def equity_integrity_api():
         return jsonify({"error": str(e), "verdict": "ERROR"}), 500
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# /api/equity-freshness — "is the equity point my headline KPIs are computed
+# from still current, or frozen behind a fresher book under load?"
+#
+# The orthogonal sibling of /api/equity-integrity (within-curve corruption)
+# and /api/mark-integrity (point-in-time position staleness): this compares
+# the live `portfolio` table total against the LATEST recorded `equity_curve`
+# point. Under a NO_DECISION storm the portfolio table re-marks every cycle
+# while the curve lags one whole cycle behind, so /api/benchmark,
+# /api/drawdown, /api/analytics Sharpe and the hourly P/L line (all derived
+# from equity_curve) silently misstate the true account by the divergence.
+# equity_integrity reads CLEAN here (the gap is portfolio-vs-curve, not
+# within recorded points) so it does NOT cover this dimension. The endpoint
+# owns the store reads + the market-open probe; the builder is pure (the
+# runner_heartbeat "network in the caller, builder is pure" split). Pure
+# store reads only — NO network, so fast enough to need no SWR wrap.
+# Advisory / read-only: never gates Opus, adds no caps (AGENTS.md #2/#12 —
+# same contract as equity-integrity / mark-integrity). Pure core:
+# analytics/equity_freshness.py. Placed at EOF for the documented
+# lowest-collision insertion point (concurrent-agent operating model).
+@app.route("/api/equity-freshness")
+def equity_freshness_api():
+    try:
+        from .analytics.equity_freshness import build_equity_freshness
+        from . import market as _mkt
+        store = get_store()
+        now_utc = datetime.now(timezone.utc)
+        out = build_equity_freshness(
+            store.get_portfolio(),
+            store.equity_curve(limit=5000),
+            _mkt.is_market_open(now_utc),
+            now=now_utc,
+        )
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR"}), 500
+
+
 if __name__ == "__main__":
     run()
