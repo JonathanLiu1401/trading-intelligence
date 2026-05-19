@@ -71,6 +71,7 @@ from collectors.market_movers import collect_market_movers
 from collectors.fear_greed_collector import collect_fear_greed
 from collectors.vix_term_structure import collect as collect_vix_ts
 from collectors.dxy_collector import collect as collect_dxy
+from collectors.sector_etf_momentum import collect as collect_sector_etf
 from collectors.cisa_kev_collector import collect_cisa_kev
 from collectors.benzinga_analyst_collector import collect_benzinga_analyst
 from collectors import source_health
@@ -125,6 +126,7 @@ MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active eve
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
 VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
 DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
+SECTOR_ETF_INTERVAL     = 600     # Sector ETF momentum snapshot every 10min
 BENZINGA_INTERVAL       = 300     # Benzinga analyst-ratings RSS sweep every 5min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
@@ -962,6 +964,29 @@ def dxy_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(DXY_INTERVAL)
+
+
+# ── Worker: Sector ETF momentum / rotation — every 10min ────────────────────
+def sector_etf_worker(store: ArticleStore):
+    log.info("[sector_etf_worker] started")
+    bo = Backoff("sector_etf", base=30.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_sector_etf()
+            n = len(articles)
+            try:
+                source_health.record_result("sector_etf", n)
+            except Exception as he:
+                log.warning(f"[sector_etf_worker] source_health error: {he}")
+            _worker_last_ok["sector_etf"] = time.time()
+            if n:
+                log.info(f"[sector_etf] emitted {n} article(s)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[sector_etf_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SECTOR_ETF_INTERVAL)
 
 
 # ── Worker: Wikipedia recent-changes filter — every 10min ───────────────────
@@ -2219,6 +2244,7 @@ def main():
         ("fear_greed",  fear_greed_worker),
         ("vix_ts",      vix_ts_worker),
         ("dxy",         dxy_worker),
+        ("sector_etf",  sector_etf_worker),
         ("wikipedia",   wikipedia_worker),
         ("macro_calendar", macro_calendar_worker),
         ("finra_short",   finra_short_worker),
