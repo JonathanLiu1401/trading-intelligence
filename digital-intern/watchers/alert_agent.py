@@ -52,6 +52,8 @@ Categories: EARNINGS | RATING CHANGE | MACRO SHOCK | SUPPLY CHAIN | REGULATORY |
 
 RECENCY: Each article below carries `age` = elapsed time since publication. Reflect it honestly — an item several hours old is a developing/continued story, NOT one that "just" broke; never imply a multi-hour-old item happened moments ago. {now_utc} is the alert send time, not the event time. If an item is materially old (≳3h), make that explicit in CONTEXT (e.g. "first reported ~Nh ago").
 
+CALIBRATION: An article tagged "[unverified — model-only urgent]" was flagged urgent by the local relevance/urgency model with NO LLM ground-truth label (raw ai_score=0; the displayed score came from ml_score alone). The model demonstrably over-scores recap/SEO/forum/wiki rows ("Why X Stock Is Trading Up Today" templates, "Here What the Street Thinks ..." mill content). This is a lower-confidence call. CONTEXT must explicitly hedge — "model flagged as urgent, no LLM relevance label" — and IMPACT must NOT state magnitude as confirmed (use "WATCH" rather than "BUY"/"SELL" unless other rows in the batch corroborate). Do NOT lead the alert HEADLINE on a lone unverified row when a non-unverified one is present in the batch.
+
 CONTINUITY: If an article carries a `related:` line, a standalone 🚨 BREAKING alert on a related developing story ALREADY fired to this analyst within the last few hours — they have already been told the headline event. Frame THIS alert explicitly as a continuation/update of it: lead the HEADLINE with a development verb (ESCALATES / EXTENDS / WIDENS / FOLLOWS), and in CONTEXT state it follows the earlier alert (e.g. "follows ~Nh-ago alert on <prior event>"). Do NOT present it as the first time this story broke. This is what stops the analyst seeing what reads as a duplicate BREAKING for an event they are already tracking.
 
 BOOK: If an article carries a `book:` line, it names live portfolio/watchlist positions the analyst actually has money in (LITE/LNOK/MUU/DRAM/SNDU/MU/MSFT/AXTI/ORCL/TSEM/QBTS/NVDA). That event is directly actionable for the analyst's open risk: the PORTFOLIO line MUST name the listed held ticker(s) and give a concrete directional implication for each, and weight this article's IMPACT above generic macro colour of similar magnitude. Absence of a `book:` line means the event does not touch the held book — keep PORTFOLIO short (sector read-through only, no invented position).
@@ -733,8 +735,26 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
             score = 0.0
         link = a.get("link") or a.get("url") or ""
         source = (a.get("source") or "unknown").strip() or "unknown"
+        # Verified-vs-model-only calibration tag. ``_llm_vetted`` is set by
+        # ``ArticleStore.get_unalerted_urgent``: True = a real Opus/Sonnet
+        # ai_score, False = the displayed score came from ml_score only (an
+        # UNVERIFIED local-model urgent call; the urgency head demonstrably
+        # over-scores recap-template/forum/wiki rows that the LLM would label
+        # noise). Only an explicit False tags — a row from a non-canonical
+        # caller missing the key (.get → None, ``is False`` → False) is NEVER
+        # tagged, mirroring the briefing's [model] tag discipline (66c349f).
+        # The tag does NOT suppress: this row already passed every gate and is
+        # going to fire; it only augments the prompt context so Sonnet hedges
+        # CONTEXT/IMPACT honestly instead of stating an unverified urgent call
+        # as confirmed magnitude. Read-only — no DB write, no
+        # ai_score/ml_score/score_source/urgency touch, backtest already
+        # filtered upstream by _is_synthetic — invariants intact.
+        verified_tag = (
+            " [unverified — model-only urgent]"
+            if a.get("_llm_vetted") is False else ""
+        )
         block = (
-            f"[score={score:.0f}] {title}\n"
+            f"[score={score:.0f}]{verified_tag} {title}\n"
             f"source: {source}\nurl: {link}"
         )
         # Freshness context: a news analyst reacting to "🚨 BREAKING" must be
