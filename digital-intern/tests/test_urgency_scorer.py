@@ -166,3 +166,70 @@ class TestMalformedResponses:
             "SELECT ai_score FROM articles WHERE id='a'"
         ).fetchone()
         assert row[0] == 0, "empty response must NOT poison the queue"
+
+
+class TestArticleAgeCascade:
+    """``_article_age_hours`` is the gate that feeds both the Sonnet prompt's
+    staleness rule and the hard ``STALE_HOURS``/``STALE_SCORE_CAP`` clamp. A
+    non-empty-but-unparseable ``published`` must NOT short-circuit at 0.0h —
+    that would let a 40h-old wire with a malformed RFC822 date be treated as
+    fresh and bypass the staleness clamp. The two age helpers
+    (``alert_agent._article_age_hours`` and this one) must agree on which
+    timestamp is authoritative — same field-cascade convention."""
+
+    def test_unparseable_published_falls_back_to_first_seen(self):
+        """A garbage ``published`` with a valid 40h-old ``first_seen`` must
+        return ~40h, NOT 0.0 — otherwise the STALE_HOURS=48 cap can't fire
+        on the row's `first_seen`-derived age. Was the live regression: an
+        unparseable date silently degraded the staleness defense to inert."""
+        old_seen = (datetime.now(timezone.utc) - timedelta(hours=40)).isoformat()
+        h = urgency_scorer._article_age_hours(
+            {"published": "garbage-not-a-date", "first_seen": old_seen}
+        )
+        assert h > 30.0, (
+            f"unparseable published short-circuited to {h:.1f}h; "
+            "first_seen fallback was bypassed"
+        )
+
+    def test_unparseable_both_returns_zero_fresh_default(self):
+        """When neither field parses, fall back to 0.0 (fresh) — the
+        staleness cap is a downward bound, never penalises unknown-age."""
+        assert urgency_scorer._article_age_hours(
+            {"published": "x", "first_seen": "y"}
+        ) == 0.0
+        assert urgency_scorer._article_age_hours({}) == 0.0
+
+    def test_published_preferred_over_first_seen(self):
+        """The publish time is authoritative when present and parseable —
+        first_seen is only the fallback."""
+        # published = 1h ago, first_seen = 40h ago. Must return ~1h, not 40.
+        recent_pub = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        old_seen = (datetime.now(timezone.utc) - timedelta(hours=40)).isoformat()
+        h = urgency_scorer._article_age_hours(
+            {"published": recent_pub, "first_seen": old_seen}
+        )
+        assert 0.5 < h < 2.0, f"expected ~1h from published, got {h:.1f}h"
+
+    def test_stale_cap_uses_cascaded_age(self, store):
+        """Integration: a Sonnet score=9.5 on an article with unparseable
+        ``published`` but >STALE_HOURS first_seen must be hard-capped to
+        STALE_SCORE_CAP (below the urgent threshold). Pre-fix bug: the
+        cascade short-circuited at 0.0h and the cap never fired."""
+        # 50h-old first_seen; ``published`` is garbage.
+        old_seen = (datetime.now(timezone.utc) - timedelta(hours=50)).isoformat()
+        _insert(store, id="stale", first_seen=old_seen)
+        articles = [{
+            "_id": "stale", "title": "x", "summary": "",
+            "published": "not-a-date", "first_seen": old_seen,
+        }]
+        with _patched_claude([{"index": 0, "score": 9.5, "reason": "x"}]):
+            n_urgent = urgency_scorer.score_batch(articles, store)
+        row = store.conn.execute(
+            "SELECT ai_score, urgency FROM articles WHERE id='stale'"
+        ).fetchone()
+        assert row[0] == pytest.approx(urgency_scorer.STALE_SCORE_CAP), (
+            f"stale article was not capped — got ai_score={row[0]:.2f}, "
+            f"expected {urgency_scorer.STALE_SCORE_CAP}"
+        )
+        assert row[1] == 0, "capped article must NOT be flagged urgent"
+        assert n_urgent == 0
