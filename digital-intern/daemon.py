@@ -72,6 +72,7 @@ from collectors.fear_greed_collector import collect_fear_greed
 from collectors.vix_term_structure import collect as collect_vix_ts
 from collectors.dxy_collector import collect as collect_dxy
 from collectors.cisa_kev_collector import collect_cisa_kev
+from collectors.benzinga_analyst_collector import collect_benzinga_analyst
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -124,6 +125,7 @@ MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active eve
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
 VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
 DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
+BENZINGA_INTERVAL       = 300     # Benzinga analyst-ratings RSS sweep every 5min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
 EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
@@ -200,6 +202,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "fear_greed": FEAR_GREED_INTERVAL,
     "wikipedia": WIKIPEDIA_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL,
     "cisa_kev": CISA_KEV_INTERVAL,
+    "benzinga_analyst": BENZINGA_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
     "ml_trainer": ML_TRAIN_INTERVAL,
@@ -631,6 +634,27 @@ def sec_edgar_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(SEC_EDGAR_INTERVAL)
+
+
+# ── Worker: Benzinga analyst ratings — every 5min ───────────────────────────
+def benzinga_analyst_worker(store: ArticleStore):
+    log.info("[benzinga_analyst_worker] started")
+    bo = Backoff("benzinga_analyst", base=5.0, cap=300.0)
+    while _running:
+        try:
+            articles = collect_benzinga_analyst()
+            _ingest(store, articles, "benzinga_analyst")
+            try:
+                source_health.record_result("benzinga_analyst", len(articles))
+            except Exception as he:
+                log.warning(f"[benzinga_analyst_worker] source_health error: {he}")
+            _worker_last_ok["benzinga_analyst"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[benzinga_analyst_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(BENZINGA_INTERVAL)
 
 
 # ── Worker: Google News per-ticker — every 5min ─────────────────────────────
@@ -2200,6 +2224,7 @@ def main():
         ("finra_short",   finra_short_worker),
         ("congress_trades", congress_trades_worker),
         ("cisa_kev",    cisa_kev_worker),
+        ("benzinga_analyst", benzinga_analyst_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
