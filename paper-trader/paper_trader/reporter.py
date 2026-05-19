@@ -1120,15 +1120,47 @@ def _concentration_line(store) -> str:
             ptype = (p.get("type") or "").lower()
             mult = 100.0 if ptype in ("call", "put") else 1.0
             sized.append({**p, "market_value": cur * qty * mult})
-        co = build_correlation(sized)
+        # ``price_history`` is a REQUIRED positional arg on ``build_correlation``
+        # (the endpoint passes a real {ticker: [closes...]} dict). The
+        # Discord-path discipline forbids the yfinance hop, so pass {} — the
+        # builder degrades to ``state=INSUFFICIENT`` (verdict=None) but
+        # ``top_weight_pct`` / ``top_weight_ticker`` are still computed from
+        # ``market_value`` regardless (the ``risk_mirror`` weight-based
+        # fallback precedent). So the SINGLE_NAME_RISK decision here keys off
+        # the WEIGHT field directly — same threshold ``DOMINANT_WEIGHT`` the
+        # builder uses for its OK-state verdict, so a future caller that
+        # supplies real history would land on the same call site.
+        co = build_correlation(sized, {})
         if not isinstance(co, dict):
             return ""
-        if co.get("verdict") != "SINGLE_NAME_RISK":
+        from .analytics.correlation import DOMINANT_WEIGHT
+        top_pct = co.get("top_weight_pct")
+        top_tk = co.get("top_weight_ticker")
+        try:
+            top_pct_f = float(top_pct) if top_pct is not None else None
+        except (TypeError, ValueError):
+            top_pct_f = None
+        if (top_pct_f is None or top_tk is None
+                or top_pct_f < DOMINANT_WEIGHT * 100.0):
             return ""
-        headline = co.get("headline") or ""
-        if not headline:
-            return ""
-        return f"⚠️ **CONCENTRATION** ◈ SINGLE_NAME_RISK\n> {headline}"
+        n = int(co.get("n_stock_positions") or 0)
+        eff = co.get("effective_positions_naive")
+        # If the OK-state path is reached (real price_history supplied at a
+        # future call site), use the builder's own headline verbatim — single
+        # source of truth. Otherwise (INSUFFICIENT, the live no-history path)
+        # synthesise a one-line description from the same fields the OK
+        # headline reads from, so the Discord block is meaningful without
+        # the buried "verdict withheld" sentence.
+        hl = co.get("headline") or ""
+        if co.get("verdict") == "SINGLE_NAME_RISK" and hl:
+            body = hl
+        else:
+            eff_clause = ""
+            if isinstance(eff, (int, float)):
+                eff_clause = f" — {eff:.1f} effective name(s) by weight"
+            body = (f"SINGLE_NAME_RISK — {top_tk} is {top_pct_f:.0f}% of a "
+                    f"{n}-name stock book{eff_clause}.")
+        return f"⚠️ **CONCENTRATION** ◈ SINGLE_NAME_RISK\n> {body}"
     except Exception as e:
         print(f"[reporter] concentration line skipped: {e}")
         return ""
