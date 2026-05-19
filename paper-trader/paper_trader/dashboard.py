@@ -10829,6 +10829,37 @@ def decision_weekday_api():
                         "buckets": []}), 500
 
 
+@app.route("/api/decision-daily")
+def decision_daily_api():
+    """Per-calendar-day NO_DECISION timeseries with a trend verdict.
+
+    Orthogonal to /api/decision-clock (hour-of-day) and
+    /api/decision-weekday (day-of-week): those flag *which recurring
+    slot* is starved; this answers **is it getting better or worse
+    day-over-day?**. Split-halves trend on the NO_DECISION rate emits
+    TREND_WORSENING / TREND_IMPROVING / STABLE / INSUFFICIENT_DATA.
+    Same NO_DECISION sub-classification precedence
+    (quota → host → empty → parse → other) as the other decision-*
+    surfaces so the bucket definitions cannot drift.
+
+    Query params:
+        days: window in calendar days. Clamped 1..60 (default 14)."""
+    try:
+        from .analytics.decision_daily import build_decision_daily
+        try:
+            days = int(request.args.get("days", 14))
+        except Exception:
+            days = 14
+        decisions = get_store().recent_decisions(limit=20000)
+        result = build_decision_daily(
+            decisions, now=datetime.now(timezone.utc), days=days,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR",
+                        "buckets": []}), 500
+
+
 @app.route("/api/quota-burnrate")
 def quota_burnrate_api():
     """Rolling-window quota-exhaustion burn-rate.
