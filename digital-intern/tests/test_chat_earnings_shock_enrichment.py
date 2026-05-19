@@ -181,7 +181,17 @@ def test_insufficient_history_event_surfaces_but_sigma_withheld():
     be reported as *withheld* — never fabricated. Mirrors the builder's
     own per-row honesty contract (and the baseline_compare INSUFFICIENT_DATA
     chat-silence precedent for verdicts)."""
-    rep = _rep(events=[_insuff_event()])
+    # The default _rep() headline talks about an OK NVDA event (σ ±4.2%),
+    # which would be a builder-side SSOT mismatch for a payload carrying only
+    # an insufficient-history MU event — override it to the matching insuff
+    # headline so this test gates the per-row "no fabricated σ" behaviour
+    # only, not a fixture mismatch on the SSOT headline line.
+    rep = _rep(
+        events=[_insuff_event()],
+        headline="Pre-earnings shock (1 held name ≤7d): MU σ withheld "
+                 "(1 historical print, need ≥3); event timing $250.00 "
+                 "(25.0% of book).",
+    )
     out = _earnings_shock_chat_lines(rep)
     blob = "\n".join(out)
     # Event timing + exposure surfaces (the always-visible parts).
