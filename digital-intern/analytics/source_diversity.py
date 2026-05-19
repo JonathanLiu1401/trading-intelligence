@@ -24,6 +24,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from storage.article_store import _LIVE_ONLY_CLAUSE
+
 DB_PATH = Path(__file__).resolve().parents[1] / "data" / "articles.db"
 OUT_PATH = Path("/home/zeph/logs/source_diversity.json")
 WINDOW_HOURS = 4
@@ -74,10 +76,16 @@ def _extract_tickers(title: str) -> list[str]:
 def main() -> int:
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=20)
     conn.execute("PRAGMA query_only=ON")
+    # Use the canonical `_LIVE_ONLY_CLAUSE` rather than a partial filter.
+    # A `source NOT LIKE 'backtest_run_%'`-only form lets `opus_annotation*`
+    # rows leak through, inflating `distinct_sources` and per-ticker
+    # mention counts with synthetic training labels. Mirrors the
+    # `publish_lag_audit` / `stale_source_alerter` / `ticker_concentration`
+    # pattern; pinned by `tests/test_source_diversity_backtest_isolation.py`.
     rows = conn.execute(
-        "SELECT first_seen, source, title FROM articles "
-        "WHERE source NOT LIKE 'backtest_run_%' "
-        "ORDER BY first_seen DESC LIMIT ?",
+        f"SELECT first_seen, source, title FROM articles "
+        f"WHERE {_LIVE_ONLY_CLAUSE} "
+        f"ORDER BY first_seen DESC LIMIT ?",
         (FETCH_LIMIT,),
     ).fetchall()
     conn.close()
