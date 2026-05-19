@@ -270,6 +270,145 @@ class TestFilledOnlyTrainingIntegrity:
         assert day0_outs[0]["action"] == "BUY"
 
 
+# ─────────────────────── walk-back collision in outcomes ─────────────────
+#
+# Lock the fix for the fabricated-flat-outcome bug: when PriceCache.price_on
+# falls back to a prior close for BOTH sim_d and end_d (a thin/foreign-calendar
+# ticker whose actual last trade is before the requested dates), returns_pct
+# returns 0.0 by construction. That fake 0% used to leak into
+# decision_outcomes.jsonl and silently poisoned the DecisionScorer training set
+# with bias-correlated flat labels. The fix uses PriceCache.resolved_close_date
+# to refuse a collision instead.
+
+class TestWalkBackCollisionDoesNotFabricateZero:
+    def _build_collision_cache(self):
+        """Synthetic cache where SPY has every weekday, but `THIN` has data
+        only on one date — so any sim_d / end_d pair in the surrounding window
+        forces price_on to walk back to the SAME prior close.
+        """
+        from paper_trader.backtest import PriceCache
+
+        cache = PriceCache.__new__(PriceCache)
+        cache.tickers = ["SPY", "THIN"]
+        days = []
+        d = date(2025, 1, 6)
+        while d <= date(2025, 2, 14):
+            if d.weekday() < 5:
+                days.append(d)
+            d += timedelta(days=1)
+        cache.start = days[0]
+        cache.end = days[-1]
+        cache.prices = {
+            "SPY": {dd.isoformat(): 100.0 + i for i, dd in enumerate(days)},
+            # THIN's only trade is Jan 13. sim_d=Jan 14 and end_d=Jan 16 both
+            # have no exact match but walk back finds Jan 13 → collision.
+            "THIN": {date(2025, 1, 13).isoformat(): 50.0},
+        }
+        cache.trading_days = days
+        return cache
+
+    def test_resolved_close_date_returns_the_walkback_target(self):
+        cache = self._build_collision_cache()
+        # Exact match passes through unchanged.
+        assert cache.resolved_close_date("THIN", date(2025, 1, 13)) == \
+            date(2025, 1, 13)
+        # Both sim_d and end_d resolve to the SAME prior close — collision.
+        assert cache.resolved_close_date("THIN", date(2025, 1, 14)) == \
+            date(2025, 1, 13)
+        assert cache.resolved_close_date("THIN", date(2025, 1, 16)) == \
+            date(2025, 1, 13)
+        # Outside the 7-day walk-back window → None.
+        assert cache.resolved_close_date("THIN", date(2025, 1, 23)) is None
+        # Unknown ticker → None, not crash.
+        assert cache.resolved_close_date("ZZZ", date(2025, 1, 14)) is None
+
+    def test_collision_outcome_is_dropped(self, tmp_path):
+        """A BUY of THIN on day_idx=5: sim_d and end_d both walk back to
+        THIN's only close (Jan 13) → returns_pct = 0.0% fabricated. The fix
+        skips the row instead of writing a fake 0% outcome.
+        """
+        eng = _make_engine_with_runs(tmp_path, n_runs=1)
+        # Override prices with our collision-prone cache.
+        eng.prices = self._build_collision_cache()
+        # day index 5 puts sim_d = Jan 13 (exact match for THIN) and end_d =
+        # idx+5 (Jan 21) which has NO THIN exact match. Walk-back from Jan 21
+        # goes to Jan 14 at best — beyond Jan 13 — so end_d resolves to None,
+        # and the row is dropped via the None check (existing behaviour).
+        # To exercise the COLLISION branch specifically, pick a sim_d AFTER
+        # Jan 13 so its walk-back lands on Jan 13, and choose an end_d whose
+        # walk-back also lands on Jan 13.
+        thin_only = date(2025, 1, 13)
+        # sim_d = Jan 14 (walk back to Jan 13), idx within trading_days.
+        sim_d = date(2025, 1, 14)
+        sim_idx = eng.prices.trading_days.index(sim_d)
+        # We need end_d = trading_days[sim_idx + 5] to also walk back to Jan 13.
+        # trading_days[sim_idx+5] = sim_d + 5 weekdays = Jan 21 (Tue). Walk-back
+        # from Jan 21: 7 days back → Jan 14. Doesn't reach Jan 13. To force a
+        # collision, override trading_days to make end_d close enough.
+        # Replace with a tighter calendar where 5 SPY days only span 5 calendar
+        # days (e.g., add Saturdays to SPY series, fake but valid for the test).
+        from paper_trader.backtest import PriceCache  # noqa: F401
+        cache = eng.prices
+        # Make SPY trade every day (incl. weekend) so 5 trading days from
+        # sim_d=Jan 14 ends on Jan 19 — within walk-back range of Jan 13.
+        cache.prices["SPY"] = {
+            (date(2025, 1, 6) + timedelta(days=i)).isoformat(): 100.0 + i
+            for i in range(40)
+        }
+        cache.trading_days = [
+            date(2025, 1, 6) + timedelta(days=i) for i in range(40)
+        ]
+        # sim_d=Jan 14 walk-back → Jan 13. end_d = Jan 14 + 5 = Jan 19.
+        # Jan 19 walk-back → Jan 19 - 6 = Jan 13. Both resolve to Jan 13.
+        sim_d = date(2025, 1, 14)
+        assert cache.resolved_close_date("THIN", sim_d) == thin_only
+        end_d = date(2025, 1, 19)
+        assert cache.resolved_close_date("THIN", end_d) == thin_only
+
+        # Insert a FILLED BUY of THIN on sim_d.
+        eng.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "status, reasoning) VALUES (?, ?, ?, ?, ?, ?)",
+            (1, sim_d.isoformat(), "BUY", "THIN", "FILLED",
+             "ML+quant: THIN score=2.00 regime=bull news_count=0 news_urg=0.0"),
+        )
+        eng.store.conn.commit()
+        runs = [BacktestRun(run_id=1, seed=1, start_date="2025-01-06",
+                             end_date="2025-02-14")]
+        outs = rcb._compute_decision_outcomes(eng, runs)
+        thin_outs = [o for o in outs if o["ticker"] == "THIN"
+                     and o["sim_date"] == sim_d.isoformat()]
+        # Pre-fix: a fabricated 0.0% row would appear here. Post-fix: dropped.
+        assert thin_outs == [], (
+            "walk-back collision must NOT produce a 0.0% outcome — "
+            f"got {thin_outs!r}"
+        )
+
+    def test_genuine_no_walkback_outcome_still_recorded(self, tmp_path,
+                                                       synthetic_prices):
+        """Sanity check: when there is NO collision (NVDA has data on every
+        trading day in the synthetic_prices fixture), a real forward return
+        IS still recorded. The fix must not regress the common case.
+        """
+        eng = _make_engine_with_runs(tmp_path, n_runs=1)
+        eng.prices = synthetic_prices
+        sim_d = synthetic_prices.trading_days[5].isoformat()
+        eng.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "status, reasoning) VALUES (?, ?, ?, ?, ?, ?)",
+            (1, sim_d, "BUY", "NVDA", "FILLED",
+             "ML+quant: NVDA score=2.00 regime=bull news_count=0 news_urg=0.0"),
+        )
+        eng.store.conn.commit()
+        runs = [BacktestRun(run_id=1, seed=1, start_date="2025-01-01",
+                             end_date="2025-12-31")]
+        outs = rcb._compute_decision_outcomes(eng, runs)
+        nvda = [o for o in outs if o["sim_date"] == sim_d and o["ticker"] == "NVDA"]
+        assert len(nvda) == 1
+        # NVDA: 100, 102, 104, ... — day 5 = 110, day 10 = 120 → return 9.09%
+        assert nvda[0]["forward_return_5d"] == pytest.approx(9.0909, abs=1e-3)
+
+
 # ─────────────────────── _parse_published_date ───────────────────────────
 
 class TestParsePublishedDate:

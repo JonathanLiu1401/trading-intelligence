@@ -433,8 +433,9 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
 
     def _fwd_ret_h(ticker: str, sim_d: date, idx: int, h: int) -> float | None:
         """Forward return over `h` trading days from `sim_d` (idx in
-        trading_days), or None when the window runs past cached price history
-        or either endpoint price is missing.
+        trading_days), or None when the window runs past cached price history,
+        either endpoint price is missing, or both walked back to the same
+        prior close (a fabricated flat outcome — see `_walk_back_collides`).
 
         Additive multi-horizon instrumentation (feature, 2026-05-18). The
         DecisionScorer trains ONLY on `forward_return_5d` (unchanged); the
@@ -451,8 +452,9 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
         if ti < 0 or ti >= len(trading_days):
             return None
         ed = trading_days[ti]
-        if (engine.prices.price_on(ticker, sim_d) is None
-                or engine.prices.price_on(ticker, ed) is None):
+        sim_res = engine.prices.resolved_close_date(ticker, sim_d)
+        end_res = engine.prices.resolved_close_date(ticker, ed)
+        if sim_res is None or end_res is None or sim_res == end_res:
             return None
         return round(engine.prices.returns_pct(ticker, sim_d, ed), 4)
 
@@ -504,9 +506,15 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
                 continue
             end_d = trading_days[target_idx]
 
-            # Both price lookups must hit real cached data for this ticker.
-            if (engine.prices.price_on(ticker, sim_d) is None
-                    or engine.prices.price_on(ticker, end_d) is None):
+            # Both price lookups must hit real cached data for this ticker —
+            # AND must resolve to DIFFERENT actual close dates. A walk-back
+            # collision (both endpoints fall back to the same prior close on a
+            # thin/foreign-calendar ticker) silently produces a fabricated 0%
+            # outcome that poisons the DecisionScorer training set; see
+            # PriceCache.resolved_close_date for the full honesty rationale.
+            sim_res = engine.prices.resolved_close_date(ticker, sim_d)
+            end_res = engine.prices.resolved_close_date(ticker, end_d)
+            if sim_res is None or end_res is None or sim_res == end_res:
                 continue
             fwd_ret = engine.prices.returns_pct(ticker, sim_d, end_d)
 

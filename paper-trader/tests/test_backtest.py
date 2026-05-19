@@ -598,6 +598,118 @@ class TestMlDecide:
 
 # ─────────────────────── BacktestStore isolation ───────────────────────────
 
+class TestLoadLocalArticlesScoreFallback:
+    """Regression lock for the score-fallback conflation bug.
+
+    `_load_local_articles` originally used `ai_score or kw_score or 0`. That
+    `or`-chain falls through on EITHER None (truly unscored) OR 0.0 (a
+    legitimate ArticleNet verdict that the article carries no signal). The
+    silent promotion of "scored 0.0" content to `kw_score` (typically 2.5
+    when score_article finds no bull/bear keyword hits) biased the backtest's
+    per-ticker sentiment toward articles the live ML had explicitly flagged
+    as noise. The fix uses explicit `is not None` so legitimate-zero stays 0.
+    """
+
+    def _build_engine_with_db(self, tmp_path, monkeypatch, rows):
+        """Create a tiny articles.db with the rows we want and run
+        `_load_local_articles` against it via a no-init BacktestEngine.
+        """
+        import sqlite3
+        import paper_trader.backtest as bt
+
+        db = tmp_path / "articles.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("""
+            CREATE TABLE articles (
+                id TEXT PRIMARY KEY,
+                url TEXT,
+                title TEXT,
+                source TEXT,
+                published TEXT,
+                kw_score REAL,
+                ai_score REAL,
+                urgency REAL,
+                first_seen TEXT,
+                full_text BLOB
+            )
+        """)
+        for r in rows:
+            conn.execute(
+                "INSERT INTO articles (id, url, title, source, published, "
+                "kw_score, ai_score, urgency, first_seen) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (r["id"], r.get("url"), r["title"], r.get("source", "x"),
+                 r["published"], r.get("kw_score"), r.get("ai_score"),
+                 r.get("urgency", 0), r.get("first_seen", r["published"])),
+            )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(bt, "LOCAL_ARTICLES_DB", db)
+        engine = bt.BacktestEngine.__new__(bt.BacktestEngine)
+        engine.start = date(2025, 1, 1)
+        engine.end = date(2025, 12, 31)
+        # _load_local_articles can also merge SEC cache. Bypass that by
+        # pointing at an empty dir.
+        engine.av_news = None  # unused for this code path
+        # _merge_sec_cache reads bt.CACHE_DIR / "sec_edgar"; the conftest
+        # autouse fixture already pointed CACHE_DIR at an empty tmp dir.
+        result = engine._load_local_articles()
+        return result
+
+    def test_legit_zero_ai_score_is_preserved(self, tmp_path, monkeypatch):
+        """An article with ai_score=0.0 must NOT inherit kw_score=2.5."""
+        loaded = self._build_engine_with_db(tmp_path, monkeypatch, rows=[
+            {"id": "a1", "title": "Market noise headline",
+             "published": "2025-06-15", "first_seen": "2025-06-15",
+             "ai_score": 0.0, "kw_score": 2.5},
+        ])
+        day_arts = loaded.get("2025-06-15", [])
+        assert len(day_arts) == 1
+        assert day_arts[0]["score"] == 0.0, (
+            f"ai_score=0.0 must survive intact, got {day_arts[0]['score']}"
+        )
+
+    def test_null_ai_score_falls_back_to_kw_score(self, tmp_path, monkeypatch):
+        """An unscored article (ai_score IS NULL) correctly uses kw_score."""
+        loaded = self._build_engine_with_db(tmp_path, monkeypatch, rows=[
+            {"id": "a2", "title": "Unscored headline",
+             "published": "2025-06-16", "first_seen": "2025-06-16",
+             "ai_score": None, "kw_score": 3.5},
+        ])
+        day_arts = loaded.get("2025-06-16", [])
+        assert len(day_arts) == 1
+        assert day_arts[0]["score"] == 3.5
+
+    def test_both_null_yields_zero(self, tmp_path, monkeypatch):
+        """If both ai_score and kw_score are NULL, the row is preserved with
+        score=0 (not crashed) — score 0 means "no signal", not "missing"."""
+        loaded = self._build_engine_with_db(tmp_path, monkeypatch, rows=[
+            {"id": "a3", "title": "Both null headline",
+             "published": "2025-06-17", "first_seen": "2025-06-17",
+             "ai_score": None, "kw_score": None},
+        ])
+        day_arts = loaded.get("2025-06-17", [])
+        assert len(day_arts) == 1
+        assert day_arts[0]["score"] == 0.0
+
+    def test_high_kw_score_beats_low_ai_score(self, tmp_path, monkeypatch):
+        """An article with a real low ai_score (0.5) must NOT be promoted to
+        kw_score=4.0 just because ai_score is below 1.0 — the prior bug
+        treated only None as missing, but `0.5 or 4.0` returns 0.5 correctly.
+        This regression test pins the boundary against future "looks
+        sensible" rewrites.
+        """
+        loaded = self._build_engine_with_db(tmp_path, monkeypatch, rows=[
+            {"id": "a4", "title": "Low but real ai_score",
+             "published": "2025-06-18", "first_seen": "2025-06-18",
+             "ai_score": 0.5, "kw_score": 4.0},
+        ])
+        day_arts = loaded.get("2025-06-18", [])
+        assert len(day_arts) == 1
+        assert day_arts[0]["score"] == 0.5
+
+
 class TestBacktestStoreIsolation:
     """Regression guard: BacktestStore() must resolve BACKTEST_DB at call time,
     not capture it as an import-time default parameter.
