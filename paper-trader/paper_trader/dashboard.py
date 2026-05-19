@@ -8166,6 +8166,49 @@ def earnings_risk_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/event-readiness")
+def event_readiness_api():
+    """Will the live trader actually be able to react before the next print?
+
+    /api/earnings-risk says NVDA reports in 16h; /api/decision-drought says
+    the bot is in a 4.7h PARALYSIS streak; /api/empty-claude-rate says
+    Claude returned empty on 48% of recent cycles. Each is half the picture
+    — none of them answers the operator's actual pre-print question: given
+    those three facts together, is the bot statistically going to land a
+    usable decision before the event?
+
+    This composes them into a single readiness verdict per held imminent
+    print (READY / DEGRADED / BLIND), plus expected_decisions_before_event
+    (cycles/hr × hours-until × (1 − empty-rate)) and a one-line operator-
+    actionable hint. Pulls the earnings event list from :8080/api/earnings
+    exactly as /api/earnings-risk does (single source of truth); the builder
+    itself is pure (``analytics/event_readiness.py``)."""
+    import json as _json
+    import urllib.request as _urllib
+
+    try:
+        from .analytics.event_readiness import build_event_readiness
+        store = get_store()
+        positions = store.open_positions()
+        decisions = store.recent_decisions(limit=2000)
+
+        events: list[dict] = []
+        source_ok = True
+        try:
+            with _urllib.urlopen(
+                "http://127.0.0.1:8080/api/earnings", timeout=4) as resp:
+                snap = _json.loads(resp.read().decode("utf-8"))
+            events = snap.get("events") or []
+        except Exception:
+            source_ok = False
+
+        rep = build_event_readiness(positions, decisions, events)
+        rep["source_ok"] = source_ok
+        return jsonify(rep)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/event-calendar")
 def event_calendar_api():
     """The exact upcoming-earnings awareness block the live trader now sees
