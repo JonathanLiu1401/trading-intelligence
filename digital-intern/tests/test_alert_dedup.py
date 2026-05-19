@@ -55,6 +55,107 @@ class TestSignatureNormalization:
         assert _signature("   ") == ""
 
 
+class TestSignatureFrontAttribution:
+    """Regression: ``_signature`` used to do ``_SOURCE_SEP.split(head)[0]``,
+    which silently collapsed every front-attributed copy of a wire headline to
+    just the publisher tag.
+
+    Live evidence (2026-05-19): one canonical NVDA earnings-preview story fired
+    THREE BREAKING pushes within 2.5h (03:21 ``GN: Nvidia``, 05:16
+    ``GDELT/markets.financialcontent``, 05:42 ``GN: Nvidia``) — they SHOULD
+    have been cross-cycle-suppressed by ``alert_recency`` (TTL=6h), but the
+    front-attributed copy collapsed to ``'financialcontent'`` and never
+    matched the canonical ``'nvidia nvda reports earnings tomorrow ...'``
+    signature. Every downstream gate that keys on this signature was bypassed
+    on every front-attributed copy:
+
+      * ``alert_recency.partition_already_alerted`` (cross-cycle dedup)
+      * ``dedupe_urgent`` (in-batch dedup) — for same-batch front-attrib copies
+      * ``analysis.claude_analyst._signature`` → briefing's ``[ALERTED]`` tag
+
+    Fix: pick the LONGEST split part by word count (publisher tag is 1-2
+    tokens, real headline is more). The convention of trailing attribution
+    ("Micron shares ... - Reuters") is unchanged — the leading headline is
+    still longer than the trailing publisher — so the existing
+    ``test_bare_and_attributed_match`` invariant holds, locked below by
+    ``test_canonical_trailing_attribution_unchanged``.
+    """
+
+    def test_front_attributed_matches_bare(self):
+        # The live failure that drove this fix: three BREAKING fires on one
+        # event in 2.5h — without this fix only #2 would have been suppressed.
+        canonical = _signature(
+            "Nvidia (NVDA) reports earnings tomorrow: What to expect"
+        )
+        # Should be a real multi-token signature, NOT collapsed to a single
+        # publisher tag.
+        assert len(canonical.split()) >= 5, (
+            f"canonical signature too short: {canonical!r}"
+        )
+        front_attributed = [
+            "FinancialContent - Nvidia ( NVDA ) Reports Earnings Tomorrow : What To Expect",
+            "GDELT - Nvidia (NVDA) reports earnings tomorrow: What to expect",
+        ]
+        for h in front_attributed:
+            assert _signature(h) == canonical, (
+                f"front-attributed copy did not collapse to canonical: {h!r} "
+                f"-> {_signature(h)!r}"
+            )
+
+    def test_front_attribution_never_collapses_to_publisher_tag(self):
+        # The specific bug fingerprint: a front-attribution split would
+        # produce ``parts[0] = 'FinancialContent'`` and the signature would
+        # become a single token. That is what bypassed cross-cycle dedup.
+        for h, must_not_be in (
+            ("FinancialContent - Nvidia (NVDA) Reports Earnings Tomorrow",
+             "financialcontent"),
+            ("Zacks - MU beats Q3 estimates handily", "zacks"),
+            ("Reuters - Fed surprises with 50bp cut", "reuters"),
+            ("Motley Fool - Why I'm bullish on Micron", "motley fool"),
+        ):
+            sig = _signature(h)
+            assert sig != must_not_be, (
+                f"signature collapsed to publisher tag {must_not_be!r} for {h!r}"
+            )
+            # And the canonical (headline-only) form must match.
+            canonical = h.split(" - ", 1)[1]
+            assert _signature(canonical) == sig
+
+    def test_canonical_trailing_attribution_unchanged(self):
+        """The original convention ("Headline - Publisher") must still match
+        the bare form (this is the original docstring guarantee and the
+        existing ``test_bare_and_attributed_match`` invariant — the fix MUST
+        NOT regress it)."""
+        bare = _signature("Micron shares surge after Q3 earnings blowout")
+        assert _signature(
+            "Micron shares surge after Q3 earnings blowout - Reuters"
+        ) == bare
+        assert _signature(
+            "Micron shares surge after Q3 earnings blowout - Bloomberg"
+        ) == bare
+
+    def test_three_part_publisher_sandwich(self):
+        """Multi-publisher attribution at both ends: pick the meaningful
+        middle. "Reuters - MU beats Q3 - Bloomberg" must collapse to the
+        same signature as the bare "MU beats Q3"."""
+        sig = _signature("Reuters - MU beats Q3 estimates - Bloomberg")
+        assert sig == _signature("MU beats Q3 estimates")
+
+    def test_no_separator_unchanged(self):
+        """Single-part headlines (no `_SOURCE_SEP` match) must be byte-
+        identical to before — covers every test in
+        ``test_real_allcaps_word_not_eaten`` indirectly."""
+        for h, expected in (
+            ("NVIDIA earnings crush estimates again",
+             "nvidia earnings crush estimates again"),
+            ("Fed holds rates steady amid inflation concerns",
+             "fed holds rates steady amid inflation concerns"),
+            ("AMD and TSMC expand foundry pact",
+             "amd and tsmc expand foundry pact"),
+        ):
+            assert _signature(h) == expected
+
+
 class TestDedupeMerge:
     def test_wire_revisions_merge_into_best_representative(self):
         arts = [
