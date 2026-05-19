@@ -10829,5 +10829,56 @@ def decision_weekday_api():
                         "buckets": []}), 500
 
 
+@app.route("/api/quota-burnrate")
+def quota_burnrate_api():
+    """Rolling-window quota-exhaustion burn-rate.
+
+    Orthogonal to /api/decision-clock (hour-of-day) and
+    /api/decision-weekday (day-of-week): exposes whether quota exhaustion
+    is the *dominant* NO_DECISION cause **right now** across short
+    rolling windows (6h / 24h / 72h by default). Directly addresses the
+    documented historical misdiagnosis where a NO_DECISION storm was
+    blamed on the JSON parser while the actual cause was Claude
+    org-usage-limit exhaustion — a QUOTA_DOMINANT verdict here points
+    the operator at the upgrade-plan/concurrency lever instead of the
+    parser. Same NO_DECISION sub-classification precedence as the other
+    decision-* surfaces so bucket definitions cannot drift.
+
+    Query params:
+        windows: comma-separated hour values (e.g. "1,6,24"). Clamped to
+            positive ints, capped at 30 days, max 8 windows."""
+    try:
+        from .analytics.quota_burnrate import (
+            build_quota_burnrate, DEFAULT_WINDOWS_HOURS,
+        )
+        raw = request.args.get("windows")
+        windows_hours: tuple[int, ...] = DEFAULT_WINDOWS_HOURS
+        if raw:
+            parsed: list[int] = []
+            for part in raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    v = int(part)
+                except ValueError:
+                    continue
+                if v <= 0:
+                    continue
+                parsed.append(min(v, 24 * 30))
+                if len(parsed) >= 8:
+                    break
+            if parsed:
+                windows_hours = tuple(parsed)
+        decisions = get_store().recent_decisions(limit=20000)
+        result = build_quota_burnrate(
+            decisions, now=datetime.now(timezone.utc),
+            windows_hours=windows_hours,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "windows": []}), 500
+
+
 if __name__ == "__main__":
     run()
