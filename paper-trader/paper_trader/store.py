@@ -75,6 +75,31 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _hold_duration(opened_at: str | None, closed_at: str | None
+                   ) -> tuple[int | None, float | None]:
+    """Parse an opened_at / closed_at pair into ``(hold_seconds, hold_days)``.
+
+    Returns ``(None, None)`` when either side is missing or unparseable; a
+    negative span (closed_at strictly before opened_at — non-physical, would
+    only happen on a wall-clock step-back) clamps to zero so the hold-time
+    field never renders negative. ``hold_days`` is rounded to 4 places (the
+    round_trips.py precedent) so callers can compute hourly rates without
+    surprise float precision; ``hold_seconds`` stays an int for the test path
+    that wants exact arithmetic on the per-second grain.
+    """
+    if not opened_at or not closed_at:
+        return None, None
+    try:
+        op = datetime.fromisoformat(str(opened_at).replace("Z", "+00:00"))
+        cl = datetime.fromisoformat(str(closed_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None, None
+    secs = (cl - op).total_seconds()
+    if secs < 0:
+        secs = 0.0
+    return int(secs), round(secs / 86400.0, 4)
+
+
 def _connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
@@ -373,6 +398,18 @@ class Store:
                 d["realized_pl_pct"] = (round(realized / cost * 100.0, 2)
                                         if cost > 1e-9 else None)
                 d["n_trades"] = n_trades
+                # Hold duration. Both endpoints are ISO-8601 UTC; parse what
+                # we can and surface a fractional-day figure for downstream %
+                # framing (compounding) and a coarser hold_seconds for tests
+                # that want exact integer arithmetic. ``None`` on either
+                # unparseable side — the field is purely additive, callers
+                # already tolerate missing keys (the realized_pl_pct
+                # precedent).
+                hold_seconds, hold_days = _hold_duration(
+                    d.get("opened_at"), d.get("closed_at")
+                )
+                d["hold_seconds"] = hold_seconds
+                d["hold_days"] = hold_days
                 out.append(d)
             return out
 

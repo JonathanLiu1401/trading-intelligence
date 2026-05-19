@@ -387,6 +387,49 @@ class TestClosedPositionsRealizedPL:
         assert c["realized_pl"] == 160.0
         assert c["proceeds"] == 1160.0
 
+    def test_hold_duration_fields_present(self, fresh_store):
+        """closed_positions surfaces a hold_days / hold_seconds pair so a
+        trader can answer 'I made $X in Y days' without re-parsing
+        timestamps. Both are computed from the lot's opened_at/closed_at
+        which the store maintains for every position."""
+        fresh_store.record_trade("AMD", "BUY", qty=1, price=100.0, reason="")
+        fresh_store.upsert_position("AMD", "stock", qty=1, avg_cost=100.0)
+        fresh_store.record_trade("AMD", "SELL", qty=1, price=110.0, reason="")
+        fresh_store.upsert_position("AMD", "stock", qty=-1, avg_cost=110.0)
+        c = fresh_store.closed_positions()[0]
+        # Both fields exist on the row (the additive contract).
+        assert "hold_days" in c and "hold_seconds" in c
+        # The lot was opened and closed in the same test method, so hold time
+        # is small but defined and non-negative.
+        assert c["hold_seconds"] is not None and c["hold_seconds"] >= 0
+        assert c["hold_days"] is not None and c["hold_days"] >= 0
+
+    def test_hold_duration_helper_round_trip(self):
+        """``_hold_duration`` is pure; pin its arithmetic deterministically
+        so the API-shape test above doesn't have to depend on wall clock."""
+        from paper_trader.store import _hold_duration
+        secs, days = _hold_duration(
+            "2026-05-19T10:00:00+00:00", "2026-05-22T22:00:00+00:00"
+        )
+        # 3d 12h = 302_400s = 3.5 days exactly.
+        assert secs == 302_400
+        assert days == 3.5
+
+    def test_hold_duration_helper_handles_bad_input(self):
+        """Unparseable / missing endpoints → ``(None, None)``; closed_at
+        strictly before opened_at (a non-physical wall-clock step-back) →
+        clamps to zero, never returns a negative figure."""
+        from paper_trader.store import _hold_duration
+        assert _hold_duration(None, "2026-05-19T10:00:00+00:00") == (None, None)
+        assert _hold_duration("2026-05-19T10:00:00+00:00", None) == (None, None)
+        assert _hold_duration("garbage", "garbage") == (None, None)
+        # Reverse order (clock step-back).
+        secs, days = _hold_duration(
+            "2026-05-22T22:00:00+00:00", "2026-05-19T10:00:00+00:00"
+        )
+        assert secs == 0
+        assert days == 0.0
+
     def test_summary_win_rate_via_endpoint_shape(self, fresh_store):
         """closed_positions returns newest-closed first — the same order the
         endpoint's summary section relies on for win/loss bucketing."""
