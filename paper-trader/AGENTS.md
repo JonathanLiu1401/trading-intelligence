@@ -7914,3 +7914,174 @@ additions).
   none gate Opus, none add silent caps. The hold-age token is the
   same surfacing trajectory `stale_mark` / `_pos_pct_weight` /
   `_session_block` followed.
+
+
+### 2026-05-19 review pass — ML+backtest hybrid (Agent 2): SECTOR_MAP coverage fix + live diagnostics
+
+#### Phase 1 (commit: skipped) — no concrete code bugs to fix
+
+After a focused audit of `paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py`, and `run_continuous_backtests.py` against
+the deep ML+backtest review history (passes #15–32), no concrete logic
+bugs surfaced. The hardening loop (None-coercion guards, atomic
+pickle writes, train_scorer dedup, off-distribution gate abstention,
+benchmark-honesty notes, FILLED-only training filter, per-cycle
+ledgers + trims) has covered every code path I'd otherwise flag.
+Set `bugs_fixed=0` per the per-commit guard. Targeted suites stayed
+green at the baseline (277 passed across
+`test_decision_scorer.py`/`test_decision_scorer_attribution.py`/
+`test_scorer_honesty.py`/`test_backtest.py`/`test_ml_backtest_seams.py`/
+`test_ml_backtest_coverage.py`/`test_ml_backtest_review.py`/
+`test_continuous.py`/`test_calibration.py`/`test_horizon_audit.py`/
+`test_ml_live_opinion.py`/`test_attribution_audit.py`).
+
+#### Phase 2 (commit `e691740`) — `SECTOR_MAP` coverage of all 41 unmapped watchlist tickers
+
+The DecisionScorer's 7-way sector one-hot is one of its 17 features.
+A coverage audit revealed **35% of `WATCHLIST` (41/118 tickers) had
+no `SECTOR_MAP` entry** — all silently collapsing into `sector_other`
+alongside Toyota and homebuilders. The scorer could not learn any
+sector-conditional pattern for these names: LRCX (semi equipment) had
+the same sector encoding as NAIL (homebuilders), and every broad-
+index 2x/3x leveraged ETF (QLD/SSO/UDOW/URTY/TNA/...) was
+indistinguishable from utility/defense ETFs in feature space.
+
+Added 37 explicit mappings:
+
+- **tech** — semi cap-equipment (`LITE`/`AMAT`/`LRCX`), int'l tech
+  ADRs (`BABA`/`SAP`/`SONY`), EV/innovation (`RIVN`/`NIO`/`ARKK`),
+  3x broad-index leveraged (`UDOW`/`URTY`/`MIDU`/`TNA`/`WANT`), 2x
+  broad-index (`QLD`/`SSO`/`MVV`/`SAA`/`UWM`), single-stock 2x
+  (`AAPLU`/`SMCI2X`/`PLTU`/`LNOK`), 2x tech rotation (`USD`/`ROM`),
+  3x inverse broad-index — *same correlation magnitude*, opposite
+  direction, mirroring the existing `SOXS`/`TECS`/`FNGD` pattern
+  (`SQQQ`/`SPXS`/`SDOW`/`SRTY`/`TZA`/`HIBS`).
+- **financials** — `BRK-B`/`HSBC`/`SQ`/`FAZ` (last is 3x inverse,
+  mirrors `FAS`).
+
+Added an explicit `INTENTIONALLY_OTHER` frozenset (6 tickers:
+`TM`/`UXI`/`NAIL`/`DFEN`/`UTSL`/`XLI`) for names whose economic
+sector has no enum in `SECTORS` — they correctly remain in
+`sector_other` rather than being mis-coupled to tech/financials.
+
+**Invariant locked** by 6 new tests in `TestSectorMapping`:
+
+| Test | What it catches |
+|------|-----------------|
+| `test_watchlist_coverage` | a new `WATCHLIST` ticker added without an explicit `SECTOR_MAP` entry **and** not in `INTENTIONALLY_OTHER` fails loudly here, instead of silently degrading scorer feature quality |
+| `test_sector_map_values_are_valid_sectors` | catches typos like `'techy'` that would yield an all-zero sector one-hot |
+| `test_intentionally_other_does_not_overlap_sector_map` | a ticker can't appear in both halves (the intent would be ambiguous) |
+| `test_specific_high_value_mappings` | pins `LRCX`/`BABA`/`RIVN`/`QLD`/`BRK-B`/`SPXS` so a "fix" that drops both halves the same wrong way is caught (the coverage test alone would pass) |
+| `test_sector_encoding_changes_for_newly_mapped_tickers` | end-to-end proof that `build_features` now puts `LRCX` in the same sector block as `NVDA`, while `NAIL` correctly stays in `sector_other` |
+| (pre-existing) `test_all_sectors_in_map` | every declared sector still appears somewhere |
+
+**Pickle schema unchanged** — still 7-way sector one-hot at the same
+7 feature slots (10..16). Old pickles still load. The next training
+cycle picks up the expanded mapping; the transient cost is one cycle
+of slightly off-distribution predictions for the 37 newly-mapped
+tickers, and the existing `off_distribution` guard in `_ml_decide`
+already abstains the conviction gate on those.
+
+**421 tests pass** under the canonical filter
+`-k "ml or backtest or scorer or calibration or continuous or horizon"`.
+
+#### Phase 3 — live quant findings (skeptical-quant perspective)
+
+1. **Continuous loop is NOT currently running.** `ps -ef | grep
+   run_continuous` returns no Python process. `continuous.log` last
+   touched 2026-05-18 12:03 (~10h stale); the structured per-cycle
+   ledgers (`scorer_skill_log.jsonl`, `baseline_skill_log.jsonl`)
+   stopped at 11:06 today with only **4 cycles** total ever logged
+   on this deployment. A skeptical quant has effectively no live
+   training trend to monitor — `skill_trend` / `baseline_trend`
+   return `INSUFFICIENT_DATA` against the on-disk ledgers.
+2. **Split-brain: `SCORER_PATH` local pkl (n_train=35) vs USB pkl
+   (n_train=400).** The decision_scorer module's `SCORER_PATH`
+   resolves to `paper-trader/data/ml/decision_scorer.pkl` (local
+   filesystem) which carries `n_train=35` from a stub training
+   probably done outside the continuous loop. The actually-updated
+   USB copy at `/media/zeph/projects/paper-trader/data/ml/
+   decision_scorer.pkl` (n_train=400, mtime 21:42 today) is
+   **invisible** to every consumer of `DecisionScorer()` — the
+   live trader's gate, the backtest engine's `_get_decision_scorer`,
+   `/api/scorer-predictions`, all diagnostics. Either path is
+   below the 500 gate threshold so the conviction gate (#5) is
+   **currently dormant**, but the divergence is a latent footgun if
+   either crosses 500 first. Pattern matches invariant #15 (the
+   articles.db split-brain) — could merit the same freshness-aware
+   resolver eventually.
+3. **MLP_ADDS_SKILL verdict appearing in recent cycles** — cycle 3
+   ic_gap=+0.069, cycle 4 ic_gap=+0.113 — contradicts the much-
+   documented `MLP_WORSE_THAN_TRIVIAL` finding from older review
+   passes. The anti-overfit `(32, 16) + alpha=1e-2 + early_stopping`
+   config (pass #19) appears to have flipped the verdict for cycles
+   that train on it; the per-cycle baseline ledger now alternates
+   between `MLP_ADDS_SKILL` (recent) and `MLP_NO_BETTER` (early). A
+   reading quant should now treat the loop's gate output as
+   **marginally useful** rather than reflexively dismissing it —
+   though the n=4-cycle sample is too small to call it a regime
+   change. `_oos_rank_metrics` corroborates: `oos_dir_acc` 0.52–0.55,
+   `oos_ic` 0.09–0.11 across the 4 cycles.
+4. **Recent backtest returns are leverage-dispersed, not skill.**
+   Median +143% vs SPY over the last 20 complete runs (max +610%,
+   min −53%, mean +175%) — heavy 3x-ETF cherry-picked windows.
+   AGENTS.md already warns to read `vs_spy_pct` skeptically on
+   leveraged windows; live data confirms the warning was correctly
+   loaded. The permutation/label-audit validation suite remains
+   the only real skill-vs-luck arbiter.
+5. **Run 6243 stuck in `'running'` for 4h+** — orphaned by the loop
+   death. `_reap_orphaned_runs` would have cleaned it on the next
+   loop start (6h age threshold), but the loop isn't running. Two
+   total `'running'` rows on disk (the other looks similarly stale).
+6. **USB pkl was retrained at 21:42** (≈1h before this audit)
+   **after the ledger stopped at 11:06** — so the gate state shifted
+   without leaving an audit trail in `scorer_skill_log.jsonl`. The
+   most likely cause is a one-shot `run_backtests.py` or manual
+   `train_scorer` invocation that bypassed `_append_scorer_skill_log`
+   (which is only wired into `run_continuous_backtests.main()`).
+7. **24 failed runs (~5%) historically.** Acceptable given GDELT
+   rate-limit transients and yfinance flakes visible in the log
+   tail, but worth noting for future failure-rate trending.
+
+None of these are quick safe fixes (the loop heartbeat and split-
+brain are systemic, not surgical); reported here rather than
+patched.
+
+#### Tests for this domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Canonical filter (421 tests, ~30s)
+python3 -m pytest tests/ -k "ml or backtest or scorer or calibration or continuous or horizon" -q
+
+# Just this pass's surface
+python3 -m pytest tests/test_decision_scorer.py::TestSectorMapping -v
+
+# Inspect a single scorer prediction (the read-only CLI added pass #N)
+python3 -m paper_trader.ml.decision_scorer --explain --ticker LRCX --ml-score 2.5
+
+# Cycle-trend ledgers (require the continuous loop to be running)
+python3 -m paper_trader.ml.skill_trend
+python3 -m paper_trader.ml.baseline_compare
+python3 -m paper_trader.ml.horizon_audit
+python3 -m paper_trader.ml.calibration --oos
+python3 -m paper_trader.ml.deploy_audit
+python3 -m paper_trader.ml.scorer_freshness
+```
+
+#### Invariants reaffirmed by this pass
+
+* **Pickle schema is N_FEATURES = 10 + 7 = 17** (10 numeric + 7
+  sector one-hot). The Phase 2 commit changes which sector a ticker
+  hashes to but does not change the schema, so old pickles still
+  load.
+* **`build_features` is the single source of truth for the feature
+  vector** — `_ml_decide`, `_compute_decision_outcomes`,
+  `feature_contributions`, and `predict_with_meta` all consume its
+  output. Adding new sector entries propagates everywhere without
+  touching any other call site.
+* **`INTENTIONALLY_OTHER` is the documentation-as-code answer to
+  "why does this ticker map to sector_other?"** — without it, a
+  reviewer could easily mistake a real coverage gap (the 41 silently-
+  mapped tickers this pass fixed) for an intentional choice.
