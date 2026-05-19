@@ -4537,3 +4537,72 @@ origin/master (`916f87a`, `81ffe13`).
   LLM in `build_event_threads`. **No UI panel yet** (consumers query the
   route; natural home is unified's command-center alongside the existing
   `signals` / `news-corroboration` panels).
+
+### Agent pass 2026-05-19 (hybrid 31 — Agent 3, debug + feature + analyst-validation)
+
+- **Feature: `ArticleStore.urgency_label_split(hours=24)`** — read-only
+  per-`score_source` breakdown of urgent (urgency>=1) live rows in the
+  window. Returns `{"window_h", "total", "by_source": {"llm", "ml",
+  "briefing_boost", "null"}, "llm_fraction"}` where
+  `llm_fraction = (llm + briefing_boost) / total`. Closes the
+  analyst-facing aggregate-calibration gap: the per-row
+  `[unverified — model-only urgent]` tag on the alert prompt already
+  hedges individually, but nothing surfaced "X% of recent alerts are
+  ML-only" at a glance. A persistent `llm_fraction` near zero ⇒ Sonnet
+  urgency_scorer is dark / quota-throttled / flooring everything to noise.
+
+  Live snapshot at rollout (last 24h on `articles.db`):
+  `total=82, by_source={llm: 46, ml: 36, briefing_boost: 0, null: 0},
+  llm_fraction=0.561`. Borderline-healthy — over a third of urgent calls
+  are firing on the ML head alone.
+
+  Single GROUP BY SELECT + `_LIVE_ONLY_CLAUSE` (synthetic backtest/opus
+  rows never inflate either bucket). `@_retry_on_lock` for the documented
+  shared-connection cursor-collision class — mirrors every other reader.
+  All four load-bearing invariants intact by construction (read-only;
+  no ai_score/ml_score/score_source/urgency mutation; backtest excluded;
+  urgency state machine untouched).
+
+  **Locks (`tests/test_urgency_label_split.py`, 10 tests, <1s):**
+    1. Empty store → all four buckets zero, `llm_fraction == 0.0`,
+       `total == 0` (dashboard-stable return shape)
+    2. Buckets always present even when only one is non-zero
+    3. Mixed sources count correctly (3 llm + 5 ml + 1 briefing_boost
+       + 2 null → total=11, `llm_fraction = 4/11`)
+    4. urgency=1 (queued) AND urgency=2 (already alerted) both counted —
+       the metric measures urgent CALLS in window, not just pending
+    5. Non-urgent (urgency=0) rows NEVER counted
+    6. **Backtest isolation**: `backtest://` URLs / `backtest_*` /
+       `opus_annotation*` sources NEVER inflate the metric (the live
+       calibration would otherwise be silently masked by injection bursts)
+    7. `hours` window filters out a 48h-old urgent row
+    8. Pure ML window → `llm_fraction == 0.0` (the live-evidence case)
+    9. Pure LLM window → `llm_fraction == 1.0`
+    10. `briefing_boost` counts toward vetted (alongside `llm`)
+
+  **Bug fix bundled:** `tests/test_stats_cursor_collision.py::_seed`
+  was hardcoding `first_seen='2026-05-18T10:00:00+00:00'` which fell
+  outside `stats_since(hours=24)`'s window once wall-clock passed it →
+  `test_stats_since_recovers_from_collision` failed on a real invariant
+  that was actually intact. Same `_recent_iso()`-style fix
+  `conftest.py` already uses for the storage-layer suite.
+
+- **Phase 3 live findings (read-only inspection of the live `articles.db`
+  at `/media/zeph/projects/digital-intern/db/articles.db`):**
+    * Collection healthy: ~3690 articles last 6h (~600/h); top sources
+      are GlobeNewswire, GN: earnings/IPO, Benzinga, Finnhub/Yahoo.
+    * Briefing quality high — the 2026-05-19 12:08Z heartbeat has dense
+      LEAD/MACRO/PORTFOLIO/SEMIS PULSE/TOP SIGNALS/RISK/COVERAGE GAP/
+      DESK NOTE structure; COVERAGE GAP honestly surfaces 5 dark
+      channels (SEC EDGAR/FT, Polygon, NewsAPI, Nitter).
+    * Briefing cadence drift: 7.8h gap between two recent briefings
+      (>5h target) — likely OOM-restart or Opus quota.
+    * LLM verification rate **56.1%** of urgent calls (46 llm / 36 ml /
+      0 briefing_boost / 0 null over 24h). Lower than ideal; would
+      surface in a dashboard tile via the new `urgency_label_split`.
+    * Persistent dark collectors (per memory's "DI chronic dark
+      collectors"): SEC EDGAR ~94h, SEC FT ~66h, Polygon ~157h,
+      NewsAPI ~279h, Nitter ~73h. Standing external gap, not a fresh bug.
+    * Held book under stress at briefing time: AXTI -14.46%, TSEM
+      -9.46%, LITE -8.83%, MU -5.95% — analyst's positions actively
+      bleeding into NVDA earnings tomorrow.
