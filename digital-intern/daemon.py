@@ -65,6 +65,7 @@ from collectors.newsapi_collector import collect_newsapi
 from collectors.yahoo_ticker_rss import collect_yahoo_ticker_rss
 from collectors.wikipedia_collector import collect_wikipedia
 from collectors.macro_calendar_collector import collect_macro_calendar
+from collectors.market_movers import collect_market_movers
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -110,6 +111,7 @@ NEWSAPI_INTERVAL    = 1500        # NewsAPI keyword search every 25min (free=100
 YAHOO_TICKER_RSS_INTERVAL = 240   # Yahoo per-ticker RSS every 4min
 WIKIPEDIA_INTERVAL  = 600         # Wikipedia recent-changes filter every 10min
 MACRO_CALENDAR_INTERVAL = 3600    # FOMC/BLS macro event calendar — once per hour
+MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
 EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
@@ -158,7 +160,7 @@ ALL_WORKERS = (
     "gdelt", "rss", "web", "reddit", "ticker", "sec_edgar", "sec_edgar_ft",
     "google_news", "nitter", "substack",
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
-    "yahoo_ticker_rss", "wikipedia", "macro_calendar",
+    "yahoo_ticker_rss", "market_movers", "wikipedia", "macro_calendar",
     "scorer", "alert", "heartbeat", "purge", "stats",
     "ml_trainer", "continuous_trainer", "recursive_labeler", "price_alert",
     "portfolio_pl", "sentiment_trends", "export", "web_server",
@@ -182,6 +184,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "alphavantage": ALPHAVANTAGE_INTERVAL, "polygon": POLYGON_INTERVAL,
     "massive": MASSIVE_INTERVAL, "newsapi": NEWSAPI_INTERVAL,
     "yahoo_ticker_rss": YAHOO_TICKER_RSS_INTERVAL,
+    "market_movers": MARKET_MOVERS_INTERVAL,
     "wikipedia": WIKIPEDIA_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
@@ -830,6 +833,28 @@ def yahoo_ticker_rss_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(YAHOO_TICKER_RSS_INTERVAL)
+
+
+# ── Worker: Yahoo Finance market movers — every 5min ────────────────────────
+def market_movers_worker(store: ArticleStore):
+    log.info("[market_movers_worker] started")
+    bo = Backoff("market_movers", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_market_movers()
+            _ingest(store, articles, "market_movers")
+            try:
+                source_health.record_result("market_movers", len(articles))
+            except Exception as he:
+                log.warning(f"[market_movers_worker] source_health error: {he}")
+            _worker_last_ok["market_movers"] = time.time()
+            log.debug(f"[market_movers] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[market_movers_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(MARKET_MOVERS_INTERVAL)
 
 
 # ── Worker: Wikipedia recent-changes filter — every 10min ───────────────────
@@ -2017,6 +2042,7 @@ def main():
         ("massive",     massive_worker),
         ("newsapi",     newsapi_worker),
         ("yahoo_ticker_rss", yahoo_ticker_rss_worker),
+        ("market_movers", market_movers_worker),
         ("wikipedia",   wikipedia_worker),
         ("macro_calendar", macro_calendar_worker),
         ("scorer",      scorer_worker),
