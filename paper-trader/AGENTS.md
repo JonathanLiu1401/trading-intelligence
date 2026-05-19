@@ -837,6 +837,52 @@ module constants; verdicts are exact-value test-locked in
 > succeeds, training does not. Reported, not fixed (root cause is
 > GPU-side / out of this domain's surgical scope).
 
+### Bootstrap CIs on OOS skill — `paper_trader/ml/skill_uncertainty.py`
+
+Every existing OOS diagnostic (`_oos_rank_metrics`, `evaluate_scorer_oos`,
+`calibration --oos`, `skill_trend`) reports the metric as a **single point
+estimate** per cycle. With OOS sample sizes in the hundreds-to-low-thousands
+and near-zero underlying skill, a single number can't tell a skeptical quant
+whether a rank-IC of 0.04 is real-but-weak signal or noise around 0.
+
+`skill_uncertainty.py` runs a percentile bootstrap (Efron) on the deployed
+scorer's OOS pairs and reports **95% confidence intervals** on rank-IC /
+RMSE / dir-acc, with a crisp verdict:
+
+| Verdict | Trigger |
+|---|---|
+| `NOT_TRAINED` | `scorer.is_trained` is False |
+| `INSUFFICIENT_DATA` | < `MIN_OOS=30` finite OOS pairs |
+| `SKILL_DETECTED` | rank-IC CI strictly excludes 0 (statistically distinguishable) |
+| `NO_SKILL_DETECTED` | rank-IC CI straddles or sits below 0 |
+
+Same operational discipline as `calibration.py` / `gate_audit.py` /
+`skill_trend.py`: read-only, no train, no pickle / `build_features` /
+`N_FEATURES` touch, never raises (`bootstrap_skill_ci` degrades to
+`status='error'` on any fault). Single source of truth — the OOS split is
+`validation.split_outcomes_temporal` (the EXACT split
+`_train_decision_scorer` uses for `oos_rmse`), the predict signature is
+the same 11-kwarg path `_oos_rank_metrics` uses, the rank correlation is
+`calibration._spearman`, and the universal SELL sign-flip is applied. So
+this module and the ledger's scalar metrics can never drift.
+
+```bash
+# Default: 1000 resamples, 95% CI, deterministic seed
+cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.skill_uncertainty
+
+# Tighter CI with more resamples; JSON for downstream tooling
+python3 -m paper_trader.ml.skill_uncertainty --bootstraps 2000 --json
+```
+
+Exit code 0 only when the verdict is `SKILL_DETECTED` — so a shell caller
+can `if !; then` gate dashboards on real distinguishable skill, not noisy
+point estimates. Locked by `tests/test_skill_uncertainty.py` (13 tests):
+strong signal → SKILL_DETECTED with CI excluding 0; pure noise →
+NO_SKILL_DETECTED with CI straddling 0; anti-correlated → CI fully below
+0; insufficient n; untrained; SELL sign-flip; NaN-row dropping; seed
+reproducibility (same seed ⇒ identical CIs, different seeds ⇒ different
+CI bounds); crash-resilience.
+
 ### Position sizing invariant (`_ml_decide`)
 
 A backtest BUY's notional is `min(total_val * conviction, cash * 0.95)`.
@@ -1387,6 +1433,16 @@ cd /home/zeph/paper-trader && python3 -m paper_trader.ml.calibration --oos
 
 # Training-integrity (only FILLED trades train scorer/ArticleNet)
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_continuous.py::TestFilledOnlyTrainingIntegrity -v
+
+# Bootstrap CIs on OOS skill (paper_trader/ml/skill_uncertainty.py) —
+# verdict locks (SKILL_DETECTED vs NO_SKILL_DETECTED), SELL sign-flip
+# semantics, NaN-row drop, seed reproducibility, crash resilience.
+cd /home/zeph/paper-trader && python3 -m pytest tests/test_skill_uncertainty.py -v
+
+# Quick OOS-skill significance check vs the live pickle. Exit 0 only when
+# the rank-IC CI strictly excludes 0 — so shell callers can gate on
+# distinguishable skill instead of noisy point estimates.
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.skill_uncertainty
 
 # Per-persona strategy-quality leaderboard (exact-value verdict locks;
 # incl. TestSortinoCalmar — the 2026-05-18 Sortino/Calmar risk-metric add)
