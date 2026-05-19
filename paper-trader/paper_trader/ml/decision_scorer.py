@@ -63,6 +63,29 @@ SECTOR_MAP: dict[str, str] = {
     "TSLL": "tech", "TSLT": "tech",
     "SOXS": "tech", "TECS": "tech", "FNGD": "tech", "FNGU": "tech",
     "SPY": "tech", "UPRO": "tech", "SPXL": "tech",  # broad index, treated as tech-correlated
+    # Tech: semi capital-equipment + optical (LITE/AMAT/LRCX) — group with NVDA/AMD/MU.
+    # Until now these 35% of the watchlist landed in sector_other, collapsing
+    # to one bucket with utilities/defense/Toyota and erasing every learnable
+    # semi-equipment correlation.
+    "LITE": "tech", "AMAT": "tech", "LRCX": "tech",
+    # Tech: international tech ADRs — SAP/SONY/BABA trade with the global tech
+    # tape, not "other".
+    "BABA": "tech", "SAP": "tech", "SONY": "tech",
+    # Tech: EV / innovation — treated like TSLA (already mapped).
+    "RIVN": "tech", "NIO": "tech", "ARKK": "tech",
+    # Tech: broad-index 3x leveraged ETFs — same "treated as tech-correlated"
+    # pattern documented inline for SPY/UPRO/SPXL above.
+    "UDOW": "tech", "URTY": "tech", "TNA": "tech", "MIDU": "tech", "WANT": "tech",
+    # Tech: broad-index 2x leveraged ETFs — same pattern (QQQ/SPY/Dow/small/Russell).
+    "QLD": "tech", "SSO": "tech", "MVV": "tech", "SAA": "tech", "UWM": "tech",
+    # Tech: single-stock 2x leveraged (AAPL/SMCI/PLTR/Nokia) — mirrors NVDU/MSFU pattern.
+    "AAPLU": "tech", "SMCI2X": "tech", "PLTU": "tech", "LNOK": "tech",
+    # Tech: 2x rotation ETFs (tech-themed) — USD/ROM.
+    "USD": "tech", "ROM": "tech",
+    # Tech: 3x inverse broad-index — same sector correlation magnitude (just
+    # opposite direction). Same pattern existing SOXS/TECS/FNGD already follow.
+    "SQQQ": "tech", "SPXS": "tech", "SDOW": "tech", "SRTY": "tech",
+    "TZA": "tech", "HIBS": "tech",
     # Energy
     "XOM": "energy", "CVX": "energy", "XLE": "energy", "USO": "energy", "UNG": "energy",
     "BOIL": "energy", "UCO": "energy", "BP": "energy",
@@ -70,6 +93,9 @@ SECTOR_MAP: dict[str, str] = {
     "GS": "financials", "JPM": "financials", "BAC": "financials", "XLF": "financials",
     "FAS": "financials", "V": "financials", "MA": "financials", "UYG": "financials",
     "DPST": "financials", "HIBL": "financials",
+    # Financials: mega-cap / international bank / fintech / 3x inverse (mirrors FAS).
+    "BRK-B": "financials", "HSBC": "financials", "SQ": "financials",
+    "FAZ": "financials",
     # Healthcare
     "LLY": "healthcare", "UNH": "healthcare", "NVO": "healthcare", "XLV": "healthcare",
     "CURE": "healthcare", "LABU": "healthcare",
@@ -79,7 +105,28 @@ SECTOR_MAP: dict[str, str] = {
     # Crypto
     "BTC-USD": "crypto", "COIN": "crypto", "MSTR": "crypto", "BITX": "crypto",
     "BITU": "crypto", "ETHU": "crypto", "CONL": "crypto",
+    # "other" by design (no industrials/utilities/real-estate sector enum):
+    # TM (Toyota auto), UXI (2x industrials, mirrors XLI's implicit "other"),
+    # NAIL (homebuilders), DFEN (defense), UTSL (utilities), ^VIX (vol gauge),
+    # NEWS_VEH_PSEUDO_TICKERS (ES=F/NQ=F/CL=F futures). These are *intentionally*
+    # in sector_other — adding an entry above for any of them would mis-couple
+    # them with tech/financials. The coverage test pins this allow-list.
 }
+
+# Watchlist tickers that *intentionally* fall through to sector_other because
+# their economic sector has no SECTORS enum (no industrials, utilities,
+# real-estate, defense, vol-gauge categories). The coverage test asserts
+# WATCHLIST ⊆ (SECTOR_MAP ∪ INTENTIONALLY_OTHER ∪ {^…}), so a NEW watchlist
+# ticker added without explicit classification fails loudly rather than
+# silently degrading to "other".
+INTENTIONALLY_OTHER: frozenset[str] = frozenset({
+    "TM",       # Toyota — auto industrial, no auto sector
+    "UXI",      # 2x industrials — XLI already implicitly "other"
+    "NAIL",     # homebuilders 3x — no real-estate sector
+    "DFEN",     # defense 3x — no defense sector (XLI route)
+    "UTSL",     # utilities 3x — no utilities sector
+    "XLI",      # industrials sector ETF itself — no industrials enum
+})
 
 N_FEATURES = 10 + len(SECTORS)  # 10 base (quant + news_urgency + news_article_count) + 7 sector one-hot = 17
 

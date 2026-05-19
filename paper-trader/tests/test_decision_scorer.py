@@ -600,6 +600,111 @@ class TestSectorMapping:
                 continue
             assert s in mapped_sectors, f"sector {s!r} has zero ticker mappings"
 
+    def test_watchlist_coverage(self):
+        """Every WATCHLIST ticker the scorer is ever asked to predict on must
+        either have an explicit SECTOR_MAP entry OR be in INTENTIONALLY_OTHER.
+
+        Prior to this lock, 35% of WATCHLIST (41/118) silently fell through
+        to sector_other — collapsing semi-equipment (LITE/AMAT/LRCX),
+        international tech ADRs (BABA/SAP/SONY), EVs (RIVN/NIO), every
+        broad-index leveraged ETF (UDOW/URTY/QLD/SSO/MVV/SAA/UWM/TNA/...),
+        single-stock 2x (AAPLU/SMCI2X/PLTU/LNOK), 3x inverse (SQQQ/SPXS/
+        SDOW/SRTY/TZA/HIBS), and key financials (BRK-B/HSBC/SQ/FAZ) into
+        the same sector_other one-hot bucket as Toyota and homebuilders.
+        With nothing to discriminate, the scorer cannot learn any
+        sector-conditional pattern for these — every prediction for LRCX
+        used the same encoding as for NAIL, even though their economic
+        sectors are completely different.
+
+        This regression-locks the expanded mapping: a NEW watchlist ticker
+        added without an explicit SECTOR_MAP entry (or explicit
+        INTENTIONALLY_OTHER) fails loudly here, instead of silently
+        degrading the scorer's feature quality.
+        """
+        from paper_trader.backtest import WATCHLIST
+        from paper_trader.ml.decision_scorer import INTENTIONALLY_OTHER
+
+        unclassified = [
+            t for t in WATCHLIST
+            # Index / vol gauges (^VIX, ^GSPC) are not real positions —
+            # they are referenced for prompt context but never traded.
+            if not t.startswith("^")
+            and t not in SECTOR_MAP
+            and t not in INTENTIONALLY_OTHER
+        ]
+        assert unclassified == [], (
+            f"{len(unclassified)} WATCHLIST tickers have no SECTOR_MAP "
+            f"entry and are not in INTENTIONALLY_OTHER; the scorer will "
+            f"silently encode them as sector_other. Add them to one or "
+            f"the other in decision_scorer.py: {unclassified}"
+        )
+
+    def test_sector_map_values_are_valid_sectors(self):
+        """Catches a typo like SECTOR_MAP['NVDA']='techy' that would
+        otherwise produce an all-zero sector one-hot at training time."""
+        for ticker, sector in SECTOR_MAP.items():
+            assert sector in SECTORS, (
+                f"SECTOR_MAP[{ticker!r}]={sector!r} is not a valid sector; "
+                f"valid sectors: {SECTORS}"
+            )
+
+    def test_intentionally_other_does_not_overlap_sector_map(self):
+        """A ticker is either explicitly mapped OR explicitly 'other' —
+        never both, or the intent becomes ambiguous on a future review."""
+        from paper_trader.ml.decision_scorer import INTENTIONALLY_OTHER
+        overlap = set(SECTOR_MAP) & set(INTENTIONALLY_OTHER)
+        assert not overlap, (
+            f"these tickers appear in BOTH SECTOR_MAP and "
+            f"INTENTIONALLY_OTHER: {sorted(overlap)}"
+        )
+
+    def test_specific_high_value_mappings(self):
+        """Pin a discriminating subset of the newly-added mappings so an
+        accidental revert to sector_other is caught explicitly (the watchlist
+        coverage test would pass if a reviewer "fixed" both halves the same
+        wrong way — e.g. dropped both from SECTOR_MAP and INTENTIONALLY_OTHER).
+
+        These six were chosen because they exercise each new category:
+        semi-equipment (LRCX), int'l tech ADR (BABA), EV (RIVN), broad-index
+        2x leveraged (QLD), mega-cap financial (BRK-B), 3x inverse (SPXS).
+        """
+        assert SECTOR_MAP["LRCX"] == "tech"
+        assert SECTOR_MAP["BABA"] == "tech"
+        assert SECTOR_MAP["RIVN"] == "tech"
+        assert SECTOR_MAP["QLD"] == "tech"
+        assert SECTOR_MAP["BRK-B"] == "financials"
+        assert SECTOR_MAP["SPXS"] == "tech"
+
+    def test_sector_encoding_changes_for_newly_mapped_tickers(self):
+        """End-to-end: build_features for a newly-mapped ticker must now
+        emit a non-other sector one-hot. Previously, LRCX's feature vector
+        was sector_other=1.0 and every other sector slot=0.0 — identical
+        to NAIL's. After the fix, LRCX matches NVDA's sector encoding
+        (both tech), confirming the scorer can finally learn that they
+        co-vary by sector. NAIL stays correctly in sector_other.
+        """
+        # Use identical numerics so any difference is purely from the
+        # sector one-hot block (slots 10..16).
+        common = dict(ml_score=1.0, rsi=50.0, macd=0.0, mom5=0.0,
+                      mom20=0.0, regime_mult=1.0)
+        sector_idx_start = 10  # 10 numeric + 7 sector = 17 total
+        f_lrcx = build_features(ticker="LRCX", **common)[sector_idx_start:]
+        f_nvda = build_features(ticker="NVDA", **common)[sector_idx_start:]
+        f_nail = build_features(ticker="NAIL", **common)[sector_idx_start:]
+        # LRCX (newly tech) must now match NVDA (already tech) in the
+        # sector block.
+        assert f_lrcx == f_nvda, (
+            "LRCX sector one-hot must now match NVDA's (both tech); "
+            f"LRCX={f_lrcx}, NVDA={f_nvda}"
+        )
+        # And NAIL — intentionally 'other' — must NOT match NVDA.
+        assert f_nail != f_nvda
+        # sector_other (last slot, index -1 in the sector block) must be
+        # 1.0 for NAIL and 0.0 for LRCX/NVDA.
+        assert f_nail[-1] == 1.0
+        assert f_lrcx[-1] == 0.0
+        assert f_nvda[-1] == 0.0
+
 
 # ──────────────────── anti-overfit MLP config (2026-05-18) ────────────────────
 
