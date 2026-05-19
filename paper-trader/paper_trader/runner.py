@@ -639,15 +639,26 @@ def _cycle():
         # response (status != NO_DECISION); a non-quota timeout is not proof
         # the quota is back, so we hold the alarmed state until a real
         # decision lands rather than crying "recovered" prematurely.
+        #
+        # Mirror the alarm-path symmetry: only clear ``_quota_alert_active``
+        # when the recovery notice was actually delivered. Without this, a
+        # transient openclaw / Discord outage at recovery time silently drops
+        # the operator-facing "we're back" message AND clears the latch — so
+        # the operator (who only sees Discord) is stuck believing the trader
+        # is still frozen until the NEXT quota outage re-alarms. Clearing the
+        # latch only on successful send makes the next decide() cycle retry
+        # the recovery notice; the latch itself dedupes so we never spam.
         if _quota_alert_active and status != "NO_DECISION":
+            ok = False
             try:
-                reporter._send(
+                ok = bool(reporter._send(
                     "✅ **CLAUDE QUOTA RECOVERED** ◈ decision engine responding "
                     "again — live trader resumed"
-                )
+                ))
             except Exception as e:
                 print(f"[runner] quota recovery notice failed: {e}")
-            _quota_alert_active = False
+            if ok:
+                _quota_alert_active = False
 
     try:
         if summary.get("auto_exits") or summary.get("status") == "FILLED":
