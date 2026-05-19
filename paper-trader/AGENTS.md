@@ -8739,3 +8739,195 @@ python3 -m pytest tests/test_scorer_freshness.py \
   sklearn absent) degrades gracefully. The new CONDEMN-drop codepath
   preserves this with a defensive empty-fold fallback.
 
+
+## Review pass #36 — paper-trader ML / backtest hybrid (2026-05-19, ~17:00 UTC)
+
+### Phase 1 — no fixes
+
+Read every load-bearing ML/backtest file in full
+(`paper_trader/ml/decision_scorer.py`, `paper_trader/backtest.py`,
+`run_continuous_backtests.py`) plus the surrounding diagnostic modules
+(`scorer_freshness.py`, `deploy_audit.py`, `calibration.py`,
+`baseline_compare.py`, `corpus_audit.py`, `feature_importance.py`,
+`gate_audit.py`, `gate_pnl.py`, `skill_trend.py`, `validation.py`,
+`persona_leaderboard.py`). Ran the targeted scorer/backtest/continuous
+test sweep (170 tests pass in 9.7s; the full `-k "ml or backtest or
+scorer"` slice produced 357 pass with one flaky `test_corrupt_pkl_does_not_crash`
+that pyc-cache-clears and isolated runs both pass — pytest assertion-
+rewriting cache mismatch, not a code bug). The codebase is unusually
+mature: every actionable bug class I could identify was already pinned
+by a focused test (CONDEMN-drop, FILLED-only training-integrity, dedup
+collision under SELL sign-flip, scorer freshness ladder, OOS rank-IC
+SELL sign-flip, atomic pickle write, load-cache key by mtime/size).
+Per the Phase 1 commit guard, **no Phase 1 commit** — the diff was
+empty after the read pass.
+
+### Phase 2 (commit `740c67c`) — scorer_smoke_test diagnostic + 12 tests
+
+`scorer_freshness` answers *is the loop still re-pickling*; `deploy_audit`
+answers *does the pickled config match source*. Neither asks the basic
+sub-second question: *does `DecisionScorer().predict_with_meta(...)`
+return finite, non-degenerate values for a sweep of realistic inputs?*
+A model that loaded successfully and matches source config but predicts
+the same constant for every input — a degenerate predictor — passes
+both existing diagnostics and silently disables the conviction gate at
+the predict level (the ±10/±5/0 buckets collapse to one bucket forever).
+
+New module `paper_trader/ml/scorer_smoke_test.py` (~250 LOC) closes that
+gap: 8 in-distribution probes spanning the 7-way sector axis + 2 edge
+probes (extreme RSI/momentum), each routed through the public
+`predict_with_meta` so it describes the EXACT path the live `_ml_decide`
+gate uses. Verdicts mirror the sibling ladder:
+
+  * `HEALTHY`              all probes finite, ≥2 distinct buckets       → 0
+  * `UNTRAINED`            `is_trained=False` (no pkl / load failed)    → 0
+  * `DEGENERATE_CONSTANT`  every probe collapses to one prediction      → 2
+  * `BROKEN_PREDICT`       any probe raised or returned non-finite      → 2
+
+CLI: `python3 -m paper_trader.ml.scorer_smoke_test [--json]`. Exit code
+mirrors `scorer_freshness._cli` semantics so a cron can branch on `$?`.
+Same operational discipline as every sibling diagnostic — read-only,
+no train, no pickle/`build_features`/`N_FEATURES`/trade-path mutation;
+safe to run against the live unattended loop. Locked by 12 focused
+tests in `tests/test_scorer_smoke_test.py` (verdict ladder against
+faked scorers, JSON-safety, schema cardinality, CLI exit code).
+Verified end-to-end against the deployed pickle: `HEALTHY` with 8/8
+distinct predictions and 0/8 off-distribution false positives.
+
+### Phase 3 quant findings — backtest.db live state (2026-05-19)
+
+Using `backtest.db` (475 complete runs, latest 14h ago):
+
+1. **Deployed scorer is critically thin (n_train=35).** The pickle on
+   disk reports n_train=35 — far below the 500-threshold the gate
+   engages at (invariant #5). The conviction gate is currently a no-op
+   regardless of `baseline_compare`/`scorer_smoke_test` verdict.
+   Either someone retrained with a tiny test corpus, or the production
+   continuous loop hasn't run here long enough to accumulate outcomes.
+   A skeptical quant should NOT trust the gate's modulation right now.
+2. **Backtest dispersion remains extreme.** Mean total_return=150%,
+   median=63%, stdev=267%, range -54%..+2979%. 22% (103/475) of runs
+   have negative alpha vs SPY. This is leveraged-ETF beta dispersion
+   through cherry-picked random windows, NOT repeatable alpha — the
+   long-documented finding.
+3. **Two stuck `status=running` orphan rows** (6238, 6243). The 6h-age
+   reaper hasn't touched them yet — they are below the threshold.
+   `_reap_orphaned_runs` will sweep them on the next mid-loop reap.
+4. **17% of complete runs (80/475) had `spy_return_pct = 0.0` without
+   the `benchmark_unavailable` note.** The existing guard only fires
+   when the SPY series is COMPLETELY empty; runs where SPY exists but
+   `returns_pct` returned exactly 0 over a multi-week window (price_on
+   walk-back collapsed both endpoints to the same prior close) silently
+   produced `vs_spy_pct = total_return` — a fabricated benchmark. SPY
+   essentially never has a flat ≥30-day stretch, so a 0 there is the
+   same degenerate case as the empty-series branch. **Fixed in commit
+   `739e8f4`** (additive note, no behaviour change to returns / winner
+   selection / live gate; 30-day threshold prevents false positives on
+   short legitimately-flat windows). Locked by
+   `tests/test_integration_backtest.py::TestBenchmarkUnavailableNote`
+   (degenerate ≥30d window flagged; <30d boundary NOT flagged).
+5. **Local environment lacks live training ledgers.**
+   `data/decision_outcomes.jsonl`, `data/scorer_skill_log.jsonl`,
+   `data/baseline_skill_log.jsonl`, `data/backtest_cache/` do not
+   exist in this checkout. The continuous loop is either running
+   elsewhere or has not been run here. The deployed pickle (n_train=35)
+   is suspicious — it doesn't reflect a real training run through the
+   standard `run_continuous_backtests.py` path.
+
+### Test commands for this domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Just the ML / backtest / scorer / smoke-test scope (~7 sec)
+python3 -m pytest tests/test_scorer_freshness.py \
+                  tests/test_scorer_smoke_test.py \
+                  tests/test_decision_scorer.py \
+                  tests/test_decision_scorer_attribution.py \
+                  tests/test_backtest.py \
+                  tests/test_continuous.py \
+                  tests/test_integration_backtest.py \
+                  tests/test_ml_backtest_review.py \
+                  tests/test_calibration.py \
+                  tests/test_baseline_compare.py -v
+
+# Just the new coverage from this pass (~1 sec)
+python3 -m pytest tests/test_scorer_smoke_test.py \
+                  tests/test_integration_backtest.py::TestBenchmarkUnavailableNote -v
+
+# Run the new diagnostic against the deployed pickle (sub-second)
+python3 -m paper_trader.ml.scorer_smoke_test            # human-readable
+python3 -m paper_trader.ml.scorer_smoke_test --json     # machine output
+```
+
+### How to interpret the scorer / backtest ladder
+
+The full diagnostic ladder, in roughly the order an operator should run
+on a freshly redeployed pickle:
+
+1. `python3 -m paper_trader.ml.scorer_smoke_test` — sub-second. Verifies
+   the pickle even produces finite, non-degenerate predictions for a
+   canonical input sweep. Catches DEGENERATE_CONSTANT / BROKEN_PREDICT.
+2. `python3 -m paper_trader.ml.scorer_freshness` — verifies the loop is
+   still re-pickling and the on-disk pkl matches the heartbeat ledger
+   (catches LOOP_STALLED / STALE_PKL / PKL_REGRESSED).
+3. `python3 -m paper_trader.ml.deploy_audit` — verifies the deployed
+   pickle's fitted-model architecture matches `MLP_CONFIG` in source
+   (catches a stale pre-retune net that the loop hasn't retrained
+   under the current hyper-params).
+4. `python3 -m paper_trader.ml.calibration --oos` — does the model's
+   predictions monotonically rank realized outcomes on the temporal
+   OOS slice?
+5. `python3 -m paper_trader.ml.baseline_compare` — does the 17-feature
+   MLP earn its complexity vs a one-line rule? Verdict ladder
+   `MLP_WORSE_THAN_TRIVIAL` / `MLP_NO_BETTER_THAN_TRIVIAL` / `MLP_ADDS_SKILL`.
+6. `python3 -m paper_trader.ml.gate_audit` — is the conviction gate's
+   ±10/±5/0 bucketing actually buying realized edge?
+7. `python3 -m paper_trader.ml.feature_importance` — permutation
+   importance per feature. Catches the "model overfits to the sector
+   one-hot, ignores quant signals" failure mode.
+
+### Manual backtest run
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# One-shot 10-run sweep over the default window (legacy launcher)
+python3 run_backtests.py
+
+# Long-lived continuous loop (5 runs/cycle, retrain after every cycle)
+python3 run_continuous_backtests.py
+# Tails continuously; SIGTERM/SIGINT exits cleanly between cycles.
+```
+
+### Interpreting backtest results
+
+Per CLAUDE.md §11 and AGENTS.md's longstanding caveats, **do not read
+top-line `total_return_pct` as alpha**. The recurring extreme dispersion
+(2979% top return, median 63%, stdev 267%) is leveraged-ETF beta through
+cherry-picked random windows, not repeatable strategy edge. The
+authoritative skill arbiters are:
+
+- `vs_spy_pct` — alpha column, but ONLY meaningful when the
+  `benchmark_unavailable` note is absent (after commit `739e8f4` this
+  now also catches degenerate spy_return=0 cases).
+- `baseline_compare` and `calibration --oos` — OOS rank skill of the
+  scorer itself.
+- `gate_audit` — realized PnL effect of the conviction gate's actual
+  ±10/±5/0 buckets, not the (in-sample-flattering) calibration plot.
+
+### Invariants reaffirmed by this pass
+
+- **Read-only diagnostic discipline** — `scorer_smoke_test` never
+  trains, never touches the pickle, no `build_features` / `N_FEATURES` /
+  trade-path mutation. Safe to run against the unattended loop.
+- **Verdict-ladder discipline** — every CLI in `paper_trader/ml/`
+  emits a verdict from a fixed public `VERDICTS` tuple, exit 0 on
+  benign/insufficient-data, exit 2 on actionable failure. The new
+  `scorer_smoke_test` joins that ladder; tests pin the membership.
+- **Benchmark honesty (additive notes)** — `run_one` now flags BOTH
+  empty-SPY-series AND degenerate-walk-back spy_return=0 cases via
+  the same `notes` column. No behaviour change to returns / winner
+  selection / live gate; purely informational.
+
+
