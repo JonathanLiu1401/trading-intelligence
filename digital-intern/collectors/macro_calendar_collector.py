@@ -69,8 +69,33 @@ def _ensure_db() -> sqlite3.Connection:
     return conn
 
 
-def _seen_id(event_type: str, date_str: str) -> str:
-    return hashlib.sha256(f"macro_event|{date_str}|{event_type}".encode()).hexdigest()
+def _day_class(event_date: datetime, now: datetime) -> str:
+    """Categorical day bucket for the seen-id dedup key.
+
+    The visible title prefix (TODAY / TOMORROW / UPCOMING (Nd) / IN Nd) is the
+    signal the urgency scorer keys on, but a per-(date, type) dedup that
+    ignores it makes the prefix dead code: once the event is emitted at any
+    distance, it is NEVER re-emitted at a sharper prefix. Live FOMC discovered
+    7d out gets "UPCOMING (7d)" and stays at "UPCOMING (7d)" forever — the
+    "TODAY: FOMC Meeting" row that should trigger urgent scoring is never
+    inserted. Bucketing into 4 classes ({"today","tomorrow","upcoming",
+    "future"}) and folding that into the dedup key emits at MOST 4 articles
+    per event lifetime (one per transition), so the TODAY/TOMORROW prefix
+    actually reaches the scorer."""
+    delta = (event_date.date() - now.date()).days
+    if delta == 0:
+        return "today"
+    if delta == 1:
+        return "tomorrow"
+    if delta <= UPCOMING_WINDOW_DAYS:
+        return "upcoming"
+    return "future"
+
+
+def _seen_id(event_type: str, date_str: str, day_class: str = "") -> str:
+    return hashlib.sha256(
+        f"macro_event|{date_str}|{event_type}|{day_class}".encode()
+    ).hexdigest()
 
 
 def _is_seen(conn: sqlite3.Connection, sid: str) -> bool:
@@ -254,7 +279,12 @@ def collect_macro_calendar() -> list[dict[str, Any]]:
 
     for event in all_events:
         date_str = event["date"].strftime("%Y-%m-%d")
-        sid = _seen_id(event["type"], date_str)
+        # day_class folded into the seen-id so a (date, type) row emitted as
+        # "UPCOMING (5d)" days ago does NOT block the same event re-emitting
+        # as "TODAY"/"TOMORROW" when its prefix bucket transitions — see
+        # _day_class. Without this, the prefix logic below was dead code.
+        day_cls = _day_class(event["date"], now)
+        sid = _seen_id(event["type"], date_str, day_cls)
         if _is_seen(conn, sid):
             continue
 
@@ -274,7 +304,7 @@ def collect_macro_calendar() -> list[dict[str, Any]]:
             "source": SOURCE_NAME,
         }
         articles.append(article)
-        _mark_seen(conn, sid, event["type"], date_str, title)
+        _mark_seen(conn, sid, f"{event['type']}|{day_cls}", date_str, title)
 
     conn.close()
     return articles
