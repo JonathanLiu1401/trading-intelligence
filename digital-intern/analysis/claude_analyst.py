@@ -397,33 +397,66 @@ _ALERT_VELOCITY_MIN_DELTA_PCT = 50.0
 
 
 def _collect_alert_velocity(window_hours: int = 5) -> dict | None:
-    """Best-effort: count BREAKING alerts (urgency=2) in the recent
+    """Best-effort: count BREAKING alerts ACTUALLY FIRED in the recent
     ``window_hours`` and the immediately-preceding window of the same length.
     Returns ``{"recent": int, "prior": int, "window_h": int}`` or ``None`` on
     ANY failure — an alert-temperature read must NEVER break or delay the 5h
     briefing it annotates (identical discipline to ``_collect_source_health``
     / ``_collect_source_throughput`` / ``_recent_briefing_digest``).
+
+    Reads from ``watchers.alert_recency.DB_PATH`` (one row per fired-alert
+    signature, ``last_ts`` = most recent successful Discord send). The earlier
+    implementation counted ``urgency=2`` rows in ``articles.db``, but that
+    state is ALSO set by the four pre-fire suppression gates in
+    ``watchers.alert_agent.send_urgent_alert`` (quote-widget, stale-by-
+    published, low-authority-lone, cross-cycle-syndication): each gate calls
+    ``store.mark_alerted_batch`` to exit the suppressed row from the urgent
+    queue WITHOUT firing a Discord push. So a story alerted once and then
+    re-suppressed across five later re-syndicated copies counted as six
+    "fires" and told Opus the wire was materially hotter than it was —
+    inflating LEAD/macro framing toward noise on the analyst's primary
+    consumed product. Live evidence (2026-05-19 10h window): 58 ``urgency=2``
+    rows in ``articles.db`` vs 37 hits in ``alert_recency.db`` — the metric
+    over-counted by ~57%. The recency store ONLY records on a successful
+    Discord send (see ``alert_agent.send_urgent_alert`` and
+    ``alert_recency.record_alerted``) so its count is the canonical
+    "pushed to analyst" tally.
+
+    Minor known under-count: ``record_alerted`` upserts on conflict (one row
+    per signature, ``last_ts`` = LATEST fire), so a signature that fired
+    twice within the queried 2× window is counted ONCE in whichever sub-
+    window its latest fire falls in. Same 2026-05-19 snapshot: 36 distinct
+    signatures vs 37 hits = a single re-fire over 10h, ~3% under-count.
+    Trading a 57% over-count for a 3% under-count is unambiguous — and the
+    error direction is analyst-safe (a false "wire quiet" just means a real
+    story stands out more in TOP SIGNALS; a false "wire hot" inflated the
+    LEAD toward macro framing on noise).
+
     Opens a fresh short-lived ``mode=ro`` connection (never the daemon's
-    shared ``self.conn`` — the documented cursor-collision hazard)."""
+    shared ``self.conn`` — the documented cursor-collision hazard); the
+    ``alert_recency.db`` file is tiny (~36 rows in production) and indexed
+    on ``last_ts``, so each count is a few µs. The four load-bearing
+    invariants are unchanged: this read never touches ``articles.db``, so
+    backtest isolation / ml_score≠ai_score / score_source / the urgency
+    state machine are intact by construction."""
     try:
         import sqlite3
-        from storage.article_store import _get_db_path, _LIVE_ONLY_CLAUSE
+        from watchers.alert_recency import DB_PATH as _RECENCY_DB_PATH
         from datetime import timedelta as _td
         now = datetime.now(timezone.utc)
         recent_cut = (now - _td(hours=window_hours)).isoformat()
         prior_cut = (now - _td(hours=2 * window_hours)).isoformat()
         conn = sqlite3.connect(
-            f"file:{_get_db_path()}?mode=ro", uri=True, timeout=5,
+            f"file:{_RECENCY_DB_PATH}?mode=ro", uri=True, timeout=5,
         )
         try:
             conn.execute("PRAGMA busy_timeout=5000")
             row = conn.execute(
                 "SELECT "
-                "SUM(CASE WHEN first_seen >= ? THEN 1 ELSE 0 END) AS recent, "
-                "SUM(CASE WHEN first_seen >= ? AND first_seen < ? "
+                "SUM(CASE WHEN last_ts >= ? THEN 1 ELSE 0 END) AS recent, "
+                "SUM(CASE WHEN last_ts >= ? AND last_ts < ? "
                 "         THEN 1 ELSE 0 END) AS prior "
-                f"FROM articles WHERE urgency = 2 AND first_seen >= ? "
-                f"AND {_LIVE_ONLY_CLAUSE}",
+                "FROM alerted_sig WHERE last_ts >= ?",
                 (recent_cut, prior_cut, recent_cut, prior_cut),
             ).fetchone()
         finally:

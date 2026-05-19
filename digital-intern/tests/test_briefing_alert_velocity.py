@@ -20,9 +20,16 @@ Tests pin the operational contract with SPECIFIC numbers (not "no crash"):
     discipline as ``source_throughput`` / ``source_health_report`` /
     ``prior_digest``);
   * the SYSTEM_PROMPT reproduces the new section (a non-prompt that silently
-    dropped the input would defeat the whole feature).
+    dropped the input would defeat the whole feature);
+  * ``_collect_alert_velocity`` reads from ``alert_recency.db`` (ACTUAL
+    fires) — NOT from ``articles.db urgency=2`` (which conflates fires with
+    pre-fire suppressions); a synthetic mixed fixture pins the discriminator.
 """
 from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -219,6 +226,172 @@ class TestBuildPayloadAlertVelocityWiring:
         )
         assert "=== ALERT VELOCITY" in out
         assert "wire newly active" in out
+
+
+class TestCollectAlertVelocityDataSource:
+    """Pin that ``_collect_alert_velocity`` reads from ``alert_recency.db``
+    (the canonical fires log) and NOT from ``articles.db urgency=2`` (which
+    conflates fires with the four pre-fire suppression gates'
+    ``mark_alerted_batch`` calls in ``watchers.alert_agent``).
+
+    Live evidence (2026-05-19, 10h window): 58 ``urgency=2`` rows in
+    ``articles.db`` vs 37 hits in ``alert_recency.db`` — the prior
+    implementation over-counted fires by ~57%, inflating the wire-heat
+    signal Opus sees on the briefing's primary consumed product. These
+    tests pin the data-source switch so a future regression that points
+    ``_collect_alert_velocity`` back at ``urgency=2`` fails loud."""
+
+    def _make_recency_db(self, path: Path, rows: list[tuple[str, str]]) -> None:
+        """Build a fake ``alert_recency.db`` at ``path`` mirroring the live
+        schema. Each row is ``(sig, last_ts_iso)``."""
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS alerted_sig (
+                    sig      TEXT PRIMARY KEY,
+                    last_ts  TEXT NOT NULL,
+                    title    TEXT,
+                    hits     INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE INDEX IF NOT EXISTS idx_alerted_sig_ts
+                    ON alerted_sig(last_ts);
+            """)
+            conn.executemany(
+                "INSERT OR REPLACE INTO alerted_sig (sig, last_ts, title, hits) "
+                "VALUES (?, ?, ?, 1)",
+                [(sig, ts, f"title-{sig}") for sig, ts in rows],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_counts_distinct_fires_in_each_window(
+        self, tmp_path, monkeypatch
+    ):
+        """Three fires in the last 5h, two in the prior 5h — collector must
+        report recent=3, prior=2, window_h=5 (and never read ``articles.db``).
+        Pinned against last_ts boundary semantics: recent = ``last_ts >= now-5h``,
+        prior = ``now-10h <= last_ts < now-5h``."""
+        db_path = tmp_path / "alert_recency.db"
+        now = datetime.now(timezone.utc)
+        rows = [
+            # recent (within 5h)
+            ("sig-recent-1", (now - timedelta(hours=0.5)).isoformat()),
+            ("sig-recent-2", (now - timedelta(hours=2.0)).isoformat()),
+            ("sig-recent-3", (now - timedelta(hours=4.9)).isoformat()),
+            # prior (5h..10h ago)
+            ("sig-prior-1", (now - timedelta(hours=5.5)).isoformat()),
+            ("sig-prior-2", (now - timedelta(hours=8.0)).isoformat()),
+            # outside both windows (>10h ago) — must not count
+            ("sig-stale", (now - timedelta(hours=11.0)).isoformat()),
+        ]
+        self._make_recency_db(db_path, rows)
+
+        # Point the collector at our fixture path. The module's ``DB_PATH``
+        # is what the runtime reads; monkeypatch it for the duration of the
+        # test.
+        monkeypatch.setattr(
+            "watchers.alert_recency.DB_PATH", db_path, raising=True
+        )
+
+        result = claude_analyst._collect_alert_velocity(window_hours=5)
+        assert result == {"recent": 3, "prior": 2, "window_h": 5}
+
+    def test_ignores_articles_db_urgency_2_suppressions(
+        self, tmp_path, monkeypatch
+    ):
+        """**The discriminating regression.** Seed an ``articles.db`` with
+        many ``urgency=2`` rows (the four ``alert_agent`` suppression gates
+        all mark rows alerted WITHOUT firing) and a SEPARATE
+        ``alert_recency.db`` with only ONE recorded fire. The collector must
+        report 1, not 5+ — i.e. it must NOT be looking at the articles
+        table. The prior buggy implementation would have counted the 5
+        urgency=2 suppressed rows as fires."""
+        recency_path = tmp_path / "alert_recency.db"
+        now = datetime.now(timezone.utc)
+        self._make_recency_db(
+            recency_path,
+            [("sig-real-fire", (now - timedelta(hours=1)).isoformat())],
+        )
+
+        # Seed a parallel articles.db with FIVE urgency=2 rows in the same
+        # recent window — these are what the prior bug counted. The collector
+        # must ignore them by virtue of pointing at alert_recency.db instead.
+        articles_path = tmp_path / "articles.db"
+        aconn = sqlite3.connect(str(articles_path))
+        try:
+            aconn.executescript("""
+                CREATE TABLE articles (
+                    id TEXT PRIMARY KEY, url TEXT, title TEXT, source TEXT,
+                    first_seen TEXT, urgency INTEGER
+                );
+            """)
+            for i in range(5):
+                aconn.execute(
+                    "INSERT INTO articles VALUES (?, ?, ?, ?, ?, 2)",
+                    (f"id{i}", f"https://example.com/{i}", f"t{i}", "rss",
+                     (now - timedelta(hours=0.5 + i * 0.1)).isoformat()),
+                )
+            aconn.commit()
+        finally:
+            aconn.close()
+
+        monkeypatch.setattr(
+            "watchers.alert_recency.DB_PATH", recency_path, raising=True
+        )
+        # Belt-and-braces: force-point the articles DB resolver at the
+        # poisoned suppression-only fixture. If the collector ever queries
+        # it, the assertion below catches the regression.
+        monkeypatch.setattr(
+            "storage.article_store._get_db_path",
+            lambda: articles_path,
+            raising=True,
+        )
+
+        result = claude_analyst._collect_alert_velocity(window_hours=5)
+        assert result is not None
+        # Exactly 1 real fire — the 5 urgency=2 articles-only suppressions
+        # MUST NOT count.
+        assert result["recent"] == 1, (
+            f"Expected 1 real fire; counted {result['recent']} — collector "
+            "is reading articles.db urgency=2 again (the over-count bug)"
+        )
+        assert result["prior"] == 0
+        assert result["window_h"] == 5
+
+    def test_returns_none_on_missing_recency_db(self, tmp_path, monkeypatch):
+        """A missing/locked recency DB is the documented best-effort failure
+        mode: return ``None`` so ``_build_payload`` omits the section entirely
+        (the 5h briefing is never broken or delayed)."""
+        missing = tmp_path / "does_not_exist.db"
+        monkeypatch.setattr(
+            "watchers.alert_recency.DB_PATH", missing, raising=True
+        )
+        assert claude_analyst._collect_alert_velocity(window_hours=5) is None
+
+    def test_window_hours_propagates_to_result(self, tmp_path, monkeypatch):
+        """A non-default ``window_hours`` (e.g. 2h) must round-trip into the
+        returned dict so ``_alert_velocity_lines`` renders the correct
+        period label (the test fixtures above already check the renderer's
+        end, this checks the collector's end)."""
+        recency_path = tmp_path / "alert_recency.db"
+        now = datetime.now(timezone.utc)
+        rows = [
+            # Inside 2h window
+            ("a", (now - timedelta(minutes=30)).isoformat()),
+            ("b", (now - timedelta(minutes=90)).isoformat()),
+            # Inside prior 2h..4h window
+            ("c", (now - timedelta(hours=2.5)).isoformat()),
+            # Outside both
+            ("d", (now - timedelta(hours=5)).isoformat()),
+        ]
+        self._make_recency_db(recency_path, rows)
+        monkeypatch.setattr(
+            "watchers.alert_recency.DB_PATH", recency_path, raising=True
+        )
+
+        result = claude_analyst._collect_alert_velocity(window_hours=2)
+        assert result == {"recent": 2, "prior": 1, "window_h": 2}
 
 
 class TestSystemPromptCoverage:
