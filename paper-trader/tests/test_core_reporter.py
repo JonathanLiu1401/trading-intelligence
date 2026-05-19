@@ -3049,3 +3049,176 @@ class TestNextSessionLine:
         monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5000.0)
         assert reporter.send_hourly_summary() is True
         assert "**MARKET** ◈ closed" not in captured[0]
+
+
+class TestSourceMixLine:
+    """`_source_mix_line` + its hourly/daily wiring — the news-breadth
+    false-signal surface. `news_velocity` measures rate (BUILDING/FADING);
+    a SURGING z-score is identical whether five distinct outlets are
+    reporting or one wire is mirrored across five feeds. This line fires
+    ONLY when at least one held ticker reads ECHO (single-source ≥70%);
+    every other state is silent."""
+
+    def _stub_builder(self, monkeypatch, payload):
+        from paper_trader.analytics import news_source_mix as nsm
+        monkeypatch.setattr(nsm, "build_news_source_mix",
+                            lambda *a, **k: payload)
+
+    def _seed_held_nvda(self, store):
+        """Open a real NVDA position so the reporter's open_positions read
+        produces a held set the builder is invoked against."""
+        store.upsert_position("NVDA", qty=2, avg_cost=200.0,
+                              type_="stock")
+        store.update_portfolio(cash=500.0, total_value=1000.0, positions=[])
+
+    def _stub_db_present(self, monkeypatch, tmp_path):
+        """``_source_mix_line`` reads articles.db via signals._db_path. We
+        stub it to return a placeholder file so the helper proceeds past the
+        no-DB gate (the SQL itself returns no rows on an empty DB, which is
+        the documented degrade path)."""
+        from paper_trader import signals as sigs
+        # Create an empty articles.db so sqlite can open it.
+        import sqlite3
+        p = tmp_path / "articles.db"
+        c = sqlite3.connect(str(p))
+        c.execute(
+            "CREATE TABLE articles ("
+            "id TEXT PRIMARY KEY, url TEXT, title TEXT, source TEXT, "
+            "first_seen TEXT NOT NULL, ai_score REAL, urgency INTEGER, "
+            "full_text BLOB)"
+        )
+        c.commit()
+        c.close()
+        monkeypatch.setattr(sigs, "_db_path", lambda: p)
+        return p
+
+    def test_empty_when_no_positions(self, fresh_store, monkeypatch):
+        """No held names → the builder is never reached; line empty."""
+        # No held positions seeded.
+        assert reporter._source_mix_line(fresh_store) == ""
+
+    def test_empty_when_no_db_path(self, fresh_store, monkeypatch):
+        self._seed_held_nvda(fresh_store)
+        from paper_trader import signals as sigs
+        monkeypatch.setattr(sigs, "_db_path", lambda: None)
+        assert reporter._source_mix_line(fresh_store) == ""
+
+    def test_empty_when_state_is_quiet(self, fresh_store, tmp_path,
+                                       monkeypatch):
+        """Silence-when-nothing-actionable: STRONG/MODERATE/QUIET states all
+        suppress. Only ECHO surfaces (the false-signal warning)."""
+        self._seed_held_nvda(fresh_store)
+        self._stub_db_present(monkeypatch, tmp_path)
+        self._stub_builder(monkeypatch, {
+            "state": "OK", "any_echo": False,
+            "headline": "Source mix: NVDA STRONG (...).",
+            "per_ticker": [{"ticker": "NVDA", "state": "STRONG"}],
+        })
+        assert reporter._source_mix_line(fresh_store) == ""
+
+    def test_empty_when_state_no_data(self, fresh_store, tmp_path,
+                                      monkeypatch):
+        self._seed_held_nvda(fresh_store)
+        self._stub_db_present(monkeypatch, tmp_path)
+        self._stub_builder(monkeypatch, {
+            "state": "NO_DATA", "any_echo": False,
+            "headline": "Source mix: 0 articles ...",
+        })
+        assert reporter._source_mix_line(fresh_store) == ""
+
+    def test_surfaces_echo_verbatim(self, fresh_store, tmp_path, monkeypatch):
+        """ECHO state → fire the warning line with the builder's headline
+        carried VERBATIM (single source of truth — no re-derive)."""
+        self._seed_held_nvda(fresh_store)
+        self._stub_db_present(monkeypatch, tmp_path)
+        headline = ("Source mix: NVDA ECHO (5 articles, 100% from yahoo) — "
+                    "surge may be syndication, not breadth.")
+        self._stub_builder(monkeypatch, {
+            "state": "OK", "any_echo": True, "headline": headline,
+            "per_ticker": [{"ticker": "NVDA", "state": "ECHO",
+                            "n_articles": 5, "top_source": "yahoo"}],
+        })
+        line = reporter._source_mix_line(fresh_store)
+        assert line.startswith("**NEWS BREADTH** ◈ syndication warning")
+        # Builder's headline appears verbatim — no re-derive.
+        assert headline in line
+
+    def test_degrades_to_empty_on_builder_fault(self, fresh_store, tmp_path,
+                                                 monkeypatch):
+        """Additive failure contract — drops this line, never raises."""
+        self._seed_held_nvda(fresh_store)
+        self._stub_db_present(monkeypatch, tmp_path)
+        from paper_trader.analytics import news_source_mix as nsm
+
+        def _boom(*a, **k):
+            raise RuntimeError("builder blew up")
+
+        monkeypatch.setattr(nsm, "build_news_source_mix", _boom)
+        assert reporter._source_mix_line(fresh_store) == ""
+
+    def test_hourly_summary_includes_echo_after_idle(
+            self, fresh_store, tmp_path, monkeypatch):
+        """Wiring order: IDLE (regret) → NEWS BREADTH (false-signal) →
+        CAPITAL (manual-fix). NEWS BREADTH sits adjacent to IDLE because
+        both read articles.db on held names."""
+        self._seed_held_nvda(fresh_store)
+        self._stub_db_present(monkeypatch, tmp_path)
+        self._stub_builder(monkeypatch, {
+            "state": "OK", "any_echo": True,
+            "headline": "Source mix: NVDA ECHO (...).",
+            "per_ticker": [],
+        })
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        # Force CAPITAL line so the ordering is end-to-end observable.
+        monkeypatch.setattr(reporter, "_capital_pulse_line",
+                            lambda store: "**CAPITAL** ◈ FREE\n> $500 cash")
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**NEWS BREADTH**" in body
+        assert "**CAPITAL**" in body
+        # Order: NEWS BREADTH appears before CAPITAL.
+        assert body.index("**NEWS BREADTH**") < body.index("**CAPITAL**")
+
+    def test_hourly_silent_when_no_echo(
+            self, fresh_store, tmp_path, monkeypatch):
+        """End-to-end silence guarantee: a STRONG / MODERATE / QUIET verdict
+        must NEVER reach Discord — the summary must not become its own
+        green-light line."""
+        self._seed_held_nvda(fresh_store)
+        self._stub_db_present(monkeypatch, tmp_path)
+        self._stub_builder(monkeypatch, {
+            "state": "OK", "any_echo": False,
+            "headline": "Source mix: NVDA MODERATE.",
+            "per_ticker": [],
+        })
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_hourly_summary() is True
+        assert "**NEWS BREADTH**" not in captured[0]
+
+    def test_daily_close_includes_echo(self, fresh_store, tmp_path,
+                                       monkeypatch):
+        self._seed_held_nvda(fresh_store)
+        self._stub_db_present(monkeypatch, tmp_path)
+        self._stub_builder(monkeypatch, {
+            "state": "OK", "any_echo": True,
+            "headline": "Source mix: NVDA ECHO (...).",
+            "per_ticker": [],
+        })
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_daily_close() is True
+        assert "**NEWS BREADTH**" in captured[0]

@@ -862,6 +862,95 @@ def _stress_line(store) -> str:
         return ""
 
 
+def _source_mix_line(store) -> str:
+    """One-line ECHO warning for held names whose news SURGE is
+    actually one syndicated source mirrored across many feeds.
+
+    ``/api/news-velocity`` answers *rate* (BUILDING/FADING). A SURGING
+    z-score of +4 looks identical whether five distinct outlets are
+    reporting or one wire is being mirrored across five feeds.
+    ``build_news_source_mix`` adds the orthogonal *breadth* observable:
+    the source-diversity verdict (STRONG/MODERATE/ECHO/QUIET). This line
+    fires ONLY when at least one held ticker reads ECHO — the false-
+    signal case (a chase risk: the operator sees the velocity spike
+    in their hourly and trims/adds, not realising the surge is one
+    wire). All other states are silent — the ``_capital_pulse_line``
+    FREE / ``_host_pulse_line`` CLEAR suppression precedent (the
+    summary must never become its own lying green light).
+
+    Single source of truth (invariant #10): composes the builder's
+    own ``headline`` verbatim so the Discord line and
+    ``/api/news-source-mix`` can never drift.
+
+    Discord-path discipline (no network): reads ONLY the articles.db
+    that ``/api/news-source-mix`` reads and the held set from
+    ``store.open_positions()``. No yfinance, no Claude, no remote DB
+    — the documented per-call latency/hang hazard for any hot Discord
+    line. Observational only, no caps, never gates
+    (invariants #2/#12). Failure contract mirrors the rest of
+    ``reporter``: any builder/store fault degrades to ``""``, never
+    an exception."""
+    try:
+        from .analytics.news_source_mix import build_news_source_mix
+        from .signals import _db_path as _signals_db_path
+        import sqlite3
+
+        positions = store.open_positions()
+        held = []
+        for p in positions:
+            tk = (p.get("ticker") or "").upper().strip()
+            if not tk or (p.get("type") or "stock") != "stock":
+                continue
+            if tk in {"CASH", "NONE", "NO_DECISION", "BLOCKED"}:
+                continue
+            if tk not in held:
+                held.append(tk)
+        if not held:
+            return ""
+
+        path = _signals_db_path()
+        if not path:
+            return ""
+
+        now_utc = datetime.now(timezone.utc)
+        since = (now_utc - timedelta(hours=24.0)).isoformat()
+        articles: list[dict] = []
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
+        try:
+            like_clauses = " OR ".join(["title LIKE ?"] * len(held))
+            like_params = [f"%{t}%" for t in held]
+            cur = conn.execute(
+                f"SELECT title, source, first_seen FROM articles "
+                f"WHERE first_seen >= ? AND ({like_clauses}) "
+                f"AND url NOT LIKE 'backtest://%' "
+                f"AND source NOT LIKE 'backtest_%' "
+                f"AND source NOT LIKE 'opus_annotation%' "
+                f"ORDER BY first_seen DESC LIMIT 5000",
+                [since] + like_params,
+            )
+            for r in cur.fetchall():
+                articles.append({
+                    "title": r[0] or "",
+                    "source": r[1] or "",
+                    "first_seen": r[2],
+                })
+        finally:
+            conn.close()
+
+        result = build_news_source_mix(
+            articles, held, now=now_utc, window_hours=24.0,
+        )
+        if not isinstance(result, dict) or not result.get("any_echo"):
+            # ECHO-only firing — STRONG/MODERATE/QUIET are silent.
+            return ""
+        # Verbatim from builder for no-drift with the endpoint.
+        return ("**NEWS BREADTH** ◈ syndication warning — "
+                + str(result.get("headline") or ""))
+    except Exception as e:
+        print(f"[reporter] source mix line skipped: {e}")
+        return ""
+
+
 def _earnings_shock_line(store) -> str:
     """One-line pre-earnings $-at-risk-by-position summary for the hourly /
     daily report.
@@ -2337,6 +2426,14 @@ def send_hourly_summary() -> bool:
     iox = _idle_opportunity_line(store)
     if iox:
         body += "\n" + iox
+    # News-breadth warning — fires ONLY on ECHO (a SURGING velocity that
+    # is actually one wire mirrored across many feeds). Sits right after
+    # IDLE because both read articles.db and both are silence-by-default;
+    # an ECHO warning on a held name catches the operator about to chase
+    # a false-signal velocity spike.
+    smx = _source_mix_line(store)
+    if smx:
+        body += "\n" + smx
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
@@ -2457,6 +2554,9 @@ def send_daily_close() -> bool:
     iox = _idle_opportunity_line(store)
     if iox:
         body += "\n" + iox
+    smx = _source_mix_line(store)
+    if smx:
+        body += "\n" + smx
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
