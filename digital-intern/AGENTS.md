@@ -3806,3 +3806,54 @@ expected; this entry was appended, not rewritten).
   `collectors/seekingalpha_collector.py` + all `paper-trader/*`
   deliberately never staged. This AGENTS.md entry was appended, not
   rewritten.
+
+- **2026-05-19 feat (Agent 4 product-engineer pass) — `/api/news-corroboration`.**
+  New deterministic, **no-LLM** route that surfaces multi-source story
+  confirmation as a triage filter against the dominant feed false-positive:
+  a single-source wire-recap headline (e.g. `Why <ticker> Trading Up Today`
+  from one GoogleNews aggregator wrapper) hitting `ai_score` 9+ with NO
+  other outlet carrying the story. Pure builder `build_news_corroboration`
+  at `dashboard/web_server.py` greedily clusters fresh `articles.db` rows
+  by token-set Jaccard (**SSOT**: composes `ml.dedup.title_tokens` +
+  `ml.dedup.jaccard_similarity` verbatim — same near-duplicate primitive
+  the briefing's domain-diversity / near-dup-collapse depend on, so this
+  view of "what story is this article about" cannot drift from the rest of
+  the pipeline). For each cluster: distinct sources set, max ai_score, max
+  urgency, latest first_seen. Filters to `n_sources >= min_sources` (default
+  2, range 2..10) and ranks by corroboration count → quality → freshness.
+
+  **Route** `/api/news-corroboration?hours=6&min_sources=2` (hours clamped
+  1..168). Carries the `_LIVE_ONLY_SQL` exclusion (backtest:// /
+  backtest_* / opus_annotation* never reach corroboration view; mirrors
+  `/api/sector-pulse` + `/api/portfolio-signals`). Live evidence at
+  rollout: 1534 articles scanned → 1100 clusters → 130 multi-source; top
+  cluster (17 distinct GDELT-Australian-regional sources for one inflation
+  story) is exactly the corroboration extreme an analyst wants surfaced;
+  Nvidia/Micron Earnings-eve stories carry 7-8 sources each at ai_score
+  5-8 (real news), while single-source `Why <ticker> Trading Up Today`
+  recaps at ai_score 9+ are correctly elided.
+
+  **Locks (`tests/test_news_corroboration.py`, 18 tests, 0.17s):**
+    1. NO_DATA / multi-source filter ladder
+    2. Jaccard threshold semantics (default 0.6 to match `ml.dedup`)
+    3. Same-source-repeated does NOT inflate `n_sources` (DISTINCT-source
+       contract)
+    4. Ranking: corroboration → quality → freshness (no other order)
+    5. Reordered headlines collapse to one cluster ("Apple beats Q2" ↔
+       "Q2 beaten by Apple")
+    6. **No-LLM / no-subprocess / no-network / no-sqlite3 purity** — the
+       survives-quota guarantee made falsifiable
+    7. **SSOT pinned by source inspection** — must `from ml.dedup import`
+       both primitives (no re-implemented tokenizer)
+    8. Route returns JSON envelope, clamps `hours` (1..168) +
+       `min_sources` (2..10)
+    9. Route SQL carries `_LIVE_ONLY_SQL` exclusion (backtest isolation
+       invariant inlined, not skipped)
+
+  **Observational only** — no decision-prompt injection, no chat
+  enrichment yet (defer until live signal quality validated); pure
+  diagnostic surface for the dashboard's news triage. Builder appended
+  ABOVE `create_app` so `build_news_corroboration` is importable for
+  tests; route appended IMMEDIATELY AFTER `/api/portfolio-signals` inside
+  `create_app` (alphabetical-ish news-bucket ordering). NEVER raises into
+  the Flask handler — `_ro_query` failure degrades to empty `arts`.

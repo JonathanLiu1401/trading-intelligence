@@ -1045,7 +1045,7 @@ def build_news_corroboration(
     articles: list,
     *,
     min_sources: int = 2,
-    jaccard_threshold: float = 0.5,
+    jaccard_threshold: float = 0.6,
     max_clusters: int = 50,
     now: datetime | None = None,
 ) -> dict:
@@ -1461,6 +1461,55 @@ def create_app(store=None) -> Flask:
             for r in rows
         ]
         out = build_portfolio_signals(arts)
+        out["window_hours"] = hours
+        return jsonify(out)
+
+    @app.get("/api/news-corroboration")
+    def api_news_corroboration():
+        """Multi-source story confirmation feed — rank live clusters by how
+        many distinct collectors carried the same headline.
+
+        Single-source urgency is the dominant false-positive in the feed
+        (a wire-recap "Why X Trading Up Today" can spike ai_score past 9
+        without any other outlet confirming). This buckets fresh articles
+        by ``ml.dedup`` title-token Jaccard (same primitive the briefing's
+        near-dup-collapse uses) and returns clusters with ``n_sources >=
+        min_sources`` ranked by corroboration count, then quality, then
+        freshness. ``?hours=`` clamped 1..168 (default 6).
+        ``?min_sources=`` clamped 2..10 (default 2).
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            hours = int(request.args.get("hours", 6))
+        except (TypeError, ValueError):
+            hours = 6
+        hours = max(1, min(168, hours))
+        try:
+            min_sources = int(request.args.get("min_sources", 2))
+        except (TypeError, ValueError):
+            min_sources = 2
+        min_sources = max(2, min(10, min_sources))
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT title, source, url, ai_score, urgency, first_seen "
+                "FROM articles "
+                f"WHERE first_seen >= ? AND {_LIVE_ONLY_SQL} "
+                "ORDER BY first_seen DESC LIMIT 4000",
+                (since,),
+            )
+        except sqlite3.Error:
+            rows = []
+        arts = [
+            {"title": r[0] or "", "source": r[1] or "", "url": r[2],
+             "ai_score": float(r[3] or 0), "urgency": int(r[4] or 0),
+             "first_seen": r[5]}
+            for r in rows
+        ]
+        out = build_news_corroboration(arts, min_sources=min_sources)
         out["window_hours"] = hours
         return jsonify(out)
 
