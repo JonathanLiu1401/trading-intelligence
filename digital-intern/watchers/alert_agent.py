@@ -226,22 +226,50 @@ _QW_QUOTE_PATH = re.compile(r"/quote/[^/]+/?$", re.I)
 _QW_LISTING = re.compile(
     r"^\s*\$[^$\n]{0,60}\([A-Za-z0-9.\-]{1,8}\.[A-Za-z]{1,4}\)\$"
 )
+# Yahoo Finance screener-tape pseudo-article — distinct fingerprint the three
+# regexes above don't catch (no glued price, no parenthesised %, no $share-card
+# lead). ``collectors/market_movers.py`` emits screener entries with a leading
+# ``[YF/<bucket>]`` tag, e.g.
+#   ``[YF/most_actives] MU (Micron Technology, Inc.) +2.5% @ $698.74 | vol 6``
+#   ``[YF/day_gainers] AXTI (AXT Inc) +6.6% @ $112.88 | vol 9.6M (0.8x avg)``
+# Live evidence (2026-05-19, last 2h of urgency=2 rows): 4 of 12 BREAKING
+# alerts fired by the analyst's standalone-push channel were YF screener
+# entries — ml_score 9.9 score_source='ml' (urgency head over-scores them
+# because the title looks "extreme": signed %, large vol number, ticker dollar
+# price). They are NOT breaking news — they describe the CURRENT market state
+# (this ticker is one of today's top movers), and the 30-min per-(symbol,
+# screener) cooldown in market_movers.py dampens repetition but cannot
+# down-rank the urgency itself. The defense-in-depth drop here is the only
+# surface that suppresses the standalone push without breaking the collector
+# (it still emits one row per surge that survives in the digest if Opus picks
+# it up).
+#
+# Fingerprint anchoring: ``^\s*\[YF/<lowercase_underscore>\]\s+[A-Z]``. The
+# real publisher tag convention is ``GDELT/reuters.com`` / ``scraped/finance.
+# yahoo.com`` / ``GN: Nvidia`` — never bracketed. The bucket-token character
+# class ``[a-z_]+`` excludes the ``.com`` in ``[GDELT/reuters.com]`` should one
+# ever appear, and the trailing ``\s+[A-Z]`` requires a ticker-like next token
+# so a bare ``[YF/...]`` paragraph break is not matched.
+_QW_SCREENER_TAPE = re.compile(
+    r"^\s*\[YF/[a-z_]+\]\s+[A-Z]"
+)
 
 
 def _looks_like_quote_widget(art: dict) -> bool:
     """True for a live quote-tape / quote-listing entry masquerading as an
     urgent article.
 
-    Three independent title fingerprints (a letter glued to a decimal price; a
+    Four independent title fingerprints (a letter glued to a decimal price; a
     parenthesised signed % change; a "$NAME (SYMBOL.EXCH)$" share-card listing
-    page) plus a Yahoo /quote/ landing path. All are anchored so real headlines
-    with $/%/comma numbers ("rises 22% to $35.1 billion", "5,123.41 record
-    high"), real "$TICKER ..." prose ("$MU upgraded to Buy") and real
-    quote-scoped article URLs are never caught. Mirrors
+    page; a ``[YF/<bucket>]`` screener-tape lead from ``market_movers``) plus a
+    Yahoo /quote/ landing path. All are anchored so real headlines with
+    $/%/comma numbers ("rises 22% to $35.1 billion", "5,123.41 record high"),
+    real "$TICKER ..." prose ("$MU upgraded to Buy") and real quote-scoped
+    article URLs are never caught. Mirrors
     collectors.web_scraper._looks_like_quote_widget."""
     title = art.get("title") or ""
     if (_QW_PRICE_GLUE.search(title) or _QW_PCT_PAREN.search(title)
-            or _QW_LISTING.search(title)):
+            or _QW_LISTING.search(title) or _QW_SCREENER_TAPE.search(title)):
         return True
     url = art.get("link") or art.get("url") or ""
     try:
