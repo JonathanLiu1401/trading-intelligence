@@ -1215,6 +1215,50 @@ def _pos_pct_weight(p: dict, total_value: float | None) -> str:
     return f"  ({' · '.join(parts)})" if parts else ""
 
 
+def _pos_hold_age_token(p: dict, now: datetime | None = None) -> str:
+    """Compact ``  held 3d`` token from a position's ``opened_at`` field.
+
+    Mirrors the ``held=Xd`` annotation the Opus decision prompt already shows
+    per position (``strategy._hold_age_str`` — invariants #2/#12, the
+    stale_mark / pct-weight precedent: pure formatting of an existing field,
+    additive on the Discord surface). The desk's #1 documented pathology is
+    the disposition effect (riding losers); the hourly summary's position
+    lines historically showed qty/avg/now/P/L with no idea *how long* a
+    position had been held, so a 4-day-stuck loser read the same as a fresh
+    fill.
+
+    Read-only over ``opened_at`` — ``store.open_positions()`` always carries
+    it, the unit-test positions and the ``portfolio.positions_json``
+    snapshot cache do not (``strategy._portfolio_snapshot`` strips it on
+    persist, see store.py upsert_position). A missing / unparseable field
+    degrades to ``""`` so existing test callers stay byte-compatible.
+
+    Sub-minute returns ``""`` so a just-opened lot does not flicker a noisy
+    ``held 0m`` next to its own fill. A future ``opened_at`` (wall-clock
+    stepped back — the documented clock-skew hazard) clamps to ``""`` too.
+    ``now`` is injectable for deterministic tests (the
+    ``_fmt_trade_stamp`` precedent).
+    """
+    opened = p.get("opened_at")
+    if not opened:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(opened).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    secs = (now - dt).total_seconds()
+    if secs < 60:
+        return ""
+    if secs < 3600:
+        return f"  held {int(secs // 60)}m"
+    if secs < 86400:
+        return f"  held {int(secs // 3600)}h"
+    return f"  held {int(secs // 86400)}d"
+
+
 def _portfolio_lines(positions: list[dict],
                      total_value: float | None = None) -> list[str]:
     lines = []
@@ -1231,15 +1275,21 @@ def _portfolio_lines(positions: list[dict],
         # substring assertions; only the live hourly/daily callers, which
         # already hold ``pf['total_value']``, opt into the weight token.
         pw = _pos_pct_weight(p, total_value)
+        # Hold age — same shape as the Opus prompt's per-position annotation
+        # (strategy._hold_age_str). Surfaces the disposition-effect signal on
+        # the Discord surface the operator actually reads. Empty when
+        # opened_at is absent (existing test callers), so the existing
+        # byte-compatible assertions stay locked.
+        age = _pos_hold_age_token(p)
         if p["type"] in ("call", "put"):
             lines.append(
                 f"  {p['ticker']} {p['type'].upper()}{p['strike']} {p['expiry']}  "
-                f"qty {p['qty']}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{stale}"
+                f"qty {p['qty']}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{age}{stale}"
             )
         else:
             lines.append(
                 f"  {p['ticker']:<6} qty {p['qty']:<8} avg ${p['avg_cost']:.2f} "
-                f"now ${(p.get('current_price') or 0):.2f}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{stale}"
+                f"now ${(p.get('current_price') or 0):.2f}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{age}{stale}"
             )
     return lines
 
