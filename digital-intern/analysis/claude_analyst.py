@@ -99,25 +99,86 @@ def _collapse_syndicated(articles: list) -> list:
 
     keep: dict[str, dict] = {}
     order: list[str] = []
+    # Per-cluster set of distinct source keys (e.g. ``gdelt_gkg/iheart.com``
+    # vs ``rss`` vs ``gdelt_gkg/joker.com``). Used to discriminate ``[echo]``
+    # — a cluster whose ``_corroboration > 1`` but ``_distinct_sources == 1``
+    # is the SAME source repeating itself (e.g. a mass-aggregator host
+    # restating one wire under slightly-varied titles), NOT independent
+    # cross-outlet corroboration. The ``[syndicated xN]`` tag oversells that
+    # case; ``[echo]`` qualifies it so Opus down-weights it in TOP SIGNALS.
+    # An empty / missing source is treated as the literal empty-string key so
+    # two empty-source copies count as one distinct (still echo-eligible) —
+    # the analyst-safe direction for noisy collectors that lose source tags.
+    hosts: dict[str, set[str]] = {}
     for idx, art in enumerate(articles):
         sig = _signature(art.get("title"))
         if not sig:
             sig = f"__uniq__{idx}"
+        src = str(art.get("source") or "")
         cur = keep.get(sig)
         if cur is None:
             rep = dict(art)
             rep["_corroboration"] = 1
             keep[sig] = rep
             order.append(sig)
+            hosts[sig] = {src}
             continue
         cur["_corroboration"] += 1
+        hosts[sig].add(src)
         # Strictly-greater so ties keep the earlier (already higher-ranked)
         # representative — deterministic and stable.
         if _score(art) > _score(cur):
             merged = dict(art)
             merged["_corroboration"] = cur["_corroboration"]
             keep[sig] = merged
+    # Surface distinct-source count on the representative. The render layer
+    # uses it for ``[echo]``; downstream consumers that already keyed on
+    # ``_corroboration`` are unaffected (additive field).
+    for sig in order:
+        keep[sig]["_distinct_sources"] = len(hosts[sig]) or 1
     return [keep[s] for s in order]
+
+
+# ── Echo detection (single-source self-syndication) ─────────────────────────
+# A cluster of N>=ECHO_MIN_COPIES copies all carrying the SAME ``source`` key
+# is one outlet repeating itself, not independent cross-outlet corroboration.
+# GDELT GKG hosts (iheart.com, joker.com, wkrb13.com) are the recurring
+# culprits — a single host can write 5-8 slight headline variants of one wire
+# in an hour. The existing ``[syndicated xN]`` tag tells Opus "N wire copies
+# of this story exist" — true, but reads as positive corroboration; this
+# qualifies it. ``[echo]`` says: those N copies all came from ONE outlet —
+# down-weight, not up-weight, when ranking TOP SIGNALS / choosing the LEAD.
+#
+# Threshold N>=3 (not 2) keeps a benign retitle by the same source quiet; a
+# 2-copy single-source cluster might just be a corrected/updated headline.
+# 3+ copies from one source is the firehose pattern the analyst persona
+# complains about as "echo".
+ECHO_MIN_COPIES = 3
+
+
+def _is_echo_row(art: dict) -> bool:
+    """Pure: True iff this collapsed-cluster representative is a single-source
+    echo (>=ECHO_MIN_COPIES copies, all from one ``source`` key).
+
+    Defaults assume the more conservative answer: a missing
+    ``_distinct_sources`` (e.g. a row that bypassed ``_collapse_syndicated``,
+    or a prepended snapshot row) defaults to the corroboration count, so a
+    snapshot row that already has ``_corroboration==1`` never lights up.
+    """
+    if not isinstance(art, dict):
+        return False
+    try:
+        corro = int(art.get("_corroboration", 1))
+    except (TypeError, ValueError):
+        return False
+    if corro < ECHO_MIN_COPIES:
+        return False
+    distinct = art.get("_distinct_sources", corro)
+    try:
+        distinct = int(distinct)
+    except (TypeError, ValueError):
+        return False
+    return distinct <= 1
 
 # ── Coverage-gap intelligence ────────────────────────────────────────────────
 # A news analyst's most dangerous failure is a *silent* one: a high-value intel
@@ -820,6 +881,7 @@ RULES:
 - Total output must fit in 1800 characters. Be ruthlessly concise. Cut low-signal rows.
 - No nested backticks. No backtick dividers. Dividers are plain ━━━ lines outside code blocks.
 - A newswire row tagged "[syndicated xN]" was independently carried by N sources — treat higher N as stronger corroboration/magnitude when choosing the LEAD and ordering TOP SIGNALS; a lone (untagged) item is single-sourced and less confirmed.
+- A newswire row ALSO tagged "[echo]" alongside "[syndicated xN]" is a calibration warning: those N copies all came from ONE source (a single outlet self-syndicating slight title variants of the same wire) — NOT independent corroboration. Down-weight: do not lead a "[syndicated xN] [echo]" row over a comparable single-but-credible row, and never treat the N count as cross-outlet confirmation when choosing the LEAD or ranking TOP SIGNALS. An untagged "[syndicated xN]" (no [echo]) means the N copies WERE distinct outlets — full corroboration credit applies.
 - A newswire row tagged "[model]" carries a score set by the local relevance model ONLY, with NO LLM verification; that model demonstrably over-scores forum/wiki/social rows. Treat an untagged (LLM-vetted) row as materially more trustworthy than a "[model]" row of equal or near-equal score: prefer untagged rows for the LEAD and rank them above "[model]" rows of similar score in TOP SIGNALS. NEVER make a lone "[model]" row the LEAD when an untagged row of comparable score exists.
 - A newswire row tagged "[ALERTED]" ALREADY fired a standalone 🚨 BREAKING push to the analyst within the last few hours — it is a developing/continued story the analyst has ALREADY been told about, NOT new news. Do NOT make an "[ALERTED]" row the LEAD when any untagged story of comparable importance exists; rank a fresh untagged story above an "[ALERTED]" one of similar score in TOP SIGNALS; and frame any "[ALERTED]" item explicitly as continuation (e.g. "follows the earlier alert", "developing") — never as if it just broke. This is what separates new desk intel from a rehash of an alert already delivered.
 - A newswire row tagged "[BOOK: TICKER,...]" names live portfolio/watchlist positions the analyst actually holds money in (LITE, LNOK, MUU, DRAM, MU, NVDA, MSFT, AXTI, ORCL, TSEM, QBTS). A "[BOOK:...]" row is directly actionable for the analyst's open risk: weight it ABOVE a same-score untagged general-market row when choosing the LEAD and ordering TOP SIGNALS, always reflect its named ticker(s) in the PORTFOLIO table with a concrete implication, and never bury a "[BOOK:...]" item below generic macro colour of similar magnitude. Absence of the tag means the row does not touch the held book.
@@ -1517,6 +1579,14 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None,
             # surface it verbatim so Opus can weight a 6-wire story over a
             # lone mention in TOP SIGNALS / LEAD.
             tag = f" [syndicated x{corro}]" if corro > 1 else ""
+            # Echo calibration: a >=3-copy cluster whose copies all came from
+            # ONE source key is single-source self-syndication, not
+            # independent corroboration. Qualifies the [syndicated xN] tag so
+            # Opus doesn't over-weight a mass-aggregator host repeating
+            # itself. Pinned by tests/test_briefing_echo_tag.py. Pure render-
+            # side: no DB write, no ai_score / ml_score / score_source /
+            # urgency touch — four invariants intact by construction.
+            echo_tag = " [echo]" if _is_echo_row(a) else ""
             # Real wire-arrival clock so Opus fills the SYSTEM_PROMPT
             # TOP SIGNALS "[HH:MM]" slot from data, not invention. Omitted
             # for the synthetic PORTFOLIO/OPTIONS snapshot rows (no
@@ -1566,7 +1636,7 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None,
                 if _bk:
                     book_tag = f" [BOOK: {','.join(_bk)}]"
             parts.append(
-                f"{i:>2}. [score={score}]{model_tag}{seen_tag}{tag}{pushed}{book_tag} [{a.get('source','?')}] {a.get('title','')}\n"
+                f"{i:>2}. [score={score}]{model_tag}{seen_tag}{tag}{echo_tag}{pushed}{book_tag} [{a.get('source','?')}] {a.get('title','')}\n"
                 f"    {(a.get('summary') or '')[:300]}"
             )
         # Held-book concentration hint. Computed over the SAME collapsed+capped
