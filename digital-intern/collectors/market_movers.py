@@ -42,6 +42,18 @@ MIN_LOSER_PCT = -3.0
 
 
 def _ensure_db(conn: sqlite3.Connection) -> None:
+    # Match the canonical connection hardening used by google_news / rss_collector
+    # / source_health / article_store. ``seen_articles.db`` is the SHARED dedup
+    # store every collector writes through, so contention is the norm. Without
+    # ``busy_timeout``, SQLite's default of 0 raises ``OperationalError("database
+    # is locked")`` on the FIRST concurrent write, abort the cycle, and trip the
+    # worker's 10-600s backoff. Live evidence (2026-05-19): market_movers_worker
+    # hit "database is locked" 7 times in 11 min, exponentially backed off to the
+    # 600s cap, then was flagged DEAD by the supervisor (last_ok=1471s — 25min
+    # with no successful collection cycle). WAL + 30s busy_timeout lets the write
+    # wait out cross-collector contention instead.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS seen_articles (
             id TEXT PRIMARY KEY,
@@ -84,7 +96,7 @@ def collect_market_movers() -> list[dict]:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     results: list[dict] = []
 
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
     _ensure_db(conn)
 
     try:
