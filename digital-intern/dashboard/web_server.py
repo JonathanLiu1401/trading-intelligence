@@ -1709,7 +1709,11 @@ def create_app(store=None) -> Flask:
         })
 
     @app.get("/healthz")
+    @app.get("/api/health")
     def healthz():
+        # /api/health is an alias for /healthz so dashboard.html's health
+        # badge (and any external probe using the conventional /api/health
+        # path) stops silently 404'ing. Same body either way.
         store = _store_handle()
         return jsonify({"ok": store is not None})
 
