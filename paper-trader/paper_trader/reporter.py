@@ -1281,6 +1281,86 @@ def _heartbeat_line(store) -> str:
         return ""
 
 
+def _position_attention_line(store) -> str:
+    """One-line "which open positions has Opus stopped examining?" for the
+    hourly / daily report.
+
+    ``analytics/position_attention.py`` answers the **per-position** question
+    ``decision_health`` (aggregate NO_DECISION rate), ``decision_drought``
+    (portfolio-wide drift) and ``hold_discipline`` (hold-time vs empirical
+    cut-time) do not: *which specific held lots has Opus gone hours without
+    examining?*. When the documented #1 pathology (host-saturation
+    NO_DECISION storms — see ``_host_pulse_line``) drags on, the live trader
+    silently defaults to holding every open position while those positions
+    are no longer being **evaluated**. ``/api/position-attention`` (commit
+    ``f703cb2``) made this auditable on the *dashboard* — but the operator
+    lives in Discord and never opens it (the exact dashboard→Discord gap
+    ``_host_pulse_line`` / ``_capital_pulse_line`` / ``_singleton_lock_line``
+    each closed, one dimension over: aggregate-vs-host → per-held-position).
+
+    Composes ``build_position_attention`` **verbatim** (single source of
+    truth, AGENTS.md invariant #10 — the verdict / note are the builder's,
+    never re-derived, so this Discord line and ``/api/position-attention``
+    can never tell different stories) and feeds it the EXACT same store
+    reads the endpoint does (``open_positions()`` + ``recent_decisions``).
+    **Pure store reads only — NO network** (the Discord-path discipline;
+    adds zero latency). Observational only, never gates, adds no caps
+    (invariants #2/#12 — the ``_host_pulse_line`` precedent). Failure
+    contract mirrors the rest of ``reporter``: any builder/store fault
+    degrades to ``""`` ("no attention line this report"), **never** an
+    exception ("no Discord summary this report").
+
+    Suppression — surface ONLY when ≥1 held position has gone stale, so an
+    actively-evaluated book adds no hourly noise (the summary must never
+    become its own lying green light — the ``_heartbeat_line`` HEALTHY
+    suppression precedent):
+      * ``NEGLECTED_BOOK`` (>=1 position no Opus look in >24h) → ALWAYS
+        surfaced (the operator should not assume a passively-held lot is
+        still under model attention — the whole point);
+      * ``STALE_BOOK`` (>=1 position last seen >6h ago) → surfaced (the
+        operator should know which lots are drifting unmonitored);
+      * ``OK`` / ``INSUFFICIENT_DATA`` (and any non-verdict) → silent
+        (nothing actionable — the ``_hold_discipline_line`` NO_DATA /
+        ``_heartbeat_line`` HEALTHY suppression precedent).
+
+    Renders up to 3 worst-first per-position lines so the operator sees the
+    exact tickers to triage, not just an aggregate count.
+    """
+    try:
+        from .analytics.position_attention import build_position_attention
+        pa = build_position_attention(
+            store.open_positions(),
+            store.recent_decisions(limit=3000),
+        )
+        if not isinstance(pa, dict):
+            return ""
+        verdict = pa.get("verdict")
+        if verdict not in ("STALE_BOOK", "NEGLECTED_BOOK"):
+            return ""
+        note = pa.get("note") or ""
+        if not note:
+            return ""
+        positions = pa.get("positions") or []
+        # Worst-first: NEGLECTED before STALE. The builder already sorts that
+        # way, but filter so a STALE_BOOK with one neglected outlier still
+        # shows the neglected one first.
+        worst = [p for p in positions
+                 if p.get("verdict") in ("NEGLECTED", "STALE")][:3]
+        lines = [f"⚠️ **ATTENTION** ◈ {verdict}", f"> {note}"]
+        for p in worst:
+            tk = p.get("ticker", "?")
+            hrs = p.get("hours_since_last_decision")
+            v = p.get("verdict", "?")
+            if hrs is None:
+                lines.append(f"> `{tk:>6}` {v} — no Opus look on record")
+            else:
+                lines.append(f"> `{tk:>6}` {v} — {hrs:.1f}h since last look")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[reporter] position-attention line skipped: {e}")
+        return ""
+
+
 def _ago(seconds: float) -> str:
     """Compact human age: `45m` / `3h` / `2d`. Sub-minute reads `0m`."""
     seconds = max(0.0, float(seconds))
@@ -1394,6 +1474,9 @@ def send_hourly_summary() -> bool:
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
+    pa = _position_attention_line(store)
+    if pa:
+        body += "\n" + pa
     return _send(body)
 
 
@@ -1488,4 +1571,7 @@ def send_daily_close() -> bool:
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
+    pa = _position_attention_line(store)
+    if pa:
+        body += "\n" + pa
     return _send(body)
