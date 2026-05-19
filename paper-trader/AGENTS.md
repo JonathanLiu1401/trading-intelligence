@@ -9937,3 +9937,125 @@ print(market.seconds_until_close())   # int seconds
 - **#19** (singleton lock fail-open / never refuse the sole runner) —
   reaffirmed by Phase 3 finding #4: the manual instance holds the
   lock, systemd's competing instance correctly exits.
+
+
+## ML / backtest review pass (Agent 2, 2026-05-19, ~11:30 UTC) — symmetric training-label clamp
+
+### Scope
+
+`paper_trader/ml/decision_scorer.py`, `run_continuous_backtests.py`
+(scorer status string + parser), plus new tests. The deployed scorer
+already clamps its OUTPUT to ±`PRED_CLAMP_PCT` (50%) but trained on
+unclamped labels. Live audit of `data/decision_outcomes.jsonl` (7413
+rows in the corpus, last 5000 used by the trainer) showed:
+
+- 25 rows with `|fr_5d| > 50%` in the trainer tail
+- 2 MSTR rows with `forward_return_5d > +100%` (one at +175%)
+- 23 exact-zero rows (the documented walk-back-collision footprint
+  pre-fix; current rate 14/5000 = 0.28% — below the audit's 0.5% gate)
+
+The MSE gradient at fit time pulls weights toward magnitudes the gate
+can never act on (`predict()` clamps regardless). Aligning the
+training label space with the inference output space is a clean ML
+hygiene fix with bounded impact on the heart of the distribution.
+
+### Feature: clamp training labels to ±PRED_CLAMP_PCT
+
+`train_scorer` now applies the same ±`PRED_CLAMP_PCT` clamp to every
+training label BEFORE the SELL sign-flip, and reports the count of
+rows it touched as `n_label_clamped` in the result dict. The
+continuous loop forwards that count into the per-cycle scorer-skill
+status string (and the structured ledger row) so a quant can trend
+the outlier-rate of the training tail per cycle — a spike correlates
+with leveraged-ETF crash/rip weeks (MSTR/SOXL/TQQQ) polluting the
+corpus.
+
+### How to interpret it
+
+`n_label_clamped == 0` is the steady-state expectation. A sudden
+single-cycle spike (>5% of `train_n`) means the new outcomes batch
+carries an unusual cluster of >50% 5-day moves — typically a
+short-window crypto/MSTR rip or a leveraged-ETF crash. Sustained
+nonzero `n_label_clamped > 20` over many cycles means the corpus is
+chronically populated by leveraged outliers; a quant should know
+this before reading any of the OOS skill metrics, because the
+non-clamped corpus would have produced a different model (and the
+clamped version is the deployed one).
+
+### How to run / test
+
+```sh
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Decision-scorer surface (57 tests, ~3s — 5 new for label clamp):
+python3 -m pytest tests/test_decision_scorer.py -v
+
+# Continuous-loop parser/status surface (2 new tests):
+python3 -m pytest tests/test_continuous.py -v -k "ParseScorerStatus"
+
+# Full ml/backtest/scorer focused sweep (~2 min):
+python3 -m pytest tests/ -v -k "ml or backtest or scorer"
+```
+
+Inspect against the deployed pickle (read-only):
+
+```python
+from paper_trader.ml.decision_scorer import train_scorer
+# Train returns the new key on every call:
+#   {"status": "ok", "n": …, "val_rmse": …, "n_label_clamped": …}
+```
+
+### Phase 3 findings (live operator perspective, quant-relevant)
+
+Concrete observations from probing the deployed system against
+`/media/zeph/projects/paper-trader/data/` (the active continuous
+loop's actual data directory):
+
+1. **Continuous loop is dead.** `scorer_freshness` reports
+   `LOOP_DEAD`, heartbeat 24.6h stale; last cycle was #4
+   (2026-05-18T18:25:43+00:00). `run_continuous_backtests.py` is NOT
+   running. While dead, the conviction gate operates on a frozen
+   pickle that's increasingly stale relative to the accumulating
+   `decision_outcomes.jsonl` tail.
+
+2. **Deployed pickle is REGRESSED** (already detected by
+   `tests/test_scorer_freshness.py::TestPklRegressed`). The deployed
+   `data/ml/decision_scorer.pkl` has `n_train=400` but cycle 4
+   logged `train_n=3959`. Something clobbered the pickle with a
+   tiny-corpus fit. Since `n_train < 500`, the conviction gate is
+   INACTIVE per invariant #5, even though `scorer_skill_log.jsonl`
+   reports `gate_active=True` (based on the last LOGGED training
+   event, not the deployed pickle).
+
+3. **OOS rank-IC ≈ noise.** On the last 1483 outcomes (temporal
+   20% holdout), Spearman rank-IC = +0.035, directional accuracy =
+   0.492. The MLP has no useful OOS skill on this corpus —
+   reaffirming the `MLP_WORSE_THAN_TRIVIAL` finding from
+   `baseline_compare`.
+
+4. **Mean prediction is biased −4.02% while mean realized is
+   +0.85%.** A 4.87pp negative calibration bias — the model
+   systematically over-pessimizes. The training-label clamp helps
+   here: removing huge positive outliers (MSTR +175%, +128%) tames
+   the gradient-magnitude story even though the mean target shifts
+   by only ~0.1pp.
+
+5. **Backtest runs themselves look healthy.** 475/501 complete, 24
+   failed, 2 stuck running (orphans — the
+   `_reap_orphaned_runs` should clear them at startup of the next
+   loop revival). Returns of recent complete runs (+580%, +317%,
+   +189%, +50%, +38%) are plausible for 3–9yr leveraged-watchlist
+   windows.
+
+### Invariants reaffirmed by this pass
+
+- **#5** (DecisionScorer gates only when `_n_train ≥ 500`) —
+  untouched: the clamp acts on TRAINING LABELS, not on
+  `build_features` or the gate boundaries. `_ml_decide`'s arm
+  thresholds (±10/±5/0) are byte-identical.
+- **#10** (single source of truth) — the clamp reuses
+  `PRED_CLAMP_PCT`, the same constant `predict()` /
+  `predict_with_meta` already enforce; changing one moves both in
+  lockstep.
+- **#13** (pickle schema `{model, scaler, n_train}`) — untouched:
+  the clamp is in the data-prep pass, not the persistence shape.

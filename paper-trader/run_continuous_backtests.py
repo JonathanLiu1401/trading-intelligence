@@ -906,12 +906,17 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
             oos_ic_10_s = oos_diracc_10_s = f"n/a ({type(exc).__name__})"
             oos_ic_20_s = oos_diracc_20_s = f"n/a ({type(exc).__name__})"
 
+    # Label-clamp count surfaced so the per-cycle skill ledger can trend the
+    # outlier rate of the training tail (a sudden spike correlates with
+    # MSTR/leveraged-ETF crash/rip weeks polluting the corpus).
+    label_clamped = result.get("n_label_clamped", 0)
     return (f"scorer {result['status']} train_n={result['n']} "
             f"val_rmse={val_s} oos_n={len(oos_records)} oos_rmse={oos_rmse_s} "
             f"oos_diracc={oos_diracc_s} oos_ic={oos_ic_s} "
             f"oos_n_10={oos_n_10} oos_diracc_10={oos_diracc_10_s} "
             f"oos_ic_10={oos_ic_10_s} oos_n_20={oos_n_20} "
-            f"oos_diracc_20={oos_diracc_20_s} oos_ic_20={oos_ic_20_s}")
+            f"oos_diracc_20={oos_diracc_20_s} oos_ic_20={oos_ic_20_s} "
+            f"n_label_clamped={label_clamped}")
 
 
 def _parse_scorer_status(status: str) -> dict:
@@ -943,6 +948,7 @@ def _parse_scorer_status(status: str) -> dict:
         "oos_n": None, "oos_rmse": None, "oos_dir_acc": None, "oos_ic": None,
         "oos_n_10": None, "oos_dir_acc_10": None, "oos_ic_10": None,
         "oos_n_20": None, "oos_dir_acc_20": None, "oos_ic_20": None,
+        "n_label_clamped": None,
     }
     try:
         s = str(status or "").strip()
@@ -981,13 +987,17 @@ def _parse_scorer_status(status: str) -> dict:
         out["oos_ic_10"] = _num("oos_ic_10")
         out["oos_dir_acc_20"] = _num("oos_diracc_20")
         out["oos_ic_20"] = _num("oos_ic_20")
+        # Label-clamp count is an integer when reported; legacy status strings
+        # (cycles before the clamp landed) omit it — degrades to None cleanly.
+        nlc = _num("n_label_clamped")
+        out["n_label_clamped"] = int(nlc) if nlc is not None else None
     except Exception:
         return {
             "status": "unparseable", "train_n": None, "val_rmse": None,
             "oos_n": None, "oos_rmse": None, "oos_dir_acc": None,
             "oos_ic": None, "oos_n_10": None, "oos_dir_acc_10": None,
             "oos_ic_10": None, "oos_n_20": None, "oos_dir_acc_20": None,
-            "oos_ic_20": None,
+            "oos_ic_20": None, "n_label_clamped": None,
         }
     return out
 

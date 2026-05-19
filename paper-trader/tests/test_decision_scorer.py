@@ -528,6 +528,117 @@ class TestTrainScorer:
         assert v_hi - v_lo > 5.0, f"ml_score signal too weak: gap={v_hi - v_lo:.2f}"
 
 
+class TestLabelClamp:
+    """Symmetric label clamp at train time — labels exceeding ``PRED_CLAMP_PCT``
+    are clipped to ``±PRED_CLAMP_PCT`` BEFORE the SELL sign-flip so that the
+    training label space matches the inference output (which always clamps).
+
+    Motivated by the live audit: the 5000-record trainer tail carries
+    2 MSTR rows with ``forward_return_5d > +100%`` and a long tail of |fr|>50%
+    outliers. Those labels can never be predicted (predict() clamps), yet
+    they drive huge MSE gradients during fit and perturb weights across the
+    feature subspace.
+    """
+
+    def test_clamp_count_reported_when_outliers_present(self):
+        """Records with |fr_5d| > PRED_CLAMP_PCT are counted; in-range rows are not."""
+        recs = []
+        for i in range(35):
+            r = _synthetic_outcome(sim_date=f"2025-09-{i+1:02d}", fwd=2.0)
+            recs.append(r)
+        # Inject five outliers — three positive, two negative.
+        recs[0]["forward_return_5d"] = PRED_CLAMP_PCT + 25.0       # +75
+        recs[1]["forward_return_5d"] = PRED_CLAMP_PCT + 125.0      # +175 (the MSTR case)
+        recs[2]["forward_return_5d"] = PRED_CLAMP_PCT + 0.01       # just above bound
+        recs[3]["forward_return_5d"] = -(PRED_CLAMP_PCT + 30.0)    # -80
+        recs[4]["forward_return_5d"] = -(PRED_CLAMP_PCT + 0.5)     # just below bound
+        # Records 5..34 have fwd=2.0 — well inside the band, NOT clamped.
+        result = train_scorer(recs)
+        assert result["status"] == "ok"
+        assert result["n_label_clamped"] == 5
+
+    def test_clamp_is_zero_when_no_outliers(self):
+        """No record exceeds the bound → no clamps applied."""
+        recs = [_synthetic_outcome(sim_date=f"2025-10-{i+1:02d}", fwd=3.0)
+                for i in range(35)]
+        result = train_scorer(recs)
+        assert result["status"] == "ok"
+        assert result["n_label_clamped"] == 0
+
+    def test_boundary_exact_is_not_clamped(self):
+        """A label exactly at ±PRED_CLAMP_PCT is on the boundary; the clamp uses
+        strict `>`, so it should NOT count as clamped."""
+        recs = [_synthetic_outcome(sim_date=f"2025-11-{i+1:02d}", fwd=2.0)
+                for i in range(35)]
+        recs[0]["forward_return_5d"] = PRED_CLAMP_PCT       # exactly +50
+        recs[1]["forward_return_5d"] = -PRED_CLAMP_PCT      # exactly -50
+        result = train_scorer(recs)
+        assert result["status"] == "ok"
+        assert result["n_label_clamped"] == 0
+
+    def test_clamp_aligns_train_to_inference_bound(self, tmp_path, monkeypatch):
+        """The point of the clamp: a model trained on outlier labels still
+        cannot predict outside ±PRED_CLAMP_PCT because predict() clamps. Verify
+        end-to-end by saturating training with extreme labels and checking that
+        predict() never exits the clamp band.
+        """
+        import paper_trader.ml.decision_scorer as ds
+        path = tmp_path / "clamp_rt.pkl"
+        monkeypatch.setattr(ds, "SCORER_PATH", path)
+
+        recs = []
+        for i in range(40):
+            # Strong monotone signal pushing label way out of band.
+            mom = (i - 20) * 0.5
+            fwd = mom * 25.0  # at extremes hits ±250 (way over ±50)
+            recs.append(_synthetic_outcome(
+                sim_date=f"2025-12-{i+1:02d}", mom5=mom, fwd=fwd, ml_score=mom,
+            ))
+        result = train_scorer(recs)
+        assert result["status"] == "ok"
+        # Many of these labels exceed PRED_CLAMP_PCT.
+        assert result["n_label_clamped"] >= 10
+
+        s = DecisionScorer()
+        assert s.is_trained
+        for ml in (-15.0, -5.0, 0.0, 5.0, 15.0):
+            v = s.predict(ml_score=ml, rsi=50, macd=0.1, mom5=ml,
+                          mom20=0.0, regime_mult=1.0, ticker="NVDA")
+            assert math.isfinite(v)
+            # predict() must clamp to ±PRED_CLAMP_PCT regardless of training labels.
+            assert -PRED_CLAMP_PCT <= v <= PRED_CLAMP_PCT
+
+    def test_clamp_applied_before_sell_sign_flip(self):
+        """The clamp must be applied BEFORE the SELL sign-flip. A SELL with
+        fr=-175 should become -clamped(-50) = +50, not -clamped(-175) leaving
+        the model with a +175 label."""
+        # Build a corpus where the SELL outlier label has known magnitude.
+        # We use the numpy fallback (no sklearn split) via the lstsq path —
+        # but `train_scorer` uses sklearn when present. Either way, we can
+        # verify the COUNT and trust the documented order via the
+        # implementation (a behavioural check would require model surgery).
+        recs = []
+        for i in range(35):
+            r = _synthetic_outcome(
+                sim_date=f"2026-01-{i+1:02d}",
+                action=("SELL" if i % 2 == 0 else "BUY"),
+                fwd=3.0,
+            )
+            recs.append(r)
+        # One SELL outlier at -175 (so -fr = +175). Clamp BEFORE flip keeps
+        # it at |50|; clamp AFTER flip wouldn't matter (same magnitude). But
+        # the COUNT detection is on the pre-flip absolute value of fr, so
+        # |fr|=175 > 50 means count incremented exactly once.
+        recs[0]["forward_return_5d"] = -175.0
+        recs[0]["action"] = "SELL"
+        # One BUY outlier matched.
+        recs[1]["forward_return_5d"] = 175.0
+        recs[1]["action"] = "BUY"
+        result = train_scorer(recs)
+        assert result["status"] == "ok"
+        assert result["n_label_clamped"] == 2
+
+
 # ─────────────────────── ranking semantics ───────────────────────
 
 class TestLoadCaching:

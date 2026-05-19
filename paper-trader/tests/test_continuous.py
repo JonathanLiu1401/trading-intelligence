@@ -1067,6 +1067,27 @@ class TestParseScorerStatus:
         assert p["oos_n_10"] == 42
         assert p["oos_n_20"] == 33
 
+    def test_parses_label_clamp_count(self):
+        """`n_label_clamped` token is parsed as int (the label-clamp feature
+        surfaces the per-cycle count of training labels truncated to
+        ±PRED_CLAMP_PCT)."""
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=708 "
+             "oos_rmse=12.40 oos_diracc=0.55 oos_ic=+0.03 "
+             "n_label_clamped=27")
+        p = rcb._parse_scorer_status(s)
+        assert p["status"] == "ok"
+        assert p["n_label_clamped"] == 27   # int, not float
+
+    def test_legacy_status_without_label_clamp_parses_cleanly(self):
+        """Pre-feature status strings carry no `n_label_clamped=` token;
+        parser MUST default it to None (historical rows in the ledger must
+        still parse, mirroring the multi-horizon legacy-status discipline)."""
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=708 "
+             "oos_rmse=12.40 oos_diracc=0.55 oos_ic=+0.03")
+        p = rcb._parse_scorer_status(s)
+        assert p["status"] == "ok"
+        assert p["n_label_clamped"] is None
+
 
 class TestAppendScorerSkillLog:
     def test_trained_row_has_accurate_gate_active_flag(self, tmp_path, monkeypatch):

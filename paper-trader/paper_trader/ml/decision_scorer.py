@@ -590,6 +590,7 @@ def train_scorer(records: list[dict]) -> dict:
         return {"status": "insufficient_after_dedup", "n": len(records)}
 
     X_raw, y, weights = [], [], []
+    n_label_clamped = 0
     for r in records:
         X_raw.append(build_features(
             _to_float(r.get("ml_score"), 0.0),
@@ -608,6 +609,24 @@ def train_scorer(records: list[dict]) -> dict:
         # Prior float(r.get(..., default)) crashed on `null` values because
         # dict.get returns the value (None) even when a default is supplied.
         fr = _to_float(r.get("forward_return_5d"), 0.0)
+        # Symmetric label clamp — mirror the inference-side ±PRED_CLAMP_PCT
+        # clamp at train time. predict() always clamps its output to
+        # ±PRED_CLAMP_PCT, so a training label like MSTR +175% (the live
+        # corpus carries 2 such rows in the 5000-record trainer tail; see
+        # data audit) can never be predicted — yet it still drives huge MSE
+        # gradients during fit, pulling weights toward magnitudes the gate
+        # can never act on and perturbing the entire feature subspace those
+        # outliers inhabit. Aligning the label space with the prediction
+        # space removes this outlier-induced training noise. Applied BEFORE
+        # the SELL sign-flip so the clamp bound is identical on either side
+        # — abs() is symmetric. Only ~0.5% of the live trainer tail has
+        # |fr|>50% (25/5000), so impact is concentrated on the genuine
+        # outliers without touching the heart of the distribution. The
+        # ±50 boundary is the same constant predict() / predict_with_meta
+        # already enforces, so the alignment is verifiable.
+        if abs(fr) > PRED_CLAMP_PCT:
+            n_label_clamped += 1
+        fr = max(-PRED_CLAMP_PCT, min(PRED_CLAMP_PCT, fr))
         action = str(r.get("action") or "BUY").upper()
         # SELL: negative forward returns were the *correct* outcome, so flip
         # sign — the model then learns one consistent meaning of "good".
@@ -721,7 +740,8 @@ def train_scorer(records: list[dict]) -> dict:
         pickle.dump({"model": model, "scaler": scaler, "n_train": len(records)}, f)
     _tmp.replace(SCORER_PATH)
 
-    return {"status": "ok", "n": len(records), "val_rmse": val_rmse}
+    return {"status": "ok", "n": len(records), "val_rmse": val_rmse,
+            "n_label_clamped": n_label_clamped}
 
 
 # ---------------------------------------------------------------------------
