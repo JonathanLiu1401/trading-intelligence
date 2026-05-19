@@ -1245,5 +1245,140 @@ class ArticleStore:
         )
         return out
 
+    @_retry_on_lock
+    def ticker_mention_velocity(
+        self, tickers: list[str], window_min: int = 120
+    ) -> list[dict]:
+        """Per-ticker mention velocity: live article count in the most-recent
+        ``window_min`` minutes vs the immediately-preceding equal window, for
+        every requested ticker.
+
+        ``source_freshness`` / ``source_throughput`` answer "which collectors
+        are slowing"; this answers the *book-level* question "which held names
+        are getting unusual coverage right now". A programmatic primitive that
+        external callers (paper-trader pre-trade checks, dashboard
+        portfolio-signals, chat enrichment) can consume without re-running
+        the regex-and-counter glue inline.
+
+        Built over the canonical live-only set (``_LIVE_ONLY_CLAUSE`` —
+        synthetic backtest/opus rows are excluded so a per-ticker count can
+        never be inflated/masked by an injection burst sharing the table,
+        CLAUDE.md §5). This is the bug that ``analytics/trend_velocity.py``
+        carries: a partial filter (``source NOT LIKE 'backtest_run_%'``)
+        which lets ``backtest://`` URLs and ``opus_annotation*`` sources leak
+        through. Use this method instead of writing a new ad-hoc scan.
+
+        Matching is whole-word and ALL-CAPS so a substring like ``NVDAQ`` or
+        ``AMDOCS`` cannot leak a hit for ``NVDA`` / ``AMD``. Tickers shorter
+        than 2 chars are skipped (no signal, would over-match). A leading
+        ``$`` is allowed (``$NVDA`` matches ``NVDA``).
+
+        Returns one dict per requested ticker (a missing ticker is still
+        returned with zero counts so callers can iterate the full book
+        without conditional branches):
+          * ``ticker``         — the input symbol (preserved verbatim)
+          * ``recent``         — live mentions in ``[now-window_min, now]``
+          * ``prior``          — live mentions in ``[now-2*window_min, now-window_min]``
+          * ``ratio``          — ``(recent + 1) / (prior + 1)`` (Laplace-smoothed
+                                  so the prior=0 case yields a finite ratio)
+          * ``newest_age_s``   — seconds since the newest matching mention
+                                  (``None`` when no mentions at all)
+
+        Ordered highest-ratio-first so an accelerating ticker surfaces at
+        the top. A ticker with no signal at all (``ratio == 1.0`` from
+        zero data) sorts below a real decelerator (whose ratio < 1.0 IS a
+        signal); the secondary key (``recent`` desc) breaks ties between
+        equally-rising names.
+        """
+        if not tickers:
+            return []
+
+        clean: list[str] = []
+        for raw in tickers:
+            if not raw:
+                continue
+            t = str(raw).strip().upper()
+            if len(t) < 2:
+                continue
+            clean.append(t)
+        if not clean:
+            return []
+
+        now = datetime.now(timezone.utc)
+        recent_cut = (now - timedelta(minutes=window_min)).isoformat()
+        prior_cut = (now - timedelta(minutes=2 * window_min)).isoformat()
+        rows = self.conn.execute(
+            "SELECT title, first_seen "
+            f"FROM articles WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+            (prior_cut,),
+        ).fetchall()
+
+        # Compile one regex per ticker — whole-word, ALL-CAPS, optional
+        # leading $. Avoids re-compiling inside the title-scan loop and
+        # makes each match O(len(title)) regardless of ticker-set size.
+        patterns = {t: re.compile(rf"\b\${{0,1}}{re.escape(t)}\b")
+                    for t in clean}
+        recent_counts: dict[str, int] = {t: 0 for t in clean}
+        prior_counts: dict[str, int] = {t: 0 for t in clean}
+        newest: dict[str, datetime | None] = {t: None for t in clean}
+
+        for title, first_seen in rows:
+            if not first_seen:
+                continue
+            try:
+                ts = datetime.fromisoformat(first_seen)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            in_recent = first_seen >= recent_cut
+            hay = title or ""
+            for t, pat in patterns.items():
+                if not pat.search(hay):
+                    continue
+                if in_recent:
+                    recent_counts[t] += 1
+                else:
+                    prior_counts[t] += 1
+                cur = newest[t]
+                if cur is None or ts > cur:
+                    newest[t] = ts
+
+        out: list[dict] = []
+        for t in clean:
+            r = recent_counts[t]
+            p = prior_counts[t]
+            ratio = round((r + 1) / (p + 1), 3)
+            age_s: float | None
+            if newest[t] is None:
+                age_s = None
+            else:
+                age_s = round((now - newest[t]).total_seconds(), 1)
+            out.append({
+                "ticker": t,
+                "recent": r,
+                "prior": p,
+                "ratio": ratio,
+                "newest_age_s": age_s,
+            })
+
+        # Highest-velocity first; ties broken by larger recent count so a
+        # ticker with 10/5 ranks above one with 2/1 at the same ratio.
+        # A never-mentioned ticker (ratio==1.0, recent==0) sinks below a
+        # real decelerator (ratio<1.0) — the float ordering does this for
+        # free since 1.0 > any sub-1 ratio. The unary tuple key uses the
+        # numeric ratio first so the natural sort holds.
+        out.sort(
+            key=lambda r: (
+                # No-data rows (recent==prior==0) ranked AFTER real signals
+                # regardless of their ratio (which would otherwise tie at
+                # 1.0). False sorts before True with reverse=True.
+                r["recent"] == 0 and r["prior"] == 0,
+                -r["ratio"],
+                -r["recent"],
+            ),
+        )
+        return out
+
     def close(self):
         self.conn.close()
