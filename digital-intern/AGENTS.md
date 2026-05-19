@@ -4328,3 +4328,140 @@ confirmed); force-rewriting a pushed history on a shared branch with active
 concurrent writers is destructive — left as-is per the documented precedent
 (pass 16/22's identical auto-commit-sweep notes). Both commits on
 origin/master.
+
+### Agent pass 2026-05-19 (hybrid 30 — Agent 3, debug + feature + analyst-validation)
+
+Required-file-set pass (30th). 9 task-critical files + AGENTS.md re-read.
+Live evidence again the discovery engine. Concurrent sibling agents +
+auto-commit/push daemon visible (memory `di-shared-repo-concurrency`);
+strict per-commit pathspec staging held. Stale daemon `pid 2124003` started
+2026-05-18 ~07:13 predates BOTH of this pass's commits (the consistent
+stale-daemon caveat — fixes ship on next `systemctl restart digital-intern`).
+
+**Phase 1 — bugs_fixed=1, commit `916f87a`** (`collectors/macro_calendar_collector.py`
++ new `tests/test_macro_calendar_collector.py`, +305/-4, pathspec-scoped via
+explicit `git add`). **`macro_calendar` day-class transitions never
+re-emitted — TODAY/TOMORROW prefixes were dead code.** The newly-shipped
+`eb2725a` collector's `_seen_id(event_type, date_str)` keyed only on
+`(date, type)`, so once an event was emitted at ANY distance ("UPCOMING (5d)")
+the dedup table blocked all later emissions — including the "TOMORROW" /
+"TODAY" rows the urgency scorer must see for the prefix system to be
+anything more than dead code. A live FOMC discovered 7d out stayed
+"UPCOMING (7d)" in articles.db forever; the just-in-time "TODAY: FOMC
+Meeting" row that should trigger urgent scoring was never inserted. Fix:
+fold a 4-bucket `_day_class` ({today, tomorrow, upcoming, future}) into the
+seen-id so the same (date, type) re-emits at MOST 4 times over its lifetime
+— once per class transition. Same-class re-polls still dedup. The visible
+title prefix string is unchanged. The collector had zero prior test
+coverage (zero rows in live articles.db — stale daemon caveat — so the bug
+was inspection-only); +15 specific-value tests pin the renderer, the
+day-class fold, _seen_id stability + cross-class separation, _parse_month,
+end-to-end re-emission across simulated wall-clock advances using a
+per-test seen-events DB (a regression in the seen-id composition fails the
+test). All four load-bearing invariants untouched (this collector only
+*writes* to articles.db via the standard ingest path which preserves them).
+
+**Phase 2 — features_added=1, commit `81ffe13`** (`analysis/claude_analyst.py`
++183 / new `tests/test_briefing_macro_calendar.py` +335, 19 tests).
+**MACRO CALENDAR — forward FOMC/CPI/Jobs/PPI in the 5h Opus briefing.**
+The macro_calendar_collector (eb2725a) writes forward events to articles.db
+with future `published` timestamps, but until now nothing in the briefing
+surfaced those rows as the forward-catalyst signal they are — a TODAY FOMC
+sitting at #34 in a busy newswire read to Opus as a generic mid-rank story,
+not as the rate decision that reshapes risk for the whole leveraged-ETF-heavy
+book. Three coordinated pieces: `_collect_macro_calendar_events(window_hours=72)`
+opens a fresh `mode=ro` connection (never the daemon's shared self.conn —
+the documented cursor-collision hazard, same discipline as
+`_collect_alert_velocity`); filters `source='macro_calendar'` only (the
+SCHEDULED-event surface — breaking-rate news still flows through the standard
+newswire); dedups by `published` instant picking the freshest `first_seen`
+so the sharper day-class prefix (TODAY > TOMORROW > UPCOMING) wins;
+best-effort → None on any failure so the briefing is never broken / delayed.
+`_macro_calendar_event_lines` is a pure renderer with `~Nh` sub-day / `~Nd`
+multi-day urgency tag (timing at a glance independent of title prefix).
+Wired into `_build_payload` as additive `macro_calendar_events` kwarg
+(omit-when-None / omit-when-empty so the 8-arg default path stays
+byte-identical for existing callers) + new SYSTEM_PROMPT rule + OUTPUT
+FORMAT placeholder so Opus reproduces the section between ALERT VELOCITY
+and DESK NOTE. A REPRODUCED section (operational-status family, like
+COVERAGE GAP / THROUGHPUT DEGRADATION / ALERT VELOCITY) — NOT an
+INPUT-only hint like BOOK HEAT. Pure read-side: no DB write, no
+ai_score/ml_score/score_source/urgency touch, never reads or mutates
+source_articles, `source='macro_calendar'` filter is already backtest-clean
+by construction — all four load-bearing invariants intact. +19
+specific-value tests pin: renderer empty / single-today / multi-day-tag /
+malformed-skip / non-dict-skip / non-numeric-hours / max-lines cap;
+collector source-filter / freshest-prefix dedup / past-event skip / horizon
+skip / None-on-failure; `_build_payload` emit-vs-omit gates incl.
+byte-identical-when-omitted-vs-None; SYSTEM_PROMPT rule + OUTPUT FORMAT
+placeholder presence.
+
+**Phase 3 — analyst-lens live validation, user_findings=8.**
+1. **Briefing quality EXCELLENT (positive, direct read)** — id30 (04:18Z,
+   50 arts, 3328 chars) read end-to-end: dense, decisive LEAD ties Trump-Iran
+   strike delay → WTI -5.45% → US tape bleeds into NVDA's earnings tomorrow
+   (held book stated up front MU -5.95% / LITE -8.83% / AXTI -14.46% /
+   TSEM -9.46%); PORTFOLIO names every held ticker with concrete prices +
+   ATM IV + P/C skew + actionable forward note; SEMIS PULSE / MACRO indices
+   precise.
+2. **Briefing cadence HEALTHY (positive)** — id25→26→27→28→29→30 gaps =
+   5.32 / 5.65 / 5.23 / 5.13 / 5.10h vs the 5h target. The `ef839a8`
+   heartbeat-clock fix continues to hold; no 30h+ gaps in window.
+3. **Invariants HOLD live (positive)** — direct DB probe confirms 0
+   synthetic `urgency>=1` rows and 0 `ai_score>0 AND score_source='ml'`
+   rows. Both load-bearing invariants intact in production despite ~24h+
+   of continuous writes on the 1.4 GB USB DB.
+4. **Collection HEALTHY (positive)** — 1981 live articles in last 1h;
+   diverse top sources (GoogleNews round-robin / Economic Times /
+   Finnhub/Yahoo / scraped/finance.yahoo.com / Benzinga / EIA /
+   Bloomberg). Daemon log: 0 ERROR / 0 CRITICAL / 0 Traceback in current
+   100-line window; only one transient "synthetic-label recovery skipped:
+   database is locked" WARNING (absorbed by `_retry_on_lock`, benign).
+5. **macro_calendar collector STILL 0 rows live (stale-daemon caveat,
+   NOT a new bug)** — stale daemon `pid 2124003` (started 2026-05-18 ~07:13)
+   predates `eb2725a` + my Phase-1 fix + my Phase-2 feature. Both the
+   day-class bug fix AND the briefing block depend on this collector
+   actually running. Ships on next `systemctl --user restart
+   digital-intern`. Operational, not a code bug.
+6. **scorer worker `alive=False` / last_ok_age=1498s (~25 min)** — this
+   is the documented wedged-thread class (AGENTS.md "alive but wedged"
+   caveat): the scorer's poll cadence is 30s, so 25 minutes' staleness
+   means the thread is blocked (on `_INFER_LOCK`, a long Sonnet call, or
+   sqlite busy_timeout under USB-DB contention). `state=ok` because
+   crashes_5m=0; the supervisor's respawn logic (`if t.is_alive(): continue`)
+   doesn't fire for this class. Documented operational issue (the external
+   `scripts/alert_pipeline_watchdog.py` handles the alert-side equivalent
+   on a cron cadence); out of surgical scope for a code-review pass.
+7. **Recap-template alerts still firing on the running daemon
+   (stale-daemon caveat, NOT a new bug)** — the 24h urgency=2 set includes
+   "Why Did Micron Stock Drop Today | The Motley Fool" (matches
+   `_RT_WHY_DID`), "Why Nvidia (NVDA) Stock Is Trading Up Today" from
+   Finnhub/Yahoo (`_RT_WHY_TRADING`), "QBTS Q1 2026 Earnings Call
+   Highlights" ×2 (`_RT_EARNINGS_CALL`), "GuruFocus / GF Value Says" ×2
+   on LITE/AXTI (`_RT_GF_VALUE`), "Stock Market Today, May 18: ..." 
+   (`_RT_MARKET_TODAY`). All match the deployed
+   `_filter_recap_template_noise` patterns; the running daemon predates
+   the gate's deploy. Ships on restart.
+8. **Lone reddit/r/stockstobuytoday + r/smallstreetbets BREAKING** (cred
+   0.40, would be gated by deployed `_filter_low_authority_lone`) —
+   same pre-restart residue class as 7.
+
+None of 5/6/7/8 is a quick safe fix in clean scope (5/7/8 all ship
+post-restart via already-committed code; 6 is a supervisor-design
+operational issue). → No Phase-3 fold-in; bugs_fixed stays 1,
+features_added 1.
+
+**Verify:** `storage.article_store` / `ml.features` / `ml.model` /
+`analysis.claude_analyst` imports OK; full suite **1253 passed** (1219
+prior baseline + 15 new macro-collector tests + 19 new MACRO CALENDAR
+tests, no regressions). *Pre-existing, deliberately never staged*
+(consistent with every prior entry): `paper-trader/paper_trader/dashboard.py`,
+`paper-trader/paper_trader/ml/decision_scorer.py`,
+`paper-trader/paper_trader/market.py`, `paper-trader/paper_trader/reporter.py`,
+`paper-trader/tests/test_core_market.py` (concurrent sibling agents' WIP);
+all untracked `paper-trader/paper_trader/analytics/implied_move.py`,
+`pnl_attribution.py`, `paper-trader/tests/test_implied_move.py`,
+`test_pnl_attribution.py`. Both commits pathspec-scoped via explicit
+`git add` of EXACTLY the 2 intended files; `git diff --staged --stat`
+verified immediately before each commit; never `git add -A`; both on
+origin/master (`916f87a`, `81ffe13`).
