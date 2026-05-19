@@ -10403,6 +10403,42 @@ def no_decision_reasons_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/no-decision-recovery")
+def no_decision_recovery_api():
+    """Recovery-time grade for NO_DECISION wedges — how long do they last?
+
+    /api/no-decision-reasons says WHY cycles fail; /api/decision-drought
+    prices the P&L cost; /api/runner-heartbeat flags IDLE_STORM. None
+    answer the on-call operator's *next* question: **"is the current
+    wedge anomalous vs history — keep waiting or escalate?"** This wires
+    the existing pure builder ``build_no_decision_recovery`` (full unit
+    test coverage in tests/test_no_decision_recovery.py) into an HTTP
+    endpoint so the dashboard / Discord chat / digital-intern analyst can
+    pull the same grade the CLI ``python3 -m
+    paper_trader.analytics.no_decision_recovery`` already prints.
+
+    Mirror of the /api/no-decision-reasons access pattern: pure builder,
+    network in the endpoint, advisory only (never gates Opus, adds no
+    caps — AGENTS.md #2/#12). The verdict ladder is WITHIN_NORMAL /
+    ELEVATED / ABNORMAL_WEDGE / NOISE / RECOVERED /
+    INSUFFICIENT_HISTORY — see no_decision_recovery.py docstring.
+    """
+    try:
+        from .analytics.no_decision_recovery import (
+            DEFAULT_WINDOW, build_no_decision_recovery,
+        )
+        try:
+            window = int(request.args.get("window") or DEFAULT_WINDOW)
+        except (TypeError, ValueError):
+            window = DEFAULT_WINDOW
+        window = max(1, min(window, 500))
+        store = get_store()
+        return jsonify(build_no_decision_recovery(
+            store.recent_decisions(window), window=window))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/churn")
 def churn_api():
     """Overtrading & same-name re-entry churn — the turnover question.
