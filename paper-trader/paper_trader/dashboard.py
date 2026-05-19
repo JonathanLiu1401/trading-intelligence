@@ -9791,6 +9791,96 @@ def reasoning_coherence_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/reasoning-themes")
+def reasoning_themes_api():
+    """Top recurring phrases across recent Opus decision reasoning prose.
+
+    Descriptive complement to ``/api/reasoning-coherence`` (which measures
+    pair-wise Jaccard stability between consecutive HOLDs — a *vocabulary
+    stability* metric, not a *vocabulary distribution* one). Surfaces
+    what topics actually dominate Opus's mental loops: across a window
+    of N decisions, the top phrases ranked by **decisions_mentioning**
+    (breadth, not loudness — a phrase repeated 30× in one verbose row
+    counts as ONE decision, while a phrase recurring across 12 different
+    decisions ranks high).
+
+    1-grams and 2-grams compete in the same leaderboard; on ties the
+    bigram wins (a bigram is more informative than its component words).
+
+    ``?limit=`` decisions to scan (clamped 5..500, default 100).
+    ``?top_k=`` phrases to return (clamped 3..50, default 10).
+    ``?include_bigrams=0`` to disable bigrams (1-grams only).
+
+    Pure builder, cheap by construction (no yfinance / no LLM) — not
+    behind the SWR cache. Observational only — never gates Opus, never
+    injected into the decision prompt (invariants #2/#12)."""
+    try:
+        from .analytics.reasoning_themes import build_reasoning_themes
+        try:
+            limit = int(request.args.get("limit", 100))
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(5, min(500, limit))
+        try:
+            top_k = int(request.args.get("top_k", 10))
+        except (TypeError, ValueError):
+            top_k = 10
+        include_bigrams_raw = request.args.get("include_bigrams", "1")
+        include_bigrams = str(include_bigrams_raw).strip().lower() not in (
+            "0", "false", "no", "off",
+        )
+        store = get_store()
+        decisions = store.recent_decisions(limit=limit)
+        out = build_reasoning_themes(
+            decisions, top_k=top_k, include_bigrams=include_bigrams,
+        )
+        out["window_limit"] = limit
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/decision-confidence")
+def decision_confidence_api():
+    """Aggregate Opus's self-rated ``confidence`` across recent decisions.
+
+    The decision envelope ``{"decision": {"confidence": 0.7, ...}}``
+    carries a 0..1 conviction value on every parseable row — yet nothing
+    in the ~80-endpoint surface aggregates it. ``/api/scorer-confidence``
+    is the **DecisionScorer** (small CPU MLP on the backtest side), not
+    Opus; ``/api/decision-forensics`` reads one decision; ``/api/
+    reasoning-coherence`` measures pair stability. An operator scanning
+    a paralysed week cannot tell from those whether Opus is **confidently**
+    sitting on its hands (high-conviction HOLDs around a binary event)
+    or **uncertainly** doing nothing.
+
+    Returns median / mean / min / max / 4-bucket histogram (low /
+    medium / high / very_high) / per-action breakdown / recent-vs-older
+    trend / regime verdict (``CAUTIOUS`` / ``NEUTRAL`` / ``CONVICTED``).
+
+    ``state`` ladder: ``NO_DATA`` (no parseable confidence) → ``INSUFFICIENT``
+    (< 5 samples; raw stats emitted, regime withheld) → ``OK``.
+
+    ``?limit=`` decisions to scan (clamped 5..500, default 100). Pure
+    builder, cheap (no yfinance / no LLM) — not behind the SWR cache.
+    Observational only — never gates Opus, never injected into the
+    decision prompt (invariants #2/#12)."""
+    try:
+        from .analytics.decision_confidence import build_decision_confidence
+        try:
+            limit = int(request.args.get("limit", 100))
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(5, min(500, limit))
+        store = get_store()
+        decisions = store.recent_decisions(limit=limit)
+        out = build_decision_confidence(decisions)
+        out["window_limit"] = limit
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/self-review")
 def self_review_api():
     """The behavioural mirror the live trader now sees in its own prompt.
