@@ -8202,6 +8202,56 @@ def earnings_shock_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/earnings-distribution")
+@swr_cached("earnings-distribution", 300.0)
+def earnings_distribution_api():
+    """Empirical observed-quantile complement to ``/api/earnings-shock``.
+
+    ``/api/earnings-shock`` assumes a Gaussian shock model and reports a single
+    1σ figure per held imminent print. Earnings reactions are fat-tailed, so
+    the Gaussian framing hides the historical worst case. This endpoint
+    surfaces the **observed** distribution instead — worst / Q1 / median / Q3
+    / best of historical 1-day post-earnings reactions per held imminent
+    event, each dollarized against the current position size and book.
+
+    Composes ``build_event_calendar`` for the held set verbatim (single source
+    of truth, AGENTS.md #10) so this endpoint, ``/api/earnings-shock`` and
+    ``/api/event-calendar`` can never disagree on what counts as
+    held-imminent. Reuses ``_earnings_history_for`` as the I/O seam (same
+    yfinance call shape, same 5-min SWR TTL). Observational only — never
+    gates Opus, never injected into the decision prompt (AGENTS.md #2/#12 —
+    the ``earnings_shock`` / ``stress_scenarios`` precedent).
+
+    Per advisor framing: quantile fields are named ``q1`` / ``median`` /
+    ``q3`` (observed quartiles), **not** ``p25`` / ``p50`` / ``p75``, because
+    n=3–8 historical prints cannot legitimately support distributional
+    percentile claims. The fields report shape; they don't promise
+    distributional inference."""
+    try:
+        from .analytics.earnings_distribution import build_earnings_distribution
+        from .analytics.event_calendar import build_event_calendar
+        store = get_store()
+        pf = store.get_portfolio()
+        positions = store.open_positions()
+        try:
+            from .strategy import WATCHLIST as _WATCHLIST
+            watch = {t.upper() for t in _WATCHLIST}
+        except Exception:
+            watch = set()
+        held = {(p.get("ticker") or "").upper()
+                for p in positions if p.get("ticker")}
+        ec = build_event_calendar(positions, held | watch)
+        result = build_earnings_distribution(
+            positions,
+            float(pf.get("total_value") or 0.0),
+            ec,
+            history_provider=_earnings_history_for,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/macro-calendar")
 def macro_calendar_api():
     """The exact forward FOMC rate-decision awareness block the live trader
@@ -8520,6 +8570,59 @@ def disagreement_api():
         })
     except Exception as e:
         return jsonify({"error": str(e), "rows": []}), 500
+
+
+@app.route("/api/shadow-vs-claude")
+def shadow_vs_claude_api():
+    """Right-now snapshot: top deterministic shadow rec vs the most recent
+    Claude decision. Identifies ``MISSED_OPPORTUNITY`` when Claude was
+    ``NO_DECISION`` and the rules engine currently has a strong directional
+    BUY/ADD/TRIM/EXIT.
+
+    ``/api/empty-claude-rate`` / ``/api/host-guard`` already surface *that the
+    box is starved* — but they say nothing about *what the bot would have done
+    if a decision had come back*. This endpoint joins ``/api/suggestions``
+    (the deterministic ``_classify_action`` rules engine, the closest thing
+    the trader has to a "shadow decision") with the most recent row in the
+    ``decisions`` table and emits a verdict:
+
+    * ``MISSED_OPPORTUNITY`` — Claude NO_DECISION while shadow has a
+      strong (conviction ≥ 0.7) directional rec. The operationally meaningful
+      case to act on manually.
+    * ``DROUGHT_OK`` — Claude NO_DECISION but shadow is quiet too.
+    * ``ALIGNED`` — Claude and shadow agree on the same directional call.
+    * ``DIVERGENT`` — both produced directional calls, they disagree.
+    * ``CLAUDE_HOLDS`` — Claude said HOLD while shadow flags a directional rec.
+    * ``NO_CLAUDE_DATA`` / ``NO_SHADOW_DATA`` — degraded inputs.
+
+    Snapshot-only by construction (per advisor): the inputs are produced from
+    different points in time (last decision can be minutes-to-hours old; the
+    suggestion list is current), so this endpoint deliberately does **not**
+    compute "agreement %" over a historical window — that comparison would
+    be incoherent (signals at decision time ≠ signals now). For the
+    aggregate-over-time view of decisions see ``/api/decision-health``.
+
+    Observational only — never gates Opus (invariants #2/#12)."""
+    try:
+        from .analytics.shadow_vs_claude import build_shadow_vs_claude
+        # Reuse /api/suggestions verbatim — single source of truth for the
+        # deterministic rules engine. Same pattern as /api/funded-suggestions.
+        resp = suggestions_api()
+        if isinstance(resp, tuple):
+            resp = resp[0]
+        sug_payload = resp.get_json(silent=True) or {}
+        suggestions = sug_payload.get("suggestions", [])
+        store = get_store()
+        recent = store.recent_decisions(limit=1) or []
+        last_decision = recent[0] if recent else None
+        result = build_shadow_vs_claude(suggestions, last_decision)
+        # Surface a suggestions-side error rather than masking it as
+        # "NO_SHADOW_DATA" — mirrors funded_suggestions' error pass-through.
+        if sug_payload.get("error"):
+            result["suggestions_error"] = sug_payload["error"]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/validation")

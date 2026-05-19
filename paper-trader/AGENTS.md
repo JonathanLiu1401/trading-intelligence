@@ -6930,3 +6930,105 @@ prewarm target — the precise contract-rot the test guards against.
   tests).
 
 *Review pass #31 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+## 2026-05-19 feature-dev pass (Agent 4) — shadow-vs-claude + earnings-distribution
+
+Two new read-only dashboard endpoints (observational, never gate Opus —
+invariants #2/#12, sibling-precedent: `/api/earnings-shock`, `/api/disagreement`).
+
+### `/api/shadow-vs-claude` — snapshot of deterministic shadow rec vs last Claude decision
+
+The live 2026-05-19 shape exposed a gap on the operations surface:
+`/api/empty-claude-rate` and `/api/host-guard` correctly surface
+HOST_SATURATED (5 concurrent Opus, 73% NO_DECISION over last 11 cycles) but
+say nothing about *what the bot would have done if Claude had come back*.
+This endpoint joins `/api/suggestions` (the deterministic `_classify_action`
+co-pilot rules engine) with the most recent row in the `decisions` table
+and emits a verdict:
+
+| verdict | meaning |
+|---|---|
+| `MISSED_OPPORTUNITY` | last Claude was NO_DECISION while shadow has a strong (conviction ≥ 0.70) directional BUY/ADD/TRIM/EXIT. The operationally meaningful case — operator may want to act manually. |
+| `DROUGHT_OK` | Claude NO_DECISION but shadow is quiet (HOLD/WATCH only); nothing to act on. |
+| `ALIGNED` | Claude and shadow agree on the same directional call on the same name (BUY≡ADD, SELL≡TRIM≡EXIT). |
+| `DIVERGENT` | both produced directional calls — they disagree. |
+| `CLAUDE_HOLDS` | Claude HOLD while shadow flags a directional rec. |
+| `NO_CLAUDE_DATA` / `NO_SHADOW_DATA` | degraded inputs. |
+
+**Snapshot-only by construction** (advisor framing): the two inputs are
+produced from different points in time (last decision can be minutes-to-hours
+old; the suggestion list is current), so the builder deliberately does NOT
+compute "agreement %" over a historical window — that comparison would be
+incoherent (signals at decision time ≠ signals now). For the aggregate-over-
+time view of decisions see `/api/decision-health` (also SSOT, no re-derive).
+
+Pure builder in `paper_trader/analytics/shadow_vs_claude.py`. Endpoint is a
+thin wrapper that reuses `suggestions_api()` verbatim (the
+`/api/funded-suggestions` precedent) — single source of truth for the
+deterministic shadow engine; never re-derives.
+
+### `/api/earnings-distribution` — empirical observed-quantile complement to `/api/earnings-shock`
+
+`/api/earnings-shock` assumes a Gaussian shock model and reports a single 1σ
+figure per held imminent print (e.g. for the live 2026-05-19 NVDA 44%
+position: `σ ±1.8% → ±$8.17 (book ±0.82%); 3σ down stress $-24.51 (-2.45%)`).
+Earnings reactions are fat-tailed; the Gaussian framing hides the historical
+worst case. This endpoint surfaces the **empirical observed distribution**
+per held imminent event:
+
+* `observed_quartiles`: `{worst, q1, median, q3, best}` of historical
+  1-day post-earnings reactions (in % terms, signed)
+* `dollar_quartiles`: same shape × current position value
+* `book_pct_quartiles`: same shape, normalised by total_value
+* `downside_worst_dollar` / `downside_worst_book_pct`: loss-side worst case
+  clipped at zero (a string of all-positive observations yields 0 here, not
+  a manufactured negative — operator's clearest "what's the worst this
+  name has cost on a print?" read)
+* `row_verdict`: ELEVATED/MODERATE/LOW on |worst-observed book impact|,
+  thresholds locked to `earnings_shock` (5% / 2%) by
+  `test_thresholds_consistent_with_earnings_shock`
+
+**Naming discipline** (per advisor): fields are `q1`/`median`/`q3` (observed
+quartiles), **not** `p25`/`p50`/`p75` (which would imply distributional
+percentile inference n=3–8 historical prints can't support). The
+`test_quartile_keys_use_observational_naming` Flask test locks this — adding
+a `p25` etc. field will fail the suite.
+
+Composes `build_event_calendar` for the held set verbatim (SSOT, #10) so
+this endpoint, `/api/earnings-shock` and `/api/event-calendar` can never
+disagree on what counts as held-imminent. Reuses `_earnings_history_for`
+as the I/O seam (same yfinance call shape, same 5-min SWR TTL on both).
+
+Pure builder in `paper_trader/analytics/earnings_distribution.py`.
+Mirrors the `earnings_shock` state ladder (`NO_DATA` / `NO_EVENTS` /
+`OK`, per-row `INSUFFICIENT_HISTORY` at n<3) and `_z`/`_position_value`
+shape so the two builders are byte-symmetric on the same shape of inputs.
+
+### Tests
+
+Pure-function tests:
+- `tests/test_shadow_vs_claude.py` (29 tests) — verdict ladder, action
+  classification, BUY≡ADD / SELL≡TRIM equivalence, naive-UTC timestamp
+  handling, never-raises contract.
+- `tests/test_earnings_distribution.py` (20 tests) — quartile interpolation
+  (numpy-default linear, NIST type 7), INSUFFICIENT_HISTORY at n<3,
+  downside-zero on all-positive history, threshold-consistency with
+  `earnings_shock`, builder never raises on garbage inputs.
+
+Flask test-client tests (no :8090 bind, no live DB):
+- `tests/test_shadow_vs_claude_endpoint.py` (7 tests) — MISSED_OPPORTUNITY
+  on the live 2026-05-19 shape, ALIGNED on BUY/ADD equivalence,
+  suggestions_error pass-through, CORS for cross-fetch, degrade-to-error-
+  body contract.
+- `tests/test_earnings_distribution_endpoint.py` (7 tests) — payload
+  shape, **quartile-key naming lock** (no `p25`/`p50`/`p75` regression),
+  dollar = pos_value × pct math, NO_DATA / NO_EVENTS state ladder, CORS,
+  degrade-to-error-body contract.
+
+Full new suite: **66/66 green**. Adjacent endpoint suites
+(`test_baseline_compare_endpoint`, `test_capital_paralysis_swr`) remain
+green — no neighbor regressions.
+
+*Feature-dev pass appended 2026-05-19. Prior content above is unmodified.*
