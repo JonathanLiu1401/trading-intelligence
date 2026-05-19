@@ -787,3 +787,147 @@ class TestAntiOverfitConfig:
         assert ratio < 0.65, (
             f"model memorized noise (pred/target std ratio={ratio:.3f} "
             f"≥ 0.65) — regularization not effective")
+
+
+# ──────────────── LLM annotation weight replication (regression) ─────────────
+
+class TestLlmWeightReplication:
+    """Locks the LLM-annotation weight replication scheme.
+
+    The dedicated ``llm_quality_label`` multiplier (`endorsed→3.0`,
+    `condemned→0.1`, `unlabeled→1.0`, applied to a base weight derived from
+    `return_pct`) was previously fed into ``rep = np.maximum(1,
+    np.round(w_tr * 2).astype(int))``. The `max(1, ...)` floor erased the
+    ``0.1×`` multiplier: a CONDEMN row on any run rounded to ``rep=0`` and
+    was then promoted to ``rep=1`` — measured 0.5× relative weight vs.
+    unlabeled, NOT the documented 0.1×. Tests pin the corrected ×10
+    scaling + drop-on-zero behaviour: ENDORSE replicates strictly more
+    than unlabeled (signal amplified), CONDEMN drops out of the training
+    fold (the documented near-zero weight is realized).
+    """
+
+    def _capture_repeat(self, monkeypatch):
+        """Wrap np.repeat in the module under test so the rep array used to
+        oversample the training fold is observable from outside train_scorer.
+        Returns the most recent (rep_array_as_list,) call args.
+        """
+        import paper_trader.ml.decision_scorer as ds
+        captured: dict = {}
+        real_repeat = ds.np.repeat
+
+        def _spy(a, repeats, axis=None):
+            # The X_tr_w call comes first (axis=0); record that one. The
+            # second call (y_tr_w, axis=None) carries the same rep array.
+            if "rep" not in captured:
+                # `repeats` is either a numpy array or list-like.
+                captured["rep"] = list(np.asarray(repeats, dtype=int))
+            return real_repeat(a, repeats, axis=axis)
+
+        monkeypatch.setattr(ds.np, "repeat", _spy)
+        return captured
+
+    def test_endorse_replicates_more_than_unlabeled(
+            self, tmp_path, monkeypatch):
+        """ENDORSE annotations replicate ~3× more than unlabeled rows.
+
+        Uses 50 ENDORSE records so the random 80/20 split (random_state=42)
+        deterministically lands ENDORSE rows in the training fold."""
+        import paper_trader.ml.decision_scorer as ds
+        monkeypatch.setattr(ds, "SCORER_PATH", tmp_path / "weights.pkl")
+        captured = self._capture_repeat(monkeypatch)
+
+        # 50 ENDORSE + 50 unlabeled. Same return_pct, so only llm label varies.
+        records: list[dict] = []
+        for i in range(50):
+            r = _synthetic_outcome(
+                ticker="NVDA", sim_date=f"2025-07-{i+1:02d}",
+                return_pct=0.0)
+            records.append(r)
+        for i in range(50):
+            r = _synthetic_outcome(
+                ticker="AMD", sim_date=f"2025-08-{i+1:02d}",
+                return_pct=0.0)
+            r["llm_quality_label"] = 1
+            records.append(r)
+
+        result = train_scorer(records)
+        assert result["status"] == "ok"
+        rep = captured["rep"]
+        # ENDORSE: weight 1.0 × 3.0 = 3.0 → ×2 scaling → rep=6.
+        # Unlabeled: weight 1.0 → ×2 = rep=2.
+        assert 6 in rep, (
+            f"ENDORSE rep=6 (weight 3.0 × 2 scaling) must appear in the "
+            f"training fold: {rep}"
+        )
+        assert 2 in rep, (
+            f"unlabeled rep=2 (weight 1.0 × 2 scaling) must appear in the "
+            f"training fold: {rep}"
+        )
+        # Strict directional skew: ENDORSE / unlabeled = 3×.
+        assert max(rep) == 6
+        assert min(rep) == 2
+
+    def test_condemn_rows_are_dropped_from_training(
+            self, tmp_path, monkeypatch):
+        """CONDEMN rows (llm_quality_label=-1, multiplier 0.1×) must not
+        appear in the training fold at all.
+
+        At ×2 scaling, a CONDEMN row's weight is ≤ 0.2 × 2 = 0.4 (capped at
+        return_pct=+200%; lower at any other return), which rounds to 0 in
+        all cases. The prior `np.maximum(1, …)` floor promoted these to
+        rep=1 — silently negating the documented 0.1× weight. With the fix
+        these rows drop out entirely. Validates the drop-zero codepath."""
+        import paper_trader.ml.decision_scorer as ds
+        monkeypatch.setattr(ds, "SCORER_PATH", tmp_path / "drop.pkl")
+
+        # 50 unlabeled + 50 CONDEMN records, balanced so CONDEMN rows do
+        # land in the 80% training split. Without the drop-zero codepath
+        # each CONDEMN would contribute rep=1 from the old `max(1, ...)`
+        # floor — observable here as a 1 entry in the rep array.
+        records = [
+            _synthetic_outcome(
+                ticker="NVDA", sim_date=f"2025-09-{i+1:02d}",
+                return_pct=0.0)
+            for i in range(50)
+        ]
+        for i in range(50):
+            r = _synthetic_outcome(
+                ticker="AMD", sim_date=f"2025-10-{i+1:02d}",
+                return_pct=0.0)
+            r["llm_quality_label"] = -1
+            records.append(r)
+
+        captured = self._capture_repeat(monkeypatch)
+        result = train_scorer(records)
+        assert result["status"] == "ok"
+        rep = captured["rep"]
+        # CONDEMN rows must be DROPPED upstream — never floor-promoted to
+        # rep=1. Every surviving entry must be a clean unlabeled rep=2.
+        assert all(r == 2 for r in rep), (
+            f"after the drop-zero fix, every surviving rep should be 2 "
+            f"(unlabeled × 2 scaling); a 1 here means a CONDEMN row was "
+            f"floor-promoted: {rep}"
+        )
+
+    def test_unlabeled_records_replicate_at_expected_scale(
+            self, tmp_path, monkeypatch):
+        """Sanity-check the ×2 scaling: an unlabeled record on a flat 0%
+        run has weight 1.0; its rep should round to 2. Pins the absolute
+        scale, not just the relative ratio."""
+        import paper_trader.ml.decision_scorer as ds
+        monkeypatch.setattr(ds, "SCORER_PATH", tmp_path / "unlab.pkl")
+        captured = self._capture_repeat(monkeypatch)
+
+        records = [
+            _synthetic_outcome(
+                ticker="NVDA", sim_date=f"2025-11-{i+1:02d}", return_pct=0.0)
+            for i in range(35)
+        ]
+        result = train_scorer(records)
+        assert result["status"] == "ok"
+        rep = captured["rep"]
+        # Every unlabeled-on-flat-run row gets weight=1.0, × 2 → rep=2.
+        assert all(r == 2 for r in rep), (
+            f"every unlabeled rep should be 2 (weight 1.0 × 2 scaling); "
+            f"got {rep}"
+        )
