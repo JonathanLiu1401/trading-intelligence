@@ -43,6 +43,7 @@ Verdicts (exit code mirrors the sibling diagnostics so cron can branch):
   FRESH               loop alive, pkl reflects the last logged retrain   → 0
   INSUFFICIENT_DATA   no skill-log and no pkl yet                        → 0
   STALE_PKL           loop alive but on-disk pkl lags the last retrain   → 2
+  PKL_REGRESSED       on-disk pkl `n_train` ≪ last logged `train_n`      → 2
   LOOP_STALLED        heartbeat older than STALE_HEARTBEAT_H             → 2
   LOOP_DEAD           heartbeat older than DEAD_HEARTBEAT_H              → 2
 """
@@ -70,6 +71,27 @@ DEAD_HEARTBEAT_H = 24.0    # loop is almost certainly down → CRITICAL
 # (one in-flight cycle). Beyond it, the gate is reading a model older than the
 # loop's own ledger says it trained — a liveness/deploy inversion.
 PKL_LAG_GRACE_H = 4.0
+# Deployed pkl `n_train` is allowed to regress below the last logged retrain's
+# `train_n` by at most this fraction — beyond it, the on-disk pkl was almost
+# certainly clobbered by a side process (e.g. a manual `python3 -m
+# paper_trader.ml.decision_scorer` re-train, an out-of-tree script, or a
+# concurrent agent's one-off training pass that bypassed conftest's
+# `SCORER_PATH` monkeypatch). Observed live (2026-05-19): production pkl
+# `n_train=400` while the loop's last logged retrain reported `train_n=3959`
+# — the gate WAS gating on a model trained on ~10% of the corpus the ledger
+# claimed, and no existing verdict surfaced this (STALE_PKL fires only when
+# pkl mtime *predates* the heartbeat; here the pkl was *newer*, just
+# clobbered with a much smaller fit). 0.5 = "pkl `n_train` must be at least
+# half the last logged retrain's `train_n`" — a non-tunable round threshold
+# that catches the order-of-magnitude clobber documented above while ignoring
+# the normal across-cycle dedup-tail-wander (train_n swings of ~±10% are
+# routine — see `_compute_decision_outcomes` window selection).
+PKL_REGRESSION_TOL = 0.5
+# Below this absolute floor a `train_n` swing carries no real signal — early
+# cycles or insufficient_after_dedup cases can land near here legitimately,
+# so the regression check is muted until the loop has accumulated enough
+# corpus to make a regression meaningful.
+PKL_REGRESSION_MIN_TRAIN_N = 500
 
 
 def _now_utc() -> datetime:
@@ -228,6 +250,39 @@ def scorer_freshness_report() -> dict:
         )
         return out
 
+    # The pkl mtime is consistent with the heartbeat — but is the pkl's
+    # *contents* consistent with the ledger? A pkl can be NEWER than the
+    # heartbeat (the STALE_PKL check above is for the inverse case) yet
+    # carry a much smaller `n_train`: a manual retrain on a tiny corpus,
+    # an out-of-tree script, or a concurrent agent's test that bypassed
+    # conftest's `SCORER_PATH` monkeypatch will all leave this signature.
+    # Real failure mode observed live (2026-05-19): deployed pkl reported
+    # `n_train=400` while the ledger's last `train_n=3959` — the gate was
+    # acting on a 10% corpus. STALE_PKL did NOT fire because pkl mtime was
+    # later than the heartbeat, just clobbered. This verdict closes that
+    # gap with a single number-comparison the existing report already
+    # surfaces as inputs (`pkl_n_train` / `last_train_n`) but never folded
+    # into a verdict.
+    last_tn = out.get("last_train_n")
+    if (
+        isinstance(last_tn, (int, float))
+        and last_tn >= PKL_REGRESSION_MIN_TRAIN_N
+        and pkl_n is not None
+        and pkl_n < last_tn * PKL_REGRESSION_TOL
+    ):
+        out["verdict"] = "PKL_REGRESSED"
+        ratio = round(pkl_n / float(last_tn), 3) if last_tn else 0.0
+        out["hint"] = (
+            f"loop alive (heartbeat {age_h}h old, cycle #{out['last_cycle']}) "
+            f"but decision_scorer.pkl carries n_train={pkl_n} vs the last "
+            f"logged retrain's train_n={int(last_tn)} (ratio={ratio}, "
+            f"tol={PKL_REGRESSION_TOL}) — the on-disk pkl was almost "
+            f"certainly clobbered by a side process (manual retrain / "
+            f"out-of-tree script / test that bypassed SCORER_PATH "
+            f"isolation){gate_note}"
+        )
+        return out
+
     out["verdict"] = "FRESH"
     out["hint"] = (
         f"loop alive — last cycle #{out['last_cycle']} {age_h}h ago "
@@ -263,6 +318,19 @@ def _cli() -> int:
         f"  last_train_n={rep['last_train_n']}"
     )
     return 0 if rep["verdict"] in ("FRESH", "INSUFFICIENT_DATA") else 2
+
+
+# Public list of every verdict the report can emit — kept module-level so
+# tests can iterate them and a typo in any of the verdict-emission paths
+# above is caught by the verdict-membership lock below.
+VERDICTS: tuple[str, ...] = (
+    "FRESH",
+    "INSUFFICIENT_DATA",
+    "STALE_PKL",
+    "PKL_REGRESSED",
+    "LOOP_STALLED",
+    "LOOP_DEAD",
+)
 
 
 if __name__ == "__main__":
