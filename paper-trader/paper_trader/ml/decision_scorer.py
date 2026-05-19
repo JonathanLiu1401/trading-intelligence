@@ -490,6 +490,68 @@ class DecisionScorer:
     def n_train(self) -> int:
         return self._n_train
 
+    def feature_importance(self) -> dict:
+        """Global feature importance derived from the trained model's
+        input-layer weights — a model-wide answer to "which of the 17
+        features does the scorer actually rely on?", complementing
+        feature_contributions() which only answers it for one input.
+
+        For the sklearn MLPRegressor, importance is mean(|first-layer weight|)
+        per input neuron — a standard "this input drives many hidden units"
+        proxy. For the numpy lstsq fallback (a single linear layer), it is
+        |coefficient| directly. Both metrics live in the *standardized*
+        feature space the scaler produces, so cross-feature comparison is
+        meaningful even though raw units differ (RSI 0..100 vs sector 0/1).
+
+        Returns a JSON-safe dict ``{"trained", "method", "n_train",
+        "importances": [{"feature", "importance", "importance_normalized"}]}``
+        sorted desc by raw importance. ``importance_normalized`` sums to 1.0
+        across all features so a reader can read it as a share. Every failure
+        path degrades to an ``error`` field, never an exception (mirrors
+        predict_with_meta / feature_contributions)."""
+        if not self._trained or self._model is None:
+            return {"trained": False, "method": None, "n_train": 0,
+                    "importances": []}
+        try:
+            if hasattr(self._model, "coefs_") and self._model.coefs_:
+                W = np.asarray(self._model.coefs_[0], dtype=np.float64)
+                raw = np.abs(W).mean(axis=1)
+                method = "mlp_first_layer_mean_abs_weight"
+            elif hasattr(self._model, "w_"):
+                # _LstsqModel: w_ is shape (n_features + 1,); last entry is bias.
+                w = np.asarray(self._model.w_, dtype=np.float64)
+                if w.shape[0] < N_FEATURES:
+                    return {"trained": True, "method": "lstsq_abs_weight",
+                            "n_train": int(self._n_train), "importances": [],
+                            "error": f"weights len {w.shape[0]} < "
+                                     f"N_FEATURES {N_FEATURES}"}
+                raw = np.abs(w[:N_FEATURES])
+                method = "lstsq_abs_weight"
+            else:
+                return {"trained": True, "method": None,
+                        "n_train": int(self._n_train), "importances": [],
+                        "error": "unknown model type"}
+            if raw.size != N_FEATURES:
+                return {"trained": True, "method": method,
+                        "n_train": int(self._n_train), "importances": [],
+                        "error": f"importance len {raw.size} != "
+                                 f"N_FEATURES {N_FEATURES}"}
+            total = float(raw.sum())
+            norm = (raw / total) if total > 0 else raw
+            rows = [
+                {"feature": FEATURE_NAMES[i],
+                 "importance": round(float(raw[i]), 6),
+                 "importance_normalized": round(float(norm[i]), 6)}
+                for i in range(N_FEATURES)
+            ]
+            rows.sort(key=lambda r: -r["importance"])
+            return {"trained": True, "method": method,
+                    "n_train": int(self._n_train), "importances": rows}
+        except Exception as e:
+            return {"trained": True, "method": None,
+                    "n_train": int(self._n_train), "importances": [],
+                    "error": str(e)}
+
 
 def train_scorer(records: list[dict]) -> dict:
     """Train DecisionScorer on outcome records.
@@ -669,7 +731,13 @@ def _build_arg_parser():
                     "read-only — never trains or writes.",
     )
     p.add_argument("--explain", action="store_true",
-                   help="(Accepted for clarity; explain is the only mode.)")
+                   help="(Accepted for clarity; the default mode.)")
+    p.add_argument("--feature-importance", action="store_true",
+                   dest="feature_importance",
+                   help="Global mode: print which features the trained model "
+                        "relies on most (mean-|first-layer-weight| for the "
+                        "MLP, |coef| for the lstsq fallback). Ignores all "
+                        "per-prediction args.")
     p.add_argument("--ticker", default="",
                    help="Ticker symbol — drives the 7-way sector one-hot.")
     p.add_argument("--ml-score", type=float, default=0.0, dest="ml_score",
@@ -704,6 +772,30 @@ def main(argv: list[str] | None = None) -> int:
         sys.argv[1:] if argv is None else argv)
 
     scorer = DecisionScorer()
+
+    if args.feature_importance:
+        imp = scorer.feature_importance()
+        if args.json:
+            import json
+
+            print(json.dumps(imp, indent=2, sort_keys=True))
+            return 0 if imp.get("trained") and not imp.get("error") else 1
+        if not imp.get("trained"):
+            print("[decision_scorer] model NOT trained — no pickle at "
+                  f"{SCORER_PATH} or load failed.")
+            return 1
+        if imp.get("error"):
+            print(f"[decision_scorer] feature importance unavailable: "
+                  f"{imp['error']}")
+            return 1
+        print(f"[decision_scorer] feature importance  "
+              f"n_train={imp.get('n_train', 0)}  method={imp.get('method')}")
+        print(f"  {'feature':<22}{'importance':>14}{'share':>10}")
+        for r in imp.get("importances") or []:
+            print(f"  {r['feature']:<22}{r['importance']:>14.6f}"
+                  f"{r['importance_normalized']*100:>9.2f}%")
+        return 0
+
     common = dict(
         ml_score=args.ml_score, rsi=args.rsi, macd=args.macd,
         mom5=args.mom5, mom20=args.mom20, regime_mult=args.regime_mult,
