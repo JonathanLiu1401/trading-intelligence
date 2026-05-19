@@ -7440,3 +7440,178 @@ tests) both green — no neighboring regression. **Pre-existing failure**
 (missing `earnings-distribution` entry) confirmed on HEAD via
 stash-swap — NOT from this pass; belongs to another agent's commit
 window and is left untouched per concurrent-agent discipline.
+
+## Review pass #32 — paper-trader core hybrid (2026-05-19)
+
+**Agent persona:** debugger + feature dev + live trader; concurrent with
+three sibling HYBRID agents (ML+backtest, core, feature-dev).
+
+### Phase 1 fix (commit bdffbf8) — quota-recovery latch retries until delivered
+
+**Bug**: `runner._cycle` cleared `_quota_alert_active = False` *unconditionally*
+inside the recovery-notice path, even when `reporter._send` returned False or
+raised. Result: a transient openclaw / Discord outage at the moment the quota
+recovered silently dropped the "we're back" message AND cleared the latch —
+the operator (who only sees Discord) was stuck believing the trader was still
+frozen until the NEXT quota outage re-alarmed. The whole point of the latch is
+operator-visible state; clearing it without delivery is the failure mode it
+exists to prevent.
+
+**Fix**: mirror the alarm-path symmetry — clear the latch ONLY on a confirmed
+successful send. A failed send keeps the latch set so the next non-NO_DECISION
+cycle retries the notice; the latch itself dedupes so we never spam. Exact
+mirror of the original `if reporter.send_quota_alert(detail): _quota_alert_active = True`
+asymmetry — both paths now key off the same `bool(_send(...))` contract.
+
+```python
+if _quota_alert_active and status != "NO_DECISION":
+    ok = False
+    try:
+        ok = bool(reporter._send("✅ **CLAUDE QUOTA RECOVERED** ◈ ..."))
+    except Exception as e:
+        print(f"[runner] quota recovery notice failed: {e}")
+    if ok:
+        _quota_alert_active = False
+```
+
+**Test coverage** (4 new tests in `TestCycleQuotaRecoveryUndelivered`):
+- `test_failed_recovery_send_keeps_latch_so_we_retry` — `_send` returns False:
+  latch stays True, recovery msg was attempted (operator-visible log line),
+  next cycle will retry.
+- `test_recovery_send_exception_keeps_latch_so_we_retry` — `_send` raises:
+  cycle does NOT propagate the exception (would crash the live loop), latch
+  stays True.
+- `test_retry_until_success_then_latch_clears` — flaky send: first attempt
+  fails, second succeeds. After the second the latch clears and a fresh outage
+  re-alarms (the rearm contract).
+- `test_successful_recovery_send_clears_latch_unchanged` — regression guard:
+  the happy path (single OK send) still clears the latch on the first try.
+
+### Phase 2 feature (commit 9f12f65 + bundled into a028ad5)
+
+**Enriched `/api/portfolio`** — backwards-compatible enrichment of the public
+lean endpoint that Digital Intern's dashboard (port 8080) cross-fetches:
+
+Legacy keys (UNCHANGED — cross-port consumers never break):
+- `total_value`, `cash`, `starting_value`
+
+New trader-actionable fields, composed *purely* from the already-cached
+`portfolio.positions_json` row (no extra store reads, no network — the
+endpoint stays the lowest-latency public surface):
+- `n_positions` — open lots count
+- `open_value` — Σ market_value across open lots (= total_value − cash)
+- `unrealized_pl` / `unrealized_pl_pct` — book-wide drift since entry. The
+  pct denominator is `total_value` (the equity base) to align with
+  `/api/benchmark` / `/api/drawdown` % framing.
+- `stale_marks` — count of positions flagged `stale_mark=True` (yfinance
+  returned nothing; mark fell back to avg_cost). Nonzero means the
+  `unrealized_pl` understates real exposure — explicit so the trader is never
+  misled by a phantom "flat" book the `stale_mark` flag was added to expose.
+- `last_updated` — ISO timestamp of the most recent mark-to-market write.
+  A polling caller can detect "the trader has stopped writing" without
+  re-reading equity_curve.
+- `pnl_vs_start` / `pnl_vs_start_pct` — absolute and % delta from the $1000
+  baseline (`INITIAL_CASH`, invariant #12; never a literal).
+
+**Degrade-safe**: every numeric coercion is try/except so a malformed
+`positions_json` row (defensive — `get_portfolio` already falls it back to
+`[]`) or a non-numeric `unrealized_pl` degrades to zeros while the legacy
+three keys are always present. `total_value=0` yields `unrealized_pl_pct=None`
+(no ZeroDivisionError on the synthetic empty case).
+
+**Test coverage** (`tests/test_core_dashboard_portfolio.py`, 13 tests):
+- `TestPortfolioApiLegacyContract` — legacy three keys present, CORS header
+  intact for cross-port fetch.
+- `TestPortfolioApiEnrichedFields` — exact computed values: n_positions /
+  open_value summed from cached marks, signed `unrealized_pl` (a +20 and a −5
+  net to +15), the % denominator is `total_value` (a divide-by-open_value
+  bug would inflate the % whenever cash is high), stale_marks counts only
+  flagged rows, pnl_vs_start positive AND negative cases, last_updated parses
+  as ISO.
+- `TestPortfolioApiEmptyAndDegradeSafe` — empty book, non-list
+  `positions_json`, non-numeric `unrealized_pl`, total_value=0.
+
+**Note on commit attribution**: the dashboard.py edit was caught in a
+sibling agent's commit `a028ad5` (concurrent-staging race — the
+`pt-concurrent-samerole-staging-race.md` memory pattern). The test
+file lands separately as `9f12f65`. Net: `/api/portfolio` enrichment
+is live + locked by 13 regression tests.
+
+### Phase 3 live-validation findings (live trader 2026-05-19 ~04:40 UTC)
+
+1. **Host saturation pathology continues** (#1 known): /api/host-guard reports
+   `state=STARVED — 78% of the last 27 decisions never reached Opus`. With
+   four concurrent HYBRID Opus agents on the box (≥4 = `opus > MAX_OPUS`
+   = saturation), the live trader's pre-flight guard skips most cycles. The
+   bot cannot resolve this by trading — it is an OPS problem (`_host_pulse_line`
+   in reporter.py routes it to Discord verbatim). NOT a code bug.
+
+2. **NVDA earnings discipline holds**: trader sized 44.5% NVDA + 14.9% TQQQ
+   into NVDA earnings (0.8d away). /api/event-calendar surfaces
+   `NVDA — earnings in 0.8d [HELD_IMMINENT]`. /api/risk fires MEDIUM
+   concentration warning at top1=44.47%. The forward stack works as designed.
+
+3. **Build staleness churn**: /api/build-info reads `stale: true` on average
+   within a few minutes of any push (multiple HYBRID agents committing
+   concurrently). The git-watcher's deferred restart is honored, but each
+   restart kills the in-flight cycle and contributes to the NO_DECISION rate
+   (a self-amplifying loop: agents that touch the codebase trigger restarts
+   that surface as NO_DECISION metrics). Documented; no code change here.
+
+4. **Discord delivery healthy**: /api/runner-heartbeat `notify.verdict=HEALTHY`,
+   `last_ok_ts` within seconds. The 2026-05-17 PATH/shebang outage that
+   originally motivated the openclaw fallback resolver remains fully fixed.
+
+5. **Enriched /api/portfolio live**: response shape post-fix:
+   ```json
+   { "n_positions": 2, "open_value": 593.26, "unrealized_pl": 0.0,
+     "stale_marks": 0, "last_updated": "2026-05-19T04:40:01.797701+00:00",
+     "pnl_vs_start": 0.0, "pnl_vs_start_pct": 0.0,
+     "total_value": 1000.0, "cash": 406.74139404296875,
+     "starting_value": 1000.0 }
+   ```
+   At-a-glance: the trader can confirm "2 positions, exactly at start, marks
+   are fresh" in one call rather than fanning out across /api/state,
+   /api/equity-freshness, and /api/risk.
+
+6. **Equity integrity OK**: /api/equity-freshness `verdict=FRESH`, no
+   portfolio/equity divergence — the live trader and the equity_curve agree
+   on $1000.00 ± 0% (the trader memory `pt-portfolio-equity-divergence.md`
+   shows this is a temporary mid-cycle artifact, not a bug — confirmed clean
+   right now).
+
+### How to run / test (unchanged but locked here)
+
+```bash
+# Live trader (foreground; manual launch — see pt-systemd-vs-manual-restart-spam.md)
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.runner
+
+# Final import check
+python3 -c "import sys; sys.path.insert(0,'.'); from paper_trader import signals, reporter, strategy; print('imports OK')"
+
+# Phase-1 regression net (~5s)
+python3 -m pytest tests/test_quota_guard.py -v
+
+# Phase-2 regression net (~1s)
+python3 -m pytest tests/test_core_dashboard_portfolio.py -v
+
+# Full suite
+python3 -m pytest tests/ -v
+```
+
+### Invariants reaffirmed by this pass
+- **#10 single source of truth**: `_INITIAL_EQUITY = INITIAL_CASH` — the new
+  /api/portfolio `pnl_vs_start` keys off the module constant, never a literal.
+- **#12 cross-process value baseline**: `INITIAL_CASH` is the only baseline
+  the new endpoint reports against. The legacy `starting_value` key is the
+  same constant; consumers that ever switch on it never break.
+- **Reporter dedupe symmetry**: the alarm-path "set on success" pattern is
+  now mirrored on the recovery path "clear on success" — both keyed off the
+  same `bool(_send(...))` contract, so a Discord outage at *either* edge of
+  the quota cycle leaves the operator with the truthful state (alarmed if
+  outage started, alarmed if recovery undelivered).
+- **`pt-concurrent-samerole-staging-race.md` discipline observed**: this
+  pass's dashboard.py edit was bundled into a sibling agent's commit. Test
+  file committed standalone with explicit pathspec; AGENTS.md commit lands
+  alongside the test. Never `git add -A` in this tree.
