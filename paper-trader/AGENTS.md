@@ -9291,3 +9291,219 @@ python3 -m paper_trader.ml.scorer_smoke_test --json   # machine-readable
   `distinct_gate_buckets` consumers see no JSON-schema break; older
   callers that just read `verdict` / `probes` are byte-unaffected.
 
+
+## ML / backtest review pass (Agent 2, 2026-05-19, 4th pass) — leveraged-vs-non-leveraged scorer-skill audit
+
+Hybrid pass against `paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py`, `run_continuous_backtests.py` after the
+prior three 2026-05-19 passes saturated the bug-fix surface (CONDEMN
+floor + `PKL_REGRESSED` + `GATE_BUCKETS_DEGENERATE` already shipped).
+Phase 1 commit guard cleanly skipped this cycle (no concrete bugs);
+value is in the new `leveraged_skill` diagnostic plus 7 Phase 3 quant
+findings.
+
+### Phase 2 (commit `7abd09a`) — `leveraged_skill.py` per-bucket OOS skill audit
+
+The skeptical-quant gap left open by every existing OOS audit module.
+Production `data/decision_outcomes.jsonl` is empirically **35.3%
+leveraged ETFs** — SOXL alone = 12.6%, TQQQ = 9.6%. The live BUY
+conviction-gate (`_ml_decide` line ~1655) acts on the SAME
+`predict()` output for both classes through one ladder (±10/±5/0).
+If the scorer's apparent `oos_ic` is carried by leveraged-ETF beta
+amplification (a strong-trending bull window predictably pushes
+TQQQ/SOXL up 5–15% in 5 trading days regardless of news/quant
+features), then gating on the SAME predictions for a non-leveraged
+BUY is gating on noise.
+
+`sector_skill` cannot answer this question — it groups SOXL, TQQQ,
+NVDA, AAPL all under "tech", collapsing the leveraged ETFs and their
+underliers into one bucket whose IC is dominated by the leveraged
+tail. `persona_skill` is orthogonal (persona ≠ leverage class).
+`baseline_compare` is silent on subset breakdown.
+
+`leveraged_skill` splits the OOS slice strictly on `ticker IN
+_LEVERAGED_ETFS` (the SAME constant `_ml_decide` uses for the
+elevated 40% conviction cap, imported — not redefined — so a future
+edit to that set shifts every consumer in lockstep) and reports
+per-bucket `n_train`, `n_oos`, `mean_pred`, `mean_realized`,
+`magnitude_bias`, `rmse`, `dir_acc`, `rank_ic`. Verdict ladder:
+
+| Verdict | Trigger |
+|---|---|
+| `INSUFFICIENT_DATA` | < `MIN_RECORDS=30` aligned OOS rows total |
+| `SCORER_UNTRAINED` | `is_trained=False` |
+| `HAS_INVERTED_BUCKET` | any bucket `rank_ic ≤ -IC_GOOD=0.15` |
+| `LEVERAGED_ONLY_EDGE` | leveraged ≥ SIGNAL_EDGE AND non-leveraged < WEAK_SIGNAL_EDGE |
+| `NONLEVERAGED_ONLY_EDGE` | non-leveraged ≥ SIGNAL_EDGE AND leveraged < WEAK_SIGNAL_EDGE |
+| `LEVERAGED_DOMINATES` | both have edge, `(ic_lev − ic_non) ≥ IC_DOMINANCE_GAP=0.10` |
+| `BALANCED_EDGE` | both have edge, gap < `IC_DOMINANCE_GAP` |
+| `NO_EDGE` | neither bucket reaches `WEAK_SIGNAL_EDGE` |
+
+Per-bucket ladder (`SPARSE` / `INVERTED_SIGNAL` / `SIGNAL_EDGE` /
+`WEAK_SIGNAL_EDGE` / `NO_SIGNAL_EDGE`) mirrors `sector_skill`'s
+exactly — thresholds (`IC_MIN=0.05`, `IC_GOOD=0.15`,
+`MIN_OUTCOMES_PER_BUCKET=20`) are intentionally aligned so a quant
+reading both diagnostics sees one consistent ladder.
+
+CLI: `python3 -m paper_trader.ml.leveraged_skill [--json]`.
+Exit-code contract:
+- `0` — `BALANCED_EDGE` / `NONLEVERAGED_ONLY_EDGE` / `NO_EDGE` /
+  `LEVERAGED_DOMINATES` / `LEVERAGED_ONLY_EDGE` / `INSUFFICIENT_DATA`
+- `1` — `SCORER_UNTRAINED` / other recoverable error
+- `2` — `HAS_INVERTED_BUCKET` (cron-actionable; the gate is harmful
+  in that bucket)
+
+Reuses `validation.split_outcomes_temporal` (same temporal holdout
+the scorer-skill ledger uses) and `calibration._spearman` (tie-aware,
+load-bearing because `PRED_CLAMP_PCT` ties off-distribution preds at
+±50). Read-only, never raises, never touches `decision_scorer.pkl` /
+`build_features` / `N_FEATURES` / trade path — safe under the live
+unattended continuous loop.
+
+Locked by `tests/test_leveraged_skill.py` (34 tests, ~0.8s):
+- `TestBucketOf` (4 tests) — leveraged/non assignment, lowercase
+  normalisation, None/empty
+- `TestVerdictForBucket` (5 tests) — every per-bucket boundary pinned
+- `TestAlignedOosPair` (4 tests) — missing fwd_5d / NaN / SELL
+  sign-flip / scorer exception
+- `TestBucketMetrics` (4 tests) — perfect/zero correlation, magnitude_bias
+- `TestVerdictsTuple` + `TestSchema` (3 tests) — VERDICTS cardinality
+  lock (8 verdicts), JSON-safety
+- `TestOverallVerdicts` (7 tests) — every overall verdict reached
+  exactly once on staged synthetic data
+- `TestLeveragedDominates` (1 test) — IC gap exceeds threshold case
+- `TestTrainCountSurfacing` (1 test) — per-bucket `n_train` exposed
+- `TestAnalyzeCli` (5 tests) — analyze degrade-safe + CLI JSON/table
+  + exit-code 2 on `HAS_INVERTED_BUCKET`
+
+### Phase 3 quant findings (worth reading)
+
+1. **Continuous loop is STOPPED.** Last `scorer_skill_log.jsonl`
+   heartbeat `2026-05-18T18:06:04+00:00` (cycle 4), `continuous.log`
+   mtime `2026-05-17`. Loop dead ≥14h at time of this pass. Same
+   state the prior pass observed; no recovery between. 2 stuck
+   `status='running'` rows on USB backtest.db (6238 from 14:17,
+   6243 from 18:45); 6238 is >6h old so the per-cycle reaper will
+   sweep it on restart.
+2. **Deployed pickle remains in PKL_REGRESSED state.** Local read:
+   `n_train=35` in `data/ml/decision_scorer.pkl`. Last skill-log
+   row (cycle 4 of the most recent loop instance) recorded
+   `train_n=3959`. Ratio `0.009` ≪ `PKL_REGRESSION_TOL=0.5` — the
+   gate is OPERATIONALLY INERT (`_scorer_n >= 500` False); live
+   trading unaffected. Same critical-thin state two prior passes
+   documented.
+3. **Outcomes corpus is 35.3% leveraged ETFs.** SOXL=12.6%,
+   TQQQ=9.6%, UPRO/TECL/FNGU/CURE/LABU/NAIL/DPST/FAS the rest.
+   This is exactly the asymmetry the new `leveraged_skill`
+   diagnostic exists to surface: the scorer is trained heavily on
+   leveraged-ETF forward returns whose 5d distribution has very
+   different statistical properties than the single-name underliers.
+4. **`leveraged_skill` on a 1500-row subsample of the production
+   corpus surfaces HAS_INVERTED_BUCKET against the deployed (n=35
+   clobbered) pickle.** `nonleveraged` rank_ic=+0.181 SIGNAL_EDGE,
+   `leveraged` rank_ic=-0.205 INVERTED_SIGNAL — the deployed
+   tiny-model's predictions are anti-predictive on leveraged ETFs
+   AND weakly skilled on non-leveraged names. Of course `n_train=35`
+   < 500 so the gate is inactive; this demonstrates the diagnostic
+   reads a genuine asymmetry the headline `oos_ic` cannot show. The
+   verdict on the FULL n=3959 production pickle will likely differ
+   — re-run when the loop restarts and lifts the deployed model
+   back above the gate threshold.
+5. **Historical gate-decision capture: 5165/7413 rows (69.7%) carry
+   a non-null `gate_scorer_pred` from the loop's then-deployed
+   model.** Mean=+1.72%, stdev=7.31%. Bucket histogram:
+   `strong_headwind=4.3% | mild_headwind=29.7% | neutral=43.3% |
+   mild_tailwind=14.5% | strong_tailwind=8.3%`. The conviction
+   modulation was historically weighted toward the headwind side
+   (34.0% headwind vs 22.8% tailwind), so the gate cut conviction
+   more often than it amplified. 4 off-distribution abstentions —
+   the gate skipped modulation cleanly when the scorer flagged
+   off-dist (the documented `(off-dist,gate-skipped)` marker).
+6. **Baseline_compare verdict trajectory (cycles 1-4 of the most
+   recent loop instance): cycle 2 `MLP_NO_BETTER_THAN_TRIVIAL` →
+   cycles 3-4 `MLP_ADDS_SKILL`.** Latest cycle 4: `mlp_rank_ic=0.192`,
+   best baseline (`rsi_meanrev`) IC=0.079, `ic_gap=+0.113`. The
+   skill ledger headline `oos_ic=0.11` agrees with `mlp_rank_ic` by
+   construction. The MLP is BEATING a one-line rule in the most
+   recent cycle, contradicting the long-standing
+   `MLP_NO_BETTER_THAN_TRIVIAL` finding — worth re-evaluating once
+   the loop restarts and accumulates more cycles.
+7. **Production data directories remain SPLIT** across the monorepo
+   path (this checkout) and `/media/zeph/projects/paper-trader/`.
+   `data/` is not symlinked here — `decision_outcomes.jsonl`,
+   `scorer_skill_log.jsonl`, `baseline_skill_log.jsonl` are not
+   visible from the monorepo working tree, so `analyze()` against
+   the default path returns `INSUFFICIENT_DATA`. Out-of-scope
+   deployment issue; flagged in the prior pass too. Operators must
+   either symlink or pass an explicit `outcomes_path=` to invoke
+   any diagnostic from this checkout.
+
+### Test commands for this domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Just the ML / backtest / scorer / smoke-test / leveraged scope (~6 sec)
+python3 -m pytest tests/test_scorer_freshness.py \
+                  tests/test_scorer_smoke_test.py \
+                  tests/test_decision_scorer.py \
+                  tests/test_backtest.py \
+                  tests/test_continuous.py \
+                  tests/test_ml_backtest_review.py \
+                  tests/test_calibration.py \
+                  tests/test_baseline_compare.py \
+                  tests/test_leveraged_skill.py \
+                  tests/test_sector_skill.py \
+                  tests/test_persona_skill.py -v
+
+# Just this pass's new coverage (~0.8s)
+python3 -m pytest tests/test_leveraged_skill.py -v
+
+# Inspect deployed pickle through the leveraged lens (read-only)
+python3 -m paper_trader.ml.leveraged_skill            # table view
+python3 -m paper_trader.ml.leveraged_skill --json     # machine-readable
+# Against the production outcomes file on USB:
+python3 -c "from paper_trader.ml.leveraged_skill import analyze; \
+import json; print(json.dumps(analyze( \
+  '/media/zeph/projects/paper-trader/data/decision_outcomes.jsonl'), indent=2))"
+```
+
+### How to interpret the leveraged-skill ladder
+
+A `BALANCED_EDGE` verdict says the scorer's `rank_ic` generalises
+across the leverage axis — the conviction gate's prediction carries
+comparable edge on both halves of the watchlist. This is the
+"gate is doing real work, not beta-amplification" reading.
+
+A `LEVERAGED_DOMINATES` or `LEVERAGED_ONLY_EDGE` says the scorer's
+apparent rank-IC from the headline `oos_ic` is essentially the
+leveraged-ETF subset's IC — non-leveraged BUYs are gated on a
+prediction the data says doesn't carry differential edge there.
+Per-bucket reads should be the primary signal, not the headline.
+
+A `HAS_INVERTED_BUCKET` is the actionable red flag — the scorer's
+sign is systematically wrong on one half of the universe. Gating
+on it there is actively harmful. This is the data for a (separate,
+explicit) decision to exclude the bucket from gating or retrain
+with rebalanced classes; do NOT change `_LEVERAGED_ETFS` or
+`SECTOR_MAP` from this read-only audit — both are SSOTs.
+
+### Invariants reaffirmed by this pass
+
+- **Read-only diagnostic discipline.** `leveraged_skill` never
+  trains, never touches `decision_scorer.pkl`, no
+  `build_features` / `N_FEATURES` / trade-path mutation. Safe to
+  run against the live unattended loop.
+- **Verdict-ladder discipline.** Every CLI in `paper_trader/ml/`
+  emits a verdict from a fixed public `VERDICTS` tuple, exit 0 on
+  benign/insufficient-data, exit 2 on actionable failure. The new
+  `leveraged_skill` joins that ladder; tests pin the membership.
+- **Single source of truth for leveraged-ETF class.** Imports
+  `_LEVERAGED_ETFS` from `paper_trader.backtest` rather than
+  redefining — a future edit to that set shifts every consumer in
+  one place (mirrors `sector_skill`'s `SECTOR_MAP` discipline).
+- **Single source of truth for OOS split.** Reuses
+  `validation.split_outcomes_temporal` (the EXACT split the
+  scorer-skill ledger and `calibration --oos` /
+  `baseline_compare` / `sector_skill` already use). The diagnostic
+  describes the SAME holdout every other OOS tool reports on.
