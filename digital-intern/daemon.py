@@ -74,6 +74,10 @@ from collectors.dxy_collector import collect as collect_dxy
 from collectors.sector_etf_momentum import collect as collect_sector_etf
 from collectors.cisa_kev_collector import collect_cisa_kev
 from collectors.benzinga_analyst_collector import collect_benzinga_analyst
+from collectors.fed_press_collector import collect_fed_press
+from collectors.ecb_press_collector import collect_ecb_press
+from collectors.boj_press_collector import collect_boj_press
+from collectors.boe_press_collector import collect_boe_press
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -128,6 +132,10 @@ VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
 DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
 SECTOR_ETF_INTERVAL     = 600     # Sector ETF momentum snapshot every 10min
 BENZINGA_INTERVAL       = 300     # Benzinga analyst-ratings RSS sweep every 5min
+FED_PRESS_INTERVAL      = 1800    # Federal Reserve press / speech / testimony RSS — every 30min
+ECB_PRESS_INTERVAL      = 1800    # ECB press releases RSS — every 30min
+BOJ_PRESS_INTERVAL      = 1800    # Bank of Japan press / speech / MPM RSS — every 30min
+BOE_PRESS_INTERVAL      = 1800    # Bank of England press / publications RSS — every 30min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
 EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
@@ -177,6 +185,7 @@ ALL_WORKERS = (
     "google_news", "nitter", "substack",
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
     "yahoo_ticker_rss", "market_movers", "wikipedia", "macro_calendar",
+    "fed_press", "ecb_press", "boj_press", "boe_press",
     "scorer", "alert", "heartbeat", "purge", "stats",
     "ml_trainer", "continuous_trainer", "recursive_labeler", "price_alert",
     "portfolio_pl", "sentiment_trends", "export", "web_server",
@@ -205,6 +214,10 @@ WORKER_POLL_INTERVAL_SECS = {
     "wikipedia": WIKIPEDIA_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL,
     "cisa_kev": CISA_KEV_INTERVAL,
     "benzinga_analyst": BENZINGA_INTERVAL,
+    "fed_press": FED_PRESS_INTERVAL,
+    "ecb_press": ECB_PRESS_INTERVAL,
+    "boj_press": BOJ_PRESS_INTERVAL,
+    "boe_press": BOE_PRESS_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
     "ml_trainer": ML_TRAIN_INTERVAL,
@@ -1097,6 +1110,98 @@ def cisa_kev_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(CISA_KEV_INTERVAL)
+
+
+# ── Worker: Federal Reserve press / speech / testimony — every 30min ──────
+# These four central-bank press workers all follow the cisa_kev pattern: pull
+# the collector (which handles its own dedup via seen_articles.db), hand the
+# fresh entries to _ingest() so the heuristic scorer / insert_batch path runs
+# verbatim, and ping source_health. Press releases are low-volume (handfuls
+# per day), so 30min is high enough to avoid worsening the chronic
+# insert_batch lock contention and low enough to catch a same-hour FOMC /
+# ECB / BoJ decision before the next briefing cycle.
+def fed_press_worker(store: ArticleStore):
+    log.info("[fed_press_worker] started")
+    bo = Backoff("fed_press", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_fed_press()
+            _ingest(store, articles, "fed_press")
+            try:
+                source_health.record_result("fed_press", len(articles))
+            except Exception as he:
+                log.warning(f"[fed_press_worker] source_health error: {he}")
+            _worker_last_ok["fed_press"] = time.time()
+            log.debug(f"[fed_press] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[fed_press_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(FED_PRESS_INTERVAL)
+
+
+def ecb_press_worker(store: ArticleStore):
+    log.info("[ecb_press_worker] started")
+    bo = Backoff("ecb_press", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_ecb_press()
+            _ingest(store, articles, "ecb_press")
+            try:
+                source_health.record_result("ecb_press", len(articles))
+            except Exception as he:
+                log.warning(f"[ecb_press_worker] source_health error: {he}")
+            _worker_last_ok["ecb_press"] = time.time()
+            log.debug(f"[ecb_press] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[ecb_press_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(ECB_PRESS_INTERVAL)
+
+
+def boj_press_worker(store: ArticleStore):
+    log.info("[boj_press_worker] started")
+    bo = Backoff("boj_press", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_boj_press()
+            _ingest(store, articles, "boj_press")
+            try:
+                source_health.record_result("boj_press", len(articles))
+            except Exception as he:
+                log.warning(f"[boj_press_worker] source_health error: {he}")
+            _worker_last_ok["boj_press"] = time.time()
+            log.debug(f"[boj_press] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[boj_press_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(BOJ_PRESS_INTERVAL)
+
+
+def boe_press_worker(store: ArticleStore):
+    log.info("[boe_press_worker] started")
+    bo = Backoff("boe_press", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_boe_press()
+            _ingest(store, articles, "boe_press")
+            try:
+                source_health.record_result("boe_press", len(articles))
+            except Exception as he:
+                log.warning(f"[boe_press_worker] source_health error: {he}")
+            _worker_last_ok["boe_press"] = time.time()
+            log.debug(f"[boe_press] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[boe_press_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(BOE_PRESS_INTERVAL)
 
 
 # ── Worker: Portfolio P/L snapshot — every 5min ─────────────────────────────
@@ -2251,6 +2356,10 @@ def main():
         ("congress_trades", congress_trades_worker),
         ("cisa_kev",    cisa_kev_worker),
         ("benzinga_analyst", benzinga_analyst_worker),
+        ("fed_press",   fed_press_worker),
+        ("ecb_press",   ecb_press_worker),
+        ("boj_press",   boj_press_worker),
+        ("boe_press",   boe_press_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
