@@ -215,6 +215,41 @@ Suites:
   must NOT catch), (3) integration on ``send_urgent_alert`` with the
   no-Claude-call short-circuit + cross-gate chaining vs the quote-
   widget gate. 20 cases.
+- `test_urgency_recap_prefilter.py` — the **third** surface of the recap-
+  template gate: `watchers/urgency_scorer.py::score_batch` now pre-filters
+  recap-template rows BEFORE the Sonnet call, flooring them to
+  `ai_score=0.01 / urgency=0 / score_source='llm'`. Live evidence
+  (2026-05-18/19): Sonnet had been mis-labeling 10 such rows in 24h as
+  ai_score=8+ score_source='llm' — poisoning the trainer's strong-label
+  pool with retrospective SEO fluff tagged ground-truth urgent. Pre-floor
+  saves Sonnet quota AND keeps the LLM label distribution honest. Pins
+  (1) zero Sonnet calls on a recap row, (2) zero Sonnet calls on an
+  all-recap batch, (3) mixed batch — recap row excluded from Sonnet
+  prompt, real urgent row still scored 9.5, (4) must-survive corpus
+  (real earnings, Fed cuts, mid-sentence "why", earnings PREVIEWS,
+  analyst-rating headlines) still reaches Sonnet, (5) **3-way lockstep
+  parity**: `urgency_scorer._looks_like_recap_template is
+  alert_agent._looks_like_recap_template` — single source of truth
+  across alert / briefing / scorer surfaces, a future fork of the
+  patterns fails this assertion. 24 cases.
+- `test_recap_template_audit.py` — `analytics/recap_template_audit.py`,
+  the calibration view of the recap gate (counterpart to
+  `ml/label_audit.py` for training-pool integrity). Counts
+  recap-template-matching rows in the recent window by their CURRENT
+  state so a regression manifests as a nonzero `leaked_to_strong_pool`
+  metric — exactly the 10-rows-in-24h leak the pre-filter was added to
+  prevent. Pins (1) verdict shape (stable 6-fingerprint dict on empty
+  input), (2) strong-pool leak detection (single `score_source='llm'
+  AND ai_score>=8` recap row flips `ok` to False), (3) post-fix clean
+  state (`ai_score=0.01` floored rows do not leak), (4) per-fingerprint
+  counting reconciles (one fingerprint per row, first-wins), (5)
+  backtest isolation (`backtest://` URLs and `backtest_*` /
+  `opus_annotation*` sources never inflate the metric — same drift
+  class as the dashboard-parity tests), (6) window filtering respects
+  the `hours` parameter, (7) `LIVE_ONLY_CLAUSE` constant stays
+  byte-identical to `storage.article_store._LIVE_ONLY_CLAUSE` (anti-
+  drift discipline). Standalone CLI: `python3 -m
+  analytics.recap_template_audit --hours 24`. 13 cases.
 - `test_features.py` — exactly 15 extra dims, ticker density, days-since-published normalization
   (`min(age,30)/30` → ~1/30 at 24h, saturates 1.0 at ≥30d; this is intended ML feature scaling,
   not a bug), cyclic feature bounds.
