@@ -109,6 +109,36 @@ class TestExtractTickers:
         assert signals._extract_tickers("") == set()
         assert signals._extract_tickers(None) == set()
 
+    def test_time_and_date_abbreviations_filtered(self):
+        # Time / date / chat abbreviations are common in news headlines and
+        # are NOT tickers — extracting them pollutes the per-article `tickers`
+        # field Opus reads in the live decision prompt and biases the model
+        # toward "names" that don't exist. Pin so a future trim of
+        # _NOT_TICKERS cannot silently re-introduce these false positives.
+        for noise in ("AM", "ET", "JUN", "JUL", "BTW", "FYI", "ETA"):
+            out = signals._extract_tickers(f"hours are 10 {noise} today")
+            assert noise not in out, (
+                f"expected {noise!r} to be filtered as noise, "
+                f"got {sorted(out)!r}"
+            )
+
+    def test_time_phrase_extracts_no_tickers(self):
+        # A typical news-headline time phrase produces nothing —
+        # historically gave {'AM','ET'} which silently misled Opus.
+        assert signals._extract_tickers(
+            "Fed meeting at 10 AM ET on Wednesday"
+        ) == set()
+
+    def test_real_ticker_still_extracted_alongside_noise(self):
+        out = signals._extract_tickers(
+            "NVDA earnings call 5 PM ET; AMD reports Q3 later"
+        )
+        assert "NVDA" in out
+        assert "AMD" in out
+        # Time/date noise is dropped.
+        for noise in ("AM", "ET", "PM", "Q3"):
+            assert noise not in out
+
 
 class TestDecompress:
     def test_roundtrip(self):
