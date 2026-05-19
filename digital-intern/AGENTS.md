@@ -247,7 +247,18 @@ Suites:
   consecutive-failure threshold and on every multiple after, never below it, never on a
   non-positive count or misconfigured threshold (see ML pipeline note below).
 - `test_alert_dedup.py` / `test_logger_rotation.py` — syndication dedup signature/merge rules and
-  size-rotation of `logs/structured.jsonl`.
+  size-rotation of `logs/structured.jsonl`. `TestSignatureFrontAttribution` pins the
+  2026-05-19 front-attribution fix: a headline like
+  `"FinancialContent - Nvidia (NVDA) Reports Earnings Tomorrow"` used to collapse to the
+  one-token publisher tag `"financialcontent"` via `_SOURCE_SEP.split(head)[0]`, silently
+  bypassing every gate that keys on this signature (alert_recency cross-cycle 6h dedup,
+  `dedupe_urgent` in-batch syndication collapse, briefing `[ALERTED]` parity tag).
+  Live evidence: one canonical NVDA earnings-preview story fired THREE BREAKING pushes
+  within 2.5h (03:21 GN canonical, 05:16 front-attributed by FinancialContent
+  bypassing the TTL, 05:42 GN). The fix picks the LONGEST split part by word count so
+  front-attribution maps to the trailing real headline; the canonical trailing-attribution
+  case (`"Headline ... - Reuters"`) is byte-unchanged (longer leading part still wins),
+  and the no-separator case is byte-unchanged.
 - `test_recursive_labeler.py` — `_apply_labels` defensive urgency parse (a non-int urgency from
   Claude must not abort the run or discard the batch's good labels), 0..5→0..10 relevance rescale,
   `score_source='llm'` on writes, and `_fetch_round1_candidates` backtest/opus exclusion (a
