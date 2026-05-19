@@ -743,6 +743,156 @@ def _alert_book_velocity_lines(
     return [line for _, _, line in rows[:max_lines]]
 
 
+# ── Forward macro calendar (the OUT-of-articles forward catalysts) ───────────
+# EARNINGS CALENDAR is supplied by the caller (a separate yfinance scrape) so
+# the briefing has explicit forward awareness of every held/watched ticker's
+# next earnings print. The 2026-05-18 ``macro_calendar_collector`` ships the
+# parallel FORWARD MACRO awareness — FOMC meetings + BLS CPI/Jobs/PPI releases
+# — into articles.db with ``source='macro_calendar'`` and ``published`` set to
+# the FUTURE event datetime. But those rows have no surfacing in the briefing
+# beyond the generic NEWSWIRE rank order: a TODAY FOMC sitting at #34 in a
+# busy-wire window is read by Opus as a generic newswire item, not as the
+# market-wide rate decision it actually is.
+#
+# This is the read-side complement to that collector: a SEPARATE forward
+# block, parallel in shape to EARNINGS CALENDAR (a REPRODUCED section,
+# operational-status family — same surfacing discipline as COVERAGE GAP /
+# THROUGHPUT DEGRADATION / ALERT VELOCITY, not an INPUT hint like BOOK HEAT).
+# Pure read-side: a fresh ``mode=ro`` connection (never the daemon's shared
+# self.conn — the documented cursor-collision hazard), best-effort → [] on
+# any failure so the 5h briefing is NEVER broken or delayed. No DB write,
+# no ai_score/ml_score/score_source/urgency touch, never reads or mutates
+# source_articles, backtest already excluded by _LIVE_ONLY_CLAUSE — all four
+# load-bearing invariants intact by construction.
+#
+# Why ``source='macro_calendar'`` only (not ``LIKE 'macro_calendar%'`` or a
+# broader filter): the collector writes that exact tag, and we want this
+# block to surface ONLY curated forward-event rows, NEVER a general news
+# headline that happens to mention FOMC. The alert path already catches
+# breaking-rate-decision news via the standard urgency pipeline; this is
+# the SCHEDULED-event surface, kept clean and orthogonal.
+#
+# Why dedup by ``published`` (not by title): each event can be present in
+# articles.db with multiple title prefixes ("UPCOMING (5d)" / "TOMORROW" /
+# "TODAY") — the day-class transitions are a feature, not a bug. The most
+# recent row (``MAX(first_seen)``) carries the sharpest prefix for the
+# current day, so picking it per ``published`` instant naturally surfaces
+# "TODAY: FOMC ..." when an FOMC is today and "UPCOMING (3d): FOMC ..."
+# when it's three days out, without us re-parsing the title.
+MACRO_CALENDAR_WINDOW_HOURS = 72
+_MACRO_CALENDAR_MAX_LINES = 6
+
+
+def _collect_macro_calendar_events(
+    window_hours: int = MACRO_CALENDAR_WINDOW_HOURS,
+    now: datetime | None = None,
+) -> list[dict] | None:
+    """Best-effort: forward macro events from articles.db (source=macro_calendar)
+    within the next ``window_hours``. Returns a list of ``{"title": str,
+    "published": str, "hours_until": float}`` sorted ascending by ``hours_until``
+    (most-imminent first), or ``None`` on ANY failure — a forward-calendar
+    read must NEVER break or delay the 5h briefing it annotates (identical
+    discipline to ``_collect_source_health`` / ``_collect_alert_velocity``).
+
+    Dedup by the ``published`` instant — each event lifetime can write up to
+    4 rows (one per day_class transition; see ``macro_calendar_collector``);
+    we want exactly ONE entry per scheduled event, carrying the freshest
+    title prefix. ``MAX(first_seen)`` gives the latest day-class emission per
+    event datetime, so "TODAY: FOMC Meeting — March 17, 2026" wins on the day
+    of the meeting and the obsolete "UPCOMING (5d): ..." is correctly hidden.
+    """
+    try:
+        import sqlite3
+        from storage.article_store import _get_db_path
+        from datetime import timedelta as _td
+        cur_now = now or datetime.now(timezone.utc)
+        horizon = (cur_now + _td(hours=window_hours)).isoformat()
+        now_iso = cur_now.isoformat()
+        conn = sqlite3.connect(
+            f"file:{_get_db_path()}?mode=ro", uri=True, timeout=5,
+        )
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            # Dedup on ``published`` (the event instant) — the freshest
+            # first_seen row per instant carries the sharpest day_class
+            # prefix. Bounded LIMIT so a runaway insertion can never
+            # produce a multi-page briefing block.
+            rows = conn.execute(
+                "SELECT title, published, MAX(first_seen) AS fs "
+                "FROM articles "
+                "WHERE source = 'macro_calendar' "
+                "AND published >= ? AND published <= ? "
+                "GROUP BY published "
+                "ORDER BY published ASC "
+                "LIMIT 50",
+                (now_iso, horizon),
+            ).fetchall()
+        finally:
+            conn.close()
+        out: list[dict] = []
+        for title, published, _fs in rows:
+            if not title or not published:
+                continue
+            try:
+                ev_dt = datetime.fromisoformat(str(published).replace("Z", "+00:00"))
+                if ev_dt.tzinfo is None:
+                    ev_dt = ev_dt.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            hours_until = (ev_dt - cur_now).total_seconds() / 3600.0
+            if hours_until < 0:
+                continue  # event already past — should not happen given SQL filter, defensive
+            out.append({
+                "title": str(title),
+                "published": str(published),
+                "hours_until": round(hours_until, 1),
+            })
+        return out
+    except Exception:
+        return None
+
+
+def _macro_calendar_event_lines(
+    events: list[dict] | None,
+    max_lines: int = _MACRO_CALENDAR_MAX_LINES,
+) -> list[str]:
+    """Pure: render forward macro events as compact one-line entries.
+
+    Each line carries the event title verbatim (which the collector already
+    composed with the appropriate day-class prefix — TODAY / TOMORROW /
+    UPCOMING (Nd) / IN Nd) plus a human-readable hours-until tag (``~Nh``
+    for sub-day, ``~Nd`` for multi-day so the line communicates urgency at
+    a glance independent of how the title is worded).
+
+    ``[]`` when nothing usable — the same omit-when-empty discipline as
+    ``_coverage_gap_lines`` / ``_alert_velocity_lines``. Non-list / empty
+    / malformed entries are skipped, never raise (the analyst's #1
+    complaint is noise, so a broken row degrades to silence)."""
+    if not isinstance(events, list) or not events:
+        return []
+    out: list[str] = []
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        title = (e.get("title") or "").strip()
+        if not title:
+            continue
+        h = e.get("hours_until")
+        try:
+            hours = float(h)
+        except (TypeError, ValueError):
+            out.append(title)
+            continue
+        if hours < 24.0:
+            tag = f"~{int(round(hours))}h"
+        else:
+            tag = f"~{int(round(hours / 24.0))}d"
+        out.append(f"{title} ({tag})")
+        if len(out) >= max_lines:
+            break
+    return out
+
+
 # ── Prior-digest continuity (anti-rehash) ────────────────────────────────────
 # A news analyst reading consecutive 5h heartbeats complains most about
 # repetition: the briefing re-LEADS with the SAME story it led with last time.
@@ -893,6 +1043,7 @@ RULES:
 - If an "ALERT VELOCITY" block is present in the data input, reproduce it as an **ALERT VELOCITY** section under the THROUGHPUT DEGRADATION bullets (one bullet, verbatim). This is the BREAKING-alert wire's firing-rate vs the prior window of the same length: an objective magnitude signal independent of any individual story's score. Use it for cumulative framing — a "wire materially hot" window means cumulative event flow is itself the story (weight the LEAD accordingly: macro/risk regime, not a lone headline); a "wire silent" window means scrutinise any one BREAKING-tagged story more carefully. Omit the section entirely if no velocity block is provided.
 - If an "ALERT BOOK VELOCITY" block is present, it lists held names mentioned in MULTIPLE 🚨 BREAKING alerts in the recent window vs the prior window of the same length — per-position alert-rate magnitude. The per-row [BOOK:] tag flags WHICH rows touch the held book; this block flags that the held name is itself the WINDOW'S hot centre of breaking-wire activity (≥2 distinct alerts mention it). Weight these held names above other rows of comparable score when choosing the LEAD and ordering TOP SIGNALS, and give them a concrete forward-looking implication in the PORTFOLIO table. This is a ranking/weighting hint only — do NOT echo a literal "ALERT BOOK VELOCITY" section in the output (same as BOOK HEAT / BOOK SILENCE / AGING TOP ROWS, unlike COVERAGE GAP).
 - If a "PRIOR DIGEST" block is present, it is the LEAD and TOP SIGNALS YOU YOURSELF published in your previous 5h briefing — the analyst just read that one. Re-leading the SAME story as if it were new is the single most-cited "repetitive digest" complaint. If the dominant story is materially unchanged, do NOT restate it as the LEAD: lead instead with what has CHANGED since (a new level/print/catalyst, a reversal, or a genuinely different top story that now outranks it), and frame any necessarily-carried theme explicitly as continuation/development ("rout now easing", "follows this morning's selloff"), never as a fresh break. This is a framing/selection hint only — do NOT echo a literal "PRIOR DIGEST" section in the output (same as BOOK HEAT / AGING TOP ROWS, unlike COVERAGE GAP).
+- If a "MACRO CALENDAR" block is present in the data input, reproduce it as a **MACRO CALENDAR** section directly above the DESK NOTE (one bullet per scheduled event, verbatim). These are scheduled forward catalysts — FOMC rate decisions, BLS CPI/Jobs/PPI releases — within the next 72h that materially reshape risk for a leveraged-ETF-heavy book. An imminent TODAY/TOMORROW FOMC or CPI is the single biggest market-wide event; the LEAD must explicitly factor it (e.g. "ahead of FOMC tomorrow", "into Friday's jobs print") and the RISK / CATALYST section must NAME each upcoming event with its remaining timing. A 5h+ horizon shifts how every individual story should be weighted — a strong move into a Fed decision is positioning, not pure signal. Omit the section entirely if no macro block is provided.
 
 OUTPUT FORMAT — use EXACTLY this, filled with real data:
 
@@ -946,6 +1097,9 @@ AMD   $xxx  +x.xx%  |  AMAT $xxx +x.xx%  |  SMH  $xxx  +x.xx%
 
 **ALERT VELOCITY** (only if a velocity block is provided — else omit this whole section)
 - [BREAKING-wire firing rate verbatim from the ALERT VELOCITY data block]
+
+**MACRO CALENDAR** (only if a macro block is provided — else omit this whole section)
+- [scheduled FOMC / CPI / Jobs / PPI event verbatim from the MACRO CALENDAR data block]
 
 **DESK NOTE:** [1-2 sentences. One thesis. One level to watch.]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1493,7 +1647,8 @@ def _aging_top_rows(
 
 def _build_payload(articles, stock_data, earnings, source_health_report=None,
                    prior_digest=None, source_throughput=None,
-                   alert_velocity=None, alert_book_velocity=None):
+                   alert_velocity=None, alert_book_velocity=None,
+                   macro_calendar_events=None):
     parts = [f"BRIEFING TIME: {_now_utc_str()}\n"]
 
     macro_data   = stock_data.get("macro", [])   if isinstance(stock_data, dict) else []
@@ -1701,6 +1856,32 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None,
             # renders as the placeholder rather than the literal "None".
             parts.append(f"  {e.get('ticker') or '?'}  {e.get('earnings_date') or 'N/A'}")
 
+    # Forward macro-calendar block — the FOMC / CPI / Jobs / PPI catalysts
+    # the macro_calendar_collector writes to articles.db with future
+    # ``published`` timestamps. Only emitted when an explicit event list is
+    # supplied (analyze() fetches it live). When None, the section is omitted
+    # entirely so the prompt's "omit if no macro block" rule fires and
+    # callers/tests that build a payload without macro context stay
+    # deterministic — exact same shape as source_health_report / source_throughput
+    # / alert_velocity above (the documented anti-drift discipline). A
+    # REPRODUCED section (operational-status family, like COVERAGE GAP /
+    # THROUGHPUT DEGRADATION / ALERT VELOCITY), NOT an INPUT hint like
+    # BOOK HEAT. Pure read-side: no DB write, no
+    # ai_score/ml_score/score_source/urgency touch, never reads or mutates
+    # source_articles, backtest already excluded by the _collector's
+    # ``source='macro_calendar'`` filter — all four load-bearing invariants
+    # intact by construction.
+    if macro_calendar_events is not None:
+        macro_lines = _macro_calendar_event_lines(macro_calendar_events)
+        if macro_lines:
+            parts.append(
+                "\n=== MACRO CALENDAR (FOMC / CPI / Jobs / PPI within "
+                f"{MACRO_CALENDAR_WINDOW_HOURS}h — scheduled forward "
+                "catalysts) ==="
+            )
+            for ml in macro_lines:
+                parts.append(f"  - {ml}")
+
     # Coverage-gap block — only emitted when an explicit report is supplied
     # (analyze() fetches it live). When None, the section is omitted entirely
     # so the prompt's "omit if no gap block" rule fires and callers/tests that
@@ -1809,6 +1990,7 @@ def analyze(articles, stock_data, earnings):
         source_throughput=_collect_source_throughput(),
         alert_velocity=_collect_alert_velocity(),
         alert_book_velocity=_collect_alert_book_velocity(),
+        macro_calendar_events=_collect_macro_calendar_events(),
     )
     full_prompt = f"{SYSTEM_PROMPT}\n\n---\nDATA INPUT:\n{payload}"
     result = claude_call(full_prompt, model=MODEL, timeout=180)
