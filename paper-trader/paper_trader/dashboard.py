@@ -10100,6 +10100,15 @@ def _swr_prewarm():
         # cold-stall blind spot test_swr_prewarm_coverage.py locks against.
         ("stress_scenarios", stress_scenarios_api),
         ("watchlist-opportunities", watchlist_opportunities_api),
+        # scorer-opportunities (20295e8), scorer-portfolio-attribution
+        # (6018347), and trade-attribution (2a28eea) were @swr_cached but
+        # never prewarmed — same freeze-triage cold-stall blind spot. The
+        # scorer panels are the operator's primary attribution surface when
+        # the book is bleeding; a {"warming": true} on first poll after a
+        # restart is exactly the wrong UX during triage.
+        ("scorer-opportunities", scorer_opportunities_api),
+        ("scorer-portfolio-attribution", scorer_portfolio_attribution_api),
+        ("trade-attribution", trade_attribution_api),
     ]
     for name, wrapper in targets:
         try:
