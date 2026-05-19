@@ -3639,3 +3639,142 @@ expected; this entry was appended, not rewritten).
   `collectors/seekingalpha_collector.py`,
   `tests/test_chat_correlation_enrichment.py`); this AGENTS.md entry was
   appended, not rewritten.
+
+- **2026-05-19 (hybrid pass 29 — Agent 3, debug + feature + analyst-validation)** —
+  All 9 required files + AGENTS.md read in full. Concurrent sibling hybrid
+  agents (`pid 1979386` finishing as `pid 2291376` started) committed/pushed
+  `6018347 feat(dashboard): /api/scorer-portfolio-attribution` mid-session;
+  strict per-commit pathspec staging held throughout (memory
+  `di-shared-repo-concurrency`). Stale daemon (pid 2124003, etimes ≈4h+) was
+  still running unrestarted, so phantom-row evidence persisted into this
+  pass.
+
+  **Phase 1 — bugs_fixed=1, commit `a27109f`** (1 src + 1 test,
+  +95/−4, pathspec-scoped, `git show --stat` verified EXACTLY 2 files, on
+  origin/master `6018347..a27109f`). **purge_worker startup reap.** Live
+  evidence (2026-05-18 → 19): 26 rows STILL stuck at `urgency=1` since
+  2026-05-13 — 6 days, never alerted — even though the well-tested
+  `ArticleStore.reap_stale_urgent` exists at HEAD. Root cause: reap is
+  called ONLY inside `purge_old`, which fires on a 6h cadence after a
+  manually-initialised `last_purge = time.time()` (so the FIRST purge is 6h
+  after worker start). The operator-restart cycle is shorter than 6h
+  (memory `di-stale-manual-daemon`), so on every daemon run the reaper
+  never gets a turn — phantom rows accumulate indefinitely, inflating the
+  dashboard `urgent` tile and re-fetched/re-decompressed by the alert
+  worker every cycle. Fix: a one-shot `_purge_worker_startup_reap(store)`
+  call at the top of `purge_worker` (BEFORE the 5-min health-ping loop).
+  Idempotent + cheap (one indexed UPDATE), identically invariant-safe to
+  the existing in-`purge_old` call: only `urgency` is mutated, never
+  ai_score/ml_score/score_source/synthetic rows. Best-effort wrapper —
+  any store exception is logged and swallowed so the 5-min liveness ping
+  loop still starts. +4 specific-value tests pin: aged-row demotion (6d
+  phantom → urgency=0), no-op when nothing stale (fresh row + already-
+  alerted row both untouched), exception swallowing (custom `_Boom` mock),
+  synthetic-row defense-in-depth (backtest:// row with urgency=1 stays
+  urgency=1, the live row in the same call is reaped). Suite 960→964 pass
+  after Phase 1.
+
+  **Phase 2 — features_added=1, commit `cef83f2`** (1 src + 1 test,
+  +399/−1, pathspec-scoped via explicit `git add <files>`,
+  `git show --stat` verified EXACTLY 2 files, on origin/master
+  `3e24437..cef83f2`). **ALERT VELOCITY — BREAKING-wire firing-rate
+  magnitude hint.** The 🚨 BREAKING alert path is the analyst's most
+  time-critical product, and its raw firing rate over a 5h window vs the
+  prior 5h carries a magnitude signal NO individual story score can
+  express: 24 alerts vs 8 prior tells Opus the wire is materially hot (a
+  real macro event under way — Fed surprise, geopolitical escalation,
+  broad selloff) and stories should be weighted with cumulative gravity;
+  2 vs 12 means the wire is unusually quiet so a lone BREAKING-tagged
+  story deserves closer scrutiny than the same score in a busy window.
+  Until now the briefing composed LEAD/TOP SIGNALS with ZERO awareness
+  of the standalone-push channel's firing rate.
+
+  Same shape as COVERAGE GAP / THROUGHPUT DEGRADATION (operational-status
+  family): three coordinated pieces in `analysis/claude_analyst.py` —
+  (a) `_collect_alert_velocity(window_hours=5)` opens a fresh `mode=ro`
+  connection (never the daemon's shared `self.conn` — the documented
+  cursor-collision hazard, same discipline as the family), best-effort →
+  None on any failure so the 5h briefing is never broken or delayed;
+  (b) `_alert_velocity_lines` is a pure renderer with conservative
+  thresholds (`recent+prior >= 5` AND `|delta_pct| >= 50%`, plus two
+  special-case branches for the previously-dark and newly-silent edges
+  that bypass the percentage gate because the ratio is undefined / -100%);
+  (c) wired into `_build_payload` as a new optional input block +
+  SYSTEM_PROMPT rule under THROUGHPUT DEGRADATION, with the same "omit
+  when absent" byte-determinism discipline as `source_throughput` /
+  `source_health_report` / `prior_digest`. Counts only `urgency=2` (the
+  actually-fired state); `urgency=1` is the queued/phantom state (whose
+  reap I fixed in Phase 1) and is correctly excluded. `_LIVE_ONLY_CLAUSE`
+  applied — backtest isolation invariant.
+
+  Pure read-side by construction: no DB write, no ai_score / ml_score /
+  score_source / urgency mutation, never reads or mutates source_articles,
+  backtest already excluded upstream — **all four load-bearing invariants
+  intact**. +18 specific-value tests pin: empty/non-dict input,
+  below-min-total / below-min-delta silence, hot-wire exact rendered
+  message, cooling-wire exact rendered message, newly-lit / newly-silent
+  edges, below-min-total special cases stay silent, doubling at threshold
+  emits, window_hours reflected in text, malformed dict (non-numeric /
+  negative / zero window) → [], `_build_payload` wiring (emit/omit/
+  none-vs-explicit-none byte-equality), SYSTEM_PROMPT coverage rule.
+  **Live verification before commit:** current 5h window reads "32 alerts
+  vs 17 prior (+88%) — wire materially hot"; current 2h window reads
+  "7 vs 15 (-53%) — cooling". Both pass the magnitude bar with real DB
+  data, confirming the feature produces a real operational signal on next
+  briefing run. Suite 964→982 pass after Phase 2 (zero regressions).
+
+  **Phase 3 — analyst-lens live validation, user_findings=8.**
+  (1) **Collection HEALTHY (positive)** — 414/h GN: Nasdaq, ~3-4k articles/h
+  aggregate across GN round-robin + GDELT + scraped + Finnhub + Yahoo +
+  Benzinga + DigiTimes; well within expected rates.
+  (2) **Alerts on-book and actionable (positive)** — LITE -8.83%
+  (ai=9.71, insider distribution), AXTI -14.46% (ai=9.0, +650% YTD
+  profit-take), TSEM -9.46% (ai=9.63), MU -5.95% (continuation),
+  NVDA Culper Research short (ai=9.33, "tip of iceberg" China problem),
+  NVIDIA Huang/Dell parabolic-demand quote (ai=8.0). Exact persona match
+  — these are the alerts the SAO semis analyst WOULD react to.
+  (3) **Recap-headline noise (negative)** — `Why Nvidia (NVDA) Stock Is
+  Trading Up Today` fired BREAKING twice (StockStory + YahooFinance/NVDA,
+  ml=8.6/9.4) — these are post-hoc price-move recaps, not breaking news.
+  Contested ML-tuning territory (per the cred-bar precedent, deferred);
+  the fingerprint pattern is "Why <TICKER> ... Today" but its FP rate on
+  legitimate "Why semis are crashing today" explainers is unmeasured,
+  out of clean scope this pass.
+  (4) **GDELT GKG SEO-mill noise** — `Here What the Street Thinks About
+  ​NVIDIA Corporation` (note zero-width space U+200B between space-and-N
+  in "​NVIDIA" — SEO content from insidermonkey.com via GDELT, ml=8.57).
+  Distinct surface from existing junk-domain map; not in the
+  _LOW_AUTHORITY_DOMAINS list. Worth a future evidence-driven addition.
+  (5) **Briefing id29 (23:13Z) is EXCELLENT** — read end-to-end: LEAD
+  ties LITE/AXTI/TSEM/MU together as broadened book pain ahead of NVDA
+  print; PORTFOLIO table has exact prices/%/notes for every held name;
+  TOP SIGNALS carry [seen HH:MM] timestamps with continuation framing.
+  Highest-quality briefing observed across recent passes.
+  (6) **26 phantom urgency=1 rows STILL in live DB** — daemon hasn't
+  restarted to pick up Phase 1 fix; ships on next `systemctl restart
+  digital-intern`. Confirmed live root cause matches my fix discipline.
+  (7) **7 disabled collectors** (alphavantage, massive, newsapi, nitter,
+  polygon, sec_edgar, sec_edgar_ft) — chronic external/rate-limit gap
+  (memory `di-chronic-dark-collectors`), correctly surfaced by COVERAGE
+  GAP in the briefing. Operational, not a code bug.
+  (8) **Live alert wire is HOT (positive — feature validated)** — 32
+  alerts/5h vs 17 prior = +88% confirmed against the live DB. The new
+  ALERT VELOCITY feature would correctly flag this to Opus, weighting
+  the LEAD with the cumulative-gravity context the prior briefing
+  composed without. None of 3/4/6/7 is a quick safe fix in clean scope
+  → no Phase-3 fold-in; bugs_fixed stays 1, features_added 1.
+
+  **Verify:** `from storage import article_store; from ml import
+  features, model; from analysis import claude_analyst` imports OK;
+  suite **982 passed** (`tests/`, my +4 reaper-startup tests + 18
+  alert-velocity tests all green, zero regressions). Commits `a27109f`
+  (Phase 1) and `cef83f2` (Phase 2) pathspec-scoped via explicit
+  `git add <files>`; `git diff --staged --stat` + `git show --stat`
+  verified EXACTLY 2 + 2 = 4 intended files, zero sibling leakage; never
+  `git add -A`; both pushed to origin/master. Concurrent sibling
+  committed `6018347 feat(dashboard): /api/scorer-portfolio-attribution`
+  mid-session (separate file domain, no collision); untracked
+  `collectors/fda_collector.py`, `collectors/nasdaq_ipo_calendar.py`,
+  `collectors/seekingalpha_collector.py` + all `paper-trader/*`
+  deliberately never staged. This AGENTS.md entry was appended, not
+  rewritten.
