@@ -822,6 +822,81 @@ def _macro_calendar_chat_lines(mc) -> list[str]:
     return lines
 
 
+def _event_readiness_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/event-readiness` (will the live trader
+    actually be able to react before the next earnings print?) as compact
+    chat-context lines.
+
+    The chat now carries forward macro + earnings timing (`_macro_calendar_
+    chat_lines`) and pre-print dollarized shock (`_earnings_shock_chat_
+    lines`), but ALL of that assumes the bot will *make a decision* before
+    the print. The live failure mode (NO_DECISION storms / Claude empty
+    streaks / wedged-supervisor PARALYSIS) breaks that assumption silently
+    — and the chat-side analyst answers "is your book at risk?" without
+    ever questioning whether the bot can act. This closes that gap.
+
+    SSOT (paper-trader invariant #10): the builder's own ``summary`` string
+    is the verbatim chat headline — no chat-side re-derived verdict that
+    could drift from the trader endpoint. Per-event lines restate the
+    builder's *own* fields (ticker / exposure_usd / hours_until_event /
+    verdict / recommended_action) — never a recomputation (the
+    ``_macro_calendar_chat_lines`` precedent).
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never an exception into the chat
+      handler)
+    - non-actionable verdicts (``READY`` / ``NO_EVENTS`` / ``NO_DECISIONS``)
+      → ``[]``: only ``BLIND`` / ``DEGRADED`` / ``IMMINENT_OVERDUE`` events
+      are worth surfacing to the analyst. A healthy pipeline is silence
+      (the ``_behavioural_chat_lines`` NO_DATA-omit precedent — never
+      chat filler)
+    - actionable verdicts → builder's verbatim ``summary`` headline (only
+      when a usable string) + one line per BLIND/DEGRADED/OVERDUE event
+      restating the builder's OWN fields (ticker, hours-until, verdict,
+      and the verbatim recommended_action — the
+      ``_earnings_shock_chat_lines`` per-row precedent); a malformed row is
+      skipped, never raises (the ``_paper_trader_position_lines`` precedent)
+    """
+    if not isinstance(rep, dict):
+        return []
+    worst = rep.get("worst_verdict")
+    actionable = {"BLIND", "DEGRADED", "IMMINENT_OVERDUE"}
+    if worst not in actionable:
+        return []
+    events = rep.get("events")
+    if not isinstance(events, list) or not events:
+        return []
+
+    lines: list[str] = []
+    summary = rep.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        lines.append(summary)                  # verbatim SSOT — invariant #10
+
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        v = e.get("verdict")
+        if v not in actionable:
+            continue
+        tk = e.get("ticker") or "?"
+        hours = e.get("hours_until_event")
+        if isinstance(hours, (int, float)) and not isinstance(hours, bool):
+            timing = f"in {hours:.1f}h"
+        else:
+            timing = "imminent"
+        exposure = e.get("exposure_usd")
+        exp_str = (f"${exposure:.0f}"
+                   if isinstance(exposure, (int, float))
+                   and not isinstance(exposure, bool) else "$?")
+        action = e.get("recommended_action") or ""
+        lines.append(f"  {tk} {timing} — exposure {exp_str} [{v}]")
+        if isinstance(action, str) and action.strip():
+            lines.append(f"    → {action}")    # verbatim — builder SSOT
+
+    return lines
+
+
 def _earnings_shock_chat_lines(es) -> list[str]:
     """Render paper-trader's `/api/earnings-shock` (pre-earnings dollarized
     1σ shock per held imminent print) as compact chat-context lines.
@@ -2654,6 +2729,33 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: earnings-shock fetch failed: %s", e)
 
+        # Event-readiness — will the live trader actually be able to react
+        # before the next earnings print? Every block above describes the
+        # event (timing, σ shock, sector exposure) and implicitly assumes
+        # the bot will *make a decision* before the print. The live
+        # failure mode (PARALYSIS / NO_DECISION storms / Claude empty
+        # streaks) silently breaks that assumption — and a chat-side
+        # analyst answering "is your book at risk?" without questioning
+        # whether the bot can act is dangerously incomplete. Composed
+        # verbatim by the pure _event_readiness_chat_lines helper (unit-
+        # tested; SSOT — the builder's own `summary` is the headline, no
+        # re-derived verdict). Guarded 3s read; READY / NO_EVENTS /
+        # NO_DECISIONS payloads silently omit the block (the
+        # _macro_calendar_chat_lines silence precedent — never chat filler
+        # when the pipeline is healthy). Only appears once :8090 is
+        # restarted onto /api/event-readiness.
+        event_readiness_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/event-readiness",
+                    timeout=3) as resp:
+                _er = json.loads(resp.read().decode("utf-8"))
+            event_readiness_block = "\n".join(
+                _event_readiness_chat_lines(_er))
+        except Exception as e:
+            _logger().warning("chat: event-readiness fetch failed: %s", e)
+
         # "What materially changed since you last looked" — the one temporal-
         # change view. Every sub-fetch above is a current-state snapshot; this
         # lets the chat answer "what happened while I was away / since I last
@@ -2838,6 +2940,7 @@ def create_app(store=None) -> Flask:
             + (f"EARNINGS RADAR (scheduled gap risk):\n{earnings_block}\n\n" if earnings_block else "")
             + (f"PAPER TRADER — PRE-EARNINGS DOLLARIZED 1σ SHOCK (per HELD imminent print: 'if NVDA gaps the typical 1σ on its release, the book moves $X / Y% of equity' — the forward $-at-risk view that complements the EARNINGS RADAR's timing-only listing):\n{earnings_shock_block}\n\n" if earnings_shock_block else "")
             + (f"MACRO CALENDAR — FOMC RATE DECISION (the single biggest MARKET-WIDE event; it moves the whole book at once, leveraged ETFs most violently — surfaced only when one is actually within the 14d horizon):\n{macro_calendar_block}\n\n" if macro_calendar_block else "")
+            + (f"PAPER TRADER — EVENT READINESS (will the live trader actually be able to react before the next earnings print? Joins earnings-risk + decision-velocity + Claude-empty rate + the *current* NO_DECISION streak into a single per-event verdict — surfaced ONLY when BLIND / DEGRADED / IMMINENT_OVERDUE, never as filler when the pipeline is healthy. Recommended_action carries verbatim from the trader endpoint — restate, never re-derive):\n{event_readiness_block}\n\n" if event_readiness_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "
