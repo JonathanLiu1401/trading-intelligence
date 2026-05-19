@@ -7615,3 +7615,164 @@ python3 -m pytest tests/ -v
   pass's dashboard.py edit was bundled into a sibling agent's commit. Test
   file committed standalone with explicit pathspec; AGENTS.md commit lands
   alongside the test. Never `git add -A` in this tree.
+
+---
+
+### 2026-05-19 review pass — ML+backtest hybrid (Agent 2): per-horizon scorer skill + evaluate_scorer_oos NaN-sentinel parity
+
+**Phase 1 bug fix — `evaluate_scorer_oos` silently coerced null forward returns to 0.0**
+
+`paper_trader/validation.py::evaluate_scorer_oos` used
+`_to_float(r.get("forward_return_5d"), 0.0)` to read the realized
+target on each OOS record. A row with a missing key, JSON null, or
+non-finite (`inf`/`-inf`/`nan`) `forward_return_5d` then defaulted to
+0.0 and contributed `(pred - 0.0)**2` to RMSE — fabricating a flat
+outcome and biasing the reported skill metric. The sister function
+`run_continuous_backtests._oos_rank_metrics` was already hardened with
+a `float("nan")` sentinel + `a == a` drop (see
+`TestOosRankMetrics::test_records_missing_forward_return_are_dropped_not_zeroed`);
+`evaluate_scorer_oos` was the last function still trusting the silent
+0.0 fallback. The bug is **latent** on current live data (7,413/7,413
+outcomes carry a finite `forward_return_5d`) but the contract was
+wrong, and a future writer emitting a null target would silently
+inflate the OOS RMSE — pre-fix RMSE on a constructed (1 real + 4 null)
+input is ~8.94 vs the correct 0.0.
+
+**Test locks** (2 new tests in `tests/test_validation.py`):
+* `test_missing_forward_return_dropped_not_zeroed` — five records,
+  four with null/missing/inf/NaN, one well-formed; post-fix `n=1`,
+  `rmse=0.0` exactly.
+* `test_sell_sign_flip_still_applied_after_nan_filter` — the NaN
+  filter must NOT bypass the SELL sign-flip on records it KEEPS.
+
+**Phase 2 feature — per-horizon (10d, 20d) OOS rank-IC + dir-acc in the scorer-skill ledger**
+
+The scorer trains on `forward_return_5d`, but each outcome row also
+carries `forward_return_10d` / `forward_return_20d` (the 2026-05-18
+multi-horizon instrumentation). Live: 6,300/7,413 outcomes carry 10d
+and 6,265 carry 20d. The per-cycle scorer-skill ledger only reported
+5d metrics — yet AGENTS.md notes leveraged-ETF strategies have noisy
+5d windows but stronger multi-month returns, so a non-trivial signal
+at 10d/20d when 5d sits at noise (current state: mean OOS IC ≈ 0.05,
+dir_acc ≈ 0.52 across 22 cycles) is the exact research signal a
+skeptical quant needs to evaluate the gate's edge.
+
+**Adds**:
+* `run_continuous_backtests._oos_multi_horizon_metrics(scorer,
+  oos_records, horizons)` — mirrors `_oos_rank_metrics` (same predict
+  signature, SELL sign-flip, tie-aware Spearman via
+  `calibration._spearman`) but evaluates against `forward_return_{h}d`
+  for each requested horizon. Each horizon reports its own `n`
+  honestly — a row missing `forward_return_20d` drops from the 20d
+  cell only, never poisons the 10d view. Never raises (returns empty
+  per-horizon sentinels on any fault — the "scorer-train status must
+  stay truthful" discipline, mirrored from `_oos_rank_metrics`).
+* Six new tokens in `_train_decision_scorer`'s status string:
+  `oos_n_10`, `oos_diracc_10`, `oos_ic_10`, and 20d siblings. Wired
+  alongside the 5d tokens so the per-cycle scorer-skill ledger
+  automatically carries them via the existing `**parsed` splat in
+  `_append_scorer_skill_log`.
+* `_parse_scorer_status` extracts the new tokens with a strict
+  `(?:^|\s)key=` boundary so the legacy `oos_n=` lookup does **NOT**
+  swallow `oos_n_10=`. Old (pre-feature) status strings parse cleanly
+  with 10d/20d fields defaulting to `None` (read-side back-compat for
+  every historical skill-log row).
+
+**Test locks** (13 new tests in `tests/test_continuous.py`):
+* `TestOosMultiHorizonMetrics` (6 tests) — untrained sentinel,
+  perfect-rank-ordering at each horizon, per-horizon missing-target
+  drop (10d-only row contributes to 10d only), SELL sign-flip parity,
+  predict-exception isolation, and the wiring lock that asserts every
+  new token appears in `_train_decision_scorer`'s status string.
+* `TestParseScorerStatus` (3 new tests) — full multi-horizon parse,
+  back-compat for legacy status, and the `oos_n` vs `oos_n_10`
+  boundary lock that proves the strict regex prevents substring
+  collision.
+
+**Phase 3 quant findings (from running the new metric on live data)**
+
+End-to-end smoke on the deployed pickle (`n_train=3959`,
+`(32,16)/alpha=1e-2/early_stopping=True` — matches `MLP_CONFIG`, no
+deploy_stale) against the most recent 5,000 outcomes with the
+canonical temporal 80/20 split:
+
+| horizon | n | rank_IC | dir_acc |
+|---|---|---|---|
+| 5d | 1000 | +0.1141 | 0.5516 |
+| 10d | 990 | +0.0557 | 0.5592 |
+| 20d | 957 | +0.0372 | 0.5350 |
+
+**Finding 1 (decisive):** the scorer's edge is **concentrated at 5d
+and decays at longer horizons** — rank_IC halves at 10d and thirds at
+20d. The gate's captured then-deployed prediction on the full-history
+slice (5,165 captured rows) shows the SAME monotone decay: 5d IC
++0.0471, 10d +0.0189, 20d +0.0136. This is the **opposite** of the
+AGENTS.md qualitative hypothesis ("leveraged ETFs have noisy 5d but
+stronger multi-month returns"). A future multi-horizon training
+experiment cannot assume the longer-horizon target carries MORE
+signal than 5d — at the current feature set the opposite holds.
+
+**Finding 2:** the continuous loop appears to have been **DOWN** for
+~10 hours at review time — last write to
+`decision_outcomes.jsonl` / `scorer_skill_log.jsonl` was 11:06 vs
+21:47 inspection. Two `status='running'` rows aged 9.9h and 14.4h
+exceed `_reap_orphaned_runs`'s 6h `max_age_hours` guard; they will be
+swept to `failed` on the next loop start. Action: confirm loop is
+intended down.
+
+**Finding 3:** `_ml_is_qualified()` currently **PASSES** — median
+`vs_spy_pct` across the most recent 20 qualifying runs is **+143.33%**
+(threshold 0.0%). Qualification is based on **persona-driven backtest
+alpha**, NOT on scorer skill (the scorer itself has near-zero OOS
+edge). An operator should NOT read advisor-presence as "the scorer
+has skill."
+
+**Finding 4:** `baseline_skill_log.jsonl` verdict oscillates by
+window: cycles 1–2 → `MLP_NO_BETTER_THAN_TRIVIAL`, cycles 3–4 →
+`MLP_ADDS_SKILL`. The 17-feature MLP's edge over a one-line
+`ml_score` rule is **borderline and window-sensitive**. The new
+per-horizon ledger fields will surface whether this holds at 10d/20d
+once the loop runs the next ~10 cycles.
+
+**Finding 5:** the news_urgency / news_article_count propagation is
+sound — outcome rows that parse values use them, no-news rows fall
+back to None which `build_features` neutralizes to 50/1 (the
+documented inference-vs-train parity).
+
+**Finding 6:** 24/501 (4.8%) backtest runs have `status='failed'`,
+20 carrying the `[reaped: orphaned running row]` note. Reaper working
+as designed.
+
+**Test commands for this domain (Agent-2 scope):**
+```
+# Phase-1 + Phase-2 changes
+python3 -m pytest tests/test_validation.py -k evaluate_scorer_oos -v
+python3 -m pytest tests/test_continuous.py -k "MultiHorizon or ParseScorer" -v
+
+# Full ML/backtest regression (the canonical filter)
+python3 -m pytest tests/ -k "ml or backtest or scorer or validation or continuous"
+```
+398 tests pass (up from 389 — 2 new in Phase 1, 13 new in Phase 2).
+
+**Invariants reaffirmed:**
+* "Scorer-train status must stay truthful" — every new diagnostic
+  block is guarded SEPARATELY so a downstream crash never masks a
+  successful train or the previously-reported metrics. The per-horizon
+  block degrades to all-n/a tokens on any fault.
+* Read-side back-compat — the parser's strict boundary regex keeps
+  every historical skill-log row parseable; dashboard panels reading
+  the parsed dict get `None` for the new fields on old rows, never a
+  KeyError.
+* SELL sign-flip parity — `evaluate_scorer_oos`, `_oos_rank_metrics`,
+  `_oos_multi_horizon_metrics`, and `train_scorer` all flip the
+  realized target sign for SELL actions. Tested across all four
+  surfaces now.
+
+**Concurrent-staging hazard observed:** my Phase 2 `git add` was
+overwritten by a sibling agent's `git add -A` between staging and
+commit — the first commit `a028ad5` carries my message but a
+sibling's `reasoning_coherence` files. Re-committed with explicit
+pathspec (`git commit -- run_continuous_backtests.py
+tests/test_continuous.py`) as `c18e679`, which contains the correct
+files. The hazard matches [[pt-concurrent-samerole-staging-race]] in
+the agent memory exactly.
