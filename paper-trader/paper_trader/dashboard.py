@@ -12653,5 +12653,55 @@ def reentry_velocity_api():
                         "recent_gaps": [], "per_ticker": []}), 500
 
 
+@app.route("/api/blocked-repeats")
+def blocked_repeats_api():
+    """Repeated-BLOCKED action audit — which (verb, ticker) is Opus trying
+    but the engine keeps refusing?
+
+    ``decisions.action_taken`` is free text like ``"BUY NVDA → BLOCKED"``
+    (AGENTS.md invariant #11). When Opus keeps trying to act but the engine
+    keeps blocking, the trader needs to know **which (verb, ticker)** and
+    **the dominant cause** (CASH / DATA / SIZING / SPECIFICATION / OTHER)
+    so they pick the right remediation: fund the trade, fix the feed,
+    re-prompt Opus, or accept the data blackout.
+
+    Every other operator-facing surface (``/api/decision-health``,
+    ``/api/no-decision-reasons``, the Discord ``_no_decision_reasons_line``)
+    targets ``NO_DECISION`` (Claude didn't reply). Repeated BLOCKED is the
+    orthogonal failure: Claude DID reply, the engine rejected the trade —
+    a surface no other endpoint owns.
+
+    Query params (clamped):
+      * ``limit`` — how many recent decisions to scan (50..5000, default 500)
+      * ``min_repeat`` — minimum count to qualify as a repeat (2..20, default 2)
+
+    Observational only, never gates, no caps (AGENTS.md #2 / #12 — the
+    ``no_decision_reasons`` precedent)."""
+    try:
+        from .analytics.blocked_repeats import build_blocked_repeats
+
+        try:
+            limit = int(request.args.get("limit", 500))
+        except Exception:
+            limit = 500
+        limit = max(50, min(limit, 5000))
+
+        try:
+            min_repeat = int(request.args.get("min_repeat", 2))
+        except Exception:
+            min_repeat = 2
+        min_repeat = max(2, min(min_repeat, 20))
+
+        store = get_store()
+        decisions = store.recent_decisions(limit=limit)
+        result = build_blocked_repeats(
+            decisions, now=datetime.now(timezone.utc), min_repeat=min_repeat,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR",
+                        "blocked_repeats": []}), 500
+
+
 if __name__ == "__main__":
     run()
