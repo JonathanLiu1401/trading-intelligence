@@ -1826,3 +1826,210 @@ class TestHostPulseLine:
         monkeypatch.setattr(host_guard, "pulse", lambda *a, **k: self._SAT)
         assert reporter.send_daily_close() is True
         assert "**HOST** ◈ SATURATED" in captured[0]
+
+
+class TestPositionAttentionLine:
+    """`_position_attention_line` + its hourly/daily wiring — the missing
+    per-held-position attention surface in Discord. ``/api/position-attention``
+    answers "WHICH lots has Opus stopped examining?" on the dashboard;
+    nothing surfaced it in Discord, where the operator lives. Under a
+    NO_DECISION storm a held lot can sit unmonitored for many hours while
+    the operator (reading only Discord) assumes Opus is still watching it."""
+
+    def _stub(self, monkeypatch, payload):
+        """Replace build_position_attention with a fixed return."""
+        from paper_trader.analytics import position_attention as pa_mod
+        monkeypatch.setattr(pa_mod, "build_position_attention",
+                            lambda *a, **k: payload)
+
+    def test_empty_when_ok(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, {
+            "verdict": "OK",
+            "note": "All 2 held position(s) examined by Opus in the last 6h.",
+            "positions": [],
+        })
+        assert reporter._position_attention_line(fresh_store) == ""
+
+    def test_empty_when_insufficient_data(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, {
+            "verdict": "INSUFFICIENT_DATA",
+            "note": "No open positions to evaluate.",
+            "positions": [],
+        })
+        assert reporter._position_attention_line(fresh_store) == ""
+
+    def test_surfaces_neglected_book(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, {
+            "verdict": "NEGLECTED_BOOK",
+            "note": ("1 of 2 held position(s) have had no Opus look in "
+                     ">24h — model attention has lapsed on them (likely "
+                     "passive HOLD via NO_DECISION storms)."),
+            "positions": [
+                {"ticker": "LITE", "verdict": "NEGLECTED",
+                 "hours_since_last_decision": 31.7},
+                {"ticker": "MU", "verdict": "MONITORED",
+                 "hours_since_last_decision": 4.2},
+            ],
+        })
+        line = reporter._position_attention_line(fresh_store)
+        assert line.startswith("⚠️ **ATTENTION** ◈ NEGLECTED_BOOK")
+        # Note verbatim — single source of truth, never re-derived here.
+        assert "have had no Opus look in >24h" in line
+        # The actual neglected ticker is named (operator can triage directly).
+        assert "LITE" in line
+        assert "NEGLECTED" in line
+        assert "31.7h" in line
+        # MONITORED row filtered out (only NEGLECTED/STALE shown).
+        assert "MU" not in line
+
+    def test_surfaces_stale_book(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, {
+            "verdict": "STALE_BOOK",
+            "note": "1 of 1 held position(s) last seen by Opus >6h ago — monitor for drift.",
+            "positions": [
+                {"ticker": "NVDA", "verdict": "STALE",
+                 "hours_since_last_decision": 8.3},
+            ],
+        })
+        line = reporter._position_attention_line(fresh_store)
+        assert "⚠️ **ATTENTION** ◈ STALE_BOOK" in line
+        assert "NVDA" in line
+        assert "STALE" in line
+        assert "8.3h" in line
+
+    def test_neglected_with_no_last_look(self, fresh_store, monkeypatch):
+        # A position with no recorded decision at all → hours_since=None;
+        # the line must render a distinct, parseable token (not crash on
+        # f-string formatting of None).
+        self._stub(monkeypatch, {
+            "verdict": "NEGLECTED_BOOK",
+            "note": "1 of 1 held position(s) have had no Opus look in >24h",
+            "positions": [
+                {"ticker": "LITE", "verdict": "NEGLECTED",
+                 "hours_since_last_decision": None},
+            ],
+        })
+        line = reporter._position_attention_line(fresh_store)
+        assert "LITE" in line
+        assert "no Opus look on record" in line
+
+    def test_caps_per_position_lines_at_three(self, fresh_store, monkeypatch):
+        # Five neglected — only the top 3 should appear (builder-sorted
+        # worst-first; the reporter must not flood the summary).
+        self._stub(monkeypatch, {
+            "verdict": "NEGLECTED_BOOK",
+            "note": "5 of 5 neglected",
+            "positions": [
+                {"ticker": f"TK{i}", "verdict": "NEGLECTED",
+                 "hours_since_last_decision": float(40 - i)}
+                for i in range(5)
+            ],
+        })
+        line = reporter._position_attention_line(fresh_store)
+        assert "TK0" in line and "TK1" in line and "TK2" in line
+        assert "TK3" not in line and "TK4" not in line
+
+    def test_degrades_to_empty_on_builder_fault(self, fresh_store, monkeypatch):
+        from paper_trader.analytics import position_attention as pa_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("position_attention blew up")
+
+        monkeypatch.setattr(pa_mod, "build_position_attention", _boom)
+        # Additive failure contract: a fault drops THIS line, never raises.
+        assert reporter._position_attention_line(fresh_store) == ""
+
+    def test_degrades_to_empty_on_non_dict(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, None)
+        assert reporter._position_attention_line(fresh_store) == ""
+
+    def test_degrades_to_empty_on_missing_note(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, {"verdict": "NEGLECTED_BOOK",
+                                 "note": "", "positions": []})
+        assert reporter._position_attention_line(fresh_store) == ""
+
+    def test_hourly_summary_surfaces_neglected(self, fresh_store, monkeypatch):
+        from paper_trader import host_guard
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse",
+                            lambda *a, **k: {"state": "CLEAR", "headline": ""})
+        self._stub(monkeypatch, {
+            "verdict": "NEGLECTED_BOOK",
+            "note": "1 held lot unmonitored >24h",
+            "positions": [
+                {"ticker": "LITE", "verdict": "NEGLECTED",
+                 "hours_since_last_decision": 26.0},
+            ],
+        })
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**ATTENTION** ◈ NEGLECTED_BOOK" in body
+        # Pre-existing hourly intact alongside the new block.
+        assert "**HOURLY**" in body and "Equity" in body
+
+    def test_hourly_summary_silent_when_ok(self, fresh_store, monkeypatch):
+        from paper_trader import host_guard
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse",
+                            lambda *a, **k: {"state": "CLEAR", "headline": ""})
+        self._stub(monkeypatch, {
+            "verdict": "OK",
+            "note": "All 2 held position(s) examined by Opus in the last 6h.",
+            "positions": [],
+        })
+        assert reporter.send_hourly_summary() is True
+        assert "**ATTENTION**" not in captured[0]
+
+    def test_daily_close_surfaces_neglected(self, fresh_store, monkeypatch):
+        from paper_trader import host_guard
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse",
+                            lambda *a, **k: {"state": "CLEAR", "headline": ""})
+        self._stub(monkeypatch, {
+            "verdict": "STALE_BOOK",
+            "note": "1 lot last seen >6h ago",
+            "positions": [
+                {"ticker": "MU", "verdict": "STALE",
+                 "hours_since_last_decision": 7.5},
+            ],
+        })
+        assert reporter.send_daily_close() is True
+        assert "**ATTENTION** ◈ STALE_BOOK" in captured[0]
+
+    def test_hourly_summary_still_sends_on_builder_fault(self, fresh_store,
+                                                         monkeypatch):
+        """The whole hourly must still ship if the attention builder faults —
+        the additive failure contract (a bad block drops one line, never the
+        report)."""
+        from paper_trader import host_guard
+        from paper_trader.analytics import position_attention as pa_mod
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse",
+                            lambda *a, **k: {"state": "CLEAR", "headline": ""})
+        monkeypatch.setattr(pa_mod, "build_position_attention",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                RuntimeError("builder boom")))
+        assert reporter.send_hourly_summary() is True
+        # No attention block but the summary itself shipped.
+        assert "**ATTENTION**" not in captured[0]
+        assert "**HOURLY**" in captured[0]
