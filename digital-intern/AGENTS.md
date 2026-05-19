@@ -4177,3 +4177,154 @@ commit was pathspec-scoped via `git add analysis/claude_analyst.py
 tests/test_briefing_alert_book_velocity.py` and verified by
 `git diff --staged --stat` (2 files / +596 lines, no sibling leakage);
 never `git add -A`; pushed to origin/master.
+
+### Agent pass 2026-05-19 (hybrid 29 — Agent 3, debug + feature + analyst-validation)
+
+Required-file-set pass (29th; codebase exceptionally mature). Live evidence
+again the discovery engine. Bare daemon `pid 2124003` started 2026-05-18 ~07:13,
+predates BOTH of this pass's commits (the consistent stale-daemon caveat —
+fixes ship on next `systemctl restart digital-intern`). Concurrent sibling
+agent + auto-commit/push daemon on the shared monorepo index (memory
+`di-shared-repo-concurrency`) → strict per-commit pathspec staging; the
+shared-index race fired once and gave my Phase-1 commit `f3e3020` a sibling's
+"feat(collectors): eia" title even though `git show --stat` confirms the
+commit contains **only my 2 intended files** (no sibling leakage); commit
+title is cosmetic and force-rewriting a shared branch with concurrent agents
+is destructive — left as-is per the documented precedent.
+
+**Phase 1 — bugs_fixed=1, commit `f3e3020`** (`analytics/source_diversity.py`
++ new `tests/test_source_diversity_backtest_isolation.py`). **Backtest
+isolation parity drift in newly-shipped analytic** (`94a46b2`, 2026-05-18
+23:13). `source_diversity.py` writes `/home/zeph/logs/source_diversity.json`
+— the analyst-facing per-ticker outlet-breadth + echo-detection report. The
+shipped SQL filter was `source NOT LIKE 'backtest_run_%'`-only — same
+partial-filter class `analytics/trend_velocity.py` carries (explicitly called
+out in `ArticleStore.ticker_mention_velocity`'s docstring as a known bug, just
+deferred to a separate primitive instead of fixed in the analytic). It
+catches BUY/SELL synthetic injection rows but lets `opus_annotation*` source
+rows leak through, inflating both per-ticker mention totals AND
+`distinct_sources` on every held name an Opus lesson references (an
+`opus_annotation_cycle_3` lesson titled "[Cycle 3] Good buy on NVDA" appears
+as another outlet covering NVDA). Net effect: synthetic training labels
+rendered as live diversity signal in the JSON the analyst reads. Same drift
+class `tests/test_dashboard_backtest_isolation.py` pinned for
+`dashboard/server.py` + `ml/sentiment_trends.py`. Fix: import canonical
+`_LIVE_ONLY_CLAUSE` from `storage.article_store` (the established pattern
+`analytics/publish_lag_audit.py` / `stale_source_alerter.py` /
+`ticker_concentration.py` already use). +2 tests: behavioural contract
+(synthetic rows excluded from rendered report; mentions / distinct_sources /
+top_source unaffected) + SQL-shape contract (all three canonical fragments
+present, so a future re-introduction of a partial filter fails here). The
+other 4 analytics with the same gap (`breaking_news_detector`,
+`collection_quality`, `consensus_signal`, `trend_velocity`) carry it too but
+are older — same fix would apply uniformly; deliberately scoped to the
+newly-shipped one this pass per the surgical discipline (precedent: the
+2026-05-16 `seen_articles.db` fleet-hardening commit was a *single batched*
+fix to one drift class; this is the inverse — older drifts left alone to
+avoid scope-creeping into the sibling reader-`_retry_on_lock` work).
+
+**Phase 2 — features_added=1, commit `c881e21`** (`analysis/claude_analyst.py`
++72, new `tests/test_briefing_echo_tag.py` +276, 18 tests). **`[echo]`
+calibration tag on briefing newswire rows.** `[syndicated xN]` is read by
+Opus as positive corroboration — N independent wire copies of one story —
+but when ALL N copies came from ONE `source` key (typical for mass-aggregator
+GDELT-GKG hosts like iheart.com / joker.com / wkrb13.com that re-publish
+slight title variants of the same wire under their own domain), the N count
+oversells the corroboration. Opus would weight a `[syndicated x5]`
+lone-aggregator story over a single high-credibility Reuters row — exactly
+inverse to the analyst's risk on a noisy GKG-dominated corpus
+(`gdelt_gkg/iheart.com` 63k/24h is documented in prior passes). Fix:
+`_collapse_syndicated` now tracks the SET of distinct `source` keys per
+signature cluster and attaches `_distinct_sources` to the representative;
+new pure `_is_echo_row(art)` fires on `_corroboration >= ECHO_MIN_COPIES (=3)
+AND _distinct_sources <= 1`, rendering ` [echo]` after `[syndicated xN]` on
+the SAME line (so Opus sees both tags together — corroboration count
+qualified by source diversity). New SYSTEM_PROMPT rule names the
+**down-weight consequence** so Opus discounts these in LEAD / TOP SIGNALS
+ranking. Threshold 3 (not 2) keeps benign retitles by the same source quiet;
+3+ copies from one source is the firehose pattern the analyst persona
+complains about. **Render line preserves the exact `[syndicated xN]` literal
+format** so `test_briefing_syndication_collapse`'s pinned-string assertion
+still holds — the new tag is strictly additive (the established `[model]` /
+`[ALERTED]` / `[BOOK:]` shape). Pure read-side: `_collapse_syndicated` writes
+onto NEW shallow copies only (input-non-mutation pinned by test), no DB
+write, no ai_score/ml_score/score_source/urgency touch, backtest already
+excluded upstream by `get_top_for_briefing`'s `_LIVE_ONLY_CLAUSE` — **all
+four load-bearing invariants intact by construction**. +18 specific-value
+tests: threshold floor, single/multi-source discrimination, missing
+`_distinct_sources` defaults to corroboration (no false positives on rows
+that bypassed the collapse — snapshot rows / legacy callers), input
+non-mutation, empty-source key handling, end-to-end render via
+`_build_payload`, SYSTEM_PROMPT rule presence + down-weight phrasing pinned.
+
+**Phase 3 — analyst-lens live validation, user_findings=7.**
+1. **Briefing quality EXCELLENT (positive)** — id30 (2026-05-19 04:18Z, 50
+   arts, 3328 chars) read end-to-end: dense, exact, decisively-actionable
+   LEAD (Trump-Iran delay → WTI -5.45% → risk rotation; held book stated up
+   front MU -5.95% / LITE -8.83% / AXTI -14.46% / TSEM -9.46%); exact MACRO;
+   PORTFOLIO names every held ticker with concrete options-level
+   implications (LITE IV 109% P/C 2.07, MU IV 113% P/C 1.64); precise SEMIS
+   PULSE; TOP SIGNALS timestamped + scored + ticker-tagged with the
+   pass-23 `[HH:MM]` format working live. Consumer experience strong.
+2. **Briefing cadence HEALTHY (positive)** — id25→26→27→28→29→30 gaps =
+   5.3h / 5.6h / 5.2h / 5.1h / 5.1h vs the 5h target; the `ef839a8`
+   heartbeat-clock fix continues to hold; no 30h+ gaps in the window.
+3. **Invariants HOLD live (positive)** — direct DB probe (`immutable=1`)
+   confirms **0** synthetic `urgency>=1` rows and **0** `ai_score>0 AND
+   score_source='ml'` rows in the 1.45 GB prod DB. Both load-bearing
+   invariants intact in production.
+4. **Collection healthy (positive)** — 300 live rows last 1h, newest
+   `first_seen` ≈3 min fresh; GoogleNews round-robin / GDELT / scraped-yahoo
+   / Benzinga / Bloomberg / Seeking Alpha all ingesting.
+5. **Alert volume HIGH** — **67 urgency=2 in 24h** (≈3/h pushed). Many are
+   genuinely high-value (NVDA earnings tomorrow, Trump-Iran/Brent, MU drop
+   on Samsung-strike, Warsh-Fed-chair swearing-in, LITE Nasdaq-100
+   inclusion). But significant overlap on the SAME catalyst across paraphrases:
+   "Why Did Micron Stock Drop Today" alerted **FIVE times** from
+   `scraped/finance.yahoo.com` / `Nasdaq Markets` / `GoogleNews/MSN` /
+   `GDELT/fool.com` / Stock Story — different signatures (different first-8
+   tokens), so the cross-cycle `alert_recency` gate correctly didn't collapse
+   them. The deployed `_filter_recap_template_noise` `_RT_WHY_DID` /
+   `_RT_GF_VALUE` patterns (see pass-22's recap gate) WOULD catch the bulk
+   of these, but the running daemon predates the gate's deploy — stale-daemon
+   caveat. Same for the GuruFocus "GF Value Says" pattern (LITE / AXTI both
+   alerted from `GoogleNews/GuruFocus`). The Phase-2 `[echo]` tag is on the
+   BRIEFING path, not the alert path — it does not address this alert-noise
+   complaint directly; it complements it (Opus down-weights the same
+   single-source firehose when composing the briefing).
+6. **Daemon health CLEAN (positive)** — `daemon.log` carries 0 ERROR / 0
+   CRITICAL / 0 Traceback in the current 92-line window; only 3 transient
+   `database is locked` WARNINGs absorbed by `_retry_on_lock` (the
+   `bec95ea`/`8180055`/`05b406e` retry-allowlist work continues to hold);
+   ML retrain stable (early-stops at val_loss ≈ 0.62-0.86).
+7. **6 collectors DARK** — `nitter` (1417 empty polls, 0 delivered all
+   session), `sec_edgar` (1097, 0 — analyst BLIND to 8-K filings,
+   priority-0), `polygon` (921, 0), `newsapi` (660, 0), `sec_edgar_ft` (252,
+   3), `finnhub` (6 transient — likely recovering). Same chronic external
+   gap (memory `di-chronic-dark-collectors`); correctly surfaced verbatim by
+   the existing COVERAGE GAP briefing block (working as intended);
+   upstream/rate-limit/key — operational, not code bugs. The COVERAGE GAP
+   line in briefing id30 reports these dark channels honestly with the
+   `b20cbae` fails×cadence dark-duration estimate.
+
+None of 5/6/7 is a quick safe fix in clean scope (5 ships post-restart via
+already-committed recap gate; 6 already clean live; 7 upstream) → no extra
+Phase-3 fold-in; bugs_fixed stays 1, features_added stays 1.
+
+**Verify:** `storage.article_store` / `ml.features` / `ml.model` imports OK;
+suite **1219 passed** (1195 baseline + 2 source_diversity + 18 echo + 4
+concurrent sibling work since baseline); zero regressions introduced.
+*Pre-existing, deliberately never staged* (consistent with every prior
+entry): `paper-trader/paper_trader/dashboard.py` modified, untracked
+`paper-trader/paper_trader/analytics/decision_confidence.py` +
+`reasoning_themes.py`, untracked `collectors/eia_collector.py` +
+`tests/test_eia_collector.py` (a concurrent sibling agent's EIA collector
+WIP), all `paper-trader/*`, `logs/*`. Both commits pathspec-scoped to
+exactly their intended files; `git diff --staged --stat` verified
+immediately before each commit; the Phase-1 commit `f3e3020` was hit by the
+shared-index auto-commit race that gave it a sibling's `eia` title but
+captured **exclusively** my 2 intended files (`git show --stat f3e3020`
+confirmed); force-rewriting a pushed history on a shared branch with active
+concurrent writers is destructive — left as-is per the documented precedent
+(pass 16/22's identical auto-commit-sweep notes). Both commits on
+origin/master.
