@@ -10465,6 +10465,12 @@ def _swr_prewarm():
         # risk; the prewarm==@swr_cached invariant (test_swr_prewarm_coverage)
         # requires it here too.
         ("earnings-shock", earnings_shock_api),
+        # earnings-distribution @swr_cached 300s — observed-quantile complement
+        # to earnings-shock, same yfinance earnings_dates + multi-year daily
+        # history shape (the slowest per-name yfinance call we make). Was
+        # @swr_cached but never prewarmed — same freeze-triage cold-stall
+        # blind spot the test_swr_prewarm_coverage invariant locks against.
+        ("earnings-distribution", earnings_distribution_api),
     ]
     for name, wrapper in targets:
         try:

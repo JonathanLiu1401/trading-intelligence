@@ -384,7 +384,13 @@ def _trade_impact_line(trade: dict, snapshot: dict | None,
                 parts.append(
                     f"partial — {ticker} still {leg_pct:.1f}% of book")
             else:
-                parts.append(f"closed — cash ${cash:.2f}")
+                # Full close with no round-trip available (e.g. caller did not
+                # pass ``store`` or build_round_trips failed). Use a bare
+                # "closed" token and let the unconditional cash append below
+                # supply the cash — appending "closed — cash $X" here AND
+                # falling through to the cash append produced a duplicated
+                # "cash $X · cash $X" tail (no test exercised this path).
+                parts.append("closed")
         parts.append(f"cash ${cash:.2f}")
         return "post: " + " · ".join(parts)
 
@@ -1809,6 +1815,9 @@ def send_hourly_summary() -> bool:
     pa = _position_attention_line(store)
     if pa:
         body += "\n" + pa
+    dc = _decision_clock_line(store)
+    if dc:
+        body += "\n" + dc
     return _send(body)
 
 
@@ -1909,4 +1918,7 @@ def send_daily_close() -> bool:
     pa = _position_attention_line(store)
     if pa:
         body += "\n" + pa
+    dc = _decision_clock_line(store)
+    if dc:
+        body += "\n" + dc
     return _send(body)
