@@ -253,6 +253,147 @@ class TestSendTradeAlert:
         assert "600.0C" in body or "600C" in body
         assert "2026-12-19" in body
 
+    def test_no_impact_line_when_snapshot_missing(self, monkeypatch):
+        # Backwards compat: a caller that passes only ``trade`` gets the
+        # byte-compatible body (no trailing "post: …" line).
+        captured = []
+        monkeypatch.setattr(reporter, "_send", lambda msg: captured.append(msg) or True)
+        trade = {"action": "BUY", "ticker": "NVDA", "qty": 1, "price": 100.0,
+                 "value": 100.0, "reason": ""}
+        reporter.send_trade_alert(trade)
+        assert "post:" not in captured[0]
+
+
+class TestTradeAlertImpactLine:
+    """The post-trade book-impact one-liner — the trader-useful payload."""
+
+    def test_buy_shows_lot_weight_and_cash(self, monkeypatch):
+        # Post-trade snapshot: NVDA at $100, 5 shares = $500, cash $500,
+        # total $1000 → NVDA = 50% of book.
+        captured = []
+        monkeypatch.setattr(reporter, "_send", lambda msg: captured.append(msg) or True)
+        trade = {"action": "BUY", "ticker": "NVDA", "qty": 5, "price": 100.0,
+                 "value": 500.0, "reason": "high conviction",
+                 "timestamp": "2026-05-18T16:00:00+00:00"}
+        snapshot = {
+            "cash": 500.0, "total_value": 1000.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "stock", "qty": 5, "avg_cost": 100.0,
+                "current_price": 100.0, "market_value": 500.0,
+            }],
+        }
+        reporter.send_trade_alert(trade, snapshot=snapshot, store=None)
+        body = captured[0]
+        assert "post:" in body
+        assert "NVDA now 50.0% of book" in body
+        assert "cash $500.00" in body
+
+    def test_buy_call_shows_lot_label(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(reporter, "_send", lambda msg: captured.append(msg) or True)
+        trade = {
+            "action": "BUY_CALL", "ticker": "NVDA", "qty": 1, "price": 5.0,
+            "value": 500.0, "reason": "",
+            "option_type": "call", "strike": 600.0, "expiry": "2026-12-19",
+            "timestamp": "2026-05-18T16:00:00+00:00",
+        }
+        snapshot = {
+            "cash": 500.0, "total_value": 1000.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "call", "qty": 1, "avg_cost": 5.0,
+                "current_price": 5.0, "market_value": 500.0,
+                "strike": 600.0, "expiry": "2026-12-19",
+            }],
+        }
+        reporter.send_trade_alert(trade, snapshot=snapshot)
+        body = captured[0]
+        # Whole-number strike renders without ".0"
+        assert "NVDA 600C 2026-12-19" in body
+        assert "50.0% of book" in body
+
+    def test_sell_shows_realized_pnl_and_hold(self, monkeypatch, tmp_path):
+        # Seed a real store so build_round_trips operates on actual trades.
+        from paper_trader import store as store_mod
+        from paper_trader.store import Store
+        db = tmp_path / "paper_trader.db"
+        monkeypatch.setattr(store_mod, "DB_PATH", db)
+        monkeypatch.setattr(store_mod, "_singleton", None)
+        s = Store()
+        try:
+            # BUY 5 @ 100 → SELL 5 @ 120 closes a round-trip with +$100, +20%.
+            s.record_trade("NVDA", "BUY", 5, 100.0)
+            s.record_trade("NVDA", "SELL", 5, 120.0)
+            sell_trade = s.recent_trades(1)[0]
+            captured = []
+            monkeypatch.setattr(reporter, "_send",
+                                lambda msg: captured.append(msg) or True)
+            snapshot = {
+                "cash": 1100.0, "total_value": 1100.0, "positions": [],
+            }
+            reporter.send_trade_alert(sell_trade, snapshot=snapshot, store=s)
+            body = captured[0]
+            assert "post:" in body
+            # +20% on $500 cost = +$100 realized; cash now $1100.
+            assert "realized $+100.00" in body
+            assert "+20.0%" in body
+            assert "cash $1100.00" in body
+        finally:
+            s.close()
+
+    def test_sell_partial_close_does_not_invent_pnl(self, monkeypatch, tmp_path):
+        # Partial close (still holding qty>0) → no round-trip closed yet,
+        # so the alert must NOT manufacture a realized P/L figure. Instead
+        # it falls back to "partial — NVDA still X% of book".
+        from paper_trader import store as store_mod
+        from paper_trader.store import Store
+        db = tmp_path / "paper_trader.db"
+        monkeypatch.setattr(store_mod, "DB_PATH", db)
+        monkeypatch.setattr(store_mod, "_singleton", None)
+        s = Store()
+        try:
+            s.record_trade("NVDA", "BUY", 10, 100.0)
+            s.record_trade("NVDA", "SELL", 4, 120.0)   # partial close
+            sell_trade = s.recent_trades(1)[0]
+            captured = []
+            monkeypatch.setattr(reporter, "_send",
+                                lambda msg: captured.append(msg) or True)
+            snapshot = {
+                "cash": 480.0, "total_value": 1080.0,
+                "positions": [{
+                    "ticker": "NVDA", "type": "stock", "qty": 6,
+                    "avg_cost": 100.0, "current_price": 100.0,
+                    "market_value": 600.0,
+                }],
+            }
+            reporter.send_trade_alert(sell_trade, snapshot=snapshot, store=s)
+            body = captured[0]
+            # Must NOT fabricate a realized line for an open round-trip.
+            assert "realized" not in body
+            # Partial close path surfaces remaining exposure.
+            assert "partial" in body.lower()
+            assert "NVDA still" in body
+        finally:
+            s.close()
+
+    def test_zero_total_value_suppresses_line(self, monkeypatch):
+        # A book sitting at $0 (impossible in practice, but the guard
+        # prevents a div-by-zero or "0.0% of book" misleading text).
+        captured = []
+        monkeypatch.setattr(reporter, "_send", lambda msg: captured.append(msg) or True)
+        trade = {"action": "BUY", "ticker": "NVDA", "qty": 1, "price": 100.0,
+                 "value": 100.0, "reason": ""}
+        snapshot = {"cash": 0.0, "total_value": 0.0, "positions": []}
+        reporter.send_trade_alert(trade, snapshot=snapshot)
+        assert "post:" not in captured[0]
+
+    def test_hold_str_from_days_buckets(self):
+        # Locked: <1h → minutes, <1d → fractional hours, ≥1d → fractional days.
+        assert reporter._hold_str_from_days(0.0007) == "1m"     # ~1 min
+        assert reporter._hold_str_from_days(0.5) == "12.0h"
+        assert reporter._hold_str_from_days(2.5) == "2.5d"
+        assert reporter._hold_str_from_days(None) == ""
+        assert reporter._hold_str_from_days(-1) == ""           # bad data → silent
+
 
 class TestSendDecisionLog:
     def test_includes_action_and_pl(self, monkeypatch):
