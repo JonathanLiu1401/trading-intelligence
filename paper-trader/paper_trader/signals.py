@@ -241,19 +241,26 @@ def feed_status() -> dict:
 
 
 _TICKER_RE = re.compile(r"\b([A-Z]{1,5})\b")
-# common english noise that's all-caps but not tickers
+# Common all-caps English noise / time + date abbreviations / org acronyms that
+# are NOT tickers. _extract_tickers strips matches against this set so they do
+# not pollute the `tickers` field Opus reads in the live decision prompt. A
+# missing entry here is silently trader-visible: an article headlined
+# "Fed meeting 10 AM ET" emits `tickers=AM,ET` and Opus then reads
+# uncorrelated tokens as if they were watchlist names. Common false-positives
+# observed live: AM, ET, JUN, JUL, BTW, FYI, ETA. (PM, SEPT and the rest of
+# the calendar abbreviations were already covered.)
 _NOT_TICKERS = {
-    "A", "I", "AI", "ALL", "AN", "AND", "ANY", "API", "APR", "AS", "AT",
-    "AUG", "BE", "BEA", "BLS", "BOE", "BOJ", "BUT", "BY", "CEO", "CFO",
-    "CPI", "CTO", "DEC", "DOJ", "ECB", "EIA", "EPS", "ETF", "ETFS", "EU",
-    "FBI", "FDA", "FEB", "FED", "FOMC", "FOR", "FX", "FY", "GDP", "GOP",
-    "HOW", "IMF", "IN", "IPO", "IS", "ISM", "IT", "ITS", "JAN", "JULY",
-    "JUNE", "MAR", "MAY", "MOM", "NATO", "NEW", "NO", "NOV", "OCT", "OF",
-    "OK", "OLD", "ON", "ONE", "OPEC", "OR", "PB", "PBOC", "PCE", "PE", "PM",
-    "PMI", "PPI", "Q1", "Q2", "Q3", "Q4", "QE", "QOQ", "QT", "RE", "SEC",
-    "SEPT", "SO", "TBA", "THE", "TO", "TWO", "UN", "UP", "US", "USA",
-    "USD", "USDA", "VS", "WE", "WHAT", "WHEN", "WHERE", "WHO", "WHY",
-    "WTI", "WTO", "YES", "YOY", "ADP",
+    "A", "I", "AI", "ALL", "AM", "AN", "AND", "ANY", "API", "APR", "AS", "AT",
+    "AUG", "BE", "BEA", "BLS", "BOE", "BOJ", "BTW", "BUT", "BY", "CEO", "CFO",
+    "CPI", "CTO", "DEC", "DOJ", "ECB", "EIA", "EPS", "ET", "ETA", "ETF",
+    "ETFS", "EU", "FBI", "FDA", "FEB", "FED", "FOMC", "FOR", "FX", "FY",
+    "FYI", "GDP", "GOP", "HOW", "IMF", "IN", "IPO", "IS", "ISM", "IT", "ITS",
+    "JAN", "JUN", "JUL", "JULY", "JUNE", "MAR", "MAY", "MOM", "NATO", "NEW",
+    "NO", "NOV", "OCT", "OF", "OK", "OLD", "ON", "ONE", "OPEC", "OR", "PB",
+    "PBOC", "PCE", "PE", "PM", "PMI", "PPI", "Q1", "Q2", "Q3", "Q4", "QE",
+    "QOQ", "QT", "RE", "SEC", "SEPT", "SO", "TBA", "THE", "TO", "TWO", "UN",
+    "UP", "US", "USA", "USD", "USDA", "VS", "WE", "WHAT", "WHEN", "WHERE",
+    "WHO", "WHY", "WTI", "WTO", "YES", "YOY", "ADP",
 }
 
 
