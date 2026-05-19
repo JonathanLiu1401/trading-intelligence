@@ -4642,3 +4642,88 @@ origin/master (`916f87a`, `81ffe13`).
     * Held book under stress at briefing time: AXTI -14.46%, TSEM
       -9.46%, LITE -8.83%, MU -5.95% — analyst's positions actively
       bleeding into NVDA earnings tomorrow.
+
+## Pass (2026-05-19 hybrid: analytics backtest-isolation + screener-tape gate)
+
+- **Phase 1 — bugs_fixed=8, commit `07d42cf`.** Eight `analytics/*` modules
+  used `source NOT LIKE 'backtest_run_%'` alone instead of the canonical
+  `_LIVE_ONLY_CLAUSE`. The partial filter lets through three classes of
+  synthetic rows: `backtest://` URLs (no URL check at all), other
+  `backtest_*` sources beyond `backtest_run_*` (e.g. `backtest_winner`),
+  and `opus_annotation*` sources. Same drift class CLAUDE.md §5 / AGENTS.md
+  already pin for `signals.py` and `source_diversity.py`. Fixed in lockstep:
+  `source_score_volatility`, `collection_quality`, `scorer_skew`,
+  `daily_digest`, `trend_velocity`, `breaking_news_detector`,
+  `consensus_signal`, `ticker_comentions`, `ticker_first_mention`. Some had
+  a secondary predicate that masked the leak (`urgency >= 2` in
+  daily_digest, `ml_score IS NOT NULL` in scorer_skew); the rest were
+  actively contaminating per-source aggregates with replay/opus magnitudes.
+  Pinned by `tests/test_analytics_backtest_isolation.py` — 9 parameterised
+  cases against a seeded mixed DB (1 live + 3 synthetic, one per leak
+  class) asserting each module's output excludes all synthetic source/URL
+  markers. Verified out-of-band: partial filter keeps all 4 rows;
+  canonical keeps only the live row (regression discriminator works).
+
+- **Phase 2 — features_added=1, commit `e8a9202`.** **Screener-tape title
+  gate** added as a 4th fingerprint to the existing quote-widget family in
+  `watchers/alert_agent.py` (lockstep duplicated in
+  `analysis/claude_analyst.py`). **Live evidence (2026-05-19, last 4h of
+  articles.db urgency=2 set): 30 of 105 BREAKING alerts (28.6%) were
+  Yahoo screener entries** with the unique title shape
+  `[YF/<bucket>] TICKER (Name) +X.X% @ $price | vol N` emitted by
+  `collectors/market_movers.py`. The urgency head over-scores them to
+  ml_score 9.9 because the title looks "extreme" (signed %, large vol,
+  dollar price), but they describe CURRENT market state, not breaking
+  news. The 30-min per-(symbol, screener) cooldown in market_movers.py
+  dampens repetition but cannot down-rank the urgency itself. The
+  defense-in-depth gate at the formatter chokepoint is the only surface
+  that suppresses the standalone push.
+
+  Regex: `^\s*\[YF/[a-z_]+\]\s+[A-Z]` — anchored start-of-string + a
+  lowercase_underscore bucket token so:
+    * `[BREAKING]`, `[UPDATE]`, `[Reuters]` real-prefix headlines NEVER
+      match (different bucket character class);
+    * `[GDELT/reuters.com]` cannot match (the `.com` violates `[a-z_]+`);
+    * real `$TICKER ...` headlines and the prepended PORTFOLIO/OPTIONS
+      snapshot rows pass through untouched.
+
+  Pinned by `tests/test_screener_tape_gate.py` — 37 cases: every live
+  screener title verbatim caught on both alert + briefing surfaces; the
+  must-survive corpus (real headlines + bracketed real text:
+  `[BREAKING]`, `[Reuters]`, `[GDELT/reuters.com]`, snapshot rows) NOT
+  caught; **lockstep regex parity** (`alert_agent._QW_SCREENER_TAPE.pattern
+  == claude_analyst._QW_SCREENER_TAPE.pattern` — a future fork fails the
+  assertion, same drift-class precedent as the 3-way recap-template
+  lockstep); end-to-end `send_urgent_alert` integration (screener-only
+  batch never reaches Claude/Discord, every row marked alerted so it
+  exits the urgent queue; mixed batch fires only on the real story).
+
+  Pure read-side: no DB write, no ai_score/ml_score/score_source/urgency
+  mutation on the gate itself (the alert path's normal `mark_alerted_batch`
+  on suppression only sets urgency=2). All four load-bearing invariants
+  intact by construction. Ships on next `systemctl restart digital-intern`
+  (stale-daemon caveat per memory `di-stale-manual-daemon`).
+
+- **Phase 3 — live findings, user_findings=5.**
+    1. **Screener-tape noise was 28.6% of last-4h BREAKING alerts** (30 of
+       105). This is the live evidence cited in the Phase-2 commit — the
+       new gate suppresses these going forward. Top contributors:
+       `YF/most_actives` 16 alerts/24h, `YF/day_gainers` 14 alerts/24h.
+    2. **LLM-vetted fraction only 37.1%** of last-6h urgent rows (66 ml,
+       39 llm, 0 briefing_boost). Known calibration concern; already
+       mitigated by the `[unverified — model-only urgent]` prompt tag on
+       the alert path and the `_llm_vetted` field on briefing rows. Worth
+       monitoring; no surgical fix this pass.
+    3. **Briefing quality good** — most recent briefing (id=32,
+       2026-05-19T17:12Z) leads with a structural NVDA-vs-GOOG cloud
+       venture story tied directly to a held-name (MU +5.39%) move.
+       LEAD/MACRO/PORTFOLIO/SEMIS PULSE all dense and analyst-actionable.
+    4. **Source health: 11 disabled** (per latest `[source_health]` line
+       in daemon.log). Chronic dark collectors per memory
+       `di-chronic-dark-collectors`: sec_edgar / polygon / newsapi /
+       nitter. Standing external gap, not a fresh bug.
+    5. **Lock contention occasional** — last hour shows 5x `lock retry
+       exhausted` errors on `stats`/`insert_batch`/`update_time_sensitivity_batch`.
+       Documented chronic SQLite contention per memory
+       `di-insert-batch-lock-contention`. The retry-decorator absorbs most
+       collisions; the persistent class is unchanged.
