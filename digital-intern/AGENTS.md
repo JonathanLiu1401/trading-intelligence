@@ -4476,3 +4476,64 @@ all untracked `paper-trader/paper_trader/analytics/implied_move.py`,
 `git add` of EXACTLY the 2 intended files; `git diff --staged --stat`
 verified immediately before each commit; never `git add -A`; both on
 origin/master (`916f87a`, `81ffe13`).
+
+- **2026-05-19 feat (Agent 4 product-engineer pass) — `/api/event-threads`.**
+  New deterministic, **no-LLM** route that answers a different trader question
+  than `/api/news-corroboration`: not "what's multi-source confirmed?" but
+  "what *distinct events* happened recently, ranked by impact × recency?".
+  `news-corroboration` filters out single-source events (its `min_sources=2`
+  guard is the whole point of that view); `event-threads` KEEPS them — a
+  solo Reuters 8-K before the wire picks it up is exactly the event the
+  trader needs to see first, not last. Pure builder `build_event_threads`
+  at `dashboard/web_server.py` greedily clusters fresh `articles.db` rows by
+  the same `ml.dedup.title_tokens` + `jaccard_similarity` primitive
+  `build_news_corroboration` and the briefing's near-dup-collapse use
+  (SSOT — the three views agree on "what story is this article about").
+  Per-thread enrichment routes the event to held positions:
+    * `tickers` = union of `_extract_tickers` over all member titles
+      (SSOT: the same word-boundary regex + `_SECTOR_MAP` `/api/sector-pulse`
+      uses — a single sector taxonomy across reads, no drift)
+    * `sectors` = `_SECTOR_MAP` lookup over those tickers
+    * `impact_score` = `max_ai_score × 0.5^(age_h / 6h)` — the same
+      recency-decay shape as the sector-pulse velocity, so a fresh max=8
+      thread outranks a 12h-stale max=10 (which IS the trader's eye-tracking
+      order when scrolling the feed)
+    * `members` capped at 5, highest-score first, so the trader can drill
+      into supporting evidence without a second query
+  Ranking: `impact_score` DESC → `n_articles` DESC → `n_sources` DESC →
+  `anchor_title` (deterministic ties).
+
+  **Route** `/api/event-threads?hours=24&min_score=5&min_articles=1&max_threads=30`
+  (hours 1..168; min_score 0..10; min_articles 1..20; max_threads 1..100).
+  Carries `_LIVE_ONLY_SQL` (no backtest:// / opus_annotation* contamination —
+  mirrors `/api/news-corroboration` / `/api/sector-pulse`). Live evidence at
+  rollout: 4000 articles scanned → 30 threads at default `min_score=5`; the
+  Samsung HBM4 / SK Hynix strike thread surfaces as 1 distinct event with
+  the supporting members, where the raw feed showed ~5 syndicated copies
+  fighting for top spot.
+
+  **Locks (`tests/test_event_threads.py`, 18 tests, ~18s):**
+    1. Empty / non-list inputs collapse to well-formed envelope (never raise)
+    2. Single-article thread surfaces above `min_score` — the differentiator
+       from `news-corroboration`'s `min_sources >= 2` filter
+    3. `min_articles >= 2` opts into corroboration-style filtering
+    4. Ticker extraction is case-sensitive word-bounded (`samuel` does NOT
+       match `MU`; lowercase `amd` does NOT match `AMD`)
+    5. Tickers from distinct member titles are UNIONED into the thread
+       (the trader's actual exposure surface for the event)
+    6. Unknown ticker → no `None` sector
+    7. Fresh lower-score thread outranks stale higher-score thread (the
+       recency-decay shape is the whole point of "impact" vs "max_score")
+    8. Deterministic tie-break order on identical impact
+    9. `min_score` filter; `min_score=0` keeps everything
+   10. Member cap = 5 (n_articles still reflects the full count)
+   11. **SSOT**: source contains `from ml.dedup import` — clustering can't
+       silently drift from the briefing's near-dup-collapse
+   12. Route exists, returns JSON, clamps `hours` / `min_score` /
+       `min_articles` / `max_threads`, tolerates garbage params
+
+  Advisory only — never gates Opus, never enters a decision prompt, sizes
+  nothing (invariants #2 / #12). Pure builder: ~120 LoC; no DB / network /
+  LLM in `build_event_threads`. **No UI panel yet** (consumers query the
+  route; natural home is unified's command-center alongside the existing
+  `signals` / `news-corroboration` panels).
