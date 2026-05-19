@@ -202,6 +202,60 @@ class TestBenchmarkUnavailableNote:
         assert (detail["notes"] or "") == ""
         assert detail["spy_return_pct"] == pytest.approx(50.0, abs=1.0)
 
+    def test_degenerate_spy_zero_return_over_long_window_is_flagged(
+            self, tmp_path):
+        """Live Phase-3 finding (2026-05-19): backtest.db carried 80/475
+        complete runs with `spy_return_pct = 0.0` but NO note — the empty-
+        SPY guard only catches the *missing-series* case, not the
+        *degenerate-walk-back* case where SPY exists but `returns_pct`
+        returned exactly 0 over a multi-week window (e.g. price_on walked
+        both endpoints back to the same prior close). SPY essentially
+        never has a flat ≥30-day stretch, so a 0 there is a fabricated
+        benchmark just like the empty-series case. The new branch in
+        run_one flags it the same way."""
+        prices = _build_synthetic_prices(rise_pct=50.0, days=51)
+        # Populate SPY with a single price — every other entry stays the
+        # same. price_on falls back to that single price for ALL queries,
+        # so first_day and final_day resolve to identical closes and
+        # returns_pct returns exactly 0.0 despite SPY being non-empty.
+        single_price = 400.0
+        prices.prices["SPY"] = {
+            prices.trading_days[0].isoformat(): single_price,
+        }
+        # The 51-day window is ≥30d so the new guard fires.
+        engine = _make_engine(prices, tmp_path)
+        self._drive(engine)
+        detail = engine.store.run_detail(1)
+        assert detail is not None
+        assert detail["spy_return_pct"] == pytest.approx(0.0)
+        # The note must explicitly call out the degenerate condition so
+        # an operator reading the dashboard or skimming the DB can see
+        # the alpha column is not real.
+        notes = detail["notes"] or ""
+        assert "benchmark_unavailable" in notes, notes
+        assert "0.0" in notes or "degenerate" in notes, notes
+
+    def test_spy_zero_over_short_window_does_not_flag(self, tmp_path):
+        """A truly short window (<30 days) where SPY happens to return
+        0% must NOT trigger the new degenerate guard — the noise floor
+        for SPY over a few days is wide enough that a real 0 is plausible
+        and over-flagging would spam the note column with false positives.
+        Lock the 30-day threshold as the boundary."""
+        # 21-day window with a flat SPY series → spy_return = 0 over a
+        # short period.
+        prices = _build_synthetic_prices(rise_pct=50.0, days=21)
+        flat = 400.0
+        prices.prices["SPY"] = {
+            d.isoformat(): flat for d in prices.trading_days
+        }
+        engine = _make_engine(prices, tmp_path)
+        self._drive(engine)
+        detail = engine.store.run_detail(1)
+        assert detail is not None
+        assert detail["spy_return_pct"] == pytest.approx(0.0)
+        # No note — the run is below the 30d guard threshold.
+        assert (detail["notes"] or "") == ""
+
 
 # ─────────────────── Test B: DecisionScorer train/predict cycle ─────────────
 

@@ -2492,6 +2492,33 @@ class BacktestEngine:
             )
             print(f"[run {run_id}] WARNING: SPY series empty for "
                   f"{self.start}→{self.end} — vs_spy_pct is not a real benchmark")
+        elif spy_return == 0.0 and (final_day - self.prices.trading_days[0]).days >= 30:
+            # Second-class degenerate: SPY series is non-empty but
+            # returns_pct came back at EXACTLY 0.0 for a ≥30-day window. SPY
+            # has no realistic flat ≥30-day stretches — across 30+ years
+            # since 1993 the empirical p10..p90 of 30d SPY return is roughly
+            # -5%..+5% but is essentially never exactly 0. So either:
+            #   * `price_on` walk-back collapsed both endpoints to the same
+            #     historical close (a degenerate trading_days[0] / final_day
+            #     pair we never want to compare),
+            #   * yfinance returned SPY for the window but with both end
+            #     dates missing (so `price_on` falls back to identical priors),
+            # — either way the resulting `vs_spy_pct = total_return - 0` is
+            # fabricated alpha, identical to the empty-SPY case. Flag it the
+            # same way (additive note, no behaviour change). Observed live
+            # in this checkout: 80/475 complete runs hit this branch and went
+            # uncaught for months because the schema's NOT NULL DEFAULT 0
+            # made the degenerate spy_return indistinguishable from a real 0%.
+            benchmark_note = (
+                "benchmark_unavailable: SPY returns_pct=0.0 for a "
+                f"{(final_day - self.prices.trading_days[0]).days}-day window "
+                "(degenerate price_on walk-back collapsed both endpoints to "
+                "the same close); spy_return_pct/vs_spy_pct are NOT a valid "
+                "SPY benchmark — equals raw return, do not read as alpha"
+            )
+            print(f"[run {run_id}] WARNING: SPY returns_pct=0 across "
+                  f"{(final_day - self.prices.trading_days[0]).days}d window "
+                  f"{self.start}→{self.end} — vs_spy_pct is not a real benchmark")
         self.store.finalize_run(run_id, final_value, spy_return, n_trades,
                                 n_decisions, equity_curve, status="complete",
                                 notes=benchmark_note)
