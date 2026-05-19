@@ -113,7 +113,14 @@ def build_decision_clock(decisions: list[dict],
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
-    days = max(1, min(int(days or 7), 30))
+    # `days or 7` silently coerces an explicit `days=0` to the default 7 —
+    # the test contract is "clamp 0 to 1", not "treat 0 as unspecified".
+    # Coerce defensively (None / non-numeric → default 7), THEN clamp.
+    try:
+        days = int(days) if days is not None else 7
+    except (TypeError, ValueError):
+        days = 7
+    days = max(1, min(days, 30))
     cutoff = now - timedelta(days=days)
 
     buckets = _empty_buckets()

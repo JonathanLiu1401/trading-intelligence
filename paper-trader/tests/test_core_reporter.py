@@ -386,6 +386,52 @@ class TestTradeAlertImpactLine:
         reporter.send_trade_alert(trade, snapshot=snapshot)
         assert "post:" not in captured[0]
 
+    def test_sell_full_close_without_store_does_not_duplicate_cash(
+        self, monkeypatch
+    ):
+        # Full close + no store (so no round-trip lookup) used to emit
+        # "closed — cash $X · cash $X" because the fallback branch baked
+        # cash into its own token AND the unconditional cash-append fired.
+        # Lock the single cash token now.
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        sell_trade = {"action": "SELL", "ticker": "NVDA", "qty": 5,
+                       "price": 120.0, "value": 600.0, "reason": "exit",
+                       "timestamp": "2026-05-18T16:00:00+00:00"}
+        # Snapshot is post-trade with NVDA fully closed → no NVDA row.
+        snapshot = {"cash": 1100.0, "total_value": 1100.0, "positions": []}
+        reporter.send_trade_alert(sell_trade, snapshot=snapshot, store=None)
+        body = captured[0]
+        assert "post:" in body
+        assert "closed" in body
+        assert body.count("cash $1100.00") == 1, (
+            f"expected single cash token, got: {body!r}")
+
+    def test_sell_full_close_with_failing_store_falls_back_cleanly(
+        self, monkeypatch
+    ):
+        # Same path as above, but exercised through a store whose
+        # recent_trades raises so the round-trip lookup fails internally.
+        # The "closed" branch must still emit exactly one cash token.
+        class _FailingStore:
+            def recent_trades(self, _n):
+                raise RuntimeError("simulated store fault")
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        sell_trade = {"action": "SELL", "ticker": "AMD", "qty": 3,
+                       "price": 200.0, "value": 600.0, "reason": "exit",
+                       "timestamp": "2026-05-18T16:00:00+00:00"}
+        snapshot = {"cash": 600.0, "total_value": 600.0, "positions": []}
+        reporter.send_trade_alert(sell_trade, snapshot=snapshot,
+                                  store=_FailingStore())
+        body = captured[0]
+        assert "post:" in body
+        assert "closed" in body
+        assert body.count("cash $600.00") == 1
+        assert "realized" not in body  # never invent a P/L when the lookup failed
+
     def test_hold_str_from_days_buckets(self):
         # Locked: <1h → minutes, <1d → fractional hours, ≥1d → fractional days.
         assert reporter._hold_str_from_days(0.0007) == "1m"     # ~1 min
