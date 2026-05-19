@@ -1447,6 +1447,16 @@ cd /home/zeph/paper-trader && python3 -m pytest tests/test_feature_coverage.py -
 # (read-only; exit 2 on DEAD/DEGRADED, 0 on FULL_COVERAGE/INSUFFICIENT):
 cd /home/zeph/paper-trader && python3 -m paper_trader.ml.feature_coverage
 
+# Off-distribution gate-abstention diagnostic — how often does the live
+# gate's off_distribution guard (commit 84d8234) actually fire? The
+# gate_off_dist field is captured per row but no diagnostic reports the
+# rate; this answers "is the ±PRED_CLAMP_PCT protection live or dormant?"
+# (25 exact-value verdict locks)
+cd /home/zeph/paper-trader && python3 -m pytest tests/test_gate_abstention.py -v
+# Read-only; exit 2 on GUARD_RAMPANT (gate mostly neutral), 0 elsewhere:
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.gate_abstention          # OOS slice
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.gate_abstention --all    # full corpus
+
 # Training-corpus & OOS-construction audit (exact-value verdict locks)
 cd /home/zeph/paper-trader && python3 -m pytest tests/test_corpus_audit.py -v
 # Is the loop's temporal-OOS holdout a real generalization test? (read-only;
@@ -6756,3 +6766,167 @@ prewarm target — the precise contract-rot the test guards against.
   (feature), and the AGENTS.md commit to follow.
 
 *Review pass #30 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+### 2026-05-18 review pass #31 (ML+backtest hybrid · gate-abstention diagnostic · live findings)
+
+- **Phase 1 — no new bugs (bugs_fixed = 0; no Phase-1 commit).** Full
+  re-trace of `decision_scorer.py`, `backtest.py`,
+  `run_continuous_backtests.py` plus coupled `validation.py` /
+  `calibration.py` / `gate_realized.py`: the `score=` vs `scorer=` regex
+  first-match disambiguation, the `(ticker, sim_date, action)` dedup key
+  in `train_scorer`, the universal SELL `-forward_return_5d` sign-flip
+  (train ↔ inference ↔ calibration ↔ gate ↔ `_oos_rank_metrics`), the
+  5-trading-day forward-window guard, the `_parse_gate_decision` regex +
+  `(off-dist` substring check, the off-distribution gate abstention path
+  in `_ml_decide` (the `_pwm` callable probe + `not scorer_off_dist`
+  guard), the `_Dummy` fallback's 11-keyword `predict(**kw)` contract,
+  `_to_float`'s `np.number` (not `np.generic`) branch with inf/NaN/bool
+  rejection, the `_inject_and_train` lock-retry `for…else` semantics,
+  the separately-guarded OOS blocks in `_train_decision_scorer`, every
+  module-global lock — all re-verified correct and exact-value
+  test-locked. Consistent with the documented 12+ prior no-new-bug ML/
+  backtest passes — not a fabricated fix. ML/backtest subset 387/387
+  green before the feature.
+
+- **Feature shipped: off-distribution gate-abstention diagnostic
+  (`paper_trader/ml/gate_abstention.py`, `tests/test_gate_abstention.py`,
+  25 exact-value verdict/boundary/threshold locks).** The gap it fills:
+  commit `84d8234` added the off-distribution gate abstention to
+  `_ml_decide` (when the scorer's clamped output exceeds `±PRED_CLAMP_PCT`
+  the gate **leaves conviction untouched** — the multiplier arm is
+  skipped entirely). Commit `60b20d9` then made that decision durable
+  in `decision_outcomes.jsonl` via the `gate_off_dist` boolean.
+  **Nothing reports how often the guard actually fires.**
+  `gate_realized.py` reads the field (to route abstained rows to a
+  separate bucket) but its verdict grades only ACTED rows; the *rate*
+  of abstention itself, the per-arm distribution it abstained from, and
+  whether it is rising or falling over time were unread. That is the
+  ledger-wired-but-unread pattern of pass #15 / pass #20
+  (`baseline_trend` for the baseline ledger), applied to a per-row
+  field instead of a per-cycle ledger column.
+
+  This matters operationally. Two failure modes look identical from a
+  distance:
+
+  * **GUARD_INACTIVE** — rate < 0.5%. Either the model is always
+    in-distribution (good — but worth knowing) OR the abstention
+    threshold is too lax to ever fire. The guard exists to catch the
+    −89→+32 same-LITE-vector extrapolation `decision_scorer.py`
+    documents; if it never fires, that protection is dead code.
+  * **GUARD_RAMPANT** — rate ≥ 15%. The model is regularly emitting
+    clamped ±50 outputs the gate then refuses to act on — so the gate
+    is mostly *neutral* despite being "active". The 1.30/0.60
+    multiplier spread `gate_audit` / `gate_realized` grade is being
+    applied to a shrinking fraction of decisions.
+
+  Imports `gate_arm` from `gate_audit` (single source of truth — the
+  "would-have-been arm" distribution must match `_ml_decide` to the
+  bit; the `gate_realized`-imports-`gate_arm` precedent) and
+  `split_outcomes_temporal` from `validation` for the OOS slice (the
+  same temporal split every sibling OOS tool uses). Same operational
+  discipline as `paper_trader/ml/calibration.py`: read-only, no train,
+  no pickle / `build_features` / `N_FEATURES` touch, no trade path —
+  safe to run against the live unattended loop. Never raises. CLI
+  exits 2 on `GUARD_RAMPANT` (operator-actionable: gate is mostly
+  neutral), 0 on every other verdict — mirrors the sibling diagnostics'
+  cron-branch convention.
+
+  ```bash
+  cd /home/zeph/paper-trader && python3 -m paper_trader.ml.gate_abstention
+  cd /home/zeph/paper-trader && python3 -m paper_trader.ml.gate_abstention --all
+  cd /home/zeph/paper-trader && python3 -m pytest tests/test_gate_abstention.py -v
+  ```
+
+  Trend axis (recent half vs older half of captured rows by `sim_date`):
+  `IMPROVING` / `DEGRADING` / `STABLE` / `UNKNOWN`. Independent of the
+  verdict axis (the `baseline_trend` precedent of orthogonal axes) so a
+  ledger row reading `GUARD_INACTIVE` + `trend=DEGRADING` is the
+  decisive "still mostly dormant but starting to fire more" signal —
+  exactly what a quant would want to spot the moment the model begins
+  drifting OOD.
+
+  > **Quant finding (2026-05-18, live).** Run on the live
+  > `decision_outcomes.jsonl` (5165 captured rows, 7413 total):
+  >
+  > | Slice | n_captured | n_abstained | rate | verdict |
+  > |-------|-----------|-------------|------|---------|
+  > | full corpus | 5165 | 4 | **0.08%** | `GUARD_INACTIVE` |
+  > | OOS (last 20%) | 1089 | 4 | **0.37%** | `GUARD_INACTIVE` |
+  >
+  > **All 4 abstentions cluster at the extreme clamp arms** — 2 at
+  > `strong_headwind` (would-have-been ×0.60), 2 at `strong_tailwind`
+  > (×1.30) — which is the expected shape (the off-dist guard fires
+  > exclusively when the unbounded MLP head emits a clamped ±50). All 4
+  > are on **leveraged ETFs**: URTY (×2), SOXL, FAS — exactly the names
+  > `decision_scorer.py`'s clamp comment cites as the documented
+  > extrapolation case. The guard infrastructure is mostly dormant: the
+  > ±PRED_CLAMP_PCT extrapolation protection it was added for is
+  > engaging on **0.08% of decisions**. Trend `STABLE` (older 0.00% →
+  > recent 0.15%, within ±2pp band). **Reported observation, not a code
+  > change** — tuning the abstention threshold is a model-dynamics
+  > change out of surgical scope (CLAUDE.md §6). The new diagnostic
+  > makes this question durably answerable for the first time, and is
+  > the operator's signal for if/when the model starts drifting OOD.
+
+- **Phase 3 live findings (other arbiters, reconfirmed).** Reading every
+  existing trender against the live ledgers:
+  * `skill_trend` = **`DIRECTIONAL_BUT_HIGH_ERROR`** — recent median
+    `oos_rmse=12.71` ≥ fresh mean-predictor baseline `9.65` (worse than
+    a constant predictor), but median `oos_ic=+0.07 > IC_MIN=0.05` so
+    the gate's sign decision carries marginal value. Trend
+    **DEGRADING** (older 10.80 → recent 12.71), `gate_active=1.0` across
+    all 22 ledger cycles.
+  * `overfit_gap` = **`SEVERE_OVERFIT`** with **trend=DEGRADING**
+    (recent median oos/val ratio **1.45 ≥ 1.40**, older 1.19, overall
+    1.21). The new (32,16)+L2+early_stop config (`5a0af2d`) is deployed
+    (`deploy_stale=False` on the last 4 cycles) but the gap has
+    **widened**, not closed, on the most recent draws — a sharper
+    statement than prior passes' `MILD_OVERFIT/STABLE`.
+  * `gate_realized` = **`GATE_INEFFECTIVE`** — `strong_tailwind +3.50%`
+    vs `strong_headwind +4.27%` on the OOS slice (spread **−0.77pp**,
+    inside the ±1pp band — so the verdict is "ineffective" not
+    "harmful", but the *direction is inverted*: the gate's ×0.60 arm
+    (sizing DOWN bearish-predicted names) realized the BEST returns at
+    exactly the moments the gate thought the smallest position was
+    right). `arm_monotone_fraction=0.5` — only half the arm-mean
+    sequence is non-decreasing.
+  * `baseline_trend` = `INSUFFICIENT_DATA` (only 4 baseline-ledger
+    cycles vs `MIN_CYCLES=5`) — populates as more cycles run; the most
+    recent cycle 4 in the raw ledger reads `MLP_ADDS_SKILL`
+    (mlp_rank_ic=+0.19, ic_gap=+0.11), in contrast to prior passes'
+    documented `MLP_WORSE_THAN_TRIVIAL` verdict. **Sample is small**
+    (n=4): a regime shift is plausible but unconfirmed.
+  * `calibration --oos` = **`MISCALIBRATED`** on the live pickle on
+    both full-corpus and OOS slice (spearman 0.05 / -0.05; OOS
+    decile-realized column noise — d1 mean_pred −11.65 realized +3.17
+    vs d10 mean_pred +5.99 realized +0.04: tails over-predict and
+    direction is inverted on the bearish tail).
+
+  Joint reading: the gate's economic skill is marginal-at-best on the
+  same regime where the model's `gate_off_dist` guard is barely firing
+  (0.08%). The gate is acting confidently on a signal that does not
+  pay; the guard that would otherwise abstain on extrapolation is
+  protecting fewer than 1-in-1000 decisions. **All reported
+  observations, not model changes** — altering thresholds / abstention
+  rules / the gate is a training-dynamics change out of surgical scope
+  (CLAUDE.md §6, gate is invariant #5).
+
+- **Live health.** `backtest.db` external/symlinked (`/media/...`)
+  responding (read times >5s under the running-loop write contention,
+  per the documented pre-existing scalability characteristic); ledgers
+  fresh — `scorer_skill_log.jsonl` 22 rows on cycles 1-7 of the *new*
+  loop process (after a redeploy: `deploy_stale=False` on the last 4
+  cycles, the regularized config is live), `baseline_skill_log.jsonl` 4
+  rows, `decision_outcomes.jsonl` 7413 rows / 3.2 MB. `continuous.log`
+  fresh, mid-cycle, no Python tracebacks — only expected `[gdelt]
+  permanent` short-circuits (commit `8899c16` working as designed) and
+  yfinance `possibly delisted` lines for pre-IPO windows on names like
+  LITE/SNOW/COIN/PLTR (handled gracefully via `prices[t]={}`).
+
+- **Run the ML/backtest suite:** `cd /home/zeph/trading-intelligence/paper-trader
+  && python3 -m pytest tests/ -k "ml or backtest or scorer or calibration
+  or continuous or horizon or gate_abstention" -q` (412/412 green;
+  +25 over the prior 387 baseline from the new `gate_abstention.py`
+  tests).
+
+*Review pass #31 (ML+backtest hybrid) appended 2026-05-18. Prior content above is unmodified.*
