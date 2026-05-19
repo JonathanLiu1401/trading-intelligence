@@ -79,6 +79,7 @@ from collectors.ecb_press_collector import collect_ecb_press
 from collectors.boj_press_collector import collect_boj_press
 from collectors.boe_press_collector import collect_boe_press
 from collectors.globenewswire_collector import collect_globenewswire
+from collectors.sec_xbrl_financials import collect_sec_xbrl_financials
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -138,6 +139,7 @@ ECB_PRESS_INTERVAL      = 1800    # ECB press releases RSS — every 30min
 BOJ_PRESS_INTERVAL      = 1800    # Bank of Japan press / speech / MPM RSS — every 30min
 BOE_PRESS_INTERVAL      = 1800    # Bank of England press / publications RSS — every 30min
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
+SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
 EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
@@ -183,7 +185,7 @@ SUPERVISOR_STATE_PATH = BASE_DIR / "logs" / "supervisor_state.json"
 # by the health reporter so dashboards know what to expect even when a worker
 # has never logged anything yet.
 ALL_WORKERS = (
-    "gdelt", "rss", "web", "reddit", "ticker", "sec_edgar", "sec_edgar_ft",
+    "gdelt", "rss", "web", "reddit", "ticker", "sec_edgar", "sec_edgar_ft", "sec_xbrl",
     "google_news", "nitter", "substack",
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
     "yahoo_ticker_rss", "market_movers", "wikipedia", "macro_calendar",
@@ -221,6 +223,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "boj_press": BOJ_PRESS_INTERVAL,
     "boe_press": BOE_PRESS_INTERVAL,
     "globenewswire": GLOBENEWSWIRE_INTERVAL,
+    "sec_xbrl": SEC_XBRL_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
     "ml_trainer": ML_TRAIN_INTERVAL,
@@ -1227,6 +1230,28 @@ def globenewswire_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(GLOBENEWSWIRE_INTERVAL)
+
+
+# ── Worker: SEC XBRL financial facts — every 6h ─────────────────────────────
+def sec_xbrl_worker(store: ArticleStore):
+    log.info("[sec_xbrl_worker] started")
+    bo = Backoff("sec_xbrl", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_sec_xbrl_financials()
+            _ingest(store, articles, "sec_xbrl")
+            try:
+                source_health.record_result("sec_xbrl", len(articles))
+            except Exception as he:
+                log.warning(f"[sec_xbrl_worker] source_health error: {he}")
+            _worker_last_ok["sec_xbrl"] = time.time()
+            log.debug(f"[sec_xbrl] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[sec_xbrl_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SEC_XBRL_INTERVAL)
 
 
 # ── Worker: Portfolio P/L snapshot — every 5min ─────────────────────────────
@@ -2386,6 +2411,7 @@ def main():
         ("boj_press",   boj_press_worker),
         ("boe_press",   boe_press_worker),
         ("globenewswire", globenewswire_worker),
+        ("sec_xbrl",    sec_xbrl_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
