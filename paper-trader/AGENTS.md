@@ -9507,3 +9507,166 @@ with rebalanced classes; do NOT change `_LEVERAGED_ETFS` or
   scorer-skill ledger and `calibration --oos` /
   `baseline_compare` / `sector_skill` already use). The diagnostic
   describes the SAME holdout every other OOS tool reports on.
+
+## Review pass — paper-trader core hybrid (2026-05-19, Agent 1, ~12:45 UTC)
+
+### Phase 1 (commit `8f8d862`) — `_option_expired` flips at NYSE close
+
+Strategy.py `_option_expired` used `exp < datetime.now(timezone.utc).date()`,
+which kept an expired option marked at `avg_cost` (with `stale_mark=True`)
+for ~3-4h after the actual 16:00 ET close — every monthly expiry. Same
+window let `_execute` SELL_CALL/SELL_PUT settle a closed expired
+contract at `avg_cost` (instead of intrinsic) when the chain returned
+None. Documented as a *deferred* fix in review pass #33 ("Skipped this
+pass; documented for the next") — now applied.
+
+The fix preserves the existing 6 pin tests verbatim by keeping the
+legacy `today=date` kwarg (date-only comparison, "expiry day itself is
+not expired") and adds a new `now=datetime` kwarg that drives the NY-tz
++ `market.close_minute` close-gate path. Production callers
+(`_mark_to_market`, `_execute`) pass neither kwarg, so they pick up the
+new wall-clock NY-tz logic. 9 new tests in `TestOptionExpiredCloseGate`
+lock the boundary at 16:00 ET, the half-day 13:00 ET early-close, the
+UTC→NY normalization, the past-/future-date short circuits, and the
+naive-datetime tolerance. `bugs_fixed = 1`.
+
+### Phase 2 (commit `c83d31f`) — per-position earnings-imminent flag on Discord
+
+The Opus decision prompt already sees the earnings calendar
+(`event_calendar.build_event_calendar`), but the operator's Discord
+hourly/daily summary's position lines showed weight + hold-age with
+**no indication that a held name reports in <1d**. The live 2026-05-19
+book sat at NVDA **75% of stock book** with NVDA reporting
+**0.5d away** — the trader scanning the hourly saw nothing about the
+imminent print. The same dashboard→Discord gap `_concentration_line`
+closed for name concentration (pass #34), `_pos_hold_age_token` closed
+for the disposition effect (pass #33), and `_capital_pulse_line` /
+`_host_pulse_line` each closed one dimension over.
+
+`_pos_earnings_token(p, events_by_ticker)` renders:
+
+* `  ⚠ ER 0.7d` — tier `HELD_IMMINENT` (≤3d): must-see warning glyph;
+* `  ER 5.0d`   — tier `HELD_SOON` within horizon: informational;
+* `  ⚠ ER after close` / `  ER after close` — `days_away < 0`
+  (same-day post-bell — print just happened); explicit wording beats a
+  confusing "-0.1d".
+
+`_portfolio_lines` now takes an optional `events_by_ticker` kwarg
+(default `None` → byte-identical to prior behaviour; every existing
+unit-test caller stays compatible). `send_hourly_summary` and
+`send_daily_close` resolve the events dict via the new
+`_earnings_events_by_ticker` helper, which composes
+`build_event_calendar` **verbatim** (single source of truth, invariant
+#10 — the prompt and the Discord surface can never tell different
+earnings stories). Pure filesystem read inside the builder (the
+`signals.py` / `event_calendar` precedent — **no network on the Discord
+path**, the `_concentration_line` discipline).
+
+Same observational-only contract as `_pos_pct_weight` /
+`_pos_hold_age_token` (invariants #2/#12). Any builder fault degrades
+to `None` so the calling line drops the earnings token but the whole
+summary still ships (reporter additive failure contract).
+
+17 new tests (`TestPosEarningsToken` 11 + `TestEarningsEventsByTicker`
+6) lock the token shape, the same-day-post-bell wording, the
+byte-compat path for the existing unit-test callers (no kwarg → no
+token), and the degrade-to-None path on every documented builder
+failure mode (raise / source_ok=False / non-dict / empty events /
+malformed event rows). `features_added = 1`.
+
+### Phase 3 — live validation against the running trader (12:44 UTC)
+
+1. ✅ **`/api/event-calendar`** — `NVDA: HELD_IMMINENT, 0.47d`,
+   `MRVL: WATCH, 7.47d`. My new Discord token resolves from this
+   exact endpoint's underlying data.
+2. ✅ **Dry-run hourly summary against live store** rendered NVDA's
+   position line as `NVDA  qty 2.0  ... held 12h  ⚠ ER 0.5d` — the
+   feature works end-to-end.
+3. ✅ **`/api/portfolio`** healthy — $1000 equity, NVDA 2sh + TQQQ
+   2sh, `stale_marks: 0`. (P/L $0 is the documented after-hours-
+   close-print coincidence noted in pass #34, not a bug.)
+4. ✅ **Notify (Discord) HEALTHY** — last successful send 12:20,
+   `consecutive_failures: 0`.
+5. ⚠️ **17 consecutive NO_DECISIONs (95% IDLE_STORM)** —
+   `/api/no-decision-reasons` correctly buckets dominant cause as
+   `host_saturated (50%)` with the right recommendation ("a runner
+   restart does NOT help"). The 4-agent concurrent review (this run +
+   3 siblings, ~14 Opus subprocesses) IS the saturation. Known
+   [[pt-no-decision-host-saturation]]; not a code bug.
+6. ⚠️ **`/api/supervision` `UNSUPERVISED` + `behind: 1` commit** —
+   trader runs as orphan PID 2849533 (PPID 1), on boot SHA `5066b20`
+   while HEAD moved to `c83d31f` after my Phase 2 push. The
+   git-watcher's deferred restart will fire on the next cycle
+   boundary to deploy the new feature. Known
+   [[pt-systemd-vs-manual-restart-spam]]; operator chose this
+   configuration.
+
+`user_findings = 3`: (a) the saturation pattern remains the dominant
+NO_DECISION cause, operator-resolvable, not code-resolvable; (b) the
+runner-supervised-orphan / behind-HEAD pattern remains visible to
+every operator surface (Discord summary correctly surfaces both
+warnings, no silent failure); (c) the new earnings token surfaces
+correctly inline next to NVDA on the live hourly body — a real
+value-add for a trader checking Discord while holding into the print.
+
+### How to run / test
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# This pass's surface (~1.5s)
+python3 -m pytest tests/test_core_strategy.py::TestOptionExpiredCloseGate \
+                  tests/test_core_reporter.py::TestPosEarningsToken \
+                  tests/test_core_reporter.py::TestEarningsEventsByTicker -v
+
+# Full focused core sweep (~15s)
+python3 -m pytest tests/test_core_runner.py tests/test_core_signals.py \
+                  tests/test_core_market.py tests/test_core_store.py \
+                  tests/test_core_strategy.py tests/test_core_reporter.py \
+                  tests/test_core_runner_cycle.py tests/test_core_invariants.py \
+                  tests/test_parse_retry.py tests/test_event_calendar.py -q
+
+# Inspect the new earnings token against the live store
+python3 -c "
+from paper_trader import reporter
+ev = reporter._earnings_events_by_ticker()
+from paper_trader.store import get_store
+s = get_store(); pos = s.open_positions(); pf = s.get_portfolio()
+for ln in reporter._portfolio_lines(pos, total_value=pf['total_value'], events_by_ticker=ev):
+    print(ln)
+"
+```
+
+### Invariants reaffirmed by this pass
+
+* **No `git add -A`** — sibling agents were running concurrently;
+  explicit pathspec on every commit ([[pt-concurrent-samerole-staging-race]]).
+  Phase 1 staged only `paper_trader/strategy.py` +
+  `tests/test_core_strategy.py`; Phase 2 staged only
+  `paper_trader/reporter.py` + `tests/test_core_reporter.py`. The
+  sibling untracked `paper_trader/analytics/restart_recommendation.py`
+  / `position_action_brief.py` / `tests/test_restart_recommendation.py`
+  + the `digital-intern/` working-tree edits were correctly left out.
+* **Single source of truth (invariant #10)** — the Discord earnings
+  token reads from `build_event_calendar` verbatim, the SAME builder
+  the Opus prompt's `event_calendar_block` reads from. Never
+  re-derives `days_away` / `tier`.
+* **No network on the Discord path** — `_earnings_events_by_ticker`
+  goes through `build_event_calendar` which reads the JSON snapshot
+  *from disk* (digital-intern writes it via its earnings collector),
+  never a `:8080` hop. Preserves the `_stress_line` /
+  `_recovery_line` / `_concentration_line` no-yfinance discipline on
+  the alert path.
+* **Reporter additive failure contract** — every new block/function
+  degrades to `""` or `None` on fault; the whole hourly / daily
+  summary still ships. Locked by the `test_*_returns_none` and
+  `summary_still_sends_when_*` test path across the suite.
+* **Invariants #2/#12 (observational only)** — the earnings token
+  states a fact (a held name reports in X days); never gates,
+  imposes a cap, or sends a directive. The Opus decision prompt
+  already had this data via `event_calendar_block`; this is the
+  Discord-surface mirror.
+* **NYSE close gate (invariant #14)** — `_option_expired` now uses
+  `market.close_minute` (16:00 ET regular / 13:00 ET half-day) and
+  the NYSE NY tz, the same source of truth `is_market_open` /
+  `next_session_open` / `_maybe_daily_close` already use.
