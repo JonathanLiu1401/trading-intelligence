@@ -186,7 +186,35 @@ Suites:
 
 - `test_article_store.py` — backtest isolation, alerted-marking, ml/llm score separation, CRUD.
 - `test_urgency_scorer.py` — classification at the 8.0 threshold, partial Sonnet responses,
-  alerted-state preservation.
+  alerted-state preservation. `TestArticleAgeCascade` pins
+  ``_article_age_hours``'s field-cascade contract (a non-empty-but-
+  unparseable ``published`` must NOT short-circuit at 0.0h — that bypassed
+  the STALE_HOURS=48 cap on rows whose ``first_seen`` was genuinely old;
+  the cascade now mirrors ``alert_agent._article_age_hours``'s convention
+  so the two age helpers agree on which timestamp is authoritative).
+- `test_alert_recap_template.py` — the recap / SEO template gate
+  (``watchers/alert_agent.py::_filter_recap_template_noise``). A second,
+  distinct surface the urgency head over-scores that neither the quote-
+  widget gate nor the 0.45 source-authority bar catches: retrospective
+  recap / preview / transcript-summary templates from publishers ABOVE
+  the cred bar (Finnhub 0.78, Motley Fool/yahoo 0.65, GoogleNews 0.62).
+  Six precision-anchored fingerprints: "Why <X> Stock Is Trading Up
+  Today" (Zacks/Yahoo/Finnhub), "Why Did <X> Stock Drop Today" (Motley
+  Fool variant), "Stock Market Today, May 18: ..." dated wrap-up, "Q1
+  2026 Earnings Call Highlights" (transcript-summary), "Here What the
+  Street Thinks About ..." (InsiderMonkey), "GF Value Says" (GuruFocus
+  algorithmic mill). Runs BEFORE dedup so a syndicated recap is caught
+  on every copy (live: a single "Stock Market Today, May 18: ..." wrap-
+  up fired three times in one minute from Motley Fool + Nasdaq +
+  YahooFinance). Suppressed rows are marked alerted UNCONDITIONALLY
+  (exit the urgent queue, never re-fetched). Tests pin (1) live-noise
+  catches by the exact strings observed firing 2026-05-18/19, (2) the
+  must-survive corpus (real earnings, macro breaks, ticker action, mid-
+  sentence "why", earnings PREVIEWS that the call-highlights pattern
+  must NOT catch, value/analyst headlines that the GF Value pattern
+  must NOT catch), (3) integration on ``send_urgent_alert`` with the
+  no-Claude-call short-circuit + cross-gate chaining vs the quote-
+  widget gate. 20 cases.
 - `test_features.py` — exactly 15 extra dims, ticker density, days-since-published normalization
   (`min(age,30)/30` → ~1/30 at 24h, saturates 1.0 at ≥30d; this is intended ML feature scaling,
   not a bug), cyclic feature bounds.
