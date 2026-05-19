@@ -643,9 +643,30 @@ def train_scorer(records: list[dict]) -> dict:
         # MLPRegressor.fit doesn't accept sample_weight — emulate by deterministic
         # oversampling: weight 0.5→1× replica, 1.0→2×, 1.5→3×, 2.0→4×. Done
         # only on the training fold so val_rmse stays clean.
-        rep = np.maximum(1, np.round(w_tr * 2).astype(int))
-        X_tr_w = np.repeat(X_tr, rep, axis=0)
-        y_tr_w = np.repeat(y_tr, rep, axis=0)
+        #
+        # Rounding produces rep=0 for very low weights — the documented LLM
+        # `CONDEMN` annotation (`llm_mult=0.1`) at base weight 0.5 gives
+        # 0.05 → ×2=0.1 → round to 0. Such rows are DROPPED from the
+        # training fold so the documented 0.1× weight is actually realized.
+        # The prior `np.maximum(1, …)` floor promoted CONDEMN to rep=1,
+        # rendering the 0.1× multiplier indistinguishable from a 0.5× weight
+        # on a losing run (measured CONDEMN/unlabeled ≈ 0.5×, NOT the
+        # documented 0.1×). Keeping the ×2 scaling (not ×10) preserves the
+        # original training-fold size so the unweighted L2 `alpha` term
+        # stays comparable across samples (a 5× larger fold would weaken
+        # regularization 5×, breaking the anti-overfit guarantees the
+        # noise-memorization test pins). Defensive empty-fold guard: if
+        # every weight rounds to 0 (impossible in any real corpus, since
+        # unlabeled records always weight ≥0.5 → rep≥1), fall back to the
+        # raw training fold so MLPRegressor.fit never sees an empty array.
+        rep = np.round(w_tr * 2).astype(int)
+        _keep = rep > 0
+        if _keep.any():
+            X_tr_w = np.repeat(X_tr[_keep], rep[_keep], axis=0)
+            y_tr_w = np.repeat(y_tr[_keep], rep[_keep], axis=0)
+        else:
+            X_tr_w = X_tr
+            y_tr_w = y_tr
 
         # Anti-overfit config (2026-05-18). The prior unregularized
         # (64,32,16)/600-iter net memorised the noisy training fold:
