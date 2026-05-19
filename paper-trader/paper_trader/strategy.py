@@ -472,16 +472,50 @@ def _parse_decision(raw: str) -> dict | None:
     return None
 
 
-def _option_expired(expiry: str | None, today: date | None = None) -> bool:
-    """True if the option's expiry date is strictly before today (UTC). An
-    option is still live *on* its expiry date, so the comparison is `<`."""
+def _option_expired(expiry: str | None, today: date | None = None,
+                    now: datetime | None = None) -> bool:
+    """True if the option's expiry has passed the NYSE session close.
+
+    Expiry day flips to expired at ``market.close_minute`` (16:00 ET regular
+    / 13:00 ET half-day), NOT at UTC midnight. Previously the comparison was
+    ``exp < datetime.now(timezone.utc).date()``, which kept an expired
+    contract marked at avg_cost (with ``stale_mark=True``) for ~3-4h after
+    the actual bell — every monthly expiry, the dashboard and the decision
+    prompt's position lines both showed an OTM option at full premium
+    instead of $0 (or its true intrinsic) from 16:00 ET until UTC midnight.
+    Same window let ``_execute`` SELL_CALL/SELL_PUT settle a closed expired
+    contract at ``avg_cost`` if the chain returned None, breaking-even a
+    worthless leg. Documented in AGENTS.md review pass #33 (impact: stale
+    display only, market closed in the window so no trade fires on the
+    wrong mark — but the fix was deferred and is now applied).
+
+    ``today`` preserves the legacy "pretend today is this date" date-only
+    override used by the 6 pre-existing pin tests (no time-of-day check —
+    expiry day itself counts as not expired). ``now`` is the new
+    NY-tz-aware injection point; given a UTC- or NY-aware datetime, the
+    function does the same logic the production wall-clock path runs.
+    Both unset → real wall clock + NY tz + close gate."""
     if not expiry:
         return False
     try:
         exp = date.fromisoformat(str(expiry)[:10])
     except (TypeError, ValueError):
         return False
-    return exp < (today or datetime.now(timezone.utc).date())
+    if today is not None:
+        return exp < today
+    now_dt = now or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    now_ny = now_dt.astimezone(market.NY)
+    today_ny = now_ny.date()
+    if exp < today_ny:
+        return True
+    if exp > today_ny:
+        return False
+    # exp == today_ny: expired at/after the NYSE session close.
+    close_min = market.close_minute(today_ny)
+    cur_min = now_ny.hour * 60 + now_ny.minute
+    return cur_min >= close_min
 
 
 def _hold_age_str(opened_at: str | None, now: datetime | None = None) -> str:
