@@ -8087,6 +8087,121 @@ def event_calendar_api():
         return jsonify({"error": str(e)}), 500
 
 
+def _earnings_history_for(ticker: str, depth: int = 8) -> list[float]:
+    """Per-ticker historical 1-day post-earnings reactions in percent.
+
+    The I/O seam for ``/api/earnings-shock`` (the builder is pure — the
+    ``tail_risk`` / ``stress_scenarios`` builder/endpoint split). For each
+    past entry in ``yfinance.Ticker(t).earnings_dates``, finds the first
+    daily session at or after the announcement timestamp and reports
+    ``(close[first_session] / close[first_session − 1]) − 1`` in percent.
+
+    The "first session at or after" rule handles BMO/AMC asymmetry without
+    needing the report-time-of-day flag: a BMO print on day D is reflected
+    in close[D] vs close[D−1]; an AMC print on day D is reflected in
+    close[D+1] vs close[D] (the next session is D+1). Either way the move
+    we attribute IS the first market reaction to the announcement.
+
+    Returns the most-recent ``depth`` reactions, oldest→newest. Any failure
+    returns ``[]`` so the builder degrades each row to
+    ``INSUFFICIENT_HISTORY`` (never raises — the ``_safe`` contract; the
+    Opus prompt is unaffected, this endpoint is observational only)."""
+    try:
+        import yfinance as _yf
+        tk = _yf.Ticker(ticker)
+        ed = tk.earnings_dates  # DataFrame; index is announcement TZ-aware ts
+        if ed is None or len(ed) == 0:
+            return []
+        now_utc = datetime.now(timezone.utc)
+        past = []
+        for idx in ed.index:
+            try:
+                ts = idx.to_pydatetime()
+            except Exception:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts < now_utc:
+                past.append(ts)
+        if not past:
+            return []
+        past.sort()
+        oldest = past[0]
+        start_str = (oldest - timedelta(days=15)).date().isoformat()
+        hist = tk.history(start=start_str, interval="1d")
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            return []
+        closes = hist["Close"]
+        session_dates = [i.date() for i in closes.index]
+        reactions: list[float] = []
+        for announce_ts in past:
+            target_date = announce_ts.date()
+            try:
+                first_after_pos = next(
+                    i for i, d in enumerate(session_dates) if d >= target_date
+                )
+            except StopIteration:
+                continue
+            if first_after_pos < 1:
+                continue
+            try:
+                c_after = float(closes.iloc[first_after_pos])
+                c_before = float(closes.iloc[first_after_pos - 1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if c_before <= 0:
+                continue
+            reactions.append((c_after / c_before - 1.0) * 100.0)
+        return reactions[-depth:]
+    except Exception:
+        return []
+
+
+@app.route("/api/earnings-shock")
+@swr_cached("earnings-shock", 300.0)
+def earnings_shock_api():
+    """Pre-earnings dollarized 1σ shock for each HELD position with an
+    imminent print. The forward $-at-risk complement to /api/event-calendar
+    (which tells WHICH name reports WHEN but does not dollarize the gap
+    against the current book).
+
+    Composes ``build_event_calendar`` for the held set verbatim (single
+    source of truth, AGENTS.md #10) so this endpoint and the prompt block
+    can never disagree on what counts as held-imminent. Per-name history is
+    pulled live from yfinance (``_earnings_history_for``); the builder is
+    pure and the I/O seam degrades each row honestly to
+    INSUFFICIENT_HISTORY on a yfinance miss. Observational only — never
+    gates Opus, never injected into the decision prompt (AGENTS.md
+    #2/#12 — the ``stress_scenarios`` / ``recovery`` precedent).
+
+    SWR-cached 5 min: yfinance earnings_dates + 3y history is the slowest
+    per-call yfinance shape we touch (~1-3 s per name); a 5-min TTL
+    matches /api/source-edge / /api/sector-heatmap cadence."""
+    try:
+        from .analytics.earnings_shock import build_earnings_shock
+        from .analytics.event_calendar import build_event_calendar
+        store = get_store()
+        pf = store.get_portfolio()
+        positions = store.open_positions()
+        try:
+            from .strategy import WATCHLIST as _WATCHLIST
+            watch = {t.upper() for t in _WATCHLIST}
+        except Exception:
+            watch = set()
+        held = {(p.get("ticker") or "").upper()
+                for p in positions if p.get("ticker")}
+        ec = build_event_calendar(positions, held | watch)
+        result = build_earnings_shock(
+            positions,
+            float(pf.get("total_value") or 0.0),
+            ec,
+            history_provider=_earnings_history_for,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/macro-calendar")
 def macro_calendar_api():
     """The exact forward FOMC rate-decision awareness block the live trader
@@ -10109,6 +10224,13 @@ def _swr_prewarm():
         ("scorer-opportunities", scorer_opportunities_api),
         ("scorer-portfolio-attribution", scorer_portfolio_attribution_api),
         ("trade-attribution", trade_attribution_api),
+        # earnings-shock @swr_cached 300s — yfinance earnings_dates + 3y daily
+        # history is the slowest per-name yfinance shape we touch (~1-3s per
+        # held name). Without a prewarm the first user poll cold-stalls into
+        # {"warming": true} exactly when the operator is checking pre-print
+        # risk; the prewarm==@swr_cached invariant (test_swr_prewarm_coverage)
+        # requires it here too.
+        ("earnings-shock", earnings_shock_api),
     ]
     for name, wrapper in targets:
         try:
