@@ -660,6 +660,84 @@ def _stress_line(store) -> str:
         return ""
 
 
+def _earnings_shock_line(store) -> str:
+    """One-line pre-earnings $-at-risk-by-position summary for the hourly /
+    daily report.
+
+    ``/api/event-calendar`` already tells the live trader WHICH held name
+    reports WHEN (the prompt block, fed into Opus). But the operator who
+    lives in Discord has never seen that surface — there is no event-
+    calendar reporter line. So today a 44 %-of-book NVDA position into
+    tomorrow's earnings is invisible to the desk's hourly/daily report,
+    even though every analytics block here is built around closing exactly
+    that "what's the hidden risk?" gap.
+
+    Composes ``build_earnings_shock`` over ``build_event_calendar`` with
+    ``history_provider=None`` (the **Discord-path no-network discipline**;
+    the ``_stress_line`` / ``_recovery_line`` precedent — yfinance is the
+    documented per-call latency/hang hazard, and a hung reporter call
+    drops the WHOLE Discord summary). That makes every row read
+    ``INSUFFICIENT_HISTORY`` at the σ level; the full σ figure is served
+    by ``/api/earnings-shock`` (which pays the yfinance call once and
+    SWR-caches 5 min) and re-surfaced in the digital-intern chat
+    enrichment. Here the value-add is the **awareness + dollarized
+    exposure** — even without σ, "NVDA in 0.9d ($444.70 = 44.5 % of book)"
+    is the heads-up the Discord operator currently has zero of.
+
+    Single source of truth (invariant #10): the held set + days_away come
+    from ``build_event_calendar`` (the canonical earnings tier source),
+    and the dollarized exposure mirrors ``stress_scenarios``'s position-
+    value semantics (option ×100, price falls back avg_cost) via the
+    builder's ``_position_value`` helper. Observational only, no caps,
+    never gates (invariants #2/#12 — the ``_stress_line`` precedent).
+
+    NO_DATA (no priced book) and NO_EVENTS (calendar quiet) are
+    suppressed (the ``_hold_discipline_line`` no-noise precedent — the
+    summary must never become its own lying green light). Failure
+    contract mirrors the rest of ``reporter``: any builder/store fault
+    degrades to ``""`` ("no earnings-shock line this report"), **never**
+    an exception ("no Discord summary this report")."""
+    try:
+        from .analytics.earnings_shock import build_earnings_shock
+        from .analytics.event_calendar import build_event_calendar
+        pf = store.get_portfolio()
+        positions = store.open_positions()
+        held = {(p.get("ticker") or "").upper()
+                for p in positions if p.get("ticker")}
+        ec = build_event_calendar(positions, held)
+        es = build_earnings_shock(
+            positions,
+            float(pf.get("total_value") or 0.0),
+            ec,
+            history_provider=None,
+        )
+        if not isinstance(es, dict) or es.get("state") in (None, "NO_DATA", "NO_EVENTS"):
+            return ""
+        events = es.get("events") or []
+        if not events:
+            return ""
+        per_event = []
+        for e in events:
+            days = e.get("days_to_earnings")
+            tk = e.get("ticker")
+            wt = e.get("weight_pct")
+            cv = e.get("current_value_usd")
+            if days is None or tk is None or wt is None or cv is None:
+                continue
+            per_event.append(
+                f"{tk} in {days:.1f}d (${cv:.2f} = {wt:.1f}% of book)"
+            )
+        if not per_event:
+            return ""
+        body = " · ".join(per_event)
+        return ("**PRE-EARNINGS RISK** ◈ held names with imminent prints "
+                "(σ figure in /api/earnings-shock)\n"
+                f"{body}")
+    except Exception as e:
+        print(f"[reporter] earnings shock line skipped: {e}")
+        return ""
+
+
 def _recovery_line(store) -> str:
     """One-line "what does it take to get back to even?" for the hourly /
     daily report.
@@ -1465,6 +1543,9 @@ def send_hourly_summary() -> bool:
     stx = _stress_line(store)
     if stx:
         body += "\n" + stx
+    esx = _earnings_shock_line(store)
+    if esx:
+        body += "\n" + esx
     rcx = _recovery_line(store)
     if rcx:
         body += "\n" + rcx
@@ -1562,6 +1643,9 @@ def send_daily_close() -> bool:
     stx = _stress_line(store)
     if stx:
         body += "\n" + stx
+    esx = _earnings_shock_line(store)
+    if esx:
+        body += "\n" + esx
     rcx = _recovery_line(store)
     if rcx:
         body += "\n" + rcx
