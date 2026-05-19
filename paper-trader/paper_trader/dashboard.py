@@ -10286,5 +10286,174 @@ def equity_freshness_api():
         return jsonify({"error": str(e), "verdict": "ERROR"}), 500
 
 
+# ───────── News velocity (2026-05-18, agent 4) ─────────
+# Appended at the tail of the route section (not interleaved) so a concurrent
+# review pass editing existing endpoints doesn't collide on merge — mirrors
+# the `/api/decision-reliability` / `/api/funded-suggestions` placement.
+
+
+def _stock_tickers_from_positions(positions: list[dict]) -> list[str]:
+    """Held-book stock side only. Option lots reuse the underlying ticker,
+    so a stock-or-option NVDA position bucketed once. Pseudo-tickers
+    (CASH/NONE/empty — the ``_parse_action_ticker`` carve-out, AGENTS.md
+    invariant #11) excluded."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in positions or []:
+        tk = (p.get("ticker") or "").upper().strip()
+        if not tk or tk in {"CASH", "NONE", "NO_DECISION", "BLOCKED"}:
+            continue
+        if tk in seen:
+            continue
+        seen.add(tk)
+        out.append(tk)
+    return out
+
+
+@app.route("/api/news-velocity")
+def news_velocity_api():
+    """Per-held-ticker news-flow velocity — is the catalyst BUILDING or
+    FADING? Compares the article rate over the last ``window_hours``
+    (default 24h) to a non-overlapping ``baseline_hours`` (default 168h)
+    baseline and emits a Poisson-style z-score + state ladder
+    (SURGING / STABLE / FADING / INSUFFICIENT / NO_DATA).
+
+    Reads the digital-intern articles.db through the SAME freshness-aware
+    ``_articles_db_path()`` the other news-analytics endpoints use
+    (``signals._db_path()``, invariant #17 — no split-brain feed). Live-only
+    clause applied (AGENTS.md invariant #3); the pure ``build_news_velocity``
+    composes the verdict on already-decompressed rows so it is unit-testable
+    without a DB.
+
+    Query params (clamped):
+      * ``window_hours`` — 1..72, default 24
+      * ``baseline_hours`` — must exceed window, capped at 720 (30d),
+        default 168 (7d)
+      * ``tickers`` — comma-separated override; default = open held stock
+        tickers from ``store.open_positions()``
+
+    Observational only — never gates Opus, no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.news_velocity import build_news_velocity
+
+        try:
+            window_h = float(request.args.get("window_hours", 24.0))
+        except Exception:
+            window_h = 24.0
+        window_h = max(1.0, min(window_h, 72.0))
+
+        try:
+            baseline_h = float(request.args.get("baseline_hours", 168.0))
+        except Exception:
+            baseline_h = 168.0
+        baseline_h = max(window_h + 1.0, min(baseline_h, 720.0))
+
+        override = (request.args.get("tickers") or "").strip()
+        if override:
+            held = [t.strip().upper() for t in override.split(",") if t.strip()]
+        else:
+            store = get_store()
+            held = _stock_tickers_from_positions(store.open_positions())
+
+        now_utc = datetime.now(timezone.utc)
+        if not held:
+            return jsonify(build_news_velocity([], [], now=now_utc,
+                                               window_hours=window_h,
+                                               baseline_hours=baseline_h))
+
+        path = _articles_db_path()
+        if path is None:
+            return jsonify({
+                "as_of": now_utc.isoformat(timespec="seconds"),
+                "state": "NO_DATA",
+                "headline": "News velocity: articles.db not found.",
+                "window_hours": window_h,
+                "baseline_hours": baseline_h,
+                "n_held": len(held),
+                "n_with_data": 0,
+                "per_ticker": [],
+            })
+
+        # Split the fetch into a window + baseline pair. The live articles.db
+        # ingests ~thousands of rows/day (observed 2026-05-18: 1.47M live rows
+        # in last 7d) so a single ORDER BY first_seen DESC LIMIT N pull
+        # returns ONLY window-era rows on a high-throughput day — collapsing
+        # every baseline count to 0 and forcing INSUFFICIENT everywhere.
+        #
+        # Baseline pre-filter is pushed to SQL via a per-ticker LIKE union:
+        # most articles don't mention any held ticker by symbol, so the
+        # SQL-side filter drops the scan from ~hundreds-of-thousands of rows
+        # to a few thousand before Python regex refinement (a naive
+        # ORDER-by-first_seen Python-side scan reads ~40s on a 60k LIMIT;
+        # the LIKE-prefilter version is well under 1s). SQLite LIKE is
+        # case-insensitive for ASCII by default — exactly what we need to
+        # catch ``NVDA``/``nvda``/``Nvda`` in titles. Word-boundary refinement
+        # (so AMD does NOT alias AMDOCS) happens inside ``build_news_velocity``
+        # via the compiled regex.
+        window_since = (now_utc - timedelta(hours=window_h)).isoformat()
+        baseline_since = (now_utc - timedelta(hours=baseline_h)).isoformat()
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            window_rows = conn.execute(
+                "SELECT title, full_text, ai_score, urgency, first_seen "
+                "FROM articles WHERE first_seen >= ? "
+                "AND url NOT LIKE 'backtest://%' "
+                "AND source NOT LIKE 'backtest_%' "
+                "AND source NOT LIKE 'opus_annotation%' "
+                "ORDER BY first_seen DESC LIMIT 8000",
+                (window_since,),
+            ).fetchall()
+            like_clauses = " OR ".join(["title LIKE ?"] * len(held))
+            like_params = [f"%{t}%" for t in held]
+            baseline_rows = conn.execute(
+                f"SELECT title, ai_score, urgency, first_seen "
+                f"FROM articles WHERE first_seen >= ? AND first_seen < ? "
+                f"AND ({like_clauses}) "
+                f"AND url NOT LIKE 'backtest://%' "
+                f"AND source NOT LIKE 'backtest_%' "
+                f"AND source NOT LIKE 'opus_annotation%' "
+                f"ORDER BY first_seen DESC LIMIT 20000",
+                [baseline_since, window_since] + like_params,
+            ).fetchall()
+        finally:
+            conn.close()
+
+        articles: list[dict] = []
+        for r in window_rows:
+            body = ""
+            if r["full_text"]:
+                try:
+                    body = zlib.decompress(r["full_text"]).decode(
+                        "utf-8", errors="replace")
+                except Exception:
+                    body = ""
+            articles.append({
+                "title": r["title"] or "",
+                "body": body,
+                "first_seen": r["first_seen"],
+                "ai_score": r["ai_score"],
+                "urgency": r["urgency"],
+            })
+        for r in baseline_rows:
+            articles.append({
+                "title": r["title"] or "",
+                "body": "",
+                "first_seen": r["first_seen"],
+                "ai_score": r["ai_score"],
+                "urgency": r["urgency"],
+            })
+
+        result = build_news_velocity(
+            articles, held, now=now_utc,
+            window_hours=window_h, baseline_hours=baseline_h,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR",
+                        "per_ticker": []}), 500
+
+
 if __name__ == "__main__":
     run()
