@@ -339,19 +339,19 @@ class TestEndpoint:
     output without 500, with query-param clamping."""
 
     def _setup_app(self, monkeypatch):
-        from paper_trader import dashboard as d, store as s_module
-        # Use the actual Flask test client against a private fresh-store
-        # (no live DB writes).
-        from paper_trader.store import _connect
+        """Wire the Flask app to a pure in-memory stub Store.
 
-        class _FreshStore:
+        CRITICAL: do NOT call ``store._connect()`` here — that opens the
+        LIVE ``data/paper_trader.db`` (DB_PATH is read at module level,
+        not from any monkeypatched fixture) and any DDL/DML against it
+        WIPES production decisions. The endpoint only needs
+        ``recent_decisions`` so a pure list stub is correct and safe.
+        """
+        from paper_trader import dashboard as d
+
+        class _StubStore:
             def __init__(self):
-                self.conn = _connect()
-                import threading as _t
-                self._lock = _t.Lock()
-                self.conn.execute("DELETE FROM decisions")
-                self.conn.commit()
-                self._decisions = []
+                self._decisions: list[dict] = []
 
             def recent_decisions(self, limit: int = 20):
                 return list(self._decisions[:limit])
@@ -359,7 +359,7 @@ class TestEndpoint:
             def seed(self, decs):
                 self._decisions = list(decs)
 
-        store = _FreshStore()
+        store = _StubStore()
         monkeypatch.setattr(d, "get_store", lambda: store)
         return d.app, store
 
