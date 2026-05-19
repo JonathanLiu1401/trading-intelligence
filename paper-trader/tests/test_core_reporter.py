@@ -2347,15 +2347,51 @@ class TestConcentrationLine:
         })
         assert reporter._concentration_line(fresh_store) == ""
 
-    def test_silent_when_insufficient(self, fresh_store, monkeypatch):
-        # INSUFFICIENT (no correlatable history yet — the live decide()
-        # path with no price_history) → silent. The risk_mirror prompt block
-        # uses weight-based fallback; this Discord line stays quiet.
+    def test_surfaces_when_insufficient_but_top_weight_dominates(
+            self, fresh_store, monkeypatch):
+        # INSUFFICIENT state (no price_history supplied — the live no-network
+        # Discord path) but top_weight_pct ≥ DOMINANT_WEIGHT (60%) → surface
+        # using the weight-based fallback synthesis. This is the
+        # discriminating path versus the OK-state verbatim-headline branch:
+        # the same SINGLE_NAME_RISK condition must still reach Discord even
+        # when the builder's own verdict is None (no correlation history yet).
         self._stub(monkeypatch, {
             "state": "INSUFFICIENT", "verdict": None,
             "headline": "correlation verdict withheld.",
             "top_weight_pct": 75.0, "top_weight_ticker": "NVDA",
+            "n_stock_positions": 2, "effective_positions_naive": 1.6,
+        })
+        line = reporter._concentration_line(fresh_store)
+        assert line.startswith("⚠️ **CONCENTRATION** ◈ SINGLE_NAME_RISK")
+        # Builder's buried "verdict withheld" line must NOT leak through —
+        # we synthesise our own one-liner from the same structured fields
+        # the OK-headline reads (the risk_mirror weight-based fallback
+        # precedent).
+        assert "verdict withheld" not in line
+        assert "NVDA is 75% of a 2-name stock book" in line
+        assert "1.6 effective name(s)" in line
+
+    def test_silent_when_insufficient_and_top_weight_below_threshold(
+            self, fresh_store, monkeypatch):
+        # INSUFFICIENT (no price_history) AND top_weight_pct < 60% →
+        # silent. The threshold is the same builder constant
+        # ``DOMINANT_WEIGHT`` (0.60) so the no-history and OK-state paths
+        # land on the same SINGLE_NAME_RISK gate.
+        self._stub(monkeypatch, {
+            "state": "INSUFFICIENT", "verdict": None,
+            "headline": "correlation verdict withheld.",
+            "top_weight_pct": 55.0, "top_weight_ticker": "NVDA",
             "n_stock_positions": 2,
+        })
+        assert reporter._concentration_line(fresh_store) == ""
+
+    def test_silent_when_top_weight_unparseable(self, fresh_store, monkeypatch):
+        # Defensive: a non-numeric top_weight_pct (future builder bug)
+        # degrades silently rather than crashing the comparison.
+        self._stub(monkeypatch, {
+            "state": "OK", "verdict": "SINGLE_NAME_RISK",
+            "headline": "single name risk", "top_weight_pct": "not a number",
+            "top_weight_ticker": "NVDA", "n_stock_positions": 2,
         })
         assert reporter._concentration_line(fresh_store) == ""
 
@@ -2383,17 +2419,21 @@ class TestConcentrationLine:
         assert "NVDA is 75% of the book" in line
         assert "1.18 effective independent bet" in line
 
-    def test_silent_when_headline_empty(self, fresh_store, monkeypatch):
-        # Belt-and-suspenders: a SINGLE_NAME_RISK verdict with no headline
-        # (defensive against a future builder bug) stays silent rather than
-        # emitting a half-formed block.
+    def test_synthesises_block_when_headline_empty(
+            self, fresh_store, monkeypatch):
+        # OK verdict + SINGLE_NAME_RISK + missing headline (defensive against
+        # a future builder bug): fall through to the same weight-based
+        # synthesis path the INSUFFICIENT branch uses, so the operator still
+        # sees the concentration alarm.
         self._stub(monkeypatch, {
             "state": "OK", "verdict": "SINGLE_NAME_RISK",
             "headline": "",
             "top_weight_pct": 75.0, "top_weight_ticker": "NVDA",
-            "n_stock_positions": 2,
+            "n_stock_positions": 2, "effective_positions_naive": 1.6,
         })
-        assert reporter._concentration_line(fresh_store) == ""
+        line = reporter._concentration_line(fresh_store)
+        assert line.startswith("⚠️ **CONCENTRATION** ◈ SINGLE_NAME_RISK")
+        assert "NVDA is 75% of a 2-name stock book" in line
 
     def test_degrades_to_empty_on_non_dict(self, fresh_store, monkeypatch):
         self._stub(monkeypatch, None)
@@ -2555,3 +2595,30 @@ class TestConcentrationLine:
         # No concentration block but the summary itself shipped.
         assert "**CONCENTRATION**" not in captured[0]
         assert "**HOURLY**" in captured[0]
+
+    def test_calls_real_build_correlation_with_correct_signature(
+            self, fresh_store):
+        """Regression lock: a previous version of this code called
+        ``build_correlation(sized)`` with ONE positional arg, but the
+        builder requires ``(positions, price_history)``. Every monkeypatch
+        test above happened to mask the TypeError because their lambdas
+        accept ``*a, **k`` — so the broken-signature regression was caught
+        ONLY by live validation (the line silently returned "" every cycle).
+        This test exercises the REAL builder end-to-end with a 75%-NVDA
+        book — exactly the live 2026-05-19 shape — and asserts the line
+        renders, so a future signature drift fails loudly in CI rather
+        than silently dropping the Discord block."""
+        # Seed a clearly-SINGLE_NAME_RISK book (NVDA 75% / TQQQ 25%).
+        fresh_store.upsert_position("NVDA", "stock", 3, 250.0)   # $750
+        fresh_store.upsert_position("TQQQ", "stock", 5, 50.0)    # $250
+        # Update marks so build_correlation receives positive market_value.
+        marks = {p["id"]: (p["avg_cost"], 0.0)
+                 for p in fresh_store.open_positions()}
+        fresh_store.update_position_marks(marks)
+        # Real builder, no monkeypatch. price_history={} ⇒ INSUFFICIENT
+        # state with verdict=None, but top_weight_pct=75 ≥ 60 trips the
+        # weight-based fallback path.
+        line = reporter._concentration_line(fresh_store)
+        assert "**CONCENTRATION** ◈ SINGLE_NAME_RISK" in line
+        assert "NVDA" in line
+        assert "75% of a 2-name stock book" in line
