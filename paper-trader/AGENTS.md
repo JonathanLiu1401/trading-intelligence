@@ -7032,3 +7032,174 @@ Full new suite: **66/66 green**. Adjacent endpoint suites
 green — no neighbor regressions.
 
 *Feature-dev pass appended 2026-05-19. Prior content above is unmodified.*
+
+## Review pass #31 — paper-trader core hybrid (2026-05-19)
+
+Single HYBRID agent on the core surface (`runner.py`, `reporter.py`,
+`signals.py`, `strategy.py`, `dashboard.py`, `market.py`, `store.py`).
+Two real-bug fix commits + one trader-useful feature.
+
+### Phase 1 fixes (commit 2db36ef)
+
+Three regressions where a single malformed input crashed the live
+trader's `decide()` cycle (no decision row, no equity point logged)
+instead of recording a clean BLOCKED:
+
+1. **`strategy._execute(BUY_CALL / BUY_PUT / SELL_CALL / SELL_PUT)`** —
+   an unguarded `float(strike)` raised `ValueError` when Claude emitted
+   `strike="ATM"` / `"ITM"` (a description rather than a number).
+   Strike is now coerced under `try` / `except` once, reused (no second
+   `float()` later that could re-raise); a non-numeric strike returns
+   `BLOCKED` with the offending value in the detail.
+2. **`strategy._enforce_risk_pre_trade`** — same unguarded `float()` on
+   a non-numeric `qty` (`"all"` / `"half"`). Defensive: `_execute`
+   already coerces before calling this helper, but a direct call (or
+   test, or future refactor) would otherwise abort `decide()` with an
+   uncaught `ValueError`. Returns `(False, "qty not numeric: …")` now.
+3. **`signals._maybe_warn_stale`** — when one stale-feed sibling's
+   `first_seen` was non-`None` but unparseable, `_age_hours` returned
+   `None` and the `{age:.1f}h` format raised `TypeError` — the warn
+   diagnostics line could take down `decide()`. The composer now
+   silently skips a sibling with no usable age while still emitting
+   the warning for the chosen feed.
+
+4 new tests cover each path:
+- `tests/test_core_strategy.py::TestExecuteBuyCall::test_buy_call_blocked_on_non_numeric_strike`
+- `tests/test_core_strategy.py::TestExecuteBuyCall::test_sell_call_blocked_on_non_numeric_strike`
+- `tests/test_core_strategy.py::TestEnforceRiskPreTrade::test_non_numeric_qty_blocks_cleanly_not_crashes`
+- `tests/test_core_signals.py::TestFeedStatusAndWarn::test_unparseable_other_timestamp_does_not_crash`
+
+### Phase 2 feature — trade-alert immediate book impact (commit c181e7d)
+
+`reporter.send_trade_alert(trade, snapshot=None, store=None)` now
+appends a `post: …` line summarising what the fill just did to the
+book, the trader's #1 follow-up question after every alert:
+
+```
+**TRADE** `BUY` `NVDA`
+qty `2.0` @ `$222.35` = `$444.70`
+_Pre-earnings asymmetric setup; ~44% conviction sizing_
+post: NVDA now 44.5% of book · cash $555.30
+```
+
+```
+**TRADE** `SELL` `MU`
+qty `5` @ `$120.00` = `$600.00`
+_taking profits_
+post: realized $+100.00 (+20.0%) · held 2.3d · cash $1100.00
+```
+
+- **BUY**: post-trade lot weight (per option leg, not aggregated by
+  ticker) + remaining cash.
+- **SELL (full close)**: realized $ P/L and pct from the single source
+  of truth (`build_round_trips`), hold duration, cash. Cannot drift
+  from the daily-close round-trip line.
+- **SELL (partial close)**: never invents a P/L figure — falls back to
+  `partial — NVDA still X% of book · cash $Y`.
+- **Backwards-compatible**: callers passing only `trade` get the
+  byte-compatible body. `runner._cycle()` now passes the post-trade
+  snapshot from `strategy.decide()` + the store.
+
+Failure contract mirrors the rest of `reporter`: any
+snapshot/store/builder fault degrades to `""` ("no impact line on this
+alert"), never an exception ("no trade alert this fill"). A missing
+snapshot or non-positive `total_value` returns `""` so a flat / empty
+book never emits a misleading `0.0% of book` token.
+
+12 new tests cover both action paths, the option-lot label, partial
+close fallback, snapshot=None backward-compat, and the
+`_hold_str_from_days` bucket boundaries (`tests/test_core_reporter.py
+::TestTradeAlertImpactLine`, `tests/test_core_reporter.py
+::TestSendTradeAlert::test_no_impact_line_when_snapshot_missing`).
+
+### Phase 3 live-validation findings
+
+Probed the running system at `:8090` while the runner was on commit
+`c181e7d` (git-watcher restarted onto the new code mid-session):
+
+- **Heartbeat HEALTHY**, last decision 5m ago — within the 60m
+  market-closed cadence; `restart_recommended=false`.
+- **`decision_efficacy` DEGRADED** at 79% NO_DECISION across last
+  14 cycles, traceable to the documented #1 pathology: host
+  saturation (5 concurrent Opus, mem 6.3GB available, swap 70%). The
+  pre-flight `host_saturated` guard correctly records distinct
+  `"skipped claude call — host saturated"` reasons — these stay out
+  of the "claude returned no response" empty-timeout bucket
+  (`/api/empty-claude-rate` is honest).
+- **Equity FRESH**: live $1000.00 (portfolio table) agrees with the
+  recorded equity-curve point (5m old); benchmark/drawdown/Sharpe
+  headlines are trustworthy.
+- **NVDA position**: 2 sh @ $222.35 = $444.70 (44.5% of book),
+  cash $555.30, total exactly $1000.00 (Opus's pre-earnings setup).
+- **Position attention**: NVDA `FRESH`, 0.5h since last Opus look.
+- **Reports flowing**: `runner_state.json` shows the hourly was sent
+  within the last minute and yesterday's daily-close marker is set.
+- **Singleton lock working**: runner.log shows several
+  `another paper trader is already running (pid=…); refusing to
+  start a second trader` rejects — the singleton fcntl guard is
+  doing its job under systemd-Restart=always pressure (the known
+  benign spam — `pt-systemd-vs-manual-restart-spam` memory note).
+- **Live verification of the new alert path**: ran
+  `send_trade_alert` against the real BUY NVDA trade with a
+  hand-constructed post-trade snapshot — body included
+  `post: NVDA now 44.5% of book · cash $555.30` exactly as designed.
+
+#### Unrelated findings (not in this commit)
+
+- **2 pre-existing test failures**:
+  `tests/test_earnings_distribution.py::test_downside_worst_dollar_is_negative_when_worst_is_negative`
+  and
+  `tests/test_swr_prewarm_coverage.py::test_every_swr_cached_endpoint_is_prewarmed`.
+  Both reference a sibling agent's incomplete uncommitted work
+  (`paper_trader/analytics/earnings_distribution.py` is untracked
+  on this tree, dashboard.py has an uncommitted
+  `/api/earnings-distribution` route, prewarm list not yet updated).
+  Not from this pass; sibling's commit will fix them.
+- **GOOGU/METAU yfinance 404s in `logs/runner.log`** still appear
+  occasionally — they were removed from `strategy.WATCHLIST` in a
+  prior pass but still live in `backtest.py::WATCHLIST` and
+  `dashboard.py::SECTOR_MAP`. The dead-cache (`_DEAD_CACHE` /
+  `_DEAD_TTL=300s`) suppresses repeated requests for live trading,
+  so it's noise-not-bug — but worth cleaning in a future pass.
+
+### How to run
+
+```bash
+# Live trader (foreground)
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.runner
+
+# Or via systemd
+systemctl --user start paper-trader
+
+# Core tests (this pass's surface — ~30s)
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_core_store.py tests/test_core_market.py \
+                  tests/test_core_signals.py tests/test_core_strategy.py \
+                  tests/test_core_runner.py tests/test_core_runner_cycle.py \
+                  tests/test_core_reporter.py
+
+# Full suite (~80s, may show 2 pre-existing sibling failures
+# noted in "Unrelated findings" above)
+python3 -m pytest tests/
+
+# Final import check
+python3 -c "from paper_trader import signals, reporter, strategy; print('OK')"
+```
+
+### Invariants reaffirmed by this pass
+
+- **`decide()` must never crash on a malformed Claude decision** —
+  every field-coercion is `try/except`-guarded; a non-numeric
+  qty/strike returns `BLOCKED`, never raises. Tests lock the
+  contract for both BUY and SELL legs of options.
+- **Reporter additive contract** — any analytics-block fault drops
+  the affected one-liner, never the whole Discord summary. The new
+  `_trade_impact_line` follows the same rule (any fault → `""`).
+- **Single source of truth for realized P/L** (invariant #10):
+  the trade-alert impact line composes `build_round_trips`
+  verbatim — the daily-close round-trip line and the alert can
+  never disagree.
+- **No new caps / gates** (invariants #2 / #12): the impact line
+  is observational, never blocks an alert, never injects into
+  the decision prompt.
