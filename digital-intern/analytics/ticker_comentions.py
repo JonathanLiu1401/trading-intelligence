@@ -18,6 +18,7 @@ from itertools import combinations
 from pathlib import Path
 
 from analytics.trend_velocity import extract_tickers, _parse_ts
+from storage.article_store import _LIVE_ONLY_CLAUSE
 
 DB_PATH = Path(__file__).resolve().parents[1] / "data" / "articles.db"
 OUT_PATH = Path("/home/zeph/logs/ticker_comentions.json")
@@ -30,9 +31,12 @@ MIN_PAIR_COUNT = 2
 def main() -> int:
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=20)
     conn.execute("PRAGMA query_only=ON")
+    # Canonical `_LIVE_ONLY_CLAUSE` — a partial `source NOT LIKE 'backtest_run_%'`
+    # leaks `backtest://` URLs and `opus_annotation*` synthetic rows into the
+    # co-mention graph, inflating pair counts with training-only artefacts.
     rows = conn.execute(
         "SELECT first_seen, title FROM articles "
-        "WHERE source NOT LIKE 'backtest_run_%' "
+        f"WHERE {_LIVE_ONLY_CLAUSE} "
         "ORDER BY first_seen DESC LIMIT ?",
         (FETCH_LIMIT,),
     ).fetchall()

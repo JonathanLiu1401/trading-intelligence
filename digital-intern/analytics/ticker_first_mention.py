@@ -18,6 +18,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from storage.article_store import _LIVE_ONLY_CLAUSE
+
 DB_PATH = Path(__file__).resolve().parents[1] / "data" / "articles.db"
 OUT_PATH = Path("/home/zeph/logs/ticker_first_mention.json")
 MENTION_WINDOW_MIN = 60
@@ -64,10 +66,14 @@ def run() -> dict:
 
     con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10)
     con.execute("PRAGMA busy_timeout=10000")
+    # Canonical `_LIVE_ONLY_CLAUSE` — synthetic backtest/opus rows carry
+    # tickers in their title (the same tickers as live news) and would otherwise
+    # mask a genuinely cold-start "first mention" by appearing in the LOOKBACK
+    # history window.
     rows = con.execute(
         "SELECT first_seen, title, source, url, ml_score "
         "FROM articles "
-        "WHERE source NOT LIKE 'backtest_run_%' "
+        f"WHERE {_LIVE_ONLY_CLAUSE} "
         "ORDER BY rowid DESC LIMIT ?",
         (FETCH_LIMIT,),
     ).fetchall()

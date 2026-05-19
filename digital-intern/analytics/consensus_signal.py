@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from analytics.trend_velocity import _parse_ts, extract_tickers
+from storage.article_store import _LIVE_ONLY_CLAUSE
 
 DB_PATH = Path(__file__).resolve().parents[1] / "data" / "articles.db"
 OUT_PATH = Path("/home/zeph/logs/strong_consensus.jsonl")
@@ -74,9 +75,13 @@ def main() -> int:
     since = (datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
+    # Canonical `_LIVE_ONLY_CLAUSE` — backtest replay rows carry ai_score=5.0
+    # (BUY winner) and stack into the same ticker, which would otherwise fake
+    # a "strong consensus" signal entirely from synthetic training data. Same
+    # drift class as the source_diversity / trend_velocity fixes.
     cur = conn.execute(
         "SELECT first_seen, title, source, ai_score FROM articles INDEXED BY idx_first_seen "
-        "WHERE first_seen >= ? AND source NOT LIKE 'backtest_run_%' "
+        f"WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE} "
         "ORDER BY first_seen DESC LIMIT ?",
         (since, FETCH_LIMIT),
     )

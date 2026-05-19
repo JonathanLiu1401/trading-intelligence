@@ -10,6 +10,8 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from storage.article_store import _LIVE_ONLY_CLAUSE
+
 DB = Path(__file__).resolve().parents[1] / "data" / "articles.db"
 OUT = Path("/home/zeph/logs/daily_digest.txt")
 TOP_N = 5
@@ -30,23 +32,28 @@ def compute():
     conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     cutoff = f"-{WINDOW_HOURS} hours"
+    # Canonical `_LIVE_ONLY_CLAUSE` — the `urgency >= 2` predicate currently
+    # masks the bug (synthetic rows are inserted with urgency=0) but the
+    # partial filter is the same drift class as elsewhere; future change to
+    # the backtest replay loop that sets a non-zero urgency would silently
+    # pollute the digest. Both `total_real` and the digest read get the fix.
     rows = conn.execute(
-        """
+        f"""
         SELECT id, title, source, url, urgency, ai_score, ml_score, kw_score, first_seen
           FROM articles
          WHERE id IN (SELECT id FROM articles ORDER BY id DESC LIMIT ?)
            AND urgency >= 2
-           AND source NOT LIKE 'backtest_run_%'
+           AND {_LIVE_ONLY_CLAUSE}
            AND datetime(replace(first_seen,'T',' ')) >= datetime('now', ?)
         """,
         (SCAN_LIMIT, cutoff),
     ).fetchall()
 
     total_real = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) FROM articles
          WHERE id IN (SELECT id FROM articles ORDER BY id DESC LIMIT ?)
-           AND source NOT LIKE 'backtest_run_%'
+           AND {_LIVE_ONLY_CLAUSE}
            AND datetime(replace(first_seen,'T',' ')) >= datetime('now', ?)
         """,
         (SCAN_LIMIT, cutoff),

@@ -11,6 +11,8 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from storage.article_store import _LIVE_ONLY_CLAUSE
+
 DB = Path(__file__).resolve().parents[1] / "data" / "articles.db"
 OUT = Path("/home/zeph/logs/collection_quality.json")
 SCAN_LIMIT = 8000
@@ -20,12 +22,16 @@ MIN_PER_SOURCE = 3
 def compute():
     conn = sqlite3.connect(str(DB))
     conn.execute("PRAGMA busy_timeout=5000")
+    # Canonical `_LIVE_ONLY_CLAUSE` — synthetic backtest replay and
+    # opus-annotation rows carry their own ai_score / urgency values and would
+    # inflate per-source averages with training-pool magnitudes if they leaked
+    # through the partial `source NOT LIKE 'backtest_run_%'` filter.
     rows = conn.execute(
-        """
+        f"""
         SELECT source, ai_score, ml_score, urgency
           FROM articles
          WHERE id IN (SELECT id FROM articles ORDER BY id DESC LIMIT ?)
-           AND source NOT LIKE 'backtest_run_%'
+           AND {_LIVE_ONLY_CLAUSE}
         """,
         (SCAN_LIMIT,),
     ).fetchall()
