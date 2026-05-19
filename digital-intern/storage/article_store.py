@@ -1141,6 +1141,65 @@ class ArticleStore:
         return {"total": total, "urgent": urgent}
 
     @_retry_on_lock
+    def urgency_label_split(self, hours: int = 24) -> dict:
+        """Per-``score_source`` breakdown of urgent rows in the last ``hours``.
+
+        The analyst-facing calibration metric the dashboard was missing: of all
+        urgency>=1 rows the alerter saw in the window, what fraction carry a
+        real LLM ground-truth label vs only a model self-prediction? Live
+        evidence (2026-05-19): every single urgency>=1 row alerted/marked in
+        the last 6h had ``ai_score=0`` (so ``score_source='ml'`` — model-only,
+        unverified) — exactly the case the alert prompt's "[unverified —
+        model-only urgent]" calibration tag exists to hedge per-row, but with
+        nothing exposing the aggregate fact at a glance. A persistent
+        ``llm_fraction`` near zero means the Sonnet urgency_scorer path is
+        either dark, quota-throttled, or flooring everything to noise — the
+        analyst's standalone-push channel is being fed by a single (over-
+        confident) head and they should know.
+
+        Returns ``{"window_h": int, "total": int, "by_source": {"llm": N,
+        "ml": N, "briefing_boost": N, "null": N}, "llm_fraction": float}``.
+        ``llm_fraction`` = ``(llm + briefing_boost) / total`` (the two
+        ground-truth tags), 0.0 when ``total == 0``. ``null`` covers the
+        legacy pre-migration rows still without an explicit tag.
+
+        Read-only (single GROUP BY SELECT) with ``_LIVE_ONLY_CLAUSE`` so the
+        synthetic backtest/opus injection rows never inflate either side.
+        Decorated with ``@_retry_on_lock`` like every other reader for the
+        documented shared-connection cursor-collision class. NO DB write,
+        no ai_score/ml_score/score_source/urgency mutation — all four
+        load-bearing invariants intact by construction.
+        """
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        rows = self.conn.execute(
+            "SELECT score_source, COUNT(*) FROM articles "
+            f"WHERE urgency>=1 AND first_seen >= ? AND {_LIVE_ONLY_CLAUSE} "
+            "GROUP BY score_source",
+            (since,),
+        ).fetchall()
+        # Always emit the same four keys so a dashboard / health check can
+        # render an empty window without conditional branches (mirrors the
+        # zero-data discipline of ``ticker_mention_velocity`` returning a row
+        # per requested ticker even when it has no mentions).
+        by_source: dict[str, int] = {
+            "llm": 0, "ml": 0, "briefing_boost": 0, "null": 0,
+        }
+        for src, n in rows:
+            key = src if src in ("llm", "ml", "briefing_boost") else "null"
+            by_source[key] += int(n or 0)
+        total = sum(by_source.values())
+        vetted = by_source["llm"] + by_source["briefing_boost"]
+        llm_fraction = round(vetted / total, 4) if total else 0.0
+        return {
+            "window_h": int(hours),
+            "total": total,
+            "by_source": by_source,
+            "llm_fraction": llm_fraction,
+        }
+
+    @_retry_on_lock
     def source_freshness(self) -> list[dict]:
         """Per-source liveness view: for every live source, its live-row count
         and how long ago its most recent article landed.

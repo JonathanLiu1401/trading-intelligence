@@ -28,6 +28,7 @@ These pin the fix with specific behaviour, not "no crash":
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -116,12 +117,19 @@ class _FlakyConn:
 
 
 def _seed(store):
+    """Insert one fixture row whose ``first_seen`` is INSIDE the 24h window
+    every reader filters against. A hardcoded absolute date silently broke
+    ``test_stats_since_recovers_from_collision`` the moment wall-clock passed
+    it by 24h — a date-bound test failure on a real invariant that was
+    actually intact (identical pattern to ``conftest._recent_iso``)."""
+    fresh = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     with store._write_lock:
         store.conn.execute(
             "INSERT INTO articles (id,url,title,source,published,kw_score,"
             "ai_score,urgency,first_seen,cycle) VALUES "
             "('a','http://x/a','Held MU earnings beat','rss','',2.0,0,0,"
-            "'2026-05-18T10:00:00+00:00',0)"
+            "?,0)",
+            (fresh,),
         )
         store.conn.commit()
 
