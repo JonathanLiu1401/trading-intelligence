@@ -409,6 +409,144 @@ class TestWalkBackCollisionDoesNotFabricateZero:
         assert nvda[0]["forward_return_5d"] == pytest.approx(9.0909, abs=1e-3)
 
 
+# ───────────────── wk52_pos / pct_from_52h capture in outcomes ─────────────
+#
+# `_compute_technical_indicators` already computes `wk52_pos` (0..1 position
+# in the trailing 52-week range) and `pct_from_52h` (% below the trailing
+# high), and `_ml_decide` consumes `wk52_pos` for its bubble-top BUY gate.
+# But until now neither value was persisted to `decision_outcomes.jsonl` —
+# so the documented "bubble-top gate" explanation could never be empirically
+# checked against realized forward returns. The capture is purely additive
+# (the scorer trains via explicit kwargs to build_features and ignores
+# extra dict keys), matching the `forward_return_10d/20d` precedent.
+
+class TestWk52PosCapturedInOutcomes:
+    def _build_long_history_cache(self):
+        """PriceCache with 80 weekdays of NVDA closes — enough to satisfy
+        `_compute_technical_indicators`'s ``len(pairs) >= 60`` gate so the
+        function actually returns indicator values (including `wk52_pos`).
+        SPY only needs enough to be the trading-day calendar source; we mirror
+        NVDA so `_market_regime` doesn't trip on missing SPY history.
+        """
+        from paper_trader.backtest import PriceCache
+
+        start = date(2025, 1, 2)
+        days = []
+        d = start
+        while len(days) < 80:
+            if d.weekday() < 5:
+                days.append(d)
+            d += timedelta(days=1)
+        # NVDA: 100 → ~158, monotonic up — sim_d near the end is close to the
+        # 52w high (wk52_pos ~= 1.0). SPY parallels NVDA so trading_days has 80
+        # weekdays AND the regime computation has data (returns "unknown" with
+        # only 80 closes, but that's fine — wk52_pos is the thing under test).
+        cache = PriceCache.__new__(PriceCache)
+        cache.tickers = ["SPY", "NVDA"]
+        cache.start = days[0]
+        cache.end = days[-1]
+        cache.prices = {
+            "SPY": {dd.isoformat(): 100.0 + i for i, dd in enumerate(days)},
+            "NVDA": {dd.isoformat(): 100.0 + i * 0.75
+                     for i, dd in enumerate(days)},
+        }
+        cache.trading_days = days
+        return cache
+
+    def test_wk52_pos_field_present_when_history_sufficient(self, tmp_path):
+        eng = _make_engine_with_runs(tmp_path, n_runs=1)
+        eng.prices = self._build_long_history_cache()
+        # sim_d at index 70: 70 prior closes >= 60 → indicators computable.
+        # 5-day forward window (idx 75) is within range (cache has 80 days).
+        sim_d = eng.prices.trading_days[70]
+        eng.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "status, reasoning) VALUES (?, ?, ?, ?, ?, ?)",
+            (1, sim_d.isoformat(), "BUY", "NVDA", "FILLED",
+             "ML+quant: NVDA score=3.50 regime=bull news_count=0 news_urg=0.0"),
+        )
+        eng.store.conn.commit()
+        runs = [BacktestRun(run_id=1, seed=1, start_date="2025-01-02",
+                            end_date="2025-12-31")]
+        outs = rcb._compute_decision_outcomes(eng, runs)
+        nvda = [o for o in outs if o["ticker"] == "NVDA"
+                and o["sim_date"] == sim_d.isoformat()]
+        assert len(nvda) == 1, f"expected 1 NVDA outcome, got {outs!r}"
+        # New fields MUST be present (not missing keys) and carry numeric
+        # values for this sufficient-history fixture.
+        assert "wk52_pos" in nvda[0]
+        assert "pct_from_52h" in nvda[0]
+        # NVDA is monotonically increasing → sim_d (idx 70) close is the
+        # trailing high of the 71-day window, so wk52_pos ≈ 1.0.
+        # _compute_technical_indicators rounds to 2dp, so allow tight tolerance.
+        assert nvda[0]["wk52_pos"] == pytest.approx(1.0, abs=0.02)
+        # pct_from_52h ≈ 0.0% since sim_d's close IS the high. Rounded to 1dp.
+        assert nvda[0]["pct_from_52h"] == pytest.approx(0.0, abs=0.5)
+
+    def test_wk52_pos_is_none_when_history_insufficient(self, tmp_path,
+                                                       synthetic_prices):
+        """synthetic_prices fixture has only ~51 days of NVDA data, below the
+        60-close threshold `_compute_technical_indicators` requires — so its
+        return is None and `wk52_pos` should be captured as None, NOT as a
+        sentinel like 0.0 (which would be indistinguishable from a real
+        "ticker at 52w low" signal and silently poison training).
+        """
+        eng = _make_engine_with_runs(tmp_path, n_runs=1)
+        eng.prices = synthetic_prices
+        sim_d = synthetic_prices.trading_days[5].isoformat()
+        eng.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "status, reasoning) VALUES (?, ?, ?, ?, ?, ?)",
+            (1, sim_d, "BUY", "NVDA", "FILLED",
+             "ML+quant: NVDA score=2.00 regime=bull news_count=0 news_urg=0.0"),
+        )
+        eng.store.conn.commit()
+        runs = [BacktestRun(run_id=1, seed=1, start_date="2025-01-02",
+                            end_date="2025-12-31")]
+        outs = rcb._compute_decision_outcomes(eng, runs)
+        nvda = [o for o in outs if o["sim_date"] == sim_d
+                and o["ticker"] == "NVDA"]
+        assert len(nvda) == 1
+        # Key present, value None — distinguishable from a real numeric reading.
+        assert nvda[0]["wk52_pos"] is None
+        assert nvda[0]["pct_from_52h"] is None
+
+    def test_capture_does_not_break_existing_keys(self, tmp_path,
+                                                  synthetic_prices):
+        """Regression lock: the additive capture must not displace or rename
+        any existing outcome field. A downstream tool reading
+        `forward_return_5d` / `ml_score` / `gate_scorer_pred` must continue to
+        find them.
+        """
+        eng = _make_engine_with_runs(tmp_path, n_runs=1)
+        eng.prices = synthetic_prices
+        sim_d = synthetic_prices.trading_days[5].isoformat()
+        eng.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "status, reasoning) VALUES (?, ?, ?, ?, ?, ?)",
+            (1, sim_d, "BUY", "NVDA", "FILLED",
+             "ML+quant: NVDA score=2.50 regime=bull news_count=0 news_urg=0.0"),
+        )
+        eng.store.conn.commit()
+        runs = [BacktestRun(run_id=1, seed=1, start_date="2025-01-02",
+                            end_date="2025-12-31")]
+        outs = rcb._compute_decision_outcomes(eng, runs)
+        nvda = [o for o in outs if o["sim_date"] == sim_d
+                and o["ticker"] == "NVDA"]
+        assert len(nvda) == 1
+        # Spot-check that every documented existing field is still present.
+        for required in ("run_id", "sim_date", "ticker", "action", "ml_score",
+                         "rsi", "macd", "mom5", "mom20", "regime_mult",
+                         "vol_ratio", "bb_position", "news_urgency",
+                         "news_article_count", "forward_return_5d",
+                         "forward_return_10d", "forward_return_20d",
+                         "gate_scorer_pred", "gate_off_dist", "return_pct"):
+            assert required in nvda[0], (
+                f"existing field {required!r} missing from outcomes — "
+                "the wk52_pos capture must not have displaced it"
+            )
+
+
 # ─────────────────────── _parse_published_date ───────────────────────────
 
 class TestParsePublishedDate:
