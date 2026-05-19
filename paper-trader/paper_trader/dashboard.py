@@ -11042,5 +11042,95 @@ def quota_burnrate_api():
         return jsonify({"error": str(e), "windows": []}), 500
 
 
+@app.route("/api/ticker-decision-mix")
+def ticker_decision_mix_api():
+    """Per-ticker decision-action breakdown over a recent window.
+
+    /api/decision-health emits the *book-wide* action mix (BUY/SELL/HOLD/
+    NO_DECISION %). /api/track-record groups *closed round-trips* by ticker.
+    Neither answers "of the names Opus actually deliberated on this session,
+    which did it buy, sell, hold — and which is it stuck repeatedly holding
+    on?". Pure read of recent decisions; reuses _parse_action_ticker (the
+    SSOT used by /api/disagreement) so the (verb, ticker) extraction never
+    drifts from sibling endpoints. Advisory only — never gates Opus, never
+    injected into the decision prompt (AGENTS.md #2/#12).
+
+    Query params:
+        hours: lookback window, clamped 1..168 (default 24).
+        min_count: min decisions per ticker to include, clamped 1..50 (default 2)."""
+    try:
+        try:
+            hours = max(1, min(168, int(request.args.get("hours", 24))))
+        except (TypeError, ValueError):
+            hours = 24
+        try:
+            min_count = max(1, min(50, int(request.args.get("min_count", 2))))
+        except (TypeError, ValueError):
+            min_count = 2
+
+        decisions = get_store().recent_decisions(limit=3000)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+        by_ticker: dict[str, dict[str, int]] = {}
+        total_in_window = 0
+        no_ticker_count = 0
+        for d in decisions:
+            try:
+                ts = datetime.fromisoformat(str(d.get("timestamp")))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if ts < cutoff:
+                continue
+            total_in_window += 1
+            verb, ticker = _parse_action_ticker(d.get("action_taken") or "")
+            if not ticker:
+                no_ticker_count += 1
+                continue
+            bucket = by_ticker.setdefault(ticker, {})
+            v = (verb or "OTHER").upper()
+            bucket[v] = bucket.get(v, 0) + 1
+
+        rows = []
+        for tk, counts in by_ticker.items():
+            total = sum(counts.values())
+            if total < min_count:
+                continue
+            buys = sum(counts.get(v, 0) for v in _BUY_VERBS)
+            sells = sum(counts.get(v, 0) for v in _SELL_VERBS)
+            holds = counts.get("HOLD", 0)
+            if buys > 0 and buys >= sells and buys >= holds:
+                lean = "BUY_BIAS"
+            elif sells > 0 and sells >= holds:
+                lean = "SELL_BIAS"
+            elif holds >= max(buys, sells) and holds >= 3:
+                lean = "STUCK_HOLD"
+            else:
+                lean = "MIXED"
+            rows.append({
+                "ticker": tk,
+                "total": total,
+                "buy_count": buys,
+                "sell_count": sells,
+                "hold_count": holds,
+                "lean": lean,
+                "verbs": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
+            })
+        rows.sort(key=lambda r: (-r["total"], r["ticker"]))
+
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "hours": hours,
+            "min_count": min_count,
+            "total_decisions_in_window": total_in_window,
+            "no_ticker_decisions": no_ticker_count,
+            "n_tickers": len(rows),
+            "tickers": rows,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "tickers": []}), 500
+
+
 if __name__ == "__main__":
     run()
