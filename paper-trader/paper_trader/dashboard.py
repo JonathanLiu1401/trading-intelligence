@@ -8886,6 +8886,83 @@ def implied_move_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/earnings-war-room")
+@swr_cached("earnings-war-room", 300.0)
+def earnings_war_room_api():
+    """Pre-print game plan: one composite view answering *"if this name gaps
+    by its implied move tomorrow, what does my book actually look like
+    after?"*. Six existing surfaces each own one slice of this question
+    (``/api/event-calendar`` who+when, ``/api/implied-move`` market-priced
+    straddle, ``/api/earnings-shock`` historical σ, ``/api/stress-scenarios``
+    single-name −10 %, ``/api/sector-exposure`` current concentration,
+    ``/api/recovery`` path-to-even). None composes the worst-case projection:
+    post-shock book value vs the $1000 start, post-shock concentration, total
+    $-at-risk across all held imminent prints. This is that composer.
+
+    Composes the sibling builders' results **verbatim** (single source of
+    truth, AGENTS.md #10) — no new math beyond `position_value × shock_pct`
+    arithmetic and the post-shock book-value projection. Per-event tier is
+    ``max(|implied_book_pct|, |sigma_book_pct|)`` so a chain miss still
+    tiers off historical σ and an IPO-name with no prior prints still tiers
+    off the implied straddle. Observational only — never gates Opus, never
+    injected into the decision prompt (AGENTS.md #2/#12 — the
+    ``earnings_shock`` / ``stress_scenarios`` / ``recovery`` precedent).
+
+    SWR-cached 5 min: matches the sibling earnings endpoints' cadence."""
+    try:
+        from .analytics.event_calendar import build_event_calendar
+        from .analytics.earnings_war_room import build_earnings_war_room
+        from .analytics.earnings_shock import build_earnings_shock
+        from .analytics.implied_move import build_implied_move
+        from .analytics.stress_scenarios import build_stress_scenarios
+        from .analytics.sector_exposure import classify as _classify
+        from . import market as _market
+        store = get_store()
+        pf = store.get_portfolio()
+        positions = store.open_positions()
+        try:
+            from .strategy import WATCHLIST as _WATCHLIST
+            watch = {t.upper() for t in _WATCHLIST}
+        except Exception:
+            watch = set()
+        held = {(p.get("ticker") or "").upper()
+                for p in positions if p.get("ticker")}
+        total_value = float(pf.get("total_value") or 0.0)
+
+        ec = build_event_calendar(positions, held | watch)
+        shock = build_earnings_shock(
+            positions, total_value, ec,
+            history_provider=_earnings_history_for,
+        )
+
+        def _chain_provider(ticker: str, dte: int):
+            try:
+                return _market.get_options_chain(ticker, target_dte=dte)
+            except Exception:
+                return None
+
+        implied = build_implied_move(
+            positions, total_value, ec,
+            options_provider=_chain_provider,
+        )
+        stress = build_stress_scenarios(
+            positions, total_value, _classify, _LEVERAGE_BETA,
+        )
+
+        result = build_earnings_war_room(
+            positions,
+            total_value,
+            INITIAL_CASH,
+            ec,
+            implied_move_result=implied,
+            earnings_shock_result=shock,
+            stress_scenarios_result=stress,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/macro-calendar")
 def macro_calendar_api():
     """The exact forward FOMC rate-decision awareness block the live trader
@@ -11399,6 +11476,11 @@ def _swr_prewarm():
         # spot the prewarm-coverage invariant locks against; matches the
         # earnings-shock prewarm cadence.
         ("implied-move", implied_move_api),
+        # earnings-war-room @swr_cached 300s — composes implied-move +
+        # earnings-shock + stress + event-calendar, so it inherits the slow
+        # yfinance options-chain + earnings-history I/O of its inputs. Same
+        # prewarm-coverage cold-stall invariant.
+        ("earnings-war-room", earnings_war_room_api),
     ]
     for name, wrapper in targets:
         try:
