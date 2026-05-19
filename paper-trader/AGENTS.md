@@ -8999,3 +8999,93 @@ query the route; natural home is the live trader page's existing
 suggestions panel as a per-card expand).
 
 
+### 2026-05-19 review pass (paper-trader core hybrid · `closed_positions` realized-P/L correctness · post-trade summary stats · live findings)
+
+`Store.closed_positions` (the data source for `/api/closed-positions` and
+the `closed-positions` summary card) was systematically computing the
+wrong realized P/L for **every** closed lot — but the bug was silent
+because no trade had closed since the endpoint was added. Two distinct
+failures stacked:
+
+1. **The opening BUY was always excluded from the window.** The SQL
+   filter was `timestamp >= opened_at`, but `record_trade` runs *before*
+   `upsert_position` in `strategy._execute`, so the opening BUY's trade
+   timestamp lands a few microseconds *before* the position row's
+   `opened_at`. Observed in the live DB:
+   - NVDA trade ts `02:56:34.147236`, position opened_at `.150387` → 3.15 ms gap
+   - TQQQ trade ts `00:42:15.202798`, position opened_at `.203088` → 290 µs gap
+   The window therefore skipped every opening BUY and `realized_pl`
+   reported only the gross SELL proceeds with no cost deducted — wildly
+   overstating every winner and silently zeroing every breakeven.
+
+2. **The action filter missed option round-trips.** The exact-match list
+   `("SELL","CLOSE","SELL_TO_CLOSE")` / `("BUY","OPEN","BUY_TO_OPEN")`
+   never matched the live trader's `BUY_CALL` / `BUY_PUT` / `SELL_CALL`
+   / `SELL_PUT` actions. Even when (1) was fixed, every option close
+   would have read **$0 realized** regardless of strike or exit price.
+
+The new `closed_positions` walks every trade for the lot's
+`(ticker, type, expiry, strike)` key chronologically and identifies the
+round-trip whose close lands at or before `closed_at` (held qty starts
+at 0, BUYs add, SELLs subtract, every return-to-≈0 closes a round-trip
+slice — the same `round_trips.py` walk pattern, single source of truth
+#10 in spirit). The slice's BUY/SELL legs are summed with
+`startswith("BUY")` / `startswith("SELL")` so every documented action
+contributes, and the per-lot output now additionally carries `cost`,
+`proceeds`, `realized_pl_pct`, `hold_seconds`, `hold_days`.
+
+**Feature complement** (`/api/closed-positions` summary, the natural
+post-mortem panel a trader reads after the bell):
+
+- `total_cost` / `total_proceeds` — gross BUY / SELL dollar flow
+- `avg_realized_pl_pct` — **cost-weighted** realized / cost across the
+  slice. A simple mean of per-lot percentages would over-weight a $10
+  lot up 100% against a $1000 lot down 5% (the test
+  `test_cost_weighted_avg_differs_from_simple_mean` pins exactly this:
+  a real-dollar mixed slice that the cost-weighted figure reports as
+  NEGATIVE while a naive mean would report +47.5%)
+- `avg_winner_pct` / `avg_loser_pct` — un-weighted mean inside each
+  bucket so both edges of the payoff ratio remain visible (None when
+  the bucket is empty)
+- `median_hold_days` — median per-lot hold_days, None when no lot has
+  a parseable opened_at/closed_at pair
+
+Observational only — never gates Opus, never injected into the decision
+prompt, no caps (invariants #2/#12 — the existing `/api/closed-positions`
+contract). Pure builder; any unparseable timestamp degrades to None /
+zero and never raises (the `_hold_duration` precedent).
+
+**Locks**:
+- `tests/test_core_store.py::TestClosedPositionsRealizedPL` (9 tests):
+  stock winner, stock loser, option round-trip pinning ($0 regression),
+  put round-trip losing, partial-then-full close, `hold_duration`
+  helper round-trip + bad-input degrade-safe, summary newest-first
+  ordering
+- `tests/test_core_dashboard_portfolio.py::TestClosedPositionsApiSummary`
+  (5 tests): empty-book null aggregates, one-winner-one-loser exact
+  W/L/pct, per-lot `realized_pl_pct` present, cost-weighted vs simple-
+  mean divergence, median_hold_days present + non-negative
+
+**Live findings (this pass)**:
+1. `closed_positions` realized P/L was wrong for every closed lot —
+   bug surfaced via the lack of any test that exercised the documented
+   action filter against the live trader's actual action strings
+   (BUY_CALL/SELL_CALL never matched). The fix lands the new
+   walk-trades-chronologically logic with regression tests.
+2. The live runner is **UNSUPERVISED** at the moment of this pass —
+   `/api/supervision` reports `verdict: UNSUPERVISED, orphan: true,
+   ppid: 1`. Pre-existing operational state (not a code bug); a clean
+   exit (git-watcher restart / deadman) would leave the trader DOWN.
+   Recommendation lifted from `/api/supervision`: `systemctl --user
+   enable --now paper-trader`.
+3. The `git-watcher` self-restart path is **verified working live**
+   during this pass — the runner booted on `e594450` and auto-restarted
+   onto my `15bee44` commit (current `head_sha`), serving the new
+   summary fields within ~60s of the push. The auto-deploy contract
+   documented in `runner.py` is intact.
+
+Applies to existing data immediately — no schema change. `/api/closed-
+positions` was already gated behind `?limit=N`; new fields are purely
+additive.
+
+
