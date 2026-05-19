@@ -10701,5 +10701,30 @@ def decision_clock_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/decision-weekday")
+def decision_weekday_api():
+    """Per-day-of-week decision distribution in NY market time.
+
+    Orthogonal to /api/decision-clock (hour-of-day): exposes whether a
+    specific weekday (e.g. Friday-after-close quota slump) is consistently
+    starved across the last ``days`` (7..90, default 28) of decisions.
+    Same NO_DECISION sub-classification (quota / host / empty / parse) so
+    the operator sees the dominant cause per weekday."""
+    try:
+        from .analytics.decision_weekday import build_decision_weekday
+        try:
+            days = int(request.args.get("days", 28))
+        except Exception:
+            days = 28
+        decisions = get_store().recent_decisions(limit=20000)
+        result = build_decision_weekday(
+            decisions, now=datetime.now(timezone.utc), days=days,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR",
+                        "buckets": []}), 500
+
+
 if __name__ == "__main__":
     run()
