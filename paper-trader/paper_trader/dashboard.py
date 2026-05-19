@@ -10455,5 +10455,113 @@ def news_velocity_api():
                         "per_ticker": []}), 500
 
 
+@app.route("/api/decision-clock")
+def decision_clock_api():
+    """Per-hour-of-day decision distribution in NY market time.
+
+    /api/empty-claude-rate gives an aggregate empty-response rate;
+    /api/host-guard a point-in-time concurrent-Opus snapshot. Neither
+    answers which hour of the trading day is most starved. This
+    endpoint buckets the last ``days`` of decisions (1..30, default 7)
+    by local hour-of-day and splits each bucket's NO_DECISION count
+    into ``host_saturated`` (skipped-claude-call / saturated prefixes),
+    ``empty_response`` (timeout/empty), and ``parse_failed`` so an
+    operator can spot a recurring saturation window (e.g. concurrent
+    review agents always firing 10:00 ET) instead of treating the
+    storm as flat noise."""
+    try:
+        try:
+            days = int(request.args.get("days", 7))
+        except Exception:
+            days = 7
+        days = max(1, min(days, 30))
+
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc - timedelta(days=days)
+        decisions = get_store().recent_decisions(limit=20000)
+
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo("America/New_York")
+        except Exception:
+            tz = timezone.utc
+
+        buckets = [
+            {
+                "hour": h, "total": 0, "filled": 0, "no_decision": 0,
+                "host_saturated": 0, "empty_response": 0,
+                "parse_failed": 0, "other_no_decision": 0,
+            }
+            for h in range(24)
+        ]
+
+        total = 0
+        for d in decisions:
+            try:
+                ts = datetime.fromisoformat(str(d.get("timestamp")))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if ts < cutoff:
+                continue
+            try:
+                hour = ts.astimezone(tz).hour
+            except Exception:
+                hour = ts.hour
+            b = buckets[hour]
+            b["total"] += 1
+            total += 1
+            action = (d.get("action_taken") or "")
+            reasoning = (d.get("reasoning") or "")
+            if "FILLED" in action:
+                b["filled"] += 1
+            elif action == "NO_DECISION":
+                b["no_decision"] += 1
+                if "host saturated" in reasoning or "skipped claude call" in reasoning:
+                    b["host_saturated"] += 1
+                elif "no response" in reasoning:
+                    b["empty_response"] += 1
+                elif "parse_failed" in reasoning or "retry_failed" in reasoning:
+                    b["parse_failed"] += 1
+                else:
+                    b["other_no_decision"] += 1
+
+        for b in buckets:
+            n = b["total"]
+            b["fill_rate_pct"] = round(100.0 * b["filled"] / n, 1) if n else 0.0
+            b["no_decision_pct"] = round(100.0 * b["no_decision"] / n, 1) if n else 0.0
+            b["host_saturated_pct"] = round(100.0 * b["host_saturated"] / n, 1) if n else 0.0
+
+        worst = None
+        for b in buckets:
+            if b["total"] < 3:
+                continue
+            if worst is None or b["no_decision_pct"] > worst["no_decision_pct"]:
+                worst = b
+        worst_hour = worst["hour"] if worst else None
+
+        if total < 5:
+            verdict = "INSUFFICIENT_DATA"
+        elif worst and worst["no_decision_pct"] >= 50.0:
+            verdict = (f"HOURLY_CONCENTRATION — hour {worst['hour']:02d}:00 ET "
+                       f"has {worst['no_decision_pct']:.0f}% NO_DECISION over "
+                       f"{worst['total']} samples")
+        else:
+            verdict = "EVEN_DISTRIBUTION"
+
+        return jsonify({
+            "as_of": now_utc.isoformat(timespec="seconds"),
+            "days": days,
+            "tz": "America/New_York",
+            "total_decisions": total,
+            "buckets": buckets,
+            "worst_hour_local": worst_hour,
+            "verdict": verdict,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     run()
