@@ -11,6 +11,7 @@ import sqlite3
 import json
 import re
 import datetime
+from datetime import timezone
 from collections import Counter
 
 DB = '/home/zeph/digital-intern/data/articles.db'
@@ -36,11 +37,21 @@ def tokenise(title: str):
 def bigrams(toks):
     return [f"{toks[i]} {toks[i+1]}" for i in range(len(toks) - 1)]
 
+def _now_utc_isoformat() -> str:
+    """Match `articles.db`'s ``first_seen`` column format byte-for-byte —
+    ``datetime.now(timezone.utc).isoformat()`` produces ``2026-05-19T11:34:56.123456+00:00``.
+    Using ``utcnow().isoformat() + 'Z'`` (the previous form) made the string
+    comparison wrong at the boundary: '+' (43) < 'Z' (90), so an article whose
+    `first_seen` was at almost exactly the cutoff second was incorrectly
+    excluded from the recent window and pushed into the baseline bucket."""
+    return datetime.datetime.now(timezone.utc).isoformat()
+
+
 def main():
     con = sqlite3.connect(f'file:{DB}?mode=ro', uri=True)
     con.execute('PRAGMA busy_timeout=8000')
-    cutoff_recent = (datetime.datetime.utcnow() - datetime.timedelta(hours=1)).isoformat() + 'Z'
-    cutoff_base = (datetime.datetime.utcnow() - datetime.timedelta(hours=24)).isoformat() + 'Z'
+    cutoff_recent = (datetime.datetime.now(timezone.utc) - datetime.timedelta(hours=1)).isoformat()
+    cutoff_base = (datetime.datetime.now(timezone.utc) - datetime.timedelta(hours=24)).isoformat()
     rows = con.execute(
         """
         SELECT first_seen, title FROM articles INDEXED BY idx_first_seen
@@ -76,7 +87,7 @@ def main():
         })
     scored.sort(key=lambda x: (-x['lift'], -x['now_count']))
     out = {
-        'generated_at': datetime.datetime.utcnow().isoformat() + 'Z',
+        'generated_at': _now_utc_isoformat(),
         'articles_scanned': len(rows),
         'articles_recent_1h': n_now,
         'articles_baseline_23h': n_base,

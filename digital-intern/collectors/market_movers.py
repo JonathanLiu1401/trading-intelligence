@@ -8,11 +8,18 @@ Each article row title encodes: symbol, name, price, % change, volume.
 Source tags: "YF/day_gainers", "YF/day_losers", "YF/most_actives".
 """
 import hashlib
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+
+try:
+    from core.logger import get_logger
+    _log = get_logger("market_movers")
+except Exception:
+    _log = logging.getLogger("market_movers")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "seen_articles.db"
@@ -52,13 +59,23 @@ def _article_id(link: str, title: str) -> str:
 
 
 def _fetch_screener(scr_id: str) -> list[dict]:
+    """Fetch one Yahoo predefined-screener payload.
+
+    Exceptions are caught and logged at WARNING so a transient Yahoo
+    outage / schema-shift surfaces in the daemon log (without it the
+    previous bare ``except: return []`` silently turned every network
+    failure into an empty list — source_health then recorded
+    ``n_articles=0`` and the collector looked healthy even when Yahoo
+    was returning 401 / non-JSON / empty result lists for hours)."""
     url = SCREENER_URL.format(scr_id=scr_id)
     try:
         r = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         return data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
-    except Exception:
+    except Exception as e:
+        _log.warning(f"[market_movers] {scr_id} fetch failed: "
+                     f"{type(e).__name__}: {str(e)[:120]}")
         return []
 
 
