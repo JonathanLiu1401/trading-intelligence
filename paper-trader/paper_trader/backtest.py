@@ -716,6 +716,33 @@ class PriceCache:
                 return series[prior]
         return None
 
+    def resolved_close_date(self, ticker: str, d: date) -> date | None:
+        """The actual date `price_on(ticker, d)` resolves to (after up-to-7-day
+        walk-back), or None if no close was found in that window.
+
+        Honesty helper for outcome computation. ``price_on`` returns a float but
+        hides whether the value came from the requested date or a walk-back
+        fallback — so an outcome-side caller cannot detect when two ``price_on``
+        lookups for sim_d / end_d both walked back to the SAME prior close
+        (e.g. a ticker whose last trade was before sim_d on a thin/foreign
+        calendar). When that happens ``returns_pct`` is 0.0 by construction —
+        a fabricated flat outcome that poisons the DecisionScorer training set
+        and looks indistinguishable from a real flat 5-day window. This method
+        exposes the resolution so callers can refuse a collision instead.
+        Pure read; uses the same 7-day window as ``price_on`` so semantics stay
+        in lockstep (a change to ``price_on``'s window MUST update this too).
+        """
+        series = self.prices.get(ticker)
+        if not series:
+            return None
+        if d.isoformat() in series:
+            return d
+        for delta in range(1, 8):
+            prior_d = d - timedelta(days=delta)
+            if prior_d.isoformat() in series:
+                return prior_d
+        return None
+
     def returns_pct(self, ticker: str, start_d: date, end_d: date) -> float:
         s = self.price_on(ticker, start_d)
         e = self.price_on(ticker, end_d)
@@ -2122,10 +2149,23 @@ class BacktestEngine:
                     days_lag = (seen_d - pub_d).days
                     hindsight_contaminated = days_lag > LABEL_STALENESS_DAYS
 
+                # Distinguish None (unscored) from 0.0 (legitimately-zero ML
+                # score). The prior `ai_score or kw_score or 0` form collapsed
+                # both — so an article ArticleNet had scored as flat-zero (a
+                # real "this carries no signal" verdict) silently inherited the
+                # heuristic baseline `kw_score` (typically 2.5 from
+                # score_article's BUY_PHRASES/SELL_PHRASES net of zero hits).
+                # That promoted "scored 0" content above other articles, biasing
+                # the backtest's per-ticker sentiment scores. Explicit None
+                # checks keep the legitimate-zero verdict intact.
                 if hindsight_contaminated:
-                    score = float(kw_score or 0)
+                    score = float(kw_score) if kw_score is not None else 0.0
+                elif ai_score is not None:
+                    score = float(ai_score)
+                elif kw_score is not None:
+                    score = float(kw_score)
                 else:
-                    score = float(ai_score or kw_score or 0)
+                    score = 0.0
 
                 try:
                     urg_v = float(urgency) if urgency is not None else 0.0
