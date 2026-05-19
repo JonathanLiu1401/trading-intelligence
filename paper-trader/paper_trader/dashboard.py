@@ -10490,7 +10490,8 @@ def decision_clock_api():
             {
                 "hour": h, "total": 0, "filled": 0, "no_decision": 0,
                 "host_saturated": 0, "empty_response": 0,
-                "parse_failed": 0, "other_no_decision": 0,
+                "parse_failed": 0, "quota_exhausted": 0,
+                "other_no_decision": 0,
             }
             for h in range(24)
         ]
@@ -10518,7 +10519,22 @@ def decision_clock_api():
                 b["filled"] += 1
             elif action == "NO_DECISION":
                 b["no_decision"] += 1
-                if "host saturated" in reasoning or "skipped claude call" in reasoning:
+                # Bucket precedence is load-bearing — branches must be
+                # mutually exclusive and ordered most-specific first.
+                # quota-exhaustion (the strategy.decide() "claude quota/usage
+                # limit exhausted (no decision)" reason) was previously
+                # uncategorised and silently absorbed by other_no_decision;
+                # the operator triaging a NO_DECISION storm couldn't tell a
+                # host-saturation freeze (kill review agents) apart from a
+                # quota freeze (wait / upgrade plan) — distinct operator
+                # actions. Check the quota marker BEFORE the empty/parse
+                # branches: strategy.py's quota reason starts with "claude
+                # quota" and does not include the "no response" / "host
+                # saturated" / "skipped claude call" tokens, but a
+                # future-format change must not silently re-merge them.
+                if "quota" in reasoning:
+                    b["quota_exhausted"] += 1
+                elif "host saturated" in reasoning or "skipped claude call" in reasoning:
                     b["host_saturated"] += 1
                 elif "no response" in reasoning:
                     b["empty_response"] += 1
