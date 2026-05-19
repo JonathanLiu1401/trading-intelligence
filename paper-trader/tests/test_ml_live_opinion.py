@@ -196,3 +196,70 @@ class TestRobustness:
         assert op["action"] == "BUY"
         assert op["ticker"] == "NVDA"
         assert "regime=bull" in op["reasoning"]
+
+
+class TestRegimeAndUniverseGuards:
+    """Locks the regime multiplier and watch_px universe guards — the two
+    paths that *suppress* an otherwise-buyable signal."""
+
+    def test_bear_regime_suppresses_borderline_buy(self):
+        # A moderate bullish quant signal (RSI oversold alone → +1.5 adj)
+        # clears the >1.0 buy threshold under bull regime_mult=1.0
+        # (1.5 > 1.0 → BUY) but collapses under bear regime_mult=0.3
+        # (1.5 × 0.3 = 0.45 < 1.0 → HOLD). Locks that regime_mult is
+        # actually applied to the score, not just rendered in the label.
+        quant = {
+            "NVDA": {"rsi": 25.0},     # only oversold RSI → adj=+1.5
+            "SPY": {"mom_20d": -5.0},  # bear regime (< -3.0)
+        }
+        op = strategy._ml_live_opinion(
+            [], quant_sigs=quant, snap=_snap(),
+            watch_px={"NVDA": 900.0, "SPY": 500.0},
+        )
+        assert op is not None
+        assert op["action"] == "HOLD"
+        assert "regime=bear" in op["reasoning"]
+
+    def test_keyword_mapping_picks_up_unticked_article(self):
+        # An article whose `tickers` list is empty but whose title contains a
+        # mapped keyword (`_WORD_TO_TICKER_LIVE`) must still drive a BUY —
+        # the keyword→ticker fallback IS the value-add of that map. "nvidia"
+        # → NVDA is the canonical mapping; the bullish words `surges` /
+        # `record` net bullish; raw_score 8.0 × +1.0 sentiment well clears
+        # the 1.0 threshold.
+        articles = [{
+            "id": 100,
+            "title": "nvidia surges to record on chip demand",
+            "ai_score": 8.0,
+            "urgency": 0,
+            "tickers": [],  # the test: tickers extractor missed it
+        }]
+        op = strategy._ml_live_opinion(
+            articles, quant_sigs={}, snap=_snap(),
+            watch_px={"NVDA": 900.0, "SOXL": 30.0},
+        )
+        assert op is not None
+        assert op["action"] == "BUY"
+        # The mapping puts NVDA AND SOXL ("chip") in scope. Whichever wins,
+        # it must be one of the keyword-mapped tickers — locks the path.
+        assert op["ticker"] in ("NVDA", "SOXL")
+
+    def test_unpriced_ticker_cannot_be_chosen(self):
+        # `watch_px` is the live universe gate: a ticker with no live price
+        # (yfinance dead / delisted / off-hours) must NOT be picked as best
+        # even when its score is the highest. Without the `px and px > 0`
+        # guard the engine would emit a BUY recommendation for a name the
+        # trader cannot actually transact in.
+        articles = [{
+            "id": 200,
+            "title": "NVDA surges to record on strong AI demand",
+            "ai_score": 9.0,
+            "urgency": 0,
+            "tickers": ["NVDA"],
+        }]
+        op = strategy._ml_live_opinion(
+            articles, quant_sigs={}, snap=_snap(),
+            watch_px={"NVDA": None, "AMD": 0.0},  # both unpriced
+        )
+        assert op is not None
+        assert op["action"] == "HOLD"
