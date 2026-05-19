@@ -1,14 +1,15 @@
 """Tests for `paper_trader.ml.scorer_smoke_test` — DecisionScorer health
 sanity check.
 
-Pins the four documented verdicts so a refactor cannot silently weaken a
+Pins the five documented verdicts so a refactor cannot silently weaken a
 verdict to HEALTHY when the scorer is actually broken (the regression-of-
 record that motivated this module):
 
-  * HEALTHY              — predictions finite & span ≥ 2 distinct buckets
-  * UNTRAINED            — no pickle / is_trained False
-  * DEGENERATE_CONSTANT  — every probe collapses to one prediction
-  * BROKEN_PREDICT       — predict_with_meta raised or returned non-finite
+  * HEALTHY                  — predictions finite & span ≥ 2 distinct gate buckets
+  * UNTRAINED                — no pickle / is_trained False
+  * DEGENERATE_CONSTANT      — every probe collapses to one prediction
+  * GATE_BUCKETS_DEGENERATE  — predictions distinct but all in ONE conviction-gate arm
+  * BROKEN_PREDICT           — predict_with_meta raised or returned non-finite
 
 Every test exercises real verdict logic against a faked DecisionScorer (no
 pickle / network / disk dependency) so the suite is offline-clean and
@@ -197,12 +198,195 @@ class TestSchema:
         """`VERDICTS` and the probe lists are part of the module's
         public surface; lock their cardinality so a silent removal of a
         verdict or a probe is caught."""
-        assert len(sst.VERDICTS) == 4
+        assert len(sst.VERDICTS) == 5
         assert set(sst.VERDICTS) == {
-            "HEALTHY", "UNTRAINED", "DEGENERATE_CONSTANT", "BROKEN_PREDICT",
+            "HEALTHY", "UNTRAINED", "DEGENERATE_CONSTANT",
+            "GATE_BUCKETS_DEGENERATE", "BROKEN_PREDICT",
         }
         assert len(sst._PROBES) >= 8
         assert len(sst._EDGE_PROBES) >= 2
+        # _GATE_BUCKETS exposes the five conviction-gate arm labels
+        # `_gate_bucket` returns; the GATE_BUCKETS_DEGENERATE verdict's
+        # JSON-schema field `gate_bucket_counts` is keyed by these
+        # exact strings, so the dashboard / Discord template can rely
+        # on every bucket key always being present.
+        assert sst._GATE_BUCKETS == (
+            "strong_headwind", "mild_headwind", "neutral",
+            "mild_tailwind", "strong_tailwind",
+        )
+
+
+# ─────────────────────────── gate-bucket verdict ────────────────────────────
+
+
+class _NeutralBucketScorer:
+    """Predictions are 8 distinct values BUT all fall in [0, 5] (the
+    neutral bucket of `_ml_decide`'s conviction gate). The
+    DEGENERATE_CONSTANT check, which compares raw predictions at 1e-4
+    tolerance, would mark this scorer HEALTHY — but the gate is
+    operationally dormant because no prediction crosses the ±10/±5/0
+    thresholds. This is the EXACT failure pattern AGENTS.md review
+    pass #2 documents for the n_train=400 clobber: predictions vary
+    but the gate's arms collapse to one multiplier."""
+    is_trained = True
+    n_train = 400
+
+    def predict_with_meta(self, **kw):
+        # Deterministic spread within [0.01, 4.5] across probes — well
+        # above the 1e-4 constant tolerance, well below the 5.0 neutral
+        # boundary. Yields 8 distinct values, all neutral-bucket.
+        seed = sum(ord(c) for c in kw.get("ticker", ""))
+        pred = 0.5 + ((seed % 11) * 0.4)  # 0.5..4.5 range
+        return {"pred": round(pred, 4), "raw": round(pred, 4),
+                "clamped": False, "off_distribution": False}
+
+
+class _TwoBucketScorer:
+    """Predictions span TWO gate buckets across probes — the minimum
+    bar HEALTHY requires under the new gate-bucket check. Pins that
+    the `distinct_gate_buckets >= 2` boundary is inclusive (≥, not >)."""
+    is_trained = True
+    n_train = 2000
+
+    def predict_with_meta(self, **kw):
+        seed = sum(ord(c) for c in kw.get("ticker", ""))
+        # Alternate between neutral (~2.0) and mild_tailwind (~7.0) by
+        # parity. Guaranteed to populate exactly 2 of the 5 gate buckets.
+        pred = 2.0 if (seed % 2 == 0) else 7.0
+        return {"pred": round(pred, 4), "raw": round(pred, 4),
+                "clamped": False, "off_distribution": False}
+
+
+class TestGateBucket:
+    """`_gate_bucket()` is the lockstep mirror of `_ml_decide`'s
+    conviction-gate ladder (CLAUDE.md §6). A drift between the two
+    would silently produce a wrong GATE_BUCKETS_DEGENERATE verdict.
+    These tests pin every arm boundary AND the non-finite degrade."""
+
+    def test_strong_headwind_below_minus_ten(self):
+        assert sst._gate_bucket(-50.0) == "strong_headwind"
+        assert sst._gate_bucket(-10.01) == "strong_headwind"
+        # Boundary: exactly -10 is NOT strong_headwind (the gate's
+        # `< -10` is strict), it lands in mild_headwind.
+        assert sst._gate_bucket(-10.0) == "mild_headwind"
+
+    def test_mild_headwind_between_minus_ten_and_zero(self):
+        assert sst._gate_bucket(-5.0) == "mild_headwind"
+        assert sst._gate_bucket(-0.0001) == "mild_headwind"
+        # Exactly 0 is NOT mild_headwind (the gate's `< 0` is strict)
+        # — it falls through to the neutral arm.
+        assert sst._gate_bucket(0.0) == "neutral"
+
+    def test_neutral_inclusive_on_both_ends(self):
+        # `_ml_decide` neutral arm: `0 ≤ p ≤ 5`. Both endpoints inclusive.
+        assert sst._gate_bucket(0.0) == "neutral"
+        assert sst._gate_bucket(2.5) == "neutral"
+        assert sst._gate_bucket(5.0) == "neutral"
+
+    def test_mild_tailwind_above_five(self):
+        assert sst._gate_bucket(5.01) == "mild_tailwind"
+        assert sst._gate_bucket(10.0) == "mild_tailwind"
+        # Exactly 10 is NOT strong_tailwind (the gate's `> 10` is strict),
+        # so 10.0 stays in mild_tailwind — matching `_ml_decide`.
+        assert sst._gate_bucket(10.0) == "mild_tailwind"
+
+    def test_strong_tailwind_above_ten(self):
+        assert sst._gate_bucket(10.01) == "strong_tailwind"
+        assert sst._gate_bucket(50.0) == "strong_tailwind"
+
+    def test_nan_and_non_numeric_fall_through_to_neutral(self):
+        """A non-finite or non-numeric input must never raise — the
+        gate ladder mirror is supposed to be total. Neutral (the no-op
+        arm) is the safest default; an erroneous fall-through to a
+        non-neutral bucket would fabricate gate decisions."""
+        assert sst._gate_bucket(float("nan")) == "neutral"
+        assert sst._gate_bucket(None) == "neutral"
+        assert sst._gate_bucket("bogus") == "neutral"
+
+
+class TestGateBucketsDegenerate:
+    def test_neutral_only_scorer_yields_gate_buckets_degenerate(self):
+        """Predictions span 8 DISTINCT values (passes the constant check)
+        but all map to the same neutral gate bucket → verdict must catch
+        this. This is the n_train=400-clobber failure pattern AGENTS.md
+        review pass #2 documented; before this verdict the smoke test
+        marked this scorer HEALTHY."""
+        rep = sst.scorer_smoke_report(scorer=_NeutralBucketScorer())
+        assert rep["verdict"] == "GATE_BUCKETS_DEGENERATE", rep
+        assert rep["distinct_predictions"] >= 2  # the failure signature
+        assert rep["distinct_gate_buckets"] == 1
+        # All 8 probes must be in the neutral bucket per construction.
+        assert rep["gate_bucket_counts"]["neutral"] == 8
+        # Hint mentions both the bucket name AND that the gate is dormant.
+        assert "neutral" in rep["hint"]
+        assert "dormant" in rep["hint"].lower()
+
+    def test_two_distinct_buckets_passes_healthy(self):
+        """The boundary case: exactly 2 gate buckets populated must
+        still verdict HEALTHY (≥ 2, not > 2)."""
+        rep = sst.scorer_smoke_report(scorer=_TwoBucketScorer())
+        assert rep["verdict"] == "HEALTHY", rep
+        assert rep["distinct_gate_buckets"] == 2
+        # Healthy hint surfaces the bucket count for operator visibility.
+        assert "gate buckets" in rep["hint"]
+
+    def test_gate_bucket_counts_include_every_bucket_key(self):
+        """JSON-schema lock: every documented bucket name appears as a
+        key in `gate_bucket_counts`, even with 0 count. Without this,
+        a dashboard / Discord template would KeyError on an absent arm
+        when no probe lands in it."""
+        rep = sst.scorer_smoke_report(scorer=_NeutralBucketScorer())
+        for b in sst._GATE_BUCKETS:
+            assert b in rep["gate_bucket_counts"], (b, rep)
+        # Sum across all buckets equals the number of in-distribution
+        # probes — no probe is lost, no probe is double-counted.
+        total = sum(rep["gate_bucket_counts"].values())
+        assert total == rep["n_probes"]
+
+    def test_constant_predictor_takes_priority_over_gate_buckets(self):
+        """A scorer that fails the STRONGER DEGENERATE_CONSTANT check
+        (all predictions equal at 1e-4 tolerance) also fails the gate-
+        bucket check (1 bucket), but the stronger verdict must win for
+        diagnostic precision. The hint specifically tells operators
+        'constant predictor', not 'one bucket'."""
+        rep = sst.scorer_smoke_report(scorer=_ConstantScorer())
+        assert rep["verdict"] == "DEGENERATE_CONSTANT", rep
+        assert rep["distinct_predictions"] == 1
+        # The bucket count IS computed (all 8 in neutral) but the verdict
+        # ladder selected the stronger fail.
+        assert rep["gate_bucket_counts"]["neutral"] == 8
+
+    def test_off_distribution_does_not_block_gate_buckets_verdict(self):
+        """An off-distribution scorer whose predictions span multiple
+        gate buckets is still HEALTHY (off_distribution is informational).
+        Conversely, a scorer ALL off-dist AND all in one bucket should
+        verdict GATE_BUCKETS_DEGENERATE — off-dist alone doesn't save
+        it. Belt-and-braces for the verdict precedence."""
+        class _OneBucketOffDist:
+            is_trained = True
+            n_train = 1500
+
+            def predict_with_meta(self, **kw):
+                seed = sum(ord(c) for c in kw.get("ticker", ""))
+                pred = 0.5 + ((seed % 11) * 0.4)
+                return {"pred": round(pred, 4), "raw": round(pred, 4),
+                        "clamped": True, "off_distribution": True}
+
+        rep = sst.scorer_smoke_report(scorer=_OneBucketOffDist())
+        assert rep["verdict"] == "GATE_BUCKETS_DEGENERATE", rep
+        assert rep["off_distribution_in_distribution"] == 8
+
+    def test_cli_exit_code_is_two_for_gate_buckets_degenerate(self,
+                                                              monkeypatch,
+                                                              capsys):
+        """Cron contract: GATE_BUCKETS_DEGENERATE must exit 2 like the
+        other actionable verdicts. An operator running this in a 5-min
+        cron loop relies on `$?` to branch on 'gate is dormant right
+        now' without parsing stdout."""
+        rep = sst.scorer_smoke_report(scorer=_NeutralBucketScorer())
+        assert rep["verdict"] == "GATE_BUCKETS_DEGENERATE"
+        actual_rc = 0 if rep["verdict"] in ("HEALTHY", "UNTRAINED") else 2
+        assert actual_rc == 2
 
 
 class TestPredictionMath:

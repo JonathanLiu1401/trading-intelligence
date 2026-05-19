@@ -26,10 +26,21 @@ disables the conviction gate at the predict level (the gate's bucket
 arms ±10/±5/0 collapse to one bucket forever). This module catches that.
 
 Verdicts (exit code mirrors the sibling diagnostics for cron):
-  HEALTHY              all probes finite, predictions span ≥ 2 distinct buckets → 0
-  UNTRAINED            no pickle / DecisionScorer.is_trained is False           → 0
-  DEGENERATE_CONSTANT  every probe returned the same prediction (±tolerance)    → 2
-  BROKEN_PREDICT       one or more probes raised / returned non-finite          → 2
+  HEALTHY                  all probes finite, predictions span ≥ 2 distinct conviction-gate buckets → 0
+  UNTRAINED                no pickle / DecisionScorer.is_trained is False                          → 0
+  DEGENERATE_CONSTANT      every probe returned the same prediction (±tolerance)                   → 2
+  GATE_BUCKETS_DEGENERATE  predictions nominally distinct but all in ONE conviction-gate arm       → 2
+  BROKEN_PREDICT           one or more probes raised / returned non-finite                         → 2
+
+The GATE_BUCKETS_DEGENERATE verdict is strictly weaker than DEGENERATE_CONSTANT
+and catches a real failure mode the existing check misses: a model whose
+predictions vary by 0.0001%-1% (passing the constant-tolerance check) but
+NEVER cross the gate's ±10 / ±5 / 0 thresholds. In that state the
+conviction gate's ×0.6/×0.85/×1.0/×1.15/×1.3 arms collapse to one
+multiplier across all real inputs — every BUY ends up with the same gate
+adjustment regardless of the model's "prediction". See AGENTS.md review
+pass #2 for the n_train=400 clobber that produced exactly this pattern
+while passing every other smoke check.
 """
 from __future__ import annotations
 
@@ -102,10 +113,65 @@ _EDGE_PROBES: tuple[dict[str, Any], ...] = (
 _CONSTANT_TOLERANCE_PCT = 1e-4
 
 
+# Conviction-gate bucket boundaries — kept in lockstep with `_ml_decide`'s
+# four-arm scorer gate (CLAUDE.md §6, `paper_trader/backtest.py::_ml_decide`):
+#   p < -10  → ×0.6  (strong headwind)
+#   p < 0    → ×0.85 (mild headwind)
+#   0 ≤ p ≤ 5 → ×1.0 (neutral / no change)
+#   p > 5    → ×1.15 (mild tailwind)
+#   p > 10   → ×1.3  (strong tailwind, capped at 0.95)
+# `_gate_bucket()` returns the string label _ml_decide acts on, so a scorer
+# whose predictions all map to the SAME bucket across the in-distribution
+# probes has a dormant gate — every conviction adjustment is the same number.
+# That is a *strictly weaker* failure mode than DEGENERATE_CONSTANT (which
+# checks raw equality at 1e-4 tolerance): two predictions of 0.5% and 2.0%
+# are "distinct" at that tolerance but BOTH fall in the neutral bucket, so
+# the gate's ±10/±5/0 arms never engage. AGENTS.md (review pass 2) records
+# the live-system failure pattern this catches: deployed pkl with
+# `n_train=400` posted near-zero predictive value despite "passing" every
+# existing diagnostic.
+_GATE_BUCKETS: tuple[str, ...] = (
+    "strong_headwind", "mild_headwind", "neutral",
+    "mild_tailwind", "strong_tailwind",
+)
+
+
+def _gate_bucket(pred: float) -> str:
+    """Map a scorer prediction (% 5d forward return) to the conviction-gate
+    arm label `_ml_decide` would apply. Pure, total, never raises — a
+    non-finite input falls through to ``neutral`` (the no-op arm) so a
+    diagnostic crash can never propagate from this helper to the verdict.
+
+    Lockstep mirror of `paper_trader/backtest.py::_ml_decide`'s four-arm
+    threshold ladder (CLAUDE.md §6). The neutral arm is INCLUSIVE on both
+    ends of [0, 5] to match `_ml_decide`'s `elif scorer_pred > 5.0` /
+    `elif scorer_pred < 0.0` chain exactly: a prediction of exactly 0.0
+    hits neither the negative branch (`< 0`) nor the positive branch
+    (`> 5`), and a prediction of exactly 5.0 hits neither (`> 5` is False)
+    — so both are neutral, just like the gate.
+    """
+    try:
+        p = float(pred)
+        if p != p:  # NaN
+            return "neutral"
+    except (TypeError, ValueError):
+        return "neutral"
+    if p < -10.0:
+        return "strong_headwind"
+    if p < 0.0:
+        return "mild_headwind"
+    if p > 10.0:
+        return "strong_tailwind"
+    if p > 5.0:
+        return "mild_tailwind"
+    return "neutral"
+
+
 VERDICTS: tuple[str, ...] = (
     "HEALTHY",
     "UNTRAINED",
     "DEGENERATE_CONSTANT",
+    "GATE_BUCKETS_DEGENERATE",
     "BROKEN_PREDICT",
 )
 
@@ -170,6 +236,14 @@ def scorer_smoke_report(scorer=None) -> dict:
         "probes": [],
         "edge_probes": [],
         "distinct_predictions": 0,
+        # Per-bucket count across the in-distribution probes — pre-populated
+        # with every documented bucket name (zeros) so downstream consumers
+        # never KeyError on an absent arm and a dashboard / Discord template
+        # can render the histogram unconditionally. Keys are stable; ORDER
+        # is `_GATE_BUCKETS` (headwind → neutral → tailwind) so a sorted
+        # render reads left-to-right as it does in `_ml_decide`'s ladder.
+        "gate_bucket_counts": {b: 0 for b in _GATE_BUCKETS},
+        "distinct_gate_buckets": 0,
         "off_distribution_in_distribution": 0,
         "off_distribution_edge": 0,
         "broken_probe_count": 0,
@@ -227,6 +301,18 @@ def scorer_smoke_report(scorer=None) -> dict:
     distinct = sorted(set(round(p / _CONSTANT_TOLERANCE_PCT) for p in preds))
     out["distinct_predictions"] = len(distinct)
 
+    # Conviction-gate bucket histogram across the in-distribution probes.
+    # `_gate_bucket` is the lockstep mirror of `_ml_decide`'s four-arm
+    # ladder, so this counts the *actual gate decisions* the deployed
+    # pickle would make on these probes — not just raw prediction
+    # variance. See the `_GATE_BUCKETS` comment for why this is a
+    # strictly different failure mode than DEGENERATE_CONSTANT.
+    for p in preds:
+        out["gate_bucket_counts"][_gate_bucket(p)] += 1
+    out["distinct_gate_buckets"] = sum(
+        1 for c in out["gate_bucket_counts"].values() if c > 0
+    )
+
     # In-distribution probes should ideally NOT fire off_distribution.
     # If most do, the scaler / model trained on a wildly different feature
     # distribution than the inputs we just fed it — a silent feature drift.
@@ -246,10 +332,35 @@ def scorer_smoke_report(scorer=None) -> dict:
         )
         return out
 
+    # Gate-bucket diversity check — STRICTLY WEAKER than the constant
+    # check above, so it runs only after DEGENERATE_CONSTANT has cleared.
+    # A model whose predictions are nominally distinct (passes the 1e-4
+    # tolerance) but all map to the same gate arm is in the "the gate is
+    # dormant" failure mode AGENTS.md review pass #2 documented for the
+    # n_train=400 clobber: every BUY gets the same conviction multiplier
+    # regardless of the model's "prediction".
+    if out["distinct_gate_buckets"] < 2:
+        out["verdict"] = "GATE_BUCKETS_DEGENERATE"
+        only_bucket = next(
+            (b for b, c in out["gate_bucket_counts"].items() if c > 0),
+            "neutral",
+        )
+        out["hint"] = (
+            f"all {len(preds)} in-distribution probes mapped to the SAME "
+            f"conviction-gate arm '{only_bucket}' — predictions vary "
+            f"({out['distinct_predictions']} distinct values) but none "
+            f"cross the ±10/±5/0 thresholds, so the gate's "
+            f"×0.6/×0.85/×1.0/×1.15/×1.3 arms collapse to one multiplier "
+            f"on these inputs; the conviction gate is operationally "
+            f"dormant"
+        )
+        return out
+
     out["verdict"] = "HEALTHY"
     out["hint"] = (
         f"n_train={out['n_train']} | {out['distinct_predictions']} distinct "
         f"predictions across {len(preds)} in-distribution probes | "
+        f"{out['distinct_gate_buckets']}/{len(_GATE_BUCKETS)} gate buckets | "
         f"off-dist: {out['off_distribution_in_distribution']}/{len(preds)} "
         f"in-distribution, {out['off_distribution_edge']}/"
         f"{len(_EDGE_PROBES)} edge"
@@ -288,15 +399,27 @@ def _cli() -> int:
         print(f"VERDICT: {rep['verdict']}  ({rep['hint']})")
         print(f"  is_trained={rep['is_trained']}  n_train={rep['n_train']}")
         print(f"  distinct_predictions={rep['distinct_predictions']}/"
-              f"{rep['n_probes']}  broken={rep['broken_probe_count']}")
+              f"{rep['n_probes']}  "
+              f"distinct_gate_buckets={rep.get('distinct_gate_buckets', 0)}/"
+              f"{len(_GATE_BUCKETS)}  broken={rep['broken_probe_count']}")
+        buckets = rep.get("gate_bucket_counts") or {}
+        if buckets:
+            # Render in the documented headwind→neutral→tailwind order so
+            # the histogram reads left-to-right as it does in `_ml_decide`.
+            ordered = "  ".join(
+                f"{b}={buckets.get(b, 0)}" for b in _GATE_BUCKETS
+            )
+            print(f"  gate buckets: {ordered}")
         for r in rep["probes"]:
             if "error" in r:
                 print(f"    {r['label']:<26} {r['ticker']:<6} "
                       f"ERROR {r['error']}")
                 continue
             flag = " [off-dist]" if r.get("off_distribution") else ""
+            bucket = _gate_bucket(r["pred"])
             print(f"    {r['label']:<26} {r['ticker']:<6} "
-                  f"pred={r['pred']:+.3f}%  raw={r['raw']:+.3f}%{flag}")
+                  f"pred={r['pred']:+.3f}%  raw={r['raw']:+.3f}%  "
+                  f"gate={bucket}{flag}")
     return 0 if rep["verdict"] in ("HEALTHY", "UNTRAINED") else 2
 
 
