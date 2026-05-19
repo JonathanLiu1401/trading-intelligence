@@ -8930,4 +8930,72 @@ authoritative skill arbiters are:
   the same `notes` column. No behaviour change to returns / winner
   selection / live gate; purely informational.
 
+### 2026-05-19 feat (Agent 4 product-engineer pass) — `/api/suggestion-impact`
+
+`/api/suggestions` ranks BUY / ADD / TRIM / EXIT / WATCH ideas but is silent
+on the **operational consequence** — a BUY of MU at the default 5%-of-equity
+sizing might tip `concentration_top1` past the 40% MEDIUM threshold (the same
+threshold `/api/risk` displays) or burn the last cash on hand. The trader
+then has to open `/api/risk` *and* `/api/portfolio` and project the impact
+mentally before each act. This endpoint does that projection deterministically.
+
+Pure builder `paper_trader.dashboard.build_suggestion_impact` augments each
+suggestion with the per-trade projection (each act treated INDEPENDENTLY —
+"if I take THIS idea ALONE", which IS the trader's actual decision unit):
+
+- **BUY / ADD**: `projected_size_usd` (default 5% of `total_value`, capped
+  at available cash for BUYs with `cash_constrained=true` when capped),
+  `projected_qty` (`size / price`), `projected_cash_after`,
+  `projected_position_pct_after`, `projected_top1_pct_after`,
+  `projected_top3_pct_after`, `projected_severity_after`,
+  `would_overconcentrate` (severity LOW → ≥MEDIUM after the act)
+- **TRIM (default 50%) / EXIT (100%)**: `projected_proceeds_usd`,
+  `projected_realized_pnl_usd` (`(current_price - avg_cost) × qty_sold ×
+  multiplier`), `projected_cash_after`, `projected_position_pct_after`,
+  `projected_top1_pct_after`, `projected_top3_pct_after`,
+  `projected_severity_after`, `frees_concentration` (severity ≥MEDIUM → LOW
+  after the act, or HIGH → MEDIUM)
+- **HOLD / WATCH**: pass-through with `would_act: false` (no projection
+  fields). The baseline still surfaces so the UI doesn't have to merge two
+  endpoints.
+
+**SSOT — single concentration taxonomy.** The projected severity comes from
+the SAME `_concentration_severity` helper `/api/risk` uses; the per-position
+rows come from the SAME `_classify` + `_LEVERAGE_BETA` constants. A trader
+who reads "projected HIGH after BUY" here sees the same `concentration_warning`
+on `/api/risk` after the act. No second threshold table to drift.
+
+**Route** `/api/suggestion-impact?size_pct=5` (clamped 0..100, default 5.0).
+SWR-cached 45s (matches the `/api/suggestions` cache lifecycle — the impact
+view re-derives only when suggestions do). Re-uses `suggestions_api()`'s JSON
+output as input so the contract follows automatically if the suggestions
+shape evolves.
+
+**Locks (`tests/test_suggestion_impact.py`, 17 tests, ~1.6s):**
+  1. Empty / non-list inputs collapse to a well-formed envelope (never raise)
+  2. `size_pct` parameter overrides the default 5% sizing
+  3. BUY uses 5%-of-equity sizing when cash is sufficient
+  4. BUY caps at available cash and flags `cash_constrained`
+  5. BUY pushes severity through the SAME `_concentration_severity` buckets
+     `/api/risk` displays (LOW → MEDIUM via the 40%-top1 threshold)
+  6. BUY into an unheld ticker creates a new row in the projection
+  7. EXIT projects full liquidation; realized P/L = `(current - avg_cost) × qty`
+  8. TRIM defaults to 50% (matches the `_SUGGESTION_TRIM_FRACTION` constant)
+  9. `frees_concentration` fires when EXIT drops severity HIGH → LOW
+ 10. Realized P/L is negative when current < avg_cost
+ 11. HOLD / WATCH pass through with `would_act: false` and no projection keys
+ 12. SSOT proof: projected severity through the builder agrees with calling
+     `_concentration_severity` directly
+ 13. Flask route exists, clamps `size_pct` to 0..100, tolerates garbage
+
+**Live evidence at rollout:** with NVDA at 44.47% of book (MEDIUM severity)
+and $406.74 cash, a BUY card for MU at default 5% sizing ($50 → 0.07 shares
+at $681) projects severity unchanged at MEDIUM (top1 stays NVDA, top3 barely
+moves), so the trader can act without re-opening the risk panel.
+
+Advisory only — never gates Opus, never sizes an actual trade, never enters
+the decision prompt (invariants #2 / #12). **No UI card yet** (consumers
+query the route; natural home is the live trader page's existing
+suggestions panel as a per-card expand).
+
 

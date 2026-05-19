@@ -1628,6 +1628,204 @@ def build_news_corroboration(
     }
 
 
+# ── event-thread clustering (trader-facing event view of the feed) ──────────
+# /api/news-corroboration answers "what stories are multi-source confirmed?"
+# (trust filter, ranks by n_sources). /api/event-threads answers a different
+# question the live feed currently fails: "what *distinct events* happened
+# recently, ranked by impact × recency?" Same Jaccard clustering primitive,
+# but:
+#   - single-article threads are KEPT (a solo Reuters 8-K matters before
+#     anyone else picks it up — the corroboration view filters these out)
+#   - per-thread tickers + sectors are extracted (the analyst routes a thread
+#     to a held-position decision via the same _SECTOR_MAP the sector-pulse
+#     and chat use, no drift)
+#   - ranking is recency-decayed impact (max_ai_score × 0.5^(age_h/halflife))
+#     so the eye lands on what just broke, not on stale-but-corroborated
+#   - member articles are surfaced (cap ``_EVENT_THREAD_MEMBER_CAP``) so the
+#     trader can drill into supporting evidence without a second query
+_EVENT_THREAD_HALFLIFE_H = 6.0  # match _SECTOR_PULSE_HALFLIFE_H — same eye
+_EVENT_THREAD_MEMBER_CAP = 5
+_EVENT_THREAD_JACCARD = 0.6  # match build_news_corroboration default
+
+
+def build_event_threads(
+    articles: list,
+    *,
+    min_score: float = 5.0,
+    min_articles: int = 1,
+    jaccard_threshold: float = _EVENT_THREAD_JACCARD,
+    max_threads: int = 30,
+    now: datetime | None = None,
+) -> dict:
+    """Cluster recent articles into distinct event threads, ranked by impact.
+
+    Pure / total — no DB, no LLM, no network. Caller passes article dicts
+    (must have ``title``; ``source`` / ``url`` / ``ai_score`` / ``urgency`` /
+    ``first_seen`` optional). Empty / non-list / titleless inputs collapse to
+    the well-formed empty skeleton, never an exception.
+
+    Clustering is greedy Jaccard on ``ml.dedup.title_tokens`` — same primitive
+    ``build_news_corroboration``, ``build_alert_confidence_trend``, and the
+    briefing's near-dup-collapse use, so this view of "what story is this
+    article about" cannot drift from the rest of the pipeline.
+
+    Per-thread enrichment:
+      - ``tickers``: ``_extract_tickers`` over the union of member titles
+        (case-sensitive, word-bounded; longest-first so GOOGL beats GOOG —
+        the same regex the sector-pulse uses, no separate copy)
+      - ``sectors``: ``_SECTOR_MAP`` lookup over those tickers
+      - ``impact_score``: ``max_ai_score × 0.5 ** (age_h / halflife)`` —
+        same recency-decay shape as the sector-pulse velocity, so a fresh
+        max=8 thread outranks a stale max=10 (which is what a trader sees
+        when scrolling the feed)
+      - ``members``: up to ``_EVENT_THREAD_MEMBER_CAP`` (title, source, url,
+        ai_score, urgency, first_seen), highest-score first
+
+    Filtering:
+      - ``min_score`` — drop threads whose ``max_ai_score`` is below this
+        (default 5.0; the same threshold ``/api/signals`` uses internally
+        to skip noise). Set 0 to see everything.
+      - ``min_articles`` — drop threads with fewer member articles than this
+        (default 1; KEEPS single-article threads — the differentiator from
+        ``build_news_corroboration``'s ``min_sources >= 2`` filter).
+    """
+    from ml.dedup import jaccard_similarity, title_tokens
+
+    now = now or datetime.now(timezone.utc)
+    # Strict input contract: must be a list/tuple of dicts. Anything else
+    # (None, dict, str, int) collapses to the empty skeleton — never raises,
+    # never scans an unintended iterable (e.g. a dict's keys).
+    if not isinstance(articles, (list, tuple)):
+        arts: list = []
+    else:
+        arts = list(articles)
+
+    def _f(v, default=0.0):
+        try:
+            return float(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    def _i(v, default=0):
+        try:
+            return int(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    clusters: list[dict] = []
+    for art in arts:
+        if not isinstance(art, dict):
+            continue
+        title = art.get("title")
+        if not isinstance(title, str) or not title.strip():
+            continue
+        toks = title_tokens(title)
+        placed = False
+        if toks:
+            for cl in clusters:
+                if cl["anchor_tokens"] and jaccard_similarity(
+                    toks, cl["anchor_tokens"]
+                ) >= jaccard_threshold:
+                    cl["members"].append(art)
+                    src = (art.get("source") or "").strip()
+                    if src:
+                        cl["sources"].add(src)
+                    placed = True
+                    break
+        if not placed:
+            src = (art.get("source") or "").strip()
+            clusters.append({
+                "anchor_tokens": toks,
+                "members": [art],
+                "sources": {src} if src else set(),
+            })
+
+    out_threads: list[dict] = []
+    for cl in clusters:
+        members = cl["members"]
+        if len(members) < max(1, int(min_articles)):
+            continue
+        scores = [_f(m.get("ai_score")) for m in members]
+        max_score = max(scores) if scores else 0.0
+        if max_score < float(min_score):
+            continue
+        urgs = [_i(m.get("urgency")) for m in members]
+        first_seens = [m.get("first_seen") for m in members if m.get("first_seen")]
+        # ISO timestamps sort lexically — same convention sector_pulse uses.
+        first_seen = min(first_seens) if first_seens else None
+        latest_seen = max(first_seens) if first_seens else None
+        # Tickers: union over all member titles (a Samsung HBM4 piece may
+        # mention only WDC while the Reuters companion piece mentions MU —
+        # union is the trader's actual exposure surface).
+        all_tickers: set[str] = set()
+        for m in members:
+            all_tickers |= _extract_tickers(m.get("title"))
+        sectors = sorted({_SECTOR_MAP[t] for t in all_tickers if t in _SECTOR_MAP})
+
+        # Recency-decayed impact. Reuse claude_analyst._seen_age_hours so the
+        # ranking time-zero is identical to the chat decay + sector-pulse
+        # velocity time-zero (no drift). If it can't be imported, fall back
+        # to a parse here — never raise into the route.
+        try:
+            from analysis.claude_analyst import _seen_age_hours
+            age_h = _seen_age_hours(latest_seen, now=now) if latest_seen else 0.0
+        except Exception:  # noqa: BLE001
+            ts = _parse_first_seen(latest_seen) if latest_seen else None
+            age_h = ((now - ts).total_seconds() / 3600.0) if ts else 0.0
+        impact = max_score * (0.5 ** (max(0.0, age_h) / _EVENT_THREAD_HALFLIFE_H))
+
+        # Anchor = highest-scoring member title (canonical headline).
+        top = max(members, key=lambda m: _f(m.get("ai_score")))
+        # Surface members highest-score first, cap to _EVENT_THREAD_MEMBER_CAP.
+        sorted_members = sorted(
+            members, key=lambda m: -_f(m.get("ai_score"))
+        )[: _EVENT_THREAD_MEMBER_CAP]
+        members_out = [{
+            "title": m.get("title") or "",
+            "source": m.get("source") or "",
+            "url": m.get("url"),
+            "ai_score": round(_f(m.get("ai_score")), 2),
+            "urgency": _i(m.get("urgency")),
+            "first_seen": m.get("first_seen"),
+        } for m in sorted_members]
+
+        out_threads.append({
+            "anchor_title": top.get("title") or "",
+            "anchor_url": top.get("url"),
+            "n_articles": len(members),
+            "n_sources": len(cl["sources"]),
+            "sources": sorted(cl["sources"]),
+            "tickers": sorted(all_tickers),
+            "sectors": sectors,
+            "max_ai_score": round(max_score, 2),
+            "max_urgency": max(urgs) if urgs else 0,
+            "first_seen": first_seen,
+            "latest_seen": latest_seen,
+            "age_hours": round(age_h, 2),
+            "impact_score": round(impact, 3),
+            "members": members_out,
+        })
+
+    out_threads.sort(
+        key=lambda t: (-t["impact_score"], -t["n_articles"],
+                       -t["n_sources"], t["anchor_title"])
+    )
+    if max_threads and len(out_threads) > max_threads:
+        out_threads = out_threads[:max_threads]
+
+    return {
+        "as_of": now.isoformat(timespec="seconds"),
+        "n_articles_scanned": len(arts),
+        "n_clusters_formed": len(clusters),
+        "n_threads_kept": len(out_threads),
+        "min_score": float(min_score),
+        "min_articles": int(min_articles),
+        "jaccard_threshold": float(jaccard_threshold),
+        "halflife_hours": _EVENT_THREAD_HALFLIFE_H,
+        "threads": out_threads,
+    }
+
+
 def create_app(store=None) -> Flask:
     """Build the Flask app. ``store`` is the shared ArticleStore from daemon.py."""
     global _store
@@ -1977,6 +2175,73 @@ def create_app(store=None) -> Flask:
             for r in rows
         ]
         out = build_news_corroboration(arts, min_sources=min_sources)
+        out["window_hours"] = hours
+        return jsonify(out)
+
+    @app.get("/api/event-threads")
+    def api_event_threads():
+        """Distinct event view of the live feed — clustered by title-token
+        Jaccard, enriched with watchlist tickers + sectors, ranked by
+        recency-decayed impact (max_ai_score × 0.5^(age_h/halflife)).
+
+        Complements ``/api/news-corroboration`` (which filters to ≥2 sources,
+        ranks by corroboration count): this surface KEEPS single-article
+        threads — a solo Reuters 8-K matters before the wire picks it up —
+        and routes each thread to held positions via ``_SECTOR_MAP``.
+
+        Query:
+          - ``hours`` clamped 1..168, default 24
+          - ``min_score`` clamped 0..10, default 5.0 (drops noise; 0 = all)
+          - ``min_articles`` clamped 1..20, default 1 (keep solo events)
+          - ``max_threads`` clamped 1..100, default 30
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            hours = int(request.args.get("hours", 24))
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(168, hours))
+        try:
+            min_score = float(request.args.get("min_score", 5.0))
+        except (TypeError, ValueError):
+            min_score = 5.0
+        min_score = max(0.0, min(10.0, min_score))
+        try:
+            min_articles = int(request.args.get("min_articles", 1))
+        except (TypeError, ValueError):
+            min_articles = 1
+        min_articles = max(1, min(20, min_articles))
+        try:
+            max_threads = int(request.args.get("max_threads", 30))
+        except (TypeError, ValueError):
+            max_threads = 30
+        max_threads = max(1, min(100, max_threads))
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT title, source, url, ai_score, urgency, first_seen "
+                "FROM articles "
+                f"WHERE first_seen >= ? AND {_LIVE_ONLY_SQL} "
+                "ORDER BY first_seen DESC LIMIT 4000",
+                (since,),
+            )
+        except sqlite3.Error:
+            rows = []
+        arts = [
+            {"title": r[0] or "", "source": r[1] or "", "url": r[2],
+             "ai_score": float(r[3] or 0), "urgency": int(r[4] or 0),
+             "first_seen": r[5]}
+            for r in rows
+        ]
+        out = build_event_threads(
+            arts,
+            min_score=min_score,
+            min_articles=min_articles,
+            max_threads=max_threads,
+        )
         out["window_hours"] = hours
         return jsonify(out)
 
