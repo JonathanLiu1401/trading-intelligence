@@ -399,3 +399,83 @@ class TestGetOptionsChain:
             raise RuntimeError("network down")
         monkeypatch.setattr(market.yf, "Ticker", raise_)
         assert market.get_options_chain("FAKE") is None
+
+
+class TestNextSessionOpen:
+    """`market.next_session_open` — pure forward-walk over the NYSE calendar
+    used by `reporter._next_session_line`. Wall clock is injected so the
+    tests are deterministic regardless of when the suite runs.
+
+    Lower-bound semantics: a candidate day is the *next* open only when
+    we are NOT inside its session and NOT past its close. So a 09:30 ET
+    check on a regular weekday returns *that* day's open (we're at the
+    open instant) — but a 10:00 ET check returns *tomorrow*'s open."""
+
+    def _utc_from_ny(self, year, month, day, hour, minute):
+        return datetime(year, month, day, hour, minute, tzinfo=NY).astimezone(UTC)
+
+    def test_friday_after_close_jumps_to_monday(self):
+        # 2026-05-15 Fri 17:00 ET → 2026-05-18 Mon 09:30 ET.
+        now = self._utc_from_ny(2026, 5, 15, 17, 0)
+        nxt = market.next_session_open(now)
+        nxt_ny = nxt.astimezone(NY)
+        assert nxt_ny.date() == datetime(2026, 5, 18).date()
+        assert (nxt_ny.hour, nxt_ny.minute) == (9, 30)
+
+    def test_saturday_returns_monday(self):
+        now = self._utc_from_ny(2026, 5, 16, 10, 0)  # Sat
+        nxt = market.next_session_open(now)
+        nxt_ny = nxt.astimezone(NY)
+        assert nxt_ny.date() == datetime(2026, 5, 18).date()
+        assert (nxt_ny.hour, nxt_ny.minute) == (9, 30)
+
+    def test_sunday_returns_monday(self):
+        now = self._utc_from_ny(2026, 5, 17, 23, 59)  # Sun
+        nxt = market.next_session_open(now)
+        nxt_ny = nxt.astimezone(NY)
+        assert nxt_ny.date() == datetime(2026, 5, 18).date()
+
+    def test_weekday_premarket_returns_today(self):
+        # 09:00 ET — before today's open. Today is the next open.
+        now = self._utc_from_ny(2026, 5, 14, 9, 0)
+        nxt = market.next_session_open(now)
+        nxt_ny = nxt.astimezone(NY)
+        assert nxt_ny.date() == datetime(2026, 5, 14).date()
+        assert (nxt_ny.hour, nxt_ny.minute) == (9, 30)
+
+    def test_at_open_advances_to_next_day(self):
+        # We're AT 09:30 ET — market is currently open, so the next open
+        # is tomorrow. (cur_min >= _OPEN_MIN advances past today.)
+        now = self._utc_from_ny(2026, 5, 14, 9, 30)  # Thu open
+        nxt = market.next_session_open(now)
+        nxt_ny = nxt.astimezone(NY)
+        assert nxt_ny.date() == datetime(2026, 5, 15).date()  # Fri
+
+    def test_during_session_advances_to_next_day(self):
+        now = self._utc_from_ny(2026, 5, 14, 14, 30)  # Thu mid-session
+        nxt = market.next_session_open(now)
+        nxt_ny = nxt.astimezone(NY)
+        assert nxt_ny.date() == datetime(2026, 5, 15).date()  # Fri
+
+    def test_skips_holiday(self):
+        # 2026-11-25 Wed → next open skips Thanksgiving (Thu 2026-11-26)
+        # to Friday 2026-11-27 (half-day but still opens at 09:30).
+        now = self._utc_from_ny(2026, 11, 25, 17, 0)
+        nxt = market.next_session_open(now)
+        nxt_ny = nxt.astimezone(NY)
+        assert nxt_ny.date() == datetime(2026, 11, 27).date()
+
+    def test_skips_weekend_and_holiday(self):
+        # Friday 2026-04-03 (Good Friday) — closed. Skip to Mon 04-06.
+        now = self._utc_from_ny(2026, 4, 2, 17, 0)  # Thu close
+        nxt = market.next_session_open(now)
+        nxt_ny = nxt.astimezone(NY)
+        assert nxt_ny.date() == datetime(2026, 4, 6).date()
+
+    def test_returns_utc_aware_datetime(self):
+        now = self._utc_from_ny(2026, 5, 16, 10, 0)  # Sat
+        nxt = market.next_session_open(now)
+        assert nxt is not None
+        # Returned datetime is UTC-tagged regardless of NY DST state.
+        assert nxt.tzinfo is not None
+        assert nxt.utcoffset().total_seconds() == 0

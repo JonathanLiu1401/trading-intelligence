@@ -95,6 +95,50 @@ def is_market_open(now: datetime | None = None) -> bool:
     return _OPEN_MIN <= minutes < close_minute(now.date())
 
 
+def next_session_open(now: datetime | None = None) -> datetime | None:
+    """The next regular-session 09:30 ET open after ``now``.
+
+    Returns a UTC-aware datetime, or ``None`` when no NYSE open day can be
+    found within 14 forward days (defensive; the actual NYSE calendar has
+    no >4-day gap). When the market is currently OPEN, returns the *next*
+    open after today's close (so callers always get a future timestamp;
+    "when can I act next?" semantics).
+
+    Pure — walks the NYSE_HOLIDAYS_2026 / weekday calendar from ``now``,
+    no I/O. The week-end NY date is the only state read besides
+    ``NYSE_HOLIDAYS_2026``. Half-day sessions (NYSE_HALF_DAYS_2026) still
+    *open* at 09:30 ET, so they are a normal open day from this helper's
+    perspective; only the close is early.
+    """
+    now_utc = (now or datetime.now(UTC)).astimezone(UTC)
+    now_ny = now_utc.astimezone(NY)
+    cur_min = now_ny.hour * 60 + now_ny.minute
+    # If we're inside today's session OR past today's close, today is no
+    # longer the next open — advance to tomorrow before scanning.
+    advance_past_today = (
+        now_ny.weekday() < 5
+        and now_ny.date() not in NYSE_HOLIDAYS_2026
+        and cur_min >= _OPEN_MIN
+    )
+    candidate = now_ny
+    if advance_past_today:
+        candidate = (candidate + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    for _ in range(14):
+        if candidate.weekday() < 5 and candidate.date() not in NYSE_HOLIDAYS_2026:
+            is_today = candidate.date() == now_ny.date()
+            if not is_today or cur_min < _OPEN_MIN:
+                open_dt = candidate.replace(
+                    hour=9, minute=30, second=0, microsecond=0
+                )
+                return open_dt.astimezone(UTC)
+        candidate = (candidate + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    return None
+
+
 def _cached_price(ticker: str) -> float | None:
     rec = _PRICE_CACHE.get(ticker)
     if rec and time.time() - rec[1] < _PRICE_TTL:

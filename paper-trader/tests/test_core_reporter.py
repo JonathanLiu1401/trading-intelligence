@@ -2622,3 +2622,126 @@ class TestConcentrationLine:
         assert "**CONCENTRATION** ◈ SINGLE_NAME_RISK" in line
         assert "NVDA" in line
         assert "75% of a 2-name stock book" in line
+
+
+class TestCountdown:
+    """`_countdown` — compact "in Xh Ym" countdown label.
+
+    Pure formatting; the value-add over the existing `_ago` is the explicit
+    "in N..." prefix and the H:M composition (a 14h-3m gap should not lose
+    the minute precision)."""
+
+    def test_minute_bucket(self):
+        assert reporter._countdown(30 * 60) == "in 30m"
+
+    def test_sub_minute_clamps_to_zero(self):
+        assert reporter._countdown(5) == "in 0m"
+
+    def test_hour_with_minutes(self):
+        # 2h 30m → "in 2h 30m"
+        assert reporter._countdown(2 * 3600 + 30 * 60) == "in 2h 30m"
+
+    def test_hour_exact(self):
+        # Whole-hour gap drops the "0m" tail for a clean read.
+        assert reporter._countdown(3 * 3600) == "in 3h"
+
+    def test_day_with_hours(self):
+        # 2d 4h gap.
+        assert reporter._countdown(2 * 86400 + 4 * 3600) == "in 2d 4h"
+
+    def test_day_exact(self):
+        assert reporter._countdown(3 * 86400) == "in 3d"
+
+    def test_negative_clamps_to_zero(self):
+        # Clock skew must never render "-Xm"; clamp to "in 0m" instead.
+        assert reporter._countdown(-300) == "in 0m"
+
+
+class TestNextSessionLine:
+    """`_next_session_line` — orientation cue for the operator who checks
+    Discord on weekends/overnight. Pure: no I/O, uses market.next_session_open
+    + market.is_market_open. Discord-side suppression: emit nothing when the
+    market is currently open."""
+
+    def _utc_from_ny(self, year, month, day, hour, minute):
+        return datetime(year, month, day, hour, minute,
+                        tzinfo=reporter.market.NY).astimezone(timezone.utc)
+
+    def test_market_open_returns_empty(self):
+        # 2026-05-14 Thu 10:00 ET — market open, no orientation line.
+        now = self._utc_from_ny(2026, 5, 14, 10, 0)
+        assert reporter._next_session_line(now) == ""
+
+    def test_friday_after_close_points_to_monday(self):
+        # 2026-05-15 Fri 17:00 ET → Mon 2026-05-18 09:30 ET (~64.5h).
+        now = self._utc_from_ny(2026, 5, 15, 17, 0)
+        line = reporter._next_session_line(now)
+        # Header + day-of-week token from %a (Mon) + the date.
+        assert line.startswith("**MARKET** ◈ closed — next session:")
+        assert "Mon 05-18 09:30 ET" in line
+        # 64.5h gap → "in 2d 16h" (countdown switches to day-bucket ≥24h).
+        assert "in 2d 16h" in line
+
+    def test_saturday_morning_points_to_monday(self):
+        now = self._utc_from_ny(2026, 5, 16, 10, 0)  # Sat
+        line = reporter._next_session_line(now)
+        assert "Mon 05-18 09:30 ET" in line
+
+    def test_premarket_today_today_open(self):
+        # 09:00 ET Thursday — market closed, today's open is the next.
+        now = self._utc_from_ny(2026, 5, 14, 9, 0)
+        line = reporter._next_session_line(now)
+        assert "Thu 05-14 09:30 ET" in line
+        assert "in 30m" in line  # exactly 30 minutes until open
+
+    def test_holiday_skips_to_next_open_day(self):
+        # Wed 2026-11-25 17:00 ET. Thu 11-26 is Thanksgiving — skip. Fri
+        # 11-27 (half-day) opens at 09:30 still.
+        now = self._utc_from_ny(2026, 11, 25, 17, 0)
+        line = reporter._next_session_line(now)
+        assert "Fri 11-27 09:30 ET" in line
+
+    def test_helper_never_raises_on_garbage_now(self, monkeypatch):
+        # If market.next_session_open faults for some reason, the helper
+        # must degrade to "" — never propagate ("no Discord summary").
+        def _boom(*_a, **_k):
+            raise RuntimeError("clock broken")
+        monkeypatch.setattr(reporter.market, "next_session_open", _boom)
+        # is_market_open returns False → we'd hit next_session_open.
+        monkeypatch.setattr(reporter.market, "is_market_open", lambda *_a, **_k: False)
+        # Returns "" rather than raising.
+        assert reporter._next_session_line() == ""
+
+    def test_wired_into_hourly_summary_when_closed(
+        self, fresh_store, monkeypatch
+    ):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        # Freeze "now" to a Saturday so the line is rendered.
+        sat = self._utc_from_ny(2026, 5, 16, 10, 0)
+        monkeypatch.setattr(reporter.market, "is_market_open",
+                            lambda *_a, **_k: False)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5000.0)
+        monkeypatch.setattr(
+            reporter, "_next_session_line",
+            lambda *_a, **_k: reporter._next_session_line.__wrapped__(sat)
+            if hasattr(reporter._next_session_line, "__wrapped__")
+            else "**MARKET** ◈ closed — next session: Mon 05-18 09:30 ET (in 47h 30m)",
+        )
+        assert reporter.send_hourly_summary() is True
+        assert "**MARKET** ◈ closed — next session: Mon 05-18" in captured[0]
+
+    def test_not_wired_into_hourly_summary_when_open(
+        self, fresh_store, monkeypatch
+    ):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(reporter.market, "is_market_open",
+                            lambda *_a, **_k: True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5000.0)
+        assert reporter.send_hourly_summary() is True
+        assert "**MARKET** ◈ closed" not in captured[0]

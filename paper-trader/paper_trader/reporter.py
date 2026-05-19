@@ -1864,6 +1864,60 @@ def _ago(seconds: float) -> str:
     return f"{int(seconds // 86400)}d"
 
 
+def _countdown(seconds: float) -> str:
+    """Compact "in Xh Ym" / "in Nm" / "in Nd Yh" countdown label. Always
+    non-negative — a negative input clamps to 0m so a tiny clock-skew never
+    renders a misleading "-12m"."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 3600:
+        return f"in {int(seconds // 60)}m"
+    if seconds < 86400:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"in {h}h {m}m" if m else f"in {h}h"
+    d = int(seconds // 86400)
+    h = int((seconds % 86400) // 3600)
+    return f"in {d}d {h}h" if h else f"in {d}d"
+
+
+def _next_session_line(now: datetime | None = None) -> str:
+    """One-line "when does the next NYSE session start?" for the hourly
+    summary.
+
+    A trader who lives in Discord checks the hourly at any hour — including
+    weekends and overnight. The body currently shows positions + stale
+    prices but no orientation cue: a 2 AM ET check looks identical to a
+    10 AM ET one. This adds a single line so the operator can plan ("ok,
+    next open is Monday 09:30 ET, ~37h away").
+
+    Composes ``market.next_session_open`` verbatim (single source of truth —
+    the NYSE calendar lives in market.py). Pure: zero I/O, never raises.
+    Suppression: emit nothing when the market is currently OPEN (the
+    hourly during the session already implies "we're trading"). NY clock
+    explicit in the rendered string so the operator never has to mentally
+    convert.
+
+    Same additive failure contract as the rest of reporter: any fault
+    degrades to ``""`` ("no next-session line this report"), never an
+    exception ("no Discord summary this report"). ``now`` is injectable
+    for deterministic tests (the ``_fmt_trade_stamp`` precedent).
+    """
+    try:
+        n = now or datetime.now(timezone.utc)
+        if market.is_market_open(n):
+            return ""
+        nxt = market.next_session_open(n)
+        if nxt is None:
+            return ""
+        delta = (nxt - n).total_seconds()
+        nxt_ny = nxt.astimezone(market.NY)
+        when = nxt_ny.strftime("%a %m-%d 09:30 ET")
+        return f"**MARKET** ◈ closed — next session: {when} ({_countdown(delta)})"
+    except Exception as e:
+        print(f"[reporter] next-session line skipped: {e}")
+        return ""
+
+
 def _fmt_trade_stamp(ts_iso: str | None, now: datetime | None = None) -> str:
     """Bracket label for a recent-trade line in the hourly summary.
 
@@ -1928,6 +1982,9 @@ def send_hourly_summary() -> bool:
         + "\n".join(trade_lines)
         + "\n```"
     )
+    ns = _next_session_line()
+    if ns:
+        body += "\n" + ns
     lk = _singleton_lock_line()
     if lk:
         body += "\n" + lk
