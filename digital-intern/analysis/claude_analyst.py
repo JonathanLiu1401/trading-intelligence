@@ -530,6 +530,158 @@ def _alert_velocity_lines(
     ]
 
 
+# ── Per-held-ticker alert velocity (book-level magnitude) ────────────────────
+# ALERT VELOCITY tracks the OVERALL BREAKING wire firing-rate; BOOK HEAT tracks
+# how many DISTINCT digest rows touch each held name. Neither answers the
+# analyst-persona question the operator most cares about for *open positions*:
+# is one of MY held names itself the centre of the breaking-wire activity this
+# window? A held ticker carried by one alert is generic news (already surfaced
+# by the per-row [BOOK:] tag); the SAME held ticker carried by 4 distinct
+# breaking alerts in 5h vs 1 prior is a magnitude signal in its own right —
+# concentration on the position the analyst has money in.
+#
+# Same pure read-side, BOOK-HEAT-shaped contract as the existing held-book
+# blocks (separate input block, NEVER a per-row token, NEVER echoed): no DB
+# write, no ai_score/ml_score/score_source/urgency touch, no row mutation,
+# never reads or mutates source_articles, alert_recency.db is a separate file
+# (NOT articles.db) so backtest isolation holds by construction — all four
+# load-bearing invariants intact by construction. Data source mirrors
+# ``_collect_alert_velocity`` (the canonical fires log — ``alert_recency.db``
+# — NOT ``articles.db`` urgency=2 which also marks pre-fire-suppressed rows).
+#
+# Same minor under-count caveat as _collect_alert_velocity: ``record_alerted``
+# upserts on signature conflict (one row per signature, ``last_ts`` = LATEST
+# fire), so a signature firing twice across the 2× window is counted ONCE in
+# whichever sub-window its latest fire falls in. Trading the over-count of
+# articles.db-urgency=2 for this small ~3% under-count is unambiguous (the
+# error direction is analyst-safe: a held ticker briefly under-counted just
+# means it stays on the per-row [BOOK:] tag instead of getting the
+# multiplicity callout — silent, not noisy).
+#
+# Thresholds (conservative — the analyst's #1 complaint is noise):
+#   * recent >= 2: a single alert mentioning a held ticker is normal news,
+#     already surfaced by the per-row [BOOK:] tag and the cross-cycle alert-
+#     recency [ALERTED] briefing tag. This block's job is MULTIPLICITY —
+#     two or more breaking alerts mentioning the same held name in the
+#     window is the signal worth surfacing as a separate magnitude hint.
+ALERT_BOOK_VELOCITY_MIN_RECENT = 2
+_ALERT_BOOK_VELOCITY_MAX_LINES = 4
+
+
+def _collect_alert_book_velocity(
+    window_hours: float = 5.0,
+    now: datetime | None = None,
+) -> dict | None:
+    """Best-effort: per-held-ticker BREAKING-alert counts recent vs prior window.
+
+    Reads from ``watchers.alert_recency.recent_alerts`` (the canonical fires
+    log — NOT ``articles.db`` ``urgency=2`` which is also set by the four
+    pre-fire suppression gates in ``watchers.alert_agent.send_urgent_alert``
+    without firing a Discord push; see ``_collect_alert_velocity`` for the
+    full data-source rationale). Each fired-alert row's stored title is
+    scanned for held tickers via ``_book_tickers`` (reuses the same primitive
+    the briefing's BOOK HEAT / [BOOK:] tag use — single source of truth so
+    the three surfaces can never silently drift apart about whether a wire
+    touches the held book).
+
+    Returns ``{"window_h": int, "tickers": {T: {"recent": N, "prior": N},
+    ...}}`` or ``None`` on ANY failure (missing/locked DB, import error) —
+    an alert-book-velocity read must NEVER break or delay the 5h briefing
+    it annotates (identical discipline to ``_collect_source_health`` /
+    ``_collect_alert_velocity`` / ``_recent_briefing_digest``).
+    """
+    try:
+        from watchers.alert_recency import recent_alerts as _recent_alerts
+        # Need 2× window of alerts to split recent vs prior. Defensive cap
+        # at the alert_recency 2× TTL prune so we never ask for data the
+        # store has pruned.
+        from watchers.alert_recency import ALERT_RECENCY_TTL_HOURS as _TTL
+        ttl = min(2.0 * float(window_hours), 2.0 * float(_TTL))
+        alerts = _recent_alerts(ttl_hours=ttl, now=now) or []
+        tickers: dict[str, dict[str, int]] = {}
+        cutoff_recent = float(window_hours)
+        cutoff_window = 2.0 * float(window_hours)
+        for a in alerts:
+            try:
+                age_h = float(a.get("age_hours") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if age_h < 0 or age_h > cutoff_window:
+                continue
+            book = _book_tickers(
+                {"title": a.get("title") or "", "summary": ""}
+            )
+            if not book:
+                continue
+            bucket = "recent" if age_h <= cutoff_recent else "prior"
+            for t in book:
+                if t not in tickers:
+                    tickers[t] = {"recent": 0, "prior": 0}
+                tickers[t][bucket] += 1
+        return {
+            "window_h": int(round(float(window_hours))),
+            "tickers": tickers,
+        }
+    except Exception:
+        return None
+
+
+def _alert_book_velocity_lines(
+    velocity: dict | None,
+    min_recent: int = ALERT_BOOK_VELOCITY_MIN_RECENT,
+    max_lines: int = _ALERT_BOOK_VELOCITY_MAX_LINES,
+) -> list[str]:
+    """Pure: render per-held-ticker BREAKING-alert velocity into ranked lines.
+
+    Skip a ticker with ``recent < min_recent``: single-alert noise is already
+    surfaced by the per-row ``[BOOK:]`` tag and the briefing's ``[ALERTED]``
+    parity tag. This block's job is MULTIPLICITY (≥2 alerts on the same held
+    name in window). A ``prior == 0`` baseline with ``recent >= min_recent``
+    is the STRONGEST per-position signal (newly-active wire on a held name)
+    and is emitted, just like ``_alert_velocity_lines``' newly-lit edge.
+
+    Sort: ``recent`` desc, then canonical ``_BOOK_TICKERS`` order — same
+    stable cycle-to-cycle tiebreak as ``_book_heat_lines`` / ``_book_tickers``
+    / ``_book_silence_lines`` so all four held-book surfaces describe the
+    same window in the same order.
+
+    Returns ``[]`` on non-dict input or unparseable ``window_h`` — same
+    "degrade rather than crash the briefing" discipline as
+    ``_alert_velocity_lines``.
+    """
+    if not isinstance(velocity, dict):
+        return []
+    tickers = velocity.get("tickers")
+    if not isinstance(tickers, dict) or not tickers:
+        return []
+    try:
+        window_h = int(velocity.get("window_h") or 0)
+    except (TypeError, ValueError):
+        return []
+    if window_h <= 0:
+        return []
+    rank = {t: i for i, t in enumerate(_BOOK_TICKERS)}
+    rows: list[tuple[int, int, str]] = []
+    for t, counts in tickers.items():
+        if not isinstance(counts, dict):
+            continue
+        try:
+            r = int(counts.get("recent") or 0)
+            p = int(counts.get("prior") or 0)
+        except (TypeError, ValueError):
+            continue
+        if r < min_recent or r < 0 or p < 0:
+            continue
+        rows.append((
+            -r,
+            rank.get(t, len(rank)),
+            f"{t} — {r} BREAKING alerts mention this name in last "
+            f"{window_h}h (vs {p} in prior {window_h}h)",
+        ))
+    rows.sort()
+    return [line for _, _, line in rows[:max_lines]]
+
+
 # ── Prior-digest continuity (anti-rehash) ────────────────────────────────────
 # A news analyst reading consecutive 5h heartbeats complains most about
 # repetition: the briefing re-LEADS with the SAME story it led with last time.
@@ -677,6 +829,7 @@ RULES:
 - If a "COVERAGE GAP" block is present in the data input, reproduce it as a **COVERAGE GAP** section (one bullet per dark channel, verbatim). These are intel channels the system could NOT collect from this window — the analyst must know what they are blind to, not assume silence means calm. Omit the section entirely if no gap block is provided.
 - If a "THROUGHPUT DEGRADATION" block is present in the data input, reproduce it as a **THROUGHPUT DEGRADATION** section directly under the COVERAGE GAP bullets (one bullet per source, verbatim). These sources are still alive but have lost most of their recent flow — partial blind spots an analyst must know about (the early-warning complement to COVERAGE GAP: a marginally-alive source has not crossed the disable threshold yet, but the briefing has materially less coverage from it than the prior window). Omit the section entirely if no degradation block is provided.
 - If an "ALERT VELOCITY" block is present in the data input, reproduce it as an **ALERT VELOCITY** section under the THROUGHPUT DEGRADATION bullets (one bullet, verbatim). This is the BREAKING-alert wire's firing-rate vs the prior window of the same length: an objective magnitude signal independent of any individual story's score. Use it for cumulative framing — a "wire materially hot" window means cumulative event flow is itself the story (weight the LEAD accordingly: macro/risk regime, not a lone headline); a "wire silent" window means scrutinise any one BREAKING-tagged story more carefully. Omit the section entirely if no velocity block is provided.
+- If an "ALERT BOOK VELOCITY" block is present, it lists held names mentioned in MULTIPLE 🚨 BREAKING alerts in the recent window vs the prior window of the same length — per-position alert-rate magnitude. The per-row [BOOK:] tag flags WHICH rows touch the held book; this block flags that the held name is itself the WINDOW'S hot centre of breaking-wire activity (≥2 distinct alerts mention it). Weight these held names above other rows of comparable score when choosing the LEAD and ordering TOP SIGNALS, and give them a concrete forward-looking implication in the PORTFOLIO table. This is a ranking/weighting hint only — do NOT echo a literal "ALERT BOOK VELOCITY" section in the output (same as BOOK HEAT / BOOK SILENCE / AGING TOP ROWS, unlike COVERAGE GAP).
 - If a "PRIOR DIGEST" block is present, it is the LEAD and TOP SIGNALS YOU YOURSELF published in your previous 5h briefing — the analyst just read that one. Re-leading the SAME story as if it were new is the single most-cited "repetitive digest" complaint. If the dominant story is materially unchanged, do NOT restate it as the LEAD: lead instead with what has CHANGED since (a new level/print/catalyst, a reversal, or a genuinely different top story that now outranks it), and frame any necessarily-carried theme explicitly as continuation/development ("rout now easing", "follows this morning's selloff"), never as a fresh break. This is a framing/selection hint only — do NOT echo a literal "PRIOR DIGEST" section in the output (same as BOOK HEAT / AGING TOP ROWS, unlike COVERAGE GAP).
 
 OUTPUT FORMAT — use EXACTLY this, filled with real data:
@@ -1278,7 +1431,7 @@ def _aging_top_rows(
 
 def _build_payload(articles, stock_data, earnings, source_health_report=None,
                    prior_digest=None, source_throughput=None,
-                   alert_velocity=None):
+                   alert_velocity=None, alert_book_velocity=None):
     parts = [f"BRIEFING TIME: {_now_utc_str()}\n"]
 
     macro_data   = stock_data.get("macro", [])   if isinstance(stock_data, dict) else []
@@ -1529,6 +1682,28 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None,
             for al in av_lines:
                 parts.append(f"  - {al}")
 
+    # Alert-book-velocity block — per-held-ticker BREAKING-alert magnitude.
+    # ALERT VELOCITY measures the OVERALL wire firing rate; this is the
+    # per-position complement, reading the SAME canonical fires log
+    # (alert_recency.db, NOT articles.db urgency=2) but bucketing by which
+    # held tickers each alert's title mentions. Same omit-when-None /
+    # omit-when-below-threshold discipline as alert_velocity (so the
+    # 7-arg path stays byte-identical for callers that don't pass it). An
+    # INPUT hint, NOT a reproduced section (SYSTEM_PROMPT rule below) — same
+    # BOOK-HEAT-shaped contract as the held-book block family. Pure read-side:
+    # no DB write, no ai_score/ml_score/score_source/urgency touch, never
+    # reads or mutates source_articles, alert_recency.db is a separate file —
+    # all four load-bearing invariants intact by construction.
+    if alert_book_velocity is not None:
+        abv_lines = _alert_book_velocity_lines(alert_book_velocity)
+        if abv_lines:
+            parts.append(
+                "\n=== ALERT BOOK VELOCITY (held names mentioned in multiple "
+                "BREAKING alerts vs prior window — per-position magnitude) ==="
+            )
+            for al in abv_lines:
+                parts.append(f"  - {al}")
+
     # Prior-digest continuity block — anti-rehash. Only emitted when an
     # explicit prior digest is supplied (analyze() reads it best-effort);
     # ``None`` ⇒ the section is omitted entirely and the 4-arg path stays
@@ -1563,6 +1738,7 @@ def analyze(articles, stock_data, earnings):
         prior_digest=_recent_briefing_digest(),
         source_throughput=_collect_source_throughput(),
         alert_velocity=_collect_alert_velocity(),
+        alert_book_velocity=_collect_alert_book_velocity(),
     )
     full_prompt = f"{SYSTEM_PROMPT}\n\n---\nDATA INPUT:\n{payload}"
     result = claude_call(full_prompt, model=MODEL, timeout=180)
