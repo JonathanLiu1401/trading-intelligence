@@ -186,6 +186,398 @@ def _tail_risk_chat_lines(an: dict) -> list[str]:
     ]
 
 
+# ── alert-confidence-trend enrichment ──────────────────────────────────
+# Clusters urgent / near-urgent articles in the last 24h by title-token
+# Jaccard similarity (reusing `ml/dedup.py`'s normalizer) and reports the
+# corroborating-source count delta between the recent half (0-6h) and the
+# earlier half (6-24h). A story whose unique-source count is GROWING is
+# being corroborated by additional outlets — high-trust, possibly act soon;
+# a flat count from a single outlet is PR / spam; a high count fading to
+# zero recent sources is the wire moving on.
+#
+# The existing `news_corroboration` endpoint reports CURRENT-state source
+# counts; this is the temporal-DELTA companion the chat carried no view of.
+_ALERT_TREND_DELTA = 1     # min new sources in recent half to call RISING
+_ALERT_CLUSTER_THRESHOLD = 0.6  # Jaccard match — same as ml.dedup default
+
+
+def build_alert_confidence_trend(
+    articles: Any,
+    *,
+    now: datetime | None = None,
+    min_cluster_size: int = 2,
+    max_clusters: int = 6,
+) -> dict:
+    """Cluster urgent articles by title and report source-count trend.
+
+    Pure / total — never raises, never reads DB. Caller supplies article
+    rows (already filtered to `urgency >= 1` and through `_LIVE_ONLY_SQL`).
+
+    Each output cluster carries:
+      - `anchor_title`: the highest-ai_score title in the cluster (the
+        canonical headline the analyst recognizes)
+      - `n_total`, `n_recent` (0-6h), `n_earlier` (6-24h): UNIQUE source
+        counts (a single outlet syndicating itself doesn't inflate trust)
+      - `delta`: n_recent − n_earlier
+      - `trend`: ``RISING`` (delta ≥ +ALERT_TREND_DELTA), ``FADING``
+        (delta ≤ -ALERT_TREND_DELTA), ``STABLE``, or ``SINGLE_SOURCE``
+        (only one unique source across the window — likely PR/spam, not a
+        corroborated story)
+      - `max_ai_score`: peak ai_score in the cluster (lets the analyst
+        prioritise across clusters by both trend AND urgency)
+
+    Clustering reuses `ml.dedup.title_tokens` + `jaccard_similarity` so
+    chat / briefing / dashboard cluster identically (no drift).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if not isinstance(articles, (list, tuple)):
+        return {"as_of": now.isoformat(timespec="seconds"),
+                "window_hours": 24, "clusters": []}
+    # Import inline so a missing module never breaks the chat handler at
+    # import time (dedup is part of the same repo, this is belt-and-braces).
+    try:
+        from ml.dedup import title_tokens, jaccard_similarity
+    except ImportError:
+        return {"as_of": now.isoformat(timespec="seconds"),
+                "window_hours": 24, "clusters": []}
+    cutoff = now - timedelta(hours=24)
+    boundary = now - timedelta(hours=6)
+    clusters: list[dict] = []
+    for art in articles:
+        if not isinstance(art, dict):
+            continue
+        ts = _parse_first_seen(art.get("first_seen"))
+        if ts is None or ts < cutoff or ts > now:
+            continue
+        title = art.get("title") or ""
+        toks = title_tokens(title)
+        if not toks:
+            continue
+        try:
+            score = float(art.get("ai_score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        source = (art.get("source") or "").strip().lower()
+        is_recent = ts >= boundary
+        placed = False
+        for cl in clusters:
+            if jaccard_similarity(toks, cl["anchor_tokens"]) >= _ALERT_CLUSTER_THRESHOLD:
+                if score > cl["max_ai_score"]:
+                    cl["max_ai_score"] = score
+                    cl["anchor_title"] = title
+                if source:
+                    if is_recent:
+                        cl["recent_sources"].add(source)
+                    else:
+                        cl["earlier_sources"].add(source)
+                    cl["all_sources"].add(source)
+                cl["n_articles"] += 1
+                placed = True
+                break
+        if not placed:
+            clusters.append({
+                "anchor_tokens": toks,
+                "anchor_title": title,
+                "max_ai_score": score,
+                "recent_sources": ({source} if (source and is_recent) else set()),
+                "earlier_sources": ({source} if (source and not is_recent) else set()),
+                "all_sources": ({source} if source else set()),
+                "n_articles": 1,
+            })
+    out: list[dict] = []
+    for cl in clusters:
+        if cl["n_articles"] < min_cluster_size:
+            continue
+        n_recent = len(cl["recent_sources"])
+        n_earlier = len(cl["earlier_sources"])
+        n_total = len(cl["all_sources"])
+        delta = n_recent - n_earlier
+        if n_total <= 1:
+            trend = "SINGLE_SOURCE"
+        elif delta >= _ALERT_TREND_DELTA:
+            trend = "RISING"
+        elif delta <= -_ALERT_TREND_DELTA:
+            trend = "FADING"
+        else:
+            trend = "STABLE"
+        out.append({
+            "anchor_title": cl["anchor_title"],
+            "max_ai_score": round(cl["max_ai_score"], 2),
+            "n_articles": cl["n_articles"],
+            "n_total_sources": n_total,
+            "n_recent_sources": n_recent,
+            "n_earlier_sources": n_earlier,
+            "delta": delta,
+            "trend": trend,
+        })
+    # Rank: RISING first (most actionable), then STABLE/FADING by score.
+    _trend_order = {"RISING": 0, "STABLE": 1, "FADING": 2, "SINGLE_SOURCE": 3}
+    out.sort(key=lambda c: (
+        _trend_order.get(c["trend"], 9),
+        -c["max_ai_score"],
+    ))
+    return {
+        "as_of": now.isoformat(timespec="seconds"),
+        "window_hours": 24,
+        "boundary_hours": 6,
+        "clusters": out[:max_clusters],
+    }
+
+
+_ALERT_TREND_REAL = ("RISING", "FADING")  # STABLE/SINGLE_SOURCE → silence
+
+
+def _alert_confidence_trend_chat_lines(rep) -> list[str]:
+    """Render `build_alert_confidence_trend` as chat-context lines.
+
+    Same pure / total contract as siblings — non-dict / empty clusters →
+    ``[]``. STABLE & SINGLE_SOURCE are silent (the chat already shows
+    `articles_block` for current top signals; this surface adds value only
+    by flagging stories whose corroboration is actively moving).
+    """
+    if not isinstance(rep, dict):
+        return []
+    clusters = rep.get("clusters")
+    if not isinstance(clusters, list) or not clusters:
+        return []
+    lines: list[str] = []
+    for cl in clusters:
+        if not isinstance(cl, dict):
+            continue
+        trend = cl.get("trend")
+        if trend not in _ALERT_TREND_REAL:
+            continue
+        title = (cl.get("anchor_title") or "").strip()
+        if not title:
+            continue
+        n_total = cl.get("n_total_sources")
+        n_recent = cl.get("n_recent_sources")
+        n_earlier = cl.get("n_earlier_sources")
+        score = cl.get("max_ai_score")
+        score_s = (f", score {score:.1f}"
+                   if isinstance(score, (int, float)) else "")
+        # Truncate title to keep chat budget tight; the operator can ask
+        # for full details if needed.
+        title_short = title if len(title) <= 90 else title[:87] + "..."
+        # Render arrow direction so the line reads left-to-right as time.
+        if (isinstance(n_earlier, int) and isinstance(n_recent, int)
+                and isinstance(n_total, int)):
+            corr_s = (
+                f" ({n_earlier} src in 6-24h → {n_recent} src in 0-6h, "
+                f"{n_total} total)"
+            )
+        else:
+            corr_s = ""
+        lines.append(f"[{trend}{score_s}] {title_short}{corr_s}")
+    return lines
+
+
+# ── position-conviction-decay enrichment ───────────────────────────────
+# Per-held-ticker 24h ai_score trend, bucketed into 4 × 6h slices.
+# Closes the temporal gap in `_portfolio_signals` (snapshot only). A held
+# position whose ai_score band is RISING means the wire is increasingly
+# focused on it; FADING means the story is going quiet. Pure builder + pure
+# render helper — no Flask, no DB; the chat handler injects ticker list +
+# pre-fetched article rows.
+_CONV_DELTA_THRESHOLD = 0.5  # avg ai_score delta to call RISING / FADING
+_CONV_MIN_ARTICLES = 2       # below this, trend is INSUFFICIENT_DATA
+
+
+def _parse_first_seen(s: Any) -> datetime | None:
+    """Robust ISO timestamp parser — returns aware UTC datetime or None.
+    Mirrors the tolerance of `analysis.claude_analyst` so the briefing and
+    the chat helper bucket articles into the same windows."""
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        # Accept both '...+00:00' and '...Z'
+        v = s.replace("Z", "+00:00") if s.endswith("Z") else s
+        dt = datetime.fromisoformat(v)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def build_position_conviction_decay(
+    held_tickers: Any,
+    articles: Any,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """Bucket the last 24h of articles into 4 × 6h slices per held ticker
+    and report the avg ai_score per bucket + a coarse trend verdict.
+
+    Pure / total — never raises, never reads DB, never sub-fetches. Caller
+    supplies the held ticker list (from paper-trader's /api/state.positions)
+    and the recent article rows (already filtered through `_LIVE_ONLY_SQL`).
+
+    Trend rule (deliberately blunt — a finer model would over-fit the
+    sparse-sample regime this runs in): compare the avg ai_score of the
+    earlier half (12-24h bucket) against the recent half (0-12h bucket).
+    Δ > +CONV_DELTA_THRESHOLD → RISING; Δ < -CONV_DELTA_THRESHOLD →
+    FADING; else STABLE. Fewer than CONV_MIN_ARTICLES total → trend is
+    INSUFFICIENT_DATA and the bucket numbers still surface honestly.
+
+    Buckets are oldest → newest in `buckets`:
+      bucket[0] = 18-24h, bucket[1] = 12-18h, bucket[2] = 6-12h, bucket[3] = 0-6h
+    So the *last* element is the freshest. Each bucket carries `n` (count)
+    and `avg` (mean ai_score; None when n == 0).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    # Normalize held tickers — accept list[str] or list[dict] with "ticker".
+    held: set[str] = set()
+    if isinstance(held_tickers, (list, tuple, set)):
+        for h in held_tickers:
+            if isinstance(h, str):
+                t = h.strip().upper()
+                if t:
+                    held.add(t)
+            elif isinstance(h, dict):
+                t = (h.get("ticker") or "").strip().upper()
+                if t:
+                    held.add(t)
+    out_tickers: list[dict] = []
+    if not held or not isinstance(articles, (list, tuple)):
+        return {
+            "as_of": now.isoformat(timespec="seconds"),
+            "window_hours": 24,
+            "bucket_hours": 6,
+            "tickers": [],
+        }
+    # Compile a case-insensitive word-boundary regex per held ticker; we
+    # match the title (cheap and consistent with the rest of the daemon's
+    # ticker extraction patterns — the brittler "tickers" column may be
+    # missing on legacy rows).
+    patterns = {
+        t: re.compile(rf"\b{re.escape(t)}\b", re.IGNORECASE) for t in held
+    }
+    cutoff = now - timedelta(hours=24)
+    # buckets[ticker] = [list_for_18-24, list_for_12-18, list_for_6-12, list_for_0-6]
+    buckets: dict[str, list[list[float]]] = {t: [[], [], [], []] for t in held}
+    for art in articles:
+        if not isinstance(art, dict):
+            continue
+        ts = _parse_first_seen(art.get("first_seen"))
+        if ts is None or ts < cutoff or ts > now:
+            continue
+        age_h = (now - ts).total_seconds() / 3600.0
+        # idx = 0 (18-24h) … 3 (0-6h). Round down conservatively.
+        if age_h >= 24:
+            continue
+        idx = 3 - min(3, int(age_h // 6))
+        title = (art.get("title") or "")
+        try:
+            score = float(art.get("ai_score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        for tk, pat in patterns.items():
+            if pat.search(title):
+                buckets[tk][idx].append(score)
+    for tk in sorted(held):
+        slots = buckets[tk]
+        bucket_view = []
+        for slot in slots:
+            n = len(slot)
+            avg = (sum(slot) / n) if n else None
+            bucket_view.append({"n": n, "avg": round(avg, 2) if avg is not None else None})
+        n_total = sum(b["n"] for b in bucket_view)
+        # Trend: recent half (idx 2+3 = 0-12h) vs earlier half (idx 0+1 = 12-24h).
+        recent_scores = slots[2] + slots[3]
+        earlier_scores = slots[0] + slots[1]
+        if n_total < _CONV_MIN_ARTICLES or not recent_scores or not earlier_scores:
+            trend = "INSUFFICIENT_DATA"
+            delta: float | None = None
+        else:
+            r_avg = sum(recent_scores) / len(recent_scores)
+            e_avg = sum(earlier_scores) / len(earlier_scores)
+            delta = r_avg - e_avg
+            if delta > _CONV_DELTA_THRESHOLD:
+                trend = "RISING"
+            elif delta < -_CONV_DELTA_THRESHOLD:
+                trend = "FADING"
+            else:
+                trend = "STABLE"
+        row = {
+            "ticker": tk,
+            "n_articles": n_total,
+            "buckets": bucket_view,    # oldest → newest
+            "trend": trend,
+        }
+        if delta is not None:
+            row["recent_minus_earlier"] = round(delta, 2)
+        out_tickers.append(row)
+    return {
+        "as_of": now.isoformat(timespec="seconds"),
+        "window_hours": 24,
+        "bucket_hours": 6,
+        "tickers": out_tickers,
+    }
+
+
+_CONV_REAL_TRENDS = ("RISING", "STABLE", "FADING")
+
+
+def _position_conviction_decay_chat_lines(rep) -> list[str]:
+    """Render `build_position_conviction_decay` output as chat-context lines.
+
+    Pure / total — mirrors the `_baseline_compare_chat_lines` contract:
+    non-dict / missing structure → ``[]`` (silence, never an exception).
+    A ticker with INSUFFICIENT_DATA collapses to one honest line; a real
+    trend gets a one-line summary with the bucket counts so the analyst can
+    audit the verdict (a 'RISING' that's really 1→2 articles deserves the
+    raw n visible, not buried).
+    """
+    if not isinstance(rep, dict):
+        return []
+    tickers = rep.get("tickers")
+    if not isinstance(tickers, list) or not tickers:
+        return []
+    lines: list[str] = []
+    # Stable trend → silence (chat budget is finite; only surface motion).
+    # INSUFFICIENT_DATA → silence per ticker (no value in saying "I don't know"
+    # for every held name); but if EVERY held ticker is INSUFFICIENT_DATA the
+    # block stays empty (handler omits the section).
+    for row in tickers:
+        if not isinstance(row, dict):
+            continue
+        trend = row.get("trend")
+        if trend not in _CONV_REAL_TRENDS:
+            continue
+        if trend == "STABLE":
+            continue
+        tk = row.get("ticker") or "?"
+        n = row.get("n_articles")
+        delta = row.get("recent_minus_earlier")
+        buckets = row.get("buckets") or []
+        # Render oldest → newest so the chat reads left-to-right as time forward.
+        if isinstance(buckets, list) and len(buckets) == 4:
+            parts = []
+            for label, b in zip(("18-24h", "12-18h", "6-12h", "0-6h"), buckets):
+                if not isinstance(b, dict):
+                    continue
+                bn = b.get("n") or 0
+                avg = b.get("avg")
+                if bn == 0 or avg is None:
+                    parts.append(f"{label} —")
+                else:
+                    parts.append(f"{label} {avg:.1f}({bn})")
+            bucket_s = " → ".join(parts)
+        else:
+            bucket_s = ""
+        delta_s = (f", recent−earlier {delta:+.2f}"
+                   if isinstance(delta, (int, float)) else "")
+        n_s = (f", n={n}" if isinstance(n, int) else "")
+        line = f"{tk}: 24h ai_score trend {trend}{n_s}{delta_s}"
+        if bucket_s:
+            line += f" [{bucket_s}]"
+        lines.append(line)
+    return lines
+
+
 _BC_REAL_VERDICTS = (
     "MLP_ADDS_SKILL", "MLP_NO_BETTER_THAN_TRIVIAL", "MLP_WORSE_THAN_TRIVIAL",
 )
@@ -2324,6 +2716,99 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: action-plan fetch failed: %s", e)
 
+        # Per-held-ticker 24h ai_score TREND (RISING / FADING) — the temporal
+        # complement to /api/portfolio-signals' current-state snapshot. The
+        # chat already carries "what's the wire saying about MU right now";
+        # this answers "is that signal RAMPING UP, going QUIET, or stable
+        # since you last asked?" — exactly the question an analyst gets when
+        # the portfolio block shows a held name and the operator wants to
+        # know whether to push or fade. Pure helpers (`build_position_
+        # conviction_decay` + `_position_conviction_decay_chat_lines`); held
+        # tickers come from the same /api/state already fetched above so we
+        # don't double the upstream load. STABLE & INSUFFICIENT_DATA collapse
+        # to silence per-ticker; an all-silent block omits the section.
+        conviction_decay_block = ""
+        try:
+            # `pt` was set by the paper-trader-state fetch above; extract
+            # held tickers from its positions. Falls back to silence if
+            # paper-trader was unreachable (pt would be undefined here, so
+            # we guard via locals()).
+            _pt = locals().get("pt")
+            held_tickers: list[str] = []
+            if isinstance(_pt, dict):
+                for p in (_pt.get("positions") or []):
+                    if not isinstance(p, dict):
+                        continue
+                    if p.get("type") and p.get("type") != "stock":
+                        continue
+                    qty = p.get("qty") or 0
+                    if not (isinstance(qty, (int, float)) and qty > 0):
+                        continue
+                    tk = (p.get("ticker") or "").strip().upper()
+                    if tk:
+                        held_tickers.append(tk)
+            if held_tickers:
+                cutoff = (
+                    datetime.now(timezone.utc) - timedelta(hours=24)
+                ).isoformat()
+                try:
+                    rows = _ro_query(
+                        "SELECT title, ai_score, first_seen FROM articles "
+                        f"WHERE first_seen >= ? AND {_LIVE_ONLY_SQL} "
+                        "ORDER BY first_seen DESC LIMIT 4000",
+                        (cutoff,),
+                    )
+                except sqlite3.Error:
+                    rows = []
+                arts = [
+                    {"title": r[0] or "", "ai_score": float(r[1] or 0),
+                     "first_seen": r[2]}
+                    for r in rows
+                ]
+                rep = build_position_conviction_decay(held_tickers, arts)
+                conviction_decay_block = "\n".join(
+                    _position_conviction_decay_chat_lines(rep))
+        except Exception as e:
+            _logger().warning(
+                "chat: position-conviction-decay enrichment failed: %s", e)
+
+        # Alert-confidence trend — which urgent stories are gaining new
+        # corroborating sources (RISING) vs which started loud and are
+        # losing the wire (FADING). The existing news_corroboration
+        # endpoint reports CURRENT-state source counts; this is the
+        # temporal-delta companion that tells the analyst "Nvidia earnings
+        # was 3-source 18h ago → 8-source now (RISING)" vs "rate cut
+        # rumour was 5-source then → 1-source now (FADING)". RISING
+        # corroboration is the highest-trust BUY signal; STABLE +
+        # SINGLE_SOURCE clusters silently drop (chat budget, and a
+        # single-source story is usually PR/spam not corroboration).
+        alert_trend_block = ""
+        try:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=24)
+            ).isoformat()
+            try:
+                rows = _ro_query(
+                    "SELECT title, ai_score, first_seen, source FROM articles "
+                    f"WHERE first_seen >= ? AND urgency >= 1 "
+                    f"AND {_LIVE_ONLY_SQL} "
+                    "ORDER BY first_seen DESC LIMIT 4000",
+                    (cutoff,),
+                )
+            except sqlite3.Error:
+                rows = []
+            arts = [
+                {"title": r[0] or "", "ai_score": float(r[1] or 0),
+                 "first_seen": r[2], "source": r[3] or ""}
+                for r in rows
+            ]
+            rep = build_alert_confidence_trend(arts)
+            alert_trend_block = "\n".join(
+                _alert_confidence_trend_chat_lines(rep))
+        except Exception as e:
+            _logger().warning(
+                "chat: alert-confidence-trend enrichment failed: %s", e)
+
         now_iso = datetime.now(timezone.utc).isoformat()
         system_prompt = (
             "You are a market intelligence analyst with access to a real-time news feed, "
@@ -2345,6 +2830,8 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — FACTOR CONCENTRATION (the held book's pairwise return correlation + effective-independent-bets count; complements /api/risk's NAME-level view — a 59/41 book that is concentrated by weight may STILL be a single FACTOR bet if both names move as one):\n{correlation_block}\n\n" if correlation_block else "")
             + (f"PAPER TRADER — PRIORITISED ACTION PLAN (the bot's own next-session game plan):\n{game_plan_block}\n\n" if game_plan_block else "")
             + (f"PAPER TRADER — HOLD-DISCIPLINE ALERT (a losing position overstayed past the desk's own median losing-cut):\n{hold_discipline_block}\n\n" if hold_discipline_block else "")
+            + (f"HELD-TICKER 24h NEWS-CONVICTION TREND (per held name, ai_score bucketed into 4 × 6h slices; only RISING / FADING are surfaced — STABLE/quiet collapses to silence. Complements /api/portfolio-signals' current-state snapshot with the temporal direction: is the wire focusing MORE or LESS on this position over the last day?):\n{conviction_decay_block}\n\n" if conviction_decay_block else "")
+            + (f"ALERT-CONFIDENCE TREND (urgent-story clusters whose unique-source count is GROWING or FADING vs the prior 6-24h half; corroboration that's still expanding is the highest-trust read — a single-source story is usually PR not news, a fading story has been priced):\n{alert_trend_block}\n\n" if alert_trend_block else "")
             + (f"PAPER TRADER OPTIONS GREEKS (Black-Scholes, live IV):\n{greeks_block}\n\n" if greeks_block else "")
             + (f"NEWS SECTOR PULSE (native — where the wire is concentrated right now, recency-weighted, last 24h; independent of the price heatmap below so it survives a stale/down paper-trader):\n{sector_pulse_block}\n\n" if sector_pulse_block else "")
             + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP (paper-trader price momentum):\n{heatmap_block}\n\n" if heatmap_block else "")
