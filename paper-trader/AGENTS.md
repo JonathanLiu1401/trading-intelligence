@@ -7777,3 +7777,140 @@ pathspec (`git commit -- run_continuous_backtests.py
 tests/test_continuous.py`) as `c18e679`, which contains the correct
 files. The hazard matches [[pt-concurrent-samerole-staging-race]] in
 the agent memory exactly.
+
+
+## Review pass #33 — paper-trader core hybrid (2026-05-19)
+
+### Phase 1 fixes (commit ef6e9d0) — 4 surgical bugs in the Discord & decision-clock surfaces
+
+1. `reporter._trade_impact_line` SELL "closed" branch emitted
+   `closed — cash $X` *and then* unconditionally appended a second
+   `cash $X` token, so any full-close where the round-trip lookup
+   could not match (caller did not pass `store`, or
+   `build_round_trips` raised) produced a duplicated
+   `cash $X · cash $X` tail in the trade alert. No test covered this
+   path — added two: `store=None` and a `store` whose
+   `recent_trades` raises both must produce **exactly one** cash
+   token (`body.count("cash $X") == 1`).
+2. `reporter._decision_clock_line` was defined but never wired into
+   `send_hourly_summary` or `send_daily_close`, so the
+   `HOURLY_CONCENTRATION` verdict (the canonical signal that a
+   recurring NY hour is being starved by out-of-band Opus jobs) only
+   reached `/api/decision-clock` and never Discord. The end-to-end
+   test `test_hourly_summary_includes_line_when_concentrated` was
+   failing for this reason — fixed by appending `_decision_clock_line`
+   after `_position_attention_line` in both summary paths (preserves
+   the load-bearing HOST→CAPITAL→ATTENTION→CLOCK ordering: structural
+   risks first, drift signals after).
+3. `analytics.decision_clock.build_decision_clock` used
+   `int(days or 7)` which silently coerced an explicit `days=0` to
+   the default 7 instead of clamping to 1. `test_days_clamped`
+   `(0, 1)` was failing. Fixed by coercing `None`/non-numeric → 7
+   explicitly, then clamping `[1..30]`.
+4. `dashboard._swr_prewarm` was missing
+   `("earnings-distribution", earnings_distribution_api)` — the
+   `@swr_cached` `/api/earnings-distribution` endpoint cold-stalled
+   with `{"warming": true}` on first poll after every restart.
+   `test_swr_prewarm_coverage`'s "prewarm == @swr_cached" invariant
+   locked the gap.
+
+### Phase 2 feature (commit 838ec76) — per-position hold-age on Discord position lines
+
+`_pos_hold_age_token(p, now=None)` reads `opened_at` (always carried
+by `store.open_positions()`; absent on the unit-test position dicts
+and the persisted `portfolio.positions_json` cache, so existing
+assertions stay byte-compatible) and emits a compact `held 42m` /
+`held 5h` / `held 3d` token appended in `_portfolio_lines` after the
+existing `_pos_pct_weight` parenthetical. Mirrors the `held=Xd`
+annotation the Opus decision prompt already shows per position
+(`strategy._hold_age_str`) so the operator's Discord surface and the
+decision engine see the same staleness signal at a glance.
+
+A 4-day-stuck loser previously rendered identical to a fresh fill in
+the hourly / daily Discord summary — the desk's #1 documented
+pathology (disposition effect) was visible to the decision engine but
+invisible to the operator reviewing the book. Sub-minute returns are
+silent (no flicker on a just-opened lot); a future `opened_at` (NTP
+step-back — documented clock-skew hazard) clamps to silent rather
+than rendering a negative age (the `_fmt_trade_stamp` precedent).
+Observational only, no caps (invariants #2/#12 — the `stale_mark` /
+`pct-weight` precedent). 11 new tests under
+`TestPosHoldAgeToken` cover bucket boundaries, missing / unparseable
+/ naive / future fields, and the byte-compat guarantee for the
+existing `_portfolio_lines` call sites.
+
+### Phase 3 live-validation findings (live trader 2026-05-19 ~05:38 UTC)
+
+1. **Service is in a systemd-vs-manual restart spam** (known —
+   [[pt-systemd-vs-manual-restart-spam]]): the manual orphan instance
+   (PID 2502051, PPID 1) holds the singleton flock; the systemd unit
+   restarts every 15s, fails the lock acquisition, and exits — 276
+   restart attempts in journal. Documented; do not "fix" by killing
+   the manual instance, the operator chose this configuration.
+2. **77% NO_DECISION rate over the last 35 cycles** due to host
+   saturation (known — [[pt-no-decision-host-saturation]]): the
+   `/api/host-guard` `pulse.state` reads `STARVED` (probe clear now,
+   but intermittent out-of-band parallel Opus jobs OOM-starve the
+   live trader). This very review pass is one of the parallel Opus
+   sources. Not a code bug.
+3. **`_option_expired` UTC-vs-NY same-day-after-close gap** (low
+   impact, **not fixed this pass** — see Phase 1 advisor scope
+   ruling). For an option whose expiry == today, the comparison
+   `exp < datetime.now(timezone.utc).date()` only flips to True at
+   UTC midnight, which is 3-4 hours after the actual 16:00 ET close.
+   In that window an expired option is marked at avg_cost with
+   `stale_mark=True` instead of at `_expired_intrinsic` (worth $0
+   OTM or settlement). Market is closed so no trade executes against
+   the wrong mark — the impact is one stale-display window per
+   monthly expiry on the dashboard. Fix is straightforward (extend
+   the signature to take an optional `now: datetime` and compare via
+   NY date + same-day close-time check using `market.close_minute`)
+   but adds test surface across 6 existing test cases that pin
+   `today=date(...)`. Skipped this pass; documented for the next.
+4. **`/api/feed-health` HEALTHY** — 419 live articles in 2h, newest
+   0.1h old. The digital-intern pipeline is feeding the live trader
+   correctly; the NO_DECISION storm is purely Opus-side.
+5. **Dashboard responds fast** — 34 ms TTFB on `/` (280 kB HTML).
+   `/api/build-info` reports `stale: true, behind: 1` (the live
+   process is on `72285ac`, HEAD is `838ec76`) — the git-watcher will
+   restart between cycles to apply the Phase 2 hold-age annotation.
+
+### How to run / test
+
+Live trader: managed by `paper-trader.service` (systemd --user) **or**
+a manual orphan — current state has the manual instance holding the
+flock. To verify after a config change:
+```
+python3 -m paper_trader.should_restart    # OK / RESTART / OPS_ONLY / ERROR
+```
+
+Tests (this pass's scope):
+```
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_core_reporter.py -v          # 166 tests
+python3 -m pytest tests/test_decision_clock_builder.py -v # 28 tests
+python3 -m pytest tests/test_swr_prewarm_coverage.py -v   # 3 tests
+python3 -m pytest tests/ -v 2>&1 | tail -20               # full sweep
+```
+2448 tests pass + 1 skipped after this pass (was 2438 before; the
++10 includes the 8 new hold-age tests, 2 new duplicate-cash tests,
+and a small overlap with sibling Agent 4's `/api/sector-signal-fit`
+additions).
+
+### Invariants reaffirmed by this pass
+
+* **No `git add -A`** — sibling Agent 2 and Agent 4 were running
+  concurrently on the same tree; explicit pathspec on every commit
+  ([[pt-concurrent-samerole-staging-race]] discipline). My Phase 2
+  commit (`838ec76`) staged only `paper_trader/reporter.py` +
+  `tests/test_core_reporter.py`; Agent 4's `/api/sector-signal-fit`
+  + analytics file + tests were correctly left out.
+* **Reporter additive contract** — every Phase 1 + Phase 2 change
+  preserves the existing failure mode: a fault drops the offending
+  line, never the whole summary. Locked by the existing
+  `summary_still_sends_when_*_faults` tests across multiple
+  reporter blocks.
+* **Invariants #2/#12** — every new feature is observational only;
+  none gate Opus, none add silent caps. The hold-age token is the
+  same surfacing trajectory `stale_mark` / `_pos_pct_weight` /
+  `_session_block` followed.
