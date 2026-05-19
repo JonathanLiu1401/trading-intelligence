@@ -1041,6 +1041,126 @@ def build_portfolio_signals(articles: list, now: datetime | None = None) -> dict
     }
 
 
+def build_news_corroboration(
+    articles: list,
+    *,
+    min_sources: int = 2,
+    jaccard_threshold: float = 0.5,
+    max_clusters: int = 50,
+    now: datetime | None = None,
+) -> dict:
+    """Group syndicated articles by title-token Jaccard similarity and rank by
+    how many DISTINCT sources carried the same story.
+
+    Single-source urgency is the dominant false-positive in the live feed —
+    one wire-recap headline ("Why <ticker> Trading Up Today") can spike
+    ``ai_score`` past 9.0 and even trip ``urgency=2`` while no other outlet
+    has touched the story. Multi-source corroboration is the cheap, model-
+    independent signal a desk-side analyst would use to triage: if Reuters +
+    Bloomberg + Yahoo + CNBC all carry the same beat, it's real news; if a
+    single Google News aggregator wrapper carries it, it's noise to ignore
+    until a second source confirms.
+
+    SSOT: clustering reuses ``ml.dedup.title_tokens`` and
+    ``ml.dedup.jaccard_similarity`` verbatim — the same near-duplicate
+    primitives the briefing's domain-diversity / near-dup-collapse rely on —
+    so this view of "what story is this article about" cannot drift from how
+    the rest of the pipeline normalises titles.
+
+    Pure: no DB, no LLM, no network. Caller passes a list of article dicts
+    (must have ``title``, ``source``; ``ai_score`` / ``urgency`` /
+    ``first_seen`` / ``url`` optional). Output cluster ranking:
+      1. ``n_sources`` DESC  (most-corroborated first)
+      2. ``max_ai_score`` DESC  (within tie, highest-quality)
+      3. ``latest_first_seen`` DESC  (within tie, freshest)
+
+    Articles whose title yields no tokens (empty / pure-punct) form
+    standalone clusters — they will never reach ``min_sources >= 2`` unless
+    the impossible (multiple identical empty-title articles from distinct
+    sources) which is fine: this defaults the no-signal case to "skip".
+    """
+    from ml.dedup import jaccard_similarity, title_tokens
+
+    now = now or datetime.now(timezone.utc)
+    arts = list(articles or [])
+
+    clusters: list[dict] = []
+    for art in arts:
+        toks = title_tokens(art.get("title"))
+        placed = False
+        if toks:
+            for cl in clusters:
+                anchor = cl["anchor_tokens"]
+                if anchor and jaccard_similarity(toks, anchor) >= jaccard_threshold:
+                    cl["articles"].append(art)
+                    src = (art.get("source") or "").strip()
+                    if src:
+                        cl["sources"].add(src)
+                    placed = True
+                    break
+        if not placed:
+            src = (art.get("source") or "").strip()
+            clusters.append({
+                "anchor_tokens": toks,
+                "anchor_title": art.get("title") or "",
+                "articles": [art],
+                "sources": {src} if src else set(),
+            })
+
+    def _ai(a: dict) -> float:
+        try:
+            return float(a.get("ai_score") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _urg(a: dict) -> int:
+        try:
+            return int(a.get("urgency") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    out_clusters: list[dict] = []
+    for cl in clusters:
+        n_sources = len(cl["sources"])
+        if n_sources < min_sources:
+            continue
+        members = cl["articles"]
+        top = max(members, key=_ai)
+        first_seens = [a.get("first_seen") for a in members if a.get("first_seen")]
+        latest = max(first_seens) if first_seens else None
+        out_clusters.append({
+            "headline": top.get("title") or cl["anchor_title"],
+            "top_source": top.get("source"),
+            "top_url": top.get("url"),
+            "n_articles": len(members),
+            "n_sources": n_sources,
+            "sources": sorted(cl["sources"]),
+            "max_ai_score": round(max((_ai(a) for a in members), default=0.0), 3),
+            "max_urgency": max((_urg(a) for a in members), default=0),
+            "latest_first_seen": latest,
+        })
+
+    out_clusters.sort(
+        key=lambda c: (-c["n_sources"], -c["max_ai_score"],
+                       -(len(c["latest_first_seen"]) if c["latest_first_seen"] else 0),
+                       c["latest_first_seen"] or "")
+    )
+
+    n_kept = len(out_clusters)
+    if max_clusters and n_kept > max_clusters:
+        out_clusters = out_clusters[:max_clusters]
+
+    return {
+        "as_of": now.isoformat(),
+        "n_articles_scanned": len(arts),
+        "n_clusters_formed": len(clusters),
+        "n_multi_source": n_kept,
+        "min_sources": int(min_sources),
+        "jaccard_threshold": float(jaccard_threshold),
+        "clusters": out_clusters,
+    }
+
+
 def create_app(store=None) -> Flask:
     """Build the Flask app. ``store`` is the shared ArticleStore from daemon.py."""
     global _store
