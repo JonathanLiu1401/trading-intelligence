@@ -65,6 +65,7 @@ from collectors.newsapi_collector import collect_newsapi
 from collectors.yahoo_ticker_rss import collect_yahoo_ticker_rss
 from collectors.wikipedia_collector import collect_wikipedia
 from collectors.macro_calendar_collector import collect_macro_calendar
+from collectors.congress_trades_collector import collect_congress_trades
 from collectors.finra_short_volume import collect_finra_short_volume
 from collectors.market_movers import collect_market_movers
 from collectors import source_health
@@ -113,6 +114,7 @@ YAHOO_TICKER_RSS_INTERVAL = 240   # Yahoo per-ticker RSS every 4min
 WIKIPEDIA_INTERVAL  = 600         # Wikipedia recent-changes filter every 10min
 MACRO_CALENDAR_INTERVAL = 3600    # FOMC/BLS macro event calendar — once per hour
 FINRA_SHORT_INTERVAL    = 3600    # FINRA RegSHO short volume — once per hour (daily file)
+CONGRESS_TRADES_INTERVAL = 3600   # Congressional trading disclosures — once per hour
 MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
@@ -923,6 +925,28 @@ def finra_short_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(FINRA_SHORT_INTERVAL)
+
+
+# ── Worker: Congressional trading disclosures — every 1h ────────────────────
+def congress_trades_worker(store: ArticleStore):
+    log.info("[congress_trades_worker] started")
+    bo = Backoff("congress_trades", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_congress_trades()
+            _ingest(store, articles, "congress_trades")
+            try:
+                source_health.record_result("congress_trades", len(articles))
+            except Exception as he:
+                log.warning(f"[congress_trades_worker] source_health error: {he}")
+            _worker_last_ok["congress_trades"] = time.time()
+            log.debug(f"[congress_trades] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[congress_trades_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(CONGRESS_TRADES_INTERVAL)
 
 
 # ── Worker: Portfolio P/L snapshot — every 5min ─────────────────────────────
@@ -2070,6 +2094,7 @@ def main():
         ("wikipedia",   wikipedia_worker),
         ("macro_calendar", macro_calendar_worker),
         ("finra_short",   finra_short_worker),
+        ("congress_trades", congress_trades_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
