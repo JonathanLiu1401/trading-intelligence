@@ -70,6 +70,7 @@ from collectors.finra_short_volume import collect_finra_short_volume
 from collectors.market_movers import collect_market_movers
 from collectors.fear_greed_collector import collect_fear_greed
 from collectors.vix_term_structure import collect as collect_vix_ts
+from collectors.dxy_collector import collect as collect_dxy
 from collectors.cisa_kev_collector import collect_cisa_kev
 from collectors import source_health
 from core.backoff import Backoff
@@ -122,6 +123,7 @@ CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog
 MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
 VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
+DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
 EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
@@ -913,6 +915,29 @@ def vix_ts_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(VIX_TS_INTERVAL)
+
+
+# ── Worker: DXY + major-pair FX snapshot — every 10min ─────────────────────
+def dxy_worker(store: ArticleStore):
+    log.info("[dxy_worker] started")
+    bo = Backoff("dxy", base=30.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_dxy()
+            n = len(articles)
+            try:
+                source_health.record_result("dxy", n)
+            except Exception as he:
+                log.warning(f"[dxy_worker] source_health error: {he}")
+            _worker_last_ok["dxy"] = time.time()
+            if n:
+                log.info(f"[dxy] emitted {n} article(s)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[dxy_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(DXY_INTERVAL)
 
 
 # ── Worker: Wikipedia recent-changes filter — every 10min ───────────────────
@@ -2169,6 +2194,7 @@ def main():
         ("market_movers", market_movers_worker),
         ("fear_greed",  fear_greed_worker),
         ("vix_ts",      vix_ts_worker),
+        ("dxy",         dxy_worker),
         ("wikipedia",   wikipedia_worker),
         ("macro_calendar", macro_calendar_worker),
         ("finra_short",   finra_short_worker),
