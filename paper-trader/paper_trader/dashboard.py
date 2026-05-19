@@ -8386,6 +8386,75 @@ def sector_exposure_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/sector-signal-fit")
+def sector_signal_fit_api():
+    """Per-sector position weight vs. live-signal density — the "am I
+    allocated where the wire is pointing?" answer.
+
+    Composes ``/api/sector-exposure``'s position weights with a sector-
+    weighted ai_score rollup of the last ``hours`` (default 6) of live
+    signals (``signals.get_top_signals``) and reports per-sector
+    OVERWEIGHT (long but wire is quiet) / UNDERWEIGHT (signals strong but
+    no position) / ALIGNED, plus the top-level state and the most-divergent
+    sector. Signal ticker classification reuses ``sector_exposure.classify``
+    so the position and signal columns share one SECTOR_MAP (drift-locked).
+    Observational only; never gates Opus."""
+    try:
+        from .analytics.sector_exposure import build_sector_exposure
+        from .analytics.sector_signal_fit import (
+            build_sector_signal_fit, GAP_THRESHOLD_PCT,
+        )
+        from . import signals as _sig
+
+        try:
+            hours = int(request.args.get("hours", 6))
+        except (TypeError, ValueError):
+            hours = 6
+        hours = max(1, min(168, hours))
+        try:
+            min_score = float(request.args.get("min_score", 4.0))
+        except (TypeError, ValueError):
+            min_score = 4.0
+        try:
+            gap_threshold = float(
+                request.args.get("gap_threshold_pct", GAP_THRESHOLD_PCT))
+        except (TypeError, ValueError):
+            gap_threshold = GAP_THRESHOLD_PCT
+        try:
+            n_max = int(request.args.get("n", 80))
+        except (TypeError, ValueError):
+            n_max = 80
+        n_max = max(1, min(500, n_max))
+
+        store = get_store()
+        pf = store.get_portfolio()
+        positions = store.open_positions()
+        snap = {
+            "cash": float(pf.get("cash") or 0.0),
+            "total_value": float(pf.get("total_value") or 0.0),
+            "positions": positions,
+        }
+        try:
+            from .strategy import WATCHLIST as _WATCHLIST, _names_in_play
+            names = _names_in_play(positions, [], _WATCHLIST)
+        except Exception:
+            names = {(p.get("ticker") or "").upper()
+                     for p in positions if p.get("ticker")}
+        exposure = build_sector_exposure(snap, names)
+        sigs = _sig.get_top_signals(n=n_max, hours=hours, min_score=min_score)
+        fit = build_sector_signal_fit(
+            exposure, sigs, gap_threshold_pct=gap_threshold)
+        # Echo input knobs so the response is self-describing.
+        fit["window_hours"] = hours
+        fit["min_score"] = min_score
+        fit["gap_threshold_pct"] = gap_threshold
+        fit["n_signals_input"] = len(sigs)
+        return jsonify(fit)
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "NO_DATA",
+                        "sectors": []}), 500
+
+
 # ───────── Feature-dev additions (2026-05-15, agent 4) ─────────
 # /api/scorer-confidence — empirical ± bands + directional hit-rate for the
 #                          DecisionScorer, so its point predictions can be

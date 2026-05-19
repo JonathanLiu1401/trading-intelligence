@@ -1358,6 +1358,70 @@ old USB; RESTART it — the on-disk fix only applies on next start).
   trader restart). Commit pathspec-scoped (`web_server.py` + new test +
   this `AGENTS.md`), never `git add -A`.
 
+- **2026-05-18 (Agent 4, feature-dev — analyst-chat: held-ticker conviction-decay TREND + alert-confidence TREND)** —
+  Advisor-reviewed. Two additive chat enrichment blocks closing the
+  **temporal-direction** gap left by every existing enrichment (snapshot
+  only). `dashboard/web_server.py::api_chat` gains two pure helpers + their
+  builders (the `_baseline_compare_chat_lines`/`_macro_calendar_chat_lines`
+  precedent — total/pure, degrade to `[]`, never raise into chat):
+  **(1) `build_position_conviction_decay(held_tickers, articles, *, now)`
+  + `_position_conviction_decay_chat_lines(rep)`** — per-held-ticker 24h
+  ai_score bucketed into 4×6h slices (oldest→newest in `buckets`), with
+  trend ∈ `RISING`/`STABLE`/`FADING`/`INSUFFICIENT_DATA` judged on
+  recent-half avg vs earlier-half avg (`±_CONV_DELTA_THRESHOLD`=0.5).
+  Held tickers come from the **already-fetched `pt` dict** (the
+  `paper_trader_block` `/api/state` sub-fetch above; `locals().get('pt')`
+  guard means a stale/down trader degrades the new block to silence
+  without doubling the upstream load — the `_baseline_compare_chat_lines`
+  guarded-degrade sibling contract). Article rows come from a fresh
+  `_ro_query` against `articles.db` with the canonical `_LIVE_ONLY_SQL`
+  inlined verbatim (invariant: backtest isolation; mirrors
+  `api_sector_pulse`). Word-boundary case-insensitive ticker match on
+  title (MU does NOT match MUST / MUSK — discriminator test-pinned). Only
+  RISING / FADING surface as chat lines; STABLE & INSUFFICIENT_DATA
+  collapse to silence per ticker (chat budget — a quiet held book would
+  push every other sub-block off the screen).
+  **(2) `build_alert_confidence_trend(articles, *, now, min_cluster_size,
+  max_clusters)` + `_alert_confidence_trend_chat_lines(rep)`** — clusters
+  urgent articles (urgency≥1, last 24h, `_LIVE_ONLY_SQL`) by title-token
+  Jaccard similarity **reusing `ml.dedup.title_tokens` +
+  `jaccard_similarity`** (SSOT with the dedup module so chat / briefing /
+  dashboard cluster identically — no drift), and reports per-cluster
+  unique-source count delta between recent half (0-6h) and earlier half
+  (6-24h). Trend ∈ `RISING` (+`_ALERT_TREND_DELTA`=1 new corroborating
+  source) / `FADING` (−1) / `STABLE` / `SINGLE_SOURCE` (only one unique
+  outlet across the window — likely PR/spam, not corroboration; a single
+  outlet syndicating itself MUST NOT inflate trust — discriminator test-
+  pinned). Anchor title is the highest-ai_score cluster member (the
+  canonical headline the analyst recognises). Empty-source rows neither
+  inflate the unique-source count nor block cluster membership. Only
+  RISING / FADING surface; STABLE & SINGLE_SOURCE collapse to silence.
+  Both blocks wired as sibling cross-fetch sections (own try/except,
+  `_logger().warning` on fault), injected into `system_prompt` right
+  after `HOLD-DISCIPLINE ALERT` via the existing `if block else ""`
+  idiom under the headers `HELD-TICKER 24h NEWS-CONVICTION TREND` and
+  `ALERT-CONFIDENCE TREND`. New `tests/test_chat_position_conviction_
+  decay_enrichment.py` (30, pure-helper, no Flask/DB) and
+  `tests/test_chat_alert_confidence_trend_enrichment.py` (27, pure-helper,
+  no Flask/DB) — discriminating locks: bucket boundaries / 24h window
+  drop / word-boundary ticker match / case-insensitive match / dict-form
+  held tickers / RISING-FADING-STABLE-INSUFFICIENT threshold flips /
+  unique-source-count-not-article-count (single outlet syndicating
+  itself ⇒ SINGLE_SOURCE) / Jaccard near-duplicate collapse / unrelated-
+  stories-form-separate-clusters / min_cluster_size drops singletons /
+  anchor-title-is-highest-score / empty-source-doesn't-inflate / no-
+  ticker-counted-separately-not-absorbed-as-other / pure/total contracts.
+  One additive feature, **this repo only** (no cross-repo restart
+  coupling — both enrichments consume what the trader already emits, no
+  new `:8090` endpoints needed), never gates Opus (invariants #2/#12 —
+  chat context only). Suites: **57 new passed**; the chat-related
+  regression slice (`test_chat_*` + `test_portfolio_signals` +
+  `test_sector_pulse` + `test_news_corroboration` + `test_dedup`) **298
+  passed**; no import breakage in `tests/`. Applies on next
+  `systemctl --user restart digital-intern`. Commit pathspec-scoped
+  (`dashboard/web_server.py` + the two new test files + this `AGENTS.md`),
+  never `git add -A`.
+
 - **2026-05-18 (Agent 4, feature-dev — analyst-chat: forward FOMC / macro-calendar awareness)** —
   Advisor-reviewed; gap falsified by grep first (`macro|fomc|rate.decision`
   returned **nothing** in the chat path — the chat carried ~15 BACKWARD
