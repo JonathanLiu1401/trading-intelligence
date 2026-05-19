@@ -337,3 +337,136 @@ class TestCycleQuotaAlarm:
         assert runner._quota_alert_active is True              # not cleared
         assert not any("RECOVERED" in m for m in calls["send"])
         assert runner._consecutive_no_decisions == 1           # breaker counts it
+
+
+class TestCycleQuotaRecoveryUndelivered:
+    """Recovery-notice delivery must mirror the alarm-path symmetry: only
+    clear the dedupe latch when the operator actually received the "we're
+    back" message.
+
+    Without this, a transient openclaw / Discord outage at recovery time
+    silently DROPS the recovery message AND clears ``_quota_alert_active``.
+    Result: the operator, who only sees Discord, is stuck believing the
+    trader is still frozen until the NEXT quota outage re-alarms — i.e.
+    the trader could resume trading for hours/days while the desk thinks
+    it is dead. Clearing the latch only on a confirmed send retries the
+    notice on every subsequent non-NO_DECISION cycle until it lands.
+    """
+
+    _Q = {"status": "NO_DECISION", "decision": None, "quota_exhausted": True}
+    _OK = {"status": "HOLD", "decision": {"action": "HOLD"},
+           "quota_exhausted": False}
+
+    def _fixture(self, monkeypatch, send_results):
+        """Like cycle_spy but ``_send`` returns the next value from
+        ``send_results`` (list popped from the front). ``send_quota_alert``
+        always succeeds — the bug only manifests on the RECOVERY send."""
+        calls = {"quota_alert": 0, "send": [], "send_attempts": 0}
+        monkeypatch.setattr(
+            runner.reporter, "send_quota_alert",
+            lambda detail="": calls.__setitem__(
+                "quota_alert", calls["quota_alert"] + 1) or True,
+        )
+
+        def _flaky_send(m):
+            calls["send"].append(m)
+            calls["send_attempts"] += 1
+            # If exhausted, default to True so trade alerts (post-recovery)
+            # don't error out — only the recovery message is flaky.
+            return send_results.pop(0) if send_results else True
+
+        monkeypatch.setattr(runner.reporter, "_send", _flaky_send)
+        monkeypatch.setattr(runner.reporter, "send_trade_alert",
+                            lambda *a, **k: True)
+        monkeypatch.setattr(runner.reporter, "send_decision_log",
+                            lambda s: True)
+        monkeypatch.setattr(runner, "_kill_stale_claude", lambda: None)
+        monkeypatch.setattr(runner, "get_store", lambda: mock.MagicMock())
+        monkeypatch.setattr(runner, "_quota_alert_active", False)
+        monkeypatch.setattr(runner, "_consecutive_no_decisions", 0)
+
+        def run(summary):
+            monkeypatch.setattr(runner.strategy, "decide", lambda: summary)
+            runner._cycle()
+
+        return calls, run
+
+    def test_failed_recovery_send_keeps_latch_so_we_retry(
+            self, monkeypatch):
+        """openclaw returns False on the recovery send → latch must stay
+        True so the next cycle retries the notice. The bug-pre-fix behaviour
+        cleared the latch unconditionally; if this regresses the operator
+        misses the recovery announcement for an entire outage cycle."""
+        calls, run = self._fixture(monkeypatch, send_results=[False])
+        run(self._Q)
+        assert runner._quota_alert_active is True
+        run(self._OK)  # would-be recovery, but _send fails
+        # Latch MUST stay set so the next live cycle retries the notice.
+        assert runner._quota_alert_active is True
+        # The recovery attempt did happen (operator-visible log line),
+        # we just want it to be re-sent until it lands.
+        assert any("RECOVERED" in m for m in calls["send"])
+
+    def test_recovery_send_exception_keeps_latch_so_we_retry(
+            self, monkeypatch):
+        """openclaw raises (subprocess errored / binary segfaulted) — same
+        contract: latch stays set, retry next cycle."""
+        calls = {"send": [], "raised": 0}
+        monkeypatch.setattr(
+            runner.reporter, "send_quota_alert", lambda detail="": True)
+
+        def _boom(m):
+            calls["send"].append(m)
+            calls["raised"] += 1
+            raise RuntimeError("openclaw segfault")
+
+        monkeypatch.setattr(runner.reporter, "_send", _boom)
+        monkeypatch.setattr(runner.reporter, "send_trade_alert",
+                            lambda *a, **k: True)
+        monkeypatch.setattr(runner.reporter, "send_decision_log",
+                            lambda s: True)
+        monkeypatch.setattr(runner, "_kill_stale_claude", lambda: None)
+        monkeypatch.setattr(runner, "get_store", lambda: mock.MagicMock())
+        monkeypatch.setattr(runner, "_quota_alert_active", True)
+        monkeypatch.setattr(runner, "_consecutive_no_decisions", 0)
+        monkeypatch.setattr(runner.strategy, "decide", lambda: self._OK)
+        # The cycle itself must NOT propagate the recovery-send exception
+        # (would crash the live loop). It is caught and logged.
+        runner._cycle()
+        assert runner._quota_alert_active is True             # not cleared
+        assert calls["raised"] == 1
+        assert any("RECOVERED" in m for m in calls["send"])
+
+    def test_retry_until_success_then_latch_clears(self, monkeypatch):
+        """Two consecutive non-quota cycles: the first send fails, the
+        second succeeds. After the second, the latch clears so a future
+        outage re-alarms (the rearm contract the existing
+        test_recovery_sends_notice_and_rearms locks in for the OK path)."""
+        calls, run = self._fixture(monkeypatch, send_results=[False, True])
+        run(self._Q)
+        assert runner._quota_alert_active is True
+        run(self._OK)                                          # send #1 fails
+        assert runner._quota_alert_active is True
+        run(self._OK)                                          # send #2 ok
+        assert runner._quota_alert_active is False
+        # Both attempts went out (the operator-facing retry is observable),
+        # never silently dropped.
+        recovery_msgs = [m for m in calls["send"] if "RECOVERED" in m]
+        assert len(recovery_msgs) == 2
+
+        # Re-armed: a fresh outage alarms again.
+        run(self._Q)
+        assert runner._quota_alert_active is True
+        assert calls["quota_alert"] == 2
+
+    def test_successful_recovery_send_clears_latch_unchanged(
+            self, monkeypatch):
+        """Regression guard: the happy path locked in by the existing
+        ``test_recovery_sends_notice_and_rearms`` must still clear the
+        latch on a single successful send (no behaviour change for the
+        common case)."""
+        calls, run = self._fixture(monkeypatch, send_results=[True])
+        run(self._Q)
+        run(self._OK)
+        assert runner._quota_alert_active is False
+        assert sum(1 for m in calls["send"] if "RECOVERED" in m) == 1
