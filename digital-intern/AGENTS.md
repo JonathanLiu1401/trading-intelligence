@@ -3857,3 +3857,131 @@ expected; this entry was appended, not rewritten).
   tests; route appended IMMEDIATELY AFTER `/api/portfolio-signals` inside
   `create_app` (alphabetical-ish news-bucket ordering). NEVER raises into
   the Flask handler — `_ro_query` failure degrades to empty `arts`.
+
+---
+
+### Agent pass 2026-05-19 (hybrid 27 — Agent 3, debug + feature + analyst-validation)
+
+All 9 required files re-read (claude_analyst.py 1483→1574 lines now;
+codebase exceptionally mature — 26 prior passes). Advisor-reviewed before
+substantive work AND before each commit. Concurrent sibling agents +
+auto-commit/push daemon visible in `ps`; HEAD advanced multiple times
+during the pass (`422dcf6`→`ee8a31b`→…→`dc79e1b`→`a7e5d8a`); strict
+per-commit pathspec staging held (memory `di-shared-repo-concurrency`).
+USB DB saturated under live daemon contention; pytest in `D` for ~6m30s
+(documented `pt-test-suite-timing` class), completed cleanly. Bare daemon
+`pid 1702195` predates every recent fix (the consistent stale-daemon
+caveat — fixes ship on next restart).
+
+**Phase 1 — bugs_fixed=1, commit `dc79e1b`** (`tests/test_chat_earnings_shock_enrichment.py`).
+**Real test-fixture bug from `a480dcf` (sibling agent's `feat(analytics):
+scorer_skew` shipped this test simultaneously and it was failing on the
+floor since).** `_rep()` default `headline` talks about an OK NVDA event
+(`"σ ±4.2%"`); `test_insufficient_history_event_surfaces_but_sigma_withheld`
+passed events carrying only an insufficient-history MU event. The function
+correctly emits headline verbatim as the SSOT first line (invariant #10
+— `_baseline_compare_chat_lines` / `_macro_calendar_chat_lines`
+precedent) and emits a `σ withheld` detail for MU — but the `σ ±4.2%` in
+the unrelated NVDA-default headline failed the test's `"σ ±" not in blob`
+assertion, **masking the real per-row no-σ-fabrication behaviour the test
+docstring intends to gate**. Override the headline to a matching insuff-only
+form so the assertion gates only the per-row line, not a fixture mismatch
+on the SSOT. The function code is correct (verified by re-reading
+`_earnings_shock_chat_lines`); the test docstring intent is preserved
+byte-for-byte. Full suite was 1070 pass / 1 fail → my Phase-1 plus tests
+take it back to floor. Honest test-bug fix; NOT a code change that
+weakens any existing assertion.
+
+**Phase 2 — features_added=1, commit `a7e5d8a`** (`analysis/claude_analyst.py`
++91 / new `tests/test_briefing_book_silence.py` +218, +17 tests).
+**BOOK SILENCE — held names with ZERO stories in the 5h Opus digest.**
+Advisor-recommended (highest-impact, lowest-risk among enumerated
+candidates; sentiment-based BOOK CONFLICT explicitly rejected as
+heuristic-fragile). The Discord-post-briefing `_format_portfolio_coverage`
+line already names silent tickers — but it is appended AFTER Opus has
+written the briefing, so Opus composes LEAD / TOP SIGNALS / PORTFOLIO
+**blind** to which held names had no story and historically fabricates a
+"neutral implication" for them (live: a recent PORTFOLIO line wrote
+`"AXTI: continued caution given thin coverage"` — pure hedging filler on
+zero wires, the analyst persona's exact complaint). New pure
+`_book_silence_lines(articles, min_silent=3)` + a new `=== BOOK SILENCE ===`
+input block emitted right after BOOK HEAT + a new SYSTEM_PROMPT rule
+mandating an honest `"N/A — no catalyst this window"` in PORTFOLIO (never
+fabricated filler) and forbidding silent tickers from leading or
+outranking material news in TOP SIGNALS. Same shape as BOOK HEAT (input
+hint, never echoed): conservative 3-ticker floor so a 1-2 silent normal
+macro window stays silent; canonical `_BOOK_TICKERS` ordering stable
+cycle-to-cycle; real-url snapshot guard (the prepended PORTFOLIO/OPTIONS
+P&L body listing held tickers cannot fake-cover a silent name — identical
+guard to the `[BOOK:]` tag and `_book_heat_lines`). Pure read-side: no DB
+write, no `ai_score`/`ml_score`/`score_source`/`urgency` touch, no
+mutation of `source_articles`, backtest already excluded upstream by
+`get_top_for_briefing`'s `_LIVE_ONLY_CLAUSE` — **all four load-bearing
+invariants intact by construction**. +17 specific-value tests cover the
+silent-set computation (empty / below-floor / at-threshold / all-silent),
+canonical ordering parity with `_BOOK_TICKERS`, the snapshot guard, the
+pure/read-only contract (no list mutation, fresh list each call), word-
+boundary ticker discipline (MUU ≠ MU ≠ MUSEUM), `_build_payload`
+emission gate (omit on empty/below-floor; emit on above-floor), the
+SYSTEM_PROMPT rule content (N/A consequence + silent-must-not-lead +
+do-NOT-echo framing), and module constant locks
+(`BOOK_SILENCE_MIN_SILENT=3`, `_BOOK_TICKERS` set parity). All 17 pass.
+The 159 existing briefing-related tests pass unchanged. Ships on next
+`systemctl restart digital-intern` (stale-daemon caveat).
+
+**Phase 3 — analyst-lens live validation, user_findings=5.** (1)
+**Briefing quality EXCELLENT (positive, direct read)** — id30 (04:18Z,
+50 arts) read end-to-end: dense, exact, decisively-actionable LEAD
+(Trump-Iran delay → oil −5.45% → risk-on rotation; NVDA earnings
+tomorrow; held book stated up-front MU −5.95% / LITE −8.83% /
+AXTI −14.46% / TSEM −9.46%); precise MACRO/PORTFOLIO/SEMIS/RISK; AGING
+TOP ROWS marker working (`"cont., ~3.5h old"` framing on a Motley Fool
+recap correctly suppressed as fresh). (2) **Briefing cadence HEALTHY
+(positive)** — id26→27→28→29→30 gaps = 5.6h / 5.2h / 5.1h / 5.1h vs the
+5h target; the `ef839a8` heartbeat-clock fix holding; no 30h+ gaps.
+(3) **Invariants HOLD live (positive)** — `0` synthetic `urgency>=1`,
+`0` `ai_score>0 AND score_source='ml'`; collection healthy at 1049 live
+articles/hr, diverse sources. Supervisor: 30 workers OK / 0 dead; daemon
+log: **0 ERRORs / 0 tracebacks** in the current window. (4) **Recap-
+template alerts still firing on the live daemon (stale-daemon caveat,
+NOT a new bug)** — `"Why Did Micron Stock Drop Today | The Motley Fool"`
+(00:50Z), `"Why Nvidia (NVDA) Stock Is Trading Up Today"` (00:12Z),
+`"D-Wave Quantum (QBTS) Q1 2026 Earnings Call Highlights"` (×2, 01:03Z
++ 01:17Z), `"LITE/AXTI Shares Fall — GF Value Says..."` all fired as
+🚨 BREAKING — these match the deployed `_RT_WHY_DID`/`_RT_WHY_TRADING`/
+`_RT_EARNINGS_CALL`/`_RT_GF_VALUE` patterns and the live
+`_filter_recap_template_noise` gate, but the running daemon predates
+the recap-template gate's deploy. Ships on restart; lone reddit
+`stockstobuytoday` (cred=0.40, below the 0.45 gate) also fired and is
+likewise pre-restart residue. (5) **7 collectors disabled**: `sec_edgar`
+(1076 empty polls, 0 delivered — analyst BLIND to 8-K filings,
+priority-0), `nitter` (1396, 0), `polygon` (908, 0), `newsapi` (654, 0),
+`sec_edgar_ft` (243, 3), plus `alphavantage` (23, 1310 historical),
+`massive` (17, 1006 historical) — chronic external/rate-limit gap
+(memory `di-chronic-dark-collectors`); correctly surfaced verbatim by
+the COVERAGE GAP briefing block (working as intended); upstream/
+operational. **DB torn-read under load** — `immutable=1` probes hit
+`"database disk image is malformed"` mid-write; documented
+`export_worker` operational issue, not a code bug. None of 4/5 is a
+quick safe fix in clean scope (stale-daemon-with-HEAD-fix / upstream /
+operational) → no Phase-3 fold-in; bugs_fixed stays 1,
+features_added 1.
+
+**Verify:** `storage.article_store` / `ml.features` / `ml.model` /
+`analysis.claude_analyst` imports OK; briefing-suite regression slice
+(14 files, including the 17 new BOOK SILENCE tests) **220 passed**
+in 3.33s; the broader full-suite contention from concurrent sibling
+agents prevented a clean total green-count baseline this pass (the
+documented `pt-test-suite-timing` USB-contention class), but the
+briefing regression is the load-bearing slice for the changes and is
+fully green. *Pre-existing, deliberately never staged* (consistent with
+every prior entry): `dashboard/web_server.py` `build_news_corroboration`
+threshold tweak + new `/api/news-corroboration` endpoint (concurrent
+sibling agent's WIP); untracked `tests/test_news_corroboration.py`,
+`collectors/coingecko_collector.py`; all `paper-trader/*` sibling
+edits / untracked files; `logs/*`. Both my commits pathspec-scoped via
+`git commit -F … -- <explicit paths>` (`dc79e1b`:
+`tests/test_chat_earnings_shock_enrichment.py` ONLY; `a7e5d8a`:
+`analysis/claude_analyst.py` + `tests/test_briefing_book_silence.py`
+ONLY); `git show --stat` verified no sibling leakage; never `git add -A`;
+both on origin/master.
