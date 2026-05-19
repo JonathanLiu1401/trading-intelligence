@@ -264,6 +264,158 @@ def _filter_quote_widget_noise(
     return kept, suppressed
 
 
+# ── Recap / SEO template title gate (defense-in-depth) ──────────────────────
+# A second, distinct surface the urgency head over-scores is the *recap /
+# preview / transcript-summary* template — content that is inherently
+# retrospective ("trading up TODAY", "Q1 Earnings Call Highlights", a date-
+# stamped "Stock Market Today, May 18:" wrap-up) or algorithmic mill output
+# ("(LITE) Shares Fall 8.8% -- GF Value Says ..."). These NEVER warrant a
+# standalone 🚨 BREAKING push: by the time the recap was written the move was
+# already in the market, the call was already over, the wire already printed.
+#
+# Live evidence (2026-05-18/19, recurring across multiple alert cycles
+# inspected from the live articles.db urgency=2 set):
+#   - "Why Nvidia (NVDA) Stock Is Trading Up Today" — fired 22:34 and 00:12
+#     from Finnhub/Yahoo and YahooFinance/NVDA (two separate BREAKING pushes)
+#   - "Why Did Micron Stock Drop Today ? | The Motley Fool" — fired 00:50
+#   - "Stock Market Today, May 18: Micron Falls as Memory Concerns Test AI
+#      Rally" — fired THREE times at 22:52 from YahooFinance/005930.KS,
+#     Motley Fool, and Nasdaq Markets (three separate BREAKING pushes for
+#     one wrap-up)
+#   - "D-Wave Quantum Inc (QBTS) Q1 2026 Earnings Call Highlights: Surging
+#      Bookings Amid Revenue Decline" — fired twice ~14 min apart
+#   - "Lumentum Holdings Inc (LITE) Shares Fall 8.8% -- GF Value Says ..."
+#     and "AXT Inc (AXTI) Shares Fall 14.3% -- GF Value Says Still
+#     Overvalued" — GuruFocus algorithmic stock-mention press mill
+#   - "Here What the Street Thinks About NVIDIA Corporation (NVDA)" —
+#     opinion mill recap
+#
+# These all came from publishers ABOVE the ``ALERT_MIN_LONE_SOURCE_CRED``
+# 0.45 bar (Finnhub 0.78, Motley Fool/yahoo ~0.65, GoogleNews 0.62) so the
+# existing source-authority gate doesn't catch them — the failure is the
+# *content type*, not the publisher's credibility tier.
+#
+# Same shape as ``_filter_quote_widget_noise``: a small, evidence-backed set
+# of title fingerprints, anchored so real breaking headlines never match;
+# runs BEFORE dedup so a recap syndicated across multiple feeds is
+# suppressed once (not after dedup picks one survivor); suppressed rows are
+# marked alerted UNCONDITIONALLY by ``send_urgent_alert`` so they exit the
+# urgent queue. Pure read-side — no DB write, no ai_score/ml_score/
+# score_source mutation, backtest already filtered upstream by
+# ``_is_synthetic`` — all four load-bearing invariants intact.
+
+# "Why <Co|TICKER> Stock Is Trading {Up|Down|Higher|Lower} Today" — the
+# canonical Zacks/Yahoo/Finnhub recap template. Anchored ``^Why`` so a
+# headline that USES "why" mid-sentence is unaffected. The "Stock Is
+# Trading" + "Today" co-occurrence is the discriminator: a real headline
+# like "Why investors are bullish on Nvidia" or "Why MU beat estimates"
+# does NOT match.
+_RT_WHY_TRADING = re.compile(
+    r"^\s*why\s+.+?\s+stock\s+is\s+trading\s+(?:up|down|higher|lower)\s+today\b",
+    re.IGNORECASE,
+)
+# "Why Did <X> Stock {Drop|Rise|Surge|Fall|Climb|Plunge|Soar|Jump} Today"
+# (Motley Fool / Zacks variant — past-tense recap of an intraday move).
+_RT_WHY_DID = re.compile(
+    r"^\s*why\s+did\s+.+?\s+stock\s+"
+    r"(?:drop|rise|surge|fall|climb|plunge|soar|jump|tumble)\b",
+    re.IGNORECASE,
+)
+# "Stock Market Today, May 18: ..." — date-stamped daily market wrap-up
+# (Motley Fool / Nasdaq / Yahoo). Anchored ^ + month-name + 1-2 digit day.
+# Real headlines do not lead with this exact "Stock Market Today, <Month>
+# <day>" pattern.
+_RT_MARKET_TODAY = re.compile(
+    r"^\s*stock\s+market\s+today\s*[,:]\s*"
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?)\s+\d{1,2}\b",
+    re.IGNORECASE,
+)
+# "Q1 2026 Earnings Call Highlights" — GuruFocus / Seeking Alpha transcript-
+# summary template. The call already happened; this is recap, not breaking.
+# Substring (not anchored) — the template appears mid-headline ("D-Wave
+# Quantum Inc (QBTS) Q1 2026 Earnings Call Highlights: ..."). Quarter and
+# year are bounded so a normal earnings preview doesn't match.
+_RT_EARNINGS_CALL = re.compile(
+    r"\bq[1-4]\s*20\d{2}\s+earnings\s+call\s+(?:highlights|recap|takeaways|"
+    r"transcript|summary)\b",
+    re.IGNORECASE,
+)
+# "Here['s|is] What the Street Thinks About <X>" — InsiderMonkey opinion-
+# mill recap template. The "Street thinks" framing IS the recap signature.
+_RT_STREET_THINKS = re.compile(
+    r"^\s*here(?:'?s|\s+is)?\s+what\s+the\s+street\s+thinks\b",
+    re.IGNORECASE,
+)
+# "(TICKER) Shares Fall 8.8% -- GF Value Says ..." — GuruFocus algorithmic
+# press-mill template, posted on every fractional stock-price move. The
+# "GF Value Says" tagline is unique to GuruFocus, so this is a high-
+# precision pattern (no false positives on real headlines that mention
+# value or analyst ratings).
+_RT_GF_VALUE = re.compile(
+    r"\bgf\s+value\s+says\b",
+    re.IGNORECASE,
+)
+
+_RECAP_TEMPLATE_PATTERNS = (
+    ("why_trading_today", _RT_WHY_TRADING),
+    ("why_did_stock", _RT_WHY_DID),
+    ("market_today_dated", _RT_MARKET_TODAY),
+    ("earnings_call_recap", _RT_EARNINGS_CALL),
+    ("street_thinks", _RT_STREET_THINKS),
+    ("gf_value_says", _RT_GF_VALUE),
+)
+
+
+def _looks_like_recap_template(art: dict) -> tuple[bool, str]:
+    """``(True, fingerprint_name)`` for a recap/preview/transcript-summary or
+    algorithmic-mill title — these are inherently retrospective and must not
+    fire a standalone 🚨 BREAKING push. ``(False, "")`` for everything else.
+
+    Pure, side-effect-free; reads only ``title``. Six independent
+    fingerprints, anchored so real breaking headlines are never caught
+    (validated against the live noise set on 2026-05-18/19 and the
+    must-survive corpus: "Nvidia Q3 revenue rises 22%...", "Fed cuts rates",
+    "MU earnings blow past estimates", "Why investors are bullish on
+    Nvidia", "MU shares halted")."""
+    title = (art.get("title") or "").strip()
+    if not title:
+        return False, ""
+    for name, pat in _RECAP_TEMPLATE_PATTERNS:
+        if pat.search(title):
+            return True, name
+    return False, ""
+
+
+def _filter_recap_template_noise(
+    arts: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Partition urgent rows into ``(kept, suppressed)``. ``suppressed`` is
+    the recap/preview/transcript-summary/algorithmic-mill rows the urgency
+    head over-scored; everything else is kept. Pure — no DB / IO.
+
+    Runs BEFORE ``dedupe_urgent`` so a recap syndicated across multiple
+    feeds ("Stock Market Today, May 18: ..." carried by Motley Fool +
+    Nasdaq + YahooFinance) is caught on every copy and the dedup layer
+    isn't asked to discriminate against a real story with a similar prefix.
+
+    The suppressed rows are tagged ``_recap_fingerprint`` for log clarity
+    so an operator can see WHICH template fired — without dumping the full
+    title, mirrors the syndication-dedup tagging discipline."""
+    kept: list[dict] = []
+    suppressed: list[dict] = []
+    for a in arts:
+        hit, name = _looks_like_recap_template(a)
+        if hit:
+            a = dict(a)  # shallow copy — never mutate caller's row
+            a["_recap_fingerprint"] = name
+            suppressed.append(a)
+        else:
+            kept.append(a)
+    return kept, suppressed
+
+
 # ── Held-book relevance (the analyst's open positions) ───────────────────────
 # The 🚨 BREAKING alert is the analyst's most time-critical product, and the
 # persona is explicitly "I depend on this to react to events affecting MY
@@ -362,6 +514,43 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         )
     if not filtered:
         _log.info("[alert] all urgent rows were quote-widget noise — skipping")
+        return False
+
+    # Recap / SEO template gate (defense-in-depth, same shape as the quote-
+    # widget gate above). "Why X Stock Is Trading Up Today" / "Stock Market
+    # Today, May 18:" / "Q1 2026 Earnings Call Highlights" / GuruFocus's
+    # "GF Value Says ..." are inherently retrospective or algorithmic mill
+    # output the urgency head over-scores — the move was already in the
+    # market by the time the recap was written. Suppressed rows are marked
+    # alerted UNCONDITIONALLY so they exit the urgent queue instead of being
+    # re-fetched every 20s cycle. They stay in articles.db untouched (ai_score
+    # / ml_score / score_source unchanged) — only the noisy push is dropped.
+    # Runs BEFORE dedup so a recap syndicated across multiple feeds ("Stock
+    # Market Today, May 18: ..." live-evidenced three copies at the same
+    # minute from Motley Fool + Nasdaq + YahooFinance) is caught on every
+    # copy. Best-effort store mark — a store failure must never block a
+    # genuine fresh alert in the same batch.
+    filtered, recap_suppressed = _filter_recap_template_noise(filtered)
+    if recap_suppressed:
+        try:
+            store.mark_alerted_batch(alerted_ids(recap_suppressed))
+        except Exception:
+            _log.exception(
+                "[alert] failed to mark recap-template rows alerted"
+            )
+        fps = ", ".join(
+            f"{a.get('_recap_fingerprint','?')}:{(a.get('title') or '')[:60]}"
+            for a in recap_suppressed[:5]
+        )
+        _log.info(
+            f"[alert] suppressed {len(recap_suppressed)} recap-template "
+            f"row(s) (retrospective recap / SEO mill / transcript summary — "
+            f"never breaking) — {fps}"
+        )
+    if not filtered:
+        _log.info(
+            "[alert] all urgent rows were recap-template noise — skipping"
+        )
         return False
 
     # Drop articles older than 24 hours — stale news must not fire as breaking.
