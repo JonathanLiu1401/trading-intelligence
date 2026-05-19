@@ -6651,6 +6651,7 @@ def analytics_api():
         # 4dp there; the win/loss split below uses strict `> 0`, so a sub-cent
         # rounding artefact reads as a non-win (pinned by test_round_trips).
         from .analytics.drawdown import compute_drawdown
+        from .analytics.etf_lookthrough import build_etf_lookthrough
         from .analytics.pnl_attribution import build_pnl_attribution
         from .analytics.recovery import build_recovery
         from .analytics.round_trips import build_round_trips
@@ -6810,6 +6811,23 @@ def analytics_api():
             "pnl_attribution": build_pnl_attribution(
                 positions, eq, _classify, _LEVERAGE_BETA,
             ),
+            # ETF look-through: pierce leveraged-ETF positions into effective
+            # single-name exposure. Every other risk surface stops at the
+            # ticker boundary — sector_exposure classifies TQQQ as
+            # ``broad_lev``, risk_mirror reports HHI on line-item tickers,
+            # neither sees that a TQQQ position silently amplifies NVDA
+            # exposure. Additive top-level key (keyed asserts, never
+            # whole-dict equality) so the digital-intern analyst chat that
+            # fetches /api/analytics inherits the "hidden concentration"
+            # verdict for free — the tail_risk/stress_scenarios/recovery
+            # additive-key precedent. Snapshot built from the same
+            # positions/total_value already on hand so the fold cannot
+            # drift from /api/etf-lookthrough.
+            "etf_lookthrough": build_etf_lookthrough({
+                "cash": float(pf.get("cash") or 0.0),
+                "total_value": float(total_value or 0.0),
+                "positions": positions,
+            }),
         }
         # Same single-source-of-truth honesty fold as /api/tail-risk &
         # /api/drawdown — mark_integrity's docstring names THIS endpoint's
@@ -6923,6 +6941,34 @@ def recovery_api():
         mt = _mark_trust_block(store)
         if mt is not None:
             result["mark_trust"] = mt
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/etf-lookthrough")
+@swr_cached("etf-lookthrough", 30.0)
+def etf_lookthrough_api():
+    """ETF look-through into effective single-name exposure.
+
+    Pierces leveraged-ETF positions (TQQQ=3x QQQ, SOXL=3x SOXX, FNGU=3x
+    FANG+, …) into virtual single-name exposures so a book reading "44%
+    NVDA, 22% TQQQ" doesn't silently understate its TRUE NVDA bet. Every
+    existing risk surface stops at the ticker boundary; this one piercs
+    through. Inverse ETFs (SQQQ/SOXS/SPXS/FNGD/TECS) honestly subtract.
+
+    Observational only — never gates Opus, adds no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.etf_lookthrough import build_etf_lookthrough
+        store = get_store()
+        pf = store.get_portfolio()
+        snapshot = {
+            "cash": float(pf.get("cash") or 0.0),
+            "total_value": float(pf.get("total_value") or 0.0),
+            "positions": store.open_positions(),
+        }
+        result = build_etf_lookthrough(snapshot)
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -11284,6 +11330,11 @@ def _swr_prewarm():
         # never prewarmed (commits 737a2d2 / 6e9c5d8) — same freeze-triage
         # cold-stall blind spot test_swr_prewarm_coverage.py locks against.
         ("stress_scenarios", stress_scenarios_api),
+        # etf-lookthrough @swr_cached 30s — pure compute, no I/O, but the
+        # prewarm==@swr_cached invariant locks every cached endpoint here so
+        # the first poll after a restart never cold-stalls on {"warming":
+        # true}; same freeze-triage discipline as the sibling additive keys.
+        ("etf-lookthrough", etf_lookthrough_api),
         ("watchlist-opportunities", watchlist_opportunities_api),
         # scorer-opportunities (20295e8), scorer-portfolio-attribution
         # (6018347), and trade-attribution (2a28eea) were @swr_cached but

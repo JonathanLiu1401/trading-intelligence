@@ -19,6 +19,7 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 - `paper_trader/analytics/implied_move.py` — **forward, market-priced** complement to the backward-looking `earnings_shock` (historical-Gaussian σ) and `earnings_distribution` (empirical observed quartiles). Answers the discretionary trader's #1 pre-earnings question: *"what is the market currently pricing as the move on this print?"*. For each held imminent earnings event (held ∩ event_calendar within `horizon_days`=7), pulls the options chain at the expiry closest to `ceil(days_away)` so the chain **captures** the event, picks the ATM call (min `|strike − spot|`) and ATM put **independently** (so a one-sided chain gap doesn't silently mis-pair), computes the straddle mid as `(bid+ask)/2` when both > 0 else `lastPrice` else `None` (NaN-rejected — yfinance returns NaN for thin chains and a half-NaN sum would silently halve every implied), and reports `implied_move_pct = straddle / spot * 100` (desk-standard breakeven-move shorthand) plus the strict Black-Scholes 1σ ≈ 0.8 × straddle/spot and the per-strike `iv_atm` (decimal → percent). Dollarized: `position_value × implied_pct / 100 → $-at-risk`; `book_pct = $-at-risk / total_value * 100`. State ladder mirrors `earnings_shock`: `NO_DATA` (empty/unpriceable book) / `NO_EVENTS` (book fine, calendar quiet — distinct so the operator can tell "calendar quiet" from "book empty") / `OK`. Per-event honesty: `OK` / `NO_QUOTES` (chain returned but ATM bid/ask/last all zero — withhold rather than fabricate 0%) / `NO_CHAIN` (provider returned None or raised — `_safe` contract, never propagates). Composes `build_event_calendar`'s `events` list **verbatim** (single source of truth #10) so this endpoint, `/api/earnings-shock`, `/api/earnings-distribution` and `/api/event-calendar` can never disagree on what counts as held-imminent. Option positions degrade to `NO_CHAIN` (the current_price is the premium, not the underlying — an implied-move read on an option-on-an-earnings-name is its own feature, not this one). Pure builder, never raises on garbage rows (the `_safe` discipline); the endpoint owns the yfinance I/O (`market.get_options_chain` via a `_chain_provider` lambda). Served at `/api/implied-move`, SWR-cached 5 min matching `/api/earnings-shock` cadence, and registered in the prewarm set (the `test_swr_prewarm_coverage` invariant). Observational only, never gates Opus, never injected into the decision prompt, no caps (invariants #2/#12 — the `earnings_shock` / `stress_scenarios` / `recovery` precedent). Locked by `tests/test_implied_move.py` (34 tests: helper-fn discriminators (NaN-rejected `_safe_float`, mid-wins-over-last `_mid_or_last`, min-distance `_atm_row`); state ladder NO_DATA / NO_EVENTS-distance / NO_EVENTS-unheld / OK; exact hand-computed arithmetic on a pinned $1000-book NVDA scenario (`straddle=8.0 → implied=8% → $32 → 3.2% of book → MODERATE`); ELEVATED/MODERATE/LOW threshold boundaries; degrade paths NO_CHAIN-on-None / NO_CHAIN-on-raise / NO_QUOTES-on-thin / option-position-no-spot / garbage-row-never-raises / past-event-dropped; sort order by `days_to_earnings`; total_implied_book_pct sum-of-abs; `TestImpliedMoveEndpoint` Flask test_client (offline-deterministic via monkeypatched `market.get_options_chain` + on-disk event_calendar fixture) — endpoint↔builder no-drift on the load-bearing fields, empty-book→NO_DATA-not-500)
 - `paper_trader/analytics/pnl_attribution.py` — **β-adjusted** decomposition of open unrealized P/L into `β·SPY-explained` vs **idiosyncratic** residual. The honest answer to *"is my NVDA gain just SPY going up?"* — `analytics/open_attribution.py` (`/api/open-attribution`) reports the unweighted `position_return − spy_return`, which **implicitly assumes β=1** and so systematically over-attributes "alpha" on the bot's documented leveraged-ETF/semis book (TQQQ β=3, NVDA β=1.5, FNGU β=3); the desk-correct read is `idiosyncratic = position_return − β × spy_return`. The discriminating disagreement: a +1% SPY day on a $200 TQQQ position contributes ≈$6 of β·SPY-explained P/L, not $2. `build_pnl_attribution(positions, equity_curve, classify, beta_map, now=None)` is pure (no I/O, never raises — the `_safe` contract). Anchors per-position to the equity curve's `sp500_price` at-or-after `opened_at` (same SSOT as `open_attribution`'s `_spy_at_or_after`, AGENTS.md #10 — a drift in either side fails the no-drift check). Uses the **same** `_classify`/`_LEVERAGE_BETA` SSOT as `stress_scenarios` / `/api/risk` so an unknown-sector ticker reads β=1.0 *exactly* the same as those panels do; an unmapped ticker → `classify→"other"` → β=1.0 (market-beta fallback, the `_position_betas` precedent). Options are flagged and skipped (β-attribution on a Greeks instrument is its own surface, see `/api/greeks` — the `open_attribution` precedent). State ladder `NO_DATA` (no stock positions / all skipped) / `NO_BENCHMARK` (positions exist but equity curve has no `sp500_price` history — cold start before the first equity tick) / `INSUFFICIENT` (positions exist + benchmark exists but no position's `opened_at` anchors against the available SPY history, e.g. all opened *after* the last equity tick — the row is still emitted with `anchored=False` for honest withholding) / `OK` (at least one anchored row). Per-row fields: `beta`, `position_return_pct`, `spy_return_pct`, `beta_explained_pct = β × spy_return`, `idiosyncratic_pct = position_return − beta_explained`, plus all four dollarized. Book totals satisfy `unrealized_usd = beta_explained_usd + idiosyncratic_usd` exactly (asserted in the suite). Rows sorted by `|idiosyncratic_usd|` DESC (the desk's "what is selection actually contributing" sort), unanchored rows last. Served at `/api/pnl-attribution` (the **true SSOT** — strategy-side pinned copies are CI-pinned to its `_classify`/`_LEVERAGE_BETA`) **and** folded into `/api/analytics` as an additive `pnl_attribution` key (digital-intern analyst chat that fetches `/api/analytics` inherits it for free — the `tail_risk`/`stress_scenarios`/`recovery` additive-key precedent). Observational only, never gates Opus, never injected into the decision prompt, no caps (invariants #2/#12 — the `open_attribution` precedent). Locked by `tests/test_pnl_attribution.py` (19 tests: state ladder NO_DATA-empty / NO_DATA-options-only / NO_BENCHMARK-no-SPY / INSUFFICIENT-opened-after-curve; **exact hand-computed β-decomposition** on a pinned NVDA β=1.5 scenario (`+10% pos, +1% SPY, +1.5% β-explained, +8.5% idio`); the **TQQQ leveraged discriminator** (`+6% pos, +2% SPY, β=3 → β-explained=6%, idio=0% — vs `open_attribution`'s would-be +4% naive alpha — that disagreement IS the value-add); negative-idiosyncratic-on-losing-leveraged-ETF (TQQQ flat while SPY +1%, β=3 → idio=-3%); totals math (book unrealized = β-explained + idiosyncratic, exact); unknown-ticker→β=1 fallback; option-skip; classify-raises→other-fallback (`_safe`); garbage-position-never-raises; corrupt-equity-curve-row-skipped; sort by |idio| DESC with unanchored last; `TestPnlAttributionEndpoint` Flask test_client (real Store + `update_position_marks` to seed `current_price`) — endpoint serves builder output with `β=1.5` on NVDA (the dashboard's true SSOT); `TestAnalyticsFold` no-drift between `/api/analytics["pnl_attribution"]` and `/api/pnl-attribution` on the load-bearing fields)
 - `paper_trader/analytics/idle_opportunity.py` — **drought-regret** quantifier (2026-05-19): during the current PARALYSIS drought, which high-score live signals on the watchlist arrived that the bot never decided against? The recurring host-saturation NO_DECISION storms have three diagnostic surfaces — `/api/decision-drought` (WHEN + realized portfolio drift), `/api/host-guard`+`/api/decision-forensics` (WHY: host load + dominant parse-fail mode), `/api/shadow-vs-claude` (RIGHT-NOW rec, **snapshot-only by design** per its docstring, does not look across the drought window) — but none answer the operator's "while the bot was dark for 9.0h, did anything high-score actually arrive on a name I follow that I would have acted on?" question. `build_idle_opportunity(decision_drought_result, articles, watchlist, held_tickers=None, now=None, min_ai_score=6.0, max_opportunities=20)` is pure (no I/O, never raises on garbage — the `_safe` contract). **Composes `build_decision_drought.current_drought` verbatim** (SSOT, AGENTS.md #10 — so `/api/idle-opportunity` and `/api/decision-drought` can never disagree on what counts as an ongoing drought). Buckets live-only watchlist articles at-or-above the score floor inside `[drought_start, now]` per ticker, keeping the top article per ticker (score DESC, tie-break **newer first_seen** — more plausibly causal, the `trade_attribution` precedent). State ladder `NO_DATA` (no decisions yet) → `NO_DROUGHT` (bot filling normally — by definition nothing was missed, suppressed in reports) → `OK` (drought exists; `n_opportunities` carries the regret list, possibly empty — the silence-when-nothing-actionable case, the `_macro_calendar_chat_lines`/`_event_readiness_chat_lines` precedent). Word-boundary regex `(?:\$|\b)TKR\b` (so `MU` does NOT alias `MUTUAL`/`MUSE`; `$NVDA` cashtag hits; `AMDOCS` ≠ `AMD` — the same locks as `news_velocity` / `trade_attribution` / `signal_followthrough`). NaN/Inf `ai_score` explicitly rejected (digital-intern's column has been observed with stale NaNs from a half-trained model; Python NaN compared with min_ai_score is ALWAYS False which would silently drop the row otherwise). Held positions flagged via `held` so the headline can call out *"the bot was dark on MY OWN position's news"*. Served at `/api/idle-opportunity` (query params: `min_ai_score` 0..10, `max_opportunities` 1..50). **Endpoint short-circuits when no ongoing drought** — saves the articles.db read entirely (the operator-happy path; same cost discipline as `news_velocity`'s drought-bounded scan, typically narrows to hundreds of rows even on the 1.47M-rows/7d articles.db). Live-only clause applied at the SQL layer (invariant #3 — synthetic `backtest://` and `opus_annotation*` rows never reach the panel). `reporter._idle_opportunity_line` appended to `send_hourly_summary` and `send_daily_close` **after `_host_pulse_line`, before `_capital_pulse_line`** (load-bearing order: HOST names the CAUSE, IDLE names what was MISSED while the cause held, CAPITAL names the manual-fix lever; all three can be independently true and none suppresses the others — the same HOST/CAPITAL independence precedent). Composes the builder's `headline` verbatim so the Discord line and the endpoint can never drift. Observational only — never gates Opus, never injected into the decision prompt, no caps (AGENTS.md #2/#12 — the `shadow_vs_claude`/`stress_scenarios`/`recovery` precedent). Applies on next paper-trader restart. **Live integration (May 19, 9.0h ongoing drought, 34 NO_DECISION):** `state=OK, headline="loudest: MU @ ai_score 9.0"` — MU: BofA doubled price target to 950 (2 articles); NVDA (held): earnings tomorrow (8 articles); DRAM and AMD also flagged. Locked by `tests/test_idle_opportunity.py` (33 tests: state ladder NO_DATA/NO_DROUGHT/closed-drought→NO_DROUGHT/OK-quiet/OK-regret + headline-HELD-tag; drought-window strict-inclusive boundary; ai_score floor + clamp + NaN/Inf-reject + min_ai_score-carried-in-payload; word-boundary discriminators MU≠MUTUAL/AMD≠AMDOCS/$NVDA-cashtag + the compiled-regex helper directly; per-ticker bucketing including score-DESC then newest-first tie-break order-independent + max-urgency carried; sort top_score DESC; max_opportunities cap; held flag; garbage-degrade-never-raises for None-articles/non-dict-rows/missing-fields/unparseable-ts/empty-watchlist + `_safe_float` helper; defensive drought-with-no-start→NO_DATA; `TestIdleOpportunityEndpoint` Flask test_client with a real seeded articles.db proving the synthetic backtest row at score 9.5 is filtered by the SQL-side live-only clause + min_ai_score param clamp + NO_DROUGHT short-circuit no-DB-read sentinel) and `tests/test_core_reporter.py::TestIdleOpportunityLine` (7 tests: silence-when-no-drought / silence-when-quiet / regret-verbatim / builder-fault-degrade / HOST→IDLE→CAPITAL ordering lock in `send_hourly_summary` / hourly-silent-when-quiet / daily-close-includes-idle).
+- `paper_trader/analytics/etf_lookthrough.py` — **single-name look-through** through leveraged-ETF positions (2026-05-19): pierce TQQQ/SOXL/FNGU/TECL/SPXL/etc. into the *effective* per-ticker exposure a book of NVDA + TQQQ truly carries. Every existing risk surface stops at the ticker boundary — `sector_exposure` classifies TQQQ as `broad_lev` and adds the full position to that sector; `risk_mirror` reports HHI on line-item tickers; `pnl_attribution` β-decomposes the move but does NOT pierce the ETF wrapper. The decision-relevant question this answers: *"I hold $445 NVDA cash AND $295 TQQQ. TQQQ is 3x QQQ, QQQ is ~9% NVDA. What is my TRUE effective NVDA exposure?"* Live answer on the actual book (2026-05-19): **52.4% effective NVDA vs 44.5% direct (8pp hidden via TQQQ amplification)**, plus **silent MSFT/AAPL/AMZN** lines via TQQQ that have **zero direct positions** but ride the next NVDA earnings move with the book regardless. `build_etf_lookthrough(snapshot, lookthrough_map=None, hidden_ratio=1.5, max_underlyings=12)` is pure (no I/O, never raises — the `_safe` contract). Position value mirrors `sector_exposure._position_value` **verbatim** (single source of truth #10 — same `(current_price or avg_cost) * qty * (100 if option else 1)` formula, so starting weights cannot drift). For each held position: if ticker is in `_ETF_LOOKTHROUGH`, decompose into virtual exposures `position_value × leverage × weight%`; otherwise contribute as direct. Inverse ETFs (SQQQ/SOXS/SPXS/FNGD/TECS) carry NEGATIVE leverage so they honestly SHORT their basket — a book of NVDA + SQQQ reads net NVDA = direct − indirect (the sign honesty IS the value-add — locked RED by the inverse-ETF test). Options skipped from look-through (delta-adjustment is its own surface — the `pnl_attribution` option-skip precedent) but still contribute as direct exposure. Per-underlying tier ladder: `HIDDEN_AMPLIFIED` (effective_pct ≥ `HIDDEN_RATIO`=1.5× direct_pct), `HIDDEN_ONLY` (no direct line, ETF-only exposure — the silent-MSFT case), `TRANSPARENT` (look-through within 1.5×), `TRIVIAL` (<0.5% of book). State ladder `NO_DATA` (no priced book) / `NO_ETF_HELD` (book exists but no mapped ETF held — look-through ≡ direct, suppressed in reports — the `decision_drought`/`no_decision_recovery` silence-when-nothing-actionable precedent) / `OK`. Sort by `|effective_usd|` DESC tie-break `direct_usd` DESC. Headline priority: HIDDEN_AMPLIFIED → HIDDEN_ONLY → largest-effective fallback. Served at `/api/etf-lookthrough` **and** folded into `/api/analytics` as an additive `etf_lookthrough` key (digital-intern analyst chat that fetches `/api/analytics` inherits it for free — the `tail_risk`/`stress_scenarios`/`recovery`/`pnl_attribution` additive-key precedent). Observational only, never gates Opus, no caps (invariants #2/#12). Static weights are approximate top-10 issuer-fact-sheet constituents (late-2025); the headline says so — decision support, not VaR. Locked by `tests/test_etf_lookthrough.py` (35 tests: state ladder NO_DATA/NO_ETF_HELD/OK; exact hand-computed arithmetic (`$100 × 3.0 × 10% = $30 indirect NVDA`); direct+indirect=effective totals; inverse-ETF NEGATIVE leverage sign honesty; multi-ETF compounding (TQQQ + SOXL both lift NVDA additively); tier classification HIDDEN_AMPLIFIED-at-1.5× boundary / HIDDEN_ONLY-when-no-direct / TRANSPARENT-below-ratio / TRIVIAL-below-0.5%; sort order |effective_usd| DESC; max_underlyings cap; options-not-looked-through (NVDA call doesn't decompose); live-map sanity (canonical TQQQ/SQQQ/SOXL/SOXS/FNGU/FNGD/TECL/SPXL/UPRO present + inverse-leverage-negative + long-leverage-positive + holdings-shape); garbage-degrade-never-raises (None snapshot / non-dict rows / missing keys / unparseable weights); `TestEtfLookthroughEndpoint` Flask test_client (real Store + `update_position_marks`) endpoint↔builder no-drift on state/headline/n_etfs_held + `/api/analytics` additive-fold no-drift).
 - `paper_trader/signals.py` — live news signal queries against digital-intern's articles.db
 - `paper_trader/market.py` — yfinance wrapper + NYSE session calendar
 - `paper_trader/store.py` — SQLite store (portfolio, trades, positions, decisions, equity_curve)
@@ -9805,3 +9806,134 @@ c = app.test_client()
 print(c.get("/api/restart-recommendation").get_json())
 print(c.get("/api/position-action-brief").get_json())
 ```
+
+
+## Review pass — paper-trader core hybrid (2026-05-19, Agent 1, ~18:30 UTC) — close-side countdown helper
+
+### Phase 1 — no bugs found, no commit
+
+A read-pass through `runner.py`, `reporter.py`, `signals.py`, `strategy.py`,
+`market.py`, `store.py`, and a partial sweep of `dashboard.py` found no
+real bugs. The codebase has been through many prior review passes (see
+this file's "Review pass" headers) and the obvious things are already
+fixed. Per the Phase-1 commit guard, this pass set `bugs_fixed=0` and made
+no Phase-1 commit. The 8 `TestSourceMixLine` failures present at session
+start are sibling agent work-in-progress (broken
+`store.update_portfolio(cash=…, total_value=…)` calls missing the
+`positions` arg) and were intentionally left alone — that file belongs to
+the sibling per the `pt-concurrent-samerole-staging-race` memory note.
+
+### Phase 2 (commit `813c4c5`) — `next_session_close` / `seconds_until_close`
+
+`paper_trader/market.py` already exposed `next_session_open()` and a
+`close_minute(date)` helper, but had no *close-side* timestamp. Callers
+who wanted "when is the next bell DOWN?" had to reach into
+`close_minute` and roll their own date arithmetic — and several already
+do (the `reporter._next_session_line` precedent, the prompt's
+`MARKET_OPEN` flag). New pure helpers:
+
+- `next_session_close(now=None) -> datetime | None` — the next NYSE
+  session close (16:00 ET regular / 13:00 ET half-day) after `now`, as
+  a UTC-aware datetime. Mirrors `next_session_open`'s semantics:
+  mid-session returns today's close, pre-open today returns today's
+  close, at-or-past-close advances to next trading day's close.
+- `seconds_until_close(now=None) -> int | None` — integer-second
+  countdown for prompt/Discord rendering. Always ≥ 0 (clock step-back
+  clamps to 0).
+
+Half-day aware (the day-after-Thanksgiving / Christmas Eve 13:00 ET
+close lands correctly; 13:00 on a half-day advances past). Strict
+`close_dt > now_ny` advance rule so a tick *at* the bell always
+advances to the next session — same discipline as `next_session_open`
+("at the open instant, today is no longer the next open").
+
+22 new unit tests in
+`tests/test_core_market.py::TestNextSessionClose` /
+`TestSecondsUntilClose` covering: mid-session, pre-open, at-close
+strict advance, post-close, Friday→Monday, weekend, holiday skip,
+half-day morning, half-day at-1300 advance, Christmas Eve half-day,
+Good Friday skip, UTC awareness, seconds arithmetic at boundaries,
+clock-step-back clamp, int return type. The new helpers are not yet
+wired into reporter/strategy/dashboard — Phase 2 ships the primitive;
+wiring it into the hourly summary's "session ends in Xh Ym" line is
+a follow-up (kept out of this pass so the staging is one feature, not
+one feature + one Discord refactor).
+
+### Phase 3 — live validation against the running trader (18:30 UTC)
+
+Probed the live trader as an operator would. Findings:
+
+1. **Dashboard endpoint timeouts during sibling Opus storms.** While
+   ~4 sibling Opus subprocesses (this HYBRID pass + sibling hourly
+   reviews) were active, `/api/empty-claude-rate`, `/api/host-guard`,
+   and `/api/capital-paralysis` all timed out at 15–30s while
+   `/api/healthz` and `/api/state` responded in <100ms. After the
+   trader's own deferred restart cleared, the same endpoints responded
+   in ~200ms. The dashboard's existing SWR machinery (see lines
+   230–418) is *meant* to serve a stale payload during a cold rebuild,
+   but the warming sometimes outlasts the client timeout — not a bug,
+   but worth noting that operator polling needs to tolerate the SWR
+   `{"warming": true}` shape for the first call after a busy interval.
+
+2. **Self-healing stale-runner window.** Between this pass's commit
+   `813c4c5` landing and the next decision-cycle boundary the runner's
+   `/api/healthz.stale` reported `true` (boot_sha `83b4f2e`, head_sha
+   `813c4c5`). The git-watcher does eventually fire the deferred
+   restart, but the trader briefly executes on stale code. Per
+   invariant #19 / `RESTART_GRACE_S` this is by design — never
+   force-kill a healthy mid-Opus call — but is the documented "stale
+   for up to ~1 cycle" UX. No action needed.
+
+3. **HOST_SATURATED is the dominant NO_DECISION cause (60.9% over
+   6h).** Verified via `/api/empty-claude-rate` —
+   `concurrent_opus_processes: 4`, `verdict: "HOST_SATURATED — live
+   trader starved by concurrent Opus"`. The trader's own mid-call
+   re-probe (strategy.py:1538) is correctly bucketing these as
+   "skipped claude call —" rather than the model-timeout signature.
+   `/api/restart-recommendation` correctly says MONITOR (empty rate
+   below 50% URGENT threshold) — restart would NOT help; the cause is
+   external concurrent jobs, not a wedged CLI. Working as designed.
+
+4. **systemd-vs-manual restart-counter pathology persists** (counter
+   at 680). The systemd unit keeps failing to start while the manual
+   instance holds the singleton lock. Per the
+   `pt-systemd-vs-manual-restart-spam` memory note this is "not a bug,
+   don't fix" — the singleton lock is correctly defending against
+   double-trading; the systemd unit just needs to stay disabled
+   (it is).
+
+5. **Capital-paralysis recovered organically.** While the pass was
+   running, the trader SOLD DRAM at 18:20:55, releasing $253 of pinned
+   cash (from $7.86 → $260.91). This is healthy trading behavior —
+   the trader correctly recycles capital when conviction shifts —
+   confirming the no-hard-limits design (invariant #12) does what it
+   says when Opus is willing to act.
+
+### How to run / test
+
+```sh
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_core_market.py -v
+# 65 tests, ~1s (22 new ones added by this pass)
+```
+
+Inspect the new helpers against the live wall clock:
+
+```python
+from paper_trader import market
+print(market.next_session_close())    # UTC-aware
+print(market.seconds_until_close())   # int seconds
+```
+
+### Invariants reaffirmed by this pass
+
+- **#1** (backtest articles never reach live signals) — untouched; no
+  signals/SQL changes.
+- **#2 / #12** (no hard limits, observational only) — new helpers are
+  pure read of the calendar, never gate.
+- **#10** (single source of truth) — both helpers share the
+  `close_minute(date)` and `NYSE_HOLIDAYS_2026` / `NYSE_HALF_DAYS_2026`
+  primitives `is_market_open` already uses; no parallel calendar.
+- **#19** (singleton lock fail-open / never refuse the sole runner) —
+  reaffirmed by Phase 3 finding #4: the manual instance holds the
+  lock, systemd's competing instance correctly exits.
