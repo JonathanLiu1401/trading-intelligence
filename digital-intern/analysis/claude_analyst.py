@@ -360,6 +360,143 @@ def _throughput_degradation_lines(
     return out
 
 
+# ── Alert-velocity wire-temperature hint ─────────────────────────────────────
+# The 🚨 BREAKING alert path is the analyst's most time-critical product. Its
+# RAW FIRING RATE (urgency=2 rows landed per unit time) carries a magnitude
+# signal no individual story's score can express: 24 alerts in 5h vs 8 in the
+# prior 5h tells Opus the wire is materially HOT — a real macro event is
+# under way (Fed surprise, geopolitical escalation, broad selloff), so the
+# briefing should weight stories with appropriate cumulative weight; 2 vs 12
+# tells Opus the wire is unusually QUIET, so a lone "8.5 score" headline this
+# window is more noteworthy than the same score in a busy window. Today the
+# briefing has neither read — it composes the LEAD/TOP SIGNALS without any
+# awareness of how the standalone-push channel is firing.
+#
+# Same shape as COVERAGE GAP / THROUGHPUT DEGRADATION (the operational-status
+# family): a separate input block, REPRODUCED in the output as a one-line
+# section, omitted entirely when the change is below the magnitude bar (so it
+# never becomes noise). Pure read-side: NO DB write, NO ai_score / ml_score /
+# score_source / urgency mutation, never reads or mutates source_articles,
+# backtest already excluded by _LIVE_ONLY_CLAUSE — all four load-bearing
+# invariants intact by construction. Counts only urgency=2 (the alerted state
+# — what actually fired); urgency=1 is the queued/phantom state (see the
+# 2026-05-13 reaper evidence) and is correctly excluded.
+#
+# Thresholds (conservative — the analyst's #1 complaint is noise):
+#   * recent + prior >= 5: a 1→3 swing on a sleepy wire is statistical
+#     noise; we want a materially-different intensity, not micro-fluctuations.
+#   * |delta_pct| >= 50: half-or-double from prior, both directions. A 25%
+#     swing is normal news-rate variance, not analyst-actionable.
+# Two special cases that bypass the percentage gate (the ratio is undefined
+# or near-infinite, but the absolute change is itself the signal):
+#   * recent >= 5 AND prior == 0: a previously-dark wire just lit up — a
+#     real wire-event signal, regardless of % math (-/0 is undefined).
+#   * recent == 0 AND prior >= 5: the wire just went silent — also notable.
+_ALERT_VELOCITY_MIN_TOTAL = 5
+_ALERT_VELOCITY_MIN_DELTA_PCT = 50.0
+
+
+def _collect_alert_velocity(window_hours: int = 5) -> dict | None:
+    """Best-effort: count BREAKING alerts (urgency=2) in the recent
+    ``window_hours`` and the immediately-preceding window of the same length.
+    Returns ``{"recent": int, "prior": int, "window_h": int}`` or ``None`` on
+    ANY failure — an alert-temperature read must NEVER break or delay the 5h
+    briefing it annotates (identical discipline to ``_collect_source_health``
+    / ``_collect_source_throughput`` / ``_recent_briefing_digest``).
+    Opens a fresh short-lived ``mode=ro`` connection (never the daemon's
+    shared ``self.conn`` — the documented cursor-collision hazard)."""
+    try:
+        import sqlite3
+        from storage.article_store import _get_db_path, _LIVE_ONLY_CLAUSE
+        from datetime import timedelta as _td
+        now = datetime.now(timezone.utc)
+        recent_cut = (now - _td(hours=window_hours)).isoformat()
+        prior_cut = (now - _td(hours=2 * window_hours)).isoformat()
+        conn = sqlite3.connect(
+            f"file:{_get_db_path()}?mode=ro", uri=True, timeout=5,
+        )
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            row = conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN first_seen >= ? THEN 1 ELSE 0 END) AS recent, "
+                "SUM(CASE WHEN first_seen >= ? AND first_seen < ? "
+                "         THEN 1 ELSE 0 END) AS prior "
+                f"FROM articles WHERE urgency = 2 AND first_seen >= ? "
+                f"AND {_LIVE_ONLY_CLAUSE}",
+                (recent_cut, prior_cut, recent_cut, prior_cut),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        recent = int(row[0] or 0)
+        prior = int(row[1] or 0)
+        return {"recent": recent, "prior": prior, "window_h": int(window_hours)}
+    except Exception:
+        return None
+
+
+def _alert_velocity_lines(
+    velocity: dict | None,
+    min_total: int = _ALERT_VELOCITY_MIN_TOTAL,
+    min_delta_pct: float = _ALERT_VELOCITY_MIN_DELTA_PCT,
+) -> list[str]:
+    """Pure: render an alert-velocity dict into 0 or 1 analyst-facing lines.
+
+    Three emit paths (all anchored on absolute count so micro-fluctuations
+    on a sleepy wire stay silent):
+
+      * ``recent + prior >= min_total`` AND ``|delta_pct| >= min_delta_pct``
+        — normal-range change, both directions ("+200%" / "-75%");
+      * ``recent >= min_total`` AND ``prior == 0`` — previously-dark wire
+        just lit up (percentage undefined; report "fired vs 0 prior");
+      * ``recent == 0`` AND ``prior >= min_total`` — wire just went silent
+        ("0 fired vs N prior — wire silent").
+
+    Returns [] otherwise so the caller omits the whole section — same
+    "omit when below threshold" discipline as ``_coverage_gap_lines`` /
+    ``_throughput_degradation_lines``. The output is a SINGLE line (this
+    section can never itself become a wall of text).
+    """
+    if not isinstance(velocity, dict):
+        return []
+    try:
+        recent = int(velocity.get("recent") or 0)
+        prior = int(velocity.get("prior") or 0)
+        window_h = int(velocity.get("window_h") or 0)
+    except (TypeError, ValueError):
+        return []
+    if recent < 0 or prior < 0 or window_h <= 0:
+        return []
+    # Newly-lit / newly-silent edges first — bypass the percentage gate
+    # because the ratio is undefined / divergent.
+    if recent >= min_total and prior == 0:
+        return [
+            f"BREAKING wire fired {recent} alert(s) in last {window_h}h "
+            f"vs 0 in prior {window_h}h — wire newly active"
+        ]
+    if recent == 0 and prior >= min_total:
+        return [
+            f"BREAKING wire fired 0 alerts in last {window_h}h "
+            f"vs {prior} in prior {window_h}h — wire silent"
+        ]
+    if recent + prior < min_total:
+        return []
+    # prior > 0 here (recent+prior >= 5 AND prior == 0 was handled above);
+    # delta_pct is well-defined.
+    delta_pct = (recent - prior) / prior * 100.0
+    if abs(delta_pct) < min_delta_pct:
+        return []
+    sign = "+" if delta_pct >= 0 else ""
+    label = "hot" if delta_pct > 0 else "cooling"
+    return [
+        f"BREAKING wire fired {recent} alerts in last {window_h}h "
+        f"vs {prior} in prior {window_h}h ({sign}{delta_pct:.0f}%) — "
+        f"wire materially {label}"
+    ]
+
+
 # ── Prior-digest continuity (anti-rehash) ────────────────────────────────────
 # A news analyst reading consecutive 5h heartbeats complains most about
 # repetition: the briefing re-LEADS with the SAME story it led with last time.
@@ -505,6 +642,7 @@ RULES:
 - If an "AGING TOP ROWS" block is present, it names the highest-ranked digest rows whose deterministic wall-clock age (time since the story hit our wire) is several hours old — a ground-truth recency cross-check, independent of any row's score or decay rank. An aging top row is a developing/continued story, NOT one that just broke: do NOT make it the LEAD as if it were fresh when a comparably-important newer row exists, frame it explicitly as developing in the LEAD and TOP SIGNALS, and never imply a multi-hour-old item happened moments ago. This is a ranking/framing hint only — do NOT echo a literal "AGING TOP ROWS" section in the output (same as BOOK HEAT, unlike COVERAGE GAP).
 - If a "COVERAGE GAP" block is present in the data input, reproduce it as a **COVERAGE GAP** section (one bullet per dark channel, verbatim). These are intel channels the system could NOT collect from this window — the analyst must know what they are blind to, not assume silence means calm. Omit the section entirely if no gap block is provided.
 - If a "THROUGHPUT DEGRADATION" block is present in the data input, reproduce it as a **THROUGHPUT DEGRADATION** section directly under the COVERAGE GAP bullets (one bullet per source, verbatim). These sources are still alive but have lost most of their recent flow — partial blind spots an analyst must know about (the early-warning complement to COVERAGE GAP: a marginally-alive source has not crossed the disable threshold yet, but the briefing has materially less coverage from it than the prior window). Omit the section entirely if no degradation block is provided.
+- If an "ALERT VELOCITY" block is present in the data input, reproduce it as an **ALERT VELOCITY** section under the THROUGHPUT DEGRADATION bullets (one bullet, verbatim). This is the BREAKING-alert wire's firing-rate vs the prior window of the same length: an objective magnitude signal independent of any individual story's score. Use it for cumulative framing — a "wire materially hot" window means cumulative event flow is itself the story (weight the LEAD accordingly: macro/risk regime, not a lone headline); a "wire silent" window means scrutinise any one BREAKING-tagged story more carefully. Omit the section entirely if no velocity block is provided.
 - If a "PRIOR DIGEST" block is present, it is the LEAD and TOP SIGNALS YOU YOURSELF published in your previous 5h briefing — the analyst just read that one. Re-leading the SAME story as if it were new is the single most-cited "repetitive digest" complaint. If the dominant story is materially unchanged, do NOT restate it as the LEAD: lead instead with what has CHANGED since (a new level/print/catalyst, a reversal, or a genuinely different top story that now outranks it), and frame any necessarily-carried theme explicitly as continuation/development ("rout now easing", "follows this morning's selloff"), never as a fresh break. This is a framing/selection hint only — do NOT echo a literal "PRIOR DIGEST" section in the output (same as BOOK HEAT / AGING TOP ROWS, unlike COVERAGE GAP).
 
 OUTPUT FORMAT — use EXACTLY this, filled with real data:
@@ -556,6 +694,9 @@ AMD   $xxx  +x.xx%  |  AMAT $xxx +x.xx%  |  SMH  $xxx  +x.xx%
 
 **THROUGHPUT DEGRADATION** (only if a degradation block is provided — else omit this whole section)
 - [degrading source verbatim from the THROUGHPUT DEGRADATION data block]
+
+**ALERT VELOCITY** (only if a velocity block is provided — else omit this whole section)
+- [BREAKING-wire firing rate verbatim from the ALERT VELOCITY data block]
 
 **DESK NOTE:** [1-2 sentences. One thesis. One level to watch.]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1030,7 +1171,8 @@ def _aging_top_rows(
 
 
 def _build_payload(articles, stock_data, earnings, source_health_report=None,
-                   prior_digest=None, source_throughput=None):
+                   prior_digest=None, source_throughput=None,
+                   alert_velocity=None):
     parts = [f"BRIEFING TIME: {_now_utc_str()}\n"]
 
     macro_data   = stock_data.get("macro", [])   if isinstance(stock_data, dict) else []
@@ -1243,6 +1385,26 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None,
             for dl in deg_lines:
                 parts.append(f"  - {dl}")
 
+    # Alert-velocity block — BREAKING-wire firing-rate magnitude hint. Only
+    # emitted when an explicit velocity dict is supplied (analyze() fetches it
+    # live). When None, the section is omitted entirely so the prompt's "omit
+    # if no velocity block" rule fires and callers/tests that build a payload
+    # without alert-velocity context stay deterministic — exact same shape as
+    # the source_throughput block above (the documented anti-drift discipline).
+    # A REPRODUCED section (like COVERAGE GAP / THROUGHPUT DEGRADATION),
+    # operational-status family. Pure read-side: no DB write, no
+    # ai_score/ml_score/score_source/urgency touch, never reads or mutates
+    # source_articles, backtest already excluded upstream — invariants intact.
+    if alert_velocity is not None:
+        av_lines = _alert_velocity_lines(alert_velocity)
+        if av_lines:
+            parts.append(
+                "\n=== ALERT VELOCITY (BREAKING wire firing rate vs prior "
+                "window — magnitude signal, not in any one row's score) ==="
+            )
+            for al in av_lines:
+                parts.append(f"  - {al}")
+
     # Prior-digest continuity block — anti-rehash. Only emitted when an
     # explicit prior digest is supplied (analyze() reads it best-effort);
     # ``None`` ⇒ the section is omitted entirely and the 4-arg path stays
@@ -1276,6 +1438,7 @@ def analyze(articles, stock_data, earnings):
         source_health_report=_collect_source_health(),
         prior_digest=_recent_briefing_digest(),
         source_throughput=_collect_source_throughput(),
+        alert_velocity=_collect_alert_velocity(),
     )
     full_prompt = f"{SYSTEM_PROMPT}\n\n---\nDATA INPUT:\n{payload}"
     result = claude_call(full_prompt, model=MODEL, timeout=180)
