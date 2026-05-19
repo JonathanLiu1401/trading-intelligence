@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from analytics.trend_velocity import TICKER_RE, STOP, _parse_ts, extract_tickers
+from storage.article_store import _LIVE_ONLY_CLAUSE
 
 DB_PATH = Path(__file__).resolve().parents[1] / "data" / "articles.db"
 OUT_PATH = Path("/home/zeph/logs/breaking_news.jsonl")
@@ -68,9 +69,12 @@ def main() -> int:
     since = (datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
+    # Canonical `_LIVE_ONLY_CLAUSE` — a partial `source NOT LIKE 'backtest_run_%'`
+    # lets backtest:// URLs and opus_annotation* rows contribute fake "breaking"
+    # bursts (multiple synthetic rows on one ticker in a small replay window).
     cur = conn.execute(
         "SELECT first_seen, title, source FROM articles INDEXED BY idx_first_seen "
-        "WHERE first_seen >= ? AND source NOT LIKE 'backtest_run_%' "
+        f"WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE} "
         "ORDER BY first_seen DESC LIMIT ?",
         (since, FETCH_LIMIT),
     )

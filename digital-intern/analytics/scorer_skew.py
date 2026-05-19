@@ -13,6 +13,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from storage.article_store import _LIVE_ONLY_CLAUSE
+
 DB = Path(__file__).resolve().parents[1] / "data" / "articles.db"
 OUT = Path("/home/zeph/logs/scorer_skew.json")
 SCAN_LIMIT = 4000
@@ -22,14 +24,20 @@ MIN_PER_SOURCE = 5
 def compute(window_hours: int = 6):
     conn = sqlite3.connect(str(DB))
     conn.execute("PRAGMA busy_timeout=5000")
+    # Canonical `_LIVE_ONLY_CLAUSE` — the previous `source NOT LIKE
+    # 'backtest_run_%'`-only filter let `backtest_*` (e.g. `backtest_winner`)
+    # and `opus_annotation*` rows through, polluting per-source ai-vs-ml gap
+    # averages with synthetic training labels. Currently masked by the
+    # `ml_score IS NOT NULL` predicate (synthetic rows never go through ML
+    # scoring), but the partial filter is the same drift class as elsewhere.
     rows = conn.execute(
-        """
+        f"""
         SELECT source, ai_score, ml_score
           FROM articles
          WHERE id IN (SELECT id FROM articles ORDER BY id DESC LIMIT ?)
            AND ai_score IS NOT NULL
            AND ml_score IS NOT NULL
-           AND source NOT LIKE 'backtest_run_%'
+           AND {_LIVE_ONLY_CLAUSE}
         """,
         (SCAN_LIMIT,),
     ).fetchall()

@@ -10,6 +10,8 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from storage.article_store import _LIVE_ONLY_CLAUSE
+
 DB_PATH = Path(__file__).resolve().parents[1] / "data" / "articles.db"
 OUT_PATH = Path("/home/zeph/logs/trend_velocity.json")
 WINDOW_HOURS = 2
@@ -61,9 +63,13 @@ def extract_tickers(title: str) -> list[str]:
 
 
 def fetch_recent(conn: sqlite3.Connection, limit: int) -> list[tuple[str, str]]:
+    # Canonical `_LIVE_ONLY_CLAUSE` — `source NOT LIKE 'backtest_run_%'`-only
+    # let `backtest://` URLs and `opus_annotation*` synthetic rows leak into
+    # the velocity calculation (AGENTS.md / CLAUDE.md §5 explicitly call this
+    # one out as the long-standing partial-filter bug).
     cur = conn.execute(
         "SELECT first_seen, title FROM articles "
-        "WHERE source NOT LIKE 'backtest_run_%' "
+        f"WHERE {_LIVE_ONLY_CLAUSE} "
         "ORDER BY first_seen DESC LIMIT ?",
         (limit,),
     )
