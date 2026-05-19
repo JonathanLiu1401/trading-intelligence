@@ -40,6 +40,22 @@ HTTP_TIMEOUT = 10
 MIN_GAINER_PCT = 3.0
 MIN_LOSER_PCT = -3.0
 
+# Per-(symbol, source_tag) cooldown for re-emissions. The article-level dedup
+# above keys on hash(link, title); the title encodes the LIVE price/percent/
+# volume, so a 5.7% MU tick that ticks to 5.2% three minutes later is a NEW row
+# and re-enters the urgent pipeline. Live evidence (2026-05-19 18:01:25): a
+# single MU move surfaced FOUR distinct urgent articles within the same minute
+# — "[YF/day_gainers] MU ... +5.7% @ $720.63", "+5.2% @ $716.84",
+# "[YF/most_actives] MU ... +5.7% @ $720.63", "+5.2% @ $716.84" — and all four
+# fired Bloomberg alerts as ai_score=9.0 score_source='llm'. The analyst's
+# top noise complaint pattern: same mover, same direction, multiple pushes.
+# The cooldown gate suppresses re-emission of the SAME (symbol, source_tag)
+# within MOVER_COOLDOWN_MIN minutes of the prior emission — independent of
+# the article-id dedup, so the daemon still gets ONE row per mover surge
+# regardless of how the price wobbles intra-window. A genuine fresh direction
+# change (e.g., gainer → loser) crosses screener buckets and re-arms.
+MOVER_COOLDOWN_MIN = 30
+
 
 def _ensure_db(conn: sqlite3.Connection) -> None:
     # Match the canonical connection hardening used by google_news / rss_collector
@@ -63,7 +79,45 @@ def _ensure_db(conn: sqlite3.Connection) -> None:
             first_seen TEXT
         )"""
     )
+    # Companion table for the per-(symbol, source_tag) re-emission cooldown.
+    # Separate from seen_articles because the cooldown key is (symbol,
+    # source_tag) — NOT the article id (which encodes the moving price/volume
+    # and thus changes every tick). Adjacent to seen_articles in the same DB
+    # so a single connection / single PRAGMA arm covers both queries.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS mover_cooldown (
+            key TEXT PRIMARY KEY,
+            last_emit_iso TEXT NOT NULL
+        )"""
+    )
     conn.commit()
+
+
+def _cooldown_key(symbol: str, source_tag: str) -> str:
+    return f"{source_tag}|{symbol.upper()}"
+
+
+def _within_cooldown(conn: sqlite3.Connection, key: str,
+                     now: datetime, cooldown_min: int) -> bool:
+    """True iff this ``(symbol, source_tag)`` was emitted within the last
+    ``cooldown_min`` minutes. Unparseable/missing rows fall through to False
+    (safe default — emit) so a corrupted timestamp can never permanently
+    silence a mover. Caller decides on True (skip) vs False (emit + update)."""
+    if cooldown_min <= 0:
+        return False
+    row = conn.execute(
+        "SELECT last_emit_iso FROM mover_cooldown WHERE key=?", (key,)
+    ).fetchone()
+    if not row or not row[0]:
+        return False
+    try:
+        last = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    delta_min = (now - last).total_seconds() / 60.0
+    return delta_min < cooldown_min
 
 
 def _article_id(link: str, title: str) -> str:
@@ -92,9 +146,24 @@ def _fetch_screener(scr_id: str) -> list[dict]:
 
 
 def collect_market_movers() -> list[dict]:
-    """Fetch gainers/losers/most-active. Returns net-new article dicts."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Fetch gainers/losers/most-active. Returns net-new article dicts.
+
+    Two-layer dedup:
+      1. ``seen_articles.id = hash(link, title)`` — cross-cycle gate for the
+         exact same row (same price, same percent).
+      2. ``mover_cooldown(key=(source_tag, symbol))`` — the SAME mover surging
+         from +5.7% to +5.2% three minutes later is a NEW row by layer (1)
+         (the title changed), but the analyst was already pushed; suppress
+         the re-emission for ``MOVER_COOLDOWN_MIN`` minutes. The cooldown is
+         scoped per ``source_tag`` so a ticker that flips from gainer to
+         loser (a genuine direction change) re-arms in the other screener
+         bucket. ``most_actives`` is still distinct from ``day_gainers`` —
+         that is by design, the two screeners are independent signals.
+    """
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     results: list[dict] = []
+    skipped_cooldown: list[str] = []
 
     conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
     _ensure_db(conn)
@@ -119,6 +188,17 @@ def collect_market_movers() -> list[dict]:
                 if scr_id == "day_losers" and chg_pct > MIN_LOSER_PCT:
                     continue
 
+                # Per-(symbol, source_tag) cooldown gate. The article-id dedup
+                # below only catches *byte-identical* rows; this catches the
+                # "same MU, same screener, slightly different price" pattern
+                # where every refresh becomes a new urgent alert. Checked
+                # BEFORE building the title / id so a price update doesn't
+                # waste hash work just to be thrown away.
+                ckey = _cooldown_key(symbol, source_tag)
+                if _within_cooldown(conn, ckey, now_dt, MOVER_COOLDOWN_MIN):
+                    skipped_cooldown.append(f"{source_tag}/{symbol}")
+                    continue
+
                 vol_str = f"{volume/1e6:.1f}M" if volume >= 1_000_000 else f"{volume/1e3:.0f}K"
                 vol_rel = f" ({volume/avg_vol:.1f}x avg)" if avg_vol else ""
 
@@ -140,6 +220,17 @@ def collect_market_movers() -> list[dict]:
                     "VALUES (?,?,?,?,?)",
                     (aid, link, title, source_tag, now),
                 )
+                # Arm the cooldown only AFTER a successful emission so a row
+                # rejected by the article-id dedup above doesn't silence the
+                # ticker on the next cycle (which would race with the same-
+                # title fingerprint check). Upsert keeps the cooldown
+                # idempotent across re-runs of the same minute.
+                conn.execute(
+                    "INSERT INTO mover_cooldown (key, last_emit_iso) "
+                    "VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET last_emit_iso=excluded.last_emit_iso",
+                    (ckey, now),
+                )
                 results.append({
                     "id": aid,
                     "link": link,
@@ -155,6 +246,15 @@ def collect_market_movers() -> list[dict]:
         conn.commit()
     finally:
         conn.close()
+
+    if skipped_cooldown:
+        # Log at DEBUG so the daemon log isn't spammed every minute on a
+        # high-volatility day; the count is what matters for diagnosis.
+        _log.debug(
+            f"[market_movers] cooldown suppressed {len(skipped_cooldown)} "
+            f"re-emission(s) (per-(symbol,screener) within "
+            f"{MOVER_COOLDOWN_MIN}min): {','.join(skipped_cooldown[:8])}"
+        )
 
     return results
 

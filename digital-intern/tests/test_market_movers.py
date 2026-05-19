@@ -162,6 +162,200 @@ class TestDedup:
         assert second == []
 
 
+class TestMoverCooldown:
+    """Per-(symbol, source_tag) cooldown — the SAME ticker bouncing inside one
+    screener within a few minutes used to emit a NEW urgent article per tick
+    because the title encodes the moving price (live 2026-05-19 18:01:25: MU
+    surfaced FOUR distinct urgent rows across day_gainers + most_actives at
+    +5.7% then +5.2% within the same minute). The cooldown gate suppresses
+    re-emission of the same key within MOVER_COOLDOWN_MIN minutes."""
+
+    def _setup(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(market_movers, "DB_PATH",
+                            tmp_path / "seen_articles.db")
+
+    def test_same_symbol_same_screener_changing_price_is_suppressed(
+        self, monkeypatch, tmp_path
+    ):
+        """The live failure mode: MU at +5.7% emits, then 3 minutes later MU
+        at +5.2% (different title → passes article-id dedup) — the cooldown
+        gate must catch the re-emission."""
+        self._setup(monkeypatch, tmp_path)
+        ticks = iter([
+            [_quote(symbol="MU", price=720.63, chg_pct=5.7)],
+            [_quote(symbol="MU", price=716.84, chg_pct=5.2)],
+        ])
+        monkeypatch.setattr(
+            market_movers, "_fetch_screener",
+            lambda scr_id: next(ticks) if scr_id == "day_gainers" else [],
+        )
+
+        first = market_movers.collect_market_movers()
+        second = market_movers.collect_market_movers()
+
+        assert [a["symbol"] for a in first] == ["MU"]
+        # The second tick has a different title (different price) so the
+        # article-id dedup would NOT catch it. The cooldown gate must.
+        assert second == [], (
+            f"expected the second MU tick within MOVER_COOLDOWN_MIN to be "
+            f"suppressed by the cooldown gate, got {second!r}"
+        )
+
+    def test_different_screener_for_same_symbol_is_not_suppressed(
+        self, monkeypatch, tmp_path
+    ):
+        """The cooldown is scoped per source_tag so a ticker on both
+        day_gainers and most_actives is still allowed to emit once per
+        screener — they are independent signals."""
+        self._setup(monkeypatch, tmp_path)
+        nvda_g = _quote(symbol="NVDA", chg_pct=7.0)
+        # most_actives is volume-driven, no chg_pct threshold; reuse same vol
+        nvda_a = _quote(symbol="NVDA", chg_pct=0.5, volume=50_000_000)
+        monkeypatch.setattr(
+            market_movers, "_fetch_screener",
+            lambda scr_id: {"day_gainers": [nvda_g],
+                            "most_actives": [nvda_a]}.get(scr_id, []),
+        )
+
+        out = market_movers.collect_market_movers()
+        sources = sorted({a["source"] for a in out})
+        assert sources == ["YF/day_gainers", "YF/most_actives"], (
+            f"NVDA on two different screeners must emit once per screener; "
+            f"got sources={sources}"
+        )
+
+    def test_different_symbol_same_screener_is_not_suppressed(
+        self, monkeypatch, tmp_path
+    ):
+        """The cooldown gate must not bleed across tickers — MU on cooldown
+        cannot suppress a fresh NVDA mover on the same screener."""
+        self._setup(monkeypatch, tmp_path)
+        run_quotes = iter([
+            [_quote(symbol="MU", chg_pct=5.7)],
+            [_quote(symbol="NVDA", chg_pct=6.5)],
+        ])
+        monkeypatch.setattr(
+            market_movers, "_fetch_screener",
+            lambda scr_id: next(run_quotes) if scr_id == "day_gainers" else [],
+        )
+
+        first = market_movers.collect_market_movers()
+        second = market_movers.collect_market_movers()
+
+        assert [a["symbol"] for a in first] == ["MU"]
+        assert [a["symbol"] for a in second] == ["NVDA"], (
+            "a different ticker on the same screener must NOT be suppressed by "
+            "an unrelated ticker's cooldown — they are independent emissions"
+        )
+
+    def test_cooldown_arms_only_after_successful_emit(
+        self, monkeypatch, tmp_path
+    ):
+        """A sub-threshold gainer (filtered out by MIN_GAINER_PCT) must NOT
+        arm the cooldown — otherwise the next run with a *real* mover would
+        be silently suppressed even though we never told the analyst."""
+        self._setup(monkeypatch, tmp_path)
+        run_quotes = iter([
+            [_quote(symbol="MU", chg_pct=1.5)],   # under threshold → dropped
+            [_quote(symbol="MU", chg_pct=8.5)],   # genuine mover next cycle
+        ])
+        monkeypatch.setattr(
+            market_movers, "_fetch_screener",
+            lambda scr_id: next(run_quotes) if scr_id == "day_gainers" else [],
+        )
+
+        first = market_movers.collect_market_movers()
+        second = market_movers.collect_market_movers()
+
+        assert first == [], "sub-threshold gainer must not emit"
+        assert [a["chg_pct"] for a in second] == [8.5], (
+            "the genuine mover on the next cycle must emit — cooldown must "
+            "only arm AFTER a successful emission, not after a filtered drop"
+        )
+
+    def test_cooldown_expires_after_window(self, monkeypatch, tmp_path):
+        """Outside the MOVER_COOLDOWN_MIN window a re-emission is allowed —
+        otherwise a mover that surges twice in one day would be silenced for
+        the second push. Simulates time progression by mutating the stored
+        last_emit_iso directly (cleaner than monkeypatching datetime)."""
+        import sqlite3
+        from datetime import datetime, timezone, timedelta
+        self._setup(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            market_movers, "_fetch_screener",
+            lambda scr_id: [_quote(symbol="MU", chg_pct=5.7,
+                                   price=720.63 if scr_id == "day_gainers" else 0)]
+                            if scr_id == "day_gainers" else [],
+        )
+
+        first = market_movers.collect_market_movers()
+        assert [a["symbol"] for a in first] == ["MU"]
+
+        # Backdate the cooldown row past the window
+        old = (datetime.now(timezone.utc)
+               - timedelta(minutes=market_movers.MOVER_COOLDOWN_MIN + 5))
+        old_iso = old.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Use the same DB the collector touches (per the monkeypatched
+        # DB_PATH); a fresh connection that arms its OWN busy_timeout/WAL.
+        conn = sqlite3.connect(str(market_movers.DB_PATH), timeout=10)
+        try:
+            conn.execute(
+                "UPDATE mover_cooldown SET last_emit_iso=? "
+                "WHERE key=?",
+                (old_iso, market_movers._cooldown_key("MU", "YF/day_gainers")),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # The next emission has a different title (encoded price differs)
+        # AND the cooldown has expired — the row should be allowed through.
+        monkeypatch.setattr(
+            market_movers, "_fetch_screener",
+            lambda scr_id: [_quote(symbol="MU", chg_pct=5.2, price=716.84)]
+                            if scr_id == "day_gainers" else [],
+        )
+        second = market_movers.collect_market_movers()
+        assert [a["symbol"] for a in second] == ["MU"], (
+            "after the cooldown window expires the same ticker must be "
+            "allowed to emit a fresh mover article again"
+        )
+
+    def test_unparseable_cooldown_row_falls_through_to_emit(
+        self, monkeypatch, tmp_path
+    ):
+        """A corrupted last_emit_iso (e.g. truncated string) must NOT
+        permanently silence the ticker — the gate fails open. Same safe-default
+        discipline as alert_agent / urgency_scorer date parsers."""
+        import sqlite3
+        self._setup(monkeypatch, tmp_path)
+
+        monkeypatch.setattr(
+            market_movers, "_fetch_screener",
+            lambda scr_id: [] if scr_id != "day_gainers" else
+                            [_quote(symbol="MU", chg_pct=5.7)],
+        )
+        # Force-arm the cooldown with a junk timestamp
+        from collectors.market_movers import _ensure_db
+        DB = tmp_path / "seen_articles.db"
+        conn = sqlite3.connect(str(DB), timeout=10)
+        _ensure_db(conn)
+        conn.execute(
+            "INSERT INTO mover_cooldown (key, last_emit_iso) VALUES (?, ?)",
+            (market_movers._cooldown_key("MU", "YF/day_gainers"),
+             "not-a-real-timestamp"),
+        )
+        conn.commit()
+        conn.close()
+
+        out = market_movers.collect_market_movers()
+        assert [a["symbol"] for a in out] == ["MU"], (
+            "a corrupted cooldown timestamp must fall through to emit (gate "
+            "fails open) — otherwise a single bad row permanently silences "
+            "the ticker"
+        )
+
+
 class TestSeenDbHardening:
     """Pins the SQLite hardening on the shared ``seen_articles.db``.
 
