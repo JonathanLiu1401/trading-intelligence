@@ -95,6 +95,65 @@ def is_market_open(now: datetime | None = None) -> bool:
     return _OPEN_MIN <= minutes < close_minute(now.date())
 
 
+def next_session_close(now: datetime | None = None) -> datetime | None:
+    """The next NYSE session close after ``now`` (16:00 ET regular /
+    13:00 ET half-day).
+
+    Returns a UTC-aware datetime, or ``None`` when no NYSE close day can
+    be found within 14 forward days (defensive; the calendar has no
+    >4-day gap). Semantics mirror ``next_session_open``:
+
+      * Mid-session (e.g. 10:00 ET on a weekday) → TODAY's 16:00 close.
+      * Pre-open today (e.g. 09:00 ET) → still TODAY's 16:00 close (the
+        next session bell of any kind belongs to today's session).
+      * At or past today's close (e.g. 16:00 ET exactly) → NEXT trading
+        day's close.
+      * Weekend / holiday → the next trading day's close.
+      * Half-day → 13:00 ET, not 16:00, on the half-day itself.
+
+    Pure: walks the NYSE_HOLIDAYS_2026 / NYSE_HALF_DAYS_2026 / weekday
+    calendar from ``now``, no I/O. Companion to ``seconds_until_close``
+    — both share the strict ``close_dt > now`` advance rule so a tick
+    at exactly the bell always advances to the next session (never
+    returns a stale "0s left" against a frozen book)."""
+    now_utc = (now or datetime.now(UTC)).astimezone(UTC)
+    now_ny = now_utc.astimezone(NY)
+    candidate = now_ny.date()
+    for _ in range(14):
+        is_trading_day = (
+            candidate.weekday() < 5
+            and candidate not in NYSE_HOLIDAYS_2026
+        )
+        if is_trading_day:
+            close_min = close_minute(candidate)
+            close_dt_ny = datetime(
+                candidate.year, candidate.month, candidate.day,
+                close_min // 60, close_min % 60, tzinfo=NY,
+            )
+            if close_dt_ny > now_ny:
+                return close_dt_ny.astimezone(UTC)
+        candidate = candidate + timedelta(days=1)
+    return None
+
+
+def seconds_until_close(now: datetime | None = None) -> int | None:
+    """Integer seconds from ``now`` until the next NYSE session close.
+
+    Returns ``None`` when no close is reachable within 14 forward days
+    (mirrors ``next_session_close``'s defensive cap). Always >= 0 —
+    a wall-clock step-back that would otherwise yield a negative
+    countdown clamps to 0. Round-trips with ``next_session_close``:
+    callers that only need the countdown for prompt/Discord rendering
+    should use this; callers that need the absolute timestamp should
+    use ``next_session_close``."""
+    now_utc = (now or datetime.now(UTC)).astimezone(UTC)
+    close_dt = next_session_close(now_utc)
+    if close_dt is None:
+        return None
+    secs = (close_dt - now_utc).total_seconds()
+    return int(max(0.0, secs))
+
+
 def next_session_open(now: datetime | None = None) -> datetime | None:
     """The next regular-session 09:30 ET open after ``now``.
 

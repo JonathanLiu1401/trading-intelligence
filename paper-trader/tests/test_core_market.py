@@ -479,3 +479,171 @@ class TestNextSessionOpen:
         # Returned datetime is UTC-tagged regardless of NY DST state.
         assert nxt.tzinfo is not None
         assert nxt.utcoffset().total_seconds() == 0
+
+
+class TestNextSessionClose:
+    """`market.next_session_close` / `seconds_until_close` — the close-side
+    companion of next_session_open. Pure forward-walk over the NYSE calendar
+    that knows about half-days; wall clock is injected for determinism."""
+
+    def _utc_from_ny(self, year, month, day, hour, minute):
+        return datetime(year, month, day, hour, minute, tzinfo=NY).astimezone(UTC)
+
+    def test_mid_session_returns_today_4pm(self):
+        # 2026-05-14 Thu 10:00 ET → today's 16:00 ET close.
+        now = self._utc_from_ny(2026, 5, 14, 10, 0)
+        cl = market.next_session_close(now)
+        cl_ny = cl.astimezone(NY)
+        assert cl_ny.date() == datetime(2026, 5, 14).date()
+        assert (cl_ny.hour, cl_ny.minute) == (16, 0)
+
+    def test_premarket_returns_today_close(self):
+        # 09:00 ET on a weekday — still inside today's session window for
+        # close purposes ("the next bell of any kind belongs to today").
+        now = self._utc_from_ny(2026, 5, 14, 9, 0)
+        cl = market.next_session_close(now)
+        cl_ny = cl.astimezone(NY)
+        assert cl_ny.date() == datetime(2026, 5, 14).date()
+        assert (cl_ny.hour, cl_ny.minute) == (16, 0)
+
+    def test_at_close_exactly_advances_to_next_day(self):
+        # 16:00 ET exactly: close_dt > now is strict — advance to Friday.
+        now = self._utc_from_ny(2026, 5, 14, 16, 0)
+        cl = market.next_session_close(now)
+        cl_ny = cl.astimezone(NY)
+        assert cl_ny.date() == datetime(2026, 5, 15).date()
+        assert (cl_ny.hour, cl_ny.minute) == (16, 0)
+
+    def test_post_close_returns_next_day(self):
+        # 17:00 ET Thu → Fri 16:00 ET close.
+        now = self._utc_from_ny(2026, 5, 14, 17, 0)
+        cl = market.next_session_close(now)
+        cl_ny = cl.astimezone(NY)
+        assert cl_ny.date() == datetime(2026, 5, 15).date()
+
+    def test_friday_after_close_jumps_to_monday(self):
+        # 2026-05-15 Fri 17:00 ET → 2026-05-18 Mon 16:00 ET.
+        now = self._utc_from_ny(2026, 5, 15, 17, 0)
+        cl = market.next_session_close(now)
+        cl_ny = cl.astimezone(NY)
+        assert cl_ny.date() == datetime(2026, 5, 18).date()
+        assert (cl_ny.hour, cl_ny.minute) == (16, 0)
+
+    def test_saturday_returns_monday(self):
+        now = self._utc_from_ny(2026, 5, 16, 10, 0)
+        cl = market.next_session_close(now)
+        cl_ny = cl.astimezone(NY)
+        assert cl_ny.date() == datetime(2026, 5, 18).date()
+        assert (cl_ny.hour, cl_ny.minute) == (16, 0)
+
+    def test_skips_holiday(self):
+        # Thursday 2026-11-26 is Thanksgiving (full close). Wed 17:00 →
+        # next close is Friday 2026-11-27 — a half-day, so the close is
+        # 13:00 ET, NOT 16:00.
+        now = self._utc_from_ny(2026, 11, 25, 17, 0)
+        cl = market.next_session_close(now)
+        cl_ny = cl.astimezone(NY)
+        assert cl_ny.date() == datetime(2026, 11, 27).date()
+        assert (cl_ny.hour, cl_ny.minute) == (13, 0)
+
+    def test_half_day_morning_returns_1pm(self):
+        # 2026-11-27 (day after Thanksgiving), 10:00 ET. The session
+        # closes at 13:00 ET, so the next close IS today's 13:00 — not
+        # 16:00.
+        now = self._utc_from_ny(2026, 11, 27, 10, 0)
+        cl = market.next_session_close(now)
+        cl_ny = cl.astimezone(NY)
+        assert cl_ny.date() == datetime(2026, 11, 27).date()
+        assert (cl_ny.hour, cl_ny.minute) == (13, 0)
+
+    def test_half_day_at_1300_advances_past(self):
+        # 13:00 ET on a half-day is the close — strict >, so we advance.
+        # The next session is Monday 2026-11-30, regular 16:00 ET close.
+        now = self._utc_from_ny(2026, 11, 27, 13, 0)
+        cl = market.next_session_close(now)
+        cl_ny = cl.astimezone(NY)
+        assert cl_ny.date() == datetime(2026, 11, 30).date()
+        assert (cl_ny.hour, cl_ny.minute) == (16, 0)
+
+    def test_christmas_eve_half_day_close(self):
+        # 2026-12-24 Thu is a known half-day. 10:00 ET → today's 13:00.
+        now = self._utc_from_ny(2026, 12, 24, 10, 0)
+        cl = market.next_session_close(now)
+        cl_ny = cl.astimezone(NY)
+        assert cl_ny.date() == datetime(2026, 12, 24).date()
+        assert (cl_ny.hour, cl_ny.minute) == (13, 0)
+
+    def test_good_friday_skipped(self):
+        # Thu 2026-04-02 17:00 ET — Fri Apr 3 is Good Friday. Next close
+        # is Monday Apr 6 at 16:00.
+        now = self._utc_from_ny(2026, 4, 2, 17, 0)
+        cl = market.next_session_close(now)
+        cl_ny = cl.astimezone(NY)
+        assert cl_ny.date() == datetime(2026, 4, 6).date()
+        assert (cl_ny.hour, cl_ny.minute) == (16, 0)
+
+    def test_returns_utc_aware_datetime(self):
+        now = self._utc_from_ny(2026, 5, 14, 10, 0)
+        cl = market.next_session_close(now)
+        assert cl is not None
+        assert cl.tzinfo is not None
+        assert cl.utcoffset().total_seconds() == 0
+
+
+class TestSecondsUntilClose:
+    """`market.seconds_until_close` — the integer-second countdown used by
+    Discord/dashboard surfaces. Round-trips with `next_session_close`."""
+
+    def _utc_from_ny(self, year, month, day, hour, minute):
+        return datetime(year, month, day, hour, minute, tzinfo=NY).astimezone(UTC)
+
+    def test_one_minute_before_close(self):
+        # 15:59 ET → 60s until 16:00 close. (Tolerant of sub-second slop.)
+        now = self._utc_from_ny(2026, 5, 14, 15, 59)
+        s = market.seconds_until_close(now)
+        assert s is not None
+        assert 59 <= s <= 60
+
+    def test_six_and_a_half_hours_at_open(self):
+        # 09:30 ET to 16:00 ET = 6h 30min = 23,400s.
+        now = self._utc_from_ny(2026, 5, 14, 9, 30)
+        s = market.seconds_until_close(now)
+        assert s == 23400
+
+    def test_half_day_three_and_a_half_hours_at_open(self):
+        # 09:30 ET to 13:00 ET on half-day = 3h 30min = 12,600s.
+        now = self._utc_from_ny(2026, 11, 27, 9, 30)
+        s = market.seconds_until_close(now)
+        assert s == 12600
+
+    def test_at_close_returns_next_session_distance(self):
+        # 16:00 ET exactly → strict advance to next day's 16:00 = 24h.
+        now = self._utc_from_ny(2026, 5, 14, 16, 0)
+        s = market.seconds_until_close(now)
+        # Within Thu→Fri there's no DST transition, so exactly 86400s.
+        assert s == 86400
+
+    def test_weekend_to_monday_close(self):
+        # Sat 10:00 ET → Mon 16:00 ET = 2d + 6h = 194,400s.
+        now = self._utc_from_ny(2026, 5, 16, 10, 0)
+        s = market.seconds_until_close(now)
+        assert s == 194400
+
+    def test_clock_step_back_clamps_to_zero(self):
+        # If the wall clock somehow steps just past the next close after
+        # the close datetime is resolved, the bare subtraction would be
+        # negative. The helper itself uses one consistent ``now``, so the
+        # only way to exercise this is structural — confirm the public
+        # surface never returns a negative integer.
+        s = market.seconds_until_close(
+            self._utc_from_ny(2026, 5, 14, 10, 0)
+        )
+        assert s is not None and s >= 0
+
+    def test_returns_int_type(self):
+        # API contract: int, not float — Discord rendering does integer
+        # math (`s // 3600`).
+        s = market.seconds_until_close(
+            self._utc_from_ny(2026, 5, 14, 10, 0)
+        )
+        assert isinstance(s, int)
