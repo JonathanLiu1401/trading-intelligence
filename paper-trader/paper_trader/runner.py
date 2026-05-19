@@ -652,9 +652,20 @@ def _cycle():
     try:
         if summary.get("auto_exits") or summary.get("status") == "FILLED":
             # post the trade that was just executed
-            trades = get_store().recent_trades(1)
+            store_ = get_store()
+            trades = store_.recent_trades(1)
             if trades and summary.get("status") == "FILLED":
-                reporter.send_trade_alert(trades[0])
+                # Pass the POST-trade snapshot (strategy.decide() re-marks at
+                # the end of the cycle) + the store so the alert can append
+                # a one-liner with the trade's immediate book impact (lot
+                # weight, realized P/L, hold time, cash). Backwards-
+                # compatible — send_trade_alert degrades to the old body
+                # when either kwarg is missing.
+                reporter.send_trade_alert(
+                    trades[0],
+                    snapshot=summary.get("snapshot"),
+                    store=store_,
+                )
             for ax in summary.get("auto_exits") or []:
                 reporter._send(f"**AUTO RISK EXIT** `{ax}`")
         if summary.get("status") == "FILLED":

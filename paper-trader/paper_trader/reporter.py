@@ -205,8 +205,201 @@ def _send(message: str) -> bool:
         return False
 
 
-def send_trade_alert(trade: dict) -> bool:
-    """Post a single trade immediately."""
+def _hold_str_from_days(days: float | None) -> str:
+    """``2.3d`` / ``5.4h`` / ``42m`` — compact hold-duration label from a
+    fractional-day ``hold_days`` value (the build_round_trips emit). ``None``
+    yields ``""`` so the caller can suppress the token entirely on a missing
+    timestamp."""
+    if days is None:
+        return ""
+    try:
+        d = float(days)
+    except (TypeError, ValueError):
+        return ""
+    if d < 0:
+        return ""
+    if d < 1 / 24.0:                   # < 1h
+        return f"{int(d * 24 * 60)}m"
+    if d < 1.0:                        # < 1d
+        return f"{d * 24:.1f}h"
+    return f"{d:.1f}d"
+
+
+def _trade_impact_line(trade: dict, snapshot: dict | None,
+                       store) -> str:
+    """Compact "what did this trade just do to the book" one-liner appended
+    to ``send_trade_alert``.
+
+    A live trader's #1 follow-up question after a fill is the immediate
+    consequence: for a BUY — "how big is this name now, and how much cash do
+    I have left?"; for a SELL — "what did I lock in, and how long did I sit
+    on it?". The hourly summary already exposes book-weight % and the daily
+    close emits realized P&L by round-trip, but a trader waits up to an hour
+    for the next hourly and a full day for the daily close — by then the
+    next trade has already fired, and the alert is the only surface that
+    pairs cause (the fill) with effect (the new book shape) at the moment
+    of action.
+
+    Pure composition over an already-marked ``snapshot`` (the post-trade
+    snapshot from ``strategy.decide()``) and ``build_round_trips`` on the
+    trade ledger. **No network**, no extra mark-to-market (the alert path
+    must stay zero-latency — a slow alert would queue behind the next
+    cycle's decision). Observational only, never gates (invariants #2/#12 —
+    the reporter additive contract).
+
+    Failure contract mirrors the rest of ``reporter``: any
+    snapshot/store/builder fault degrades to ``""`` ("no impact line on
+    this alert"), **never** an exception ("no trade alert this fill"). A
+    missing ``snapshot`` or non-positive ``total_value`` returns ``""`` too
+    so a flat / empty book never emits a misleading "0.0% of book" token.
+    """
+    if not isinstance(snapshot, dict):
+        return ""
+    try:
+        total = float(snapshot.get("total_value") or 0.0)
+    except (TypeError, ValueError):
+        total = 0.0
+    if total <= 0:
+        return ""
+    try:
+        cash = float(snapshot.get("cash") or 0.0)
+    except (TypeError, ValueError):
+        cash = 0.0
+    action = (trade.get("action") or "").upper()
+    ticker = (trade.get("ticker") or "").upper()
+    is_option = trade.get("option_type") in ("call", "put")
+
+    # Find the post-trade book weight of THIS lot (same ticker, same
+    # stock/option side). Sum across the lot's matching positions in the
+    # snapshot — for stocks there's only one row; for options a single
+    # ticker can hold multiple strikes/expiries so we attribute weight per
+    # contract leg, not per ticker.
+    positions = snapshot.get("positions") or []
+    same_ticker_value = 0.0
+    same_lot_value = 0.0
+    for p in positions:
+        if (p.get("ticker") or "").upper() != ticker:
+            continue
+        try:
+            mv = float(p.get("market_value") or 0.0)
+        except (TypeError, ValueError):
+            mv = 0.0
+        same_ticker_value += mv
+        ptype = (p.get("type") or "").lower()
+        if (is_option and ptype in ("call", "put") and
+                p.get("strike") == trade.get("strike") and
+                p.get("expiry") == trade.get("expiry")):
+            same_lot_value += mv
+        elif not is_option and ptype == "stock":
+            same_lot_value += mv
+
+    if action.startswith("BUY"):
+        parts: list[str] = []
+        # Show the lot weight (e.g. "NVDA 600C 2026-12 35% of book") rather
+        # than aggregating across strikes — a trader sizing a fresh
+        # contract cares about the contract leg, not the ticker stack.
+        leg_pct = same_lot_value / total * 100.0 if total > 0 else 0.0
+        if leg_pct >= 0.1:                      # >=0.1% to skip rounding noise
+            label = ticker
+            if is_option:
+                strike = trade.get("strike")
+                otype_l = (trade.get("option_type") or "")[:1].upper()
+                expiry = trade.get("expiry") or ""
+                # Format strike compactly — drop the .0 on whole strikes so
+                # "600C" reads cleanly instead of "600.0C".
+                try:
+                    sf = float(strike) if strike is not None else None
+                except (TypeError, ValueError):
+                    sf = None
+                if sf is not None:
+                    label = (f"{ticker} {int(sf) if sf == int(sf) else sf}"
+                             f"{otype_l} {expiry}")
+            parts.append(f"{label} now {leg_pct:.1f}% of book")
+        # Cash gives the trader the affordability number their NEXT decision
+        # has to fit inside. Suppress when not meaningful.
+        parts.append(f"cash ${cash:.2f}")
+        return "post: " + " · ".join(parts) if parts else ""
+
+    if action.startswith("SELL"):
+        # Realized P&L on the round-trip(s) THIS sell closed. Re-derive
+        # from the trade ledger via the single source of truth so the
+        # alert and the daily close's "Realized P/L (round-trip)" line can
+        # never disagree. ``build_round_trips`` emits one row per closed
+        # round-trip; the SELL we just executed closes either one (full
+        # close to zero) or none (partial close — held qty still > 0).
+        parts = []
+        if store is not None:
+            try:
+                from .analytics.round_trips import build_round_trips
+                trades_oldest_first = list(
+                    reversed(store.recent_trades(5000)))
+                rts = build_round_trips(trades_oldest_first)
+                # Match by exit_ts AND ticker — exit_ts is the closing-SELL's
+                # own timestamp, which equals trade.timestamp for the trade
+                # that just landed. A null trade.timestamp degrades to no
+                # match → "partial close" fallback below.
+                trade_ts = trade.get("timestamp")
+                strike = trade.get("strike")
+                expiry = trade.get("expiry")
+                matched = None
+                if trade_ts:
+                    for rt in rts:
+                        if (rt.get("ticker") or "").upper() != ticker:
+                            continue
+                        if rt.get("exit_ts") != trade_ts:
+                            continue
+                        # Disambiguate when options of the same ticker close
+                        # the same second — match strike + expiry too.
+                        if is_option and (
+                            rt.get("strike") != strike
+                            or rt.get("expiry") != expiry
+                        ):
+                            continue
+                        matched = rt
+                        break
+                if matched is not None:
+                    pnl = float(matched.get("pnl_usd") or 0.0)
+                    pnl_pct = matched.get("pnl_pct")
+                    if pnl_pct is not None:
+                        try:
+                            parts.append(
+                                f"realized ${pnl:+.2f} "
+                                f"({float(pnl_pct):+.1f}%)")
+                        except (TypeError, ValueError):
+                            parts.append(f"realized ${pnl:+.2f}")
+                    else:
+                        parts.append(f"realized ${pnl:+.2f}")
+                    held = _hold_str_from_days(matched.get("hold_days"))
+                    if held:
+                        parts.append(f"held {held}")
+            except Exception as e:
+                # Builder/store fault → drop the realized fragment but still
+                # surface the bookkeeping cash delta below.
+                print(f"[reporter] trade-impact round-trip lookup failed: {e}")
+        if not parts:
+            # Partial close (still held >0) OR no round-trip context (the
+            # snapshot path tells the trader "you still have a stake").
+            if same_lot_value > 0:
+                leg_pct = same_lot_value / total * 100.0
+                parts.append(
+                    f"partial — {ticker} still {leg_pct:.1f}% of book")
+            else:
+                parts.append(f"closed — cash ${cash:.2f}")
+        parts.append(f"cash ${cash:.2f}")
+        return "post: " + " · ".join(parts)
+
+    return ""
+
+
+def send_trade_alert(trade: dict, snapshot: dict | None = None,
+                      store=None) -> bool:
+    """Post a single trade immediately.
+
+    ``snapshot`` (post-trade, the same one ``strategy.decide()`` returns in
+    ``summary["snapshot"]``) and ``store`` are optional; when supplied an
+    extra ``post: …`` line is appended with the trade's immediate book
+    impact (lot weight, realized P/L, hold time, cash). Existing callers
+    that pass only ``trade`` still produce a byte-compatible body."""
     t = trade
     extra = ""
     if t.get("option_type"):
@@ -216,6 +409,9 @@ def send_trade_alert(trade: dict) -> bool:
         f"qty `{t['qty']}` @ `${t['price']:.2f}` = `${t['value']:.2f}`\n"
         f"_{t.get('reason','')}_"
     )
+    impact = _trade_impact_line(trade, snapshot, store)
+    if impact:
+        body += f"\n{impact}"
     return _send(body)
 
 
@@ -1436,6 +1632,61 @@ def _position_attention_line(store) -> str:
         return "\n".join(lines)
     except Exception as e:
         print(f"[reporter] position-attention line skipped: {e}")
+        return ""
+
+
+def _decision_clock_line(store) -> str:
+    """One-line "is there a recurring HOUR-OF-DAY where this trader is
+    consistently being starved?" for the hourly / daily report.
+
+    ``/api/decision-clock`` (commit ``513a1c1``) made the per-hour-of-day
+    NO_DECISION distribution auditable on the *dashboard* — surfacing
+    e.g. "hour 20:00 ET has 80% NO_DECISION over 5 samples" as a
+    HOURLY_CONCENTRATION verdict. That signal is actionable: a single
+    saturation window means out-of-band concurrent jobs (review agents
+    / backtest committee) consistently fire that hour and the operator
+    can schedule them differently. But the operator lives in Discord
+    and never opens the dashboard panel — the exact dashboard→Discord
+    gap ``_host_pulse_line`` / ``_capital_pulse_line`` /
+    ``_position_attention_line`` each closed, one dimension over:
+    aggregate-host (host-pulse) → per-position (attention) → per-hour
+    (this line).
+
+    Composes ``build_decision_clock`` **verbatim** (single source of
+    truth, AGENTS.md invariant #10 — the verdict / headline are the
+    builder's, never re-derived here, so this Discord line and the
+    pure builder can never tell different stories) and feeds it the
+    EXACT same store read the endpoint does
+    (``recent_decisions(limit=20000)``). **Pure store reads only — NO
+    network** (the Discord-path discipline; adds zero latency).
+    Observational only, never gates, adds no caps (invariants #2/#12
+    — the ``_position_attention_line`` precedent). Failure contract
+    mirrors the rest of ``reporter``: any builder/store fault degrades
+    to ``""`` ("no decision-clock line this report"), **never** an
+    exception ("no Discord summary this report").
+
+    Suppression — surface ONLY HOURLY_CONCENTRATION (the actionable
+    verdict — there's a real concentrated saturation window). The
+    other two verdicts (``EVEN_DISTRIBUTION`` and
+    ``INSUFFICIENT_DATA``) say "nothing to act on" — silent so the
+    summary doesn't turn into its own lying green light (the
+    ``_position_attention_line`` OK / ``_heartbeat_line`` HEALTHY
+    suppression precedent).
+    """
+    try:
+        from .analytics.decision_clock import build_decision_clock
+        decisions = store.recent_decisions(limit=20000)
+        dc = build_decision_clock(decisions)
+        if not isinstance(dc, dict):
+            return ""
+        if dc.get("verdict") != "HOURLY_CONCENTRATION":
+            return ""
+        headline = dc.get("headline") or ""
+        if not headline:
+            return ""
+        return f"⚠️ **DECISION CLOCK** ◈ HOURLY_CONCENTRATION\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] decision-clock line skipped: {e}")
         return ""
 
 

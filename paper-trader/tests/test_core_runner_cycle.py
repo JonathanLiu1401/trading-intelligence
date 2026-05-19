@@ -68,8 +68,11 @@ def spy(monkeypatch):
         store = _FakeStore(trades or [])
         monkeypatch.setattr(runner.strategy, "decide", lambda: summary)
         monkeypatch.setattr(runner, "get_store", lambda: store)
+        # send_trade_alert now accepts ``snapshot=`` / ``store=`` kwargs (the
+        # post-trade book-impact line); stub must accept-and-ignore them so
+        # the call signature evolution does not break this regression lock.
         monkeypatch.setattr(runner.reporter, "send_trade_alert",
-                            lambda t: calls["trade_alert"].append(t) or True)
+                            lambda t, **_: calls["trade_alert"].append(t) or True)
         monkeypatch.setattr(runner.reporter, "send_decision_log",
                             lambda s: calls["decision_log"].append(s) or True)
         monkeypatch.setattr(runner.reporter, "_send",
