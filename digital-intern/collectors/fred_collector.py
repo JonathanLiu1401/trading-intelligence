@@ -44,6 +44,13 @@ FRED_SERIES = {
     "BAMLC0A0CM": "ICE BofA US Corp Bond IG OAS (bps)",
     "BAMLH0A0HYM2": "ICE BofA US HY Index OAS (bps)",
     "SOFR": "Secured Overnight Financing Rate (%)",
+    # Market-implied inflation expectations (TIPS breakevens). The Fed has
+    # repeatedly cited "well-anchored long-term inflation expectations" as the
+    # principal test of monetary credibility — when 5y5y breakeven drifts above
+    # the 2% target band the FOMC reaction function turns more hawkish.
+    "T5YIE": "5-Year breakeven inflation rate (%)",
+    "T10YIE": "10-Year breakeven inflation rate (%)",
+    "T5YIFR": "5-Year, 5-Year forward inflation expectation rate (%)",
 }
 
 # Yield-curve spread emitted as a separate synthetic article series. The
@@ -59,6 +66,24 @@ YIELD_CURVE_SERIES = "DGS10_MINUS_DGS2"
 # Widens ahead of equity selloffs when credit markets price stress first.
 CREDIT_SPREAD_SOURCE = "fred/hy_ig_spread"
 CREDIT_SPREAD_SERIES = "BAMLH0A0HYM2_MINUS_BAMLC0A0CM"
+
+# Inflation-expectations anchoring regime, derived from T5YIFR (the Fed's
+# preferred forward inflation gauge — the 5-year inflation rate the bond
+# market expects to prevail in the 5-year window STARTING 5 years from now,
+# i.e. long-term expectations stripped of near-term shocks). The FOMC has
+# stated that anchored long-term expectations is the precondition for
+# tolerating transient near-term overshoots. A standalone article series
+# lets the briefing layer flag "expectations DE-ANCHORED" the same way it
+# flags an INVERTED yield curve.
+INFLATION_ANCHOR_SOURCE = "fred/inflation_anchor_5y5y"
+INFLATION_ANCHOR_SERIES = "T5YIFR_REGIME"
+# Bands calibrated against the Fed's 2% PCE target. T5YIFR is in CPI terms
+# which has historically run ~0.3pp above PCE, so >2.5% reads as a true
+# credibility risk. Reviewed against 2022-2024 cycle prints (Jun-2022 peak
+# T5YIFR ~2.62% during the worst inflation expectations stress).
+INFLATION_ANCHOR_DEANCHORED_PCT = 2.50
+INFLATION_ANCHOR_ELEVATED_PCT = 2.25
+INFLATION_ANCHOR_BELOW_PCT = 1.75
 
 FREDGRAPH_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
 RECENT_N = 3  # most recent observations to synthesise per series
@@ -280,6 +305,73 @@ def _credit_spread_articles(conn, hy_oas: list[tuple[str, float]],
     return out
 
 
+def _inflation_anchor_articles(conn, t5yifr: list[tuple[str, float]]) -> list[dict]:
+    """Emit synthetic 5y5y forward inflation expectation regime articles.
+
+    T5YIFR is the Fed's canonical long-term inflation expectations gauge.
+    Crossing 2.5% historically corresponds to credibility stress; sub-1.75%
+    flags deflationary risk and Japan-style demand-trap concerns. A standalone
+    article series lets the briefing/alert layer surface "DEANCHORED" as a
+    wire-headline token the keyword scorer can lift. Dedup key: obs_date only,
+    so a later FRED revision of the input does not re-emit the same date.
+    """
+    if not t5yifr:
+        return []
+    surfaced = t5yifr[-RECENT_N:]
+    url = (
+        "https://fred.stlouisfed.org/graph/?g=fredgraph"
+        "&id=T5YIFR"
+    )
+    out: list[dict] = []
+    for idx, (d, v) in enumerate(surfaced, start=len(t5yifr) - len(surfaced)):
+        sid = _seen_id(INFLATION_ANCHOR_SERIES, d)
+        if _is_seen(conn, sid):
+            continue
+        if idx > 0:
+            prev_v = t5yifr[idx - 1][1]
+            d_v = v - prev_v
+            direction = "rising" if d_v > 0 else "falling"
+            change = f"prev {_fmt_num(prev_v)} ({direction} {d_v:+.2f})"
+        else:
+            change = "no prior obs"
+        # Regime classification matches the canonical Fed reaction-function
+        # narrative: target band is roughly 1.75-2.25% in CPI terms (the
+        # ~0.3pp CPI-vs-PCE wedge brings this into ~1.5-2% PCE space, the
+        # FOMC's stated objective).
+        if v >= INFLATION_ANCHOR_DEANCHORED_PCT:
+            regime = "DEANCHORED"
+        elif v >= INFLATION_ANCHOR_ELEVATED_PCT:
+            regime = "elevated"
+        elif v < INFLATION_ANCHOR_BELOW_PCT:
+            regime = "BELOW_TARGET"
+        else:
+            regime = "anchored"
+        title = (
+            f"FRED 5y5y forward inflation {d}: {_fmt_num(v)}% "
+            f"({regime}; {change})"
+        )
+        body = (
+            f"FRED-derived 5-year, 5-year forward inflation expectation for "
+            f"{d}: {_fmt_num(v)}% — the rate the bond market expects to "
+            f"prevail in the 5-year window starting 5 years from now. "
+            f"Regime: {regime} (>=2.50% = DEANCHORED expectations / "
+            f"credibility risk; <1.75% = BELOW_TARGET / deflationary). "
+            f"The Fed cites long-term expectations anchoring as the test of "
+            f"monetary credibility. "
+            f"Source: FRED (Federal Reserve Economic Data), St. Louis Fed."
+        )
+        out.append({
+            "title": title,
+            "link": url,
+            "summary": body,
+            "published": d,
+            "source": INFLATION_ANCHOR_SOURCE,
+            "_series": INFLATION_ANCHOR_SERIES,
+        })
+        _mark_seen(conn, sid, url, title, INFLATION_ANCHOR_SOURCE)
+    return out
+
+
 def collect_fred() -> list[dict]:
     """Collect deduplicated synthetic macro articles from FRED.
 
@@ -373,6 +465,14 @@ def collect_fred() -> list[dict]:
         new_articles.extend(credit_items)
     except Exception as e:
         print(f"[fred_collector] credit spread synth failed: {e}")
+
+    # Derived inflation-expectations regime from the 5y5y forward (T5YIFR).
+    # Quietly no-ops if T5YIFR fetch failed — never breaks the whole cycle.
+    try:
+        anchor_items = _inflation_anchor_articles(conn, fetched.get("T5YIFR", []))
+        new_articles.extend(anchor_items)
+    except Exception as e:
+        print(f"[fred_collector] inflation anchor synth failed: {e}")
 
     conn.commit()
     conn.close()
