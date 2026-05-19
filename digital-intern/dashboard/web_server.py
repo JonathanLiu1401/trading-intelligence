@@ -430,6 +430,98 @@ def _macro_calendar_chat_lines(mc) -> list[str]:
     return lines
 
 
+def _earnings_shock_chat_lines(es) -> list[str]:
+    """Render paper-trader's `/api/earnings-shock` (pre-earnings dollarized
+    1σ shock per held imminent print) as compact chat-context lines.
+
+    The chat carried rich BACKWARD analytics + held-book context, and the
+    macro / earnings calendars covered the FORWARD-event timing, but
+    nothing translated *"NVDA earnings in 0.9d"* into *"if NVDA gaps the
+    typical 1σ, your book moves $X (Y % of equity)."* — exactly the
+    pre-print question the analyst gets asked. This closes that gap, in
+    the same shape as `_macro_calendar_chat_lines` / `_baseline_compare_
+    chat_lines` (verbatim SSOT headline; non-actionable states silenced;
+    pure/total).
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline``
+    string is the verbatim chat headline — no re-derived verdict that
+    could drift from the trader endpoint. Per-row lines restate the
+    builder's *own* fields (ticker / days_to_earnings / current_value /
+    weight_pct / sigma_pct / sigma_dollar_move / sigma_book_pct) — never
+    a recomputation (the ``_macro_calendar_chat_lines`` precedent).
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never an exception into the chat
+      handler — the ``_macro_calendar_chat_lines`` contract; a non-actionable
+      state must never become chat filler).
+    - state in {NO_DATA, NO_EVENTS} or events empty → ``[]``: the empty
+      book / quiet calendar paths must be silence, mirroring how
+      ``_macro_calendar_chat_lines`` omits the no-FOMC and not-loaded
+      branches and how ``_behavioural_chat_lines`` omits NO_DATA.
+    - state OK with events → builder ``headline`` verbatim + one line per
+      held event (ticker · in Nd · $value · weight · σ if known).
+    - per-row ``INSUFFICIENT_HISTORY``: the event still surfaces (so
+      "NVDA reports in 0.9d" is never hidden) but σ is reported as
+      *withheld* — never fabricated (the builder's per-row honesty
+      precedent; mirrors the ``baseline_compare`` INSUFFICIENT_DATA →
+      silent-but-honest contract).
+    - malformed event row → skipped, never raises (the
+      ``_macro_calendar_chat_lines`` malformed-row precedent).
+    """
+    if not isinstance(es, dict):
+        return []
+    state = es.get("state")
+    if state in (None, "NO_DATA", "NO_EVENTS"):
+        return []
+    events = es.get("events")
+    if not isinstance(events, list) or not events:
+        return []
+
+    def _num(v):
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    lines: list[str] = []
+    headline = es.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)            # verbatim SSOT — invariant #10
+
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        tk = e.get("ticker")
+        if not isinstance(tk, str) or not tk:
+            continue
+        days = _num(e.get("days_to_earnings"))
+        cv = _num(e.get("current_value_usd"))
+        wt = _num(e.get("weight_pct"))
+        ev_state = e.get("state")
+        sigma_pct = _num(e.get("sigma_pct"))
+        sigma_dollar = _num(e.get("sigma_dollar_move"))
+        sigma_book = _num(e.get("sigma_book_pct"))
+        # ticker + timing (always)
+        when = f"in {days:.1f}d" if days is not None else "imminent"
+        # exposure (always when known)
+        if cv is not None and wt is not None:
+            expo = f" — ${cv:.2f} ({wt:.1f}% of book)"
+        elif cv is not None:
+            expo = f" — ${cv:.2f}"
+        else:
+            expo = ""
+        # σ tail: report when known; honestly say "σ withheld" otherwise
+        if (sigma_pct is not None and sigma_dollar is not None
+                and sigma_book is not None and ev_state == "OK"):
+            sig = (f" · σ ±{sigma_pct:.1f}% → ±${sigma_dollar:.2f} "
+                   f"(book ±{sigma_book:.2f}%)")
+        elif ev_state == "INSUFFICIENT_HISTORY":
+            sig = " · σ withheld (insufficient earnings history)"
+        else:
+            sig = ""
+        lines.append(f"  {tk} {when}{expo}{sig}")
+
+    return lines
+
+
 def _norm_title(t: Any) -> str:
     return str(t or "").strip().casefold()
 
@@ -1969,6 +2061,34 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: macro-calendar fetch failed: %s", e)
 
+        # Earnings shock — the pre-earnings dollarized 1σ shock per held
+        # imminent print (paper-trader /api/earnings-shock, the forward
+        # $-at-risk complement to /api/event-calendar). The chat already
+        # carries event-calendar timing and macro-calendar FOMC risk, but
+        # nothing translated "NVDA earnings in 0.9d" into "if NVDA gaps the
+        # typical 1σ on its print, the book moves $X (Y% of equity)" — the
+        # actual pre-print question the analyst gets asked. Composed
+        # verbatim by the pure _earnings_shock_chat_lines helper (unit-
+        # tested; SSOT — the builder's own `headline` is the headline, no
+        # re-derived verdict). Guarded 4s read (yfinance is the slowest
+        # per-name shape upstream; the SWR cache makes the *cached* response
+        # fast); NO_DATA / NO_EVENTS / INSUFFICIENT_HISTORY rows silently
+        # omit or report "σ withheld" honestly (the
+        # _macro_calendar_chat_lines / _baseline_compare_chat_lines
+        # precedents — never chat filler, never fabricated numerics).
+        # Only appears once :8090 is restarted onto the endpoint.
+        earnings_shock_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/earnings-shock",
+                    timeout=4) as resp:
+                _es = json.loads(resp.read().decode("utf-8"))
+            earnings_shock_block = "\n".join(
+                _earnings_shock_chat_lines(_es))
+        except Exception as e:
+            _logger().warning("chat: earnings-shock fetch failed: %s", e)
+
         # "What materially changed since you last looked" — the one temporal-
         # change view. Every sub-fetch above is a current-state snapshot; this
         # lets the chat answer "what happened while I was away / since I last
@@ -2056,6 +2176,7 @@ def create_app(store=None) -> Flask:
             + (f"NEWS SECTOR PULSE (native — where the wire is concentrated right now, recency-weighted, last 24h; independent of the price heatmap below so it survives a stale/down paper-trader):\n{sector_pulse_block}\n\n" if sector_pulse_block else "")
             + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP (paper-trader price momentum):\n{heatmap_block}\n\n" if heatmap_block else "")
             + (f"EARNINGS RADAR (scheduled gap risk):\n{earnings_block}\n\n" if earnings_block else "")
+            + (f"PAPER TRADER — PRE-EARNINGS DOLLARIZED 1σ SHOCK (per HELD imminent print: 'if NVDA gaps the typical 1σ on its release, the book moves $X / Y% of equity' — the forward $-at-risk view that complements the EARNINGS RADAR's timing-only listing):\n{earnings_shock_block}\n\n" if earnings_shock_block else "")
             + (f"MACRO CALENDAR — FOMC RATE DECISION (the single biggest MARKET-WIDE event; it moves the whole book at once, leveraged ETFs most violently — surfaced only when one is actually within the 14d horizon):\n{macro_calendar_block}\n\n" if macro_calendar_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "

@@ -864,7 +864,7 @@ class ArticleStore:
         cur = self.conn.execute(
             "SELECT id, url, title, source, "
             "COALESCE(NULLIF(ai_score, 0), ml_score, 0) AS score, full_text, "
-            "first_seen, published "
+            "first_seen, published, ai_score "
             "FROM articles "
             f"WHERE urgency=1 AND {_LIVE_ONLY_CLAUSE} "
             # Primary SQL guard: only articles first collected in the last 24h.
@@ -879,7 +879,25 @@ class ArticleStore:
                  "ai_score": r[4],
                  "summary": (decompress(r[5])[:600] if r[5] else ""),
                  "first_seen": r[6],
-                 "published": r[7]}
+                 "published": r[7],
+                 # True iff this row carries a real LLM ground-truth label (raw
+                 # ai_score > 0). Model self-predictions go to ml_score and
+                 # NEVER ai_score (invariant #2), so a falsy raw ai_score means
+                 # the displayed COALESCEd ``ai_score`` field above came from
+                 # ml_score — an UNVERIFIED local-model urgent call. The ML
+                 # urgency head demonstrably over-scores forum/wiki/social /
+                 # recap-template rows; the briefing already exposes this via
+                 # its [model] tag (see get_top_for_briefing). The alert path
+                 # is the analyst's MORE time-critical product, so it should
+                 # carry the same calibration signal — alert_agent._fmt reads
+                 # this key and Sonnet hedges the CONTEXT/IMPACT line for
+                 # unverified urgent rows. Read-side only — does NOT change
+                 # which rows are returned (urgency=1 + 24h freshness + live-
+                 # only clause are unchanged), and the existing ``ai_score``
+                 # field (COALESCEd score, used by every existing caller and
+                 # the score= line) is byte-unchanged. Same shape as
+                 # get_top_for_briefing's _llm_vetted addition (66c349f).
+                 "_llm_vetted": bool(r[8])}
                 for r in rows]
 
     @_retry_on_lock
