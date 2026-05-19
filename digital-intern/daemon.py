@@ -65,6 +65,7 @@ from collectors.newsapi_collector import collect_newsapi
 from collectors.yahoo_ticker_rss import collect_yahoo_ticker_rss
 from collectors.wikipedia_collector import collect_wikipedia
 from collectors.macro_calendar_collector import collect_macro_calendar
+from collectors.finra_short_volume import collect_finra_short_volume
 from collectors.market_movers import collect_market_movers
 from collectors import source_health
 from core.backoff import Backoff
@@ -111,6 +112,7 @@ NEWSAPI_INTERVAL    = 1500        # NewsAPI keyword search every 25min (free=100
 YAHOO_TICKER_RSS_INTERVAL = 240   # Yahoo per-ticker RSS every 4min
 WIKIPEDIA_INTERVAL  = 600         # Wikipedia recent-changes filter every 10min
 MACRO_CALENDAR_INTERVAL = 3600    # FOMC/BLS macro event calendar — once per hour
+FINRA_SHORT_INTERVAL    = 3600    # FINRA RegSHO short volume — once per hour (daily file)
 MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
@@ -899,6 +901,28 @@ def macro_calendar_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(MACRO_CALENDAR_INTERVAL)
+
+
+# ── Worker: FINRA RegSHO short volume — every 1h ────────────────────────────
+def finra_short_worker(store: ArticleStore):
+    log.info("[finra_short_worker] started")
+    bo = Backoff("finra_short", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_finra_short_volume()
+            _ingest(store, articles, "finra_short_volume")
+            try:
+                source_health.record_result("finra_short_volume", len(articles))
+            except Exception as he:
+                log.warning(f"[finra_short_worker] source_health error: {he}")
+            _worker_last_ok["finra_short_volume"] = time.time()
+            log.debug(f"[finra_short] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[finra_short_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(FINRA_SHORT_INTERVAL)
 
 
 # ── Worker: Portfolio P/L snapshot — every 5min ─────────────────────────────
@@ -2045,6 +2069,7 @@ def main():
         ("market_movers", market_movers_worker),
         ("wikipedia",   wikipedia_worker),
         ("macro_calendar", macro_calendar_worker),
+        ("finra_short",   finra_short_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),

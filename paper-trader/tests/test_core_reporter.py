@@ -2100,6 +2100,129 @@ class TestHostPulseLine:
         assert "**HOST** ◈ SATURATED" in captured[0]
 
 
+class TestIdleOpportunityLine:
+    """`_idle_opportunity_line` + its hourly/daily wiring — the missing
+    *regret* surface for a PARALYSIS drought. Host-pulse names WHY the bot
+    is dark; idle-opportunity names WHAT was missed while the cause held."""
+
+    _DROUGHT_OK = {
+        "state": "OK",
+        "headline": ("Idle opportunity: drought 8.0h (33 NO_DECISION) — "
+                     "2 watchlist signal(s) ≥6.0 arrived; loudest: NVDA "
+                     "(HELD) @ ai_score 9.0."),
+        "n_opportunities": 2,
+        "drought": {"ongoing": True},
+        "opportunities": [{"ticker": "NVDA", "top_score": 9.0, "held": True}],
+    }
+    _DROUGHT_QUIET = {
+        "state": "OK", "headline": "no signals", "n_opportunities": 0,
+        "drought": {"ongoing": True}, "opportunities": [],
+    }
+    _NO_DROUGHT = {
+        "state": "NO_DROUGHT", "headline": "filling normally",
+        "n_opportunities": 0, "drought": None, "opportunities": [],
+    }
+
+    def _stub(self, monkeypatch, payload):
+        """Stub BOTH builders the helper composes: build_decision_drought
+        provides the gate (must return an ongoing drought for the helper to
+        proceed to the article scan); build_idle_opportunity returns the
+        final verdict the reporter renders. This mirrors the helper's
+        actual composition order so a regression in either path is
+        observable."""
+        from paper_trader.analytics import idle_opportunity as io_mod
+        from paper_trader.analytics import decision_drought as dd_mod
+        # If the test payload represents no drought / no opps, also stub
+        # decision_drought to match — but if it's the OK-with-regret case
+        # we need an ongoing drought block so the helper proceeds.
+        ongoing = bool(payload.get("drought") and payload["drought"].get("ongoing"))
+        dd_payload = {
+            "current_drought": (
+                {"ongoing": True, "start": "2026-05-19T03:15:42+00:00"}
+                if ongoing else None
+            )
+        }
+        monkeypatch.setattr(dd_mod, "build_decision_drought",
+                            lambda *a, **k: dd_payload)
+        monkeypatch.setattr(io_mod, "build_idle_opportunity",
+                            lambda *a, **k: payload)
+
+    def test_empty_when_no_drought(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, self._NO_DROUGHT)
+        assert reporter._idle_opportunity_line(fresh_store) == ""
+
+    def test_empty_when_drought_quiet(self, fresh_store, monkeypatch):
+        """Silence-when-nothing-actionable — an empty opportunities list is
+        informative ("nothing missed") and must not become Discord filler."""
+        self._stub(monkeypatch, self._DROUGHT_QUIET)
+        assert reporter._idle_opportunity_line(fresh_store) == ""
+
+    def test_surfaces_regret_verbatim(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, self._DROUGHT_OK)
+        line = reporter._idle_opportunity_line(fresh_store)
+        assert line.startswith("**IDLE** ◈ regret")
+        # Headline carried VERBATIM (single source of truth — no re-derive).
+        assert self._DROUGHT_OK["headline"] in line
+
+    def test_degrades_to_empty_on_builder_fault(self, fresh_store, monkeypatch):
+        from paper_trader.analytics import idle_opportunity as io_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("builder blew up")
+
+        monkeypatch.setattr(io_mod, "build_idle_opportunity", _boom)
+        # Additive failure contract — drops this line, never raises.
+        assert reporter._idle_opportunity_line(fresh_store) == ""
+
+    def test_hourly_summary_idle_between_host_and_capital(
+            self, fresh_store, monkeypatch):
+        """Order: HOST (cause) → IDLE (regret) → CAPITAL (manual-fix
+        suggestion). All three can be independently true; none suppresses
+        the others — the same independence as HOST/CAPITAL."""
+        self._stub(monkeypatch, self._DROUGHT_OK)
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        # Force HOST and CAPITAL lines to also emit so the ordering is
+        # observable end-to-end.
+        monkeypatch.setattr(reporter, "_host_pulse_line",
+                            lambda: "**HOST** ◈ SATURATED\n> opus starved")
+        monkeypatch.setattr(reporter, "_capital_pulse_line",
+                            lambda store: "**CAPITAL** ◈ PINNED\n> ~98%")
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**HOST**" in body
+        assert "**IDLE** ◈ regret" in body
+        assert "**CAPITAL**" in body
+        assert body.index("**HOST**") < body.index("**IDLE**")
+        assert body.index("**IDLE**") < body.index("**CAPITAL**")
+
+    def test_hourly_silent_when_quiet(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, self._DROUGHT_QUIET)
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_hourly_summary() is True
+        assert "**IDLE**" not in captured[0]
+
+    def test_daily_close_includes_idle(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, self._DROUGHT_OK)
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_daily_close() is True
+        assert "**IDLE** ◈ regret" in captured[0]
+
+
 class TestPositionAttentionLine:
     """`_position_attention_line` + its hourly/daily wiring — the missing
     per-held-position attention surface in Discord. ``/api/position-attention``
