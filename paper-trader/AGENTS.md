@@ -8502,6 +8502,98 @@ python3 -m paper_trader.host_guard        # CLEAR / SATURATED + opus_count + loa
   real-builder test ensures any future signature drift fails in CI
   rather than silently in production.
 
+## Review pass #35 — paper-trader core hybrid (2026-05-19, ~08:00 UTC)
+
+### Phase 1 — no fixes
+
+Re-read every load-bearing core file in full: `runner.py`, `reporter.py`,
+`signals.py`, `strategy.py`, `market.py`, `store.py`, plus the relevant
+slice of `dashboard.py`. 418-test core baseline (`test_core_*` + the
+already-existing parse-retry + ML opinion suites) green on entry; 521
+tests green after the Phase 2 additions. A careful trace through
+`runner._cycle` (quota latch / circuit breaker / restart-requested
+event), `strategy.decide` (host-guard pre-flight + mid-call re-probe +
+Sonnet fallback + JSON-only retry), `_ml_live_opinion` (news-sentiment
++ quant adjustments + regime + watch_px universe gate), and
+`_concentration_line` (the pass-#34 addition, intact and live) turned
+up no actionable bug. Per the Phase-1 commit guard, **no Phase 1
+commit** — diff was empty after the read pass. `bugs_fixed = 0`.
+
+### Phase 2 (commit `5a3cb32`) — lock 3 untested paths in `_ml_live_opinion`
+
+`tests/test_ml_live_opinion.py` covers the documented news-key + tokenization
+regressions and quant-only path. Three branches in the function had no
+direct lock yet — added as the new `TestRegimeAndUniverseGuards` class:
+
+* **`test_bear_regime_suppresses_borderline_buy`** — locks that the
+  `regime_mult` (1.0 bull / 0.6 sideways / 0.3 bear, SPY 20d-momentum
+  derived) is actually applied to the score, not just rendered in the
+  reasoning label. RSI-25-only NVDA (`adj=+1.5`) buys in bull (1.5 > 1.0
+  threshold) but HOLDs in bear (1.5 × 0.3 = 0.45 < 1.0) — the exact
+  regime-gating contract.
+* **`test_keyword_mapping_picks_up_unticked_article`** — an article with
+  empty `.tickers` but `nvidia` / `chip` in the title must still drive
+  a BUY via `_WORD_TO_TICKER_LIVE` fallback. This is the canonical
+  value-add of the keyword map (extractor misses; keyword recovers); a
+  silent regression here would re-blind the advisor to any article
+  whose ticker extractor failed.
+* **`test_unpriced_ticker_cannot_be_chosen`** — a ticker with
+  `watch_px[tk] = None` or `0.0` must NOT be picked as best even when
+  its sentiment+quant score is the highest. Without the `px and px > 0`
+  guard the engine would emit a BUY for a name the trader cannot
+  actually transact (yfinance dead / delisted / off-hours hole).
+
+Staged ONLY `tests/test_ml_live_opinion.py` per
+[[pt-concurrent-samerole-staging-race]] — concurrent sibling agents
+were running with modified `paper_trader/dashboard.py` and untracked
+`paper_trader/analytics/event_readiness.py` in the working tree, all
+correctly left out. `features_added = 1` (3 tests in one regression-
+locking class).
+
+### Phase 3 — live validation against the running trader (08:10 UTC)
+
+1. ✅ **`/api/build-info`** `boot_sha == head_sha == 5a3cb32`,
+   `stale: false`, `behind: 0`. The git-watcher autorestart fired
+   between my push and the read — the running trader is on the
+   newly-pushed commit.
+2. ✅ **`/api/portfolio`** healthy — $1000 equity, cash $406.74,
+   NVDA + TQQQ open value $593.26, `stale_marks: 0`.
+3. ⚠️ **`/api/host-guard`** `state: SATURATED`, **14 concurrent Opus
+   (>4)**, swap **95.3%** (>90% threshold), `mem_available_mb=1535`,
+   `load1=24.93`. **77.6% of the last 49 decisions never reached Opus**.
+   The 4-agent concurrent hybrid review (this run + 3 siblings, ~14
+   Opus subprocesses) IS the saturation. Known
+   [[pt-no-decision-host-saturation]]; not a code bug.
+4. ⚠️ **`/api/runner-heartbeat`** stuck `warming` (SWR cold) for >5s —
+   secondary symptom of dashboard contention under the same host load.
+   `/api/portfolio` (smaller payload) replied fine.
+5. ⚠️ **`/api/concentration` 404** — concentration is exposed via
+   `/api/correlation`, not a dedicated endpoint. Operator surface only,
+   no functional impact (the reporter Discord line landed in pass #34
+   reaches the operator regardless).
+
+`user_findings = 3`: (a) the saturation pattern remains the dominant
+NO_DECISION cause and is operator-resolvable but not code-resolvable;
+(b) dashboard SWR cold-path response time degrades sharply under host
+load — a 5-second pause to warm `/api/runner-heartbeat` looks like a
+dead endpoint to a trader checking by hand; (c) the running trader
+auto-deployed my own commit within a minute of `git push` — the
+git-watcher deferred-restart path is healthy end-to-end.
+
+### Invariants reaffirmed by this pass
+
+* **No `git add -A`** — staged only my own file; sibling agents'
+  `dashboard.py` / `digital-intern/AGENTS.md` / `event_readiness.py`
+  changes were correctly left out of the commit. [[pt-concurrent-samerole-staging-race]].
+* **Mature-codebase Phase-1 honesty** — read the full surface, found no
+  actionable bug, set `bugs_fixed = 0` per the explicit guard rather
+  than manufacturing churn. The honest zero IS the answer when the
+  codebase is mature.
+* **Edge-case test value-add** — the three new tests don't repeat any
+  branch already covered; each locks a distinct path
+  (regime / keyword-map / universe-gate) whose silent break would
+  degrade the advisor in a different mode.
+
 ## ML / backtest review pass (Agent 2, 2026-05-19, 2nd pass)
 
 Hybrid pass against `paper_trader/ml/decision_scorer.py`,
