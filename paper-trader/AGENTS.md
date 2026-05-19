@@ -9089,3 +9089,203 @@ positions` was already gated behind `?limit=N`; new fields are purely
 additive.
 
 
+## ML / backtest review pass (Agent 2, 2026-05-19, 3rd pass) — gate-bucket diversity
+
+Hybrid pass against `paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py`, `run_continuous_backtests.py` after the prior
+two 2026-05-19 passes already saturated the bug-fix surface. No new bug
+fixes were warranted this cycle (Phase 1 commit guard cleanly skipped);
+the value of this pass is in the smoke-test feature add plus 7 Phase 3
+quant findings.
+
+### Feature: `GATE_BUCKETS_DEGENERATE` verdict + per-bucket histogram in `scorer_smoke_test.py`
+
+The existing `DEGENERATE_CONSTANT` verdict compares predictions at
+`_CONSTANT_TOLERANCE_PCT = 1e-4` raw-magnitude tolerance — a scorer
+producing 8 distinct predictions of 0.5%, 1.2%, 2.0%, 4.5% etc. (all
+inside the conviction gate's neutral `[0, 5]` arm) cleanly clears that
+check and verdicted HEALTHY despite **the conviction gate being
+operationally dormant on those inputs**. Every BUY through that
+deployed model ends up with the same `×1.0` multiplier regardless of
+the model's "prediction" because none cross the gate's `±10 / ±5 / 0`
+thresholds. This is the same failure pattern the prior `n_train=400`
+clobber documented in review pass #2 produced live (calibration
+spearman=0.0157 / MISCALIBRATED, gate near-zero predictive value).
+
+`_gate_bucket(pred: float) -> str` is the lockstep mirror of
+`_ml_decide`'s four-arm ladder (`paper_trader/backtest.py`):
+
+| pred range            | label              | gate multiplier |
+|-----------------------|--------------------|----------------:|
+| `p < -10`             | `strong_headwind`  | `×0.6`          |
+| `-10 ≤ p < 0`         | `mild_headwind`    | `×0.85`         |
+| `0 ≤ p ≤ 5`           | `neutral`          | `×1.0` (no-op)  |
+| `5 < p ≤ 10`          | `mild_tailwind`    | `×1.15`         |
+| `p > 10`              | `strong_tailwind`  | `×1.3`          |
+
+The mirror is pure / total / NaN-safe (a non-finite or non-numeric
+prediction falls through to `neutral`, the no-op arm — a diagnostic
+crash can never propagate from this helper to a verdict) and uses
+strict comparators that exactly match `_ml_decide`'s `< -10` / `< 0` /
+`> 10` / `> 5` chain at every boundary.
+
+The smoke report gains:
+- `gate_bucket_counts: {strong_headwind:int, mild_headwind:int,
+  neutral:int, mild_tailwind:int, strong_tailwind:int}` — every
+  documented arm pre-populated to `0` so dashboard / Discord templates
+  never `KeyError` on an absent arm.
+- `distinct_gate_buckets: int` — the count of arms with at least one
+  probe.
+
+Verdict precedence: `BROKEN_PREDICT` > `DEGENERATE_CONSTANT` >
+`GATE_BUCKETS_DEGENERATE` > `HEALTHY`. The constant check (a strictly
+stronger fail than gate-bucket collapse) takes precedence so an
+operator reading "DEGENERATE_CONSTANT" knows it is also a gate-collapse
+case, but a "GATE_BUCKETS_DEGENERATE" specifically tells them the model
+varies but the gate is dormant — different actionable surfaces.
+
+CLI:
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.scorer_smoke_test
+```
+Now prints the bucket histogram inline (`strong_headwind=0
+mild_headwind=2 neutral=5 mild_tailwind=1 strong_tailwind=0` for the
+deployed `n_train=35` pkl at the time of this pass) and a per-probe
+`gate=<arm>` label. Exit code 2 on `GATE_BUCKETS_DEGENERATE` mirrors
+the other actionable verdicts (cron contract preserved).
+
+Locked by `tests/test_scorer_smoke_test.py` (10 new tests, 24 total,
+~1.4s):
+
+`TestGateBucket` (6 tests) — pins every arm boundary:
+- `strong_headwind` strictly below `-10` (boundary `-10.0` falls into
+  `mild_headwind` per `_ml_decide`'s `< -10` strictness)
+- `mild_headwind` strictly negative (boundary `0.0` is `neutral` per
+  `_ml_decide`'s `< 0` strictness)
+- `neutral` INCLUSIVE on both ends of `[0, 5]` (matches `_ml_decide`'s
+  branchless fall-through chain)
+- `mild_tailwind` strictly above `5` (boundary `10.0` stays in
+  `mild_tailwind` per `_ml_decide`'s `> 10` strictness)
+- `strong_tailwind` strictly above `10`
+- NaN / `None` / non-numeric inputs fall through to `neutral`
+
+`TestGateBucketsDegenerate` (6 tests):
+- Neutral-only `_NeutralBucketScorer` (8 distinct preds, all in
+  `[0.5, 4.5]`) verdicts `GATE_BUCKETS_DEGENERATE` — the exact failure
+  pattern review pass #2 catches via `PKL_REGRESSED` AFTER the loop
+  restarts; this verdict catches it BEFORE.
+- Two-bucket boundary (exactly 2 arms populated) still HEALTHY (≥ 2,
+  not > 2 — inclusive boundary).
+- `gate_bucket_counts` includes every documented bucket key (zeros
+  filled in for absent arms; JSON-schema lock).
+- Sum across all bucket counts equals `n_probes` — no probe lost,
+  none double-counted.
+- DEGENERATE_CONSTANT takes precedence over GATE_BUCKETS_DEGENERATE
+  (the stronger fail wins for diagnostic precision).
+- Off-distribution scorer with predictions in ONE bucket still
+  verdicts GATE_BUCKETS_DEGENERATE (off-dist alone doesn't save it).
+- CLI exit code 2 for GATE_BUCKETS_DEGENERATE (cron contract).
+
+`TestSchema::test_module_level_constants_are_stable` updated to lock
+the 5-verdict cardinality (was 4) and the `_GATE_BUCKETS` tuple
+ordering (headwind → neutral → tailwind, matching the `_ml_decide`
+ladder for left-to-right histogram rendering).
+
+### Phase 3 quant findings (worth reading)
+
+1. **Continuous loop is STOPPED.** Last skill-log heartbeat
+   `2026-05-18T18:06:04+00:00` (cycle 4), `continuous.log` mtime
+   `2026-05-18 12:03 PDT`. The loop has been dead ~14h at the time of
+   this pass. 2 `backtest_runs` rows remain `status='running'` (6238,
+   6243) — the per-cycle reap-on-startup will clean them when the loop
+   restarts (`_reap_orphaned_runs` with 6h age guard).
+2. **The deployed pickle is in PKL_REGRESSED state.** Live read:
+   `n_train=35` in `data/ml/decision_scorer.pkl`. The last skill-log
+   row (cycle 4) recorded `train_n=3959`. Ratio is `0.009` — well
+   below the `PKL_REGRESSION_TOL=0.5` threshold review pass #2 added
+   detection for. The `_ml_decide` conviction gate is INACTIVE
+   (`_scorer_n >= 500` is False) so live trading is unaffected; the
+   smoke test's new verdict ladder would correctly verdict HEALTHY on
+   the *predictions* (3/5 gate buckets populated, sane spread) but the
+   `n_train=35` makes the gate operationally inert regardless.
+3. **Production data directories are SPLIT across two on-disk
+   locations.** The continuous loop writes JSONL ledgers to
+   `/media/zeph/projects/paper-trader/data/` (USB mount). The current
+   working directory `/home/zeph/trading-intelligence/paper-trader/`
+   (the monorepo path) has `backtest.db` symlinked to USB but **no
+   symlink for `data/`** — so `decision_outcomes.jsonl`,
+   `winner_training.jsonl`, `scorer_skill_log.jsonl`, and
+   `baseline_skill_log.jsonl` are NOT visible from this working tree.
+   Any operator-run diagnostic from the monorepo path
+   (`calibration` / `baseline_compare` / `scorer_freshness`) returns
+   "no outcomes file" / `INSUFFICIENT_DATA` despite the production
+   data existing on USB. This is an out-of-scope deployment issue;
+   diagnostics themselves are correct, the path mismatch is the bug.
+4. **Stale code on USB.** `/media/zeph/projects/paper-trader/`
+   (where the production loop runs) has `paper_trader/ml/
+   decision_scorer.py` mtime `2026-05-17 00:36`, while the monorepo
+   path has it at `2026-05-19 00:48`. The production loop runs ~2-day-
+   stale code. Out-of-scope deployment issue; flagged here so a future
+   restart picks up the current head.
+5. **Documented OOS skill plateau is stable.** Last four skill-log
+   rows (cycle 1-4 of the most recent loop instance):
+   `val_rmse ∈ {7.3, 12.9, 11.4, 10.9}`, `oos_rmse ∈ {11.0, 11.8,
+   12.7, 14.1}`, `oos_dir_acc ∈ {0.52, 0.53, 0.52, 0.55}`, `oos_ic ∈
+   {0.08, 0.09, 0.09, 0.11}`. The mild val<<oos gap is the documented
+   modest-overfit; rank-IC of 0.08-0.11 / dir-acc 0.52-0.55 is barely
+   above coin-flip, consistent with prior passes' "modest but real
+   skill" reading. `gate_active=true` and `deploy_stale=false` on every
+   row — when the loop was running, the gate was being trusted on a
+   net that matches source config.
+6. **Smoke test against the deployed (clobbered) pickle: HEALTHY,
+   3/5 gate buckets populated.** Predictions span `-9.4%` (UNH
+   healthcare_weak) to `+5.3%` (AAPL tech_overbought), all
+   in-distribution (no probe clamped). No probe lands in
+   `strong_headwind` (`< -10%`) or `strong_tailwind` (`> +10%`) — even
+   the extreme-overbought edge probe predicts modestly. This is a
+   genuinely useful operator signal added by this pass: the gate's
+   tail arms are dormant on typical inputs to the deployed model.
+7. **No bugs warranted Phase 1 fixes.** The prior two 2026-05-19
+   review passes (CONDEMN floor + `PKL_REGRESSED`) saturated the
+   bug-fix surface; the remaining failure-mode gap was the gate-bucket
+   diversity check shipped above.
+
+### Test commands for this domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Just the ML / backtest / scorer / freshness scope (~5 sec)
+python3 -m pytest tests/test_scorer_freshness.py \
+                  tests/test_scorer_smoke_test.py \
+                  tests/test_decision_scorer.py \
+                  tests/test_backtest.py \
+                  tests/test_continuous.py \
+                  tests/test_ml_backtest_review.py \
+                  tests/test_calibration.py \
+                  tests/test_baseline_compare.py -v
+
+# Just this pass's new coverage (~1.4s)
+python3 -m pytest tests/test_scorer_smoke_test.py::TestGateBucket \
+                  tests/test_scorer_smoke_test.py::TestGateBucketsDegenerate -v
+
+# Inspect the deployed pickle interactively (read-only)
+python3 -m paper_trader.ml.scorer_smoke_test          # table view + gate buckets
+python3 -m paper_trader.ml.scorer_smoke_test --json   # machine-readable
+```
+
+### Invariants reaffirmed by this pass
+
+- **`_gate_bucket` lockstep with `_ml_decide`.** A drift between the
+  two would silently produce wrong `GATE_BUCKETS_DEGENERATE` verdicts;
+  the boundary tests (every comparator pinned) catch it.
+- **Read-only diagnostic discipline.** `scorer_smoke_test` still
+  never trains, never touches the pickle, no `build_features` /
+  `N_FEATURES` / trade-path mutation. The new bucket histogram is
+  pure post-processing of predictions already produced by the
+  existing probe sweep.
+- **Schema additivity.** Existing `gate_bucket_counts` /
+  `distinct_gate_buckets` consumers see no JSON-schema break; older
+  callers that just read `verdict` / `probes` are byte-unaffected.
+
