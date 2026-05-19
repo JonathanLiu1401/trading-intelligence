@@ -2567,7 +2567,7 @@ class BacktestEngine:
         sim_end_ts = int(datetime(sim_date.year, sim_date.month, sim_date.day,
                                   23, 59, 59, tzinfo=timezone.utc).timestamp())
         articles: list[dict] = []
-        seen = set()
+        seen: set[str] = set()
         sample_tickers = tickers[:8]  # limit to avoid slow fetches
         for tk in sample_tickers:
             try:
@@ -2576,11 +2576,19 @@ class BacktestEngine:
                     title = n.get("title", "")
                     url = n.get("link", "")
                     pub_ts = n.get("providerPublishTime")
-                    if not title or url in seen:
+                    # Skip dedup for empty URLs — otherwise a single empty
+                    # string in `seen` silently swallows EVERY subsequent
+                    # URL-less yfinance article (only the first survives),
+                    # even when their titles carry distinct signals. Mirrors
+                    # the same idiom already used in `_fetch_signals`.
+                    if not title:
+                        continue
+                    if url and url in seen:
                         continue
                     if isinstance(pub_ts, (int, float)) and pub_ts > sim_end_ts:
                         continue  # future news — would leak forward into training
-                    seen.add(url)
+                    if url:
+                        seen.add(url)
                     score, found_tickers = score_article({"title": title, "url": url})
                     articles.append({"title": title, "url": url,
                                      "score": score, "tickers": found_tickers})

@@ -121,6 +121,38 @@ class TestDedupAndEmptyTitle:
         assert [a["url"] for a in out] == ["https://x/dup"]
         assert out[0]["title"] == "NVDA earnings beat"  # first wins, not the dup
 
+    def test_empty_url_does_not_collapse_distinct_titles(self, monkeypatch):
+        # Regression lock: a previous bug added `""` to `seen` on the first
+        # empty-URL article, then skipped EVERY subsequent empty-URL article
+        # via `url in seen` — silently dropping headlines with distinct
+        # titles. yfinance occasionally returns articles without a `link`
+        # field (e.g. promoted / aggregated items), and those carry real
+        # signal that must not be collapsed. `_fetch_signals` already uses
+        # this idiom in Tier 2 / Tier 3 (skip dedup for empty URL); this
+        # pins `_fetch_yf_news` itself to the same contract.
+        sim_date = date.today()
+        end_ts = _sim_end_ts(sim_date)
+        news = [
+            {"title": "NVDA earnings beat strong demand",
+             "link": "", "providerPublishTime": end_ts - 10},
+            {"title": "AMD guidance raised rally",
+             "link": "", "providerPublishTime": end_ts - 5},
+            {"title": "MU record revenue surge",
+             "link": "", "providerPublishTime": end_ts - 2},
+        ]
+        _patch_yf(monkeypatch, news)
+
+        out = _engine()._fetch_yf_news(["NVDA"], sim_date)
+        titles = [a["title"] for a in out]
+        # All three distinct titles must survive — none collapsed by the
+        # empty-URL dedup.
+        assert titles == [
+            "NVDA earnings beat strong demand",
+            "AMD guidance raised rally",
+            "MU record revenue surge",
+        ]
+        assert all(a["url"] == "" for a in out)
+
 
 class TestStaleDateShortCircuit:
     def test_sim_date_older_than_30d_returns_empty_without_network(self, monkeypatch):
