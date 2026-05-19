@@ -8502,3 +8502,147 @@ python3 -m paper_trader.host_guard        # CLEAR / SATURATED + opus_count + loa
   real-builder test ensures any future signature drift fails in CI
   rather than silently in production.
 
+## ML / backtest review pass (Agent 2, 2026-05-19, 2nd pass)
+
+Hybrid pass against `paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py`, `run_continuous_backtests.py`. After the
+prior pass on 2026-05-19 (`attribution_audit` + 9+15 new tests) the
+diagnostic suite is genuinely saturated — this pass found two real
+issues missed by every existing check.
+
+### Bug fix: CONDEMN train-fold weight floor
+
+`train_scorer`'s replication code used
+`rep = np.maximum(1, np.round(w_tr * 2).astype(int))`. The `max(1, …)`
+floor silently promoted every CONDEMN-annotated row
+(`llm_quality_label=-1`, multiplier 0.1×) to rep=1 — the docs claim a
+0.1× weight, the measured CONDEMN/unlabeled ratio was ~0.5×. With this
+fix rows whose rounded rep is 0 are DROPPED from the training fold
+entirely (not floored to 1), so CONDEMN's near-zero weight is realized
+in practice. Defensive empty-fold fallback added (impossible in any real
+corpus — unlabeled records always weight ≥0.5 → rep≥1 — but keeps
+`train_scorer` total-failure-free).
+
+Empirically inert today: 7413/7413 production outcomes carry
+`llm_quality_label=0` because `_llm_annotate_outcomes` has failed every
+cycle since deployment (no `ANTHROPIC_API_KEY` set — see Phase 3
+findings). The fix is correctness-on-future-use: when the auth issue
+gets resolved and CONDEMN labels start appearing, they will be down-
+weighted as the design intended rather than indistinguishable from a
+0.5× weight on a losing run.
+
+Locked by `tests/test_decision_scorer.py::TestLlmWeightReplication`
+(3 tests): ENDORSE replicates 3× more than unlabeled (`max(rep)==6`,
+`min(rep)==2`); CONDEMN rows are dropped (no `rep==1` floor leakage);
+unlabeled rep=2 (×2 scaling pinned). Keeps the ×2 scaling rather than
+re-scaling to ×10 — a wider scaling would weaken the unweighted L2
+`alpha` term and break the
+`test_regularization_suppresses_pure_noise_memorization` guarantee.
+
+### Feature: PKL_REGRESSED verdict in `scorer_freshness.py`
+
+The existing scorer-freshness ladder
+(FRESH/INSUFFICIENT_DATA/STALE_PKL/LOOP_STALLED/LOOP_DEAD) reports
+`pkl_n_train` and `last_train_n` as INPUTS but no verdict was driven by
+their relationship. Observed live (2026-05-19) production state shows
+the gap: deployed pkl `n_train=400` while the loop's most recent
+skill-log row logged `train_n=3959` — a ~10% corpus, and the gate WAS
+acting on it (`gate_active=true`). STALE_PKL does not fire because the
+pkl mtime is *newer* than the heartbeat — just clobbered with a tiny-
+corpus fit by a side process (manual retrain / out-of-tree script /
+agent test that bypassed conftest's `SCORER_PATH` isolation).
+
+`PKL_REGRESSED` fires when:
+  - heartbeat is fresh (LOOP_DEAD / LOOP_STALLED take precedence)
+  - pkl mtime ≥ heartbeat (STALE_PKL doesn't fire)
+  - `last_train_n ≥ PKL_REGRESSION_MIN_TRAIN_N=500` (mutes early-cycle wander)
+  - `pkl_n_train < last_train_n × PKL_REGRESSION_TOL=0.5`
+
+Run:
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.scorer_freshness
+```
+Exit code mirrors siblings: 0 on FRESH/INSUFFICIENT_DATA, 2 on every
+actionable verdict including PKL_REGRESSED.
+
+Locked by `tests/test_scorer_freshness.py` (15 tests — module had **zero
+direct test coverage** before this pass): full verdict ladder; CLI
+exit-code contract; verdict precedence (LOOP_DEAD wins over
+PKL_REGRESSED); below-floor mute; robustness against unparseable JSONL
+lines and corrupt pkls.
+
+### Phase 3 quant findings (worth reading)
+
+1. **Production pkl is in a clobbered state.** Deployed
+   `decision_scorer.pkl` reports `n_train=400` (mtime 2026-05-18 21:42)
+   while the last skill-log row (cycle 4, 2026-05-18 18:06) reports
+   `train_n=3959`. Calibration on that pkl: spearman=0.0157
+   (MISCALIBRATED) — the gate has near-zero predictive value right now.
+   The new PKL_REGRESSED verdict will catch this on the next loop restart
+   (currently masked by LOOP_STALLED since heartbeat is 14h+ old).
+2. **Continuous loop is currently STOPPED.** No `run_continuous_backtests`
+   process; last heartbeat 14h+ stale. Two `backtest_runs` rows remain
+   `status='running'` indefinitely. The new freshness check correctly
+   identifies this as LOOP_STALLED, escalating with "the conviction
+   gate is ACTIVE, so trades are being modulated against this frozen
+   model".
+3. **LLM annotation has never worked.** Every cycle in `continuous.log`
+   shows `[continuous] LLM annotation failed: "Could not resolve
+   authentication method..."` because no `ANTHROPIC_API_KEY` is set.
+   All 7413 production outcomes carry `llm_quality_label=0` — the
+   ENDORSE/CONDEMN weighting scheme is inert. The Phase 1 fix is
+   ready-for-when-it-starts-working; the auth gap is out of scope.
+4. **Effective dedup is ~7%**, not the suspected 95%. Dedup by
+   `(ticker, sim_date, action)` on 7413 outcomes ⇒ 6906 unique
+   (ratio 0.932); tail-5000 ⇒ 4943 unique. The pkl's `n_train=400`
+   anomaly is NOT explained by dedup — confirms the clobber hypothesis.
+5. **Recent baseline-skill trend is FLIPPING POSITIVE.**
+   `baseline_skill_log.jsonl` cycles 1-4 show:
+   `MLP_NO_BETTER_THAN_TRIVIAL → MLP_NO_BETTER_THAN_TRIVIAL →
+   MLP_ADDS_SKILL (ic_gap=+0.07) → MLP_ADDS_SKILL (ic_gap=+0.11)`.
+   The historical "MLP is worse than a one-line `ml_score` rule"
+   finding may no longer hold post-anti-overfit retune (echoing the
+   prior pass's #5 observation). The clobbered pkl currently in
+   production interferes with this trend; restart-and-retrain would
+   reveal the true state.
+6. **Backtest dispersion remains extreme.** 475 complete runs;
+   `avg(total_return)=150%`, `avg(vs_spy)=118%`; last 50 runs:
+   `avg(total_return)=271%`, `avg(vs_spy)=213%`. This is leveraged-ETF
+   beta dispersion through cherry-picked windows, NOT repeatable
+   alpha (as AGENTS.md has long emphasized).
+
+### Test commands for this domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Just the ML / backtest / scorer / freshness scope (~5 sec)
+python3 -m pytest tests/test_scorer_freshness.py \
+                  tests/test_decision_scorer.py \
+                  tests/test_backtest.py \
+                  tests/test_continuous.py \
+                  tests/test_ml_backtest_review.py \
+                  tests/test_calibration.py \
+                  tests/test_baseline_compare.py -v
+
+# Just the new coverage from this pass (~3 sec)
+python3 -m pytest tests/test_scorer_freshness.py \
+                  tests/test_decision_scorer.py::TestLlmWeightReplication -v
+```
+
+### Invariants reaffirmed by this pass
+
+- **Read-only diagnostic discipline** — `scorer_freshness` never trains,
+  never touches the pickle, no `build_features` / `N_FEATURES` /
+  trade-path mutation. Safe to run against the unattended loop.
+- **Conftest SCORER_PATH isolation discipline** — the bug class the new
+  PKL_REGRESSED verdict catches is precisely "a side process clobbered
+  the production pkl by bypassing conftest's monkeypatch". The
+  diagnostic exists as a runtime alarm; the test discipline remains the
+  primary defense.
+- **`train_scorer` honesty contract** — every failure mode (empty
+  records, insufficient_after_dedup, null/non-finite forward returns,
+  sklearn absent) degrades gracefully. The new CONDEMN-drop codepath
+  preserves this with a defensive empty-fold fallback.
+
