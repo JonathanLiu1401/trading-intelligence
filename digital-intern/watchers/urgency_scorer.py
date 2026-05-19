@@ -69,25 +69,38 @@ Respond ONLY with a JSON array: [{{"index": 0, "score": 9, "reason": "MU earning
 
 
 def _article_age_hours(article: dict) -> float:
-    """Return age in hours from published date. Returns 0.0 if unknown (treat as fresh)."""
-    published = article.get("published") or article.get("first_seen") or ""
-    if not published:
-        return 0.0
-    dt = None
-    try:
-        dt = parsedate_to_datetime(published)
-    except Exception:
-        pass
-    if dt is None:
+    """Hours since the article was published — ``published`` preferred, else
+    ``first_seen``. ``0.0`` when neither field parses (treat as fresh — safe
+    default; staleness cap is a downward bound).
+
+    Cascading fallback: a non-empty-but-unparseable ``published`` must NOT
+    short-circuit the lookup at 0.0h, because that bypasses the
+    ``STALE_HOURS`` cap on a row whose ``first_seen`` is genuinely old (live
+    failure: an unparseable RFC822 date on a 40h-old article was treated as
+    fresh, letting Sonnet's "urgent=9" through the staleness clamp). Mirrors
+    ``alert_agent._article_age_hours``'s field-cascade convention so the two
+    age helpers agree on which timestamp is authoritative."""
+    now = datetime.now(timezone.utc)
+    for field in ("published", "first_seen"):
+        raw = (article.get(field) or "").strip()
+        if not raw:
+            continue
+        dt = None
         try:
-            s = published.replace("Z", "+00:00")
-            dt = datetime.fromisoformat(s)
+            dt = parsedate_to_datetime(raw)
         except Exception:
-            return 0.0
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
-    return max(0.0, age_h)
+            dt = None
+        if dt is None:
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except Exception:
+                dt = None
+        if dt is None:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (now - dt).total_seconds() / 3600.0)
+    return 0.0
 
 
 def score_batch(articles: list, store) -> int:
