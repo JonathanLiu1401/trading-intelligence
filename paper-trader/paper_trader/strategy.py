@@ -884,7 +884,15 @@ def _enforce_risk_pre_trade(decision: dict, snapshot: dict) -> tuple[bool, str]:
         return True, ""
 
     ticker = (decision.get("ticker") or "").upper()
-    qty = float(decision.get("qty") or 0)
+    try:
+        qty = float(decision.get("qty") or 0)
+    except (TypeError, ValueError):
+        # Claude can emit a non-numeric qty (e.g. "all", "half"). _execute
+        # already catches this defensively, but a direct call into this
+        # helper without prior coercion would otherwise raise and abort the
+        # cycle. Mirror _execute's BLOCKED-tuple shape ("ok=False") so the
+        # caller logs a clean decision row instead.
+        return False, f"qty not numeric: {decision.get('qty')!r}"
     if qty <= 0 and action != "REBALANCE":
         return False, "qty must be > 0"
 
@@ -949,25 +957,41 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
         expiry = decision.get("expiry")
         if not (strike and expiry):
             return "BLOCKED", "option trade missing strike/expiry"
-        opt_px = market.get_option_price(ticker, expiry, float(strike), otype)
+        # Claude can emit a non-numeric strike ("ATM", "OTM", a description).
+        # An unguarded float() would raise ValueError and abort the whole
+        # decide() cycle (no decision row, no equity point); record a clean
+        # BLOCKED instead so the operator can diagnose what came back.
+        try:
+            strike_f = float(strike)
+        except (TypeError, ValueError):
+            return "BLOCKED", f"strike not numeric: {strike!r}"
+        opt_px = market.get_option_price(ticker, expiry, strike_f, otype)
         if not opt_px:
             return "BLOCKED", f"no option price for {ticker} {expiry} {strike} {otype}"
         notional = opt_px * qty * 100
         if snapshot["cash"] - notional < 0:
             return "BLOCKED", f"insufficient cash (have ${snapshot['cash']:.2f}, need ${notional:.2f})"
         store.record_trade(ticker, action, qty, opt_px, reason, expiry=expiry,
-                           strike=float(strike), option_type=otype)
-        store.upsert_position(ticker, otype, qty, opt_px, expiry=expiry, strike=float(strike))
+                           strike=strike_f, option_type=otype)
+        store.upsert_position(ticker, otype, qty, opt_px, expiry=expiry, strike=strike_f)
         store.update_portfolio(snapshot["cash"] - notional, snapshot["total_value"], snapshot["positions"])
-        return "FILLED", f"{action} {qty} {ticker} {strike}{otype[0].upper()} {expiry} @ {opt_px:.2f}"
+        return "FILLED", f"{action} {qty} {ticker} {strike_f}{otype[0].upper()} {expiry} @ {opt_px:.2f}"
 
     if action in ("SELL_CALL", "SELL_PUT"):
         otype = "call" if action == "SELL_CALL" else "put"
         strike = decision.get("strike")
         expiry = decision.get("expiry")
+        # Same non-numeric-strike guard as the BUY path above: an unguarded
+        # float() inside the list comprehension would crash the cycle.
+        strike_f: float | None = None
+        if strike:
+            try:
+                strike_f = float(strike)
+            except (TypeError, ValueError):
+                return "BLOCKED", f"strike not numeric: {strike!r}"
         candidates = [p for p in snapshot["positions"]
                       if p["ticker"] == ticker and p["type"] == otype
-                      and (not strike or p["strike"] == float(strike))
+                      and (strike_f is None or p["strike"] == strike_f)
                       and (not expiry or p["expiry"] == expiry)]
         if not candidates:
             return "BLOCKED", f"no matching open {otype} for {ticker}"

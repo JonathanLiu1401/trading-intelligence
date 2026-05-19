@@ -128,11 +128,19 @@ def _maybe_warn_stale(chosen: Path, freshness: dict[Path, str | None]) -> None:
     if age is None or age < _STALE_FEED_WARN_HOURS:
         return
     _STALE_WARNED.add(key)
-    others = [
-        f"{p.name}@{_age_hours(ts):.1f}h"
-        for p, ts in freshness.items()
-        if p != chosen and ts is not None
-    ]
+    # Other candidates with a *parseable* freshness — a candidate whose ts is
+    # non-None but unparseable would have ``_age_hours`` return None and crash
+    # the f-string's ``.1f`` format. The diagnostics line must never be able to
+    # take down ``decide()``, so filter out the None-age cases (and a candidate
+    # with no usable age contributes no diagnostic value anyway).
+    others = []
+    for p, ts in freshness.items():
+        if p == chosen or ts is None:
+            continue
+        age_h = _age_hours(ts)
+        if age_h is None:
+            continue
+        others.append(f"{p.name}@{age_h:.1f}h")
     extra = f" (fresher candidate(s): {', '.join(others)})" if others else ""
     print(
         f"[signals] WARNING reading STALE feed {chosen} — newest live article "
