@@ -1398,6 +1398,148 @@ def _filter_quote_widget_noise(articles: list) -> tuple[list, list]:
     return kept, suppressed
 
 
+# ── Recap / SEO template gate (defense-in-depth, briefing path) ──────────────
+# A *second* over-scored content class the urgency head over-weights: the
+# *recap / preview / transcript-summary* template — content that is inherently
+# retrospective ("trading up TODAY", "Q1 Earnings Call Highlights", a date-
+# stamped "Stock Market Today, May 18:" wrap-up) or algorithmic press-mill
+# output ("(LITE) Shares Fall 8.8% -- GF Value Says ..."). The alert path
+# already gates these via watchers.alert_agent._filter_recap_template_noise
+# (tests/test_alert_recap_template.py), but the briefing path — the analyst's
+# PRIMARY consumed product — did not. Live evidence (2026-05-19 04:18Z
+# heartbeat): "[00:50] 9.85 MU Motley: why MU dropped (cont., ~3.5h old)"
+# made it into TOP SIGNALS — a model self-prediction at 9.85 on the exact
+# "Why Did Micron Stock Drop Today ? | The Motley Fool" recap title. The
+# 6-hour articles.db scan also surfaced six other ai_score>=7 recap rows in
+# the same window (LITE GF Value, AXTI GF Value, QBTS Q1 Earnings Call
+# Highlights ×2, "Stock Market Today, May 18: ...", "Why Nvidia Stock Is
+# Trading Up Today"). These are exactly the rows
+# watchers.alert_agent._filter_recap_template_noise drops on the standalone
+# push.
+#
+# Same shape as ``_filter_quote_widget_noise``: a pure read-side text drop at
+# the single chokepoint the briefing funnels through, NOT an ML-threshold
+# change and NOT a DB write. Runs BEFORE dedup so a recap syndicated across
+# multiple feeds (live: the "Stock Market Today, May 18: ..." wrap-up carried
+# by Motley Fool + Nasdaq + YahooFinance) is caught on every copy. Returns
+# NEW lists, never mutates the caller's source_articles (heartbeat_worker
+# feeds those onward to the briefing-label / training path) — so all four
+# load-bearing invariants (backtest isolation, ml_score≠ai_score,
+# score_source, urgency state machine) are intact by construction.
+#
+# Patterns and lockstep discipline are duplicated from
+# watchers.alert_agent._RECAP_TEMPLATE_PATTERNS rather than cross-imported:
+# the analysis layer must not pull the watchers+ml_features import graph
+# (same documented anti-import-cycle discipline as _collapse_syndicated
+# reusing alert_dedup._signature and article_store._briefing_domain_key
+# duplicating ml.features). Test parity (tests/test_briefing_recap_template
+# vs tests/test_alert_recap_template) pins the two gates against drift.
+
+# "Why <Co|TICKER> Stock Is Trading {Up|Down|Higher|Lower} Today" — Zacks /
+# Yahoo / Finnhub recap. Anchored "^Why" so a headline that uses "why" mid-
+# sentence is unaffected. "Stock Is Trading" + "Today" is the discriminator.
+_BRIEFING_RT_WHY_TRADING = re.compile(
+    r"^\s*why\s+.+?\s+stock\s+is\s+trading\s+(?:up|down|higher|lower)\s+today\b",
+    re.IGNORECASE,
+)
+# "Why Did <X> Stock {Drop|Rise|Surge|Fall|Climb|Plunge|Soar|Jump|Tumble} Today"
+# — Motley Fool / Zacks past-tense intraday-move recap.
+_BRIEFING_RT_WHY_DID = re.compile(
+    r"^\s*why\s+did\s+.+?\s+stock\s+"
+    r"(?:drop|rise|surge|fall|climb|plunge|soar|jump|tumble)\b",
+    re.IGNORECASE,
+)
+# "Stock Market Today, May 18: ..." — date-stamped daily market wrap-up.
+_BRIEFING_RT_MARKET_TODAY = re.compile(
+    r"^\s*stock\s+market\s+today\s*[,:]\s*"
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?)\s+\d{1,2}\b",
+    re.IGNORECASE,
+)
+# "Q1 2026 Earnings Call Highlights" — GuruFocus / Seeking Alpha transcript-
+# summary template (substring — appears mid-headline). Quarter + year bounded
+# so a normal earnings preview ("Q1 earnings preview", "Q1 ahead of") never
+# matches; the discriminator verbs are highlights|recap|takeaways|transcript|
+# summary, NOT preview|ahead.
+_BRIEFING_RT_EARNINGS_CALL = re.compile(
+    r"\bq[1-4]\s*20\d{2}\s+earnings\s+call\s+(?:highlights|recap|takeaways|"
+    r"transcript|summary)\b",
+    re.IGNORECASE,
+)
+# "Here['s|is] What the Street Thinks About <X>" — InsiderMonkey opinion-mill.
+_BRIEFING_RT_STREET_THINKS = re.compile(
+    r"^\s*here(?:'?s|\s+is)?\s+what\s+the\s+street\s+thinks\b",
+    re.IGNORECASE,
+)
+# "(TICKER) Shares Fall 8.8% -- GF Value Says ..." — GuruFocus algorithmic
+# press-mill. "GF Value Says" is unique enough to be a high-precision pattern.
+_BRIEFING_RT_GF_VALUE = re.compile(
+    r"\bgf\s+value\s+says\b",
+    re.IGNORECASE,
+)
+
+_BRIEFING_RECAP_TEMPLATE_PATTERNS = (
+    ("why_trading_today", _BRIEFING_RT_WHY_TRADING),
+    ("why_did_stock", _BRIEFING_RT_WHY_DID),
+    ("market_today_dated", _BRIEFING_RT_MARKET_TODAY),
+    ("earnings_call_recap", _BRIEFING_RT_EARNINGS_CALL),
+    ("street_thinks", _BRIEFING_RT_STREET_THINKS),
+    ("gf_value_says", _BRIEFING_RT_GF_VALUE),
+)
+
+
+def _looks_like_recap_template(article: dict) -> tuple[bool, str]:
+    """``(True, fingerprint_name)`` for a recap/preview/transcript-summary or
+    algorithmic-mill title — these are inherently retrospective and must not
+    surface as a fresh TOP SIGNAL in the Opus heartbeat digest. ``(False, "")``
+    for everything else.
+
+    Pure, side-effect-free; reads only ``title``. Six independent fingerprints,
+    all anchored so real breaking headlines are NEVER caught (the alert-path
+    test_alert_recap_template.py must-survive corpus is verified verbatim
+    against this gate too — "Nvidia Q3 revenue rises 22%...", "Fed cuts
+    rates", "MU earnings blow past estimates", "Why investors are bullish on
+    Nvidia", "MU shares halted", "Nvidia Q1 earnings preview")."""
+    title = (article.get("title") or "").strip()
+    if not title:
+        return False, ""
+    for name, pat in _BRIEFING_RECAP_TEMPLATE_PATTERNS:
+        if pat.search(title):
+            return True, name
+    return False, ""
+
+
+def _filter_recap_template_noise(articles: list) -> tuple[list, list]:
+    """Partition digest rows into ``(kept, suppressed)``; ``suppressed`` is the
+    recap/preview/transcript-summary/algorithmic-mill rows the urgency head
+    over-scored. Pure, order-preserving, side-effect-free — returns NEW lists
+    and never mutates the caller's ``source_articles`` (heartbeat_worker feeds
+    those onward to the briefing-label / training path), so all four
+    load-bearing invariants (backtest isolation, ml_score≠ai_score,
+    score_source, urgency state machine) are intact by construction: this only
+    ever reshapes the text Opus reads.
+
+    Runs BEFORE ``_collapse_syndicated`` so a recap syndicated across multiple
+    feeds (live: the "Stock Market Today, May 18: ..." wrap-up carried by
+    Motley Fool + Nasdaq + YahooFinance) is suppressed on every copy and the
+    dedup layer is never asked to discriminate against a real story with a
+    similar prefix. Suppressed rows are tagged with ``_recap_fingerprint`` on a
+    *defensive shallow copy* so the caller's row is never mutated (mirrors
+    ``alert_agent._filter_recap_template_noise``'s mutation discipline)."""
+    kept: list = []
+    suppressed: list = []
+    for a in articles:
+        hit, name = _looks_like_recap_template(a)
+        if hit:
+            tagged = dict(a)
+            tagged["_recap_fingerprint"] = name
+            suppressed.append(tagged)
+        else:
+            kept.append(a)
+    return kept, suppressed
+
+
 # ── Held-book relevance tag (the analyst's open positions) ───────────────────
 # The 5h Opus digest tells the analyst what is *important*, but never which
 # rows touch money they actually have at risk RIGHT NOW. The Discord-only
@@ -1674,6 +1816,18 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None,
     # the same "(no high-relevance ...)" line as before — behaviour-preserving
     # for the common path, strictly cleaner for the widget path.
     articles, _qw_suppressed = _filter_quote_widget_noise(articles or [])
+    # Recap / SEO template gate — defense-in-depth, same shape as the quote-
+    # widget gate above. Drops "Why X Stock Is Trading Up Today" / "Stock
+    # Market Today, May 18:" / "Q1 2026 Earnings Call Highlights" / GuruFocus
+    # "GF Value Says ..." rows the urgency head over-scored before dedup/decay/
+    # cap so the analyst's primary Opus digest never surfaces them as TOP
+    # SIGNALS (live evidence 2026-05-19 04:18Z briefing: "[00:50] 9.85 MU
+    # Motley: why MU dropped" — a model-only 9.85 on the exact recap template
+    # the alert path already filters). Pure read-side reshape: returns NEW
+    # lists, never mutates caller's source_articles, so the training-label /
+    # backtest-isolation invariants are untouched. Runs BEFORE dedup so a
+    # recap syndicated across multiple feeds is caught on every copy.
+    articles, _recap_suppressed = _filter_recap_template_noise(articles)
     if not articles:
         parts.append("(no high-relevance articles this cycle)")
     else:
