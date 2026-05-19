@@ -236,6 +236,24 @@ class TestEnforceRiskPreTrade:
             {"action": "SELL", "ticker": "NVDA", "qty": 5}, snap)
         assert ok is True
 
+    def test_non_numeric_qty_blocks_cleanly_not_crashes(self):
+        # Regression: a Claude decision with qty="all" / "half" used to raise
+        # ValueError inside _enforce_risk_pre_trade — the unguarded float()
+        # call would propagate up and abort the whole decide() cycle (no
+        # decision row, no equity point). The helper must now return
+        # ok=False with an actionable detail instead.
+        snap = {"positions": [{"ticker": "NVDA", "type": "stock", "qty": 5}]}
+        ok, why = strategy._enforce_risk_pre_trade(
+            {"action": "SELL", "ticker": "NVDA", "qty": "all"}, snap)
+        assert ok is False
+        assert "qty" in why.lower()
+        assert "all" in why
+        ok2, why2 = strategy._enforce_risk_pre_trade(
+            {"action": "BUY", "ticker": "NVDA", "qty": None}, snap)
+        # qty None coerces to 0, blocked as qty must be > 0 (separate path).
+        # We just need to confirm there's no crash and ok is False.
+        assert ok2 is False
+
 
 # ─────────────────────────── _execute (BUY / SELL) ───────────────────────────
 
@@ -329,6 +347,37 @@ class TestExecuteBuyCall:
         status, detail = strategy._execute(decision, snap, fresh_store)
         assert status == "BLOCKED"
         assert "insufficient cash" in detail
+
+    def test_buy_call_blocked_on_non_numeric_strike(self, fresh_store):
+        # Regression: Claude can emit strike="ATM" (a description, not a
+        # number). Before the fix this raised ValueError inside _execute and
+        # crashed the whole decide() cycle (no decision row, no equity point).
+        # Must now cleanly BLOCK with an actionable detail.
+        snap = {"cash": 1000.0, "total_value": 1000.0, "positions": []}
+        decision = {"action": "BUY_CALL", "ticker": "NVDA", "qty": 1,
+                    "strike": "ATM", "expiry": "2026-12-19", "reasoning": ""}
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "BLOCKED"
+        assert "strike" in detail.lower()
+        assert "ATM" in detail
+        # Same defensive check for puts.
+        decision_p = {**decision, "action": "BUY_PUT"}
+        status_p, detail_p = strategy._execute(decision_p, snap, fresh_store)
+        assert status_p == "BLOCKED"
+        assert "strike" in detail_p.lower()
+
+    def test_sell_call_blocked_on_non_numeric_strike(self, fresh_store):
+        # Same regression on the close side: a non-numeric strike must not
+        # reach the list-comp ``float(strike)`` and crash the cycle.
+        positions = [{"ticker": "NVDA", "type": "call", "qty": 1,
+                      "avg_cost": 5.0, "strike": 600.0, "expiry": "2026-12-19"}]
+        snap = {"cash": 1000.0, "total_value": 2000.0, "positions": positions}
+        decision = {"action": "SELL_CALL", "ticker": "NVDA", "qty": 1,
+                    "strike": "ITM", "expiry": "2026-12-19", "reasoning": ""}
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "BLOCKED"
+        assert "strike" in detail.lower()
+        assert "ITM" in detail
 
 
 class TestExecuteSellCallDisambiguation:

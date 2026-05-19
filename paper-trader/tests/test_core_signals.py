@@ -558,6 +558,25 @@ class TestFeedStatusAndWarn:
         signals._maybe_warn_stale(usb, {usb: _iso_ago(1)})
         assert capfd.readouterr().err == ""
 
+    def test_unparseable_other_timestamp_does_not_crash(self, two_dbs, capfd):
+        # Regression: when the *chosen* feed is stale and ANOTHER candidate
+        # carries an unparseable ISO timestamp (corrupt DB row /
+        # implementation drift), _age_hours returns None for that other
+        # candidate. The warning composer used to feed that None straight
+        # into ``{:.1f}`` and TypeError'd, taking down the whole decide()
+        # cycle. The composer must now silently skip the unparseable
+        # candidate while still emitting the warning for the chosen one.
+        usb, local = two_dbs
+        # chosen is the stale USB; the LOCAL candidate has a garbage ts
+        freshness = {usb: _iso_ago(30), local: "not-an-iso-timestamp"}
+        signals._maybe_warn_stale(usb, freshness)
+        err = capfd.readouterr().err
+        # Warning still fires for the stale chosen feed
+        assert "WARNING reading STALE feed" in err
+        assert "30.0h old" in err
+        # And the unparseable sibling is not surfaced (silently skipped)
+        assert "not-an-iso-timestamp" not in err
+
 
 class TestCheckFreshnessCLI:
     """`_print_freshness_report` is the `--check-freshness` body; its return
