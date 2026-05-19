@@ -7618,6 +7618,88 @@ def scorer_attribution_api():
         return jsonify({"error": str(e), "attribution": {"contributions": []}}), 500
 
 
+@app.route("/api/scorer-portfolio-attribution")
+@swr_cached("scorer-portfolio-attribution", 90.0)
+def scorer_portfolio_attribution_api():
+    """Top driving features (signed contributions) behind the DecisionScorer's
+    verdict for *every* currently-held stock — portfolio-wide attribution in a
+    single call.
+
+    /api/scorer-attribution answers the same question for ONE ticker at a time,
+    which means N HTTP round-trips when the operator is asking "WHY does the
+    scorer want out of half my book?". This composes the same live feature
+    plumbing /api/scorer-predictions uses + feature_contributions() and emits
+    one row per held position, each carrying the top 3 features by |signed
+    contribution|. Read-only; never touches the trade path; off-distribution
+    rows are flagged so a clamped extrapolation isn't read as a confident
+    EXIT."""
+    try:
+        from .ml.decision_scorer import DecisionScorer
+        from .strategy import get_quant_signals_live
+        from . import signals as _sig
+
+        scorer = DecisionScorer()
+        store = get_store()
+        held = sorted({
+            p["ticker"] for p in store.open_positions()
+            if p.get("type") == "stock" and (p.get("qty") or 0) > 0
+        })
+        result = {
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "is_trained": scorer.is_trained,
+            "n_train": scorer.n_train,
+            "gate_threshold": 500,
+            "n_positions": len(held),
+            "rows": [],
+        }
+        if not held or not scorer.is_trained:
+            return jsonify(result)
+
+        quant = get_quant_signals_live(held) or {}
+        sent_by_tk = {s["ticker"]: s for s in (_sig.ticker_sentiments(held, hours=4) or [])}
+        regime_mult = 1.0
+        try:
+            spy_mom = (get_quant_signals_live(["SPY"]).get("SPY") or {}).get("mom_5d")
+            if isinstance(spy_mom, (int, float)):
+                regime_mult = max(0.7, min(1.3, 1.0 + spy_mom * 0.075))
+        except Exception:
+            pass
+
+        rows = []
+        for tk in held:
+            q = quant.get(tk) or {}
+            sent = sent_by_tk.get(tk) or {}
+            ml_score = float(sent.get("max_score") or 0.0)
+            common = dict(
+                ml_score=ml_score, rsi=q.get("rsi"), macd=q.get("macd_signal"),
+                mom5=q.get("mom_5d"), mom20=q.get("mom_20d"),
+                regime_mult=regime_mult, ticker=tk,
+                vol_ratio=q.get("vol_ratio"), bb_pos=q.get("bb_position"),
+            )
+            meta = scorer.predict_with_meta(**common)
+            attr = scorer.feature_contributions(**common)
+            contribs = (attr.get("contributions") or [])[:3]
+            rows.append({
+                "ticker": tk,
+                "pred_5d_return_pct": round(float(meta["pred"]), 3),
+                "verdict": _scorer_verdict(float(meta["pred"])),
+                "off_distribution": bool(meta["off_distribution"]),
+                "raw_pred_5d_return_pct": (round(float(meta["raw"]), 3)
+                                            if meta["off_distribution"] else None),
+                "top_features": contribs,
+                "interaction_residual": attr.get("interaction_residual"),
+                "ml_news_score": round(ml_score, 2),
+            })
+        # Most-bearish first — that's the row most likely to drive an EXIT call,
+        # which is what the operator opening this panel mid-drawdown wants to see.
+        rows.sort(key=lambda r: r["pred_5d_return_pct"])
+        result["rows"] = rows
+        result["regime_mult"] = round(regime_mult, 3)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "rows": []}), 500
+
+
 @app.route("/api/scorer-opportunities")
 @swr_cached("scorer-opportunities", 90.0)
 def scorer_opportunities_api():
