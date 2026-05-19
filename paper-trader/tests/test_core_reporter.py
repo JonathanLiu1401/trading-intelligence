@@ -2305,3 +2305,253 @@ class TestPositionAttentionLine:
         # No attention block but the summary itself shipped.
         assert "**ATTENTION**" not in captured[0]
         assert "**HOURLY**" in captured[0]
+
+
+class TestConcentrationLine:
+    """`_concentration_line` + its hourly/daily wiring — the missing
+    SINGLE_NAME_RISK Discord surface. ``/api/correlation`` answers
+    "is one name dominating the stock book?" on the dashboard and the
+    ``risk_mirror`` block surfaces the same to Opus; nothing surfaced it
+    to Discord, where the operator lives. The live 2026-05-19 book sat at
+    NVDA 75% of stock book with no concentration verdict in any hourly /
+    daily report."""
+
+    def _stub(self, monkeypatch, payload):
+        """Replace build_correlation with a fixed return so we can exercise
+        every state/verdict branch deterministically."""
+        from paper_trader.analytics import correlation as corr_mod
+        monkeypatch.setattr(corr_mod, "build_correlation",
+                            lambda *a, **k: payload)
+
+    def test_silent_when_diversified(self, fresh_store, monkeypatch):
+        # A balanced book → DIVERSIFIED verdict → no concentration line.
+        # Asserts the suppression discipline (the summary must never become
+        # its own lying green light).
+        self._stub(monkeypatch, {
+            "state": "OK", "verdict": "DIVERSIFIED",
+            "headline": "DIVERSIFIED — names move largely independently.",
+            "top_weight_pct": 35.0, "top_weight_ticker": "NVDA",
+            "n_stock_positions": 4,
+        })
+        assert reporter._concentration_line(fresh_store) == ""
+
+    def test_silent_when_moderate(self, fresh_store, monkeypatch):
+        # MODERATE (top weight 50-60%, not yet single-name-risk) → silent;
+        # the per-position weights in `_portfolio_lines` already expose the
+        # raw number. Surface ONLY actionable SINGLE_NAME_RISK.
+        self._stub(monkeypatch, {
+            "state": "OK", "verdict": "MODERATE",
+            "headline": "MODERATE — partial diversification.",
+            "top_weight_pct": 55.0, "top_weight_ticker": "NVDA",
+            "n_stock_positions": 2,
+        })
+        assert reporter._concentration_line(fresh_store) == ""
+
+    def test_silent_when_insufficient(self, fresh_store, monkeypatch):
+        # INSUFFICIENT (no correlatable history yet — the live decide()
+        # path with no price_history) → silent. The risk_mirror prompt block
+        # uses weight-based fallback; this Discord line stays quiet.
+        self._stub(monkeypatch, {
+            "state": "INSUFFICIENT", "verdict": None,
+            "headline": "correlation verdict withheld.",
+            "top_weight_pct": 75.0, "top_weight_ticker": "NVDA",
+            "n_stock_positions": 2,
+        })
+        assert reporter._concentration_line(fresh_store) == ""
+
+    def test_silent_when_no_data(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, {
+            "state": "NO_DATA", "verdict": None,
+            "headline": "No stock positions — concentration risk undefined.",
+            "top_weight_pct": None, "top_weight_ticker": None,
+            "n_stock_positions": 0,
+        })
+        assert reporter._concentration_line(fresh_store) == ""
+
+    def test_surfaces_single_name_risk(self, fresh_store, monkeypatch):
+        # The live 2026-05-19 shape: NVDA 75% of stock book.
+        self._stub(monkeypatch, {
+            "state": "OK", "verdict": "SINGLE_NAME_RISK",
+            "headline": ("SINGLE_NAME_RISK — NVDA is 75% of the book; "
+                         "1.18 effective independent bet(s)."),
+            "top_weight_pct": 75.0, "top_weight_ticker": "NVDA",
+            "n_stock_positions": 2,
+        })
+        line = reporter._concentration_line(fresh_store)
+        assert line.startswith("⚠️ **CONCENTRATION** ◈ SINGLE_NAME_RISK")
+        # Headline verbatim — single source of truth, never re-derived.
+        assert "NVDA is 75% of the book" in line
+        assert "1.18 effective independent bet" in line
+
+    def test_silent_when_headline_empty(self, fresh_store, monkeypatch):
+        # Belt-and-suspenders: a SINGLE_NAME_RISK verdict with no headline
+        # (defensive against a future builder bug) stays silent rather than
+        # emitting a half-formed block.
+        self._stub(monkeypatch, {
+            "state": "OK", "verdict": "SINGLE_NAME_RISK",
+            "headline": "",
+            "top_weight_pct": 75.0, "top_weight_ticker": "NVDA",
+            "n_stock_positions": 2,
+        })
+        assert reporter._concentration_line(fresh_store) == ""
+
+    def test_degrades_to_empty_on_non_dict(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, None)
+        assert reporter._concentration_line(fresh_store) == ""
+
+    def test_degrades_to_empty_on_builder_fault(self, fresh_store, monkeypatch):
+        from paper_trader.analytics import correlation as corr_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("correlation blew up")
+
+        monkeypatch.setattr(corr_mod, "build_correlation", _boom)
+        # Additive failure contract: a fault drops THIS line, never raises.
+        assert reporter._concentration_line(fresh_store) == ""
+
+    def test_market_value_uses_option_multiplier(self, fresh_store, monkeypatch):
+        """An option position must contribute ×100 to market_value so a 1-contract
+        NVDA call at $10 weighs ${10 \\times 100 = 1000}, not $10. Verify by
+        capturing the positions actually passed to build_correlation."""
+        from paper_trader.analytics import correlation as corr_mod
+        captured: dict = {}
+
+        def _capture(positions, *a, **k):
+            captured["positions"] = list(positions)
+            return {
+                "state": "NO_DATA", "verdict": None, "headline": "",
+                "top_weight_pct": None, "top_weight_ticker": None,
+            }
+
+        monkeypatch.setattr(corr_mod, "build_correlation", _capture)
+        # Seed a stock + option position via the store's upsert primitives.
+        fresh_store.upsert_position("NVDA", "stock", 2, 222.0)
+        fresh_store.upsert_position("AAPL", "call", 1, 10.0,
+                                     expiry="2026-06-19", strike=200.0)
+        # Update marks so the line has cur prices to work with.
+        marks = {p["id"]: (p["avg_cost"], 0.0)
+                 for p in fresh_store.open_positions()}
+        fresh_store.update_position_marks(marks)
+        # Smoke: line returns "" because builder returned NO_DATA.
+        assert reporter._concentration_line(fresh_store) == ""
+        # The sized positions passed to build_correlation must reflect the
+        # option ×100 multiplier — a regression that drops it would
+        # cataclysmically underweight options in the concentration calc.
+        sized = {p["ticker"]: p["market_value"] for p in captured["positions"]}
+        assert sized["NVDA"] == 2 * 222.0          # stock: qty × price
+        assert sized["AAPL"] == 1 * 10.0 * 100.0   # option: × 100
+
+    def test_market_value_falls_back_to_avg_cost_when_no_mark(
+            self, fresh_store, monkeypatch):
+        """A stale-mark position (current_price falls back to avg_cost) must
+        still contribute to the weight Herfindahl — otherwise a yfinance
+        outage silently halves the book's apparent concentration."""
+        from paper_trader.analytics import correlation as corr_mod
+        captured: dict = {}
+
+        def _capture(positions, *a, **k):
+            captured["positions"] = list(positions)
+            return {"state": "NO_DATA", "verdict": None, "headline": "",
+                    "top_weight_pct": None, "top_weight_ticker": None}
+
+        monkeypatch.setattr(corr_mod, "build_correlation", _capture)
+        fresh_store.upsert_position("NVDA", "stock", 2, 100.0)
+        # Don't update_position_marks → current_price stays at the default 0
+        # (the stale-mark scenario the live trader documents — see
+        # strategy._mark_to_market).
+        reporter._concentration_line(fresh_store)
+        nvda = next(p for p in captured["positions"]
+                    if p["ticker"] == "NVDA")
+        # Fell back to avg_cost × qty, not silently zeroed.
+        assert nvda["market_value"] == 2 * 100.0
+
+    def test_hourly_summary_surfaces_single_name_risk(
+            self, fresh_store, monkeypatch):
+        """End-to-end wiring: a SINGLE_NAME_RISK verdict must appear in the
+        Discord-bound hourly body and the rest of the summary must still
+        ship (the additive failure contract)."""
+        from paper_trader import host_guard
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse",
+                            lambda *a, **k: {"state": "CLEAR", "headline": ""})
+        self._stub(monkeypatch, {
+            "state": "OK", "verdict": "SINGLE_NAME_RISK",
+            "headline": "SINGLE_NAME_RISK — NVDA is 75% of the book.",
+            "top_weight_pct": 75.0, "top_weight_ticker": "NVDA",
+            "n_stock_positions": 2,
+        })
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**CONCENTRATION** ◈ SINGLE_NAME_RISK" in body
+        assert "NVDA is 75% of the book" in body
+        # Pre-existing hourly intact alongside the new block.
+        assert "**HOURLY**" in body and "Equity" in body
+
+    def test_hourly_summary_silent_when_diversified(
+            self, fresh_store, monkeypatch):
+        from paper_trader import host_guard
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse",
+                            lambda *a, **k: {"state": "CLEAR", "headline": ""})
+        self._stub(monkeypatch, {
+            "state": "OK", "verdict": "DIVERSIFIED",
+            "headline": "DIVERSIFIED — names move largely independently.",
+            "top_weight_pct": 35.0, "top_weight_ticker": "NVDA",
+            "n_stock_positions": 4,
+        })
+        assert reporter.send_hourly_summary() is True
+        assert "**CONCENTRATION**" not in captured[0]
+
+    def test_daily_close_surfaces_single_name_risk(
+            self, fresh_store, monkeypatch):
+        from paper_trader import host_guard
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse",
+                            lambda *a, **k: {"state": "CLEAR", "headline": ""})
+        self._stub(monkeypatch, {
+            "state": "OK", "verdict": "SINGLE_NAME_RISK",
+            "headline": "SINGLE_NAME_RISK — LITE is 80% of the book.",
+            "top_weight_pct": 80.0, "top_weight_ticker": "LITE",
+            "n_stock_positions": 1,
+        })
+        assert reporter.send_daily_close() is True
+        assert "**CONCENTRATION** ◈ SINGLE_NAME_RISK" in captured[0]
+        assert "LITE is 80% of the book" in captured[0]
+
+    def test_hourly_still_sends_when_builder_raises(self, fresh_store,
+                                                    monkeypatch):
+        """The whole hourly must still ship if the correlation builder
+        faults — the additive failure contract (a bad block drops one line,
+        never the report)."""
+        from paper_trader import host_guard
+        from paper_trader.analytics import correlation as corr_mod
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse",
+                            lambda *a, **k: {"state": "CLEAR", "headline": ""})
+        monkeypatch.setattr(corr_mod, "build_correlation",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                RuntimeError("builder boom")))
+        assert reporter.send_hourly_summary() is True
+        # No concentration block but the summary itself shipped.
+        assert "**CONCENTRATION**" not in captured[0]
+        assert "**HOURLY**" in captured[0]

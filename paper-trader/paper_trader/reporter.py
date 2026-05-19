@@ -1058,6 +1058,82 @@ def _capital_pulse_line(store) -> str:
         return ""
 
 
+def _concentration_line(store) -> str:
+    """One-line "is the book dangerously concentrated in one name?" for the
+    hourly / daily report.
+
+    ``/api/correlation`` exposes the SINGLE_NAME_RISK verdict (top stock-book
+    weight ≥ ``DOMINANT_WEIGHT`` = 60%) on the *dashboard*, and the
+    ``risk_mirror`` block surfaces the same fields to Opus in the *prompt*.
+    But the operator who lives in Discord never sees this verdict directly —
+    they see per-position weight %s in ``_portfolio_lines`` but no
+    categorical "this is concentration risk" alarm. The 2026-05-19 live book
+    sat at NVDA 75% of stock book, deep in SINGLE_NAME_RISK territory, with
+    nothing in Discord saying so. This routes the correlation builder's own
+    verdict to the surface the operator actually reads.
+
+    Composes ``build_correlation`` **verbatim** (single source of truth,
+    AGENTS.md invariant #10 — the verdict/headline are the builder's, never
+    re-derived, so this Discord line and ``/api/correlation`` can never tell
+    different stories). **Pure store reads only — NO network** (the
+    Discord-path discipline; ``price_history`` is intentionally not passed
+    so a per-position yfinance call is never required, mirroring the
+    risk_mirror hot-path discipline). Computes ``market_value`` per
+    position inline from the stored mark (avg_cost fallback for any
+    missing price), then feeds the same shape ``build_correlation``
+    expects. Observational only, never gates, no caps (invariants #2/#12 —
+    the ``_capital_pulse_line`` / ``_stress_line`` precedent). Failure
+    contract mirrors the rest of ``reporter``: any builder/store fault
+    degrades to ``""`` ("no concentration line this report"), **never** an
+    exception ("no Discord summary this report").
+
+    Suppression — surface ONLY ``SINGLE_NAME_RISK`` (the actionable
+    verdict, top weight ≥ 60%); MODERATE / DIVERSIFIED / INSUFFICIENT /
+    NO_DATA stay silent so a balanced book adds no hourly noise (the
+    ``_capital_pulse_line`` FREE-and-not-bleeding / ``_hold_discipline_line``
+    NO_DATA precedent — the summary must never become its own lying green
+    light). The per-position ``_portfolio_lines`` weight % continues to
+    show raw weights regardless, so a non-SINGLE_NAME_RISK book is still
+    fully diagnosable from the existing lines."""
+    try:
+        from .analytics.correlation import build_correlation
+        positions = store.open_positions()
+        sized: list[dict] = []
+        for p in positions:
+            try:
+                qty = float(p.get("qty") or 0.0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            try:
+                cur = float(p.get("current_price") or 0.0)
+            except (TypeError, ValueError):
+                cur = 0.0
+            if cur <= 0:
+                # Mark unavailable — fall back to avg_cost so a stale-mark
+                # position still contributes to the weight Herfindahl
+                # (the _portfolio_snapshot stale_mark precedent). A bad
+                # avg_cost coerces to 0 ⇒ weight 0 ⇒ position drops out.
+                try:
+                    cur = float(p.get("avg_cost") or 0.0)
+                except (TypeError, ValueError):
+                    cur = 0.0
+            ptype = (p.get("type") or "").lower()
+            mult = 100.0 if ptype in ("call", "put") else 1.0
+            sized.append({**p, "market_value": cur * qty * mult})
+        co = build_correlation(sized)
+        if not isinstance(co, dict):
+            return ""
+        if co.get("verdict") != "SINGLE_NAME_RISK":
+            return ""
+        headline = co.get("headline") or ""
+        if not headline:
+            return ""
+        return f"⚠️ **CONCENTRATION** ◈ SINGLE_NAME_RISK\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] concentration line skipped: {e}")
+        return ""
+
+
 def _host_pulse_line() -> str:
     """One-line "is the desk frozen because the *box* is overloaded?" for the
     hourly / daily report — the **#1 documented live pathology's** missing
@@ -1862,6 +1938,9 @@ def send_hourly_summary() -> bool:
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
+    cn = _concentration_line(store)
+    if cn:
+        body += "\n" + cn
     pa = _position_attention_line(store)
     if pa:
         body += "\n" + pa
@@ -1965,6 +2044,9 @@ def send_daily_close() -> bool:
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
+    cn = _concentration_line(store)
+    if cn:
+        body += "\n" + cn
     pa = _position_attention_line(store)
     if pa:
         body += "\n" + pa
