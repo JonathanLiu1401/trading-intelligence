@@ -270,10 +270,32 @@ class Store:
         return [dict(r) for r in rows]
 
     def closed_positions(self, limit: int = 100) -> list[dict]:
-        """Closed position lots with realized P&L summed from trades that ran
-        against the same (ticker,type,expiry,strike) tuple inside the lot's
-        [opened_at, closed_at] window. SELL/CLOSE legs add to realized; BUY/OPEN
-        legs subtract. Returns newest-closed first."""
+        """Closed position lots with realized P&L computed from the round-trip
+        of trades that ran on the same (ticker,type,expiry,strike) key.
+
+        Walks every trade on the key chronologically and picks out the
+        round-trip whose final close lands at or before this lot's
+        ``closed_at``: held qty starts at 0, BUYs add, SELLs subtract, and
+        every time held returns to ≈0 a round-trip closes. We pick the
+        round-trip whose closing trade matches the lot's ``closed_at`` (or
+        the latest one ≤ ``closed_at`` when the timestamps don't byte-match).
+
+        The previous implementation used a naive ``timestamp >= opened_at``
+        SQL window. ``record_trade`` runs *before* ``upsert_position`` in the
+        live trader (see strategy._execute), so the opening BUY's
+        ``timestamp`` lands a few microseconds BEFORE the position row's
+        ``opened_at`` — observed live: 290µs–3ms gap. The window therefore
+        skipped every opening BUY and ``realized_pl`` reported only the
+        SELL proceeds, hugely overstating every closed lot's P/L on
+        /api/closed-positions. The same flaw made the BUY_CALL/SELL_CALL fix
+        invisible (the option BUY was missed even when matched correctly).
+
+        ``startswith`` matches every documented entry/exit action the live
+        trader writes (BUY, BUY_CALL, BUY_PUT and SELL, SELL_CALL, SELL_PUT);
+        any non-BUY/SELL action (REBALANCE, OPEN, etc.) is ignored.
+
+        Returns newest-closed first.
+        """
         with self._lock:
             rows = self.conn.execute(
                 "SELECT * FROM positions WHERE closed_at IS NOT NULL "
@@ -285,25 +307,72 @@ class Store:
                 d = dict(r)
                 ptype = (d.get("type") or "").lower()
                 opt = ptype if ptype in ("call", "put") else None
-                trades = self.conn.execute(
-                    "SELECT action, value FROM trades "
+                all_trades = self.conn.execute(
+                    "SELECT timestamp, action, value, qty FROM trades "
                     "WHERE ticker=? AND IFNULL(option_type,'')=IFNULL(?,'') "
                     "AND IFNULL(expiry,'')=IFNULL(?,'') "
                     "AND IFNULL(strike,0)=IFNULL(?,0) "
-                    "AND timestamp >= ? AND timestamp <= ?",
-                    (d["ticker"], opt, d.get("expiry"),
-                     d.get("strike"), d["opened_at"], d["closed_at"]),
+                    "ORDER BY timestamp ASC, id ASC",
+                    (d["ticker"], opt, d.get("expiry"), d.get("strike")),
                 ).fetchall()
-                realized = 0.0
-                for t in trades:
+                closed_at = d["closed_at"]
+                # Identify the round-trip that ends at this lot's closed_at.
+                # Walk every trade for the key; whenever held returns to ≈0
+                # we have a completed round-trip slice. Pick the slice whose
+                # closing-trade timestamp is the latest one ≤ closed_at.
+                held = 0.0
+                start_idx = 0
+                round_trips: list[tuple[int, int, str]] = []
+                for i, t in enumerate(all_trades):
                     act = (t["action"] or "").upper()
-                    val = float(t["value"] or 0.0)
-                    if act in ("SELL", "CLOSE", "SELL_TO_CLOSE"):
-                        realized += val
-                    elif act in ("BUY", "OPEN", "BUY_TO_OPEN"):
-                        realized -= val
+                    try:
+                        q = float(t["qty"] or 0.0)
+                    except (TypeError, ValueError):
+                        q = 0.0
+                    if act.startswith("BUY"):
+                        if abs(held) < 1e-6:
+                            start_idx = i
+                        held += q
+                    elif act.startswith("SELL"):
+                        held -= q
+                        if abs(held) < 1e-6:
+                            round_trips.append(
+                                (start_idx, i, t["timestamp"] or "")
+                            )
+                # Pick the trip whose close ts == lot's closed_at when present,
+                # otherwise the most recent trip that finished by closed_at.
+                # ISO-8601 strings compare lexically.
+                chosen: tuple[int, int, str] | None = None
+                for tr in round_trips:
+                    if tr[2] == closed_at:
+                        chosen = tr
+                        break
+                if chosen is None:
+                    for tr in round_trips:
+                        if not closed_at or tr[2] <= closed_at:
+                            chosen = tr  # last one wins (newest <= closed_at)
+                realized = 0.0
+                cost = 0.0
+                proceeds = 0.0
+                n_trades = 0
+                if chosen is not None:
+                    lo, hi, _ts = chosen
+                    for t in all_trades[lo:hi + 1]:
+                        act = (t["action"] or "").upper()
+                        val = float(t["value"] or 0.0)
+                        if act.startswith("SELL"):
+                            proceeds += val
+                            realized += val
+                        elif act.startswith("BUY"):
+                            cost += val
+                            realized -= val
+                        n_trades += 1
                 d["realized_pl"] = round(realized, 2)
-                d["n_trades"] = len(trades)
+                d["cost"] = round(cost, 2)
+                d["proceeds"] = round(proceeds, 2)
+                d["realized_pl_pct"] = (round(realized / cost * 100.0, 2)
+                                        if cost > 1e-9 else None)
+                d["n_trades"] = n_trades
                 out.append(d)
             return out
 

@@ -51,16 +51,41 @@ def _signature(title: str | None) -> str:
     """Lowercased first-N-alphanumeric-token signature of a headline.
 
     Leading wire-service editorial markers ("UPDATE 2-", "RPT-", "BREAKING:")
-    and trailing source attribution ("...blowout - Reuters", "(Bloomberg)")
-    are both stripped first — otherwise the most heavily syndicated stories
-    (the ones with the most revisions and attributed reposts) would dedup the
-    least. Once markers and attribution are gone, verbatim reposts collide
-    outright and minor suffix/revision variants collide too.
+    and source attribution ("...blowout - Reuters", "(Bloomberg)") are both
+    stripped first — otherwise the most heavily syndicated stories (the ones
+    with the most revisions and attributed reposts) would dedup the least.
+
+    Source attribution can appear at the START as well as at the END of a
+    headline ("FinancialContent - Nvidia (NVDA) Reports Earnings Tomorrow",
+    "Zacks - MU beats Q3 estimates", "Reuters - Fed surprises with 50bp cut").
+    A naive ``_SOURCE_SEP.split(head)[0]`` collapses those to the bare
+    publisher tag ("financialcontent", "zacks", "reuters") — a one-token
+    signature that can never match the canonical bare form, so cross-cycle
+    suppression, in-batch dedup, AND the briefing's [ALERTED] parity tag all
+    silently miss every front-attributed copy. Live evidence (2026-05-19):
+    "Nvidia (NVDA) reports earnings tomorrow" fired THREE separate BREAKING
+    pushes within 2.5h — one bare ("nvidia nvda reports earnings tomorrow
+    ...") and one front-attributed by FinancialContent that collapsed to
+    "financialcontent" and bypassed the 6h cross-cycle TTL.
+
+    Pick the LONGEST split part by word count. Publisher tags are short
+    (1-2 tokens — "Reuters", "FinancialContent", "Motley Fool"); the real
+    headline carries more words. ``max`` returns the FIRST occurrence on
+    ties so:
+      * the no-separator case (single part) is byte-identical to before;
+      * the canonical trailing-attribution case ("Micron shares ... - Reuters")
+        keeps the longer leading part — same result as ``[0]``;
+      * front-attribution ("FinancialContent - Nvidia (NVDA) ...") now picks
+        the trailing real headline instead of the publisher.
     """
     if not title:
         return ""
     head = _WIRE_PREFIX.sub("", title.strip())
-    head = _SOURCE_SEP.split(head)[0]
+    parts = _SOURCE_SEP.split(head)
+    if len(parts) > 1:
+        head = max(parts, key=lambda p: len(_WORD.findall(p.lower())))
+    else:
+        head = parts[0]
     head = _TRAIL_PAREN.sub("", head)
     return " ".join(_WORD.findall(head.lower())[:_DEDUP_TOKENS])
 

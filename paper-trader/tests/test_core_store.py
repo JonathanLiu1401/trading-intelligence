@@ -263,6 +263,151 @@ class TestUpdatePositionMarks:
         assert pos["unrealized_pl"] == 200.0
 
 
+class TestClosedPositionsRealizedPL:
+    """``store.closed_positions`` rolls up realized P/L per closed lot by
+    summing matching trade rows inside the lot's [opened_at, closed_at]
+    window. Each of these locks a specific behaviour a trader relies on
+    when reading ``/api/closed-positions`` after the bell."""
+
+    def test_stock_round_trip_realized_pl(self, fresh_store):
+        """A simple BUY → SELL on a stock at a higher price.
+
+        Cost  = 10 * 50 = 500
+        Proceeds = 10 * 60 = 600
+        Realized P/L = +100. The endpoint's % framing is gross P/L / cost.
+        """
+        fresh_store.record_trade("AMD", "BUY", qty=10, price=50.0, reason="")
+        fresh_store.upsert_position("AMD", "stock", qty=10, avg_cost=50.0)
+        fresh_store.record_trade("AMD", "SELL", qty=10, price=60.0, reason="")
+        fresh_store.upsert_position("AMD", "stock", qty=-10, avg_cost=60.0)
+        closed = fresh_store.closed_positions()
+        assert len(closed) == 1
+        c = closed[0]
+        assert c["ticker"] == "AMD"
+        assert c["realized_pl"] == 100.0
+        assert c["cost"] == 500.0
+        assert c["proceeds"] == 600.0
+        assert c["realized_pl_pct"] == 20.0  # 100 / 500 * 100
+
+    def test_stock_losing_round_trip(self, fresh_store):
+        """A BUY → SELL at a lower price → negative realized."""
+        fresh_store.record_trade("AMD", "BUY", qty=5, price=100.0, reason="")
+        fresh_store.upsert_position("AMD", "stock", qty=5, avg_cost=100.0)
+        fresh_store.record_trade("AMD", "SELL", qty=5, price=80.0, reason="")
+        fresh_store.upsert_position("AMD", "stock", qty=-5, avg_cost=80.0)
+        c = fresh_store.closed_positions()[0]
+        # Loss: 5 * (80 - 100) = -100
+        assert c["realized_pl"] == -100.0
+        assert c["realized_pl_pct"] == -20.0
+
+    def test_option_round_trip_realized_pl_is_not_zero(self, fresh_store):
+        """REGRESSION: an option round-trip used to report $0 realized.
+
+        The OLD code matched only ``("SELL","CLOSE","SELL_TO_CLOSE")`` and
+        ``("BUY","OPEN","BUY_TO_OPEN")`` — exact strings — so the live
+        trader's ``BUY_CALL`` / ``SELL_CALL`` actions silently fell out of
+        both arms and every option close on /api/closed-positions read as
+        breakeven. The fix uses ``startswith("BUY")`` / ``startswith("SELL")``
+        which matches every documented entry/exit action.
+
+        Cost  = 2 * 5  * 100 = 1000  (the contract multiplier)
+        Proceeds = 2 * 8  * 100 = 1600
+        Realized P/L = +600.
+        """
+        fresh_store.record_trade(
+            "NVDA", "BUY_CALL", qty=2, price=5.0, reason="bullish",
+            option_type="call", strike=600.0, expiry="2026-12-19",
+        )
+        fresh_store.upsert_position(
+            "NVDA", "call", qty=2, avg_cost=5.0,
+            expiry="2026-12-19", strike=600.0,
+        )
+        fresh_store.record_trade(
+            "NVDA", "SELL_CALL", qty=2, price=8.0, reason="profit-take",
+            option_type="call", strike=600.0, expiry="2026-12-19",
+        )
+        fresh_store.upsert_position(
+            "NVDA", "call", qty=-2, avg_cost=8.0,
+            expiry="2026-12-19", strike=600.0,
+        )
+        closed = fresh_store.closed_positions()
+        assert len(closed) == 1, "the call lot must appear in closed_positions"
+        c = closed[0]
+        assert c["type"] == "call"
+        assert c["ticker"] == "NVDA"
+        assert c["strike"] == 600.0
+        assert c["expiry"] == "2026-12-19"
+        # The bug pinning: this MUST NOT be zero.
+        assert c["realized_pl"] != 0, (
+            "option round-trip realized_pl reported $0 — the action filter "
+            "is missing BUY_CALL / SELL_CALL (regression)"
+        )
+        assert c["realized_pl"] == 600.0
+        assert c["cost"] == 1000.0
+        assert c["proceeds"] == 1600.0
+        assert c["realized_pl_pct"] == 60.0  # 600 / 1000 * 100
+
+    def test_put_round_trip_losing(self, fresh_store):
+        """SAME regression on the PUT path — BUY_PUT/SELL_PUT must also
+        contribute to realized."""
+        fresh_store.record_trade(
+            "SPY", "BUY_PUT", qty=1, price=3.0, reason="hedge",
+            option_type="put", strike=500.0, expiry="2026-06-19",
+        )
+        fresh_store.upsert_position(
+            "SPY", "put", qty=1, avg_cost=3.0,
+            expiry="2026-06-19", strike=500.0,
+        )
+        fresh_store.record_trade(
+            "SPY", "SELL_PUT", qty=1, price=1.0, reason="bleeding",
+            option_type="put", strike=500.0, expiry="2026-06-19",
+        )
+        fresh_store.upsert_position(
+            "SPY", "put", qty=-1, avg_cost=1.0,
+            expiry="2026-06-19", strike=500.0,
+        )
+        c = fresh_store.closed_positions()[0]
+        # Cost = 1 * 3 * 100 = 300; Proceeds = 1 * 1 * 100 = 100; PL = -200.
+        assert c["realized_pl"] == -200.0
+        assert c["realized_pl_pct"] == pytest.approx(-66.67, abs=0.01)
+
+    def test_partial_close_then_full_close(self, fresh_store):
+        """Two SELLs covering a 10-share BUY: realized aggregates across
+        them once the lot fully closes."""
+        fresh_store.record_trade("MU", "BUY", qty=10, price=100.0, reason="")
+        fresh_store.upsert_position("MU", "stock", qty=10, avg_cost=100.0)
+        fresh_store.record_trade("MU", "SELL", qty=4, price=110.0, reason="")
+        fresh_store.upsert_position("MU", "stock", qty=-4, avg_cost=110.0)
+        # Still open — should not appear in closed_positions yet.
+        assert fresh_store.closed_positions() == []
+        fresh_store.record_trade("MU", "SELL", qty=6, price=120.0, reason="")
+        fresh_store.upsert_position("MU", "stock", qty=-6, avg_cost=120.0)
+        c = fresh_store.closed_positions()[0]
+        # Cost = 1000. Proceeds = 4*110 + 6*120 = 440 + 720 = 1160.
+        assert c["realized_pl"] == 160.0
+        assert c["proceeds"] == 1160.0
+
+    def test_summary_win_rate_via_endpoint_shape(self, fresh_store):
+        """closed_positions returns newest-closed first — the same order the
+        endpoint's summary section relies on for win/loss bucketing."""
+        # Winner first (closed earlier).
+        fresh_store.record_trade("A", "BUY", qty=1, price=10.0, reason="")
+        fresh_store.upsert_position("A", "stock", qty=1, avg_cost=10.0)
+        fresh_store.record_trade("A", "SELL", qty=1, price=20.0, reason="")
+        fresh_store.upsert_position("A", "stock", qty=-1, avg_cost=20.0)
+        # Loser second (closed later).
+        fresh_store.record_trade("B", "BUY", qty=1, price=30.0, reason="")
+        fresh_store.upsert_position("B", "stock", qty=1, avg_cost=30.0)
+        fresh_store.record_trade("B", "SELL", qty=1, price=10.0, reason="")
+        fresh_store.upsert_position("B", "stock", qty=-1, avg_cost=10.0)
+        lots = fresh_store.closed_positions()
+        # Newest-closed first.
+        assert [p["ticker"] for p in lots] == ["B", "A"]
+        # Per-lot sign matches the price direction.
+        assert lots[0]["realized_pl"] < 0
+        assert lots[1]["realized_pl"] > 0
+
+
 class TestGetPortfolioResilience:
     """get_portfolio() must never 500 the dashboard on a transient bad row.
 
