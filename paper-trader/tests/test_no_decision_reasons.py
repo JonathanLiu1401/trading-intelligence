@@ -50,6 +50,50 @@ class TestBucketFor:
             "claude returned no response (timeout/empty)")
             == "model_empty")
 
+    def test_claude_call_subcause_buckets(self):
+        # ``strategy._claude_call`` now sets a per-call cause code that
+        # ``decide()`` surfaces as the parenthesised suffix. These five
+        # sub-buckets must be matched BEFORE the legacy ``model_empty``
+        # fallback — otherwise the new diagnostic detail disappears into
+        # the same "restart the runner" line, defeating the entire point
+        # of the split. The order of the prefix substring checks inside
+        # ``_bucket_for`` is the load-bearing piece; this test guards
+        # against a future edit that re-orders them.
+        cases = [
+            ("claude returned no response (timeout)", "model_timeout"),
+            ("claude returned no response (nonzero_rc)", "cli_nonzero_rc"),
+            ("claude returned no response (empty_stdout)", "cli_empty_stdout"),
+            ("claude returned no response (cli_missing)", "cli_missing"),
+            ("claude returned no response (exception)", "cli_exception"),
+        ]
+        for reason, expected in cases:
+            assert ndr._bucket_for(reason) == expected, (reason, expected)
+
+    def test_each_subcause_has_distinct_recommendation(self):
+        # The fix is different for each sub-cause — a timeout wants a runner
+        # restart, a nonzero_rc wants you to wait one cycle, a cli_missing
+        # wants you to reinstall the CLI. A copy-paste regression that
+        # collapsed them all to the same string would silently re-introduce
+        # the very misdirection this feature exists to prevent.
+        recs = {
+            b: ndr._RECOMMENDATIONS[b]
+            for b in ("model_timeout", "cli_nonzero_rc", "cli_empty_stdout",
+                      "cli_missing", "cli_exception", "model_empty")
+        }
+        # Distinct text per bucket.
+        assert len(set(recs.values())) == len(recs)
+        # cli_missing must not say "restart the runner" — a PATH regression
+        # is unaffected by a runner restart.
+        assert "restart the runner" not in recs["cli_missing"].lower()
+        # cli_nonzero_rc must not say "restart" as the primary fix — the
+        # observed live behaviour is upstream API blips that resolve in one
+        # or two cycles.
+        assert "wait" in recs["cli_nonzero_rc"].lower()
+        # cli_empty_stdout must NOT say "restart" — it's a one-cycle blip,
+        # not a wedged CLI.
+        first_clause = recs["cli_empty_stdout"].split(".")[0].lower()
+        assert "restart" not in first_clause
+
     def test_parse_and_retry_failed(self):
         assert ndr._bucket_for("parse_failed: garbage prose returned") \
             == "parse_failed"

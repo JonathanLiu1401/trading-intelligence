@@ -73,6 +73,178 @@ class TestParseDecision:
         assert d["ticker"] == "NVDA"
 
 
+# ─────────────────────────── _claude_call failure-cause tracking ───────────────────────────
+
+class TestLastClaudeFail:
+    """``_claude_call`` now sets ``strategy._last_claude_fail`` on every
+    failure path with a short cause code (or None on success). decide()
+    surfaces it in the NO_DECISION reasoning so no_decision_reasons can
+    bucket the empty-response case by *why* the CLI was empty (timeout vs
+    rc!=0 vs empty stdout vs missing CLI). A regression here turns the
+    whole feature back into a single ``model_empty`` line."""
+
+    def _reset(self):
+        strategy._last_claude_fail = None
+        strategy._quota_exhausted = False
+        strategy._active_claude_proc = None
+
+    def test_cli_missing_sets_cli_missing(self, monkeypatch):
+        self._reset()
+        monkeypatch.setattr(strategy.shutil, "which", lambda _: None)
+        assert strategy._claude_call("p") is None
+        assert strategy._last_claude_fail == "cli_missing"
+
+    def test_timeout_sets_timeout(self, monkeypatch):
+        import subprocess as sp
+        self._reset()
+        monkeypatch.setattr(strategy.shutil, "which", lambda _: "/usr/bin/claude")
+
+        class _FakeProc:
+            def __init__(self):
+                self.returncode = None
+
+            def communicate(self, input=None, timeout=None):  # noqa: A002
+                raise sp.TimeoutExpired(cmd="claude", timeout=timeout)
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+        monkeypatch.setattr(strategy.subprocess, "Popen",
+                            lambda *a, **k: _FakeProc())
+        assert strategy._claude_call("p", timeout_s=1) is None
+        assert strategy._last_claude_fail == "timeout"
+
+    def test_empty_stdout_sets_empty_stdout(self, monkeypatch):
+        self._reset()
+        monkeypatch.setattr(strategy.shutil, "which", lambda _: "/usr/bin/claude")
+
+        class _FakeProc:
+            def __init__(self):
+                self.returncode = 0
+
+            def communicate(self, input=None, timeout=None):  # noqa: A002
+                return ("", "")
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return self.returncode
+
+        monkeypatch.setattr(strategy.subprocess, "Popen",
+                            lambda *a, **k: _FakeProc())
+        assert strategy._claude_call("p", timeout_s=1) is None
+        assert strategy._last_claude_fail == "empty_stdout"
+
+    def test_nonzero_rc_sets_nonzero_rc(self, monkeypatch):
+        self._reset()
+        monkeypatch.setattr(strategy.shutil, "which", lambda _: "/usr/bin/claude")
+
+        class _FakeProc:
+            def __init__(self):
+                self.returncode = 1
+
+            def communicate(self, input=None, timeout=None):  # noqa: A002
+                return ("transient upstream error", "")
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+        monkeypatch.setattr(strategy.subprocess, "Popen",
+                            lambda *a, **k: _FakeProc())
+        assert strategy._claude_call("p", timeout_s=1) is None
+        assert strategy._last_claude_fail == "nonzero_rc"
+        # And the quota flag must NOT be set — the error text has no quota
+        # marker. cli_nonzero_rc and quota_exhausted are deliberately
+        # different paths with different operator actions.
+        assert strategy._quota_exhausted is False
+
+    def test_quota_marker_does_not_set_nonzero_rc(self, monkeypatch):
+        # When the rc!=0 output looks like a quota rejection, the dedicated
+        # quota flag wins and _last_claude_fail stays None — decide()'s
+        # quota_exhausted branch owns the reason text in that case.
+        self._reset()
+        monkeypatch.setattr(strategy.shutil, "which", lambda _: "/usr/bin/claude")
+
+        class _FakeProc:
+            def __init__(self):
+                self.returncode = 1
+
+            def communicate(self, input=None, timeout=None):  # noqa: A002
+                return ("you've hit your org's monthly usage limit", "")
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+        monkeypatch.setattr(strategy.subprocess, "Popen",
+                            lambda *a, **k: _FakeProc())
+        assert strategy._claude_call("p", timeout_s=1) is None
+        assert strategy._quota_exhausted is True
+        assert strategy._last_claude_fail is None
+
+    def test_exception_sets_exception(self, monkeypatch):
+        self._reset()
+        monkeypatch.setattr(strategy.shutil, "which", lambda _: "/usr/bin/claude")
+
+        def _boom(*a, **k):
+            raise OSError("Popen failed")
+
+        monkeypatch.setattr(strategy.subprocess, "Popen", _boom)
+        assert strategy._claude_call("p", timeout_s=1) is None
+        assert strategy._last_claude_fail == "exception"
+
+    def test_success_resets_to_none(self, monkeypatch):
+        # A previous failure must NOT leak into a successful call's slot;
+        # otherwise a successful cycle following a failed one would record
+        # a stale reason if decide() ever read the variable post-success.
+        self._reset()
+        strategy._last_claude_fail = "timeout"  # simulate leftover state
+        monkeypatch.setattr(strategy.shutil, "which", lambda _: "/usr/bin/claude")
+
+        class _FakeProc:
+            def __init__(self):
+                self.returncode = 0
+
+            def communicate(self, input=None, timeout=None):  # noqa: A002
+                return ('{"action": "HOLD"}', "")
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return self.returncode
+
+        monkeypatch.setattr(strategy.subprocess, "Popen",
+                            lambda *a, **k: _FakeProc())
+        out = strategy._claude_call("p", timeout_s=1)
+        assert out == '{"action": "HOLD"}'
+        assert strategy._last_claude_fail is None
+
+
 # ─────────────────────────── indicator helpers ───────────────────────────
 
 class TestRSILive:

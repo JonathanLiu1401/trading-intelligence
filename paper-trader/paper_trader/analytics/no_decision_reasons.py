@@ -73,6 +73,50 @@ _RECOMMENDATIONS: dict[str, str] = {
         "(review agents / backtest committee). Reduce parallel Opus jobs, "
         "or wait for the storm to clear; a runner restart does NOT help."
     ),
+    # Sub-buckets of the legacy ``model_empty`` (the empty-response case).
+    # ``strategy._claude_call`` now sets a per-call cause code which surfaces
+    # as ``claude returned no response (timeout|nonzero_rc|empty_stdout|
+    # cli_missing|exception)``. Each sub-cause has a different fix: a
+    # ``timeout`` is the wedge case the legacy "restart the runner" line
+    # was written for; ``nonzero_rc`` means the CLI itself is crashing
+    # (usually a transient API error); ``empty_stdout`` is rc=0 with no
+    # output (model-level blank, almost always a one-cycle blip — restart
+    # is overkill); ``cli_missing`` means the ``claude`` binary is gone
+    # from PATH (deploy / env regression); ``exception`` means the Popen
+    # call itself raised (a system-level issue, not a model one).
+    "model_timeout": (
+        "Claude timed out (full request budget exhausted). Most often a "
+        "wedged CLI subprocess: restart the runner so the auto-recovery "
+        "breaker reaps the stale claude process and the next cycle gets a "
+        "fresh one. If it persists across restarts, suspect network /"
+        " upstream Anthropic latency."
+    ),
+    "cli_nonzero_rc": (
+        "The claude CLI exited non-zero (and not a quota rejection). Usually "
+        "a transient upstream API error or a temporary auth blip — wait one "
+        "or two cycles. If it persists, run `claude --print --model "
+        "claude-opus-4-7` by hand to read the actual error message; "
+        "restarting the runner does NOT fix an upstream API problem."
+    ),
+    "cli_empty_stdout": (
+        "The claude CLI exited cleanly but returned no text (rc=0, empty "
+        "stdout). Distinct from a timeout — the model itself returned blank. "
+        "Almost always a one-cycle blip; restart is overkill. If it "
+        "repeats, retry with the JSON-only nudge or try the Sonnet "
+        "fallback by lowering MODEL temporarily."
+    ),
+    "cli_missing": (
+        "The ``claude`` binary is missing from PATH at decide() time. "
+        "Deploy / environment regression — neither a runner restart nor "
+        "waiting will help. Reinstall the Claude CLI or fix the PATH on "
+        "the trader host."
+    ),
+    "cli_exception": (
+        "Popen / communicate raised an exception (system-level failure, "
+        "not a model one). Check disk space, file-handle limits, and the "
+        "[strategy] claude exception: line in runner.log — restarting the "
+        "runner is unlikely to help if the underlying OS issue persists."
+    ),
     "model_empty": (
         "Claude returned no response (timeout/empty). Most often a wedged "
         "CLI: restart the runner so the auto-recovery breaker reaps the "
@@ -118,6 +162,25 @@ def _bucket_for(reason: str | None) -> str:
         return "parse_failed"
     if r.startswith("retry_failed"):
         return "retry_failed"
+    # Sub-buckets of the empty-response case, keyed off the cause code
+    # ``strategy._claude_call`` writes into the parenthesised suffix. Match
+    # specific causes FIRST — every one of these strings still contains
+    # "no response" and would otherwise fall through to the legacy
+    # ``model_empty`` bucket. The order within is irrelevant (mutually
+    # exclusive substrings); the ``model_empty`` fallback below remains the
+    # back-compat path for any caller that didn't set a cause (legacy DB rows
+    # plus the literal "timeout/empty" default when ``_last_claude_fail`` was
+    # None at decide() time).
+    if "no response (timeout)" in r:
+        return "model_timeout"
+    if "no response (nonzero_rc)" in r:
+        return "cli_nonzero_rc"
+    if "no response (empty_stdout)" in r:
+        return "cli_empty_stdout"
+    if "no response (cli_missing)" in r:
+        return "cli_missing"
+    if "no response (exception)" in r:
+        return "cli_exception"
     if "no response" in r or "timeout/empty" in r:
         return "model_empty"
     return "other"
@@ -201,12 +264,23 @@ def build_no_decision_reasons(
     # sorting on (-count, _ACTION_RANK[bucket]) so e.g. a 50/50 split of
     # quota_exhausted and other never reports "other" as dominant.
     rank = {
+        # Most operator-actionable first (lowest rank wins on ties).
+        # Quota / host outranks model timeouts (a saturation diagnosis is
+        # more actionable than a generic wedge). cli_missing outranks
+        # cli_exception (PATH regression is a definite fix; an exception
+        # tail is "go read the log"). Sub-buckets keep model_empty below
+        # them so a tied "specific 5 vs generic 5" prefers the specific.
         "quota_exhausted": 0,
         "host_saturated": 1,
         "parse_failed": 2,
         "retry_failed": 3,
-        "model_empty": 4,
-        "other": 5,
+        "cli_missing": 4,
+        "model_timeout": 5,
+        "cli_nonzero_rc": 6,
+        "cli_empty_stdout": 7,
+        "cli_exception": 8,
+        "model_empty": 9,
+        "other": 10,
     }
     items = sorted(counts.items(), key=lambda kv: (-kv[1], rank.get(kv[0], 99)))
     top_name, top_n = items[0]
