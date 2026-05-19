@@ -610,6 +610,22 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
                 # reasoning) or on SELL (the gate modulates BUY only).
                 "gate_scorer_pred": gate_scorer_pred,
                 "gate_off_dist": gate_off_dist,
+                # Additive 52-week position signal (0=at low, 1=at high) and
+                # %-from-52-week-high. Already computed by
+                # `_compute_technical_indicators` and consumed by
+                # `_ml_decide`'s bubble-top gate (`wk52_pos > 0.80` suppresses
+                # the BUY) — yet was never persisted to outcomes. Capturing it
+                # here lets downstream research tools (`baseline_compare`,
+                # `regime_audit`, ad-hoc Jupyter analysis) test whether the
+                # documented 52-week-high gate explanation actually
+                # corresponds to a realized forward-return shift. The scorer
+                # is unchanged: `train_scorer`/`build_features` ignore extra
+                # dict keys, so this is purely additive — same operational
+                # discipline as the `forward_return_10d/20d` precedent. None
+                # when `_compute_technical_indicators` had insufficient
+                # history (<60 closes) for this ticker at sim_date.
+                "wk52_pos": q.get("wk52_pos"),
+                "pct_from_52h": q.get("pct_from_52h"),
                 "return_pct": run.total_return_pct,
             })
 
