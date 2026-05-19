@@ -1487,8 +1487,63 @@ def _pos_hold_age_token(p: dict, now: datetime | None = None) -> str:
     return f"  held {int(secs // 86400)}d"
 
 
+def _pos_earnings_token(p: dict, events_by_ticker: dict | None) -> str:
+    """Compact ``  ⚠ ER 0.7d`` / ``  ER 7.7d`` token from the earnings
+    snapshot.
+
+    Same observational-only, additive contract as ``_pos_pct_weight`` /
+    ``_pos_hold_age_token`` (invariants #2/#12 — the stale_mark precedent).
+    The decision prompt already gets the earnings calendar via
+    ``build_event_calendar``, but the *operator's* Discord summary surfaced
+    the per-position weight and the hold age with NO indication that the
+    name reports in <1d. A trader scanning the hourly summary sees a 75%
+    NVDA position with no signal that earnings are tomorrow — the exact
+    "held into the print, blind" failure ``event_calendar`` exists to close
+    on the decision side, mirrored to the operator side.
+
+    Returns ``""`` when:
+      * ``events_by_ticker`` is None / empty (callers without earnings data
+        — existing unit-test callers — stay byte-compatible);
+      * the position's ticker is absent from the events map;
+      * ``days_away`` is missing / non-numeric (a corrupt event row degrades
+        silently — the additive contract).
+
+    ``  ⚠ ER Xd`` for tier ``HELD_IMMINENT`` (≤3d — flag, must-see) and
+    ``  ER Xd`` otherwise (HELD_SOON within horizon — informational, no flag
+    to keep the line compact when the print is still weeks away). The
+    ``days_away`` formatter uses 1 decimal so a sub-day distance reads
+    accurate (0.7d) and a same-day post-bell event (days_away < 0) reads
+    explicitly as ``after close`` rather than rendering a confusing
+    ``-0.1d``.
+    """
+    if not events_by_ticker:
+        return ""
+    ticker = (p.get("ticker") or "").upper()
+    if not ticker:
+        return ""
+    ev = events_by_ticker.get(ticker)
+    if not isinstance(ev, dict):
+        return ""
+    try:
+        days = float(ev.get("days_away"))
+    except (TypeError, ValueError):
+        return ""
+    tier = ev.get("tier") or ""
+    if days < 0:
+        # Same-day-post-bell — the event has just happened. Surface it
+        # rather than hiding (the trader's first question after a print is
+        # "did I hold through that?").
+        if tier == "HELD_IMMINENT":
+            return "  ⚠ ER after close"
+        return "  ER after close"
+    if tier == "HELD_IMMINENT":
+        return f"  ⚠ ER {days:.1f}d"
+    return f"  ER {days:.1f}d"
+
+
 def _portfolio_lines(positions: list[dict],
-                     total_value: float | None = None) -> list[str]:
+                     total_value: float | None = None,
+                     events_by_ticker: dict | None = None) -> list[str]:
     lines = []
     for p in positions:
         # Additive: only positions carrying an explicit ``stale_mark`` True
@@ -1509,17 +1564,80 @@ def _portfolio_lines(positions: list[dict],
         # opened_at is absent (existing test callers), so the existing
         # byte-compatible assertions stay locked.
         age = _pos_hold_age_token(p)
+        # Per-position earnings flag — observational, additive, opt-in
+        # (events_by_ticker defaults to None → token is ""). Surfaces the
+        # forward earnings event the decision prompt already sees, on the
+        # operator's Discord surface.
+        er = _pos_earnings_token(p, events_by_ticker)
         if p["type"] in ("call", "put"):
             lines.append(
                 f"  {p['ticker']} {p['type'].upper()}{p['strike']} {p['expiry']}  "
-                f"qty {p['qty']}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{age}{stale}"
+                f"qty {p['qty']}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{age}{er}{stale}"
             )
         else:
             lines.append(
                 f"  {p['ticker']:<6} qty {p['qty']:<8} avg ${p['avg_cost']:.2f} "
-                f"now ${(p.get('current_price') or 0):.2f}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{age}{stale}"
+                f"now ${(p.get('current_price') or 0):.2f}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{age}{er}{stale}"
             )
     return lines
+
+
+def _earnings_events_by_ticker() -> dict | None:
+    """Resolve the earnings snapshot via ``build_event_calendar`` (the SAME
+    source the Opus decision prompt already sees — invariant #10 single
+    source of truth) and reshape it as ``{ticker: event_dict}`` for the
+    per-position lookup in ``_portfolio_lines``.
+
+    Pure filesystem read inside the builder (the ``signals.py`` /
+    ``event_calendar`` precedent — NO network on the Discord path, the
+    ``_concentration_line`` discipline). Wrapped end-to-end: any builder
+    fault returns ``None`` so the calling line drops the earnings token but
+    the whole hourly / daily summary still ships (the reporter additive
+    failure contract: a side block must never take down the whole report).
+
+    Returns ``None`` when:
+      * the calendar file is missing / stale / corrupt (``source_ok=False``);
+      * the builder raises (``import`` error / disk fault / future-incompat);
+      * positions / in-play resolution fails.
+
+    Returns ``{}`` when the calendar is fine but no held / in-play name has
+    a print within the 14d horizon — the per-position token then renders
+    empty for every position (byte-identical to the calendar-unavailable
+    branch from the rendered position lines' perspective)."""
+    try:
+        from .analytics.event_calendar import build_event_calendar
+        store = get_store()
+        positions = store.open_positions()
+        held = {(p.get("ticker") or "").upper()
+                for p in positions if p.get("ticker")}
+        # Mirror strategy.decide's scope: held ∪ FULL WATCHLIST so a name
+        # the trader is *about* to add (not yet held) shows the earnings
+        # flag through the position line eventually. Practically here only
+        # held names matter (the line iterates positions), but build the
+        # scope consistently with the prompt-side caller so a future
+        # extension to /api/portfolio doesn't re-narrow the view.
+        try:
+            from .strategy import WATCHLIST
+            in_play = held | {t.upper() for t in WATCHLIST}
+        except Exception:
+            in_play = held
+        rep = build_event_calendar(positions, in_play)
+        if not isinstance(rep, dict):
+            return None
+        if not rep.get("source_ok"):
+            return None
+        out: dict[str, dict] = {}
+        for ev in rep.get("events") or []:
+            if not isinstance(ev, dict):
+                continue
+            tk = (ev.get("ticker") or "").upper()
+            if not tk:
+                continue
+            out[tk] = ev
+        return out
+    except Exception as e:
+        print(f"[reporter] earnings token skipped: {e}")
+        return None
 
 
 def _singleton_lock_line() -> str:
@@ -2151,6 +2269,7 @@ def send_hourly_summary() -> bool:
     ] or ["  (no trades yet)"]
 
     sp_line = f"S&P 500: {sp:.2f}" if sp else "S&P 500: N/A"
+    events_by_ticker = _earnings_events_by_ticker()
 
     body = (
         f"**HOURLY** ◈ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
@@ -2161,7 +2280,8 @@ def send_hourly_summary() -> bool:
         f"{sp_line}\n"
         f"```\n"
         f"**Positions**\n```\n"
-        + ("\n".join(_portfolio_lines(positions, pf["total_value"])) or "  (none)")
+        + ("\n".join(_portfolio_lines(positions, pf["total_value"],
+                                       events_by_ticker=events_by_ticker)) or "  (none)")
         + "\n```\n**Recent trades**\n```\n"
         + "\n".join(trade_lines)
         + "\n```"
@@ -2268,6 +2388,7 @@ def send_daily_close() -> bool:
         realized_rt_line = ""
 
     sp_line = f"S&P 500: {sp:.2f}" if sp else "S&P 500: N/A"
+    events_by_ticker = _earnings_events_by_ticker()
 
     body = (
         f"**DAILY CLOSE** ◈ {today}\n"
@@ -2281,7 +2402,8 @@ def send_daily_close() -> bool:
         f"{sp_line}\n"
         f"```\n"
         f"**Open positions**\n```\n"
-        + ("\n".join(_portfolio_lines(positions, pf["total_value"])) or "  (none)")
+        + ("\n".join(_portfolio_lines(positions, pf["total_value"],
+                                       events_by_ticker=events_by_ticker)) or "  (none)")
         + "\n```"
     )
     lk = _singleton_lock_line()

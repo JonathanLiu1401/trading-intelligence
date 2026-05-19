@@ -987,6 +987,187 @@ class TestPosHoldAgeToken:
         assert "held " not in line, line
 
 
+class TestPosEarningsToken:
+    """`_pos_earnings_token` — pure per-position earnings-imminent flag from
+    the `build_event_calendar` events list. Same additive-only contract as
+    `_pos_hold_age_token`: a missing / corrupt / out-of-scope input drops the
+    token, never raises."""
+
+    def test_held_imminent_renders_warning_token(self):
+        # NVDA earnings tomorrow, held — the canonical "must-see" alert.
+        ev_map = {"NVDA": {"ticker": "NVDA", "days_away": 0.7,
+                            "tier": "HELD_IMMINENT", "held": True}}
+        p = {"ticker": "NVDA", "type": "stock"}
+        tok = reporter._pos_earnings_token(p, ev_map)
+        assert tok == "  ⚠ ER 0.7d"
+
+    def test_held_soon_renders_compact_token(self):
+        # 5d away — informational, no warning glyph (line stays compact).
+        ev_map = {"AAPL": {"ticker": "AAPL", "days_away": 5.0,
+                            "tier": "HELD_SOON", "held": True}}
+        p = {"ticker": "AAPL", "type": "stock"}
+        tok = reporter._pos_earnings_token(p, ev_map)
+        assert tok == "  ER 5.0d"
+
+    def test_same_day_post_bell_renders_after_close(self):
+        # days_away < 0 means the event has just happened. Surface explicitly
+        # rather than rendering a confusing "-0.1d".
+        ev_map = {"NVDA": {"ticker": "NVDA", "days_away": -0.05,
+                            "tier": "HELD_IMMINENT", "held": True}}
+        p = {"ticker": "NVDA", "type": "stock"}
+        assert reporter._pos_earnings_token(p, ev_map) == "  ⚠ ER after close"
+
+    def test_held_soon_same_day_post_bell_no_warning(self):
+        # HELD_SOON tier shouldn't carry the warning glyph even post-bell.
+        ev_map = {"AAPL": {"ticker": "AAPL", "days_away": -0.2,
+                            "tier": "HELD_SOON", "held": True}}
+        p = {"ticker": "AAPL", "type": "stock"}
+        assert reporter._pos_earnings_token(p, ev_map) == "  ER after close"
+
+    def test_ticker_not_in_events_is_silent(self):
+        # No event for this name → no token.
+        ev_map = {"NVDA": {"ticker": "NVDA", "days_away": 0.7,
+                            "tier": "HELD_IMMINENT", "held": True}}
+        p = {"ticker": "TQQQ", "type": "stock"}
+        assert reporter._pos_earnings_token(p, ev_map) == ""
+
+    def test_none_events_is_silent_byte_compat(self):
+        # The pre-existing unit-test callers (and any backwards-compat path
+        # without earnings data) get the no-token form.
+        p = {"ticker": "NVDA", "type": "stock"}
+        assert reporter._pos_earnings_token(p, None) == ""
+        assert reporter._pos_earnings_token(p, {}) == ""
+
+    def test_missing_days_away_is_silent(self):
+        # A corrupt event row (no days_away or non-numeric) drops the token
+        # rather than raising — the additive failure contract.
+        ev_map = {"NVDA": {"ticker": "NVDA", "tier": "HELD_IMMINENT"}}
+        p = {"ticker": "NVDA", "type": "stock"}
+        assert reporter._pos_earnings_token(p, ev_map) == ""
+        ev_map_bad = {"NVDA": {"ticker": "NVDA", "days_away": "soon",
+                                "tier": "HELD_IMMINENT"}}
+        assert reporter._pos_earnings_token(p, ev_map_bad) == ""
+
+    def test_ticker_normalized_to_upper(self):
+        # Position records carry uppercase; defend the lookup against any
+        # mixed-case ticker by uppercasing.
+        ev_map = {"NVDA": {"ticker": "NVDA", "days_away": 0.7,
+                            "tier": "HELD_IMMINENT", "held": True}}
+        p = {"ticker": "nvda", "type": "stock"}
+        assert reporter._pos_earnings_token(p, ev_map) == "  ⚠ ER 0.7d"
+
+    def test_missing_ticker_is_silent(self):
+        ev_map = {"NVDA": {"ticker": "NVDA", "days_away": 0.7,
+                            "tier": "HELD_IMMINENT", "held": True}}
+        assert reporter._pos_earnings_token({}, ev_map) == ""
+        assert reporter._pos_earnings_token({"ticker": ""}, ev_map) == ""
+
+    def test_portfolio_lines_includes_earnings_token(self):
+        # End-to-end: a position with an HELD_IMMINENT event in the map
+        # gets the warning token in its rendered line.
+        ev_map = {"NVDA": {"ticker": "NVDA", "days_away": 0.7,
+                            "tier": "HELD_IMMINENT", "held": True}}
+        positions = [{
+            "ticker": "NVDA", "type": "stock", "qty": 2,
+            "avg_cost": 222.0, "current_price": 222.0, "unrealized_pl": 0.0,
+        }]
+        line = reporter._portfolio_lines(
+            positions, total_value=444.0, events_by_ticker=ev_map
+        )[0]
+        assert "⚠ ER 0.7d" in line
+        # Existing tokens still present (byte-compat on the other axes).
+        assert "NVDA" in line and "222.00" in line
+
+    def test_portfolio_lines_byte_compat_when_no_events(self):
+        # Backward compat: positions without an events map (the existing
+        # test callers) must produce a line with no ER token.
+        positions = [{
+            "ticker": "NVDA", "type": "stock", "qty": 2,
+            "avg_cost": 222.0, "current_price": 222.0, "unrealized_pl": 0.0,
+        }]
+        line = reporter._portfolio_lines(positions)[0]
+        assert "ER " not in line and "⚠" not in line
+
+
+class TestEarningsEventsByTicker:
+    """`_earnings_events_by_ticker` — the reporter's pure-resolver layer
+    between ``build_event_calendar`` and ``_portfolio_lines``."""
+
+    def test_builder_unavailable_returns_none(self, monkeypatch):
+        # If build_event_calendar raises, the whole resolver must degrade to
+        # None — the calling hourly/daily report must still ship.
+        def _raise(*a, **k):
+            raise RuntimeError("disk gone")
+        monkeypatch.setattr(
+            "paper_trader.analytics.event_calendar.build_event_calendar",
+            _raise,
+        )
+        assert reporter._earnings_events_by_ticker() is None
+
+    def test_source_not_ok_returns_none(self, monkeypatch):
+        # Calendar JSON missing/corrupt → source_ok=False → None.
+        monkeypatch.setattr(
+            "paper_trader.analytics.event_calendar.build_event_calendar",
+            lambda *a, **k: {"source_ok": False, "events": []},
+        )
+        assert reporter._earnings_events_by_ticker() is None
+
+    def test_returns_map_keyed_by_uppercase_ticker(self, monkeypatch):
+        # The happy path: a source-ok report with events becomes a
+        # ticker→event dict for the portfolio lines lookup.
+        monkeypatch.setattr(
+            "paper_trader.analytics.event_calendar.build_event_calendar",
+            lambda *a, **k: {
+                "source_ok": True,
+                "events": [
+                    {"ticker": "NVDA", "days_away": 0.7,
+                     "tier": "HELD_IMMINENT"},
+                    {"ticker": "aapl", "days_away": 5.0, "tier": "HELD_SOON"},
+                ],
+            },
+        )
+        out = reporter._earnings_events_by_ticker()
+        assert isinstance(out, dict)
+        assert "NVDA" in out and "AAPL" in out
+        assert out["NVDA"]["days_away"] == 0.7
+
+    def test_empty_events_returns_empty_dict(self, monkeypatch):
+        # Calendar OK but nothing scheduled → {} (not None) so the position
+        # lines render with no ER token instead of treating it as a fault.
+        monkeypatch.setattr(
+            "paper_trader.analytics.event_calendar.build_event_calendar",
+            lambda *a, **k: {"source_ok": True, "events": []},
+        )
+        assert reporter._earnings_events_by_ticker() == {}
+
+    def test_malformed_event_rows_silently_skipped(self, monkeypatch):
+        # A None or missing-ticker event must not crash the resolver.
+        monkeypatch.setattr(
+            "paper_trader.analytics.event_calendar.build_event_calendar",
+            lambda *a, **k: {
+                "source_ok": True,
+                "events": [
+                    None,
+                    {"ticker": "", "days_away": 1.0, "tier": "HELD_IMMINENT"},
+                    {"ticker": "NVDA", "days_away": 0.7,
+                     "tier": "HELD_IMMINENT"},
+                ],
+            },
+        )
+        out = reporter._earnings_events_by_ticker()
+        assert out == {"NVDA": {"ticker": "NVDA", "days_away": 0.7,
+                                 "tier": "HELD_IMMINENT"}}
+
+    def test_non_dict_report_returns_none(self, monkeypatch):
+        # A future builder regression that returns the wrong shape (list /
+        # str / None) degrades to None instead of TypeErroring.
+        monkeypatch.setattr(
+            "paper_trader.analytics.event_calendar.build_event_calendar",
+            lambda *a, **k: [{"ticker": "NVDA"}],
+        )
+        assert reporter._earnings_events_by_ticker() is None
+
+
 class TestClassifyDecisionOutcome:
     """`decisions.action_taken` is free text (AGENTS.md invariant #11).
     The bucket order is load-bearing: a FILLED/BLOCKED verb line also
