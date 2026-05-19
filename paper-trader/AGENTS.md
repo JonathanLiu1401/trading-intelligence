@@ -6583,3 +6583,175 @@ prewarm target — the precise contract-rot the test guards against.
   this fix (`99053ff`) are three separate path-scoped commits.
 
 *Review pass #28 AMENDMENT (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
+
+---
+
+## Review pass #30 — paper-trader core hybrid (2026-05-18)
+
+**bugs_fixed=1 · features_added=1 · user_findings=5**
+
+- **Phase 1 — bugs_fixed=1 (commit `3e24437`, pushed).**
+  `_swr_prewarm.targets` was missing **three** `@swr_cached` endpoints
+  added in recent commits (`scorer-opportunities` from `20295e8`,
+  `scorer-portfolio-attribution` from `6018347`, `trade-attribution`
+  from `2a28eea`). Their panels cold-stalled with `{"warming": true}`
+  on the first poll after every restart — the exact freeze-triage
+  blind spot `tests/test_swr_prewarm_coverage.py` exists to lock
+  against (the same class as commit `542446d` 6-endpoint batch fix
+  and `99053ff` for `scorer-attribution`). Caught by running the
+  prewarm coverage test, which failed listing all three. Surgical
+  9-line addition with a 6-line freeze-triage comment naming the
+  commits. Path-scoped: only `paper_trader/dashboard.py` staged
+  (`git diff --staged --stat` verified before commit; sibling-token
+  grep clean). After fix: 469 focused tests green
+  (`test_core_{market,signals,store,strategy,runner,reporter,
+  dashboard_helpers}` + `test_swr_prewarm_coverage` +
+  `test_dashboard_swr`).
+  ```bash
+  python3 -m pytest tests/test_swr_prewarm_coverage.py -q   # 3 green
+  ```
+
+- **Phase 2 — feature (committed `4a576da`, pushed):
+  `reporter._position_attention_line` — surface NEGLECTED/STALE held
+  lots in Discord.**
+  `/api/position-attention` (commit `f703cb2`) answers a question NO
+  other hourly/daily block did: **which specific open lots has Opus
+  stopped examining?** When a NO_DECISION storm drags on (the
+  documented #1 pathology — `pt-no-decision-host-saturation`
+  memory), the live trader silently defaults to holding every open
+  lot while those lots are no longer being **evaluated**. Every
+  other Discord block on the hourly is aggregate (decision-health
+  rate, capital-paralysis, host-guard) or per-trade (asymmetry,
+  autopsy). The operator who lives in Discord had no per-position
+  attention surface — the exact dashboard→Discord gap
+  `_host_pulse_line` / `_capital_pulse_line` /
+  `_singleton_lock_line` each closed, one dimension over
+  (aggregate-vs-host → per-held-position).
+
+  Composes `build_position_attention` **verbatim** (single source of
+  truth, AGENTS.md invariant #10 — the verdict / note are the
+  builder's, never re-derived, so this Discord line and
+  `/api/position-attention` can never tell different stories) and
+  feeds it the EXACT same store reads the endpoint does
+  (`open_positions()` + `recent_decisions(limit=3000)`). **Pure
+  store reads only — NO network** (the Discord-path discipline; adds
+  zero latency). Observational only, never gates, adds no caps
+  (invariants #2/#12 — the `_host_pulse_line` precedent). Renders up
+  to 3 worst-first per-position lines (`ticker`, `verdict`, `hours
+  since last look`) so the operator sees the exact tickers to triage,
+  not just an aggregate count. Wired immediately after
+  `_capital_pulse_line` in both `send_hourly_summary` and
+  `send_daily_close`.
+
+  **Suppression** — surface ONLY when the model has stopped looking:
+  `NEGLECTED_BOOK` (>=1 lot no Opus look in >24h) → ALWAYS surfaced;
+  `STALE_BOOK` (>=1 lot last seen >6h ago) → surfaced; `OK` /
+  `INSUFFICIENT_DATA` → silent (no noise; the
+  `_hold_discipline_line` NO_DATA / `_heartbeat_line` HEALTHY
+  suppression precedent — the summary must never become its own
+  lying green light). Failure contract mirrors the rest of
+  `reporter`: any builder/store fault degrades to `""` ("no
+  attention line this report"), **never** an exception ("no Discord
+  summary this report").
+
+  **13 exact-assert tests** (`tests/test_core_reporter.py::
+  TestPositionAttentionLine`): OK/INSUFFICIENT_DATA suppression;
+  NEGLECTED/STALE rendering with ticker+verdict+hours;
+  `hours_since=None` → `"no Opus look on record"`; 3-line per-position
+  cap (no flooding); builder-fault / non-dict / empty-note
+  degrade-to-empty; hourly + daily wiring (surfaces when neglected,
+  silent when ok); summary-still-ships on builder fault (additive
+  contract).
+  ```bash
+  python3 -m pytest tests/test_core_reporter.py -k "PositionAttention" -q
+  # 13 passed in 0.91s
+  python3 -m pytest tests/test_core_reporter.py tests/test_core_*  \
+    tests/test_swr_prewarm_coverage.py tests/test_dashboard_swr.py -q
+  # 469 passed in 6.48s
+  ```
+
+- **Phase 3 — live findings (`:8090`, runner alive but on stale code;
+  box under the concurrent review-swarm load this pass's own siblings
+  contribute to). 5 distinct + positive.**
+
+  1. **UNSUPERVISED_STALE — trader running on stale code as an
+     orphan (HIGH, ops/continuity, recalled
+     `pt-stale-manual-daemon` + `pt-systemd-vs-manual-restart-spam`
+     memories).** `/api/supervision` `UNSUPERVISED_STALE`, boot SHA
+     `cef83f2` vs head `4a576da` (behind 2 — this pass's own
+     `3e24437` + `4a576da`), systemd unit `disabled`/`inactive`,
+     PPID=1269 (manual launch). The git-watcher's `os._exit(0)`
+     would leave the trader DOWN permanently. `should_restart` CLI
+     agrees: `RESTART RECOMMENDED`. Not actionable in code — the
+     operator's existing observation is that this trader runs as a
+     manual long-lived process, not under systemd. Remediation is
+     `systemctl --user enable --now paper-trader` OR accept the
+     manual-daemon arrangement and tolerate stale code between
+     restarts.
+
+  2. **Host saturation symptom — 100% of last decision didn't reach
+     Opus (MEDIUM, host, continuity — recalled
+     `pt-no-decision-host-saturation`).** `/api/host-guard`
+     `STARVED`: load1=11.67/16 CPU, swap_used=64.9%, 4 concurrent
+     Opus. `/api/empty-claude-rate` `INSUFFICIENT_DATA` (n=1).
+     Architectural reality of the 16-CPU box under the concurrent
+     review-swarm + backtest committee load this pass's own
+     siblings contribute to; self-clears when the swarm ends. Not
+     a code bug.
+
+  3. **Empty book — $1000 cash, 0 positions, 0 decisions, 0 trades
+     (LOW).** `/api/portfolio` `cash=$1000.0 total=$1000.0`,
+     `/api/decision-health` `NO_DATA`,
+     `/api/runner-heartbeat` `NO_DATA` (`secs_since_last_decision=
+     None`). Live trader looks freshly reset (between this pass's
+     reads); legitimate state, not a bug. My new
+     `_position_attention_line` correctly returns `""` for this
+     state (the `INSUFFICIENT_DATA` suppression branch — validated
+     live against the empty book).
+
+  4. **Runner on stale code still queries delisted GOOGU/METAU
+     (LOW, symptom of #1).** `logs/runner.log` shows repeating
+     yfinance HTTP 404 / `possibly delisted; no price data found`
+     for `GOOGU` / `METAU`. The current `strategy.py` WATCHLIST on
+     HEAD no longer includes them (removed `2026-05-18` per the
+     code comment) but the running process still does — direct
+     consequence of finding 1 (stale code). Self-resolves on
+     restart.
+
+  5. **POSITIVE — data/book/feed trust intact, dashboard healthy,
+     ALL my new code paths validated live.**
+     `/api/feed-health` HEALTHY, 0.1h newest, 8284 live articles
+     24h, no split-brain; `/api/equity-freshness` curve current and
+     agrees with live book; `/api/mark-integrity` `NO_DATA` (no
+     open positions to mark — clean); `/api/position-attention`
+     returns my new endpoint correctly with the empty-book
+     `INSUFFICIENT_DATA` verdict; `/api/scorer-portfolio-
+     attribution` returns sensibly (`is_trained:true`,
+     `n_train:35`, `n_positions:0`); all queried endpoints respond
+     within 5–8s under the saturated-host conditions; Discord send
+     healthy (no consecutive failures). No tracebacks in runner.log
+     besides the yfinance 404s of #4.
+
+  No Phase-3 fix folded in — findings 1, 2, 4 are operational
+  continuity (ops decision, not code), and 3 is legitimate fresh
+  state. Finding 5 confirms the deployed product works.
+
+- **Concurrency / staging discipline.** Multiple concurrent siblings
+  active (pid 2291372 me, 2291374 ML/backtest, 2291377 feature-dev;
+  the feature-dev sibling committed `/api/news-velocity` to
+  `dashboard.py` mid-pass — uncommitted in my working tree when I
+  read it, then auto-commit daemon picked it up between my reads).
+  Recalled `pt-concurrent-samerole-staging-race`. Never `git add -A`.
+  Staged exactly the path-scoped files (`paper_trader/dashboard.py`
+  for the Phase-1 fix; `paper_trader/reporter.py` +
+  `tests/test_core_reporter.py` for the Phase-2 feature);
+  `git diff --staged` filtered for sibling tokens
+  (`news-velocity`, `news_velocity_api`, `_stock_tickers_from_positions`,
+  `digital-intern`, `decision_scorer`, `persona`) returned **zero
+  hits** before each commit. AGENTS.md re-read at the tail
+  immediately before this append (still ended at pass #28 amendment),
+  appended-only, committed separately (not counted as the feature or
+  fix). Three path-scoped commits: `3e24437` (fix), `4a576da`
+  (feature), and the AGENTS.md commit to follow.
+
+*Review pass #30 (paper-trader core hybrid) appended 2026-05-18. Prior content above is unmodified.*
