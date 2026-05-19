@@ -4049,3 +4049,131 @@ edits / untracked files; `logs/*`. Both my commits pathspec-scoped via
 `analysis/claude_analyst.py` + `tests/test_briefing_book_silence.py`
 ONLY); `git show --stat` verified no sibling leakage; never `git add -A`;
 both on origin/master.
+
+### Agent pass 2026-05-19 (hybrid 28 — Agent 3, debug + feature + analyst-validation)
+
+All 9 required files re-read; advisor-reviewed before substantive work
+AND before commit. Concurrent sibling agents visible in `ps`
+(paper-trader core / ML+backtests / Agent 4 feature-dev all running
+simultaneously) + auto-commit/push daemon; strict per-commit pathspec
+staging held (memory `di-shared-repo-concurrency`). USB DB under heavy
+contention (documented torn-read class — `database disk image is
+malformed` on mid-write read probes — recovered with retry-loop; not a
+new bug, operational/`export_worker` class).
+
+**Phase 1 — bugs_fixed=0, no commit (honest, not a miss).** Per the
+established pattern (27 prior passes), the heavily-reviewed nine-file
+core is exceptionally mature; every task-listed test already exists and
+value-asserts (`get_unalerted_urgent` `backtest://` exclusion,
+`mark_alerted` re-fetch suppression, `update_ml_scores_batch` →
+`score_source='ml'`, urgency_scorer 9.5/3.0 boundary, alerted-state
+preservation, `EXTRA_FEATURE_DIM == 15`, days_since_published scaling,
+relevance ∈ [0,10] / urgency ∈ [0,1] / no-NaN-on-zero-input,
+`_fetch_training_data` `score_source='ml'` exclusion, sample-weight
+monotonicity). The four load-bearing invariants re-traced and hold by
+inspection. Full suite **1111 passed** baseline (clean
+`__pycache__`/`.pytest_cache`). Per the standing "do not fabricate"
+discipline: no Phase 1 commit.
+
+**Phase 2 — features_added=1, commit `72285ac`** (`analysis/claude_analyst.py`
++178 / new `tests/test_briefing_alert_book_velocity.py` +419, 25 tests).
+**ALERT BOOK VELOCITY — per-held-ticker BREAKING-alert magnitude block.**
+Advisor-reviewed (three locks adopted: data-source pin mirroring
+`TestCollectAlertVelocityDataSource`, word-boundary discipline on this
+surface, multiplicity-floor noise gate; rendered as "alerts mention this
+name" since the ticker is the subject, not the wire). Gap: ALERT
+VELOCITY measures the OVERALL wire firing rate; BOOK HEAT counts
+distinct DIGEST rows touching each held name. Neither answers the
+per-position question the analyst persona most cares about — is one of
+MY held names itself the centre of the breaking-wire activity this 5h
+window? A held ticker carried by one alert is generic news (already
+surfaced by the per-row `[BOOK:]` tag + the briefing's `[ALERTED]`
+parity tag); the SAME held ticker carried by ≥2 distinct breaking alerts
+is a multiplicity signal in its own right — concentration on the
+position the analyst has open risk on. Two new pure helpers:
+`_collect_alert_book_velocity(window_hours)` reads
+`watchers.alert_recency.recent_alerts` (canonical fires log, SAME source
+as `_collect_alert_velocity` — NOT `articles.db` `urgency=2` which also
+reflects pre-fire suppression gates), scans each fired-alert title via
+`_book_tickers` (SSOT reuse — the SAME primitive BOOK HEAT / BOOK
+SILENCE / per-row `[BOOK:]` tag use, so the four held-book surfaces
+cannot silently drift), splits into recent/prior windows by stored
+`last_ts` age, returns `{"window_h": int, "tickers": {T: {"recent": N,
+"prior": N}, ...}}` or `None` on ANY failure (best-effort);
+`_alert_book_velocity_lines(velocity)` pure renderer with
+`min_recent=2` floor (single-alert noise is already on per-row
+`[BOOK:]` tag), sort by `recent` desc with canonical `_BOOK_TICKERS`
+tiebreak. Wired into `_build_payload` as additive `alert_book_velocity`
+kwarg (omit-when-`None` / omit-when-below-threshold, byte-identical
+default path so the 7-arg callers stay unaffected); `analyze()` pulls
+it via `_collect_alert_book_velocity()`. New SYSTEM_PROMPT rule names
+the per-row `[BOOK:]` vs window-level magnitude distinction and pins
+"do NOT echo" framing (input hint, not a reproduced section — same
+shape as BOOK HEAT / BOOK SILENCE / AGING TOP ROWS, unlike COVERAGE GAP
+/ ALERT VELOCITY). Pure read-side: no DB write, no `ai_score` /
+`ml_score` / `score_source` / `urgency` touch, no row mutation, never
+reads or mutates `source_articles`, `alert_recency.db` is a separate
+file (NOT `articles.db`) so backtest isolation holds by construction —
+**all four load-bearing invariants intact**. Same minor under-count
+caveat as `_collect_alert_velocity` inherited (alert_recency upserts
+per sig, counted in latest fire's window; analyst-safe direction — a
+brief under-count just keeps a held ticker on the per-row `[BOOK:]`
+tag instead of getting the multiplicity callout: silent, not noisy).
+25 new tests pin: empty/non-dict/missing-`window_h`/below-floor/at-floor
+renderer paths, newly-active per-position edge (`prior == 0`),
+recent-desc ordering, canonical `_BOOK_TICKERS` tiebreak, max-lines cap,
+malformed-entry skip, negative-counts skip, the `alert_recency.db`
+data-source pin (mirrors `TestCollectAlertVelocityDataSource` — same
+drift class), the word-boundary discipline (`MUSEUM` ≠ MU, `Micron` ≠
+MU — the held ticker is the SYMBOL, not the company name), the
+`_build_payload` emission gates (`None` / explicit-empty-dict /
+above-floor), multi-ticker render order, SYSTEM_PROMPT rule content +
+per-row `[BOOK:]` distinction, and the SSOT source-inspection pin
+(`_collect_alert_book_velocity` composes `_book_tickers` verbatim).
+Ships on next `systemctl --user restart digital-intern` (stale-daemon
+caveat).
+
+**Phase 3 — analyst-lens live validation, user_findings=5.** (1)
+**Briefing quality EXCELLENT (positive)** — id30 (2026-05-19 04:18Z,
+50 arts, 3328 chars) LEAD is precise and decisively actionable
+(Trump-Iran delay → WTI −5.45% → risk rotation; held book stated up
+front MU −5.95% / LITE −8.83% / AXTI −14.46% / TSEM −9.46%); PORTFOLIO
+names every held ticker with concrete options-level implications (LITE
+IV 109% P/C 2.07, MU IV 113% P/C 1.64); AGING TOP ROWS marker working
+(`Motley: why MU dropped (cont., ~3.5h old)` correctly framed as
+continuation); SEMIS PULSE / RISK / DESK NOTE well-formed. (2)
+**Briefing cadence HEALTHY (positive)** — id26→27→28→29→30 gaps =
+5.6h / 5.2h / 5.1h / 5.1h vs the 5h target; `ef839a8` heartbeat-clock
+fix holding; no 30h+ gaps. (3) **Invariants HOLD live (positive)** —
+direct DB probe (`immutable=1`) confirms 0 synthetic `urgency>=1` rows
+and 0 `ai_score>0 AND score_source='ml'` rows. Both load-bearing
+invariants intact in production. (4) **Worker health HEALTHY
+(positive)** — `supervisor_state.json` shows 30/30 workers OK / 0 DEAD;
+`daemon.log` carries 0 ERROR / 0 CRITICAL / 0 Traceback in the current
+window. (5) **Recap-template alerts still firing on the running daemon
+(stale-daemon caveat, NOT a new bug)** — recent `urgency=2` set
+includes `Why Did Micron Stock Drop Today | The Motley Fool` (matches
+the deployed `_RT_WHY_DID`), `Lumentum/AXT ... GF Value Says` ×2
+(matches `_RT_GF_VALUE`), `QBTS Q1 2026 Earnings Call Highlights`
+(matches `_RT_EARNINGS_CALL`), `Thoughts on MU for the last week` from
+`reddit/r/stockstobuytoday` cred=0.40 (would be gated by
+`_filter_low_authority_lone`). All match committed-but-not-deployed
+gates — chronic stale-daemon caveat (documented in every prior pass);
+ships on next `systemctl --user restart digital-intern` (out of scope —
+live system + concurrent sibling agents). None of these is a quick
+safe fix in clean scope (stale-daemon-with-HEAD-fix / operational) →
+no Phase-3 fold-in; bugs_fixed stays 0, features_added 1.
+
+**Verify:** `storage.article_store` / `ml.features` / `ml.model` /
+`analysis.claude_analyst` imports OK; full suite **1193 passed** in
+54s (my +25 ALERT BOOK VELOCITY tests + concurrent sibling additions
+since baseline 1111, zero regressions). *Pre-existing, deliberately
+never staged* (consistent with every prior entry):
+`dashboard/web_server.py` edit and the untracked
+`tests/test_chat_alert_confidence_trend_enrichment.py` +
+`tests/test_chat_position_conviction_decay_enrichment.py` (Agent 4
+sibling work); all `paper-trader/*` sibling edits; `logs/*`. The
+commit was pathspec-scoped via `git add analysis/claude_analyst.py
+tests/test_briefing_alert_book_velocity.py` and verified by
+`git diff --staged --stat` (2 files / +596 lines, no sibling leakage);
+never `git add -A`; pushed to origin/master.
