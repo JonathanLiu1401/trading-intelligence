@@ -437,3 +437,75 @@ class TestEvaluateScorerOos:
         result = evaluate_scorer_oos(scorer, [])
         assert result["n"] == 0
         assert result["rmse"] is None or result["rmse"] != result["rmse"]  # NaN ok
+
+    def test_missing_forward_return_dropped_not_zeroed(self):
+        """Regression lock: a record with `forward_return_5d=None` (or
+        missing key, or non-finite) must be DROPPED, not silently coerced to
+        0.0. The previous code used `_to_float(..., 0.0)` which fabricated a
+        flat-target outcome — every (p, 0.0) pair then contributed `p**2`
+        to RMSE and biased the reported skill. `_oos_rank_metrics` (the
+        sister function) was already hardened with a NaN sentinel; this
+        locks the same discipline here for consistency.
+
+        Constructs a scorer stub whose `predict()` always returns +10.0 so
+        the RMSE is mathematically pinned: with only ONE legitimate record
+        (predicted +10 vs actual +10 → squared error 0), RMSE must be 0.0.
+        Pre-fix, the null/missing records would contribute (+10 - 0)**2 = 100
+        each, dragging RMSE up to ~8.16 — RED on this exact bound.
+        """
+        from paper_trader.validation import evaluate_scorer_oos
+
+        class _FixedScorer:
+            is_trained = True
+
+            def predict(self, **_kw):
+                return 10.0
+
+        records = [
+            # The only well-formed record: predicted 10 vs actual 10 → err=0.
+            {"forward_return_5d": 10.0, "action": "BUY", "ticker": "NVDA"},
+            # Null target — must drop, not coerce to 0.0.
+            {"forward_return_5d": None, "action": "BUY", "ticker": "AMD"},
+            # Missing key entirely — must drop.
+            {"action": "BUY", "ticker": "MU"},
+            # +inf — non-finite, must drop.
+            {"forward_return_5d": float("inf"), "action": "BUY",
+             "ticker": "TSM"},
+            # NaN — must drop.
+            {"forward_return_5d": float("nan"), "action": "BUY",
+             "ticker": "QCOM"},
+        ]
+        result = evaluate_scorer_oos(_FixedScorer(), records)
+        # Only one record contributed; the other four were dropped.
+        assert result["n"] == 1
+        # With one (p=10, a=10) pair, RMSE is EXACTLY 0.0. Pre-fix RMSE
+        # would have been sqrt(((10-10)^2 + (10-0)^2 * 4) / 5) ≈ 8.94.
+        assert result["rmse"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_sell_sign_flip_still_applied_after_nan_filter(self):
+        """The NaN-sentinel guard must NOT skip the SELL sign-flip on the
+        records it KEEPS. Mirrors `_oos_rank_metrics.test_sell_action_flips...`
+        verbatim so the OOS RMSE and OOS rank-IC views always describe the
+        same action-aligned target convention.
+
+        Scorer predicts +5.0 for every input. Two records:
+        - BUY with realized +5.0 → no flip → (5 - 5)^2 = 0
+        - SELL with realized -5.0 → flipped to +5.0 → (5 - 5)^2 = 0
+        ⇒ RMSE = 0.0. Pre-flip (if a regression dropped the flip) the SELL
+        contributes (5 - (-5))^2 = 100, RMSE = sqrt(50) ≈ 7.07 → fails RED.
+        """
+        from paper_trader.validation import evaluate_scorer_oos
+
+        class _FixedScorer:
+            is_trained = True
+
+            def predict(self, **_kw):
+                return 5.0
+
+        records = [
+            {"forward_return_5d": 5.0, "action": "BUY", "ticker": "NVDA"},
+            {"forward_return_5d": -5.0, "action": "SELL", "ticker": "AMD"},
+        ]
+        result = evaluate_scorer_oos(_FixedScorer(), records)
+        assert result["n"] == 2
+        assert result["rmse"] == pytest.approx(0.0, abs=1e-9)

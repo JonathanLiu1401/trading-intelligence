@@ -533,7 +533,17 @@ def split_outcomes_temporal(
 
 def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
     """Compute RMSE of `scorer` predictions against actual `forward_return_5d`
-    on a held-out set. Returns ``{"n": int, "rmse": float|None}``."""
+    on a held-out set. Returns ``{"n": int, "rmse": float|None}``.
+
+    Records whose `forward_return_5d` is missing or non-finite are DROPPED,
+    not coerced to 0.0 — mirroring the NaN-sentinel discipline that
+    `_oos_rank_metrics` already uses for rank-IC. A silent 0.0 fallback
+    biases RMSE with a fabricated flat-target outcome (and `(p - 0.0)**2`
+    artificially adds magnitude to every missing row), exactly the latent
+    bug that `_oos_rank_metrics` was previously hardened against — fixed
+    here for consistency so a future writer that emits null forward returns
+    cannot silently inflate or deflate this metric.
+    """
     if not oos_records:
         return {"n": 0, "rmse": None}
     if not getattr(scorer, "is_trained", False):
@@ -559,14 +569,20 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
                 news_urgency=r.get("news_urgency"),
                 news_article_count=r.get("news_article_count"),
             )
-            actual = _to_float(r.get("forward_return_5d"), 0.0)
+            # NaN sentinel default — missing / null / non-finite targets are
+            # excluded by the `a == a` guard below, not silently coerced to
+            # 0.0 (which would fabricate a flat outcome and bias RMSE).
+            actual = _to_float(r.get("forward_return_5d"), float("nan"))
             action = str(r.get("action") or "BUY").upper()
             # Mirror train_scorer's sign-flip convention so the OOS error
             # measures the same thing the training loss minimized.
             if action == "SELL":
                 actual = -actual
-            preds.append(float(p))
-            actuals.append(float(actual))
+            pf = float(p)
+            af = float(actual)
+            if pf == pf and af == af:  # drop NaN defensively
+                preds.append(pf)
+                actuals.append(af)
         except Exception:
             continue
 
