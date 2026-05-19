@@ -525,6 +525,78 @@ class TestOptionExpired:
         assert strategy._option_expired("2020-01-17T00:00:00", today=_date(2026, 5, 16)) is True
 
 
+class TestOptionExpiredCloseGate:
+    """The new NY-tz-aware path: expiry day flips at the NYSE close
+    (16:00 ET regular / 13:00 ET half-day), not at UTC midnight.
+
+    Pre-fix bug (AGENTS.md review pass #33): an expired option was marked at
+    avg_cost with stale_mark=True for the ~3-4h window between the actual
+    close and UTC midnight, every monthly expiry."""
+
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _Zi
+    NY = _Zi("America/New_York")
+    UTC = _Zi("UTC")
+
+    def test_expiry_day_before_close_still_live(self):
+        # 15:00 ET on 2026-05-15 (regular session day) — pre-close.
+        now = self._dt(2026, 5, 15, 15, 0, tzinfo=self.NY)
+        assert strategy._option_expired("2026-05-15", now=now) is False
+
+    def test_expiry_day_at_close_is_expired(self):
+        # 16:00 ET exactly — the bell. Expired.
+        now = self._dt(2026, 5, 15, 16, 0, tzinfo=self.NY)
+        assert strategy._option_expired("2026-05-15", now=now) is True
+
+    def test_expiry_day_after_close_is_expired(self):
+        # 16:30 ET — the window the bug left mis-marked.
+        now = self._dt(2026, 5, 15, 16, 30, tzinfo=self.NY)
+        assert strategy._option_expired("2026-05-15", now=now) is True
+
+    def test_utc_midnight_window_now_correct(self):
+        # 20:00 ET = 00:00 UTC the next day. Old logic flipped here; new
+        # logic flipped 4h earlier (16:00 ET) — the bug's resolution.
+        now = self._dt(2026, 5, 15, 20, 0, tzinfo=self.NY)
+        assert strategy._option_expired("2026-05-15", now=now) is True
+
+    def test_half_day_early_close_flips_at_13_00_et(self):
+        # 2026-11-27 (day after Thanksgiving) closes at 13:00 ET, not 16:00.
+        # 12:30 ET — pre-early-close, still live.
+        pre = self._dt(2026, 11, 27, 12, 30, tzinfo=self.NY)
+        assert strategy._option_expired("2026-11-27", now=pre) is False
+        # 13:00 ET — early-close bell, expired.
+        at = self._dt(2026, 11, 27, 13, 0, tzinfo=self.NY)
+        assert strategy._option_expired("2026-11-27", now=at) is True
+        # 14:00 ET — formerly the buggy window (regular close = 16:00 would
+        # have read False; new logic correctly reads True for the half day).
+        after = self._dt(2026, 11, 27, 14, 0, tzinfo=self.NY)
+        assert strategy._option_expired("2026-11-27", now=after) is True
+
+    def test_future_expiry_still_not_expired_even_late_in_day(self):
+        # Future date — never expired regardless of time of day.
+        now = self._dt(2026, 5, 15, 23, 30, tzinfo=self.NY)
+        assert strategy._option_expired("2026-12-19", now=now) is False
+
+    def test_past_expiry_always_expired(self):
+        # Past date — always expired, no close-time check needed.
+        now = self._dt(2026, 5, 15, 9, 0, tzinfo=self.NY)
+        assert strategy._option_expired("2020-01-17", now=now) is True
+
+    def test_utc_input_is_normalized_to_ny(self):
+        # 20:30 UTC on 2026-05-15 = 16:30 ET — should be expired (post-close).
+        now_utc = self._dt(2026, 5, 15, 20, 30, tzinfo=self.UTC)
+        assert strategy._option_expired("2026-05-15", now=now_utc) is True
+        # 19:30 UTC on 2026-05-15 = 15:30 ET — pre-close, still live.
+        now_utc_pre = self._dt(2026, 5, 15, 19, 30, tzinfo=self.UTC)
+        assert strategy._option_expired("2026-05-15", now=now_utc_pre) is False
+
+    def test_naive_datetime_treated_as_utc(self):
+        # A naive datetime is interpreted as UTC (the function tolerates the
+        # legacy callers that built datetime.now() without tzinfo).
+        now_naive = self._dt(2026, 5, 15, 20, 30)  # naive == UTC == 16:30 ET
+        assert strategy._option_expired("2026-05-15", now=now_naive) is True
+
+
 class TestExpiredIntrinsic:
     def test_call_in_the_money(self, monkeypatch):
         monkeypatch.setattr(market, "get_price", lambda t: 650.0)
