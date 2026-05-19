@@ -7203,3 +7203,149 @@ python3 -c "from paper_trader import signals, reporter, strategy; print('OK')"
 - **No new caps / gates** (invariants #2 / #12): the impact line
   is observational, never blocks an alert, never injects into
   the decision prompt.
+
+## ML / backtest review pass (Agent 2, 2026-05-19)
+
+Hybrid pass against `paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py`, `run_continuous_backtests.py`. The codebase
+already has 28+ documented review passes and a saturated diagnostic
+suite (`calibration`, `gate_audit`, `gate_pnl`, `gate_realized`,
+`gate_stability`, `gate_abstention`, `horizon_audit`, `feature_coverage`,
+`feature_importance`, `baseline_compare`, `baseline_trend`,
+`skill_trend`, `persona_skill`, `sector_skill`, `regime_audit`,
+`label_audit`, `corpus_audit`, `overfit_gap`, `scorer_freshness`,
+`deploy_audit`, `linear_probe`, `response_audit`, `action_skill`,
+`persona_leaderboard`) so the bar for a "real bug" was high. None
+surfaced; the additions below are coverage + a new diagnostic.
+
+### New: `paper_trader.ml.attribution_audit`
+
+Aggregates `DecisionScorer.feature_contributions` (the per-prediction
+Shapley-style ablation `/api/scorer-attribution` already renders) across
+the `decision_outcomes.jsonl` corpus. Complementary to existing tools:
+
+- `feature_importance` — "what would the model LOSE if I removed feature X?" (permutation)
+- `attribution_audit`  — "what does the model SAY it's actually using?" (attribution)
+- `feature_coverage`   — "is feature X varying in the input data at all?"
+
+The combination disambiguates "dead model dimension" (low coverage),
+"model ignores a real signal" (high coverage, low attribution), and
+"feature carries skill" (high coverage, high attribution, high
+permutation drop) — three actionable states no single existing
+diagnostic separates.
+
+Verdicts (threshold-driven, exit-code mirrors siblings):
+
+| Verdict | Meaning | rc |
+|---------|---------|---:|
+| `UNTRAINED` | scorer not trained — nothing to attribute | 2 |
+| `INSUFFICIENT_DATA` | < `MIN_RECORDS=30` analyzable rows | 1 |
+| `MODEL_INERT` | every feature `mean_abs < 0.10pp` — the gate has no leverage | 2 |
+| `CONCENTRATED` | one feature > 50 % of total `|contribution|` — effectively a 1-feature rule | 0 |
+| `DIVERSIFIED` | attribution spread across features | 0 |
+
+Run:
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.attribution_audit                # OOS slice (default)
+python3 -m paper_trader.ml.attribution_audit --all          # full corpus
+python3 -m paper_trader.ml.attribution_audit --json
+```
+
+### New test coverage
+
+- `tests/test_decision_scorer_attribution.py` (9 tests) — locks
+  `DecisionScorer.feature_contributions` schema, FEATURE_NAMES order
+  invariant, the Shapley-style ablation identity
+  (`pred_raw == pred_baseline + Σ contributions + interaction_residual`),
+  off-distribution propagation, model.predict-raises degradation, and
+  non-finite output safe-flagging. Previously zero direct coverage —
+  the dashboard's `/api/scorer-attribution` consumer was at silent-
+  regression risk.
+- `tests/test_attribution_audit.py` (15 tests) — locks the new
+  diagnostic's verdict thresholds, aggregate maths
+  (top3_share sums to exactly 3.0 across all features),
+  IO tolerance (corrupt JSONL lines skipped, missing file empty
+  iterator), CLI exit-code convention.
+
+### Phase 3 quant findings (worth reading)
+
+1. **Local-vs-production scorer divergence**. `backtest.db` at this
+   repo location is a **symlink** to `/media/zeph/projects/paper-trader/`
+   but `data/` is NOT. Local
+   `data/ml/decision_scorer.pkl` (`n_train=35`) is far below the
+   `_ml_decide` gate threshold (`>= 500`, invariant #5) while the
+   production deployment under `/media/zeph/projects/paper-trader/`
+   has `n_train=3959`. A fresh continuous loop started from this
+   repo would have an inert gate. If you ever run the continuous
+   loop from THIS path, expect a 100-cycle warm-up before the gate
+   engages.
+2. **Continuous loop appears stopped** (at observation time).
+   No `run_continuous_backtests` process in `ps -ef`; latest
+   `scorer_skill_log.jsonl` cycle was at 18:06 (`>1.5h` stale).
+   Two `backtest_runs` rows sit in `status='running'` indefinitely
+   (`run 6238` ~5h stale, `run 6243` ~45min — within the 6h reaper
+   grace window) so the dashboard would keep rendering dead runs
+   as in-flight (CLAUDE.md §11 symptom) until the loop restarts.
+3. **Calibration on production scorer + production outcomes**:
+   - in-sample: `WEAK_SIGNAL` (spearman 0.286, monotone 1.0, bias 3.0pp)
+   - temporal OOS: `DIRECTIONAL_BUT_BIASED` (spearman 0.192,
+     monotone 0.78, bias 5.8pp)
+   Predictions are directionally informative; magnitudes (the
+   `±10/±5/0` gate thresholds) over-predict by ~6pp OOS — the gate
+   reads tail predictions as more confident than the realized
+   distribution supports.
+4. **Attribution-audit surprise** (the new diagnostic, run on
+   production scorer + production OOS slice n=1482): top drivers
+   are `sector_tech` (8.81pp mean_abs), `regime_mult` (6.31pp),
+   `sector_financials` (4.56pp), `mom20` (4.46pp), `rsi` (3.56pp).
+   `ml_score` is buried (mean_abs=0.125pp) — the gate is sizing
+   trades almost entirely on **sector + regime**, NOT on the
+   news-derived ml_score that justified the BUY direction in the
+   first place. Trade direction (news-based) and trade size
+   (sector/regime-based) are now uncorrelated decisions. This is
+   the kind of insight only `attribution_audit` could surface.
+5. **`MLP_WORSE_THAN_TRIVIAL` may be outdated**. The
+   `baseline_skill_log` shows recent cycles flipping to
+   `MLP_ADDS_SKILL`: cycle 3 `ic_gap=+0.07`, cycle 4
+   `ic_gap=+0.11`. The historical "the 17-feature MLP is worse
+   than a one-line `ml_score` rule" finding may no longer hold
+   post-anti-overfit retune. Worth confirming next pass.
+6. **News features sparse**: only 4.4 % of training records have
+   `news_article_count > 0` (already documented by
+   `feature_coverage`; flagged again here because
+   `attribution_audit` ranks `news_urgency` #3 despite this
+   sparsity — the rare populated rows carry disproportionate
+   attribution).
+
+### Test commands for this domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Just the ML / backtest / scorer scope (~2 min)
+python3 -m pytest tests/ -v -k "ml or backtest or scorer or attribution \
+                                or calibration or continuous or baseline"
+
+# Specifically the new attribution coverage
+python3 -m pytest tests/test_decision_scorer_attribution.py \
+                  tests/test_attribution_audit.py -v
+```
+
+### Invariants reaffirmed by this pass
+
+- **Read-only diagnostic discipline** — `attribution_audit` never
+  trains, never touches the pickle, no `build_features` / `N_FEATURES`
+  / trade-path mutation. Safe to run against the unattended loop
+  (same operational rule as every sibling diagnostic).
+- **Single-source-of-truth** — `attribution_audit` reuses
+  `FEATURE_NAMES` (no shadow ordering),
+  `decision_scorer.feature_contributions` (no re-derivation of the
+  ablation), and `validation.split_outcomes_temporal` (the EXACT
+  OOS slice `baseline_compare` and `calibration --oos` use, so
+  cross-diagnostic verdicts compare apples to apples).
+- **`feature_contributions` honesty contract** — every failure
+  mode (untrained, model raise, non-finite, off-distribution)
+  returns a safe dict with `off_distribution=True`, never an
+  exception. The new tests lock this contract so a refactor
+  cannot silently break `/api/scorer-attribution`.
