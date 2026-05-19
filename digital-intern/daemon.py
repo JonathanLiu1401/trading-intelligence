@@ -90,8 +90,8 @@ SCORE_INTERVAL      = 30          # run scoring pass every 30s
 ALERT_CHECK         = 20          # check for urgent alerts every 20s
 PURGE_INTERVAL      = 6 * 3600   # purge old data every 6h
 GDELT_INTERVAL      = 600         # full GDELT sweep every 10min
-ML_TRAIN_INTERVAL   = 180         # full ArticleNet retrain every 3 min (GPU)
-CONTINUOUS_TRAIN_INTERVAL = 120   # lightweight GPU pass every 2 min
+ML_TRAIN_INTERVAL   = 1800        # full ArticleNet retrain every 30 min (GPU)
+CONTINUOUS_TRAIN_INTERVAL = 600   # lightweight GPU pass every 10 min
 RECURSIVE_LABEL_INTERVAL = 4 * 3600  # recursive Claude labeling every 4h
 PRICE_ALERT_INTERVAL = 300        # check portfolio prices every 5min
 PRICE_ALERT_THRESHOLD = 3.0       # alert when |%| move >= this
@@ -1161,7 +1161,7 @@ def price_alert_worker(store: ArticleStore):
 def ml_trainer_worker(store: ArticleStore):
     log.info("[ml_trainer] started")
     # Bootstrap on first run
-    _sleep(30)  # let collectors gather some data first
+    _sleep(300)  # let collectors gather some data first
     if not _running:
         return
     try:
@@ -1211,7 +1211,7 @@ def ml_trainer_worker(store: ArticleStore):
 # ── Worker W12: Continuous GPU pass — keeps RTX 3060 hot ────────────────────
 def continuous_trainer_worker(store: ArticleStore):
     log.info("[continuous_trainer] started")
-    _sleep(45)  # let full trainer bootstrap first
+    _sleep(300)  # let full trainer bootstrap first
 
     # A single pass (data-load + 40-epoch fit) can legitimately run >900s
     # under GPU contention — longer than the supervisor's staleness deadline.
@@ -1545,9 +1545,45 @@ def heartbeat_worker(store: ArticleStore):
         _sleep(30)
 
 
+def _purge_worker_startup_reap(store) -> int:
+    """One-shot reap on worker startup. ``ArticleStore.reap_stale_urgent`` is
+    otherwise only called inside ``purge_old`` which fires on a 6h cadence; an
+    operator restart cycle SHORTER than 6h (the documented stale-manual-daemon
+    case — memory ``di-stale-manual-daemon``) means the reaper never gets a
+    chance to clean accumulated phantom ``urgency=1`` rows.
+    Live evidence (2026-05-18→19): 26 rows stuck at ``urgency=1`` since
+    2026-05-13 — 6 days — inflating the dashboard urgent tile and re-fetched/
+    re-decompressed every cycle by the alert worker. Calling reap once at
+    purge_worker startup makes the cleanup deterministic per daemon run.
+    Idempotent + cheap (one UPDATE with the indexed ``urgency=1`` filter +
+    a first_seen comparison) and identically invariant-safe to the existing
+    in-purge_old call: only ``urgency`` is mutated, never ai_score /
+    ml_score / score_source / synthetic rows. Best-effort — any exception is
+    logged and swallowed so a transient store error never blocks the worker
+    from starting the 5-min health-ping loop."""
+    try:
+        n = store.reap_stale_urgent()
+        if n:
+            log.info(
+                f"[purge_worker] startup-reaped {n} phantom urgency=1 row(s) "
+                f"(aged out of the alert worker's 24h window between daemon "
+                f"runs — never alerted, now demoted to urgency=0)"
+            )
+        return n
+    except Exception as e:
+        log.warning(f"[purge_worker] startup reap failed: {e}")
+        return 0
+
+
 # ── Worker W9: Purge old data every 6h ──────────────────────────────────────
 def purge_worker(store: ArticleStore):
     log.info("[purge_worker] started")
+    # Startup reap: catch up phantom urgency=1 rows that aged out between
+    # daemon runs. The full purge cadence is 6h; the operator restart cycle is
+    # often shorter (memory ``di-stale-manual-daemon``), so without this the
+    # reaper would never fire on a short-lived daemon and phantom rows
+    # accumulate indefinitely. See ``_purge_worker_startup_reap``.
+    _purge_worker_startup_reap(store)
     # Pin liveness independently of the 6h purge cadence so the health
     # snapshot doesn't mark this worker stale between fires. Without this
     # split, ``min(PURGE_INTERVAL, 300)`` was capping the loop at 5 min and

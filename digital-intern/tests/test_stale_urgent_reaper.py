@@ -137,3 +137,58 @@ class TestPurgeOldWiring:
         assert _urgency(store, "keep") == 0
         # purge_old still returns the delete count (unchanged contract).
         assert isinstance(deleted, int)
+
+
+class TestPurgeWorkerStartupReap:
+    """Pin the daemon-side wiring: ``_purge_worker_startup_reap`` fires once on
+    purge_worker entry, BEFORE the 6h purge cadence kicks in. This is the live
+    fix for the recurring stale-manual-daemon failure mode where the operator
+    restarts the daemon faster than the 6h purge interval, so the in-purge_old
+    reap call never gets a chance and phantom urgency=1 rows accumulate (6 days
+    stuck in the 2026-05-13 evidence). The reaper itself is pinned by
+    TestReapStaleUrgent above — these tests only verify the worker calls it."""
+
+    def test_demotes_aged_phantom_row_immediately_on_startup(self, store):
+        import daemon
+        _seed(store, aid="phantom", urgency=1, first_seen=_iso(6 * 24))
+        n = daemon._purge_worker_startup_reap(store)
+        assert n == 1
+        assert _urgency(store, "phantom") == 0
+
+    def test_returns_zero_and_leaves_state_alone_when_nothing_to_reap(self, store):
+        import daemon
+        _seed(store, aid="fresh", urgency=1, first_seen=_iso(1))
+        _seed(store, aid="alerted", urgency=2, first_seen=_iso(72))
+        assert daemon._purge_worker_startup_reap(store) == 0
+        assert _urgency(store, "fresh") == 1
+        assert _urgency(store, "alerted") == 2
+
+    def test_swallows_store_exception_and_returns_zero(self):
+        import daemon
+
+        class _Boom:
+            def reap_stale_urgent(self):
+                raise RuntimeError("simulated store failure")
+
+        # A transient store error during startup must NEVER block the worker
+        # — it just logs and returns 0 so the 5-min health-ping loop still
+        # starts (a wedged purge_worker would silently disable phantom-row
+        # cleanup AND the 6h vacuum on every subsequent daemon run).
+        assert daemon._purge_worker_startup_reap(_Boom()) == 0
+
+    def test_does_not_touch_synthetic_backtest_rows(self, store):
+        """Defense-in-depth invariant: even on startup, the reap path must
+        never write into a backtest/opus row. (The startup helper delegates to
+        the same reap_stale_urgent the existing tests pin — but a future fork
+        of the helper could regress this, so it's worth its own pinning test.)
+        """
+        import daemon
+        _seed(store, aid="bt", urgency=1, first_seen=_iso(99),
+              url="backtest://run_7/2026-05-13/BUY/MU",
+              source="backtest_run_7", score_source=None)
+        _seed(store, aid="live", urgency=1, first_seen=_iso(48))
+        n = daemon._purge_worker_startup_reap(store)
+        # Only the live aged-out row was reaped; the synthetic stayed urgency=1.
+        assert n == 1
+        assert _urgency(store, "bt") == 1
+        assert _urgency(store, "live") == 0
