@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS source_health (
     last_seen TEXT,
     consecutive_failures INTEGER DEFAULT 0,
     total_articles INTEGER DEFAULT 0,
-    disabled INTEGER DEFAULT 0
+    disabled INTEGER DEFAULT 0,
+    last_success TEXT
 );
 """
 
@@ -92,6 +93,16 @@ def _connect() -> sqlite3.Connection:
         except Exception:
             pass
         conn.executescript(SCHEMA)
+        # Additive migration: pre-existing DBs created before the
+        # last_success column existed need an ALTER (CREATE TABLE IF NOT
+        # EXISTS won't add new columns to an existing table). Idempotent —
+        # caught silently if the column is already present.
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(source_health)").fetchall()]
+            if cols and "last_success" not in cols:
+                conn.execute("ALTER TABLE source_health ADD COLUMN last_success TEXT")
+        except Exception:
+            pass
         conn.commit()
         _schema_ready_path = db
     return conn
@@ -128,32 +139,47 @@ def record_result(source: str, article_count: int) -> None:
                 if article_count > 0:
                     cons_fail = 0
                     disabled = 0
+                    last_success = now
                 else:
                     cons_fail = 1
                     disabled = 0
+                    last_success = None
                 conn.execute(
                     """INSERT INTO source_health
-                       (source, last_seen, consecutive_failures, total_articles, disabled)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (source, now, cons_fail, article_count, disabled),
+                       (source, last_seen, consecutive_failures, total_articles, disabled, last_success)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (source, now, cons_fail, article_count, disabled, last_success),
                 )
             else:
                 cur_fail, cur_disabled = row[0], row[1]
                 if article_count > 0:
                     new_fail = 0
                     new_disabled = 0  # re-enable on any success
+                    # Stamp last_success only on a productive pass; a zero
+                    # pass MUST leave last_success untouched so get_dark_sources
+                    # measures from the last genuine article.
+                    conn.execute(
+                        """UPDATE source_health
+                           SET last_seen = ?,
+                               consecutive_failures = ?,
+                               total_articles = total_articles + ?,
+                               disabled = ?,
+                               last_success = ?
+                           WHERE source = ?""",
+                        (now, new_fail, article_count, new_disabled, now, source),
+                    )
                 else:
                     new_fail = cur_fail + 1
                     new_disabled = 1 if new_fail >= FAILURE_THRESHOLD else cur_disabled
-                conn.execute(
-                    """UPDATE source_health
-                       SET last_seen = ?,
-                           consecutive_failures = ?,
-                           total_articles = total_articles + ?,
-                           disabled = ?
-                       WHERE source = ?""",
-                    (now, new_fail, article_count, new_disabled, source),
-                )
+                    conn.execute(
+                        """UPDATE source_health
+                           SET last_seen = ?,
+                               consecutive_failures = ?,
+                               total_articles = total_articles + ?,
+                               disabled = ?
+                           WHERE source = ?""",
+                        (now, new_fail, article_count, new_disabled, source),
+                    )
             conn.commit()
         except Exception as e:
             _warn_dedup(f"source_health record_result failed: {e}")
@@ -244,7 +270,7 @@ def get_health_report() -> dict:
         try:
             rows = conn.execute(
                 """SELECT source, last_seen, consecutive_failures,
-                          total_articles, disabled
+                          total_articles, disabled, last_success
                    FROM source_health
                    ORDER BY source"""
             ).fetchall()
@@ -262,8 +288,90 @@ def get_health_report() -> dict:
             "consecutive_failures": r[2],
             "total_articles": r[3],
             "disabled": bool(r[4]),
+            "last_success": r[5],
         }
     return report
+
+
+# A source whose last_seen is fresh (still being polled) but whose
+# last_success is older than this threshold is "dark": the worker is
+# alive and recording results, but every result has been zero articles
+# for a long stretch. This is the chronic state of sec_edgar / polygon /
+# newsapi / nitter — never disabled long enough to count as stale, never
+# producing actual news, and impossible to tell from the disabled bit
+# alone (disabled flips off on the first article and back on after 3
+# zero passes — it doesn't carry "how long has this been going on").
+DEFAULT_DARK_SECS = 24 * 3600  # 24h without a single article
+
+
+def get_dark_sources(min_dark_secs: int = DEFAULT_DARK_SECS) -> list[tuple[str, int]]:
+    """Return (source, dark_secs) for every source actively polling but
+    productively dark.
+
+    Two distinct populations:
+      * ``last_success`` set but old: dark_secs = now - last_success, included
+        when dark_secs >= ``min_dark_secs``.
+      * ``last_success`` NULL (never produced): always included with
+        dark_secs = ``-1`` as a sentinel — "we have observed this source poll
+        but it has never returned an article since last_success tracking
+        was introduced." This is the worst case for an analyst: a source
+        that looks alive (it's polling) but has yielded literally nothing.
+
+    Stale sources (last_seen older than DEFAULT_STALE_SECS) are excluded —
+    ``get_stale_sources`` already covers a worker that stopped polling.
+
+    Sorted with NEVER-succeeded first, then by dark_secs DESC, then alpha:
+    the worst offenders surface first, and the order is stable for log lines.
+    """
+    if min_dark_secs < 0:
+        min_dark_secs = 0
+    now = datetime.now(timezone.utc).timestamp()
+    stale_cutoff = now - DEFAULT_STALE_SECS
+
+    with _lock:
+        try:
+            conn = _connect()
+        except Exception:
+            return []
+        try:
+            rows = conn.execute(
+                "SELECT source, last_seen, last_success FROM source_health"
+            ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    out: list[tuple[str, int]] = []
+    for source, last_seen, last_success in rows:
+        if not source or not last_seen:
+            continue
+        try:
+            seen_ts = datetime.fromisoformat(last_seen).timestamp()
+        except (ValueError, TypeError):
+            continue
+        # Exclude stale: get_stale_sources is the right signal for those.
+        if seen_ts < stale_cutoff:
+            continue
+        if not last_success:
+            out.append((source, -1))
+            continue
+        try:
+            success_ts = datetime.fromisoformat(last_success).timestamp()
+        except (ValueError, TypeError):
+            # Unparseable last_success: treat as never-succeeded.
+            out.append((source, -1))
+            continue
+        dark_secs = int(now - success_ts)
+        if dark_secs >= min_dark_secs:
+            out.append((source, dark_secs))
+    # -1 sentinel sorts last numerically; flip its sort key so NEVER comes
+    # first. Then by descending dark_secs for actual aged-out rows.
+    out.sort(key=lambda r: (0 if r[1] == -1 else 1, -r[1], r[0]))
+    return out
 
 
 def is_disabled(source: str) -> bool:
