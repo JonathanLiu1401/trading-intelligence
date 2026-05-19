@@ -5837,13 +5837,104 @@ def state():
 
 @app.route("/api/portfolio")
 def portfolio_api():
-    """Compact public read of the portfolio — consumed by Digital Intern's dashboard."""
+    """Compact public read of the portfolio — consumed by Digital Intern's dashboard.
+
+    Backward-compatible: the original three keys (``total_value``, ``cash``,
+    ``starting_value``) remain unchanged. We additionally expose at-a-glance
+    trader-actionable fields composed *purely* from the already-cached
+    ``portfolio.positions_json`` row (no extra store reads, no network — so
+    this endpoint stays the lean lowest-latency public surface):
+
+      * ``n_positions`` — open lots count
+      * ``open_value`` — Σ market_value across open lots (i.e. total_value − cash)
+      * ``unrealized_pl`` / ``unrealized_pl_pct`` — book-wide drift since entry,
+        the single answer to a trader's first-glance question "am I up or down
+        on what I'm holding?". ``unrealized_pl_pct`` is over ``total_value``
+        (the equity base) to align with ``benchmark`` / ``drawdown`` % framing.
+      * ``stale_marks`` — count of positions flagged ``stale_mark=True``
+        (yfinance returned nothing this cycle; the mark fell back to avg_cost).
+        Nonzero means the unrealized_pl above understates real exposure —
+        explicit so the trader is never misled by a phantom "flat" book the
+        ``stale_mark`` flag was added to expose.
+      * ``last_updated`` — ISO timestamp of the most recent mark-to-market
+        write (``store.update_portfolio``'s own clock). Lets a polling caller
+        detect "the trader has stopped writing" without re-reading equity_curve.
+      * ``pnl_vs_start`` / ``pnl_vs_start_pct`` — absolute and % delta from
+        the $1000 baseline (``INITIAL_CASH``, invariant #12; never a literal).
+
+    Pure read, never raises: every derivation is wrapped so a malformed
+    ``positions_json`` (defensive — ``get_portfolio`` already falls it back
+    to ``[]``) or a non-numeric column degrades to safe zeros while the
+    three legacy keys are always present.
+    """
     store = get_store()
     pf = store.get_portfolio()
+
+    cash_raw = pf.get("cash")
+    total_raw = pf.get("total_value")
+    try:
+        cash = float(cash_raw) if cash_raw is not None else None
+    except (TypeError, ValueError):
+        cash = None
+    try:
+        total_value = float(total_raw) if total_raw is not None else None
+    except (TypeError, ValueError):
+        total_value = None
+
+    positions = pf.get("positions") or []
+    if not isinstance(positions, list):
+        positions = []
+
+    n_positions = 0
+    open_value = 0.0
+    unrealized_pl = 0.0
+    stale_marks = 0
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+        n_positions += 1
+        try:
+            mv = float(p.get("market_value") or 0.0)
+        except (TypeError, ValueError):
+            mv = 0.0
+        open_value += mv
+        try:
+            pl = float(p.get("unrealized_pl") or 0.0)
+        except (TypeError, ValueError):
+            pl = 0.0
+        unrealized_pl += pl
+        if p.get("stale_mark"):
+            stale_marks += 1
+
+    # `unrealized_pl_pct` is the book-wide P/L over equity — aligns with the
+    # benchmark / drawdown framing (`/api/benchmark` returns pct over the
+    # equity baseline). Falls back to None when total_value is missing /
+    # non-positive (no meaningful denominator) so the panel renders "n/a"
+    # instead of an unbounded number.
+    pnl_pct = None
+    if total_value is not None and total_value > 0:
+        pnl_pct = round(unrealized_pl / total_value * 100.0, 2)
+
+    pnl_vs_start = None
+    pnl_vs_start_pct = None
+    if total_value is not None:
+        pnl_vs_start = round(total_value - INITIAL_CASH, 2)
+        if INITIAL_CASH > 0:
+            pnl_vs_start_pct = round(
+                (total_value / INITIAL_CASH - 1.0) * 100.0, 2)
+
     return jsonify({
-        "total_value": pf.get("total_value"),
-        "cash": pf.get("cash"),
+        "total_value": total_value,
+        "cash": cash,
         "starting_value": INITIAL_CASH,
+        "n_positions": n_positions,
+        "open_value": round(open_value, 2),
+        "unrealized_pl": round(unrealized_pl, 2),
+        "unrealized_pl_pct": pnl_pct,
+        "stale_marks": stale_marks,
+        "last_updated": pf.get("last_updated"),
+        "pnl_vs_start": pnl_vs_start,
+        "pnl_vs_start_pct": pnl_vs_start_pct,
     })
 
 
@@ -9587,6 +9678,46 @@ def thesis_drift_api():
         except Exception:
             signals = None  # builder degrades to price-only health
         return jsonify(build_thesis_drift(positions, trades, signals))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/reasoning-coherence")
+def reasoning_coherence_api():
+    """How stable is Opus's HOLD justification across consecutive cycles?
+
+    Distinct from ``/api/thesis-drift`` (which re-tests an OPEN POSITION's
+    entry rationale against current state — a position-level question) and
+    ``/api/decision-drought`` (which counts consecutive NO_DECISION silences,
+    not the content of HOLDs that bracket them) and ``/api/decision-
+    forensics`` (which diagnoses ONE latest decision, no across-time view).
+
+    This is the across-time complement: token-set Jaccard similarity between
+    consecutive HOLD-reasoning prose, summarised into a single ``regime``
+    verdict — ``STABLE_THESIS`` (Opus reiterating same justification cycle-
+    to-cycle, conviction signal) / ``DRIFTING`` (reasoning evolves between
+    holds) / ``RAPID_DRIFT`` (each HOLD cites different content — confusion
+    signal). ``state`` ladder mirrors neighbouring diagnostics: ``NO_DATA``
+    (no parseable HOLD reasoning), ``INSUFFICIENT`` (< 3 HOLD pairs in
+    window), ``OK`` (verdict emitted).
+
+    ``?limit=`` decisions to scan (clamped 5..500, default 100). Builder is
+    pure: degrades to ``NO_DATA`` on any store failure rather than 500. Cheap
+    by construction (no yfinance / no LLM) — not behind ``@swr_cached``.
+    Observational only — never gates Opus, never injected into the decision
+    prompt (invariants #2/#12)."""
+    try:
+        from .analytics.reasoning_coherence import build_reasoning_coherence
+        try:
+            limit = int(request.args.get("limit", 100))
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(5, min(500, limit))
+        store = get_store()
+        decisions = store.recent_decisions(limit=limit)
+        out = build_reasoning_coherence(decisions)
+        out["window_limit"] = limit
+        return jsonify(out)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
