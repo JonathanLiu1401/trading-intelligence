@@ -1161,6 +1161,37 @@ modulates identically; reasoning surfaces the skip; independent of the
   > (CLAUDE.md §6). The actionable thread: the signal demonstrably *exists*
   > in raw `ml_score` (+0.20 OOS); the MLP is the lossy component.
 
+### 52-week position outcome capture (2026-05-19)
+
+- **`_compute_decision_outcomes` now additively records `wk52_pos`
+  (0..1 trailing 52-week position) + `pct_from_52h`** alongside the
+  existing quant features. Both are already computed by
+  `_compute_technical_indicators` (`paper_trader/backtest.py`) and
+  `wk52_pos` is the threshold driving `_ml_decide`'s **bubble-top BUY
+  gate** (`wk52_pos > 0.80` → BUY suppressed; see invariant in
+  `backtest._ml_decide`). Until this pass, neither value was persisted to
+  `decision_outcomes.jsonl` — so the documented bubble-top gate
+  explanation could never be empirically checked against realized
+  forward returns by any downstream tool. The capture is purely additive:
+  `train_scorer`/`build_features` consume explicit kwargs and ignore
+  extra dict keys, so the scorer pickle, `N_FEATURES`, and every existing
+  OOS diagnostic are byte-identical (the `forward_return_10d/20d`
+  precedent). Legacy outcome rows have no `wk52_pos` key; new rows
+  populate from the next continuous cycle.
+- **Honest None semantics.** When `_compute_technical_indicators` returns
+  `None` for a ticker (history < 60 closes at sim_date), `wk52_pos` /
+  `pct_from_52h` are captured as **`None`** in the outcome row — *not* a
+  0.0 sentinel, which would be indistinguishable from a real
+  ticker-at-52w-low signal and silently poison the gate-explanation
+  analysis. Test-locked in
+  `tests/test_continuous.py::TestWk52PosCapturedInOutcomes`:
+  `test_wk52_pos_field_present_when_history_sufficient` (monotonic
+  80-day fixture → `wk52_pos ≈ 1.0`, `pct_from_52h ≈ 0%`),
+  `test_wk52_pos_is_none_when_history_insufficient` (synthetic_prices
+  fixture's 51-day series → keys present, values `None`),
+  `test_capture_does_not_break_existing_keys` (full schema regression
+  lock: every previously-documented outcome field must still appear).
+
 ### Baseline-trend reader (2026-05-18)
 
 - **`paper_trader/ml/baseline_trend.py` (new read-only diagnostic).**
