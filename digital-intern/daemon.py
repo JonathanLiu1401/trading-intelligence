@@ -68,6 +68,7 @@ from collectors.macro_calendar_collector import collect_macro_calendar
 from collectors.congress_trades_collector import collect_congress_trades
 from collectors.finra_short_volume import collect_finra_short_volume
 from collectors.market_movers import collect_market_movers
+from collectors.cisa_kev_collector import collect_cisa_kev
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -115,6 +116,7 @@ WIKIPEDIA_INTERVAL  = 600         # Wikipedia recent-changes filter every 10min
 MACRO_CALENDAR_INTERVAL = 3600    # FOMC/BLS macro event calendar — once per hour
 FINRA_SHORT_INTERVAL    = 3600    # FINRA RegSHO short volume — once per hour (daily file)
 CONGRESS_TRADES_INTERVAL = 3600   # Congressional trading disclosures — once per hour
+CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog — once per hour
 MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
@@ -190,6 +192,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "yahoo_ticker_rss": YAHOO_TICKER_RSS_INTERVAL,
     "market_movers": MARKET_MOVERS_INTERVAL,
     "wikipedia": WIKIPEDIA_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL,
+    "cisa_kev": CISA_KEV_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
     "ml_trainer": ML_TRAIN_INTERVAL,
@@ -947,6 +950,28 @@ def congress_trades_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(CONGRESS_TRADES_INTERVAL)
+
+
+# ── Worker: CISA Known Exploited Vulnerabilities — every 1h ────────────────
+def cisa_kev_worker(store: ArticleStore):
+    log.info("[cisa_kev_worker] started")
+    bo = Backoff("cisa_kev", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_cisa_kev()
+            _ingest(store, articles, "cisa_kev")
+            try:
+                source_health.record_result("cisa_kev", len(articles))
+            except Exception as he:
+                log.warning(f"[cisa_kev_worker] source_health error: {he}")
+            _worker_last_ok["cisa_kev"] = time.time()
+            log.debug(f"[cisa_kev] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[cisa_kev_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(CISA_KEV_INTERVAL)
 
 
 # ── Worker: Portfolio P/L snapshot — every 5min ─────────────────────────────
@@ -2095,6 +2120,7 @@ def main():
         ("macro_calendar", macro_calendar_worker),
         ("finra_short",   finra_short_worker),
         ("congress_trades", congress_trades_worker),
+        ("cisa_kev",    cisa_kev_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
