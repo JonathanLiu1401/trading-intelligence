@@ -9023,6 +9023,81 @@ def earnings_war_room_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/event-protection")
+@swr_cached("event-protection", 300.0)
+def event_protection_api():
+    """Sized trim + ATM-put-hedge plan for each held name that reports inside
+    the implied-move horizon. The **quantitative complement** to
+    ``/api/implied-move`` (which prices the market's 1σ move) and
+    ``/api/position-action-brief`` (which gives a qualitative ``TRIM_BEFORE_
+    EVENT`` / ``HOLD_THROUGH_EVENT`` verdict). Together they answer the
+    operator's pre-print question: *"how many shares do I trim to cap 1σ
+    downside at X% of book, and what would the equivalent put hedge cost?"*
+
+    Composes ``build_implied_move`` verbatim (single source of truth, AGENTS.md
+    #10) so this endpoint, ``/api/implied-move`` and ``/api/earnings-shock``
+    can never disagree on per-event 1σ. The builder is pure — no I/O — and
+    degrades each row honestly to ``NO_IMPLIED`` when the chain hint is
+    unavailable rather than fabricating sizing off a zero σ.
+
+    Accepts ``?target_pct=<float>`` to override the default 5% 1σ-book cap
+    (clamped to (0, 100]). Observational only — never gates Opus, never
+    injected into the decision prompt (AGENTS.md #2/#12 — the ``implied_
+    move`` / ``stress_scenarios`` precedent).
+
+    SWR-cached 5 min: matches ``/api/implied-move``'s cadence since the
+    upstream options-chain pull dominates cost."""
+    try:
+        from .analytics.event_calendar import build_event_calendar
+        from .analytics.event_protection import (
+            DEFAULT_TARGET_MAX_1SIGMA_PCT,
+            build_event_protection_plan,
+        )
+        from .analytics.implied_move import build_implied_move
+        from . import market as _market
+        try:
+            target_pct = float(request.args.get(
+                "target_pct", DEFAULT_TARGET_MAX_1SIGMA_PCT))
+        except (TypeError, ValueError):
+            target_pct = DEFAULT_TARGET_MAX_1SIGMA_PCT
+        if not (0.0 < target_pct <= 100.0):
+            target_pct = DEFAULT_TARGET_MAX_1SIGMA_PCT
+
+        store = get_store()
+        pf = store.get_portfolio()
+        positions = store.open_positions()
+        try:
+            from .strategy import WATCHLIST as _WATCHLIST
+            watch = {t.upper() for t in _WATCHLIST}
+        except Exception:
+            watch = set()
+        held = {(p.get("ticker") or "").upper()
+                for p in positions if p.get("ticker")}
+        total_value = float(pf.get("total_value") or 0.0)
+
+        ec = build_event_calendar(positions, held | watch)
+
+        def _chain_provider(ticker: str, dte: int):
+            try:
+                return _market.get_options_chain(ticker, target_dte=dte)
+            except Exception:
+                return None
+
+        implied = build_implied_move(
+            positions, total_value, ec,
+            options_provider=_chain_provider,
+        )
+        result = build_event_protection_plan(
+            positions,
+            total_value,
+            implied,
+            target_max_1sigma_loss_pct=target_pct,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/macro-calendar")
 def macro_calendar_api():
     """The exact forward FOMC rate-decision awareness block the live trader
@@ -11564,6 +11639,13 @@ def _swr_prewarm():
         ("earnings-war-room", earnings_war_room_api),
         ("restart-recommendation", restart_recommendation_api),
         ("position-action-brief", position_action_brief_api),
+        # event-protection @swr_cached 300s — composes /api/implied-move's
+        # options-chain pull (1-2s per held earnings name) and sizes a trim +
+        # ATM-put-hedge plan against a configurable 1σ-book cap. Same cold-
+        # stall blind spot the prewarm-coverage invariant locks against; first
+        # poll right after a restart is exactly when the operator is triaging
+        # pre-print risk.
+        ("event-protection", event_protection_api),
     ]
     for name, wrapper in targets:
         try:
