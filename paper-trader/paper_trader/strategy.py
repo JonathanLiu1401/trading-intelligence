@@ -65,6 +65,26 @@ _active_claude_proc: subprocess.Popen | None = None
 # only from decide(), so a single module global is race-free here.
 _quota_exhausted = False
 
+# Set by _claude_call on EVERY failure path with a short, specific cause code
+# (None on success). decide() reads this when raw is None to write a more
+# diagnostic reason into decisions.reasoning. Five buckets are emitted today,
+# all collapsing into the previous one-size-fits-all "claude returned no
+# response (timeout/empty)" line:
+#   * "timeout"      — subprocess.TimeoutExpired (full DECISION_TIMEOUT_S hit;
+#                      Opus / network / CLI wedged on the wire)
+#   * "nonzero_rc"   — proc.returncode != 0 with no quota marker (CLI crashed
+#                      or hit a transient API error; quota gets its own path)
+#   * "empty_stdout" — rc=0 but stdout was empty (CLI completed without
+#                      producing text — model-level empty response, distinct
+#                      from a timeout; usually a one-cycle blip)
+#   * "cli_missing"  — `claude` not in PATH at call time
+#   * "exception"    — Popen/communicate raised
+# Reset to None at the TOP of every _claude_call (not just on success) so a
+# success after a failure cannot leak the stale code into the next cycle.
+# Per-call, never sticky — distinct from _quota_exhausted (sticky-by-design).
+# The new no_decision_reasons sub-buckets key off the suffix in parentheses.
+_last_claude_fail: str | None = None
+
 # Tight marker set — matched case-insensitively against the claude CLI's
 # stdout/stderr ONLY on a non-zero exit. Kept precise so an unrelated failure
 # (network blip, transient 5xx, parse miss) does NOT trip the trader-facing
@@ -368,9 +388,13 @@ def _format_quant_signals(sigs: dict[str, dict]) -> str:
 
 def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
                  model: str = MODEL) -> str | None:
-    global _active_claude_proc, _quota_exhausted
+    global _active_claude_proc, _quota_exhausted, _last_claude_fail
+    # Reset per-call so a success after a failure cannot leak the stale code
+    # into the next cycle's diagnostic reason text.
+    _last_claude_fail = None
     if not shutil.which("claude"):
         print("[strategy] claude CLI not found")
+        _last_claude_fail = "cli_missing"
         return None
     # A claude call still alive from a prior cycle competes for the same API
     # quota as this one and makes *both* time out. Kill the stale one first.
@@ -401,6 +425,7 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
             except Exception:
                 pass
             print(f"[strategy] claude timeout after {timeout_s}s")
+            _last_claude_fail = "timeout"
             return None
         finally:
             _active_claude_proc = None
@@ -419,13 +444,23 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
             if _is_quota_exhausted(f"{stdout or ''}\n{stderr or ''}"):
                 _quota_exhausted = True
                 print(f"[strategy] claude QUOTA EXHAUSTED (rc={proc.returncode}): {err}")
+                # Don't tag _last_claude_fail — decide() takes a dedicated
+                # branch on _quota_exhausted with its own reason text.
             else:
                 print(f"[strategy] claude err (rc={proc.returncode}): {err}")
+                _last_claude_fail = "nonzero_rc"
             return None
-        return (stdout or "").strip() or None
+        text = (stdout or "").strip()
+        if not text:
+            # CLI exited cleanly but produced no output — distinct from a
+            # timeout (the model itself returned empty within budget).
+            _last_claude_fail = "empty_stdout"
+            return None
+        return text
     except Exception as e:
         print(f"[strategy] claude exception: {e}")
         _active_claude_proc = None
+        _last_claude_fail = "exception"
         return None
 
 
@@ -1648,7 +1683,15 @@ def decide() -> dict:
             tag = "retry_failed" if retried else "parse_failed"
             reason_text = f"{tag}: {excerpt}"
         else:
-            reason_text = "claude returned no response (timeout/empty)"
+            # Sub-bucket the empty-response case using the per-call cause code
+            # _claude_call just set. Keeps the literal "claude returned no
+            # response" prefix verbatim — /api/empty-claude-rate and
+            # model_reliability key off that substring (strategy.py:1641) and
+            # the existing no_decision_reasons.model_empty bucket stays the
+            # back-compat fallback for any code path that didn't set a cause.
+            # The new analytics sub-buckets read the parenthesised suffix.
+            cause = _last_claude_fail or "timeout/empty"
+            reason_text = f"claude returned no response ({cause})"
         store.record_decision(market_open, len(merged), "NO_DECISION",
                               reason_text,
                               snap["total_value"], snap["cash"])
