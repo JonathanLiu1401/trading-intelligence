@@ -9518,6 +9518,23 @@ def decision_health_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/decision-pace")
+@swr_cached("decision-pace", 30.0)
+def decision_pace_api():
+    """Rolling inter-decision latency distribution — is the runner cycling on
+    cadence? Splits gaps by market_open and reports per-window p50/p95/max so
+    a stalled cycle shows as a tail, not as a flat decisions/day aggregate.
+
+    Closes the gap between /api/decision-health (one decisions/day scalar) and
+    /api/runner-heartbeat (single-sample 'is the loop alive *now*' check)."""
+    try:
+        from .analytics.decision_pace import build_decision_pace
+        decisions = get_store().recent_decisions(limit=2000)
+        return jsonify(build_decision_pace(decisions))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/decision-forensics")
 def decision_forensics_api():
     """*Why* the live trader produces no decision — failure-mode taxonomy.
@@ -11491,6 +11508,7 @@ def _swr_prewarm():
         ("benchmark", benchmark_api),
         ("capital-paralysis", capital_paralysis_api),
         ("decision-health", decision_health_api),
+        ("decision-pace", decision_pace_api),
         ("runner-heartbeat", runner_heartbeat_api),
         ("scorer-confidence", scorer_confidence_api),
         # scorer-attribution was @swr_cached but never prewarmed — the same
