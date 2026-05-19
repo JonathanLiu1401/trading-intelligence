@@ -160,3 +160,72 @@ class TestDedup:
         # Second run sees the exact same article and must skip it via the
         # seen_articles dedup index.
         assert second == []
+
+
+class TestSeenDbHardening:
+    """Pins the SQLite hardening on the shared ``seen_articles.db``.
+
+    Live failure (2026-05-19 daemon.log): market_movers_worker hit "database is
+    locked" seven times in eleven minutes (10s/20s/40s/80s/160s/320s/600s back-
+    off), then was flagged DEAD by the supervisor (last_ok=1471s — 25 min with
+    no successful collection cycle). The cause was the bare
+    ``sqlite3.connect(str(DB_PATH))`` — default ``busy_timeout=0`` so the first
+    concurrent writer on the shared dedup store raised immediately. Every other
+    collector that touches ``seen_articles.db`` already uses ``timeout=30`` +
+    ``PRAGMA busy_timeout=30000`` (google_news, rss_collector, finnhub, ...);
+    market_movers was the lone holdout. The hardening MUST stick — without it
+    the worker silently degrades to ~0 cycles/h on a busy daemon."""
+
+    def test_collect_uses_timeout_30(self, monkeypatch, tmp_path):
+        """collect_market_movers must open seen_articles.db with timeout=30
+        — without it the Python wrapper bails on the FIRST contended write."""
+        captured: dict = {}
+        real_connect = market_movers.sqlite3.connect
+
+        def spy_connect(*args, **kwargs):
+            captured["kwargs"] = dict(kwargs)
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(market_movers, "DB_PATH",
+                            tmp_path / "seen_articles.db")
+        monkeypatch.setattr(market_movers.sqlite3, "connect", spy_connect)
+        monkeypatch.setattr(market_movers, "_fetch_screener", lambda s: [])
+
+        market_movers.collect_market_movers()
+
+        assert captured.get("kwargs", {}).get("timeout") == 30, (
+            "market_movers must connect with timeout=30; got "
+            f"{captured.get('kwargs')!r}. Without the Python-wrapper timeout "
+            "the FIRST concurrent write on the shared seen_articles.db raises "
+            "OperationalError('database is locked') immediately and the cycle "
+            "aborts — observed live as exponential backoff to DEAD."
+        )
+
+    def test_ensure_db_sets_busy_timeout_and_wal(self, tmp_path):
+        """``_ensure_db`` must arm the connection with busy_timeout=30000 ms
+        and WAL journal mode — what SQLite actually consults during a lock
+        wait. busy_timeout=0 (default) means a contended write fails instantly,
+        not after a 30s grace period, regardless of the Python-wrapper timeout
+        above. Verifies the PRAGMA state directly so a regression to
+        ``conn.execute("PRAGMA ...")`` being silently dropped is caught."""
+        import sqlite3
+        db_path = tmp_path / "seen_articles.db"
+        conn = sqlite3.connect(str(db_path), timeout=30,
+                               check_same_thread=False)
+        try:
+            market_movers._ensure_db(conn)
+            busy = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        finally:
+            conn.close()
+
+        assert busy == 30000, (
+            f"expected busy_timeout=30000 ms, got {busy}. With busy_timeout=0 "
+            f"(SQLite default) any concurrent writer on the shared "
+            f"seen_articles.db raises 'database is locked' immediately."
+        )
+        assert (journal or "").lower() == "wal", (
+            f"expected WAL journal mode, got {journal!r}. Other collectors on "
+            f"the same shared DB use WAL — a non-WAL writer would block every "
+            f"other reader for the duration of its transaction."
+        )
