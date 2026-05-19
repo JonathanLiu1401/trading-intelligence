@@ -73,14 +73,24 @@ def healthz_api():
     last_decision_age_s: float | None = None
     try:
         st = get_store()
-        conn = st.conn
-        row = conn.execute(
-            "SELECT COUNT(*) FROM positions WHERE closed_at IS NULL AND qty != 0"
-        ).fetchone()
+        # The store's connection is shared across threads (check_same_thread=
+        # False) and writes serialise on ``st._lock`` (store.py:134 docstring).
+        # An unlocked read whose ``execute()`` interleaves with a concurrent
+        # writer raises ``sqlite3.InterfaceError: bad parameter or other API
+        # misuse`` or hands back a corrupted/None row — the very 500s the
+        # store.py invariant exists to prevent. Hold ``_lock`` only across the
+        # two reads; the git probe + parsing above are deliberately outside
+        # the critical section (the writer would otherwise stall behind a
+        # subprocess shell-out on every /api/healthz hit). Mirrors the
+        # ``/api/trade-attribution`` access pattern at line 10216.
+        with st._lock:  # noqa: SLF001 — documented store-access discipline
+            row = st.conn.execute(
+                "SELECT COUNT(*) FROM positions WHERE closed_at IS NULL AND qty != 0"
+            ).fetchone()
+            row2 = st.conn.execute(
+                "SELECT MAX(timestamp) FROM decisions"
+            ).fetchone()
         positions_n = int(row[0]) if row else 0
-        row2 = conn.execute(
-            "SELECT MAX(timestamp) FROM decisions"
-        ).fetchone()
         if row2 and row2[0]:
             try:
                 last_iso = str(row2[0]).replace("Z", "+00:00")
@@ -6836,6 +6846,56 @@ def analytics_api():
         mt = _mark_trust_block(store)
         if mt is not None:
             payload["mark_trust"] = mt
+        # Per-held-ticker source-diversity verdict — orthogonal to
+        # /api/news-velocity (which measures rate). A SURGING z-score is
+        # identical whether five outlets are reporting or one wire is
+        # mirrored across five feeds; ``ECHO`` is the false-signal case
+        # velocity cannot see. Composes the held set from the same
+        # ``positions`` already on hand. Additive top-level key (keyed
+        # asserts, never whole-dict equality) so the digital-intern
+        # analyst chat that fetches /api/analytics inherits the breadth
+        # verdict for free — the tail_risk/stress_scenarios/recovery
+        # additive-key precedent. Wrapped in try/except: a fault drops
+        # ONLY this key, never sinks /api/analytics (the _safe contract).
+        try:
+            from .analytics.news_source_mix import build_news_source_mix
+            held = _stock_tickers_from_positions(positions)
+            if held:
+                path = _articles_db_path()
+                if path is not None:
+                    now_utc = datetime.now(timezone.utc)
+                    since = (now_utc - timedelta(hours=24.0)).isoformat()
+                    conn = sqlite3.connect(
+                        f"file:{path}?mode=ro", uri=True, timeout=3)
+                    conn.row_factory = sqlite3.Row
+                    try:
+                        like_clauses = " OR ".join(
+                            ["title LIKE ?"] * len(held))
+                        like_params = [f"%{t}%" for t in held]
+                        rows = conn.execute(
+                            f"SELECT title, source, first_seen "
+                            f"FROM articles WHERE first_seen >= ? "
+                            f"AND ({like_clauses}) "
+                            f"AND url NOT LIKE 'backtest://%' "
+                            f"AND source NOT LIKE 'backtest_%' "
+                            f"AND source NOT LIKE 'opus_annotation%' "
+                            f"ORDER BY first_seen DESC LIMIT 5000",
+                            [since] + like_params,
+                        ).fetchall()
+                    finally:
+                        conn.close()
+                    articles = [
+                        {"title": r["title"] or "",
+                         "source": r["source"] or "",
+                         "first_seen": r["first_seen"]}
+                        for r in rows
+                    ]
+                    payload["news_source_mix"] = build_news_source_mix(
+                        articles, held, now=now_utc, window_hours=24.0,
+                    )
+        except Exception as _e:
+            # Swallow — additive key only, never sinks /api/analytics.
+            pass
         return jsonify(payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -11476,11 +11536,16 @@ def _swr_prewarm():
         # spot the prewarm-coverage invariant locks against; matches the
         # earnings-shock prewarm cadence.
         ("implied-move", implied_move_api),
-        # earnings-war-room @swr_cached 300s — composes implied-move +
-        # earnings-shock + stress + event-calendar, so it inherits the slow
-        # yfinance options-chain + earnings-history I/O of its inputs. Same
-        # prewarm-coverage cold-stall invariant.
+        # The four endpoints below were @swr_cached but never added to this
+        # prewarm list — exactly the freeze-triage cold-stall blind spot the
+        # test_swr_prewarm_coverage invariant exists to catch. A trader who
+        # opens these panels right after a restart got {"warming": true}
+        # instead of real data for one full TTL cycle. Restored to keep the
+        # prewarm == @swr_cached contract intact.
+        ("suggestion_impact", suggestion_impact_api),
         ("earnings-war-room", earnings_war_room_api),
+        ("restart-recommendation", restart_recommendation_api),
+        ("position-action-brief", position_action_brief_api),
     ]
     for name, wrapper in targets:
         try:
@@ -11820,6 +11885,107 @@ def news_velocity_api():
         result = build_news_velocity(
             articles, held, now=now_utc,
             window_hours=window_h, baseline_hours=baseline_h,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR",
+                        "per_ticker": []}), 500
+
+
+@app.route("/api/news-source-mix")
+def news_source_mix_api():
+    """Per-held-ticker news source-diversity verdict (STRONG/MODERATE/
+    ECHO/QUIET).
+
+    Complementary to ``/api/news-velocity``. Velocity reports *rate*
+    (BUILDING/FADING); a SURGING z-score of +4 looks identical whether
+    five distinct outlets are reporting genuine news or one wire is
+    being mirrored across five feeds. ``ECHO`` is the false-signal
+    case velocity cannot see. Combined: SURGING + STRONG = real
+    catalyst; SURGING + ECHO = syndication artifact.
+
+    Reads the digital-intern articles.db through the freshness-aware
+    ``_articles_db_path()`` (invariant #17). Live-only clause applied
+    (AGENTS.md invariant #3). The pure ``build_news_source_mix`` composes
+    the verdict on already-fetched rows so it stays unit-testable
+    without a DB.
+
+    Query params (clamped):
+      * ``window_hours`` — 1..72, default 24
+      * ``tickers`` — comma-separated override; default = open held stock
+        tickers from ``store.open_positions()``
+
+    Observational only — never gates Opus, no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.news_source_mix import build_news_source_mix
+
+        try:
+            window_h = float(request.args.get("window_hours", 24.0))
+        except Exception:
+            window_h = 24.0
+        window_h = max(1.0, min(window_h, 72.0))
+
+        override = (request.args.get("tickers") or "").strip()
+        if override:
+            held = [t.strip().upper() for t in override.split(",") if t.strip()]
+        else:
+            store = get_store()
+            held = _stock_tickers_from_positions(store.open_positions())
+
+        now_utc = datetime.now(timezone.utc)
+        if not held:
+            return jsonify(build_news_source_mix([], [], now=now_utc,
+                                                 window_hours=window_h))
+
+        path = _articles_db_path()
+        if path is None:
+            return jsonify({
+                "as_of": now_utc.isoformat(timespec="seconds"),
+                "state": "NO_DATA",
+                "headline": "Source mix: articles.db not found.",
+                "window_hours": window_h,
+                "n_held": len(held),
+                "n_with_data": 0,
+                "any_echo": False,
+                "per_ticker": [],
+            })
+
+        # Pre-filter SQL by per-ticker LIKE union — same cost discipline as
+        # /api/news-velocity. Window is bounded (default 24h) so the row
+        # cap of 5000 is more than enough on the observed 1.47M-rows/7d
+        # articles.db. Word-boundary refinement happens inside the
+        # builder.
+        since = (now_utc - timedelta(hours=window_h)).isoformat()
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            like_clauses = " OR ".join(["title LIKE ?"] * len(held))
+            like_params = [f"%{t}%" for t in held]
+            rows = conn.execute(
+                f"SELECT title, source, first_seen "
+                f"FROM articles WHERE first_seen >= ? "
+                f"AND ({like_clauses}) "
+                f"AND url NOT LIKE 'backtest://%' "
+                f"AND source NOT LIKE 'backtest_%' "
+                f"AND source NOT LIKE 'opus_annotation%' "
+                f"ORDER BY first_seen DESC LIMIT 5000",
+                [since] + like_params,
+            ).fetchall()
+        finally:
+            conn.close()
+
+        articles = [
+            {
+                "title": r["title"] or "",
+                "source": r["source"] or "",
+                "first_seen": r["first_seen"],
+            }
+            for r in rows
+        ]
+
+        result = build_news_source_mix(
+            articles, held, now=now_utc, window_hours=window_h,
         )
         return jsonify(result)
     except Exception as e:
@@ -12443,6 +12609,48 @@ def position_action_brief_api():
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e), "briefs": []}), 500
+
+
+@app.route("/api/reentry-velocity")
+def reentry_velocity_api():
+    """Close→re-buy interval distribution per ticker.
+
+    ``/api/track-record`` gives Opus a per-name *memory* of how prior
+    round-trips on that ticker ended (the verbatim loser/winner-autopsy).
+    ``/api/churn`` reports size-weighted intraday turnover. Neither
+    surfaces the explicit close-to-re-buy interval, which is the
+    documented fast-flip pathology (CLAUDE.md / AGENTS.md observed
+    ``avg_holding_days`` ~0.27 with the NVDA→LITE→NVDA shape and
+    ``KNIFE_CATCH`` repeats).
+
+    The builder composes ``round_trips.build_round_trips`` (the
+    closed-round-trip SSOT — invariant #10) and walks each key's exits
+    to the next same-key entry. Open positions whose key has a prior
+    closed round-trip surface as ``open_after_close=True`` rows so the
+    *live* fast-flip case is visible too (round_trips alone never sees
+    a still-open re-entry).
+
+    Observational only — never gates Opus, no caps (AGENTS.md #2 / #12).
+    """
+    try:
+        from .analytics.reentry_velocity import build_reentry_velocity
+
+        store = get_store()
+        trades = list(reversed(store.recent_trades(2000)))  # oldest → newest
+        open_pos = store.open_positions()
+        now_utc = datetime.now(timezone.utc)
+        try:
+            limit = int(request.args.get("recent_limit", 10))
+        except Exception:
+            limit = 10
+        limit = max(1, min(limit, 100))
+        result = build_reentry_velocity(
+            trades, open_positions=open_pos, now=now_utc, recent_limit=limit,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR",
+                        "recent_gaps": [], "per_ticker": []}), 500
 
 
 if __name__ == "__main__":
