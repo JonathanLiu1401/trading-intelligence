@@ -8266,3 +8266,181 @@ python3 -m paper_trader.ml.scorer_freshness
   "why does this ticker map to sector_other?"** — without it, a
   reviewer could easily mistake a real coverage gap (the 41 silently-
   mapped tickers this pass fixed) for an intentional choice.
+
+
+## Review pass #34 — paper-trader core hybrid (2026-05-19, ~07:15 UTC)
+
+### Phase 1 — no fixes
+
+Read every load-bearing core file in full
+(`runner.py`, `reporter.py`, `signals.py`, `strategy.py`, `dashboard.py`,
+`market.py`, `store.py`) plus the recently-touched `host_guard.py` and
+`analytics/correlation.py`. The 423 baseline core tests passed cleanly.
+A careful trace through the quota-latch flow, singleton-lock degraded
+→ recovered transitions, `_window_delta` / `_movers` / `_realized_pl_today`
+edge cases, `_extract_tickers` cashtag-vs-bare regex asymmetry, the
+`_execute` BUY/SELL/option paths, and `_mark_to_market` stale flagging
+turned up no actionable bug. The reporter additive contract held
+end-to-end; the host-guard pulse → discord wiring was correct under load.
+Per the Phase 1 commit guard, **no Phase 1 commit** — the diff was empty
+after the read pass.
+
+### Phase 2 (commit `a5b1d0b`) — SINGLE_NAME_RISK concentration alert in Discord
+
+`/api/correlation` exposes the `SINGLE_NAME_RISK` verdict (top stock-book
+weight ≥ `DOMINANT_WEIGHT` = 60%) on the *dashboard* and the
+`risk_mirror` block surfaces the same fields to Opus in the *prompt*
+(strategy.py `build_risk_mirror` call site). But the operator who lives
+in Discord never saw this verdict directly — per-position weight %s in
+`_portfolio_lines` exposed the raw number, but nothing flagged the
+categorical "this is single-name risk" alarm. The live 2026-05-19 book
+sat at NVDA **75%** of stock book — deep in SINGLE_NAME_RISK territory —
+with **nothing in any hourly/daily Discord report** saying so. This pass
+closed the same dashboard→Discord gap `_capital_pulse_line` /
+`_host_pulse_line` / `_position_attention_line` each closed, one
+dimension over (capital → host → per-position → name-concentration).
+
+`reporter._concentration_line(store)` composes
+`build_correlation` **verbatim** (single source of truth, invariant #10;
+same builder `/api/correlation` uses). **Pure store reads only — NO
+network** (the Discord-path discipline; `price_history` is intentionally
+passed as `{}` so a per-position yfinance hop is never required, the
+`_stress_line` / `_recovery_line` / `risk_mirror` no-history precedent).
+Computes per-position `market_value` inline (option ×100; stale-mark
+falls back to `avg_cost` so a yfinance outage doesn't silently halve the
+apparent concentration). Wired into both `send_hourly_summary` and
+`send_daily_close` after `_capital_pulse_line` and before
+`_position_attention_line` — load-bearing order
+HOST→CAPITAL→CONCENTRATION→ATTENTION→CLOCK (structural risks first,
+drift signals after, the established #33 ordering).
+
+**Suppression: surface ONLY SINGLE_NAME_RISK.** DIVERSIFIED / MODERATE /
+INSUFFICIENT-with-low-top-weight / NO_DATA / empty-headline all stay
+silent so a balanced book adds no hourly noise (the `_capital_pulse_line`
+FREE-and-not-bleeding precedent — the summary must never become its own
+lying green light). The per-position weights in `_portfolio_lines`
+continue to show raw numbers regardless, so a non-SINGLE_NAME_RISK book
+remains fully diagnosable from the existing lines. The SINGLE_NAME_RISK
+threshold uses the builder's own `DOMINANT_WEIGHT` constant (0.60) so
+the no-history and OK-state paths land on the same gate.
+
+Failure contract mirrors the rest of `reporter`: any builder/store fault
+degrades to `""` ("no concentration line this report"), **never** an
+exception ("no Discord summary this report"). Locked by 17 tests in
+`TestConcentrationLine`:
+
+* state-ladder suppression (`DIVERSIFIED` / `MODERATE` /
+  `NO_DATA` / `INSUFFICIENT`-below-threshold / unparseable-top-weight /
+  non-dict / builder-fault all silent);
+* OK-state SINGLE_NAME_RISK headline surfaced verbatim;
+* INSUFFICIENT-with-dominant-weight surfaces via the weight-based
+  fallback synthesis (the buried "verdict withheld" sentence never leaks
+  through);
+* empty-headline OK-state synthesises a body rather than dropping the
+  alarm (defensive against a future builder regression);
+* `market_value` uses ×100 multiplier on options;
+* `market_value` falls back to `avg_cost` when current_price is the
+  default 0 (the stale-mark scenario);
+* end-to-end wiring in both `send_hourly_summary` and
+  `send_daily_close`;
+* whole summary still ships when the correlation builder raises (the
+  reporter additive failure contract);
+* **end-to-end against the REAL `build_correlation`** with a seeded
+  75% NVDA store — this last test is the regression-catch for the
+  signature-mismatch bug fixed in `dc49740` (see Phase 3 below).
+
+### Phase 3 — live validation against the running trader (07:08–07:15 UTC)
+
+1. ✅ **`/api/portfolio`** healthy — $1000 equity, NVDA 2 sh @ $222.35
+   + TQQQ 2 sh @ $74.28. `stale_marks: 0`. Zero P/L is coincidence
+   (market closed, both buys filled at the after-hours close print).
+2. ✅ **`/api/runner-heartbeat`** `verdict: HEALTHY`, last decision 1h
+   ago, lock acquired by PID 2544540, Discord notify HEALTHY. Decision
+   efficacy reads `DEGRADED — 70% of the last 20 cycles were
+   NO_DECISION` — expected during this 4-agent concurrent review.
+3. ✅ **`/api/correlation`** confirms `SINGLE_NAME_RISK — NVDA is 75%
+   of the book` — exactly the case my new feature surfaces in Discord
+   on the next hourly cycle.
+4. ⚠️ **`/api/host-guard`** `state: SATURATED`, 7 concurrent Opus
+   (`>4`), 75.6% starvation rate. The 4-agent review IS the saturation;
+   known [[pt-no-decision-host-saturation]]. Not a code bug.
+5. ⚠️ **`/api/decision-drought`** `current_drought: PARALYSIS` 3.99h
+   long, `alpha_pct: 0.0` (market closed, no alpha to bleed).
+6. ⚠️ **`/api/build-info`** `behind: 5` commits. The live runner is on
+   boot SHA `f3e3020`; HEAD moved 5 commits forward during this review
+   round (sibling agents' commits + my own). The git-watcher's deferred
+   restart will trigger on the next cycle boundary.
+7. ⚠️ **`/api/supervision`** `verdict: UNSUPERVISED_STALE`, `orphan:
+   true` (PPID 1), `systemd: "Failed to connect to bus: No medium
+   found"`. The trader runs as a manual orphan; if its git-watcher /
+   deadman fires an `os._exit(0)`, there is **no systemd safety net to
+   bring it back up**. Known [[pt-systemd-vs-manual-restart-spam]] —
+   the operator chose this configuration.
+8. 🐛 **My own bug, caught by live validation:**
+   `reporter._concentration_line` invoked `build_correlation(sized)`
+   with one positional arg, but the builder requires `(positions,
+   price_history)`. Every Phase-2 test passed because they all
+   monkeypatched `build_correlation` with a lambda accepting `*a, **k`
+   — so the `TypeError` was silently swallowed by the outer
+   `try/except` and the Discord block dropped every cycle. Fixed in
+   commit `dc49740` by (a) passing `price_history={}` (the no-network
+   discipline) and (b) keying SINGLE_NAME_RISK off `top_weight_pct ≥
+   DOMINANT_WEIGHT` directly so the no-history INSUFFICIENT path still
+   surfaces the alarm (the `risk_mirror` weight-based-fallback
+   precedent). Added 4 regression tests, including one that exercises
+   the **real `build_correlation`** end-to-end against a fresh_store
+   seeded to the live 75% NVDA shape — a future signature drift fails
+   loudly in CI rather than silently dropping the Discord block.
+   Verified live with
+   `python3 -c "from paper_trader import reporter; from
+   paper_trader.store import get_store; print(reporter._concentration_line(get_store()))"`
+   → produced
+   `⚠️ **CONCENTRATION** ◈ SINGLE_NAME_RISK\n> SINGLE_NAME_RISK — NVDA
+   is 75% of a 2-name stock book — 1.6 effective name(s) by weight.`
+
+### How to run / test
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Sanity import + full focused core suite (~3s, deterministic, offline)
+python3 -c "import sys; sys.path.insert(0, '.'); from paper_trader import signals, reporter, strategy; print('imports OK')"
+python3 -m pytest tests/test_core_strategy.py tests/test_core_runner.py tests/test_core_reporter.py tests/test_core_signals.py tests/test_core_market.py tests/test_core_runner_cycle.py tests/test_risk_mirror.py tests/test_correlation.py -v
+
+# Just this pass's surface
+python3 -m pytest tests/test_core_reporter.py::TestConcentrationLine -v   # 17 tests
+
+# Inspect the new line against the live store
+python3 -c "from paper_trader import reporter; from paper_trader.store import get_store; print(reporter._concentration_line(get_store()))"
+
+# Operator-level diagnostics still working
+python3 -m paper_trader.should_restart    # OK / RESTART / OPS_ONLY / ERROR
+python3 -m paper_trader.host_guard        # CLEAR / SATURATED + opus_count + load + swap
+```
+
+### Invariants reaffirmed by this pass
+
+* **No `git add -A`** — sibling agents were running concurrently on the
+  same tree; explicit pathspec on every commit
+  ([[pt-concurrent-samerole-staging-race]] discipline). Both my commits
+  (`a5b1d0b`, `dc49740`) staged ONLY `paper_trader/reporter.py` +
+  `tests/test_core_reporter.py`; sibling work was correctly left out.
+* **Reporter additive contract** — fault → `""`, never *no summary*.
+  The `_concentration_line` `try/except` swallows builder faults; the
+  whole hourly / daily-close still ships.
+* **Single source of truth (invariant #10)** — the line composes
+  `build_correlation` verbatim, never re-derives a top-weight number.
+  Even the no-history weight-based fallback reads the SAME
+  `top_weight_pct` / `top_weight_ticker` / `effective_positions_naive`
+  / `n_stock_positions` fields the OK-headline reads from.
+* **Discord-path no-network discipline** — passing `price_history={}`
+  preserves the zero-yfinance-call guarantee every recent reporter line
+  reaffirms (`_stress_line` / `_recovery_line` / `_capital_pulse_line`).
+* **Mock-vs-real test discipline** — every monkeypatch'd test was
+  joined by ONE real-builder end-to-end test (the
+  `test_calls_real_build_correlation_with_correct_signature` regression
+  lock). Phase-3 caught that the original Phase-2 tests had ALL been
+  monkeypatched, masking a real signature mismatch; the new
+  real-builder test ensures any future signature drift fails in CI
+  rather than silently in production.
+
