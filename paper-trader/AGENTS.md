@@ -7349,3 +7349,94 @@ python3 -m pytest tests/test_decision_scorer_attribution.py \
   returns a safe dict with `off_distribution=True`, never an
   exception. The new tests lock this contract so a refactor
   cannot silently break `/api/scorer-attribution`.
+
+---
+
+### 2026-05-19 feat (Agent 4 product-engineer pass) — `/api/reasoning-coherence`
+
+A live operator question no existing endpoint answers: when Opus repeats
+HOLD for many cycles, is it reiterating *the same thesis* (conviction
+signal) or citing *different content each pass* (confusion signal —
+groping for a different justification)? Adjacent diagnostics are silent
+on this:
+  * `/api/decision-drought` counts consecutive NO_DECISION cycles —
+    frequency of silence, not coherence of HOLDs that bracket it.
+  * `/api/decision-forensics` diagnoses ONE latest decision — no
+    across-time view of how reasoning evolves.
+  * `/api/thesis-drift` re-tests an OPEN POSITION's entry rationale
+    against current state — a position-level question, not a
+    reasoning-evolution one. (**Naming-collision note**: my feature is
+    reasoning-COHERENCE, the existing one is thesis-DRIFT; distinct
+    domains, do not merge.)
+
+**Route** `/api/reasoning-coherence?limit=100` (clamped 5..500). Pure
+builder at `paper_trader/analytics/reasoning_coherence.py` reads the
+last N rows of `store.recent_decisions`, filters to `action_taken`
+starting with `HOLD`, parses each row's `reasoning` JSON envelope
+(`{"decision": {"reasoning": "..."}}` — strips `parse_failed:` /
+`retry_failed:` prefixes from `strategy._should_retry_parse` capture;
+tolerates ```json``` fences), extracts the prose, then computes
+**token-set Jaccard similarity between consecutive HOLD reasonings**
+over content tokens (alphanumeric, length≥3, stopword-filtered).
+
+**Regime ladder** (median Jaccard over emitted pairs):
+  * `STABLE_THESIS` (median ≥ 0.60) — Opus reiterating same justification
+  * `DRIFTING` (0.30 ≤ median < 0.60) — reasoning evolves between holds
+  * `RAPID_DRIFT` (median < 0.30) — each HOLD cites different content
+
+**State ladder** (operator clarity over verdict pressure):
+  * `NO_DATA` — no HOLD rows with parseable reasoning in window
+  * `INSUFFICIENT` — fewer than `MIN_PAIRS_FOR_VERDICT = 3` HOLD pairs;
+    raw stats still emitted so the operator sees "only 1 HOLD pair this
+    window" rather than mistaking silence for OK
+  * `OK` — regime + headline emitted
+
+Output carries per-pair `(a_ts, b_ts, similarity)` for drill-down, plus
+`min` / `max` / `median` similarity and the threshold constants in-band
+so a UI can render the band the regime fell in.
+
+**Locks (`tests/test_reasoning_coherence.py`, 19 tests, 0.80s):**
+  1. NO_DATA / INSUFFICIENT / OK ladder + min-pairs gating
+  2. Regime thresholds (STABLE/DRIFTING/RAPID_DRIFT) all exercised with
+     constructed pairs whose content tokens land deterministically in
+     band
+  3. JSON envelope extraction (canonical + top-level `reasoning`
+     fallback)
+  4. `parse_failed:` / `retry_failed:` prefix stripping
+  5. HOLD filter excludes NO_DECISION / BLOCKED / FILLED / SKIPPED rows
+  6. Garbage-input total-tolerance — no field type raises
+  7. Caller's list not mutated
+  8. **No-subprocess / no-claude_call / no-yfinance / no-sqlite3 purity**
+  9. Route surface: JSON envelope, `limit` clamp (5..500), broken-store
+     degrades to 500 + JSON error (not crash)
+  10. **NOT behind `@swr_cached`** — cheap by construction
+     (recent_decisions + pure builder, no yfinance / no LLM); locked so
+     a future refactor doesn't bring in the prewarm-coverage obligation
+
+**Observational only** (invariants #2/#12 — never gates Opus, never
+injected into the decision prompt, no caps). Builder degrades to
+NO_DATA on any input failure; route degrades to JSON `{"error": ...}` +
+500 on store exceptions (mirrors `/api/shadow-vs-claude` +
+`/api/thesis-drift` error-pass-through pattern). Builder lives at
+`paper_trader/analytics/reasoning_coherence.py`, route appended in
+`dashboard.py` IMMEDIATELY AFTER `/api/thesis-drift` — the two are
+now the across-time thesis-stability pair the operator can read
+together: position-level vs reasoning-level.
+
+**Naming-collision lesson:** my first scope was `/api/thesis-drift` for
+this feature; verified before writing that the route already existed
+for a different domain (entry-thesis-vs-current scorecard). Renamed to
+`/api/reasoning-coherence` BEFORE writing the builder. **Discipline
+pin: always grep the dashboard for the proposed route name + builder
+filename before scaffolding** — the analytics surface is mature and the
+obvious names are usually taken.
+
+**Verify:** `from paper_trader import dashboard;
+dashboard.reasoning_coherence_api` imports OK;
+`tests/test_reasoning_coherence.py` 19 / 19 pass; adjacent
+`test_thesis_drift.py` (27 tests) + `test_shadow_vs_claude.py` (13
+tests) both green — no neighboring regression. **Pre-existing failure**
+`test_swr_prewarm_coverage::test_every_swr_cached_endpoint_is_prewarmed`
+(missing `earnings-distribution` entry) confirmed on HEAD via
+stash-swap — NOT from this pass; belongs to another agent's commit
+window and is left untouched per concurrent-agent discipline.
