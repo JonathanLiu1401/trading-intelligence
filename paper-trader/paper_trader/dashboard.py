@@ -11926,5 +11926,302 @@ def ticker_decision_mix_api():
         return jsonify({"error": str(e), "tickers": []}), 500
 
 
+def _empty_rate_24h_pct(decisions: list[dict]) -> float | None:
+    """24h "claude returned no response" rate over recent_decisions.
+
+    Mirrors the empty-claude-rate endpoint's `_is_empty` semantics. Shared
+    here so position-action-brief and restart-recommendation read the same
+    24h surface — the two endpoints disagreeing by 1% on the same DB would
+    be exactly the kind of operator-confusion bug this composite tries to
+    close. Returns None when no rows fall in the window."""
+    if not decisions:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    n = 0
+    empty = 0
+    for d in decisions:
+        ts_raw = d.get("timestamp")
+        try:
+            ts = datetime.fromisoformat(str(ts_raw))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        n += 1
+        action = (d.get("action_taken") or "")
+        reasoning = (d.get("reasoning") or "")
+        if action == "NO_DECISION" and \
+                reasoning.startswith("claude returned no response"):
+            empty += 1
+    if n == 0:
+        return None
+    return round(100.0 * empty / n, 1)
+
+
+def _consecutive_no_decision(decisions: list[dict]) -> int:
+    """Newest-first run of NO_DECISION action_taken — the runner_heartbeat
+    decision-efficacy input. Stops at the first non-NO_DECISION row."""
+    n = 0
+    for d in (decisions or []):
+        a = (d.get("action_taken") or "").upper()
+        if "NO_DECISION" in a and not a.startswith("BLOCKED"):
+            n += 1
+        else:
+            break
+    return n
+
+
+def _fetch_earnings_events_intern() -> list[dict]:
+    """Pull the earnings calendar from :8080. Mirrors the read shared by
+    /api/earnings-risk and /api/event-readiness so the three surfaces never
+    disagree on what's imminent. Best-effort — returns [] on any failure
+    (timeouts, intern wedge — the documented digital_intern_8080_hangs class)."""
+    import json as _json
+    import urllib.request as _urllib
+    try:
+        with _urllib.urlopen(
+                "http://127.0.0.1:8080/api/earnings", timeout=4) as resp:
+            snap = _json.loads(resp.read().decode("utf-8"))
+        return list(snap.get("events") or [])
+    except Exception:
+        return []
+
+
+def _concurrent_opus_processes() -> int | None:
+    """Cheap /proc walk to count concurrent `claude` subprocesses on the host.
+    Mirrors the host-guard / empty-claude-rate read shape; degrades to None
+    rather than raising on permission errors."""
+    try:
+        import os
+        n = 0
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    cl = fh.read().replace(b"\x00", b" ").decode(
+                        "utf-8", "ignore")
+            except (OSError, IOError):
+                continue
+            if "claude" in cl and (" --model" in cl or "claude-opus" in cl):
+                n += 1
+        return n
+    except Exception:
+        return None
+
+
+@app.route("/api/restart-recommendation")
+@swr_cached("restart-recommendation", 30.0)
+def restart_recommendation_api():
+    """Single operator-actionable verdict: should I restart paper-trader NOW?
+
+    Closes the false-HEALTHY gap that ``desk_pulse.liveness`` and the bare
+    ``runner_heartbeat`` cadence verdict leave open: cadence-HEALTHY can
+    coexist with an 81%-empty-rate parse-fail storm, and neither surface
+    weights *held-exposure-at-risk-into-event* into the operator's restart
+    decision. This composes the parse-fail / host-saturation / idle-storm
+    inputs already on the existing surface with held-imminent earnings
+    exposure into one **restart_now: bool** + ``urgency_score: 0..1`` + a
+    reason bundle suitable for a 30-second cron or Discord nudge.
+
+    The builder is pure; this endpoint owns the I/O (the documented
+    thesis_drift split). Advisory only — never gates Opus, adds no caps
+    (AGENTS.md invariants #2 / #12)."""
+    try:
+        from .analytics.restart_recommendation import build_restart_recommendation
+        from .analytics.event_readiness import build_event_readiness
+        store = get_store()
+        decs = store.recent_decisions(limit=2000)
+        empty_rate = _empty_rate_24h_pct(decs)
+        consec = _consecutive_no_decision(decs)
+
+        opus_n = _concurrent_opus_processes()
+        # Mirror host_guard's _CLAUDE_SEM=3 + the live-trader headroom of 1.
+        host_saturated = (opus_n > 4) if opus_n is not None else None
+
+        # Held-imminent earnings — reuse build_event_readiness which already
+        # cross-joins positions × event_calendar and emits exposure_usd.
+        exposure = 0.0
+        hours_to: float | None = None
+        try:
+            events = _fetch_earnings_events_intern()
+            positions = store.open_positions()
+            er = build_event_readiness(positions, decs, events)
+            for ev in (er.get("events") or []):
+                ex = float(ev.get("exposure_usd") or 0.0)
+                if ex <= 0:
+                    continue
+                exposure += ex
+                ht = ev.get("hours_until_event")
+                if ht is None:
+                    da = ev.get("days_away")
+                    ht = (float(da) * 24.0) if da is not None else None
+                if ht is not None:
+                    ht_f = float(ht)
+                    if hours_to is None or ht_f < hours_to:
+                        hours_to = ht_f
+        except Exception:
+            pass
+
+        result = build_restart_recommendation(
+            empty_rate_pct=empty_rate,
+            host_saturated=host_saturated,
+            held_imminent_exposure_usd=exposure,
+            hours_to_nearest_held_event=hours_to,
+            consecutive_no_decision=consec,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR"}), 500
+
+
+@app.route("/api/position-action-brief")
+@swr_cached("position-action-brief", 90.0)
+def position_action_brief_api():
+    """Per-held-position composite brief — the operator's pre-bed view.
+
+    Each held position is annotated with: exposure_usd / pct_portfolio,
+    earnings-event proximity (held-imminent only), 24h news-velocity state +
+    top story, last real decision attempt + status (DECIDED / EMPTY /
+    HOST_SKIP / PARSE_FAIL / NEVER), and a recommended action
+    (TRIM_BEFORE_EVENT / HOLD_THROUGH_EVENT / RESTART_RUNNER / MONITOR / OK)
+    with an urgency score. Briefs sort most-urgent-first; the overall
+    headline surfaces the single most-actionable position.
+
+    Composes the network-free portfolio + decisions read, the
+    /api/news-velocity SSOT builder, /api/earnings-risk events, and the
+    /api/empty-claude-rate + /api/host-guard scalars. The builder is pure;
+    this endpoint owns the I/O. Advisory only — never gates Opus, adds no
+    caps (AGENTS.md invariants #2 / #12)."""
+    try:
+        from .analytics.position_action_brief import build_position_action_brief
+        from .analytics.news_velocity import build_news_velocity
+        from .analytics.event_readiness import build_event_readiness
+
+        store = get_store()
+        positions = store.open_positions()
+        decisions = store.recent_decisions(limit=2000)
+        held = _stock_tickers_from_positions(positions)
+        now_utc = datetime.now(timezone.utc)
+
+        # 24h news velocity over held tickers. Reads articles.db via the
+        # same path /api/news-velocity uses (the invariant #17 anti-split-
+        # brain hook); degrades to NO_DATA when the DB isn't reachable.
+        news_velocity: dict | None = None
+        if held:
+            try:
+                path = _articles_db_path()
+                if path is not None:
+                    window_h = 24.0
+                    baseline_h = 168.0
+                    window_since = (now_utc - timedelta(hours=window_h)).isoformat()
+                    baseline_since = (now_utc - timedelta(hours=baseline_h)).isoformat()
+                    conn = sqlite3.connect(
+                        f"file:{path}?mode=ro", uri=True, timeout=5)
+                    conn.row_factory = sqlite3.Row
+                    try:
+                        window_rows = conn.execute(
+                            "SELECT title, full_text, ai_score, urgency, first_seen "
+                            "FROM articles WHERE first_seen >= ? "
+                            "AND url NOT LIKE 'backtest://%' "
+                            "AND source NOT LIKE 'backtest_%' "
+                            "AND source NOT LIKE 'opus_annotation%' "
+                            "ORDER BY first_seen DESC LIMIT 8000",
+                            (window_since,),
+                        ).fetchall()
+                        like_clauses = " OR ".join(
+                            ["title LIKE ?"] * len(held))
+                        like_params = [f"%{t}%" for t in held]
+                        baseline_rows = conn.execute(
+                            f"SELECT title, ai_score, urgency, first_seen "
+                            f"FROM articles WHERE first_seen >= ? "
+                            f"AND first_seen < ? AND ({like_clauses}) "
+                            f"AND url NOT LIKE 'backtest://%' "
+                            f"AND source NOT LIKE 'backtest_%' "
+                            f"AND source NOT LIKE 'opus_annotation%' "
+                            f"ORDER BY first_seen DESC LIMIT 20000",
+                            [baseline_since, window_since] + like_params,
+                        ).fetchall()
+                    finally:
+                        conn.close()
+                    articles: list[dict] = []
+                    for r in window_rows:
+                        body = ""
+                        if r["full_text"]:
+                            try:
+                                body = zlib.decompress(
+                                    r["full_text"]).decode(
+                                        "utf-8", errors="replace")
+                            except Exception:
+                                body = ""
+                        articles.append({
+                            "title": r["title"] or "",
+                            "body": body,
+                            "first_seen": r["first_seen"],
+                            "ai_score": r["ai_score"],
+                            "urgency": r["urgency"],
+                        })
+                    for r in baseline_rows:
+                        articles.append({
+                            "title": r["title"] or "",
+                            "body": "",
+                            "first_seen": r["first_seen"],
+                            "ai_score": r["ai_score"],
+                            "urgency": r["urgency"],
+                        })
+                    news_velocity = build_news_velocity(
+                        articles, held, now=now_utc,
+                        window_hours=window_h, baseline_hours=baseline_h,
+                    )
+            except Exception:
+                news_velocity = None
+
+        # Held-imminent earnings events.
+        held_events: list[dict] = []
+        try:
+            events_raw = _fetch_earnings_events_intern()
+            er = build_event_readiness(positions, decisions, events_raw)
+            held_events = list(er.get("events") or [])
+        except Exception:
+            held_events = []
+
+        empty_rate = _empty_rate_24h_pct(decisions)
+
+        opus_n = _concurrent_opus_processes()
+        host_saturated = (opus_n > 4) if opus_n is not None else None
+
+        # Starting equity = cash + open value (the same denominator
+        # /api/portfolio uses). Live position rows expose ``qty``;
+        # options carry the ×100 contract multiplier.
+        try:
+            portfolio = store.get_portfolio()
+            cash = float(portfolio.get("cash") or 0.0)
+            open_val = 0.0
+            for p in positions:
+                qty = float(p.get("qty") or 0)
+                px = float(p.get("current_price") or p.get("avg_cost") or 0)
+                mult = 100 if p.get("type") in ("call", "put") else 1
+                open_val += qty * px * mult
+            starting = cash + open_val
+        except Exception:
+            starting = None
+
+        result = build_position_action_brief(
+            positions=positions,
+            decisions=decisions,
+            news_velocity=news_velocity,
+            held_events=held_events,
+            empty_rate_pct=empty_rate,
+            host_saturated=host_saturated,
+            starting_equity_usd=starting,
+            now=now_utc,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "briefs": []}), 500
+
+
 if __name__ == "__main__":
     run()

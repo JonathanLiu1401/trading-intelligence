@@ -9670,3 +9670,138 @@ for ln in reporter._portfolio_lines(pos, total_value=pf['total_value'], events_b
   `market.close_minute` (16:00 ET regular / 13:00 ET half-day) and
   the NYSE NY tz, the same source of truth `is_market_open` /
   `next_session_open` / `_maybe_daily_close` already use.
+
+
+## Review pass — paper-trader product-engineer (2026-05-19, Agent 4, ~12:50 UTC) — false-HEALTHY closure
+
+Two new composite analytics endpoints. Both pure builders, both backed by
+SWR cache, both anchored on the live false-HEALTHY case observed at session
+start: `desk_pulse.liveness.restart_recommended=false` while
+`empty-claude-rate=81.4%` AND $445 NVDA exposure into an earnings print
+11h away. The cadence-only liveness verdict is structurally blind to that
+combination; neither it nor any single existing endpoint composes
+parse-fail-rate × held-exposure × event-proximity into one operator-actionable
+scalar.
+
+### Feature: `/api/restart-recommendation` — single operator-actionable verdict
+
+`paper_trader/analytics/restart_recommendation.py` + tiny route wrapper.
+Pure builder takes already-computed scalars (empty-rate over 24h,
+host-saturated flag, held-imminent exposure $, hours-to-nearest-event,
+consecutive-no-decision count) and returns:
+
+* `verdict` ∈ {OK, MONITOR, RESTART_RECOMMENDED, RESTART_URGENT}
+* `restart_now: bool` — the ONE bit a cron / Discord poller acts on
+* `urgency_score: 0..1`
+* `reasons: [str]` — one-line human readables, headline-ready
+* `next_check_seconds` — cadence shortens as urgency climbs (15m → 1m)
+* `inputs` — transparency block for the operator
+* `thresholds` — what the ladder cuts on
+
+Precedence ladder, first match wins:
+
+1. **RESTART_URGENT** — empty_rate ≥ 60% AND held-imminent exposure
+   within 24h. The exact "BLIND into the print" wedge.
+2. **RESTART_RECOMMENDED** — IDLE_STORM (≥5 consecutive NO_DECISION,
+   matches `runner_heartbeat`'s gate), OR moderate empty_rate (≥50%)
+   with any held-imminent exposure.
+3. **MONITOR** — host saturated, mild empty_rate (≥30%) with held
+   exposure, OR ≥3-cycle no-decision streak.
+4. **OK** — none of the above.
+
+The endpoint reads recent_decisions via the store, computes empty_rate +
+consecutive-no-decision using the shared `_empty_rate_24h_pct` /
+`_consecutive_no_decision` helpers so all three surfaces never disagree
+by 1% on the same DB, and pulls held-imminent earnings exposure by
+calling `build_event_readiness` against `:8080/api/earnings` exactly the
+way `/api/event-readiness` and `/api/earnings-risk` already do (SSOT,
+same intern hop). SWR cache 30s.
+
+### Feature: `/api/position-action-brief` — per-held-position composite
+
+`paper_trader/analytics/position_action_brief.py` + small route wrapper.
+For every held position (stock + option lots folded into the
+underlying), composes:
+
+* exposure_usd / cost_basis_usd / unrealized_pl_usd / pct_portfolio
+* hours_to_event + event_verdict + earnings_date (from `build_event_readiness`;
+  reads the readiness verdict BLIND/DEGRADED/READY, falls back to the
+  earnings-risk tier HELD_IMMINENT/HELD_SOON/WATCH when events come from
+  that endpoint instead)
+* news_state / window_count / z_score / top_window_title (from
+  `build_news_velocity` — the same SSOT `/api/news-velocity` uses)
+* last_decision_status ∈ {DECIDED, EMPTY, HOST_SKIP, PARSE_FAIL, NEVER}
+  + last_decision_age_min + the action text
+* recommended_action ∈ {OK, MONITOR, HOLD_THROUGH_EVENT,
+  TRIM_BEFORE_EVENT, RESTART_RUNNER}
+* urgency_score 0..1
+* reasons
+
+Per-position action ladder, TRIM_BEFORE_EVENT dominates: held-imminent
+print × wedged bot ⇒ TRIM, otherwise HOLD_THROUGH_EVENT; wedged-bot with
+SURGING news ⇒ RESTART_RUNNER; SURGING news alone or near-event without
+wedge ⇒ MONITOR; clean state ⇒ OK. Briefs sort most-urgent-first;
+overall headline surfaces the single most-actionable position.
+
+The route owns the I/O — runs the same `articles.db` read shape as
+`/api/news-velocity` (mode=ro + live-only clause + LIKE-prefilter for
+baseline performance — the documented anti-INSUFFICIENT-everywhere
+optimisation), pulls earnings events from `:8080/api/earnings`, and
+calls `build_event_readiness` to get exposure-tagged held events. SWR
+cache 90s — bounded by the cold news-velocity articles.db scan.
+
+### Live validation
+
+Both endpoints return on the live wedged book:
+
+* `/api/restart-recommendation` reads `verdict=RESTART_RECOMMENDED`,
+  `restart_now=true`, `urgency_score=0.85`, headline:
+  *18 consecutive NO_DECISION cycles — engine cycling but not deciding,
+  restart clears a wedged Claude CLI*. Closes the false-HEALTHY gap.
+* `/api/position-action-brief` reads `overall_action=HOLD_THROUGH_EVENT`,
+  `overall_urgency=0.6`, headline:
+  *ACTION — NVDA HOLD_THROUGH_EVENT: earnings in 11.0h — hold through
+  with a working bot*. NVDA brief shows exposure $444.70, hours_to_event
+  11.04, news SURGING (231 articles in 24h, top "Nvidia Earnings And
+  The Burden Of Perfection"), last_decision_status=DECIDED 5h ago.
+  TQQQ brief reads OK clean.
+
+The two endpoints complement rather than duplicate: restart-rec answers
+*does the bot need to be kicked NOW (idle storm)?* while
+position-action-brief answers *what is the situation on each held name
+right now?*. The 18-cycle idle storm fires restart-rec but
+position-action-brief still reads HOLD because 24h-empty-rate=42.6% is
+below the 50% wedged threshold — the bot WAS working earlier and only
+just now is wedged.
+
+### Invariants reaffirmed by this pass
+
+* **Pure builders** — both analytics modules never raise on garbage
+  inputs and own no DB / network / module-global; the routes own the
+  I/O (the documented `thesis_drift` split).
+* **Advisory only** — neither endpoint gates Opus, neither injects into
+  the decision prompt, neither adds caps (invariants #2 / #12).
+* **SSOT** — news-velocity reuses `build_news_velocity`; event proximity
+  reuses `build_event_readiness`; empty-rate / no-decision counters are
+  shared module-level helpers so `/api/empty-claude-rate`,
+  `/api/restart-recommendation`, and `/api/position-action-brief`
+  always agree on what the same DB says.
+
+### How to test
+
+```sh
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_restart_recommendation.py \
+                   tests/test_position_action_brief.py -v
+# 55 tests, ~1s
+```
+
+Live verification, Flask test client (the documented `__main__` smoke
+hits the wrong DB per the analytics-verification discipline):
+
+```python
+from paper_trader.dashboard import app
+c = app.test_client()
+print(c.get("/api/restart-recommendation").get_json())
+print(c.get("/api/position-action-brief").get_json())
+```
