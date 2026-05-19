@@ -6550,6 +6550,7 @@ def analytics_api():
         # 4dp there; the win/loss split below uses strict `> 0`, so a sub-cent
         # rounding artefact reads as a non-win (pinned by test_round_trips).
         from .analytics.drawdown import compute_drawdown
+        from .analytics.pnl_attribution import build_pnl_attribution
         from .analytics.recovery import build_recovery
         from .analytics.round_trips import build_round_trips
         from .analytics.stress_scenarios import build_stress_scenarios
@@ -6696,6 +6697,17 @@ def analytics_api():
             "stress_scenarios": build_stress_scenarios(
                 positions, float(total_value or 0.0),
                 _classify, _LEVERAGE_BETA,
+            ),
+            # β-adjusted unrealized P/L decomposition. ``open_attribution``
+            # implicitly assumes β=1 and so over-attributes "alpha" on a
+            # leveraged-ETF/semis book (TQQQ β=3, NVDA β=1.5). This fold
+            # answers "is my gain just SPY ×β?" using the SAME
+            # ``_classify``/``_LEVERAGE_BETA`` SSOT as
+            # ``stress_scenarios``/``/api/risk``/``/api/pnl-attribution`` —
+            # additive top-level key (digital-intern analyst chat inherits
+            # it for free) so cross-fold drift fails the no-drift test.
+            "pnl_attribution": build_pnl_attribution(
+                positions, eq, _classify, _LEVERAGE_BETA,
             ),
         }
         # Same single-source-of-truth honesty fold as /api/tail-risk &
@@ -8343,6 +8355,65 @@ def earnings_distribution_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/implied-move")
+@swr_cached("implied-move", 300.0)
+def implied_move_api():
+    """Options-market-implied move for each HELD position with an imminent
+    earnings print. The **forward, market-priced complement** to
+    ``/api/earnings-shock`` (which gives historical-Gaussian σ from prior
+    prints) and ``/api/earnings-distribution`` (which gives the empirical
+    observed quartiles of those same prints). Backward-looking history vs.
+    today's market-implied price — together they answer "what did this
+    name historically do AND what is the market currently pricing for
+    tomorrow's print?".
+
+    Composes ``build_event_calendar`` for the held set verbatim (single
+    source of truth, AGENTS.md #10) so this endpoint, ``/api/earnings-
+    shock``, ``/api/earnings-distribution`` and ``/api/event-calendar`` can
+    never disagree on what counts as held-imminent. Per-name options chain
+    is pulled live from yfinance via ``market.get_options_chain`` at the
+    expiry closest to ``ceil(days_away)`` so the chain *captures* the
+    event. The builder is pure; the I/O seam degrades each row honestly to
+    ``NO_CHAIN``/``NO_QUOTES`` on a yfinance miss or thin chain.
+    Observational only — never gates Opus, never injected into the
+    decision prompt (AGENTS.md #2/#12 — the ``earnings_shock`` /
+    ``stress_scenarios`` precedent).
+
+    SWR-cached 5 min: matching ``/api/earnings-shock``'s cadence; an
+    options chain is 1-2s per held name on a cold call."""
+    try:
+        from .analytics.event_calendar import build_event_calendar
+        from .analytics.implied_move import build_implied_move
+        from . import market as _market
+        store = get_store()
+        pf = store.get_portfolio()
+        positions = store.open_positions()
+        try:
+            from .strategy import WATCHLIST as _WATCHLIST
+            watch = {t.upper() for t in _WATCHLIST}
+        except Exception:
+            watch = set()
+        held = {(p.get("ticker") or "").upper()
+                for p in positions if p.get("ticker")}
+        ec = build_event_calendar(positions, held | watch)
+
+        def _chain_provider(ticker: str, dte: int):
+            try:
+                return _market.get_options_chain(ticker, target_dte=dte)
+            except Exception:
+                return None
+
+        result = build_implied_move(
+            positions,
+            float(pf.get("total_value") or 0.0),
+            ec,
+            options_provider=_chain_provider,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/macro-calendar")
 def macro_calendar_api():
     """The exact forward FOMC rate-decision awareness block the live trader
@@ -9124,6 +9195,36 @@ def open_attribution_api():
         return jsonify(build_open_attribution(
             store.open_positions(),
             store.equity_curve(limit=5000),
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/pnl-attribution")
+def pnl_attribution_api():
+    """**β-adjusted** decomposition of open unrealized P/L — the honest
+    answer to "is my NVDA gain just SPY going up?".
+
+    Complement to ``/api/open-attribution`` (which assumes β=1 and so
+    over-attributes "alpha" on a leveraged-ETF/semis book). Per open
+    stock position: ``β × SPY_return`` over the same opened_at-anchored
+    window vs. residual ``idiosyncratic = position_return − β·SPY``.
+    Dollarized using cost basis on both sides. β comes from the
+    dashboard/stress_scenarios ``_classify``/``_LEVERAGE_BETA`` SSOT
+    (this endpoint is THE true SSOT — the strategy-side pinned copies
+    are CI-pinned to these). Options are flagged and skipped (β-attribution
+    on a Greeks instrument is its own surface, see ``/api/greeks``).
+    Pure, never raises; observational only — never gates Opus, never
+    injected into the decision prompt (AGENTS.md #2/#12 — the
+    ``open_attribution`` precedent)."""
+    try:
+        from .analytics.pnl_attribution import build_pnl_attribution
+        store = get_store()
+        return jsonify(build_pnl_attribution(
+            store.open_positions(),
+            store.equity_curve(limit=5000),
+            _classify,
+            _LEVERAGE_BETA,
         ))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -10630,6 +10731,11 @@ def _swr_prewarm():
         # @swr_cached but never prewarmed — same freeze-triage cold-stall
         # blind spot the test_swr_prewarm_coverage invariant locks against.
         ("earnings-distribution", earnings_distribution_api),
+        # implied-move @swr_cached 300s — yfinance options chain is a per-
+        # ticker network call (1-2s per held name). Same cold-stall blind
+        # spot the prewarm-coverage invariant locks against; matches the
+        # earnings-shock prewarm cadence.
+        ("implied-move", implied_move_api),
     ]
     for name, wrapper in targets:
         try:
