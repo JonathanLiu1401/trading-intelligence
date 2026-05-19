@@ -5940,10 +5940,27 @@ def portfolio_api():
 
 @app.route("/api/closed-positions")
 def closed_positions_api():
-    """Closed position lots with realized P&L computed from matching trades
-    inside each lot's [opened_at, closed_at] window. Supports `?limit=N`
-    (1..1000, default 100). Returns newest-closed first plus a rollup
-    summary (total realized, win count, loss count, win rate)."""
+    """Closed position lots with realized P&L computed from each lot's
+    matching round-trip of trades (BUY/BUY_CALL/BUY_PUT → SELL/SELL_CALL/
+    SELL_PUT). Supports ``?limit=N`` (1..1000, default 100). Returns
+    newest-closed first plus a rollup summary.
+
+    The summary surfaces:
+
+      * ``n``, ``wins``, ``losses``, ``flat`` — counts (flat = realized 0)
+      * ``win_rate_pct`` — wins / (wins + losses), null when no decided lot
+      * ``total_realized_pl`` — Σ realized across all listed lots
+      * ``total_cost`` / ``total_proceeds`` — gross BUY / SELL dollar flow
+      * ``avg_realized_pl_pct`` — cost-weighted realized / cost across the
+        slice, null when total_cost is non-positive (a simple mean of
+        per-lot percentages would over-weight a tiny lot up 100% against a
+        large lot down 10%, so this is the honest portfolio-level number)
+      * ``avg_winner_pct`` / ``avg_loser_pct`` — un-weighted mean of the
+        per-lot realized_pl_pct inside each bucket, so a trader sees both
+        edges of the payoff ratio at a glance (None when bucket is empty)
+      * ``median_hold_days`` — median of per-lot hold_days, null when no
+        lot has a parseable opened_at/closed_at pair
+    """
     try:
         limit = max(1, min(int(request.args.get("limit", 100)), 1000))
     except (TypeError, ValueError):
@@ -5953,8 +5970,33 @@ def closed_positions_api():
     wins = sum(1 for p in lots if (p.get("realized_pl") or 0) > 0)
     losses = sum(1 for p in lots if (p.get("realized_pl") or 0) < 0)
     total_realized = round(sum((p.get("realized_pl") or 0.0) for p in lots), 2)
+    total_cost = round(sum((p.get("cost") or 0.0) for p in lots), 2)
+    total_proceeds = round(sum((p.get("proceeds") or 0.0) for p in lots), 2)
     decided = wins + losses
     win_rate = round(100.0 * wins / decided, 2) if decided else None
+    avg_pl_pct = (round(total_realized / total_cost * 100.0, 2)
+                  if total_cost > 1e-9 else None)
+    win_pcts = [p["realized_pl_pct"] for p in lots
+                if (p.get("realized_pl") or 0) > 0
+                and isinstance(p.get("realized_pl_pct"), (int, float))]
+    loss_pcts = [p["realized_pl_pct"] for p in lots
+                 if (p.get("realized_pl") or 0) < 0
+                 and isinstance(p.get("realized_pl_pct"), (int, float))]
+    avg_winner_pct = (round(sum(win_pcts) / len(win_pcts), 2)
+                      if win_pcts else None)
+    avg_loser_pct = (round(sum(loss_pcts) / len(loss_pcts), 2)
+                     if loss_pcts else None)
+    holds = sorted(p["hold_days"] for p in lots
+                   if isinstance(p.get("hold_days"), (int, float)))
+    if holds:
+        mid = len(holds) // 2
+        median_hold_days = round(
+            holds[mid] if len(holds) % 2
+            else (holds[mid - 1] + holds[mid]) / 2,
+            4,
+        )
+    else:
+        median_hold_days = None
     return jsonify({
         "positions": lots,
         "summary": {
@@ -5963,7 +6005,13 @@ def closed_positions_api():
             "losses": losses,
             "flat": len(lots) - wins - losses,
             "total_realized_pl": total_realized,
+            "total_cost": total_cost,
+            "total_proceeds": total_proceeds,
             "win_rate_pct": win_rate,
+            "avg_realized_pl_pct": avg_pl_pct,
+            "avg_winner_pct": avg_winner_pct,
+            "avg_loser_pct": avg_loser_pct,
+            "median_hold_days": median_hold_days,
         },
     })
 
@@ -7504,6 +7552,288 @@ def suggestions_api():
         })
     except Exception as e:
         return jsonify({"error": str(e), "suggestions": []}), 500
+
+
+# ───────── /api/suggestion-impact — "if I act on this, what happens to the book?" ─────────
+# /api/suggestions returns ranked BUY / ADD / TRIM / EXIT / WATCH ideas but is
+# silent on the OPERATIONAL consequence: a BUY of MU at 5% of equity might
+# tip concentration_top1 past the 40% MEDIUM threshold or burn the last cash.
+# This endpoint augments each suggestion with the per-trade projection — same
+# concentration math (_concentration_severity, _classify, _LEVERAGE_BETA)
+# /api/risk uses, so the projected severity buckets are identical to the live
+# baseline (no second taxonomy to drift). Each projection is INDEPENDENT (act
+# on this idea ALONE) — that's the trader's actual decision unit.
+_SUGGESTION_DEFAULT_SIZE_PCT = 5.0  # default BUY/ADD sizing as % of total_value
+_SUGGESTION_TRIM_FRACTION = 0.5     # TRIM = sell half of held value
+
+
+def _portfolio_rows_from_positions(positions: list[dict]) -> tuple[list[dict], float]:
+    """Pure: build the same per-position rows /api/risk emits (ticker, sector,
+    market_value, pct_port) PLUS the leveraged-USD total. Decoupled from the
+    Flask request lifecycle so build_suggestion_impact can stay testable."""
+    rows: list[dict] = []
+    leveraged_usd = 0.0
+    for p in positions:
+        mult = 100 if p.get("type") in ("call", "put") else 1
+        price = float(p.get("current_price") or p.get("avg_cost") or 0.0)
+        qty = float(p.get("qty") or 0)
+        val = price * qty * mult
+        sec = _classify(p["ticker"])
+        if sec in _LEVERAGED_SECTORS:
+            leveraged_usd += val
+        rows.append({
+            "ticker": p["ticker"],
+            "type": p.get("type"),
+            "sector": sec,
+            "market_value": val,
+            "avg_cost": float(p.get("avg_cost") or 0.0),
+            "current_price": float(p.get("current_price") or 0.0),
+            "qty": qty,
+            "multiplier": mult,
+        })
+    return rows, leveraged_usd
+
+
+def _conc_top1_top3(rows: list[dict], total_value: float) -> tuple[float, float, str | None]:
+    """Pure: compute (top1_pct, top3_pct, top1_ticker) from a list of rows
+    that carry ``market_value`` and ``ticker``. Empty / zero-value → (0, 0, None)."""
+    if not rows or total_value <= 0:
+        return 0.0, 0.0, None
+    sorted_rows = sorted(rows, key=lambda r: -float(r.get("market_value") or 0.0))
+    top1_val = float(sorted_rows[0].get("market_value") or 0.0)
+    top3_val = sum(float(r.get("market_value") or 0.0) for r in sorted_rows[:3])
+    return (
+        round(top1_val / total_value * 100, 2),
+        round(top3_val / total_value * 100, 2),
+        sorted_rows[0].get("ticker"),
+    )
+
+
+def build_suggestion_impact(
+    suggestions: list[dict],
+    portfolio_rows: list[dict],
+    *,
+    cash: float,
+    total_value: float,
+    size_pct: float = _SUGGESTION_DEFAULT_SIZE_PCT,
+    trim_fraction: float = _SUGGESTION_TRIM_FRACTION,
+) -> dict:
+    """Pure: augment each suggestion with the per-trade portfolio projection.
+
+    Each projection is INDEPENDENT — "if I take THIS idea ALONE, what changes?"
+    BUY / ADD: cash burn, post-trade per-ticker pct, post-trade top1/top3,
+    post-trade severity (LOW/MEDIUM/HIGH via the same ``_concentration_severity``
+    /api/risk uses — single taxonomy, no drift). Sizing defaults to 5% of
+    total_value (the same number the live trader's risk prompt assumes when
+    unconstrained), capped at available cash for BUYs (ADDs are allowed to
+    burn through cash; the suggestion engine doesn't currently emit ADDs
+    that would, but the projection makes the consequence visible).
+
+    TRIM (default 50%) / EXIT (100%): cash freed, realized P/L at current
+    price, post-trade top1/top3, severity drop (e.g., MEDIUM → LOW = "frees
+    concentration"). Both pass back the per-ticker baseline so the trader
+    can SEE the before/after side-by-side.
+
+    HOLD / WATCH: surfaces ``would_act: false`` — no projection, but the
+    cards still come back so the UI doesn't have to merge two endpoints.
+
+    Pure / total: any missing field defaults to 0; a non-list suggestions
+    input returns the well-formed empty envelope; never raises.
+    """
+    if not isinstance(suggestions, list):
+        suggestions = []
+    if not isinstance(portfolio_rows, list):
+        portfolio_rows = []
+    cash = max(0.0, float(cash or 0.0))
+    total_value = max(0.0, float(total_value or 0.0))
+    size_pct = max(0.0, min(100.0, float(size_pct)))
+    trim_fraction = max(0.0, min(1.0, float(trim_fraction)))
+
+    base_rows = [dict(r) for r in portfolio_rows]  # shallow copies for mutation
+    base_top1, base_top3, base_top1_tk = _conc_top1_top3(base_rows, total_value)
+    base_sev, _ = _concentration_severity(base_top1, base_top3)
+
+    default_size_usd = round(size_pct / 100.0 * total_value, 2)
+
+    out_cards: list[dict] = []
+    for s in suggestions:
+        if not isinstance(s, dict):
+            continue
+        action = (s.get("action") or "").upper()
+        ticker = (s.get("ticker") or "").upper()
+        try:
+            price = float(s.get("price") or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        try:
+            held_qty = float(s.get("held_qty") or 0.0)
+        except (TypeError, ValueError):
+            held_qty = 0.0
+        # Find existing row by ticker (None for un-held).
+        existing = next(
+            (r for r in base_rows if (r.get("ticker") or "").upper() == ticker),
+            None,
+        )
+
+        card = {
+            "ticker": ticker,
+            "action": action,
+            "would_act": action in ("BUY", "ADD", "TRIM", "EXIT"),
+            "baseline_top1_pct": base_top1,
+            "baseline_top3_pct": base_top3,
+            "baseline_severity": base_sev,
+            "baseline_position_pct": (
+                round(float(existing["market_value"]) / total_value * 100, 2)
+                if existing and total_value > 0
+                else 0.0
+            ),
+        }
+
+        if action in ("BUY", "ADD") and price > 0 and total_value > 0:
+            # Cap by cash for BUYs (unheld). ADDs reuse default size and only
+            # surface a cash_constrained flag if they'd overdraft — the
+            # operator is then choosing to free cash first.
+            uncapped = default_size_usd
+            sized_usd = min(uncapped, cash) if action == "BUY" else uncapped
+            cash_constrained = action == "BUY" and uncapped > cash
+            projected_qty = round(sized_usd / price, 4) if price > 0 else 0.0
+            projected_cash = round(cash - sized_usd, 2)
+            # Project the post-trade row for this ticker.
+            existing_val = (
+                float(existing["market_value"]) if existing else 0.0
+            )
+            new_val = existing_val + sized_usd
+            proj_rows = [r for r in base_rows if r is not existing]
+            if existing is not None:
+                proj_row = dict(existing)
+                proj_row["market_value"] = new_val
+                proj_rows.append(proj_row)
+            else:
+                proj_rows.append({
+                    "ticker": ticker,
+                    "sector": _classify(ticker),
+                    "market_value": new_val,
+                })
+            top1, top3, top1_tk = _conc_top1_top3(proj_rows, total_value)
+            sev, _ = _concentration_severity(top1, top3)
+            card.update({
+                "projected_size_usd": round(sized_usd, 2),
+                "projected_size_pct_of_book": round(
+                    sized_usd / total_value * 100, 2
+                ) if total_value > 0 else 0.0,
+                "projected_qty": projected_qty,
+                "projected_cash_after": projected_cash,
+                "projected_position_pct_after": round(
+                    new_val / total_value * 100, 2
+                ),
+                "projected_top1_pct_after": top1,
+                "projected_top1_ticker_after": top1_tk,
+                "projected_top3_pct_after": top3,
+                "projected_severity_after": sev,
+                "would_overconcentrate": (
+                    sev != "LOW" and base_sev == "LOW"
+                ) or (sev == "HIGH" and base_sev != "HIGH"),
+                "cash_constrained": cash_constrained,
+            })
+
+        elif action in ("TRIM", "EXIT") and existing is not None:
+            frac = 1.0 if action == "EXIT" else trim_fraction
+            current_val = float(existing["market_value"])
+            proceeds = round(current_val * frac, 2)
+            # Realized P/L at current price: (current - avg_cost) × sold_qty × mult.
+            sold_qty = float(existing["qty"]) * frac
+            cost_per = float(existing["avg_cost"]) * existing.get("multiplier", 1)
+            cur_per = float(existing["current_price"]) * existing.get("multiplier", 1)
+            realized_pnl = round((cur_per - cost_per) * sold_qty, 2)
+            new_val = current_val - proceeds
+            proj_rows = [r for r in base_rows if r is not existing]
+            if new_val > 0.01:
+                proj_row = dict(existing)
+                proj_row["market_value"] = new_val
+                proj_rows.append(proj_row)
+            top1, top3, top1_tk = _conc_top1_top3(proj_rows, total_value)
+            sev, _ = _concentration_severity(top1, top3)
+            card.update({
+                "projected_proceeds_usd": proceeds,
+                "projected_realized_pnl_usd": realized_pnl,
+                "projected_cash_after": round(cash + proceeds, 2),
+                "projected_position_pct_after": round(
+                    new_val / total_value * 100, 2
+                ) if total_value > 0 else 0.0,
+                "projected_top1_pct_after": top1,
+                "projected_top1_ticker_after": top1_tk,
+                "projected_top3_pct_after": top3,
+                "projected_severity_after": sev,
+                "frees_concentration": (
+                    base_sev != "LOW" and sev == "LOW"
+                ) or (base_sev == "HIGH" and sev == "MEDIUM"),
+            })
+
+        out_cards.append(card)
+
+    return {
+        "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "baseline_top1_pct": base_top1,
+        "baseline_top1_ticker": base_top1_tk,
+        "baseline_top3_pct": base_top3,
+        "baseline_severity": base_sev,
+        "cash_usd": round(cash, 2),
+        "total_value_usd": round(total_value, 2),
+        "default_size_pct": size_pct,
+        "default_size_usd": default_size_usd,
+        "trim_fraction": trim_fraction,
+        "n_cards": len(out_cards),
+        "cards": out_cards,
+    }
+
+
+@app.route("/api/suggestion-impact")
+@swr_cached("suggestion_impact", 45.0)
+def suggestion_impact_api():
+    """Per-trade portfolio projection layered on top of /api/suggestions.
+
+    For each BUY / ADD: cash burn + post-trade per-ticker pct + post-trade
+    top1/top3 + severity bucket (LOW/MEDIUM/HIGH via the same taxonomy
+    /api/risk uses; no drift).
+    For each TRIM / EXIT: proceeds, realized P/L at current price, post-trade
+    concentration, ``frees_concentration`` flag.
+    HOLD / WATCH: passed through with ``would_act: false``.
+
+    ``?size_pct=`` clamped 0..100 (default 5.0).
+    """
+    try:
+        # Re-derive suggestions from the same code path (cached internally at
+        # 45s by @swr_cached on suggestions_api). We could call the route
+        # handler directly but pulling the JSON keeps the contract stable —
+        # if suggestions_api evolves its shape, this endpoint follows.
+        sug_resp = suggestions_api()
+        sug_data = sug_resp.get_json() if hasattr(sug_resp, "get_json") else {}
+        if not isinstance(sug_data, dict) or sug_data.get("error"):
+            return jsonify({
+                "error": (sug_data or {}).get("error", "suggestions unavailable"),
+                "cards": [],
+            }), 200
+        suggestions = sug_data.get("suggestions") or []
+        try:
+            size_pct = float(request.args.get("size_pct", _SUGGESTION_DEFAULT_SIZE_PCT))
+        except (TypeError, ValueError):
+            size_pct = _SUGGESTION_DEFAULT_SIZE_PCT
+        size_pct = max(0.0, min(100.0, size_pct))
+
+        store = get_store()
+        pf = store.get_portfolio()
+        positions = store.open_positions()
+        rows, _lev = _portfolio_rows_from_positions(positions)
+        out = build_suggestion_impact(
+            suggestions,
+            rows,
+            cash=float(pf.get("cash") or 0.0),
+            total_value=float(pf.get("total_value") or 0.0),
+            size_pct=size_pct,
+        )
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e), "cards": []}), 500
 
 
 # ───────── Feature-dev additions (2026-05-14 part 2) ─────────

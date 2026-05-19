@@ -301,3 +301,111 @@ class TestPortfolioApiEmptyAndDegradeSafe:
         body = _get_json(client, "/api/portfolio")
         # pct is None (not 0.0 — None signals "no meaningful denominator")
         assert body["unrealized_pl_pct"] is None
+
+
+class TestClosedPositionsApiSummary:
+    """Aggregate summary attached to ``/api/closed-positions``. Each field
+    must be asserted on concrete trade flows so a regression in the
+    arithmetic (a sign flip, a divide-by-zero, an inverted W/L sign) fails
+    loudly — the panel a trader reads after the bell."""
+
+    def _round_trip(self, store, ticker, buy_qty, buy_px, sell_qty, sell_px):
+        store.record_trade(ticker, "BUY", qty=buy_qty, price=buy_px, reason="")
+        store.upsert_position(ticker, "stock", qty=buy_qty, avg_cost=buy_px)
+        store.record_trade(ticker, "SELL", qty=sell_qty, price=sell_px,
+                           reason="")
+        store.upsert_position(ticker, "stock", qty=-sell_qty,
+                              avg_cost=sell_px)
+
+    def test_empty_book_returns_null_aggregates(self, fresh_store, client):
+        body = _get_json(client, "/api/closed-positions")
+        s = body["summary"]
+        assert s["n"] == 0
+        assert s["wins"] == 0 and s["losses"] == 0 and s["flat"] == 0
+        assert s["total_realized_pl"] == 0
+        assert s["win_rate_pct"] is None
+        assert s["avg_realized_pl_pct"] is None
+        assert s["avg_winner_pct"] is None
+        assert s["avg_loser_pct"] is None
+        assert s["median_hold_days"] is None
+
+    def test_one_winner_one_loser_summary(self, fresh_store, client):
+        """Two closed lots — one winner, one loser. The summary must split
+        them correctly on every dimension."""
+        # Winner: BUY 1 @ 100, SELL 1 @ 200 → +100, +100% over $100 cost.
+        self._round_trip(fresh_store, "WIN", 1, 100.0, 1, 200.0)
+        # Loser: BUY 1 @ 100, SELL 1 @ 50 → -50, -50% over $100 cost.
+        self._round_trip(fresh_store, "LOSE", 1, 100.0, 1, 50.0)
+        body = _get_json(client, "/api/closed-positions")
+        s = body["summary"]
+        assert s["n"] == 2
+        assert s["wins"] == 1
+        assert s["losses"] == 1
+        assert s["flat"] == 0
+        # Total realized: +100 + (-50) = +50.
+        assert s["total_realized_pl"] == pytest.approx(50.0)
+        # Total cost: $100 + $100 = $200 (gross BUY value).
+        assert s["total_cost"] == pytest.approx(200.0)
+        # Total proceeds: $200 + $50 = $250.
+        assert s["total_proceeds"] == pytest.approx(250.0)
+        # win_rate: 1/2 = 50%.
+        assert s["win_rate_pct"] == 50.0
+        # Cost-weighted avg: total_realized / total_cost = 50 / 200 = 25%.
+        assert s["avg_realized_pl_pct"] == 25.0
+        # Per-bucket means: winner +100%, loser -50%.
+        assert s["avg_winner_pct"] == 100.0
+        assert s["avg_loser_pct"] == -50.0
+
+    def test_realized_pl_pct_per_lot_present_after_fix(
+            self, fresh_store, client):
+        """The /api/closed-positions list MUST carry the per-lot
+        realized_pl_pct — a regression to the pre-fix shape would null this
+        out and the bug-pinning test in test_core_store can pass while the
+        endpoint stays broken at the dashboard layer."""
+        self._round_trip(fresh_store, "AMD", 5, 100.0, 5, 110.0)
+        body = _get_json(client, "/api/closed-positions")
+        positions = body["positions"]
+        assert len(positions) == 1
+        p = positions[0]
+        assert p["realized_pl"] == 50.0       # 5 * (110 - 100)
+        assert p["realized_pl_pct"] == 10.0   # 50 / 500 * 100
+        assert p["cost"] == 500.0
+        assert p["proceeds"] == 550.0
+        # hold_days computed in the store layer is surfaced verbatim.
+        assert isinstance(p["hold_days"], (int, float))
+
+    def test_cost_weighted_avg_differs_from_simple_mean(
+            self, fresh_store, client):
+        """A trader thinking in dollar terms cares about the cost-weighted
+        average — a $10 lot up 100% must NOT outweigh a $1000 lot down 5%
+        in the portfolio-level number. Pin that the endpoint reports the
+        weighted figure, not the naive mean of percentages."""
+        # Big lot, small loss: BUY 10 @ 100, SELL 10 @ 95 → -50 on $1000 cost.
+        self._round_trip(fresh_store, "BIG", 10, 100.0, 10, 95.0)
+        # Tiny lot, big win: BUY 1 @ 10, SELL 1 @ 20 → +10 on $10 cost.
+        self._round_trip(fresh_store, "TINY", 1, 10.0, 1, 20.0)
+        body = _get_json(client, "/api/closed-positions")
+        s = body["summary"]
+        # total_realized = -50 + 10 = -40; total_cost = 1000 + 10 = 1010.
+        # Cost-weighted avg = -40 / 1010 * 100 = -3.96% — NEGATIVE.
+        # A simple mean of [-5%, +100%] would be +47.5% — bullish.
+        assert s["avg_realized_pl_pct"] is not None
+        assert s["avg_realized_pl_pct"] < 0, (
+            "expected the cost-weighted avg to surface the dollar truth "
+            "(a small winner can't paper over a big loser)"
+        )
+        # The per-bucket means stay un-weighted so the trader still sees
+        # both edges of the payoff ratio.
+        assert s["avg_winner_pct"] == 100.0
+        assert s["avg_loser_pct"] == -5.0
+
+    def test_median_hold_days_is_present_and_non_negative(
+            self, fresh_store, client):
+        """The summary surfaces median hold time so the trader can answer
+        'how fast do my round-trips close?' without a histogram."""
+        self._round_trip(fresh_store, "A", 1, 10.0, 1, 11.0)
+        self._round_trip(fresh_store, "B", 1, 10.0, 1, 11.0)
+        body = _get_json(client, "/api/closed-positions")
+        med = body["summary"]["median_hold_days"]
+        assert med is not None
+        assert med >= 0
