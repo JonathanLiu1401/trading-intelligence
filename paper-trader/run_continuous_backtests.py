@@ -608,6 +608,95 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
     return outcomes
 
 
+def _oos_multi_horizon_metrics(scorer, oos_records: list[dict],
+                               horizons: tuple[int, ...] = (10, 20)) -> dict:
+    """Per-longer-horizon out-of-sample directional skill of the scorer.
+
+    Mirrors ``_oos_rank_metrics`` (same predict signature, same SELL
+    sign-flip, same tie-aware Spearman via ``calibration._spearman``)
+    EXCEPT the realized target is ``forward_return_{h}d`` for h in
+    ``horizons``, not the 5d anchor. The scorer was trained on the 5d
+    label, so a non-trivial signal at 10d or 20d is informative even
+    when the 5d OOS rank-IC is at noise — AGENTS.md documents leveraged
+    ETFs have noisy 5d windows but stronger multi-month returns.
+
+    Decisions whose row carries no ``forward_return_{h}d`` (the horizon
+    window ran past cached price history at outcome-compute time, so
+    ``_fwd_ret_h`` returned None) are DROPPED for THAT horizon only —
+    each horizon reports its own ``n`` honestly. A scorer-predict crash
+    on a single row drops just that row, never the whole horizon (the
+    ``_oos_rank_metrics`` partial-raiser discipline).
+
+    Returns ``{h: {dir_acc, rank_ic, n}}`` for each requested horizon,
+    with the same ``{None, None, 0}`` honest-empty sentinels
+    ``_oos_rank_metrics`` uses. Never raises — outer try/except returns
+    empty per-horizon sentinels on any fault so the skill ledger is
+    NEVER blocked by a diagnostic crash (the AGENTS.md "scorer-train
+    status must stay truthful" discipline, mirrored across siblings).
+    """
+    empty = {h: {"dir_acc": None, "rank_ic": None, "n": 0} for h in horizons}
+    try:
+        if not oos_records or not getattr(scorer, "is_trained", False):
+            return empty
+        import numpy as _np
+        from paper_trader.ml.decision_scorer import _to_float
+        from paper_trader.ml.calibration import _spearman
+
+        # Predict once per record (the scorer call is the same regardless of
+        # horizon — the model was trained on 5d, predictions don't shift
+        # with the realized-window choice). Bucket realizations per horizon.
+        per_horizon_preds: dict[int, list[float]] = {h: [] for h in horizons}
+        per_horizon_acts: dict[int, list[float]] = {h: [] for h in horizons}
+        for r in oos_records:
+            try:
+                p = scorer.predict(
+                    ml_score=_to_float(r.get("ml_score"), 0.0),
+                    rsi=r.get("rsi"), macd=r.get("macd"),
+                    mom5=r.get("mom5"), mom20=r.get("mom20"),
+                    regime_mult=_to_float(r.get("regime_mult"), 1.0),
+                    ticker=str(r.get("ticker") or ""),
+                    vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
+                    news_urgency=r.get("news_urgency"),
+                    news_article_count=r.get("news_article_count"),
+                )
+                p = float(p)
+                if p != p:  # NaN — defensive; predict_with_meta caller would
+                    continue  # neutralize but pure predict() is unguarded
+                is_sell = str(r.get("action") or "BUY").upper() == "SELL"
+                for h in horizons:
+                    a = _to_float(r.get(f"forward_return_{h}d"),
+                                  float("nan"))
+                    if is_sell:
+                        a = -a
+                    a = float(a)
+                    if a == a:  # drop NaN per-horizon
+                        per_horizon_preds[h].append(p)
+                        per_horizon_acts[h].append(a)
+            except Exception:
+                continue
+
+        out: dict[int, dict] = {}
+        for h in horizons:
+            preds = per_horizon_preds[h]
+            actuals = per_horizon_acts[h]
+            n = len(preds)
+            cell = {"dir_acc": None, "rank_ic": None, "n": n}
+            if n >= 2:
+                ic = _spearman(_np.asarray(preds, dtype=float),
+                               _np.asarray(actuals, dtype=float))
+                if ic == ic:
+                    cell["rank_ic"] = round(float(ic), 4)
+            dir_pairs = [(p, a) for p, a in zip(preds, actuals)
+                         if p != 0.0 and a != 0.0]
+            if dir_pairs:
+                hits = sum(1 for p, a in dir_pairs if (p > 0) == (a > 0))
+                cell["dir_acc"] = round(hits / len(dir_pairs), 4)
+            out[h] = cell
+        return out
+    except Exception:
+        return empty
+
+
 def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
     """Out-of-sample *directional* skill of the scorer on the temporal holdout.
 
@@ -773,9 +862,48 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
         except Exception as exc:
             oos_diracc_s = oos_ic_s = f"n/a ({type(exc).__name__})"
 
+    # Per-longer-horizon OOS rank skill (10d, 20d). The scorer was trained
+    # on the 5d label, so a non-trivial rank-IC at 10d/20d is informative
+    # even when 5d is at noise — AGENTS.md documents leveraged ETFs have
+    # noisy 5d windows but stronger multi-month returns. Guarded
+    # independently so a long-horizon diagnostic crash never masks the
+    # successful train or the 5d metrics already reported (the same
+    # discipline applied to oos_rmse and oos_diracc/oos_ic above). Each
+    # horizon reports its own n honestly — a row that lacks
+    # forward_return_{h}d (window ran past cached price history) drops
+    # for THAT horizon only, never poisons the 5d view.
+    oos_ic_10_s = "n/a"
+    oos_diracc_10_s = "n/a"
+    oos_ic_20_s = "n/a"
+    oos_diracc_20_s = "n/a"
+    oos_n_10 = 0
+    oos_n_20 = 0
+    if result.get("status") == "ok" and oos_records:
+        try:
+            mh = _oos_multi_horizon_metrics(DecisionScorer(), oos_records,
+                                            horizons=(10, 20))
+            c10 = mh.get(10, {})
+            c20 = mh.get(20, {})
+            oos_n_10 = int(c10.get("n") or 0)
+            oos_n_20 = int(c20.get("n") or 0)
+            if c10.get("dir_acc") is not None:
+                oos_diracc_10_s = f"{c10['dir_acc']:.2f}"
+            if c10.get("rank_ic") is not None:
+                oos_ic_10_s = f"{c10['rank_ic']:+.2f}"
+            if c20.get("dir_acc") is not None:
+                oos_diracc_20_s = f"{c20['dir_acc']:.2f}"
+            if c20.get("rank_ic") is not None:
+                oos_ic_20_s = f"{c20['rank_ic']:+.2f}"
+        except Exception as exc:
+            oos_ic_10_s = oos_diracc_10_s = f"n/a ({type(exc).__name__})"
+            oos_ic_20_s = oos_diracc_20_s = f"n/a ({type(exc).__name__})"
+
     return (f"scorer {result['status']} train_n={result['n']} "
             f"val_rmse={val_s} oos_n={len(oos_records)} oos_rmse={oos_rmse_s} "
-            f"oos_diracc={oos_diracc_s} oos_ic={oos_ic_s}")
+            f"oos_diracc={oos_diracc_s} oos_ic={oos_ic_s} "
+            f"oos_n_10={oos_n_10} oos_diracc_10={oos_diracc_10_s} "
+            f"oos_ic_10={oos_ic_10_s} oos_n_20={oos_n_20} "
+            f"oos_diracc_20={oos_diracc_20_s} oos_ic_20={oos_ic_20_s}")
 
 
 def _parse_scorer_status(status: str) -> dict:
@@ -796,11 +924,17 @@ def _parse_scorer_status(status: str) -> dict:
     `status="unparseable"` and `None` metrics rather than killing the loop.
 
     Returns ``{status, train_n, val_rmse, oos_n, oos_rmse, oos_dir_acc,
-    oos_ic}`` — ints for the two counts, floats or None for the four metrics.
+    oos_ic, oos_n_10, oos_dir_acc_10, oos_ic_10, oos_n_20, oos_dir_acc_20,
+    oos_ic_20}`` — ints for the count fields, floats or None for the
+    metrics. The 10d/20d fields are additive (see ``_oos_multi_horizon_metrics``)
+    and default to None on any older status string that pre-dates the
+    multi-horizon wiring — old skill-log rows therefore parse cleanly.
     """
     out: dict = {
         "status": "unparseable", "train_n": None, "val_rmse": None,
         "oos_n": None, "oos_rmse": None, "oos_dir_acc": None, "oos_ic": None,
+        "oos_n_10": None, "oos_dir_acc_10": None, "oos_ic_10": None,
+        "oos_n_20": None, "oos_dir_acc_20": None, "oos_ic_20": None,
     }
     try:
         s = str(status or "").strip()
@@ -825,17 +959,27 @@ def _parse_scorer_status(status: str) -> dict:
 
         tn = _num("train_n")
         on = _num("oos_n")
+        on10 = _num("oos_n_10")
+        on20 = _num("oos_n_20")
         out["train_n"] = int(tn) if tn is not None else None
         out["oos_n"] = int(on) if on is not None else None
+        out["oos_n_10"] = int(on10) if on10 is not None else None
+        out["oos_n_20"] = int(on20) if on20 is not None else None
         out["val_rmse"] = _num("val_rmse")
         out["oos_rmse"] = _num("oos_rmse")
         out["oos_dir_acc"] = _num("oos_diracc")
         out["oos_ic"] = _num("oos_ic")
+        out["oos_dir_acc_10"] = _num("oos_diracc_10")
+        out["oos_ic_10"] = _num("oos_ic_10")
+        out["oos_dir_acc_20"] = _num("oos_diracc_20")
+        out["oos_ic_20"] = _num("oos_ic_20")
     except Exception:
         return {
             "status": "unparseable", "train_n": None, "val_rmse": None,
             "oos_n": None, "oos_rmse": None, "oos_dir_acc": None,
-            "oos_ic": None,
+            "oos_ic": None, "oos_n_10": None, "oos_dir_acc_10": None,
+            "oos_ic_10": None, "oos_n_20": None, "oos_dir_acc_20": None,
+            "oos_ic_20": None,
         }
     return out
 

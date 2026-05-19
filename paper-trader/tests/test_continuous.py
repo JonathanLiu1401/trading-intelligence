@@ -650,6 +650,186 @@ class TestOosRankMetrics:
         assert out["dir_acc"] == pytest.approx(1.0)
 
 
+# ──────────────────── _oos_multi_horizon_metrics direct ────────────
+
+class TestOosMultiHorizonMetrics:
+    """Per-longer-horizon (10d, 20d) OOS skill metrics.
+
+    The scorer is trained on `forward_return_5d`, but each outcome row
+    also carries `forward_return_10d` / `forward_return_20d` (added in
+    the 2026-05-18 multi-horizon instrumentation). A non-trivial signal
+    at 10d/20d when 5d is at noise is informative — AGENTS.md documents
+    leveraged ETFs have noisy 5d windows but stronger multi-month
+    returns. This locks the new metric's contract.
+    """
+
+    @staticmethod
+    def _scorer_returning(predictions: list[float]):
+        class _Stub:
+            is_trained = True
+
+            def __init__(self, preds):
+                self._it = iter(preds)
+
+            def predict(self, **_kw):
+                return next(self._it)
+
+        return _Stub(predictions)
+
+    def test_untrained_scorer_returns_empty_per_horizon(self):
+        class _Untrained:
+            is_trained = False
+
+            def predict(self, **_kw):
+                return 0.0
+
+        out = rcb._oos_multi_horizon_metrics(_Untrained(), [
+            {"forward_return_10d": 1.0, "forward_return_20d": 2.0,
+             "action": "BUY", "ticker": "NVDA"}
+        ], horizons=(10, 20))
+        # Honest empty sentinels for every requested horizon — never raises,
+        # never fabricates a metric.
+        assert out == {10: {"dir_acc": None, "rank_ic": None, "n": 0},
+                       20: {"dir_acc": None, "rank_ic": None, "n": 0}}
+
+    def test_perfect_rank_ordering_at_each_horizon(self):
+        # Three records: predictions and 10d/20d realizations are perfectly
+        # rank-ordered together. rank_ic must be EXACTLY +1.0 for both
+        # horizons (tie-aware Spearman) and dir_acc must be 1.0 (all hits).
+        scorer = self._scorer_returning([1.0, 0.5, -1.0])
+        records = [
+            {"forward_return_10d": 5.0, "forward_return_20d": 8.0,
+             "action": "BUY", "ticker": "NVDA"},
+            {"forward_return_10d": 2.0, "forward_return_20d": 3.0,
+             "action": "BUY", "ticker": "AMD"},
+            {"forward_return_10d": -3.0, "forward_return_20d": -4.0,
+             "action": "BUY", "ticker": "MU"},
+        ]
+        out = rcb._oos_multi_horizon_metrics(scorer, records,
+                                             horizons=(10, 20))
+        assert out[10]["n"] == 3
+        assert out[10]["rank_ic"] == pytest.approx(1.0)
+        assert out[10]["dir_acc"] == pytest.approx(1.0)
+        assert out[20]["n"] == 3
+        assert out[20]["rank_ic"] == pytest.approx(1.0)
+        assert out[20]["dir_acc"] == pytest.approx(1.0)
+
+    def test_each_horizon_drops_only_its_own_missing_target(self):
+        """A row missing forward_return_20d but having forward_return_10d
+        must contribute to the 10d cell and be dropped from the 20d cell.
+        Each horizon reports its own n independently — a 20d gap NEVER
+        poisons the 10d view.
+        """
+        scorer = self._scorer_returning([0.6, -0.4, 1.2])
+        records = [
+            # Has both — contributes to both.
+            {"forward_return_10d": 1.5, "forward_return_20d": 2.5,
+             "action": "BUY", "ticker": "NVDA"},
+            # Has only 10d (20d=None — common when 20d window runs past
+            # cached price history) — contributes to 10d only.
+            {"forward_return_10d": -1.0, "forward_return_20d": None,
+             "action": "BUY", "ticker": "AMD"},
+            # Has only 20d — contributes to 20d only.
+            {"forward_return_10d": None, "forward_return_20d": 3.0,
+             "action": "BUY", "ticker": "MU"},
+        ]
+        out = rcb._oos_multi_horizon_metrics(scorer, records,
+                                             horizons=(10, 20))
+        # 10d cell: 2 rows (NVDA + AMD). 20d cell: 2 rows (NVDA + MU).
+        assert out[10]["n"] == 2
+        assert out[20]["n"] == 2
+        # Both 10d pairs go in the same direction (pred +0.6 → +1.5,
+        # pred -0.4 → -1.0) → rank_ic = +1.0, dir_acc = 1.0.
+        assert out[10]["rank_ic"] == pytest.approx(1.0)
+        assert out[10]["dir_acc"] == pytest.approx(1.0)
+
+    def test_sell_target_sign_flipped_consistently_at_all_horizons(self):
+        """The SELL flip convention (mirror train_scorer / evaluate_scorer_oos
+        / _oos_rank_metrics) must apply to forward_return_{h}d for every
+        horizon — otherwise the 10d/20d metrics report the WRONG action-
+        aligned target and a "good SELL" looks like a wrong call.
+        """
+        scorer = self._scorer_returning([1.0, 1.0])
+        records = [
+            # BUY that went up — predicted +1, realized +2 at 10d → hit.
+            {"forward_return_10d": 2.0, "forward_return_20d": 3.0,
+             "action": "BUY", "ticker": "NVDA"},
+            # SELL that went DOWN — predicted +1, realized -2 at 10d, but
+            # the SELL flip makes the action-aligned actual +2 → hit too.
+            # If the flip is missing, dir_acc would be 0.5, not 1.0.
+            {"forward_return_10d": -2.0, "forward_return_20d": -3.0,
+             "action": "SELL", "ticker": "AMD"},
+        ]
+        out = rcb._oos_multi_horizon_metrics(scorer, records,
+                                             horizons=(10, 20))
+        assert out[10]["dir_acc"] == pytest.approx(1.0)
+        assert out[20]["dir_acc"] == pytest.approx(1.0)
+
+    def test_predict_exception_drops_only_that_row(self):
+        """A scorer that raises on one row must NOT poison every horizon —
+        that row is dropped from BOTH horizons and the rest contribute.
+        Mirrors _oos_rank_metrics.test_predict_exception_skips_that_record.
+        """
+        class _PartialRaiser:
+            is_trained = True
+
+            def __init__(self):
+                self.calls = 0
+
+            def predict(self, **_kw):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("simulated transient predict fault")
+                return 0.5 if self.calls == 1 else -0.5
+
+        records = [
+            {"forward_return_10d": 1.0, "forward_return_20d": 2.0,
+             "action": "BUY", "ticker": "NVDA"},
+            {"forward_return_10d": 2.0, "forward_return_20d": 3.0,
+             "action": "BUY", "ticker": "AMD"},
+            {"forward_return_10d": -1.0, "forward_return_20d": -2.0,
+             "action": "BUY", "ticker": "MU"},
+        ]
+        out = rcb._oos_multi_horizon_metrics(_PartialRaiser(), records,
+                                             horizons=(10, 20))
+        assert out[10]["n"] == 2
+        assert out[20]["n"] == 2
+
+    def test_train_status_includes_multi_horizon_tokens(self):
+        """Wiring lock: _train_decision_scorer's returned status string MUST
+        contain the new oos_n_10/oos_ic_10/oos_diracc_10/20 tokens whenever
+        OOS records are present, so the scorer-skill ledger captures them
+        on every training cycle.
+        """
+        import random as _rnd
+        rng = _rnd.Random(31)
+        records = []
+        for i in range(80):
+            month = 1 + (i % 12)
+            day = 1 + (i // 12)
+            records.append({
+                "ticker": "NVDA" if i % 2 == 0 else "AMD",
+                "sim_date": f"2024-{month:02d}-{day:02d}",
+                "action": "BUY",
+                "ml_score": rng.uniform(0, 5),
+                "rsi": rng.uniform(20, 80),
+                "macd": rng.uniform(-1, 1),
+                "mom5": rng.uniform(-3, 3),
+                "mom20": rng.uniform(-5, 5),
+                "regime_mult": 1.0,
+                "forward_return_5d": rng.uniform(-3, 3),
+                "forward_return_10d": rng.uniform(-5, 5),
+                "forward_return_20d": rng.uniform(-7, 7),
+                "return_pct": 10.0,
+            })
+        status = rcb._train_decision_scorer(records)
+        # Every multi-horizon token must surface so the parser can extract
+        # them and the skill ledger row carries the new columns.
+        for token in ("oos_n_10=", "oos_diracc_10=", "oos_ic_10=",
+                      "oos_n_20=", "oos_diracc_20=", "oos_ic_20="):
+            assert token in status, f"missing {token} in {status!r}"
+
+
 # ──────────────────── scorer-skill ledger ───────────────────────
 
 class TestParseScorerStatus:
@@ -689,6 +869,64 @@ class TestParseScorerStatus:
         assert p["status"] == "unparseable"
         p2 = rcb._parse_scorer_status(None)  # type: ignore[arg-type]
         assert p2["status"] == "unparseable"
+
+    def test_parses_multi_horizon_tokens(self):
+        # The 2026-05-18 feature pass adds oos_n_10/oos_diracc_10/oos_ic_10
+        # (and 20d siblings) to the status string. Parser must extract them
+        # alongside the legacy 5d tokens — and parse `oos_n_10` correctly
+        # despite `oos_n` being a substring of its key (the parser uses an
+        # exact `(?:^|\s)oos_n=…` boundary that must NOT match `oos_n_10=`).
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=708 "
+             "oos_rmse=12.40 oos_diracc=0.55 oos_ic=+0.03 "
+             "oos_n_10=620 oos_diracc_10=0.57 oos_ic_10=+0.09 "
+             "oos_n_20=540 oos_diracc_20=0.59 oos_ic_20=+0.14")
+        p = rcb._parse_scorer_status(s)
+        assert p["status"] == "ok"
+        # Legacy 5d fields are unchanged.
+        assert p["oos_n"] == 708
+        assert p["oos_ic"] == pytest.approx(0.03)
+        # New 10d fields.
+        assert p["oos_n_10"] == 620
+        assert p["oos_dir_acc_10"] == pytest.approx(0.57)
+        assert p["oos_ic_10"] == pytest.approx(0.09)
+        # New 20d fields.
+        assert p["oos_n_20"] == 540
+        assert p["oos_dir_acc_20"] == pytest.approx(0.59)
+        assert p["oos_ic_20"] == pytest.approx(0.14)
+
+    def test_legacy_status_without_multi_horizon_tokens_parses_cleanly(self):
+        # Old skill-log rows that pre-date the multi-horizon wiring carry
+        # no oos_n_10/etc. tokens. Parser must still return them as None,
+        # NOT raise and NOT fabricate a metric (the parser is the read-side
+        # contract for every historical skill-log row).
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=708 "
+             "oos_rmse=12.40 oos_diracc=0.55 oos_ic=+0.03")
+        p = rcb._parse_scorer_status(s)
+        # 5d unchanged.
+        assert p["oos_n"] == 708
+        # 10d/20d fields default to None.
+        assert p["oos_n_10"] is None
+        assert p["oos_dir_acc_10"] is None
+        assert p["oos_ic_10"] is None
+        assert p["oos_n_20"] is None
+        assert p["oos_dir_acc_20"] is None
+        assert p["oos_ic_20"] is None
+
+    def test_oos_n_does_not_swallow_oos_n_10_value(self):
+        """Boundary lock: a parser that uses a naïve `re.search("oos_n=…")`
+        would match the substring inside `oos_n_10=`, capturing the 10d
+        value as the 5d count and silently fabricating a wrong train_n=`/`
+        oos_n=` pair. The implementation uses `(?:^|\\s)oos_n=` so the
+        following char MUST be ``=`` for the legacy match — proven here.
+        """
+        # No oos_n token at all, only oos_n_10/20 — legacy field MUST stay None.
+        s = ("scorer ok train_n=100 val_rmse=1.0 "
+             "oos_n_10=42 oos_diracc_10=0.50 oos_ic_10=+0.01 "
+             "oos_n_20=33 oos_diracc_20=0.55 oos_ic_20=+0.02")
+        p = rcb._parse_scorer_status(s)
+        assert p["oos_n"] is None       # not 42, not 33 — absent
+        assert p["oos_n_10"] == 42
+        assert p["oos_n_20"] == 33
 
 
 class TestAppendScorerSkillLog:
