@@ -40,6 +40,10 @@ FRED_SERIES = {
     "DGS10": "10-year Treasury constant maturity",
     "GDPC1": "Real GDP (chained 2017 $)",
     "PAYEMS": "Total nonfarm payrolls",
+    # Credit market indicators (ICE BofA via FRED, 1-day lag)
+    "BAMLC0A0CM": "ICE BofA US Corp Bond IG OAS (bps)",
+    "BAMLH0A0HYM2": "ICE BofA US HY Index OAS (bps)",
+    "SOFR": "Secured Overnight Financing Rate (%)",
 }
 
 # Yield-curve spread emitted as a separate synthetic article series. The
@@ -50,6 +54,11 @@ FRED_SERIES = {
 # operator can see it as its own signal in the dashboard's source view.
 YIELD_CURVE_SOURCE = "fred/10y2y_spread"
 YIELD_CURVE_SERIES = "DGS10_MINUS_DGS2"
+
+# HY-IG credit spread: difference between high-yield and investment-grade OAS.
+# Widens ahead of equity selloffs when credit markets price stress first.
+CREDIT_SPREAD_SOURCE = "fred/hy_ig_spread"
+CREDIT_SPREAD_SERIES = "BAMLH0A0HYM2_MINUS_BAMLC0A0CM"
 
 FREDGRAPH_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
 RECENT_N = 3  # most recent observations to synthesise per series
@@ -209,6 +218,68 @@ def _yield_curve_articles(conn, dgs10: list[tuple[str, float]],
     return out
 
 
+def _credit_spread_articles(conn, hy_oas: list[tuple[str, float]],
+                            ig_oas: list[tuple[str, float]]) -> list[dict]:
+    """Emit synthetic HY-IG credit risk spread articles.
+
+    HY OAS minus IG OAS = excess compensation demanded for default risk.
+    A widening spread signals credit-market stress; historically leads
+    equity drawdowns by days to weeks. Dedup key: obs_date only.
+    """
+    if not hy_oas or not ig_oas:
+        return []
+    by_date_hy = dict(hy_oas)
+    by_date_ig = dict(ig_oas)
+    common_dates = sorted(set(by_date_hy) & set(by_date_ig))
+    if not common_dates:
+        return []
+    surfaced = common_dates[-RECENT_N:]
+    url = (
+        "https://fred.stlouisfed.org/graph/?g=fredgraph"
+        f"&id=BAMLH0A0HYM2,BAMLC0A0CM"
+    )
+    out: list[dict] = []
+    for d in surfaced:
+        hy = by_date_hy[d]
+        ig = by_date_ig[d]
+        spread = hy - ig
+        sid = _seen_id(CREDIT_SPREAD_SERIES, d)
+        if _is_seen(conn, sid):
+            continue
+        prev_idx = common_dates.index(d) - 1
+        if prev_idx >= 0:
+            pd = common_dates[prev_idx]
+            prev_spread = by_date_hy[pd] - by_date_ig[pd]
+            d_spread = spread - prev_spread
+            direction = "widening" if d_spread > 0 else "tightening"
+            change = f"prev {_fmt_num(prev_spread)} ({direction} {d_spread:+.2f})"
+        else:
+            change = "no prior obs"
+        # Stress regime: >3% HY-IG spread historically signals elevated default risk
+        regime = "STRESSED" if spread > 3.0 else ("elevated" if spread > 2.0 else "normal")
+        title = (
+            f"FRED HY-IG credit spread {d}: {_fmt_num(spread)}% ({regime}, "
+            f"HY={_fmt_num(hy)} IG={_fmt_num(ig)}; {change})"
+        )
+        body = (
+            f"FRED-derived HY minus IG OAS credit spread for {d}: "
+            f"{spread:+.2f}% (HY OAS={_fmt_num(hy)}, IG OAS={_fmt_num(ig)}). "
+            f"Credit regime: {regime} (>3% = stressed credit market, "
+            f"historically leads equity drawdowns). "
+            f"Source: ICE BofA indices via FRED, St. Louis Fed."
+        )
+        out.append({
+            "title": title,
+            "link": url,
+            "summary": body,
+            "published": d,
+            "source": CREDIT_SPREAD_SOURCE,
+            "_series": CREDIT_SPREAD_SERIES,
+        })
+        _mark_seen(conn, sid, url, title, CREDIT_SPREAD_SOURCE)
+    return out
+
+
 def collect_fred() -> list[dict]:
     """Collect deduplicated synthetic macro articles from FRED.
 
@@ -293,6 +364,15 @@ def collect_fred() -> list[dict]:
         new_articles.extend(spread_items)
     except Exception as e:  # pragma: no cover - belt+braces; live insertion
         print(f"[fred_collector] yield-curve spread synth failed: {e}")
+
+    # Derived HY-IG credit risk spread.
+    try:
+        credit_items = _credit_spread_articles(
+            conn, fetched.get("BAMLH0A0HYM2", []), fetched.get("BAMLC0A0CM", [])
+        )
+        new_articles.extend(credit_items)
+    except Exception as e:
+        print(f"[fred_collector] credit spread synth failed: {e}")
 
     conn.commit()
     conn.close()
