@@ -672,6 +672,7 @@ RULES:
 - A newswire row tagged "[ALERTED]" ALREADY fired a standalone 🚨 BREAKING push to the analyst within the last few hours — it is a developing/continued story the analyst has ALREADY been told about, NOT new news. Do NOT make an "[ALERTED]" row the LEAD when any untagged story of comparable importance exists; rank a fresh untagged story above an "[ALERTED]" one of similar score in TOP SIGNALS; and frame any "[ALERTED]" item explicitly as continuation (e.g. "follows the earlier alert", "developing") — never as if it just broke. This is what separates new desk intel from a rehash of an alert already delivered.
 - A newswire row tagged "[BOOK: TICKER,...]" names live portfolio/watchlist positions the analyst actually holds money in (LITE, LNOK, MUU, DRAM, MU, NVDA, MSFT, AXTI, ORCL, TSEM, QBTS). A "[BOOK:...]" row is directly actionable for the analyst's open risk: weight it ABOVE a same-score untagged general-market row when choosing the LEAD and ordering TOP SIGNALS, always reflect its named ticker(s) in the PORTFOLIO table with a concrete implication, and never bury a "[BOOK:...]" item below generic macro colour of similar magnitude. Absence of the tag means the row does not touch the held book.
 - If a "BOOK HEAT" block is present, it ranks the analyst's held names by how many DISTINCT stories this window touched each one. Concentration on a single held name is itself a magnitude signal, independent of any one row's score: strongly prefer the most-concentrated held name for the LEAD when it has any material story, rank its stories up in TOP SIGNALS, and give that ticker a concrete forward-looking implication in the PORTFOLIO table. This is a ranking/weighting hint only — do NOT echo a literal "BOOK HEAT" section in the output (unlike COVERAGE GAP).
+- If a "BOOK SILENCE" block is present, it lists held tickers with ZERO mentions this 5h window — the analyst has open risk on those names but no incoming catalyst this window. In the PORTFOLIO table, mark each silent ticker with a brief honest "N/A — no catalyst this window" (or similar terse note, never a fabricated implication or hedge filler like "continued caution"). Silent names should NOT lead and should NOT outrank a ticker with material news in TOP SIGNALS. This is an honesty/composition hint only — do NOT echo a literal "BOOK SILENCE" section in the output (same as BOOK HEAT / AGING TOP ROWS, unlike COVERAGE GAP).
 - If an "AGING TOP ROWS" block is present, it names the highest-ranked digest rows whose deterministic wall-clock age (time since the story hit our wire) is several hours old — a ground-truth recency cross-check, independent of any row's score or decay rank. An aging top row is a developing/continued story, NOT one that just broke: do NOT make it the LEAD as if it were fresh when a comparably-important newer row exists, frame it explicitly as developing in the LEAD and TOP SIGNALS, and never imply a multi-hour-old item happened moments ago. This is a ranking/framing hint only — do NOT echo a literal "AGING TOP ROWS" section in the output (same as BOOK HEAT, unlike COVERAGE GAP).
 - If a "COVERAGE GAP" block is present in the data input, reproduce it as a **COVERAGE GAP** section (one bullet per dark channel, verbatim). These are intel channels the system could NOT collect from this window — the analyst must know what they are blind to, not assume silence means calm. Omit the section entirely if no gap block is provided.
 - If a "THROUGHPUT DEGRADATION" block is present in the data input, reproduce it as a **THROUGHPUT DEGRADATION** section directly under the COVERAGE GAP bullets (one bullet per source, verbatim). These sources are still alive but have lost most of their recent flow — partial blind spots an analyst must know about (the early-warning complement to COVERAGE GAP: a marginally-alive source has not crossed the disable threshold yet, but the briefing has materially less coverage from it than the prior window). Omit the section entirely if no degradation block is provided.
@@ -1139,6 +1140,78 @@ def _book_heat_lines(
             for t, n in hot[:_BOOK_HEAT_MAX_LINES]]
 
 
+# ── Held-book SILENCE (the inverse of BOOK HEAT) ─────────────────────────────
+# BOOK HEAT surfaces held names CONCENTRATED in the digest; this surfaces the
+# opposite — held names with ZERO mentions this 5h window. The
+# Discord-post-briefing ``daemon._format_portfolio_coverage`` line already
+# names silent tickers, but it is appended AFTER Opus has written the
+# briefing — Opus composes the LEAD / TOP SIGNALS / PORTFOLIO table BLIND to
+# which held names had no story, and routinely fabricates a "neutral
+# implication" for a dark ticker (live: a recent briefing's PORTFOLIO line
+# wrote "AXTI: continued caution given thin coverage" — a fabrication on
+# zero wires, the analyst persona's exact complaint about hedging filler).
+#
+# Surfacing the silent set as an INPUT block lets Opus mark these honestly
+# (N/A — no catalyst this window) rather than guess. The silent list is
+# itself a magnitude signal of its own kind: a held name with zero wires
+# in 5h means the catalyst engine isn't running, so the position drifts on
+# pure macro/peers. Different signal class from BOOK HEAT (concentration);
+# complementary, not duplicative.
+#
+# Pure read-side, same shape as ``_book_heat_lines`` (input hint, NOT a
+# reproduced section — the SYSTEM_PROMPT rule forbids echoing it): NO DB
+# write, NO ai_score/ml_score/score_source/urgency touch, NO mutation of
+# ``source_articles``, backtest already excluded upstream by
+# ``get_top_for_briefing``'s ``_LIVE_ONLY_CLAUSE`` — all four load-bearing
+# invariants intact by construction.
+#
+# Honest "absence" is computed against the *full* held set (`_BOOK_TICKERS`
+# — 12 names), so the silent line is comparable cycle-to-cycle even when
+# the digest is sparse. The 3-ticker floor mirrors `BOOK_HEAT_MIN_STORIES`
+# (a 1-2 ticker silent list is the normal case for a busy macro window and
+# would just be filler); we want a silent list big enough that PORTFOLIO
+# composition is materially constrained.
+BOOK_SILENCE_MIN_SILENT = 3
+
+
+def _book_silence_lines(
+    articles: list, min_silent: int = BOOK_SILENCE_MIN_SILENT
+) -> list[str]:
+    """Pure: list held tickers with ZERO mentions in the digest.
+
+    ``articles`` must be the post-``_collapse_syndicated``, post-cap list the
+    newswire actually renders — same input as ``_book_heat_lines`` so the two
+    blocks describe the SAME window. The url guard (skip rows with no real
+    ``link``/``url``) excludes the prepended PORTFOLIO/OPTIONS snapshot rows
+    so a snapshot P&L body listing held tickers can never falsely "cover" a
+    silent name (same guard as ``_book_heat_lines`` / the ``[BOOK:]`` tag).
+
+    Returns ``[]`` (silence, no line) when:
+      - the digest is empty (no held name can be honestly called silent);
+      - fewer than ``min_silent`` held names are silent — a 1-2 ticker silent
+        list is noise in a normal macro window (the analyst's #1 complaint
+        is noise, so the bar is conservative).
+
+    Otherwise: ONE compact line listing the silent tickers in canonical
+    ``_BOOK_TICKERS`` order (stable cycle-to-cycle, same tie-break discipline
+    as ``_book_tickers`` / ``_book_heat_lines``). Same shape as the
+    BOOK HEAT block — a single input hint Opus uses for PORTFOLIO
+    composition, NOT a section reproduced in the output. No DB / IO /
+    mutation by construction."""
+    if not articles:
+        return []
+    seen: set[str] = set()
+    for a in articles:
+        if not (a.get("link") or a.get("url")):
+            continue  # snapshot/synthetic row — same guard as the [BOOK:] tag
+        for t in _book_tickers(a):
+            seen.add(t)
+    silent = [t for t in _BOOK_TICKERS if t not in seen]
+    if len(silent) < min_silent:
+        return []
+    return [" ".join(silent)]
+
+
 # ── Aging-top-row recency cross-check ────────────────────────────────────────
 # A news analyst whose persona is "react to BREAKING events fast" is misled
 # worst by a stale story dressed as fresh. The model-estimated time_sensitivity
@@ -1358,6 +1431,24 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None,
             )
             for hl in heat_lines:
                 parts.append(f"  - {hl}")
+
+        # Held-book SILENCE hint — held names with ZERO mentions this window.
+        # The complement to BOOK HEAT (concentration). Opus composes PORTFOLIO
+        # BLIND to which held tickers are dark and historically fabricates a
+        # "neutral implication" for them — surfacing the silent set as INPUT
+        # lets PORTFOLIO honestly mark them N/A. Pure read-side, same shape as
+        # BOOK HEAT (input hint, never echoed): NEW list, no mutation of
+        # source_articles, no DB / ai_score / ml_score / score_source /
+        # urgency touch, backtest already excluded upstream by
+        # get_top_for_briefing's _LIVE_ONLY_CLAUSE — four invariants intact.
+        silence_lines = _book_silence_lines(deduped[:60])
+        if silence_lines:
+            parts.append(
+                "\n=== BOOK SILENCE (analyst's held names with ZERO stories "
+                "this window — catalyst engine dark, drift on macro/peers) ==="
+            )
+            for sl in silence_lines:
+                parts.append(f"  - {sl}")
 
         # Deterministic wall-clock recency cross-check on the rows Opus leads
         # with. Computed over the SAME collapsed+decayed+capped list rendered
