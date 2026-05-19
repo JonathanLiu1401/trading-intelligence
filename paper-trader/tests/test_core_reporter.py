@@ -902,6 +902,91 @@ class TestPosPctWeight:
         assert "0.5% bk" in tok
 
 
+class TestPosHoldAgeToken:
+    """`_pos_hold_age_token` — pure per-position hold-age annotation that
+    mirrors the Opus prompt's `held=Xd` tag on the Discord surface."""
+
+    def test_minute_bucket(self):
+        now = datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc)
+        p = {"opened_at": "2026-05-18T11:42:00+00:00"}  # 18 min ago
+        assert reporter._pos_hold_age_token(p, now=now) == "  held 18m"
+
+    def test_hour_bucket(self):
+        now = datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc)
+        p = {"opened_at": "2026-05-18T07:00:00+00:00"}  # 5h ago
+        assert reporter._pos_hold_age_token(p, now=now) == "  held 5h"
+
+    def test_day_bucket(self):
+        now = datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc)
+        p = {"opened_at": "2026-05-15T12:00:00+00:00"}  # 3d ago
+        assert reporter._pos_hold_age_token(p, now=now) == "  held 3d"
+
+    def test_sub_minute_is_silent_to_skip_just_filled_noise(self):
+        now = datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc)
+        p = {"opened_at": "2026-05-18T11:59:45+00:00"}  # 15s ago
+        assert reporter._pos_hold_age_token(p, now=now) == ""
+
+    def test_missing_opened_at_degrades_silent(self):
+        # The existing unit-test position dicts have no opened_at — output
+        # must stay byte-compatible (no token).
+        assert reporter._pos_hold_age_token({"ticker": "X"}) == ""
+
+    def test_unparseable_opened_at_degrades_silent(self):
+        # store always writes datetime.now(utc).isoformat(); a garbage value
+        # is genuinely corrupt — drop the token, never raise (reporter
+        # additive contract).
+        p = {"opened_at": "not-a-date"}
+        assert reporter._pos_hold_age_token(p) == ""
+
+    def test_future_opened_at_clamps_to_silent(self):
+        # Wall clock stepped back (NTP / VM time-sync — documented hazard);
+        # rendering "held -2h" would be misleading. Clamp to silent so the
+        # operator gets no token rather than a wrong one.
+        now = datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc)
+        p = {"opened_at": "2026-05-18T14:00:00+00:00"}  # 2h in the future
+        # secs is negative, so secs < 60 → "" via the sub-minute guard.
+        assert reporter._pos_hold_age_token(p, now=now) == ""
+
+    def test_naive_opened_at_treated_as_utc(self):
+        # store records ISO with explicit +00:00, but a hand-rolled migration
+        # could plausibly write a naive value. Treat as UTC rather than
+        # raising on tz arithmetic.
+        now = datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc)
+        p = {"opened_at": "2026-05-18T10:00:00"}  # naive, 2h before now
+        assert reporter._pos_hold_age_token(p, now=now) == "  held 2h"
+
+    def test_portfolio_lines_includes_age_when_opened_at_present(self):
+        # Live caller (store.open_positions()) carries opened_at; the
+        # position line must include the hold-age annotation.
+        now = datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc)
+        positions = [{
+            "ticker": "AMD", "type": "stock", "qty": 5,
+            "avg_cost": 100.0, "current_price": 110.0,
+            "unrealized_pl": 50.0,
+            "opened_at": "2026-05-15T12:00:00+00:00",  # 3d ago
+        }]
+        # The helper is used unconditionally; we just need a sufficiently old
+        # opened_at to land in the day bucket regardless of wall clock.
+        ages = [_p["opened_at"] for _p in positions]
+        line = reporter._portfolio_lines(positions, total_value=1000.0)[0]
+        # The age token landed in the line (exact value depends on wall
+        # clock — assert presence of the prefix instead).
+        assert "held " in line, line
+        # Existing assertions still hold (byte-compat on the other tokens).
+        assert "+10.0%" in line and "55% bk" in line and "AMD" in line
+
+    def test_portfolio_lines_unchanged_for_unit_test_positions(self):
+        # Backward compat: positions without opened_at (the existing
+        # test_stock_line_format / test_option_line_includes_strike shape)
+        # must produce a line with no "held" token.
+        positions = [{
+            "ticker": "AMD", "type": "stock", "qty": 5,
+            "avg_cost": 100.0, "current_price": 110.0, "unrealized_pl": 50.0,
+        }]
+        line = reporter._portfolio_lines(positions)[0]
+        assert "held " not in line, line
+
+
 class TestClassifyDecisionOutcome:
     """`decisions.action_taken` is free text (AGENTS.md invariant #11).
     The bucket order is load-bearing: a FILLED/BLOCKED verb line also
