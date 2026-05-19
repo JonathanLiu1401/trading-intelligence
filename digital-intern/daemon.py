@@ -69,6 +69,7 @@ from collectors.congress_trades_collector import collect_congress_trades
 from collectors.finra_short_volume import collect_finra_short_volume
 from collectors.market_movers import collect_market_movers
 from collectors.fear_greed_collector import collect_fear_greed
+from collectors.vix_term_structure import collect as collect_vix_ts
 from collectors.cisa_kev_collector import collect_cisa_kev
 from collectors import source_health
 from core.backoff import Backoff
@@ -120,6 +121,7 @@ CONGRESS_TRADES_INTERVAL = 3600   # Congressional trading disclosures — once p
 CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog — once per hour
 MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
+VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
 EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
@@ -887,6 +889,30 @@ def fear_greed_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(FEAR_GREED_INTERVAL)
+
+
+# ── Worker: VIX term structure snapshot — every 10min ───────────────────────
+def vix_ts_worker(store: ArticleStore):
+    log.info("[vix_ts_worker] started")
+    bo = Backoff("vix_ts", base=30.0, cap=600.0)
+    while _running:
+        try:
+            # collector inserts directly; count emitted rows
+            articles = collect_vix_ts()
+            n = len(articles)
+            try:
+                source_health.record_result("vix_ts", n)
+            except Exception as he:
+                log.warning(f"[vix_ts_worker] source_health error: {he}")
+            _worker_last_ok["vix_ts"] = time.time()
+            if n:
+                log.info(f"[vix_ts] emitted {n} article(s)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[vix_ts_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(VIX_TS_INTERVAL)
 
 
 # ── Worker: Wikipedia recent-changes filter — every 10min ───────────────────
@@ -2142,6 +2168,7 @@ def main():
         ("yahoo_ticker_rss", yahoo_ticker_rss_worker),
         ("market_movers", market_movers_worker),
         ("fear_greed",  fear_greed_worker),
+        ("vix_ts",      vix_ts_worker),
         ("wikipedia",   wikipedia_worker),
         ("macro_calendar", macro_calendar_worker),
         ("finra_short",   finra_short_worker),
