@@ -37,6 +37,7 @@ def _git_sha(repo_dir: str, ref: str = "HEAD") -> str | None:
 
 
 _BOOT_SHA = _git_sha(_REPO_DIR)
+_BOOT_TIME = __import__("time").time()
 
 
 def _head_sha_and_behind() -> tuple[str | None, int]:
@@ -56,6 +57,58 @@ def _head_sha_and_behind() -> tuple[str | None, int]:
         except Exception:
             behind = 0
     return head, behind
+
+
+@app.route("/api/healthz")
+def healthz_api():
+    """Lightweight liveness probe for watchdog / unified-dashboard. Exposes
+    pid, uptime, build-staleness, and a cheap store sanity count so the
+    watchdog can distinguish "alive but stuck" from "alive and trading"
+    without hitting the slow /api/state path."""
+    import os as _os_l
+    import time as _time_l
+    head, behind = _head_sha_and_behind()
+    uptime_s = max(0.0, _time_l.time() - _BOOT_TIME)
+    positions_n: int | None = None
+    last_decision_age_s: float | None = None
+    try:
+        st = get_store()
+        conn = st.conn
+        row = conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE closed_at IS NULL AND qty != 0"
+        ).fetchone()
+        positions_n = int(row[0]) if row else 0
+        row2 = conn.execute(
+            "SELECT MAX(timestamp) FROM decisions"
+        ).fetchone()
+        if row2 and row2[0]:
+            try:
+                last_iso = str(row2[0]).replace("Z", "+00:00")
+                last_dt = datetime.fromisoformat(last_iso)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                last_decision_age_s = max(
+                    0.0,
+                    (datetime.now(timezone.utc) - last_dt).total_seconds(),
+                )
+            except (TypeError, ValueError):
+                last_decision_age_s = None
+    except Exception:
+        pass
+    return jsonify({
+        "ok": True,
+        "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "service": "paper_trader",
+        "pid": _os_l.getpid(),
+        "uptime_s": round(uptime_s, 1),
+        "boot_sha": _BOOT_SHA,
+        "head_sha": head,
+        "behind": behind,
+        "stale": bool(_BOOT_SHA and head and head != _BOOT_SHA),
+        "open_positions": positions_n,
+        "last_decision_age_s": (round(last_decision_age_s, 1)
+                                if last_decision_age_s is not None else None),
+    })
 
 
 @app.route("/api/build-info")
