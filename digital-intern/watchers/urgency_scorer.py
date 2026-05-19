@@ -9,6 +9,12 @@ from email.utils import parsedate_to_datetime
 
 from core.claude_cli import claude_call
 from core.json_extract import extract_json_array
+# Single source of truth for the recap-template fingerprint set — defined in
+# alert_agent and re-used here so urgency_scorer, the alert formatter, and the
+# briefing builder can never silently drift in WHICH titles count as a recap.
+# Same intra-watchers import discipline as alert_agent->alert_recency. Pulls
+# ml.features transitively (cheap — already in the daemon's process graph).
+from watchers.alert_agent import _looks_like_recap_template
 
 try:
     from core.logger import get_logger
@@ -104,9 +110,53 @@ def _article_age_hours(article: dict) -> float:
 
 
 def score_batch(articles: list, store) -> int:
-    """Score a batch of articles; update store. Returns count of urgent items found."""
+    """Score a batch of articles; update store. Returns count of urgent items found.
+
+    Pre-filter pass (defense-in-depth): retrospective recap / preview /
+    transcript-summary templates ("Why X Stock Is Trading Up Today",
+    "Q1 2026 Earnings Call Highlights", "Stock Market Today, May 18:",
+    "GF Value Says ...", "Here What the Street Thinks About ...") are floored
+    to noise (ai_score=0.01, urgency=0, score_source='llm') WITHOUT a Sonnet
+    call. Sonnet demonstrably mis-labels these as ai_score=8+ urgent (live
+    evidence 2026-05-18/19: 10 such rows landed in articles.db as
+    score_source='llm', poisoning the training pool with retrospective fluff
+    flagged as ground-truth urgent). The same fingerprint set the alert path
+    uses (``_looks_like_recap_template`` — single source of truth) gates them
+    here BEFORE the Claude call so we (1) save quota and (2) keep the LLM
+    label distribution honest. The floor value 0.01 matches what
+    ``urgency_scorer``'s anti-loop floor would write for a row Sonnet returned
+    no score on, and is equivalent to what Sonnet would output if the prompt
+    were extended with the same exclusion — so the trainer's strong-label pool
+    inherits a noise-tagged 0.01 instead of an urgent-tagged 8.0.
+    """
     if not articles:
         return 0
+
+    recap_articles: list = []
+    real_articles: list = []
+    for a in articles:
+        hit, _name = _looks_like_recap_template(a)
+        (recap_articles if hit else real_articles).append(a)
+
+    if recap_articles:
+        recap_updates: list[tuple[str, float, int]] = [
+            (a["_id"], 0.01, 0) for a in recap_articles if a.get("_id")
+        ]
+        if recap_updates:
+            store.update_ai_scores_batch(recap_updates)
+        _log.info(
+            f"[urgency] pre-floored {len(recap_articles)} recap-template "
+            f"row(s) — skipped Sonnet call (would have over-scored to 8+)"
+        )
+
+    if not real_articles:
+        return 0
+
+    # The remainder of this function (Sonnet prompt construction + per-index
+    # mapping) operates on the live payload only. Rebinding here keeps the
+    # downstream index math (truncation guard, anti-loop floor) intact without
+    # an additional remap layer.
+    articles = real_articles
 
     age_hours_map: dict[int, float] = {i: _article_age_hours(a) for i, a in enumerate(articles)}
     payload = [
