@@ -1166,6 +1166,126 @@ def _concentration_line(store) -> str:
         return ""
 
 
+def _idle_opportunity_line(store) -> str:
+    """One-line "what high-score signals arrived while the bot was dark?"
+    for the hourly / daily report — the missing **regret** surface for a
+    PARALYSIS drought.
+
+    ``_host_pulse_line`` says WHY the desk is frozen; ``_capital_pulse_line``
+    says whether the operator can act manually (cash free?). Neither names a
+    specific MISSED opportunity. ``/api/idle-opportunity`` enumerates the
+    loudest live watchlist articles inside the current
+    ``build_decision_drought.current_drought`` window; the loudest miss is
+    what the operator actually needs in Discord — "while you were dark for
+    7.94h, NVDA scored 9.0 on an earnings-preview headline and you didn't
+    decide on it."
+
+    Composes ``build_idle_opportunity`` over
+    ``build_decision_drought.current_drought`` **verbatim** (single source of
+    truth, AGENTS.md invariant #10 — so the Discord line and the endpoint
+    can never disagree on which articles count) plus a **read-only**
+    articles.db scan bounded by the drought-start (typically narrows to
+    hundreds of rows even on the 1.47M-rows/7d articles.db, the
+    ``news_velocity`` cost discipline). Live-only clause applied
+    (AGENTS.md #3). Pure store + sqlite reads — NO network (the
+    Discord-path discipline; the ``_recovery_line`` / ``_stress_line``
+    precedent). Observational only, no caps, never gates (invariants
+    #2/#12). Failure contract mirrors the rest of ``reporter``: any
+    builder / store / db fault degrades to ``""`` ("no idle-opportunity
+    line this report"), **never** an exception ("no Discord summary this
+    report").
+
+    Suppression — silence-when-nothing-actionable (the
+    ``_macro_calendar_chat_lines`` / ``_event_readiness_chat_lines``
+    precedent):
+      * ``NO_DROUGHT`` — bot is filling normally, by definition nothing
+        was missed; ``""`` (the ``_capital_pulse_line`` FREE-and-not-bleeding
+        suppression precedent).
+      * ``NO_DATA`` — degenerate (no decisions yet); ``""``.
+      * ``OK`` with ``n_opportunities == 0`` — the silence is honest
+        (drought ran but no live signals arrived); ``""``.
+      * ``OK`` with ``n_opportunities >= 1`` — the regret line is the
+        builder's own ``headline`` (verbatim, so no drift from the
+        endpoint).
+    """
+    try:
+        import sqlite3
+        from datetime import datetime, timezone
+
+        from . import signals as _signals
+        from .analytics.decision_drought import build_decision_drought
+        from .analytics.idle_opportunity import build_idle_opportunity
+        from .strategy import WATCHLIST as _WATCHLIST
+
+        dd = build_decision_drought(
+            store.recent_decisions(limit=3000),
+            store.equity_curve(limit=5000),
+        )
+        cur = dd.get("current_drought") if isinstance(dd, dict) else None
+        if not cur or not cur.get("ongoing"):
+            return ""
+        drought_start = cur.get("start")
+        if not drought_start:
+            return ""
+
+        # Bounded scan — drought_start is typically hours, not days, ago.
+        path = _signals._db_path()
+        articles: list[dict] = []
+        if path is not None:
+            try:
+                conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
+                                       timeout=5)
+                try:
+                    rows = conn.execute(
+                        "SELECT title, ai_score, urgency, first_seen, url, source "
+                        "FROM articles WHERE first_seen >= ? "
+                        "AND ai_score >= ? "
+                        "AND url NOT LIKE 'backtest://%' "
+                        "AND source NOT LIKE 'backtest_%' "
+                        "AND source NOT LIKE 'opus_annotation%' "
+                        "ORDER BY ai_score DESC, first_seen DESC LIMIT 5000",
+                        (drought_start, 6.0),
+                    ).fetchall()
+                finally:
+                    conn.close()
+                for r in rows:
+                    articles.append({
+                        "title": r[0] or "",
+                        "ai_score": r[1],
+                        "urgency": r[2],
+                        "first_seen": r[3],
+                        "url": r[4],
+                        "source": r[5],
+                    })
+            except Exception as e:
+                print(f"[reporter] idle-opportunity db read skipped: {e}")
+                # Drop the line on DB read fault rather than fabricating a
+                # "no opportunities" silence — but build_idle_opportunity
+                # against an empty list returns OK with n=0, which we then
+                # suppress below. That's the honest path: the reporter
+                # said nothing because we couldn't see.
+
+        held = [p.get("ticker") for p in store.open_positions()
+                if isinstance(p, dict) and (p.get("ticker") or "").strip()
+                and (p.get("type") or "").lower() == "stock"]
+        result = build_idle_opportunity(
+            dd, articles, list(_WATCHLIST),
+            held_tickers=[t.upper() for t in held if t],
+            now=datetime.now(timezone.utc),
+        )
+        if (not isinstance(result, dict)
+                or result.get("state") != "OK"
+                or not result.get("n_opportunities")):
+            return ""
+        headline = result.get("headline") or ""
+        if not headline:
+            return ""
+        return f"**IDLE** ◈ regret\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] idle-opportunity line skipped: {e}")
+        return ""
+
+
 def _host_pulse_line() -> str:
     """One-line "is the desk frozen because the *box* is overloaded?" for the
     hourly / daily report — the **#1 documented live pathology's** missing
@@ -1799,6 +1919,70 @@ def _position_attention_line(store) -> str:
         return ""
 
 
+def _no_decision_reasons_line(store) -> str:
+    """One-line "WHY isn't the bot deciding?" for the hourly / daily report.
+
+    ``_heartbeat_line`` raises ``IDLE_STORM`` once consecutive
+    NO_DECISION cycles cross the threshold, and its blanket
+    recommendation is "restart may clear a wedged CLI". But the *real*
+    cause of a storm splits into operator-distinct buckets that the
+    runner already records per-row in ``decisions.reasoning``:
+
+      * QUOTA_EXHAUSTED  — wait for reset; restart does NOTHING.
+      * HOST_SATURATED   — kill parallel Opus jobs; restart does NOTHING.
+      * MODEL_EMPTY      — wedged CLI; restart IS the fix.
+      * PARSE_FAILED     — prompt / model regression; inspect, tweak prompt.
+      * RETRY_FAILED     — JSON-nudge retry not rescuing; ditto.
+
+    Telling the operator "restart" when the storm is actually quota or
+    host saturation wastes the only Discord surface they read on a
+    fix that cannot work. This routes the no_decision_reasons builder's
+    dominant-cause verdict + its TARGETED recommendation to the surface
+    the operator actually reads (the dashboard→Discord trajectory
+    ``_heartbeat_line`` / ``_capital_pulse_line`` each followed).
+
+    Composes ``build_no_decision_reasons`` **verbatim** (single source of
+    truth, AGENTS.md invariant #10 — the headline / dominant bucket /
+    recommendation are the builder's, never re-derived). **Pure store
+    read only — NO network.** Observational only, never gates, adds no
+    caps (invariants #2/#12 — the ``_heartbeat_line`` precedent). Failure
+    contract mirrors the rest of ``reporter``: any builder/store fault
+    degrades to ``""`` ("no reason-breakdown line this report"), never an
+    exception ("no Discord summary this report").
+
+    Suppression — surface ONLY a real DOMINANT cause. A MIXED storm
+    (no single bucket ≥ ``DOMINANT_THRESHOLD_PCT``) and the NO_DATA
+    "engine producing fine" case both stay silent: a balanced histogram
+    has no single fix and a healthy book has no problem to report (the
+    ``_heartbeat_line`` HEALTHY suppression precedent — the summary
+    must never become its own lying green light).
+    """
+    try:
+        from .analytics.no_decision_reasons import (
+            DEFAULT_WINDOW, build_no_decision_reasons,
+        )
+        nr = build_no_decision_reasons(
+            store.recent_decisions(DEFAULT_WINDOW),
+            window=DEFAULT_WINDOW,
+        )
+        if not isinstance(nr, dict) or nr.get("state") != "DOMINANT":
+            return ""
+        bucket = (nr.get("dominant_bucket") or "?").upper()
+        headline = nr.get("headline") or ""
+        rec = nr.get("recommendation") or ""
+        if not headline:
+            return ""
+        lines = [f"**NO_DECISION CAUSE** ◈ {bucket}", f"> {headline}"]
+        # The headline already folds in the recommendation when DOMINANT;
+        # avoid duplicating it as a second bullet.
+        if rec and rec not in headline:
+            lines.append(f"> {rec}")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[reporter] no-decision-reasons line skipped: {e}")
+        return ""
+
+
 def _decision_clock_line(store) -> str:
     """One-line "is there a recurring HOUR-OF-DAY where this trader is
     consistently being starved?" for the hourly / daily report.
@@ -2024,6 +2208,15 @@ def send_hourly_summary() -> bool:
     hp = _host_pulse_line()
     if hp:
         body += "\n" + hp
+    # IDLE sits right AFTER HOST — host pulse names the CAUSE (saturated /
+    # starved); idle-opportunity names what was MISSED while the cause held.
+    # Both can be silent independently (silence-when-nothing-actionable);
+    # neither suppresses the other, so a future drought without a high-score
+    # miss reports HOST alone and a future drought on a clear host reports
+    # IDLE alone — the same independence as HOST/CAPITAL.
+    iox = _idle_opportunity_line(store)
+    if iox:
+        body += "\n" + iox
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
@@ -2036,6 +2229,9 @@ def send_hourly_summary() -> bool:
     dc = _decision_clock_line(store)
     if dc:
         body += "\n" + dc
+    ndr = _no_decision_reasons_line(store)
+    if ndr:
+        body += "\n" + ndr
     return _send(body)
 
 
@@ -2130,6 +2326,15 @@ def send_daily_close() -> bool:
     hp = _host_pulse_line()
     if hp:
         body += "\n" + hp
+    # IDLE sits right AFTER HOST — host pulse names the CAUSE (saturated /
+    # starved); idle-opportunity names what was MISSED while the cause held.
+    # Both can be silent independently (silence-when-nothing-actionable);
+    # neither suppresses the other, so a future drought without a high-score
+    # miss reports HOST alone and a future drought on a clear host reports
+    # IDLE alone — the same independence as HOST/CAPITAL.
+    iox = _idle_opportunity_line(store)
+    if iox:
+        body += "\n" + iox
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
@@ -2142,4 +2347,7 @@ def send_daily_close() -> bool:
     dc = _decision_clock_line(store)
     if dc:
         body += "\n" + dc
+    ndr = _no_decision_reasons_line(store)
+    if ndr:
+        body += "\n" + ndr
     return _send(body)

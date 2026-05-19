@@ -9339,6 +9339,127 @@ def decision_drought_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/idle-opportunity")
+def idle_opportunity_api():
+    """During the current PARALYSIS drought, which high-score live signals
+    on the watchlist arrived that the bot never decided against?
+
+    ``/api/decision-drought`` reports the realized portfolio drift while the
+    bot was dark — a backward-looking P&L cost. ``/api/shadow-vs-claude``
+    reports a right-now deterministic rec vs the (possibly hours-stale)
+    last claude decision — snapshot-only by design. Neither answers the
+    operator's "did anything HIGH-SCORE actually arrive on a name I follow
+    during the dark window I would have acted on?" question. This endpoint
+    enumerates the loudest live watchlist articles inside the canonical
+    ``build_decision_drought.current_drought`` window (composes verbatim —
+    AGENTS.md #10, so the two endpoints can never disagree on what counts as
+    an ongoing drought) and buckets them per ticker. An empty result is
+    itself informative — ``state="OK"``, ``n_opportunities=0`` —
+    silence-when-nothing-actionable (the ``_macro_calendar_chat_lines`` /
+    ``_event_readiness_chat_lines`` / ``_host_pulse_line`` precedent).
+
+    Query params (clamped):
+      * ``min_ai_score`` — 0..10, default 6.0 (above grey-zone threshold,
+        below the 8.0 urgency cap; raise to focus only on near-urgent rows)
+      * ``max_opportunities`` — 1..50, default 20
+
+    Reads digital-intern's articles.db read-only through the same
+    freshness-aware ``_articles_db_path()`` the other news-IO endpoints use
+    (invariant #15/#17 — no split-brain feed). Live-only clause applied
+    (invariant #3). Article scan is bounded by the drought window so the
+    SQL is bounded even on a high-throughput articles.db (the
+    ``news_velocity`` precedent — drought is typically 4-24h so the row
+    count is hundreds, not the 1.47M-rows/7d worst case).
+
+    Observational only — never gates Opus, no caps (AGENTS.md #2/#12 — the
+    ``shadow_vs_claude`` / ``stress_scenarios`` / ``recovery`` precedent).
+    """
+    try:
+        from .analytics.idle_opportunity import (
+            build_idle_opportunity,
+            DEFAULT_MIN_AI_SCORE,
+            DEFAULT_MAX_OPPORTUNITIES,
+        )
+        from .analytics.decision_drought import build_decision_drought
+
+        try:
+            min_score = float(request.args.get("min_ai_score",
+                                               DEFAULT_MIN_AI_SCORE))
+        except Exception:
+            min_score = DEFAULT_MIN_AI_SCORE
+        min_score = max(0.0, min(min_score, 10.0))
+
+        try:
+            max_opps = int(request.args.get("max_opportunities",
+                                            DEFAULT_MAX_OPPORTUNITIES))
+        except Exception:
+            max_opps = DEFAULT_MAX_OPPORTUNITIES
+        max_opps = max(1, min(max_opps, 50))
+
+        store = get_store()
+        # Compose decision_drought verbatim — single source of truth so
+        # /api/idle-opportunity and /api/decision-drought can never disagree
+        # on whether there is an ongoing drought (AGENTS.md #10).
+        dd = build_decision_drought(
+            store.recent_decisions(limit=3000),
+            store.equity_curve(limit=5000),
+        )
+        now_utc = datetime.now(timezone.utc)
+
+        from .strategy import WATCHLIST as _WATCHLIST
+        watchlist = list(_WATCHLIST)
+        held = _stock_tickers_from_positions(store.open_positions())
+
+        # Short-circuit when there's no ongoing drought — saves the
+        # articles.db read entirely (the operator-happy path).
+        cur = dd.get("current_drought") if isinstance(dd, dict) else None
+        if not cur or not cur.get("ongoing"):
+            return jsonify(build_idle_opportunity(
+                dd, [], watchlist, held_tickers=held, now=now_utc,
+                min_ai_score=min_score, max_opportunities=max_opps,
+            ))
+
+        drought_start = cur.get("start")
+        articles: list[dict] = []
+        path = _articles_db_path()
+        if path is not None and drought_start:
+            # Window-bounded scan — drought_start is the cheapest filter
+            # (typically narrows to hundreds of rows). Same live-only
+            # clause as every other news-IO endpoint (AGENTS.md #3).
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
+                                   timeout=5)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT title, ai_score, urgency, first_seen, url, source "
+                    "FROM articles WHERE first_seen >= ? "
+                    "AND ai_score >= ? "
+                    "AND url NOT LIKE 'backtest://%' "
+                    "AND source NOT LIKE 'backtest_%' "
+                    "AND source NOT LIKE 'opus_annotation%' "
+                    "ORDER BY ai_score DESC, first_seen DESC LIMIT 5000",
+                    (drought_start, float(min_score)),
+                ).fetchall()
+            finally:
+                conn.close()
+            for r in rows:
+                articles.append({
+                    "title": r["title"] or "",
+                    "ai_score": r["ai_score"],
+                    "urgency": r["urgency"],
+                    "first_seen": r["first_seen"],
+                    "url": r["url"],
+                    "source": r["source"],
+                })
+
+        return jsonify(build_idle_opportunity(
+            dd, articles, watchlist, held_tickers=held, now=now_utc,
+            min_ai_score=min_score, max_opportunities=max_opps,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/position-attention")
 def position_attention_api():
     """Per-open-position last-real-Opus-look freshness — which held names has
@@ -10150,6 +10271,35 @@ def runner_heartbeat_api():
         except Exception:
             pass
         return jsonify(hb)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/no-decision-reasons")
+def no_decision_reasons_api():
+    """Bucket the WHY of recent NO_DECISION cycles into actionable buckets.
+
+    Complements /api/runner-heartbeat (which says ``IDLE_STORM``: cycles
+    are blank) and /api/decision-drought (which prices the P&L cost of
+    inaction). This says **WHAT IS CAUSING THE BLANKS** — quota /
+    host-saturation / model-empty / parse-failed / retry-failed — so the
+    operator's next step is targeted (wait, kill parallel Opus, restart
+    runner, or tweak prompt) instead of the generic "restart may help"
+    /api/runner-heartbeat falls back to. Pure builder; network in the
+    endpoint (the runner-heartbeat split). Advisory only — never gates
+    Opus, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.no_decision_reasons import (
+            DEFAULT_WINDOW, build_no_decision_reasons,
+        )
+        try:
+            window = int(request.args.get("window") or DEFAULT_WINDOW)
+        except (TypeError, ValueError):
+            window = DEFAULT_WINDOW
+        window = max(1, min(window, 500))
+        store = get_store()
+        return jsonify(build_no_decision_reasons(
+            store.recent_decisions(window), window=window))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
