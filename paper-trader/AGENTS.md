@@ -7442,6 +7442,187 @@ tests) both green — no neighboring regression. **Pre-existing failure**
 stash-swap — NOT from this pass; belongs to another agent's commit
 window and is left untouched per concurrent-agent discipline.
 
+## Feature pass — reasoning themes + decision confidence (2026-05-19)
+
+Two new pure-builder endpoints layered on the existing decision-history
+surface. Both descriptive complements to `/api/reasoning-coherence`
+(which measures pair-wise Jaccard stability — a *vocabulary stability*
+metric) that close gaps in the operator's view of Opus's mental state.
+
+### `/api/reasoning-themes`
+
+**Problem:** the decisions table accumulates Opus's reasoning prose
+across thousands of cycles — recurring topics ("earnings premium",
+"concentration drag", "memory super-cycle", "macro overhang") and
+recurring failure prefixes ("claude returned no response (timeout/
+empty)") — but the ~80-endpoint analytics surface has **no vocabulary
+distribution** view. `/api/reasoning-coherence` measures pair stability,
+`/api/decision-forensics` reads one row, and the dashboard reasoning
+panels show the latest blob. None answer "what has Opus been *talking
+about* this week?"
+
+**Route** `/api/reasoning-themes?limit=100&top_k=10&include_bigrams=1`
+(limit clamped 5..500, top_k clamped 3..50). Pure builder at
+`paper_trader/analytics/reasoning_themes.py` reads `store.recent_decisions`,
+extracts reasoning text from each row across the three real shapes
+(JSON envelope `{"decision": {"reasoning": "..."}}`, top-level
+`reasoning` key, bare prose for NO_DECISION timeout strings — the
+`parse_failed:` / `retry_failed:` prefix + ```json``` fence stripping
+mirrors `reasoning_coherence`), tokenises into content words (length≥3,
+non-stopword — the same stopword set as `reasoning_coherence` extended
+with prose-glue: `amid`/`against`/`during`/`their`/`them`/`such`/...),
+walks the stream to emit 1-grams + (optionally) 2-grams of consecutive
+content tokens, then ranks by **decisions_mentioning** (the
+breadth-not-loudness contract — a phrase repeated 30× in one verbose
+reasoning counts as ONE mentioning decision, but a phrase recurring
+across 12 different decisions ranks high). Bigrams and unigrams compete
+in the same leaderboard; on a tie the bigram wins (informativeness
+tie-break — "super cycle" beats "super" + "cycle"). The example excerpt
+is locally anchored (±80 chars around the first hit) so the operator
+sees the surrounding context, not a beginning fragment.
+
+**Output:** ranked `themes[]` with `{phrase, decisions_mentioning,
+share_of_decisions, total_mentions, first_seen_ts, example, is_bigram}`
++ headline naming the top theme + state in `NO_DATA` (zero rows with
+extractable reasoning text) / `OK` (leaderboard emitted) +
+`n_unparseable` so the operator can spot a malformed-row spike.
+
+**Locks (`tests/test_reasoning_themes.py`, 20 tests, ~0.8s):**
+  1. `NO_DATA` / `OK` ladder + n_unparseable accounting
+  2. **Breadth beats loudness** — a 30× repetition in one row does NOT
+     outrank a phrase appearing 1× across 5 different rows; the
+     discriminating test asserts ranking position AND that `total_mentions`
+     is preserved as a *secondary* field (a loudness regression that
+     swapped the primary sort key would surface high alpha first)
+  3. **Bigram-wins-tie informativeness** — `"super cycle"` outranks
+     `"super"` and `"cycle"` at identical (decisions_mentioning,
+     total_mentions); a reviewer "consistency-fixing" the sort to prefer
+     unigrams fails RED
+  4. `include_bigrams=False` strips ALL multi-word phrases from leaderboard
+  5. Stopword + len<3 filter applied to BOTH the unigram stream and the
+     bigram pairing chain (so "the and for with" produces zero content)
+  6. Three real reasoning shapes extract correctly: JSON envelope,
+     top-level `reasoning` key, `parse_failed:` prefix
+  7. NO_DECISION timeout strings (`"claude returned no response …"`) ARE
+     themable as bare prose (the host-saturation pattern surface)
+  8. `share_of_decisions` denominator is *parseable rows*, not total
+     rows — an unparseable row in window does NOT dilute the share of
+     a phrase present in every text-bearing row
+  9. Example excerpt contains the phrase literally (case-insensitive)
+  10. `top_k` clamps high (>50 → 50) and low (0/missing → 3, not 10 via
+      Python `or` short-circuit — explicit `is not None` guard locked)
+  11. Caller's list not mutated; garbage row keys never raise
+  12. Route surface: limit + top_k clamp, garbage params fall back to
+      defaults, `include_bigrams=0/false/no/off` all disable, fresh
+      `Store` wiring through `monkeypatch.setattr(store.DB_PATH, …)`
+  13. **NOT behind the SWR cache** — cheap pure builder; locked so a
+      future refactor can't accidentally bring in the prewarm-coverage
+      obligation. Discipline pin from #1 (the literal `@swr_cached`
+      docstring lock): the route docstring must NOT contain the literal
+      substring `@swr_cached` or the inspect-getsource lock self-trips
+
+### `/api/decision-confidence`
+
+**Problem:** every parseable decision blob carries a numeric
+`confidence` 0..1 in the `{"decision": {"confidence": 0.7, ...}}`
+envelope. Nothing across the ~80-endpoint surface aggregates it.
+`/api/scorer-confidence` is the **DecisionScorer** (the tiny CPU MLP
+on the backtest side), not Opus; `/api/decision-forensics` reads one
+decision; `/api/reasoning-coherence` measures pair stability — none
+answers "is Opus confidently sitting on its hands, or uncertainly doing
+nothing?" An operator scanning a paralysed week cannot distinguish
+high-conviction HOLDs around a binary event (correct) from low-
+conviction churn (a flag to operators that the model is hedging).
+
+**Route** `/api/decision-confidence?limit=100` (clamped 5..500). Pure
+builder at `paper_trader/analytics/decision_confidence.py` reads
+`store.recent_decisions`, extracts the numeric `confidence` from each
+row's reasoning JSON (canonical envelope + top-level fallback +
+`parse_failed:` prefix tolerance — same shape ladder as `reasoning_themes`),
+computes median / mean / min / max / 4-bucket histogram + per-action
+breakdown + recent-vs-older trend split + regime verdict.
+
+**Numerical-robustness contract:**
+  * Out-of-band values (`1.5`, `-0.3`) are **CLAMPED to [0, 1]**, not
+    dropped. A model emitting 1.2 is bounded conviction noise, not
+    invalid data — silently dropping would hide a real model bug from
+    the operator. (Discriminator test: `[1.5, -0.5, 0.7, 0.6, 0.8]` →
+    `n_with_confidence=5`, `max=1.0`, `min=0.0`.)
+  * `NaN` IS dropped (treated as unparseable — the operator sees
+    `n_unparseable` go up)
+  * Non-numeric (`"high"`, `null`) dropped silently
+  * Order of caller's list preserved — `recent_decisions` is newest-
+    first, so the FIRST half of the value stream is the *recent* half
+    in the trend split (TRENDING_UP = recent half median ≥ older half
+    median by `TREND_DELTA = 0.10`)
+
+**Regime ladder** (median confidence):
+  * `CAUTIOUS` — median < `CAUTIOUS_THRESHOLD = 0.45` ("Opus is hedging")
+  * `NEUTRAL` — 0.45 ≤ median < `CONVICTED_THRESHOLD = 0.70`
+  * `CONVICTED` — median ≥ 0.70 ("Opus is decisive")
+  Boundary inclusive on the *upper* side: `median == 0.45` → NEUTRAL;
+  `median == 0.70` → CONVICTED.
+
+**State ladder** (operator clarity over verdict pressure — the
+`reasoning_coherence` / `tail_risk` precedent):
+  * `NO_DATA` — zero parseable confidence values
+  * `INSUFFICIENT` — fewer than `MIN_SAMPLES_FOR_VERDICT = 5` parsed;
+    raw stats (median, mean, buckets) emitted, regime + trend withheld
+  * `OK` — verdict emitted
+
+**Output:** state + regime + median/mean/min/max + 4-bucket histogram
+(`low <0.4`, `medium [0.4,0.6)`, `high [0.6,0.8)`, `very_high [0.8,1.0]`)
++ `by_action` (per-leading-verb median/mean/n, so the operator can spot
+"HOLDs median 0.75, BUYs median 0.42 — Opus buys with less conviction
+than it holds") + trend block (`{tag, recent_median, older_median, delta,
+split_size}` or None when sample size won't support a split) +
+threshold constants in-band for UI rendering. Headline composes the
+regime line + a trend appendix when non-FLAT.
+
+**Locks (`tests/test_decision_confidence.py`, 28 tests, ~0.4s):**
+  1. `NO_DATA` / `INSUFFICIENT` / `OK` ladder + min-sample gating;
+     raw stats emitted under INSUFFICIENT, regime + trend withheld
+  2. Three real reasoning shapes extract correctly: envelope,
+     top-level `confidence`, `parse_failed:` prefix
+  3. **Out-of-band clamp, NOT drop** — the discriminating contract;
+     `1.5` → `1.0` in `max`, not absent from `n_with_confidence`
+  4. NaN dropped; non-numeric (`"high"`) dropped; `null` dropped
+  5. CAUTIOUS / NEUTRAL / CONVICTED at exact threshold boundaries
+     (inclusive-upper convention: 0.45 → NEUTRAL, 0.70 → CONVICTED)
+  6. TRENDING_UP / TRENDING_DOWN / FLAT by `recent_median − older_median`
+     vs `TREND_DELTA`; recent half is the FIRST half of caller-supplied
+     order (the `recent_decisions` newest-first contract)
+  7. Trend withheld when split half is < 2 samples
+  8. Per-action breakdown groups by leading verb (`HOLD NVDA → HOLD` →
+     `HOLD`; `SELL_CALL NVDA 200C → FILLED` → `SELL_CALL`); blank /
+     None `action_taken` → `UNKNOWN` bucket
+  9. Buckets partition [0,1] with no gaps; all 4 keys present (zeroed
+     when empty); `very_high` includes exact `1.0`
+  10. Garbage-row tolerance — `{}`, `{"reasoning": 12345}`, missing keys
+      degrade to `NO_DATA`, never raise
+  11. Route: fresh-Store wiring, limit clamp 5..500, garbage param
+      `?limit=banana` falls back to default 100, **NOT behind the SWR
+      cache** (same docstring-literal discipline as `reasoning_themes`)
+
+**Observational only** (invariants #2/#12 — never gates Opus, never
+injected into the decision prompt, no caps). Builder degrades to
+NO_DATA on any input failure; route degrades to JSON `{"error": ...}` +
+500 on store exceptions. Both endpoints sit immediately after
+`/api/reasoning-coherence` in `dashboard.py` so the three across-time
+decision-introspection diagnostics (coherence / themes / confidence)
+are co-located.
+
+**Applies on next paper-trader restart** (the documented pattern for
+every recent feature — the running `:8090` continues until restart).
+
+**Verify:** `from paper_trader import dashboard;
+dashboard.reasoning_themes_api; dashboard.decision_confidence_api`
+imports OK; `tests/test_reasoning_themes.py` 20/20 +
+`tests/test_decision_confidence.py` 28/28 + adjacent
+`test_reasoning_coherence.py` 19/19 + `test_core_dashboard_helpers.py` /
+`test_core_dashboard_articles_db.py` all pass — no neighboring
+regression. Full suite still collects (2657 tests).
+
 ## Review pass #32 — paper-trader core hybrid (2026-05-19)
 
 **Agent persona:** debugger + feature dev + live trader; concurrent with
