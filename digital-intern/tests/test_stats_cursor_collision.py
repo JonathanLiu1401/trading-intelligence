@@ -83,6 +83,38 @@ def test_expect_row_none_is_retried_by_decorator_then_succeeds():
     assert calls["n"] == 2, "must retry exactly once after the None collision"
 
 
+def test_expect_row_raises_retryable_on_empty_tuple():
+    """Empty-tuple cursor-collision class — same root cause as the None
+    variant, surfacing as ``fetchone() -> ()`` instead. Live evidence
+    (2026-05-19/20 daemon.log): ``[stats_worker] error: tuple index out of
+    range`` recurred under writer contention. ``_expect_row`` must convert
+    this into the SAME retryable signal so the @_retry_on_lock decorator
+    succeeds on the next attempt instead of letting ``IndexError`` bubble
+    to ``stats_worker``'s broad except."""
+    with pytest.raises(sqlite3.DatabaseError) as ei:
+        article_store._expect_row(_Cur(()))
+    msg = str(ei.value).lower()
+    assert any(s in msg for s in article_store._RETRYABLE_DB_ERRORS), (
+        "the empty-tuple collision must stay within _RETRYABLE_DB_ERRORS "
+        "or _retry_on_lock will not retry it (anti-drift pin)"
+    )
+
+
+def test_expect_row_empty_tuple_is_retried_by_decorator_then_succeeds():
+    """Parallel to ``test_expect_row_none_is_retried_by_decorator_then_succeeds``
+    for the empty-tuple variant of the same cursor collision."""
+    calls = {"n": 0}
+
+    @article_store._retry_on_lock
+    def flaky_reader():
+        calls["n"] += 1
+        row = () if calls["n"] == 1 else (11,)
+        return article_store._expect_row(_Cur(row))[0]
+
+    assert flaky_reader() == 11
+    assert calls["n"] == 2, "must retry exactly once after the () collision"
+
+
 # ── integration: stats() / count_unscored() / stats_since() recover ──────────
 class _FlakyCursor:
     """Delegates to a real cursor but returns ``None`` from the FIRST
