@@ -372,6 +372,21 @@ class BacktestStore:
         self.conn.executescript(SCHEMA)
         self.conn.commit()
         self._lock = threading.Lock()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Idempotent schema migrations for columns added after initial deploy."""
+        migrations = [
+            "ALTER TABLE backtest_runs ADD COLUMN model_id TEXT NOT NULL DEFAULT 'ml_quant'",
+            "ALTER TABLE backtest_runs ADD COLUMN hf_errors INT NOT NULL DEFAULT 0",
+        ]
+        with self._lock:
+            for sql in migrations:
+                try:
+                    self.conn.execute(sql)
+                    self.conn.commit()
+                except Exception:
+                    pass  # column already exists — idempotent
 
     def upsert_run(self, run_id: int, seed: int, status: str,
                    start: date, end: date) -> None:
