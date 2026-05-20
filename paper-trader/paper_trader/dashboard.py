@@ -12398,6 +12398,33 @@ def _swr_prewarm():
         # is the long-tail latency contributor; same cold-stall blind
         # spot the prewarm-coverage invariant locks against.
         ("round-trip-postmortem", round_trip_postmortem_api),
+        # The four endpoints below were @swr_cached but never added to the
+        # prewarm list — same freeze-triage cold-stall blind spot the
+        # test_swr_prewarm_coverage invariant locks against. A trader who
+        # opens these panels right after a restart got {"warming": true}
+        # instead of real data for one full TTL cycle. Restored to keep the
+        # prewarm == @swr_cached contract intact.
+        #
+        # decision-paralysis: consecutive-HOLD streak detector
+        # (HOLD_LOCK pathology). Right when the operator is checking
+        # "is the bot actually deciding or wedged on HOLD?", a cold-
+        # stall {"warming": true} hides the answer.
+        ("decision-paralysis", decision_paralysis_api),
+        # position-news-cooldown: per-held-name news-flow gone-quiet
+        # detector — articles.db SELECT over a multi-day window per
+        # held ticker, the slowest pure-DB shape outside /api/state.
+        ("position-news-cooldown", position_news_cooldown_api),
+        # correlation-cluster-warning: hidden-factor-bet alarm built
+        # on /api/correlation's pairwise output. Together with
+        # /api/correlation (already prewarmed) this is the desk's
+        # concentration-risk surface; cold-stalling it alone leaves the
+        # operator with only half the picture during freeze triage.
+        ("correlation-cluster-warning", correlation_cluster_warning_api),
+        # launcher-restart-loop: systemd/launcher crash-loop detector.
+        # First poll right after a restart is exactly when the operator
+        # is checking "did the supervisor flap?"; a {"warming": true}
+        # there is the worst possible UX.
+        ("launcher-restart-loop", launcher_restart_loop_api),
     ]
     for name, wrapper in targets:
         try:
