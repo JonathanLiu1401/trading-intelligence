@@ -92,6 +92,7 @@ from collectors.hackernews_collector import collect_hackernews
 from collectors.sec_xbrl_financials import collect_sec_xbrl_financials
 from collectors.usgs_earthquake_collector import collect_usgs_earthquakes
 from collectors.sec_13f_collector import collect_13f_filings
+from collectors.sec_insider_form4 import collect_sec_form4
 from collectors.nasdaq_halts_collector import collect_nasdaq_halts
 from collectors import source_health
 from core.backoff import Backoff
@@ -163,6 +164,7 @@ GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 su
 HACKERNEWS_INTERVAL     = 300     # Hacker News front-page + finance/business stories — every 5min
 SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
 SEC_13F_INTERVAL        = 1800      # SEC 13F institutional holdings — every 30min (quarterly season)
+SEC_FORM4_INTERVAL      = 300       # SEC Form 4 insider transactions (portfolio tickers) — every 5min
 USGS_QUAKE_INTERVAL     = 1800    # USGS M≥5 earthquake feed every 30min (insurance/semis/energy catalyst)
 NASDAQ_HALTS_INTERVAL   = 120     # NASDAQ/UTP trading halt+resume feed every 2min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
@@ -257,6 +259,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "hackernews": HACKERNEWS_INTERVAL,
     "sec_xbrl": SEC_XBRL_INTERVAL,
     "sec_13f": SEC_13F_INTERVAL,
+    "sec_form4": SEC_FORM4_INTERVAL,
     "usgs_quake": USGS_QUAKE_INTERVAL,
     "nasdaq_halts": NASDAQ_HALTS_INTERVAL,
     "scorer": SCORE_INTERVAL,
@@ -1536,6 +1539,27 @@ def sec_13f_worker(store: ArticleStore):
         _sleep(SEC_13F_INTERVAL)
 
 
+# ── Worker: SEC Form 4 insider transactions (portfolio tickers) — every 5min ─
+def sec_form4_worker(store: ArticleStore):
+    log.info("[sec_form4_worker] started")
+    bo = Backoff("sec_form4", base=30.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_sec_form4()
+            _ingest(store, articles, "sec_form4")
+            try:
+                source_health.record_result("sec_form4", len(articles))
+            except Exception as he:
+                log.warning(f"[sec_form4_worker] source_health error: {he}")
+            _worker_last_ok["sec_form4"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[sec_form4_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SEC_FORM4_INTERVAL)
+
+
 # ── Worker: Hacker News front-page + finance/business stories — every 5min ──
 def hackernews_worker(store: ArticleStore):
     log.info("[hackernews_worker] started")
@@ -2726,6 +2750,7 @@ def main():
         ("hackernews",  hackernews_worker),
         ("sec_xbrl",    sec_xbrl_worker),
         ("sec_13f",     sec_13f_worker),
+        ("sec_form4",   sec_form4_worker),
         ("usgs_quake",  usgs_quake_worker),
         ("nasdaq_halts", nasdaq_halts_worker),
         ("scorer",      scorer_worker),
