@@ -48,7 +48,8 @@ def test_status_ok_when_no_deceleration(monkeypatch):
 
 
 def test_status_degraded_when_mid_decline(monkeypatch):
-    """A 40-75% decel triggers ``degraded`` — investigate before next briefing."""
+    """A 40-75% decel on a meaningful baseline triggers ``degraded`` —
+    investigate before next briefing. Baseline must be >= MIN_PRIOR (5)."""
     store = _FakeStore(rows=[
         {"source": "gdelt", "recent": 30, "prior": 60, "delta": -30, "decel_pct": 50.0},
         {"source": "rss", "recent": 100, "prior": 95, "delta": 5, "decel_pct": -5.3},
@@ -61,7 +62,8 @@ def test_status_degraded_when_mid_decline(monkeypatch):
 
 
 def test_status_critical_when_sharp_decline(monkeypatch):
-    """A >=75% decel triggers ``critical`` — source is effectively dark."""
+    """A >=75% decel on a meaningful baseline triggers ``critical`` — source
+    is effectively dark."""
     store = _FakeStore(rows=[
         {"source": "finnhub", "recent": 2, "prior": 40, "delta": -38, "decel_pct": 95.0},
         {"source": "rss", "recent": 100, "prior": 95, "delta": 5, "decel_pct": -5.3},
@@ -84,6 +86,34 @@ def test_critical_dominates_degraded(monkeypatch):
     assert d["status"] == "critical"
     assert d["n_critical"] == 1
     assert d["n_degraded"] == 1
+
+
+def test_low_prior_noise_excluded_from_verdict(monkeypatch):
+    """Long-tail one-off sub-tag noise — a single article last hour, zero this
+    hour — must NOT count as critical. Live evidence (2026-05-20): the
+    ``ArticleStore.source_throughput`` 60-min window returned 8+ rows of
+    ``prior=1, recent=0, decel_pct=100`` for one-off GDELT/AlphaVantage host
+    keys. Without a baseline floor every cycle reported ``critical`` on a
+    healthy daemon — false alarm. Sources must have prior >= 5 to count.
+
+    Crucially the rows ARE still returned in ``sources`` so an operator can
+    still see them; only the verdict count is gated.
+    """
+    store = _FakeStore(rows=[
+        {"source": "GDELT/longtail1", "recent": 0, "prior": 1, "delta": -1, "decel_pct": 100.0},
+        {"source": "GDELT/longtail2", "recent": 0, "prior": 2, "delta": -2, "decel_pct": 100.0},
+        {"source": "GDELT/longtail3", "recent": 0, "prior": 3, "delta": -3, "decel_pct": 100.0},
+        {"source": "GDELT/longtail4", "recent": 0, "prior": 4, "delta": -4, "decel_pct": 100.0},
+    ])
+    r = _client(store, monkeypatch).get("/api/source-throughput")
+    d = r.get_json()
+    assert d["status"] == "ok", (
+        "low-prior noise rows must not inflate the verdict to critical"
+    )
+    assert d["n_critical"] == 0
+    assert d["n_degraded"] == 0
+    # All rows still surfaced in the sources list — the operator can inspect.
+    assert len(d["sources"]) == 4
 
 
 def test_none_decel_does_not_inflate_status(monkeypatch):

@@ -2629,14 +2629,28 @@ def create_app(store=None) -> Flask:
         # look at this?" bar: 75%+ drop = source effectively dark for the
         # window; 40-75% = degrading enough to investigate before the next
         # briefing. None=brand-new sources are NOT flagged (no baseline).
+        #
+        # ``MIN_PRIOR_FOR_VERDICT`` excludes one-off sub-tag noise (a long-
+        # tail aggregator key seen once last hour, zero this hour) from the
+        # verdict count. Live evidence (2026-05-20, 60-min window): 8+
+        # ``GDELT/<host>`` / ``AlphaVantage/<host>`` rows hit decel_pct=100
+        # purely because prior was 1 — a normal long-tail fluctuation, not a
+        # degradation worth alerting on. Without this floor the verdict
+        # collapsed to ``critical`` on every cycle. The full ``sources``
+        # list is still returned (the operator can still see them), but
+        # only sources with a meaningful baseline drive the verdict.
+        MIN_PRIOR_FOR_VERDICT = 5
         n_critical = sum(
             1 for r in rows
-            if isinstance(r.get("decel_pct"), (int, float)) and r["decel_pct"] >= 75
+            if isinstance(r.get("decel_pct"), (int, float))
+            and r["decel_pct"] >= 75
+            and int(r.get("prior") or 0) >= MIN_PRIOR_FOR_VERDICT
         )
         n_degraded = sum(
             1 for r in rows
             if isinstance(r.get("decel_pct"), (int, float))
             and 40 <= r["decel_pct"] < 75
+            and int(r.get("prior") or 0) >= MIN_PRIOR_FOR_VERDICT
         )
         if n_critical:
             status = "critical"
