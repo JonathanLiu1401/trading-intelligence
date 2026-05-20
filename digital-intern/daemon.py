@@ -78,6 +78,7 @@ from collectors.fed_press_collector import collect_fed_press
 from collectors.ecb_press_collector import collect_ecb_press
 from collectors.boj_press_collector import collect_boj_press
 from collectors.boe_press_collector import collect_boe_press
+from collectors.global_regulators_collector import collect_global_regulators
 from collectors.globenewswire_collector import collect_globenewswire
 from collectors.sec_xbrl_financials import collect_sec_xbrl_financials
 from collectors.usgs_earthquake_collector import collect_usgs_earthquakes
@@ -139,6 +140,7 @@ FED_PRESS_INTERVAL      = 1800    # Federal Reserve press / speech / testimony R
 ECB_PRESS_INTERVAL      = 1800    # ECB press releases RSS — every 30min
 BOJ_PRESS_INTERVAL      = 1800    # Bank of Japan press / speech / MPM RSS — every 30min
 BOE_PRESS_INTERVAL      = 1800    # Bank of England press / publications RSS — every 30min
+GLOBAL_REG_INTERVAL     = 1800    # FSB, FCA, Fed research notes/papers — every 30min
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
 SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
 USGS_QUAKE_INTERVAL     = 1800    # USGS M≥5 earthquake feed every 30min (insurance/semis/energy catalyst)
@@ -191,7 +193,7 @@ ALL_WORKERS = (
     "google_news", "nitter", "substack",
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
     "yahoo_ticker_rss", "market_movers", "wikipedia", "macro_calendar",
-    "fed_press", "ecb_press", "boj_press", "boe_press",
+    "fed_press", "ecb_press", "boj_press", "boe_press", "global_reg",
     "usgs_quake",
     "scorer", "alert", "heartbeat", "purge", "stats",
     "ml_trainer", "continuous_trainer", "recursive_labeler", "price_alert",
@@ -225,6 +227,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "ecb_press": ECB_PRESS_INTERVAL,
     "boj_press": BOJ_PRESS_INTERVAL,
     "boe_press": BOE_PRESS_INTERVAL,
+    "global_reg": GLOBAL_REG_INTERVAL,
     "globenewswire": GLOBENEWSWIRE_INTERVAL,
     "sec_xbrl": SEC_XBRL_INTERVAL,
     "usgs_quake": USGS_QUAKE_INTERVAL,
@@ -1241,6 +1244,28 @@ def usgs_quake_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(USGS_QUAKE_INTERVAL)
+
+
+# ── Worker: Global financial regulators — every 30min ────────────────────────
+def global_reg_worker(store: ArticleStore):
+    log.info("[global_reg_worker] started")
+    bo = Backoff("global_reg", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_global_regulators()
+            _ingest(store, articles, "global_reg")
+            try:
+                source_health.record_result("global_reg", len(articles))
+            except Exception as he:
+                log.warning(f"[global_reg_worker] source_health error: {he}")
+            _worker_last_ok["global_reg"] = time.time()
+            log.debug(f"[global_reg] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[global_reg_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(GLOBAL_REG_INTERVAL)
 
 
 # ── Worker: GlobeNewswire financial press releases — every 10min ─────────────
@@ -2443,6 +2468,7 @@ def main():
         ("ecb_press",   ecb_press_worker),
         ("boj_press",   boj_press_worker),
         ("boe_press",   boe_press_worker),
+        ("global_reg",  global_reg_worker),
         ("globenewswire", globenewswire_worker),
         ("sec_xbrl",    sec_xbrl_worker),
         ("usgs_quake",  usgs_quake_worker),
