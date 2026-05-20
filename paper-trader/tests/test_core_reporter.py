@@ -441,6 +441,210 @@ class TestTradeAlertImpactLine:
         assert reporter._hold_str_from_days(-1) == ""           # bad data → silent
 
 
+class TestTradeImpactLineUnit:
+    """Direct unit tests for ``_trade_impact_line`` — the post-trade book-
+    impact one-liner. The sibling ``TestTradeAlertImpactLine`` exercises the
+    same helper indirectly through ``send_trade_alert``; this class pins
+    edge cases (degenerate inputs, non-BUY/SELL actions, sub-0.1% lot
+    weights, fractional option strikes, garbage cash, multi-lot
+    aggregation) directly on the function so a future regression that
+    leaves the alert path green still fails loudly on the helper."""
+
+    _BUY = {"action": "BUY", "ticker": "NVDA", "qty": 5, "price": 100.0,
+            "value": 500.0, "reason": "",
+            "timestamp": "2026-05-18T16:00:00+00:00"}
+    _SELL = {"action": "SELL", "ticker": "NVDA", "qty": 5, "price": 120.0,
+             "value": 600.0, "reason": "",
+             "timestamp": "2026-05-18T16:00:00+00:00"}
+
+    def test_snapshot_none_returns_empty(self):
+        assert reporter._trade_impact_line(self._BUY, None, None) == ""
+
+    def test_snapshot_non_dict_returns_empty(self):
+        # Defensive against a future caller passing the wrong shape — the
+        # contract is "no impact line on bad inputs", not a crash.
+        assert reporter._trade_impact_line(self._BUY, "garbage", None) == ""
+        assert reporter._trade_impact_line(self._BUY, ["not", "a", "dict"],
+                                            None) == ""
+
+    def test_zero_total_value_returns_empty(self):
+        # An empty / dead book reads total_value=0 — emitting "0.0% of book"
+        # would mislead. Locks the guard against the div-by-zero path too.
+        snap = {"cash": 0.0, "total_value": 0.0, "positions": []}
+        assert reporter._trade_impact_line(self._BUY, snap, None) == ""
+
+    def test_missing_total_value_returns_empty(self):
+        snap = {"cash": 100.0, "positions": []}   # no total_value key
+        assert reporter._trade_impact_line(self._BUY, snap, None) == ""
+
+    def test_negative_total_value_returns_empty(self):
+        # A negative total is impossible in practice (no shorts), but the
+        # guard already catches it — pin so a future refactor can't drift.
+        snap = {"cash": -10.0, "total_value": -1.0, "positions": []}
+        assert reporter._trade_impact_line(self._BUY, snap, None) == ""
+
+    def test_hold_action_returns_empty(self):
+        snap = {"cash": 500.0, "total_value": 1000.0, "positions": []}
+        hold = {"action": "HOLD", "ticker": "NVDA"}
+        assert reporter._trade_impact_line(hold, snap, None) == ""
+
+    def test_rebalance_action_returns_empty(self):
+        # REBALANCE is treated as HOLD upstream and never a real fill —
+        # the helper must not invent an impact line for it either.
+        snap = {"cash": 500.0, "total_value": 1000.0, "positions": []}
+        rb = {"action": "REBALANCE", "ticker": "NVDA"}
+        assert reporter._trade_impact_line(rb, snap, None) == ""
+
+    def test_buy_tiny_lot_weight_suppressed(self):
+        # Sub-0.1% holding (e.g. fractional share rounding noise) → no
+        # name token; cash still emits because the trader always needs
+        # "what can I spend next" even on a noisy fill.
+        snap = {
+            "cash": 1000.0, "total_value": 1_000_000.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "stock", "qty": 0.001,
+                "market_value": 0.5,   # 0.5 / 1e6 = 5e-5% → < 0.1% threshold
+            }],
+        }
+        out = reporter._trade_impact_line(self._BUY, snap, None)
+        assert out == "post: cash $1000.00"
+        assert "NVDA now" not in out
+
+    def test_buy_no_matching_position_in_snapshot(self):
+        # A BUY whose lot is no longer in the snapshot (e.g. an auto-exit
+        # closed it post-trade). same_lot_value=0 → no name token; cash
+        # still emits. Locks the "cash but no name" honest degradation.
+        snap = {
+            "cash": 500.0, "total_value": 1000.0,
+            "positions": [{
+                "ticker": "MSFT",      # different ticker
+                "type": "stock", "qty": 2, "market_value": 500.0,
+            }],
+        }
+        out = reporter._trade_impact_line(self._BUY, snap, None)
+        assert out == "post: cash $500.00"
+
+    def test_buy_garbage_cash_defaults_to_zero(self):
+        # Defensive: non-numeric cash coerces to 0.0 and still emits
+        # rather than raising. Same contract as market_value coercion.
+        snap = {
+            "cash": "not a number", "total_value": 1000.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "stock", "qty": 5,
+                "market_value": 500.0,
+            }],
+        }
+        out = reporter._trade_impact_line(self._BUY, snap, None)
+        assert "post:" in out
+        assert "cash $0.00" in out
+
+    def test_buy_fractional_option_strike_keeps_decimal(self):
+        # Whole strikes drop ".0" (e.g. "600C") for compactness; a
+        # fractional strike like 600.5 must keep the decimal in the label,
+        # not silently round to "600C" (would mis-identify the lot).
+        trade = {
+            "action": "BUY_CALL", "ticker": "NVDA", "qty": 1, "price": 5.0,
+            "value": 500.0, "reason": "",
+            "option_type": "call", "strike": 600.5, "expiry": "2026-12-19",
+            "timestamp": "2026-05-18T16:00:00+00:00",
+        }
+        snap = {
+            "cash": 500.0, "total_value": 1000.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "call", "qty": 1,
+                "market_value": 500.0,
+                "strike": 600.5, "expiry": "2026-12-19",
+            }],
+        }
+        out = reporter._trade_impact_line(trade, snap, None)
+        assert "NVDA 600.5C 2026-12-19" in out
+        assert "600C" not in out      # would mislabel a 600.5 strike
+        assert "50.0% of book" in out
+
+    def test_buy_non_numeric_option_strike_drops_label_gracefully(self):
+        # If Claude emits a non-numeric strike string (e.g. "ATM") it
+        # would still reach _trade_impact_line via record_trade. The
+        # function must NOT crash on the int() formatter — degrade to the
+        # bare ticker label and let the cash line still ship.
+        trade = {
+            "action": "BUY_CALL", "ticker": "NVDA", "qty": 1, "price": 5.0,
+            "value": 500.0, "reason": "",
+            "option_type": "call", "strike": "ATM", "expiry": "2026-12-19",
+            "timestamp": "2026-05-18T16:00:00+00:00",
+        }
+        # Position has a normal strike — same_lot_value matches by string
+        # equality on strike, so an "ATM" trade.strike won't match a
+        # numeric position.strike → same_lot_value stays 0 → no label.
+        # Either way: NO crash.
+        snap = {
+            "cash": 500.0, "total_value": 1000.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "call", "qty": 1,
+                "market_value": 500.0,
+                "strike": 600.0, "expiry": "2026-12-19",
+            }],
+        }
+        # Most importantly: this does not raise.
+        out = reporter._trade_impact_line(trade, snap, None)
+        # Garbage strike → no lot match → no name token; cash still emits.
+        assert "post:" in out
+        assert "cash $500.00" in out
+
+    def test_buy_option_aggregates_only_matching_strike_expiry(self):
+        # Two option lots on the same ticker, different strikes — the
+        # BUY's lot weight must be just THIS contract's market_value,
+        # not the ticker total (a trader sizing a fresh strike cares
+        # about the contract leg, not the ticker stack).
+        trade = {
+            "action": "BUY_CALL", "ticker": "NVDA", "qty": 1, "price": 5.0,
+            "value": 500.0, "reason": "",
+            "option_type": "call", "strike": 600.0, "expiry": "2026-12-19",
+            "timestamp": "2026-05-18T16:00:00+00:00",
+        }
+        # Total book = 1000; matching 600C lot = 200 (20%); a sibling
+        # 700C lot also 200 — the line must show 20%, not 40%.
+        snap = {
+            "cash": 600.0, "total_value": 1000.0,
+            "positions": [
+                {"ticker": "NVDA", "type": "call", "qty": 1,
+                 "market_value": 200.0,
+                 "strike": 600.0, "expiry": "2026-12-19"},
+                {"ticker": "NVDA", "type": "call", "qty": 1,
+                 "market_value": 200.0,
+                 "strike": 700.0, "expiry": "2026-12-19"},
+            ],
+        }
+        out = reporter._trade_impact_line(trade, snap, None)
+        assert "NVDA 600C 2026-12-19 now 20.0% of book" in out
+        assert "40.0% of book" not in out
+
+    def test_sell_no_store_no_remaining_emits_closed_then_cash(self):
+        # SELL with no remaining lot in the snapshot and no store handle —
+        # the "closed" fallback emits exactly one cash token (the historic
+        # double-cash bug regression is locked in TestTradeAlertImpactLine
+        # via send_trade_alert; pin it on the helper directly too).
+        snap = {"cash": 1100.0, "total_value": 1100.0, "positions": []}
+        out = reporter._trade_impact_line(self._SELL, snap, store=None)
+        assert out == "post: closed · cash $1100.00"
+        assert out.count("cash $") == 1
+
+    def test_sell_partial_close_emits_remaining_weight_then_cash(self):
+        # Partial close — store is None so the round-trip lookup is
+        # skipped entirely; the fallback path must surface remaining
+        # weight (not invent a realized P/L).
+        snap = {
+            "cash": 480.0, "total_value": 1080.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "stock", "qty": 6,
+                "market_value": 600.0,        # 600 / 1080 ≈ 55.6%
+            }],
+        }
+        out = reporter._trade_impact_line(self._SELL, snap, store=None)
+        assert "post: partial — NVDA still 55.6% of book" in out
+        assert "cash $480.00" in out
+        assert "realized" not in out
+
+
 class TestSendDecisionLog:
     def test_includes_action_and_pl(self, monkeypatch):
         captured = []
