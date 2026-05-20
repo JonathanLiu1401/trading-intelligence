@@ -5400,3 +5400,74 @@ never `git add -A`; staged with explicit pathspec only
 `paper-trader/docs/superpowers/plans/` left untouched. AGENTS.md
 appended-only, alongside the related code, in this same documentation
 commit.
+
+## 2026-05-20 — Hybrid pass (briefing-label extractor coverage)
+
+**Test pass** — `_extract_briefing_labels` in `daemon.py` was the one
+producer-side function in the briefing-boost training pipeline with no
+direct test coverage. `tests/test_briefing_boost.py` covered the
+**consumer** (`store.update_scores_from_labels`) but a regression in the
+extractor (e.g. accidental removal of the 12-char prefix guard, or a
+rename of `art["link"]` to `art["url"]`) would silently poison the
+training pool with no test failure. Added `tests/test_briefing_label_
+extraction.py` with 11 invariant pins:
+
+  - **Empty / short titles never match**: pins the 12-char floor (the
+    empty-string-substring trap `"" in "anything"` is True; without the
+    guard every untitled snapshot row would land in the training pool
+    tagged `in_briefing=True`).
+  - **Synthetic snapshot rows skip cleanly**: `PORTFOLIO P&L SNAPSHOT`
+    and `OPTIONS SNAPSHOT` carry no `url` — the extractor must
+    `continue` past them silently, neither KeyError-crash the worker
+    nor emit a bogus `url=''` the consumer would `UPDATE` on.
+  - **Case-insensitive prefix match**: pinned with a verbatim
+    Opus-style mixed-case rephrase; broke a candidate cleanup that
+    would have removed the `.lower()` from one side.
+  - **40-char prefix bound**: a long title whose *tail* (past char 40)
+    coincidentally appears in the briefing must NOT count — pinned
+    against a future "smart" rewrite that relaxes the bound.
+  - **`link` / `url` alias fallback**: the extractor reads `art.get("url")
+    or art.get("link", "")`, matching the convention every other
+    briefing path uses. Pinned because a previous rename to
+    `art["url"]` would have crashed the worker on every heartbeat.
+
+**Live validation** — confirmed all four load-bearing invariants intact
+in production:
+
+  - Live collection rate: ~46 articles/min sustained over the last hour.
+  - Alert pipeline draining: 0 phantom `urgency=1` rows older than 2h
+    (the reaper is working — see `reap_stale_urgent`).
+  - **Backtest isolation intact**: 0 backtest rows have *ever* been
+    alerted (`urgency=2 AND (backtest:// URL OR backtest_* source OR
+    opus_annotation* source)` = 0). The most critical invariant in the
+    system is provably held in production.
+  - **ML/LLM separation intact**: 0 rows have `score_source='ml' AND
+    ai_score>0`. Model predictions never pollute the trainer's
+    ground-truth column.
+  - Briefing cadence: last fired 6min ago, prior 5.2h ago — at target
+    (5h). `_initial_heartbeat_last` is preserving cadence across the
+    documented daemon-restart churn.
+
+**Stale-source observations** (analyst view): GDELT/yfinance specialty
+hosts (CNN Business, Just Auto, Mining Technology, Yahoo Finance UK,
+profile.ru, ifanr.com) last fired around 2026-05-13 — these are
+chronic dark collectors per memory `di-chronic-dark-collectors`, a
+standing external gap, not a fresh bug.
+
+**Phase 2 (features)**: no feature was added in this pass. The
+codebase already has six layers of defense-in-depth alert filtering
+(synth, quote-widget, recap, low-authority, exact-sig cross-cycle, the
+just-merged paraphrase-tolerant cross-cycle) plus continuation framing
+and held-book tagging, all with thorough tests. The one feature idea
+I considered — combining "model-only urgent + no held-book + lone" as
+an additional suppression — was too aggressive (would silently
+suppress legitimate breaking-but-not-yet-syndicated wires on
+non-held names) so I deferred rather than ship without strong live
+evidence backing the cost/benefit.
+
+**Staging discipline** — auto-commit daemon picked up a sibling
+agent's `alert_agent.py`/`alert_recency.py` paraphrase work as
+`b34dbe3` while my session ran; my only staged file was the new test
+file. `git diff --staged --stat` verified before commit. Never
+`git add -A`. Untracked `paper-trader/docs/superpowers/plans/` left
+untouched per the `di-shared-repo-concurrency` memory.
