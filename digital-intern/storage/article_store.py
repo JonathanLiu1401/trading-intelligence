@@ -194,9 +194,22 @@ def _expect_row(cur):
     construction: every call site is a ``MAX``/``COUNT`` aggregate, which
     SQLite ALWAYS returns one row for, so this can never mask a real empty
     result (mirrors the ``_retry_on_lock`` rationale: this only ever means
-    cursor-state corruption)."""
+    cursor-state corruption).
+
+    Empty-tuple guard: cursor-state corruption can ALSO surface as
+    ``fetchone()`` returning ``()`` instead of ``None`` (or the documented
+    ``DatabaseError`` variants). The caller's ``[0]`` then raises
+    ``IndexError: tuple index out of range`` — also NOT a
+    ``sqlite3.DatabaseError``, so ``_retry_on_lock`` never catches it and it
+    bubbles to the worker's broad ``except`` exactly like the ``None`` case
+    did before the 2026-05-18 fix. Live evidence (2026-05-19/20 daemon.log):
+    ``[stats_worker] error: tuple index out of range`` recurred under the
+    same ``database is locked`` writer-contention storm pattern. Treating an
+    empty tuple identically to ``None`` is safe: every aggregate call site
+    yields a 1-column row, so ``len(row) == 0`` is also a corruption signal
+    that can never be a legitimate result."""
     row = cur.fetchone()
-    if row is None:
+    if row is None or len(row) == 0:
         raise sqlite3.OperationalError("another row available")
     return row
 
