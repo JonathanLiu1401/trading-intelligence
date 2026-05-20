@@ -29,6 +29,7 @@ from pathlib import Path
 import yfinance as yf
 
 from .strategy import MODEL
+from .llm_adapter import call_llm as _llm_call
 
 ROOT = Path(__file__).resolve().parent.parent
 BACKTEST_DB = ROOT / "backtest.db"
@@ -46,9 +47,9 @@ GDELT_RETRY_BACKOFF_S = 20.0  # reduced; 30s was too conservative
 GDELT_WARM_WORKERS = 1        # single worker — parallel workers share rate-limit lock and deadlock
 GDELT_MAX_WARM_REQUESTS = 150  # cap per warm cycle — full window warming takes hours; not worth it
 OPUS_TIMEOUT_S = 150
-# Global semaphore: caps concurrent claude CLI subprocesses to prevent OOM kills.
-# 10 parallel runs × ~1.5 GB/process = OOM on 14 GB RAM. Cap at 2 concurrent.
-_CLAUDE_SEM = threading.Semaphore(2)
+# Concurrency for claude subprocesses now lives in paper_trader.llm_adapter
+# (`_CLAUDE_SEM`) so it is shared across all callers that route through
+# `call_llm`. The orphaned module-level definition was removed in Task 3.
 
 WATCHLIST = [
     # Core US large-cap + semis (kept from v1 watchlist)
@@ -389,22 +390,27 @@ class BacktestStore:
                     pass  # column already exists — idempotent
 
     def upsert_run(self, run_id: int, seed: int, status: str,
-                   start: date, end: date) -> None:
+                   start: date, end: date, model_id: str = "ml_quant") -> None:
         with self._lock:
             existing = self.conn.execute(
                 "SELECT run_id FROM backtest_runs WHERE run_id=?", (run_id,)
             ).fetchone()
             now = datetime.now(timezone.utc).isoformat()
             if existing:
+                # Update model_id too so re-running a row under a different
+                # model (e.g. retry on a different LLM) reflects honestly in
+                # the persisted record rather than the original default.
                 self.conn.execute(
-                    "UPDATE backtest_runs SET status=? WHERE run_id=?", (status, run_id)
+                    "UPDATE backtest_runs SET status=?, model_id=? WHERE run_id=?",
+                    (status, model_id, run_id),
                 )
             else:
                 self.conn.execute(
                     "INSERT INTO backtest_runs (run_id, seed, start_date, end_date, "
-                    "start_value, status, started_at) VALUES (?,?,?,?,?,?,?)",
+                    "start_value, status, started_at, model_id) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
                     (run_id, seed, start.isoformat(), end.isoformat(),
-                     INITIAL_CASH, status, now),
+                     INITIAL_CASH, status, now, model_id),
                 )
             self.conn.commit()
 
@@ -1961,29 +1967,12 @@ Return JSON ONLY.
 
 
 def _claude_call(prompt: str, retries: int = 1) -> str | None:
-    if not shutil.which("claude"):
-        print("[backtest] claude CLI not found")
-        return None
-    with _CLAUDE_SEM:  # max 2 concurrent claude processes to avoid OOM
-        for attempt in range(retries + 1):
-            try:
-                r = subprocess.run(
-                    ["claude", "--model", MODEL, "--print",
-                     "--permission-mode", "bypassPermissions"],
-                    input=prompt, capture_output=True, text=True,
-                    timeout=OPUS_TIMEOUT_S,
-                )
-                if r.returncode == 0 and r.stdout.strip():
-                    return r.stdout.strip()
-                print(f"[backtest] claude attempt {attempt+1} returncode={r.returncode} "
-                      f"err={r.stderr.strip()[:200]!r}")
-            except subprocess.TimeoutExpired:
-                print(f"[backtest] claude timeout attempt {attempt+1}")
-            except Exception as e:
-                print(f"[backtest] claude exception attempt {attempt+1}: {e}")
-            if attempt < retries:
-                time.sleep(2)
-    return None
+    """Thin delegation to llm_adapter.call_llm.
+
+    The `retries` parameter is kept for backward compatibility with any
+    existing callers, but the unified adapter owns retry policy internally.
+    """
+    return _llm_call(MODEL, prompt)
 
 
 def _parse_decision(raw: str | None) -> dict | None:
@@ -2138,10 +2127,24 @@ LOCAL_ARTICLES_DB = Path(__file__).resolve().parent.parent.parent / "digital-int
 
 
 class BacktestEngine:
-    def __init__(self, start: date | None = None, end: date | None = None):
+    _VALID_MODEL_PREFIXES = ("ml_quant", "claude-", "hf/")
+    # Class-level default so callers that bypass __init__ via
+    # `BacktestEngine.__new__(...)` (the canonical no-network test pattern in
+    # tests/test_integration_backtest.py and tests/test_model_rankings.py)
+    # still see a sensible model_id for run_one → upsert_run wiring.
+    model_id: str = "ml_quant"
+
+    def __init__(self, start: date | None = None, end: date | None = None,
+                 model_id: str = "ml_quant"):
         # Standalone runs (e.g. `python3 run_backtests.py`) get a sane default
         # equal to the pre-refactor hardcoded window so the one-shot launcher
         # keeps working without arg-plumbing changes. Continuous loop overrides.
+        if not any(model_id.startswith(p) for p in self._VALID_MODEL_PREFIXES):
+            raise ValueError(
+                f"Invalid model_id {model_id!r}. Must start with one of "
+                f"{self._VALID_MODEL_PREFIXES}"
+            )
+        self.model_id = model_id
         self.start = start or date(2025, 5, 1)
         self.end = end or date(2026, 5, 13)
         self.store = BacktestStore()
@@ -2504,8 +2507,10 @@ class BacktestEngine:
             seed = int.from_bytes(os.urandom(4), "big") ^ (run_id * 1337)
         rng = random.Random(seed)
         self.store.upsert_run(run_id, seed, "running",
-                              start=self.start, end=self.end)
-        print(f"\n══════ RUN {run_id}  seed={seed} window={self.start}→{self.end} ══════")
+                              start=self.start, end=self.end,
+                              model_id=self.model_id)
+        print(f"\n══════ RUN {run_id}  seed={seed} window={self.start}→{self.end} "
+              f"model={self.model_id} ══════")
 
         portfolio = SimPortfolio()
         equity_curve: list[dict] = []
@@ -2529,15 +2534,27 @@ class BacktestEngine:
             # fetch & score (once per day — signals don't change intraday)
             signals = self._fetch_signals(sim_date, seed, rng, portfolio)
 
-            # Intraday loop: up to MAX_DECISIONS_PER_DAY ml_decide calls per day.
+            # Intraday loop: up to MAX_DECISIONS_PER_DAY ml_decide calls per day
+            # for the ml_quant path. LLM paths (claude-*, hf/*) call once per
+            # day — they are slow + expensive, and the prompt would have to be
+            # regenerated with growing `exclude_tickers` each pass.
             # Each filled trade excludes that ticker from subsequent calls today.
             traded_today: set[str] = set()
             day_filled = 0
-            status, detail = "NO_DECISION", "ml_decide returned None"
+            status, detail = "NO_DECISION", "decide returned None"
             decision = None
-            for _intra in range(MAX_DECISIONS_PER_DAY):
-                decision = _ml_decide(sim_date, portfolio, signals, self.prices,
-                                      run_id, rng, exclude_tickers=traded_today)
+            max_intra = MAX_DECISIONS_PER_DAY if self.model_id == "ml_quant" else 1
+            for _intra in range(max_intra):
+                if self.model_id == "ml_quant":
+                    decision = _ml_decide(sim_date, portfolio, signals, self.prices,
+                                          run_id, rng, exclude_tickers=traded_today)
+                else:
+                    # LLM-based decision — build the same prompt the live trader
+                    # would see and route through the unified adapter.
+                    prompt = _build_prompt(run_id, seed, sim_date, portfolio,
+                                           signals, self.prices)
+                    raw = _llm_call(self.model_id, prompt)
+                    decision = _parse_decision(raw)
                 n_decisions += 1
 
                 if not decision:
