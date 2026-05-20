@@ -12479,3 +12479,66 @@ python3 -m paper_trader.ml.decision_scorer \
   --explain --ticker NVDA --ml-score 4.0 --rsi 70 --macd 2.0 \
   --mom5 5.0 --mom20 12.0 --regime-mult 1.0
 ```
+
+## 2026-05-20 core hybrid pass — `_streak_line` Discord surface (Agent 1, ~14:30 UTC)
+
+### Phase 1 — debug
+
+No real bugs surfaced after a careful review of `paper_trader/{runner,reporter,signals,strategy,market,store,dashboard,host_guard}.py`. Full test suite (4014 tests) was green at baseline; targeted code reads for race conditions, missing error handling, off-by-one boundaries, NULL-column reads, lock primitives, and JSON parsing edges all looked correct. The codebase has been heavily hardened over prior review passes — most of the previously suspect paths now carry their own surgical guards (e.g. `_acquire_singleton_lock` fail-open, `_recheck_singleton_lock` upgrade-or-exit, `_realized_pl_window` exit_ts lexical compare). Counters: `bugs_fixed=0`, no Phase 1 commit.
+
+### Phase 2 feature — `_streak_line` (Discord)
+
+`/api/streak` exposes the **closed-round-trip streak structure** (HOT_HAND on a ≥4-win cluster, TILT_RISK on a ≥4-loss cluster) on the dashboard, but the operator who lives in Discord never saw it. Two documented desk pathologies were invisible on the surface they actually read:
+
+* **HOT_HAND** — overconfidence trap after a hot run; a PM that doesn't see it can over-size into the next setup.
+* **TILT_RISK** — the loss-cluster bias every PM steps back from before adding more risk.
+
+`reporter._streak_line(store)` composes `build_streak` **verbatim** (invariant #10 — the headline / verdict are the builder's, never re-derived, so this Discord line and `/api/streak` can never tell different stories) and is wired into both `send_hourly_summary` and `send_daily_close`. Pure store read (`recent_trades(2000)` reversed oldest-first — the build_streak contract), **no network** (the Discord-path discipline — the `_capital_pulse_line` / `_hold_discipline_line` precedent). Observational only, never gates, no caps (invariants #2/#12). Same additive failure contract as the rest of `reporter`: any builder/store fault degrades to `""` ("no streak line this report"), **never** an exception ("no Discord summary this report").
+
+**Suppression** — silence-when-nothing-actionable (the `_decision_clock_line` EVEN_DISTRIBUTION / `_hold_discipline_line` NO_DATA precedent — the summary must never become its own lying green light):
+
+* `HOT_HAND`   — ALWAYS surfaced.
+* `TILT_RISK`  — ALWAYS surfaced.
+* `NEUTRAL` / `EMERGING` (n_round_trips < `STABLE_MIN_ROUND_TRIPS=8`) / `NO_DATA` → silent.
+
+Block placement: last among the behavioural lines in both summaries, after `_no_decision_reasons_line` — the existing structural+process+behavioural→run ordering (concentration → drift → host pulse → streak).
+
+### Phase 2 — tests (14)
+
+`paper-trader/tests/test_streak_reporter.py`:
+  - `TestStreakLineSuppression::test_empty_book_returns_empty` — no trades → "".
+  - `TestStreakLineSuppression::test_emerging_below_stable_returns_empty` — 3 round-trips < 8 → silent (the EMERGING precedent).
+  - `TestStreakLineSuppression::test_neutral_streak_returns_empty` — 8 alternating W/L → NEUTRAL → silent.
+  - `TestStreakLineSurfaces::test_hot_hand_surfaces_verbatim` — 4-win run at series end → HOT_HAND + builder's "4-win run" headline.
+  - `TestStreakLineSurfaces::test_tilt_risk_surfaces_verbatim` — 4-loss run → TILT_RISK.
+  - `TestStreakLineSurfaces::test_longer_loss_run_still_surfaces` — 6-loss run reads "6-loss run".
+  - `TestStreakLineFailureContract::test_store_raise_returns_empty` — store.recent_trades raises → "".
+  - `TestStreakLineFailureContract::test_builder_raise_returns_empty` — build_streak raises → "".
+  - `TestStreakLineFailureContract::test_non_dict_result_returns_empty` — builder returns None → "".
+  - `TestStreakLineFailureContract::test_missing_headline_returns_empty` — `headline=""` → "".
+  - `TestStreakLineWiredIntoSummaries::test_hourly_summary_surfaces_tilt_risk` — end-to-end through `send_hourly_summary` body.
+  - `TestStreakLineWiredIntoSummaries::test_hourly_summary_silent_when_neutral` — confirms no STREAK token in a balanced book's hourly.
+  - `TestStreakLineWiredIntoSummaries::test_daily_close_surfaces_hot_hand` — end-to-end through `send_daily_close`.
+  - `TestStreakLineWiredIntoSummaries::test_summary_still_sends_when_streak_builder_faults` — additive contract end-to-end.
+
+### Phase 3 — live findings (trader perspective)
+
+Run at 14:30 UTC against the live `:8090` dashboard + `data/paper_trader.db`:
+
+  * **Host saturation is the dominant blocker right now.** 8/8 recent decisions in `data/paper_trader.db` were NO_DECISION: 6 with `skipped claude call — host saturated: 5–6 concurrent Opus (>4)` (the pre-flight / mid-call guard correctly declining), 2 with `claude returned no response (nonzero_rc)`. Concurrent Opus reads 3 at the moment of the probe but `recent_starvation_rate` reads 22.5 % — intermittent storm class. No actual TRADE has happened in ~9 h, even though the system is reporting "alive" through dashboard endpoints.
+  * **Book is currently profitable.** 2 open positions (NVDA stock qty 3 @ avg $221.78, now $224.02, +$6.74; TQQQ qty 4 @ avg $73.48, now $74.93, +$5.78). `/api/portfolio` reads `total_value $1012.08, +1.21 % vs $1000 start`, `stale_marks 0` — marks are fresh and the headline P&L is honest.
+  * **The runner is on stale code.** `/api/healthz` reads `boot_sha b5a765f, head_sha 8d25bb1, behind 2, stale true` (this Agent 1's `_streak_line` commit and a sibling Agent's edits are pushed but not yet running). The git-watcher should fire the deferred restart within its 3 min poll cycle.
+  * **Singleton-lock is held.** `lock_status acquired, lock_holder_pid 3965827, lock_degraded false` — only one trader is writing the paper book (the documented 2026-05-17/18 double-trade pathology is not in force).
+  * **`_streak_line` itself will be silent until the book has ≥8 closed round-trips.** Today's `/api/streak` reads `n_round_trips=1, state=EMERGING, verdict=null` — by design, the verdict is withheld below the stable threshold. The Discord surface will start firing HOT_HAND / TILT_RISK once enough round-trips accumulate; right now the suppression contract is the correct outcome.
+
+### Counters
+
+`bugs_fixed=0` (no real bugs found after a careful review) · `features_added=1` (`_streak_line` Discord surface) · `user_findings=5` (host-saturation freeze, no-trades-for-9h, profitable open book, runner on stale code awaiting restart, streak surface honestly silent below threshold).
+
+### Invariants reaffirmed by this pass
+
+* **#10 single source of truth** — `_streak_line` consumes `build_streak`'s own `headline` / `verdict` verbatim; the Discord line and `/api/streak` cannot disagree.
+* **#2 / #12 advisory only** — observational, never gates Opus, adds no caps.
+* **Discord-path discipline** — pure store reads, no network in the hot path (the `_capital_pulse_line` / `_hold_discipline_line` precedent).
+* **Additive failure contract** — any builder/store fault degrades to `""`, never an exception that takes down the whole hourly / daily summary.
+* **Silence-when-nothing-actionable** — NEUTRAL / EMERGING / NO_DATA are silent; the summary never becomes its own lying green light.
