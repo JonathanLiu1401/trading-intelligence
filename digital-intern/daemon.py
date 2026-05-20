@@ -82,6 +82,7 @@ from collectors.boe_press_collector import collect_boe_press
 from collectors.g10_central_banks_collector import collect_g10_central_banks
 from collectors.global_regulators_collector import collect_global_regulators
 from collectors.globenewswire_collector import collect_globenewswire
+from collectors.hackernews_collector import collect_hackernews
 from collectors.sec_xbrl_financials import collect_sec_xbrl_financials
 from collectors.usgs_earthquake_collector import collect_usgs_earthquakes
 from collectors import source_health
@@ -146,6 +147,7 @@ BOE_PRESS_INTERVAL      = 1800    # Bank of England press / publications RSS —
 G10_CB_INTERVAL         = 1800    # Bank of Canada + RBA press / speeches RSS — every 30min
 GLOBAL_REG_INTERVAL     = 1800    # FSB, FCA, Fed research notes/papers — every 30min
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
+HACKERNEWS_INTERVAL     = 300     # Hacker News front-page + finance/business stories — every 5min
 SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
 USGS_QUAKE_INTERVAL     = 1800    # USGS M≥5 earthquake feed every 30min (insurance/semis/energy catalyst)
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
@@ -235,6 +237,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "g10_cb": G10_CB_INTERVAL,
     "global_reg": GLOBAL_REG_INTERVAL,
     "globenewswire": GLOBENEWSWIRE_INTERVAL,
+    "hackernews": HACKERNEWS_INTERVAL,
     "sec_xbrl": SEC_XBRL_INTERVAL,
     "usgs_quake": USGS_QUAKE_INTERVAL,
     "scorer": SCORE_INTERVAL,
@@ -1359,6 +1362,28 @@ def sec_xbrl_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(SEC_XBRL_INTERVAL)
+
+
+# ── Worker: Hacker News front-page + finance/business stories — every 5min ──
+def hackernews_worker(store: ArticleStore):
+    log.info("[hackernews_worker] started")
+    bo = Backoff("hackernews", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_hackernews()
+            _ingest(store, articles, "hackernews")
+            try:
+                source_health.record_result("hackernews", len(articles))
+            except Exception as he:
+                log.warning(f"[hackernews_worker] source_health error: {he}")
+            _worker_last_ok["hackernews"] = time.time()
+            log.debug(f"[hackernews] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[hackernews_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(HACKERNEWS_INTERVAL)
 
 
 # ── Worker: Portfolio P/L snapshot — every 5min ─────────────────────────────
@@ -2521,6 +2546,7 @@ def main():
         ("g10_cb",      g10_cb_worker),
         ("global_reg",  global_reg_worker),
         ("globenewswire", globenewswire_worker),
+        ("hackernews",  hackernews_worker),
         ("sec_xbrl",    sec_xbrl_worker),
         ("usgs_quake",  usgs_quake_worker),
         ("scorer",      scorer_worker),
