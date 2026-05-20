@@ -11034,3 +11034,77 @@ documented invariants on a freshly-restarted runner).
 - **#2 / #12** (no hard limits, advisory-only) — both Phase 1 (cadence) and
   Phase 2 (alias) are observational/data-sourcing changes; neither modulates
   a trade decision or adds a position cap.
+
+---
+
+## 2026-05-20 core hybrid pass (Phase 1 fix + Phase 2 feature)
+
+### Phase 1 — fix: 4 missing `@swr_cached` endpoints added to `_swr_prewarm`
+
+Commit `1bcb95f`. `decision-paralysis`, `position-news-cooldown`,
+`correlation-cluster-warning`, and `launcher-restart-loop` were
+`@swr_cached` but never added to `_swr_prewarm`'s targets list — the same
+freeze-triage cold-stall blind spot the
+`test_swr_prewarm_coverage.py::test_every_swr_cached_endpoint_is_prewarmed`
+invariant exists to catch. A trader opening these panels right after a
+restart got `{"warming": true}` instead of real data for one full TTL
+cycle. The fix adds the four `(name, handler)` tuples to the prewarm
+target list; the test now passes.
+
+### Phase 2 — feature: `/api/buying-power` endpoint
+
+Commit `7e30005`. Surfaces `build_buying_power` (the lean prompt-facing
+complement to `capital_paralysis`, already in the Opus decision prompt)
+via a new dashboard endpoint, closing the established
+prompt→dashboard→Discord trajectory the `buying_power` block has been
+following one surface at a time.
+
+Returns: `cash`, `deployed_pct`, `affordable[ticker, price, whole_shares]`,
+`cheapest_name` + `cheapest_price`, and the `unlock` candidate
+(biggest-loser-first cut priority). Pure single-source-of-truth wrapper
+over `build_buying_power` (invariant #10); observational only — never
+gates Opus, never caps a trade (#2/#12). SWR-cached 60s with prewarm
+registration (test_swr_prewarm_coverage invariant). Scoped to the FULL
+WATCHLIST so an operator sees affordability across the universe, not
+just the lean `_names_in_play` subset the prompt block trims to.
+
+Tests in `tests/test_buying_power_endpoint.py` pin the
+CASH_CONSTRAINED live pathology shape, the DEPLOYABLE whole-share counts
+under known mocked prices, the strict `int(cash // px)` floor (999.99 /
+500 ⇒ 1 share, never 2), warm-hit cache behaviour, and the prewarm
+registration invariant.
+
+### Phase 3 — live validation
+
+Live runner restarted onto commit `7e30005` between Phase 2 push and
+Phase 3 probe (git-watcher healthy; `boot_sha == head_sha`). Healthy
+state confirmed:
+
+1. ✅ `/api/build-info` `boot_sha == head_sha == 7e30005`, `stale: false`.
+2. ✅ `/api/portfolio` $993.93 equity, $40.28 cash, 2 positions
+   (NVDA + TQQQ), -0.61% vs $1000 start, `stale_marks=0`.
+3. ✅ `/api/runner-heartbeat` HEALTHY — last decision 4m ago in the 60m
+   closed-market cadence; `decision_efficacy=PRODUCING` (18/20).
+4. ✅ Discord delivery — `notify_verdict=HEALTHY`, last_ok ~5m before probe.
+5. ✅ Singleton lock `acquired` (pid=3700750).
+6. ✅ `/api/buying-power` (new endpoint) returned a complete affordable
+   list with whole-share counts at $40.28 cash against live yfinance
+   prices for the full watchlist — feature working end-to-end on the
+   live book.
+
+### Counters
+
+`bugs_fixed=1, features_added=1, user_findings=0` (no novel pathology
+caught; the value is confirming the live state matches the documented
+invariants on a freshly-restarted runner running the new code).
+
+### Invariants reaffirmed by this pass
+
+- **#10** (single source of truth) — `/api/buying-power` is a pure
+  formatter over `build_buying_power`; cash/deployed_pct/affordable
+  computation lives in one builder and feeds both the Opus prompt and
+  the new endpoint, so they can never disagree.
+- **#2 / #12** (no hard limits, advisory-only) — the new endpoint is
+  observational; it surfaces what cash *can* fund, never caps what Opus
+  *should* do. The advisory contract follows the `capital_paralysis`
+  precedent.
