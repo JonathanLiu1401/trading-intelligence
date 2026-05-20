@@ -5859,3 +5859,163 @@ Untracked sibling files (`collectors/short_interest_collector.py`,
 `tests/test_breaking_confluence.py`, `dashboard/web_server.py` mods,
 `paper-trader/*`) deliberately left unstaged. AGENTS.md appended-only,
 committed alongside the related code in this same documentation step.
+
+---
+
+## 2026-05-20 hybrid pass — _RT_TODAYS_MOVERS Barron's daily-column gate
+
+**Phase 1 (debug):** No new bugs found.
+
+Re-read all required files (`daemon.py`, `storage/article_store.py`,
+`watchers/alert_agent.py`, `watchers/urgency_scorer.py`, `ml/trainer.py`,
+`ml/model.py`, `ml/features.py`, `collectors/web_scraper.py`,
+`analysis/claude_analyst.py`). The four load-bearing invariants
+(backtest isolation, `ml_score`/`ai_score` separation, urgency state
+machine, `get_unscored` train/serve age-field parity) are all enforced
+by current tests and defenses-in-depth. The codebase has accumulated
+~302 passing tests across two prior reviews today plus the
+`_RT_EARNINGS_TOMORROW` addition that the previous session shipped —
+no surgical bug-fix opportunity remained.
+
+Setting `bugs_fixed=0` per the Phase 1 commit guard (allowed when no
+real bugs are found).
+
+**Phase 2 (feature):** `_RT_TODAYS_MOVERS` — 7th recap-template gate.
+
+Live evidence (2026-05-20 14:31Z urgency=1 phantom-queue probe via
+direct `articles.db` read): the canonical Barron's daily column
+"These Stocks Are Today's Movers: Nvidia, Micron, Intel, Meta, ..."
+was ML-flagged urgent (ml_score~9.x, `score_source='ml'`) and reached
+the alerter through every existing gate. Multiple distinct copies (the
+ticker-composition changes daily; today's NVDA earnings day produced
+both "Nvidia, Micron, Intel, Meta" and "Micron, Intel, Lowe's, Nvidia"
+variants) syndicated across YahooFinance/MU, yfinance/Barrons.com,
+scraped/www.barrons.com, Finnhub/Yahoo, multiple GoogleNews channels.
+
+This is the SAME retrospective-recap class as `_RT_MARKET_TODAY` (the
+date-stamped daily wrap-up) — by definition a same-day list of names
+that already moved, never breaking news. The ML urgency head
+systematically over-scores it because the title is dense with held
+tickers (NVDA + MU concentration trips
+`portfolio_flag`/`ticker_count`/`ticker_density` features in
+`ml/features.py`).
+
+Pattern (`watchers/alert_agent.py`):
+```python
+_RT_TODAYS_MOVERS = re.compile(
+    r"^\s*these\s+stocks\s+are\s+today['’]?s\s+"
+    r"(?:top\s+|biggest\s+)?movers\s*:",
+    re.IGNORECASE,
+)
+```
+- Anchored `^` so mid-sentence "today's movers" references and forward-
+  looking "tomorrow's movers" / "next week's movers" analyses are NOT
+  caught.
+- `['’]?` handles ASCII apostrophe (U+0027), curly Unicode apostrophe
+  (U+2019), and no-apostrophe variants the live feeds emit — Barron's
+  RSS uses curly, GoogleNews republished copies sometimes ASCII.
+- Optional `top\s+|biggest\s+` infix so plausible same-template
+  variants are caught with one regex.
+- Trailing `\s*:` is the colon-bounded ticker list — the SEO-mill
+  discriminator. Real prose mentioning "today's movers" mid-sentence
+  doesn't have the leading-bracketed-list signature.
+
+Added to `_RECAP_TEMPLATE_PATTERNS` tuple as `todays_movers_list`
+(7th of 8 fingerprints). Both surfaces (`alert_agent.send_urgent_alert`
+recap-template gate AND `urgency_scorer.score_batch` pre-Sonnet floor)
+use the SAME `_looks_like_recap_template` helper, so the lockstep-parity
+test (`tests/test_urgency_recap_prefilter.py::test_urgency_scorer_
+uses_alert_agent_gate`) catches drift between the alert path and the
+pre-floor path automatically — no separate registration needed.
+
+All four load-bearing invariants intact by construction:
+- pure read-side helper (no DB write; the suppression path's
+  `mark_alerted_batch` only sets `urgency=2` — `ai_score` / `ml_score` /
+  `score_source` untouched);
+- backtest isolation: synthetic rows are excluded upstream by
+  `get_unalerted_urgent`'s `_LIVE_ONLY_CLAUSE` AND re-filtered at the
+  formatter by `_is_synthetic`;
+- urgency state machine: only `urgency=1 → urgency=2` transitions via
+  `mark_alerted_batch`.
+
+**Tests pinned** in `tests/test_alert_recap_template.py` (+2 new tests,
+all pass; 27/27 in the recap-template file, 106/106 across the
+broader alert-suite touching all affected paths):
+- `test_todays_movers_list_barrons_column` — 6 verbatim live-evidence
+  titles caught (NVDA/MU/Intel/Meta + NVDA/MU/Intel/Lowe's
+  combinations, ASCII / curly / no-apostrophe variants, "Top Movers" /
+  "Biggest Movers" variants);
+- `test_todays_movers_pattern_does_not_over_catch` — 7-title must-
+  survive corpus (mid-sentence "today's movers" references, forward-
+  looking "tomorrow's movers" / "next week's movers", "premarket
+  movers" analyses, mid-headline "today's session weakness"
+  references).
+
+**Phase 3 (live validation):** No fold-in fix needed.
+
+1. **Article ingestion rate healthy.** 5,252 live articles in the last
+   hour (excl. backtest/opus_annotation rows), 14,575 in the last 24h —
+   well above operational threshold. Top sources by raw volume on NVDA
+   earnings day: `GN: earnings`, `GN: Nasdaq`, `GN: IPO`,
+   `scraped/finance.yahoo.com`, `GN: Nvidia`, `Benzinga Economics`,
+   `Finnhub/Yahoo`, `YahooFinance/NVDA`.
+2. **Alert quality.** 185 `urgency=2` rows alerted in last 24h: 68 LLM-
+   labeled (avg score 8.37), 117 ML-only (avg score 9.6). Per-cycle
+   draining of 5/cycle handles the typical ~25-row backlog within a
+   few minutes.
+3. **Phantom urgency=1 queue: 21 rows.** Mostly ML-flagged
+   (`score_source='ml'`, ml_score ~9.1), draining naturally. NOT a
+   regression — consistent with the documented memory
+   `di-stale-manual-daemon` — same handful of rows the prior session
+   inspected, now reduced from 26 to 21 as the alerter processes them.
+4. **The Barron's "Today's Movers" column is in TODAY's phantom queue**
+   ("These Stocks Are Today's Movers: Nvidia, Micron, Intel, Meta,
+   Low...", `YahooFinance/MU` at 14:29Z) — directly motivating this
+   gate. On daemon restart the new pattern will mark it `urgency=2`
+   unconditionally on the next alert cycle.
+5. **Daemon must be restarted to apply this fix.** The daemon has been
+   running since 2026-05-20 00:10 per `ps`; per memory
+   `di-stale-manual-daemon` the daemon is a long-lived manual process
+   that does NOT auto-reload code changes. Operator action required:
+   `systemctl --user restart digital-intern` or kill+relaunch.
+6. **USB DB I/O saturation continues** (chronic per
+   `di-insert-batch-lock-contention`). Live log: 9 `insert_batch:
+   lock retry exhausted after 5 attempts — raising` ERRORs in the
+   last 30min (14:54Z cluster). Standing operational issue, not a
+   fresh bug.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:**
+- `python3 -c "import sys; sys.path.insert(0,'.'); from storage import
+  article_store; from ml import features, model; print('imports OK')"`
+  → `imports OK`.
+- Focused suite (all paths touching the change): `test_alert_recap_
+  template.py` (27), `test_urgency_recap_prefilter.py` (13),
+  `test_recap_template_audit.py` (13), `test_alert_agent.py` (20),
+  `test_alert_dedup.py` (26), `test_urgency_scorer.py` (12),
+  `test_alert_source_authority.py` (7),
+  `test_alert_continuation_context.py` (14) — **132 passed in 1.07s
+  (no flake, no warning)**. Full `python3 -m pytest tests/` deferred
+  due to concurrent-agent I/O saturation (3 other claude agents
+  running paper-trader passes in parallel locked the disk for >20min
+  per the prior session's pytest hang) — focused suite covers every
+  module the change touches.
+
+**Counters:** `bugs_fixed=0` (no Phase 1 commit; the four invariants
+already pinned), `features_added=1` (the Barron's "Today's Movers" SEO-
+mill gate, one commit on master `221ff9e`), `user_findings=6`
+(collection rate healthy, alert quality with 68 LLM + 117 ML alerts in
+24h, phantom queue draining, the live "Today's Movers" exemplar in the
+queue motivates the gate, daemon-restart required to ship the fix
+operationally, USB DB I/O saturation continues as standing chronic).
+
+**Staging discipline.** Two other agents running concurrently in
+`paper-trader` (visible in `ps`); per the `pt-concurrent-samerole-
+staging-race` memory, staged with explicit pathspec only
+(`watchers/alert_agent.py`, `tests/test_alert_recap_template.py`,
+`AGENTS.md`). Never `git add -A`. Untracked sibling files (the prior
+session's `dashboard/web_server.py` mods, the
+`tests/test_breaking_confluence.py` cleanup) deliberately left
+unstaged. AGENTS.md committed alongside the related code in this
+same documentation step.
