@@ -160,6 +160,50 @@ def _domain_candidates(source: str) -> list[str]:
     return out
 
 
+# Source-tag *prefix* aliases — for tag conventions that name an aggregator
+# but carry NO dotted publisher host (so _domain_candidates yields nothing)
+# AND whose aggregator label is missed by the verbatim word-boundary scan
+# (either because the label has no entry in SOURCE_CRED under its literal
+# spelling — ``GN:`` is the Google News topic-feed prefix used in
+# ``config/sources.json``, not the spelling "googlenews" — or because the
+# label is glued to the next token without a word boundary, e.g.
+# ``YahooFinance/005930.KS`` where ``\byahoo\b`` cannot match the embedded
+# ``yahoo`` inside ``yahoofinance``).
+#
+# Live evidence (2026-05-20, 24h window): 5,376 ``GN: <topic>`` rows
+# (Google News topic feeds — sources.json), 95 ``YF/<bucket>`` rows
+# (collectors/market_movers.py screener-tape entries), and ~hundreds of
+# ``YahooFinance/<symbol>`` rows (yahoo_ticker_rss). All silently fell to
+# DEFAULT_SOURCE_CRED — flattening feature[0] for the model and reading
+# every such tag as "unknown source" in the alert-authority gate.
+#
+# Strictly additive (same Phase-1 contract as ``_DOMAIN_CRED``): every
+# alias resolves to a publisher grade that ALREADY exists in SOURCE_CRED,
+# every value is >= DEFAULT (no host is moved downward), and every tag
+# that was already non-default keeps its EXACT grade because the prefix
+# step runs AFTER the domain-host step and BEFORE the verbatim word-
+# boundary scan — so a tag with a dotted host (``GDELT/reuters.com``) or
+# an already-matched word-boundary publisher token (``yfinance/AFP``,
+# ``Finnhub/Yahoo``) reaches its old grade through the unchanged paths.
+_PREFIX_ALIASES: tuple[tuple[str, float], ...] = (
+    # Google News topic feeds — sources.json: "GN: stock market" / "GN: Nvidia"
+    # / "GN: earnings". Tag spelling is "GN:" (with the colon), so an anchored
+    # case-insensitive startswith match is the exact discriminator; "GNeurope"
+    # or "MGN: x" never matches.
+    ("gn:", SOURCE_CRED["googlenews"]),  # 0.62
+    # Yahoo Finance market-movers screener — collectors/market_movers.py emits
+    # "[YF/most_actives]" titles and ``YF/<bucket>`` source tags. The
+    # underlying publisher IS Yahoo Finance (yfinance API), so resolves to the
+    # existing "yahoo"/"yfinance" grade.
+    ("yf/", SOURCE_CRED["yfinance"]),  # 0.65
+    # Yahoo per-ticker RSS — collectors/yahoo_ticker_rss.py emits
+    # "YahooFinance/<symbol>" (e.g. "YahooFinance/005930.KS"). The verbatim
+    # scan misses because ``yahoo`` and ``finance`` are glued (no word
+    # boundary between them); the embedded publisher is still Yahoo.
+    ("yahoofinance/", SOURCE_CRED["yahoo"]),  # 0.65
+)
+
+
 def _source_credibility(source: str) -> float:
     if not source:
         return DEFAULT_SOURCE_CRED
@@ -171,6 +215,14 @@ def _source_credibility(source: str) -> float:
             return _LOW_AUTHORITY_DOMAINS[cand]
         if cand in _DOMAIN_CRED:
             return _DOMAIN_CRED[cand]
+    # Prefix-alias step: handles aggregator tags whose label has no dotted host
+    # AND is missed by the verbatim word-boundary scan (see _PREFIX_ALIASES).
+    # Anchored startswith match (case-insensitive) so an alias only fires when
+    # the tag actually leads with that prefix — never substring-matched.
+    s_low = source.lstrip().lower()
+    for prefix, score in _PREFIX_ALIASES:
+        if s_low.startswith(prefix):
+            return score
     # Fall back to the verbatim word-boundary scan — unchanged behaviour, and
     # the only path for non-dotted publisher tokens (reddit, nitter, rss, …).
     for pat, score in _SOURCE_CRED_PATTERNS:
