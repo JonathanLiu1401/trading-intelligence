@@ -12051,3 +12051,227 @@ includes block when in-session and OMITS it pre-open.
 
 Applies on next paper-trader restart (the documented pattern for
 every recent feature).
+
+## 2026-05-20 ML/backtest hybrid pass (Agent 2) — _WORD_TO_TICKER substring false positives + feature_value_skill diagnostic
+
+### Phase 1 — fix: backtest-side `_WORD_TO_TICKER` matched substrings (1 bug)
+
+`paper_trader/backtest.py::_ml_decide` used naive `keyword in title_lower`
+substring matching for every entry in `_WORD_TO_TICKER`. Exactly the
+class of bug the LIVE side already fixed via
+`strategy._WORD_TO_TICKER_LIVE_PATTERNS` (locked by
+`tests/test_ml_live_opinion.TestKeywordSubstringFalsePositives`) — but
+the backtest engine still ran the buggy form. Concrete false positives:
+
+- `"ai"` → TQQQ matched `"rain"` / `"training"` / `"Spain"` / `"captain"` /
+  `"blockchain"` (most common — every ML-training / crypto headline)
+- `"gold"` → GLD matched `"Goldman"` (every Goldman Sachs headline)
+- `"intel"` → INTC matched `"intelligence"` and `"artificial intelligence"`
+  (double-counted with the broken `"ai"` map)
+- `"oil"` → USO matched `"spoiled"` / `"coil"`
+
+Each silently inflated unrelated tickers' `ticker_scores`, distorting
+which ticker the backtest's `_ml_decide` picked AND **poisoning the
+`decision_outcomes.jsonl` corpus that retrains the DecisionScorer** (the
+gate the live trader eventually relies on). Fix mirrors strategy.py:
+compile `\bkw\b` once at module import into `_WORD_TO_TICKER_PATTERNS`
+and match via `Pattern.search`. Multi-word keys still match because `\b`
+sits between word/non-word transitions (including spaces).
+
+### Phase 1 — tests added (22)
+
+`tests/test_ml_backtest_word_boundary.py` (new, 17 tests) —
+`TestWordToTickerPatterns` pins every false-positive class at the
+pattern level (rain/training/blockchain/captain/Goldman/intelligence/
+spoiled don't match) AND that standalone tokens still match (ai/gold/
+oil/multi-word `"natural gas"`). `TestMlDecideKeywordIntegration` pins
+END-TO-END `_ml_decide`: a `"Heavy rain delays harvests"` headline must
+NOT result in `BUY TQQQ`, etc., with a standalone-`"nvidia"`-token
+regression guard.
+
+`tests/test_decision_scorer.py` — 2 new tests:
+- `test_feature_names_order_matches_build_features` pins the
+  `FEATURE_NAMES` ↔ `build_features` output-order contract by name
+  with a known-distinct input vector. A silent reorder in
+  `build_features` without updating `FEATURE_NAMES` would mislabel
+  every row in `feature_contributions` / `feature_importance` and the
+  existing length assertion would NOT catch it.
+- `test_dedup_survivor_is_highest_return_record` strengthens the
+  existing dedup count test: rigs two same-key records with `fwd=+15`
+  vs `fwd=-5`, asserts the **survivor's label sign** propagates
+  through to the trained model's prediction.
+
+`tests/test_backtest.py::TestMlDecideScorerGateBoundary` (3 new tests)
+pins invariant #5 (gate engages at `_n_train >= 500`) with exact-value
+conviction assertions at n=499 (gate inactive → conviction 0.25) vs
+n=500 (strong-headwind arm fires → conviction 0.15 = 0.25 × 0.6). A
+regression that drifts the threshold OR the strong-headwind multiplier
+fails one of the three assertions.
+
+Run: `cd /home/zeph/trading-intelligence/paper-trader && python3 -m
+pytest tests/test_ml_backtest_word_boundary.py
+tests/test_decision_scorer.py tests/test_backtest.py -v` — 178 pass.
+Broader `-k "ml or backtest or scorer"`: 467 pass, no regressions.
+
+### Phase 2 — feature: `feature_value_skill` per-feature-value rank skill (1 feature)
+
+Adds `paper_trader/ml/feature_value_skill.py` — a read-only diagnostic
+that buckets OOS decision_outcomes by **empirical quintiles** of a
+configurable feature (`mom5` / `vol_ratio` / `bb_position` / `ml_score`)
+and reports per-bucket `n / rank_ic / dir_acc / mean_realized`. Reuses
+`calibration._spearman` (the single source of truth for tie-aware rank
+correlation) and `decision_scorer._to_float` so the metric can never
+drift from `_oos_rank_metrics` / the per-cycle skill ledger.
+
+Genuinely orthogonal to the 35-module suite. Existing siblings bucket
+by news volume, sector, regime, persona, leveraged-or-not, action, or
+ticker — none of them slices by a value of a feature the scorer
+**actually trains on**. Answers the quant-decisive question
+`baseline_compare` cannot:
+
+> Is the scorer's aggregate `+0.225` OOS rank-IC concentrated in one
+> feature regime (LOCALIZED_EDGE — a single-feature rule could
+> replicate it), or does it generalize across the feature's range
+> (UNIFORM_EDGE — multi-feature combination is doing real work)?
+
+Verdicts (threshold-driven, exactly testable):
+- `HAS_INVERTED_BUCKET` (≥1 quintile anti-predictive — actionable, first)
+- `LOCALIZED_EDGE` (only 1 quintile has EDGE — the model is a gate)
+- `UNIFORM_EDGE` (3+ buckets EDGE, IC spread < `BUCKET_SPREAD_TOL=0.05`)
+- `MIXED_EDGE` (2+ buckets EDGE with visible spread)
+- `NO_EDGE_ANY` (no bucket clears `IC_MIN=0.05`)
+- `INSUFFICIENT_DATA` (< 30 aligned outcomes or < 2 sufficient buckets)
+
+Run against the **live OOS corpus** (n=1482 aligned outcomes,
+deployed `decision_scorer.pkl` with `n_train=400`):
+
+| Feature      | Verdict     | All 5 quintiles | IC spread |
+|--------------|-------------|-----------------|-----------|
+| `mom5`       | MIXED_EDGE  | all EDGE        | 0.104     |
+| `vol_ratio`  | MIXED_EDGE  | all EDGE        | 0.162     |
+| `ml_score`   | MIXED_EDGE  | all EDGE        | 0.088     |
+
+⇒ The deployed scorer's `+0.225` aggregate rank-IC is NOT artifactual
+from any single feature regime — it has measurable EDGE in EVERY
+quintile of every feature we bucket on. The model genuinely combines
+features rather than acting as a single-feature gate.
+
+CLI: `python3 -m paper_trader.ml.feature_value_skill` (default mom5),
+`--feature vol_ratio`, `--feature ml_score`, `--feature bb_position`,
+`--json` for machine-readable output, `--no-oos-only` for the full
+corpus. Exit code 2 on `HAS_INVERTED_BUCKET` so cron / operator
+scripts can branch.
+
+Tests: `tests/test_feature_value_skill.py` (32 tests, all
+assertion-based). Pins `_safe_float` / `_bucket_for` /
+`_quintile_breakpoints` math; `_verdict_for` per-bucket thresholds at
+exact boundaries; END-TO-END verdict pins for UNIFORM_EDGE,
+LOCALIZED_EDGE, HAS_INVERTED_BUCKET, NO_EDGE_ANY paths via rigged
+scorer stubs; FEATURES dict completeness; analyze() entry on empty
+file + CLI argparse rejection of unknown feature flag.
+
+### Phase 3 live findings (quant researcher perspective)
+
+1. **Continuous backtest loop is DOWN** (~2 days). Last
+   `scorer_skill_log.jsonl` row is `cycle 4` at 2026-05-18T18:06 UTC;
+   last completed `backtest_runs` row is `run_id 6242` at
+   2026-05-18T18:05 UTC; `continuous.log` last modified 2026-05-18
+   12:03 PDT. `ps aux | grep run_continuous_backtests` finds no
+   process. The live trader (PID 3926526) IS running and making
+   decisions (most recent 2026-05-20T13:57 UTC), but the scorer
+   retraining loop that feeds the conviction gate is dead. Restart
+   `python3 run_continuous_backtests.py` to resume per-cycle retrains.
+2. **Deployed `decision_scorer.pkl` is stale relative to the
+   accumulated corpus.** `paper_trader.ml.scorer_freshness` reports
+   `n_train=400, age=24.77h`, but `data/decision_outcomes.jsonl` has
+   7413 rows (most recent appended 2026-05-20 02:48). A fresh retrain
+   on the 5000-record tail would land the scorer at `n_train≈3950`
+   (consistent with the last logged cycles, `train_n=3987`/`3959`).
+   The live gate is sizing on a model trained from a smaller, older
+   corpus than the OOS evaluation suggests. The `MLP_ADDS_SKILL`
+   verdict describes what an `n=400` model can rank OOS, NOT what a
+   fresh retrain would produce.
+3. **2 orphaned `running` backtest rows** (`run_id 6238` from
+   2026-05-18T14:17, `run_id 6243` from 2026-05-18T18:45) — would be
+   auto-reaped by the continuous loop's `_reap_orphaned_runs` 6h-age
+   guard, but the loop is dead. Restarting the loop reaps them on
+   the next cycle; no manual SQL needed.
+4. **Scorer + diagnostics all healthy modulo the staleness above**:
+   - `baseline_compare`: `MLP_ADDS_SKILL  rank_ic=+0.225 dir_acc=0.611
+     best_baseline=rsi_meanrev +0.079 ic_gap=+0.145`.
+   - `deploy_audit`: `DEPLOYED_MATCHES_SOURCE` (8/8 hyper-params
+     match `MLP_CONFIG`).
+   - `regime_audit`: `REGIME_UNIFORM_EDGE` (bull/sideways/bear all
+     ≥+0.16 rank_ic).
+   - `sector_skill`: `HAS_INVERTED_SECTOR` — energy `rank_ic=-0.277`
+     on 30 OOS rows (documented finding, plausibly sampling noise).
+   - `outcome_data_quality`: CLEAN (0 corrupt, 0 conflicts, 0
+     nonfinite features).
+   - `news_volume_skill`: `MIXED` (sparse-news bucket `+0.459`,
+     no-news `+0.192`).
+
+### How to run / interpret (ML & backtest domain)
+
+**Live OOS skill snapshot:**
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.baseline_compare      # MLP vs single-feature baselines
+python3 -m paper_trader.ml.deploy_audit          # deployed pickle vs MLP_CONFIG drift
+python3 -m paper_trader.ml.regime_audit          # bull/sideways/bear bucketed IC
+python3 -m paper_trader.ml.sector_skill          # per-sector IC
+python3 -m paper_trader.ml.feature_value_skill   # per-feature-quintile IC (NEW)
+python3 -m paper_trader.ml.scorer_freshness      # pkl age + heartbeat
+python3 -m paper_trader.ml.outcome_data_quality  # outcome-file integrity
+```
+
+**Manual backtest one-shot:**
+```bash
+python3 run_backtests.py    # 10 parallel year-long runs
+```
+
+**Continuous loop (currently down):**
+```bash
+python3 run_continuous_backtests.py    # 1 run/cycle, 600s cooldown, scorer retrain
+```
+
+**Interpreting backtest results** (`/api/backtests` on `:8090`):
+- `total_return_pct` — raw return over the window
+- `vs_spy_pct` — alpha (`total_return_pct - spy_return_pct`). Watch
+  for `notes` containing `benchmark_unavailable` — empty/degenerate
+  SPY series makes `vs_spy_pct` fabricated.
+- `equity_curve_json` — per-sample equity points
+- `status='running'` for >6h ⇒ orphan reap-candidate (only reaps
+  when the continuous loop is alive)
+
+**Tests for the ML/backtest domain:**
+```bash
+python3 -m pytest tests/ -v -k "ml or backtest or scorer"   # 467 tests
+python3 -m pytest tests/test_feature_value_skill.py -v       # 32 NEW
+python3 -m pytest tests/test_ml_backtest_word_boundary.py -v # 17 NEW
+```
+
+### Counters
+
+`bugs_fixed=1, features_added=1, user_findings=4`.
+
+### Invariants reaffirmed by this pass
+
+- **#1** (live-only clause / training-corpus integrity) — the
+  `_WORD_TO_TICKER` substring fix removes a vector that polluted
+  `decision_outcomes.jsonl` with mislabeled-ticker decisions,
+  protecting #1's "backtest articles must never reach live signals"
+  spirit at the corpus level.
+- **#5** (DecisionScorer gate at `n_train >= 500`) — locked in code
+  by `TestMlDecideScorerGateBoundary`'s exact-value pins at n=499 /
+  n=500.
+- **#10** (SSOT) — `feature_value_skill` reuses
+  `calibration._spearman` / `decision_scorer._to_float` /
+  `validation.split_outcomes_temporal`; the same building blocks
+  every sibling skill diagnostic uses.
+- **scorer-train status truthfulness** — `feature_value_skill`'s
+  bad-feature-name path returns `status='error'` with an honest
+  hint, mirroring `news_volume_skill.analyze` /
+  `sector_skill.analyze`.
+
+Read-only diagnostic + bugfix in a path the live trader doesn't
+import; safe to take effect immediately.
