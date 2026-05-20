@@ -2440,6 +2440,90 @@ def create_app(store=None) -> Flask:
             "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         })
 
+    @app.get("/api/db-lock-health")
+    def api_db_lock_health():
+        """Live article_store DB-lock contention surface.
+
+        Pairs ``article_store.lock_metrics()`` (process-lifetime retry +
+        failure counters; the dashboard runs in-process with the daemon so
+        the numbers are the same ones article_store has been incrementing)
+        with a recent-window tail of ``logs/daemon.log`` for
+        ``lock retry exhausted`` lines, which is the operator-visible
+        symptom of WAL+busy_timeout=60s+5-retry exhaustion under heavy
+        writer contention (see article_store._retry_on_lock).
+
+        Status thresholds (1h window):
+          - ok:        0 exhausted failures
+          - degraded:  1..9 failures (transient contention)
+          - critical:  ≥10 failures (sustained contention storm)
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        from storage import article_store as _as
+        try:
+            metrics = _as.lock_metrics()
+        except Exception:
+            metrics = {"lock_retries": None, "lock_failures": None}
+        log_path = BASE_DIR / "logs" / "daemon.log"
+        failures_1h = 0
+        retries_1h = 0
+        last_failure_ts: str | None = None
+        if log_path.exists():
+            try:
+                size = log_path.stat().st_size
+                # Tail the last ~256KB; lock-retry storms produce many
+                # lines so a generous window survives bursts without
+                # scanning the whole file.
+                with open(log_path, "rb") as f:
+                    if size > 256 * 1024:
+                        f.seek(size - 256 * 1024)
+                        f.readline()  # drop partial line
+                    tail = f.read().decode("utf-8", errors="replace")
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+                for line in tail.splitlines():
+                    if "lock retry exhausted" in line:
+                        ts_match = line[:20]
+                        try:
+                            ts = datetime.strptime(
+                                ts_match, "%Y-%m-%dT%H:%M:%SZ"
+                            ).replace(tzinfo=timezone.utc)
+                        except ValueError:
+                            continue
+                        if ts >= cutoff:
+                            failures_1h += 1
+                            last_failure_ts = ts.isoformat(timespec="seconds")
+                    elif "transient DB error" in line and "retrying in" in line:
+                        ts_match = line[:20]
+                        try:
+                            ts = datetime.strptime(
+                                ts_match, "%Y-%m-%dT%H:%M:%SZ"
+                            ).replace(tzinfo=timezone.utc)
+                        except ValueError:
+                            continue
+                        if ts >= cutoff:
+                            retries_1h += 1
+            except Exception as exc:
+                return jsonify({
+                    "error": f"log scan failed: {exc!s}",
+                    "lock_retries": metrics.get("lock_retries"),
+                    "lock_failures": metrics.get("lock_failures"),
+                }), 500
+        if failures_1h >= 10:
+            status = "critical"
+        elif failures_1h >= 1:
+            status = "degraded"
+        else:
+            status = "ok"
+        return jsonify({
+            "status": status,
+            "lock_retries_lifetime": metrics.get("lock_retries"),
+            "lock_failures_lifetime": metrics.get("lock_failures"),
+            "retries_1h": retries_1h,
+            "failures_1h": failures_1h,
+            "last_failure_ts": last_failure_ts,
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+
     @app.get("/healthz")
     @app.get("/api/health")
     def healthz():
