@@ -713,11 +713,19 @@ class PriceCache:
     def _build_trading_days(self) -> None:
         spy = self.prices.get("SPY") or {}
         if not spy:
-            # fallback: any ticker
-            for t in self.prices:
-                if self.prices[t]:
-                    spy = self.prices[t]
-                    break
+            # Pick the DENSEST non-empty series as the calendar proxy. The
+            # prior "first non-empty" fallback could land on a thin/foreign
+            # ticker (LNOK / a sparse ADR) and produce a sparse trading_days
+            # calendar that silently skipped real NYSE days for the WHOLE
+            # backtest — every sampled decision day, the SL/TP scan, and the
+            # equity curve all run off this calendar. Density (len of close
+            # map) is a safe proxy: SPY-like ETFs (QQQ, NVDA, etc.) all have
+            # near-full NYSE coverage; thin names have much shorter series.
+            best_n = 0
+            for t, series in self.prices.items():
+                if series and len(series) > best_n:
+                    spy = series
+                    best_n = len(series)
         days = sorted(date.fromisoformat(d) for d in spy.keys()
                       if self.start <= date.fromisoformat(d) <= self.end)
         self.trading_days = days

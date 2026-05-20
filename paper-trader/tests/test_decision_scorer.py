@@ -499,25 +499,28 @@ class TestTrainScorer:
         assert result["n"] == 60
 
     def test_handles_null_forward_return(self):
-        # JSON nulls in the outcome file historically crashed training because
-        # float(r.get("forward_return_5d", 0.0)) saw None instead of the default.
+        # An outcome record with forward_return_5d=null carries NO realized
+        # label — training on a silent 0.0 coercion contaminated the model
+        # with phantom flat-return rows. The strengthened contract drops
+        # such rows and surfaces them in n_label_dropped. When ALL rows are
+        # null we honestly return "no_valid_labels" rather than fitting on
+        # an all-zero target vector.
         recs = []
         for i in range(35):
             r = _synthetic_outcome(sim_date=f"2025-05-{i+1:02d}")
-            r["forward_return_5d"] = None  # the bug case
+            r["forward_return_5d"] = None
             recs.append(r)
-        # Must not crash — _to_float coerces None → 0.0.
         result = train_scorer(recs)
-        assert result["status"] == "ok"
+        assert result["status"] == "no_valid_labels"
+        assert result["n"] == 0
+        assert result["n_label_dropped"] == 35
 
     def test_handles_non_finite_forward_return(self):
         # Regression: a single decision_outcomes.jsonl row with a non-finite
         # forward_return_5d (inf / -inf) used to pass _to_float untouched,
         # poison the y vector, and make MLPRegressor.fit raise
-        # "Input y contains infinity". _train_decision_scorer swallows that
-        # exception, so the scorer silently stopped retraining for that cycle
-        # AND every cycle after (the poisoned row persists in the 5000-record
-        # tail). With the fix, inf/-inf coerce to 0.0 and training completes.
+        # "Input y contains infinity". Strengthened contract drops the bad
+        # rows entirely (counted in n_label_dropped) and trains on the rest.
         recs = [_synthetic_outcome(sim_date=f"2025-06-{i+1:02d}")
                 for i in range(35)]
         recs[5]["forward_return_5d"] = float("inf")
@@ -527,6 +530,29 @@ class TestTrainScorer:
         # val_rmse must be a real finite number, not nan/inf from a poisoned fit.
         vr = result["val_rmse"]
         assert vr == vr and abs(vr) < 1e6
+        # Exactly the 2 inf rows must have been dropped — every other row
+        # carried a finite synthetic forward return.
+        assert result["n_label_dropped"] == 2
+        # Pickled n_train reflects the post-validation count, not the input
+        # `len(records)`. Dedup is a no-op here (35 unique sim_dates).
+        assert result["n"] == 33
+
+    def test_drops_mixed_invalid_forward_returns(self):
+        # Defence-in-depth: any non-finite / non-coercible label must be
+        # dropped (NaN, inf, bool True, a string). The remaining valid rows
+        # produce the trained model — n_label_dropped tells the skill
+        # ledger exactly how dirty the trainer tail was.
+        recs = [_synthetic_outcome(sim_date=f"2025-07-{i+1:02d}")
+                for i in range(40)]
+        recs[0]["forward_return_5d"] = None
+        recs[1]["forward_return_5d"] = float("nan")
+        recs[2]["forward_return_5d"] = float("inf")
+        recs[3]["forward_return_5d"] = True          # bool sneaks through as int
+        recs[4]["forward_return_5d"] = "not a number"
+        result = train_scorer(recs)
+        assert result["status"] == "ok"
+        assert result["n_label_dropped"] == 5
+        assert result["n"] == 35  # 40 input - 5 dropped, no dedup collisions
 
     def test_persists_to_scorer_path(self, tmp_path, monkeypatch):
         """After training, the pickle must exist and contain {model, scaler, n_train}."""
