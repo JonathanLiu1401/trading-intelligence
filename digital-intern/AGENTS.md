@@ -4727,3 +4727,141 @@ origin/master (`916f87a`, `81ffe13`).
        Documented chronic SQLite contention per memory
        `di-insert-batch-lock-contention`. The retry-decorator absorbs most
        collisions; the persistent class is unchanged.
+
+---
+
+## 2026-05-20 — Multi-phase agent pass
+
+- **Phase 1 — bugs_fixed=3, commit `6fd016b`.** **`ai_score IS NOT NULL`
+  tautology** in three ml-vs-llm audits: `scripts/score_divergence.py`,
+  `analytics/scorer_skew.py`, `analytics/source_score_volatility.py`.
+  `articles.ai_score` is `REAL DEFAULT 0` — never NULL — so the predicate
+  swept in every model-scored-but-LLM-unscored row at the implicit ai=0.
+  **Live smoking-gun: `score_divergence.py` output read `divergent=5000
+  ml_higher_pct=100.0%` with every top-5 row showing `ai=0.00`** — that
+  is not divergence, it is unlabelled rows.
+
+  * `scripts/score_divergence.py`: refactored to expose pure
+    `load_rows(db, hours)` / `classify_divergent(rows, min_gap)` /
+    `build_summary(divergent, sampled)` so the SQL contract and the
+    aggregation are unit-testable independently. SQL: `ai_score >= _MIN_AI`
+    (SSOT import from `ml.score_agreement` — same anti-drift discipline
+    `ml/per_source_agreement.py` already uses) + `_LIVE_ONLY_CLAUSE` (the
+    script previously had no backtest filter at all). `mode=ro` URI +
+    `busy_timeout=4000` so a concurrent writer storm cannot crash the
+    audit (memory `di-insert-batch-lock-contention`). Added `sys.path`
+    bootstrap so the script runs both `python3 scripts/score_divergence.py`
+    and `python3 -m scripts.score_divergence` from the repo root
+    (mirrors `export_training_data.py` / `finnhub_historical_news.py`).
+  * `analytics/scorer_skew.py`: `ai_score IS NOT NULL` → `ai_score > 0`.
+    Comment updated with the live evidence (per-source ai-vs-ml gap
+    averages dragged toward (avg_ml − 0) by every unscored row).
+  * `analytics/source_score_volatility.py`: `ai_score IS NOT NULL` →
+    `ai_score > 0`. Comment updated — a source with 100 LLM-scored rows
+    (3..7) and 900 unscored zeros was looking vastly noisier than its
+    real LLM-label spread; `urgency_scorer` floors any LLM-touched row at
+    0.01 so `> 0` is the canonical "the LLM actually graded this" filter
+    (same SSOT as `ml/score_agreement._MIN_AI`).
+
+  Pinned by:
+  * `tests/test_score_divergence.py` (7 cases) — SQL contract (no
+    ai_score=0/synthetic/stale rows in `load_rows`); classifier gap math
+    and direction; sort order by gap desc; `build_summary` zero-div
+    guard; end-to-end discriminator that the buggy `ml_higher_pct=100.0%`
+    output cannot recur.
+  * `tests/test_scorer_skew_unscored_excluded.py` (2 cases) — one
+    labelled row + four ai_score=0 rows under the same source; post-fix
+    both modules report n=1 with specific values (`avg_ai=8.0`,
+    `avg_ml=7.0`, `avg_gap_ml_minus_ai=-1.0`; `mean=8.0`, `std=0.0`). Buggy
+    version produced n=5, mean=1.6, std≈3.2 — characterising "rss" as
+    vastly noisy on the back of unscored rows alone.
+
+- **Phase 1 follow-up — Phase-3 quick fix folded in, commit `8e8977e`.**
+  **`_expect_row` empty-tuple cursor-collision variant**. Live evidence
+  (2026-05-19/20 daemon.log): `[stats_worker] error: tuple index out of
+  range` recurred under the same writer-contention storm that produces
+  the documented `database is locked` / `another row available` classes.
+  The existing `_expect_row` guard catches `fetchone() -> None`
+  cursor-state corruption but not the `fetchone() -> ()` variant — the
+  caller's `[0]` then raises `IndexError`, which is NOT a
+  `sqlite3.DatabaseError`, so `_retry_on_lock` declines it and
+  `stats_worker` silently fails the contended cycle.
+
+  * `storage/article_store.py::_expect_row`: extended the guard from
+    `row is None` to `row is None or len(row) == 0`. Every call site is
+    `MAX`/`COUNT` (always 1-column row), so an empty tuple can never be a
+    legitimate result — safe by construction, same rationale as the
+    existing None-guard.
+  * `tests/test_stats_cursor_collision.py`: added two parallel tests
+    (`test_expect_row_raises_retryable_on_empty_tuple`,
+    `test_expect_row_empty_tuple_is_retried_by_decorator_then_succeeds`)
+    pinning the new branch with specific behaviour, byte-identical shape
+    to the existing None-variant tests so a future refactor of either
+    must update both (anti-drift).
+
+- **Phase 2 — features_added=1, commit `e57ce0c`.** **Per-source
+  alerted-row breakdown with LLM-vs-ML calibration** —
+  `analytics/alert_source_breakdown.py`. Answers the recurring analyst
+  question: "which collectors fired BREAKING alerts in the last N hours,
+  and is each alert backed by an LLM ground-truth label or only by the
+  local model's hunch?" The aggregate metric already lives in
+  `ArticleStore.urgency_label_split`, but it has no per-source axis — an
+  analyst seeing `llm_fraction=0.10` cannot tell whether one chatty
+  source is dragging the average or every collector is dark on Sonnet.
+
+  Live evidence (run on the production DB at agent-pass time):
+  `total_alerted=101  aggregate_llm_fraction=0.3564  sources=38`. Top
+  alerters in 24h: `YF/most_actives` 16/16 with only 12.5% LLM-vetted,
+  `YF/day_gainers` 14/14 at 42.9% — the screener-tape noise the previous
+  pass's `_QW_SCREENER_TAPE` gate (commit `e8a9202`) suppresses going
+  forward. Post-restart sample of 4 alerts in the last ~4h has zero
+  YF/* entries, confirming the gate works once the daemon picks up the
+  fix.
+
+  * Pure `compute_breakdown(rows)` + `load_alerted_rows(db, hours)` +
+    `build_report(breakdown, hours)` so the aggregation and the SQL are
+    unit-testable independently (same shape as the new
+    `scripts/score_divergence.py` Phase-1 refactor).
+  * Calibration keys / `llm_fraction` formula are SSOT-shared with
+    `urgency_label_split` (same `{"llm", "ml", "briefing_boost", "null"}`
+    bucket set, same `(llm + briefing_boost) / total` formula) so the
+    two audits cannot drift on what "vetted" means.
+  * Read-only. `_LIVE_ONLY_CLAUSE` applied (defense-in-depth — synthetic
+    rows are `urgency=0` by construction today). No DB write, no
+    `ai_score` / `ml_score` / `score_source` / `urgency` mutation — all
+    four load-bearing invariants intact by construction.
+  * CLI: `python3 -m analytics.alert_source_breakdown --hours 24` prints
+    a one-line per-source table and persists JSON to
+    `/home/zeph/logs/alert_source_breakdown.json`.
+
+  Pinned by `tests/test_alert_source_breakdown.py` (12 cases): empty
+  input, bucketing across all four score_source classes, unknown-tag
+  fallback to `null`, sort order (alerted desc, source asc) including
+  the alphabetical tiebreak, empty-source → `"unknown"` coalesce,
+  `min_per_source` floor, zero-total div-by-zero guard, SQL contract
+  (only urgency=2 + 24h window + live-only with synthetic + queued +
+  stale rows excluded), JSON serialised output contains no synthetic
+  markers, and a cross-product parity check that summed per-source
+  `by_source` plus the seeded queued row equals
+  `urgency_label_split.by_source` (anti-drift on the calibration keys).
+
+- **Phase 3 — live findings (user_findings=4).**
+    1. **24h alert noise dominated by Yahoo screener tape (pre-gate)** —
+       30 of 101 alerts (29.7%) under `YF/most_actives` + `YF/day_gainers`
+       with `llm_fraction` 0.125 / 0.429. Confirms the previous pass's
+       Phase-2 gate is correctly targeted; post-restart these have stopped
+       firing.
+    2. **Briefings on schedule** — last 3 briefings at `T22:48`, `T17:12`,
+       `T12:08` UTC, each `article_count=50`. 5h cadence holds.
+    3. **`stats_worker` empty-tuple noise FIXED** — previously
+       intermittent `tuple index out of range` at DEBUG under writer
+       contention; folded into the Phase-1 fix commit.
+    4. **`ArticleStore.urgency_label_split` is unexposed** — defined in
+       `storage/article_store.py:1144`, well-tested by
+       `tests/test_urgency_label_split.py`, but no dashboard route, CLI,
+       or analytics consumer surfaces it. The new
+       `analytics.alert_source_breakdown` covers the per-source axis;
+       the aggregate metric (one number, calibration health) remains a
+       memory-only call. Worth a one-line dashboard endpoint in a future
+       pass — not done here (dashboard/web_server.py is large; out of
+       single-commit scope).
