@@ -9,6 +9,7 @@ Workers (intervals below track the *_INTERVAL constants in the Config block):
   W2  rss_worker         — re-polls all RSS feeds every 30s
   W3  web_worker         — scrapes 100+ financial sites every 60s
   W4  reddit_worker      — re-polls Reddit every 45s
+  W4b stocktwits_worker  — StockTwits trending stream every 90s
   W5  ticker_worker      — re-fetches yfinance news every 60s
   W6  scorer_worker      — NN-first urgency scoring; Sonnet only for uncertain articles
   W7  alert_worker       — fires Discord alert whenever urgent items appear
@@ -48,6 +49,7 @@ from collectors.rss_collector import collect_rss
 from collectors.gdelt_collector import collect_gdelt, QUERY_GROUPS
 from collectors.ticker_news import collect_ticker_news
 from collectors.reddit_collector import collect_reddit
+from collectors.stocktwits_collector import collect_stocktwits
 from collectors.web_scraper import scrape_web
 from collectors.stock_data import get_stock_data
 from collectors.earnings_calendar import get_earnings
@@ -108,6 +110,7 @@ HEARTBEAT_INTERVAL  = 5 * 3600   # 5h
 RSS_INTERVAL        = 30          # re-poll RSS every 30s (collector is parallelized)
 WEB_INTERVAL        = 60          # scrape web every 60s
 REDDIT_INTERVAL     = 45          # re-poll Reddit every 45s
+STOCKTWITS_INTERVAL = 90          # re-poll StockTwits trending every 90s
 TICKER_INTERVAL     = 60          # re-fetch ticker news every 60s
 SCORE_INTERVAL      = 30          # run scoring pass every 30s
 ALERT_CHECK         = 20          # check for urgent alerts every 20s
@@ -221,7 +224,7 @@ CORE_WORKERS = ("rss", "web", "reddit", "scorer")
 # floor, preserving the previous behaviour for them.
 WORKER_POLL_INTERVAL_SECS = {
     "gdelt": GDELT_INTERVAL, "rss": RSS_INTERVAL, "web": WEB_INTERVAL,
-    "reddit": REDDIT_INTERVAL, "ticker": TICKER_INTERVAL,
+    "reddit": REDDIT_INTERVAL, "stocktwits": STOCKTWITS_INTERVAL, "ticker": TICKER_INTERVAL,
     "sec_edgar": SEC_EDGAR_INTERVAL, "sec_edgar_ft": SEC_EDGAR_FT_INTERVAL,
     "google_news": GOOGLE_NEWS_INTERVAL, "nitter": NITTER_INTERVAL,
     "substack": SUBSTACK_INTERVAL, "finnhub": FINNHUB_INTERVAL,
@@ -639,6 +642,27 @@ def reddit_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(REDDIT_INTERVAL)
+
+
+# ── Worker W4b: StockTwits trending — re-poll every 90s ──────────────────────
+def stocktwits_worker(store: ArticleStore):
+    log.info("[stocktwits_worker] started")
+    bo = Backoff("stocktwits", base=5.0, cap=300.0)
+    while _running:
+        try:
+            articles = collect_stocktwits()
+            _ingest(store, articles, "stocktwits")
+            try:
+                source_health.record_result("stocktwits", len(articles))
+            except Exception as he:
+                log.warning(f"[stocktwits_worker] source_health error: {he}")
+            _worker_last_ok["stocktwits"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[stocktwits_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(STOCKTWITS_INTERVAL)
 
 
 # ── Worker W5: Ticker news — re-fetch every 120s ─────────────────────────────
@@ -2564,6 +2588,7 @@ def main():
         ("rss",         rss_worker),
         ("web",         web_worker),
         ("reddit",      reddit_worker),
+        ("stocktwits",  stocktwits_worker),
         ("ticker",      ticker_worker),
         ("sec_edgar",   sec_edgar_worker),
         ("sec_edgar_ft", sec_edgar_ft_worker),
