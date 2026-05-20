@@ -747,6 +747,90 @@ window-keyed and never evicted, so a long-lived continuous loop's RSS
 grows slowly across cycles — restart the loop periodically; do not add
 an ad-hoc eviction policy without measuring.
 
+**Persist-write serialization (`_VOLUME_PERSIST_LOCK`, 2026-05-20).** Two
+backtest run threads that both fetched a fresh volume series in the
+*same* window both reach `_persist_volume_cache_for_window` concurrently;
+the shared `".json.tmp"` filename means they both `open(..., 'w')`
+(O_TRUNC) the SAME file in parallel and their writes can interleave at
+the OS level → torn JSON could then land under the canonical path via
+`tmp.replace(path)`. The cache snapshot already runs under
+`_VOLUME_CACHE_LOCK`; `_VOLUME_PERSIST_LOCK` (a *separate* lock so cache
+readers/writers aren't blocked by disk I/O) wraps only the short
+`tmp.write_text` + `tmp.replace` so one writer at a time touches the
+file. Last writer wins by construction — both threads staged the same
+snapshot under the cache lock above. Locked deterministically by
+`tests/test_backtest.py::TestVolumeCachePersistAtomicity::test_concurrent_persists_serialize_tmp_write`
+(8 concurrent writers must record zero "tmp write started without
+persist lock held" violations + canonical file must remain valid JSON).
+
+### Concept-drift report (`paper_trader/ml/outcome_drift.py`)
+
+The scorer retrains every cycle on the last `MAX_OUTCOMES_FOR_TRAINING`
+(5000) records of `data/decision_outcomes.jsonl`. `regime_audit` answers
+"skill conditional on regime", but nothing in the existing surface
+(`skill_trend`, `baseline_compare`, `calibration`, `feature_coverage`,
+`feature_importance`) reports whether the trainer's input/output
+distribution itself is drifting under the model. This module fills that
+gap.
+
+`build_outcome_drift(records, recent_fraction=0.25)` sorts records by
+`sim_date`, splits the last 25% (recent) vs first 75% (older), and for
+every numeric feature in `TRACKED_FEATURES` reports
+`drift_score = (μ_recent − μ_older) / σ_older` — a z-style shift in
+σ-of-older units. State ladder mirrors `tail_risk` / `build_correlation`:
+`NO_DATA` / `INSUFFICIENT` (<`MIN_PER_BUCKET`=20 in either bucket) /
+`STABLE` / `MILD_DRIFT` (≥0.5σ on any feature) / `SEVERE_DRIFT` (≥1.0σ
+or constant-older-with-nonzero-shift → ±inf). Pure / no I/O / never
+raises (the `_safe` contract — `None`/non-dict/garbage rows degrade
+rather than crash; `_safe_float` rejects NaN/inf/bool exactly like
+`decision_scorer._to_float`). Sort by `|drift_score|` DESC, INSUFFICIENT
+rows last. Locked by `tests/test_outcome_drift.py` (39 tests: state
+ladder boundaries, exact 1σ/0.5σ arithmetic, constant-older→±inf
+convention, |drift| DESC sort, recent_fraction clamp + invalid-type
+fallback, garbage-row degrade-never-raise, `load_outcomes` streaming
++ malformed-line skip, CLI JSON + table modes).
+
+CLI: `python3 -m paper_trader.ml.outcome_drift [--path PATH] [--recent-fraction F] [--json]`.
+Live read on the 7413-row outcomes file (2026-05-20) flags `MILD_DRIFT`:
+`news_article_count +0.96σ` and `regime_mult -0.52σ` against the older
+bucket — quant-actionable evidence the trainer's tail no longer
+describes a stationary signal regime.
+
+### Test commands for the ML / backtest domain
+
+```bash
+# Focused unit tests (offline, mocks yfinance):
+python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+                 tests/test_outcome_drift.py tests/test_continuous.py \
+                 tests/test_calibration.py -v
+
+# Volume-cache + persist-race coverage:
+python3 -m pytest tests/test_backtest.py -k VolumeCache -v
+
+# Full ML/backtest slice (the spec the HYBRID reviewers run):
+python3 -m pytest tests/ -v -k "ml or backtest or scorer" 2>&1 | tail -30
+```
+
+### Operational quirks a quant should know
+
+- The deployed `data/ml/decision_scorer.pkl` and the per-cycle
+  `data/scorer_skill_log.jsonl` are written by *different* code paths
+  (the pickle by `train_scorer` after dedup; the ledger by
+  `_train_decision_scorer` parsing the formatted status string). The
+  pickle's `n_train` is the dedup'd training count for the train fold
+  only; the ledger's `train_n` is the same number. If they disagree
+  (observed 2026-05-20: pickle `n_train=400` vs ledger
+  `train_n=3987`), the continuous loop has not run a fresh retrain
+  cycle since the pickle was written — the gate state derived from the
+  pickle (`gate_active = n_train ≥ 500`) is the authoritative live
+  state, not what the ledger says.
+- A stuck `status='running'` row in `backtest.db` older than 6h has
+  already passed the `_reap_orphaned_runs` window — that means the
+  continuous loop process itself is down (verified via
+  `pgrep -af continuous_backtest`), not that the reaper is broken.
+  Restart the loop; the next process's startup-reap (and the mid-loop
+  reap each cycle) will sweep them to `failed`.
+
 ### How to run backtests manually
 
 ```bash
