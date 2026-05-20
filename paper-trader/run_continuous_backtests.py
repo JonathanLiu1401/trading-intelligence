@@ -788,7 +788,20 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
     a successful train (the AGENTS.md "scorer-train status must stay
     truthful" discipline, mirrored from the separate ``oos_rmse`` guard).
     """
-    out = {"dir_acc": None, "rank_ic": None, "n": 0}
+    # Additive per-action breakdown (2026-05-20 feature). The conviction
+    # gate (#5) is BUY-only, so a researcher needs to know the GATE-RELEVANT
+    # skill (BUY rank-IC) separately from the aggregate. SELL rank-IC is
+    # informative as a sanity check — the model is trained on flipped SELL
+    # labels, so a positive SELL rank-IC means the scorer would also help
+    # short selection if the gate were ever extended to SELL. Returned as
+    # additional keys; the legacy aggregate (dir_acc, rank_ic, n) is
+    # unchanged so every existing caller (_train_decision_scorer status
+    # string, tests) keeps working byte-identically.
+    out: dict = {
+        "dir_acc": None, "rank_ic": None, "n": 0,
+        "buy_dir_acc": None, "buy_rank_ic": None, "buy_n": 0,
+        "sell_dir_acc": None, "sell_rank_ic": None, "sell_n": 0,
+    }
     try:
         if not oos_records or not getattr(scorer, "is_trained", False):
             return out
@@ -798,6 +811,13 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
 
         preds: list[float] = []
         actuals: list[float] = []
+        # Per-action buckets — populated alongside the aggregate so we never
+        # do a second predict pass (the scorer call is the expensive step;
+        # the bucket split is free).
+        buy_preds: list[float] = []
+        buy_acts: list[float] = []
+        sell_preds: list[float] = []
+        sell_acts: list[float] = []
         for r in oos_records:
             try:
                 p = scorer.predict(
@@ -816,11 +836,11 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
                 # flat-target ties). Mirrors persona_skill._aligned's NaN-
                 # sentinel discipline so this OOS metric and that diagnostic
                 # treat unparseable targets the same way.
-                a = _to_float(r.get("forward_return_5d"), float("nan"))
+                a_raw = _to_float(r.get("forward_return_5d"), float("nan"))
                 # Mirror train_scorer / evaluate_scorer_oos: a SELL's realized
                 # target sign is flipped so "good" has one consistent meaning.
-                if str(r.get("action") or "BUY").upper() == "SELL":
-                    a = -a
+                is_sell = str(r.get("action") or "BUY").upper() == "SELL"
+                a = -a_raw if is_sell else a_raw
                 p = float(p)
                 if p == p and a == a:  # drop non-finite defensively
                     # Mirror train_scorer's symmetric label clamp + the
@@ -833,23 +853,55 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
                     a = max(-PRED_CLAMP_PCT, min(PRED_CLAMP_PCT, a))
                     preds.append(p)
                     actuals.append(a)
+                    if is_sell:
+                        sell_preds.append(p)
+                        sell_acts.append(a)
+                    else:
+                        buy_preds.append(p)
+                        buy_acts.append(a)
             except Exception:
                 continue
 
-        n = len(preds)
-        out["n"] = n
-        if n >= 2:
-            ic = _spearman(_np.asarray(preds, dtype=float),
-                           _np.asarray(actuals, dtype=float))
-            if ic == ic:  # not NaN
-                out["rank_ic"] = round(float(ic), 4)
-        dir_pairs = [(p, a) for p, a in zip(preds, actuals)
-                     if p != 0.0 and a != 0.0]
-        if dir_pairs:
-            hits = sum(1 for p, a in dir_pairs if (p > 0) == (a > 0))
-            out["dir_acc"] = round(hits / len(dir_pairs), 4)
+        def _rank_dir(ps: list[float], acs: list[float]) -> tuple:
+            """Return (rank_ic, dir_acc) for one bucket. rank_ic requires
+            n>=2 (Spearman undefined on n<2); dir_acc only requires at
+            least one non-zero pair (a single concordant pair is honest
+            information — locked by the legacy n=1 test).
+            """
+            ic_v: float | None = None
+            if len(ps) >= 2:
+                ic = _spearman(_np.asarray(ps, dtype=float),
+                               _np.asarray(acs, dtype=float))
+                if ic == ic:  # not NaN
+                    ic_v = round(float(ic), 4)
+            dir_pairs = [(p, a) for p, a in zip(ps, acs)
+                         if p != 0.0 and a != 0.0]
+            dacc_v: float | None = None
+            if dir_pairs:
+                hits = sum(1 for p, a in dir_pairs if (p > 0) == (a > 0))
+                dacc_v = round(hits / len(dir_pairs), 4)
+            return ic_v, dacc_v
+
+        out["n"] = len(preds)
+        agg_ic, agg_da = _rank_dir(preds, actuals)
+        out["rank_ic"] = agg_ic
+        out["dir_acc"] = agg_da
+
+        out["buy_n"] = len(buy_preds)
+        buy_ic, buy_da = _rank_dir(buy_preds, buy_acts)
+        out["buy_rank_ic"] = buy_ic
+        out["buy_dir_acc"] = buy_da
+
+        out["sell_n"] = len(sell_preds)
+        sell_ic, sell_da = _rank_dir(sell_preds, sell_acts)
+        out["sell_rank_ic"] = sell_ic
+        out["sell_dir_acc"] = sell_da
     except Exception:
-        return {"dir_acc": None, "rank_ic": None, "n": 0}
+        return {
+            "dir_acc": None, "rank_ic": None, "n": 0,
+            "buy_dir_acc": None, "buy_rank_ic": None, "buy_n": 0,
+            "sell_dir_acc": None, "sell_rank_ic": None, "sell_n": 0,
+        }
     return out
 
 
@@ -923,6 +975,18 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
     # the metric describes the exact serialized state the next cycle deploys.
     oos_diracc_s = "n/a"
     oos_ic_s = "n/a"
+    # Per-action breakdown — the conviction gate (#5) is BUY-only, so a
+    # researcher needs to see BUY rank-IC SEPARATELY from the aggregate.
+    # An aggregate rank-IC ~0 (the documented current state) could hide a
+    # positive BUY skill cancelled by a SELL anti-skill, OR vice versa.
+    # Additive in the status string — the legacy `oos_diracc/oos_ic`
+    # tokens are unchanged so every existing parser keeps working.
+    oos_buy_diracc_s = "n/a"
+    oos_buy_ic_s = "n/a"
+    oos_buy_n = 0
+    oos_sell_diracc_s = "n/a"
+    oos_sell_ic_s = "n/a"
+    oos_sell_n = 0
     if result.get("status") == "ok" and oos_records:
         try:
             m = _oos_rank_metrics(DecisionScorer(), oos_records)
@@ -930,6 +994,16 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
                 oos_diracc_s = f"{m['dir_acc']:.2f}"
             if m["rank_ic"] is not None:
                 oos_ic_s = f"{m['rank_ic']:+.2f}"
+            oos_buy_n = int(m.get("buy_n") or 0)
+            oos_sell_n = int(m.get("sell_n") or 0)
+            if m.get("buy_dir_acc") is not None:
+                oos_buy_diracc_s = f"{m['buy_dir_acc']:.2f}"
+            if m.get("buy_rank_ic") is not None:
+                oos_buy_ic_s = f"{m['buy_rank_ic']:+.2f}"
+            if m.get("sell_dir_acc") is not None:
+                oos_sell_diracc_s = f"{m['sell_dir_acc']:.2f}"
+            if m.get("sell_rank_ic") is not None:
+                oos_sell_ic_s = f"{m['sell_rank_ic']:+.2f}"
         except Exception as exc:
             oos_diracc_s = oos_ic_s = f"n/a ({type(exc).__name__})"
 
@@ -979,6 +1053,10 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
             f"oos_n_10={oos_n_10} oos_diracc_10={oos_diracc_10_s} "
             f"oos_ic_10={oos_ic_10_s} oos_n_20={oos_n_20} "
             f"oos_diracc_20={oos_diracc_20_s} oos_ic_20={oos_ic_20_s} "
+            f"oos_buy_n={oos_buy_n} oos_buy_diracc={oos_buy_diracc_s} "
+            f"oos_buy_ic={oos_buy_ic_s} "
+            f"oos_sell_n={oos_sell_n} oos_sell_diracc={oos_sell_diracc_s} "
+            f"oos_sell_ic={oos_sell_ic_s} "
             f"n_label_clamped={label_clamped}")
 
 
@@ -1011,6 +1089,11 @@ def _parse_scorer_status(status: str) -> dict:
         "oos_n": None, "oos_rmse": None, "oos_dir_acc": None, "oos_ic": None,
         "oos_n_10": None, "oos_dir_acc_10": None, "oos_ic_10": None,
         "oos_n_20": None, "oos_dir_acc_20": None, "oos_ic_20": None,
+        # Per-action breakdown (gate-relevant BUY vs informational SELL).
+        # Defaults to None on older status strings that pre-date the wiring,
+        # so historical skill-ledger rows parse cleanly.
+        "oos_buy_n": None, "oos_buy_dir_acc": None, "oos_buy_ic": None,
+        "oos_sell_n": None, "oos_sell_dir_acc": None, "oos_sell_ic": None,
         "n_label_clamped": None,
     }
     try:
@@ -1050,6 +1133,17 @@ def _parse_scorer_status(status: str) -> dict:
         out["oos_ic_10"] = _num("oos_ic_10")
         out["oos_dir_acc_20"] = _num("oos_diracc_20")
         out["oos_ic_20"] = _num("oos_ic_20")
+        # Per-action breakdown — int counts, float metrics. Old status
+        # strings predating this wiring omit the tokens entirely and
+        # degrade to None via the `_num` regex miss.
+        obn = _num("oos_buy_n")
+        osn = _num("oos_sell_n")
+        out["oos_buy_n"] = int(obn) if obn is not None else None
+        out["oos_sell_n"] = int(osn) if osn is not None else None
+        out["oos_buy_dir_acc"] = _num("oos_buy_diracc")
+        out["oos_buy_ic"] = _num("oos_buy_ic")
+        out["oos_sell_dir_acc"] = _num("oos_sell_diracc")
+        out["oos_sell_ic"] = _num("oos_sell_ic")
         # Label-clamp count is an integer when reported; legacy status strings
         # (cycles before the clamp landed) omit it — degrades to None cleanly.
         nlc = _num("n_label_clamped")
@@ -1060,7 +1154,10 @@ def _parse_scorer_status(status: str) -> dict:
             "oos_n": None, "oos_rmse": None, "oos_dir_acc": None,
             "oos_ic": None, "oos_n_10": None, "oos_dir_acc_10": None,
             "oos_ic_10": None, "oos_n_20": None, "oos_dir_acc_20": None,
-            "oos_ic_20": None, "n_label_clamped": None,
+            "oos_ic_20": None,
+            "oos_buy_n": None, "oos_buy_dir_acc": None, "oos_buy_ic": None,
+            "oos_sell_n": None, "oos_sell_dir_acc": None, "oos_sell_ic": None,
+            "n_label_clamped": None,
         }
     return out
 

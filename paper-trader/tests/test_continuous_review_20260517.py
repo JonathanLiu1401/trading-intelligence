@@ -126,7 +126,14 @@ class TestOosRankMetrics:
                 return 0.0
 
         m = rcb._oos_rank_metrics(_Untrained(), [_rec(1.0, 1.0)])
-        assert m == {"dir_acc": None, "rank_ic": None, "n": 0}
+        # Aggregate honest-empty; per-action breakdown (2026-05-20) keys
+        # also present with None/0 defaults — old dict-literal assert was
+        # too tight for the additive per-action contract.
+        assert m["dir_acc"] is None
+        assert m["rank_ic"] is None
+        assert m["n"] == 0
+        assert m["buy_n"] == 0
+        assert m["sell_n"] == 0
 
     def test_never_raises_on_predict_failure(self):
         class _Broken:

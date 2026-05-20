@@ -883,7 +883,18 @@ class TestOosRankMetrics:
         out = rcb._oos_rank_metrics(_Untrained(), [
             {"forward_return_5d": 1.0, "action": "BUY", "ticker": "NVDA"}
         ])
-        assert out == {"dir_acc": None, "rank_ic": None, "n": 0}
+        # Aggregate + per-action breakdown both honest-empty when the model
+        # isn't trained. Locks the full shape so a future caller can rely on
+        # the new buy/sell keys being present even on the no-op path.
+        assert out["dir_acc"] is None
+        assert out["rank_ic"] is None
+        assert out["n"] == 0
+        assert out["buy_n"] == 0
+        assert out["buy_dir_acc"] is None
+        assert out["buy_rank_ic"] is None
+        assert out["sell_n"] == 0
+        assert out["sell_dir_acc"] is None
+        assert out["sell_rank_ic"] is None
 
     def test_records_missing_forward_return_are_dropped_not_zeroed(self):
         """A `forward_return_5d=None` (or missing key) MUST be dropped.
@@ -1023,6 +1034,82 @@ class TestOosRankMetrics:
         assert out["dir_acc"] == pytest.approx(1.0)
         # rank_ic computable (n=2, both pairs concordant) — IC = 1.0.
         assert out["rank_ic"] == pytest.approx(1.0)
+
+    def test_per_action_breakdown_isolates_buy_from_sell(self):
+        """The conviction gate (#5) is BUY-only, so a quant needs the
+        BUY-specific rank-IC separately from the aggregate. This test
+        proves the bucket split is correct: a scorer that's PERFECTLY
+        right on BUYs and PERFECTLY wrong on SELLs must report a
+        positive buy_rank_ic AND a negative sell_rank_ic — the
+        aggregate would hide that by averaging.
+        """
+        scorer = self._scorer_returning([
+            # BUY predictions agree with realized signs.
+            1.0, -1.0,
+            # SELL predictions disagree with sign-flipped realized.
+            1.0, -1.0,
+        ])
+        records = [
+            # BUY records — perfect concordance (sign(pred) == sign(actual))
+            {"forward_return_5d": 2.0, "action": "BUY", "ticker": "NVDA"},
+            {"forward_return_5d": -3.0, "action": "BUY", "ticker": "AMD"},
+            # SELL records — after sign flip, the realized goodness is
+            # -forward_return_5d. predictions disagree with that flipped sign.
+            # raw fwd=-2 → flipped +2; pred=+1.0 → BOTH positive → "concordant"
+            # AFTER flip but the SELL bucket reports rank-IC over (pred, flipped).
+            # So to make the SELL bucket NEGATIVE rank-IC we set:
+            # raw fwd=+2 → flipped -2; pred=+1.0 → discordant → miss
+            {"forward_return_5d": 2.0, "action": "SELL", "ticker": "MU"},
+            # raw fwd=-2 → flipped +2; pred=-1.0 → discordant → miss
+            {"forward_return_5d": -2.0, "action": "SELL", "ticker": "INTC"},
+        ]
+        out = rcb._oos_rank_metrics(scorer, records)
+        # Counts honest per bucket.
+        assert out["n"] == 4
+        assert out["buy_n"] == 2
+        assert out["sell_n"] == 2
+        # BUY bucket: perfect concordance → IC=+1.0, dir_acc=1.0
+        assert out["buy_rank_ic"] == pytest.approx(1.0)
+        assert out["buy_dir_acc"] == pytest.approx(1.0)
+        # SELL bucket: perfect anti-concordance → IC=-1.0, dir_acc=0.0
+        assert out["sell_rank_ic"] == pytest.approx(-1.0)
+        assert out["sell_dir_acc"] == pytest.approx(0.0)
+
+    def test_per_action_buckets_handle_empty_one_side(self):
+        """When OOS rows are 100% BUYs (the common case — SELLs are rarer),
+        the SELL bucket reports n=0 and metric=None honestly rather than a
+        fabricated value. The BUY metrics are unaffected."""
+        scorer = self._scorer_returning([0.5, -0.5, 1.0])
+        records = [
+            {"forward_return_5d": 1.0, "action": "BUY", "ticker": "NVDA"},
+            {"forward_return_5d": -1.0, "action": "BUY", "ticker": "AMD"},
+            {"forward_return_5d": 2.0, "action": "BUY", "ticker": "MU"},
+        ]
+        out = rcb._oos_rank_metrics(scorer, records)
+        assert out["buy_n"] == 3
+        assert out["buy_rank_ic"] is not None  # computable
+        # SELL bucket empty → honest None.
+        assert out["sell_n"] == 0
+        assert out["sell_rank_ic"] is None
+        assert out["sell_dir_acc"] is None
+
+    def test_per_action_drops_missing_forward_return_per_bucket(self):
+        """A None forward_return drops from BOTH buckets correctly — the
+        per-action split must respect the same NaN-sentinel discipline as
+        the aggregate."""
+        scorer = self._scorer_returning([0.5, 1.0, -0.5, 0.7])
+        records = [
+            {"forward_return_5d": 1.0, "action": "BUY", "ticker": "NVDA"},
+            {"forward_return_5d": None, "action": "BUY", "ticker": "AMD"},  # drops
+            {"forward_return_5d": -0.8, "action": "SELL", "ticker": "MU"},
+            {"forward_return_5d": None, "action": "SELL", "ticker": "INTC"},  # drops
+        ]
+        out = rcb._oos_rank_metrics(scorer, records)
+        assert out["buy_n"] == 1
+        assert out["sell_n"] == 1
+        # n=1 in each bucket → rank_ic=None (need n>=2)
+        assert out["buy_rank_ic"] is None
+        assert out["sell_rank_ic"] is None
 
 
 # ──────────────────── _oos_multi_horizon_metrics direct ────────────
@@ -1323,6 +1410,43 @@ class TestParseScorerStatus:
         p = rcb._parse_scorer_status(s)
         assert p["status"] == "ok"
         assert p["n_label_clamped"] is None
+
+    def test_parses_per_action_breakdown_tokens(self):
+        """The 2026-05-20 per-action breakdown adds oos_buy_n/diracc/ic and
+        oos_sell_* tokens. Parser must extract them as int counts + float
+        metrics. Substring-boundary lock: `oos_n` must NOT swallow values
+        from `oos_buy_n=` / `oos_sell_n=` (same `(?:^|\\s)` discipline)."""
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=708 "
+             "oos_rmse=12.40 oos_diracc=0.55 oos_ic=+0.03 "
+             "oos_buy_n=600 oos_buy_diracc=0.58 oos_buy_ic=+0.11 "
+             "oos_sell_n=108 oos_sell_diracc=0.47 oos_sell_ic=-0.04")
+        p = rcb._parse_scorer_status(s)
+        assert p["status"] == "ok"
+        # Legacy 5d aggregate unchanged.
+        assert p["oos_n"] == 708
+        # New per-action fields.
+        assert p["oos_buy_n"] == 600
+        assert p["oos_buy_dir_acc"] == pytest.approx(0.58)
+        assert p["oos_buy_ic"] == pytest.approx(0.11)
+        assert p["oos_sell_n"] == 108
+        assert p["oos_sell_dir_acc"] == pytest.approx(0.47)
+        assert p["oos_sell_ic"] == pytest.approx(-0.04)
+
+    def test_legacy_status_without_per_action_tokens_parses_cleanly(self):
+        """A pre-feature status string carries NO per-action tokens; parser
+        must return them as None so historical skill-log rows still load
+        (same legacy-status discipline as the multi-horizon / label-clamp
+        precedents)."""
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=708 "
+             "oos_rmse=12.40 oos_diracc=0.55 oos_ic=+0.03")
+        p = rcb._parse_scorer_status(s)
+        assert p["status"] == "ok"
+        assert p["oos_buy_n"] is None
+        assert p["oos_buy_dir_acc"] is None
+        assert p["oos_buy_ic"] is None
+        assert p["oos_sell_n"] is None
+        assert p["oos_sell_dir_acc"] is None
+        assert p["oos_sell_ic"] is None
 
 
 class TestAppendScorerSkillLog:
