@@ -9887,6 +9887,133 @@ def idle_opportunity_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/news-action-funnel")
+def news_action_funnel_api():
+    """Per-ticker funnel of loud-articles → decisions → fills → P&L over the
+    last ``window_hours``.
+
+    Held ∪ ``strategy.WATCHLIST`` are evaluated. For each ticker, count the
+    live articles ≥ ``min_ai_score`` in the window, the decisions naming the
+    ticker (parsed via the dashboard SSOT ``_parse_action_ticker``), and the
+    FILLED trades on that ticker. The per-row verdict surfaces the
+    loud-news / no-action pathology (``IGNORED``) FIRST so the operator
+    sees the missed names without scrolling — distinct from
+    ``/api/idle-opportunity`` (drought-gated by design — silent when the
+    bot is filling normally even if a specific name was missed),
+    ``/api/signal-followthrough`` (forward 1d/3d/5d edge — can't answer
+    current window), and ``/api/trade-attribution`` (reverse direction:
+    fills → articles).
+
+    Query params (clamped):
+      * ``window_hours`` — 1..72, default 24 (matches the operator headline
+        horizon for "did the desk do anything today")
+      * ``min_ai_score`` — 0..10, default 6.0 (above the daemon grey-zone
+        threshold, below urgency cap; matches ``idle_opportunity`` floor)
+      * ``max_tickers`` — 1..100, default 25
+      * ``tickers`` — comma-separated override of the universe; default is
+        held ∪ strategy.WATCHLIST
+
+    Reads the digital-intern articles.db read-only via the freshness-aware
+    ``_articles_db_path()`` (invariant #15/#17 — no split-brain feed).
+    Live-only clause applied (AGENTS.md invariant #3). The window scan is
+    bounded by a single LIMIT (the ``news_velocity`` precedent — 24h
+    typically returns ≤10k rows on the live articles.db).
+
+    Observational only — never gates Opus, never injected into the decision
+    prompt, no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.news_action_funnel import (
+            build_news_action_funnel,
+            DEFAULT_MIN_AI_SCORE,
+            DEFAULT_WINDOW_HOURS,
+            DEFAULT_MAX_TICKERS,
+        )
+
+        try:
+            window_h = float(request.args.get("window_hours",
+                                              DEFAULT_WINDOW_HOURS))
+        except Exception:
+            window_h = DEFAULT_WINDOW_HOURS
+        window_h = max(1.0, min(window_h, 72.0))
+
+        try:
+            min_score = float(request.args.get("min_ai_score",
+                                               DEFAULT_MIN_AI_SCORE))
+        except Exception:
+            min_score = DEFAULT_MIN_AI_SCORE
+        min_score = max(0.0, min(min_score, 10.0))
+
+        try:
+            max_tk = int(request.args.get("max_tickers",
+                                          DEFAULT_MAX_TICKERS))
+        except Exception:
+            max_tk = DEFAULT_MAX_TICKERS
+        max_tk = max(1, min(max_tk, 100))
+
+        store = get_store()
+        held = _stock_tickers_from_positions(store.open_positions())
+
+        override = (request.args.get("tickers") or "").strip()
+        if override:
+            universe = [t.strip().upper() for t in override.split(",")
+                        if t.strip()]
+        else:
+            from .strategy import WATCHLIST as _WATCHLIST
+            # Held first so they sort earlier among same-verdict rows;
+            # builder dedups while preserving order.
+            universe = list(held) + [t.upper() for t in _WATCHLIST]
+
+        now_utc = datetime.now(timezone.utc)
+        cutoff_iso = (now_utc - timedelta(hours=window_h)).isoformat()
+
+        articles: list[dict] = []
+        path = _articles_db_path()
+        if path is not None:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
+                                   timeout=5)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT title, ai_score, urgency, first_seen, url, source "
+                    "FROM articles WHERE first_seen >= ? "
+                    "AND ai_score >= ? "
+                    "AND url NOT LIKE 'backtest://%' "
+                    "AND source NOT LIKE 'backtest_%' "
+                    "AND source NOT LIKE 'opus_annotation%' "
+                    "ORDER BY first_seen DESC LIMIT 12000",
+                    (cutoff_iso, float(min_score)),
+                ).fetchall()
+            finally:
+                conn.close()
+            for r in rows:
+                articles.append({
+                    "title": r["title"] or "",
+                    "ai_score": r["ai_score"],
+                    "urgency": r["urgency"],
+                    "first_seen": r["first_seen"],
+                    "url": r["url"],
+                    "source": r["source"],
+                })
+
+        result = build_news_action_funnel(
+            articles=articles,
+            decisions=store.recent_decisions(limit=2000),
+            trades=store.recent_trades(limit=2000),
+            positions=store.open_positions(),
+            tickers=universe,
+            held_tickers=held,
+            now=now_utc,
+            window_hours=window_h,
+            min_ai_score=min_score,
+            max_tickers=max_tk,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR",
+                        "tickers": []}), 500
+
+
 @app.route("/api/position-attention")
 def position_attention_api():
     """Per-open-position last-real-Opus-look freshness — which held names has
