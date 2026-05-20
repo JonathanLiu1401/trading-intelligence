@@ -658,6 +658,82 @@ class TestVolumeCachePersistAtomicity:
         assert ("T1", s_iso, e_iso) in bt._VOLUME_CACHE
         assert bt._VOLUME_CACHE[("T1", s_iso, e_iso)] == {"2024-01-02": 9.0}
 
+    def test_concurrent_persists_serialize_tmp_write(self, monkeypatch):
+        """Regression: concurrent calls to `_persist_volume_cache_for_window`
+        for the same window must not interleave `open(tmp, 'w')` writes.
+
+        Pre-fix, two backtest run threads that each fetched a volume series
+        in the same window both reached this persist concurrently; with the
+        shared `".json.tmp"` filename they both `open(..., 'w')` (O_TRUNC)
+        the SAME file in parallel and their writes can interleave at the OS
+        level → torn JSON could land under canonical via `.replace`. The
+        fix serializes the tmp open→write→replace under `_VOLUME_PERSIST_LOCK`
+        so only one writer at a time touches the file.
+
+        Deterministic check: replace `Path.write_text` with a probe that
+        records whether the persist lock is currently held when each write
+        starts. A non-reentrant Lock cannot be acquired by its holder, so
+        `acquire(blocking=False)` returning True proves no writer holds it —
+        i.e. the file write was NOT serialized. The fixed code must record
+        zero such violations across N concurrent persists.
+        """
+        import json
+        import threading as _th
+
+        import paper_trader.backtest as bt
+
+        start = date(2024, 4, 1)
+        end = date(2024, 9, 30)
+        s_iso, e_iso = start.isoformat(), end.isoformat()
+        # Seed enough tickers per writer that each write touches real bytes,
+        # so an unserialised interleave would actually produce torn output.
+        for i in range(40):
+            bt._VOLUME_CACHE[(f"T{i}", s_iso, e_iso)] = {
+                f"2024-{m:02d}-15": float(i + m)
+                for m in range(1, 13)
+            }
+
+        lock = bt._VOLUME_PERSIST_LOCK
+        violations: list[str] = []
+        write_count = [0]
+        from pathlib import Path as _P
+        _orig_write_text = _P.write_text
+
+        def _probe_write_text(self, *args, **kwargs):
+            if str(self).endswith(".json.tmp"):
+                if lock.acquire(blocking=False):
+                    lock.release()
+                    violations.append(
+                        f"tmp write started without persist lock held: {self}"
+                    )
+                write_count[0] += 1
+            return _orig_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(_P, "write_text", _probe_write_text)
+
+        threads = [
+            _th.Thread(target=bt._persist_volume_cache_for_window,
+                       args=(start, end))
+            for _ in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+            assert not t.is_alive(), "persist thread did not finish"
+
+        assert violations == [], violations
+        assert write_count[0] == 8, (
+            f"each thread should have written exactly once, "
+            f"got {write_count[0]}"
+        )
+
+        # And the canonical file must be valid JSON, not torn.
+        path = bt._volume_cache_path(start, end)
+        assert path.exists()
+        data = json.loads(path.read_text())  # raises on torn file
+        assert len(data) == 40
+
 
 # ─────────────────────── _ml_decide (smoke tests) ──────────────────────
 
