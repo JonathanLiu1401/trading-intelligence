@@ -4993,3 +4993,123 @@ origin/master (`916f87a`, `81ffe13`).
        `AlphaVantage/<publisher>` sub-feeds intermittently dark
        (quota-throttling, expected). Not fresh bugs; surfaced for
        maintenance triage.
+
+## 2026-05-20 — Hybrid pass (held-ticker news-silence audit)
+
+- **Phase 1: bugs_fixed=0, no commit.** Read pass over the nine task-critical
+  files + `ml/inference.py`, `core/*`, recent commits (`7488816` portfolio
+  overlap, `e15d6ea` source_credibility_audit, `51fee98` prefix-alias
+  rescue). The four load-bearing invariants re-traced and hold; ~30 prior
+  passes have exhausted by-inspection bug-hunting on the heavily-reviewed
+  core. Live `daemon.log` (last 2k lines): 0 NEW tracebacks; the recurring
+  `lock retry exhausted` ERRORs are the documented USB-saturation class
+  (memory `di-insert-batch-lock-contention`), not a fresh bug. Per the
+  COMMIT GUARD: bugs_fixed=0 is the honest call — adding a synthetic
+  "fix" to justify a commit would violate the standing rule.
+
+- **Phase 2: features_added=1, commit `707f822`** — `analytics/held_ticker_news_silence.py`
+  + `tests/test_held_ticker_news_silence.py`. **Per-held-ticker multi-window
+  coverage audit with verdict ladder.** Surfaces the analyst's standing
+  question that no existing tool answers in one shot: for each name in
+  `LIVE_PORTFOLIO_TICKERS`, what does live coverage look like across 1h /
+  6h / 24h, and is any one publisher the SOLE source of it?
+
+  * Verdict ladder **DARK** (zero 24h mentions — analyst blind) /
+    **ECHO** (mentions exist but from a single distinct source — same
+    single-source-self-syndication pattern the briefing's `[echo]` tag
+    catches at the cluster level, here at the holding level) / **NORMAL**
+    (2+ distinct sources) / **HOT** (`recent ≥ HOT_RECENT_THRESHOLD=3`).
+    Output sorted severity-first so the gaps land at the top.
+  * Differentiated vs `analytics/portfolio_overlap_scorer.py` (committed
+    `7488816`): that ranks recent articles BY held-ticker overlap count;
+    this is the inverse — per-ticker coverage *across multiple windows*
+    with a per-source diversity verdict, answering "which held names have
+    the LEAST coverage" not "which articles touch the most held names".
+  * Held-ticker set sourced verbatim from `ml.features.LIVE_PORTFOLIO_TICKERS`
+    — the SSOT every other held-book surface already keys on (alert
+    `book:`, briefing `[BOOK:]`, ml.features ticker density). Tests pin
+    the SSOT import so a new module that re-derives the held set would
+    fail loud.
+  * Read-only: `LIVE_ONLY_CLAUSE` inlined byte-identical with
+    `storage.article_store._LIVE_ONLY_CLAUSE` (drift-test pinned, same
+    anti-drift discipline as `analytics/alert_source_breakdown.py`).
+    `mode=ro` connection. No `ai_score` / `ml_score` / `score_source` /
+    `urgency` mutation — all four load-bearing invariants intact by
+    construction.
+  * Pure `compute_silence(rows, tickers, now)` over `(title, source,
+    first_seen)` tuples so the aggregator's 20 tests need NO DB. The DB
+    shell `load_rows()` is exercised by a small in-memory synth DB
+    fixture that mirrors the production projection and pins
+    backtest/opus-annotation exclusion + the >24h cutoff.
+  * **20 specific-value tests** (`tests/test_held_ticker_news_silence.py`):
+    DARK / ECHO / NORMAL / HOT at each rung; word-boundary discriminator
+    (MU does NOT match MUST/MUSE/MUSK); case-insensitive coverage;
+    single-source burst stays ECHO at high 1h volume (not promoted to HOT
+    — same anti-noise principle as `ECHO_MIN_COPIES`); one title naming
+    two held tickers counts for both; severity sort order;
+    unparseable/malformed timestamps and tuples skipped not crashing;
+    synth-DB backtest/opus/stale exclusion via `load_rows`; SSOT import
+    pin; `LIVE_ONLY_CLAUSE` byte-identity vs `article_store`.
+  * **Live run (post-commit) produced real analyst signal** —
+    `n_tickers=12 dark=1 echo=1 normal=9 hot=1`. SNDU **DARK** (zero
+    coverage all session, analyst blind); LNOK **ECHO** (2 mentions, 1
+    publisher); NVDA **HOT** (200 mentions across 43 sources, 7 in last
+    hour); the other 9 NORMAL. Exactly the kind of at-a-glance gap report
+    the briefing's `_book_silence_lines` cannot give for arbitrary
+    windows.
+  * CLI: `python3 -m analytics.held_ticker_news_silence [--json]`.
+    Output: `/home/zeph/logs/held_ticker_news_silence.json`.
+
+- **Phase 3 — live findings (analyst lens; daemon `pid 3026236`, log
+  forensics + read-only DB probes + the new feature's live output).
+  user_findings=5:**
+  1. **SNDU is DARK (live confirmation, the new feature's first surfacing).**
+     A held position with zero live mentions in the last 24h — the analyst
+     is blind on it. Worth a manual check (illiquid micro-cap; coverage gap
+     is plausible upstream behaviour, not a daemon bug). LNOK is ECHO with
+     only 1 distinct publisher across 2 mentions — also worth eye-on.
+  2. **Recurring DB lock-retry exhaustion** — 60 `lock retry exhausted`
+     ERRORs in current log window (last few hours), all on `stats` /
+     `insert_batch`. Each one drops a batch. Documented operational issue
+     (memory `di-insert-batch-lock-contention`); not a fresh code bug;
+     sibling-WIP per-connection-isolation work in `storage/article_store.py`
+     targets it (deliberately untouched per the staging discipline).
+  3. **Noise-suppression stack working as designed.** 24h alerted set
+     surfaces legit BREAKING (Samsung 48k strike, NVDA Vera CPU shipping,
+     Iran/UAE drone, MU memory shock) plus YF screener-tape rows that
+     correctly DO NOT push (`urgency=2` + the `[YF/...]` quote-widget gate
+     consuming them silently — verified by paired log lines
+     `suppressed N quote-widget pseudo-article(s)` + `all urgent rows were
+     quote-widget noise — skipping`). One `reddit/r/smallstreetbets` "MU
+     on its way to $800" correctly suppressed by `_filter_low_authority_lone`
+     (cred<0.45). The 4-layer formatter-side defense is holding.
+  4. **Briefing quality EXCELLENT.** id=34 (`T04:39Z`, 50 articles,
+     2872 chars) read end-to-end: Samsung-strike LEAD that correctly
+     hardens last brief's risk into confirmed disruption ("48k workers
+     walk Thursday"), exact MACRO/PORTFOLIO/SEMIS numbers, ALERT VELOCITY
+     hint ("5 vs 13 in prior 5h"), COVERAGE GAP block (SEC EDGAR ~104h
+     dark, NewsAPI ~294h dark — the documented chronic dark collectors).
+     The DESK NOTE ("watch MU $700 break and 30Y UST 5.20% pin") is
+     decisively actionable.
+  5. **Briefing cadence holding:** id32→33→34 = ~5.4h / ~5.85h /
+     ~5.85h vs the 5h target. The `ef839a8` heartbeat-clock fix continues
+     to hold; no 30h+ gaps anywhere in the last 5 briefings.
+
+- **Final verify:** `storage`/`ml.features`/`ml.model` imports OK;
+  focused suite (`test_held_ticker_news_silence + test_alert_source_breakdown +
+  test_alert_dedup + test_briefing_syndication_collapse + test_recap_template_audit
+  + test_source_credibility_audit + test_score_divergence`) **95 passed**
+  in 0.74s. The full `tests/` suite is unrunnable end-to-end this session
+  due to live-daemon USB I/O contention (>3min in `D` state then
+  SIGTERM-at-timeout — documented in memory `pt-test-suite-timing`'s sister
+  pattern for digital-intern under live load). The new feature's own 20
+  tests pass in 0.15s with no DB dependency. *Pre-existing, deliberately
+  never staged* (consistent with every prior entry):
+  `analytics/alert_freshness.py` (sibling untracked) and
+  `collectors/imf_bis_worldbank_collector.py` (sibling untracked); all
+  `paper-trader/*`. The one commit was pathspec-scoped to exactly its
+  2 intended `.py` + test files; `git diff --staged` verified; never
+  `git add -A`. A concurrent four-agent storm was running on this repo
+  throughout (paper-trader core, paper-trader ML, digital-intern, and
+  feature-dev sibling) — this entry was appended, not rewritten; the
+  push was left to the auto-commit daemon per the project memory.
