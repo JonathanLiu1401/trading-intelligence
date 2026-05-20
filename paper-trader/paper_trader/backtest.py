@@ -1465,6 +1465,30 @@ _WORD_TO_TICKER: dict[str, str] = {
     "bitcoin": "BTC-USD", "crypto": "COIN", "coinbase": "COIN",
 }
 
+# Word-boundary regex patterns for `_WORD_TO_TICKER` lookup. A naive
+# `keyword in title_lower` substring match — the old form — false-positively
+# mapped short keys to their tickers on irrelevant articles in the SAME
+# pattern strategy.py was previously broken in (see `strategy._WORD_TO_TICKER_LIVE_PATTERNS`
+# and `tests/test_ml_live_opinion.TestKeywordSubstringFalsePositives`):
+#
+#   * "ai" → TQQQ matched "rain" / "Spain" / "training" / "captain" / "blockchain"
+#   * "gold" → GLD matched "Goldman" (very common in finance headlines)
+#   * "intel" → INTC matched "intelligence" (and "artificial intelligence",
+#     double-counted with the "ai" → TQQQ map)
+#   * "oil" → USO matched "spoiled" / "coil"
+#
+# Every such false positive silently boosted an unrelated ticker's `ticker_scores`
+# weight on every article containing the substring — distorting which ticker
+# wins the per-day buy/sell pick AND poisoning the `decision_outcomes.jsonl`
+# training corpus that retrains the DecisionScorer (the gate the live trader
+# eventually relies on). The fix mirrors the strategy.py side exactly: compile
+# `\bkw\b` once at module import and match via `Pattern.search`. Multi-word
+# keys ("nasdaq rally", "natural gas") still match because `\b` sits between
+# any word/non-word transition — including the space between the two tokens.
+_WORD_TO_TICKER_PATTERNS: dict[str, "re.Pattern[str]"] = {
+    kw: re.compile(rf"\b{re.escape(kw)}\b") for kw in _WORD_TO_TICKER
+}
+
 
 def _article_sentiment(title: str) -> float:
     """Return -1..+1 based on bullish/bearish keyword count in title."""
@@ -1544,8 +1568,19 @@ def _ml_decide(
         # real list value (a non-empty list is truthy; an empty list stays []).
         tickers = list(a.get("tickers") or [])
         title_lower = (a.get("title") or "").lower()
+        # Word-boundary match via pre-compiled patterns — mirrors strategy.py's
+        # `_WORD_TO_TICKER_LIVE_PATTERNS` so the backtest signal extractor and
+        # the live trader treat the same keyword inputs identically. Naive
+        # `word in title_lower` substring matching false-positively aliased
+        # "ai" → TQQQ on "training" / "rain" / "Spain" / "blockchain" / etc.,
+        # silently inflating unrelated tickers' scores and poisoning the
+        # decision_outcomes corpus that retrains the DecisionScorer. See the
+        # `_WORD_TO_TICKER_PATTERNS` block for the full rationale.
         for word, sym in _WORD_TO_TICKER.items():
-            if word in title_lower and sym not in tickers:
+            if sym in tickers:
+                continue
+            pat = _WORD_TO_TICKER_PATTERNS.get(word)
+            if pat is not None and pat.search(title_lower):
                 tickers.append(sym)
         try:
             a_urg = float(a.get("urgency", 0.0) or 0.0)

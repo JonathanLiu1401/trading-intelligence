@@ -1210,6 +1210,103 @@ class TestComputeDecisionOutcomes:
 # ─────────────────────── _ml_decide news-driven behaviour ──────────────────
 
 
+class TestMlDecideScorerGateBoundary:
+    """Pin invariant #5: the DecisionScorer gate engages only at
+    ``_n_train >= 500``. Below that threshold its predictions are too
+    noisy to trust and conviction must be left untouched.
+
+    These tests substitute a controlled scorer-stand-in (no network, no
+    sklearn) and confirm that ``_ml_decide``'s emitted conviction
+    differs (or doesn't) across the n_train=499 / n_train=500 boundary
+    by EXACTLY the amount the gate's strong-headwind arm applies. A
+    regression that lowered/raised the threshold would change the
+    conviction at one of these two probe points and fail loudly.
+    """
+
+    class _FakeScorer:
+        """A drop-in stand-in for DecisionScorer with the minimal contract
+        ``_ml_decide`` uses. Predict returns a fixed value (so the gate
+        boundary is the only moving part). predict_with_meta mirrors
+        ``predict_with_meta``'s honest-meta shape."""
+        def __init__(self, pred: float, n_train: int):
+            self._pred = float(pred)
+            self._n_train = int(n_train)
+            self.is_trained = True
+
+        def predict(self, **kw):
+            return self._pred
+
+        def predict_with_meta(self, **kw):
+            return {
+                "pred": self._pred, "raw": self._pred,
+                "clamped": False, "off_distribution": False,
+            }
+
+    @pytest.fixture
+    def _gated_setup(self, synthetic_prices, monkeypatch):
+        """Yield a callable that runs _ml_decide with a substituted scorer
+        at a given n_train, returning the BUY conviction expressed as
+        notional / total_value."""
+        import paper_trader.backtest as bt
+        # Headwind prediction: scorer.predict() < -10.0 ⇒ the gate's
+        # strong-headwind arm multiplies conviction by 0.6 (#5).
+        HEADWIND_PRED = -20.0
+        p = SimPortfolio(cash=100_000.0)
+        rng = random.Random(0)
+        d = synthetic_prices.trading_days[-1]
+        articles = [{"title": "Nvidia beats earnings, guidance raised, "
+                              "semiconductor surge",
+                     "score": 10.0, "tickers": ["NVDA"]}]
+
+        def _run(n_train: int) -> float:
+            monkeypatch.setattr(
+                bt, "_DECISION_SCORER",
+                self._FakeScorer(HEADWIND_PRED, n_train),
+                raising=False,
+            )
+            decision = _ml_decide(d, p, articles, synthetic_prices,
+                                  run_id=1, rng=rng)
+            assert decision["action"] == "BUY"
+            assert decision["ticker"] == "NVDA"
+            price = synthetic_prices.price_on("NVDA", d)
+            return (decision["qty"] * price) / p.total_value(synthetic_prices, d)
+
+        return _run
+
+    def test_gate_inactive_below_threshold(self, _gated_setup):
+        """n_train=499 → gate skipped → conviction unmodified at 0.25
+        (the synthetic_prices regime is "unknown" → mult 1.0, NVDA is
+        not leveraged → 0.25 cap binds, see TestMlDecide above)."""
+        conviction = _gated_setup(n_train=499)
+        # 0.25 is the conviction cap from the non-leveraged-ETF arm.
+        assert conviction == pytest.approx(0.25, abs=1e-6), (
+            f"With n_train=499 the gate must NOT engage (invariant #5); "
+            f"observed conviction {conviction:.4f} != 0.25 means the "
+            f"threshold has drifted below 500"
+        )
+
+    def test_gate_active_at_threshold(self, _gated_setup):
+        """n_train=500 → gate engages on strong headwind (-20% prediction)
+        → conviction × 0.6 = 0.15."""
+        conviction = _gated_setup(n_train=500)
+        # 0.25 base × 0.6 headwind multiplier = 0.15
+        assert conviction == pytest.approx(0.15, abs=1e-6), (
+            f"With n_train=500 the gate's strong-headwind arm must "
+            f"apply ×0.6 (invariant #5); observed conviction "
+            f"{conviction:.4f} != 0.15 means the gate arms changed or "
+            f"the threshold drifted above 500"
+        )
+
+    def test_gate_boundary_difference(self, _gated_setup):
+        """The difference between n_train=499 and n_train=500 conviction
+        is EXACTLY the headwind multiplier — pins the boundary AND the
+        arm value in one assertion (any change to either fails here)."""
+        below = _gated_setup(n_train=499)
+        at = _gated_setup(n_train=500)
+        # The strong-headwind arm multiplies conviction by 0.6.
+        assert at / below == pytest.approx(0.6, abs=1e-6)
+
+
 class TestMlDecideNewsRanking:
     """Locks `_ml_decide` ranking: an article with HIGHER kw/ai score on a
     given ticker must dominate over a tie/low-score competitor. Without this,
