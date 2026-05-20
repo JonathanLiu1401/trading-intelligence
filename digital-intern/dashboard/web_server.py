@@ -2598,6 +2598,24 @@ def create_app(store=None) -> Flask:
             "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         })
 
+    @app.get("/api/score-distribution")
+    def api_score_distribution():
+        """ai_score drift surface: 24h histogram + 7d baseline + mean delta.
+
+        Backed by ml.score_distribution.snapshot() — read-only, SQL-aggregated,
+        with bounded-sample percentiles so it stays cheap on the multi-GB
+        USB-backed DB.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            from ml.score_distribution import snapshot as _score_snapshot
+            snap = _score_snapshot()
+        except Exception as exc:
+            return jsonify({"error": f"snapshot failed: {exc}"}), 500
+        snap["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return jsonify(snap)
+
     @app.get("/healthz")
     @app.get("/api/health")
     def healthz():
