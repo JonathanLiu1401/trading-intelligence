@@ -90,6 +90,7 @@ from collectors.hackernews_collector import collect_hackernews
 from collectors.sec_xbrl_financials import collect_sec_xbrl_financials
 from collectors.usgs_earthquake_collector import collect_usgs_earthquakes
 from collectors.sec_13f_collector import collect_13f_filings
+from collectors.nasdaq_halts_collector import collect_nasdaq_halts
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -159,6 +160,7 @@ HACKERNEWS_INTERVAL     = 300     # Hacker News front-page + finance/business st
 SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
 SEC_13F_INTERVAL        = 1800      # SEC 13F institutional holdings — every 30min (quarterly season)
 USGS_QUAKE_INTERVAL     = 1800    # USGS M≥5 earthquake feed every 30min (insurance/semis/energy catalyst)
+NASDAQ_HALTS_INTERVAL   = 120     # NASDAQ/UTP trading halt+resume feed every 2min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
 EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
@@ -252,6 +254,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "sec_xbrl": SEC_XBRL_INTERVAL,
     "sec_13f": SEC_13F_INTERVAL,
     "usgs_quake": USGS_QUAKE_INTERVAL,
+    "nasdaq_halts": NASDAQ_HALTS_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
     "ml_trainer": ML_TRAIN_INTERVAL,
@@ -1351,6 +1354,28 @@ def usgs_quake_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(USGS_QUAKE_INTERVAL)
+
+
+# ── Worker: NASDAQ/UTP trading halts — every 2min ────────────────────────────
+def nasdaq_halts_worker(store: ArticleStore):
+    log.info("[nasdaq_halts_worker] started")
+    bo = Backoff("nasdaq_halts", base=30.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_nasdaq_halts()
+            _ingest(store, articles, "nasdaq_halts")
+            try:
+                source_health.record_result("nasdaq_halts", len(articles))
+            except Exception as he:
+                log.warning(f"[nasdaq_halts_worker] source_health error: {he}")
+            _worker_last_ok["nasdaq_halts"] = time.time()
+            log.debug(f"[nasdaq_halts] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[nasdaq_halts_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(NASDAQ_HALTS_INTERVAL)
 
 
 # ── Worker: Global financial regulators — every 30min ────────────────────────
@@ -2651,6 +2676,7 @@ def main():
         ("sec_xbrl",    sec_xbrl_worker),
         ("sec_13f",     sec_13f_worker),
         ("usgs_quake",  usgs_quake_worker),
+        ("nasdaq_halts", nasdaq_halts_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
