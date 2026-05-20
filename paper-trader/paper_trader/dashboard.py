@@ -10873,15 +10873,33 @@ def launcher_restart_loop_api():
         log_path = Path(__file__).resolve().parent.parent / "logs" / "runner.log"
         max_bytes = 64 * 1024  # last ~64KB is plenty for a launcher-loop window
         lines: list[str] = []
+        log_size_bytes: int | None = None
+        log_age_seconds: float | None = None
         if log_path.exists():
-            size = log_path.stat().st_size
+            st = log_path.stat()
+            log_size_bytes = int(st.st_size)
+            # Wall-clock age of the file — ctime is closest to "when did this
+            # log first start growing"; falls back to mtime if unavailable.
+            try:
+                import time as _t
+                ref = st.st_ctime or st.st_mtime
+                if ref:
+                    age = _t.time() - float(ref)
+                    if age > 0:
+                        log_age_seconds = age
+            except Exception:
+                pass
             with log_path.open("rb") as fh:
-                if size > max_bytes:
-                    fh.seek(size - max_bytes)
+                if log_size_bytes > max_bytes:
+                    fh.seek(log_size_bytes - max_bytes)
                     fh.readline()  # discard partial first line
                 raw = fh.read()
             lines = raw.decode("utf-8", errors="replace").splitlines()
-        result = build_launcher_restart_loop(lines)
+        result = build_launcher_restart_loop(
+            lines,
+            log_size_bytes=log_size_bytes,
+            log_age_seconds=log_age_seconds,
+        )
         result["log_path"] = str(log_path)
         return jsonify(result)
     except Exception as e:
