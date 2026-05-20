@@ -2309,6 +2309,69 @@ def _decision_clock_line(store) -> str:
         return ""
 
 
+def _streak_line(store) -> str:
+    """One-line "am I on a hot-hand or a tilt-risk run right now?" for the
+    hourly / daily report.
+
+    ``/api/streak`` exposes the closed-round-trip streak structure
+    (HOT_HAND when a STABLE book lands a ≥4-win run, TILT_RISK on a ≥4-loss
+    run) on the *dashboard* — but the operator lives in Discord and never
+    opens it (the exact dashboard→Discord gap ``_capital_pulse_line`` /
+    ``_hold_discipline_line`` / ``_heartbeat_line`` each closed, one
+    dimension over: structural risk → process health → behavioural run).
+    A trader on a 4-loss run who keeps adding risk is exactly the
+    classic loss-cluster tilt this verdict exists to flag, and a 4+
+    win cluster is the overconfidence trap a desk reviews before adding
+    more size — neither surfaced anywhere the operator reads today.
+
+    Composes ``build_streak`` **verbatim** (single source of truth,
+    AGENTS.md invariant #10 — the headline / verdict are the builder's,
+    never re-derived here, so this Discord line and ``/api/streak`` can
+    never tell different stories) and feeds it the EXACT same store
+    read the endpoint does (``recent_trades(2000)`` reversed oldest-
+    first, the ``build_streak`` contract). **Pure store reads only —
+    NO network** (the Discord-path discipline; the
+    ``_capital_pulse_line`` precedent). Observational only, never gates,
+    adds no caps (invariants #2/#12 — the ``_hold_discipline_line``
+    precedent). Failure contract mirrors the rest of ``reporter``: any
+    builder/store fault degrades to ``""`` ("no streak line this
+    report"), **never** an exception ("no Discord summary this report").
+
+    Suppression — surface ONLY the two actionable verdicts a desk acts
+    on, so a balanced book or insufficient sample adds no hourly noise
+    (the summary must never become its own lying green light — the
+    ``_hold_discipline_line`` NO_DATA / ``_decision_clock_line``
+    EVEN_DISTRIBUTION suppression precedent):
+      * ``HOT_HAND``   (≥4-win cluster) → ALWAYS surfaced — the
+        overconfidence trap a desk reviews before adding size.
+      * ``TILT_RISK``  (≥4-loss cluster) → ALWAYS surfaced — the
+        loss-cluster tilt every PM steps back from.
+      * ``NEUTRAL`` / ``EMERGING`` / ``NO_DATA`` (and any non-verdict)
+        → silent (nothing actionable — the ``_hold_discipline_line``
+        NO_DATA / ``_decision_clock_line`` EVEN_DISTRIBUTION
+        precedent).
+    """
+    try:
+        from .analytics.streak import build_streak
+        # ``build_streak`` expects oldest → newest; store hands back
+        # newest-first (the canonical store contract — same reversal
+        # the ``_realized_pl_today`` / ``_trade_impact_line`` paths use).
+        trades = list(reversed(store.recent_trades(2000)))
+        sk = build_streak(trades)
+        if not isinstance(sk, dict):
+            return ""
+        verdict = sk.get("verdict")
+        if verdict not in ("HOT_HAND", "TILT_RISK"):
+            return ""
+        headline = sk.get("headline") or ""
+        if not headline:
+            return ""
+        return f"**STREAK** ◈ {verdict}\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] streak line skipped: {e}")
+        return ""
+
+
 def _ago(seconds: float) -> str:
     """Compact human age: `45m` / `3h` / `2d`. Sub-minute reads `0m`."""
     seconds = max(0.0, float(seconds))
@@ -2610,6 +2673,14 @@ def send_hourly_summary() -> bool:
     ndr = _no_decision_reasons_line(store)
     if ndr:
         body += "\n" + ndr
+    # STREAK sits last among the behavioural blocks — surfaces HOT_HAND
+    # (overconfidence trap) or TILT_RISK (loss-cluster bias) from
+    # closed round-trip outcomes. Silent on a balanced/young book (the
+    # _decision_clock / _hold_discipline suppression precedent — the
+    # summary must never become its own lying green light).
+    sk = _streak_line(store)
+    if sk:
+        body += "\n" + sk
     return _send(body)
 
 
@@ -2733,4 +2804,9 @@ def send_daily_close() -> bool:
     ndr = _no_decision_reasons_line(store)
     if ndr:
         body += "\n" + ndr
+    # See send_hourly_summary STREAK rationale — daily close mirrors the
+    # block placement so the operator sees the same surface on both reports.
+    sk = _streak_line(store)
+    if sk:
+        body += "\n" + sk
     return _send(body)
