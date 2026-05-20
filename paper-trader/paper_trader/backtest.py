@@ -2182,7 +2182,7 @@ class BacktestEngine:
         # Standalone runs (e.g. `python3 run_backtests.py`) get a sane default
         # equal to the pre-refactor hardcoded window so the one-shot launcher
         # keeps working without arg-plumbing changes. Continuous loop overrides.
-        if not any(model_id.startswith(p) for p in self._VALID_MODEL_PREFIXES):
+        if not (model_id == "ml_quant" or model_id.startswith(("claude-", "hf/"))):
             raise ValueError(
                 f"Invalid model_id {model_id!r}. Must start with one of "
                 f"{self._VALID_MODEL_PREFIXES}"
@@ -2854,7 +2854,8 @@ class BacktestEngine:
                 print(f"[engine] RUN {i} CRASHED: {e}")
                 traceback.print_exc()
                 self.store.upsert_run(i, 0, "failed",
-                                      start=self.start, end=self.end)
+                                      start=self.start, end=self.end,
+                                      model_id=self.model_id)
                 return None
 
         with ThreadPoolExecutor(max_workers=n) as pool:
