@@ -843,7 +843,20 @@ def _persist_volume_cache_for_window(start: date, end: date) -> None:
             flat = {ticker: series
                     for (ticker, s, e), series in _VOLUME_CACHE.items()
                     if (s, e) == key}
-        path.write_text(json.dumps(flat))
+        # Atomic write — `path.write_text` is NOT atomic: a process kill (OOM
+        # / SIGKILL) mid-write leaves a truncated/torn JSON file. The next
+        # `_load_volume_cache_for_window` then fails `json.loads`, falls back
+        # to an empty dict, and the bookkeeping marks the window "loaded";
+        # subsequent vol_ratio computations re-fetch from yfinance on every
+        # single decision for the whole window. Worse, a CONCURRENT loader
+        # (the disk-load helper in another thread) can read a partially-
+        # written file. Mirrors the atomic-write idiom already used by
+        # `train_scorer` (scorer.pkl.tmp), the outcomes-file trim, and the
+        # validation persister — all of which document the same class of
+        # "a process kill mid-write would corrupt the artifact" failure.
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(flat))
+        tmp.replace(path)
     except Exception as e:
         print(f"[volume_cache] persist failed: {e}")
 
