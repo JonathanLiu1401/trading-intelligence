@@ -4865,3 +4865,131 @@ origin/master (`916f87a`, `81ffe13`).
        memory-only call. Worth a one-line dashboard endpoint in a future
        pass — not done here (dashboard/web_server.py is large; out of
        single-commit scope).
+
+
+## 2026-05-20 — Hybrid pass (source-credibility prefix-alias rescue + audit)
+
+- **Phase 1 — bugs_fixed=1.** **Source-credibility resolver silently
+  defaulted three high-volume aggregator-prefix tag conventions** —
+  `ml/features.py::_source_credibility`. Tags like `GN: <topic>` (Google
+  News topic feeds defined in `config/sources.json`), `YF/<bucket>`
+  (Yahoo Finance screener-tape entries from
+  `collectors/market_movers.py`), and `YahooFinance/<symbol>` (Yahoo per-
+  ticker RSS via `collectors/yahoo_ticker_rss.py`) all carry no dotted
+  publisher host (so `_domain_candidates` yields `[]`) AND are missed by
+  the verbatim word-boundary scan — either because the label spelling
+  has no entry in `SOURCE_CRED` (`GN:` vs the key "googlenews", `YF/`
+  vs "yfinance") or because the embedded publisher token is glued to
+  the next token without a `\b` ("yahoo" inside "yahoofinance"). All
+  three silently fell to `DEFAULT_SOURCE_CRED=0.55`.
+
+  Live evidence (2026-05-20, 24h snapshot): **5,376 `GN: <topic>` rows
+  + ~95 `YF/<bucket>` + ~hundreds of `YahooFinance/<symbol>` all at the
+  floor default**, flattening feature[0] for the ArticleNet relevance
+  head and reading every such tag as "unknown source" in
+  `watchers.alert_agent._filter_low_authority_lone` (0.55 > 0.45, so
+  the lone-alert gate also can't down-rate them — "unknown is never
+  gated", correctly).
+
+  * `ml/features.py`: added `_PREFIX_ALIASES` — an ordered tuple of
+    `(prefix, score)` checked AFTER `_domain_candidates` and BEFORE the
+    verbatim `_SOURCE_CRED_PATTERNS` scan. Match is anchored
+    case-insensitive `startswith` on the lstripped tag, so `"EFGN: x"`
+    cannot match the `gn:` alias (substring guard pinned by a test).
+    Each alias resolves to a publisher grade that ALREADY exists in
+    `SOURCE_CRED` (`gn:` → `googlenews` = 0.62, `yf/` → `yfinance` =
+    0.65, `yahoofinance/` → `yahoo` = 0.65) — strictly additive Phase-1
+    contract, same shape as `_DOMAIN_CRED`: every alias value `>=
+    DEFAULT`, no host moved downward, every already-non-default tag
+    keeps its EXACT pre-fix grade (the alias step runs after the
+    domain step, and the verbatim scan still serves non-aliased tags
+    unchanged — `Finnhub/Yahoo` still returns 0.65 because "yahoo" is
+    ordered before "finnhub" in `SOURCE_CRED`, the spelling-order
+    discriminator pinned by `test_already_differentiated_tags_still_unchanged`).
+
+  Pinned by `tests/test_source_credibility_domains.py::TestPrefixAliasesRescueAggregatorTags`
+  (11 new cases): per-tag rescue parametrise for all three prefix
+  conventions; alias values never below DEFAULT; aliases only resolve to
+  existing `SOURCE_CRED` grades (anti-drift discipline — adding an alias
+  is a *spelling rescue*, never an opinionated new grade); anchored
+  startswith vs substring discriminator; and a belt-and-braces parity
+  check on the high-volume already-differentiated tags
+  (`Finnhub/Yahoo`, `yfinance/AFP`, `reddit/r/Daytrading`,
+  `GDELT/finance.yahoo.com`) so the new alias step cannot regress them.
+
+- **Phase 2 — features_added=1.** **Source-credibility coverage audit**
+  — `analytics/source_credibility_audit.py`. The standing leading-
+  indicator for the bug class Phase 1 just fixed: walks the recent
+  live-window of `articles.db`, partitions every observed source tag
+  by whether `_source_credibility(tag) == DEFAULT_SOURCE_CRED`, and
+  reports the top N defaulting tags by row count plus a
+  `defaulting_share` ratio (the fraction of live rows whose feature[0]
+  is the floor default).
+
+  Live evidence (post-fix, 24h window): `defaulting_share=0.1448`
+  (1,372 of 9,477 live rows), `defaulting_sources=72`. Top remaining
+  defaulters surface real publishers the maintenance team has not yet
+  graded: `Nasdaq Markets` (147), `GlobeNewswire` (127),
+  `Motley Fool` (110), `PR Newswire Tech` (108),
+  `Economic Times India Markets` (84), `Investing.com` (83),
+  `FXStreet News` (65), etc. The audit makes this maintenance backlog
+  queryable instead of buried in `articles.db`.
+
+  * Read-only by construction: `_RoStore` opens a fresh `mode=ro` URI
+    connection (same shape as
+    `analytics.recap_template_audit._RoStore` /
+    `ml.label_audit._RoStore`) — never the daemon's shared `self.conn`
+    (the documented shared-connection cursor-collision hazard).
+  * `_LIVE_ONLY_CLAUSE` enforces backtest isolation on BOTH sides of
+    the partition (a synthetic injection burst cannot inflate the
+    defaulting numerator nor mask a real default by adding to the
+    differentiated denominator). The inline constant is pinned
+    byte-identical to `storage.article_store._LIVE_ONLY_CLAUSE` by
+    `TestLiveOnlyClauseInSync` — same anti-drift discipline as
+    `analytics.recap_template_audit.LIVE_ONLY_CLAUSE`.
+  * `OK_THRESHOLD = 0.25` — the maintenance team's accepted defaulting
+    share. Tuned generously against the post-fix snapshot (~14.5%);
+    `ok=False` only fires when a *new* large-volume aggregator prefix
+    is ingesting unrecognised, telling the team it's time to add
+    another `_PREFIX_ALIASES` / `_DOMAIN_CRED` entry. Same "omit when
+    below threshold, raise when above" discipline as
+    `analytics.recap_template_audit`'s `leaked_to_strong_pool` /
+    `ok` gate.
+  * CLI: `python3 -m analytics.source_credibility_audit --hours 24
+    --top 15` prints a JSON report and exits non-zero when the share
+    crosses `OK_THRESHOLD` (cron-friendly).
+
+  Pinned by `tests/test_source_credibility_audit.py` (10 cases):
+  inline-clause byte-parity vs storage; partition splits known/unknown
+  / handles empty-source as defaulting / honours the Phase-1
+  prefix-alias rescue (rescued tags MUST NOT appear in `top_defaulting`,
+  otherwise the audit would signal a leak the resolver already
+  closed); leaderboard count-desc + alphabetical-tiebreak; share &
+  count arithmetic; `ok` flips at the threshold; empty-window
+  fast-path; backtest synthetic rows excluded from both sides; `top`
+  param caps; `format_report` round-trips through `json.loads`.
+
+- **Phase 3 — live findings (user_findings=4).**
+    1. **Defaulting-share post-fix at ~14.5%** — Phase-1 alias rescue
+       lifted ~5,471 rows/24h off the floor, but the audit still flags
+       72 distinct unknown tags accounting for 1,372 rows. Real
+       publishers worth grading in a future pass: `Nasdaq Markets`,
+       `Motley Fool`, `GlobeNewswire`, `PR Newswire Tech`,
+       `Economic Times India Markets`, `Investing.com`, `FXStreet
+       News`, `Financial Post` — each consistently > 50 rows/24h.
+       Scope-cap discipline: NOT done in this pass (adding new
+       publisher grades is an opinionated tier choice, not a spelling
+       rescue — out of single-commit scope).
+    2. **Worker fleet healthy at scrape time** — `health_report ok=32
+       dead=0` per `logs/daemon.log` 05:37Z. Every long-cadence worker
+       (`alphavantage` ≤30 min, `newsapi` ≤25 min, `recursive_labeler`
+       ≤4h) inside its liveness deadline. No stale-pings warnings.
+    3. **Briefings on schedule** — latest 5 at `T04:39 / T22:48 /
+       T17:12 / T12:08 / T04:19` UTC, each `article_count=50`. The 5h
+       cadence holds across the day boundary.
+    4. **Sources gone dark > 12h** — `scraped/www.bloomberg.com` last
+       seen `T14:55Z` (suspected Bloomberg-side anti-scrape); the
+       three EIA feeds (`eia_press`, `eia_today`) silent ~22h; several
+       `AlphaVantage/<publisher>` sub-feeds intermittently dark
+       (quota-throttling, expected). Not fresh bugs; surfaced for
+       maintenance triage.
