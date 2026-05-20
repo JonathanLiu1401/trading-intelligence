@@ -615,11 +615,55 @@ def _window_delta(equity_asc: list[dict], since_iso: str) -> dict | None:
     return out or None
 
 
+def _realized_pl_window(trades_newest_first: list[dict],
+                        since_iso: str) -> tuple[float, int, int] | None:
+    """True realized P/L from round-trips that **closed** at or after
+    ``since_iso`` (UTC ISO-8601).
+
+    The hourly ``_session_block`` showed decision activity, the best/worst
+    open mover, and the portfolio %Δ over the window — but never the one
+    number a portfolio manager actually reads first: "what did I lock in
+    this hour?". ``_realized_pl_today`` answers the same question for the
+    daily close (UTC-date startswith); this is the same arithmetic with a
+    proper ISO comparison instead of a date-only ``startswith``, so any
+    window (1h / 4h / 24h / since-last-summary) can ask "how much did the
+    desk realize over THIS slice".
+
+    Consumes ``build_round_trips`` (single source of truth, invariant #10
+    — the same SSOT ``_realized_pl_today`` and ``/api/trade-asymmetry``
+    feed off; this surface and the daily-close surface can never disagree
+    on what counts as a closed trip). ``exit_ts`` is the closing-SELL's
+    timestamp written by ``store.record_trade`` (UTC ISO-8601), so a
+    lexical ``>=`` against ``since_iso`` is byte-correct (the
+    ``signals.py`` first_seen precedent; both sides are fixed-offset UTC).
+
+    Returns ``(pnl_usd, n_closed, n_wins)`` or ``None`` when nothing
+    closed in the window OR on any failure (additive contract: a fault
+    drops just this one line, never the whole report — the
+    ``_realized_pl_today`` precedent).
+    """
+    try:
+        from .analytics.round_trips import build_round_trips
+        rts = [
+            rt for rt in build_round_trips(list(reversed(trades_newest_first)))
+            if (rt.get("exit_ts") or "") >= since_iso
+        ]
+        if not rts:
+            return None
+        pnl = sum(float(rt.get("pnl_usd") or 0.0) for rt in rts)
+        wins = sum(1 for rt in rts if (rt.get("pnl_usd") or 0.0) > 0)
+        return pnl, len(rts), wins
+    except Exception as e:
+        print(f"[reporter] realized-pl-window skipped: {e}")
+        return None
+
+
 def _session_block(store, window_hours: float, label: str) -> str:
     """Compact "what the desk actually did this <label>" block for the
     hourly / daily-close report: the decision-activity mix (did the bot
-    *do* anything, or sit on its hands?), the best/worst open mover, and
-    the portfolio-vs-SPY delta over the window.
+    *do* anything, or sit on its hands?), the best/worst open mover, the
+    portfolio-vs-SPY delta over the window, AND the true realized P/L
+    from round-trips that closed in the window.
 
     Composed purely from existing store reads — no new state, no caps,
     observational only (the `_behavioural_block` precedent; invariants
@@ -661,6 +705,19 @@ def _session_block(store, window_hours: float, label: str) -> str:
                 seg += (f"  spy `{d['spy_pct']:+.2f}%`  "
                         f"alpha `{d['alpha_pct']:+.2f}%`")
             lines.append(seg)
+        # Realized P/L from round-trips that closed in this window — the one
+        # number the daily close already shows that the hourly never did. A
+        # fault drops just this line (the additive contract); the rest of the
+        # SESSION block still ships.
+        rp = _realized_pl_window(store.recent_trades(5000), since)
+        if rp is not None:
+            pnl, n_closed, n_wins = rp
+            n_losses = n_closed - n_wins
+            trip_word = "trip" if n_closed == 1 else "trips"
+            lines.append(
+                f"Closed {n_closed} {trip_word} ({n_wins}W/{n_losses}L) "
+                f"realized `${pnl:+.2f}`"
+            )
         return "\n".join(lines)
     except Exception as e:
         print(f"[reporter] session block skipped: {e}")
