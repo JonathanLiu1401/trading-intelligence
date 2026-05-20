@@ -177,6 +177,59 @@ class TestHindsightLabelFilter:
         assert len(recs) == 1
         assert recs[0]["score"] == pytest.approx(3.2)
 
+    def test_hindsight_contaminated_urgency_is_zeroed(self, tmp_path, monkeypatch):
+        # The urgency column is also computed by ArticleNet at first_seen
+        # time. If first_seen is 8 years after published, both ai_score AND
+        # urgency are forward-looking. The score gets replaced by kw_score
+        # already — urgency must be zeroed too, or the news_urgency feature
+        # leaks future knowledge into the DecisionScorer training set.
+        old = "2018-03-15"
+        today = date.today().isoformat()
+        db = _make_articles_db(tmp_path / "articles.db", [
+            {"published": old, "first_seen": today,
+             "ai_score": 4.8, "kw_score": 2.5,
+             "urgency": 95.0,
+             "url": "https://news.com/old-contaminated"},
+        ])
+        monkeypatch.setattr("paper_trader.backtest.LOCAL_ARTICLES_DB", db)
+
+        from paper_trader.backtest import BacktestEngine
+        engine = BacktestEngine.__new__(BacktestEngine)
+        engine.start = date(2018, 1, 1)
+        engine.end = date(2019, 1, 1)
+        engine._merge_sec_cache = lambda result: 0
+        articles = engine._load_local_articles()
+        recs = articles.get(old, [])
+        assert len(recs) == 1
+        # Hindsight-contaminated → urgency zeroed, NOT 95.0
+        assert recs[0]["hindsight_contaminated"] is True
+        assert recs[0]["urgency"] == 0.0
+
+    def test_fresh_article_urgency_is_preserved(self, tmp_path, monkeypatch):
+        # A FRESH article (no hindsight contamination) must retain its
+        # original urgency value — the zero-out applies only to contaminated
+        # rows.
+        fresh = (date.today() - timedelta(days=1)).isoformat()
+        today = date.today().isoformat()
+        db = _make_articles_db(tmp_path / "articles.db", [
+            {"published": fresh, "first_seen": today,
+             "ai_score": 4.5, "kw_score": 1.0,
+             "urgency": 88.0,
+             "url": "https://news.com/fresh-urg"},
+        ])
+        monkeypatch.setattr("paper_trader.backtest.LOCAL_ARTICLES_DB", db)
+
+        from paper_trader.backtest import BacktestEngine
+        engine = BacktestEngine.__new__(BacktestEngine)
+        engine.start = date.today() - timedelta(days=30)
+        engine.end = date.today()
+        engine._merge_sec_cache = lambda result: 0
+        articles = engine._load_local_articles()
+        recs = articles.get(fresh, [])
+        assert len(recs) == 1
+        assert recs[0]["hindsight_contaminated"] is False
+        assert recs[0]["urgency"] == pytest.approx(88.0)
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # audit_label_contamination
