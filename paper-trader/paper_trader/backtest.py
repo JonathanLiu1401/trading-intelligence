@@ -775,6 +775,14 @@ class PriceCache:
 # against an unrelated window's history.
 _VOLUME_CACHE: dict[tuple[str, str, str], dict[str, float]] = {}
 _VOLUME_CACHE_LOCK = threading.Lock()
+# Serializes the tmp open→write→replace in `_persist_volume_cache_for_window`
+# so two backtest threads that both fetched a fresh volume series in the same
+# window can't concurrently `open(..., 'w')` the SAME `.json.tmp` (O_TRUNC,
+# interleaved writes → torn JSON under canonical via `.replace`). The cache
+# snapshot itself runs under `_VOLUME_CACHE_LOCK` above; this is a SEPARATE
+# (write-only) lock so a cache reader/writer is never blocked by an in-flight
+# disk write. See `_persist_volume_cache_for_window` for the full rationale.
+_VOLUME_PERSIST_LOCK = threading.Lock()
 # Track which (start, end) windows we've already loaded from disk into memory.
 # Uses an OrderedDict to preserve insertion order so we can evict the oldest
 # window when bounded growth hits the cap. The continuous loop picks a fresh
@@ -869,9 +877,22 @@ def _persist_volume_cache_for_window(start: date, end: date) -> None:
         # `train_scorer` (scorer.pkl.tmp), the outcomes-file trim, and the
         # validation persister — all of which document the same class of
         # "a process kill mid-write would corrupt the artifact" failure.
+        #
+        # Serialize the tmp open→write→replace under a separate persist
+        # lock. Two run threads that each fetched a volume series in the
+        # same window both reach this persist concurrently; with the
+        # shared `".json.tmp"` filename they would `open(..., 'w')`
+        # (O_TRUNC) the SAME file in parallel and their writes can
+        # interleave at the OS level → a torn JSON tmp could land under
+        # `path` via `replace`. The serialization is a no-op in the common
+        # single-window case (the snapshot above happened under the
+        # cache lock, releasing it before this short write); only
+        # concurrent persists for the SAME window contend, and they
+        # write the same snapshot anyway so last-writer-wins is correct.
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(flat))
-        tmp.replace(path)
+        with _VOLUME_PERSIST_LOCK:
+            tmp.write_text(json.dumps(flat))
+            tmp.replace(path)
     except Exception as e:
         print(f"[volume_cache] persist failed: {e}")
 
