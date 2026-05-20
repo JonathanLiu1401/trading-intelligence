@@ -81,6 +81,7 @@ from collectors.boj_press_collector import collect_boj_press
 from collectors.boe_press_collector import collect_boe_press
 from collectors.g10_central_banks_collector import collect_g10_central_banks
 from collectors.global_regulators_collector import collect_global_regulators
+from collectors.imf_bis_worldbank_collector import collect_imf_bis_worldbank
 from collectors.globenewswire_collector import collect_globenewswire
 from collectors.hackernews_collector import collect_hackernews
 from collectors.sec_xbrl_financials import collect_sec_xbrl_financials
@@ -147,6 +148,7 @@ BOJ_PRESS_INTERVAL      = 1800    # Bank of Japan press / speech / MPM RSS — e
 BOE_PRESS_INTERVAL      = 1800    # Bank of England press / publications RSS — every 30min
 G10_CB_INTERVAL         = 1800    # Bank of Canada + RBA press / speeches RSS — every 30min
 GLOBAL_REG_INTERVAL     = 1800    # FSB, FCA, Fed research notes/papers — every 30min
+BIS_INTERVAL            = 1800    # BIS press releases, speeches, research — every 30min
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
 HACKERNEWS_INTERVAL     = 300     # Hacker News front-page + finance/business stories — every 5min
 SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
@@ -238,6 +240,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "boe_press": BOE_PRESS_INTERVAL,
     "g10_cb": G10_CB_INTERVAL,
     "global_reg": GLOBAL_REG_INTERVAL,
+    "bis": BIS_INTERVAL,
     "globenewswire": GLOBENEWSWIRE_INTERVAL,
     "hackernews": HACKERNEWS_INTERVAL,
     "sec_xbrl": SEC_XBRL_INTERVAL,
@@ -1321,6 +1324,28 @@ def global_reg_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(GLOBAL_REG_INTERVAL)
+
+
+# ── Worker: BIS press releases, speeches, research — every 30min ─────────────
+def bis_worker(store: ArticleStore):
+    log.info("[bis_worker] started")
+    bo = Backoff("bis", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_imf_bis_worldbank()
+            _ingest(store, articles, "bis")
+            try:
+                source_health.record_result("bis", len(articles))
+            except Exception as he:
+                log.warning(f"[bis_worker] source_health error: {he}")
+            _worker_last_ok["bis"] = time.time()
+            log.debug(f"[bis] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[bis_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(BIS_INTERVAL)
 
 
 # ── Worker: GlobeNewswire financial press releases — every 10min ─────────────
@@ -2569,6 +2594,7 @@ def main():
         ("boe_press",   boe_press_worker),
         ("g10_cb",      g10_cb_worker),
         ("global_reg",  global_reg_worker),
+        ("bis",         bis_worker),
         ("globenewswire", globenewswire_worker),
         ("hackernews",  hackernews_worker),
         ("sec_xbrl",    sec_xbrl_worker),
