@@ -96,7 +96,8 @@ def isolated_caches(tmp_path, monkeypatch):
     monkeypatch.setattr(bt, "AV_QUOTA_PATH", cache_dir / "av_quota.json")
     # Reset volume cache state so a previous test's data doesn't bleed in.
     monkeypatch.setattr(bt, "_VOLUME_CACHE", {})
-    monkeypatch.setattr(bt, "_VOLUME_CACHE_DISK_LOADED", set())
+    from collections import OrderedDict as _OD
+    monkeypatch.setattr(bt, "_VOLUME_CACHE_DISK_LOADED", _OD())
     # Redirect backtest.db to a temp path too.
     monkeypatch.setattr(bt, "BACKTEST_DB", tmp_path / "backtest.db")
     # Tiny watchlist so test fakes stay cheap.

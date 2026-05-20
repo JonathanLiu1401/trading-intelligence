@@ -408,7 +408,95 @@ class TestParseDecision:
         assert d["ticker"] == "AMD"
 
 
-# ─────────────────────── volume cache concurrency ─────────────────────
+# ─────────────────────── volume cache bounded LRU ─────────────────────
+
+class TestVolumeCacheBoundedLRU:
+    """Bound the in-memory volume cache so the continuous loop's parade of
+    random per-cycle windows can't silently leak tens of MB of cached
+    per-ticker volume series over a day of running.
+
+    The eviction is LRU-on-load (touched on access via ``move_to_end``).
+    Each evicted window drops its per-ticker entries from ``_VOLUME_CACHE``
+    so memory is actually reclaimed — not just bookkeeping."""
+
+    def _seed_windows(self, n, bt, monkeypatch):
+        from collections import OrderedDict as _OD
+        monkeypatch.setattr(bt, "_VOLUME_CACHE", {})
+        monkeypatch.setattr(bt, "_VOLUME_CACHE_DISK_LOADED", _OD())
+        for i in range(n):
+            start = date(2010, 1, 1) + timedelta(days=i * 30)
+            end = start + timedelta(days=365)
+            # Directly populate as if a disk-load had landed; mirror the load
+            # helper's bookkeeping (window key in the OrderedDict).
+            with bt._VOLUME_CACHE_LOCK:
+                bt._VOLUME_CACHE[("NVDA", start.isoformat(), end.isoformat())] = {
+                    start.isoformat(): 1_000_000.0 + i,
+                }
+                bt._VOLUME_CACHE[("AMD", start.isoformat(), end.isoformat())] = {
+                    start.isoformat(): 500_000.0 + i,
+                }
+                bt._VOLUME_CACHE_DISK_LOADED[(start.isoformat(), end.isoformat())] = True
+        return [
+            (date(2010, 1, 1) + timedelta(days=i * 30),
+             date(2010, 1, 1) + timedelta(days=i * 30 + 365))
+            for i in range(n)
+        ]
+
+    def test_evicts_oldest_when_cap_exceeded(self, monkeypatch):
+        import paper_trader.backtest as bt
+
+        # Cap at 4 so the test is small and deterministic.
+        monkeypatch.setattr(bt, "_VOLUME_CACHE_MAX_WINDOWS", 4)
+        windows = self._seed_windows(4, bt, monkeypatch)
+        # No eviction yet — at the cap, not above.
+        with bt._VOLUME_CACHE_LOCK:
+            assert bt._evict_oldest_volume_windows_locked() == 0
+        assert len(bt._VOLUME_CACHE_DISK_LOADED) == 4
+        assert len(bt._VOLUME_CACHE) == 8  # 2 tickers × 4 windows
+
+        # Add a 5th window via the real loader (no disk file → empty load,
+        # but still registers the window and triggers eviction).
+        new_start = windows[-1][0] + timedelta(days=30)
+        new_end = new_start + timedelta(days=365)
+        bt._load_volume_cache_for_window(new_start, new_end)
+
+        # Oldest window (windows[0]) must be evicted; new one must be the
+        # most-recently-touched.
+        old_key = (windows[0][0].isoformat(), windows[0][1].isoformat())
+        new_key = (new_start.isoformat(), new_end.isoformat())
+        assert old_key not in bt._VOLUME_CACHE_DISK_LOADED
+        assert new_key in bt._VOLUME_CACHE_DISK_LOADED
+        assert len(bt._VOLUME_CACHE_DISK_LOADED) == 4
+
+        # Per-ticker series for the evicted window must also be GONE
+        # (otherwise memory isn't actually reclaimed — the bug we're fixing).
+        evicted_data_keys = [
+            k for k in bt._VOLUME_CACHE
+            if k[1] == old_key[0] and k[2] == old_key[1]
+        ]
+        assert evicted_data_keys == []
+
+    def test_access_refreshes_lru_order(self, monkeypatch):
+        import paper_trader.backtest as bt
+
+        monkeypatch.setattr(bt, "_VOLUME_CACHE_MAX_WINDOWS", 3)
+        windows = self._seed_windows(3, bt, monkeypatch)
+
+        # Touch the OLDEST window — it should jump to most-recently-used
+        # so that adding a 4th window evicts what was the *middle* one.
+        bt._load_volume_cache_for_window(windows[0][0], windows[0][1])
+
+        new_start = windows[-1][0] + timedelta(days=30)
+        new_end = new_start + timedelta(days=365)
+        bt._load_volume_cache_for_window(new_start, new_end)
+
+        # Cap is 3. We now have 4 inserted with the original [0] touched
+        # most recently. Expected eviction: original windows[1] (now oldest).
+        assert (windows[1][0].isoformat(), windows[1][1].isoformat()) \
+            not in bt._VOLUME_CACHE_DISK_LOADED
+        assert (windows[0][0].isoformat(), windows[0][1].isoformat()) \
+            in bt._VOLUME_CACHE_DISK_LOADED
+
 
 class TestVolumeCacheConcurrency:
     """Regression test for the `_persist_volume_cache_for_window` race.

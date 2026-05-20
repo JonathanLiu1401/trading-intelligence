@@ -60,7 +60,12 @@ def _isolate_data_dir(tmp_path, monkeypatch):
     if hasattr(bt, "_VOLUME_CACHE_LOADED"):
         bt._VOLUME_CACHE_LOADED = False
     if hasattr(bt, "_VOLUME_CACHE_DISK_LOADED"):
-        bt._VOLUME_CACHE_DISK_LOADED = set()
+        # _VOLUME_CACHE_DISK_LOADED is now an OrderedDict (LRU bookkeeping)
+        # rather than a set; resetting to an empty OrderedDict preserves the
+        # `key in …`/`len(…)` contract every test relies on while keeping the
+        # `move_to_end`/`popitem(last=False)` API the eviction helper needs.
+        from collections import OrderedDict as _OD
+        bt._VOLUME_CACHE_DISK_LOADED = _OD()
 
     # Unit tests must be deterministic regardless of the *real* host load.
     # strategy.decide() now runs a pre-flight host-saturation guard
