@@ -76,6 +76,7 @@ from collectors.yield_curve_collector import collect_yield_curve
 from collectors.cftc_cot_collector import collect_cftc_cot
 from collectors.vix_term_structure import collect as collect_vix_ts
 from collectors.dxy_collector import collect as collect_dxy
+from collectors.openinsider_cluster import collect as collect_insider_cluster
 from collectors.sector_etf_momentum import collect as collect_sector_etf
 from collectors.cisa_kev_collector import collect_cisa_kev
 from collectors.benzinga_analyst_collector import collect_benzinga_analyst
@@ -148,6 +149,7 @@ COT_INTERVAL            = 6 * 3600  # CFTC COT report — weekly release, check 
 SHORT_INTEREST_INTERVAL = 21600   # highshortinterest.com every 6h (data updates ~2/month)
 VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
 DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
+INSIDER_CLUSTER_INTERVAL = 600    # EDGAR Form 4 cluster-buy scan every 10min
 SECTOR_ETF_INTERVAL     = 600     # Sector ETF momentum snapshot every 10min
 BENZINGA_INTERVAL       = 300     # Benzinga analyst-ratings RSS sweep every 5min
 FED_PRESS_INTERVAL      = 1800    # Federal Reserve press / speech / testimony RSS — every 30min
@@ -1102,6 +1104,30 @@ def dxy_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(DXY_INTERVAL)
+
+
+# ── Worker: EDGAR Form 4 insider cluster-buy detection — every 10min ────────
+def insider_cluster_worker(store: ArticleStore):
+    log.info("[insider_cluster_worker] started")
+    bo = Backoff("insider_cluster", base=30.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_insider_cluster()
+            n = len(articles)
+            if n:
+                _ingest(store, articles, "insider_cluster")
+                log.info(f"[insider_cluster] emitted {n} cluster alert(s)")
+            try:
+                source_health.record_result("insider_cluster", n)
+            except Exception as he:
+                log.warning(f"[insider_cluster_worker] source_health error: {he}")
+            _worker_last_ok["insider_cluster"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[insider_cluster_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(INSIDER_CLUSTER_INTERVAL)
 
 
 # ── Worker: Sector ETF momentum / rotation — every 10min ────────────────────
@@ -2687,6 +2713,7 @@ def main():
         ("finra_short",   finra_short_worker),
         ("congress_trades", congress_trades_worker),
         ("cisa_kev",    cisa_kev_worker),
+        ("insider_cluster", insider_cluster_worker),
         ("benzinga_analyst", benzinga_analyst_worker),
         ("fed_press",   fed_press_worker),
         ("ecb_press",   ecb_press_worker),
