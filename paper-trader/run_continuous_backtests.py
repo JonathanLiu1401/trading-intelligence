@@ -695,7 +695,7 @@ def _oos_multi_horizon_metrics(scorer, oos_records: list[dict],
         if not oos_records or not getattr(scorer, "is_trained", False):
             return empty
         import numpy as _np
-        from paper_trader.ml.decision_scorer import _to_float
+        from paper_trader.ml.decision_scorer import _to_float, PRED_CLAMP_PCT
         from paper_trader.ml.calibration import _spearman
 
         # Predict once per record (the scorer call is the same regardless of
@@ -726,6 +726,13 @@ def _oos_multi_horizon_metrics(scorer, oos_records: list[dict],
                         a = -a
                     a = float(a)
                     if a == a:  # drop NaN per-horizon
+                        # Same train_scorer-aligned clamp as the 5d path
+                        # above. Rank metrics are nearly insensitive (only
+                        # extreme rows tie at ±50) but the clamp keeps the
+                        # 10d/20d slices coherent with the 5d view: a single
+                        # extreme-week row no longer extends rank space on
+                        # one horizon and not another.
+                        a = max(-PRED_CLAMP_PCT, min(PRED_CLAMP_PCT, a))
                         per_horizon_preds[h].append(p)
                         per_horizon_acts[h].append(a)
             except Exception:
@@ -786,7 +793,7 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
         if not oos_records or not getattr(scorer, "is_trained", False):
             return out
         import numpy as _np
-        from paper_trader.ml.decision_scorer import _to_float
+        from paper_trader.ml.decision_scorer import _to_float, PRED_CLAMP_PCT
         from paper_trader.ml.calibration import _spearman
 
         preds: list[float] = []
@@ -816,6 +823,14 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
                     a = -a
                 p = float(p)
                 if p == p and a == a:  # drop non-finite defensively
+                    # Mirror train_scorer's symmetric label clamp + the
+                    # evaluate_scorer_oos RMSE clamp so this OOS metric
+                    # describes the same target space the model was trained
+                    # against (apples-to-apples with val). For rank-IC this is
+                    # near-no-op since Spearman operates on ranks, but the
+                    # ~0.4% of rows with |fr|>50 land in ties at ±50 instead of
+                    # silently extending rank space the model can never reach.
+                    a = max(-PRED_CLAMP_PCT, min(PRED_CLAMP_PCT, a))
                     preds.append(p)
                     actuals.append(a)
             except Exception:

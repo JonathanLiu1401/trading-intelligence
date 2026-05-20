@@ -533,7 +533,8 @@ def split_outcomes_temporal(
 
 def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
     """Compute RMSE of `scorer` predictions against actual `forward_return_5d`
-    on a held-out set. Returns ``{"n": int, "rmse": float|None}``.
+    on a held-out set. Returns ``{"n": int, "rmse": float|None,
+    "rmse_unclamped": float|None}``.
 
     Records whose `forward_return_5d` is missing or non-finite are DROPPED,
     not coerced to 0.0 — mirroring the NaN-sentinel discipline that
@@ -543,17 +544,36 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
     bug that `_oos_rank_metrics` was previously hardened against — fixed
     here for consistency so a future writer that emits null forward returns
     cannot silently inflate or deflate this metric.
+
+    **Label-clamping for honest val/oos comparison (2026-05-19).**
+    ``train_scorer`` clamps training labels to ``±PRED_CLAMP_PCT`` before fit
+    (see the symmetric label-clamp block in ``decision_scorer.py::train_scorer``),
+    so ``val_rmse`` is computed against clamped val labels. The scorer's
+    ``predict()`` then clamps its outputs to the same band. Comparing those
+    clamped predictions against UNclamped OOS labels means the operator-facing
+    ``val_rmse / oos_rmse`` pair reported by the skill ledger was NOT
+    apples-to-apples: one extreme MSTR / leveraged-ETF crash-week row
+    (|fr|≈175%) contributes ``(50 - 175)² = 15,625`` to OOS MSE but
+    ``(50 - 50)² = 0`` to val MSE, inflating ``oos_rmse`` by ~0.3-0.5 RMSE
+    points on a typical 1000-row OOS slice. That inflation looks identical to
+    overfit. Mirror the training-side clamp here so the two numbers describe
+    the same target space the model was trained against. ``rmse_unclamped`` is
+    surfaced alongside ``rmse`` (the primary headline metric) so a quant who
+    wants the raw real-world error can still see it — additive, not
+    destructive.
     """
     if not oos_records:
-        return {"n": 0, "rmse": None}
+        return {"n": 0, "rmse": None, "rmse_unclamped": None}
     if not getattr(scorer, "is_trained", False):
         return {"n": len(oos_records), "rmse": None,
+                "rmse_unclamped": None,
                 "error": "scorer not trained"}
 
-    from paper_trader.ml.decision_scorer import _to_float
+    from paper_trader.ml.decision_scorer import _to_float, PRED_CLAMP_PCT
 
     preds: list[float] = []
-    actuals: list[float] = []
+    actuals_clamped: list[float] = []
+    actuals_raw: list[float] = []
     for r in oos_records:
         try:
             p = scorer.predict(
@@ -582,14 +602,22 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
             af = float(actual)
             if pf == pf and af == af:  # drop NaN defensively
                 preds.append(pf)
-                actuals.append(af)
+                actuals_raw.append(af)
+                # Mirror train_scorer's symmetric label clamp so RMSE describes
+                # the same target space the model was trained against.
+                actuals_clamped.append(
+                    max(-PRED_CLAMP_PCT, min(PRED_CLAMP_PCT, af))
+                )
         except Exception:
             continue
 
     if not preds:
-        return {"n": 0, "rmse": None, "error": "no predictable records"}
+        return {"n": 0, "rmse": None, "rmse_unclamped": None,
+                "error": "no predictable records"}
 
     arr_p = np.array(preds, dtype=np.float64)
-    arr_a = np.array(actuals, dtype=np.float64)
-    rmse = float(np.sqrt(np.mean((arr_p - arr_a) ** 2)))
-    return {"n": len(preds), "rmse": rmse}
+    arr_a_clamped = np.array(actuals_clamped, dtype=np.float64)
+    arr_a_raw = np.array(actuals_raw, dtype=np.float64)
+    rmse = float(np.sqrt(np.mean((arr_p - arr_a_clamped) ** 2)))
+    rmse_unclamped = float(np.sqrt(np.mean((arr_p - arr_a_raw) ** 2)))
+    return {"n": len(preds), "rmse": rmse, "rmse_unclamped": rmse_unclamped}

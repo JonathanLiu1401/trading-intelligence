@@ -1000,6 +1000,30 @@ class TestOosRankMetrics:
         # Single pair both non-zero → dir_acc is computable
         assert out["dir_acc"] == pytest.approx(1.0)
 
+    def test_extreme_label_clamped_keeps_dir_acc_truthful(self):
+        """An extreme |forward_return_5d|>50 must be clamped to ±50 so OOS
+        rank metrics describe the same target space the scorer was trained
+        against (mirrors train_scorer's symmetric label-clamp and
+        evaluate_scorer_oos's RMSE clamp). dir_acc operates on signs so the
+        clamp is a no-op there — but locking this test prevents a future
+        regression where the clamp would be silently dropped from one of
+        the OOS paths but not the other (cross-diagnostic drift).
+        """
+        # Scorer predicts +50 (the gate-aligned clamp ceiling) and -50.
+        scorer = self._scorer_returning([50.0, -50.0])
+        records = [
+            # Realized +175 — model predicted +50, both positive → hit.
+            {"forward_return_5d": 175.0, "action": "BUY", "ticker": "MSTR"},
+            # Realized -200 — model predicted -50, both negative → hit.
+            {"forward_return_5d": -200.0, "action": "BUY", "ticker": "SOXS"},
+        ]
+        out = rcb._oos_rank_metrics(scorer, records)
+        assert out["n"] == 2
+        # Both directional hits.
+        assert out["dir_acc"] == pytest.approx(1.0)
+        # rank_ic computable (n=2, both pairs concordant) — IC = 1.0.
+        assert out["rank_ic"] == pytest.approx(1.0)
+
 
 # ──────────────────── _oos_multi_horizon_metrics direct ────────────
 

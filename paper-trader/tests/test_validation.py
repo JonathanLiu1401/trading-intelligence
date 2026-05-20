@@ -509,3 +509,113 @@ class TestEvaluateScorerOos:
         result = evaluate_scorer_oos(_FixedScorer(), records)
         assert result["n"] == 2
         assert result["rmse"] == pytest.approx(0.0, abs=1e-9)
+
+
+class TestEvaluateScorerOosLabelClamp:
+    """train_scorer clamps training labels to ±PRED_CLAMP_PCT before fit, so
+    val_rmse is computed against clamped val labels. evaluate_scorer_oos must
+    mirror the SAME label clamp so the operator-facing val_rmse vs oos_rmse
+    pair (reported by run_continuous_backtests._train_decision_scorer) is
+    apples-to-apples — without it, a single extreme MSTR / 3x-leveraged crash
+    week (|fr|≈175%) inflates OOS MSE by ~15,000 while contributing 0 to val
+    MSE, looking identical to overfit.
+    """
+
+    def _scorer_predicting(self, value: float):
+        class _FixedScorer:
+            is_trained = True
+
+            def predict(self, **_kw):
+                return value
+        return _FixedScorer()
+
+    def test_extreme_label_clamped_to_50_for_rmse(self):
+        """A single record with |forward_return_5d| > 50 must be clamped to
+        ±50 for the primary `rmse` field (matching train_scorer).
+        """
+        from paper_trader.validation import evaluate_scorer_oos
+        # Scorer outputs +50 (the max it can ever predict). Record claims +175%
+        # forward return. Pre-fix RMSE would be |50-175|=125 — a huge spike.
+        # Post-fix RMSE is |50-50|=0 because the label clamps too.
+        result = evaluate_scorer_oos(
+            self._scorer_predicting(50.0),
+            [{"forward_return_5d": 175.0, "action": "BUY", "ticker": "MSTR"}],
+        )
+        assert result["n"] == 1
+        assert result["rmse"] == pytest.approx(0.0, abs=1e-9)
+        # The unclamped sibling EXPOSES the raw real-world error for honesty —
+        # additive field, never destructive of the clamped headline.
+        assert result["rmse_unclamped"] == pytest.approx(125.0, abs=1e-6)
+
+    def test_negative_extreme_label_clamped(self):
+        """Mirror: a -100% forward return clamps to -50, matching training."""
+        from paper_trader.validation import evaluate_scorer_oos
+        result = evaluate_scorer_oos(
+            self._scorer_predicting(-50.0),
+            [{"forward_return_5d": -100.0, "action": "BUY", "ticker": "SOXS"}],
+        )
+        assert result["n"] == 1
+        assert result["rmse"] == pytest.approx(0.0, abs=1e-9)
+        assert result["rmse_unclamped"] == pytest.approx(50.0, abs=1e-6)
+
+    def test_in_band_labels_unaffected(self):
+        """The clamp is a no-op for the ~99.6% of realistic 5d returns that
+        live inside ±50. Two well-behaved records: clamped == unclamped RMSE.
+        """
+        from paper_trader.validation import evaluate_scorer_oos
+        result = evaluate_scorer_oos(
+            self._scorer_predicting(2.0),
+            [
+                {"forward_return_5d": 3.0, "action": "BUY", "ticker": "NVDA"},
+                {"forward_return_5d": 1.0, "action": "BUY", "ticker": "AAPL"},
+            ],
+        )
+        assert result["n"] == 2
+        # Predictions are constant 2; actuals are 3 and 1 → errors 1 and -1
+        # → RMSE = 1.0. Both clamped and unclamped agree because nothing
+        # exceeded ±50.
+        assert result["rmse"] == pytest.approx(1.0, abs=1e-9)
+        assert result["rmse_unclamped"] == pytest.approx(1.0, abs=1e-9)
+
+    def test_sell_extreme_clamped_after_sign_flip(self):
+        """A SELL whose realized return was -80% (correctly avoided a crash)
+        flips to +80, then clamps to +50. Mirrors train_scorer ordering.
+        """
+        from paper_trader.validation import evaluate_scorer_oos
+        result = evaluate_scorer_oos(
+            self._scorer_predicting(50.0),
+            [{"forward_return_5d": -80.0, "action": "SELL", "ticker": "FAZ"}],
+        )
+        assert result["n"] == 1
+        assert result["rmse"] == pytest.approx(0.0, abs=1e-9)
+        # Unclamped: pred 50 vs flipped raw 80 → error 30
+        assert result["rmse_unclamped"] == pytest.approx(30.0, abs=1e-6)
+
+    def test_empty_returns_both_none(self):
+        """The new rmse_unclamped field must be honestly None on empty
+        input (the documented n=0 honest-empty path) — never silently
+        coerced to NaN or 0 which a dashboard could render as "no error".
+        """
+        from paper_trader.validation import evaluate_scorer_oos
+        result = evaluate_scorer_oos(self._scorer_predicting(0.0), [])
+        assert result["n"] == 0
+        assert result["rmse"] is None
+        assert result["rmse_unclamped"] is None
+
+    def test_untrained_returns_both_none(self):
+        """Untrained scorer: both rmse fields must be None so a downstream
+        ledger consumer never sees a clamped fake-zero next to an unclamped
+        None and decides the OOS metric is suddenly available."""
+        from paper_trader.validation import evaluate_scorer_oos
+
+        class _Untrained:
+            is_trained = False
+
+            def predict(self, **_kw):
+                return 0.0
+        result = evaluate_scorer_oos(_Untrained(), [
+            {"forward_return_5d": 1.0, "action": "BUY", "ticker": "NVDA"},
+        ])
+        assert result["rmse"] is None
+        assert result["rmse_unclamped"] is None
+
