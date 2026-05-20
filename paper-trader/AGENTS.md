@@ -10191,9 +10191,9 @@ loop's actual data directory):
   the clamp is in the data-prep pass, not the persistence shape.
 
 
-## 2026-05-20 feature-dev pass (Agent 4) — `/api/round-trip-postmortem` + `/api/news-themes`
+## 2026-05-20 feature-dev pass (Agent 4) — `/api/round-trip-postmortem` + `/api/news-themes` + `/api/held-theme-decay`
 
-Two new dashboard surfaces that fill orthogonal operator gaps that
+Three new dashboard surfaces that fill orthogonal operator gaps that
 none of the existing ~120 endpoints close.
 
 ### `/api/round-trip-postmortem` — was the exit good?
@@ -10319,38 +10319,125 @@ no-tickers articles counted separately) +
 real on-disk sqlite articles.db, synthetic-row filter via SQL,
 NO_DATA when no DB, param clamps, store-failure-degrades-not-raises).
 
+### `/api/held-theme-decay` — is the catalyst on my held positions still alive in the wire?
+
+`/api/news-themes` is a single-window snapshot — a held theme that
+went DARK looks identical to one that just lit up. `/api/news-velocity`
+is the per-held-ticker Poisson MENTION-RATE z-score; a flood of
+low-relevance mentions inflates the rate while one 9.5
+Sonnet-labelled article moves it the same as a junk RSS row
+(different signal, different question). `/api/position-thesis` is a
+single-window 24h headlines+bull/bear split, no velocity dimension.
+`/api/thesis-drift` grades against ENTRY rationale, not current
+wire prominence. None of them answer the operator's actual
+reassessment trigger: *for each ticker I currently own, is the
+score-weighted news flow LOUDER NOW or QUIETER NOW than it was
+earlier?* — i.e. is the catalyst that justified holding it still
+alive in the wire, or has the wire moved on?
+
+Pure SSOT `analytics/held_theme_decay.py::build_held_theme_decay`.
+Per held ticker: a FRESH window (default 6h — matches
+`news_themes.DECAY_HALF_LIFE_HOURS` so fresh_score lines up with
+that endpoint's top-theme contribution) and an immediately
+preceding PRIOR window of the same width. Each window carries a
+decayed-score sum `Σ ai_score × exp(-age_h / 6h × ln 2)`. Multi-
+ticker articles SPLIT their weight evenly across ALL mentioned
+tickers (anti-inflation rule, same discriminator as `news_themes`
+/ `sector_signal_fit`).
+
+Verdict ladder per hold:
+
+- **DARK** — no qualifying articles in either window (nobody is
+  talking about it; the entry-time catalyst may have run out of
+  fuel). Also the verdict when both windows are below
+  `MIN_FRESH_SCORE` (1.0) — absolute prominence floor honesty,
+  prevents a 0.1→0.5 noise jump from claiming BUILDING.
+- **FADING** — `fresh < prior × FADE_RATIO` (0.7); the wire is
+  moving away from this name → reassess thesis.
+- **BUILDING** — `fresh > prior × BUILD_RATIO` (1.43) AND fresh
+  meets `MIN_FRESH_SCORE`; catalyst strengthening, current entry
+  well-timed.
+- **STABLE** — ratio between 0.7 and 1.43; steady-state coverage.
+
+Worst-verdict aggregator picks the highest-severity bucket present
+(FADING > DARK > STABLE > BUILDING) — FADING anywhere is the
+operator's first re-assessment signal. The headline leads with
+FADING, then DARK, then a flat status line. `holds[]` is sorted by
+the same severity so the most urgent row is at index 0.
+
+Defense-in-depth backtest filter at the builder mirrors
+`news_themes._is_synthetic`: any row whose `url` LIKE
+`backtest://%` or `source` LIKE `backtest_%` / `opus_annotation%`
+is dropped — so a leaked synthetic row cannot corrupt the held-
+position view even if a future caller forgets the SQL clause (the
+canonical SQL filter is still applied in the endpoint).
+
+State ladder: `NO_HELD` (no held positions — collapse-to-silence,
+the chat-enrichment SSOT precedent) / `OK`. Per-hold `ratio` is
+`None` when `prior_score == 0` (never fabricates `+inf`).
+
+Query params: `hours` (default 6, clamp 1..72), `min_score`
+(default 2.0, 0..10). SWR-cached 60s. Ticker extraction reuses
+`signals._extract_tickers` so the held-theme view never drifts
+from the universe `decide()` builds prompts against. Advisory
+only — never gates Opus, never injected into the decision prompt
+(invariants #2/#12). On the live 2026-05-20 book (NVDA + TQQQ),
+the endpoint reports NVDA FADING (fresh 2.57 / prior 4.00) and
+TQQQ DARK — exactly the "your NVDA coverage is fading INTO the
+earnings print and nobody is writing about TQQQ" the operator
+needs surfaced.
+
+Locked by `tests/test_held_theme_decay.py` (26 tests — SSOT decay
+halflife matches `news_themes`, full state-ladder edge cases on
+the FADE_RATIO/BUILD_RATIO/MIN_FRESH_SCORE cutoffs, exact
+decayed-weight arithmetic per article age, multi-ticker SPLIT
+arithmetic, articles-outside-both-windows ignored, unheld-ticker
+articles dropped, defense-in-depth backtest filter, worst-verdict
++ headline aggregator, holds sorted by severity, held-tickers
+case-insensitive dedupe, never-raises on garbage rows /
+non-list-tickers / string-ai_score, stable output shape).
+
 ### How to run / test
 
 ```sh
 cd /home/zeph/trading-intelligence/paper-trader
 
-# Both feature surfaces (51 tests, <2s):
+# All three feature surfaces (77 tests, <2s):
 python3 -m pytest tests/test_round_trip_postmortem.py \
                    tests/test_round_trip_postmortem_endpoint.py \
                    tests/test_news_themes.py \
-                   tests/test_news_themes_endpoint.py -v
+                   tests/test_news_themes_endpoint.py \
+                   tests/test_held_theme_decay.py -v
 
 # Live probe (after the next paper-trader restart picks up the new routes):
 curl -s 'http://localhost:8090/api/round-trip-postmortem?max_n=5' | python3 -m json.tool
 curl -s 'http://localhost:8090/api/news-themes?hours=12&max_themes=10' | python3 -m json.tool
+curl -s 'http://localhost:8090/api/held-theme-decay?hours=6' | python3 -m json.tool
 ```
 
 ### Invariants reaffirmed by this pass
 
-- **#1** (backtest articles must never reach live signals) — both
-  endpoints apply the canonical SQL filter; `build_news_themes`
-  additionally drops `backtest://%` / `backtest_*` /
-  `opus_annotation*` rows at the builder as defense-in-depth.
-- **#2 / #12** (live trader has no hard limits, advisory-only) — both
-  endpoints are observational, never gate Opus, never injected into
-  the decision prompt; reporter Discord pulse not added.
+- **#1** (backtest articles must never reach live signals) — all three
+  endpoints apply the canonical SQL filter; `build_news_themes` and
+  `build_held_theme_decay` additionally drop `backtest://%` /
+  `backtest_*` / `opus_annotation*` rows at the builder as defense-in-
+  depth (both reference `_is_synthetic` shape for consistency).
+- **#2 / #12** (live trader has no hard limits, advisory-only) — all
+  three endpoints are observational, never gate Opus, never injected
+  into the decision prompt; reporter Discord pulse not added.
 - **#10** (single source of truth, do not consolidate) — verdict
-  ladder lives in one builder; the endpoint computes nothing. News
-  ticker extraction reuses `signals._extract_tickers` so the theme
-  tickers cannot drift from the universe `decide()` builds prompts
-  against.
-- **#7** (SWR-cached slow read-only) — both endpoints carry
-  `@swr_cached("...", 60.0)` like every news-IO sibling.
+  ladder lives in one builder per endpoint; the route computes nothing.
+  News ticker extraction reuses `signals._extract_tickers` so the
+  theme tickers cannot drift from the universe `decide()` builds
+  prompts against. `held_theme_decay` imports `DECAY_HALF_LIFE_HOURS`
+  from `news_themes` so the two endpoints share a decay shape; any
+  future re-tune updates both simultaneously and is pinned by
+  `tests/test_held_theme_decay.py::TestSSOTDecayHalfLife`.
+- **#7** (SWR-cached slow read-only) — all three endpoints carry
+  `@swr_cached("...", 60.0)` like every news-IO sibling, and
+  `held-theme-decay` is added to the SWR prewarm list so the first
+  poll right after a restart is exactly when the operator is
+  checking "did any held thesis go dark while I was away".
 
 Applies on next paper-trader restart (the documented pattern for
 every recent feature).

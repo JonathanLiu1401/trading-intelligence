@@ -10829,6 +10829,136 @@ def news_themes_api():
         return jsonify({"error": str(e), "state": "ERROR"}), 500
 
 
+@app.route("/api/held-theme-decay")
+@swr_cached("held-theme-decay", 60.0)
+def held_theme_decay_api():
+    """Per-held-ticker fresh-vs-prior decayed news score velocity.
+
+    Answers the question every other news surface punts on:
+    *for each ticker I currently own, is the score-weighted news flow
+    LOUDER NOW or QUIETER NOW than it was a window ago?* — i.e. is the
+    catalyst still alive in the wire or has the wire moved on?
+
+    Distinct from neighbours (invariant #10 — do not consolidate):
+
+      * ``/api/news-themes`` — single-window decayed-score snapshot,
+        NO comparison vs an earlier window; a held theme that went DARK
+        looks identical to one that just lit up.
+      * ``/api/news-velocity`` — Poisson MENTION-RATE z-score vs a 168h
+        baseline; not score-weighted (a flood of low-relevance mentions
+        inflates the rate while one 9.5 Sonnet-labelled article moves
+        it the same as a junk RSS row). Different signal entirely.
+      * ``/api/position-thesis`` — latest 24h headlines per held position
+        with a bull/bear split; single window, no velocity dimension.
+      * ``/api/thesis-drift`` — grades held positions against ENTRY
+        rationale, not current wire prominence.
+
+    Builder is pure (``analytics/held_theme_decay.py``): the fresh
+    window default (6h) matches ``news_themes.DECAY_HALF_LIFE_HOURS`` so
+    a held ticker's ``fresh_score`` is directly comparable to its
+    contribution to the news-themes top-themes ranking. The prior
+    window is the immediately preceding non-overlapping band of the
+    same width. Multi-ticker articles split their weight evenly across
+    ALL mentioned tickers (anti-inflation rule, same discriminator as
+    ``news_themes`` / ``sector_signal_fit``). Defense-in-depth backtest
+    filter at the builder so a leaked synthetic row cannot reach
+    user-facing JSON.
+
+    Verdict ladder:
+      DARK     — no qualifying articles in either window
+      FADING   — fresh < prior × ``FADE_RATIO`` (0.7) → reassess thesis
+      BUILDING — fresh > prior × ``BUILD_RATIO`` (1.43) AND fresh meets
+                 the ``MIN_FRESH_SCORE`` (1.0) absolute floor
+      STABLE   — between ``FADE_RATIO`` and ``BUILD_RATIO``
+
+    Query params (all optional):
+      ``hours`` — fresh-window width (default 6, clamp 1..72). Prior
+        window is the immediately preceding band of the same width.
+      ``min_score`` — article ai_score floor at SQL (default 2.0, 0..10).
+
+    Advisory only — never gates Opus, adds no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.held_theme_decay import build_held_theme_decay
+
+        def _qf(name: str, default: float, lo: float, hi: float) -> float:
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        fresh_window_hours = _qf("hours", 6.0, 1.0, 72.0)
+        min_score = _qf("min_score", 2.0, 0.0, 10.0)
+
+        now = datetime.now(timezone.utc)
+        # SQL window must cover the FULL fresh+prior band (2× the fresh
+        # window) plus a small safety margin so an article right at the
+        # prior-edge isn't trimmed by clock drift.
+        sql_window_hours = max(fresh_window_hours * 2.0 + 1.0, 4.0)
+        since = (now - timedelta(hours=sql_window_hours)).isoformat()
+
+        # Live-only article rows — SSOT _LIVE_ONLY_CLAUSE inlined per
+        # AGENTS.md invariant (paper-trader copy of digital-intern's
+        # canonical filter). Re-extract tickers via signals._extract_tickers
+        # so the held-theme universe never drifts from the live trader's
+        # decide-time view (same discriminator news-themes uses).
+        articles: list[dict] = []
+        path = _articles_db_path()
+        if path is not None:
+            conn = None
+            try:
+                conn = sqlite3.connect(
+                    f"file:{path}?mode=ro", uri=True, timeout=5)
+                rows = conn.execute(
+                    "SELECT title, url, source, ai_score, urgency, "
+                    "first_seen FROM articles "
+                    "WHERE first_seen >= ? AND ai_score >= ? "
+                    "AND url NOT LIKE 'backtest://%' "
+                    "AND source NOT LIKE 'backtest_%' "
+                    "AND source NOT LIKE 'opus_annotation%' "
+                    "ORDER BY ai_score DESC LIMIT 2000",
+                    (since, min_score),
+                ).fetchall()
+                from .signals import _extract_tickers  # noqa: WPS433
+                for r in rows:
+                    title = r[0] or ""
+                    tk = sorted(_extract_tickers(title))
+                    articles.append({
+                        "title": title, "url": r[1], "source": r[2],
+                        "ai_score": r[3], "urgency": r[4],
+                        "first_seen": r[5],
+                        "tickers": tk,
+                    })
+            except Exception:
+                articles = []
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        # Held tickers from the live book — case-insensitive normalized
+        # inside the builder.
+        held: list[str] = []
+        try:
+            held = [
+                p["ticker"]
+                for p in get_store().open_positions()
+                if p.get("ticker")
+            ]
+        except Exception:
+            held = []
+
+        return jsonify(build_held_theme_decay(
+            articles, held_tickers=held, now=now,
+            fresh_window_hours=fresh_window_hours,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR"}), 500
+
+
 @app.route("/api/round-trip-postmortem")
 @swr_cached("round-trip-postmortem", 60.0)
 def round_trip_postmortem_api():
@@ -12199,6 +12329,12 @@ def _swr_prewarm():
         # exactly when the operator is glancing at the wire — locked
         # by the prewarm==@swr_cached invariant.
         ("news-themes", news_themes_api),
+        # held-theme-decay @swr_cached 60s — same articles.db SELECT shape
+        # as news-themes (~2000 rows + ticker regex) over a wider window
+        # (fresh+prior bands). First poll right after a restart is exactly
+        # when the operator is checking "did any held thesis go dark while
+        # I was away" — locked by the prewarm==@swr_cached invariant.
+        ("held-theme-decay", held_theme_decay_api),
         # round-trip-postmortem @swr_cached 60s — store.recent_trades
         # + market.get_prices (yfinance per closed-ticker). yfinance
         # is the long-tail latency contributor; same cold-stall blind

@@ -85,6 +85,7 @@ from collectors.globenewswire_collector import collect_globenewswire
 from collectors.hackernews_collector import collect_hackernews
 from collectors.sec_xbrl_financials import collect_sec_xbrl_financials
 from collectors.usgs_earthquake_collector import collect_usgs_earthquakes
+from collectors.sec_13f_collector import collect_13f_filings
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -149,6 +150,7 @@ GLOBAL_REG_INTERVAL     = 1800    # FSB, FCA, Fed research notes/papers — ever
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
 HACKERNEWS_INTERVAL     = 300     # Hacker News front-page + finance/business stories — every 5min
 SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
+SEC_13F_INTERVAL        = 1800      # SEC 13F institutional holdings — every 30min (quarterly season)
 USGS_QUAKE_INTERVAL     = 1800    # USGS M≥5 earthquake feed every 30min (insurance/semis/energy catalyst)
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
@@ -239,6 +241,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "globenewswire": GLOBENEWSWIRE_INTERVAL,
     "hackernews": HACKERNEWS_INTERVAL,
     "sec_xbrl": SEC_XBRL_INTERVAL,
+    "sec_13f": SEC_13F_INTERVAL,
     "usgs_quake": USGS_QUAKE_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
@@ -1362,6 +1365,27 @@ def sec_xbrl_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(SEC_XBRL_INTERVAL)
+
+
+# ── Worker: SEC 13F institutional holdings — every 30min ────────────────────
+def sec_13f_worker(store: ArticleStore):
+    log.info("[sec_13f_worker] started")
+    bo = Backoff("sec_13f", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_13f_filings()
+            _ingest(store, articles, "sec_13f")
+            try:
+                source_health.record_result("sec_13f", len(articles))
+            except Exception as he:
+                log.warning(f"[sec_13f_worker] source_health error: {he}")
+            _worker_last_ok["sec_13f"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[sec_13f_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SEC_13F_INTERVAL)
 
 
 # ── Worker: Hacker News front-page + finance/business stories — every 5min ──
@@ -2548,6 +2572,7 @@ def main():
         ("globenewswire", globenewswire_worker),
         ("hackernews",  hackernews_worker),
         ("sec_xbrl",    sec_xbrl_worker),
+        ("sec_13f",     sec_13f_worker),
         ("usgs_quake",  usgs_quake_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
