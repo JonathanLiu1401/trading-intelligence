@@ -10216,6 +10216,51 @@ def capital_paralysis_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/buying-power")
+@swr_cached("buying-power", 60.0)
+def buying_power_api():
+    """Deployable-cash awareness — the lean "what can my free cash fund right
+    now?" surface, ALREADY fed into the live Opus decision prompt
+    (``strategy.decide()`` builds the same dict and renders ``prompt_block``).
+    Surfacing it via the dashboard closes the established prompt→dashboard→
+    Discord trajectory the ``buying_power`` block has been following one
+    surface at a time (the same path ``capital_paralysis`` already walked).
+
+    Composes ``build_buying_power`` over the read-only portfolio snapshot +
+    the freshly-fetched watchlist prices (yfinance bulk — the single slow
+    call), scoped to the FULL WATCHLIST so an operator viewing the panel
+    sees affordability for every name in the universe, not just the lean
+    in-play subset the prompt block trims to. Pure formatting of an existing
+    builder's output (single source of truth, AGENTS.md invariant #10):
+    cash, deployed_pct, affordable[ticker, price, whole_shares], cheapest
+    name + price, and the unlock candidate (biggest-loser-first cut
+    priority). Observational only — never gates Opus, never caps a trade
+    (AGENTS.md invariants #2/#12 — the ``capital_paralysis`` precedent).
+
+    SWR-cached 60s: the underlying prices.get_prices(WATCHLIST) is the
+    same yfinance bulk call the decision cycle already pays for; a 60s
+    stale window matches the runner's OPEN_INTERVAL (≥1800s) and is well
+    under any operator-perceptible latency. The prewarm == @swr_cached
+    invariant (test_swr_prewarm_coverage) keeps this endpoint warm on
+    first paint."""
+    try:
+        from . import market as _market
+        from .analytics.buying_power import build_buying_power
+        from .strategy import WATCHLIST, portfolio_snapshot_readonly
+        store = get_store()
+        snap = portfolio_snapshot_readonly(store)
+        watch_px = _market.get_prices(WATCHLIST) if WATCHLIST else {}
+        # Scope the dashboard view to the WHOLE watchlist (not the lean
+        # _names_in_play subset the prompt block uses): an operator on the
+        # dashboard wants to see affordability across the full universe,
+        # not just "what mattered to Opus this cycle".
+        in_play = {t.upper() for t in WATCHLIST}
+        rep = build_buying_power(snap, watch_px, in_play)
+        return jsonify(rep)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/open-attribution")
 def open_attribution_api():
     """Selection-vs-market on the *open* book — the bot's dominant return.
@@ -12425,6 +12470,13 @@ def _swr_prewarm():
         # is checking "did the supervisor flap?"; a {"warming": true}
         # there is the worst possible UX.
         ("launcher-restart-loop", launcher_restart_loop_api),
+        # buying-power: deployable-cash awareness — the lean "what can my
+        # free cash fund right now?" surface, ALREADY in the Opus prompt
+        # block. yfinance bulk price call is the single slow path; first
+        # poll after a restart is exactly when the operator is sizing a
+        # manual trade — cold-stalling that surface defeats the point of
+        # surfacing the block in the first place.
+        ("buying-power", buying_power_api),
     ]
     for name, wrapper in targets:
         try:
