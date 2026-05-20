@@ -5696,3 +5696,166 @@ appended-only, committed alongside the related code in this same
 
 
 documentation step.
+
+## 2026-05-20 — Hybrid pass (FinancialContent / StockStory SEO-mill earnings-tomorrow gate)
+
+**Persona:** news analyst (the standalone-alert + briefing consumer).
+
+**Phase 1 (debug):** `bugs_fixed = 0`. The four load-bearing invariants
+re-traced and hold; the brief-listed test assertions already exist and
+value-assert per ~10 prior hybrid passes (verified by running
+`test_article_store.py` + `test_urgency_scorer.py` + `test_features.py`
++ `test_model.py` + `test_trainer.py` — 55 passed in 12s). Adding
+duplicates would violate the standing no-redundant-coverage discipline.
+No Phase 1 commit per the brief's commit guard.
+
+**Phase 2 (feature, commit pending):** `_RT_EARNINGS_TOMORROW` —
+the 7th recap-template fingerprint on `watchers.alert_agent`. Catches
+the FinancialContent / StockStory / MSN / TradingView SEO-mill template
+"X (TICKER) Reports Earnings Tomorrow: What To Expect" that leaked
+through the existing 6-fingerprint gate because `_RT_EARNINGS_CALL`
+only catches POST-earnings recaps (`highlights|recap|takeaways|
+transcript|summary` verb list, explicitly excluding `preview|ahead of`).
+
+Live evidence (2026-05-19/20, 36h `articles.db` scan, all `urgency=2`):
+6 distinct hits — DECK + SCVL (neither held; pure SEO spam) fired
+BREAKING pushes on 2026-05-20 at 03:57Z and 04:12Z, plus NVDA syndicated
+4× across FinancialContent / StockStory / MSN / TradingView on
+2026-05-19 (03:21Z, 05:16Z, 05:42Z, 14:51Z). Today's DECK + SCVL pushes
+confirmed in `alert_recency.db` at 13:26Z and 13:40Z — fired to Discord
+as standalone 🚨 BREAKING for tickers with zero portfolio relevance,
+exactly the analyst-persona noise complaint this gate eliminates.
+
+Discriminator (in `alert_agent.py`):
+```python
+_RT_EARNINGS_TOMORROW = re.compile(
+    r"\breports?\s+earnings\s+tomorrow\s*:\s*what\s+to\s+expect\b",
+    re.IGNORECASE,
+)
+```
+
+All four parts (`Reports Earnings`, `Tomorrow`, `:`, `What To Expect`)
+must co-occur in that order. The colon-bounded `What To Expect` trailer
+is the SEO-mill tell — real wire copy announces an earnings date
+without it ("NVIDIA Earnings Today: Wall Street Expects EPS to Jump to
+$1.76 on $78.75B Revenue" has the colon but no "what to expect", so
+survives).
+
+Wired into `_RECAP_TEMPLATE_PATTERNS` between `earnings_call_recap` and
+`street_thinks` — same shape as the prior 7 patterns, so:
+- `alert_agent._filter_recap_template_noise` automatically picks it up
+- `urgency_scorer.py` (`from watchers.alert_agent import
+  _looks_like_recap_template`) picks it up via SSOT import (no second
+  edit required — verified by `test_lockstep_with_alert_path_on_live_
+  noise` continues to pass)
+- the Sonnet pre-floor in `urgency_scorer.score_batch` floors these to
+  `ai_score=0.01` / `urgency=0` / `score_source='llm'` BEFORE the
+  Claude call (saves quota AND keeps the LLM label distribution honest
+  — same `_RT_WHY_JUST_MOVED` precedent: alert-path-only addition, no
+  briefing pattern change). The briefing gate
+  (`analysis.claude_analyst._BRIEFING_RECAP_TEMPLATE_PATTERNS`) is
+  deliberately NOT touched — the live evidence is alert-path-only, the
+  same scope discipline that `_RT_WHY_JUST_MOVED` set for the prior
+  alert-only addition; briefing parity tests (`tests/test_briefing_
+  recap_template.py`) only assert on the shared corpus of six original
+  titles, so they stay green.
+
+All four load-bearing invariants intact by construction:
+- pure read-side helper (no DB write; the suppression path's
+  `mark_alerted_batch` only sets `urgency=2` — ai_score / ml_score /
+  score_source untouched);
+- backtest isolation: synthetic rows are excluded upstream by
+  `get_unalerted_urgent`'s `_LIVE_ONLY_CLAUSE` AND re-filtered at the
+  formatter by `_is_synthetic` (the suppressed rows reach this gate
+  only after surviving both);
+- urgency state machine: only `urgency=1 → urgency=2` transitions via
+  `mark_alerted_batch` (the existing gate's discipline).
+
+**Tests pinned** in `tests/test_alert_recap_template.py` (+3 new tests,
+all pass; full focused suite **150 passed in 21.21s**):
+- `test_earnings_tomorrow_preview_seo_mill` — 8 verbatim live-evidence
+  titles caught (DECK, SCVL, NVDA ×4 from each syndicator, plus
+  plausible MU/AMD same-template variants);
+- `test_earnings_tomorrow_preview_does_not_over_catch` — the must-
+  survive corpus (10 titles: all 7 genuine NVDA-earnings-day pushes
+  that fired alongside the SEO noise on 2026-05-20 + 3 token-subset
+  variants that must NOT match: "earnings tomorrow" alone, "what to
+  expect" alone, "reports earnings" without "tomorrow");
+- `test_earnings_tomorrow_seo_mill_end_to_end` — end-to-end via
+  `send_urgent_alert`: a real MU urgent + a SEO-mill SCVL row → MU
+  fires (Claude/Discord called once, prompt contains MU and NOT the
+  SEO row); SCVL marked alerted unconditionally; both ids in
+  `spy.marked`.
+
+**Phase 3 (live validation):** No fold-in fix needed.
+
+  1. **Collection rate healthy.** 4,664 live articles in the last hour
+     (excl. backtest/opus_annotation rows) — well above the 600/h
+     healthy threshold. Top sources by raw volume on NVDA earnings day:
+     `GN: earnings`, `GN: Nasdaq`, `Benzinga Economics`,
+     `scraped/finance.yahoo.com`, `Finnhub/Yahoo`, `GN: Nvidia`.
+  2. **Alert quality genuinely improved with this gate.** 33 distinct
+     Discord pushes in the last 12h (per `alert_recency.db` audit). The
+     2 SEO-mill noise pushes (DECK + SCVL "Reports Earnings Tomorrow:
+     What To Expect") are exactly what the new gate suppresses; the
+     other 31 are legitimate NVDA earnings-day coverage, Samsung
+     strike, Micron PT raises, India RBI swap, etc.
+  3. **Paraphrase suppression appears stale (chronic stale-daemon).**
+     The Samsung "S. Korea"/"South Korea" pair STILL fired ~1h apart at
+     04:57Z and 05:51Z TODAY despite the `b34dbe3` fix being committed
+     today — the daemon hasn't been restarted since (the documented
+     chronic-stale-daemon pattern: code fixes land in git but require a
+     `systemctl --user restart digital-intern` to take effect). NOT a
+     code bug — operational. The fix will apply on the next restart;
+     when the new SEO mill gate ships, both will take effect together.
+  4. **All four load-bearing invariants intact in production.**
+     - Backtest isolation: 0 backtest URLs / sources have EVER been
+       alerted (verified by direct probe).
+     - ML/LLM separation: 0 rows with `score_source='ml' AND
+       ai_score>0` (would have indicated model predictions leaking
+       into the LLM label column — none found).
+     - Urgency state machine: 31 `urgency=1` pending, 163 `urgency=2`
+       alerted in 24h — consistent transition counts, no regression.
+  5. **USB DB I/O saturation continues** (chronic per the
+     `di-insert-batch-lock-contention` memory). One read probe hit
+     `sqlite3.DatabaseError: database disk image is malformed` —
+     torn-page read under sustained writer contention. Not actionable
+     in this session per the standing "don't fix it" guidance — it is
+     operational (USB drive saturation under bulk gdelt_gkg backfill +
+     scorer + purge + dashboard reads).
+  6. **17 sources still chronic-dark** per the
+     `di-chronic-dark-collectors` memory (sec_edgar, polygon, newsapi,
+     nitter, etc.) — standing external gap, not a fresh bug.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:**
+- `python3 -c "import sys; sys.path.insert(0,'.'); from storage import
+  article_store; from ml import features, model; print('imports OK')"`
+  → `imports OK`.
+- Focused suite (touching all affected paths): `tests/test_alert_recap_
+  template.py` + `test_alert_agent.py` + `test_urgency_recap_prefilter.
+  py` + `test_recap_template_audit.py` + `test_article_store.py` +
+  `test_briefing_recap_template.py` + `test_features.py` +
+  `test_model.py` + `test_trainer.py` + `test_urgency_scorer.py`:
+  **150 passed in 21.21s**.
+
+**Counters:** `bugs_fixed=0` (no Phase 1 commit; existing tests already
+pin the invariants the brief enumerated; the Phase 1 commit guard
+explicitly allows skipping); `features_added=1` (the FinancialContent /
+StockStory / MSN / TradingView SEO-mill earnings-tomorrow gate, one
+commit); `user_findings=6` (collection rate, alert quality improved by
+this gate, paraphrase-suppression stale-daemon, four invariants intact,
+chronic USB DB saturation confirmed standing, 17 chronic-dark sources
+confirmed standing).
+
+**Staging discipline.** Three other agents running concurrently per the
+`pt-concurrent-samerole-staging-race` memory (paper-trader core,
+paper-trader ML+backtests, paper-trader feature-dev all visible in
+`ps -ef`). `git status` checked before staging; staged with explicit
+pathspec only (`watchers/alert_agent.py`,
+`tests/test_alert_recap_template.py`, `AGENTS.md`). Never `git add -A`.
+Untracked sibling files (`collectors/short_interest_collector.py`,
+`tests/test_breaking_confluence.py`, `dashboard/web_server.py` mods,
+`paper-trader/*`) deliberately left unstaged. AGENTS.md appended-only,
+committed alongside the related code in this same documentation step.
