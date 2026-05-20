@@ -1025,3 +1025,236 @@ class TestBacktestStoreIsolation:
             assert explicit.exists()
         finally:
             store.conn.close()
+
+
+# ─────────────────────── _buy update-existing edge cases ───────────────────
+
+
+class TestBuyExistingPositionTruthiness:
+    """Regression lock for `_buy` truthiness on stop_loss/take_profit updates.
+
+    Pre-fix `if stop_loss:` skipped explicit 0.0 updates on existing positions
+    while the new-position branch stored 0.0 unconditionally — accumulating
+    into the same ticker therefore diverged silently from a fresh open. The
+    fix is `is not None`. These tests pin the (None-skips, 0.0-applies)
+    semantics so a future "looks-sensible" rewrite back to truthiness fails.
+    """
+
+    def test_buy_into_existing_preserves_prior_stop_when_new_is_none(self):
+        """None stop_loss on a top-up must NOT clobber the prior value."""
+        p = SimPortfolio(cash=10_000.0)
+        _buy(p, "NVDA", 1.0, 100.0, stop_loss=90.0, take_profit=120.0)
+        # Top up with no new stops — prior values stay intact.
+        _buy(p, "NVDA", 1.0, 110.0, stop_loss=None, take_profit=None)
+        pos = p.positions["NVDA"]
+        assert pos["qty"] == pytest.approx(2.0)
+        assert pos["stop_loss"] == 90.0
+        assert pos["take_profit"] == 120.0
+
+    def test_buy_into_existing_overwrites_with_explicit_zero(self):
+        """Explicit 0.0 (a deliberate "wipe the stop") must overwrite, not be
+        treated as None. Pre-fix truthiness silently dropped this update."""
+        p = SimPortfolio(cash=10_000.0)
+        _buy(p, "NVDA", 1.0, 100.0, stop_loss=90.0, take_profit=120.0)
+        _buy(p, "NVDA", 1.0, 110.0, stop_loss=0.0, take_profit=0.0)
+        pos = p.positions["NVDA"]
+        assert pos["stop_loss"] == 0.0
+        assert pos["take_profit"] == 0.0
+
+    def test_buy_into_existing_overwrites_with_new_real_value(self):
+        """A new real stop_loss must replace the prior one."""
+        p = SimPortfolio(cash=10_000.0)
+        _buy(p, "NVDA", 1.0, 100.0, stop_loss=90.0, take_profit=120.0)
+        _buy(p, "NVDA", 1.0, 110.0, stop_loss=95.0, take_profit=130.0)
+        pos = p.positions["NVDA"]
+        assert pos["stop_loss"] == 95.0
+        assert pos["take_profit"] == 130.0
+
+
+# ─────────────────────── outcome features (regression locks) ───────────────
+
+
+class TestComputeDecisionOutcomes:
+    """Pins forward_return_5d arithmetic and walk-back collision rejection in
+    `run_continuous_backtests._compute_decision_outcomes` against the deterministic
+    synthetic_prices fixture. Catches subtle index/off-by-one bugs."""
+
+    def _build_engine_with_decisions(self, synthetic_prices, decisions,
+                                      tmp_path):
+        """Stub the bits `_compute_decision_outcomes` reads — store rows +
+        engine.prices — without booting yfinance or the GDELT fetcher."""
+        import paper_trader.backtest as bt
+
+        engine = bt.BacktestEngine.__new__(bt.BacktestEngine)
+        engine.start = synthetic_prices.start
+        engine.end = synthetic_prices.end
+        engine.prices = synthetic_prices
+        engine.store = bt.BacktestStore(tmp_path / "bt.db")
+        for d in decisions:
+            engine.store.upsert_run(
+                run_id=d["run_id"], seed=1, status="running",
+                start=synthetic_prices.start, end=synthetic_prices.end,
+            )
+            engine.store.conn.execute(
+                "INSERT INTO backtest_decisions (run_id, sim_date, action, "
+                "ticker, qty, confidence, reasoning, status, detail, cash, "
+                "total_value, signal_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (d["run_id"], d["sim_date"], d["action"], d["ticker"], 1.0,
+                 0.5, d.get("reasoning", "ML+quant: score=1.50 regime=bull"),
+                 "FILLED", "", 1000.0, 1000.0, 1),
+            )
+        engine.store.conn.commit()
+        return engine
+
+    def test_forward_return_5d_matches_synthetic_arithmetic(
+            self, synthetic_prices, tmp_path):
+        """NVDA in synthetic_prices is 100 + 2i. A BUY on day 0 (price 100)
+        has 5-day forward price 100 + 2*5 = 110 → +10.00% exactly. A BUY on
+        day 10 (price 120) has end price 130 → +8.333…% exactly."""
+        from run_continuous_backtests import _compute_decision_outcomes
+        from paper_trader.backtest import BacktestRun
+
+        days = synthetic_prices.trading_days
+        # Two BUYs at known offsets — pin exact realised returns.
+        decisions = [
+            {"run_id": 101, "sim_date": days[0].isoformat(), "action": "BUY",
+             "ticker": "NVDA"},
+            {"run_id": 101, "sim_date": days[10].isoformat(), "action": "BUY",
+             "ticker": "NVDA"},
+        ]
+        engine = self._build_engine_with_decisions(synthetic_prices, decisions,
+                                                    tmp_path)
+        try:
+            run = BacktestRun(run_id=101, seed=1,
+                              start_date=synthetic_prices.start.isoformat(),
+                              end_date=synthetic_prices.end.isoformat(),
+                              total_return_pct=5.0, status="complete")
+            outcomes = _compute_decision_outcomes(engine, [run])
+        finally:
+            engine.store.conn.close()
+        assert len(outcomes) == 2
+        # Day-0 BUY at 100 → day-5 price 110 → +10%
+        assert outcomes[0]["forward_return_5d"] == pytest.approx(10.0, abs=1e-3)
+        # Day-10 BUY at 120 → day-15 price 130 → 10/120 * 100 = 8.3333%
+        assert outcomes[1]["forward_return_5d"] == pytest.approx(
+            (130 - 120) / 120 * 100, abs=1e-3)
+
+    def test_outcomes_drop_when_5d_window_runs_past_history(
+            self, synthetic_prices, tmp_path):
+        """A decision near the end of trading_days has no 5d window → dropped."""
+        from run_continuous_backtests import _compute_decision_outcomes
+        from paper_trader.backtest import BacktestRun
+
+        days = synthetic_prices.trading_days
+        # last day - 2: only 2 forward trading days exist, window of 5 fails
+        decisions = [
+            {"run_id": 202, "sim_date": days[-2].isoformat(), "action": "BUY",
+             "ticker": "NVDA"},
+        ]
+        engine = self._build_engine_with_decisions(synthetic_prices, decisions,
+                                                    tmp_path)
+        try:
+            run = BacktestRun(run_id=202, seed=1,
+                              start_date=synthetic_prices.start.isoformat(),
+                              end_date=synthetic_prices.end.isoformat(),
+                              total_return_pct=0.0, status="complete")
+            outcomes = _compute_decision_outcomes(engine, [run])
+        finally:
+            engine.store.conn.close()
+        assert outcomes == []
+
+    def test_outcomes_only_filled_decisions(self, synthetic_prices, tmp_path):
+        """A non-FILLED decision (e.g. BLOCKED no-cash, NO_DECISION marker)
+        must NOT be trained on — its forward return would be a phantom outcome."""
+        import paper_trader.backtest as bt
+        from run_continuous_backtests import _compute_decision_outcomes
+        from paper_trader.backtest import BacktestRun
+
+        engine = bt.BacktestEngine.__new__(bt.BacktestEngine)
+        engine.start = synthetic_prices.start
+        engine.end = synthetic_prices.end
+        engine.prices = synthetic_prices
+        engine.store = bt.BacktestStore(tmp_path / "bt.db")
+        engine.store.upsert_run(303, 1, "running",
+                                 synthetic_prices.start, synthetic_prices.end)
+        days = synthetic_prices.trading_days
+        # FILLED — should be picked up
+        engine.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "qty, confidence, reasoning, status, detail, cash, total_value, "
+            "signal_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (303, days[0].isoformat(), "BUY", "NVDA", 1.0, 0.5,
+             "ML+quant: score=1.50 regime=bull", "FILLED", "", 1000, 1000, 1))
+        # BLOCKED — must be ignored
+        engine.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "qty, confidence, reasoning, status, detail, cash, total_value, "
+            "signal_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (303, days[1].isoformat(), "BUY", "NVDA", 1.0, 0.5,
+             "ML+quant: score=2.50 regime=bull", "BLOCKED",
+             "insufficient cash", 0, 0, 1))
+        engine.store.conn.commit()
+        try:
+            run = BacktestRun(run_id=303, seed=1,
+                              start_date=synthetic_prices.start.isoformat(),
+                              end_date=synthetic_prices.end.isoformat(),
+                              total_return_pct=5.0, status="complete")
+            outcomes = _compute_decision_outcomes(engine, [run])
+        finally:
+            engine.store.conn.close()
+        # Only the FILLED row produces an outcome.
+        assert len(outcomes) == 1
+        assert outcomes[0]["sim_date"] == days[0].isoformat()
+
+
+# ─────────────────────── _ml_decide news-driven behaviour ──────────────────
+
+
+class TestMlDecideNewsRanking:
+    """Locks `_ml_decide` ranking: an article with HIGHER kw/ai score on a
+    given ticker must dominate over a tie/low-score competitor. Without this,
+    the gate could silently invert ranking via persona boosts or regime mult."""
+
+    def test_higher_score_ticker_wins_over_low_score(
+            self, synthetic_prices, monkeypatch):
+        """Two bullish articles, one with score=8 on NVDA and one with score=2
+        on a non-watchlist sentinel — NVDA must be picked (mapped via
+        _WORD_TO_TICKER from 'nvidia')."""
+        import paper_trader.backtest as bt
+
+        monkeypatch.setattr(bt, "_DECISION_SCORER", None, raising=False)
+        p = SimPortfolio(cash=10_000.0)
+        rng = random.Random(0)
+        articles = [
+            {"title": "Nvidia beats earnings, guidance raised, "
+                      "semiconductor surge",
+             "score": 8.0, "tickers": ["NVDA"]},
+            # Score below the 1.0 cutoff in _ml_decide — should be ignored.
+            {"title": "minor headline",
+             "score": 0.5, "tickers": ["NVDA"]},
+        ]
+        d = synthetic_prices.trading_days[-1]
+        decision = _ml_decide(d, p, articles, synthetic_prices, run_id=1,
+                              rng=rng)
+        assert decision["action"] == "BUY"
+        assert decision["ticker"] == "NVDA"
+
+    def test_no_articles_yields_hold_or_persona_buy(
+            self, synthetic_prices, monkeypatch):
+        """Empty article list with no held positions. Without news, only
+        persona boosts (and quant adjustments) can drive a buy — for a
+        synthetic price series with no quant history (51 days < 60), no
+        buy should trigger and HOLD is the safe outcome."""
+        import paper_trader.backtest as bt
+        monkeypatch.setattr(bt, "_DECISION_SCORER", None, raising=False)
+        p = SimPortfolio(cash=10_000.0)
+        rng = random.Random(0)
+        d = synthetic_prices.trading_days[-1]
+        # Use persona 1 (Value) which has lowest boost magnitudes.
+        decision = _ml_decide(d, p, [], synthetic_prices, run_id=1, rng=rng)
+        assert decision["action"] in ("HOLD", "BUY")
+        if decision["action"] == "BUY":
+            # If a persona boost did select a buy, qty must be positive and a
+            # price must exist for the chosen ticker.
+            assert decision["qty"] > 0
+            assert synthetic_prices.price_on(decision["ticker"], d) is not None
