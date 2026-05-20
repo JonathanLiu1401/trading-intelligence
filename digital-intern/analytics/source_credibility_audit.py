@@ -54,9 +54,12 @@ import argparse
 import json
 import math
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 from ml.features import DEFAULT_SOURCE_CRED, _source_credibility
+
+OUT_PATH = Path("/home/zeph/logs/source_credibility_audit.json")
 
 
 # Mirrors storage.article_store._LIVE_ONLY_CLAUSE — duplicated as a string
@@ -229,6 +232,10 @@ def main(argv: Optional[list] = None) -> int:
         "--top", type=int, default=15,
         help="How many top defaulting tags to report (default: 15)",
     )
+    parser.add_argument(
+        "--no-write", action="store_true",
+        help="skip writing OUT_PATH (stdout only)",
+    )
     args = parser.parse_args(argv)
 
     from storage.article_store import _get_db_path
@@ -238,6 +245,13 @@ def main(argv: Optional[list] = None) -> int:
         report = audit(store, hours=args.hours, top=args.top)
     finally:
         store.close()
+
+    if not args.no_write:
+        OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = OUT_PATH.with_suffix(".json.tmp")
+        tmp.write_text(format_report(report))
+        tmp.replace(OUT_PATH)
+
     print(format_report(report))
     return 0 if report["ok"] else 1
 
