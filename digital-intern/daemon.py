@@ -80,6 +80,7 @@ from collectors.boj_press_collector import collect_boj_press
 from collectors.boe_press_collector import collect_boe_press
 from collectors.globenewswire_collector import collect_globenewswire
 from collectors.sec_xbrl_financials import collect_sec_xbrl_financials
+from collectors.usgs_earthquake_collector import collect_usgs_earthquakes
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -140,6 +141,7 @@ BOJ_PRESS_INTERVAL      = 1800    # Bank of Japan press / speech / MPM RSS — e
 BOE_PRESS_INTERVAL      = 1800    # Bank of England press / publications RSS — every 30min
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
 SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
+USGS_QUAKE_INTERVAL     = 1800    # USGS M≥5 earthquake feed every 30min (insurance/semis/energy catalyst)
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
 EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
@@ -190,6 +192,7 @@ ALL_WORKERS = (
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
     "yahoo_ticker_rss", "market_movers", "wikipedia", "macro_calendar",
     "fed_press", "ecb_press", "boj_press", "boe_press",
+    "usgs_quake",
     "scorer", "alert", "heartbeat", "purge", "stats",
     "ml_trainer", "continuous_trainer", "recursive_labeler", "price_alert",
     "portfolio_pl", "sentiment_trends", "export", "web_server",
@@ -224,6 +227,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "boe_press": BOE_PRESS_INTERVAL,
     "globenewswire": GLOBENEWSWIRE_INTERVAL,
     "sec_xbrl": SEC_XBRL_INTERVAL,
+    "usgs_quake": USGS_QUAKE_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
     "ml_trainer": ML_TRAIN_INTERVAL,
@@ -1208,6 +1212,35 @@ def boe_press_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(BOE_PRESS_INTERVAL)
+
+
+# ── Worker: USGS M≥5 earthquake feed — every 30min ───────────────────────────
+# Seismic events with magnitude ≥5 in populated regions are a recurring
+# insurance / semiconductor-supply-chain / energy-infrastructure catalyst no
+# other collector covers. The USGS feed itself updates every minute, but
+# M≥5 quakes are rare enough (~3/day worldwide) that 30min is plenty fast
+# to land an event in the next briefing without worsening writer contention.
+# The collector applies its own M≥5.0 floor and dedups by USGS event_id, so
+# magnitude revisions of the same quake do NOT re-emit.
+def usgs_quake_worker(store: ArticleStore):
+    log.info("[usgs_quake_worker] started")
+    bo = Backoff("usgs_quake", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_usgs_earthquakes()
+            _ingest(store, articles, "usgs_quake")
+            try:
+                source_health.record_result("usgs_quake", len(articles))
+            except Exception as he:
+                log.warning(f"[usgs_quake_worker] source_health error: {he}")
+            _worker_last_ok["usgs_quake"] = time.time()
+            log.debug(f"[usgs_quake] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[usgs_quake_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(USGS_QUAKE_INTERVAL)
 
 
 # ── Worker: GlobeNewswire financial press releases — every 10min ─────────────
@@ -2412,6 +2445,7 @@ def main():
         ("boe_press",   boe_press_worker),
         ("globenewswire", globenewswire_worker),
         ("sec_xbrl",    sec_xbrl_worker),
+        ("usgs_quake",  usgs_quake_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
