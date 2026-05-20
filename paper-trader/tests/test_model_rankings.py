@@ -110,6 +110,16 @@ def test_backtest_engine_rejects_invalid_model_id(tmp_path):
                               model_id="gpt-4")
 
 
+def _insert_run(store, run_id, model_id, total_return_pct, vs_spy_pct=5.0, n_trades=10, n_decisions=100):
+    store.conn.execute(
+        "INSERT INTO backtest_runs (run_id, seed, start_date, end_date, start_value, "
+        "final_value, total_return_pct, spy_return_pct, vs_spy_pct, n_trades, n_decisions, "
+        "status, started_at, model_id) VALUES (?,1,'2025-01-01','2026-01-01',1000,1000,?,10.0,?,?,?,'complete','2026-01-01T00:00:00Z',?)",
+        (run_id, total_return_pct, vs_spy_pct, n_trades, n_decisions, model_id),
+    )
+    store.conn.commit()
+
+
 def test_model_rankings_api(tmp_path):
     """GET /api/model-rankings returns correct aggregated stats per model."""
     import json
@@ -117,18 +127,17 @@ def test_model_rankings_api(tmp_path):
     bt.BACKTEST_DB = tmp_path / "bt.db"
     store = bt.BacktestStore(path=tmp_path / "bt.db")
 
-    # Insert two complete runs with different model_ids
+    # ml_quant: 3 runs with returns 10, 30, 50 → avg=30, median=30, best=50, win_rate=100%
+    _insert_run(store, 1, "ml_quant", 10.0, n_trades=20, n_decisions=100)
+    _insert_run(store, 2, "ml_quant", 30.0, n_trades=40, n_decisions=200)
+    _insert_run(store, 3, "ml_quant", 50.0, n_trades=60, n_decisions=300)
+    # hf model: 2 runs: 60 (win) and -10 (loss) → avg=25, median=25, win_rate=50%
+    _insert_run(store, 4, "hf/deepseek-ai/DeepSeek-R1", 60.0)
+    _insert_run(store, 5, "hf/deepseek-ai/DeepSeek-R1", -10.0)
+    # one incomplete run — must be excluded
     store.conn.execute(
         "INSERT INTO backtest_runs (run_id, seed, start_date, end_date, start_value, "
-        "final_value, total_return_pct, spy_return_pct, vs_spy_pct, n_trades, n_decisions, "
-        "status, started_at, model_id) VALUES (1, 1, '2025-01-01', '2026-01-01', 1000, "
-        "1200, 20.0, 10.0, 10.0, 50, 300, 'complete', '2026-01-01T00:00:00Z', 'ml_quant')"
-    )
-    store.conn.execute(
-        "INSERT INTO backtest_runs (run_id, seed, start_date, end_date, start_value, "
-        "final_value, total_return_pct, spy_return_pct, vs_spy_pct, n_trades, n_decisions, "
-        "status, started_at, model_id) VALUES (2, 2, '2025-01-01', '2026-01-01', 1000, "
-        "1500, 50.0, 10.0, 40.0, 80, 250, 'complete', '2026-01-01T00:00:00Z', 'hf/deepseek-ai/DeepSeek-R1')"
+        "status, started_at, model_id) VALUES (6,1,'2025-01-01','2026-01-01',1000,'running','2026-01-01T00:00:00Z','ml_quant')"
     )
     store.conn.commit()
 
@@ -140,8 +149,40 @@ def test_model_rankings_api(tmp_path):
     assert resp.status_code == 200
     data = json.loads(resp.data)
     assert "models" in data
+    assert "as_of" in data
     models = {m["model_id"]: m for m in data["models"]}
+
+    # Both models present
     assert "ml_quant" in models
     assert "hf/deepseek-ai/DeepSeek-R1" in models
-    assert models["ml_quant"]["avg_return_pct"] == pytest.approx(20.0)
-    assert models["hf/deepseek-ai/DeepSeek-R1"]["avg_return_pct"] == pytest.approx(50.0)
+
+    ml = models["ml_quant"]
+    hf = models["hf/deepseek-ai/DeepSeek-R1"]
+
+    # AVG is computed correctly (not MAX/MIN)
+    assert ml["avg_return_pct"] == pytest.approx(30.0)
+    assert hf["avg_return_pct"] == pytest.approx(25.0)
+
+    # Median
+    assert ml["median_return_pct"] == pytest.approx(30.0)
+    assert hf["median_return_pct"] == pytest.approx(25.0)
+
+    # best_return_pct
+    assert ml["best_return_pct"] == pytest.approx(50.0)
+    assert hf["best_return_pct"] == pytest.approx(60.0)
+
+    # win_rate: ml_quant 3/3=100%, hf 1/2=50%
+    assert ml["win_rate_pct"] == pytest.approx(100.0)
+    assert hf["win_rate_pct"] == pytest.approx(50.0)
+
+    # runs count (incomplete run excluded)
+    assert ml["runs"] == 3
+    assert hf["runs"] == 2
+
+    # display_name from static dict
+    assert ml["display_name"] == "ML+Quant (deterministic)"
+    # unknown model_id falls back to raw string
+    assert hf["display_name"] == "DeepSeek R1"
+
+    # ml_quant has higher avg (30 > 25) → should appear first (sorted desc)
+    assert data["models"][0]["model_id"] == "ml_quant"
