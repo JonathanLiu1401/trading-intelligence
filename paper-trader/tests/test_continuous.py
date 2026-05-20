@@ -511,6 +511,80 @@ class TestWk52PosCapturedInOutcomes:
         assert nvda[0]["wk52_pos"] is None
         assert nvda[0]["pct_from_52h"] is None
 
+    def test_persona_and_regime_label_captured(self, tmp_path,
+                                                synthetic_prices):
+        """Additive: each outcome row carries the persona name + raw regime
+        label so downstream tools don't need to re-derive them.
+
+        - `persona`: maps from `run_id` via `persona_for` so a future rename
+          in the live `PERSONAS` dict doesn't desynchronize old outcome rows
+          from their persona-time labels.
+        - `regime_label`: the raw `bull`/`sideways`/`bear`/`unknown` string —
+          NOT the multiplier, since `bull` and `unknown` both have
+          `regime_mult=1.0` and an analysis cut on `regime_mult==1.0` silently
+          conflates them.
+        """
+        eng = _make_engine_with_runs(tmp_path, n_runs=1)
+        eng.prices = synthetic_prices
+        sim_d = synthetic_prices.trading_days[5].isoformat()
+        # run_id 2 → persona_for returns persona key 2 (Momentum Trader)
+        eng.store.conn.execute(
+            "INSERT INTO backtest_runs (run_id, seed, start_date, end_date,"
+            " start_value, status, started_at) VALUES (?,?,?,?,?,?,?)",
+            (2, 2, "2025-01-02", "2025-12-31", 1000.0, "complete",
+             "2025-01-02T00:00:00+00:00"),
+        )
+        eng.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "status, reasoning) VALUES (?, ?, ?, ?, ?, ?)",
+            (2, sim_d, "BUY", "NVDA", "FILLED",
+             "ML+quant: NVDA score=2.50 regime=bull news_count=0 news_urg=0.0"),
+        )
+        eng.store.conn.commit()
+        runs = [BacktestRun(run_id=2, seed=2, start_date="2025-01-02",
+                            end_date="2025-12-31")]
+        outs = rcb._compute_decision_outcomes(eng, runs)
+        nvda = [o for o in outs if o["sim_date"] == sim_d
+                and o["ticker"] == "NVDA"]
+        assert len(nvda) == 1
+        # Persona name pulled from PERSONAS dict — run_id=2 → "Momentum Trader".
+        assert nvda[0]["persona"] == "Momentum Trader"
+        # Regime label is the raw string returned by `_market_regime`. With
+        # synthetic_prices' short history, `_market_regime` falls through to
+        # "unknown" (insufficient SPY 200d MA) — exactly the case the
+        # additive capture exists to distinguish from a real "bull" cycle
+        # that would carry the SAME regime_mult=1.0.
+        assert nvda[0]["regime_label"] in (
+            "bull", "sideways", "bear", "unknown",
+        ), nvda[0]["regime_label"]
+        # `regime_mult` is preserved alongside the new label — additive, not
+        # a replacement, so existing diagnostics that read the multiplier
+        # keep working unchanged.
+        assert "regime_mult" in nvda[0]
+
+    def test_persona_field_present_for_run_id_1(self, tmp_path,
+                                                synthetic_prices):
+        """run_id=1 → persona key 1 → "Value Investor". Locks the
+        persona_for mapping into the outcome row's persona field so a future
+        change to ``persona_for``'s cycling formula immediately surfaces."""
+        eng = _make_engine_with_runs(tmp_path, n_runs=1)
+        eng.prices = synthetic_prices
+        sim_d = synthetic_prices.trading_days[5].isoformat()
+        eng.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "status, reasoning) VALUES (?, ?, ?, ?, ?, ?)",
+            (1, sim_d, "BUY", "NVDA", "FILLED",
+             "ML+quant: NVDA score=2.50 regime=bull news_count=0 news_urg=0.0"),
+        )
+        eng.store.conn.commit()
+        runs = [BacktestRun(run_id=1, seed=1, start_date="2025-01-02",
+                            end_date="2025-12-31")]
+        outs = rcb._compute_decision_outcomes(eng, runs)
+        nvda = [o for o in outs if o["sim_date"] == sim_d
+                and o["ticker"] == "NVDA"]
+        assert len(nvda) == 1
+        assert nvda[0]["persona"] == "Value Investor"
+
     def test_capture_does_not_break_existing_keys(self, tmp_path,
                                                   synthetic_prices):
         """Regression lock: the additive capture must not displace or rename

@@ -580,8 +580,40 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
             # reconstruction residual). None on SELL / untrained-cycle rows.
             gate_scorer_pred, gate_off_dist = _parse_gate_decision(reasoning)
 
+            # Additive persona + regime-label capture (read-only research
+            # signal, 2026-05-19 feature — same `forward_return_10d/20d`
+            # precedent: scorer is unchanged because `train_scorer` /
+            # `build_features` ignore unknown dict keys, so no retrain
+            # required and no risk of feature-vector drift). Two reasons:
+            #
+            # 1. `persona_skill` / `persona_leaderboard` already derive the
+            #    persona via `persona_for(run_id)`. Capturing the persona
+            #    NAME directly in the outcome row lets ad-hoc queries
+            #    (`grep persona=Momentum decision_outcomes.jsonl | …`) and
+            #    future per-persona diagnostics filter without re-importing
+            #    the live `PERSONAS` dict — the dict can later add/rename
+            #    personas, and old outcome rows still self-describe.
+            # 2. `regime_mult` (0.3/0.6/1.0) is a STRINGLY-TYPED encoding of
+            #    the `bull/sideways/bear/unknown` label that `_ml_decide`
+            #    and `_compute_decision_outcomes` BOTH compute from the
+            #    SPY 50/200 MA via `_market_regime`. The multiplier alone
+            #    can't distinguish `bull` from `unknown` (both = 1.0), so a
+            #    downstream regime-conditional cut on `regime_mult==1.0`
+            #    silently lumps an SPY-pre-200d-history "unknown" cycle in
+            #    with a real bull cycle. Capturing the raw label resolves
+            #    that ambiguity. Existing `regime_audit` decodes the same
+            #    label from `regime_mult`; this is a strict superset so
+            #    that diagnostic keeps working unchanged.
+            try:
+                from paper_trader.backtest import persona_for as _persona_for
+                _persona_name = _persona_for(run.run_id).get("name")
+            except Exception:
+                _persona_name = None
+
             outcomes.append({
                 "run_id": run.run_id,
+                "persona": _persona_name,
+                "regime_label": regime,
                 "sim_date": sim_date_str,
                 "ticker": ticker,
                 "action": r["action"],
