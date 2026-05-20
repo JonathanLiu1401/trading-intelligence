@@ -446,6 +446,46 @@ _RT_EARNINGS_TOMORROW = re.compile(
     r"\breports?\s+earnings\s+tomorrow\s*:\s*what\s+to\s+expect\b",
     re.IGNORECASE,
 )
+# "These Stocks Are Today's Movers: Nvidia, Micron, Intel, ..." — Barron's
+# daily column heavily syndicated across yfinance/Barrons.com,
+# scraped/www.barrons.com, Finnhub/Yahoo, YahooFinance/<TICKER> (the per-
+# ticker RSS picks up the SAME column for every ticker it mentions). Same
+# retrospective-recap class as ``_RT_MARKET_TODAY`` (the date-stamped daily
+# wrap-up); this one is the *same-day movers* sibling — by definition a
+# retrospective list of names that already moved, not a forward-looking
+# breaking story.
+#
+# Live evidence (2026-05-20, last 4h urgency=1 queue scan): the exact title
+# "These Stocks Are Today's Movers: Nvidia, Micron, Intel, Meta" appeared
+# from 3 distinct sources (yfinance/Barrons.com, scraped/www.barrons.com,
+# Finnhub/Yahoo) all ML-flagged urgency=1, score_source='ml', ml_score~9.x,
+# and "These Stocks Are Today's Movers: Micron, Intel, Lowe's, Nvidia" from
+# 5 more sources (Finnhub/Yahoo, YahooFinance/NVDA, yfinance/Barrons.com,
+# scraped/www.barrons.com, GoogleNews variants). The cross-cycle alert-
+# recency suppression collapses repeated copies of the SAME signature, but
+# the analyst still gets one push per distinct movers-list (which changes
+# composition daily as different tickers move) — pure SEO-mill recap, never
+# breaking, and the ML urgency head systematically over-scores it because
+# the title is dense with held tickers (NVDA + MU concentration trips the
+# model's portfolio_flag/ticker_count/ticker_density features).
+#
+# Discriminator: "These Stocks Are Today's Movers" + ":" — the colon-bounded
+# list is the SEO-mill signature. Anchored ``^`` so a mid-sentence "today's
+# movers" reference in a real headline ("Why Some Of Today's Movers Could
+# Run Higher Tomorrow", forward-looking analysis) is NOT caught. The
+# possessive apostrophe is optional (``today'?s``) to handle the curly
+# Unicode apostrophe / no-apostrophe variants live feeds occasionally emit.
+# Validated catches all live-noise copies and does NOT catch the must-
+# survive corpus (real "today's high" / "today's session" / mid-sentence
+# uses; forward-looking "tomorrow's movers" / "next week's movers"; legit
+# headlines that don't lead with the bracketed list pattern).
+_RT_TODAYS_MOVERS = re.compile(
+    # ['’]? handles ASCII (U+0027), curly Unicode (U+2019), or no apostrophe.
+    # The Barron's column live-feeds curly while the GoogleNews/Finnhub
+    # republished copies sometimes carry the ASCII or none at all.
+    r"^\s*these\s+stocks\s+are\s+today['’]?s\s+(?:top\s+|biggest\s+)?movers\s*:",
+    re.IGNORECASE,
+)
 
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
@@ -454,6 +494,7 @@ _RECAP_TEMPLATE_PATTERNS = (
     ("market_today_dated", _RT_MARKET_TODAY),
     ("earnings_call_recap", _RT_EARNINGS_CALL),
     ("earnings_tomorrow_preview", _RT_EARNINGS_TOMORROW),
+    ("todays_movers_list", _RT_TODAYS_MOVERS),
     ("street_thinks", _RT_STREET_THINKS),
     ("gf_value_says", _RT_GF_VALUE),
 )

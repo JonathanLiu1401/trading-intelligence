@@ -199,6 +199,30 @@ class TestHelperCatchesLiveNoise:
             assert hit, f"missed live why-just-moved recap: {t!r}"
             assert name == "why_just_moved"
 
+    def test_todays_movers_list_barrons_column(self):
+        """Live evidence (2026-05-20, articles.db urgency=1 phantom queue):
+        the Barron's daily "These Stocks Are Today's Movers" column was
+        ML-flagged urgent (ml_score~9.x, score_source='ml') and syndicated
+        across 5+ sources without the recap gate catching it — every
+        distinct ticker-composition daily produces a fresh BREAKING-eligible
+        candidate. Same retrospective-recap class as the date-stamped daily
+        wrap-up (already caught by _RT_MARKET_TODAY). Pinned by the actual
+        live titles from the 2026-05-20 urgency=1 queue scan."""
+        for t in (
+            # 2026-05-20 live phantom-queue copies (multi-source syndication).
+            "These Stocks Are Today’s Movers: Nvidia, Micron, Intel, Meta",
+            "These Stocks Are Today’s Movers: Micron, Intel, Lowe’s, Nvidia",
+            # ASCII-apostrophe / no-apostrophe variants for parser tolerance.
+            "These Stocks Are Today's Movers: Nvidia, AMD, MU",
+            "These Stocks Are Todays Movers: AAPL, MSFT, NVDA",
+            # Plausible same-template variants ("Top Movers" / "Biggest Movers").
+            "These Stocks Are Today's Top Movers: NVDA, MU, INTC",
+            "These Stocks Are Today's Biggest Movers: TSLA, NVDA, AMD",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed live Today's Movers recap: {t!r}"
+            assert name == "todays_movers_list"
+
 
 # ── _looks_like_recap_template: real breaking headlines MUST survive ───────
 
@@ -297,6 +321,31 @@ class TestHelperPreservesRealBreaking:
             hit, _ = alert_agent._looks_like_recap_template({"title": t})
             assert not hit, (
                 f"false-positive on real earnings-day push: {t!r}"
+            )
+
+    def test_todays_movers_pattern_does_not_over_catch(self):
+        """The todays_movers_list pattern is anchored to ``^These Stocks Are
+        Today's Movers:`` — mid-sentence "today's movers" mentions, forward-
+        looking "tomorrow's movers" / "next week's movers" / "premarket
+        movers" analyses, and any real headline that does NOT lead with the
+        exact bracketed-list signature must survive. Pins the SEO-mill
+        discriminator against the genuine market-movers coverage corpus."""
+        for t in (
+            # Mid-sentence "today's movers" - real analysis copy.
+            "Why Some Of Today's Movers Could Run Higher Tomorrow",
+            "Today's premarket movers: NVDA leads, MU lags",
+            # Forward-looking, NOT recap.
+            "Tomorrow's Movers To Watch: Earnings Calendar Heavy",
+            "Next week's biggest movers: 8 stocks on watch",
+            # Different lead pattern - analysis, not recap.
+            "Today's biggest market mover is the bond rout",
+            "Premarket movers: NVDA up 2%, MU down 3%",
+            # Mid-headline "today's" reference.
+            "After-hours movers reflect today's session weakness",
+        ):
+            hit, _ = alert_agent._looks_like_recap_template({"title": t})
+            assert not hit, (
+                f"false-positive on real movers headline: {t!r}"
             )
 
     def test_value_analyst_headlines_survive(self):
