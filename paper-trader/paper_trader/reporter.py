@@ -1575,8 +1575,15 @@ def _pos_pct_weight(p: dict, total_value: float | None) -> str:
     qty = _num(p.get("qty"))
     is_opt = p.get("type") in ("call", "put")
 
+    # ``cur >= 0`` (not ``> 0``): a worthless expired option settles at a real
+    # ``current_price`` of $0 (not a missing mark — ``stale_mark`` stays False
+    # via the deliberate ``_expired_intrinsic`` settlement in
+    # ``strategy._mark_to_market``). The strict ``> 0`` previously suppressed
+    # the −100% the trader needs to see, so a wiped contract showed only the
+    # dollar P/L. ``avg > 0`` still guards the division; ``cur is None``
+    # (missing mark) still suppresses.
     if (not p.get("stale_mark") and avg is not None and avg > 0
-            and cur is not None and cur > 0):
+            and cur is not None and cur >= 0):
         parts.append(f"{(cur - avg) / avg * 100.0:+.1f}%")
 
     tv = _num(total_value)

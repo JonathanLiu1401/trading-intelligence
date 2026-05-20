@@ -901,6 +901,31 @@ class TestPosPctWeight:
         tok = reporter._pos_pct_weight(p, 1000.0)  # 5/1000 = 0.5%
         assert "0.5% bk" in tok
 
+    def test_worthless_expired_option_shows_minus_100_pct(self):
+        # An OTM-expired option settles via strategy._expired_intrinsic at a
+        # real ``current_price`` of $0 with ``stale_mark`` False. The trader
+        # must see -100% on the wiped contract — previously the strict
+        # ``cur > 0`` guard silently suppressed it.
+        p = {"ticker": "NVDA", "type": "call", "qty": 1,
+             "avg_cost": 5.50, "current_price": 0.0,
+             "stale_mark": False,
+             "strike": 600.0, "expiry": "2026-05-16"}
+        tok = reporter._pos_pct_weight(p, 1000.0)
+        assert "-100.0%" in tok
+        # Weight clause keeps its strict ``cur > 0`` gate: a 0-mark contract
+        # has 0 market value, so emitting "0.0% bk" adds no information.
+
+    def test_stale_mark_with_zero_price_still_suppresses(self):
+        # A stale_mark position whose mark fell through to 0 (not a real
+        # settlement) must still suppress P/L% — the stale flag is the
+        # discriminator, not the price value.
+        p = {"ticker": "MU", "type": "stock", "qty": 5,
+             "avg_cost": 100.0, "current_price": 0.0,
+             "stale_mark": True}
+        tok = reporter._pos_pct_weight(p, 1000.0)
+        assert "%" not in tok or "% bk" in tok  # only weight, never P/L%
+        assert "-100.0%" not in tok
+
 
 class TestPosHoldAgeToken:
     """`_pos_hold_age_token` — pure per-position hold-age annotation that
