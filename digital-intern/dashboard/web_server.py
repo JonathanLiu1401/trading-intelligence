@@ -2514,6 +2514,145 @@ def create_app(store=None) -> Flask:
             "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         })
 
+    @app.get("/api/urgent-label-split")
+    def api_urgent_label_split():
+        """Per-``score_source`` breakdown of urgent rows in the last ``hours``.
+
+        Exposes ``ArticleStore.urgency_label_split`` so an analyst consuming
+        the standalone-push channel can see the aggregate calibration story
+        at a glance: of every urgency>=1 row in the window, what fraction
+        carry a real LLM ground-truth label vs only a model self-prediction?
+
+        Live evidence in ``article_store.py`` (2026-05-19): every urgent row
+        the alerter saw in a 6h window had ``ai_score=0`` (model-only). The
+        per-row "[unverified — model-only urgent]" alert tag exists for that
+        case, but nothing exposed the AGGREGATE rate at a glance — when the
+        Sonnet urgency_scorer is dark, quota-throttled or flooring everything
+        to noise, the standalone-push channel becomes single-headed and the
+        analyst should know.
+
+        Query params:
+          ``hours`` — window size, clamped 1..168 (default 24).
+
+        Returns (passthrough from ``urgency_label_split`` plus a verdict):
+          ``window_h``       — int
+          ``total``          — total urgent rows in window (urgency>=1)
+          ``by_source``      — {"llm": N, "ml": N, "briefing_boost": N, "null": N}
+          ``llm_fraction``   — (llm + briefing_boost) / total (0.0 when total==0)
+          ``status``         — "quiet" (total==0), "healthy" (>=50% LLM),
+                                "mostly_unverified" (<50% LLM with total>=5),
+                                "unverified_storm" (0% LLM with total>=3)
+          ``as_of``          — ISO8601 UTC timestamp
+        Read-only — no DB writes; backtest rows excluded by the underlying
+        method's ``_LIVE_ONLY_CLAUSE``; all four load-bearing invariants are
+        preserved by construction.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        store = _store_handle()
+        if store is None:
+            return jsonify({"error": "store unavailable"}), 503
+        try:
+            hours = int(request.args.get("hours", 24))
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(168, hours))
+        try:
+            data = store.urgency_label_split(hours=hours)
+        except Exception as exc:
+            return jsonify({"error": f"urgency_label_split failed: {exc!s}"}), 500
+        total = int(data.get("total") or 0)
+        llm_fraction = float(data.get("llm_fraction") or 0.0)
+        # Verdict — same silence-vs-signal discipline the chat enrichment
+        # blocks use (event-readiness / macro-calendar): a quiet window
+        # collapses to "quiet" instead of inventing a problem, and only an
+        # actionable miscalibration emits a non-healthy status.
+        if total == 0:
+            status = "quiet"
+        elif llm_fraction == 0.0 and total >= 3:
+            status = "unverified_storm"
+        elif llm_fraction < 0.5 and total >= 5:
+            status = "mostly_unverified"
+        else:
+            status = "healthy"
+        data["status"] = status
+        data["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return jsonify(data)
+
+    @app.get("/api/source-throughput")
+    def api_source_throughput():
+        """Per-source recent-vs-prior article rate + deceleration percentage.
+
+        Exposes ``ArticleStore.source_throughput`` so the analyst gets a
+        leading indicator BEFORE a collector goes fully dark. A source can
+        decelerate sharply (40/h → 3/h) while its newest item is still only
+        minutes old — ``/api/collector-health`` (which only carries 1h/24h
+        counts) won't flag it; this endpoint will.
+
+        Query params:
+          ``window_min`` — window size in minutes, clamped 5..720 (default 60).
+          ``limit``      — max rows returned, clamped 1..200 (default 50).
+
+        Returns (passthrough from ``source_throughput`` plus a verdict):
+          ``window_min``  — int
+          ``sources``     — [{source, recent, prior, delta, decel_pct}, ...],
+                             most-decelerated first
+          ``n_critical``  — count of sources with decel_pct >= 75
+          ``n_degraded``  — count of sources with decel_pct >= 40 and < 75
+          ``status``      — "ok" if no critical/degraded; "degraded" if any
+                             degraded but no critical; "critical" if any
+                             critical
+          ``as_of``       — ISO8601 UTC timestamp
+        Read-only — backtest rows excluded by the underlying method's
+        ``_LIVE_ONLY_CLAUSE``; all four load-bearing invariants preserved.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        store = _store_handle()
+        if store is None:
+            return jsonify({"error": "store unavailable"}), 503
+        try:
+            window_min = int(request.args.get("window_min", 60))
+        except (TypeError, ValueError):
+            window_min = 60
+        window_min = max(5, min(720, window_min))
+        try:
+            limit = int(request.args.get("limit", 50))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(200, limit))
+        try:
+            rows = store.source_throughput(window_min=window_min)
+        except Exception as exc:
+            return jsonify({"error": f"source_throughput failed: {exc!s}"}), 500
+        # Verdict thresholds chosen to match the analyst's "do I need to
+        # look at this?" bar: 75%+ drop = source effectively dark for the
+        # window; 40-75% = degrading enough to investigate before the next
+        # briefing. None=brand-new sources are NOT flagged (no baseline).
+        n_critical = sum(
+            1 for r in rows
+            if isinstance(r.get("decel_pct"), (int, float)) and r["decel_pct"] >= 75
+        )
+        n_degraded = sum(
+            1 for r in rows
+            if isinstance(r.get("decel_pct"), (int, float))
+            and 40 <= r["decel_pct"] < 75
+        )
+        if n_critical:
+            status = "critical"
+        elif n_degraded:
+            status = "degraded"
+        else:
+            status = "ok"
+        return jsonify({
+            "window_min": window_min,
+            "sources": rows[:limit],
+            "n_critical": n_critical,
+            "n_degraded": n_degraded,
+            "status": status,
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+
     @app.get("/api/db-lock-health")
     def api_db_lock_health():
         """Live article_store DB-lock contention surface.
