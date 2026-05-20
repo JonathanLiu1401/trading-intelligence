@@ -5260,3 +5260,143 @@ for commit `555db04`, and `dashboard/web_server.py` +
 files in `paper-trader/*` and `paper-trader/docs/superpowers/plans/`
 left alone. AGENTS.md is being appended-only in this same commit as the
 fix it documents, per project convention.
+
+## 2026-05-20 — Hybrid pass (paraphrase-tolerant cross-cycle alert suppression)
+
+**Persona:** news analyst (the standalone-alert + briefing consumer).
+
+**Phase 1 (debug):** `bugs_fixed = 0`. Full `tests/` suite: **1635 passed
+in 453s**. Every load-bearing invariant the brief enumerated is already
+pinned in existing tests (`test_article_store.py`,
+`test_features.py`, `test_model.py`, `test_urgency_scorer.py`,
+`test_trainer.py`). The codebase has been hardened by ~30 hybrid passes
+already documented in this file; surface-level "find a bug" yielded
+nothing genuinely broken. The Phase 1 commit guard explicitly permits
+skipping when no real bug is found — honored.
+
+**Phase 2 (feature, commit `b34dbe3`):** paraphrase-tolerant cross-cycle
+alert suppression — closes the one remaining duplicate-alert gap the
+existing `partition_already_alerted` (exact-signature) gate cannot.
+
+Live evidence (12h `alert_recency.db` audit, 2026-05-20 14:10Z):
+- 28 distinct standalone 🚨 BREAKING pushes fired to Discord in 12h.
+- **One** pair of those is a true duplicate: "Union calls strike at S.
+  Korea chip giant Samsung Electronics" fired at 04:26Z, then "Union
+  calls strike at South Korea chip giant Samsung Electronics" at
+  05:28Z — Jaccard 0.86 between canonical signatures, exact-sig
+  mismatch, second push reached the analyst as if it were new news.
+
+New functions in `watchers/alert_recency.py`:
+- `PARAPHRASE_MIN_JACCARD = 0.75`, `PARAPHRASE_MIN_SHARED = 4` — tuned
+  conservatively. Single-token antonym flips in short headlines ("Fed
+  raises rates 25bp" vs "Fed cuts rates 25bp") have only 3 salient
+  shared tokens after `_REL_STOPWORDS` strip → below `min_shared`,
+  never merged. Long-headline antonyms (rare in practice — same wire
+  event reported with opposite outcome in the same 6h TTL window) are
+  accepted as the documented limitation; the analyst gets the news
+  once, not zero times.
+- `paraphrase_match(title, recent, *, min_jaccard, min_shared) -> dict
+  | None` — pure: returns the highest-Jaccard prior alert that meets
+  both thresholds, else `None`. Skips exact-sig repeats (already
+  handled by `partition_already_alerted` upstream), untitled rows, and
+  too-short signatures.
+- `partition_paraphrase_alerted(articles, recent, ...) -> (kept,
+  suppressed)` — pure split; suppressed rows are shallow-copied and
+  tagged with `_paraphrase_match` for audit logging.
+
+Wired into `watchers/alert_agent.send_urgent_alert` between the existing
+`partition_already_alerted` exact-sig pass and the
+`related_prior_alert` continuation annotation. Suppressed rows are
+marked `urgency=2` (mirrors every other gate's discipline so the queue
+empties instead of re-firing every 20s). Best-effort: any failure
+silently degrades to the prior exact-sig-only behaviour — same safety
+contract as every other alert gate; a missed alert is far worse than a
+duplicate.
+
+All four load-bearing invariants intact by construction:
+- `articles.db` `ai_score`/`ml_score`/`score_source` untouched (the
+  partition is pure; only `urgency` is mutated by `mark_alerted_batch`),
+- backtest isolation: synthetic rows are excluded upstream by
+  `get_unalerted_urgent`'s `_LIVE_ONLY_CLAUSE` (re-checked at the
+  formatter by `_is_synthetic`),
+- urgency state machine: only urgency=1 → urgency=2 transitions
+  (`mark_alerted_batch` is `SET urgency=2`).
+
+**Tests pinned** in `tests/test_alert_paraphrase_suppression.py` (14
+tests, all pass; full suite **1649 passed**):
+- live Samsung "S. Korea"/"South Korea" pair caught (the exact failure
+  mode);
+- distinct headlines NOT suppressed (zero-token-overlap unrelated
+  story);
+- antonym flip in short headline ("Fed raises rates" vs "Fed cuts
+  rates") NEVER merged (analyst-safe direction);
+- exact-signature repeats skipped (upstream catches them);
+- untitled / too-short / empty-recent rows always pass through;
+- end-to-end: a paraphrase second-cycle row is suppressed
+  (`claude_call`/`discord_send` mocks NEVER called), marked urgency=2,
+  `send_urgent_alert` returns False;
+- a genuinely distinct story still fires normally.
+
+**Phase 3 (live validation):** No fold-in fix needed.
+
+  1. **Collection rate healthy.** 2,553 live articles in the last hour
+     (excl. backtest/opus_annotation rows). Top sources by volume:
+     `GN: earnings` (175), `GN: Nasdaq` (132), `GN: economy inflation`
+     (104), `scraped/finance.yahoo.com` (64). Healthy distribution.
+  2. **40/40 workers alive.** Daemon supervisor health report at
+     2026-05-20T09:09:08Z: `ok=40 dead=0`. No worker disabled.
+  3. **Alert pipeline working but had ONE paraphrase duplicate** —
+     the exact failure the Phase 2 feature targets. Among 28 distinct
+     Discord pushes in 12h, only the Samsung S. Korea/South Korea pair
+     was a true paraphrase duplicate. Real urgent items fired
+     correctly: Nvidia Q1 earnings preview, Samsung strike (single
+     push after this fix), Micron price-target raises, "Stock futures
+     edge higher ahead of Nvidia earnings".
+  4. **Score-source distribution healthy.** Last 24h live rows: 7,364
+     `score_source='ml'` (model self-predictions, separate from LLM
+     pool), 662 `'llm'` (Sonnet/Opus ground truth), 3,882 `NULL`
+     (legacy pre-migration or synthetic backtest). The
+     ml/ai_score separation is intact — `update_ml_scores_batch`
+     writes to `ml_score` only, `score_source='ml'`, never pollutes
+     `ai_score`.
+  5. **Lock-retry exhaustion: 36 `insert_batch` failures in current
+     log session.** Pre-existing chronic issue documented in the
+     `di-insert-batch-lock-contention` user memory; not actionable in
+     this session per "don't 'fix' it" guidance. The 5-retry budget
+     with 60s timeout is the same as every other writer; the cause is
+     concurrent writer pressure with SQLite WAL on a USB drive.
+  6. **Recap-template gate is working.** "Why Micron Stock Just Popped
+     Again" appears 6× in `articles.db` as urgency=2 from
+     `Finnhub/Yahoo` / `YahooFinance/MU` / `Nasdaq Markets` / `Motley
+     Fool` / `scraped/finance.yahoo.com` — all marked alerted by the
+     `_RT_WHY_JUST_MOVED` gate WITHOUT firing a Discord push. The
+     analyst was never spammed.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:**
+- `python3 -c "import sys; sys.path.insert(0,'.'); from storage import
+  article_store; from ml import features, model; print('imports OK')"`
+  → `imports OK`.
+- Full repo suite: **1649 passed** in 650.51s (1635 baseline +
+  14 new).
+- New test file standalone: **14 passed** in 0.26s.
+
+**Counters:** `bugs_fixed=0` (no Phase 1 commit; existing tests already
+pin the invariants the brief enumerated; the Phase 1 commit guard
+explicitly allows skipping); `features_added=1` (paraphrase-tolerant
+suppression, commit `b34dbe3`); `user_findings=6` (collection rate,
+worker health, paraphrase duplicate fixed by the same commit, score-
+source distribution healthy, chronic lock-retry exhaustion confirmed
+as standing not fresh, recap gate confirmed working).
+
+**Concurrency hygiene:** Three other agents were running concurrently
+(paper-trader core, paper-trader ML+backtests, both-repo feature-dev)
+per the `pt-concurrent-samerole-staging-race` memory. `git status`
+checked before staging; `git diff --staged --stat` ran before commit;
+never `git add -A`; staged with explicit pathspec only
+(`watchers/alert_agent.py`, `watchers/alert_recency.py`,
+`tests/test_alert_paraphrase_suppression.py`). Untracked
+`paper-trader/docs/superpowers/plans/` left untouched. AGENTS.md
+appended-only, alongside the related code, in this same documentation
+commit.
