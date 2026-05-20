@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from . import market, reporter, strategy
+from .analytics.dynamic_interval import compute_interval
 from .store import DB_PATH, get_store
 
 NY = ZoneInfo("America/New_York")
@@ -754,7 +755,18 @@ def main():
             os._exit(0)
 
         market_open = market.is_market_open()
-        sleep_s = OPEN_INTERVAL_S if market_open else CLOSED_INTERVAL_S
+        current_positions: list[dict] = []
+        try:
+            import sqlite3 as _sq
+            _conn = _sq.connect(str(DB_PATH))
+            current_positions = [
+                {"ticker": r[0]} for r in
+                _conn.execute("SELECT ticker FROM positions WHERE closed_at IS NULL").fetchall()
+            ]
+            _conn.close()
+        except Exception:
+            pass
+        sleep_s = compute_interval(current_positions)
         print(f"[runner] sleeping {sleep_s}s (market_open={market_open})")
         _restart_requested.wait(timeout=sleep_s)
         if _restart_requested.is_set():
