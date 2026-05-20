@@ -11062,6 +11062,271 @@ def held_theme_decay_api():
         return jsonify({"error": str(e), "state": "ERROR"}), 500
 
 
+@app.route("/api/rising-unheld-themes")
+@swr_cached("rising-unheld-themes", 60.0)
+def rising_unheld_themes_api():
+    """Per-unheld-ticker fresh-vs-prior decayed-news-score velocity.
+
+    The mirror of ``/api/held-theme-decay``. held-theme-decay asks *is
+    the catalyst on a ticker I OWN still alive in the wire?* This
+    endpoint answers the complementary rotation question: *which
+    tickers does the wire have a RISING catalyst on that I am NOT in?*
+
+    Distinct from every neighbour (invariant #10 — do not consolidate):
+
+      * ``/api/news-themes`` — single-window decayed-score snapshot of
+        every theme (held + unheld). NO comparison vs an earlier
+        window: a stale theme with a long tail looks identical to one
+        that just lit up.
+      * ``/api/held-theme-decay`` — same velocity decomposition,
+        restricted to HELD tickers. Identical math; this is the
+        unheld complement (shares constants + ``_verdict`` rule via
+        SSOT import).
+      * ``/api/watchlist-opportunities`` — scan over the named
+        WATCHLIST tickers only, no velocity dimension, no decay
+        weighting.
+      * ``/api/idle-opportunity`` — drought-gated point-in-time
+        surface (only fires when the bot is in a HOLD streak);
+        snapshot, no velocity. This endpoint is always-on and is the
+        velocity decomposition, so an unheld ticker can show up here
+        with a BUILDING verdict even when the bot is actively trading
+        and idle-opportunity is silent.
+      * digital-intern ``trend_velocity`` — market-wide MENTION-RATE
+        gainers (Poisson), not score-weighted decayed prominence.
+
+    Builder is pure (``analytics/rising_unheld_themes.py``). Fresh-
+    window default (6h) is imported from
+    ``held_theme_decay.FRESH_WINDOW_HOURS`` so the two velocity
+    surfaces share their window shape (a rotation-pair invariant).
+    Defense-in-depth backtest filter at the builder so a leaked
+    synthetic row cannot reach user-facing JSON.
+
+    Verdict ladder (per-ticker):
+      DARK     — no qualifying articles in either window
+      FADING   — fresh < prior × FADE_RATIO (0.7)
+      STABLE   — between FADE_RATIO and BUILD_RATIO
+      BUILDING — fresh > prior × BUILD_RATIO (1.43) AND fresh >=
+                 MIN_FRESH_SCORE (1.0) — accelerating existing story
+      BREAKING — prior == 0 AND fresh >= BREAKING_FRESH_SCORE (3.0)
+                 — brand-new catalyst, no prior coverage (the highest-
+                 urgency rotation signal)
+
+    Output is sorted BREAKING > BUILDING > STABLE > FADING > DARK
+    within each bucket by descending fresh_score so the loudest
+    actionable rotation candidate tops the list.
+
+    Query params (all optional):
+      ``hours`` — fresh-window width (default 6, clamp 1..72). Prior
+        window is the immediately preceding band of the same width.
+      ``min_score`` — article ai_score floor at SQL (default 2.0,
+        0..10).
+      ``max_themes`` — cap on returned rows (default 20, clamp 1..100).
+        Aggregate counts span the full unheld universe regardless.
+
+    Advisory only — never gates Opus, adds no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.rising_unheld_themes import build_rising_unheld_themes
+
+        def _qf(name: str, default: float, lo: float, hi: float) -> float:
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        def _qi(name: str, default: int, lo: int, hi: int) -> int:
+            try:
+                v = int(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        fresh_window_hours = _qf("hours", 6.0, 1.0, 72.0)
+        min_score = _qf("min_score", 2.0, 0.0, 10.0)
+        max_themes = _qi("max_themes", 20, 1, 100)
+
+        now = datetime.now(timezone.utc)
+        # SQL window must cover the FULL fresh+prior band (2× the
+        # fresh window) plus a small safety margin so an article right
+        # at the prior-edge isn't trimmed by clock drift. Identical
+        # shape to held-theme-decay.
+        sql_window_hours = max(fresh_window_hours * 2.0 + 1.0, 4.0)
+        since = (now - timedelta(hours=sql_window_hours)).isoformat()
+
+        articles: list[dict] = []
+        path = _articles_db_path()
+        if path is not None:
+            conn = None
+            try:
+                conn = sqlite3.connect(
+                    f"file:{path}?mode=ro", uri=True, timeout=5)
+                rows = conn.execute(
+                    "SELECT title, url, source, ai_score, urgency, "
+                    "first_seen FROM articles "
+                    "WHERE first_seen >= ? AND ai_score >= ? "
+                    "AND url NOT LIKE 'backtest://%' "
+                    "AND source NOT LIKE 'backtest_%' "
+                    "AND source NOT LIKE 'opus_annotation%' "
+                    "ORDER BY ai_score DESC LIMIT 2000",
+                    (since, min_score),
+                ).fetchall()
+                from .signals import _extract_tickers  # noqa: WPS433
+                for r in rows:
+                    title = r[0] or ""
+                    tk = sorted(_extract_tickers(title))
+                    articles.append({
+                        "title": title, "url": r[1], "source": r[2],
+                        "ai_score": r[3], "urgency": r[4],
+                        "first_seen": r[5],
+                        "tickers": tk,
+                    })
+            except Exception:
+                articles = []
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        held: list[str] = []
+        try:
+            held = [
+                p["ticker"]
+                for p in get_store().open_positions()
+                if p.get("ticker")
+            ]
+        except Exception:
+            held = []
+
+        return jsonify(build_rising_unheld_themes(
+            articles, held_tickers=held, now=now,
+            fresh_window_hours=fresh_window_hours,
+            max_themes=max_themes,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR"}), 500
+
+
+@app.route("/api/sector-velocity-delta")
+@swr_cached("sector-velocity-delta", 60.0)
+def sector_velocity_delta_api():
+    """Per-sector-bucket news-velocity delta (fresh vs prior window).
+
+    Answers the operator's first-glance rotation question: *which
+    sector bucket is the wire ROTATING INTO right now?* — i.e. is
+    bucket-level news flow ACCELERATING or DECELERATING relative to
+    the immediately-prior window of equal length?
+
+    Distinct from neighbours (invariant #10 — do not consolidate):
+
+      * ``/api/sector-heatmap`` — PRICE + RSI + 24h news COUNT per
+        bucket; point-in-time snapshot. NO velocity dimension: a
+        bucket with steady 17-art/day and one ramping from 2→17 look
+        identical.
+      * ``/api/sector-pulse`` — per-ticker momentum + news count
+        snapshot; not bucketed, not velocity.
+      * ``/api/sector-signal-fit`` — bucket news COVERAGE vs the
+        live book's bucket WEIGHT (a fit measure, not a wire-time-
+        derivative).
+      * ``/api/sector-exposure`` — $-weight per bucket of the book;
+        the inverse direction (book→wire, not wire-velocity).
+      * ``/api/news-themes`` / ``/api/held-theme-decay`` /
+        ``/api/rising-unheld-themes`` — per-TICKER decomposition;
+        this endpoint is the per-BUCKET aggregation of the same
+        velocity shape.
+
+    Bucket SSOT is ``sector_heatmap.HEATMAP_BUCKETS`` — the same
+    bucket definitions ``/api/sector-heatmap`` uses, so a
+    ``memory_core ACCELERATING`` verdict here lines up with the
+    memory_core row of the heatmap. Decay / window / ratio constants
+    come from ``held_theme_decay`` / ``news_themes`` so re-tuning the
+    decay shape in one place updates all three velocity surfaces
+    (rotation-pair invariant, extended).
+
+    Verdict ladder (per bucket):
+      DARK         — no qualifying articles in either window
+      DECELERATING — fresh < prior × FADE_RATIO AND prior was
+                     bucket-level prominent (rotation OUT signal)
+      FADING       — ratio drop on a marginal bucket (informational)
+      STABLE       — between FADE_RATIO and BUILD_RATIO
+      BUILDING     — fresh > prior × BUILD_RATIO + per-ticker floor
+                     (individual ticker acceleration, sub-sector)
+      ACCELERATING — fresh > prior × ACCEL_RATIO AND fresh meets the
+                     bucket-prominence floor (rotation IN signal)
+
+    Query params (all optional):
+      ``hours`` — fresh-window width (default 6, clamp 1..72). Prior
+        window is the immediately preceding band of the same width.
+      ``min_score`` — article ai_score floor at SQL (default 2.0,
+        0..10).
+
+    Advisory only — never gates Opus, adds no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.sector_velocity_delta import build_sector_velocity_delta
+
+        def _qf(name: str, default: float, lo: float, hi: float) -> float:
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        fresh_window_hours = _qf("hours", 6.0, 1.0, 72.0)
+        min_score = _qf("min_score", 2.0, 0.0, 10.0)
+
+        now = datetime.now(timezone.utc)
+        # Same SQL window shape as held-theme-decay / rising-unheld:
+        # FULL fresh+prior band (2× the fresh window) + safety margin.
+        sql_window_hours = max(fresh_window_hours * 2.0 + 1.0, 4.0)
+        since = (now - timedelta(hours=sql_window_hours)).isoformat()
+
+        articles: list[dict] = []
+        path = _articles_db_path()
+        if path is not None:
+            conn = None
+            try:
+                conn = sqlite3.connect(
+                    f"file:{path}?mode=ro", uri=True, timeout=5)
+                rows = conn.execute(
+                    "SELECT title, url, source, ai_score, urgency, "
+                    "first_seen FROM articles "
+                    "WHERE first_seen >= ? AND ai_score >= ? "
+                    "AND url NOT LIKE 'backtest://%' "
+                    "AND source NOT LIKE 'backtest_%' "
+                    "AND source NOT LIKE 'opus_annotation%' "
+                    "ORDER BY ai_score DESC LIMIT 2000",
+                    (since, min_score),
+                ).fetchall()
+                from .signals import _extract_tickers  # noqa: WPS433
+                for r in rows:
+                    title = r[0] or ""
+                    tk = sorted(_extract_tickers(title))
+                    articles.append({
+                        "title": title, "url": r[1], "source": r[2],
+                        "ai_score": r[3], "urgency": r[4],
+                        "first_seen": r[5],
+                        "tickers": tk,
+                    })
+            except Exception:
+                articles = []
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        return jsonify(build_sector_velocity_delta(
+            articles, now=now,
+            fresh_window_hours=fresh_window_hours,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR"}), 500
+
+
 @app.route("/api/round-trip-postmortem")
 @swr_cached("round-trip-postmortem", 60.0)
 def round_trip_postmortem_api():
@@ -12438,6 +12703,22 @@ def _swr_prewarm():
         # when the operator is checking "did any held thesis go dark while
         # I was away" — locked by the prewarm==@swr_cached invariant.
         ("held-theme-decay", held_theme_decay_api),
+        # rising-unheld-themes @swr_cached 60s — same articles.db SELECT
+        # shape as held-theme-decay (~2000 rows + ticker regex over a
+        # 13h+ window for a 6h fresh+prior band). First poll right
+        # after a restart is exactly when the operator scans for
+        # rotation candidates ("what catalyst am I missing while my
+        # held names are FADING?") — locked by the prewarm==@swr_cached
+        # invariant.
+        ("rising-unheld-themes", rising_unheld_themes_api),
+        # sector-velocity-delta @swr_cached 60s — same articles.db
+        # SELECT shape as held-theme-decay / rising-unheld-themes
+        # (~2000 rows + ticker regex over a 13h+ window for a 6h
+        # fresh+prior band). First poll right after a restart is
+        # exactly when the operator scans for sector rotation
+        # ("is the wire moving from semis into design or the other
+        # way?") — locked by the prewarm==@swr_cached invariant.
+        ("sector-velocity-delta", sector_velocity_delta_api),
         # round-trip-postmortem @swr_cached 60s — store.recent_trades
         # + market.get_prices (yfinance per closed-ticker). yfinance
         # is the long-tail latency contributor; same cold-stall blind
