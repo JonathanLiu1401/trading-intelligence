@@ -30,12 +30,20 @@ def compute():
     # training labels. Same drift class as the publish_lag_audit /
     # source_diversity / trend_velocity fixes; pinned by
     # tests/test_analytics_backtest_isolation.py.
+    #
+    # ai_score > 0: the column defaults to 0 (REAL DEFAULT 0), never NULL,
+    # so `ai_score IS NOT NULL` was a tautology that included every unscored
+    # row at ai_score=0 in the per-source variance calculation. A source with
+    # 100 LLM-scored rows (3..7) and 900 unscored zeros looks vastly more
+    # "noisy" than its real LLM-label spread; urgency_scorer floors any
+    # LLM-touched row at 0.01 so `> 0` is the canonical "the LLM graded this"
+    # filter (same SSOT as ml/score_agreement._MIN_AI).
     rows = conn.execute(
         f"""
         SELECT source, ai_score
           FROM articles
          WHERE id IN (SELECT id FROM articles ORDER BY id DESC LIMIT ?)
-           AND ai_score IS NOT NULL
+           AND ai_score > 0
            AND {_LIVE_ONLY_CLAUSE}
         """,
         (SCAN_LIMIT,),
