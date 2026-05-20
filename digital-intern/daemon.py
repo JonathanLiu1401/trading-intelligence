@@ -65,6 +65,7 @@ from collectors.polygon_collector import collect_polygon
 from collectors.massive_collector import collect_massive
 from collectors.newsapi_collector import collect_newsapi
 from collectors.yahoo_ticker_rss import collect_yahoo_ticker_rss
+from collectors.short_interest_collector import collect_short_interest
 from collectors.wikipedia_collector import collect_wikipedia
 from collectors.macro_calendar_collector import collect_macro_calendar
 from collectors.congress_trades_collector import collect_congress_trades
@@ -141,6 +142,7 @@ CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog
 MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
+SHORT_INTEREST_INTERVAL = 21600   # highshortinterest.com every 6h (data updates ~2/month)
 VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
 DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
 SECTOR_ETF_INTERVAL     = 600     # Sector ETF momentum snapshot every 10min
@@ -205,7 +207,7 @@ ALL_WORKERS = (
     "gdelt", "rss", "web", "reddit", "ticker", "sec_edgar", "sec_edgar_ft", "sec_xbrl",
     "google_news", "nitter", "substack",
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
-    "yahoo_ticker_rss", "market_movers", "wikipedia", "macro_calendar",
+    "yahoo_ticker_rss", "market_movers", "wikipedia", "macro_calendar", "short_interest",
     "fed_press", "ecb_press", "boj_press", "boe_press", "g10_cb", "global_reg",
     "usgs_quake",
     "scorer", "alert", "heartbeat", "purge", "stats",
@@ -234,6 +236,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "market_movers": MARKET_MOVERS_INTERVAL,
     "fear_greed": FEAR_GREED_INTERVAL,
     "yield_curve": YIELD_CURVE_INTERVAL,
+    "short_interest": SHORT_INTEREST_INTERVAL,
     "wikipedia": WIKIPEDIA_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL,
     "cisa_kev": CISA_KEV_INTERVAL,
     "benzinga_analyst": BENZINGA_INTERVAL,
@@ -1004,6 +1007,28 @@ def yield_curve_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(YIELD_CURVE_INTERVAL)
+
+
+# ── Worker: High short interest monitor — every 6h ──────────────────────────
+def short_interest_worker(store: ArticleStore):
+    log.info("[short_interest_worker] started")
+    bo = Backoff("short_interest", base=60.0, cap=3600.0)
+    while _running:
+        try:
+            articles = collect_short_interest()
+            _ingest(store, articles, "short_interest")
+            try:
+                source_health.record_result("short_interest", len(articles))
+            except Exception as he:
+                log.warning(f"[short_interest_worker] source_health error: {he}")
+            _worker_last_ok["short_interest"] = time.time()
+            log.debug(f"[short_interest] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[short_interest_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SHORT_INTEREST_INTERVAL)
 
 
 # ── Worker: VIX term structure snapshot — every 10min ───────────────────────
@@ -2602,6 +2627,7 @@ def main():
         ("newsapi",     newsapi_worker),
         ("yahoo_ticker_rss", yahoo_ticker_rss_worker),
         ("market_movers", market_movers_worker),
+        ("short_interest", short_interest_worker),
         ("fear_greed",  fear_greed_worker),
         ("yield_curve", yield_curve_worker),
         ("vix_ts",      vix_ts_worker),
