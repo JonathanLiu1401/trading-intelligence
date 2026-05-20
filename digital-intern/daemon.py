@@ -69,6 +69,7 @@ from collectors.congress_trades_collector import collect_congress_trades
 from collectors.finra_short_volume import collect_finra_short_volume
 from collectors.market_movers import collect_market_movers
 from collectors.fear_greed_collector import collect_fear_greed
+from collectors.yield_curve_collector import collect_yield_curve
 from collectors.vix_term_structure import collect as collect_vix_ts
 from collectors.dxy_collector import collect as collect_dxy
 from collectors.sector_etf_momentum import collect as collect_sector_etf
@@ -132,6 +133,7 @@ CONGRESS_TRADES_INTERVAL = 3600   # Congressional trading disclosures — once p
 CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog — once per hour
 MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
+YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
 VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
 DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
 SECTOR_ETF_INTERVAL     = 600     # Sector ETF momentum snapshot every 10min
@@ -220,6 +222,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "yahoo_ticker_rss": YAHOO_TICKER_RSS_INTERVAL,
     "market_movers": MARKET_MOVERS_INTERVAL,
     "fear_greed": FEAR_GREED_INTERVAL,
+    "yield_curve": YIELD_CURVE_INTERVAL,
     "wikipedia": WIKIPEDIA_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL,
     "cisa_kev": CISA_KEV_INTERVAL,
     "benzinga_analyst": BENZINGA_INTERVAL,
@@ -943,6 +946,28 @@ def fear_greed_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(FEAR_GREED_INTERVAL)
+
+
+# ── Worker: 10Y-2Y yield-curve inversion monitor — every 1h ─────────────────
+def yield_curve_worker(store: ArticleStore):
+    log.info("[yield_curve_worker] started")
+    bo = Backoff("yield_curve", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_yield_curve()
+            _ingest(store, articles, "yield_curve")
+            try:
+                source_health.record_result("yield_curve", len(articles))
+            except Exception as he:
+                log.warning(f"[yield_curve_worker] source_health error: {he}")
+            _worker_last_ok["yield_curve"] = time.time()
+            log.debug(f"[yield_curve] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[yield_curve_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(YIELD_CURVE_INTERVAL)
 
 
 # ── Worker: VIX term structure snapshot — every 10min ───────────────────────
@@ -2455,6 +2480,7 @@ def main():
         ("yahoo_ticker_rss", yahoo_ticker_rss_worker),
         ("market_movers", market_movers_worker),
         ("fear_greed",  fear_greed_worker),
+        ("yield_curve", yield_curve_worker),
         ("vix_ts",      vix_ts_worker),
         ("dxy",         dxy_worker),
         ("sector_etf",  sector_etf_worker),
