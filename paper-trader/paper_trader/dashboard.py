@@ -10043,6 +10043,35 @@ def position_attention_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/position-rationale")
+def position_rationale_api():
+    """Per-open-position most-recent Opus rationale — *what did Opus actually
+    say* about each held name?
+
+    ``position_attention`` answers "did Opus look?" (freshness, neglect).
+    ``thesis_drift`` re-tests entry theses. Neither surfaces the **concrete
+    current rationale** — the trader's #1 question reviewing the live book:
+    *"why am I still holding NVDA? what did Opus actually say last cycle?"*
+
+    The data is already in ``decisions.reasoning`` (JSON envelope written
+    by ``strategy.decide()``: ``{"decision": {"reasoning": "...",
+    "confidence": x}, ...}``). Today the operator must scroll the decision
+    feed and find the most recent row for each ticker by hand. This puts
+    the answer one HTTP read away. Pure read of ``open_positions`` +
+    ``recent_decisions`` — no network, no Opus invocation. Advisory only —
+    never gates Opus, never injected into the decision prompt, adds no
+    caps (AGENTS.md #2/#12 — the ``position_attention`` precedent)."""
+    try:
+        from .analytics.position_rationale import build_position_rationale
+        store = get_store()
+        return jsonify(build_position_rationale(
+            store.open_positions(),
+            store.recent_decisions(limit=3000),
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def _ticker_news_cooldown(tickers: list[str],
                           min_score: float,
                           hours_window: int = 72) -> dict[str, dict]:
@@ -14204,6 +14233,104 @@ def news_to_trade_lag_api():
     except Exception as e:
         return jsonify({"error": str(e), "verdict": "ERROR",
                         "per_trade": []}), 500
+
+
+@app.route("/api/holding-period-distribution")
+def holding_period_distribution_api():
+    """Closed round-trip P/L stratified by hold duration.
+
+    Every realised-P/L surface on this desk (``track_record``,
+    ``trade_asymmetry``, ``round_trip_postmortem``, ``churn``,
+    ``winner_autopsy``, ``loser_autopsy``) reduces the round-trip set to a
+    single aggregate or per-trip story — none of them answer
+    "*where in the holding-period axis does my P/L live?*". This endpoint
+    is that stratification: buckets every closed trip into SCALP (<1h) /
+    INTRADAY (1-6h) / OVERNIGHT (6-24h) / SWING (1-3d) / TREND (3-7d) /
+    POSITION (>7d) and surfaces per-bucket n_trips + total P/L + win rate
+    + share-of-P/L. ``alpha_engine`` (highest total P/L bucket) and
+    ``dominant_bucket`` (most-trips bucket) together give the actionable
+    signal "63% of trips are SCALP but 91% of P/L comes from SWING".
+
+    Composes ``analytics.round_trips.build_round_trips`` as the SSOT for
+    the closed-trip ledger (AGENTS.md invariant #10) and feeds it to
+    ``analytics.holding_period_distribution.build_holding_period_distribution``.
+    Pure read — no network, no extra DB hops beyond the trades read. Never
+    raises (a malformed trade row degrades that row, never the verdict).
+
+    Observational only — never gates Opus, never injected into the
+    decision prompt, no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.round_trips import build_round_trips
+        from .analytics.holding_period_distribution import (
+            build_holding_period_distribution,
+        )
+        try:
+            limit = int(request.args.get("limit", 2000))
+        except Exception:
+            limit = 2000
+        limit = max(50, min(limit, 10000))
+
+        store = get_store()
+        trades = store.recent_trades(limit=limit)
+        # build_round_trips expects oldest-first; recent_trades returns
+        # newest-first per the existing convention in the round-trips
+        # endpoint.
+        trades_oldest_first = list(reversed(trades or []))
+        round_trips = build_round_trips(trades_oldest_first)
+        result = build_holding_period_distribution(round_trips)
+        result["as_of"] = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR",
+                        "buckets": []}), 500
+
+
+@app.route("/api/add-discipline")
+def add_discipline_api():
+    """ADD-trade discipline audit — chasing vs averaging-down vs stacking.
+
+    When the book BUYs into a name it already holds, that ADD carries a
+    sign: paying above the running avg_cost is *chasing* (anchoring on
+    the original entry, bidding into strength after the easy money is
+    gone); paying below is *averaging down* (rational only if the thesis
+    is intact, the textbook setup for ``loser_autopsy``'s SLOW_BLEED).
+    No existing endpoint watches this — ``trade_asymmetry`` reduces to
+    disposition, ``churn`` counts overtrading, ``loser_autopsy`` narrates
+    closed losses but doesn't see the ADD moment itself. This is the
+    missing surface.
+
+    The closed-round-trip rollup answers the falsifiable question: did
+    chasing-ADDs produce worse round-trip P/L than averaging-down ADDs?
+    Per-style P/L lets the operator see whether the bot's averaging-down
+    is rationally cost-improving or doubling-down on broken theses.
+
+    Composes ``analytics.round_trips.build_round_trips`` as the SSOT
+    (AGENTS.md #10) and ``analytics.add_discipline.build_add_discipline``
+    over the same trade ledger. Pure read — never raises. Observational
+    only — never gates Opus, no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.round_trips import build_round_trips
+        from .analytics.add_discipline import build_add_discipline
+        try:
+            limit = int(request.args.get("limit", 2000))
+        except Exception:
+            limit = 2000
+        limit = max(50, min(limit, 10000))
+
+        store = get_store()
+        trades = store.recent_trades(limit=limit)
+        trades_oldest_first = list(reversed(trades or []))
+        round_trips = build_round_trips(trades_oldest_first)
+        result = build_add_discipline(trades_oldest_first, round_trips)
+        result["as_of"] = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR",
+                        "adds": [], "counts": {}}), 500
 
 
 if __name__ == "__main__":
