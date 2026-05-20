@@ -3492,6 +3492,219 @@ class TestNextSessionLine:
         assert "**MARKET** ◈ closed" not in captured[0]
 
 
+class TestTodaySessionAnchorIso:
+    """`_today_session_anchor_iso` — the pure NYSE-calendar anchor that
+    `_today_session_line` reads from. Returns None on non-trading days /
+    pre-open, otherwise today's 09:30 ET as UTC ISO."""
+
+    def _utc_from_ny(self, year, month, day, hour, minute):
+        return datetime(year, month, day, hour, minute,
+                        tzinfo=reporter.market.NY).astimezone(timezone.utc)
+
+    def test_weekend_returns_none(self):
+        # 2026-05-16 Sat 10:00 ET.
+        now = self._utc_from_ny(2026, 5, 16, 10, 0)
+        assert reporter._today_session_anchor_iso(now) is None
+
+    def test_holiday_returns_none(self):
+        # 2026-11-26 Thanksgiving Thu 10:00 ET — full close.
+        now = self._utc_from_ny(2026, 11, 26, 10, 0)
+        assert reporter._today_session_anchor_iso(now) is None
+
+    def test_pre_open_returns_none(self):
+        # 2026-05-14 Thu 09:00 ET — 30m before the bell.
+        now = self._utc_from_ny(2026, 5, 14, 9, 0)
+        assert reporter._today_session_anchor_iso(now) is None
+
+    def test_pre_open_one_minute_before_open_returns_none(self):
+        # 2026-05-14 Thu 09:29 ET — the strict ``<`` boundary.
+        now = self._utc_from_ny(2026, 5, 14, 9, 29)
+        assert reporter._today_session_anchor_iso(now) is None
+
+    def test_at_open_returns_today_anchor(self):
+        # 2026-05-14 Thu 09:30 ET — the bell rings; anchor returned.
+        now = self._utc_from_ny(2026, 5, 14, 9, 30)
+        iso = reporter._today_session_anchor_iso(now)
+        # 09:30 ET == 13:30 UTC during DST (May).
+        assert iso == "2026-05-14T13:30:00+00:00"
+
+    def test_intraday_returns_same_open_anchor(self):
+        # 2026-05-14 Thu 13:00 ET (mid-session) — same 09:30 ET anchor.
+        now = self._utc_from_ny(2026, 5, 14, 13, 0)
+        iso = reporter._today_session_anchor_iso(now)
+        assert iso == "2026-05-14T13:30:00+00:00"
+
+    def test_post_close_still_returns_today_anchor(self):
+        # 2026-05-14 Thu 18:00 ET (post-close). The line still answers
+        # "what did today's session do" — anchor stays at today 09:30 ET
+        # until tomorrow's pre-open shifts it forward.
+        now = self._utc_from_ny(2026, 5, 14, 18, 0)
+        iso = reporter._today_session_anchor_iso(now)
+        assert iso == "2026-05-14T13:30:00+00:00"
+
+    def test_half_day_open_unchanged(self):
+        # 2026-11-27 Fri — NYSE early-close half-day. The OPEN bell still
+        # rings at 09:30 ET (only the close moves to 13:00). So the
+        # anchor for a half-day is unchanged: 09:30 ET → 14:30 UTC.
+        now = self._utc_from_ny(2026, 11, 27, 11, 0)
+        iso = reporter._today_session_anchor_iso(now)
+        # November is EST (UTC-5), so 09:30 ET == 14:30 UTC.
+        assert iso == "2026-11-27T14:30:00+00:00"
+
+
+class TestTodaySessionLine:
+    """`_today_session_line` — single line "what has TODAY's session done so
+    far" anchored to 09:30 ET. Reuses ``_window_delta`` for direction so the
+    hourly's 1h SESSION block and this surface can never disagree on
+    direction. Suppressed when non-trading-day, pre-open, or no equity
+    point at-or-after today's open."""
+
+    def _utc_from_ny(self, year, month, day, hour, minute):
+        return datetime(year, month, day, hour, minute,
+                        tzinfo=reporter.market.NY).astimezone(timezone.utc)
+
+    def test_weekend_returns_empty(self, fresh_store):
+        now = self._utc_from_ny(2026, 5, 16, 10, 0)  # Sat
+        assert reporter._today_session_line(fresh_store, now=now) == ""
+
+    def test_pre_open_returns_empty(self, fresh_store):
+        now = self._utc_from_ny(2026, 5, 14, 9, 0)   # Thu 09:00 ET
+        assert reporter._today_session_line(fresh_store, now=now) == ""
+
+    def test_no_equity_curve_returns_empty(self, fresh_store):
+        # Trading day at 13:00 ET, but the store has no equity points yet.
+        now = self._utc_from_ny(2026, 5, 14, 13, 0)
+        assert reporter._today_session_line(fresh_store, now=now) == ""
+
+    def test_only_pre_open_points_returns_empty(self, fresh_store,
+                                                  monkeypatch):
+        # Equity curve exists but every point is BEFORE today's 09:30 ET.
+        # next() falls back to the last point (= last), → "" not crash.
+        now = self._utc_from_ny(2026, 5, 14, 10, 0)
+        # Two pre-open points (UTC).
+        pre_open = "2026-05-14T12:00:00+00:00"  # 08:00 ET
+        pre_open2 = "2026-05-14T13:00:00+00:00"  # 09:00 ET
+        # Inject a curve that has no point >= anchor (13:30 UTC).
+        monkeypatch.setattr(
+            fresh_store, "equity_curve",
+            lambda limit=5000: [
+                {"timestamp": pre_open, "total_value": 1000.0,
+                 "sp500_price": 5000.0},
+                {"timestamp": pre_open2, "total_value": 1005.0,
+                 "sp500_price": 5010.0},
+            ],
+        )
+        assert reporter._today_session_line(fresh_store, now=now) == ""
+
+    def test_exact_intraday_pl_with_alpha(self, fresh_store, monkeypatch):
+        # 2026-05-14 Thu 13:00 ET — anchor at 13:30 UTC (09:30 ET).
+        now = self._utc_from_ny(2026, 5, 14, 13, 0)
+        # Seed an equity curve: pre-open + at-open + later.
+        # base = 13:30 UTC: total_value=1000, sp=5000.
+        # last = 17:00 UTC: total_value=1020, sp=5050.
+        # port_pct = (1020/1000-1)*100 = +2.00%
+        # spy_pct  = (5050/5000-1)*100 = +1.00%
+        # alpha    = +1.00%
+        # port_abs = 1020 - 1000 = +$20.00
+        curve = [
+            {"timestamp": "2026-05-14T12:00:00+00:00",  # pre-open, ignored
+             "total_value": 990.0, "sp500_price": 4990.0},
+            {"timestamp": "2026-05-14T13:30:00+00:00",  # base (09:30 ET)
+             "total_value": 1000.0, "sp500_price": 5000.0},
+            {"timestamp": "2026-05-14T17:00:00+00:00",  # last (13:00 ET)
+             "total_value": 1020.0, "sp500_price": 5050.0},
+        ]
+        monkeypatch.setattr(fresh_store, "equity_curve",
+                             lambda limit=5000: curve)
+        line = reporter._today_session_line(fresh_store, now=now)
+        assert line.startswith("**TODAY** ◈ since 09:30 ET NYSE open")
+        assert "$+20.00 (+2.00%)" in line
+        assert "alpha `+1.00%`" in line
+
+    def test_negative_intraday_motion(self, fresh_store, monkeypatch):
+        # Losing session: -$30 on a $1000 baseline, no SPY data (alpha
+        # clause must NOT render when only port_pct is available).
+        now = self._utc_from_ny(2026, 5, 14, 14, 0)
+        curve = [
+            {"timestamp": "2026-05-14T13:30:00+00:00",
+             "total_value": 1000.0, "sp500_price": None},
+            {"timestamp": "2026-05-14T18:00:00+00:00",
+             "total_value": 970.0, "sp500_price": None},
+        ]
+        monkeypatch.setattr(fresh_store, "equity_curve",
+                             lambda limit=5000: curve)
+        line = reporter._today_session_line(fresh_store, now=now)
+        assert "$-30.00 (-3.00%)" in line
+        assert "alpha" not in line                    # no SPY → no alpha clause
+
+    def test_store_fault_degrades_to_empty(self, monkeypatch):
+        # Builder/store exception → "" (never "no Discord summary").
+        boom = MagicMock()
+        boom.equity_curve.side_effect = RuntimeError("db gone")
+        now = self._utc_from_ny(2026, 5, 14, 13, 0)
+        assert reporter._today_session_line(boom, now=now) == ""
+
+    def test_hourly_wires_today_block_when_in_session(
+        self, fresh_store, monkeypatch
+    ):
+        """Locks the wiring: the hourly summary INCLUDES the **TODAY** block
+        when the session anchor resolves AND there's an in-window equity
+        point. This is the integration regression-lock."""
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5050.0)
+        monkeypatch.setattr(reporter.market, "is_market_open",
+                            lambda *_a, **_k: True)
+        # Seed an in-window equity curve. _today_session_line reads "now"
+        # from the wall clock when not passed; the wiring call does not
+        # pass `now`. To pin behavior we monkeypatch the anchor helper.
+        monkeypatch.setattr(
+            reporter, "_today_session_anchor_iso",
+            lambda now=None: "2026-05-14T13:30:00+00:00",
+        )
+        # Real fresh_store: record a base point at the anchor + a later
+        # point (post-anchor). Direct sqlite manipulation via store API.
+        fresh_store.conn.execute(
+            "INSERT INTO equity_curve (timestamp,total_value,cash,sp500_price)"
+            " VALUES (?,?,?,?)",
+            ("2026-05-14T13:30:00+00:00", 1000.0, 500.0, 5000.0),
+        )
+        fresh_store.conn.execute(
+            "INSERT INTO equity_curve (timestamp,total_value,cash,sp500_price)"
+            " VALUES (?,?,?,?)",
+            ("2026-05-14T17:00:00+00:00", 1015.0, 485.0, 5050.0),
+        )
+        fresh_store.conn.commit()
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**TODAY** ◈ since 09:30 ET NYSE open" in body
+        # 1015/1000-1 = +1.5%, 5050/5000-1 = +1%, alpha = +0.5%
+        assert "$+15.00 (+1.50%)" in body
+        assert "alpha `+0.50%`" in body
+
+    def test_hourly_omits_today_block_pre_open(
+        self, fresh_store, monkeypatch
+    ):
+        """Locks the suppression wiring: a pre-open hourly does NOT include
+        the **TODAY** block (anchor resolves to None)."""
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5000.0)
+        monkeypatch.setattr(reporter.market, "is_market_open",
+                            lambda *_a, **_k: False)
+        # Anchor returns None (pre-open / non-trading day): no TODAY line.
+        monkeypatch.setattr(
+            reporter, "_today_session_anchor_iso",
+            lambda now=None: None,
+        )
+        assert reporter.send_hourly_summary() is True
+        assert "**TODAY** ◈" not in captured[0]
+
+
 class TestSourceMixLine:
     """`_source_mix_line` + its hourly/daily wiring — the news-breadth
     false-signal surface. `news_velocity` measures rate (BUILDING/FADING);
