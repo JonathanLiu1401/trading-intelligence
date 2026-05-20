@@ -94,22 +94,39 @@ def _parse_dt(s) -> datetime | None:
 
 
 def _is_session_open_window(now_et: datetime) -> bool:
-    """First 30 min of the regular NYSE session (9:30-10:00 ET, weekday)."""
+    """First 30 min of the regular NYSE session (9:30-10:00 ET, weekday,
+    not a full holiday). Half-days still open at 9:30 ET so they fall in
+    this window normally."""
     if now_et.weekday() >= 5:  # Saturday/Sunday
         return False
+    try:
+        from ..market import NYSE_HOLIDAYS_2026
+        if now_et.date() in NYSE_HOLIDAYS_2026:
+            return False
+    except Exception:
+        pass
     start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     end = now_et.replace(hour=10, minute=0, second=0, microsecond=0)
     return start <= now_et < end
 
 
 def _is_market_hours(now_et: datetime) -> bool:
-    """Regular NYSE hours, weekday (ignores holidays — best-effort fallback
-    only, used when the proper market.is_market_open is unavailable)."""
-    if now_et.weekday() >= 5:
-        return False
-    start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    end = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-    return start <= now_et < end
+    """Regular NYSE hours, honoring weekends, full holidays, and half-day
+    early closes (so cadence here never disagrees with the trader's own
+    ``market.is_market_open`` gate — the documented half-day bug was that the
+    simple 9:30-16:00 rule kept the OPEN cadence running for three hours past
+    the 13:00 early bell, and fired SESSION/OPEN-tier cycles on full
+    holidays). Falls back to the bare weekday/hour rule only if the market
+    module is unavailable."""
+    try:
+        from ..market import is_market_open
+        return is_market_open(now_et.astimezone(timezone.utc))
+    except Exception:
+        if now_et.weekday() >= 5:
+            return False
+        start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        end = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        return start <= now_et < end
 
 
 def _is_earnings_window(now_et: datetime) -> bool:

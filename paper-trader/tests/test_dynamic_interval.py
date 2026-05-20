@@ -129,3 +129,78 @@ def test_missing_calendar_path_does_not_raise(tmp_path):
     # Missing file → no earnings tier — falls through to MARKET_OPEN
     # for a weekday 10:30 ET.
     assert sleep_s == 1800
+
+
+# ─────────────────────── half-day / holiday correctness ───────────────────────
+
+def test_half_day_afternoon_after_early_close_is_closed_cadence(tmp_path):
+    """Day after Thanksgiving 2026 (2026-11-27) closes at 13:00 ET. At 14:30
+    ET — three-quarters of an hour past the early bell — the trader must NOT
+    still be on the 30-min MARKET_OPEN cadence; the bug was the simple
+    9:30-16:00 rule kept firing OPEN-tier cycles for three hours on a closed
+    market, doubling Opus subprocess load against a frozen book."""
+    cal = tmp_path / "earnings_calendar.json"
+    _write_calendar(cal, [])
+    now_utc = _et(2026, 11, 27, 14, 30)  # half-day, post-close
+    sleep_s = compute_interval(
+        positions=[{"ticker": "NVDA"}],
+        now=now_utc,
+        calendar_path=cal,
+    )
+    # Held position → MARKET_CLOSED (3600s), not MARKET_OPEN (1800s)
+    assert sleep_s == 3600, (
+        f"half-day post-close should use closed cadence, got {sleep_s}s"
+    )
+
+
+def test_half_day_before_early_close_still_open_cadence(tmp_path):
+    """Day after Thanksgiving 2026 at 11:00 ET — pre-13:00 close, market IS
+    open. Cadence must remain MARKET_OPEN (1800s) so the fix does not over-
+    correct and starve the genuine half-day morning session."""
+    cal = tmp_path / "earnings_calendar.json"
+    _write_calendar(cal, [])
+    now_utc = _et(2026, 11, 27, 11, 0)  # half-day morning, market open
+    sleep_s = compute_interval(
+        positions=[{"ticker": "NVDA"}],
+        now=now_utc,
+        calendar_path=cal,
+    )
+    assert sleep_s == 1800, (
+        f"half-day morning should still be open cadence, got {sleep_s}s"
+    )
+
+
+def test_full_holiday_uses_closed_cadence(tmp_path):
+    """Christmas 2026 at 10:00 ET — NYSE fully closed. The trader must NOT
+    cycle on the OPEN cadence: the simple weekday/hour rule used to pick
+    MARKET_OPEN, leaving the runner spawning Opus subprocesses against a
+    closed market every 30 min on a major holiday."""
+    cal = tmp_path / "earnings_calendar.json"
+    _write_calendar(cal, [])
+    now_utc = _et(2026, 12, 25, 10, 0)  # Christmas Day, full holiday
+    sleep_s = compute_interval(
+        positions=[{"ticker": "NVDA"}],
+        now=now_utc,
+        calendar_path=cal,
+    )
+    assert sleep_s == 3600, (
+        f"full holiday should use closed cadence, got {sleep_s}s"
+    )
+
+
+def test_holiday_does_not_trigger_session_open_window(tmp_path):
+    """MLK Day 2026 (Monday 2026-01-19) at 9:45 ET — without the holiday
+    check the 9:30-10:00 SESSION_OPEN window would fire (300s), which is
+    even more aggressive than MARKET_OPEN. On a closed market this is
+    pure wasted Opus capacity."""
+    cal = tmp_path / "earnings_calendar.json"
+    _write_calendar(cal, [])
+    now_utc = _et(2026, 1, 19, 9, 45)  # MLK Day, fully closed
+    sleep_s = compute_interval(
+        positions=[{"ticker": "NVDA"}],
+        now=now_utc,
+        calendar_path=cal,
+    )
+    assert sleep_s == 3600, (
+        f"holiday 9:45 ET should NOT trigger SESSION_OPEN, got {sleep_s}s"
+    )
