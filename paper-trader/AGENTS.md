@@ -1161,6 +1161,69 @@ modulates identically; reasoning surfaces the skip; independent of the
   > (CLAUDE.md §6). The actionable thread: the signal demonstrably *exists*
   > in raw `ml_score` (+0.20 OOS); the MLP is the lossy component.
 
+### Persona name + raw regime label in outcomes (2026-05-19)
+
+- **`_compute_decision_outcomes` now additively records `persona` (e.g.
+  `"Momentum Trader"`) + `regime_label` (raw `bull` / `sideways` / `bear` /
+  `unknown` string)** on every outcome row. Inert to scorer training
+  (`train_scorer` / `build_features` ignore unknown dict keys — the
+  `forward_return_10d/20d` / `wk52_pos` / `gate_scorer_pred` precedent), so
+  no retrain is required and the scorer pickle / `N_FEATURES` / every
+  existing OOS diagnostic stay byte-identical.
+- **Why persona:** `persona_skill` / `persona_leaderboard` already derive
+  the persona via `persona_for(run_id)` at analysis time. Capturing the
+  NAME directly lets ad-hoc shell queries
+  (`grep '"persona": "Momentum"' data/decision_outcomes.jsonl | …`) and
+  future per-persona diagnostics filter without re-importing the live
+  `PERSONAS` dict. If a future change renames or adds personas, old
+  outcome rows still self-describe (they carry the persona name as it was
+  when the decision happened, not as it is now).
+- **Why regime_label:** `regime_mult` (0.3 / 0.6 / 1.0) is a stringly-typed
+  encoding of the `bull` / `sideways` / `bear` / `unknown` label that
+  `_ml_decide` and `_compute_decision_outcomes` both compute from the SPY
+  50/200 MA via `_market_regime`. The multiplier alone cannot distinguish
+  `bull` from `unknown` (both = 1.0), so a regime-conditional cut on
+  `regime_mult == 1.0` silently lumps SPY-pre-200d-history `unknown`
+  cycles with real bull cycles — biasing every per-regime analysis.
+  Capturing the raw label resolves that ambiguity. `regime_audit` (which
+  decodes the same label from `regime_mult`) keeps working unchanged.
+- **Test-locked in `tests/test_continuous.py::TestWk52PosCapturedInOutcomes`:**
+  `test_persona_and_regime_label_captured` (run_id=2 → `"Momentum Trader"`,
+  `regime_label` is one of the documented strings),
+  `test_persona_field_present_for_run_id_1` (run_id=1 → `"Value Investor"`,
+  locks the `persona_for` `((run_id - 1) % 10) + 1` cycling formula),
+  `test_capture_does_not_break_existing_keys` (full schema regression —
+  every previously-documented outcome field must still appear).
+
+### `_VOLUME_CACHE` bounded LRU eviction (2026-05-19)
+
+- **`paper_trader/backtest.py::_VOLUME_CACHE_DISK_LOADED` is now an
+  `OrderedDict` (LRU bookkeeping), bounded to the most recent
+  `_VOLUME_CACHE_MAX_WINDOWS = 16` (start, end) windows.** Before this
+  pass, every continuous-loop cycle picked a fresh random window and the
+  in-memory `_VOLUME_CACHE` / `_VOLUME_CACHE_DISK_LOADED` accumulated
+  forever — roughly 30 quant-signal tickers × ~250 daily volumes × 8 bytes
+  ≈ 60 KB / window; ~144 cycles / 24 h ≈ 8.6 MB / day, ≈ 60 MB / week of
+  resident memory leaking with no clean release path on a 14 GB host.
+- **LRU on access:** `_load_volume_cache_for_window` calls `move_to_end`
+  when a previously-seen window is hit, so an actively-replayed window
+  doesn't get evicted under the cap. New eviction helper
+  `_evict_oldest_volume_windows_locked()` (called only under
+  `_VOLUME_CACHE_LOCK`) drops both the bookkeeping entry AND every
+  per-ticker series whose key matches the evicted (start, end) — memory
+  is actually reclaimed, not just bookkeeping. On-disk caches at
+  `data/backtest_cache/volumes_<start>_<end>.json` are untouched; a
+  revisited window pays one disk read, not a yfinance fetch.
+- **Test-locked in `tests/test_backtest.py::TestVolumeCacheBoundedLRU`:**
+  `test_evicts_oldest_when_cap_exceeded` (eviction triggers at cap+1 and
+  purges per-ticker series, not just the bookkeeping set),
+  `test_access_refreshes_lru_order` (touching an old window moves it to
+  most-recently-used so the next eviction drops a different victim).
+  `conftest.py` and `tests/test_variable_windows.py` updated to seed an
+  empty `OrderedDict()` instead of an empty `set()` for test isolation —
+  same `key in …` / `len(…)` contract, plus the `move_to_end` /
+  `popitem(last=False)` API the eviction helper needs.
+
 ### 52-week position outcome capture (2026-05-19)
 
 - **`_compute_decision_outcomes` now additively records `wk52_pos`
