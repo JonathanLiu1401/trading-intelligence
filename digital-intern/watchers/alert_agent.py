@@ -736,6 +736,68 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         )
         return False
 
+    # Paraphrase-tolerant cross-cycle suppression (defense-in-depth, runs AFTER
+    # the exact-signature suppression above and BEFORE the continuation
+    # annotation below — same formatter-side shape as every other alert gate).
+    # Live evidence (2026-05-20, alert_recency.db 12h audit): the "Union calls
+    # strike at South Korea" wire fired a "S. Korea" abbreviated variant FIRST
+    # at 04:26Z, then the "South Korea" spelling at 05:28Z — Jaccard 0.86
+    # between the two canonical sigs, but the exact-sig mismatch let the
+    # second standalone 🚨 BREAKING push through to the analyst. partition_
+    # paraphrase_alerted catches this with a strict ≥0.75 Jaccard + ≥4 shared
+    # salient tokens bar — well above the antonym-flip ceiling (0.50-0.667)
+    # so an opposite-direction story is provably never merged. Suppressed
+    # rows are marked alerted UNCONDITIONALLY (separate call, before any
+    # Discord attempt) so they leave the urgent queue instead of being
+    # re-fetched every 20s. articles.db ai_score/ml_score/score_source are
+    # untouched — only the noisy paraphrase push is dropped. Best-effort:
+    # any failure in paraphrase_match degrades silently to the prior
+    # (exact-sig-only) behaviour — a missed alert is far worse than a
+    # duplicate.
+    try:
+        para_recent = alert_recency.recent_alerts()
+    except Exception:
+        para_recent = []
+    if para_recent:
+        try:
+            deduped, para_suppressed = alert_recency.partition_paraphrase_alerted(
+                deduped, para_recent
+            )
+        except Exception:
+            _log.exception(
+                "[alert] paraphrase suppression failed — degrading to exact-sig only"
+            )
+            para_suppressed = []
+    else:
+        para_suppressed = []
+    if para_suppressed:
+        try:
+            store.mark_alerted_batch(alerted_ids(para_suppressed))
+        except Exception:
+            _log.exception(
+                "[alert] failed to mark paraphrase duplicate rows alerted"
+            )
+        # Log shows WHICH paraphrase fired so an operator can audit the gate.
+        notes = []
+        for a in para_suppressed[:5]:
+            m = a.get("_paraphrase_match") or {}
+            notes.append(
+                f"{(a.get('source') or '?')}:{(a.get('title') or '')[:40]} "
+                f"≈{m.get('jaccard','?')} of '{(m.get('title') or '')[:40]}'"
+            )
+        _log.info(
+            f"[alert] suppressed {len(para_suppressed)} paraphrase "
+            f"duplicate(s) (Jaccard >= "
+            f"{alert_recency.PARAPHRASE_MIN_JACCARD} of a prior alert "
+            f"within {alert_recency.ALERT_RECENCY_TTL_HOURS:.0f}h) — "
+            f"{'; '.join(notes)}"
+        )
+    if not deduped:
+        _log.info(
+            "[alert] all urgent rows were paraphrase duplicates — skipping"
+        )
+        return False
+
     # Only the first ALERT_BATCH_SIZE feed the prompt — and only those (plus the
     # duplicates they absorbed) get marked alerted. Marking the entire urgent
     # list would silently drop the tail (it'd never be picked up next cycle),
