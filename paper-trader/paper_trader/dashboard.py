@@ -10828,6 +10828,43 @@ def runner_heartbeat_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/launcher-restart-loop")
+@swr_cached("launcher-restart-loop", 30.0)
+def launcher_restart_loop_api():
+    """Did the systemd/launcher layer crash-loop on the singleton flock?
+
+    Orthogonal to /api/runner-heartbeat (which says "is the trading loop
+    alive *now*"): a wedged launcher can fire dozens of doomed launches per
+    minute while the actual trader holds the flock and is perfectly fine.
+    /api/runner-heartbeat correctly stays HEALTHY in that scenario, so the
+    pathology was invisible from every operator surface. This tails the
+    tail of ``logs/runner.log`` and tallies refusal lines.
+
+    Advisory only — never gates Opus, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from pathlib import Path
+        from .analytics.launcher_restart_loop import build_launcher_restart_loop
+
+        # Resolve logs/runner.log relative to the repo root (dashboard.py
+        # is paper_trader/dashboard.py — go up two parents).
+        log_path = Path(__file__).resolve().parent.parent / "logs" / "runner.log"
+        max_bytes = 64 * 1024  # last ~64KB is plenty for a launcher-loop window
+        lines: list[str] = []
+        if log_path.exists():
+            size = log_path.stat().st_size
+            with log_path.open("rb") as fh:
+                if size > max_bytes:
+                    fh.seek(size - max_bytes)
+                    fh.readline()  # discard partial first line
+                raw = fh.read()
+            lines = raw.decode("utf-8", errors="replace").splitlines()
+        result = build_launcher_restart_loop(lines)
+        result["log_path"] = str(log_path)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/no-decision-reasons")
 def no_decision_reasons_api():
     """Bucket the WHY of recent NO_DECISION cycles into actionable buckets.
