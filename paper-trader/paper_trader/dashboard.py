@@ -8524,6 +8524,64 @@ def position_thesis_api():
         return jsonify({"error": str(e), "cards": []}), 500
 
 
+@app.route("/api/position-runrate")
+def position_runrate_api():
+    """Per-open-position P/L runrate — dollars-per-day-held + verdict.
+
+    Answers "is this position bleeding faster than I'd tolerate, or actually
+    working?" at the moment of action. Composes ``build_position_runrate``
+    verbatim (single source of truth, AGENTS.md invariant #10) and routes the
+    pure-arithmetic builder over ``store.open_positions()`` +
+    ``portfolio.total_value``. NO network, NO extra store reads — the
+    risk_mirror hot-path discipline. Observational only, never gates, no caps
+    (invariants #2/#12). Failure contract mirrors the rest of the dashboard:
+    a builder/store fault degrades to a 500 with ``rows=[]``, never an
+    exception that takes down the endpoint."""
+    try:
+        from .analytics.position_runrate import build_position_runrate
+        store = get_store()
+        pf = store.get_portfolio()
+        # positions_json carries the enriched per-cycle snapshot (with
+        # current_price, unrealized_pl, stale_mark already applied) — same
+        # source /api/portfolio uses. No mark-to-market here on purpose:
+        # the live trader's _portfolio_snapshot is the SSOT for marks; this
+        # endpoint just reads what was last persisted.
+        positions = pf.get("positions") or []
+        if not isinstance(positions, list):
+            positions = []
+        # If the persisted snapshot has no opened_at (positions_json strips
+        # it on persist — see store.upsert_position docstring), join it from
+        # the open_positions table so the runrate builder can compute hold age.
+        opened_by_key: dict[tuple, str] = {}
+        for row in store.open_positions():
+            key = (
+                (row.get("ticker") or "").upper(),
+                (row.get("type") or "").lower(),
+                row.get("expiry"),
+                row.get("strike"),
+            )
+            if row.get("opened_at"):
+                opened_by_key[key] = row["opened_at"]
+        enriched: list[dict] = []
+        for p in positions:
+            if not isinstance(p, dict):
+                continue
+            key = (
+                (p.get("ticker") or "").upper(),
+                (p.get("type") or "").lower(),
+                p.get("expiry"),
+                p.get("strike"),
+            )
+            if not p.get("opened_at") and key in opened_by_key:
+                p = {**p, "opened_at": opened_by_key[key]}
+            enriched.append(p)
+        out = build_position_runrate(enriched, pf.get("total_value"))
+        out["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e), "rows": []}), 500
+
+
 @app.route("/api/calibration")
 def calibration_api():
     """Confidence calibration + signal-source attribution.
