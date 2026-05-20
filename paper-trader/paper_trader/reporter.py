@@ -2373,6 +2373,95 @@ def _next_session_line(now: datetime | None = None) -> str:
         return ""
 
 
+def _today_session_anchor_iso(now: datetime | None = None) -> str | None:
+    """ISO UTC timestamp of today's NYSE session open (09:30 ET) as a string,
+    or ``None`` when today is not a trading day or the session has not yet
+    opened.
+
+    Pure NYSE calendar lookup — no I/O, never raises. Mirrors
+    ``market.is_market_open``'s gating (weekend / NYSE_HOLIDAYS_2026 /
+    pre-09:30 ET → no session yet). Returns the anchor even POST-close so a
+    late-session or after-hours hourly summary still attributes today's
+    motion to today's bell (the operator at 18:00 ET still asks "what did
+    today do" — that question has an answer until UTC date rolls over to
+    the next session, and the resolver below shifts naturally at the next
+    pre-open).
+    """
+    n = (now or datetime.now(timezone.utc)).astimezone(market.NY)
+    if n.weekday() >= 5 or n.date() in market.NYSE_HOLIDAYS_2026:
+        return None
+    cur_min = n.hour * 60 + n.minute
+    if cur_min < 9 * 60 + 30:                 # pre-09:30 ET → no session yet
+        return None
+    open_dt = datetime(n.year, n.month, n.day, 9, 30, tzinfo=market.NY)
+    return open_dt.astimezone(timezone.utc).isoformat()
+
+
+def _today_session_line(store, now: datetime | None = None) -> str:
+    """One-line "what has TODAY's session done to the book so far?" for the
+    hourly summary.
+
+    The hourly already shows TOTAL P/L from the ``$1000`` start and a 1h
+    ``_session_block`` over the trailing-hour window. Neither answers the
+    trader's first morning question after the 09:30 ET bell: "what is
+    today's intraday motion so far?". For a book that gained ``$30``
+    yesterday then lost ``$20`` today by 11 AM ET, the TOTAL P/L still
+    reads ``+$10`` (positive, looks fine) while the 1h block only shows
+    the latest hour. The today-anchor line closes the gap: a single line
+    anchored to today's NYSE open (09:30 ET) so any hourly answers
+    "today" without waiting until the 16:05 ET daily close.
+
+    Composes ``_window_delta`` **verbatim** (single source of truth — the
+    same math the ``_session_block`` portfolio Δ uses, just with a
+    different baseline, so this surface and the 1h SESSION block can
+    never disagree on direction). Pure store reads only — NO network (the
+    Discord-path discipline; the ``_drawdown_line`` / ``_benchmark_line``
+    precedent). Observational only, never gates, adds no caps (invariants
+    #2/#12).
+
+    Suppression — silence-when-nothing-actionable (the ``_next_session_line``
+    closed-only precedent): today is not a trading day, the session has
+    not yet opened today, or the equity_curve has no point at-or-after
+    today's 09:30 ET anchor (a runner that booted post-open with no
+    pre-anchor history — the today motion is undefined).
+
+    Same additive failure contract as the rest of ``reporter``: any
+    builder/store fault degrades to ``""`` ("no today-session line this
+    report"), **never** an exception ("no Discord summary this report").
+    ``now`` is injectable for deterministic tests (the ``_next_session_line``
+    precedent).
+    """
+    try:
+        since = _today_session_anchor_iso(now)
+        if not since:
+            return ""
+        eq = store.equity_curve(limit=5000)
+        if not eq or len(eq) < 2:
+            return ""
+        last = eq[-1]
+        base = next((p for p in eq if (p.get("timestamp") or "") >= since),
+                    None)
+        if base is None or base is last:
+            return ""
+        d = _window_delta(eq, since)
+        if not d or "port_pct" not in d:
+            return ""
+        try:
+            b_tv = float(base.get("total_value") or 0.0)
+            l_tv = float(last.get("total_value") or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        port_abs = l_tv - b_tv
+        seg = f"${port_abs:+.2f} ({d['port_pct']:+.2f}%)"
+        if "alpha_pct" in d:
+            seg += f" · alpha `{d['alpha_pct']:+.2f}%`"
+        return ("**TODAY** ◈ since 09:30 ET NYSE open\n"
+                f"> {seg}")
+    except Exception as e:
+        print(f"[reporter] today-session line skipped: {e}")
+        return ""
+
+
 def _fmt_trade_stamp(ts_iso: str | None, now: datetime | None = None) -> str:
     """Bracket label for a recent-trade line in the hourly summary.
 
@@ -2460,6 +2549,14 @@ def send_hourly_summary() -> bool:
     sx = _session_block(store, 1.0, "1h")
     if sx:
         body += "\n" + sx
+    # TODAY sits right AFTER the 1h SESSION block — the two answer the same
+    # "what has the desk done lately" question one dimension over (last 1h vs
+    # since today's 09:30 ET open). Both are silence-by-default on different
+    # axes (SESSION needs >=2 in-window equity points; TODAY needs the market
+    # to have opened today) so neither suppresses the other.
+    tsl = _today_session_line(store)
+    if tsl:
+        body += "\n" + tsl
     mx = _benchmark_line(store)
     if mx:
         body += "\n" + mx
