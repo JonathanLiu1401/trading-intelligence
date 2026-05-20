@@ -5113,3 +5113,150 @@ origin/master (`916f87a`, `81ffe13`).
   throughout (paper-trader core, paper-trader ML, digital-intern, and
   feature-dev sibling) — this entry was appended, not rewritten; the
   push was left to the auto-commit daemon per the project memory.
+
+## 2026-05-20 — Hybrid pass (urgent-label-split + source-throughput endpoints)
+
+**Persona:** news analyst (the standalone-alert + briefing consumer).
+
+**Phase 1 (debug):** `bugs_fixed = 0`. The full `tests/` suite collects
+1614 tests and they ALL pass (full run, 287s). The "critical invariant"
+tests the brief enumerated are already pinned in `tests/test_article_store.py`
+(backtest:// exclusion from `get_unalerted_urgent`, `mark_alerted` removing
+rows from re-fetch, `update_ml_scores_batch` setting `score_source='ml'`,
+`update_ai_scores_batch` setting `score_source='llm'`) and
+`tests/test_features.py` / `test_alert_source_authority.py` etc. Adding
+redundant tests would have been pure commit noise. The brief explicitly
+permits skipping the Phase 1 commit when no real bug is found — honored.
+
+**Phase 2 (feature, commit `555db04`):** Two new analyst-facing dashboard
+endpoints, each wrapping an existing `ArticleStore` method that previously
+had no HTTP surface (verified via `grep` on `dashboard/`).
+
+- `GET /api/urgent-label-split?hours=H` — wraps
+  `store.urgency_label_split`. Returns the per-`score_source` breakdown of
+  `urgency>=1` rows in the window (`{"llm": N, "ml": N, "briefing_boost": N,
+  "null": N}` + `llm_fraction`) plus a verdict ladder:
+  - `quiet` when `total==0` (no manufactured alarm),
+  - `unverified_storm` at `total>=3` and `llm_fraction==0.0` (the exact
+    live-evidence case from `article_store.py` 2026-05-19: every urgent
+    row in a 6h window was ml-only, the Sonnet path was dark),
+  - `mostly_unverified` at `total>=5` and `llm_fraction<0.5` (degraded),
+  - `healthy` otherwise. `briefing_boost` counts as vetted (it's a real
+    Opus-curated label, same training treatment as `llm` in
+    `storage/article_store.py`).
+- `GET /api/source-throughput?window_min=N&limit=K` — wraps
+  `store.source_throughput`. Per-source recent-vs-prior article rate +
+  `decel_pct` (positive = slowing). Leading indicator BEFORE a source
+  fully dies — `/api/collector-health` carries 1h/24h counts but won't
+  flag a 40/h → 3/h drop with a still-fresh newest item. Verdict ladder:
+  - `critical` when any source with `decel_pct >= 75` AND
+    `prior >= MIN_PRIOR_FOR_VERDICT (5)`,
+  - `degraded` when any source with `40 <= decel_pct < 75` AND
+    `prior >= 5`,
+  - `ok` otherwise. The `prior >= 5` floor was added in commit `88495a1`
+    after Phase 3 live evidence (see below) — without it the live 60-min
+    window collapsed to `critical` every cycle because of long-tail
+    one-off `GDELT/<host>` sub-tags hitting `prior=1 → recent=0`. Full
+    `sources` array is still returned so the operator sees the low-prior
+    rows; only the verdict count is gated.
+
+Both endpoints:
+- read-only, no DB writes; underlying methods carry `_LIVE_ONLY_CLAUSE`,
+- 401 when `WEB_API_KEY` set (same gate as every other `/api/*`),
+- 500 with `{"error": "..."}` JSON on store exception (never an HTML
+  Flask debug page that breaks a JS consumer),
+- 503 when store unwired (`_store_handle()` is `None`),
+- input clamped (`hours` 1..168; `window_min` 5..720; `limit` 1..200).
+
+All four load-bearing invariants (backtest isolation; `ml_score` vs
+`ai_score` separation; `score_source` correctness; URL-startswith
+`backtest://` exclusion from live signals) preserved by construction —
+the endpoints are pure read paths on methods that already enforce them.
+
+**Phase 3 (live validation, commit `88495a1`):**
+
+  1. **Collection rate healthy.** 2,446 live articles/hr (excl. backtest)
+     over the last hour, 11,768 over the last 24h.
+  2. **Briefing #34 (2026-05-20 T04:39Z, 50 articles, ~2.9KB) reads
+     well.** Samsung-Electronics-strike LEAD ("48k workers walk
+     Thursday"), exact MACRO/PORTFOLIO/SEMIS tables, AXTI flagged
+     correctly as a held name with `+6.61%`. The chronic-dark-source
+     COVERAGE GAP block was honest about sec_edgar / newsapi being dark.
+  3. **Alerts firing for genuinely urgent items.** Last 4h includes
+     Nvidia Q1 earnings (the major market event tonight), Samsung
+     Electronics 48k strike (cross-source corroborated), Mizuho cut MCO
+     target after earnings beat, US indicts four Chinese container
+     manufacturers — all real news, no manufactured noise.
+  4. **Calibration concern observed live AND surfaced by the new
+     endpoint.** `store.urgency_label_split(hours=24)` returns
+     `{total: 127, by_source: {llm: 52, ml: 75, briefing_boost: 0,
+     null: 0}, llm_fraction: 0.4094}`. With `total >= 5` and
+     `llm_fraction < 0.5`, the verdict is `mostly_unverified` — 59% of
+     urgent alerts in the last 24h are model-only. The per-row
+     `[unverified — model-only urgent]` tag was already firing in the
+     alert prompt; the new endpoint exposes the AGGREGATE rate so the
+     analyst can answer "is the calibration path broken?" at a glance
+     instead of inspecting individual alerts.
+  5. **Source-throughput verdict needed a floor (folded into the same
+     phase, commit `88495a1`).** Live `source_throughput(window_min=60)`
+     returned 8+ rows of `prior=1, recent=0, decel_pct=100` from
+     long-tail one-off `GDELT/<host>` / `AlphaVantage/<host>` sub-tags.
+     These are normal aggregator fluctuation, not degradations. Without
+     a baseline floor, the verdict collapsed to `critical` on every
+     cycle — exactly the kind of false alarm an analyst learns to
+     ignore, which then masks a real degradation. Added
+     `MIN_PRIOR_FOR_VERDICT=5` to the verdict computation; new test
+     `test_low_prior_noise_excluded_from_verdict` reproduces the live
+     failure case (four `prior<=4` rows at 100% decel) and pins the
+     verdict at `ok`. The full `sources` list is unchanged — operators
+     can still inspect the noise rows.
+  6. **17 sources currently `disabled` via `source_health`.** This is
+     the chronic-dark-collectors gap documented in the
+     `di-chronic-dark-collectors` memory (sec_edgar / polygon / newsapi /
+     nitter never produced in this session) plus recently-added 30-min
+     central-bank press feeds (bis, ecb_press, g10_cb) that are simply
+     low-volume on a quiet day. Direct calls to `collect_ecb_press()` /
+     `collect_macro_calendar()` return `[]` cleanly — no exception, just
+     a sparse upstream. NOT a fresh bug; verified per memory before
+     investigating. The COVERAGE GAP block in the briefing already lists
+     these honestly to the analyst, so the situation is visible by
+     design.
+
+**Phase 4 (docs):** Appended this section; no broader rewrite (the
+project memory `pt-concurrent-samerole-staging-race` warns against it
+during multi-agent storms, and this entry is the only AGENTS.md change).
+
+**Final verify:**
+- `python3 -c "import sys; sys.path.insert(0,'.'); from storage import
+  article_store; from ml import features, model; print('imports OK')"`
+  → `imports OK`.
+- Full focused suite for new feature: `tests/test_api_urgent_label_split.py`
+  (10 tests) + `tests/test_api_source_throughput.py` (11 tests) =
+  **21 passed in 2.20s**.
+- Full repo suite: **1634 passed** in 388.85s (1614 baseline + 20 new;
+  the 21st test was added after the full run and validated standalone).
+- Live endpoint check (daemon was running pre-restart, so the live
+  URLs `404`d as expected; the new code is live after the systemd /
+  auto-restart picks it up — same precedent as every prior dashboard
+  endpoint addition).
+
+**Counters:** `bugs_fixed=0` (no Phase 1 commit; the existing test suite
+already pins the invariants the brief enumerated, and the Phase 1 commit
+guard explicitly allows skipping); `features_added=2` (the two new
+endpoints, one commit `555db04`); `user_findings=6` (collection rate,
+briefing quality, alert quality, calibration concern surfaced by
+`/api/urgent-label-split`, source-throughput verdict floor, chronic dark
+collectors confirmed as standing not fresh — one folded into the Phase 3
+`fix:` commit `88495a1`).
+
+**Concurrency hygiene:** Three other agents were running on
+`paper-trader` and (one) `feature-dev` on both repos during this pass.
+`git status` checked before EVERY stage; `git diff --staged --stat` ran
+before EVERY commit; never `git add -A` / `git add .`; staged with
+explicit pathspec only — `dashboard/web_server.py` +
+`tests/test_api_urgent_label_split.py` + `tests/test_api_source_throughput.py`
+for commit `555db04`, and `dashboard/web_server.py` +
+`tests/test_api_source_throughput.py` for commit `88495a1`. Untracked
+files in `paper-trader/*` and `paper-trader/docs/superpowers/plans/`
+left alone. AGENTS.md is being appended-only in this same commit as the
+fix it documents, per project convention.
