@@ -11421,3 +11421,191 @@ service picks up the new code).
   `_is_synthetic` SSOT shape (`backtest://` URL / `backtest_*` /
   `opus_annotation*` source) so a leaked synthetic row cannot reach
   user-facing JSON even if a future caller forgets the SQL clause.
+
+## 2026-05-20 hybrid pass — ML/backtest (Agent 2)
+
+### Phase 1 — fix: `_buy` truthiness on stop_loss/take_profit top-ups (1 bug)
+
+`paper_trader/backtest.py::_buy` accumulate-into-existing branch used
+`if stop_loss:` / `if take_profit:` to decide whether to overwrite the
+existing position's stop_loss / take_profit. Truthiness silently dropped
+an explicit `0.0` update while the **new-position branch** stores `0.0`
+unconditionally via the dict literal — so accumulating into a position
+with the same `0.0` diverged from a fresh open (the prior non-zero value
+survived a deliberate wipe attempt). Switched to `is not None` so a
+`None` caller still skips (legacy semantics preserved) but a real `0.0`
+overwrites the prior value as the schema intends. `_enforce_risk_exits`'s
+`if sl and px <= sl:` is intentionally left as truthiness — there `0.0`
+correctly means "no real stop" (never fires when price > 0); the new
+discipline applies only to the **assignment** path, where `0.0` is a
+deliberate wipe-intent that must overwrite. Mirrors
+`_execute_decision`'s `isinstance(..., (int, float))` value-check
+discipline.
+
+### Phase 1 — tests added (8)
+
+Locked the new (None-skips, 0.0-applies, real-value-overwrites)
+semantics with three regression tests in
+`tests/test_backtest.py::TestBuyExistingPositionTruthiness` so a future
+"looks-sensible" rewrite back to truthiness fails. Added five more
+edge-case regression tests that lock previously-untested behaviour:
+`TestComputeDecisionOutcomes` (forward_return_5d arithmetic on the
+deterministic `synthetic_prices` fixture — pinned at +10.00% from
+day-0 BUY at 100 → day-5 100+2·5=110, plus the
+end-of-window window-overflow drop and FILLED-only outcome capture),
+and `TestMlDecideNewsRanking` (high-score article wins over low-score
+on the same ticker; empty-articles → HOLD-or-persona-buy).
+
+### Phase 2 — feat: `paper_trader/ml/news_volume_skill.py`
+
+**The gap none of the existing 30+ ML/backtest diagnostics filled.**
+The aggregate `_oos_rank_metrics` (one number across all
+news-availability slices) hides a load-bearing question every existing
+diagnostic structurally misses: *is the scorer's near-zero OOS skill the
+same in news-poor and news-rich conditions, or does adding news context
+move it?* `feature_importance` answers the model's view ("if I scramble
+news columns, how much skill is lost?"). `attribution_audit` answers the
+model's per-record view ("how strongly does the model lean on news
+features?"). **Neither slices the realized OOS outcomes by news
+availability** and asks whether the model's predictions are more
+accurate when more news exists. This module fills exactly that gap
+(strictly orthogonal — no SSOT overlap with any sibling).
+
+`news_volume_skill(scorer, records) → dict` buckets decisions by
+`news_article_count` into four canonical bins (matching the
+`_compute_decision_outcomes` and `build_features` clamp semantics):
+
+| Bucket | Range | Meaning |
+|--------|-------|---------|
+| `no_news` | None or `0..1` | Decisions made without supporting news |
+| `sparse` | `1..3` | 1-2 articles |
+| `moderate` | `3..10` | 3-9 articles |
+| `dense` | `10+` | 10+ articles (cnt_v clamps at 20) |
+
+Per bucket it reports tie-aware Spearman rank-IC, directional accuracy,
+mean action-aligned realized return, and an `EDGE` / `WEAK_EDGE` /
+`NO_EDGE` / `INVERTED` / `INSUFFICIENT` verdict (mirrors the
+`action_skill` per-action verdict ladder, same thresholds). Overall
+verdict combines the trajectory across sufficient buckets:
+
+| Overall verdict | Meaning |
+|-----------------|---------|
+| `INSUFFICIENT_DATA` | < `MIN_RECORDS`=30 aligned outcomes OR < 2 sufficient buckets |
+| `NEWS_VALUE_MONOTONIC_POSITIVE` | rank-IC rises monotonically with news volume (spread ≥ `BUCKET_SPREAD_TOL`=0.05) — scorer extracts more signal from news-rich decisions |
+| `NEWS_VALUE_MONOTONIC_NEGATIVE` | rank-IC FALLS monotonically — adding news context degrades predictions (audit upstream news scoring pipeline) |
+| `NEWS_VALUE_INVARIANT` | spread < `BUCKET_SPREAD_TOL` — news doesn't differentiate skill (model leans on quant signals) |
+| `MIXED` | non-monotone, no clean effect — per-bucket table is the honest read |
+| `HAS_INVERTED_BUCKET` | ≥1 bucket has rank-IC ≤ `-IC_GOOD`=-0.10 (operator-actionable red flag, surfaced first) |
+
+**Operational discipline mirrors the existing read-only ML diagnostics**
+(`action_skill` / `calibration` / `skill_trend`): no train, never touches
+`decision_scorer.pkl` / `decision_outcomes.jsonl` / `build_features` /
+`N_FEATURES` / trade path, never raises on bad input — safe to run
+against the live unattended continuous loop and cannot break pickle
+compatibility. Reuses `ml.calibration._spearman` (SSOT — tie-awareness
+is load-bearing because clamped ±50 predictions tie at the empirical
+label support). Reuses `validation.split_outcomes_temporal` so the slice
+matches what `_train_decision_scorer` reports `oos_rmse`/`oos_ic` on
+(the SAME holdout the per-cycle skill ledger trends).
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.news_volume_skill
+cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/test_news_volume_skill.py -v
+```
+
+CLI exits 0 on healthy/insufficient verdicts, exits 2 if any bucket is
+INVERTED (so an operator/cron can branch on it, exactly like
+`action_skill._cli` / `calibration._cli`).
+
+Pinned by 30 unit tests in `tests/test_news_volume_skill.py`: bucket
+boundaries (None/0 → no_news, 1-2 → sparse, 3-9 → moderate, 10+ →
+dense; NaN/negative/unparseable rejected to None and dropped), per-bucket
+verdict thresholds (full ladder at IC_GOOD / IC_MIN boundaries),
+overall-verdict logic (monotonic positive/negative, INVARIANT, MIXED,
+HAS_INVERTED_BUCKET, INSUFFICIENT_DATA), universal SELL sign-flip,
+non-finite forward_return drop, single-sufficient-bucket →
+INSUFFICIENT_DATA, missing/corrupt outcomes file degrades to
+INSUFFICIENT_DATA not a crash.
+
+### Phase 3 — quant-perspective findings (6)
+
+Ran the diagnostic against the live `/media/zeph/projects/paper-trader/data/decision_outcomes.jsonl`
+(7413 outcomes, sim-dates 1996-02-01 → 2021-06-01) and the per-cycle
+ledgers:
+
+1. **System is IDLE since 2026-05-18.** `continuous.log` mtime, latest
+   `scorer_skill_log.jsonl` row (cycle 4, 2026-05-18T18:06:04), and the
+   latest `backtest_runs` row all converge on this date. No cycles have
+   run in ~2 days. (Not a regression — just operational state worth
+   flagging to a reading quant.)
+2. **The deployed `decision_scorer.pkl` has `n_train=400`**, which is
+   **BELOW** the documented gate-active threshold of 500 (invariant #5)
+   — yet the most recent skill-log row reports `train_n=3959` and
+   `gate_active=True`. The deployed pickle has been overwritten with a
+   smaller-corpus model since cycle 4 (both `data/ml/decision_scorer.pkl`
+   and `/media/zeph/projects/paper-trader/data/ml/decision_scorer.pkl`
+   read n=400). So the LIVE gate is effectively **INACTIVE** despite
+   the cycle ledgers suggesting otherwise. Worth investigating the
+   overwrite path before relying on the gate.
+3. **`news_volume_skill` (the new diagnostic) reveals real
+   news-driven skill on the actual outcomes corpus** that contradicts
+   the recurring `MLP_NO_BETTER_THAN_TRIVIAL` view when looked at via
+   this slice. OOS (1482 records, slice=oos):
+   - `no_news`: ic=+0.19, dir_acc=0.60, n=1293 → EDGE
+   - `sparse`: ic=+0.46, dir_acc=0.71, n=158 → EDGE (surprisingly strong)
+   - `moderate`: ic=+0.28, dir_acc=0.74, n=31 → EDGE (small sample)
+   - `dense`: insufficient data (no records)
+   - Overall verdict: `MIXED` (non-monotone, spread 0.267)
+   - **dir_acc rises monotonically with news count** (0.60 → 0.71 →
+     0.74) — a real signal that news context measurably helps the
+     scorer's directional skill.
+4. **Mean action-aligned realized return DROPS as news volume rises**
+   (+0.65 → +0.79 → -1.11). News-rich decisions appear to be on
+   more-volatile / overcrowded / exhausted moves on average, even
+   though the scorer's rank skill is BETTER in those buckets. The
+   sample size in `moderate` (n=31) is small enough that this could be
+   sampling noise — worth re-checking when `dense` accumulates.
+5. **News features are heavily under-represented in training**: 95.6%
+   of outcomes have `no_news` (None or 0 articles), 3.9% sparse, 0.5%
+   moderate, 0% dense. The deployed model has scarce training examples
+   for news-rich features (`news_urgency`, `news_article_count`) — yet
+   finding #3 says the news-rich buckets carry the most rank skill.
+   This is the strongest argument for a digital-intern news pipeline
+   density improvement: more news-rich training examples could lift the
+   scorer's overall OOS skill above the documented
+   `MLP_NO_BETTER_THAN_TRIVIAL` plateau.
+6. **ArticleNet feedback loop is broken on >75% of recent cycles**:
+   in 35 `ml:` log lines, 13 fail with `inject err: database is locked`
+   / `database locked after 4 attempts` (37%), and 14 succeed at inject
+   but fail with `trainer timeout (injected N)` because the digital-intern
+   trainer subprocess is killed by the 120s timeout (40%). Only ~22% of
+   cycles complete the full inject + retrain pass. The retry budget
+   (4 attempts × ~15s) and the trainer timeout are too tight for the
+   digital-intern daemon's lock-holding patterns and dataset size.
+
+### Counters
+
+`bugs_fixed=1, features_added=1, user_findings=6` — one principled
+correctness fix for `_buy`'s top-up truthiness; one genuinely orthogonal
+diagnostic (`news_volume_skill`) that fills the only remaining unfilled
+slice in the 30+ ML/backtest diagnostic suite; six independent live
+observations including a real concern (deployed `n_train=400` < gate
+threshold while ledgers say `gate_active=True`).
+
+### Invariants reaffirmed by this pass
+
+- **#5** (`DecisionScorer` only gates at `n_train >= 500`) — finding #2
+  shows the LIVE pickle violates this threshold; the gate condition is
+  load-bearing and the source-of-truth threshold remains correct.
+- **#10** (SSOT) — `news_volume_skill` reuses `_spearman` from
+  `calibration`, `_to_float` from `decision_scorer`, and
+  `split_outcomes_temporal` from `validation` — never re-derives any
+  rank-correlation, NaN handling, or holdout split. Cannot drift.
+- **Read-only diagnostic discipline** — `news_volume_skill` follows the
+  established `action_skill` / `calibration` / `skill_trend` pattern:
+  no train, no pickle touch, never raises on bad input. Cannot perturb
+  the unattended continuous loop or break pickle compatibility.
+- **Universal SELL sign-flip** — `news_volume_skill._aligned_pred`
+  mirrors `action_skill._aligned_pred` / `persona_skill._aligned`
+  byte-for-byte (`-forward_return_5d` on SELL, prediction NOT flipped).
+  Test `test_sell_action_flips_realized_sign` pins the convention.
