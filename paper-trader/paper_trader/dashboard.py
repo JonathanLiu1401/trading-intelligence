@@ -10693,6 +10693,83 @@ def churn_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/round-trips")
+def round_trips_api():
+    """Raw closed-round-trip ledger — the canonical underlying data.
+
+    Every realised-P&L analytics endpoint (track-record, churn, streak,
+    winner/loser autopsy, trade-asymmetry, session-delta) reduces
+    ``analytics.round_trips.build_round_trips`` output to an aggregate;
+    the per-RT detail it computes from is never exposed. This returns
+    that list directly so frontends/notebooks can drill into the same
+    rows the aggregates summarise without re-pairing the trade ledger.
+
+    Distinct from ``/api/closed-positions``, which reads the ``positions``
+    table (lot-shaped, ``store.closed_positions``). Those two views can
+    disagree on edge cases (option re-pairs, mid-cycle partial exits);
+    AGENTS.md #10 designates ``build_round_trips`` as the single source
+    of truth for realised-P&L analytics, so this is the view the other
+    endpoints' aggregates are computed against.
+
+    Query params:
+        ?limit=N  — last N closed round-trips (default 200, max 2000),
+                    returned newest-exit-first.
+
+    The ``summary`` block uses the same strict ``> 0`` win split as
+    ``/api/analytics`` / ``/api/track-record`` so n_wins + n_losses == n
+    and ties at exactly 0 are counted as losses (rounding-artefact pin —
+    see comment at the build_round_trips call site near line 6660).
+    Advisory only — never gates Opus, adds no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.round_trips import build_round_trips
+        try:
+            limit = max(1, min(int(request.args.get("limit", 200)), 2000))
+        except (TypeError, ValueError):
+            limit = 200
+        store = get_store()
+        # Same convention as /api/analytics, /api/churn, /api/streak:
+        # oldest → newest (build_round_trips reads in sequence and does
+        # not sort).
+        trades = list(reversed(store.recent_trades(2000)))
+        rts = build_round_trips(trades)
+        # Newest-exit-first for display, then clip.
+        rts_sorted = sorted(rts, key=lambda r: (r.get("exit_ts") or ""),
+                            reverse=True)
+        clipped = rts_sorted[:limit]
+
+        pnls = [r.get("pnl_usd") or 0.0 for r in rts_sorted]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        holds = [r["hold_days"] for r in rts_sorted
+                 if r.get("hold_days") is not None]
+        gross_win = sum(wins)
+        gross_loss = abs(sum(losses))
+        summary = {
+            "n": len(pnls),
+            "n_wins": len(wins),
+            "n_losses": len(losses),
+            "win_rate_pct": (round(len(wins) / len(pnls) * 100, 2)
+                             if pnls else None),
+            "total_pnl_usd": round(sum(pnls), 2) if pnls else 0.0,
+            "gross_win_usd": round(gross_win, 2) if wins else 0.0,
+            "gross_loss_usd": round(gross_loss, 2) if losses else 0.0,
+            "profit_factor": (round(gross_win / gross_loss, 2)
+                              if gross_loss > 1e-9 else None),
+            "avg_hold_days": (round(sum(holds) / len(holds), 2)
+                              if holds else None),
+            "returned": len(clipped),
+            "truncated": len(clipped) < len(pnls),
+        }
+        return jsonify({
+            "round_trips": clipped,
+            "summary": summary,
+            "limit": limit,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/thesis-drift")
 @swr_cached("thesis-drift", 60.0)
 def thesis_drift_api():
