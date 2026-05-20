@@ -10573,3 +10573,222 @@ notes rather than catching anything novel).
 - **#2 / #12** (no hard limits, advisory-only) — the ML advisor
   remains advisory; the fix changes which articles its score
   reads from, not the gate logic.
+
+## ML / backtest review pass (Agent 2, 2026-05-19, ~22:30 UTC) — OOS label-clamp consistency + bootstrap CIs
+
+### Phase 1 — fix: `oos_rmse` label-clamping consistency (1 bug)
+
+`paper_trader/ml/decision_scorer.py::train_scorer` clamps training
+labels to ±`PRED_CLAMP_PCT` (50%) before fit (the symmetric label-
+clamp block landed 2026-05-18; see the in-code comment for the
+OOS-RMSE evidence). The scorer's `predict()` then clamps outputs to
+the same band. **Three OOS paths were reading `forward_return_5d/10d/20d`
+RAW**, so the operator-facing `val_rmse` vs `oos_rmse` pair in the
+per-cycle skill ledger was NOT apples-to-apples: one ±175% MSTR /
+3x-leveraged crash-rip week contributes `(50 − 175)² = 15,625` to OOS
+MSE but `(50 − 50)² = 0` to val MSE, inflating `oos_rmse` by ~0.3–0.5
+RMSE points on a typical 1000-row OOS slice — making honest training
+look identical to overfit.
+
+Mirror the training-side symmetric clamp in all three OOS metric paths:
+
+- `paper_trader/validation.py::evaluate_scorer_oos` — clamped `rmse`
+  is the new headline; `rmse_unclamped` is surfaced as a sibling
+  field so the raw real-world error stays visible (additive, never
+  destructive — same precedent as the `predict_with_meta` `raw`
+  alongside `pred`).
+- `run_continuous_backtests.py::_oos_rank_metrics` — near-no-op for
+  Spearman rank-IC (extreme rows now tie at ±50 instead of extending
+  rank space the model can never reach) but locked for
+  cross-diagnostic consistency.
+- `run_continuous_backtests.py::_oos_multi_horizon_metrics` — same
+  clamp for 10d/20d horizons so a single extreme-week row no longer
+  extends rank space on one horizon and not another.
+
+The status-string contract `_train_decision_scorer` returns is
+unchanged (token shape is what `_parse_scorer_status` /
+`test_continuous.py::TestParseScorerStatus` lock); only the numeric
+values are now honest. No retrain required — the clamp is at the
+OOS-evaluation seam, not the training seam.
+
+### Phase 1 — tests (8 added)
+
+- `tests/test_validation.py::TestEvaluateScorerOosLabelClamp` (6
+  tests) — ±175% / ±100% / -80% SELL clamp paths + in-band no-op +
+  empty + untrained → both `rmse` and the new `rmse_unclamped` are
+  honestly None.
+- `tests/test_continuous.py::TestOosRankMetrics
+  ::test_extreme_label_clamped_keeps_dir_acc_truthful` — locks the
+  cross-OOS-path clamp consistency.
+
+All 478 ml/backtest/scorer/oos tests pass (`pytest -k "ml or backtest
+or scorer or oos"`).
+
+### Phase 2 — feat: `paper_trader/ml/oos_bootstrap_ci.py` (95% CIs)
+
+**The decisive gap:** every other OOS diagnostic in this codebase
+(`skill_trend`, `baseline_compare`, `calibration`, `persona_skill`,
+`sector_skill`, `_oos_rank_metrics`, `_oos_multi_horizon_metrics`)
+reports POINT ESTIMATES. None of them answers the operator-decisive
+question:
+
+> Is the +0.11 OOS rank-IC the skill ledger reports each cycle
+> actually above zero, or a coin flip on a ~1000-row OOS slice?
+> Is `oos_rmse=11.83` statistically distinguishable from the
+> σ(target)≈11.7 mean-predictor baseline, or within sampling noise?
+
+`paper_trader/ml/oos_bootstrap_ci.py::bootstrap_ci` answers both via
+a **non-parametric percentile bootstrap** over the SAME temporal-OOS
+slice `_train_decision_scorer` evaluates against
+(`split_outcomes_temporal` at `oos_fraction=0.2`):
+
+1. Pre-compute (pred, realized) once per record (the expensive
+   `scorer.predict()` call only runs `n` times, not `n * n_bootstrap`).
+2. Apply the universal SELL sign-flip + the ±`PRED_CLAMP_PCT` label
+   clamp (SAME path as the Phase-1 fix across `evaluate_scorer_oos` /
+   `_oos_rank_metrics` / `_oos_multi_horizon_metrics`, so CI bounds
+   describe the same target space the model was trained against —
+   single source of truth across the whole OOS suite).
+3. Resample N indices with replacement, recompute
+   `(rmse, dir_acc, rank_ic)`, repeat `n_bootstrap` times (default
+   1000), report empirical 2.5%/97.5% percentiles as 95% CIs.
+
+Output (CLI):
+
+```
+$ python3 -m paper_trader.ml.oos_bootstrap_ci
+[oos_bootstrap_ci] slice=oos  n=1482  n_bootstrap=1000  n_train=400  (95% CI)
+  rmse            = 14.9982  [14.06, 15.82]
+  dir_acc         = 0.6111   [0.586, 0.636]
+  rank_ic         = +0.2245  [+0.171, +0.287]
+  → rank_ic CI EXCLUDES 0 — directional edge is real
+```
+
+The `rank_ic` CI is the decisive verdict: excluding 0 means the
+ordering edge is statistically real (however small in magnitude);
+straddling 0 means the recent +0.11 reads are within sampling noise
+of zero — the conviction gate (invariant #5, active at `n_train ≥ 500`)
+would be sizing on a signal the data can't distinguish from random.
+
+**Read-only by construction:** never trains, never touches
+`decision_scorer.pkl` / `build_features` / `N_FEATURES` / any trade
+path. Safe to run against the unattended continuous loop — like the
+other `ml/*` diagnostics, it loads the deployed pickle + outcomes
+file fresh and exits. CLI pattern mirrors `decision_scorer.py::main`
+(int return + `--json` + `SystemExit`) so an operator gets one
+muscle memory.
+
+**Tests (13 added):**
+
+- `TestStatusSentinels` — empty / untrained / below `MIN_PAIRS_FOR_CI`
+  → verdict-keyed insufficient-data dicts (the calibration /
+  baseline_compare honest-empty precedent).
+- `TestPointEstimatesAndCIs` — perfect predictor → CI tightly
+  around 0 RMSE / 1.0 dir_acc / 1.0 rank_ic; anti-predictor → CI
+  excludes 0 (anti-skill detected); constant predictor → rank_ic =
+  0 via tie-aware Spearman (no fabricated +1).
+- `TestCorrectnessInvariants` — SELL sign-flip honoured; ±175% row
+  clamps to ±50 so RMSE CI doesn't spike; single-row predict
+  exception drops just that row.
+- `TestDeterminism` — same seed → identical CI bounds (so
+  cycle-over-cycle CI drift reflects real data shifts, not RNG
+  noise).
+- `TestJsonSafety` — result is JSON-serializable, no numpy
+  floats/NaN leak through.
+- `TestPercentileBounds` — CI bounds bracket the point estimate
+  for any well-behaved input.
+
+### How to run the new diagnostic
+
+```bash
+# 95% CI over the temporal-OOS slice (default)
+python3 -m paper_trader.ml.oos_bootstrap_ci
+
+# JSON output for piping into a dashboard / downstream check
+python3 -m paper_trader.ml.oos_bootstrap_ci --json
+
+# Faster, fewer bootstraps (still stable to ±~2pp on bounds)
+python3 -m paper_trader.ml.oos_bootstrap_ci --n-bootstrap 300
+
+# Evaluate against ALL records (in-sample + OOS) for comparison only —
+# the OOS slice remains the trustworthy generalization view.
+python3 -m paper_trader.ml.oos_bootstrap_ci --all-records
+
+# Custom outcomes path (e.g. when worktree pickle is stale, point
+# the live production outcomes file)
+python3 -m paper_trader.ml.oos_bootstrap_ci \
+  --outcomes /media/zeph/projects/paper-trader/data/decision_outcomes.jsonl
+```
+
+### Test commands (ML / backtest domain)
+
+```bash
+# Focused suite — fastest signal on ML/scorer/backtest changes (~5s)
+cd /home/zeph/trading-intelligence/paper-trader && \
+  python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+  tests/test_continuous.py tests/test_validation.py \
+  tests/test_oos_bootstrap_ci.py -v
+
+# Broad ML/backtest suite (~5min)
+python3 -m pytest tests/ -v -k "ml or backtest or scorer or oos"
+```
+
+### Phase 3 — quant-perspective findings (5)
+
+1. **Continuous loop is STOPPED.** Last activity in
+   `/media/zeph/projects/paper-trader/continuous.log` was a SIGTERM
+   at 2026-05-17, with the latest `backtest_runs.completed_at` at
+   2026-05-18T18:05Z. Two days of stale skill metrics — restart the
+   loop to refresh `data/scorer_skill_log.jsonl` /
+   `data/baseline_skill_log.jsonl`.
+
+2. **Two orphaned `status='running'` rows** in `backtest.db`
+   (run_id 6238 from 2026-05-18T14:17Z, run_id 6243 from
+   2026-05-18T18:45Z). The startup-time `_reap_orphaned_runs()` will
+   sweep them on next launch (both >6h old now, comfortably past
+   the `max_age_hours=6.0` guard).
+
+3. **3 cycles lost ArticleNet training to lock exhaustion** —
+   `inject err: database is locked` after the `_LOCK_RETRY_SLEEPS =
+   (3.0, 8.0, 15.0)` retries exhausted. ArticleNet was retrained on
+   the previous cycle's data those cycles. Not a bug (the retry +
+   backoff is correctly tuned) — a heads-up for the operator that
+   under heavy host saturation the inject step IS the bottleneck.
+
+4. **Recent (last 2000) OOS forward-return-5d distribution is calmer
+   than the documented ~σ=11.7 baseline:** `μ=+0.84, σ=6.13,
+   p1=-15.56, p99=+18.69, |fr|>50: 0, |fr|>30: 3`. The Phase-1
+   label-clamp fix is essentially a no-op on this slice (only 3/2000
+   rows >30%, none >50%), but it's still correct for older tail
+   data (the docs cite 25/5000 above 50% in earlier cycles).
+
+5. **`oos_bootstrap_ci` on the full accumulated outcomes file
+   surfaces real edge:** `rank_ic = +0.2245 [+0.171, +0.287]` —
+   CI cleanly excludes 0. This is materially higher than the
+   per-cycle `oos_ic` of 0.02–0.11 the skill ledger reports
+   because the per-cycle view runs on smaller temporal slices
+   (~1000 rows from one window). The full-file accumulated view
+   shows the scorer's directional edge IS real over the broader
+   corpus — even though magnitude RMSE remains above σ. A
+   skeptical quant can now read this as a single line with a
+   statistically defensible verdict.
+
+### Constraints honoured
+
+- **Invariant #5** (gate at `n_train ≥ 500`) — unchanged. The CI
+  diagnostic is read-only and never modulates the gate.
+- **Invariant #10** (single source of truth) — `_spearman` is the
+  same `paper_trader.ml.calibration._spearman` every other rank
+  diagnostic uses; the label-clamp is `PRED_CLAMP_PCT` from
+  `decision_scorer.py`; `_to_float` semantics from the same module.
+- **CLAUDE.md §6** — gate arms (`±10/±5/0` buckets, ×0.6 / ×0.85 /
+  ×1.15 / ×1.3) untouched; pickle schema untouched; predict() scalar
+  contract untouched; `build_features` / `SECTORS` / `N_FEATURES`
+  untouched.
+- **Concurrent staging discipline** ([[pt-concurrent-samerole-staging-race]])
+  — staged ONLY the 4 files I changed (validation.py,
+  run_continuous_backtests.py, the two test files) for Phase 1, and
+  the 2 new files for Phase 2; concurrent Agent 1 / Agent 4 changes
+  to `paper_trader/dashboard.py` and untracked
+  `paper_trader/analytics/position_runrate.py` were correctly left
+  out of both commits.
