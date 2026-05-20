@@ -30,12 +30,19 @@ def compute(window_hours: int = 6):
     # averages with synthetic training labels. Currently masked by the
     # `ml_score IS NOT NULL` predicate (synthetic rows never go through ML
     # scoring), but the partial filter is the same drift class as elsewhere.
+    #
+    # ai_score > 0: the column defaults to 0 (REAL DEFAULT 0), never NULL,
+    # so `ai_score IS NOT NULL` was a tautology that let unscored rows
+    # (ai_score=0, ml_score=8) report a fake ml-vs-ai gap of 8 against an
+    # implicit "ai=0" — every model-scored-but-LLM-unscored row inflated the
+    # per-source skew average. urgency_scorer floors any LLM-touched row at
+    # 0.01 so `> 0` is the canonical "the LLM actually graded this" filter.
     rows = conn.execute(
         f"""
         SELECT source, ai_score, ml_score
           FROM articles
          WHERE id IN (SELECT id FROM articles ORDER BY id DESC LIMIT ?)
-           AND ai_score IS NOT NULL
+           AND ai_score > 0
            AND ml_score IS NOT NULL
            AND {_LIVE_ONLY_CLAUSE}
         """,
