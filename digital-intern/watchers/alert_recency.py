@@ -281,6 +281,133 @@ def partition_already_alerted(
     return kept, suppressed
 
 
+# ── Paraphrase-tolerant suppression (complements partition_already_alerted) ──
+# Exact-signature cross-cycle suppression collapses a wire-prefix / source-
+# attribution repost of the SAME 8-token headline, but is silent on a
+# paraphrase whose first-8-token signature shifts by even one token. Live
+# evidence (2026-05-20 12h window, alert_recency.db audit): the "Union calls
+# strike at South Korea chip giant Samsung" wire fired a "S. Korea" variant
+# FIRST (04:26Z), then the "South Korea" spelling 1h later (05:28Z) — Jaccard
+# 0.86 between the two canonical sigs, but exact-sig mismatch let the second
+# push through. That is the analyst's #1 noise complaint reproduced on the
+# one path that thought it had already solved cross-cycle dupes.
+#
+# Tuned conservatively (the analyst's #2 complaint is missed alerts, so
+# false-suppression must stay near-zero):
+#   * min_jaccard 0.75 — well above the 0.667 ceiling for single-token
+#     antonym flips on short 4-5 token sigs (e.g. "Fed raises rates 25bp" vs
+#     "Fed cuts rates 25bp" → token sets {raises, rates, 25bp} vs {cuts,
+#     rates, 25bp} = J 0.50 after stopword strip; "NVDA earnings beat Q3" vs
+#     "NVDA earnings miss Q3" = J 0.60). Single-direction flips below.
+#   * min_shared 4 — at least four SALIENT (post-stopword) tokens must
+#     overlap so two 5-token headlines that happen to share a generic prefix
+#     ("Apple beats Q1", "Apple misses Q1" — only 1 salient shared) cannot
+#     trigger. The Samsung-strike pair shares 8+ salient tokens (union,
+#     calls, strike, korea, chip, giant, samsung, electronics) — far above
+#     the bar.
+# Pure functions — no DB / IO. Best-effort applied at the caller site
+# exactly like partition_already_alerted, so any failure degrades to the
+# previous (exact-sig-only) behaviour and never raises into the alert path.
+PARAPHRASE_MIN_JACCARD = 0.75
+PARAPHRASE_MIN_SHARED = 4
+
+
+def _salient_tokens(sig: str) -> set[str]:
+    """Pure: canonical-signature tokens with the _REL_STOPWORDS removed."""
+    if not sig:
+        return set()
+    return {t for t in sig.split() if t not in _REL_STOPWORDS}
+
+
+def paraphrase_match(
+    title: str | None,
+    recent: list[dict],
+    *,
+    min_jaccard: float = PARAPHRASE_MIN_JACCARD,
+    min_shared: int = PARAPHRASE_MIN_SHARED,
+) -> dict | None:
+    """Pure: is ``title`` a high-overlap paraphrase of a recently-fired alert?
+
+    Returns the best ``{"title", "age_hours", "sig", "jaccard", "shared"}``
+    match or ``None``. Distinct from ``related_prior_alert`` (which finds a
+    *related developing story* worth annotating, threshold ≥3 shared tokens)
+    by requiring Jaccard ≥ ``min_jaccard`` AND ≥ ``min_shared`` shared
+    salient tokens — the bar a *paraphrase of the same event* must clear
+    before suppression is safe. An exact-signature repeat is skipped (already
+    caught by ``partition_already_alerted`` upstream); empty signatures never
+    match. Ties break to the most-recent prior (``recent`` is newest-first).
+    No DB / IO."""
+    sig_cur = _signature(title)
+    if not sig_cur:
+        return None
+    cur = _salient_tokens(sig_cur)
+    if len(cur) < min_shared:
+        return None
+    best: dict | None = None
+    best_j = 0.0
+    for r in recent:
+        sig_prev = r.get("sig") or ""
+        if not sig_prev or sig_prev == sig_cur:
+            continue  # missing, or exact dup (already suppressed upstream)
+        prev = _salient_tokens(sig_prev)
+        if len(prev) < min_shared:
+            continue
+        shared = cur & prev
+        if len(shared) < min_shared:
+            continue
+        union = cur | prev
+        if not union:
+            continue
+        jac = len(shared) / len(union)
+        if jac < min_jaccard:
+            continue
+        if jac > best_j:
+            best_j = jac
+            best = {
+                "title": r.get("title") or "",
+                "age_hours": float(r.get("age_hours") or 0.0),
+                "sig": sig_prev,
+                "jaccard": round(jac, 3),
+                "shared": sorted(shared),
+            }
+    return best
+
+
+def partition_paraphrase_alerted(
+    articles: list[dict],
+    recent: list[dict],
+    *,
+    min_jaccard: float = PARAPHRASE_MIN_JACCARD,
+    min_shared: int = PARAPHRASE_MIN_SHARED,
+) -> tuple[list[dict], list[dict]]:
+    """Pure split of ``articles`` into ``(kept, suppressed)``.
+
+    ``suppressed`` = a row whose canonical signature is a paraphrase
+    (``paraphrase_match`` hit) of a recently-fired prior alert. Untitled
+    rows / rows with fewer than ``min_shared`` salient tokens are NEVER
+    suppressed (same conservative discipline as
+    ``partition_already_alerted``). Each suppressed row is tagged with
+    ``_paraphrase_match`` (the matched prior's title + Jaccard) so callers
+    can log WHICH paraphrase fired without dumping the full title pair.
+    Empty ``recent`` is a no-op. No DB / IO."""
+    if not recent:
+        return list(articles), []
+    kept: list[dict] = []
+    suppressed: list[dict] = []
+    for a in articles:
+        match = paraphrase_match(
+            a.get("title"), recent,
+            min_jaccard=min_jaccard, min_shared=min_shared,
+        )
+        if match is None:
+            kept.append(a)
+        else:
+            tagged = dict(a)  # shallow copy — never mutate caller's row
+            tagged["_paraphrase_match"] = match
+            suppressed.append(tagged)
+    return kept, suppressed
+
+
 def record_alerted(
     articles: list[dict],
     now: datetime | None = None,
