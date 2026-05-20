@@ -15,6 +15,7 @@ import pytest
 
 from paper_trader.ml.decision_scorer import (
     DecisionScorer,
+    FEATURE_NAMES,
     N_FEATURES,
     PRED_CLAMP_PCT,
     SECTORS,
@@ -284,6 +285,62 @@ class TestBuildFeatures:
         assert hi[0] > lo[0]
         assert hi != lo
 
+    def test_feature_names_order_matches_build_features(self):
+        """``FEATURE_NAMES`` is the single source of truth that
+        ``feature_contributions`` and ``feature_importance`` use to label
+        each slot of ``build_features``'s output. A silent reorder in
+        ``build_features`` (without touching ``FEATURE_NAMES``) would mis-
+        label every attribution row and silently mislead operators
+        debugging "why does the scorer predict this?". This test pins
+        every slot by name with a known input vector — any change to
+        either side that desyncs the two will fail loudly here.
+
+        Catches the regression class: a developer adds/reorders a feature
+        in ``build_features`` and forgets to update ``FEATURE_NAMES`` (or
+        vice versa). The existing ``assert len(FEATURE_NAMES) == N_FEATURES``
+        only catches a length mismatch — NOT a reorder.
+        """
+        # Inputs chosen so every slot has a DISTINCT value — that way a
+        # silent swap (e.g. mom5 ↔ mom20) lands the wrong value in the
+        # wrong slot and the per-name assertion below catches it.
+        feats = build_features(
+            ml_score=3.7,
+            rsi=42.0,
+            macd=0.123,
+            mom5=4.5,
+            mom20=12.3,
+            regime_mult=0.6,
+            ticker="NVDA",
+            vol_ratio=2.5,
+            bb_pos=0.8,
+            news_urgency=75.0,
+            news_article_count=7.0,
+        )
+        by_name = dict(zip(FEATURE_NAMES, feats))
+        # Pin every non-sector slot by name. A reorder of `build_features`
+        # without updating FEATURE_NAMES would fail at least one of these.
+        assert by_name["ml_score"] == 3.7
+        assert by_name["rsi"] == 42.0
+        assert by_name["macd"] == pytest.approx(0.123, abs=1e-6)
+        assert by_name["mom5"] == 4.5
+        assert by_name["mom20"] == 12.3
+        assert by_name["regime_mult"] == 0.6
+        assert by_name["vol_ratio"] == 2.5
+        assert by_name["bb_pos"] == pytest.approx(0.8, abs=1e-6)
+        assert by_name["news_urgency"] == 75.0
+        assert by_name["news_article_count"] == 7.0
+        # The 7-way sector one-hot must follow IMMEDIATELY after the 10
+        # numeric features, in `SECTORS` order, and NVDA must one-hot
+        # the "tech" slot specifically.
+        assert by_name["sector_tech"] == 1.0
+        assert sum(by_name[f"sector_{s}"] for s in SECTORS) == 1.0
+        # Index sanity: tech slot must align with SECTORS.index("tech")
+        # plus the 10 numeric prefix — pins the layout contract that
+        # `feature_contributions` and `feature_importance` rely on.
+        tech_slot_idx = 10 + SECTORS.index("tech")
+        assert FEATURE_NAMES[tech_slot_idx] == "sector_tech"
+        assert feats[tech_slot_idx] == 1.0
+
 
 # ─────────────────────── DecisionScorer (untrained) ───────────────
 
@@ -363,6 +420,65 @@ class TestTrainScorer:
         assert result["status"] == "ok"
         # 30 unique pad records + 1 deduped NVDA — 31 total.
         assert result["n"] == 31
+
+    def test_dedup_survivor_is_highest_return_record(
+            self, tmp_path, monkeypatch):
+        """Stronger pin: not just that ONE NVDA survives the dedup, but that
+        the SURVIVOR is the higher-return-run copy specifically.
+
+        Mechanism: a +50% run's record carries a higher training sample
+        weight (max(0.5, min(2.0, 1.0 + 50/200)) = 1.25) than a -10% run's
+        (max(0.5, 0.95) = 0.95). With ALL OTHER features identical and the
+        only difference being which fwd label the survivor brings, the
+        trained model's prediction on those identical features must align
+        in SIGN with the survivor's label sign. A regression that flipped
+        the dedup tiebreaker would silently train on the -5% loss instead
+        of the +15% win and the resulting prediction-sign assertion would
+        fail.
+        """
+        import paper_trader.ml.decision_scorer as ds
+        # Avoid interfering with the deployed pickle.
+        monkeypatch.setattr(ds, "SCORER_PATH", tmp_path / "scorer.pkl")
+
+        # Two same-key records: the +50% run has fwd=+15, the -10% run has
+        # fwd=-5. Dedup must keep the +50% one — and the model trained on
+        # +15 must predict positively on the shared feature vector.
+        rec_lo = _synthetic_outcome(return_pct=-10, fwd=-5.0)
+        rec_hi = _synthetic_outcome(return_pct=50, fwd=15.0)
+        # Pad with 30 distinct neutral records to clear the threshold.
+        # Use mom5=0, fwd≈0 so the pad has no directional contribution.
+        pad = [_synthetic_outcome(sim_date=f"2025-02-{i:02d}", ticker="AMD",
+                                  fwd=0.0, ml_score=0.0, mom5=0.0)
+               for i in range(1, 31)]
+
+        result = train_scorer([rec_lo, rec_hi] + pad)
+        assert result["status"] == "ok"
+        assert result["n"] == 31
+
+        # Reload the freshly-pickled model and predict on the SHARED
+        # feature vector of the NVDA collision. A model trained on the
+        # +15 survivor — with everything else neutralised — should land
+        # on the positive side; if dedup kept the -5 record instead the
+        # prediction sign would flip.
+        s = ds.DecisionScorer()
+        assert s.is_trained
+        pred = s.predict(
+            ml_score=rec_hi["ml_score"],
+            rsi=rec_hi["rsi"], macd=rec_hi["macd"],
+            mom5=rec_hi["mom5"], mom20=rec_hi["mom20"],
+            regime_mult=rec_hi["regime_mult"],
+            ticker=rec_hi["ticker"],
+            vol_ratio=rec_hi["vol_ratio"], bb_pos=rec_hi["bb_position"],
+            news_urgency=rec_hi["news_urgency"],
+            news_article_count=rec_hi["news_article_count"],
+        )
+        # Loose bound — early-stopping MLP isn't perfectly calibrated on
+        # 31 records — but the survivor's sign must carry through.
+        assert math.isfinite(pred)
+        assert pred > 0, (
+            f"dedup tiebreaker should have kept the +15-label survivor; "
+            f"got pred={pred:.3f} (≤ 0 implies the -5-label record won)"
+        )
 
     def test_sell_target_sign_flipped(self):
         """A SELL whose forward return was negative is a CORRECT call — the
