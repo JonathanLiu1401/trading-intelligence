@@ -151,6 +151,27 @@ class TestHelperCatchesLiveNoise:
             assert hit, f"missed GF Value recap: {t!r}"
             assert name == "gf_value_says"
 
+    def test_why_x_stock_just_moved_motley_fool_variant(self):
+        """Live evidence (2026-05-19 19:49Z): "Why Micron Stock Just Popped
+        Again" was Sonnet-scored urgent=8 and fired a 🚨 BREAKING alert
+        because the existing why_did_stock regex required "Did". The
+        adverbial past-tense form ("Just/Now/Finally/Today/... Popped/Surged/
+        Tumbled/...") is the same retrospective Motley-Fool/Zacks shape and
+        must be suppressed. Pinned by the actual live title."""
+        for t in (
+            "Why Micron Stock Just Popped Again",
+            "Why Nvidia Stock Just Surged",
+            "Why AMD Stock Finally Tumbled",
+            "Why Tesla Stock Suddenly Soared",
+            "Why Microsoft Stock Now Crashed",
+            "Why Lumentum Stock Today Plunged",
+            "Why AXT Stock Just Jumped on Asia Demand",
+            "Why Intel Stock Already Rebounded",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed live why-just-moved recap: {t!r}"
+            assert name == "why_just_moved"
+
 
 # ── _looks_like_recap_template: real breaking headlines MUST survive ───────
 
@@ -231,6 +252,31 @@ class TestHelperPreservesRealBreaking:
         ):
             hit, _ = alert_agent._looks_like_recap_template({"title": t})
             assert not hit, f"false-positive on value/analyst: {t!r}"
+
+    def test_why_just_moved_does_not_catch_forward_looking(self):
+        """The why-just-moved pattern requires an adverb between "Stock" and
+        a PAST-TENSE verb — a forward-looking headline that uses the same
+        verbs as nouns ("Stock Pop Could Continue") or present-tense
+        ("Stock Slumps Today") must NOT match. Pins the discriminator."""
+        for t in (
+            # Forward-looking nouns — no past-tense verb after the adverb.
+            "Why MU Stock Pop Could Continue",
+            "Why Nvidia Stock Surge May Be Sustainable",
+            "Why Tesla Stock Drop Is Likely Overdone",
+            "Why AMD Stock Jump May Be the Start",
+            # Present-tense verbs — recap-flavoured but a different
+            # template the urgency_scorer prompt handles via the staleness
+            # rule rather than this past-tense gate.
+            "Why Microsoft Stock Slumps Today",
+            "Why Intel Stock Soars on Foundry Win",
+            # No adverb between "Stock" and verb — defaults to recap_did
+            # surface (which requires "Did"), so this should fall through.
+            "Why Microsoft Stock Drop Continues This Week",
+        ):
+            hit, _ = alert_agent._looks_like_recap_template({"title": t})
+            assert not hit, (
+                f"false-positive on forward-looking / non-past-tense: {t!r}"
+            )
 
 
 # ── _filter_recap_template_noise: partitioning + tagging ───────────────────

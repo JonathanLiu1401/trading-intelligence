@@ -387,10 +387,37 @@ _RT_GF_VALUE = re.compile(
     r"\bgf\s+value\s+says\b",
     re.IGNORECASE,
 )
+# "Why <X> Stock {Just|Now|Today|Finally|Suddenly|...} {Popped|Surged|...}"
+# (Motley Fool variant — same retrospective shape as _RT_WHY_DID, but the
+# subject does the moving past-tense without "Did" between Why and the
+# subject). Live evidence (2026-05-19): "Why Micron Stock Just Popped
+# Again" was Sonnet-scored urgent=8 and fired a 🚨 BREAKING alert at
+# 19:49Z; the recap gate would have caught it but the regex required
+# "Did", so the row leaked all the way to Discord. The cross-cycle
+# dedup later suppressed three syndicated copies of the same headline
+# (yfinance/Motley Fool, scraped/finance.yahoo.com, YahooFinance/MU at
+# 19:57-20:13Z) — the analyst still got the first push.
+#
+# Discriminator: an adverb between "Stock" and the past-tense verb is
+# required so a real forward-looking headline ("Why Microsoft Stock
+# Drop Continues", "Why MU Stock Pop Could Continue") is NOT caught. The
+# verb list is past-tense ONLY, so "Pop" / "Surge" / "Drop" as nouns
+# (forward-looking) also do not match. Validated against the live noise
+# set and the must-survive corpus (the question-form headlines that
+# legitimately discuss the future).
+_RT_WHY_JUST_MOVED = re.compile(
+    r"^\s*why\s+.+?\s+stock\s+"
+    r"(?:just|now|today|finally|suddenly|then|recently|already)\s+"
+    r"(?:popped|surged|jumped|soared|crashed|tumbled|plunged|sank|fell|"
+    r"dropped|climbed|spiked|slid|slipped|rallied|tanked|plummeted|"
+    r"nosedived|hammered|skyrocketed|rocketed|sliding|rebounded)\b",
+    re.IGNORECASE,
+)
 
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
+    ("why_just_moved", _RT_WHY_JUST_MOVED),
     ("market_today_dated", _RT_MARKET_TODAY),
     ("earnings_call_recap", _RT_EARNINGS_CALL),
     ("street_thinks", _RT_STREET_THINKS),
