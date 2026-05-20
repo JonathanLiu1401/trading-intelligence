@@ -558,6 +558,107 @@ class TestVolumeCacheConcurrency:
         assert data["T0"] == {"2024-01-02": 0.0}
 
 
+class TestVolumeCachePersistAtomicity:
+    """The persist helper writes to ``volumes_<start>_<end>.json.tmp`` then
+    atomically renames over the canonical path. A bare ``write_text`` would
+    leave a torn / truncated JSON file if the process is killed mid-write
+    (OOM / SIGKILL on the continuous loop is documented in CLAUDE.md §11),
+    and the next ``_load_volume_cache_for_window`` would then read a corrupt
+    file. The fix uses tmp+``.replace`` (the same atomic-write idiom
+    ``train_scorer``, the outcomes-trim, and the validation persister
+    already use)."""
+
+    def _seed_cache(self, bt, start, end, ticker_count: int = 5):
+        """Populate `_VOLUME_CACHE` with a deterministic window snapshot."""
+        s_iso, e_iso = start.isoformat(), end.isoformat()
+        for i in range(ticker_count):
+            bt._VOLUME_CACHE[(f"T{i}", s_iso, e_iso)] = {
+                "2024-01-02": float(i),
+                "2024-01-03": float(i + 0.5),
+            }
+
+    def test_persist_writes_canonical_path_atomically(self, monkeypatch):
+        """The post-persist state must show:
+          * the canonical ``.json`` file exists with the full payload, and
+          * no leftover ``.json.tmp`` shadow remains (``.replace`` consumes it).
+        """
+        import json
+        import paper_trader.backtest as bt
+
+        start = date(2024, 1, 1)
+        end = date(2024, 12, 31)
+        self._seed_cache(bt, start, end, ticker_count=5)
+
+        bt._persist_volume_cache_for_window(start, end)
+
+        path = bt._volume_cache_path(start, end)
+        tmp = path.with_suffix(".json.tmp")
+        assert path.exists()
+        # tmp is renamed over canonical by atomic .replace — must not linger.
+        assert not tmp.exists(), (
+            "tmp shadow leaked — caller did NOT use the atomic-rename idiom"
+        )
+        data = json.loads(path.read_text())
+        assert len(data) == 5
+        assert data["T0"] == {"2024-01-02": 0.0, "2024-01-03": 0.5}
+
+    def test_torn_tmp_does_not_corrupt_canonical_path(self, monkeypatch):
+        """Regression: a half-written `.json.tmp` from a crashed prior persist
+        must NOT poison the canonical file. The fix's `.replace` atomically
+        swaps the new fully-written tmp over the canonical path, so a torn
+        tmp from an earlier crash is silently overwritten on the next
+        successful persist.
+        """
+        import json
+        import paper_trader.backtest as bt
+
+        start = date(2024, 2, 1)
+        end = date(2024, 11, 30)
+        path = bt._volume_cache_path(start, end)
+        tmp = path.with_suffix(".json.tmp")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Simulate a torn write from a prior crash — half a JSON literal.
+        tmp.write_text('{"T1": {"2024-01-02": 1.0')
+
+        # Now do a real persist.
+        self._seed_cache(bt, start, end, ticker_count=3)
+        bt._persist_volume_cache_for_window(start, end)
+
+        # Canonical file is the well-formed snapshot just written; tmp is
+        # gone (consumed by .replace).
+        assert path.exists()
+        assert not tmp.exists()
+        data = json.loads(path.read_text())
+        assert sorted(data.keys()) == ["T0", "T1", "T2"]
+
+    def test_load_ignores_tmp_shadow_filename(self, monkeypatch):
+        """`_load_volume_cache_for_window` opens the canonical `.json` path
+        directly — it must NEVER attempt to read the `.json.tmp` shadow
+        (which by construction may be torn). Verify by writing a corrupt
+        `.tmp` alongside a valid canonical file and ensuring loading still
+        succeeds with the canonical data.
+        """
+        import json
+        import paper_trader.backtest as bt
+
+        start = date(2024, 3, 1)
+        end = date(2024, 10, 31)
+        path = bt._volume_cache_path(start, end)
+        tmp = path.with_suffix(".json.tmp")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        s_iso, e_iso = start.isoformat(), end.isoformat()
+        # Write a healthy canonical file.
+        path.write_text(json.dumps({"T1": {"2024-01-02": 9.0}}))
+        # Write a corrupt tmp shadow.
+        tmp.write_text("{not valid json{{")
+
+        bt._load_volume_cache_for_window(start, end)
+
+        # Cache must reflect the canonical file's content, not the corrupt tmp.
+        assert ("T1", s_iso, e_iso) in bt._VOLUME_CACHE
+        assert bt._VOLUME_CACHE[("T1", s_iso, e_iso)] == {"2024-01-02": 9.0}
+
+
 # ─────────────────────── _ml_decide (smoke tests) ──────────────────────
 
 class TestMlDecide:
