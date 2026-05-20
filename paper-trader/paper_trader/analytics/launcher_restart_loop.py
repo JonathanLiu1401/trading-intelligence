@@ -34,7 +34,19 @@ REFUSAL_MARK = "another paper trader is already running"
 START_MARK = "[runner] starting paper trader"
 
 
-def build_launcher_restart_loop(lines: Iterable[str]) -> dict:
+def build_launcher_restart_loop(lines: Iterable[str],
+                                *,
+                                log_size_bytes: int | None = None,
+                                log_age_seconds: float | None = None) -> dict:
+    """Tally refusal lines and (optionally) price the log-churn cost.
+
+    ``log_size_bytes`` and ``log_age_seconds`` are optional and pure
+    pass-through facts the dashboard endpoint can hand in (``stat()``
+    on the runner.log path). When present we surface them so an
+    operator can see the *operational cost* of a wedged launcher — a
+    multi-MB runner.log that grows by N MB/day is the symptom; the
+    refusal count is the cause. Caller may omit either; missing fields
+    degrade to ``None`` (the NO_DATA contract). Never raises."""
     starts = 0
     refusals = 0
     last_holder_pid: str | None = None
@@ -68,6 +80,21 @@ def build_launcher_restart_loop(lines: Iterable[str]) -> dict:
     else:
         verdict = "QUIET"
         headline = f"quiet — {refusals} refusal(s) across {starts} launch(es)"
+
+    # Log-churn cost block — degrades cleanly when the caller omits the
+    # stat() facts; never re-derives them (the _safe contract).
+    log_size_mb: float | None = None
+    bytes_per_day: float | None = None
+    if isinstance(log_size_bytes, (int, float)) and log_size_bytes >= 0:
+        log_size_mb = round(float(log_size_bytes) / (1024 * 1024), 3)
+        if (isinstance(log_age_seconds, (int, float))
+                and log_age_seconds and log_age_seconds > 0):
+            # Wall-clock growth rate, not refusal-attributed. The whole
+            # file is dominated by the refusal pair in a LOOP, so this
+            # is a faithful upper bound for the operational cost.
+            bytes_per_day = round(
+                float(log_size_bytes) * 86400.0 / float(log_age_seconds), 1)
+
     return {
         "verdict": verdict,
         "headline": headline,
@@ -75,4 +102,13 @@ def build_launcher_restart_loop(lines: Iterable[str]) -> dict:
         "refusals": refusals,
         "holder_pid": last_holder_pid,
         "loop_floor": LOOP_FLOOR,
+        "log_size_bytes": (int(log_size_bytes)
+                           if isinstance(log_size_bytes, (int, float))
+                           and log_size_bytes >= 0 else None),
+        "log_size_mb": log_size_mb,
+        "log_age_seconds": (float(log_age_seconds)
+                            if isinstance(log_age_seconds, (int, float))
+                            and log_age_seconds and log_age_seconds > 0
+                            else None),
+        "log_bytes_per_day": bytes_per_day,
     }
