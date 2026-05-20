@@ -897,6 +897,80 @@ def _event_readiness_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _decision_paralysis_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/decision-paralysis` (consecutive HOLD
+    streak detector — the HOLD_LOCK pathology) as compact chat-context
+    lines.
+
+    The chat already carries the NO_DECISION-storm path via
+    `_event_readiness_chat_lines` (which folds the current NO_DECISION
+    streak into BLIND/DEGRADED verdicts) and the broad action-mix via the
+    decision-health 24h aggregate, but neither flags the *other* "the loop
+    is alive but nothing is happening" failure mode: a contiguous run of
+    pure-HOLD decisions. A 95% HOLD share over 24h looks identical whether
+    spread across the day or stacked into a single immovable block where
+    Opus is deciding every cycle and never moving the book. The chat
+    answers "should I be doing something?" — and a stacked HOLD_LOCK is the
+    exact pathology that question is asked about. This closes that gap.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` string
+    is the verbatim chat headline — no re-derived verdict. Per-row lines
+    restate the builder's *own* fields (current_hold_streak,
+    hours_since_last_active) — never a recomputation (the
+    ``_event_readiness_chat_lines`` precedent).
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never an exception into the chat
+      handler)
+    - non-actionable verdicts (``ACTIVE`` / ``NO_DATA``) → ``[]``: only
+      ``HOLD_LOCK`` / ``IDLE_STORM`` / ``PASSIVE_LOOP`` are worth surfacing
+      to the analyst. A healthy decision loop is silence (the
+      ``_event_readiness_chat_lines`` silence precedent — never chat filler)
+    - actionable verdicts → builder's verbatim ``headline`` (only when a
+      usable string) + one detail line restating
+      current_hold_streak / current_passive_streak / hours_since_last_active
+      from the builder's OWN fields (the ``_macro_calendar_chat_lines``
+      precedent); a missing field degrades to a "?" placeholder rather than
+      raises (the ``_paper_trader_position_lines`` precedent)
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"HOLD_LOCK", "IDLE_STORM", "PASSIVE_LOOP"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)                  # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    hold_run = _num(rep.get("current_hold_streak"))
+    pass_run = _num(rep.get("current_passive_streak"))
+    nd_run = _num(rep.get("current_no_decision_streak"))
+    hsla = _num(rep.get("hours_since_last_active"))
+
+    detail_parts: list[str] = []
+    if hold_run is not None:
+        detail_parts.append(f"HOLD streak {int(hold_run)}")
+    if nd_run:
+        detail_parts.append(f"NO_DECISION streak {int(nd_run)}")
+    if pass_run is not None and (hold_run is None or pass_run > hold_run):
+        detail_parts.append(f"passive streak {int(pass_run)}")
+    if hsla is not None:
+        detail_parts.append(f"last FILLED/BLOCKED {hsla:.1f}h ago")
+
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    return lines
+
+
 def _earnings_shock_chat_lines(es) -> list[str]:
     """Render paper-trader's `/api/earnings-shock` (pre-earnings dollarized
     1σ shock per held imminent print) as compact chat-context lines.
@@ -3105,6 +3179,33 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: event-readiness fetch failed: %s", e)
 
+        # Consecutive-HOLD paralysis (HOLD_LOCK) — the other "alive but
+        # nothing happens" failure mode that event-readiness covers only
+        # the NO_DECISION storm half of. A stacked HOLD-only block where
+        # Opus decides every cycle but never moves the book reads as
+        # HEALTHY on /api/runner-heartbeat and /api/decision-health, yet
+        # the operator's "should I be doing something?" question is
+        # exactly the one this pathology breaks. Composed verbatim by the
+        # pure _decision_paralysis_chat_lines helper (unit-tested; SSOT —
+        # the builder's own `headline` is the chat headline, no
+        # re-derived verdict). Guarded 3s read; ACTIVE / NO_DATA payloads
+        # silently omit the block (the _event_readiness_chat_lines
+        # silence precedent — never chat filler when the loop is
+        # healthy). Only appears once :8090 is restarted onto
+        # /api/decision-paralysis.
+        decision_paralysis_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/decision-paralysis",
+                    timeout=3) as resp:
+                _dp = json.loads(resp.read().decode("utf-8"))
+            decision_paralysis_block = "\n".join(
+                _decision_paralysis_chat_lines(_dp))
+        except Exception as e:
+            _logger().warning(
+                "chat: decision-paralysis fetch failed: %s", e)
+
         # "What materially changed since you last looked" — the one temporal-
         # change view. Every sub-fetch above is a current-state snapshot; this
         # lets the chat answer "what happened while I was away / since I last
@@ -3290,6 +3391,7 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — PRE-EARNINGS DOLLARIZED 1σ SHOCK (per HELD imminent print: 'if NVDA gaps the typical 1σ on its release, the book moves $X / Y% of equity' — the forward $-at-risk view that complements the EARNINGS RADAR's timing-only listing):\n{earnings_shock_block}\n\n" if earnings_shock_block else "")
             + (f"MACRO CALENDAR — FOMC RATE DECISION (the single biggest MARKET-WIDE event; it moves the whole book at once, leveraged ETFs most violently — surfaced only when one is actually within the 14d horizon):\n{macro_calendar_block}\n\n" if macro_calendar_block else "")
             + (f"PAPER TRADER — EVENT READINESS (will the live trader actually be able to react before the next earnings print? Joins earnings-risk + decision-velocity + Claude-empty rate + the *current* NO_DECISION streak into a single per-event verdict — surfaced ONLY when BLIND / DEGRADED / IMMINENT_OVERDUE, never as filler when the pipeline is healthy. Recommended_action carries verbatim from the trader endpoint — restate, never re-derive):\n{event_readiness_block}\n\n" if event_readiness_block else "")
+            + (f"PAPER TRADER — DECISION PARALYSIS (consecutive HOLD-only / NO_DECISION runs on the live decision loop — a stacked HOLD_LOCK block reads HEALTHY on runner-heartbeat and decision-health 24h aggregate but means Opus decided every cycle and never moved the book. Surfaced ONLY when HOLD_LOCK / IDLE_STORM / PASSIVE_LOOP, never filler when ACTIVE. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{decision_paralysis_block}\n\n" if decision_paralysis_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "

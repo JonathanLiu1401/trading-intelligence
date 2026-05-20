@@ -9628,6 +9628,29 @@ def decision_pace_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/decision-paralysis")
+@swr_cached("decision-paralysis", 30.0)
+def decision_paralysis_api():
+    """Consecutive HOLD streak detector — the "HOLD_LOCK" pathology.
+
+    Distinct from ``/api/runner-heartbeat`` (NO_DECISION storms only) and
+    ``/api/decision-health`` (24h HOLD% aggregate, not contiguous runs).
+    A 95% HOLD share looks identical whether spread across the day or
+    stacked into a single immovable block; this surface only flags the
+    block. See ``analytics/decision_paralysis.py`` docstring for the
+    full verdict ladder (IDLE_STORM / HOLD_LOCK / PASSIVE_LOOP / ACTIVE)
+    and threshold rationale.
+
+    Pure builder over ``store.recent_decisions``; observational only
+    (AGENTS.md invariants #2/#12)."""
+    try:
+        from .analytics.decision_paralysis import build_decision_paralysis
+        decisions = get_store().recent_decisions(limit=500)
+        return jsonify(build_decision_paralysis(decisions))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/decision-forensics")
 def decision_forensics_api():
     """*Why* the live trader produces no decision — failure-mode taxonomy.
