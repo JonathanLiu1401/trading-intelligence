@@ -2304,10 +2304,21 @@ class BacktestEngine:
                 else:
                     score = 0.0
 
-                try:
-                    urg_v = float(urgency) if urgency is not None else 0.0
-                except (TypeError, ValueError):
+                # `urgency` is also computed by ArticleNet at first_seen time. A
+                # hindsight-contaminated row was scored AFTER what the article
+                # described actually happened, so its urgency is forward-looking
+                # too — keeping it would leak that knowledge into the
+                # `news_urgency` scorer feature (via _ml_decide → reasoning →
+                # _compute_decision_outcomes → train_scorer). Mirror the score
+                # filter: zero out urgency for the same reason kw_score replaces
+                # ai_score here.
+                if hindsight_contaminated:
                     urg_v = 0.0
+                else:
+                    try:
+                        urg_v = float(urgency) if urgency is not None else 0.0
+                    except (TypeError, ValueError):
+                        urg_v = 0.0
                 result.setdefault(day_str, []).append({
                     "title": title, "url": url or "",
                     "source": source or "", "score": score, "snippet": snippet,
