@@ -8963,6 +8963,84 @@ def earnings_distribution_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/peer-earnings-shock")
+@swr_cached("peer-earnings-shock", 300.0)
+def peer_earnings_shock_api():
+    """Indirect 1σ exposure on held LEVERAGED ETFs from upcoming
+    constituent (peer) earnings. The fusion complement to
+    ``/api/earnings-shock`` (direct held-name σ) and
+    ``/api/etf-lookthrough`` (hidden indirect $-exposure). Neither
+    answers the operator's actual pre-mega-cap-print question: *"NVDA
+    reports tonight. I hold $148 TQQQ. NVDA's σ is 7%. What is my
+    INDIRECT NVDA $-shock on the TQQQ position?"* — the arithmetic is
+    one multiplication, but the surfaces above never fuse it.
+
+    Composes ``build_etf_lookthrough`` (per-(ETF, underlying) indirect
+    $-exposure) and ``build_event_calendar`` (which underlyings have
+    imminent earnings) verbatim (single source of truth, AGENTS.md
+    #10). σ per underlying comes from yfinance via
+    ``_earnings_history_for`` + the same ``_pop_stdev`` convention
+    ``earnings_shock`` uses (so a constituent's σ here byte-matches
+    its σ in ``earnings_shock`` for held names). Per-row INSUFFICIENT_
+    SIGMA when history < ``earnings_shock.MIN_HISTORY=3`` — the row
+    surfaces but the σ is honestly withheld (the
+    ``earnings_shock`` row-level discipline).
+
+    State ladder: NO_DATA / NO_ETF_HELD / NO_PEER_EVENTS / OK.
+    Verdict band (LOW / MODERATE / SEVERE) anchored to book-relative
+    σ (the ``earnings_shock`` calibration shape). Advisory only —
+    never gates Opus, never injected into the decision prompt, no
+    caps (AGENTS.md #2/#12). SWR-cached 5 min: yfinance earnings_dates
+    + 3y daily history per constituent ticker is the slowest yfinance
+    shape; same TTL as ``earnings-shock`` / ``earnings-distribution`` /
+    ``implied-move``."""
+    try:
+        from .analytics.earnings_shock import (
+            MIN_HISTORY as _ES_MIN_HISTORY,
+            _pop_stdev as _es_pop_stdev,
+        )
+        from .analytics.event_calendar import build_event_calendar
+        from .analytics.peer_earnings_shock import build_peer_earnings_shock
+        store = get_store()
+        pf = store.get_portfolio()
+        positions = store.open_positions()
+        try:
+            from .strategy import WATCHLIST as _WATCHLIST
+            watch = {t.upper() for t in _WATCHLIST}
+        except Exception:
+            watch = set()
+        held = {(p.get("ticker") or "").upper()
+                for p in positions if p.get("ticker")}
+        # event_calendar's horizon must cover the peer-shock horizon —
+        # use a slightly wider window so a 7-day peer event isn't
+        # pre-filtered by event_calendar's default.
+        ec = build_event_calendar(positions, held | watch, horizon_days=14.0)
+        snap = {
+            "cash": pf.get("cash"),
+            "total_value": float(pf.get("total_value") or 0.0),
+            "positions": positions,
+        }
+
+        # Sigma provider: yfinance history → pop_stdev. SSOT shape:
+        # byte-identical σ to earnings_shock for a name covered by
+        # both surfaces (a held name's NVDA σ here equals its NVDA σ
+        # in earnings_shock — same MIN_HISTORY, same _pop_stdev).
+        def _sigma_for(tk: str):
+            try:
+                history = _earnings_history_for(tk)
+            except Exception:
+                return None
+            if not history or len(history) < _ES_MIN_HISTORY:
+                return None
+            return _es_pop_stdev(history)
+
+        return jsonify(build_peer_earnings_shock(
+            snap, ec, sigma_provider=_sigma_for,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/implied-move")
 @swr_cached("implied-move", 300.0)
 def implied_move_api():
@@ -10542,6 +10620,38 @@ def winner_autopsy_api():
         # oldest → newest (build_round_trips reads in sequence).
         trades = list(reversed(store.recent_trades(2000)))
         return jsonify(build_winner_autopsy(trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/catalyst-class-autopsy")
+def catalyst_class_autopsy_api():
+    """Per-entry-thesis-class autopsy of closed round-trips. The orthogonal
+    complement to /api/loser-autopsy and /api/winner-autopsy: both of those
+    classify the EXIT behaviour (KNIFE_CATCH / WHIPSAW / SLOW_BLEED /
+    STOPPED_OUT and HOME_RUN / SCALP / SLOW_GRIND / TARGET_HIT) — *how the
+    trade was closed*. Neither classifies the ENTRY thesis — *which catalyst
+    TYPE motivated the open*. This composes the single source of truth
+    (build_round_trips, AGENTS.md #10), joins the verbatim entry reason back
+    from the contributing trade row by DB id (the loser/winner_autopsy
+    discipline), multi-labels each closed trip by every matched class
+    (ML_ADVISOR / EARNINGS_PLAY / ANALYST_PT / TECHNICALS / MACRO /
+    BREAKING_NEWS / PUNDIT / SECTOR_SYMPATHY / CONCENTRATION /
+    UNCLASSIFIED), and surfaces per-class win-rate vs the pool baseline.
+    Verdicts (BIASED_WINNER / BIASED_LOSER / NEUTRAL) are withheld below
+    n=STABLE_MIN_TRIPS_PER_CLASS=4 per class (the loser_autopsy /
+    trade_asymmetry STABLE-gate idiom). Advisory only — never gates Opus,
+    never injected into the decision prompt, adds no caps (AGENTS.md
+    #2/#12)."""
+    try:
+        from .analytics.catalyst_class_autopsy import (
+            build_catalyst_class_autopsy,
+        )
+        store = get_store()
+        # Same trades convention as /api/analytics & /api/loser-autopsy:
+        # oldest → newest (build_round_trips reads in sequence).
+        trades = list(reversed(store.recent_trades(2000)))
+        return jsonify(build_catalyst_class_autopsy(trades))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -12830,6 +12940,14 @@ def _swr_prewarm():
         # spot the prewarm-coverage invariant locks against; matches the
         # earnings-shock prewarm cadence.
         ("implied-move", implied_move_api),
+        # peer-earnings-shock @swr_cached 300s — fuses etf_lookthrough +
+        # event_calendar to surface indirect 1σ exposure on held leveraged
+        # ETFs from constituent prints. Same slow-yfinance shape as
+        # earnings-shock (3y daily history per constituent → _pop_stdev);
+        # the prewarm==@swr_cached invariant locks it here so first poll
+        # post-restart returns real data, not {"warming": true} — exactly
+        # the cold-stall blind spot during pre-mega-cap-print triage.
+        ("peer-earnings-shock", peer_earnings_shock_api),
         # The four endpoints below were @swr_cached but never added to this
         # prewarm list — exactly the freeze-triage cold-stall blind spot the
         # test_swr_prewarm_coverage invariant exists to catch. A trader who
