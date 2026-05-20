@@ -344,6 +344,24 @@ _TICKER_ALIAS_PATTERNS: dict[str, tuple["re.Pattern[str]", ...]] = {
 }
 
 
+# Company-name aliases whose UPPER-cased form would be picked up by the
+# 1–5-char ALLCAPS regex as a "ticker", but which are NOT real tickers — the
+# alias path already maps them to the canonical symbol. Without this filter a
+# shouty headline ``"APPLE BEATS EARNINGS"`` extracts BOTH ``APPLE`` (fake)
+# and ``AAPL`` (real), and Opus reads ``tickers=APPLE,AAPL`` in the prompt
+# block — non-existent ticker pollution. Built from the alias table itself so
+# adding a new alias automatically gets the same protection. Only entries
+# whose alias.upper() is DIFFERENT from the canonical ticker count: ASML's
+# ``"asml"`` alias upper-cases to ``ASML`` which IS the real ticker, so
+# extracting ``ASML`` from a headline is correct and must not be filtered.
+_ALIAS_UPPER_FALSE_POSITIVES: frozenset[str] = frozenset(
+    a.upper()
+    for tk, aliases in _TICKER_ALIASES.items()
+    for a in aliases
+    if 2 <= len(a) <= 5 and a.upper() != tk
+)
+
+
 def _alias_match(text: str | None, ticker: str) -> bool:
     """True iff any of ``ticker``'s registered company-name aliases occurs as a
     standalone word in ``text`` (case-insensitive). False when ``text`` is
@@ -370,7 +388,9 @@ def _extract_tickers(text: str) -> set[str]:
         out.add(m.group(1))
     for m in _TICKER_RE.finditer(text):
         tok = m.group(1)
-        if tok in _NOT_TICKERS or len(tok) < 2:
+        if (tok in _NOT_TICKERS
+                or tok in _ALIAS_UPPER_FALSE_POSITIVES
+                or len(tok) < 2):
             continue
         out.add(tok)
     for tk in _TICKER_ALIAS_PATTERNS:
