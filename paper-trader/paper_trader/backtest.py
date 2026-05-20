@@ -761,11 +761,40 @@ class PriceCache:
 _VOLUME_CACHE: dict[tuple[str, str, str], dict[str, float]] = {}
 _VOLUME_CACHE_LOCK = threading.Lock()
 # Track which (start, end) windows we've already loaded from disk into memory.
-_VOLUME_CACHE_DISK_LOADED: set[tuple[str, str]] = set()
+# Uses an OrderedDict to preserve insertion order so we can evict the oldest
+# window when bounded growth hits the cap. The continuous loop picks a fresh
+# random window every cycle, so an unbounded set silently leaked tens of MB
+# of volume series across a day of running (~30 tickers × ~250 daily volumes
+# × 8 bytes ≈ 60 KB / window; ~144 cycles / 24 h ≈ 8.6 MB / day; ~60 MB / week).
+# Cap at the most recent N windows — well above any realistic in-flight set
+# but bounded so the cache cannot dominate process RSS.
+from collections import OrderedDict as _OrderedDict
+_VOLUME_CACHE_DISK_LOADED: "_OrderedDict[tuple[str, str], bool]" = _OrderedDict()
+_VOLUME_CACHE_MAX_WINDOWS = 16
 
 
 def _volume_cache_path(start: date, end: date) -> Path:
     return CACHE_DIR / f"volumes_{start.isoformat()}_{end.isoformat()}.json"
+
+
+def _evict_oldest_volume_windows_locked() -> int:
+    """Evict the oldest cached (start, end) windows when the in-memory map
+    exceeds the configured cap. Returns count of windows evicted.
+
+    Caller MUST hold `_VOLUME_CACHE_LOCK`. The eviction drops every per-ticker
+    entry whose (start_iso, end_iso) matches the evicted window so memory is
+    actually reclaimed (not just the bookkeeping set). On-disk caches remain
+    untouched — the next visit to that window pays one disk read to refill.
+    """
+    evicted = 0
+    while len(_VOLUME_CACHE_DISK_LOADED) > _VOLUME_CACHE_MAX_WINDOWS:
+        (old_start, old_end), _ = _VOLUME_CACHE_DISK_LOADED.popitem(last=False)
+        stale_keys = [k for k in _VOLUME_CACHE
+                      if k[1] == old_start and k[2] == old_end]
+        for k in stale_keys:
+            _VOLUME_CACHE.pop(k, None)
+        evicted += 1
+    return evicted
 
 
 def _load_volume_cache_for_window(start: date, end: date) -> None:
@@ -779,6 +808,9 @@ def _load_volume_cache_for_window(start: date, end: date) -> None:
     key = (start.isoformat(), end.isoformat())
     with _VOLUME_CACHE_LOCK:
         if key in _VOLUME_CACHE_DISK_LOADED:
+            # Touch on access so an actively-used window doesn't get evicted
+            # under bounded-LRU semantics.
+            _VOLUME_CACHE_DISK_LOADED.move_to_end(key)
             return
         path = _volume_cache_path(start, end)
         loaded: dict[str, dict[str, float]] = {}
@@ -789,7 +821,8 @@ def _load_volume_cache_for_window(start: date, end: date) -> None:
                 loaded = {}
         for ticker, series in loaded.items():
             _VOLUME_CACHE[(ticker, key[0], key[1])] = series
-        _VOLUME_CACHE_DISK_LOADED.add(key)
+        _VOLUME_CACHE_DISK_LOADED[key] = True
+        _evict_oldest_volume_windows_locked()
 
 
 def _persist_volume_cache_for_window(start: date, end: date) -> None:
