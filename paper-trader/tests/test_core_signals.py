@@ -139,6 +139,81 @@ class TestExtractTickers:
         for noise in ("AM", "ET", "PM", "Q3"):
             assert noise not in out
 
+    def test_common_english_words_filtered_out(self):
+        # All-caps English words observed live polluting the `tickers` field
+        # Opus reads in the live decision prompt. Each entry is verified NOT
+        # to collide with a known real-money ticker. Pin so a future trim of
+        # _NOT_TICKERS cannot silently re-introduce the live regression.
+        noise_phrases = [
+            ("JOIN NVDA AT 5PM", "JOIN", "NVDA"),
+            ("CEO TOLD INVESTORS", "TOLD", None),
+            ("Apple HIGH today", "HIGH", None),
+            ("NEAR HIGH again", "NEAR", None),
+            ("WHEN WILL FED CUT", "WILL", None),
+            ("THIS WAS UNDER PRESSURE", "WAS", None),
+            ("OVER 50% UP", "OVER", None),
+        ]
+        for phrase, false_positive, real_ticker in noise_phrases:
+            out = signals._extract_tickers(phrase)
+            assert false_positive not in out, (
+                f"{false_positive!r} should be filtered from {phrase!r}; "
+                f"got {sorted(out)!r}"
+            )
+            if real_ticker is not None:
+                assert real_ticker in out, (
+                    f"{real_ticker!r} should still be extracted from "
+                    f"{phrase!r}; got {sorted(out)!r}"
+                )
+
+    def test_known_collision_tickers_still_extracted(self):
+        # OPEN (Opendoor) and LOW (Lowe's) are real publicly-traded tickers
+        # whose symbols collide with common English words. They MUST NOT be
+        # added to _NOT_TICKERS, or the live trader goes blind to legit
+        # news on those names. Pin so the trade-off is explicit.
+        assert "OPEN" in signals._extract_tickers("OPEN announces new partnership")
+        assert "LOW" in signals._extract_tickers("LOW lifts dividend, raises guidance")
+
+    def test_cashtag_overrides_expanded_noise_filter(self):
+        # Even for words newly added to _NOT_TICKERS, an explicit $cashtag
+        # is an intentional signal and is kept (the AI / $AI asymmetry
+        # pin extended).
+        assert "TOLD" in signals._extract_tickers("watching $TOLD into the print")
+        assert "JOIN" in signals._extract_tickers("$JOIN if you must")
+
+    def test_finance_verbs_and_nouns_filtered(self):
+        # Verbs and nouns that dominate financial-news headlines but are not
+        # real tickers. Each entry observed live polluting the `tickers`
+        # field Opus reads (e.g. "Fed CUT RATES today" → tickers=CUT,RATES).
+        # Pin so a future trim cannot silently re-introduce the regression.
+        cases = [
+            ("Fed CUT RATES today", ("CUT", "RATES"), None),
+            ("NVDA BEATS earnings, MISSES guidance", ("BEATS", "MISSES"), "NVDA"),
+            ("AMD shares JUMP on STRONG REVENUE", ("JUMP", "REVENUE"), "AMD"),
+            ("MU PRICE TARGET RAISED to $200", ("PRICE", "RAISED"), "MU"),
+            ("MSFT REPORTS Q3 PROFIT", ("REPORTS", "PROFIT"), "MSFT"),
+            ("AAPL DROPS on guidance miss", ("DROPS",), "AAPL"),
+            ("Markets RALLY as Fed HIKES rates", ("RALLY", "HIKES"), None),
+        ]
+        for phrase, false_positives, real_ticker in cases:
+            out = signals._extract_tickers(phrase)
+            for fp in false_positives:
+                assert fp not in out, (
+                    f"{fp!r} should be filtered from {phrase!r}; "
+                    f"got {sorted(out)!r}"
+                )
+            if real_ticker is not None:
+                assert real_ticker in out, (
+                    f"{real_ticker!r} should still be extracted from "
+                    f"{phrase!r}; got {sorted(out)!r}"
+                )
+
+    def test_finance_verb_cashtag_overrides_filter(self):
+        # Even for finance verbs like CUT / RATES, an explicit $cashtag is
+        # an intentional signal and is kept (pin the cashtag-override
+        # asymmetry for the new finance-verb additions).
+        assert "CUT" in signals._extract_tickers("watching $CUT into the print")
+        assert "BEAT" in signals._extract_tickers("$BEAT calls active")
+
 
 class TestDecompress:
     def test_roundtrip(self):
