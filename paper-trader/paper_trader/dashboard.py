@@ -105,6 +105,21 @@ def healthz_api():
                 last_decision_age_s = None
     except Exception:
         pass
+    # Singleton-lock state of THIS process — surfaced on the cheap liveness
+    # probe so the watchdog can detect a "fail-open degraded" runner without
+    # paying for /api/state (see /api/runner-heartbeat for the long form).
+    lock_status: str | None = None
+    lock_holder_pid: int | None = None
+    lock_degraded: bool | None = None
+    try:
+        from . import runner as _runner
+        _ls = _runner.singleton_lock_state()
+        if isinstance(_ls, dict):
+            lock_status = _ls.get("status")
+            lock_holder_pid = _ls.get("holder_pid")
+            lock_degraded = bool(_ls.get("degraded"))
+    except Exception:
+        pass
     return jsonify({
         "ok": True,
         "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -118,6 +133,9 @@ def healthz_api():
         "open_positions": positions_n,
         "last_decision_age_s": (round(last_decision_age_s, 1)
                                 if last_decision_age_s is not None else None),
+        "lock_status": lock_status,
+        "lock_holder_pid": lock_holder_pid,
+        "lock_degraded": lock_degraded,
     })
 
 
