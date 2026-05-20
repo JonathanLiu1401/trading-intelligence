@@ -639,6 +639,7 @@ Digital Intern dashboard on `:8080` can cross-fetch.
 | `GET /api/mark-integrity` | **How much of the displayed book value is *fictional* right now?** — the mark-trust meta-metric no panel surfaces. When yfinance returns nothing for a held name `strategy._mark_to_market` falls back to `avg_cost` and flags `stale_mark=True` (the live 2026-05-17 pathology: `MU 0.5 @ 724.12`, `current_price==avg_cost`, `P/L $0.00` — indistinguishable from a genuinely flat row). That flag is surfaced *per position* to Opus & Discord, but nothing answers the **aggregate**: what share of gross book value is marked at cost, so `/api/analytics` Sharpe, `/api/drawdown`, the equity curve and the headline P&L are all quietly partially false. Reports `n_stale`, `stale_value_usd`, `stale_value_pct` of gross, per-name rows, `stale_tickers`, and a verdict `NO_DATA`→`CLEAN`→`DEGRADED` (0<pct<`UNTRUSTWORTHY_PCT`=50, or gross 0 with stale rows so the share is unquantifiable) →`UNTRUSTWORTHY` (≥50% — treat every displayed P/L as substantially fictional until the feed recovers / runner restarts). Reads the write-free `strategy.portfolio_snapshot_readonly` (never mutates the live trader). Pure, never raises (garbage rows degrade to zero value — the behavioural-builder `_safe` contract). Advisory only — never gates Opus, adds no caps (invariants #2/#12). Also embedded inside `/api/decision-context`. **Folded as an additive `mark_trust` honesty key into the three equity-derived risk endpoints this docstring names as the silent victims — `/api/tail-risk`, `/api/drawdown`, `/api/analytics` (2026-05-18, Agent 4).** A stale cycle records a *cost-frozen flat* equity point; those flats deflate vol/drawdown, inflate Sharpe, and truncate the VaR tail, yet a grep showed `stale_mark` had only ever reached mark_integrity/strategy/dashboard/reporter — never these maths. `dashboard._mark_trust_block(store)` composes `build_mark_integrity` **verbatim** off the SAME write-free `portfolio_snapshot_readonly` snapshot (single source of truth #10 — no re-derived staleness), adds `{verdict,n_stale,n_positions,stale_value_pct,stale_tickers,headline,note}` (the `note` only when verdict ∉ CLEAN/NO_DATA), and is `_safe`: any fault → key **omitted** so the risk payload is byte-identical and the endpoint never 500s for this reason. Purely additive (keyed-assertion-safe, the existing `tail_risk`-in-`/api/analytics` precedent); observational only, no caps, not injected into the decision prompt, **no schema change** (invariants #2/#12/#13). `hold_discipline`/`thesis_drift` (which read open-position P/L and silently misread a stale `$0.00` as a genuine flat) are a known *deferred* contamination — their endpoints feed `store.open_positions()` which lacks `stale_mark`, so a fix needs an endpoint data-source change that risks their existing exact-value `TestEndpoint`s; see `docs/superpowers/specs/2026-05-18-mark-trust-risk-surface-design.md`. Pure core: `analytics/mark_integrity.py::build_mark_integrity`. Locked by `tests/test_mark_integrity.py` (the exact live MU-stale shape `stale_value_pct`=37.94 off the raw gross, `>=50`→UNTRUSTWORTHY inclusive boundary, zero-gross no-divide-by-zero, option ×100, never-raises-on-garbage) + `tests/test_decision_context_endpoint.py` (Flask test client read-only + UNTRUSTWORTHY-when-price-missing) + `tests/test_mark_trust.py` (Flask test client end-to-end on all three endpoints: stale book → `mark_trust` UNTRUSTWORTHY; clean → CLEAN/`note`=None; **additive no-risk-drift** vs a direct `build_tail_risk` call — only `mark_trust` added, every risk field byte-identical; the `_safe` snapshot-fault → 200 + key-omitted contract; single-source-of-truth no-drift vs `build_mark_integrity`). Applies on next paper-trader restart |
 | `GET /api/holding-period-distribution` | **Closed round-trip P/L stratified by hold duration — where in the holding-period axis does my P/L actually live?** (2026-05-20) Every other realised-P/L surface reduces the closed-trip set to a single aggregate (`/api/track-record`, `/api/trade-asymmetry`) or a per-trip story (`/api/round-trip-postmortem`, `/api/winner-autopsy`, `/api/loser-autopsy`) — none of them answer the discretionary-PM question "63% of trips are SCALP but 91% of P/L comes from SWING". This surfaces it. Buckets each closed round-trip into SCALP (<1h) / INTRADAY (1-6h) / OVERNIGHT (6-24h) / SWING (1-3d) / TREND (3-7d) / POSITION (>7d) and per bucket reports `n_trips`, `n_winners`/`n_losers`, `total_pnl_usd`, `avg_pnl_usd`, `median_pnl_usd`, `win_rate_pct` (winners ÷ decided — zero-pnl trips excluded from the denominator, same convention as track_record), `share_of_trips_pct`, `share_of_abs_pnl_pct` (denominator is the absolute-value sum so a signed sum near zero can't blow the share fractions to nonsense). Cross-bucket verdicts: `alpha_engine` (bucket with the highest total $ P/L — must be net positive to count as an "engine", never a least-loss bucket); `dominant_bucket` (most trips; ties broken in canonical SCALP→POSITION order for determinism); `worst_bucket` (most-negative total $ P/L). State ladder mirrors `round_trip_postmortem`: `NO_DATA` → `INSUFFICIENT` (<`STABLE_MIN_TRIPS`=5; bucket rows still emit so the distribution can be watched accumulating, only the verdict is withheld — sample-size-honesty precedent) → `OK`. Bucket edges are exclusive-upper inclusive-lower; the 1h/6h/24h/72h/168h boundaries are pinned by tests so a silent widen can't shift a whole bucket of trips. Composes `analytics.round_trips.build_round_trips` as the SSOT (invariant #10) — no re-implemented round-trip aggregation. Pure builder; the endpoint owns I/O over `store.recent_trades`. Observational only — never gates Opus, never injected into the decision prompt, no caps (invariants #2/#12). Pure core: `analytics/holding_period_distribution.py::build_holding_period_distribution`. Locked by `tests/test_holding_period_distribution.py` (20 tests: each bucket boundary inclusive at its lower edge / exclusive at its upper edge, state ladder, alpha_engine must-be-net-positive, dominant tie-break canonical order, zero-pnl-excluded-from-decided, share_of_abs_pnl denominator, degrade-never-raise on garbage). Applies on next paper-trader restart |
 | `GET /api/add-discipline` | **ADD-trade discipline audit — is the book chasing (paying up vs running cost basis), averaging down (paying below), or stacking (neutral)?** (2026-05-20) When the book BUYs into a name it already holds, that ADD carries a sign: paying above the running avg_cost is the textbook *chasing* behaviour (anchoring on the original entry, bidding into strength after the easy entry is behind); paying below is *averaging down* (rational if the thesis is intact, the textbook setup for `loser_autopsy`'s SLOW_BLEED — doubling down on a broken thesis). **No existing endpoint watches the ADD moment itself.** `/api/trade-asymmetry` is the disposition gap; `/api/churn` counts overtrading; `/api/loser-autopsy`/`/api/winner-autopsy` narrate closed round-trips but neither sees the ADD pricing. Walks the trade ledger chronologically per position-key, maintains a running avg_cost (same VWAP arithmetic `store.upsert_position` uses), and classifies each non-opening BUY as `CHASING` (≥`CHASE_THRESHOLD_PCT`=1.5% above running cost, inclusive at the band edge with a 1e-6 epsilon for float-jitter robustness) / `AVERAGING_DOWN` (≤-1.5% below) / `STACKING` (inside the band). Reports `counts`, `pct`, per-add rows (ticker/ts/price/running_avg_cost_before/pct_above_cost/category), `by_ticker` (sorted by n_adds desc, ties by ticker for determinism), `closed_outcomes` (each closed round-trip tagged with its dominant ADD style via the `entry_trade_ids` join — `CHASING > AVERAGING_DOWN > STACKING` precedence on ties so the riskiest behaviour can't be masked by a balancing average-down), and `outcomes_by_style` ({style → n, total_pnl_usd, mean_pnl_pct, median_pnl_pct}). The closed-outcomes rollup answers the falsifiable question: did chasing-ADDs produce worse round-trip P/L than averaging-down ADDs? SELL-to-zero (full close) resets the per-position basis cycle so the next BUY is an "open", not an ADD — mirrors `build_round_trips` so the two views never disagree on what counts as open vs add. Partial SELLs leave basis intact. Distinct (option_type/strike/expiry) position keys are isolated — an option BUY on a held stock is a new open, not an ADD on the stock basis. State ladder: `NO_DATA` (no BUYs / only opens) → `EMERGING` (<`STABLE_MIN_ADDS`=3; counts emit but `dominant_style_overall` withheld) → `STABLE`. Composes `analytics.round_trips.build_round_trips` as the SSOT (invariant #10). Pure builder; the endpoint owns I/O over `store.recent_trades`. Observational only — never gates Opus, never injected into the decision prompt, no caps (invariants #2/#12). Pure core: `analytics/add_discipline.py::build_add_discipline`. Locked by `tests/test_add_discipline.py` (22 tests: opening-BUY suppression, CHASING/AVERAGING_DOWN/STACKING per ±1.5% boundary inclusive, VWAP basis update after each ADD (blended-basis lock so a stale basis can't misclassify subsequent adds), SELL-to-zero resets basis vs partial-sell does not, distinct position keys isolated, CHASING > AVG_DOWN > STACKING precedence on ties, round-trip outcome rollup verifies signs (CHASING trip −P/L vs AVG_DOWN trip +P/L), state ladder NO_DATA→EMERGING→STABLE, by_ticker sort + dominant, degrade-never-raise on garbage rows / non-list input / non-positive basis fallback to STACKING). Applies on next paper-trader restart |
+| `GET /api/position-rationale` | **Per-open-position most-recent Opus rationale — *what did Opus actually say* about each held name?** (2026-05-20) `/api/position-attention` answers "did Opus look?" (freshness / neglect). `/api/thesis-drift` re-tests entry theses against current state. Neither surfaces the concrete current rationale — the trader's #1 review-the-book question: *"why am I still holding NVDA? what did Opus actually say last cycle?"* The data is already in `decisions.reasoning` (JSON envelope `{"decision": {"reasoning": "...", "confidence": x, "action": "..."}, ...}` written by `strategy.decide()`). Today the operator must scroll the decision feed by hand to find the most recent row per ticker; this puts the answer one HTTP read away. Walks the newest-first `recent_decisions` list and picks the FIRST match per held ticker via `_parse_action_ticker` (mirror of `position_attention`'s helper — kept local so the two builders never disagree on the (verb, ticker) split). The reasoning string is capped at `_MAX_REASON_CHARS`=600 so a long Opus block can't bloat the response. Per-position output: `ticker`, `type`, `qty`, `days_held`, `last_decision_ts`, `hours_since_last_decision`, `last_decision_verb` (HOLD / BUY / SELL / ...), `last_decision_confidence`, `last_decision_reasoning`. NO_DECISION rows are correctly skipped (the helper returns ticker=None for them). BLOCKED rows DO match their ticker (a real Opus decision the trader still wants to see) but carry no JSON envelope, so `last_decision_reasoning` reads None — `n_with_rationale` counts only rows with actual reasoning so the verdict reflects rationale presence, not match presence. Degrade-safe (the `_safe` contract): legacy pre-JSON reasoning (parse_failed/retry_failed/raw "no response" text), missing inner `decision` key, non-dict envelopes, non-string reasoning fields, unparseable timestamps all degrade gracefully — the row still ships with `last_decision_reasoning=None`, never raises. Sort: positions WITHOUT a rationale to the top (need attention first), then within each bucket oldest-since-last-decision first (most stale rationale most operator-actionable). Verdict ladder: `INSUFFICIENT_DATA` (no open positions) → `MISSING_RATIONALE` (any held position has no recent Opus rationale on file — including a position that's only been BLOCKED but never HOLD/BUY/SELL'd) → `OK`. Pure builder over `store.open_positions()` + `store.recent_decisions(limit)` — no DB writes, no network, no Opus invocation. Advisory only — never gates Opus, never injected into the decision prompt, adds no caps (invariants #2/#12 — the `position_attention` precedent). Pure core: `analytics/position_rationale.py::build_position_rationale`. Locked by `tests/test_position_rationale.py` (13 tests: most-recent-per-ticker, NO_DECISION/BLOCKED filtering, legacy unparseable reasoning, envelope-missing-decision / non-dict-decision / non-string-reasoning edges, 600-char cap, missing-rationale rows sort to top, OK-verdict-when-all-have-reasoning, empty input, garbage timestamp skipped not raised). Applies on next paper-trader restart |
 | `GET /api/model-reliability` | **Which model actually made each live decision — full Opus vs the degraded Sonnet fallback — and how often the cycle produced nothing.** The stack is tuned end-to-end around Opus's reasoning depth (invariant #3), but `strategy.decide()` has a degrade ladder Opus→(timeout)Sonnet-on-condensed-prompt→NO_DECISION and **no panel was blind-spot-free here**: `/api/decision-health` buckets by *outcome* (a Sonnet-on-a-stripped-prompt FILLED is counted identically to a full-Opus FILLED), `/api/decision-forensics` only dissects the *NO_DECISION* excerpts. This reads the authoritative `fallback_used` flag in each made-decision's `reasoning` JSON (rows predating that flag read back `None` — verified live, a large pre-instrumentation tail — and are bucketed `legacy_unknown` and **excluded from the ratio** so a stale history can't fake a healthy/unhealthy number) and the NO_DECISION reason-prefix (`timeout`/`parse_failed`/`retry_failed`, mirroring strategy.py's exact strings). Reports per 24h/7d/all: `opus`/`sonnet_fallback`/`legacy_unknown` counts, `opus_share_pct` (of *attributable*), `no_decision_pct`, and the money cut `filled_fallback`/`filled_total`/`filled_fallback_pct` (how many *executed trades* the degraded model placed); plus a recent-vs-older `trend` (improving/worsening/flat) and a verdict `NO_DATA`→`INSUFFICIENT` (<`_MIN_ATTRIBUTABLE`=10 attributable, verdict withheld — the sample-size-honesty precedent)→`OPUS_HEALTHY` (≥90% Opus) / `DEGRADED` (≥70%) / `FAILING`. Pure, never raises (non-str rows degrade, not raise). Observational only — never gates Opus, adds no caps (invariants #2/#12; the `decision_health`/`self_review` precedent). Also `python -m paper_trader.analytics.model_reliability [--json]` (works when `:8090` is wedged). Pure core: `analytics/model_reliability.py::build_model_reliability`. Locked by `tests/test_model_reliability.py` (legacy-`None`-not-counted-as-Opus, outcome-prefix parsing, verdict bands, FILLED-from-fallback only-counts-fills, 24h windowing, worsening-trend ordering, never-raises-on-garbage). Applies on next paper-trader restart |
 
 ### Common failure modes (live trader)
@@ -11613,3 +11614,102 @@ threshold while ledgers say `gate_active=True`).
   mirrors `action_skill._aligned_pred` / `persona_skill._aligned`
   byte-for-byte (`-forward_return_5d` on SELL, prediction NOT flipped).
   Test `test_sell_action_flips_realized_sign` pins the convention.
+
+
+## 2026-05-20 core hybrid pass — `_extract_tickers` ALLCAPS false positives + `/api/position-rationale` (Agent 1)
+
+### Phase 1 fix — `signals._extract_tickers` strips shouted-company-name false positives
+
+A headline shouted in all caps (`"APPLE BEATS EARNINGS today"`) extracted
+BOTH `APPLE` (fake — Apple's real ticker is `AAPL`, never `APPLE`) and
+`AAPL` (via the existing alias path). Opus then read
+`tickers=APPLE,AAPL` in the live prompt's TOP SCORED SIGNALS block —
+non-existent-ticker pollution that confuses the decision engine. Same
+pattern affected the three other alias entries whose `len<=5` lowercase
+alias upper-cases to something OTHER than the canonical ticker:
+`TESLA→TSLA`, `INTEL→INTC`, `TSMC→TSM`. `ASML→ASML` (alias == ticker) is
+a legitimate extraction and stays unfiltered.
+
+Fix: precompute `_ALIAS_UPPER_FALSE_POSITIVES` from the existing
+`_TICKER_ALIASES` table at import time:
+
+```python
+_ALIAS_UPPER_FALSE_POSITIVES = frozenset(
+    a.upper()
+    for tk, aliases in _TICKER_ALIASES.items()
+    for a in aliases
+    if 2 <= len(a) <= 5 and a.upper() != tk
+)
+```
+
+…then add membership-check to the `_TICKER_RE` filter alongside
+`_NOT_TICKERS`. The alias-derived ticker (`AAPL`, `TSLA`, `INTC`, `TSM`)
+is unaffected — only the shouted-company-name form is stripped. New
+aliases automatically inherit the protection at module load.
+
+Locked by `tests/test_core_signals.py::TestExtractTickersAliasPath`:
+`test_allcaps_company_name_does_not_pollute_with_fake_ticker` covers
+the four documented collisions; `test_alias_filter_keeps_alias_that_
+equals_real_ticker` pins the ASML carve-out;
+`test_alias_false_positive_set_only_contains_distinct_aliases` locks
+membership of the precomputed set itself so a future alias addition
+with a same-as-ticker entry can't silently regress ASML.
+
+### Phase 2 feature — `/api/position-rationale`
+
+See the endpoint table entry. Sibling-orthogonal to
+`/api/position-attention` (which answers *did Opus look?*) and
+`/api/thesis-drift` (which re-tests the entry thesis): this surfaces the
+**most-recent concrete Opus rationale** per held position by parsing the
+JSON envelope `strategy.decide()` already writes into
+`decisions.reasoning`. Today the operator must scroll the decision feed
+by hand; this puts the answer one HTTP read away. 13 unit tests in
+`tests/test_position_rationale.py`. Live smoke against the running book
+confirms the desired shape (NVDA → HOLD @ 0.7 conviction with the
+current reasoning; TQQQ → MISSING_RATIONALE — a genuinely actionable
+finding flagged in Phase 3).
+
+### Phase 3 live findings (user perspective)
+
+1. **Runner is N commits behind HEAD between git-watcher polls** —
+   normal cadence (3-min polls + 2-min boot grace). The new
+   `/api/position-rationale` 404s until the runner restarts. Not a bug;
+   expected behaviour of the deferred-restart pattern.
+2. **TQQQ position is NEGLECTED** — `/api/position-attention` already
+   flagged it (1.29d held, no real Opus look). Once the new endpoint
+   goes live the same position will read MISSING_RATIONALE. The
+   operator can now see *both* "Opus hasn't looked" AND "no rationale
+   on file for the current state" at the per-position level — the
+   exact double-blind the two endpoints together close.
+3. **Host saturation at the edge** — 4 concurrent Opus subprocesses
+   (== `DEFAULT_MAX_OPUS`), `load_per_cpu`=2.04 (below 4.0 threshold),
+   6192 MB available. `recent_starvation_rate` 8.5% over last 59
+   decisions (below `STARVATION_RATE_FLOOR`=25% so not flagged STARVED).
+   Live HYBRID multi-agent runs nudge the box close to the gate; the
+   pre-flight + mid-call guards are working as designed.
+4. **Discord delivery briefly DEGRADED then recovered** — earlier
+   heartbeat showed `openclaw timeout (60s)`; subsequent send
+   succeeded. No persistent outage; the existing health tracker
+   surfaces the flap as a single failed attempt.
+
+### Counters
+
+`bugs_fixed=1, features_added=1, user_findings=4`.
+
+### Invariants reaffirmed by this pass
+
+- **#1** (live-only article filter) — `_extract_tickers` operates on
+  the title/summary text *after* the SQL live-only clause has run. The
+  fix is post-extraction filtering of alias false-positives; it does
+  not weaken any backtest-isolation gate.
+- **#2 / #12** (advisory-only, no caps) — `/api/position-rationale` is
+  a pure read of `open_positions` + `recent_decisions`. Never gates
+  Opus, never injected into the decision prompt, no risk caps. The
+  `position_attention` precedent.
+- **#10** (SSOT) — `_parse_action_ticker` in `position_rationale` is a
+  byte-equivalent local copy of `position_attention`'s helper (and
+  matches `dashboard._parse_action_ticker` per AGENTS.md invariant #11
+  on the free-text decision label). Kept local so the analytics module
+  has no dashboard dependency — the `round_trips` / `decision_forensics`
+  pattern. The JSON envelope shape is the same one `strategy.decide()`
+  writes (read by `decision_health` and the dashboard already).
