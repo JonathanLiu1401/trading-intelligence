@@ -1199,6 +1199,104 @@ modulates identically; reasoning surfaces the skip; independent of the
   `test_capture_does_not_break_existing_keys` (full schema regression —
   every previously-documented outcome field must still appear).
 
+### Per-window volume cache atomic write (2026-05-19)
+
+- **`_persist_volume_cache_for_window` now uses tmp+`.replace`** instead of
+  a bare `path.write_text(json.dumps(flat))`. The bare write is NOT atomic:
+  a process kill (OOM / SIGKILL, the documented `CLAUDE.md §11` continuous-
+  loop failure mode) mid-write leaves a torn / truncated JSON file. The
+  next `_load_volume_cache_for_window` then fails `json.loads`, falls back
+  to an empty dict (silent `except` swallows the error), and *still* marks
+  the window "loaded" in `_VOLUME_CACHE_DISK_LOADED` — so every subsequent
+  `vol_ratio` computation re-fetches the volume series from yfinance for
+  the entire window. Worse, a CONCURRENT loader in another thread can read
+  a partially-written file (same swallow path, same yfinance re-fetch
+  cascade). The fix writes `<path>.json.tmp` then atomically renames it
+  over the canonical `<path>.json`, mirroring the tmp+`.replace` idiom
+  `train_scorer` (scorer.pkl.tmp), the outcomes-file trim, and the
+  validation persister already use — all of which document the same class
+  of "a process kill mid-write would corrupt the artifact" failure.
+- **Test-locked in
+  `tests/test_backtest.py::TestVolumeCachePersistAtomicity`:**
+  `test_persist_writes_canonical_path_atomically` (canonical file exists +
+  no tmp shadow remains after a successful persist),
+  `test_torn_tmp_does_not_corrupt_canonical_path` (a half-written `.tmp`
+  from a simulated prior crash is silently overwritten by the next
+  successful persist — canonical content is the new payload, no torn data
+  leaks), `test_load_ignores_tmp_shadow_filename` (loader opens the
+  canonical `.json` path directly and never reads a corrupt `.json.tmp`
+  shadow even when both exist on disk).
+
+### Per-ticker scorer skill diagnostic (2026-05-19)
+
+- **`paper_trader/ml/per_ticker_skill.py` (new read-only diagnostic).**
+  `sector_skill` answers "is the calibration uniform across the seven
+  sectors?" but the next quant question is one level finer: *within a
+  sector, which individual tickers does the scorer actually predict well,
+  and which is it actively wrong on?* `build_features` carries a 7-way
+  sector one-hot but **no per-ticker identity**, so two tickers in the
+  same sector are forced to share sector weights even if their realized 5d
+  behaviour diverges sharply (e.g. NVDA vs INTC, both `sector_tech`).
+  Empirically the live `decision_outcomes.jsonl` tail is also ticker-
+  concentrated (top 10 tickers carry ~70% of outcomes — SOXL / TQQQ /
+  AMZN / MSTR / MSFT dominate), so the headline `oos_ic` from the scorer
+  ledger is essentially a weighted average of a handful of leveraged-ETF
+  names. The diagnostic buckets the temporal-OOS rows by ticker (same
+  `validation.split_outcomes_temporal` the scorer ledger uses) and
+  produces per-ticker `n_train` / `n_oos` / `mean_pred` vs `mean_realized`
+  (magnitude bias) / `rmse` / `dir_acc` / tie-aware
+  `rank_ic` (via the shared `calibration._spearman` — never drifts from
+  `sector_skill` / `persona_skill` / `_oos_rank_metrics`) plus a per-
+  ticker verdict (`SPARSE`/`INVERTED_SIGNAL`/`SIGNAL_EDGE`/
+  `WEAK_SIGNAL_EDGE`/`NO_SIGNAL_EDGE`) and an overall verdict
+  (`HAS_INVERTED_TICKER` — actionable red flag, the gate is *actively
+  harmful* on that name / `NO_TICKER_EDGE` / `HEALTHY` /
+  `INSUFFICIENT_DATA`). Output is sorted by `rank_ic` desc with `SPARSE`
+  rows sunk to the bottom and capped at `MAX_TICKERS_IN_REPORT=50`; the
+  separate `inverted_tickers` list is **uncapped** so a red-flag name far
+  down the rank-IC sort is never silently dropped. Read-only and never
+  raises — same operational discipline as the rest of `paper_trader/ml`:
+  no `decision_scorer.pkl` / `build_features` / `N_FEATURES` / trade-path
+  touch, safe under the live unattended continuous loop. CLI:
+  `python3 -m paper_trader.ml.per_ticker_skill` with exit codes mirroring
+  `sector_skill._cli` — `0` on `HEALTHY`/`NO_TICKER_EDGE`/
+  `INSUFFICIENT_DATA`, `1` on `SCORER_UNTRAINED`/other recoverable
+  error, `2` on `HAS_INVERTED_TICKER` (a cron can branch on it).
+- **Test-locked in `tests/test_per_ticker_skill.py`** (28 exact-value
+  cases mirroring the `sector_skill` test shape): verdict thresholds at
+  `IC_MIN`/`IC_GOOD`/`MIN_OUTCOMES_PER_TICKER`; universal SELL sign-flip
+  on realized; non-finite / string / `None` `forward_return_5d` dropped;
+  scorer-`predict` exception drops only that row; perfectly-correlated
+  ticker → `rank_ic≈1.0` / `dir_acc=1.0` / `SIGNAL_EDGE`; anti-correlated
+  ticker → `INVERTED_SIGNAL` and overall `HAS_INVERTED_TICKER`; inverted
+  outranks no-edge in the overall verdict; ticker case normalised so
+  mixed-case external rows bucket together; empty-ticker rows dropped;
+  report capped at `MAX_TICKERS_IN_REPORT` with `tickers_truncated=True`
+  but the `inverted_tickers` list stays complete; JSONL loader skips
+  unparseable lines and non-dict tops; `analyze()` end-to-end against an
+  empty file yields `INSUFFICIENT_DATA`; CLI exit codes 0/1/2 per verdict.
+
+  > **Quant finding (2026-05-19, this pass).** Run against the live
+  > ~7400-row `decision_outcomes.jsonl` corpus the diagnostic surfaces
+  > **one INVERTED_SIGNAL ticker: `XLE`** (`n_oos=30`, `rank_ic=-0.277`,
+  > `dir_acc=40%`, `mean_pred=+8.32%` vs `mean_realized=-1.58%` — the
+  > scorer is loudly bullish on energy while realised 5d energy returns
+  > were flat-to-negative). That is the operational definition of "the
+  > gate is worse than no gate" on this name. Several `SIGNAL_EDGE`
+  > names anchor the gate's overall positive contribution: `SPXL`
+  > (`rank_ic +0.495 / dir_acc 76%`), `SOXL` (the dominant training name
+  > at `n_train=558`, `rank_ic +0.294 / dir_acc 65%`), `CURE`
+  > (`+0.278 / 57%`), `TQQQ` (`+0.271 / 62%`), `LLY` (`+0.264 / 62%`),
+  > `NVO` (`+0.223 / 63%`), `UPRO` (`+0.206 / 57%`). The headline scorer
+  > rank-IC the ledger reports is essentially the cap-weighted average of
+  > these names; a targeted fix would be to **exclude XLE from the gate
+  > or retrain with rebalanced ticker exposure** — but that is a separate
+  > deliberate decision (CLAUDE.md §6 scope), this read-only diagnostic
+  > only surfaces the data. The deployed pickle is currently `n_train=400`
+  > on the local checkout (vs ~3987 in production on the USB-mounted
+  > scorer.pkl) — production reads will surface the same INVERTED finding
+  > against a larger trained corpus.
+
 ### `_VOLUME_CACHE` bounded LRU eviction (2026-05-19)
 
 - **`paper_trader/backtest.py::_VOLUME_CACHE_DISK_LOADED` is now an
