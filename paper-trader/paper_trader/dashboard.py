@@ -13,8 +13,21 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template_string, request
 
 from .store import INITIAL_CASH, get_store
+from .backtest import BACKTEST_DB  # re-exported so tests can monkeypatch dash.BACKTEST_DB
 
 app = Flask(__name__)
+
+
+_MODEL_DISPLAY_NAMES = {
+    "ml_quant": "ML+Quant (deterministic)",
+    "claude-opus-4-7": "Claude Opus 4.7",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6",
+    "hf/deepseek-ai/DeepSeek-R1": "DeepSeek R1",
+    "hf/deepseek-ai/DeepSeek-V3.2": "DeepSeek V3.2",
+    "hf/meta-llama/Llama-3.3-70B-Instruct": "Llama 3.3 70B",
+    "hf/Qwen/Qwen3-32B": "Qwen3 32B",
+    "hf/Qwen/Qwen3-8B": "Qwen3 8B",
+}
 
 # ── Code-freshness probe ─────────────────────────────────────────────────
 # Long-running daemons silently serve pre-deploy bytecode: the scorer-clamp
@@ -6317,6 +6330,52 @@ def backtest_leaderboard_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/model-rankings")
+def api_model_rankings():
+    """Aggregated backtest stats per model_id, ranked by avg_return_pct desc.
+
+    Reads from the module-level BACKTEST_DB so tests can monkeypatch the path.
+    """
+    try:
+        conn = sqlite3.connect(str(BACKTEST_DB), timeout=10)
+        rows = conn.execute("""
+            SELECT
+                model_id,
+                COUNT(*) AS runs,
+                ROUND(AVG(total_return_pct), 2) AS avg_return_pct,
+                ROUND(MAX(total_return_pct), 2) AS best_return_pct,
+                ROUND(AVG(vs_spy_pct), 2) AS avg_vs_spy_pct,
+                ROUND(AVG(n_trades), 1) AS avg_trades,
+                ROUND(
+                    100.0 * SUM(CASE WHEN total_return_pct > 0 THEN 1 ELSE 0 END)
+                    / COUNT(*), 1
+                ) AS win_rate_pct,
+                SUM(n_decisions) AS total_decisions
+            FROM backtest_runs
+            WHERE status = 'complete'
+            GROUP BY model_id
+            ORDER BY avg_return_pct DESC
+        """).fetchall()
+        conn.close()
+        models = []
+        for r in rows:
+            mid = r[0] or "ml_quant"
+            models.append({
+                "model_id": mid,
+                "display_name": _MODEL_DISPLAY_NAMES.get(mid, mid),
+                "runs": r[1],
+                "avg_return_pct": r[2],
+                "best_return_pct": r[3],
+                "avg_vs_spy_pct": r[4],
+                "avg_trades": r[5],
+                "win_rate_pct": r[6],
+                "total_decisions": r[7],
+            })
+        return jsonify({"models": models, "as_of": datetime.now(timezone.utc).isoformat()})
+    except Exception as e:
+        return jsonify({"error": str(e), "models": []}), 500
+
+
 @app.route("/api/backtests/stats")
 @swr_cached("backtests-stats", 30.0)
 def backtest_stats_api():
@@ -10676,6 +10735,29 @@ def streak_api():
         # oldest → newest (build_round_trips reads in sequence).
         trades = list(reversed(store.recent_trades(2000)))
         return jsonify(build_streak(trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/repeat-loser")
+def repeat_loser_api():
+    """Per-ticker losing-streak detector — the per-ticker companion to
+    /api/streak. /api/streak says "you're on a 4-loss run"; this says "and
+    3 of those 4 are on LITE", which is the actionable read. A desk on a
+    book-wide tilt run whose losses are concentrated on one name acts
+    differently ("stop sizing this name") than one whose losses are
+    distributed ("general tilt, step back from the keys"). Consumes the
+    single source of truth (build_round_trips → build_repeat_loser,
+    AGENTS.md #10), surfaces the REPEAT_LOSER verdict when ≥1 ticker has a
+    ≥2-loss run ending in its most recent non-flat outcome. Advisory only —
+    never gates Opus, never injected into the decision prompt, adds no
+    caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.repeat_loser import build_repeat_loser
+        store = get_store()
+        # Same trades convention as /api/streak: oldest → newest.
+        trades = list(reversed(store.recent_trades(2000)))
+        return jsonify(build_repeat_loser(trades))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

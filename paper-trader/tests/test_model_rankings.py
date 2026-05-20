@@ -108,3 +108,40 @@ def test_backtest_engine_rejects_invalid_model_id(tmp_path):
         with pytest.raises(ValueError, match="Invalid model_id"):
             bt.BacktestEngine(start=date(2024, 1, 2), end=date(2024, 1, 5),
                               model_id="gpt-4")
+
+
+def test_model_rankings_api(tmp_path):
+    """GET /api/model-rankings returns correct aggregated stats per model."""
+    import json
+    import paper_trader.backtest as bt
+    bt.BACKTEST_DB = tmp_path / "bt.db"
+    store = bt.BacktestStore(path=tmp_path / "bt.db")
+
+    # Insert two complete runs with different model_ids
+    store.conn.execute(
+        "INSERT INTO backtest_runs (run_id, seed, start_date, end_date, start_value, "
+        "final_value, total_return_pct, spy_return_pct, vs_spy_pct, n_trades, n_decisions, "
+        "status, started_at, model_id) VALUES (1, 1, '2025-01-01', '2026-01-01', 1000, "
+        "1200, 20.0, 10.0, 10.0, 50, 300, 'complete', '2026-01-01T00:00:00Z', 'ml_quant')"
+    )
+    store.conn.execute(
+        "INSERT INTO backtest_runs (run_id, seed, start_date, end_date, start_value, "
+        "final_value, total_return_pct, spy_return_pct, vs_spy_pct, n_trades, n_decisions, "
+        "status, started_at, model_id) VALUES (2, 2, '2025-01-01', '2026-01-01', 1000, "
+        "1500, 50.0, 10.0, 40.0, 80, 250, 'complete', '2026-01-01T00:00:00Z', 'hf/deepseek-ai/DeepSeek-R1')"
+    )
+    store.conn.commit()
+
+    import paper_trader.dashboard as dash
+    dash.BACKTEST_DB = tmp_path / "bt.db"
+
+    client = dash.app.test_client()
+    resp = client.get("/api/model-rankings")
+    assert resp.status_code == 200
+    data = json.loads(resp.data)
+    assert "models" in data
+    models = {m["model_id"]: m for m in data["models"]}
+    assert "ml_quant" in models
+    assert "hf/deepseek-ai/DeepSeek-R1" in models
+    assert models["ml_quant"]["avg_return_pct"] == pytest.approx(20.0)
+    assert models["hf/deepseek-ai/DeepSeek-R1"]["avg_return_pct"] == pytest.approx(50.0)
