@@ -73,6 +73,7 @@ from collectors.finra_short_volume import collect_finra_short_volume
 from collectors.market_movers import collect_market_movers
 from collectors.fear_greed_collector import collect_fear_greed
 from collectors.yield_curve_collector import collect_yield_curve
+from collectors.cftc_cot_collector import collect_cftc_cot
 from collectors.vix_term_structure import collect as collect_vix_ts
 from collectors.dxy_collector import collect as collect_dxy
 from collectors.sector_etf_momentum import collect as collect_sector_etf
@@ -143,6 +144,7 @@ CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog
 MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
+COT_INTERVAL            = 6 * 3600  # CFTC COT report — weekly release, check 6-hourly
 SHORT_INTEREST_INTERVAL = 21600   # highshortinterest.com every 6h (data updates ~2/month)
 VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
 DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
@@ -1010,6 +1012,27 @@ def yield_curve_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(YIELD_CURVE_INTERVAL)
+
+
+def cftc_cot_worker(store: ArticleStore):
+    log.info("[cftc_cot_worker] started")
+    bo = Backoff("cftc_cot", base=300.0, cap=3600.0)
+    while _running:
+        try:
+            articles = collect_cftc_cot()
+            _ingest(store, articles, "cftc_cot")
+            try:
+                source_health.record_result("cftc_cot", len(articles))
+            except Exception as he:
+                log.warning(f"[cftc_cot_worker] source_health error: {he}")
+            _worker_last_ok["cftc_cot"] = time.time()
+            log.debug(f"[cftc_cot] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[cftc_cot_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(COT_INTERVAL)
 
 
 # ── Worker: High short interest monitor — every 6h ──────────────────────────
@@ -2655,6 +2678,7 @@ def main():
         ("short_interest", short_interest_worker),
         ("fear_greed",  fear_greed_worker),
         ("yield_curve", yield_curve_worker),
+        ("cftc_cot",    cftc_cot_worker),
         ("vix_ts",      vix_ts_worker),
         ("dxy",         dxy_worker),
         ("sector_etf",  sector_etf_worker),
