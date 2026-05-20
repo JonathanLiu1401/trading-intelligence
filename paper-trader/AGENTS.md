@@ -11713,3 +11713,213 @@ finding flagged in Phase 3).
   has no dashboard dependency — the `round_trips` / `decision_forensics`
   pattern. The JSON envelope shape is the same one `strategy.decide()`
   writes (read by `decision_health` and the dashboard already).
+
+
+## 2026-05-20 feature-dev pass (Agent 4) — `/api/catalyst-class-autopsy` + `/api/peer-earnings-shock`
+
+Two orthogonal additions that close gaps the existing ~135-endpoint
+surface still left open.
+
+### `/api/catalyst-class-autopsy` — which ENTRY thesis classes win?
+
+The desk question `/api/loser-autopsy` and `/api/winner-autopsy` don't
+answer. Both of those classify the **exit** behaviour (KNIFE_CATCH /
+WHIPSAW / SLOW_BLEED / STOPPED_OUT and HOME_RUN / SCALP / SLOW_GRIND /
+TARGET_HIT respectively) — *how the trade was closed*. Neither
+classifies the **entry thesis** — *which catalyst TYPE motivated the
+open*. The verbatim entry rationale is the strongest learning signal
+in the ledger (the live DRAM whipsaw's reason carried 6 classes:
+`Citi bullish + HSBC/Melius PT + Cramer buy signal + ML advisor + NVDA
+earnings + semis concentration` → ANALYST_PT, PUNDIT, ML_ADVISOR,
+EARNINGS_PLAY, SECTOR_SYMPATHY, CONCENTRATION). Multi-labels each
+closed round-trip by every matched class, then surfaces per-class
+win-rate vs the pool baseline.
+
+Taxonomy (regex, word-boundary, case-insensitive — substring traps
+guarded against the same way ALLCAPS / news-themes pipelines guard):
+
+- **ML_ADVISOR**       — "ML advisor", "DecisionScorer", "median +%
+  alpha", scorer-flags/-gates/-nudges.
+- **EARNINGS_PLAY**    — "earnings", "EPS", "Q1..Q4 report", "print",
+  "guidance cut/raise".
+- **ANALYST_PT**       — "price target", "$N PT", "PT raise/cut",
+  "upgrade/downgrade/reiterate", explicit bank names (Citi / JPM /
+  Goldman / HSBC / BofA / Morgan Stanley / Wells Fargo / Barclays /
+  Melius / Wedbush / Piper / Bernstein / Jefferies / UBS / Deutsche
+  Bank / Susquehanna / Mizuho / Raymond James / Stifel / Oppenheimer /
+  Truist / Cantor / Loop Capital).
+- **TECHNICALS**       — RSI / MACD / golden-cross / death-cross /
+  moving-average / breakout / support / resistance / bollinger /
+  stochastic / overbought / oversold / 52-week-high|low.
+- **MACRO**            — FOMC / Fed / Powell / rate decision / CPI /
+  PPI / PCE / NFP / DXY / GDP / recession.
+- **BREAKING_NEWS**    — "breaking" / "just crossed" / "tape bomb" /
+  "wire reports".
+- **PUNDIT**           — Cramer / Buffett / Druckenmiller / Burry /
+  Ackman / Tepper / Dalio / Munger / Cathie Wood / Loeb / Einhorn /
+  Klarman / Marks / Soros / Icahn.
+- **SECTOR_SYMPATHY**  — "sympathy" / "peer strength|weakness" /
+  "sector rotation|momentum|move|leadership" / "cohort" / "leveraged
+  cousin|peer".
+- **CONCENTRATION**    — "concentration" / "over|under weight" /
+  "trim" / "raise dry powder" / "cash headroom" / "rebalance".
+- **UNCLASSIFIED**     — non-empty rationale matching nothing (kept
+  bucketed so the pool WR doesn't silently inflate by dropping the
+  worst un-rationalized trades).
+
+Per-class row: `n_trips`, `n_wins`, `n_losses`, `win_rate_pct`,
+`total_pnl_usd`, `avg_pnl_usd`, `avg_pnl_pct`, `median_hold_days`,
+`verdict` (`UNSTABLE` / `BIASED_WINNER` / `BIASED_LOSER` /
+`NEUTRAL`). Verdicts are sample-size-gated below
+`STABLE_MIN_TRIPS_PER_CLASS=4` (the `loser_autopsy` /
+`trade_asymmetry` STABLE idiom, dropped from 8 to 4 because per-class
+N is necessarily smaller than the pooled losers count). The bias
+band is `BIASED_WR_DELTA_PCT=15.0%` — a class WR has to beat/undershoot
+the pool baseline by this margin to flip BIASED; inside the band is
+NEUTRAL. The pool baseline anchors against **this trader's**
+disposition (a 40% pool WR makes a 50% class WR a BIASED_WINNER, not
+NEUTRAL).
+
+Multi-class trips contribute to every bucket — a trip with classes
+{ML_ADVISOR, ANALYST_PT} counts in BOTH (the operator wants "ML+PT
+combined" win-rate, not "ML alone" win-rate). `n_scored` counts
+trips, not bucket-fills.
+
+Pure SSOT `analytics/catalyst_class_autopsy.py::
+build_catalyst_class_autopsy`. Consumes `round_trips.build_round_trips`
+verbatim (AGENTS.md #10); joins the entry reason back by DB id (the
+`loser_autopsy._reason_for(pick_last=False)` pattern). Advisory only —
+never gates Opus, never injected into the decision prompt, no caps
+(#2/#12 — the `loser_autopsy` / `winner_autopsy` / `trade_asymmetry`
+precedent). Never raises on garbage rows.
+
+Locked by `tests/test_catalyst_class_autopsy.py` (31 tests — taxonomy
+classifier per class, multi-label on the real DRAM trade rationale,
+deterministic taxonomy order, case-insensitive, word-boundary
+substring guard, EMERGING-vs-STABLE gate, pool baseline anchor with
+4W/4L mixed-class fixture (ML wins 100% vs pool 50% → BIASED_WINNER,
+ANALYST_PT loses 0% → BIASED_LOSER), multi-class bucket fill arithmetic,
+UNCLASSIFIED bucket, zero-pnl-is-not-a-win parity with
+`loser_autopsy`, never-raises on garbage rows, response shape
+stability, headline correctness, band-edge NEUTRAL precision)
++ `tests/test_catalyst_class_autopsy_endpoint.py` (3 tests — Flask
+wiring with DRAM-replay fixture, NO_DATA on empty store, store-
+failure-degrades-not-raises).
+
+### `/api/peer-earnings-shock` — indirect 1σ on held ETFs from peer prints
+
+The fusion question `/api/earnings-shock` (direct held-name σ) and
+`/api/etf-lookthrough` (hidden indirect $-exposure) don't answer.
+The arithmetic is one multiplication — `indirect_usd × sigma_pct /
+100` — but the desk has to manually fuse
+`etf-lookthrough.etf_positions[i].breakdown[j].indirect_usd` with the
+matching `earnings_shock.events[k].sigma_pct` row. Nothing on the
+live dashboard does that fusion today. The live 2026-05-20 book runs
+29% TQQQ; every mega-cap tech print pressures the basket
+indirectly. NVDA earnings tonight + TQQQ 9% NVDA × 3x lev means
+~$40 of indirect NVDA exposure on top of the $447 direct, and σ 7%
+makes the indirect 1σ ±$2.80 — a real number no current surface
+quantifies.
+
+Per (ETF, underlying) row:
+`underlying`, `weight_pct`, `days_away`, `indirect_usd`,
+`sigma_pct`, `indirect_sigma_dollar`, `indirect_sigma_book_pct`,
+`row_state` (`OK` / `INSUFFICIENT_SIGMA` — the `earnings_shock`
+row-level σ-withheld discipline). Inverse ETFs (SQQQ / SOXS / SPXS /
+FNGD / TECS) carry NEGATIVE `indirect_usd` (they short their
+underlyings); the aggregate uses `|indirect_sigma_dollar|` (the
+`earnings_shock` "worst-case all-surprise-same-way" convention — a
+7% NVDA down move means SQQQ goes UP 21%, still real $-at-risk).
+
+Per-ETF aggregate: `sum_indirect_sigma_dollar`,
+`sum_indirect_sigma_book_pct`, `n_peer_events`. Book-wide aggregate:
+`total_indirect_sigma_dollar`, `total_indirect_sigma_book_pct`,
+verdict band `LOW / MODERATE / SEVERE` (`MODERATE_BOOK_PCT=2.0%`,
+`SEVERE_BOOK_PCT=5.0%` — same calibration shape as `earnings_shock`
+so the operator's mental model carries across the three pre-earnings
+surfaces).
+
+State ladder mirrors `earnings_shock` / `etf_lookthrough`:
+`NO_DATA` / `NO_ETF_HELD` / `NO_PEER_EVENTS` / `OK`. Headline picks
+the single (ETF, underlying) pair with the loudest
+indirect_sigma_dollar — the most actionable line.
+
+Pure SSOT `analytics/peer_earnings_shock.py::build_peer_earnings_shock`.
+Composes `build_etf_lookthrough` and `build_event_calendar`
+verbatim — never recomputes indirect_usd or which-tickers-have-
+earnings. σ comes from the caller-supplied `sigma_provider`
+callable (the builder/endpoint split `earnings_shock` /
+`stress_scenarios` / `tail_risk` use). The endpoint wires it to
+`_earnings_history_for` (yfinance) → `earnings_shock._pop_stdev` (the
+σ-byte-equality discipline: a constituent's σ here byte-matches its
+σ in `earnings_shock` for held names — SSOT). Provider returning
+`None` reads `INSUFFICIENT_SIGMA`; provider raising is caught at the
+builder, never propagates.
+
+`DEFAULT_HORIZON_DAYS = 7.0` — wider than `earnings_shock`'s
+HELD_IMMINENT (3d) because a basket is materially moved by the
+first mega-cap print in a clustered earnings week. Endpoint reads
+event_calendar at `horizon_days=14.0` so a 10-day peer event isn't
+pre-filtered by the calendar's default. SWR-cached 300s (matches
+`earnings-shock` / `earnings-distribution` / `implied-move` cadence
+— yfinance earnings_dates + 3y history is the slowest per-name
+shape). Prewarm-registered (locked by `test_swr_prewarm_coverage`).
+Advisory only — never gates Opus, never injected into the decision
+prompt, no caps (AGENTS.md #2/#12).
+
+Locked by `tests/test_peer_earnings_shock.py` (20 tests —
+state ladder per branch, indirect_usd arithmetic on the live
+TQQQ-NVDA shape ($148 × 3 × 0.09 × 0.07 = $2.80), two-ETF two-
+underlying aggregate, inverse-ETF sign honesty, INSUFFICIENT_SIGMA
+exclusion from aggregate, horizon edge cases, custom-horizon
+extension, past-event drop, verdict-band LOW/MODERATE/SEVERE
+thresholds, never-raises on sigma_provider exception / garbage
+event_calendar / None snapshot, response shape stability, SSOT
+arithmetic byte-equality against build_etf_lookthrough) +
+`tests/test_peer_earnings_shock_endpoint.py` (3 tests — Flask
+wiring with NO_ETF_HELD branch, empty-history INSUFFICIENT_SIGMA
+branch, store-failure-degrades-not-raises).
+
+### How to run / test
+
+```sh
+cd /home/zeph/trading-intelligence/paper-trader
+
+# All four new test modules (57 tests, <2s):
+python3 -m pytest tests/test_catalyst_class_autopsy.py \
+                   tests/test_catalyst_class_autopsy_endpoint.py \
+                   tests/test_peer_earnings_shock.py \
+                   tests/test_peer_earnings_shock_endpoint.py -v
+
+# Live probe (after the next paper-trader restart picks up the routes):
+curl -s 'http://localhost:8090/api/catalyst-class-autopsy' | python3 -m json.tool
+curl -s 'http://localhost:8090/api/peer-earnings-shock' | python3 -m json.tool
+```
+
+### Invariants reaffirmed by this pass
+
+- **#10** (single source of truth) — `catalyst_class_autopsy` consumes
+  `round_trips.build_round_trips` verbatim; never recomputes P&L,
+  hold-time, or which-trades-closed. `peer_earnings_shock` composes
+  `build_etf_lookthrough` and `build_event_calendar` verbatim; never
+  recomputes indirect_usd or earnings-imminent set. σ derivation
+  reuses `earnings_shock._pop_stdev` so a constituent's σ here byte-
+  matches its σ in `earnings_shock` for held names (test locked).
+- **#2 / #12** (no hard limits, advisory-only) — both endpoints are
+  observational. Neither modulates a trade decision, neither adds a
+  position cap, neither feeds the Opus prompt (no auto-injection;
+  the operator reads the UI to learn which catalyst classes earn
+  and which baskets are exposed to peer prints).
+- **prewarm == @swr_cached** — `peer-earnings-shock` registered in
+  the prewarm list; locked by `test_swr_prewarm_coverage`. First
+  poll right after a restart returns real data, not `{"warming":
+  true}` — exactly the cold-stall blind spot during pre-mega-cap-
+  print triage.
+- **Defense-in-depth never-raises** — both builders catch any
+  unexpected fault and degrade to one honest line (the `_safe`
+  contract — `stress_scenarios` / `etf_lookthrough` /
+  `earnings_shock` precedent); the endpoints also catch and 500
+  with an error JSON, never propagate out to the WSGI layer.
+
+Applies on next paper-trader restart (the documented pattern for
+every recent feature).
