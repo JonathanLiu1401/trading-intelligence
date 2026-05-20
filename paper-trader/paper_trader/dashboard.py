@@ -734,6 +734,8 @@ TEMPLATE = r"""
     .bt-tabs a.active { color: var(--amber); border-bottom-color: var(--amber); }
     .bt-subpane { display: none; }
     .bt-subpane.active { display: block; }
+    .bt-section { display: none; }
+    .bt-section.active { display: block; }
     tr.bt-row.selected td { background: var(--bg-elevated) !important; }
     .pill.status-running { animation: pulse 1.5s ease-in-out infinite; }
     @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.55;} }
@@ -1775,6 +1777,11 @@ TEMPLATE = r"""
 
   <!-- ────── Backtests pane ────── -->
   <div id="tab-backtests" class="tab-pane">
+    <div class="bt-tabs" style="margin-bottom:14px;">
+      <a id="bt-section-runs-link" class="active" onclick="showBtSection('runs')">Backtest Runs</a>
+      <a id="bt-section-model-rankings-link" onclick="showBtSection('model-rankings')">🏆 Model Rankings</a>
+    </div>
+    <div id="bt-section-runs" class="bt-section active">
     <div class="bt-layout">
       <aside class="bt-sidebar card">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
@@ -1974,6 +1981,39 @@ TEMPLATE = r"""
         </div>
       </div>
     </div>
+    </div><!-- /#bt-section-runs -->
+
+    <!-- ── Model Rankings section ── -->
+    <div id="bt-section-model-rankings" class="bt-section" style="display:none;">
+      <div class="card" style="margin-bottom:14px;">
+        <h2 style="margin:0 0 4px;">Model rankings</h2>
+        <div style="color:var(--text-secondary);font-size:12px;margin-bottom:14px;">
+          Aggregated backtest stats per decision model. Ranked by average total return %.
+        </div>
+        <div id="model-rankings-loading" style="padding:14px 4px;color:var(--text-muted);font-size:13px;">Loading rankings…</div>
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">
+          <table id="model-rankings-table" style="display:none;width:100%;border-collapse:collapse;font-size:13px;">
+            <thead>
+              <tr id="model-rankings-header"></tr>
+            </thead>
+            <tbody id="model-rankings-body"></tbody>
+          </table>
+        </div>
+        <div style="margin-top:16px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;">
+          <label style="color:var(--text-secondary);font-size:13px;">Run backtest with model:
+            <select id="run-model-select" style="margin-left:8px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:3px;">
+              <option value="ml_quant">ML+Quant (deterministic)</option>
+              <option value="claude-opus-4-7">Claude Opus 4.7</option>
+              <option value="hf/deepseek-ai/DeepSeek-R1">DeepSeek R1</option>
+              <option value="hf/meta-llama/Llama-3.3-70B-Instruct">Llama 3.3 70B</option>
+              <option value="hf/Qwen/Qwen3-32B">Qwen3 32B</option>
+            </select>
+          </label>
+          <button class="bt-btn" onclick="triggerBacktestWithModel()">▶ Run Backtest</button>
+          <span id="run-model-status" style="color:var(--text-muted);font-size:12px;"></span>
+        </div>
+      </div>
+    </div><!-- /#bt-section-model-rankings -->
   </div>
 
 <script>
@@ -2011,6 +2051,93 @@ function showTab(name) {
   if (name === "backtests" && !btLoaded) loadBacktests();
   // Update URL without reload
   if (history.replaceState) history.replaceState(null, "", name === "trader" ? "/" : "/backtests");
+}
+
+// ───────── Backtests section sub-tabs (Runs / Model Rankings) ─────────
+let modelRankingsLoaded = false;
+function showBtSection(name) {
+  document.querySelectorAll("#tab-backtests > .bt-section").forEach(el => {
+    el.classList.remove("active");
+    el.style.display = "none";
+  });
+  document.querySelectorAll("#tab-backtests > .bt-tabs > a").forEach(el => el.classList.remove("active"));
+  const pane = document.getElementById("bt-section-" + name);
+  const link = document.getElementById("bt-section-" + name + "-link");
+  if (pane) { pane.classList.add("active"); pane.style.display = "block"; }
+  if (link) link.classList.add("active");
+  if (name === "model-rankings" && !modelRankingsLoaded) loadModelRankings();
+}
+
+async function loadModelRankings() {
+  const loading = document.getElementById("model-rankings-loading");
+  const table = document.getElementById("model-rankings-table");
+  if (!loading || !table) return;
+  loading.style.display = "block";
+  loading.textContent = "Loading rankings…";
+  table.style.display = "none";
+  function pctFmt(v) {
+    if (v === null || v === undefined) return "—";
+    return (v > 0 ? "+" : "") + v + "%";
+  }
+  function colorStyle(v) {
+    if (v === null || v === undefined) return "";
+    const n = parseFloat(v);
+    if (n > 0) return "color:#00c896";
+    if (n < 0) return "color:#ff4455";
+    return "";
+  }
+  try {
+    const data = await fetch(API_PREFIX + "/api/model-rankings").then(r => r.json());
+    const medals = ["🥇", "🥈", "🥉"];
+    const cols = [
+      {h: "Rank",        fn: (m, i) => medals[i] || (i + 1) + ".",   colored: false},
+      {h: "Model",       fn: (m) => m.display_name || m.model_id,     colored: false},
+      {h: "Runs",        fn: (m) => m.runs,                           colored: false},
+      {h: "Avg Return",  fn: (m) => pctFmt(m.avg_return_pct),         colored: true, raw: (m) => m.avg_return_pct},
+      {h: "Best Return", fn: (m) => pctFmt(m.best_return_pct),        colored: true, raw: (m) => m.best_return_pct},
+      {h: "Median",      fn: (m) => pctFmt(m.median_return_pct),      colored: true, raw: (m) => m.median_return_pct},
+      {h: "vs SPY",      fn: (m) => pctFmt(m.avg_vs_spy_pct),         colored: true, raw: (m) => m.avg_vs_spy_pct},
+      {h: "Win Rate",    fn: (m) => (m.win_rate_pct == null ? "—" : m.win_rate_pct + "%"), colored: false},
+      {h: "Avg Trades",  fn: (m) => (m.avg_trades == null ? "—" : m.avg_trades),           colored: false},
+    ];
+    document.getElementById("model-rankings-header").innerHTML =
+      cols.map(c => '<th style="text-align:left;padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text-secondary);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">' + c.h + "</th>").join("");
+    const models = data.models || [];
+    if (!models.length) {
+      loading.textContent = "No completed backtest runs yet.";
+      return;
+    }
+    document.getElementById("model-rankings-body").innerHTML = models.map((m, i) => {
+      const safeId = String(m.model_id || "").replace(/'/g, "\\'");
+      const cells = cols.map(c => {
+        const val = c.fn(m, i);
+        const style = c.colored ? colorStyle(c.raw(m)) : "";
+        return '<td style="padding:8px 12px;border-bottom:1px solid var(--border);' + style + '">' + val + "</td>";
+      }).join("");
+      return '<tr class="bt-row" style="cursor:pointer" onclick="filterByModel(\'' + safeId + '\')">' + cells + "</tr>";
+    }).join("");
+    loading.style.display = "none";
+    table.style.display = "table";
+    modelRankingsLoaded = true;
+  } catch (e) {
+    loading.textContent = "Failed to load rankings: " + (e && e.message ? e.message : e);
+  }
+}
+
+function triggerBacktestWithModel() {
+  const sel = document.getElementById("run-model-select");
+  const status = document.getElementById("run-model-status");
+  if (!sel || !status) return;
+  const model = sel.value;
+  status.textContent = "To run from shell: python3 run_continuous_backtests.py --model " + model;
+}
+
+function filterByModel(modelId) {
+  // Switch back to the runs section; existing runs table has no text filter,
+  // so we just surface the selection to the user.
+  showBtSection("runs");
+  const status = document.getElementById("run-model-status");
+  if (status) status.textContent = "Selected model: " + modelId;
 }
 
 // ───────── Trader pane ─────────
