@@ -24,6 +24,7 @@ from ml.features import (
     DEFAULT_SOURCE_CRED,
     _DOMAIN_CRED,
     _LOW_AUTHORITY_DOMAINS,
+    _PREFIX_ALIASES,
     _domain_candidates,
     _source_credibility,
 )
@@ -153,3 +154,82 @@ class TestPreviouslyDefaultingTagsNowResolve:
         c = _source_credibility("gdelt_gkg/brand-new-outlet-2027.example")
         assert c == pytest.approx(DEFAULT_SOURCE_CRED)
         assert c >= 0.45
+
+
+class TestPrefixAliasesRescueAggregatorTags:
+    """``_PREFIX_ALIASES`` rescues aggregator tag conventions that carry no
+    dotted host AND are missed by the verbatim word-boundary scan. Same Phase-1
+    contract as the rescue tier: strictly additive, every alias resolves to
+    an existing SOURCE_CRED grade, every value >= DEFAULT.
+
+    Live evidence (2026-05-20, 24h): ``GN: <topic>`` (~5,376 rows from
+    config/sources.json Google News topic feeds), ``YF/<bucket>`` (95 rows
+    from collectors/market_movers.py screener-tape), ``YahooFinance/<sym>``
+    (~hundreds from collectors/yahoo_ticker_rss.py) all silently fell to
+    DEFAULT_SOURCE_CRED — flattening feature[0] for the model and blinding
+    the lone-alert authority gate."""
+
+    @pytest.mark.parametrize(
+        "source,expected",
+        [
+            # Google News topic feeds — sources.json: "GN: Nvidia" etc.
+            ("GN: Nvidia", features.SOURCE_CRED["googlenews"]),
+            ("GN: earnings", features.SOURCE_CRED["googlenews"]),
+            ("GN: stock market", features.SOURCE_CRED["googlenews"]),
+            # Yahoo Finance market_movers screener-tape buckets.
+            ("YF/most_actives", features.SOURCE_CRED["yfinance"]),
+            ("YF/day_gainers", features.SOURCE_CRED["yfinance"]),
+            # Yahoo per-ticker RSS — embedded "yahoo" misses the word
+            # boundary in "yahoofinance"; alias rescues it.
+            ("YahooFinance/005930.KS", features.SOURCE_CRED["yahoo"]),
+            ("YahooFinance/MU", features.SOURCE_CRED["yahoo"]),
+        ],
+    )
+    def test_aggregator_prefix_resolves_to_publisher(self, source, expected):
+        assert _source_credibility(source) == pytest.approx(expected), (
+            f"{source}: expected prefix-alias rescue to {expected}"
+        )
+
+    def test_prefix_aliases_never_below_default(self):
+        """Phase-1 contract: a prefix alias only ever RAISES a defaulting tag."""
+        for prefix, score in _PREFIX_ALIASES:
+            assert score >= DEFAULT_SOURCE_CRED, (
+                f"alias {prefix!r}={score} < DEFAULT — would *suppress* a wire"
+            )
+
+    def test_prefix_aliases_only_resolve_to_existing_grades(self):
+        """Anti-drift discipline: an alias must point at a publisher tier that
+        ALREADY exists in SOURCE_CRED — so adding the alias is purely a
+        spelling rescue, never an opinionated grade for an unrated publisher."""
+        existing = set(features.SOURCE_CRED.values())
+        for prefix, score in _PREFIX_ALIASES:
+            assert score in existing, (
+                f"alias {prefix!r}={score} doesn't match any SOURCE_CRED grade"
+            )
+
+    def test_prefix_alias_is_anchored_not_substring(self):
+        """An alias must only fire on a tag that actually LEADS with that
+        prefix — never as a mid-string substring. Pins the discriminator so
+        a future regression replacing startswith with a contains check
+        wouldn't silently re-grade a real publisher whose name happens to
+        contain ``gn:`` mid-string."""
+        # "EFGN: x" / "AGN: x" must NOT be re-graded as Google News — the
+        # alias is anchored to the START of the (lstripped) tag.
+        for non_alias in ("EFGN: news", "AGN: pharma", "MGN: x", "TheGN:"):
+            assert _source_credibility(non_alias) == pytest.approx(
+                DEFAULT_SOURCE_CRED
+            ), f"{non_alias!r} must not match GN: alias (substring guard)"
+
+    def test_already_differentiated_tags_still_unchanged(self):
+        """Belt-and-braces parity check on the most-trafficked rescued tags:
+        every tag that already resolved to a non-default grade must keep its
+        EXACT pre-alias value through the new code path."""
+        # The "Finnhub/Yahoo" case is the spelling-order discriminator pinned
+        # in PRE_FIX above: yahoo (0.65) appears in SOURCE_CRED BEFORE finnhub
+        # (0.78), so the word-boundary scan returns 0.65 first. The new alias
+        # step runs BEFORE the verbatim scan but only after testing for the
+        # tag's own prefix, so this resolution is unchanged.
+        assert _source_credibility("Finnhub/Yahoo") == pytest.approx(0.65)
+        assert _source_credibility("yfinance/AFP") == pytest.approx(0.65)
+        assert _source_credibility("reddit/r/Daytrading") == pytest.approx(0.40)
+        assert _source_credibility("GDELT/finance.yahoo.com") == pytest.approx(0.65)
