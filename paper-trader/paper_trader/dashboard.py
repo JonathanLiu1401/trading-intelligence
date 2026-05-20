@@ -12765,6 +12765,63 @@ def session_delta_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/today-action-tape")
+@swr_cached("today-action-tape", 15.0)
+def today_action_tape_api():
+    """Chronological tape of every TRADE and every DECISION since UTC
+    midnight.
+
+    Every other timeline panel is either ranked-by-materiality
+    (/api/session-delta — caps at 40, synthesises EQUITY_MOVE rows), or
+    an aggregate (/api/daily-recap — totals only, no per-cycle rows), or
+    behavioural-only (/api/decision-forensics et al — no trade rows
+    interleaved). This is the *literal* "what did my bot do today" tape:
+    every trades row + every decisions row (HOLD / NO_DECISION /
+    BLOCKED included), oldest → newest, no ranking, no cap (limited only
+    by the underlying store query).
+
+    Query params (all optional):
+      ``since`` — ISO-8601 instant; default is today's UTC midnight.
+      ``minutes`` — when ``since`` is absent, look back this many
+        minutes from now instead of anchoring to UTC midnight. Clamped
+        [5, 10080] (5 min to 7 days). Useful for an "any 4-hour" recap.
+
+    Advisory only — dashboard/chat surface, never injected into the
+    decision prompt, never gates Opus, adds no caps (invariants #2/#12).
+    Pure core: analytics/today_action_tape.build_today_action_tape."""
+    try:
+        from .analytics.today_action_tape import build_today_action_tape
+
+        now = datetime.now(timezone.utc)
+        since_arg = request.args.get("since")
+        since_dt: datetime | None = None
+        if since_arg:
+            try:
+                since_dt = datetime.fromisoformat(
+                    since_arg.replace("Z", "+00:00"))
+                if since_dt.tzinfo is None:
+                    since_dt = since_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                since_dt = None
+        if since_dt is None and request.args.get("minutes") is not None:
+            try:
+                m = int(request.args.get("minutes", 0))
+            except (TypeError, ValueError):
+                m = 0
+            m = max(5, min(10080, m))
+            since_dt = now - timedelta(minutes=m)
+
+        store = get_store()
+        return jsonify(build_today_action_tape(
+            list(reversed(store.recent_trades(2000))),
+            store.recent_decisions(2000),
+            now=now,
+            since=since_dt,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/mark-integrity")
 def mark_integrity_api():
     """How much of the displayed book value is *fictional* right now?
