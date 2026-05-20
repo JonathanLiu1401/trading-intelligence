@@ -291,6 +291,54 @@ class TestTickerAliasExtraction:
         assert signals._extract_tickers("") == set()
         assert signals._extract_tickers(None) == set()
 
+    def test_allcaps_company_name_does_not_pollute_with_fake_ticker(self):
+        # An ALLCAPS headline like "APPLE BEATS EARNINGS" used to extract
+        # BOTH `APPLE` (fake — Apple's ticker is AAPL, never APPLE) and
+        # `AAPL` (via the alias path). Opus then read `tickers=APPLE,AAPL`
+        # in the prompt block — non-existent-ticker pollution that confuses
+        # the decision engine. The alias-false-positive filter strips the
+        # shouted-company-name form so only the canonical ticker survives.
+        # Locks the fix for the four documented collisions (alias len 2-5,
+        # alias.upper() != ticker): apple/tesla/intel/tsmc.
+        out = signals._extract_tickers("APPLE BEATS EARNINGS today")
+        assert "AAPL" in out
+        assert "APPLE" not in out
+
+        out = signals._extract_tickers("TESLA stock plunges 5%")
+        assert "TSLA" in out
+        assert "TESLA" not in out
+
+        out = signals._extract_tickers("INTEL upgrades chip design")
+        assert "INTC" in out
+        assert "INTEL" not in out
+
+        out = signals._extract_tickers("TSMC raises capex guidance")
+        assert "TSM" in out
+        assert "TSMC" not in out
+
+    def test_alias_filter_keeps_alias_that_equals_real_ticker(self):
+        # ASML's company-name alias is "asml" — upper-cased == the canonical
+        # ticker ASML, so it is a *legitimate* extraction, NOT a false
+        # positive. The filter must only strip aliases whose upper form
+        # differs from the canonical ticker (e.g. APPLE/AAPL); a regression
+        # that silently filters ASML out would silently undercount semis
+        # news for the live trader.
+        assert "ASML" in signals._extract_tickers("ASML beats Q3 expectations")
+        assert "ASML" in signals._extract_tickers("ASML guidance raised")
+
+    def test_alias_false_positive_set_only_contains_distinct_aliases(self):
+        # Lock the membership of _ALIAS_UPPER_FALSE_POSITIVES so a future
+        # alias addition with a same-as-ticker entry (length 2-5) doesn't
+        # accidentally regress the ASML case. The set is the four observed
+        # collisions; verify by inclusion (additions are fine, deletions
+        # must not silently happen).
+        fp = signals._ALIAS_UPPER_FALSE_POSITIVES
+        # ASML must NOT be in the false-positive set.
+        assert "ASML" not in fp
+        # The four documented collisions must be filtered.
+        for shouted in ("APPLE", "TESLA", "INTEL", "TSMC"):
+            assert shouted in fp
+
 
 class TestTickerSentimentsAliasPath:
     """The alias pass must propagate through ``ticker_sentiments`` and
