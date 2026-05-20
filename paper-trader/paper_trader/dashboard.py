@@ -6338,34 +6338,46 @@ def api_model_rankings():
     """
     try:
         conn = sqlite3.connect(str(BACKTEST_DB), timeout=10)
-        rows = conn.execute("""
-            SELECT
-                model_id,
-                COUNT(*) AS runs,
-                ROUND(AVG(total_return_pct), 2) AS avg_return_pct,
-                ROUND(MAX(total_return_pct), 2) AS best_return_pct,
-                ROUND(AVG(vs_spy_pct), 2) AS avg_vs_spy_pct,
-                ROUND(AVG(n_trades), 1) AS avg_trades,
-                ROUND(
-                    100.0 * SUM(CASE WHEN total_return_pct > 0 THEN 1 ELSE 0 END)
-                    / COUNT(*), 1
-                ) AS win_rate_pct,
-                SUM(n_decisions) AS total_decisions
-            FROM backtest_runs
-            WHERE status = 'complete'
-            GROUP BY model_id
-            ORDER BY avg_return_pct DESC
-        """).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute("""
+                SELECT
+                    model_id,
+                    COUNT(*) AS runs,
+                    ROUND(AVG(total_return_pct), 2) AS avg_return_pct,
+                    ROUND(MAX(total_return_pct), 2) AS best_return_pct,
+                    ROUND(AVG(vs_spy_pct), 2) AS avg_vs_spy_pct,
+                    ROUND(AVG(n_trades), 1) AS avg_trades,
+                    ROUND(
+                        100.0 * SUM(CASE WHEN total_return_pct > 0 THEN 1 ELSE 0 END)
+                        / COUNT(*), 1
+                    ) AS win_rate_pct,
+                    SUM(n_decisions) AS total_decisions,
+                    GROUP_CONCAT(total_return_pct ORDER BY total_return_pct) AS sorted_returns
+                FROM backtest_runs
+                WHERE status = 'complete'
+                GROUP BY model_id
+                ORDER BY avg_return_pct DESC
+            """).fetchall()
+        finally:
+            conn.close()
         models = []
         for r in rows:
             mid = r[0] or "ml_quant"
+            # Compute median from the sorted comma-separated returns string
+            raw_returns = r[8]
+            if raw_returns:
+                vals = [float(x) for x in raw_returns.split(",") if x]
+                n = len(vals)
+                median_pct = round((vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2), 2)
+            else:
+                median_pct = None
             models.append({
                 "model_id": mid,
                 "display_name": _MODEL_DISPLAY_NAMES.get(mid, mid),
                 "runs": r[1],
                 "avg_return_pct": r[2],
                 "best_return_pct": r[3],
+                "median_return_pct": median_pct,
                 "avg_vs_spy_pct": r[4],
                 "avg_trades": r[5],
                 "win_rate_pct": r[6],
