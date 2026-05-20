@@ -12275,3 +12275,61 @@ python3 -m pytest tests/test_ml_backtest_word_boundary.py -v # 17 NEW
 
 Read-only diagnostic + bugfix in a path the live trader doesn't
 import; safe to take effect immediately.
+
+---
+
+- **2026-05-20 feat (Agent 4 product-engineer pass) — `/api/today-action-tape`.**
+  New deterministic, pure-DB chronological tape of every TRADE and every
+  DECISION (HOLD / NO_DECISION / BLOCKED included) since today's UTC
+  midnight. Solves the morning-glance gap: every other timeline panel is
+  either ranked-by-materiality (`/api/session-delta` caps at 40 events,
+  synthesizes EQUITY_MOVE/DRAWDOWN/INACTION rows), an aggregate
+  (`/api/daily-recap` totals only), or behavioural-only
+  (`/api/decision-forensics` et al — no trade rows interleaved). None of
+  them is the literal "what did my bot do today, every move and every
+  no-move, in order" feed.
+
+  Pure builder `build_today_action_tape` at
+  `paper_trader/analytics/today_action_tape.py`: interleaves every
+  in-window `trades` and `decisions` row, sorts chronologically
+  (oldest → newest), pins TRADE-before-DECISION on tie (matches
+  `recent_trades`' deterministic `(timestamp, id) DESC` tie-break — the
+  tape and the trades-table chronology can never disagree). Per-class
+  fault drops that class only (the `session_delta` precedent — never
+  sink the whole feed). Reuses `dashboard._parse_action_ticker` shape for
+  free-text `action_taken` (verb, ticker) and collapses CASH/NONE
+  pseudo-tickers — SSOT.
+
+  Aggregate counters: `n_buys`, `n_sells`, `n_holds`, `n_no_decisions`,
+  `n_blocked`, `n_other_decisions`, plus `notional_in_usd`,
+  `notional_out_usd`, `net_cash_flow_usd = proceeds − spend` (NOT
+  realized P&L — that's `/api/round-trips`' job; named accordingly so
+  callers don't confuse the two).
+
+  **Route** `/api/today-action-tape` — default since=today's UTC
+  midnight; `?since=<ISO-8601>` overrides; `?minutes=<5..10080>` gives a
+  rolling "last N minutes" recap. SWR-cached at 15s (decision cadence is
+  60s, so 15s avoids stampedes without lagging the desk). Advisory only
+  — never gates Opus, adds no caps (invariants #2/#12).
+
+  **Locks (`tests/test_today_action_tape.py`, 15 tests, 0.66s):**
+    1. Empty input → well-formed envelope, no exception
+    2. Default since = today's UTC midnight
+    3. Yesterday rows excluded; custom `since` widens window
+    4. Tape chronological oldest → newest
+    5. TRADE sorts before DECISION on tie (chronology pin)
+    6. Decision-verb mix counts (HOLD / NO_DECISION / BLOCKED / executed)
+    7. `BUY NVDA → FILLED`-style free-text → (verb, ticker) parse
+    8. Pseudo-ticker (`HOLD CASH`) collapses to ticker=None
+    9. Buy/sell tallies and `net_cash_flow_usd = out − in`
+   10. Option trade notional uses the row's pre-computed `value` field
+   11. Unparseable timestamp drops the row, not the report
+   12. Future-dated rows excluded defensively
+   13. Route returns JSON envelope via Flask test_client
+   14. `?minutes=` overrides default and produces the expected window
+
+  Builder appended to `analytics/`; route appended IMMEDIATELY AFTER
+  `/api/session-delta` inside `dashboard.py` (sibling ordering). NEVER
+  raises into the Flask handler — analytics import failure or store
+  read failure returns a `{"error": ...}` 500 envelope, not a process
+  crash.
