@@ -215,6 +215,166 @@ class TestExtractTickers:
         assert "BEAT" in signals._extract_tickers("$BEAT calls active")
 
 
+class TestTickerAliasExtraction:
+    """Locks the company-name → ticker alias path. A headline that names a
+    company by its everyday name (e.g. "Nvidia") historically extracted no
+    ticker because the regex needed $cashtag or an ALLCAPS token; the alias
+    feature folds the company name into the same tag set the rest of the
+    pipeline consumes."""
+
+    def test_nvidia_alias_extracts_nvda(self):
+        assert "NVDA" in signals._extract_tickers(
+            "Nvidia surges to record on chip demand"
+        )
+
+    def test_apple_alias_extracts_aapl(self):
+        assert "AAPL" in signals._extract_tickers(
+            "Apple expands service revenue beats"
+        )
+
+    def test_tesla_alias_extracts_tsla(self):
+        assert "TSLA" in signals._extract_tickers(
+            "Tesla cuts model 3 prices in Europe"
+        )
+
+    def test_multi_word_alias_taiwan_semiconductor_extracts_tsm(self):
+        # Multi-word alias matches because \b sits between any word/non-word
+        # transition, so spaces don't break the boundary.
+        assert "TSM" in signals._extract_tickers(
+            "Taiwan Semiconductor raises capex guidance"
+        )
+
+    def test_alias_is_case_insensitive(self):
+        # "NVIDIA" (all caps), "nvidia" (lower), "Nvidia" (title) all map to NVDA.
+        # The all-caps token would already be caught by the regex extractor (and
+        # NVIDIA is NOT in _NOT_TICKERS), so this test specifically locks the
+        # lower-case alias path.
+        assert "NVDA" in signals._extract_tickers("nvidia rallies")
+        assert "NVDA" in signals._extract_tickers("Nvidia rallies")
+
+    def test_alias_substring_does_not_falsely_match(self):
+        # Word-boundary discipline: "appletini" or "apples" must NOT map to AAPL.
+        # The substring "apple" inside another word should be ignored — same
+        # contract as strategy._WORD_TO_TICKER_LIVE_PATTERNS after the
+        # rain→TQQQ fix.
+        assert "AAPL" not in signals._extract_tickers(
+            "the applesauce supply chain")
+        assert "AAPL" not in signals._extract_tickers(
+            "pineapple cocktail launches")
+
+    def test_alias_does_not_duplicate_existing_ticker(self):
+        # Headline carries both the ticker symbol AND the company name.
+        # _extract_tickers returns a set, so the ticker is present exactly once.
+        out = signals._extract_tickers(
+            "NVDA / Nvidia beats on earnings"
+        )
+        assert "NVDA" in out
+        # Sanity — no surprise extra tickers from the company-name pass.
+        # AMD is uppercase 3-char, would also extract if present — it isn't.
+        assert "AMD" not in out
+
+    def test_alias_extraction_keeps_existing_ticker_extraction(self):
+        # The alias pass is additive — it must not break the ALLCAPS / cashtag
+        # extraction or the _NOT_TICKERS filter for the same body.
+        out = signals._extract_tickers(
+            "Nvidia rallies; AMD also up Q3; FOMC and PCE noise"
+        )
+        assert "NVDA" in out
+        assert "AMD" in out
+        assert "FOMC" not in out
+        assert "PCE" not in out
+        assert "Q3" not in out
+
+    def test_empty_text_alias_path_does_not_raise(self):
+        # The alias loop must respect the same empty-text contract as the
+        # regex extractor (returns empty set, never raises).
+        assert signals._extract_tickers("") == set()
+        assert signals._extract_tickers(None) == set()
+
+
+class TestTickerSentimentsAliasPath:
+    """The alias pass must propagate through ``ticker_sentiments`` and
+    ``get_ticker_sentiment`` — these are the per-name aggregates Opus reads
+    in the live prompt, and a company-name headline silently dropped from
+    them was the documented under-count this feature closes."""
+
+    def test_company_name_headline_counts_toward_ticker(self, fake_articles_db):
+        _build_articles_db(fake_articles_db, [
+            {"id": 1, "url": "http://a", "title": "Nvidia surges to record",
+             "source": "x", "ai_score": 8.0, "urgency": 0,
+             "first_seen": _now_iso(), "body": ""},
+        ])
+        out = signals.ticker_sentiments(["NVDA"], hours=24)
+        assert len(out) == 1
+        # Pre-fix: n=0 (silent miss). Post-fix: n=1 with the article's score.
+        assert out[0]["n"] == 1
+        assert out[0]["avg_score"] == 8.0
+        assert out[0]["max_score"] == 8.0
+
+    def test_get_ticker_sentiment_alias_path(self, fake_articles_db):
+        _build_articles_db(fake_articles_db, [
+            {"id": 1, "url": "http://a", "title": "Apple expands services",
+             "source": "x", "ai_score": 7.0, "urgency": 1,
+             "first_seen": _now_iso(), "body": ""},
+            {"id": 2, "url": "http://b", "title": "AAPL hits new high",
+             "source": "x", "ai_score": 9.0, "urgency": 0,
+             "first_seen": _now_iso(), "body": ""},
+        ])
+        out = signals.get_ticker_sentiment("AAPL", hours=24)
+        # BOTH headlines count — one by alias, one by symbol.
+        assert out["n"] == 2
+        assert out["urgent"] == 1
+        assert out["max_score"] == 9.0
+
+    def test_alias_does_not_double_count_when_symbol_also_present(
+            self, fake_articles_db):
+        # A single article with BOTH the ticker symbol AND the company name
+        # is one match, not two. The alias path is gated by ``or _alias_match``
+        # — same row in the outer loop, no double-counting.
+        _build_articles_db(fake_articles_db, [
+            {"id": 1, "url": "http://a", "title": "NVDA / Nvidia beats EPS",
+             "source": "x", "ai_score": 8.0, "urgency": 0,
+             "first_seen": _now_iso(), "body": ""},
+        ])
+        out = signals.ticker_sentiments(["NVDA"], hours=24)
+        assert out[0]["n"] == 1
+        assert out[0]["avg_score"] == 8.0
+
+    def test_unrelated_alias_does_not_pollute_other_ticker(
+            self, fake_articles_db):
+        # An article about Nvidia must NOT pollute MU sentiment (a sibling
+        # semi). Aliases are scoped per-ticker; this would only fail if the
+        # alias_match dispatch silently OR'd patterns across tickers.
+        _build_articles_db(fake_articles_db, [
+            {"id": 1, "url": "http://a", "title": "Nvidia surges",
+             "source": "x", "ai_score": 8.0, "urgency": 0,
+             "first_seen": _now_iso(), "body": ""},
+        ])
+        out = {r["ticker"]: r for r in
+               signals.ticker_sentiments(["NVDA", "MU"], hours=24)}
+        assert out["NVDA"]["n"] == 1
+        assert out["MU"]["n"] == 0
+
+    def test_alias_substring_does_not_falsely_match_in_body_scan(
+            self, fake_articles_db):
+        # The same word-boundary discipline applied at the body-scan path
+        # (not just extraction): an "applesauce" headline must NOT count for
+        # AAPL. Otherwise the under-count fix would re-introduce noise into
+        # the opposite direction.
+        _build_articles_db(fake_articles_db, [
+            {"id": 1, "url": "http://a",
+             "title": "applesauce supply chain stays steady",
+             "source": "x", "ai_score": 5.0, "urgency": 0,
+             "first_seen": _now_iso(),
+             "body": "pineapple cocktail launches expected"},
+        ])
+        out = signals.ticker_sentiments(["AAPL"], hours=24)
+        assert out[0]["n"] == 0, (
+            "substring of 'apple' (applesauce/pineapple) must not match the "
+            f"AAPL alias word-boundary, got n={out[0]['n']}"
+        )
+
+
 class TestDecompress:
     def test_roundtrip(self):
         blob = zlib.compress(b"hello world")
