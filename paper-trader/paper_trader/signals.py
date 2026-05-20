@@ -261,6 +261,45 @@ _NOT_TICKERS = {
     "QOQ", "QT", "RE", "SEC", "SEPT", "SO", "TBA", "THE", "TO", "TWO", "UN",
     "UP", "US", "USA", "USD", "USDA", "VS", "WE", "WHAT", "WHEN", "WHERE",
     "WHO", "WHY", "WTI", "WTO", "YES", "YOY", "ADP",
+    # Common all-caps English words that leak through the regex and pollute
+    # the `tickers` field Opus sees in the live decision prompt — observed
+    # live in 2026-05 (e.g. "JOIN NVDA AT 5PM" → tickers=JOIN,NVDA). Each
+    # entry verified NOT to collide with a known real-money ticker (OPEN /
+    # Opendoor and LOW / Lowe's are deliberately NOT included so the genuine
+    # tickers still surface). NEAR is excluded by intent — NEAR Protocol is
+    # a crypto, not a stock ticker our universe trades.
+    "AFTER", "AGO", "ALSO", "ASK", "BACK", "BAD", "BEEN", "BEFORE", "BEING",
+    "BEST", "BIG", "BIGGEST", "BOTH", "CAN", "COULD", "DAY", "DID", "DO",
+    "DOES", "DONE", "DUE", "EACH", "EARLY", "EVEN", "EVER", "EVERY", "FAR",
+    "FEW", "FIRST", "FROM", "FULL", "GET", "GOOD", "GOT", "HAD", "HAS",
+    "HAVE", "HE", "HER", "HERE", "HIGH", "HIM", "HIS", "IF", "INTO", "JOIN",
+    "JUST", "KEY", "LAST", "LATE", "LATER", "LESS", "LIKE", "LONG", "LOTS",
+    "MADE", "MAKE", "MAKES", "MANY", "MORE", "MOST", "MR", "MUCH", "MUST",
+    "MY", "NEAR", "NEXT", "NIL", "NO", "NOR", "NOT", "NOW", "OFF", "ONLY",
+    "OTHER", "OUR", "OUT", "OVER", "OWN", "PAST", "PER", "PLUS", "PUT",
+    "RAN", "RAW", "READ", "RIGHT", "ROSE", "RUN", "SAID", "SAME", "SAW",
+    "SAY", "SAYS", "SEEN", "SET", "SHE", "SHORT", "SHOWS", "SINCE", "SO",
+    "SOME", "SOON", "SUCH", "TAKE", "TAKEN", "TELL", "TEN", "THAN", "THAT",
+    "THEN", "THEY", "THIS", "THOSE", "TOLD", "TOO", "TOP", "TOTAL", "TRUE",
+    "UNTIL", "USE", "USED", "USING", "VERY", "WAS", "WAY", "WAYS", "WEEK",
+    "WELL", "WENT", "WERE", "WILL", "WITH", "WORK", "YEAR", "YET", "YOU",
+    "YOUR",
+    # Finance-headline verbs and nouns observed live polluting `tickers` for
+    # Opus (e.g. "Fed CUT RATES" → tickers=CUT,RATES; "NVDA BEATS, MISSES on
+    # guidance" → tickers=BEATS,MISSES). Each verified NOT to collide with a
+    # known real-money ticker. BUY/SELL deliberately NOT filtered — they
+    # frequently appear in *cashtag* form ($BUY) on penny-stock chatter and
+    # the cashtag path bypasses _NOT_TICKERS anyway; filtering the bare token
+    # would silently strip the rare-but-legitimate ALLCAPS analyst-call usage
+    # ("RBC upgrades NVDA to BUY") that does not collide with a real ticker.
+    "BEAT", "BEATS", "MISS", "MISSES", "CUT", "CUTS", "HIKE", "HIKES",
+    "RAISE", "RAISES", "RAISED", "RATES", "RATE", "TRIM", "TRIMS",
+    "RALLY", "RALLIES", "SURGE", "SURGES", "DROP", "DROPS", "DROPPED",
+    "JUMP", "JUMPS", "JUMPED", "PLUNGE", "PLUNGES", "GAIN", "GAINS",
+    "QUICK", "QUARTERLY", "DEAL", "DEALS", "GUIDANCE", "REVENUE",
+    "EARNINGS", "PROFIT", "PROFITS", "LOSS", "LOSSES", "STOCKS",
+    "SHARES", "MARKET", "MARKETS", "PRICE", "PRICES", "TRADER",
+    "TRADERS", "TRADING", "REPORTED", "REPORTS", "REPORT",
 }
 
 
