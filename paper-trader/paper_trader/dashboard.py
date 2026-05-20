@@ -9858,6 +9858,123 @@ def position_attention_api():
         return jsonify({"error": str(e)}), 500
 
 
+def _ticker_news_cooldown(tickers: list[str],
+                          min_score: float,
+                          hours_window: int = 72) -> dict[str, dict]:
+    """Per-ticker last-news bookkeeping for ``/api/position-news-cooldown``.
+
+    Returns ``{TICKER_UPPER: {last_first_seen, top_score, top_title, n_24h,
+    n_72h}}`` derived from the live-only article window. Unlike
+    ``_ticker_news_pulse`` (which ranks by score), this picks the **most
+    recent** scored hit per ticker because the endpoint's question is
+    "when did news on this name last move" rather than "what was the
+    biggest story". Live-only filter mirrors ``signals.get_top_signals``
+    (invariant #1).
+    """
+    base = {t.upper(): {
+        "last_first_seen": None,
+        "top_score": None,
+        "top_title": None,
+        "n_24h": 0,
+        "n_72h": 0,
+    } for t in tickers}
+    if not tickers:
+        return base
+    path = _articles_db_path()
+    if path is None:
+        return base
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        now = datetime.now(timezone.utc)
+        since = (now - timedelta(hours=hours_window)).isoformat()
+        cutoff_24h = (now - timedelta(hours=24)).isoformat()
+        rows = conn.execute(
+            "SELECT title, full_text, ai_score, first_seen FROM articles "
+            "WHERE first_seen >= ? AND ai_score >= ? "
+            "AND url NOT LIKE 'backtest://%' "
+            "AND source NOT LIKE 'backtest_%' "
+            "AND source NOT LIKE 'opus_annotation%' "
+            "ORDER BY first_seen DESC LIMIT 4000",
+            (since, min_score),
+        ).fetchall()
+    except Exception:
+        return base
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    patterns = {t.upper(): re.compile(rf"(?:\$|\b){re.escape(t.upper())}\b")
+                for t in tickers}
+    for r in rows:
+        body = r["title"] or ""
+        if r["full_text"]:
+            try:
+                body = body + " " + zlib.decompress(
+                    r["full_text"]).decode("utf-8", "replace")
+            except Exception:
+                pass
+        body_up = body.upper()
+        ts = r["first_seen"]
+        score = float(r["ai_score"] or 0.0)
+        title = r["title"]
+        for t, pat in patterns.items():
+            if not pat.search(body_up):
+                continue
+            rec = base[t]
+            rec["n_72h"] += 1
+            if ts and (cutoff_24h <= ts):
+                rec["n_24h"] += 1
+            # Rows are ordered newest-first, so the first hit per ticker is
+            # the most-recent scored mention — sets last_first_seen exactly
+            # once per (ticker, query).
+            if rec["last_first_seen"] is None and ts:
+                rec["last_first_seen"] = ts
+            # Top-score within the same window (informational; the verdict
+            # is keyed off recency, not score).
+            cur_top = rec["top_score"]
+            if cur_top is None or score > cur_top:
+                rec["top_score"] = score
+                rec["top_title"] = title
+    return base
+
+
+@app.route("/api/position-news-cooldown")
+@swr_cached("position-news-cooldown", 60.0)
+def position_news_cooldown_api():
+    """Per-open-position news-flow cooldown — has the news desk gone quiet
+    on this held ticker, or is the story still moving?
+
+    Distinct from ``/api/position-attention`` (which times *Opus* looks)
+    and ``/api/thesis-drift`` (which re-tests the entry rationale). This
+    one answers: **for each held name, when was the last live article
+    that actually scored above noise (ai_score≥4.0)?** Catches the
+    "thesis decay through silence" pathology — a position opened on a
+    catalyst whose news flow has dried up while the operator's attention
+    moved on. Verdict ladder: per-position FRESH/WARM/COOL/DARK rolled up
+    to OK/COOLING_BOOK/DARK_BOOK/INSUFFICIENT_DATA. Advisory only — never
+    gates Opus, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.position_news_cooldown import (
+            MIN_SCORE_THRESHOLD,
+            build_position_news_cooldown,
+        )
+        store = get_store()
+        positions = store.open_positions()
+        tickers = sorted({(p.get("ticker") or "").upper()
+                          for p in positions if p.get("ticker")})
+        last_news = _ticker_news_cooldown(
+            tickers, min_score=MIN_SCORE_THRESHOLD, hours_window=72)
+        return jsonify(build_position_news_cooldown(
+            positions, last_news, min_score_threshold=MIN_SCORE_THRESHOLD))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/empty-claude-rate")
 def empty_claude_rate_api():
     """Live-trader 'claude returned no response (timeout/empty)' rate vs the
@@ -10428,6 +10545,56 @@ def correlation_api():
                 except Exception:
                     price_history[p["ticker"]] = []
         return jsonify(build_correlation(poss, price_history))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/correlation-cluster-warning")
+@swr_cached("correlation-cluster-warning", 90.0)
+def correlation_cluster_warning_api():
+    """Hidden-factor-bet alarm — translates ``/api/correlation``'s pairwise
+    matrix into a single cluster-share verdict.
+
+    The parent ``/api/correlation`` reports a *mean* ρ across all pairs +
+    one global verdict. A book like {NVDA, AMD, AVGO, KO, JNJ} reads as
+    MODERATE on mean ρ — but the first three names form a single semis
+    cluster running as one trade inside a wrapper of two uncorrelated
+    consumer staples. This endpoint surfaces that cluster: it
+    single-linkages the names at ρ ≥ ``HIGH_CORR`` (the same constant the
+    parent uses for ``CONCENTRATED``), returns the largest multi-name
+    cluster + its share of book by market value, and emits an
+    ``NO_CLUSTERS / WATCHLIST_CLUSTER / DOMINANT_CLUSTER /
+    HIDDEN_FACTOR_BET`` verdict keyed off the cluster's *weight*, not the
+    mean ρ. Pure builder over the existing ``build_correlation`` payload —
+    no new network. Advisory only — never gates Opus, adds no caps
+    (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.correlation import build_correlation
+        from .analytics.correlation_cluster_warning import (
+            build_correlation_cluster_warning,
+        )
+        store = get_store()
+        positions = store.open_positions()
+        poss, price_history = [], {}
+        for p in positions:
+            ptype = p.get("type")
+            kind = ptype if ptype in ("call", "put") else "stock"
+            mult = 100 if kind in ("call", "put") else 1
+            price = p.get("current_price") or p.get("avg_cost") or 0.0
+            qty = float(p.get("qty") or 0.0)
+            poss.append({
+                "ticker": p.get("ticker"),
+                "market_value": round(float(price) * qty * mult, 2),
+                "type": kind,
+            })
+            if kind == "stock" and p.get("ticker") not in price_history:
+                try:
+                    bars = _daily_history_cached(p["ticker"], "3mo")
+                    price_history[p["ticker"]] = [c for _, c in bars]
+                except Exception:
+                    price_history[p["ticker"]] = []
+        corr = build_correlation(poss, price_history)
+        return jsonify(build_correlation_cluster_warning(corr))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
