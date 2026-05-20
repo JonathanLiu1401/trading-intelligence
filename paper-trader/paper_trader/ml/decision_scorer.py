@@ -591,7 +591,29 @@ def train_scorer(records: list[dict]) -> dict:
 
     X_raw, y, weights = [], [], []
     n_label_clamped = 0
+    n_label_dropped = 0
     for r in records:
+        # Drop rows whose forward_return_5d is missing / non-finite BEFORE
+        # building features. The prior `_to_float(..., 0.0)` silently
+        # coerced None / NaN / inf into a 0.0 (a fake flat-return label),
+        # which contaminated training with neutral-label phantom rows.
+        # `_compute_decision_outcomes` already filters genuine missing
+        # outcomes; this is defence-in-depth for any externally injected /
+        # malformed record (a single bad row otherwise distorts the entire
+        # 5000-record retrain). Drops are counted so the per-cycle skill
+        # ledger can trend training-set integrity.
+        fr_raw = r.get("forward_return_5d")
+        if isinstance(fr_raw, bool) or fr_raw is None:
+            n_label_dropped += 1
+            continue
+        try:
+            fr = float(fr_raw)
+        except (TypeError, ValueError):
+            n_label_dropped += 1
+            continue
+        if not math.isfinite(fr):
+            n_label_dropped += 1
+            continue
         X_raw.append(build_features(
             _to_float(r.get("ml_score"), 0.0),
             r.get("rsi"),
@@ -605,10 +627,6 @@ def train_scorer(records: list[dict]) -> dict:
             news_urgency=r.get("news_urgency"),
             news_article_count=r.get("news_article_count"),
         ))
-        # Use _to_float so JSON nulls / missing keys / strings don't crash.
-        # Prior float(r.get(..., default)) crashed on `null` values because
-        # dict.get returns the value (None) even when a default is supplied.
-        fr = _to_float(r.get("forward_return_5d"), 0.0)
         # Symmetric label clamp — mirror the inference-side ±PRED_CLAMP_PCT
         # clamp at train time. predict() always clamps its output to
         # ±PRED_CLAMP_PCT, so a training label like MSTR +175% (the live
@@ -639,6 +657,15 @@ def train_scorer(records: list[dict]) -> dict:
         llm_label = int(r.get("llm_quality_label") or 0)
         llm_mult = {1: 3.0, -1: 0.1, 0: 1.0}.get(llm_label, 1.0)
         weights.append(max(0.5, min(2.0, 1.0 + rp / 200.0)) * llm_mult)
+
+    # Honest empty-after-validation guard. If every record dropped (e.g. all
+    # rows carried `forward_return_5d=null` from a malformed outcomes batch),
+    # building np.array on []/[] is itself fine, but train_test_split below
+    # would raise on n=0. Return a status the caller can surface to the skill
+    # ledger rather than letting that exception poison the cycle.
+    if not X_raw:
+        return {"status": "no_valid_labels", "n": 0,
+                "n_label_dropped": n_label_dropped}
 
     X = np.array(X_raw, dtype=np.float32)
     y = np.array(y, dtype=np.float32)
@@ -735,13 +762,19 @@ def train_scorer(records: list[dict]) -> dict:
     # Atomic write: a torn pickle (process killed mid-write, or a backtest
     # thread loading the file concurrently) would leave DecisionScorer
     # permanently untrained. Write to a temp file then atomically replace.
+    # Pickle n_train as the ACTUAL count of rows that produced training
+    # features (post forward_return validation), not the pre-validation
+    # `len(records)` count, so the gate-relevant n_train >= 500 invariant
+    # (#5) reflects the model's true exposure to data.
+    n_pickle = len(X_raw)
     _tmp = SCORER_PATH.with_suffix(".pkl.tmp")
     with _tmp.open("wb") as f:
-        pickle.dump({"model": model, "scaler": scaler, "n_train": len(records)}, f)
+        pickle.dump({"model": model, "scaler": scaler, "n_train": n_pickle}, f)
     _tmp.replace(SCORER_PATH)
 
-    return {"status": "ok", "n": len(records), "val_rmse": val_rmse,
-            "n_label_clamped": n_label_clamped}
+    return {"status": "ok", "n": n_pickle, "val_rmse": val_rmse,
+            "n_label_clamped": n_label_clamped,
+            "n_label_dropped": n_label_dropped}
 
 
 # ---------------------------------------------------------------------------

@@ -65,6 +65,58 @@ class TestPriceCache:
         ret = synthetic_prices.returns_pct("ZZZ", date(2025, 1, 1), date(2025, 1, 2))
         assert ret == 0.0
 
+    def test_build_trading_days_picks_densest_fallback(self):
+        """When SPY's series is empty, the trading_days calendar must fall
+        back to the DENSEST non-empty series — not just the first one
+        ``dict.items()`` happens to yield. A sparse fallback (e.g. a thin
+        ETF with 50 days) would silently produce a 50-day calendar that
+        skips every other real NYSE trading day for the entire backtest:
+        every sampled decision day, the SL/TP scan, and the equity curve
+        all run off this calendar."""
+        start = date(2025, 1, 2)
+        # Build three series of varying density. THIN comes first in dict
+        # insertion order — the old "first non-empty" fallback would land
+        # on it. DENSE is the correct choice.
+        weekdays = []
+        d = start
+        while len(weekdays) < 250:
+            if d.weekday() < 5:
+                weekdays.append(d)
+            d += timedelta(days=1)
+
+        cache = PriceCache.__new__(PriceCache)
+        cache.tickers = ["SPY", "THIN", "DENSE"]
+        cache.start = weekdays[0]
+        cache.end = weekdays[-1]
+        cache.prices = {
+            "SPY": {},  # transient yfinance failure
+            "THIN": {d.isoformat(): 100.0 for d in weekdays[:30]},
+            "DENSE": {d.isoformat(): 100.0 for d in weekdays},
+        }
+        cache._build_trading_days()
+        # The fallback MUST yield the full 250-day calendar from DENSE,
+        # not the 30-day one from THIN.
+        assert len(cache.trading_days) == 250
+        assert cache.trading_days[0] == weekdays[0]
+        assert cache.trading_days[-1] == weekdays[-1]
+
+    def test_build_trading_days_uses_spy_when_available(self, synthetic_prices):
+        """The fallback must NOT trigger when SPY is non-empty — the SPY
+        calendar is the canonical NYSE proxy and the densest-fallback only
+        applies on a genuine SPY failure."""
+        # synthetic_prices fixture has SPY populated; the trading_days were
+        # built from it. Replace one of the other tickers with a
+        # higher-density series and confirm trading_days still tracks SPY.
+        spy_days_n = len(synthetic_prices.trading_days)
+        # Add a denser fake ticker — should be ignored when SPY is present.
+        synthetic_prices.prices["FAKE"] = {
+            (synthetic_prices.start + timedelta(days=i)).isoformat(): 1.0
+            for i in range(spy_days_n * 5)
+        }
+        synthetic_prices._build_trading_days()
+        # trading_days must still come from SPY (unchanged).
+        assert len(synthetic_prices.trading_days) == spy_days_n
+
 
 # ─────────────────────── SimPortfolio ───────────────────────────
 
