@@ -1702,6 +1702,221 @@ def build_news_corroboration(
     }
 
 
+# ── breaking-confluence (NOW-focused velocity view) ─────────────────────────
+# /api/news-corroboration is a 6h trust filter ranked by n_sources — a stale
+# but well-corroborated cluster sits at the top forever. /api/event-threads
+# is a 24h recency-decayed impact ranking that keeps singletons. Neither
+# answers the desk question on a fresh login at 13:57 EDT: "what is breaking
+# RIGHT NOW with confirmation building?" — i.e. small window (60m default),
+# urgency-weighted, with arrival VELOCITY and a verdict that distinguishes a
+# CONFIRMED 5-source story from one still EMERGING in the last 30 minutes.
+# Same Jaccard primitive (ml.dedup) so this can never drift from the other
+# clustering surfaces; the differentiation is purely the window, the
+# velocity term, and the verdict ladder. Single-source clusters are
+# filtered by default (min_sources=2 — the corroboration discipline) but a
+# fresh hot singleton (urgency ≥ 1 AND ai_score ≥ 9) is kept under a
+# SINGLETON_HOT verdict so a solo Reuters 8-K isn't lost before the wire
+# picks it up (event_threads precedent for keeping single-article threads).
+_BREAKING_DEFAULT_WINDOW_MIN = 60
+_BREAKING_EMERGING_MIN = 30  # latest-seen within this -> EMERGING
+_BREAKING_JACCARD = 0.6  # match build_news_corroboration / event_threads
+_BREAKING_CONFIRMED_SOURCES = 3
+_BREAKING_HOT_SINGLETON_URGENCY = 1
+_BREAKING_HOT_SINGLETON_SCORE = 9.0
+
+
+def build_breaking_confluence(
+    articles: list,
+    *,
+    now: datetime | None = None,
+    window_minutes: int = _BREAKING_DEFAULT_WINDOW_MIN,
+    emerging_window_minutes: int = _BREAKING_EMERGING_MIN,
+    jaccard_threshold: float = _BREAKING_JACCARD,
+    min_sources: int = 2,
+    min_score: float = 5.0,
+    max_clusters: int = 30,
+) -> dict:
+    """Group hot recent articles by title-token Jaccard, rank by arrival
+    velocity, classify CONFIRMED / EMERGING / SINGLETON_HOT.
+
+    Pure: no DB, no LLM, no network. Caller passes a list of article dicts
+    with the same shape ``build_news_corroboration`` expects (``title``,
+    ``source``, ``first_seen`` required; ``ai_score`` / ``urgency`` /
+    ``url`` optional). Articles outside the ``window_minutes`` window are
+    dropped before clustering; articles whose ``ai_score < min_score`` are
+    also dropped (default 5.0 — drops kw_score-only rows that never made it
+    past the model).
+
+    Output cluster shape:
+      headline, top_source, top_url, n_articles, n_sources, sources,
+      max_ai_score, max_urgency, first_seen, latest_seen,
+      first_seen_min_ago, latest_seen_min_ago,
+      velocity_per_30min  (articles per 30 minutes within window),
+      verdict  (CONFIRMED / EMERGING / SINGLETON_HOT)
+
+    Ranking: (-verdict_rank, -recency_score, -n_sources, -max_ai_score).
+    ``recency_score = 1 / (1 + latest_seen_min_ago / 10)`` — soft, so a
+    cluster with 3 sources 12 min ago beats one with 2 sources 1 min ago.
+    """
+    from ml.dedup import jaccard_similarity, title_tokens
+
+    now = now or datetime.now(timezone.utc)
+    window_minutes = max(5, int(window_minutes))
+    emerging_window_minutes = max(1, int(emerging_window_minutes))
+    arts_all = list(articles or [])
+    window_start = now - timedelta(minutes=window_minutes)
+
+    def _ai(a: dict) -> float:
+        try:
+            return float(a.get("ai_score") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _urg(a: dict) -> int:
+        try:
+            return int(a.get("urgency") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _ts(a: dict) -> datetime | None:
+        s = a.get("first_seen")
+        if not s:
+            return None
+        try:
+            d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d
+
+    # Window + score floor pre-filter so clustering only ever sees fresh+hot.
+    arts: list[dict] = []
+    for a in arts_all:
+        if _ai(a) < min_score:
+            continue
+        ts = _ts(a)
+        if ts is None or ts < window_start:
+            continue
+        arts.append(a)
+
+    # Greedy single-link Jaccard clustering — same recipe as
+    # build_news_corroboration; the anchor token set is fixed at first
+    # article so later additions cannot widen it (drift guard).
+    clusters: list[dict] = []
+    for art in arts:
+        toks = title_tokens(art.get("title"))
+        placed = False
+        if toks:
+            for cl in clusters:
+                anchor = cl["anchor_tokens"]
+                if anchor and jaccard_similarity(toks, anchor) >= jaccard_threshold:
+                    cl["articles"].append(art)
+                    src = (art.get("source") or "").strip()
+                    if src:
+                        cl["sources"].add(src)
+                    placed = True
+                    break
+        if not placed:
+            src = (art.get("source") or "").strip()
+            clusters.append({
+                "anchor_tokens": toks,
+                "anchor_title": art.get("title") or "",
+                "articles": [art],
+                "sources": {src} if src else set(),
+            })
+
+    window_min_f = float(window_minutes)
+    out_clusters: list[dict] = []
+    for cl in clusters:
+        n_sources = len(cl["sources"])
+        members = cl["articles"]
+        n_articles = len(members)
+        max_score = max((_ai(a) for a in members), default=0.0)
+        max_urg = max((_urg(a) for a in members), default=0)
+        top = max(members, key=_ai)
+        member_ts = [t for t in (_ts(a) for a in members) if t is not None]
+        if not member_ts:
+            continue
+        first_ts = min(member_ts)
+        latest_ts = max(member_ts)
+        first_min_ago = max(0.0, (now - first_ts).total_seconds() / 60.0)
+        latest_min_ago = max(0.0, (now - latest_ts).total_seconds() / 60.0)
+
+        # Singletons: keep only if hot enough to matter on their own.
+        if n_sources < min_sources:
+            if not (n_sources == 1
+                    and max_urg >= _BREAKING_HOT_SINGLETON_URGENCY
+                    and max_score >= _BREAKING_HOT_SINGLETON_SCORE
+                    and latest_min_ago <= emerging_window_minutes):
+                continue
+            verdict = "SINGLETON_HOT"
+        elif n_sources >= _BREAKING_CONFIRMED_SOURCES:
+            verdict = "CONFIRMED"
+        elif latest_min_ago <= emerging_window_minutes:
+            verdict = "EMERGING"
+        else:
+            verdict = "CONFIRMED"  # 2 sources but stale → still corroborated
+
+        velocity_per_30min = round(
+            n_articles * (30.0 / window_min_f), 3
+        )
+
+        out_clusters.append({
+            "headline": top.get("title") or cl["anchor_title"],
+            "top_source": top.get("source"),
+            "top_url": top.get("url"),
+            "n_articles": n_articles,
+            "n_sources": n_sources,
+            "sources": sorted(cl["sources"]),
+            "max_ai_score": round(max_score, 3),
+            "max_urgency": max_urg,
+            "first_seen": first_ts.isoformat(),
+            "latest_seen": latest_ts.isoformat(),
+            "first_seen_min_ago": round(first_min_ago, 2),
+            "latest_seen_min_ago": round(latest_min_ago, 2),
+            "velocity_per_30min": velocity_per_30min,
+            "verdict": verdict,
+        })
+
+    _VERDICT_RANK = {"CONFIRMED": 0, "EMERGING": 1, "SINGLETON_HOT": 2}
+
+    def _sort_key(c: dict) -> tuple:
+        latest = c["latest_seen_min_ago"]
+        recency = 1.0 / (1.0 + latest / 10.0)
+        return (
+            _VERDICT_RANK.get(c["verdict"], 9),
+            -recency,
+            -c["n_sources"],
+            -c["max_ai_score"],
+        )
+
+    out_clusters.sort(key=_sort_key)
+    n_kept = len(out_clusters)
+    if max_clusters and n_kept > max_clusters:
+        out_clusters = out_clusters[:max_clusters]
+
+    counts_by_verdict = {"CONFIRMED": 0, "EMERGING": 0, "SINGLETON_HOT": 0}
+    for c in out_clusters:
+        counts_by_verdict[c["verdict"]] = counts_by_verdict.get(
+            c["verdict"], 0) + 1
+
+    return {
+        "as_of": now.isoformat(),
+        "window_minutes": int(window_minutes),
+        "emerging_window_minutes": int(emerging_window_minutes),
+        "min_sources": int(min_sources),
+        "min_score": float(min_score),
+        "jaccard_threshold": float(jaccard_threshold),
+        "n_articles_scanned": len(arts_all),
+        "n_articles_in_window": len(arts),
+        "n_clusters_formed": len(clusters),
+        "n_surfaced": n_kept,
+        "counts_by_verdict": counts_by_verdict,
+        "clusters": out_clusters,
+    }
+
+
 # ── event-thread clustering (trader-facing event view of the feed) ──────────
 # /api/news-corroboration answers "what stories are multi-source confirmed?"
 # (trust filter, ranks by n_sources). /api/event-threads answers a different
@@ -2250,6 +2465,87 @@ def create_app(store=None) -> Flask:
         ]
         out = build_news_corroboration(arts, min_sources=min_sources)
         out["window_hours"] = hours
+        return jsonify(out)
+
+    @app.get("/api/breaking-confluence")
+    def api_breaking_confluence():
+        """What is BREAKING right now with confirmation building?
+
+        Same Jaccard clustering primitive as ``/api/news-corroboration``
+        and ``/api/event-threads`` (``ml.dedup`` — no drift) but anchored
+        to a tight NOW-focused window so a desk reopening at 14:00 EDT
+        sees only the clusters that grew in the last hour, not a stale
+        well-corroborated wire from this morning. Each cluster carries
+        a verdict:
+
+          * CONFIRMED — ≥3 distinct sources have the story
+          * EMERGING — 2 sources AND latest article within
+            ``emerging_window_minutes``
+          * SINGLETON_HOT — 1 source but ``urgency >= 1`` AND
+            ``ai_score >= 9`` AND latest within the emerging window;
+            keeps a solo Reuters 8-K visible before the wire confirms.
+
+        Query (all optional):
+          - ``window_minutes`` — recency window (default 60, clamp 5..720)
+          - ``emerging_minutes`` — EMERGING latest-seen cutoff (default
+            30, clamp 1..window_minutes)
+          - ``min_score`` — ai_score floor (default 5.0, clamp 0..10)
+          - ``min_sources`` — corroboration floor for non-singletons
+            (default 2, clamp 1..10; <2 = also include all non-hot
+            singletons, noisy)
+          - ``max_clusters`` — cap (default 30, clamp 1..100)
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+
+        def _qi(name: str, default: int, lo: int, hi: int) -> int:
+            try:
+                v = int(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        def _qf(name: str, default: float, lo: float, hi: float) -> float:
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        window_minutes = _qi("window_minutes", 60, 5, 720)
+        emerging_minutes = _qi(
+            "emerging_minutes", 30, 1, window_minutes)
+        min_score = _qf("min_score", 5.0, 0.0, 10.0)
+        min_sources = _qi("min_sources", 2, 1, 10)
+        max_clusters = _qi("max_clusters", 30, 1, 100)
+
+        since = (
+            datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+        ).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT title, source, url, ai_score, urgency, first_seen "
+                "FROM articles "
+                f"WHERE first_seen >= ? AND {_LIVE_ONLY_SQL} "
+                "ORDER BY first_seen DESC LIMIT 4000",
+                (since,),
+            )
+        except sqlite3.Error:
+            rows = []
+        arts = [
+            {"title": r[0] or "", "source": r[1] or "", "url": r[2],
+             "ai_score": float(r[3] or 0), "urgency": int(r[4] or 0),
+             "first_seen": r[5]}
+            for r in rows
+        ]
+        out = build_breaking_confluence(
+            arts,
+            window_minutes=window_minutes,
+            emerging_window_minutes=emerging_minutes,
+            min_score=min_score,
+            min_sources=min_sources,
+            max_clusters=max_clusters,
+        )
         return jsonify(out)
 
     @app.get("/api/event-threads")

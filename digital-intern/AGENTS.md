@@ -5615,4 +5615,84 @@ before staging; staged with explicit pathspec only
 `AGENTS.md`). Never `git add -A`. Untracked
 `paper-trader/docs/superpowers/plans/` left untouched. AGENTS.md
 appended-only, committed alongside the related code in this same
+
+---
+
+- **2026-05-20 feat (Agent 4 product-engineer pass) — `/api/breaking-confluence`.**
+  New deterministic, **no-LLM** NOW-focused velocity view of multi-source
+  clusters. Sibling to `/api/news-corroboration` (whole-window trust
+  filter ranked by `n_sources`) and `/api/event-threads` (24h
+  recency-decayed impact). Neither answers the desk question on a fresh
+  login at 14:00 EDT: "what is BREAKING right now with confirmation
+  building?" — small window (60m default), score-floored, with arrival
+  velocity AND a verdict ladder that distinguishes a 3-source CONFIRMED
+  story from a 2-source EMERGING one whose latest article is < 30 min
+  old. Filling that gap saves an analyst scanning twenty corroboration
+  rows to find the three that grew in the last hour.
+
+  Pure builder `build_breaking_confluence` at `dashboard/web_server.py`
+  reuses `ml.dedup.title_tokens` + `ml.dedup.jaccard_similarity`
+  **verbatim** (SSOT — same near-duplicate primitive
+  `build_news_corroboration` / `build_event_threads` / the briefing's
+  near-dup-collapse use; this view cannot drift from the rest of the
+  pipeline). The differentiation is purely (a) tight window, (b)
+  per-30min arrival velocity, (c) verdict ladder, (d) keeps a fresh
+  HOT singleton (urgency ≥ 1 AND ai_score ≥ 9 AND latest within
+  emerging window) under `SINGLETON_HOT` — a solo Reuters 8-K stays
+  visible before the wire confirms (the `event_threads` keep-singletons
+  precedent), but a cold/stale solo wire-recap is still filtered (the
+  `news_corroboration` discipline).
+
+  **Verdict ladder:**
+    * `CONFIRMED` — `n_sources >= 3` (or `n_sources == 2` but the
+      latest article is past the emerging window — still corroborated,
+      just no longer fresh)
+    * `EMERGING` — `n_sources == 2` AND latest article within
+      `emerging_window_minutes` (default 30)
+    * `SINGLETON_HOT` — `n_sources == 1` AND `urgency >= 1` AND
+      `ai_score >= 9` AND latest within emerging window
+    * cold singletons filtered (the dominant feed false-positive)
+
+  **Ranking:** verdict → recency_score → n_sources → max_ai_score.
+  `recency_score = 1 / (1 + latest_min_ago / 10)` — soft, so a CONFIRMED
+  cluster with 3 sources 12 min ago beats one with 5 sources 45 min ago.
+
+  **Route** `/api/breaking-confluence` — params:
+    * `window_minutes` (default 60, clamp 5..720)
+    * `emerging_minutes` (default 30, clamp 1..window_minutes)
+    * `min_score` (default 5.0, clamp 0..10)
+    * `min_sources` (default 2, clamp 1..10)
+    * `max_clusters` (default 30, clamp 1..100)
+
+  Carries `_LIVE_ONLY_SQL` exclusion (backtest:// / backtest_* /
+  opus_annotation* never reach the breaking view — mirrors
+  `/api/news-corroboration`, `/api/event-threads`, `/api/sector-pulse`).
+
+  **Locks (`tests/test_breaking_confluence.py`, 15 tests, 0.19s):**
+    1. Empty input → well-formed envelope
+    2. Articles outside window dropped before clustering
+    3. `min_score` floor drops kw-only rows
+    4. 3 sources → CONFIRMED
+    5. 2 sources fresh (within emerging) → EMERGING
+    6. 2 sources stale → CONFIRMED (not EMERGING)
+    7. Hot singleton (urg≥1, score≥9, fresh) → SINGLETON_HOT
+    8. Cold singleton (low urg/score) → filtered
+    9. Stale hot singleton (past emerging window) → filtered
+   10. `velocity_per_30min` math scales with window
+   11. Velocity doubles when window halves
+   12. Verdict ordering in output: CONFIRMED < EMERGING < SINGLETON_HOT
+   13. Recency breaks tie within same verdict
+   14. `max_clusters` cap on returned list
+   15. Route returns JSON envelope, clamps `window_minutes`
+
+  **Observational only** — no decision-prompt injection, no chat
+  enrichment yet (defer until live-signal quality is validated against
+  the existing corroboration + event-threads surfaces). Builder appended
+  ABOVE `create_app` (between `build_news_corroboration` and the
+  event-thread comment block) so it is importable for tests. Route
+  appended IMMEDIATELY AFTER `/api/news-corroboration` inside
+  `create_app` (sibling ordering). NEVER raises into the Flask handler —
+  `_ro_query` failure degrades to empty `arts`.
+
+
 documentation step.
