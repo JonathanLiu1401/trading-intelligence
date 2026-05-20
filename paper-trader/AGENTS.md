@@ -11108,3 +11108,231 @@ invariants on a freshly-restarted runner running the new code).
   observational; it surfaces what cash *can* fund, never caps what Opus
   *should* do. The advisory contract follows the `capital_paralysis`
   precedent.
+
+## 2026-05-20 feature-dev pass (Agent 4) — `/api/rising-unheld-themes` + `/api/sector-velocity-delta`
+
+Two new dashboard surfaces that close the **rotation-opportunity** gap
+in the velocity-decomposition triplet. `/api/held-theme-decay` (shipped
+earlier today) answers *"is the catalyst on a ticker I OWN still alive
+in the wire?"*; these two answer the operator's complementary
+question: *"what catalyst am I missing?"* at the per-ticker and
+per-sector level respectively.
+
+The live book context driving this pass: NVDA 67% / TQQQ 29% / cash 4%
+(95.94% top-3 concentration), pre-NVDA-earnings, with the wire
+actively running on MU (33 articles, decayed score 44.7) and AMD (10+
+articles) — neither of which the book has any exposure to.
+`/api/idle-opportunity` already surfaces these during DROUGHT periods,
+but the operator wants a *always-on* rotation surface that doesn't
+depend on a HOLD streak first.
+
+### `/api/rising-unheld-themes` — what catalyst am I missing?
+
+The mirror image of `/api/held-theme-decay`. Per-UNHELD-ticker fresh-
+vs-prior decayed news score; same fresh/prior 6h-window decomposition,
+same MIN_FRESH / FADE_RATIO / BUILD_RATIO floors imported verbatim
+(rotation-pair invariant: re-tuning the decay shape in one place
+updates both surfaces in lockstep — never drift). Held tickers are
+EXCLUDED at the builder before any per-ticker computation, so no
+overlap with `/api/held-theme-decay` (invariant #10).
+
+Verdict ladder adds one rung over held-theme-decay's:
+- **DARK** / **FADING** / **STABLE** / **BUILDING** — same definitions.
+- **BREAKING** — prior == 0 AND fresh ≥ `BREAKING_FRESH_SCORE` (3.0).
+  A brand-new catalyst with no prior coverage at all. Distinct from
+  BUILDING (which lumps "accelerating existing story" + "fresh from no
+  prior"); for an UNHELD name the zero-prior case is qualitatively
+  different — it's a brand-new story, not an accelerating one. The
+  operator triages BREAKING faster than BUILDING. (held-theme-decay
+  doesn't split this case because for a held name the distinction is
+  irrelevant — "my catalyst exists" is the actionable signal either
+  way.)
+
+The bar for BREAKING (3.0) is intentionally above MIN_FRESH (1.0): a
+single 1.0-score article with no prior shouldn't claim "brand new
+theme." Three middle-quality articles or one high-relevance article
+at half-life age is the desk's mental model.
+
+Sort order: BREAKING > BUILDING > STABLE > FADING > DARK, within each
+bucket by descending fresh_score (loudest catalyst on top). Aggregate
+counts (`n_building`, `n_breaking`, `n_fading`, `n_dark`, `n_stable`)
+span the full unheld universe; `themes` is capped to `max_themes`
+(default 20).
+
+Multi-ticker article split denominator counts ALL tickers (held +
+unheld) — same anti-inflation rule news_themes / held_theme_decay use,
+so the unheld weights here are directly comparable to the held weights
+in held-theme-decay. A 2-ticker article with one held + one unheld
+name contributes 0.5× the article's full weight to each; the held name
+is then dropped (not redistributed).
+
+Distinct from neighbours (invariant #10 — do not consolidate):
+`/api/news-themes` (single-window snapshot, no velocity);
+`/api/held-theme-decay` (same math, HELD tickers — this is the
+complement); `/api/watchlist-opportunities` (curated-watchlist scan,
+no velocity); `/api/idle-opportunity` (drought-gated point-in-time
+surface; this is always-on velocity); digital-intern `trend_velocity`
+(market-wide mention-rate Poisson, not score-weighted decayed).
+
+Query params: `hours` (default 6, clamp 1..72), `min_score` (default
+2.0, 0..10), `max_themes` (default 20, clamp 1..100). SWR-cached 60s
+with prewarm registration (test_swr_prewarm_coverage invariant).
+Advisory only — never gates Opus, adds no caps (#2/#12).
+
+Pure builder `paper_trader/analytics/rising_unheld_themes.py::
+build_rising_unheld_themes(articles, held_tickers, now=None,
+fresh_window_hours=6.0, max_themes=20)`. Never raises (garbage row /
+None / "not-a-list" tickers / unparseable timestamp → skipped, never
+exception). Defense-in-depth backtest filter at the builder so a
+leaked synthetic row cannot reach user-facing JSON.
+
+Locked by `tests/test_rising_unheld_themes.py` (37 tests — SSOT
+constant sharing with held_theme_decay, held-exclusion case-
+insensitivity, multi-ticker split denominator cross-surface
+invariant against held_theme_decay, state ladder edge cases per
+verdict, BREAKING floor honesty, sort order with bucket precedence,
+max_themes cap on rows but not on counters, top_rising
+BREAKING-over-BUILDING precedence, backtest defense-in-depth on URL /
+source / opus_annotation paths, response shape stability across
+NO_DATA / OK / held-only-wire / garbage paths, param clamps) +
+`tests/test_rising_unheld_themes_endpoint.py` (4 tests — Flask wiring
+with synthetic-filter live fixture, NO_DATA when no articles.db,
+query-param clamps, store-failure degradation).
+
+### `/api/sector-velocity-delta` — which sector is the wire rotating into?
+
+The per-BUCKET aggregation of the same velocity shape. Uses
+`sector_heatmap.HEATMAP_BUCKETS` as the bucket SSOT (so a
+`memory_core ACCELERATING` verdict here lines up with the memory_core
+row of `/api/sector-heatmap`). Decay / window / ratio constants
+imported from `held_theme_decay` / `news_themes` (rotation-pair
+invariant extended to the bucket level — three velocity surfaces, one
+decay shape).
+
+Verdict ladder at the bucket level introduces stricter thresholds
+than the per-ticker view because at sum-over-multiple-tickers the
+noise floor is correspondingly higher:
+
+- **DARK** — no qualifying articles in either window.
+- **DECELERATING** — `fresh < prior × DECEL_RATIO` (0.7) AND prior was
+  bucket-level prominent (prior ≥ `bucket_floor` = `MIN_FRESH × n_tickers`).
+  Rotation-OUT signal. A bucket whose news flow dropped from "loud
+  whole-sector" to "quiet" — the formerly-loud bucket is the more
+  material signal than a marginal cool-off.
+- **FADING** — ratio drop on a marginal bucket (prior below bucket floor).
+  Informational only — a single ticker in the bucket cooling is not a
+  rotation-OUT signal.
+- **STABLE** — between FADE_RATIO and BUILD_RATIO.
+- **BUILDING** — `fresh > prior × BUILD_RATIO` (1.43) AND fresh ≥
+  `MIN_FRESH_SCORE` (1.0). Individual ticker acceleration, below the
+  sector-level rotation floor.
+- **ACCELERATING** — `fresh > prior × ACCEL_RATIO` (1.6) AND fresh ≥
+  `bucket_floor` (n_tickers × MIN_FRESH). Rotation-IN signal — the
+  whole sector is meaningfully louder, not just one ticker spiking.
+  Also covers the "no prior, loud bucket-level fresh" case (a sector
+  lighting up from nothing IS the strongest rotation-in signal).
+
+`ACCEL_RATIO` (1.6) is strictly above `BUILD_RATIO` (1.43) so the two
+verdicts can't collapse to the same threshold. The bucket-prominence
+floor scales linearly with bucket size (4-ticker bucket needs 4×
+MIN_FRESH to claim sector-level rotation; 1-ticker bucket uses
+MIN_FRESH directly — consistent with the per-ticker view for that
+edge case).
+
+Multi-ticker articles split decayed weight evenly across ALL mentioned
+tickers; cross-bucket articles attribute weight to every bucket the
+mentioned tickers belong to (a 2-ticker MU/NVDA article puts 0.5× the
+full weight into both memory_core and design). The bucket-level
+article COUNT (fresh_n / prior_n) increments once per bucket
+regardless of multi-mention. Cross-surface invariant locked in tests:
+the bucket's `fresh_score` equals the sum of per-held-ticker
+`fresh_score` values from held_theme_decay over the same input.
+
+`top_accelerating` is the loudest rotation-IN bucket (sorted by
+fresh_score); `top_decelerating` is the formerly-loudest rotation-OUT
+bucket (sorted by prior_score — the bigger the bucket was before, the
+more material the drop). `rotating_in` / `rotating_out` lists carry
+the bucket names for one-line surfacing.
+
+Distinct from neighbours (invariant #10 — do not consolidate):
+`/api/sector-heatmap` (PRICE + RSI + 24h news COUNT per bucket;
+point-in-time, no velocity); `/api/sector-pulse` (per-ticker, not
+bucketed); `/api/sector-signal-fit` (bucket news vs book weight; a
+fit measure, not a wire-velocity); `/api/sector-exposure` ($-weight
+per bucket; inverse direction book→wire); all three per-ticker
+velocity endpoints (this is the per-bucket aggregation).
+
+Query params: `hours` (default 6, clamp 1..72), `min_score` (default
+2.0, 0..10). SWR-cached 60s with prewarm registration. Advisory only
+(#2/#12).
+
+Pure builder `paper_trader/analytics/sector_velocity_delta.py::
+build_sector_velocity_delta(articles, now=None,
+fresh_window_hours=6.0, buckets=None)`. The `buckets` param is a
+test seam — production always uses the `HEATMAP_BUCKETS` SSOT.
+Never raises on garbage rows.
+
+Locked by `tests/test_sector_velocity_delta.py` (31 tests — SSOT
+constant sharing across all three velocity surfaces (news_themes /
+held_theme_decay / sector_heatmap), verdict ladder edge cases per
+bucket size, bucket-prominence floor scaling, multi-ticker split
+denominator invariant, cross-bucket article attribution to every
+bucket the tickers belong to, cross-surface invariant against
+held_theme_decay weights, top_accelerating / top_decelerating
+surfacing, sort order, backtest defense-in-depth on URL / source /
+opus_annotation paths, response shape stability, ratio-None on
+prior==0, top_fresh_ticker drill-down identification) +
+`tests/test_sector_velocity_delta_endpoint.py` (3 tests — Flask
+wiring with memory_core ACCELERATING fixture, NO_DATA when no
+articles.db, query-param clamps).
+
+### Phase 3 — test validation (no live restart pre-earnings)
+
+NVDA earnings ~7h out; the new routes are hot-pluggable on the next
+natural service restart — this pass deliberately did NOT trigger a
+restart. All 108 tests across the new modules + adjacent regression
+(rising_unheld + endpoint, sector_velocity + endpoint, held_theme_decay,
+news_themes + endpoint, swr_prewarm_coverage) pass:
+
+```
+python3 -m pytest tests/test_rising_unheld_themes.py \
+  tests/test_rising_unheld_themes_endpoint.py \
+  tests/test_sector_velocity_delta.py \
+  tests/test_sector_velocity_delta_endpoint.py \
+  tests/test_held_theme_decay.py \
+  tests/test_news_themes_endpoint.py \
+  tests/test_swr_prewarm_coverage.py
+# 108 passed
+```
+
+Broader targeted regression `pytest -k "theme or sector"` clean at
+145 passed / 0 failed.
+
+### Counters
+
+`bugs_fixed=0, features_added=2, user_findings=0` (clean rotation
+surface gap fill; no novel pathology caught, but the live MU / AMD
+unheld coverage will surface as BREAKING / BUILDING the moment the
+service picks up the new code).
+
+### Invariants reaffirmed by this pass
+
+- **#10** (single source of truth) — three velocity surfaces
+  (held_theme_decay, rising_unheld_themes, sector_velocity_delta)
+  share decay half-life, fresh-window width, MIN_FRESH / FADE_RATIO /
+  BUILD_RATIO via verbatim imports. Sector-bucket SSOT comes from
+  `sector_heatmap.HEATMAP_BUCKETS` — the same map the heatmap UI
+  uses. Held-set normalization (case-insensitive upper-strip) is the
+  same shape both surfaces apply. The rotation-pair invariant is
+  pinned by SSOT-import tests on both new modules.
+- **#2 / #12** (no hard limits, advisory-only) — both endpoints are
+  observational. Neither modulates a trade decision, neither adds a
+  position cap, neither feeds the Opus prompt (no auto-injection;
+  the operator reads the UI to triage rotation).
+- **prewarm == @swr_cached** — both endpoints registered in the
+  prewarm list; locked by test_swr_prewarm_coverage. First poll
+  right after a restart returns real data, not `{"warming": true}`.
+- **Defense-in-depth backtest filter** — both builders include the
+  `_is_synthetic` SSOT shape (`backtest://` URL / `backtest_*` /
+  `opus_annotation*` source) so a leaked synthetic row cannot reach
+  user-facing JSON even if a future caller forgets the SQL clause.
