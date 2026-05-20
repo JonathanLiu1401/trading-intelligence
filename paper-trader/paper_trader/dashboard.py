@@ -13555,5 +13555,169 @@ def blocked_repeats_api():
                         "blocked_repeats": []}), 500
 
 
+@app.route("/api/rebuy-regret")
+def rebuy_regret_api():
+    """Sell-then-rebuy **$ regret** quantifier — did the desk save or lose
+    money on close→re-entry hops?
+
+    ``/api/reentry-velocity`` tracks the *time* gap between close and re-buy
+    (CHURN_RISK / STABLE on the cadence). ``/api/churn`` measures size-
+    weighted turnover. Neither answers the discretionary trader's hardest
+    exit question:
+
+      **Did I sell low and buy back higher?**
+
+    Sign convention: ``regret_usd > 0`` means lost money on the
+    round-trip-to-re-entry hop (sold low, re-bought higher). ``regret_usd
+    < 0`` means saved money. Composes ``round_trips.build_round_trips``
+    (SSOT, AGENTS.md #10) for closed round-trips, then walks the trade
+    stream for the next same-key BUY to measure the price delta against
+    shared quantity. Option ×100 multiplier honored (the
+    ``round_trips`` precedent).
+
+    Query params:
+      ``recent_limit`` — newest-first event slice (1..100, default 10)
+
+    Observational only — never gates Opus, no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.rebuy_regret import build_rebuy_regret
+
+        try:
+            limit = int(request.args.get("recent_limit", 10))
+        except Exception:
+            limit = 10
+        limit = max(1, min(100, limit))
+
+        store = get_store()
+        # Oldest→newest is what round_trips expects; the builder also
+        # sorts defensively but pass clean data.
+        trades = list(reversed(store.recent_trades(2000)))
+        result = build_rebuy_regret(
+            trades, now=datetime.now(timezone.utc), recent_limit=limit,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR",
+                        "recent_events": [], "per_ticker": []}), 500
+
+
+@app.route("/api/news-to-trade-lag")
+def news_to_trade_lag_api():
+    """News-to-trade lag distribution — is the desk reacting to fresh news?
+
+    ``/api/trade-attribution`` enumerates the highest-scored articles
+    preceding each FILLED trade (with a ``minutes_before_trade`` per
+    attributed article). This endpoint compresses that detail to one
+    distribution + verdict on the desk's *reactivity*: are recent trades
+    happening fast on hot news, or consistently 2 hours behind?
+
+    Composes ``build_trade_attribution`` (SSOT, AGENTS.md #10). For each
+    attributed trade, takes the minimum ``minutes_before_trade`` across
+    its attributed articles (the freshest plausibly-causal signal the
+    trade could have reacted to). Trades with zero attributions are
+    counted separately, not assigned a fake worst-case lag (the
+    ``recovery`` negative-space-is-data precedent).
+
+    Verdict: REACTIVE_FAST (median <30min) / REACTIVE (30..120) /
+    DELAYED (>120) / NO_ATTRIBUTION (>50% trades lack live news) /
+    NO_DATA.
+
+    Query params (forwarded to ``trade_attribution``):
+      ``hours_back`` — trade lookback (1..168, default 24)
+      ``window_hours`` — per-trade article window (0.5..24, default 4.0)
+      ``max_per_trade`` — top-N articles per trade (1..10, default 3)
+      ``min_ai_score`` — article cutoff (0..10, default 2.0)
+
+    Observational only — never gates Opus, no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.news_to_trade_lag import build_news_to_trade_lag
+        from .analytics.trade_attribution import build_trade_attribution
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        hours_back = _qf("hours_back", 24.0, 1.0, 168.0)
+        window_hours = _qf("window_hours", 4.0, 0.5, 24.0)
+        max_per_trade = int(_qf("max_per_trade", 3.0, 1.0, 10.0))
+        min_ai_score = _qf("min_ai_score", 2.0, 0.0, 10.0)
+
+        store = get_store()
+        with store._lock:  # noqa: SLF001 — same access pattern as trade_attribution
+            cur = store.conn.execute(
+                "SELECT id, timestamp, ticker, action, qty, price, value, "
+                "reason, option_type FROM trades "
+                "WHERE timestamp >= datetime('now', ?) "
+                "ORDER BY timestamp DESC LIMIT 200",
+                (f"-{hours_back:.1f} hours",),
+            )
+            rows = cur.fetchall()
+        trades = [{
+            "id": r[0], "timestamp": r[1], "ticker": r[2], "action": r[3],
+            "qty": r[4], "price": r[5], "value": r[6], "reason": r[7],
+            "type": r[8],
+        } for r in rows]
+
+        articles: list[dict] = []
+        if trades:
+            oldest_iso = trades[-1]["timestamp"]
+            try:
+                oldest_dt = datetime.fromisoformat(
+                    str(oldest_iso).replace("Z", "+00:00"))
+            except Exception:
+                oldest_dt = datetime.now(timezone.utc) - timedelta(
+                    hours=hours_back)
+            if oldest_dt.tzinfo is None:
+                oldest_dt = oldest_dt.replace(tzinfo=timezone.utc)
+            since = (oldest_dt - timedelta(hours=window_hours)).isoformat()
+            path = _articles_db_path()
+            if path is not None:
+                conn = None
+                try:
+                    conn = sqlite3.connect(
+                        f"file:{path}?mode=ro", uri=True, timeout=5)
+                    art_rows = conn.execute(
+                        "SELECT title, url, source, ai_score, urgency, "
+                        "first_seen FROM articles "
+                        "WHERE first_seen >= ? AND ai_score >= ? "
+                        "AND url NOT LIKE 'backtest://%' "
+                        "AND source NOT LIKE 'backtest_%' "
+                        "AND source NOT LIKE 'opus_annotation%' "
+                        "ORDER BY ai_score DESC LIMIT 5000",
+                        (since, min_ai_score),
+                    ).fetchall()
+                    articles = [{
+                        "title": r[0], "url": r[1], "source": r[2],
+                        "ai_score": r[3], "urgency": r[4], "first_seen": r[5],
+                    } for r in art_rows]
+                except Exception:
+                    articles = []
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+        attribution = build_trade_attribution(
+            trades, articles,
+            window_hours=window_hours,
+            max_per_trade=max_per_trade,
+            min_ai_score=min_ai_score,
+        )
+        result = build_news_to_trade_lag(
+            attribution, now=datetime.now(timezone.utc),
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR",
+                        "per_trade": []}), 500
+
+
 if __name__ == "__main__":
     run()
