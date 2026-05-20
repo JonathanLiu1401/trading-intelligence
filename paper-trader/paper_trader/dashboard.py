@@ -10523,6 +10523,213 @@ def trade_attribution_api():
         return jsonify({"error": str(e), "state": "ERROR"}), 500
 
 
+@app.route("/api/news-themes")
+@swr_cached("news-themes", 60.0)
+def news_themes_api():
+    """Per-ticker theme aggregation across the live news feed.
+
+    The wire produces 100+ articles per hour; the operator's actual
+    glance-at-the-feed question is "which tickers is the wire spending
+    its breath on right now, and which of those am I holding vs
+    ignoring?" The existing surfaces are siblings (do NOT consolidate —
+    AGENTS.md #10):
+
+      * ``/api/news-deduped`` is the linear item list.
+      * ``/api/news-velocity`` is the per-held-ticker Poisson rate
+        (BUILDING vs FADING vs baseline) — not a score-weighted "loudest
+        theme" rollup.
+      * ``/api/sector-heatmap`` / ``/api/sector-signal-fit`` aggregate
+        at the SECTOR level.
+      * ``/api/watchlist-opportunities`` ranks within the curated
+        watchlist; this is across the *entire* live feed regardless of
+        watchlist membership.
+
+    Builder is pure (``analytics/news_themes.py::build_news_themes``):
+    Σ ai_score × exp(-age_h / 6h × ln 2), multi-ticker articles split
+    their score evenly (a 4-ticker headline contributes 0.25× to each
+    theme — avoids one wide-net article inflating four themes
+    simultaneously, the same discriminator as ``sector_signal_fit``).
+    Defense-in-depth backtest-row filter at the builder so a leaked
+    synthetic row cannot reach user-facing JSON.
+
+    Query params (all optional):
+      ``hours`` — recency window (default 24, clamp 1..168)
+      ``max_themes`` — surfaced themes clip (default 20, clamp 1..100)
+      ``min_score`` — article ai_score floor at SQL (default 2.0, 0..10)
+
+    Advisory only — never gates Opus, adds no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.news_themes import build_news_themes
+
+        def _qf(name: str, default: float, lo: float, hi: float) -> float:
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        window_hours = _qf("hours", 24.0, 1.0, 168.0)
+        max_themes = int(_qf("max_themes", 20.0, 1.0, 100.0))
+        min_score = _qf("min_score", 2.0, 0.0, 10.0)
+
+        now = datetime.now(timezone.utc)
+        since = (now - timedelta(hours=window_hours)).isoformat()
+
+        # Live-only articles. We re-use the canonical SQL filter and
+        # also count on the builder's defense-in-depth drop.
+        articles: list[dict] = []
+        path = _articles_db_path()
+        if path is not None:
+            conn = None
+            try:
+                conn = sqlite3.connect(
+                    f"file:{path}?mode=ro", uri=True, timeout=5)
+                rows = conn.execute(
+                    "SELECT title, url, source, ai_score, urgency, "
+                    "first_seen FROM articles "
+                    "WHERE first_seen >= ? AND ai_score >= ? "
+                    "AND url NOT LIKE 'backtest://%' "
+                    "AND source NOT LIKE 'backtest_%' "
+                    "AND source NOT LIKE 'opus_annotation%' "
+                    "ORDER BY ai_score DESC LIMIT 2000",
+                    (since, min_score),
+                ).fetchall()
+                # Re-extract tickers from title/summary using the same
+                # cashtag/word-boundary regex shape signals.py uses; the
+                # articles table doesn't persist a parsed tickers list.
+                # Reuse signals._extract_tickers (the SSOT used by the
+                # live trader's prompt-building path) so theme tickers
+                # never drift from the universe Opus sees in `decide()`.
+                from .signals import _extract_tickers  # noqa: WPS433
+                for r in rows:
+                    title = r[0] or ""
+                    tk = sorted(_extract_tickers(title))
+                    articles.append({
+                        "title": title, "url": r[1], "source": r[2],
+                        "ai_score": r[3], "urgency": r[4],
+                        "first_seen": r[5],
+                        "tickers": tk,
+                    })
+            except Exception:
+                articles = []
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        # Held tickers for the held/unheld flag.
+        held: list[str] = []
+        try:
+            held = [
+                p["ticker"]
+                for p in get_store().open_positions()
+                if p.get("ticker")
+            ]
+        except Exception:
+            held = []
+
+        return jsonify(build_news_themes(
+            articles, held_tickers=held, now=now,
+            window_hours=window_hours, max_themes=max_themes,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR"}), 500
+
+
+@app.route("/api/round-trip-postmortem")
+@swr_cached("round-trip-postmortem", 60.0)
+def round_trip_postmortem_api():
+    """Post-exit drift verdict per recent closed round-trip.
+
+    ``/api/round-trips`` says WHAT closed (and what realised P&L it
+    booked). Every realised-P&L surface (track-record, churn, streak,
+    winner/loser autopsy, trade-asymmetry) reduces the round-trip list
+    to a summary stat. None of them ask the operator's follow-up: *was
+    the exit good?* — i.e. did the price keep moving in the bot's
+    favoured direction after the sell (PREMATURE / MISSED_RUNNER /
+    WHIPSAW) or against it (CORRECT)?
+
+    Pure SSOT in ``analytics/round_trip_postmortem.py``; verdict ladder:
+    CORRECT (post-exit drop ≤ -1%) / PREMATURE (rise 1..5%) /
+    MISSED_RUNNER (rise ≥ 5%) / WHIPSAW (short hold + small loss +
+    post-exit recovery — the DRAM-1h-paper-cut pathology) / NEUTRAL
+    (inside band) / INSUFFICIENT (exit < 2h ago or no current price).
+    Aggregate ``exit_quality_score`` is +1 CORRECT / -1 PREMATURE /
+    -2 WHIPSAW / -2 MISSED_RUNNER averaged over scored trips —
+    persistently negative ⇒ bot exits too early.
+
+    Distinct from neighbours (invariant #10 — do not consolidate):
+    ``/api/thesis-drift`` grades OPEN positions against entry rationale;
+    ``/api/loser-autopsy`` / ``/api/winner-autopsy`` reduce closed P&L
+    to aggregate stats; neither incorporates *post-exit price action*.
+    The post-exit drift is the only new piece of data this endpoint
+    adds — and it makes the realised-P&L number falsifiable in
+    hindsight.
+
+    Query params (all optional):
+      ``max_n`` — surfaced trips clip (default 10, clamp 1..50)
+      ``hours_back`` — round-trip lookback in hours (default 168, clamp 1..720)
+
+    Advisory only — never gates Opus, adds no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.round_trip_postmortem import build_round_trip_postmortem
+        from .analytics.round_trips import build_round_trips
+
+        def _qf(name: str, default: float, lo: float, hi: float) -> float:
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        max_n = int(_qf("max_n", 10.0, 1.0, 50.0))
+        hours_back = _qf("hours_back", 168.0, 1.0, 720.0)
+
+        store = get_store()
+        trades = list(reversed(store.recent_trades(2000)))
+        rts_all = build_round_trips(trades)
+
+        # Filter to round-trips closed within the lookback window.
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=hours_back)
+        def _exit_dt(rt):
+            ts = rt.get("exit_ts")
+            if not ts:
+                return None
+            try:
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                return None
+        rts_recent = [
+            rt for rt in rts_all
+            if (_exit_dt(rt) is not None and _exit_dt(rt) >= cutoff)
+        ]
+        # Sort newest-exit-first and clip BEFORE the price fetch so we
+        # don't pay yfinance for trips that won't surface.
+        rts_recent.sort(key=lambda r: r.get("exit_ts") or "", reverse=True)
+        rts_recent = rts_recent[: max(2 * max_n, max_n)]
+
+        tickers = sorted({rt["ticker"] for rt in rts_recent if rt.get("ticker")})
+        prices: dict[str, float | None] = {}
+        if tickers:
+            try:
+                from . import market as _mkt
+                prices = _mkt.get_prices(tickers)
+            except Exception:
+                prices = {}
+
+        return jsonify(build_round_trip_postmortem(
+            rts_recent, prices, now=now, max_n=max_n,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR"}), 500
+
+
 @app.route("/api/runner-heartbeat")
 @swr_cached("runner-heartbeat", 20.0)
 def runner_heartbeat_api():
@@ -11741,6 +11948,17 @@ def _swr_prewarm():
         # poll right after a restart is exactly when the operator is triaging
         # pre-print risk.
         ("event-protection", event_protection_api),
+        # news-themes @swr_cached 60s — articles.db SELECT + ticker
+        # regex over ~2000 rows is the slowest pure-DB shape we touch
+        # outside of /api/state. First poll right after a restart is
+        # exactly when the operator is glancing at the wire — locked
+        # by the prewarm==@swr_cached invariant.
+        ("news-themes", news_themes_api),
+        # round-trip-postmortem @swr_cached 60s — store.recent_trades
+        # + market.get_prices (yfinance per closed-ticker). yfinance
+        # is the long-tail latency contributor; same cold-stall blind
+        # spot the prewarm-coverage invariant locks against.
+        ("round-trip-postmortem", round_trip_postmortem_api),
     ]
     for name, wrapper in targets:
         try:

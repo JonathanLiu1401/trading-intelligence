@@ -10123,3 +10123,168 @@ loop's actual data directory):
   lockstep.
 - **#13** (pickle schema `{model, scaler, n_train}`) — untouched:
   the clamp is in the data-prep pass, not the persistence shape.
+
+
+## 2026-05-20 feature-dev pass (Agent 4) — `/api/round-trip-postmortem` + `/api/news-themes`
+
+Two new dashboard surfaces that fill orthogonal operator gaps that
+none of the existing ~120 endpoints close.
+
+### `/api/round-trip-postmortem` — was the exit good?
+
+`/api/round-trips` says WHAT closed (and realised P&L). Every
+realised-P&L panel (track-record, churn, streak, winner/loser
+autopsy, trade-asymmetry) reduces the round-trip list to summary
+stats. None of them ask the operator's actual follow-up: *was the
+exit good?* The DRAM 2026-05-19 round-trip (BUY 5 @50.70 17:13 UTC,
+SELL 5 @50.61 18:20 UTC, -0.18% / -$0.45) is precisely the case the
+existing surfaces flatten — the post-exit price action is the only
+piece of data that makes a paper-cut sell falsifiable.
+
+Pure SSOT `analytics/round_trip_postmortem.py::build_round_trip_postmortem`
+(never raises, never network). Verdict ladder per closed RT:
+
+- **CORRECT** — post-exit drift `≤ CORRECT_MAX_DRIFT_PCT` (-1%). Exit
+  captured the local high.
+- **PREMATURE** — drift between `PREMATURE_MIN_DRIFT_PCT` (1%) and
+  `MISSED_RUNNER_MIN_DRIFT_PCT` (5%). Bot sold, the move continued
+  against the exit direction.
+- **MISSED_RUNNER** — drift ≥ 5%. Bot exited a big winner.
+- **WHIPSAW** — short hold (≤ `WHIPSAW_MAX_HOLD_HOURS`=4h) + small loss
+  (≥ -`WHIPSAW_MAX_LOSS_PCT`=1.5%) + post-exit recovery > half of
+  `PREMATURE_MIN_DRIFT_PCT`. The specific DRAM-1h-paper-cut pathology;
+  pnl signal + short-hold are the discriminator (a long-hold winner's
+  rise-after is PREMATURE, not WHIPSAW).
+- **NEUTRAL** — drift inside the band.
+- **INSUFFICIENT** — exit `< MIN_HOURS_SINCE_EXIT` (2h) ago or no
+  current price. Sample-size honest (same `build_tail_risk` /
+  `build_correlation` / `build_news_velocity` precedent — numerics
+  emitted whenever defined, verdict withheld until window matures).
+
+Aggregate **`exit_quality_score`** is +1 CORRECT / -1 PREMATURE /
+-2 WHIPSAW / -2 MISSED_RUNNER averaged over scored trips —
+persistently negative ⇒ the bot is exiting too early. Single trip is
+not load-bearing; the score matures with N≥3.
+
+Distinct from neighbours (invariant #10 — do not consolidate):
+`/api/thesis-drift` grades OPEN positions against entry rationale;
+`/api/winner-autopsy`/`/api/loser-autopsy` reduce CLOSED P&L to
+aggregate stats; neither incorporates post-exit price action. The
+post-exit drift is the only new piece of data this endpoint adds —
+and it makes the realised-P&L number falsifiable in hindsight.
+
+Query params: `max_n` (default 10, clamp 1..50), `hours_back`
+(default 168, clamp 1..720). SWR-cached 60s. Advisory only — never
+gates Opus, never injected into the decision prompt (invariants
+#2/#12). Pure builder `build_round_trip_postmortem(round_trips,
+current_prices, now=None, max_n=10)` — never raises (garbage row /
+None / negative price → INSUFFICIENT, never an exception). Yfinance
+fetch lives in the endpoint (`market.get_prices`); a fetch failure
+degrades the whole table to INSUFFICIENT, never raises.
+
+Locked by `tests/test_round_trip_postmortem.py` (23 tests — verdict
+ladder per case, WHIPSAW disambiguation from CORRECT vs PREMATURE,
+per-share-avg arithmetic, `exit_quality_score` arithmetic,
+NO_DATA/INSUFFICIENT/OK ladder, max_n clip, never-raises on
+garbage) + `tests/test_round_trip_postmortem_endpoint.py` (6 tests —
+Flask wiring with DRAM-replay fixture, `hours_back` filter, max_n
+clamp, price-fetch-fails-degrades, NO_DATA on empty store).
+
+### `/api/news-themes` — what is the wire ACTUALLY talking about?
+
+The wire produces 100+ articles per hour across ~17 collectors. The
+existing surfaces tell the operator a slice of what is in there but
+not the per-name "loudest theme" view a discretionary PM watches:
+
+- `/api/news-deduped` is the linear item list (one row per article,
+  no ticker rollup).
+- `/api/news-velocity` is the per-held-ticker MENTION RATE vs
+  baseline (Poisson z-score) — not a score-weighted loudest-theme
+  rollup.
+- `/api/sector-heatmap` / `/api/sector-signal-fit` aggregate at the
+  SECTOR level — coarser than the per-name view.
+- `/api/watchlist-opportunities` ranks within the curated watchlist;
+  this is across the *entire* live feed regardless of watchlist
+  membership.
+- digital-intern's `trend_velocity` does market-wide mention-gainers,
+  not score-weighted theme prominence.
+
+Pure SSOT `analytics/news_themes.py::build_news_themes`. Per-ticker
+recency-decayed score: `Σ ai_score × exp(-age_h / 6h × ln 2)`.
+Multi-ticker articles **split** their score evenly across mentioned
+tickers (a 4-ticker headline contributes 0.25× to each — avoids one
+wide-net article inflating four themes simultaneously; the same
+discriminator as `sector_signal_fit`'s `signal_share_pct`). Per-row:
+`decayed_score`, `n_articles`, `max_urgency`, `top_title` /
+`top_url` (highest decayed-weight article for this theme),
+`held` (case-insensitive against `store.open_positions()`).
+Aggregate: `total_decayed_score`, `n_held_themes`,
+`n_unheld_themes`, `top_unheld_ticker` (a missed-opportunity
+bookmark distinct from `/api/watchlist-opportunities`).
+
+Defense-in-depth backtest filter at the builder: any row whose `url`
+LIKE `backtest://%` or `source` LIKE `backtest_%` /
+`opus_annotation%` is dropped — so a leaked synthetic row cannot
+reach user-facing JSON even if a future caller forgets the SQL
+clause (the canonical SQL filter is still applied in the endpoint,
+mirroring `signals.get_top_signals`).
+
+State ladder: NO_DATA (no articles in window) / OK. No sample-size
+gate beyond "at least one article surviving the recency filter" —
+the single ranked list is honest even with one input.
+
+Query params: `hours` (default 24, clamp 1..168), `max_themes`
+(default 20, clamp 1..100), `min_score` (default 2.0, 0..10).
+SWR-cached 60s. Ticker extraction reuses
+`signals._extract_tickers` (the SSOT used by the live trader's
+prompt-building path) so theme tickers never drift from the
+universe Opus sees in `decide()`. Advisory only — never gates Opus,
+never injected into the decision prompt (invariants #2/#12).
+
+Locked by `tests/test_news_themes.py` (18 tests — decay arithmetic
+on a halflife article, ranking by decayed score, count/max-urgency
+aggregation, top_title is the highest-weight article, multi-ticker
+SPLIT (not full-weight to each), held flag case-insensitive,
+held/unheld counts, top_unheld bookmark, summary block arithmetic,
+max_themes clipping, synthetic-row drop at the builder, never-raises
+on `None`/`"not a dict"`/missing-ts/garbage-timestamp rows,
+no-tickers articles counted separately) +
+`tests/test_news_themes_endpoint.py` (4 tests — Flask wiring with a
+real on-disk sqlite articles.db, synthetic-row filter via SQL,
+NO_DATA when no DB, param clamps, store-failure-degrades-not-raises).
+
+### How to run / test
+
+```sh
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Both feature surfaces (51 tests, <2s):
+python3 -m pytest tests/test_round_trip_postmortem.py \
+                   tests/test_round_trip_postmortem_endpoint.py \
+                   tests/test_news_themes.py \
+                   tests/test_news_themes_endpoint.py -v
+
+# Live probe (after the next paper-trader restart picks up the new routes):
+curl -s 'http://localhost:8090/api/round-trip-postmortem?max_n=5' | python3 -m json.tool
+curl -s 'http://localhost:8090/api/news-themes?hours=12&max_themes=10' | python3 -m json.tool
+```
+
+### Invariants reaffirmed by this pass
+
+- **#1** (backtest articles must never reach live signals) — both
+  endpoints apply the canonical SQL filter; `build_news_themes`
+  additionally drops `backtest://%` / `backtest_*` /
+  `opus_annotation*` rows at the builder as defense-in-depth.
+- **#2 / #12** (live trader has no hard limits, advisory-only) — both
+  endpoints are observational, never gate Opus, never injected into
+  the decision prompt; reporter Discord pulse not added.
+- **#10** (single source of truth, do not consolidate) — verdict
+  ladder lives in one builder; the endpoint computes nothing. News
+  ticker extraction reuses `signals._extract_tickers` so the theme
+  tickers cannot drift from the universe `decide()` builds prompts
+  against.
+- **#7** (SWR-cached slow read-only) — both endpoints carry
+  `@swr_cached("...", 60.0)` like every news-IO sibling.
+
+Applies on next paper-trader restart (the documented pattern for
+every recent feature).
