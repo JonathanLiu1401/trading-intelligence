@@ -1833,9 +1833,18 @@ def _buy(portfolio: SimPortfolio, ticker: str, qty: float, price: float,
         blended = (existing["qty"] * existing["avg_cost"] + qty * price) / new_qty
         existing["qty"] = new_qty
         existing["avg_cost"] = blended
-        if stop_loss:
+        # Truthiness check would silently drop an explicit `stop_loss=0.0` (or
+        # `take_profit=0.0`) update without overwriting the prior value — the
+        # new-position branch below stores 0.0 unconditionally via the dict
+        # literal, so accumulating into an existing position with the same
+        # 0.0 would silently diverge from a fresh open. `is not None` matches
+        # the (None-aware, zero-preserving) semantics every other check on
+        # these fields uses (`_execute_decision`'s `isinstance(..., (int, float))`,
+        # `_enforce_risk_exits`'s `if sl and ...` is intentional — there 0.0
+        # means "no real stop" — but for assignment we honor explicit zero).
+        if stop_loss is not None:
             existing["stop_loss"] = stop_loss
-        if take_profit:
+        if take_profit is not None:
             existing["take_profit"] = take_profit
     else:
         portfolio.positions[ticker] = {
