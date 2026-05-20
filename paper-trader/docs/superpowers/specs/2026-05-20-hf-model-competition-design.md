@@ -36,16 +36,19 @@ CLI: --model hf/deepseek-ai/DeepSeek-R1
 
 ```python
 HF_BASE = "https://router.huggingface.co/v1"
-_HF_SEM = threading.Semaphore(3)   # independent of _CLAUDE_SEM (2-slot)
+_HF_SEM = threading.Semaphore(3)    # HF: up to 3 concurrent calls
+_CLAUDE_SEM = threading.Semaphore(2) # Claude: max 2 concurrent (OOM guard) — MOVED here from backtest.py
 
 def call_llm(model_id: str, prompt: str, timeout: int = 90) -> str | None:
     """Route prompt to the right backend. Returns raw string or None."""
     if model_id.startswith("hf/"):
         return _hf_call(model_id[3:], prompt, timeout)
     elif model_id.startswith("claude-"):
-        return _claude_call(prompt)          # existing logic, relocated here
+        return _claude_call(model_id, prompt)   # existing logic, relocated here
     raise ValueError(f"Unknown model_id: {model_id!r}")
 ```
+
+**Migration note:** `_CLAUDE_SEM` moves from `backtest.py` into `llm_adapter.py`. The existing `_claude_call` in `backtest.py` is replaced with a call to `llm_adapter.call_llm`. Remove the now-orphaned `_CLAUDE_SEM` definition from `backtest.py` to avoid a silent duplicate.
 
 **`_hf_call` specifics:**
 - Auth: `HUGGINGFACE_HUB_TOKEN` → `HF_TOKEN` → parse from `.env` file
