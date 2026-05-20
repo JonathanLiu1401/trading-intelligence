@@ -12333,3 +12333,149 @@ import; safe to take effect immediately.
   raises into the Flask handler — analytics import failure or store
   read failure returns a `{"error": ...}` 500 envelope, not a process
   crash.
+
+## 2026-05-20 ML/backtest hybrid pass (Agent 2) — training-integrity hardening + per-action OOS skill
+
+Three concrete training-integrity / diagnostic improvements informed by a
+live quant-researcher pass over `data/decision_outcomes.jsonl` (7413 rows)
+and the deployed scorer pickle (`data/ml/decision_scorer.pkl`, n_train=400
+at start of pass — BELOW the 500 conviction-gate threshold).
+
+### Phase 1 — surgical fixes
+
+1. **`PriceCache._build_trading_days` densest fallback**
+   (`paper_trader/backtest.py`). When SPY's series is empty for a window
+   (transient yfinance failure), the trading-day calendar fell back to the
+   FIRST non-empty ticker by dict-insertion order. That could land on a
+   thin/foreign ETF and silently produce a sparse calendar that skipped
+   real NYSE days for the entire backtest — every sampled decision day,
+   the SL/TP scan, AND the equity curve all key on this calendar. Now
+   picks the DENSEST non-empty series (`max len(series)` over
+   `self.prices.items()`). SPY-like ETFs (QQQ, NVDA, etc.) all carry
+   near-full NYSE coverage so the proxy is safe; thin names lose to them.
+   The SPY-available path is unchanged (assertion lock:
+   `test_build_trading_days_uses_spy_when_available`).
+
+2. **`train_scorer` validates forward-return labels up front**
+   (`paper_trader/ml/decision_scorer.py`). A record with
+   `forward_return_5d=null/NaN/inf/bool/non-numeric` used to pass through
+   `_to_float(..., 0.0)` and become a 0.0 label — a phantom flat-return
+   training row that contaminated the 5000-record retrain tail (a single
+   bad row distorts the entire fit because the SELL sign-flip means
+   contradictory features → labels). Now drops invalid rows BEFORE
+   `build_features`, counts them in `n_label_dropped`, and pickles
+   `n_train` as the post-validation count so the gate-active>=500
+   invariant (#5) reflects the model's true data exposure. When every row
+   is invalid, returns `{"status": "no_valid_labels", "n": 0}` rather
+   than fitting an all-zero target vector.
+
+   The dirtiest-input forms now caught:
+   `None`, `float("nan")`, `float("inf")`, `True` (bool slips through
+   `isinstance(..., int)`), and any non-coercible string.
+
+### Phase 2 — per-action (BUY vs SELL) OOS rank skill
+
+`_oos_rank_metrics` in `run_continuous_backtests.py` now returns
+**buy_rank_ic / buy_dir_acc / buy_n** and **sell_rank_ic / sell_dir_acc
+/ sell_n** alongside the legacy aggregate. The conviction gate (#5) is
+BUY-only, so a quant needs the GATE-RELEVANT skill separately from the
+aggregate — an aggregate rank-IC ~0 (the documented current state) can
+hide a positive BUY skill cancelled by a SELL anti-skill.
+
+Wired through `_train_decision_scorer`'s status string and
+`_parse_scorer_status` so the per-cycle scorer-skill ledger
+(`data/scorer_skill_log.jsonl`) now persists the per-action breakdown
+durably. Legacy status strings (pre-feature ledger rows) parse cleanly —
+every new per-action key defaults to None, mirroring the
+multi-horizon / label-clamp legacy-status precedents.
+
+Aggregate metrics (rank_ic / dir_acc / n) byte-identical: same predict
+pass, same SELL-flip, same `±PRED_CLAMP_PCT` clamp, single-record n=1
+behaviour preserved (dir_acc computable on one non-zero pair, rank_ic
+None below n=2).
+
+### Phase 3 — live quant findings
+
+Concrete observations from running the now-deployed scorer pickle against
+the last 1000 outcomes (offline, after fixes shipped):
+
+  * **Aggregate rank_ic = +0.061** (weak). **BUY-only rank_ic = +0.107
+    (2x the aggregate)**. SELL-only rank_ic = +0.060. The per-action
+    diagnostic immediately surfaced exactly the gate-relevant signal a
+    quant cares about — without it, a reader would conclude "the model
+    has no skill" when the BUY side is actually meaningfully positive.
+  * **Continuous loop is DOWN**: no `run_continuous_backtests.py`
+    process; `continuous.log` last activity ~2026-05-18, dominated by
+    GDELT rate-limit / `ConnectionResetError` noise.
+  * **Gate INACTIVE**: deployed `n_train=400 < 500` — the conviction
+    gate is currently DISABLED for any live trader inference; the next
+    full retrain cycle (5000-outcome tail → ~4000-5000 deduped) will
+    push n_train past the threshold and re-arm the gate.
+  * **2 orphaned 'running' rows** (run_id 6238, 6243) — would be reaped
+    on next continuous-loop start by `_reap_orphaned_runs` (idempotent,
+    6h-age-guarded).
+  * **Returns distribution looks too good to be true**: last-50 complete
+    runs show **mean total_return_pct = +300%, max = +1446%, mean α =
+    +240%** on 1-year windows. For one-year backtests this is far
+    outside any realistic public benchmark — suggests one of:
+    (a) leveraged-ETF + persona-boost overfitting, (b) decision_outcome
+    hindsight leakage (the `hindsight_contaminated` filter in
+    `_load_local_articles` may not be catching everything), or
+    (c) survivorship bias from `TOP_RUNS_TO_TRAIN=1` always keeping the
+    best run. Worth a follow-up audit.
+  * **1 run with fabricated alpha** (`benchmark_unavailable` note set) —
+    the existing benchmark-honesty guard is catching the edge case as
+    designed; vs_spy_pct values on that row should be ignored.
+
+### Tests
+
+`paper-trader/tests/`:
+  - `test_backtest.py::TestPriceCache::test_build_trading_days_picks_densest_fallback`
+    — synthesises 3 series (SPY empty, THIN 30-day, DENSE 250-day) and
+    asserts the calendar resolves to DENSE's 250 days.
+  - `test_backtest.py::TestPriceCache::test_build_trading_days_uses_spy_when_available`
+    — adds a 5x-denser fake ticker, asserts SPY's calendar still wins.
+  - `test_decision_scorer.py::TestTrainScorer::test_handles_null_forward_return`
+    — all-null input → `status="no_valid_labels"`, `n=0`, `n_label_dropped=35`.
+  - `test_decision_scorer.py::TestTrainScorer::test_handles_non_finite_forward_return`
+    — 2 inf rows in a 35-record batch → trains on remaining 33, with
+    `n_label_dropped=2`.
+  - `test_decision_scorer.py::TestTrainScorer::test_drops_mixed_invalid_forward_returns`
+    — None / NaN / inf / bool / string ALL drop, leaving 35 valid.
+  - `test_continuous.py::TestOosRankMetrics::test_per_action_breakdown_isolates_buy_from_sell`
+    — perfectly-concordant BUYs + perfectly-discordant SELLs yield
+    `buy_rank_ic=+1.0` and `sell_rank_ic=-1.0` (aggregate would hide
+    that signal).
+  - `test_continuous.py::TestOosRankMetrics::test_per_action_buckets_handle_empty_one_side`
+    — 100% BUYs → `sell_n=0`, `sell_rank_ic=None` honestly (not a
+    fabricated value).
+  - `test_continuous.py::TestParseScorerStatus::test_parses_per_action_breakdown_tokens`
+    — status string with `oos_buy_n=600 oos_buy_ic=+0.11 oos_sell_n=108
+    oos_sell_ic=-0.04` → parser extracts ints + floats correctly.
+  - `test_continuous.py::TestParseScorerStatus::test_legacy_status_without_per_action_tokens_parses_cleanly`
+    — pre-feature status strings parse with new keys defaulting to None.
+
+### Test command (ML/backtest domain)
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader && \
+  python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+                    tests/test_continuous.py -q
+```
+
+(217 tests, ~5s. The full suite is ~3900 tests + ~25min under load.)
+
+### Manual backtest commands
+
+```bash
+# One-shot 10-run launcher (uses BacktestEngine().run_all(10) defaults)
+python3 run_backtests.py
+
+# Continuous loop (5 runs/cycle, picks a random 1–10yr window each cycle)
+python3 run_continuous_backtests.py
+
+# Inspect a single scorer prediction
+python3 -m paper_trader.ml.decision_scorer \
+  --explain --ticker NVDA --ml-score 4.0 --rsi 70 --macd 2.0 \
+  --mom5 5.0 --mom20 12.0 --regime-mult 1.0
+```
