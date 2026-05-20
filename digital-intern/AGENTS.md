@@ -5471,3 +5471,148 @@ agent's `alert_agent.py`/`alert_recency.py` paraphrase work as
 file. `git diff --staged --stat` verified before commit. Never
 `git add -A`. Untracked `paper-trader/docs/superpowers/plans/` left
 untouched per the `di-shared-repo-concurrency` memory.
+
+## 2026-05-20 — Hybrid pass (per-held-ticker alert book_velocity annotation)
+
+**Multi-phase agent pass** — the third HYBRID agent for digital-intern on
+2026-05-20. The codebase is exceptionally mature (1660 tests passing in
+12:27); this pass adds a per-held-ticker velocity annotation to the urgent
+alert prompt and documents live findings from a news-analyst perspective.
+
+**Phase 1 (debug/fix).** A full sweep of the listed files (`daemon.py`,
+`storage/article_store.py`, `watchers/alert_agent.py`,
+`watchers/urgency_scorer.py`, `ml/trainer.py`, `ml/model.py`,
+`ml/features.py`, `collectors/web_scraper.py`,
+`analysis/claude_analyst.py`) plus the analytics modules without
+`_LIVE_ONLY_CLAUSE` found NO new bugs worth fixing — every invariant the
+brief enumerated is already pinned by existing tests
+(`TestBacktestIsolation`, `TestAlertedMarking`, `TestScoreSourceSeparation`,
+`TestArticleAgeCascade`, `TestLabelSourcing`,
+`TestContinuousLabelSourcing`, the recap/quote-widget gate tests).
+`bugs_fixed=0`, no Phase 1 commit per the brief's commit guard.
+
+**Phase 2 (feature).** Added a per-held-ticker mention-velocity annotation
+to the urgent alert prompt:
+
+  - `watchers/alert_agent.py::send_urgent_alert` — single batched call to
+    `store.ticker_mention_velocity` for the union of all `_book_tickers`
+    in the dedup'd alert batch, before the `_fmt` loop (one DB query per
+    alert cycle, not per row).
+  - `_fmt` — when a row carries a `book:` line AND any of its held
+    tickers has `>=2` mentions in the last 60min, an additive
+    `book_velocity:` line names each qualifying ticker with its count.
+    Below the threshold the line is silent (mirrors the
+    "omit-when-empty" discipline of the briefing's BOOK HEAT / AGING TOP
+    ROWS / `book_velocity` companion blocks). Single-mention rows are
+    THIS alert itself — silence is correct.
+  - `ALERT_PROMPT` — new "BOOK VELOCITY" rule sits directly under the
+    BOOK rule, instructing Sonnet to weight IMPACT magnitude on a
+    multi-mention wire (prefer BUY/SELL over WATCH on a surge, treat a
+    `book:` line WITHOUT velocity as an isolated headline).
+  - `tests/test_alert_book_velocity.py` (8 new tests) — pins emission
+    threshold (≥2), multi-ticker silence on the non-qualifying ones,
+    no-book rows skipping the velocity lookup entirely (one batched
+    call, never per-row), best-effort degradation when the store has no
+    `ticker_mention_velocity` method (legacy mocks) OR when it raises
+    (locked DB), and that the new BOOK VELOCITY rule reaches the Sonnet
+    prompt verbatim. The data-block discriminator
+    (`_data_block(prompt)`) scopes substring assertions to the
+    per-article payload — the static prompt rule legitimately contains
+    the literal token `book_velocity:` in its own explanation.
+
+**Live data validates the feature.** Phase 3 inspection
+(2026-05-20T13:50Z) showed multiple concurrent NVDA-earnings-day urgent
+items hitting the wire at once: "Nvidia Stock Price Set to Fall after
+Today's Earnings?", "Bespoke's Morning Lineup – Higher Ahead of
+Nvidia", "The Ultimate Test of the AI Wave: NVIDIA's Earnings Report
+Arrives", "Nvidia Earnings Are Imminent...", "Today's Movers: Micron,
+Intel, Lowe's, Nvidia...". When any of these fires the standalone push,
+the new `book_velocity:` line would tell Sonnet "NVDA: 6 mentions in
+last 60min — weight IMPACT magnitude accordingly". This is exactly the
+analyst-persona "wire is concentrating on my held name" signal that
+neither the per-row `book:` tag nor the briefing's BOOK HEAT (which
+fires every 5h, not on each alert) was surfacing on the time-critical
+alert path.
+
+**Load-bearing invariants intact.** `ticker_mention_velocity` is
+`_LIVE_ONLY_CLAUSE`-scoped (synthetic backtest/opus rows cannot inflate
+the count, CLAUDE.md §5). The new annotation is pure read-side: NO DB
+write, NO `ai_score` / `ml_score` / `score_source` / `urgency`
+mutation, NO mutation of `source_articles`. The four load-bearing
+invariants (backtest isolation, ml_score≠ai_score, score_source, the
+urgency state machine) are intact by construction. Best-effort failure
+path: a mock store without the method OR a locked-DB exception
+degrades silently to the pre-feature behaviour (the `book:` line still
+appears, no `book_velocity:` line) — the analyst-persona's #2 complaint
+is missed urgent items, so this gate must NEVER block a fresh alert.
+
+**Phase 3 (live validation, news-analyst lens).**
+
+  - **F1 (ML-only urgent dominance — ~92%):** 11 of 12 recent urgent
+    items inspected (last 6h window) carry `ai_score=0` with the score
+    coming from `ml_score` alone (typically `>=9`). The
+    `[unverified — model-only urgent]` calibration tag (`_llm_vetted=
+    False` in `get_unalerted_urgent`) is hedging these correctly on
+    the alert path. Sonnet's CONTEXT/IMPACT lines should be using
+    WATCH rather than BUY/SELL for these — pre-existing discipline.
+    The single LLM-vetted urgent item (ai_score=8.0, ml_score=0,
+    `reddit/r/ValueInvesting`) is real LLM ground truth. Heavy
+    reliance on the ML head is a known design choice; the calibration
+    tag is the mitigation.
+  - **F2 (queue backlog of 23 items aged 1–6h):** 30 `urgency=1`
+    items queued (live-only): 3 <1h, 23 in 1–6h, 4 in 6–24h, 0 >=24h.
+    The alerter processes ≤5 per 20s cycle; 30 items × 20s/5 = 120s
+    minimum drain time, but new urgent items keep arriving (NVDA
+    earnings day surge). The cohort sitting 1–6h old is consistent
+    with the daemon-log line "[alert] 30 urgent items → dispatching"
+    + tail-suppression logic. The `reap_stale_urgent` worker handles
+    anything that ages past 24h. No action required — system behaving
+    correctly under high-rate input.
+  - **F3 (`stats:` endpoint occasional 500):** `/api/stats` 500'd at
+    13:53:27 with `lock retry exhausted after 5 attempts`. This is
+    the documented shared-connection cursor-collision storm — under
+    sustained writer contention, even five retries aren't enough. The
+    `_STATS_BACKLOG_CACHE` short-TTL refresh path absorbs the
+    expensive `unscored` / `below_threshold` scans but the `total` /
+    `urgent` MAX(rowid) reads still go through the shared
+    `self.conn` and can collide. Known limitation; a future fix is
+    per-call read connection isolation (mirroring dashboard
+    `_ro_query`).
+  - **F4 (collector health excellent):** 671/h, 9416/24h — well above
+    threshold. Top sources `GN: earnings` (468), `GN: Nasdaq` (421),
+    `Benzinga Economics` (263), `scraped/finance.yahoo.com` (244),
+    `Finnhub/Yahoo` (227), `GN: Nvidia` (222) all delivering. No
+    curated-channel dark periods evident from `_coverage_gap_lines`
+    inspection.
+  - **F5 (chronic dark sources):** Multiple reddit subs idle 5+ days
+    (`r/AMCSTOCK`, `r/AIstocks`, `r/Vitards`, `r/EconomicHistory`,
+    `r/Biotechplays`, `r/ethfinance`, `r/GlobalMarkets` 150+h). Plus
+    `substack/semianalysis.substack.com` 126h. Matches the
+    `di-chronic-dark-collectors` memory pattern — standing external
+    gap (Reddit access throttling / subreddit privacy changes), not
+    a fresh bug.
+
+  `user_findings=5`. F2 and F3 are the most operationally relevant;
+  F1 confirms the calibration tag is working as designed; F4/F5 are
+  health observations.
+
+**Phase 4 (this section).**
+
+**Final verify.**
+- `python3 -c "import sys; sys.path.insert(0,'.'); from storage import
+  article_store; from ml import features, model; print('imports OK')"`
+  → `imports OK`.
+- Full suite baseline before this pass: **1660 passed** in 747.06s.
+- After Phase 2: alert subsuite `+8 new tests` — **168 passed** in
+  1.11s across alert+article+features+urgency tests.
+
+**Counters.** `bugs_fixed=0`, `features_added=1`, `user_findings=5`.
+
+**Staging discipline.** Three other agents running concurrently per the
+`pt-concurrent-samerole-staging-race` memory. `git status` checked
+before staging; staged with explicit pathspec only
+(`watchers/alert_agent.py`, `tests/test_alert_book_velocity.py`,
+`AGENTS.md`). Never `git add -A`. Untracked
+`paper-trader/docs/superpowers/plans/` left untouched. AGENTS.md
+appended-only, committed alongside the related code in this same
+documentation step.

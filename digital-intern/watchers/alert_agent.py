@@ -58,6 +58,8 @@ CONTINUITY: If an article carries a `related:` line, a standalone 🚨 BREAKING 
 
 BOOK: If an article carries a `book:` line, it names live portfolio/watchlist positions the analyst actually has money in (LITE/LNOK/MUU/DRAM/SNDU/MU/MSFT/AXTI/ORCL/TSEM/QBTS/NVDA). That event is directly actionable for the analyst's open risk: the PORTFOLIO line MUST name the listed held ticker(s) and give a concrete directional implication for each, and weight this article's IMPACT above generic macro colour of similar magnitude. Absence of a `book:` line means the event does not touch the held book — keep PORTFOLIO short (sector read-through only, no invented position).
 
+BOOK VELOCITY: If a `book_velocity:` line ALSO appears on a `book:` alert, it names how many other distinct articles mentioned the same held ticker in the last 60 minutes — the wire is materially CONCENTRATING on that name (momentum / cluster of related developments), so the IMPACT magnitude should reflect that: prefer BUY/SELL over WATCH and state magnitude with more confidence than for a lone event. A `book:` line WITHOUT a `book_velocity:` line means this is the only recent mention — frame it as an isolated headline (use WATCH unless the body itself is unambiguous). Absence of `book_velocity:` is silent (never reproduced as a section).
+
 Urgent articles detected:
 {articles_text}
 
@@ -831,6 +833,38 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
             if rel:
                 a["_related_prior"] = rel
 
+    # Per-held-ticker mention velocity. For each held ticker mentioned by any
+    # row in the batch, count distinct article mentions in the last 60min via
+    # the canonical ``ArticleStore.ticker_mention_velocity`` primitive (already
+    # ``_LIVE_ONLY_CLAUSE``-scoped — synthetic backtest/opus rows can never
+    # inflate the count, CLAUDE.md §5). The analyst's persona is "react to
+    # events affecting MY positions"; today the ``book:`` line names WHICH
+    # held tickers touch this wire but not "is this part of a multi-mention
+    # surge or a lone event?". A standalone alert on a held name with 4 other
+    # recent mentions is materially different (the wire is concentrating on
+    # that name — bigger event, momentum trade) from one with zero other
+    # mentions (an isolated headline). Single batched call covering every
+    # held ticker in the batch (not per-row) so DB cost is one query per
+    # alert cycle. Best-effort: any failure (mock store without the method,
+    # locked DB, …) degrades to no annotation — never blocks an alert. Pure
+    # read-side: no DB write, no ai_score / ml_score / score_source /
+    # urgency mutation. Pinned by ``tests/test_alert_book_velocity.py``.
+    velocity_map: dict[str, dict] = {}
+    all_book_tickers = sorted({t for a in batch for t in _book_tickers(a)})
+    if all_book_tickers:
+        try:
+            v_rows = store.ticker_mention_velocity(
+                all_book_tickers, window_min=60
+            )
+            velocity_map = {
+                r["ticker"]: r for r in v_rows if isinstance(r, dict)
+            }
+        except Exception:
+            _log.exception(
+                "[alert] ticker_mention_velocity failed — degrading"
+            )
+            velocity_map = {}
+
     def _fmt(a: dict) -> str | None:
         # Defensive field access. The rest of this pipeline (_is_synthetic,
         # dedupe_urgent) reads every key through .get(); _fmt used to be the
@@ -898,6 +932,34 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
                 f"the PORTFOLIO line MUST give a concrete directional "
                 f"implication for them"
             )
+            # Per-held-ticker mention velocity hint. Multiple recent
+            # mentions = a wire concentrating on that name (momentum / event
+            # cluster), so the IMPACT magnitude should reflect that. Single
+            # mention (no velocity line) means this is a lone event. Pure
+            # read-side annotation; the velocity_map was computed above.
+            # >=2 mentions in 60min is the conservative discriminator —
+            # one mention is THIS alert itself, two means at least one other
+            # recent article hit the same name (the analyst persona's "is
+            # this part of a wire surge?" question is genuinely answered).
+            velocity_notes: list[str] = []
+            for t in book:
+                v = velocity_map.get(t)
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    recent = int(v.get("recent") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if recent >= 2:
+                    velocity_notes.append(
+                        f"{t}: {recent} mentions in last 60min"
+                    )
+            if velocity_notes:
+                block += (
+                    f"\nbook_velocity: {'; '.join(velocity_notes)} — "
+                    f"weight IMPACT magnitude accordingly (wire is "
+                    f"concentrating on these held names)"
+                )
         rel = a.get("_related_prior")
         if isinstance(rel, dict) and (rel.get("title") or "").strip():
             # Drives the prompt's CONTINUITY rule — a related 🚨 alert already
