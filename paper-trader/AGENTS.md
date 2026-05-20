@@ -10792,3 +10792,145 @@ python3 -m pytest tests/ -v -k "ml or backtest or scorer or oos"
   to `paper_trader/dashboard.py` and untracked
   `paper_trader/analytics/position_runrate.py` were correctly left
   out of both commits.
+
+## Review pass — paper-trader core hybrid (2026-05-20, Agent 1, ~06:35 UTC) — half-day cadence + signals alias resolution
+
+### Phase 1 — fix: `compute_interval` honored simple weekday/hour rule, not NYSE half-days or full holidays (1 bug)
+
+`paper_trader/analytics/dynamic_interval.py::_is_market_hours` used a flat
+9:30–16:00 weekday rule and `_is_session_open_window` only excluded weekends.
+On the two known half-days (2026-11-27 day-after-Thanksgiving, 2026-12-24
+Christmas Eve, both 13:00 ET close) the runner stayed on the 30-min
+MARKET_OPEN cadence for the three hours past the 13:00 early bell — and on
+full holidays (MLK, Christmas, etc.) it cycled OPEN-tier (1800s) and could
+even fire SESSION_OPEN-tier (300s) cycles on a closed market. Both wasted
+Opus capacity against a frozen book (and `market.is_market_open()` correctly
+reads False the whole time, so the cadence here disagreed with the gate the
+trader's own decision path keys off).
+
+Fix delegates `_is_market_hours` to `market.is_market_open(now_utc)` (the
+existing SSOT — handles half-days, holidays, weekends together) and guards
+`_is_session_open_window` against `NYSE_HOLIDAYS_2026`. Lazy import inside
+both helpers so unrelated test suites that import `compute_interval` don't
+pull yfinance through `market.py`; falls back to the pre-fix simple rule on
+any market-module import failure (degrade-safe; the hot-path discipline).
+
+### Tests added (4)
+
+`tests/test_dynamic_interval.py`:
+- `test_half_day_afternoon_after_early_close_is_closed_cadence` —
+  2026-11-27 14:30 ET → 3600s (was 1800s pre-fix).
+- `test_half_day_before_early_close_still_open_cadence` —
+  2026-11-27 11:00 ET → 1800s (no over-correction).
+- `test_full_holiday_uses_closed_cadence` — 2026-12-25 10:00 ET → 3600s.
+- `test_holiday_does_not_trigger_session_open_window` — 2026-01-19 (MLK
+  Monday) 9:45 ET → 3600s (NOT 300s SESSION_OPEN).
+
+All 8 dynamic-interval tests + 335 nearby tests
+(strategy/store/market/half_day/signals/runner_heartbeat/negcache) pass.
+Staged only `paper_trader/analytics/dynamic_interval.py` +
+`tests/test_dynamic_interval.py` per [[pt-concurrent-samerole-staging-race]]
+— concurrent sibling agents had `paper_trader/backtest.py` open with their
+own work in flight, correctly left untouched in this commit.
+
+### Phase 2 — feat: company-name → ticker alias resolution in `signals.py`
+
+A headline like `"Nvidia surges to record on chip demand"` historically
+extracted **zero tickers** (no `$cashtag`, no ALLCAPS `NVDA` token), so the
+article never contributed to `ticker_sentiments(["NVDA"])` counts or to the
+per-article `tickers` field Opus reads in the live prompt. Every held name's
+news-volume was silently undercounted by every headline that referenced the
+company by name rather than by symbol — a real gap in the live prompt the
+decision engine reads.
+
+Added `_TICKER_ALIASES: dict[str, tuple[str, ...]]` mapping 19 well-known
+companies (NVDA→nvidia, AAPL→apple, MSFT→microsoft, AMZN→amazon,
+GOOGL→alphabet, META→facebook, TSLA→tesla, MU→micron, AVGO→broadcom,
+QCOM→qualcomm, INTC→intel, MRVL→marvell, TSM→tsmc / taiwan semiconductor,
+ASML, AMAT→applied materials, LRCX→lam research, KLAC→kla-tencor,
+LITE→lumentum, COIN→coinbase). Each alias matched as a **case-insensitive
+whole-word regex** (mirroring `strategy._WORD_TO_TICKER_LIVE_PATTERNS` after
+its 2026-05-20 substring-FP fix), so `"applesauce"` / `"pineapple"` do NOT
+match AAPL.
+
+Wired through three paths via the new single-source-of-truth `_alias_match`
+helper:
+- `_extract_tickers` — additive on top of the existing $cashtag + ALLCAPS
+  extraction. Every downstream consumer of `signal["tickers"]` benefits
+  (the Opus prompt's `tickers=NVDA,...` line, the source-edge attribution,
+  etc.).
+- `ticker_sentiments` (bulk) — outer loop now `(symbol OR alias)`-matches
+  per article; one article hit per ticker per row (no double-counting).
+- `get_ticker_sentiment` (single) — same `(symbol OR alias)` semantics.
+
+### Tests added (14)
+
+`tests/test_core_signals.py`:
+- `TestTickerAliasExtraction` (9 tests) — `"Nvidia surges"` → `NVDA`;
+  `"Apple expands services"` → `AAPL`; `"Tesla cuts prices"` → `TSLA`;
+  multi-word `"Taiwan Semiconductor"` → `TSM`; case-insensitive
+  (`"nvidia"` / `"Nvidia"` both → NVDA); word-boundary discipline
+  (`"applesauce"` / `"pineapple"` → NOT AAPL); no duplication when ticker
+  AND alias both present in the same headline; alias pass keeps the
+  existing ALLCAPS + `_NOT_TICKERS` filters intact; empty-text contract
+  preserved.
+- `TestTickerSentimentsAliasPath` (5 tests) — company-name headline
+  counts toward ticker `n`; `get_ticker_sentiment` alias path locks
+  same behaviour; no double-count when symbol + alias both present;
+  unrelated alias does NOT pollute sibling ticker (cross-ticker
+  isolation); substring of alias does NOT falsely match in body scan.
+
+73 pre-existing signals tests still pass; 218 across the
+signals-related suites (`test_core_signals` +
+`test_execute_and_fetch_signals` + `test_signals_lock_degrade` +
+`test_signal_followthrough`) clean.
+
+Staged only `paper_trader/signals.py` + `tests/test_core_signals.py`
+per [[pt-concurrent-samerole-staging-race]]; concurrent sibling agent had
+`paper_trader/backtest.py` modified with their own atomic-write fix in
+flight, correctly left untouched (their `a7d93a8` shipped between this
+agent's Phase 1 and Phase 3).
+
+### Phase 3 — live validation (~06:35 UTC)
+
+Live runner restarted onto sibling commit `a7d93a8` (the backtest atomic-
+write fix) between Phase 2 push and Phase 3 probe. Healthy state:
+
+1. ✅ **`/api/build-info`** `boot_sha == head_sha == a7d93a8`, `stale: false`.
+2. ✅ **`/api/portfolio`** $993.93 equity, $40.28 cash, 2 positions, -0.61% vs
+   $1000 start, stale_marks=0.
+3. ✅ **`/api/runner-heartbeat`** HEALTHY — last decision 3m ago in the
+   60m closed-market cadence; `decision_efficacy=PRODUCING` (19/20).
+4. ✅ **Discord delivery** — `notify_verdict=HEALTHY`, last_ok 4s before probe.
+5. ✅ **Singleton lock** `acquired` (pid=3580806).
+6. ✅ **Database** `paper_trader.db` last_updated current (within 3m of
+   probe); decisions over last 24h: 43 cycles → 1 fill, 40 hold, 2
+   no_decision (4.7% rate; matches `/api/host-guard` empty rate).
+7. ⚠️ **Concentration HIGH** — NVDA 66.59% of book + TQQQ 29.35%
+   (top3 95.94%). `/api/correlation` confirms SINGLE_NAME_RISK,
+   `/api/risk` flags `concentration_severity: HIGH`. Documented in
+   the hourly Discord block; not actionable from this pass.
+8. ⚠️ **Capital pinned** — 4.05% cash with NVDA earnings ~7h away
+   (`/api/briefing` → `Market CLOSED — opens in 7h03m`). The book is
+   structurally inelastic to a post-print catalyst. Known
+   `capital_paralysis` pathology; already surfaces in Discord.
+9. ⚠️ **Host saturation boundary** — `/api/host-guard` `state=CLEAR`,
+   `opus_count=4` (this run + 3 sibling concurrent hybrid agents),
+   `load_per_cpu=0.72`, `swap_used_pct=77.8%`. The 4-agent concurrent
+   review is right at the saturation knee; documented host pathology.
+
+### Counters
+
+`bugs_fixed=1, features_added=1, user_findings=3` (all 3 ⚠ items above
+are documented patterns surfaced for awareness; no novel pathology
+caught this pass — the value is confirming the live state matches the
+documented invariants on a freshly-restarted runner).
+
+### Invariants reaffirmed by this pass
+
+- **#10** (single source of truth) — the alias map's matching is centralised
+  in `_alias_match`; both extraction and the two sentiment-scan paths consume
+  the same helper, so they can never disagree on whether a headline "counts".
+- **#2 / #12** (no hard limits, advisory-only) — both Phase 1 (cadence) and
+  Phase 2 (alias) are observational/data-sourcing changes; neither modulates
+  a trade decision or adds a position cap.
