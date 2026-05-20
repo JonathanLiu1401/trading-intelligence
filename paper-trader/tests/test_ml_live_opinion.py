@@ -263,3 +263,85 @@ class TestRegimeAndUniverseGuards:
         )
         assert op is not None
         assert op["action"] == "HOLD"
+
+
+class TestKeywordSubstringFalsePositives:
+    """Locks that ``_WORD_TO_TICKER_LIVE`` matching uses word boundaries.
+
+    A bare ``keyword in title`` substring match false-positively mapped
+    short keys to their tickers on irrelevant articles:
+
+      * "ai" → TQQQ matched "China" / "rain" / "Spain" / "trail"
+      * "gold" → GLD matched "Goldman" (very common in finance news)
+      * "intel" → INTC matched "intelligence" (and "artificial intelligence",
+        double-counted with the "ai" → TQQQ map)
+
+    Each silently boosted an unrelated ticker's score on every article
+    containing the substring — a real signal-quality regression on the
+    advisor (CLAUDE.md §15). The canonical recovery case in
+    ``test_keyword_mapping_picks_up_unticked_article`` ("nvidia surges to
+    record on chip demand") still matches under ``\\bkeyword\\b`` because
+    the keyword appears as a standalone token — both paths must hold.
+    """
+
+    def test_rain_in_title_does_not_alias_to_tqqq_via_ai(self):
+        # "rain" contains the substring "ai". Pre-fix: ``"ai" in "rain..."``
+        # is True → TQQQ gets the article's raw_score * sentiment added.
+        # Post-fix: ``\bai\b`` requires the standalone token "ai".
+        # The article has no other watchlist ticker, no quant signal, no
+        # mapped keyword that matches at a word boundary → expect HOLD.
+        articles = [{
+            "id": 300,
+            "title": "Heavy rain surges to record level in strong storm",
+            "ai_score": 9.0,
+            "urgency": 0,
+            "tickers": [],  # extractor would not surface RAIN as a ticker
+        }]
+        op = strategy._ml_live_opinion(
+            articles, quant_sigs={}, snap=_snap(),
+            watch_px={"TQQQ": 80.0, "NVDA": 900.0},
+        )
+        assert op is not None
+        # Pre-fix this returned BUY TQQQ (substring "ai" in "rain" bullishly
+        # routed the high-score article to TQQQ). Post-fix → HOLD.
+        assert op["action"] == "HOLD", op
+
+    def test_pain_in_title_does_not_alias_to_tqqq_via_ai(self):
+        # Additional "ai" substring false-positive: "pain" → TQQQ pre-fix,
+        # HOLD post-fix. Two different stems is the regression-locking
+        # value-add over relying on one word's letter pattern alone.
+        articles = [{
+            "id": 302,
+            "title": "Inflation pain surges to record strong levels",
+            "ai_score": 9.0,
+            "urgency": 0,
+            "tickers": [],
+        }]
+        op = strategy._ml_live_opinion(
+            articles, quant_sigs={}, snap=_snap(),
+            watch_px={"TQQQ": 80.0},
+        )
+        assert op is not None
+        assert op["action"] == "HOLD", op
+
+    def test_standalone_ai_token_still_maps_to_tqqq(self):
+        # The fix must NOT regress the canonical "AI" → TQQQ recovery — the
+        # whole point of the keyword map. A title with "AI" as a standalone
+        # token (after lowering) is exactly what the map exists to surface.
+        articles = [{
+            "id": 303,
+            "title": "AI demand surges to record on strong outlook",
+            "ai_score": 8.0,
+            "urgency": 0,
+            "tickers": [],  # extractor missed it (2-char "AI" filtered)
+        }]
+        op = strategy._ml_live_opinion(
+            articles, quant_sigs={}, snap=_snap(),
+            watch_px={"TQQQ": 80.0},
+        )
+        assert op is not None
+        # Standalone "ai" → TQQQ (the recovery path the keyword map exists
+        # for) — locks the keyword-mapping picks-up regression. Pre-fix
+        # and post-fix BOTH match here, by design.
+        assert op["action"] == "BUY"
+        assert op["ticker"] == "TQQQ"

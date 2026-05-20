@@ -1160,6 +1160,22 @@ _WORD_TO_TICKER_LIVE: dict[str, str] = {
     "gold": "GLD", "bitcoin": "BTC-USD", "crypto": "COIN",
     "defense": "DFEN", "biotech": "LABU",
 }
+# Pre-compiled word-boundary patterns for `_WORD_TO_TICKER_LIVE` lookup.
+# A bare `keyword in title` substring match false-positively triggered on the
+# short keys: "ai" matched "China"/"rain"/"Spain"/"trail"; "gold" matched
+# "Goldman" (very common in finance news); "intel" matched "intelligence"
+# (double-counted with the "ai" → TQQQ mapping). Each silently polluted the
+# advisor score on irrelevant articles. The canonical keyword-recovery case
+# locked by `test_keyword_mapping_picks_up_unticked_article` ("nvidia surges
+# to record on chip demand" → NVDA/SOXL) still matches under \bkeyword\b
+# because the keyword appears as a standalone token; the multi-word
+# "federal reserve" / "artificial intelligence" still match because \b sits
+# between any word/non-word transition (spaces included). Keys are
+# lowercased and titles are lowered before matching, so the pattern is
+# built from the lowercase keyword.
+_WORD_TO_TICKER_LIVE_PATTERNS: dict[str, "re.Pattern[str]"] = {
+    kw: re.compile(rf"\b{re.escape(kw)}\b") for kw in _WORD_TO_TICKER_LIVE
+}
 _LEVERAGED_ETFS_LIVE = {
     "TQQQ", "UPRO", "SPXL", "UDOW", "URTY", "SOXL", "TECL", "FNGU",
     "CURE", "LABU", "NAIL", "DPST", "FAS", "DFEN", "TNA", "UTSL",
@@ -1213,7 +1229,8 @@ def _ml_live_opinion(
             sentiment = ((bull - bear) / total_sent) if total_sent else 0.0
             tickers = list(a.get("tickers") or [])
             for keyword, sym in _WORD_TO_TICKER_LIVE.items():
-                if keyword in title and sym not in tickers:
+                pat = _WORD_TO_TICKER_LIVE_PATTERNS.get(keyword)
+                if pat is not None and pat.search(title) and sym not in tickers:
                     tickers.append(sym)
             try:
                 a_urg = float(a.get("urgency", 0.0) or 0.0)
