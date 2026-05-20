@@ -303,16 +303,81 @@ _NOT_TICKERS = {
 }
 
 
+# Company-name → ticker aliases. A headline like "Nvidia surges to record on chip
+# demand" historically extracted no tickers (no $cashtag, no ALLCAPS NVDA token),
+# so the article never contributed to `ticker_sentiments(["NVDA"])` counts —
+# silently undercounting NVDA's news volume by every headline that referenced
+# the company by name rather than by symbol. Below the regex extractor, each
+# alias is matched **case-insensitively as a standalone token** (word boundary,
+# mirroring strategy._WORD_TO_TICKER_LIVE_PATTERNS after that file's substring-
+# false-positive fix). Multi-word aliases like "taiwan semiconductor" match the
+# full phrase because \b sits between any word/non-word transition (spaces
+# included). Only well-known companies with low ambiguity in finance-feed text;
+# adding a noisy alias here would silently re-introduce the very pollution the
+# strategy.py fix removed.
+_TICKER_ALIASES: dict[str, tuple[str, ...]] = {
+    "NVDA": ("nvidia",),
+    "AAPL": ("apple",),
+    "MSFT": ("microsoft",),
+    "AMZN": ("amazon",),
+    "GOOGL": ("alphabet",),
+    "META": ("facebook",),
+    "TSLA": ("tesla",),
+    "MU": ("micron",),
+    "AVGO": ("broadcom",),
+    "QCOM": ("qualcomm",),
+    "INTC": ("intel",),
+    "MRVL": ("marvell",),
+    "TSM": ("tsmc", "taiwan semiconductor"),
+    "ASML": ("asml",),
+    "AMAT": ("applied materials",),
+    "LRCX": ("lam research",),
+    "KLAC": ("kla-tencor",),
+    "LITE": ("lumentum",),
+    "COIN": ("coinbase",),
+}
+
+# Pre-compiled case-insensitive word-boundary patterns for the alias table.
+_TICKER_ALIAS_PATTERNS: dict[str, tuple["re.Pattern[str]", ...]] = {
+    tk: tuple(re.compile(rf"\b{re.escape(a)}\b", re.IGNORECASE) for a in aliases)
+    for tk, aliases in _TICKER_ALIASES.items()
+}
+
+
+def _alias_match(text: str | None, ticker: str) -> bool:
+    """True iff any of ``ticker``'s registered company-name aliases occurs as a
+    standalone word in ``text`` (case-insensitive). False when ``text`` is
+    empty or the ticker has no aliases. Single source of truth for the
+    alias-matching used by both ``_extract_tickers`` and the
+    ``ticker_sentiments`` / ``get_ticker_sentiment`` body-scan paths so the
+    two surfaces can never disagree on whether a headline "counts"."""
+    if not text:
+        return False
+    pats = _TICKER_ALIAS_PATTERNS.get(ticker)
+    if not pats:
+        return False
+    return any(pat.search(text) for pat in pats)
+
+
 def _extract_tickers(text: str) -> set[str]:
-    """Heuristic ticker extraction — pulls $TICKER or ALLCAPS 1-5 char tokens, filters noise."""
-    out = set()
-    for m in re.finditer(r"\$([A-Z]{1,5})\b", text or ""):
+    """Heuristic ticker extraction — pulls $TICKER or ALLCAPS 1-5 char tokens,
+    filters noise, and additionally tags tickers when their company-name alias
+    appears as a standalone word (e.g. ``"Nvidia surges"`` → ``{"NVDA"}``)."""
+    out: set[str] = set()
+    if not text:
+        return out
+    for m in re.finditer(r"\$([A-Z]{1,5})\b", text):
         out.add(m.group(1))
-    for m in _TICKER_RE.finditer(text or ""):
+    for m in _TICKER_RE.finditer(text):
         tok = m.group(1)
         if tok in _NOT_TICKERS or len(tok) < 2:
             continue
         out.add(tok)
+    for tk in _TICKER_ALIAS_PATTERNS:
+        if tk in out:
+            continue
+        if _alias_match(text, tk):
+            out.add(tk)
     return out
 
 
@@ -409,8 +474,14 @@ def get_ticker_sentiment(ticker: str, hours: int = 4) -> dict:
     needle = ticker.upper()
     pattern = re.compile(rf"(?:\$|\b){re.escape(needle)}\b")
     for r in rows:
-        body = f"{r['title']} {_decompress(r['full_text'])}".upper()
-        if pattern.search(body):
+        title = r["title"] or ""
+        full = _decompress(r["full_text"])
+        upper_body = f"{title} {full}".upper()
+        # Symbol match (uppercase) OR a registered company-name alias
+        # (case-insensitive against the raw mixed-case body). The alias path
+        # lets a "Nvidia surges …" headline count toward NVDA sentiment even
+        # though the literal "NVDA" never appears.
+        if pattern.search(upper_body) or _alias_match(f"{title} {full}", needle):
             scores.append(r["ai_score"])
             if (r["urgency"] or 0) >= 1:
                 urgent += 1
@@ -529,10 +600,17 @@ def ticker_sentiments(tickers: list[str], hours: int = 4) -> list[dict]:
     upper_tickers = [t.upper() for t in tickers]
     patterns = {t: re.compile(rf"(?:\$|\b){re.escape(t)}\b") for t in upper_tickers}
     for r in rows:
-        body = f"{r['title']} {_decompress(r['full_text'])}".upper()
+        title = r["title"] or ""
+        full = _decompress(r["full_text"])
+        raw_body = f"{title} {full}"
+        upper_body = raw_body.upper()
         urg = (r["urgency"] or 0) >= 1
-        for t, pat in patterns.items():
-            if pat.search(body):
+        for t in upper_tickers:
+            # Symbol match OR a registered company-name alias (e.g. a "Nvidia"
+            # headline counts toward NVDA sentiment volume — historically these
+            # were silently dropped and the per-name `n` undercount fed the
+            # decision prompt). Single source of truth via `_alias_match`.
+            if patterns[t].search(upper_body) or _alias_match(raw_body, t):
                 agg[t]["scores"].append(r["ai_score"])
                 if urg:
                     agg[t]["urgent"] += 1
