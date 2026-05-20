@@ -415,6 +415,37 @@ _RT_WHY_JUST_MOVED = re.compile(
     r"nosedived|hammered|skyrocketed|rocketed|sliding|rebounded)\b",
     re.IGNORECASE,
 )
+# "X (TICKER) Reports Earnings Tomorrow: What To Expect" — the FinancialContent
+# / StockStory / MSN / TradingView SEO-mill earnings-preview template. By
+# definition NOT breaking ("tomorrow"), heavily syndicated, and the trailing
+# "What To Expect" is the SEO-mill discriminator that distinguishes it from a
+# real earnings preview (which says "Q1 Earnings Preview" or "ahead of
+# earnings"). Live evidence (2026-05-19/20, 36h articles.db scan, all
+# urgency=2): 6 distinct hits — DECK + SCVL (not held, pure SEO spam) at
+# 03:57Z / 04:12Z 2026-05-20 fired BREAKING pushes today, plus NVDA syndicated
+# 4× across FinancialContent / StockStory / MSN / TradingView at 03:21Z /
+# 05:16Z / 05:42Z / 14:51Z 2026-05-19. Same retrospective-template class as
+# _RT_EARNINGS_CALL (which catches POST-earnings "Q1 2026 Earnings Call
+# Highlights"); this catches the PRE-earnings preview variant the existing
+# gate's "highlights|recap|takeaways|transcript|summary" verb list explicitly
+# excludes (real previews like "Q1 Earnings Preview" must NOT match).
+#
+# Discriminator: "Reports Earnings" + "Tomorrow" + ":" + "What To Expect" all
+# four must appear in that order with the canonical separators. The colon-
+# bounded "What To Expect" suffix is the SEO-mill tell — real wire copy
+# announces an earnings date without that trailer ("NVIDIA Earnings Today:
+# Wall Street Expects EPS to Jump..." has the colon but no "what to expect").
+# Catches all 6 live cases (mixed-case, optional space around the colon, both
+# `(NVDA)` and `( NVDA )` spacings handled by the regex's whitespace
+# tolerance). Validated against the 12h Discord-push corpus that any
+# legitimate NVDA-earnings-day push ("Nvidia Earnings Are Hours Away. Here Are
+# 3 Things to Watch.", "Stock futures edge higher ahead of Nvidia earnings",
+# "Nvidia stock erases early losses ahead of earnings", "NVIDIA Earnings
+# Today: ...") does NOT match.
+_RT_EARNINGS_TOMORROW = re.compile(
+    r"\breports?\s+earnings\s+tomorrow\s*:\s*what\s+to\s+expect\b",
+    re.IGNORECASE,
+)
 
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
@@ -422,6 +453,7 @@ _RECAP_TEMPLATE_PATTERNS = (
     ("why_just_moved", _RT_WHY_JUST_MOVED),
     ("market_today_dated", _RT_MARKET_TODAY),
     ("earnings_call_recap", _RT_EARNINGS_CALL),
+    ("earnings_tomorrow_preview", _RT_EARNINGS_TOMORROW),
     ("street_thinks", _RT_STREET_THINKS),
     ("gf_value_says", _RT_GF_VALUE),
 )

@@ -151,6 +151,33 @@ class TestHelperCatchesLiveNoise:
             assert hit, f"missed GF Value recap: {t!r}"
             assert name == "gf_value_says"
 
+    def test_earnings_tomorrow_preview_seo_mill(self):
+        """Live evidence (2026-05-19/20, 36h articles.db scan, all urgency=2):
+        6 distinct hits — DECK + SCVL (neither held; pure SEO spam) fired
+        BREAKING pushes on 2026-05-20 at 03:57Z and 04:12Z, plus NVDA
+        syndicated 4× across FinancialContent / StockStory / MSN /
+        TradingView on 2026-05-19 (03:21Z, 05:16Z, 05:42Z, 14:51Z). The
+        existing earnings_call_recap pattern is POST-earnings only
+        (highlights/recap/takeaways/transcript/summary verb list); this
+        PRE-earnings preview variant the SEO mills use leaked through. Pin
+        each live failure-case title by the exact string."""
+        for t in (
+            # 2026-05-20 live noise (DECK + SCVL — not portfolio names).
+            "FinancialContent - Deckers ( DECK ) Reports Earnings Tomorrow : What To Expect",
+            "FinancialContent - Shoe Carnival ( SCVL ) Reports Earnings Tomorrow : What To Expect",
+            # 2026-05-19 NVDA syndication (4 sources, same template).
+            "FinancialContent - Nvidia ( NVDA ) Reports Earnings Tomorrow : What To Expect",
+            "Nvidia (NVDA) Reports Earnings Tomorrow: What To Expect - StockStory",
+            "Nvidia (NVDA) reports earnings tomorrow: What to expect - MSN",
+            "Nvidia (NVDA) Reports Earnings Tomorrow: What To Expect - TradingView",
+            # Plausible same-template variants (singular/plural, spacing).
+            "Micron Technology (MU) Reports Earnings Tomorrow: What to Expect",
+            "AMD ( AMD ) Reports Earnings Tomorrow : What To Expect - Yahoo",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed live earnings-tomorrow SEO mill: {t!r}"
+            assert name == "earnings_tomorrow_preview"
+
     def test_why_x_stock_just_moved_motley_fool_variant(self):
         """Live evidence (2026-05-19 19:49Z): "Why Micron Stock Just Popped
         Again" was Sonnet-scored urgent=8 and fired a 🚨 BREAKING alert
@@ -239,6 +266,38 @@ class TestHelperPreservesRealBreaking:
         ):
             hit, _ = alert_agent._looks_like_recap_template({"title": t})
             assert not hit, f"false-positive on earnings preview: {t!r}"
+
+    def test_earnings_tomorrow_preview_does_not_over_catch(self):
+        """The earnings_tomorrow_preview pattern requires the four-part
+        signature "Reports Earnings Tomorrow:What To Expect" — a real
+        earnings-day/preview headline that uses a SUBSET of those tokens
+        (just "tomorrow", just "what to expect", just "earnings today") must
+        NOT match. Pins the SEO-mill discriminator against the genuine
+        earnings-coverage corpus the analyst NEEDS as urgent. Live evidence:
+        all 8 of the genuine NVDA-earnings-day pushes that fired alongside
+        the SEO-mill noise on 2026-05-20."""
+        for t in (
+            # Real earnings-day NVDA pushes from 2026-05-20 (must survive).
+            "Nvidia's Earnings Are Hours Away. Here Are 3 Things to Watch.",
+            "Stock futures edge higher ahead of Nvidia earnings",
+            "Nvidia stock erases early losses ahead of earnings: what to expect - Cryptonews.",
+            "NVIDIA Earnings Today: Wall Street Expects EPS to Jump to $1.76 on $78.75B Revenue",
+            "Nvidia to announce Q1 earnings tonight. What to expect and why there could be a",
+            "Asian stocks extend losing streak as higher yields bite, Nvidia results in focus",
+            "Nvidia Stock Heads Into Earnings With Biggest Short Position In S&P 500",
+            # "Earnings tomorrow" alone (no SEO-mill "What To Expect" trailer).
+            "MU reports earnings tomorrow at 4pm ET",
+            # "What to expect" alone (real wire piece, no "Reports Earnings
+            # Tomorrow" exact phrase).
+            "Fed meeting tomorrow: what to expect from the SEP",
+            # "Reports earnings" without "tomorrow" — POST-earnings, caught
+            # by a different gate (or legitimate same-day coverage).
+            "MU reports earnings: beats DRAM expectations",
+        ):
+            hit, _ = alert_agent._looks_like_recap_template({"title": t})
+            assert not hit, (
+                f"false-positive on real earnings-day push: {t!r}"
+            )
 
     def test_value_analyst_headlines_survive(self):
         """Real headlines that mention value/analyst takes (without the
@@ -407,6 +466,41 @@ class TestSendUrgentAlertIntegration:
             "syndicated recap not suppressed on every copy — gate must "
             "run BEFORE dedupe_urgent"
         )
+
+    def test_earnings_tomorrow_seo_mill_end_to_end(self, monkeypatch):
+        """End-to-end: a FinancialContent SEO-mill 'Reports Earnings Tomorrow:
+        What To Expect' row alongside a real urgent must (a) suppress the SEO
+        row without a Discord push, (b) fire on the real urgent, (c) mark
+        BOTH alerted. Pins the live failure-mode the new gate targets — DECK
+        / SCVL fired BREAKING pushes from this template on 2026-05-20 with
+        zero portfolio relevance (`score_source='ml'`, urgency head over-
+        scored), exactly the noise this gate suppresses."""
+        spy = _StoreSpy()
+        real = _row(_id="real",
+                    title="MU earnings blow past Q3 estimates sharply",
+                    source="reuters", ai_score=9.5)
+        seo = _row(_id="seo",
+                   title="FinancialContent - Shoe Carnival ( SCVL ) "
+                         "Reports Earnings Tomorrow : What To Expect",
+                   source="GDELT/markets.financialcontent.com")
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK",
+                            "https://x/webhook")
+        with patch.object(alert_agent, "claude_call",
+                          return_value="🚨 BREAKING ◈ EARNINGS ◈ MU"
+                          ) as mock_claude, \
+             patch("notifier.discord_notifier.send",
+                   return_value=True) as mock_send:
+            ok = alert_agent.send_urgent_alert([real, seo], spy)
+        assert ok is True
+        mock_claude.assert_called_once()
+        mock_send.assert_called_once()
+        prompt = mock_claude.call_args.args[0]
+        # The real headline IS in the prompt; the SEO mill row is NOT.
+        assert "MU earnings blow past Q3 estimates" in prompt
+        assert "Reports Earnings Tomorrow" not in prompt
+        assert "FinancialContent" not in prompt
+        # Both ids marked: real on send-success, SEO unconditionally by gate.
+        assert sorted(spy.marked) == ["real", "seo"]
 
     def test_gate_runs_after_quote_widget_gate(self, monkeypatch):
         """Both gates run BEFORE dedup and both mark-alerted-unconditionally
