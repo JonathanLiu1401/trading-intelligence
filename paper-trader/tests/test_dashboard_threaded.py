@@ -92,19 +92,35 @@ def test_threaded_server_parallelizes():
     """A threaded werkzeug server overlaps slow requests instead of serializing.
 
     Builds an independent tiny Flask app (does not bind :8090, does not touch
-    the real Store) and serves it threaded on an ephemeral port. Four
-    concurrent 0.4s requests must finish in well under the 1.6s a
-    single-threaded server would take. This pins the *property* the
-    ``threaded=True`` kwarg exists to provide.
+    the real Store) and serves it threaded on an ephemeral port. The actual
+    property we test: requests OVERLAP in time. A single-threaded server would
+    process them back-to-back with zero overlap; a threaded server must run at
+    least some of them concurrently.
+
+    Earlier versions of this test used a wall-clock elapsed-time assertion
+    (``elapsed < 0.8s``) which flaked badly under heavy host load — observed
+    live 2026-05-20 at 1.04s and 1.82s for 4×0.4s requests on a box running
+    continuous backtests + paper trader concurrently. Scheduler overhead can
+    exceed the per-request sleep itself on a saturated box, so the elapsed
+    measurement no longer cleanly discriminates "threaded but slow" from
+    "single-threaded". The per-request overlap check captures the *actual*
+    concurrency property deterministically — overlap is a structural fact
+    that does not depend on absolute wall time.
     """
     from flask import Flask
     from werkzeug.serving import make_server
 
     sleep_app = Flask(__name__)
+    intervals: list[tuple[float, float]] = []
+    intervals_lock = threading.Lock()
 
     @sleep_app.route("/slow")
     def _slow():  # noqa: D401
+        t0 = time.perf_counter()
         time.sleep(0.4)
+        t1 = time.perf_counter()
+        with intervals_lock:
+            intervals.append((t0, t1))
         return "ok"
 
     srv = make_server("127.0.0.1", 0, sleep_app, threaded=True)
@@ -115,22 +131,31 @@ def test_threaded_server_parallelizes():
         url = f"http://127.0.0.1:{port}/slow"
 
         def hit() -> str:
-            with urllib.request.urlopen(url, timeout=5) as r:
+            with urllib.request.urlopen(url, timeout=10) as r:
                 return r.read().decode()
 
         n = 4
-        start = time.perf_counter()
         with ThreadPoolExecutor(max_workers=n) as ex:
             results = list(ex.map(lambda _: hit(), range(n)))
-        elapsed = time.perf_counter() - start
 
         assert results == ["ok"] * n
-        # Serial would be ~n*0.4 = 1.6s. Concurrent ≈ 0.4s. Use a generous
-        # ceiling (0.4 * n * 0.5 = 0.8s) so a loaded CI box never flakes
-        # while a serialized regression (≥1.6s) still fails loudly.
-        assert elapsed < 0.4 * n * 0.5, (
-            f"threaded server serialized: {elapsed:.2f}s for {n} concurrent "
-            f"0.4s requests (expected ~0.4s, serial would be ~{0.4*n:.1f}s)"
+        assert len(intervals) == n, (
+            f"expected {n} server-side intervals, got {len(intervals)}"
+        )
+        # Sort by start time and count adjacent overlapping pairs. A
+        # single-threaded server processes back-to-back: the next request's
+        # start strictly follows the previous request's finish (zero overlap).
+        # A threaded server runs them concurrently: subsequent requests start
+        # while the previous is still sleeping.
+        intervals.sort()
+        overlapping_pairs = sum(
+            1 for i in range(len(intervals) - 1)
+            if intervals[i + 1][0] < intervals[i][1]
+        )
+        assert overlapping_pairs >= 1, (
+            f"threaded server serialized: 0/{n - 1} adjacent request pairs "
+            f"overlapped (every request started after the prior one finished). "
+            f"Per-request (start, end) intervals: {intervals}"
         )
     finally:
         srv.shutdown()
