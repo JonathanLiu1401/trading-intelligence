@@ -11923,3 +11923,131 @@ curl -s 'http://localhost:8090/api/peer-earnings-shock' | python3 -m json.tool
 
 Applies on next paper-trader restart (the documented pattern for
 every recent feature).
+
+
+## 2026-05-20 core hybrid pass — `_trade_impact_line` unit coverage + **TODAY** hourly block (Agent 1, ~13:50 UTC)
+
+### Phase 1 fix — direct unit tests for `reporter._trade_impact_line`
+
+The post-trade book-impact one-liner (`_trade_impact_line`, ~170 lines)
+had *zero direct test coverage*; every existing assertion went through
+`send_trade_alert`, so a regression that hit the helper's internals but
+left the alert-side body green would ship silently. Added a
+`TestTradeImpactLineUnit` class (15 tests, all PASS in 0.85s) that pins:
+
+- `snapshot=None` / non-dict → `""` (the defensive guard)
+- missing / zero / negative `total_value` → `""` (no
+  div-by-zero, no misleading "0.0% of book")
+- `HOLD` / `REBALANCE` actions → `""` (the non-BUY/SELL branch
+  never invents an impact line)
+- sub-0.1% lot weight suppression — emits cash-only token (rounding-noise
+  fills never get a name token)
+- BUY of a ticker whose lot has been closed post-trade
+  (`same_lot_value=0`) → cash-only, no crash
+- non-numeric cash field → coerces to 0.0, never raises (same contract
+  as the existing market_value coercion)
+- fractional option strike (600.5) → keeps decimal in label, *not*
+  silently rounded to "600C" (would mislabel a different contract)
+- non-numeric option strike "ATM" → drops label gracefully, no crash on
+  the `int(sf) if sf == int(sf) else sf` formatter
+- multi-strike same-ticker option book → weight attributed to the
+  *matching contract leg*, not summed across the ticker stack
+- SELL no-store / no-remaining → `"closed · cash $X"` (single cash
+  token; locks the historic double-cash regression on the helper
+  directly, not just via `send_trade_alert`)
+- SELL partial close (still held qty > 0) → `"partial — NVDA still X%
+  of book"`, never fabricates a realized P/L when no round-trip closed
+
+### Phase 2 feature — **TODAY** hourly block (`_today_session_line`)
+
+Closed a dashboard→Discord gap one dimension over from the existing 1h
+`_session_block`: the hourly had no compact answer to the trader's
+*first* morning question after the 09:30 ET bell — "what is **today's**
+intraday motion so far?". For a book that gained $30 yesterday then
+lost $20 today by 11 AM ET, TOTAL P/L reads +$10 (positive, looks fine)
+and the 1h SESSION block only shows the latest hour. Neither answers
+"today" until the 16:05 ET daily close (5+ hours later).
+
+- `_today_session_anchor_iso(now)` — pure NYSE-calendar lookup. Returns
+  today's 09:30 ET as a UTC-ISO string, or `None` when today is not a
+  trading day (weekend / `market.NYSE_HOLIDAYS_2026`) or pre-open
+  (`cur_min < 9*60+30`, strict `<` boundary). Half-days keep the
+  regular 09:30 ET open (only the *close* shifts to 13:00 ET).
+  Post-close still returns today's anchor until UTC date rolls over to
+  the next trading day's pre-open.
+- `_today_session_line(store, now)` — composes `_window_delta`
+  **verbatim** (single source of truth, invariant #10 — same math the
+  SESSION block uses with a different baseline, so this surface and the
+  1h SESSION block can never disagree on direction) and emits:
+
+  ```
+  **TODAY** ◈ since 09:30 ET NYSE open
+  > $+15.00 (+1.50%) · alpha `+0.50%`
+  ```
+
+  Pure store reads only — NO network (the Discord-path discipline; the
+  `_drawdown_line` / `_benchmark_line` precedent). Observational only,
+  never gates, adds no caps (invariants #2/#12). The alpha clause
+  renders only when SPY is present on BOTH bookends; a partial-SPY
+  curve degrades to port-only.
+
+- Wired into `send_hourly_summary` immediately AFTER the 1h SESSION
+  block (same "what has the desk done lately" theme, one window over)
+  and BEFORE benchmark/drawdown. Suppressed silently when today is not
+  a trading day, the session has not yet opened, or the equity_curve
+  has no point at-or-after today's anchor.
+- Failure contract mirrors the rest of `reporter`: any builder/store
+  fault degrades to `""` ("no today-session line this report"), never
+  an exception ("no Discord summary this report").
+
+Locked by `tests/test_core_reporter.py::TestTodaySessionAnchorIso` (8)
++ `::TestTodaySessionLine` (9) — 17 tests covering weekend / holiday /
+pre-open (incl. 09:29 ET strict-< boundary) / at-open / mid-session /
+post-close / half-day; exact +$/+%/alpha on a pinned curve; negative
+motion + missing SPY → port-only; store-fault → `""`; hourly wiring
+includes block when in-session and OMITS it pre-open.
+
+### Phase 3 live findings (trader perspective)
+
+1. **Live trader on stale code (3 commits behind HEAD)** —
+   `/api/build-info` `boot_sha=a673d6b head_sha=1682e2d behind=3`,
+   `stale=true`. The new **TODAY** feature applies on the next
+   git-watcher restart (~3-min poll cadence); no manual action required.
+2. **Host saturated** — 5 concurrent Opus subprocesses (1 live trader +
+   4 review agents), `load1=21.93` / `swap_used=70%`. `/api/host-guard`
+   correctly flags `SATURATED` with 18% recent starvation rate; the
+   pre-flight + mid-call guards dodge the doomed Opus calls so a storm
+   only inflates the "skipped claude call —" bucket, not the
+   model-empty bucket — the AGENTS.md `pulse()` design working.
+3. **New TODAY feature validates value on live data** — current book
+   reads `pnl_vs_start=+0.59%` (total P/L since $1000 start) and the
+   new TODAY line resolves to `$-6.35 (-0.63%) · alpha -0.62%`. A
+   trader checking the hourly without the TODAY block sees +$5.94 and
+   would miss that today is actively bleeding -$6.35 against alpha of
+   -0.62%. Exactly the gap this block exists to close.
+4. **Feed & Discord both HEALTHY** — `/api/feed-health` HEALTHY (9390
+   live articles in 24h, newest 0.1h old, no split-brain); Discord
+   notify HEALTHY (last send 22m ago, no consecutive failures).
+
+### Counters
+
+`bugs_fixed=1, features_added=1, user_findings=4`.
+
+### Invariants reaffirmed by this pass
+
+- **#2 / #12** (no caps / observational) — `_today_session_line` is
+  pure store reads + arithmetic over the existing `_window_delta`
+  helper. Never gates Opus, never injected into the decision prompt,
+  no risk caps. The `_drawdown_line` / `_benchmark_line` precedent.
+- **#10** (SSOT) — `_window_delta` is reused verbatim; the same math
+  the 1h SESSION block uses, so the TODAY line and the SESSION delta
+  can never disagree on direction.
+- **#13** (SCHEMA discipline) — no new tables. Reads `equity_curve`
+  (already populated by the live trader) only.
+- **NYSE-half-day**: `_today_session_anchor_iso` keeps the 09:30 ET
+  open anchor unchanged on a half-day (only `market.close_minute`
+  shifts to 13:00 ET — the open is regular). Locked by
+  `test_half_day_open_unchanged`.
+
+Applies on next paper-trader restart (the documented pattern for
+every recent feature).
