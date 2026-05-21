@@ -92,6 +92,7 @@ from collectors.globenewswire_collector import collect_globenewswire
 from collectors.hackernews_collector import collect_hackernews
 from collectors.sec_xbrl_financials import collect_sec_xbrl_financials
 from collectors.usgs_earthquake_collector import collect_usgs_earthquakes
+from collectors.forex_factory_calendar import collect as collect_forex_factory_cal
 from collectors.sec_13f_collector import collect_13f_filings
 from collectors.sec_insider_form4 import collect_sec_form4
 from collectors.nasdaq_halts_collector import collect_nasdaq_halts
@@ -141,6 +142,7 @@ NEWSAPI_INTERVAL    = 1500        # NewsAPI keyword search every 25min (free=100
 YAHOO_TICKER_RSS_INTERVAL = 240   # Yahoo per-ticker RSS every 4min
 WIKIPEDIA_INTERVAL  = 600         # Wikipedia recent-changes filter every 10min
 MACRO_CALENDAR_INTERVAL = 3600    # FOMC/BLS macro event calendar — once per hour
+FOREX_FACTORY_CAL_INTERVAL = 3600  # Forex Factory economic calendar — once per hour
 FINRA_SHORT_INTERVAL    = 3600    # FINRA RegSHO short volume — once per hour (daily file)
 CONGRESS_TRADES_INTERVAL = 3600   # Congressional trading disclosures — once per hour
 CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog — once per hour
@@ -1241,6 +1243,27 @@ def macro_calendar_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(MACRO_CALENDAR_INTERVAL)
+
+
+def forex_factory_cal_worker(store: ArticleStore):
+    log.info("[forex_factory_cal_worker] started")
+    bo = Backoff("forex_factory_cal", base=120.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_forex_factory_cal()
+            _ingest(store, articles, "forex_factory_calendar")
+            try:
+                source_health.record_result("forex_factory_calendar", len(articles))
+            except Exception as he:
+                log.warning(f"[forex_factory_cal_worker] source_health error: {he}")
+            _worker_last_ok["forex_factory_cal"] = time.time()
+            log.debug(f"[forex_factory_cal] cycle ok ({len(articles)} new events)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[forex_factory_cal_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(FOREX_FACTORY_CAL_INTERVAL)
 
 
 # ── Worker: FINRA RegSHO short volume — every 1h ────────────────────────────
@@ -2778,6 +2801,7 @@ def main():
         ("sector_etf",  sector_etf_worker),
         ("wikipedia",   wikipedia_worker),
         ("macro_calendar", macro_calendar_worker),
+        ("forex_factory_cal", forex_factory_cal_worker),
         ("finra_short",   finra_short_worker),
         ("congress_trades", congress_trades_worker),
         ("cisa_kev",    cisa_kev_worker),
