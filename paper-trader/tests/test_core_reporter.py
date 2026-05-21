@@ -5174,3 +5174,240 @@ class TestHourlySummaryStaleMarkBugFix:
         # the substring and are not the position flag.
         assert "⚠ STALE" not in body
         assert "+20.0%" in body
+
+
+class TestMarkIntegrityLine:
+    """`_mark_integrity_line` — aggregate "your book value is partially
+    fictional" Discord surface. The per-position ⚠ STALE flag is easy to
+    miss when scanning a 5-position list; this surfaces the aggregate
+    "X% of $Y book value is at cost" verdict alongside the headline P/L
+    so it can't be missed."""
+
+    class _FakeStore:
+        """Minimal store stub that returns whatever positions/portfolio we
+        feed it. Mirrors the contract reporter._mark_integrity_line reads
+        (get_portfolio, open_positions)."""
+
+        def __init__(self, json_positions=None, open_positions=None):
+            self._json = list(json_positions or [])
+            self._open = list(open_positions or [])
+
+        def get_portfolio(self) -> dict:
+            return {"cash": 0.0, "total_value": 0.0,
+                    "positions": self._json}
+
+        def open_positions(self) -> list[dict]:
+            return list(self._open)
+
+    def test_clean_book_is_silent(self):
+        store = self._FakeStore(
+            json_positions=[
+                {"ticker": "NVDA", "type": "stock", "expiry": None,
+                 "strike": None, "qty": 5, "avg_cost": 100.0,
+                 "current_price": 110.0, "market_value": 550.0,
+                 "stale_mark": False},
+            ],
+            open_positions=[{"ticker": "NVDA", "type": "stock",
+                             "qty": 5, "avg_cost": 100.0,
+                             "current_price": 110.0}],
+        )
+        assert reporter._mark_integrity_line(store) == ""
+
+    def test_no_positions_is_silent(self):
+        store = self._FakeStore(json_positions=[], open_positions=[])
+        assert reporter._mark_integrity_line(store) == ""
+
+    def test_degraded_surfaces_verdict_and_stale_ticker(self):
+        # 1 stale (MU) of 2 positions; stale_value is 100 / 600 gross = 16.7%
+        # < UNTRUSTWORTHY_PCT (50%) → DEGRADED.
+        store = self._FakeStore(
+            json_positions=[
+                {"ticker": "NVDA", "type": "stock", "expiry": None,
+                 "strike": None, "qty": 5, "avg_cost": 100.0,
+                 "current_price": 100.0, "market_value": 500.0,
+                 "stale_mark": False},
+                {"ticker": "MU", "type": "stock", "expiry": None,
+                 "strike": None, "qty": 2, "avg_cost": 50.0,
+                 "current_price": 50.0, "market_value": 100.0,
+                 "stale_mark": True},
+            ],
+        )
+        line = reporter._mark_integrity_line(store)
+        assert "**MARK INTEGRITY**" in line
+        assert "DEGRADED" in line
+        assert "MU" in line       # named in the stale tickers list
+        assert "NVDA" not in line  # not stale, must not appear
+
+    def test_untrustworthy_uses_warning_emoji(self):
+        # Single stale-marked NVDA, 100% of book gross is stale → ≥50% so
+        # UNTRUSTWORTHY (the builder verdict).
+        store = self._FakeStore(
+            json_positions=[
+                {"ticker": "NVDA", "type": "stock", "expiry": None,
+                 "strike": None, "qty": 5, "avg_cost": 100.0,
+                 "current_price": 100.0, "market_value": 500.0,
+                 "stale_mark": True},
+            ],
+        )
+        line = reporter._mark_integrity_line(store)
+        assert line.startswith("⚠️ ")
+        assert "UNTRUSTWORTHY" in line
+        assert "NVDA" in line
+
+    def test_dedupes_stale_tickers(self):
+        # Two stale legs on the same ticker (e.g. two strikes) should not
+        # render NVDA twice in the stale list.
+        store = self._FakeStore(
+            json_positions=[
+                {"ticker": "NVDA", "type": "call", "expiry": "2026-06-19",
+                 "strike": 600.0, "qty": 1, "avg_cost": 5.0,
+                 "current_price": 5.0, "market_value": 500.0,
+                 "stale_mark": True},
+                {"ticker": "NVDA", "type": "call", "expiry": "2026-06-19",
+                 "strike": 700.0, "qty": 1, "avg_cost": 3.0,
+                 "current_price": 3.0, "market_value": 300.0,
+                 "stale_mark": True},
+            ],
+        )
+        line = reporter._mark_integrity_line(store)
+        # Each ticker shows once. The "stale:" header line should not have
+        # "NVDA, NVDA" — count needles in the stale tail only.
+        stale_seg = line.split("stale: ", 1)[1] if "stale: " in line else ""
+        assert stale_seg.count("NVDA") == 1, (
+            f"expected one NVDA in stale list, got: {stale_seg!r}"
+        )
+
+    def test_falls_back_to_merged_open_positions_when_json_empty(self):
+        # The positions_json snapshot has no stale_mark info (e.g. a fresh
+        # restart before the first mark-to-market write). The helper should
+        # still detect a stale row via open_positions+merge, but
+        # open_positions has no stale_mark column either. Both empty for
+        # stale means the merge path also degrades to no-flags — so the
+        # endpoint silently returns "" (no positions are stale).
+        store = self._FakeStore(
+            json_positions=[
+                {"ticker": "NVDA", "type": "stock", "expiry": None,
+                 "strike": None, "qty": 5, "avg_cost": 100.0,
+                 "current_price": 100.0, "market_value": 500.0},
+            ],
+            open_positions=[
+                {"ticker": "NVDA", "type": "stock", "expiry": None,
+                 "strike": None, "qty": 5, "avg_cost": 100.0,
+                 "current_price": 100.0},
+            ],
+        )
+        # No stale_mark anywhere ⇒ CLEAN ⇒ silent.
+        assert reporter._mark_integrity_line(store) == ""
+
+    def test_builder_fault_degrades_to_empty_not_raise(self, monkeypatch):
+        # A builder/store fault must drop just this one line, never the
+        # whole summary — the reporter additive contract.
+        store = self._FakeStore()
+        from paper_trader.analytics import mark_integrity as _mi
+        monkeypatch.setattr(
+            _mi, "build_mark_integrity",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        assert reporter._mark_integrity_line(store) == ""
+
+    def test_non_dict_builder_result_degrades_to_empty(self, monkeypatch):
+        # If the builder returns something weird (legacy / API drift),
+        # don't crash and don't render a bogus line.
+        store = self._FakeStore()
+        from paper_trader.analytics import mark_integrity as _mi
+        monkeypatch.setattr(_mi, "build_mark_integrity",
+                            lambda *a, **k: "not a dict")
+        assert reporter._mark_integrity_line(store) == ""
+
+
+class TestHourlySummaryMarkIntegrity:
+    """End-to-end wire test: the hourly summary surfaces the MARK
+    INTEGRITY block when at least one position is stale-marked, and
+    suppresses it on a clean book."""
+
+    def _stub_signals(self, monkeypatch):
+        from paper_trader import signals as _signals
+        monkeypatch.setattr(_signals, "get_top_signals",
+                            lambda *a, **k: [])
+        monkeypatch.setattr(_signals, "get_urgent_articles",
+                            lambda *a, **k: [])
+        for fn in ("_source_mix_line", "_idle_opportunity_line",
+                   "_cash_conviction_fit_line", "_earnings_shock_line",
+                   "_position_attention_line"):
+            monkeypatch.setattr(reporter, fn, lambda *a, **k: "")
+
+    def test_hourly_surfaces_mark_integrity_on_stale_book(
+            self, fresh_store, monkeypatch):
+        fresh_store.upsert_position("NVDA", "stock", 5, 100.0)
+        fresh_store.update_portfolio(
+            cash=500.0, total_value=1000.0,
+            positions=[{
+                "ticker": "NVDA", "type": "stock",
+                "expiry": None, "strike": None,
+                "qty": 5, "avg_cost": 100.0, "current_price": 100.0,
+                "unrealized_pl": 0.0, "pl_pct": 0.0,
+                "market_value": 500.0, "stale_mark": True,
+            }],
+        )
+        self._stub_signals(monkeypatch)
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: None)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**MARK INTEGRITY**" in body
+        # Must precede the SESSION block / drawdown analytics block (the
+        # placement rationale: integrity verdict comes BEFORE any P/L
+        # number that depends on those marks).
+        if "**SESSION**" in body:
+            assert body.index("**MARK INTEGRITY**") < body.index("**SESSION**")
+
+    def test_hourly_silent_on_clean_book(self, fresh_store, monkeypatch):
+        fresh_store.upsert_position("MU", "stock", 2, 50.0)
+        fresh_store.update_portfolio(
+            cash=900.0, total_value=1020.0,
+            positions=[{
+                "ticker": "MU", "type": "stock",
+                "expiry": None, "strike": None,
+                "qty": 2, "avg_cost": 50.0, "current_price": 60.0,
+                "unrealized_pl": 20.0, "pl_pct": 20.0,
+                "market_value": 120.0, "stale_mark": False,
+            }],
+        )
+        self._stub_signals(monkeypatch)
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: None)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_hourly_summary() is True
+        # The summary must never become its own lying green light — a
+        # clean book produces no MARK INTEGRITY block.
+        assert "**MARK INTEGRITY**" not in captured[0]
+
+    def test_daily_close_surfaces_mark_integrity(self, fresh_store,
+                                                    monkeypatch):
+        fresh_store.upsert_position("NVDA", "stock", 5, 100.0)
+        fresh_store.update_portfolio(
+            cash=500.0, total_value=1000.0,
+            positions=[{
+                "ticker": "NVDA", "type": "stock",
+                "expiry": None, "strike": None,
+                "qty": 5, "avg_cost": 100.0, "current_price": 100.0,
+                "unrealized_pl": 0.0, "pl_pct": 0.0,
+                "market_value": 500.0, "stale_mark": True,
+            }],
+        )
+        self._stub_signals(monkeypatch)
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: None)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_daily_close() is True
+        assert "**MARK INTEGRITY**" in captured[0]

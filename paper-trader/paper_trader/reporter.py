@@ -2123,6 +2123,100 @@ def _pos_alpha_token(p: dict, equity_asc: list[dict] | None,
     return f"  α {alpha:+.1f}%"
 
 
+def _mark_integrity_line(store) -> str:
+    """One-line "is the displayed book value reliable right now?" for the
+    hourly / daily report — the aggregate complement to the per-position
+    ⚠ STALE annotation in ``_portfolio_lines``.
+
+    ``/api/mark-integrity`` exposes the verdict on the *dashboard* (built
+    from the same ``build_mark_integrity`` SSOT every other surface uses
+    — invariant #10). But the operator lives in Discord and never opens
+    it (the documented dashboard→Discord gap the rest of this file's
+    one-liners close — ``_drawdown_line`` / ``_capital_pulse_line`` /
+    ``_realized_vs_unrealized_line`` precedent). When yfinance returns
+    nothing for one held name, that lot is silently marked at
+    ``avg_cost`` — its P/L reads ``$0.00``, indistinguishable from a
+    genuinely flat position. The per-position ⚠ STALE annotation flags
+    *which* lot is stale, but a trader skimming the hourly with 5
+    positions can miss the inline flag entirely; this surfaces the
+    *aggregate* "X% of your book value is fictional" question alongside
+    the headline P/L so it can't be missed.
+
+    Composes ``build_mark_integrity`` **verbatim** (single source of
+    truth — the headline is the builder's, never re-derived here, so
+    this Discord line and ``/api/mark-integrity`` can never drift). Uses
+    the SAME ``_merge_stale_marks(open_positions, pf["positions"])`` shape
+    the rest of the reporter now uses so the stale flag survives the
+    positions-TABLE round-trip (the Phase-1 fix this feature builds on).
+    Falls back to the positions_json snapshot directly when the merged
+    rows have no ``stale_mark`` flag set anywhere — that snapshot already
+    carries the enriched ``market_value`` + ``stale_mark`` from
+    ``strategy._mark_to_market``, so the aggregate stays accurate even
+    when the open_positions rows lack a current mark.
+
+    **Pure store reads only — NO network** (the Discord-path
+    discipline; the ``_drawdown_line`` precedent). Observational only,
+    never gates, adds no caps (invariants #2/#12). Failure contract
+    mirrors the rest of ``reporter``: any builder/store fault degrades
+    to ``""`` ("no mark-integrity line this report"), **never** an
+    exception ("no Discord summary this report").
+
+    Suppression — surface ONLY ``DEGRADED`` / ``UNTRUSTWORTHY`` (the
+    actionable verdicts where at least one mark is at cost). ``CLEAN``
+    (every mark live) and ``NO_DATA`` (no positions) stay silent — the
+    summary must never become its own lying green light (the
+    ``_drawdown_line`` at-high-water suppression precedent).
+    """
+    try:
+        from .analytics.mark_integrity import build_mark_integrity
+        pf = store.get_portfolio() or {}
+        json_pos = pf.get("positions") or []
+        # Prefer the positions_json snapshot — it already carries the
+        # enriched ``market_value`` + ``stale_mark`` from
+        # ``strategy._mark_to_market``. open_positions() rows lack both
+        # without an explicit merge.
+        if any(isinstance(p, dict) and p.get("stale_mark") for p in json_pos):
+            rows = json_pos
+        else:
+            rows = _merge_stale_marks(store.open_positions(), json_pos)
+        mi = build_mark_integrity(rows)
+        if not isinstance(mi, dict):
+            return ""
+        verdict = mi.get("verdict")
+        if verdict not in ("DEGRADED", "UNTRUSTWORTHY"):
+            return ""
+        headline = mi.get("headline") or ""
+        if not headline:
+            return ""
+        # Tag UNTRUSTWORTHY with the warning emoji on its own line — same
+        # visual weight as _realized_vs_unrealized_line's "⚠️" prefix on the
+        # comparable "your numbers are fictional" surface. DEGRADED uses
+        # the unified ◈ separator like the other observational blocks.
+        tag = "⚠️ " if verdict == "UNTRUSTWORTHY" else ""
+        lines = [f"{tag}**MARK INTEGRITY** ◈ {verdict}", f"> {headline}"]
+        stale_tickers = mi.get("stale_tickers") or []
+        if stale_tickers:
+            # Render the affected tickers so the operator knows WHICH names
+            # are dark without re-reading every position line. Dedupe while
+            # preserving order (a multi-leg ticker may appear twice).
+            seen: set[str] = set()
+            uniq: list[str] = []
+            for tk in stale_tickers:
+                if not isinstance(tk, str):
+                    continue
+                t = tk.upper()
+                if t in seen:
+                    continue
+                seen.add(t)
+                uniq.append(t)
+            if uniq:
+                lines.append(f"> stale: {', '.join(uniq)}")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[reporter] mark-integrity line skipped: {e}")
+        return ""
+
+
 def _merge_stale_marks(open_positions: list[dict],
                        json_positions: list[dict] | None) -> list[dict]:
     """Return ``open_positions`` rows enriched with the ``stale_mark`` flag
@@ -3332,6 +3426,16 @@ def send_hourly_summary() -> bool:
         + "\n".join(trade_lines)
         + "\n```"
     )
+    # MARK INTEGRITY sits right after the position lines and BEFORE every
+    # P/L analytics block (drawdown, benchmark, banked-vs-paper, …). When
+    # the book is partially marked at cost, every downstream P/L number is
+    # quietly fictional — the operator must see the integrity verdict
+    # alongside the headline P/L, not buried after 15 analytics lines.
+    # Silent on CLEAN / NO_DATA (the silence-when-nothing-actionable
+    # precedent).
+    mi = _mark_integrity_line(store)
+    if mi:
+        body += "\n" + mi
     ns = _next_session_line()
     if ns:
         body += "\n" + ns
@@ -3540,6 +3644,14 @@ def send_daily_close() -> bool:
                                        sp500_now=sp)) or "  (none)")
         + "\n```"
     )
+    # MARK INTEGRITY surfaces ≥1 stale-marked position right after the
+    # position lines — same placement as the hourly summary. See
+    # send_hourly_summary for the rationale (must precede every downstream
+    # P/L analytics line so the operator reads the integrity verdict
+    # before any number derived from those marks).
+    mi = _mark_integrity_line(store)
+    if mi:
+        body += "\n" + mi
     lk = _singleton_lock_line()
     if lk:
         body += "\n" + lk
