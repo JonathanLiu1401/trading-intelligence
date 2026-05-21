@@ -12,9 +12,20 @@ import sqlite3
 import threading
 import time
 import zlib
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+
+# Near-duplicate detection at insert time — prevents syndicated copies of the
+# same story from inflating the DB. Pure-Python, no network, no LLM.
+try:
+    from ml.dedup import dedupe_articles as _dedup_articles
+    from ml.dedup import jaccard_similarity as _jaccard_sim
+    from ml.dedup import title_tokens as _title_tokens
+    _DEDUP_AVAILABLE = True
+except ImportError:
+    _DEDUP_AVAILABLE = False
 
 # Module logger — uses central logger if available, falls back to stdlib.
 try:
@@ -466,6 +477,11 @@ class ArticleStore:
         # with check_same_thread=False; concurrent execute+commit pairs would otherwise
         # race on implicit transaction starts ("cannot start a transaction within a transaction").
         self._write_lock = threading.Lock()
+        # Rolling cache of title-token sets for cross-batch near-dedup.
+        # maxlen=500 keeps ~last 10 collection cycles in memory; deque append
+        # is thread-safe for single-item ops, but we only touch it inside _write_lock.
+        self._recent_title_fps: deque = deque(maxlen=500)
+        self._dedup_skipped = 0  # lifetime counter for logging
         self._migrate()
         db = _get_db_path()
         print(f"[store] Using DB at {db} ({db.stat().st_size // 1024}KB)" if db.exists() else f"[store] New DB at {db}")
@@ -584,9 +600,39 @@ class ArticleStore:
     @_retry_on_lock
     def insert_batch(self, articles: list, cycle: int = 0) -> int:
         """Insert new articles; skip duplicates. Returns count of new insertions."""
+        if not articles:
+            return 0
         now = datetime.now(timezone.utc).isoformat()
         inserted = 0
+        skipped_dedup = 0
         with self._write_lock:
+            # ── Near-duplicate collapse ────────────────────────────────────────
+            # 1. Within-batch: dedupe_articles collapses syndicated copies of the
+            #    same story (e.g. same headline from GDELT + RSS + Finnhub arriving
+            #    in the same cycle). Keeps the highest-scored representative.
+            # 2. Cross-batch: check each surviving article's title tokens against
+            #    _recent_title_fps (rolling 500-entry deque of the last few cycles).
+            #    Jaccard >= 0.6 = same story already in DB → skip.
+            if _DEDUP_AVAILABLE:
+                pre = len(articles)
+                articles = _dedup_articles(articles, score_key="_relevance_score")
+                skipped_dedup += pre - len(articles)
+
+                unique: list = []
+                for art in articles:
+                    toks = _title_tokens(art.get("title"))
+                    if toks and any(
+                        _jaccard_sim(toks, cached) >= 0.6
+                        for cached in self._recent_title_fps
+                    ):
+                        skipped_dedup += 1
+                        continue
+                    unique.append(art)
+                    if toks:
+                        self._recent_title_fps.append(frozenset(toks))
+                articles = unique
+
+            # ── DB insertion ───────────────────────────────────────────────────
             for art in articles:
                 url = art.get("link", "")
                 title = art.get("title", "")
@@ -605,6 +651,13 @@ class ArticleStore:
                 if self.conn.execute("SELECT changes()").fetchone()[0]:
                     inserted += 1
             self.conn.commit()
+
+        if skipped_dedup:
+            self._dedup_skipped += skipped_dedup
+            _log.info(
+                f"[insert_batch] near-dedup skipped {skipped_dedup} articles "
+                f"(lifetime total: {self._dedup_skipped})"
+            )
         return inserted
 
     @_retry_on_lock
