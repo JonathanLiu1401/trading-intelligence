@@ -3313,6 +3313,91 @@ def create_app(store=None) -> Flask:
             card_cap=card_cap,
         ))
 
+    @app.get("/api/source-urgency-yield")
+    def api_source_urgency_yield():
+        """Per-source urgent-yield audit — which collectors are signal vs noise.
+
+        For each source in the last ``hours`` window, returns total /
+        urgent / alerted counts plus an operator verdict
+        (``NOISY`` / ``CLEAN`` / ``MIXED`` / ``QUIET`` / ``UNKNOWN``).
+        Operator question: "of my 60+ collectors, which are producing
+        urgent flags that all get suppressed by the alert-side gates
+        before reaching Discord, and which are clean signal worth keeping?"
+
+        Complementary to existing analytics:
+
+        * ``ArticleStore.source_freshness`` — answers "how stale is each
+          source's NEWEST article".
+        * ``ArticleStore.source_throughput`` — answers "which sources are
+          slowing down right now".
+        * ``analytics/publish_lag_audit.py`` — per-source publication
+          latency.
+
+        None of those measures whether a source's *urgent* flags survive
+        the alert-side gates (recap-template, quote-widget, low-authority,
+        cross-cycle dedup, paraphrase). This route does — the
+        ``suppression_rate`` field is precisely "how many urgent rows from
+        this source got gate-dropped before Discord push".
+
+        Query params (clamped):
+          ``hours``       — lookback window, 1..168 (default 24)
+          ``min_samples`` — verdict floor; below this a source returns
+                             ``"UNKNOWN"``, 1..1000 (default 20)
+          ``top_sources`` — display cap on the per-source list, 1..100
+                             (default 15). The aggregate ``totals`` always
+                             reflects every kept article.
+
+        Reads articles.db via the dashboard's ``_ro_query`` short-lived
+        read-only connection (same precedent as
+        ``api_news_arrival_rhythm`` / ``api_score_distribution``). The
+        ``_LIVE_ONLY_CLAUSE`` is applied — backtest-injected rows can
+        never poison the operator panel (invariant #5 preserved).
+
+        Pure builder (``analytics.source_urgency_yield``) handles the
+        verdict policy; this route is the SQL adapter only.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            hours = int(request.args.get("hours", 24))
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(168, hours))
+        try:
+            min_samples = int(request.args.get("min_samples", 20))
+        except (TypeError, ValueError):
+            min_samples = 20
+        min_samples = max(1, min(1000, min_samples))
+        try:
+            top_sources = int(request.args.get("top_sources", 15))
+        except (TypeError, ValueError):
+            top_sources = 15
+        top_sources = max(1, min(100, top_sources))
+
+        from storage.article_store import _LIVE_ONLY_CLAUSE
+        from analytics.source_urgency_yield import build_source_urgency_yield
+
+        cutoff = (datetime.now(timezone.utc) -
+                  timedelta(hours=hours)).isoformat(timespec="seconds")
+        try:
+            rows = _ro_query(
+                f"""SELECT source, urgency, first_seen
+                      FROM articles
+                     WHERE {_LIVE_ONLY_CLAUSE}
+                       AND first_seen >= ?
+                     ORDER BY first_seen DESC
+                     LIMIT 30000""",
+                (cutoff,),
+            )
+        except sqlite3.Error as exc:
+            return jsonify({"error": f"db: {exc!s}"}), 500
+        arts = [{"source": r[0], "urgency": r[1], "first_seen": r[2]}
+                for r in rows]
+        return jsonify(build_source_urgency_yield(
+            arts, hours=hours, min_samples=min_samples,
+            top_sources=top_sources,
+        ))
+
     @app.get("/healthz")
     @app.get("/api/health")
     def healthz():
