@@ -2948,6 +2948,255 @@ class TestDrawdownLine:
         assert "**DRAWDOWN**" not in body
 
 
+class TestRealizedVsUnrealizedLine:
+    """`_realized_vs_unrealized_line` + its hourly/daily wiring — routes the
+    banked-vs-paper P&L split (LEAKING_PAPER / DRAWING_DOWN / PAPER_HEAVY)
+    to Discord. ``/api/realized-vs-unrealized`` made this auditable on the
+    dashboard; the operator lives in Discord, so the same builder's verdict
+    now lands in the surface they actually read. Verdict is the builder's,
+    never re-derived (the single-source-of-truth precedent the
+    ``_concentration_line`` / ``_drawdown_line`` tests already lock).
+    """
+
+    def _stub(self, monkeypatch, payload):
+        """Patch the symbol the reporter line imports (it does a *local*
+        import inside the function body, so we patch the source module —
+        same monkeypatch shape ``TestConcentrationLine`` uses)."""
+        from paper_trader.analytics import realized_vs_unrealized as rvu_mod
+        monkeypatch.setattr(rvu_mod, "build_realized_vs_unrealized",
+                            lambda *a, **k: payload)
+
+    # ── verdict suppression discipline ──────────────────────────────────
+
+    def test_silent_when_banked_verdict(self, fresh_store, monkeypatch):
+        # BANKED is the HEALTHY locked-in state — nothing actionable to say.
+        self._stub(monkeypatch, {
+            "verdict": "BANKED",
+            "headline": "BANKED — 100% of today's $11.95 (+1.20%) gain is "
+                        "locked-in realized.",
+        })
+        assert reporter._realized_vs_unrealized_line(fresh_store) == ""
+
+    def test_silent_when_balanced_verdict(self, fresh_store, monkeypatch):
+        # BALANCED is mid-state noise — silent so the summary doesn't
+        # become its own lying green light.
+        self._stub(monkeypatch, {
+            "verdict": "BALANCED",
+            "headline": "BALANCED — net $+0.10 (+0.01%).",
+        })
+        assert reporter._realized_vs_unrealized_line(fresh_store) == ""
+
+    def test_silent_when_no_data(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, {
+            "verdict": "NO_DATA",
+            "headline": "No equity-curve points yet.",
+        })
+        assert reporter._realized_vs_unrealized_line(fresh_store) == ""
+
+    # ── actionable verdicts ─────────────────────────────────────────────
+
+    def test_surfaces_leaking_paper(self, fresh_store, monkeypatch):
+        # The classic give-back: realized banked, open book undoing it.
+        self._stub(monkeypatch, {
+            "verdict": "LEAKING_PAPER",
+            "headline": "LEAKING_PAPER — realized $25.00 (+2.50%) banked "
+                        "but open book is now $-18.00 (-1.80%) underwater.",
+        })
+        line = reporter._realized_vs_unrealized_line(fresh_store)
+        assert line.startswith("⚠️ **BANKED-vs-PAPER** ◈ LEAKING_PAPER\n")
+        # Verbatim headline (single source of truth, never re-derived).
+        assert "realized $25.00 (+2.50%) banked" in line
+        assert "open book is now $-18.00 (-1.80%) underwater" in line
+
+    def test_surfaces_drawing_down(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, {
+            "verdict": "DRAWING_DOWN",
+            "headline": "DRAWING_DOWN — book down $-30.00 (-3.00%): "
+                        "realized $-10.00 + unrealized $-20.00.",
+        })
+        line = reporter._realized_vs_unrealized_line(fresh_store)
+        assert line.startswith("⚠️ **BANKED-vs-PAPER** ◈ DRAWING_DOWN\n")
+        assert "book down $-30.00" in line
+        assert "realized $-10.00 + unrealized $-20.00" in line
+
+    def test_surfaces_paper_heavy(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, {
+            "verdict": "PAPER_HEAVY",
+            "headline": "PAPER_HEAVY — 80% of today's $50.00 (+5.00%) gain "
+                        "is unrealized paper ($40.00).",
+        })
+        line = reporter._realized_vs_unrealized_line(fresh_store)
+        assert line.startswith("⚠️ **BANKED-vs-PAPER** ◈ PAPER_HEAVY\n")
+        assert "80% of today's $50.00" in line
+        assert "unrealized paper ($40.00)" in line
+
+    # ── defensive ────────────────────────────────────────────────────────
+
+    def test_silent_when_non_dict(self, fresh_store, monkeypatch):
+        # A future builder bug returning None must degrade silently.
+        self._stub(monkeypatch, None)
+        assert reporter._realized_vs_unrealized_line(fresh_store) == ""
+
+    def test_silent_when_headline_empty(self, fresh_store, monkeypatch):
+        # An actionable verdict with no headline cannot render — silent.
+        self._stub(monkeypatch, {
+            "verdict": "LEAKING_PAPER",
+            "headline": "",
+        })
+        assert reporter._realized_vs_unrealized_line(fresh_store) == ""
+
+    def test_silent_when_verdict_missing(self, fresh_store, monkeypatch):
+        self._stub(monkeypatch, {"headline": "lots of text here"})
+        assert reporter._realized_vs_unrealized_line(fresh_store) == ""
+
+    def test_degrades_to_empty_on_builder_fault(self, fresh_store, monkeypatch):
+        from paper_trader.analytics import realized_vs_unrealized as rvu_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("realized-vs-unrealized builder boom")
+
+        monkeypatch.setattr(rvu_mod, "build_realized_vs_unrealized", _boom)
+        # Additive failure contract: fault drops THIS line, never raises.
+        assert reporter._realized_vs_unrealized_line(fresh_store) == ""
+
+    # ── correctness: ensure we feed the builder the right starting value
+    #    and data shape (mirrors the /api/realized-vs-unrealized endpoint).
+    # ────────────────────────────────────────────────────────────────────
+
+    def test_calls_builder_with_initial_equity_starting_value(
+            self, fresh_store, monkeypatch):
+        """The Discord line must pass ``_INITIAL_EQUITY`` (== ``INITIAL_CASH``,
+        invariant #12) as ``starting_value`` so the Discord line and
+        ``/api/realized-vs-unrealized`` agree on the baseline."""
+        from paper_trader.analytics import realized_vs_unrealized as rvu_mod
+        captured: dict = {}
+
+        def _capture(trades, curve, *a, **k):
+            captured["starting_value"] = k.get("starting_value")
+            captured["trades_len"] = len(trades) if trades is not None else None
+            captured["curve_len"] = len(curve) if curve is not None else None
+            return {"verdict": "BANKED", "headline": "banked"}
+
+        monkeypatch.setattr(rvu_mod, "build_realized_vs_unrealized", _capture)
+        # Seed enough state to make the call meaningful.
+        fresh_store.record_trade("NVDA", "BUY", 1.0, 100.0)
+        fresh_store.record_equity_point(1000.0, 900.0, 5000.0)
+        reporter._realized_vs_unrealized_line(fresh_store)
+        # The starting_value baseline must be exactly _INITIAL_EQUITY.
+        assert captured["starting_value"] == reporter._INITIAL_EQUITY
+        # Trades and equity points were passed through.
+        assert captured["trades_len"] == 1
+        assert captured["curve_len"] == 1
+
+    def test_calls_builder_with_oldest_first_trades(
+            self, fresh_store, monkeypatch):
+        """The endpoint reverses ``recent_trades`` into oldest→newest before
+        handing it to the builder. The Discord line must mirror that
+        ordering, otherwise the cost-basis walk would run in reverse."""
+        from paper_trader.analytics import realized_vs_unrealized as rvu_mod
+        captured: dict = {}
+
+        def _capture(trades, curve, *a, **k):
+            captured["actions"] = [t.get("action") for t in trades]
+            return {"verdict": "BANKED", "headline": "banked"}
+
+        monkeypatch.setattr(rvu_mod, "build_realized_vs_unrealized", _capture)
+        # Two trades — oldest BUY, then newer SELL.
+        fresh_store.record_trade("NVDA", "BUY", 1.0, 100.0)
+        fresh_store.record_trade("NVDA", "SELL", 1.0, 110.0)
+        reporter._realized_vs_unrealized_line(fresh_store)
+        # recent_trades returns newest-first (SELL, BUY); the line reverses to
+        # oldest-first (BUY, SELL) before the builder sees it.
+        assert captured["actions"] == ["BUY", "SELL"]
+
+    # ── end-to-end wiring (hourly + daily) ──────────────────────────────
+
+    def test_hourly_summary_surfaces_paper_heavy(self, fresh_store, monkeypatch):
+        from paper_trader import host_guard
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse",
+                            lambda *a, **k: {"state": "CLEAR", "headline": ""})
+        self._stub(monkeypatch, {
+            "verdict": "PAPER_HEAVY",
+            "headline": "PAPER_HEAVY — 80% of today's $50.00 (+5.00%) gain "
+                        "is unrealized paper ($40.00).",
+        })
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**BANKED-vs-PAPER** ◈ PAPER_HEAVY" in body
+        assert "80% of today's $50.00" in body
+        # Pre-existing hourly intact alongside the new block.
+        assert "**HOURLY**" in body and "Equity" in body
+
+    def test_hourly_summary_silent_when_banked(self, fresh_store, monkeypatch):
+        from paper_trader import host_guard
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse",
+                            lambda *a, **k: {"state": "CLEAR", "headline": ""})
+        self._stub(monkeypatch, {
+            "verdict": "BANKED",
+            "headline": "BANKED — 100% locked in.",
+        })
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        # Healthy book → silent — never become a lying green light.
+        assert "**BANKED-vs-PAPER**" not in body
+
+    def test_daily_close_surfaces_drawing_down(self, fresh_store, monkeypatch):
+        from paper_trader import host_guard
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse",
+                            lambda *a, **k: {"state": "CLEAR", "headline": ""})
+        self._stub(monkeypatch, {
+            "verdict": "DRAWING_DOWN",
+            "headline": "DRAWING_DOWN — book down $-30.00 (-3.00%).",
+        })
+        assert reporter.send_daily_close() is True
+        body = captured[0]
+        assert "**DAILY CLOSE**" in body
+        assert "**BANKED-vs-PAPER** ◈ DRAWING_DOWN" in body
+        assert "book down $-30.00" in body
+
+    def test_hourly_still_sends_when_builder_raises(self, fresh_store,
+                                                     monkeypatch):
+        """The whole hourly must still ship if the rvu builder faults — the
+        additive failure contract (a bad block drops one line, never the
+        report). Mirrors TestConcentrationLine's hourly fault test."""
+        from paper_trader import host_guard
+        from paper_trader.analytics import realized_vs_unrealized as rvu_mod
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(host_guard, "pulse",
+                            lambda *a, **k: {"state": "CLEAR", "headline": ""})
+        monkeypatch.setattr(rvu_mod, "build_realized_vs_unrealized",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                RuntimeError("builder boom")))
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        # No banked-vs-paper block, but the summary itself shipped.
+        assert "**BANKED-vs-PAPER**" not in body
+        assert "**HOURLY**" in body and "Equity" in body
+
+
 class TestAgo:
     """`_ago` bucket boundaries — minutes < 1h, hours < 1d, days beyond."""
 
