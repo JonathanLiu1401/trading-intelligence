@@ -17006,3 +17006,121 @@ curl -s http://localhost:8090/api/mark-integrity \
   light. Only `DEGRADED` / `UNTRUSTWORTHY` surface, with the ⚠️
   prefix reserved for the `UNTRUSTWORTHY` (≥50% of gross value at
   cost) case.
+
+## 2026-05-21 — Agent 2 (ML+backtests) review pass
+
+### Phase 1: Debug — 0 bugs fixed
+
+Honest investigation across `paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py`, and `run_continuous_backtests.py` found no
+real bugs to fix. The codebase is exceptionally hardened — almost every
+function carries a multi-line comment explaining a prior bug fix and
+the regression test for it. Phase 1 guard explicitly permits
+`bugs_fixed=0` and "make no commit" when honest effort finds nothing.
+
+### Phase 2: Feature — `paper_trader/ml/scorer_health.py`
+
+A new read-only diagnostic that composes the three existing
+sub-diagnostics into ONE operator-readable verdict:
+
+- `decision_scorer` pickle status (`is_trained`, `n_train`,
+  `gate_active` = `n_train ≥ GATE_THRESHOLD=500`)
+- `gate_realized.analyze` — captured-then-deployed arm-spread
+- `calibration.calibration_report` over `(gate_scorer_pred,
+  forward_return_5d)` pairs — the **historically captured** gate
+  prediction's calibration (no re-prediction with today's pickle,
+  unlike `scorer_calibration_oos`)
+
+Verdict ladder (a verdict higher in this list wins):
+
+1. `UNTRAINED` — pickle absent or load failed (gate dark)
+2. `GATE_INACTIVE` — trained but `n_train < GATE_THRESHOLD`
+3. `INSUFFICIENT_DATA` — fewer than `MIN_OUTCOMES_FOR_VERDICT=30`
+   captured gate decisions on either child
+4. `GATE_HARMFUL` — realized arm allocation INVERTED
+5. `NOISE_GATE_ACTIVE` — gate active but realized `GATE_INEFFECTIVE`
+   OR calibration `MISCALIBRATED`/`WEAK_SIGNAL`
+6. `DIRECTIONAL_BUT_BIASED` — gate effective by rank, magnitude biased
+7. `HEALTHY` — `GATE_EFFECTIVE` + `WELL_CALIBRATED` + gate active
+
+Exit codes mirror `gate_realized._cli`: `2` on actionable
+(`UNTRAINED` / `NOISE_GATE_ACTIVE` / `GATE_HARMFUL`), `0` on
+informational. The exact `_EXIT_NONZERO` set is test-pinned so a
+future tightening can't silently start paging on `GATE_INACTIVE`.
+
+Run:
+
+```
+python3 -m paper_trader.ml.scorer_health           # human-readable
+python3 -m paper_trader.ml.scorer_health --json    # structured
+```
+
+Tests:
+
+```
+python3 -m pytest tests/test_scorer_health.py -v   # 23 green
+```
+
+### Phase 3: Quant-researcher findings against the live system
+
+Reconnaissance commands and findings (read-only, all reproducible):
+
+1. **Continuous backtest loop has been OFF for ~3 days.** Last
+   `continuous.log` mtime `2026-05-18 12:03`; `data/scorer_skill_log.jsonl`,
+   `data/baseline_skill_log.jsonl`, `data/llm_annotation_skill_log.jsonl`,
+   `data/winner_training.jsonl` all MISSING. A skeptical quant relying
+   on the documented per-cycle trend ledgers has nothing to look at.
+2. **DecisionScorer pickle is sub-gate.** `n_train=400`, below the
+   `GATE_THRESHOLD=500` invariant — `_ml_decide` does not modulate any
+   real trade right now. (`scorer_health` verdict: `GATE_INACTIVE`.)
+3. **Historical gate is `GATE_INEFFECTIVE`.** Across all 5165 captured
+   decisions, `tail−head=-0.77pp` (OOS) / `-0.44pp` (all). Strong-headwind
+   arm realized HIGHER (+2.06%) than strong-tailwind arm (+1.62%) —
+   the gate's sizing is essentially noise.
+4. **Historical gate-prediction calibration is `MISCALIBRATED`.**
+   `spearman=+0.047`, `mean_abs_decile_err=4.65pp`. The captured
+   `gate_scorer_pred` carries near-zero predictive content for the
+   realized 5d return. (Matches AGENTS.md long-standing
+   `MLP_WORSE_THAN_TRIVIAL` finding for OOS rank skill.)
+5. **Two stuck `running` backtest rows from 2026-05-18.** `run_id=6238`
+   (76.3h old) and `run_id=6243` (71.9h old). `_reap_orphaned_runs`
+   runs only at continuous-loop startup; since the loop is off, the
+   rows pollute any in-flight view forever.
+6. **The new `_compute_decision_outcomes` fields (persona, regime_label,
+   conviction_pct, wk52_pos, pct_from_52h) are ZERO populated** across
+   all 7413 records. They were added 2026-05-18..21 but the loop
+   hasn't run since. Will start populating only when the loop restarts.
+
+None of these are bugs in the code — they're operational state. But a
+quant researcher relying on this stack to evaluate a strategy needs to
+know that the deployed scorer is currently empirically a noise
+generator AND that the loop that would refresh it is off.
+
+### Test commands for the ML / backtest domain
+
+```
+# Focused (fast — ~10s):
+python3 -m pytest tests/test_decision_scorer.py tests/test_decision_scorer_attribution.py tests/test_scorer_health.py tests/test_scorer_honesty.py tests/test_scorer_smoke_test.py tests/test_calibration.py tests/test_gate_realized.py -q
+
+# Broader ML+backtest slice (~3min):
+python3 -m pytest tests/ -v -k "ml or backtest or scorer" 2>&1 | tail -30
+
+# Live diagnostic verification:
+python3 -m paper_trader.ml.scorer_health           # NEW — composite verdict
+python3 -m paper_trader.ml.gate_realized           # OOS arm spread
+python3 -m paper_trader.ml.calibration             # decile calibration
+```
+
+### Reaffirmed invariants
+
+- **Phase-1 commit guard is honest, not a counter.** Spurious "fix"
+  commits in this hardened codebase are worse than zero — every
+  function has a documented prior bug fix, so a behavioural change
+  without a real bug introduces regression risk under a false-positive
+  guise. The Phase-1 commit guard's "skip commit if no real fix" is
+  the load-bearing discipline that keeps the codebase honest.
+- **Diagnostic composition over reimplementation.** `scorer_health`
+  imports `gate_realized` and `calibration` rather than reimplementing
+  their verdict logic — single source of truth so a threshold change
+  in either child propagates without drift (the AGENTS.md spirit of
+  #10).
