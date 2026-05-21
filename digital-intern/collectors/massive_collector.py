@@ -10,6 +10,7 @@ Skips silently if MASSIVE_API_KEY is unset.
 import hashlib
 import json
 import os
+import random
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -118,8 +119,19 @@ def _fetch_ticker(key: str, ticker: str) -> list:
         print(f"[massive] {ticker} fetch error: {e}")
         return []
     if r.status_code == 429:
-        print(f"[massive] {ticker} rate-limited (429)")
-        return []
+        delay = random.uniform(15.0, 45.0)
+        print(f"[massive] {ticker} rate-limited (429) — backing off {delay:.1f}s")
+        time.sleep(delay)
+        try:
+            r = requests.get(API_URL, params=params, timeout=HTTP_TIMEOUT)
+        except Exception as e:
+            print(f"[massive] {ticker} retry error: {e}")
+            return []
+        if r.status_code == 429:
+            print(f"[massive] {ticker} still rate-limited after backoff — skipping")
+            return []
+        if r.status_code != 200:
+            return []
     if r.status_code != 200:
         return []
     try:
