@@ -100,6 +100,7 @@ from collectors.forex_factory_calendar import collect as collect_forex_factory_c
 from collectors.sec_13f_collector import collect_13f_filings
 from collectors.sec_insider_form4 import collect_sec_form4
 from collectors.nasdaq_halts_collector import collect_nasdaq_halts
+from collectors.fda_collector import collect_fda
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -178,6 +179,7 @@ SEC_13F_INTERVAL        = 1800      # SEC 13F institutional holdings — every 3
 SEC_FORM4_INTERVAL      = 300       # SEC Form 4 insider transactions (portfolio tickers) — every 5min
 USGS_QUAKE_INTERVAL     = 1800    # USGS M≥5 earthquake feed every 30min (insurance/semis/energy catalyst)
 NASDAQ_HALTS_INTERVAL   = 120     # NASDAQ/UTP trading halt+resume feed every 2min
+FDA_INTERVAL            = 1800    # FDA press releases + MedWatch safety alerts — every 30min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
 EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
@@ -228,7 +230,7 @@ ALL_WORKERS = (
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
     "yahoo_ticker_rss", "market_movers", "wikipedia", "macro_calendar", "short_interest",
     "fed_press", "ecb_press", "boj_press", "boe_press", "g10_cb", "global_reg", "whitehouse",
-    "usgs_quake",
+    "usgs_quake", "fda",
     "scorer", "alert", "heartbeat", "purge", "stats",
     "ml_trainer", "continuous_trainer", "recursive_labeler", "price_alert",
     "portfolio_pl", "sentiment_trends", "export", "web_server",
@@ -277,6 +279,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "sec_form4": SEC_FORM4_INTERVAL,
     "usgs_quake": USGS_QUAKE_INTERVAL,
     "nasdaq_halts": NASDAQ_HALTS_INTERVAL,
+    "fda": FDA_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
     "ml_trainer": ML_TRAIN_INTERVAL,
@@ -1587,6 +1590,28 @@ def nasdaq_halts_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(NASDAQ_HALTS_INTERVAL)
+
+
+# ── Worker: FDA press releases + MedWatch safety alerts — every 30min ────────
+def fda_worker(store: ArticleStore):
+    log.info("[fda_worker] started")
+    bo = Backoff("fda", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_fda()
+            _ingest(store, articles, "fda")
+            try:
+                source_health.record_result("fda", len(articles))
+            except Exception as he:
+                log.warning(f"[fda_worker] source_health error: {he}")
+            _worker_last_ok["fda"] = time.time()
+            log.debug(f"[fda] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[fda_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(FDA_INTERVAL)
 
 
 # ── Worker: Global financial regulators — every 30min ────────────────────────
@@ -3116,6 +3141,7 @@ def main():
         ("sec_form4",   sec_form4_worker),
         ("usgs_quake",  usgs_quake_worker),
         ("nasdaq_halts", nasdaq_halts_worker),
+        ("fda",         fda_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
