@@ -104,6 +104,7 @@ from collectors.nasdaq_halts_collector import collect_nasdaq_halts
 from collectors.fda_collector import collect_fda
 from collectors.usaspending_contracts_collector import collect_usaspending_contracts
 from collectors.unusual_volume_collector import collect_unusual_volume
+from collectors.twse_semiconductor import collect_twse_semiconductor
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -162,6 +163,7 @@ POLYMARKET_INTERVAL     = 900     # Polymarket prediction markets every 15min
 RATE_MONITOR_INTERVAL   = 3600    # per-collector silence detector — hourly
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
 COT_INTERVAL            = 6 * 3600  # CFTC COT report — weekly release, check 6-hourly
+TWSE_INTERVAL           = 3600    # Taiwan Stock Exchange semis — hourly (market open 09:00–13:30 TW)
 SHORT_INTEREST_INTERVAL = 21600   # highshortinterest.com every 6h (data updates ~2/month)
 VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
 DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
@@ -1081,6 +1083,28 @@ def fear_greed_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(FEAR_GREED_INTERVAL)
+
+
+# ── Worker: TWSE Semiconductor pre-market tracker — every 1h ────────────────
+def twse_semiconductor_worker(store: ArticleStore):
+    log.info("[twse_semiconductor_worker] started")
+    bo = Backoff("twse_semiconductor", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_twse_semiconductor()
+            _ingest(store, articles, "twse_semiconductor")
+            try:
+                source_health.record_result("twse_semiconductor", len(articles))
+            except Exception as he:
+                log.warning(f"[twse_semiconductor_worker] source_health error: {he}")
+            _worker_last_ok["twse_semiconductor"] = time.time()
+            log.debug(f"[twse_semiconductor] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[twse_semiconductor_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(TWSE_INTERVAL)
 
 
 # ── Worker: Crypto Fear & Greed Index — every 30min ─────────────────────────
@@ -3218,6 +3242,7 @@ def main():
         ("sec_form4",   sec_form4_worker),
         ("usgs_quake",  usgs_quake_worker),
         ("nasdaq_halts", nasdaq_halts_worker),
+        ("twse_semiconductor", twse_semiconductor_worker),
         ("fda",         fda_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
