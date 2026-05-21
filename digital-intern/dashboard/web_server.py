@@ -1236,6 +1236,167 @@ def _regime_leverage_fit_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _realized_vs_unrealized_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/realized-vs-unrealized` (banked-vs-paper
+    P&L split) as compact chat-context lines.
+
+    Every other equity-shape block describes a scalar (portfolio total
+    pnl%, drawdown%, β-attribution). None answers the single composition
+    question that distinguishes a disciplined book from a lucky one:
+    "of today's net P&L, how much is locked-in realized vs paper that
+    can evaporate on the next adverse mark?" A +$50 book that is 100%
+    realized is fundamentally different from the same headline that is
+    100% open-paper, and the chat is where the analyst makes that
+    distinction.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+    the chat headline — no chat-side re-derived verdict (the
+    ``_decision_paralysis_chat_lines`` precedent). Detail line restates
+    the builder's *own* ``realized_pnl_usd`` / ``unrealized_pnl_usd``
+    fields — never a recomputation.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - non-actionable verdicts (``BANKED`` / ``BALANCED`` / ``NO_DATA``)
+      → ``[]``: a healthy split is silence, matching the
+      ``_decision_paralysis_chat_lines`` silence precedent — never chat
+      filler when the desk is in good shape
+    - actionable verdicts (``DRAWING_DOWN`` / ``LEAKING_PAPER`` /
+      ``PAPER_HEAVY``) → builder's verbatim ``headline`` + one detail
+      line composed from the builder's own ``realized_pnl_usd`` /
+      ``unrealized_pnl_usd`` (the ``_macro_calendar_chat_lines``
+      precedent); a missing field degrades silently rather than raises
+      (the ``_paper_trader_position_lines`` precedent)
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"DRAWING_DOWN", "LEAKING_PAPER", "PAPER_HEAVY"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    r_usd = _num(rep.get("realized_pnl_usd"))
+    u_usd = _num(rep.get("unrealized_pnl_usd"))
+    net_pct = _num(rep.get("net_pnl_pct"))
+
+    detail_parts: list[str] = []
+    if r_usd is not None and u_usd is not None:
+        detail_parts.append(
+            f"realized ${r_usd:+,.2f} + unrealized ${u_usd:+,.2f}")
+    if net_pct is not None:
+        detail_parts.append(f"net {net_pct:+.2f}% of starting")
+
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    return lines
+
+
+def _watchlist_coverage_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/watchlist-coverage` (per-watchlist-ticker
+    attention scan over the recent decision stream) as compact chat-context
+    lines.
+
+    The chat carries plenty of *position*-centric and *trade*-centric
+    blocks but nothing names a ticker the bot has stopped attending
+    to. The live WATCHLIST has 48 tickers; if 36 of them have not
+    appeared in 1000 decisions while NVDA absorbs 100+ actions, the
+    analyst should see "STAGNANT — 75% of universe untouched" before
+    the next prompt — that is opportunity cost that no other surface
+    exposes.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+    the chat headline — no chat-side re-derived verdict (the
+    ``_decision_paralysis_chat_lines`` precedent). Detail line restates
+    builder's *own* ``n_never_seen`` / ``n_active_24h`` fields and a
+    sample of the stalest tickers from ``by_ticker`` (verbatim
+    passthrough — the ``_thesis_drift_chat_lines`` drift_reasons
+    precedent).
+
+    Pure / total — same contract as the sibling helpers:
+
+    - non-dict → ``[]``
+    - non-actionable verdicts (``DIVERSIFIED`` / ``NO_DATA``) → ``[]``:
+      healthy coverage breadth is silence
+    - actionable verdicts (``STAGNANT`` / ``CONCENTRATED``) → builder's
+      verbatim ``headline`` (only when usable) + one detail line +
+      (for STAGNANT only) up to ``MAX_STALE_TICKERS_SHOWN`` ticker
+      symbols verbatim from ``by_ticker``'s most-stale entries; missing
+      fields degrade silently rather than raise
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"STAGNANT", "CONCENTRATED"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    n_never = _num(rep.get("n_never_seen"))
+    n_stale = _num(rep.get("n_stale_7d"))
+    n_active = _num(rep.get("n_active_24h"))
+    n_wl = _num(rep.get("n_watchlist"))
+    top3 = _num(rep.get("top_3_share_24h"))
+
+    detail_parts: list[str] = []
+    if (n_never is not None and n_stale is not None
+            and n_active is not None and n_wl is not None and n_wl > 0):
+        detail_parts.append(
+            f"{int(n_never)} never-seen / {int(n_stale)} stale-7d / "
+            f"{int(n_active)} active-24h of {int(n_wl)} watchlist")
+    elif n_wl is not None:
+        detail_parts.append(f"{int(n_wl)}-ticker watchlist")
+    if verdict == "CONCENTRATED" and top3 is not None:
+        detail_parts.append(f"top-3 24h share {top3*100:.0f}%")
+
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    if verdict == "STAGNANT":
+        # Surface a sample of the stalest tickers verbatim — the
+        # analyst's "names you should be looking at" prompt. Capped so
+        # the chat block stays compact.
+        MAX_STALE_TICKERS_SHOWN = 8
+        by_ticker = rep.get("by_ticker")
+        if isinstance(by_ticker, list):
+            sample: list[str] = []
+            for row in by_ticker:
+                if not isinstance(row, dict):
+                    continue
+                if not (row.get("never_seen")
+                        or (isinstance(row.get("hours_since_last_seen"),
+                                       (int, float))
+                            and row["hours_since_last_seen"] > 168.0)):
+                    continue
+                tk = row.get("ticker")
+                if isinstance(tk, str) and tk:
+                    sample.append(tk)
+                    if len(sample) >= MAX_STALE_TICKERS_SHOWN:
+                        break
+            if sample:
+                lines.append("  stale: " + ", ".join(sample))
+
+    return lines
+
+
 def _thesis_drift_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/thesis-drift` (every open position re-tested
     against the verbatim reason it was opened for, graded INTACT / WEAKENING /
@@ -4368,6 +4529,57 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: regime-leverage-fit fetch failed: %s", e)
 
+        # Realized-vs-unrealized P&L split — the "banked vs paper" composition
+        # question. Every other P&L block is a scalar (portfolio total pnl%,
+        # drawdown%, β-attribution); none answers "of today's gain, how much
+        # is locked-in vs paper that can evaporate?". A +$50 book that is
+        # 100% realized is a fundamentally different desk than 100% open
+        # paper. Block fires ONLY on DRAWING_DOWN / LEAKING_PAPER /
+        # PAPER_HEAVY (BANKED / BALANCED / NO_DATA collapse to silence — the
+        # _decision_paralysis_chat_lines silence precedent). Composed
+        # verbatim by the pure _realized_vs_unrealized_chat_lines helper
+        # (unit-tested; SSOT — the builder's own `headline` is the chat
+        # headline, no re-derived verdict). Guarded 3s read; only appears
+        # once :8090 is restarted onto /api/realized-vs-unrealized.
+        realized_vs_unrealized_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/realized-vs-unrealized",
+                    timeout=3) as resp:
+                _rvu = json.loads(resp.read().decode("utf-8"))
+            realized_vs_unrealized_block = "\n".join(
+                _realized_vs_unrealized_chat_lines(_rvu))
+        except Exception as e:
+            _logger().warning(
+                "chat: realized-vs-unrealized fetch failed: %s", e)
+
+        # Watchlist coverage — which WATCHLIST tickers has the bot stopped
+        # attending to? Every other panel is position-centric (what was
+        # traded); none names a ticker that was IGNORED. The live WATCHLIST
+        # has 48 tickers; if 36 are silent across 1000 decisions while NVDA
+        # absorbs 100+ actions, that is opportunity cost the operator never
+        # sees. Block fires ONLY on STAGNANT / CONCENTRATED (DIVERSIFIED /
+        # NO_DATA collapse to silence — the _decision_paralysis_chat_lines
+        # silence precedent). Composed verbatim by the pure
+        # _watchlist_coverage_chat_lines helper (unit-tested; SSOT — the
+        # builder's own `headline` is the chat headline; STAGNANT surfaces
+        # up to 8 stalest ticker symbols verbatim from `by_ticker`). Guarded
+        # 3s read; only appears once :8090 is restarted onto
+        # /api/watchlist-coverage.
+        watchlist_coverage_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/watchlist-coverage",
+                    timeout=3) as resp:
+                _wlc = json.loads(resp.read().decode("utf-8"))
+            watchlist_coverage_block = "\n".join(
+                _watchlist_coverage_chat_lines(_wlc))
+        except Exception as e:
+            _logger().warning(
+                "chat: watchlist-coverage fetch failed: %s", e)
+
         # "What materially changed since you last looked" — the one temporal-
         # change view. Every sub-fetch above is a current-state snapshot; this
         # lets the chat answer "what happened while I was away / since I last
@@ -4558,6 +4770,8 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — CASH REDEPLOYMENT LATENCY (post-SELL cash-to-next-BUY interval distribution — the sold-then-sat pathology. A book that sells then sits for 5 days has the same headline cash% as one that redeploys in 6h, but the desk in question is materially different. Surfaced ONLY when SLOW / STALLED, never filler when FAST_REDEPLOY / STEADY. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{cash_redeployment_block}\n\n" if cash_redeployment_block else "")
             + (f"PAPER TRADER — DECISION VAPOR (per-FILLED-decision structural-quality detector — does the reasoning cite specific numbers + catalysts + tickers, or is Opus writing generic 'strong setup, building position' vapor? A vapor trade that fails has nothing for the next decision to learn from — this is the only block that answers 'is the bot thinking, or rationalising?'. Surfaced ONLY when MIXED / VAPOR_DECISIONS, never filler when SPECIFIC. Headline + any VAPOR sample excerpt carry verbatim from the trader endpoint — restate, never re-derive):\n{decision_vapor_block}\n\n" if decision_vapor_block else "")
             + (f"PAPER TRADER — REGIME-LEVERAGE FIT (book-leverage alignment vs prevailing SPY momentum regime. The watchlist is leveraged-ETF-heavy — the structural question 'are we positioned with or against the regime?' is high-stakes and answered nowhere else in chat. A 0% leveraged book during a bull tape is just as structurally wrong as a 40% leveraged book during a bear. Surfaced ONLY when BLIND_LEVERING / DANGEROUS_HEADWIND / MISSED_TAILWIND, never filler when ALIGNED / DEFENSIVE / NEUTRAL. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{regime_leverage_fit_block}\n\n" if regime_leverage_fit_block else "")
+            + (f"PAPER TRADER — REALIZED vs UNREALIZED P&L SPLIT (the banked-vs-paper composition question — of today's net P&L, how much is locked-in realized vs paper that can evaporate on the next adverse mark? A +$50 book that is 100% realized is fundamentally different from the same headline that is 100% open-paper. Surfaced ONLY when DRAWING_DOWN / LEAKING_PAPER / PAPER_HEAVY, never filler when BANKED / BALANCED. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{realized_vs_unrealized_block}\n\n" if realized_vs_unrealized_block else "")
+            + (f"PAPER TRADER — WATCHLIST COVERAGE (per-watchlist-ticker attention scan over the recent decision stream — which tickers has the bot stopped looking at? Every other panel is position-centric and never names an IGNORED ticker; this is the only block that surfaces opportunity cost from neglected names. Surfaced ONLY when STAGNANT / CONCENTRATED, never filler when DIVERSIFIED. Headline and the stale-ticker sample carry verbatim from the trader endpoint — restate, never re-derive):\n{watchlist_coverage_block}\n\n" if watchlist_coverage_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "
