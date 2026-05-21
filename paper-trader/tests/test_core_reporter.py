@@ -3909,6 +3909,165 @@ class TestNextSessionLine:
         assert "**MARKET** ◈ closed" not in captured[0]
 
 
+class TestSessionCloseCountdownLine:
+    """`_session_close_countdown_line` — the natural complement to
+    ``_next_session_line``. When the market is OPEN, surface the countdown
+    to today's close (16:00 ET regular, 13:00 ET on a half-day). When
+    CLOSED, return ``""`` — the two lines are mutually exclusive."""
+
+    def _utc_from_ny(self, year, month, day, hour, minute):
+        return datetime(year, month, day, hour, minute,
+                        tzinfo=reporter.market.NY).astimezone(timezone.utc)
+
+    def test_market_closed_returns_empty(self):
+        # 2026-05-16 Sat 10:00 ET — _next_session_line carries this case.
+        now = self._utc_from_ny(2026, 5, 16, 10, 0)
+        assert reporter._session_close_countdown_line(now) == ""
+
+    def test_market_open_returns_countdown(self):
+        # 2026-05-14 Thu 10:00 ET — regular session, closes 16:00 ET.
+        # 16:00 - 10:00 = 6h exactly.
+        now = self._utc_from_ny(2026, 5, 14, 10, 0)
+        line = reporter._session_close_countdown_line(now)
+        assert line.startswith("**MARKET** ◈ open — closes at ")
+        assert "16:00 ET" in line
+        # countdown helper renders 6h exact as "in 6h" (no minute term)
+        assert "in 6h" in line
+
+    def test_market_open_near_close_minute_granularity(self):
+        # 2026-05-14 Thu 15:42 ET — 18 minutes to close.
+        now = self._utc_from_ny(2026, 5, 14, 15, 42)
+        line = reporter._session_close_countdown_line(now)
+        # 18 min < 1h, _countdown uses pure-minute bucket.
+        assert "in 18m" in line
+        assert "16:00 ET" in line
+
+    def test_half_day_closes_at_1300_et(self):
+        # 2026-11-27 Fri half-day (day after Thanksgiving) — 13:00 ET close.
+        # Sample mid-session at 12:00 ET → 1 hour to close, header
+        # MUST say 13:00 ET, not 16:00 (the operational legibility
+        # requirement — a trader cannot infer half-day from elapsed time
+        # alone if the line said 16:00).
+        now = self._utc_from_ny(2026, 11, 27, 12, 0)
+        line = reporter._session_close_countdown_line(now)
+        assert "13:00 ET" in line
+        assert "16:00 ET" not in line
+        assert "in 1h" in line
+
+    def test_half_day_at_1255_et_five_minutes_to_close(self):
+        # Half-day at 12:55 ET — exactly 5 minutes to the 13:00 bell.
+        now = self._utc_from_ny(2026, 11, 27, 12, 55)
+        line = reporter._session_close_countdown_line(now)
+        assert "13:00 ET" in line
+        assert "in 5m" in line
+
+    def test_at_open_returns_full_session_countdown(self):
+        # 2026-05-14 Thu 09:30 ET exactly — the moment the bell rings.
+        # is_market_open is True at 09:30 ([09:30, 16:00)), so the line
+        # fires. Full 6h30m session ahead.
+        now = self._utc_from_ny(2026, 5, 14, 9, 30)
+        line = reporter._session_close_countdown_line(now)
+        assert "16:00 ET" in line
+        assert "in 6h 30m" in line
+
+    def test_at_close_minute_returns_empty(self):
+        # 2026-05-14 Thu 16:00 ET exactly — is_market_open is False at
+        # the bell (strict ``<`` upper bound). Neither this line nor
+        # _next_session_line is required to fire AT the bell — but a
+        # bell-minute hourly should not invent a fake "in 0m" countdown.
+        now = self._utc_from_ny(2026, 5, 14, 16, 0)
+        assert reporter._session_close_countdown_line(now) == ""
+
+    def test_holiday_returns_empty(self):
+        # 2026-11-26 Thanksgiving Thu 10:00 ET — full close.
+        now = self._utc_from_ny(2026, 11, 26, 10, 0)
+        assert reporter._session_close_countdown_line(now) == ""
+
+    def test_weekend_returns_empty(self):
+        # 2026-05-17 Sun 11:00 ET.
+        now = self._utc_from_ny(2026, 5, 17, 11, 0)
+        assert reporter._session_close_countdown_line(now) == ""
+
+    def test_complement_invariant_open_vs_closed(self):
+        # The two helpers must be mutually exclusive at any single sample:
+        # exactly one fires (or neither, in the documented atomic bell
+        # transition window). They MUST NOT both fire on the same input.
+        samples = [
+            self._utc_from_ny(2026, 5, 14, 10, 0),    # Thu mid-session
+            self._utc_from_ny(2026, 5, 14, 15, 59),   # 1 min to close
+            self._utc_from_ny(2026, 5, 16, 10, 0),    # Sat closed
+            self._utc_from_ny(2026, 5, 14, 9, 0),     # Pre-open Thu
+            self._utc_from_ny(2026, 11, 27, 12, 0),   # Half-day mid-session
+            self._utc_from_ny(2026, 11, 26, 10, 0),   # Thanksgiving
+        ]
+        for sample in samples:
+            ns = reporter._next_session_line(sample)
+            sc = reporter._session_close_countdown_line(sample)
+            both = bool(ns) and bool(sc)
+            assert not both, (
+                f"complement violated at {sample.isoformat()}: "
+                f"_next_session_line={ns!r}, "
+                f"_session_close_countdown_line={sc!r}"
+            )
+
+    def test_helper_never_raises_on_market_fault(self, monkeypatch):
+        # If market.next_session_close faults, degrade to "" — never
+        # propagate ("no Discord summary"). The additive-fault contract.
+        def _boom(*_a, **_k):
+            raise RuntimeError("clock broken")
+        monkeypatch.setattr(reporter.market, "next_session_close", _boom)
+        monkeypatch.setattr(reporter.market, "is_market_open",
+                            lambda *_a, **_k: True)
+        assert reporter._session_close_countdown_line() == ""
+
+    def test_helper_never_raises_when_seconds_until_close_none(
+            self, monkeypatch):
+        # ``next_session_close`` returns None (defensive 14d cap exhausted)
+        # → helper returns "" rather than crashing on ``None.astimezone``.
+        monkeypatch.setattr(reporter.market, "is_market_open",
+                            lambda *_a, **_k: True)
+        monkeypatch.setattr(reporter.market, "next_session_close",
+                            lambda *_a, **_k: None)
+        assert reporter._session_close_countdown_line() == ""
+
+    def test_wired_into_hourly_summary_when_open(
+        self, fresh_store, monkeypatch
+    ):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(reporter.market, "is_market_open",
+                            lambda *_a, **_k: True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5000.0)
+        # Stub the helper to a deterministic body — we are testing wiring
+        # not the line content itself (the dedicated tests above lock the
+        # content shape).
+        monkeypatch.setattr(
+            reporter, "_session_close_countdown_line",
+            lambda *_a, **_k:
+                "**MARKET** ◈ open — closes at 16:00 ET (in 3h 12m)",
+        )
+        assert reporter.send_hourly_summary() is True
+        assert ("**MARKET** ◈ open — closes at 16:00 ET" in captured[0])
+
+    def test_not_wired_into_hourly_summary_when_closed(
+        self, fresh_store, monkeypatch
+    ):
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        monkeypatch.setattr(reporter.market, "is_market_open",
+                            lambda *_a, **_k: False)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500", lambda: 5000.0)
+        assert reporter.send_hourly_summary() is True
+        # _session_close_countdown_line is silent when CLOSED — the
+        # "open — closes at" header must not appear. (_next_session_line
+        # carries the closed-side message.)
+        assert "open — closes at" not in captured[0]
+
+
 class TestTodaySessionAnchorIso:
     """`_today_session_anchor_iso` — the pure NYSE-calendar anchor that
     `_today_session_line` reads from. Returns None on non-trading days /

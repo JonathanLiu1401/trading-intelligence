@@ -2832,6 +2832,75 @@ def _next_session_line(now: datetime | None = None) -> str:
         return ""
 
 
+def _session_close_countdown_line(now: datetime | None = None) -> str:
+    """One-line "session closes in Xh Ym ET" for the hourly summary — the
+    natural complement to ``_next_session_line``.
+
+    ``_next_session_line`` fires when the market is *closed*; this fires
+    when the market is *open*. Together they give the operator a consistent
+    "when is the next state transition?" cue on every hourly report,
+    whichever side of the bell they happen to be reading on.
+
+    Why this matters for a live trader:
+      * **Sizing decisions near the bell.** A 10-minute-to-close hourly
+        check is materially different from a 3-hour-to-close one. The
+        first should bias toward NOT opening new directional exposure
+        (EOD pinning / liquidity / no follow-through window); the
+        second is a normal session window. The trader can already infer
+        this from the wall clock, but a hourly summary read on a phone
+        out-of-office may not.
+      * **Half-day awareness.** On NYSE early-close half-days
+        (NYSE_HALF_DAYS_2026 — day after Thanksgiving, Christmas Eve)
+        the bell rings at 13:00 ET, not 16:00. A trader who only checks
+        a 12:00 ET hourly on a half-day would otherwise assume the
+        standard 4h-to-close. This line names the *actual* close, not
+        the conventional one, so a half-day is operationally legible.
+
+    Composes ``market.next_session_close`` + ``market.seconds_until_close``
+    **verbatim** (single source of truth — the NYSE calendar lives in
+    market.py, the close minute resolution and the half-day handling are
+    its responsibility). The clamping inside ``seconds_until_close`` (max
+    0) keeps this line non-negative under a wall-clock step-back (the
+    documented clock-skew hazard the runner-state sidecar already
+    hardens against).
+
+    Pure: zero I/O, never raises by construction. Suppression mirrors
+    ``_next_session_line``'s complement contract — emit nothing when the
+    market is closed (let ``_next_session_line`` carry the message on
+    that side; never duplicate). Both can be silent in the tiny window
+    *at* the bell where ``next_session_close`` is in the past but
+    ``next_session_open`` is in the future — the same atomic transition
+    moment ``_next_session_line`` is silent through; this preserves that
+    invariant rather than racing it.
+
+    Same additive failure contract as the rest of ``reporter``: any
+    fault degrades to ``""`` ("no session-close countdown this report"),
+    **never** an exception ("no Discord summary this report"). ``now``
+    is injectable for deterministic tests (the ``_next_session_line``
+    precedent).
+    """
+    try:
+        n = now or datetime.now(timezone.utc)
+        if not market.is_market_open(n):
+            return ""
+        close_dt = market.next_session_close(n)
+        if close_dt is None:
+            return ""
+        secs = market.seconds_until_close(n)
+        if secs is None:
+            return ""
+        close_ny = close_dt.astimezone(market.NY)
+        # 16:00 ET on a regular day, 13:00 ET on a half-day — render the
+        # actual bell so a half-day reads "closes at 13:00 ET" and the
+        # operator can never mistake it for the conventional 16:00.
+        when = close_ny.strftime("%H:%M ET")
+        return (f"**MARKET** ◈ open — closes at {when} "
+                f"({_countdown(secs)})")
+    except Exception as e:
+        print(f"[reporter] session-close countdown line skipped: {e}")
+        return ""
+
+
 def _today_session_anchor_iso(now: datetime | None = None) -> str | None:
     """ISO UTC timestamp of today's NYSE session open (09:30 ET) as a string,
     or ``None`` when today is not a trading day or the session has not yet
@@ -3000,6 +3069,12 @@ def send_hourly_summary() -> bool:
     ns = _next_session_line()
     if ns:
         body += "\n" + ns
+    # Complement to _next_session_line: when market is OPEN, surface the
+    # countdown to today's close (16:00 ET regular, 13:00 ET on a half-day).
+    # The two lines are mutually exclusive — at most one fires per report.
+    sc = _session_close_countdown_line()
+    if sc:
+        body += "\n" + sc
     lk = _singleton_lock_line()
     if lk:
         body += "\n" + lk
