@@ -13012,3 +13012,155 @@ Inspected `/api/healthz`, `/api/portfolio`, `/api/runner-heartbeat`,
 storm from 5 parallel Opus is *expected* under multi-agent reviews and
 correctly recorded as `skipped claude call`, 0.56% off peak, MRVL earnings
 in 5.89d on watchlist).
+
+## 2026-05-20 ML/backtest hybrid pass (Agent 2) — Broadcom-dead-mapping fix + dead_sector_audit diagnostic + stale-loop quant audit
+
+### Phase 1 — fix (commit `15f6d92`)
+
+Dead `_WORD_TO_TICKER` entry caught by a single-pass watchlist-coverage
+scan: `"broadcom" → "AVGO"` had been silently dropped on every
+Broadcom-headline call to `_ml_decide` because AVGO is NOT in
+`WATCHLIST`, and the function's `if tk not in WATCHLIST: continue`
+guard filters every extracted ticker not on the live list. Every other
+of the 85 keyword mappings is now confirmed in-WATCHLIST by a generic
+regression test that would fail RED on any future dead entry. Redirect
+the keyword to **SOXL** (3x semis ETF, already in WATCHLIST) so
+Broadcom news contributes to the same semi tracker as the existing
+`"semiconductor" / "chip"` mappings.
+
+Tests added (`tests/test_backtest.py::TestWordToTickerWatchlistCoverage`,
+4 new):
+* `test_no_dead_word_to_ticker_mappings` — generic regression guard.
+* `test_broadcom_maps_to_soxl_not_dead_avgo` — pin the specific redirect.
+* `test_pattern_compiled_for_every_mapping_key` — 1:1 contract between
+  `_WORD_TO_TICKER` and `_WORD_TO_TICKER_PATTERNS`.
+* `test_broadcom_headline_attributes_to_soxl` — end-to-end through
+  `_ml_decide` with a synthetic price + portfolio.
+
+### Phase 2 — feature (commit `8ee94b6`)
+
+`paper_trader/ml/dead_sector_audit.py` — cross-references per-sector
+record counts in `decision_outcomes.jsonl` against the deployed
+scorer's per-sector first-layer weight share. The 40+ existing ML
+diagnostics include `feature_importance` (per-feature importance, but
+cannot distinguish "no data" from "model failure") and
+`feature_coverage` (default-frequency, misleading for sectors — every
+non-majority sector is at zero ~90% by construction). **Neither tool
+answers the gate-relevant question for the operator: "do I have
+sectors that carry real outcome mass yet contribute nothing to
+predictions?"** This module fills the gap with one CLI call:
+
+```bash
+python3 -m paper_trader.ml.dead_sector_audit
+```
+
+Per-sector verdict (each threshold-driven):
+
+| Verdict | Trigger |
+|---|---|
+| `DEAD_FEATURE` | `n_outcomes >= MIN_RECORDS=30` AND `importance_share < MIN_IMPORTANCE_SHARE=0.005` (THE ALERT) |
+| `SPARSE_DATA`  | `n_outcomes < MIN_RECORDS` (expected near-zero importance) |
+| `HEALTHY`      | otherwise |
+
+Overall verdict: `INSUFFICIENT_DATA` / `HAS_DEAD_SECTORS` / `HEALTHY`.
+The audit surfaces `corpus_growth_ratio = n_outcomes_total /
+scorer.n_train` so the operator can distinguish "retrain will fix it"
+(≥2×) from "data-pipeline issue" (≈1.0). Read-only — no train, no
+pickle write, no trade-path touch. Exit codes match host_guard /
+decision_scorer (0=HEALTHY, 1=INSUFFICIENT_DATA, 2=HAS_DEAD_SECTORS).
+
+Live read on production `decision_scorer.pkl` (n_train=400) and
+`decision_outcomes.jsonl` (7413 records):
+
+```
+verdict=HAS_DEAD_SECTORS  n_outcomes=7413  n_train_in_pickle=400  corpus_growth_ratio=18.53×
+  sector          n_outcomes     share  verdict
+  energy                 117     0.00%  DEAD_FEATURE
+  crypto                 626     0.00%  DEAD_FEATURE
+  healthcare            1043     5.93%  HEALTHY
+  tech                  4793     5.48%  HEALTHY
+  financials             613     4.09%  HEALTHY
+  commodities              5     4.11%  SPARSE_DATA
+  hint: 2 dead sector(s): energy,crypto. corpus_growth_ratio=18.53×
+        — retrain will almost certainly fix it.
+```
+
+The deployed scorer is structurally mute on energy and crypto despite
+626 crypto records (mostly MSTR) and 117 energy records existing in
+the training pool. A retrain via the continuous loop would resolve it
+— corpus_growth_ratio=18.5× shows the pickle predates the bulk of the
+corpus.
+
+Tests added (`tests/test_dead_sector_audit.py`, 27 new):
+* `TestClassifySector` (3) — verdict boundaries.
+* `TestPerSectorCounts` (5) — record→sector counting, None/missing
+  ticker, unknown ticker → "other", empty-input zero counts.
+* `TestReport` (12) — composition: insufficient-data, healthy,
+  dead+sparse boundaries, growth ratio computation, retrain-hint
+  threshold, sort order (dead first), malformed input safety.
+* `TestAnalyze` (3) — missing file, empty file, corrupt JSON.
+* `TestCli` (4) — exit codes 0/1/2, `--json` round-trip.
+
+### Phase 3 — live validation findings (quant researcher perspective)
+
+Inspected scorer pickle, outcomes file, backtest DB, continuous.log,
+calibration and baseline_compare on production data.
+
+1. **Continuous loop is DEAD** since 2026-05-18 12:03 (~2.5 days).
+   No `continuous_backtests.py` process running. The whole ML
+   pipeline (cycle-driven retraining, outcome accumulation,
+   ArticleNet injection) is stalled. The last log entry shows run
+   #6243 mid-cycle at step 1311/2516 of a 10-year window —
+   probably killed by OOM or manual stop while battling GDELT
+   rate-limits.
+2. **2 orphaned `running` backtest rows** stuck since 2026-05-18:
+   #6238 (5-yr window) and #6243 (10-yr window mid-step). The
+   `_reap_orphaned_runs` helper is loop-coupled — it only fires from
+   `main()`. With the loop down it never runs, so the dashboard
+   shows these as in-flight indefinitely (CLAUDE.md §11 documents
+   this exact symptom class).
+3. **Dead sectors in deployed scorer** — confirmed by the new
+   `dead_sector_audit`: sector_energy and sector_crypto have 0.0
+   first-layer weight share despite carrying 117 and 626 outcomes
+   respectively. The model is structurally mute on those sectors
+   right now. Retrain (corpus_growth_ratio=18.5×) would resolve.
+4. **`scorer_skill_log.jsonl` does not exist** on disk. The per-cycle
+   ledger has never been populated, so `scorer_freshness` heartbeat
+   is uncomputable. Either the loop was never restarted after the
+   ledger was added, or the file was manually deleted. Either way,
+   one of the documented liveness watchdogs has nothing to read.
+5. **Production scorer n_train=400 < gate threshold 500** →
+   conviction gate INACTIVE in production. `_ml_decide` runs but
+   does NOT modulate conviction on any BUY. All sizing currently
+   relies on quant signals + persona boosts alone. Per CLAUDE.md
+   invariant #5 this is the correct behaviour below the threshold
+   — but a fresh retrain on the 7413-row corpus would re-arm it.
+6. **Calibration / OOS-skill divergence** —
+   `python3 -m paper_trader.ml.calibration` reports `MISCALIBRATED`
+   (spearman 0.0157, decile-mean realized flat at +0.1..+1.4% across
+   all 10 deciles) on the full sample. Simultaneously
+   `python3 -m paper_trader.ml.baseline_compare` reports
+   `MLP_ADDS_SKILL` (OOS rank_ic +0.225, beats best baseline
+   `rsi_meanrev` +0.079 by +0.145). The scorer has directional rank
+   skill OOS but its prediction MAGNITUDES don't track realized
+   outcomes — the decile bucket boundaries are saturated to
+   ±PRED_CLAMP_PCT=50 while realized means cluster near 0. A quant
+   should size by direction only, not magnitude, until the
+   magnitude calibration improves (the planned retrain may help).
+7. **GDELT instability is the root cause of the loop death.**
+   continuous.log tail shows hundreds of `[gdelt] rate-limited` and
+   `ConnectionError` retries, each backing off 20-60s. With 2516
+   trading days × multiple keyword groups per 10-yr window, that's
+   thousands of GDELT calls — the process spent most of its time in
+   retry sleeps before being killed. The disk-cache + per-(date,
+   keyword) negative-cache work, but cold-cache cycles are
+   compute-starved. Operationally: starting the loop on cold cache
+   requires patience and possibly capping window length.
+
+### Counters
+
+`bugs_fixed=1` (broadcom→AVGO dead mapping → SOXL redirect + 4 tests)
+· `features_added=1` (dead_sector_audit + 27 tests)
+· `user_findings=7` (loop dead, orphaned rows, dead sectors,
+no skill ledger, gate inactive, calibration/OOS divergence, GDELT
+instability)
