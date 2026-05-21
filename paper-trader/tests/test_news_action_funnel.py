@@ -668,7 +668,13 @@ class TestTopArticle:
 @pytest.fixture
 def seeded_articles_db(tmp_path) -> Path:
     """Hand-craft a tiny articles.db with one IGNORED row and one synthetic
-    backtest row that MUST be filtered by the SQL-side live-only clause."""
+    backtest row that MUST be filtered by the SQL-side live-only clause.
+
+    Timestamps anchor on real ``datetime.now(timezone.utc)`` — the endpoint
+    uses real wall-clock for its window cutoff, so a fixed-NOW anchor here
+    would silently bit-rot the moment the test was older than 24h. The
+    relative offsets (1h/3h/5h ago) are what the test asserts on; the
+    absolute anchor doesn't matter."""
     db = tmp_path / "articles.db"
     conn = sqlite3.connect(str(db))
     conn.execute(
@@ -689,24 +695,25 @@ def seeded_articles_db(tmp_path) -> Path:
         );
         """
     )
+    real_now = datetime.now(timezone.utc)
     rows = [
         ("a1", "https://x/1", "MU on its way to 800 — BofA target raise",
          "rss", 9.0, 0,
-         (NOW - timedelta(hours=1)).isoformat(timespec="seconds")),
+         (real_now - timedelta(hours=1)).isoformat(timespec="seconds")),
         ("a2", "https://x/2", "MU strong demand sustained",
          "rss", 8.0, 0,
-         (NOW - timedelta(hours=3)).isoformat(timespec="seconds")),
+         (real_now - timedelta(hours=3)).isoformat(timespec="seconds")),
         ("a3", "https://x/3", "MU upgrade analyst",
          "rss", 7.0, 0,
-         (NOW - timedelta(hours=5)).isoformat(timespec="seconds")),
+         (real_now - timedelta(hours=5)).isoformat(timespec="seconds")),
         # Synthetic backtest row — SQL live-only filter MUST drop it.
         ("a4", "backtest://run_1/MU", "MU backtest winner annotation",
          "backtest_run_1_winner", 10.0, 0,
-         (NOW - timedelta(hours=1)).isoformat(timespec="seconds")),
+         (real_now - timedelta(hours=1)).isoformat(timespec="seconds")),
         # Old article outside the window — dropped by cutoff.
         ("a5", "https://x/5", "MU ancient news",
          "rss", 9.0, 0,
-         (NOW - timedelta(hours=48)).isoformat(timespec="seconds")),
+         (real_now - timedelta(hours=48)).isoformat(timespec="seconds")),
     ]
     conn.executemany(
         "INSERT INTO articles (id,url,title,source,ai_score,urgency,first_seen) "
@@ -829,7 +836,10 @@ class TestNewsActionFunnelEndpoint:
         dash, store = _bootstrap_dashboard_app(
             tmp_path, monkeypatch, seeded_db=seeded_articles_db,
         )
-        ts = (NOW - timedelta(hours=1)).isoformat(timespec="seconds")
+        # Anchor on real now for the same reason the fixture does — the
+        # endpoint uses real wall-clock for the window cutoff.
+        ts = (datetime.now(timezone.utc)
+              - timedelta(hours=1)).isoformat(timespec="seconds")
         store.conn.execute(
             "INSERT INTO decisions (timestamp, market_open, signal_count, "
             "action_taken, reasoning, portfolio_value, cash) "
@@ -853,7 +863,9 @@ class TestNewsActionFunnelEndpoint:
         dash, store = _bootstrap_dashboard_app(
             tmp_path, monkeypatch, seeded_db=seeded_articles_db,
         )
-        ts = (NOW - timedelta(hours=1)).isoformat(timespec="seconds")
+        # Anchor on real now (endpoint uses real wall-clock for the window).
+        ts = (datetime.now(timezone.utc)
+              - timedelta(hours=1)).isoformat(timespec="seconds")
         store.conn.execute(
             "INSERT INTO decisions (timestamp, market_open, signal_count, "
             "action_taken, reasoning, portfolio_value, cash) "
