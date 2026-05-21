@@ -6,6 +6,159 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 paper-trader-core HYBRID pass (Agent 1, ~14:45 UTC) — `_realized_vs_unrealized_line` Discord surface
+
+### Phase 1 — fix (no commit)
+
+Audited the seven core files (`runner.py`, `reporter.py`, `signals.py`,
+`strategy.py`, `dashboard.py`, `market.py`, `store.py`). The prior
+2026-05-21 Agent 1 pass already noted "this code path is exhaustively
+reviewed" with `bugs_fixed=0`; that remains true. Re-checked the
+load-bearing edges (`_cycle` consecutive-NO_DECISION counter + host-
+saturation interaction, `_realized_pl_window` exit_ts bounds, the new
+`_cash_conviction_fit_line` builder shape, `_decompress` zlib guard,
+`_extract_tickers` cashtag/alias asymmetry, `closed_positions`
+round-trip walker, `_option_expired` NY-tz close gate, `_parse_decision`
+fence-strip + raw_decode walk, and `_db_path`'s `_choose` vs.
+`_legacy_choice` split-brain logic). Every targeted area checked clean —
+no commit warranted. **The honest call (the documented "don't pad with
+whitespace renames" discipline) — bugs_fixed=0.**
+
+### Phase 2 — feature (commit `046ce38`)
+
+**`paper_trader/reporter.py::_realized_vs_unrealized_line()`** — Discord
+surface for the banked-vs-paper P&L split (LEAKING_PAPER / DRAWING_DOWN
+/ PAPER_HEAVY).
+
+`build_realized_vs_unrealized` + `/api/realized-vs-unrealized` (commit
+`f55d1b7`) answer the question every other equity / P&L surface dodges:
+*of today's net P&L, how much is locked-in vs evaporable paper?* A $13
+net gain that is 100% realized is a fundamentally different desk than
+the same headline gain that is 100% open-book paper — the second is one
+adverse mark from zero. But the operator lives in Discord and never
+opens the dashboard panel — the exact dashboard→Discord gap
+`_benchmark_line` / `_drawdown_line` / `_cash_conviction_fit_line` each
+closed, one dimension over: vs-index, then vs-own-peak, then cash-vs-
+signal, now banked-vs-paper.
+
+Composes `build_realized_vs_unrealized` **verbatim** (single source of
+truth, invariant #10 — the headline / verdict are the builder's, never
+re-derived here). Feeds it the EXACT same store reads
+`/api/realized-vs-unrealized` does (`recent_trades(5000)` reversed into
+oldest→newest + `equity_curve(limit=2000)`) and the same `_INITIAL_EQUITY`
+(== `INITIAL_CASH`, invariant #12) so the Discord line and the endpoint
+are byte-aligned.
+
+**Pure store reads only — NO network** (the Discord-path discipline;
+adds zero latency — the `_drawdown_line` / `_cash_conviction_fit_line`
+precedent). Observational only, never gates, no caps (invariants #2/#12).
+
+**Suppression** — surface ONLY the three actionable verdicts:
+
+  * `LEAKING_PAPER` — realized banked but open book undoing the gain
+    (classic give-back; ordered first inside the builder so the more
+    diagnostic reading wins on a give-back)
+  * `DRAWING_DOWN` — net P&L below `-DD_PCT` of starting (the catch-all
+    bleed; verbatim builder headline covers the realized/unrealized
+    split)
+  * `PAPER_HEAVY` — net positive but ≥66% is unrealized paper (one bad
+    mark and the headline evaporates)
+
+`BANKED` (the HEALTHY locked-in state), `BALANCED` (mid-state noise) and
+`NO_DATA` (empty / nothing to say) all stay silent — the summary must
+never become its own lying green light (the `_drawdown_line`
+at-high-water suppression precedent).
+
+Wired into `send_hourly_summary` and `send_daily_close` **right after
+`_drawdown_line`** — both are P&L-shape surfaces with independent
+silence (DRAWDOWN suppresses at-high-water, BANKED-vs-PAPER suppresses
+on BANKED/BALANCED/NO_DATA; neither suppresses the other).
+
+**Tests**: 16 new tests under
+`tests/test_core_reporter.py::TestRealizedVsUnrealizedLine` covering:
+
+  * verdict-matrix branches (BANKED / BALANCED / NO_DATA suppressed;
+    LEAKING_PAPER / DRAWING_DOWN / PAPER_HEAVY surfaced verbatim)
+  * defensive degradation (non-dict result / empty headline / missing
+    verdict / builder raise → empty, never an exception — the additive
+    failure contract)
+  * correctness contract (starting_value == `_INITIAL_EQUITY`,
+    trades passed oldest→newest matching the endpoint reversal)
+  * end-to-end hourly/daily wiring (PAPER_HEAVY appears, BANKED stays
+    silent, DRAWING_DOWN on daily close, hourly still ships when builder
+    raises)
+
+All 16 new tests pass. 388/388 reporter+realized_vs_unrealized tests pass;
+622/622 across the audited core files pass — no regression.
+
+### Phase 3 — live validation (read-only findings)
+
+Used the system as a live trader at ~14:45 UTC. Findings:
+
+1. **CRITICAL: ACTIVE IDLE_STORM (20/20 NO_DECISION).**
+   `/api/runner-heartbeat` reports `restart_recommended: true`,
+   `decision_efficacy.verdict: IDLE_STORM` (last 20 cycles ALL
+   NO_DECISION, 100% of the last 20). Last decision 27 minutes ago,
+   within the 30m market-open cadence — the loop IS cycling, but the
+   engine is not deciding. `_heartbeat_line` correctly surfaces this to
+   Discord via the existing path.
+
+2. **HOST SATURATED is the documented root cause** — `/api/host-guard`
+   reports `state: SATURATED`, **8 concurrent Opus subprocesses (>4
+   cap)**, swap_used 96%, mem_available 4.2GB, load1=7.8 / load_per_cpu
+   0.49. **45% of the last 120 decisions never reached Opus.**
+   `_host_pulse_line` correctly identifies this as an OPS issue (kill
+   review/backtest agents) — a restart will NOT fix it. The IDLE_STORM
+   the heartbeat surfaces is downstream of host saturation.
+
+3. **NVDA concentration RAMPING_UP** — `/api/concentration-trajectory`
+   verdict `RAMPING_UP`, NVDA climbed 60.2% → 100.0% over 3 days. The
+   book is now 100% one name (single position $658.89 of deployed
+   capital). `/api/risk` reads `concentration_severity: HIGH`,
+   `concentration_top1_pct: 66.24` (against total_value including cash).
+   The two surfaces report on different denominators (`top1_pct` 100%
+   is share of *deployed*, 66.24% is share of *total* equity) — both
+   correct, not in conflict.
+
+4. **BANKED-vs-PAPER currently BANKED** — `/api/realized-vs-unrealized`
+   reads `verdict: BANKED`, "86% of today's $13.94 (+1.39%) gain is
+   locked-in realized ($11.95). Open book sits $+2.00." My new Discord
+   line correctly stays SILENT on this state — but if a future BUY marks
+   up enough to flip the unrealized share above 66%, the line fires
+   PAPER_HEAVY automatically. Verified live: the endpoint is responsive
+   (<200ms), matches the on-disk builder, and my reporter wrapper
+   composes it verbatim.
+
+5. **STAGNANT watchlist coverage** — `/api/watchlist-coverage` confirms
+   36+ watchlist tickers never seen in 7d+. The desk is hyper-focused on
+   NVDA and ignoring the universe. Resolves only on actual book
+   diversification — observational only, no action needed by reporter.
+
+6. **Build stale (`behind=1`)** — `/api/build-info` reports
+   `boot_sha: ed0d494`, `head_sha: 046ce38` (my Phase-2 commit),
+   `stale: true`. The git-watcher will request a deferred restart at the
+   next 3-min poll boundary; force-exit safety net (`RESTART_GRACE_S=600`)
+   kicks in if the main loop is wedged past that window. Working as
+   documented.
+
+7. **Singleton-lock restart spam** — `logs/runner.log` shows repeated
+   "another paper trader is already running (pid=693946)" — matches the
+   `pt-systemd-vs-manual-restart-spam` memory note. The lock guard is
+   doing its job (only one trader runs); the launcher is bouncing off it
+   indefinitely. Historical pattern, not new.
+
+8. **Discord delivery HEALTHY** — `notify.last_ok_ts 14:05:21Z`, zero
+   consecutive failures. The channel is alive; my new line will land
+   once the next hourly fires (the runner currently late on it because
+   `_last_hourly` advances only on successful send).
+
+**Counters**: bugs_fixed=0, features_added=1, user_findings=8.
+
+**Staged paths:** `paper_trader/reporter.py`,
+`tests/test_core_reporter.py`, `AGENTS.md`. No `git add -A`.
+
+---
+
 ## 2026-05-21 feature-dev pass (Agent 4 #3) — `/api/concentration-trajectory` (the missing slope view)
 
 **features_added: 1.** New `paper_trader/analytics/concentration_trajectory.py`
