@@ -980,6 +980,80 @@ def _drawdown_line(store) -> str:
         return ""
 
 
+def _realized_vs_unrealized_line(store) -> str:
+    """One-line "is today's gain locked-in or one bad mark from zero?" for
+    the hourly / daily report.
+
+    ``/api/realized-vs-unrealized`` (commit ``f55d1b7``) made the
+    banked-vs-paper P&L split auditable on the *dashboard* — but the
+    operator lives in Discord and never opens it (the exact
+    dashboard→Discord gap ``_benchmark_line`` / ``_drawdown_line`` /
+    ``_cash_conviction_fit_line`` each closed, one dimension over: vs-
+    index, then vs-own-peak, then cash-vs-signal, now banked-vs-paper —
+    the classic give-back / paper-heavy / leak surfaces a discretionary
+    desk reads alongside absolute P&L). Live evidence (2026-05-21 NVDA
+    earnings-night round-trip, $1011.95 book): the desk is BANKED and the
+    line stays silent; the moment a fresh BUY marks up into PAPER_HEAVY
+    territory this surface fires automatically.
+
+    Composes ``build_realized_vs_unrealized`` **verbatim** (single source
+    of truth, AGENTS.md invariant #10 — the headline is the builder's,
+    never re-derived here, so this Discord line and
+    ``/api/realized-vs-unrealized`` can never disagree). Feeds it the
+    EXACT same store reads the endpoint does
+    (``recent_trades(5000)`` reversed into oldest→newest +
+    ``equity_curve(limit=2000)``) and the same ``_INITIAL_EQUITY``
+    (== ``INITIAL_CASH``, invariant #12) so the Discord line and the
+    endpoint are byte-aligned. **Pure store reads only — NO network**
+    (the Discord-path discipline; adds zero latency). Observational
+    only, never gates, adds no caps (invariants #2/#12 — the
+    ``_drawdown_line`` precedent). Failure contract mirrors the rest of
+    ``reporter``: any builder/store fault degrades to ``""`` ("no
+    banked-vs-paper line this report"), **never** an exception ("no
+    Discord summary this report").
+
+    Suppression — surface ONLY actionable verdicts. The verdict ladder
+    in ``realized_vs_unrealized`` is most-specific-first, so the same
+    silence discipline applies (the summary must never become its own
+    lying green light — the ``_drawdown_line`` at-high-water suppression
+    precedent):
+
+      * ``LEAKING_PAPER`` — realized banked but open book undoing the
+        banked gain (classic give-back) → ⚠️ fires.
+      * ``DRAWING_DOWN`` — net P&L below ``-DD_PCT`` of starting →
+        ⚠️ fires (catch-all; verbatim builder text covers the split).
+      * ``PAPER_HEAVY`` — net positive but ≥66% is unrealized paper →
+        ⚠️ fires (one bad mark and the headline evaporates).
+      * ``BANKED`` / ``BALANCED`` / ``NO_DATA`` → silent (locked-in /
+        neutral / nothing to say — never become a lying green light).
+    """
+    try:
+        from .analytics.realized_vs_unrealized import (
+            build_realized_vs_unrealized,
+        )
+        # Same store-read shape as ``/api/realized-vs-unrealized``
+        # (dashboard.realized_vs_unrealized_api) — reversed into
+        # oldest→newest because that endpoint and the builder both want it.
+        trades = list(reversed(store.recent_trades(5000)))
+        curve = store.equity_curve(limit=2000)
+        rvu = build_realized_vs_unrealized(
+            trades, curve, starting_value=_INITIAL_EQUITY,
+        )
+        if not isinstance(rvu, dict):
+            return ""
+        verdict = rvu.get("verdict")
+        if verdict not in ("LEAKING_PAPER", "DRAWING_DOWN", "PAPER_HEAVY"):
+            return ""
+        headline = rvu.get("headline") or ""
+        if not headline:
+            return ""
+        return (f"⚠️ **BANKED-vs-PAPER** ◈ {verdict}\n"
+                f"> {headline}")
+    except Exception as e:
+        print(f"[reporter] realized-vs-unrealized line skipped: {e}")
+        return ""
+
+
 def _hold_discipline_line(store) -> str:
     """One-line "am I sitting on a loser past my own cut-time?" for the
     daily close.
@@ -3242,6 +3316,16 @@ def send_hourly_summary() -> bool:
     dd = _drawdown_line(store)
     if dd:
         body += "\n" + dd
+    # BANKED-vs-PAPER sits right AFTER DRAWDOWN — both are P&L-shape
+    # surfaces. DRAWDOWN says "how deep is the hole vs your own high".
+    # BANKED-vs-PAPER says "of today's net P&L, how much is locked-in
+    # vs evaporable paper" — the orthogonal give-back / paper-heavy / leak
+    # diagnostic. Both can be silent independently (DRAWDOWN suppresses on
+    # at-high-water; this one suppresses on BANKED/BALANCED/NO_DATA);
+    # neither suppresses the other.
+    rvu = _realized_vs_unrealized_line(store)
+    if rvu:
+        body += "\n" + rvu
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx
@@ -3421,6 +3505,12 @@ def send_daily_close() -> bool:
     dd = _drawdown_line(store)
     if dd:
         body += "\n" + dd
+    # BANKED-vs-PAPER follows DRAWDOWN on daily close too — see
+    # send_hourly_summary for the placement rationale (peak-to-trough then
+    # banked-vs-paper, both P&L-shape surfaces with independent silence).
+    rvu = _realized_vs_unrealized_line(store)
+    if rvu:
+        body += "\n" + rvu
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx
