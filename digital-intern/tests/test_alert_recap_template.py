@@ -335,6 +335,47 @@ class TestHelperCatchesLiveNoise:
             assert hit, f"missed why-is-pct-since recap: {t!r}"
             assert name == "why_is_pct_since"
 
+    def test_why_x_stock_is_after_earnings_recap(self):
+        """Live evidence (2026-05-21 NVDA earnings night, articles.db
+        urgency=2 set): "Why Nvidia Stock Is Barely Moving After Earnings
+        Crushed Expectations" fired a real 🚨 BREAKING push TWICE
+        (10:37:16Z from `GN: Nvidia`/Barron's + 10:50:41Z from `GN: AI
+        stocks`/MSN syndication). The cross-cycle dedup caught the third
+        copy at 10:59:00Z but the analyst had already received two
+        pushes. score_source='ml' on both — the urgency head over-scored
+        the SEO post-event explainer template; the existing four "Why X
+        Stock ..." recap variants all use a different phrasing and none
+        catches the present-tense `Stock Is <state-verb> After <event>`
+        shape.
+
+        Pin each live failure-case title PLUS plausible same-template
+        siblings (other verbs / adverbs / recap-nouns from the closed
+        verb list) so a future regex tightening that re-admits any of
+        them fails this suite. The "after" + earnings-noun terminator
+        is the retrospective anchor — without it ("Why X stock is
+        moving") the regex fails by design (must-survive corpus)."""
+        for t in (
+            # Live failure cases — exact titles that fired.
+            "Why Nvidia Stock Is Barely Moving After Earnings Crushed Expectations - Barron's",
+            "Why Nvidia stock is barely moving after earnings crushed expectations - MSN",
+            "Why Nvidia Stock Is Barely Moving After Earnings Crushed Expectations",
+            # Same template, other adverbs / tickers / verbs / recap-nouns.
+            "Why NVDA Stock Is Down 3% After Q1 Earnings",
+            "Why Tesla Stock Is Up After Earnings Beat",
+            "Why Lumentum Stock Is Falling After Q2 Results",
+            "Why MU Stock Is Surging After Earnings Beat",
+            "Why AMD Stock Is Still Higher After Their Latest Report",
+            "Why Intel Stock Is Now Trading Lower After Q3 Guidance",
+            "Why Oracle Stock Is Just Soaring After Earnings",
+            "Why Cisco Stock Is Currently Down After Q4 Results",
+            # No adverb, simple state.
+            "Why NVDA Stock Is Climbing After Earnings",
+            "Why MU Stock Is Sliding After Q3",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed why-stock-is-after recap: {t!r}"
+            assert name == "why_stock_is_after"
+
 
 # ── _looks_like_recap_template: real breaking headlines MUST survive ───────
 
@@ -531,6 +572,46 @@ class TestHelperPreservesRealBreaking:
             hit, _ = alert_agent._looks_like_recap_template({"title": t})
             assert not hit, (
                 f"false-positive on partial why-is-pct-since signature: {t!r}"
+            )
+
+    def test_why_stock_is_after_does_not_catch_forward_or_real_news(self):
+        """The why_stock_is_after pattern requires the QUAD of leading
+        ``^Why\\s+...\\s+Stock\\s+Is`` + (adverb)? + present-state action verb
+        from a CLOSED list + ``\\bafter\\b`` + recap-noun terminator. A real
+        forward-looking headline that uses a SUBSET (just "Why X stock is",
+        "Stock Could Rise after earnings", "Stock Is the Best Buy" with no
+        state verb, "Why X is up" with no "Stock") must NOT match. Pins the
+        discriminator against the must-survive corpus so the analyst's real
+        breaking news survives this gate."""
+        for t in (
+            # Missing "Stock" — question form about company not stock.
+            "Why investors are bullish on Nvidia ahead of earnings",
+            "Why NVDA is the best AI play",
+            "Why Nvidia is winning the AI race",
+            # Question form "Why is X stock" (not "Why X stock is") — real ongoing question.
+            "Why is Tesla stock falling?",
+            "Why is MU stock down today?",
+            # No "after" + earnings-noun — forward-looking / present-tense.
+            "Why Nvidia stock is moving today",
+            "Why MU stock is up",
+            "Why AMD stock is breaking out",
+            # Verb is "could/may/might" — future-tense, not a present state.
+            "Why Microsoft Stock Could Rise After Earnings",
+            "Why MU stock may climb after Q3 results",
+            "Why Tesla stock might tumble after Q4 report",
+            # "after" present but action verb is non-action / not in the list.
+            "Why Nvidia Stock Is the Best Buy After Q1",
+            "Why AMD Stock Is a Buy After Earnings",
+            "Why Tesla Stock Is Worth Watching After Q3",
+            # "after" present but non-earnings context — out of scope.
+            "Why Nvidia Stock Is Surging After the Fed Cut",
+            "Why MU Stock Is Falling After the China News",
+            "Why Tesla Stock Is Climbing After the Crash",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert not hit, (
+                f"false-positive on why-stock-is-after pattern: {t!r} "
+                f"(name={name})"
             )
 
     def test_why_just_moved_does_not_catch_forward_looking(self):
@@ -767,6 +848,33 @@ class TestSendUrgentAlertIntegration:
         mock_claude.assert_not_called()
         mock_send.assert_not_called()
         assert spy.marked == ["wiP"]
+
+    def test_new_why_stock_is_after_pattern_end_to_end(self, monkeypatch):
+        """End-to-end pin for the new why_stock_is_after fingerprint: the live
+        failure-case title from 2026-05-21 NVDA-earnings-night articles.db
+        urgency=2 set must (a) be suppressed without a Discord push, (b) be
+        marked alerted so it exits the urgent queue. Falsifies the live
+        evidence: a regression here means the analyst will see "Why X Stock
+        Is Barely Moving After Earnings" fire BREAKING twice (Barron's +
+        MSN syndication) on the next earnings night, as it did on
+        2026-05-21 (10:37:16Z + 10:50:41Z)."""
+        spy = _StoreSpy()
+        row = _row(
+            _id="wSI",
+            title="Why Nvidia Stock Is Barely Moving After Earnings Crushed Expectations - Barron's",
+            source="GN: Nvidia",
+        )
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call") as mock_claude, \
+             patch("notifier.discord_notifier.send") as mock_send:
+            ok = alert_agent.send_urgent_alert([row], spy)
+        assert ok is False
+        mock_claude.assert_not_called()
+        mock_send.assert_not_called()
+        assert spy.marked == ["wSI"], (
+            "why_stock_is_after recap not marked alerted — would re-fetch "
+            "every 20s and fire BREAKING on next batch"
+        )
 
     def test_new_patterns_pre_floor_via_urgency_scorer_ssot(self):
         """Both new patterns are SSOT-shared with `watchers.urgency_scorer`
