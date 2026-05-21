@@ -295,6 +295,257 @@ class TestWindowFiltering:
 # ── Anti-drift: live-only clause stays in sync with storage layer ───────────
 
 
+# ── Per-source breakdown (analyst-facing: WHICH feeds dominate the noise?) ──
+
+
+class TestAuditBySource:
+    """``audit_by_source`` answers the next question after ``audit()``: of
+    the recap rows ingested, which sources produce most of them? Live
+    evidence (2026-05-21 24h scan): 425 recap rows / 41 sources, with
+    the top four producing 53% of the total — the per-source view turns
+    that into a pruneable list. Pins the contract so a regression in the
+    builder (counting, fingerprint attribution, sort order, leak split,
+    backtest isolation, window enforcement, top_n cap) fails loudly."""
+
+    def test_empty_store_yields_empty_list_and_ok(self, store):
+        report = recap_template_audit.audit_by_source(store)
+        assert report["window_h"] == 24
+        assert report["by_source"] == []
+        assert report["total_recap_rows"] == 0
+        assert report["total_sources"] == 0
+        assert report["ok"] is True
+
+    def test_single_source_single_fingerprint(self, store):
+        _insert(
+            store, id="a",
+            title="Micron (MU) Q3 2026 Earnings Call Highlights",
+            source="Motley Fool", ai_score=4.0, score_source="llm",
+            urgency=0,
+        )
+        report = recap_template_audit.audit_by_source(store)
+        assert report["total_recap_rows"] == 1
+        assert report["total_sources"] == 1
+        assert len(report["by_source"]) == 1
+        row = report["by_source"][0]
+        assert row["source"] == "Motley Fool"
+        assert row["recap_count"] == 1
+        assert row["by_fingerprint"] == {"earnings_call_recap": 1}
+        assert row["top_fingerprint"] == "earnings_call_recap"
+        assert row["leaked_urgent"] == 0
+        assert row["leaked_strong_pool"] == 0
+
+    def test_sort_order_recap_count_desc_then_source_asc(self, store):
+        """Ranking discipline (mirrors source_urgency_yield): most-recap-
+        first, alphabetical tie-break. Pinned so a future builder change
+        cannot silently re-order the analyst's pruning list."""
+        # 3 recap rows from "GN: earnings", 2 from "Motley Fool",
+        # 1 each from "Aaa" and "Zzz" (tied — Aaa must rank first).
+        for i in range(3):
+            _insert(
+                store, id=f"gn{i}",
+                title=f"NVDA Q3 2026 Earnings Call Highlights {i} extra",
+                source="GN: earnings", ai_score=0.01, score_source="llm",
+            )
+        for i in range(2):
+            _insert(
+                store, id=f"mf{i}",
+                title=f"AMD Q1 2027 Earnings Call Highlights {i} extra",
+                source="Motley Fool", ai_score=0.01, score_source="llm",
+            )
+        _insert(
+            store, id="aaa",
+            title="MU Q3 2026 Earnings Call Highlights",
+            source="Aaa", ai_score=0.01, score_source="llm",
+        )
+        _insert(
+            store, id="zzz",
+            title="TSM Q2 2026 Earnings Call Highlights",
+            source="Zzz", ai_score=0.01, score_source="llm",
+        )
+        report = recap_template_audit.audit_by_source(store)
+        ordering = [(r["source"], r["recap_count"]) for r in report["by_source"]]
+        assert ordering == [
+            ("GN: earnings", 3),
+            ("Motley Fool", 2),
+            ("Aaa", 1),     # alphabetical tie-break wins over "Zzz"
+            ("Zzz", 1),
+        ]
+
+    def test_mixed_fingerprints_per_source_top_fingerprint_correct(self, store):
+        """A single source with a mix of fingerprints — ``top_fingerprint``
+        must be the highest-count one (alpha tie-break). Pins the
+        per-source counter math: each fingerprint counted exactly once
+        per row, first-wins (matches audit() precedent)."""
+        rows = [
+            ("a", "Why Did Micron Stock Drop Today", "why_did_stock"),
+            ("b", "Why Did Nvidia Stock Surge Today", "why_did_stock"),
+            ("c", "Why Did AMD Stock Plunge Today", "why_did_stock"),
+            ("d", "Stock Market Today, May 18: Micron Falls",
+             "market_today_dated"),
+            ("e", "Stock Market Today, May 19: Nvidia Climbs",
+             "market_today_dated"),
+        ]
+        for id, t, _ in rows:
+            _insert(
+                store, id=id, title=t, source="Motley Fool",
+                ai_score=0.01, score_source="llm",
+            )
+        report = recap_template_audit.audit_by_source(store)
+        assert len(report["by_source"]) == 1
+        row = report["by_source"][0]
+        assert row["recap_count"] == 5
+        assert row["by_fingerprint"] == {
+            "why_did_stock": 3,
+            "market_today_dated": 2,
+        }
+        assert row["top_fingerprint"] == "why_did_stock"
+
+    def test_leaked_urgent_and_strong_pool_per_source(self, store):
+        """The per-source view must surface the same two regression
+        signals ``audit()`` does, but attributed: which source produced
+        the gate failure. Real-world action item — drop the offending
+        feed or harden its credibility tier."""
+        # A clean recap (floored to noise) — counts in recap_count but
+        # NOT in either leak metric.
+        _insert(
+            store, id="ok1",
+            title="MU Q3 2026 Earnings Call Highlights",
+            source="Seeking Alpha Editors", ai_score=0.01,
+            score_source="llm", urgency=0,
+        )
+        # An ml-urgent recap (alert-gate failure, NOT strong-pool leak).
+        _insert(
+            store, id="ml_urg",
+            title="Why Did NVDA Stock Surge Today",
+            source="Motley Fool", ai_score=0.0, ml_score=9.0,
+            score_source="ml", urgency=1,
+        )
+        # A strong-pool leak (Sonnet tagged urgent — the worst case).
+        _insert(
+            store, id="poison",
+            title="Lumentum (LITE) Shares Fall -- GF Value Says X",
+            source="GoogleNews/GuruFocus", ai_score=8.0,
+            score_source="llm", urgency=2,
+        )
+        report = recap_template_audit.audit_by_source(store)
+        # Three sources, three recap rows total. ok=False because of poison.
+        assert report["total_recap_rows"] == 3
+        assert report["total_sources"] == 3
+        assert report["ok"] is False
+        by_src = {r["source"]: r for r in report["by_source"]}
+        assert by_src["Seeking Alpha Editors"]["leaked_urgent"] == 0
+        assert by_src["Seeking Alpha Editors"]["leaked_strong_pool"] == 0
+        assert by_src["Motley Fool"]["leaked_urgent"] == 1
+        assert by_src["Motley Fool"]["leaked_strong_pool"] == 0
+        assert by_src["GoogleNews/GuruFocus"]["leaked_urgent"] == 1
+        assert by_src["GoogleNews/GuruFocus"]["leaked_strong_pool"] == 1
+
+    def test_backtest_rows_excluded_from_per_source_view(self, store):
+        """The per-source builder shares the same ``_LIVE_ONLY_CLAUSE`` as
+        ``audit()``: a synthetic backtest/opus row whose title matches a
+        recap pattern must NEVER appear in the per-source list — a
+        contaminated source row would mislead an analyst into pruning
+        a legit feed."""
+        # Live recap row — must count.
+        _insert(
+            store, id="live",
+            title="Why Did MU Stock Surge Today",
+            source="Motley Fool", ai_score=0.01, score_source="llm",
+        )
+        # Three synthetic recap rows — must NOT appear in by_source.
+        _insert(
+            store, id="bt1",
+            url="backtest://run_1/2026-01-01/BUY/MU",
+            title="Why Did MU Stock Surge Today",
+            source="backtest_run_1_winner",
+            ai_score=8.0, score_source=None,
+        )
+        _insert(
+            store, id="bt2", url="https://x.com/bt2",
+            title="Stock Market Today, May 19: Micron Falls",
+            source="backtest_run_42_rank1",
+            ai_score=8.0, score_source=None,
+        )
+        _insert(
+            store, id="op", url="https://x.com/op",
+            title="Why Nvidia Stock Is Trading Up Today",
+            source="opus_annotation_cycle_3",
+            ai_score=8.0, score_source=None,
+        )
+        report = recap_template_audit.audit_by_source(store)
+        sources = [r["source"] for r in report["by_source"]]
+        # Only the live row's source is present; backtest/opus tags must
+        # NEVER appear in the analyst-facing pruning list.
+        assert sources == ["Motley Fool"]
+        for tag in ("backtest_run_1_winner", "backtest_run_42_rank1",
+                    "opus_annotation_cycle_3"):
+            assert tag not in sources
+        assert report["total_recap_rows"] == 1
+
+    def test_top_n_caps_list_but_total_counts_everything(self, store):
+        """``top_n`` is a display cap on ``by_source``; the aggregate totals
+        (``total_recap_rows`` / ``total_sources``) still reflect every kept
+        row so a dashboard rendering only the top-N never under-states the
+        scale of the noise."""
+        # 5 distinct sources, 1 recap row each.
+        for i, src in enumerate(["A", "B", "C", "D", "E"]):
+            _insert(
+                store, id=f"r{i}",
+                title=f"Stock Market Today, May {18+i}: filler row text",
+                source=src, ai_score=0.01, score_source="llm",
+            )
+        report = recap_template_audit.audit_by_source(store, top_n=2)
+        assert len(report["by_source"]) == 2
+        assert report["total_recap_rows"] == 5
+        assert report["total_sources"] == 5
+
+    def test_window_filtering_excludes_old_rows(self, store):
+        """A recap row older than ``hours`` must NOT appear in the per-
+        source breakdown — same window discipline as ``audit()``."""
+        old_seen = (
+            datetime.now(timezone.utc) - timedelta(hours=48)
+        ).isoformat()
+        _insert(
+            store, id="old",
+            title="Why Did Nvidia Stock Surge Today",
+            source="Motley Fool", ai_score=0.01, score_source="llm",
+            first_seen=old_seen,
+        )
+        recent_seen = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        _insert(
+            store, id="new",
+            title="Why Did AMD Stock Plunge Today",
+            source="Yahoo Finance", ai_score=0.01, score_source="llm",
+            first_seen=recent_seen,
+        )
+        report = recap_template_audit.audit_by_source(store, hours=24)
+        sources = [r["source"] for r in report["by_source"]]
+        assert sources == ["Yahoo Finance"]
+        assert report["total_recap_rows"] == 1
+
+    def test_non_recap_rows_do_not_create_source_entries(self, store):
+        """A source with NO recap rows must NOT appear in the per-source
+        list — the analyst-facing view is recap-noise-only. Pin this so
+        a future refactor doesn't silently start emitting one row per
+        live source (which would bury the actual offenders)."""
+        _insert(
+            store, id="clean",
+            title="NVDA reports Q1 revenue $81.6B beating estimates",
+            source="reuters", ai_score=9.0, score_source="llm", urgency=2,
+        )
+        _insert(
+            store, id="recap1",
+            title="Why Did NVDA Stock Surge Today",
+            source="Motley Fool", ai_score=0.01, score_source="llm",
+        )
+        report = recap_template_audit.audit_by_source(store)
+        sources = [r["source"] for r in report["by_source"]]
+        assert sources == ["Motley Fool"]
+        assert "reuters" not in sources
+
+
 def test_live_only_clause_in_sync_with_storage():
     """The audit duplicates ``_LIVE_ONLY_CLAUSE`` as a string constant to
     avoid pulling the writable ArticleStore graph. The two MUST stay

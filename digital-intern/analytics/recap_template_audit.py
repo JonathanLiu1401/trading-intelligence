@@ -93,6 +93,138 @@ def _count_recap_matches(
     return counts
 
 
+def audit_by_source(
+    store,
+    hours: int = 24,
+    top_n: int = 15,
+    now: Optional[datetime] = None,
+) -> dict:
+    """Per-source recap-template hit breakdown over the last ``hours``.
+
+    The aggregate ``audit()`` answers "is the recap gate still working in
+    aggregate?". A news analyst pruning low-signal sources needs the next
+    question: WHICH SOURCES generate the bulk of recap noise? Live evidence
+    (2026-05-21 24h scan): 425 recap rows across 41 sources, but the top
+    four — ``GN: earnings`` (101), ``Motley Fool`` (44), ``Nasdaq Markets``
+    (42), ``Seeking Alpha Editors`` (41) — produce 53% of the total.
+    Knowing this lets the analyst (or future credibility-tuning pass) target
+    the actual offenders instead of guessing.
+
+    Returns::
+
+        {
+            "window_h": int,
+            "by_source": [
+                {
+                    "source": str,
+                    "recap_count": int,           # total recap hits from this source
+                    "by_fingerprint": {name: count, ...},  # non-zero fingerprints only
+                    "top_fingerprint": str,
+                    "leaked_urgent": int,         # urgency>=1 recap rows from this source
+                    "leaked_strong_pool": int,    # llm-tagged ai_score>=8 recap rows
+                },
+                ...  # most-recap-first; capped at top_n
+            ],
+            "total_recap_rows": int,
+            "total_sources": int,
+            "ok": bool,  # True iff zero strong-pool leaks across all sources
+        }
+
+    Pure read-side over the indexed first_seen window. ``_LIVE_ONLY_CLAUSE``
+    is applied, so synthetic backtest/opus rows are excluded from both the
+    numerator and denominator — a future invariant violation elsewhere
+    cannot leak a backtest source into this calibration view.
+    """
+    conn = store.conn
+    now = now or datetime.now(timezone.utc)
+    since = (now - timedelta(hours=hours)).isoformat()
+
+    rows = conn.execute(
+        "SELECT source, title, urgency, score_source, ai_score "
+        "FROM articles "
+        f"WHERE first_seen >= ? AND {LIVE_ONLY_CLAUSE}",
+        (since,),
+    ).fetchall()
+
+    # per-source aggregates
+    per_source: dict[str, dict] = {}
+    total_recap = 0
+    for source, title, urgency, score_source, ai_score in rows:
+        if not title:
+            continue
+        hit_name: Optional[str] = None
+        for name, pat in _RECAP_TEMPLATE_PATTERNS:
+            if pat.search(title):
+                hit_name = name
+                break
+        if hit_name is None:
+            continue
+        total_recap += 1
+        bucket = per_source.setdefault(
+            source or "",
+            {"recap_count": 0, "by_fingerprint": {},
+             "leaked_urgent": 0, "leaked_strong_pool": 0},
+        )
+        bucket["recap_count"] += 1
+        bucket["by_fingerprint"][hit_name] = (
+            bucket["by_fingerprint"].get(hit_name, 0) + 1
+        )
+        try:
+            urg_int = int(urgency or 0)
+        except (TypeError, ValueError):
+            urg_int = 0
+        if urg_int >= 1:
+            bucket["leaked_urgent"] += 1
+        try:
+            ai_val = float(ai_score or 0.0)
+        except (TypeError, ValueError):
+            ai_val = 0.0
+        # The exact "strong-pool poisoning" predicate from audit() —
+        # score_source='llm' AND ai_score>=8. Mirrored verbatim so a
+        # source-level metric drift is impossible.
+        if (score_source == "llm") and ai_val >= 8.0:
+            bucket["leaked_strong_pool"] += 1
+
+    # Materialise sorted view; top_fingerprint is the highest-count one
+    # for the source (deterministic alphabetical tie-break for snapshot
+    # tests that pin a multi-fingerprint source).
+    materialised: list[dict] = []
+    for source, b in per_source.items():
+        fps = b["by_fingerprint"]
+        if fps:
+            top_fp = sorted(
+                fps.items(), key=lambda kv: (-kv[1], kv[0])
+            )[0][0]
+        else:
+            top_fp = ""
+        materialised.append({
+            "source": source,
+            "recap_count": b["recap_count"],
+            "by_fingerprint": dict(fps),
+            "top_fingerprint": top_fp,
+            "leaked_urgent": b["leaked_urgent"],
+            "leaked_strong_pool": b["leaked_strong_pool"],
+        })
+
+    # Sort by recap_count desc; ties broken alphabetically by source so
+    # the order is reproducible across runs (mirrors source_urgency_yield).
+    materialised.sort(
+        key=lambda r: (-r["recap_count"], r["source"])
+    )
+
+    total_strong_leaks = sum(
+        r["leaked_strong_pool"] for r in materialised
+    )
+
+    return {
+        "window_h": int(hours),
+        "by_source": materialised[: max(int(top_n), 0)],
+        "total_recap_rows": total_recap,
+        "total_sources": len(materialised),
+        "ok": total_strong_leaks == 0,
+    }
+
+
 def audit(store, hours: int = 24, now: Optional[datetime] = None) -> dict:
     """Calibration report for the recap-template gate over the last ``hours``.
 
@@ -178,13 +310,28 @@ def main(argv: Optional[list] = None) -> int:
         "--hours", type=int, default=24,
         help="Window size in hours (default: 24)",
     )
+    parser.add_argument(
+        "--by-source", action="store_true",
+        help="Emit the per-source recap breakdown (which feeds dominate the noise) "
+             "instead of the aggregate gate-calibration view.",
+    )
+    parser.add_argument(
+        "--top-n", type=int, default=15,
+        help="When --by-source is set, cap the per-source list at this many "
+             "rows (default: 15).",
+    )
     args = parser.parse_args(argv)
 
     from storage.article_store import _get_db_path
 
     store = _RoStore(_get_db_path())
     try:
-        report = audit(store, hours=args.hours)
+        if args.by_source:
+            report = audit_by_source(
+                store, hours=args.hours, top_n=args.top_n,
+            )
+        else:
+            report = audit(store, hours=args.hours)
     finally:
         store.close()
     print(format_report(report))
