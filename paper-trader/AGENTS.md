@@ -6,6 +6,204 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 ML+backtest HYBRID pass #4 (Agent 2) — sizing_pnl_skill (conviction × realized $-PnL attribution)
+
+**Phase 1 — bugs_fixed: 0 (honest zero).** Audited `decision_scorer.py`,
+`backtest.py::_ml_decide`, `run_continuous_backtests.py` end to end.
+The leveraged-ETF cap candidate ("Cap is 40%" comment then scorer
+tailwind pushes conviction to 0.40×1.3=0.52, silently violating the
+documented cap) IS a real arithmetic over-cap, but
+`tests/test_ml_backtest_review.py::TestMlDecideScorerGate::
+test_strong_tailwind_scales_1_3` (line 287) explicitly pins the
+post-modulation expansion as the intended design — it expects
+qty=162.5 corresponding to conviction=0.25×1.3=0.325 (above the 0.25
+base cap). With a passing test pinning the current behavior as a
+deliberate modulate-past-cap sizing rule (a Kelly-style edge-driven
+upsize), this is not a fix candidate — would require an explicit
+design decision to change semantics, outside the scope of a debugging
+pass. Code path is exhaustively covered by recent passes
+(pass #3 PriceCache atomic-write, pass #2 outcome regex word-boundary,
+pass #1 outcomes regex, the bubble_gate audit, the consensus_skill
+landing) — the "don't pad with whitespace" discipline applies.
+
+**Phase 2 — features_added: 1.** New
+`paper_trader/ml/sizing_pnl_skill.py` — sizing realized-PnL attribution
+per conviction bucket. The diagnostic shelf already has
+`conviction_calibration` (rank skill of conviction vs realized return,
+per-trade) and `gate_pnl` (×0.6..×1.3 multiplier overlay's
+portfolio-level impact). Neither answers the actual book attribution
+question a quant running a real book asks: *of the dollars the
+strategy made (or lost), which conviction buckets contributed them?*
+
+The portfolio's realized PnL per cycle is
+`Σ conviction_pct_i × forward_return_5d_i` (since `conviction_pct` IS
+the fraction of book sized into trade *i*). Decomposing by conviction
+bucket gives per-trade dollar contribution = `mean(conviction_pct ×
+forward_return_5d)` over rows in the bucket (pp of book per trade) and
+aggregate share = bucket-sum-of-products / total-sum-of-products. These
+two numbers tell a skeptical quant whether the gate is making its money
+on the rare high-conviction calls (good — concentrate edge) or bleeding
+it on them (the documented latent danger: a leveraged-ETF cap of 0.40
+means one bad high-conviction call can dominate the cycle).
+
+**Why a separate verdict from `conviction_calibration`.** That
+sibling correctly verdicts on bucket-monotonicity of
+`mean(forward_return_5d)`. But rank skill and dollar skill diverge: a
+high-conv bucket realizing 5%/trade contributes 10× the dollars of a
+low-conv bucket realizing 8%/trade (0.40×5=2.0 vs 0.05×8=0.4). The
+book question is the dollar one; this module is its dedicated answer.
+
+Verdict ladder (test-locked, exact-value):
+
+| Verdict | Trigger |
+|---|---|
+| `INSUFFICIENT_DATA` | < 60 BUY rows OR < 8 in top/bottom bucket |
+| `TOP_BUCKET_BLEEDS` | top bucket mean PnL ≤ 0 (biggest bets lose money) |
+| `SIZING_INVERTED` | bottom > top by ≥ 0.10pp (sizing anti-skillful) |
+| `SIZING_PAYS` | top > bottom by ≥ 0.10pp AND top > 0 |
+| `BALANCED` | spread within ±0.05pp |
+| `WEAK_EDGE` / `WEAK_INVERSION` | between thresholds |
+
+**Bucket-collapse hardening.** When conviction values are clustered
+(e.g. 95% of rows at the 0.25 base cap), the quantile cuts produce
+duplicate edges and terminal buckets come up empty. The verdict picks
+the highest non-empty bucket as "top" rather than reading None from an
+empty terminal bucket — the diagnostic still verdicts on the actual
+top vs bottom of the realized distribution.
+
+Same operational discipline as siblings (`consensus_skill`,
+`conviction_calibration`, `gate_audit`): read-only, never trains,
+never touches `build_features` / `N_FEATURES` / `decision_scorer.pkl`
+/ trade path, never raises (a fault yields `status='error'`). CLI
+exit-code contract: 0 on every acceptable verdict, 2 on
+`TOP_BUCKET_BLEEDS` / `SIZING_INVERTED` so a shell caller can
+`if !` on real harm.
+
+CLI:
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.sizing_pnl_skill            # table verdict
+python3 -m paper_trader.ml.sizing_pnl_skill --json     # JSON
+python3 -m paper_trader.ml.sizing_pnl_skill --buckets 5
+```
+
+**Live evidence at merge.** The corpus has 6032 BUY rows but 0 with
+`conviction_pct` — the column was added 2026-05-21 with f520926;
+historical rows pre-date it. The diagnostic correctly reports
+`INSUFFICIENT_DATA` today and will activate as the continuous loop
+populates the column on next run.
+
+Tests: `tests/test_sizing_pnl_skill.py` — 32 exact-value tests covering
+the full verdict ladder (each row hit by synthetic data engineered to
+land precisely on its threshold), bucket geometry (quartile edges via
+the standard linear-interpolation method, top-inclusive assignment,
+distribution sums, total-PnL conservation, top-bucket-share math),
+row-filter contract (SELL/HOLD dropped, missing/non-finite/out-of-range/
+bool conviction dropped, action case-normalised, non-dict rows
+dropped), never-raises discipline of `analyze()`, and CLI exit-code
+contract on all three observed verdicts (SIZING_PAYS,
+TOP_BUCKET_BLEEDS, SIZING_INVERTED). 254/254 in the focused ML/backtest
+sibling suite still pass.
+
+**Phase 3 — live validation as a skeptical quant (user_findings: 6):**
+
+1. **MLP_ADDS_SKILL stands.** Re-running
+   `python3 -m paper_trader.ml.baseline_compare` confirms pass #3's
+   flip: OOS rank-IC=+0.2245 vs best one-liner baseline
+   `rsi_meanrev` +0.0791 — gap +0.1454 (≫ 0.05 threshold). The 17-feature
+   MLP is genuinely additive OOS. `deploy_audit` reports
+   `DEPLOYED_MATCHES_SOURCE` (all 8 audited hyper-params match
+   `decision_scorer.MLP_CONFIG`).
+
+2. **Scorer is still sub-gate.** Pickle mtime 2026-05-19T06:10
+   (~50h old), `n_train=400` < 500 threshold (invariant #5). Gate
+   remains inactive — same state as pass #3. As outcomes accumulate
+   the gate will engage, but `_train_decision_scorer` would need the
+   continuous loop running for that.
+
+3. **Continuous loop dormant since 2026-05-18T18:45.** Still the
+   same 2 orphaned `status='running'` rows from pass #3 (rid 6238 ~17h
+   old at that time, now ~67h). `continuous.log` mtime
+   2026-05-18T12:03. The next `python3 run_continuous_backtests.py`
+   start will reap both via `_reap_orphaned_runs` (6h-age guard).
+   `scorer_freshness` reports `INSUFFICIENT_DATA` because
+   `scorer_skill_log.jsonl` is absent — never written since the loop
+   stopped.
+
+4. **GUARD_INACTIVE confirmed.**
+   `python3 -m paper_trader.ml.gate_abstention` reports 0.37%
+   abstention rate (4 abstentions / 1089 captured), below the 0.5%
+   activation threshold. URTY(2), SOXL(1), FAS(1) — same 4 names
+   pass #3 documented. Either the model is more in-distribution than
+   the original audit suggested OR the threshold (`|raw| > 50`) is
+   too lax.
+
+5. **Calibration verdict DIRECTIONAL_BUT_BIASED.** OOS spearman=0.225
+   but `mean_abs_decile_err=7.46pp`. Decile 10 (top predicted)
+   predicts +24% but realizes +0.90% — the ranking is trustworthy
+   but the magnitude is wildly overconfident. **A reading quant
+   should trust the sign / decile rank, discount the predicted %.**
+   In-sample reports MISCALIBRATED (spearman=0.0157) because the
+   400-row dedup tail leaves the model trained on a sparse view
+   while the full 7413-row corpus magnifies the bias — same
+   in-sample-vs-OOS divergence pass #3 noted.
+
+6. **CONSENSUS_EDGE re-verified.**
+   `python3 -m paper_trader.ml.consensus_skill` still reports a +3.16pp
+   spread between top-consensus (3+ runs: +4.22%, n=42) and lone-bucket
+   (+1.07%, n=6413). Cross-run agreement carries real signal but the
+   continuous loop's `RUNS_PER_CYCLE=1` throttle (from `38f23133` /
+   pass #2's load-reduction) means no NEW consensus rows accumulate
+   until the throttle relaxes.
+
+**Sub-finding — `outcome_data_quality` CLEAN.** Same 7413-record
+corpus, 0 corrupt rows, 0 nonfinite features, 0 conflicts, 23
+exact-zero 5d returns (the walk-back-collision footprint), 25
+extreme >|50%| outliers (real leveraged-ETF crash/rip weeks).
+Training data integrity is solid.
+
+**Sub-finding — `claude-` model probes still in DB.** Same observation
+as passes #2/#3: rid 99001 / 90001 (zero-trade, -1.08% / -1.75% vs SPY)
+sit in `backtest_runs`. The `_trim_history(keep=500)` cutoff still
+holds (503 total rows; trims to 500). Not a fix priority.
+
+**How to run this pass's tests** (focused; full suite ≥25 min):
+
+```bash
+# This pass's regression coverage (32 tests, <1s)
+python3 -m pytest tests/test_sizing_pnl_skill.py -v
+
+# Joint with the nearest-sibling diagnostics (no drift cross-check):
+python3 -m pytest tests/test_sizing_pnl_skill.py \
+                 tests/test_consensus_skill.py \
+                 tests/test_decision_scorer.py \
+                 tests/test_ml_backtest_seams.py \
+                 tests/test_continuous.py \
+                 tests/test_outcome_data_quality.py -q
+# 254 passed
+```
+
+**How to run the sizing diagnostic manually:**
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.sizing_pnl_skill             # table
+python3 -m paper_trader.ml.sizing_pnl_skill --json      # JSON
+python3 -m paper_trader.ml.sizing_pnl_skill --buckets 5 # quintiles
+python3 -m paper_trader.ml.sizing_pnl_skill --outcomes path/to/alt.jsonl
+```
+
+**Counters**: bugs_fixed=0 (honest — pass #3's atomic-write fix
+landed the last open item; leveraged-cap candidate is
+test-pinned as intentional) · features_added=1
+(`sizing_pnl_skill` analyzer with 32 verdict-locked tests) ·
+user_findings=6 (MLP_ADDS_SKILL stands, scorer sub-gate, loop
+dormant, gate guard inactive, calibration directional-but-biased,
+consensus edge re-verified).
+
+---
+
 ## 2026-05-21 paper-trader-core HYBRID pass (Agent 1, ~14:45 UTC) — `_realized_vs_unrealized_line` Discord surface
 
 ### Phase 1 — fix (no commit)
