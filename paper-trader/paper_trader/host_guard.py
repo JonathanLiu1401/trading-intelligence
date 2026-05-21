@@ -434,7 +434,14 @@ def main(argv: list[str] | None = None) -> int:
     if "--json" in argv:
         import json
 
-        print(json.dumps(snap, indent=2, sort_keys=True))
+        # Surface the starvation figure (counts BOTH prefixes) alongside the
+        # narrower empty rate so machine consumers see what the human line
+        # below does — the two numbers diverge once the pre-flight guard is
+        # live (skip rows aren't counted by recent_empty_rate; see the
+        # recent_starvation_rate docstring on why the broader bucket exists).
+        out = dict(snap)
+        out["recent_starvation_rate"] = recent_starvation_rate()
+        print(json.dumps(out, indent=2, sort_keys=True))
     else:
         p = snap["probe"]
         verdict = "SATURATED" if snap["saturated"] else "CLEAR"
@@ -444,14 +451,32 @@ def main(argv: list[str] | None = None) -> int:
             f"  swap_used={p['swap_used_pct']:.0f}%"
             f"  load1={p['load1']} ({p['load_per_cpu']}/cpu, {p['cpus']} cpu)"
         )
+        # `recent_empty_rate` counts the OLD "claude returned no response"
+        # prefix only — once the pre-flight host_saturated guard is live,
+        # storms produce mostly "skipped claude call" rows that this bucket
+        # silently misses, so the empty% alone underreports the live
+        # pathology (observed live 2026-05-21: 14% empty vs 27% starved).
+        # Show the broader starvation figure too so the operator can see
+        # what the saturation guard *and* the model timeouts actually cost.
         er = snap["recent_empty_rate"]
-        if er["ok"]:
+        sr = recent_starvation_rate()
+        if sr["ok"]:
+            skipped = sr["starved"] - (er["empty"] if er["ok"] else 0)
+            print(
+                f"  live trader: {sr['starved']}/{sr['n']} recent decisions"
+                f" never reached Opus ({sr['rate'] * 100:.0f}%) — "
+                f"{er['empty'] if er['ok'] else 0} empty/timeout + "
+                f"{max(skipped, 0)} skipped (host guard)"
+            )
+        elif er["ok"]:
+            # Starvation probe failed but empty probe ok — degrade to the
+            # narrower line rather than printing nothing.
             print(
                 f"  live trader: {er['empty']}/{er['n']} recent decisions were"
                 f" empty/timeout NO_DECISION ({er['rate'] * 100:.0f}%)"
             )
         else:
-            print("  live trader: recent empty-rate unavailable (DB unreadable)")
+            print("  live trader: recent starvation rate unavailable (DB unreadable)")
     return 1 if snap["saturated"] else 0
 
 
