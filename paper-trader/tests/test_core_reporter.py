@@ -5411,3 +5411,480 @@ class TestHourlySummaryMarkIntegrity:
         monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
         assert reporter.send_daily_close() is True
         assert "**MARK INTEGRITY**" in captured[0]
+
+
+class TestFeedHealthLine:
+    """`_feed_health_line` — Discord surface for the /api/feed-health verdict.
+
+    Mirrors the dashboard-to-Discord pattern: composes ``build_feed_health``
+    verbatim (single source of truth, invariant #10) and surfaces only
+    actionable verdicts (BLIND / STALE_FEED). HEALTHY / NO_DATA stay silent
+    per the silence-when-nothing-actionable contract (the ``_drawdown_line``
+    at-high-water precedent). A builder/probe/signals fault degrades to ``""``
+    (the additive reporter contract — never takes down the whole summary).
+    """
+
+    def _patch_signals(self, monkeypatch, *, resolved="/local.db",
+                       legacy=None):
+        """Stub signals.{_db_path,_legacy_choice,USB_DB,LOCAL_DB}."""
+        from pathlib import Path as _P
+        from paper_trader import signals as _sig
+        monkeypatch.setattr(_sig, "_db_path", lambda: _P(resolved))
+        monkeypatch.setattr(_sig, "_legacy_choice",
+                            lambda: _P(legacy or resolved))
+        monkeypatch.setattr(_sig, "USB_DB", _P("/usb.db"))
+        monkeypatch.setattr(_sig, "LOCAL_DB", _P("/local.db"))
+
+    def _patch_probe(self, monkeypatch, probes: dict):
+        """Stub ``_feed_db_probe`` lookup. Missing paths → all-zero/none."""
+        def fake_probe(path, want_counts=False):
+            return probes.get(str(path), {
+                "exists": False, "newest": None,
+                "live_2h": 0, "live_24h": 0,
+            })
+        monkeypatch.setattr(reporter, "_feed_db_probe", fake_probe)
+
+    def _stub_builder(self, monkeypatch, payload):
+        from paper_trader.analytics import feed_health as fh_mod
+        monkeypatch.setattr(fh_mod, "build_feed_health",
+                            lambda *a, **k: payload)
+
+    # ── verdict suppression discipline ──────────────────────────────────
+
+    def test_silent_on_healthy_verdict(self, fresh_store, monkeypatch):
+        # HEALTHY is the locked-in green state — never surface (no lying
+        # green-light precedent).
+        self._patch_signals(monkeypatch)
+        self._patch_probe(monkeypatch, {
+            "/local.db": {"exists": True,
+                          "newest": "2026-05-21T18:00:00+00:00",
+                          "live_2h": 100, "live_24h": 1000},
+        })
+        self._stub_builder(monkeypatch, {
+            "verdict": "HEALTHY",
+            "headline": "HEALTHY — newest live article 0.1h old…",
+            "restart_recommended": False,
+        })
+        assert reporter._feed_health_line(fresh_store) == ""
+
+    def test_silent_on_no_data_verdict(self, fresh_store, monkeypatch):
+        # NO_DATA = nothing to say (no resolved path / no decisions yet).
+        self._patch_signals(monkeypatch)
+        self._patch_probe(monkeypatch, {})
+        self._stub_builder(monkeypatch, {
+            "verdict": "NO_DATA",
+            "headline": "NO_DATA — no resolved article DB",
+            "restart_recommended": False,
+        })
+        assert reporter._feed_health_line(fresh_store) == ""
+
+    def test_fires_on_blind_verdict(self, fresh_store, monkeypatch):
+        # BLIND = ≥3 consecutive 0-signal decisions; the actionable harm.
+        self._patch_signals(monkeypatch)
+        self._patch_probe(monkeypatch, {
+            "/local.db": {"exists": True,
+                          "newest": "2026-05-21T18:00:00+00:00",
+                          "live_2h": 0, "live_24h": 0},
+        })
+        self._stub_builder(monkeypatch, {
+            "verdict": "BLIND",
+            "headline": "BLIND — 5 consecutive decision(s) with 0 signals",
+            "restart_recommended": False,
+        })
+        line = reporter._feed_health_line(fresh_store)
+        assert line.startswith("⚠️ **FEED HEALTH** ◈ BLIND")
+        assert "BLIND — 5 consecutive decision(s)" in line
+        assert "restart_recommended" not in line
+
+    def test_fires_on_stale_feed_verdict(self, fresh_store, monkeypatch):
+        # STALE_FEED = newest article >6h old; feed stuck.
+        self._patch_signals(monkeypatch)
+        self._patch_probe(monkeypatch, {
+            "/local.db": {"exists": True,
+                          "newest": "2026-05-21T06:00:00+00:00",
+                          "live_2h": 0, "live_24h": 50},
+        })
+        self._stub_builder(monkeypatch, {
+            "verdict": "STALE_FEED",
+            "headline": "STALE_FEED — newest live article in /local.db is "
+                        "12.5h old (>6h)",
+            "restart_recommended": False,
+        })
+        line = reporter._feed_health_line(fresh_store)
+        assert line.startswith("⚠️ **FEED HEALTH** ◈ STALE_FEED")
+        assert "12.5h old" in line
+
+    def test_restart_recommended_clause_appended(self, fresh_store,
+                                                  monkeypatch):
+        # split_brain → restart_recommended True → explicit operator hint
+        # appended on its own line.
+        self._patch_signals(monkeypatch, legacy="/usb.db")
+        self._patch_probe(monkeypatch, {
+            "/local.db": {"exists": True,
+                          "newest": "2026-05-21T18:00:00+00:00",
+                          "live_2h": 100, "live_24h": 1000},
+            "/usb.db": {"exists": True,
+                        "newest": "2026-05-20T18:00:00+00:00",
+                        "live_2h": 0, "live_24h": 5},
+        })
+        self._stub_builder(monkeypatch, {
+            "verdict": "STALE_FEED",
+            "headline": "STALE_FEED — split-brain",
+            "restart_recommended": True,
+        })
+        line = reporter._feed_health_line(fresh_store)
+        assert "restart_recommended" in line
+        assert "relaunch the runner" in line
+
+    def test_nondict_builder_result_suppressed(self, fresh_store,
+                                                monkeypatch):
+        self._patch_signals(monkeypatch)
+        self._patch_probe(monkeypatch, {
+            "/local.db": {"exists": True, "newest": None,
+                          "live_2h": 0, "live_24h": 0},
+        })
+        self._stub_builder(monkeypatch, None)
+        assert reporter._feed_health_line(fresh_store) == ""
+
+    def test_empty_headline_suppressed(self, fresh_store, monkeypatch):
+        # Builder gives an actionable verdict but no headline (defensive) →
+        # never render a tag-only line.
+        self._patch_signals(monkeypatch)
+        self._patch_probe(monkeypatch, {
+            "/local.db": {"exists": True,
+                          "newest": "2026-05-21T06:00:00+00:00",
+                          "live_2h": 0, "live_24h": 0},
+        })
+        self._stub_builder(monkeypatch, {
+            "verdict": "STALE_FEED", "headline": "",
+            "restart_recommended": False,
+        })
+        assert reporter._feed_health_line(fresh_store) == ""
+
+    def test_degrades_to_empty_when_builder_raises(self, fresh_store,
+                                                    monkeypatch):
+        self._patch_signals(monkeypatch)
+        self._patch_probe(monkeypatch, {
+            "/local.db": {"exists": True,
+                          "newest": "2026-05-21T18:00:00+00:00",
+                          "live_2h": 1, "live_24h": 10},
+        })
+        from paper_trader.analytics import feed_health as fh_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("feed_health builder boom")
+
+        monkeypatch.setattr(fh_mod, "build_feed_health", _boom)
+        assert reporter._feed_health_line(fresh_store) == ""
+
+    def test_degrades_when_db_path_raises(self, fresh_store, monkeypatch):
+        # signals._db_path() itself can fail (USB unmount mid-read); the
+        # Discord path must never crash on it.
+        from paper_trader import signals as _sig
+
+        def _boom():
+            raise RuntimeError("disk gone")
+
+        monkeypatch.setattr(_sig, "_db_path", _boom)
+        assert reporter._feed_health_line(fresh_store) == ""
+
+    def test_degrades_when_store_decisions_read_fails(self, fresh_store,
+                                                       monkeypatch):
+        # The builder still gets called (with an empty decision list), so a
+        # store decision-read failure must NOT take down the line — it just
+        # produces NO_DATA / HEALTHY (both silenced) without crashing.
+        self._patch_signals(monkeypatch)
+        self._patch_probe(monkeypatch, {
+            "/local.db": {"exists": True, "newest": None,
+                          "live_2h": 0, "live_24h": 0},
+        })
+
+        class _BrokenStore:
+            def recent_decisions(self, *a, **k):
+                raise RuntimeError("DB locked")
+
+        # Builder honestly reports NO_DATA on an empty resolved feed; the
+        # line then suppresses per the silence contract.
+        out = reporter._feed_health_line(_BrokenStore())
+        assert out == ""
+
+    # ── end-to-end with the real builder (no monkeypatching of the
+    # build_feed_health function) ──────────────────────────────────────
+
+    def test_real_builder_fires_on_blind_streak(self, fresh_store,
+                                                  monkeypatch):
+        # Seed 4 consecutive NO_DECISION rows with signal_count=0 (newest-
+        # first store reads will see all 4 as 0-signal → BLIND).
+        for _ in range(4):
+            fresh_store.record_decision(
+                market_open=True, signal_count=0,
+                action_taken="NO_DECISION",
+                reasoning="claude returned no response (timeout/empty)",
+                portfolio_value=1000.0, cash=1000.0,
+            )
+        self._patch_signals(monkeypatch)
+        # Fresh article DB — newest 0.1h old — so feed itself is healthy
+        # but the 0-signal streak still says BLIND (verdict precedence).
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        recent_iso = (_dt.now(_tz.utc) - _td(minutes=6)).isoformat()
+        self._patch_probe(monkeypatch, {
+            "/local.db": {"exists": True, "newest": recent_iso,
+                          "live_2h": 50, "live_24h": 800},
+        })
+        line = reporter._feed_health_line(fresh_store)
+        assert "⚠️ **FEED HEALTH** ◈ BLIND" in line
+        assert "consecutive decision" in line
+
+    def test_real_builder_fires_on_stale_feed(self, fresh_store, monkeypatch):
+        # No 0-signal streak — but the newest live article is ≥6h old →
+        # STALE_FEED verdict (BLIND precedence bypassed because streak<3).
+        fresh_store.record_decision(
+            market_open=True, signal_count=5,
+            action_taken="HOLD NVDA → HOLD", reasoning="seeing signals",
+            portfolio_value=1000.0, cash=1000.0,
+        )
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        stale_iso = (_dt.now(_tz.utc) - _td(hours=10)).isoformat()
+        self._patch_signals(monkeypatch)
+        self._patch_probe(monkeypatch, {
+            "/local.db": {"exists": True, "newest": stale_iso,
+                          "live_2h": 0, "live_24h": 5},
+        })
+        line = reporter._feed_health_line(fresh_store)
+        assert "⚠️ **FEED HEALTH** ◈ STALE_FEED" in line
+        # Builder's own headline carries the age — pinning the
+        # builder-verbatim invariant (the single-source-of-truth contract).
+        assert "STALE_FEED — newest live article" in line
+
+    def test_real_builder_silent_on_fresh_feed_and_signal(self, fresh_store,
+                                                          monkeypatch):
+        # Healthy book + fresh feed → HEALTHY → silent.
+        fresh_store.record_decision(
+            market_open=True, signal_count=5,
+            action_taken="HOLD NVDA → HOLD", reasoning="seeing signals",
+            portfolio_value=1000.0, cash=1000.0,
+        )
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        recent_iso = (_dt.now(_tz.utc) - _td(minutes=10)).isoformat()
+        self._patch_signals(monkeypatch)
+        self._patch_probe(monkeypatch, {
+            "/local.db": {"exists": True, "newest": recent_iso,
+                          "live_2h": 200, "live_24h": 3000},
+        })
+        assert reporter._feed_health_line(fresh_store) == ""
+
+
+class TestFeedDbProbe:
+    """``_feed_db_probe`` — the private articles.db reader shared with the
+    dashboard endpoint (intentionally duplicated to avoid a circular import).
+    Pure / never raises / safe defaults on missing path."""
+
+    def test_missing_path_returns_zero(self, tmp_path):
+        out = reporter._feed_db_probe(str(tmp_path / "absent.db"))
+        assert out == {"exists": False, "newest": None,
+                        "live_2h": 0, "live_24h": 0}
+
+    def test_unparseable_db_degrades(self, tmp_path):
+        # A file that exists but isn't a sqlite DB must not crash the probe.
+        bogus = tmp_path / "bogus.db"
+        bogus.write_text("not a database")
+        out = reporter._feed_db_probe(str(bogus), want_counts=True)
+        # exists=True is fine (the file IS there); the rest degrades.
+        assert out["newest"] is None
+        assert out["live_2h"] == 0
+        assert out["live_24h"] == 0
+
+    def test_real_articles_db_reads_newest_and_counts(self, tmp_path):
+        # Plant a tiny articles.db with the exact schema the live feed uses
+        # and verify the live-only clause + counts.
+        import sqlite3
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        db = tmp_path / "articles.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "CREATE TABLE articles (id INTEGER PRIMARY KEY, "
+            "url TEXT, source TEXT, first_seen TEXT)"
+        )
+        now = _dt.now(_tz.utc)
+        rows = [
+            (1, "https://live.example/1", "rss",
+             (now - _td(minutes=10)).isoformat()),
+            (2, "https://live.example/2", "rss",
+             (now - _td(hours=1)).isoformat()),
+            (3, "https://live.example/3", "rss",
+             (now - _td(hours=10)).isoformat()),
+            # Backtest contamination — MUST be filtered out by the live clause.
+            (4, "backtest://2025-01/1", "backtest_persona_1",
+             (now + _td(minutes=5)).isoformat()),
+            (5, "https://live.example/5", "opus_annotation_run_1",
+             (now + _td(minutes=10)).isoformat()),
+        ]
+        conn.executemany(
+            "INSERT INTO articles (id,url,source,first_seen) VALUES (?,?,?,?)",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        out = reporter._feed_db_probe(str(db), want_counts=True)
+        assert out["exists"] is True
+        # Newest LIVE article is the 10-min-old row (the synthetic backtest
+        # rows are future-dated but must be excluded by the canonical filter).
+        assert out["newest"] == rows[0][3]
+        assert out["live_2h"] == 2     # 10m + 1h
+        assert out["live_24h"] == 3    # 10m + 1h + 10h
+
+
+class TestHourlySummaryFeedHealth:
+    """End-to-end wire test: the hourly summary surfaces FEED HEALTH on
+    BLIND / STALE_FEED, and suppresses it on a HEALTHY feed."""
+
+    def _stub_signals_modules(self, monkeypatch):
+        from paper_trader import signals as _signals
+        monkeypatch.setattr(_signals, "get_top_signals", lambda *a, **k: [])
+        monkeypatch.setattr(_signals, "get_urgent_articles",
+                            lambda *a, **k: [])
+        # Silence other lines that would crowd the body.
+        for fn in ("_source_mix_line", "_idle_opportunity_line",
+                   "_cash_conviction_fit_line", "_earnings_shock_line",
+                   "_position_attention_line"):
+            monkeypatch.setattr(reporter, fn, lambda *a, **k: "")
+
+    def test_hourly_summary_fires_on_stale_feed(self, fresh_store,
+                                                  monkeypatch):
+        from pathlib import Path as _P
+        from paper_trader import signals as _sig
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        # Seed a healthy book + a record decision so the builder sees ≥1 row.
+        fresh_store.record_decision(
+            market_open=True, signal_count=8, action_taken="HOLD MU → HOLD",
+            reasoning="seeing signals", portfolio_value=1000.0, cash=1000.0,
+        )
+        monkeypatch.setattr(_sig, "_db_path", lambda: _P("/local.db"))
+        monkeypatch.setattr(_sig, "_legacy_choice",
+                            lambda: _P("/local.db"))
+        monkeypatch.setattr(_sig, "USB_DB", _P("/usb.db"))
+        monkeypatch.setattr(_sig, "LOCAL_DB", _P("/local.db"))
+        stale_iso = (_dt.now(_tz.utc) - _td(hours=12)).isoformat()
+        monkeypatch.setattr(
+            reporter, "_feed_db_probe",
+            lambda path, want_counts=False: (
+                {"exists": True, "newest": stale_iso,
+                 "live_2h": 0, "live_24h": 4}
+                if str(path) == "/local.db"
+                else {"exists": False, "newest": None,
+                      "live_2h": 0, "live_24h": 0}
+            ),
+        )
+        self._stub_signals_modules(monkeypatch)
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: None)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "⚠️ **FEED HEALTH** ◈ STALE_FEED" in body
+        # Placement: MARK INTEGRITY → FEED HEALTH → everything else. If MARK
+        # INTEGRITY also fires the two must stack, FEED HEALTH after.
+        if "**MARK INTEGRITY**" in body:
+            assert (body.index("**MARK INTEGRITY**")
+                    < body.index("**FEED HEALTH**"))
+
+    def test_hourly_summary_silent_on_healthy_feed(self, fresh_store,
+                                                    monkeypatch):
+        from pathlib import Path as _P
+        from paper_trader import signals as _sig
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        fresh_store.record_decision(
+            market_open=True, signal_count=8, action_taken="HOLD MU → HOLD",
+            reasoning="seeing signals", portfolio_value=1000.0, cash=1000.0,
+        )
+        monkeypatch.setattr(_sig, "_db_path", lambda: _P("/local.db"))
+        monkeypatch.setattr(_sig, "_legacy_choice",
+                            lambda: _P("/local.db"))
+        monkeypatch.setattr(_sig, "USB_DB", _P("/usb.db"))
+        monkeypatch.setattr(_sig, "LOCAL_DB", _P("/local.db"))
+        fresh_iso = (_dt.now(_tz.utc) - _td(minutes=5)).isoformat()
+        monkeypatch.setattr(
+            reporter, "_feed_db_probe",
+            lambda path, want_counts=False: (
+                {"exists": True, "newest": fresh_iso,
+                 "live_2h": 100, "live_24h": 2000}
+                if str(path) == "/local.db"
+                else {"exists": False, "newest": None,
+                      "live_2h": 0, "live_24h": 0}
+            ),
+        )
+        self._stub_signals_modules(monkeypatch)
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: None)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**FEED HEALTH**" not in body
+
+    def test_summary_still_sends_when_feed_health_builder_faults(
+            self, fresh_store, monkeypatch):
+        # Builder boom must NOT take down the whole hourly summary (the
+        # reporter additive contract).
+        fresh_store.record_decision(
+            market_open=True, signal_count=8, action_taken="HOLD",
+            reasoning="ok", portfolio_value=1000.0, cash=1000.0,
+        )
+        from paper_trader.analytics import feed_health as fh_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("builder boom")
+
+        monkeypatch.setattr(fh_mod, "build_feed_health", _boom)
+        self._stub_signals_modules(monkeypatch)
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: None)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**HOURLY**" in body
+        assert "**FEED HEALTH**" not in body
+
+    def test_daily_close_fires_on_stale_feed(self, fresh_store, monkeypatch):
+        from pathlib import Path as _P
+        from paper_trader import signals as _sig
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        fresh_store.record_decision(
+            market_open=True, signal_count=8, action_taken="HOLD MU → HOLD",
+            reasoning="seeing signals", portfolio_value=1000.0, cash=1000.0,
+        )
+        monkeypatch.setattr(_sig, "_db_path", lambda: _P("/local.db"))
+        monkeypatch.setattr(_sig, "_legacy_choice",
+                            lambda: _P("/local.db"))
+        monkeypatch.setattr(_sig, "USB_DB", _P("/usb.db"))
+        monkeypatch.setattr(_sig, "LOCAL_DB", _P("/local.db"))
+        stale_iso = (_dt.now(_tz.utc) - _td(hours=12)).isoformat()
+        monkeypatch.setattr(
+            reporter, "_feed_db_probe",
+            lambda path, want_counts=False: (
+                {"exists": True, "newest": stale_iso,
+                 "live_2h": 0, "live_24h": 4}
+                if str(path) == "/local.db"
+                else {"exists": False, "newest": None,
+                      "live_2h": 0, "live_24h": 0}
+            ),
+        )
+        self._stub_signals_modules(monkeypatch)
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: None)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_daily_close() is True
+        body = captured[0]
+        assert "**DAILY CLOSE**" in body
+        assert "⚠️ **FEED HEALTH** ◈ STALE_FEED" in body
