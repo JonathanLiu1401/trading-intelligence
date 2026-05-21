@@ -84,6 +84,67 @@ STARVATION_RATE_FLOOR = 0.25
 #     BOTH (see /api/host-guard's docstring on the same trap).
 _STARVATION_PREFIXES = ("claude returned no response", "skipped claude call")
 
+
+# Cause buckets for `recent_starvation_by_cause`. The cell the operator
+# needs is finer than "starved vs not": each class needs a DIFFERENT action.
+#
+#   model_timeout  — Opus subprocess hit the 180s wall on the wire. May
+#                    resolve when load drops; no operator action required
+#                    unless persistent.
+#   cli_nonzero_rc — `claude` CLI exited non-zero with NO quota marker (a
+#                    transient API error or CLI crash). Distinct from a
+#                    deliberate quota rejection; check the Anthropic
+#                    status page if persistent.
+#   model_empty    — CLI exited 0 but stdout was empty, OR Popen raised.
+#                    Model-level miss; usually a one-cycle blip.
+#   cli_missing    — `claude` not in PATH at call time. Real config bug;
+#                    the live trader can never decide until fixed.
+#   host_skip      — pre-flight or mid-call `host_saturated` guard
+#                    DECLINED the call. The operator must reduce parallel
+#                    Opus jobs (review/backtest agents) — trading cannot
+#                    resolve this (see `_OPS_ACTION`).
+#   unknown        — starved row whose reason text doesn't match any of
+#                    the above (a legacy "timeout/empty" generic line
+#                    written before strategy.py's per-cause sub-buckets,
+#                    or future code paths). Surfaced so the breakdown
+#                    sums back to `starved` exactly.
+_CAUSE_LABELS = (
+    "model_timeout", "cli_nonzero_rc", "model_empty",
+    "cli_missing", "host_skip", "unknown",
+)
+
+
+def _classify_starvation_cause(reason: str) -> str:
+    """Pick a single cause bucket for a starved NO_DECISION reason string.
+    Pure / never raises. Returns one of ``_CAUSE_LABELS``.
+
+    The host_skip prefix is checked FIRST because "skipped claude call —
+    host saturated mid-call" may parenthesise the underlying reason in
+    a future format (today it doesn't, but the dispatch order pins the
+    intent so a future suffix can't be mis-classified as a model failure).
+    """
+    r = reason or ""
+    if r.startswith("skipped claude call"):
+        return "host_skip"
+    if not r.startswith("claude returned no response"):
+        return "unknown"
+    # Parenthesised sub-bucket. strategy.py:1791 writes the cause from
+    # `_last_claude_fail`: timeout / nonzero_rc / empty_stdout / cli_missing
+    # / exception. The legacy generic "(timeout/empty)" rolls into
+    # model_timeout (the dominant historical signature pre-sub-buckets).
+    import re as _re
+    m = _re.search(r"\(([^)]+)\)", r)
+    suffix = (m.group(1).strip() if m else "").lower()
+    if suffix in ("timeout", "timeout/empty"):
+        return "model_timeout"
+    if suffix == "nonzero_rc":
+        return "cli_nonzero_rc"
+    if suffix in ("empty_stdout", "exception"):
+        return "model_empty"
+    if suffix == "cli_missing":
+        return "cli_missing"
+    return "unknown"
+
 # `pulse()` is inert under pytest unless a dedicated test opts in — the
 # `dashboard._swr_active()` / runner `_STATE_PATH` offline-invariant precedent.
 # The real path reads live /proc + the live WAL `paper_trader.db`; if it ran
@@ -311,6 +372,68 @@ def recent_starvation_rate(db_path: str | os.PathLike | None = None,
     return out
 
 
+def recent_starvation_by_cause(db_path: str | os.PathLike | None = None,
+                                limit: int = 120) -> dict:
+    """Read-only: bucket the last ``limit`` decisions' starvation cells by
+    operator-actionable cause (``_CAUSE_LABELS``).
+
+    The aggregate ``recent_starvation_rate`` answers "how many cycles never
+    reached Opus?". This answers the follow-up the operator needs DURING a
+    storm: "what proportion of those were model timeouts (Opus wedged) vs
+    pre-flight skips (out-of-band Opus contention) vs CLI errors (Anthropic-
+    side)?" — three classes that need three different actions (see the
+    `_CAUSE_LABELS` docstring on each).
+
+    Distinct from the dashboard's ``/api/no-decision-reasons`` (which buckets
+    ALL no-decision reasons, including non-starvation parse failures, and
+    runs inside the runner process): this stays inside the host_guard
+    shell-runnable scope so the operator can answer the question even when
+    the dashboard is unreachable.
+
+    Returns:
+        ``{"n": <total rows>, "starved": <starved count>,
+           "by_cause": {label: count, ...}, "rate": <starved/n>,
+           "ok": bool}``
+
+        ``by_cause`` ALWAYS includes every label in ``_CAUSE_LABELS`` (with
+        zero counts for missing classes) so consumers can render the cell
+        without key-misses. Counts sum to ``starved`` exactly.
+
+    Degrade-safe — ``ok=False`` on any error (missing DB, locked, schema
+    drift); ``by_cause`` returns the all-zero shape (the
+    ``recent_starvation_rate`` precedent)."""
+    path = str(db_path) if db_path is not None else str(_DEFAULT_DB)
+    zero_by_cause = {label: 0 for label in _CAUSE_LABELS}
+    out = {"n": 0, "starved": 0, "by_cause": zero_by_cause,
+           "rate": 0.0, "ok": False}
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = conn.execute(
+                "SELECT action_taken, reasoning FROM decisions "
+                "ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return out
+    n = len(rows)
+    by_cause = {label: 0 for label in _CAUSE_LABELS}
+    starved = 0
+    for action, reasoning in rows:
+        if (action or "") != "NO_DECISION":
+            continue
+        r = reasoning or ""
+        if not r.startswith(_STARVATION_PREFIXES):
+            continue
+        starved += 1
+        by_cause[_classify_starvation_cause(r)] += 1
+    out.update(n=n, starved=starved, by_cause=by_cause,
+               rate=round(starved / n, 3) if n else 0.0, ok=True)
+    return out
+
+
 def snapshot(db_path: str | os.PathLike | None = None) -> dict:
     """Full degrade-safe report: probe + verdict + recent empty-rate."""
     p = probe()
@@ -431,6 +554,7 @@ def main(argv: list[str] | None = None) -> int:
     (``python3 -m paper_trader.host_guard && start-trader``)."""
     argv = sys.argv[1:] if argv is None else argv
     snap = snapshot()
+    cause = recent_starvation_by_cause()
     if "--json" in argv:
         import json
 
@@ -441,6 +565,7 @@ def main(argv: list[str] | None = None) -> int:
         # recent_starvation_rate docstring on why the broader bucket exists).
         out = dict(snap)
         out["recent_starvation_rate"] = recent_starvation_rate()
+        out["recent_starvation_by_cause"] = cause
         print(json.dumps(out, indent=2, sort_keys=True))
     else:
         p = snap["probe"]
@@ -459,15 +584,29 @@ def main(argv: list[str] | None = None) -> int:
         # Show the broader starvation figure too so the operator can see
         # what the saturation guard *and* the model timeouts actually cost.
         er = snap["recent_empty_rate"]
-        sr = recent_starvation_rate()
-        if sr["ok"]:
-            skipped = sr["starved"] - (er["empty"] if er["ok"] else 0)
+        if cause["ok"]:
+            sr_starved = cause["starved"]
+            sr_n = cause["n"]
+            sr_pct = round((sr_starved / sr_n) * 100.0, 0) if sr_n else 0.0
+            skipped = sr_starved - (er["empty"] if er["ok"] else 0)
             print(
-                f"  live trader: {sr['starved']}/{sr['n']} recent decisions"
-                f" never reached Opus ({sr['rate'] * 100:.0f}%) — "
+                f"  live trader: {sr_starved}/{sr_n} recent decisions"
+                f" never reached Opus ({sr_pct:.0f}%) — "
                 f"{er['empty'] if er['ok'] else 0} empty/timeout + "
                 f"{max(skipped, 0)} skipped (host guard)"
             )
+            # Per-cause breakdown: each class needs a different action, so
+            # the aggregate alone is operator-incomplete. Only surface
+            # non-zero buckets — a clean "0 model_timeout 0 host_skip ..."
+            # line would add noise.
+            non_zero = [
+                (label, n) for label, n in cause["by_cause"].items() if n > 0
+            ]
+            if non_zero:
+                by_cause_str = "  ".join(
+                    f"{label}={n}" for label, n in non_zero
+                )
+                print(f"    by cause: {by_cause_str}")
         elif er["ok"]:
             # Starvation probe failed but empty probe ok — degrade to the
             # narrower line rather than printing nothing.
