@@ -5,6 +5,112 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 hybrid pass (Agent 3) — `/api/source-urgency-yield` + sample_title fidelity fix
+
+Per-source urgent-yield audit closes the visibility gap on collector
+signal-quality. Existing analytics describe related slices —
+`source_freshness` (newest article age), `source_throughput` (rate
+change), `publish_lag_audit` (publication latency) — but none measure
+whether a source's urgent-flagged rows survive the alert-side gates
+(recap-template / quote-widget / low-authority / cross-cycle dedup /
+paraphrase). The new builder fills that gap.
+
+Pure builder
+(`analytics.source_urgency_yield.build_source_urgency_yield`,
+mirrors `news_arrival_rhythm` / `briefing_coverage_audit` discipline —
+pre-fetched article rows in, dict out, never raises). Route layer
+(`dashboard/web_server.py::api_source_urgency_yield`) is the SQL adapter
+only — `_ro_query` (short-lived `mode=ro` conn) over articles.db with
+`_LIVE_ONLY_CLAUSE` applied + `first_seen` window. Invariant #5
+(backtest isolation) preserved.
+
+Query params (clamped):
+- `hours`       — lookback window, 1..168 (default 24)
+- `min_samples` — verdict floor; below this a source returns
+                   `"UNKNOWN"`, 1..1000 (default 20)
+- `top_sources` — display cap on the per-source list, 1..100
+                   (default 15). The aggregate `totals` always
+                   reflects every kept article.
+
+Per-source verdict policy (pinned by tests; thresholds locked):
+- `NOISY`   — urgent_rate ≥ floor AND suppression_rate ≥ 30%. Most
+              urgent flags get gate-dropped; candidate for tuning.
+- `CLEAN`   — urgent_rate ≥ floor AND suppression_rate < 20%. Urgent
+              flags consistently survive every gate.
+- `MIXED`   — mid-band between CLEAN and NOISY.
+- `QUIET`   — no urgent flow (urgent==0 OR urgent_rate < 2% floor).
+- `UNKNOWN` — below `min_samples` — verdict withheld.
+
+**Important semantic caveat** (the live audit surfaces this): the
+`suppression_rate` is computed from the DB invariant
+`(urgency≥1) - (urgency=2)` — both "real Discord push" AND
+"gate-suppressed at alert time" land at `urgency=2` (the alert worker
+marks gate-suppressed rows alerted unconditionally so they exit the
+queue). So `suppression_rate` actually measures "fraction of urgent
+rows that ALERT_WORKER hasn't processed yet" — a snapshot of queue
+depth, not literal gate-suppression. A truly noisy source will show
+elevated `suppression_rate` during its bursts (rows queued faster than
+the 5-per-cycle ALERT_BATCH_SIZE drain) AND when gate-suppressions
+themselves slow the worker. Still useful for spotting flooders; not a
+direct measure of which gate fired.
+
+```sh
+curl -s 'http://localhost:8080/api/source-urgency-yield?hours=24' | python3 -m json.tool
+```
+
+Pinned by `tests/test_source_urgency_yield.py` (33 cases): envelope key
+stability across NO_DATA/SPARSE/STABLE, window enforcement (in-window
+kept / out-of-window dropped / future timestamps rejected), verdict
+policy boundaries (below-min-samples → UNKNOWN; urgent==0 → QUIET;
+below 2% urgent floor → QUIET; ≥30% suppression → NOISY; <20%
+suppression + above floor → CLEAN; mid-band → MIXED), rate math
+(urgency=2 counts as urgent too; aggregate totals reconcile), ranking
+(NOISY ranks before CLEAN; alphabetical tie-break), card-cap
+truncation, threshold-pinning regression guards, and the
+backtest-isolation contract documenting that the builder doesn't
+filter — the SQL adapter does.
+
+**Companion fix** in the same pass:
+`analytics/briefing_coverage_audit.py::build_briefing_coverage_audit`
+had a `sample_title` urgency-fidelity bug — a lower-urgency article
+could silently fill the per-ticker sample slot when the top-urgency
+article had its headline text in `summary` (empty `title` field). The
+operator would see a missed-card displaying a low-priority sample with
+`max_urgency=2`, misreading the miss as low-priority. Fixed: only
+overwrite on strict urgency improvement; on ties, fill only when the
+slot is empty. Four regression tests added in
+`tests/test_briefing_coverage_audit.py::TestSampleTitleUrgencyFidelity`.
+
+Live findings from the analyst-perspective Phase 3 inspection
+(2026-05-21, ~24h window):
+- **Briefing cadence healthy** — 6.25h between the last two briefings
+  (slightly over 5h target — within tolerance, no `BRIEFING_GAP_WARN`
+  banner triggered).
+- **Latest briefing is comprehensive** — covers NVDA earnings (the
+  day's main event, $81.62B rev / $80B buyback / AH slip), MU upgrade
+  ($731.99 +4.76%), Fed minutes ("aren't afraid to raise"), China
+  NVDA gaming chip ban, full portfolio + semis pulse. Looked
+  analyst-ready.
+- **Live data flow healthy** — 276 articles/hour ingested, 17 urgent
+  flagged, 9 alerted in the last 1h. Backlog of 30-40 urgent rows
+  queued each cycle is normal (ALERT_BATCH_SIZE=5, cycle=20s — bursts
+  are intentionally rate-limited so the Sonnet alert prompt cost is
+  bounded).
+- **Lock contention chronic** — 239 `insert_batch` lock-retry-exhausted
+  errors in the rotated daemon log. Known issue per the memory record
+  `di-insert-batch-lock-contention.md`; the 5-retry + 60s busy_timeout
+  budget is not always enough during heavy concurrent-writer storms.
+  Not a fresh bug.
+- **YF/most_actives screener-tape gate IS firing** — verified via log
+  greps ("suppressed N quote-widget rows" — 144 occurrences in the
+  current log). The `_QW_SCREENER_TAPE` regex correctly suppresses the
+  `[YF/<bucket>] <TICKER> +N% @ $price` titles before Discord push,
+  even though they show as `urgency=2` in articles.db (the suppression
+  marks them alerted to exit the queue — see the semantic caveat
+  above).
+
+---
+
 ## 2026-05-21 feature-dev pass (Agent 4) — `/api/briefing-coverage-audit`
 
 Retrospective audit on the published 5h Opus briefing: given the latest
