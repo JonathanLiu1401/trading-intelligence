@@ -384,6 +384,74 @@ class TestRanking:
         assert abs(rep["window_hours"] - 5.0) < 0.01
 
 
+# ────────────── sample_title urgency-fidelity (regression) ──────────────
+
+class TestSampleTitleUrgencyFidelity:
+    """The per-ticker ``sample_title`` shown to the operator must never
+    come from a *lower-urgency* article — that would mislead them into
+    reading a high-urgency miss as low-priority.
+
+    Bug pinned: the prior implementation entered the overwrite branch on
+    ``not slot["sample_title"]`` regardless of relative urgency, so a
+    high-urgency article whose title sat in the summary (empty ``title``
+    field) would leave the sample slot blank, and a subsequent
+    *lower-urgency* article with a title would silently fill it.
+    """
+
+    def test_lower_urgency_title_does_not_fill_empty_top_sample(self):
+        arts = [
+            # First MU article: urg=2 (top), but the title text lives in
+            # summary so the ``title`` field is empty.
+            _art("", urgency=2, summary="MU shares plunge after print"),
+            # Second MU article: urg=1 (lower), real title. Must NOT
+            # become the sample.
+            _art("MU mention in macro recap", urgency=1, summary=""),
+        ]
+        rep = build_briefing_coverage_audit(
+            _briefing("Generic macro line only."), arts, now=NOW,
+        )
+        mu_row = next(m for m in rep["missed"] if m["ticker"] == "MU")
+        assert mu_row["max_urgency"] == 2
+        # The lower-urgency title must NOT have filled the empty top slot.
+        assert mu_row["sample_title"] != "MU mention in macro recap"
+
+    def test_tied_urgency_title_fills_empty_top_sample(self):
+        arts = [
+            _art("", urgency=2, summary="MU shares plunge"),
+            # Tied urgency with a title → safe to fill the empty slot.
+            _art("MU also flagged urgent", urgency=2, summary=""),
+        ]
+        rep = build_briefing_coverage_audit(
+            _briefing("Generic macro line only."), arts, now=NOW,
+        )
+        mu_row = next(m for m in rep["missed"] if m["ticker"] == "MU")
+        assert mu_row["max_urgency"] == 2
+        assert mu_row["sample_title"] == "MU also flagged urgent"
+
+    def test_first_tied_title_wins_deterministic(self):
+        arts = [
+            _art("MU first urgent", urgency=2, summary=""),
+            _art("MU second tied", urgency=2, summary=""),
+        ]
+        rep = build_briefing_coverage_audit(
+            _briefing("Generic macro line only."), arts, now=NOW,
+        )
+        mu_row = next(m for m in rep["missed"] if m["ticker"] == "MU")
+        assert mu_row["sample_title"] == "MU first urgent"
+
+    def test_strict_improvement_overwrites_lower_urgency_sample(self):
+        arts = [
+            _art("MU early lower urgency", urgency=1, summary=""),
+            _art("MU bigger break", urgency=2, summary=""),
+        ]
+        rep = build_briefing_coverage_audit(
+            _briefing("Generic macro line only."), arts, now=NOW,
+        )
+        mu_row = next(m for m in rep["missed"] if m["ticker"] == "MU")
+        assert mu_row["max_urgency"] == 2
+        assert mu_row["sample_title"] == "MU bigger break"
+
+
 # ────────────── parity with claude_analyst._BOOK_TICKERS ────────────────
 
 class TestBookTickerParityWithClaudeAnalyst:
