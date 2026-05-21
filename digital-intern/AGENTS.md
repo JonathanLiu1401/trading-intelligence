@@ -5,6 +5,123 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 hybrid pass (Agent 3 post-NVDA) — throughput sort crash + StockTwits Sentiment gate
+
+**Phase 1 (debug):** read CLAUDE.md, AGENTS.md tail, the eight required files
+(daemon.py, storage/article_store.py, watchers/alert_agent.py,
+watchers/urgency_scorer.py, ml/trainer.py, ml/model.py, ml/features.py,
+collectors/web_scraper.py, analysis/claude_analyst.py) plus inference.py.
+Confirmed the four load-bearing invariants are intact (backtest isolation,
+ml_score ≠ ai_score, score_source correct, urgency state machine clean).
+
+Bug found via the full pytest run: 3 `tests/test_claude_analyst.py::TestAnalyze`
+cases failed with `TypeError: '<' not supported between instances of 'dict'
+and 'dict'` raised by `_throughput_degradation_lines` at the
+`candidates.sort()` call (analysis/claude_analyst.py:411). The candidate
+tuple was `(-abs_loss, -prior, row_dict)`; two rows with the same
+`(abs_loss, prior)` forced Python to compare the trailing dicts and raise.
+
+Live consequence: of 39 briefings in the DB, **3 carry the
+`[analyst] No response from Claude.` sentinel** — the throughput crash
+bubbled up from `_build_payload` to `analyze()` which returned the
+placeholder for the whole 5h cycle, blanking the analyst's primary product.
+Briefing cadence shows 7-10h gaps where 5h is expected: id37→38 = 10.2h,
+id38→39 = 7.1h.
+
+**The fix.** Add a deterministic source-name tiebreaker BEFORE the dict in
+the sort tuple: `(-abs_loss, -prior, src_key, r)`. New regression test
+`test_ties_on_loss_and_prior_do_not_crash` pins it. Commit `ec9542e`.
+
+**Phase 2 (feature):** `[StockTwits Sentiment]` pseudo-article fingerprint.
+
+Live audit (5h window): `collectors/stocktwits_sentiment.py` emitted 130
+extreme-sentiment summary rows whose title is structured data, not news
+("`[StockTwits Sentiment] NVDA Bullish: 53% Bullish / 3% Bearish (16↑ 1↓
+of 30 msgs)`"). The urgency head over-scored them — 45 with ml_score >=5,
+several at the 10.0 ceiling (the title is dense with held tickers and
+"Bullish:"/percent figures the model learned correlate with high relevance:
+pure model artefact). The stocktwits credibility tier 0.30 < 0.45
+`ALERT_MIN_LONE_SOURCE_CRED` already suppresses LONE Discord pushes (live:
+0 ever pushed), but the briefing's per-domain cap admits up to 6 into the
+top-50 pool every cycle, displacing real news in TOP SIGNALS — the
+analyst's primary consumed product.
+
+Added as the FIFTH quote-widget fingerprint (lockstep across
+`watchers.alert_agent` / `analysis.claude_analyst` /
+`watchers.urgency_scorer` pre-filter via the shared
+`_looks_like_quote_widget` import; the `_QUOTE_WIDGET_TITLE_PATTERNS`
+SSOT auto-extends to `analytics.quote_widget_audit`). Discriminator:
+
+```
+^\s*\[StockTwits\s+Sentiment\]\s+[A-Z]
+```
+
+Real news about StockTwits / sentiment / "Bullish: ..." prose SURVIVE — only
+the bracketed-marker prefix is the discriminator.
+
+**Tests pinned** (six new):
+- `tests/test_alert_agent.py::test_helper_rejects_stocktwits_sentiment` (4
+  must-catch titles)
+- `tests/test_alert_agent.py::test_stocktwits_sentiment_suppressed_before_claude`
+  (full `send_urgent_alert` integration: no Claude call, no Discord push,
+  marked alerted to exit queue)
+- `tests/test_briefing_quote_widget.py::test_stocktwits_sentiment_pseudo_detected`
+- `tests/test_briefing_quote_widget.py::test_real_sentiment_headlines_not_flagged`
+- `tests/test_briefing_quote_widget.py::test_build_payload_excludes_stocktwits_sentiment_keeps_real`
+- `tests/test_urgency_quote_widget_prefilter.py::test_lockstep_with_alert_path_on_live_noise`
+  extended with the live StockTwits Sentiment row
+- `tests/test_quote_widget_audit.py::test_audit_fingerprint_set_matches_alert_agent_gate`
+  updated for the new `stocktwits_sentiment` name
+
+Commit `6c8824e`.
+
+**Phase 3 (live validation findings):**
+
+1. **3 sentinel briefings** in DB (`[analyst] No response from Claude.`) —
+   the throughput sort crash above is the likely culprit for the recent ones;
+   Phase 1 fix should reduce this going forward.
+2. **Briefing cadence irregular** — 5.1h to 10.2h gaps over the last 10
+   briefings against an expected 5h interval. The 10.2h gap correlates with
+   the throughput crash window.
+3. **NVDA earnings cluster live**: 98 of 123 alert fires in last 3h mention
+   NVDA. Recap/burst/dedup gates handling it well — no obvious leak besides
+   the patterns prior passes already fixed.
+4. **ML-only urgent fraction ~73% (24h)**: 508 ml vs 185 llm. The dashboard
+   `urgency_label_split` shows this as alarming, but inspection confirms most
+   ml-only rows are pre-fire-suppressed by the cred-bar / recap / quote-widget
+   gates and never reach Discord. The metric over-counts what actually fires
+   (alert_recency.db is the canonical pushed-alert tally — 123 in 3h).
+5. **Chronic dark collectors persist** (matches the `di-chronic-dark-collectors`
+   memory note): Polygon ~196h dark, NewsAPI ~324h, Nitter ~93h, all with 0
+   delivered all session. SEC EDGAR briefly dark ~1h (transient, normal). The
+   COVERAGE GAP block surfaces all of these correctly to the analyst.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:**
+- `python3 -c "import sys; sys.path.insert(0,'.'); from storage import
+  article_store; from ml import features, model; print('imports OK')"`
+  → `imports OK`.
+- Focused regression set covering every module touched: 91 passed in 1.71s
+  (`test_alert_agent` + `test_briefing_quote_widget` + `test_quote_widget_audit`
+  + `test_urgency_quote_widget_prefilter`); plus 156 passed in 1.35s extending
+  to `test_alert_recap_template` + `test_briefing_recap_template`; plus 27
+  passed in 1.71s for `test_briefing_throughput_degradation` + `test_claude_analyst`
+  (the originally-failing Phase 1 tests). Full `python3 -m pytest tests/`
+  deferred per the standing concurrent-agent / 25min runtime rule.
+
+**Counters:** `bugs_fixed=1` (throughput dict-sort crash, commit `ec9542e`),
+`features_added=1` (StockTwits Sentiment pseudo-article gate, commit `6c8824e`),
+`user_findings=5` (3 sentinel briefings, 5-10h cadence gaps, NVDA cluster
+handling, ml-only fraction interpretation, chronic dark collectors).
+
+**Staging discipline.** Per-commit, explicit pathspec, no `git add -A`. The
+auto-commit daemon and (per `ps`) sibling agents were running; `git diff
+--staged --stat` verified before each commit. AGENTS.md committed alongside
+the related code in this same documentation step.
+
+---
+
 ## 2026-05-21 hybrid pass (Agent 3 late) — `_RT_WHY_STOCK_IS_AFTER` recap regex (live NVDA-night leak fix)
 
 **Phase 1 (live noise audit + regex fix):** read AGENTS.md, daemon.py,
