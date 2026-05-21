@@ -454,7 +454,13 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
         ed = trading_days[ti]
         sim_res = engine.prices.resolved_close_date(ticker, sim_d)
         end_res = engine.prices.resolved_close_date(ticker, ed)
-        if sim_res is None or end_res is None or sim_res == end_res:
+        # Walk-back inversion guard. See the matching comment in the 5d
+        # outcome path below: an `end_d` walk-back can land BEFORE `sim_d`
+        # for a thin/foreign-calendar ticker, producing a time-reversed
+        # "forward return" that silently poisons multi-horizon analytics.
+        # `<=` strictly strengthens the prior collision check.
+        if (sim_res is None or end_res is None
+                or end_res <= sim_res):
             return None
         return round(engine.prices.returns_pct(ticker, sim_d, ed), 4)
 
@@ -514,7 +520,20 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
             # PriceCache.resolved_close_date for the full honesty rationale.
             sim_res = engine.prices.resolved_close_date(ticker, sim_d)
             end_res = engine.prices.resolved_close_date(ticker, end_d)
-            if sim_res is None or end_res is None or sim_res == end_res:
+            # Defense-in-depth beyond the collision check. A 7-day walk-back
+            # on `end_d` can theoretically land BEFORE `sim_d` for a ticker
+            # with 7+ consecutive missing closes around end_d (e.g. a thin
+            # ADR taking a long holiday week off). The resulting
+            # `returns_pct(sim_d, end_d)` would then compute a "forward
+            # return" between two endpoints in REVERSE time order — a sign-
+            # inverted, time-mangled outcome that silently contaminates the
+            # DecisionScorer training set the same way the documented
+            # collision-fabricated 0% outcomes did. `<=` already implies
+            # `==` (the collision), so this strictly STRENGTHENS the prior
+            # collision guard rather than replacing it: any case the
+            # previous check rejected is still rejected.
+            if (sim_res is None or end_res is None
+                    or end_res <= sim_res):
                 continue
             fwd_ret = engine.prices.returns_pct(ticker, sim_d, end_d)
 

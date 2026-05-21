@@ -1512,3 +1512,211 @@ class TestWordToTickerWatchlistCoverage:
         assert _WORD_TO_TICKER["broadcom"] == "SOXL"
         # Sanity: the decision is a real action (not blocked).
         assert decision["action"] in ("BUY", "HOLD")
+
+
+class TestCacheCorruptionTypeGuards:
+    """Cache files (GDELT, AlphaVantage, volume, SEC) live on disk and can be
+    corrupted by truncation mid-write, external editors, or storage faults.
+    Each loader USED to assume `json.loads` returning a valid Python object
+    meant a valid PAYLOAD — a `json.loads("{}")` is syntactically valid but
+    returns a dict where the code expected a list, then crashes downstream
+    with cryptic AttributeError ('list/dict object has no attribute "get"').
+    These tests pin the type-narrowing guards: a corrupt cache must produce
+    an empty / dropped result, never a thread-killing exception."""
+
+    def test_gdelt_fetch_treats_dict_cache_as_empty(self, tmp_path, monkeypatch):
+        """A GDELT cache file that holds a dict (not the expected list of
+        article dicts) used to crash `_fetch_signals` at `a.get("title")`
+        when iterating yielded dict keys as strings. Must drop the file
+        silently and return [].
+        """
+        import paper_trader.backtest as bt
+        monkeypatch.setattr(bt, "GDELT_CACHE", tmp_path)
+        f = bt.GDELTFetcher()
+        # Bypass the GdeltDoc constructor for unit isolation
+        d = date(2024, 5, 1)
+        kw = "earnings"
+        cache_path = f._cache_key(d, kw)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text('{"foo": "bar"}')  # dict, not list — corrupt
+
+        result = f.fetch(d, kw)
+        # Empty list, NOT a crash. (gdeltdoc network call won't be made
+        # because the file exists; we just don't trust its contents.)
+        # Implementation may still attempt network if it deems the cache
+        # untrustworthy; we just need a list returned, no exception.
+        assert isinstance(result, list)
+        # The corrupt dict's keys must NOT have leaked into the result.
+        for a in result:
+            assert isinstance(a, dict)
+
+    def test_gdelt_fetch_treats_list_of_strings_as_empty(self, tmp_path,
+                                                         monkeypatch):
+        """Cache poisoned with a list of strings (instead of dicts) must
+        produce an empty / drops result, never a crash on a.get('title').
+        """
+        import paper_trader.backtest as bt
+        monkeypatch.setattr(bt, "GDELT_CACHE", tmp_path)
+        f = bt.GDELTFetcher()
+        d = date(2024, 5, 2)
+        kw = "rally"
+        cache_path = f._cache_key(d, kw)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text('["just a string", "another string"]')
+
+        result = f.fetch(d, kw)
+        assert isinstance(result, list)
+        # Strings must NOT have leaked through.
+        for a in result:
+            assert isinstance(a, dict)
+
+    def test_gdelt_fetch_returns_dicts_when_cache_is_valid_list(self, tmp_path,
+                                                                 monkeypatch):
+        """Positive path — a well-formed list of dicts is returned verbatim
+        (after the type filter drops nothing)."""
+        import paper_trader.backtest as bt
+        monkeypatch.setattr(bt, "GDELT_CACHE", tmp_path)
+        f = bt.GDELTFetcher()
+        d = date(2024, 5, 3)
+        kw = "earnings"
+        cache_path = f._cache_key(d, kw)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        good = [
+            {"title": "X up", "url": "http://a", "source": "S1", "seendate": "x"},
+            {"title": "Y down", "url": "http://b", "source": "S2", "seendate": "y"},
+        ]
+        import json as _json
+        cache_path.write_text(_json.dumps(good))
+
+        result = f.fetch(d, kw)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0]["title"] == "X up"
+
+    def test_av_fetch_treats_dict_cache_as_empty(self, tmp_path, monkeypatch):
+        """An AlphaVantage cache file containing a dict (instead of the
+        expected list of {title,url,source} dicts) used to extend articles
+        with dict keys (strings) and crash downstream.
+        """
+        import paper_trader.backtest as bt
+        monkeypatch.setattr(bt, "AV_CACHE_DIR", tmp_path)
+        monkeypatch.setattr(bt, "AV_QUOTA_PATH", tmp_path / "quota.json")
+        # Force key present so fetch doesn't short-circuit
+        f = bt.AlphaVantageNewsFetcher()
+        f._key = "FAKE_KEY"
+        d = date(2024, 5, 4)
+        path = f._cache_path("NVDA", d)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"feed": [{"title": "x"}]}')  # dict — wrong type
+
+        # Quota exhausted to avoid any real network call attempt
+        f._inc_quota()
+        # Force quota above max so the network branch is skipped
+        import json as _json
+        bt.AV_QUOTA_PATH.write_text(_json.dumps(
+            {"date": d.today().isoformat(), "calls": bt.AV_MAX_DAILY + 1}
+        ))
+
+        result = f.fetch(["NVDA"], d)
+        assert isinstance(result, list)
+        for a in result:
+            assert isinstance(a, dict)
+
+    def test_load_volume_cache_handles_non_dict_file(self, tmp_path, monkeypatch):
+        """A volume cache file containing a JSON list instead of the expected
+        {ticker: {date: volume}} dict used to crash `_load_volume_cache_for_window`
+        at `loaded.items()` with AttributeError, killing the run thread.
+        Must degrade to empty cache, not raise.
+        """
+        import paper_trader.backtest as bt
+        monkeypatch.setattr(bt, "CACHE_DIR", tmp_path)
+        # Reset disk-loaded bookkeeping so we actually re-read.
+        bt._VOLUME_CACHE_DISK_LOADED.clear()
+        bt._VOLUME_CACHE.clear()
+
+        start = date(2024, 6, 1)
+        end = date(2024, 6, 30)
+        path = bt._volume_cache_path(start, end)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[1, 2, 3]")  # list — wrong type
+
+        # Must NOT raise.
+        bt._load_volume_cache_for_window(start, end)
+        # Cache is empty for this window — no ticker entries.
+        s_iso, e_iso = start.isoformat(), end.isoformat()
+        matching = [k for k in bt._VOLUME_CACHE if k[1:] == (s_iso, e_iso)]
+        assert matching == []
+        # Bookkeeping still marks the window as loaded so we don't re-read.
+        assert (s_iso, e_iso) in bt._VOLUME_CACHE_DISK_LOADED
+
+    def test_load_volume_cache_filters_bad_nested_entries(self, tmp_path,
+                                                           monkeypatch):
+        """A volume cache where SOME tickers map to a dict and others map
+        to a list / string (partial corruption) must keep the valid entries
+        and drop the bad ones — not raise."""
+        import json as _json
+        import paper_trader.backtest as bt
+        monkeypatch.setattr(bt, "CACHE_DIR", tmp_path)
+        bt._VOLUME_CACHE_DISK_LOADED.clear()
+        bt._VOLUME_CACHE.clear()
+
+        start = date(2024, 7, 1)
+        end = date(2024, 7, 31)
+        path = bt._volume_cache_path(start, end)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "GOODTKR": {"2024-07-15": 1234.0},
+            "BADTKR": [1, 2, 3],   # corrupt — must be dropped
+            "BADTKR2": "string",   # corrupt — must be dropped
+        }
+        path.write_text(_json.dumps(payload))
+
+        bt._load_volume_cache_for_window(start, end)
+
+        s_iso, e_iso = start.isoformat(), end.isoformat()
+        assert ("GOODTKR", s_iso, e_iso) in bt._VOLUME_CACHE
+        assert bt._VOLUME_CACHE[("GOODTKR", s_iso, e_iso)] == {"2024-07-15": 1234.0}
+        assert ("BADTKR", s_iso, e_iso) not in bt._VOLUME_CACHE
+        assert ("BADTKR2", s_iso, e_iso) not in bt._VOLUME_CACHE
+
+
+class TestMergeSecCacheTypeGuards:
+    """`_merge_sec_cache` reads disk-cached SEC EDGAR filings on engine init.
+    A corrupt cache file used to crash the entire engine init (and therefore
+    the backtest cycle) because the loader iterated `entries or []` without
+    type-checking, then called `e.get("published")` on whatever the JSON
+    deserialized to (string chars, dict keys as strings, etc.)."""
+
+    def test_engine_init_survives_corrupt_sec_cache(self, tmp_path, monkeypatch,
+                                                     synthetic_prices):
+        """Drop a corrupt SEC cache file (a dict instead of the expected list
+        of filing dicts) and confirm `_merge_sec_cache` returns 0 rather
+        than raising. Mirrors the GDELT/AV/volume guard pattern.
+        """
+        import json as _json
+        import paper_trader.backtest as bt
+        sec_dir = tmp_path / "sec_edgar"
+        sec_dir.mkdir(parents=True, exist_ok=True)
+        # Corrupt cache files — three different wrong-type payloads.
+        (sec_dir / "NVDA_2024-01-01_2024-12-31.json").write_text('{"foo": "bar"}')
+        (sec_dir / "AMD_2024-01-01_2024-12-31.json").write_text('"just a string"')
+        (sec_dir / "MU_2024-01-01_2024-12-31.json").write_text("42")
+        # And one valid file mixed in so we know the good path still works.
+        (sec_dir / "INTC_2024-01-01_2024-12-31.json").write_text(_json.dumps([
+            {"title": "Valid 8-K", "url": "https://sec.gov/INTC/123",
+             "source": "SEC", "published": "2024-06-15",
+             "full_text": "Some filing content"}
+        ]))
+        monkeypatch.setattr(bt, "CACHE_DIR", tmp_path)
+
+        engine = bt.BacktestEngine.__new__(bt.BacktestEngine)
+        engine.start = date(2024, 1, 1)
+        engine.end = date(2024, 12, 31)
+        result: dict = {}
+        # Must not raise.
+        added = engine._merge_sec_cache(result)
+        # Exactly one valid filing merged in; the three corrupt files
+        # contributed nothing.
+        assert added == 1
+        assert "2024-06-15" in result
+        assert result["2024-06-15"][0]["title"] == "Valid 8-K"
