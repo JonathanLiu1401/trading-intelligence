@@ -285,6 +285,56 @@ class TestHelperCatchesLiveNoise:
             assert hit, f"missed live Today's Movers recap: {t!r}"
             assert name == "todays_movers_list"
 
+    def test_is_x_a_buy_after_earnings_recap(self):
+        """Live evidence (2026-05-21, alert_recency.db pushed-alert audit —
+        the canonical record of REAL Discord pushes, distinct from urgency=2
+        in articles.db which also captures gate-suppressed rows): "Is Nvidia
+        a Buy After Their Latest Earnings Report?" fired a real 🚨 BREAKING
+        push at 04:46:07Z from `yfinance/Motley Fool` and repeated from
+        `YahooFinance/NVDA` ml_score 9.79. Both variants — bare leading
+        "Is X a Buy" and subject-leading "Subject Is Still/Now/It a Buy" —
+        are the same post-event valuation-question SEO template. Pin each
+        live failure-case title."""
+        for t in (
+            # Live failure case — exact title that fired.
+            "Is Nvidia a Buy After Their Latest Earnings Report?",
+            # Subject-leading variant — analyst-attributed retrospective call.
+            "Tesla Is Still a Buy After Q1 Beat, Says Wedbush",
+            "NVDA Is Now a Buy After Earnings, Says JPM",
+            # Same template, other tickers / verbs / recap-nouns.
+            "Is AMD a Buy After Q3 Results?",
+            "Is Micron a Buy After Their Latest Quarter?",
+            "Is Lumentum a Sell After Q2 Report?",
+            "Is Oracle a Hold After Q4 Earnings?",
+            "AMD Is It Still a Buy After Q1 Results, Says BofA",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed Is-X-a-Buy-After-earnings recap: {t!r}"
+            assert name == "is_buy_after"
+
+    def test_why_is_x_pct_since_earnings_recap(self):
+        """Live evidence (2026-05-21, alert_recency.db pushed-alert audit):
+        "Why Is AGNC Investment (AGNC) Down 7.2% Since Last Earnings Report?"
+        fired a real 🚨 BREAKING push at 05:19:12Z. The discriminator is the
+        TRIO of leading "^Why Is" + percent-move + "since" — by definition
+        retrospective ("since" anchors the move BEFORE the article was
+        written). Same retrospective class as why_did_stock but present-
+        tense `Is` instead of past-tense `Did`, and requires the
+        `% since` discriminator so real ongoing-move coverage survives."""
+        for t in (
+            # Live failure case — exact title that fired.
+            "Why Is AGNC Investment (AGNC) Down 7.2% Since Last Earnings Report?",
+            # Same template, other tickers / directions / spacing.
+            "Why Is NVDA Up 12.5% Since Q3 Results?",
+            "Why is MU down 5% since earnings",
+            "Why Is Tesla Higher 15.2% Since Their Last Report?",
+            "Why is Lumentum lower 8% since Q2",
+            "Why Is AMD Down 4.5 % Since Last Earnings Call?",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed why-is-pct-since recap: {t!r}"
+            assert name == "why_is_pct_since"
+
 
 # ── _looks_like_recap_template: real breaking headlines MUST survive ───────
 
@@ -422,6 +472,66 @@ class TestHelperPreservesRealBreaking:
         ):
             hit, _ = alert_agent._looks_like_recap_template({"title": t})
             assert not hit, f"false-positive on value/analyst: {t!r}"
+
+    def test_is_buy_after_does_not_catch_forward_or_macro(self):
+        """The is_buy_after pattern must NEVER catch:
+          - Forward-looking PRE-earnings questions (`before earnings`)
+          - "X is a buy" without `after` (a standalone forward-looking call)
+          - Non-investment "Is ... a ..." (Fed/macro/meta questions)
+          - "after" + non-earnings context ("after the crash", "after this
+            rally") — the recap-noun (earnings/results/report/quarter/Q[1-4])
+            terminator is REQUIRED to keep this scoped to post-earnings."""
+        for t in (
+            # Forward-looking — "before" not "after".
+            "NVDA: Is It a Buy Before Earnings?",
+            "Is Tesla a Buy Before Q1 Results?",
+            # Standalone "is a buy" — no "after" → still forward-looking.
+            "AMD is a buy",
+            "Is Nvidia a Buy",
+            "Is AMD a Buy Right Now",
+            # Macro / non-investment "is ... a ..." questions.
+            "Is the Fed about to act?",
+            "Is investing a hobby for retail traders",
+            # "after" present but no earnings-noun → out of scope.
+            "Is Bitcoin headed to 100k after this rally?",
+            "Is AMD a buy after the crash?",
+            "Is gold a buy after the dollar weakness?",
+            # Real analyst raises / target changes / wires — never "is X a buy"
+            "Bank of America raises NVDA price target to $250",
+            "Wedbush says Nvidia likely to top estimates",
+        ):
+            hit, _ = alert_agent._looks_like_recap_template({"title": t})
+            assert not hit, (
+                f"false-positive on forward-looking / macro: {t!r}"
+            )
+
+    def test_why_is_pct_since_does_not_catch_partial_signatures(self):
+        """The why_is_pct_since pattern requires the TRIO of leading "^Why Is"
+        + direction-word + percent + "since". A real headline that uses a
+        SUBSET (just "why is", just "since", just a percent move) must NOT
+        match — that scopes the SEO-mill discriminator tightly enough to
+        preserve all real ongoing-move coverage the analyst NEEDS as urgent."""
+        for t in (
+            # Missing "since" — real ongoing-move questions.
+            "Why is Tesla down?",
+            "Why is the rally fading?",
+            "Why is MU up 12% today",
+            "Why is Nvidia higher 5%",
+            # Missing percent — abstract "why is" without explicit move.
+            "Why is NVDA down since earnings",
+            # Missing "^Why Is" lead — mid-sentence/different verb.
+            "MU down 7% since earnings",
+            "Investors ask why Tesla is down 5% since Q3",
+            "Why MU beat Q3 estimates",
+            "Why investors are bullish on Nvidia ahead of earnings",
+            # Real macro / breaking — none of the trio present.
+            "Fed cuts rates by 50bp, citing labor weakness",
+            "Nvidia Q1 revenue rises 22% to $35.1 billion, beats estimates",
+        ):
+            hit, _ = alert_agent._looks_like_recap_template({"title": t})
+            assert not hit, (
+                f"false-positive on partial why-is-pct-since signature: {t!r}"
+            )
 
     def test_why_just_moved_does_not_catch_forward_looking(self):
         """The why-just-moved pattern requires an adverb between "Stock" and
@@ -612,6 +722,72 @@ class TestSendUrgentAlertIntegration:
         assert "FinancialContent" not in prompt
         # Both ids marked: real on send-success, SEO unconditionally by gate.
         assert sorted(spy.marked) == ["real", "seo"]
+
+    def test_new_is_buy_after_pattern_end_to_end(self, monkeypatch):
+        """End-to-end pin for the new is_buy_after fingerprint: the live
+        failure-case title from 2026-05-21 alert_recency.db must (a) be
+        suppressed without a Discord push, (b) be marked alerted so it
+        exits the urgent queue. Falsifies the live evidence: if this gate
+        regresses the analyst will receive the same noisy post-event
+        valuation-question push again on the next NVDA earnings cycle."""
+        spy = _StoreSpy()
+        row = _row(
+            _id="ibA",
+            title="Is Nvidia a Buy After Their Latest Earnings Report?",
+            source="yfinance/Motley Fool",
+        )
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call") as mock_claude, \
+             patch("notifier.discord_notifier.send") as mock_send:
+            ok = alert_agent.send_urgent_alert([row], spy)
+        assert ok is False
+        mock_claude.assert_not_called()
+        mock_send.assert_not_called()
+        assert spy.marked == ["ibA"], (
+            "is_buy_after recap not marked alerted — would re-fetch every "
+            "20s and fire BREAKING on next batch"
+        )
+
+    def test_new_why_is_pct_since_pattern_end_to_end(self, monkeypatch):
+        """End-to-end pin for the new why_is_pct_since fingerprint: the live
+        failure-case title from 2026-05-21 alert_recency.db must be
+        suppressed and marked alerted. Same shape as the is_buy_after
+        end-to-end test — both target real BREAKING pushes that fired."""
+        spy = _StoreSpy()
+        row = _row(
+            _id="wiP",
+            title="Why Is AGNC Investment (AGNC) Down 7.2% Since Last Earnings Report?",
+            source="GoogleNews/Zacks",
+        )
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call") as mock_claude, \
+             patch("notifier.discord_notifier.send") as mock_send:
+            ok = alert_agent.send_urgent_alert([row], spy)
+        assert ok is False
+        mock_claude.assert_not_called()
+        mock_send.assert_not_called()
+        assert spy.marked == ["wiP"]
+
+    def test_new_patterns_pre_floor_via_urgency_scorer_ssot(self):
+        """Both new patterns are SSOT-shared with `watchers.urgency_scorer`
+        (which imports `_looks_like_recap_template`); the urgency_scorer
+        pre-floor path treats matching titles as noise (score 0.01, urgency 0)
+        without calling Sonnet. Pin both patterns reach that path by asserting
+        the imported helper returns the new fingerprint names — a future
+        local fork that breaks SSOT would fail this guard."""
+        from watchers import urgency_scorer as us
+        # The urgency_scorer module imports _looks_like_recap_template from
+        # alert_agent (the SSOT). If this import ever forks to a local copy,
+        # the assertion below catches it.
+        assert us._looks_like_recap_template is alert_agent._looks_like_recap_template
+        hit_ib, name_ib = us._looks_like_recap_template(
+            {"title": "Is Nvidia a Buy After Their Latest Earnings Report?"}
+        )
+        hit_wp, name_wp = us._looks_like_recap_template(
+            {"title": "Why Is AGNC Down 7.2% Since Last Earnings Report?"}
+        )
+        assert hit_ib and name_ib == "is_buy_after"
+        assert hit_wp and name_wp == "why_is_pct_since"
 
     def test_gate_runs_after_quote_widget_gate(self, monkeypatch):
         """Both gates run BEFORE dedup and both mark-alerted-unconditionally

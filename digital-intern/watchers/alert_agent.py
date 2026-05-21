@@ -511,15 +511,79 @@ _RT_TODAYS_MOVERS = re.compile(
     r"^\s*these\s+stocks\s+are\s+today['’]?s\s+(?:top\s+|biggest\s+)?movers\s*:",
     re.IGNORECASE,
 )
+# "Is <X> a Buy After <Earnings|Q1|Results|Report|Quarter>" — the Motley Fool /
+# Yahoo / TipRanks / InsiderMonkey post-event valuation question template. By
+# the time someone writes "Is Nvidia a Buy After Their Latest Earnings Report?",
+# the print has already crossed the wire, the price has moved, and the analyst
+# has either traded the print or missed it — a standalone 🚨 BREAKING push on
+# this content is by definition retrospective recap, not breaking news.
+#
+# Live evidence (2026-05-21, alert_recency.db pushed-alert audit; the canonical
+# record of REAL Discord pushes, distinct from urgency=2 in articles.db which
+# also captures gate-suppressed rows): "Is Nvidia a Buy After Their Latest
+# Earnings Report?" fired a real BREAKING push at 04:46:07Z from
+# `yfinance/Motley Fool` and was repeated by `YahooFinance/NVDA` ml_score 9.79.
+# Source-credibility tier 0.65-0.68 → above the 0.45 ALERT_MIN_LONE_SOURCE_CRED
+# bar so the authority gate doesn't catch it; content type IS the failure.
+#
+# Discriminator: leading `^Is` + `a (Buy|Sell|Hold)` + the `\bafter\b` bridge +
+# a recap-noun terminator (`earnings|results|report|quarter|Q[1-4]`). The
+# `after` requirement is what makes this retrospective — a forward-looking
+# pre-earnings question ("Is NVDA a Buy Before Earnings?" / "Is AMD a Buy")
+# does NOT match. The recap-noun list bounds it so "Is X a Buy after the
+# crash" without an earnings/results context (a real macro question) is not
+# auto-suppressed either. Validated against the must-survive corpus: real
+# analyst raises ("Bank of America raises NVDA price target", "Wedbush says
+# Nvidia likely to top estimates"), forward-looking previews, and macro
+# headlines all do NOT match because none lead with `^Is ... a Buy/Sell/Hold`.
+_RT_IS_BUY_AFTER = re.compile(
+    # Two leading-anchor variants: bare "Is X a Buy..." (the live failure case)
+    # AND the "Subject Is [Still|Now|It] a Buy..." variant where the ticker
+    # name precedes the verb ("Tesla Is Still a Buy After Q1 Beat, Says
+    # Wedbush"). Both are POST-event valuation questions — the `after` +
+    # earnings-noun terminator is the discriminator.
+    r"^\s*(?:\S+\s+)?is\s+(?:\w+\s+){0,2}a\s+(?:buy|sell|hold)\b.*?"
+    r"\bafter\b.*?\b(?:earnings|results|report|quarter|q[1-4])\b",
+    re.IGNORECASE,
+)
+# "Why Is <X> Down/Up N.N% Since Last <Earnings|Report|Quarter>?" — the
+# Zacks / Seeking Alpha / TipRanks post-event price-attribution template. By
+# definition retrospective ("since" anchors the move BEFORE this article was
+# written), with an explicit percent figure that names the move that already
+# happened. Same retrospective-recap class as `_RT_WHY_DID` ("Why Did X Stock
+# Drop Today") but uses present-tense `Is` instead of past-tense `Did`, and
+# requires the `% since` discriminator to avoid catching real ongoing-move
+# coverage ("Why is the rally fading?", "Why is Tesla down?").
+#
+# Live evidence (2026-05-21, alert_recency.db pushed-alert audit): "Why Is
+# AGNC Investment (AGNC) Down 7.2% Since Last Earnings Report?" fired a real
+# BREAKING push at 05:19:12Z. Source-credibility tier above the 0.45 bar so
+# the authority gate doesn't catch it; the content is pure SEO-mill retro.
+#
+# Discriminator: leading `^Why\s+Is` + `\b(up|down|higher|lower)\b` +
+# `\d+(?:\.\d+)?%` (the explicit move magnitude, REQUIRED) + `\bsince\b` (the
+# explicit temporal anchor placing the move BEFORE the article — REQUIRED).
+# Both `%` and `since` together is the discriminator — either alone is too
+# broad. Validated against the must-survive corpus: "Why is the rally
+# fading?" (no % no since), "Why investors are bullish on Nvidia" (no Is),
+# "MU down 7% since earnings" (no leading Why Is anchor), "Why MU beat Q3
+# estimates" (no up/down/higher/lower + % + since trio) all do NOT match.
+_RT_WHY_IS_PCT_SINCE = re.compile(
+    r"^\s*why\s+is\s+.+?\s+(?:up|down|higher|lower)\s+"
+    r"\d+(?:\.\d+)?\s*%\s+since\b",
+    re.IGNORECASE,
+)
 
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
     ("why_just_moved", _RT_WHY_JUST_MOVED),
+    ("why_is_pct_since", _RT_WHY_IS_PCT_SINCE),
     ("market_today_dated", _RT_MARKET_TODAY),
     ("earnings_call_recap", _RT_EARNINGS_CALL),
     ("earnings_tomorrow_preview", _RT_EARNINGS_TOMORROW),
     ("todays_movers_list", _RT_TODAYS_MOVERS),
+    ("is_buy_after", _RT_IS_BUY_AFTER),
     ("street_thinks", _RT_STREET_THINKS),
     ("gf_value_says", _RT_GF_VALUE),
 )
