@@ -635,7 +635,15 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
 
             reasoning = r["reasoning"] or ""
             ml_score = 0.0
-            m = re.search(r"score=([0-9.+-]+)", reasoning)
+            # Word-boundary anchor so `score=` cannot match inside a longer
+            # identifier (e.g. a future `kw_score=` / `text_score=` / accidental
+            # `underscore=…` token) — mirrors the sibling `\bscorer=` /
+            # `\bconviction=` discipline already used by `_parse_gate_decision`
+            # and `_parse_conviction_pct`. Without `\b`, a `re.search` on
+            # `"underscore=999 score=1.5"` returns `999` (first substring
+            # `score=` lives INSIDE `underscore=`), poisoning the
+            # DecisionScorer's `ml_score` training feature.
+            m = re.search(r"\bscore=([0-9.+-]+)", reasoning)
             if m:
                 try:
                     ml_score = float(m.group(1))
@@ -644,13 +652,17 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
 
             news_urgency: float | None = None
             news_article_count: float | None = None
-            m_urg = re.search(r"news_urg=([0-9.+-]+)", reasoning)
+            # Same word-boundary discipline as `\bscore=` above. The current
+            # `_ml_decide` reasoning emits exactly one `news_urg=` token, but
+            # a `prev_news_urg=` or `max_news_urg=` future addition would
+            # silently match inside the longer identifier without `\b`.
+            m_urg = re.search(r"\bnews_urg=([0-9.+-]+)", reasoning)
             if m_urg:
                 try:
                     news_urgency = float(m_urg.group(1))
                 except ValueError:
                     pass
-            m_cnt = re.search(r"news_count=(\d+)", reasoning)
+            m_cnt = re.search(r"\bnews_count=(\d+)", reasoning)
             if m_cnt:
                 try:
                     news_article_count = float(m_cnt.group(1))
