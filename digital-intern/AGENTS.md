@@ -5,6 +5,125 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 hybrid pass (Agent 3 nightly) — `recap_template_audit.audit_by_source`
+
+A per-source breakdown layer on top of the existing aggregate recap-gate
+calibration. The aggregate `audit()` answers "is the gate still working?";
+analysts pruning low-signal feeds need the next question: WHICH SOURCES
+generate the recap noise? Live evidence (2026-05-21 24h scan): 362 recap
+rows / 39 sources, with the top four — `GN: earnings` (77 hits),
+`Motley Fool` (43), `Nasdaq Markets` (41), `Seeking Alpha Editors` (34) —
+producing 53% of the total. `YahooFinance/NVDA` (14 hits) carries 2
+strong-pool leaks and 6 leaked-urgent rows in the same window — i.e.
+this feed is the worst gate-failure source despite a modest absolute
+count. Aggregate-only audit said `ok=False` without saying WHERE.
+
+New shape (mirrors `source_urgency_yield` discipline — pre-fetched rows
+in, dict out, never raises):
+
+```
+{
+  "window_h": int,
+  "by_source": [
+    {
+      "source": str,
+      "recap_count": int,
+      "by_fingerprint": {<name>: count, ...},  # non-zero only
+      "top_fingerprint": str,                  # highest-count, alpha tie-break
+      "leaked_urgent": int,
+      "leaked_strong_pool": int,
+    },
+    ...                                        # most-recap-first, alpha tie-break
+  ],
+  "total_recap_rows": int,
+  "total_sources": int,
+  "ok": bool,                                  # zero strong-pool leaks across ALL sources
+}
+```
+
+Pure read-side. `_LIVE_ONLY_CLAUSE` is applied so synthetic backtest/opus
+rows can never inflate (or fake) a per-source recap count — pinned by
+`tests/test_recap_template_audit.py::TestAuditBySource::
+test_backtest_rows_excluded_from_per_source_view`. Recap fingerprints
+come from the SSOT `watchers.alert_agent._RECAP_TEMPLATE_PATTERNS`, the
+exact same set the three live gates use (`urgency_scorer.score_batch`
+pre-filter, `alert_agent.send_urgent_alert` suppression,
+`claude_analyst._build_payload` briefing drop) so the per-source view
+can never disagree with what the production gate actually flagged.
+
+CLI:
+
+```sh
+python3 -m analytics.recap_template_audit --by-source --hours 24 --top-n 15
+# JSON → which feeds dominate the recap noise + per-source leak counts
+```
+
+`exit 0` iff `ok==True` (no strong-pool leaks across all sources), so
+the same module can drive a daemon healthcheck — same exit-code
+contract as the aggregate `audit()` mode.
+
+All four load-bearing invariants intact:
+1. Backtest isolation — `LIVE_ONLY_CLAUSE` is applied verbatim; the
+   anti-drift test `test_live_only_clause_in_sync_with_storage` pins it
+   byte-identical to `storage.article_store._LIVE_ONLY_CLAUSE`.
+2. `ml_score` vs `ai_score` separation — no DB writes added; pure
+   read-only `SELECT`.
+3. `score_source` — no mutation. `leaked_strong_pool` reads `score_source='llm'`
+   AND `ai_score>=8.0` (verbatim from the aggregate `audit()`); a regression
+   in either path manifests in BOTH metrics, never one silently.
+4. SSOT — pattern set imported from `alert_agent`; the existing parity
+   guard (`tests/test_urgency_recap_prefilter.py`) covers fingerprint
+   drift between the three gates AND this audit.
+
+10 new tests in `TestAuditBySource` (envelope shape; single-source
+single-fingerprint; sort order recap_count desc + source alphabetical
+tie-break; per-source top_fingerprint with mixed fingerprints;
+leaked_urgent + leaked_strong_pool per-source attribution;
+backtest/opus exclusion; top_n display cap vs. uncapped totals; window
+filtering; non-recap rows do NOT create source entries).
+
+Live findings from the analyst-perspective Phase 3 inspection
+(2026-05-21, NVDA earnings night, ~10h into the wire):
+- **Live data flow healthy** — 3417 articles/h ingested, 91 urgent
+  flagged + 175 alerted in 1h. Wire is dominated by NVDA recovery
+  narrative (686 mentions in 6h of held tickers — 91% of book volume).
+- **Briefing cadence healthy** — latest 2026-05-21T07:36Z, ~10h after
+  prior; one missed slot due to Opus quota window (known external),
+  briefing quality strong (Asia AI rally / SK Hynix +11% / Samsung
+  +8.5% strike-suspension / AMD +8% Taiwan / VIX -3.43%).
+- **`llm_fraction` = 32%** over last 6h (84 LLM-vetted urgent vs 182
+  ml-only) — slightly above the 28% chronic baseline from the prior
+  pass. Per-row `[unverified — model-only urgent]` hedge already on
+  the alert path; the aggregate is exposed via `/api/urgency-label-split`.
+- **`recap_template_audit --by-source` surfaces the worst feed: top
+  recap-producer is `GN: earnings` (77 hits), and the worst
+  gate-failure source is `YahooFinance/NVDA` (14 recap rows / 2
+  strong-pool leaks / 6 leaked-urgent). The earnings-day NVDA wire
+  concentrates SEO-mill `earnings_call_recap` content from yahoo per-
+  ticker RSS; the gate caught most but 2 LLM-tagged urgent rows leaked
+  into the strong training pool — a real, current `ok=False` signal
+  the analyst would not otherwise see.
+- **Stale Yahoo per-ticker feeds** — `YahooFinance/LITE` (39 rows),
+  `YahooFinance/AMAT` (57), `YahooFinance/AXTI` (22) all silent >9h
+  while other Yahoo channels (`YahooFinance/NVDA`) are firing every
+  cycle. Investigate `collectors/yahoo_ticker_rss.py` per-ticker
+  round-robin for held names without major news flow.
+- **Lock contention chronic** — `stats` reader hit `'another row
+  available'` retries 8× in last 5min during heavy NVDA-night writer
+  contention. Recovery works (5-retry budget absorbed every collision),
+  but this is the same `di-insert-batch-lock-contention.md` memory
+  pattern. Not a fresh bug.
+
+**Staging discipline.** Sibling claude agents (paper-trader hybrid 1 &
+2) are visible in `ps -ef`; the auto-commit daemon is running on the
+monorepo. The commit used explicit pathspec
+(`git add analytics/recap_template_audit.py tests/test_recap_template_audit.py`);
+`git diff --staged` confirmed only the intentional changes were
+included. No `git add -A`, no `config/`/`data/`/`logs/` files staged.
+AGENTS.md committed alongside the related code in this same step.
+
+---
+
 ## 2026-05-21 hybrid pass (Agent 3b) — two new recap-template fingerprints
 
 Two SEO-mill / retrospective-recap templates were still firing real
