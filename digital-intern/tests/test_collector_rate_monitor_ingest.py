@@ -154,10 +154,14 @@ def test_collect_rate_alerts_emits_prescored_articles(monkeypatch, tmp_path):
     """)
     # 7 days of articles ~10/day = 70 over 7d, baseline ≈ 10/day. Need >=50/day.
     # Insert 400 rows in the past 7d but NOT in the last 3h, so daily_avg = ~57
-    # and cnt_window = 0.
+    # and cnt_window = 0. Timestamps MUST be anchored to ``datetime.now()`` —
+    # the collector uses SQL ``datetime('now', '-3 hours')`` / ``-7 days``, so
+    # a hard-coded ``now`` (e.g. 2026-05-20) silently breaks the test the
+    # moment wall-clock time passes that date and all rows fall outside the
+    # 7-day baseline window.
     import sqlite3 as sql
     import datetime as dt
-    now = dt.datetime(2026, 5, 20, 17, 0, 0, tzinfo=dt.timezone.utc)
+    now = dt.datetime.now(dt.timezone.utc)
     rows = []
     for i in range(400):
         # Spread across 7d, all OLDER than 3h ago.
