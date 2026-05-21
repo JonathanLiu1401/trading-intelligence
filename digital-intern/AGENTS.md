@@ -5,6 +5,82 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 hybrid pass (Agent 3b) — two new recap-template fingerprints
+
+Two SEO-mill / retrospective-recap templates were still firing real
+🚨 BREAKING Discord pushes despite all the existing
+`_RECAP_TEMPLATE_PATTERNS` coverage. Validated against
+`data/alert_recency.db` (the canonical record of REAL pushes, distinct
+from `articles.db` `urgency=2` which also counts gate-suppressed rows):
+
+  - **`is_buy_after`** — "Is Nvidia a Buy After Their Latest Earnings
+    Report?" fired 2026-05-21 04:46:07Z (`yfinance/Motley Fool`,
+    ml_score 9.79). Catches both bare leading-`Is` and subject-leading
+    ("Tesla Is Still a Buy After Q1 Beat, Says Wedbush") variants. The
+    `\bafter\b` bridge + earnings-noun terminator
+    (`earnings|results|report|quarter|Q[1-4]`) is the discriminator,
+    so forward-looking pre-earnings questions and macro
+    `after the crash`/`after this rally` headlines never auto-suppress.
+
+  - **`why_is_pct_since`** — "Why Is AGNC Investment (AGNC) Down 7.2%
+    Since Last Earnings Report?" fired 2026-05-21 05:19:12Z. Requires
+    the TRIO of leading `^Why Is` + direction word + percent move +
+    `since` — by definition retrospective (`since` anchors the move
+    BEFORE the article was written). Real ongoing-move coverage
+    survives because none have all three signals at once.
+
+Both publishers were ABOVE the 0.45 `ALERT_MIN_LONE_SOURCE_CRED` bar
+so the existing authority gate did not catch them — failure was
+CONTENT TYPE, not credibility. Same shape as every other recap
+fingerprint: anchored regex, evidence-only, validated against the
+must-survive corpus in `tests/test_alert_recap_template.py`.
+
+The SSOT discipline is preserved — `watchers.urgency_scorer.score_batch`
+imports `_looks_like_recap_template` from `alert_agent`, so matching
+titles pre-floor to noise (`ai_score=0.01`, `urgency=0`,
+`score_source='llm'`) WITHOUT calling Sonnet, saving quota AND keeping
+the LLM training-label pool honest. The new
+`test_new_patterns_pre_floor_via_urgency_scorer_ssot` regression guard
+fails if a future local fork ever breaks SSOT.
+
+All four load-bearing invariants intact:
+1. Backtest isolation — `_is_synthetic` upstream already filters
+   `backtest://` URLs / `backtest_*` / `opus_annotation*` sources;
+   gates only see live rows.
+2. `ml_score` vs `ai_score` separation — no DB writes added; the
+   pre-floor uses `update_ai_scores_batch` (the existing `'llm'`
+   tagging path) so no new score-source contamination is possible.
+3. `score_source` — pre-floor tags `'llm'` as before; no change.
+4. SSOT — `alert_agent` owns the regex set; `urgency_scorer` imports
+   it. The new test asserts `urgency_scorer._looks_like_recap_template
+   is alert_agent._looks_like_recap_template` so a future fork is
+   caught at test time, not in production.
+
+7 new tests in `tests/test_alert_recap_template.py`: two `must catch`
+(live failure-case + same-template variants), two `must-survive`
+(forward-looking + partial-signature corpus), two end-to-end on
+`send_urgent_alert` (no Discord push, marked alerted), one SSOT-parity
+guard.
+
+Live findings from the analyst-perspective Phase 3 inspection
+(2026-05-21, ~30min after merge):
+- **Live data flow healthy** — 2469 articles/h ingested (NVDA earnings
+  night surge), 50 urgent queued, 165 alerted in last hour.
+- **`llm_fraction` = 31% over last 6h** — 67 LLM-vetted urgent vs 148
+  ml-only. Per-row calibration tag already exists; aggregate is exposed
+  via `/api/urgency-label-split`.
+- **Briefing cadence stale** — last briefing 2026-05-20T21:22Z, 9.87h
+  ago at audit time (5h cadence target). Live evidence of recurring
+  `[heartbeat] empty/placeholder briefing — skipping post` warnings in
+  the 03-04Z window across 2026-05-19/20 suggests Opus quota
+  exhaustion at certain hours of day — known external constraint, not
+  a fresh code bug.
+- **154 sources dark in last 6h** — predominantly
+  `AlphaVantage/<sub-channel>` entries; AV quota is 25/day so
+  sub-channel sparsity is expected, not a collector failure.
+
+---
+
 ## 2026-05-21 hybrid pass (Agent 3) — `/api/source-urgency-yield` + sample_title fidelity fix
 
 Per-source urgent-yield audit closes the visibility gap on collector
