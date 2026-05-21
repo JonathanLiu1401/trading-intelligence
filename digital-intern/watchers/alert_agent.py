@@ -588,12 +588,60 @@ _RT_WHY_IS_PCT_SINCE = re.compile(
     r"\d+(?:\.\d+)?\s*%\s+since\b",
     re.IGNORECASE,
 )
+# "Why <X> Stock Is [adverb]? <present-state-action> After <Earnings|Q1|Results|...>"
+# — the Barron's / MSN / Yahoo post-event price-attribution recap template.
+# Distinct from the existing why-recap variants:
+#   - _RT_WHY_TRADING requires "trading up/down today" (today + direction)
+#   - _RT_WHY_DID requires "Did" between Why and subject
+#   - _RT_WHY_JUST_MOVED requires past-tense verb with adverb (just / now / ...)
+#   - _RT_WHY_IS_PCT_SINCE requires explicit "% since" trio
+# This shape is "Why X Stock Is <state-verb> After <event>" — present-tense,
+# retrospective via the "after" + earnings-noun anchor placing the move BEFORE
+# the article was written. None of the existing four caught it.
+#
+# Live evidence (2026-05-21 NVDA earnings night, alerted urgency=2 rows
+# 10:37:16Z + 10:50:41Z): "Why Nvidia Stock Is Barely Moving After Earnings
+# Crushed Expectations" fired BREAKING twice on Barron's + MSN syndication
+# (the cross-cycle dedup caught the THIRD copy at 10:59:00Z but the analyst
+# had already received two pushes). Pure SEO/recap post-event explainer.
+#
+# Discriminator: leading `^Why\s+...\s+Stock\s+Is` + (adverb)? + a
+# present-state action verb from a closed list + `\bafter\b` + recap-noun
+# (earnings|results|report|quarter|q[1-4]|beat|miss|guidance). The closed
+# action-verb list is what makes this safe: "Why X Stock Is the Best Buy"
+# does NOT match because "the" is not a present-state action verb; "Why X
+# stock could rise after earnings" does NOT match because "could" is not in
+# the verb list. The "after" + recap-noun terminator is REQUIRED so a real
+# ongoing question ("Why X stock is moving") doesn't match.
+_RT_WHY_STOCK_IS_AFTER = re.compile(
+    r"^\s*why\s+.+?\s+stock\s+is\s+"
+    # Optional qualifying adverb (live evidence: "barely"; plausible extensions
+    # the same SEO template uses: still / now / finally / just / currently /
+    # actually / suddenly / hardly / so / really).
+    r"(?:still\s+|barely\s+|now\s+|finally\s+|just\s+|currently\s+|"
+    r"actually\s+|suddenly\s+|hardly\s+|so\s+|really\s+)?"
+    # Closed list of present-state action verbs / state adjectives. Each is a
+    # past-or-present description of what the stock IS doing — never a future-
+    # tense "could/may/might" or a non-action filler. Matches the live failure
+    # case (Barely Moving) plus the same retrospective shape with synonymous
+    # verbs the template family uses.
+    r"(?:moving|trading|sliding|sinking|tumbling|crashing|plunging|"
+    r"jumping|surging|soaring|rising|falling|climbing|dropping|"
+    r"rallying|spiking|tanking|sliding|skyrocketing|nosediving|"
+    r"up|down|higher|lower|flat|stuck|red|green|bid|offered)"
+    r"\b.*?"
+    # Required "after" + recap-noun terminator — the retrospective anchor.
+    r"\bafter\b.*?\b"
+    r"(?:earnings|results|report|quarter|q[1-4]|beat|miss|guidance)\b",
+    re.IGNORECASE,
+)
 
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
     ("why_just_moved", _RT_WHY_JUST_MOVED),
     ("why_is_pct_since", _RT_WHY_IS_PCT_SINCE),
+    ("why_stock_is_after", _RT_WHY_STOCK_IS_AFTER),
     ("market_today_dated", _RT_MARKET_TODAY),
     ("earnings_call_recap", _RT_EARNINGS_CALL),
     ("earnings_tomorrow_preview", _RT_EARNINGS_TOMORROW),
