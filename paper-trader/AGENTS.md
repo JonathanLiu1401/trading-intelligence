@@ -6,6 +6,84 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 paper-trader-core HYBRID pass (Agent 1)
+
+**Phase 1 — bug fix (bugs_fixed: 1).** `runner.main()` opened a SECOND
+sqlite3 connection inline — no WAL pragma, no busy_timeout, missing the
+schema-true `qty > 0` filter — purely to read the held set for
+`compute_interval`. Two real risks: (a) duplicated reader competes with
+the singleton store for the WAL lock without the 30s busy_timeout, so
+under contention `except: pass` silently degrades the dynamic-interval
+calc to "0 positions" — a real held earnings day reads as
+MARKET_CLOSED; (b) a torn `upsert_position` could leave `qty=0` with
+`closed_at IS NULL`, inflating the held set with rows that have no
+exposure. Extracted into `runner._open_position_tickers_for_interval`,
+which goes through `store.open_positions()` (same lock, qty>0 filter,
+WAL discipline). Five new tests in `TestOpenPositionTickersForInterval`
+pin shape, empty case, fault degradation (with logged diagnostic),
+missing/None ticker rejection, and a regression sentinel that fires if
+any future refactor reintroduces raw sqlite on this path. Commit
+`1c8a9f8`.
+
+**Phase 2 — feature (features_added: 1).** `reporter._session_close_countdown_line`
+— the natural complement to `_next_session_line`. When market is OPEN,
+surfaces a one-line `MARKET ◈ open — closes at HH:MM ET (in Xh Ym)` in
+the hourly Discord summary. The two helpers are mutually exclusive:
+one fires when closed, the other when open. Why this matters for the
+desk that lives in Discord, not the dashboard: (a) sizing-near-the-bell
+awareness (10-min-to-close vs 3h-to-close is a materially different
+sizing decision an out-of-office phone check otherwise misses); (b)
+**half-day legibility** — on NYSE early-close half-days the bell rings
+at 13:00 ET, not 16:00, and a 12:00 ET hourly that said "16:00 ET"
+would silently mislead the operator. The line emits the ACTUAL bell so
+a half-day reads `closes at 13:00 ET (in 1h)`. Composes
+`market.next_session_close` + `market.seconds_until_close` verbatim
+(SSOT). 14 new tests in `TestSessionCloseCountdownLine` pin the
+shape, half-day-vs-regular split, complement invariant across 6
+timepoints (`_next_session_line` and the new one never co-fire), bell-
+minute silence (no fake "in 0m"), fault degradation, and wiring into
+`send_hourly_summary`. Commit `65bbfba`.
+
+**Phase 3 — live validation (user_findings: 6).**
+1. Dashboard at :8090 healthy — `/api/runner-heartbeat` verdict
+   HEALTHY, last decision 14s ago. `/api/notify-health` HEALTHY (last
+   Discord send succeeded). `/api/build-info` confirms boot_sha now
+   `1c8a9f8` (= my Phase 1 commit) — the trader picked it up and
+   restarted within the git-watcher poll window.
+2. **5 consecutive NO_DECISION cycles** flagged on the heartbeat
+   headline. Root cause per `/api/host-guard`: 5 concurrent Opus
+   processes (load1=6.57, load15=11.36, swap_used 72.5%) — the
+   documented host-saturation class (`pt-no-decision-host-saturation`
+   memory). Not a bug to fix; the pre-flight guard and mid-call re-
+   probe are working as documented. Op-side action: reduce
+   out-of-band concurrent Opus agents.
+3. Portfolio: $1011.95 total, $565.08 cash, NVDA 2 shares (44% of
+   book). Up +1.2% from $1000 start; sole position. Heartbeat shows
+   `secs_since_last_decision: 14.2s` against a 60-min closed-cadence
+   expectation — well within window.
+4. Singleton lock: ACQUIRED (pid 548156). Not degraded. The
+   2026-05-17 double-trade pathology is not currently active.
+5. `boot_sha`=`1c8a9f8`, `head_sha`=`fe27997`, `behind: 2`,
+   `stale: true` — the git-watcher will restart again within
+   ~3min to pick up Phase 2 (`65bbfba`) + a sibling commit. Working
+   as designed; the deferred-restart deadman is the safety net.
+6. The /alive endpoint mentioned in some legacy docs returns 404 —
+   the real liveness probe is `/api/healthz` (returns `ok: true`
+   + uptime + lock state). Worth noting in any onboarding doc that
+   refers to /alive.
+
+**Phase 4 — final verify**: `tests/test_core_*.py` → 698 passed
+across runner, runner_cycle, market, signals, store, reporter,
+strategy. Imports clean. Focused subset finishes in ~8s. Full suite
+~25 min per memory (`pt-test-suite-timing`).
+
+**Counters:** bugs_fixed=1 (raw-sqlite read in main loop) ·
+features_added=1 (`_session_close_countdown_line`) ·
+user_findings=6 (listed above). Commits: `1c8a9f8` (fix),
+`65bbfba` (feat). 19 new tests added, all passing.
+
+---
+
 ## 2026-05-21 ML+backtest HYBRID pass #2 (Agent 2)
 
 **Phase 1 — bug fix (bugs_fixed: 0).** The surface is heavily mined by 30+
