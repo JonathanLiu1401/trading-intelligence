@@ -668,13 +668,51 @@ _RT_WHY_STOCK_IS_AFTER = re.compile(
     r"(?:earnings|results|report|quarter|q[1-4]|beat|miss|guidance)\b",
     re.IGNORECASE,
 )
+# "Why <X> Is <up|down|higher|lower> N.N% After <event>" — the Zacks /
+# StockStory / MSN post-event price-attribution recap template that lacks an
+# explicit ``Stock`` token (so ``_RT_WHY_STOCK_IS_AFTER`` doesn't anchor) and
+# uses ``after`` rather than ``since`` (so ``_RT_WHY_IS_PCT_SINCE`` doesn't
+# trigger). Same retrospective shape as both, distinct phrasing.
+#
+# Live evidence (2026-05-21, alert_recency.db pushed-alert audit): "Why AXT
+# (AXTI) Is Down 14.2% After Betting Big On AI-Focused Indium Phosphide
+# Expansion" fired a real BREAKING push at 11:14:35Z. Source-credibility tier
+# above the 0.45 bar so the authority gate doesn't catch it; content type IS
+# the failure. The 14.2% move was already in the market by the time the recap
+# was written and the "After Betting Big ..." terminator names the prior event
+# the move is being retrospectively attributed to.
+#
+# Discriminator: leading ``^Why\s+`` + arbitrary subject (``.+?``) + auxiliary
+# (``is/are/was/were``) + direction (``up/down/higher/lower``) + explicit move
+# (``\d+(?:\.\d+)?\s*%``) + ``after\b``. The auxiliary + direction + % + after
+# quad is the discriminator — a real ongoing question ("Why is Tesla down?")
+# lacks the % digit; a real earnings beat ("Nvidia Q1 revenue rises 22%")
+# lacks the ``^Why ... Is ... after`` anchor; a forward-looking question
+# ("Why NVDA Stock Could Rise 10% After Q1") uses "could" not "is". The
+# AGNC ``% since`` variant is already caught by ``_RT_WHY_IS_PCT_SINCE`` so
+# this pattern deliberately requires ``after`` not ``since`` — the two
+# fingerprints are mutually exclusive on their terminator.
+_RT_WHY_PCT_AFTER = re.compile(
+    r"^\s*why\s+.+?\s+(?:is|are|was|were)\s+"
+    r"(?:up|down|higher|lower)\s+"
+    r"\d+(?:\.\d+)?\s*%\s+"
+    r"after\b",
+    re.IGNORECASE,
+)
 
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
     ("why_just_moved", _RT_WHY_JUST_MOVED),
     ("why_is_pct_since", _RT_WHY_IS_PCT_SINCE),
+    # ``why_stock_is_after`` is the strictly more-specific sibling of
+    # ``why_pct_after`` (the title has a ``Stock`` token AND a state verb AND
+    # an earnings-noun terminator) — must run first so a title like
+    # "Why NVDA Stock Is Down 3% After Q1 Earnings" gets the more-precise
+    # fingerprint name. The two gates are otherwise mutually compatible:
+    # whichever fires, the row is suppressed identically.
     ("why_stock_is_after", _RT_WHY_STOCK_IS_AFTER),
+    ("why_pct_after", _RT_WHY_PCT_AFTER),
     ("market_today_dated", _RT_MARKET_TODAY),
     ("earnings_call_recap", _RT_EARNINGS_CALL),
     ("earnings_tomorrow_preview", _RT_EARNINGS_TOMORROW),

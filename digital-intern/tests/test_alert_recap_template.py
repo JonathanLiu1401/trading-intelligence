@@ -335,6 +335,83 @@ class TestHelperCatchesLiveNoise:
             assert hit, f"missed why-is-pct-since recap: {t!r}"
             assert name == "why_is_pct_since"
 
+    def test_why_x_is_pct_after_recap(self):
+        """Live evidence (2026-05-21, alert_recency.db pushed-alert audit):
+        "Why AXT (AXTI) Is Down 14.2% After Betting Big On AI-Focused Indium
+        Phosphide Expansion" fired a real 🚨 BREAKING push at 11:14:35Z. The
+        existing four "Why X ..." recap fingerprints all use different
+        phrasings:
+          - _RT_WHY_TRADING requires "trading up/down today"
+          - _RT_WHY_DID requires "Did" between Why and subject
+          - _RT_WHY_JUST_MOVED requires past-tense verb after adverb
+          - _RT_WHY_IS_PCT_SINCE requires explicit "% since" trio
+          - _RT_WHY_STOCK_IS_AFTER requires "stock is" + state-verb + after +
+            earnings-noun
+        None catches the present-tense ``Is <direction> N% After <event>``
+        shape with arbitrary terminator. Pin the live failure-case title plus
+        plausible same-template siblings."""
+        for t in (
+            # Live failure case — exact title that fired.
+            "Why AXT (AXTI) Is Down 14.2% After Betting Big On AI-Focused Indium Phosphide Expansion",
+            # Same template, other tickers / directions / spacing.
+            "Why MU Is Down 7% After Q3 Guidance Cut",
+            "Why NVDA Is Up 5.2% After New AI Chip Launch",
+            "Why Tesla Is Down 12% After Delivery Miss",
+            "Why Lumentum (LITE) Is Lower 3.8% After Slowing Telecom Outlook",
+            "Why AMD Are Up 4.5 % After Analyst Day",
+            "Why Intel Was Down 2.1% After Foundry Loss",
+            "Why Oracle is higher 6% After Cloud Beat",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed why-pct-after recap: {t!r}"
+            assert name == "why_pct_after", (
+                f"wrong fingerprint for {t!r}: got {name!r}"
+            )
+
+    def test_why_pct_after_does_not_over_catch(self):
+        """The why_pct_after pattern requires the QUAD of leading ``^Why`` +
+        subject + ``is/are/was/were`` + direction (``up|down|higher|lower``) +
+        explicit % move + ``after``. Any real headline lacking one element of
+        that quad MUST NOT match — otherwise this gate would suppress legit
+        ongoing-move analysis. AGNC's ``% since`` variant is deliberately
+        caught by a SIBLING fingerprint (``_RT_WHY_IS_PCT_SINCE``) — this one
+        must scope to ``after`` only so the two never overlap."""
+        for t in (
+            # Missing %.
+            "Why is Tesla down?",
+            "Why is the rally fading?",
+            "Why is MU up today",
+            "Why Lumentum is lower after Q2",
+            # Missing direction word.
+            "Why AXTI Is 14.2% After Earnings",
+            "Why Tesla Is Trading After Hours",
+            # Missing is/are/was/were auxiliary.
+            "Why AXTI Down 14% After Earnings",
+            "Why investors are bullish on Nvidia",
+            # Missing after.
+            "Why AXTI Is Down 14.2% on Earnings",
+            "Why MU Is Down 7% Today",
+            # Forward-looking — "could/may/might" not "is".
+            "Why NVDA Stock Could Rise 10% After Q1",
+            "Why MU stock may climb 5% after Q3 results",
+            # ``% since`` is the sibling pattern's territory — NOT this one.
+            "Why Is AGNC Investment (AGNC) Down 7.2% Since Last Earnings Report?",
+            # Real news that mentions a % move.
+            "Nvidia Q1 revenue rises 22% to $35.1 billion, beats estimates",
+            "MU shares halted on pending news",
+            "Fed cuts rates by 50bp, citing labor weakness",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            # AGNC variant SHOULD be caught — but by why_is_pct_since, not us.
+            if "since" in t.lower():
+                assert hit and name == "why_is_pct_since", (
+                    f"AGNC-shaped variant fingerprint drifted: {t!r} → {name!r}"
+                )
+                continue
+            assert not hit, (
+                f"why_pct_after over-caught: {t!r} (name={name})"
+            )
+
     def test_why_x_stock_is_after_earnings_recap(self):
         """Live evidence (2026-05-21 NVDA earnings night, articles.db
         urgency=2 set): "Why Nvidia Stock Is Barely Moving After Earnings

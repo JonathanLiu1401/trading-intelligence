@@ -5168,5 +5168,9 @@ class TestHourlySummaryStaleMarkBugFix:
         monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
         assert reporter.send_hourly_summary() is True
         body = captured[0]
-        assert "STALE" not in body
+        # Position-line stale annotation must not render for a clean book.
+        # Match the annotation token, not bare "STALE": unrelated ATTENTION
+        # verdicts (UNSUPERVISED_STALE / STALE_BOOK / STALE_CURVE) contain
+        # the substring and are not the position flag.
+        assert "⚠ STALE" not in body
         assert "+20.0%" in body
