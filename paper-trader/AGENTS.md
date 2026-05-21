@@ -6,6 +6,58 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 HYBRID pass (Agent 1, paper-trader core) — verb-noise filter + reasoning_action_verbs coverage
+
+A debug + feature + live-validation pass over the live-trader core
+(`runner.py`, `reporter.py`, `signals.py`, `strategy.py`, `dashboard.py`,
+`market.py`, `store.py`).
+
+### Phase 1 — test coverage for `reasoning_action_verbs`
+
+`paper_trader/analytics/reasoning_action_verbs.py` (the action-verb
+internal-consistency builder — does Opus's *prose* agree with the
+structured `action` field on the same decision?) shipped with **no test
+coverage**. Added `tests/test_reasoning_action_verbs.py` — 69 tests pinning
+the cue scanner (BUY/SELL/HOLD verbs + conjugations), the negation window
+("would not add" → no vote), the hedge window ("if X, then add" → no
+vote — one-directional, preceding words only), option-verb direction
+mapping (`BUY_CALL`→BUY, `SELL_PUT`→BUY, `SELL_CALL`→SELL, `BUY_PUT`→SELL),
+the verdict matrix, the state ladder (`INSUFFICIENT`/`CLEAN`/`MILD`/
+`NOTABLE`/`ALARMING` with exact thresholds), inner-JSON action preference
+over the outer FILLED/BLOCKED suffix, and graceful degrade on garbage.
+
+### Phase 2 — `signals._extract_tickers` headline-verb noise filter
+
+Live headlines were still leaking finance verbs/plural-nouns into the
+per-article `tickers` field Opus reads: "Nvidia BLOWS PAST estimates" →
+`tickers=BLOWS`, "NVDA TANKS on guidance" → `tickers=TANKS`, "Q3 SALES
+TOPPED" → `tickers=SALES,TOPPED`. Each polluted token reads to Opus as a
+non-existent watchlist name. Added BLOWS / CLIMB(ED)(S) / EDGES / LOWS /
+SALES / SINK(S) / SLID / SLIDE(S) / SLIP(S) / SOAR(ED) / TALKS / TANKS /
+TOPPED / TUMBLE(S) to `_NOT_TICKERS`. Each verified NOT to collide with a
+known real-money ticker; BIRD/ME/REAL/CHIP are deliberately left out
+(genuine listed tickers — their `$cashtag` path stays correct). The
+cashtag asymmetry is preserved (an explicit `$TANKS` is still extracted).
+
+### Phase 3 — live validation findings (advisory, no code change)
+
+1. **NO_DECISION storm** — 46% of recent decisions NO_DECISION, 100%
+   `host_saturated` (7–9 concurrent Opus subprocesses). Self-inflicted by
+   the parallel review/HYBRID agents; the pre-flight `host_guard`
+   correctly skips the doomed Opus call. Self-resolves when the review
+   session ends — not a code bug.
+2. **Concentration** — NVDA 65.8% of the book (single position);
+   `/api/risk` correctly flags `concentration_severity=HIGH`.
+3. **Scorer/Opus disagreement** — `/api/disagreement` shows the
+   DecisionScorer flags EXIT on NVDA while Opus stays long (advisory by
+   design — the scorer has no path to `_execute`).
+
+All 770 core tests + the 69 new tests pass. `runner.log` was stale (last
+write hours behind wall-clock — the runner writes to journald; a known
+non-issue).
+
+---
+
 ## 2026-05-21 feature-dev pass (Agent 4) — `/api/hourly-pnl-fingerprint` + `/api/weekday-pnl-fingerprint`
 
 Two new observational endpoints surfacing a structural read no
