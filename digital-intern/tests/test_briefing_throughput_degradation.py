@@ -123,6 +123,26 @@ class TestThroughputDegradationLines:
         assert len(lines) == 1
         assert lines[0].startswith("good —")
 
+    def test_ties_on_loss_and_prior_do_not_crash(self):
+        """Two rows with identical (abs_loss, prior) must sort cleanly — the
+        tuple's trailing element used to be the row dict, so Python fell back
+        to comparing dicts and raised ``TypeError: '<' not supported between
+        instances of 'dict' and 'dict'`` for the entire ``_throughput_
+        degradation_lines`` call (live evidence: bubbled to ``analyze()`` and
+        blanked a 5h heartbeat). The tiebreaker is now the source name so a
+        stable string comparison resolves the tie deterministically."""
+        rows = [
+            {"source": "rss_b", "recent": 0, "prior": 50,
+             "delta": -50, "decel_pct": 100.0},
+            {"source": "rss_a", "recent": 0, "prior": 50,
+             "delta": -50, "decel_pct": 100.0},
+        ]
+        lines = claude_analyst._throughput_degradation_lines(rows)
+        assert len(lines) == 2
+        # Alphabetical tiebreak on identical abs_loss/prior — both lines emit.
+        assert lines[0].startswith("rss_a —")
+        assert lines[1].startswith("rss_b —")
+
 
 class TestBuildPayloadWiring:
     def test_section_emitted_when_throughput_provided(self):
