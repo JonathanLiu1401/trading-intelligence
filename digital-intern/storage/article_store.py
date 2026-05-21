@@ -1213,6 +1213,99 @@ class ArticleStore:
         }
 
     @_retry_on_lock
+    def urgency_label_split_by_source(
+        self, hours: int = 24, top_n: int = 15
+    ) -> dict:
+        """Per-source breakdown of urgent rows by score_source — answers
+        the analyst's "WHICH FEEDERS are driving the unverified rate?"
+        question that the aggregate ``urgency_label_split`` cannot.
+
+        Live evidence (2026-05-19 → 2026-05-21): the aggregate metric has
+        been pinned at ``mostly_unverified`` (29% LLM-vetted, 71% ML-only)
+        for days; the analyst knows the *rate* is bad but not which
+        collectors generate the bulk of the ML-only firings, so the action
+        ("prune the worst feeders") is ungrounded. This is the natural
+        complement — same data, sliced by ``source`` — so the next step
+        becomes "yfinance/Motley Fool produced 80 of the 283 ML-only
+        urgent rows" rather than guesswork.
+
+        Sibling to ``source_freshness`` / ``source_throughput`` /
+        ``ticker_mention_velocity`` (same one-call-instead-of-eyeballing-
+        the-log ergonomics, same ``_LIVE_ONLY_CLAUSE`` discipline).
+        Returns one row per source that contributed at least one urgent
+        article in the window:
+
+          * ``source``         — verbatim ``articles.source`` value
+          * ``total``          — urgent rows from this source in the window
+          * ``llm``            — tagged ``score_source='llm'``
+          * ``ml``             — tagged ``score_source='ml'``
+          * ``briefing_boost`` — tagged ``score_source='briefing_boost'``
+          * ``null``           — legacy / pre-migration rows with no tag
+          * ``llm_fraction``   — ``(llm + briefing_boost) / total``
+
+        Rows are sorted most-ml-only-first (``ml`` desc) so the worst
+        offenders surface at the top; alphabetical by ``source`` for ties
+        (mirrors ``source_throughput``'s deterministic-tiebreak convention).
+        Capped at ``top_n``; ``total_sources`` returns the full count so
+        a UI can report "showing 15 of 47".
+
+        Read-only (single GROUP BY SELECT) with ``_LIVE_ONLY_CLAUSE`` so
+        the synthetic backtest/opus rows never inflate the per-source
+        figure — exactly the discipline the aggregate metric carries and
+        the recurring partial-filter regression class
+        (``analytics/trend_velocity.py``) violates. NO DB write, no
+        ai_score/ml_score/score_source/urgency mutation. All four
+        load-bearing invariants intact by construction.
+        """
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        rows = self.conn.execute(
+            "SELECT source, score_source, COUNT(*) FROM articles "
+            f"WHERE urgency>=1 AND first_seen >= ? AND {_LIVE_ONLY_CLAUSE} "
+            "GROUP BY source, score_source",
+            (since,),
+        ).fetchall()
+
+        per_source: dict[str, dict[str, int]] = {}
+        for source, src_tag, n in rows:
+            bucket = per_source.setdefault(
+                source or "",
+                {"llm": 0, "ml": 0, "briefing_boost": 0, "null": 0},
+            )
+            key = (src_tag if src_tag in ("llm", "ml", "briefing_boost")
+                   else "null")
+            bucket[key] += int(n or 0)
+
+        materialised: list[dict] = []
+        for source, b in per_source.items():
+            total = b["llm"] + b["ml"] + b["briefing_boost"] + b["null"]
+            if total == 0:
+                continue  # defensive — shouldn't happen, dropped row by row
+            vetted = b["llm"] + b["briefing_boost"]
+            materialised.append({
+                "source": source,
+                "total": total,
+                "llm": b["llm"],
+                "ml": b["ml"],
+                "briefing_boost": b["briefing_boost"],
+                "null": b["null"],
+                "llm_fraction": round(vetted / total, 4),
+            })
+
+        # Most-ml-only-first; alphabetical tiebreak. Worst-offender feeders
+        # surface at the top so the analyst's "which sources do I prune?"
+        # question has an immediate answer.
+        materialised.sort(key=lambda r: (-r["ml"], r["source"]))
+
+        return {
+            "window_h": int(hours),
+            "by_source": materialised[: max(int(top_n), 0)],
+            "total_urgent": sum(r["total"] for r in materialised),
+            "total_sources": len(materialised),
+        }
+
+    @_retry_on_lock
     def source_freshness(self) -> list[dict]:
         """Per-source liveness view: for every live source, its live-row count
         and how long ago its most recent article landed.
