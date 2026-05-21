@@ -419,6 +419,64 @@ def _parse_gate_decision(reasoning: str | None) -> tuple[float | None, bool | No
         return None, None
 
 
+def _parse_conviction_pct(reasoning: str | None) -> float | None:
+    """Extract the position-sizing **conviction** the gate emitted at decision
+    time from a backtest decision's ``reasoning`` string.
+
+    ``backtest._ml_decide`` ends every BUY's reasoning with
+    ``conviction={conviction:.0%}`` (e.g. ``conviction=25%``), where
+    ``conviction`` is the fraction of total portfolio value sized into that
+    trade (post gate/regime/leveraged-ETF modulation). The token is already
+    emitted by every BUY; capturing it as a structured field in the
+    outcome row unlocks sizing-weighted realized analysis:
+
+      * does higher conviction predict higher realized return?
+        (calibration of the sizing rule itself)
+      * what is the realized return of trades the gate actually sized DOWN
+        (×0.6 / ×0.85 arms) vs sized UP (×1.15 / ×1.3 arms) — the GATE's
+        net effect on the portfolio rather than the model's rank skill
+        (the `gate_pnl` question, but with TRUE then-applied sizing rather
+        than a re-predict-and-multiply reconstruction).
+      * are there persona × conviction interactions worth pinning?
+        (`persona_skill` joined to this column)
+
+    Returns the conviction as a **fraction** in ``[0.0, 1.0]`` (so
+    ``conviction=25%`` ⇒ ``0.25``), matching the inference-side variable's
+    unit. Returns ``None`` when no ``conviction=`` token is present — SELL
+    reasoning never carries one (the token is BUY-only, same scope as the
+    `scorer=` gate marker), and a HOLD reasoning ("no high-conviction
+    signal …") legitimately omits it. SELL outcomes ALWAYS read ``None``
+    here, mirroring the ``gate_scorer_pred`` SELL convention.
+
+    Pure, total, never raises (a ledger-feeding parser must not break the
+    cycle — the ``_parse_gate_decision`` discipline). Out-of-range values
+    (a malformed reasoning emitting ``conviction=900%``) are clamped to
+    ``[0.0, 1.0]`` rather than silently propagating impossible sizing.
+    """
+    if not reasoning:
+        return None
+    try:
+        # `\bconviction=` so the token is anchored to a word boundary and a
+        # future emission like `low-conviction=…` cannot accidentally match.
+        # `(\d+)` covers the documented `:.0%` format exactly; a non-integer
+        # would not match and degrade to None (the discipline tests pin).
+        m = re.search(r"\bconviction=(\d+)%", reasoning)
+        if not m:
+            return None
+        try:
+            pct = float(m.group(1)) / 100.0
+        except (TypeError, ValueError):
+            return None
+        # Clamp to [0, 1]. `_ml_decide` caps conviction at 0.95 (regular) /
+        # 0.40 (leveraged-bull), so a real emission is always ≤ 95. Defensive
+        # against malformed reasoning that emits an impossible percentage —
+        # we round-trip through training the way build_features consumers
+        # would expect (a fraction in [0,1]).
+        return max(0.0, min(1.0, pct))
+    except Exception:
+        return None
+
+
 def _compute_decision_outcomes(engine: "BacktestEngine",
                                top_runs: list["BacktestRun"]) -> list[dict]:
     """Compute actual 5-trading-day forward returns for BUY/SELL decisions.
@@ -617,6 +675,19 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
             # reconstruction residual). None on SELL / untrained-cycle rows.
             gate_scorer_pred, gate_off_dist = _parse_gate_decision(reasoning)
 
+            # Additive sizing capture (read-only research signal, 2026-05-21
+            # feature — same `forward_return_10d/20d` precedent: scorer is
+            # unchanged because `train_scorer`/`build_features` ignore unknown
+            # dict keys, so no retrain required and no risk of feature-vector
+            # drift). The `conviction=X%` token is already emitted by every
+            # BUY reasoning; structured-field capture here unlocks
+            # sizing-weighted realized analysis without a schema migration
+            # — see `_parse_conviction_pct` for the documented payoff.
+            # SELL/HOLD rows read None (the gate is BUY-only); the SQL
+            # already filters to BUY/SELL FILLED, so a None on a SELL row
+            # is the parsed-truth, not a fault.
+            conviction_pct = _parse_conviction_pct(reasoning)
+
             # Additive persona + regime-label capture (read-only research
             # signal, 2026-05-19 feature — same `forward_return_10d/20d`
             # precedent: scorer is unchanged because `train_scorer` /
@@ -679,6 +750,16 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
                 # reasoning) or on SELL (the gate modulates BUY only).
                 "gate_scorer_pred": gate_scorer_pred,
                 "gate_off_dist": gate_off_dist,
+                # Additive — the gate's actual then-applied sizing
+                # (`_parse_conviction_pct`). Fraction in [0,1] (e.g. 0.25
+                # for `conviction=25%`); None on SELL / HOLD rows because
+                # the conviction emission is BUY-only. Unlocks sizing-
+                # weighted realized analysis (does higher conviction
+                # actually predict higher realized return? — the
+                # calibration question existing diagnostics structurally
+                # cannot answer because they only see rank skill, not
+                # economic weight).
+                "conviction_pct": conviction_pct,
                 # Additive 52-week position signal (0=at low, 1=at high) and
                 # %-from-52-week-high. Already computed by
                 # `_compute_technical_indicators` and consumed by

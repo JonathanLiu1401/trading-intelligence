@@ -150,3 +150,136 @@ class TestComputeDecisionOutcomesGateCapture:
         assert o["gate_off_dist"] is None
         # 5d outcome still correct & present (training unaffected).
         assert o["forward_return_5d"] == pytest.approx(8.3333, abs=1e-4)
+
+
+# ───────────────────────── _parse_conviction_pct (pure) ──────────────────────
+
+class TestParseConvictionPct:
+    """Pins the conviction-sizing capture (2026-05-21 feature). The token
+    ``conviction=X%`` is already emitted by every BUY reasoning in
+    ``_ml_decide``; capturing it as a fraction in [0,1] unlocks
+    sizing-weighted realized analysis. Mirrors ``TestParseGateDecision``'s
+    exact-literal style — a regex change must update the locks deliberately."""
+
+    def test_typical_buy_conviction(self):
+        # `_ml_decide`'s standard BUY reasoning carries `conviction=25%`.
+        # Parser must return the FRACTION (0.25), not the integer 25 —
+        # matching the inference-side variable's unit so a downstream
+        # consumer can multiply realized_return * conviction_pct directly.
+        assert rcb._parse_conviction_pct(
+            "ML+quant: NVDA score=2.0 regime=bull conviction=25% scorer=+5.2%"
+        ) == 0.25
+
+    def test_leveraged_etf_high_conviction(self):
+        # The leveraged-ETF arm allows convictions up to 40%; 40% must
+        # parse as 0.40 (defensively below the 1.0 clamp).
+        assert rcb._parse_conviction_pct(
+            "ML+quant: SOXL score=8.0 regime=bull conviction=40% scorer=+12%"
+        ) == 0.40
+
+    def test_zero_conviction_boundary(self):
+        # `_ml_decide` can emit `conviction=0%` for tiny notional trades
+        # (rare but possible); parser must return 0.0, NOT None — None
+        # means "no conviction token at all", which is semantically distinct
+        # from "the gate sized 0%". Mirrors the `+0.0%` gate-decision
+        # boundary test exactly.
+        assert rcb._parse_conviction_pct(
+            "ML+quant: PLTR score=1.5 conviction=0% scorer=+0.0%"
+        ) == 0.0
+
+    def test_hold_reasoning_no_conviction(self):
+        # `_ml_decide` HOLD reasoning never includes `conviction=` — the
+        # token is BUY-only. Must read None so downstream analyses can
+        # filter HOLD rows from sizing studies.
+        assert rcb._parse_conviction_pct(
+            "ML+quant: no high-conviction signal 2025-06-15 regime=sideways"
+        ) is None
+
+    def test_sell_reasoning_no_conviction(self):
+        # `_ml_decide` SELL reasoning never includes `conviction=` either
+        # (the SELL path emits `— reducing` instead). Parser returns None,
+        # matching the `gate_scorer_pred` SELL convention.
+        assert rcb._parse_conviction_pct(
+            "ML+quant: SOXL score=-1.20 regime=bear RSI=72 "
+            "news_count=0 news_urg=0.0 — reducing"
+        ) is None
+
+    def test_garbage_and_none_inputs_never_raise(self):
+        assert rcb._parse_conviction_pct(None) is None
+        assert rcb._parse_conviction_pct("") is None
+        # Non-digit value → no regex match → None (not a parse exception).
+        assert rcb._parse_conviction_pct("conviction=abc%") is None
+        # Non-string garbage must not raise.
+        assert rcb._parse_conviction_pct(12345) is None  # type: ignore[arg-type]
+
+    def test_out_of_range_value_clamped(self):
+        # A malformed reasoning emitting an impossible percentage (>100%)
+        # must clamp to 1.0 — never propagating an impossible sizing into
+        # the outcomes corpus. Defense-in-depth: `_ml_decide` caps at 95%
+        # in source, so this branch only triggers on a hand-crafted or
+        # corrupted reasoning string.
+        assert rcb._parse_conviction_pct(
+            "ML+quant: X score=99 conviction=900%"
+        ) == 1.0
+
+    def test_first_match_disambiguation(self):
+        # If multiple `conviction=` tokens somehow appear in one reasoning
+        # (impossible today but defensive), the FIRST match wins — same
+        # discipline as the existing `ml_score` `score=` first-match rule
+        # documented in `_parse_gate_decision`.
+        assert rcb._parse_conviction_pct(
+            "ML+quant: X conviction=25% later conviction=99%"
+        ) == 0.25
+
+
+# ──────────── conviction_pct lands in decision_outcomes row ──────────────────
+
+class TestComputeDecisionOutcomesConvictionCapture:
+    """End-to-end: the conviction parsed from reasoning lands in the
+    additive ``conviction_pct`` outcome key, exactly like the gate-decision
+    capture lands ``gate_scorer_pred`` / ``gate_off_dist``. Synthetic-prices
+    fixture is shared with the gate-capture suite above."""
+
+    def test_buy_conviction_pct_lands_and_5d_unchanged(self, tmp_path,
+                                                       synthetic_prices):
+        eng = _engine_with_decision(
+            tmp_path, synthetic_prices, action="BUY", ticker="NVDA",
+            day_index=10,
+            reasoning=("ML+quant: NVDA score=2.00 regime=bull RSI=40 "
+                       "news_count=0 news_urg=0.0 conviction=25% "
+                       "scorer=+7.5%"),
+        )
+        runs = [BacktestRun(run_id=1, seed=1, start_date="2025-01-01",
+                            end_date="2025-12-31")]
+        outs = rcb._compute_decision_outcomes(eng, runs)
+        assert len(outs) == 1
+        o = outs[0]
+        # Additive sizing capture lands as a fraction in [0,1].
+        assert o["conviction_pct"] == 0.25
+        # Regression anchor: the 5d training path is byte-identical
+        # (additive keys must not perturb the scorer's only target).
+        assert o["forward_return_5d"] == pytest.approx(8.3333, abs=1e-4)
+        # The companion gate-capture fields are still populated; the
+        # conviction addition does not shadow them.
+        assert o["gate_scorer_pred"] == 7.5
+        assert o["gate_off_dist"] is False
+
+    def test_hold_or_missing_conviction_records_none(self, tmp_path,
+                                                     synthetic_prices):
+        # A BUY decision whose reasoning was hand-crafted without the
+        # conviction token — captured as None, not 0.0 (the two are
+        # semantically distinct: 0.0 means "gate sized 0%", None means
+        # "no conviction token was emitted").
+        eng = _engine_with_decision(
+            tmp_path, synthetic_prices, action="BUY", ticker="NVDA",
+            day_index=10,
+            reasoning="ML+quant: NVDA score=2.00 regime=bull "
+                      "news_count=0 news_urg=0.0",
+        )
+        runs = [BacktestRun(run_id=1, seed=1, start_date="2025-01-01",
+                            end_date="2025-12-31")]
+        outs = rcb._compute_decision_outcomes(eng, runs)
+        assert len(outs) == 1
+        assert outs[0]["conviction_pct"] is None
+        # 5d outcome still correct (training unaffected by missing token).
+        assert outs[0]["forward_return_5d"] == pytest.approx(8.3333, abs=1e-4)
