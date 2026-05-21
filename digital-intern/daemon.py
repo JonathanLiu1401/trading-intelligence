@@ -57,6 +57,7 @@ from collectors.earnings_calendar import get_earnings
 from collectors.options_monitor import get_options_data, format_options_block
 from collectors.portfolio_pnl import get_portfolio_pnl, format_pnl_block, write_pl_snapshot
 from collectors.sec_edgar import collect_sec_edgar, collect_sec_edgar_fulltext
+from collectors.sec_activist_collector import collect as collect_sec_activist
 from collectors.google_news import collect_google_news
 from collectors.nitter_collector import collect_nitter
 from collectors.substack_collector import collect_substack
@@ -142,6 +143,7 @@ PRICE_ALERT_THRESHOLD = 3.0       # alert when |%| move >= this
 WORKER_HEALTH_STALE_SECS = 15 * 60  # mark worker stale in heartbeat if no success in this many seconds
 SEC_EDGAR_INTERVAL  = 300         # SEC 8-K RSS sweep every 5min
 SEC_EDGAR_FT_INTERVAL = 900       # SEC full-text per-ticker every 15min
+SEC_ACTIVIST_INTERVAL = 600       # SEC activist/M&A special filings every 10min
 GOOGLE_NEWS_INTERVAL = 120        # Google News per-ticker pass every 2min
 NITTER_INTERVAL     = 180         # Nitter twitter mirror every 3min
 SUBSTACK_INTERVAL   = 600         # Substack newsletters every 10min
@@ -260,6 +262,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "gdelt": GDELT_INTERVAL, "rss": RSS_INTERVAL, "web": WEB_INTERVAL,
     "reddit": REDDIT_INTERVAL, "stocktwits": STOCKTWITS_INTERVAL, "ticker": TICKER_INTERVAL,
     "sec_edgar": SEC_EDGAR_INTERVAL, "sec_edgar_ft": SEC_EDGAR_FT_INTERVAL,
+    "sec_activist": SEC_ACTIVIST_INTERVAL,
     "google_news": GOOGLE_NEWS_INTERVAL, "nitter": NITTER_INTERVAL,
     "substack": SUBSTACK_INTERVAL, "finnhub": FINNHUB_INTERVAL,
     "alphavantage": ALPHAVANTAGE_INTERVAL, "polygon": POLYGON_INTERVAL,
@@ -848,6 +851,27 @@ def sec_edgar_ft_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(SEC_EDGAR_FT_INTERVAL)
+
+
+# ── Worker: SEC Activist / M&A — every 10min ────────────────────────────────
+def sec_activist_worker(store: ArticleStore):
+    log.info("[sec_activist_worker] started")
+    bo = Backoff("sec_activist", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_sec_activist()
+            _ingest(store, articles, "sec_activist")
+            try:
+                source_health.record_result("sec_activist", len(articles))
+            except Exception as he:
+                log.warning(f"[sec_activist_worker] source_health error: {he}")
+            _worker_last_ok["sec_activist"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[sec_activist_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SEC_ACTIVIST_INTERVAL)
 
 
 # ── Worker: Nitter / Twitter — every 3min ───────────────────────────────────
@@ -3245,6 +3269,7 @@ def main():
         ("ticker",      ticker_worker),
         ("sec_edgar",   sec_edgar_worker),
         ("sec_edgar_ft", sec_edgar_ft_worker),
+        ("sec_activist", sec_activist_worker),
         ("google_news", google_news_worker),
         ("nitter",      nitter_worker),
         ("substack",    substack_worker),
