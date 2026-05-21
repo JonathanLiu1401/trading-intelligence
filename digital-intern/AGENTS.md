@@ -6210,3 +6210,121 @@ related code in this same documentation step.
   paper-trader repo's separate commit. Commit pathspec-scoped
   (`dashboard/web_server.py` + new test + this `AGENTS.md`), never
   `git add -A`.
+
+
+## 2026-05-21 — Hybrid pass (earnings-recap regex widen + BREAKING burst awareness)
+
+  **Persona:** market news analyst, NVDA earnings night.
+
+  **Phase 1 — bugs_fixed=1, commit `cd304ad`** (`watchers/alert_agent.py`
+  + `tests/test_alert_recap_template.py`). **`_RT_EARNINGS_CALL` regex
+  widened.** Live evidence from the 2026-05-20 NVDA earnings cycle
+  (urgency=2 set inspected directly from the live `articles.db`): two
+  retrospective recap variants leaked through the alert path and fired
+  standalone 🚨 BREAKING pushes because the prior regex demanded BOTH
+  a year `20\d{2}` AND the literal `Call` between `Earnings` and the
+  recap-noun:
+
+  - `"NVIDIA Q1 Earnings Call Highlights"` (no year — fired BREAKING)
+  - `"Nvidia (NVDA) Q1 2027 Earnings Transcript - The Globe and Mail"`
+    (no `Call` bridge — fired BREAKING, syndicated across multiple feeds)
+
+  Year and the `call ` bridge are now BOTH optional; the recap-noun
+  list (`highlights|recap|takeaways|transcript|summary|review`) remains
+  the discriminator. Validated against the must-survive corpus —
+  forward-looking previews (`"Q3 2026 earnings preview"`,
+  `"Q1 Earnings Preview"`), breaking earnings results (`"Nvidia Q1
+  beats estimates"`, `"NVDA earnings: revenue beats, guidance lifted"`,
+  `"Earnings beat sends NVDA higher in pre-market"`), and upcoming-call
+  announcements (`"NVDA Q2 2026 earnings call begins at 5pm ET"`) all
+  still pass through unchanged. The same `_looks_like_recap_template`
+  helper is used by both `alert_agent` (formatter-side suppression)
+  and `urgency_scorer` (pre-Sonnet floor) — single source of truth, so
+  the widening lands everywhere in lockstep. +2 new tests added
+  (`test_earnings_call_recap_widened_variants` pinning each live
+  failure-case title verbatim; `test_earnings_recap_widened_does_not_
+  catch_real_news` pinning the must-survive corpus). All 29 existing
+  recap-template tests still pass.
+
+  **Phase 2 — features_added=1, commit `f81a95f`**
+  (`watchers/alert_recency.py` + `watchers/alert_agent.py` + new
+  `tests/test_alert_ticker_burst.py`). **Per-held-ticker BREAKING
+  burst awareness.** During the NVDA earnings event the analyst's
+  Discord channel received a rapid series of distinct BREAKING pushes
+  for the same name (revenue beat → guidance → $80B buyback → segment
+  colour → Vera Rubin GPU details). The existing gates already
+  collapse exact-sig dupes (`alert_dedup`), paraphrases (`alert_recency.
+  partition_paraphrase_alerted`), and wire syndication, but a series
+  of GENUINELY DIFFERENT headlines about the same event are NOT
+  duplicates and correctly fire as separate alerts. Each currently
+  presents as a fresh break, though — so the 4th distinct NVDA push
+  reads identically to the 1st, the analyst persona's recurring noise
+  complaint.
+
+  **Mechanism (non-suppressing — only the framing changes):**
+  - New pure helper `alert_recency.ticker_burst_counts(recent, tickers)`
+    walks the `recent_alerts()` list and counts case-insensitive
+    `\bTICKER\b` matches per held name. Substring false positives
+    pinned out (`"MUUSE"` doesn't match MU, `"DAMD"` doesn't match
+    AMD). Per-alert dedup so one title mentioning NVDA twice counts
+    once.
+  - `alert_agent.send_urgent_alert` calls it once per cycle for the
+    union of all held-book tickers in the batch (re-using the existing
+    `alert_recency` graph — same import-safety profile as
+    `_related_prior`, no `articles.db` touch).
+  - `BURST_MIN_PRIOR_ALERTS = 3` threshold: below this the line is
+    silent — chat-filler-free when the wire is normally active.
+  - `_fmt` emits `burst: TICKER: N prior BREAKING alerts in last <ttl>h`
+    only when a held ticker on THIS row cleared the bar (multi-ticker
+    composes with `; ` like `book_velocity`).
+  - `BURST WIRE` rule added to `ALERT_PROMPT`: tells Sonnet to use
+    DETAILS / ADDS / NOW / FOLLOWS / EXTENDS framing on the HEADLINE
+    and make the burst explicit in CONTEXT, instead of presenting the
+    (N+1)th push as a fresh break. The PORTFOLIO line must still name
+    the held ticker; magnitude is still allowed (the wire IS active).
+
+  **Invariants preserved by construction:** pure-function counter; no
+  DB write at all; no `ai_score` / `ml_score` / `score_source` /
+  `urgency` mutation; backtest already filtered upstream by
+  `_is_synthetic` / `_LIVE_ONLY_CLAUSE`. The annotation is read-only —
+  it only changes the text Sonnet reads.
+
+  **Tests (`test_alert_ticker_burst.py`, 14 cases):** pure-counter
+  substring/case/dedup correctness; threshold-emission gate (below =
+  silent, at = line appears); multi-ticker composition with `; `;
+  held-book-only emission (a row with no held ticker gets no burst
+  line even when other recent alerts mention held names); empty-
+  recent degrades silently (the alert still fires); BURST WIRE rule
+  and named development verbs present in `ALERT_PROMPT`. All 188
+  alert-suite tests still pass alongside.
+
+  **Phase 3 — user_findings (live analyst validation):**
+  1. Collection rate is healthy — 7,000+ articles in the last 4h
+     across 40+ distinct source tags; the supervisor reports 37 OK
+     workers and only 4 transiently DEAD (scorer cycles through DEAD
+     between long batches under GPU contention but each batch still
+     succeeds — known false-positive of the liveness deadline; the
+     `scorer` long-cycle pattern, not a real outage).
+  2. Latest 5h Opus briefing (`2026-05-20T21:21Z`) is excellent
+     quality: LEAD synthesises the NVDA earnings event with the right
+     forward framing (`"AH slip despite double-beat — gap risk for
+     SMH/AMD/MU into open"`); MACRO / PORTFOLIO / SEMIS PULSE / TOP
+     SIGNALS all populated; COVERAGE GAP correctly names SEC 8-K /
+     Polygon / NewsAPI / Nitter as DARK so the analyst is never
+     silently blind; THROUGHPUT DEGRADATION calls out GlobeNewswire
+     -71% in the last 60min. This is the briefing actually working as
+     designed.
+  3. Lock-contention surface (`"database is locked"` after the 5-retry
+     budget) recurs ~10-20×/h on the slow USB DB during writer storms
+     (`insert_batch`, `update_ml_scores_batch`, `mark_alerted_batch`).
+     This is a known cost of the shared-`self.conn`-from-30-threads
+     architecture and is correctly retried; one collateral effect is
+     that suppressed low-authority rows occasionally re-suppress next
+     cycle (the row stays `urgency=1` until the mark succeeds). Not
+     blocking — the row eventually exits the queue — but is the
+     longest-tail durability gap on the alert pipeline.
+
+  Commit pathspec-scoped (`watchers/alert_agent.py`,
+  `watchers/alert_recency.py`, `tests/test_alert_recap_template.py`,
+  `tests/test_alert_ticker_burst.py` + this `AGENTS.md` section);
+  `git diff --staged` verified before each commit; never `git add -A`.
