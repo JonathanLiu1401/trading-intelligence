@@ -101,6 +101,7 @@ from collectors.sec_13f_collector import collect_13f_filings
 from collectors.sec_insider_form4 import collect_sec_form4
 from collectors.nasdaq_halts_collector import collect_nasdaq_halts
 from collectors.fda_collector import collect_fda
+from collectors.usaspending_contracts_collector import collect_usaspending_contracts
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -174,6 +175,7 @@ GLOBAL_REG_INTERVAL     = 1800    # FSB, FCA, Fed research notes/papers — ever
 BIS_INTERVAL            = 1800    # BIS press releases, speeches, research — every 30min
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
 HACKERNEWS_INTERVAL     = 300     # Hacker News front-page + finance/business stories — every 5min
+USASPENDING_INTERVAL    = 3600    # USASpending.gov federal contract awards — hourly (new awards rare)
 SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
 SEC_13F_INTERVAL        = 1800      # SEC 13F institutional holdings — every 30min (quarterly season)
 SEC_FORM4_INTERVAL      = 300       # SEC Form 4 insider transactions (portfolio tickers) — every 5min
@@ -274,6 +276,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "bis": BIS_INTERVAL,
     "globenewswire": GLOBENEWSWIRE_INTERVAL,
     "hackernews": HACKERNEWS_INTERVAL,
+    "usaspending": USASPENDING_INTERVAL,
     "sec_xbrl": SEC_XBRL_INTERVAL,
     "sec_13f": SEC_13F_INTERVAL,
     "sec_form4": SEC_FORM4_INTERVAL,
@@ -1766,6 +1769,28 @@ def hackernews_worker(store: ArticleStore):
         _sleep(HACKERNEWS_INTERVAL)
 
 
+# ── Worker: USASpending.gov federal contract awards — hourly ─────────────────
+def usaspending_worker(store: ArticleStore):
+    log.info("[usaspending_worker] started")
+    bo = Backoff("usaspending", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_usaspending_contracts()
+            _ingest(store, articles, "usaspending_contracts")
+            try:
+                source_health.record_result("usaspending_contracts", len(articles))
+            except Exception as he:
+                log.warning(f"[usaspending_worker] source_health error: {he}")
+            _worker_last_ok["usaspending"] = time.time()
+            log.debug(f"[usaspending] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[usaspending_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(USASPENDING_INTERVAL)
+
+
 # ── Worker: Portfolio P/L snapshot — every 5min ─────────────────────────────
 def portfolio_pl_worker(store: ArticleStore):
     log.info("[portfolio_pl_worker] started")
@@ -3136,6 +3161,7 @@ def main():
         ("bis",         bis_worker),
         ("globenewswire", globenewswire_worker),
         ("hackernews",  hackernews_worker),
+        ("usaspending", usaspending_worker),
         ("sec_xbrl",    sec_xbrl_worker),
         ("sec_13f",     sec_13f_worker),
         ("sec_form4",   sec_form4_worker),
