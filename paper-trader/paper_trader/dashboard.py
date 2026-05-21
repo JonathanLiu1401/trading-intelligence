@@ -15769,5 +15769,182 @@ def peer_momentum_divergence_skill_api():
         }), 500
 
 
+@app.route("/api/cash-redeployment-latency-skill")
+def cash_redeployment_latency_skill_api():
+    """Cash-redeployment latency — after each SELL, how long until any
+    new BUY? Catches the documented "sold-then-sat" cash-deployment
+    pathology that ``capital_paralysis`` / ``idle_opportunity``
+    (snapshots) and ``rebuy_regret`` / ``reentry_velocity`` (per-ticker
+    same-name) all miss.
+
+    Verdict matrix:
+
+      * ``FAST_REDEPLOY`` — median ≤ 6h AND ≥ 80% of SELLs redeployed.
+      * ``STEADY`` — median ≤ 24h AND ≥ 70% redeployed.
+      * ``SLOW`` — median ≤ 72h OR 50-70% redeployed.
+      * ``STALLED`` — median > 72h OR < 50% redeployed.
+      * ``NO_DATA`` — fewer than 3 classifiable SELLs in window.
+
+    Query params (clamped):
+      ``window_days`` — analysis window, 1..365 (default 30)
+      ``stalled_cutoff_hours`` — SELLs with no BUY within this are
+        STALLED, 1..720 (default 168 = 1 week)
+      ``fast_median_h`` / ``steady_median_h`` / ``slow_median_h`` —
+        verdict median thresholds (clamped 0..720)
+      ``healthy_redeploy_pct`` / ``steady_redeploy_pct`` /
+        ``degraded_redeploy_pct`` — verdict rate floors (clamped 0..100)
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.cash_redeployment_latency_skill import (
+            build_cash_redeployment_latency_skill,
+            DEFAULT_WINDOW_DAYS,
+            DEFAULT_STALLED_CUTOFF_H,
+            DEFAULT_FAST_MEDIAN_H,
+            DEFAULT_STEADY_MEDIAN_H,
+            DEFAULT_SLOW_MEDIAN_H,
+            DEFAULT_HEALTHY_REDEPLOY_PCT,
+            DEFAULT_STEADY_REDEPLOY_PCT,
+            DEFAULT_DEGRADED_REDEPLOY_PCT,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        window_days = _qf("window_days", DEFAULT_WINDOW_DAYS, 1.0, 365.0)
+        stalled_cutoff_hours = _qf(
+            "stalled_cutoff_hours", DEFAULT_STALLED_CUTOFF_H, 1.0, 720.0,
+        )
+        fast_median_h = _qf("fast_median_h", DEFAULT_FAST_MEDIAN_H, 0.0, 720.0)
+        steady_median_h = _qf("steady_median_h", DEFAULT_STEADY_MEDIAN_H, 0.0, 720.0)
+        slow_median_h = _qf("slow_median_h", DEFAULT_SLOW_MEDIAN_H, 0.0, 720.0)
+        healthy_redeploy_pct = _qf(
+            "healthy_redeploy_pct", DEFAULT_HEALTHY_REDEPLOY_PCT, 0.0, 100.0,
+        )
+        steady_redeploy_pct = _qf(
+            "steady_redeploy_pct", DEFAULT_STEADY_REDEPLOY_PCT, 0.0, 100.0,
+        )
+        degraded_redeploy_pct = _qf(
+            "degraded_redeploy_pct", DEFAULT_DEGRADED_REDEPLOY_PCT, 0.0, 100.0,
+        )
+
+        store = get_store()
+        # Pull enough history to cover the analysis window plus the
+        # next-buy lookahead. 2000 covers ~6 months of mixed flow.
+        trades = store.recent_trades(limit=2000) or []
+
+        return jsonify(build_cash_redeployment_latency_skill(
+            trades,
+            window_days=window_days,
+            stalled_cutoff_hours=stalled_cutoff_hours,
+            fast_median_h=fast_median_h,
+            steady_median_h=steady_median_h,
+            slow_median_h=slow_median_h,
+            healthy_redeploy_pct=healthy_redeploy_pct,
+            steady_redeploy_pct=steady_redeploy_pct,
+            degraded_redeploy_pct=degraded_redeploy_pct,
+        ))
+    except Exception as e:
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "stats": {},
+            "thresholds": {},
+            "pairs": [],
+        }), 500
+
+
+@app.route("/api/decision-vapor-skill")
+def decision_vapor_skill_api():
+    """Decision-vapor skill — for FILLED decisions, does the reasoning
+    cite specifics (numeric figure + named catalyst + explicit ticker)
+    or read as generic vapor?
+
+    Verdict matrix:
+
+      * ``SPECIFIC`` — specific% ≥ 50 AND vapor% < 15.
+      * ``MIXED`` — between SPECIFIC and VAPOR_DECISIONS.
+      * ``VAPOR_DECISIONS`` — vapor% ≥ 35.
+      * ``NO_DATA`` — fewer than 5 FILLED decisions in window.
+
+    Query params (clamped):
+      ``window_hours`` — analysis window, 1..720 (default 168 = 7d)
+      ``vapor_pct_floor`` — vapor% above this triggers VAPOR_DECISIONS,
+        0..100 (default 35)
+      ``vapor_pct_ceil`` — for SPECIFIC, vapor% must be below this,
+        0..100 (default 15)
+      ``specific_pct_floor`` — specific% required for SPECIFIC,
+        0..100 (default 50)
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.decision_vapor_skill import (
+            build_decision_vapor_skill,
+            DEFAULT_WINDOW_HOURS,
+            DEFAULT_VAPOR_PCT_FLOOR,
+            DEFAULT_VAPOR_PCT_CEIL,
+            DEFAULT_SPECIFIC_PCT_FLOOR,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        window_hours = _qf("window_hours", DEFAULT_WINDOW_HOURS, 1.0, 720.0)
+        vapor_pct_floor = _qf(
+            "vapor_pct_floor", DEFAULT_VAPOR_PCT_FLOOR, 0.0, 100.0,
+        )
+        vapor_pct_ceil = _qf(
+            "vapor_pct_ceil", DEFAULT_VAPOR_PCT_CEIL, 0.0, 100.0,
+        )
+        specific_pct_floor = _qf(
+            "specific_pct_floor", DEFAULT_SPECIFIC_PCT_FLOOR, 0.0, 100.0,
+        )
+
+        store = get_store()
+        # Window is hours but recent_decisions is row-limited; 500 covers
+        # ~21 days at the 1h closed cadence (worst case ~7-10 days at the
+        # 60s open cadence). The window filter prunes anything older.
+        decisions = store.recent_decisions(limit=500) or []
+
+        # Watchlist injection — when available, sharpens ticker detection.
+        wl = None
+        try:
+            from .strategy import WATCHLIST  # type: ignore
+            wl = list(WATCHLIST)
+        except Exception:
+            wl = None
+
+        return jsonify(build_decision_vapor_skill(
+            decisions,
+            watchlist=wl,
+            window_hours=window_hours,
+            vapor_pct_floor=vapor_pct_floor,
+            vapor_pct_ceil=vapor_pct_ceil,
+            specific_pct_floor=specific_pct_floor,
+        ))
+    except Exception as e:
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "stats": {},
+            "thresholds": {},
+            "samples": [],
+        }), 500
+
+
 if __name__ == "__main__":
     run()

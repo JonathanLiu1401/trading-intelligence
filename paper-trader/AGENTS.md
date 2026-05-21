@@ -6,6 +6,165 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4) — `/api/cash-redeployment-latency-skill` + `/api/decision-vapor-skill`
+
+Two new observational skills that answer questions none of the existing
+~110 analytics endpoints answer cleanly. Pure builders, fully tested,
+zero touch to the live decision path.
+
+### `/api/cash-redeployment-latency-skill`
+
+**Question**: after each FILLED SELL, how many hours until ANY new
+FILLED BUY? Catches the documented "sold-then-sat" cash-deployment
+pathology — the desk closes a position and then sits on cash for days
+while alpha bleeds.
+
+Distinct from the nearest neighbours (each addresses a different axis):
+
+* `rebuy_regret` — *$ regret* on SAME-ticker SELL→re-BUY (price delta
+  over the close→re-entry interval).
+* `reentry_velocity` — *time* gap between SAME-ticker close and the
+  next entry of the same (ticker, type, strike, expiry) key.
+* `capital_paralysis` / `idle_opportunity` / `cash_conviction_fit` —
+  point-in-time snapshots of idle-cash-vs-signal, not interval
+  distribution.
+
+**Builder**: `paper_trader/analytics/cash_redeployment_latency_skill.py`.
+Pure — trades in, dict out, never raises. Cross-ticker by design
+(SELL NVDA → BUY MSFT counts as redeployment).
+
+**Verdict ladder** (test-locked, exact-value):
+
+* `FAST_REDEPLOY` — median ≤ 6h AND ≥ 80% of classifiable SELLs
+  redeployed.
+* `STEADY` — median ≤ 24h AND ≥ 70% redeployed.
+* `SLOW` — median ≤ 72h OR 50-70% redeployed.
+* `STALLED` — median > 72h OR < 50% redeployed.
+* `NO_DATA` — fewer than 3 classifiable SELLs in the window.
+
+**Window-edge handling**: a SELL too close to `now` for the
+`stalled_cutoff_hours` (default 168h = 1 week) to have elapsed is
+excluded from both numerator and denominator of redeploy_pct (lands in
+`n_window_edge`). Without this, the trailing-edge SELLs would
+systematically over-count as STALLED.
+
+**Dashboard route**: `dashboard.py::cash_redeployment_latency_skill_api`.
+Pulls `store.recent_trades(limit=2000)` (covers ~6 months at the
+current mixed-flow rate) and forwards 8 clamped query params for the
+verdict thresholds + window.
+
+Tests: `tests/test_cash_redeployment_latency_skill.py` — 19 exact-value
+locks covering the 5 verdicts, window-edge exclusion, cross-ticker
+pairing, stalled-cutoff override forwarding, defensive degradation
+across malformed trades, plus the helper-function invariants
+(`_median`, `_percentile`).
+
+### `/api/decision-vapor-skill`
+
+**Question**: for FILLED decisions, does the reasoning cite *specifics*
+(at least one numeric figure + at least one named catalyst + at least
+one explicit ticker), or is it generic vapor ("Strong setup, building
+position")? Catches a real LLM failure mode — a FILLED trade with vapor
+reasoning is structurally indistinguishable from one with grounded
+reasoning at JSON-parse time, but the post-mortem diagnostics are
+entirely different.
+
+Distinct from the nearest neighbours (each measures a different axis):
+
+* `reasoning_coherence` — pair-wise Jaccard between consecutive HOLDs
+  (stability metric across decisions).
+* `reasoning_action_verbs` — directional-verb consistency between the
+  structured `action` and the prose.
+* `reasoning_themes` — n-gram phrase frequency (which topics recur).
+* `decision_confidence` — aggregates the self-rated `confidence`
+  scalar.
+* `conviction_language_skill` — does the prose language *match* the
+  conviction number (expressed-conviction calibration).
+
+None ask the per-decision specificity question: is the reasoning
+*anchored* in concrete numbers + catalysts + tickers?
+
+**Builder**: `paper_trader/analytics/decision_vapor_skill.py`. Pure —
+decisions in, dict out, never raises. Each FILLED decision is
+classified `SPECIFIC` (all 3 signals) / `SEMI` (2) / `VAPOR` (0-1).
+
+**Signal detection**:
+
+* `has_numeric` — regex match for any numeric figure (digits with
+  optional decimal, optional %, $ prefix, B/M/K/T suffix). Year-only
+  is intentionally accepted as grounding.
+* `has_catalyst` — case-insensitive whole-word match against ~80
+  catalyst tokens (earnings, beat, miss, guide, upgrade, downgrade,
+  FDA, fed, rate, hike, deal, buyback, dividend, …).
+* `has_ticker` — when an explicit `watchlist` is supplied, requires a
+  whole-word match against the uppercased set (allows 1-letter
+  tickers); otherwise falls back to a 2-5-cap-letter regex with a
+  curated blacklist (BUY/SELL/ML/AI/JSON/FOMC/etc. filtered out).
+
+**Verdict ladder** (test-locked, exact-value):
+
+* `SPECIFIC` — `specific_pct` ≥ 50 AND `vapor_pct` < 15.
+* `MIXED` — between SPECIFIC and VAPOR_DECISIONS.
+* `VAPOR_DECISIONS` — `vapor_pct` ≥ 35.
+* `NO_DATA` — fewer than 5 FILLED decisions in window.
+
+**Dashboard route**: `dashboard.py::decision_vapor_skill_api`. Pulls
+`store.recent_decisions(limit=500)` + `strategy.WATCHLIST` (degrades
+to regex fallback if the import fails), forwards 4 clamped query
+params.
+
+Tests: `tests/test_decision_vapor_skill.py` — 26 exact-value locks
+covering signal detection (numeric / catalyst / ticker), the
+classifier truth table (SPECIFIC / SEMI / VAPOR), watchlist-aware vs
+regex-fallback ticker matching, blacklist filtering of common cap
+tokens (BUY/ML/AI/JSON), the verdict ladder, window enforcement,
+defensive degradation across malformed decisions, parse_failed: raw
+text handling, sample cap, and Flask route smoke.
+
+### Live findings on the desk right now
+
+1. **`/api/cash-redeployment-latency-skill` → STEADY**.
+   `median 6.0h; 3/3 SELLs redeployed (100%)`. The DRAM SELL on
+   2026-05-19T18:20 took 11.4h to redeploy (into NVDA at
+   2026-05-20T05:47); the TQQQ SELL took 6.0h; the most recent NVDA
+   SELL took 0.4h. No stalled cash on the recent ledger — but the
+   floor for verdict promotion to FAST_REDEPLOY is 6.0h median, and
+   the live median is 6.03h, *just barely* outside FAST.
+2. **`/api/decision-vapor-skill` → SPECIFIC**.
+   `7/7 (100%) FILLED decisions cite specifics; vapor 0%` in the last
+   168h. Every FILLED decision references a number, a catalyst verb,
+   and the watchlist ticker by name. The reasoning prose grade is
+   excellent — operator can fully audit each trade post hoc.
+
+### Test runner
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# This pass's regression coverage (45 tests, <1s)
+python3 -m pytest tests/test_cash_redeployment_latency_skill.py \
+                  tests/test_decision_vapor_skill.py -v
+
+# Joint with the nearest neighbours — confirms no drift
+python3 -m pytest tests/test_cash_redeployment_latency_skill.py \
+                  tests/test_decision_vapor_skill.py \
+                  tests/test_rebuy_regret.py \
+                  tests/test_reentry_velocity.py \
+                  tests/test_reasoning_coherence.py \
+                  tests/test_reasoning_themes.py \
+                  tests/test_regime_leverage_fit_skill.py \
+                  tests/test_conviction_language_skill.py \
+                  tests/test_conviction_deployment.py \
+                  tests/test_cash_conviction_fit.py \
+                  tests/test_conviction_calibration.py -q
+# 292 passed
+```
+
+**Counters**: bugs_fixed=0 · features_added=2 (cash_redeployment_latency_skill
++ decision_vapor_skill) · tests_added=45 · user_findings=2 (live verdicts above).
+
+---
+
 ## 2026-05-21 paper-trader-core HYBRID pass (Agent 1)
 
 **Phase 1 — bug fix (bugs_fixed: 1).** `runner.main()` opened a SECOND
