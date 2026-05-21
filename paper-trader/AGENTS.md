@@ -6,6 +6,149 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 ML+backtest HYBRID pass #2 (Agent 2)
+
+**Phase 1 — bug fix (bugs_fixed: 0).** The surface is heavily mined by 30+
+prior review passes; on honest inspection every documented bug class
+(scorer-vs-score regex disambiguation, sub-gate token emission, walk-back
+collision in outcome computation, training-integrity FILLED-only filter,
+volume cache atomic write, …) is already locked by exact-value tests. No
+new code-level bug found that wasn't either documented or test-locked.
+
+**Phase 2 — feature.** New
+`paper_trader/ml/conviction_calibration.py` — the dual of the
+2026-05-21 (pass #1) `conviction_pct` additive capture. Buckets BUY
+decisions by then-applied conviction quantile and reports whether higher
+sizing predicts higher realized 5d return — the calibration question
+no existing analyzer answers:
+
+* `gate_audit` / `gate_pnl` bucket by the scorer's predicted-return
+  rank and re-predict with TODAY's pickle; describe a counterfactual.
+* `calibration` measures the scorer's directional skill, not the
+  gate's sizing rule.
+* `persona_skill` / `leveraged_skill` cut by persona / instrument
+  type, not by the size of the bet.
+
+Verdict ladder (test-locked, exact-value): `WELL_CALIBRATED` /
+`DIRECTIONAL` / `MISCALIBRATED` / `INVERTED` (the GATE_HARMFUL shape —
+top-conviction bucket realizes worse than bottom) /
+`INSUFFICIENT_DATA`. Mirrors `calibration.py` discipline: read-only, no
+train / pickle / `build_features` / `N_FEATURES` / trade-path touch,
+never raises (a fault yields `status='error'`). CLI exit code 0 only on
+`WELL_CALIBRATED`, exit 2 on `INVERTED` (the quant-decisive sizing-
+anti-predictive state) so a shell caller can `if !` on real edge.
+
+CLI:
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Bucket BUY decisions by then-applied conviction quantile, verdict + spread
+python3 -m paper_trader.ml.conviction_calibration
+
+# Machine-readable
+python3 -m paper_trader.ml.conviction_calibration --json
+```
+
+Tests: `tests/test_conviction_calibration.py` — 28 exact-value verdict
+locks covering the 4 non-INSUFFICIENT verdicts + INSUFFICIENT_DATA
+boundary + row-filter contract (SELL drop, out-of-range conviction
+drop, non-finite return drop, non-dict-row drop, bool-conviction drop) +
+bucket geometry (quintile cut, n//3 clamp, std=0 at bucket-size-1) +
+loader contract (missing file → INSUFFICIENT, malformed lines skipped) +
+CLI exit codes + never-raises discipline.
+
+**Phase 3 — live validation as a skeptical quant** (user_findings: 4):
+
+1. **Conviction-token emission verified against real backtest.db.**
+   Pulled 3 most-recent BUY reasonings from `backtest_decisions`
+   (run 6243, 2000-10-25, MU/MSTR/AMD). All emit `conviction=X%`
+   exactly as `_ml_decide` documents (MU 7%, MSTR 5%, AMD 7%) AND
+   `_parse_conviction_pct` decodes each to the matching fraction.
+   The pass-#1 wiring is correct end-to-end — the only reason 0/7413
+   production outcome rows carry the field is that no cycle has
+   completed since the parser landed.
+
+2. **Continuous loop is still dormant since 2026-05-18T18:45.**
+   `continuous.log` mtime is 2026-05-18 12:03; 2 stuck `status='running'`
+   rows (rid 6238, 6243) > 60h old. Same state the pass #1 reported;
+   no new evidence of restart. The next process start will reap both
+   (`_reap_orphaned_runs` 6h-age guard).
+
+3. **Per-cycle skill ledgers (`scorer_skill_log.jsonl`,
+   `baseline_skill_log.jsonl`, `llm_annotation_skill_log.jsonl`) still
+   absent on disk.** All wired in `run_continuous_backtests.main()` and
+   their `_append_*_skill_log` helpers are tested in
+   `test_continuous.py`, but with the loop dormant since 2026-05-18 no
+   cycle has yet appended a row. Validates the pass #1 observation;
+   ledger durability is a code-level invariant, not yet a data-level
+   one until a cycle completes.
+
+4. **Two `claude-` model_id rows (rid 99001 / 90001) joined the
+   `backtest.db` history on 2026-05-20T20:23 → 20:59.** Both completed,
+   both returned 0.0% total / negative vs_spy (-1.08% / -1.75%), 0
+   trades each. This is new since pass #1 — somebody (likely a manual
+   `run_backtests.py` with `model_id="claude-..."`) ran two zero-trade
+   LLM-backtest probes and they joined the persistent store. Not a
+   bug (the model_id is a valid prefix per
+   `BacktestEngine._VALID_MODEL_PREFIXES`), but worth flagging because
+   `_trim_history`'s `KEEP_LAST_RUNS=500` is run-id-ordered: a manual
+   one-off with a huge run_id (99001) shifts the cutoff and could
+   evict the most-recent real `ml_quant` rows from the dashboard. The
+   trim's invariant should perhaps be "keep last N completed real-mode
+   runs", not "last N rows by run_id" — reported, not fixed (the
+   filter change touches winner-selection semantics across the suite
+   and is out of surgical scope here).
+
+**Sub-finding — deployed pickle `n_train=400` is sub-gate, BUT
+historical reasoning at rid 6243 (2026-05-18) carries `scorer=X%`
+tokens.** Reconciliation: the 2026-05-18 cycle deployed a pickle with
+`n_train ≥ 500` (gate active at decision time); a later
+`_train_decision_scorer` retrain on the rotated 5000-tail produced
+`n_train=400` after dedup (`train_scorer` dedup key is
+`(ticker, sim_date, action)`). Documented behaviour, not a bug —
+verifies the `gate_scorer_pred` capture is THE TRUE
+then-deployed-prediction, not a re-predict-with-today's-pickle
+reconstruction (the documented `gate_pnl` reconstruction-residual
+problem). Worth re-reading: a row's `gate_scorer_pred` describes the
+gate state THEN, not the gate state NOW.
+
+**How to run this pass's tests** (focused; full suite ≥25 min):
+
+```bash
+# This pass's regression coverage (28 verdict-locked tests, <1s)
+python3 -m pytest tests/test_conviction_calibration.py -v
+
+# Joint with the nearest-neighbour calibration analyzer + the conviction-
+# capture parser pinned by pass #1 — confirms no drift
+python3 -m pytest tests/test_conviction_calibration.py \
+                 tests/test_calibration.py \
+                 tests/test_gate_decision_capture.py \
+                 tests/test_decision_scorer.py -q
+# 123 passed
+
+# Broader ML/scorer/gate/calibration/conviction domain
+python3 -m pytest tests/ -k "ml or backtest or scorer or gate or calibration or continuous or horizon or outcome or conviction" \
+                 -q --ignore=tests/test_integration_backtest.py
+```
+
+**Counters**: bugs_fixed=0 (no honest bug found) ·
+features_added=1 (`conviction_calibration` analyzer with 28 verdict-
+locked tests) · user_findings=4 (live validation above).
+
+> **Operational note (concurrent-staging artifact)**: this pass's
+> Phase-2 commit landed in master under the *other* HYBRID agent's
+> commit message (`1c8a9f8 fix(runner): replace inline raw-sqlite
+> read with store.open_positions()`) due to the documented
+> `PT concurrent same-role staging race` — the other agent's
+> staging-then-commit sequence overlapped this agent's pathspec
+> commit. The conviction_calibration.py + test_conviction_calibration.py
+> files ARE in master (verified via `git show HEAD:./paper_trader/ml/`
+> + `wc -l`); the commit message attribution is the only thing
+> garbled.
+
+---
+
 ## 2026-05-21 feature-dev pass (Agent 4) — `/api/regime-leverage-fit-skill` + `/api/peer-momentum-divergence-skill`
 
 Two new observational endpoints answer two desk questions none of the
