@@ -540,8 +540,26 @@ def _worker_health_report() -> None:
 
 
 def _ingest(store: ArticleStore, articles: list, source_tag: str) -> int:
-    """Score and insert articles into store. Returns new count."""
+    """Score and insert articles into store. Returns new count.
+
+    An article that already carries ``_relevance_score`` is treated as
+    pre-scored by its collector — the heuristic scorer is NOT re-run on it.
+    Synthetic operations alerts (the ``collector_rate_monitor`` SILENT
+    notifications, in particular) carry no portfolio tickers / financial
+    keywords, so ``_heuristic_score_article`` returns 0.0 on them and the
+    0.5 noise gate below silently dropped every one — the operations-alert
+    path was inert in production. The opt-in pre-scoring contract lets a
+    collector deliberately set its own ``kw_score`` (the same convention
+    ``vix_ts`` / ``dxy`` / ``sector_etf`` use via their direct-write
+    pattern) without bypassing this central insert path. Existing
+    collectors that DON'T set ``_relevance_score`` are byte-unchanged —
+    their articles are still heuristic-scored and 0.5-noise-gated exactly
+    as before. Backtest isolation is untouched (`store.insert_batch` is
+    the same call; the ``_LIVE_ONLY_CLAUSE`` read filter in the store is
+    where invariant #1 is enforced, not here)."""
     for art in articles:
+        if "_relevance_score" in art:
+            continue  # collector pre-scored — honor its score, skip heuristic
         result = _heuristic_score_article(
             art.get("title", ""), art.get("summary", ""),
             art.get("source", ""), art.get("published", ""),

@@ -143,6 +143,16 @@ def collect_rate_alerts() -> list[dict]:
                 "first_seen": now_str,
                 "silent_source": source,
                 "daily_avg": daily_avg,
+                # Pre-scored: an operations alert about a silent collector
+                # has no portfolio tickers / financial keywords, so the
+                # daemon._ingest heuristic returned 0.0 and the 0.5 noise
+                # gate dropped every one — the entire rate-monitor path
+                # was inert. ``_ingest`` now respects a pre-set
+                # ``_relevance_score`` (see its docstring); 3.0 keeps the
+                # row well clear of the 0.5 gate but below the ml/llm
+                # urgent thresholds so it surfaces in the briefing
+                # COVERAGE GAP path without firing a standalone alert.
+                "_relevance_score": 3.0,
             })
             log.warning("[collector_monitor] SILENT SOURCE: %s (avg %.0f/day)", source, daily_avg)
 
