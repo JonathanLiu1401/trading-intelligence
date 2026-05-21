@@ -14763,5 +14763,306 @@ def add_discipline_api():
                         "adds": [], "counts": {}}), 500
 
 
+@app.route("/api/conviction-deployment-curve")
+def conviction_deployment_curve_api():
+    """Conviction-deployment curve — does BUY size scale with the news
+    ai_score at the moment of entry?
+
+    Joins the BUY trade ledger (``store.recent_trades``) with the
+    digital-intern articles.db (live-only rows, mode=ro) and the
+    equity_curve (``store.equity_curve``) to compute, per BUY trade:
+
+      * the peak ai_score in the (trade_ts - window, trade_ts] window
+        for a word-boundary title match on the trade's ticker
+      * the position_size_pct = trade.value / equity_at_trade
+
+    Output has two parallel surfaces — both ship at every sample size:
+
+      * ``evidence`` — per-trade chronological table (operator-readable
+        at N=1; the primary surface at low sample size).
+      * ``buckets`` — five ai_score buckets (<6 / 6-7 / 7-8 / 8-9 / 9+)
+        with n_buys, median/max size_pct, total deployed.
+
+    Verdict ``MONOTONIC`` / ``FLAT`` / ``INVERTED`` / ``INSUFFICIENT``
+    rolls up over buckets only — gated on density per-bucket, not
+    total trade count. Two trades in the "9+" bucket tell you nothing
+    about the curve.
+
+    Query params (clamped):
+      ``limit`` — trade lookback row cap, 50..10000 (default 2000)
+      ``window_hours_pre_trade`` — peak-score window before each BUY,
+        0.5..48 (default 6.0)
+      ``article_floor_score`` — minimum ai_score for an article to be
+        considered, 0..10 (default 2.0). Lower than the bucket floor
+        because articles in [0, 6) still inform the "<6" bucket.
+
+    Pure read — never raises. Articles older than articles.db retention
+    degrade per-trade to ``score_unavailable=true`` rather than crash.
+    Observational only — never gates Opus, no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.conviction_deployment import (
+            build_conviction_deployment,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        limit = int(_qf("limit", 2000.0, 50.0, 10000.0))
+        window_hours = _qf("window_hours_pre_trade", 6.0, 0.5, 48.0)
+        article_floor = _qf("article_floor_score", 2.0, 0.0, 10.0)
+
+        store = get_store()
+        trades = store.recent_trades(limit=limit) or []
+        equity = store.equity_curve(limit=2000) or []
+
+        # Pull articles spanning the trade window — oldest trade ts
+        # minus the per-trade scan window minus a small slack so the
+        # window edge case still matches.
+        articles: list[dict] = []
+        if trades:
+            oldest_iso = trades[-1].get("timestamp")
+            try:
+                oldest_dt = datetime.fromisoformat(
+                    str(oldest_iso).replace("Z", "+00:00")
+                )
+            except Exception:
+                oldest_dt = datetime.now(timezone.utc) - timedelta(
+                    hours=window_hours
+                )
+            if oldest_dt.tzinfo is None:
+                oldest_dt = oldest_dt.replace(tzinfo=timezone.utc)
+            since_dt = oldest_dt - timedelta(hours=window_hours + 0.25)
+            since = since_dt.isoformat()
+            path = _articles_db_path()
+            if path is not None:
+                conn = None
+                try:
+                    conn = sqlite3.connect(
+                        f"file:{path}?mode=ro", uri=True, timeout=5
+                    )
+                    art_rows = conn.execute(
+                        "SELECT title, url, source, ai_score, urgency, "
+                        "first_seen FROM articles "
+                        "WHERE first_seen >= ? AND ai_score >= ? "
+                        "AND url NOT LIKE 'backtest://%' "
+                        "AND source NOT LIKE 'backtest_%' "
+                        "AND source NOT LIKE 'opus_annotation%' "
+                        "ORDER BY first_seen DESC LIMIT 20000",
+                        (since, article_floor),
+                    ).fetchall()
+                    articles = [{
+                        "title": r[0], "url": r[1], "source": r[2],
+                        "ai_score": r[3], "urgency": r[4],
+                        "first_seen": r[5],
+                    } for r in art_rows]
+                except Exception:
+                    articles = []
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+        result = build_conviction_deployment(
+            trades, articles, equity,
+            window_hours_pre_trade=window_hours,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "state": "ERROR",
+            "verdict": "INSUFFICIENT",
+            "headline": f"error: {e}",
+            "buckets": [],
+            "evidence": [],
+        }), 500
+
+
+@app.route("/api/cash-conviction-fit")
+def cash_conviction_fit_api():
+    """Cash-conviction fit — point-in-time verdict on whether the
+    book's cash level is appropriate given the loudest live signal.
+
+    None of ``capital_paralysis`` / ``idle_opportunity`` /
+    ``position_action_brief`` join cash idleness × top signal score ×
+    last-decision verb into a single verdict. This endpoint does. It
+    works at N=1 trade, N=1 position, N=0 — strictly point-in-time;
+    no historical roll-up.
+
+    Verdict matrix:
+
+      * ``IDLE_DESPITE_SURGE`` — cash ≥ idle floor AND top signal ≥
+        high-conviction floor AND last decision passive. The book is
+        sitting on capital while the loudest signal screams.
+      * ``OVERDEPLOYED`` — cash ≤ overdeployed floor AND top signal ≥
+        high-conviction floor. Cannot add without trimming.
+      * ``IDLE_LOW_CONVICTION`` — cash ≥ idle floor AND top signal <
+        low-conviction ceiling. Cash idleness is correct.
+      * ``BALANCED`` — none of the above (incl. active recent fill).
+      * ``NO_DATA`` — portfolio or signals missing.
+
+    Query params (clamped):
+      ``signal_floor`` — ai_score floor for fetched signals, 0..10
+        (default 4.0). Low enough that the IDLE_LOW_CONVICTION reading
+        still has a top signal to attach to.
+      ``signal_window_hours`` — how fresh the signal must be, 0.5..48
+        (default 4.0).
+      ``idle_cash_pct`` / ``overdeployed_cash_pct`` /
+      ``high_conviction_score`` / ``low_conviction_score`` /
+      ``recent_fill_max_min`` — threshold overrides (clamped to
+        sensible ranges).
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.cash_conviction_fit import (
+            build_cash_conviction_fit,
+            DEFAULT_IDLE_CASH_PCT,
+            DEFAULT_OVERDEPLOYED_CASH_PCT,
+            DEFAULT_HIGH_CONVICTION_SCORE,
+            DEFAULT_LOW_CONVICTION_SCORE,
+            DEFAULT_RECENT_FILL_MAX_MIN,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        signal_floor = _qf("signal_floor", 4.0, 0.0, 10.0)
+        signal_window_hours = _qf("signal_window_hours", 4.0, 0.5, 48.0)
+        idle_cash_pct = _qf("idle_cash_pct", DEFAULT_IDLE_CASH_PCT, 0.0, 100.0)
+        overdeployed_cash_pct = _qf(
+            "overdeployed_cash_pct", DEFAULT_OVERDEPLOYED_CASH_PCT, 0.0, 100.0,
+        )
+        high_conviction_score = _qf(
+            "high_conviction_score", DEFAULT_HIGH_CONVICTION_SCORE, 0.0, 10.0,
+        )
+        low_conviction_score = _qf(
+            "low_conviction_score", DEFAULT_LOW_CONVICTION_SCORE, 0.0, 10.0,
+        )
+        recent_fill_max_min = _qf(
+            "recent_fill_max_min", DEFAULT_RECENT_FILL_MAX_MIN, 0.0, 1440.0,
+        )
+
+        store = get_store()
+        # Build the portfolio snapshot in the same shape the other
+        # cash-aware endpoints use.
+        pf = store.get_portfolio() or {}
+        cash = pf.get("cash")
+        total_value = pf.get("total_value")
+        cash_pct = None
+        if isinstance(cash, (int, float)) and isinstance(total_value, (int, float)) and total_value > 0:
+            cash_pct = (cash / total_value) * 100.0
+        positions_open = [
+            p for p in (pf.get("positions") or [])
+            if isinstance(p, dict) and not p.get("closed_at")
+        ]
+        portfolio = {
+            "cash": cash,
+            "total_value": total_value,
+            "cash_pct": cash_pct,
+            "n_positions": len(positions_open),
+        }
+        held_tickers = {
+            p.get("ticker") for p in positions_open
+            if isinstance(p.get("ticker"), str)
+        }
+
+        # Pull top live signals from articles.db.
+        signals: list[dict] = []
+        path = _articles_db_path()
+        if path is not None:
+            now_utc = datetime.now(timezone.utc)
+            since = (now_utc - timedelta(hours=signal_window_hours)).isoformat()
+            conn = None
+            try:
+                conn = sqlite3.connect(
+                    f"file:{path}?mode=ro", uri=True, timeout=5,
+                )
+                rows = conn.execute(
+                    "SELECT title, source, ai_score, urgency, first_seen "
+                    "FROM articles WHERE first_seen >= ? "
+                    "AND ai_score >= ? "
+                    "AND url NOT LIKE 'backtest://%' "
+                    "AND source NOT LIKE 'backtest_%' "
+                    "AND source NOT LIKE 'opus_annotation%' "
+                    "ORDER BY ai_score DESC LIMIT 200",
+                    (since, signal_floor),
+                ).fetchall()
+            except Exception:
+                rows = []
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            # Map each article to its loudest book-ticker mention. We
+            # delegate to the same ticker-extraction convention used by
+            # briefing_coverage_audit: word-boundary match against the
+            # title. The active universe is the held book PLUS the
+            # canonical _BOOK_TICKERS so unheld surging names still
+            # surface (the IDLE_DESPITE_SURGE failure mode is
+            # specifically about *unheld* names — held-name signal
+            # only blocks adding, not opening fresh exposure).
+            try:
+                from analysis.claude_analyst import _BOOK_TICKERS
+                book = set(_BOOK_TICKERS) | held_tickers
+            except Exception:
+                book = held_tickers
+            for r in rows:
+                title = r[0] or ""
+                for tkr in book:
+                    if not isinstance(tkr, str) or not tkr:
+                        continue
+                    # Same word-boundary convention as briefing_coverage_audit.
+                    import re as _re
+                    if _re.search(rf"\b{_re.escape(tkr)}\b", title):
+                        signals.append({
+                            "ticker": tkr,
+                            "ai_score": r[2],
+                            "urgency": r[3],
+                            "source": r[1],
+                            "first_seen": r[4],
+                            "held": tkr in held_tickers,
+                            "title": title,
+                        })
+                        break  # one ticker per article — first match wins
+        # Last decision (any verb).
+        decisions = store.recent_decisions(limit=1) or []
+        last_decision = decisions[0] if decisions else None
+
+        result = build_cash_conviction_fit(
+            portfolio, signals, last_decision,
+            idle_cash_pct=idle_cash_pct,
+            overdeployed_cash_pct=overdeployed_cash_pct,
+            high_conviction_score=high_conviction_score,
+            low_conviction_score=low_conviction_score,
+            recent_fill_max_min=recent_fill_max_min,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "portfolio": {},
+            "top_signal": {},
+            "last_decision": {},
+            "thresholds": {},
+        }), 500
+
+
 if __name__ == "__main__":
     run()
