@@ -5,6 +5,89 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4) — three new `/api/chat` enrichment blocks for today's paper-trader skills
+
+Three pure `_*_chat_lines` helpers in `dashboard/web_server.py` (plus 3
+guarded 3s sub-fetches + 3 prompt blocks in the chat handler) that
+surface today's brand-new paper-trader skills (commits `7ea7a4b` +
+`4e12e56`) to the analyst — those builders shipped fully tested but
+were not yet reachable from chat. Exactly mirrors the established
+`_decision_paralysis_chat_lines` / `_event_readiness_chat_lines` /
+`_macro_calendar_chat_lines` enrichment design (SSOT — builder's own
+`headline` is the chat headline, no chat-side re-derived verdict;
+non-actionable verdicts collapse to silence — never chat filler).
+
+### `_cash_redeployment_chat_lines` ← `/api/cash-redeployment-latency-skill`
+
+The chat carries `/api/risk`'s point-in-time cash_pct snapshot but no
+block for the *interval-distribution* question: when the desk SELLs,
+how long does the freed capital sit before it's working again? A book
+that sells into a thesis weakening then sits for 5 days has the same
+headline cash_pct as one that redeploys in 6h — the desk in question
+is materially different. The chat block fires ONLY on `SLOW` / `STALLED`
+(`FAST_REDEPLOY` / `STEADY` / `NO_DATA` → silence). Detail line restates
+the builder's own `stats` fields (p25/median/p75 latency, n_stalled,
+total_freed minus total_redeployed = idle-cash dollars).
+
+### `_decision_vapor_chat_lines` ← `/api/decision-vapor-skill`
+
+The chat already carries the *what* of recent decisions (the trader
+snapshot + recent trades) but nothing answers the structural-quality
+question: are FILLED decisions citing concrete numbers + catalysts +
+tickers, or has Opus been writing generic "strong setup, building
+position" vapor? A vapor trade that fails has nothing for the next
+decision to learn from. The chat block fires ONLY on `MIXED` /
+`VAPOR_DECISIONS` (`SPECIFIC` / `NO_DATA` → silence). `VAPOR_DECISIONS`
+additionally surfaces one **verbatim** VAPOR sample excerpt so the
+analyst sees what the bot is actually saying when reasoning collapses
+— the chat is forbidden from paraphrasing the bot's own words (the
+`_thesis_drift_chat_lines` drift_reasons verbatim-passthrough
+precedent).
+
+### `_regime_leverage_fit_chat_lines` ← `/api/regime-leverage-fit-skill`
+
+The watchlist is leveraged-ETF-heavy (TQQQ / SOXL / SQQQ / SOXS / SPXL
+/ SPXS), so the structural question "are we positioned with or against
+the regime?" is the highest-stakes structural read and answered nowhere
+else in chat. The portfolio block reports `leveraged_pct` as a scalar
+but the *fit* (lev% × regime sign × flow direction) is what actually
+matters. A 0% leveraged book during a bull tape is just as structurally
+wrong as a 40% leveraged book during a bear — both fightable in chat,
+neither shows up as a discrete signal anywhere else. Block fires ONLY
+on `BLIND_LEVERING` / `DANGEROUS_HEADWIND` / `MISSED_TAILWIND`
+(`ALIGNED` / `DEFENSIVE` / `NEUTRAL` / `NO_DATA` → silence). Detail
+line restates the builder's own `regime` / `spy_mom_20d` /
+`portfolio.leveraged_pct` / `recent_flow` fields — never a recomp.
+
+Live verdict at merge (2026-05-21 NVDA earnings night, paper-trader
+$1011.95 book, 66% NVDA / 34% cash, 0% leveraged): regime-leverage-fit
+returns `MISSED_TAILWIND` ("bull tape — spy_mom_20d=4.22% — but only
+0.0% leveraged"), cash-redeployment returns `STEADY` (silence — desk
+is redeploying within 6h median), decision-vapor returns `SPECIFIC`
+(silence — every FILLED reasoning today cites Q1 +85% rev, $80B
+buyback, etc.). One of the three is actionable RIGHT NOW. None would
+be visible without this pass.
+
+### Discipline + tests
+
+Pure builders (verdict-dispatch on `headline` passthrough, total / never
+raises). 68 new tests across three files — exact-copy of the
+`test_chat_decision_paralysis_enrichment.py` pattern, mapped to the new
+verdict ladder per skill:
+
+- `tests/test_chat_cash_redeployment_enrichment.py` — 22 tests
+- `tests/test_chat_decision_vapor_enrichment.py` — 23 tests (incl.
+  verbatim-excerpt passthrough lock — the chat must not paraphrase
+  the bot's own words)
+- `tests/test_chat_regime_leverage_fit_enrichment.py` — 23 tests
+
+All 310 chat-enrichment tests still pass (`pytest tests/ -k chat`).
+Staged paths: `dashboard/web_server.py` + the three new test files +
+`AGENTS.md`. No `git add -A`. No paper-trader-side edits — every
+builder this pass enriches was already test-locked on the trader side.
+
+---
+
 ## 2026-05-21 hybrid pass (Agent 3 nightly) — `recap_template_audit.audit_by_source`
 
 A per-source breakdown layer on top of the existing aggregate recap-gate
