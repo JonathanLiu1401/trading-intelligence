@@ -1,6 +1,6 @@
 {
   "_account": {
-    "last_updated": "2026-05-14T01:20 PDT"
+    "last_updated": "2026-05-21T00:27 PDT"
   },
   "_note": "Sao's trading portfolio - updated via UI",
   "options": [
@@ -32,17 +32,38 @@
     },
     {
       "avg_cost": 887.119,
-      "notes": "Lumentum - photonics/semis",
+      "notes": "Lumentum - photonics/semis; +$3,000 queued market open 2026-05-21 (pending fill)",
       "qty": 0.1908,
       "ticker": "LITE",
       "type": "stock"
     },
     {
-      "avg_cost": 596.32,
-      "notes": "Direxion Daily MU Bull 2X - position closed",
-      "qty": 0,
+      "avg_cost": 0,
+      "notes": "Direxion Daily MU Bull 2X - 5 shares queued market open 2026-05-21 (pending fill)",
+      "qty": 5,
       "ticker": "MUU",
       "type": "etf_leveraged"
+    },
+    {
+      "avg_cost": 0,
+      "notes": "$2,000 queued market open 2026-05-21 (pending fill)",
+      "qty": 0,
+      "ticker": "MSFT",
+      "type": "stock"
+    },
+    {
+      "avg_cost": 0,
+      "notes": "$3,000 queued market open 2026-05-21 (pending fill)",
+      "qty": 0,
+      "ticker": "GOOG",
+      "type": "stock"
+    },
+    {
+      "avg_cost": 0,
+      "notes": "$2,000 queued market open 2026-05-21 (pending fill)",
+      "qty": 0,
+      "ticker": "COHR",
+      "type": "stock"
     }
   ],
   "sector_watchlist": [
