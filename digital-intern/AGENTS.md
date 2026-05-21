@@ -5,6 +5,211 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 hybrid pass (Agent 3 evening) — `urgency_label_split_by_ticker`
+
+**Phase 1 (audit):** read daemon.py, storage/article_store.py,
+watchers/alert_agent.py, watchers/urgency_scorer.py, ml/trainer.py,
+ml/model.py, ml/features.py, collectors/web_scraper.py,
+analysis/claude_analyst.py. Ran the focused test suite covering every
+required invariant (`test_article_store.py` + `test_urgency_scorer.py` +
+`test_features.py` + `test_model.py` + `test_trainer.py`) — **55/55
+passed**. Quick sanity checks on the `_LIVE_RE` word-boundary discipline,
+the recap-template anchored regexes, and the `_QW_LISTING` share-card
+pattern all behaved correctly on adversarial inputs. The four
+load-bearing invariants (backtest isolation, ml_score vs ai_score,
+score_source, urgency state machine) remain pinned by their respective
+test suites with no drift. `bugs_fixed=0` — per the commit guard, no
+real code defect found to fix; the prior passes have been thorough.
+
+**Phase 2 (feature):** added `ArticleStore.urgency_label_split_by_ticker`
+— the **third natural slice** of the urgency-label calibration metric.
+
+The aggregate `urgency_label_split` answers "is the alert path mostly
+LLM-vetted?" (pinned ~29% for days); the 2026-05-21 `by_source` slice
+answers "WHICH FEEDERS produce the unverified noise?" (Google News topic
+feeds dominate); this answers "which of MY HELD POSITIONS are getting
+LLM-vetted urgent alerts vs only model-only ones?" — the analyst persona
+"I depend on these alerts to react to events affecting MY positions"'s
+most direct question.
+
+Live evidence at merge (2026-05-21 11:10Z, last 24h, NVDA earnings night
++ AI-rally morning): the three slices now give the analyst a triangulated
+view of WHERE the unverified-rate problem actually lives.
+
+```
+ticker  total  llm   ml   bb  null  llm_frac
+NVDA      120   28   92    0    0    23%   ← biggest held name, WORST vetted
+MU         15    6    9    0    0    40%
+AXTI       10    6    4    0    0    60%   ← best vetted (low-volume name)
+QBTS        2    1    1    0    0    50%
+```
+
+Aggregate at the same instant: 153 llm / 398 ml / 0 boost / 0 null = 28%
+LLM-vetted across 551 total urgent rows. NVDA's 23% vetted rate is
+materially worse than the aggregate — the per-ticker slice exposes a
+structural tilt the prior two slices could only hint at (per-source said
+"GN: Nvidia is the worst feeder", which is consistent with "NVDA mentions
+are the least vetted name" but doesn't *prove* it).
+
+**Shape contract** (mirrors `urgency_label_split_by_source` /
+`source_freshness` / `source_throughput` / `ticker_mention_velocity`):
+
+```
+{
+  "window_h": int,
+  "by_ticker": [
+    {
+      "ticker": str,
+      "total": int,
+      "llm": int,
+      "ml": int,
+      "briefing_boost": int,
+      "null": int,
+      "llm_fraction": float,   # (llm + briefing_boost) / total
+    },
+    ...                         # ML-DESC sort, alphabetical tiebreak
+  ],
+  "total_urgent": int,          # sum of per-ticker totals (a row touching
+                                # N held names contributes N to this sum)
+  "total_tickers": int,         # held names with >=1 urgent mention
+}
+```
+
+**Discipline highlights:**
+
+- **Pass tickers in** (mirrors `ticker_mention_velocity`): SSOT for the
+  held set lives at the caller (`ml.features.LIVE_PORTFOLIO_TICKERS` /
+  `daemon.PORTFOLIO_TICKERS`), avoiding the storage→ml import cycle and
+  preventing the duplicated-list drift class that the per-source slice
+  also avoids.
+- **Word-boundary + ALL-CAPS + optional `$`** — `NVDAQ` never inflates
+  `NVDA`; `$NVDA` matches `NVDA`. Pinned by
+  `test_word_boundary_prevents_substring_match` /
+  `test_leading_dollar_sign_matches`.
+- **Match surface is title+summary** — same as
+  `watchers.alert_agent._book_tickers` (SSOT with the alert path: the
+  two surfaces never disagree about whether a row touches a held name).
+  Pinned by `test_match_surface_includes_summary`.
+- **Held names with zero urgent mentions are OMITTED** (deliberately
+  different from `ticker_mention_velocity`'s zero-row policy; this
+  metric is consumed by worst-vetted-first displays where empties are
+  pure clutter). Pinned by `test_zero_mention_held_name_omitted`.
+- **One row touching N held names contributes N to the sum** — same
+  multi-mention discipline as `_book_tickers` / alert_book_velocity.
+  Pinned by `test_one_row_with_multiple_held_tickers_counts_in_each`.
+
+**Load-bearing invariants intact by construction:**
+
+1. Backtest isolation — `_LIVE_ONLY_CLAUSE` applied verbatim; pinned by
+   `test_synthetic_rows_never_inflate_a_ticker` (three synthetic shapes
+   seeded with NVDA in the title, only the live row counts).
+2. `ml_score` vs `ai_score` — no DB writes; pure read-only SELECT.
+3. `score_source` — no mutation; the metric READS the three canonical
+   tags (`llm` / `ml` / `briefing_boost`) plus the legacy `null` legacy
+   bucket exactly as `urgency_label_split` does.
+4. SSOT — match surface (title+summary) matches `_book_tickers`; the
+   tag bucket definition matches the aggregate metric; the parity is
+   pinned by `test_per_ticker_sum_lte_aggregate` (per-ticker sum must
+   stay ≤ aggregate row count — a held name double-counted would break
+   it).
+
+Decorated with `@_retry_on_lock` like every other reader for the
+documented shared-connection cursor-collision class.
+
+**Tests pinned** in `tests/test_urgency_label_split_by_ticker.py`
+(17 tests, all pass in 0.21s; mirror the precision-anchored style of
+`test_urgency_label_split_by_source.py`): empty-store, empty-ticker-list,
+invalid-tickers, single-ticker-four-buckets, word-boundary,
+$-prefix-matches, title+summary match surface, multi-ticker row counting,
+mixed score_source partition, zero-mention omission,
+worst-ml-offender-first sort, zero-ml alphabetical, synthetic isolation,
+non-urgent excluded, urgency=2 included alongside urgency=1, window
+filter, aggregate-parity lower bound.
+
+Focused sibling suite (touched module + every aggregate / per-source /
+calibration / scorer sibling): **77 passed in 9.59s**, no regressions.
+
+Commit `13437f0`.
+
+**Phase 3 (live findings — news-analyst validation, 2026-05-21 11:10Z):**
+
+1. **(positive) Pipeline healthy under NVDA-night load.** 14,624
+   articles in 24h, 617 urgent>=1, 520 alerted (84% urgent→push delivery
+   rate). 41/41 workers alive in `supervisor_state.json` — no DEAD
+   workers. The alert worker is keeping up.
+
+2. **(positive) Latest briefing id38 (2026-05-21 07:36Z, 50 articles,
+   3439 chars) is dense and analyst-actionable** — leads with the Asia
+   AI complex erupting (SK Hynix +11.17%, Softbank +19.85%, Samsung
+   +8.51%), tight MACRO table (S&P/NASDAQ/RUT/VIX/10Y/BTC/Gold/Oil/SSE),
+   per-position PORTFOLIO column (LITE/LNOK/MUU/AXTI/MU/NVDA with
+   $-price + chg% + note), SEMIS PULSE numbers. Briefing surface working
+   as designed.
+
+3. **(NEW, motivates Phase 2 feature) NVDA per-position vetting is
+   structurally worst** — 120 urgent ticker-mentions on NVDA at only 23%
+   LLM-vetted (92 of 120 ML-only). The biggest held name is also where
+   the verification rate is materially below the aggregate. This is the
+   per-position answer the analyst could not previously get. Not a code
+   bug — the underlying cause is the same Sonnet-quota / Google-News-
+   topic-feed dynamic the per-source slice surfaced; the visibility gap
+   was the actual problem.
+
+4. **(chronic, recurring) Briefing cadence id37→id38 gap was 10.2h**
+   while id33→id37 stayed within the 5-6h target. The overnight Opus
+   quota skip pattern is recurring — analyst's "missed overnight digest"
+   failure mode. Same as the prior pass; left as a standing finding.
+
+5. **(observation, structural) Only 19% (116/617) of urgent rows in
+   last 24h mentioned a held ticker.** The standalone alert push is
+   firing 5× more often on non-held names than on held ones. Plausibly
+   correct — the analyst follows broad market context, not just open
+   positions — but worth knowing the alert channel is materially
+   tilted toward macro/sector colour.
+
+6. **(chronic, expected) 22,772 sources dark >24h** — dominated by GDELT
+   GKG hyperlocal-host backfill artefacts (matches the standing
+   `di-chronic-dark-collectors` memory).
+
+7. **(chronic, recurring) `insert_batch: lock retry exhausted after 5
+   attempts — raising` ERRORs at 10:45Z** — two consecutive on the
+   NVDA-night writer storm. Recovery works (next cycle drains), but this
+   is the same `di-insert-batch-lock-contention` pattern. Not a fresh
+   bug.
+
+8. **(observation) Stuck `urgency=1` residue** — 10 urgent rows still at
+   `urgency=1` from 24-26h ago (oldest: DigiTimes SpaceX/Cursor row from
+   2026-05-20 09:09Z). `reap_stale_urgent` (purge_worker, default 24h
+   cutoff, 6h cadence) should demote these on its next sweep; they are
+   awaiting that sweep. Not a fresh bug — the structural fix is already
+   in `purge_worker.purge_old → reap_stale_urgent` path; this is just
+   the natural lag between aging-out and the next purge tick.
+
+**Counters:** `bugs_fixed=0` (per the commit guard — no real defect
+found; existing test suite covers every required assertion, the four
+invariants are pinned, focused suite passes 55/55), `features_added=1`
+(per-held-ticker urgency-label split —
+`ArticleStore.urgency_label_split_by_ticker`, code+tests on master in
+`13437f0`), `user_findings=8` (pipeline healthy under NVDA-night load,
+latest briefing dense+actionable, NVDA per-position vetting 23% worst-
+in-book validated live, recurring 10.2h overnight briefing skip, 19%
+held-ticker share of urgent channel, chronic dark-sources GDELT GKG,
+recurring lock retry exhausted, 10 urgency=1 residue awaiting next
+purge sweep).
+
+**Staging discipline.** Per-commit, explicit pathspec
+(`git add storage/article_store.py
+tests/test_urgency_label_split_by_ticker.py`), no `git add -A`.
+`git diff --staged --stat` checked before commit to confirm only the
+intentional changes were included. Sibling paper-trader-side `M` files
+(`paper_trader/backtest.py` / `paper_trader/dashboard.py` /
+`tests/test_pricecache_benchmark_poison.py`) and untracked
+new-skill/test files from concurrent agents were left exactly as
+found, untouched. AGENTS.md committed alongside the related code in
+this same step.
+
+---
+
 ## 2026-05-21 feature-dev pass (Agent 4) — three new `/api/chat` enrichment blocks for today's paper-trader skills
 
 Three pure `_*_chat_lines` helpers in `dashboard/web_server.py` (plus 3
