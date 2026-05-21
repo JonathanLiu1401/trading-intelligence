@@ -1397,6 +1397,175 @@ def _watchlist_coverage_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _concentration_trajectory_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/concentration-trajectory` (the daily-snapshot
+    slope view of single-name concentration) as compact chat-context lines.
+
+    Every existing chat block describing book shape is **point-in-time**: the
+    portfolio snapshot reports current cash%, /api/risk reports current
+    top1_pct, the correlation block reports current factor structure. None
+    answers the first-derivative question: *over the past N days, has the
+    book's single-name concentration been rising, falling, or steady?* A book
+    sitting at 65% top-1 today reads identically in every other surface
+    whether it ramped from 30% → 65% over a week (concentration creep — the
+    desk drifted in) or jumped 0% → 65% in the last cycle (a single fill blew
+    it up — different operator response).
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is the
+    chat headline — no chat-side re-derived verdict (the
+    ``_decision_paralysis_chat_lines`` precedent). Detail line restates the
+    builder's *own* ``current`` + ``delta_top1_pct`` fields — never a
+    recomputation.
+
+    Pure / total — same contract as the sibling helpers:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - non-actionable verdicts (``DECONCENTRATING`` / ``DIVERSIFIED`` /
+      ``BALANCED`` / ``INSUFFICIENT_DATA`` / ``NO_DATA``) → ``[]``: a healthy
+      or improving trajectory is silence, matching the
+      ``_decision_paralysis_chat_lines`` silence precedent — never chat
+      filler when the book is diversifying or already broad
+    - actionable verdicts (``CONCENTRATION_SPIKE`` / ``RAMPING_UP`` /
+      ``CONCENTRATED_STEADY``) → builder's verbatim ``headline`` (only when
+      usable) + one detail line composed from the builder's own ``current``
+      snapshot and ``delta_top1_pct`` (the ``_macro_calendar_chat_lines``
+      precedent); a missing field degrades silently rather than raises (the
+      ``_paper_trader_position_lines`` precedent)
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"CONCENTRATION_SPIKE", "RAMPING_UP", "CONCENTRATED_STEADY"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    current = rep.get("current") if isinstance(rep.get("current"), dict) else {}
+    top1_pct = _num(current.get("top1_pct"))
+    top1_ticker = current.get("top1_ticker")
+    top3_pct = _num(current.get("top3_pct"))
+    n_pos = _num(current.get("n_positions"))
+    delta = _num(rep.get("delta_top1_pct"))
+    window_days = _num(rep.get("window_days"))
+
+    detail_parts: list[str] = []
+    if (top1_pct is not None and isinstance(top1_ticker, str)
+            and top1_ticker.strip() and n_pos is not None):
+        detail_parts.append(
+            f"top-1: {top1_ticker} {top1_pct:.1f}% of book "
+            f"({int(n_pos)} name{'s' if int(n_pos) != 1 else ''})"
+        )
+    elif top1_pct is not None and n_pos is not None:
+        detail_parts.append(
+            f"top-1 {top1_pct:.1f}% "
+            f"({int(n_pos)} name{'s' if int(n_pos) != 1 else ''})"
+        )
+    if top3_pct is not None:
+        detail_parts.append(f"top-3 {top3_pct:.1f}%")
+    if (delta is not None and window_days is not None
+            and verdict in {"RAMPING_UP", "CONCENTRATION_SPIKE"}):
+        detail_parts.append(
+            f"{delta:+.1f}pp over {int(window_days)}d"
+        )
+
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    return lines
+
+
+def _streak_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/streak` (current run + historical extremes
+    on the closed round-trip series) as compact chat-context lines.
+
+    The chat already carries plenty of *aggregate* behavioural reads — the
+    scorecard summary, churn metrics, decision paralysis, hold discipline —
+    but none surface the *streak structure* of the closed round-trips
+    themselves. Two questions a desk asks the analyst that have no other
+    chat block:
+
+      * Am I on a hot hand or a cold streak right now? (Recent consecutive
+        same-sign closes.) Useful for surfacing potential **tilt** after a
+        loss cluster or **overconfidence** after a win cluster.
+      * What are the historical extremes? (Longest W / L runs.) Context for
+        whether the current run is normal or unusual.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is the
+    chat headline — no chat-side re-derived verdict (the
+    ``_decision_paralysis_chat_lines`` precedent). Detail line restates the
+    builder's *own* ``current_streak`` + ``longest_win_streak`` /
+    ``longest_loss_streak`` + ``n_round_trips`` fields — never a recompute.
+
+    Pure / total — same contract as the sibling helpers:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - non-actionable verdicts (``NEUTRAL`` / ``None`` from EMERGING /
+      NO_DATA states) → ``[]``: a stable book that just hasn't strung
+      together a run is silence, matching the
+      ``_decision_paralysis_chat_lines`` silence precedent — never chat
+      filler when no streak signal is active
+    - actionable verdicts (``HOT_HAND`` / ``TILT_RISK``) → builder's
+      verbatim ``headline`` (only when usable) + one detail line composed
+      from the builder's own ``current_streak`` / ``longest_*_streak`` /
+      ``n_round_trips`` (the ``_macro_calendar_chat_lines`` precedent); a
+      missing field degrades silently rather than raises (the
+      ``_paper_trader_position_lines`` precedent)
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"HOT_HAND", "TILT_RISK"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    cur = rep.get("current_streak") if isinstance(rep.get("current_streak"), dict) else {}
+    cur_len = _num(cur.get("length"))
+    cur_kind = cur.get("kind")
+    longest_w = _num(rep.get("longest_win_streak"))
+    longest_l = _num(rep.get("longest_loss_streak"))
+    n_rts = _num(rep.get("n_round_trips"))
+
+    detail_parts: list[str] = []
+    if (cur_len is not None and isinstance(cur_kind, str)
+            and cur_kind in ("WIN", "LOSS")):
+        n = int(cur_len)
+        if cur_kind == "WIN":
+            word = "win" if n == 1 else "wins"
+        else:
+            word = "loss" if n == 1 else "losses"
+        detail_parts.append(f"current run: {n} {word}")
+    if longest_w is not None and longest_l is not None:
+        detail_parts.append(
+            f"longest W={int(longest_w)} / L={int(longest_l)}"
+        )
+    if n_rts is not None:
+        detail_parts.append(
+            f"{int(n_rts)} round-trip{'s' if int(n_rts) != 1 else ''}"
+        )
+
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    return lines
+
+
 def _thesis_drift_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/thesis-drift` (every open position re-tested
     against the verbatim reason it was opened for, graded INTACT / WEAKENING /
@@ -4580,6 +4749,61 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: watchlist-coverage fetch failed: %s", e)
 
+        # Concentration trajectory — the slope view of single-name exposure.
+        # Every other concentration block on chat is point-in-time (portfolio
+        # snapshot cash%, /api/risk top1_pct, correlation factor structure).
+        # None answers the first-derivative question: has the book's top-1
+        # weight been rising, falling, or steady over the last N days? A
+        # book at 65% top-1 today reads identically in every other surface
+        # whether it ramped from 30% → 65% over a week (concentration creep)
+        # or jumped 0% → 65% in one cycle (single-fill blow-up — different
+        # operator response). Block fires ONLY on CONCENTRATION_SPIKE /
+        # RAMPING_UP / CONCENTRATED_STEADY (DECONCENTRATING / DIVERSIFIED /
+        # BALANCED / INSUFFICIENT_DATA / NO_DATA collapse to silence — the
+        # _decision_paralysis_chat_lines silence precedent). Composed
+        # verbatim by the pure _concentration_trajectory_chat_lines helper
+        # (unit-tested; SSOT — the builder's own `headline` is the chat
+        # headline, no re-derived verdict). Guarded 3s read; only appears
+        # once :8090 is restarted onto /api/concentration-trajectory.
+        concentration_trajectory_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/concentration-trajectory",
+                    timeout=3) as resp:
+                _ct = json.loads(resp.read().decode("utf-8"))
+            concentration_trajectory_block = "\n".join(
+                _concentration_trajectory_chat_lines(_ct))
+        except Exception as e:
+            _logger().warning(
+                "chat: concentration-trajectory fetch failed: %s", e)
+
+        # Streak (current run + historical extremes on closed round-trips) —
+        # the behavioural read no other chat block carries. The scorecard
+        # gives win-rate aggregate; churn counts re-entries; hold-discipline
+        # times the median losing-cut. None surface "am I on a HOT_HAND right
+        # now, am I on a TILT_RISK loss-cluster?" — the textbook
+        # behavioural-edge questions a desk asks after a streak forms. Block
+        # fires ONLY on HOT_HAND / TILT_RISK (NEUTRAL / EMERGING / NO_DATA
+        # collapse to silence — the _decision_paralysis_chat_lines silence
+        # precedent — the verdict is gated to STABLE n>=8 round-trips, so a
+        # three-trip "streak" stays silent by construction). Composed
+        # verbatim by the pure _streak_chat_lines helper (unit-tested; SSOT
+        # — the builder's own `headline` is the chat headline, no re-derived
+        # verdict). Guarded 3s read; only appears once :8090 is restarted
+        # onto /api/streak.
+        streak_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/streak",
+                    timeout=3) as resp:
+                _sk = json.loads(resp.read().decode("utf-8"))
+            streak_block = "\n".join(_streak_chat_lines(_sk))
+        except Exception as e:
+            _logger().warning(
+                "chat: streak fetch failed: %s", e)
+
         # "What materially changed since you last looked" — the one temporal-
         # change view. Every sub-fetch above is a current-state snapshot; this
         # lets the chat answer "what happened while I was away / since I last
@@ -4772,6 +4996,8 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — REGIME-LEVERAGE FIT (book-leverage alignment vs prevailing SPY momentum regime. The watchlist is leveraged-ETF-heavy — the structural question 'are we positioned with or against the regime?' is high-stakes and answered nowhere else in chat. A 0% leveraged book during a bull tape is just as structurally wrong as a 40% leveraged book during a bear. Surfaced ONLY when BLIND_LEVERING / DANGEROUS_HEADWIND / MISSED_TAILWIND, never filler when ALIGNED / DEFENSIVE / NEUTRAL. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{regime_leverage_fit_block}\n\n" if regime_leverage_fit_block else "")
             + (f"PAPER TRADER — REALIZED vs UNREALIZED P&L SPLIT (the banked-vs-paper composition question — of today's net P&L, how much is locked-in realized vs paper that can evaporate on the next adverse mark? A +$50 book that is 100% realized is fundamentally different from the same headline that is 100% open-paper. Surfaced ONLY when DRAWING_DOWN / LEAKING_PAPER / PAPER_HEAVY, never filler when BANKED / BALANCED. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{realized_vs_unrealized_block}\n\n" if realized_vs_unrealized_block else "")
             + (f"PAPER TRADER — WATCHLIST COVERAGE (per-watchlist-ticker attention scan over the recent decision stream — which tickers has the bot stopped looking at? Every other panel is position-centric and never names an IGNORED ticker; this is the only block that surfaces opportunity cost from neglected names. Surfaced ONLY when STAGNANT / CONCENTRATED, never filler when DIVERSIFIED. Headline and the stale-ticker sample carry verbatim from the trader endpoint — restate, never re-derive):\n{watchlist_coverage_block}\n\n" if watchlist_coverage_block else "")
+            + (f"PAPER TRADER — CONCENTRATION TRAJECTORY (the slope view of single-name exposure over the last N days — has top-1 weight been RISING, FALLING, or STEADY? Every other concentration surface is point-in-time and reads identically whether the book ramped 30%→65% over a week or jumped 0%→65% in one cycle. Surfaced ONLY when CONCENTRATION_SPIKE / RAMPING_UP / CONCENTRATED_STEADY, never filler when DECONCENTRATING / DIVERSIFIED / BALANCED. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{concentration_trajectory_block}\n\n" if concentration_trajectory_block else "")
+            + (f"PAPER TRADER — STREAK (current win/loss run + historical extremes on closed round-trips — the behavioural-edge read no other surface carries. Surfaced ONLY when HOT_HAND / TILT_RISK, never filler when NEUTRAL or EMERGING; verdict is gated to ≥8 closed round-trips so a 3-trip 'streak' stays silent. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{streak_block}\n\n" if streak_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "

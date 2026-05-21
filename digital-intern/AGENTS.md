@@ -5,6 +5,133 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4) — two new `/api/chat` enrichment blocks: concentration trajectory + streak
+
+**Phase 1 — bugs_fixed: 0.** Read CLAUDE.md, AGENTS.md head, the chat handler
+in `dashboard/web_server.py`, the existing chat-enrichment helpers (the
+established `_decision_paralysis_chat_lines` / `_macro_calendar_chat_lines` /
+`_cash_redeployment_chat_lines` / `_realized_vs_unrealized_chat_lines` /
+`_watchlist_coverage_chat_lines` family), and the paper-trader endpoints
+this pass wires in. No new bugs surfaced in the chat path; the live
+`/api/chat` flow is well-covered by the 423 chat-related tests already
+passing.
+
+**Phase 2 — features_added: 2.** Two new chat enrichment blocks composing
+paper-trader analytics into the analyst's chat context. Both follow the
+established silence-on-healthy pattern verbatim.
+
+### Block 1: `_concentration_trajectory_chat_lines`
+
+Surfaces `/api/concentration-trajectory` (committed in paper-trader's
+`6b4791c`) — the slope view of single-name concentration over the last N
+days. **The chat-side gap this fills:** every existing chat block describing
+book shape is point-in-time (the portfolio snapshot reports current cash%,
+`/api/risk` reports current top1_pct, the correlation block reports current
+factor structure). None answers the first-derivative question: *over the
+past N days, has the book's top-1 weight been rising, falling, or steady?*
+A book sitting at 65% top-1 today reads identically in every other surface
+whether it ramped from 30% → 65% over a week (concentration creep — the
+desk drifted in) or jumped 0% → 65% in the last cycle (a single fill blew
+it up — different operator response).
+
+Live evidence at merge — `/api/concentration-trajectory` reported
+`RAMPING_UP — NVDA climbed 60.2% → 100.0% (top-1 of 1 name(s)) over 3
+day(s) — concentration creep into one name.` (verdict=RAMPING_UP,
+delta_top1_pct=+39.80, n_trades_walked=12). That's the exact pathology the
+chat block exists to surface to the analyst.
+
+Verdict gating (mirrors paper-trader's builder verdict ladder):
+* fires on `CONCENTRATION_SPIKE` / `RAMPING_UP` / `CONCENTRATED_STEADY`
+* silences on `DECONCENTRATING` / `DIVERSIFIED` / `BALANCED` /
+  `INSUFFICIENT_DATA` / `NO_DATA` (the `_decision_paralysis_chat_lines`
+  silence precedent — never chat filler when the trajectory is healthy or
+  improving)
+
+### Block 2: `_streak_chat_lines`
+
+Surfaces `/api/streak` — the current win/loss run + historical extremes on
+the closed round-trip series. **The chat-side gap this fills:** the chat
+already carries plenty of aggregate behavioural reads (the scorecard
+summary, churn metrics, decision paralysis, hold discipline) but none
+surface the *streak structure* of the closed round-trips themselves.
+Two questions a desk asks the analyst that have no other chat block:
+
+* *Am I on a hot hand or a cold streak right now?* (Recent consecutive
+  same-sign closes.) Useful for surfacing potential **tilt** after a loss
+  cluster or **overconfidence** after a win cluster.
+* *What are the historical extremes?* (Longest W / L runs.) Context for
+  whether the current run is normal or unusual.
+
+Verdict gating:
+* fires on `HOT_HAND` / `TILT_RISK`
+* silences on `NEUTRAL` / `None` (EMERGING / NO_DATA states have
+  `verdict=None`) — the `_decision_paralysis_chat_lines` silence precedent.
+  The builder gates the verdict to STABLE n_round_trips ≥ 8, so a 3-trip
+  "streak" never reaches the chat by construction.
+
+**Both blocks honour SSOT (paper-trader invariant #10):** the builder's own
+`headline` string passes through UNCHANGED into the chat block; no
+chat-side re-derived verdict. Detail line restates the builder's own
+fields (`current` / `delta_top1_pct` for trajectory; `current_streak` /
+`longest_win_streak` / `longest_loss_streak` / `n_round_trips` for streak)
+— never a recomputation. Missing fields degrade silently rather than
+raise (the `_paper_trader_position_lines` precedent).
+
+**Pure / total contract** — exactly the `_baseline_compare_chat_lines`
+contract:
+- non-dict input → `[]` (block omitted, never raises into the chat handler)
+- non-actionable verdict → `[]` (silence precedent)
+- actionable verdict → builder's verbatim `headline` (only when usable
+  string) + one detail line composed from the builder's own numeric fields
+
+**Integration:** each block is its own guarded 3s `urlopen` to
+`http://127.0.0.1:8090/api/concentration-trajectory` and `http://127.0.0.1:8090/api/streak`,
+composed verbatim by the respective pure helper, inserted into the
+system prompt under a labelled section that explains *why this block
+exists* and *what verdicts surface it* (the established prompt-block
+documentation pattern). One upstream fault degrades that block to
+silence, never sinks the chat handler. Both blocks only appear once
+`:8090` is restarted onto the endpoints they consume (the
+`_realized_vs_unrealized_block` / `_watchlist_coverage_block` precedent —
+stale paper-trader → silent block).
+
+**Tests pinned:** `tests/test_chat_concentration_trajectory_enrichment.py`
+(34 tests) and `tests/test_chat_streak_enrichment.py` (30 tests). Both
+follow the established chat-enrichment test contract from
+`test_chat_realized_vs_unrealized_enrichment.py`:
+
+* `TestPureTotalContract` — non-dict input silence, missing verdict silence
+* `TestSilenceOnNonActionable` — every non-actionable verdict collapses
+  to `[]` (parametrised over all known non-actionable values + `None` +
+  `""` + `"OTHER"`)
+* `TestVerbatimHeadlineSSOT` — invariant #10: a custom test headline string
+  passes through unchanged
+* `TestDetailLineComposition` — detail line restates the builder's own
+  fields; missing / garbage / bool numerics degrade silently; specific
+  formatting locks (singular/plural agreement, delta-clause inclusion per
+  verdict)
+* `TestAllActionableVerdictsFire` — every actionable verdict emits at
+  least the headline; plus one **live-shape smoke** for trajectory that
+  uses the exact response shape pulled from `/api/concentration-trajectory`
+  on 2026-05-21 (NVDA RAMPING_UP) — the production failure-mode lock
+
+64/64 new tests pass in 0.24s. Focused sibling suite (155 tests across
+`test_chat_realized_vs_unrealized_enrichment` + `test_chat_decision_paralysis_enrichment`
++ `test_chat_cash_redeployment_enrichment` + `test_chat_watchlist_coverage_enrichment`
++ the two new files) passes. Broader chat suite (423 tests across all
+`-k chat` selected tests) passes — no regression to sibling blocks.
+
+**Counters**: bugs_fixed=0 · features_added=2 (two chat enrichment blocks
+surfacing existing paper-trader analytics into the analyst chat context,
+64 exact-value tests).
+
+Commit: this pass. Staged paths (explicit pathspec, no `git add -A`):
+`dashboard/web_server.py` (helpers + integration blocks + prompt strings) +
+`tests/test_chat_concentration_trajectory_enrichment.py` +
+`tests/test_chat_streak_enrichment.py` + this `AGENTS.md` entry.
+
+---
+
 ## 2026-05-21 hybrid pass (Agent 3 post-NVDA) — throughput sort crash + StockTwits Sentiment gate
 
 **Phase 1 (debug):** read CLAUDE.md, AGENTS.md tail, the eight required files
