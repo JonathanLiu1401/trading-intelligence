@@ -5,6 +5,73 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4 #2) — two new `/api/chat` enrichment blocks for today's paper-trader analytics
+
+Two pure `_*_chat_lines` helpers in `dashboard/web_server.py` (plus 2
+guarded 3s sub-fetches + 2 prompt blocks in the chat handler) that
+surface today's brand-new paper-trader analytics
+(`/api/realized-vs-unrealized` and `/api/watchlist-coverage`) to the
+analyst. Mirrors the established `_decision_paralysis_chat_lines` /
+`_cash_redeployment_chat_lines` / `_regime_leverage_fit_chat_lines`
+enrichment design (SSOT — builder's own `headline` is the chat
+headline, no chat-side re-derived verdict; non-actionable verdicts
+collapse to silence — never chat filler).
+
+### `_realized_vs_unrealized_chat_lines` ← `/api/realized-vs-unrealized`
+
+Every other equity-shape block describes a scalar (portfolio total
+pnl%, drawdown%, β-attribution); none answers the composition
+question: *of today's net P&L, how much is locked-in realized vs
+paper that can evaporate?* A +$50 book that is 100% realized is
+fundamentally different from the same headline that is 100%
+open-paper. Block fires ONLY on `DRAWING_DOWN` / `LEAKING_PAPER` /
+`PAPER_HEAVY` (`BANKED` / `BALANCED` / `NO_DATA` → silence). Detail
+line restates the builder's own `realized_pnl_usd` /
+`unrealized_pnl_usd` / `net_pnl_pct` fields verbatim — no chat-side
+re-derivation.
+
+### `_watchlist_coverage_chat_lines` ← `/api/watchlist-coverage`
+
+The chat carries plenty of *position*-centric and *trade*-centric
+blocks but nothing names a ticker the bot has stopped attending to.
+The live WATCHLIST has 48 tickers; if 36 are silent across 1000
+decisions while NVDA absorbs 100+ actions, the analyst should see
+"STAGNANT — 75% of universe untouched" — opportunity cost no other
+surface exposes. Block fires ONLY on `STAGNANT` / `CONCENTRATED`
+(`DIVERSIFIED` / `NO_DATA` → silence). `STAGNANT` additionally
+surfaces up to 8 stalest ticker symbols **verbatim** from
+`by_ticker` (the `_thesis_drift_chat_lines` drift_reasons
+verbatim-passthrough precedent — the chat must not paraphrase the
+builder's own field, and the analyst sees *which* names to look at).
+
+Live verdict at merge (2026-05-21 NVDA earnings night, $1011.95 book,
+1 NVDA position, 1000 decisions scanned): **realized-vs-unrealized
+returns `BANKED` (silence — 100% realized, $0 paper); watchlist-
+coverage returns `STAGNANT — 36 of 48 watchlist tickers (75%)
+untouched in 7d+`**, surfacing AMAT, AMZU, BITU, CONL, CURE, … as
+candidate names the desk is ignoring. Without this pass none would be
+visible to the chat.
+
+### Discipline + tests
+
+Pure builders (verdict-dispatch on `headline` passthrough, total /
+never raises). 49 new tests across two files — exact-copy of the
+`test_chat_decision_paralysis_enrichment.py` pattern, mapped to the
+new verdict ladder per skill:
+
+- `tests/test_chat_realized_vs_unrealized_enrichment.py` — 26 tests
+- `tests/test_chat_watchlist_coverage_enrichment.py` — 23 tests
+  (incl. stale-ticker verbatim-sample passthrough lock + cap)
+
+All 359 chat-enrichment tests still pass (`pytest tests/ -k chat`).
+Staged paths: `dashboard/web_server.py` + the two new test files +
+`AGENTS.md`. No `git add -A`. The matching paper-trader-side
+analytics endpoints (`/api/realized-vs-unrealized` and
+`/api/watchlist-coverage`) shipped fully test-locked in the same
+session — see the paper-trader AGENTS.md entry for the contract.
+
+---
+
 ## 2026-05-21 hybrid pass (Agent 3 evening) — `urgency_label_split_by_ticker`
 
 **Phase 1 (audit):** read daemon.py, storage/article_store.py,
