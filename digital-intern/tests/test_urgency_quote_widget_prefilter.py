@@ -348,6 +348,9 @@ def test_lockstep_with_alert_path_on_live_noise():
         "NVDANVIDIA Corporation227.13-8.61(-3.65%)",
         "NQ=FNasdaq 100 Jun 2629,215.25-472.50(-1.59%)",
         "$NVIDIA (NVDA.US)$ - Moomoo",
+        # StockTwits sentiment pseudo-article (5h live: 130 rows, 45 ml>=5,
+        # several at 10.0). Lockstep across alert / urgency_scorer / briefing.
+        "[StockTwits Sentiment] NVDA Bullish: 53% Bullish / 3% Bearish (16↑ 1↓ of 30 msgs)",
     ]
     for t in titles:
         assert alert_agent._looks_like_quote_widget(
