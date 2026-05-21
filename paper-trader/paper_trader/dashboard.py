@@ -16120,5 +16120,159 @@ def decision_vapor_skill_api():
         }), 500
 
 
+@app.route("/api/cost-basis-ladder")
+def cost_basis_ladder_api():
+    """Cost-basis ladder — per-open-position FIFO lot reconstruction
+    with per-lot P&L at the current mark. Surfaces the lot-level
+    dispersion that ``positions.avg_cost`` flattens away.
+
+    Verdict matrix (aggregate over open book):
+
+      * ``HARVESTABLE_LOTS`` — ≥1 lot ≥ harvest_pct_floor in profit.
+      * ``UNDERWATER_BOOK`` — every lot underwater.
+      * ``MIXED_BOOK`` — green and red lots present but none clear
+        the harvest floor.
+      * ``NO_DATA`` — no open positions or no reconstructable lots.
+
+    Per-position verdict:
+
+      * ``LADDER_ALL_GREEN`` / ``LADDER_ALL_RED`` — every lot on
+        the same side of the mark.
+      * ``LADDER_WIDE`` — lot P&L spread ≥ wide_spread_pct.
+      * ``LADDER_STACKED`` — multi-lot ladder tightly clustered.
+      * ``LADDER_SINGLE_LOT`` — fresh position, no averaging.
+      * ``NO_LOTS`` — position present but no reconstructable BUYs.
+
+    Query params (clamped):
+      ``wide_spread_pct`` — LADDER_WIDE threshold (pp), 0..100
+        (default 5)
+      ``harvest_pct_floor`` — HARVESTABLE per-lot floor (pp), 0..100
+        (default 3)
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.cost_basis_ladder import (
+            build_cost_basis_ladder,
+            DEFAULT_WIDE_SPREAD_PCT,
+            DEFAULT_HARVEST_PCT_FLOOR,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        wide_spread_pct = _qf(
+            "wide_spread_pct", DEFAULT_WIDE_SPREAD_PCT, 0.0, 100.0,
+        )
+        harvest_pct_floor = _qf(
+            "harvest_pct_floor", DEFAULT_HARVEST_PCT_FLOOR, 0.0, 100.0,
+        )
+
+        store = get_store()
+        positions = store.open_positions() or []
+        # 2000 trades covers ~6 months of mixed live flow; the FIFO walk
+        # only consumes the trades that match a held position's key.
+        trades = store.recent_trades(limit=2000) or []
+
+        return jsonify(build_cost_basis_ladder(
+            positions,
+            trades,
+            wide_spread_pct=wide_spread_pct,
+            harvest_pct_floor=harvest_pct_floor,
+        ))
+    except Exception as e:
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "positions": [],
+            "harvestable": [],
+            "thresholds": {},
+        }), 500
+
+
+@app.route("/api/catalyst-expiry-skill")
+def catalyst_expiry_skill_api():
+    """Catalyst-expiry skill — for each open position, classify the
+    entry-rationale catalyst class and flag positions whose dated
+    catalyst has aged past its expiry window.
+
+    Verdict matrix (aggregate):
+
+      * ``ZOMBIE_HOLDINGS`` — ≥1 position is ZOMBIE.
+      * ``ALL_FRESH`` — every position on a fresh dated catalyst
+        (<fresh_days_ceil).
+      * ``STRUCTURAL_BOOK`` — every position structural / no time
+        marker.
+      * ``MIXED_BOOK`` — fresh + structural present, no zombies.
+      * ``NO_DATA`` — no open positions.
+
+    Per-position verdict:
+
+      * ``ZOMBIE`` — dated catalyst (EARNINGS/MACRO/PRODUCT/REGULATORY)
+        + time marker + days_held ≥ zombie_days_floor.
+      * ``FRESH_CATALYST`` — dated catalyst + days_held <
+        fresh_days_ceil.
+      * ``STRUCTURAL`` — TECHNICAL / CORPORATE thesis, or no time
+        marker.
+      * ``UNCATEGORIZED`` — no catalyst keyword family matched.
+      * ``NO_REASON`` — entry trade has no parseable reason text.
+
+    Query params (clamped):
+      ``zombie_days_floor`` — dated catalysts older than this flag as
+        ZOMBIE (days), 0..365 (default 3)
+      ``fresh_days_ceil`` — dated catalysts younger than this stay
+        FRESH (days), 0..365 (default 2)
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.catalyst_expiry_skill import (
+            build_catalyst_expiry_skill,
+            DEFAULT_ZOMBIE_DAYS_FLOOR,
+            DEFAULT_FRESH_DAYS_CEIL,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        zombie_days_floor = _qf(
+            "zombie_days_floor", DEFAULT_ZOMBIE_DAYS_FLOOR, 0.0, 365.0,
+        )
+        fresh_days_ceil = _qf(
+            "fresh_days_ceil", DEFAULT_FRESH_DAYS_CEIL, 0.0, 365.0,
+        )
+
+        store = get_store()
+        positions = store.open_positions() or []
+        trades = store.recent_trades(limit=2000) or []
+
+        return jsonify(build_catalyst_expiry_skill(
+            positions,
+            trades,
+            zombie_days_floor=zombie_days_floor,
+            fresh_days_ceil=fresh_days_ceil,
+        ))
+    except Exception as e:
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "positions": [],
+            "counts": {},
+            "thresholds": {},
+        }), 500
+
+
 if __name__ == "__main__":
     run()
