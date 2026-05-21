@@ -507,7 +507,10 @@ class TestTradeImpactLineUnit:
             }],
         }
         out = reporter._trade_impact_line(self._BUY, snap, None)
-        assert out == "post: cash $1000.00"
+        # The cash-delta token (`(-$500.00)`) is appended because the BUY
+        # has a positive ``trade.value`` — the sizing context for the next
+        # add. Sub-0.1% lot weight is still suppressed (no name token).
+        assert out == "post: cash $1000.00 (-$500.00)"
         assert "NVDA now" not in out
 
     def test_buy_no_matching_position_in_snapshot(self):
@@ -522,7 +525,8 @@ class TestTradeImpactLineUnit:
             }],
         }
         out = reporter._trade_impact_line(self._BUY, snap, None)
-        assert out == "post: cash $500.00"
+        # No lot match → no name token; cash + delta still emit.
+        assert out == "post: cash $500.00 (-$500.00)"
 
     def test_buy_garbage_cash_defaults_to_zero(self):
         # Defensive: non-numeric cash coerces to 0.0 and still emits
@@ -625,7 +629,10 @@ class TestTradeImpactLineUnit:
         # via send_trade_alert; pin it on the helper directly too).
         snap = {"cash": 1100.0, "total_value": 1100.0, "positions": []}
         out = reporter._trade_impact_line(self._SELL, snap, store=None)
-        assert out == "post: closed · cash $1100.00"
+        # The cash-freed delta (`(+$600.00)`) is appended — the SELL added
+        # $600 of proceeds. "closed" path emits exactly one cash token
+        # (historic double-cash regression is locked in TestTradeAlertImpactLine).
+        assert out == "post: closed · cash $1100.00 (+$600.00)"
         assert out.count("cash $") == 1
 
     def test_sell_partial_close_emits_remaining_weight_then_cash(self):
@@ -665,9 +672,11 @@ class TestTradeImpactLineUnit:
             }],
         }
         out = reporter._trade_impact_line(self._BUY, snap, None)
-        # Specific numerics — not just "field present".
+        # Specific numerics — not just "field present". Cash-delta token
+        # `(-$500.00)` reflects the BUY's deployed dollars.
         assert out == (
-            "post: NVDA now 100.0% of book @ avg $110.00 · cash $500.00"
+            "post: NVDA now 100.0% of book @ avg $110.00 "
+            "· cash $500.00 (-$500.00)"
         )
 
     def test_partial_sell_emits_avg_cost_token_when_avg_present(self):
@@ -727,7 +736,11 @@ class TestTradeImpactLineUnit:
             }],
         }
         out = reporter._trade_impact_line(self._BUY, snap, None)
-        assert out == "post: NVDA now 50.0% of book · cash $500.00"
+        # Cash-delta token (`(-$500.00)`) appended; garbage avg_cost
+        # silently drops the @avg token rather than crashing.
+        assert out == (
+            "post: NVDA now 50.0% of book · cash $500.00 (-$500.00)"
+        )
         assert "@ avg" not in out
 
     def test_buy_zero_avg_cost_suppresses_token(self):
@@ -741,8 +754,165 @@ class TestTradeImpactLineUnit:
             }],
         }
         out = reporter._trade_impact_line(self._BUY, snap, None)
+        # `> 0` gate suppresses the @avg token on zero avg_cost; cash-delta
+        # still emits.
         assert "@ avg" not in out
-        assert out == "post: NVDA now 50.0% of book · cash $500.00"
+        assert out == (
+            "post: NVDA now 50.0% of book · cash $500.00 (-$500.00)"
+        )
+
+
+class TestCashDeltaToken:
+    """Direct unit tests for ``reporter._cash_delta_token`` — the
+    ``cash $X.XX (-$Y.YY)`` (BUY, burned) / ``(+$Y.YY)`` (SELL, freed)
+    formatter appended to the impact line.
+
+    A live trader's second follow-up after a fill is "how much of my cash
+    did this just consume / free?" — absolute cash alone says what's
+    *left*; the signed delta says what just *moved*. Tests pin SPECIFIC
+    numerics (the advisor's "field is present" warning), the action-
+    direction sign convention (BUY=minus, SELL=plus), and the degrade-safe
+    contract (missing/garbage/zero ``trade.value`` → bare cash token,
+    byte-identical to the pre-feature path)."""
+
+    def test_buy_emits_negative_delta(self):
+        trade = {"action": "BUY", "ticker": "NVDA", "value": 446.87}
+        assert reporter._cash_delta_token(565.08, trade) == \
+            "cash $565.08 (-$446.87)"
+
+    def test_sell_emits_positive_delta(self):
+        # Cash freed by a SELL — the trader's "what did I just pull
+        # back to redeploy?" number.
+        trade = {"action": "SELL", "ticker": "TQQQ", "value": 301.36}
+        assert reporter._cash_delta_token(701.50, trade) == \
+            "cash $701.50 (+$301.36)"
+
+    def test_buy_call_emits_negative_delta(self):
+        # Option BUY: trade.value is already qty * price * 100 (the
+        # store.record_trade contract) — caller does NOT re-scale.
+        trade = {"action": "BUY_CALL", "ticker": "NVDA", "value": 500.0}
+        assert reporter._cash_delta_token(500.0, trade) == \
+            "cash $500.00 (-$500.00)"
+
+    def test_sell_put_emits_positive_delta(self):
+        trade = {"action": "SELL_PUT", "ticker": "NVDA", "value": 350.0}
+        assert reporter._cash_delta_token(1100.0, trade) == \
+            "cash $1100.00 (+$350.00)"
+
+    def test_missing_value_emits_bare_cash(self):
+        # A test trade without a ``value`` field — byte-compatible with
+        # the pre-feature output so hand-crafted snapshots stay green.
+        trade = {"action": "BUY", "ticker": "NVDA"}
+        assert reporter._cash_delta_token(500.0, trade) == "cash $500.00"
+
+    def test_zero_value_emits_bare_cash(self):
+        # ``> 0`` gate: a degenerate zero-value trade emits no delta.
+        trade = {"action": "BUY", "ticker": "NVDA", "value": 0.0}
+        assert reporter._cash_delta_token(500.0, trade) == "cash $500.00"
+
+    def test_negative_value_emits_bare_cash(self):
+        # Non-physical (a trade.value is always >= 0); defensive.
+        trade = {"action": "BUY", "ticker": "NVDA", "value": -1.0}
+        assert reporter._cash_delta_token(500.0, trade) == "cash $500.00"
+
+    def test_garbage_value_emits_bare_cash(self):
+        # Non-numeric ``value`` (e.g. a hand-built test trade) silently
+        # drops the delta token rather than raising — the additive
+        # reporter contract.
+        trade = {"action": "BUY", "ticker": "NVDA", "value": "garbage"}
+        assert reporter._cash_delta_token(500.0, trade) == "cash $500.00"
+
+    def test_unknown_action_emits_bare_cash(self):
+        # HOLD / REBALANCE never reach the impact line in practice, but
+        # the helper must NOT invent a delta for a non-BUY/SELL action
+        # (would mislead about cash movement).
+        for action in ("HOLD", "REBALANCE", "", None):
+            trade = {"action": action, "ticker": "X", "value": 100.0}
+            assert reporter._cash_delta_token(1000.0, trade) == \
+                "cash $1000.00", f"action={action!r}"
+
+    def test_negative_cash_still_formats(self):
+        # A negative cash balance is non-physical (no shorts) but pin
+        # so a future refactor's overflow can't accidentally drop the
+        # token: format ALWAYS emits a number, never a crash.
+        trade = {"action": "BUY", "ticker": "X", "value": 50.0}
+        assert reporter._cash_delta_token(-1.5, trade) == \
+            "cash $-1.50 (-$50.00)"
+
+
+class TestTradeImpactLineCashDelta:
+    """Integration-shape tests for the cash-delta token through the full
+    ``_trade_impact_line`` path — verifying the delta lands in the right
+    slot of the composed string and degrades alongside the other tokens."""
+
+    def test_buy_impact_line_includes_negative_delta(self):
+        trade = {"action": "BUY", "ticker": "NVDA", "qty": 2,
+                 "price": 223.43, "value": 446.87, "reason": "",
+                 "timestamp": "2026-05-21T01:36:00+00:00"}
+        snap = {
+            "cash": 565.08, "total_value": 1011.95,
+            "positions": [{
+                "ticker": "NVDA", "type": "stock", "qty": 2,
+                "avg_cost": 223.43, "current_price": 223.43,
+                "market_value": 446.87,
+            }],
+        }
+        out = reporter._trade_impact_line(trade, snap, None)
+        # Composite: name token, avg-cost token, cash + delta — all in
+        # the canonical order.
+        assert out == (
+            "post: NVDA now 44.2% of book @ avg $223.43 "
+            "· cash $565.08 (-$446.87)"
+        )
+
+    def test_sell_partial_impact_line_includes_positive_delta(self):
+        # Partial close: still holding 6 shares, sold 5 at $120 → freed
+        # $600 → cash $480; remaining 600 / 1080 ≈ 55.6%.
+        trade = {"action": "SELL", "ticker": "NVDA", "qty": 5,
+                 "price": 120.0, "value": 600.0, "reason": "",
+                 "timestamp": "2026-05-18T16:00:00+00:00"}
+        snap = {
+            "cash": 480.0, "total_value": 1080.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "stock", "qty": 6,
+                "avg_cost": 100.0, "current_price": 100.0,
+                "market_value": 600.0,
+            }],
+        }
+        out = reporter._trade_impact_line(trade, snap, store=None)
+        # Partial-close path: remaining-weight token (no round-trip
+        # lookup possible without a store), plus cash + freed delta.
+        assert (
+            "post: partial — NVDA still 55.6% of book @ avg $100.00 "
+            "· cash $480.00 (+$600.00)"
+        ) == out
+
+    def test_sell_full_close_no_store_includes_positive_delta(self):
+        # Full close with no store handle → "closed" fallback. Cash +
+        # freed delta still emit (the SELL did move cash).
+        trade = {"action": "SELL", "ticker": "NVDA", "qty": 5,
+                 "price": 220.0, "value": 1100.0, "reason": "",
+                 "timestamp": "2026-05-21T01:13:00+00:00"}
+        snap = {"cash": 1100.0, "total_value": 1100.0, "positions": []}
+        out = reporter._trade_impact_line(trade, snap, store=None)
+        assert out == "post: closed · cash $1100.00 (+$1100.00)"
+
+    def test_zero_value_trade_emits_bare_cash_in_impact_line(self):
+        # An exotic zero-value trade still produces an impact line with
+        # the bare cash token (no delta). Locks the degrade-safe path
+        # through the full _trade_impact_line composition.
+        trade = {"action": "BUY", "ticker": "NVDA", "qty": 0,
+                 "price": 100.0, "value": 0.0, "reason": "",
+                 "timestamp": "2026-05-18T16:00:00+00:00"}
+        snap = {
+            "cash": 1000.0, "total_value": 1000.0,
+            "positions": [],
+        }
+        out = reporter._trade_impact_line(trade, snap, None)
+        # No name token (no lot in snapshot), bare cash (no delta).
+        assert out == "post: cash $1000.00"
+        assert "(-$" not in out
+        assert "(+$" not in out
 
 
 class TestSendDecisionLog:

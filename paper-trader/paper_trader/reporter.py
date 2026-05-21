@@ -225,6 +225,38 @@ def _hold_str_from_days(days: float | None) -> str:
     return f"{d:.1f}d"
 
 
+def _cash_delta_token(cash: float, trade: dict) -> str:
+    """Compact ``cash $X.XX (-$Y.YY)`` (BUY, cash burned) or ``cash $X.XX
+    (+$Y.YY)`` (SELL, cash freed) — the new cash absolute *with* the
+    delta-from-pre-trade.
+
+    A live trader's second follow-up after a fill is "how much of my cash
+    did this just consume / free?". Absolute cash alone tells them what's
+    *left*; the signed delta tells them what just *moved*, which is the
+    sizing input for the next decision ("I just deployed 44% — am I
+    over-extending?" / "I just freed $300 — what's the next setup?").
+    Pure: derived from the in-hand ``trade.value`` (already qty×price for
+    stock, qty×price×100 for options — ``store.record_trade``). No network,
+    no extra reads. Degrade-safe: a missing/non-numeric/non-positive
+    ``trade.value`` silently drops the delta and emits the bare cash token,
+    byte-identical to the pre-feature path so any hand-built test trade
+    without a ``value`` field still produces the same output.
+    """
+    bare = f"cash ${cash:.2f}"
+    try:
+        tv = float(trade.get("value") or 0.0)
+    except (TypeError, ValueError):
+        return bare
+    if not (tv > 0):                        # 0 / negative / NaN → no delta
+        return bare
+    action = (trade.get("action") or "").upper()
+    if action.startswith("BUY"):
+        return f"{bare} (-${tv:.2f})"
+    if action.startswith("SELL"):
+        return f"{bare} (+${tv:.2f})"
+    return bare
+
+
 def _trade_impact_line(trade: dict, snapshot: dict | None,
                        store) -> str:
     """Compact "what did this trade just do to the book" one-liner appended
@@ -246,6 +278,11 @@ def _trade_impact_line(trade: dict, snapshot: dict | None,
     must stay zero-latency — a slow alert would queue behind the next
     cycle's decision). Observational only, never gates (invariants #2/#12 —
     the reporter additive contract).
+
+    The cash token includes a signed delta (``cash $X (-$Y)`` for BUY,
+    ``(+$Y)`` for SELL) derived from ``trade.value`` so the trader sees
+    *what just moved* alongside *what's left* without re-deriving — the
+    sizing input for the next decision.
 
     Failure contract mirrors the rest of ``reporter``: any
     snapshot/store/builder fault degrades to ``""`` ("no impact line on
@@ -340,8 +377,10 @@ def _trade_impact_line(trade: dict, snapshot: dict | None,
                              f"{otype_l} {expiry}")
             parts.append(f"{label} now {leg_pct:.1f}% of book{avg_token}")
         # Cash gives the trader the affordability number their NEXT decision
-        # has to fit inside. Suppress when not meaningful.
-        parts.append(f"cash ${cash:.2f}")
+        # has to fit inside. The signed delta (`(-$Y)`) shows how much THIS
+        # trade burned — the sizing input for the next add. Suppress delta
+        # when ``trade.value`` is missing / non-positive (degrade-safe).
+        parts.append(_cash_delta_token(cash, trade))
         return "post: " + " · ".join(parts) if parts else ""
 
     if action.startswith("SELL"):
@@ -416,7 +455,9 @@ def _trade_impact_line(trade: dict, snapshot: dict | None,
                 # falling through to the cash append produced a duplicated
                 # "cash $X · cash $X" tail (no test exercised this path).
                 parts.append("closed")
-        parts.append(f"cash ${cash:.2f}")
+        # Cash absolute + the freed delta (`(+$Y)`) so the trader sees what
+        # the SELL just generated alongside the running cash balance.
+        parts.append(_cash_delta_token(cash, trade))
         return "post: " + " · ".join(parts)
 
     return ""
