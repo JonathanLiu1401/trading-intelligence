@@ -10100,6 +10100,67 @@ def realized_vs_unrealized_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/concentration-trajectory")
+@swr_cached("concentration-trajectory", 120.0)
+def concentration_trajectory_api():
+    """Daily-snapshot concentration trajectory — the missing slope view.
+
+    Every existing concentration surface (``/api/risk`` ``top1_pct``,
+    ``/api/analytics`` ``concentration_top1_pct``, the risk-mirror prompt
+    block, ``analytics/correlation``) is point-in-time. None answers
+    *over the past N days, has single-name concentration been rising,
+    falling, or steady?* — the first-derivative question that
+    discriminates a slow ramp into a single name (operator drift) from a
+    one-cycle spike (a single fill blew up exposure).
+
+    Walks ``store.recent_trades`` chronologically, snapshots the open
+    book at the close of each of the last ``?days=`` (3..30, default 14)
+    calendar days, marks each position to that day's close via
+    ``_daily_history_cached``, and emits the daily series + a verdict
+    ladder (CONCENTRATION_SPIKE / RAMPING_UP / DECONCENTRATING /
+    CONCENTRATED_STEADY / DIVERSIFIED / BALANCED / INSUFFICIENT_DATA /
+    NO_DATA). Stocks-only by deliberate carve-out (options excluded from
+    the concentration math — same discipline as
+    ``correlation.build_correlation``).
+
+    Read-only / observational; never gates Opus (AGENTS.md
+    invariants #2/#12)."""
+    try:
+        from .analytics.concentration_trajectory import (
+            MAX_SNAPSHOTS,
+            MIN_SNAPSHOTS,
+            build_concentration_trajectory,
+        )
+        days = int(request.args.get("days", 14))
+        days = max(MIN_SNAPSHOTS, min(MAX_SNAPSHOTS, days))
+        store = get_store()
+        trades = list(reversed(store.recent_trades(limit=5000)))  # oldest→newest
+        # Collect the unique stock-tickers traded over the window so the
+        # daily-close fetch is bounded — a typical book touches ≤ 10
+        # tickers over a month, well below `_daily_history_cached`'s TTL
+        # cache.
+        tickers = set()
+        for t in trades:
+            if not isinstance(t, dict):
+                continue
+            if t.get("option_type"):
+                continue
+            tk = (t.get("ticker") or "").strip().upper()
+            if tk:
+                tickers.add(tk)
+        # Fetch a generous trailing window (3mo) — the helper caches.
+        daily_closes = {}
+        for tk in tickers:
+            try:
+                daily_closes[tk] = _daily_history_cached(tk, period="3mo") or []
+            except Exception:
+                daily_closes[tk] = []
+        return jsonify(build_concentration_trajectory(
+            trades, daily_closes, window_days=days))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/decision-forensics")
 def decision_forensics_api():
     """*Why* the live trader produces no decision — failure-mode taxonomy.

@@ -6,6 +6,112 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4 #3) — `/api/concentration-trajectory` (the missing slope view)
+
+**features_added: 1.** New `paper_trader/analytics/concentration_trajectory.py`
++ `/api/concentration-trajectory` route. Every existing concentration
+surface in the repo (`risk_mirror`, `analytics/correlation`,
+`/api/risk.concentration_top1_pct`, `/api/analytics`, `sector_exposure`)
+is **point-in-time**: a book at 66% top-1 NVDA reads identically whether
+it ramped 30%→66% over a week (concentration creep — operator drift) or
+jumped 0%→66% on the latest cycle (a single fill blew it up). The
+operator response is different in each case and the existing surface
+can't tell them apart.
+
+This is the first-derivative view. Walks `store.recent_trades` chronologically,
+snapshots the open book at the close of each of the last `?days=`
+(3..30, default 14) calendar days, marks each held position to that
+day's close via the existing `_daily_history_cached` helper, and emits
+a `series` of `(date, top1_pct, top1_ticker, top3_pct, hhi,
+effective_positions, n_positions, deployed_usd)` plus `current`,
+`delta_top1_pct`, `max/min_top1_pct`, and a verdict ladder.
+
+Verdict ladder (**most-specific first** — chat surfaces fire on the
+sharpest signal, neutral collapses to silence per the
+`realized_vs_unrealized` / `decision_paralysis` precedent):
+
+* `CONCENTRATION_SPIKE` — any adjacent pair in the window jumps from
+  `<SPIKE_FROM_PCT=40` → `>=SPIKE_TO_PCT=60` in one cycle AND current
+  top-1 still `>= SPIKE_TO_PCT`. The fill happened mid-window, the book
+  has parked at the elevated level — the desk still needs to know it
+  *happened*. Reports the date pair + delta.
+* `RAMPING_UP` — top-1 climbed `>= RAMP_DELTA_PCT=15` from first to
+  last snapshot AND latest `>= RAMP_TO_PCT=50`. Slow creep into one
+  name.
+* `DECONCENTRATING` — top-1 fell `>= RAMP_DELTA_PCT=15` AND the first
+  snapshot was `>= DECONC_FROM_PCT=50`. Desk pared a concentrated bet.
+* `CONCENTRATED_STEADY` — top-1 mean `>= STEADY_PCT=50` AND range
+  `<= STEADY_BAND_PCT=10`. Parked.
+* `DIVERSIFIED` — top-1 never crossed `DIVERSIFIED_CEILING=35` over
+  the window.
+* `BALANCED` — residual catch-all.
+* `INSUFFICIENT_DATA` / `NO_DATA` — sample-size honesty
+  (`MIN_SNAPSHOTS=3`, also clamps `?days=` low end).
+
+**Stocks-only carve-out** (same discipline as `correlation` /
+`open_attribution`): an option's non-linear Greeks payoff doesn't fit a
+linear "% of book" metric, and the documented book pathologies are
+name-level on the equity leg. Options walk for state-keeping purposes
+but are excluded from the per-snapshot concentration math.
+
+**Pure builder + test seam.** No DB / no network — the endpoint owns
+the daily-close fetch via `_daily_history_cached` (which itself caches
+TTL=30min). Read-only / observational; never gates Opus, no caps
+(invariants #2/#12). Never raises — garbage rows, unparseable
+timestamps, missing closes for a snapshot date all degrade to "drop
+that ticker for that snapshot" never an exception.
+
+**Live evidence at merge** (2026-05-21 NVDA earnings night, $1011.95
+book, 1 NVDA position currently at 100% top-1): with the trade ladder
+shown in `/api/portfolio` (BUY 2 → SELL 4.5 → BUY 0.5 → BUY 1 across
+~24h), the latest two snapshots both read top-1 NVDA at ~100% — the
+verdict is `CONCENTRATED_STEADY` (top-1 mean ≥ 50, band 0). When the
+trader next adds a second name and dilutes NVDA below 90%, this
+endpoint will surface `DECONCENTRATING` while every other concentration
+surface still reports the point-in-time scalar.
+
+### Tests
+
+`tests/test_concentration_trajectory.py` — 36 exact-value tests:
+
+* Full verdict ladder (each row hit by a synthetic trade ladder
+  engineered to land precisely on its threshold)
+* `CONCENTRATION_SPIKE` outranks `RAMPING_UP` when both conditions are
+  satisfied (the ladder-order discipline)
+* Per-snapshot concentration math (top-1/top-3/HHI/effective-positions)
+  pinned on hand-checked weights
+* Options skipped from concentration math
+* Trade-walk full-sell cleanup (`_stock_positions_after_trade` pops the
+  ticker at zero qty)
+* Daily-close lookup picks the latest-on-or-before row
+* `window_days` clamps to `[MIN_SNAPSHOTS, MAX_SNAPSHOTS]`
+* Never-raises discipline (None daily_closes, None inner rows, zero-qty
+  trades, garbage timestamps, unparseable ts dropped)
+* Series chronological + `current` matches `series[-1]`
+
+`tests/test_concentration_trajectory_endpoint.py` — 3 Flask-client
+tests (per the `project_paper_trader_analytics_verification` note —
+module __main__ smoke hits a different DB; route correctness must be
+exercised through `app.test_client()`):
+
+* `/api/concentration-trajectory?days=10` on a synthetic NVDA-only
+  $1000 book returns `verdict=CONCENTRATED_STEADY`,
+  `current.top1_pct=100.0`, `top1_ticker=NVDA`
+* `?days=1` clamps to `window_days=3` (MIN_SNAPSHOTS)
+* `?days=9999` clamps to `window_days<=30` (MAX_SNAPSHOTS)
+
+39/39 pass; full neighbouring suite (`test_sector_exposure_endpoint`,
+`test_realized_vs_unrealized`, `test_risk_mirror`) — 45/45 still pass.
+
+**Staged paths:** `paper_trader/analytics/concentration_trajectory.py`,
+`paper_trader/dashboard.py` (route only — diff is a single
+`@app.route` block above `/api/decision-forensics`),
+`tests/test_concentration_trajectory.py`,
+`tests/test_concentration_trajectory_endpoint.py`, `AGENTS.md`. No
+`git add -A`.
+
+---
+
 ## 2026-05-21 ML+backtest HYBRID pass #3 (Agent 2) — PriceCache atomic write + consensus_skill
 
 **Phase 1 — bug fix (bugs_fixed: 1).** `PriceCache._load` wrote the
