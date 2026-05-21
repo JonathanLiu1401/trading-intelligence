@@ -1694,9 +1694,95 @@ def _pos_earnings_token(p: dict, events_by_ticker: dict | None) -> str:
     return f"  ER {days:.1f}d"
 
 
+def _pos_alpha_token(p: dict, equity_asc: list[dict] | None,
+                     sp500_now: float | None) -> str:
+    """Compact ``  α +0.3%`` / ``  α −1.1%`` per-position alpha-vs-SPY
+    annotation: the position's % return *minus* SPY's % return over the
+    same hold window.
+
+    Answers the one question per-position weight / age / earnings tokens
+    can't: "is this trade contributing alpha, or just riding the index?"
+    A position +1.2 % in a +1.5 %-since-entry tape is actually a 0.3-pt
+    drag on alpha; per-trade P/L % alone hides that.
+
+    Pure arithmetic over the already-stored ``equity_curve`` (which
+    carries ``sp500_price`` at each tick) + the live ``sp500_now`` price
+    the caller already holds for the report header — **no network**,
+    same Discord-path discipline as ``_pos_pct_weight`` /
+    ``_pos_hold_age_token`` / ``_pos_earnings_token`` (invariants #2/#12
+    — the stale_mark precedent: pure formatting of pre-existing data).
+    Looks up the FIRST equity_curve point at-or-after the position's
+    ``opened_at`` (lexical ISO compare — same pattern ``_window_delta``
+    uses) and reads its ``sp500_price`` as the entry-time SPY baseline.
+
+    Failure contract — degrade to ``""`` (drop the token), never raise:
+      * ``equity_asc`` missing/empty or ``sp500_now`` missing → ``""``;
+      * position has no ``opened_at`` / non-ISO ``opened_at`` → ``""``;
+      * no equity_curve point at-or-after the open → ``""``;
+      * base point has no ``sp500_price`` (early rows before the field
+        was added) → ``""``;
+      * a stale-mark position (no real ``current_price``) → ``""``
+        (the alpha number would lie next to the STALE flag, the
+        ``_pos_pct_weight`` precedent);
+      * avg_cost / current_price not usable positive numbers → ``""``.
+
+    Sub-1bp absolute alpha is shown as ``α 0.0%`` (the trader sees the
+    trade is *exactly* tracking the index, not a missing token); the
+    threshold for emitting the token at all is just "we have the data".
+    """
+    if not equity_asc or not sp500_now:
+        return ""
+    if p.get("stale_mark"):
+        return ""
+    opened_at = p.get("opened_at")
+    if not opened_at:
+        return ""
+    opened_str = str(opened_at)
+    # ISO timestamps compare lexically when normalised; both equity_curve
+    # rows and ``opened_at`` are written via ``store._now`` which is
+    # always UTC ISO-8601 with offset, so a string compare is byte-correct
+    # (the same precedent ``_window_delta`` and ``_realized_pl_window``
+    # already rely on).
+    base = None
+    for pt in equity_asc:
+        ts = pt.get("timestamp") or ""
+        if ts >= opened_str:
+            base = pt
+            break
+    if base is None:
+        return ""
+    try:
+        base_spy = float(base.get("sp500_price") or 0.0)
+    except (TypeError, ValueError):
+        base_spy = 0.0
+    if base_spy <= 0:
+        return ""
+    try:
+        spy_pct = (float(sp500_now) / base_spy - 1.0) * 100.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        return ""
+    try:
+        avg = float(p.get("avg_cost") or 0.0)
+        cur = float(p.get("current_price") or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    if avg <= 0 or cur <= 0:
+        return ""
+    pos_pct = (cur - avg) / avg * 100.0
+    alpha = pos_pct - spy_pct
+    # Round to the display grain before the +/- formatter so a tiny
+    # floating-point residual (e.g. 1.7e-14) never renders as "-0.0%".
+    alpha = round(alpha, 1)
+    if alpha == 0.0:
+        alpha = 0.0  # squash -0.0 → +0.0
+    return f"  α {alpha:+.1f}%"
+
+
 def _portfolio_lines(positions: list[dict],
                      total_value: float | None = None,
-                     events_by_ticker: dict | None = None) -> list[str]:
+                     events_by_ticker: dict | None = None,
+                     equity_asc: list[dict] | None = None,
+                     sp500_now: float | None = None) -> list[str]:
     lines = []
     for p in positions:
         # Additive: only positions carrying an explicit ``stale_mark`` True
@@ -1722,15 +1808,21 @@ def _portfolio_lines(positions: list[dict],
         # forward earnings event the decision prompt already sees, on the
         # operator's Discord surface.
         er = _pos_earnings_token(p, events_by_ticker)
+        # Per-position alpha-vs-SPY since entry — observational, additive,
+        # opt-in (equity_asc / sp500_now default to None → token is "").
+        # Pure arithmetic over already-stored data — no network. Byte-
+        # compatible with every existing test caller that does not pass
+        # the new kwargs (the events_by_ticker precedent).
+        al = _pos_alpha_token(p, equity_asc, sp500_now)
         if p["type"] in ("call", "put"):
             lines.append(
                 f"  {p['ticker']} {p['type'].upper()}{p['strike']} {p['expiry']}  "
-                f"qty {p['qty']}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{age}{er}{stale}"
+                f"qty {p['qty']}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{age}{er}{al}{stale}"
             )
         else:
             lines.append(
                 f"  {p['ticker']:<6} qty {p['qty']:<8} avg ${p['avg_cost']:.2f} "
-                f"now ${(p.get('current_price') or 0):.2f}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{age}{er}{stale}"
+                f"now ${(p.get('current_price') or 0):.2f}  P/L ${(p.get('unrealized_pl') or 0):+.2f}{pw}{age}{er}{al}{stale}"
             )
     return lines
 
@@ -2682,6 +2774,14 @@ def send_hourly_summary() -> bool:
 
     sp_line = f"S&P 500: {sp:.2f}" if sp else "S&P 500: N/A"
     events_by_ticker = _earnings_events_by_ticker()
+    # Equity curve in ascending order — read once per report so the
+    # per-position α token can pick the entry-time SPY baseline without a
+    # network hop. Bounded read so a deep history doesn't bloat the path.
+    try:
+        equity_asc = store.equity_curve(limit=5000)
+    except Exception as e:
+        print(f"[reporter] equity_curve read for alpha skipped: {e}")
+        equity_asc = []
 
     body = (
         f"**HOURLY** ◈ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
@@ -2693,7 +2793,9 @@ def send_hourly_summary() -> bool:
         f"```\n"
         f"**Positions**\n```\n"
         + ("\n".join(_portfolio_lines(positions, pf["total_value"],
-                                       events_by_ticker=events_by_ticker)) or "  (none)")
+                                       events_by_ticker=events_by_ticker,
+                                       equity_asc=equity_asc,
+                                       sp500_now=sp)) or "  (none)")
         + "\n```\n**Recent trades**\n```\n"
         + "\n".join(trade_lines)
         + "\n```"
@@ -2840,6 +2942,13 @@ def send_daily_close() -> bool:
 
     sp_line = f"S&P 500: {sp:.2f}" if sp else "S&P 500: N/A"
     events_by_ticker = _earnings_events_by_ticker()
+    # Per-position α-vs-SPY since entry — same Discord-path discipline as
+    # the hourly: read the equity curve once and pass it down.
+    try:
+        equity_asc = store.equity_curve(limit=5000)
+    except Exception as e:
+        print(f"[reporter] equity_curve read for alpha skipped: {e}")
+        equity_asc = []
 
     body = (
         f"**DAILY CLOSE** ◈ {today}\n"
@@ -2854,7 +2963,9 @@ def send_daily_close() -> bool:
         f"```\n"
         f"**Open positions**\n```\n"
         + ("\n".join(_portfolio_lines(positions, pf["total_value"],
-                                       events_by_ticker=events_by_ticker)) or "  (none)")
+                                       events_by_ticker=events_by_ticker,
+                                       equity_asc=equity_asc,
+                                       sp500_now=sp)) or "  (none)")
         + "\n```"
     )
     lk = _singleton_lock_line()
