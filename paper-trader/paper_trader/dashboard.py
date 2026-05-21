@@ -15520,5 +15520,254 @@ def conviction_language_skill_api():
         }), 500
 
 
+@app.route("/api/regime-leverage-fit-skill")
+def regime_leverage_fit_skill_api():
+    """Regime × leveraged-ETF-exposure fit — is the book's leverage
+    class appropriate to the current SPY-20d regime?
+
+    The recurring backtest finding (paper-trader AGENTS.md): the
+    bot's alpha is largely a leveraged-bull-window artifact. This
+    endpoint surfaces the live state of that risk: classifies SPY
+    20d momentum into bull/sideways/bear, measures current
+    leveraged-ETF book exposure %, measures recent leveraged-ETF
+    BUY flow in a configurable window, and emits a single regime-fit
+    verdict.
+
+    Verdict matrix:
+
+      * ``BLIND_LEVERING`` — bear/sideways regime AND recent
+        leveraged BUY flow ≥ ``high_flow_pct``. Highest priority —
+        the *direction of change* matters more than static exposure.
+      * ``DANGEROUS_HEADWIND`` — bear regime AND lev_pct ≥
+        ``high_lev_floor``. Static high exposure into a bear tape.
+      * ``ALIGNED`` — bull regime AND lev_pct ≥ ``aligned_lev_floor``.
+        Correctly tailwinded.
+      * ``MISSED_TAILWIND`` — bull regime AND lev_pct ≤
+        ``low_lev_ceil``. Under-allocating to the bull.
+      * ``DEFENSIVE`` — bear/sideways AND lev_pct ≤ ``low_lev_ceil``.
+        Correctly de-risked.
+      * ``NEUTRAL`` — mid-band exposure or ambiguous regime + flow.
+      * ``NO_DATA`` — empty everything.
+
+    Query params (clamped):
+      ``flow_window_hours`` — recent buy-flow window, 0.5..168 (default 24)
+      ``high_flow_pct`` — buy-flow ≥ this triggers BLIND_LEVERING,
+        0.0..100 (default 5.0)
+      ``high_lev_floor`` / ``aligned_lev_floor`` / ``low_lev_ceil`` —
+        exposure thresholds (clamped 0..100)
+      ``bull_mom_pct`` / ``bear_mom_pct`` — regime cutoffs
+        (clamped sensibly)
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.regime_leverage_fit_skill import (
+            build_regime_leverage_fit_skill,
+            DEFAULT_BULL_MOM_PCT,
+            DEFAULT_BEAR_MOM_PCT,
+            DEFAULT_HIGH_LEV_FLOOR,
+            DEFAULT_ALIGNED_LEV_FLOOR,
+            DEFAULT_LOW_LEV_CEIL,
+            DEFAULT_FLOW_WINDOW_HOURS,
+            DEFAULT_HIGH_FLOW_PCT,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        flow_window_hours = _qf(
+            "flow_window_hours", DEFAULT_FLOW_WINDOW_HOURS, 0.5, 168.0,
+        )
+        high_flow_pct = _qf(
+            "high_flow_pct", DEFAULT_HIGH_FLOW_PCT, 0.0, 100.0,
+        )
+        high_lev_floor = _qf(
+            "high_lev_floor", DEFAULT_HIGH_LEV_FLOOR, 0.0, 100.0,
+        )
+        aligned_lev_floor = _qf(
+            "aligned_lev_floor", DEFAULT_ALIGNED_LEV_FLOOR, 0.0, 100.0,
+        )
+        low_lev_ceil = _qf(
+            "low_lev_ceil", DEFAULT_LOW_LEV_CEIL, 0.0, 100.0,
+        )
+        bull_mom_pct = _qf(
+            "bull_mom_pct", DEFAULT_BULL_MOM_PCT, -20.0, 20.0,
+        )
+        bear_mom_pct = _qf(
+            "bear_mom_pct", DEFAULT_BEAR_MOM_PCT, -20.0, 20.0,
+        )
+
+        store = get_store()
+        pf = store.get_portfolio() or {}
+        cash_usd = pf.get("cash")
+        total_value_usd = pf.get("total_value")
+        positions_open = [
+            p for p in (pf.get("positions") or [])
+            if isinstance(p, dict) and not p.get("closed_at")
+        ]
+
+        # Trades for recent flow — cap pull at a sensible upper bound
+        # (the flow window itself filters in the builder).
+        trades = store.recent_trades(limit=2000) or []
+
+        # SPY 20d momentum via the same live quant path the strategy
+        # uses. Guarded — fall back to None so the builder degrades
+        # gracefully to NEUTRAL / NO_DATA rather than failing.
+        spy_mom_20d = None
+        try:
+            from .strategy import get_quant_signals_live
+            spy_q = (get_quant_signals_live(["SPY"]) or {}).get("SPY") or {}
+            mv = spy_q.get("mom_20d")
+            if isinstance(mv, (int, float)):
+                spy_mom_20d = float(mv)
+        except Exception:
+            spy_mom_20d = None
+
+        return jsonify(build_regime_leverage_fit_skill(
+            positions_open,
+            cash_usd,
+            total_value_usd,
+            spy_mom_20d,
+            trades,
+            flow_window_hours=flow_window_hours,
+            high_flow_pct=high_flow_pct,
+            high_lev_floor=high_lev_floor,
+            aligned_lev_floor=aligned_lev_floor,
+            low_lev_ceil=low_lev_ceil,
+            bull_mom_pct=bull_mom_pct,
+            bear_mom_pct=bear_mom_pct,
+        ))
+    except Exception as e:
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "regime": "unknown",
+            "spy_mom_20d": None,
+            "portfolio": {},
+            "recent_flow": {},
+            "thresholds": {},
+        }), 500
+
+
+@app.route("/api/peer-momentum-divergence-skill")
+def peer_momentum_divergence_skill_api():
+    """Per-held-name price-momentum vs sector-peer-median divergence.
+
+    The existing sector / momentum surface answers *bucket* questions
+    (sector_velocity_delta — per-sector news velocity;
+    sector_signal_fit — book exposure vs sector news; sector_heatmap
+    — per-bucket price+RSI+news; sector_pulse — per-ticker snapshot).
+    None ask: *is my held name moving with its sector peers, or is it
+    ripping/lagging on its own?* That's a real single-name catalyst
+    risk signal an operator who is long ONE name needs.
+
+    Per-position verdict matrix:
+      * ``IDIOSYNCRATIC_RALLY`` — held mom_5d ≥ peers + delta AND
+        held positive while peers ≤ 0. Single-name rip.
+      * ``IDIOSYNCRATIC_DECLINE`` — held mom_5d ≤ peers - delta AND
+        held negative while peers ≥ 0. Single-name drop.
+      * ``LEADING_PEERS`` / ``LAGGING_PEERS`` — magnitude
+        out/under-performance with directional alignment.
+      * ``TRACKING_PEERS`` — within ``delta_pct`` of peer median.
+      * ``NO_PEERS`` — sector unmapped or peer momentums missing.
+
+    Top-level roll-up: ``BOOK_IDIOSYNCRATIC`` /
+    ``BOOK_DIVERGENT`` / ``BOOK_TRACKING`` / ``INSUFFICIENT_DATA`` /
+    ``NO_DATA``.
+
+    Query params (clamped):
+      ``delta_pct`` — per-position |held - peer_median| 5d-mom
+        threshold, 0.1..20 (default 2.0)
+      ``min_peers`` — peer momentums needed for a stable median,
+        1..10 (default 2)
+      ``min_positions`` — book-level INSUFFICIENT_DATA floor, 1..10
+        (default 1)
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.peer_momentum_divergence_skill import (
+            build_peer_momentum_divergence_skill,
+            PEERS_BY_SECTOR,
+            DEFAULT_DELTA_PCT,
+            DEFAULT_MIN_PEERS,
+            DEFAULT_MIN_POSITIONS,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        delta_pct = _qf("delta_pct", DEFAULT_DELTA_PCT, 0.1, 20.0)
+        min_peers = int(_qf(
+            "min_peers", float(DEFAULT_MIN_PEERS), 1.0, 10.0,
+        ))
+        min_positions = int(_qf(
+            "min_positions", float(DEFAULT_MIN_POSITIONS), 1.0, 10.0,
+        ))
+
+        store = get_store()
+        positions_open = [
+            p for p in (store.open_positions() or [])
+            if isinstance(p, dict)
+            and p.get("type") == "stock"
+            and (p.get("qty") or 0) > 0
+        ]
+
+        # Collect every ticker we need a mom_5d for: each held name
+        # + every peer of its sector. One batched quant call.
+        held_set = set()
+        wanted = set()
+        for p in positions_open:
+            t = p.get("ticker")
+            if isinstance(t, str) and t:
+                held_set.add(t.upper())
+                wanted.add(t.upper())
+        for tk in list(held_set):
+            from .analytics.peer_momentum_divergence_skill import (
+                TICKER_TO_SECTOR,
+            )
+            sec = TICKER_TO_SECTOR.get(tk)
+            if sec is not None:
+                for peer in PEERS_BY_SECTOR.get(sec, []):
+                    wanted.add(peer.upper())
+
+        quant_signals: dict[str, dict] = {}
+        if wanted:
+            try:
+                from .strategy import get_quant_signals_live
+                quant_signals = get_quant_signals_live(sorted(wanted)) or {}
+            except Exception:
+                quant_signals = {}
+
+        return jsonify(build_peer_momentum_divergence_skill(
+            positions_open,
+            quant_signals,
+            delta_pct=delta_pct,
+            min_peers=min_peers,
+            min_positions=min_positions,
+        ))
+    except Exception as e:
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "n_positions": 0,
+            "n_with_peers": 0,
+            "positions": [],
+            "thresholds": {},
+        }), 500
+
+
 if __name__ == "__main__":
     run()
