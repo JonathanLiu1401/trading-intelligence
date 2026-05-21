@@ -106,6 +106,33 @@ def audit(store) -> dict:
     heuristic_fraction = (
         round(heuristic_gap / strong_total, 4) if strong_total else 0.0
     )
+    # Share of the strong pool that comes from synthetic backtest / opus-
+    # annotation rows. CLAUDE.md §5 says synthetic IS legitimate training
+    # signal (the paper-trader injects backtest winners + opus GOOD/BAD
+    # annotations into articles.db precisely so ArticleNet trains on them),
+    # so a high value is NOT by itself a bug — but the analyst-persona
+    # question "how much of the model's signal is real Claude ground-truth
+    # vs replayed-trade outcomes?" was not answerable from this report.
+    # Live evidence (2026-05-20 articles.db snapshot): strong pool 529,565
+    # total = 510,779 synthetic + 18,786 LLM → 96.5% synthetic. The audit
+    # reported ``ok=True`` with the analyst entirely blind to that
+    # composition. Surfaced here purely as observability — the ``ok`` flag
+    # is NOT gated on it (synthetic rows are legitimate per the invariant,
+    # only the existing hygiene + reconcile checks decide ``ok``).
+    synthetic_fraction = (
+        round(strong_synthetic / strong_total, 4) if strong_total else 0.0
+    )
+    # The complement — the share of the strong pool that is explicitly
+    # tagged 'llm' or 'briefing_boost'. This is the "Claude-ground-truth"
+    # tally the analyst persona actually cares about; surfaced as its own
+    # field so a downstream reader (briefing, dashboard, alert) doesn't
+    # have to recompute the sum to ask "is the model still being taught by
+    # Claude?". Same provenance-tagged-fraction discipline as
+    # ``heuristic_fraction_of_strong``.
+    llm_fraction = (
+        round((strong_llm + strong_briefing) / strong_total, 4)
+        if strong_total else 0.0
+    )
 
     return {
         "strong_pool": {
@@ -124,6 +151,12 @@ def audit(store) -> dict:
         # an integer ai_score rather than an explicit score_source tag.
         "heuristic_trust_gap": heuristic_gap,
         "heuristic_fraction_of_strong": heuristic_fraction,
+        # Observability-only composition metrics (see derivation block above).
+        # NOT gated on ``ok`` — synthetic rows are legitimate training signal
+        # per CLAUDE.md §5; this just makes the composition visible to the
+        # analyst persona, parallel to ``heuristic_fraction_of_strong``.
+        "synthetic_fraction_of_strong": synthetic_fraction,
+        "llm_fraction_of_strong": llm_fraction,
         "ml_predictions_total": ml_predictions,
         # Overall verdict: the pool is clean AND the buckets reconcile.
         "ok": hygiene_violations == 0 and reconciles,

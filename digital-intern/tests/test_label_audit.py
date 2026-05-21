@@ -82,10 +82,63 @@ def test_bucket_counts_and_reconciliation(store):
 
     assert r["heuristic_trust_gap"] == 2
     assert r["heuristic_fraction_of_strong"] == round(2 / 9, 4)
+    # Composition observability — 3 synthetic / 9 total, (3 llm + 1 briefing)
+    # / 9 total. Pins the analyst-persona "how much of the model's signal is
+    # Claude ground truth vs replayed-trade outcomes?" derivation.
+    assert r["synthetic_fraction_of_strong"] == round(3 / 9, 4)
+    assert r["llm_fraction_of_strong"] == round(4 / 9, 4)
+    # The three observability fractions partition the strong pool exactly
+    # (every strong-pool row falls into ONE of: llm/briefing_boost,
+    # synthetic, heuristic-null-integer). Sum is 1.0 on any non-empty pool
+    # — within rounding (each fraction is round(_, 4)).
+    partition_sum = (
+        r["llm_fraction_of_strong"]
+        + r["synthetic_fraction_of_strong"]
+        + r["heuristic_fraction_of_strong"]
+    )
+    assert abs(partition_sum - 1.0) < 1e-3
     assert r["column_hygiene_violations"] == 2     # the two ml@8.5
     assert r["ml_predictions_total"] == 3          # ml0, ml1, mlzero
     # Hygiene violation present ⇒ overall verdict must fail.
     assert r["ok"] is False
+
+
+def test_synthetic_dominant_pool_still_ok(store):
+    """Synthetic IS legitimate training signal (CLAUDE.md §5). A 95%-synthetic
+    pool must NOT flip ``ok=False`` — only the existing hygiene + reconcile
+    checks decide ``ok``. The new ``synthetic_fraction_of_strong`` field is
+    pure observability so the analyst can see the composition risk.
+
+    Mirrors the live 2026-05-20 evidence (510,779 synthetic / 18,786 LLM →
+    96.5%) at small scale: 19 synthetic backtest winners + 1 LLM label."""
+    _insert(store, id="real", title="real claude label",
+            ai_score=9.0, score_source="llm")
+    for i in range(19):
+        _insert(store, id=f"bt{i}", title=f"backtest winner {i}",
+                ai_score=5.0, score_source=None,
+                url=f"backtest://run_3/d/BUY/SYM{i}",
+                source="backtest_run_3_winner")
+    r = label_audit.audit(store)
+    sp = r["strong_pool"]
+    assert sp["total"] == 20
+    assert sp["llm"] == 1
+    assert sp["synthetic_backtest_opus"] == 19
+    assert r["synthetic_fraction_of_strong"] == round(19 / 20, 4)
+    assert r["llm_fraction_of_strong"] == round(1 / 20, 4)
+    # The composition is extremely skewed, but the pool is still clean by
+    # construction — only the documented gates decide ``ok``.
+    assert r["ok"] is True
+
+
+def test_empty_store_fractions_are_zero(store):
+    """All three observability fractions are 0.0 on an empty store — no
+    ZeroDivisionError, no NaN. Mirrors ``heuristic_fraction_of_strong``'s
+    zero-guard discipline (the existing test_empty_store_does_not_divide_by_zero
+    already pins that field; this widens the contract to the new fields)."""
+    r = label_audit.audit(store)
+    assert r["synthetic_fraction_of_strong"] == 0.0
+    assert r["llm_fraction_of_strong"] == 0.0
+    assert r["heuristic_fraction_of_strong"] == 0.0
 
 
 def test_ml_rows_never_enter_strong_pool(store):
