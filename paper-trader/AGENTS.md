@@ -6,6 +6,206 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4) — `/api/regime-leverage-fit-skill` + `/api/peer-momentum-divergence-skill`
+
+Two new observational endpoints answer two desk questions none of the
+existing surface answers cleanly.
+
+### `/api/regime-leverage-fit-skill`
+
+**Question**: given the current SPY-20d regime, is the book's
+leveraged-ETF exposure (and recent BUY flow into leveraged names)
+aligned with the tape, or are we levering into a headwind?
+
+This is the desk question motivated by the recurring backtest
+finding (this AGENTS.md, Agent 2 pass): *"the alpha is largely a
+leveraged-bull-window artifact ... NOT a portfolio-management
+edge."* A book whose realised alpha depends on the bull tape getting
+and staying bull has a regime-flip failure mode no existing
+behavioural-mirror endpoint surfaces.
+
+Distinct from the nearest neighbours:
+* `/api/risk` — reports `leveraged_pct` of the live book right now;
+  pure exposure snapshot, no regime context.
+* `/api/sector-heatmap` — has a `memory_leveraged` bucket with
+  price/RSI/news per bucket; no book-level leverage verdict.
+* `analytics.ml.leveraged_skill` — OOS DecisionScorer rank-IC
+  stratified by leveraged-vs-non-leveraged. Measures whether the
+  scorer's *rank skill* generalises across leverage classes; says
+  nothing about the live book's regime fit.
+
+**Builder**: `paper_trader/analytics/regime_leverage_fit_skill.py::build_regime_leverage_fit_skill`.
+Pure — positions + cash + spy_mom_20d + recent_trades in, dict out,
+never raises.
+
+**Verdict matrix** (priority ladder pinned by tests):
+* `BLIND_LEVERING` — regime in (bear, sideways) AND recent BUY flow
+  into leveraged ≥ `high_flow_pct`. **Highest priority** — direction
+  of change matters more than static exposure. Fires before
+  DANGEROUS_HEADWIND even when lev_pct is already high.
+* `DANGEROUS_HEADWIND` — bear regime AND lev_pct ≥ `high_lev_floor`.
+  Static high exposure into a bear tape (decay drag at 3x in
+  flat-to-down compounds against the book).
+* `ALIGNED` — bull regime AND lev_pct ≥ `aligned_lev_floor`.
+  Correctly tailwinded — leverage is doing work for you.
+* `MISSED_TAILWIND` — bull regime AND lev_pct ≤ `low_lev_ceil` AND
+  no recent leveraged buy-flow. Under-allocating to the bull.
+* `DEFENSIVE` — bear/sideways AND lev_pct ≤ `low_lev_ceil` AND no
+  recent leveraged buy-flow. Correctly de-risked.
+* `NEUTRAL` — mid-band, or ambiguous regime+flow.
+* `NO_DATA` — empty everything (no positions, no flow, no
+  spy_mom_20d).
+
+**Regime classifier** mirrors `strategy._ml_live_opinion`'s inline
+rule (spy_mom > 3 → bull, < -3 → bear, else sideways). Boundary
+behaviour pinned: exact threshold is sideways (`> bull_mom_pct`),
+strictly-above is bull.
+
+**Leveraged set** is duplicated inline (precedent:
+`strategy._LEVERAGED_ETFS_LIVE`, `backtest._LEVERAGED_ETFS`,
+`ml.leveraged_skill._LEVERAGED_ETFS` — see also #15 ML advisor gate's
+documented duplicate). Includes the leveraged-INVERSE set
+(SQQQ/SPXS/SOXS/TECS/FNGD) so a flip into them in a bull regime
+trips BLIND_LEVERING just as forcefully. A drift-guard test
+(`TestStrategySetParity`) fails if a future addition to the
+strategy set isn't present here.
+
+**Trade-flow window** defaults to 24h. Accepts both `ts` and
+`timestamp` keys (trades table uses the latter); falls back to
+`value` field for notional when `notional` is absent. The window
+filters out the prior backtest window naturally — every position
+mark-to-current sums over only positions still open AS OF `now`.
+
+**Dashboard route**: `paper_trader/dashboard.py::regime_leverage_fit_skill_api`.
+Reads `store.get_portfolio()` + `store.recent_trades(limit=2000)`,
+fetches `spy_mom_20d` via `strategy.get_quant_signals_live(["SPY"])`
+guarded so any failure degrades the regime to "unknown" (NEUTRAL,
+not error).
+
+**Query params** (clamped): `flow_window_hours` 0.5..168 (default 24),
+`high_flow_pct` 0..100 (default 5.0), `high_lev_floor` 0..100
+(default 30), `aligned_lev_floor` 0..100 (default 20),
+`low_lev_ceil` 0..100 (default 10), `bull_mom_pct` / `bear_mom_pct`
+−20..20 (defaults 3 / −3).
+
+**Live read** (after restart, test-client harness against the live
+store): current portfolio = 1 stock (NVDA, $446) + $565 cash; SPY
+20d mom positive ⇒ regime=bull, lev_pct=0%, no recent leveraged
+flow ⇒ verdict = `MISSED_TAILWIND` ("bull tape but 0% leveraged").
+The endpoint's first-job verdict surface immediately catches the
+"under-allocating to the bull" state — exactly the discretionary
+question the regime-aware reading is for.
+
+### `/api/peer-momentum-divergence-skill`
+
+**Question**: for each held position, is it moving with its sector
+peers or ripping/lagging on its own?
+
+Distinct from the nearest neighbours:
+* `/api/sector-velocity-delta` — per-bucket NEWS velocity (fresh vs
+  prior window). Per-bucket aggregate, not per held name.
+* `/api/sector-signal-fit` — book sector $-weight vs sector NEWS
+  density. Bucket-level alignment, not per held name price-momentum.
+* `/api/sector-heatmap` — per-bucket price+RSI+news count snapshot.
+  Bucket aggregate.
+* `/api/sector-pulse` — per-ticker price+news snapshot, no per-held
+  peer-relative momentum.
+
+A held position that's idiosyncratically rallying (single-name
+catalyst, news-driven, news-reversal-fragile) is operationally
+opposite to one that's lagging while peers rally (sector lifting
+boats but not this one; thesis may be broken). Neither is visible
+from any existing per-bucket or per-ticker snapshot.
+
+**Builder**: `paper_trader/analytics/peer_momentum_divergence_skill.py::build_peer_momentum_divergence_skill`.
+Pure — positions + quant_signals (with `mom_5d`) in, dict out,
+never raises.
+
+**Per-position verdict matrix**:
+* `IDIOSYNCRATIC_RALLY` — held ≥ peer_median + delta AND held
+  positive while peers ≤ 0. Single-name rip.
+* `IDIOSYNCRATIC_DECLINE` — held ≤ peer_median - delta AND held
+  negative while peers ≥ 0. Single-name drop (thesis-broken candidate).
+* `LEADING_PEERS` — magnitude outperformance with directional
+  alignment (both positive or both negative).
+* `LAGGING_PEERS` — magnitude underperformance with directional
+  alignment.
+* `TRACKING_PEERS` — |held - peer_median| < `delta_pct`.
+* `NO_PEERS` — sector unmapped or peer momentums missing.
+
+**Top-level roll-up**:
+* `BOOK_IDIOSYNCRATIC` — any IDIOSYNCRATIC_* in the book.
+* `BOOK_DIVERGENT` — any LAGGING_PEERS / IDIOSYNCRATIC_DECLINE.
+* `BOOK_TRACKING` — all positions TRACKING_PEERS or LEADING_PEERS.
+* `INSUFFICIENT_DATA` — fewer than `min_positions` positions with
+  a peer comparison.
+* `NO_DATA` — no positions.
+
+**Sector→peers map** is duplicated verbatim from
+`analytics.sector_heatmap.HEATMAP_BUCKETS` (the operator-curated
+DRAM/semis-leaning universe). A parity test
+(`TestSectorHeatmapParity::test_sector_buckets_identical`) fails
+loudly on drift.
+
+**Held-ticker excluded from its own peer median** — pinned by
+`test_held_excluded_from_peer_median` so a runaway NVDA mom_5d
+can't poison its own peer median and silently flip the verdict.
+
+**Dashboard route**: `paper_trader/dashboard.py::peer_momentum_divergence_skill_api`.
+Reads `store.open_positions()`, computes the full `held + peers`
+ticker set, makes ONE batched `get_quant_signals_live(...)` call
+(no per-ticker fan-out), composes the builder. Failure path
+returns a structured ERROR envelope (HTTP 500) per the existing
+never-raises endpoint contract.
+
+**Query params** (clamped): `delta_pct` 0.1..20 (default 2.0),
+`min_peers` 1..10 (default 2), `min_positions` 1..10 (default 1).
+
+**Live read** (after restart, test-client harness against the live
+store): current portfolio = 1 NVDA position; sector=design;
+quant_signals fetched live; verdict = `BOOK_TRACKING` (NVDA's
+mom_5d within delta of design-sector peer-median). The endpoint's
+correct first-job behaviour at N=1 was the test design goal — it
+delivers a useful verdict the day the position count grows.
+
+### Tests
+
+```sh
+# 78 new exact-value tests, sub-second
+python3 -m pytest tests/test_regime_leverage_fit_skill.py tests/test_peer_momentum_divergence_skill.py -q
+
+# Joint with nearest-neighbour analytics — confirms no regression
+python3 -m pytest tests/test_regime_leverage_fit_skill.py tests/test_peer_momentum_divergence_skill.py tests/test_cash_conviction_fit.py tests/test_conviction_language_skill.py tests/test_news_age_at_decision_skill.py tests/test_conviction_deployment.py tests/test_round_trips.py -q
+# 219 passed in 1.57s
+```
+
+(Memory: paper-trader's full suite is ~1863 tests and won't finish
+in 9 min — scope to focused-file + nearest-neighbour subset, the
+established discipline. The Flask test-client smoke pattern is
+applied here because module `__main__` smoke hits a different DB
+than the live store.)
+
+**Files**:
+* `paper_trader/analytics/regime_leverage_fit_skill.py` (new)
+* `paper_trader/analytics/peer_momentum_divergence_skill.py` (new)
+* `paper_trader/dashboard.py` (two new routes appended before
+  `if __name__ == "__main__"`)
+* `tests/test_regime_leverage_fit_skill.py` (new, 32 tests)
+* `tests/test_peer_momentum_divergence_skill.py` (new, 46 tests)
+
+**Invariants honoured**: AGENTS.md #2 (live-only filter on
+`articles.db` — neither endpoint reads it), #12 (observational
+only — never gates Opus, no caps). Both endpoints follow the
+"never raises" contract: missing data degrades to a structured
+`NO_DATA` / `INSUFFICIENT_DATA` envelope; internal exception
+surfaces as HTTP 500 with a stable `ERROR` envelope so a
+downstream cross-fetch never sees a raw stack.
+
+**Counters**: features_added=2 (`regime_leverage_fit_skill` +
+`peer_momentum_divergence_skill`), tests_added=78, regression_count=0.
+
+---
+
 ## 2026-05-21 ML+backtest HYBRID pass (Agent 2)
 
 **Phase 1 — bug fix.** `paper_trader/backtest.py::_ml_decide` was
