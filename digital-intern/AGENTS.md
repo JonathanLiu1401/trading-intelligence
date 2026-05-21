@@ -6668,3 +6668,149 @@ calibration.py`) landed on master with my content intact (`git show
 --stat` confirmed). AGENTS.md committed alongside the related code
 in this same documentation step (this section).
 
+
+
+---
+
+## 2026-05-20 hybrid pass — training-pool composition surfaced in briefing
+
+**Phase 1 (bug fix):** `ml/label_audit.py` reported `ok=True` while
+the strong-label training pool was 96.5% synthetic backtest/opus rows
+vs 3.5% Claude-tagged labels — the analyst persona "how much of the
+model's signal is real Claude ground truth?" was not answerable from
+the audit's output. Synthetic rows ARE legitimate training signal
+(CLAUDE.md §5), so `ok` is unchanged; what was missing was the
+composition number. Added two derived fields:
+
+  * `synthetic_fraction_of_strong` — share of strong pool from
+    backtest/opus
+  * `llm_fraction_of_strong` — share explicitly tagged `llm` or
+    `briefing_boost`
+
+Both are pure observability (parallel to the existing
+`heuristic_fraction_of_strong`); `ok` remains gated only on the
+existing hygiene + reconcile checks. The three fractions partition
+the strong pool exactly. Pinned by new tests
+(`test_synthetic_dominant_pool_still_ok`,
+`test_empty_store_fractions_are_zero`, plus a partition-sum invariant
+on the existing seeded-mixed test). Commit `b7d8662`.
+
+**Phase 2 (feature):** Added `daemon._format_training_pool_composition`
+— a parallel signal to the existing `_format_label_calibration` line,
+but for the TRAINING corpus rather than the short-horizon urgent
+stream. Silent on healthy windows (Claude-tagged labels >= 15%), emits
+on two ladder verdicts:
+
+  * `llm_fraction < 0.05`  → "🧪 Training pool: only N% Claude-tagged
+    labels — model learns mostly from backtest replay" (Sonnet dark /
+    quota-floored to near-zero)
+  * `synthetic_fraction >= 0.85` → "🧪 Training pool: N% Claude-tagged
+    labels — synthetic-dominant"
+
+Uses `label_audit._RoStore` — a fresh `mode=ro` connection, NEVER the
+daemon's shared `self.conn` (documented cursor-collision hazard, same
+discipline as `analysis.claude_analyst._collect_macro_calendar_events`).
+Discord-only: appended to the briefing message, NEVER folded into the
+saved `briefing` text (so the trainer's title-prefix label scan cannot
+reach it — same discipline as `_build_health_line` /
+`_format_portfolio_coverage` / `_format_label_calibration`).
+Best-effort: any failure → `""` so a metric outage cannot block a 5h
+briefing. All four load-bearing invariants intact by construction.
+Live run on current DB produces:
+`🧪 Training pool: only 4% Claude-tagged labels (18817 LLM vs 510779
+synthetic) — model learns mostly from backtest replay` — exactly the
+analyst-actionable signal that was previously silent. Pinned by 14
+new tests in `tests/test_briefing_training_pool.py` (verdict ladder,
+silent thresholds, best-effort failure paths, max_chars truncation).
+Commit `9d857d8`.
+
+**Phase 3 (live findings — news-analyst validation):**
+
+1. **(positive) Briefing cadence healthy.** id37 (2026-05-20 21:22Z) is
+   the NVDA earnings-night digest; gaps id32→37 are 5.6/5.8/5.2/5.3/
+   6.3h, all within the 5h target. NVDA Q1 print read end-to-end is
+   high-quality (the same pattern as the prior session note: dense,
+   exact MACRO/PORTFOLIO/SEMIS/TOP SIGNALS/RISK).
+
+2. **(positive) Backtest isolation invariant holding.** `SELECT
+   COUNT(*) FROM articles WHERE urgency>=1 AND NOT (_LIVE_ONLY_CLAUSE)`
+   returns 0 rows — no synthetic row has ever reached the live alert
+   path. CLAUDE.md §5 holds.
+
+3. **(NEW chronic, validates Phase 2) Training pool 96.5% synthetic /
+   3.5% Claude-tagged.** Live evidence motivating the Phase 2 feature.
+   The line will surface on next daemon restart and remain visible
+   until Sonnet quota / hand-labeling raises the Claude share above
+   15%. Underlying cause is documented (Sonnet quota chronically
+   throttling urgency_scorer); the analyst-visibility gap was the
+   actual bug.
+
+4. **(chronic operational, NOT a fresh bug) Sonnet alert path losing
+   ~half batches to "No response from Claude".** 9 occurrences of
+   `[alert] No response from Claude — skipping` in 90 min (04:23-05:36Z).
+   Each is one batch (~5 urgent rows) silently not pushed. The
+   alert-recency / dedup / paraphrase systems mean many of these are
+   actually noise that would be re-filtered, but during high-volume
+   windows the analyst is provably missing some BREAKING pushes. Same
+   class as the documented `pt-no-decision-host-saturation` failure
+   mode (mass NO_DECISION = concurrent-Opus host starvation) — alert_
+   agent is hitting the same concurrent-Claude-quota wall.
+
+5. **(chronic operational) USB DB writer-side lock contention.**
+   8 `insert_batch: lock retry exhausted after 5 attempts — raising`
+   ERRORs at 04:22:04-20Z plus 3 more at 05:00:10-16Z. Each loses one
+   batch worth of articles (re-collected next cycle). Documented per
+   memory `di-insert-batch-lock-contention` — standing chronic, not
+   a fresh bug.
+
+6. **(chronic, alert calibration line firing) Urgent-row LLM-vetted
+   fraction 28% last 24h.** 351 ML-only vs 138 LLM-tagged of
+   urgency≥1. The existing `_format_label_calibration` line will
+   continue to emit `mostly_unverified` on every briefing (verdict
+   stable since at least 2026-05-19). The Phase 2 line is the
+   *complement*: it tells the analyst the TRAINING data is similarly
+   Claude-light, completing the picture.
+
+7. **(quality observation) Alert source diversity healthy.** Last
+   12h urgency=2 by source: 46 GN: Nvidia, 31 GN: earnings, 31 GN:
+   dividend buyback, 19 stocktwits, 19 YahooFinance/NVDA, 15
+   scraped/finance.yahoo.com, 12 YF/most_actives, 12 Finnhub/Yahoo —
+   diverse mix, correctly NVDA-concentrated for the earnings-night
+   window. No single low-cred source is dominating.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:**
+- `python3 -c "import sys; sys.path.insert(0,'.'); from storage import
+  article_store; from ml import features, model; print('imports OK')"`
+  → `imports OK`.
+- Focused suite (every module touched plus the new test files): 88
+  passed in 18.58s (`test_label_audit` 7 + `test_briefing_training_
+  pool` 14 + `test_briefing_label_calibration` 12 + `test_article_
+  store` 17 + `test_trainer` 7 + `test_features` 11 + `test_model` 8 +
+  `test_urgency_scorer` 12). Full `python3 -m pytest tests/` deferred
+  per the standing concurrent-agent I/O saturation rule (sibling
+  agents running concurrently; the focused suite covers every module
+  touched by this change).
+
+**Counters:** `bugs_fixed=1` (the label_audit observability gap — the
+audit module's stated purpose was answered for the heuristic gap but
+silent on the synthetic-vs-Claude composition, which the live 96.5%
+finding makes obviously analyst-relevant), `features_added=1` (the
+training-pool composition line in the 5h briefing — code on master in
+`9d857d8`), `user_findings=7` (briefing cadence healthy, invariant
+intact, training-pool composition surfaced and validated live, Sonnet
+alert quota losing ~half batches, USB lock contention chronic, 28%
+LLM-vetted urgent calibration line chronically firing, alert source
+diversity healthy).
+
+**Staging discipline.** Sibling claude agents visible in `ps -ef`
+(paper-trader file changes in the same `git status` output that I
+correctly did NOT stage); the auto-commit daemon is running. Both
+commits used explicit pathspec (`git add ml/label_audit.py tests/test_
+label_audit.py` for Phase 1; `git add daemon.py tests/test_briefing_
+training_pool.py` for Phase 2) — `git diff --staged` was checked
+before each commit to confirm only my intentional changes were
+included. No `git add -A`, no config/data/logs files staged.
+AGENTS.md committed alongside the related code in this same
+documentation step.
