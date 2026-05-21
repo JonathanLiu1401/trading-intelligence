@@ -5,6 +5,86 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4) — `/api/briefing-coverage-audit`
+
+Retrospective audit on the published 5h Opus briefing: given the latest
+`briefings` row + every `urgency >= 1` article that fired between the
+prior briefing's ts and the latest briefing's ts, classify each book
+ticker (the canonical 12-name `_BOOK_TICKERS` universe) with urgent flow
+as COVERED (mentioned anywhere in `briefing.text`) or MISSED (absent
+despite urgent stories).
+
+This closes the loop on the *other* side of the briefing-quality
+analytics. The prospective sibling helpers (`_coverage_gap_lines` for
+curated dark-intel channels; `_book_silence_lines` for held names with
+zero stories) tell Opus what to mention *before* he writes. Nothing
+verifies what got into the *published* text. An operator who sees
+3 NVDA alerts fire overnight wants to know the morning briefing
+actually surfaced NVDA — not a "macro recap drafted around the
+alerts" THIN case.
+
+Pure builder (`analytics.briefing_coverage_audit.build_briefing_coverage_audit`,
+mirrors the `event_threads` / `portfolio_signals` / `news_arrival_rhythm`
+discipline — pre-fetched briefing row + pre-fetched article rows in, dict
+out, never raises). Route layer (`dashboard/web_server.py::api_briefing_coverage_audit`)
+is the SQL adapter only — pulls the latest two briefings (window =
+prior_ts → latest_ts, 5h fallback when only one briefing exists), pulls
+urgent articles in the window via `_ro_query` (`mode=ro` short-lived
+conn), with `_LIVE_ONLY_CLAUSE` applied so backtest rows can't poison
+the audit (invariant #5 preserved).
+
+Query params (clamped):
+- `card_cap` — per-side row cap on covered/missed lists, 1..50 (default
+  12). The aggregate `n_covered` / `n_missed` always reflect the full
+  set; the cap truncates display rows only.
+
+Note on SQL projection: the articles table has no `summary` column (wire
+body lives in `full_text` as zlib BLOB). The route selects `title` only
+— title alone is the high-signal field for ticker mentions, and
+decompressing thousands of bodies per request would dominate the budget.
+The builder still accepts `summary` so callers with cheaper sources of
+body text (the in-process briefing path, smoke tests) can pass it.
+
+Response (envelope identical across NO_BRIEFING / NO_URGENT / COMPLETE /
+PARTIAL / THIN so the UI binding never sees a missing field):
+
+- `state` — `NO_BRIEFING` (no published briefing yet) / `NO_URGENT` (no
+  book-ticker flow in the window) / `COMPLETE` (≥80%) / `PARTIAL`
+  (50%–80%) / `THIN` (<50%)
+- `headline` — coverage ratio + state + (for non-COMPLETE) top miss
+- `briefing_ts` / `briefing_age_hours` — when Opus posted; how stale now
+- `window_start` / `window_end` / `window_hours` — the audit window the
+  route resolved (prior briefing → latest briefing, or 5h fallback)
+- `n_urgent_articles` — every `urgency >= 1` article in the window
+  (diagnostic; rows that touch no book ticker still count here)
+- `n_unique_tickers` — book tickers with at least one urgent story
+- `n_covered` / `n_missed` / `coverage_ratio` — the core verdict
+- `covered` / `missed` — `[{ticker, n_articles, max_urgency,
+  sample_title}]`, highest-urgency × most-articles first, with the
+  canonical `_BOOK_TICKERS` order as tie-break (stable cycle-to-cycle)
+- `card_cap` — display cap echoed back
+
+```sh
+curl -s 'http://localhost:8080/api/briefing-coverage-audit' | python3 -m json.tool
+```
+
+Pinned by `tests/test_briefing_coverage_audit.py` (26 cases): NO_BRIEFING
+on None / non-dict / empty-text / missing-ts; NO_URGENT on no
+book-ticker flow + briefing_age passthrough; COMPLETE at 100% + at the
+80% floor boundary; PARTIAL at 50% (floor inclusive) and 60%; THIN below
+50% and at 0%; envelope key stability across all five states; ticker
+extraction edges (word-boundary keeps MU out of "Museum",
+longest-first alternation prefers MUU over MU, non-string text safely
+empty, summary contributes when present, garbage urgency tolerated);
+ranking determinism (max_urgency → n_articles → canonical rank); card_cap
+truncation of display rows leaves aggregate counts intact; window
+metadata passthrough; **drift-guard parity with
+`analysis.claude_analyst._BOOK_TICKERS`** (set + order identical — the
+audit duplicates the literal rather than importing the analysis layer's
+heavy graph; the two can't silently diverge).
+
+---
+
 ## 2026-05-21 feature-dev pass (Agent 4) — `/api/news-arrival-rhythm`
 
 Per-source hour-of-day urgent-article distribution. The operator
