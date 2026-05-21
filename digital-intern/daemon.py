@@ -82,6 +82,7 @@ from collectors.g10_sovereign_yields import collect_g10_yields
 from collectors.cftc_cot_collector import collect_cftc_cot
 from collectors.vix_term_structure import collect as collect_vix_ts
 from collectors.dxy_collector import collect as collect_dxy
+from collectors.commodity_futures_collector import collect as collect_commodity_futures
 from collectors.openinsider_cluster import collect as collect_insider_cluster
 from collectors.sector_etf_momentum import collect as collect_sector_etf
 from collectors.cisa_kev_collector import collect_cisa_kev
@@ -171,6 +172,7 @@ VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
 DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
 INSIDER_CLUSTER_INTERVAL = 600    # EDGAR Form 4 cluster-buy scan every 10min
 SECTOR_ETF_INTERVAL     = 600     # Sector ETF momentum snapshot every 10min
+COMMODITY_FUTURES_INTERVAL = 600  # Commodity futures price monitor every 10min
 BENZINGA_INTERVAL       = 300     # Benzinga analyst-ratings RSS sweep every 5min
 FED_PRESS_INTERVAL      = 1800    # Federal Reserve press / speech / testimony RSS — every 30min
 ECB_PRESS_INTERVAL      = 1800    # ECB press releases RSS — every 30min
@@ -1327,6 +1329,29 @@ def dxy_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(DXY_INTERVAL)
+
+
+# ── Worker: Commodity futures price monitor — every 10min ───────────────────
+def commodity_futures_worker(store: ArticleStore):
+    log.info("[commodity_futures_worker] started")
+    bo = Backoff("commodity_futures", base=30.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_commodity_futures()
+            n = len(articles)
+            try:
+                source_health.record_result("commodity_futures", n)
+            except Exception as he:
+                log.warning(f"[commodity_futures_worker] source_health error: {he}")
+            _worker_last_ok["commodity_futures"] = time.time()
+            if n:
+                log.info(f"[commodity_futures] emitted {n} article(s)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[commodity_futures_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(COMMODITY_FUTURES_INTERVAL)
 
 
 # ── Worker: EDGAR Form 4 insider cluster-buy detection — every 10min ────────
@@ -3242,6 +3267,7 @@ def main():
         ("cftc_cot",    cftc_cot_worker),
         ("vix_ts",      vix_ts_worker),
         ("dxy",         dxy_worker),
+        ("commodity_futures", commodity_futures_worker),
         ("sector_etf",  sector_etf_worker),
         ("wikipedia",   wikipedia_worker),
         ("macro_calendar", macro_calendar_worker),
