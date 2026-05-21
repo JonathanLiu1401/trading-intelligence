@@ -286,3 +286,94 @@ class TestPulse:
         out = hg.pulse(db_path="/nonexistent/pt.db")
         assert out["state"] in ("CLEAR", "STARVED", "SATURATED")
         assert out["starvation_ok"] is False  # nonexistent DB → safe default
+
+
+# ── CLI text — must surface the BROADER starvation rate ──────────────────────
+# `recent_empty_rate` counts the OLD "claude returned no response" prefix only;
+# once the pre-flight host_saturated guard is live, storms produce mostly
+# "skipped claude call" rows that bucket silently misses. The CLI must show
+# the broader starvation figure (which counts BOTH prefixes) so the operator
+# isn't given a misleadingly small empty-only percentage — the very blind spot
+# `recent_starvation_rate` was added to address.
+
+class TestMainCLI:
+    def _seed_db(self, tmp_path, rows):
+        db = tmp_path / "pt.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE decisions (id INTEGER PRIMARY KEY, "
+            "action_taken TEXT, reasoning TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO decisions (action_taken, reasoning) VALUES (?, ?)",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_cli_human_text_includes_starvation_rate(
+            self, tmp_path, capsys, monkeypatch):
+        # 2 empty + 2 skipped + 1 parse_failed (not starved) + 1 filled
+        rows = [
+            ("NO_DECISION", "claude returned no response (timeout/empty)"),
+            ("NO_DECISION", "claude returned no response (nonzero_rc)"),
+            ("NO_DECISION", "skipped claude call — host saturated: 5 ..."),
+            ("NO_DECISION", "skipped claude call — host saturated: 6 ..."),
+            ("NO_DECISION", "parse_failed: {garbage"),
+            ("BUY NVDA → FILLED", "ok"),
+        ]
+        db = self._seed_db(tmp_path, rows)
+        monkeypatch.setattr(hg, "_DEFAULT_DB", db)
+        # Inert /proc probe so the CLI's verdict text is deterministic.
+        monkeypatch.setattr(hg, "probe", lambda: {
+            "opus_count": 1, "mem_available_mb": 8000.0,
+            "swap_used_pct": 5.0, "load1": 1.0, "load5": 1.0,
+            "load15": 1.0, "cpus": 16, "load_per_cpu": 0.1,
+        })
+        rc = hg.main([])
+        out = capsys.readouterr().out
+        # 4 starved out of 6 = 67%. Both legs (2 empty + 2 skipped) shown.
+        assert "4/6 recent decisions never reached Opus (67%)" in out
+        assert "2 empty/timeout + 2 skipped (host guard)" in out
+        assert rc == 0  # not saturated by the inert probe
+
+    def test_cli_json_payload_includes_starvation_rate(
+            self, tmp_path, capsys, monkeypatch):
+        rows = [
+            ("NO_DECISION", "claude returned no response (timeout/empty)"),
+            ("NO_DECISION", "skipped claude call — host saturated: 5 ..."),
+        ]
+        db = self._seed_db(tmp_path, rows)
+        monkeypatch.setattr(hg, "_DEFAULT_DB", db)
+        monkeypatch.setattr(hg, "probe", lambda: {
+            "opus_count": 1, "mem_available_mb": 8000.0,
+            "swap_used_pct": 5.0, "load1": 1.0, "load5": 1.0,
+            "load15": 1.0, "cpus": 16, "load_per_cpu": 0.1,
+        })
+        import json
+        hg.main(["--json"])
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        # Empty-rate bucket is the original snapshot key; starvation-rate
+        # is the additive new key — both must be present so a JSON consumer
+        # sees the broader figure too.
+        assert "recent_empty_rate" in payload
+        assert "recent_starvation_rate" in payload
+        assert payload["recent_starvation_rate"]["starved"] == 2
+        assert payload["recent_empty_rate"]["empty"] == 1
+
+
+# ── _NOT_TICKERS — no duplicate tokens ───────────────────────────────────────
+# The set deduplicates at runtime but duplicate literals in the source code
+# are a maintenance smell: a future editor adding a new token may not notice
+# that a "NEW" was already present elsewhere. Test pins the invariant.
+
+def test_not_tickers_has_no_duplicate_source_tokens():
+    import re
+    text = Path(_ROOT, "paper_trader", "signals.py").read_text()
+    m = re.search(r"_NOT_TICKERS = \{(.*?)^\}", text, re.M | re.S)
+    assert m is not None, "could not locate _NOT_TICKERS literal"
+    tokens = re.findall(r'"([A-Z][A-Z0-9_]*)"', m.group(1))
+    duplicates = sorted(t for t in set(tokens) if tokens.count(t) > 1)
+    assert duplicates == [], f"_NOT_TICKERS has duplicate tokens: {duplicates}"
