@@ -321,6 +321,180 @@ def ticker_burst_counts(
     return counts
 
 
+def pushed_ticker_breakdown(
+    recent: list[dict],
+    tickers: list[str] | set[str] | tuple[str, ...],
+) -> dict:
+    """Pure: per-held-ticker breakdown of REAL Discord BREAKING pushes.
+
+    The analyst persona is "react to events affecting MY positions". Today
+    the system already exposes:
+
+      * ``ticker_burst_counts`` — a flat ``{ticker: int}`` count of recent
+        pushes mentioning each ticker. Drives the ``burst:`` alert annotation
+        but exposes neither newest-push timing nor the COVERAGE GAP (held
+        names with ZERO pushes).
+      * ``storage.article_store.urgency_label_split_by_ticker`` — counts
+        urgency>=1 rows in articles.db (queued OR alerted). Conflates
+        gate-suppressed rows with rows that actually became Discord pushes,
+        so a ticker with 50 ML-only urgent rows that the recap gate
+        suppressed reads identically to one with 50 real pushes the analyst
+        actually received.
+
+    This primitive is the richer alert-recency-sourced sibling: it answers
+    "of the REAL pushes the analyst has been sent, which of my held names
+    are getting pushed and which are silent right now?" The alert_recency.db
+    is the canonical record of REAL Discord pushes (only ``record_alerted``
+    in ``send_urgent_alert``'s success path writes to it — gate suppressions
+    don't), so a ticker with zero entries here is a real coverage gap, not
+    a counting artefact.
+
+    Returns:
+
+      .. code-block:: python
+
+        {
+            "total_pushes": int,        # length of `recent`
+            "by_ticker": [               # rows for tickers with >= 1 push,
+                {                        #   sorted most-pushed-first
+                    "ticker": str,       # preserved verbatim (input case)
+                    "pushes": int,
+                    "newest_age_h": float | None,
+                    "newest_title": str,
+                },
+                ...
+            ],
+            "silent_tickers": [str, ...],  # held names with zero pushes —
+                                            #   coverage gaps, input order
+        }
+
+    Match surface and behaviour:
+
+      * Title-only match, case-insensitive whole-word (matches
+        ``ticker_burst_counts``'s convention and ``ml.features._LIVE_RE``).
+      * Tickers shorter than 2 chars are skipped — same convention as
+        ``storage.article_store.urgency_label_split_by_ticker``. Falsy /
+        non-string entries are dropped.
+      * Each alert's set of distinct ticker matches is collapsed to
+        ``set(per_alert_matches).upper()`` BEFORE counting, so a single
+        push mentioning NVDA twice counts as one push (the noise being
+        measured is distinct PUSHES, not text occurrences). Mirrors
+        ``ticker_burst_counts``'s same-decision discipline.
+      * Pure — no DB / IO. The caller controls the recency window via
+        ``recent_alerts(ttl_hours=...)``; this works on whatever ``recent``
+        the caller hands in.
+      * Best-effort on per-row parsing: a recent-alerts row missing
+        ``title`` / ``age_hours`` is skipped (NOT treated as a match), same
+        defensive-row-access discipline as ``ticker_burst_counts``.
+      * ``by_ticker`` is sorted most-pushed-first; alphabetical tiebreak so
+        the ordering is stable cycle-to-cycle (mirrors
+        ``urgency_label_split_by_source``).
+      * ``silent_tickers`` is returned in the input ordering (preserved
+        ticker order — useful when the caller already sorted the held book
+        by importance).
+
+    Backtest isolation & invariants: alert_recency.db NEVER carries
+    backtest signatures (only the alert formatter's success path writes
+    here, and ``send_urgent_alert`` already filters synthetic rows via
+    ``_is_synthetic`` and ``_LIVE_ONLY_CLAUSE`` upstream). No DB write,
+    no ai_score/ml_score/score_source/urgency mutation — all four
+    load-bearing invariants intact by construction.
+    """
+    if not tickers:
+        return {"total_pushes": len(recent or []), "by_ticker": [],
+                "silent_tickers": []}
+
+    # Preserve input ordering + case for the held-book; de-dup by uppercase.
+    clean_pairs: list[tuple[str, str]] = []  # (verbatim, upper)
+    seen_upper: set[str] = set()
+    for raw in tickers:
+        if not raw or not isinstance(raw, str):
+            continue
+        t = raw.strip()
+        if len(t) < 2:
+            continue
+        u = t.upper()
+        if u in seen_upper:
+            continue
+        seen_upper.add(u)
+        clean_pairs.append((t, u))
+
+    if not clean_pairs:
+        return {"total_pushes": len(recent or []), "by_ticker": [],
+                "silent_tickers": []}
+
+    if not recent:
+        return {
+            "total_pushes": 0,
+            "by_ticker": [],
+            # Every requested ticker is "silent" when there are no pushes,
+            # preserved in input order.
+            "silent_tickers": [t for t, _ in clean_pairs],
+        }
+
+    # Single alternation across all uppercase tickers — one regex walk per
+    # title regardless of held-book size. Same compile-once discipline as
+    # ticker_burst_counts.
+    upper_list = sorted({u for _, u in clean_pairs})
+    pattern = _re.compile(
+        r"\b(?:" + "|".join(_re.escape(u) for u in upper_list) + r")\b",
+        _re.IGNORECASE,
+    )
+
+    # Aggregate per ticker. Track newest-push age and title so the caller
+    # can render "NVDA: 28 pushes, newest 0.4h ago" without a second pass.
+    push_count: dict[str, int] = {u: 0 for u in upper_list}
+    newest_age: dict[str, float | None] = {u: None for u in upper_list}
+    newest_title: dict[str, str] = {u: "" for u in upper_list}
+    for r in recent:
+        if not isinstance(r, dict):
+            continue
+        title = r.get("title") or ""
+        if not title:
+            continue
+        try:
+            age_h = float(r.get("age_hours") or 0.0)
+        except (TypeError, ValueError):
+            age_h = 0.0
+        # Per-alert distinct hits — same dedup discipline as ticker_burst_counts.
+        hits = {m.upper() for m in pattern.findall(title)}
+        for h in hits:
+            push_count[h] += 1
+            cur = newest_age[h]
+            if cur is None or age_h < cur:
+                newest_age[h] = age_h
+                newest_title[h] = title
+
+    # Build the output rows. Tickers with zero pushes go to silent_tickers
+    # in INPUT order (preserve held-book importance ordering); rows with
+    # >= 1 push go to by_ticker sorted most-pushed-first with alphabetical
+    # tiebreak (mirrors urgency_label_split_by_source).
+    by_ticker: list[dict] = []
+    silent: list[str] = []
+    upper_to_verbatim = {u: t for t, u in clean_pairs}
+    # Iterate input order for silent_tickers; sort for by_ticker.
+    for t, u in clean_pairs:
+        if push_count[u] == 0:
+            silent.append(t)
+    for u in upper_list:
+        if push_count[u] == 0:
+            continue
+        by_ticker.append({
+            "ticker": upper_to_verbatim[u],
+            "pushes": push_count[u],
+            "newest_age_h": (round(newest_age[u], 2)
+                             if newest_age[u] is not None else None),
+            "newest_title": newest_title[u],
+        })
+    by_ticker.sort(key=lambda r: (-r["pushes"], r["ticker"]))
+
+    return {
+        "total_pushes": len(recent),
+        "by_ticker": by_ticker,
+        "silent_tickers": silent,
+    }
+
+
 def partition_already_alerted(
     articles: list[dict], recent_sigs: set[str]
 ) -> tuple[list[dict], list[dict]]:
