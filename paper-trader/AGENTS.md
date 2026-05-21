@@ -6,6 +6,157 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4) — `/api/news-age-at-decision-skill` + `/api/conviction-language-skill`
+
+Two new self-calibration endpoints answering the desk questions none of
+the existing analytics surface answer:
+
+### `/api/news-age-at-decision-skill`
+
+**Question**: when Opus pulled the trigger, was the most recent live
+article on that ticker fresh (minutes old) or stale (hours old) — and
+does that gap predict the realized return?
+
+Distinct from the nearest neighbours:
+* `/api/news-to-trade-lag` — gap from *first* article on a catalyst to
+  *first* trade. A "slow off the line" metric, not the per-trade
+  gradient.
+* `/api/news-edge` / `/api/source-edge` — per-source predictive edge of
+  scored headlines. Says nothing about freshness at decision time.
+* `/api/decision-context-completeness` / `/api/position-rationale` —
+  whether the trade had any news vs none. Binary, not a gradient.
+
+**Builder**: `paper_trader/analytics/news_age_at_decision_skill.py::build_news_age_at_decision_skill`.
+Pure — pre-joined samples in, dict out, never raises.
+
+**Buckets** (test-locked): `FRESH_LT_60M` / `HOURS_1_TO_6` /
+`HOURS_6_TO_24` / `STALE_GT_24H` / `NO_NEWS`. `lo` inclusive, `hi`
+exclusive (60.0 min rolls into HOURS_1_TO_6, 1440.0 rolls into
+STALE_GT_24H). Defensive: a negative joined age means the joiner
+attached an article *after* the trade — a join bug, not a valid sample
+— and degrades to NO_NEWS rather than poisoning a real bucket.
+
+**Verdict matrix**: `FRESH_NEWS_BETTER` / `STALE_NEWS_BETTER` /
+`NO_PATTERN` / `INSUFFICIENT_DATA`. Compares the *extremes* (FRESH
+vs STALE) only — the middle buckets are surfaced for inspection but
+do not move the verdict. The operator question is "does minute-fresh
+news beat day-old news?", not the full curve.
+
+**Sample size honesty**: the verdict stays `INSUFFICIENT_DATA` until
+both compare-bucket counts ≥ `min_per_bucket` (default 3). Below that
+the per-bucket cards still ship — verdict alone is withheld. This
+mirrors the `trade_asymmetry` / `loser_autopsy` discipline.
+
+**Dashboard route**: `paper_trader/dashboard.py::news_age_at_decision_skill_api`.
+Two helpers wire the join:
+* `_build_realized_pct_index(trades)` — composes
+  `analytics.round_trips.build_round_trips` (AGENTS.md #10 SSOT) plus
+  the positions table for mark-to-current on open legs. Returns
+  `{trade_id: {realized_pct, closed}}`. **BUY-only attribution** by
+  design — a round-trip with 2 BUYs + 1 SELL contributes 2 samples
+  (one per BUY entry), not 3. A SELL's "realized return" is just the
+  round-trip outcome the sibling BUY(s) already encoded — attributing
+  to SELL ids too would inflate bucket counts without new information.
+  Exit-decision skill (forward return *after* the SELL) is a *different*
+  question for a *different* endpoint.
+* `_freshest_article_age_index(trades, lookback_days=30.0)` — reads
+  `articles.db` with the live-only filter (`_LIVE_ONLY_CLAUSE`), builds
+  per-ticker timelines via word-boundary `\b{ticker}\b` title match,
+  bisects per-trade for the newest article strictly before the trade
+  ts. Missing DB / no match / parse failure all degrade to `None` →
+  builder routes to NO_NEWS.
+
+**Query params** (clamped): `limit` 50..10000 (default 2000),
+`lookback_days` 1..120 (default 30), `min_per_bucket` 1..20 (default 3),
+`verdict_gap_pct` 0.1..20 (default 2.0).
+
+**Live read** (after restart): with 11 BUY/SELL trades all in the
+last 24h, samples bucket as FRESH_LT_60M and the verdict correctly
+stays INSUFFICIENT_DATA (need ≥3 in STALE_GT_24H too) — the gate is
+*supposed* to refuse a call at this sample size.
+
+### `/api/conviction-language-skill`
+
+**Question**: when Opus wrote "high conviction" vs "small probe /
+speculative", did the realized outcomes actually match that ranking?
+
+Distinct from the nearest neighbours:
+* `/api/cash-conviction-fit` — point-in-time cash vs loudest live
+  signal. Forward-looking, not a calibration check.
+* `/api/conviction-deployment-curve` — does capital *deployed* scale
+  with an external conviction proxy. About sizing.
+* `/api/decision-confidence` — distribution of self-reported scalar
+  over time. Doesn't link confidence to outcome.
+
+**Builder**: `paper_trader/analytics/conviction_language_skill.py::build_conviction_language_skill`.
+Pure — pre-joined samples in, dict out, never raises.
+
+**Classifier**: `classify_reason(reason) → (HIGH|LOW|ADD|NEUTRAL,
+matched_phrase)`. Precedence pinned in tests: HIGH > LOW > ADD >
+NEUTRAL. Patterns are word-boundary regex — defended against
+substring poisoning ("problem" must not match "probe"; "the addition
+to" must not match the ADD pattern). Matched substring is surfaced
+to the operator card so the classifier is auditable.
+
+**HIGH patterns**: `high/strong/max/full conviction`, `full size`,
+`aggressively sized/deploying`.
+**LOW patterns**: `small/tiny/micro position/stake/tranche`,
+`test/probe/starter`, `speculative`, `cautious/tentative`,
+`low-conviction`.
+**ADD patterns**: `scale in/up`, `accumulating`, `ramping`, `building
+into`, `adding to`.
+
+**Verdict matrix**: `SELF_AWARE` / `OVERCONFIDENT` / `NO_PATTERN` /
+`INSUFFICIENT_DATA`. Same `min_per_bucket` × `verdict_gap_pct` gate
+as the news-age sibling.
+
+**Dashboard route**: `paper_trader/dashboard.py::conviction_language_skill_api`.
+Reuses the same `_build_realized_pct_index` helper as the news-age
+sibling (shared join math, no drift).
+
+**Query params** (clamped): `limit` 50..10000 (default 2000),
+`min_per_bucket` 1..20 (default 3), `verdict_gap_pct` 0.1..20
+(default 2.0).
+
+**Live read** (after restart): 1 of 11 trades currently classifies as
+HIGH ("Sizing at 2 shares (~44% of book) — strong conviction"); 1 as
+ADD ("adding to my already 44.5% NVDA"); 9 as NEUTRAL. Verdict
+correctly INSUFFICIENT_DATA at this sample size. As the bot
+accumulates HIGH/LOW vocabulary it will start firing.
+
+### Tests
+
+```sh
+# 28 + 49 = 77 new exact-value tests, sub-second
+python3 -m pytest tests/test_news_age_at_decision_skill.py tests/test_conviction_language_skill.py -v
+
+# Joint with the nearest-neighbour analytics — confirms no regression
+python3 -m pytest tests/test_news_age_at_decision_skill.py tests/test_conviction_language_skill.py tests/test_cash_conviction_fit.py tests/test_conviction_deployment.py tests/test_round_trips.py tests/test_add_discipline.py tests/test_loser_autopsy.py -q
+# 185 passed in <1s
+
+# Full ml/backtest/scorer/news_age/conviction_lang filter
+python3 -m pytest tests/ -k "calibration or backtest or scorer or ml or horizon or news_age or conviction_lang" -q
+# 636 passed in ~2min
+```
+
+**Files**:
+* `paper_trader/analytics/news_age_at_decision_skill.py` (new)
+* `paper_trader/analytics/conviction_language_skill.py` (new)
+* `paper_trader/dashboard.py` (two new routes + two shared helpers
+  `_build_realized_pct_index`, `_freshest_article_age_index`)
+* `tests/test_news_age_at_decision_skill.py` (new, 28 tests)
+* `tests/test_conviction_language_skill.py` (new, 49 tests)
+
+**Invariants honoured**: AGENTS.md #2 (live-only filter on
+`articles.db`), #10 (round_trips as SSOT), #12 (observational
+only — never gates Opus, no caps).
+
+**Endpoints both follow the established "never raises" contract**:
+every error path returns a stable envelope with `verdict: ERROR` and
+HTTP 500; missing data degrades to `INSUFFICIENT_DATA` not error.
+
+---
+
 ## 2026-05-21 paper-trader-core HYBRID pass (Agent 1, ~07:10 UTC)
 
 ### Phase 1 — debug + tests (bugs_fixed: 0)
