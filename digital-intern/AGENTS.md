@@ -5,6 +5,175 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 hybrid pass (Agent 3, post-AXTI-leak) — `_RT_WHY_PCT_AFTER` regex + `pushed_ticker_breakdown` primitive
+
+**Phase 1 (live noise audit + regex fix):** read AGENTS.md head,
+daemon.py, storage/article_store.py, watchers/alert_agent.py,
+watchers/urgency_scorer.py, ml/trainer.py, ml/model.py, ml/features.py,
+collectors/web_scraper.py. Probed live `articles.db` for the four
+load-bearing invariants — all clean: `synthetic_ever_alerted=0`,
+`ml_with_ai>0=0`, `stuck_urgency1>24h=0`.
+
+Inspected live `alert_recency.db` (canonical record of REAL Discord
+pushes — distinct from articles.db urgency=2 which also includes
+gate-suppressed rows). Found ONE fresh leak: **"Why AXT (AXTI) Is
+Down 14.2% After Betting Big On AI-Focused Indium Phosphide
+Expansion"** fired a real 🚨 BREAKING push at 11:14:35Z 2026-05-21
+from `yfinance/Motley Fool`. Source-credibility tier above the 0.45
+bar so the authority gate doesn't catch it; content type IS the
+failure.
+
+None of the existing five "Why ..." recap variants catches it:
+
+- `_RT_WHY_TRADING` requires "trading up/down today"
+- `_RT_WHY_DID` requires "Did" between Why and subject
+- `_RT_WHY_JUST_MOVED` requires past-tense verb after adverb
+- `_RT_WHY_IS_PCT_SINCE` requires explicit "% since" trio
+- `_RT_WHY_STOCK_IS_AFTER` requires "stock is" + state-verb + after +
+  earnings-noun
+
+This shape is present-tense `Is <direction> N% After <event>` with an
+arbitrary (non-earnings) terminator — distinct phrasing, same
+retrospective intent.
+
+**The fix.** New fingerprint `_RT_WHY_PCT_AFTER` in
+`watchers/alert_agent.py` added to `_RECAP_TEMPLATE_PATTERNS` SSOT, so
+`watchers.urgency_scorer` pre-floor + `analysis.claude_analyst`
+briefing prefilter + `analytics.recap_template_audit` all engage
+automatically via the existing import discipline. Discriminator: the
+auxiliary + direction + % + after QUAD (``^Why\s+ + (subject .+?) +
+(is|are|was|were) + (up|down|higher|lower) + \d+(?:\.\d+)?\s*% +
+after\b``). `why_stock_is_after` is ordered BEFORE `why_pct_after` in
+the tuple so the strictly-more-specific sibling fingerprint wins on
+titles with `Stock` + earnings-noun terminator.
+
+**Tests pinned** in `tests/test_alert_recap_template.py`:
+`test_why_x_is_pct_after_recap` (8 must-catch incl. live AXTI
+failure-case) + `test_why_pct_after_does_not_over_catch` (14
+must-survive — missing each element of the quad, forward-tense, real
+news, and AGNC `% since` variant which routes to sibling). 42/42
+pass; 251/251 alert + ML sibling suite passes.
+
+Load-bearing invariants intact. Read-side title regex only.
+
+Commit: `8663e35` (auto-commit-daemon stamped it with an unrelated
+reporter-test commit message due to concurrent same-role staging race
+— actual file changes are mine, 115-line additions; memory
+`pt-concurrent-samerole-staging-race`).
+
+**Phase 2 — feature: `alert_recency.pushed_ticker_breakdown`.**
+Per-held-ticker push view + COVERAGE-GAP surface that answers a
+question no current surface answers cleanly:
+
+  "Over the recent window, which of MY held names are getting REAL
+   Discord BREAKING pushes vs which are SILENT (coverage gap)?"
+
+Distinct from the two existing per-ticker counters:
+
+- `ticker_burst_counts` returns a flat `{ticker: int}` for the
+  in-alert `burst:` annotation — no newest-age, no silent-ticker
+  list, no aggregate context.
+- `storage.article_store.urgency_label_split_by_ticker` counts
+  urgency>=1 rows in articles.db — conflates rows the gates
+  SUPPRESSED with rows that actually fired as pushes, so a ticker
+  with 50 recap-suppressed ML-only urgent rows reads identically to
+  one with 50 real pushes.
+
+`alert_recency.db` is the canonical record of REAL Discord pushes
+(only `record_alerted` in `send_urgent_alert`'s success path writes
+here — gate suppressions never do), so a ticker absent from this
+view is a real coverage gap, not a counting artefact.
+
+Returns:
+
+```python
+{
+    "total_pushes": int,
+    "by_ticker": [
+        {"ticker": str, "pushes": int,
+         "newest_age_h": float | None, "newest_title": str},
+        ...   # sorted most-pushed-first, alphabetical tiebreak
+    ],
+    "silent_tickers": [str, ...],  # held names with zero pushes,
+                                   # preserved input order
+}
+```
+
+Contract pinned by 22 tests in `tests/test_pushed_ticker_breakdown.py`:
+title-only case-insensitive whole-word, per-alert dedup, single-char
+tickers skipped, input ticker case preserved, input duplicate-ticker
+collapse, `newest_age_h` is MIN across pushes rounded to 0.01h,
+`silent_tickers` preserves input ordering, `by_ticker` sorted
+most-pushed-first with alphabetical tiebreak (matches
+`urgency_label_split_by_source`'s convention), pure (no DB / IO),
+defensive on malformed rows. Realistic NVDA-earnings-night scenario +
+end-to-end `record_alerted` → `recent_alerts` →
+`pushed_ticker_breakdown` integration tests.
+
+138/138 full alert-path sibling suite passes.
+
+Load-bearing invariants intact. Pure function; alert_recency.db never
+carries backtest signatures (filtered upstream).
+
+Commit `42e15fd`. Staged paths: `watchers/alert_recency.py` +
+`tests/test_pushed_ticker_breakdown.py` (explicit pathspec).
+
+**Phase 3 (live findings — 2026-05-21 15:40Z):**
+
+1. **(POSITIVE) Pipeline healthy under load.** 12,214 articles/24h
+   (live), 868/h. All 41 workers alive.
+
+2. **(NEW FEATURE LIVE) `pushed_ticker_breakdown` 24h shows real
+   COVERAGE GAPS no other surface exposed cleanly:**
+   - NVDA: 9 pushes (concentration)
+   - AXTI: 1 push (the exact title the new gate catches)
+   - MU: 1 push
+   - **9 of 12 held tickers SILENT in 24h** (LITE / LNOK / MUU /
+     DRAM / SNDU / MSFT / ORCL / TSEM / QBTS).
+
+3. **(BUG FIXED, LIVE CONFIRMED)** the AXTI "Why ... Is Down 14.2%
+   After ..." title that fired BREAKING at 11:14:35Z is suppressed
+   by the new `_RT_WHY_PCT_AFTER`. Daemon needs restart to pick it
+   up (memory: `di-stale-manual-daemon`).
+
+4. **(POSITIVE) Load-bearing invariants intact under earnings-night
+   pressure.** No synthetic row ever alerted; no `score_source='ml'`
+   carries `ai_score>0`; no `urgency=1` row older than 24h.
+
+5. **(POSITIVE) Briefing quality excellent.** Most recent briefing
+   2026-05-21 14:40Z (5h cadence target met). Well-formed sections:
+   MACRO, PORTFOLIO, SEMIS PULSE, TOP SIGNALS, RISK / CATALYST,
+   COVERAGE GAP, DESK NOTE.
+
+6. **(OPERATIONAL) Claude empty-response failures under load.**
+   alert_worker logged "No response from Claude — skipping" twice in
+   4 minutes (15:23:47Z + 15:25:20Z). Backlog tail "37 more queued"
+   per cycle indicates Claude latency under load. Alerts still
+   going through (15:30:15Z + 15:41:25Z).
+
+7. **(CHRONIC, KNOWN) `database is locked` + cursor-collision
+   retries** firing every few minutes under writer contention.
+   Retry layer absorbs (memory:
+   `di-insert-batch-lock-contention`).
+
+8. **(OBSERVATION) ml_trainer subprocess timeout** at 15:27:57Z —
+   642.4s elapsed > 600s `_TRAIN_TIMEOUT_S`. Full ArticleNet retrain
+   was killed. Suggests dataset / USB I/O pushing past budget;
+   monitor.
+
+9. **(CHRONIC, KNOWN) Source health 28 disabled / 0 stale / 28
+   down** — standing chronic dark-collectors (memory:
+   `di-chronic-dark-collectors`).
+
+**Counters:** `bugs_fixed=1` (the `_RT_WHY_PCT_AFTER` recap regex —
+real live noise leak fixed today, AXTI push verified in
+alert_recency.db, fix + 22 new pin tests committed in 8663e35),
+`features_added=1` (`pushed_ticker_breakdown` — real analyst-facing
+per-held-ticker push view + coverage-gap surface no other endpoint
+provided cleanly, 22 tests, committed in 42e15fd), `user_findings=9`.
+
+---
+
 ## 2026-05-21 feature-dev pass (Agent 4) — two new `/api/chat` enrichment blocks: concentration trajectory + streak
 
 **Phase 1 — bugs_fixed: 0.** Read CLAUDE.md, AGENTS.md head, the chat handler
