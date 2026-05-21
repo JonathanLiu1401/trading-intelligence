@@ -168,6 +168,64 @@ def build_info_api():
     })
 
 
+@app.route("/api/notify-health")
+def notify_health_api():
+    """Discord delivery-health snapshot — operator-facing surface for the
+    silent-channel class of failure (the 2026-05-17 ``env node`` PATH outage
+    being the canonical case).
+
+    The same data is already nested in ``/api/runner-heartbeat`` under
+    ``notify`` — but that endpoint is SWR-cached (20s TTL, can serve a
+    minutes-old payload under host saturation). When an operator suspects
+    Discord is dark, they need the *current* in-process counter — not a
+    cached snapshot frozen at "the last time the dashboard managed to
+    rebuild the heartbeat panel". This endpoint is **deliberately NOT
+    @swr_cached**: ``reporter.notify_health()`` is a pure module-global
+    read (no I/O, no store hop) so the cost of bypassing the cache is zero
+    while the latency benefit is the whole point.
+
+    Pinned by ``tests/test_core_dashboard_notify_health.py`` so a future
+    re-introduction of the cache (or an accidental import change) is
+    caught by CI.
+
+    Single source of truth (invariant #10): the verdict / headline /
+    consecutive-failures fields are ``reporter.notify_health()``'s own —
+    never re-derived here, so this endpoint and the ``notify`` block on
+    ``/api/runner-heartbeat`` can never tell different stories.
+
+    Failure contract: any import / call fault degrades to a valid-shaped
+    ERROR envelope (verdict=ERROR + a short error string) so the panel
+    can render and the operator sees the fault, never a 500 that the
+    upstream digital-intern dashboard would render as "endpoint dark".
+    """
+    try:
+        from . import reporter as _reporter
+        nh = _reporter.notify_health()
+        if not isinstance(nh, dict):
+            nh = {"verdict": "ERROR",
+                  "headline": "notify_health returned non-dict",
+                  "consecutive_failures": 0,
+                  "last_ok_ts": None, "last_attempt_ts": None,
+                  "last_error": "", "restart_recommended": False}
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            **nh,
+        })
+    except Exception as e:
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "verdict": "ERROR",
+            "headline": f"notify-health endpoint error: {e}",
+            "consecutive_failures": 0,
+            "last_ok_ts": None,
+            "last_attempt_ts": None,
+            "last_error": str(e),
+            "restart_recommended": False,
+        }), 500
+
+
 # Static sector classification for analytics + sector-pulse cards.
 # Keyed by the symbols we actually use in the watchlist + portfolio.
 SECTOR_MAP = {
