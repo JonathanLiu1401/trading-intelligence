@@ -9,12 +9,13 @@ from email.utils import parsedate_to_datetime
 
 from core.claude_cli import claude_call
 from core.json_extract import extract_json_array
-# Single source of truth for the recap-template fingerprint set — defined in
-# alert_agent and re-used here so urgency_scorer, the alert formatter, and the
-# briefing builder can never silently drift in WHICH titles count as a recap.
-# Same intra-watchers import discipline as alert_agent->alert_recency. Pulls
-# ml.features transitively (cheap — already in the daemon's process graph).
-from watchers.alert_agent import _looks_like_recap_template
+# Single source of truth for the recap-template AND quote-widget fingerprint
+# sets — defined in alert_agent and re-used here so urgency_scorer, the alert
+# formatter, and the briefing builder can never silently drift in WHICH titles
+# count as a recap / quote-widget. Same intra-watchers import discipline as
+# alert_agent->alert_recency. Pulls ml.features transitively (cheap — already
+# in the daemon's process graph).
+from watchers.alert_agent import _looks_like_recap_template, _looks_like_quote_widget
 
 try:
     from core.logger import get_logger
@@ -112,18 +113,32 @@ def _article_age_hours(article: dict) -> float:
 def score_batch(articles: list, store) -> int:
     """Score a batch of articles; update store. Returns count of urgent items found.
 
-    Pre-filter pass (defense-in-depth): retrospective recap / preview /
-    transcript-summary templates ("Why X Stock Is Trading Up Today",
-    "Q1 2026 Earnings Call Highlights", "Stock Market Today, May 18:",
-    "GF Value Says ...", "Here What the Street Thinks About ...") are floored
-    to noise (ai_score=0.01, urgency=0, score_source='llm') WITHOUT a Sonnet
-    call. Sonnet demonstrably mis-labels these as ai_score=8+ urgent (live
-    evidence 2026-05-18/19: 10 such rows landed in articles.db as
-    score_source='llm', poisoning the training pool with retrospective fluff
-    flagged as ground-truth urgent). The same fingerprint set the alert path
-    uses (``_looks_like_recap_template`` — single source of truth) gates them
-    here BEFORE the Claude call so we (1) save quota and (2) keep the LLM
-    label distribution honest. The floor value 0.01 matches what
+    Pre-filter pass (defense-in-depth): two classes of non-prose pseudo-articles
+    are floored to noise (ai_score=0.01, urgency=0, score_source='llm') WITHOUT
+    a Sonnet call.
+
+      1. Live ticker-tape / quote-widget pseudo-articles
+         ("NVDANVIDIA Corporation227.13-8.61(-3.65%)") — Sonnet and the urgency
+         head both over-score these. Web_scraper drops them at ingestion but
+         is not the only entry path (yahoo_ticker_rss / finnhub /
+         google_news), and a 30-day live audit found 111 such rows tagged
+         score_source='llm' with ai_score > 0 (one at 8.0). The alert path's
+         own gate suppresses the Discord push but runs too late to prevent
+         the training-pool contamination.
+
+      2. Retrospective recap / preview / transcript-summary templates
+         ("Why X Stock Is Trading Up Today", "Q1 2026 Earnings Call
+         Highlights", "Stock Market Today, May 18:", "GF Value Says ...",
+         "Here What the Street Thinks About ...") — Sonnet demonstrably
+         mis-labels these as ai_score=8+ urgent (live evidence 2026-05-18/19:
+         10 such rows landed in articles.db as score_source='llm', poisoning
+         the training pool with retrospective fluff flagged as ground-truth
+         urgent).
+
+    The same fingerprint sets the alert path uses (``_looks_like_quote_widget``
+    + ``_looks_like_recap_template`` — single source of truth) gate them here
+    BEFORE the Claude call so we (1) save quota and (2) keep the LLM label
+    distribution honest. The floor value 0.01 matches what
     ``urgency_scorer``'s anti-loop floor would write for a row Sonnet returned
     no score on, and is equivalent to what Sonnet would output if the prompt
     were extended with the same exclusion — so the trainer's strong-label pool
@@ -132,11 +147,44 @@ def score_batch(articles: list, store) -> int:
     if not articles:
         return 0
 
+    # Quote-widget pre-filter runs FIRST: a spaceless price-tape title
+    # ("NVDANVIDIA Corporation227.13-8.61(-3.65%)") that web_scraper missed
+    # (or that entered via yahoo_ticker_rss / finnhub / google_news, none of
+    # which apply the ingestion-time gate) would otherwise reach Sonnet and
+    # be scored as if it were prose. Live evidence (2026-05-21, 30d audit):
+    # 111 such rows landed with score_source='llm' and ai_score > 0 — one at
+    # 8.0 (urgent territory) for a "NVDANVIDIA Corporation227.13-8.61(-3.65%)"
+    # row. Those 111 rows then entered the trainer's strong-label pool tagged
+    # as ground-truth LLM labels (STRONG_LABEL_WHERE includes score_source=
+    # 'llm'), polluting the learning signal with patently-not-prose junk and
+    # wasting Sonnet quota on every cycle. The alert path's defense-in-depth
+    # quote-widget gate already drops these BEFORE Discord, but it runs too
+    # late to prevent training-pool contamination — the row already carries
+    # ai_score=8 by then. Same single-source-of-truth fingerprint set as the
+    # alert formatter (``_looks_like_quote_widget`` imported above), so a
+    # regex tightening on the alert side automatically engages here.
+    quote_widget_articles: list = []
     recap_articles: list = []
     real_articles: list = []
     for a in articles:
+        if _looks_like_quote_widget(a):
+            quote_widget_articles.append(a)
+            continue
         hit, _name = _looks_like_recap_template(a)
         (recap_articles if hit else real_articles).append(a)
+
+    if quote_widget_articles:
+        qw_updates: list[tuple[str, float, int]] = [
+            (a["_id"], 0.01, 0) for a in quote_widget_articles if a.get("_id")
+        ]
+        if qw_updates:
+            store.update_ai_scores_batch(qw_updates)
+        _log.info(
+            f"[urgency] pre-floored {len(quote_widget_articles)} quote-widget "
+            f"row(s) — skipped Sonnet call (urgency head over-scores live "
+            f"ticker-tape; would have polluted training pool as score_source="
+            f"'llm')"
+        )
 
     if recap_articles:
         recap_updates: list[tuple[str, float, int]] = [
