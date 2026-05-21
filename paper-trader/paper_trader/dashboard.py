@@ -16274,5 +16274,152 @@ def catalyst_expiry_skill_api():
         }), 500
 
 
+@app.route("/api/hourly-pnl-fingerprint")
+def hourly_pnl_fingerprint_api():
+    """Hourly P&L fingerprint — bucket equity-curve cycle deltas by
+    NY-local hour-of-day, surface the alpha-vs-SPY spread across the
+    trading session.
+
+    Verdict matrix:
+
+      * ``INSUFFICIENT_DATA`` — qualifying samples < min_total_samples.
+      * ``NO_SPY_DATA`` — samples present but no SPY-anchored pair.
+      * ``MORNING_EDGE`` — best alpha hour ∈ [9,12) AND spread ≥ floor.
+      * ``MIDDAY_EDGE`` — best alpha hour ∈ [12,14) AND spread ≥ floor.
+      * ``AFTERNOON_EDGE`` — best alpha hour ∈ [14,17) AND spread ≥ floor.
+      * ``OFF_HOURS_EDGE`` — best alpha hour outside [9,17).
+      * ``FLAT_CLOCK`` — alpha spread < floor across qualifying hours.
+
+    Query params (clamped):
+      ``limit`` — equity-curve rows to consider, 50..50000 (default 5000).
+      ``min_total_samples`` — verdict floor, 1..100000 (default 60).
+      ``alpha_spread_pp`` — EDGE/FLAT threshold (pp), 0..100 (default 0.5).
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.hourly_pnl_fingerprint import (
+            build_hourly_pnl_fingerprint,
+            DEFAULT_MIN_TOTAL_SAMPLES,
+            DEFAULT_ALPHA_SPREAD_PP,
+            DEFAULT_MIN_BUCKET_ALPHA_SAMPLES,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        def _qi(name, default, lo, hi):
+            try:
+                v = int(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        limit = _qi("limit", 5000, 50, 50000)
+        min_total_samples = _qi(
+            "min_total_samples", DEFAULT_MIN_TOTAL_SAMPLES, 1, 100000,
+        )
+        alpha_spread_pp = _qf(
+            "alpha_spread_pp", DEFAULT_ALPHA_SPREAD_PP, 0.0, 100.0,
+        )
+        min_bucket_alpha_samples = _qi(
+            "min_bucket_alpha_samples", DEFAULT_MIN_BUCKET_ALPHA_SAMPLES,
+            1, 100000,
+        )
+
+        store = get_store()
+        rows = store.equity_curve(limit=limit) or []
+        return jsonify(build_hourly_pnl_fingerprint(
+            rows,
+            min_total_samples=min_total_samples,
+            alpha_spread_pp=alpha_spread_pp,
+            min_bucket_alpha_samples=min_bucket_alpha_samples,
+        ))
+    except Exception as e:
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "buckets": [],
+        }), 500
+
+
+@app.route("/api/weekday-pnl-fingerprint")
+def weekday_pnl_fingerprint_api():
+    """Weekday P&L fingerprint — bucket equity-curve cycle deltas by
+    NY-local weekday, surface the alpha-vs-SPY spread across the week.
+
+    Verdict matrix:
+
+      * ``INSUFFICIENT_DATA`` — qualifying samples < min_total_samples.
+      * ``NO_SPY_DATA`` — samples present but no SPY-anchored pair.
+      * ``WEEKDAY_EDGE`` — best alpha day ∈ Mon..Fri AND spread ≥ floor.
+      * ``WEEKEND_EDGE`` — best alpha day ∈ Sat/Sun AND spread ≥ floor.
+      * ``FLAT_WEEK`` — alpha spread < floor across qualifying weekdays.
+
+    Query params (clamped):
+      ``limit`` — equity-curve rows to consider, 50..50000 (default 5000).
+      ``min_total_samples`` — verdict floor, 1..100000 (default 60).
+      ``alpha_spread_pp`` — EDGE/FLAT threshold (pp), 0..100 (default 0.5).
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.weekday_pnl_fingerprint import (
+            build_weekday_pnl_fingerprint,
+            DEFAULT_MIN_TOTAL_SAMPLES,
+            DEFAULT_ALPHA_SPREAD_PP,
+            DEFAULT_MIN_BUCKET_ALPHA_SAMPLES,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        def _qi(name, default, lo, hi):
+            try:
+                v = int(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        limit = _qi("limit", 5000, 50, 50000)
+        min_total_samples = _qi(
+            "min_total_samples", DEFAULT_MIN_TOTAL_SAMPLES, 1, 100000,
+        )
+        alpha_spread_pp = _qf(
+            "alpha_spread_pp", DEFAULT_ALPHA_SPREAD_PP, 0.0, 100.0,
+        )
+        min_bucket_alpha_samples = _qi(
+            "min_bucket_alpha_samples", DEFAULT_MIN_BUCKET_ALPHA_SAMPLES,
+            1, 100000,
+        )
+
+        store = get_store()
+        rows = store.equity_curve(limit=limit) or []
+        return jsonify(build_weekday_pnl_fingerprint(
+            rows,
+            min_total_samples=min_total_samples,
+            alpha_spread_pp=alpha_spread_pp,
+            min_bucket_alpha_samples=min_bucket_alpha_samples,
+        ))
+    except Exception as e:
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "buckets": [],
+        }), 500
+
+
 if __name__ == "__main__":
     run()

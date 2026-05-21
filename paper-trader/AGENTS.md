@@ -6,6 +6,128 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4) — `/api/hourly-pnl-fingerprint` + `/api/weekday-pnl-fingerprint`
+
+Two new observational endpoints surfacing a structural read no
+existing diagnostic answered. Both pure builders, both never raise,
+both observational only (AGENTS.md invariants #2 / #12). Wired at the
+bottom of `paper_trader/dashboard.py`.
+
+### The gap
+
+`decision_clock` (per-hour) and `decision_weekday` (per-weekday) both
+bucket *decision cadence* — when the trader decides / NO_DECISIONs.
+Neither buckets **realised P&L**. A bot that prints +0.4% alpha during
+the 10–11am ET window and bleeds −0.6% during 14–15pm ET reads neutral
+on every existing diagnostic — but the clock-time pattern is a real
+desk edge: the operator can re-cadence decision flow toward the
+productive window. `decision_drought` grades idle-cost vs SPY but
+window-relative, not clock-bucketed; `session_delta` is a "since-T"
+change feed, not a clock aggregate.
+
+### `/api/hourly-pnl-fingerprint` — equity delta bucketed by NY hour
+
+Module: `paper_trader/analytics/hourly_pnl_fingerprint.py`. Pure walk
+of `equity_curve` rows: each consecutive (prev, curr) pair yields
+`port_delta_pct` and (when both `sp500_price` legs present)
+`spy_delta_pct`; `alpha_pct = port − spy`. Pairs are bucketed by the
+**trailing timestamp's** NY-local hour. **Dead intervals** (both legs
+round to 0 — overnight / weekend ticks) are dropped so they don't
+dominate a bucket.
+
+Aggregate verdict ladder: `INSUFFICIENT_DATA` (< `min_total_samples`,
+default 60) → `NO_SPY_DATA` (samples but no SPY-anchored pair) →
+`MORNING_EDGE` / `MIDDAY_EDGE` / `AFTERNOON_EDGE` / `OFF_HOURS_EDGE`
+(best-alpha hour ∈ [9,12)/[12,14)/[14,17)/outside, AND best−worst ≥
+`alpha_spread_pp`, default 0.5pp) → `FLAT_CLOCK` (spread below floor).
+Order is load-bearing: `INSUFFICIENT_DATA` before any quant verdict so
+a thin curve reads honestly; `NO_SPY_DATA` before the EDGE ladder so a
+curve with no SPY anchors is never miscalled FLAT.
+
+**Per-bucket sample floor (load-bearing):** only hour buckets carrying
+≥ `min_bucket_alpha_samples` SPY-anchored samples (default 8, mirrors
+`signal_followthrough._MIN_ACTED`) may anchor the best/worst EDGE
+pick. A bucket with n=3 at −10pp alpha would otherwise drive a
+spurious EDGE on pure noise; the floor bars it. If no bucket clears
+the floor the verdict degrades to `INSUFFICIENT_DATA` (the thin
+buckets still surface in the `buckets` list, just barred from
+anchoring).
+
+### `/api/weekday-pnl-fingerprint` — equity delta bucketed by weekday
+
+Module: `paper_trader/analytics/weekday_pnl_fingerprint.py`. Identical
+input contract / dead-interval filter / alpha decomposition /
+per-bucket sample floor; the only axis swap is the bucket key
+(NY-local weekday, Mon=0..Sun=6). Verdict ladder:
+`INSUFFICIENT_DATA` → `NO_SPY_DATA` → `WEEKDAY_EDGE` (best day ∈
+Mon..Fri) / `WEEKEND_EDGE` (best day ∈ Sat/Sun) → `FLAT_WEEK`.
+
+### Live evidence at merge (live trader, 76 alpha samples)
+
+```
+/api/hourly-pnl-fingerprint  → FLAT_CLOCK   (alpha spread 0.34pp < 0.50pp;
+                                best hour 09:00 NY +0.23pp)
+/api/weekday-pnl-fingerprint → FLAT_WEEK    (alpha spread 0.08pp < 0.50pp;
+                                best Wed +0.03pp)
+```
+
+Both honest FLAT verdicts — the live equity curve is only ~76
+SPY-anchored cycles deep (per the `paper_trader equity_curve
+shallow/lumpy` note), so neither panel claims a clock edge yet. They
+flip to an EDGE verdict automatically once the curve accumulates a
+real spread.
+
+### Query params (both endpoints, clamped)
+
+`limit` (equity rows, 50..50000, default 5000) · `min_total_samples`
+(verdict floor, 1..100000, default 60) · `alpha_spread_pp` (EDGE/FLAT
+threshold pp, 0..100, default 0.5) · `min_bucket_alpha_samples`
+(per-bucket EDGE-eligibility floor, 1..100000, default 8).
+
+```
+curl -s http://localhost:8090/api/hourly-pnl-fingerprint  | python3 -m json.tool
+curl -s http://localhost:8090/api/weekday-pnl-fingerprint | python3 -m json.tool
+# tighten the EDGE threshold for a noisier book:
+curl -s 'http://localhost:8090/api/hourly-pnl-fingerprint?alpha_spread_pp=1.0'
+```
+
+### Tests
+
+Two new files, both pure-builder tests (no Flask, no live DB):
+
+```
+python3 -m pytest tests/test_hourly_pnl_fingerprint.py \
+                 tests/test_weekday_pnl_fingerprint.py -v   # 45 tests, <1s
+```
+
+`test_hourly_pnl_fingerprint.py` (27) — full verdict ladder
+(MORNING/MIDDAY/AFTERNOON/OFF_HOURS/FLAT each hit by synthetic curves
+engineered to a known alpha spread), `INSUFFICIENT_DATA` /
+`NO_SPY_DATA` paths, dead-interval filter, the per-bucket
+sample floor (a 3-sample bucket cannot anchor an EDGE; a thin-only
+curve reads INSUFFICIENT_DATA), robustness (non-dict / bad-timestamp /
+non-positive / NaN-inf rows dropped), bucket sort-ascending, threshold
++ tz override forwarding, envelope stability.
+`test_weekday_pnl_fingerprint.py` (18) — the sister ladder
+(WEEKDAY_EDGE / WEEKEND_EDGE / FLAT_WEEK), same robustness coverage.
+
+Synthetic curves pack one bucket per chunk into a single UTC hour/day
+and insert a `None` chain-break between chunks (the builder treats a
+non-dict row as a `prev`-reset) so cross-chunk pairs cannot
+contaminate a bucket's stats.
+
+### Invariants reaffirmed
+
+- Pure-builder discipline: input is a list of `equity_curve` dicts,
+  output is a stable envelope dict, no I/O, never raises.
+- AGENTS.md invariants #2 / #12: both endpoints are observational
+  only — never gate Opus, never injected into the decision prompt.
+- Single source of truth (#10): both read `store.equity_curve()`
+  verbatim — the same series `/api/drawdown` / `/api/benchmark`
+  consume; no re-derived equity history.
+
+---
+
 ## 2026-05-21 paper-trader-core HYBRID pass (Agent 1, ~18:30 UTC) — feed-health Discord surface
 
 Counters: `bugs_fixed=0` (honest zero) · `features_added=1` ·
