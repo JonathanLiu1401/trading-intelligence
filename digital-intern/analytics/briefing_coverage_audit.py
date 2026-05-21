@@ -228,11 +228,16 @@ def build_briefing_coverage_audit(briefing,
                 })
                 slot["n_articles"] += 1
                 # Keep the FIRST title that ties the running max-urgency, so
-                # ranking is deterministic across re-runs of the same input.
-                if urg > slot["max_urgency"] or not slot["sample_title"]:
-                    slot["max_urgency"] = max(slot["max_urgency"], urg)
-                    if title:
-                        slot["sample_title"] = title
+                # the displayed sample always belongs to a top-urgency row
+                # (a lower-urgency article with a title must NOT fill the
+                # sample slot just because the prior top-urgency article had
+                # an empty title — that misleads the operator into reading
+                # the miss as a low-urgency story).
+                if urg > slot["max_urgency"]:
+                    slot["max_urgency"] = urg
+                    slot["sample_title"] = title if title else ""
+                elif urg == slot["max_urgency"] and not slot["sample_title"] and title:
+                    slot["sample_title"] = title
 
     # --- NO_URGENT --------------------------------------------------------
     if not per_ticker:
