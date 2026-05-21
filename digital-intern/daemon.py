@@ -88,6 +88,7 @@ from collectors.fed_press_collector import collect_fed_press
 from collectors.ecb_press_collector import collect_ecb_press
 from collectors.boj_press_collector import collect_boj_press
 from collectors.boe_press_collector import collect_boe_press
+from collectors.whitehouse_collector import collect_whitehouse
 from collectors.g10_central_banks_collector import collect_g10_central_banks
 from collectors.global_regulators_collector import collect_global_regulators
 from collectors.imf_bis_worldbank_collector import collect_imf_bis_worldbank
@@ -166,6 +167,7 @@ FED_PRESS_INTERVAL      = 1800    # Federal Reserve press / speech / testimony R
 ECB_PRESS_INTERVAL      = 1800    # ECB press releases RSS — every 30min
 BOJ_PRESS_INTERVAL      = 1800    # Bank of Japan press / speech / MPM RSS — every 30min
 BOE_PRESS_INTERVAL      = 1800    # Bank of England press / publications RSS — every 30min
+WHITEHOUSE_INTERVAL     = 1800    # White House executive orders / proclamations / briefings — every 30min
 G10_CB_INTERVAL         = 1800    # Bank of Canada + RBA press / speeches RSS — every 30min
 GLOBAL_REG_INTERVAL     = 1800    # FSB, FCA, Fed research notes/papers — every 30min
 BIS_INTERVAL            = 1800    # BIS press releases, speeches, research — every 30min
@@ -225,7 +227,7 @@ ALL_WORKERS = (
     "google_news", "nitter", "substack",
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
     "yahoo_ticker_rss", "market_movers", "wikipedia", "macro_calendar", "short_interest",
-    "fed_press", "ecb_press", "boj_press", "boe_press", "g10_cb", "global_reg",
+    "fed_press", "ecb_press", "boj_press", "boe_press", "g10_cb", "global_reg", "whitehouse",
     "usgs_quake",
     "scorer", "alert", "heartbeat", "purge", "stats",
     "ml_trainer", "continuous_trainer", "recursive_labeler", "price_alert",
@@ -264,6 +266,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "ecb_press": ECB_PRESS_INTERVAL,
     "boj_press": BOJ_PRESS_INTERVAL,
     "boe_press": BOE_PRESS_INTERVAL,
+    "whitehouse": WHITEHOUSE_INTERVAL,
     "g10_cb": G10_CB_INTERVAL,
     "global_reg": GLOBAL_REG_INTERVAL,
     "bis": BIS_INTERVAL,
@@ -1491,6 +1494,27 @@ def boe_press_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(BOE_PRESS_INTERVAL)
+
+
+def whitehouse_worker(store: ArticleStore):
+    log.info("[whitehouse_worker] started")
+    bo = Backoff("whitehouse", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_whitehouse()
+            _ingest(store, articles, "whitehouse")
+            try:
+                source_health.record_result("whitehouse", len(articles))
+            except Exception as he:
+                log.warning(f"[whitehouse_worker] source_health error: {he}")
+            _worker_last_ok["whitehouse"] = time.time()
+            log.debug(f"[whitehouse] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[whitehouse_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(WHITEHOUSE_INTERVAL)
 
 
 def g10_cb_worker(store: ArticleStore):
@@ -3081,6 +3105,7 @@ def main():
         ("ecb_press",   ecb_press_worker),
         ("boj_press",   boj_press_worker),
         ("boe_press",   boe_press_worker),
+        ("whitehouse",  whitehouse_worker),
         ("g10_cb",      g10_cb_worker),
         ("global_reg",  global_reg_worker),
         ("bis",         bis_worker),
