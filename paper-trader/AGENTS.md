@@ -6,6 +6,189 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 ML+backtest HYBRID pass (Agent 2, late session) — training/inference feature-parity
+
+### Phase 1 — fix (commit `9268ee0`)
+
+**Bug**: `_ml_decide` pre-fetches quant signals only for
+`QUANT_SIGNAL_TICKERS ∪ portfolio.positions` (~34 of 117 watchlist tickers).
+A sentiment-only BUY of a ticker outside that set — empirically ~21% of all
+BUYs across the live `decision_outcomes.jsonl` tail (1287/6032 rows; classic
+examples: XLF/XLV/XLI sector ETFs, ARKK, BTC-USD, leveraged single-stock 2x
+names NVDU/AMZU/METAU/CONL) — fed the DecisionScorer `build_features`
+neutral defaults (rsi=50, macd=0, mom=0, bb=0) at INFERENCE while
+`_compute_decision_outcomes` calls `_get_quant_signals(sim_date, [ticker], ...)`
+per outcome with no WATCHLIST subset, so the **training** row carried the
+REAL indicators. Net: the scorer trained on a feature manifold the gate
+never visited at inference, and predicted at a manifold the model never
+saw in training.
+
+**Fix**: lazy single-ticker `_get_quant_signals(sim_date, [buy_ticker], prices)`
+call when the picked ticker is outside the pre-fetched `quant` dict. Cheap
+(one ticker, cached PriceCache series) and only runs on sentiment-only buys.
+The score-adjustment loop is deliberately LEFT at the originally-covered
+tickers so this fix changes ONLY the scorer feature vector, not
+`best_score` / persona / regime decisions.
+
+**Tests**: 3 new regression locks under
+`tests/test_ml_backtest_review.py::TestBuyTickerQuantFeatureParity`:
+sentiment-only XLF buy feeds real RSI; covered NVDA path unchanged;
+held-position BABA buy path unchanged. Each uses a `_CapturingScorer`
+stand-in to assert `predict_with_meta` kwargs directly.
+
+### Phase 2 — feature (commit `d20dafa`, bundled with sibling agent's edit)
+
+**`paper_trader/ml/buy_ticker_quant_coverage.py`** — read-only diagnostic
+quantifying the historical drift the Phase-1 fix removes for new decisions.
+For each BUY row in `decision_outcomes.jsonl`, reports:
+
+| Field | Meaning |
+|---|---|
+| `n_total_buys` | total BUY rows analyzed in the corpus tail |
+| `n_quant_covered` | ticker ∈ QUANT_SIGNAL_TICKERS (the pre-fetched set) |
+| `n_quant_gap` | ticker ∉ QUANT_SIGNAL_TICKERS (sentiment-only pick — the gap) |
+| `gap_fraction` | `n_quant_gap / n_total_buys` |
+| `gap_rsi_real_count` | gap rows with `rsi != None` in the outcome |
+| `gap_rsi_real_fraction` | "drift severity" — 1.0 ⇒ every gap row trained on real RSI while the gate saw defaults |
+| `top_gap_tickers` | most-frequent gap tickers, sorted desc by count |
+| `verdict` | `HEALTHY` / `GAP_PRESENT` / `GAP_DOMINANT` / `INSUFFICIENT_DATA` |
+
+Verdict thresholds (calibrated against live corpus state at fix time):
+
+| Verdict | Trigger |
+|---|---|
+| `HEALTHY` | `gap_fraction < 0.05` |
+| `GAP_PRESENT` | `0.05 ≤ gap_fraction < 0.30`, drift severity `< 0.80` OR `gap_fraction < 0.15` |
+| `GAP_DOMINANT` | `gap_fraction ≥ 0.30`, OR (`≥ 0.15` AND severity `≥ 0.80`) |
+
+CLI: `python3 -m paper_trader.ml.buy_ticker_quant_coverage [--json] [--tail N]`.
+Read-only — never trains, never touches the pickle / outcomes (read-only) /
+`build_features` / `N_FEATURES` / trade path. Same operational discipline
+as `feature_coverage` / `calibration` / `skill_trend`. 18 tests under
+`tests/test_buy_ticker_quant_coverage.py` cover threshold boundaries, row
+filtering, top-ticker sorting, drift severity, insufficient-data
+degradation, corrupt-JSONL handling, tail truncation, CLI integration,
+and live-corpus consistency.
+
+Live corpus at fix time (5000-row tail): verdict=`GAP_PRESENT`,
+`n_quant_gap=513` (12.5%), `gap_rsi_real_fraction=0.98` — top gap tickers
+JPM (167), LLY (137), DFEN (87), NVO (72), CURE (47).
+
+### Phase 3 — live validation findings (quant researcher perspective)
+
+1. **Continuous backtest loop has been DEAD for 3 days** (since
+   2026-05-18 12:03 PT, per `continuous.log` mtime). No `ml_quant` backtest
+   runs since then; no outcome accumulation; no scorer retraining. Cause is
+   external (no `run_continuous_backtests.py` process in `ps`). The live
+   trader dashboard at `:8090` is still running and serving requests, so
+   the operator might not notice the backtest training loop is starved.
+
+2. **Deployed scorer is permanently sub-gate**.
+   `data/ml/decision_scorer.pkl` has `n_train=400` (mtime 2026-05-19) — below
+   the `n_train >= 500` gate threshold (invariant #5). With the current
+   `decision_outcomes.jsonl` (7413 rows; 6906 distinct keys after dedup;
+   3959 trainable rows after 80/20 temporal split + label validation), a
+   retrain WOULD produce `n_train=3959`, well above the 500 threshold.
+   The gate is inactive purely because the loop isn't running — NOT because
+   of insufficient data. To unstick: restart `run_continuous_backtests.py`.
+
+3. **2 orphaned `running` rows** in `backtest.db` from 2026-05-18
+   (run_ids 6243, 90001 status='running' for 3+ days).
+   `_reap_orphaned_runs` would fix these but only on next continuous-loop
+   process start, which hasn't happened. The dashboard renders these as
+   in-flight indefinitely (CLAUDE.md §11 symptom).
+
+4. **`buy_ticker_quant_coverage` verdict on live corpus is `GAP_PRESENT`**:
+   513/4117 recent BUYs (12.5%) had `ticker ∉ QUANT_SIGNAL_TICKERS` while
+   98.25% of those had real RSI in training. Concentrated in JPM/LLY/DFEN/
+   NVO/CURE. Historical impact is real but the Phase-1 fix removes this
+   class of drift for new decisions. The fix is forward-looking; the old
+   training corpus still carries it, and the deployed pickle was trained
+   on a corpus dominated by this drift.
+
+5. **Scorer predictions look directionally inverted on synthetic vectors**.
+   `predict(ml_score=2.5, rsi=70, macd=0.5, mom5=5, mom20=8, regime=bull,
+   ticker=NVDA)` → -15.53% (a bullish input maps to a bearish 5d prediction),
+   while `predict(ml_score=-2.5, rsi=30, macd=-0.5, mom5=-5, mom20=-8,
+   regime=bear, ticker=SQQQ)` → +28.27%. This corroborates the documented
+   `MLP_WORSE_THAN_TRIVIAL` verdict from `baseline_compare`. The 17-feature
+   net may be fitting noise / cross-ticker contradictions in the corpus
+   rather than learning a coherent directional signal. The Phase-1 fix
+   alone won't change this — but training on a corpus that no longer mixes
+   real-feature training rows with default-feature inference points should
+   help convergence quality of future retrains.
+
+### Counters
+
+- bugs_fixed: 1 (training/inference feature-parity for sentiment-only BUYs)
+- features_added: 1 (`buy_ticker_quant_coverage` diagnostic + 18 tests)
+- user_findings: 5 (continuous loop DEAD; scorer sub-gate; orphaned runs;
+  GAP_PRESENT verdict; inverted synthetic predictions)
+
+### How the ML decision scorer works (consolidated reference)
+
+| Layer | Where | What it does |
+|---|---|---|
+| Feature build | `paper_trader/ml/decision_scorer.py::build_features` | 17-slot vector (10 numeric + 7-way sector one-hot) per (sim_date, ticker) |
+| Training | `train_scorer(records)` | sklearn MLPRegressor `(32, 16)`, ReLU, `alpha=1e-2`, `early_stopping=True`, `n_iter_no_change=25`. Labels clamped to `±PRED_CLAMP_PCT=50`. Sample weights from run-quality + LLM annotation |
+| Prediction | `DecisionScorer.predict` / `predict_with_meta` | Loads pickle, applies scaler, predicts, clamps to ±50, surfaces `off_distribution` flag |
+| Gate | `paper_trader/backtest.py::_ml_decide` | Only modulates BUY conviction (`×0.6 / ×0.85 / unchanged / ×1.15 / ×1.3`) when `is_trained AND n_train >= 500 AND not off_distribution` |
+| Cycle wiring | `run_continuous_backtests.py::_train_decision_scorer` | Per cycle: 80/20 temporal split → train → reload → OOS metrics (RMSE, dir_acc, rank_IC, BUY/SELL split, 10d/20d horizons) → append `scorer_skill_log.jsonl` |
+
+### How to run backtests manually
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Continuous loop (long-lived; one window per cycle, retrains scorer)
+python3 run_continuous_backtests.py
+
+# One-shot (10 parallel runs over hardcoded BacktestEngine window)
+python3 run_backtests.py
+```
+
+### How to interpret backtest results
+
+- `total_return_pct` per run is over the full random window (1–10 years).
+- `vs_spy_pct = total_return_pct - spy_return_pct` is alpha. A
+  `benchmark_unavailable` `notes` field means SPY series was empty or
+  degenerate for the window — `vs_spy_pct` is NOT a valid benchmark there.
+- The continuous loop's persona dispatch maps `run_id` to one of 10
+  personas via `((run_id - 1) % 10) + 1`. Same persona on different windows
+  reveals robustness; same window on different personas reveals
+  persona-specific edge.
+
+### Test commands for the ML/backtest domain
+
+```bash
+# Targeted ML/backtest tests (this hybrid pass — fast, ~25s)
+python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+    tests/test_continuous.py tests/test_ml_backtest_review.py \
+    tests/test_ml_backtest_word_boundary.py tests/test_ml_backtest_seams.py \
+    tests/test_buy_ticker_quant_coverage.py tests/test_feature_coverage.py
+
+# Just the new diagnostic
+python3 -m pytest tests/test_buy_ticker_quant_coverage.py -v
+
+# Full suite (~25 min under load; per-CLAUDE.md memory)
+python3 -m pytest tests/ -v
+```
+
+### Invariants reaffirmed by this pass
+
+- Invariant #5 (gate engages at `n_train >= 500`) — unchanged. The fix
+  changes only the feature vector fed to the scorer at inference; the
+  gate predicate is byte-identical.
+- Invariant #2 (backtest articles carry `urgency=0`) — unchanged.
+- Invariant #12 (live risk has no hard limits) — out of scope for this
+  pass; not touched.
+- Training/inference feature parity (new explicit invariant locked by
+  `TestBuyTickerQuantFeatureParity`): `q_buy = quant.get(buy_ticker, {})`
+  in `_ml_decide` must NOT yield `{}` for any ticker whose
+  `_compute_technical_indicators` would succeed at `sim_date`.
+
+---
+
 ## 2026-05-21 paper-trader-core HYBRID pass (Agent 1, late session)
 
 **Phase 1 — bug fix (bugs_fixed: 1).** `host_guard` CLI silently
