@@ -971,6 +971,271 @@ def _decision_paralysis_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _cash_redeployment_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/cash-redeployment-latency-skill` (post-SELL
+    cash-to-next-BUY latency distribution; the sold-then-sat pathology) as
+    compact chat-context lines.
+
+    The chat already carries idle-cash snapshots (the `/api/risk` cash_pct in
+    the portfolio block) and a point-in-time conviction-vs-cash fit, but no
+    block surfaces the *interval-distribution* question: when the desk SELLs,
+    how long does the freed capital sit before it's working again? A book that
+    sells into a thesis weakening then sits for 5 days has the same headline
+    cash_pct as one that redeploys in 6h — the desk in question is materially
+    different. This is the chat-side surface for the existing builder.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is the
+    chat headline — no chat-side re-derived verdict (the
+    ``_decision_paralysis_chat_lines`` precedent). Detail line restates the
+    builder's *own* `stats` fields (median, p25/p75 latency, n_stalled,
+    total_freed_usd) — never a recomputation.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - non-actionable verdicts (``FAST_REDEPLOY`` / ``STEADY`` / ``NO_DATA``)
+      → ``[]``: a healthy redeployment cadence is silence, matching the
+      ``_decision_paralysis_chat_lines`` silence precedent — never chat
+      filler when capital is moving fine
+    - actionable verdicts (``SLOW`` / ``STALLED``) → builder's verbatim
+      ``headline`` (only when a usable string) + one detail line composed
+      from `stats` (the ``_macro_calendar_chat_lines`` precedent); a missing
+      field degrades silently rather than raises (the
+      ``_paper_trader_position_lines`` precedent)
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"SLOW", "STALLED"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    stats = rep.get("stats") if isinstance(rep.get("stats"), dict) else {}
+    median_h = _num(stats.get("median_latency_h"))
+    p25_h = _num(stats.get("p25_latency_h"))
+    p75_h = _num(stats.get("p75_latency_h"))
+    n_stalled = _num(stats.get("n_stalled"))
+    n_classifiable = _num(stats.get("n_classifiable"))
+    total_freed = _num(stats.get("total_freed_usd"))
+    total_redep = _num(stats.get("total_redeployed_usd"))
+
+    detail_parts: list[str] = []
+    if median_h is not None and p25_h is not None and p75_h is not None:
+        detail_parts.append(
+            f"latency p25/median/p75 = {p25_h:.1f}/{median_h:.1f}/{p75_h:.1f}h"
+        )
+    elif median_h is not None:
+        detail_parts.append(f"median latency {median_h:.1f}h")
+    if (n_stalled is not None and n_classifiable is not None
+            and n_stalled > 0):
+        detail_parts.append(
+            f"{int(n_stalled)}/{int(n_classifiable)} SELLs never redeployed")
+    if total_freed is not None and total_redep is not None and total_freed > 0:
+        idle = total_freed - total_redep
+        if idle > 0:
+            detail_parts.append(f"${idle:,.0f} freed but unworked")
+
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    return lines
+
+
+def _decision_vapor_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/decision-vapor-skill` (per-FILLED-decision
+    grounded-reasoning detector — SPECIFIC / SEMI / VAPOR) as compact
+    chat-context lines.
+
+    The chat already carries the *what* of recent decisions (the trader
+    snapshot, recent trades) but nothing answers the structural-quality
+    question: are the FILLED decisions grounded in concrete numbers +
+    catalysts + tickers, or has Opus been writing generic vapor? A vapor
+    trade that fails has nothing for the next decision to learn from. This
+    surfaces the gate-level honesty so the analyst can answer "is the bot
+    thinking, or rationalising?"
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is the
+    chat headline. When verdict is ``VAPOR_DECISIONS`` and a VAPOR sample is
+    available, the sample excerpt is surfaced **verbatim** — no chat-side
+    paraphrase. The ``_decision_paralysis_chat_lines`` precedent.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - non-actionable verdicts (``SPECIFIC`` / ``NO_DATA``) → ``[]``: a
+      grounded decision pool is silence, matching the
+      ``_decision_paralysis_chat_lines`` silence precedent — never chat
+      filler when reasoning is fine
+    - actionable verdicts (``MIXED`` / ``VAPOR_DECISIONS``) → builder's
+      verbatim ``headline`` (only when a usable string) + one detail line
+      from `stats`; ``VAPOR_DECISIONS`` additionally surfaces one verbatim
+      VAPOR sample excerpt (if any), the `_thesis_drift_chat_lines`
+      drift_reasons precedent for verbatim-passthrough rendering
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"MIXED", "VAPOR_DECISIONS"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    stats = rep.get("stats") if isinstance(rep.get("stats"), dict) else {}
+    n_filled = _num(stats.get("n_filled"))
+    n_specific = _num(stats.get("n_specific"))
+    n_semi = _num(stats.get("n_semi"))
+    n_vapor = _num(stats.get("n_vapor"))
+
+    detail_parts: list[str] = []
+    if n_filled is not None and n_filled > 0:
+        bits = []
+        if n_specific is not None:
+            bits.append(f"{int(n_specific)} SPECIFIC")
+        if n_semi is not None:
+            bits.append(f"{int(n_semi)} SEMI")
+        if n_vapor is not None:
+            bits.append(f"{int(n_vapor)} VAPOR")
+        if bits:
+            detail_parts.append(
+                f"{int(n_filled)} FILLED: " + " / ".join(bits))
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    # For VAPOR_DECISIONS, surface one VAPOR exemplar so the analyst can see
+    # what the bot is actually saying when reasoning collapses.
+    if verdict == "VAPOR_DECISIONS":
+        samples = rep.get("samples")
+        if isinstance(samples, list):
+            for s in samples:
+                if not isinstance(s, dict):
+                    continue
+                if s.get("klass") != "VAPOR":
+                    continue
+                excerpt = s.get("excerpt")
+                action = s.get("action_taken")
+                if isinstance(excerpt, str) and excerpt.strip():
+                    head = f"e.g. {action}: " if isinstance(action, str) else "e.g. "
+                    lines.append(f"  {head}{excerpt.strip()}")
+                    break
+
+    return lines
+
+
+def _regime_leverage_fit_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/regime-leverage-fit-skill` (book-leverage
+    alignment vs prevailing SPY momentum regime) as compact chat-context
+    lines.
+
+    The watchlist is leveraged-ETF-heavy (TQQQ / SOXL / SQQQ / SOXS / SPXL /
+    SPXS), so the analyst's single highest-stakes structural question is
+    "are we positioned with or against the regime?" The chat carries no
+    block that answers this — the portfolio block reports leveraged_pct as a
+    scalar, but the *fit* (lev% × regime sign × flow direction) is what
+    actually matters. A 0% leveraged book during a bull tape is just as
+    structurally wrong as a 40% leveraged book during a bear — both are
+    fightable in chat, neither shows up as a discrete signal anywhere else.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is the
+    chat headline — no chat-side re-derived verdict (the
+    ``_decision_paralysis_chat_lines`` precedent). Detail line restates the
+    builder's *own* fields (regime, spy_mom_20d, leveraged_pct, recent flow)
+    — never a recomputation.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - non-actionable verdicts (``ALIGNED`` / ``DEFENSIVE`` / ``NEUTRAL`` /
+      ``NO_DATA``) → ``[]``: a regime-fit book is silence, matching the
+      ``_decision_paralysis_chat_lines`` silence precedent — never chat
+      filler when the structural tilt is fine
+    - actionable verdicts (``BLIND_LEVERING`` / ``DANGEROUS_HEADWIND`` /
+      ``MISSED_TAILWIND``) → builder's verbatim ``headline`` (only when a
+      usable string) + one detail line composed from the builder's own
+      `regime`, `spy_mom_20d`, `portfolio.leveraged_pct` and `recent_flow`
+      fields (the ``_macro_calendar_chat_lines`` precedent); a missing field
+      degrades silently rather than raises (the
+      ``_paper_trader_position_lines`` precedent)
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"BLIND_LEVERING", "DANGEROUS_HEADWIND", "MISSED_TAILWIND"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    regime = rep.get("regime") if isinstance(rep.get("regime"), str) else None
+    spy_mom = _num(rep.get("spy_mom_20d"))
+    portfolio = (rep.get("portfolio")
+                 if isinstance(rep.get("portfolio"), dict) else {})
+    lev_pct = _num(portfolio.get("leveraged_pct"))
+    lev_usd = _num(portfolio.get("leveraged_usd"))
+    n_lev_positions = _num(portfolio.get("n_leveraged_positions"))
+    flow = (rep.get("recent_flow")
+            if isinstance(rep.get("recent_flow"), dict) else {})
+    buy_flow_pct = _num(flow.get("buy_flow_pct"))
+    sell_flow_pct = _num(flow.get("sell_flow_pct"))
+    flow_window = _num(flow.get("window_hours"))
+
+    detail_parts: list[str] = []
+    bits = []
+    if regime is not None:
+        bits.append(f"regime={regime}")
+    if spy_mom is not None:
+        bits.append(f"spy_mom_20d={spy_mom:.2f}%")
+    if bits:
+        detail_parts.append(" / ".join(bits))
+    lev_bits = []
+    if lev_pct is not None:
+        lev_bits.append(f"leveraged={lev_pct}%")
+    if lev_usd is not None and lev_usd > 0:
+        lev_bits.append(f"${lev_usd:,.0f}")
+    if n_lev_positions is not None and n_lev_positions > 0:
+        lev_bits.append(f"{int(n_lev_positions)} pos")
+    if lev_bits:
+        detail_parts.append(" ".join(lev_bits))
+    flow_bits = []
+    if buy_flow_pct is not None and buy_flow_pct > 0:
+        flow_bits.append(f"lev BUY flow {buy_flow_pct}%")
+    if sell_flow_pct is not None and sell_flow_pct > 0:
+        flow_bits.append(f"lev SELL flow {sell_flow_pct}%")
+    if flow_bits and flow_window is not None:
+        detail_parts.append(
+            " ".join(flow_bits) + f" ({flow_window:g}h)")
+    elif flow_bits:
+        detail_parts.append(" ".join(flow_bits))
+
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    return lines
+
+
 def _thesis_drift_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/thesis-drift` (every open position re-tested
     against the verbatim reason it was opened for, graded INTACT / WEAKENING /
@@ -4029,6 +4294,80 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: decision-paralysis fetch failed: %s", e)
 
+        # Post-SELL cash-redeployment latency — the sold-then-sat pathology.
+        # /api/risk reports cash_pct as a *snapshot*, but a book that sells
+        # into a thesis weakening then sits for 5 days has the same headline
+        # cash% as one that redeploys in 6h. The chat block fires ONLY on
+        # SLOW / STALLED (FAST_REDEPLOY, STEADY, NO_DATA collapse to silence
+        # — the _decision_paralysis_chat_lines silence precedent). Composed
+        # verbatim by the pure _cash_redeployment_chat_lines helper
+        # (unit-tested; SSOT — the builder's own `headline` is the chat
+        # headline, no re-derived verdict). Guarded 3s read; only appears
+        # once :8090 is restarted onto /api/cash-redeployment-latency-skill.
+        cash_redeployment_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/cash-redeployment-latency-skill",
+                    timeout=3) as resp:
+                _crl = json.loads(resp.read().decode("utf-8"))
+            cash_redeployment_block = "\n".join(
+                _cash_redeployment_chat_lines(_crl))
+        except Exception as e:
+            _logger().warning(
+                "chat: cash-redeployment-latency fetch failed: %s", e)
+
+        # Decision-vapor (reasoning grounded-ness) — does Opus cite specific
+        # numbers + catalysts + tickers, or is FILLED reasoning generic
+        # "strong setup, building position" vapor? A vapor trade that fails
+        # has nothing for the next decision to learn from. Block fires ONLY
+        # on MIXED / VAPOR_DECISIONS (SPECIFIC / NO_DATA collapse to silence
+        # — the _decision_paralysis_chat_lines silence precedent). VAPOR_
+        # DECISIONS additionally surfaces ONE verbatim VAPOR sample excerpt
+        # so the analyst sees what the bot is actually saying when reasoning
+        # collapses. Composed verbatim by the pure _decision_vapor_chat_lines
+        # helper (unit-tested; SSOT — the builder's own `headline` is the
+        # chat headline, no re-derived verdict). Guarded 3s read; only
+        # appears once :8090 is restarted onto /api/decision-vapor-skill.
+        decision_vapor_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/decision-vapor-skill",
+                    timeout=3) as resp:
+                _dv = json.loads(resp.read().decode("utf-8"))
+            decision_vapor_block = "\n".join(
+                _decision_vapor_chat_lines(_dv))
+        except Exception as e:
+            _logger().warning(
+                "chat: decision-vapor fetch failed: %s", e)
+
+        # Regime-leverage fit — the watchlist is leveraged-ETF-heavy (TQQQ /
+        # SOXL / SQQQ / SOXS / SPXL / SPXS), so the structural question
+        # "are we positioned with or against the regime?" is high-stakes
+        # and not answered anywhere else in chat. Portfolio block reports
+        # leveraged_pct as a scalar, but the *fit* (lev% × regime × flow)
+        # is what actually matters. Block fires ONLY on BLIND_LEVERING /
+        # DANGEROUS_HEADWIND / MISSED_TAILWIND (ALIGNED / DEFENSIVE /
+        # NEUTRAL / NO_DATA collapse to silence — the _decision_paralysis_
+        # chat_lines silence precedent). Composed verbatim by the pure
+        # _regime_leverage_fit_chat_lines helper (unit-tested; SSOT — the
+        # builder's own `headline` is the chat headline, no re-derived
+        # verdict). Guarded 3s read; only appears once :8090 is restarted
+        # onto /api/regime-leverage-fit-skill.
+        regime_leverage_fit_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/regime-leverage-fit-skill",
+                    timeout=3) as resp:
+                _rlf = json.loads(resp.read().decode("utf-8"))
+            regime_leverage_fit_block = "\n".join(
+                _regime_leverage_fit_chat_lines(_rlf))
+        except Exception as e:
+            _logger().warning(
+                "chat: regime-leverage-fit fetch failed: %s", e)
+
         # "What materially changed since you last looked" — the one temporal-
         # change view. Every sub-fetch above is a current-state snapshot; this
         # lets the chat answer "what happened while I was away / since I last
@@ -4216,6 +4555,9 @@ def create_app(store=None) -> Flask:
             + (f"MACRO CALENDAR — FOMC RATE DECISION (the single biggest MARKET-WIDE event; it moves the whole book at once, leveraged ETFs most violently — surfaced only when one is actually within the 14d horizon):\n{macro_calendar_block}\n\n" if macro_calendar_block else "")
             + (f"PAPER TRADER — EVENT READINESS (will the live trader actually be able to react before the next earnings print? Joins earnings-risk + decision-velocity + Claude-empty rate + the *current* NO_DECISION streak into a single per-event verdict — surfaced ONLY when BLIND / DEGRADED / IMMINENT_OVERDUE, never as filler when the pipeline is healthy. Recommended_action carries verbatim from the trader endpoint — restate, never re-derive):\n{event_readiness_block}\n\n" if event_readiness_block else "")
             + (f"PAPER TRADER — DECISION PARALYSIS (consecutive HOLD-only / NO_DECISION runs on the live decision loop — a stacked HOLD_LOCK block reads HEALTHY on runner-heartbeat and decision-health 24h aggregate but means Opus decided every cycle and never moved the book. Surfaced ONLY when HOLD_LOCK / IDLE_STORM / PASSIVE_LOOP, never filler when ACTIVE. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{decision_paralysis_block}\n\n" if decision_paralysis_block else "")
+            + (f"PAPER TRADER — CASH REDEPLOYMENT LATENCY (post-SELL cash-to-next-BUY interval distribution — the sold-then-sat pathology. A book that sells then sits for 5 days has the same headline cash% as one that redeploys in 6h, but the desk in question is materially different. Surfaced ONLY when SLOW / STALLED, never filler when FAST_REDEPLOY / STEADY. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{cash_redeployment_block}\n\n" if cash_redeployment_block else "")
+            + (f"PAPER TRADER — DECISION VAPOR (per-FILLED-decision structural-quality detector — does the reasoning cite specific numbers + catalysts + tickers, or is Opus writing generic 'strong setup, building position' vapor? A vapor trade that fails has nothing for the next decision to learn from — this is the only block that answers 'is the bot thinking, or rationalising?'. Surfaced ONLY when MIXED / VAPOR_DECISIONS, never filler when SPECIFIC. Headline + any VAPOR sample excerpt carry verbatim from the trader endpoint — restate, never re-derive):\n{decision_vapor_block}\n\n" if decision_vapor_block else "")
+            + (f"PAPER TRADER — REGIME-LEVERAGE FIT (book-leverage alignment vs prevailing SPY momentum regime. The watchlist is leveraged-ETF-heavy — the structural question 'are we positioned with or against the regime?' is high-stakes and answered nowhere else in chat. A 0% leveraged book during a bull tape is just as structurally wrong as a 40% leveraged book during a bear. Surfaced ONLY when BLIND_LEVERING / DANGEROUS_HEADWIND / MISSED_TAILWIND, never filler when ALIGNED / DEFENSIVE / NEUTRAL. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{regime_leverage_fit_block}\n\n" if regime_leverage_fit_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "
