@@ -6,6 +6,96 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 paper-trader-core HYBRID pass (Agent 1, late session)
+
+**Phase 1 — bug fix (bugs_fixed: 1).** `host_guard` CLI silently
+under-reported the live starvation rate. The function `recent_empty_rate`
+counts only the OLD `"claude returned no response"` prefix; once the
+pre-flight `host_saturated` guard is live (which it is), starved cycles
+mostly land under the NEW `"skipped claude call …"` prefix that the old
+function misses. The already-shipped `recent_starvation_rate` correctly
+counts BOTH prefixes — but `host_guard.main()` was still wired to the
+narrower empty-rate. Operator-visible impact: CLI said `17/120 empty/
+timeout (14%)` while the real cell was `33/120 starved (28%)` — half of
+the actual host-starvation damage hidden. Fix: CLI text shows both legs
+(`33/120 never reached Opus (28%) — 17 empty/timeout + 16 skipped (host
+guard)`); JSON adds the `recent_starvation_rate` field; the
+`snapshot()` keys are unchanged so `test_snapshot_and_main_are_degrade_safe`
+still passes. Two new CLI text/json tests pin the wiring. Bonus:
+dropped duplicate `"NO"` and `"SO"` literals in
+`signals._NOT_TICKERS` (a set deduplicates at runtime but the duplicate
+source tokens were a maintenance smell); added a regression test that
+fails on any new duplicate. Commit `5219379`.
+
+**Phase 2 — feature (features_added: 1).**
+`host_guard.recent_starvation_by_cause` + CLI breakdown — the
+operator-actionable per-class cell inside the aggregate starvation
+figure. Each starvation class needs a DIFFERENT response (see the
+`_CAUSE_LABELS` docstring): `model_timeout` (Opus wedged on the wire,
+may self-resolve as load drops) vs `cli_nonzero_rc` (Anthropic API /
+CLI transient) vs `host_skip` (pre-flight guard correctly declined the
+call, operator must reduce parallel Opus) vs `model_empty` /
+`cli_missing` / `unknown`. The aggregate alone misleads — observed
+live (2026-05-21 SATURATED state): 33/120 = 28% starved decomposes as
+**17 cli_nonzero_rc + 16 host_skip, ZERO model timeouts**. Without
+the breakdown an operator would chase "Opus wedging"; the real story
+is Anthropic-side CLI errors plus the guard working correctly. Pure
+SQLite read, degrade-safe (every `_CAUSE_LABELS` key always present so
+consumers render without key-miss guards), counts reconcile to
+`starved` exactly. CLI surfaces non-zero buckets only (no
+`model_empty=0` noise on a quiet box). JSON exposes the full dict.
+Six new tests in `TestStarvationByCause`: dispatch table for every
+known cause, unknown fall-through preserves the sum, exact bucket
+counts on a seeded DB, missing-DB safe default, CLI text contains
+non-zero buckets, CLI omits the line on a clean box. Commit `586e180`.
+
+**Phase 3 — live validation (user_findings: 6).**
+1. **Host SATURATED right now** (load1 17.5, opus_count 7, swap 83%).
+   Recent-skip rate 27.5%; documented #1 pathology
+   (`pt-no-decision-host-saturation` memory). NEW from this pass: the
+   per-cause breakdown reveals **zero model timeouts** — every
+   starvation today is either Anthropic CLI nonzero_rc (17) or
+   pre-flight host_skip (16). Operator should reduce parallel Opus,
+   NOT restart the trader.
+2. **Runner UNSUPERVISED_STALE** — `ppid=1` (orphaned manual launch),
+   `systemctl --user` reports `"Failed to connect to bus: No medium
+   found"` (user bus unavailable). Verdict: NO restart safety net;
+   any clean exit (git-watcher restart, deadman, circuit breaker)
+   leaves the trader DOWN permanently. The recommendation is exact:
+   `systemctl --user enable --now paper-trader`. Documented #1
+   recurring HIGH finding (`pt-systemd-vs-manual-restart-spam`).
+3. **SINGLE_NAME_RISK** — NVDA 100% of stock book; 66% of total
+   `$1011.95` book. Beyond the 60% `DOMINANT_WEIGHT` threshold —
+   `_concentration_line` should be lighting up Discord on the next
+   hourly. Recent trade history shows the desk SOLD a 4.5-share
+   position into earnings (good discipline), then re-bought
+   smaller — single name is the *current* exposure, not a
+   stuck-in-loser.
+4. **Beating SPY +0.79pp** (`$1011.95` vs `$1004.01` index-only).
+   Ahead in 70% of 233 cycles. Despite the host-sat state, the
+   alpha is real — the trader is making good calls when it gets to
+   decide.
+5. **Discord delivery HEALTHY**, last_ok 5min ago. Equity freshness
+   FRESH (curve == live book). Singleton lock ACQUIRED.
+   `/api/empty-claude-rate` verdict HEALTHY despite the storm — the
+   12.4% empty-rate alone is misleading without the breakdown
+   feature shipped above; it'd read ~28% if it folded in host_skip.
+6. The new git-watcher restart cycle works as designed — within
+   3min of the Phase 1 push, runner self-restarted onto `5219379`
+   (confirmed via boot_sha). Confidence the auto-deploy plumbing
+   is live for ops fixes.
+
+**Phase 4 — final verify**: `tests/test_host_guard.py` 33 passed
+(8 new across both phases), `tests/test_core_signals.py` + core
+suite green. Focused subset finishes in <20s. Full suite ~25min per
+memory (`pt-test-suite-timing`); focused -k filter is the gate.
+
+**Counters:** bugs_fixed=1 (host_guard CLI starvation under-count) ·
+features_added=1 (recent_starvation_by_cause + CLI breakdown) ·
+user_findings=6.
+
+---
+
 ## 2026-05-21 feature-dev pass (Agent 4) — `/api/cash-redeployment-latency-skill` + `/api/decision-vapor-skill`
 
 Two new observational skills that answer questions none of the existing
