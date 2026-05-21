@@ -591,6 +591,41 @@ def _kill_stale_claude():
             print(f"[runner] circuit breaker: pkill {pattern!r} failed: {e}")
 
 
+def _open_position_tickers_for_interval(store) -> list[dict]:
+    """``[{ticker: T}, ...]`` for ``compute_interval`` from the singleton store.
+
+    Previously the main loop opened its OWN raw sqlite connection (no WAL pragma,
+    no busy_timeout, missing the schema-true ``qty > 0`` filter that
+    ``store.open_positions()`` always applies) to feed ``dynamic_interval``.
+    Two real problems with that:
+
+      * a duplicated reader connection competes with the singleton store for
+        the WAL lock and is not subject to its 30s ``busy_timeout`` — under
+        contention it raised ``database is locked`` and the ``except: pass``
+        below silently degraded the dynamic-interval calc to "0 positions",
+        making a real held earnings day read as MARKET_CLOSED.
+      * a closed lot whose ``closed_at`` had not yet been written (a torn
+        ``upsert_position`` mid-crash; rare but possible) would still satisfy
+        ``WHERE closed_at IS NULL`` even though ``qty=0`` — silently inflating
+        the held set with a row that has no actual exposure.
+
+    Using ``store.open_positions()`` fixes both: same lock, same ``qty > 0``
+    filter, same WAL/busy_timeout discipline. Any store fault degrades to
+    ``[]`` (the dynamic-interval calc's documented "fall back to MARKET_OPEN
+    or MARKET_CLOSED" path), never an exception — invariant: this helper
+    never raises, mirroring the original inline ``try/except``.
+    """
+    try:
+        return [
+            {"ticker": p.get("ticker")}
+            for p in store.open_positions()
+            if p.get("ticker")
+        ]
+    except Exception as e:
+        print(f"[runner] open-position read for interval failed: {e}")
+        return []
+
+
 def _cycle():
     global _consecutive_no_decisions, _quota_alert_active
     summary = strategy.decide()
@@ -755,17 +790,7 @@ def main():
             os._exit(0)
 
         market_open = market.is_market_open()
-        current_positions: list[dict] = []
-        try:
-            import sqlite3 as _sq
-            _conn = _sq.connect(str(DB_PATH))
-            current_positions = [
-                {"ticker": r[0]} for r in
-                _conn.execute("SELECT ticker FROM positions WHERE closed_at IS NULL").fetchall()
-            ]
-            _conn.close()
-        except Exception:
-            pass
+        current_positions = _open_position_tickers_for_interval(store)
         sleep_s = compute_interval(current_positions)
         print(f"[runner] sleeping {sleep_s}s (market_open={market_open})")
         _restart_requested.wait(timeout=sleep_s)

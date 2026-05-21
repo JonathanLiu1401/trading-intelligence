@@ -895,3 +895,92 @@ class TestRecheckSingletonLock:
         st = runner.singleton_lock_state()
         assert st == {"status": "acquired", "holder_pid": 4242,
                       "have_lock": True, "degraded": False}
+
+
+class TestOpenPositionTickersForInterval:
+    """``_open_position_tickers_for_interval`` replaces an inline raw-sqlite
+    read in ``main()``. It must:
+      * shape-match what ``compute_interval`` expects: list of dicts each
+        having a ``ticker`` field
+      * use ``store.open_positions()`` so the same WAL/qty>0/lock discipline
+        applies (no duplicated reader connection, no closed-but-not-yet-marked
+        rows leaking through)
+      * never raise — a store fault must degrade to ``[]`` so the next sleep
+        still fires (the original inline ``except: pass`` contract).
+    """
+
+    def test_returns_list_of_ticker_dicts(self):
+        class _StubStore:
+            def open_positions(self):
+                return [
+                    {"ticker": "NVDA", "qty": 2.0, "type": "stock",
+                     "avg_cost": 100.0},
+                    {"ticker": "MU", "qty": 1.0, "type": "stock",
+                     "avg_cost": 200.0},
+                ]
+        out = runner._open_position_tickers_for_interval(_StubStore())
+        # Exact shape: only the ticker field is forwarded (compute_interval
+        # uses it; the other position fields are private to the store).
+        assert out == [{"ticker": "NVDA"}, {"ticker": "MU"}]
+
+    def test_empty_store_returns_empty_list(self):
+        class _StubStore:
+            def open_positions(self):
+                return []
+        assert runner._open_position_tickers_for_interval(_StubStore()) == []
+
+    def test_store_exception_degrades_to_empty_not_raise(self, capsys):
+        class _StubStore:
+            def open_positions(self):
+                raise RuntimeError("database is locked")
+        out = runner._open_position_tickers_for_interval(_StubStore())
+        # Degrades to "no positions held" (compute_interval falls back to
+        # the weekday/hour MARKET_OPEN/CLOSED default) rather than aborting
+        # the main loop.
+        assert out == []
+        # And the failure is logged so an operator can diagnose, not silent.
+        assert "open-position read for interval failed" in capsys.readouterr().out
+
+    def test_filters_rows_with_missing_ticker(self):
+        # A defensive row with no ticker key (or empty ticker) must be dropped —
+        # compute_interval keys off ``ticker`` and a row with ``ticker=None``
+        # would silently leak as "an unnamed held position", which neither the
+        # earnings-held check nor the position-density branch could match.
+        class _StubStore:
+            def open_positions(self):
+                return [
+                    {"ticker": "NVDA"},
+                    {"ticker": None},
+                    {"ticker": ""},
+                    {"qty": 1.0},  # no ticker key at all
+                    {"ticker": "MU"},
+                ]
+        out = runner._open_position_tickers_for_interval(_StubStore())
+        assert out == [{"ticker": "NVDA"}, {"ticker": "MU"}]
+
+    def test_uses_store_open_positions_not_raw_sqlite(self, monkeypatch):
+        # Locks down: the helper goes through store.open_positions() (which
+        # applies WAL + qty>0 + busy_timeout) rather than the legacy raw
+        # ``SELECT ticker FROM positions WHERE closed_at IS NULL`` that
+        # bypassed all of that. If a future refactor reintroduced a raw
+        # sqlite3.connect path, this test would fail because the stub never
+        # opens one.
+        called = {"open_positions": 0}
+
+        class _StubStore:
+            def open_positions(self):
+                called["open_positions"] += 1
+                return [{"ticker": "SPY"}]
+
+        # Sentinel: any sqlite3.connect call from inside the helper would
+        # fail loudly.
+        import sqlite3 as _sqlite3
+        def _no_raw_connect(*a, **k):
+            raise AssertionError(
+                "helper must use store.open_positions(), not raw sqlite"
+            )
+        monkeypatch.setattr(_sqlite3, "connect", _no_raw_connect)
+
+        out = runner._open_position_tickers_for_interval(_StubStore())
+        assert out == [{"ticker": "SPY"}]
+        assert called["open_positions"] == 1
