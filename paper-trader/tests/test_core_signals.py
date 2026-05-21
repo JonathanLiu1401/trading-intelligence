@@ -214,6 +214,51 @@ class TestExtractTickers:
         assert "CUT" in signals._extract_tickers("watching $CUT into the print")
         assert "BEAT" in signals._extract_tickers("$BEAT calls active")
 
+    def test_additional_headline_verbs_filtered(self):
+        # A second batch of finance-headline verbs / plural nouns observed
+        # live polluting the `tickers` field Opus reads (e.g. "Nvidia BLOWS
+        # PAST estimates" → tickers=BLOWS,PAST). Pin so a future trim of
+        # _NOT_TICKERS cannot silently re-introduce them while preserving
+        # the real ticker in each phrase.
+        cases = [
+            ("Nvidia BLOWS PAST Wall Street estimates", ("BLOWS", "PAST"), "NVDA"),
+            ("NVDA TANKS on guidance miss", ("TANKS",), "NVDA"),
+            ("CEO TALKS UP the outlook", ("TALKS",), None),
+            ("Q3 SALES TOPPED estimates", ("SALES", "TOPPED"), None),
+            ("AMD CLIMBS in pre-market", ("CLIMBS",), "AMD"),
+            ("Tech stocks TUMBLE; chips SLIP", ("TUMBLE", "SLIP"), None),
+            ("Banks SLID as yields SOAR", ("SLID", "SOAR"), None),
+            ("Retail prints fresh LOWS", ("LOWS",), None),
+        ]
+        for phrase, false_positives, real_ticker in cases:
+            out = signals._extract_tickers(phrase)
+            for fp in false_positives:
+                assert fp not in out, (
+                    f"{fp!r} should be filtered from {phrase!r}; "
+                    f"got {sorted(out)!r}"
+                )
+            if real_ticker is not None:
+                assert real_ticker in out, (
+                    f"{real_ticker!r} should still be extracted from "
+                    f"{phrase!r}; got {sorted(out)!r}"
+                )
+
+    def test_new_noise_words_cashtag_still_overrides(self):
+        # The cashtag asymmetry must hold for the new entries too — a
+        # deliberate $TANKS / $SLIP is kept even though the bare token is
+        # now filtered. (No collision with a real ticker; this only pins
+        # that the bare-token filter does not leak into the cashtag path.)
+        assert "TANKS" in signals._extract_tickers("eyeing $TANKS today")
+        assert "SLIP" in signals._extract_tickers("$SLIP momentum building")
+
+    def test_real_low_volume_tickers_not_collateral_damaged(self):
+        # ME / REAL / CHIP / BIRD are genuine listed tickers deliberately
+        # NOT added to the noise filter — a bare-ALLCAPS mention still
+        # surfaces them (the OPEN / LOW precedent). Pin the trade-off so a
+        # future "cleanup" does not silently blind the trader to them.
+        assert "REAL" in signals._extract_tickers("REAL beats on subscriber growth")
+        assert "CHIP" in signals._extract_tickers("CHIP lifts full-year guidance")
+
 
 class TestTickerAliasExtraction:
     """Locks the company-name → ticker alias path. A headline that names a
