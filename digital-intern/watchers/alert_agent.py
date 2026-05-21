@@ -364,14 +364,27 @@ _RT_MARKET_TODAY = re.compile(
     r"dec(?:ember)?)\s+\d{1,2}\b",
     re.IGNORECASE,
 )
-# "Q1 2026 Earnings Call Highlights" — GuruFocus / Seeking Alpha transcript-
-# summary template. The call already happened; this is recap, not breaking.
-# Substring (not anchored) — the template appears mid-headline ("D-Wave
-# Quantum Inc (QBTS) Q1 2026 Earnings Call Highlights: ..."). Quarter and
-# year are bounded so a normal earnings preview doesn't match.
+# "Q1 2026 Earnings Call Highlights" / "Q1 Earnings Call Highlights" /
+# "Q1 2027 Earnings Transcript" — GuruFocus / Seeking Alpha / Globe-and-Mail
+# transcript-summary template. The call already happened; this is recap, not
+# breaking. Substring (not anchored) — the template appears mid-headline
+# ("D-Wave Quantum Inc (QBTS) Q1 2026 Earnings Call Highlights: ...").
+#
+# Live evidence (2026-05-20, NVDA earnings day): the prior form REQUIRED
+# both a year ``20\d{2}`` *and* the literal ``call`` between earnings and
+# the recap noun, so two recap variants leaked through and fired BREAKING:
+#   - "NVIDIA Q1 Earnings Call Highlights"            (no year)
+#   - "Nvidia (NVDA) Q1 2027 Earnings Transcript - The Globe and Mail"
+#                                                     (no "Call")
+# Year and the "call " bridge are now BOTH optional; the discriminator stays
+# the recap-noun list ``highlights|recap|takeaways|transcript|summary|review``.
+# Validated against the must-survive corpus: forward-looking titles
+# ("Q1 Earnings Preview", "Q3 2026 earnings preview", "Nvidia Q1 beats
+# estimates", "NVDA Q2 2026 earnings call begins at 5pm ET") are NOT caught
+# because they lack any recap-noun terminator.
 _RT_EARNINGS_CALL = re.compile(
-    r"\bq[1-4]\s*20\d{2}\s+earnings\s+call\s+(?:highlights|recap|takeaways|"
-    r"transcript|summary)\b",
+    r"\bq[1-4](?:\s*(?:fy\s*)?20\d{2})?\s+earnings\s+(?:call\s+)?"
+    r"(?:highlights|recap|takeaways|transcript|summary|review)\b",
     re.IGNORECASE,
 )
 # "Here['s|is] What the Street Thinks About <X>" — InsiderMonkey opinion-

@@ -130,6 +130,68 @@ class TestHelperCatchesLiveNoise:
             assert hit, f"missed earnings-call recap: {t!r}"
             assert name == "earnings_call_recap"
 
+    def test_earnings_call_recap_widened_variants(self):
+        """Live evidence (2026-05-20, NVDA earnings night): the prior regex
+        REQUIRED both a year ``20\\d{2}`` AND the literal ``call`` between
+        ``earnings`` and the recap-noun, so two retrospective variants leaked
+        through the gate and the urgency head over-scored them into the
+        🚨 BREAKING channel. Pin each live failure-case title by the exact
+        string so a future tightening that re-admits them fails this suite.
+
+        Variant A — no year, still has ``Earnings Call Highlights``:
+          - "NVIDIA Q1 Earnings Call Highlights"
+        Variant B — has year, but ``Earnings Transcript`` (no ``Call`` bridge):
+          - "Nvidia (NVDA) Q1 2027 Earnings Transcript - The Globe and Mail"
+        """
+        for t in (
+            # Variant A — no year (NVIDIA repeated this exact title on
+            # several syndicated feeds 2026-05-21 night).
+            "NVIDIA Q1 Earnings Call Highlights",
+            "MU Q3 Earnings Call Highlights",
+            "Lumentum Q2 Earnings Call Recap",
+            # Variant B — year, but no "Call" between Earnings and recap-noun
+            # (Globe-and-Mail / Seeking Alpha transcript syndications).
+            "Nvidia (NVDA) Q1 2027 Earnings Transcript - The Globe and Mail",
+            "Micron Technology (MU) Q3 2026 Earnings Transcript",
+            "AMD Q4 2025 Earnings Summary",
+            "AXT Inc (AXTI) Q4 2025 Earnings Recap",
+            # Combined: no year AND no Call.
+            "Nvidia Q1 Earnings Transcript",
+            "MSFT Q2 Earnings Summary",
+            # FY-prefixed quarter form ("FY27Q1" / "Q1 FY2027") still works.
+            "Nvidia Q1 FY2027 Earnings Call Highlights",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed widened earnings recap: {t!r}"
+            assert name == "earnings_call_recap"
+
+    def test_earnings_recap_widened_does_not_catch_real_news(self):
+        """The widened ``_RT_EARNINGS_CALL`` must NEVER catch forward-looking
+        previews, breaking earnings beats/misses, or mid-sentence references
+        — otherwise the gate would suppress real news during earnings week.
+
+        These come from the must-survive corpus and represent the kinds of
+        headlines an analyst actually wants pushed."""
+        for t in (
+            # Forward-looking previews — explicit "preview" terminator.
+            "Q3 2026 earnings preview: what to expect",
+            "Q1 Earnings Preview: NVDA outlook",
+            # Breaking earnings results — no recap noun.
+            "Nvidia Q1 beats estimates",
+            "Q1 earnings come in below estimates",
+            "Nvidia Q1 earnings: revenue beats, guidance lifted",
+            "Earnings beat sends NVDA higher in pre-market",
+            "MU misses Q3 estimates, shares plunge",
+            # Earnings call upcoming — no recap noun terminator.
+            "NVDA Q2 2026 earnings call begins at 5pm ET",
+            "Nvidia Q1 earnings call tonight at 5pm",
+            # Mid-sentence year/quarter — no Earnings adjacency.
+            "Nvidia 2027 outlook brightens after Q1 call",
+            "Q1 was the best quarter for AMD earnings since 2020",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert not hit, f"widened earnings recap wrongly caught: {t!r} (name={name})"
+
     def test_here_what_the_street_thinks_opinion_mill(self):
         for t in (
             "Here What the Street Thinks About ​NVIDIA Corporation ( NVDA )",
