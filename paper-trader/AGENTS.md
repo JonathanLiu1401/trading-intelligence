@@ -6,6 +6,211 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 paper-trader-core HYBRID pass (Agent 1, ~18:30 UTC) — feed-health Discord surface
+
+Counters: `bugs_fixed=0` (honest zero) · `features_added=1` ·
+`user_findings=7`.
+
+### Phase 1 — debug
+
+No real bug surfaced after surgical pass over the seven target files
+(`runner.py`, `reporter.py`, `signals.py`, `strategy.py`, `dashboard.py`,
+`market.py`, `store.py`). Every angle I checked
+(`_active_claude_proc` reset discipline on the exception path,
+`_QUANT_CACHE` / `_PRICE_CACHE` TTL eviction bounds, `_db_resolve_cache`
+mid-read race under concurrent dashboard+runner reads,
+`_extract_tickers` boundary handling of `$F` / `$NVDA9`,
+`_window_delta` lexical-ISO comparison) already had explicit code or a
+test pin. ~30+ prior HYBRID passes have already landed surgical fixes
+here; the residual is correct.
+
+Per the Phase-1 commit guard, no Phase-1 commit was made.
+
+### Phase 2 — feat: `_feed_health_line` — Discord surface for /api/feed-health
+
+The dashboard→Discord gap one dimension over from
+`_mark_integrity_line`: when the article DB goes stale (>6h newest
+live article) OR the trader logs ≥3 consecutive 0-signal decisions
+(BLIND streak), `signal_count` is recorded `0` and a 0-signal `HOLD`
+looks identical to a deliberate one in every existing Discord
+surface. The operator-visible symptom is *"the book just HOLDs for
+hours"* with no explanation in the hourly summary — the silent-
+failure mode `analytics/feed_health.py` was built to catch but only
+exposed via `/api/feed-health`, which the operator never opens.
+
+Composes `build_feed_health` **verbatim** (single source of truth,
+invariant #10 — the headline is the builder's, never re-derived
+here, so this Discord line and `/api/feed-health` can never drift).
+Calls `signals._db_path()` for the resolved DB and
+`signals._legacy_choice()` for the existence-first legacy resolver
+(canonical split-brain comparison). Probes each candidate via
+`_feed_db_probe` (inlined locally to avoid a reporter→dashboard
+import cycle — dashboard already imports reporter) for newest live
+`first_seen` and resolved-only 2h/24h counts. Pure local filesystem
+reads — **NO network** (the `_drawdown_line` discipline).
+
+Placement (hourly + daily close): immediately after `MARK INTEGRITY`,
+before every P/L analytics block — same urgency tier ("inputs feeding
+every downstream signal are compromised"). Silent on `HEALTHY` /
+`NO_DATA` per the silence-when-nothing-actionable contract (the
+`_drawdown_line` at-high-water precedent — the summary must never
+become its own lying green light). Only `BLIND` (⚠️ FEED HEALTH ◈
+BLIND, the actionable harm) and `STALE_FEED` (⚠️ FEED HEALTH ◈
+STALE_FEED, the feed-stuck warning) surface; an explicit
+`restart_recommended` clause is appended on split-brain (the runner
+is reading the stale legacy resolution — relaunch fixes it).
+
+Failure contract: any signals / probe / builder fault degrades to
+`""` ("no feed-health line this report"), **never** an exception
+("no Discord summary this report") — the reporter additive contract
+(invariants #2/#12).
+
+20 new tests in `tests/test_core_reporter.py`:
+
+* `TestFeedHealthLine` (13): verdict-suppression on the full ladder
+  (HEALTHY/NO_DATA silent; BLIND/STALE_FEED fire), the explicit
+  `restart_recommended` clause on split-brain, builder/probe/signals
+  fault degradation paths (`signals._db_path` raises, `BrokenStore`
+  raises on `recent_decisions`, builder returns non-dict, builder
+  returns empty headline, builder raises), and **end-to-end real-
+  builder** firings on both BLIND (seeded with 4 consecutive 0-signal
+  decisions) and STALE_FEED (12h-old newest live article), plus
+  end-to-end silence on a healthy fresh feed.
+* `TestFeedDbProbe` (3): missing path returns zero shape;
+  unparseable file degrades; a real seeded articles.db with the
+  canonical live-only filter (`backtest://%` / `backtest_%` /
+  `opus_annotation%` MUST NOT read as the freshest article —
+  invariants #1/#3) — pinned by future-dated synthetic rows.
+* `TestHourlySummaryFeedHealth` (4): end-to-end hourly fires the
+  line on STALE_FEED, suppresses it on HEALTHY, hourly summary still
+  ships when the feed-health builder faults (the additive contract),
+  and the daily close fires on STALE_FEED.
+
+760 passed in the focused core suite (up from 740). Commit `3ea256f`.
+
+### Phase 3 — live validation findings (live trader ~18:30 UTC)
+
+The live trader is running PID 1103070 (manual launch; the systemd
+unit at this writing is in the documented restart-spam mode because
+the manual launch holds the flock — see the
+`pt-systemd-vs-manual-restart-spam` memory note). Boot SHA `ecfa87e`
+vs head SHA `3ea256f` — the new commit will deploy on the next
+git-watcher 3-min poll.
+
+1. **HOST SATURATED, dominant pathology**. `/api/host-guard`: 9
+   concurrent Opus (limit 4); load1=23.48 on 16 CPUs (1.47/cpu);
+   mem_available_mb 2677; swap_used_pct 83.0%. 59.2% of last 120
+   decisions never reached Opus, dominated by `host_skip` (54/120 —
+   pre-flight guard correctly declining doomed calls) + 17
+   `cli_nonzero_rc` (Anthropic-side transient CLI exits). 4 parallel
+   HYBRID agents + the continuous backtest committee + sibling
+   automation. Documented pattern, not a fresh bug — confirming the
+   #1 live pathology still bites under multi-agent load. The
+   actionable lever is `_OPS_ACTION` (reduce concurrent Opus jobs),
+   NOT a restart.
+
+2. **Single-name concentration HIGH (66.02% NVDA)**. `/api/risk`
+   reports `concentration_severity=HIGH`, `top1_ticker=NVDA` at
+   66.02% of a 1-name stock book — well over the SINGLE_NAME_RISK
+   60% threshold. Cash 33.98%. Total $1005.33 (+0.53% vs $1000
+   start). Open NVDA position $-9.40 unrealized at the probe time.
+
+3. **Discord delivery HEALTHY**. `/api/notify-health`:
+   `verdict=HEALTHY`, `consecutive_failures=0`,
+   `last_attempt_ts=2026-05-21T18:27:56` (~30s before probe), no
+   error. The shipped `openclaw` PATH fix continues to hold.
+
+4. **FEED HEALTH on the live system: HEALTHY**. `/api/feed-health`
+   verdict `HEALTHY`: newest live article 0.0h old in
+   `digital-intern/data/articles.db`; 1167 live articles in the last
+   2h, 12597 in 24h; the most-recent decision received signals. My
+   new `_feed_health_line` correctly stays silent on this state —
+   verified live by running the helper against a read-only store
+   wrapper (output: `(silent — feed HEALTHY)`). Will fire
+   automatically the moment the digital-intern pipeline stalls (the
+   real-builder STALE_FEED test pins that path).
+
+5. **NO_DECISION storm in flight**. `/api/decision-health` reports
+   41.8% of last 177 decisions as NO_DECISION; `/api/no-decision-
+   reasons` reports dominant cause `host_saturated` (91%, 42/46 of
+   the last 50 NO_DECISIONs). The trader is cycling but cannot
+   decide; pure saturation symptom, not a wedged claude CLI (the
+   auto-recovery `_kill_stale_claude` breaker doesn't help — the box
+   would just re-saturate on the next spawn). 8.4 hours since the
+   last fill (`BUY NVDA → FILLED` at 10:00 UTC).
+
+6. **Dashboard endpoints all responsive**. Probed `/api/healthz`,
+   `/api/portfolio`, `/api/risk`, `/api/decision-health`,
+   `/api/feed-health`, `/api/host-guard`, `/api/notify-health`,
+   `/api/no-decision-reasons`, `/api/decision-context`, `/api/state`.
+   All return well-formed JSON; SWR-cached endpoints surface
+   `cached: true` with sub-minute `cache_age_s` values (`/api/risk`
+   at 64s, `/api/feed-health` at 747s — past TTL, on next probe a
+   refresh fires).
+
+7. **`/api/state` shape clarification (not a bug)**. The top-level
+   `cash` / `total_value` / `last_updated` keys are NOT on the
+   `/api/state` envelope itself — they live under
+   `state["portfolio"]`. Easy to mis-probe; documenting here so the
+   next operator probe doesn't read `cash: None` and worry.
+
+### How to run this pass's tests
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_core_reporter.py -v \
+    -k "FeedHealth or FeedDbProbe"             # 20 tests, <15s
+python3 -m pytest tests/test_core_*.py -q       # full core slice, ~70s
+```
+
+### How to probe the feature live
+
+```bash
+# Dashboard endpoint (already exists pre-feature)
+curl -s http://localhost:8090/api/feed-health | python3 -m json.tool
+
+# The new Discord line will land in the next hourly / daily summary.
+# To exercise the function directly (read-only against the live DB):
+python3 -c "
+import sys, sqlite3
+sys.path.insert(0, '/home/zeph/trading-intelligence/paper-trader')
+from paper_trader import reporter
+class _S:
+    def recent_decisions(self, limit=3000):
+        conn = sqlite3.connect(
+            'file:/home/zeph/trading-intelligence/paper-trader/data/'
+            'paper_trader.db?mode=ro', uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute(
+                'SELECT * FROM decisions ORDER BY id DESC LIMIT ?',
+                (limit,)).fetchall()]
+        finally:
+            conn.close()
+print(reporter._feed_health_line(_S()) or '(silent — HEALTHY)')
+"
+```
+
+### Invariants reaffirmed by this pass
+
+- `_feed_health_line` composes `build_feed_health` verbatim — single
+  source of truth (invariant #10) with `/api/feed-health`. Same
+  candidate-resolution order, same legacy comparator, same canonical
+  live-only filter.
+- Reporter additive contract (invariants #2/#12): any
+  builder/probe/signals fault degrades to `""`, never crashes the
+  whole hourly/daily summary.
+- Silence-when-nothing-actionable: HEALTHY / NO_DATA stay silent —
+  the summary must never become its own lying green light (the
+  `_drawdown_line` at-high-water precedent).
+- The `_feed_db_probe` helper is intentionally **duplicated** between
+  reporter.py and dashboard.py to avoid a circular import
+  (dashboard already imports reporter — the inverse direction is
+  load-bearing). Future refactor option: move into `signals.py` as a
+  shared probe, deferred to keep this pass surgical.
+
+---
+
 ## 2026-05-21 feature pass (Agent 4 — feature-dev) — cost-basis ladder + catalyst-expiry
 
 Two new observational endpoints surfacing structural reads no
