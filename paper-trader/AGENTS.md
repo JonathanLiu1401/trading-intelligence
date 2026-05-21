@@ -16286,3 +16286,169 @@ curl -s http://localhost:8090/api/host-guard \
   | python3 -m json.tool | grep -A 20 starvation_by_cause
 ```
 
+
+## 2026-05-21 paper-trader-core HYBRID pass (Agent 1, ~15:33 UTC)
+
+Counters: `bugs_fixed=1` · `features_added=1` · `user_findings=5`.
+
+### Phase 1 — fix: stale_mark drop in hourly/daily reporter
+
+`store.open_positions()` reads the positions TABLE, whose schema has **no
+``stale_mark`` column** — that flag is an in-memory enrichment from
+`strategy._mark_to_market` persisted ONLY into `portfolio.positions_json`.
+`send_hourly_summary` and `send_daily_close` fetched
+`store.open_positions()` and passed those rows straight to
+`_portfolio_lines`, so every `p.get("stale_mark")` read falsy. Two
+trader-visible failures resulted:
+
+* The ⚠ STALE annotation in `_portfolio_lines` NEVER fired on the hourly
+  / daily summary — a cost-fallback mark that should have been flagged
+  as fictional displayed silently as a normal position line.
+* `_pos_pct_weight` / `_pos_alpha_token` rendered "+0.0%" P/L next to the
+  stale row — indistinguishable from a genuinely flat position. Exactly
+  the misleading-token mode the `stale_mark` flag was introduced to
+  expose.
+
+Live evidence the surface was dark: `/api/portfolio` already returns
+`stale_marks=<count>` correctly (it reads from `positions_json`), but
+the Discord summary the operator actually reads silently dropped every
+stale flag.
+
+Fix: `_merge_stale_marks(open_positions, json_positions)` copies the
+flag in by matching the same `(ticker, type, expiry, strike)` UNIQUE key
+the positions table enforces. Pure / additive / never raises (the
+reporter additive contract). Both send paths now merge before
+`_portfolio_lines`. Tests pin:
+
+* 6 unit tests on the helper itself — stock match, option strike+expiry
+  match, no-json-positions identity, no-stale-rows identity, unmatched
+  rows don't pollute, malformed rows don't raise.
+* 3 end-to-end regression tests on `send_hourly_summary` — STALE
+  annotation now renders, +0.0% suppressed next to STALE, clean book
+  stays byte-compatible (the "fix is additive" contract).
+
+Commit `486ca4a`.
+
+### Phase 2 — feat: `_mark_integrity_line` — Discord surface for stale-mark coverage
+
+`/api/mark-integrity` already exposes `build_mark_integrity`'s aggregate
+"what share of book value is marked at cost (so every P/L number is
+quietly fictional)" verdict on the dashboard. But the operator lives in
+Discord and never opens it (the documented dashboard→Discord gap the
+rest of this file's one-liners close — `_drawdown_line` /
+`_capital_pulse_line` / `_realized_vs_unrealized_line` precedent). The
+Phase-1 fix made the per-position ⚠ STALE annotation visible inline,
+but a trader skimming 5 position lines can still miss the inline flag.
+This adds the *aggregate* "X% of $Y book value is fictional; tickers:
+…" surface right after the position block and BEFORE every downstream
+P/L analytics line (drawdown, benchmark, banked-vs-paper, …) — so the
+integrity verdict is read alongside the headline P/L, not buried under
+15 analytics lines.
+
+* Single source of truth (invariant #10): composes
+  `build_mark_integrity` verbatim — same data path
+  `/api/mark-integrity` uses, no re-derived verdict.
+* Pure store reads, no network (the Discord-path discipline; the
+  `_drawdown_line` precedent).
+* Surfaces ONLY `DEGRADED` / `UNTRUSTWORTHY`; `CLEAN` / `NO_DATA` stay
+  silent (the summary must never become its own lying green light —
+  the `_drawdown_line` at-high-water precedent).
+* `UNTRUSTWORTHY` gets the ⚠️ prefix (consistent with
+  `_realized_vs_unrealized_line`'s warning weight on the comparable
+  "your numbers are fictional" surface); both verdicts include the
+  affected ticker(s) with multi-leg dedup.
+
+11 new tests pin: builder verbatim composition, silence on
+CLEAN / NO_DATA, ticker dedup for multi-leg option positions, the ⚠️
+prefix only on `UNTRUSTWORTHY`, builder/non-dict fault degrades to
+empty, end-to-end wire on both send paths (incl. ordering pin — MARK
+INTEGRITY must precede the SESSION analytics block).
+
+Commit `cad91c5`.
+
+### Phase 3 — live validation findings (live trader ~15:33 UTC)
+
+The live trader rebooted onto my Phase-2 commit (`/api/healthz`
+boot_sha=cad91c5, uptime_s=1.2) — the git-watcher auto-restart fired
+between cycles, so my changes are LIVE on the box.
+
+1. **HOST SATURATED, dominant pathology**. `/api/host-guard`: 9
+   concurrent Opus (limit 4); load1=11.01 on 16 CPUs; mem_available_mb
+   6609; swap_used_pct 83.3%. 50.8% of last 120 decisions never reached
+   Opus, dominated by `host_skip` (43/61) — the pre-flight guard is
+   correctly declining doomed calls. 4 parallel HYBRID agents + the
+   continuous backtest committee + sibling automation. Documented
+   pattern, not a fresh bug — confirming the documented #1 live
+   pathology still bites under multi-agent load. `_OPS_ACTION` is the
+   actionable lever (reduce concurrent Opus), not a restart.
+
+2. **Single-name concentration HIGH (65.77% NVDA)**. `/api/risk`
+   reports `concentration_severity=HIGH`, top1_ticker=NVDA at 65.77% of
+   a 1-name stock book — well over the SINGLE_NAME_RISK 60% threshold.
+   `_concentration_line` will fire on the next successful hourly
+   summary (gated only by the saturation-induced NO_DECISION storm
+   blocking the send cadence). Real exposure that the trader sees on
+   every cycle's risk_mirror block.
+
+3. **Mark integrity CLEAN — my Phase-2 feature correctly silent**.
+   `/api/mark-integrity` reports `verdict=CLEAN, n_stale=0,
+   stale_value_pct=0.0` — all 1 mark live. The new
+   `_mark_integrity_line` stays silent per the suppression contract
+   (never a lying green light). Will fire automatically the moment
+   yfinance fails on a held name — the live-evidence verification
+   would require an in-flight stale event we don't currently have.
+
+4. **NO_DECISION storm in flight**. `/api/decision-health` reports
+   38.3% of last 167 decisions are NO_DECISION;
+   `/api/no-decision-reasons` reports dominant cause `host_saturated`
+   (89%) with 37/50 NO_DECISION in the last window. The runner is
+   cycling but cannot decide; this is the saturation symptom, not a
+   wedged claude CLI (the auto-recovery `_kill_stale_claude` breaker
+   doesn't help — the box would just re-saturate on the next spawn).
+
+5. **Discord delivery HEALTHY**. `/api/notify-health` verdict
+   `HEALTHY`, `consecutive_failures=0`, last OK send seconds ago. The
+   shipped `openclaw` PATH fix continues to hold.
+
+### How to run
+
+Live trader (singleton-guarded; the systemd unit at this writing
+remains in restart-spam mode because the manual launch holds the
+flock — see the `pt-systemd-vs-manual-restart-spam` memory note):
+
+```
+python3 -m paper_trader.runner               # manual, foreground
+```
+
+Tests (this pass touched only reporter):
+
+```
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_core_reporter.py -v        # this pass + reporter
+python3 -m pytest tests/test_core_*.py -q               # full core slice (~15s, 846 pass)
+```
+
+Probe the new feature live:
+
+```
+curl -s http://localhost:8090/api/mark-integrity \
+  | python3 -m json.tool
+```
+
+### Invariants reaffirmed by this pass
+
+- `store.open_positions()` returns positions TABLE rows; the
+  `stale_mark` enrichment lives ONLY in `portfolio.positions_json`.
+  Any caller that needs the flag MUST merge via `_merge_stale_marks`
+  (or use `pf["positions"]` directly when it doesn't need `opened_at`).
+- Reporter additive contract (invariants #2 / #12): any builder /
+  store fault on the new MARK INTEGRITY block degrades to `""` — never
+  takes down the whole hourly / daily summary.
+- Single source of truth (invariant #10): the new Discord line
+  composes `build_mark_integrity` verbatim — no re-derived staleness
+  math, no drift from `/api/mark-integrity`.
+- Silence-when-nothing-actionable: `CLEAN` and `NO_DATA` produce no
+  Discord noise — the summary must never become its own lying green
+  light. Only `DEGRADED` / `UNTRUSTWORTHY` surface, with the ⚠️
+  prefix reserved for the `UNTRUSTWORTHY` (≥50% of gross value at
+  cost) case.
