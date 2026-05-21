@@ -6,6 +6,223 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 ML+backtest HYBRID pass #5 (Agent 2) — gate_capture_coverage (capture-pipeline health audit)
+
+**Phase 1 — bugs_fixed: 0 (honest zero).** Audited
+`decision_scorer.py`, `backtest.py` (PriceCache + volume cache +
+_ml_decide + _compute_technical_indicators), and
+`run_continuous_backtests.py` (parse helpers + ledger writers + main
+loop) end to end. The candidates I considered:
+
+* `_ensure_volume_for` reads `_VOLUME_CACHE[cache_key]` outside the
+  lock between the `in` check and the `[]` access. Under current
+  load (`RUNS_PER_CYCLE=1` throttle, one window-keyed insert per
+  cycle, `_VOLUME_CACHE_MAX_WINDOWS=16` cap) the eviction would need
+  16 OTHER windows to be `move_to_end`'d AFTER the read's window in
+  that 1-bytecode gap — not reachable. Not a fix candidate.
+* `_to_float` against `np.bool_` / numeric strings / numpy strings —
+  every branch verified correct. The `(int, float)` guard catches
+  Python bool first; `np.number` excludes `np.bool_` cleanly; the
+  numpy string TypeError comment is correct.
+* Zero-news inference→outcome parity (`_ml_decide` emits None when
+  `buy_news_count == 0`; `_compute_decision_outcomes` parses
+  `news_count=0 news_urg=0.0` then the
+  `if news_article_count is not None and news_article_count <= 0`
+  guard sets both to None — verified by hand sim).
+* `_parse_gate_decision` / `_parse_conviction_pct` regex word-boundary
+  discipline (`\bscorer=`, `\bconviction=`) holds against the documented
+  `score=` / `_score=` / `underscore=` false-positive patterns.
+
+Same "exhaustively-reviewed" picture as pass #3 / pass #4. Honest call,
+matching the discipline.
+
+**Phase 2 — features_added: 1.** New
+`paper_trader/ml/gate_capture_coverage.py` — read-only audit of the
+gate-decision capture pipeline (`gate_scorer_pred` / `gate_off_dist`
+columns commit `60b20d9` introduced).
+
+The shelf has consumers of the capture columns (`gate_realized`,
+`gate_abstention`, `conviction_calibration`, `exit_disposition_skill`)
+but no diagnostic audits the *capture pipeline itself*. Two silent
+failure modes the existing tools structurally cannot surface:
+
+1. **Architectural drift** — a future `_ml_decide` refactor leaking
+   the `scorer=` token into SELL/HOLD reasoning would silently
+   populate SELL rows with predictions the gate is BUY-only-by-contract
+   never modulated on. Every `gate_realized` bucket then mixes a
+   BUY-only signal with SELL ghost rows. Nothing today enforces the
+   SELL ∩ gate_scorer_pred=∅ invariant on the persisted corpus.
+2. **Loop dormancy** — the continuous loop dies, deployed pickle's
+   `n_train` stays sub-500, every new BUY writes
+   `gate_scorer_pred=None` (sub-gate). The capture rate decay is the
+   only operational signal, and no module surfaces it. This is exactly
+   the live state pass #4 documented ("scorer is still sub-gate, loop
+   dormant since 2026-05-18") — but with no way to confirm the dormancy
+   from the outcomes corpus alone.
+
+Method: pure pass over `decision_outcomes.jsonl`, classify by `action`
+and `gate_scorer_pred` presence, tally per-quartile by **`run_id`**
+ascending (write order — gate-activity time, which is what loop liveness
+moves) rather than by `sim_date` (decision time, fixed by the backtest
+window pick and revealing nothing about loop behaviour). The choice of
+ordering axis is load-bearing: by `sim_date` the live corpus quartiles
+read 73.9/98.8/82.8/87.0% (no signal); by `run_id` they read
+42.5/100/100/100% (the gate clearly activated mid-corpus).
+
+Verdict ladder (test-locked, exact-value):
+
+| Verdict | Trigger |
+|---|---|
+| `INSUFFICIENT_DATA` | < `MIN_BUY_ROWS=60` BUY rows |
+| `SCHEMA_VIOLATION` | ≥1 SELL row carries non-None `gate_scorer_pred` |
+| `GATE_CAPTURE_DARK` | overall BUY capture < `DARK_PCT=5.0`% |
+| `GATE_CAPTURE_DEGRADING` | newest-q − oldest-q ≤ −`TREND_PP=20.0`pp |
+| `GATE_CAPTURE_IMPROVING` | newest-q − oldest-q ≥ +`TREND_PP=20.0`pp |
+| `GATE_CAPTURE_PARTIAL` | overall 5–90% with no significant trend |
+| `GATE_CAPTURE_HEALTHY` | overall ≥ `HEALTHY_PCT=90.0`% with no degrading trend |
+
+Order is load-bearing: `SCHEMA_VIOLATION` ALWAYS wins (contract breach
+trumps quant verdict); `INSUFFICIENT_DATA` precedes any quant verdict
+so a thin corpus reads honestly; DARK before trend so a dead corpus
+isn't classified as "improving."
+
+Same operational discipline as siblings (`gate_realized`,
+`gate_abstention`, `gate_audit`, `scorer_freshness`): read-only, never
+trains, never touches `decision_scorer.pkl` / `build_features` /
+`N_FEATURES` / trade path, never raises (any I/O / parse fault
+degrades to `INSUFFICIENT_DATA` rather than killing the cycle). CLI
+exit-code contract mirrors the rest of the shelf: 0 on
+HEALTHY/IMPROVING/PARTIAL/INSUFFICIENT_DATA (gap, not harm), 2 on
+DARK/DEGRADING/SCHEMA_VIOLATION (real harm).
+
+CLI:
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.gate_capture_coverage            # table verdict
+python3 -m paper_trader.ml.gate_capture_coverage --json     # JSON
+python3 -m paper_trader.ml.gate_capture_coverage --outcomes path/to/alt.jsonl
+```
+
+**Live evidence at merge** — `GATE_CAPTURE_IMPROVING` (85.6% overall,
+oldest q 42.5%, newest q 100%, trend +57.5pp). 4 off-distribution
+captures (0.08% of captured BUYs). 0 schema violations across 1381
+SELL rows — the BUY-only invariant holds. Critically, the IMPROVING
+verdict reflects the *historical* capture pattern on rows already in
+the corpus (gate activated around run_id 6239 and stayed at 100%
+through 6242); the loop has been dormant since 2026-05-18, so no
+NEW rows are accumulating — the verdict is correct on what's persisted
+but says nothing about current liveness. That distinction is exactly
+the `scorer_freshness` heartbeat watcher's job (it reports
+INSUFFICIENT_DATA right now because `scorer_skill_log.jsonl` is
+absent). The two diagnostics together close the loop on:
+*is the gate's training+capture machinery actually working?*
+
+Tests: `tests/test_gate_capture_coverage.py` — 29 exact-value tests
+covering the full verdict ladder (each row hit by synthetic data
+engineered to land precisely on its threshold: 59 BUY → INSUFFICIENT,
+60 → active; 4% capture → DARK, 5% → DEGRADING; 100% old / 0% new →
+DEGRADING; 0% old / 100% new → IMPROVING; SCHEMA_VIOLATION always wins
+even at 100% capture), violation cap (10 entries reported), off-dist
+counting (excludes uncaptured rows correctly), robustness
+(malformed/non-dict/blank/non-BUY/non-SELL rows dropped; rows without
+run_id excluded from trend split but counted in aggregate; missing file
+degrades to INSUFFICIENT), CLI exit-code contract on all verdicts, JSON
+schema stability. 311/311 in the joint focused ML/backtest sibling
+suite still pass.
+
+**Phase 3 — live validation as a skeptical quant (user_findings: 7):**
+
+1. **`gate_capture_coverage` reports `GATE_CAPTURE_IMPROVING` (the
+   new diagnostic).** 85.6% overall BUY capture, +57.5pp newest-vs-
+   oldest trend. **Read with care:** the trend is *historical* — the
+   gate activated mid-corpus around run_id 6239 and stayed at 100%
+   through 6242, then the loop went dormant. The IMPROVING verdict
+   describes what's persisted, not what's happening now. Use
+   `scorer_freshness` (heartbeat-on-`scorer_skill_log.jsonl`) for
+   current liveness.
+
+2. **Loop still dormant since 2026-05-18T12:03** (`continuous.log`
+   mtime). Same 2 orphaned `status='running'` rows pass #4 documented
+   (rid 6238, 6243), now ~3 days old. The next `python3
+   run_continuous_backtests.py` start will reap both via
+   `_reap_orphaned_runs` (6h-age guard).
+
+3. **Scorer pickle still sub-gate.** Pickle mtime 2026-05-19T06:10
+   (~50h old), `n_train=400` < 500 threshold (invariant #5). Gate
+   remains inactive. Identical to pass #4.
+
+4. **`sizing_pnl_skill` permanently INSUFFICIENT_DATA until loop
+   restart.** The `conviction_pct` column landed 2026-05-21 with
+   `f520926`; 0/7413 rows have it populated. Pass #4's diagnostic
+   activates as the continuous loop populates the column on next run
+   — confirmed still 0 today.
+
+5. **In-sample calibration MISCALIBRATED on the full corpus**
+   (spearman=0.0157, pearson=0.009, mean_abs_decile_err=10.7pp).
+   `baseline_compare --oos` (which `analyze(oos_only=True)` is) still
+   reports MLP_ADDS_SKILL (rank_ic +0.225 vs best baseline +0.079,
+   gap +0.145). The full-corpus verdict magnifies in-sample noise on
+   the 400-row dedup tail; the OOS slice is the trustworthy
+   generalization metric. **A reading quant trusts the OOS rank;
+   discounts the full-corpus calibration verdict.**
+
+6. **`outcome_drift` reports MILD_DRIFT.** `regime_mult` shifted
+   -0.524σ recently vs older bucket (recent windows skewed away from
+   bull); `news_urgency` shifted +0σ but with the most recent bucket
+   showing all-zero — the news urgency signal is *dead* in the recent
+   window (likely a window-pick that landed on a no-news-coverage
+   sim_date range). The trainer's input is leaning even harder on the
+   quant signals.
+
+7. **`gate_abstention` confirmed GUARD_INACTIVE** (0.37%, 4 rows).
+   Identical to pass #4 — the off-distribution guard rarely fires
+   on the corpus. URTY(2), SOXL(1), FAS(1) — same 4 names.
+
+**Sub-finding — `consensus_skill` CONSENSUS_EDGE re-verified.** Top
+3+ bucket realized +4.225% (n=42) vs lone-bucket +1.068% (n=6413),
+spread +3.157pp. Same as pass #4 — cross-run agreement carries real
+signal but no new consensus rows accumulate while the loop is dormant.
+
+**Sub-finding — `deploy_audit` DEPLOYED_MATCHES_SOURCE.** All 8
+audited hyper-params match `decision_scorer.MLP_CONFIG`. No drift.
+
+**How to run this pass's tests** (focused; full suite ≥25 min):
+
+```bash
+# This pass's regression coverage (29 tests, <1s)
+python3 -m pytest tests/test_gate_capture_coverage.py -v
+
+# Joint with the nearest-sibling diagnostics (no drift cross-check):
+python3 -m pytest tests/test_gate_capture_coverage.py \
+                 tests/test_decision_scorer.py \
+                 tests/test_backtest.py \
+                 tests/test_continuous.py \
+                 tests/test_ml_backtest_seams.py \
+                 tests/test_outcome_data_quality.py -q
+# 311 passed
+```
+
+**How to run the new diagnostic manually:**
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.gate_capture_coverage             # table
+python3 -m paper_trader.ml.gate_capture_coverage --json      # JSON
+python3 -m paper_trader.ml.gate_capture_coverage --outcomes path/to/alt.jsonl
+```
+
+**Counters**: bugs_fixed=0 (honest — every load-bearing edge re-checked,
+identical "exhaustively-reviewed" picture pass #4 closed) ·
+features_added=1 (`gate_capture_coverage` analyzer with 29 verdict-locked
+tests) · user_findings=7 (gate_capture_coverage IMPROVING on persisted
+rows, loop dormant ~3 days, scorer sub-gate, sizing_pnl_skill blocked on
+column populate, calibration full-corpus MISCALIBRATED vs OOS DIRECTIONAL,
+outcome_drift MILD with regime_mult shift + news_urgency dead in recent
+window, gate_abstention GUARD_INACTIVE re-verified).
+
+---
+
 ## 2026-05-21 ML+backtest HYBRID pass #4 (Agent 2) — sizing_pnl_skill (conviction × realized $-PnL attribution)
 
 **Phase 1 — bugs_fixed: 0 (honest zero).** Audited `decision_scorer.py`,
