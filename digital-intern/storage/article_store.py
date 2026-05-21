@@ -1463,6 +1463,124 @@ class ArticleStore:
         }
 
     @_retry_on_lock
+    def urgency_label_split_trend(
+        self, hours: int = 24, bucket_h: int = 4
+    ) -> dict:
+        """Per-time-bucket breakdown of urgent rows by ``score_source`` — the
+        TIME-AXIS sibling to ``urgency_label_split``.
+
+        ``urgency_label_split`` reports a single point-in-time calibration
+        figure (LLM-vetted fraction over the whole window). It cannot tell
+        the analyst whether the rate is improving, degrading, or stable —
+        critical when Sonnet quota throttles or recovers mid-window, when a
+        ML-only spike (recap-template cluster, screener-tape burst) drives
+        a transient hour of unverified pushes, or when the daemon was
+        restarted partway through and the early buckets have no LLM yet.
+
+        Returns one dict per ``bucket_h``-sized bucket in the requested
+        window, oldest-first (so a chart renders left-to-right by time).
+        Bucket boundaries are aligned to ``now - hours`` so a 24h window
+        with bucket_h=4 yields exactly 6 buckets. An empty bucket (no
+        urgent rows) is still emitted — same zero-data discipline as
+        ``urgency_label_split`` / ``ticker_mention_velocity`` — so a
+        consumer can iterate a fixed-length series without conditional
+        branches and the dashboard never renders a gap.
+
+        Each bucket dict has:
+
+          * ``bucket_start`` — ISO timestamp of the bucket's start
+                                (``first_seen >= bucket_start``)
+          * ``bucket_end``   — ISO timestamp of the bucket's end
+                                (``first_seen < bucket_end``)
+          * ``total``        — urgent rows in this bucket
+          * ``llm``          — score_source='llm'
+          * ``ml``           — score_source='ml'
+          * ``briefing_boost`` — score_source='briefing_boost'
+          * ``null``         — legacy / pre-migration rows
+          * ``llm_fraction`` — ``(llm + briefing_boost) / total`` (0.0 when
+                                ``total == 0``)
+
+        Top-level keys mirror ``urgency_label_split``: ``window_h``,
+        ``bucket_h``, ``total`` (over all buckets), ``llm_fraction``
+        (over all buckets — identical to ``urgency_label_split``'s value
+        when the same window is queried).
+
+        Read-only (single GROUP BY SELECT) with ``_LIVE_ONLY_CLAUSE`` so
+        the synthetic backtest/opus rows never inflate either side. NO DB
+        write, no ai_score/ml_score/score_source/urgency mutation. All
+        four load-bearing invariants intact by construction.
+        """
+        hours = max(int(hours), 1)
+        bucket_h = max(int(bucket_h), 1)
+        # Round up so the window always contains complete buckets — a
+        # half-bucket tail would produce an emptier-looking series than the
+        # caller asked for.
+        n_buckets = (hours + bucket_h - 1) // bucket_h
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(hours=n_buckets * bucket_h)
+        since_iso = window_start.isoformat()
+
+        rows = self.conn.execute(
+            "SELECT first_seen, score_source FROM articles "
+            f"WHERE urgency>=1 AND first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+            (since_iso,),
+        ).fetchall()
+
+        # Pre-seed every bucket with zeros so a quiet hour still emits a
+        # row — same discipline as ``urgency_label_split``'s fixed-key dict.
+        buckets: list[dict] = []
+        for i in range(n_buckets):
+            start = window_start + timedelta(hours=i * bucket_h)
+            end = window_start + timedelta(hours=(i + 1) * bucket_h)
+            buckets.append({
+                "bucket_start": start.isoformat(),
+                "bucket_end": end.isoformat(),
+                "total": 0,
+                "llm": 0, "ml": 0, "briefing_boost": 0, "null": 0,
+                "llm_fraction": 0.0,
+            })
+
+        bucket_secs = bucket_h * 3600
+        for first_seen, src_tag in rows:
+            if not first_seen:
+                continue
+            try:
+                ts = datetime.fromisoformat(first_seen)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            offset_s = (ts - window_start).total_seconds()
+            if offset_s < 0:
+                continue
+            idx = int(offset_s // bucket_secs)
+            if idx >= n_buckets:
+                continue  # future row or off-by-one at the trailing edge
+            key = (src_tag if src_tag in ("llm", "ml", "briefing_boost")
+                   else "null")
+            buckets[idx][key] += 1
+            buckets[idx]["total"] += 1
+
+        # Compute per-bucket llm_fraction now that all rows are bucketed.
+        grand_total = 0
+        grand_vetted = 0
+        for b in buckets:
+            total = b["total"]
+            grand_total += total
+            vetted = b["llm"] + b["briefing_boost"]
+            grand_vetted += vetted
+            b["llm_fraction"] = round(vetted / total, 4) if total else 0.0
+
+        return {
+            "window_h": int(hours),
+            "bucket_h": int(bucket_h),
+            "total": grand_total,
+            "llm_fraction": round(grand_vetted / grand_total, 4)
+                            if grand_total else 0.0,
+            "buckets": buckets,
+        }
+
+    @_retry_on_lock
     def source_freshness(self) -> list[dict]:
         """Per-source liveness view: for every live source, its live-row count
         and how long ago its most recent article landed.
