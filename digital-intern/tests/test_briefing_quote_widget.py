@@ -200,6 +200,54 @@ def test_build_payload_does_not_mutate_caller_articles():
     assert articles == before, "caller's article list must be untouched"
 
 
+# ── StockTwits Sentiment fingerprint (_QW_STOCKTWITS_SENTIMENT) ──────────────
+# "[StockTwits Sentiment] NVDA Bullish: 53% Bullish / 3% Bearish (16↑ 1↓ of 30
+# msgs)" — structured-data summary from collectors/stocktwits_sentiment.py.
+# Live evidence (2026-05-21, 5h): 130 rows, 45 ML-scored >=5, several at the
+# 10.0 ceiling — the briefing's per-domain cap admits up to 6 into the top
+# pool every cycle, displacing real news in TOP SIGNALS.
+
+
+@pytest.mark.parametrize("title", [
+    "[StockTwits Sentiment] NVDA Bullish: 53% Bullish / 3% Bearish (16↑ 1↓ of 30 msgs)",
+    "[StockTwits Sentiment] ORCL Bullish: 80% Bullish / 0% Bearish (24↑ 0↓ of 30 msgs)",
+    "[StockTwits Sentiment] LITE Bearish: 10% Bullish / 60% Bearish (3↑ 18↓ of 30 msgs)",
+    "  [StockTwits Sentiment] MU Bullish: 30% Bullish / 0% Bearish",  # leading ws
+])
+def test_stocktwits_sentiment_pseudo_detected(title):
+    assert _looks_like_quote_widget({"title": title, "link": ""}) is True
+
+
+@pytest.mark.parametrize("title", [
+    # Real news about StockTwits or sentiment must not match — the leading
+    # bracketed marker is the discriminator.
+    "StockTwits announces new sentiment dashboard for retail traders",
+    "Retail bullish on NVDA per StockTwits sentiment data",
+    "Sentiment turns bullish ahead of NVDA earnings",
+    "Bullish: NVDA breaks key resistance level",
+])
+def test_real_sentiment_headlines_not_flagged(title):
+    assert _looks_like_quote_widget({"title": title, "link": ""}) is False
+
+
+def test_build_payload_excludes_stocktwits_sentiment_keeps_real():
+    """A real news headline must survive while the StockTwits Sentiment
+    pseudo-article is dropped from the digest — analyst's primary product
+    must not surface structured sentiment as a TOP SIGNAL."""
+    articles = [
+        {"title": "Micron beats Q3 estimates, raises guidance",
+         "source": "rss", "ai_score": 9, "summary": "Strong DRAM demand",
+         "link": "https://example.com/micron-q3"},
+        {"title": "[StockTwits Sentiment] NVDA Bullish: 53% Bullish / 3% Bearish (16↑ 1↓ of 30 msgs)",
+         "source": "stocktwits/sentiment", "ai_score": 0, "ml_score": 10.0,
+         "summary": "", "link": "https://stocktwits.com/symbol/NVDA"},
+    ]
+    payload = _build_payload(articles, {}, [])
+    section = _digest_section(payload)
+    assert "Micron beats Q3 estimates" in section
+    assert "StockTwits Sentiment" not in payload
+
+
 def test_snapshot_rows_pass_through_payload():
     # The daemon prepends synthetic P&L / OPTIONS rows (ai_score=10, no url).
     # They must survive the gate and appear in the digest.

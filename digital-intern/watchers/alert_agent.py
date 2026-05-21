@@ -267,6 +267,36 @@ _QW_LISTING = re.compile(
 _QW_SCREENER_TAPE = re.compile(
     r"^\s*\[YF/[a-z_]+\]\s+[A-Z]"
 )
+# StockTwits sentiment pseudo-article — distinct fingerprint the four above
+# don't catch (no glued price, no parenthesised % paren, no $share-card, no
+# bracketed YF screener). ``collectors/stocktwits_sentiment.py`` emits
+# extreme-sentiment summary rows whose title is structured data, not a news
+# headline:
+#   ``[StockTwits Sentiment] NVDA Bullish: 53% Bullish / 3% Bearish (16↑ 1↓ of 30 msgs)``
+#   ``[StockTwits Sentiment] LITE Bullish: 33% Bullish / 0% Bearish (10↑ 0↓ of 30 msgs)``
+# Live evidence (2026-05-21, last 5h): 130 such rows, 45 ML-scored >=5, several
+# at the 10.0 ceiling (the urgency head over-scores them because the title is
+# dense with held tickers and "Bullish:"/percent figures the model has learned
+# correlate with high relevance — model artefact). The stocktwits credibility
+# tier (0.30 < ALERT_MIN_LONE_SOURCE_CRED 0.45) already suppresses LONE pushes,
+# but the briefing's per-domain cap admits up to 6 of them into the 50-row
+# top pool every cycle, displacing real news in TOP SIGNALS. The drop here is
+# the alert-path lockstep for the briefing-path drop in
+# analysis.claude_analyst._QW_STOCKTWITS_SENTIMENT, same anti-drift discipline
+# as the four fingerprints above (byte-identical regex across the three
+# defense layers: alert_agent / claude_analyst / web_scraper-pattern).
+#
+# Fingerprint anchoring: ``^\s*\[StockTwits Sentiment\]\s+[A-Z]``. The real
+# publisher tag convention is unbracketed (``GDELT/reuters.com`` /
+# ``scraped/finance.yahoo.com`` / ``GN: Nvidia``), so the leading bracket is
+# the canonical pseudo-article-tag pattern (mirrors ``[YF/<bucket>]``). The
+# trailing ``\s+[A-Z]`` requires a ticker-like next token so a bare
+# ``[StockTwits Sentiment]`` paragraph break is not matched. Validated zero
+# false positives on the live corpus — no real headline leads with this
+# bracketed marker.
+_QW_STOCKTWITS_SENTIMENT = re.compile(
+    r"^\s*\[StockTwits\s+Sentiment\]\s+[A-Z]"
+)
 
 # Single source of truth for the title-fingerprint set, mirrored by
 # ``_RECAP_TEMPLATE_PATTERNS`` below. analytics.quote_widget_audit imports this
@@ -281,24 +311,27 @@ _QUOTE_WIDGET_TITLE_PATTERNS = (
     ("pct_paren", _QW_PCT_PAREN),
     ("listing_card", _QW_LISTING),
     ("screener_tape", _QW_SCREENER_TAPE),
+    ("stocktwits_sentiment", _QW_STOCKTWITS_SENTIMENT),
 )
 
 
 def _looks_like_quote_widget(art: dict) -> bool:
-    """True for a live quote-tape / quote-listing entry masquerading as an
-    urgent article.
+    """True for a live quote-tape / quote-listing / structured-data-summary
+    entry masquerading as an urgent article.
 
-    Four independent title fingerprints (a letter glued to a decimal price; a
+    Five independent title fingerprints (a letter glued to a decimal price; a
     parenthesised signed % change; a "$NAME (SYMBOL.EXCH)$" share-card listing
-    page; a ``[YF/<bucket>]`` screener-tape lead from ``market_movers``) plus a
-    Yahoo /quote/ landing path. All are anchored so real headlines with
-    $/%/comma numbers ("rises 22% to $35.1 billion", "5,123.41 record high"),
-    real "$TICKER ..." prose ("$MU upgraded to Buy") and real quote-scoped
-    article URLs are never caught. Mirrors
+    page; a ``[YF/<bucket>]`` screener-tape lead from ``market_movers``; a
+    ``[StockTwits Sentiment]`` extreme-sentiment summary row from
+    ``stocktwits_sentiment``) plus a Yahoo /quote/ landing path. All are
+    anchored so real headlines with $/%/comma numbers ("rises 22% to $35.1
+    billion", "5,123.41 record high"), real "$TICKER ..." prose ("$MU upgraded
+    to Buy") and real quote-scoped article URLs are never caught. Mirrors
     collectors.web_scraper._looks_like_quote_widget."""
     title = art.get("title") or ""
     if (_QW_PRICE_GLUE.search(title) or _QW_PCT_PAREN.search(title)
-            or _QW_LISTING.search(title) or _QW_SCREENER_TAPE.search(title)):
+            or _QW_LISTING.search(title) or _QW_SCREENER_TAPE.search(title)
+            or _QW_STOCKTWITS_SENTIMENT.search(title)):
         return True
     url = art.get("link") or art.get("url") or ""
     try:

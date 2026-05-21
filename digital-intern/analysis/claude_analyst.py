@@ -1376,26 +1376,43 @@ _QW_LISTING = re.compile(
 _QW_SCREENER_TAPE = re.compile(
     r"^\s*\[YF/[a-z_]+\]\s+[A-Z]"
 )
+# StockTwits sentiment pseudo-article — lockstep mirror of the fifth fingerprint
+# added to ``watchers.alert_agent._QW_STOCKTWITS_SENTIMENT``. Live evidence
+# (2026-05-21, last 5h): 130 ``[StockTwits Sentiment]`` rows from
+# ``collectors/stocktwits_sentiment.py``, 45 ML-scored >=5, several at the 10.0
+# ceiling (the urgency head over-scores them because the title is structured
+# data dense with held tickers and "Bullish:"/percent figures — pure model
+# artefact). The briefing's per-domain cap admits up to 6 of them into the
+# 50-row top pool every cycle, displacing real news in TOP SIGNALS. Same
+# byte-identical lockstep-duplication discipline as the four quote-widget
+# fingerprints above (anti-import-cycle: the analysis layer must not pull the
+# watchers+ml_features graph). Validated zero false positives on the live
+# headline corpus — no real news headline leads with this bracketed marker.
+_QW_STOCKTWITS_SENTIMENT = re.compile(
+    r"^\s*\[StockTwits\s+Sentiment\]\s+[A-Z]"
+)
 
 
 def _looks_like_quote_widget(article: dict) -> bool:
-    """True for a live quote-tape / quote-listing entry masquerading as a
-    digest article.
+    """True for a live quote-tape / quote-listing / structured-data-summary
+    entry masquerading as a digest article.
 
-    Four independent title fingerprints (a letter glued directly to a decimal
+    Five independent title fingerprints (a letter glued directly to a decimal
     price; a parenthesised signed % change; a "$NAME (SYMBOL.EXCH)$" share-card
     listing page; a ``[YF/<bucket>]`` screener-tape lead from
-    ``market_movers``) plus a Yahoo /quote/ landing path. All anchored so real
-    prose with $/%/comma numbers ("rises 22% to $35.1 billion", "5,123.41
-    record high"), real "$TICKER ..." headlines and real quote-scoped article
-    URLs ("/quote/NVDA/news/headline-123") are never caught. Byte-identical
-    logic to watchers.alert_agent._looks_like_quote_widget. The synthetic
-    PORTFOLIO/OPTIONS snapshot rows the daemon prepends ("PORTFOLIO P&L
-    SNAPSHOT" / "OPTIONS SNAPSHOT", no url) never match any fingerprint, so
-    they always pass through untouched."""
+    ``market_movers``; a ``[StockTwits Sentiment]`` extreme-sentiment summary
+    row from ``stocktwits_sentiment``) plus a Yahoo /quote/ landing path. All
+    anchored so real prose with $/%/comma numbers ("rises 22% to $35.1
+    billion", "5,123.41 record high"), real "$TICKER ..." headlines and real
+    quote-scoped article URLs ("/quote/NVDA/news/headline-123") are never
+    caught. Byte-identical logic to watchers.alert_agent._looks_like_quote_widget.
+    The synthetic PORTFOLIO/OPTIONS snapshot rows the daemon prepends
+    ("PORTFOLIO P&L SNAPSHOT" / "OPTIONS SNAPSHOT", no url) never match any
+    fingerprint, so they always pass through untouched."""
     title = article.get("title") or ""
     if (_QW_PRICE_GLUE.search(title) or _QW_PCT_PAREN.search(title)
-            or _QW_LISTING.search(title) or _QW_SCREENER_TAPE.search(title)):
+            or _QW_LISTING.search(title) or _QW_SCREENER_TAPE.search(title)
+            or _QW_STOCKTWITS_SENTIMENT.search(title)):
         return True
     url = article.get("link") or article.get("url") or ""
     try:

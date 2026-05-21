@@ -608,3 +608,50 @@ class TestQuoteWidgetGate:
         assert "MU earnings blow past Q3 estimates" in prompt
         assert "$NVIDIA (NVDA.US)$" not in prompt
         assert sorted(spy.marked) == ["ql", "r"]
+
+    # ── StockTwits sentiment fingerprint (_QW_STOCKTWITS_SENTIMENT) ─────────
+    # ``[StockTwits Sentiment] NVDA Bullish: 53% Bullish / 3% Bearish (16↑ 1↓
+    # of 30 msgs)`` — structured-data summary from
+    # collectors/stocktwits_sentiment.py. ML head over-scores them (live 5h:
+    # 130 rows, 45 ml>=5, several at 10.0). The stocktwits cred tier 0.30 < 0.45
+    # already suppresses LONE pushes, but this is the defense-in-depth title
+    # fingerprint so a syndicated copy (dup_count>1) is also caught — exactly
+    # the same shape as the four prior quote-widget fingerprints.
+    def test_helper_rejects_stocktwits_sentiment(self):
+        f = alert_agent._looks_like_quote_widget
+        for junk in (
+            "[StockTwits Sentiment] NVDA Bullish: 53% Bullish / 3% Bearish (16↑ 1↓ of 30 msgs)",
+            "[StockTwits Sentiment] ORCL Bullish: 80% Bullish / 0% Bearish (24↑ 0↓ of 30 msgs)",
+            "[StockTwits Sentiment] LITE Bearish: 10% Bullish / 60% Bearish (3↑ 18↓ of 30 msgs)",
+            "  [StockTwits Sentiment] MU Bullish: 30% Bullish / 0% Bearish",  # leading ws
+        ):
+            assert f({"title": junk}) is True, junk
+        # Real headlines about StockTwits / sentiment must SURVIVE — only the
+        # bracketed-marker prefix is the discriminator.
+        for good in (
+            "StockTwits announces new sentiment dashboard for retail traders",
+            "Retail bullish on NVDA per StockTwits sentiment data",
+            "Sentiment turns bullish ahead of NVDA earnings",
+            "Bullish: NVDA breaks key resistance level",
+        ):
+            assert f({"title": good, "link": "https://x.com/a/b"}) is False, good
+
+    def test_stocktwits_sentiment_suppressed_before_claude(self, monkeypatch):
+        """A lone StockTwits sentiment row must NOT fire 🚨 BREAKING: no Claude
+        call, no Discord, but marked alerted so it exits the urgent queue
+        (same pre-fire-suppression mark discipline as other quote-widget gates)."""
+        spy = self._StoreSpy()
+        row = self._row(
+            _id="st", source="stocktwits/sentiment",
+            link="https://stocktwits.com/symbol/NVDA",
+            title="[StockTwits Sentiment] NVDA Bullish: 53% Bullish / 3% Bearish (16↑ 1↓ of 30 msgs)",
+            ai_score=0.0,
+        )
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call") as mock_claude, \
+             patch("notifier.discord_notifier.send") as mock_send:
+            ok = alert_agent.send_urgent_alert([row], spy)
+        assert ok is False
+        mock_claude.assert_not_called()
+        mock_send.assert_not_called()
+        assert spy.marked == ["st"]
