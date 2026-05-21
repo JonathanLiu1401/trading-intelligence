@@ -2574,6 +2574,67 @@ def _repeat_loser_line(store) -> str:
         return ""
 
 
+def _rebuy_regret_line(store) -> str:
+    """One-line "did I sell low and buy back higher?" for the hourly / daily
+    report — the $ cost of premature exits followed by re-entries.
+
+    ``_repeat_loser_line`` names tickers the desk loses on repeatedly;
+    ``_streak_line`` flags loss-clusters in time. Neither answers the
+    discretionary trader's hardest exit question: **when I closed a name and
+    re-bought it later, did I pay UP for the re-entry?** The disposition
+    effect (cutting winners early; the desk's #1 documented pathology) shows
+    up here as positive net regret — sold $220, re-bought $223. ``/api/rebuy-
+    regret`` quantifies this on the dashboard; the operator lives in
+    Discord and never opens it (the exact dashboard→Discord gap
+    ``_capital_pulse_line`` / ``_streak_line`` / ``_repeat_loser_line``
+    each closed, one dimension over: capital → time → name → price).
+
+    Composes ``build_rebuy_regret`` **verbatim** (single source of truth,
+    AGENTS.md invariant #10 — the headline / verdict are the builder's,
+    never re-derived here, so this Discord line and ``/api/rebuy-regret``
+    can never tell different stories) and feeds it the EXACT same store
+    read the endpoint does (``recent_trades(2000)`` reversed oldest-first,
+    the ``build_rebuy_regret`` contract). **Pure store reads only — NO
+    network** (the Discord-path discipline; the ``_repeat_loser_line``
+    precedent). Observational only, never gates, adds no caps (invariants
+    #2/#12 — the ``_streak_line`` precedent). Failure contract mirrors
+    the rest of ``reporter``: any builder/store fault degrades to ``""``
+    ("no rebuy-regret line this report"), **never** an exception ("no
+    Discord summary this report").
+
+    Suppression — surface ONLY the actionable verdict, so a balanced or
+    sample-poor book adds no hourly noise (the summary must never become
+    its own lying green light — the ``_streak_line`` NEUTRAL /
+    ``_repeat_loser_line`` OK suppression precedent):
+      * ``REGRETTING`` (net positive regret above the noise floor) → ALWAYS
+        surfaced — the disposition-effect / whipsaw pattern the desk loses
+        money on.
+      * ``SAVINGS`` / ``NET_NEUTRAL`` / ``NO_DATA`` / ``NO_REBUYS`` (and any
+        non-verdict) → silent. SAVINGS is the GOOD case (sold high,
+        re-bought lower) — the trader doesn't need an hourly alert to
+        celebrate it; named in the daily-close behavioural stack via the
+        existing ``_session_block`` realized-P/L line instead.
+    """
+    try:
+        from .analytics.rebuy_regret import build_rebuy_regret
+        # ``build_rebuy_regret`` is direction-tolerant but oldest→newest is
+        # cheaper (no re-sort inside the builder) and matches the
+        # ``_streak_line`` / ``_repeat_loser_line`` precedent.
+        trades = list(reversed(store.recent_trades(2000)))
+        rr = build_rebuy_regret(trades)
+        if not isinstance(rr, dict):
+            return ""
+        if rr.get("verdict") != "REGRETTING":
+            return ""
+        headline = rr.get("headline") or ""
+        if not headline:
+            return ""
+        return f"⚠️ **REBUY REGRET** ◈ sold low, bought higher\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] rebuy-regret line skipped: {e}")
+        return ""
+
+
 def _streak_line(store) -> str:
     """One-line "am I on a hot-hand or a tilt-risk run right now?" for the
     hourly / daily report.
@@ -2971,6 +3032,16 @@ def send_hourly_summary() -> bool:
     rl = _repeat_loser_line(store)
     if rl:
         body += "\n" + rl
+    # REBUY_REGRET sits right after REPEAT_LOSER — the same dimension (per-
+    # name loss pattern) one degree sharper: not "I keep losing on LITE"
+    # but "I sold LITE at $X then re-bought at $X+Δ — the *exit timing* is
+    # costing me, separate from the trade picks themselves". Silent on
+    # SAVINGS / NET_NEUTRAL (the silence precedent — never become a lying
+    # green light), so this only fires on the actionable disposition-
+    # effect / whipsaw pattern.
+    rr = _rebuy_regret_line(store)
+    if rr:
+        body += "\n" + rr
     return _send(body)
 
 
@@ -3118,4 +3189,9 @@ def send_daily_close() -> bool:
     rl = _repeat_loser_line(store)
     if rl:
         body += "\n" + rl
+    # REBUY_REGRET follows REPEAT_LOSER on daily close too — see
+    # send_hourly_summary for the rationale (sold low, re-bought higher).
+    rr = _rebuy_regret_line(store)
+    if rr:
+        body += "\n" + rr
     return _send(body)
