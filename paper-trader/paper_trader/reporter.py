@@ -620,6 +620,43 @@ def _classify_decision_outcome(action_taken: str | None) -> str:
     return "other"
 
 
+def _decision_action_verb(action_taken: str | None) -> str | None:
+    """Extract the action verb (``BUY`` / ``SELL`` / ``HOLD``) from a free-text
+    ``decisions.action_taken`` row, or ``None`` for ``NO_DECISION`` / unknown.
+
+    The column shape (AGENTS.md invariant #11) is ``"<ACTION> <TICKER> → <STATUS>"``
+    where ACTION ∈ {BUY, SELL, BUY_CALL, BUY_PUT, SELL_CALL, SELL_PUT, HOLD,
+    REBALANCE}. The action verb is the FIRST whitespace-separated token of the
+    pre-arrow segment. Special row ``"NO_DECISION"`` (no arrow) returns ``None``.
+
+    Buy variants (``BUY``, ``BUY_CALL``, ``BUY_PUT``) collapse to ``"BUY"`` —
+    the trader-facing distinction is "deploying cash" vs. "freeing cash", not
+    stock-vs-option (option mix is already surfaced via the trade alert). Sell
+    variants collapse to ``"SELL"`` the same way.
+
+    Pure on the input string — no store reads, never raises. The companion
+    helper to ``_classify_decision_outcome``: that function buckets by STATUS
+    (filled/hold/blocked/no-dec), this one buckets by ACTION.
+    """
+    s = (action_taken or "").upper().strip()
+    if not s or s.startswith("NO_DECISION"):
+        return None
+    # Take the segment before the arrow (or the whole string if there isn't one),
+    # then the first token. The action verb sits there in every row strategy.py
+    # writes via record_decision.
+    head_seg = s.split("→", 1)[0].strip() if "→" in s else s
+    if not head_seg:
+        return None
+    head_tok = head_seg.split()[0] if head_seg.split() else ""
+    if head_tok.startswith("BUY"):
+        return "BUY"
+    if head_tok.startswith("SELL"):
+        return "SELL"
+    if head_tok == "HOLD":
+        return "HOLD"
+    return None
+
+
 def _activity_counts(decisions: list[dict], since_iso: str) -> dict[str, int]:
     """Tally decision outcomes whose timestamp is at-or-after ``since_iso``.
 
@@ -628,12 +665,29 @@ def _activity_counts(decisions: list[dict], since_iso: str) -> dict[str, int]:
     ``datetime.now(timezone.utc).isoformat()`` strings — fixed-offset UTC, so
     a lexical ``<`` orders them correctly (the same comparison pattern
     ``signals.py`` documents and relies on for ``first_seen``).
+
+    Status buckets (``filled`` / ``hold`` / ``no_decision`` / ``blocked`` /
+    ``other``) tell the trader what HAPPENED. The additive ``buys`` / ``sells``
+    buckets sub-divide the ``filled`` count by direction so the operator can
+    see at a glance whether the desk was DEPLOYING cash (buys) or FREEING it
+    (sells) — three filled buys and three filled sells are very different
+    states a "filled 3" line conflates. Counted only on FILLED rows; a BUY
+    that BLOCKED counts as blocked, not as a buy (it never moved cash).
     """
-    counts = {"filled": 0, "hold": 0, "no_decision": 0, "blocked": 0, "other": 0}
+    counts = {"filled": 0, "hold": 0, "no_decision": 0, "blocked": 0, "other": 0,
+              "buys": 0, "sells": 0}
     for d in decisions:
         if (d.get("timestamp") or "") < since_iso:
             continue
-        counts[_classify_decision_outcome(d.get("action_taken"))] += 1
+        action_taken = d.get("action_taken")
+        outcome = _classify_decision_outcome(action_taken)
+        counts[outcome] += 1
+        if outcome == "filled":
+            verb = _decision_action_verb(action_taken)
+            if verb == "BUY":
+                counts["buys"] += 1
+            elif verb == "SELL":
+                counts["sells"] += 1
     return counts
 
 
@@ -741,11 +795,27 @@ def _session_block(store, window_hours: float, label: str) -> str:
         since = (datetime.now(timezone.utc)
                  - timedelta(hours=window_hours)).isoformat()
         counts = _activity_counts(store.recent_decisions(limit=500), since)
-        n_dec = sum(counts.values())
+        # `buys` / `sells` are an additive sub-division of `filled`, NOT a
+        # separate top-level bucket — they would double-count in the total.
+        # _classify_decision_outcome keys (the 5 status buckets) are the canonical
+        # disjoint partition; this preserves it.
+        n_dec = sum(counts[k] for k in
+                    ("filled", "hold", "no_decision", "blocked", "other"))
+        # "filled X (YB/ZS)" — surface the buy/sell direction split inline so
+        # the trader can see at a glance whether the desk was DEPLOYING cash or
+        # FREEING it. Only rendered when filled > 0 (no filled → no split to
+        # render). Format matches existing inline-token style elsewhere in
+        # _session_block (e.g. the closed-trip "(YW/ZL)" pattern).
+        n_filled = counts["filled"]
+        if n_filled > 0:
+            filled_seg = (f"filled {n_filled} "
+                          f"({counts['buys']}B/{counts['sells']}S)")
+        else:
+            filled_seg = f"filled {n_filled}"
         lines = [
             f"**SESSION** ◈ last {label}",
             "```\n"
-            f"Decisions {n_dec:>3}   filled {counts['filled']}  "
+            f"Decisions {n_dec:>3}   {filled_seg}  "
             f"hold {counts['hold']}  no-dec {counts['no_decision']}  "
             f"blocked {counts['blocked']}\n"
             "```",
