@@ -10674,6 +10674,27 @@ def host_guard_api():
             snap["pulse"] = host_guard.pulse()
         except Exception:
             snap["pulse"] = {"state": "CLEAR", "headline": ""}
+        # Additive `starvation_by_cause` — per-cause breakdown of recent
+        # NO_DECISION starvation rows (model_timeout / cli_nonzero_rc /
+        # model_empty / cli_missing / host_skip / unknown). The aggregate
+        # ``recent_empty_rate`` / ``recent_skip_rate`` answer "how many cycles
+        # never reached Opus" but NOT "what's the dominant cause" — three
+        # classes that need three different actions (see _CAUSE_LABELS in
+        # host_guard.py). The ``python3 -m paper_trader.host_guard`` CLI
+        # already prints this breakdown; without surfacing it here, an
+        # operator hitting the dashboard during a storm sees the rate
+        # collapse to a single number with no class signal — exactly the
+        # blind-spot host_guard.recent_starvation_by_cause exists to
+        # resolve. Degrade-safe (ok=False, all-zero by_cause shape) by the
+        # builder's contract — never raises into this endpoint.
+        try:
+            snap["starvation_by_cause"] = host_guard.recent_starvation_by_cause()
+        except Exception:
+            snap["starvation_by_cause"] = {
+                "n": 0, "starved": 0,
+                "by_cause": {label: 0 for label in host_guard._CAUSE_LABELS},
+                "rate": 0.0, "ok": False,
+            }
         return jsonify(snap)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
