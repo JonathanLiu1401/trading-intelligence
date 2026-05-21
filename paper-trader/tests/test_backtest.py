@@ -1359,6 +1359,108 @@ class TestMlDecideScorerGateBoundary:
         assert at / below == pytest.approx(0.6, abs=1e-6)
 
 
+class TestMlDecideSubGateReasoning:
+    """Pin the sub-gate reasoning contract: when the scorer is trained but
+    its ``n_train`` is below the gate threshold (invariant #5), the BUY
+    reasoning string MUST NOT carry a ``scorer=X%`` token. The token is the
+    in-band marker that ``_parse_gate_decision`` reads to populate
+    ``decision_outcomes.gate_scorer_pred`` — emitting it sub-gate falsely
+    advertises a gate decision the model never made, poisoning every
+    downstream gate diagnostic (``gate_pnl`` / ``gate_audit`` / the per-row
+    research signal).
+
+    Mirrors ``TestMlDecideScorerGateBoundary``'s harness exactly (same fake
+    scorer, same headwind prediction, same fixture seam) so the boundary
+    pin (#5) and this reasoning-emission pin lock the same gate from two
+    angles: the conviction value AND the reasoning advertisement."""
+
+    class _FakeScorer:
+        def __init__(self, pred: float, n_train: int):
+            self._pred = float(pred)
+            self._n_train = int(n_train)
+            self.is_trained = True
+
+        def predict(self, **kw):
+            return self._pred
+
+        def predict_with_meta(self, **kw):
+            return {
+                "pred": self._pred, "raw": self._pred,
+                "clamped": False, "off_distribution": False,
+            }
+
+    @pytest.fixture
+    def _gated_decision(self, synthetic_prices, monkeypatch):
+        """Yield a callable that runs _ml_decide with a substituted scorer
+        at a given n_train, returning the full decision dict (NOT just
+        conviction) so the test can inspect the reasoning string."""
+        import paper_trader.backtest as bt
+        HEADWIND_PRED = -20.0
+        p = SimPortfolio(cash=100_000.0)
+        rng = random.Random(0)
+        d = synthetic_prices.trading_days[-1]
+        articles = [{"title": "Nvidia beats earnings, guidance raised, "
+                              "semiconductor surge",
+                     "score": 10.0, "tickers": ["NVDA"]}]
+
+        def _run(n_train: int) -> dict:
+            monkeypatch.setattr(
+                bt, "_DECISION_SCORER",
+                self._FakeScorer(HEADWIND_PRED, n_train),
+                raising=False,
+            )
+            decision = _ml_decide(d, p, articles, synthetic_prices,
+                                  run_id=1, rng=rng)
+            assert decision["action"] == "BUY"
+            assert decision["ticker"] == "NVDA"
+            return decision
+
+        return _run
+
+    def test_subgate_buy_reasoning_omits_scorer_token(self, _gated_decision):
+        """n_train=499 (sub-gate): reasoning must NOT contain ``scorer=`` —
+        the gate never acted, so the in-band token would lie. Aligns the
+        emitted reasoning with ``_parse_gate_decision``'s contract
+        ('None when the cycle's scorer was untrained / sub-gate')."""
+        decision = _gated_decision(n_train=499)
+        reasoning = decision["reasoning"]
+        assert "scorer=" not in reasoning, (
+            f"Sub-gate (n_train<500) reasoning must not advertise a gate "
+            f"decision via 'scorer=X%' — observed: {reasoning!r}"
+        )
+
+    def test_gate_active_buy_reasoning_includes_scorer_token(self, _gated_decision):
+        """n_train=500 (gate active): reasoning MUST contain ``scorer=`` so
+        downstream parsers can capture the gate's then-deployed prediction.
+        Locks the dual side of the sub-gate suppression: the marker still
+        appears when the gate is genuinely live."""
+        decision = _gated_decision(n_train=500)
+        reasoning = decision["reasoning"]
+        assert "scorer=" in reasoning, (
+            f"Gate-active (n_train>=500) reasoning must advertise the "
+            f"gate's prediction via 'scorer=X%' — observed: {reasoning!r}"
+        )
+        # The scorer note follows the format "scorer={pred:+.1f}%". With a
+        # fixed -20.0 prediction it lands at the strong-headwind arm; the
+        # token itself records the prediction the gate acted on.
+        assert "scorer=-20.0%" in reasoning, (
+            f"Expected the headwind prediction in the gate's scorer "
+            f"token — observed: {reasoning!r}"
+        )
+
+    def test_sub_gate_parse_is_consistent(self, _gated_decision):
+        """End-to-end check: feed the sub-gate reasoning into
+        ``_parse_gate_decision`` and confirm it returns (None, None) —
+        the contracted 'no gate decision' signal. This anchors the
+        cross-module invariant: emission and parsing must agree on what
+        'no gate decision' looks like in the reasoning text."""
+        import run_continuous_backtests as rcb
+        decision = _gated_decision(n_train=499)
+        pred, off = rcb._parse_gate_decision(decision["reasoning"])
+        assert pred is None
+        assert off is None
+
+
 class TestMlDecideNewsRanking:
     """Locks `_ml_decide` ranking: an article with HIGHER kw/ai score on a
     given ticker must dominate over a tie/low-score competitor. Without this,
