@@ -10822,6 +10822,40 @@ def winner_autopsy_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/thesis-keyword-lift")
+def thesis_keyword_lift_api():
+    """Open-vocabulary keyword-lift across closed round-trips' entry reasons.
+
+    The orthogonal *open-vocabulary* mirror of /api/catalyst-class-autopsy.
+    catalyst_class_autopsy labels each closed trip with a fixed taxonomy
+    chosen by the analytics author (ML_ADVISOR / EARNINGS_PLAY / ANALYST_PT
+    / TECHNICALS / MACRO / BREAKING_NEWS / PUNDIT / SECTOR_SYMPATHY /
+    CONCENTRATION / UNCLASSIFIED). This builder learns the dominant
+    keywords directly from the trader's own entry_reason text — a pattern
+    like "trades whose reason mentions 'guidance' win 80% of the time vs
+    50% baseline" surfaces here even when no class exists for it.
+
+    Composes build_round_trips (SSOT, AGENTS.md #10) and joins entry_reason
+    verbatim from the contributing trade row by DB id (the
+    loser/winner_autopsy / catalyst_class_autopsy discipline). Pure / no
+    LLM — never raises. Lift expressed as percentage-point delta vs the
+    pool baseline (symmetric and bounded; an all-winner keyword is +baseline
+    pp, all-loser is -baseline pp). Verdict is the single most-positive-lift
+    keyword once STABLE (n_winners >= 4 AND n_losers >= 4 — both sides
+    needed for a meaningful lift comparison). Advisory only — never gates
+    Opus, never injected into the decision prompt, adds no caps (AGENTS.md
+    #2/#12)."""
+    try:
+        from .analytics.thesis_keyword_lift import build_thesis_keyword_lift
+        store = get_store()
+        # Same trades convention as /api/analytics & /api/loser-autopsy:
+        # oldest → newest (build_round_trips reads in sequence).
+        trades = list(reversed(store.recent_trades(2000)))
+        return jsonify(build_thesis_keyword_lift(trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/catalyst-class-autopsy")
 def catalyst_class_autopsy_api():
     """Per-entry-thesis-class autopsy of closed round-trips. The orthogonal

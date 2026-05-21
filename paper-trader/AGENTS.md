@@ -11715,6 +11715,84 @@ finding flagged in Phase 3).
   writes (read by `decision_health` and the dashboard already).
 
 
+## 2026-05-21 feature-dev pass (Agent 4) — `/api/thesis-keyword-lift`
+
+The open-vocabulary mirror of `/api/catalyst-class-autopsy`. That builder
+labels each closed round-trip with a fixed taxonomy (ML_ADVISOR /
+EARNINGS_PLAY / ANALYST_PT / TECHNICALS / MACRO / BREAKING_NEWS /
+PUNDIT / SECTOR_SYMPATHY / CONCENTRATION / UNCLASSIFIED) chosen by the
+analytics author. This learns the dominant keywords directly from the
+trader's own `entry_reason` text — the pattern "trades whose reason
+mentions 'guidance' win 80% of the time vs 50% baseline" surfaces here
+even when no class was ever written for it.
+
+**Lift definition** (`lift_pp`): percentage-point delta vs the pool
+baseline, NOT a multiplicative ratio. For each keyword K that appears
+in at least `min_kw_occurrences` (default 3) closed round-trips:
+
+```
+win_rate(K)        = n_winners_with_K / n_trips_with_K
+baseline_win_rate  = n_winners_total / (n_winners_total + n_losers_total)
+lift_pp            = (win_rate(K) - baseline) * 100        # bounded [-100, +100]
+```
+
+PP-delta (not ratio) was chosen because a 0-loser / all-winner keyword
+has a well-defined finite lift (+baseline_pp) — a ratio formula
+would be undefined exactly when the signal is strongest.
+
+**Discipline**:
+- Composes `round_trips.build_round_trips` (SSOT, AGENTS.md #10) — never
+  recomputes P&L / hold-time. Pure / no LLM / no DB — never raises.
+- Joins `entry_reason` verbatim from the contributing trade row by DB
+  `id` (the loser/winner_autopsy / catalyst_class_autopsy "surface the
+  reason verbatim, never NLP-parse it for trading logic" discipline).
+- First-buy convention (`pick_last=False`) — add-on BUY rows after the
+  opening thesis do NOT contribute keywords. Mirrors
+  `winner_autopsy._reason_for`.
+- Exit reason is **never** tokenised — this is a *thesis* keyword lift.
+- `set(...)` per round-trip — 'earnings earnings earnings' counts once.
+- Stopword list is *trading-text-specific* (the generic English list
+  under-covers "this trade", "the position", "hold" — the open_reason
+  boilerplate that would otherwise dominate every ranking). Frozen on
+  import so a test that mutates the set can't bleed across runs.
+- Pure-numeric tokens dropped ("2026", "80" — no thesis content; "rsi60"
+  / "q1" mixed-alphanum survive). 3-char minimum length.
+- Washes (sub-cent PnL) excluded from both sides — same convention as
+  `winner_autopsy` / `loser_autopsy` / `trade_asymmetry`.
+
+**STABLE gate**: `STABLE_MIN_PER_SIDE=4` on EACH side. Below this it is
+EMERGING (numerics + ranked lists emitted, `verdict=None`). At STABLE,
+the `verdict` field surfaces the single most-positive-lift keyword —
+one word the operator can scan instantly. Verdict is withheld in the
+degenerate "STABLE pool but no keyword cleared baseline" case (e.g.,
+the only keyword appears equally in wins and losses → 0pp lift → no
+verdict, headline says so).
+
+**Ranking determinism**: lift_pp DESC for winners, lift_pp ASC for
+losers, ties broken by n_total DESC then keyword ASC. A two-run
+identical-data input must produce a byte-identical ranked list (the
+disposition test pins this).
+
+**Advisory only** — never gates Opus, never injected into the decision
+prompt, no caps (AGENTS.md #2/#12). Same observational discipline as
+loser_autopsy / winner_autopsy / catalyst_class_autopsy.
+
+```sh
+curl -s 'http://localhost:8090/api/thesis-keyword-lift' | python3 -m json.tool
+```
+
+Pinned by `tests/test_thesis_keyword_lift.py` (31 cases): tokenize
+boundary (stopwords / numeric / short-tokens / non-string-defensive),
+empty-pool and one-sided pools (NO_DATA / NO_WINS / NO_LOSSES), wash
+exclusion, baseline arithmetic, pp-not-ratio formula, min_kw_occurrences
+threshold, STABLE gate (3W/4L = EMERGING, 4W/4L = STABLE), degenerate
+"no positive lift" verdict suppression, deterministic tie-break (sample
+size then alphabetical), top_n cap (each side independently),
+entry-reason-only discipline (exit reason cannot leak; add-on BUY cannot
+leak), envelope shape stability.
+
+---
+
 ## 2026-05-20 feature-dev pass (Agent 4) — `/api/catalyst-class-autopsy` + `/api/peer-earnings-shock`
 
 Two orthogonal additions that close gaps the existing ~135-endpoint
