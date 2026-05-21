@@ -13164,3 +13164,218 @@ calibration and baseline_compare on production data.
 · `user_findings=7` (loop dead, orphaned rows, dead sectors,
 no skill ledger, gate inactive, calibration/OOS divergence, GDELT
 instability)
+
+### 2026-05-20 review pass — ML+backtest HYBRID (Agent 2): cache type guards + walk-back inversion guard + `sample_weight_audit`
+
+Three concerns this pass addresses:
+
+#### Phase 1 — fix (commit `de0b18f`)
+
+Two contamination-risk bugs in the disk-cache / outcome-computation
+path that until now silently killed run threads or seeded fake outcomes
+into the scorer training set.
+
+**1. Cache-loader type guards (GDELT / AlphaVantage / volume / SEC).**
+Every `json.loads(path.read_text())` site in `paper_trader/backtest.py`
+that consumed a cache file assumed JSON syntactic validity ⇒ correct
+PAYLOAD shape. It does not. A truncated mid-write file, an external
+editor saving the wrong structure, or a storage fault could leave a
+dict/string/number where the code expected a list-of-dicts. The crash
+then surfaced cryptically at `for a in articles: a.get(...)` —
+iterating a dict yields keys as strings (no `.get`), a string yields
+chars, a number raises `TypeError`. Result: the backtest run thread
+died mid-cycle with no honest error path. Each loader now narrows to
+the expected shape and drops bad nested entries rather than the whole
+file when possible (mirrors `train_scorer`'s `n_label_dropped`
+discipline). Covered by `TestCacheCorruptionTypeGuards` (6 tests across
+GDELT/AV/volume) and `TestMergeSecCacheTypeGuards`. The four files
+affected:
+
+```python
+# backtest.py — narrow to a list of dicts; drop bad rows
+GDELTFetcher.fetch       (cache path: data/backtest_cache/gdelt/*.json)
+AlphaVantageNewsFetcher.fetch  (cache path: data/backtest_cache/alphavantage/*.json)
+_load_volume_cache_for_window  (cache path: data/backtest_cache/volumes_*.json)
+_merge_sec_cache         (cache path: data/backtest_cache/sec_edgar/*.json)
+```
+
+**2. Walk-back inversion guard in `_compute_decision_outcomes`.**
+The existing collision check (`sim_res == end_res`) rejects the case
+where BOTH endpoints walk back to the same prior close — a fabricated
+0% outcome that poisoned scorer training before the fix. But the same
+machinery has a theoretically-reachable INVERSION case: `end_d`'s
+walk-back lands MORE THAN 0 days BEFORE `sim_d` for a thin/foreign-
+calendar ticker with ≥7 consecutive missing closes around `end_d`.
+The resulting `returns_pct(sim_d, end_d)` then computes a "forward
+return" between two endpoints in REVERSE time order — sign-inverted,
+time-mangled, indistinguishable in the outcomes file from a real
+forward return. The fix STRICTLY STRENGTHENS the prior check:
+`end_res <= sim_res` rejects both collision (==) and inversion (<).
+Locked by `TestWalkBackInversionGuard` in `test_continuous.py`.
+Applied to both `_compute_decision_outcomes` (5d path) and `_fwd_ret_h`
+(10d/20d multi-horizon helper).
+
+#### Phase 2 — feature (commit `a9d3ba7`)
+
+`paper_trader/ml/sample_weight_audit.py` — A/B sweep across the
+DecisionScorer sample-weight policies on the temporal-OOS holdout.
+Answers the quant-research question every existing 'skill' module
+structurally cannot: *would a DIFFERENTLY-WEIGHTED scorer (uniform /
+run-only / llm-only / abs-label) have better OOS rank-IC than the
+deployed (`run_quality × LLM annotation`) policy?*
+
+Until now this required manually editing `train_scorer` and running
+a full cycle. The module makes it a one-command CLI:
+
+```bash
+python3 -m paper_trader.ml.sample_weight_audit          # text table
+python3 -m paper_trader.ml.sample_weight_audit --json   # JSON
+```
+
+Operational discipline matches every existing `paper_trader/ml/*.py`
+diagnostic:
+
+- **read-only** — NEVER writes the deployed pickle (load-bearing
+  invariant locked by `test_audit_does_not_write_deployed_pickle`)
+- never touches the trade path
+- degrades to `INSUFFICIENT_DATA` / error verdicts on bad input,
+  never raises (a CLI fault must not break automated pipelines)
+
+Five policies tested, all sharing the same dedup / SELL sign-flip /
+label clamp / `MLP_CONFIG` / OOS evaluator as the production path so
+the ONLY thing that varies is the weight column:
+
+| Policy      | Formula                                                |
+|-------------|--------------------------------------------------------|
+| `current`   | `max(0.5, min(2.0, 1 + return_pct/200)) * llm_mult`   |
+| `uniform`   | every record weighted 1.0 (null hypothesis)             |
+| `run_only`  | drop the LLM multiplier (isolates return_pct effect)    |
+| `llm_only`  | drop the run_quality clamp (isolates LLM annotation)    |
+| `abs_label` | weight by `|forward_return_5d|`                         |
+
+Verdicts (crisp, threshold-driven so they're exactly testable —
+threshold at module scope as `IC_TOL = 0.02`):
+
+| Verdict             | Meaning                                              |
+|---------------------|------------------------------------------------------|
+| `CURRENT_OPTIMAL`   | `current` beats every alternative by ≥ `IC_TOL`       |
+| `CURRENT_TIED`      | top alternative beats `current` by < `IC_TOL`         |
+| `CURRENT_DOMINATED` | top alternative beats `current` by ≥ `IC_TOL`         |
+| `INSUFFICIENT_DATA` | < `MIN_OOS_PAIRS` (=30) OOS pairs                     |
+
+28 tests in `test_sample_weight_audit.py` covering policy weight math,
+dedup, the temporal split, the no-disk-write invariant, and CLI exit
+codes.
+
+#### Phase 3 — live validation findings (quant researcher perspective)
+
+Ran against the deployed state on 2026-05-20. Seven concrete findings,
+all observational — not bug-fix candidates unless flagged:
+
+1. **`sample_weight_audit` verdict on the live corpus: `CURRENT_TIED`.**
+   Run on `data/decision_outcomes.jsonl` (n=7413, OOS=1406): the
+   deployed `current` policy and `run_only` are IDENTICAL on OOS
+   rank-IC (+0.0664). `llm_only` is identical to `uniform` (+0.0438).
+   **The LLM-annotation multiplier provides ZERO OOS rank skill on
+   this corpus.** Dropping the `llm_mult` factor from `train_scorer`
+   would shrink the corpus weight calculation to a single dimension
+   with no OOS skill loss. The LLM annotator pipeline (subprocess
+   to Claude Haiku, ENDORSE/CONDEMN labels) is currently overhead
+   without measurable benefit — a candidate for removal or
+   re-targeting. (No fix this pass — surfacing only.)
+
+2. **Deployed scorer pickle is stale.** `data/ml/decision_scorer.pkl`
+   was last written 2026-05-19 06:10 with `n_train=400`. The
+   accumulated `decision_outcomes.jsonl` has 7413 outcomes (dedupes
+   to ~6900 unique). The gap means the deployed pickle was trained
+   when only ~500 outcomes existed in the file; the loop has not
+   retrained since. **Critically: `n_train=400 < 500` ⇒ the
+   conviction gate (invariant #5) is INACTIVE in the deployed state.**
+   `_ml_decide`'s scorer modulation arms (×0.6/×0.85/×1.15/×1.3)
+   are no-ops on every live BUY. The next successful continuous-loop
+   cycle that completes `_train_decision_scorer` would advance `n_train`
+   to several thousand and re-engage the gate.
+
+3. **Two orphaned `running` backtest rows from 2026-05-18 not reaped.**
+   `run_id=6238` (started 14:17) and `run_id=6243` (started 18:45)
+   have remained in `status='running'` for 48+ hours despite the
+   `_reap_orphaned_runs(max_age_hours=6.0)` reaper. The reap function
+   only fires from the continuous loop's startup and per-cycle paths —
+   so either the loop hasn't started since these rows were created
+   (a process-uptime gap, not a code bug) or the reap silently failed.
+   Other 2026-05-17 rows were correctly reaped (visible in `notes` of
+   `run_id 6170, 6221–6224`), suggesting the reaper itself works.
+
+4. **Continuous loop appears to be currently DOWN.** `pgrep -fa
+   run_continuous_backtests` returned no process during validation.
+   Last successful retrain was 2026-05-19; latest DB writes are
+   `run_id=99001 / 90001` from 2026-05-20 — those have `n_trades=0`
+   (no fills) and `n_decisions=5/7`, suggesting truncated cycles. The
+   loop is not producing fresh training data right now.
+
+5. **`continuous.log` is stale.** Last write was 2026-05-18 12:03,
+   despite DB writes through 2026-05-20. Either log rotation moved
+   the file or the loop fork wrote to a different path. Monitoring
+   gap, not a code bug.
+
+6. **Backtest median return is unrealistically high.** Of 475
+   qualifying complete runs (`n_trades >= 5`), median total return is
+   **+63.5%** with median `vs_spy_pct` **+41.7%**. The mean is +150%
+   driven by tail leverage wins (max +689%, min -49%). This is not
+   "skill at picking winners" so much as **leveraged-ETF concentration
+   in favorable historical windows** — the persona boost matrix gives
+   personas 2 (Momentum), 4 (Macro), 6 (Quant), 10 (Speculator) heavy
+   SOXL/TQQQ/UPRO weights, and a 5-year window starting in 2015 or
+   2020 cannot lose if you load up on 3x semis. A skeptical quant
+   should NOT read these numbers as "the strategy adds 41pp alpha
+   vs SPY".
+
+7. **`news_urgency` / `news_article_count` features are 95.6% pinned
+   at build_features defaults.** Of 7413 outcomes, only 324 carry
+   non-null news urgency. The other 7089 land on the build_features
+   defaults (50.0 / 1.0). This is already documented in
+   `paper_trader.ml.feature_coverage`'s `DEAD_FEATURE_DEFAULTS`
+   finding, but worth highlighting: the "17-feature MLP" is
+   effectively a 15-feature MLP in practice because two slots carry
+   no variation. Operationally tied to the historical-backtest
+   article DB lacking urgency labels for old dates.
+
+### Counters
+
+`bugs_fixed=2` (cache type guards × 4 loaders + walk-back inversion
+guard × 2 paths; together they prevent two distinct contamination
+classes — cycle-crash and silent training-corpus poisoning)
+· `features_added=1` (`paper_trader/ml/sample_weight_audit.py` — 28 tests)
+· `user_findings=7` (LLM column inert · scorer pickle stale · orphan
+rows not reaped · continuous loop down · stale log · unrealistic
+backtest returns · dead news features)
+
+### How to use `sample_weight_audit`
+
+The decision a quant makes after reading the verdict:
+
+- `CURRENT_OPTIMAL` — current policy adds skill; keep it. No action.
+- `CURRENT_TIED` — current policy is statistically tied with the
+  simplest sibling. Inspect the leaderboard: if `current ≡ run_only`,
+  the LLM annotation column is inert and a candidate for removal.
+- `CURRENT_DOMINATED` — an alternative policy materially beats
+  current OOS. Switch the production weight function in
+  `train_scorer` to that alternative and observe the next few cycles.
+- `INSUFFICIENT_DATA` — wait for more cycles. The minimum is
+  `MIN_OOS_PAIRS=30` post-dedup-and-validation in the OOS tail.
+
+### Test commands for this pass
+
+```bash
+# Phase 1 cache type guards
+python3 -m pytest tests/test_backtest.py -v -k "CacheCorruption or MergeSec"
+
+# Phase 1 walk-back inversion guard
+python3 -m pytest tests/test_continuous.py -v -k "InversionGuard"
+
+# Phase 2 sample_weight_audit (full module coverage)
+python3 -m pytest tests/test_sample_weight_audit.py -v
+
+# Full ML/backtest slice
+python3 -m pytest tests/ -v -k "ml or backtest or scorer or weight"
+```
