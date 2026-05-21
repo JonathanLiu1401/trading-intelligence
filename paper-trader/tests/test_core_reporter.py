@@ -644,6 +644,106 @@ class TestTradeImpactLineUnit:
         assert "cash $480.00" in out
         assert "realized" not in out
 
+    # ── Cost-basis enrichment (``@ avg $X.XX``) ─────────────────────────
+    # After a BUY a trader's first sizing question is "what's my NEW avg
+    # cost?"; after a partial SELL it's "what does the leftover cost me?"
+    # The post-trade snapshot already carries ``avg_cost`` per position
+    # (set by ``upsert_position``'s blend), so the impact line surfaces it
+    # without re-deriving anything. Tests pin SPECIFIC numerics — the
+    # advisor's "field is present" warning — and lock byte-compat for
+    # snapshots that omit ``avg_cost`` (the earlier tests above).
+
+    def test_buy_emits_avg_cost_token_when_avg_present(self):
+        # 5 shares × $100 + 5 shares × $120 = $1100 / 10 shares = $110.
+        # Snapshot reflects the post-trade blended cost basis.
+        snap = {
+            "cash": 500.0, "total_value": 1100.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "stock", "qty": 10,
+                "avg_cost": 110.0, "current_price": 110.0,
+                "market_value": 1100.0,
+            }],
+        }
+        out = reporter._trade_impact_line(self._BUY, snap, None)
+        # Specific numerics — not just "field present".
+        assert out == (
+            "post: NVDA now 100.0% of book @ avg $110.00 · cash $500.00"
+        )
+
+    def test_partial_sell_emits_avg_cost_token_when_avg_present(self):
+        # Trader sold half; the remaining lot's avg cost ($100) is what
+        # they need to decide whether to trim more or hold.
+        snap = {
+            "cash": 480.0, "total_value": 1080.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "stock", "qty": 6,
+                "avg_cost": 100.0, "current_price": 100.0,
+                "market_value": 600.0,    # 600 / 1080 ≈ 55.6%
+            }],
+        }
+        out = reporter._trade_impact_line(self._SELL, snap, store=None)
+        assert (
+            "post: partial — NVDA still 55.6% of book @ avg $100.00"
+        ) in out
+        assert "cash $480.00" in out
+
+    def test_buy_option_avg_cost_only_for_matching_strike(self):
+        # 600C and 700C share the ticker but a fresh 600C BUY should show
+        # ONLY the 600C lot's blended avg ($5), never the 700C's ($8).
+        trade = {
+            "action": "BUY_CALL", "ticker": "NVDA", "qty": 1, "price": 5.0,
+            "value": 500.0, "reason": "",
+            "option_type": "call", "strike": 600.0, "expiry": "2026-12-19",
+            "timestamp": "2026-05-18T16:00:00+00:00",
+        }
+        snap = {
+            "cash": 600.0, "total_value": 1000.0,
+            "positions": [
+                {"ticker": "NVDA", "type": "call", "qty": 1,
+                 "avg_cost": 5.0, "market_value": 200.0,
+                 "strike": 600.0, "expiry": "2026-12-19"},
+                {"ticker": "NVDA", "type": "call", "qty": 1,
+                 "avg_cost": 8.0, "market_value": 200.0,
+                 "strike": 700.0, "expiry": "2026-12-19"},
+            ],
+        }
+        out = reporter._trade_impact_line(trade, snap, None)
+        assert (
+            "NVDA 600C 2026-12-19 now 20.0% of book @ avg $5.00"
+        ) in out
+        # The 700C's $8 cost must NOT leak into the 600C line.
+        assert "$8.00" not in out
+
+    def test_buy_garbage_avg_cost_suppresses_token(self):
+        # Defensive: a non-numeric avg_cost (impossible from the store,
+        # but a hand-built snapshot could supply garbage) silently drops
+        # the @avg token rather than crashing — the byte-compat path for
+        # the earlier tests that omit avg_cost altogether.
+        snap = {
+            "cash": 500.0, "total_value": 1000.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "stock", "qty": 5,
+                "avg_cost": "garbage", "market_value": 500.0,
+            }],
+        }
+        out = reporter._trade_impact_line(self._BUY, snap, None)
+        assert out == "post: NVDA now 50.0% of book · cash $500.00"
+        assert "@ avg" not in out
+
+    def test_buy_zero_avg_cost_suppresses_token(self):
+        # Zero avg_cost is non-physical (would mean a free fill); the
+        # `> 0` gate must hide a misleading "@ avg $0.00".
+        snap = {
+            "cash": 500.0, "total_value": 1000.0,
+            "positions": [{
+                "ticker": "NVDA", "type": "stock", "qty": 5,
+                "avg_cost": 0.0, "market_value": 500.0,
+            }],
+        }
+        out = reporter._trade_impact_line(self._BUY, snap, None)
+        assert "@ avg" not in out
+        assert out == "post: NVDA now 50.0% of book · cash $500.00"
+
 
 class TestSendDecisionLog:
     def test_includes_action_and_pl(self, monkeypatch):

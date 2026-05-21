@@ -269,14 +269,22 @@ def _trade_impact_line(trade: dict, snapshot: dict | None,
     ticker = (trade.get("ticker") or "").upper()
     is_option = trade.get("option_type") in ("call", "put")
 
-    # Find the post-trade book weight of THIS lot (same ticker, same
-    # stock/option side). Sum across the lot's matching positions in the
-    # snapshot — for stocks there's only one row; for options a single
-    # ticker can hold multiple strikes/expiries so we attribute weight per
-    # contract leg, not per ticker.
+    # Find the post-trade book weight + qty-weighted cost basis of THIS lot
+    # (same ticker, same stock/option side). Sum across the lot's matching
+    # positions in the snapshot — for stocks there's only one row; for
+    # options a single ticker can hold multiple strikes/expiries so we
+    # attribute weight per contract leg, not per ticker. The cost-basis
+    # accumulators feed the ``@ avg $X.XX`` token: after a BUY the trader
+    # wants the NEW blended avg cost (sizing the next add/exit); after a
+    # partial SELL the trader wants the REMAINING lot's avg cost (decide
+    # whether to add or trim further). Computed from the post-trade
+    # snapshot's own ``avg_cost`` field — single source of truth with the
+    # store (no re-derivation), and the snapshot already reflects the
+    # blend ``upsert_position`` just wrote.
     positions = snapshot.get("positions") or []
-    same_ticker_value = 0.0
     same_lot_value = 0.0
+    lot_qty_total = 0.0
+    lot_cost_total = 0.0  # Σ qty · avg_cost across matched rows
     for p in positions:
         if (p.get("ticker") or "").upper() != ticker:
             continue
@@ -284,7 +292,6 @@ def _trade_impact_line(trade: dict, snapshot: dict | None,
             mv = float(p.get("market_value") or 0.0)
         except (TypeError, ValueError):
             mv = 0.0
-        same_ticker_value += mv
         ptype = (p.get("type") or "").lower()
         if (is_option and ptype in ("call", "put") and
                 p.get("strike") == trade.get("strike") and
@@ -292,6 +299,23 @@ def _trade_impact_line(trade: dict, snapshot: dict | None,
             same_lot_value += mv
         elif not is_option and ptype == "stock":
             same_lot_value += mv
+        else:
+            continue
+        try:
+            q = float(p.get("qty") or 0.0)
+            ac = float(p.get("avg_cost") or 0.0)
+        except (TypeError, ValueError):
+            q = ac = 0.0
+        if q > 0 and ac > 0:
+            lot_qty_total += q
+            lot_cost_total += q * ac
+
+    lot_avg_cost = (
+        lot_cost_total / lot_qty_total if lot_qty_total > 0 else 0.0
+    )
+    avg_token = (
+        f" @ avg ${lot_avg_cost:.2f}" if lot_avg_cost > 0 else ""
+    )
 
     if action.startswith("BUY"):
         parts: list[str] = []
@@ -314,7 +338,7 @@ def _trade_impact_line(trade: dict, snapshot: dict | None,
                 if sf is not None:
                     label = (f"{ticker} {int(sf) if sf == int(sf) else sf}"
                              f"{otype_l} {expiry}")
-            parts.append(f"{label} now {leg_pct:.1f}% of book")
+            parts.append(f"{label} now {leg_pct:.1f}% of book{avg_token}")
         # Cash gives the trader the affordability number their NEXT decision
         # has to fit inside. Suppress when not meaningful.
         parts.append(f"cash ${cash:.2f}")
@@ -382,7 +406,8 @@ def _trade_impact_line(trade: dict, snapshot: dict | None,
             if same_lot_value > 0:
                 leg_pct = same_lot_value / total * 100.0
                 parts.append(
-                    f"partial — {ticker} still {leg_pct:.1f}% of book")
+                    f"partial — {ticker} still {leg_pct:.1f}% of book"
+                    f"{avg_token}")
             else:
                 # Full close with no round-trip available (e.g. caller did not
                 # pass ``store`` or build_round_trips failed). Use a bare
