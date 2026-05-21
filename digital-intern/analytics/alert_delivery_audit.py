@@ -79,6 +79,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
+OUT_PATH = Path("/home/zeph/logs/alert_delivery_audit.json")
+
 from watchers.alert_agent import (
     ALERT_MIN_LONE_SOURCE_CRED,
     _article_age_ok,
@@ -331,8 +333,17 @@ def main() -> int:
         "--pretty", action="store_true",
         help="Pretty-print the JSON report.",
     )
+    p.add_argument(
+        "--no-write", action="store_true",
+        help="Skip writing JSON to OUT_PATH (stdout only).",
+    )
     args = p.parse_args()
     report = run_audit(hours=args.hours)
+    if not args.no_write:
+        OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = OUT_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(report, indent=2))
+        tmp.replace(OUT_PATH)
     print(json.dumps(report, indent=2 if args.pretty else None))
     return 0
 
