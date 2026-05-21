@@ -736,6 +736,8 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    quant_signals: dict[str, dict] | None = None,
                    self_review_block: str | None = None,
                    track_record_block: str | None = None,
+                   repeat_loser_block: str | None = None,
+                   thesis_drift_block: str | None = None,
                    risk_mirror_block: str | None = None,
                    sector_exposure_block: str | None = None,
                    stress_block: str | None = None,
@@ -811,6 +813,25 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # aggregate mirror so the trader sees its concrete history on the exact
     # names in play before market data biases it.
     track_section = f"{track_record_block}\n" if track_record_block else ""
+    # Per-name losing-streak watch — same observational/advisory contract as
+    # track_record (invariants #2/#12). Placed immediately after the per-name
+    # closed-trade memory because it is the same dimension (per-name history)
+    # one degree sharper: a contiguous 2+ loss run on a single name is the
+    # exact pattern the aggregate self_review cannot localise. Silent on a
+    # clean book — the silence precedent.
+    repeat_loser_section = (
+        f"{repeat_loser_block}\n" if repeat_loser_block else ""
+    )
+    # Open-position thesis drift — observational only, same advisory contract
+    # (invariants #2/#12). Placed right after the closed-trade memory and
+    # before the structural-risk mirror so the trader sees its *open* book's
+    # health against the verbatim reason it was opened for, the exact
+    # discipline question this stack is built to surface. All-INTACT collapses
+    # to silence — the chat-enrichment silence precedent — so a healthy book
+    # produces no section.
+    thesis_drift_section = (
+        f"{thesis_drift_block}\n" if thesis_drift_block else ""
+    )
     # Concentration + churn mirror — same observational/advisory contract as
     # the two mirrors above (invariants #2/#12). Placed last in the
     # behavioural stack so the trader sees its structural risk (book shape +
@@ -867,7 +888,7 @@ PORTFOLIO:
   total value: ${snapshot['total_value']:.2f}
   positions:
 {chr(10).join(pos_lines) if pos_lines else '  (none)'}
-{review_section}{track_section}{risk_section}{sector_section}{stress_section}{event_section}{macro_section}{bp_section}
+{review_section}{track_section}{repeat_loser_section}{thesis_drift_section}{risk_section}{sector_section}{stress_section}{event_section}{macro_section}{bp_section}
 WATCHLIST PRICES:
 {chr(10).join(px_lines)}
 
@@ -1386,6 +1407,64 @@ def decide() -> dict:
     except Exception as e:
         print(f"[strategy] track-record failed (non-fatal): {e}")
 
+    # Per-name losing-streak watch — composed from the same trades ledger as
+    # track_record (single source of truth, invariant #10). Scoped to the SAME
+    # `_names_in_play` set so the prompt section only fires on tickers
+    # actionable this cycle. Observational only (the track_record precedent;
+    # invariants #2/#12); wrapped so a diagnostics failure is "no
+    # repeat-loser block this cycle", never "no decision this cycle". The
+    # builder reads oldest→newest — same `list(reversed(...))` shape
+    # track_record uses.
+    repeat_loser_block: str | None = None
+    try:
+        from .analytics.repeat_loser import build_repeat_loser
+        rl = build_repeat_loser(
+            list(reversed(store.recent_trades(2000))),
+            names=_names_in_play(snap.get("positions") or [], merged,
+                                  WATCHLIST),
+        )
+        repeat_loser_block = rl.get("prompt_block")
+    except Exception as e:
+        print(f"[strategy] repeat-loser failed (non-fatal): {e}")
+
+    # Open-position thesis drift — re-tests each holding against the verbatim
+    # reason it was opened for, scored against current quant + news. Pure
+    # arithmetic over the already-marked snapshot + the in-hand quant signals
+    # (NO extra store read / NO network — the risk_mirror hot-path
+    # discipline). All-INTACT collapses to a `None` block — the silence
+    # precedent — so a healthy book produces no section. Observational only
+    # (invariants #2/#12 — the track_record precedent); wrapped so a
+    # diagnostics fault is "no thesis-drift block this cycle", never "no
+    # decision this cycle".
+    thesis_drift_block: str | None = None
+    try:
+        from .analytics.thesis_drift import build_thesis_drift
+        # Remap the live quant_sigs (`MACD` uppercase string label, `rsi` /
+        # `mom_5d` lowercase numerics) into the lowercase shape the builder
+        # consumes (mirrors the `/api/thesis-drift` endpoint's exact remap so
+        # the prompt block and the dashboard panel cannot disagree on which
+        # positions are WEAKENING/BROKEN). News_count is intentionally
+        # omitted — the builder degrades off it (the entry_cited_news +
+        # news_cold heuristic stays dormant) and pulling per-ticker news on
+        # the live cycle is a latency hazard (the risk_mirror discipline).
+        td_signals = {
+            tk: {
+                "rsi": q.get("rsi"),
+                "macd": q.get("MACD"),
+                "mom_5d": q.get("mom_5d"),
+                "mom_20d": q.get("mom_20d"),
+            }
+            for tk, q in (quant_sigs or {}).items() if q
+        }
+        td = build_thesis_drift(
+            snap.get("positions") or [],
+            store.recent_trades(2000),
+            signals=td_signals or None,
+        )
+        thesis_drift_block = td.get("prompt_block")
+    except Exception as e:
+        print(f"[strategy] thesis-drift failed (non-fatal): {e}")
+
     # Concentration + churn mirror — the trader's *structural* risk (how
     # bunched the book is + how much it churns), composed verbatim from the
     # correlation/churn builders (single source of truth, invariant #10).
@@ -1550,6 +1629,8 @@ def decide() -> dict:
                              quant_signals=quant_sigs,
                              self_review_block=self_review_block,
                              track_record_block=track_record_block,
+                             repeat_loser_block=repeat_loser_block,
+                             thesis_drift_block=thesis_drift_block,
                              risk_mirror_block=risk_mirror_block,
                              sector_exposure_block=sector_exposure_block,
                              stress_block=stress_block,

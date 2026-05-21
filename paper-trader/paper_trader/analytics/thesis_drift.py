@@ -8,6 +8,13 @@ trader actually asks — *"is the thing I bought this for still true?"* —
 is unanswered, even though the answer is sitting verbatim in
 ``trades.reason`` of the opening fill.
 
+Also exposes ``prompt_block`` — a lean, advisory-only render of the
+WEAKENING / BROKEN entries for direct injection into the live decision
+prompt (the ``track_record_block`` precedent — same observational
+contract, AGENTS.md invariants #2/#12). INTACT positions collapse to
+silence — the chat-enrichment silence precedent — so a healthy book
+produces no block and the prompt sees nothing this cycle.
+
 ``build_thesis_drift`` anchors each open position on its **own opening
 BUY rationale** (the trader's literal words) and places it next to a
 deterministic, objective read of the present: P/L since entry, days
@@ -47,6 +54,77 @@ RSI_HOT = 78.0    # overextended; mean-reversion risk against a long thesis
 
 _NEWS_KWS = ("news", "urgent", "earnings", "catalyst", "headline",
              "beat", "guidance", "upgrade", "downgrade")
+
+# Prompt-block display caps. The block is injected every decision cycle
+# so it must stay lean: entry_reason is surfaced verbatim but truncated
+# past ``REASON_CAP`` — the ``track_record`` PER_NAME_CAP / REASON_CAP
+# discipline.
+REASON_CAP = 200
+
+_PROMPT_PREAMBLE = (
+    "YOUR OPEN-POSITION THESIS DRIFT (each holding re-tested against the "
+    "verbatim reason you opened it — INTACT positions are silent; "
+    "WEAKENING/BROKEN entries are observations and your own history, "
+    "NOT directives or limits; you retain complete autonomy over the "
+    "next decision):"
+)
+
+
+def _fmt_reason(r, cap: int) -> str:
+    """Verbatim reason, blank→``''``, truncated with an ellipsis past ``cap``."""
+    if r is None:
+        return ""
+    s = str(r).strip()
+    if not s:
+        return ""
+    if len(s) > cap:
+        s = s[: cap - 1].rstrip() + "…"
+    return s
+
+
+def _card_block_line(card: dict, reason_cap: int) -> list[str]:
+    """One position's lines for the prompt block. WEAKENING/BROKEN only —
+    INTACT cards are filtered before this is called."""
+    ticker = card.get("ticker") or "?"
+    typ = card.get("type") or "stock"
+    health = card.get("health") or "?"
+    pl_pct = card.get("pl_pct")
+    days = card.get("days_held")
+    head_bits = [f"{ticker} {typ} thesis {health}"]
+    if pl_pct is not None:
+        head_bits.append(f"P/L {pl_pct:+.2f}%")
+    if days is not None:
+        head_bits.append(f"held {days:.2f}d")
+    lines = [f"  {' — '.join(head_bits)}"]
+    reasons = card.get("drift_reasons") or []
+    if reasons:
+        lines.append(f"    drift: {'; '.join(reasons)}")
+    er = _fmt_reason(card.get("entry_reason"), reason_cap)
+    if er:
+        lines.append(f'    entry:"{er}"')
+    return lines
+
+
+def _render_prompt_block(report: dict, reason_cap: int = REASON_CAP) -> str | None:
+    """Turn a ``build_thesis_drift`` dict into a lean advisory block.
+
+    Returns ``None`` when there is nothing meaningful to surface — no
+    open positions, or every position is INTACT. Same silence
+    precedent as ``track_record_block`` and the chat-enrichment helpers
+    (a healthy book produces no block this cycle).
+
+    Output ordering follows the report's own ``positions`` ordering
+    (worst first: BROKEN → WEAKENING; most-negative P/L within a band)
+    so the prompt is consistent with ``/api/thesis-drift``.
+    """
+    cards = (report or {}).get("positions") or []
+    bad = [c for c in cards if c.get("health") in ("BROKEN", "WEAKENING")]
+    if not bad:
+        return None
+    lines = [_PROMPT_PREAMBLE]
+    for c in bad:
+        lines.extend(_card_block_line(c, reason_cap))
+    return "\n".join(lines)
 
 
 def _parse_ts(ts: str | None) -> datetime | None:
@@ -228,7 +306,7 @@ def build_thesis_drift(positions: list[dict],
                 else "all open theses still intact")
         headline = f"{n} open position(s): {', '.join(parts)} — {lead}."
 
-    return {
+    report = {
         "as_of": now.isoformat(timespec="seconds"),
         "state": state,
         "headline": headline,
@@ -239,6 +317,8 @@ def build_thesis_drift(positions: list[dict],
                  "opening rationale; never gates Opus, imposes no caps "
                  "(AGENTS.md #2/#12)."),
     }
+    report["prompt_block"] = _render_prompt_block(report)
+    return report
 
 
 if __name__ == "__main__":  # smoke test against the live DB
