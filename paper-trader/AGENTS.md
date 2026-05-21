@@ -15116,3 +15116,128 @@ python3 -m pytest tests/test_core_*.py -v
 - SESSION block top-level `Decisions N` total is the disjoint partition sum of
   the five status buckets; the new `buys` / `sells` sub-counts are NOT summed
   into N. Pinned by `test_decisions_total_does_not_double_count_buys_sells`.
+
+---
+
+## 2026-05-21 paper-trader-core HYBRID pass (Agent 1, ~10:42 UTC)
+
+Counters: `bugs_fixed=0` · `features_added=1` · `user_findings=4`.
+
+### Phase 1 — debug
+
+No real bug surfaced after a careful surgical pass over the seven target files
+(`runner.py`, `reporter.py`, `signals.py`, `strategy.py`, `dashboard.py`,
+`market.py`, `store.py`) — every angle I checked (`_classify_starvation_cause`
+parens regex, runner single-instance guard, `_decompress` fallback,
+`_maybe_daily_close` early-close gate, `_kill_stale_claude` PID scoping,
+`_enforce_risk_pre_trade` edge cases, `_extract_tickers` cashtag + alias
+filters, the runner-state sidecar future-marker hardening) all already had
+explicit code or a test pin. Roughly 30 prior HYBRID passes have already
+landed surgical fixes here; the residual is correct.
+
+Per the Phase-1 commit guard, no Phase-1 commit was made. The Phase-2 commit
+below also includes edge-case test pins for `_classify_starvation_cause` that
+lock down behaviour that wasn't explicitly tested but isn't a bug fix.
+
+### Phase 2 — feat: `/api/host-guard` surfaces per-cause starvation breakdown
+
+`paper_trader.host_guard.recent_starvation_by_cause` already classifies the
+last 120 NO_DECISION starvation rows into six operator-actionable buckets
+(`model_timeout` · `cli_nonzero_rc` · `model_empty` · `cli_missing` ·
+`host_skip` · `unknown`). The CLI (`python3 -m paper_trader.host_guard`)
+prints the breakdown verbatim, but the dashboard's `/api/host-guard`
+exposed only the AGGREGATE empty/skip rates — so an operator hitting the
+dashboard during a NO_DECISION storm saw the rate collapse to a single
+number with no class signal, and three classes of failure that each need
+a different action looked identical (CLI-side API hiccup vs sibling
+review-agent Opus contention vs configuration bug all read as "Opus
+isn't responding").
+
+Surfaced verbatim through `host_guard.recent_starvation_by_cause()` as the
+additive `starvation_by_cause` key on the existing `/api/host-guard`
+response. Degrade-safe to the all-zero `by_cause` shape on builder fault —
+mirrors the existing `recent_empty_rate` / `recent_skip_rate` contract on
+the same endpoint. Never raises into the dashboard.
+
+Live verification on `:8090` immediately after the commit deployed
+(git-watcher restart):
+```
+ok=True n=120 starved=41 rate=0.342
+by_cause:
+  cli_nonzero_rc=17   # Anthropic-side transient CLI exits
+  host_skip=24        # pre-flight + mid-call host_saturated declined
+  model_timeout=0  model_empty=0  cli_missing=0  unknown=0
+```
+The 17 `cli_nonzero_rc` rows are the cell my Phase 1 search had no surface
+for: 41% of the desk's recent starvation isn't the documented host-load
+pathology, it's Anthropic-side transient CLI exits — distinct from the
+out-of-band Opus contention that drove the 24 `host_skip` rows. Without
+this breakdown both classes rolled into "the box is overloaded" and the
+operator can't see which of the two dominates in a given window.
+
+Tests (9 new in `tests/test_host_guard_endpoint.py`):
+- `TestHostGuardStarvationByCause` (5): field-always-present invariant on
+  an empty DB · per-cause exact counts on a seeded mixed payload · future
+  unknown suffix lands in `unknown` bucket (sum reconciles) · builder
+  fault degrades to all-zero shape (never 500s the panel) · existing keys
+  preserved (`probe` · `reason` · `saturated` · `recent_empty_rate` ·
+  `recent_skip_rate` · `pulse`).
+- `TestClassifyEdgeCases` (4): `_classify_starvation_cause` is case-
+  insensitive (`(TIMEOUT)` → `model_timeout`) · strips whitespace inside
+  parens · empty/whitespace-only parens → `unknown` · host_skip prefix
+  wins over an inner parenthesised cause.
+
+Commit `58dba18`.
+
+### Phase 3 — live validation findings (live trader ~10:42 UTC)
+
+1. **HOST SATURATION + intermittent Anthropic-side CLI exits**. New
+   `starvation_by_cause` breakdown on the live `/api/host-guard` shows 41/120
+   recent decisions starved (34.2%): 24 `host_skip` (pre-flight or mid-call
+   `host_saturated` declined the Opus call) + 17 `cli_nonzero_rc` (claude CLI
+   exited non-zero with NO quota marker — Anthropic-side transient API
+   issue, distinct from the documented host-load pathology). 9 concurrent
+   Opus subprocesses on a 16-CPU box, load 22.45 — saturation is real and my
+   own HYBRID session is one of the 9.
+
+2. **Heartbeat reports IDLE_STORM**. 8 consecutive NO_DECISION cycles at
+   probe time; 29.0% of the last 142 decisions were NO_DECISION (live
+   `/api/decision-health`). The trader is cycling but not deciding; the
+   freeze is host saturation, NOT a wedged claude CLI (the auto-recovery
+   `_kill_stale_claude` breaker fires after 5 consecutive NO_DECISION which
+   is correctly happening — but the box never calms enough for the next
+   cycle to land an Opus call). The fix is operational (reduce parallel
+   Opus agents), not code.
+
+3. **Portfolio: 66 % NVDA, healthy P/L**. 3 shares NVDA at avg $223.43 (mark
+   == avg, P/L $0.00 because all 3 buys landed at the same intraday print)
+   = $670.30 of $1011.95 total. Cash $341.64. Total P/L $+11.95 (+1.19 %)
+   vs $1000 start. Concentration is real — the AGENTS.md concentration-line
+   surface flags this on the hourly Discord summary.
+
+4. **Discord delivery HEALTHY**. `/api/notify-health` verdict HEALTHY, 0
+   consecutive failures, last send succeeded. The shipped `openclaw` PATH
+   fix from earlier commits is holding.
+
+### How to run
+
+Live trader (singleton-guarded; the systemd unit at this writing rotates
+through busy-exit attempts because the manual launch holds the flock —
+see the `pt-systemd-vs-manual-restart-spam` memory note for context):
+```
+python3 -m paper_trader.runner               # manual, foreground (current)
+```
+
+Tests:
+```
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_host_guard_endpoint.py -v        # this pass's new tests
+python3 -m pytest tests/ -v                                   # full suite
+```
+
+Probe the new dashboard breakdown:
+```
+curl -s http://localhost:8090/api/host-guard \
+  | python3 -m json.tool | grep -A 20 starvation_by_cause
+```
+
