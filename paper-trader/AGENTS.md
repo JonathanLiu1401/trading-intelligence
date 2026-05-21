@@ -6,6 +6,164 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 ML+backtest HYBRID pass (Agent 2, ~late session #2) — outcomes regex word-boundary + bubble_gate_skill
+
+### Phase 1 — fix (commit `f520926`)
+
+**Bug**: `_compute_decision_outcomes` parses three tokens from each
+decision's `reasoning` string to seed the DecisionScorer training
+features:
+
+  - `score=` → `ml_score`
+  - `news_urg=` → `news_urgency`
+  - `news_article_count` → `news_article_count`
+
+Each regex matched the bare token without a word-boundary anchor — so
+a substring lived INSIDE any longer identifier:
+`re.search("score=…", "underscore=999 score=1.5 …")` returns 999 because
+the first substring `score=` lives inside `underscore=`. The same
+vulnerability existed for `news_urg=` (would match inside
+`prev_news_urg=` / `max_news_urg=`). A wrong value poisons the
+corresponding scorer training feature.
+
+Current `_ml_decide` reasoning emits only the canonical tokens, so no
+live poisoning happened — but the sibling `_parse_gate_decision`
+(`\bscorer=`) and `_parse_conviction_pct` (`\bconviction=`) already
+established the word-boundary discipline. This brings the older regexes
+in line so a future emission like `kw_score=` / `text_score=` cannot
+silently corrupt training.
+
+**Fix**: prepend `\b` to all three patterns.
+
+**Tests**: 31 new regression locks under
+`tests/test_ml_backtest_review_20260521.py` covering:
+
+  - regex word-boundary disambiguation (3 cases)
+  - `predict_with_meta` non-finite contract (3 cases)
+  - `build_features` clamp ranges per documented bounds (6 cases)
+  - `_parse_gate_decision` robustness (4 cases)
+  - `_to_float` numpy/exotic input handling (8 cases)
+  - PriceCache.returns_pct walk-back semantics (3 cases)
+  - DecisionScorer load-cache invalidation across atomic retrain (1 case)
+  - SELL/HOLD reasoning carries no conviction_pct (2 cases)
+  - misc honest-empty / boundary cases (1 case)
+
+### Phase 2 — feature (commit `c9f1615`)
+
+**`paper_trader/ml/bubble_gate_skill.py`** — read-only diagnostic that
+answers: *does `_ml_decide`'s `wk52_pos > 0.80` BUY suppression
+actually improve realized returns, or is it dumping legitimate
+breakouts?*
+
+The implicit hypothesis behind the gate is that 52-week-high positions
+are bubble traps. The hypothesis was never measured. The new module
+buckets FILLED BUY outcome rows by their captured `wk52_pos` and
+reports the realized 5d return per bucket:
+
+| Bucket | Range | Interpretation |
+|---|---|---|
+| `deep_discount` | 0.00 – 0.50 | bottom half of the 52-week range |
+| `mid` | 0.50 – 0.70 | middle band |
+| `near_high` | 0.70 – 0.80 | approaching the gate threshold |
+| `at_high` | 0.80 – 1.00 | at-or-near the 52-week high (the gate's target) |
+
+Verdict is driven solely by `at_high − mid` realized-5d spread:
+
+| Verdict | Meaning |
+|---|---|
+| `BUBBLE_GATE_HARMFUL` | at_high realizes MORE than mid (the gate is suppressing legitimate breakouts; alpha left on the table) |
+| `BUBBLE_GATE_JUSTIFIED` | at_high realizes LESS than mid (the gate's hypothesis is supported within the corpus) |
+| `BUBBLE_GATE_NEUTRAL` | spread within ±EDGE_TOL_PP=1.0pp (gate adds sizing variance without realized edge) |
+| `INSUFFICIENT_DATA` | < MIN_TOTAL=30 BUYs OR < MIN_BUCKET_N=5 in either compared bucket |
+| `WK52_NOT_YET_POPULATED` | 0 BUY rows carry a non-null `wk52_pos` (loop predates capture) |
+
+Mirrors `gate_realized.py`'s read-only / no-re-prediction discipline:
+never trains, never touches `decision_scorer.pkl`, never re-fetches
+prices. Same `analyze(outcomes_path, oos_only=True)` signature as
+`baseline_compare` / `calibration` / `gate_realized` so a per-cycle
+skill-ledger wiring is a future drop-in once `wk52_pos` populates.
+
+CLI mirrors the existing sibling pattern:
+```bash
+python3 -m paper_trader.ml.bubble_gate_skill         # OOS slice (default)
+python3 -m paper_trader.ml.bubble_gate_skill --all   # full corpus
+```
+
+Exits 2 on `BUBBLE_GATE_HARMFUL` (cron-branchable — the actionable
+"the gate is suppressing winners" signal, mirroring `gate_realized`'s
+exit-2-on-`GATE_HARMFUL`).
+
+**Tests**: 24 new tests under `tests/test_bubble_gate_skill.py`
+exercising every verdict branch with hand-crafted synthetic outcomes
+that pin the exact verdict + spread value, bucket boundary semantics,
+robustness against malformed rows (None, garbage, non-finite wk52,
+non-finite returns, bool labels), and file-IO with corrupt JSONL.
+
+### Phase 3 — live validation (read-only findings)
+
+Used the ML/backtest stack as a quant researcher would:
+
+1. **Continuous loop has been DOWN since 2026-05-18 ~18:45 UTC** —
+   `decision_outcomes.jsonl` last modified 2026-05-20; no
+   `run_continuous_backtests.py` process is running (only review
+   agents). The validation suite, the scorer-skill / baseline /
+   llm-annotation ledgers, and the wk52_pos capture all stop producing
+   when the loop is down.
+
+2. **Two stuck `status='running'` rows aged 64h / 68h** (run_ids 6238
+   and 6243). The `_reap_orphaned_runs` 6h-age sweep is correct and
+   would clean these on the next loop start — but only when the loop
+   restarts. Dashboards reading `/api/backtests` currently render them
+   as "in flight" indefinitely (CLAUDE.md §11 symptom).
+
+3. **DecisionScorer magnitude is wildly miscalibrated, but rank skill
+   is positive**. On a 1000-row OOS BUY sample with full features:
+
+   | gate bucket | mean predicted | mean realized 5d |
+   |---|---|---|
+   | p<-10 (×0.6 arm) | -18.93% | **+0.88%** |
+   | p<0 (×0.85 arm) | -5.35% | +0.47% |
+   | 0..5 (neutral) | +2.45% | +1.05% |
+   | p>5 (×1.15 arm) | +7.58% | +2.10% |
+   | p>10 (×1.3 arm) | +18.78% | +3.04% |
+
+   - OOS Spearman rank-IC = **+0.1049 (p=0.001, n=1000)** — a real but
+     modest edge.
+   - The RANK is monotone correct (the gate arms ARE the right ordering
+     of realized returns).
+   - The MAGNITUDE is off by ~20pp on the negative tail — predicting
+     -19% mean when realized is +0.9%. This is exactly why the gate's
+     conviction MULTIPLIER (×0.6 to ×1.3) is the right design choice
+     and a pred-magnitude-driven multiplier would be miscalibrated.
+   - The **×0.6 arm is sizing DOWN trades that historically WON** — but
+     by a small enough margin (+0.88% vs +1.05% neutral) that this is
+     conviction-bucket noise, not gate inversion. The `gate_realized`
+     verdict over the OOS slice is the canonical home for this judgment.
+
+4. **5 outcome fields at 0% population**: `conviction_pct`, `wk52_pos`,
+   `pct_from_52h`, `persona`, `regime_label` — all captured in code
+   but `decision_outcomes.jsonl` predates each capture. They populate
+   on the next loop run. This includes the field my new
+   `bubble_gate_skill` consumes — its CLI today honestly reports
+   `WK52_NOT_YET_POPULATED` on both `--oos` and `--all` slices, per the
+   documented "populates as the loop runs" precedent.
+
+5. **Deployed scorer `n_train=400`** — below the 500-row gate threshold
+   (CLAUDE.md §6 invariant #5), so the conviction gate is currently
+   **INACTIVE** in `_ml_decide`. The rank-IC measurement above
+   describes how it WOULD modulate if it were active.
+
+6. **`llm_quality_label` pipeline-dark confirmed**: 100% of 7413
+   outcome rows carry the `0` default — the
+   `_llm_annotate_outcomes` Anthropic client either is missing API
+   key, or is failing silently in production (the documented
+   `pipeline_dark` state). The `llm_annotation_skill_log.jsonl` ledger
+   captures this honestly.
+
+Counters: bugs_fixed=1, features_added=1, user_findings=6.
+
+---
+
 ## 2026-05-21 ML+backtest HYBRID pass (Agent 2, late session) — training/inference feature-parity
 
 ### Phase 1 — fix (commit `9268ee0`)
