@@ -387,6 +387,7 @@ def test_audit_fingerprint_set_matches_alert_agent_gate():
     from watchers import alert_agent
     names = {n for n, _p in alert_agent._QUOTE_WIDGET_TITLE_PATTERNS}
     assert names == {"price_glue", "pct_paren", "listing_card",
-                     "screener_tape", "stocktwits_sentiment"}, (
+                     "screener_tape", "stocktwits_sentiment",
+                     "image_credit"}, (
         f"fingerprint name set drifted: {names}"
     )

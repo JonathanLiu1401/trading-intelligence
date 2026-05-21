@@ -655,3 +655,100 @@ class TestQuoteWidgetGate:
         mock_claude.assert_not_called()
         mock_send.assert_not_called()
         assert spy.marked == ["st"]
+
+    # ── Image-credit fingerprint (_QW_IMAGE_CREDIT) ─────────────────────────
+    # "Angela Weiss/AFP/Getty Images" — the hero-image photo credit on a news
+    # page is wrapped inside the article's own <a> link, so web_scraper's
+    # anchor-text fallback picks up the credit string as the article title.
+    # Live evidence (2026-05-21 16:30:49Z, alert_recency.db): this exact title
+    # fired a real 🚨 BREAKING push from ``scraped/www.bloomberg.com`` —
+    # cred=0.90, well above the 0.45 lone-source bar (the authority gate
+    # cannot catch this; content type IS the failure). ML urgency head scored
+    # it 10.0 because the bloomberg.com URL + proper-noun tokens triggered
+    # the high-relevance pattern recognition.
+    def test_helper_rejects_image_credit_titles(self):
+        f = alert_agent._looks_like_quote_widget
+        for junk in (
+            "Angela Weiss/AFP/Getty Images",            # the exact live noise
+            "Tomohiro Ohsumi/Getty Images",
+            "Timorthy A. Clary/AFP/Getty Images",       # initial-bearing variant
+            "Anna Moneymaker/Getty Images",
+            "Drew Angerer/AFP/Getty Images",
+            "John Smith/Reuters",                       # 2-word + 1 agency
+            "Mary Jane Doe/Bloomberg/Getty Images",     # 3-word + 2 agencies
+            "  Angela Weiss/AFP/Getty Images  ",        # leading/trailing ws
+        ):
+            assert f({"title": junk}) is True, junk
+        # Real headlines that mention agencies / slashes must SURVIVE — the
+        # anchored ^...$ + Title-Case-Name + closed-agency-list trio is the
+        # discriminator. Validated against the must-survive corpus including
+        # cross-publisher prose and the AFP/Getty-launches edge case.
+        for good in (
+            "Reuters reports Q1 earnings beat",
+            "Bloomberg: NVDA breaks $200",
+            "Getty Images launches new product",
+            "AFP Photo: 5 things to know about Q1",
+            "MU drops 5%/Yahoo",                        # %/ slash mid-headline
+            "Stock Market Today: Reuters/AP",           # colon-led list
+            "Sam Altman/OpenAI says GPT-5 coming",      # OpenAI not in list
+            "Reuters/Yahoo Finance reports earnings",   # Yahoo not in list
+            "Apple/Microsoft deal closes",              # not agencies
+            "AFP/Getty Images launches new service",    # mid-sentence content
+            "Nvidia/AMD price war intensifies",         # both tickers
+            "Q1 Earnings Preview",
+            "Why Did Micron Stock Drop Today",
+            "Tom Cruise",                                # 2-word name no /agency
+        ):
+            assert f({"title": good, "link": "https://x.com/a/b"}) is False, good
+
+    def test_image_credit_suppressed_before_claude(self, monkeypatch):
+        """The exact live row that fired 16:30:49Z (Angela Weiss/AFP/Getty
+        Images from scraped/www.bloomberg.com, ml=10.0 → urgency=2) must NOT
+        fire 🚨 BREAKING: no Claude call, no Discord, marked alerted so it
+        exits the urgent queue. The bloomberg.com source is cred=0.90 so the
+        existing source-authority gate cannot catch this — the title gate is
+        the only thing standing between the photo credit and a Discord push."""
+        spy = self._StoreSpy()
+        row = self._row(
+            _id="ic", source="scraped/www.bloomberg.com",
+            link="https://www.bloomberg.com/news/articles/2026-05-21/trump-quantum",
+            title="Angela Weiss/AFP/Getty Images",
+            ai_score=0.0,
+        )
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call") as mock_claude, \
+             patch("notifier.discord_notifier.send") as mock_send:
+            ok = alert_agent.send_urgent_alert([row], spy)
+        assert ok is False
+        mock_claude.assert_not_called()
+        mock_send.assert_not_called()
+        assert spy.marked == ["ic"]
+
+    def test_image_credit_mixed_batch_only_real_reaches_prompt(self, monkeypatch):
+        """A high-cred bloomberg.com batch with one photo credit and one real
+        story: the credit is suppressed, the real story alerts, Claude only
+        sees the real one in the prompt."""
+        spy = self._StoreSpy()
+        credit = self._row(
+            _id="ic", source="scraped/www.bloomberg.com",
+            link="https://www.bloomberg.com/news/articles/2026-05-21/x",
+            title="Angela Weiss/AFP/Getty Images",
+        )
+        real = {
+            "_id": "r", "link": "https://reuters.com/mu-q3",
+            "title": "MU earnings blow past Q3 estimates sharply",
+            "source": "rss", "ai_score": 9.5, "summary": "",
+            "published": _iso(1), "first_seen": _iso(0.1),
+        }
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call",
+                          return_value="🚨 BREAKING ◈ EARNINGS ◈ MU") as mock_claude, \
+             patch("notifier.discord_notifier.send",
+                   return_value=True) as mock_send:
+            ok = alert_agent.send_urgent_alert([credit, real], spy)
+        assert ok is True
+        prompt = mock_claude.call_args.args[0]
+        assert "MU earnings blow past Q3 estimates" in prompt
+        assert "Angela Weiss" not in prompt
+        assert "Getty Images" not in prompt
+        assert sorted(spy.marked) == ["ic", "r"]
