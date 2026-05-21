@@ -103,6 +103,7 @@ from collectors.sec_insider_form4 import collect_sec_form4
 from collectors.nasdaq_halts_collector import collect_nasdaq_halts
 from collectors.fda_collector import collect_fda
 from collectors.usaspending_contracts_collector import collect_usaspending_contracts
+from collectors.unusual_volume_collector import collect_unusual_volume
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -259,6 +260,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "massive": MASSIVE_INTERVAL, "newsapi": NEWSAPI_INTERVAL,
     "yahoo_ticker_rss": YAHOO_TICKER_RSS_INTERVAL,
     "market_movers": MARKET_MOVERS_INTERVAL,
+    "unusual_volume": MARKET_MOVERS_INTERVAL,
     "fear_greed": FEAR_GREED_INTERVAL,
     "crypto_fear_greed": CRYPTO_FEAR_GREED_INTERVAL,
     "earnings_surprise": EARNINGS_SURPRISE_INTERVAL,
@@ -1032,6 +1034,28 @@ def market_movers_worker(store: ArticleStore):
             bo.reset()
         except Exception as e:
             log.warning(f"[market_movers_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(MARKET_MOVERS_INTERVAL)
+
+
+# ── Worker: Unusual Volume screener — every 5min ────────────────────────────
+def unusual_volume_worker(store: ArticleStore):
+    log.info("[unusual_volume_worker] started")
+    bo = Backoff("unusual_volume", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_unusual_volume()
+            _ingest(store, articles, "unusual_volume")
+            try:
+                source_health.record_result("unusual_volume", len(articles))
+            except Exception as he:
+                log.warning(f"[unusual_volume_worker] source_health error: {he}")
+            _worker_last_ok["unusual_volume"] = time.time()
+            log.debug(f"[unusual_volume] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[unusual_volume_worker] error: {e}; backing off {bo.peek():.0f}s")
             bo.sleep(lambda: _running)
             continue
         _sleep(MARKET_MOVERS_INTERVAL)
@@ -3158,6 +3182,7 @@ def main():
         ("newsapi",     newsapi_worker),
         ("yahoo_ticker_rss", yahoo_ticker_rss_worker),
         ("market_movers", market_movers_worker),
+        ("unusual_volume", unusual_volume_worker),
         ("short_interest", short_interest_worker),
         ("fear_greed",  fear_greed_worker),
         ("crypto_fear_greed", crypto_fear_greed_worker),
