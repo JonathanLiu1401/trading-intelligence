@@ -7198,3 +7198,222 @@ before each commit to confirm only my intentional changes were
 included. No `git add -A`, no config/data/logs files staged.
 AGENTS.md committed alongside the related code in this same
 documentation step.
+
+
+
+---
+
+## 2026-05-21 hybrid pass — per-source urgency label split (the "WHICH feeders to prune?" slice)
+
+**Phase 1 (test-coverage audit).** Every assertion the task spec listed
+was already pinned by an existing test (mapped one-to-one against the
+prompt's enumerated requirements):
+
+- `get_unalerted_urgent` excludes `backtest://` URLs → `test_article_
+  store.py:39` `test_get_unalerted_urgent_excludes_backtest_urls`.
+- `update_ml_scores_batch` writes `score_source='ml'` (not `'llm'`) →
+  `test_article_store.py:124` `test_update_ml_scores_batch_sets_ml`.
+- `mark_alerted` prevents re-fire → urgency=2 preservation pinned by
+  `test_urgency_scorer.py:73` `test_rescore_does_not_unalert`.
+- urgency_scorer score=9.5 → urgent, 3.0 → not urgent →
+  `test_urgency_scorer.py:37, 50`.
+- `EXTRA_FEATURE_DIM == 15` → `test_features.py:15`.
+- `ticker_mention_density == 0` for no-portfolio-ticker articles →
+  `test_features.py:42`.
+- `days_since_published` 0/24h → `test_features.py:65, 75`.
+- relevance head ∈ [0, 10], urgency ∈ [0, 1], no-NaN on zero input →
+  `test_model.py:12, 58`.
+- trainer excludes `score_source='ml'` rows → `test_trainer.py:27, 159`
+  (the second pin is on the `train_continuous` hot-path duplicate).
+- sample weights higher for high-relevance → `test_trainer.py:82`.
+
+`bugs_fixed=0` — per the Phase-1 commit guard, no new test added; no
+commit made in Phase 1.
+
+**Phase 2 (feature):** added `ArticleStore.urgency_label_split_by_source`
+— the per-source slice of the aggregate calibration metric
+(`urgency_label_split`, the briefing's `_format_label_calibration` line).
+
+The aggregate metric answers "is the alert path mostly LLM-vetted?" —
+pinned in production at **29% LLM-vetted (283/400 ML-only)** for days.
+The analyst then needs the next question answered: *which sources*
+generate the bulk of the remaining ML-only urgent firings. The live
+shape of that answer (probed against the same DB at the time of this
+commit, last 24h, 540 urgent rows across 150 sources):
+
+```
+source                                        total   ml  llm boost null llm_frac
+GN: Nvidia                                       58   47   11     0    0     0.19
+GN: dividend buyback                             47   40    7     0    0     0.15
+GN: earnings                                     35   31    4     0    0     0.11
+Finnhub/Yahoo                                    22   17    5     0    0     0.23
+YahooFinance/NVDA                                22   16    6     0    0     0.27
+stocktwits                                       27   15   12     0    0     0.44
+GN: tech earnings                                16   14    2     0    0     0.12
+scraped/finance.yahoo.com                        13   12    1     0    0     0.08
+GN: market today                                 12    9    3     0    0     0.25
+GN: stock market                                 11    9    2     0    0     0.18
+```
+
+i.e. five **Google News topic feeds** combined produce 30% of all urgent
+firings at an average 14% LLM-vetted rate — the prune-candidate signal
+the new metric exists to surface. Pre-feature the answer was guesswork
+or hand-rolled SQL.
+
+**Shape contract** (mirrors `source_freshness` / `source_throughput` /
+`recap_template_audit.audit_by_source`):
+
+  * `window_h`           — int (configurable, default 24)
+  * `by_source`          — list of dicts (capped at `top_n`, default 15)
+    * `source`            — verbatim `articles.source` value
+    * `total`             — urgent rows from this source in the window
+    * `llm` / `ml` / `briefing_boost` / `null`
+                          — score_source bucket counts (all four always
+                            present even when zero — dashboard-stable shape)
+    * `llm_fraction`      — `(llm + briefing_boost) / total`
+  * `total_urgent`       — count across all sources (not just `top_n`)
+  * `total_sources`      — full count so a UI can render "showing N of M"
+
+**Sort discipline:** ml-DESC with alphabetical tiebreak — worst-offender
+feeders at the top, fully deterministic (mirrors
+`source_throughput`'s discipline).
+
+**Load-bearing invariants intact by construction:**
+- pure read-side (single GROUP BY SELECT) with `_LIVE_ONLY_CLAUSE` —
+  synthetic backtest/opus rows can never inflate the per-source figure
+  (the recurring partial-filter regression class
+  `analytics/trend_velocity.py` violates is what this discipline exists
+  to prevent);
+- no `ai_score` / `ml_score` / `score_source` / `urgency` mutation
+  anywhere in the new path;
+- backtest isolation pinned by a dedicated test that seeds three
+  synthetic shapes (backtest:// URL, `backtest_*` source,
+  `opus_annotation*` source) all with urgency=1 — the metric correctly
+  returns `total_urgent=1` (only the live row) and the synthetic
+  sources never appear in `by_source`;
+- decorated with `@_retry_on_lock` like every other reader for the
+  documented shared-connection cursor-collision class.
+
+**Tests pinned** in `tests/test_urgency_label_split_by_source.py`
+(9 tests, **all pass in 2.42s**; mirror the precision-anchored style of
+`test_urgency_label_split.py` / `test_quote_widget_audit.py` /
+`test_recap_template_audit.py`): empty-store-returns-empty-list,
+single-source-has-all-four-buckets, mixed-sources-partition-exactly
+(per-source sums equal aggregate `urgency_label_split` — anti-drift
+guard between the two SQL paths), worst-ml-offender-first sort with
+alphabetical tiebreak, zero-ml-sources-sort-alphabetically, top_n-caps-
+list-but-not-total-sources, synthetic-rows-never-inflate-a-source (the
+load-bearing isolation guard — three synthetic shapes seeded), non-
+urgent-rows-not-counted, old-urgent-row-excluded-by-window. The focused
+sibling suite (every module touched plus the storage-side pin):
+**101 passed in 61.97s**, no regressions.
+
+Commit `ed1fcef`.
+
+**Phase 3 (live findings — news-analyst validation, 2026-05-21).**
+
+1. **(positive) Live ingest healthy.** 499 articles last 1h, 2,213
+   last 6h, 11,072 last 24h. Within nominal range for the active US
+   session window.
+
+2. **(positive) Latest briefing id38 (2026-05-21 07:36Z, 50 articles,
+   3439 chars) is dense and accurate** — opens with the Asia AI
+   complex rip (SK Hynix +11.17%, Softbank +19.85%, Samsung +8.51%)
+   that fully reversed the NVDA AH "lackluster guide" rout, with exact
+   MACRO table (S&P/NASDAQ/RUT/VIX/10Y/BTC/Gold/Oil/SSE), tight
+   PORTFOLIO P&L (LITE/LNOK/AXTI/MU/NVDA/ORCL/TSEM/QBTS/MSFT with
+   per-name notes), and SEMIS PULSE numbers (NVDA $223 / AMD $447 /
+   AMAT $426 / SMH $564). Briefing surface working as designed.
+
+3. **(positive) Alert pipeline firing under load.** 540 urgent rows
+   in last 24h, 429 actually alerted (urgency=2). Latest cycle:
+   "BN alert sent (5 distinct stories) (35 more queued)" — the
+   dedup + low-authority + recap-template + quote-widget + paraphrase
+   gates compose cleanly under volume.
+
+4. **(NEW, motivates Phase 2 feature) `GN: Nvidia` produced 47 of 540
+   urgent rows last 24h at 19% LLM-vetted** — i.e. ~8.7% of all
+   urgent firings came from ONE Google News topic feed and 81% of
+   them were ML-only (no Sonnet ground truth). Combined Google News
+   feeds (`GN: Nvidia` + `GN: dividend buyback` + `GN: earnings` +
+   `GN: tech earnings` + `GN: market today`) = 162/540 = 30% of all
+   urgent rows at an average 14% LLM-vetted rate. NOT a code bug —
+   this is the analyst-facing signal the Phase 2 feature exists to
+   surface. The underlying cause (Sonnet quota chronically throttling
+   `urgency_scorer` + the ML urgency head over-scoring Google News
+   topic feeds whose titles concentrate on held tickers) is
+   operational; the *visibility* gap was the actual bug.
+
+5. **(chronic, briefing cadence warning) id37→id38 gap was 10.2h**
+   (target 5h) — twice the cadence. id31→id30 gap was 7.8h. No
+   daemon.log restart evidence around the long gap, suggesting an
+   Opus-quota skip overnight (the heartbeat_worker calls `analyze()`
+   which returns `None` on a quota failure — daemon doesn't fall
+   back to the previous text, so the cycle is silently skipped).
+   This is the analyst's "I missed the overnight digest" failure
+   mode. Not addressed in this pass; left as a finding.
+
+6. **(chronic operational) SEC-EDGAR/8-K dark for 104h** — the
+   critical filings channel returned its last live row 104.6 hours
+   ago. Matches the `di-chronic-dark-collectors` memory; CLAUDE.md
+   §10 lists SEC EDGAR among the "common failure" sources but the
+   analyst is currently completely blind to fresh 8-Ks via this
+   collector. Standing external gap, not a fresh bug.
+
+7. **(chronic, expected) 22,893 dark sources >24h** — dominated by
+   `gdelt_gkg/<hyperlocal-host>` historical-backfill artefacts
+   (iheart.com 63k rows, joker.com 13k, thetimes.co.uk 10.8k,
+   yahoo.com 9.6k, msn.com 7.3k, dailymail.co.uk 7.2k, reuters.com
+   7k, ...). These are bulk-historical bookkeeping in the
+   `_LOW_AUTHORITY_DOMAINS` / GDELT GKG firehose, not active
+   collectors. Matches `di-chronic-dark-collectors`.
+
+8. **(positive, staging) Concurrent agents + auto-commit daemon
+   active; staging discipline held.** Visible from `ps -ef`: three
+   sibling claude HYBRID agents running (one paper-trader-core, two
+   feature-dev) — exactly the `pt-concurrent-samerole-staging-race`
+   / `di-shared-repo-concurrency` hazard pattern from memory. Used
+   explicit pathspec (`git add storage/article_store.py tests/
+   test_urgency_label_split_by_source.py`) followed by `git diff
+   --staged --stat` verification before commit. Commit `ed1fcef`
+   contains exactly those two files (`2 files changed, 388
+   insertions(+)`); the sibling agents' uncommitted changes
+   (`dashboard/web_server.py`, the prior session's
+   `analytics/quote_widget_audit.py` + `tests/test_quote_widget_
+   audit.py` + `watchers/alert_agent.py` `_QUOTE_WIDGET_TITLE_
+   PATTERNS` WIP) stayed exactly as found, untouched.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:**
+- `python3 -c "import sys; sys.path.insert(0,'.'); from storage import
+  article_store; from ml import features, model; print('imports OK')"`
+  → `imports OK`.
+- Focused suite (every module touched plus the new test file): 101
+  passed in 61.97s (`test_article_store` + `test_urgency_label_split` +
+  `test_urgency_label_split_by_source` + `test_urgency_scorer` +
+  `test_features` + `test_model` + `test_trainer` +
+  `test_briefing_label_calibration` + `test_quote_widget_audit`). Full
+  `python3 -m pytest tests/` deferred per the standing concurrent-agent
+  I/O saturation rule (three sibling agents visible in `ps -ef`; the
+  focused suite covers every module touched by this change).
+
+**Counters:** `bugs_fixed=0` (per the commit guard — every required
+assertion in the task spec was already pinned by an existing test;
+the four invariants are intact and the focused suite passes),
+`features_added=1` (per-source urgency-label split —
+`ArticleStore.urgency_label_split_by_source`, code+tests on master in
+`ed1fcef`), `user_findings=8` (live ingest healthy, briefing id38
+excellent, alert path firing under load, NEW per-source ML-only
+attribution validated live (GN: Nvidia 47 urgent rows @ 19% vetted),
+10.2h briefing cadence skip overnight, SEC-EDGAR/8-K chronic dark
+104h, 22k dark sources dominated by GDELT GKG hyperlocal backfill
+artefacts, concurrent-agent staging discipline held).
+
+**Staging discipline.** Per-commit, explicit pathspec, no `git add
+-A`. Sibling agents and the auto-commit daemon were both running;
+`git diff --staged --stat` was checked before commit to confirm only
+`storage/article_store.py` + `tests/test_urgency_label_split_by_
+source.py` were included. AGENTS.md committed alongside the related
+code in this same documentation step.
+
