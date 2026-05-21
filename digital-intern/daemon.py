@@ -107,6 +107,7 @@ from collectors.nasdaq_halts_collector import collect_nasdaq_halts
 from collectors.fda_collector import collect_fda
 from collectors.usaspending_contracts_collector import collect_usaspending_contracts
 from collectors.unusual_volume_collector import collect_unusual_volume
+from collectors.short_squeeze_monitor import collect_short_squeeze
 from collectors.twse_semiconductor import collect_twse_semiconductor
 from collectors import source_health
 from core.backoff import Backoff
@@ -270,6 +271,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "yahoo_ticker_rss": YAHOO_TICKER_RSS_INTERVAL,
     "market_movers": MARKET_MOVERS_INTERVAL,
     "unusual_volume": MARKET_MOVERS_INTERVAL,
+    "short_squeeze":  MARKET_MOVERS_INTERVAL,
     "fear_greed": FEAR_GREED_INTERVAL,
     "crypto_fear_greed": CRYPTO_FEAR_GREED_INTERVAL,
     "earnings_surprise": EARNINGS_SURPRISE_INTERVAL,
@@ -1087,6 +1089,27 @@ def unusual_volume_worker(store: ArticleStore):
             bo.reset()
         except Exception as e:
             log.warning(f"[unusual_volume_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(MARKET_MOVERS_INTERVAL)
+
+
+def short_squeeze_worker(store: ArticleStore):
+    log.info("[short_squeeze_worker] started")
+    bo = Backoff("short_squeeze", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_short_squeeze()
+            _ingest(store, articles, "short_squeeze")
+            try:
+                source_health.record_result("short_squeeze", len(articles))
+            except Exception as he:
+                log.warning(f"[short_squeeze_worker] source_health error: {he}")
+            _worker_last_ok["short_squeeze"] = time.time()
+            log.debug(f"[short_squeeze] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[short_squeeze_worker] error: {e}; backing off {bo.peek():.0f}s")
             bo.sleep(lambda: _running)
             continue
         _sleep(MARKET_MOVERS_INTERVAL)
@@ -3281,6 +3304,7 @@ def main():
         ("yahoo_ticker_rss", yahoo_ticker_rss_worker),
         ("market_movers", market_movers_worker),
         ("unusual_volume", unusual_volume_worker),
+        ("short_squeeze",  short_squeeze_worker),
         ("short_interest", short_interest_worker),
         ("fear_greed",  fear_greed_worker),
         ("crypto_fear_greed", crypto_fear_greed_worker),
