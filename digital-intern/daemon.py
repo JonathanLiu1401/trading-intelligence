@@ -72,6 +72,7 @@ from collectors.congress_trades_collector import collect_congress_trades
 from collectors.finra_short_volume import collect_finra_short_volume
 from collectors.market_movers import collect_market_movers
 from collectors.fear_greed_collector import collect_fear_greed
+from collectors.collector_rate_monitor import collect_rate_alerts
 from collectors.yield_curve_collector import collect_yield_curve
 from collectors.cftc_cot_collector import collect_cftc_cot
 from collectors.vix_term_structure import collect as collect_vix_ts
@@ -145,6 +146,7 @@ CONGRESS_TRADES_INTERVAL = 3600   # Congressional trading disclosures — once p
 CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog — once per hour
 MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
+RATE_MONITOR_INTERVAL   = 3600    # per-collector silence detector — hourly
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
 COT_INTERVAL            = 6 * 3600  # CFTC COT report — weekly release, check 6-hourly
 SHORT_INTEREST_INTERVAL = 21600   # highshortinterest.com every 6h (data updates ~2/month)
@@ -243,6 +245,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "yahoo_ticker_rss": YAHOO_TICKER_RSS_INTERVAL,
     "market_movers": MARKET_MOVERS_INTERVAL,
     "fear_greed": FEAR_GREED_INTERVAL,
+    "rate_monitor": RATE_MONITOR_INTERVAL,
     "yield_curve": YIELD_CURVE_INTERVAL,
     "short_interest": SHORT_INTEREST_INTERVAL,
     "wikipedia": WIKIPEDIA_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL,
@@ -995,6 +998,28 @@ def fear_greed_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(FEAR_GREED_INTERVAL)
+
+
+# ── Worker: per-collector silence detector — every 1h ────────────────────────
+def rate_monitor_worker(store: ArticleStore):
+    log.info("[rate_monitor_worker] started")
+    bo = Backoff("rate_monitor", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_rate_alerts()
+            _ingest(store, articles, "collector_monitor")
+            try:
+                source_health.record_result("collector_monitor", len(articles))
+            except Exception as he:
+                log.warning(f"[rate_monitor_worker] source_health error: {he}")
+            _worker_last_ok["rate_monitor"] = time.time()
+            log.debug(f"[rate_monitor] cycle ok ({len(articles)} silent alerts)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[rate_monitor_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(RATE_MONITOR_INTERVAL)
 
 
 # ── Worker: 10Y-2Y yield-curve inversion monitor — every 1h ─────────────────
@@ -2727,6 +2752,7 @@ def main():
         ("market_movers", market_movers_worker),
         ("short_interest", short_interest_worker),
         ("fear_greed",  fear_greed_worker),
+        ("rate_monitor", rate_monitor_worker),
         ("yield_curve", yield_curve_worker),
         ("cftc_cot",    cftc_cot_worker),
         ("vix_ts",      vix_ts_worker),
