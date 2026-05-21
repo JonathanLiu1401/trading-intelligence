@@ -3206,6 +3206,113 @@ def create_app(store=None) -> Flask:
             top_sources=top_sources,
         ))
 
+    @app.get("/api/briefing-coverage-audit")
+    def api_briefing_coverage_audit():
+        """Did the latest 5h briefing actually mention the urgent tickers?
+
+        Retrospective audit: pulls the latest ``briefings`` row, pulls every
+        ``urgency >= 1`` article that fired between the prior briefing's
+        timestamp and the latest briefing's timestamp (5h fallback when no
+        prior briefing is on record), and classifies each book ticker with
+        urgent flow as COVERED (mentioned anywhere in the briefing text) or
+        MISSED (absent despite urgent stories).
+
+        Complementary to the *prospective* enrichment helpers
+        ``_coverage_gap_lines`` / ``_book_silence_lines`` (which tell Opus
+        what to mention *before* he writes) — this verifies the published
+        output *after* he's written.
+
+        Query params:
+          ``card_cap`` — per-side row cap on covered/missed lists, 1..50
+                          (default 12). The aggregate counts always reflect
+                          the full set; the cap truncates display rows only.
+
+        Reads articles.db + briefings via ``_ro_query`` (short-lived
+        ``mode=ro`` connection — same precedent as
+        ``api_news_arrival_rhythm`` / ``api_score_distribution``). The
+        ``_LIVE_ONLY_CLAUSE`` is applied to the urgent-article scan so
+        backtest rows can never poison the audit (invariant #5).
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            card_cap = int(request.args.get("card_cap", 12))
+        except (TypeError, ValueError):
+            card_cap = 12
+        card_cap = max(1, min(50, card_cap))
+
+        from storage.article_store import _LIVE_ONLY_CLAUSE
+        from analytics.briefing_coverage_audit import (
+            build_briefing_coverage_audit,
+        )
+
+        try:
+            briefing_rows = _ro_query(
+                "SELECT ts, text, article_count FROM briefings "
+                "ORDER BY ts DESC LIMIT 2"
+            )
+        except sqlite3.Error as exc:
+            return jsonify({"error": f"db: {exc!s}"}), 500
+
+        if not briefing_rows:
+            return jsonify(build_briefing_coverage_audit(None, []))
+
+        latest = {
+            "ts": briefing_rows[0][0],
+            "text": briefing_rows[0][1],
+            "article_count": briefing_rows[0][2],
+        }
+        # Window = (prior_briefing_ts, latest_briefing_ts]. Falls back to a
+        # 5h heartbeat-cadence lookback when only one briefing exists.
+        try:
+            latest_dt = datetime.fromisoformat(
+                str(latest["ts"]).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return jsonify(build_briefing_coverage_audit(latest, []))
+        if not latest_dt.tzinfo:
+            latest_dt = latest_dt.replace(tzinfo=timezone.utc)
+
+        if len(briefing_rows) > 1 and briefing_rows[1][0]:
+            try:
+                start_dt = datetime.fromisoformat(
+                    str(briefing_rows[1][0]).replace("Z", "+00:00"))
+                if not start_dt.tzinfo:
+                    start_dt = start_dt.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                start_dt = latest_dt - timedelta(hours=5)
+        else:
+            start_dt = latest_dt - timedelta(hours=5)
+
+        # The articles table has no ``summary`` column — wire copy stores
+        # body in ``full_text`` (zlib BLOB) and the analyst-pass-through
+        # routes lazily decode it. For a coverage audit, the title alone is
+        # the high-signal source: financial wires write the ticker in the
+        # title; body decompression for thousands of rows would dominate the
+        # request budget. The builder already tolerates missing ``summary``.
+        try:
+            urgent_rows = _ro_query(
+                f"""SELECT title, urgency, source, first_seen
+                      FROM articles
+                     WHERE {_LIVE_ONLY_CLAUSE}
+                       AND urgency >= 1
+                       AND first_seen >= ?
+                       AND first_seen <= ?
+                     ORDER BY first_seen DESC
+                     LIMIT 5000""",
+                (start_dt.isoformat(timespec="seconds"),
+                 latest_dt.isoformat(timespec="seconds")),
+            )
+        except sqlite3.Error as exc:
+            return jsonify({"error": f"db: {exc!s}"}), 500
+        arts = [{"title": r[0], "urgency": r[1],
+                 "source": r[2], "first_seen": r[3]}
+                for r in urgent_rows]
+        return jsonify(build_briefing_coverage_audit(
+            latest, arts,
+            window_start=start_dt, window_end=latest_dt,
+            card_cap=card_cap,
+        ))
+
     @app.get("/healthz")
     @app.get("/api/health")
     def healthz():
