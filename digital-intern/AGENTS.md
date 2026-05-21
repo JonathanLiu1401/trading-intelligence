@@ -5,6 +5,71 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4) — `/api/news-arrival-rhythm`
+
+Per-source hour-of-day urgent-article distribution. The operator
+visibility surface that `collector_uptime` (silence gaps) and
+`source_throughput` (rate deceleration) leave open — both detect
+**failure**; this surfaces the **baseline cadence** of urgent news.
+Daemon runs 24/7; the operator needs to know *when* news lands and
+*from which source* so the chronically-quiet bands aren't mistaken for
+outages and the peak hours aren't slept through.
+
+Pure builder (`analytics.news_arrival_rhythm.build_news_arrival_rhythm`,
+mirrors `event_threads` / `portfolio_signals` discipline — pre-fetched
+article rows in, dict out, never raises). Route layer
+(`dashboard/web_server.py::api_news_arrival_rhythm`) is the SQL
+adapter only — `_ro_query` (short-lived `mode=ro` conn) over the
+articles.db with `_LIVE_ONLY_CLAUSE` applied + `urgency >= min_urgency`
++ first_seen window. Invariant #5 (backtest isolation) preserved.
+
+Query params (clamped):
+- `hours` — lookback window, 1..168 (default 24)
+- `min_urgency` — floor, 0..2 (default 1 — "needs alert" or higher; 0
+  floods the heatmap with the noise floor of every scored article)
+- `top_sources` — display cap on the per-source breakdown, 1..50
+  (default 10). The aggregate `hour_of_day_totals` always reflects every
+  kept article — the cap truncates the cards, not the counts.
+
+Response (envelope identical across NO_DATA / SPARSE / STABLE so the UI
+binding never sees a missing field):
+
+- `state` — `NO_DATA` (no articles in window) / `SPARSE` (<5 kept,
+  rhythm read withheld) / `STABLE` (≥5 kept)
+- `headline` — peak hour + loudest source + longest quiet stretch
+- `hour_of_day_totals` — 24-element array, always; index = UTC hour
+- `peak_hour` / `trough_hour` — int 0..23 or None on NO_DATA. trough
+  prefers the earliest zero hour over the lowest-nonzero hour (the
+  "go look" signal the operator wants)
+- `quiet_window` — `{length_hours, start_hour, end_hour}`. The
+  longest contiguous zero-count stretch, **circular** over the 24h
+  cycle — a quiet 22:00→01:59 reads as length 4, start 22, end 1.
+  All-zero pool → length 24; all-nonzero → length 0 (start/end nulled).
+- `sources` — `[{source, total, hourly_counts[24], peak_hour,
+  n_quiet_hours}]`, most-active first, alphabetical tie-break for
+  byte-stable card order. Capped to `top_sources_cap`.
+- `n_sources` — distinct pre-cap source count
+- `n_articles_scanned` vs `n_articles_kept` — diagnostic gap so a
+  filter regression (urgency / window / parse) is operator-visible.
+
+```sh
+curl -s 'http://localhost:8080/api/news-arrival-rhythm?hours=24&min_urgency=1' | python3 -m json.tool
+```
+
+Pinned by `tests/test_news_arrival_rhythm.py` (33 cases): empty +
+defensive (non-list / non-dict-row / invalid urgency / invalid
+first_seen / zero hours / future timestamps), urgency floor (0 / 1 / 2
+boundaries), window cutoff (23h kept / 25h dropped on `hours=24`),
+hour-of-day UTC bucketing (per-source sums reconcile to aggregate),
+source ranking (DESC by total, ASC tiebreak), top_sources cap truncates
+display only, missing/non-string source collapses to `(unknown)`,
+circular quiet-window (simple / wrap-around / all-zero / all-nonzero /
+empty), SPARSE/STABLE state at the 5-kept boundary, envelope key
+stability across all states, naive-ISO and Z-suffixed timestamp
+tolerance.
+
+---
+
 ## Architecture at a glance
 
 `daemon.py` is the production entry point. It spins up ~30 independent worker threads — one per
