@@ -268,6 +268,21 @@ _QW_SCREENER_TAPE = re.compile(
     r"^\s*\[YF/[a-z_]+\]\s+[A-Z]"
 )
 
+# Single source of truth for the title-fingerprint set, mirrored by
+# ``_RECAP_TEMPLATE_PATTERNS`` below. analytics.quote_widget_audit imports this
+# tuple so per-fingerprint counts in the audit cannot silently drift from what
+# ``_looks_like_quote_widget`` actually catches — the same anti-drift
+# discipline the recap-audit module follows. The URL-based ``_QW_QUOTE_PATH``
+# is NOT included here: it inspects the link, not the title, and the audit
+# operates on title-only counts (matching how the rows enter the training
+# pool — by title-derived ai_score, not URL).
+_QUOTE_WIDGET_TITLE_PATTERNS = (
+    ("price_glue", _QW_PRICE_GLUE),
+    ("pct_paren", _QW_PCT_PAREN),
+    ("listing_card", _QW_LISTING),
+    ("screener_tape", _QW_SCREENER_TAPE),
+)
+
 
 def _looks_like_quote_widget(art: dict) -> bool:
     """True for a live quote-tape / quote-listing entry masquerading as an
