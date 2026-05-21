@@ -50,6 +50,7 @@ from collectors.gdelt_collector import collect_gdelt, QUERY_GROUPS
 from collectors.ticker_news import collect_ticker_news
 from collectors.reddit_collector import collect_reddit
 from collectors.stocktwits_collector import collect_stocktwits
+from collectors.stocktwits_sentiment import collect_stocktwits_sentiment
 from collectors.web_scraper import scrape_web
 from collectors.stock_data import get_stock_data
 from collectors.earnings_calendar import get_earnings
@@ -699,6 +700,26 @@ def stocktwits_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(STOCKTWITS_INTERVAL)
+
+
+def stocktwits_sentiment_worker(store: ArticleStore):
+    log.info("[stocktwits_sentiment_worker] started")
+    bo = Backoff("stocktwits_sentiment", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_stocktwits_sentiment()
+            _ingest(store, articles, "stocktwits/sentiment")
+            try:
+                source_health.record_result("stocktwits_sentiment", len(articles))
+            except Exception as he:
+                log.warning(f"[stocktwits_sentiment_worker] source_health error: {he}")
+            _worker_last_ok["stocktwits_sentiment"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[stocktwits_sentiment_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(300)  # re-scan every 5 min; internal cursor prevents per-ticker spam
 
 
 # ── Worker W5: Ticker news — re-fetch every 120s ─────────────────────────────
@@ -2299,6 +2320,13 @@ def heartbeat_worker(store: ArticleStore):
                 # `briefing` text, so it can't reach the trainer's
                 # title-prefix label scan.
                 coverage_line = _format_portfolio_coverage(source_articles)
+                # Label-calibration line: of urgency>=1 rows in the last 5h,
+                # what fraction carried a real LLM ground-truth label vs only
+                # a model self-prediction? Silent on healthy/quiet windows,
+                # emits only on Sonnet-dark or majority-unverified-storm —
+                # exact dashboard-verdict parity. Discord-only, same
+                # discipline as the other augmentation lines.
+                calibration_line = _format_label_calibration(store)
                 # Coverage-gap banner is Discord-only — NOT folded into the
                 # saved `briefing` text, so it can't reach the trainer's
                 # title-prefix label scan (same discipline as health_line).
@@ -2307,6 +2335,7 @@ def heartbeat_worker(store: ArticleStore):
                     (banner + "\n\n" if banner else "")
                     + briefing.rstrip() + "\n\n" + health_line
                     + ("\n" + coverage_line if coverage_line else "")
+                    + ("\n" + calibration_line if calibration_line else "")
                 )
                 if banner:
                     log.warning(
@@ -2655,6 +2684,77 @@ def _format_portfolio_coverage(
     return line
 
 
+def _format_label_calibration(
+    store: ArticleStore, hours: int = 5, max_chars: int = 150
+) -> str:
+    """One-line urgent-row calibration signal for the heartbeat briefing.
+
+    The 5h digest already surfaces source-health and book-coverage; the
+    aggregate that was missing is *how much of this window's urgent stream
+    carried a real LLM ground-truth label* vs only an unverified
+    model-self-prediction. The per-row "[unverified — model-only urgent]"
+    alert tag (see ``ArticleStore.get_unalerted_urgent``'s ``_llm_vetted``
+    key) hedges individual pushes, but nothing exposed the cohort fact —
+    when the Sonnet ``urgency_scorer`` is dark / quota-throttled / flooring
+    everything to noise the standalone-push channel becomes single-headed
+    and the analyst should know.
+
+    Mirrors the silence-on-healthy discipline of
+    ``_format_source_health_summary`` / ``_format_portfolio_coverage`` (and
+    the chat enrichment blocks' ``_event_readiness`` / ``_macro_calendar``
+    precedent): a quiet or healthy window emits ``""`` so the briefing
+    stays clean; only an actionable calibration miss emits a line. Verdict
+    thresholds mirror the ``/api/urgent-label-split`` endpoint
+    (``dashboard/web_server.py``) byte-for-byte so the briefing surface
+    cannot drift from the dashboard verdict.
+
+    Read-only — composes ``ArticleStore.urgency_label_split`` (a single
+    GROUP BY SELECT with ``_LIVE_ONLY_CLAUSE``, no writes, synthetic rows
+    excluded). No ``ai_score`` / ``ml_score`` / ``score_source`` / urgency
+    mutation. All four load-bearing invariants intact by construction.
+    Discord-only — the caller appends to the posted message, NEVER folds
+    into the saved ``briefing`` text, so the trainer's title-prefix label
+    scan cannot reach it (same discipline as the source-health line, the
+    coverage line, and the coverage-gap banner).
+    """
+    try:
+        data = store.urgency_label_split(hours=hours)
+    except Exception:
+        return ""  # best-effort — a metric outage must never block a briefing
+    total = int(data.get("total") or 0)
+    if total == 0:
+        return ""  # quiet window — nothing actionable to say
+    try:
+        llm_fraction = float(data.get("llm_fraction") or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    # Same verdict ladder as dashboard /api/urgent-label-split — keep aligned.
+    if llm_fraction == 0.0 and total >= 3:
+        verdict = "storm"
+    elif llm_fraction < 0.5 and total >= 5:
+        verdict = "mostly_unverified"
+    else:
+        return ""  # healthy — silent
+    by_src = data.get("by_source") or {}
+    ml_n = int(by_src.get("ml") or 0)
+    pct = int(round(llm_fraction * 100))
+    if verdict == "storm":
+        # 0% LLM-vetted means the Sonnet urgency_scorer hasn't labeled a
+        # single urgent row in the window — most likely dark / quota / wedged.
+        line = (
+            f"🔬 Urgent calibration: 0% LLM-vetted last {hours}h "
+            f"({ml_n}/{total} ML-only) — Sonnet scorer dark"
+        )
+    else:
+        line = (
+            f"🔬 Urgent calibration: {pct}% LLM-vetted last {hours}h "
+            f"({ml_n}/{total} ML-only)"
+        )
+    if len(line) > max_chars:
+        line = line[: max_chars - 1].rstrip() + "…"
+    return line
+
+
 def _build_health_line(store: ArticleStore) -> str:
     now = time.time()
     tracked = ("gdelt", "rss", "scorer", "price_alert")
@@ -2778,6 +2878,7 @@ def main():
         ("web",         web_worker),
         ("reddit",      reddit_worker),
         ("stocktwits",  stocktwits_worker),
+        ("stocktwits_sentiment", stocktwits_sentiment_worker),
         ("ticker",      ticker_worker),
         ("sec_edgar",   sec_edgar_worker),
         ("sec_edgar_ft", sec_edgar_ft_worker),
