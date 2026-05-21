@@ -2217,6 +2217,171 @@ def _mark_integrity_line(store) -> str:
         return ""
 
 
+def _feed_db_probe(db_path: str, want_counts: bool = False) -> dict:
+    """Read newest live ``first_seen`` (and optionally 2h/24h live counts) from
+    one candidate ``articles.db``. Mirrors ``dashboard._feed_db_probe`` but is
+    intentionally duplicated here to keep ``reporter`` standalone (importing
+    from ``dashboard`` would form a cycle — ``dashboard`` already imports
+    ``reporter`` and that direction is load-bearing).
+
+    The live-only clause is inlined verbatim (canonical AGENTS.md invariant
+    #1/#3) — a planted backtest:// row must never read as the freshest
+    article. Never raises (the Discord-path discipline).
+    """
+    out = {"exists": False, "newest": None, "live_2h": 0, "live_24h": 0}
+    try:
+        import sqlite3 as _sql
+        from pathlib import Path as _P
+        if not _P(db_path).exists():
+            return out
+        out["exists"] = True
+        conn = _sql.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0)
+        try:
+            live_clause = (
+                "url NOT LIKE 'backtest://%' "
+                "AND source NOT LIKE 'backtest_%' "
+                "AND source NOT LIKE 'opus_annotation%'"
+            )
+            row = conn.execute(
+                f"SELECT MAX(first_seen) FROM articles WHERE {live_clause}"
+            ).fetchone()
+            out["newest"] = row[0] if row else None
+            if want_counts:
+                now = datetime.now(timezone.utc)
+                s2 = (now - timedelta(hours=2)).isoformat()
+                s24 = (now - timedelta(hours=24)).isoformat()
+                out["live_2h"] = int(conn.execute(
+                    f"SELECT COUNT(*) FROM articles WHERE "
+                    f"first_seen >= ? AND {live_clause}", (s2,),
+                ).fetchone()[0] or 0)
+                out["live_24h"] = int(conn.execute(
+                    f"SELECT COUNT(*) FROM articles WHERE "
+                    f"first_seen >= ? AND {live_clause}", (s24,),
+                ).fetchone()[0] or 0)
+        finally:
+            conn.close()
+    except Exception:
+        return out
+    return out
+
+
+def _feed_health_line(store) -> str:
+    """One-line "is the trader actually *seeing* any news right now?" for the
+    hourly / daily report.
+
+    ``/api/feed-health`` exposes this on the *dashboard*, but the operator
+    lives in Discord and never opens it (the documented dashboard→Discord gap
+    ``_mark_integrity_line`` / ``_drawdown_line`` / ``_benchmark_line`` each
+    close, one dimension over: vs-cost-marks, vs-own-peak, vs-index, now
+    vs-news-pipeline). When the article DB is stale the prompt's signal block
+    is empty, ``signal_count`` is recorded 0, and a 0-signal HOLD looks
+    identical to a deliberate one in every other Discord surface. The
+    operator-visible symptom is "the book just HOLDs for hours" with no
+    explanation — exactly the silent-failure mode this surface catches.
+
+    Composes ``build_feed_health`` **verbatim** (single source of truth,
+    invariant #10 — the headline is the builder's, never re-derived here, so
+    this Discord line and ``/api/feed-health`` can never drift). Calls
+    ``signals._db_path()`` for the resolved DB and ``signals._legacy_choice()``
+    for the existence-first legacy resolver (the canonical split-brain
+    comparison). Probes each candidate with ``_feed_db_probe`` for newest
+    live ``first_seen`` and (resolved-only) 2h/24h counts.
+
+    **Pure local filesystem reads — NO network** (the Discord-path discipline;
+    the ``_drawdown_line`` precedent — opening articles.db read-only is
+    identical to what ``signals.get_top_signals`` does on every decision
+    cycle, no fresh latency hazard). Observational only, never gates, adds no
+    caps (invariants #2/#12). Failure contract mirrors the rest of
+    ``reporter``: any signals/probe/builder fault degrades to ``""`` ("no
+    feed-health line this report"), **never** an exception ("no Discord
+    summary this report"). ``store`` is passed only for the decision-streak
+    read; a store fault still degrades to empty.
+
+    Suppression — surface ONLY actionable verdicts:
+      * ``BLIND`` — ≥3 consecutive 0-signal decisions (the trader is provably
+        flying blind) → ⚠️ fires.
+      * ``STALE_FEED`` — newest live article ≥6h old (feed stuck) → ⚠️ fires.
+      * ``HEALTHY`` / ``NO_DATA`` → silent (silence-when-nothing-actionable;
+        the ``_drawdown_line`` at-high-water precedent). A ``HEALTHY`` summary
+        must never become its own lying green light.
+    """
+    try:
+        from . import signals as _sig
+        from .analytics.feed_health import build_feed_health
+        try:
+            resolved = _sig._db_path()
+        except Exception as e:
+            print(f"[reporter] feed-health resolve failed: {e}")
+            return ""
+        resolved_str = str(resolved)
+        # Two candidates, de-duped, listing order preserved (USB first, LOCAL
+        # second — same ordering ``/api/feed-health`` uses).
+        seen: set[str] = set()
+        cand_paths: list[str] = []
+        for p in (_sig.USB_DB, _sig.LOCAL_DB):
+            ps = str(p)
+            if ps not in seen:
+                seen.add(ps)
+                cand_paths.append(ps)
+        try:
+            legacy_str = str(_sig._legacy_choice())
+        except Exception:
+            legacy_str = resolved_str  # degrade — no split-brain detection
+        candidates: list[dict] = []
+        probe_by_path: dict[str, dict] = {}
+        resolved_probe = {"exists": False, "newest": None,
+                          "live_2h": 0, "live_24h": 0}
+        for ps in cand_paths:
+            probe = _feed_db_probe(ps, want_counts=(ps == resolved_str))
+            probe_by_path[ps] = probe
+            candidates.append({
+                "path": ps,
+                "exists": probe["exists"],
+                "newest": probe["newest"],
+            })
+            if ps == resolved_str:
+                resolved_probe = probe
+        legacy_probe = probe_by_path.get(legacy_str)
+        feed = {
+            "resolved_path": resolved_str if resolved_probe["exists"] else None,
+            "resolved_newest": resolved_probe["newest"],
+            "resolved_live_2h": resolved_probe["live_2h"],
+            "resolved_live_24h": resolved_probe["live_24h"],
+            "legacy_path": (legacy_str if legacy_probe
+                            and legacy_probe["exists"] else None),
+            "legacy_newest": legacy_probe["newest"] if legacy_probe else None,
+            "candidates": candidates,
+        }
+        try:
+            decisions = store.recent_decisions(limit=3000)
+        except Exception as e:
+            print(f"[reporter] feed-health decision read skipped: {e}")
+            decisions = []
+        fh = build_feed_health(decisions, feed)
+        if not isinstance(fh, dict):
+            return ""
+        verdict = fh.get("verdict")
+        if verdict not in ("BLIND", "STALE_FEED"):
+            return ""
+        headline = fh.get("headline") or ""
+        if not headline:
+            return ""
+        # Restart-recommended is the actionable nudge for the split-brain
+        # shape (a runner process still reading the stale legacy resolution
+        # needs a relaunch — the on-disk fix doesn't help). The builder's
+        # headline already names the split-brain clause; we add the explicit
+        # operator hint inline so it can't be missed.
+        restart = fh.get("restart_recommended")
+        lines = [f"⚠️ **FEED HEALTH** ◈ {verdict}", f"> {headline}"]
+        if restart:
+            lines.append("> restart_recommended — relaunch the runner to "
+                         "re-resolve the news feed")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[reporter] feed-health line skipped: {e}")
+        return ""
+
+
 def _merge_stale_marks(open_positions: list[dict],
                        json_positions: list[dict] | None) -> list[dict]:
     """Return ``open_positions`` rows enriched with the ``stale_mark`` flag
@@ -3436,6 +3601,13 @@ def send_hourly_summary() -> bool:
     mi = _mark_integrity_line(store)
     if mi:
         body += "\n" + mi
+    # FEED HEALTH sits right after MARK INTEGRITY — same urgency tier (both
+    # tell the operator "the inputs feeding every downstream signal are
+    # compromised"). Silent on HEALTHY / NO_DATA per the silence-when-nothing-
+    # actionable contract; only BLIND / STALE_FEED surface.
+    fh = _feed_health_line(store)
+    if fh:
+        body += "\n" + fh
     ns = _next_session_line()
     if ns:
         body += "\n" + ns
@@ -3652,6 +3824,12 @@ def send_daily_close() -> bool:
     mi = _mark_integrity_line(store)
     if mi:
         body += "\n" + mi
+    # FEED HEALTH follows MARK INTEGRITY on daily close too — see
+    # ``send_hourly_summary`` for the rationale (same urgency tier, input
+    # compromise; silent on HEALTHY / NO_DATA per the silence contract).
+    fh = _feed_health_line(store)
+    if fh:
+        body += "\n" + fh
     lk = _singleton_lock_line()
     if lk:
         body += "\n" + lk
