@@ -2309,6 +2309,113 @@ def _decision_clock_line(store) -> str:
         return ""
 
 
+def _decision_weekday_line(store) -> str:
+    """One-line "is there a recurring DAY-OF-WEEK where this trader is
+    consistently being starved?" for the hourly / daily report.
+
+    The day-of-week sibling to ``_decision_clock_line`` (hour-of-day). The
+    builder ``decision_weekday.build_decision_weekday`` buckets the same
+    decisions by NY local weekday and emits ``WEEKDAY_CONCENTRATION`` when
+    a single weekday has ≥``WEEKDAY_CONCENTRATION_PCT`` NO_DECISION over
+    ≥``MIN_WORST_BUCKET_SAMPLES`` samples — surfacing e.g. a
+    Friday-after-close quota slump that the hour-of-day clock cannot see
+    (the same hour on the off-day washes the bucket out). ``/api/decision-
+    weekday`` exposes it on the dashboard; this routes the verdict to the
+    Discord surface the operator actually reads (the exact dashboard→
+    Discord gap ``_decision_clock_line`` / ``_position_attention_line``
+    each closed, one dimension over: hour-of-day → day-of-week).
+
+    Composes ``build_decision_weekday`` **verbatim** (single source of
+    truth, AGENTS.md invariant #10 — the verdict / headline are the
+    builder's, never re-derived here, so this Discord line and
+    ``/api/decision-weekday`` can never tell different stories) and feeds
+    it the EXACT same store read the endpoint does
+    (``recent_decisions(limit=20000)``). **Pure store reads only — NO
+    network** (the Discord-path discipline; adds zero latency).
+    Observational only, never gates, adds no caps (invariants #2/#12 —
+    the ``_decision_clock_line`` precedent). Failure contract mirrors
+    the rest of ``reporter``: any builder/store fault degrades to ``""``
+    ("no decision-weekday line this report"), **never** an exception
+    ("no Discord summary this report").
+
+    Suppression — surface ONLY ``WEEKDAY_CONCENTRATION`` (the actionable
+    verdict — there's a real concentrated saturation weekday). The
+    other two verdicts (``EVEN_DISTRIBUTION`` and ``INSUFFICIENT_DATA``)
+    say "nothing to act on" — silent so the summary doesn't turn into
+    its own lying green light (the ``_decision_clock_line``
+    EVEN_DISTRIBUTION / ``_heartbeat_line`` HEALTHY suppression
+    precedent).
+    """
+    try:
+        from .analytics.decision_weekday import build_decision_weekday
+        decisions = store.recent_decisions(limit=20000)
+        dw = build_decision_weekday(decisions)
+        if not isinstance(dw, dict):
+            return ""
+        if dw.get("verdict") != "WEEKDAY_CONCENTRATION":
+            return ""
+        headline = dw.get("headline") or ""
+        if not headline:
+            return ""
+        return f"⚠️ **DECISION WEEKDAY** ◈ WEEKDAY_CONCENTRATION\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] decision-weekday line skipped: {e}")
+        return ""
+
+
+def _repeat_loser_line(store) -> str:
+    """One-line "which tickers have I been losing on repeatedly?" for the
+    hourly / daily report.
+
+    ``_streak_line`` flags an aggregate ``TILT_RISK`` on a ≥4-loss run but
+    never names *which* tickers carried the losses. A trader on a 4-loss
+    run whose losses are all on LITE has a very different actionable
+    response — "stop trading LITE" — than one whose losses are spread
+    across 4 names ("general tilt → step back"). ``/api/repeat-loser`` (and
+    this Discord line) close that gap with per-ticker loser-cluster
+    detection.
+
+    Composes ``build_repeat_loser`` **verbatim** (single source of truth,
+    AGENTS.md invariant #10 — the headline / verdict are the builder's,
+    never re-derived here, so this Discord line and ``/api/repeat-loser``
+    can never tell different stories) and feeds it the EXACT same store
+    read the endpoint does (``recent_trades(2000)`` reversed oldest-
+    first, the ``build_repeat_loser`` contract). **Pure store reads only —
+    NO network** (the Discord-path discipline; the ``_streak_line``
+    precedent). Observational only, never gates, adds no caps (invariants
+    #2/#12 — the ``_streak_line`` precedent). Failure contract mirrors
+    the rest of ``reporter``: any builder/store fault degrades to ``""``
+    ("no repeat-loser line this report"), **never** an exception ("no
+    Discord summary this report").
+
+    Suppression — surface ONLY the actionable verdict, so a balanced book
+    or insufficient sample adds no hourly noise (the summary must never
+    become its own lying green light — the ``_streak_line`` suppression
+    precedent):
+      * ``REPEAT_LOSER`` (≥1 ticker on a ≥2-loss run) → ALWAYS surfaced.
+      * ``OK`` / ``NO_DATA`` (and any non-verdict) → silent.
+    """
+    try:
+        from .analytics.repeat_loser import build_repeat_loser
+        # ``build_repeat_loser`` expects oldest → newest; the store hands
+        # back newest-first (same reversal the ``_streak_line`` /
+        # ``_realized_pl_today`` paths use).
+        trades = list(reversed(store.recent_trades(2000)))
+        rl = build_repeat_loser(trades)
+        if not isinstance(rl, dict):
+            return ""
+        verdict = rl.get("verdict")
+        if verdict != "REPEAT_LOSER":
+            return ""
+        headline = rl.get("headline") or ""
+        if not headline:
+            return ""
+        return f"⚠️ **REPEAT_LOSER** ◈ per-ticker tilt\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] repeat-loser line skipped: {e}")
+        return ""
+
+
 def _streak_line(store) -> str:
     """One-line "am I on a hot-hand or a tilt-risk run right now?" for the
     hourly / daily report.
@@ -2670,6 +2777,13 @@ def send_hourly_summary() -> bool:
     dc = _decision_clock_line(store)
     if dc:
         body += "\n" + dc
+    # DECISION_WEEKDAY sits right after the hour-of-day clock — the
+    # orthogonal day-of-week sibling. Both are silence-by-default; a
+    # recurring Friday-after-close quota slump appears here but is
+    # washed out of decision_clock by Fridays-only data.
+    dw = _decision_weekday_line(store)
+    if dw:
+        body += "\n" + dw
     ndr = _no_decision_reasons_line(store)
     if ndr:
         body += "\n" + ndr
@@ -2681,6 +2795,14 @@ def send_hourly_summary() -> bool:
     sk = _streak_line(store)
     if sk:
         body += "\n" + sk
+    # REPEAT_LOSER sits right after STREAK — the per-ticker companion to
+    # the aggregate run. STREAK says "you're on a 4-loss run"; REPEAT_LOSER
+    # says "and 3 of those 4 are on LITE — stop adding to LITE". Both
+    # surface independently (a tilt aggregate need not be one ticker, and
+    # one repeat-loser need not pull the aggregate to TILT_RISK).
+    rl = _repeat_loser_line(store)
+    if rl:
+        body += "\n" + rl
     return _send(body)
 
 
@@ -2801,6 +2923,11 @@ def send_daily_close() -> bool:
     dc = _decision_clock_line(store)
     if dc:
         body += "\n" + dc
+    # DECISION_WEEKDAY follows the hour-of-day clock on daily close too —
+    # see send_hourly_summary for the rationale (hour vs day-of-week).
+    dw = _decision_weekday_line(store)
+    if dw:
+        body += "\n" + dw
     ndr = _no_decision_reasons_line(store)
     if ndr:
         body += "\n" + ndr
@@ -2809,4 +2936,9 @@ def send_daily_close() -> bool:
     sk = _streak_line(store)
     if sk:
         body += "\n" + sk
+    # REPEAT_LOSER follows STREAK on daily close too — see send_hourly_summary
+    # for the rationale (aggregate vs per-ticker tilt).
+    rl = _repeat_loser_line(store)
+    if rl:
+        body += "\n" + rl
     return _send(body)
