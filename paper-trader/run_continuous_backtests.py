@@ -115,6 +115,24 @@ SCORER_SKILL_LOG_KEEP = 2000    # cap file growth (≈ one row per cycle)
 BASELINE_SKILL_LOG = ROOT / "data" / "baseline_skill_log.jsonl"
 BASELINE_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 
+# Per-cycle LLM-annotation skill ledger. ``_llm_annotate_outcomes`` writes
+# ENDORSE/CONDEMN labels into ``decision_outcomes.jsonl`` rows; the trainer
+# upweights ENDORSEs 3× and downweights CONDEMNs to 0.1× via the ``llm_mult``
+# column. The single most-repeated documented finding for this column is
+# ``sample_weight_audit`` reporting ``CURRENT_TIED`` (the LLM multiplier
+# provides ZERO OOS rank skill at the trained-model level). Worse, ad-hoc
+# inspection of the live ``decision_outcomes.jsonl`` reveals 0/N rows carry
+# a non-zero label — the entire annotation pipeline is dark in production
+# (missing API key / unreachable host / regex never matching), and the
+# silent ``except Exception`` in ``_llm_annotate_outcomes`` hides it. This
+# appends one structured row per cycle so a skeptical quant can see the
+# darkness immediately, and so the moment it starts working again is
+# observable in the trend. Module-level (not a function local) so tests can
+# redirect it — the same testability rule as SCORER_SKILL_LOG /
+# BASELINE_SKILL_LOG.
+LLM_ANNOTATION_SKILL_LOG = ROOT / "data" / "llm_annotation_skill_log.jsonl"
+LLM_ANNOTATION_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 EARLIEST_WINDOW_START = date(1993, 2, 1)  # SPY inception — ~30+ years of history
 WINDOW_END_BUFFER_DAYS = 180  # never end a window within 6 months of today
 MIN_WINDOW_YEARS = 1
@@ -1373,6 +1391,96 @@ def _append_baseline_skill_log(cycle: int, win_start: date, win_end: date,
         return False
 
 
+def _append_llm_annotation_skill_log(cycle: int, win_start: date, win_end: date,
+                                     outcomes_path: "Path | str | None" = None
+                                     ) -> bool:
+    """Append one structured row to the per-cycle LLM-annotation skill ledger.
+
+    Answers, durably and per-cycle, the most directly operational LLM-
+    annotation question: *did the pipeline produce ANY non-zero labels this
+    cycle, and if so do they predict realized returns?* Reuses
+    ``llm_annotation_skill.analyze`` verbatim so the persisted verdict
+    equals the CLI's by construction — a built-in no-drift cross-check.
+
+    Best-effort and idempotent-safe (the ``_append_scorer_skill_log``
+    / ``_append_baseline_skill_log`` discipline — a ledger write must NEVER
+    break the continuous loop). On any fault we still emit an honest row
+    with ``status='error' verdict='NO_LABELS_PRODUCED'`` so a gap in the
+    trend is visible, not silent. Bounded growth: when the file exceeds
+    2× ``LLM_ANNOTATION_SKILL_LOG_KEEP`` it is atomically rewritten via the
+    decision_outcomes trim idiom (tmp + ``.replace`` so a torn truncate
+    cannot lose skill history).
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        try:
+            from paper_trader.ml import llm_annotation_skill as _las
+            rep = _las.analyze(outcomes_path)
+        except Exception as exc:
+            rep = {"status": "error", "verdict": "NO_LABELS_PRODUCED",
+                   "hint": f"llm_annotation_skill unavailable: "
+                           f"{type(exc).__name__}",
+                   "n_total": 0, "n_endorsed": 0, "n_condemned": 0,
+                   "n_unlabeled": 0,
+                   "endorsed_mean_return": None,
+                   "condemned_mean_return": None,
+                   "unlabeled_mean_return": None,
+                   "endorsed_minus_condemned": None,
+                   "rank_ic": None}
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "NO_LABELS_PRODUCED"}
+
+        # `pipeline_dark` is the ledger-row equivalent of the scorer ledger's
+        # `gate_active` / the baseline ledger's `verdict=='MLP_WORSE_THAN_TRIVIAL'`:
+        # the single boolean a reading quant cares about for the *current
+        # state*. True ⇒ no labels are being produced at all (the documented
+        # production-live state); False ⇒ at least some endorsed-or-condemned
+        # labels exist this cycle, so the pipeline has woken up.
+        n_lab = int(rep.get("n_endorsed") or 0) + int(
+            rep.get("n_condemned") or 0)
+        pipeline_dark = (n_lab == 0)
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": rep.get("verdict"),
+            "n_total": rep.get("n_total"),
+            "n_endorsed": rep.get("n_endorsed"),
+            "n_condemned": rep.get("n_condemned"),
+            "n_unlabeled": rep.get("n_unlabeled"),
+            "endorsed_mean_return": rep.get("endorsed_mean_return"),
+            "condemned_mean_return": rep.get("condemned_mean_return"),
+            "unlabeled_mean_return": rep.get("unlabeled_mean_return"),
+            "endorsed_minus_condemned": rep.get("endorsed_minus_condemned"),
+            "rank_ic": rep.get("rank_ic"),
+            "pipeline_dark": pipeline_dark,
+        }
+        LLM_ANNOTATION_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LLM_ANNOTATION_SKILL_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in LLM_ANNOTATION_SKILL_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > LLM_ANNOTATION_SKILL_LOG_KEEP * 2:
+                kept = lines[-LLM_ANNOTATION_SKILL_LOG_KEEP:]
+                tmp = LLM_ANNOTATION_SKILL_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(LLM_ANNOTATION_SKILL_LOG)
+        except Exception as e:
+            print(f"[continuous] llm-annotation-skill-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] llm-annotation-skill-log append failed: {e}")
+        return False
+
+
 def _parse_published_date(published) -> date | None:
     """Parse a `published` value (ISO or RFC822) into a date; None if unparseable."""
     if not published:
@@ -2249,6 +2357,20 @@ def main() -> None:
         # accumulated outcomes tail — the same view `baseline_compare`'s CLI
         # and `calibration --oos` report, so the numbers can never drift.
         _append_baseline_skill_log(cycle, win_start, win_end)
+
+        # Durable per-cycle LLM-annotation skill ledger. Mirrors the wiring
+        # rationale exactly: ``llm_annotation_skill.analyze`` reports whether
+        # ENDORSE/CONDEMN labels exist AND whether they predict realized
+        # returns, but until now an operator had to manually run the CLI to
+        # see either. The most directly operational state — `pipeline_dark`
+        # (zero non-zero labels across the corpus) — was invisible without
+        # grepping ``decision_outcomes.jsonl``. The empty ``except Exception``
+        # in ``_llm_annotate_outcomes`` swallows missing-API-key and
+        # connection failures silently every cycle; the persisted row makes
+        # that darkness obvious in the trend so a quant doesn't pour weight-
+        # policy tuning effort into a column that is never populated. Best-
+        # effort by construction; never breaks the loop.
+        _append_llm_annotation_skill_log(cycle, win_start, win_end)
 
         ml_status = _try_train_ml() if winner else "no winner"
         print(f"[continuous] ml: {ml_status}")
