@@ -2327,6 +2327,12 @@ def heartbeat_worker(store: ArticleStore):
                 # exact dashboard-verdict parity. Discord-only, same
                 # discipline as the other augmentation lines.
                 calibration_line = _format_label_calibration(store)
+                # Training-pool composition: parallel to calibration_line but
+                # for the TRAINING corpus rather than the short-horizon urgent
+                # stream. Silent on healthy windows; emits on extreme
+                # synthetic-dominance / Claude-label-dark conditions. Same
+                # Discord-only / never-folded-into-saved-briefing discipline.
+                training_pool_line = _format_training_pool_composition()
                 # Coverage-gap banner is Discord-only — NOT folded into the
                 # saved `briefing` text, so it can't reach the trainer's
                 # title-prefix label scan (same discipline as health_line).
@@ -2336,6 +2342,7 @@ def heartbeat_worker(store: ArticleStore):
                     + briefing.rstrip() + "\n\n" + health_line
                     + ("\n" + coverage_line if coverage_line else "")
                     + ("\n" + calibration_line if calibration_line else "")
+                    + ("\n" + training_pool_line if training_pool_line else "")
                 )
                 if banner:
                     log.warning(
@@ -2750,6 +2757,118 @@ def _format_label_calibration(
             f"🔬 Urgent calibration: {pct}% LLM-vetted last {hours}h "
             f"({ml_n}/{total} ML-only)"
         )
+    if len(line) > max_chars:
+        line = line[: max_chars - 1].rstrip() + "…"
+    return line
+
+
+def _format_training_pool_composition(
+    audit_fn=None, max_chars: int = 200
+) -> str:
+    """One-line training-pool composition signal for the heartbeat briefing.
+
+    The 5h digest already carries an ``Urgent calibration`` line for the
+    short-horizon urgent stream's LLM-vetted fraction
+    (``_format_label_calibration``); this is the parallel signal for the
+    *training* corpus that ArticleNet itself is fit against. Live evidence
+    (2026-05-20 articles.db): the strong-label pool sits at 96.5%
+    synthetic backtest/opus rows vs 3.5% real Claude-tagged labels (with
+    Sonnet quota chronically throttling urgency_scorer). Synthetic IS
+    legitimate training signal per CLAUDE.md §5, but the analyst persona
+    "react to events affecting MY positions" cares whether the model's
+    relevance/urgency head is mostly remembering replayed-trade outcomes
+    vs. learning from fresh Claude judgments — that question was never
+    answerable from any consumed product. The new
+    ``synthetic_fraction_of_strong`` / ``llm_fraction_of_strong`` audit
+    fields make it answerable; this surfaces it in the briefing.
+
+    Mirrors the silence-on-healthy discipline of
+    ``_format_label_calibration`` / ``_format_source_health_summary`` /
+    ``_format_portfolio_coverage``: emit only when the composition is
+    extreme. Two thresholds:
+
+      * ``llm_fraction < 0.05`` — Claude labels effectively absent
+        (urgency_scorer dark or quota-floored to almost nothing); the
+        strong pool is learning ~entirely from backtest replay outcomes.
+      * ``synthetic_fraction >= 0.85`` — synthetic-dominant; the model's
+        signal is still mostly the paper-trader's replay outcomes, even
+        if some Claude labels are present.
+
+    Otherwise silent — a healthy mix (>=15% Claude-tagged labels) needs
+    no analyst-facing callout.
+
+    Read-only by construction: ``ml.label_audit.audit`` issues four
+    ``COUNT(*)`` queries with ``_LIVE_ONLY_CLAUSE`` /
+    ``STRONG_LABEL_WHERE`` only; this helper opens a fresh ``mode=ro``
+    connection via ``label_audit._RoStore`` (NEVER the daemon's shared
+    ``self.conn`` — the documented cursor-collision hazard, same
+    discipline as ``analysis.claude_analyst._collect_macro_calendar_events``).
+    No ``ai_score`` / ``ml_score`` / ``score_source`` / urgency mutation,
+    synthetic rows already separated from live rows by the audit's own
+    bucket logic. All four load-bearing invariants intact by construction.
+
+    Discord-only — the caller appends to the posted message, NEVER folds
+    into the saved ``briefing`` text, so the trainer's title-prefix
+    label scan cannot reach it (same discipline as ``_build_health_line``
+    / ``_format_portfolio_coverage`` / ``_format_label_calibration``).
+
+    ``audit_fn`` is an optional injectable returning the same dict shape
+    as ``label_audit.audit`` — purely for testability so the helper can
+    be exercised against a controlled in-memory bucket distribution
+    without touching the real DB. Production callers omit it; the helper
+    opens its own ``mode=ro`` connection.
+    """
+    try:
+        if audit_fn is None:
+            from ml import label_audit
+            from storage.article_store import _get_db_path
+            store = label_audit._RoStore(_get_db_path())
+            try:
+                data = label_audit.audit(store)
+            finally:
+                store.close()
+        else:
+            data = audit_fn()
+    except Exception:
+        return ""  # best-effort — a metric outage must never block a briefing
+    if not isinstance(data, dict):
+        return ""
+    sp = data.get("strong_pool") or {}
+    try:
+        total = int(sp.get("total") or 0)
+    except (TypeError, ValueError):
+        return ""
+    # A very small pool can swing dramatically on a single label arrival —
+    # the composition number would be analyst-noise, not signal. Threshold
+    # tuned to the size at which the synthetic/Claude ratio is a stable
+    # estimate (well below the live ~530k strong-pool size).
+    if total < 100:
+        return ""
+    try:
+        synth_frac = float(data.get("synthetic_fraction_of_strong") or 0.0)
+        llm_frac = float(data.get("llm_fraction_of_strong") or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    try:
+        synth_n = int(sp.get("synthetic_backtest_opus") or 0)
+        llm_n = (int(sp.get("llm") or 0) + int(sp.get("briefing_boost") or 0))
+    except (TypeError, ValueError):
+        return ""
+    pct = int(round(llm_frac * 100))
+    if llm_frac < 0.05:
+        line = (
+            f"🧪 Training pool: only {pct}% Claude-tagged labels "
+            f"({llm_n} LLM vs {synth_n} synthetic) — "
+            f"model learns mostly from backtest replay"
+        )
+    elif synth_frac >= 0.85:
+        line = (
+            f"🧪 Training pool: {pct}% Claude-tagged labels "
+            f"({llm_n} LLM vs {synth_n} synthetic) — "
+            f"synthetic-dominant"
+        )
+    else:
+        return ""  # healthy mix — silent
     if len(line) > max_chars:
         line = line[: max_chars - 1].rstrip() + "…"
     return line
