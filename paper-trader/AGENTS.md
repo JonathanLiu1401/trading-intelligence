@@ -12907,3 +12907,108 @@ python3 -m paper_trader.ml.overfit_gap            # val_rmse vs oos_rmse trend
 * **#5 conviction gate** — gate fires only at `n_train >= 500`; new diagnostic is observational only, never gates or alters Opus.
 * **#2 / #12 advisory only** — read-only, no pickle/train/feature/trade-path touch; same discipline as every other `paper_trader/ml/*` diagnostic.
 * **Backtest articles never reach live signals (#1)** — diagnostic only reads `backtest_runs.*` columns, never reads `articles.db`; cannot accidentally cross the boundary.
+
+## 2026-05-21 paper-trader-core HYBRID pass — cash-delta in trade-impact alert
+
+A live trader's #1 follow-up after a fill is "how big is this name now and
+how much cash do I have left?" — already answered by the post-trade impact
+line (book-weight %, avg cost, current cash). Their **#2 follow-up** is
+"how much of my cash did this just consume / free?" — the sizing input for
+the NEXT decision. Absolute cash alone tells them what's *left*; the
+signed delta tells them what just *moved*. Previously the alert showed
+only the former.
+
+### Phase 2 (feat) — `_cash_delta_token` in `reporter.py`
+
+New helper `_cash_delta_token(cash, trade)` produces the cash token with a
+signed delta:
+
+* **BUY**:  `cash $565.08 (-$446.87)` — minus because cash decreased
+* **SELL**: `cash $701.50 (+$301.36)` — plus because cash freed
+
+Pure: derived from the in-hand `trade.value` (already `qty × price` for
+stock, `qty × price × 100` for options — `store.record_trade` contract).
+No network, no extra store reads, no re-derivation of cash arithmetic.
+Composed into both branches of `_trade_impact_line` (the BUY-affordability
+and SELL-realized contexts each grow the cash token to `cash $X (-$Y)` /
+`cash $X (+$Y)`).
+
+**Degrade-safe contract** mirrors the rest of `reporter`:
+
+* missing / non-numeric / zero / negative `trade.value` → bare cash token,
+  byte-identical to the pre-feature output (a hand-built test trade
+  without a `value` field stays green);
+* HOLD / REBALANCE / unknown action → no delta (the action discriminator
+  prevents inventing a misleading "deployed" on a non-trading event);
+* never raises — the additive reporter contract holds end-to-end.
+
+### Tests
+
+`tests/test_core_reporter.py` extended with:
+
+* `TestCashDeltaToken` (10 unit tests) — pins SPECIFIC numerics for the
+  sign convention (BUY=minus, SELL=plus), option scaling (the `× 100`
+  multiplier is already in `trade.value`), and every degrade-safe branch
+  (missing/garbage/zero/negative value, unknown action, negative cash).
+* `TestTradeImpactLineCashDelta` (4 integration-shape tests) — pins the
+  full `_trade_impact_line` composition including the delta in the
+  canonical token order for BUY, partial SELL, full-close SELL, and the
+  zero-value degrade-safe path.
+* 6 pre-existing `TestTradeImpactLineUnit` exact-match assertions updated
+  to expect the new delta — *spec updates*, not weakened tests (the
+  exact-match form is preserved with the new expected output, so a
+  future regression that drops the delta still fails loudly).
+
+Verification:
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_core_reporter.py -k "Cash or TradeImpact or TradeAlert" -q  # 46 pass
+python3 -m pytest tests/test_core_reporter.py tests/test_core_strategy.py \
+                  tests/test_core_runner.py tests/test_core_signals.py \
+                  tests/test_core_market.py tests/test_core_store.py -q              # 653 pass
+```
+
+### Phase 3 — live validation findings (trader perspective, observational)
+
+Inspected `/api/healthz`, `/api/portfolio`, `/api/runner-heartbeat`,
+`/api/host-guard`, `/api/empty-claude-rate`, `/api/decision-health`,
+`/api/capital-paralysis`, `/api/benchmark`, `/api/drawdown`,
+`/api/event-calendar`, and the last 8 rows of `decisions`:
+
+* **Healthy and trading.** Heartbeat HEALTHY, lock acquired, Discord
+  delivery HEALTHY, 1 open NVDA position, total $1011.95 (+1.19% from
+  $1000 start), beating SPY buy-and-hold by **+0.79pp** ("ahead in 65.7%
+  of 204 cycles"), 0.56% off peak ($1017.63), 11.6h in this DD.
+* **Decision-efficacy DEGRADED right now.** 25% of the last 20 cycles
+  were NO_DECISION; root cause visible in `/api/host-guard`:
+  **`5 concurrent Opus (>4 threshold) — host saturated`**. **Working as
+  designed**: this is the parallel-agent storm (the hybrid review agents
+  themselves consume Opus slots — the trader correctly skips its doomed
+  call rather than spawning a 1.5GB OOM-killer subprocess, and records
+  a clean `skipped claude call —` instead of the empty/timeout signature
+  that would inflate `model_reliability`). No trader-side bug.
+* **MRVL earnings 5.89d away** on the watchlist — surfaces in the live
+  Opus prompt's `event_calendar` block exactly as documented in #10.
+* `unrealized_pl=0.0` on the NVDA lot (avg=mark=$223.43) reads as a
+  flat position but is a market-closed coincidence (yfinance returns the
+  same final price each call after the close); `stale_marks=0` confirms
+  the mark is genuine, not a missing-price fallback. **Not a bug**.
+
+### Invariants reaffirmed
+
+* **Reporter additive contract (#2/#12)** — `_cash_delta_token` is pure
+  observation, never gates, never invents data (no `value` → no delta).
+* **Single source of truth (#10)** — the cash delta is `trade.value`
+  verbatim (the same field `store.record_trade` writes), so the alert
+  surface, the daily-close cash-flow P&L line and any future per-trade
+  inspector can never disagree on what THIS trade moved.
+
+### Counters
+
+`bugs_fixed=0` (mature codebase — no concrete bug worth a fix this pass)
+· `features_added=1` (cash-delta token + 14 new tests + 6 spec-updated)
+· `user_findings=5` (HEALTHY heartbeat, BEATING SPY +0.79pp, host-saturation
+storm from 5 parallel Opus is *expected* under multi-agent reviews and
+correctly recorded as `skipped claude call`, 0.56% off peak, MRVL earnings
+in 5.89d on watchlist).
