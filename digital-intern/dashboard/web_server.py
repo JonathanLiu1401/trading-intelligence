@@ -3139,6 +3139,73 @@ def create_app(store=None) -> Flask:
         snap["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         return jsonify(snap)
 
+    @app.get("/api/news-arrival-rhythm")
+    def api_news_arrival_rhythm():
+        """Per-source hour-of-day urgent-article distribution.
+
+        Operator visibility into *when* urgent news lands and *from
+        which source*. Complementary to ``collector_uptime`` (silence
+        gaps) and ``source_throughput`` (rate deceleration) — those
+        flag failure; this surfaces baseline cadence.
+
+        Query params (all clamped):
+          ``hours``       — lookback window, 1..168 (default 24)
+          ``min_urgency`` — floor, 0..2 (default 1)
+          ``top_sources`` — display cap on the per-source list,
+                            1..50 (default 10)
+
+        Reads articles.db via the dashboard's ``_ro_query`` short-lived
+        read-only connection (the source_throughput / score_distribution
+        precedent — never competes for the daemon's writer lock). The
+        ``_LIVE_ONLY_CLAUSE`` is applied — backtest-injected rows
+        cannot leak into the operator panel (invariant #5).
+
+        Pure builder (``analytics.news_arrival_rhythm``) handles the
+        bucketing; this route is the SQL adapter only.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            hours = int(request.args.get("hours", 24))
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(168, hours))
+        try:
+            min_urgency = int(request.args.get("min_urgency", 1))
+        except (TypeError, ValueError):
+            min_urgency = 1
+        min_urgency = max(0, min(2, min_urgency))
+        try:
+            top_sources = int(request.args.get("top_sources", 10))
+        except (TypeError, ValueError):
+            top_sources = 10
+        top_sources = max(1, min(50, top_sources))
+
+        from storage.article_store import _LIVE_ONLY_CLAUSE
+        from analytics.news_arrival_rhythm import build_news_arrival_rhythm
+
+        cutoff = (datetime.now(timezone.utc) -
+                  timedelta(hours=hours)).isoformat(timespec="seconds")
+        try:
+            rows = _ro_query(
+                f"""SELECT source, urgency, first_seen
+                      FROM articles
+                     WHERE {_LIVE_ONLY_CLAUSE}
+                       AND urgency >= ?
+                       AND first_seen >= ?
+                     ORDER BY first_seen DESC
+                     LIMIT 20000""",
+                (min_urgency, cutoff),
+            )
+        except sqlite3.Error as exc:
+            return jsonify({"error": f"db: {exc!s}"}), 500
+        arts = [{"source": r[0], "urgency": r[1], "first_seen": r[2]}
+                for r in rows]
+        return jsonify(build_news_arrival_rhythm(
+            arts, hours=hours, min_urgency=min_urgency,
+            top_sources=top_sources,
+        ))
+
     @app.get("/healthz")
     @app.get("/api/health")
     def healthz():
