@@ -1391,28 +1391,55 @@ _QW_SCREENER_TAPE = re.compile(
 _QW_STOCKTWITS_SENTIMENT = re.compile(
     r"^\s*\[StockTwits\s+Sentiment\]\s+[A-Z]"
 )
+# Image-credit pseudo-article — lockstep mirror of the sixth fingerprint added
+# to ``watchers.alert_agent._QW_IMAGE_CREDIT`` and
+# ``collectors.web_scraper._QW_IMAGE_CREDIT``. Live evidence (2026-05-21
+# 16:30:49Z, alert_recency.db): "Angela Weiss/AFP/Getty Images" fired a real
+# 🚨 BREAKING push from ``scraped/www.bloomberg.com`` (cred=0.90 — above the
+# 0.45 lone-source bar so the authority gate cannot catch it; content type IS
+# the failure). The bug: news pages wrap the hero image inside the article's
+# own <a> link, so the web scraper's anchor-text fallback picks up the photo
+# credit line beneath the image as the article title. The ML urgency head
+# scored it 10.0 (bloomberg.com URL + proper-noun tokens triggered the
+# high-relevance pattern recognition). The briefing path — the analyst's
+# PRIMARY consumed product — would have surfaced this credit string as a
+# TOP SIGNAL had the urgency cascade not also pushed it. Same triple-gate
+# discipline as the prior five quote-widget fingerprints: every consumed
+# product gets the same defense-in-depth gate, byte-identical regex across
+# the three modules (anti-import-cycle: the analysis layer must not pull
+# the watchers+ml_features graph and the watchers layer must not pull the
+# collectors/aiohttp graph).
+_QW_IMAGE_CREDIT = re.compile(
+    r"^\s*[A-Z][a-zA-Z]+(?:\s+(?:[A-Z]\.?|[A-Z][a-zA-Z]+))+"
+    r"(?:/(?:AFP|Reuters|Getty\s+Images|AP|Bloomberg|EPA|TASS|"
+    r"WireImage|Shutterstock|Polaris|Bloomberg\s+News))+"
+    r"\s*$"
+)
 
 
 def _looks_like_quote_widget(article: dict) -> bool:
-    """True for a live quote-tape / quote-listing / structured-data-summary
-    entry masquerading as a digest article.
+    """True for a live quote-tape / quote-listing / structured-data-summary /
+    image-credit entry masquerading as a digest article.
 
-    Five independent title fingerprints (a letter glued directly to a decimal
+    Six independent title fingerprints (a letter glued directly to a decimal
     price; a parenthesised signed % change; a "$NAME (SYMBOL.EXCH)$" share-card
     listing page; a ``[YF/<bucket>]`` screener-tape lead from
     ``market_movers``; a ``[StockTwits Sentiment]`` extreme-sentiment summary
-    row from ``stocktwits_sentiment``) plus a Yahoo /quote/ landing path. All
-    anchored so real prose with $/%/comma numbers ("rises 22% to $35.1
-    billion", "5,123.41 record high"), real "$TICKER ..." headlines and real
-    quote-scoped article URLs ("/quote/NVDA/news/headline-123") are never
-    caught. Byte-identical logic to watchers.alert_agent._looks_like_quote_widget.
+    row from ``stocktwits_sentiment``; a ``Photographer Name/Agency/Getty
+    Images`` photo credit the web scraper picked up as a title) plus a Yahoo
+    /quote/ landing path. All anchored so real prose with $/%/comma numbers
+    ("rises 22% to $35.1 billion", "5,123.41 record high"), real "$TICKER ..."
+    headlines, real quote-scoped article URLs, and real headlines containing
+    agency names ("Reuters/Yahoo Finance reports") are never caught.
+    Byte-identical logic to watchers.alert_agent._looks_like_quote_widget.
     The synthetic PORTFOLIO/OPTIONS snapshot rows the daemon prepends
     ("PORTFOLIO P&L SNAPSHOT" / "OPTIONS SNAPSHOT", no url) never match any
     fingerprint, so they always pass through untouched."""
     title = article.get("title") or ""
     if (_QW_PRICE_GLUE.search(title) or _QW_PCT_PAREN.search(title)
             or _QW_LISTING.search(title) or _QW_SCREENER_TAPE.search(title)
-            or _QW_STOCKTWITS_SENTIMENT.search(title)):
+            or _QW_STOCKTWITS_SENTIMENT.search(title)
+            or _QW_IMAGE_CREDIT.search(title)):
         return True
     url = article.get("link") or article.get("url") or ""
     try:

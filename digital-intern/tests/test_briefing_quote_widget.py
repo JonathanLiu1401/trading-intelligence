@@ -263,3 +263,68 @@ def test_snapshot_rows_pass_through_payload():
     assert "PORTFOLIO P&L SNAPSHOT" in payload
     assert "OPTIONS SNAPSHOT" in payload
     assert "NVDANVIDIA Corporation227.13" not in payload
+
+
+# ── Image-credit fingerprint (_QW_IMAGE_CREDIT) ─────────────────────────────
+# "Angela Weiss/AFP/Getty Images" — the hero-image photo credit on a news page
+# is wrapped inside the article's own <a> link, so collectors/web_scraper.py's
+# anchor-text fallback picks up the credit string as the article title. Live
+# evidence (2026-05-21 16:30:49Z, alert_recency.db): this exact title fired a
+# real 🚨 BREAKING push from ``scraped/www.bloomberg.com`` (cred=0.90, above
+# the lone-source bar — the authority gate cannot catch this, content type
+# IS the failure). The briefing path needs the same gate: a credit string
+# the alert path rejects would still surface as a fake TOP SIGNAL in the 5h
+# digest had the urgency cascade not also pushed it.
+
+
+@pytest.mark.parametrize("title", [
+    "Angela Weiss/AFP/Getty Images",                # the exact live noise
+    "Tomohiro Ohsumi/Getty Images",                 # 2-word name + 1 agency
+    "Timorthy A. Clary/AFP/Getty Images",           # initial-bearing variant
+    "Anna Moneymaker/Getty Images",
+    "Drew Angerer/AFP/Getty Images",
+    "John Smith/Reuters",                            # minimum 2-word + 1 agency
+    "Mary Jane Doe/Bloomberg/Getty Images",         # 3-word + 2 agencies
+    "  Angela Weiss/AFP/Getty Images  ",             # leading/trailing ws
+])
+def test_image_credit_pseudo_detected(title):
+    assert _looks_like_quote_widget({"title": title, "link": ""}) is True
+
+
+@pytest.mark.parametrize("title", [
+    # Real headlines that mention agencies / slashes must SURVIVE — the
+    # anchored ^...$ + Title-Case-Name + closed-agency-list trio is the
+    # discriminator (real headlines never END with this no-space "/Agency").
+    "Reuters reports Q1 earnings beat",
+    "Bloomberg: NVDA breaks $200",
+    "Getty Images launches new product",
+    "AFP Photo: 5 things to know about Q1",
+    "MU drops 5%/Yahoo",                             # %/ slash mid-headline
+    "Stock Market Today: Reuters/AP",                # colon-led list
+    "Sam Altman/OpenAI says GPT-5 coming",           # OpenAI not in list
+    "Reuters/Yahoo Finance reports earnings",        # Yahoo not in list
+    "Apple/Microsoft deal closes",                   # not agencies
+    "AFP/Getty Images launches new service",         # mid-sentence content
+    "Tom Cruise",                                     # 2-word name no /agency
+])
+def test_real_headlines_with_slashes_not_flagged(title):
+    assert _looks_like_quote_widget({"title": title, "link": ""}) is False
+
+
+def test_build_payload_excludes_image_credit_keeps_real():
+    """A real news headline must survive while the photo-credit pseudo-article
+    is dropped from the digest — the briefing must not surface a credit string
+    as a TOP SIGNAL just because the ML urgency head over-scored it."""
+    articles = [
+        {"title": "Micron beats Q3 estimates, raises guidance",
+         "source": "rss", "ai_score": 9, "summary": "Strong DRAM demand",
+         "link": "https://example.com/micron-q3"},
+        {"title": "Angela Weiss/AFP/Getty Images",
+         "source": "scraped/www.bloomberg.com", "ai_score": 0, "ml_score": 10.0,
+         "summary": "", "link": "https://www.bloomberg.com/news/articles/x"},
+    ]
+    payload = _build_payload(articles, {}, [])
+    section = _digest_section(payload)
+    assert "Micron beats Q3 estimates" in section
+    assert "Angela Weiss" not in payload
+    assert "Getty Images" not in payload

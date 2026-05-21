@@ -297,6 +297,38 @@ _QW_SCREENER_TAPE = re.compile(
 _QW_STOCKTWITS_SENTIMENT = re.compile(
     r"^\s*\[StockTwits\s+Sentiment\]\s+[A-Z]"
 )
+# Image-credit pseudo-article — lockstep mirror of the sixth fingerprint added
+# to ``collectors.web_scraper._QW_IMAGE_CREDIT`` and
+# ``analysis.claude_analyst._QW_IMAGE_CREDIT``. Live evidence (2026-05-21
+# 16:30:49Z, alert_recency.db): "Angela Weiss/AFP/Getty Images" fired a real
+# 🚨 BREAKING push from ``scraped/www.bloomberg.com`` (cred=0.90 — above the
+# 0.45 lone-source bar; the source-authority gate cannot catch this, content
+# type IS the failure). The ML urgency head scored it 10.0 because the
+# bloomberg.com URL + proper-noun tokens triggered high-relevance pattern
+# recognition. The bug: news pages wrap the hero image inside the article's
+# own <a> link, so the web scraper's anchor-text fallback picks up the photo
+# credit line beneath the image as the article title. Other live samples in
+# articles.db (lower-scored, no push): "Tomohiro Ohsumi/Getty Images",
+# "Timorthy A. Clary/AFP/Getty Images".
+#
+# Discriminator: anchored ^...$ so the WHOLE title is the credit (real
+# headlines never end with this no-space ``/Agency`` structure). Title-Case
+# photographer name (≥2 tokens, allowing initials like ``A.``), then one or
+# more ``/Agency`` slugs with no space around the slash, ending in a
+# recognised image agency from a closed list. Validated zero false positives
+# against the must-survive corpus: "Reuters/Yahoo Finance reports earnings",
+# "Sam Altman/OpenAI says GPT-5 coming", "MU drops 5%/Yahoo", "AFP/Getty
+# Images launches new service" all do NOT match. Byte-identical to
+# collectors.web_scraper / analysis.claude_analyst — the documented
+# triple-gate lockstep (anti-import-cycle: the watchers layer must not pull
+# the collectors/aiohttp graph and the analysis layer must not pull the
+# watchers/ml graph).
+_QW_IMAGE_CREDIT = re.compile(
+    r"^\s*[A-Z][a-zA-Z]+(?:\s+(?:[A-Z]\.?|[A-Z][a-zA-Z]+))+"
+    r"(?:/(?:AFP|Reuters|Getty\s+Images|AP|Bloomberg|EPA|TASS|"
+    r"WireImage|Shutterstock|Polaris|Bloomberg\s+News))+"
+    r"\s*$"
+)
 
 # Single source of truth for the title-fingerprint set, mirrored by
 # ``_RECAP_TEMPLATE_PATTERNS`` below. analytics.quote_widget_audit imports this
@@ -312,26 +344,31 @@ _QUOTE_WIDGET_TITLE_PATTERNS = (
     ("listing_card", _QW_LISTING),
     ("screener_tape", _QW_SCREENER_TAPE),
     ("stocktwits_sentiment", _QW_STOCKTWITS_SENTIMENT),
+    ("image_credit", _QW_IMAGE_CREDIT),
 )
 
 
 def _looks_like_quote_widget(art: dict) -> bool:
-    """True for a live quote-tape / quote-listing / structured-data-summary
-    entry masquerading as an urgent article.
+    """True for a live quote-tape / quote-listing / structured-data-summary /
+    image-credit entry masquerading as an urgent article.
 
-    Five independent title fingerprints (a letter glued to a decimal price; a
+    Six independent title fingerprints (a letter glued to a decimal price; a
     parenthesised signed % change; a "$NAME (SYMBOL.EXCH)$" share-card listing
     page; a ``[YF/<bucket>]`` screener-tape lead from ``market_movers``; a
     ``[StockTwits Sentiment]`` extreme-sentiment summary row from
-    ``stocktwits_sentiment``) plus a Yahoo /quote/ landing path. All are
-    anchored so real headlines with $/%/comma numbers ("rises 22% to $35.1
-    billion", "5,123.41 record high"), real "$TICKER ..." prose ("$MU upgraded
-    to Buy") and real quote-scoped article URLs are never caught. Mirrors
+    ``stocktwits_sentiment``; a ``Photographer Name/Agency/Getty Images``
+    photo credit the web scraper picked up as a title) plus a Yahoo /quote/
+    landing path. All are anchored so real headlines with $/%/comma numbers
+    ("rises 22% to $35.1 billion", "5,123.41 record high"), real "$TICKER ..."
+    prose ("$MU upgraded to Buy"), real quote-scoped article URLs, and real
+    headlines that happen to contain agency names ("Reuters/Yahoo Finance
+    reports") are never caught. Mirrors
     collectors.web_scraper._looks_like_quote_widget."""
     title = art.get("title") or ""
     if (_QW_PRICE_GLUE.search(title) or _QW_PCT_PAREN.search(title)
             or _QW_LISTING.search(title) or _QW_SCREENER_TAPE.search(title)
-            or _QW_STOCKTWITS_SENTIMENT.search(title)):
+            or _QW_STOCKTWITS_SENTIMENT.search(title)
+            or _QW_IMAGE_CREDIT.search(title)):
         return True
     url = art.get("link") or art.get("url") or ""
     try:

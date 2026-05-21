@@ -203,3 +203,72 @@ class TestQuoteWidgetRejection:
         ):
             assert web_scraper._looks_like_quote_widget(
                 t, "https://x.com/a/b") is False, t
+
+    # ── Image-credit pseudo-article (_QW_IMAGE_CREDIT) ──────────────────────
+    # The hero-image photo credit on news pages is wrapped inside the
+    # article's own <a> link, so the anchor-text fallback in
+    # `_extract_articles` picks up the credit string as the article title.
+    # Live evidence (2026-05-21 16:30:49Z, alert_recency.db): "Angela Weiss/
+    # AFP/Getty Images" fired a real 🚨 BREAKING push from
+    # ``scraped/www.bloomberg.com`` — the highest-cred source tier so the
+    # authority gate cannot catch it; content type IS the failure. Ingestion
+    # gate here drops the credit string at the source.
+
+    IMAGE_CREDIT_TITLES = [
+        "Angela Weiss/AFP/Getty Images",                # the exact live noise
+        "Tomohiro Ohsumi/Getty Images",                 # 2-word + 1 agency
+        "Timorthy A. Clary/AFP/Getty Images",           # initial-bearing
+        "Anna Moneymaker/Getty Images",
+        "Drew Angerer/AFP/Getty Images",
+        "John Smith/Reuters",                            # minimum match
+        "Mary Jane Doe/Bloomberg/Getty Images",         # 3-word + 2 agencies
+        "  Angela Weiss/AFP/Getty Images  ",             # leading/trailing ws
+    ]
+
+    def test_image_credit_titles_rejected(self):
+        for t in self.IMAGE_CREDIT_TITLES:
+            assert web_scraper._looks_like_quote_widget(t, "") is True, t
+
+    def test_real_headlines_with_agency_names_accepted(self):
+        # Real headlines that mention agencies / slashes must SURVIVE — the
+        # anchored ^...$ + Title-Case-Name + closed-agency-list trio is the
+        # discriminator (real headlines never END with the no-space "/Agency"
+        # structure of a photo credit).
+        for t in (
+            "Reuters reports Q1 earnings beat",
+            "Bloomberg: NVDA breaks $200",
+            "Getty Images launches new product",
+            "AFP Photo: 5 things to know about Q1",
+            "MU drops 5%/Yahoo",
+            "Stock Market Today: Reuters/AP",
+            "Sam Altman/OpenAI says GPT-5 coming",      # OpenAI not in list
+            "Reuters/Yahoo Finance reports earnings",   # Yahoo not in list
+            "Apple/Microsoft deal closes",
+            "AFP/Getty Images launches new service",    # mid-sentence content
+            "Nvidia/AMD price war intensifies",
+            "Tom Cruise",                                # 2-word name, no /agency
+        ):
+            assert web_scraper._looks_like_quote_widget(
+                t, "https://x.com/a/b") is False, t
+
+    def test_extract_articles_filters_image_credit_anchors(self):
+        """End-to-end: a news page where the hero image (and its photo credit)
+        is wrapped in the article's own <a> link must NOT produce a fake
+        article whose title is the credit string. The exact bloomberg.com
+        shape that fired the live BREAKING push at 16:30:49Z 2026-05-21."""
+        html = """
+        <html><body>
+        <a href="/news/articles/2026-05-21/trump-quantum-firms">
+          <img src="/photos/x.jpg" alt="Trump signs quantum order">
+          Angela Weiss/AFP/Getty Images
+        </a>
+        <a href="/news/articles/2026-05-21/real-story">
+          Trump signs $2B quantum executive order, AI stocks rally
+        </a>
+        </body></html>
+        """
+        arts = web_scraper._extract_articles(html, "https://www.bloomberg.com/")
+        titles = [a["title"] for a in arts]
+        # Credit string must NOT be a "title"; the real story survives.
+        assert "Angela Weiss/AFP/Getty Images" not in titles
+        assert any("$2B quantum" in t for t in titles), titles

@@ -251,15 +251,44 @@ _QW_QUOTE_PATH = re.compile(r"/quote/[^/]+/?$", re.I)
 _QW_LISTING = re.compile(
     r"^\s*\$[^$\n]{0,60}\([A-Za-z0-9.\-]{1,8}\.[A-Za-z]{1,4}\)\$"
 )
+# Image-credit pseudo-article — the news-page hero image is wrapped in the
+# article's own <a href="..."> link, so when this scraper falls back to anchor
+# text it picks up the photo credit line as the "title". Live evidence
+# (2026-05-21 16:30:49Z, alert_recency.db): "Angela Weiss/AFP/Getty Images"
+# fired a real 🚨 BREAKING Discord push from ``scraped/www.bloomberg.com``
+# (cred=0.90 — well above the 0.45 lone-source bar; content type IS the
+# failure). The ML urgency head scored it 10.0 because the bloomberg.com URL +
+# proper-noun tokens + the implied semis-quantum subject (the hero image was
+# beneath a "Trump pledges $2B for quantum firms" article) triggered the
+# urgency head's high-relevance pattern recognition. Other live samples:
+# "Tomohiro Ohsumi/Getty Images", "Timorthy A. Clary/AFP/Getty Images".
+#
+# Fingerprint: anchored ^...$ so the WHOLE title is the credit (never a
+# mid-headline use). Title-Case photographer name (≥2 tokens, allowing
+# initials like ``A.``), then one or more ``/Agency`` slugs with NO space
+# around the slash, ending in a recognised image agency from a closed list.
+# Validated zero false positives against the must-survive corpus including
+# "Reuters/Yahoo Finance reports", "Sam Altman/OpenAI says", "MU drops 5%/Yahoo".
+# Defense-in-depth: a byte-identical twin lives in
+# ``watchers.alert_agent._QW_IMAGE_CREDIT`` and
+# ``analysis.claude_analyst._QW_IMAGE_CREDIT`` — the documented lockstep
+# triple-gate (collectors must not pull the watchers/ml import graph).
+_QW_IMAGE_CREDIT = re.compile(
+    r"^\s*[A-Z][a-zA-Z]+(?:\s+(?:[A-Z]\.?|[A-Z][a-zA-Z]+))+"
+    r"(?:/(?:AFP|Reuters|Getty\s+Images|AP|Bloomberg|EPA|TASS|"
+    r"WireImage|Shutterstock|Polaris|Bloomberg\s+News))+"
+    r"\s*$"
+)
 
 
 def _looks_like_quote_widget(title: str, url: str) -> bool:
-    """True for live quote-tape / quote-listing entries masquerading as
-    articles. See the block comment above for the live evidence and the three
-    title fingerprints (price-glue, parenthesised %, share-card listing)."""
+    """True for live quote-tape / quote-listing / image-credit entries
+    masquerading as articles. See the block comments above for the live
+    evidence and the four title fingerprints (price-glue, parenthesised %,
+    share-card listing, image credit)."""
     t = title or ""
     if (_QW_PRICE_GLUE.search(t) or _QW_PCT_PAREN.search(t)
-            or _QW_LISTING.search(t)):
+            or _QW_LISTING.search(t) or _QW_IMAGE_CREDIT.search(t)):
         return True
     try:
         if _QW_QUOTE_PATH.search(urlparse(url or "").path):
