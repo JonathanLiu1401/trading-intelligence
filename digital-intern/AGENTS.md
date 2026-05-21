@@ -5,6 +5,161 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 hybrid pass (Agent 3 late) — `_RT_WHY_STOCK_IS_AFTER` recap regex (live NVDA-night leak fix)
+
+**Phase 1 (live noise audit + regex fix):** read AGENTS.md, daemon.py,
+storage/article_store.py, watchers/alert_agent.py, watchers/urgency_scorer.py,
+ml/trainer.py, ml/features.py. Skipped redundant deep reads (the prior passes
+covered them exhaustively) and went straight to Phase-3-style live DB queries.
+
+Probed the live `articles.db` for the four load-bearing invariants — all
+clean: `synthetic_ever_alerted=0`, `ml_with_ai_gt_0=0`,
+`stuck_urgency1_24h=0`. The structural guards from prior passes are holding.
+
+Inspected the last 12h of `urgency=2` titles for noise. Found ONE clear
+fresh leak: **"Why Nvidia Stock Is Barely Moving After Earnings Crushed
+Expectations"** fired a real 🚨 BREAKING push TWICE within 14 minutes —
+2026-05-21 10:37:16Z from `GN: Nvidia`/Barron's + 10:50:41Z from `GN: AI
+stocks`/MSN syndication; the cross-cycle dedup caught the THIRD copy at
+10:59:00Z (visible in daemon.log) but the analyst had already received two
+pushes. score_source='ml' on both — the ML urgency head over-scored the
+SEO post-event explainer.
+
+None of the existing four "Why X Stock ..." recap variants caught this:
+
+- `_RT_WHY_TRADING` requires "trading up/down today"
+- `_RT_WHY_DID` requires "Did" between Why and subject
+- `_RT_WHY_JUST_MOVED` requires past-tense verb after adverb
+- `_RT_WHY_IS_PCT_SINCE` requires explicit "% since" trio
+
+This shape is present-tense `Stock Is <state-verb> After <event>` — a
+distinct retrospective template the analyst saw twice today.
+
+**The fix.** New fingerprint `_RT_WHY_STOCK_IS_AFTER` in
+`watchers/alert_agent.py` (added to `_RECAP_TEMPLATE_PATTERNS` SSOT, so
+`watchers.urgency_scorer` pre-floor + `analysis.claude_analyst` briefing
+prefilter + `analytics.recap_template_audit` all engage automatically via
+the existing import discipline). Discriminator:
+
+```
+^Why\s+...\s+Stock\s+Is + (adverb)? + closed-list state verb
+   (moving|trading|sliding|sinking|tumbling|crashing|plunging|jumping|
+    surging|soaring|rising|falling|climbing|dropping|rallying|spiking|
+    tanking|skyrocketing|nosediving|up|down|higher|lower|flat|stuck|...)
++ \bafter\b + recap-noun terminator
+   (earnings|results|report|quarter|q[1-4]|beat|miss|guidance)
+```
+
+The CLOSED action-verb list is what keeps this safe:
+
+- "Why X Stock Is the Best Buy After Q1" → NOT caught (the/best/buy not
+  in verb list)
+- "Why X Stock Could Rise After Earnings" → NOT caught (could is future-
+  tense, not a present state)
+- "Why X Stock Is Moving" (no after + earnings-noun) → NOT caught
+- "Why X Stock Is Surging After the Fed Cut" → NOT caught (non-earnings
+  terminator)
+
+**Tests pinned** in `tests/test_alert_recap_template.py`:
+
+- `test_why_x_stock_is_after_earnings_recap` (14 must-catch titles incl.
+  both live failure-case strings verbatim)
+- `test_why_stock_is_after_does_not_catch_forward_or_real_news` (16
+  must-survive titles — question form, future-tense, non-action verbs,
+  non-earnings terminators)
+- `test_new_why_stock_is_after_pattern_end_to_end` (full
+  `send_urgent_alert` integration: live failure-mode title is suppressed
+  without Discord push AND marked alerted so it exits the urgent queue)
+
+39/39 `test_alert_recap_template.py` pass. Focused sibling suite (164
+tests across alert_agent + urgency_scorer + alert_dedup + article_store +
+features + model + trainer + quote_widget_prefilter + recap_prefilter)
+passes. Briefing+audit recap suite (48 tests) passes. The new fingerprint
+SSOTs through the existing `_RECAP_TEMPLATE_PATTERNS` tuple so a future
+regex change automatically propagates to all three engagement surfaces.
+
+**Load-bearing invariants intact by construction.** Read-side title regex
+only — no DB write, no `ai_score`/`ml_score`/`score_source`/`urgency`
+mutation. Backtest isolation handled upstream by `_LIVE_ONLY_CLAUSE` (the
+read filter `get_unalerted_urgent` applies before the alert formatter sees
+any row). The `_RECAP_TEMPLATE_PATTERNS` tuple insertion ordering does not
+matter — the regexes are mutually-exclusive in their leading anchors so the
+first-match-wins iteration is deterministic.
+
+Commit `3684fcc`. Staged paths: `watchers/alert_agent.py` +
+`tests/test_alert_recap_template.py` + this `AGENTS.md` entry. Explicit
+pathspec (`git add watchers/alert_agent.py tests/test_alert_recap_template.py`),
+no `git add -A`. `git diff --staged --stat` confirmed only the two
+intentional changes were staged. Sibling paper-trader-side `M` file
+(`paper_trader/tests/test_news_action_funnel.py`) and untracked
+new-skill/test files from concurrent agents were left exactly as found.
+
+**Phase 2 (feature):** None. Per the commit guard, no feature was added.
+Honest assessment: the prior two same-day passes (Agent 3 evening:
+`urgency_label_split_by_ticker`; Agent 4 #2: two chat enrichment blocks)
+left the codebase well-covered; a fourth contrived slice would be obvious
+churn. The Phase 1 fix is this pass's value.
+
+**Phase 3 (live findings — news-analyst validation, 2026-05-21 11:30Z):**
+
+1. **(positive) Pipeline healthy under NVDA-earnings-night load.** 14,830
+   articles/24h, 618 urgent>=1, 537 alerted (87% urgent→push delivery
+   rate). 41/41 workers alive. Ingestion rate 4,442/h. The wire is
+   active and the desk is being fed.
+
+2. **(BUG, FIXED) "Why X Stock Is Barely Moving After Earnings" leaked
+   BREAKING TWICE.** Live failure-mode title fired at 10:37:16Z (Barron's)
+   + 10:50:41Z (MSN). Fixed in commit `3684fcc` (this pass).
+
+3. **(POSITIVE) load-bearing invariants all clean.** No synthetic row ever
+   alerted; no `score_source='ml'` row carries `ai_score>0`; no
+   `urgency=1` row older than 24h. The structural guards from prior
+   passes are holding under earnings-night load.
+
+4. **(observation) Calibration ratio holding ~stable.** 24h urgent rows:
+   181 LLM-vetted + 437 ML-only = 29% LLM-vetted (matches the 28-29%
+   prior-pass figure). Alerted: 126 LLM + 411 ML = 23% LLM-vetted —
+   slightly worse than the urgent surface, meaning ML-only rows make it
+   to push more often than LLM-vetted ones do. Expected given the
+   defense-in-depth gates suppress ML-only noise but don't suppress LLM
+   ones; not a regression.
+
+5. **(STALE-DAEMON, OPERATIONAL)** The running daemon started 06:55Z; the
+   `fc34c3c` regex commit (is_buy_after + why_is_pct_since) is dated
+   07:14Z — AFTER daemon start. So the prior pass's `_RT_IS_BUY_AFTER`
+   and `_RT_WHY_IS_PCT_SINCE` regexes are NOT in the live daemon. The
+   "Is Nvidia a Buy After Their Latest Earnings Report?" (04:34Z) and
+   the "Why Is BOK Financial (BOKF) Down 5.3% Since Last Earnings
+   Report?" (yesterday 17:03Z) alerts fired through because of this. The
+   regexes are correct in master; the daemon needs a restart to pick
+   them up. Standing pattern (memory: `di-stale-manual-daemon`).
+
+6. **(chronic, known)** Recurring `database is locked` retry warnings on
+   `vix_ts` / `sector_etf` / `dxy` workers under earnings-night writer
+   contention. The retry layer absorbs them. No action (memory:
+   `di-insert-batch-lock-contention`).
+
+7. **(operational)** NVDA earnings night produced 30+ BREAKING-eligible
+   alerts in 4h — the cross-cycle dedup + source-authority + recap
+   gates are clearly saturated. The analyst sees the same event from
+   many angles. System working as designed during a major earnings
+   event.
+
+8. **(chronic, known)** `source_health` reports 31 disabled / 3 stale /
+   32 down. Same standing chronic dark-collectors finding (memory:
+   `di-chronic-dark-collectors`).
+
+**Counters:** `bugs_fixed=1` (the `_RT_WHY_STOCK_IS_AFTER` recap regex —
+real live noise leak fixed today, two BREAKING pushes verified in
+articles.db urgency=2, fix + 14+16+1 tests committed in `3684fcc`),
+`features_added=0` (per the commit guard — no honest gap to fill after
+two same-day passes), `user_findings=8` (pipeline healthy, recap-regex
+leak fixed live, invariants clean, calibration ratio holding,
+stale-daemon detection on the prior pass's fix, lock-contention
+chronic, NVDA-night flood structural, source-health 31/3/32 chronic).
+
+---
+
 ## 2026-05-21 feature-dev pass (Agent 4 #2) — two new `/api/chat` enrichment blocks for today's paper-trader analytics
 
 Two pure `_*_chat_lines` helpers in `dashboard/web_server.py` (plus 2
