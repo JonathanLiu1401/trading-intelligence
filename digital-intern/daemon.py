@@ -73,6 +73,7 @@ from collectors.congress_trades_collector import collect_congress_trades
 from collectors.finra_short_volume import collect_finra_short_volume
 from collectors.market_movers import collect_market_movers
 from collectors.fear_greed_collector import collect_fear_greed
+from collectors.polymarket_collector import collect as collect_polymarket
 from collectors.collector_rate_monitor import collect_rate_alerts
 from collectors.yield_curve_collector import collect_yield_curve
 from collectors.cftc_cot_collector import collect_cftc_cot
@@ -149,6 +150,7 @@ CONGRESS_TRADES_INTERVAL = 3600   # Congressional trading disclosures — once p
 CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog — once per hour
 MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
+POLYMARKET_INTERVAL     = 900     # Polymarket prediction markets every 15min
 RATE_MONITOR_INTERVAL   = 3600    # per-collector silence detector — hourly
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
 COT_INTERVAL            = 6 * 3600  # CFTC COT report — weekly release, check 6-hourly
@@ -248,6 +250,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "yahoo_ticker_rss": YAHOO_TICKER_RSS_INTERVAL,
     "market_movers": MARKET_MOVERS_INTERVAL,
     "fear_greed": FEAR_GREED_INTERVAL,
+    "polymarket": POLYMARKET_INTERVAL,
     "rate_monitor": RATE_MONITOR_INTERVAL,
     "yield_curve": YIELD_CURVE_INTERVAL,
     "short_interest": SHORT_INTEREST_INTERVAL,
@@ -1039,6 +1042,27 @@ def fear_greed_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(FEAR_GREED_INTERVAL)
+
+
+def polymarket_worker(store: ArticleStore):
+    log.info("[polymarket_worker] started")
+    bo = Backoff("polymarket", base=30.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_polymarket()
+            _ingest(store, articles, "polymarket")
+            try:
+                source_health.record_result("polymarket", len(articles))
+            except Exception as he:
+                log.warning(f"[polymarket_worker] source_health error: {he}")
+            _worker_last_ok["polymarket"] = time.time()
+            log.debug(f"[polymarket] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[polymarket_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(POLYMARKET_INTERVAL)
 
 
 # ── Worker: per-collector silence detector — every 1h ────────────────────────
@@ -3013,6 +3037,7 @@ def main():
         ("market_movers", market_movers_worker),
         ("short_interest", short_interest_worker),
         ("fear_greed",  fear_greed_worker),
+        ("polymarket",  polymarket_worker),
         ("rate_monitor", rate_monitor_worker),
         ("yield_curve", yield_curve_worker),
         ("cftc_cot",    cftc_cot_worker),
