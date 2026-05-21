@@ -13712,3 +13712,150 @@ python3 -m paper_trader.ml.llm_annotation_skill
 `bugs_fixed=0` (no real bugs found after ~30 prior passes; angles checked were correct)
 · `features_added=1` (`paper_trader/ml/llm_annotation_skill.py` + per-cycle ledger wiring; 44 new tests)
 · `user_findings=7` (LLM annotation pipeline 100% dark · scorer pickle stale · continuous loop down · skill ledger files absent · 2 orphan running rows · 2 truncated test-artifact rows · extreme backtest leverage dispersion)
+
+---
+
+## 2026-05-21 paper-trader-core HYBRID pass (Agent 1, ~06:35 UTC)
+
+### Phase 1 — fix: `$cashtag` bypassed `_ALIAS_UPPER_FALSE_POSITIVES` filter (1 bug)
+
+`signals._extract_tickers` filters two distinct noise sets on the bare-ALLCAPS
+path: `_NOT_TICKERS` (common English / time-date / acronyms) and
+`_ALIAS_UPPER_FALSE_POSITIVES` (alias-uppercase non-tickers — APPLE, TESLA,
+INTEL, TSMC; aliases that exist in `_TICKER_ALIASES` whose `.upper()` is NOT a
+real ticker). The `$cashtag` path skipped both filters entirely.
+
+Trader-visible impact: a Twitter/Nitter body like `"$APPLE quarterly"` extracted
+both `APPLE` (a non-existent ticker) **and** `AAPL` (via the alias path),
+polluting the `tickers` field Opus reads in the live decision prompt with a
+fake name alongside the real one. Same for `$TESLA` / `$INTEL` / `$TSMC`.
+
+Fix narrows the cashtag bypass to `_NOT_TICKERS` ONLY — that preserves the
+intentional `$AI` / `$TOLD` / `$CUT` cashtag-override behaviour pinned by
+`test_cashtag_overrides_*_filter` (Sportradar's `$AI` is a real ticker; the
+operator's explicit cashtag wins over the English-noise filter). The
+`_ALIAS_UPPER_FALSE_POSITIVES` filter applies on both paths because there is no
+legitimate use case for a `$APPLE` / `$TESLA` cashtag — the canonical symbol is
+the alias the body already maps to.
+
+Tests (2 new in `tests/test_core_signals.py::TestTickerAliasExtraction`):
+- `test_cashtag_alias_upper_does_not_pollute_with_fake_ticker` — pins the fix
+  for the four documented collisions.
+- `test_cashtag_not_tickers_override_still_pinned_after_alias_filter` —
+  regression guard that the narrower scope did NOT also filter `$AI` / `$TOLD` /
+  `$CUT` (the prior, over-broad version of this fix did).
+
+Commit `26b8ab5`.
+
+### Phase 2 — feat: BUY/SELL direction split on the SESSION block `filled` line
+
+The hourly / daily SESSION block's "Decisions N filled X hold Y …" line lumped
+buys and sells into a single `filled` count, conflating two very different desk
+states a trader must read at a glance: DEPLOYING cash (filled buys) vs FREEING
+it (filled sells). On the live 24h state at commit time, the line read
+`filled 5 hold 50 no-dec 26 blocked 0` — the operator could not tell at a
+glance whether the desk added risk on or took it off.
+
+Adds:
+- `reporter._decision_action_verb(action_taken)` — companion to
+  `_classify_decision_outcome`: returns "BUY" / "SELL" / "HOLD" / None.
+  Collapses BUY_CALL / BUY_PUT → "BUY" and SELL_CALL / SELL_PUT → "SELL" (the
+  trader-facing distinction is direction, not stock-vs-option).
+- `reporter._activity_counts` now also emits `buys` / `sells` keys — additive
+  sub-counts of `filled` (a BLOCKED BUY counts as `blocked`, NOT as a `buys`
+  entry — it never moved cash).
+- `reporter._session_block` renders the new inline split as
+  `filled X (YB/ZS)` when `filled > 0` (silent when filled == 0 — terse summary
+  discipline; "(0B/0S)" would be noise).
+
+Single source of truth (invariant #10): the verb extractor reads the canonical
+free-text `action_taken` shape strategy.py writes (`"<ACTION> <TICKER> →
+<STATUS>"`); both ends of the contract live in this repo. No new store reads —
+pure derivation over an existing `recent_decisions(limit=500)` call.
+
+Tests (14 new in `tests/test_core_reporter.py`):
+- `TestDecisionActionVerb` (8): every BUY / SELL variant collapses correctly,
+  REBALANCE / unknown return None, NO_DECISION returns None, status segment
+  ignored (a BLOCKED BUY is still a BUY *intent*), case-insensitive input.
+- `TestActivityCountsBuySellSplit` (3): mixed BUYs & SELLs counted, a BLOCKED
+  BUY does NOT inflate `buys`, `buys + sells == filled` invariant for the
+  dominant case.
+- `TestSessionBlock` (5 new + 1 updated): `filled 0` omits the split,
+  buys-only renders `(NB/0S)`, sells-only renders `(0B/NS)`, mixed renders
+  `(YB/ZS)`, and the `Decisions N` total does NOT double-count the buys/sells
+  sub-totals.
+
+Commit `d1400be`.
+
+### Phase 3 — live validation findings (live trader ~06:35 UTC)
+
+1. **HOST SATURATION (load avg 20.33)**. The 4-parallel HYBRID-agent + sibling
+   ML/backtest agent + continuous-backtest committee load drove the box past
+   `host_saturated` thresholds. Operationally-visible: SWR-cached endpoints
+   (`/api/buying-power`, `/api/risk`, `/api/notify-health`, `/api/feed-health`)
+   timed out >15s with `{"warming": true, "attempts": 0}` responses — the trader
+   is alive (`/api/healthz`, `/api/portfolio` respond) and still cycling
+   decisions, but the dashboard surface for these specific endpoints went dark.
+   This is the documented host-saturation pathology; the runner's own
+   pre-flight/mid-call `host_saturated` guard correctly skips the Claude call
+   on these cycles (see strategy.py:1660–1696 and the AGENTS.md "host
+   saturation" notes). Not a fresh bug — confirming the documented pattern
+   still bites under heavy parallel agent load.
+
+2. **systemd unit in restart-spam mode (counter 235)**. `journalctl --user -u
+   paper-trader -n 30` shows the systemd-managed unit cycling every ~15s with
+   exit-code 1: it tries to acquire the singleton flock, finds it held by the
+   manual PID (387836 in this session), exits cleanly per the documented
+   `_acquire_singleton_lock` busy-path contract. The manual instance is the
+   real trader; the unit's persistent restart attempts produce no Discord noise
+   (the failing instances never reach the ONLINE ping). Mentioned in the
+   memory note `pt-systemd-vs-manual-restart-spam` — documented as expected
+   when running manually; the unit is disabled in practice and this 235-counter
+   spam should be silenced with `systemctl --user mask paper-trader` if the
+   user wants the journal noise to stop. Not breaking the trader; cosmetic.
+
+3. **The Phase-2 feature renders correctly on live data.** Verified with
+   `_session_block(store, 24.0, "24h")` on the live `paper_trader.db`:
+   `"Decisions 81 filled 5 (3B/2S) hold 50 no-dec 26 blocked 0"`. Exactly the
+   visibility this pass adds. The 1h window read `filled 0` and (correctly)
+   omits the `(0B/0S)` token per the terse-summary discipline.
+
+### How to run
+
+Live trader (singleton-guarded; the unit at this writing keeps restart-spamming
+because the manual launch holds the flock — pick one):
+```
+python3 -m paper_trader.runner               # manual, foreground
+# OR
+systemctl --user start paper-trader          # systemd-managed
+```
+
+Tests (this pass touched signals + reporter):
+```
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_core_signals.py tests/test_core_reporter.py -v
+# Whole core slice (~9s):
+python3 -m pytest tests/test_core_*.py -v
+```
+
+### Counters
+
+- bugs_fixed: 1 (`$cashtag` alias-upper-false-positive bypass)
+- features_added: 1 (BUY/SELL direction split on SESSION block)
+- user_findings: 3 (host saturation under multi-agent load; systemd restart
+  spam (cosmetic); Phase-2 feature renders live)
+
+### Invariants reaffirmed by this pass
+
+- Cashtag-override asymmetry on `_NOT_TICKERS` (`$AI` / `$TOLD` / `$CUT`
+  preserved); narrowed scope: alias-upper false positives (`APPLE` / `TESLA` /
+  `INTEL` / `TSMC`) filtered on both paths.
+- `_classify_decision_outcome` status check order unchanged (NO_DECISION →
+  FILLED → BLOCKED → HOLD); the new verb extractor reads the action segment
+  *before* the arrow, so the two helpers can never collide.
+- Reporter additive contract (invariants #2 / #12): no caps, no gating; any
+  Phase-2 fault on the new tokens degrades to "render `filled X` without the
+  split" — the prior byte-identical body — never an exception.
+- SESSION block top-level `Decisions N` total is the disjoint partition sum of
+  the five status buckets; the new `buys` / `sells` sub-counts are NOT summed
+  into N. Pinned by `test_decisions_total_does_not_double_count_buys_sells`.
