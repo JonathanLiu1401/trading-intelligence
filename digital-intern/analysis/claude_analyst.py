@@ -391,7 +391,16 @@ def _throughput_degradation_lines(
     """
     if not isinstance(throughput, list) or not throughput:
         return []
-    candidates: list[tuple[int, int, dict]] = []
+    # Source name as deterministic tiebreaker BEFORE the dict — without it,
+    # two rows with the same (abs_loss, prior) would force Python to compare
+    # the trailing dicts and raise ``TypeError: '<' not supported between
+    # instances of 'dict' and 'dict'`` (e.g. multiple `prior=10, recent=0`
+    # sources in the throughput snapshot — observed live: the briefing call
+    # bubbled this from _throughput_degradation_lines so analyze() returned
+    # the "[analyst] No response from Claude." sentinel for the whole 5h
+    # cycle, blanking that window's heartbeat on the analyst's primary
+    # consumed product).
+    candidates: list[tuple[int, int, str, dict]] = []
     for r in throughput:
         if not isinstance(r, dict):
             continue
@@ -405,12 +414,13 @@ def _throughput_degradation_lines(
         if decel_pct < min_decel_pct:
             continue
         abs_loss = prior - recent
-        candidates.append((-abs_loss, -prior, r))
+        src_key = str(r.get("source") or "")
+        candidates.append((-abs_loss, -prior, src_key, r))
     if not candidates:
         return []
     candidates.sort()
     out: list[str] = []
-    for _abs_loss_neg, _prior_neg, r in candidates[:max_lines]:
+    for _abs_loss_neg, _prior_neg, _src_key, r in candidates[:max_lines]:
         src = (r.get("source") or "").strip() or "unknown"
         decel = r.get("decel_pct")
         decel_str = f"{decel:.0f}%" if isinstance(decel, (int, float)) else "?"
