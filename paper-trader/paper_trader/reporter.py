@@ -2123,6 +2123,57 @@ def _pos_alpha_token(p: dict, equity_asc: list[dict] | None,
     return f"  α {alpha:+.1f}%"
 
 
+def _merge_stale_marks(open_positions: list[dict],
+                       json_positions: list[dict] | None) -> list[dict]:
+    """Return ``open_positions`` rows enriched with the ``stale_mark`` flag
+    from the marked-to-market ``positions_json`` snapshot.
+
+    ``store.open_positions()`` reads the ``positions`` TABLE, whose schema
+    has no ``stale_mark`` column (it was added as an in-memory enrichment
+    in ``strategy._mark_to_market``). The mark-to-market write path
+    persists ``stale_mark`` ONLY into the ``portfolio.positions_json`` blob
+    via ``store.update_portfolio``. So a caller that fetches
+    ``store.open_positions()`` and feeds it to ``_portfolio_lines`` /
+    ``_pos_pct_weight`` / ``_pos_alpha_token`` reads ``stale_mark`` as
+    falsy on EVERY row — silently dropping the ⚠ STALE annotation and
+    rendering misleading P/L% / alpha tokens for cost-fallback marks that
+    look identical to a genuinely flat $0.00 position. The exact failure
+    mode the ``stale_mark`` flag was introduced to expose.
+
+    This helper merges the flag in by matching on the same
+    ``(ticker, type, expiry, strike)`` key the positions UNIQUE constraint
+    uses. Pure / never raises: any malformed snapshot row is skipped (the
+    additive reporter contract — a bad enrichment must drop just this
+    flag, never the whole position line). Returns the same list object
+    with ``stale_mark`` mutated onto the matched rows so callers don't
+    need to thread a copy through.
+    """
+    if not json_positions:
+        return open_positions
+
+    def _key(p: dict) -> tuple:
+        return (
+            (p.get("ticker") or "").upper(),
+            (p.get("type") or "").lower(),
+            p.get("expiry") or "",
+            p.get("strike") or 0,
+        )
+
+    stale_keys: set[tuple] = set()
+    for jp in json_positions:
+        if not isinstance(jp, dict) or not jp.get("stale_mark"):
+            continue
+        stale_keys.add(_key(jp))
+    if not stale_keys:
+        return open_positions
+    for p in open_positions:
+        if not isinstance(p, dict):
+            continue
+        if _key(p) in stale_keys:
+            p["stale_mark"] = True
+    return open_positions
+
+
 def _portfolio_lines(positions: list[dict],
                      total_value: float | None = None,
                      events_by_ticker: dict | None = None,
@@ -3236,7 +3287,13 @@ def _fmt_trade_stamp(ts_iso: str | None, now: datetime | None = None) -> str:
 def send_hourly_summary() -> bool:
     store = get_store()
     pf = store.get_portfolio()
-    positions = store.open_positions()
+    # ``store.open_positions()`` rows lack ``stale_mark`` (no such column in
+    # the positions TABLE — it's an in-memory enrichment from
+    # ``strategy._mark_to_market``). Merge it in from the marked snapshot in
+    # ``portfolio.positions_json`` so the ⚠ STALE annotation in
+    # ``_portfolio_lines`` and the P/L%/alpha suppression in
+    # ``_pos_pct_weight``/``_pos_alpha_token`` can actually fire.
+    positions = _merge_stale_marks(store.open_positions(), pf.get("positions"))
     sp = market.benchmark_sp500()
     pl = pf["total_value"] - _INITIAL_EQUITY
     pl_pct = pl / _INITIAL_EQUITY * 100
@@ -3424,7 +3481,9 @@ def send_hourly_summary() -> bool:
 def send_daily_close() -> bool:
     store = get_store()
     pf = store.get_portfolio()
-    positions = store.open_positions()
+    # See send_hourly_summary — merge stale_mark from positions_json so the
+    # ⚠ STALE annotation can fire on the daily close too.
+    positions = _merge_stale_marks(store.open_positions(), pf.get("positions"))
     sp = market.benchmark_sp500()
 
     pl = pf["total_value"] - _INITIAL_EQUITY

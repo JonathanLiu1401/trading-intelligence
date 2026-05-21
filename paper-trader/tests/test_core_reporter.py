@@ -4955,3 +4955,218 @@ class TestCashConvictionFitLine:
         monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
         assert reporter.send_daily_close() is True
         assert "**CASH FIT** ◈ OVERDEPLOYED" in captured[0]
+
+
+class TestMergeStaleMarks:
+    """`_merge_stale_marks` — fix for the trader-visible bug where
+    ``store.open_positions()`` rows lack ``stale_mark`` (no such column on
+    the positions TABLE), so the ⚠ STALE annotation in ``_portfolio_lines``
+    and the P/L%/alpha suppression in ``_pos_pct_weight`` /
+    ``_pos_alpha_token`` silently never fire on the hourly / daily summary."""
+
+    def test_merges_stock_match_on_ticker_and_type(self):
+        open_pos = [
+            {"ticker": "NVDA", "type": "stock", "expiry": None,
+             "strike": None, "qty": 5, "avg_cost": 100.0,
+             "current_price": 100.0, "unrealized_pl": 0.0},
+            {"ticker": "MU", "type": "stock", "expiry": None,
+             "strike": None, "qty": 2, "avg_cost": 50.0,
+             "current_price": 60.0, "unrealized_pl": 20.0},
+        ]
+        json_pos = [
+            {"ticker": "NVDA", "type": "stock", "expiry": None,
+             "strike": None, "stale_mark": True},
+            {"ticker": "MU", "type": "stock", "expiry": None,
+             "strike": None, "stale_mark": False},
+        ]
+        out = reporter._merge_stale_marks(open_pos, json_pos)
+        assert out[0]["stale_mark"] is True
+        # The non-stale row gets no stale_mark key (we only inject Trues).
+        assert "stale_mark" not in out[1] or out[1].get("stale_mark") in (
+            None, False
+        )
+
+    def test_merges_option_match_requires_strike_and_expiry(self):
+        # Two open call legs on the same ticker differ only by strike;
+        # exactly one is stale_mark=True in the json snapshot.
+        open_pos = [
+            {"ticker": "NVDA", "type": "call", "expiry": "2026-06-19",
+             "strike": 600.0, "qty": 1, "avg_cost": 5.0,
+             "current_price": 5.0},
+            {"ticker": "NVDA", "type": "call", "expiry": "2026-06-19",
+             "strike": 700.0, "qty": 1, "avg_cost": 3.0,
+             "current_price": 4.0},
+        ]
+        json_pos = [
+            {"ticker": "NVDA", "type": "call", "expiry": "2026-06-19",
+             "strike": 700.0, "stale_mark": True},
+        ]
+        out = reporter._merge_stale_marks(open_pos, json_pos)
+        assert not out[0].get("stale_mark")     # 600C — not stale
+        assert out[1]["stale_mark"] is True     # 700C — stale
+
+    def test_no_json_positions_returns_input_unchanged(self):
+        open_pos = [{"ticker": "NVDA", "type": "stock"}]
+        out = reporter._merge_stale_marks(open_pos, None)
+        assert out is open_pos
+        assert "stale_mark" not in out[0]
+
+    def test_no_stale_rows_returns_input_unchanged(self):
+        open_pos = [{"ticker": "NVDA", "type": "stock"}]
+        json_pos = [{"ticker": "NVDA", "type": "stock", "stale_mark": False}]
+        out = reporter._merge_stale_marks(open_pos, json_pos)
+        # No mutation happened (the loop returned before mutation).
+        assert "stale_mark" not in out[0]
+
+    def test_unmatched_stale_row_does_not_pollute_other_positions(self):
+        # The json snapshot has a stale row for a ticker the open_positions
+        # set does not carry (e.g. just-closed lot mid-cycle). Nothing should
+        # be flagged in the open_positions output.
+        open_pos = [{"ticker": "NVDA", "type": "stock", "expiry": None,
+                     "strike": None}]
+        json_pos = [{"ticker": "MU", "type": "stock", "expiry": None,
+                     "strike": None, "stale_mark": True}]
+        out = reporter._merge_stale_marks(open_pos, json_pos)
+        assert not out[0].get("stale_mark")
+
+    def test_handles_malformed_json_rows_silently(self):
+        # A non-dict / missing-key row in the json snapshot must not raise.
+        open_pos = [{"ticker": "NVDA", "type": "stock", "expiry": None,
+                     "strike": None}]
+        json_pos = [None, "garbage", {"no_keys": True},
+                    {"ticker": "NVDA", "type": "stock", "expiry": None,
+                     "strike": None, "stale_mark": True}]
+        out = reporter._merge_stale_marks(open_pos, json_pos)  # type: ignore[arg-type]
+        assert out[0]["stale_mark"] is True
+
+
+class TestHourlySummaryStaleMarkBugFix:
+    """End-to-end regression test for the silent stale_mark drop bug:
+    the hourly summary must surface the ⚠ STALE flag for a position the
+    mark-to-market snapshot flagged stale, even though the positions TABLE
+    schema has no stale_mark column. This pins the bug so a future
+    refactor can't reintroduce the silent drop."""
+
+    def _stub_signals(self, monkeypatch, articles):
+        """Disable noisy article / live-builder fetches so we just observe
+        the position-line render."""
+        from paper_trader import signals as _signals
+        monkeypatch.setattr(_signals, "get_top_signals",
+                            lambda *a, **k: articles)
+        monkeypatch.setattr(_signals, "get_urgent_articles",
+                            lambda *a, **k: [])
+        # Suppress the optional analytics blocks that fetch articles too.
+        for fn in ("_source_mix_line", "_idle_opportunity_line",
+                   "_cash_conviction_fit_line",
+                   "_earnings_shock_line", "_position_attention_line"):
+            monkeypatch.setattr(reporter, fn, lambda *a, **k: "")
+
+    def test_hourly_renders_stale_flag_when_snapshot_marked_stale(
+            self, fresh_store, monkeypatch):
+        """The trader-visible bug: a NVDA position whose live price was
+        unavailable (mark==avg, P/L $0.00, stale_mark True in
+        positions_json) historically rendered with no STALE flag because
+        the hourly used ``store.open_positions()`` which has no
+        ``stale_mark`` column. This pins the fix."""
+        # Open a live NVDA stock position via the real store path.
+        fresh_store.upsert_position("NVDA", "stock", 5, 100.0)
+        # Manually write a positions_json that flags NVDA stale (mirrors
+        # what _portfolio_snapshot does after _mark_to_market sets the
+        # flag because get_price returned None).
+        fresh_store.update_portfolio(
+            cash=500.0, total_value=1000.0,
+            positions=[{
+                "ticker": "NVDA", "type": "stock",
+                "expiry": None, "strike": None,
+                "qty": 5, "avg_cost": 100.0, "current_price": 100.0,
+                "unrealized_pl": 0.0, "pl_pct": 0.0,
+                "market_value": 500.0, "stale_mark": True,
+            }],
+        )
+        self._stub_signals(monkeypatch, [])
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: None)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        # ⚠ STALE annotation now renders on the position line — the bug fix.
+        assert "STALE" in body, (
+            f"⚠ STALE annotation missing from hourly summary body — "
+            f"the stale_mark bug regressed.\nbody={body!r}"
+        )
+
+    def test_hourly_suppresses_misleading_pl_pct_for_stale_position(
+            self, fresh_store, monkeypatch):
+        """With ``stale_mark`` properly threaded through,
+        ``_pos_pct_weight`` must suppress the +0.0% P/L token (which
+        would lie next to the STALE flag, the exact misleading-token
+        case the suppression was added to prevent)."""
+        fresh_store.upsert_position("NVDA", "stock", 5, 100.0)
+        # mark == avg → P/L = $0.00, but stale_mark=True means we did NOT
+        # observe that mark — it's the avg_cost fallback. The 0.0% must be
+        # suppressed.
+        fresh_store.update_portfolio(
+            cash=500.0, total_value=1000.0,
+            positions=[{
+                "ticker": "NVDA", "type": "stock",
+                "expiry": None, "strike": None,
+                "qty": 5, "avg_cost": 100.0, "current_price": 100.0,
+                "unrealized_pl": 0.0, "pl_pct": 0.0,
+                "market_value": 500.0, "stale_mark": True,
+            }],
+        )
+        self._stub_signals(monkeypatch, [])
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: None)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        # P/L % is suppressed when stale_mark is true (the
+        # _pos_pct_weight contract). It must NOT render "+0.0%" next to a
+        # STALE flag.
+        # The book weight % token, however, IS still rendered (weight is
+        # derived from qty*current_price/total_value which is meaningful
+        # even when current_price is the avg_cost fallback) — so a "50% bk"
+        # is fine. But the "+0.0%" return token specifically must be gone.
+        assert "+0.0%" not in body, (
+            f"+0.0% P/L token should be suppressed next to STALE flag "
+            f"(_pos_pct_weight contract).\nbody={body!r}"
+        )
+
+    def test_hourly_keeps_clean_book_byte_compatible(
+            self, fresh_store, monkeypatch):
+        """The fix must be additive: a position with no stale_mark in the
+        snapshot continues to render with the +X.X% P/L token and no
+        STALE annotation — byte-compatible with pre-fix behavior."""
+        fresh_store.upsert_position("MU", "stock", 2, 50.0)
+        fresh_store.update_portfolio(
+            cash=900.0, total_value=1020.0,
+            positions=[{
+                "ticker": "MU", "type": "stock",
+                "expiry": None, "strike": None,
+                "qty": 2, "avg_cost": 50.0, "current_price": 60.0,
+                "unrealized_pl": 20.0, "pl_pct": 20.0,
+                "market_value": 120.0, "stale_mark": False,
+            }],
+        )
+        # Also propagate the mark to the positions table so the line shows
+        # the live mark (closer to what _mark_to_market would do).
+        for p in fresh_store.open_positions():
+            fresh_store.update_position_marks({p["id"]: (60.0, 20.0)})
+        self._stub_signals(monkeypatch, [])
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: None)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "STALE" not in body
+        assert "+20.0%" in body
