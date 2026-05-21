@@ -364,6 +364,202 @@ class TestMainCLI:
         assert payload["recent_empty_rate"]["empty"] == 1
 
 
+# ── recent_starvation_by_cause — operator-actionable bucketing ──────────────
+# Each class needs a DIFFERENT action (see _CAUSE_LABELS comment):
+#   model_timeout  — Opus wedged; may resolve when load drops
+#   cli_nonzero_rc — Anthropic API / CLI transient
+#   model_empty    — model-level miss; usually one-cycle
+#   cli_missing    — config bug (claude not in PATH)
+#   host_skip      — pre-flight guard skipped; ops must reduce parallel Opus
+#   unknown        — legacy/future reason; surfaces so sum reconciles
+# The aggregate starvation rate hides this cell, so the breakdown is the
+# minimum operator-visible thing the CLI must emit during a storm.
+
+class TestStarvationByCause:
+    def test_classify_each_known_cause(self):
+        c = hg._classify_starvation_cause
+        # Host skip prefix wins regardless of an embedded "(timeout)" later.
+        assert c("skipped claude call — host saturated: 7 conc") == "host_skip"
+        assert c("skipped claude call — host saturated mid-call: ...") == "host_skip"
+        # The per-cause sub-buckets strategy.py writes.
+        assert c("claude returned no response (timeout)") == "model_timeout"
+        assert c("claude returned no response (nonzero_rc)") == "cli_nonzero_rc"
+        assert c("claude returned no response (empty_stdout)") == "model_empty"
+        assert c("claude returned no response (exception)") == "model_empty"
+        assert c("claude returned no response (cli_missing)") == "cli_missing"
+        # Legacy generic line — pre-sub-buckets fallback.
+        assert c("claude returned no response (timeout/empty)") == "model_timeout"
+
+    def test_classify_unknown_falls_through_to_unknown_bucket(self):
+        c = hg._classify_starvation_cause
+        # A starvation prefix with a NEW/unrecognised suffix → unknown so
+        # the breakdown still reconciles to the aggregate (no row lost).
+        assert c("claude returned no response (future_cause_xyz)") == "unknown"
+        # No parens → unknown (legacy unparenthesised line, defensive).
+        assert c("claude returned no response") == "unknown"
+        # Empty reason — defensive; classify() never raises.
+        assert c("") == "unknown"
+        # Non-starvation prefix (e.g. parse_failed) — unknown by contract;
+        # the caller filters via the starvation-prefix gate BEFORE this
+        # classifier runs (a non-starved row never enters the per-cause
+        # bucket), so this "unknown" return is purely defensive.
+        assert c("parse_failed: {garbage") == "unknown"
+
+    def test_by_cause_exact_counts_and_sum_reconcile(self, tmp_path):
+        db = tmp_path / "pt.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE decisions (id INTEGER PRIMARY KEY, "
+            "action_taken TEXT, reasoning TEXT)"
+        )
+        rows = [
+            ("NO_DECISION", "claude returned no response (timeout)"),
+            ("NO_DECISION", "claude returned no response (timeout)"),
+            ("NO_DECISION", "claude returned no response (timeout/empty)"),
+            ("NO_DECISION", "claude returned no response (nonzero_rc)"),
+            ("NO_DECISION", "claude returned no response (nonzero_rc)"),
+            ("NO_DECISION", "claude returned no response (empty_stdout)"),
+            ("NO_DECISION", "claude returned no response (cli_missing)"),
+            ("NO_DECISION", "skipped claude call — host saturated: 5 ..."),
+            ("NO_DECISION", "skipped claude call — host saturated mid-call ..."),
+            ("NO_DECISION", "skipped claude call — host saturated: 6 ..."),
+            ("NO_DECISION", "parse_failed: {garbage"),    # NOT starved
+            ("BUY NVDA → FILLED", "ok"),                  # NOT NO_DECISION
+            ("HOLD AAPL → HOLD", "no edge"),              # NOT NO_DECISION
+        ]
+        conn.executemany(
+            "INSERT INTO decisions (action_taken, reasoning) VALUES (?, ?)",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+
+        out = hg.recent_starvation_by_cause(db, limit=120)
+        assert out["ok"] is True
+        assert out["n"] == 13
+        assert out["starved"] == 10                       # 3 timeout + 2 rc + 1 empty + 1 cli_missing + 3 host_skip
+        bc = out["by_cause"]
+        # Counts sum to starved exactly — by_cause is a reconciling
+        # partition of the starvation slice.
+        assert sum(bc.values()) == out["starved"]
+        # Each class exact, including the timeout/empty legacy rollup into
+        # model_timeout (not model_empty — see _classify_starvation_cause
+        # docstring).
+        assert bc["model_timeout"] == 3
+        assert bc["cli_nonzero_rc"] == 2
+        assert bc["model_empty"] == 1
+        assert bc["cli_missing"] == 1
+        assert bc["host_skip"] == 3
+        assert bc["unknown"] == 0
+        # The all-labels invariant — every cause key is ALWAYS present
+        # (zero-valued for absent classes) so consumers can render the cell
+        # without a key-miss guard.
+        assert set(bc) == set(hg._CAUSE_LABELS)
+
+    def test_by_cause_missing_db_is_safe_default(self):
+        out = hg.recent_starvation_by_cause("/nonexistent/path/to/pt.db")
+        assert out["ok"] is False
+        assert out["n"] == 0
+        assert out["starved"] == 0
+        # by_cause is the all-zero shape (NOT empty) so a degraded probe
+        # still satisfies the render contract.
+        assert set(out["by_cause"]) == set(hg._CAUSE_LABELS)
+        assert all(v == 0 for v in out["by_cause"].values())
+
+    def test_unknown_cause_preserves_sum(self, tmp_path):
+        db = tmp_path / "pt.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE decisions (id INTEGER PRIMARY KEY, "
+            "action_taken TEXT, reasoning TEXT)"
+        )
+        # A future suffix we don't know about — must roll into `unknown`,
+        # not vanish. The breakdown's reconciliation contract is
+        # load-bearing: a future cause must never silently zero out a
+        # starvation count in the operator-visible aggregate.
+        rows = [
+            ("NO_DECISION", "claude returned no response (future_xyz)"),
+            ("NO_DECISION", "claude returned no response (timeout)"),
+        ]
+        conn.executemany(
+            "INSERT INTO decisions (action_taken, reasoning) VALUES (?, ?)",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        out = hg.recent_starvation_by_cause(db)
+        assert out["starved"] == 2
+        assert out["by_cause"]["unknown"] == 1
+        assert out["by_cause"]["model_timeout"] == 1
+        assert sum(out["by_cause"].values()) == 2
+
+    def test_cli_human_text_shows_per_cause_when_present(
+            self, tmp_path, capsys, monkeypatch):
+        db = tmp_path / "pt.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE decisions (id INTEGER PRIMARY KEY, "
+            "action_taken TEXT, reasoning TEXT)"
+        )
+        rows = [
+            ("NO_DECISION", "claude returned no response (timeout)"),
+            ("NO_DECISION", "claude returned no response (nonzero_rc)"),
+            ("NO_DECISION", "skipped claude call — host saturated: 5 ..."),
+            ("BUY NVDA → FILLED", "ok"),
+        ]
+        conn.executemany(
+            "INSERT INTO decisions (action_taken, reasoning) VALUES (?, ?)",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(hg, "_DEFAULT_DB", db)
+        monkeypatch.setattr(hg, "probe", lambda: {
+            "opus_count": 1, "mem_available_mb": 8000.0,
+            "swap_used_pct": 5.0, "load1": 1.0, "load5": 1.0,
+            "load15": 1.0, "cpus": 16, "load_per_cpu": 0.1,
+        })
+        hg.main([])
+        out = capsys.readouterr().out
+        # The breakdown line must surface non-zero buckets in the human
+        # CLI text so an operator gets the actionable cell without needing
+        # to read the JSON form.
+        assert "by cause:" in out
+        assert "model_timeout=1" in out
+        assert "cli_nonzero_rc=1" in out
+        assert "host_skip=1" in out
+        # Zero buckets are NOT printed — the line would be too noisy with
+        # six zero classes on a quiet box.
+        assert "model_empty=0" not in out
+        assert "cli_missing=0" not in out
+
+    def test_cli_human_text_omits_per_cause_line_when_all_zero(
+            self, tmp_path, capsys, monkeypatch):
+        db = tmp_path / "pt.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE decisions (id INTEGER PRIMARY KEY, "
+            "action_taken TEXT, reasoning TEXT)"
+        )
+        # Quiet box — no starved rows at all. The CLI must NOT print a
+        # "by cause:" line (every bucket would be zero; pure noise).
+        conn.executemany(
+            "INSERT INTO decisions (action_taken, reasoning) VALUES (?, ?)",
+            [("BUY NVDA → FILLED", "ok"), ("HOLD AAPL → HOLD", "no edge")],
+        )
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(hg, "_DEFAULT_DB", db)
+        monkeypatch.setattr(hg, "probe", lambda: {
+            "opus_count": 1, "mem_available_mb": 8000.0,
+            "swap_used_pct": 5.0, "load1": 1.0, "load5": 1.0,
+            "load15": 1.0, "cpus": 16, "load_per_cpu": 0.1,
+        })
+        hg.main([])
+        out = capsys.readouterr().out
+        assert "by cause:" not in out
+
+
 # ── _NOT_TICKERS — no duplicate tokens ───────────────────────────────────────
 # The set deduplicates at runtime but duplicate literals in the source code
 # are a maintenance smell: a future editor adding a new token may not notice
