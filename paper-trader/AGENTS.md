@@ -4,6 +4,163 @@ Companion to `CLAUDE.md` aimed at coding agents that touch this repo
 during automated review / fix cycles. Where `CLAUDE.md` documents the
 *system*, this file documents the *workflows*.
 
+---
+
+## 2026-05-20 feature-dev pass (Agent 4) — `/api/cash-conviction-fit`
+
+Point-in-time verdict on whether the book's cash level is appropriate
+given the loudest live signal. None of `capital_paralysis` /
+`idle_opportunity` / `position_action_brief` join cash idleness × top
+signal score × last-decision verb into a single verdict. This endpoint
+does. It works at N=1 trade, N=1 position, N=0 — strictly point-in-time;
+no historical roll-up; the IDLE_DESPITE_SURGE failure mode is the live
+state this surface catches today.
+
+Pure builder (`analytics.cash_conviction_fit.build_cash_conviction_fit`,
+mirrors the `briefing_coverage_audit` / `news_arrival_rhythm`
+discipline — portfolio + signals + last_decision in, dict out, never
+raises). Route layer (`dashboard/web_server.py::cash_conviction_fit_api`)
+pulls portfolio via `store.get_portfolio`, scans articles.db (live-only,
+short-lived `mode=ro` conn) for signals in the configurable freshness
+window, attaches each article to its loudest `_BOOK_TICKERS` mention
+(word-boundary, briefing-coverage-audit convention), and grabs the
+single most-recent decision row.
+
+Query params (clamped):
+- `signal_floor` — ai_score floor for fetched signals, 0..10 (default
+  4.0). Low enough that IDLE_LOW_CONVICTION still has a top signal to
+  attach to.
+- `signal_window_hours` — freshness floor, 0.5..48 (default 4.0).
+- `idle_cash_pct` — cash idleness threshold, 0..100 (default 40.0).
+- `overdeployed_cash_pct` — overdeployed floor, 0..100 (default 10.0).
+- `high_conviction_score` — ai_score floor for "loud" signals (default
+  8.0).
+- `low_conviction_score` — ai_score ceiling below which the universe is
+  materially quiet (default 6.0).
+- `recent_fill_max_min` — recent-FILL window that disambiguates an
+  active loop from chronic idleness (default 30 min).
+
+Response (envelope identical across NO_DATA / BALANCED /
+IDLE_DESPITE_SURGE / OVERDEPLOYED / IDLE_LOW_CONVICTION so the UI
+binding never sees a missing field):
+
+- `verdict` — `IDLE_DESPITE_SURGE` (cash ≥ idle floor AND top signal ≥
+  high-conviction floor AND last decision passive) / `OVERDEPLOYED`
+  (cash ≤ overdeployed floor AND top signal ≥ high-conviction floor) /
+  `IDLE_LOW_CONVICTION` (cash ≥ idle floor AND top signal <
+  low-conviction ceiling — affirmation, not warning) / `BALANCED` (none
+  of the above; recent FILL also collapses to BALANCED) / `NO_DATA`
+  (portfolio or signals missing)
+- `headline` — one-line operator summary with cash% × top score ×
+  last verb + age
+- `portfolio` — `{cash_usd, total_value_usd, cash_pct, n_positions}`
+- `top_signal` — `{ticker, ai_score, urgency, source, held}` (held flag
+  is rendering only — does not influence the verdict)
+- `last_decision` — `{verb, age_min, recent_fill}` (verb extracted from
+  the free-text `action_taken` string per CLAUDE.md invariant #11)
+- `thresholds` — every clamped/default threshold echoed back for the
+  operator-visible audit trail
+
+```sh
+curl -s 'http://localhost:8090/api/cash-conviction-fit' | python3 -m json.tool
+```
+
+Pinned by `tests/test_cash_conviction_fit.py` (22 cases): envelope
+stability across every verdict path; the IDLE_DESPITE_SURGE ×
+OVERDEPLOYED × IDLE_LOW_CONVICTION × BALANCED × NO_DATA matrix;
+recent-fill disambiguation (active fill ≤ recent_fill_max_min prevents
+IDLE_DESPITE_SURGE — the cash-idle reading is transient by construction
+in an active loop); old fills do not override; NO_DECISION counts as
+passive (no ticker, just the verb); HOLD verb extraction from the
+`"HOLD NVDA → HOLD"` free-text format (CLAUDE.md #11); threshold
+override forwarding (idle_cash_pct, high_conviction_score,
+recent_fill_max_min); top-signal picking (loudest by ai_score; urgency
+tie-break; alphabetical ticker stability); malformed signals skipped
+(None / non-dict / non-numeric ai_score / NaN); explicit cash_pct wins
+over implicit derive; defensive on empty action_taken.
+
+---
+
+## 2026-05-20 feature-dev pass (Agent 4) — `/api/conviction-deployment-curve`
+
+Does the bot's BUY size scale with the news ai_score at the moment of
+entry? Or is there a structural cap (40% of book per name, an
+unwritten persona rule, an Opus risk anchor) that *flattens* the curve
+so every entry looks the same size regardless of how loud the signal
+is? None of `add_discipline` (price-chasing on the ADD) /
+`trade_asymmetry` (disposition) / `loser_autopsy` / `winner_autopsy` /
+`news_to_trade_lag` (reactivity) / `trade_attribution` (which articles
+preceded a trade) asks the **conviction-to-size** question this
+endpoint surfaces.
+
+Pure builder (`analytics.conviction_deployment.build_conviction_deployment`,
+mirrors the `news_to_trade_lag` discipline — trades + articles +
+equity_curve in, dict out, never raises on garbage rows). Route layer
+(`dashboard/web_server.py::conviction_deployment_curve_api`) is the SQL
+adapter only — pulls trades + equity_curve via the store, scans
+articles.db (live-only, short-lived `mode=ro` conn) over the same
+window the trade ledger spans, applies word-boundary ticker matching
+against article titles (briefing-coverage-audit convention).
+
+Output has TWO parallel surfaces — both ship at every sample size:
+
+- `evidence` — per-trade chronological table the operator can eyeball
+  even at N=1. **The primary surface at low sample size.** Each row:
+  `{ts, ticker, action, qty, price, value_usd, equity_at_trade_usd,
+  size_pct, peak_ai_score_pre, score_unavailable, bucket,
+  top_article_title, top_article_source}`.
+- `buckets` — five ai_score buckets (`<6` / `6-7` / `7-8` / `8-9` /
+  `9+`) with `n_buys`, `median_size_pct`, `max_size_pct`,
+  `total_value_usd`. All five always present (empty cells emit
+  `n_buys=0`).
+
+Verdict (gated on per-bucket density, not total trade count — two
+trades in the "9+" bucket tell you nothing about the curve):
+
+- `MONOTONIC` — every consecutive populated-bucket median_size_pct
+  delta is ≥ MONOTONIC_SLOPE_PP (5pp default) and at least one is
+  strictly positive
+- `INVERTED` — every delta ≤ -MONOTONIC_SLOPE_PP, at least one < 0
+- `FLAT` — no consistent direction at the slope-pp grain
+- `INSUFFICIENT` — fewer than STABLE_MIN_POPULATED_BUCKETS (2) buckets
+  meet STABLE_MIN_PER_BUCKET (3)
+
+State envelope (orthogonal to verdict): `NO_DATA` (no BUYs) /
+`EMERGING` (BUYs present but density below the verdict threshold) /
+`STABLE` (verdict load-bearing).
+
+Query params (clamped):
+- `limit` — trade lookback row cap, 50..10000 (default 2000)
+- `window_hours_pre_trade` — peak-score scan window before each BUY,
+  0.5..48 (default 6.0 — matches news-to-trade-lag and
+  briefing-coverage-audit window conventions)
+- `article_floor_score` — ai_score floor for fetched articles, 0..10
+  (default 2.0; lower than the bucket floor so the "<6" bucket still
+  has informants)
+
+```sh
+curl -s 'http://localhost:8090/api/conviction-deployment-curve' | python3 -m json.tool
+```
+
+Pinned by `tests/test_conviction_deployment.py` (28 cases): envelope
+stability across NO_DATA / EMERGING / STABLE; BUY-only filter (SELLs
+excluded, options excluded by `option_type ∈ {CALL,PUT}`, non-positive
+value excluded, ADD action treated as BUY); the `(trade_ts - window,
+trade_ts]` peak-score window — articles exactly at the trade ts are
+included (closed upper edge); articles outside the window are dropped;
+future articles are excluded (look-ahead bias defense); equity_curve
+interpolation (nearest before-or-equal; starting_capital fallback for
+trades pre-dating the curve); word-boundary ticker matching (MU does
+not match Museum; $NVDA does match NVDA; other tickers do not); bucket
+cuts inclusive-lower / exclusive-upper with the "9+" open-ended top;
+verdict roll-up at the per-bucket density floor; MONOTONIC /
+INVERTED / FLAT (small deltas under the slope) detection; INSUFFICIENT
+when only one bucket is populated; score_unavailable accounting for
+trades that pre-date articles.db retention; malformed article / equity
+rows degrade — never raise.
+
+---
+
 ## Repository layout (quick reference)
 
 - `paper_trader/runner.py` — live trader main loop. **Single-instance guard** (`_acquire_singleton_lock`, `fcntl.flock` on `data/paper_trader.runner.lock`, invariant #19) refuses to boot a second trader on the same paper book — `main()` exits before the store/dashboard/ONLINE-ping when the lock is held by a live process; fails OPEN (degraded → continue) if the lock plumbing is unusable. Auto-recovery circuit breaker scoped to its own child claude subprocesses (`pkill -P os.getpid()`, invariant #18). Hourly / daily-close markers are restart-durable via the atomic `data/runner_state.json` sidecar (invariant #6)
