@@ -12613,3 +12613,44 @@ cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/test_
 # Re-verify no regressions in the core reporter suite (~20s):
 cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/test_core_reporter.py -q
 ```
+
+### 2026-05-20 review pass — paper-trader-core HYBRID (Agent 1): lot cost-basis in trade-impact alert
+
+- **Phase 1 — no bug-only commit.** A careful pass over `runner.py` / `reporter.py` / `signals.py` / `strategy.py` / `market.py` / `store.py` against the existing 731-test core suite (all passing) surfaced one piece of dead code in `reporter._trade_impact_line` — `same_ticker_value` was accumulated but never read — and no other concrete bugs. Per advisor guidance to avoid padding the bug counter, the dead-variable cleanup was folded into the Phase 2 commit instead of a standalone `fix:` commit. `bugs_fixed=0`.
+
+- **Feature shipped (commit `2cfb6ac`): `@ avg $X.XX` cost-basis token in the trade-impact alert.** After a BUY the trader's first sizing question is "what's my NEW blended avg cost?" — vital for sizing the next add. After a partial SELL it's "what does the leftover cost me?" — the basis on which to judge whether to trim further or hold. The post-trade snapshot (`strategy._mark_to_market`) already carries `avg_cost` per position (just written by `upsert_position`'s blend), so `_trade_impact_line` now sums qty-weighted cost over the matched lot's rows and emits `@ avg $X.XX` inline with the existing leg-%-of-book token. No re-derivation, no extra read, no network — pure composition over the snapshot the caller already has. Suppression mirrors the existing `stale_mark` precedent: missing / non-numeric / zero `avg_cost` silently drops the token rather than emitting a misleading `"$0.00"`, so every existing test (whose hand-built snapshots omit `avg_cost`) stays byte-compatible. Locked by 5 new tests in `TestTradeImpactLineUnit` asserting *specific* numerics (e.g. `"NVDA now 100.0% of book @ avg $110.00 · cash $500.00"`) — not just "field present".
+
+- **Live finding: host SATURATED during this very review.** `/api/host-guard` reads `state=SATURATED, opus_count=5, headline="Opus is starved by the box … host saturated: 5 concurrent Opus (>4); 24 % of the last 102 decisions never reached Opus. The desk is frozen by host load … ops — reduce concurrent Opus (review/backtest agents); the bot cannot resolve this by trading."` The 5 Opus processes are: the live trader (pid 167088) + this hourly review's 3 sibling HYBRID agents + 1 longer-running backtest committee process. **The hourly review is self-inducing the #1 documented pathology by design** — running 3 parallel Opus reviewers against a 16-cpu / 16-GB box that is already running the live trader and a backtest committee. Not actionable from inside the code, but a real architectural irony worth recording: the review mechanism is the saturation it would alarm on.
+
+- **Live finding: heartbeat verdict and host-guard verdict disagree by design.** `/api/runner-heartbeat` reads `verdict=HEALTHY, headline="last decision 14m ago, within the 60m market-closed cadence", decision_efficacy=PRODUCING (pct=20)` while `/api/host-guard` reads `state=SATURATED, starvation_rate_pct=23.5`. Both are correct — heartbeat measures *cadence liveness* (cycles fire on schedule) and host-guard measures *throughput health* (cycles actually reach Opus). An operator reading one without the other gets a misleading mental model. The Discord `_host_pulse_line` does surface SATURATED when it's true, so the surfaces aren't dark — just orthogonal.
+
+- **Live finding: 20% NO_DECISION rate in the last 100 cycles.** `/api/no-decision-reasons` shows the top buckets are `cli_nonzero_rc=12` and `host_saturated=9` over a window of 21 NO_DECISION cycles. Both are host-load symptoms (the nonzero_rc bucket is also likely an OOM-killed Opus subprocess). The `host_saturated` sub-bucket exists because of an earlier review-pass fix that distinguished a pre-flight/mid-call skip from a genuine model timeout — the bucket is correctly populated.
+
+- **Live finding: portfolio is flat post-NVDA-earnings-trade.** The last 3 fills were: BUY 1.0 NVDA @ $223.43 (post-print continuation) → BUY 0.5 NVDA @ $223.43 (deploying remaining cash on the catalyst) → SELL 4.5 NVDA @ $223.43 (full close on weakening AH thesis + 99% concentration). Net realized was a small + (the trade ledger shows `total_value=$1011.95, +1.20 % vs $1000 start`). Discord trade alert path would have used the new `@ avg $X.XX` token on each leg if it had been deployed at the time. On the next live BUY after the restart, the token will appear in the operator's Discord channel for the first time.
+
+- **Live finding: build SHA stale post-push as expected.** `/api/build-info` reads `boot_sha=4ab52d1, head_sha=2cfb6ac, behind=2, stale=true` immediately after my push. The `behind=2` confirms a sibling agent (Agent 2 ML or Agent 4 feature-dev) also pushed during this hour. The git-watcher will queue a deferred restart within its 3-min poll cycle so the new code deploys end-to-end without killing a mid-Opus call.
+
+- **Live finding: historical singleton-guard spam in `logs/runner.log`.** Many `[runner] another paper trader is already running (pid=…); refusing to start a second trader on the same paper book — exiting` lines from an old systemd-Restart=always loop racing the manual singleton guard. Per the user's persisted memory `pt-systemd-vs-manual-restart-spam`, this is documented historical noise from a since-resolved configuration; the trader currently runs as a manual process with the systemd unit disabled. Skip.
+
+### Counters
+
+`bugs_fixed=0` (clean review — no real bugs surfaced beyond a single dead-variable cleanup folded into the feature commit) · `features_added=1` (cost-basis `@ avg $X.XX` token in `_trade_impact_line`) · `user_findings=7` (host SATURATED self-induced by this very review, heartbeat/host-guard verdict disagreement, 20 % NO_DECISION rate dominated by `cli_nonzero_rc` + `host_saturated`, portfolio flat post-NVDA-earnings round-trip, build SHA stale post-push, runner.log singleton-guard spam is historical).
+
+### Test commands for this pass
+
+```bash
+# Just the new tests added this pass (~3s):
+python3 -m pytest tests/test_core_reporter.py -k "avg_cost or partial_sell_emits_avg" -q
+# Re-verify the full core reporter suite (~4s):
+cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/test_core_reporter.py -q
+# Full suite (~3-5 min under load):
+cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/ -q
+```
+
+### Invariants reaffirmed by this pass
+
+* **#10 single source of truth** — `_trade_impact_line` consumes the snapshot's own `avg_cost` (just written by `upsert_position`) verbatim; no re-derivation of the blend.
+* **#2 / #12 advisory only** — observational, never gates Opus, adds no caps — additive to the existing alert body.
+* **Discord-path discipline** — pure composition over the snapshot the caller already has; no network on the hot alert path (the `_pos_pct_weight` / `_pos_hold_age_token` precedent).
+* **Additive failure contract** — any garbage avg_cost / qty / market_value silently suppresses the @avg token rather than crashing; existing snapshot shapes that omit `avg_cost` stay byte-compatible.
+* **Silence-when-nothing-actionable** — zero / missing / non-positive avg_cost yields no token, never a misleading `"$0.00"`.
