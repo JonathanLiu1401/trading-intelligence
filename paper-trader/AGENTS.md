@@ -6,6 +6,180 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 ML+backtest HYBRID pass #3 (Agent 2) — PriceCache atomic write + consensus_skill
+
+**Phase 1 — bug fix (bugs_fixed: 1).** `PriceCache._load` wrote the
+per-window `prices_*.json` via `path.write_text` (non-atomic) while
+every other on-disk cache writer in this module uses tmp + `.replace`
+(volume cache, scorer.pkl, outcomes-file trim, validation results,
+scorer-skill ledger trim). A process kill (OOM / SIGKILL) mid-write
+left a torn JSON file at the destination; the next cache load failed
+`json.loads`, silently fell through to the download path, and re-paid
+the full yfinance refetch (hundreds of MB across ~125 watchlist
+tickers) on every subsequent run for that window. Fixed by writing to
+`prices_*.json.tmp` and `Path.replace`-ing it atomically into place.
+
+Pinned by `tests/test_pricecache_benchmark_poison.py::TestPriceCacheAtomicWrite`:
+(1) destination file is not corrupted when the in-progress write fails,
+(2) the normal write path uses a `.json.tmp` intermediate and
+`Path.replace`. All 7 tests in that file pass; no other ML/backtest
+test regressed.
+
+**Phase 2 — feature (features_added: 1).** New
+`paper_trader/ml/consensus_skill.py` — cross-run agreement skill
+diagnostic. When multiple backtest runs converge on the same
+(`sim_date`, `ticker`, `action`) decision, does the realized 5d
+forward return beat the lone-decision bucket? No existing module in
+the 35-module diagnostic suite (sector_skill, regime_audit,
+persona_skill, news_volume_skill, leveraged_skill, action_skill,
+per_ticker_skill, conviction_calibration, gate_audit, gate_realized,
+bubble_gate_skill, feature_value_skill, …) cuts on inter-run
+agreement count.
+
+Verdict ladder (test-locked, exact-value): `INSUFFICIENT_DATA` /
+`INVERTED` / `CONSENSUS_EDGE` / `WEAK_EDGE` / `NO_EDGE`. Same
+operational discipline as siblings: read-only, never trains, never
+touches `decision_scorer.pkl` / `build_features` / `N_FEATURES` /
+trade path, never raises (a fault yields `status='error'`). CLI
+exit-code contract: 0 on every acceptable verdict, 2 on `INVERTED`
+(the quant-decisive harmful-consensus state) so a shell caller can
+`if !` on a real edge — same gate-discipline as
+`conviction_calibration` and `gate_abstention`.
+
+Live evidence (7413-record corpus, 6906 distinct decision groups):
+
+| Bucket (distinct runs agreeing) | n_groups | n_rows | mean 5d % | median 5d % |
+|---|---:|---:|---:|---:|
+| 1 (lone)                          | 6413     | 6413   | +1.068    | +0.621      |
+| 2                                 | 479      | 958    | +1.136    | +1.129      |
+| 3+                                | 14       | 42     | **+4.225** | +6.765      |
+
+Top-consensus bucket realizes +3.157pp above lone — verdict
+`CONSENSUS_EDGE`. Small N for the 3+ bucket (14 groups), but the
+direction is decisive. As the continuous loop accumulates more
+multi-run cycles, this verdict will harden.
+
+CLI:
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.consensus_skill            # table verdict
+python3 -m paper_trader.ml.consensus_skill --json     # machine-readable
+```
+
+Tests: `tests/test_consensus_skill.py` — 26 exact-value tests covering
+the verdict ladder, bucket geometry (lone-bucket n equals lone-row
+count, 2-bucket counts each agreeing row separately, 3+ aggregates 3-
+and 4-run groups), row-filter contract (drops non-dict / missing
+required fields / non-finite targets / empty ticker / missing run_id),
+action case normalisation (`BUY` and `buy` collide as agreeing), JSONL
+loader (missing file → empty, malformed lines skipped),
+never-raises discipline of `analyze()`, and CLI exit-code contract on
+all three observed verdicts.
+
+**Phase 3 — live validation as a skeptical quant (user_findings: 5):**
+
+1. **MLP_WORSE_THAN_TRIVIAL → MLP_ADDS_SKILL FLIP.** The documented
+   ("standing verdict") finding across many prior reviews has reversed.
+   Live `python3 -m paper_trader.ml.baseline_compare` on the current
+   `data/decision_outcomes.jsonl` reports MLP rank-IC=+0.2245 vs best
+   one-liner baseline (`rsi_meanrev`) +0.0791 — gap +0.1454 (≫ 0.05
+   threshold). The 17-feature MLP is **genuinely additive OOS** for
+   the first time documented. Likely cause: enough recent data has
+   accumulated for the anti-overfit (32,16)/alpha=1e-2 config to start
+   extracting real signal. **This changes the "should the gate engage"
+   answer when n_train climbs back over 500** — see #2.
+
+2. **Scorer is currently SUB-GATE.** Deployed pickle
+   `data/ml/decision_scorer.pkl` (mtime 2026-05-19T06:10) reports
+   `n_train=400` → invariant #5's `n_train >= 500` gate is INACTIVE.
+   The pickle was last retrained on a 5000-record tail that deduped
+   down to 400 distinct rows by `(ticker, sim_date, action)`. Combined
+   with #1, this means: the model the gate *would* deploy is now skill-
+   additive, but the gate is dormant until the continuous loop
+   accumulates more outcomes. The blocker to engaging real edge is the
+   loop being dead (#3), not the model itself.
+
+3. **Continuous loop dormant since 2026-05-18T18:45.** 2 stuck
+   `status='running'` rows (rid 6238, 6243) > 60h old. `continuous.log`
+   mtime is 2026-05-18 12:03; tail shows the loop got stuck in cycle
+   6243's GDELT rate-limit backoff before any further work. The next
+   `python3 run_continuous_backtests.py` start will reap both orphans
+   via `_reap_orphaned_runs` (6h-age guard).
+
+4. **Off-distribution guard is effectively dead code.**
+   `python3 -m paper_trader.ml.gate_abstention` reports
+   `GUARD_INACTIVE` — abstention rate 0.37% (< 0.5% threshold), 4
+   abstentions out of 1089 captured gate decisions. The guard was
+   added (commit `84d8234`) for the documented "-89% then +32% same
+   LITE vector" extrapolation pathology; it has fired 4 times in the
+   captured OOS window, on URTY (2×), SOXL (1×), FAS (1×). Either the
+   model is more in-distribution than the original audit suggested OR
+   the threshold (`|raw| > PRED_CLAMP_PCT=50`) is too lax to catch
+   real extrapolation. Not actionable as a fix here (changing the
+   threshold is a strategy-dynamics decision), but documented so the
+   protection it was added for is known to be largely unexercised.
+
+5. **Calibration verdict DIRECTIONAL_BUT_BIASED.** `python3 -m
+   paper_trader.ml.calibration --oos` returns `spearman=0.2245`,
+   `pearson=0.174`, `mean_abs_decile_err=7.46pp`. Decile 10 (top
+   predicted) has `mean_pred=+26.01%` but `mean_realized=+3.16%` —
+   the ranking is trustworthy (top decile DOES realize more than
+   bottom decile) but the magnitude is wildly overconfident. The
+   ±PRED_CLAMP_PCT=50 ceiling and the sample-weight upweighting of
+   high-`return_pct` runs are both candidates for the magnitude
+   inflation, but again not actionable as a surgical fix here. A
+   reading quant should **trust the sign / decile rank, discount the
+   predicted %**.
+
+**Sub-finding — outcome_data_quality CLEAN.** `python3 -m
+paper_trader.ml.outcome_data_quality` reports `verdict: CLEAN` on the
+7413-record corpus — 0 corrupt rows, 0 nonfinite features, 0 conflicts,
+23 exact-zero 5d returns (the walk-back-collision footprint, expected
+and documented), 25 extreme >|50%| outliers (real leveraged-ETF
+crash/rip weeks, expected). Training data integrity is solid.
+
+**Sub-finding — `claude-` model probes still in DB.** Same observation
+as pass #2: rid 99001 / 90001 (zero-trade, -1.08% / -1.75% vs SPY) sit
+in `backtest_runs`. The `_trim_history(keep=500)` cutoff still holds
+(503 total rows; trims to 500). Not a fix priority.
+
+**How to run this pass's tests** (focused; full suite ≥25 min):
+
+```bash
+# This pass's regression coverage (26 + 7 = 33 tests, <1s combined)
+python3 -m pytest tests/test_consensus_skill.py \
+                 tests/test_pricecache_benchmark_poison.py -v
+
+# Joint with the nearest-sibling diagnostics (no drift cross-check):
+python3 -m pytest tests/test_consensus_skill.py \
+                 tests/test_pricecache_benchmark_poison.py \
+                 tests/test_decision_scorer.py \
+                 tests/test_ml_backtest_seams.py \
+                 tests/test_continuous.py -q
+# 193 passed
+
+# Broader ML/scorer/gate/calibration/conviction domain
+python3 -m pytest tests/ -k "ml or backtest or scorer or gate or calibration or continuous or horizon or outcome or conviction or consensus" \
+                 -q --ignore=tests/test_integration_backtest.py
+```
+
+**How to run the consensus diagnostic manually:**
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.consensus_skill             # table
+python3 -m paper_trader.ml.consensus_skill --json      # JSON
+python3 -m paper_trader.ml.consensus_skill --outcomes path/to/alt.jsonl
+```
+
+**Counters**: bugs_fixed=1 (PriceCache atomic write) · features_added=1
+(`consensus_skill` analyzer with 26 verdict-locked tests) ·
+user_findings=5 (MLP_ADDS_SKILL flip, scorer sub-gate, loop dormant,
+gate guard inactive, calibration directional-but-biased).
+
+---
+
 ## 2026-05-21 paper-trader-core HYBRID pass (Agent 1, ~11:20 UTC)
 
 ### Phase 1 — fix (no commit)
