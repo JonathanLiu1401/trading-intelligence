@@ -388,7 +388,13 @@ class TestStoreThreadSafety:
                 barrier.wait()  # maximize collision pressure on _write_lock
                 batch = [
                     {
-                        "title": f"thread {tid} article {i:03d}",
+                        # Unique discriminator token ("id..xyz", >= 2 chars so it
+                        # survives the dedup tokenizer's min-length filter)
+                        # guarantees a genuinely non-overlapping title space.
+                        # A bare "thread {tid}" prefix is NOT distinct: the
+                        # single-digit id is dropped by tokenization, so cross-
+                        # thread titles collapse and near-dedup masks write loss.
+                        "title": f"thread {tid:02d} article {i:03d} id{tid:02d}{i:03d}xyz",
                         "link": f"https://x.com/{tid}/{i}",
                         "source": "rss",
                         "published": "",
