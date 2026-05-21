@@ -6,6 +6,138 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 feature pass (Agent 4 — feature-dev) — cost-basis ladder + catalyst-expiry
+
+Two new observational endpoints surfacing structural reads no
+existing diagnostic answered. Both pure builders, both never raise,
+both observational only (AGENTS.md invariants #2 / #12). Wired at
+the bottom of `paper_trader/dashboard.py`.
+
+### `/api/cost-basis-ladder` — FIFO per-lot P&L breakdown
+
+The existing position-level diagnostics flatten a multi-entry holding
+into one weighted `avg_cost`. With NVDA opened across 4 BUYs at
+$215 / $220 / $223 / $228 the aggregate avg_cost is ~$221.50 — within
+0.2% of the mark, reading "BALANCED" — while the lot ladder reveals
++2.8% / +0.5% / -0.9% / -3.1%: a partial-exit decision has a clear
+ranked answer no other endpoint surfaces.
+
+Module: `paper_trader/analytics/cost_basis_ladder.py`. Pure
+FIFO reconstruction from the trades ledger (matches the live
+`_execute` accounting). Per-position verdict ladder:
+`LADDER_ALL_GREEN` / `LADDER_ALL_RED` / `LADDER_WIDE` (spread ≥
+`wide_spread_pct`, default 5pp) / `LADDER_STACKED` (multi-lot tight
+ladder) / `LADDER_SINGLE_LOT` / `NO_LOTS`. Aggregate verdict:
+`HARVESTABLE_LOTS` (≥1 lot clears `harvest_pct_floor`, default 3pp) /
+`UNDERWATER_BOOK` / `MIXED_BOOK` / `NO_DATA`. The `harvestable`
+list is sorted by `pl_pct` descending — the operator's "best
+trim-first lot" leaderboard.
+
+Live evidence at merge (live trader, NVDA):
+```
+verdict: UNDERWATER_BOOK
+  position NVDA — 2 lots at $223.435, mark $220.30 → both -1.4%,
+  spread 0.0 → LADDER_ALL_RED. No green lot to harvest.
+```
+
+CLI / curl:
+```
+curl -s http://localhost:8090/api/cost-basis-ladder | python3 -m json.tool
+# Tune the per-lot harvest floor (e.g. 1.5pp for tight-spread names):
+curl -s 'http://localhost:8090/api/cost-basis-ladder?harvest_pct_floor=1.5'
+```
+
+### `/api/catalyst-expiry-skill` — open-position catalyst staleness
+
+The existing per-position diagnostics either re-test technicals
+(`thesis_drift` — INTACT/WEAKENING/BROKEN on RSI/MACD/PL) or classify
+*closed* trips by catalyst (`catalyst_class_autopsy`). None answers
+"you opened NVDA on the earnings catalyst 5 days ago — is that
+catalyst still live, or are you holding a zombie?". A held position
+whose `earnings tomorrow` catalyst is now 5 days past prints INTACT
+on `thesis_drift` if technicals are still bullish, but the original
+reason to hold has expired.
+
+Module: `paper_trader/analytics/catalyst_expiry_skill.py`. Pure
+parse of the verbatim opening trade's `reason` for catalyst class
+(EARNINGS / MACRO / PRODUCT / REGULATORY / CORPORATE / TECHNICAL /
+UNCATEGORIZED) + time-marker detection (`tomorrow`, `today`,
+`in N days`, `Q1 2026`, ISO date, `post-earnings`, …). Per-position
+verdict: `ZOMBIE` (dated class + time marker + days_held ≥
+`zombie_days_floor`, default 3d) / `FRESH_CATALYST` (dated + days_held
+< `fresh_days_ceil`, default 2d) / `STRUCTURAL` (TECHNICAL or
+CORPORATE, or dated-but-no-time-marker) / `UNCATEGORIZED` / `NO_REASON`.
+Aggregate: `ZOMBIE_HOLDINGS` (≥1 zombie) / `ALL_FRESH` / `STRUCTURAL_BOOK`
+/ `MIXED_BOOK` / `NO_DATA`. Operator question answered: *am I still
+holding because the catalyst is still firing, or because I forgot to
+revisit?*
+
+Earliest-family-wins keyword precedence (EARNINGS → MACRO → PRODUCT →
+REGULATORY → CORPORATE → TECHNICAL) is load-bearing: typical reasons
+mix multiple keyword families, and the most-informative classifier is
+the one closest to the *event* the position was opened around. Tests
+pin this precedence explicitly.
+
+Live evidence at merge (live trader, NVDA opened 0.7d ago on
+verbatim "NVDA Q1 results crushed expectations… buyback authorization…"):
+```
+verdict: ALL_FRESH
+  position NVDA — class EARNINGS, has_time_marker True (matched "Q1"),
+  days_held 0.705 < fresh_days_ceil 2.0 → FRESH_CATALYST. Hold is on
+  a live catalyst window; revisit at >3d if still open.
+```
+
+CLI / curl:
+```
+curl -s http://localhost:8090/api/catalyst-expiry-skill | python3 -m json.tool
+# Tighten zombie window for fast-moving event names:
+curl -s 'http://localhost:8090/api/catalyst-expiry-skill?zombie_days_floor=2'
+```
+
+### Tests
+
+Two new files, both pure-builder tests (no Flask, no live DB):
+
+```
+python3 -m pytest tests/test_cost_basis_ladder.py tests/test_catalyst_expiry_skill.py -v
+```
+
+`test_cost_basis_ladder.py` — 23 tests covering FIFO ordering
+(BUY/SELL/partial/over-sell/multi-lot span), per-position verdict
+ladder, aggregate verdict, options-vs-stock key isolation,
+threshold-override forwarding, malformed-row defensiveness,
+harvestable list ordering (pl_pct descending).
+
+`test_catalyst_expiry_skill.py` — 40 tests covering catalyst-class
+keyword detection, time-marker detection (tomorrow / today / Q1
+2026 / ISO date / in N days / post-earnings), per-position verdict
+threshold edges (exactly-at-floor, between-ceil-and-floor),
+aggregate verdict precedence (ZOMBIE wins over FRESH), threshold
+override forwarding, position-key isolation (options never collide
+with the underlying stock's lot family).
+
+156/156 pass jointly with nearest siblings (`decision_vapor_skill`,
+`cash_redeployment_latency_skill`, `thesis_drift`,
+`catalyst_class_autopsy`) — no regression on adjacent analytics.
+
+### Invariants reaffirmed
+
+- Pure-builder discipline (AGENTS.md "Pure builder" siblings):
+  inputs are Python lists of dicts (positions / trades), outputs
+  are a stable envelope dict, no I/O, never raises.
+- AGENTS.md invariants #2 / #12: both endpoints are observational
+  only — never gate Opus, never injected into the decision prompt
+  as a directive. The new `/api/cost-basis-ladder` `harvestable`
+  list and `/api/catalyst-expiry-skill` `ZOMBIE_HOLDINGS` verdict
+  are *advisory pills* for the operator, not capped behaviour.
+- AGENTS.md invariant #11 (decisions free-text format) is
+  unaffected — neither endpoint writes back to `decisions`.
+- Position-key tuple `(ticker, type, expiry, strike)` mirrors the
+  `positions` UNIQUE constraint from `store.py`, so options lots
+  never collide with the underlying stock's lot family (tested).
+
+---
+
 ## 2026-05-21 ML+backtest HYBRID pass #5 (Agent 2) — gate_capture_coverage (capture-pipeline health audit)
 
 **Phase 1 — bugs_fixed: 0 (honest zero).** Audited
