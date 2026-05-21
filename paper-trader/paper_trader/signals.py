@@ -300,6 +300,18 @@ _NOT_TICKERS = {
     "EARNINGS", "PROFIT", "PROFITS", "LOSS", "LOSSES", "STOCKS",
     "SHARES", "MARKET", "MARKETS", "PRICE", "PRICES", "TRADER",
     "TRADERS", "TRADING", "REPORTED", "REPORTS", "REPORT",
+    # Additional finance-headline verbs / nouns observed live polluting
+    # the `tickers` field (e.g. "Nvidia BLOWS PAST estimates" → tickers=
+    # BLOWS,PAST). Each verified NOT to collide with a known real-money
+    # ticker — TANKS / TALKS / BLOWS / SALES / LOWS / TOPPED / CLIMBS /
+    # CLIMB / TUMBLE / TUMBLES / SOAR / SOARED / SINK / SINKS / SLIP /
+    # SLIPS / SLID / EDGES / SLIDE / SLIDES are common headline verbs
+    # and plural nouns, NOT publicly-traded equity symbols on this
+    # watchlist universe. (BIRD/ME/REAL/CHIP are deliberately omitted —
+    # those ARE real listed tickers; their $cashtag path stays correct.)
+    "BLOWS", "CLIMB", "CLIMBED", "CLIMBS", "EDGES", "LOWS",
+    "SALES", "SINKS", "SINK", "SLID", "SLIDE", "SLIDES", "SLIP", "SLIPS",
+    "SOAR", "SOARED", "TALKS", "TANKS", "TOPPED", "TUMBLE", "TUMBLES",
 }
 
 
