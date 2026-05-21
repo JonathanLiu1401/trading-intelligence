@@ -6,6 +6,114 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 ML+backtest HYBRID pass (Agent 2)
+
+**Phase 1 — bug fix.** `paper_trader/backtest.py::_ml_decide` was
+emitting `scorer=X%` in the BUY reasoning **even when**
+`_scorer.is_trained` and `_scorer._n_train < 500` (the documented
+sub-gate state, invariant #5). That contradicted
+`_parse_gate_decision`'s contract (and the pinned
+`test_untrained_cycle_no_scorer_token` expectation) that the token
+appears only when the gate genuinely modulated conviction (or
+explicitly abstained via off-distribution). Sub-gate emission was
+poisoning `decision_outcomes.gate_scorer_pred` with values the gate
+never touched, leaking into `gate_pnl` / `gate_audit` research
+diagnostics. Fixed by adding a third branch in the `scorer_note`
+ladder so the token is suppressed both when untrained AND when
+trained-but-sub-gate. Regression class `TestMlDecideSubGateReasoning`
+in `tests/test_backtest.py` pins emission, gate-active emission, and
+end-to-end parser round-trip from a single fixture (3 tests).
+
+**Phase 2 — feature.** New additive outcome key `conviction_pct`
+captured in `_compute_decision_outcomes` via the new pure helper
+`_parse_conviction_pct`. The token `conviction=X%` is already in every
+BUY reasoning; structured capture as a fraction in `[0, 1]` unlocks
+sizing-weighted realized analysis (does higher conviction predict
+higher realized return? — the calibration question `gate_pnl` /
+`gate_audit` structurally cannot answer because they only have
+rank skill, not economic weight). SELL/HOLD rows read `None` (the
+emission is BUY-only). Scorer is untouched: `train_scorer` /
+`build_features` ignore unknown dict keys, so no retrain required (the
+`forward_return_10d/20d` additive precedent). Tests:
+`TestParseConvictionPct` (8 cases — typical/leveraged/zero/HOLD/SELL/
+garbage/clamp/first-match) + `TestComputeDecisionOutcomesConvictionCapture`
+(2 cases — capture + missing-token-as-None) in
+`tests/test_gate_decision_capture.py`.
+
+**Phase 3 — live validation as a skeptical quant**. Direct measurements
+on the live `data/decision_outcomes.jsonl` (7413 rows) + the deployed
+`data/ml/decision_scorer.pkl`:
+
+1. **Deployed scorer is sub-gate** — `n_train=400 < 500`. The
+   conviction gate is currently INACTIVE in production. The Phase-1
+   sub-gate suppression fix is therefore visible-state immediately:
+   every running cycle's BUY reasoning will stop emitting the
+   misleading `scorer=X%` token until the trainer crosses 500.
+2. **Per-arm calibration on last 5000 records (re-predicted by current
+   pickle, bucketed by `gate_arm`)**:
+
+   | arm | mult | n | mean_real | med_real | std |
+   |-----|------|---|-----------|----------|-----|
+   | strong_headwind | 0.60 | 1303 | +0.48% | +0.42% | 10.19 |
+   | mild_headwind | 0.85 | 1704 | +0.38% | -0.14% | 8.92 |
+   | neutral | 1.00 | 773 | +0.84% | +0.78% | 7.98 |
+   | mild_tailwind | 1.15 | 492 | +1.75% | +0.82% | 10.07 |
+   | strong_tailwind | 1.30 | 728 | +1.10% | +0.61% | 12.85 |
+
+   Tailwind − headwind spread = **+0.62pp**. By `gate_audit`'s
+   threshold (`EDGE_TOL_PP=1.0`) this is **GATE_INEFFECTIVE** — the
+   1.30/0.60 multiplier ratio is underwriting essentially no realized
+   edge. Worse, monotonicity is violated at the tail:
+   `strong_tailwind (+1.10%) < mild_tailwind (+1.75%)`, so the model's
+   highest-conviction calls realize **less** than its mild-conviction
+   ones. Documented `MLP_WORSE_THAN_TRIVIAL` state visible directly.
+3. **`strong_headwind` realizes POSITIVE +0.48%** — the arm meant to
+   size names DOWN actually identifies a slightly-positive cohort on
+   average. A gate that activated tomorrow (at `n_train=500`) would
+   ×0.6 conviction on the small positive-mean cohort and ×1.3 on a
+   noisier larger-positive cohort — the kind of inverted-edge sizing
+   `gate_audit`'s `GATE_HARMFUL` verdict catches.
+4. **Off-distribution rate is 0.9%** (45/5000) — small but non-zero;
+   the ±50% clamp + off-dist gate-abstention path is structurally
+   protecting real trades from extrapolation noise (visible at the
+   ticker level: a single zero-feature `UNKNOWN_TICKER` vector still
+   predicts -9.5% because the "other" sector one-hot carries a strong
+   negative training bias).
+5. **Backtest pipeline is healthy** (477 complete runs in 14d, median
+   +63% return, median +41.6% vs SPY, 78.3% positive-alpha share) but
+   the top-10 BUY tickers in the best runs are SOXL (5440) / TQQQ
+   (4503) / UPRO (2277) / MSTR / AMD / SPXL / NVDA / TECL / BTC-USD /
+   FAS — 100% leveraged-bull or single-stock-momentum vehicles. The
+   alpha is largely a leveraged-bull-window artifact riding the
+   personas (Momentum, Macro, Sector Rotator, Speculator) that boost
+   3x ETFs, NOT a portfolio-management edge.
+6. **Operational drift**: per `continuous.log` the loop has been idle
+   since 2026-05-18T18:45. Two `status='running'` rows from that
+   session remain (rid 6238, 6243); `_reap_orphaned_runs` would catch
+   them on next loop start (`max_age_hours=6.0`) but is currently
+   dormant. None of the documented per-cycle skill ledgers
+   (`data/scorer_skill_log.jsonl`, `baseline_skill_log.jsonl`,
+   `llm_annotation_skill_log.jsonl`) or `data/validation_results.json`
+   exist on disk yet — the wiring is in source (and tests pass) but
+   no cycle has completed since the wiring landed.
+
+**How to run the ML/backtest tests** (focused; full suite ≥25 min):
+
+```bash
+# Phase-1 + Phase-2 regression coverage
+python3 -m pytest tests/test_backtest.py tests/test_gate_decision_capture.py -q
+
+# Broader ML/scorer/gate domain (no integration tests)
+python3 -m pytest tests/ -k "ml or backtest or scorer or gate" \
+    -q --ignore=tests/test_integration_backtest.py
+```
+
+**Counters**: bugs_fixed=1 (sub-gate scorer-token emission) ·
+features_added=1 (`conviction_pct` capture + parser) · user_findings=6
+(listed above). Commits: `caef017` (fix), `667cf49` (feat).
+
+---
+
 ## 2026-05-21 feature-dev pass (Agent 4) — `/api/news-age-at-decision-skill` + `/api/conviction-language-skill`
 
 Two new self-calibration endpoints answering the desk questions none of
