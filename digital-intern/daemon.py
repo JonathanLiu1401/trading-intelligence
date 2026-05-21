@@ -78,6 +78,7 @@ from collectors.earnings_surprise_collector import collect_earnings_surprises
 from collectors.polymarket_collector import collect as collect_polymarket
 from collectors.collector_rate_monitor import collect_rate_alerts
 from collectors.yield_curve_collector import collect_yield_curve
+from collectors.g10_sovereign_yields import collect_g10_yields
 from collectors.cftc_cot_collector import collect_cftc_cot
 from collectors.vix_term_structure import collect as collect_vix_ts
 from collectors.dxy_collector import collect as collect_dxy
@@ -162,6 +163,7 @@ EARNINGS_SURPRISE_INTERVAL = 900  # EPS beat/miss scanner every 15min
 POLYMARKET_INTERVAL     = 900     # Polymarket prediction markets every 15min
 RATE_MONITOR_INTERVAL   = 3600    # per-collector silence detector — hourly
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
+G10_YIELDS_INTERVAL     = 3600    # G10 sovereign yields every 1h (FRED daily/monthly)
 COT_INTERVAL            = 6 * 3600  # CFTC COT report — weekly release, check 6-hourly
 TWSE_INTERVAL           = 3600    # Taiwan Stock Exchange semis — hourly (market open 09:00–13:30 TW)
 SHORT_INTEREST_INTERVAL = 21600   # highshortinterest.com every 6h (data updates ~2/month)
@@ -269,6 +271,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "polymarket": POLYMARKET_INTERVAL,
     "rate_monitor": RATE_MONITOR_INTERVAL,
     "yield_curve": YIELD_CURVE_INTERVAL,
+    "g10_yields": G10_YIELDS_INTERVAL,
     "short_interest": SHORT_INTEREST_INTERVAL,
     "wikipedia": WIKIPEDIA_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL,
     "cisa_kev": CISA_KEV_INTERVAL,
@@ -1213,6 +1216,27 @@ def yield_curve_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(YIELD_CURVE_INTERVAL)
+
+
+def g10_yields_worker(store: ArticleStore):
+    log.info("[g10_yields_worker] started")
+    bo = Backoff("g10_yields", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_g10_yields()
+            _ingest(store, articles, "g10_yields")
+            try:
+                source_health.record_result("g10_yields", len(articles))
+            except Exception as he:
+                log.warning(f"[g10_yields_worker] source_health error: {he}")
+            _worker_last_ok["g10_yields"] = time.time()
+            log.debug(f"[g10_yields] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[g10_yields_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(G10_YIELDS_INTERVAL)
 
 
 def cftc_cot_worker(store: ArticleStore):
@@ -3214,6 +3238,7 @@ def main():
         ("polymarket",  polymarket_worker),
         ("rate_monitor", rate_monitor_worker),
         ("yield_curve", yield_curve_worker),
+        ("g10_yields",  g10_yields_worker),
         ("cftc_cot",    cftc_cot_worker),
         ("vix_ts",      vix_ts_worker),
         ("dxy",         dxy_worker),
