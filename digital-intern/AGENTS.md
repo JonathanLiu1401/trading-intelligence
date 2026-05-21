@@ -6393,3 +6393,198 @@ related code in this same documentation step.
   `watchers/alert_recency.py`, `tests/test_alert_recap_template.py`,
   `tests/test_alert_ticker_burst.py` + this `AGENTS.md` section);
   `git diff --staged` verified before each commit; never `git add -A`.
+
+---
+
+## 2026-05-21 — Hybrid pass (urgent-row label-calibration line in 5h briefing)
+
+**Persona:** market news analyst, NVDA earnings night (post-print).
+
+**Phase 1 — bugs_fixed=0 (honest, per the commit guard).** The four
+load-bearing invariants re-traced and hold; the brief-listed test
+assertions already exist and value-assert (verified by running
+`test_article_store.py` + `test_urgency_scorer.py` + `test_features.py`
++ `test_model.py` + `test_trainer.py` — **55 passed in 49.69s**). Live
+DB probe re-confirmed invariants in production: 0 synthetic rows with
+`urgency>=1`; 0 rows with `ai_score>0 AND score_source='ml'`. Adding
+duplicate test cases would violate the standing no-redundant-coverage
+discipline. No Phase 1 commit per the guard.
+
+**Phase 2 — features_added=1, code on master at `61ec87e`/`15f6d92`**
+(see staging note below). **`daemon._format_label_calibration` — a
+one-line urgent-row label-calibration signal in the 5h heartbeat
+briefing.** The briefing already surfaces source-health (`⚠ Sources
+down`) and book-coverage (`📊 Book in digest`); the aggregate that was
+missing is *how much of this window's urgent stream carried a real LLM
+ground-truth label* vs only an unverified model self-prediction.
+
+The per-row `[unverified — model-only urgent]` alert tag (see
+`ArticleStore.get_unalerted_urgent`'s `_llm_vetted` key,
+`alert_agent.ALERT_PROMPT`'s CALIBRATION rule) hedges *individual*
+pushes, but nothing exposed the **cohort** rate to the briefing
+consumer — and per `ArticleStore.urgency_label_split`'s docstring +
+the 2026-05-19 live finding (every urgency>=1 row alerted in the last
+6h had `score_source='ml'`), the live channel can drift into a
+single-headed state (Sonnet `urgency_scorer` dark / quota-throttled /
+flooring everything to noise) while every individual push reads
+normally. The 2026-05-21 NVDA-earnings probe right before this commit
+confirmed the gap: **29.25% LLM-vetted last 5h (283/400 ML-only)** —
+`mostly_unverified` verdict; without this line the analyst sees only
+the per-row hedge, never the aggregate `🔬 Urgent calibration: 29%
+LLM-vetted last 5h (283/400 ML-only)`.
+
+**Verdict ladder (byte-identical to `/api/urgent-label-split` in
+`dashboard/web_server.py` — the new briefing surface cannot drift from
+the dashboard verdict):**
+  * `total == 0` → `""` (quiet, silent — same precedent as
+    `_format_source_health_summary`)
+  * `llm_fraction == 0.0 AND total >= 3` → `🔬 Urgent calibration: 0%
+    LLM-vetted last Nh (M/M ML-only) — Sonnet scorer dark` (storm)
+  * `llm_fraction < 0.5 AND total >= 5` → `🔬 Urgent calibration: X%
+    LLM-vetted last Nh (M/M ML-only)` (mostly_unverified)
+  * else → `""` (healthy, silent)
+
+**Wired into `heartbeat_worker`** between `coverage_line` and `banner`
+in the same message-assembly idiom (`+ ("\n" + calibration_line if
+calibration_line else "")`). **Discord-only** — the caller appends to
+the posted `message`, NEVER folds into the saved `briefing` text, so
+the trainer's title-prefix label scan cannot reach it (same discipline
+as the source-health line, the coverage line, and the coverage-gap
+banner — same `_format_portfolio_coverage` precedent).
+
+**All four load-bearing invariants intact by construction:**
+- pure read-side composer of `ArticleStore.urgency_label_split` (a
+  single GROUP BY SELECT with `_LIVE_ONLY_CLAUSE`, no writes, synthetic
+  rows excluded);
+- no `ai_score` / `ml_score` / `score_source` / `urgency` mutation
+  anywhere in the new code path;
+- backtest isolation: the upstream method's `_LIVE_ONLY_CLAUSE` keeps
+  synthetic rows out of both the numerator and denominator (pinned by
+  `TestBacktestIsolation` — without the filter, 6 seeded synthetic
+  ML-only rows would create a spurious storm in an otherwise-empty
+  store; with the filter, the line correctly collapses to `""`);
+- best-effort degradation: a metric-side failure (`urgency_label_split`
+  raises, or returns a malformed `None`-laden dict) returns `""` so a
+  briefing posts cleanly even with a degraded store.
+
+**Tests pinned** in `tests/test_briefing_label_calibration.py`
+(12 tests, **all pass in 11.43s**; mirror the precision-anchored style
+of `test_source_health_briefing.py` / `test_portfolio_coverage_
+briefing.py`): empty-store-silent, healthy-majority-LLM-silent,
+briefing-boost-counts-as-vetted, zero-LLM-total-3-emits-storm-line
+(EXACT string), zero-LLM-total-2-does-not-fire (boundary), minority-
+LLM-total-5-emits-line (EXACT string with 20%), minority-LLM-total-4-
+does-not-fire (boundary), backtest-isolation-via-three-synthetic-
+shapes, store-raising-returns-empty, non-dict-return-collapses-to-
+silence, hours-arg-propagates-to-store (probe pattern), max_chars-
+truncates-with-ellipsis. The full focused sibling suite (briefing
+surfaces + invariants — `test_briefing_label_calibration` +
+`test_source_health_briefing` + `test_portfolio_coverage_briefing` +
+`test_briefing_coverage_gap` + `test_urgency_label_split` +
+`test_article_store` + `test_trainer` + `test_briefing_boost` +
+`test_urgency_scorer` + `test_features` + `test_model`):
+**115 passed in 9.07s**, no regressions.
+
+**Phase 3 — user_findings=6 (live analyst lens, NVDA earnings night).**
+
+1. **(positive) Briefing quality EXCELLENT.** id=37 (2026-05-20 21:21
+   UTC, 50 articles, 3041 chars) read end-to-end: dense, accurate,
+   decisively-actionable Bloomberg digest — NVDA Q1 print lead
+   ($81.62B rev / $1.87 EPS double beat + $80B buyback, "lackluster"
+   forward guide AH slip) with exact MACRO table (S&P/NASDAQ/Russell/
+   VIX/10Y/BTC/Gold/Oil), PORTFOLIO P&L tied to live book
+   (LITE/LNOK/MUU/MU/NVDL/AXTI/ORCL/TSEM/QBTS) with per-name notes,
+   tight SEMIS PULSE numbers, decisively-prioritised TOP SIGNALS with
+   ranked relevance scores, sharp RISK / CATALYST with specific
+   thresholds (NVDA $220 hold). Cadence id33→37 = 5.85h / 5.4h / 5.2h
+   / 5.3h / 6.3h — healthy. The `ef839a8` heartbeat-clock fix is
+   holding.
+
+2. **(positive) Alert path WORKING UNDER NVDA STORM.** Latest cycle:
+   `[alert] 50 urgent items → dispatching` immediately followed by
+   `[alert] suppressed 1 lone low-authority urgent row(s)` — the
+   `_filter_low_authority_lone` gate (`31dea26`) firing live as
+   designed. Last 24h: 247 ML-only + 75 LLM-vetted alerted rows
+   (avg LLM ai_score=8.8). Cross-cycle paraphrase / source-authority
+   / burst-awareness gates all firing.
+
+3. **(NEW — live evidence motivating Phase 2 feature) Alert pipeline
+   is 29% LLM-vetted last 5h (`mostly_unverified` verdict).** 117 LLM
+   + 283 ML out of 400 urgency>=1 rows. The new
+   `_format_label_calibration` line will surface this on next daemon
+   restart — `🔬 Urgent calibration: 29% LLM-vetted last 5h (283/400
+   ML-only)`. NOT a code bug — this is the analyst-facing signal the
+   feature exists to provide. The underlying cause (Sonnet capacity
+   under high-urgent-volume + ML-head over-confidence on the YF
+   `[YF/<bucket>]` screener tape + recap-template residue) is
+   operational, addressed elsewhere by the recap-template gates, the
+   `[YF/<bucket>]` quote-widget gate, and the per-row CALIBRATION
+   prompt rule — but the analyst was missing the aggregate visibility.
+
+4. **(chronic operational) USB DB writer-side lock contention.** Live
+   tail of daemon.log: 8+ `insert_batch: lock retry exhausted after 5
+   attempts — raising` ERRORs in a ~60s window (02:29:46→02:30:46Z),
+   plus one downstream `mark_alerted_batch: lock retry exhausted` →
+   `[alert] failed to mark suppressed low-authority rows alerted`.
+   Self-healing — the row stays `urgency=1` for one more cycle until
+   the mark succeeds. Documented operational issue per memory
+   `di-insert-batch-lock-contention` — standing chronic, not a fresh
+   bug.
+
+5. **(chronic operational) 15+ GDELT GKG hyperlocal sources stale
+   for >24h** (GDELT/wesh.com, GDELT/wyff4.com, GDELT/nbcmiami.com,
+   etc.) plus reddit/r/ChatGPT 27h. Matches the
+   `di-chronic-dark-collectors` memory pattern — these hyperlocal GKG
+   hosts are bulk-historical-backfill artefacts, not active
+   collectors. Standing external gap, not a fresh bug.
+
+6. **(staging hazard, recurred) Auto-commit daemon bundled my code
+   into unrelated sibling commits.** `daemon.py` landed in `61ec87e`
+   ("stocktwits per-ticker sentiment" by a sibling agent),
+   `tests/test_briefing_label_calibration.py` landed in `15f6d92`
+   ("fix(backtest): redirect dead 'broadcom'"). My intended pathspec
+   was `daemon.py` + `tests/test_briefing_label_calibration.py` only;
+   the auto-commit daemon's race with the sibling agents' staging
+   produced commits that bundle multiple agents' work under one
+   author's commit message. This is the documented
+   `pt-concurrent-samerole-staging-race` hazard but from the
+   auto-commit-daemon side. The code is correctly on master under both
+   commits with my content intact (`git show --stat` confirmed); only
+   the commit-message attribution is "wrong" — no correctness impact,
+   no rebase needed (rebasing would dehydrate sibling agents' work).
+   Same disposition as prior session entries that documented this:
+   code lands, commit metadata is misleading, leave it.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:**
+- `python3 -c "import sys; sys.path.insert(0,'.'); from storage import
+  article_store; from ml import features, model; print('imports OK')"`
+  → `imports OK`.
+- Focused suite (every module the change touches): 115 passed in 9.07s.
+  Brief-named suite (`test_article_store` + `test_urgency_scorer` +
+  `test_features` + `test_model` + `test_trainer`): 55 passed in
+  49.69s. Full `python3 -m pytest tests/` deferred per the standing
+  concurrent-agent I/O saturation rule (3 sibling claude agents
+  running paper-trader passes in parallel; the focused suite covers
+  every module touched by this change).
+
+**Counters:** `bugs_fixed=0` (per the commit guard — no real bug; the
+four invariants are pinned), `features_added=1` (the urgent-row
+label-calibration line in the 5h briefing — code on master in
+`61ec87e`, tests on master in `15f6d92`, both auto-commit-bundled per
+finding #6), `user_findings=6` (briefing excellent, alert path
+working under storm, NEW 29%-LLM-vetted calibration signal, chronic
+USB lock contention persists, 15+ GDELT GKG hosts chronic-dark,
+auto-commit staging hazard recurred).
+
+**Staging discipline.** Three other claude agents running concurrently
+(paper-trader sibling agents visible in `ps -ef`) plus the
+auto-commit daemon. `git status` checked before staging; the auto-
+commit daemon raced and bundled my files into unrelated sibling
+commits (finding #6) — verified that BOTH my files (`daemon.py` for
+the helper + wire-up, and the new `tests/test_briefing_label_
+calibration.py`) landed on master with my content intact (`git show
+--stat` confirmed). AGENTS.md committed alongside the related code
+in this same documentation step (this section).
+
