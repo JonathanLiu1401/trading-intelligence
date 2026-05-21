@@ -6,6 +6,130 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4) — `/api/realized-vs-unrealized` + `/api/watchlist-coverage`
+
+Two new read-only diagnostic endpoints, each filling a gap no existing
+panel covers. Pure builders, observational only, drift-locked tests.
+
+### `/api/realized-vs-unrealized` ← `paper_trader/analytics/realized_vs_unrealized.py`
+
+Banked-vs-paper P&L split. Every other equity / P&L surface answers a
+different question (`/api/portfolio` scalar, `/api/drawdown` peak-to-
+trough, `/api/equity-integrity` sanity, `/api/pnl-attribution` β +
+idiosyncratic, `/api/trade-asymmetry` closed-round-trip aggregates).
+What no surface answered: *of today's net P&L, how much is locked-in
+realized vs paper that can evaporate?* A $11.95 net gain that is 100%
+realized is fundamentally different from the same headline that is
+100% open-book paper — the second is one adverse mark away from zero.
+
+The builder walks the trade ledger oldest→newest maintaining
+per-position `(qty, total_cost)`, reproducing the exact running
+avg-cost basis the live engine maintains in `positions.avg_cost`.
+For each equity-curve point it attaches cumulative realized P&L (from
+SELLs up to that ts) and computes `unrealized = total − starting −
+realized`. The algebraic invariant
+
+  realized(t) + unrealized(t) == total(t) − starting
+
+is pinned by `tests/test_realized_vs_unrealized.py::TestAlgebraicInvariant`
+across simple, partial-sell and round-trip-then-reentry scenarios — the
+single discriminating constraint that catches any sign / double-count
+drift no scenario test catches.
+
+Verdict ladder (chat-actionable verdicts marked ★, neutrals collapse
+to silence on the chat side):
+
+| Verdict | Trigger |
+|---|---|
+| ★ `DRAWING_DOWN` | `net_pct < -DD_PCT (0.5)` |
+| ★ `LEAKING_PAPER` | `realized>0` AND `unrealized<-LEAK_PCT (0.25%)` AND (`\|unrealized\| ≥ 0.5·realized` OR `net_pct<-MIN_NET_PCT`) — ordered BEFORE DRAWING_DOWN so the more diagnostic "open book is undoing banked gains" reading wins on a give-back |
+| ★ `PAPER_HEAVY` | `net_pct ≥ MIN_NET_PCT` AND `unrealized > 0` AND `unrealized/(realized+unrealized) ≥ PAPER_HEAVY_SHARE (0.66)` |
+| `BANKED` | `net_pct ≥ MIN_NET_PCT` AND realized ≥ `(1-PAPER_HEAVY_SHARE)` share |
+| `BALANCED` | small net P&L, within noise band |
+| `NO_DATA` | empty curve / empty trades |
+
+Live verdict at merge (2026-05-21, $1011.95 book, NVDA-only after the
+earnings-night round-trip): **BANKED — 100% of today's $11.95 (+1.19%)
+gain is locked-in realized; open book sits $+0.00**. The desk has the
+locked-in shape; a chat warning fires automatically if the next BUY
+marks up and tips it into PAPER_HEAVY.
+
+**Tests**: 34 under `tests/test_realized_vs_unrealized.py` covering
+empty/garbage inputs, the algebraic invariant (3 scenarios), running
+avg-cost walk (5 cases incl. partial sells, full-close-then-rebuy
+reset, option ×100 parity, naked-short degradation, cross-ticker
+isolation), each verdict-ladder branch, series attribution / out-of-
+order sort, payload-size compression, the exposed threshold contract,
+headline sanity, and a live-DB parity smoke test.
+
+### `/api/watchlist-coverage` ← `paper_trader/analytics/watchlist_coverage.py`
+
+Per-watchlist-ticker attention scan over the recent decision stream.
+Every other panel is position-centric (it shows what was traded);
+none names a ticker that was IGNORED. The live `WATCHLIST` has 48
+tickers; if 36 of them have not been mentioned in 1000 decisions
+while NVDA absorbs 100+ actions, that is opportunity cost the
+operator never sees.
+
+For each watchlist ticker the builder reports `last_seen_ts`,
+`hours_since_last_seen`, `never_seen`, `mentions_24h`, `mentions_7d`,
+`action_count_7d`. A ticker counts as "seen" via the `action_taken`
+verb-ticker (SSOT mirror of `dashboard._parse_action_ticker`,
+drift-locked) OR via a `\b`-anchored whole-word mention in
+`reasoning` against a longest-first watchlist alternation regex (AMD
+beats AM, "MULTITUDE" doesn't match MU, "format" doesn't match T).
+
+Verdict ladder (chat-actionable verdicts marked ★):
+
+| Verdict | Trigger |
+|---|---|
+| ★ `STAGNANT` | `(never_seen + stale_>7d) / n_watchlist > STAGNANT_SHARE (0.5)` |
+| ★ `CONCENTRATED` | top-3 tickers absorb `≥ CONCENTRATED_TOP3_SHARE (0.8)` of 24h mentions AND total mentions ≥ 10 |
+| `DIVERSIFIED` | healthy breadth, neither tail |
+| `NO_DATA` | empty watchlist or empty decisions |
+
+Live verdict at merge (1000 decisions scanned): **STAGNANT — 36 of
+48 watchlist tickers (75%) untouched in 7d+ (n_never_seen=36).
+Top-3 24h share = 0.81. The desk is under-fishing its own universe.**
+Specific stale tickers: AMAT, AMZU, BITU, CONL, CURE, … (sorted
+most-stale-first; the chat block surfaces a verbatim sample of up to
+8 names so the analyst sees *which* tickers to look at).
+
+**Tests**: 24 under `tests/test_watchlist_coverage.py` covering the
+SSOT mirror of `dashboard._parse_action_ticker` (drift-lock — any
+future change to the dashboard parser must propagate here), the
+whole-word regex / longest-match-wins / case sensitivity contract,
+empty/garbage degradation, action-ticker vs reasoning-mention
+capture, off-watchlist filtering, 24h/7d window split, last-seen
+newest-match semantics, each verdict-ladder branch incl. the
+"silenced when few mentions" carve-out, the threshold-boundary
+constants, by_ticker sort order (never-seen floats to top), the
+exposed threshold contract, and a live-WATCHLIST+DB parity smoke
+test.
+
+### Discipline + integration
+
+Both endpoints are wrapped with `@swr_cached` (30s and 60s TTL
+respectively) following the dashboard.py convention. Both rely
+entirely on existing `store.recent_trades` / `store.equity_curve` /
+`store.recent_decisions` / `strategy.WATCHLIST` — no new schema, no
+new external dependencies, no live-trade-loop modification
+(AGENTS.md invariants #2 / #12). Both `try/except` the build so any
+analytics fault returns `{"error": str(e)}, 500` rather than
+poisoning the surface.
+
+The digital-intern side carries matching chat enrichment helpers
+(`_realized_vs_unrealized_chat_lines` + `_watchlist_coverage_chat_lines`)
+behind guarded 3s `:8090` sub-fetches, surfacing the same actionable
+verdicts to the chat analyst with verbatim headline + sample
+passthrough. Locked by 49 tests on the intern side. See the intern
+AGENTS.md entry for the chat-side contract.
+
+**Counters**: features_added=2, endpoints_added=2, tests_added=58
+(paper-trader-side) + 49 (intern-side) = 107.
+
+---
+
 ## 2026-05-21 ML+backtest HYBRID pass (Agent 2, ~late session #2) — outcomes regex word-boundary + bubble_gate_skill
 
 ### Phase 1 — fix (commit `f520926`)
