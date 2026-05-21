@@ -853,7 +853,21 @@ def _load_volume_cache_for_window(start: date, end: date) -> None:
         loaded: dict[str, dict[str, float]] = {}
         if path.exists():
             try:
-                loaded = json.loads(path.read_text())
+                raw = json.loads(path.read_text())
+                # Type guard. `json.loads` raises only on syntax errors —
+                # a syntactically valid but type-wrong payload (e.g. a list
+                # `[1,2,3]` written by some external tool, or a truncated dict
+                # that happened to land on a closed bracket) returned a
+                # non-dict here. The next line then crashed on `.items()`,
+                # raising AttributeError out through `_load_volume_cache_for_window`
+                # → `_ensure_volume_for` → `_compute_technical_indicators`,
+                # killing the run thread mid-cycle. Mirror the GDELT /
+                # AlphaVantage cache guards: narrow to a dict of dicts so
+                # a single bad nested entry drops just that ticker rather
+                # than the whole window's volume series.
+                if isinstance(raw, dict):
+                    loaded = {tk: s for tk, s in raw.items()
+                              if isinstance(s, dict)}
             except Exception:
                 loaded = {}
         for ticker, series in loaded.items():
@@ -1233,7 +1247,20 @@ class GDELTFetcher:
         path = self._cache_key(d, keywords)
         if path.exists():
             try:
-                return json.loads(path.read_text())
+                cached = json.loads(path.read_text())
+                # Type guard. A corrupt cache file (truncated mid-write,
+                # external editor saving a dict / number / string instead of
+                # the expected list) silently passed through here as the
+                # function return, then crashed downstream in `_fetch_signals`
+                # at `for a in articles: a.get(...)`. Iterating a string yields
+                # single-char strings whose `.get` raises AttributeError; a
+                # number isn't iterable; a dict iterates its keys (strings).
+                # Any of those kills the run thread mid-cycle. Mirror the
+                # `_load_volume_cache_for_window` type guard discipline:
+                # narrow to a list of dicts (drop non-dict entries so a single
+                # bad row doesn't poison the whole day's signals).
+                if isinstance(cached, list):
+                    return [a for a in cached if isinstance(a, dict)]
             except Exception:
                 pass
 
@@ -1357,7 +1384,18 @@ class AlphaVantageNewsFetcher:
             path = self._cache_path(tk, d)
             if path.exists():
                 try:
-                    articles.extend(json.loads(path.read_text()))
+                    cached = json.loads(path.read_text())
+                    # Type guard mirrors `GDELTFetcher.fetch` / the volume
+                    # cache loader: a corrupt AV cache file (truncated
+                    # mid-write, external editor saving a dict / number
+                    # instead of a list) silently extended `articles` with
+                    # whatever the raw value iterated to (dict→keys as
+                    # strings, number→TypeError) and crashed downstream at
+                    # `a.get("url")` in `_fetch_signals`. Narrow to a list of
+                    # dicts so a single bad row drops just that row, not the
+                    # whole ticker's news for the day.
+                    if isinstance(cached, list):
+                        articles.extend(a for a in cached if isinstance(a, dict))
                     continue
                 except Exception:
                     pass
@@ -2384,7 +2422,18 @@ class BacktestEngine:
                 entries = json.loads(f.read_text())
             except Exception:
                 continue
-            for e in entries or []:
+            # Type guard mirrors the GDELT / AlphaVantage / volume cache
+            # loaders. A corrupt SEC cache file (truncated, externally edited)
+            # could deserialize to a dict / number / string, then crash the
+            # whole engine init at `e.get("published")` because iterating a
+            # string yields chars (no .get) and iterating a number raises
+            # TypeError. Skip non-list payloads; per-entry isinstance check
+            # below already protects against mixed-type contents.
+            if not isinstance(entries, list):
+                continue
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
                 pub = e.get("published") or ""
                 if len(pub) < 10:
                     continue
