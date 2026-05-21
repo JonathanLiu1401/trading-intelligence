@@ -6,6 +6,138 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 paper-trader-core HYBRID pass (Agent 1, ~11:20 UTC)
+
+### Phase 1 — fix (no commit)
+
+Audited the seven core files (`runner.py`, `reporter.py`, `signals.py`,
+`strategy.py`, `dashboard.py`, `market.py`, `store.py`) plus the newer
+subsystems `host_guard.py`, `preflight.py`, `validation.py`,
+`should_restart.py`, `historical_collector.py`, `llm_adapter.py`,
+`analytics/dynamic_interval.py`. Every targeted area suggested by recent
+review passes (`_pos_alpha_token` baseline lookup, `_realized_pl_window`
+vs `_realized_pl_today` boundary, `_window_delta` two-point edge,
+`closed_positions` round-trip walker, `_swr_refresh` cacheability,
+`_decision_action_verb` BLOCKED row handling, `_send` recovery latch
+symmetry, `_hold_duration` clock-skew clamp) checked out clean — no
+surfaced bug warranted a commit.
+
+`bugs_fixed=0`. The honest call (the documented "Don't pad with
+whitespace renames" discipline) — this code path is exhaustively
+reviewed.
+
+### Phase 2 — feature (commit `1511224`)
+
+**`paper_trader/reporter.py::_cash_conviction_fit_line()`** — Discord
+surface for the cash-conviction-fit verdict.
+
+`build_cash_conviction_fit` + `/api/cash-conviction-fit` answer the
+point-in-time question every PM asks first: *given today's loudest live
+signal, is my cash level appropriate?* But the operator lives in
+Discord and never opens that endpoint — the dashboard→Discord gap
+`_capital_pulse_line` / `_concentration_line` / `_heartbeat_line` each
+closed, one dimension over.
+
+`_capital_pulse_line` covers structural CAN-ACT (PINNED/FREE/BLEEDING —
+from cash %, recent activity, droughts). This new line covers the
+orthogonal IS-SIZED-TO-LIVE-SIGNAL question. A FREE book can still be
+IDLE_DESPITE_SURGE on an unheld 9.0-ai_score signal — the live state
+the existing CAPITAL line cannot catch.
+
+Composes `build_cash_conviction_fit` **verbatim** (single source of
+truth, invariant #10 — the verdict / headline are the builder's, never
+re-derived). Feeds it the SAME shape `/api/cash-conviction-fit` does:
+`store.get_portfolio()` (cash + total_value + cash_pct),
+`signals.get_top_signals` (already `_LIVE_ONLY`-filtered, AGENTS.md #3)
+for top signals, and `store.recent_decisions(limit=1)` for fill-recency
+disambiguation. Reads `store.open_positions()` (qty>0 SSOT) for the held
+set rather than the lagged `portfolio.positions_json` blob — under the
+documented equity-freshness divergence, the snapshot can be stale for a
+cycle while `open_positions` is always fresh.
+
+**Pure store + read-only articles.db reads — NO network** (the
+Discord-path discipline; the `_source_mix_line` precedent).
+Observational only, never gates Opus, no caps (invariants #2/#12 — the
+`_capital_pulse_line` precedent).
+
+Suppression — surface ONLY the two actionable verdicts:
+
+  * `IDLE_DESPITE_SURGE` — cash idle while top signal screams
+  * `OVERDEPLOYED`       — cash so low the book cannot respond
+
+`IDLE_LOW_CONVICTION` (correctly idle), `BALANCED` (level fits), and
+`NO_DATA` all stay silent (silence-when-nothing-actionable; the summary
+must never become its own lying green light).
+
+Wired into `send_hourly_summary` and `send_daily_close` **right after
+`_capital_pulse_line`** — both about cash deployment, neither suppresses
+the other.
+
+**Tests**: 14 new tests under `tests/test_core_reporter.py::TestCashConvictionFitLine`
+covering:
+
+  * verdict-matrix branches (BALANCED / IDLE_LOW_CONVICTION / NO_DATA
+    suppressed; IDLE_DESPITE_SURGE / OVERDEPLOYED surfaced verbatim)
+  * defensive: missing headline / non-dict builder return / no signals
+    → empty
+  * failure contract: builder raise / signals.get_top_signals raise →
+    empty, never an exception (the reporter line invariant)
+  * builder shape: first-extracted-ticker-per-article wins;
+    `held=True` for tickers in `store.open_positions()`
+  * hourly/daily wiring + ordering (CAPITAL before CASH FIT)
+
+All 338 reporter tests pass; 704 core tests pass.
+
+### Phase 3 — live validation (read-only findings)
+
+Used the system as a live trader at 11:20 UTC. Findings:
+
+1. **ACTIVE IDLE_STORM** — `/api/runner-heartbeat` reports
+   `restart_recommended: true`, `decision_efficacy.verdict: IDLE_STORM`
+   (last 13 cycles ALL NO_DECISION, 90% of last 20). 10/10 most recent
+   `decisions` rows in `paper_trader.db` are NO_DECISION. The bot has
+   not made a real decision in ~4 minutes despite a closed-market 60-min
+   cadence. `_heartbeat_line` correctly surfaces this to Discord via
+   the existing path.
+
+2. **Host SATURATED is the root cause** — `/api/host-guard` reports
+   `state: SATURATED`, 7 concurrent Opus subprocesses (>4 cap),
+   swap_used 88%, mem_avail 5.2GB, load1=9.29 / load_per_cpu 0.58.
+   39% of the last 120 decisions never reached Opus. `_host_pulse_line`
+   correctly identifies this is an OPS issue (kill review/backtest
+   agents) — a restart will NOT fix it.
+
+3. **`/api/cash-conviction-fit` endpoint hangs >30s** — the very
+   endpoint my new reporter line composes from is unusable from the
+   dashboard under the current host load. No `@swr_cached` decorator,
+   no bounded I/O around the per-article × `_BOOK_TICKERS` regex
+   iteration (~120 tickers × matching articles). The reporter line
+   bypasses this by calling `signals.get_top_signals` directly, so the
+   Discord surface is unaffected; but the dashboard panel is dead.
+   This is sibling-agent territory (dashboard.py is dirty in this
+   worktree from concurrent passes) — reported, not fixed.
+
+4. **66% single-name concentration** — the live book is one NVDA
+   position worth $670.30 of $1011.95 total, deep in SINGLE_NAME_RISK
+   territory (>60% threshold). `_concentration_line` is the existing
+   surface; it would fire ⚠️ CONCENTRATION on the next hourly.
+
+5. **All recent NVDA trades at same $223.43** — five most recent trade
+   rows (back to 2026-05-20 21:10 UTC) all priced at $223.4349…. Market
+   has been closed for the entire window; yfinance returns the most
+   recent regular-session close, so this is the expected stale-mark
+   behaviour, not a bug. Worth knowing on read.
+
+6. **Singleton-lock restart spam** — `logs/runner.log` shows repeated
+   "another paper trader is already running (pid=651735)" — a launcher
+   loop bouncing against the singleton lock guard. Matches the prior
+   `pt-systemd-vs-manual-restart-spam` memory note — historical
+   systemd-vs-manual contention, lock working as designed. Not new.
+
+Counters: bugs_fixed=0, features_added=1, user_findings=6.
+
+---
+
 ## 2026-05-21 feature-dev pass (Agent 4) — `/api/realized-vs-unrealized` + `/api/watchlist-coverage`
 
 Two new read-only diagnostic endpoints, each filling a gap no existing
