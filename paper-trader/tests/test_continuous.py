@@ -1694,6 +1694,141 @@ class TestAppendBaselineSkillLog:
             outcomes_path=tmp_path / "nope.jsonl") is False
 
 
+# ──────────────── LLM-annotation skill ledger ────────────
+
+class TestAppendLlmAnnotationSkillLog:
+    """The per-cycle LLM-annotation skill ledger — answers
+    "is the _llm_annotate_outcomes pipeline producing labels at all" durably
+    and per-cycle so the documented production-dark state is visible in the
+    trend, not only via manual grep of decision_outcomes.jsonl. Mirrors the
+    `_append_scorer_skill_log` / `_append_baseline_skill_log` discipline:
+    best-effort, honest gap rows, atomic bounded trim, never breaks the loop.
+    """
+
+    def _write_outcomes(self, path, rows):
+        path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    def test_pipeline_dark_row_when_zero_labels(self, tmp_path, monkeypatch):
+        # The documented live state: 7413/7413 rows have label=0. Ledger must
+        # persist `pipeline_dark=True` so the operator sees it.
+        log = tmp_path / "llm_annotation_skill_log.jsonl"
+        monkeypatch.setattr(rcb, "LLM_ANNOTATION_SKILL_LOG", log)
+        outcomes = tmp_path / "decision_outcomes.jsonl"
+        self._write_outcomes(outcomes, [
+            {"action": "BUY", "forward_return_5d": 1.0, "llm_quality_label": 0}
+            for _ in range(50)
+        ])
+
+        ok = rcb._append_llm_annotation_skill_log(
+            cycle=11, win_start=date(2018, 1, 2), win_end=date(2019, 1, 2),
+            outcomes_path=outcomes)
+        assert ok is True
+
+        rows = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["cycle"] == 11
+        assert row["window_start"] == "2018-01-02"
+        assert row["window_end"] == "2019-01-02"
+        assert row["verdict"] == "NO_LABELS_PRODUCED"
+        assert row["pipeline_dark"] is True
+        assert row["n_endorsed"] == 0
+        assert row["n_condemned"] == 0
+        assert row["n_unlabeled"] == 50
+
+    def test_directional_row_when_labels_predict(self, tmp_path, monkeypatch):
+        # Labels exist AND predict realized returns — the row reports the
+        # gap and rank-IC. pipeline_dark flips to False the moment any
+        # endorsed/condemned label appears.
+        log = tmp_path / "llm_annotation_skill_log.jsonl"
+        monkeypatch.setattr(rcb, "LLM_ANNOTATION_SKILL_LOG", log)
+        outcomes = tmp_path / "decision_outcomes.jsonl"
+        rows = (
+            [{"action": "BUY", "forward_return_5d": 5.0,
+              "llm_quality_label": 1} for _ in range(15)]
+            + [{"action": "BUY", "forward_return_5d": -5.0,
+                "llm_quality_label": -1} for _ in range(15)]
+        )
+        self._write_outcomes(outcomes, rows)
+
+        rcb._append_llm_annotation_skill_log(
+            cycle=22, win_start=date(2010, 1, 4), win_end=date(2011, 1, 4),
+            outcomes_path=outcomes)
+        row = json.loads(log.read_text().strip())
+        assert row["verdict"] == "LLM_DIRECTIONAL"
+        assert row["pipeline_dark"] is False
+        assert row["n_endorsed"] == 15
+        assert row["n_condemned"] == 15
+        # SSOT cross-check — the persisted gap MUST equal what
+        # llm_annotation_skill returns directly on the same input.
+        from paper_trader.ml import llm_annotation_skill as las
+        direct = las.llm_annotation_skill(rows)
+        assert row["endorsed_minus_condemned"] == direct[
+            "endorsed_minus_condemned"]
+        assert row["rank_ic"] == direct["rank_ic"]
+
+    def test_missing_outcomes_file_persists_honest_dark_row(self, tmp_path,
+                                                            monkeypatch):
+        log = tmp_path / "llm_annotation_skill_log.jsonl"
+        monkeypatch.setattr(rcb, "LLM_ANNOTATION_SKILL_LOG", log)
+        # outcomes file does not exist — analyze returns NO_LABELS_PRODUCED
+        # (the n_total == 0 path); the row must STILL appear so a gap in
+        # the trend is visible.
+        assert rcb._append_llm_annotation_skill_log(
+            cycle=4, win_start=date(2009, 1, 2), win_end=date(2010, 1, 2),
+            outcomes_path=tmp_path / "missing.jsonl") is True
+        row = json.loads(log.read_text().strip())
+        assert row["verdict"] == "NO_LABELS_PRODUCED"
+        assert row["pipeline_dark"] is True
+        assert row["n_total"] == 0
+
+    def test_analyze_exception_degrades_to_honest_row_not_crash(
+            self, tmp_path, monkeypatch):
+        log = tmp_path / "llm_annotation_skill_log.jsonl"
+        monkeypatch.setattr(rcb, "LLM_ANNOTATION_SKILL_LOG", log)
+
+        def _boom(*a, **k):
+            raise RuntimeError("simulated llm_annotation_skill failure")
+
+        import paper_trader.ml.llm_annotation_skill as las
+        monkeypatch.setattr(las, "analyze", _boom)
+
+        assert rcb._append_llm_annotation_skill_log(
+            cycle=6, win_start=date(2012, 1, 3), win_end=date(2013, 1, 3),
+            outcomes_path=tmp_path / "missing.jsonl") is True
+        row = json.loads(log.read_text().strip())
+        assert row["status"] == "error"
+        assert row["verdict"] == "NO_LABELS_PRODUCED"
+        assert row["pipeline_dark"] is True  # zero labels ⇒ dark
+        assert row["cycle"] == 6
+
+    def test_bounded_trim_rewrites_when_past_2x_keep(self, tmp_path,
+                                                     monkeypatch):
+        log = tmp_path / "llm_annotation_skill_log.jsonl"
+        monkeypatch.setattr(rcb, "LLM_ANNOTATION_SKILL_LOG", log)
+        monkeypatch.setattr(rcb, "LLM_ANNOTATION_SKILL_LOG_KEEP", 4)
+        # 9 pre-seeded rows (> 2×4) ⇒ next append triggers a rewrite.
+        log.write_text("\n".join(json.dumps({"cycle": i}) for i in range(9))
+                       + "\n")
+        rcb._append_llm_annotation_skill_log(
+            cycle=99, win_start=date(2012, 1, 3), win_end=date(2013, 1, 3),
+            outcomes_path=tmp_path / "nope.jsonl")
+        lines = [l for l in log.read_text().splitlines() if l.strip()]
+        assert len(lines) == 4  # trimmed to LLM_ANNOTATION_SKILL_LOG_KEEP
+        assert json.loads(lines[-1])["cycle"] == 99  # newest survives
+
+    def test_never_raises_on_unwritable_path(self, tmp_path, monkeypatch):
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x")
+        monkeypatch.setattr(rcb, "LLM_ANNOTATION_SKILL_LOG",
+                            blocker / "sub" / "llm.jsonl")
+        # Even when the parent path can't be created, the function must
+        # swallow the OSError and return False — never raise.
+        assert rcb._append_llm_annotation_skill_log(
+            1, date(2000, 1, 3), date(2001, 1, 3),
+            outcomes_path=tmp_path / "nope.jsonl") is False
+
+
 # ──────────────── winner_training.jsonl bounded trim ────────────
 
 class TestTrimWinnerJsonl:
@@ -1766,6 +1901,16 @@ class TestCycleWiringRegression:
         import inspect
         src = inspect.getsource(rcb.main)
         assert "_append_baseline_skill_log(" in src
+
+    def test_main_invokes_llm_annotation_skill_ledger(self):
+        # The LLM-annotation ledger surfaces the documented
+        # NO_LABELS_PRODUCED state of the _llm_annotate_outcomes pipeline.
+        # CLI-only until this wiring; lock the call so a future refactor
+        # cannot silently re-orphan it (the same failure mode the scorer /
+        # baseline ledgers suffered until they were each wired).
+        import inspect
+        src = inspect.getsource(rcb.main)
+        assert "_append_llm_annotation_skill_log(" in src
 
     def test_main_reaps_orphans_per_cycle_not_only_at_startup(self):
         # Live finding: 15 rows stuck 'running' for 35h because the reaper
