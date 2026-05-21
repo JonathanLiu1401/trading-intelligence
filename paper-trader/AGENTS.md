@@ -12654,3 +12654,178 @@ cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/ -q
 * **Discord-path discipline** — pure composition over the snapshot the caller already has; no network on the hot alert path (the `_pos_pct_weight` / `_pos_hold_age_token` precedent).
 * **Additive failure contract** — any garbage avg_cost / qty / market_value silently suppresses the @avg token rather than crashing; existing snapshot shapes that omit `avg_cost` stay byte-compatible.
 * **Silence-when-nothing-actionable** — zero / missing / non-positive avg_cost yields no token, never a misleading `"$0.00"`.
+
+## 2026-05-20 ML/backtest hybrid pass (Agent 2) — benchmark_integrity diagnostic + skeptical-quant live audit
+
+### Phase 1 — honest no-commit
+
+Three advisor-suggested suspects checked carefully and ruled out:
+
+* **`BacktestStore` concurrency** (background `_opus_annotate` thread + main thread + `_compute_decision_outcomes` + `_append_top_decisions` all share `engine.store.conn`): every public method holds `self._lock` for the full cursor lifetime. No bug.
+* **`_train_decision_scorer` oversampling `_keep` guard**: `rep > 0` filter combined with the `_keep.any()` fallback correctly preserves training-fold integrity even when every row is a CONDEMN that rounds to rep=0. Behaviour matches the documented 0.1× weight semantic. No bug.
+* **`_inject_and_train` for/else retry loop**: `for` exits via `break` on success (bypassing `else`) and via exhaustion on persistent lock (triggering `else`'s "locked after N attempts" return). Non-lock `OperationalError` returns early from inside the except. No bug.
+
+Per the saturation-pass principle (~30 prior reviews, 466 ML/backtest tests green at baseline), `bugs_fixed=0`, no Phase 1 commit. Advisor approved.
+
+### Phase 2 feature — `paper_trader/ml/benchmark_integrity.py` (commit `720d534`)
+
+**Why.** `backtest.py::run_one` carries a benchmark-honesty guard (line ~2697) that writes `benchmark_unavailable` into a run's `notes` column when SPY returned `0.0` over a ≥30-day window — both branches (SPY series empty AND spy_return=0 on a non-trivial window) are degenerate-`returns_pct` outputs that make `vs_spy_pct = total_return - 0` a fabricated number, not real alpha. The guard catches every NEW run. But it landed AFTER ~80 historical runs had been finalized with `spy_return_pct=0.0` and empty `notes` — those runs still appear in `vs_spy_pct`-keyed analytics, the dashboard, AND in `strategy.py::_ml_is_qualified`'s 20-run median-α qualifier gate (the SQL filters `vs_spy_pct IS NOT NULL` but does NOT filter the degenerate case — those rows DO have non-NULL vs_spy_pct, just a fabricated one). A skeptical quant cannot judge the magnitude of this contamination by reading the dashboard.
+
+**Behaviour.** Single SQL pass over `backtest_runs`. Degenerate criterion mirrors the in-engine guard exactly (`status='complete' AND spy_return_pct=0.0 AND (end_date − start_date) ≥ 30 days`). Flagged subset: degenerate AND `notes LIKE '%benchmark_unavailable%'`. Reports total / flagged / unflagged counts, per-500-run-id-bucket distribution (flat ⇒ leak frozen, growing ⇒ leak active), and the **economic impact** on the live qualifier window: median `vs_spy_pct` of the last `QUALIFIER_WINDOW=20` qualifying runs both as-is and with unflagged-degenerate rows excluded — the number a quant cares about ("does removing these flip the live ML-advisor gate state").
+
+**Verdict ladder (most alarming first):**
+
+| Verdict | Trigger |
+|---|---|
+| `INSUFFICIENT_DATA` | < `MIN_TOTAL=30` complete runs |
+| `ACTIVE_LEAK` | ≥1 unflagged-degenerate run in the last `LEAK_DETECTION_WINDOW=50` runs — the engine's guard regressed or a code path bypasses it |
+| `HISTORICAL_CONTAMINATION` | unflagged-degenerate runs exist but are all older than the leak window — pre-guard pollution that won't grow |
+| `FLAGGED_ONLY` | every degenerate run carries the `benchmark_unavailable` flag; engine guard is working as intended |
+| `CLEAN` | no degenerate runs at all |
+
+**Same operational discipline as every other `paper_trader/ml/*` diagnostic:** read-only, never trains, never touches `decision_scorer.pkl` / `decision_outcomes.jsonl` / `build_features` / any trade path. Pure DB read. Module-level `DEFAULT_DB_PATH` resolved at call time (the test-isolation rule). Never raises — a malformed row drops itself only; missing DB degrades to `status='error', verdict='INSUFFICIENT_DATA'`. CLI pattern mirrors `gate_utilization` / `gate_audit` / `baseline_compare`.
+
+```bash
+python3 -m paper_trader.ml.benchmark_integrity
+cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.benchmark_integrity --json
+```
+
+Exit codes for shell-script gating: `0` = CLEAN/FLAGGED_ONLY; `1` = HISTORICAL_CONTAMINATION; `2` = ACTIVE_LEAK; `3` = INSUFFICIENT_DATA/error.
+
+**Live read on `backtest.db` (477 complete runs):**
+```
+verdict=HISTORICAL_CONTAMINATION
+flagged degenerate   : 1
+unflagged degenerate : 80 (16.8% of total)
+max unflagged run_id : 6145
+max flagged   run_id : 6225
+unflagged by run_id bucket:
+   5500- 5999: 55
+   6000- 6499: 25
+qualifier window (last 20):
+   n_unflagged       : 0
+   median α (asis)   : +143.33%
+   median α (clean)  : +143.33%
+   median α (delta)  : +0.00pp
+```
+The leak is **frozen** (max unflagged 6145 < max flagged 6225 — the in-engine elif guard landed at ~6146 and has caught every degenerate case since). The current live trader qualifier window has **zero** contaminated rows, so the ML advisor's gate state is unaffected by the historical pollution — but a future window that recedes back into the pre-guard run-id range could include them. (Cross-domain — see live findings.)
+
+**Tests (`tests/test_benchmark_integrity.py`, 25 tests, ~1s offline):**
+* `TestEmptyOrClean` (4 tests) — empty / non-complete-only / clean-corpus / below-MIN_TOTAL.
+* `TestDegenerateDetection` (4 tests) — SPY=0 over 30d IS degenerate, SPY=0 under 30d is NOT, flagged vs unflagged separation, non-zero SPY never degenerate regardless of window.
+* `TestVerdictLadder` (4 tests) — ACTIVE_LEAK / HISTORICAL_CONTAMINATION / FLAGGED_ONLY discrimination at the `LEAK_DETECTION_WINDOW=50` boundary; ACTIVE_LEAK dominates HISTORICAL (most-actionable-first precedent).
+* `TestBucketing` (2 tests) — 500-id bucket arithmetic, ascending bucket order.
+* `TestQualifierWindow` (4 tests) — run_id-DESC order, exact median-α arithmetic (clean=10 vs asis=105 ⇒ delta=95), `n_trades<5` filter mirrored from `_ml_is_qualified`, all-unflagged degenerate path returns `clean=None / delta=None` honestly.
+* `TestDegradeNeverRaises` (3 tests) — malformed rows drop themselves only (good rows survive), `None` input → INSUFFICIENT_DATA, missing DB → status='error'.
+* `TestAnalyzeAgainstRealDb` (1 test) — round-trip through real SQLite so a schema drift between this test's fixture and `BacktestStore` surfaces.
+* `TestCli` (3 tests) — `--json` payload schema, exit code 0 (CLEAN) vs 2 (ACTIVE_LEAK) vs 3 (missing DB).
+
+### Phase 3 — live quant findings (concrete, run against the actual deployed state)
+
+1. **Continuous loop is DOWN locally.** `ps aux | grep continuous` returns nothing; `data/scorer_skill_log.jsonl` / `data/baseline_skill_log.jsonl` both absent. Last `decision_scorer.pkl` mtime is ~36.5h ago (`scorer_freshness` reads `pkl: age_h=36.49`). With the loop down, no skill ledger is being maintained, so `skill_trend` / `overfit_gap` / `baseline_trend` all read `INSUFFICIENT_DATA` ("0 usable cycles") and cannot answer "is OOS skill improving" durably.
+
+2. **Deployed scorer pickle is BELOW the conviction-gate threshold.** `n_train=400 < 500` (invariant #5), so the conviction gate is **inactive** in production. `data/decision_outcomes.jsonl` has **7,413** rows ready to push `n_train` from 400 → ~6,906 (after dedup) on the next retrain cycle — so a single restart of `run_continuous_backtests.py` immediately re-arms the gate. Operational, not a code bug.
+
+3. **OOS gate diagnostics on the live slice are HEALTHY** (the substantive finding for a skeptical quant). On the 1,482 OOS records:
+   * `gate_audit`: **GATE_EFFECTIVE** — strong_tailwind realized `+3.69%`, strong_headwind `-2.38%`, spread `+6.07pp`, `arm_monotone=1.0` (every arm correctly ordered).
+   * `gate_utilization`: **BALANCED** — every arm 11.88%-34.41%, `side_balance=0.497` (symmetric), distribution `min=-50/median=-0.05/max=+50`.
+   * `baseline_compare` (the decisive question — does the 17-feature MLP carry more OOS rank skill than a one-line rule?): **MLP_ADDS_SKILL** — MLP `rank_ic=+0.2245 dir_acc=0.6111`, beats best baseline (`rsi_meanrev`, `rank_ic=+0.079`) by `+0.145`, well above the 0.05 skill floor. The MLP is genuinely additive OOS.
+   * `deploy_audit`: **DEPLOYED_MATCHES_SOURCE** — all 8 hyper-params match `MLP_CONFIG`, no architectural drift.
+
+   So once `n_train` crosses 500, the gate will engage on a model that is both economically effective AND structurally reachable AND genuinely skill-adding versus trivial baselines. The path is clear; only the operational gap (loop down) blocks the unlock.
+
+4. **Cross-domain leak risk (report-only; strategy.py owns the fix).** `strategy.py::_ml_is_qualified` SQL filter is `status='complete' AND vs_spy_pct IS NOT NULL AND n_trades >= 5 ORDER BY run_id DESC LIMIT 20`. None of those clauses excludes the 80 historical unflagged-degenerate rows (they have non-NULL but fabricated `vs_spy_pct`). The current window happens to be clean by luck — `max_unflagged_run_id=6145` is well below the last 20 qualifying runs — but if the engine ever pauses long enough that the qualifier window receeds back into run_ids ≤6145, contaminated rows would re-enter the median and could falsely qualify the ML advisor. Defensive fix would be adding `AND NOT (spy_return_pct = 0.0 AND (julianday(end_date) - julianday(start_date)) >= 30)` to the qualifier SQL. Cross-domain (live trader strategy), not in this pass's scope.
+
+5. **Calibration on the FULL corpus reads MISCALIBRATED** (`spearman=0.016`) but this is the well-documented in-sample noise artifact — the MLP memorizes the 80% training split, so a Spearman over all 7,413 rows is dominated by the noisy in-sample portion. The honest OOS-only view (baseline_compare above) shows the actual additive skill. This is exactly why the loop's skill ledger reports OOS metrics rather than the in-sample calibration verdict.
+
+6. **`outcome_data_quality` reads CLEAN**: 7,413 rows parsed, 0 corrupt, 0 conflicts. Distribution `mean=+1.09% std=9.52 p1=-23.48% p99=+29.35%`. 25 rows have `|fr_5d|>50%` (the symmetric label-clamp at train time handles these correctly). Training-set integrity is intact.
+
+7. **3 sibling Claude agents running concurrently** (this agent + 2 others all dispatched at ~18:17 UTC against the same paper-trader-core / digital-intern trees). Each is a `claude --print` subprocess holding ~230MB RSS. Past pass documented [PT concurrent same-role staging race](../../../.claude/projects/-home-zeph-trading-intelligence/memory/pt-concurrent-samerole-staging-race.md): a sibling agent's whole-file `git add` between this agent's stage and commit could bundle their work into ours. I staged only the two files I created (one new module + its test file), verified with `git diff --staged --stat` before committing — no contamination.
+
+8. **Pre-existing test failure surfaces in the full suite (NOT this pass's fix).** `tests/test_swr_prewarm_coverage.py::test_every_swr_cached_endpoint_is_prewarmed` fails because the `today-action-tape` endpoint was added with `@swr_cached` but never registered in `_swr_prewarm.targets`. That endpoint is in the core/dashboard domain (Agent 1), not ML/backtest. Verified the failure exists on master before my changes by stashing+re-running. Reported here so the next core hybrid pass knows to look.
+
+9. **`data/paper_trader.db?mode=ro` empty orphan file persists** from the 2026-05-20 core hybrid pass observation. Still safe to delete; not mine to remove this pass.
+
+### Counters
+
+`bugs_fixed=0` (honest no-commit per advisor guidance — the three reviewed suspects all checked out clean) · `features_added=1` (`benchmark_integrity` diagnostic + 25 tests + AGENTS.md docs) · `user_findings=9` (continuous loop DOWN locally, deployed pkl n_train=400 below gate threshold, OOS gate is HEALTHY/EFFECTIVE/BALANCED on 1482-record slice, MLP_ADDS_SKILL with +0.225 rank_ic, strategy.py `_ml_is_qualified` is structurally vulnerable to historical leak though current window is clean, calibration MISCALIBRATED on full corpus is in-sample-noise artifact not real degradation, outcome data quality CLEAN with intact training integrity, 3 concurrent same-role siblings without contamination, pre-existing core/dashboard test failure unrelated to ML/backtest).
+
+### How the ML decision scorer works (consolidated reference)
+
+The scorer is a small `MLPRegressor(32, 16)` (sklearn, with numpy `lstsq` fallback) that maps a 17-dim feature vector to a predicted 5-day forward return %.
+
+* **Features** (`paper_trader/ml/decision_scorer.py::build_features`, 17 dims, single source of truth in `FEATURE_NAMES`): `ml_score`, `rsi`, `macd`, `mom5`, `mom20`, `regime_mult`, `vol_ratio`, `bb_pos`, `news_urgency`, `news_article_count`, plus 7-way sector one-hot (`tech / energy / financials / healthcare / commodities / crypto / other`).
+* **Sector mapping** (`SECTOR_MAP`): explicit ticker → sector dict. `INTENTIONALLY_OTHER` frozenset pins tickers that fall through to `other` by design (TM/UXI/NAIL/DFEN/UTSL/XLI — no industrial/utility/real-estate/defense sector enum). A test (`test_decision_scorer.py`) asserts `WATCHLIST ⊆ (SECTOR_MAP ∪ INTENTIONALLY_OTHER)` so a NEW watchlist ticker without explicit classification fails loudly rather than silently degrading.
+* **Hyper-params** live in module-level `MLP_CONFIG` (single source of truth shared with `deploy_audit`). Anti-overfit config: `hidden_layer_sizes=(32, 16)`, `alpha=1e-2`, `early_stopping=True`, `validation_fraction=0.15`, `n_iter_no_change=25`. Drift would be caught by `deploy_audit.is_deploy_stale`.
+* **Prediction clamp** `PRED_CLAMP_PCT=50.0` — the MLP head is unbounded; any raw output exceeding ±50 is flagged off-distribution via `predict_with_meta` and the conviction-gate honours that abstention.
+* **Training** (`train_scorer`): dedup by `(ticker, sim_date, action)` keeping the highest-`return_pct` copy; drop invalid `forward_return_5d` (None/NaN/inf/bool/string) BEFORE `build_features` (counted in `n_label_dropped`); symmetric label clamp at ±`PRED_CLAMP_PCT` (counted in `n_label_clamped`); sample-weight oversampling rounds `w*2` to ints, drops CONDEMN rows (rep=0) per the documented `llm_mult=0.1` semantic; atomic write via tmp+`.replace` so a torn pickle is impossible.
+* **Gate** (`paper_trader/backtest.py::_ml_decide`): conviction multiplier only — NEVER cancels a trade (an earlier blocking version oscillated SOXL/TQQQ strategies, see the inline comment). Arms: `< -10 → ×0.6`, `< 0 → ×0.85`, `0..5 → unchanged`, `> 5 → ×1.15`, `> 10 → ×1.30`. Fires only when `is_trained AND _n_train >= 500 AND NOT scorer_off_dist`.
+* **Outcome capture** (`run_continuous_backtests.py::_compute_decision_outcomes`): every FILLED BUY/SELL across ALL runs in a cycle (winners + losers — survivorship bias avoidance), forward-window from `PriceCache` so no network, walk-back collision check (`sim_res == end_res` ⇒ drop) so a fabricated 0% outcome can't enter training. Additive captures: `gate_scorer_pred / gate_off_dist` (gate's then-deployed prediction), `persona / regime_label / wk52_pos / pct_from_52h / forward_return_10d / forward_return_20d` — read-only research signal, training is unchanged.
+
+### How to run backtests manually
+
+```bash
+# Live trader (live decisions, 60s cadence when market open)
+python3 -m paper_trader.runner
+
+# One-shot 10-run backtest launcher (BacktestEngine().run_all(10))
+python3 run_backtests.py
+
+# Continuous backtest loop (1 run/cycle currently — throttled for load,
+# random 1-10yr window each cycle, ~10min cooldown)
+python3 run_continuous_backtests.py
+
+# Inspect a single scorer prediction with per-feature attribution
+python3 -m paper_trader.ml.decision_scorer \
+  --explain --ticker NVDA --ml-score 4.0 --rsi 70 --macd 2.0 \
+  --mom5 5.0 --mom20 12.0 --regime-mult 1.0
+```
+
+### How to interpret backtest results (quant cheatsheet)
+
+* **Returns alone are not skill.** `total_return_pct` can be inflated by leveraged-ETF over-sizing in a bull regime. Read `vs_spy_pct` (alpha) instead — BUT run `benchmark_integrity` first to see how much of historical alpha is fake-benchmark (the documented 16.8% historical-contamination figure).
+* **`benchmark_unavailable` in the `notes` column** ⇒ that row's `spy_return_pct=0.0` is fabricated; treat `vs_spy_pct` as raw return only.
+* **OOS rank-IC is the headline metric, not `val_rmse`.** The in-engine `val_rmse` is computed on a random 80/20 split (information leakage when records span time). `oos_rmse` / `oos_dir_acc` / `oos_ic` in the scorer-skill-log row come from a TEMPORAL holdout — that's the trustworthy view.
+* **Three things must align to trust the gate:** (a) deployed `n_train >= 500` (`scorer_freshness`), (b) gate ordering economically correct (`gate_audit GATE_EFFECTIVE`), (c) prediction distribution reaches all arms (`gate_utilization BALANCED`). All three currently green on OOS; only (a) is below threshold on the deployed pickle.
+* **`baseline_compare` is decisive.** If MLP rank-IC doesn't beat the best one-line baseline (`rsi_meanrev`, `mom20`, etc.) by ≥0.05, the 17-feature model is net-negative complexity and the conviction gate is sizing variance with no real edge. Currently: MLP +0.225 vs best baseline +0.079 ⇒ MLP_ADDS_SKILL.
+
+### Test commands for the ML/backtest domain
+
+```bash
+# Focused ML/backtest tests (~10s; this is the dev-loop gate):
+cd /home/zeph/trading-intelligence/paper-trader && \
+  python3 -m pytest tests/test_decision_scorer.py \
+                    tests/test_decision_scorer_attribution.py \
+                    tests/test_backtest.py tests/test_continuous.py \
+                    tests/test_calibration.py tests/test_validation.py \
+                    tests/test_integration_backtest.py \
+                    tests/test_ml_backtest_coverage.py \
+                    tests/test_ml_backtest_review.py \
+                    tests/test_ml_backtest_seams.py \
+                    tests/test_ml_backtest_word_boundary.py \
+                    tests/test_scorer_freshness.py tests/test_scorer_honesty.py \
+                    tests/test_scorer_smoke_test.py tests/test_gate_audit.py \
+                    tests/test_gate_utilization.py \
+                    tests/test_benchmark_integrity.py -q
+
+# Just the new benchmark_integrity tests (~1s):
+python3 -m pytest tests/test_benchmark_integrity.py -q
+
+# Full read-only diagnostic suite against live state:
+python3 -m paper_trader.ml.benchmark_integrity    # SPY-benchmark integrity (NEW)
+python3 -m paper_trader.ml.gate_audit             # Economic gate-arm spread
+python3 -m paper_trader.ml.gate_utilization       # Distributional gate reachability
+python3 -m paper_trader.ml.baseline_compare       # MLP vs trivial-baseline rank-IC
+python3 -m paper_trader.ml.calibration            # Per-decile predicted-vs-realized
+python3 -m paper_trader.ml.deploy_audit           # Deployed pickle matches MLP_CONFIG?
+python3 -m paper_trader.ml.scorer_freshness       # Pickle age + skill-log heartbeat
+python3 -m paper_trader.ml.outcome_data_quality   # decision_outcomes.jsonl integrity
+python3 -m paper_trader.ml.overfit_gap            # val_rmse vs oos_rmse trend
+```
+
+### Invariants reaffirmed by this pass
+
+* **#10 single source of truth** — `benchmark_integrity` mirrors the in-engine guard's degenerate criterion verbatim (`spy_return_pct=0.0 AND window>=30d`); a future tightening of the guard requires a matching update here.
+* **#5 conviction gate** — gate fires only at `n_train >= 500`; new diagnostic is observational only, never gates or alters Opus.
+* **#2 / #12 advisory only** — read-only, no pickle/train/feature/trade-path touch; same discipline as every other `paper_trader/ml/*` diagnostic.
+* **Backtest articles never reach live signals (#1)** — diagnostic only reads `backtest_runs.*` columns, never reads `articles.db`; cannot accidentally cross the boundary.
