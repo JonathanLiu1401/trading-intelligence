@@ -10043,6 +10043,63 @@ def decision_paralysis_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/watchlist-coverage")
+@swr_cached("watchlist-coverage", 60.0)
+def watchlist_coverage_api():
+    """Per-ticker attention scan over the recent decision stream.
+
+    Surfaces watchlist tickers the bot has stopped attending to — every
+    other panel is position-centric (it shows what was traded) and never
+    names a ticker that was ignored. Distinct from
+    ``/api/ticker-decision-mix`` (per-ticker mix only for tickers that
+    *appear* in decisions), ``/api/watchlist-opportunities``
+    (forward-looking news heat), and ``/api/rising-unheld-themes``
+    (theme surface, not per-ticker attention). See
+    ``analytics/watchlist_coverage.py`` for the verdict ladder
+    (STAGNANT / CONCENTRATED / DIVERSIFIED / NO_DATA).
+
+    Pure builder over ``strategy.WATCHLIST`` +
+    ``store.recent_decisions``; observational only (AGENTS.md
+    invariants #2/#12)."""
+    try:
+        from .analytics.watchlist_coverage import build_watchlist_coverage
+        from .strategy import WATCHLIST
+        decisions = get_store().recent_decisions(limit=2000)
+        return jsonify(build_watchlist_coverage(WATCHLIST, decisions))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/realized-vs-unrealized")
+@swr_cached("realized-vs-unrealized", 30.0)
+def realized_vs_unrealized_api():
+    """Banked-vs-paper P&L split — the "is my gain locked in or
+    evaporable?" surface.
+
+    Every other equity / P&L endpoint answers a different question
+    (``/api/portfolio`` scalar, ``/api/drawdown`` peak-to-trough,
+    ``/api/equity-integrity`` sanity, ``/api/pnl-attribution`` β +
+    idiosyncratic, ``/api/trade-asymmetry`` closed-round-trip
+    aggregates). This one walks the trade ledger chronologically to
+    reproduce the running cost basis, attaches cumulative realized P&L
+    to every equity-curve point, and emits a verdict ladder
+    (DRAWING_DOWN / LEAKING_PAPER / PAPER_HEAVY / BANKED / BALANCED /
+    NO_DATA). See ``analytics/realized_vs_unrealized.py`` docstring for
+    threshold rationale.
+
+    Pure builder over ``store.recent_trades`` + ``store.equity_curve``;
+    observational only (AGENTS.md invariants #2/#12)."""
+    try:
+        from .analytics.realized_vs_unrealized import build_realized_vs_unrealized
+        store = get_store()
+        trades = list(reversed(store.recent_trades(limit=5000)))  # oldest→newest
+        curve = store.equity_curve(limit=2000)
+        return jsonify(build_realized_vs_unrealized(
+            trades, curve, starting_value=INITIAL_CASH))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/decision-forensics")
 def decision_forensics_api():
     """*Why* the live trader produces no decision — failure-mode taxonomy.
