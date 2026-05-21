@@ -1306,6 +1306,163 @@ class ArticleStore:
         }
 
     @_retry_on_lock
+    def urgency_label_split_by_ticker(
+        self, tickers: list[str], hours: int = 24
+    ) -> dict:
+        """Per-held-ticker breakdown of urgent rows by ``score_source`` —
+        the analyst-facing question: which of MY held names are getting
+        LLM-vetted urgent alerts vs only model-only ones?
+
+        Sibling to ``urgency_label_split`` (aggregate — the calibration
+        headline) and ``urgency_label_split_by_source`` (per-collector
+        slice — "which feeders to prune?"). Per-ticker is the third
+        natural slice for the analyst persona "I depend on these alerts
+        to react to events affecting MY positions". The aggregate metric
+        answers "is the alert path LLM-vetted?"; the per-source slice
+        answers "which feeders produce the unverified noise?"; this
+        answers "which of my OPEN POSITIONS are getting good vs bad
+        urgent vetting?". Live evidence (2026-05-21, 24h): NVDA had 89
+        urgent rows at 25% LLM-vetted (67 ML-only); AXTI had 10 urgent
+        rows at 60% LLM-vetted — the biggest held name has the worst
+        verification rate, a per-position answer no other metric
+        surfaces.
+
+        Mirrors ``ticker_mention_velocity``'s discipline: tickers are
+        passed in (single source of truth lives at the caller —
+        ``ml.features.LIVE_PORTFOLIO_TICKERS`` / ``daemon.PORTFOLIO_TICKERS``),
+        avoiding the storage→ml import cycle and keeping the held-book
+        definition outside the storage layer. Matching is whole-word and
+        ALL-CAPS so a substring like ``NVDAQ`` cannot leak a hit for
+        ``NVDA``. A leading ``$`` is allowed (``$NVDA`` matches ``NVDA``).
+        Tickers shorter than 2 chars are skipped (no signal, would
+        over-match). Match surface is ``title + summary`` — same surface
+        as ``_book_tickers`` in alert_agent.py so the alert path and this
+        metric never disagree about whether a row touches a held name.
+
+        Returns one row per requested ticker that contributed at least
+        one urgent article in the window (a ticker with zero urgent
+        mentions is omitted — the analyst wants signal, not zero-rows
+        for the entire book):
+
+          * ``ticker``         — preserved verbatim from the input
+          * ``total``          — urgent rows mentioning this ticker
+          * ``llm``            — tagged ``score_source='llm'``
+          * ``ml``             — tagged ``score_source='ml'``
+          * ``briefing_boost`` — tagged ``score_source='briefing_boost'``
+          * ``null``           — legacy / pre-migration rows with no tag
+          * ``llm_fraction``   — ``(llm + briefing_boost) / total``
+
+        Rows are sorted most-ml-only-first (``ml`` desc) so the worst-
+        vetted held name surfaces at the top; ALPHABETICAL by ticker for
+        ties (matches ``urgency_label_split_by_source``'s deterministic
+        tiebreak). ``total_urgent`` and ``total_tickers`` come from rows
+        actually returned (matched ≥1 ticker), so a UI can render
+        "showing N of M held names".
+
+        Read-only (single SELECT) with ``_LIVE_ONLY_CLAUSE`` so the
+        synthetic backtest/opus rows never inflate the per-ticker figure
+        (the partial-filter regression class ``analytics/trend_velocity.py``
+        violates is what this discipline exists to prevent). NO DB write,
+        no ai_score/ml_score/score_source/urgency mutation. All four
+        load-bearing invariants intact by construction.
+        """
+        if not tickers:
+            return {
+                "window_h": int(hours),
+                "by_ticker": [],
+                "total_urgent": 0,
+                "total_tickers": 0,
+            }
+
+        clean: list[str] = []
+        for raw in tickers:
+            if not raw:
+                continue
+            t = str(raw).strip().upper()
+            if len(t) < 2:
+                continue
+            if t not in clean:
+                clean.append(t)
+        if not clean:
+            return {
+                "window_h": int(hours),
+                "by_ticker": [],
+                "total_urgent": 0,
+                "total_tickers": 0,
+            }
+
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        # Mirror urgency_label_split's WHERE: urgency>=1 (queued OR alerted)
+        # so both the actually-pushed (urgency=2) AND the suppressed-but-
+        # marked-alerted formatter rows count — same surface the aggregate
+        # metric describes. Summary is decompressed so the match surface
+        # matches alert_agent._book_tickers exactly (title + summary).
+        rows = self.conn.execute(
+            "SELECT title, full_text, score_source FROM articles "
+            f"WHERE urgency>=1 AND first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+            (since,),
+        ).fetchall()
+
+        # Whole-word, ALL-CAPS, optional leading $. Compiled once per ticker
+        # outside the row loop so the row-scan stays O(rows * tickers).
+        patterns = {
+            t: re.compile(rf"\b\${{0,1}}{re.escape(t)}\b")
+            for t in clean
+        }
+        per_ticker: dict[str, dict[str, int]] = {}
+        for title, blob, src_tag in rows:
+            title = title or ""
+            try:
+                summary = decompress(blob) if blob else ""
+            except Exception:
+                summary = ""
+            hay = f"{title} {summary}"
+            key = (src_tag if src_tag in ("llm", "ml", "briefing_boost")
+                   else "null")
+            for t, pat in patterns.items():
+                if not pat.search(hay):
+                    continue
+                bucket = per_ticker.setdefault(
+                    t,
+                    {"llm": 0, "ml": 0, "briefing_boost": 0, "null": 0},
+                )
+                bucket[key] += 1
+
+        materialised: list[dict] = []
+        for t in clean:
+            b = per_ticker.get(t)
+            if not b:
+                continue  # held name with zero urgent mentions — omit
+            total = b["llm"] + b["ml"] + b["briefing_boost"] + b["null"]
+            if total == 0:
+                continue  # defensive — shouldn't happen, dropped row by row
+            vetted = b["llm"] + b["briefing_boost"]
+            materialised.append({
+                "ticker": t,
+                "total": total,
+                "llm": b["llm"],
+                "ml": b["ml"],
+                "briefing_boost": b["briefing_boost"],
+                "null": b["null"],
+                "llm_fraction": round(vetted / total, 4),
+            })
+
+        # Worst-vetted held name first: most-ml-only-first, alphabetical
+        # tiebreak. Same deterministic discipline as
+        # urgency_label_split_by_source so the dashboard ordering is
+        # stable cycle-to-cycle.
+        materialised.sort(key=lambda r: (-r["ml"], r["ticker"]))
+
+        return {
+            "window_h": int(hours),
+            "by_ticker": materialised,
+            "total_urgent": sum(r["total"] for r in materialised),
+            "total_tickers": len(materialised),
+        }
+
+    @_retry_on_lock
     def source_freshness(self) -> list[dict]:
         """Per-source liveness view: for every live source, its live-row count
         and how long ago its most recent article landed.
