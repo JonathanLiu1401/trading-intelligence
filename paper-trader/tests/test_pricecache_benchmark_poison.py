@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -164,3 +165,104 @@ class TestPoisonedDownloadNotPersisted:
         assert cache_file.exists(), "a healthy download must still be cached"
         saved = json.loads(cache_file.read_text())
         assert saved.get("SPY") and saved.get("NVDA")
+
+
+class TestPriceCacheAtomicWrite:
+    """Atomic-write guard for the per-window price cache.
+
+    Without atomicity, a process kill (OOM/SIGKILL) mid-write leaves a
+    truncated/torn JSON file at the destination path. The next cache load
+    fails `json.loads`, falls through to the download path, and silently
+    re-pays the (hundreds of MB, dozens of tickers) yfinance refetch on
+    every subsequent run for this window. This pins the same tmp+replace
+    discipline already enforced for scorer.pkl, the volume cache, the
+    outcomes-file trim, and validation_results.json.
+    """
+
+    def test_destination_unchanged_when_write_fails_midstream(self, monkeypatch):
+        cache_file = bt.CACHE_DIR / f"prices_{START.isoformat()}_{END.isoformat()}.json"
+
+        # Pre-seed a HEALTHY cache file. If the in-progress write were not
+        # atomic, the partial-write would clobber this and the next load
+        # would see torn JSON and silently retry the download.
+        sentinel = {
+            "_meta": {"start": START.isoformat(), "end": END.isoformat(),
+                      "tickers": ["SPY", "NVDA"],
+                      "saved_at": "2026-05-21T00:00:00+00:00"},
+            "SPY": {(START + timedelta(days=i)).isoformat(): 200.0 + i
+                    for i in range(120)},
+            "NVDA": {(START + timedelta(days=i)).isoformat(): 300.0 + i
+                     for i in range(120)},
+        }
+        cache_file.write_text(json.dumps(sentinel))
+        sentinel_bytes = cache_file.read_bytes()
+
+        # Force the next cache load to BYPASS the on-disk file (so we hit the
+        # download → write code path) by mutating the cached _meta tickers so
+        # the meta-match check fails. The download path will then try to
+        # write a fresh cache file.
+        bad = json.loads(cache_file.read_text())
+        bad["_meta"]["tickers"] = ["DIFFERENT"]
+        cache_file.write_text(json.dumps(bad))
+
+        _install_fake_yf(monkeypatch)
+
+        # Crash the write_text call (simulating SIGKILL mid-write or a disk
+        # full). With atomic write the destination file is updated via tmp
+        # + replace; a failure before .replace leaves the destination's prior
+        # contents intact (in this case, the meta-modified cache file).
+        original_write = Path.write_text
+
+        def _explode(self, content, *a, **kw):
+            if self.name.endswith(".json.tmp"):
+                raise OSError("simulated SIGKILL mid-write")
+            return original_write(self, content, *a, **kw)
+
+        monkeypatch.setattr(Path, "write_text", _explode)
+
+        with pytest.raises(OSError):
+            PriceCache(["SPY", "NVDA"], START, END)
+
+        # The destination file must still be readable JSON — never a torn
+        # half-write that a future load can't parse. The contents will be
+        # the pre-crash meta-modified file (still valid JSON), not a
+        # truncated payload.
+        post_crash = cache_file.read_bytes()
+        json.loads(post_crash)  # would raise on torn JSON
+
+    def test_tmp_file_replace_used_in_normal_write(self, monkeypatch):
+        """Direct-pattern test: observe that the write goes through a
+        `.json.tmp` file then `.replace`s into place, mirroring the
+        discipline used by every other on-disk cache writer in this module.
+        """
+        cache_file = bt.CACHE_DIR / f"prices_{START.isoformat()}_{END.isoformat()}.json"
+        _install_fake_yf(monkeypatch)
+
+        # Spy on Path.replace to confirm the atomic-rename step actually
+        # fires from a `.json.tmp` source onto the destination cache path.
+        replaces: list[tuple[str, str]] = []
+        original_replace = Path.replace
+
+        def _spy_replace(self, target):
+            replaces.append((str(self), str(target)))
+            return original_replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", _spy_replace)
+
+        cache = PriceCache(["SPY", "NVDA"], START, END)
+        assert cache.prices.get("SPY")
+        assert cache_file.exists()
+
+        # Find the replace that targets the price cache; it must come from
+        # a sibling `.json.tmp` file (not a direct write to the canonical path).
+        cache_target_replaces = [
+            (src, tgt) for src, tgt in replaces if tgt == str(cache_file)
+        ]
+        assert cache_target_replaces, (
+            f"PriceCache must atomically rename a .tmp file into {cache_file}; "
+            f"observed replaces: {replaces}"
+        )
+        src, _ = cache_target_replaces[-1]
+        assert src.endswith(".json.tmp"), (
+            f"PriceCache atomic-rename source must be a .json.tmp file; got {src}"
+        )

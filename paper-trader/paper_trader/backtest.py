@@ -706,7 +706,23 @@ class PriceCache:
         }}
         payload.update(self.prices)
         out_path = self.cache_path
-        out_path.write_text(json.dumps(payload))
+        # Atomic write — `path.write_text` is NOT atomic: a process kill (OOM
+        # / SIGKILL) mid-write leaves a truncated/torn JSON file. The next
+        # cache load then fails `json.loads`, falls through to the download
+        # path, and silently re-pays the (hundreds of MB, dozens of tickers)
+        # yfinance refetch on every subsequent run for this window. Worse,
+        # the legacy-cache fallback path (`prices.json`) would *also* be
+        # consulted on torn-file failure and could accept a stale cross-
+        # window payload (the `_meta` mismatch is the only guard there).
+        # Mirrors the atomic-write idiom already used by `train_scorer`
+        # (scorer.pkl.tmp), the outcomes-file trim, `_persist_volume_cache_for_window`,
+        # and the validation persister — all of which document the same
+        # class of "process kill mid-write would corrupt the artifact"
+        # failure. The CACHE_DIR is the same filesystem as the destination
+        # so `Path.replace` is genuinely atomic.
+        tmp = out_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(out_path)
         print(f"[price_cache] saved → {out_path} "
               f"({len(self.trading_days)} trading days)")
 
