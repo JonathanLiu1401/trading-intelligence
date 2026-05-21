@@ -257,6 +257,70 @@ def related_prior_alert(
     return best
 
 
+# ── Per-held-ticker BREAKING burst awareness ────────────────────────────────
+# When the wire concentrates on a single held name, the analyst gets a rapid
+# series of BREAKING alerts. The existing gates already collapse exact-sig
+# duplicates / paraphrases / wire syndication — but a series of DISTINCT
+# headlines about the same NVDA earnings event (revenue beat, then guidance,
+# then buyback announcement, then segment breakdown) are NOT duplicates and
+# correctly fire as separate alerts. Each currently presents as a fresh break,
+# though, so the 4th distinct NVDA earnings push reads identically to the 1st.
+#
+# This pure helper counts how many recent alerts (within ``ALERT_RECENCY_TTL_HOURS``)
+# mentioned each ticker in ``tickers`` — used by ``alert_agent._fmt`` to
+# annotate the prompt with a per-ticker burst hint so the LLM can frame the
+# alert as a *continuation* of an active wire rather than another fresh break.
+# NON-suppressing by contract: the caller only adds a prompt line. Pure — no
+# DB / IO — so the input is the same ``recent`` list ``recent_alerts`` returns
+# (which is itself the canonical best-effort read of ``alert_recency.db``).
+#
+# Match is on title-substring lookup with ``\bTICKER\b`` (word boundaries) so
+# "AMD" never matches inside "DAMD" but does match in "$AMD" or "AMD reports".
+# Stored ``title`` is truncated to 200 chars in ``record_alerted`` — long
+# enough that the ticker appears in nearly every real headline (the analyst's
+# noise complaint is exactly that the SAME ticker keeps appearing).
+import re as _re
+
+
+def ticker_burst_counts(
+    recent: list[dict],
+    tickers: list[str] | set[str] | tuple[str, ...],
+) -> dict[str, int]:
+    """Pure: for each ticker in ``tickers``, count how many recent alerts'
+    titles mentioned it. Returns ``{ticker: count}`` for tickers with count >= 1.
+
+    A ticker missing from the result has zero recent mentions. Match is
+    case-insensitive word-boundary on each alert's stored ``title``; this
+    matches the convention used by ``ml.features._LIVE_RE`` (held-ticker
+    detection) so the alert path and the model see the same ticker mentions.
+    Pure — no DB / IO — so callers control the recency window via
+    ``recent_alerts(ttl_hours=...)``."""
+    if not tickers or not recent:
+        return {}
+    # Sanitize ticker list (uppercase, strip duplicates).
+    norm = sorted({t.upper() for t in tickers if t and isinstance(t, str)})
+    if not norm:
+        return {}
+    # One compiled regex per ticker so we walk the titles once each.
+    # Build a single alternation: \b(?:TICK1|TICK2|...)\b. The findall result
+    # is the set of tickers found in each title (case-folded back).
+    pattern = _re.compile(
+        r"\b(?:" + "|".join(_re.escape(t) for t in norm) + r")\b",
+        _re.IGNORECASE,
+    )
+    counts: dict[str, int] = {}
+    for r in recent:
+        title = r.get("title") or ""
+        if not title:
+            continue
+        # Deduplicate per-alert hits so a single alert mentioning NVDA twice
+        # counts once (the noise being measured is # of distinct alerts).
+        hits = {m.upper() for m in pattern.findall(title)}
+        for h in hits:
+            counts[h] = counts.get(h, 0) + 1
+    return counts
+
+
 def partition_already_alerted(
     articles: list[dict], recent_sigs: set[str]
 ) -> tuple[list[dict], list[dict]]:

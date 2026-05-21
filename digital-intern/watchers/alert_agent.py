@@ -60,6 +60,8 @@ BOOK: If an article carries a `book:` line, it names live portfolio/watchlist po
 
 BOOK VELOCITY: If a `book_velocity:` line ALSO appears on a `book:` alert, it names how many other distinct articles mentioned the same held ticker in the last 60 minutes — the wire is materially CONCENTRATING on that name (momentum / cluster of related developments), so the IMPACT magnitude should reflect that: prefer BUY/SELL over WATCH and state magnitude with more confidence than for a lone event. A `book:` line WITHOUT a `book_velocity:` line means this is the only recent mention — frame it as an isolated headline (use WATCH unless the body itself is unambiguous). Absence of `book_velocity:` is silent (never reproduced as a section).
 
+BURST WIRE: If a `burst:` line appears, the analyst has already received N other 🚨 BREAKING alerts mentioning the named held ticker(s) in the last few hours — different headlines / different facets, but the SAME wire-concentrated event series (e.g. earnings night: revenue beat → guidance → buyback → segment colour). The analyst has seen N prior pushes for this name; this is the (N+1)th. Frame THIS alert explicitly as the next development in an active wire, NOT a fresh break: lead the HEADLINE with a development verb (DETAILS / ADDS / NOW / FOLLOWS / EXTENDS), and in CONTEXT make the burst explicit (e.g. "Nth NVDA wire today — adds to prior beats/guidance/buyback alerts"). PORTFOLIO must still name the held ticker. Do NOT under-state magnitude (the wire is genuinely active) — but DO honestly tell the analyst this is part of an ongoing series so they don't read it as a separate event needing a separate trade.
+
 Urgent articles detected:
 {articles_text}
 
@@ -67,6 +69,16 @@ Output ONLY the alert message."""
 
 
 ALERT_BATCH_SIZE = 5
+
+# Minimum number of recent (within ``alert_recency.ALERT_RECENCY_TTL_HOURS``)
+# BREAKING alerts mentioning a held ticker before the alert prompt is annotated
+# with a ``burst:`` line. The analyst's noise complaint is the (N+1)th alert
+# about an active wire (e.g. NVDA earnings night) reading identically to the
+# 1st; below the threshold the wire is a normal lone or low-velocity event
+# and no annotation is added. Conservative — three prior PUSHES (not three
+# articles in the DB) means the analyst has already SEEN three Discord pushes
+# for this name, well above any false-positive bar.
+BURST_MIN_PRIOR_ALERTS = 3
 
 # Minimum source credibility for a LONE (un-syndicated) article to fire a
 # standalone urgent Bloomberg "🚨 BREAKING" alert. Below this is the
@@ -951,6 +963,31 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
             )
             velocity_map = {}
 
+    # Per-held-ticker BREAKING-alert burst counts. ``velocity_map`` above counts
+    # COLLECTED article mentions (every wire copy in articles.db); the analyst
+    # cares about how many BREAKING pushes they've already received for the
+    # same name — a different and more important signal. Pure read of
+    # ``alert_recency.db`` (same source ``_related_prior`` and paraphrase
+    # suppression already use, so adding this carries the same import-safety
+    # profile and never touches articles.db / the four load-bearing
+    # invariants). Best-effort: a recency-DB failure yields {} → no annotation
+    # → exact pre-feature behaviour (a genuine alert must still fire). The
+    # threshold (>= ``BURST_MIN_PRIOR_ALERTS``) is conservative — a single
+    # prior is silently a lone event, two is borderline, three or more is the
+    # wire-concentration pattern the BURST WIRE prompt rule frames. Pinned by
+    # ``tests/test_alert_ticker_burst.py``.
+    burst_counts: dict[str, int] = {}
+    if all_book_tickers:
+        try:
+            burst_counts = alert_recency.ticker_burst_counts(
+                _recent or [], all_book_tickers
+            )
+        except Exception:
+            _log.exception(
+                "[alert] ticker_burst_counts failed — degrading"
+            )
+            burst_counts = {}
+
     def _fmt(a: dict) -> str | None:
         # Defensive field access. The rest of this pipeline (_is_synthetic,
         # dedupe_urgent) reads every key through .get(); _fmt used to be the
@@ -1045,6 +1082,29 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
                     f"\nbook_velocity: {'; '.join(velocity_notes)} — "
                     f"weight IMPACT magnitude accordingly (wire is "
                     f"concentrating on these held names)"
+                )
+            # Cross-cycle BREAKING-alert burst hint. Drives the prompt's
+            # BURST WIRE rule. Only the held tickers on THIS row that have
+            # already triggered >= BURST_MIN_PRIOR_ALERTS standalone pushes
+            # appear here; rows below the bar emit no burst line (silent —
+            # the BOOK / BOOK VELOCITY framing stays unchanged for a normal
+            # lone or low-velocity event). Pure read of the pre-computed
+            # burst_counts map (alert_recency.db); the row itself is never
+            # mutated and articles.db / the four invariants are untouched.
+            burst_notes: list[str] = []
+            for t in book:
+                c = burst_counts.get(t, 0)
+                if c >= BURST_MIN_PRIOR_ALERTS:
+                    burst_notes.append(
+                        f"{t}: {c} prior BREAKING alerts in last "
+                        f"{int(round(alert_recency.ALERT_RECENCY_TTL_HOURS))}h"
+                    )
+            if burst_notes:
+                block += (
+                    f"\nburst: {'; '.join(burst_notes)} — analyst has "
+                    f"already been pushed these; frame THIS as the next "
+                    f"development in an active wire (DETAILS/ADDS/NOW/"
+                    f"FOLLOWS/EXTENDS), not a fresh break"
                 )
         rel = a.get("_related_prior")
         if isinstance(rel, dict) and (rel.get("title") or "").strip():
