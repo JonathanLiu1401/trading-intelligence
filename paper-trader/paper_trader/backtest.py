@@ -1438,7 +1438,14 @@ _WORD_TO_TICKER: dict[str, str] = {
     # Tech / semis — map bullish tech headlines straight to leveraged ETFs
     "nvidia": "NVDA", "amd": "AMD", "apple": "AAPL", "microsoft": "MSFT",
     "amazon": "AMZN", "google": "GOOGL", "alphabet": "GOOGL", "meta": "META",
-    "tesla": "TSLA", "intel": "INTC", "micron": "MU", "broadcom": "AVGO",
+    "tesla": "TSLA", "intel": "INTC", "micron": "MU",
+    # `broadcom` previously mapped to AVGO, which is NOT in WATCHLIST — so the
+    # entry was dead (filtered out by the `if tk not in WATCHLIST: continue`
+    # guard in `_ml_decide`). Redirect to SOXL, the 3x semis ETF that IS in
+    # WATCHLIST, so Broadcom-headline sentiment actually contributes to the
+    # semis tracker the same way other semi keywords ("semiconductor", "chip")
+    # do. Avoids silently dropping a major semi name's news.
+    "broadcom": "SOXL",
     "qualcomm": "QCOM", "spy": "SPY", "qqq": "QQQ",
     "semiconductor": "SOXL", "chip": "SOXL", "chips": "SOXL",
     "nasdaq": "TQQQ",          # nasdaq headline → 3x Nasdaq
