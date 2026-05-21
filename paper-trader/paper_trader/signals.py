@@ -380,12 +380,36 @@ def _alias_match(text: str | None, ticker: str) -> bool:
 def _extract_tickers(text: str) -> set[str]:
     """Heuristic ticker extraction — pulls $TICKER or ALLCAPS 1-5 char tokens,
     filters noise, and additionally tags tickers when their company-name alias
-    appears as a standalone word (e.g. ``"Nvidia surges"`` → ``{"NVDA"}``)."""
+    appears as a standalone word (e.g. ``"Nvidia surges"`` → ``{"NVDA"}``).
+
+    Asymmetry of the noise filters on the cashtag path:
+      * ``_NOT_TICKERS`` (common English / time-date / org acronyms) is
+        deliberately NOT applied to ``$cashtag`` matches: an explicit cashtag
+        is an intentional ticker reference even when the symbol happens to be
+        a real-but-noisy token (``$AI`` is Sportradar; ``$T`` is AT&T). This
+        asymmetry is pinned by ``test_cashtag_overrides_*_filter``.
+      * ``_ALIAS_UPPER_FALSE_POSITIVES`` (an alias's uppercase form that is
+        NOT the canonical ticker — e.g. ``APPLE`` upper-cases to a token that
+        is not a real symbol; the alias path already maps the body to
+        ``AAPL``) IS applied to both paths: ``$APPLE`` previously produced
+        both ``APPLE`` (a non-existent ticker) and ``AAPL``, polluting the
+        ``tickers`` field that feeds Opus's decision prompt with a fake name
+        alongside the real one. There is no use case where ``APPLE`` /
+        ``TESLA`` / ``INTEL`` as a cashtag was the trader's intent (the real
+        symbol is the alias), so filtering them is non-controversial.
+
+    The bare-loop's additional ``len < 2`` guard is NOT applied to the
+    cashtag path: a 1-char cashtag (``$F``, ``$T``, ``$C``) is an intentional
+    ticker reference, not pollution."""
     out: set[str] = set()
     if not text:
         return out
     for m in re.finditer(r"\$([A-Z]{1,5})\b", text):
-        out.add(m.group(1))
+        tok = m.group(1)
+        # _ALIAS_UPPER_FALSE_POSITIVES only — _NOT_TICKERS bypass stays.
+        if tok in _ALIAS_UPPER_FALSE_POSITIVES:
+            continue
+        out.add(tok)
     for m in _TICKER_RE.finditer(text):
         tok = m.group(1)
         if (tok in _NOT_TICKERS

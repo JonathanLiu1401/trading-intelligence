@@ -326,6 +326,46 @@ class TestTickerAliasExtraction:
         assert "ASML" in signals._extract_tickers("ASML beats Q3 expectations")
         assert "ASML" in signals._extract_tickers("ASML guidance raised")
 
+    def test_cashtag_alias_upper_does_not_pollute_with_fake_ticker(self):
+        # The shouted-company-name fix originally ran on the bare-ALLCAPS
+        # extractor only — a ``$cashtag`` form bypassed the filter and silently
+        # re-introduced the same bug: ``$APPLE`` produced both ``APPLE`` (a
+        # non-existent ticker; the alias path already maps the body to AAPL)
+        # AND ``AAPL``. The fix narrows the cashtag bypass to ``_NOT_TICKERS``
+        # ONLY (preserving the documented ``$AI``/``$TOLD``/``$CUT`` override);
+        # ``_ALIAS_UPPER_FALSE_POSITIVES`` is filtered on both paths because
+        # there is no legitimate use case for a ``$APPLE``/``$TESLA``/``$INTEL``
+        # cashtag (the real symbol is the alias). Pin so a future refactor
+        # cannot silently re-introduce the pollution.
+        out = signals._extract_tickers("watching $APPLE into earnings")
+        assert "AAPL" in out
+        assert "APPLE" not in out, (
+            f"$APPLE cashtag must not produce the fake APPLE ticker; "
+            f"got {sorted(out)!r}"
+        )
+
+        out = signals._extract_tickers("rumor $TESLA breakout")
+        assert "TSLA" in out
+        assert "TESLA" not in out
+
+        out = signals._extract_tickers("$INTEL guidance recap")
+        assert "INTC" in out
+        assert "INTEL" not in out
+
+        out = signals._extract_tickers("$TSMC update")
+        assert "TSM" in out
+        assert "TSMC" not in out
+
+    def test_cashtag_not_tickers_override_still_pinned_after_alias_filter(self):
+        # The narrow scope of the cashtag-alias filter: it must NOT also
+        # filter ``_NOT_TICKERS`` from cashtags. ``$AI`` (Sportradar), ``$TOLD``
+        # and ``$CUT`` remain the documented cashtag-override asymmetry.
+        # Regression guard for the prior, over-broad fix that filtered both
+        # sets on cashtags.
+        assert "AI" in signals._extract_tickers("watching $AI into the print")
+        assert "TOLD" in signals._extract_tickers("$TOLD reports earnings")
+        assert "CUT" in signals._extract_tickers("$CUT pops on guide")
+
     def test_alias_false_positive_set_only_contains_distinct_aliases(self):
         # Lock the membership of _ALIAS_UPPER_FALSE_POSITIVES so a future
         # alias addition with a same-as-ticker entry (length 2-5) doesn't
