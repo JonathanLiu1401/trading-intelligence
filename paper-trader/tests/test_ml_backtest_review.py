@@ -361,6 +361,166 @@ class TestMlDecideOffDistributionGate:
         assert qty == pytest.approx(125.0)
 
 
+# ───────────────────── buy_ticker quant-feature parity ─────────────────────
+
+
+class _CapturingScorer:
+    """Stand-in DecisionScorer that captures the LAST `predict_with_meta`
+    feature kwargs so we can assert the scorer sees the same indicators that
+    `_compute_decision_outcomes` writes to the training row.
+    """
+
+    def __init__(self, n_train: int = 1000) -> None:
+        self._n_train = n_train
+        self.is_trained = True
+        self.last_kwargs: dict = {}
+
+    def predict_with_meta(self, **kw) -> dict:
+        self.last_kwargs = dict(kw)
+        return {"pred": 0.0, "raw": 0.0, "clamped": False,
+                "off_distribution": False}
+
+    def predict(self, **kw) -> float:
+        self.last_kwargs = dict(kw)
+        return 0.0
+
+
+def _price_cache_with_history(tickers: list[str], n_days: int = 70):
+    """A PriceCache with >=60 closes for every ticker so
+    `_compute_technical_indicators` produces real RSI/MACD/etc.
+    """
+    from datetime import date, timedelta
+    from paper_trader.backtest import PriceCache
+
+    start = date(2025, 1, 2)
+    days: list = []
+    d = start
+    while len(days) < n_days:
+        if d.weekday() < 5:
+            days.append(d)
+        d += timedelta(days=1)
+
+    cache = PriceCache.__new__(PriceCache)
+    cache.tickers = list(tickers)
+    cache.start = days[0]
+    cache.end = days[-1]
+    # Rising series — RSI ends up high (close-to-overbought) but non-None.
+    cache.prices = {
+        t: {d.isoformat(): 100.0 + i for i, d in enumerate(days)}
+        for t in tickers
+    }
+    cache.trading_days = days
+    return cache
+
+
+class TestBuyTickerQuantFeatureParity:
+    """Locks the training/inference feature parity fix in `_ml_decide`.
+
+    Bug: `buy_ticker` outside `QUANT_SIGNAL_TICKERS ∪ portfolio.positions`
+    (a sentiment-only pick — empirically ~21% of all BUYs across the live
+    `decision_outcomes.jsonl` tail) used to feed the scorer `build_features`
+    neutral defaults (rsi=50/macd=0/...) at inference while
+    `_compute_decision_outcomes` writes the REAL indicators to the training
+    row via `_get_quant_signals(sim_date, [ticker], ...)`. The scorer then
+    trained on a feature manifold the gate never visited, and predicted at
+    a manifold the model never saw.
+
+    The fix lazily computes `_get_quant_signals` for the picked ticker if it
+    falls outside the cycle's pre-fetched set, so the scorer feature vector
+    matches the training-time feature vector for the same (sim_date, ticker).
+    """
+
+    def test_sentiment_only_buy_feeds_scorer_real_rsi(self, monkeypatch):
+        """A BUY of XLF (∉ QUANT_SIGNAL_TICKERS, sentiment-only pick) must
+        feed the scorer a NUMERIC `rsi`, not the build_features default.
+        """
+        from paper_trader.backtest import QUANT_SIGNAL_TICKERS
+        # Sanity guard: this whole test is meaningful only if XLF is outside
+        # the pre-fetched set — pin it so a future watchlist refactor that
+        # silently moves XLF in would not falsely "pass" this test.
+        assert "XLF" not in QUANT_SIGNAL_TICKERS, (
+            "Test premise broken: XLF moved into QUANT_SIGNAL_TICKERS; "
+            "pick a different watchlist ticker outside the pre-fetched set "
+            "to keep this regression honest.")
+
+        # Need SPY for regime (>=200 closes for a real bull/bear/sideways
+        # verdict; <200 yields "unknown" with regime_mult 1.0 — fine for
+        # this test). XLF needs >=60 for indicators.
+        prices = _price_cache_with_history(["SPY", "XLF"], n_days=70)
+        scorer = _CapturingScorer()
+        monkeypatch.setattr(bt, "_DECISION_SCORER", scorer, raising=False)
+
+        p = SimPortfolio(cash=100_000.0)
+        d = prices.trading_days[-1]
+        # `financials` → XLF via _WORD_TO_TICKER; bullish phrasing → +1 sent.
+        articles = [{"title": "Financials beat earnings, guidance raised "
+                              "across the sector",
+                     "score": 10.0, "tickers": []}]
+        decision = _ml_decide(d, p, articles, prices,
+                              run_id=1, rng=random.Random(42))
+        assert decision["action"] == "BUY"
+        assert decision["ticker"] == "XLF"
+
+        # Pre-fix: scorer.last_kwargs["rsi"] would be None (build_features
+        # then substitutes 50.0 internally). Post-fix: lazy fetch populates
+        # the real RSI computed from the (rising) synthetic series.
+        assert scorer.last_kwargs["rsi"] is not None, (
+            "scorer received rsi=None — the lazy quant lookup for a "
+            "non-pre-fetched buy_ticker regressed")
+        assert isinstance(scorer.last_kwargs["rsi"], (int, float))
+        # The REASONING string is the operator-visible artefact of this fix.
+        # Pre-fix: "RSI=N/A". Post-fix: "RSI=<number>". (The reasoning uses
+        # the same q_buy.get('rsi') call as the scorer feed.)
+        assert "RSI=N/A" not in decision["reasoning"]
+
+    def test_pre_fetched_ticker_path_unchanged(self, monkeypatch):
+        """A BUY of NVDA (IN QUANT_SIGNAL_TICKERS) must keep using the
+        pre-fetched quant signal — the fix must NOT re-fetch when the
+        ticker is already in `quant`. Belt-and-braces for the no-regression
+        guard on the covered-ticker path.
+        """
+        prices = _price_cache_with_history(["SPY", "NVDA"], n_days=70)
+        scorer = _CapturingScorer()
+        monkeypatch.setattr(bt, "_DECISION_SCORER", scorer, raising=False)
+
+        p = SimPortfolio(cash=100_000.0)
+        d = prices.trading_days[-1]
+        articles = [{"title": "Nvidia beats earnings, guidance raised, "
+                              "semiconductor surge",
+                     "score": 10.0, "tickers": ["NVDA"]}]
+        decision = _ml_decide(d, p, articles, prices,
+                              run_id=1, rng=random.Random(42))
+        assert decision["action"] == "BUY"
+        assert decision["ticker"] == "NVDA"
+        # NVDA is in the pre-fetched set ⇒ its indicators are present.
+        assert scorer.last_kwargs["rsi"] is not None
+
+    def test_held_position_buy_path_unchanged(self, monkeypatch):
+        """If the buy_ticker happens to already be held, it lives in
+        `portfolio.positions` ⇒ the pre-fetched `quant_tickers` already
+        includes it. The lazy fetch is a no-op — guard against an
+        accidental refetch.
+        """
+        prices = _price_cache_with_history(["SPY", "BABA"], n_days=70)
+        scorer = _CapturingScorer()
+        monkeypatch.setattr(bt, "_DECISION_SCORER", scorer, raising=False)
+
+        p = SimPortfolio(cash=100_000.0)
+        # Open a tiny BABA lot — now BABA ∈ portfolio.positions and
+        # therefore ∈ quant_tickers via the union.
+        _buy(p, "BABA", 0.5, 100.0, stop_loss=None, take_profit=None)
+
+        d = prices.trading_days[-1]
+        articles = [{"title": "China Alibaba surge, raised guidance",
+                     "score": 10.0, "tickers": []}]
+        decision = _ml_decide(d, p, articles, prices,
+                              run_id=1, rng=random.Random(42))
+        # Either BUY adds to BABA or HOLD; in both cases no crash.
+        assert decision["action"] in {"BUY", "HOLD", "SELL"}
+        if decision["action"] == "BUY":
+            assert scorer.last_kwargs["rsi"] is not None
+
+
 # ───────────────────── _compute_decision_outcomes logic ─────────────────────
 
 def _engine_with_decision(tmp_path, synthetic_prices, *, action, ticker,

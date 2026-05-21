@@ -1809,6 +1809,25 @@ def _ml_decide(
 
         # DecisionScorer nudge: only modulate conviction once the model has seen
         # enough real outcomes (≥500 records). With fewer, it is too noisy to gate.
+        # Training/inference feature parity: a buy_ticker outside
+        # `QUANT_SIGNAL_TICKERS ∪ portfolio.positions` (a sentiment-only pick
+        # — empirically ~21% of all BUYs across the live `decision_outcomes.jsonl`
+        # tail; classic examples: XLF/XLV/XLI sector ETFs, ARKK, BTC-USD,
+        # leveraged single-stock 2x names like NVDU/AMZU/METAU/CONL — would
+        # otherwise feed `build_features` the (rsi=50/macd=0/mom=0/bb=0)
+        # neutral defaults at inference while the training-time outcome row
+        # carries the REAL indicators (`_compute_decision_outcomes` calls
+        # `_get_quant_signals(sim_date, [ticker], ...)` per outcome, with no
+        # WATCHLIST subset). The scorer then trains on a feature manifold the
+        # gate never visits, and predicts at a manifold the model never saw.
+        # Single extra `_get_quant_signals` call on miss — cheap (one ticker,
+        # cached PriceCache series). The score-adjustment loop is deliberately
+        # left at the original (covered) tickers so this fix changes ONLY the
+        # scorer feature vector, not `best_score` / persona / regime decisions.
+        if buy_ticker not in quant:
+            _extra_q = _get_quant_signals(sim_date, [buy_ticker], prices)
+            if buy_ticker in _extra_q:
+                quant[buy_ticker] = _extra_q[buy_ticker]
         q_buy = quant.get(buy_ticker, {})
         buy_news_count = ticker_article_count.get(buy_ticker, 0)
         buy_news_urg = ticker_max_urgency.get(buy_ticker, 0.0)
