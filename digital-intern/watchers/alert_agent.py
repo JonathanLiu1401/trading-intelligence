@@ -522,7 +522,7 @@ _RT_WHY_JUST_MOVED = re.compile(
     r"(?:just|now|today|finally|suddenly|then|recently|already)\s+"
     r"(?:popped|surged|jumped|soared|crashed|tumbled|plunged|sank|fell|"
     r"dropped|climbed|spiked|slid|slipped|rallied|tanked|plummeted|"
-    r"nosedived|hammered|skyrocketed|rocketed|sliding|rebounded)\b",
+    r"nosedived|hammered|skyrocketed|rocketed|rebounded)\b",
     re.IGNORECASE,
 )
 # "X (TICKER) Reports Earnings Tomorrow: What To Expect" — the FinancialContent
@@ -697,7 +697,7 @@ _RT_WHY_STOCK_IS_AFTER = re.compile(
     # verbs the template family uses.
     r"(?:moving|trading|sliding|sinking|tumbling|crashing|plunging|"
     r"jumping|surging|soaring|rising|falling|climbing|dropping|"
-    r"rallying|spiking|tanking|sliding|skyrocketing|nosediving|"
+    r"rallying|spiking|tanking|skyrocketing|nosediving|"
     r"up|down|higher|lower|flat|stuck|red|green|bid|offered)"
     r"\b.*?"
     # Required "after" + recap-noun terminator — the retrospective anchor.
