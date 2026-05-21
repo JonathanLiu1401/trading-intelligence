@@ -13536,3 +13536,179 @@ python3 -m pytest tests/test_sample_weight_audit.py -v
 # Full ML/backtest slice
 python3 -m pytest tests/ -v -k "ml or backtest or scorer or weight"
 ```
+
+### 2026-05-20 review pass — ML+backtest HYBRID (Agent 2): LLM-annotation dark-pipeline diagnostic + per-cycle ledger
+
+#### Phase 1 — bug hunt (bugs_fixed=0, no commit)
+
+The codebase has had ~30 hybrid review passes on this slice (most today).
+The angles I checked — the `for/else` in `_inject_and_train`'s SQLite-lock
+retry, the LRU semantics of `_evict_oldest_volume_windows_locked` vs
+`_load_volume_cache_for_window`'s `move_to_end`, the sign-flip ordering
+between `_oos_rank_metrics` (5d, sign-then-clamp) and
+`_oos_multi_horizon_metrics` (10d/20d, sign-then-clamp), and the
+`build_features` ablation matrix in `feature_contributions` — were all
+correct. Phase 1 commit guard: no code fixes, no commit (per spec). The
+focused decision_scorer suite (60 tests) still passes clean.
+
+#### Phase 2 — feature (commit `da7071d`): `llm_annotation_skill` + per-cycle ledger
+
+Two parts, one commit:
+
+**1. `paper_trader/ml/llm_annotation_skill.py`** — read-only realized-
+return diagnostic over the `llm_quality_label` column of
+`decision_outcomes.jsonl`. Answers a question that until now had no
+direct measurement at all: *do the ENDORSE/CONDEMN labels the
+`_llm_annotate_outcomes` pipeline writes actually predict realized 5d
+forward returns?*
+
+The closest sibling is `sample_weight_audit` (already shipped today), but
+that measures the column's effect at the **trained-model OOS rank-IC**
+level — yesterday's pass found `CURRENT_TIED` with the `run_only` policy,
+meaning the LLM column adds NO OOS skill *after the trainer mixes it in*.
+This diagnostic measures the column's *raw data quality* — do endorsed
+records carry higher action-aligned returns than condemned ones, BEFORE
+any modeling. The two are complementary.
+
+Verdict ladder (crisp, threshold-driven, exact-string testable):
+
+| Verdict                | Trigger                                          |
+|------------------------|--------------------------------------------------|
+| `NO_LABELS_PRODUCED`   | n_endorsed + n_condemned == 0 (pipeline dark)    |
+| `INSUFFICIENT_LABELS`  | min(n_endorsed, n_condemned) < 10                |
+| `LLM_ANTI_PREDICTIVE`  | endorsed_mean ≤ condemned_mean − 1.0pp (RED)     |
+| `LLM_DIRECTIONAL`      | endorsed_mean ≥ condemned_mean + 1.0pp           |
+| `LLM_DIRECTIONAL_WEAK` | gap in [+0.5pp, +1.0pp)                          |
+| `LLM_INERT`            | |gap| < 0.5pp (both groups exist but tied)       |
+| `LLM_ANTI_WEAK`        | gap in [-1.0pp, -0.5pp)                          |
+
+CLI exits 2 on `LLM_ANTI_PREDICTIVE` so an operator cron can branch on
+it — mirrors `news_volume_skill._cli` / `action_skill._cli` precedent.
+
+**2. `_append_llm_annotation_skill_log` wiring in `run_continuous_backtests.py`.**
+The CLI verdict is invisible to an unattended operator until they grep
+`decision_outcomes.jsonl` manually. This appends one structured row per
+cycle to `data/llm_annotation_skill_log.jsonl`, mirroring the documented
+`scorer_skill_log.jsonl` / `baseline_skill_log.jsonl` patterns:
+
+- `pipeline_dark` boolean is the canonical operational state (True ⇔
+  the LLM annotator produced ZERO non-zero labels across the corpus)
+- bounded growth via atomic tmp+`.replace` trim at 2× the keep cap
+- best-effort by construction; a ledger fault cannot break the loop
+- SSOT cross-check pinned by `TestAppendLlmAnnotationSkillLog::test_directional_row_when_labels_predict` — persisted `rank_ic` and `endorsed_minus_condemned` MUST equal what `llm_annotation_skill.analyze` returns directly on the same input
+- wiring locked by `TestCycleWiringRegression::test_main_invokes_llm_annotation_skill_ledger` so a future refactor cannot silently re-orphan it (the documented failure mode the scorer/baseline ledgers each suffered until they were wired)
+
+Test coverage: 38 tests in `tests/test_llm_annotation_skill.py` (verdict
+ladder boundary asserts, SELL sign-flip parity, robustness on
+malformed input, `analyze()` no-write invariant, CLI subprocess
+invocation with exit-code branch) + 6 tests in
+`tests/test_continuous.py::TestAppendLlmAnnotationSkillLog` (pipeline-
+dark row, directional row with SSOT check, missing-outcomes-file
+honest dark row, analyze-exception degrade, bounded trim, never raises).
+
+#### Phase 3 — live validation findings (quant researcher perspective)
+
+Seven concrete observations against the live deployment 2026-05-20:
+
+1. **`llm_annotation_skill` verdict on the live corpus: `NO_LABELS_PRODUCED`.**
+   ALL 7413 rows of `data/decision_outcomes.jsonl` carry
+   `llm_quality_label=0`. The `_llm_annotate_outcomes` pipeline is fully
+   dark — the `anthropic.Anthropic()` client constructor succeeds but
+   `client.messages.create(...)` fails (almost certainly missing
+   `ANTHROPIC_API_KEY`; confirmed unset in the test shell). The silent
+   `except Exception` in the function swallows the AuthenticationError
+   and prints to stdout, which is rotated/discarded. The `3.0×/0.1×`
+   `llm_mult` weighting in `train_scorer` is therefore CONSTANT 1.0 on
+   every record — the LLM annotation subsystem is overhead with NO
+   trainer-side effect. This is the strongest version of yesterday's
+   `CURRENT_TIED` finding: the column is not just OOS-tied, it has
+   literally never been populated.
+
+2. **Deployed scorer pickle is still stale (yesterday's finding holds).**
+   `data/ml/decision_scorer.pkl` was last written 2026-05-19 06:10 with
+   `n_train=400 < 500` — the conviction gate (invariant #5) remains
+   INACTIVE. No retrain has happened in ≥38h.
+
+3. **Continuous loop is still DOWN.** `pgrep -af continuous_backtest`
+   returns no process. `data/decision_outcomes.jsonl` last written
+   2026-05-20 02:48 (~21h ago).
+
+4. **Skill ledger files don't exist on disk.** `data/scorer_skill_log.jsonl`,
+   `data/baseline_skill_log.jsonl`, and (the new one) `llm_annotation_skill_log.jsonl`
+   are all absent. The ledger writers exist in code but no cycle has
+   completed since they were each wired — strongly implies the loop has
+   been down for an extended period. The new ledger's `pipeline_dark`
+   state will become visible only when the loop next starts.
+
+5. **Two orphaned `running` rows from 2026-05-18 still not reaped.**
+   `run_id=6238` and `run_id=6243` remain `status='running'` for 48h+.
+   `_reap_orphaned_runs` is correct but only fires from a live loop —
+   a down loop means the dashboard renders dead runs indefinitely
+   (yesterday's finding holds).
+
+6. **Two new suspicious 99001/90001 rows with truncated windows.**
+   `run_id=99001` (4-day window 2025-06-02→2025-06-06,
+   `n_trades=0, total_return_pct=0`), `run_id=90001` (8-day window,
+   same shape). Completed 2026-05-20T20:25 / T20:59 UTC. Out-of-band
+   test artifacts or aborted cycles — the normal continuous-loop window
+   distribution is 1-10 years. These don't poison `_compute_decision_outcomes`
+   (n_trades=0 ⇒ no BUY/SELL decisions to emit outcomes from) but they
+   pollute the dashboard run leaderboard.
+
+7. **Backtest dispersion is even more extreme than yesterday.** Across
+   475 complete runs (n_trades ≥ 5): mean `total_return_pct=+150%`,
+   max `+2978%` (single SOXL/TQQQ-heavy 6+ year window). The "best run
+   alpha" cycle line is the maximum of a high-variance leverage draw,
+   not strategy skill. The cycle-best is decisively NOT alpha; only the
+   permutation/label-audit validation suite is a trustworthy
+   skill-vs-luck arbiter (already documented).
+
+### How `llm_annotation_skill` works (consolidated reference)
+
+The new diagnostic answers a question every existing module misses:
+*does the LLM annotation column carry signal on the realized 5d forward
+return at the data level, or is the trainer being fed a constant 1.0
+multiplier (the documented production state)?*
+
+The `_llm_annotate_outcomes` pipeline in `run_continuous_backtests.py`
+labels BUY/SELL trades in the winner + loser run of each cycle as
+ENDORSE (`+1`) or CONDEMN (`-1`); every other row defaults to `0`
+(unlabeled). `train_scorer`'s sample-weight policy reads this as
+`{1: 3.0, -1: 0.1, 0: 1.0}` → `llm_mult`, multiplying the run-quality
+weight clamp. So a `pipeline_dark=True` state ⇒ every record gets
+`llm_mult=1.0` ⇒ the entire LLM annotation subsystem provides no
+training-side gradient effect.
+
+A `LLM_DIRECTIONAL` verdict means the ENDORSE records realize higher
+action-aligned 5d returns than CONDEMN ones — the 3.0×/0.1× weighting
+is well-grounded. A `LLM_ANTI_PREDICTIVE` verdict (RED FLAG) means
+the weighting is INVERTED relative to true signal — the trainer is
+being told to upweight noise and downweight signal, and the
+`train_scorer` policy should switch to `llm_mult=1.0` immediately.
+
+### Test commands for this pass
+
+```bash
+# llm_annotation_skill (full module coverage)
+python3 -m pytest tests/test_llm_annotation_skill.py -v
+
+# Per-cycle ledger wiring
+python3 -m pytest tests/test_continuous.py -v -k LlmAnnotation
+
+# Focused ML/backtest slice (the canonical filter — ~10s)
+python3 -m pytest tests/test_decision_scorer.py tests/test_continuous.py \
+    tests/test_calibration.py tests/test_sample_weight_audit.py \
+    tests/test_llm_annotation_skill.py tests/test_news_volume_skill.py \
+    tests/test_action_skill.py tests/test_backtest.py \
+    tests/test_baseline_compare.py tests/test_skill_trend.py
+
+# Run the diagnostic against the live outcomes
+python3 -m paper_trader.ml.llm_annotation_skill
+# (Currently reports: VERDICT: NO_LABELS_PRODUCED — pipeline is dark.)
+```
+
+### Counters
+
+`bugs_fixed=0` (no real bugs found after ~30 prior passes; angles checked were correct)
+· `features_added=1` (`paper_trader/ml/llm_annotation_skill.py` + per-cycle ledger wiring; 44 new tests)
+· `user_findings=7` (LLM annotation pipeline 100% dark · scorer pickle stale · continuous loop down · skill ledger files absent · 2 orphan running rows · 2 truncated test-artifact rows · extreme backtest leverage dispersion)
