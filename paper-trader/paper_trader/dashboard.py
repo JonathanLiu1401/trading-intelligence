@@ -10890,6 +10890,41 @@ def buying_power_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/liquidation-preview")
+def liquidation_preview_api():
+    """If I closed every open position right now at the live mark, what
+    would my book look like?
+
+    The natural complement to ``/api/buying-power`` (one dimension over,
+    opposite direction): buying-power says "what can my free cash fund?",
+    liquidation-preview says "what would my free cash BECOME if I sold
+    everything?". Answers the PM question every pre-earnings de-risk and
+    drawdown-trim decision starts with — *cleanly*, instead of forcing
+    the operator to mentally re-derive from ``/api/portfolio``.
+
+    Composes ``build_liquidation_preview`` (the pure analytics core)
+    over the read-only portfolio snapshot — single source of truth with
+    ``_mark_to_market`` (AGENTS.md invariant #10), so the panel's per-
+    position realized-PL numbers can never disagree with the live
+    snapshot Opus / the hourly summary see.
+
+    Observational only — never gates Opus, never injected into the
+    decision prompt, no caps (AGENTS.md #2/#12 — the ``buying_power``
+    precedent). Pure read-only: no store writes, no network. Stale
+    marks are surfaced per-row so the operator knows when the lock-in
+    number is unreliable. Failure contract: any builder fault returns
+    HTTP 500 with the message in ``error``, never an uncaught
+    exception."""
+    try:
+        from .analytics.liquidation_preview import build_liquidation_preview
+        from .strategy import portfolio_snapshot_readonly
+        store = get_store()
+        snap = portfolio_snapshot_readonly(store)
+        return jsonify(build_liquidation_preview(snap))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/open-attribution")
 def open_attribution_api():
     """Selection-vs-market on the *open* book — the bot's dominant return.
