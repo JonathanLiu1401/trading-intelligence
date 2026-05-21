@@ -176,6 +176,15 @@ def collect() -> list[dict]:
         )
         conn.commit()
 
+        # Pre-score: heuristic_scorer returns 0 ("no_keywords") for most
+        # macro-event titles like "[USD] CPI m/m" so they get dropped by the
+        # 0.5 noise gate in daemon._ingest. Same class of bug as 66ac656
+        # fixed for collector_rate_monitor — opt into _relevance_score.
+        # High impact → 2.5 (clears gate, below 4.0 urgent threshold).
+        # Medium → 1.0. Realized events (+1.0): surprise is the tradeable bit.
+        score = 2.5 if impact == "High" else 1.0
+        if has_actual:
+            score += 1.0
         articles.append(
             {
                 "title": art_title,
@@ -183,6 +192,7 @@ def collect() -> list[dict]:
                 "summary": art_summary,
                 "source": SOURCE,
                 "published": event_dt.isoformat(),
+                "_relevance_score": score,
             }
         )
 
