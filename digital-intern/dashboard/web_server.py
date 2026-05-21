@@ -971,6 +971,80 @@ def _decision_paralysis_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _thesis_drift_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/thesis-drift` (every open position re-tested
+    against the verbatim reason it was opened for, graded INTACT / WEAKENING /
+    BROKEN) as compact chat-context lines.
+
+    The chat already carries the bot's per-name closed-trade memory (the
+    behavioural block), and the OPEN book by *position* (the portfolio
+    snapshot) and by *factor* (the correlation block) — but neither answers
+    the single discipline question that drives most discretionary trims:
+    *"is the thing the bot bought this for still true?"* That answer sits
+    verbatim in `trades.reason` of each opening fill, and only thesis-drift
+    re-scores each holding against it. Surfacing the WEAKENING/BROKEN cards
+    here lets the analyst answer "should the bot have already sold X?"
+    honestly instead of re-deriving from raw signals.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is the
+    chat headline and each card's ``drift_reasons`` are surfaced **verbatim**
+    — no re-derived verdict (the ``_decision_paralysis_chat_lines``
+    precedent).
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict, missing/unknown shape → ``[]`` (block omitted, never an
+      exception into the chat handler)
+    - state ``NO_DATA`` (no open positions) or *every* position INTACT →
+      ``[]``: a healthy book is silence (the silence precedent — never
+      chat filler when the loop is fine)
+    - WEAKENING / BROKEN cards present → builder's verbatim ``headline``
+      + one detail line per non-INTACT card restating its OWN
+      ``ticker``/``health``/``pl_pct``/``days_held``/``drift_reasons``
+      (a missing field degrades to a "?" placeholder rather than raises —
+      the ``_paper_trader_position_lines`` precedent).
+    """
+    if not isinstance(rep, dict):
+        return []
+    cards = rep.get("positions")
+    if not isinstance(cards, list) or not cards:
+        return []
+    bad = [c for c in cards
+           if isinstance(c, dict)
+           and c.get("health") in ("BROKEN", "WEAKENING")]
+    if not bad:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)              # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    for c in bad:
+        tk = c.get("ticker") or "?"
+        typ = c.get("type") or "stock"
+        health = c.get("health") or "?"
+        pl_pct = _num(c.get("pl_pct"))
+        days = _num(c.get("days_held"))
+        bits = [f"{tk} {typ} {health}"]
+        if pl_pct is not None:
+            bits.append(f"P/L {pl_pct:+.2f}%")
+        if days is not None:
+            bits.append(f"held {days:.2f}d")
+        reasons = c.get("drift_reasons")
+        if isinstance(reasons, list) and reasons:
+            reason_s = "; ".join(str(r) for r in reasons if r)
+            if reason_s:
+                bits.append(f"drift: {reason_s}")
+        lines.append("  " + " | ".join(bits))
+
+    return lines
+
+
 def _earnings_shock_chat_lines(es) -> list[str]:
     """Render paper-trader's `/api/earnings-shock` (pre-earnings dollarized
     1σ shock per held imminent print) as compact chat-context lines.
@@ -3542,6 +3616,29 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: correlation fetch failed: %s", e)
 
+        # Thesis drift — every open position re-tested against the verbatim
+        # reason it was opened for, graded INTACT/WEAKENING/BROKEN. The chat
+        # already carries the open book (portfolio_block) and the closed-trade
+        # behavioural mirror, but neither answers "is the thing the bot bought
+        # this for still true?" — the single discipline question that drives
+        # most desk trims. Surfacing the WEAKENING/BROKEN cards here lets the
+        # analyst answer "should the bot have already sold X?" honestly
+        # instead of re-deriving from raw signals. Composed verbatim by the
+        # pure _thesis_drift_chat_lines helper (unit-tested; SSOT — no
+        # re-derived verdict). Guarded 3s sub-fetch like every sibling; an
+        # all-INTACT book collapses to silence (the silence precedent).
+        thesis_drift_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/thesis-drift",
+                    timeout=3) as resp:
+                _td = json.loads(resp.read().decode("utf-8"))
+            thesis_drift_block = "\n".join(
+                _thesis_drift_chat_lines(_td))
+        except Exception as e:
+            _logger().warning("chat: thesis-drift fetch failed: %s", e)
+
         # Earnings radar — scheduled gap risk on the paper trader's holdings.
         # Lets the chat warn "you hold NVDA and it prints in 4 days".
         earnings_block = ""
@@ -3847,6 +3944,7 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — BEHAVIOURAL DIAGNOSIS (the bot's own self-review verdicts):\n{behavioural_block}\n\n" if behavioural_block else "")
             + (f"PAPER TRADER — ML GATE HONESTY (does the DecisionScorer that modulates the bot's live position sizing beat a one-line rule OUT OF SAMPLE? the analytics above report the flattering in-sample story; this is the generalization-relevant verdict):\n{baseline_compare_block}\n\n" if baseline_compare_block else "")
             + (f"PAPER TRADER — FACTOR CONCENTRATION (the held book's pairwise return correlation + effective-independent-bets count; complements /api/risk's NAME-level view — a 59/41 book that is concentrated by weight may STILL be a single FACTOR bet if both names move as one):\n{correlation_block}\n\n" if correlation_block else "")
+            + (f"PAPER TRADER — OPEN-POSITION THESIS DRIFT (every holding re-tested against the verbatim reason it was opened for, graded INTACT/WEAKENING/BROKEN by P/L since entry + live quant/momentum; an INTACT book collapses to silence so this block ONLY fires when at least one held position is materially off its entry thesis — drift_reasons carry verbatim from the trader endpoint, never re-derived):\n{thesis_drift_block}\n\n" if thesis_drift_block else "")
             + (f"PAPER TRADER — PRIORITISED ACTION PLAN (the bot's own next-session game plan):\n{game_plan_block}\n\n" if game_plan_block else "")
             + (f"PAPER TRADER — HOLD-DISCIPLINE ALERT (a losing position overstayed past the desk's own median losing-cut):\n{hold_discipline_block}\n\n" if hold_discipline_block else "")
             + (f"HELD-TICKER 24h NEWS-CONVICTION TREND (per held name, ai_score bucketed into 4 × 6h slices; only RISING / FADING are surfaced — STABLE/quiet collapses to silence. Complements /api/portfolio-signals' current-state snapshot with the temporal direction: is the wire focusing MORE or LESS on this position over the last day?):\n{conviction_decay_block}\n\n" if conviction_decay_block else "")
