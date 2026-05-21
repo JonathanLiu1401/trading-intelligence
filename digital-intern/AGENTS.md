@@ -6019,3 +6019,194 @@ session's `dashboard/web_server.py` mods, the
 `tests/test_breaking_confluence.py` cleanup) deliberately left
 unstaged. AGENTS.md committed alongside the related code in this
 same documentation step.
+
+---
+
+### Agent pass 2026-05-20 (hybrid — debug + feature + analyst validation)
+
+**Phase 1 — bugs_fixed=1, commit `66ac656`.** **The `collector_rate_monitor`
+(`3e310c9`) was inert in production.** It emits "⚠️ COLLECTOR SILENT:
+[<source>] — 0 articles in 3h" synthetic alerts when a high-volume source
+goes dark, returning them to the worker which calls `daemon._ingest`.
+`_ingest` heuristic-scores every article via `triage.heuristic_scorer.
+score_article` and filters `_relevance_score < 0.5`. These titles carry
+NO portfolio tickers / financial keywords / event verbs, so the heuristic
+returned `{'score': 0.0, 'reason': 'no_keywords'}` and the 0.5 noise gate
+silently dropped EVERY synthetic alert before `store.insert_batch`. The
+`seen_articles.db` dedup row was marked, but the article never landed in
+`articles.db` and nothing in the briefing / dashboard / urgency pipeline
+ever surfaced the SILENT condition — the entire operations-alert path
+was dead. The commit's "caught on first run" claim is misleading: the
+collector *detected* the silence, but the alert article never reached
+the store.
+
+Verified empirically before the fix:
+```
+>>> score_article("⚠️ COLLECTOR SILENT: [Finnhub/MarketWatch] — 0 articles in 3h (avg 75/day)", ...)
+{'score': 0.0, 'reason': 'no_keywords', 'events': []}
+```
+→ 0.0 < 0.5 → dropped in `_ingest`'s noise gate.
+
+Fix: `_ingest` now respects a pre-set `_relevance_score` on the input
+dict (opt-in) — the heuristic is skipped when the collector has done
+its own scoring. `collector_rate_monitor` sets `_relevance_score=3.0`
+(well clear of the 0.5 gate, below ml/llm urgent thresholds so the row
+surfaces in briefing candidates / dashboards without firing a standalone
+push). Existing collectors that don't set the key are byte-unchanged —
+the heuristic pre-scores them and the 0.5 noise gate applies exactly as
+before.
+
+Invariant #1 (backtest isolation) preserved by construction: the
+read-side `_LIVE_ONLY_CLAUSE` filter in `storage.article_store` keys on
+url/source patterns, NOT on `kw_score`, so a pre-scored synthetic
+`backtest://` row still cannot reach live readers. Pinned explicitly by
+`test_prescore_path_does_not_break_backtest_isolation`. Invariants #2
+(`ml_score`/`ai_score` separation) and #3 (`MAX(urgency,?)` state
+machine) are untouched — the fix never writes either column or urgency.
+
++5 tests (`tests/test_collector_rate_monitor_ingest.py`): (1) heuristic
+genuinely scores SILENT titles 0.0 (sentinel — if this flips a future
+maintainer can simplify); (2) `_ingest` drops a non-pre-scored synthetic
+alert (the bug); (3) `_ingest` accepts the same alert with `_relevance_
+score=3.0` (the fix); (4) `collect_rate_alerts()` end-to-end output
+carries `_relevance_score >= 0.5` for every emitted alert; (5)
+backtest-isolation regression on the pre-score path.
+
+**Phase 2 — features_added=0, no commit (honest, per the guard).** The
+codebase has been through 19+ hybrid passes and every recently
+contemplated feature surface has shipped (BOOK / [ALERTED] / [model] /
+quote-widget / recap-template / paraphrase / cross-cycle / decay /
+domain-diversity / SILENT collector). The analytics layer has 30+
+modules covering source-debut, ticker-comentions, score-drift,
+publish-lag, recap audit, junk-source, ticker-concentration, etc. No
+clean surgical-safe high-value gap remained that wasn't already in
+sibling-WIP territory; forcing a feature would be churn. Same call as
+passes 17, 18 — explicitly permitted by the COMMIT GUARD.
+
+**Phase 3 — live findings (analyst lens), user_findings=5.**
+1. **Briefing quality EXCELLENT (positive).** id=37 (2026-05-20 21:21
+   UTC, 50 articles, 3041 chars) read end-to-end: dense, accurate,
+   decisively-actionable Bloomberg digest — NVDA Q1 print lead
+   ($81.62B rev / $1.87 EPS double beat + $80B buyback, "lackluster"
+   forward guide AH slip) with exact MACRO table, PORTFOLIO P&L tied
+   to live book (LITE/LNOK/MUU/DRAM/NVDL/AXTI/ORCL/TSEM/QBTS), tight
+   SEMIS PULSE numbers, decisively-prioritised TOP SIGNALS. Cadence
+   id30→37 = 7.8h / 5.85h / 5.4h / 5.2h / 5.3h / 6.3h / 6.2h —
+   healthy, no 30h+ gaps. The `ef839a8` heartbeat-clock fix is
+   holding.
+2. **Alert path WORKING UNDER NVDA EARNINGS STORM (positive).** Last
+   24h shows ~22 NVDA Q1 syndicated copies (Bloomberg, Reuters,
+   Shacknews, Britainnews, FXLeaders, marketscreener, DigiTimes, +10
+   GDELT publishers). The cross-cycle / paraphrase / syndication
+   gates correctly suppressed most as `urgency=2` after the canonical
+   alert fired — the analyst is NOT being spammed with the same event
+   from every wire. The DigiTimes "Nvidia revenue surges 85%" copy
+   was the first ai-vetted alert (ai=10) and acted as the canonical
+   reference for the rest of the storm.
+3. **Invariants HOLD LIVE.** Verified via `mode=ro` probe: `0`
+   synthetic rows with `urgency>=1`; `0` rows with `ai_score>0 AND
+   score_source='ml'`. Backtest isolation + ml/ai separation both
+   intact in production.
+4. **Collection healthy.** Last-1h source counts: stocktwits 650,
+   GN: earnings 487, GN: Nasdaq 433, GN: IPO 413, GN: Nvidia 315
+   (Nvidia Q1 was the day's dominant event so Nvidia channels lead).
+   Total ~5k+ articles/h in the catalyst window. Backtest isolation
+   holds on every read path checked.
+5. **Chronic operational issues persist (not new bugs, all
+   documented).** `mark_alerted_batch: lock retry exhausted` ERROR
+   at 2026-05-21T00:23:03 triggered one `Error sending urgent alert`
+   traceback (the documented USB DB writer-side contention; memory
+   `di-insert-batch-lock-contention`). Architectural fix
+   (per-connection isolation) is substantial + sibling-WIP territory
+   — out of safe surgical scope; reported, not chased.
+
+The Phase-1 fix ships on next `systemctl restart digital-intern`
+(running daemon predates `66ac656` — chronic stale-daemon caveat per
+memory `di-stale-manual-daemon`).
+
+**Phase 4 (docs):** this section.
+
+**Final verify:**
+- `python3 -c "import sys; sys.path.insert(0,'.'); from storage import
+  article_store; from ml import features, model; print('imports OK')"`
+  → `imports OK`.
+- Focused suite (task-listed assertions + the new tests):
+  `test_article_store.py`, `test_urgency_scorer.py`, `test_features.py`,
+  `test_model.py`, `test_trainer.py`, `test_integration_pipeline.py`,
+  `test_collector_rate_monitor_ingest.py` — **80 passed in 5.88s**.
+  Full `python3 -m pytest tests/` deferred under the documented
+  concurrent-agent I/O saturation (4 sibling claude agents running
+  in parallel + the live daemon — initial unfocused run stalled at
+  0 bytes for minutes, advisor-confirmed starved not stuck). The
+  focused suite covers every module the change touches.
+
+**Counters:** `bugs_fixed=1` (the collector_rate_monitor inert-feature
+fix, commit `66ac656`), `features_added=0` (no Phase-2 commit; honest
+per the guard — exhaustively reviewed surfaces are all shipped or
+sibling-WIP), `user_findings=5` (briefing excellent, alert path
+clean under NVDA earnings storm, invariants hold live, collection
+healthy, chronic lock contention persists).
+
+**Staging discipline.** Three other claude agents running concurrently
+(paper-trader core, paper-trader ML/backtests, feature-dev cross-repo)
+plus the auto-commit daemon — visible in `ps` (PIDs 130433, 130435,
+130438). Per memory `pt-concurrent-samerole-staging-race`, staged with
+explicit pathspec only: `daemon.py`, `collectors/collector_rate_
+monitor.py`, `tests/test_collector_rate_monitor_ingest.py`. `git diff
+--staged --name-only` verified immediately before commit. The
+concurrent sibling's `dashboard/web_server.py` modification and the
+paper-trader `*` working-tree changes (thesis_drift, strategy, reporter)
+were deliberately left unstaged. AGENTS.md committed alongside the
+related code in this same documentation step.
+
+- **2026-05-20 feat (Agent 4 product-engineer pass) — chat enrichment:
+  `_thesis_drift_chat_lines`.** New pure helper added to
+  `dashboard/web_server.py::api_chat` that surfaces paper-trader's
+  `/api/thesis-drift` (every open position re-tested against the
+  verbatim reason it was opened for, graded INTACT/WEAKENING/BROKEN)
+  into compact chat-context lines. The chat already carried the open
+  book by position (the portfolio snapshot) and by factor (the
+  correlation block), and the bot's per-name closed-trade memory (the
+  behavioural block); none answered the single discretionary-discipline
+  question that drives most desk trims: *"is the thing the bot bought
+  this for still true?"* That answer sits verbatim in `trades.reason`
+  of each opening fill, and only thesis-drift re-scores each holding
+  against it. Surfacing the WEAKENING/BROKEN cards here lets the
+  analyst answer "should the bot have already sold X?" honestly instead
+  of re-deriving from raw signals.
+
+  SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+  the chat headline and each card's ``drift_reasons`` are surfaced
+  **verbatim** — no chat-side re-derived verdict that could drift from
+  the trader endpoint (the `_decision_paralysis_chat_lines` /
+  `_event_readiness_chat_lines` precedent). Pure / total — exactly the
+  `_baseline_compare_chat_lines` contract: non-dict / missing keys /
+  non-dict cards inside `positions[]` never raise and degrade to
+  silence or the safe subset (the `_paper_trader_position_lines`
+  precedent). All-INTACT books collapse to `[]` — the chat must not
+  carry "all theses fine" filler (the `_decision_paralysis_chat_lines`
+  ACTIVE silence precedent).
+
+  Wired as a sibling cross-fetch block (own guarded
+  `urllib.urlopen(:8090/api/thesis-drift, timeout=3)`,
+  degrade-to-`""`), injected into `system_prompt` right after the
+  factor-concentration block via the existing `if block else ""` idiom.
+  New `tests/test_chat_thesis_drift_enrichment.py` (18 tests, pure
+  helper — no Flask, no `:8090`): SSOT verbatim-headline lock,
+  WEAKENING+BROKEN both surface / INTACT does not, all-INTACT silence
+  contract, `drift_reasons` verbatim-passthrough lock, degrade-on-
+  partial-card (missing `pl_pct` / `days_held` / rogue-non-dict-in-
+  positions), and a pure-no-network lock (a patched `urlopen` must NOT
+  be reached). Suites: **18 new passed**; the full chat-enrichment
+  slice (13 sibling test files) regresses clean at **228 passed**.
+
+  *Operational:* additive — needs `systemctl --user restart
+  digital-intern` for the chat to use the new block; the trader
+  endpoint `/api/thesis-drift` is already live. Cross-repo coupling:
+  none — the helper is pure and degrades to silence if the trader is
+  down. Companion paper-trader change (the trader's own decision
+  prompt also now sees the `thesis_drift_block` + `repeat_loser_block`
+  advisory text via `strategy._build_payload`) is shipped in the
+  paper-trader repo's separate commit. Commit pathspec-scoped
+  (`dashboard/web_server.py` + new test + this `AGENTS.md`), never
+  `git add -A`.
