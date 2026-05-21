@@ -1871,6 +1871,16 @@ def _ml_decide(
                     "reasoning": f"ML score={best_score:.2f} but notional too small"}
         if not _scorer.is_trained:
             scorer_note = ""
+        elif _scorer_n < 500:
+            # Scorer trained but sub-gate (n_train < 500, invariant #5). The
+            # gate doesn't act on the prediction, so the reasoning must not
+            # advertise `scorer=X%` as if it had — `_parse_gate_decision`'s
+            # contract is that the token appears ONLY when the gate acted
+            # (or explicitly abstained via off-distribution). Emitting it
+            # sub-gate poisons `decision_outcomes.gate_scorer_pred` with a
+            # value the gate never touched, which leaks into `gate_pnl` /
+            # `gate_audit` diagnostics. Suppress like the untrained case.
+            scorer_note = ""
         elif scorer_off_dist:
             # Surfaced so the dashboard / a reading quant can see the gate
             # deliberately abstained on an off-distribution extrapolation
