@@ -4452,3 +4452,257 @@ class TestSourceMixLine:
         monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
         assert reporter.send_daily_close() is True
         assert "**NEWS BREADTH**" in captured[0]
+
+
+class TestCashConvictionFitLine:
+    """`_cash_conviction_fit_line` + its hourly/daily wiring — the
+    point-in-time cash-fit surface. ``_capital_pulse_line`` covers
+    structural CAN-ACT (PINNED/FREE/BLEEDING); this line covers the
+    orthogonal IS-SIZED-TO-LIVE-SIGNAL question (IDLE_DESPITE_SURGE /
+    OVERDEPLOYED). Surfaces ONLY the two actionable verdicts; everything
+    else (BALANCED / IDLE_LOW_CONVICTION / NO_DATA) is silent."""
+
+    def _stub_signals(self, monkeypatch, articles):
+        """Replace signals.get_top_signals so the reporter helper's data
+        path is deterministic. We do NOT touch articles.db directly: the
+        helper's contract is "consumes signals.get_top_signals output",
+        and the SSOT discipline (invariant #10) means we test the
+        composition, not signals.py's own extraction."""
+        from paper_trader import signals as sigs
+        monkeypatch.setattr(sigs, "get_top_signals",
+                            lambda *a, **k: list(articles))
+
+    def _stub_builder(self, monkeypatch, payload):
+        from paper_trader.analytics import cash_conviction_fit as ccf
+        monkeypatch.setattr(ccf, "build_cash_conviction_fit",
+                            lambda *a, **k: payload)
+
+    def test_empty_when_builder_returns_balanced(self, fresh_store,
+                                                  monkeypatch):
+        """Silence-when-nothing-actionable: BALANCED must not surface."""
+        self._stub_signals(monkeypatch, [])
+        self._stub_builder(monkeypatch, {
+            "verdict": "BALANCED",
+            "headline": "BALANCED — cash 34% vs top signal 6.5; level fits.",
+        })
+        assert reporter._cash_conviction_fit_line(fresh_store) == ""
+
+    def test_empty_when_builder_returns_idle_low_conviction(
+            self, fresh_store, monkeypatch):
+        """IDLE_LOW_CONVICTION is *correct* idleness (nothing screaming) —
+        no actionable signal for the operator."""
+        self._stub_signals(monkeypatch, [])
+        self._stub_builder(monkeypatch, {
+            "verdict": "IDLE_LOW_CONVICTION",
+            "headline": "IDLE_LOW_CONVICTION — 45% cash idle; loudest 4.0.",
+        })
+        assert reporter._cash_conviction_fit_line(fresh_store) == ""
+
+    def test_empty_when_builder_returns_no_data(self, fresh_store,
+                                                 monkeypatch):
+        self._stub_signals(monkeypatch, [])
+        self._stub_builder(monkeypatch, {
+            "verdict": "NO_DATA",
+            "headline": "NO_DATA — portfolio + signals both missing.",
+        })
+        assert reporter._cash_conviction_fit_line(fresh_store) == ""
+
+    def test_surfaces_idle_despite_surge_verbatim(self, fresh_store,
+                                                    monkeypatch):
+        """IDLE_DESPITE_SURGE → fire with the builder's headline VERBATIM
+        (single source of truth — no re-derive)."""
+        self._stub_signals(monkeypatch, [])
+        headline = ("IDLE_DESPITE_SURGE — 45% cash idle while NVDA "
+                    "screams ai_score 9.0; last decision NO_DECISION 6m ago.")
+        self._stub_builder(monkeypatch, {
+            "verdict": "IDLE_DESPITE_SURGE",
+            "headline": headline,
+        })
+        line = reporter._cash_conviction_fit_line(fresh_store)
+        assert line.startswith("**CASH FIT** ◈ IDLE_DESPITE_SURGE")
+        # Builder's headline appears verbatim — no re-derive.
+        assert headline in line
+
+    def test_surfaces_overdeployed_verbatim(self, fresh_store, monkeypatch):
+        """OVERDEPLOYED → fire with the builder's headline VERBATIM."""
+        self._stub_signals(monkeypatch, [])
+        headline = ("OVERDEPLOYED — only 8% cash with NVDA at ai_score "
+                    "9.0; the book cannot add without trimming.")
+        self._stub_builder(monkeypatch, {
+            "verdict": "OVERDEPLOYED",
+            "headline": headline,
+        })
+        line = reporter._cash_conviction_fit_line(fresh_store)
+        assert line.startswith("**CASH FIT** ◈ OVERDEPLOYED")
+        assert headline in line
+
+    def test_empty_on_missing_headline(self, fresh_store, monkeypatch):
+        """Defensive: an actionable verdict with NO headline still drops
+        the line rather than emit a bare ``**CASH FIT** ◈ <verdict>``."""
+        self._stub_signals(monkeypatch, [])
+        self._stub_builder(monkeypatch, {
+            "verdict": "IDLE_DESPITE_SURGE",
+            "headline": "",
+        })
+        assert reporter._cash_conviction_fit_line(fresh_store) == ""
+
+    def test_empty_on_non_dict_builder_return(self, fresh_store, monkeypatch):
+        """Defensive: any non-dict from the builder degrades to ""."""
+        self._stub_signals(monkeypatch, [])
+        self._stub_builder(monkeypatch, None)
+        assert reporter._cash_conviction_fit_line(fresh_store) == ""
+
+    def test_degrades_to_empty_on_builder_fault(self, fresh_store,
+                                                  monkeypatch):
+        """Additive failure contract — a builder raise drops THIS line
+        and never an exception (the reporter line invariant)."""
+        self._stub_signals(monkeypatch, [])
+        from paper_trader.analytics import cash_conviction_fit as ccf
+
+        def _boom(*a, **k):
+            raise RuntimeError("builder blew up")
+
+        monkeypatch.setattr(ccf, "build_cash_conviction_fit", _boom)
+        assert reporter._cash_conviction_fit_line(fresh_store) == ""
+
+    def test_degrades_to_empty_on_signals_fault(self, fresh_store,
+                                                  monkeypatch):
+        """A signals.get_top_signals raise must NOT take down the line —
+        the helper internally swallows the error and falls through to
+        the builder with an empty list. Builder then receives empty
+        signals and returns NO_DATA (silent)."""
+        from paper_trader import signals as sigs
+
+        def _boom(*a, **k):
+            raise RuntimeError("signals blew up")
+
+        monkeypatch.setattr(sigs, "get_top_signals", _boom)
+        # Don't stub the builder — exercise the real signal-fault path.
+        # Real build_cash_conviction_fit returns NO_DATA for empty signals,
+        # so the helper suppresses (empty string).
+        result = reporter._cash_conviction_fit_line(fresh_store)
+        assert result == ""
+
+    def test_builder_receives_first_extracted_ticker_per_article(
+            self, fresh_store, monkeypatch):
+        """The helper's signal-mapping path: when an article has multiple
+        extracted tickers, only the first is used (mirrors the dashboard
+        endpoint's first-match-wins convention). Captures the kwargs
+        passed into the builder to verify the shape."""
+        captured_signals: list = []
+        self._stub_signals(monkeypatch, [
+            {"title": "...", "ai_score": 9.0, "urgency": 2,
+             "source": "stocktwits",
+             "tickers": ["QBTS", "NVDA"]},  # first should win
+            {"title": "...", "ai_score": 7.0, "urgency": 0,
+             "source": "yahoo",
+             "tickers": ["LITE"]},
+            {"title": "no tickers — drops", "ai_score": 8.0,
+             "urgency": 1, "source": "barrons",
+             "tickers": []},
+        ])
+        from paper_trader.analytics import cash_conviction_fit as ccf
+
+        def _capture(portfolio, signals, last_decision, **kwargs):
+            captured_signals.extend(signals or [])
+            return {"verdict": "BALANCED", "headline": "ok"}
+
+        monkeypatch.setattr(ccf, "build_cash_conviction_fit", _capture)
+        reporter._cash_conviction_fit_line(fresh_store)
+        # Two articles produced signals (one had no tickers). First ticker
+        # wins per article.
+        tickers = [s["ticker"] for s in captured_signals]
+        assert tickers == ["QBTS", "LITE"]
+        # ai_score / source / urgency propagate verbatim.
+        assert captured_signals[0]["ai_score"] == 9.0
+        assert captured_signals[0]["source"] == "stocktwits"
+        assert captured_signals[0]["urgency"] == 2
+
+    def test_builder_receives_held_flag_for_open_positions(
+            self, fresh_store, monkeypatch):
+        """A signal whose ticker is in the held set is tagged ``held=True``;
+        an unheld signal is tagged ``held=False``. The IDLE_DESPITE_SURGE
+        failure mode is specifically about *unheld* surging names."""
+        fresh_store.upsert_position("NVDA", "stock", 2, 100.0)
+        captured_signals: list = []
+        self._stub_signals(monkeypatch, [
+            {"title": "...", "ai_score": 9.0, "urgency": 2,
+             "source": "x", "tickers": ["NVDA"]},     # held
+            {"title": "...", "ai_score": 8.5, "urgency": 1,
+             "source": "y", "tickers": ["QBTS"]},     # unheld
+        ])
+        from paper_trader.analytics import cash_conviction_fit as ccf
+
+        def _capture(portfolio, signals, last_decision, **kwargs):
+            captured_signals.extend(signals or [])
+            return {"verdict": "BALANCED", "headline": "ok"}
+
+        monkeypatch.setattr(ccf, "build_cash_conviction_fit", _capture)
+        reporter._cash_conviction_fit_line(fresh_store)
+        flags = {s["ticker"]: s["held"] for s in captured_signals}
+        assert flags == {"NVDA": True, "QBTS": False}
+
+    def test_hourly_summary_includes_idle_despite_surge_after_capital(
+            self, fresh_store, monkeypatch):
+        """Wiring order: CAPITAL (structural can-act) → CASH FIT (point-
+        in-time sized-to-signal) → CONCENTRATION (single-name risk).
+        CAPITAL precedes because it answers the more primary "can the
+        desk act at all?" question."""
+        self._stub_signals(monkeypatch, [])
+        self._stub_builder(monkeypatch, {
+            "verdict": "IDLE_DESPITE_SURGE",
+            "headline": ("IDLE_DESPITE_SURGE — 45% cash idle while NVDA "
+                         "screams 9.0; last decision NO_DECISION 6m ago."),
+        })
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        # Force CAPITAL line so the relative ordering is observable.
+        monkeypatch.setattr(
+            reporter, "_capital_pulse_line",
+            lambda store: "**CAPITAL** ◈ FREE\n> $500 cash, free to act",
+        )
+        assert reporter.send_hourly_summary() is True
+        body = captured[0]
+        assert "**CASH FIT**" in body
+        assert "**CAPITAL**" in body
+        # CAPITAL appears strictly BEFORE CASH FIT (the ordering rationale).
+        assert body.index("**CAPITAL**") < body.index("**CASH FIT**")
+
+    def test_hourly_summary_omits_cash_fit_when_balanced(
+            self, fresh_store, monkeypatch):
+        """The summary must never become its own lying green light: a
+        BALANCED verdict produces no CASH FIT block."""
+        self._stub_signals(monkeypatch, [])
+        self._stub_builder(monkeypatch, {
+            "verdict": "BALANCED", "headline": "balanced — ok",
+        })
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_hourly_summary() is True
+        assert "**CASH FIT**" not in captured[0]
+
+    def test_daily_close_includes_overdeployed(self, fresh_store,
+                                                  monkeypatch):
+        """Daily close wires the line too — both surfaces parity-tested."""
+        self._stub_signals(monkeypatch, [])
+        self._stub_builder(monkeypatch, {
+            "verdict": "OVERDEPLOYED",
+            "headline": ("OVERDEPLOYED — only 8% cash with NVDA at "
+                         "ai_score 9.0; cannot add without trimming."),
+        })
+        captured: list[str] = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(reporter.market, "benchmark_sp500",
+                            lambda: 5100.0)
+        monkeypatch.setattr(reporter, "get_store", lambda: fresh_store)
+        assert reporter.send_daily_close() is True
+        assert "**CASH FIT** ◈ OVERDEPLOYED" in captured[0]

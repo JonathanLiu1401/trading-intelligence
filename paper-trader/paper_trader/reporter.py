@@ -1340,6 +1340,141 @@ def _capital_pulse_line(store) -> str:
         return ""
 
 
+def _cash_conviction_fit_line(store) -> str:
+    """One-line "is the book idle despite the loudest live signal screaming,
+    or so deployed it cannot respond to one?" for the hourly / daily report.
+
+    ``_capital_pulse_line`` answers a structural question: "is the desk
+    *able* to act?" (PINNED / FREE / BLEEDING — derived from cash %, recent
+    activity, and involuntary droughts). It cannot answer the orthogonal
+    *point-in-time* question every PM asks next: *given today's loudest
+    live signal*, **is my cash level appropriate?** ``capital_paralysis``
+    reads FREE on a $341 / 34% cash book — historically correct — even
+    while a 9.0 ai_score signal screams on an unheld name; nothing in
+    Discord says "you have ~$340 sitting idle while QBTS is at 9.0".
+    ``/api/cash-conviction-fit`` made this auditable on the *dashboard*
+    via the verdict matrix (IDLE_DESPITE_SURGE / OVERDEPLOYED /
+    IDLE_LOW_CONVICTION / BALANCED) — but the operator lives in Discord
+    and never opens it (the exact dashboard→Discord gap
+    ``_capital_pulse_line`` / ``_concentration_line`` /
+    ``_heartbeat_line`` each closed, one dimension over).
+
+    Composes ``build_cash_conviction_fit`` **verbatim** (single source of
+    truth, AGENTS.md invariant #10 — the verdict / headline are the
+    builder's, never re-derived here, so this Discord line and
+    ``/api/cash-conviction-fit`` can never tell different stories). Feeds
+    it the SAME shape that endpoint does: ``store.get_portfolio()`` for
+    cash + total_value + cash_pct, ``signals.get_top_signals`` (which is
+    already ``_LIVE_ONLY``-filtered, AGENTS.md #3) for the loudest live
+    signals, and ``store.recent_decisions(limit=1)`` to disambiguate a
+    transient idle reading right after a fill. **Pure store + read-only
+    articles.db reads — NO network** (the Discord-path discipline; the
+    ``_source_mix_line`` precedent). Observational only, never gates, adds
+    no caps (invariants #2/#12 — the ``_capital_pulse_line`` precedent).
+    Failure contract mirrors the rest of ``reporter``: any builder / store
+    fault degrades to ``""`` ("no cash-fit line this report"), **never**
+    an exception ("no Discord summary this report").
+
+    Suppression — surface ONLY the two actionable verdicts:
+
+      * ``IDLE_DESPITE_SURGE`` — cash idle while top signal screams: the
+        operator should know the book is leaving alpha on the table.
+      * ``OVERDEPLOYED``       — cash so low the book cannot respond to a
+        loud signal without trimming: the operator should know.
+
+    ``IDLE_LOW_CONVICTION`` (idle is correct — nothing is screaming) and
+    ``BALANCED`` (the level fits) both stay silent. ``NO_DATA`` (missing
+    portfolio or no signals) stays silent. The
+    ``_capital_pulse_line`` FREE-and-not-bleeding /
+    ``_concentration_line`` non-SINGLE_NAME_RISK suppression precedent —
+    the summary must never become its own lying green light."""
+    try:
+        from .analytics.cash_conviction_fit import build_cash_conviction_fit
+        from . import signals as _signals
+
+        pf = store.get_portfolio() or {}
+        cash = pf.get("cash")
+        total_value = pf.get("total_value")
+        cash_pct = None
+        if (isinstance(cash, (int, float))
+                and isinstance(total_value, (int, float))
+                and total_value > 0):
+            cash_pct = (cash / total_value) * 100.0
+        # ``store.open_positions()`` is the SSOT for "what is currently held"
+        # (qty > 0 AND closed_at IS NULL — invariant #11 / store.py:289). The
+        # snapshot ``pf["positions"]`` is the lagged ``positions_json`` blob
+        # last written by ``update_portfolio``; under the documented
+        # equity-freshness divergence (AGENTS.md "Common failure modes") it
+        # can be stale for a cycle. The held set we feed to the builder must
+        # match the actual book, not a stale mirror.
+        try:
+            open_pos = store.open_positions() or []
+        except Exception:
+            open_pos = []
+        portfolio = {
+            "cash": cash,
+            "total_value": total_value,
+            "cash_pct": cash_pct,
+            "n_positions": len(open_pos),
+        }
+        held_tickers = {
+            (p.get("ticker") or "").upper()
+            for p in open_pos
+            if isinstance(p.get("ticker"), str) and p.get("ticker")
+        }
+
+        # Pull top live signals (already `_LIVE_ONLY`-filtered, AGENTS.md #3)
+        # via signals.get_top_signals — same data path as `_idle_opportunity_line`
+        # and `_source_mix_line`, so a builder/db fault here drops just this
+        # line, never the whole summary.
+        try:
+            top_articles = _signals.get_top_signals(n=20, hours=4, min_score=4.0)
+        except Exception:
+            top_articles = []
+        sig_list: list[dict] = []
+        for a in (top_articles or []):
+            if not isinstance(a, dict):
+                continue
+            tickers = a.get("tickers") or []
+            if not tickers:
+                continue
+            # First extracted ticker wins — same convention the dashboard
+            # endpoint uses. ai_score / urgency are already on the article.
+            tk = (tickers[0] or "").upper()
+            if not tk:
+                continue
+            sig_list.append({
+                "ticker": tk,
+                "ai_score": a.get("ai_score"),
+                "urgency": a.get("urgency"),
+                "source": a.get("source"),
+                "held": tk in held_tickers,
+            })
+
+        # Last decision (any verb) — disambiguates a transient cash-idle
+        # reading right after a fill (the builder's `recent_fill` gate).
+        try:
+            decisions = store.recent_decisions(limit=1) or []
+        except Exception:
+            decisions = []
+        last_decision = decisions[0] if decisions else None
+
+        result = build_cash_conviction_fit(portfolio, sig_list, last_decision)
+        if not isinstance(result, dict):
+            return ""
+        verdict = result.get("verdict")
+        # Surface ONLY the two actionable verdicts.
+        if verdict not in ("IDLE_DESPITE_SURGE", "OVERDEPLOYED"):
+            return ""
+        headline = result.get("headline") or ""
+        if not headline:
+            return ""
+        return f"**CASH FIT** ◈ {verdict}\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] cash-conviction-fit line skipped: {e}")
+        return ""
+
+
 def _concentration_line(store) -> str:
     """One-line "is the book dangerously concentrated in one name?" for the
     hourly / daily report.
@@ -3142,6 +3277,18 @@ def send_hourly_summary() -> bool:
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
+    # CASH FIT sits right after CAPITAL — both about cash deployment, one
+    # dimension over. CAPITAL says "the desk *cannot* act" (structural —
+    # PINNED / FREE / BLEEDING from cash %, recent activity, droughts).
+    # CASH FIT says "the desk *can* act but isn't sized to the live signal"
+    # (point-in-time — IDLE_DESPITE_SURGE / OVERDEPLOYED against today's
+    # loudest screaming name). Both can be silent independently (silence-
+    # when-nothing-actionable); neither suppresses the other (a FREE book
+    # can still be IDLE_DESPITE_SURGE on an unheld signal — the live state
+    # this surface exists to catch).
+    cf = _cash_conviction_fit_line(store)
+    if cf:
+        body += "\n" + cf
     cn = _concentration_line(store)
     if cn:
         body += "\n" + cn
@@ -3307,6 +3454,12 @@ def send_daily_close() -> bool:
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
+    # CASH FIT follows CAPITAL on daily close too — see send_hourly_summary
+    # for the CAPITAL→CASH-FIT placement rationale (can the desk act? vs.
+    # is it sized to the live signal?).
+    cf = _cash_conviction_fit_line(store)
+    if cf:
+        body += "\n" + cf
     cn = _concentration_line(store)
     if cn:
         body += "\n" + cn
