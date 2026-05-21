@@ -254,6 +254,146 @@ class TestExamplesCap:
         assert out["suppressed_examples"] == {}
 
 
+# ── PUSH-quality breakdown by score_source ────────────────────────────────────
+# `delivered_by_source` / `delivered_llm_fraction` answer the analyst question
+# the aggregate `urgency_label_split` masks: of the alerts I ACTUALLY got
+# pushed, what fraction were LLM-vetted (ground-truth ai_score) vs ML-only
+# (unverified model call)? Symmetric suppressed-side fields let an operator
+# see whether any gate preferentially absorbs ground-truth rows (a red flag
+# for calibration).
+
+class TestDeliveredBySource:
+    def test_empty_returns_zeroed_four_buckets(self):
+        """Zero-data discipline (mirrors `urgency_label_split`): keys exist
+        for every bucket even when the window is empty — UI / health checks
+        can render without conditional branches."""
+        out = A.compute_delivery_audit([], set())
+        assert out["delivered_by_source"] == {
+            "llm": 0, "ml": 0, "briefing_boost": 0, "null": 0,
+        }
+        assert out["suppressed_by_source"] == {
+            "llm": 0, "ml": 0, "briefing_boost": 0, "null": 0,
+        }
+        assert out["delivered_llm_fraction"] == 0.0
+        assert out["suppressed_llm_fraction"] == 0.0
+
+    def test_delivered_llm_fraction_matches_aggregate_definition(self):
+        """The fraction definition is byte-identical to `urgency_label_split`:
+        (llm + briefing_boost) / total. A drift between the audit's number
+        and the dashboard's aggregate metric would silently mislead the
+        analyst — pin the formula so they always agree."""
+        # 2 llm + 1 briefing_boost + 2 ml = 5 delivered
+        delivered_titles = [
+            ("Fed surprise rate cut shocks markets today", "llm"),
+            ("Nvidia beats Q3 estimates on AI demand", "llm"),
+            ("Major DRAM supply shock disrupts memory pricing globally",
+             "briefing_boost"),
+            ("Real headline carried only by model relevance head", "ml"),
+            ("Another model-only call from the urgency head somewhere", "ml"),
+        ]
+        rows = []
+        sigs = set()
+        for i, (title, src) in enumerate(delivered_titles):
+            rows.append({
+                "_id": f"d{i}", "title": title, "source": "rss",
+                "link": f"https://reuters.com/{i}",
+                "published": _fresh_iso(), "first_seen": _fresh_iso(),
+                "ai_score": 9.0 if src != "ml" else 0.0,
+                "ml_score": 9.0 if src == "ml" else None,
+                "score_source": src,
+            })
+            sigs.add(_signature(title))
+        out = A.compute_delivery_audit(rows, sigs)
+        assert out["delivered"] == 5
+        assert out["delivered_by_source"] == {
+            "llm": 2, "ml": 2, "briefing_boost": 1, "null": 0,
+        }
+        # (2 llm + 1 briefing_boost) / 5 = 0.6
+        assert out["delivered_llm_fraction"] == 0.6
+
+    def test_suppressed_by_source_partitions_symmetrically(self):
+        """Suppressed-side breakdown is the early-warning view: a high
+        suppressed_llm_fraction means gates are absorbing ground-truth labels
+        (calibration red flag). Symmetric to delivered-side; both sides sum
+        to the total."""
+        rows = [
+            # 2 suppressed (recap template, both ml-only)
+            {"_id": "s1", "title": "Why MU Stock Is Trading Up Today",
+             "source": "rss", "link": "https://x.com/1",
+             "published": _fresh_iso(), "first_seen": _fresh_iso(),
+             "ai_score": 0, "ml_score": 9.5, "score_source": "ml"},
+            {"_id": "s2", "title": "Why Tesla Stock Is Trading Up Today",
+             "source": "rss", "link": "https://x.com/2",
+             "published": _fresh_iso(), "first_seen": _fresh_iso(),
+             "ai_score": 0, "ml_score": 9.0, "score_source": "ml"},
+            # 1 suppressed (low_authority) but score_source='llm' — calibration
+            # red flag worth surfacing (gate caught a ground-truth label).
+            {"_id": "s3", "title": "Real prose headline that got cred-gated",
+             "source": "reddit/r/wsb", "link": "https://reddit.com/x",
+             "published": _fresh_iso(), "first_seen": _fresh_iso(),
+             "ai_score": 9.0, "ml_score": None, "score_source": "llm"},
+        ]
+        out = A.compute_delivery_audit(rows, set())
+        assert out["suppressed"] == 3
+        assert out["suppressed_by_source"] == {
+            "llm": 1, "ml": 2, "briefing_boost": 0, "null": 0,
+        }
+        # 1 llm / 3 total = 0.3333 — a non-zero fraction here is the red flag.
+        assert out["suppressed_llm_fraction"] == round(1 / 3, 4)
+
+    def test_missing_or_unknown_score_source_bucketed_as_null(self):
+        """A row without `score_source` (legacy pre-migration / non-canonical
+        caller) buckets into `null` — mirrors `urgency_label_split`'s
+        discipline so the audit and the aggregate metric agree exactly."""
+        title = "Some headline with no score_source field at all"
+        rows = [
+            # Legacy row missing the column entirely
+            {"_id": "l1", "title": title, "source": "rss",
+             "link": "https://x.com/x",
+             "published": _fresh_iso(), "first_seen": _fresh_iso()},
+            # Row with unexpected score_source value
+            {"_id": "l2", "title": "Another similar headline that exists",
+             "source": "rss", "link": "https://x.com/y",
+             "published": _fresh_iso(), "first_seen": _fresh_iso(),
+             "score_source": "weird_value"},
+        ]
+        out = A.compute_delivery_audit(rows, {_signature(title)})
+        assert out["delivered_by_source"]["null"] == 1
+        assert out["suppressed_by_source"]["null"] == 1
+        # Neither bucketed value counts as vetted, so llm_fraction stays 0.
+        assert out["delivered_llm_fraction"] == 0.0
+        assert out["suppressed_llm_fraction"] == 0.0
+
+    def test_total_split_equals_total_partition(self):
+        """Invariant: sum of delivered_by_source + suppressed_by_source
+        equals total. No row falls through the score_source bucketing."""
+        rows = []
+        sigs = set()
+        # 3 delivered + 4 suppressed across all four buckets
+        for i, (delivered_flag, src) in enumerate([
+            (True, "llm"), (True, "ml"), (True, "briefing_boost"),
+            (False, "llm"), (False, "ml"), (False, None), (False, "briefing_boost"),
+        ]):
+            title = f"Unique headline number {i} with enough tokens for canonical signature"
+            row = {
+                "_id": f"r{i}", "title": title, "source": "rss",
+                "link": f"https://x.com/{i}",
+                "published": _fresh_iso(), "first_seen": _fresh_iso(),
+                "ai_score": 9.0, "ml_score": None,
+            }
+            if src is not None:
+                row["score_source"] = src
+            rows.append(row)
+            if delivered_flag:
+                sigs.add(_signature(title))
+        out = A.compute_delivery_audit(rows, sigs)
+        delivered_total = sum(out["delivered_by_source"].values())
+        suppressed_total = sum(out["suppressed_by_source"].values())
+        assert delivered_total == out["delivered"]
+        assert suppressed_total == out["suppressed"]
+        assert delivered_total + suppressed_total == out["total"]
+
+
 # ── pure: no DB / IO ──────────────────────────────────────────────────────────
 class TestPureNoIO:
     def test_pure_function_does_no_network_or_disk(self, monkeypatch):

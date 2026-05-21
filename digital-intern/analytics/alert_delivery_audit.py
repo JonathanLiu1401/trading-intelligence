@@ -222,6 +222,39 @@ def _fetch_alerted_sigs(
     return {r[0] for r in rows if r[0]}
 
 
+def _score_source_bucket(art: dict) -> str:
+    """Map an article row's ``score_source`` to one of the four canonical
+    buckets used by ``storage.article_store.urgency_label_split``.
+
+    Returns ``'llm'`` / ``'ml'`` / ``'briefing_boost'`` / ``'null'``. The
+    ``'null'`` bucket covers legacy pre-migration rows that pre-date the
+    score_source column AND rows from non-canonical callers that omit the
+    field entirely — mirrors the aggregate metric's discipline so the audit
+    and the dashboard tile never disagree on what counts as "unverified".
+    """
+    src = art.get("score_source")
+    if src in ("llm", "ml", "briefing_boost"):
+        return src
+    return "null"
+
+
+def _empty_source_buckets() -> dict[str, int]:
+    """Zero counts in EVERY canonical bucket — same zero-data discipline as
+    ``urgency_label_split``: a UI / health-check can render every bucket
+    without conditional branches when the window is empty."""
+    return {"llm": 0, "ml": 0, "briefing_boost": 0, "null": 0}
+
+
+def _llm_fraction(buckets: dict[str, int]) -> float:
+    """``(llm + briefing_boost) / total``, 0.0 on an empty bucket set.
+    Matches ``storage.article_store.urgency_label_split``'s definition
+    verbatim so the audit's quality figure is comparable to the aggregate
+    metric."""
+    vetted = buckets["llm"] + buckets["briefing_boost"]
+    total = sum(buckets.values())
+    return round(vetted / total, 4) if total else 0.0
+
+
 def compute_delivery_audit(
     urgent_rows: Iterable[dict],
     alerted_sigs: set[str],
@@ -237,6 +270,17 @@ def compute_delivery_audit(
     a row with no title yields an empty signature which can never appear in
     ``alerted_sigs`` (matching ``_signature``'s contract), so it is reported
     as suppressed and attributed to ``unknown_gate`` rather than crashing.
+
+    Quality breakdown — ``delivered_by_source`` / ``suppressed_by_source``
+    (and the matching ``*_llm_fraction``) count each partition by
+    ``score_source`` (``'llm'`` / ``'ml'`` / ``'briefing_boost'`` /
+    ``'null'``). The aggregate ``urgency_label_split`` measures quality over
+    the full urgency>=1 set — dominated by gate-suppressed rows — so the
+    PUSH-quality answer ("what fraction of the alerts I actually got were
+    LLM-vetted?") was previously masked. The two new fields surface that
+    answer directly, while the symmetric suppression breakdown lets an
+    operator see whether one gate preferentially absorbs model-only firings
+    vs LLM-vetted ones (the latter would be a tuning red flag).
     """
     delivered: list[dict] = []
     suppressed: list[dict] = []
@@ -245,13 +289,18 @@ def compute_delivery_audit(
     examples: dict[str, list[dict]] = {
         k: [] for k in suppressed_by
     }
+    delivered_by_source = _empty_source_buckets()
+    suppressed_by_source = _empty_source_buckets()
 
     for art in urgent_rows:
+        bucket = _score_source_bucket(art)
         sig = _signature(art.get("title"))
         if sig and sig in alerted_sigs:
             delivered.append(art)
+            delivered_by_source[bucket] += 1
             continue
         suppressed.append(art)
+        suppressed_by_source[bucket] += 1
         # Attribute to the FIRST gate that catches the row — matches live
         # precedence in ``send_urgent_alert``. If nothing catches, the row
         # is a "phantom mark" the audit can't explain (an operator action,
@@ -289,6 +338,17 @@ def compute_delivery_audit(
         "suppressed_examples": {
             k: v for k, v in examples.items() if v
         },
+        # PUSH-quality breakdown: the score_source distribution of what the
+        # analyst was actually pushed. ``delivered_llm_fraction`` matches
+        # ``urgency_label_split``'s definition verbatim (llm + briefing_boost
+        # over total) so the two metrics are directly comparable.
+        "delivered_by_source": delivered_by_source,
+        "delivered_llm_fraction": _llm_fraction(delivered_by_source),
+        # Symmetric: which score_source dominates the rows the gates absorb?
+        # If suppressed_llm_fraction is high, gates are catching ground-truth
+        # LLM-labeled urgent rows — a calibration red flag worth investigating.
+        "suppressed_by_source": suppressed_by_source,
+        "suppressed_llm_fraction": _llm_fraction(suppressed_by_source),
     }
 
 
