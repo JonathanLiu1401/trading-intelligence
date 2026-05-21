@@ -1712,25 +1712,125 @@ class TestActivityCounts:
 
     def test_window_excludes_strictly_older(self):
         c = reporter._activity_counts(self._DECISIONS, "2026-05-17T08:15:00+00:00")
-        # 09:30 filled, 09:00 hold, 08:30 no_decision in window;
+        # 09:30 filled (BUY → +1 buys), 09:00 hold, 08:30 no_decision in window;
         # 08:00 blocked and 06:00 hold are strictly older → excluded.
         assert c == {"filled": 1, "hold": 1, "no_decision": 1,
-                     "blocked": 0, "other": 0}
+                     "blocked": 0, "other": 0, "buys": 1, "sells": 0}
 
     def test_cutoff_equal_timestamp_is_included(self):
         # since == an 08:00 row's ts: it is NOT < since, so it counts.
         c = reporter._activity_counts(self._DECISIONS, "2026-05-17T08:00:00+00:00")
+        # 08:00 row is "SELL X → BLOCKED" — NOT counted as a sell (only FILLED
+        # rows feed the buy/sell direction split; a BLOCKED SELL never moved
+        # cash).
         assert c == {"filled": 1, "hold": 1, "no_decision": 1,
-                     "blocked": 1, "other": 0}
+                     "blocked": 1, "other": 0, "buys": 1, "sells": 0}
 
     def test_all_in_window(self):
         c = reporter._activity_counts(self._DECISIONS, "2026-05-17T00:00:00+00:00")
         assert c == {"filled": 1, "hold": 2, "no_decision": 1,
-                     "blocked": 1, "other": 0}
+                     "blocked": 1, "other": 0, "buys": 1, "sells": 0}
 
     def test_empty(self):
         assert reporter._activity_counts([], "2026-05-17T00:00:00+00:00") == {
-            "filled": 0, "hold": 0, "no_decision": 0, "blocked": 0, "other": 0}
+            "filled": 0, "hold": 0, "no_decision": 0, "blocked": 0, "other": 0,
+            "buys": 0, "sells": 0}
+
+
+class TestDecisionActionVerb:
+    """The action-verb extractor must coarsely bucket every action_taken row
+    strategy.py writes (BUY/SELL/HOLD variants + the special NO_DECISION row).
+    Pure on the string — no store reads, never raises. Companion to
+    _classify_decision_outcome."""
+
+    def test_buy_variants_collapse_to_buy(self):
+        # Stock + option BUY variants all bucket as BUY (deploying cash).
+        assert reporter._decision_action_verb("BUY NVDA → FILLED") == "BUY"
+        assert reporter._decision_action_verb("BUY_CALL NVDA → FILLED") == "BUY"
+        assert reporter._decision_action_verb("BUY_PUT MU → FILLED") == "BUY"
+
+    def test_sell_variants_collapse_to_sell(self):
+        # Stock + option SELL variants all bucket as SELL (freeing cash).
+        assert reporter._decision_action_verb("SELL NVDA → FILLED") == "SELL"
+        assert reporter._decision_action_verb("SELL_CALL X → FILLED") == "SELL"
+        assert reporter._decision_action_verb("SELL_PUT Y → FILLED") == "SELL"
+
+    def test_hold_returns_hold(self):
+        assert reporter._decision_action_verb("HOLD MU → HOLD") == "HOLD"
+
+    def test_no_decision_returns_none(self):
+        # The special NO_DECISION row has no arrow and no verb.
+        assert reporter._decision_action_verb("NO_DECISION") is None
+
+    def test_none_and_empty_return_none(self):
+        assert reporter._decision_action_verb(None) is None
+        assert reporter._decision_action_verb("") is None
+        assert reporter._decision_action_verb("   ") is None
+
+    def test_rebalance_and_unknown_actions_return_none(self):
+        # REBALANCE is a real action but not BUY/SELL/HOLD; the trader-facing
+        # buy/sell split doesn't apply to it. The fall-through bucket is None.
+        assert reporter._decision_action_verb("REBALANCE → HOLD") is None
+        assert reporter._decision_action_verb("UNKNOWN_THING → FILLED") is None
+
+    def test_status_only_affects_outcome_not_verb(self):
+        # A BUY that BLOCKED is still a BUY *intent* — the verb extractor
+        # reads the action segment, not the status. _activity_counts then
+        # gates the buys counter on FILLED so a blocked-buy never moves the
+        # cash counter.
+        assert reporter._decision_action_verb("BUY NVDA → BLOCKED") == "BUY"
+
+    def test_lowercase_input_normalized(self):
+        # Defensive: action_taken is written uppercase by strategy.py but the
+        # function never assumes case.
+        assert reporter._decision_action_verb("buy nvda → filled") == "BUY"
+
+
+class TestActivityCountsBuySellSplit:
+    """The new buys/sells direction split, additive to the existing status
+    buckets. Counted only on FILLED rows — a BLOCKED BUY never moved cash and
+    must not inflate the buy counter."""
+
+    def test_mixed_filled_buys_and_sells(self):
+        decisions = [
+            {"timestamp": "2026-05-17T10:00:00+00:00", "action_taken": "BUY NVDA → FILLED"},
+            {"timestamp": "2026-05-17T09:30:00+00:00", "action_taken": "SELL MU → FILLED"},
+            {"timestamp": "2026-05-17T09:00:00+00:00", "action_taken": "BUY_CALL X → FILLED"},
+            {"timestamp": "2026-05-17T08:30:00+00:00", "action_taken": "HOLD Y → HOLD"},
+            {"timestamp": "2026-05-17T08:00:00+00:00", "action_taken": "SELL_PUT Z → FILLED"},
+        ]
+        c = reporter._activity_counts(decisions, "2026-05-17T00:00:00+00:00")
+        # 4 fills total: 2 buys (BUY + BUY_CALL), 2 sells (SELL + SELL_PUT)
+        assert c["filled"] == 4
+        assert c["buys"] == 2
+        assert c["sells"] == 2
+        assert c["hold"] == 1
+
+    def test_blocked_buy_does_not_inflate_buys_count(self):
+        # A blocked buy never moved cash — must count as blocked, NOT as a buy.
+        decisions = [
+            {"timestamp": "2026-05-17T10:00:00+00:00", "action_taken": "BUY NVDA → BLOCKED"},
+            {"timestamp": "2026-05-17T09:00:00+00:00", "action_taken": "SELL X → BLOCKED"},
+        ]
+        c = reporter._activity_counts(decisions, "2026-05-17T00:00:00+00:00")
+        assert c["blocked"] == 2
+        assert c["filled"] == 0
+        assert c["buys"] == 0
+        assert c["sells"] == 0
+
+    def test_buys_plus_sells_equals_filled_when_only_buys_sells_filled(self):
+        # Invariant: buys + sells ≤ filled (a filled REBALANCE could exist and
+        # bucket as neither). Pin the equality for the dominant BUY/SELL case.
+        decisions = [
+            {"timestamp": "2026-05-17T10:00:00+00:00", "action_taken": "BUY NVDA → FILLED"},
+            {"timestamp": "2026-05-17T09:00:00+00:00", "action_taken": "BUY MU → FILLED"},
+            {"timestamp": "2026-05-17T08:00:00+00:00", "action_taken": "SELL X → FILLED"},
+        ]
+        c = reporter._activity_counts(decisions, "2026-05-17T00:00:00+00:00")
+        assert c["filled"] == 3
+        assert c["buys"] + c["sells"] == c["filled"]
+        assert c["buys"] == 2
+        assert c["sells"] == 1
 
 
 class TestMovers:
@@ -1808,7 +1908,8 @@ class TestSessionBlock:
 
         block = reporter._session_block(fresh_store, 24.0, "24h")
         assert "**SESSION** ◈ last 24h" in block
-        assert ("Decisions   3   filled 1  hold 1  no-dec 1  blocked 0"
+        # filled > 0 → the inline (YB/ZS) direction split is rendered.
+        assert ("Decisions   3   filled 1 (1B/0S)  hold 1  no-dec 1  blocked 0"
                 in block)
         assert "Best `NVDA` $+20.00  ·  Worst `LITE` $-10.00" in block
         # (1030/1000-1)*100 = +3.00, (5100/5000-1)*100 = +2.00, alpha +1.00
@@ -1826,6 +1927,52 @@ class TestSessionBlock:
         boom = MagicMock()
         boom.recent_decisions.side_effect = RuntimeError("db gone")
         assert reporter._session_block(boom, 1.0, "1h") == ""
+
+    def test_no_filled_no_split_token(self, fresh_store):
+        # With filled == 0 the (YB/ZS) split is omitted — there's nothing to
+        # split. A trader reading "filled 0" needs no further detail; rendering
+        # "(0B/0S)" would be noisy and the SESSION block must stay terse.
+        fresh_store.record_decision(True, 5, "HOLD MU → HOLD", "x", 1000, 500)
+        fresh_store.record_decision(True, 5, "NO_DECISION", "x", 1000, 500)
+        block = reporter._session_block(fresh_store, 24.0, "24h")
+        assert "filled 0" in block
+        # No parenthesised split token follows filled 0.
+        assert "filled 0 (" not in block
+
+    def test_filled_split_buys_only(self, fresh_store):
+        # All filled rows are BUYs → the split reads "(NB/0S)". Locks the
+        # "deploying cash" desk state the operator must be able to see at a
+        # glance vs. the "freeing cash" inverse.
+        fresh_store.record_decision(True, 5, "BUY NVDA → FILLED", "x", 1000, 500)
+        fresh_store.record_decision(True, 5, "BUY_CALL MU → FILLED", "x", 1000, 500)
+        block = reporter._session_block(fresh_store, 24.0, "24h")
+        assert "filled 2 (2B/0S)" in block
+
+    def test_filled_split_sells_only(self, fresh_store):
+        # All filled rows are SELLs → "(0B/NS)". Inverse desk state.
+        fresh_store.record_decision(True, 5, "SELL NVDA → FILLED", "x", 1000, 500)
+        fresh_store.record_decision(True, 5, "SELL_PUT MU → FILLED", "x", 1000, 500)
+        block = reporter._session_block(fresh_store, 24.0, "24h")
+        assert "filled 2 (0B/2S)" in block
+
+    def test_filled_split_mixed(self, fresh_store):
+        fresh_store.record_decision(True, 5, "BUY NVDA → FILLED", "x", 1000, 500)
+        fresh_store.record_decision(True, 5, "SELL MU → FILLED", "x", 1000, 500)
+        fresh_store.record_decision(True, 5, "SELL_CALL X → FILLED", "x", 1000, 500)
+        block = reporter._session_block(fresh_store, 24.0, "24h")
+        assert "filled 3 (1B/2S)" in block
+
+    def test_decisions_total_does_not_double_count_buys_sells(self, fresh_store):
+        # The new buys/sells keys are an ADDITIVE sub-division of filled —
+        # they must not be summed into the top-level "Decisions N" count or it
+        # would inflate to N + filled. Regression guard.
+        fresh_store.record_decision(True, 5, "BUY NVDA → FILLED", "x", 1000, 500)
+        fresh_store.record_decision(True, 5, "HOLD MU → HOLD", "x", 1000, 500)
+        block = reporter._session_block(fresh_store, 24.0, "24h")
+        # 1 filled + 1 hold = 2 decisions total. If buys were summed in the
+        # total would read 3 (or higher); pin to 2.
+        assert "Decisions   2" in block
+        assert "Decisions   3" not in block
 
     def test_hourly_summary_includes_session_block(self, fresh_store, monkeypatch):
         captured: list[str] = []
