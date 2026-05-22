@@ -55,6 +55,7 @@ from collectors.web_scraper import scrape_web
 from collectors.stock_data import get_stock_data
 from collectors.earnings_calendar import get_earnings
 from collectors.options_monitor import get_options_data, format_options_block
+from collectors.cboe_unusual_options import collect_cboe_unusual_options
 from collectors.portfolio_pnl import get_portfolio_pnl, format_pnl_block, write_pl_snapshot
 from collectors.sec_edgar import collect_sec_edgar, collect_sec_edgar_fulltext
 from collectors.sec_activist_collector import collect as collect_sec_activist
@@ -161,6 +162,7 @@ MACRO_CALENDAR_INTERVAL = 3600    # FOMC/BLS macro event calendar — once per h
 FOREX_FACTORY_CAL_INTERVAL = 3600  # Forex Factory economic calendar — once per hour
 FINRA_SHORT_INTERVAL    = 3600    # FINRA RegSHO short volume — once per hour (daily file)
 CONGRESS_TRADES_INTERVAL = 3600   # Congressional trading disclosures — once per hour
+CBOE_UNUSUAL_OPTIONS_INTERVAL = 900  # CBOE unusual options flow — every 15min
 CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog — once per hour
 MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
@@ -1562,6 +1564,27 @@ def finra_short_worker(store: ArticleStore):
 
 
 # ── Worker: Congressional trading disclosures — every 1h ────────────────────
+def cboe_unusual_options_worker(store: ArticleStore):
+    log.info("[cboe_unusual_options_worker] started")
+    bo = Backoff("cboe_unusual_options", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_cboe_unusual_options()
+            _ingest(store, articles, "cboe_unusual_options")
+            try:
+                source_health.record_result("cboe_unusual_options", len(articles))
+            except Exception as he:
+                log.warning(f"[cboe_unusual_options_worker] source_health error: {he}")
+            _worker_last_ok["cboe_unusual_options"] = time.time()
+            log.debug(f"[cboe_unusual_options] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[cboe_unusual_options_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(CBOE_UNUSUAL_OPTIONS_INTERVAL)
+
+
 def congress_trades_worker(store: ArticleStore):
     log.info("[congress_trades_worker] started")
     bo = Backoff("congress_trades", base=60.0, cap=900.0)
@@ -3372,6 +3395,7 @@ def main():
         ("forex_factory_cal", forex_factory_cal_worker),
         ("finra_short",   finra_short_worker),
         ("congress_trades", congress_trades_worker),
+        ("cboe_unusual_options", cboe_unusual_options_worker),
         ("cisa_kev",    cisa_kev_worker),
         ("insider_cluster", insider_cluster_worker),
         ("benzinga_analyst", benzinga_analyst_worker),
