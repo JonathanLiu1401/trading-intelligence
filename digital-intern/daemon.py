@@ -52,7 +52,7 @@ from collectors.reddit_collector import collect_reddit
 from collectors.stocktwits_collector import collect_stocktwits
 from collectors.stocktwits_sentiment import collect_stocktwits_sentiment
 from collectors.web_scraper import scrape_web
-from collectors.stock_data import get_stock_data
+from collectors.stock_data import get_stock_data, _fetch_one
 from collectors.earnings_calendar import get_earnings
 from collectors.options_monitor import get_options_data, format_options_block
 from collectors.cboe_unusual_options import collect_cboe_unusual_options
@@ -122,6 +122,7 @@ from storage.article_store import ArticleStore
 from watchers.urgency_scorer import score_batch, BATCH_SIZE as URGENCY_BATCH_SIZE
 from watchers.alert_agent import send_urgent_alert
 from ml.inference import score_articles
+from ml.features import LIVE_PORTFOLIO_TICKERS
 from ml.sentiment_trends import write_trends as write_score_trends
 from ml.trainer import train as ml_train
 from ml.trainer import train_continuous
@@ -2325,6 +2326,19 @@ def scorer_worker(store: ArticleStore):
 
 
 # ── Worker W11: Portfolio price alerts — every 5min ─────────────────────────
+def _price_alert_universe() -> list[str]:
+    """Tickers the price-alert worker monitors for >=3% moves.
+
+    The union of the static ``PORTFOLIO_TICKERS`` tuple with the live
+    ``ml.features.LIVE_PORTFOLIO_TICKERS`` set (which reads positions, option
+    underlyings and sector_watchlist out of ``config/portfolio.json``). The
+    union — never just the static tuple — is what guarantees an open position
+    added in the trading UI is never silently dropped from price alerting,
+    even though the static tuple is frozen for cross-module ``_BOOK_TICKERS``
+    parity. Sorted for a deterministic, test-pinnable order."""
+    return sorted(set(PORTFOLIO_TICKERS) | set(LIVE_PORTFOLIO_TICKERS))
+
+
 def price_alert_worker(store: ArticleStore):
     log.info("[price_alert_worker] started")
     bo = Backoff("price_alert", base=5.0, cap=300.0)
@@ -2332,7 +2346,23 @@ def price_alert_worker(store: ArticleStore):
         try:
             data = get_stock_data()
             by_ticker = {row["ticker"]: row for row in data.get("equities", [])}
-            for tkr in PORTFOLIO_TICKERS:
+            # get_stock_data() is driven by config/watchlist.json, which lags
+            # config/portfolio.json — actual open positions absent from the
+            # watchlist (live 2026-05-21: GOOG/COHR/NVDL/LNOK/MUU were held in
+            # portfolio.json but not in watchlist.json) would get NO 3% price
+            # alert at all: a silent blind spot on names the analyst has real
+            # money in. Cover every live held/watched name: union the static
+            # PORTFOLIO_TICKERS with ml.features.LIVE_PORTFOLIO_TICKERS (the
+            # SSOT that reads positions + option underlyings + sector_watchlist
+            # from config/portfolio.json), then fetch any the watchlist sweep
+            # missed directly via stock_data._fetch_one.
+            alert_universe = _price_alert_universe()
+            for tkr in alert_universe:
+                if tkr not in by_ticker:
+                    row = _fetch_one(tkr)
+                    if row:
+                        by_ticker[tkr] = row
+            for tkr in alert_universe:
                 row = by_ticker.get(tkr)
                 if not row:
                     continue
@@ -2353,7 +2383,7 @@ def price_alert_worker(store: ArticleStore):
                     discord_send(msg, is_alert=True)
                 _last_prices[tkr] = price
             _worker_last_ok["price_alert"] = time.time()
-            log.debug(f"[price_alert] checked {len(PORTFOLIO_TICKERS)} tickers")
+            log.debug(f"[price_alert] checked {len(alert_universe)} tickers")
             bo.reset()
         except Exception as e:
             log.warning(f"[price_alert_worker] error: {e}; backing off {bo.peek():.0f}s")
