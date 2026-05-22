@@ -1132,6 +1132,116 @@ class TestHoldAgeInPrompt:
         assert line.index("held=1d") < line.index("STALE MARK")
 
 
+class TestSignalAgeStr:
+    """`_signal_age_str` — the pure news-freshness primitive surfaced into
+    the Opus prompt's TOP SCORED SIGNALS lines."""
+
+    from datetime import datetime, timedelta, timezone
+    _NOW = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_minutes_render(self):
+        seen = (self._NOW - self.timedelta(minutes=5)).isoformat()
+        assert strategy._signal_age_str(seen, now=self._NOW) == "5m"
+
+    def test_sub_minute_is_zero_m(self):
+        seen = (self._NOW - self.timedelta(seconds=40)).isoformat()
+        assert strategy._signal_age_str(seen, now=self._NOW) == "0m"
+
+    def test_minutes_floor_not_round(self):
+        # 92m 59s must read "92m" (floor), never round up to 93m.
+        seen = (self._NOW - self.timedelta(minutes=92, seconds=59)).isoformat()
+        assert strategy._signal_age_str(seen, now=self._NOW) == "92m"
+
+    def test_never_rolls_up_to_hours(self):
+        # Unlike _hold_age_str, a 2h-old signal stays minute-grained ("120m")
+        # so minute freshness is never lost to an "Nh" bucket.
+        seen = (self._NOW - self.timedelta(hours=2)).isoformat()
+        assert strategy._signal_age_str(seen, now=self._NOW) == "120m"
+
+    def test_missing_returns_empty(self):
+        assert strategy._signal_age_str(None, now=self._NOW) == ""
+        assert strategy._signal_age_str("", now=self._NOW) == ""
+
+    def test_unparseable_returns_empty(self):
+        assert strategy._signal_age_str("not-a-date", now=self._NOW) == ""
+
+    def test_future_clamps_to_zero(self):
+        # Wall clock stepped back — never render a negative age.
+        seen = (self._NOW + self.timedelta(minutes=30)).isoformat()
+        assert strategy._signal_age_str(seen, now=self._NOW) == "0m"
+
+    def test_naive_timestamp_treated_as_utc(self):
+        naive = ((self._NOW - self.timedelta(minutes=15))
+                 .replace(tzinfo=None).isoformat())
+        assert strategy._signal_age_str(naive, now=self._NOW) == "15m"
+
+    def test_z_suffix_timestamp_parsed(self):
+        # digital-intern first_seen values can carry a trailing Z.
+        seen = ((self._NOW - self.timedelta(minutes=7))
+                .isoformat().replace("+00:00", "Z"))
+        assert strategy._signal_age_str(seen, now=self._NOW) == "7m"
+
+
+class TestSignalAgeInPrompt:
+    """`_build_payload` must surface `age=<Nm>` per signal when first_seen is
+    present, and stay byte-identical when it is absent."""
+
+    from datetime import datetime, timedelta, timezone
+
+    def _snap(self):
+        return {"cash": 100.0, "open_value": 0.0, "total_value": 100.0,
+                "positions": []}
+
+    def _sig(self, **over):
+        s = {"ai_score": 7.5, "urgency": 1, "title": "NVDA beats earnings",
+             "tickers": ["NVDA"]}
+        s.update(over)
+        return s
+
+    def test_signal_line_shows_age(self):
+        seen = (self.datetime.now(self.timezone.utc)
+                - self.timedelta(minutes=8)).isoformat()
+        sig = self._sig(first_seen=seen)
+        body = strategy._build_payload(self._snap(), [sig], [], {}, {}, None,
+                                       False, quant_signals={})
+        line = next(ln for ln in body.splitlines()
+                    if "NVDA beats earnings" in ln)
+        assert "age=8m" in line
+        # The age token sits before the title, after urg.
+        assert line.index("urg=") < line.index("age=8m") < line.index("NVDA beats")
+
+    def test_no_first_seen_renders_no_token(self):
+        sig = self._sig()  # no first_seen
+        body = strategy._build_payload(self._snap(), [sig], [], {}, {}, None,
+                                       False, quant_signals={})
+        line = next(ln for ln in body.splitlines()
+                    if "NVDA beats earnings" in ln)
+        assert "age=" not in line
+
+    def test_malformed_first_seen_renders_no_token(self):
+        sig = self._sig(first_seen="garbage")
+        body = strategy._build_payload(self._snap(), [sig], [], {}, {}, None,
+                                       False, quant_signals={})
+        line = next(ln for ln in body.splitlines()
+                    if "NVDA beats earnings" in ln)
+        assert "age=" not in line
+
+    def test_ai_score_and_urgency_still_rendered(self):
+        # The age token is additive — the pre-existing score/urgency fields
+        # must be untouched.
+        seen = (self.datetime.now(self.timezone.utc)
+                - self.timedelta(minutes=3)).isoformat()
+        sig = self._sig(ai_score=9.2, urgency=2, first_seen=seen)
+        body = strategy._build_payload(self._snap(), [sig], [], {}, {}, None,
+                                       False, quant_signals={})
+        line = next(ln for ln in body.splitlines()
+                    if "NVDA beats earnings" in ln)
+        assert "[9.2]" in line
+        assert "urg=2" in line
+        assert "age=3m" in line
+        assert "tickers=NVDA" in line
+
+
 class TestWatchlistHygiene:
     """The live universe must not advertise permanently-delisted tickers.
 
