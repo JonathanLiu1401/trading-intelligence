@@ -6,6 +6,156 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-22 — Agent 1 (paper-trader core) HYBRID review pass #3
+
+### Phase 1: Bug fix — `bb_position` threshold miscalibrated in the live system prompt
+
+`get_quant_signals_live` computes `bb_position = (last - sma20) / (2 * sd20)`,
+so a price sitting *on* the upper/lower Bollinger band (2σ from the 20-day
+mean) lands at exactly **±1**, not ±2 — the `±2` clamp is only reached at a
+~4σ move, i.e. effectively never. The live `SYSTEM_PROMPT` told Opus
+"`bb_position` approaching **+2 or -2**" signals stretched conditions, so a
+genuinely band-stretched name read as un-stretched to the decision engine.
+Corrected the prompt text to `+1 / -1` and pinned the calibration with
+`TestBollingerPositionCalibration` (3 tests — monkeypatched yfinance,
+asserts a price at the 2σ band yields `bb_position ≈ 1.0`, recomputes the
+documented formula, and the negative-band mirror). Commit `b4102ac`.
+`bugs_fixed = 1`.
+
+### Phase 2: Feature — band-labelled `bb_position` in the quant prompt block
+
+`_format_quant_signals` previously rendered `bb_position` as a bare float,
+leaving Opus to threshold it against the band every cycle. New `_bb_label`
+annotates a stretched reading (`|x| >= 0.9`) with `(upper band)` /
+`(lower band)`; mid-range values stay bare (the silence-when-nothing-
+actionable precedent). Observational only, never gates Opus — the same
+render-side enrichment the `held=` / signal `age=` tokens already do.
+`TestBbLabel` (7 tests) pins the boundary, both bands, the non-numeric
+degrade path, and end-to-end rendering in the quant block. Commit `04e0ac1`.
+`features_added = 1`.
+
+### Phase 3: Live validation findings (live trader ~06:30 UTC)
+
+1. **NO_DECISION storm continues — every cycle host_saturated.** The 8
+   most recent `decisions` rows are all `skipped claude call — host
+   saturated: 9–11 concurrent Opus`; last *real* trade was
+   2026-05-21T10:00 (~20h ago). `host_guard` is behaving exactly as
+   designed (skips the doomed call rather than OOM-thrash the 15 GB box).
+   Self-induced — 3+ concurrent HYBRID/review Opus agents were visible in
+   `ps`. Not a code bug; the audit harness is starving the system it
+   audits. Matches the documented `pt-no-decision-host-saturation` pattern.
+2. **SWR `/api/*` endpoints slow to warm under saturation.** `/api/risk`,
+   `/api/runner-heartbeat`, `/api/decision-health` returned
+   `{"warming":true,"attempts":0}` and `/api/risk` was still warming after
+   a 6 s inter-poll gap — it finally populated (`concentration_top1_pct
+   65.84`, severity HIGH) only after ~30 s of polling. The SWR background
+   warmer is starved by the same host load. Degraded, not broken — a clear
+   "computing — retry shortly" sentinel, never a 500.
+3. **`logs/runner.log` is stale.** Last write 2026-05-21 23:32, but the
+   live runner (PID 1998408) started ~05:00 today — the manually-launched
+   runner writes stdout elsewhere, so the documented log path no longer
+   tails the live process. Known (`pt-systemd-vs-manual-restart-spam`),
+   still an operator-confusion point.
+4. **Healthy surfaces.** `/api/portfolio` / `/api/state` fresh and correct
+   ($1000.14 equity, 1 NVDA lot ≈ 66% of book, cash $341.64,
+   `stale_marks: 0`); 130 equity points in the last 24h (equity is logged
+   every cycle even on NO_DECISION). Dashboard root `/` served HTTP 200 in
+   0.53 s on retry after one transient 5 s timeout under load.
+
+`user_findings = 4`. None are quick safe code fixes (findings 1–2 are the
+host-saturation root cause; finding 3 is a launch/systemd issue).
+
+## 2026-05-23 ML+backtest HYBRID pass #10 (Agent 2) — `DecisionScorer.predict_calibrated` (quantile-mapping calibration)
+
+**Phase 1 — bugs_fixed: 0 (honest zero).** Re-read `paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py`, `run_continuous_backtests.py` in full. Audited the hot
+paths (`_ml_decide` conviction gate, `_execute_decision`, `_buy`/`_sell`,
+`_enforce_risk_exits`, `PriceCache._load`/`returns_pct`/`resolved_close_date`,
+`_compute_decision_outcomes`, `train_scorer` dedup + label clamp, `_rsi`/`_macd`,
+`_oos_rank_metrics`, the `_parse_*` helpers). 333 focused scorer/backtest/
+continuous/gate tests pass green. After ~16 prior hardening passes these three
+files have no remaining bug, race, or dead-code defect — Phase 1 is an honest
+no-op, no commit.
+
+### Phase 2 — feature: `predict_calibrated()` (commit after this section)
+
+**The gap.** The deployed scorer's OOS verdict is `DIRECTIONAL_BUT_BIASED` — the
+rank ordering of predictions is trustworthy but the predicted *% magnitude* is
+biased. `predict_percentile()` (pass #6) already gives the honest *rank* reading,
+but nothing gave an honest *magnitude*: a raw `+42%` could not be turned back
+into a believable return number.
+
+**The fix.** `train_scorer` already persists `pred_quantiles` (101-point quantile
+table of the model's predictions on the training set). This pass adds the matching
+`label_quantiles` table — 101 quantiles of the *realized* training labels `y`
+(post SELL-sign-flip and the ±`PRED_CLAMP_PCT` clamp, so the calibration space
+equals the label space the model was fit against). `DecisionScorer.predict_calibrated()`
+/ `_raw_to_calibrated()` quantile-map a raw prediction: locate it by rank in the
+*prediction* distribution, then read the realized return at that *same* rank of
+the *label* distribution. The result is **monotonic in raw** (rank fully
+preserved) and **bounded by the empirical label support** (an off-distribution
+extrapolation can no longer print a nonsense magnitude). `predict_with_meta` now
+carries a `"calibrated"` key; the CLI `--explain` prints the calibrated line.
+
+**Additive & backward compatible.** Legacy pickles lack `label_quantiles`, so
+`predict_calibrated` / the `"calibrated"` meta key degrade to `None`. `predict()`'s
+scalar contract and the `_ml_decide` conviction gate are **untouched** — the
+calibrated value is an interpretation aid (dashboard / CLI), not a gate input.
+The `_LOAD_CACHE` tuple grew from 4 to 5 elements (model, scaler, n_train,
+pred_quantiles, label_quantiles) — internal, consistent across read/write.
+
+**Live evidence at merge.** Trained on the 5000-outcome tail (`val_rmse≈10.5`):
+the anti-overfit MLP (32,16)/`alpha=1e-2`/`early_stopping` **under-disperses** —
+its raw predictions cluster near the mean while realized 5d returns have fat
+tails. Quantile-mapping spreads them back out: raw `+9.3%` (94th pred-percentile)
+calibrates to the realized 94th-percentile return `+16.5%`; raw `+23.6%` → `+31.6%`.
+This is the *opposite* sign of the pre-retune "MLP extrapolates to −89%" finding.
+
+### Phase 3 — live validation findings (user_findings: 4, read-only)
+
+1. **Deployed scorer is stale & sub-gate.** The on-disk `data/ml/decision_scorer.pkl`
+   carries `n_train=400` — below the `>=500` gate threshold (invariant #5), so the
+   `_ml_decide` conviction gate is currently **inactive / dark**. Meanwhile
+   `data/decision_outcomes.jsonl` holds ~8.7k rows; a retrain on the 5000-row tail
+   yields `n_train≈4987` (well above the gate bar). The gate is dark only because
+   the deployed pickle predates the accumulated data.
+2. **Scorer under-dispersion (miscalibration).** `val_rmse≈10.5 ≈ σ(target)≈9.5` —
+   the magnitude carries near-zero edge over a constant predictor; the model
+   compresses predictions toward the mean. `predict_calibrated` (this pass) is the
+   honest magnitude reading; the rank (`predict_percentile`) remains the trustworthy
+   signal.
+3. **`scorer_skill_log.jsonl` is empty (0 rows).** The per-cycle skill ledger file
+   exists but holds no rows — the instrumented `run_continuous_backtests.py main()`
+   loop has not completed a cycle since the ledger wiring landed. Backtest runs in
+   `backtest.db` come from ad-hoc / other-agent runs (round run-IDs 90001/99001/
+   100000), not the instrumented loop.
+4. **0-trade `complete` runs pollute `backtest.db`.** Runs 90001/99001/100000 are
+   `complete` with `total_return_pct=0.0, n_trades=0` (manual test runs). Harmless
+   to `_ml_is_qualified` (its `n_trades>=5` filter excludes them — verified: median
+   `vs_spy` 143% over 20 qualifying runs) but they clutter the dashboard run table.
+
+### How `predict_calibrated` works (reference)
+
+| Method | Returns | Use it for |
+|--------|---------|-----------|
+| `predict()` | raw clamped to ±`PRED_CLAMP_PCT` | the `_ml_decide` gate (magnitude bucket) — **unchanged** |
+| `predict_percentile()` | 0..100 rank in the prediction distribution | honest *rank* reading (`DIRECTIONAL_BUT_BIASED`) |
+| `predict_calibrated()` | realized return % at that rank | honest *magnitude* reading — dashboard / CLI |
+| `predict_with_meta()` | dict incl. `raw`,`pred`,`percentile`,`calibrated`,`off_distribution` | panels that want every trust flag |
+
+- **Run a backtest manually:** `python3 run_backtests.py` (10 parallel year-long
+  runs) or `python3 run_continuous_backtests.py` (instrumented cycle loop).
+- **Explain one prediction:** `python3 -m paper_trader.ml.decision_scorer --explain
+  --ticker NVDA --ml-score 3 --rsi 35 --json` — prints raw, clamped, percentile,
+  and (when the pickle is current) the calibrated 5d return.
+- **Interpret a backtest run:** `total_return_pct` is raw return; `vs_spy_pct` is
+  alpha — but treat it as invalid when `notes` carries `benchmark_unavailable`.
+- **Test the domain:** `python3 -m pytest tests/ -k "ml or backtest or scorer or
+  gate or calibration or continuous" -q` (~333 in the focused set;
+  `tests/test_scorer_calibrated.py` is the new 17-test file for this feature).
+
+---
+
 ## 2026-05-22 feature-dev pass (Agent 4) — `/api/position-blowup` (per-name single-name shock ladder)
 
 Wired another fully-built but **endpoint-less AND test-less** diagnostic onto
