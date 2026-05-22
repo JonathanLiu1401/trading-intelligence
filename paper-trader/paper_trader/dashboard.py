@@ -1838,6 +1838,7 @@ TEMPLATE = r"""
     <div class="bt-tabs" style="margin-bottom:14px;">
       <a id="bt-section-runs-link" class="active" onclick="showBtSection('runs')">Backtest Runs</a>
       <a id="bt-section-model-rankings-link" onclick="showBtSection('model-rankings')">🏆 Model Rankings</a>
+      <a id="bt-section-persona-rankings-link" onclick="showBtSection('persona-rankings')">🎭 Persona Leaderboard</a>
     </div>
     <div id="bt-section-runs" class="bt-section active">
     <div class="bt-layout">
@@ -2072,6 +2073,31 @@ TEMPLATE = r"""
         </div>
       </div>
     </div><!-- /#bt-section-model-rankings -->
+
+    <!-- ── Persona Leaderboard section ── -->
+    <div id="bt-section-persona-rankings" class="bt-section" style="display:none;">
+      <div class="card" style="margin-bottom:14px;">
+        <h2 style="margin:0 0 4px;">Persona leaderboard</h2>
+        <div style="color:var(--text-secondary);font-size:12px;margin-bottom:4px;">
+          Each backtest run is one of 10 trading styles (Value, Momentum, Contrarian,
+          Global Macro, GARP, Quant, Sector Rotator, Small/Mid Cap, ESG, Pure Speculator).
+          This aggregates the backtest history by <em>style</em> — which approach actually
+          carries repeatable alpha. Ranked by median vs-SPY (the honest central read on a
+          leveraged window); per-persona verdict EDGE / FLAT / DRAG / INSUFFICIENT.
+        </div>
+        <div id="persona-rankings-headline" style="font-size:13px;margin-bottom:12px;font-weight:600;"></div>
+        <div id="persona-rankings-loading" style="padding:14px 4px;color:var(--text-muted);font-size:13px;">Loading personas…</div>
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">
+          <table id="persona-rankings-table" style="display:none;width:100%;border-collapse:collapse;font-size:13px;">
+            <thead>
+              <tr id="persona-rankings-header"></tr>
+            </thead>
+            <tbody id="persona-rankings-body"></tbody>
+          </table>
+        </div>
+        <div id="persona-rankings-hint" style="color:var(--text-muted);font-size:12px;margin-top:12px;line-height:1.5;"></div>
+      </div>
+    </div><!-- /#bt-section-persona-rankings -->
   </div>
 
 <script>
@@ -2113,6 +2139,7 @@ function showTab(name) {
 
 // ───────── Backtests section sub-tabs (Runs / Model Rankings) ─────────
 let modelRankingsLoaded = false;
+let personaRankingsLoaded = false;
 function showBtSection(name) {
   document.querySelectorAll("#tab-backtests > .bt-section").forEach(el => {
     el.classList.remove("active");
@@ -2124,6 +2151,7 @@ function showBtSection(name) {
   if (pane) { pane.classList.add("active"); pane.style.display = "block"; }
   if (link) link.classList.add("active");
   if (name === "model-rankings" && !modelRankingsLoaded) loadModelRankings();
+  if (name === "persona-rankings" && !personaRankingsLoaded) loadPersonaRankings();
 }
 
 async function loadModelRankings() {
@@ -2179,6 +2207,88 @@ async function loadModelRankings() {
     modelRankingsLoaded = true;
   } catch (e) {
     loading.textContent = "Failed to load rankings: " + (e && e.message ? e.message : e);
+  }
+}
+
+const PERSONA_VERDICT_STYLE = {
+  EDGE:         "color:#00c896;font-weight:600",
+  FLAT:         "color:#ffd700",
+  DRAG:         "color:#ff4455;font-weight:600",
+  INSUFFICIENT: "color:var(--text-muted)",
+};
+const PERSONA_OVERALL_STYLE = {
+  HEALTHY:           "color:#00c896",
+  HAS_DRAG_PERSONA:  "color:#ff4455",
+  INSUFFICIENT_DATA: "color:var(--text-muted)",
+};
+
+async function loadPersonaRankings() {
+  const loading  = document.getElementById("persona-rankings-loading");
+  const table    = document.getElementById("persona-rankings-table");
+  const headline = document.getElementById("persona-rankings-headline");
+  const hintEl   = document.getElementById("persona-rankings-hint");
+  if (!loading || !table) return;
+  loading.style.display = "block";
+  loading.textContent = "Loading personas…";
+  table.style.display = "none";
+  function ppFmt(v) {
+    if (v === null || v === undefined) return "—";
+    return (v > 0 ? "+" : "") + Number(v).toFixed(1) + "pp";
+  }
+  function numFmt(v, d) {
+    if (v === null || v === undefined) return "—";
+    return Number(v).toFixed(d == null ? 2 : d);
+  }
+  function colorStyle(v) {
+    if (v === null || v === undefined) return "";
+    const n = parseFloat(v);
+    if (n > 0) return "color:#00c896";
+    if (n < 0) return "color:#ff4455";
+    return "";
+  }
+  try {
+    const data = await fetch(API_PREFIX + "/api/persona-leaderboard").then(r => r.json());
+    if (headline) {
+      const v = data.verdict || "";
+      headline.textContent = v + (data.n_runs != null ? "  ·  " + data.n_runs + " complete runs" : "");
+      headline.style.cssText = PERSONA_OVERALL_STYLE[v] || "color:var(--text)";
+    }
+    if (hintEl) hintEl.textContent = data.hint || "";
+    const medals = ["🥇", "🥈", "🥉"];
+    const cols = [
+      {h: "Rank",          fn: (p, i) => (medals[i] || (i + 1) + "."),  colored: false},
+      {h: "Persona",       fn: (p) => p.persona,                        colored: false},
+      {h: "Runs",          fn: (p) => p.n,                              colored: false},
+      {h: "Median vs SPY", fn: (p) => ppFmt(p.median_vs_spy),           colored: true, raw: (p) => p.median_vs_spy},
+      {h: "Mean vs SPY",   fn: (p) => ppFmt(p.mean_vs_spy),             colored: true, raw: (p) => p.mean_vs_spy},
+      {h: "Win Rate",      fn: (p) => (p.win_rate == null ? "—" : Math.round(p.win_rate * 100) + "%"), colored: false},
+      {h: "Median Return", fn: (p) => (p.median_return == null ? "—" : ppFmt(p.median_return).replace("pp", "%")), colored: true, raw: (p) => p.median_return},
+      {h: "Sharpe",        fn: (p) => numFmt(p.median_sharpe),          colored: true, raw: (p) => p.median_sharpe},
+      {h: "Max DD",        fn: (p) => (p.median_max_drawdown_pct == null ? "—" : numFmt(p.median_max_drawdown_pct, 1) + "%"), colored: false},
+      {h: "% Underwater",  fn: (p) => (p.median_pct_time_underwater == null ? "—" : Math.round(p.median_pct_time_underwater) + "%"), colored: false},
+      {h: "Verdict",       fn: (p) => p.verdict,                        colored: false, verdict: true},
+    ];
+    document.getElementById("persona-rankings-header").innerHTML =
+      cols.map(c => '<th style="text-align:left;padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text-secondary);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">' + c.h + "</th>").join("");
+    const personas = data.leaderboard || [];
+    if (!personas.length) {
+      loading.textContent = (data.hint || "No completed backtest runs yet.");
+      return;
+    }
+    document.getElementById("persona-rankings-body").innerHTML = personas.map((p, i) => {
+      const cells = cols.map(c => {
+        const val = c.fn(p, i);
+        let style = c.colored ? colorStyle(c.raw(p)) : "";
+        if (c.verdict) style = PERSONA_VERDICT_STYLE[p.verdict] || "";
+        return '<td style="padding:8px 12px;border-bottom:1px solid var(--border);' + style + '">' + val + "</td>";
+      }).join("");
+      return "<tr>" + cells + "</tr>";
+    }).join("");
+    loading.style.display = "none";
+    table.style.display = "table";
+    personaRankingsLoaded = true;
+  } catch (e) {
+    loading.textContent = "Failed to load personas: " + (e && e.message ? e.message : e);
   }
 }
 
@@ -6571,6 +6681,47 @@ def api_model_rankings():
         return jsonify({"models": models, "as_of": datetime.now(timezone.utc).isoformat()})
     except Exception as e:
         return jsonify({"error": str(e), "models": []}), 500
+
+
+@app.route("/api/persona-leaderboard")
+def api_persona_leaderboard():
+    """Per-persona strategy-quality leaderboard — which of the 10 trading
+    styles actually carry repeatable alpha.
+
+    ``/api/model-rankings`` aggregates ``backtest_runs`` by ``model_id`` (the
+    decision *engine*). This sibling aggregates the *other* dimension stamped
+    on every run — the persona (Value / Momentum / Contrarian / Global Macro /
+    GARP / Quant / Sector Rotator / Small-Mid Cap / ESG / Pure Speculator) —
+    answering the structural question "is momentum or value or pure
+    speculation the edge in this regime".
+
+    The diagnostic itself — ``paper_trader.ml.persona_leaderboard`` — already
+    existed (read-only, exhaustively unit-tested, ``persona_for`` SSOT for the
+    ``run_id → persona`` map, equity-curve risk metrics) but was reachable
+    from no endpoint: an operator could only see it from a shell. This route
+    is a thin wrapper — it reuses the module's own ``_load_runs`` DB read and
+    the ``persona_leaderboard`` builder verbatim (AGENTS.md invariant #10), so
+    the dashboard panel and the CLI digest can never disagree. Observational
+    only — never gates the live loop, never prunes a persona (#2 / #12).
+    """
+    from pathlib import Path
+
+    from paper_trader.ml.persona_leaderboard import (
+        _load_runs,
+        persona_leaderboard,
+    )
+
+    try:
+        db = Path(str(BACKTEST_DB))
+        runs = _load_runs(db) if db.exists() else []
+        report = persona_leaderboard(runs)
+        report["as_of"] = datetime.now(timezone.utc).isoformat()
+        return jsonify(report)
+    except Exception as e:
+        return jsonify({
+            "error": str(e), "status": "error", "verdict": "error",
+            "leaderboard": [], "drag_personas": [], "hint": str(e),
+        }), 500
 
 
 @app.route("/api/backtests/stats")
