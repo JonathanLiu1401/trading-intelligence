@@ -166,11 +166,12 @@ class TestPredictionClamp:
         assert not s.is_trained
         m = s.predict_with_meta(ml_score=2.0, rsi=None, macd=None, mom5=None,
                                 mom20=None, regime_mult=1.0, ticker="NVDA")
-        # `percentile` is an additive key (2026-05-21 rank-calibration
-        # feature); None here because an untrained scorer carries no
-        # quantile table.
+        # `percentile` (2026-05-21 rank-calibration) and `calibrated`
+        # (quantile-mapping calibration) are additive keys; both None here
+        # because an untrained scorer carries no quantile tables.
         assert m == {"pred": 0.0, "raw": 0.0, "clamped": False,
-                     "off_distribution": False, "percentile": None}
+                     "off_distribution": False, "percentile": None,
+                     "calibrated": None}
 
 
 # ─────────────────────── _to_float ───────────────────────────
