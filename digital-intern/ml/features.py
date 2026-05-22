@@ -23,10 +23,12 @@ Features (15 dims):
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -62,13 +64,65 @@ _SOURCE_CRED_PATTERNS: list[tuple[re.Pattern, float]] = [
     for k, v in SOURCE_CRED.items()
 ]
 
-# Tickers that count as "live position" for the portfolio_relevance feature.
-LIVE_PORTFOLIO_TICKERS = {
+# ── Held/watched ticker universe ─────────────────────────────────────────────
+# Tickers that count as "live position / watchlist" for the portfolio-relevance
+# features (portfolio_flag idx 12, ticker density idx 1, distinct count idx 13)
+# and — via the transitive ``_LIVE_RE`` import in ``watchers.alert_agent`` — the
+# 🚨 BREAKING alert ``book:`` tag.
+#
+# ``config/portfolio.json`` is the operator's source of truth (rewritten by the
+# trading UI on every fill); the hardcoded set below is only a FALLBACK. The
+# live set is the UNION of the two. The fallback alone was silently drifting
+# behind the file: a 2026-05-21 live read showed GOOG / NVDL / COHR held in
+# portfolio.json yet absent here, so news on those open positions was never
+# portfolio-flagged for the model and never ``book:``-tagged in alerts. Union
+# (never replace) so a name dropped from the file is still recognised — it is
+# almost certainly still relevant — and the feature keeps working unchanged if
+# the file is missing or corrupt. Mirrors the positions+options+watchlist load
+# already used by ``ml.sentiment_trends`` / ``collectors.finnhub_collector``.
+_FALLBACK_PORTFOLIO_TICKERS = {
     "LITE", "LNOK", "MUU", "DRAM", "SNDU", "MU", "NVDA",
     "MSFT", "AXTI", "ORCL", "TSEM", "QBTS",
 }
+_PORTFOLIO_JSON = Path(__file__).resolve().parent.parent / "config" / "portfolio.json"
+# Plain US equity / ETF symbols only — uppercase A-Z0-9, 1..6 chars. Filters
+# foreign / compound symbols ("005930.KS") that would otherwise enter the
+# word-boundary regex; mirrors the symbol hygiene in
+# ``collectors.finnhub_collector._load_tickers``.
+_TICKER_RE = re.compile(r"^[A-Z0-9]{1,6}$")
+
+
+def _load_portfolio_tickers() -> set[str]:
+    """Union of the hardcoded fallback with ``config/portfolio.json``'s held +
+    watched tickers (positions, option underlyings, sector_watchlist).
+
+    Best-effort: any error (missing / corrupt file, unexpected shape) silently
+    degrades to the fallback set alone — a feature-extraction import must never
+    fail because the operator's config file is momentarily mid-write."""
+    tickers = set(_FALLBACK_PORTFOLIO_TICKERS)
+    try:
+        with open(_PORTFOLIO_JSON, "r", encoding="utf-8") as f:
+            pf = json.load(f)
+        candidates: list[str] = []
+        for pos in pf.get("positions", []) or []:
+            candidates.append((pos or {}).get("ticker", ""))
+        for opt in pf.get("options", []) or []:
+            candidates.append((opt or {}).get("underlying", ""))
+        for t in pf.get("sector_watchlist", []) or []:
+            candidates.append(t)
+        for raw in candidates:
+            sym = (raw or "").strip().upper()
+            if _TICKER_RE.match(sym):
+                tickers.add(sym)
+    except Exception:
+        pass
+    return tickers
+
+
+LIVE_PORTFOLIO_TICKERS = _load_portfolio_tickers()
+# sorted() so the compiled alternation is deterministic regardless of set order.
 _LIVE_RE = re.compile(
-    r"\b(?:" + "|".join(re.escape(t) for t in LIVE_PORTFOLIO_TICKERS) + r")\b"
+    r"\b(?:" + "|".join(re.escape(t) for t in sorted(LIVE_PORTFOLIO_TICKERS)) + r")\b"
 )
 # Word tokens for ticker-density denominator.
 _WORD_RE = re.compile(r"\b\w+\b")
