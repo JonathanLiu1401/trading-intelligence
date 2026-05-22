@@ -370,6 +370,37 @@ def get_quant_signals_live(tickers: list[str]) -> dict[str, dict]:
     return out
 
 
+# bb_position is (last - sma20) / (2 * sd20): a value of ±1 sits exactly on
+# the upper/lower Bollinger band (2σ from the 20-day mean). Opus reads the
+# raw float in the prompt and otherwise has to mentally threshold it against
+# the band — a labelled token surfaces the actionable state directly, the
+# same render-side enrichment the `held=` / signal `age=` tokens already do
+# (observational only; invariants #2/#12). Only the stretched extremes get a
+# label — a mid-range reading carries none, the silence-when-nothing-
+# actionable precedent.
+_BB_BAND_THRESHOLD = 0.9
+
+
+def _bb_label(x) -> str:
+    """Render bb_position with a band annotation when stretched.
+
+    ``None`` → ``"?"``. ``|x| >= _BB_BAND_THRESHOLD`` → ``"<x> (upper band)"``
+    or ``"(lower band)"`` so Opus sees the stretched state without re-deriving
+    it. Mid-range values render as the bare number. Degrade-safe — a
+    non-numeric value falls through to its string form, never raises."""
+    if x is None:
+        return "?"
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    if v >= _BB_BAND_THRESHOLD:
+        return f"{x} (upper band)"
+    if v <= -_BB_BAND_THRESHOLD:
+        return f"{x} (lower band)"
+    return str(x)
+
+
 def _format_quant_signals(sigs: dict[str, dict]) -> str:
     if not sigs:
         return "  (no quant signals available)"
@@ -379,7 +410,7 @@ def _format_quant_signals(sigs: dict[str, dict]) -> str:
         return "?" if x is None else f"{x}%"
     return "\n".join(
         f"  {tk}: rsi={_v(q.get('rsi'))}  macd={_v(q.get('MACD'))}/{_v(q.get('macd_signal'))}  "
-        f"ma_cross={_v(q.get('MA_cross'))}  bb_position={_v(q.get('bb_position'))}  "
+        f"ma_cross={_v(q.get('MA_cross'))}  bb_position={_bb_label(q.get('bb_position'))}  "
         f"vol_ratio={_v(q.get('vol_ratio'))}  mom_5d={_pct(q.get('mom_5d'))}  "
         f"mom_20d={_pct(q.get('mom_20d'))}  "
         f"wk52_pos={_v(q.get('wk52_pos'))}  52h={_pct(q.get('pct_from_52h'))}  52l={_pct(q.get('pct_from_52l'))}"
