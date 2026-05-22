@@ -269,6 +269,12 @@ class DecisionScorer:
         self._scaler = None
         self._trained = False
         self._n_train = 0
+        # Sorted training-set prediction quantiles (101 points, percentiles
+        # 0..100) persisted by train_scorer. Used by predict_percentile() to
+        # map a raw prediction to its rank within the training distribution.
+        # None for legacy pickles written before this field existed — every
+        # consumer degrades gracefully (returns None) in that case.
+        self._pred_quantiles = None
         if SCORER_PATH.exists():
             self._load()
 
@@ -283,7 +289,8 @@ class DecisionScorer:
         with _LOAD_CACHE_LOCK:
             cached = _LOAD_CACHE.get(key)
             if cached is not None:
-                self._model, self._scaler, self._n_train = cached
+                (self._model, self._scaler, self._n_train,
+                 self._pred_quantiles) = cached
                 self._trained = True
                 return
             try:
@@ -292,11 +299,20 @@ class DecisionScorer:
                 self._model = state["model"]
                 self._scaler = state.get("scaler")
                 self._n_train = int(state.get("n_train", 0))
+                # Additive, backward-compatible: legacy pickles have no
+                # `pred_quantiles` key, so `.get` yields None and
+                # predict_percentile() degrades to None for those.
+                pq = state.get("pred_quantiles")
+                self._pred_quantiles = (
+                    np.asarray(pq, dtype=np.float64)
+                    if pq is not None else None
+                )
                 self._trained = True
                 # Only the current file is ever relevant; clearing bounds the
                 # cache to one entry across unbounded retrain cycles.
                 _LOAD_CACHE.clear()
-                _LOAD_CACHE[key] = (self._model, self._scaler, self._n_train)
+                _LOAD_CACHE[key] = (self._model, self._scaler,
+                                    self._n_train, self._pred_quantiles)
                 print(f"[decision_scorer] loaded n={self._n_train} from {SCORER_PATH}")
             except Exception as e:
                 print(f"[decision_scorer] load failed: {e}")
@@ -319,13 +335,20 @@ class DecisionScorer:
     ) -> dict:
         """Predicted 5d forward return (%) plus calibration metadata.
 
-        Returns ``{"pred", "raw", "clamped", "off_distribution"}``:
+        Returns ``{"pred", "raw", "clamped", "off_distribution",
+        "percentile"}``:
         - ``pred``  — the value callers should act on (clamped, always finite)
         - ``raw``   — the model's unbounded output (for diagnostics / honesty)
         - ``clamped`` — True when ``|raw| > PRED_CLAMP_PCT`` (or non-finite)
         - ``off_distribution`` — alias of ``clamped``; a True here means the
           model extrapolated past the empirical label support and the point
           estimate should be treated as low-trust, not gospel.
+        - ``percentile`` — where ``raw`` falls (0..100) within the training
+          set's own prediction distribution, or None for legacy pickles that
+          carry no quantile table. The OOS calibration verdict is
+          ``DIRECTIONAL_BUT_BIASED`` — the predicted % magnitude is unreliable
+          but the *ranking* is trustworthy — so the percentile is the
+          honest, low-bias way to read a prediction.
 
         ``predict()`` is the scalar fast path every existing consumer uses;
         this sibling exists for panels that want to surface the trust flag
@@ -333,7 +356,7 @@ class DecisionScorer:
         """
         if not self._trained or self._model is None:
             return {"pred": 0.0, "raw": 0.0, "clamped": False,
-                    "off_distribution": False}
+                    "off_distribution": False, "percentile": None}
         try:
             X = np.array(
                 [build_features(ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
@@ -360,18 +383,19 @@ class DecisionScorer:
             # in-distribution call. predict()'s scalar contract is unchanged
             # (still 0.0); only the meta trust flags move.
             return {"pred": 0.0, "raw": 0.0, "clamped": True,
-                    "off_distribution": True}
+                    "off_distribution": True, "percentile": None}
 
         # A non-finite model output (inf/nan from a pathological feature
         # vector) is unusable — treat it as a 0% / off-distribution result
         # rather than letting nan propagate silently through max/min.
         if not np.isfinite(raw):
             return {"pred": 0.0, "raw": raw, "clamped": True,
-                    "off_distribution": True}
+                    "off_distribution": True, "percentile": None}
         clamped_pred = max(-PRED_CLAMP_PCT, min(PRED_CLAMP_PCT, raw))
         was_clamped = abs(raw) > PRED_CLAMP_PCT
         return {"pred": clamped_pred, "raw": raw, "clamped": was_clamped,
-                "off_distribution": was_clamped}
+                "off_distribution": was_clamped,
+                "percentile": self._raw_to_percentile(raw)}
 
     def predict(
         self,
@@ -397,6 +421,62 @@ class DecisionScorer:
             vol_ratio=vol_ratio, bb_pos=bb_pos, news_urgency=news_urgency,
             news_article_count=news_article_count,
         )["pred"]
+
+    def _raw_to_percentile(self, raw: float) -> float | None:
+        """Map a raw prediction to its percentile (0..100) within the
+        training set's own prediction distribution.
+
+        ``train_scorer`` persists 101 sorted quantile breakpoints of the
+        model's predictions on the (deduped) training features. Linear
+        interpolation between them turns any new raw prediction into a
+        rank-position: 50.0 means "a median prediction for this model",
+        90.0 means "in the top decile of how bullish this model ever gets".
+
+        Returns None when the model carries no quantile table (legacy
+        pickle written before this field existed) or ``raw`` is non-finite
+        — never raises."""
+        q = self._pred_quantiles
+        try:
+            if q is None or len(q) < 2 or not np.isfinite(raw):
+                return None
+            pcts = np.linspace(0.0, 100.0, len(q))
+            return round(float(np.interp(float(raw), q, pcts)), 2)
+        except Exception:
+            return None
+
+    def predict_percentile(
+        self,
+        ml_score: float,
+        rsi: float | None,
+        macd: float | None,
+        mom5: float | None,
+        mom20: float | None,
+        regime_mult: float,
+        ticker: str,
+        vol_ratio: float | None = None,
+        bb_pos: float | None = None,
+        news_urgency: float | None = None,
+        news_article_count: float | None = None,
+    ) -> float | None:
+        """Rank-calibrated reading of one prediction: the percentile (0..100)
+        the raw forward-return estimate occupies in the training-set
+        prediction distribution.
+
+        Motivation: the deployed scorer's OOS calibration verdict is
+        ``DIRECTIONAL_BUT_BIASED`` — the predicted % is biased (decile error
+        ~7.5pp) but the ordering carries real skill (rank-IC ≈ 0.22). A raw
+        ``+8%`` should NOT be read as "+8%"; reading it as "82nd percentile"
+        is the honest, low-bias signal.
+
+        Returns None when the model is untrained, the prediction failed /
+        went non-finite, or the loaded pickle predates the quantile table
+        (legacy compatibility). Never raises — mirrors ``predict_with_meta``.
+        """
+        return self.predict_with_meta(
+            ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
+            vol_ratio=vol_ratio, bb_pos=bb_pos, news_urgency=news_urgency,
+            news_article_count=news_article_count,
+        )["percentile"]
 
     def feature_contributions(
         self,
@@ -767,14 +847,39 @@ def train_scorer(records: list[dict]) -> dict:
     # `len(records)` count, so the gate-relevant n_train >= 500 invariant
     # (#5) reflects the model's true exposure to data.
     n_pickle = len(X_raw)
+
+    # Rank-calibration table: 101 sorted quantile breakpoints (percentiles
+    # 0..100) of the model's predictions on the full deduped training set.
+    # predict_percentile() interpolates into this to turn a raw — and, per
+    # the DIRECTIONAL_BUT_BIASED OOS verdict, magnitude-unreliable —
+    # prediction into a trustworthy rank position. Best-effort: any failure
+    # leaves `pred_quantiles=None` so training (and the gate) is never
+    # blocked by a diagnostic-only artifact, and a legacy-style pickle
+    # results (predict_percentile then degrades to None).
+    pred_quantiles = None
+    try:
+        train_pred = model.predict(scaler.transform(X))
+        train_pred = np.asarray(train_pred, dtype=np.float64)
+        train_pred = train_pred[np.isfinite(train_pred)]
+        if train_pred.size >= 2:
+            pred_quantiles = [
+                float(v) for v in
+                np.percentile(train_pred, np.arange(0, 101))
+            ]
+    except Exception as e:
+        print(f"[decision_scorer] pred-quantile build failed: {e}")
+        pred_quantiles = None
+
     _tmp = SCORER_PATH.with_suffix(".pkl.tmp")
     with _tmp.open("wb") as f:
-        pickle.dump({"model": model, "scaler": scaler, "n_train": n_pickle}, f)
+        pickle.dump({"model": model, "scaler": scaler, "n_train": n_pickle,
+                     "pred_quantiles": pred_quantiles}, f)
     _tmp.replace(SCORER_PATH)
 
     return {"status": "ok", "n": n_pickle, "val_rmse": val_rmse,
             "n_label_clamped": n_label_clamped,
-            "n_label_dropped": n_label_dropped}
+            "n_label_dropped": n_label_dropped,
+            "n_pred_quantiles": len(pred_quantiles) if pred_quantiles else 0}
 
 
 # ---------------------------------------------------------------------------
@@ -906,6 +1011,11 @@ def main(argv: list[str] | None = None) -> int:
           f"n_train={scorer.n_train}")
     print(f"  predicted 5d forward return: {meta['pred']:+.2f}%  "
           f"(raw {meta['raw']:+.2f}%){flag}")
+    _pct = meta.get("percentile")
+    if _pct is not None:
+        print(f"  rank percentile: {_pct:.1f}  (position in the training "
+              f"prediction distribution — trust this over the raw %, the "
+              f"OOS verdict is DIRECTIONAL_BUT_BIASED)")
     rows = contrib.get("contributions") or []
     if rows:
         print(f"  baseline={contrib.get('pred_baseline', 0.0):+.2f}%   "

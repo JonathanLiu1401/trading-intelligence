@@ -586,6 +586,46 @@ with the underlying stock's lot family).
 
 ---
 
+## 2026-05-21 ML+backtest HYBRID pass #6 (Agent 2) — DecisionScorer.predict_percentile (rank-calibrated reading)
+
+**Phase 1 — bugs_fixed: 0 (honest zero).** Re-audited `decision_scorer.py`,
+`backtest.py` (`_ml_decide`, `_buy/_sell`, `_enforce_risk_exits`,
+`_execute_decision`, `PriceCache`, technical indicators) and
+`run_continuous_backtests.py` (parse helpers, ledger writers, `main`).
+The three target files are exhaustively hardened by ~dozen prior passes —
+no real bug, race, or dead-code issue found. No Phase 1 commit.
+
+**Phase 2 — features_added: 1 — `DecisionScorer.predict_percentile()`.**
+Motivation grounded in live data: `calibration --oos` reports the scorer's
+OOS verdict as `DIRECTIONAL_BUT_BIASED` — the predicted % *magnitude* is
+unreliable (decile error ~7.5pp) but the *ranking* carries real skill
+(rank-IC ≈ 0.22, monotone deciles). So a raw `+8%` must not be read as
+"+8%". `train_scorer` now persists 101 sorted quantile breakpoints of the
+model's predictions on the deduped training set under a new pickle key
+`pred_quantiles`; `predict_percentile()` interpolates a raw prediction into
+that table to return its 0..100 rank position. `predict_with_meta()` gains
+a `percentile` key; the `--explain` CLI prints a rank-percentile line.
+Strictly backward-compatible: legacy pickles (no `pred_quantiles` key —
+incl. the currently deployed `n_train=400` pkl) load clean and
+`predict_percentile()` degrades to `None`. The `_ml_decide` conviction gate
+is **untouched** — this is read-only score interpretation, not a gate
+change. Tests: `tests/test_scorer_percentile.py` (10 cases — quantile
+persistence, rank monotonicity, unit-range, legacy-pickle compat,
+untrained safety).
+
+**Phase 3 — user_findings: 1.** The deployed `data/ml/decision_scorer.pkl`
+has `n_train=400` (mtime 2026-05-19) — **below the `n_train >= 500` gate
+threshold (invariant #5), so the conviction gate is currently INACTIVE.**
+`continuous.log` mtime is 2026-05-18 → the continuous loop has not run /
+retrained for 2+ days while `data/decision_outcomes.jsonl` has accumulated
+to 7413 rows. A fresh retrain on that corpus yields `n_train≈4943`
+(gate-active) and, per `calibration --oos`, OOS rank-IC ≈ 0.22 — i.e. the
+system is leaving a gate-active, directionally-skillful model unbuilt.
+This is operational (loop process not running), not a code defect; the
+agent did **not** unilaterally retrain `decision_scorer.pkl`.
+
+---
+
 ## 2026-05-21 ML+backtest HYBRID pass #5 (Agent 2) — gate_capture_coverage (capture-pipeline health audit)
 
 **Phase 1 — bugs_fixed: 0 (honest zero).** Audited
@@ -1973,7 +2013,8 @@ JPM (167), LLY (137), DFEN (87), NVO (72), CURE (47).
 |---|---|---|
 | Feature build | `paper_trader/ml/decision_scorer.py::build_features` | 17-slot vector (10 numeric + 7-way sector one-hot) per (sim_date, ticker) |
 | Training | `train_scorer(records)` | sklearn MLPRegressor `(32, 16)`, ReLU, `alpha=1e-2`, `early_stopping=True`, `n_iter_no_change=25`. Labels clamped to `±PRED_CLAMP_PCT=50`. Sample weights from run-quality + LLM annotation |
-| Prediction | `DecisionScorer.predict` / `predict_with_meta` | Loads pickle, applies scaler, predicts, clamps to ±50, surfaces `off_distribution` flag |
+| Prediction | `DecisionScorer.predict` / `predict_with_meta` | Loads pickle, applies scaler, predicts, clamps to ±50, surfaces `off_distribution` flag + `percentile` (rank position) |
+| Rank reading | `DecisionScorer.predict_percentile` | Maps a raw prediction to 0..100 within the training prediction distribution (101-point `pred_quantiles` table). The OOS verdict is `DIRECTIONAL_BUT_BIASED` — trust the percentile rank over the raw %. `None` for legacy pickles |
 | Gate | `paper_trader/backtest.py::_ml_decide` | Only modulates BUY conviction (`×0.6 / ×0.85 / unchanged / ×1.15 / ×1.3`) when `is_trained AND n_train >= 500 AND not off_distribution` |
 | Cycle wiring | `run_continuous_backtests.py::_train_decision_scorer` | Per cycle: 80/20 temporal split → train → reload → OOS metrics (RMSE, dir_acc, rank_IC, BUY/SELL split, 10d/20d horizons) → append `scorer_skill_log.jsonl` |
 
@@ -2009,8 +2050,8 @@ python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
     tests/test_ml_backtest_word_boundary.py tests/test_ml_backtest_seams.py \
     tests/test_buy_ticker_quant_coverage.py tests/test_feature_coverage.py
 
-# Just the new diagnostic
-python3 -m pytest tests/test_buy_ticker_quant_coverage.py -v
+# The rank-calibration feature (pass #6)
+python3 -m pytest tests/test_scorer_percentile.py -v
 
 # Full suite (~25 min under load; per-CLAUDE.md memory)
 python3 -m pytest tests/ -v
