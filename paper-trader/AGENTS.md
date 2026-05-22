@@ -57,7 +57,7 @@ memory `paper-trader chronic stale`.)
 
 ### Tests
 
-`tests/test_decision_forensics.py` — 7 new (35 total in file, 117 across the
+`tests/test_decision_forensics.py` — 6 new (35 total in file, 117 across the
 forensics-dependent suite, all pass): each CLI-fault cause →
 `SUBPROCESS_ERROR` with the cause as `excerpt`; the crash causes are neither
 `TIMEOUT_EMPTY` (wrong remediation) nor `OTHER` (the gap); a regression guard
