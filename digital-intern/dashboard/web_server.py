@@ -4136,6 +4136,123 @@ def create_app(store=None) -> Flask:
             top_sources=top_sources,
         ))
 
+    @app.get("/api/alert-delivery-audit")
+    def api_alert_delivery_audit():
+        """Did the urgent rows the dashboard counts actually push to Discord?
+
+        The ``urgent`` tile counts every ``urgency=2`` row, but the alert
+        worker marks a row alerted whenever *any* defense-in-depth gate
+        (synthetic / quote-widget / recap-template / low-authority /
+        stale-published) absorbs it — so the tile silently conflates "the
+        analyst was pushed" with "a gate quietly suppressed it". This route
+        joins ``articles.db`` (urgency=2 rows) against
+        ``alert_recency.db`` (signatures that actually fired to Discord) and
+        partitions into ``delivered`` vs ``suppressed``, attributing each
+        suppressed row to the gate that caught it.
+
+        Operator questions answered:
+
+        * ``delivery_rate`` — what fraction of urgency-head fires actually
+          reached Discord. A persistent drop means the model is producing
+          more false positives the gates are absorbing.
+        * ``suppressed_by`` — which gate is doing the most work (a
+          ``recap_template`` spike = a new SEO variant slipping the urgency
+          head; a ``low_authority`` spike = a social-tier feed over-firing).
+        * ``suppressed_llm_fraction`` — if high, gates are absorbing
+          *LLM-vetted* (ground-truth) urgent rows: a calibration red flag.
+
+        This is the dashboard surface for the chronic, repeatedly
+        hand-diagnosed "alerts not firing" pain (daemon.log ``No response
+        from Claude — skipping`` storms feeding an urgency=1 backlog).
+
+        Query param:
+          ``hours`` — window, floored at 0.5, ceiling = ``alert_recency``
+                      TTL (``run_audit`` applies the ceiling itself because
+                      a wider window would compare urgency=2 rows against an
+                      already-pruned signature set and over-count
+                      ``suppressed``).
+
+        Reuses ``analytics.alert_delivery_audit.run_audit`` verbatim (the
+        same dual-DB read-only shell the CLI digest uses) so the panel and
+        the CLI can never disagree. Both DBs are opened ``mode=ro``; a
+        missing recency DB degrades to "all suppressed", never a 500.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+
+        from analytics.alert_delivery_audit import (
+            run_audit, DEFAULT_WINDOW_HOURS,
+        )
+        try:
+            hours = float(request.args.get("hours", DEFAULT_WINDOW_HOURS))
+        except (TypeError, ValueError):
+            hours = DEFAULT_WINDOW_HOURS
+        # Floor only — run_audit applies the recency-TTL ceiling itself.
+        hours = max(0.5, hours)
+        try:
+            return jsonify(run_audit(hours=hours))
+        except Exception as exc:  # noqa: BLE001 — any DB/IO fault → 500, not crash
+            return jsonify({"error": f"audit: {exc!s}"}), 500
+
+    @app.get("/api/alert-freshness")
+    def api_alert_freshness():
+        """How stale were the urgent rows at the moment they were detected?
+
+        A 🚨 BREAKING alert fired on a 3-hour-old article is nearly
+        worthless — the move is already priced. Every other monitor
+        (collector uptime, source throughput, urgency calibration) can read
+        HEALTHY while the alerts the analyst actually gets are too old to
+        act on. This route is the bottom-line freshness view: of the
+        ``urgency>=1`` rows in the window, the ``published`` → ``first_seen``
+        staleness distribution, aggregate and split by ``score_source``.
+
+        Dual of ``ingestion_latency`` (all live rows, per-source —
+        "is a collector slow?"): this scopes to urgent rows only and answers
+        "were the alerts stale *content*?". A high ``p90_min`` /
+        ``pct_over_1h`` is the quality failure the volume monitors miss.
+
+        Query param:
+          ``hours`` — lookback window, 1 .. 168 (default 24).
+
+        Reads ``articles.db`` via the dashboard's ``_ro_query`` short-lived
+        ``mode=ro`` connection (the ``news-arrival-rhythm`` /
+        ``source-urgency-yield`` precedent — never competes for the daemon's
+        writer lock). ``_LIVE_ONLY_CLAUSE`` is applied so backtest-injected
+        rows cannot colour the latency view (invariant #5). The pure builder
+        ``analytics.alert_freshness.compute_alert_freshness`` owns the clock
+        parsing, percentile maths and the LLM-vs-ML split.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            hours = int(request.args.get("hours", 24))
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(168, hours))
+
+        from storage.article_store import _LIVE_ONLY_CLAUSE
+        from analytics.alert_freshness import compute_alert_freshness
+
+        cutoff = (datetime.now(timezone.utc) -
+                  timedelta(hours=hours)).isoformat(timespec="seconds")
+        try:
+            rows = _ro_query(
+                f"""SELECT published, first_seen, score_source, urgency
+                      FROM articles
+                     WHERE {_LIVE_ONLY_CLAUSE}
+                       AND urgency >= 1
+                       AND first_seen >= ?
+                     ORDER BY first_seen DESC
+                     LIMIT 100000""",
+                (cutoff,),
+            )
+        except sqlite3.Error as exc:
+            return jsonify({"error": f"db: {exc!s}"}), 500
+        report = compute_alert_freshness(rows)
+        report["window_hours"] = hours
+        report["generated_at"] = datetime.now(timezone.utc).isoformat()
+        return jsonify(report)
+
     @app.get("/healthz")
     @app.get("/api/health")
     def healthz():

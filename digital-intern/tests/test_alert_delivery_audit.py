@@ -429,3 +429,73 @@ class TestPureNoIO:
         }
         out = A.compute_delivery_audit([art], set())
         assert out["total"] == 1
+
+
+# ── endpoint wiring: /api/alert-delivery-audit ────────────────────────────────
+# The pure builder is exhaustively pinned above; these tests own the HTTP-layer
+# translation only — clamping, auth, 500-on-raise, payload passthrough. The
+# route reuses ``run_audit`` verbatim (dual-DB shell), so it is monkeypatched
+# to a canned dict — the same discipline as ``test_api_urgent_queue_health.py``
+# stubbing the store method.
+class TestDeliveryAuditEndpoint:
+    def _client(self, monkeypatch):
+        monkeypatch.delenv("WEB_API_KEY", raising=False)
+        from dashboard.web_server import create_app
+        return create_app(store=object()).test_client()
+
+    def test_endpoint_passes_run_audit_payload_through(self, monkeypatch):
+        canned = {
+            "total": 7, "delivered": 3, "suppressed": 4,
+            "delivery_rate": 0.4286,
+            "suppressed_by": {"recap_template": 4, "unknown_gate": 0},
+            "window_h": 6.0,
+        }
+        monkeypatch.setattr(A, "run_audit", lambda hours: dict(canned))
+        resp = self._client(monkeypatch).get("/api/alert-delivery-audit")
+        assert resp.status_code == 200, resp.data
+        assert resp.get_json() == canned
+
+    def test_hours_param_floored_at_half_hour(self, monkeypatch):
+        seen = {}
+
+        def _fake(hours):
+            seen["hours"] = hours
+            return {"total": 0}
+
+        monkeypatch.setattr(A, "run_audit", _fake)
+        # A zero / negative window is floored to 0.5 before run_audit sees it.
+        self._client(monkeypatch).get("/api/alert-delivery-audit?hours=0")
+        assert seen["hours"] == 0.5
+
+    def test_hours_param_forwarded_when_valid(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            A, "run_audit",
+            lambda hours: seen.update(hours=hours) or {"total": 0})
+        self._client(monkeypatch).get("/api/alert-delivery-audit?hours=3")
+        assert seen["hours"] == 3.0
+
+    def test_garbage_hours_falls_back_to_default(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            A, "run_audit",
+            lambda hours: seen.update(hours=hours) or {"total": 0})
+        self._client(monkeypatch).get("/api/alert-delivery-audit?hours=abc")
+        assert seen["hours"] == float(A.DEFAULT_WINDOW_HOURS)
+
+    def test_run_audit_raising_yields_500_not_crash(self, monkeypatch):
+        def _boom(hours):
+            raise RuntimeError("unable to open database file")
+
+        monkeypatch.setattr(A, "run_audit", _boom)
+        resp = self._client(monkeypatch).get("/api/alert-delivery-audit")
+        assert resp.status_code == 500
+        assert "error" in resp.get_json()
+
+    def test_api_key_enforced(self, monkeypatch):
+        monkeypatch.setenv("WEB_API_KEY", "secret")
+        monkeypatch.setattr(A, "run_audit", lambda hours: {"total": 0})
+        from dashboard.web_server import create_app
+        resp = create_app(store=object()).test_client().get(
+            "/api/alert-delivery-audit")
+        assert resp.status_code == 401

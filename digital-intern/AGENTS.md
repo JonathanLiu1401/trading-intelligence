@@ -5,6 +5,83 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-22 feature-dev pass (Agent 4) — surface the alert pipeline: `/api/alert-delivery-audit` + `/api/alert-freshness`
+
+Two fully-built, exhaustively-thought-through analytics builders sat in
+`analytics/` reachable from **no endpoint** — the recurring "no operator can
+see it" gap. Both answer the chronic, repeatedly hand-diagnosed alert-pipeline
+question (`daemon.log` "No response from Claude — skipping" storms, the
+urgency-backlog findings every recent pass logged in Phase 3). Wired both.
+
+### `/api/alert-delivery-audit` — did the urgent rows actually push to Discord?
+
+`analytics/alert_delivery_audit.py` already shipped a pure builder
+(`compute_delivery_audit`) + a dual-DB read-only shell (`run_audit`) + 25
+unit tests, but no route. The dashboard's `urgent` tile counts every
+`urgency=2` row — yet the alert worker marks a row alerted whenever *any*
+defense-in-depth gate absorbs it, so the tile conflates "the analyst was
+pushed" with "a gate quietly suppressed it". The audit joins `articles.db`
+(urgency=2) against `alert_recency.db` (signatures that actually fired) and
+partitions delivered vs suppressed, attributing each suppressed row to its
+gate. New route reuses `run_audit` **verbatim** (SSOT — the panel and the
+CLI digest can never disagree); `hours` floored at 0.5, ceiling applied by
+`run_audit` itself (recency TTL); any DB fault → 500, missing recency DB
+degrades to "all suppressed", never crashes.
+
+### `/api/alert-freshness` — how stale were the alerts at detection?
+
+`analytics/alert_freshness.py` shipped a pure builder
+(`compute_alert_freshness`) but **zero tests and no route**. It is the dual of
+`ingestion_latency` (all rows, per-source): scoped to `urgency>=1` rows only,
+it reports the `published`→`first_seen` staleness distribution — the quality
+failure that reads HEALTHY on every uptime/volume monitor. New route follows
+the `news-arrival-rhythm` precedent: `_ro_query` the four columns →
+`compute_alert_freshness`; `_LIVE_ONLY_CLAUSE` applied; `hours` clamped 1..168.
+
+### Live Phase-3 findings (2026-05-22, production articles.db)
+
+Both endpoints immediately surfaced real, previously-invisible problems:
+- **`alert-delivery-audit` (6h):** 55 urgency=2 rows, delivery_rate **0.87**
+  — but **`suppressed_llm_fraction 0.57`**: of the 7 rows the gates absorbed,
+  4 were LLM-vetted ground-truth labels (`low_authority` gate). Gates
+  preferentially eating LLM-vetted urgent rows is the exact calibration red
+  flag the module's docstring warns about. `delivered_llm_fraction 0.27` —
+  73% of *delivered* alerts were model-only (unverified), echoing the
+  standing `delivered_llm_fraction~0` finding.
+- **`alert-freshness` (24h):** 466 urgent rows, 399 with parseable
+  `published`. **p50 40min, p90 542min (9h), p99 1125min (~19h)**;
+  **`pct_over_1h 43.6%`** — nearly half of urgent alerts were over an hour
+  stale at detection, `pct_over_6h 17.3%`. The alert pipeline is technically
+  firing but a large fraction of what it pushes is no longer actionable —
+  precisely the failure mode the volume monitors miss. 67 urgent rows had
+  no parseable `published` (weak-metadata sources, surfaced as
+  `skipped_no_published`).
+
+### Tests
+
+`tests/test_alert_delivery_audit.py` — 6 new endpoint tests (`run_audit`
+payload passthrough, `hours` floor/forward/garbage-fallback, raise→500,
+WEB_API_KEY enforced) on top of the 25 existing builder tests.
+`tests/test_alert_freshness.py` — **new file, 17 tests**: the builder's
+first coverage (empty envelope, urgency<1 filter, `vetted_fraction` pinned
+byte-identical to `urgency_label_split`, >7d implausible skip, negative
+clock-skew clamp, malformed-row tolerance, known-sample percentiles,
+by_score_source partition sums) + 4 Flask endpoint tests (shape + backtest
+isolation, `hours` clamp, DB-error→500, WEB_API_KEY). 142 pass across the
+new + sibling endpoint suites (urgent-queue-health / source-urgency-yield /
+news-arrival-rhythm / overnight-gap-scanner / source-throughput — confirms
+the app factory still builds with the two new routes).
+
+### Invariants reaffirmed
+
+- Backtest isolation: `/api/alert-freshness` filters through
+  `_LIVE_ONLY_CLAUSE`; `alert_delivery_audit` carries the clause verbatim.
+- Read-only: both endpoints open `mode=ro` connections, no
+  `ai_score`/`ml_score`/`urgency`/`score_source` mutation.
+- Live `:8080` serves the new routes only after a daemon/dashboard restart.
+
+---
+
 ## 2026-05-22 HYBRID pass (Agent 3) — urgent-queue-health: surface the unalerted-urgent backlog
 
 A news analyst's worst failure is a *silent* one. `urgency_label_split*`
