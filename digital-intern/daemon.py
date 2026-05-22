@@ -2339,6 +2339,91 @@ def _price_alert_universe() -> list[str]:
     return sorted(set(PORTFOLIO_TICKERS) | set(LIVE_PORTFOLIO_TICKERS))
 
 
+_PORTFOLIO_JSON_PATH = BASE_DIR / "config" / "portfolio.json"
+
+
+def _load_held_positions() -> dict[str, dict]:
+    """``{TICKER: {qty, avg_cost, type}}`` for open positions in
+    config/portfolio.json. Best-effort — any error (missing / corrupt file,
+    unexpected shape) degrades to ``{}`` so a price alert still fires, just
+    without the held-position context line."""
+    out: dict[str, dict] = {}
+    try:
+        with open(_PORTFOLIO_JSON_PATH, "r", encoding="utf-8") as f:
+            pf = json.load(f)
+        for pos in pf.get("positions", []) or []:
+            tkr = ((pos or {}).get("ticker") or "").strip().upper()
+            if tkr:
+                out[tkr] = {
+                    "qty": pos.get("qty"),
+                    "avg_cost": pos.get("avg_cost"),
+                    "type": pos.get("type", ""),
+                }
+    except Exception:
+        pass
+    return out
+
+
+def _fmt_qty(qty) -> str:
+    """Render a (possibly fractional) share quantity compactly: ``14`` /
+    ``3.615`` / ``4.7095`` — never ``3.6150000001`` float dust."""
+    try:
+        q = float(qty)
+    except (TypeError, ValueError):
+        return "?"
+    return str(int(q)) if q == int(q) else f"{q:.6g}"
+
+
+def _price_alert_position_line(ticker: str, price: float,
+                               positions: dict[str, dict]) -> str:
+    """Held-position context for a price alert — the analyst persona's
+    "is this MY money, and where does the move leave me vs cost?" question.
+
+    Returns "" when ``ticker`` is watchlist-only (not an open position) or
+    its avg_cost is missing/non-positive, so a non-held mover's alert stays
+    a clean one-liner. Pure and deterministic for unit testing."""
+    pos = positions.get((ticker or "").upper())
+    if not pos:
+        return ""
+    try:
+        avg = float(pos.get("avg_cost"))
+    except (TypeError, ValueError):
+        return ""
+    if avg <= 0 or price is None:
+        return ""
+    pnl_pct = (price - avg) / avg * 100.0
+    side = "above" if pnl_pct >= 0 else "below"
+    return (f"💼 HELD POSITION: {_fmt_qty(pos.get('qty'))} @ ${avg:.2f} avg "
+            f"— now {abs(pnl_pct):.1f}% {side} cost basis")
+
+
+def _price_alert_news_line(store, ticker: str) -> str:
+    """Recent-news-catalyst context for a price alert: how many live
+    articles mentioned ``ticker`` in the last 60min. Tells the analyst at a
+    glance whether a 3% move has a news catalyst (act) or is technical/quiet
+    (watch). Best-effort — any store failure degrades to "" so the alert
+    still fires. Reuses the canonical ``ticker_mention_velocity`` primitive
+    (already ``_LIVE_ONLY_CLAUSE``-scoped, so synthetic backtest rows can
+    never inflate the count)."""
+    if store is None:
+        return ""
+    try:
+        rows = store.ticker_mention_velocity([ticker], window_min=60)
+    except Exception:
+        return ""
+    for r in rows or []:
+        if isinstance(r, dict) and r.get("ticker") == ticker:
+            try:
+                recent = int(r.get("recent") or 0)
+            except (TypeError, ValueError):
+                recent = 0
+            if recent >= 1:
+                return (f"📰 {recent} live article(s) mention {ticker} in the "
+                        f"last 60min — likely news catalyst")
+            return ""
+    return ""
+
+
 def price_alert_worker(store: ArticleStore):
     log.info("[price_alert_worker] started")
     bo = Backoff("price_alert", base=5.0, cap=300.0)
@@ -2357,6 +2442,9 @@ def price_alert_worker(store: ArticleStore):
             # from config/portfolio.json), then fetch any the watchlist sweep
             # missed directly via stock_data._fetch_one.
             alert_universe = _price_alert_universe()
+            # Held-position context (avg cost, P&L-vs-cost) for the alert —
+            # reloaded each cycle so a fresh fill is reflected without a restart.
+            held_positions = _load_held_positions()
             for tkr in alert_universe:
                 if tkr not in by_ticker:
                     row = _fetch_one(tkr)
@@ -2376,10 +2464,20 @@ def price_alert_worker(store: ArticleStore):
                 pct = (price - prev) / prev * 100.0 if prev else 0.0
                 if abs(pct) >= PRICE_ALERT_THRESHOLD:
                     sign = "+" if pct >= 0 else ""
-                    msg = (f"📈 PRICE ALERT: {tkr} {sign}{pct:.1f}% to "
-                           f"${price:.2f} (from ${prev:.2f}, "
-                           f"{PRICE_ALERT_INTERVAL // 60}min ago)")
-                    log.info(f"[price_alert] {msg}")
+                    headline = (f"📈 PRICE ALERT: {tkr} {sign}{pct:.1f}% to "
+                                f"${price:.2f} (from ${prev:.2f}, "
+                                f"{PRICE_ALERT_INTERVAL // 60}min ago)")
+                    # Enrich: held-position context (is this MY money, where
+                    # vs cost) + recent-news-catalyst context. Both degrade to
+                    # "" so a non-held / quiet mover stays a clean one-liner.
+                    extra = [
+                        ln for ln in (
+                            _price_alert_position_line(tkr, price, held_positions),
+                            _price_alert_news_line(store, tkr),
+                        ) if ln
+                    ]
+                    msg = "\n".join([headline, *extra])
+                    log.info(f"[price_alert] {headline}")
                     discord_send(msg, is_alert=True)
                 _last_prices[tkr] = price
             _worker_last_ok["price_alert"] = time.time()
