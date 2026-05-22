@@ -3087,6 +3087,68 @@ def create_app(store=None) -> Flask:
         out["window_hours"] = hours
         return jsonify(out)
 
+    @app.get("/api/overnight-gaps")
+    def api_overnight_gaps():
+        """Pre-open gap-risk scan — tickers carried by urgent / high-ml_score
+        news that broke during market-closed ET hours in the last 24h.
+
+        The wire never sleeps but the tape does: a catalyst that prints at
+        2 AM ET sits unpriced until 9:30. ``/api/articles`` is the raw feed
+        and ``/api/breaking-confluence`` clusters intraday bursts, but
+        neither isolates the *overnight* slice that actually gaps the open.
+        This reuses ``analytics.overnight_gap_scanner.build_overnight_gaps``
+        verbatim — the same ranking the CLI digest writes — so the live
+        panel and the log file can never disagree. Pure DB read, no LLM.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        from analytics.overnight_gap_scanner import build_overnight_gaps
+        try:
+            rows = _ro_query(
+                "SELECT first_seen, title, urgency, ml_score, source "
+                "FROM articles "
+                f"WHERE {_LIVE_ONLY_SQL} "
+                "ORDER BY first_seen DESC LIMIT 5000",
+            )
+        except sqlite3.Error:
+            rows = []
+        return jsonify(build_overnight_gaps(rows))
+
+    @app.get("/api/held-news-silence")
+    def api_held_news_silence():
+        """Per-held-ticker news-coverage audit — which names is the analyst
+        flying blind on?
+
+        The 5h Opus briefing's book-silence line answers this for the digest
+        window only and goes dark on Claude-quota exhaustion. This surfaces
+        the standing 1h / 6h / 24h coverage view for every book ticker as a
+        live, no-LLM panel: a ``DARK`` name has zero live mentions in 24h
+        (operating blind), an ``ECHO`` name has coverage from a single
+        publisher only (one outlet repeating itself). Reuses
+        ``analytics.held_ticker_news_silence`` verbatim — the held set is the
+        canonical ``LIVE_PORTFOLIO_TICKERS`` so it never drifts from the
+        briefing's ``[BOOK:]`` tag.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        from analytics.held_ticker_news_silence import (
+            SCAN_WINDOW_H, build_report, compute_silence,
+        )
+        from ml.features import LIVE_PORTFOLIO_TICKERS
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=SCAN_WINDOW_H)
+        ).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT title, source, first_seen FROM articles "
+                f"WHERE first_seen >= ? AND {_LIVE_ONLY_SQL}",
+                (since,),
+            )
+        except sqlite3.Error:
+            rows = []
+        per_ticker = compute_silence(rows, LIVE_PORTFOLIO_TICKERS)
+        return jsonify(build_report(per_ticker))
+
     @app.get("/api/news-corroboration")
     def api_news_corroboration():
         """Multi-source story confirmation feed — rank live clusters by how
@@ -5259,7 +5321,7 @@ _DASHBOARD_HTML = """<!doctype html>
 <div class="page-content">
 <div class="container-fluid p-3">
   <div class="d-flex justify-content-between align-items-center mb-3">
-    <h2 class="mb-0">Digital Intern</h2>
+    <h1 class="h2 mb-0">Digital Intern</h1>
     <div class="small-muted" id="last-updated">loading…</div>
   </div>
 
