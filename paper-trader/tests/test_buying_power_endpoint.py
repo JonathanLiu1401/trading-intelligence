@@ -197,7 +197,14 @@ class TestBuyingPowerEndpoint:
         """The prewarm == @swr_cached invariant
         (test_swr_prewarm_coverage.py) must include the new endpoint;
         re-assert here so a future change to either the route name or the
-        prewarm list trips a focused test before the broader invariant."""
-        import inspect
-        src = inspect.getsource(d._swr_prewarm)
-        assert '("buying-power", buying_power_api)' in src
+        prewarm list trips a focused test before the broader invariant.
+
+        Inspect the compiled code object directly rather than
+        ``inspect.getsource``: getsource resolves line numbers against
+        ``linecache``, which goes stale (returning a sibling function's
+        body) if a concurrent agent rewrites dashboard.py mid-run. The
+        ``("buying-power", buying_power_api)`` pair compiles to a const
+        string plus a global name, both immune to source-line drift."""
+        code = d._swr_prewarm.__code__
+        assert "buying-power" in code.co_consts
+        assert "buying_power_api" in code.co_names
