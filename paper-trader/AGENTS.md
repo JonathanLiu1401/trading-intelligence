@@ -6,6 +6,67 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-22 feature-dev pass (Agent 4) — `/api/per-ticker-skill` (decompose the aggregate scorer skill by ticker)
+
+Wired another fully-built, exhaustively-tested but **endpoint-less**
+diagnostic onto the dashboard — the same "no operator can see it" gap the
+`/api/persona-leaderboard` pass closed.
+
+### The gap
+
+`/api/scorer-confidence` and `/api/calibration` report the DecisionScorer's
+*aggregate* out-of-sample skill — one rank-IC over every outcome. That single
+number can sit near zero while hiding a scorer that is genuinely skilled on
+some tickers and **actively inverted** on others: the aggregate is a mix
+artifact. The per-ticker decomposition was computed by no endpoint.
+
+`paper_trader/ml/per_ticker_skill.py` already did the work — read-only, the
+temporal-split SSOT shared with `sector_skill` / `persona_skill`, per-name
+rank-IC + directional accuracy + magnitude bias + crisp `SIGNAL_EDGE` /
+`WEAK_SIGNAL_EDGE` / `NO_SIGNAL_EDGE` / `INVERTED_SIGNAL` / `SPARSE` verdicts,
+shipped with a CLI and exhaustive unit tests (`test_per_ticker_skill.py`).
+But it was reachable from **no route** — shell-only.
+
+### The fix
+
+New `/api/per-ticker-skill` route in `dashboard.py` — a thin wrapper that
+reuses the module's own `analyze` end-to-end function **verbatim** (it loads
+`decision_outcomes.jsonl`, applies the temporal split, loads the deployed
+scorer, computes per-ticker skill). `analyze` never raises — every fault
+degrades to a 200 `status='error'` / `insufficient_data` payload; only a
+genuine unexpected exception escaping the route is a 500. Observational only:
+never gates the live loop, never excludes a ticker (an `INVERTED_SIGNAL` row
+is the *data for* a separate, explicit decision — invariants #2 / #12).
+
+### Live evidence at merge
+
+```
+/api/per-ticker-skill → HAS_INVERTED_TICKER · n_oos 1482 · 30 tickers
+  TQQQ  SIGNAL_EDGE     rank_ic +0.27   dir_acc 62%   n_oos 305
+  LLY   SIGNAL_EDGE     rank_ic +0.26
+  UPRO  SIGNAL_EDGE     rank_ic +0.21
+  …
+  XLE   INVERTED_SIGNAL rank_ic -0.28   dir_acc 40%   ← lone inverted
+```
+
+A real, actionable read: the scorer rank-predicts 5d returns on TQQQ / LLY /
+NVO / UPRO / XLF, but on **XLE** its prediction is anti-predictive
+(`rank_ic -0.28`) — gating on XLE is actively worse than not gating. That is
+the data for a (separate, explicit) decision to exclude XLE from the gate or
+retrain with rebalanced ticker exposure.
+
+### Tests
+
+`tests/test_per_ticker_skill_endpoint.py` — 6 new: payload passthrough, the
+`as_of` stamp being the route's only addition, `insufficient_data` /
+`status='error'` degradations staying HTTP 200 (never 500), a genuine
+exception escaping → shaped 500, and an SSOT-parity lock (route payload minus
+`as_of` is byte-identical to calling `analyze` directly — the route forks no
+logic). 75 pass across the new + per_ticker_skill / persona / model-rankings /
+sector-skill / calibration sibling suites.
+
+---
+
 ## 2026-05-22 feature-dev pass (Agent 4) — `/api/persona-leaderboard` (surface the invisible per-persona diagnostic)
 
 Wired a fully-built, exhaustively-tested but **endpoint-less** diagnostic

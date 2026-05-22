@@ -6724,6 +6724,47 @@ def api_persona_leaderboard():
         }), 500
 
 
+@app.route("/api/per-ticker-skill")
+def api_per_ticker_skill():
+    """Per-ticker out-of-sample skill of the DecisionScorer — which names
+    the ML model can actually rank-predict, and which it is anti-predictive
+    on.
+
+    ``/api/scorer-confidence`` / ``/api/calibration`` report the scorer's
+    *aggregate* OOS skill — a single rank-IC over every outcome. That number
+    can sit near zero while hiding a scorer that is genuinely skilled on some
+    tickers and actively *inverted* on others (the aggregate is a mix
+    artifact). This sibling decomposes the same out-of-sample outcomes by
+    ticker: per-name rank-IC, directional accuracy, magnitude bias and a
+    crisp ``SIGNAL_EDGE`` / ``WEAK_SIGNAL_EDGE`` / ``NO_SIGNAL_EDGE`` /
+    ``INVERTED_SIGNAL`` / ``SPARSE`` verdict.
+
+    The diagnostic — ``paper_trader.ml.per_ticker_skill`` — already existed
+    (read-only, exhaustively unit-tested, temporal-split SSOT shared with
+    ``sector_skill`` / ``persona_skill``) but was reachable from no endpoint:
+    an operator could only see it from a shell. This route is a thin wrapper
+    that reuses the module's own ``analyze`` end-to-end function **verbatim**
+    (it loads ``decision_outcomes.jsonl``, applies the temporal split, loads
+    the deployed scorer and computes per-ticker skill), so the dashboard and
+    the CLI digest can never disagree. ``analyze`` never raises — every fault
+    degrades to a 200 ``status='error'`` / ``insufficient_data`` payload.
+    Observational only: never gates the live loop, never excludes a ticker
+    (an ``INVERTED_SIGNAL`` row is the *data for* a separate, explicit
+    decision — invariants #2 / #12).
+    """
+    from paper_trader.ml.per_ticker_skill import analyze
+
+    try:
+        report = analyze()
+        report["as_of"] = datetime.now(timezone.utc).isoformat()
+        return jsonify(report)
+    except Exception as e:
+        return jsonify({
+            "error": str(e), "status": "error", "verdict": "error",
+            "tickers": [], "inverted_tickers": [], "hint": str(e),
+        }), 500
+
+
 @app.route("/api/backtests/stats")
 @swr_cached("backtests-stats", 30.0)
 def backtest_stats_api():
@@ -12370,10 +12411,14 @@ def runner_heartbeat_api():
         decs = store.recent_decisions(20)
         last_ts = decs[0].get("timestamp") if decs else None
         recent_actions = [d.get("action_taken") for d in decs]
+        # Reasoning strings (parallel to recent_actions) let the IDLE_STORM
+        # verdict diagnose its cause — a host-saturation / quota storm is not
+        # cleared by a restart, so the heartbeat must not recommend one.
+        recent_reasons = [d.get("reasoning") for d in decs]
         now_utc = datetime.now(timezone.utc)
         hb = build_runner_heartbeat(
             last_ts, _mkt.is_market_open(now_utc), now=now_utc,
-            recent_actions=recent_actions)
+            recent_actions=recent_actions, recent_reasons=recent_reasons)
         # Additive: the single-instance-lock state of THE PROCESS SERVING
         # THIS DASHBOARD (the dashboard runs in a runner thread). A runner
         # that booted degraded (no flock — invariant #19 fail-open) may be
