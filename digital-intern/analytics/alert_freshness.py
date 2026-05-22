@@ -322,13 +322,23 @@ def run(db_path: Path | None = None, hours: int = 24) -> dict:
     return report
 
 
+_DEFAULT_OUT = Path("/home/zeph/logs/alert_freshness.json")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--hours", type=int, default=24)
     p.add_argument("--db", type=Path, default=None)
+    p.add_argument("--out", type=Path, default=_DEFAULT_OUT,
+                   help="Write JSON report to this file (default: %(default)s)")
     args = p.parse_args(argv)
     report = run(db_path=args.db, hours=args.hours)
-    print(json.dumps(report, indent=2))
+    out_str = json.dumps(report, indent=2)
+    print(out_str)
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(out_str + "\n")
+        print(f"[alert_freshness] report saved → {args.out}", flush=True)
     return 0
 
 
