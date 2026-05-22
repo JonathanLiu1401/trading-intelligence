@@ -366,6 +366,75 @@ class TestFormatQuantSignals:
         assert out.index("  AAPL:") < out.index("  MU:") < out.index("  ZM:")
 
 
+class TestBollingerPositionCalibration:
+    """`get_quant_signals_live` computes `bb_position = (last - sma20) /
+    (2 * sd20)`, so a price sitting *on* the upper/lower Bollinger band (2
+    standard deviations from the 20-day mean) lands at ≈ +1 / -1 — NOT ±2.
+
+    This pins the calibration the live system prompt now states ("bb_position
+    approaching +1 or -1 means price is at the upper/lower Bollinger band").
+    The previous prompt told Opus to watch for "+2 or -2", a threshold the
+    metric only reaches at ~4σ — i.e. effectively never — so a genuinely
+    stretched name read as un-stretched to the decision engine. A regression
+    that switched the denominator to `sd20` (band at ±2) would fail here."""
+
+    def _fake_yf(self, monkeypatch, closes):
+        import pandas as pd
+        df = pd.DataFrame({
+            "Close": closes,
+            "Volume": [1_000_000.0] * len(closes),
+        })
+
+        class _FakeTicker:
+            def __init__(self, _sym):
+                pass
+
+            def history(self, period="1y", auto_adjust=False):
+                return df
+
+        monkeypatch.setattr("yfinance.Ticker", _FakeTicker)
+        strategy._QUANT_CACHE.clear()
+
+    def test_price_at_two_sigma_band_reads_near_plus_one(self, monkeypatch):
+        # Last 20 closes: 18 alternating 95/105 + 100 + a stretched 111. The
+        # 111 sits ~1.97σ above the 20-day mean — right at the upper band.
+        window20 = [95.0, 105.0] * 9 + [100.0, 111.0]
+        closes = [100.0] * 230 + window20
+        self._fake_yf(monkeypatch, closes)
+
+        sig = strategy.get_quant_signals_live(["BBTEST1"])["BBTEST1"]
+        bb = sig["bb_position"]
+        # A price at the 2σ band reads ≈ +1, NOT ≈ +2.
+        assert 0.9 <= bb <= 1.1
+        assert bb < 1.5
+
+    def test_bb_position_matches_documented_formula(self, monkeypatch):
+        # Independent recompute of (last - sma20) / (2 * sd20) over the exact
+        # 20-element window — pins the denominator and the ±2 clamp.
+        window20 = [98.0, 101.0, 99.0, 103.0, 97.0] * 3 + [
+            100.0, 102.0, 96.0, 104.0, 108.0]
+        assert len(window20) == 20
+        closes = [100.0] * 230 + window20
+        self._fake_yf(monkeypatch, closes)
+
+        sig = strategy.get_quant_signals_live(["BBTEST2"])["BBTEST2"]
+        last = window20[-1]
+        sma20 = sum(window20) / 20
+        sd20 = strategy._stdev_live(window20)
+        expected = round(max(-2.0, min(2.0, (last - sma20) / (2 * sd20))), 2)
+        assert sig["bb_position"] == expected
+
+    def test_price_below_lower_band_is_negative(self, monkeypatch):
+        # Mirror case: a sharply depressed last close yields a negative
+        # bb_position (the oversold side of the band).
+        window20 = [95.0, 105.0] * 9 + [100.0, 89.0]
+        closes = [100.0] * 230 + window20
+        self._fake_yf(monkeypatch, closes)
+
+        sig = strategy.get_quant_signals_live(["BBTEST3"])["BBTEST3"]
+        assert sig["bb_position"] < 0.0
+
+
 # ─────────────────────────── _enforce_risk_pre_trade ───────────────────────────
 
 class TestEnforceRiskPreTrade:

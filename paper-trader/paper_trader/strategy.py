@@ -179,7 +179,8 @@ TECHNICAL SIGNAL INTERPRETATION (use alongside news, not in isolation):
 - MACD signal crossovers confirm momentum: positive macd_signal with rising price is bullish
   confirmation; negative macd_signal with falling price is bearish confirmation.
 - Bollinger Band squeezes (bb_position near 0 after a tight range) often precede breakouts;
-  bb_position approaching +2 or -2 signals stretched conditions and elevated reversal risk.
+  bb_position approaching +1 or -1 means price is at the upper/lower Bollinger band (2 standard
+  deviations from the 20-day mean) — stretched conditions and elevated reversal risk.
 - Require volume confirmation for breakout trades: only trust a breakout when vol_ratio > 1.2.
   Low-volume breakouts often fail.
 - Weight technical signals alongside news — neither alone is sufficient. A strong news catalyst
