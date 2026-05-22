@@ -13772,6 +13772,18 @@ def _swr_prewarm():
         # manual trade — cold-stalling that surface defeats the point of
         # surfacing the block in the first place.
         ("buying-power", buying_power_api),
+        # The four endpoints below were @swr_cached by later commits but
+        # never added to this prewarm list — the same freeze-triage cold-
+        # stall blind spot test_swr_prewarm_coverage locks against. A trader
+        # opening these panels right after a restart got {"warming": true}
+        # for one full TTL cycle. Restored to keep prewarm == @swr_cached.
+        # watchlist-coverage / today-action-tape are articles.db + store
+        # scans; concentration-trajectory / realized-vs-unrealized are
+        # equity-curve + round-trip rebuilds — all slow enough to cold-stall.
+        ("watchlist-coverage", watchlist_coverage_api),
+        ("realized-vs-unrealized", realized_vs_unrealized_api),
+        ("concentration-trajectory", concentration_trajectory_api),
+        ("today-action-tape", today_action_tape_api),
     ]
     for name, wrapper in targets:
         try:
