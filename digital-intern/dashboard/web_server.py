@@ -3606,6 +3606,87 @@ def create_app(store=None) -> Flask:
         data["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         return jsonify(data)
 
+    @app.get("/api/urgent-queue-health")
+    def api_urgent_queue_health():
+        """Health of the *unalerted* urgent backlog — "am I about to silently
+        miss an urgent item?".
+
+        ``urgency_label_split`` reports the calibration of urgent rows the
+        alerter already SAW; this is the complement — what is still WAITING in
+        the queue. A ``urgency=1`` row is "scored urgent, not yet pushed";
+        once its ``first_seen`` ages past 24h the alert worker can never see
+        it again and ``reap_stale_urgent`` demotes it — the push is silently
+        lost, with no trace. This endpoint surfaces that backlog before the
+        loss: how many urgent items are queued, how old the oldest is, how
+        many are within ``near_reap_hours`` of the reap deadline, and how many
+        are already ``overdue`` (push lost).
+
+        The per-held-ticker breakdown answers the analyst's sharper question
+        — "is my BOOK the thing going un-alerted?" — using the canonical
+        ``LIVE_PORTFOLIO_TICKERS`` so it never drifts from the briefing's
+        ``[BOOK:]`` tag or ``urgency_label_split_by_ticker``.
+
+        Query params:
+          ``reap_hours``  — reap deadline, clamped 1..168 (default 24).
+          ``near_hours``  — near-reap warning band, clamped 0..reap (default 3).
+
+        Returns (passthrough from ``ArticleStore.urgent_queue_health`` plus a
+        verdict):
+          ``queued`` / ``oldest_age_h`` / ``near_reap`` / ``overdue``
+          ``reap_age_hours`` / ``near_reap_hours`` / ``by_ticker``
+          ``status`` — "quiet" (queued==0), "ok" (no near/overdue rows),
+                        "near_reap" (>=1 near the deadline, none overdue),
+                        "items_lost" (>=1 overdue — urgent pushes silently
+                        dropped; the analyst's worst case)
+          ``as_of``  — ISO8601 UTC timestamp
+        Read-only — no DB writes; backtest rows excluded by the underlying
+        method's ``_LIVE_ONLY_CLAUSE``; all four load-bearing invariants are
+        preserved by construction.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        store = _store_handle()
+        if store is None:
+            return jsonify({"error": "store unavailable"}), 503
+        try:
+            reap_hours = int(request.args.get("reap_hours", 24))
+        except (TypeError, ValueError):
+            reap_hours = 24
+        reap_hours = max(1, min(168, reap_hours))
+        try:
+            near_hours = float(request.args.get("near_hours", 3.0))
+        except (TypeError, ValueError):
+            near_hours = 3.0
+        near_hours = max(0.0, min(float(reap_hours), near_hours))
+        try:
+            from ml.features import LIVE_PORTFOLIO_TICKERS
+        except Exception:
+            LIVE_PORTFOLIO_TICKERS = set()
+        try:
+            data = store.urgent_queue_health(
+                tickers=sorted(LIVE_PORTFOLIO_TICKERS),
+                reap_age_hours=reap_hours,
+                near_reap_hours=near_hours,
+            )
+        except Exception as exc:
+            return jsonify(
+                {"error": f"urgent_queue_health failed: {exc!s}"}
+            ), 500
+        # Verdict — same silence-vs-signal discipline as api_urgent_label_split:
+        # a quiet/healthy queue collapses to a benign status, only a genuine
+        # near-miss or a confirmed lost push escalates.
+        if int(data.get("queued") or 0) == 0:
+            status = "quiet"
+        elif int(data.get("overdue") or 0) > 0:
+            status = "items_lost"
+        elif int(data.get("near_reap") or 0) > 0:
+            status = "near_reap"
+        else:
+            status = "ok"
+        data["status"] = status
+        data["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return jsonify(data)
+
     @app.get("/api/source-throughput")
     def api_source_throughput():
         """Per-source recent-vs-prior article rate + deceleration percentage.

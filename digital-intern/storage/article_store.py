@@ -1873,5 +1873,142 @@ class ArticleStore:
         )
         return out
 
+    @_retry_on_lock
+    def urgent_queue_health(
+        self,
+        tickers: list[str] | None = None,
+        reap_age_hours: int = 24,
+        near_reap_hours: float = 3.0,
+    ) -> dict:
+        """Health of the *unalerted* urgent backlog — the analyst's standing
+        "am I about to silently miss an urgent item?" view.
+
+        A ``urgency=1`` row is "ML/LLM-scored urgent, not yet pushed to
+        Discord". Two facts make a growing ``urgency=1`` backlog dangerous and
+        currently invisible:
+
+          * ``get_unalerted_urgent`` only ever returns ``first_seen >= now-24h``
+            rows — the instant a still-pending row crosses that boundary the
+            alert worker can never see it again;
+          * ``reap_stale_urgent`` then demotes it to ``urgency=0``.
+
+        So a ``urgency=1`` row that ages past ``reap_age_hours`` is dropped
+        with NO push and NO trace — exactly the "missed urgent item" the
+        consuming analyst fears. ``urgency_label_split*`` count rows the
+        alerter already *saw*; this is the complement — what is still WAITING,
+        and how close it is to being lost.
+
+        A row is ``overdue`` once its age >= ``reap_age_hours`` (push already
+        lost, awaiting the next purge sweep); ``near_reap`` once its age is
+        within ``near_reap_hours`` of that deadline but not yet overdue.
+
+        ``tickers`` (optional) drives the per-held-name breakdown so the
+        analyst can answer "is my BOOK the thing going un-alerted?". Matching
+        mirrors ``urgency_label_split_by_ticker`` exactly — whole-word,
+        ALL-CAPS, optional leading ``$``, ``len >= 2``, surface = title +
+        summary — so the two metrics never disagree about whether an urgent
+        row touches a held name.
+
+        Returns::
+
+            {
+              "queued":          int,            # all live urgency=1 rows
+              "oldest_age_h":    float | None,    # None when queued == 0
+              "near_reap":       int,
+              "overdue":         int,
+              "reap_age_hours":  int,
+              "near_reap_hours": float,
+              "by_ticker": [ {ticker, queued, oldest_age_h,
+                              near_reap, overdue}, ... ],   # worst-oldest-first
+            }
+
+        Read-only (single SELECT) scoped with ``_LIVE_ONLY_CLAUSE`` so the
+        synthetic backtest/opus rows (inserted ``urgency=0`` by construction,
+        but defense-in-depth) can never inflate the backlog. NO DB write — no
+        ai_score / ml_score / score_source / urgency mutation. All four
+        load-bearing invariants intact by construction.
+        """
+        now = datetime.now(timezone.utc)
+        rows = self.conn.execute(
+            "SELECT first_seen, title, full_text FROM articles "
+            f"WHERE urgency=1 AND {_LIVE_ONLY_CLAUSE}"
+        ).fetchall()
+
+        reap_age_hours = max(int(reap_age_hours), 1)
+        near_reap_hours = max(float(near_reap_hours), 0.0)
+        near_cut = reap_age_hours - near_reap_hours  # age >= this → near-reap
+
+        # Whole-word, ALL-CAPS, optional leading $ — identical discipline to
+        # urgency_label_split_by_ticker so the two metrics never disagree.
+        clean: list[str] = []
+        for raw in tickers or []:
+            if not raw:
+                continue
+            t = str(raw).strip().upper()
+            if len(t) >= 2 and t not in clean:
+                clean.append(t)
+        patterns = {
+            t: re.compile(rf"\b\${{0,1}}{re.escape(t)}\b") for t in clean
+        }
+        per_ticker: dict[str, list[float]] = {t: [] for t in clean}
+
+        ages: list[float] = []
+        for first_seen, title, blob in rows:
+            if not first_seen:
+                # Unparseable timestamp — count it as queued but it cannot be
+                # aged. Treated as age 0.0 (fresh) so it never fakes an
+                # overdue/near-reap warning the operator would chase.
+                age_h = 0.0
+            else:
+                try:
+                    ts = datetime.fromisoformat(first_seen)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    age_h = max(0.0, (now - ts).total_seconds() / 3600.0)
+                except (ValueError, TypeError):
+                    age_h = 0.0
+            ages.append(age_h)
+            if clean:
+                try:
+                    summary = decompress(blob) if blob else ""
+                except Exception:
+                    summary = ""
+                hay = f"{title or ''} {summary}"
+                for t, pat in patterns.items():
+                    if pat.search(hay):
+                        per_ticker[t].append(age_h)
+
+        def _classify(age_list: list[float]) -> dict:
+            n = len(age_list)
+            oldest = round(max(age_list), 2) if age_list else None
+            overdue = sum(1 for a in age_list if a >= reap_age_hours)
+            near = sum(1 for a in age_list
+                       if near_cut <= a < reap_age_hours)
+            return {"queued": n, "oldest_age_h": oldest,
+                    "near_reap": near, "overdue": overdue}
+
+        top = _classify(ages)
+        by_ticker: list[dict] = []
+        for t in clean:
+            al = per_ticker[t]
+            if not al:
+                continue  # held name with zero queued urgent rows — omit
+            by_ticker.append({"ticker": t, **_classify(al)})
+        # Worst-oldest-first so the held name closest to a silent drop is at
+        # the top; alphabetical tiebreak for a stable, test-pinnable order.
+        by_ticker.sort(
+            key=lambda r: (-(r["oldest_age_h"] or 0.0), r["ticker"])
+        )
+
+        return {
+            "queued": top["queued"],
+            "oldest_age_h": top["oldest_age_h"],
+            "near_reap": top["near_reap"],
+            "overdue": top["overdue"],
+            "reap_age_hours": reap_age_hours,
+            "near_reap_hours": near_reap_hours,
+            "by_ticker": by_ticker,
+        }
+
     def close(self):
         self.conn.close()
