@@ -161,6 +161,140 @@ class TestGetOptionPrice:
         assert market.get_option_price("FAKE", "2026-12-19", 100.0, "call") == 7.5
 
 
+class TestGetOptionPriceCache:
+    """Locks the per-contract TTL cache in get_option_price.
+
+    `get_option_price` fetches the whole option chain over the network on a
+    miss; the cache means a held option is priced with at most one chain
+    fetch per `_OPT_PRICE_TTL` window. A `None` miss (off-chain strike) is
+    cached too — the dead-cache role; a network exception is NOT cached.
+    `_OPT_PRICE_CACHE` is module-global, so each test clears it first.
+    """
+
+    @staticmethod
+    def _chain_ticker(call_counter, strike=100.0, bid=4.0, ask=6.0, last=5.0):
+        """A fake yf.Ticker whose option_chain() increments call_counter and
+        returns a one-row chain at ``strike``."""
+        import pandas as pd
+        chain = MagicMock()
+        chain.calls = pd.DataFrame(
+            [{"strike": strike, "lastPrice": last, "bid": bid, "ask": ask}])
+        chain.puts = pd.DataFrame(
+            [{"strike": strike, "lastPrice": last, "bid": bid, "ask": ask}])
+
+        def _option_chain(_expiry):
+            call_counter.append(1)
+            return chain
+
+        fake = MagicMock()
+        fake.option_chain.side_effect = _option_chain
+        return fake
+
+    def test_same_ttl_window_serves_cached_value(self, monkeypatch):
+        market._OPT_PRICE_CACHE.clear()
+        calls: list[int] = []
+        monkeypatch.setattr(market.yf, "Ticker",
+                            lambda t: self._chain_ticker(calls))
+        monkeypatch.setattr(market.time, "time", lambda: 1000.0)
+
+        first = market.get_option_price("FAKE", "2026-12-19", 100.0, "call")
+        second = market.get_option_price("FAKE", "2026-12-19", 100.0, "call")
+        third = market.get_option_price("FAKE", "2026-12-19", 100.0, "call")
+
+        assert first == 5.0  # mid of (4,6)
+        assert second == first and third == first
+        assert sum(calls) == 1  # chain fetched exactly once
+
+    def test_ttl_expiry_triggers_refetch(self, monkeypatch):
+        market._OPT_PRICE_CACHE.clear()
+        calls: list[int] = []
+        # Each fresh fetch returns a different mid so a refetch is observable.
+        seq = iter([(4.0, 6.0), (8.0, 10.0)])
+
+        def fake_ticker(_t):
+            bid, ask = next(seq)
+            return self._chain_ticker(calls, bid=bid, ask=ask)
+
+        monkeypatch.setattr(market.yf, "Ticker", fake_ticker)
+        now = {"t": 0.0}
+        monkeypatch.setattr(market.time, "time", lambda: now["t"])
+
+        now["t"] = 5.0
+        a = market.get_option_price("FAKE", "2026-12-19", 100.0, "call")
+        now["t"] = 34.999  # still inside the 30s TTL window (< 5.0 + 30)
+        b = market.get_option_price("FAKE", "2026-12-19", 100.0, "call")
+        now["t"] = 35.001  # past the TTL -> refetch
+        c = market.get_option_price("FAKE", "2026-12-19", 100.0, "call")
+
+        assert a == 5.0
+        assert b == 5.0          # cached
+        assert c == 9.0          # mid of (8,10): fresh fetch
+        assert sum(calls) == 2
+
+    def test_none_miss_is_cached(self, monkeypatch):
+        """An off-chain strike returns None — and that None is cached, so the
+        whole chain is not re-pulled every cycle for a stale/bad contract."""
+        market._OPT_PRICE_CACHE.clear()
+        calls: list[int] = []
+        # Chain only has strike 100; we ask for 999 -> row empty -> None.
+        monkeypatch.setattr(market.yf, "Ticker",
+                            lambda t: self._chain_ticker(calls, strike=100.0))
+        monkeypatch.setattr(market.time, "time", lambda: 1000.0)
+
+        first = market.get_option_price("FAKE", "2026-12-19", 999.0, "call")
+        second = market.get_option_price("FAKE", "2026-12-19", 999.0, "call")
+
+        assert first is None and second is None
+        assert sum(calls) == 1  # the None miss was cached, not re-fetched
+
+    def test_distinct_contracts_keyed_independently(self, monkeypatch):
+        """Different strike / option_type must not alias to one cached price."""
+        market._OPT_PRICE_CACHE.clear()
+        import pandas as pd
+        chain = MagicMock()
+        chain.calls = pd.DataFrame([
+            {"strike": 100.0, "lastPrice": 5.0, "bid": 4.0, "ask": 6.0},
+            {"strike": 110.0, "lastPrice": 2.0, "bid": 1.0, "ask": 3.0},
+        ])
+        chain.puts = pd.DataFrame([
+            {"strike": 100.0, "lastPrice": 9.0, "bid": 8.0, "ask": 10.0},
+        ])
+        fake = MagicMock()
+        fake.option_chain.return_value = chain
+        monkeypatch.setattr(market.yf, "Ticker", lambda t: fake)
+        monkeypatch.setattr(market.time, "time", lambda: 1000.0)
+
+        assert market.get_option_price("FAKE", "2026-12-19", 100.0, "call") == 5.0
+        assert market.get_option_price("FAKE", "2026-12-19", 110.0, "call") == 2.0
+        assert market.get_option_price("FAKE", "2026-12-19", 100.0, "put") == 9.0
+        # Re-reading the first contract still gives ITS price, not an alias.
+        assert market.get_option_price("FAKE", "2026-12-19", 100.0, "call") == 5.0
+
+    def test_network_exception_is_not_cached(self, monkeypatch):
+        """A transient yfinance fault degrades to None but must be RETRIED on
+        the next call — only a stable off-chain miss is pinned for the TTL."""
+        market._OPT_PRICE_CACHE.clear()
+        calls: list[int] = []
+
+        def fake_ticker(_t):
+            calls.append(1)
+            if len(calls) == 1:
+                boom = MagicMock()
+                boom.option_chain.side_effect = RuntimeError("network down")
+                return boom
+            return self._chain_ticker([], bid=4.0, ask=6.0)
+
+        monkeypatch.setattr(market.yf, "Ticker", fake_ticker)
+        monkeypatch.setattr(market.time, "time", lambda: 1000.0)
+
+        first = market.get_option_price("FAKE", "2026-12-19", 100.0, "call")
+        second = market.get_option_price("FAKE", "2026-12-19", 100.0, "call")
+
+        assert first is None        # the fault degraded to None
+        assert second == 5.0        # retried (not cached) -> recovered
+        assert len(calls) == 2
+
+
 class TestGetFuturesPriceBucketCache:
     """Locks the 30s time-bucket lru_cache in get_futures_price.
 

@@ -67,6 +67,19 @@ def _isolate_data_dir(tmp_path, monkeypatch):
         from collections import OrderedDict as _OD
         bt._VOLUME_CACHE_DISK_LOADED = _OD()
 
+    # Reset the option-price cache between tests. `market.get_option_price`
+    # caches per (ticker, expiry, strike, option_type) for _OPT_PRICE_TTL
+    # seconds; two tests that price the SAME contract with different fake
+    # chains (test_core_market's mid-of-bid-ask vs fall-back-to-last) would
+    # otherwise see the first test's cached value. hasattr-guarded so this
+    # never breaks a test that doesn't import market.
+    try:
+        import paper_trader.market as _mkt
+        if hasattr(_mkt, "_OPT_PRICE_CACHE"):
+            _mkt._OPT_PRICE_CACHE.clear()
+    except Exception:
+        pass
+
     # Unit tests must be deterministic regardless of the *real* host load.
     # strategy.decide() now runs a pre-flight host-saturation guard
     # (paper_trader/host_guard.host_saturated) that skips the claude call when

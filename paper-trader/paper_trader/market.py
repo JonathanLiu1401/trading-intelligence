@@ -68,6 +68,22 @@ _PRICE_TTL = 30.0  # seconds
 _DEAD_CACHE: dict[str, float] = {}  # ticker -> ts when marked dead
 _DEAD_TTL = 300.0  # seconds
 
+# Option-contract price cache. `get_option_price` fetches the FULL option
+# chain over the network on every call — and it is called once per open
+# option position on every mark-to-market (`strategy._mark_to_market`, every
+# 30-min cycle) plus again from `strategy._execute` when a SELL_CALL/SELL_PUT
+# fires against the same contract in the same cycle. Stocks have `_PRICE_CACHE`
+# and futures have a 30s bucket cache; the option path had neither, so a book
+# holding options re-pulled an unchanged chain every cycle and a bad strike
+# (not in the chain — `get_option_price` returns None) re-failed forever, the
+# exact "re-request a failing symbol every cycle" spam `_DEAD_CACHE` was added
+# to stop for stocks. A short TTL keyed on the contract closes that gap:
+# `None` results are cached too (acting as the dead-cache for an off-chain
+# strike), so a 30-min cycle now does at most one chain fetch per contract.
+# TTL matches `_PRICE_TTL` so an option mark is no staler than a stock mark.
+_OPT_PRICE_CACHE: dict[tuple, tuple[float | None, float]] = {}
+_OPT_PRICE_TTL = 30.0  # seconds
+
 
 def _is_dead(ticker: str) -> bool:
     ts = _DEAD_CACHE.get(ticker)
@@ -297,9 +313,31 @@ def get_options_chain(ticker: str, target_dte: int = 14) -> dict | None:
         return None
 
 
+def _cached_option_price(key: tuple) -> tuple[bool, float | None]:
+    """``(hit, price)`` for an option-contract cache key. ``hit`` is False
+    when there is no fresh entry; ``price`` is the cached value (which may
+    legitimately be ``None`` — a cached off-chain/unfetchable miss)."""
+    rec = _OPT_PRICE_CACHE.get(key)
+    if rec is not None and time.time() - rec[1] < _OPT_PRICE_TTL:
+        return True, rec[0]
+    return False, None
+
+
+def _store_option_price(key: tuple, price: float | None) -> None:
+    _OPT_PRICE_CACHE[key] = (price, time.time())
+
+
 def get_option_price(ticker: str, expiry: str, strike: float, option_type: str) -> float | None:
     """Mid-of-bid-ask for a specific option contract. Hard-fails if strike not in chain
-    (silently substituting the nearest strike would create position/price mismatches)."""
+    (silently substituting the nearest strike would create position/price mismatches).
+
+    Result is cached per ``(ticker, expiry, strike, option_type)`` for
+    ``_OPT_PRICE_TTL`` seconds — including a ``None`` miss — so a held option
+    is priced with at most one chain fetch per cycle (see ``_OPT_PRICE_CACHE``)."""
+    key = (ticker, expiry, strike, option_type)
+    hit, cached = _cached_option_price(key)
+    if hit:
+        return cached
     try:
         t = yf.Ticker(ticker)
         chain = t.option_chain(expiry)
@@ -307,14 +345,21 @@ def get_option_price(ticker: str, expiry: str, strike: float, option_type: str) 
         row = df[df["strike"] == strike]
         if row.empty:
             print(f"[market] strike {strike} not in {ticker} {expiry} {option_type} chain")
+            _store_option_price(key, None)
             return None
         last = float(row["lastPrice"].iloc[0])
         bid = float(row["bid"].iloc[0])
         ask = float(row["ask"].iloc[0])
         if bid > 0 and ask > 0:
-            return round((bid + ask) / 2, 4)
-        return last if last > 0 else None
+            price = round((bid + ask) / 2, 4)
+        else:
+            price = last if last > 0 else None
+        _store_option_price(key, price)
+        return price
     except Exception as e:
+        # A network/parse fault is NOT cached: unlike an off-chain strike
+        # (a stable "no such contract"), a transient yfinance error should be
+        # retried on the next call, not pinned None for the whole TTL.
         print(f"[market] option price failed {ticker} {expiry} {strike} {option_type}: {e}")
         return None
 
