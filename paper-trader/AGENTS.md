@@ -17930,3 +17930,83 @@ python3 -m pytest tests/ -v                                       # full (~25min
 python3 -m pytest tests/test_core_*.py -q                         # core slice (784 tests)
 python3 -m pytest tests/test_blocked_reasons_reporter.py -q        # this pass's feature (32 tests)
 ```
+
+## 2026-05-22 — Agent 1 (paper-trader core) HYBRID review pass #2
+
+### Phase 1: Bug fix — `get_prices` single-ticker bulk branch was dead code
+
+`market.get_prices` switched on `len(missing) == 1` to read a flat
+`data["Close"]` column from the `yf.download(..., group_by="ticker")`
+result. Confirmed empirically: current yfinance returns a *per-ticker
+MultiIndex* frame even for a SINGLE symbol, so `data["Close"]` raises
+`KeyError` on every single-ticker bulk fetch — the branch never matched
+real data. The call still returned the right price (the inner
+`except` fell through to a per-ticker `get_price()`), so it was a silent
+*performance* defect: every single-stock mark-to-market did a wasted
+bulk download then a slow per-ticker fallback. Fixed by switching on the
+real column `nlevels` instead of the request size — a MultiIndex frame
+(any symbol count) reads `data[t]["Close"]`, a flat frame (older
+yfinance) reads `data["Close"]`. The pre-existing `TestGetPricesBulk`
+tests *mocked the wrong shape* (flat single-ticker frame) so they never
+caught it; a new test mocks the real MultiIndex single-ticker shape and
+asserts the price resolves from the bulk frame with no `get_price`
+fallback. Commit `4c59f0a`.
+
+### Phase 2: Feature — cause-aware IDLE_STORM restart advice
+
+`runner_heartbeat.build_runner_heartbeat` now accepts `recent_reasons`
+(newest-first `decisions.reasoning` strings, parallel to
+`recent_actions`). On an IDLE_STORM it diagnoses the dominant cause of
+the leading NO_DECISION run via `_no_decision_cause` / `_dominant_cause`:
+a `host_saturated` or `quota` storm is NOT cleared by a restart —
+restarting just adds another ~1.5 GB Opus process to the storm — so
+`restart_recommended` stays False and the headline says so, instead of
+the legacy unconditional "a restart may clear a wedged Claude CLI" that
+misdirected the operator into the action that worsens it. A genuine
+wedged-CLI storm keeps the restart advice. Omitting `recent_reasons` is
+byte-identical to before. Wired into `/api/runner-heartbeat` and
+`reporter._heartbeat_line` so the heartbeat now agrees with
+`/api/no-decision-reasons`. Verified live: with 20/20 NO_DECISION rows
+all host-saturated, the builder now returns `restart_recommended=False`
++ "cause is host saturation, a restart will NOT help". 8 new tests in
+`tests/test_runner_heartbeat.py`. Commit `85f13b3`. (The dashboard.py
+wiring was swept into a sibling agent's commit `a3fed90` by a whole-file
+`git add` — the documented concurrent same-role staging race.)
+
+### Phase 3: Live validation findings (live trader ~03:30 UTC)
+
+1. **NO_DECISION storm — 50/50 cycles, 100% host_saturated.**
+   `/api/no-decision-reasons` correctly attributes every skipped cycle
+   to host saturation (8–10 concurrent Opus, swap >90%). Self-induced
+   by concurrent Opus review agents (this HYBRID + a sibling + the
+   backtest committee). `host_guard` correctly detects it and skips the
+   doomed claude call. Not a code bug — the system is behaving exactly
+   as designed.
+2. **SWR endpoints stuck "warming" under heavy saturation.**
+   `/api/runner-heartbeat` and `/api/risk` returned
+   `{"warming":true,"attempts":0}` for >30 s after the runner restart;
+   earlier in the session they warmed in ~8 s. The SWR background
+   warmer thread is starved by the same host saturation. Degraded but
+   not broken — a clear "computing — retry shortly" sentinel, not a
+   500 — but a trader checking the dashboard mid-storm sees empty
+   panels. Not fixed (a symptom of the storm, not a defect).
+3. **Healthy surfaces.** `/api/portfolio` fresh ($1000.14, 1 NVDA lot
+   65.8% of book, −1.18% unrealized); `/api/risk` flags
+   `concentration_severity=HIGH`; dashboard root + `/api/no-decision-
+   reasons` return well-formed, accurate data.
+4. **Prompt's canned Phase-1 test list is incompatible with this
+   codebase.** "Test position sizing respects max_position limits",
+   "stop-loss triggers at threshold", "HOLD when no signal exceeds
+   threshold" — none apply: invariant #12 is *no hard limits, Opus has
+   full autonomy*; `_enforce_risk_pre_trade` only checks sell-qty ≤
+   held; there is no signal-threshold gate. Writing those tests would
+   assert vacuous behaviour or invert a documented invariant.
+
+### Test commands
+
+```
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/ -v                                  # full (~25min under load)
+python3 -m pytest tests/test_core_market.py -q -k GetPricesBulk   # Phase 1 fix
+python3 -m pytest tests/test_runner_heartbeat.py -q               # Phase 2 feature
+```
