@@ -98,6 +98,7 @@ from collectors.g10_central_banks_collector import collect_g10_central_banks
 from collectors.global_regulators_collector import collect_global_regulators
 from collectors.imf_bis_worldbank_collector import collect_imf_bis_worldbank
 from collectors.globenewswire_collector import collect_globenewswire
+from collectors.financial_blogs_collector import collect_financial_blogs
 from collectors.hackernews_collector import collect_hackernews
 from collectors.sec_xbrl_financials import collect_sec_xbrl_financials
 from collectors.usgs_earthquake_collector import collect_usgs_earthquakes
@@ -188,6 +189,7 @@ G10_CB_INTERVAL         = 1800    # Bank of Canada + RBA press / speeches RSS �
 GLOBAL_REG_INTERVAL     = 1800    # FSB, FCA, Fed research notes/papers — every 30min
 BIS_INTERVAL            = 1800    # BIS press releases, speeches, research — every 30min
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
+FINANCIAL_BLOGS_INTERVAL = 600    # InvestorPlace, Motley Fool, Nasdaq RSS — every 10min
 HACKERNEWS_INTERVAL     = 300     # Hacker News front-page + finance/business stories — every 5min
 USASPENDING_INTERVAL    = 3600    # USASpending.gov federal contract awards — hourly (new awards rare)
 SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
@@ -294,6 +296,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "global_reg": GLOBAL_REG_INTERVAL,
     "bis": BIS_INTERVAL,
     "globenewswire": GLOBENEWSWIRE_INTERVAL,
+    "financial_blogs": FINANCIAL_BLOGS_INTERVAL,
     "hackernews": HACKERNEWS_INTERVAL,
     "usaspending": USASPENDING_INTERVAL,
     "sec_xbrl": SEC_XBRL_INTERVAL,
@@ -1875,6 +1878,28 @@ def globenewswire_worker(store: ArticleStore):
         _sleep(GLOBENEWSWIRE_INTERVAL)
 
 
+# ── Worker: InvestorPlace / Motley Fool / Nasdaq RSS — every 10min ───────────
+def financial_blogs_worker(store: ArticleStore):
+    log.info("[financial_blogs_worker] started")
+    bo = Backoff("financial_blogs", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_financial_blogs()
+            _ingest(store, articles, "financial_blogs")
+            try:
+                source_health.record_result("financial_blogs", len(articles))
+            except Exception as he:
+                log.warning(f"[financial_blogs_worker] source_health error: {he}")
+            _worker_last_ok["financial_blogs"] = time.time()
+            log.debug(f"[financial_blogs] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[financial_blogs_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(FINANCIAL_BLOGS_INTERVAL)
+
+
 # ── Worker: SEC XBRL financial facts — every 6h ─────────────────────────────
 def sec_xbrl_worker(store: ArticleStore):
     log.info("[sec_xbrl_worker] started")
@@ -3359,6 +3384,7 @@ def main():
         ("global_reg",  global_reg_worker),
         ("bis",         bis_worker),
         ("globenewswire", globenewswire_worker),
+        ("financial_blogs", financial_blogs_worker),
         ("hackernews",  hackernews_worker),
         ("usaspending", usaspending_worker),
         ("sec_xbrl",    sec_xbrl_worker),
