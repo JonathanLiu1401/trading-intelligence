@@ -41,3 +41,34 @@ def alert_message(consecutive_failures: int, last_error: str) -> str:
         f"failures — ArticleNet is not learning new labels. "
         f"Last error: {last_error[:300]}"
     )
+
+
+# Return-value statuses ``ml.trainer.train()`` produces that are NOT failures:
+#   - "ok"      — a real training cycle completed.
+#   - "skipped" — benign no-op (``too_few_samples`` before bootstrap has
+#                 enough labels, or ``trainer_busy`` when the heavy trainer
+#                 holds the lock). The retrain loop is healthy; nothing stuck.
+# Everything else ("error" — ``subprocess_timeout`` / ``no_result`` /
+# ``child_exception`` — or an unexpected shape) is a failure.
+_RETRAIN_OK_STATUSES = ("ok", "skipped")
+
+
+def is_retrain_failure(metrics) -> bool:
+    """True when a ``ml.trainer.train()`` return value represents a FAILED
+    retrain cycle that should count toward consecutive-failure escalation.
+
+    ``train()`` catches every internal error and RETURNS a status dict instead
+    of raising — ``{"status": "error", "reason": "subprocess_timeout"}``,
+    ``no_result``, ``child_exception``. The trainer worker's ``try/except``
+    therefore never observes these (no exception is raised), so without this
+    classifier a trainer that times out on EVERY cycle increments no failure
+    counter and never escalates to Discord: the exact silent-staleness blind
+    spot this module exists to close, reopened on the return-value path
+    (observed live 2026-05-22: ``subprocess_timeout`` after 659.5s).
+
+    A non-dict, or a dict with a missing/unknown ``status``, is treated as a
+    failure — defensive: an unexpected shape means ``train()`` did not clearly
+    succeed, and a false "stuck" alert is far cheaper than silent staleness."""
+    if not isinstance(metrics, dict):
+        return True
+    return metrics.get("status") not in _RETRAIN_OK_STATUSES
