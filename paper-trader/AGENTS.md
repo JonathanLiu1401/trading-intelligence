@@ -17367,3 +17367,79 @@ python3 -m paper_trader.ml.calibration             # decile calibration
   their verdict logic — single source of truth so a threshold change
   in either child propagates without drift (the AGENTS.md spirit of
   #10).
+
+## 2026-05-21 — Agent 1 (paper-trader core) HYBRID review pass
+
+### Phase 1: Debug — 0 bugs fixed
+
+Honest investigation across `runner.py`, `reporter.py`, `signals.py`,
+`strategy.py`, `market.py`, `store.py` (read in full) plus a dashboard
+endpoint scan. 763 core tests green at start; every function carries a
+documented prior fix and its regression test. No real bug found — the
+Phase-1 commit guard explicitly permits `bugs_fixed=0` and "make no
+commit" when honest effort finds nothing (the AGENTS.md-documented
+discipline; two prior agents the same day used the 0-bug path). No
+Phase-1 commit.
+
+### Phase 2: Feature — news-signal age in the Opus decision prompt
+
+`_build_payload`'s TOP SCORED SIGNALS lines fed Opus `ai_score` +
+`urgency` + title only — *how fresh* a catalyst is was invisible to
+the decision engine, though `first_seen` is on every
+`get_top_signals` / `get_urgent_articles` row. A headline 5 min old
+and one 115 min old (both inside the 2h window) are very different
+trades — the stale one has likely already moved the tape.
+
+- New `strategy._signal_age_str(first_seen, now=None)` — pure,
+  minute-grained, degrade-safe age primitive. Deliberately never rolls
+  up to hours the way `_hold_age_str` does: live signal windows are
+  short (top signals ≤2h, urgent ≤30m) and minute precision is the
+  freshness signal that matters. Missing/unparseable/future →
+  `""` / `"0m"` (the `stale_mark` / `_hold_age_str` precedent).
+- Inline `age=<Nm>` token on each signal line (after `urg=`, before
+  the title). Observational only, never gates (invariants #2/#12);
+  byte-identical to the prior prompt when `first_seen` is absent.
+- 17 new tests in `tests/test_core_strategy.py` (`TestSignalAgeStr`,
+  `TestSignalAgeInPrompt`): minute floor, future clamp, naive +
+  Z-suffix parsing, missing/malformed → no token, additive (score/
+  urgency/tickers untouched).
+
+Commit `3cb4f5b`.
+
+### Phase 3: Live validation findings (live trader ~00:24 UTC)
+
+1. **Desk FROZEN ~14h by host saturation — the dominant pathology.**
+   `/api/host-guard`: 10 concurrent Opus (limit 4), load1 11.46/16
+   CPUs, swap 98.8%, mem_available 3.4 GB. `/api/no-decision-reasons`:
+   50/50 cycles NO_DECISION, 96% `host_saturated`. Every decision since
+   the 10:00 ET fill reads `skipped claude call — host saturated`. The
+   pre-flight guard is correctly declining doomed calls — this is the
+   documented #1 pathology (sibling review agents + backtest committee
+   starving the box), NOT a code bug. Ops lever: reduce concurrent Opus.
+2. **NVDA concentration HIGH (65.84%).** `/api/risk`
+   `concentration_severity=HIGH`, single-name stock book over the 60%
+   threshold; position P/L −$11.80, book $1000.14 (≈flat). Real
+   exposure the trader sees on every risk_mirror block.
+3. **Runner 2 commits stale.** `/api/healthz` `boot_sha=ffc1462`,
+   `head_sha=3cb4f5b`, `behind=2`. The git-watcher restart had not yet
+   fired onto this pass's commit; the runner is still cycling
+   (NO_DECISION rows landing), so a graceful boundary restart is
+   expected.
+4. **Healthy surfaces.** `/api/feed-health` HEALTHY (newest live
+   article 0.04h, 1018 articles/2h — the Phase-2 `age=` token will
+   render real fresh values); `/api/notify-health` HEALTHY; dashboard
+   root 287 KB in 0.04 s; singleton lock cleanly `acquired`.
+
+`runner.log` is 9 MB of "another paper trader is already running"
+spam — the historical systemd-`Restart=always`-vs-manual-singleton
+pattern (documented; not a fresh bug). No quick safe Phase-3 fix —
+all three findings are operational state, not code defects.
+
+### Test commands
+
+```
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/ -v                                  # full (~25min under load)
+python3 -m pytest tests/test_core_*.py -q                    # core slice
+python3 -m pytest tests/test_core_strategy.py -q -k SignalAge # this pass's feature
+```
