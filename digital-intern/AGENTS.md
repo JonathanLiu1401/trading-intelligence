@@ -5,6 +5,46 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-22 HYBRID pass (Agent 3) — urgent-queue-health: surface the unalerted-urgent backlog
+
+A news analyst's worst failure is a *silent* one. `urgency_label_split*`
+report the calibration of urgent rows the alerter already SAW; nothing
+reported what is still WAITING. A `urgency=1` row is "scored urgent, not yet
+pushed"; once its `first_seen` ages past the 24h window `get_unalerted_urgent`
+enforces, the alert worker can never see it and `reap_stale_urgent` demotes it
+— the push is lost with no trace.
+
+### `ArticleStore.urgent_queue_health()` + `/api/urgent-queue-health`
+
+New pure-read store method (after `ticker_mention_velocity`): counts the
+live `urgency=1` backlog — `queued`, `oldest_age_h`, `near_reap` (within
+`near_reap_hours` of the reap deadline), `overdue` (already past it — push
+lost). Per-held-ticker breakdown via the canonical `LIVE_PORTFOLIO_TICKERS`
+answers "is my BOOK the thing going un-alerted?". `_LIVE_ONLY_CLAUSE`-scoped;
+no DB write — all four invariants intact. Exposed at `/api/urgent-queue-health`
+with a `quiet`/`ok`/`near_reap`/`items_lost` verdict ladder (silence-vs-signal
+discipline). Pinned by `tests/test_urgent_queue_health.py` (10) +
+`tests/test_api_urgent_queue_health.py` (9).
+
+### Live Phase-3 findings (2026-05-22, production articles.db)
+
+The new feature immediately surfaced a real, previously-invisible problem:
+- **`overdue: 17`** — 17 `urgency=1` rows past the 24h reap deadline, oldest
+  **~211h (9 days)**, 16 of them from `2026-05-13` (the exact cohort
+  `reap_stale_urgent`'s docstring was written to clear). Includes held NVDA×2
+  / AMD×1. The reaper logged "reaped 18" at 00:11Z yet 17 are stuck again 2.3h
+  later — a reaper/re-promotion oscillation worth investigating (the reaper
+  SQL matches them; something re-bumps `urgency` 0→1 on aged rows).
+- **Alert path Claude-starvation**: current `daemon.log` shows 184 "No
+  response from Claude — skipping" vs 37 "BN alert sent" (~5:1) — urgent
+  pushes frequently not firing, feeding a 46-row `urgency=1` backlog.
+- **score_source skew**: 24h split `ml`=10861 / `llm`=1051 / `NULL`=1208
+  (~83% model-only); recent alerted rows are overwhelmingly
+  `score_source='ml' ai_score=0` (unverified model-only urgent).
+- DB-lock contention storms (`database is locked` / `another row available`)
+  still recur — a documented standing issue.
+- Briefing quality is good; cadence runs ~6-10h vs the 5h target.
+
 ## 2026-05-21 feature-dev pass (Agent 4) — surface two invisible signals as dashboard endpoints
 
 A live audit found the DI dashboard's `analytics/` directory holds ~55
