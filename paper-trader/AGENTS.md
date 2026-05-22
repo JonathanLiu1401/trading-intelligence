@@ -6,6 +6,70 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-22 feature-dev pass (Agent 4) — `/api/persona-leaderboard` (surface the invisible per-persona diagnostic)
+
+Wired a fully-built, exhaustively-tested but **endpoint-less** diagnostic
+onto the dashboard — the recurring "no operator can see it" gap.
+
+### The gap
+
+The continuous backtest loop runs a committee of 10 trading personas
+(`PERSONAS` — Value Investor … Pure Speculator); every `run_id` maps to one
+persona via the SSOT `backtest.persona_for` (`((run_id-1) % 10) + 1`), so the
+~500-run `backtest_runs` table is ~50 samples per *style*. `/api/model-rankings`
+aggregates that table — but by `model_id` (the decision *engine*: ml_quant /
+opus / the HF models), answering "which engine is best", **not** "which
+trading *style* carries repeatable alpha". The persona dimension was stamped
+on every run and aggregated by no endpoint.
+
+`paper_trader/ml/persona_leaderboard.py` already did the aggregation —
+read-only, `persona_for`-SSOT, median vs-SPY + win-rate + equity-curve risk
+metrics (Sharpe / Sortino / max-drawdown / Calmar / %-underwater), crisp
+`EDGE`/`FLAT`/`DRAG`/`INSUFFICIENT` verdicts — and shipped with a CLI and
+exhaustive unit tests (`test_persona_leaderboard_20260517.py`). But it was
+reachable from **no route**: an operator could only see it from a shell.
+
+### The fix
+
+New `/api/persona-leaderboard` route in `dashboard.py` — a thin wrapper that
+reuses the module's own `_load_runs` (DB read + `equity_curve_json` parse) and
+`persona_leaderboard` builder **verbatim** (invariant #10 — the dashboard
+panel and the CLI digest can never disagree; a `test_endpoint_is_ssot_parity_
+with_builder` test pins that by asserting the route payload, minus the
+route-only `as_of` stamp, is byte-identical to calling the builder directly).
+Missing-DB / empty-DB / sub-`MIN_RECORDS` all degrade to a 200
+`INSUFFICIENT_DATA`, never a 500. Observational only — never gates the loop,
+never prunes a persona (invariants #2 / #12).
+
+New backtests-pane section `🎭 Persona Leaderboard` (sibling of `🏆 Model
+Rankings`), JS `loadPersonaRankings()` mirroring `loadModelRankings()` —
+sortable verdict-coloured table + overall verdict/hint.
+
+### Live evidence at merge
+
+```
+/api/persona-leaderboard → HAS_DRAG_PERSONA · 477 runs · 10 personas
+  Pure Speculator   EDGE  median +130.2pp vs SPY   win 0.88
+  Global Macro      EDGE  median  +96.8pp           win 0.81
+  …
+  Sector Rotator    DRAG  median   -0.5pp vs SPY    win 0.50  ← lone DRAG
+```
+
+A real, actionable read: 9/10 styles carry alpha; Sector Rotator does not beat
+SPY at the median across 48 runs — the data for a (separate, explicit) decision
+to prune or re-tune its `_PERSONA_BOOSTS` row.
+
+### Tests
+
+`tests/test_persona_leaderboard_endpoint.py` — 8 new: empty-DB and missing-DB
+degradations (200 not 500), sub-`MIN_RECORDS` insufficiency, `EDGE`/`DRAG`/
+`FLAT` grading flowing through the route, median-vs-SPY descending order, the
+`run_id → persona` mapping via `persona_for`, `equity_curve_json` risk metrics
+surviving the DB round-trip (20% drawdown curve), and the SSOT-parity lock.
+109 pass across the new + persona/model-rankings + dashboard sibling suites.
+
+---
+
 ## 2026-05-22 ML+backtest HYBRID pass #8 (Agent 2) — per-regime OOS rank-IC telemetry
 
 **Phase 1 — bugs_fixed: 0 (honest zero).** Re-read `paper_trader/ml/decision_scorer.py`,
