@@ -5,6 +5,75 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-22 hybrid pass (Agent 3) — price alerts cover every held position
+
+**Phase 1 (fix) — `b61fb4d`.** `price_alert_worker` fired 3% price alerts
+only for the frozen `PORTFOLIO_TICKERS` tuple, reading prices from
+`get_stock_data()` — which is driven by `config/watchlist.json`, a *separate*
+legacy file. Open positions present in `config/portfolio.json` but absent
+from both (live 2026-05-21: **GOOG, COHR, NVDL** held positions, plus
+LNOK/MUU) received **no price alert at all** — a silent blind spot on names
+the analyst has real money in. The worker now monitors the union of
+`PORTFOLIO_TICKERS` with `ml.features.LIVE_PORTFOLIO_TICKERS` (the SSOT that
+reads positions + option underlyings + sector_watchlist) and directly fetches
+any ticker the watchlist sweep missed via `stock_data._fetch_one`. The static
+`PORTFOLIO_TICKERS` tuple is left **unchanged** — it is frozen for
+cross-module `_BOOK_TICKERS` parity (`test_briefing_book_tag`,
+`test_briefing_book_silence` pin its exact contents) — so this only widens
+coverage, never narrows it. New helper `_price_alert_universe()`; pinned by
+`tests/test_price_alert_universe.py` (4 tests, incl. a worker-level test that
+a held ticker missing from the watchlist sweep is directly fetched).
+
+**Phase 2 (feature) — `6a8b679`.** Enriched the bare price alert
+("GOOG +3.2% to $X") with two context lines the analyst persona needs:
+`💼 HELD POSITION: <qty> @ $<avg> avg — now <N>% above/below cost basis`
+(only for actual open positions; watchlist-only movers stay a clean
+one-liner) and `📰 <N> live article(s) mention <ticker> in the last 60min —
+likely news catalyst` (via the canonical `ticker_mention_velocity` primitive,
+`_LIVE_ONLY_CLAUSE`-scoped so synthetic backtest rows can never inflate it).
+Both degrade to `""` on any error/absence so an alert always fires. New pure
+helpers `_load_held_positions` / `_fmt_qty` / `_price_alert_position_line` /
+`_price_alert_news_line`; pinned by `tests/test_price_alert_context.py`
+(13 tests). Load-bearing invariants intact — pure read-side, no DB write,
+no ai_score/ml_score/score_source mutation, backtest rows excluded.
+
+**Phase 3 (live validation) — user_findings=5.**
+1. **Briefing PORTFOLIO table is blind to held GOOG/COHR/MSFT/NVDL.** The 5h
+   Opus digest's PORTFOLIO section showed only LITE/LNOK/MUU/DRAM — the same
+   portfolio-drift root cause, surfacing in the briefing/`portfolio_pnl`
+   layer. Not fixed: `claude_analyst._BOOK_TICKERS` is ossified by
+   exact-tuple-pinning tests across ~4 modules; a safe fix is a multi-file
+   refactor out of this pass's scope.
+2. **~50% of standalone alerts are unverified model-only** (`score_source='ml'`,
+   `ai_score=0`). Known/documented — the `[unverified — model-only urgent]`
+   tag hedges it; matches the `mostly_unverified` standing condition.
+3. **Chronic dark collectors**: Polygon ~203h, NewsAPI ~333h, Nitter ~97h,
+   SEC 8-K ~6.9h (briefing COVERAGE GAP). Standing external gaps.
+4. **Persistent `database is locked` write-contention** — self-healing
+   (`_retry_on_lock`, `lock_failures=0`) but constant; matches
+   `di-insert-batch-lock-contention`.
+5. **StockTwits dominates ingestion** (~2400 of 13505 live 24h rows ≈ 18%) —
+   heavy low-signal source; gated downstream but inflates the DB.
+   Otherwise healthy: 1202 live rows/last-hour, 44/44 workers alive, scorer
+   caught up (`unscored=0`), `urgency=1` backlog empty, 0 backtest rows with
+   `urgency>=1`. Briefing id 40 read well (coherent Bloomberg-style digest).
+
+**Phase 4 (docs):** this section.
+
+**Final verify:** `from storage import article_store; from ml import features,
+model` → `imports OK`. Full `pytest tests/` → **2303 passed** in 124s
+(0 failures; new tests included).
+
+**Counters:** `bugs_fixed=1`, `features_added=1`, `user_findings=5`.
+
+**Staging discipline.** Per-commit explicit pathspec, no `git add -A`.
+`config/portfolio.json` was modified by the auto-commit daemon / trading UI
+(not this agent) and the paper-trader sibling repo had concurrent edits —
+both left untouched. Three other hybrid agents were running concurrently;
+commits used explicit pathspec to avoid bundling sibling work.
+
+---
+
 ## 2026-05-22 feature-dev pass (Agent 4) — surface the alert pipeline: `/api/alert-delivery-audit` + `/api/alert-freshness`
 
 Two fully-built, exhaustively-thought-through analytics builders sat in
