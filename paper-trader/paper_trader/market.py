@@ -268,13 +268,22 @@ def get_prices(tickers: list[str]) -> dict[str, float | None]:
         try:
             data = yf.download(missing, period="1d", interval="1m",
                                group_by="ticker", progress=False, threads=True, auto_adjust=False)
+            # Switch on the ACTUAL frame shape, not the request size. With
+            # group_by="ticker" current yfinance returns a per-ticker
+            # MultiIndex *even for a single symbol* — the old `len(missing)==1`
+            # branch read a flat `data["Close"]`, which then raised KeyError on
+            # every single-ticker bulk fetch and silently degraded to a slow
+            # per-ticker get_price() fallback. nlevels keys off the real columns
+            # so both a MultiIndex frame (any symbol count) and a hypothetical
+            # flat single-ticker frame (older yfinance) resolve correctly.
+            multiindex = getattr(getattr(data, "columns", None), "nlevels", 1) > 1
             for t in missing:
                 price = None
                 try:
-                    if len(missing) == 1:
-                        closes = data["Close"].dropna()
-                    else:
+                    if multiindex:
                         closes = data[t]["Close"].dropna()
+                    else:
+                        closes = data["Close"].dropna()
                     if len(closes):
                         price = float(closes.iloc[-1])
                 except Exception:
