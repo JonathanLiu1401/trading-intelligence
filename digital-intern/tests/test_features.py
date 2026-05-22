@@ -1,6 +1,7 @@
 """Feature extractor contract — used by trainer + inference; shape must hold."""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -151,3 +152,70 @@ def test_source_credibility_known_high():
         "title": "x", "summary": "", "source": "reddit", "published": "",
     })
     assert a[0] > b[0]
+
+
+# ── Portfolio-ticker config loading ─────────────────────────────────────────
+# LIVE_PORTFOLIO_TICKERS is the union of a hardcoded fallback with whatever
+# config/portfolio.json currently holds — the operator's source of truth.
+
+def test_load_portfolio_tickers_unions_config(tmp_path, monkeypatch):
+    """positions + option underlyings + sector_watchlist from portfolio.json
+    are all added (uppercased); the hardcoded fallback is preserved."""
+    cfg = tmp_path / "portfolio.json"
+    cfg.write_text(json.dumps({
+        "positions": [{"ticker": "ZZZA"}, {"ticker": "zzzb"}],
+        "options": [{"underlying": "ZZZC"}],
+        "sector_watchlist": ["ZZZD", "005930.KS"],
+    }))
+    monkeypatch.setattr(features, "_PORTFOLIO_JSON", cfg)
+    got = features._load_portfolio_tickers()
+    # config tickers added, normalised to uppercase
+    assert {"ZZZA", "ZZZB", "ZZZC", "ZZZD"} <= got
+    # foreign/compound symbol filtered out by _TICKER_RE
+    assert "005930.KS" not in got
+    # union semantics: a hardcoded fallback name never disappears
+    assert "MU" in got and "LITE" in got
+
+
+def test_load_portfolio_tickers_falls_back_when_missing(tmp_path, monkeypatch):
+    """A missing portfolio.json degrades to the fallback set — never raises."""
+    monkeypatch.setattr(features, "_PORTFOLIO_JSON", tmp_path / "nope.json")
+    assert features._load_portfolio_tickers() == features._FALLBACK_PORTFOLIO_TICKERS
+
+
+def test_load_portfolio_tickers_falls_back_on_corrupt(tmp_path, monkeypatch):
+    """A malformed portfolio.json degrades to the fallback set — never raises."""
+    bad = tmp_path / "portfolio.json"
+    bad.write_text("{not valid json")
+    monkeypatch.setattr(features, "_PORTFOLIO_JSON", bad)
+    assert features._load_portfolio_tickers() == features._FALLBACK_PORTFOLIO_TICKERS
+
+
+def test_config_portfolio_positions_are_recognised():
+    """Every current position/option-underlying in the live config/portfolio.json
+    must register as a portfolio ticker — the regression this feature fixes was
+    held names (GOOG/NVDL/COHR) silently absent from the hardcoded set."""
+    cfg = json.loads(features._PORTFOLIO_JSON.read_text(encoding="utf-8"))
+    held = {(p.get("ticker") or "").strip().upper()
+            for p in cfg.get("positions", [])}
+    held |= {(o.get("underlying") or "").strip().upper()
+             for o in cfg.get("options", [])}
+    held = {t for t in held if features._TICKER_RE.match(t)}
+    assert held, "portfolio.json has no usable positions — fixture problem"
+    missing = held - features.LIVE_PORTFOLIO_TICKERS
+    assert not missing, f"held tickers not flagged portfolio-relevant: {missing}"
+
+
+def test_config_held_ticker_drives_portfolio_flag():
+    """A held ticker sourced only from portfolio.json (not the fallback) still
+    sets portfolio_flag (idx 12) — proves the union reaches extract_features."""
+    config_only = features.LIVE_PORTFOLIO_TICKERS - features._FALLBACK_PORTFOLIO_TICKERS
+    if not config_only:
+        pytest.skip("portfolio.json adds no tickers beyond the fallback")
+    tkr = sorted(config_only)[0]
+    feats = features.extract_features({
+        "title": f"{tkr} jumps on upbeat guidance",
+        "summary": "", "source": "reuters", "published": "",
+    })
+    assert feats[12] == 1.0
+    assert feats[1] > 0.0
