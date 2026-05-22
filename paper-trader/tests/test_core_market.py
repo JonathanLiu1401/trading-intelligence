@@ -373,14 +373,14 @@ class TestGetPricesBulk:
     coverage was the empty-list and full-cache short-circuits, so the actual
     DataFrame-shape handling had ZERO direct tests.
 
-    yfinance returns two STRUCTURALLY DIFFERENT frames depending on how many
-    symbols are requested with group_by='ticker':
-      * exactly one symbol  -> flat columns, code reads ``data["Close"]``
-      * two or more symbols -> a per-ticker MultiIndex, code reads
-        ``data[t]["Close"]``
-    The `len(missing) == 1` branch is the load-bearing switch between them. A
-    refactor that drops the switch (or swaps the branches) would silently
-    return None for every multi-symbol fetch — these tests fail loudly on that.
+    With group_by='ticker' current yfinance returns a per-ticker MultiIndex
+    frame REGARDLESS of symbol count (confirmed: a single-symbol download still
+    yields ``[("AAA","Close"), ...]`` columns, so ``data["Close"]`` raises
+    KeyError). get_prices therefore switches on the real column ``nlevels``,
+    not the request size — a MultiIndex frame reads ``data[t]["Close"]`` and a
+    flat frame (older yfinance) reads ``data["Close"]``. A refactor that swaps
+    that switch back to a ``len(missing)==1`` test would silently degrade every
+    single-symbol bulk fetch to the per-ticker fallback — these tests catch it.
     """
 
     def setup_method(self):
@@ -409,6 +409,28 @@ class TestGetPricesBulk:
         out = market.get_prices(["AAA", "BBB"])
         # Each ticker resolves through its OWN sub-frame, not a shared column.
         assert out == {"AAA": pytest.approx(11.0), "BBB": pytest.approx(21.0)}
+
+    def test_single_missing_multiindex_resolves_from_bulk_frame(self, monkeypatch):
+        import pandas as pd
+        # Real yfinance shape: group_by="ticker" yields a per-ticker
+        # MultiIndex even for ONE symbol. The old `len(missing)==1` branch
+        # read a flat `data["Close"]` here, raised KeyError, and silently
+        # fell through to get_price(). The price MUST resolve from the bulk
+        # frame — get_price() raising proves no fallback was taken.
+        cols = pd.MultiIndex.from_tuples([("AAA", "Open"), ("AAA", "Close")])
+        df = pd.DataFrame([[98.0, 99.0], [99.5, 100.5]], columns=cols)
+        monkeypatch.setattr(market.yf, "download", lambda *a, **k: df)
+
+        def _no_single_fetch(t):
+            raise AssertionError(
+                f"get_price({t!r}) called — single-ticker bulk frame "
+                f"was not parsed (the len(missing)==1 KeyError bug)"
+            )
+
+        monkeypatch.setattr(market, "get_price", _no_single_fetch)
+        out = market.get_prices(["AAA"])
+        assert out == {"AAA": pytest.approx(100.5)}
+        assert market._cached_price("AAA") == pytest.approx(100.5)
 
     def test_all_nan_close_falls_back_to_get_price(self, monkeypatch):
         import pandas as pd
