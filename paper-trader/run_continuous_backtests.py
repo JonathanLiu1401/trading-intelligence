@@ -931,6 +931,17 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
         "dir_acc": None, "rank_ic": None, "n": 0,
         "buy_dir_acc": None, "buy_rank_ic": None, "buy_n": 0,
         "sell_dir_acc": None, "sell_rank_ic": None, "sell_n": 0,
+        # Per-regime breakdown — bucketed by `regime_mult` (the field every
+        # outcome row carries; `regime_label` was added later and is absent
+        # from the historical corpus). Decode mirrors `regime_audit`:
+        # 0.3→bear, 0.6→sideways, 1.0→bull(-or-unknown). An aggregate rank-IC
+        # ~0 can hide real skill in one regime cancelled by an inversion in
+        # another; these keys make that visible and — riding the per-cycle
+        # scorer_skill_log — trendable, which the standalone `regime_audit`
+        # snapshot is not.
+        "regime_bull_n": 0, "regime_bull_rank_ic": None,
+        "regime_sideways_n": 0, "regime_sideways_rank_ic": None,
+        "regime_bear_n": 0, "regime_bear_rank_ic": None,
     }
     try:
         if not oos_records or not getattr(scorer, "is_trained", False):
@@ -948,6 +959,15 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
         buy_acts: list[float] = []
         sell_preds: list[float] = []
         sell_acts: list[float] = []
+        # Per-regime buckets — keyed by the decoded `regime_mult`. A record
+        # whose regime_mult is absent or not one of {0.3,0.6,1.0} lands in
+        # no bucket (honest — the corpus genuinely cannot place it) but is
+        # still counted in the aggregate above.
+        _REGIME_BY_MULT = {0.3: "bear", 0.6: "sideways", 1.0: "bull"}
+        regime_preds: dict[str, list[float]] = {
+            "bull": [], "sideways": [], "bear": []}
+        regime_acts: dict[str, list[float]] = {
+            "bull": [], "sideways": [], "bear": []}
         for r in oos_records:
             try:
                 p = scorer.predict(
@@ -989,6 +1009,15 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
                     else:
                         buy_preds.append(p)
                         buy_acts.append(a)
+                    # Regime bucket — exact float match on the decode table.
+                    # regime_mult is written by `_compute_decision_outcomes`
+                    # from a fixed {0.3,0.6,1.0} set, so an exact lookup is
+                    # safe; anything else (legacy/None) is simply not bucketed.
+                    _reg = _REGIME_BY_MULT.get(
+                        _to_float(r.get("regime_mult"), -1.0))
+                    if _reg is not None:
+                        regime_preds[_reg].append(p)
+                        regime_acts[_reg].append(a)
             except Exception:
                 continue
 
@@ -1026,11 +1055,21 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
         sell_ic, sell_da = _rank_dir(sell_preds, sell_acts)
         out["sell_rank_ic"] = sell_ic
         out["sell_dir_acc"] = sell_da
+
+        # Per-regime rank-IC — same _rank_dir path as buy/sell, no second
+        # predict pass (the bucket split above was free).
+        for _reg in ("bull", "sideways", "bear"):
+            out[f"regime_{_reg}_n"] = len(regime_preds[_reg])
+            _ric, _ = _rank_dir(regime_preds[_reg], regime_acts[_reg])
+            out[f"regime_{_reg}_rank_ic"] = _ric
     except Exception:
         return {
             "dir_acc": None, "rank_ic": None, "n": 0,
             "buy_dir_acc": None, "buy_rank_ic": None, "buy_n": 0,
             "sell_dir_acc": None, "sell_rank_ic": None, "sell_n": 0,
+            "regime_bull_n": 0, "regime_bull_rank_ic": None,
+            "regime_sideways_n": 0, "regime_sideways_rank_ic": None,
+            "regime_bear_n": 0, "regime_bear_rank_ic": None,
         }
     return out
 
@@ -1117,6 +1156,11 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
     oos_sell_diracc_s = "n/a"
     oos_sell_ic_s = "n/a"
     oos_sell_n = 0
+    # Per-regime OOS rank-IC (bull/sideways/bear) — see `_oos_rank_metrics`.
+    # The aggregate rank-IC can sit at noise while one regime carries real
+    # edge and another is inverted; surfacing each makes that trendable.
+    oos_bull_n = oos_sideways_n = oos_bear_n = 0
+    oos_bull_ic_s = oos_sideways_ic_s = oos_bear_ic_s = "n/a"
     if result.get("status") == "ok" and oos_records:
         try:
             m = _oos_rank_metrics(DecisionScorer(), oos_records)
@@ -1134,6 +1178,15 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
                 oos_sell_diracc_s = f"{m['sell_dir_acc']:.2f}"
             if m.get("sell_rank_ic") is not None:
                 oos_sell_ic_s = f"{m['sell_rank_ic']:+.2f}"
+            oos_bull_n = int(m.get("regime_bull_n") or 0)
+            oos_sideways_n = int(m.get("regime_sideways_n") or 0)
+            oos_bear_n = int(m.get("regime_bear_n") or 0)
+            if m.get("regime_bull_rank_ic") is not None:
+                oos_bull_ic_s = f"{m['regime_bull_rank_ic']:+.2f}"
+            if m.get("regime_sideways_rank_ic") is not None:
+                oos_sideways_ic_s = f"{m['regime_sideways_rank_ic']:+.2f}"
+            if m.get("regime_bear_rank_ic") is not None:
+                oos_bear_ic_s = f"{m['regime_bear_rank_ic']:+.2f}"
         except Exception as exc:
             oos_diracc_s = oos_ic_s = f"n/a ({type(exc).__name__})"
 
@@ -1187,6 +1240,9 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
             f"oos_buy_ic={oos_buy_ic_s} "
             f"oos_sell_n={oos_sell_n} oos_sell_diracc={oos_sell_diracc_s} "
             f"oos_sell_ic={oos_sell_ic_s} "
+            f"oos_bull_n={oos_bull_n} oos_bull_ic={oos_bull_ic_s} "
+            f"oos_sideways_n={oos_sideways_n} oos_sideways_ic={oos_sideways_ic_s} "
+            f"oos_bear_n={oos_bear_n} oos_bear_ic={oos_bear_ic_s} "
             f"n_label_clamped={label_clamped}")
 
 
@@ -1224,6 +1280,11 @@ def _parse_scorer_status(status: str) -> dict:
         # so historical skill-ledger rows parse cleanly.
         "oos_buy_n": None, "oos_buy_dir_acc": None, "oos_buy_ic": None,
         "oos_sell_n": None, "oos_sell_dir_acc": None, "oos_sell_ic": None,
+        # Per-regime OOS rank-IC. None on older status strings predating
+        # the regime-breakdown wiring — historical ledger rows parse clean.
+        "oos_bull_n": None, "oos_bull_ic": None,
+        "oos_sideways_n": None, "oos_sideways_ic": None,
+        "oos_bear_n": None, "oos_bear_ic": None,
         "n_label_clamped": None,
     }
     try:
@@ -1274,6 +1335,12 @@ def _parse_scorer_status(status: str) -> dict:
         out["oos_buy_ic"] = _num("oos_buy_ic")
         out["oos_sell_dir_acc"] = _num("oos_sell_diracc")
         out["oos_sell_ic"] = _num("oos_sell_ic")
+        # Per-regime — int counts, float rank-IC. Old status strings omit
+        # the tokens entirely and degrade to None via the `_num` regex miss.
+        for _reg in ("bull", "sideways", "bear"):
+            _rn = _num(f"oos_{_reg}_n")
+            out[f"oos_{_reg}_n"] = int(_rn) if _rn is not None else None
+            out[f"oos_{_reg}_ic"] = _num(f"oos_{_reg}_ic")
         # Label-clamp count is an integer when reported; legacy status strings
         # (cycles before the clamp landed) omit it — degrades to None cleanly.
         nlc = _num("n_label_clamped")
@@ -1287,6 +1354,9 @@ def _parse_scorer_status(status: str) -> dict:
             "oos_ic_20": None,
             "oos_buy_n": None, "oos_buy_dir_acc": None, "oos_buy_ic": None,
             "oos_sell_n": None, "oos_sell_dir_acc": None, "oos_sell_ic": None,
+            "oos_bull_n": None, "oos_bull_ic": None,
+            "oos_sideways_n": None, "oos_sideways_ic": None,
+            "oos_bear_n": None, "oos_bear_ic": None,
             "n_label_clamped": None,
         }
     return out
