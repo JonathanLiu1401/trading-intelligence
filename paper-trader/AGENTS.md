@@ -6,6 +6,71 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #9 (Agent 2) — `cost_drag` (transaction-cost realism audit)
+
+**Phase 1 — bugs_fixed: 0 (honest zero).** Re-read `paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py`, `run_continuous_backtests.py` in full and audited the
+hot paths (`_ml_decide` conviction gate, `_execute_decision`, `_buy`/`_sell`,
+`_enforce_risk_exits`, `PriceCache`, `_compute_decision_outcomes`, `train_scorer`,
+the parse helpers, `_oos_rank_metrics`). 240 focused scorer/backtest/continuous
+tests pass green. All three files are exhaustively hardened by ~16 prior passes —
+no real bug, race, or dead code; no Phase 1 commit.
+
+**Phase 2 — features_added: 1 — `paper_trader/ml/cost_drag.py`.** A read-only
+transaction-cost drag audit. The continuous backtest engine fills every trade at
+the daily close with **zero commission and zero slippage**, yet a typical run
+makes ~1,000 trades — so headline `vs_spy_pct` is gross of friction and no
+existing module (`model_rankings`, `permutation_test`, `gate_audit`) ever models
+costs. `cost_drag` reads `backtest.db` only, computes per completed run the
+traded notional (`Σ backtest_trades.value`), annualized turnover
+(`notional / mean(equity_curve) / years` — the standard finance metric), and a
+first-order **non-compounding** `cost_adjusted_vs_spy_pct` at a swept set of bps
+levels (default 2/5/10). Verdict is corpus-derived (`COST_ROBUST` /
+`COST_FRAGILE` / `COST_NEGATIVE`): it compares the corpus median cost-adjusted
+alpha at the highest bps level against zero. Auto-discovered by
+`python3 -m paper_trader.ml`; exit 2 on `COST_FRAGILE`. 19 tests in
+`tests/test_cost_drag.py` pin exact cost/turnover arithmetic on a synthetic
+`BacktestStore` and the run-exclusion rules (non-complete, empty-curve,
+zero-trade runs never enter the corpus). No retrain, no pickle/schema change,
+no trade-path change.
+
+**Phase 3 — user_findings: 7 (6 operational + 1 positive, no Phase 3 fix commit).**
+1. **Continuous backtest loop is DOWN.** No `run_continuous_backtests` process
+   running; `continuous.log` frozen at 2026-05-18, `decision_outcomes.jsonl`
+   last appended 2026-05-20. No new backtests, no scorer retrains.
+2. **Conviction gate DORMANT.** Deployed `decision_scorer.pkl` has `n_train=400`
+   — below the `>=500` gate threshold (invariant #5). The gate modulates no
+   trades, and with the loop down (#1) it cannot self-heal.
+3. **Skill ledgers never written.** `scorer_skill_log.jsonl`,
+   `baseline_skill_log.jsonl`, `validation_results.json` do not exist — no
+   cycle has completed since that wiring landed; `scorer_freshness` is dark.
+4. **Legacy pickle schema.** The deployed pickle is the 3-key form (no
+   `pred_quantiles`), so `predict_percentile()` returns None everywhere.
+5. **NEW — `cost_drag` on the live `backtest.db` (475 runs): `COST_ROBUST`.**
+   Corpus median raw `vs_spy_pct` +41.7% survives 10 bps → +33.9%, BUT 25.7% of
+   completed runs flip *below* SPY at 10 bps and median annualized turnover is
+   18.7×/yr (~1,009 trades/run). Headline alpha is median-robust to costs but a
+   quarter of runs are cost-fragile — and the engine still models zero friction.
+6. **NEW — `news_urgency` feature pathologically encoded.** 324/7413
+   `decision_outcomes.jsonl` rows carry a non-null `news_urgency`; **all 324 are
+   0.0**, while `build_features` defaults the other 96% to 50.0. "No news" is
+   thus encoded as *higher* urgency than any real news row, and StandardScaler
+   collapses the genuine 0-vs-1 signal. Not blind-fixed — `feature_coverage.py`
+   already flags the deadness, and changing the default would silently rewrite
+   the scaled feature space with no OOS evidence it helps.
+7. **POSITIVE — the scorer carries genuine OOS rank skill.**
+   `baseline_compare` = `MLP_ADDS_SKILL` (MLP OOS rank-IC +0.225 vs best
+   one-liner `rsi_meanrev` +0.079); `calibration --oos` decile-monotone
+   (d1 −2.9% → d10 +3.2%). The edge exists — but per #1/#2 the dead loop and
+   dormant gate mean none of it reaches trades.
+
+### How to run `cost_drag`
+- `python3 -m paper_trader.ml.cost_drag` — table; `--json` machine-readable;
+  `--bps 1,3,8` to sweep custom cost levels. Exit 2 on `COST_FRAGILE`.
+- `python3 -m pytest tests/test_cost_drag.py -v` — domain tests.
+
+---
+
 ## 2026-05-22 feature-dev pass (Agent 4) — `/api/per-ticker-skill` (decompose the aggregate scorer skill by ticker)
 
 Wired another fully-built, exhaustively-tested but **endpoint-less**
