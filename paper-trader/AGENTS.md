@@ -6,6 +6,75 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4) — `SUBPROCESS_ERROR` failure mode (CLI-crash classifier gap)
+
+A live-data audit of the NO_DECISION failure taxonomy. `/api/decision-reliability`
+reported the current-regime failure mix as `HOST_SATURATED_SKIP 80.2%` +
+`OTHER 19.8%` — and that `OTHER` bucket was *uncategorised*. Sampling the live
+trader's decision rows showed all 19 `OTHER` rows were the identical string
+`"claude returned no response (nonzero_rc)"`: the `claude` CLI subprocess ran
+but exited non-zero (a crash / OOM kill). The single largest *known* failure
+mode after host saturation was hiding behind a generic label.
+
+### The gap
+
+`analytics/decision_forensics.classify_failure` — the single-source-of-truth
+taxonomy consumed by both `/api/decision-forensics` and
+`/api/decision-reliability` — caught `TIMEOUT_EMPTY` only when the row
+contained `"timeout"` or `"empty"`. `strategy.py` appends a parenthesised
+cause code to every `"claude returned no response (<cause>)"` row; three of
+those causes — `nonzero_rc` / `cli_missing` / `exception` — mean the
+subprocess *failed* (vs `timeout` / `empty_stdout` / `timeout/empty` which
+mean it was slow / silent). The crash causes matched neither substring, so
+they fell through to `OTHER`. This is the same shape as the prior
+`HOST_SATURATED_SKIP` split-out (`decision_forensics.py:167`): pulling the
+next thing out of `OTHER`.
+
+### The fix
+
+New `SUBPROCESS_ERROR` mode in `MODES` (positioned with the operational
+classes, after `TIMEOUT_EMPTY`). `classify_failure`'s `"no response"` branch
+now scans for the three CLI-fault cause codes first → `SUBPROCESS_ERROR`
+(tag `subprocess_error`, the specific cause carried verbatim as the
+`excerpt` so the operator sees `nonzero_rc` vs `cli_missing` vs `exception`);
+`timeout` / `empty` still → `TIMEOUT_EMPTY`. Distinct `_HINTS` entry: a
+crashed subprocess is **never** cured by a longer `DECISION_TIMEOUT_S` — a
+non-zero rc under host pressure is an OOM kill (fewer concurrent Opus jobs),
+a `cli_missing` excerpt is a PATH fault. `decision_reliability` needs no
+change — its `current_mode_mix` is pure composition over `classify_failure` +
+`MODES`, so the fix flows through transparently.
+
+### Live evidence at merge
+
+```
+/api/decision-forensics  mode_mix → HOST_SATURATED_SKIP 80.2% · SUBPROCESS_ERROR 19.8%
+/api/decision-reliability current_mode_mix → (same) — OTHER no longer present
+```
+
+(Endpoints verified by running the pure builders against the live
+`paper_trader.db` decision rows; the :8090 process serves until restarted —
+memory `paper-trader chronic stale`.)
+
+### Tests
+
+`tests/test_decision_forensics.py` — 7 new (35 total in file, 117 across the
+forensics-dependent suite, all pass): each CLI-fault cause →
+`SUBPROCESS_ERROR` with the cause as `excerpt`; the crash causes are neither
+`TIMEOUT_EMPTY` (wrong remediation) nor `OTHER` (the gap); a regression guard
+that `timeout` / `empty_stdout` / `timeout/empty` still classify as
+`TIMEOUT_EMPTY` after the branch restructure; a build-level test that a
+crash storm surfaces `SUBPROCESS_ERROR` as `dominant_mode` with a
+`DECISION_TIMEOUT_S`-mentioning hint and no `OTHER` bucket.
+
+### Invariants reaffirmed
+
+- Pure-builder discipline: `classify_failure` / `build_decision_forensics`
+  stay pure, never raise; observational only (invariants #2 / #12).
+- Single source of truth (#10): `SUBPROCESS_ERROR` added once to `MODES`;
+  `decision_reliability` re-uses it with no forked logic.
+
+---
+
 ## 2026-05-21 HYBRID pass (Agent 1, paper-trader core) — verb-noise filter + reasoning_action_verbs coverage
 
 A debug + feature + live-validation pass over the live-trader core

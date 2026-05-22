@@ -136,6 +136,47 @@ class TestClassifyFailure:
         ):
             assert classify_failure(r)["mode"] != "TIMEOUT_EMPTY"
 
+    # ── subprocess-error: the `claude` CLI ran but crashed ──
+    # strategy.py records a "claude returned no response (<cause>)" row where
+    # <cause> ∈ {nonzero_rc, cli_missing, exception} when the subprocess
+    # *failed* (vs {timeout, empty_stdout, timeout/empty} when it was slow /
+    # silent). classify_failure used to dump the crash causes in OTHER — the
+    # one endpoint whose job is the *why* taxonomy hid ~1-in-5 live failures.
+    def test_subprocess_error_nonzero_rc(self):
+        c = classify_failure("claude returned no response (nonzero_rc)")
+        assert c["mode"] == "SUBPROCESS_ERROR"
+        assert c["tag"] == "subprocess_error"
+        # the specific cause is carried as the excerpt so the operator sees it
+        assert c["excerpt"] == "nonzero_rc"
+
+    def test_subprocess_error_cli_missing(self):
+        c = classify_failure("claude returned no response (cli_missing)")
+        assert c["mode"] == "SUBPROCESS_ERROR"
+        assert c["excerpt"] == "cli_missing"
+
+    def test_subprocess_error_exception(self):
+        c = classify_failure("claude returned no response (exception)")
+        assert c["mode"] == "SUBPROCESS_ERROR"
+        assert c["excerpt"] == "exception"
+
+    def test_subprocess_error_is_not_timeout_or_other(self):
+        # Contract: a crashed subprocess must NOT read as TIMEOUT_EMPTY (a
+        # longer DECISION_TIMEOUT_S can't fix a crash) and must NOT fall back
+        # to OTHER (the classifier-gap this fixes).
+        for cause in ("nonzero_rc", "cli_missing", "exception"):
+            m = classify_failure(f"claude returned no response ({cause})")["mode"]
+            assert m == "SUBPROCESS_ERROR"
+
+    def test_timeout_variants_stay_timeout_empty(self):
+        # Regression guard for the restructured "no response" branch: the
+        # genuine slow/empty causes must still classify as TIMEOUT_EMPTY.
+        for r in (
+            "claude returned no response (timeout)",
+            "claude returned no response (empty_stdout)",
+            "claude returned no response (timeout/empty)",
+        ):
+            assert classify_failure(r)["mode"] == "TIMEOUT_EMPTY"
+
 
 class TestBuildForensicsBasics:
     def test_empty_list(self):
@@ -185,6 +226,23 @@ class TestBuildForensicsBasics:
         assert r["dominant_mode"] == "HOST_SATURATED_SKIP"
         assert "Opus" in r["hint"]   # points at concurrent subprocesses
         assert r["tag_mix"].get("host_skip") == 8
+
+    def test_subprocess_error_dominant_surfaces_with_hint(self):
+        # A storm of CLI crashes must surface as its own dominant mode with a
+        # subprocess-specific hint — not absorbed into OTHER's generic one.
+        rows = [_dec(reasoning="claude returned no response (nonzero_rc)",
+                     mins_ago=i + 1) for i in range(7)]
+        r = build_decision_forensics(rows, now=NOW)
+        modes = {m["mode"]: m for m in r["mode_mix"]}
+        assert modes["SUBPROCESS_ERROR"]["n"] == 7
+        assert "OTHER" not in modes  # the gap this fixes
+        assert r["dominant_mode"] == "SUBPROCESS_ERROR"
+        assert r["hint"]                              # actionable, non-empty
+        assert "DECISION_TIMEOUT_S" in r["hint"]      # says a longer timeout won't help
+        assert r["tag_mix"].get("subprocess_error") == 7
+        # the per-row excerpt carries the specific cause
+        assert any(rf["excerpt"] == "nonzero_rc"
+                   for rf in r["recent_failures"])
 
     def test_retry_exhausted_count(self):
         rows = [

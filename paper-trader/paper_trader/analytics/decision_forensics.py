@@ -8,6 +8,10 @@ into ``decisions.reasoning`` for every failed cycle:
 * ``"parse_failed: <up-to-1000-char excerpt>"`` — Opus replied, first parse failed
 * ``"retry_failed: <excerpt>"``                 — the JSON-only retry *also* failed
 * ``"claude returned no response (timeout/empty)"`` — CLI timeout / empty stdout
+* ``"claude returned no response (nonzero_rc)"``     — the ``claude`` CLI
+  subprocess ran but exited with a non-zero return code (a crash / OOM kill /
+  ``cli_missing`` / wrapper ``exception``) — distinct from a timeout: the call
+  is not slow, it *failed*, so a longer ``DECISION_TIMEOUT_S`` cannot help
 * ``"skipped claude call — host saturated: …"``      — pre-flight guard declined
 * ``"skipped claude call — host saturated mid-call: …"`` — box saturated *during*
   the call; the doomed Sonnet fallback was skipped (root-cause-attributed, not a
@@ -32,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 # Failure *modes* — what an operator can act on. Ordered by display priority.
 MODES = [
     "TIMEOUT_EMPTY",    # CLI timed out or returned nothing — retry can't help
+    "SUBPROCESS_ERROR",      # claude CLI ran but crashed (non-zero rc / OOM)
     "HOST_SATURATED_SKIP",   # pre-flight guard declined the call (box overloaded)
     "HOST_STARVED_MIDCALL",  # box saturated *during* the call; fallback skipped
     "QUOTA_EXHAUSTED",       # claude CLI hit a usage/quota limit
@@ -50,6 +55,15 @@ _HINTS = {
     "TIMEOUT_EMPTY": ("Opus is timing out or returning empty stdout — check "
                       "`claude` CLI auth and the 3-concurrent subprocess cap; "
                       "consider raising DECISION_TIMEOUT_S."),
+    "SUBPROCESS_ERROR": ("The `claude` CLI subprocess ran but exited abnormally "
+                         "(non-zero return code, missing binary, or a wrapper "
+                         "exception) — the call *failed* rather than timed "
+                         "out, so raising DECISION_TIMEOUT_S cannot help. A "
+                         "non-zero rc under host pressure is usually an OOM "
+                         "kill (each Opus subprocess ~1.5 GB against the "
+                         "3-process cap) — same cure as the host-saturation "
+                         "modes, fewer concurrent Opus jobs; a `cli_missing` "
+                         "excerpt instead means `claude` is not on PATH."),
     "HOST_SATURATED_SKIP": ("Host was saturated at pre-flight — the Opus call "
                             "was deliberately skipped so it wouldn't feed the "
                             "storm. Reduce concurrent out-of-band Opus "
@@ -82,6 +96,15 @@ _HINTS = {
 }
 
 _EXCERPT_CAP = 280  # display cap; strategy.py already capped the stored text
+
+# Parenthesised cause codes strategy.py appends to a "claude returned no
+# response (<cause>)" row (strategy.py: `reason_text = f"claude returned no
+# response ({cause})"`). These three mean the `claude` CLI subprocess *ran and
+# failed* — a non-zero exit, a missing binary, or a wrapper exception — as
+# opposed to `timeout` / `empty_stdout` / `timeout/empty` which mean the call
+# was slow / produced nothing. The split matters because the remediation
+# differs: a crashed subprocess is never cured by a longer DECISION_TIMEOUT_S.
+_SUBPROCESS_CAUSES = ("nonzero_rc", "cli_missing", "exception")
 
 # ── Decision-loss clock ──────────────────────────────────────────────────────
 # Minimum decisions in a UTC-hour bucket before it can be named a "worst hour"
@@ -162,8 +185,19 @@ def classify_failure(reasoning: str | None) -> dict:
             "tag": tag,
             "excerpt": payload[:_EXCERPT_CAP],
         }
-    if "no response" in low and ("timeout" in low or "empty" in low):
-        return {"mode": "TIMEOUT_EMPTY", "tag": "no_response", "excerpt": ""}
+    if "no response" in low:
+        # A "claude returned no response (<cause>)" row. The CLI-fault causes
+        # (nonzero_rc / cli_missing / exception) are a *crashed* subprocess —
+        # split them out of OTHER into SUBPROCESS_ERROR and carry the specific
+        # cause as the excerpt so the operator sees which one. timeout /
+        # empty_stdout / timeout/empty stay TIMEOUT_EMPTY (model-output fault).
+        for cause in _SUBPROCESS_CAUSES:
+            if "(%s)" % cause in low:
+                return {"mode": "SUBPROCESS_ERROR",
+                        "tag": "subprocess_error", "excerpt": cause}
+        if "timeout" in low or "empty" in low:
+            return {"mode": "TIMEOUT_EMPTY", "tag": "no_response",
+                    "excerpt": ""}
     # Operational (non-model) classes. strategy.py records these as
     # "skipped claude call — host saturated[ mid-call]: …" (host-saturation
     # guard) and "claude quota/usage limit exhausted …" (CLI usage cap). They
