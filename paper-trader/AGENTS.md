@@ -6,6 +6,76 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-22 ML+backtest HYBRID pass #8 (Agent 2) — per-regime OOS rank-IC telemetry
+
+**Phase 1 — bugs_fixed: 0 (honest zero).** Re-read `paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py`, `run_continuous_backtests.py` in full and audited the
+hot paths (`_ml_decide` conviction gate, `_execute_decision`, `_enforce_risk_exits`,
+`PriceCache`, `_compute_decision_outcomes`, `train_scorer`, `_oos_rank_metrics`,
+`_train_decision_scorer`). 1397 tests pass green (`-k "ml or backtest or scorer or
+continuous or calibration or skill or regime or oos"`). All three files are
+exhaustively hardened by ~15 prior passes — no real bug, race, or dead code; no
+Phase 1 commit.
+
+**Phase 2 — features_added: 1 — per-regime OOS rank-IC breakdown.**
+`_oos_rank_metrics` already split out-of-sample directional skill into an
+aggregate + a BUY/SELL breakdown. Added a third axis: tie-aware Spearman
+rank-IC **per market regime** (bull / sideways / bear), bucketed by the
+`regime_mult` every `decision_outcomes.jsonl` row carries (0.3→bear,
+0.6→sideways, 1.0→bull-or-unknown — the `regime_audit` decode; `regime_label`
+is absent from the entire historical corpus so it cannot be keyed on).
+Rationale: an aggregate OOS rank-IC near zero can hide a scorer genuinely
+skilled in one regime and inverted in another. Unlike the standalone
+`regime_audit` CLI (a point-in-time snapshot on its own split), the new tokens
+ride the per-cycle `scorer_skill_log.jsonl`, making regime-conditional skill
+*trendable*. Wired `_oos_rank_metrics` → `_train_decision_scorer` status string
+(`oos_bull_n/ic`, `oos_sideways_n/ic`, `oos_bear_n/ic`) → `_parse_scorer_status`
+(additive; legacy strings parse clean to None). No retrain, no pickle/schema
+change, no trade-path change. 4 new tests in `tests/test_oos_regime_breakdown.py`
+assert exact per-regime rank-IC on synthetic records. Commit `9e757fe`.
+
+**Phase 3 — user_findings: 5 (4 operational issues + 1 positive, no Phase 3 fix commit).**
+1. **Conviction gate is DORMANT.** Deployed `data/ml/decision_scorer.pkl` has
+   `n_train=400` — below the `>=500` gate-activation threshold (invariant #5).
+   `_ml_decide`'s conviction gate currently modulates *no* trade. Self-heals on
+   the next completed cycle (loop retrains with ~4000 records), but real *now*.
+2. **Legacy pickle schema.** The deployed pickle is the 3-key `{model,scaler,
+   n_train}` form — no `pred_quantiles` (predates commit `f1263bd`). So
+   `predict_percentile()` / `predict_with_meta()['percentile']` return None for
+   every consumer; the "honest rank-calibrated reading" is dark until a retrain.
+3. **Per-cycle skill ledgers never written.** `data/scorer_skill_log.jsonl`,
+   `baseline_skill_log.jsonl`, `llm_annotation_skill_log.jsonl`,
+   `validation_results.json` do not exist — no cycle has completed since that
+   wiring landed. The continuous loop is alive (run 6243 in progress) but cycles
+   are very slow (GDELT rate-limiting dominates multi-year-window cache-warm).
+   Consequence: `scorer_freshness`'s heartbeat signal is permanently dark.
+4. **`regime_label` corpus-empty.** All 7413 `decision_outcomes.jsonl` rows lack
+   the `regime_label` field (the 2026-05-19 capture feature) — the loop has not
+   appended outcomes since; consistent with #3. (The new Phase-2 breakdown keys
+   on `regime_mult` precisely because `regime_label` is unavailable.)
+5. **POSITIVE — the long-documented `MLP_WORSE_THAN_TRIVIAL` plateau has flipped.**
+   `python3 -m paper_trader.ml.baseline_compare` now reads **`MLP_ADDS_SKILL`**
+   (MLP OOS rank-IC +0.225 vs best one-liner `rsi_meanrev` +0.079, gap +0.145);
+   `calibration --oos` = `DIRECTIONAL_BUT_BIASED` (spearman 0.22, clean decile
+   monotonicity d1 −2.9% → d10 +3.2%). The scorer currently carries genuine OOS
+   *rank* edge — but per finding #1 the dormant gate means none of it reaches
+   trades yet.
+
+### How the DecisionScorer + per-regime telemetry works (reference)
+- **Scorer**: `paper_trader/ml/decision_scorer.py` — sklearn `MLPRegressor(32,16)`
+  on 17 features → predicted 5d forward return %. Gates BUY conviction in
+  `_ml_decide` only once deployed `n_train >= 500`.
+- **Run a backtest manually**: `python3 run_backtests.py` (10 parallel runs) or
+  the continuous loop `python3 run_continuous_backtests.py`.
+- **Interpret results**: per-cycle status line in `continuous.log` —
+  `oos_rmse` (magnitude error), `oos_ic` (aggregate rank skill), and now
+  `oos_{bull,sideways,bear}_ic` (regime-conditional rank skill). A regime whose
+  `ic` is negative while another is positive = the aggregate is a mix artifact.
+- **Test the domain**: `python3 -m pytest tests/ -k "ml or backtest or scorer or
+  continuous or calibration or skill or regime or oos"` (1397 tests).
+
+---
+
 ## 2026-05-22 HYBRID pass (Agent 1, paper-trader core) — option-price TTL cache
 
 **Phase 1 — bugs_fixed: 0 (honest zero).** Re-read `runner.py`, `reporter.py`,
