@@ -591,6 +591,41 @@ def _hold_age_str(opened_at: str | None, now: datetime | None = None) -> str:
     return f"{int(secs // 86400)}d"
 
 
+def _signal_age_str(first_seen: str | None, now: datetime | None = None) -> str:
+    """Compact news-signal age in whole minutes: ``"5m"`` / ``"92m"``.
+
+    The TOP SCORED SIGNALS / urgent lines Opus reads in the decision prompt
+    historically showed ai_score + urgency + title only — *how fresh* a
+    catalyst is was invisible, yet a headline that broke 5 min ago and one
+    115 min ago (both inside the 2h ``get_top_signals`` window) are very
+    different trades: the stale one has likely already moved the tape. Both
+    ``signals.get_top_signals`` and ``signals.get_urgent_articles`` already
+    carry ``first_seen`` (an ISO-8601 insert timestamp), so this is a pure
+    render-side enrichment of data the cycle already fetched.
+
+    Minute granularity on purpose — never rolls up to hours/days the way
+    ``_hold_age_str`` does: the live signal windows are short (top signals
+    ≤2h, urgent ≤30m) and minute precision is exactly the freshness signal
+    that matters. Degrade-safe (the ``stale_mark`` / ``_hold_age_str``
+    precedent; invariants #2/#12): a missing / unparseable ``first_seen``
+    returns ``""`` so the caller renders no token, byte-identical to the
+    pre-feature prompt for any signal row lacking the field (e.g. the
+    handcrafted test signals). A future ``first_seen`` (wall-clock stepped
+    back — the documented clock-skew hazard) clamps to ``"0m"`` rather than
+    a negative age. ``now`` is injectable for deterministic tests."""
+    if not first_seen:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(first_seen).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    secs = max(0.0, (now - dt).total_seconds())
+    return f"{int(secs // 60)}m"
+
+
 def _expired_intrinsic(ticker: str, otype: str, strike: float) -> float:
     """Cash-settlement value (per share) of an *expired* option: its intrinsic
     value against the current underlying. 0.0 when out-of-the-money or the
@@ -777,8 +812,16 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
 
     sig_lines = []
     for s in top_signals[:10]:
+        # How long ago this catalyst broke. Observational only (the
+        # position `held=` token precedent; invariants #2/#12) — surfaces
+        # the freshness fact the decision engine was blind to so Opus can
+        # discount a signal the tape has likely already absorbed.
+        # Degrade-safe: no/bad first_seen → no token, byte-identical to
+        # before for any signal row lacking the field.
+        s_age = _signal_age_str(s.get("first_seen"))
+        age_token = f" age={s_age}" if s_age else ""
         sig_lines.append(
-            f"  [{s['ai_score']:.1f}] urg={s['urgency']} {s['title'][:120]}"
+            f"  [{s['ai_score']:.1f}] urg={s['urgency']}{age_token} {s['title'][:120]}"
             + (f"  tickers={','.join(s['tickers'][:5])}" if s['tickers'] else "")
         )
 
