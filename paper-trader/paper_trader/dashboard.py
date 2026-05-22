@@ -1071,6 +1071,23 @@ TEMPLATE = r"""
       <div id="risk-stale-list" style="font-size:12px;color:#dde1e7;"></div>
     </div>
 
+    <!-- ─── Position blow-up ladder (per-name single-name shock) ─── -->
+    <div class="card" id="blowup-card" style="margin-bottom:18px;">
+      <h2 style="display:flex;justify-content:space-between;align-items:center;">
+        <span>🧨 Position blow-up ladder <span class="muted" style="font-size:11px;text-transform:none;letter-spacing:normal;font-weight:normal;">— each held name shocked alone, idiosyncratic (no beta)</span></span>
+        <span class="muted" id="blowup-asof" style="font-size:11px;text-transform:none;letter-spacing:normal;">—</span>
+      </h2>
+      <div id="blowup-headline" class="muted" style="font-size:12px;margin-bottom:10px;">loading…</div>
+      <table style="width:100%;">
+        <thead><tr>
+          <th>ticker</th><th class="num">weight</th>
+          <th class="num">−10%</th><th class="num">−25%</th>
+          <th class="num">−50%</th><th class="num">to zero</th>
+        </tr></thead>
+        <tbody id="blowup-tbody"><tr><td colspan="6" class="muted">loading…</td></tr></tbody>
+      </table>
+    </div>
+
     <!-- ─── Earnings Risk ─── -->
     <div class="card" style="margin-bottom:18px;">
       <h2 style="display:flex;justify-content:space-between;align-items:center;">
@@ -3897,6 +3914,42 @@ async function refreshRisk() {
   } catch (e) { console.error("risk:", e); }
 }
 
+// ───────── Position blow-up ladder ─────────
+async function refreshPositionBlowup() {
+  let r;
+  try { r = await fetch(API_PREFIX + "/api/position-blowup").then(x => x.json()); }
+  catch (e) { return; }
+  const tbody = document.getElementById("blowup-tbody");
+  const head = document.getElementById("blowup-headline");
+  const asof = document.getElementById("blowup-asof");
+  if (!tbody) return;
+  if (!r || r.error) { tbody.innerHTML = `<tr><td colspan="6" class="muted">unavailable</td></tr>`; return; }
+  if (asof && r.as_of) asof.textContent = fmtTs(r.as_of, "time");
+  const verdictCls = { CONCENTRATED: "neg", MODERATE: "", DIFFUSE: "pos", NO_DATA: "muted" };
+  if (head) {
+    head.innerHTML = `<span class="${verdictCls[r.state] || 'muted'}">${r.state || '—'}</span> — ${r.headline || ''}`;
+  }
+  const rows = r.positions || [];
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="muted">no priced positions to shock</td></tr>`;
+    return;
+  }
+  // shocks list carries one entry per magnitude; index by shock_pct so a
+  // future change to SHOCK_MAGNITUDES_PCT can't silently mis-align columns.
+  const cell = (p, mag) => {
+    const s = (p.shocks || []).find(x => Number(x.shock_pct) === mag);
+    if (!s) return `<td class="num muted">—</td>`;
+    const v = Number(s.pnl_usd || 0);
+    const pct = Number(s.pnl_pct_of_book || 0);
+    return `<td class="num neg">$${v.toFixed(2)}<br><span class="muted" style="font-size:11px;">${pct.toFixed(1)}%</span></td>`;
+  };
+  tbody.innerHTML = rows.map(p =>
+    `<tr><td><b>${p.ticker}</b> <span class="muted" style="font-size:11px;">${p.type || ''}</span></td>` +
+    `<td class="num">${Number(p.weight_pct || 0).toFixed(1)}%</td>` +
+    cell(p, -10) + cell(p, -25) + cell(p, -50) + cell(p, -100) + `</tr>`
+  ).join("");
+}
+
 // ───────── Earnings radar ─────────
 async function refreshEarningsRisk() {
   let r;
@@ -5897,6 +5950,7 @@ refreshSectorPulse();
 refreshBriefing();
 refreshSuggestions();
 refreshRisk();
+refreshPositionBlowup();
 refreshEarningsRisk();
 refreshGreeks();
 refreshHeatmap();
@@ -5940,6 +5994,7 @@ setInterval(refreshSectorPulse, 60_000);
 setInterval(refreshBriefing, 60_000);
 setInterval(refreshSuggestions, 45_000);
 setInterval(refreshRisk, 30_000);
+setInterval(refreshPositionBlowup, 30_000);
 setInterval(refreshEarningsRisk, 300_000);
 setInterval(refreshGreeks, 60_000);
 setInterval(refreshHeatmap, 60_000);
@@ -7519,6 +7574,33 @@ def stress_scenarios_api():
             float(pf.get("total_value") or 0.0),
             _classify,
             _LEVERAGE_BETA,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/position-blowup")
+@swr_cached("position_blowup", 30.0)
+def position_blowup_api():
+    """Per-position single-name shock ladder — the per-name complement to
+    /api/stress-scenarios (which shocks only the *largest* name at −10 %) and
+    /api/risk (whose ``concentration_top1`` flags the weight but not the
+    dollar damage). Every held name is shocked individually at −10/−25/−50/
+    −100 %, sorted worst-first, so a concentrated book's dominant tail —
+    a single-name surprise (downgrade, lawsuit, accounting blow-up) the
+    SPY-shock and earnings-σ models never capture — is visible at a glance.
+    Pure ``weight×shock`` arithmetic over the CURRENT marked book; reuses
+    ``build_position_blowup`` verbatim (SSOT, AGENTS.md #10 — the panel and
+    the ``-m paper_trader.analytics.position_blowup`` CLI can never disagree).
+    Observational only — never gates Opus, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.position_blowup import build_position_blowup
+        store = get_store()
+        pf = store.get_portfolio()
+        result = build_position_blowup(
+            store.open_positions(),
+            float(pf.get("total_value") or 0.0),
         )
         return jsonify(result)
     except Exception as e:
@@ -13647,6 +13729,11 @@ def _swr_prewarm():
         # never prewarmed (commits 737a2d2 / 6e9c5d8) — same freeze-triage
         # cold-stall blind spot test_swr_prewarm_coverage.py locks against.
         ("stress_scenarios", stress_scenarios_api),
+        # position_blowup @swr_cached 30s — the per-name single-name shock
+        # ladder, a freeze-triage risk panel sibling of stress_scenarios.
+        # The prewarm==@swr_cached invariant locks it here so the first poll
+        # after a restart never cold-stalls on {"warming": true}.
+        ("position_blowup", position_blowup_api),
         # etf-lookthrough @swr_cached 30s — pure compute, no I/O, but the
         # prewarm==@swr_cached invariant locks every cached endpoint here so
         # the first poll after a restart never cold-stalls on {"warming":
