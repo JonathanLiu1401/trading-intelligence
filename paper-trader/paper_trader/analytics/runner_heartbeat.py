@@ -67,6 +67,54 @@ NO_DECISION_STORM_THRESHOLD = 5
 # elevated-failure regime — surfaced informational, NO restart recommended.
 NO_DECISION_ELEVATED_PCT = 50.0
 
+# Causes for which a paper-trader RESTART is actively counter-productive, not
+# merely useless: a host-saturation storm is cleared by REDUCING concurrent
+# Opus jobs — restarting just adds another ~1.5GB Opus process to the storm —
+# and a quota exhaustion only clears when the usage window resets. The pre-
+# 2026-05-22 IDLE_STORM headline unconditionally told the operator "a restart
+# may clear a wedged Claude CLI", which during the dominant live failure mode
+# (host saturation — see strategy.host_guard) misdirects the trader into the
+# exact action that worsens it. /api/no-decision-reasons already diagnoses the
+# real cause; this makes the heartbeat agree with it.
+_RESTART_INEFFECTIVE_CAUSES = ("host_saturated", "quota")
+
+
+def _no_decision_cause(reason: str | None) -> str:
+    """Bucket a ``decisions.reasoning`` string for a NO_DECISION row into the
+    coarse cause that decides whether a restart is the right lever.
+
+      * ``host_saturated`` — ``strategy.decide`` skipped the claude call
+        because ``host_guard`` saw too many concurrent Opus subprocesses /
+        high swap (reason text ``"skipped claude call — host saturated: …"``).
+      * ``quota``          — the Claude CLI rejected every attempt with a
+        usage/quota limit (reason ``"claude quota/usage limit exhausted …"``).
+      * ``other``          — a genuine model timeout / empty response / parse
+        failure (``"claude returned no response …"``, ``parse_failed:`` …):
+        a restart *may* clear a wedged CLI, so the legacy advice still holds.
+
+    Pure on the input string, never raises (the module's NO_DATA contract)."""
+    r = (reason or "").lower()
+    if "host saturat" in r or "skipped claude call" in r:
+        return "host_saturated"
+    if "quota" in r or "usage limit" in r:
+        return "quota"
+    return "other"
+
+
+def _dominant_cause(reasons: list[str | None]) -> str:
+    """Most frequent NO_DECISION cause across ``reasons`` (the leading idle
+    run). Tie-break prefers ``host_saturated`` then ``quota`` then ``other`` —
+    the restart-ineffective causes win a tie so a mixed storm never
+    *under*-warns the operator into a useless restart. ``[]`` → ``other``
+    (legacy behaviour: assume a restart could help when nothing is known)."""
+    if not reasons:
+        return "other"
+    counts = {"host_saturated": 0, "quota": 0, "other": 0}
+    for r in reasons:
+        counts[_no_decision_cause(r)] += 1
+    order = ("host_saturated", "quota", "other")
+    return max(order, key=lambda c: (counts[c], -order.index(c)))
+
 
 def _is_no_decision(action_taken: str | None) -> bool:
     """True for a failed cycle. ``strategy.py`` records ``action_taken``
@@ -83,7 +131,9 @@ def _is_no_decision(action_taken: str | None) -> bool:
 
 
 def _decision_efficacy(recent_actions: list[str] | None,
-                       threshold: int) -> dict | None:
+                       threshold: int,
+                       recent_reasons: list[str | None] | None = None
+                       ) -> dict | None:
     """Additive efficacy sub-block from newest-first ``action_taken`` rows.
 
     ``None`` when ``recent_actions`` is not supplied (caller renders the
@@ -91,13 +141,19 @@ def _decision_efficacy(recent_actions: list[str] | None,
 
       * ``NO_DATA``    — empty window;
       * ``IDLE_STORM`` — the latest ``>= threshold`` cycles were ALL
-        NO_DECISION (engine cycling but not deciding — a restart may clear a
-        wedged CLI; the runner auto-recovery-breaker wedge);
+        NO_DECISION (engine cycling but not deciding — the runner
+        auto-recovery-breaker wedge);
       * ``DEGRADED``   — not a hard storm, but ``>= NO_DECISION_ELEVATED_PCT``
         of the window is NO_DECISION (the documented elevated regime —
         informational, no restart);
       * ``PRODUCING``  — the engine is turning out real decisions.
-    """
+
+    ``recent_reasons`` (optional, newest-first ``decisions.reasoning`` strings
+    parallel to ``recent_actions``): when supplied, an IDLE_STORM sub-block
+    additionally carries ``dominant_cause`` + ``restart_helps`` and a
+    cause-specific headline so the operator is not told to restart during a
+    host-saturation / quota storm — the action that worsens it. Omitting it ⇒
+    the legacy generic "a restart may clear a wedged Claude CLI" headline."""
     if recent_actions is None:
         return None
     window = len(recent_actions)
@@ -120,12 +176,38 @@ def _decision_efficacy(recent_actions: list[str] | None,
     pct = round(n_nd / window * 100.0, 1)
     if consec >= threshold:
         verdict = "IDLE_STORM"
-        headline = (
+        storm_head = (
             f"IDLE_STORM — the last {consec} cycles were ALL NO_DECISION "
             f"({pct:.0f}% of the last {window}); the loop is cycling but the "
-            f"engine is not deciding. A restart may clear a wedged Claude "
-            f"CLI.")
-    elif pct >= NO_DECISION_ELEVATED_PCT:
+            f"engine is not deciding.")
+        cause = restart_helps = None
+        if recent_reasons is not None:
+            # Diagnose the leading idle run so the restart advice is honest.
+            cause = _dominant_cause(list(recent_reasons[:consec]))
+            restart_helps = cause not in _RESTART_INEFFECTIVE_CAUSES
+        if cause == "host_saturated":
+            headline = (storm_head + " Cause: host saturation (too many "
+                        "concurrent Opus jobs) — a restart will NOT help and "
+                        "adds load; reduce parallel Opus jobs or wait for the "
+                        "storm to clear.")
+        elif cause == "quota":
+            headline = (storm_head + " Cause: Claude quota/usage limit "
+                        "exhausted — a restart will NOT help; wait for the "
+                        "quota window to reset.")
+        else:
+            headline = storm_head + " A restart may clear a wedged Claude CLI."
+        eff = {
+            "verdict": verdict,
+            "window": window,
+            "consecutive_no_decision": consec,
+            "no_decision_pct": pct,
+            "headline": headline,
+        }
+        if cause is not None:
+            eff["dominant_cause"] = cause
+            eff["restart_helps"] = bool(restart_helps)
+        return eff
+    if pct >= NO_DECISION_ELEVATED_PCT:
         verdict = "DEGRADED"
         headline = (
             f"DEGRADED — {pct:.0f}% of the last {window} cycles were "
@@ -173,6 +255,7 @@ def build_runner_heartbeat(
     now: datetime | None = None,
     recent_actions: list[str] | None = None,
     no_decision_storm_threshold: int = NO_DECISION_STORM_THRESHOLD,
+    recent_reasons: list[str | None] | None = None,
 ) -> dict:
     """Verdict on whether the decision loop is still cycling **and deciding**.
 
@@ -192,6 +275,14 @@ def build_runner_heartbeat(
     The liveness ``verdict`` enum is left untouched (the documented
     liveness/efficacy separation). Omitting ``recent_actions`` ⇒ output
     byte-identical to before this parameter existed.
+
+    ``recent_reasons`` (optional, newest-first ``decisions.reasoning`` strings
+    parallel to ``recent_actions``): when supplied, an IDLE_STORM diagnoses
+    its dominant cause. A host-saturation / quota storm is NOT cleared by a
+    restart — ``restart_recommended`` stays False and the headline says so,
+    instead of misdirecting the operator into the action that worsens it.
+    Omitting ``recent_reasons`` ⇒ the legacy unconditional "a restart may
+    clear a wedged Claude CLI" headline, byte-identical to before.
     """
     now = now or datetime.now(timezone.utc)
     expected = OPEN_INTERVAL_S if market_open else CLOSED_INTERVAL_S
@@ -246,17 +337,42 @@ def build_runner_heartbeat(
     # "is the loop cycling?"; this answers "is it actually deciding?". A loop
     # that cycles perfectly but emits NO_DECISION every time is alive-but-
     # brain-dead — and the bare cadence verdict would call that HEALTHY.
-    eff = _decision_efficacy(recent_actions, no_decision_storm_threshold)
+    eff = _decision_efficacy(recent_actions, no_decision_storm_threshold,
+                             recent_reasons)
     if eff is not None:
         out["decision_efficacy"] = eff
         if eff["verdict"] == "IDLE_STORM":
-            # A restart is the documented lever for this exact wedge (the
-            # runner auto-recovery breaker fires at the same threshold), so
-            # surface it on the line the operator actually reads — never
-            # mutate the liveness verdict enum (the separation contract).
-            out["restart_recommended"] = True
-            out["headline"] += (
-                f" ⚠ but the last {eff['consecutive_no_decision']} cycles "
-                f"were ALL NO_DECISION — the engine is cycling, not "
-                f"deciding; a restart may clear a wedged Claude CLI.")
+            # A wedged-CLI storm IS cleared by a restart (the runner
+            # auto-recovery breaker fires at the same threshold); a
+            # host-saturation / quota storm is NOT — restarting just adds
+            # another Opus process to the storm. ``restart_helps`` is present
+            # only when ``recent_reasons`` was supplied; without it, preserve
+            # the legacy "restart recommended" behaviour byte-for-byte.
+            n = eff["consecutive_no_decision"]
+            restart_helps = eff.get("restart_helps")
+            if restart_helps is False:
+                # Cause-diagnosed and a restart would not help. Do NOT set
+                # restart_recommended — _heartbeat_line still surfaces the
+                # IDLE_STORM, just without the misleading restart directive.
+                cause = eff.get("dominant_cause")
+                if cause == "host_saturated":
+                    out["headline"] += (
+                        f" ⚠ but the last {n} cycles were ALL NO_DECISION — "
+                        f"the engine is cycling, not deciding; cause is host "
+                        f"saturation, a restart will NOT help (reduce "
+                        f"concurrent Opus jobs).")
+                else:  # quota
+                    out["headline"] += (
+                        f" ⚠ but the last {n} cycles were ALL NO_DECISION — "
+                        f"the engine is cycling, not deciding; the Claude "
+                        f"quota is exhausted, a restart will NOT help (wait "
+                        f"for the quota to reset).")
+            else:
+                # restart_helps True (wedged CLI) OR None (legacy: no reasons
+                # supplied — keep the pre-2026-05-22 string byte-identical).
+                out["restart_recommended"] = True
+                out["headline"] += (
+                    f" ⚠ but the last {n} cycles "
+                    f"were ALL NO_DECISION — the engine is cycling, not "
+                    f"deciding; a restart may clear a wedged Claude CLI.")
     return out
