@@ -77,6 +77,7 @@ from collectors.fear_greed_collector import collect_fear_greed
 from collectors.crypto_fear_greed_collector import collect_crypto_fear_greed
 from collectors.earnings_surprise_collector import collect_earnings_surprises
 from collectors.polymarket_collector import collect as collect_polymarket
+from collectors.manifold_collector import collect_manifold
 from collectors.collector_rate_monitor import collect_rate_alerts
 from collectors.yield_curve_collector import collect_yield_curve
 from collectors.g10_sovereign_yields import collect_g10_yields
@@ -165,6 +166,7 @@ FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
 CRYPTO_FEAR_GREED_INTERVAL = 1800  # Crypto Fear & Greed (alternative.me) every 30min
 EARNINGS_SURPRISE_INTERVAL = 900  # EPS beat/miss scanner every 15min
 POLYMARKET_INTERVAL     = 900     # Polymarket prediction markets every 15min
+MANIFOLD_INTERVAL       = 1800    # Manifold Markets prediction markets every 30min
 RATE_MONITOR_INTERVAL   = 3600    # per-collector silence detector — hourly
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
 G10_YIELDS_INTERVAL     = 3600    # G10 sovereign yields every 1h (FRED daily/monthly)
@@ -1221,6 +1223,27 @@ def polymarket_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(POLYMARKET_INTERVAL)
+
+
+# ── Worker: Manifold Markets prediction markets — every 30min ─────────────────
+def manifold_worker(store: ArticleStore):
+    log.info("[manifold_worker] started")
+    bo = Backoff("manifold", base=30.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_manifold()
+            _ingest(store, articles, "manifold")
+            try:
+                source_health.record_result("manifold", len(articles))
+            except Exception as he:
+                log.warning(f"[manifold_worker] source_health error: {he}")
+            _worker_last_ok["manifold"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[manifold_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(MANIFOLD_INTERVAL)
 
 
 # ── Worker: per-collector silence detector — every 1h ────────────────────────
@@ -3310,6 +3333,7 @@ def main():
         ("crypto_fear_greed", crypto_fear_greed_worker),
         ("earnings_surprise", earnings_surprise_worker),
         ("polymarket",  polymarket_worker),
+        ("manifold",    manifold_worker),
         ("rate_monitor", rate_monitor_worker),
         ("yield_curve", yield_curve_worker),
         ("g10_yields",  g10_yields_worker),
