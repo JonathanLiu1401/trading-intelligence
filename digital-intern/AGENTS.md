@@ -5,6 +5,249 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-22 hybrid pass (Agent 3) — portfolio tickers load from `config/portfolio.json`
+
+**Phase 1 (debug):** read AGENTS.md head+tail, daemon.py, storage/article_store.py,
+watchers/alert_agent.py, watchers/urgency_scorer.py, ml/trainer.py, ml/model.py,
+ml/features.py, collectors/web_scraper.py, analysis/claude_analyst.py,
+ml/inference.py, daemon.scorer_worker. Probed live articles.db — all four
+load-bearing invariants clean: `synthetic urgency>0 = 0`,
+`score_source='ml' AND ai_score>0 = 0`. The requested Phase-1 test coverage
+already exists (test_article_store / test_urgency_scorer / test_features /
+test_model / test_trainer). **No code bug found** — `bugs_fixed=0`, no Phase-1
+commit (honest per the guard).
+
+**Phase 2 (feature):** `ml/features.LIVE_PORTFOLIO_TICKERS` was a static
+hardcoded 12-ticker set that had drifted behind `config/portfolio.json` (the
+operator's UI-updated source of truth). Live read 2026-05-21: GOOG / NVDL /
+COHR are open positions yet were **absent** from the hardcoded set, so news on
+those held names was never portfolio-flagged for ArticleNet (feature idx 1 /
+12 / 13) and never `book:`-tagged in 🚨 BREAKING alerts (alert_agent.
+`_book_tickers` reuses `ml.features._LIVE_RE`). `LIVE_PORTFOLIO_TICKERS` is now
+the **union** of the hardcoded fallback with portfolio.json positions + option
+underlyings + sector_watchlist (same load `ml.sentiment_trends` /
+`collectors.finnhub_collector` already use). Union, never replace — a dropped
+name is still recognised, a missing/corrupt file degrades silently to the
+fallback. 5 new tests in `test_features.py` (union, missing-file fallback,
+corrupt-file fallback, live-config parity, held-ticker drives portfolio_flag).
+Pure additive set membership — all four invariants intact. Committed `0847013`.
+
+**Phase 3 (live validation):** collection healthy (~510 live rows/h over 24h,
+12.2k/24h). 43 workers ok / 0 dead. Latest briefing high quality (clean LEAD /
+MACRO / PORTFOLIO / SEMIS / TOP SIGNALS / RISK / COVERAGE GAP). Findings:
+(1) **`claude_analyst._BOOK_TICKERS` and `daemon.PORTFOLIO_TICKERS` are still
+stale** — same drift this pass fixed in `ml/features`, NOT addressed here
+(blast radius: `_BOOK_TICKERS` order semantics + `test_briefing_book_silence`).
+Effect: the briefing PORTFOLIO header lists only `LITE·LNOK·MUU·DRAM`, and
+`price_alert_worker` will not fire on GOOG/NVDL/COHR. Worth a follow-up pass.
+(2) Alert path: `[alert] No response from Claude — skipping` recurs (Sonnet
+host-saturation during the NVDA-earnings surge) → ~74-item `urgency=1` backlog;
+documented pattern, not a fresh bug — alerts send fine (5/cycle) when Claude
+responds. (3) Pushed `urgency=2` rows dominated by `score_source='ml'`
+(model-only urgent calls), few LLM-vetted — matches the prior pass's
+`delivered_llm_fraction~0`. (4) The `quick_glance_metrics` recap gate is
+working — "NVIDIA Earnings: A Quick Glance at Key Metrics" hit `urgency=2` 3×
+but was gate-suppressed (not pushed). (5) Briefing cadence 6–10h vs the 5h
+target (overnight Opus-quota skips). (6) 37 dark sources — nitter/polygon/
+newsapi chronic-dark (expected, `di-chronic-dark-collectors`); SEC 8-K
+(sec_edgar/sec_form4) effectively dark, analyst blind to filings.
+
+**Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=8`.
+
+---
+
+## 2026-05-21 hybrid pass (Agent 3) — `quick_glance_metrics` recap fingerprint
+
+**Phase 1 (debug):** read AGENTS.md head, daemon.py, storage/article_store.py,
+watchers/alert_agent.py, watchers/urgency_scorer.py, ml/trainer.py,
+ml/model.py, ml/features.py, collectors/web_scraper.py,
+analysis/claude_analyst.py, ml/inference.py, daemon.scorer_worker. Full test
+suite green (2187 passed, 5m51s). All requested Phase-1 test coverage already
+exists (test_article_store / test_urgency_scorer / test_features / test_model
+/ test_trainer). Probed live articles.db — all four load-bearing invariants
+clean: `synthetic urgency>0 = 0`, `score_source='ml' AND ai_score>0 = 0`.
+**No code bug found** — bugs_fixed=0, no Phase-1 commit (honest per guard).
+
+**Phase 2 (feature):** new recap-template fingerprint `quick_glance_metrics`.
+Live evidence (2026-05-21 NVDA earnings night, articles.db urgency=2 set):
+the Zacks recap-mill title "NVIDIA Earnings: A Quick Glance at Key Metrics"
+reached urgency=2 three times (YahooFinance/NVDA ml_score 9.9, yfinance/Zacks
+ml_score 9.7, GN: Nvidia ai_score 9.0 — Sonnet itself over-scored it). It is
+a retrospective post-print summary, not breaking news; all three publishers
+clear the 0.45 lone-source bar so the authority gate never caught it. Added
+`_RT_QUICK_GLANCE` to `watchers/alert_agent._RECAP_TEMPLATE_PATTERNS` and
+`_BRIEFING_RT_QUICK_GLANCE` to `analysis/claude_analyst.
+_BRIEFING_RECAP_TEMPLATE_PATTERNS` in lockstep. The alert fingerprint
+auto-propagates to `urgency_scorer`'s pre-floor via the existing SSOT import.
+Regex `\ba quick glance at (?:key )?(?:financial )?metrics\b` (substring,
+sibling of `earnings_call_recap`). 9 new tests in
+`tests/test_recap_quick_glance.py` (both gates, must-survive corpus, SSOT
+propagation, end-to-end send_urgent_alert). Pure read-side title regex —
+no DB write, all four invariants intact. Committed d2468ac.
+
+**Phase 3 (live validation):** collection healthy (~6k live rows/h);
+briefings on a ~5–7h cadence and high quality (#39 14:40 — clean LEAD /
+MACRO / PORTFOLIO / SEMIS / TOP SIGNALS). Stale-source list is only
+incidental long-tail GDELT firehose hosts (1 row/30d) — expected, not
+curated collectors. daemon.log shows recurring `stats: 'another row
+available'` + `finnhub: database is locked` — the documented SQLite
+shared-connection contention; handled by `_retry_on_lock` / Backoff,
+recoverable, not a fresh bug.
+
+---
+
+## 2026-05-21 hybrid pass (Agent 3, post-Bloomberg-image-credit-leak) — `_QW_IMAGE_CREDIT` regex + `delivered_by_source` audit
+
+**Phase 1 (live alert_recency audit + regex fix):** read AGENTS.md head,
+daemon.py top, storage/article_store.py, watchers/alert_agent.py,
+watchers/urgency_scorer.py, ml/trainer.py, ml/model.py, ml/features.py,
+collectors/web_scraper.py, analysis/claude_analyst.py. Probed live
+articles.db for the four load-bearing invariants — all clean:
+`synthetic_ever_alerted=0`, `ml_with_ai>0=0`, `stuck_urgency1>24h=0`.
+
+Audited `alert_recency.db` — the canonical record of REAL Discord pushes —
+for the last 24h (99 pushes, NVDA-earnings concentration). Found ONE fresh
+leak: **"Angela Weiss/AFP/Getty Images"** fired a real 🚨 BREAKING push at
+16:30:49Z 2026-05-21 from `scraped/www.bloomberg.com` (cred=0.90 — above
+the 0.45 lone-source bar; content type IS the failure). Root cause: news
+pages wrap the hero image inside the article's own `<a>` link, so the web
+scraper's anchor-text fallback picks up the photo credit beneath the image
+as the article title. The ML urgency head then scored it 10.0 (bloomberg.com
+URL + proper-noun tokens triggered high-relevance pattern recognition).
+Other live samples in articles.db (lower-scored, no push): "Tomohiro
+Ohsumi/Getty Images" (5/16), "Timorthy A. Clary/AFP/Getty Images" (5/16).
+
+**The fix.** New fingerprint `_QW_IMAGE_CREDIT` added in lockstep across
+all three gate modules (`collectors/web_scraper.py`,
+`watchers/alert_agent.py`, `analysis/claude_analyst.py`) following the
+documented triple-gate discipline. Anchored `^...$` Title-Case-Name
+(≥2 tokens, allowing initials like `A.`) + one or more `/Agency` slugs
+with no space around the slash + closed agency list (AFP / Reuters /
+Getty Images / AP / Bloomberg / EPA / TASS / WireImage / Shutterstock /
+Polaris / Bloomberg News). Added to `_QUOTE_WIDGET_TITLE_PATTERNS` SSOT so
+`urgency_scorer` pre-floor + `analytics/quote_widget_audit` auto-engage via
+the existing import discipline. Zero false positives against the
+must-survive corpus including "Reuters/Yahoo Finance reports earnings",
+"Sam Altman/OpenAI says GPT-5 coming", "MU drops 5%/Yahoo",
+"AFP/Getty Images launches new service".
+
+**Tests pinned** (26 new): `test_alert_agent.py` (3 new), `test_briefing_
+quote_widget.py` (3 new), `test_web_scraper.py` (3 new — including end-to-
+end test on the exact bloomberg.com-shaped HTML that fired the live push),
+`test_quote_widget_audit.py` (SSOT-parity test updated to require
+`image_credit` in the fingerprint name set so a future divergence fails
+this test). 2173/2173 alert + briefing + scraper sibling suites pass.
+
+Load-bearing invariants intact. Pure read-side title regex.
+
+Commit: `57dba88`.
+
+**Phase 2 — feature: `delivered_by_source` / `delivered_llm_fraction` in
+`analytics/alert_delivery_audit`.** The aggregate `urgency_label_split`
+measures quality (LLM-vetted vs ML-only) over the FULL urgency>=1 set —
+dominated by gate-suppressed rows — so the PUSH-quality question ("of the
+alerts I actually got, what fraction were LLM-vetted?") was previously
+masked. `compute_delivery_audit` now returns four additional fields:
+
+  * `delivered_by_source` — score_source bucket counts (llm/ml/
+    briefing_boost/null) for ACTUALLY PUSHED alerts
+  * `delivered_llm_fraction` — `(llm + briefing_boost) / total`,
+    byte-identical formula to `storage.article_store.urgency_label_split`
+    so the audit and the dashboard tile never disagree on what counts as
+    "vetted"
+  * `suppressed_by_source` — symmetric bucket counts on the gate-absorbed
+    side
+  * `suppressed_llm_fraction` — calibration red flag: a non-zero value
+    means a gate is absorbing ground-truth LLM-labeled urgent rows
+
+**Live read on push (2026-05-21, last 6h, 99 urgency=2 rows):**
+delivery_rate 53.5%, **delivered_llm_fraction 0.0** (53/53 pushed alerts
+were model-only urgent calls). The new metric immediately produced an
+actionable signal — the Sonnet urgency_scorer path is either
+quota-throttled or flooring everything to noise, and the analyst's
+standalone-push channel is currently fed exclusively by the (over-
+confident) ML urgency head.
+
+5 new tests pin: zero-data discipline (four buckets always present),
+`delivered_llm_fraction` formula matches `urgency_label_split` verbatim,
+symmetric suppressed-side partition, null bucketing for missing/unknown
+score_source, sum-equals-total invariant.
+
+Load-bearing invariants intact: pure read-side, no DB write, no
+ai_score/ml_score/score_source/urgency mutation by construction.
+
+Commit: `7701b0d`.
+
+**Phase 3 (live findings — 2026-05-21 18:54Z):**
+
+1. **(POSITIVE) Pipeline healthy under load.** 9,717 articles in last 1h
+   (838/h avg over 24h, surge during NVDA earnings day); 671 distinct
+   sources active in last 1h; daemon up 46m (recent restart).
+
+2. **(POSITIVE) Load-bearing invariants intact under earnings-day
+   pressure.** `synthetic_ever_alerted=0`, `ml_with_ai>0=0`,
+   `stuck_urgency1>24h=0` — no backtest row ever alerted; no ml-tagged
+   row carries non-zero ai_score; no urgency=1 row older than 24h.
+
+3. **(POSITIVE) Briefing quality excellent.** Most recent 2026-05-21
+   14:40Z (5h cadence target met — 14:40Z, 07:36Z, 21:22Z, 15:07Z, 09:51Z
+   all ~5-7h apart). Well-formed sections (LEAD / MACRO / PORTFOLIO /
+   SEMIS PULSE / TOP SIGNALS / RISK / COVERAGE GAP / DESK NOTE); identifies
+   coverage gaps explicitly (SEC EDGAR + Polygon + NewsAPI + Nitter all
+   dark — same chronic standing issue per memory `di-chronic-dark-collectors`).
+
+4. **(BUG FIXED, LIVE CONFIRMED)** the "Angela Weiss/AFP/Getty Images"
+   title that fired BREAKING at 16:30:49Z is suppressed by the new
+   `_QW_IMAGE_CREDIT`. Daemon needs restart to pick up the gate (memory:
+   `di-stale-manual-daemon`).
+
+5. **(NEW FEATURE LIVE) `delivered_by_source` immediately surfaced an
+   actionable calibration finding:** 100% of pushed alerts in last 6h
+   were `score_source='ml'` — the Sonnet urgency_scorer path is either
+   quota-throttled, dark, or flooring everything. The analyst's
+   standalone-push channel is currently being fed exclusively by the
+   over-confident ML urgency head with zero LLM ground-truth gating.
+
+6. **(CHRONIC, KNOWN) `database is locked` + cursor-collision retries
+   under writer contention** firing every few minutes (live: 18:53:15Z
+   google_news_worker + 18:53:27Z unusual_volume_worker + repeated
+   `another row available` retries on `stats()` reader). Retry layer
+   absorbs (memory: `di-insert-batch-lock-contention`).
+
+7. **(CHRONIC, KNOWN) Coverage gaps** SEC EDGAR / Polygon / NewsAPI /
+   Nitter all dark with 100s-1000s of empty polls (per most-recent
+   briefing's COVERAGE GAP section). Standing external gap, not a fresh
+   bug (memory: `di-chronic-dark-collectors`).
+
+8. **(OBSERVATION) Stale source list** carries multiple low-volume reddit
+   subreddits (FIREyFemmes / AIstocks / AMCSTOCK / TradingEducation /
+   ethfinance / Biotechplays — 7+ days dark, < 35 rows each in 7-day
+   history) — likely deprecated subreddits worth pruning from config.
+
+9. **(POSITIVE) 99 BREAKING pushes in 24h with NVDA-earnings burst
+   handling working as designed** — the BURST WIRE prompt rule + per-held-
+   ticker burst counts annotated the (N+1)th NVDA alert with a development-
+   verb headline so the analyst saw "NEXT-IN-SERIES" framing rather than
+   N fresh-break duplicates.
+
+10. **(POSITIVE) Triple-gate lockstep discipline working as designed** —
+    the new `_QW_IMAGE_CREDIT` regex is byte-identical across
+    web_scraper / alert_agent / claude_analyst (the documented anti-
+    drift discipline), and is auto-picked-up by
+    `analytics/quote_widget_audit` via the SSOT
+    `_QUOTE_WIDGET_TITLE_PATTERNS` import.
+
+**Counters:** `bugs_fixed=1` (the `_QW_IMAGE_CREDIT` photo-credit
+fingerprint — real live noise leak fixed today, Angela Weiss/AFP/Getty
+Images push verified in alert_recency.db, fix + 26 new pin tests
+committed in 57dba88), `features_added=1` (`delivered_by_source` +
+`delivered_llm_fraction` quality breakdown — real analyst-facing
+push-quality metric no other endpoint provided cleanly, immediately
+surfaced the 0% LLM-vetted finding on live data, 5 new tests, committed
+in 7701b0d), `user_findings=10`.
+
+---
+
 ## 2026-05-21 hybrid pass (Agent 3, post-AXTI-leak) — `_RT_WHY_PCT_AFTER` regex + `pushed_ticker_breakdown` primitive
 
 **Phase 1 (live noise audit + regex fix):** read AGENTS.md head,
