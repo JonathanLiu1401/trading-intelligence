@@ -275,6 +275,14 @@ class DecisionScorer:
         # None for legacy pickles written before this field existed — every
         # consumer degrades gracefully (returns None) in that case.
         self._pred_quantiles = None
+        # Sorted training-LABEL quantiles (101 points, percentiles 0..100)
+        # persisted by train_scorer alongside _pred_quantiles. Used by
+        # predict_calibrated() / _raw_to_calibrated() to quantile-map a raw
+        # prediction onto the realized forward-return distribution — the
+        # textbook fix for the documented DIRECTIONAL_BUT_BIASED verdict
+        # (rank trustworthy, magnitude biased). None for legacy pickles
+        # written before this field existed; every consumer degrades to None.
+        self._label_quantiles = None
         if SCORER_PATH.exists():
             self._load()
 
@@ -290,7 +298,7 @@ class DecisionScorer:
             cached = _LOAD_CACHE.get(key)
             if cached is not None:
                 (self._model, self._scaler, self._n_train,
-                 self._pred_quantiles) = cached
+                 self._pred_quantiles, self._label_quantiles) = cached
                 self._trained = True
                 return
             try:
@@ -307,12 +315,21 @@ class DecisionScorer:
                     np.asarray(pq, dtype=np.float64)
                     if pq is not None else None
                 )
+                # Additive, backward-compatible: legacy pickles have no
+                # `label_quantiles` key, so `.get` yields None and
+                # predict_calibrated() degrades to None for those.
+                lq = state.get("label_quantiles")
+                self._label_quantiles = (
+                    np.asarray(lq, dtype=np.float64)
+                    if lq is not None else None
+                )
                 self._trained = True
                 # Only the current file is ever relevant; clearing bounds the
                 # cache to one entry across unbounded retrain cycles.
                 _LOAD_CACHE.clear()
                 _LOAD_CACHE[key] = (self._model, self._scaler,
-                                    self._n_train, self._pred_quantiles)
+                                    self._n_train, self._pred_quantiles,
+                                    self._label_quantiles)
                 print(f"[decision_scorer] loaded n={self._n_train} from {SCORER_PATH}")
             except Exception as e:
                 print(f"[decision_scorer] load failed: {e}")
@@ -336,7 +353,7 @@ class DecisionScorer:
         """Predicted 5d forward return (%) plus calibration metadata.
 
         Returns ``{"pred", "raw", "clamped", "off_distribution",
-        "percentile"}``:
+        "percentile", "calibrated"}``:
         - ``pred``  — the value callers should act on (clamped, always finite)
         - ``raw``   — the model's unbounded output (for diagnostics / honesty)
         - ``clamped`` — True when ``|raw| > PRED_CLAMP_PCT`` (or non-finite)
@@ -349,6 +366,15 @@ class DecisionScorer:
           ``DIRECTIONAL_BUT_BIASED`` — the predicted % magnitude is unreliable
           but the *ranking* is trustworthy — so the percentile is the
           honest, low-bias way to read a prediction.
+        - ``calibrated`` — the quantile-mapped prediction: ``raw`` is mapped
+          to its percentile in the training PREDICTION distribution, then
+          read off at that same percentile of the training LABEL (realized
+          forward-return) distribution. This is the honest *magnitude* a
+          reader should believe — it preserves the model's trustworthy rank
+          ordering while pulling the biased % back onto the empirical return
+          support (a +42% raw extrapolation calibrates down to whatever
+          realized return its rank actually corresponds to). None for legacy
+          pickles that carry no ``label_quantiles`` table.
 
         ``predict()`` is the scalar fast path every existing consumer uses;
         this sibling exists for panels that want to surface the trust flag
@@ -356,7 +382,8 @@ class DecisionScorer:
         """
         if not self._trained or self._model is None:
             return {"pred": 0.0, "raw": 0.0, "clamped": False,
-                    "off_distribution": False, "percentile": None}
+                    "off_distribution": False, "percentile": None,
+                    "calibrated": None}
         try:
             X = np.array(
                 [build_features(ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
@@ -383,19 +410,22 @@ class DecisionScorer:
             # in-distribution call. predict()'s scalar contract is unchanged
             # (still 0.0); only the meta trust flags move.
             return {"pred": 0.0, "raw": 0.0, "clamped": True,
-                    "off_distribution": True, "percentile": None}
+                    "off_distribution": True, "percentile": None,
+                    "calibrated": None}
 
         # A non-finite model output (inf/nan from a pathological feature
         # vector) is unusable — treat it as a 0% / off-distribution result
         # rather than letting nan propagate silently through max/min.
         if not np.isfinite(raw):
             return {"pred": 0.0, "raw": raw, "clamped": True,
-                    "off_distribution": True, "percentile": None}
+                    "off_distribution": True, "percentile": None,
+                    "calibrated": None}
         clamped_pred = max(-PRED_CLAMP_PCT, min(PRED_CLAMP_PCT, raw))
         was_clamped = abs(raw) > PRED_CLAMP_PCT
         return {"pred": clamped_pred, "raw": raw, "clamped": was_clamped,
                 "off_distribution": was_clamped,
-                "percentile": self._raw_to_percentile(raw)}
+                "percentile": self._raw_to_percentile(raw),
+                "calibrated": self._raw_to_calibrated(raw)}
 
     def predict(
         self,
@@ -443,6 +473,74 @@ class DecisionScorer:
             return round(float(np.interp(float(raw), q, pcts)), 2)
         except Exception:
             return None
+
+    def _raw_to_calibrated(self, raw: float) -> float | None:
+        """Quantile-map a raw prediction onto the realized-return distribution.
+
+        Two 101-point quantile tables are persisted by ``train_scorer``:
+        ``pred_quantiles`` (the model's predictions on the training set) and
+        ``label_quantiles`` (the realized forward returns it was trained on).
+        ``_raw_to_percentile`` locates ``raw`` within the prediction
+        distribution; this method then reads the realized-return value at
+        that *same* percentile of the label distribution.
+
+        The result is the honest magnitude reading the documented
+        ``DIRECTIONAL_BUT_BIASED`` verdict calls for: it is **monotonic** in
+        ``raw`` (percentile is monotonic in raw, both quantile tables are
+        sorted ascending) so the model's trustworthy rank ordering is fully
+        preserved, while the biased % magnitude is pulled back onto the
+        empirical label support. A raw ``+42%`` extrapolation calibrates down
+        to whatever realized return its rank actually corresponds to.
+
+        Returns None when either quantile table is absent (legacy pickle),
+        ``raw`` is non-finite, or anything else fails — never raises, the
+        same discipline as ``_raw_to_percentile``."""
+        lq = self._label_quantiles
+        try:
+            if lq is None or len(lq) < 2:
+                return None
+            pct = self._raw_to_percentile(raw)
+            if pct is None:
+                return None
+            pcts = np.linspace(0.0, 100.0, len(lq))
+            return round(float(np.interp(float(pct), pcts, lq)), 4)
+        except Exception:
+            return None
+
+    def predict_calibrated(
+        self,
+        ml_score: float,
+        rsi: float | None,
+        macd: float | None,
+        mom5: float | None,
+        mom20: float | None,
+        regime_mult: float,
+        ticker: str,
+        vol_ratio: float | None = None,
+        bb_pos: float | None = None,
+        news_urgency: float | None = None,
+        news_article_count: float | None = None,
+    ) -> float | None:
+        """Quantile-mapped reading of one prediction: the realized 5-day
+        forward return (%) at the rank the raw prediction occupies.
+
+        This is the honest *magnitude* counterpart to ``predict_percentile``:
+        where the percentile answers "how bullish, in rank terms", this
+        answers "what return does that rank historically correspond to".
+        Use it over the raw ``predict()`` for any human-facing magnitude —
+        the deployed scorer's OOS verdict is ``DIRECTIONAL_BUT_BIASED``, so a
+        raw ``+8%`` is unreliable as ``+8%`` but trustworthy as a rank.
+
+        Returns None when the model is untrained, the prediction failed /
+        went non-finite, or the loaded pickle predates the ``label_quantiles``
+        table (legacy compatibility). Never raises — mirrors
+        ``predict_percentile`` / ``predict_with_meta``.
+        """
+        return self.predict_with_meta(
+            ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
+            vol_ratio=vol_ratio, bb_pos=bb_pos, news_urgency=news_urgency,
+            news_article_count=news_article_count,
+        )["calibrated"]
 
     def predict_percentile(
         self,
@@ -870,16 +968,40 @@ def train_scorer(records: list[dict]) -> dict:
         print(f"[decision_scorer] pred-quantile build failed: {e}")
         pred_quantiles = None
 
+    # Label-calibration table: 101 sorted quantile breakpoints of the
+    # realized training LABELS (`y` — clamped, SELL-sign-flipped forward
+    # returns). predict_calibrated() / _raw_to_calibrated() pair this with
+    # `pred_quantiles` to quantile-map a raw prediction onto the empirical
+    # return distribution — the honest magnitude reading the documented
+    # DIRECTIONAL_BUT_BIASED verdict calls for. Same best-effort discipline
+    # as pred_quantiles: any failure leaves it None and a legacy-style
+    # pickle results (predict_calibrated then degrades to None). `y` is the
+    # exact label space the model was fit against (post clamp + SELL flip),
+    # so the calibration is apples-to-apples with the prediction space.
+    label_quantiles = None
+    try:
+        y_finite = y[np.isfinite(y)]
+        if y_finite.size >= 2:
+            label_quantiles = [
+                float(v) for v in
+                np.percentile(y_finite, np.arange(0, 101))
+            ]
+    except Exception as e:
+        print(f"[decision_scorer] label-quantile build failed: {e}")
+        label_quantiles = None
+
     _tmp = SCORER_PATH.with_suffix(".pkl.tmp")
     with _tmp.open("wb") as f:
         pickle.dump({"model": model, "scaler": scaler, "n_train": n_pickle,
-                     "pred_quantiles": pred_quantiles}, f)
+                     "pred_quantiles": pred_quantiles,
+                     "label_quantiles": label_quantiles}, f)
     _tmp.replace(SCORER_PATH)
 
     return {"status": "ok", "n": n_pickle, "val_rmse": val_rmse,
             "n_label_clamped": n_label_clamped,
             "n_label_dropped": n_label_dropped,
-            "n_pred_quantiles": len(pred_quantiles) if pred_quantiles else 0}
+            "n_pred_quantiles": len(pred_quantiles) if pred_quantiles else 0,
+            "n_label_quantiles": len(label_quantiles) if label_quantiles else 0}
 
 
 # ---------------------------------------------------------------------------
@@ -1016,6 +1138,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  rank percentile: {_pct:.1f}  (position in the training "
               f"prediction distribution — trust this over the raw %, the "
               f"OOS verdict is DIRECTIONAL_BUT_BIASED)")
+    _cal = meta.get("calibrated")
+    if _cal is not None:
+        print(f"  calibrated 5d return: {_cal:+.2f}%  (raw quantile-mapped "
+              f"onto the realized-return distribution — the honest magnitude; "
+              f"preserves rank, corrects the documented % bias)")
     rows = contrib.get("contributions") or []
     if rows:
         print(f"  baseline={contrib.get('pred_baseline', 0.0):+.2f}%   "
