@@ -17484,3 +17484,64 @@ python3 -m pytest tests/ -v                                  # full (~25min unde
 python3 -m pytest tests/test_core_*.py -q                    # core slice
 python3 -m pytest tests/test_core_strategy.py -q -k SignalAge # this pass's feature
 ```
+
+## 2026-05-22 — Agent 1 (paper-trader core) HYBRID review pass
+
+### Phase 1: Debug — 0 bugs fixed
+
+Read the seven core files in full (`runner`, `reporter`, `signals`,
+`strategy`, `dashboard`, `market`, `store`) plus `conftest.py` and the
+hourly/daily report bodies. Ran the core test slice — 784 tests green.
+After 30+ prior review passes the marginal core bug is exhausted; no
+genuine defect found, so no Phase-1 commit (the commit guard explicitly
+allows `bugs_fixed=0`). Re-cleared `_execute`, `_choose`, `_window_delta`,
+`_kill_stale_claude`, `store.upsert_position` / `closed_positions`
+round-trip walk, and the half-day / clock-step-back paths — all already
+correct and already covered by the existing suite (`test_core_runner.py`
+half-day class, `test_core_strategy.py`, etc.).
+
+### Phase 2: Feature — BLOCKED-decision causes in the Discord reports
+
+`reporter._classify_block_reason` + `reporter._blocked_reasons_line`,
+wired into `send_hourly_summary` (1h window) and `send_daily_close`
+(24h). The hourly `_session_block` already shows a bare `blocked N`
+count, but a count is not actionable: 3 blocks on *insufficient cash*
+(desk over-deployed, Opus keeps trying to add) is a different problem
+from 3 on *no price* (yfinance outage) or 3 on *oversell* (Opus
+mis-sizing its own book). The new line reads each BLOCKED row's `detail`
+out of `decisions.reasoning` (the JSON blob `strategy.decide` writes),
+buckets it via `_BLOCK_REASON_BUCKETS`, and renders the dominant cause
+(`**BLOCKED** ◈ 3 blocked decisions last 1h > insufficient cash ×2, no
+price ×1`). Silence-by-default, pure store read, additive failure
+contract — placed right after the NO_DECISION CAUSE line (the natural
+pair: that one is "Opus failed to respond", this is "the response
+failed to execute"). 32 new tests in `tests/test_blocked_reasons_reporter.py`.
+Commit `aa42566`.
+
+### Phase 3: Live validation findings (live trader ~01:27 UTC)
+
+1. **Recent decisions all NO_DECISION.** Last ~4 cycles (01:22, 01:19,
+   01:12, 00:51) recorded NO_DECISION with healthy `signal_count`
+   (24–26) — signals.py is fine; Claude is being starved. Consistent
+   with the documented host-saturation pathology (concurrent Opus
+   review agents + backtest committee on a 15 GB box). Not a code bug;
+   the runner correctly records each cycle and the host guard declines
+   doomed calls.
+2. **`/api/buying-power` hot-polled every ~3 s** by the dashboard
+   front-end (vs ~15–30 s for other endpoints). Returns 200 fast, but
+   an oddly aggressive poll loop in the TEMPLATE JS. Minor; not fixed
+   (front-end change, not surgical).
+3. **Healthy surfaces.** `/api/portfolio` fresh ($1000.14, 1 NVDA lot
+   65.8% of book, P/L −$11.80); `/api/risk` correctly flags
+   `concentration_severity=HIGH`; `/api/healthz` `ok=true`, lock
+   `acquired`, last decision 318 s old. Runner `behind=2` commits
+   (git-watcher restart pending — expected).
+
+### Test commands
+
+```
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/ -v                                       # full (~25min under load)
+python3 -m pytest tests/test_core_*.py -q                         # core slice (784 tests)
+python3 -m pytest tests/test_blocked_reasons_reporter.py -q        # this pass's feature (32 tests)
+```
