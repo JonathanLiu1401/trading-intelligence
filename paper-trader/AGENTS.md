@@ -6,6 +6,65 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-22 feature-dev pass (Agent 4) — `/api/position-blowup` (per-name single-name shock ladder)
+
+Wired another fully-built but **endpoint-less AND test-less** diagnostic onto
+the dashboard — the recurring "no operator can see it" gap, this time with the
+extra gap that the builder shipped with **zero test coverage**.
+
+### The gap
+
+`/api/stress-scenarios` shocks only the **largest** position alone at −10 %
+(`single_name_gap`); `/api/risk` flags `concentration_top1` as a *weight* but
+never the *dollar damage*; `/api/tail-risk` reads INSUFFICIENT until the book
+has ≥20 daily returns. None of them answer the discretionary trader's first
+concentrated-book question: *if THIS name alone gaps −25/−50/−100 %, what does
+it cost me — for every held name, sorted worst-first?* On the live book that
+question has teeth: NVDA is **65.8 % of equity**, so a single-name surprise
+(downgrade, lawsuit, accounting blow-up) — the idiosyncratic tail the SPY-shock
+and earnings-σ models structurally miss — is the dominant risk.
+
+`paper_trader/analytics/position_blowup.py` already did the work: a pure,
+never-raises `build_position_blowup` (weight×shock arithmetic, options ×100,
+concentration-aware `DIFFUSE`/`MODERATE`/`CONCENTRATED` verdict ladder) shipped
+with a CLI — but reachable from **no route** and covered by **no test**.
+
+### The fix
+
+New `/api/position-blowup` route in `dashboard.py` — a thin `@swr_cached`
+wrapper that reuses `build_position_blowup` **verbatim** fed by
+`store.open_positions()` + `pf['total_value']` (SSOT, invariant #10 — same
+shape as the sibling `/api/stress-scenarios` route; the panel and the
+`-m paper_trader.analytics.position_blowup` CLI can never disagree). NO_DATA
+degradations stay HTTP 200; only a genuine exception escaping the route is a
+500. Observational only — never gates Opus, adds no caps (invariants #2/#12).
+Registered in `_swr_prewarm.targets` so the panel never cold-stalls on
+`{"warming": true}` post-restart (the `prewarm == @swr_cached` invariant).
+
+New trader-pane panel `🧨 Position blow-up ladder` (sibling of the Risk
+panel) — a worst-first table of every held name at −10/−25/−50/−100 %, JS
+`refreshPositionBlowup()` on the 30s cadence.
+
+### Live evidence at merge
+
+```
+/api/position-blowup → CONCENTRATED · 1 position · $1000 book
+  NVDA  65.8% of book   −25% costs −$164.62 (−16.5%)   to zero −$658.50 (−65.8%)
+```
+
+### Tests
+
+`tests/test_position_blowup.py` — **new file, 21 tests**: the builder's first
+coverage (NO_DATA degradations, exact shock arithmetic, `max_loss` = −market
+value, options ×100, `market_value` preferred over price×qty, zero-value-row
+skip, the `DIFFUSE`/`MODERATE`/`CONCENTRATED` ladder incl. the inclusive-at-40
+boundary, worst-first sort, malformed-row tolerance) + 4 endpoint tests
+(payload passthrough, NO_DATA → 200, builder-raises → shaped 500, SSOT-parity
+with the builder on the live store). 24 pass with the `swr_prewarm_coverage`
+invariant; 359 pass across the dashboard/endpoint/risk sibling suites.
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #9 (Agent 2) — `cost_drag` (transaction-cost realism audit)
 
 **Phase 1 — bugs_fixed: 0 (honest zero).** Re-read `paper_trader/ml/decision_scorer.py`,
