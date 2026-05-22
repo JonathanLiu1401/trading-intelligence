@@ -737,6 +737,33 @@ _RT_WHY_PCT_AFTER = re.compile(
     re.IGNORECASE,
 )
 
+# "<Company> Earnings: A Quick Glance at Key Metrics" — the Zacks Investment
+# Research post-earnings recap-mill template. By definition retrospective: the
+# print has already crossed the wire and the "Quick Glance" summary is written
+# AFTER the fact. NOT breaking news — a standalone 🚨 BREAKING push on it tells
+# the analyst nothing they can trade.
+#
+# Live evidence (2026-05-21 NVDA earnings night, articles.db urgency=2 set):
+# "NVIDIA Earnings: A Quick Glance at Key Metrics" reached urgency=2 THREE
+# times — YahooFinance/NVDA (ml_score 9.9), yfinance/Zacks (ml_score 9.7), and
+# GN: Nvidia (ai_score 9.0 — Sonnet itself over-scored it, so the urgency_
+# scorer pre-floor missed it before this gate existed). All three publishers
+# are above the 0.45 ALERT_MIN_LONE_SOURCE_CRED bar so the source-authority
+# gate does not catch it; content type IS the failure, same class as
+# `_RT_EARNINGS_CALL` (post-earnings "Q1 2026 Earnings Call Highlights").
+#
+# Discriminator: the verbatim Zacks signature phrase "a quick glance at
+# [key] [financial] metrics". Substring (not anchored ^) — the phrase appears
+# mid-headline after the "<Company> Earnings:" lead, exactly like
+# `_RT_EARNINGS_CALL`. No real breaking headline contains this phrase, so the
+# `key`/`financial` qualifiers are optional without false-positive risk.
+# Validated against the must-survive corpus: real earnings movers ("Nvidia Q1
+# revenue rises 22%", "MU earnings blow past estimates") do NOT match.
+_RT_QUICK_GLANCE = re.compile(
+    r"\ba\s+quick\s+glance\s+at\s+(?:key\s+)?(?:financial\s+)?metrics\b",
+    re.IGNORECASE,
+)
+
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
@@ -752,6 +779,7 @@ _RECAP_TEMPLATE_PATTERNS = (
     ("why_pct_after", _RT_WHY_PCT_AFTER),
     ("market_today_dated", _RT_MARKET_TODAY),
     ("earnings_call_recap", _RT_EARNINGS_CALL),
+    ("quick_glance_metrics", _RT_QUICK_GLANCE),
     ("earnings_tomorrow_preview", _RT_EARNINGS_TOMORROW),
     ("todays_movers_list", _RT_TODAYS_MOVERS),
     ("is_buy_after", _RT_IS_BUY_AFTER),
