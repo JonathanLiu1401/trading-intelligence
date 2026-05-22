@@ -2690,7 +2690,7 @@ function renderLegend() {
     const retTxt = ann != null ? ((ann >= 0 ? "+" : "") + fmt(ann) + "%/yr") : "—";
     const durYrs = r.duration_days ? (r.duration_days / 365.25).toFixed(1) + "yr" : "";
     return `<div class="bt-legend-row${hidden ? ' hidden-run' : ''}${selected ? ' selected' : ''}" onclick="selectRun(${r.run_id})">
-      <input type="checkbox" ${hidden ? '' : 'checked'} onclick="event.stopPropagation();toggleRun(${r.run_id})">
+      <input type="checkbox" aria-label="Toggle visibility of backtest run #${r.run_id}" ${hidden ? '' : 'checked'} onclick="event.stopPropagation();toggleRun(${r.run_id})">
       <span class="bt-swatch" style="background:${color};"></span>
       <span class="name">#${r.run_id} <span class="muted" style="font-size:10px;">${durYrs}</span>${r.status === 'running' ? ' <span class="spinner" style="width:8px;height:8px;border-width:1px;margin:0 0 0 4px;"></span>' : ''}</span>
       <span class="ret ${retCls}">${retTxt}</span>
