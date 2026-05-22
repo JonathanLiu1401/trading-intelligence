@@ -128,6 +128,7 @@ from ml.trainer import train_continuous
 from ml.recursive_labeler import run_recursive_labeling
 from core.retrain_guard import should_alert as _ml_retrain_should_alert
 from core.retrain_guard import alert_message as _ml_retrain_alert_message
+from core.retrain_guard import is_retrain_failure as _ml_retrain_is_failure
 
 # ── Config ──────────────────────────────────────────────────────────────────
 HEARTBEAT_INTERVAL  = 5 * 3600   # 5h
@@ -2383,31 +2384,62 @@ def ml_trainer_worker(store: ArticleStore):
     # ArticleNet from retraining for a whole daemon lifetime while these logs
     # stayed at WARNING (invisible to the ERROR/CRITICAL healthcheck grep).
     # Escalate to Discord once the failures persist so it can't recur silently.
+    #
+    # CRITICAL: ml_train()/train() catches every internal error and RETURNS a
+    # status dict ({"status": "error", "reason": "subprocess_timeout"}, ...)
+    # instead of raising. The try/except below therefore never observes the
+    # most common real failure mode — so a returned-error cycle must be
+    # classified explicitly (``_ml_retrain_is_failure``) and counted, or a
+    # trainer that times out every cycle escalates nothing (observed live
+    # 2026-05-22: subprocess_timeout after 659.5s, consec_fail stuck at 0).
     consec_fail = 0
     while _running:
         _sleep(ML_TRAIN_INTERVAL)
+        failed = False
+        last_err = ""
         try:
             log.info("[ml_trainer] Retraining on accumulated labels...")
             metrics = ml_train(store)
-            val = metrics.get("val_loss")
-            val_str = f"{val:.4f}" if isinstance(val, (int, float)) else "n/a"
-            log.info(f"[ml_trainer] Retrain: n={metrics.get('n')} "
-                     f"loss={metrics.get('final_loss', 0):.4f} "
-                     f"val_loss={val_str} "
-                     f"elapsed={metrics.get('elapsed_s', 0):.0f}s")
-            record_metric("ml.train.loss", metrics.get("final_loss", 0),
-                          {"n": metrics.get("n", 0), "phase": "retrain"})
-            _worker_last_ok["ml_trainer"] = time.time()
-            consec_fail = 0
+            if _ml_retrain_is_failure(metrics):
+                failed = True
+                last_err = (
+                    (metrics.get("reason") or metrics.get("status") or "unknown")
+                    if isinstance(metrics, dict) else str(metrics)
+                )
+                log.warning(f"[ml_trainer] Retrain failed: {metrics}")
+            else:
+                val = metrics.get("val_loss")
+                val_str = f"{val:.4f}" if isinstance(val, (int, float)) else "n/a"
+                fl = metrics.get("final_loss")
+                fl_str = f"{fl:.4f}" if isinstance(fl, (int, float)) else "n/a"
+                log.info(f"[ml_trainer] Retrain: status={metrics.get('status')} "
+                         f"n={metrics.get('n')} loss={fl_str} "
+                         f"val_loss={val_str} "
+                         f"elapsed={metrics.get('elapsed_s', 0):.0f}s")
+                # Only a real completed cycle records a loss metric — a
+                # "skipped" no-op has no final_loss and recording 0 would
+                # plant a misleading perfect-loss point in the metrics log.
+                if metrics.get("status") == "ok":
+                    record_metric("ml.train.loss", metrics.get("final_loss", 0),
+                                  {"n": metrics.get("n", 0), "phase": "retrain"})
+                _worker_last_ok["ml_trainer"] = time.time()
+                consec_fail = 0
         except MemoryError:
+            # GPU OOM has its own backoff path and is not counted toward the
+            # consecutive-failure escalation (unchanged from prior behaviour).
             _handle_memory_error("ml_trainer")
         except Exception as e:
+            failed = True
+            last_err = str(e)
+            log.warning(f"[ml_trainer] Retrain exception: {e}")
+        if failed:
             consec_fail += 1
-            log.warning(f"[ml_trainer] Retrain error (#{consec_fail}): {e}")
+            log.warning(f"[ml_trainer] retrain failure #{consec_fail} — {last_err}")
             if _ml_retrain_should_alert(consec_fail):
                 try:
-                    discord_send(_ml_retrain_alert_message(consec_fail, str(e)),
-                                 is_alert=True)
+                    discord_send(
+                        _ml_retrain_alert_message(consec_fail, last_err),
+                        is_alert=True)
                 except Exception as alert_err:
                     log.warning(f"[ml_trainer] failed to send stuck alert: {alert_err}")
 
