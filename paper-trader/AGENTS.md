@@ -6,6 +6,85 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-21 ML+backtest HYBRID pass #7 (Agent 2) — `corpus_diversity` (gate-eligibility audit)
+
+**Phase 1 — bugs_fixed: 0 (honest zero).** Re-audited `decision_scorer.py`
+(`build_features`, `_to_float`, `train_scorer` dedup + label clamp + the
+`pred_quantiles` table, `predict_with_meta`/`feature_contributions`/
+`feature_importance`), `backtest.py` (`_ml_decide` gate arms, `_buy`/`_sell`,
+`_enforce_risk_exits` stop/take, `_execute_decision` bubble gate, `PriceCache`
+walk-back + `resolved_close_date`, `_macd`/`_rsi`/`_compute_technical_indicators`)
+and `run_continuous_backtests.py` (`_compute_decision_outcomes`, the parse
+helpers, the three skill ledgers, `_inject_and_train`, `main`). All target
+code is exhaustively hardened by ~15 prior passes; the 559 focused
+ml/backtest/scorer tests pass green. No real bug, race, or dead code found —
+no Phase 1 commit.
+
+**Phase 2 — features_added: 1 — `paper_trader/ml/corpus_diversity.py`.**
+The `_ml_decide` conviction gate (invariant #5) engages only at the deployed
+scorer's `n_train >= 500`, yet `decision_outcomes.jsonl` holds thousands of
+rows — so why does the pickle keep reporting `n_train` in the hundreds? The
+answer is the dedup `train_scorer` applies on `(ticker, sim_date, action)`
+(**run_id-free** — so `outcome_data_quality`'s run_id-inclusive conflict key
+cannot see the cross-run collapse, and `corpus_audit` only validates OOS-split
+honesty). No existing tool reports the gate-relevant question: *after that
+dedup, how many distinct trainable samples will the gate see?* This module
+does. `analyze()` faithfully replays the loop pipeline (last
+`MAX_OUTCOMES_FOR_TRAINING` rows → `split_outcomes_temporal` 80/20 → train
+slice → dedup → finite-label validation) so its `trainable_n` equals the
+deployed pickle's `n_train` by construction (a no-drift cross-check, locked by
+a test that asserts `trainable_n == train_scorer(...)['n']`). Verdict:
+`INSUFFICIENT_DATA` / `GATE_STARVED` / `GATE_ELIGIBLE`; CLI exits 2 on
+`GATE_STARVED` (cron-guard convention) and the module auto-registers in the
+`python3 -m paper_trader.ml` launcher index. Read-only — never trains, never
+writes the pickle or any data file. Tests: `tests/test_corpus_diversity.py`
+(25 cases — exact distinct counts, the run_id-free dedup key, the
+keep-highest-`return_pct` tie-break, finite-label drops, the 500-gate
+boundary, `dedup_ratio`, collision surfacing, `analyze` tail/split funnel,
+and the `train_scorer` no-drift cross-check).
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.corpus_diversity
+cd /home/zeph/trading-intelligence/paper-trader && python3 -m pytest tests/test_corpus_diversity.py -v
+```
+
+**Phase 3 — user_findings: 5.**
+1. **Continuous backtest loop dormant ~60 h.** `continuous.log` frozen at
+   2026-05-18 12:03; last loop-sequence run is 6243 (stuck `running`).
+   `scorer_freshness` = `INSUFFICIENT_DATA` ("heartbeat unverifiable" — no
+   `scorer_skill_log.jsonl` exists despite the pass-#15 wiring); none of the
+   three per-cycle ledgers (`scorer_skill_log` / `baseline_skill_log` /
+   `llm_annotation_skill_log`) are on disk. Operational, not a code defect.
+2. **Deployed `decision_scorer.pkl` is stale AND gate-inactive.** It carries
+   `n_train=400` (< 500 floor, so the gate is OFF), age 60 h. But
+   `corpus_diversity` on the live corpus reports `GATE_ELIGIBLE` with
+   `trainable_n=3959` — a single retrain would produce a gate-active model.
+   The system is leaving a gate-active scorer unbuilt because the loop is
+   not running. (Pass #6 estimated `n_train≈4943`; `corpus_diversity` gives
+   the *exact* post-split figure, 3959.)
+3. **Deployed pickle is legacy (`pred_quantiles=None`).** The pass-#6
+   `predict_percentile()` / the `--explain` "rank percentile" line are
+   no-ops against the live model until the next retrain writes the quantile
+   table — verified: `decision_scorer --explain --ticker NVDA` prints no
+   percentile line.
+4. **`baseline_compare` = `MLP_ADDS_SKILL` (+0.225 OOS rank-IC) is not
+   bankable.** `corpus_audit` = `OOS_NOT_HELD_OUT`: the corpus spans only 6
+   distinct runs, so the OOS slice shares every `run_id` with train — that
+   "+0.225" is a within-window front/back split, not a generalization test.
+   A skeptical quant cannot size real capital on it until the corpus spans
+   genuinely held-out windows.
+5. **LLM-annotation pipeline dark** — 0/7413 rows carry a non-zero
+   `llm_quality_label`; the `ENDORSE/CONDEMN` 3×/0.1× training-weight column
+   is entirely unpopulated (corroborates the existing `llm_annotation_skill`
+   `pipeline_dark` finding). Also: 2 orphaned `running` rows + 24 `failed` in
+   `backtest.db`; manual runs 99001/90001 completed with 0 trades / 0.0 %.
+
+All Phase 3 findings are operational (loop not running) — no Phase 3 fix
+commit; the agent did **not** unilaterally restart the loop or retrain the
+pickle.
+
+---
+
 ## 2026-05-21 feature-dev pass (Agent 4) — `SUBPROCESS_ERROR` failure mode (CLI-crash classifier gap)
 
 A live-data audit of the NO_DECISION failure taxonomy. `/api/decision-reliability`
