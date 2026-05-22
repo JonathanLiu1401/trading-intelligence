@@ -1207,6 +1207,30 @@
   {
    "name": "Kiplinger",
    "url": "https://www.kiplinger.com/feeds/all.rss"
+  },
+  {
+   "name": "Electrek EV",
+   "url": "https://electrek.co/guides/electric-vehicles/feed"
+  },
+  {
+   "name": "Electrek",
+   "url": "https://electrek.co/feed"
+  },
+  {
+   "name": "CleanTechnica",
+   "url": "https://cleantechnica.com/feed/"
+  },
+  {
+   "name": "Canary Media",
+   "url": "https://www.canarymedia.com/articles.rss"
+  },
+  {
+   "name": "InsideEVs",
+   "url": "https://insideevs.com/rss/articles/all/"
+  },
+  {
+   "name": "Carbon Brief",
+   "url": "https://www.carbonbrief.org/feed"
   }
  ],
  "twitter_accounts": [
