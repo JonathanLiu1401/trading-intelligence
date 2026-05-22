@@ -1051,6 +1051,7 @@ RULES:
 - If a "COVERAGE GAP" block is present in the data input, reproduce it as a **COVERAGE GAP** section (one bullet per dark channel, verbatim). These are intel channels the system could NOT collect from this window — the analyst must know what they are blind to, not assume silence means calm. Omit the section entirely if no gap block is provided.
 - If a "THROUGHPUT DEGRADATION" block is present in the data input, reproduce it as a **THROUGHPUT DEGRADATION** section directly under the COVERAGE GAP bullets (one bullet per source, verbatim). These sources are still alive but have lost most of their recent flow — partial blind spots an analyst must know about (the early-warning complement to COVERAGE GAP: a marginally-alive source has not crossed the disable threshold yet, but the briefing has materially less coverage from it than the prior window). Omit the section entirely if no degradation block is provided.
 - If an "ALERT VELOCITY" block is present in the data input, reproduce it as an **ALERT VELOCITY** section under the THROUGHPUT DEGRADATION bullets (one bullet, verbatim). This is the BREAKING-alert wire's firing-rate vs the prior window of the same length: an objective magnitude signal independent of any individual story's score. Use it for cumulative framing — a "wire materially hot" window means cumulative event flow is itself the story (weight the LEAD accordingly: macro/risk regime, not a lone headline); a "wire silent" window means scrutinise any one BREAKING-tagged story more carefully. Omit the section entirely if no velocity block is provided.
+- If an "ML SCORER STALE" block is present in the data input, reproduce it as an **ML SCORER STALE** section directly under the ALERT VELOCITY bullet (one bullet, verbatim). It means the local ArticleNet model that scores every collected article — and produces the "[model]" urgent calls — has not successfully retrained for several hours, so its relevance/urgency scores are running on stale weights. Treat "[model]"-tagged rows with extra caution this window and lean harder on LLM-vetted (untagged) rows when choosing the LEAD and ranking TOP SIGNALS. Omit the section entirely if no stale block is provided.
 - If an "ALERT BOOK VELOCITY" block is present, it lists held names mentioned in MULTIPLE 🚨 BREAKING alerts in the recent window vs the prior window of the same length — per-position alert-rate magnitude. The per-row [BOOK:] tag flags WHICH rows touch the held book; this block flags that the held name is itself the WINDOW'S hot centre of breaking-wire activity (≥2 distinct alerts mention it). Weight these held names above other rows of comparable score when choosing the LEAD and ordering TOP SIGNALS, and give them a concrete forward-looking implication in the PORTFOLIO table. This is a ranking/weighting hint only — do NOT echo a literal "ALERT BOOK VELOCITY" section in the output (same as BOOK HEAT / BOOK SILENCE / AGING TOP ROWS, unlike COVERAGE GAP).
 - If a "PRIOR DIGEST" block is present, it is the LEAD and TOP SIGNALS YOU YOURSELF published in your previous 5h briefing — the analyst just read that one. Re-leading the SAME story as if it were new is the single most-cited "repetitive digest" complaint. If the dominant story is materially unchanged, do NOT restate it as the LEAD: lead instead with what has CHANGED since (a new level/print/catalyst, a reversal, or a genuinely different top story that now outranks it), and frame any necessarily-carried theme explicitly as continuation/development ("rout now easing", "follows this morning's selloff"), never as a fresh break. This is a framing/selection hint only — do NOT echo a literal "PRIOR DIGEST" section in the output (same as BOOK HEAT / AGING TOP ROWS, unlike COVERAGE GAP).
 - If a "MACRO CALENDAR" block is present in the data input, reproduce it as a **MACRO CALENDAR** section directly above the DESK NOTE (one bullet per scheduled event, verbatim). These are scheduled forward catalysts — FOMC rate decisions, BLS CPI/Jobs/PPI releases — within the next 72h that materially reshape risk for a leveraged-ETF-heavy book. An imminent TODAY/TOMORROW FOMC or CPI is the single biggest market-wide event; the LEAD must explicitly factor it (e.g. "ahead of FOMC tomorrow", "into Friday's jobs print") and the RISK / CATALYST section must NAME each upcoming event with its remaining timing. A 5h+ horizon shifts how every individual story should be weighted — a strong move into a Fed decision is positioning, not pure signal. Omit the section entirely if no macro block is provided.
@@ -1107,6 +1108,9 @@ AMD   $xxx  +x.xx%  |  AMAT $xxx +x.xx%  |  SMH  $xxx  +x.xx%
 
 **ALERT VELOCITY** (only if a velocity block is provided — else omit this whole section)
 - [BREAKING-wire firing rate verbatim from the ALERT VELOCITY data block]
+
+**ML SCORER STALE** (only if a stale block is provided — else omit this whole section)
+- [scorer staleness verbatim from the ML SCORER STALE data block]
 
 **MACRO CALENDAR** (only if a macro block is provided — else omit this whole section)
 - [scheduled FOMC / CPI / Jobs / PPI event verbatim from the MACRO CALENDAR data block]
@@ -1867,10 +1871,114 @@ def _aging_top_rows(
     return out
 
 
+# ── ML scorer freshness (operational-status family) ──────────────────────────
+# ArticleNet scores EVERY collected article and produces the [model]-tagged
+# urgent calls. When the ml_trainer worker fails persistently the model
+# silently stops learning new labels — observed live 2026-05-22: train()
+# returns {"status":"error","reason":"subprocess_timeout"} every cycle, and
+# data/ml/training_metrics.jsonl had not been appended for ~80h. COVERAGE GAP
+# tells the analyst which COLLECTORS went dark; nothing told them the SCORER
+# itself went stale. This is the missing read — same surfacing discipline as
+# COVERAGE GAP / THROUGHPUT DEGRADATION / ALERT VELOCITY: a separate input
+# block, REPRODUCED as a one-line section, omitted entirely when the model is
+# fresh so it never becomes noise.
+#
+# Source: data/ml/training_metrics.jsonl — ml.trainer._log_metrics appends one
+# JSON line per SUCCESSFUL train/continuous cycle (the skipped/error paths
+# return before logging), so the last line's ``ts`` is the last successful
+# retrain. Resolved via the same DIGITAL_INTERN_ML_DIR env convention
+# ml.trainer uses — NOT by importing ml.trainer, which would pull torch into
+# the light analysis layer (same anti-import-weight discipline as
+# article_store._briefing_domain_key duplicating ml.features). Pure stdlib.
+#
+# Pure read-side: no DB write, no ai_score/ml_score/score_source/urgency
+# touch, never reads or mutates source_articles — all four load-bearing
+# invariants intact by construction.
+
+# Warn when the last successful retrain is older than this. ArticleNet
+# retrains every ~30min (daemon.ML_TRAIN_INTERVAL) so a multi-hour gap means
+# the trainer is genuinely stuck, not mid-cycle. 6h is conservative — it
+# spans more than one full 5h briefing window, well clear of normal churn.
+_ML_STALE_WARN_HOURS = 6.0
+_ML_METRICS_FILENAME = "training_metrics.jsonl"
+
+
+def _collect_ml_freshness() -> dict | None:
+    """Best-effort: ISO ts of the last SUCCESSFUL ArticleNet retrain.
+
+    Returns ``{"last_ts": str}`` from the final parseable line of
+    ``data/ml/training_metrics.jsonl`` (ml.trainer logs one line per
+    successful cycle), or ``None`` on ANY failure (missing/empty/corrupt
+    file) — an ML-freshness read must NEVER break or delay the 5h briefing
+    it annotates (identical discipline to ``_collect_source_health`` /
+    ``_collect_alert_velocity``)."""
+    try:
+        import os
+        import json as _json
+        from pathlib import Path
+        ml_dir = Path(os.environ.get(
+            "DIGITAL_INTERN_ML_DIR",
+            Path(__file__).resolve().parent.parent / "data" / "ml",
+        ))
+        path = ml_dir / _ML_METRICS_FILENAME
+        last_ts = None
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = _json.loads(line)
+                except Exception:
+                    continue
+                ts = rec.get("ts") if isinstance(rec, dict) else None
+                if isinstance(ts, str) and ts:
+                    last_ts = ts
+        if not last_ts:
+            return None
+        return {"last_ts": last_ts}
+    except Exception:
+        return None
+
+
+def _ml_freshness_lines(
+    freshness: dict | None,
+    now: datetime | None = None,
+    warn_hours: float = _ML_STALE_WARN_HOURS,
+) -> list[str]:
+    """Pure: 0 or 1 analyst-facing line on ArticleNet scorer staleness.
+
+    Emits a single line ONLY when the last successful retrain is older than
+    ``warn_hours``. A fresh model, an unknown/unparseable ts, or a future ts
+    (clock skew) returns ``[]`` so the caller omits the whole section — the
+    same "omit when healthy" discipline as ``_coverage_gap_lines`` /
+    ``_alert_velocity_lines``. Pure — no DB / IO / mutation."""
+    if not isinstance(freshness, dict):
+        return []
+    last_ts = freshness.get("last_ts")
+    if not isinstance(last_ts, str) or not last_ts:
+        return []
+    try:
+        dt = datetime.fromisoformat(last_ts.strip().replace("Z", "+00:00"))
+    except Exception:
+        return []
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    age_h = (now - dt).total_seconds() / 3600.0
+    if age_h < warn_hours:
+        return []
+    return [
+        f"ArticleNet scorer last retrained ~{age_h:.1f}h ago "
+        f"(target every ~30min) — NN relevance/urgency scores and any "
+        f"[model]-tagged urgent calls are running on stale weights"
+    ]
+
+
 def _build_payload(articles, stock_data, earnings, source_health_report=None,
                    prior_digest=None, source_throughput=None,
                    alert_velocity=None, alert_book_velocity=None,
-                   macro_calendar_events=None):
+                   macro_calendar_events=None, ml_freshness=None):
     parts = [f"BRIEFING TIME: {_now_utc_str()}\n"]
 
     macro_data   = stock_data.get("macro", [])   if isinstance(stock_data, dict) else []
@@ -2167,6 +2275,25 @@ def _build_payload(articles, stock_data, earnings, source_health_report=None,
             for al in av_lines:
                 parts.append(f"  - {al}")
 
+    # ML-scorer-staleness block — operational-status family, REPRODUCED (like
+    # COVERAGE GAP / THROUGHPUT DEGRADATION / ALERT VELOCITY). Only emitted
+    # when an explicit freshness dict is supplied (analyze() reads it live)
+    # AND the model is materially stale; a fresh model emits nothing so the
+    # prompt's "omit if no stale block" rule fires and the common path stays
+    # byte-deterministic — exact same shape as the alert_velocity block above
+    # (the documented anti-drift discipline). Pure read-side: no DB write, no
+    # ai_score/ml_score/score_source/urgency touch, never reads or mutates
+    # source_articles — all four load-bearing invariants intact.
+    if ml_freshness is not None:
+        ml_lines = _ml_freshness_lines(ml_freshness)
+        if ml_lines:
+            parts.append(
+                "\n=== ML SCORER STALE (local ArticleNet has not retrained "
+                "for hours — scores running on stale weights) ==="
+            )
+            for ml in ml_lines:
+                parts.append(f"  - {ml}")
+
     # Alert-book-velocity block — per-held-ticker BREAKING-alert magnitude.
     # ALERT VELOCITY measures the OVERALL wire firing rate; this is the
     # per-position complement, reading the SAME canonical fires log
@@ -2225,6 +2352,7 @@ def analyze(articles, stock_data, earnings):
         alert_velocity=_collect_alert_velocity(),
         alert_book_velocity=_collect_alert_book_velocity(),
         macro_calendar_events=_collect_macro_calendar_events(),
+        ml_freshness=_collect_ml_freshness(),
     )
     full_prompt = f"{SYSTEM_PROMPT}\n\n---\nDATA INPUT:\n{payload}"
     result = claude_call(full_prompt, model=MODEL, timeout=180)
