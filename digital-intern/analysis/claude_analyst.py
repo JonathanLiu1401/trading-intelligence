@@ -1545,12 +1545,25 @@ _BRIEFING_RT_GF_VALUE = re.compile(
     r"\bgf\s+value\s+says\b",
     re.IGNORECASE,
 )
+# "<Company> Earnings: A Quick Glance at Key Metrics" — Zacks post-earnings
+# recap-mill template (lockstep mirror of watchers.alert_agent._RT_QUICK_GLANCE).
+# Live evidence (2026-05-21 NVDA earnings night): "NVIDIA Earnings: A Quick
+# Glance at Key Metrics" reached urgency=2 with ml_score 9.9 — so it scores
+# straight into the briefing's top-50 pool and would surface as a fresh TOP
+# SIGNAL despite being a retrospective post-print summary. Same earnings-recap
+# class as `_BRIEFING_RT_EARNINGS_CALL`; substring (not anchored) since the
+# phrase follows the "<Company> Earnings:" lead.
+_BRIEFING_RT_QUICK_GLANCE = re.compile(
+    r"\ba\s+quick\s+glance\s+at\s+(?:key\s+)?(?:financial\s+)?metrics\b",
+    re.IGNORECASE,
+)
 
 _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _BRIEFING_RT_WHY_TRADING),
     ("why_did_stock", _BRIEFING_RT_WHY_DID),
     ("market_today_dated", _BRIEFING_RT_MARKET_TODAY),
     ("earnings_call_recap", _BRIEFING_RT_EARNINGS_CALL),
+    ("quick_glance_metrics", _BRIEFING_RT_QUICK_GLANCE),
     ("street_thinks", _BRIEFING_RT_STREET_THINKS),
     ("gf_value_says", _BRIEFING_RT_GF_VALUE),
 )
