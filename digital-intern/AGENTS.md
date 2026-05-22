@@ -8673,3 +8673,81 @@ artefacts, concurrent-agent staging discipline held).
 source.py` were included. AGENTS.md committed alongside the related
 code in this same documentation step.
 
+## 2026-05-22 — Hybrid pass (retrain-failure escalation blind spot + stale-scorer briefing block)
+
+Debugger + feature-dev + news-analyst pass. Three commits on master
+(Phase 1 fix, Phase 2 feature; AGENTS.md alongside).
+
+**Phase 1 (debug) — bug fixed, `4f10c1c`.** `ml_trainer_worker` only
+counted *raised exceptions* toward the consecutive-failure escalation in
+`core/retrain_guard`. But `ml.trainer.train()` catches every internal
+error and *returns* a status dict — `{"status":"error","reason":
+"subprocess_timeout"}`, `no_result`, `child_exception` — instead of
+raising. So the worker's `try/except` never observed the most common
+real failure mode: `consec_fail` stayed 0, `_worker_last_ok` was bumped
+(worker looked healthy), and the Discord "ML TRAINER STUCK" alert never
+fired — the exact silent-staleness blind spot `retrain_guard` exists to
+close, reopened on the return-value path. **Live evidence:** daemon.log
+showed `[ml_trainer] Bootstrap done: {'status':'error','reason':
+'subprocess_timeout','elapsed_s':659.5}` and `data/ml/training_metrics.
+jsonl` had not been appended since 2026-05-18 18:17 (~80h — ArticleNet
+had not retrained for over three days, with zero signal raised). Fix:
+added pure, unit-tested `core.retrain_guard.is_retrain_failure()` and
+have the worker classify the returned dict (error/unknown/non-dict =
+failure; ok/skipped = not). `record_metric` now fires only on a real
+completed cycle so a skipped no-op no longer plants a fake 0 loss.
+Pinned by 7 new cases in `tests/test_retrain_guard.py` (15 pass).
+
+**Phase 2 (feature) — `1c145df`.** Added an **ML SCORER STALE** block to
+the 5h Opus briefing. ArticleNet scores every collected article and
+produces the `[model]`-tagged urgent calls; when the trainer is stuck
+(see Phase 1) those scores silently run on stale weights and nothing in
+the briefing told the analyst. New block is operational-status family —
+exact shape/discipline of COVERAGE GAP / THROUGHPUT DEGRADATION / ALERT
+VELOCITY: `_collect_ml_freshness()` reads the last successful-retrain ts
+from `training_metrics.jsonl` (best-effort, never raises);
+`_ml_freshness_lines()` is pure and emits one line only when the last
+retrain is older than 6h. Wired into `_build_payload` (omit-when-None,
+byte-deterministic for callers that don't pass it) + `analyze()`;
+SYSTEM_PROMPT gained the matching rule + output section. Pure read-side
+— no DB write, no ai_score/ml_score/score_source/urgency touch. 17 new
+tests in `tests/test_briefing_ml_freshness.py`.
+
+**Phase 3 (live validation) — user_findings=6.**
+1. **ML trainer not retraining ~80h.** `training_metrics.jsonl` last
+   line 2026-05-18T18:17Z; live `subprocess_timeout` after 659.5s
+   (`_TRAIN_TIMEOUT_S=600`). The model is badly stale. Phase 1 now makes
+   it escalate; Phase 2 now makes it visible in the briefing.
+2. **`database is locked` write-contention storm.** dxy / sector_etf /
+   vix_ts / yahoo_ticker_rss / financial_blogs backing off up to 480s —
+   the direct-write collectors lose repeatedly. Matches the
+   `di-insert-batch-lock-contention` memory note; actively occurring.
+3. **Collection decelerated.** ~171 live rows last 1h vs ~500/h 24h
+   average — correlated with the lock storm in (2).
+4. **Alert path heavily model-only.** Most recent `urgency=2` rows are
+   `score_source='ml'`, `ai_score=0` (unverified). Known/documented;
+   the `[unverified — model-only urgent]` tag already hedges it.
+5. **SEC 8-K / sec_edgar dark ~6.9h** (briefing COVERAGE GAP) — standing
+   external gap, matches `di-chronic-dark-collectors`.
+6. **Briefing cadence 6–10h vs designed 5h** — restart-related;
+   `_initial_heartbeat_last` mitigation already in place.
+   Briefing id 40 itself read well (coherent Bloomberg-style digest).
+
+**Phase 4 (docs):** this section.
+
+**Final verify:** `from storage import article_store; from ml import
+features, model` → `imports OK`; `import daemon` → OK. Focused suites:
+`test_retrain_guard` 15 pass; `test_briefing_ml_freshness` 17 pass;
+core-module sweep (article_store/urgency_scorer/features/model/trainer/
+alert_agent) 85 pass; briefing sweep (claude_analyst + 12 briefing/chat
+files) 227 pass. Full `pytest tests/` deferred per the standing
+concurrent-agent I/O rule — the focused suites cover every module
+touched.
+
+**Counters:** `bugs_fixed=1`, `features_added=1`, `user_findings=6`.
+
+**Staging discipline.** Per-commit explicit pathspec, no `git add -A`.
+`config/portfolio.json` was modified by the auto-commit daemon / trading
+UI (not this agent) and the paper-trader sibling repo had concurrent
+edits — both left untouched; `git diff --staged --name-only` verified
+before each commit that only this agent's files were included.
