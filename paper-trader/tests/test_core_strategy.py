@@ -366,6 +366,55 @@ class TestFormatQuantSignals:
         assert out.index("  AAPL:") < out.index("  MU:") < out.index("  ZM:")
 
 
+class TestBbLabel:
+    """`_bb_label` annotates a stretched bb_position with the band it sits on
+    so Opus reads the actionable state directly in the quant block. Only the
+    extremes (|x| >= 0.9) get a label; mid-range values stay bare."""
+
+    def test_none_renders_question_mark(self):
+        assert strategy._bb_label(None) == "?"
+
+    def test_mid_range_has_no_label(self):
+        # A reading between the bands carries no annotation — the
+        # silence-when-nothing-actionable contract.
+        assert strategy._bb_label(0.3) == "0.3"
+        assert strategy._bb_label(-0.45) == "-0.45"
+        assert "band" not in strategy._bb_label(0.0)
+
+    def test_upper_band_labelled(self):
+        # At/above +0.9 → upper-band annotation (price near the +2σ band).
+        assert strategy._bb_label(0.98) == "0.98 (upper band)"
+        assert strategy._bb_label(1.5) == "1.5 (upper band)"
+        # Exactly on the threshold counts as stretched.
+        assert "upper band" in strategy._bb_label(0.9)
+
+    def test_lower_band_labelled(self):
+        assert strategy._bb_label(-1.1) == "-1.1 (lower band)"
+        assert "lower band" in strategy._bb_label(-0.9)
+
+    def test_just_inside_threshold_is_bare(self):
+        # 0.89 < 0.9 → no label; 0.9 → labelled. Pins the boundary.
+        assert strategy._bb_label(0.89) == "0.89"
+        assert "band" in strategy._bb_label(0.9)
+
+    def test_non_numeric_degrades_to_string(self):
+        # Must never raise — a malformed value falls through to its str form.
+        assert strategy._bb_label("weird") == "weird"
+
+    def test_appears_in_quant_block(self):
+        # End-to-end: the label reaches the rendered TECHNICAL SIGNALS block.
+        out = strategy._format_quant_signals({
+            "NVDA": {"rsi": 72, "bb_position": 1.02},
+        })
+        assert "bb_position=1.02 (upper band)" in out
+        # A mid-range name renders bare in the same block.
+        out2 = strategy._format_quant_signals({
+            "MU": {"rsi": 50, "bb_position": 0.2},
+        })
+        assert "bb_position=0.2 " in out2
+        assert "band" not in out2
+
+
 class TestBollingerPositionCalibration:
     """`get_quant_signals_live` computes `bb_position = (last - sma20) /
     (2 * sd20)`, so a price sitting *on* the upper/lower Bollinger band (2
