@@ -6,6 +6,52 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-22 HYBRID pass (Agent 1, paper-trader core) — option-price TTL cache
+
+**Phase 1 — bugs_fixed: 0 (honest zero).** Re-read `runner.py`, `reporter.py`,
+`signals.py`, `strategy.py`, `market.py`, `store.py` in full and audited the
+decision hot paths (`decide`, `_execute`, `_enforce_risk_pre_trade`,
+`_mark_to_market`, `_portfolio_snapshot`, `_claude_call`/`_parse_decision`,
+`_build_payload`, `_ml_live_opinion`). 784 core tests pass green
+(`test_core_*`). All target code is exhaustively hardened by ~15 prior passes;
+no real bug, race, or dead code found — no Phase 1 commit.
+
+**Phase 2 — features_added: 1 — per-contract TTL cache for
+`market.get_option_price`.** `get_option_price` fetched the full option chain
+over the network on *every* call — once per open option position on every
+mark-to-market cycle, plus again from `_execute` on a SELL_CALL/SELL_PUT
+against the same contract. Stocks have `_PRICE_CACHE` + `_DEAD_CACHE` and
+futures have a 30s bucket cache; the option path had **neither**, so a book
+holding options re-pulled an unchanged chain every cycle and a bad strike
+re-failed forever (the exact re-request spam `_DEAD_CACHE` was added to stop
+for stocks). New `_OPT_PRICE_CACHE` keyed on
+`(ticker, expiry, strike, option_type)`, 30s TTL matching `_PRICE_TTL`. A
+`None` miss (off-chain strike) is cached too (dead-cache role); a transient
+network/parse fault is **not** cached so it is retried next call. `conftest`
+clears `_OPT_PRICE_CACHE` between tests. 6 new tests in `test_core_market.py`
+(`TestGetOptionPriceCache`): TTL-window hit, refetch-after-expiry, None-miss
+caching, distinct-contract keying, no-cache-on-exception. Commit `f10a72d`.
+
+**Phase 3 — user_findings: 4 (all operational, no Phase 3 fix commit).**
+1. **IDLE_STORM** — `/api/runner-heartbeat`: last 20/20 cycles ALL
+   NO_DECISION (100%). The runner is alive (pid 1628323, lock acquired,
+   uptime ~14m) and logging decision rows, but the engine is not deciding.
+2. **`/api/decision-reliability` = CRITICAL** — 51% current-regime
+   parse-fail over 210 cycles; mode mix `HOST_SATURATED_SKIP 82.2%` +
+   `SUBPROCESS_ERROR 17.8%`; involuntary alpha bleed −1.35%.
+   `restart_recommended` is correctly False — the root cause is host
+   saturation (the continuous backtest loop is running + concurrent Opus
+   review agents), so the pre-flight `host_guard` is skipping claude calls
+   as designed. Expected protective behaviour, not a code defect.
+3. **Book is HIGH-concentration** — `/api/risk` `concentration_warning=True`,
+   severity `HIGH`: 1 open position = $658.50 of a $1000.14 book (~66%).
+   The desk is sitting concentrated and the decision engine cannot act on
+   it during the storm.
+4. **Continuous backtest loop IS running** (contrary to pass #7's 60h-dormant
+   finding) — `continuous.log` active with GDELT fetches + cache warming.
+
+---
+
 ## 2026-05-21 ML+backtest HYBRID pass #7 (Agent 2) — `corpus_diversity` (gate-eligibility audit)
 
 **Phase 1 — bugs_fixed: 0 (honest zero).** Re-audited `decision_scorer.py`
