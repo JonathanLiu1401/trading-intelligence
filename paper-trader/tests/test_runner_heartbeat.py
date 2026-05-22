@@ -31,6 +31,8 @@ from paper_trader.analytics.runner_heartbeat import (
     CLOSED_INTERVAL_S,
     LAGGING_MULT,
     STALLED_MULT,
+    _no_decision_cause,
+    _dominant_cause,
 )
 
 NOW = datetime(2026, 5, 17, 14, 0, 0, tzinfo=timezone.utc)
@@ -434,3 +436,124 @@ def test_endpoint_producing_when_recent_decision_real(client):
     assert d["verdict"] == "HEALTHY"
     assert d["restart_recommended"] is False
     assert d["decision_efficacy"]["verdict"] == "PRODUCING"
+
+
+# ───────── cause-aware IDLE_STORM restart advice (recent_reasons) ──────────
+# A host-saturation / quota storm is NOT cleared by a restart — restarting
+# just adds another Opus process. These pin that build_runner_heartbeat
+# diagnoses the cause from decisions.reasoning and stops misdirecting the
+# operator into the harmful restart.
+
+_HOST_SAT = "skipped claude call — host saturated: 8 concurrent Opus (>4)"
+_QUOTA = "claude quota/usage limit exhausted (no decision)"
+_TIMEOUT = "claude returned no response (timeout)"
+
+
+def test_no_decision_cause_buckets():
+    assert _no_decision_cause(_HOST_SAT) == "host_saturated"
+    assert _no_decision_cause("skipped claude call — host saturated: swap 98%") \
+        == "host_saturated"
+    assert _no_decision_cause(_QUOTA) == "quota"
+    assert _no_decision_cause("claude err: usage limit reached") == "quota"
+    assert _no_decision_cause(_TIMEOUT) == "other"
+    assert _no_decision_cause("parse_failed: {garbage") == "other"
+    assert _no_decision_cause(None) == "other"
+    assert _no_decision_cause("") == "other"
+
+
+def test_dominant_cause_majority_and_tiebreak():
+    # Clear majority.
+    assert _dominant_cause([_HOST_SAT, _HOST_SAT, _TIMEOUT]) == "host_saturated"
+    assert _dominant_cause([_QUOTA, _QUOTA, _TIMEOUT]) == "quota"
+    # Tie between host_saturated and quota → host_saturated wins (never
+    # under-warn the operator into a useless restart).
+    assert _dominant_cause([_HOST_SAT, _QUOTA]) == "host_saturated"
+    # Tie between quota and other → quota wins over other.
+    assert _dominant_cause([_QUOTA, _TIMEOUT]) == "quota"
+    # Empty → other (legacy: assume a restart could help).
+    assert _dominant_cause([]) == "other"
+
+
+def test_idle_storm_host_saturation_does_not_recommend_restart():
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * 6,
+        recent_reasons=[_HOST_SAT] * 6)
+    eff = out["decision_efficacy"]
+    assert eff["verdict"] == "IDLE_STORM"
+    assert eff["dominant_cause"] == "host_saturated"
+    assert eff["restart_helps"] is False
+    # The whole point: a host-saturation storm must NOT recommend a restart.
+    assert out["restart_recommended"] is False
+    assert "host saturation" in out["headline"]
+    assert "will NOT help" in out["headline"]
+    assert "wedged Claude CLI" not in out["headline"]
+
+
+def test_idle_storm_quota_does_not_recommend_restart():
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * 5,
+        recent_reasons=[_QUOTA] * 5)
+    eff = out["decision_efficacy"]
+    assert eff["verdict"] == "IDLE_STORM"
+    assert eff["dominant_cause"] == "quota"
+    assert eff["restart_helps"] is False
+    assert out["restart_recommended"] is False
+    assert "quota" in out["headline"] and "will NOT help" in out["headline"]
+
+
+def test_idle_storm_wedged_cli_still_recommends_restart():
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * 5,
+        recent_reasons=[_TIMEOUT] * 5)
+    eff = out["decision_efficacy"]
+    assert eff["verdict"] == "IDLE_STORM"
+    assert eff["dominant_cause"] == "other"
+    assert eff["restart_helps"] is True
+    # A genuine wedged-CLI storm IS cleared by a restart — advice preserved.
+    assert out["restart_recommended"] is True
+    assert "wedged Claude CLI" in out["headline"]
+
+
+def test_idle_storm_only_leading_run_diagnosed():
+    # The leading consec run (newest 5) is all host-saturated; an older
+    # timeout sits past a real decision and must not dilute the diagnosis.
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * 5 + ["BUY NVDA → FILLED", ND],
+        recent_reasons=[_HOST_SAT] * 5 + ["{}", _TIMEOUT])
+    eff = out["decision_efficacy"]
+    assert eff["consecutive_no_decision"] == 5
+    assert eff["dominant_cause"] == "host_saturated"
+    assert out["restart_recommended"] is False
+
+
+def test_idle_storm_omitting_reasons_is_byte_identical():
+    """Backward compat: with recent_reasons omitted the IDLE_STORM output is
+    byte-identical to before the cause-aware feature — restart still
+    recommended, the legacy 'wedged Claude CLI' headline, no new keys."""
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW, recent_actions=[ND] * 5)
+    assert out["restart_recommended"] is True
+    assert "wedged Claude CLI" in out["headline"]
+    eff = out["decision_efficacy"]
+    assert "dominant_cause" not in eff
+    assert "restart_helps" not in eff
+
+
+def test_endpoint_idle_storm_host_saturation_no_restart(client):
+    """End-to-end: NO_DECISION rows whose reasoning is host saturation must
+    surface IDLE_STORM with restart_recommended False — the endpoint now
+    passes recent_reasons so the heartbeat agrees with /api/no-decision-
+    reasons that a restart will not help."""
+    c, s = client
+    for _ in range(6):
+        s.record_decision(False, 0, "NO_DECISION", _HOST_SAT, 1000.0, 341.0)
+    d = c.get("/api/runner-heartbeat").get_json()
+    assert d["verdict"] == "HEALTHY"
+    assert d["decision_efficacy"]["verdict"] == "IDLE_STORM"
+    assert d["decision_efficacy"]["dominant_cause"] == "host_saturated"
+    assert d["restart_recommended"] is False
+    assert "will NOT help" in d["headline"]

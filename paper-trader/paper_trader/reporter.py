@@ -2826,8 +2826,13 @@ def _heartbeat_line(store) -> str:
         decs = store.recent_decisions(20)
         last_ts = decs[0].get("timestamp") if decs else None
         recent_actions = [d.get("action_taken") for d in decs]
+        # Parallel reasoning strings → the IDLE_STORM verdict diagnoses its
+        # cause so a host-saturation storm is not mislabelled "RESTART
+        # RECOMMENDED" (a restart only adds load — see runner_heartbeat).
+        recent_reasons = [d.get("reasoning") for d in decs]
         hb = build_runner_heartbeat(
-            last_ts, market.is_market_open(), recent_actions=recent_actions)
+            last_ts, market.is_market_open(), recent_actions=recent_actions,
+            recent_reasons=recent_reasons)
         if not isinstance(hb, dict):
             return ""
         verdict = hb.get("verdict")
