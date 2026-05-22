@@ -5,6 +5,62 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-21 feature-dev pass (Agent 4) — surface two invisible signals as dashboard endpoints
+
+A live audit found the DI dashboard's `analytics/` directory holds ~55
+modules but `dashboard/web_server.py` exposes only ~28 routes — several
+genuinely trader-facing builders are computed but reachable nowhere a human
+sees them (the "no operator can see it" gap). Two were wired in.
+
+### `/api/overnight-gaps` — pre-open gap-risk scan
+
+`analytics/overnight_gap_scanner.py` ranked tickers carried by urgent /
+high-`ml_score` news that broke during market-closed ET hours (the wire
+never sleeps; the tape does — a 2 AM ET catalyst sits unpriced until 9:30).
+It was a monolithic `main()` that only wrote a JSON log file nobody read.
+
+Refactored: the ranking is extracted into a **pure** `build_overnight_gaps(
+rows, now=None, top_n=TOP_N)` builder (no DB, no file I/O, never raises — a
+malformed row is skipped). `main()` now owns only the DB read + JSON write
+and delegates the ranking, so the CLI digest and the new endpoint can never
+disagree (single source of truth). The endpoint reads via `_ro_query` with
+`_LIVE_ONLY_SQL` (backtest isolation) and calls the builder verbatim.
+
+### `/api/held-news-silence` — per-held-ticker coverage audit
+
+`analytics/held_ticker_news_silence.py` already shipped a clean pure builder
+(`compute_silence` / `build_report`) and CLI but had **no endpoint** — the
+operator's standing "which book name am I flying blind on?" question was
+answered only inside the 5h Opus briefing (and goes dark on Claude-quota
+exhaustion). The endpoint reuses the builder verbatim; the held set is the
+canonical `ml.features.LIVE_PORTFOLIO_TICKERS` so it never drifts from the
+briefing's `[BOOK:]` tag. DARK = zero 24h mentions; ECHO = single-publisher.
+
+Both endpoints: pure DB read, no LLM, no network — survive quota exhaustion.
+
+### Tests
+
+`tests/test_overnight_gap_scanner.py` — 12 new: builder logic against a
+fixed clock (overnight vs intraday ET boundary, 24h-window exclusion,
+low-signal floor, urgency-weighted ranking, STOP-word rejection, top-N /
+top-articles caps, malformed-row + garbage-type tolerance) + a Flask
+test-client endpoint test pinning shape and backtest isolation.
+`tests/test_held_ticker_news_silence.py` — 1 new endpoint test (per-ticker
+verdicts, two-source NORMAL, DARK on an uncovered book name, backtest row
+never inflates `distinct_sources`). 81 pass across the new + sibling
+endpoint suites (sector-pulse / portfolio-signals / news-corroboration —
+confirms the app factory still builds with the two new routes).
+
+### Invariants reaffirmed
+
+- Backtest isolation: both endpoints filter through `_LIVE_ONLY_SQL`.
+- Read-only: `mode=ro` connections, no `ai_score`/`ml_score`/`urgency`
+  mutation. The overnight CLI still writes its log file unchanged.
+- Live `:8080` serves the new routes only after a daemon/dashboard restart
+  (memory `di-stale-manual-daemon`).
+
+---
+
 ## 2026-05-22 hybrid pass (Agent 3) — portfolio tickers load from `config/portfolio.json`
 
 **Phase 1 (debug):** read AGENTS.md head+tail, daemon.py, storage/article_store.py,

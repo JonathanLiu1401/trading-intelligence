@@ -340,3 +340,52 @@ def test_run_writes_report_with_dark_count_when_no_live_coverage(synth_db, tmp_p
     assert report["verdict_counts"]["DARK"] == 1
     # Persisted JSON matches in-memory report.
     assert json.loads(out_path.read_text()) == report
+
+
+# ── /api/held-news-silence endpoint ─────────────────────────────────────────
+
+
+def _insert_article(store, *, id, url, title, source, age_min=5):
+    """Insert one article row through the live ArticleStore schema."""
+    fs = (datetime.now(timezone.utc) - timedelta(minutes=age_min)).isoformat()
+    with store._write_lock:
+        store.conn.execute(
+            "INSERT INTO articles "
+            "(id, url, title, source, published, kw_score, ai_score, urgency, "
+            "first_seen, cycle, ml_score, score_source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (id, url, title, source, "", 2.0, 5.0, 0, fs, 0, None, None),
+        )
+        store.conn.commit()
+
+
+def test_endpoint_returns_per_ticker_verdicts_and_excludes_backtest(
+        store, monkeypatch):
+    from dashboard import web_server
+
+    # NVDA carried by two distinct live publishers in the last hour.
+    _insert_article(store, id="n1", url="https://x/n1",
+                    title="NVDA earnings beat expectations", source="rss")
+    _insert_article(store, id="n2", url="https://x/n2",
+                    title="NVDA chip demand strong", source="reuters")
+    # Synthetic backtest row naming NVDA — must NEVER inflate the count.
+    _insert_article(store, id="bt", url="backtest://run_3/2026-01-01/BUY/NVDA",
+                    title="NVDA SYNTHETIC SHOULD NOT SURFACE",
+                    source="backtest_run_3_winner")
+
+    monkeypatch.setattr(web_server, "_store", store, raising=False)
+    client = web_server.create_app(store).test_client()
+    resp = client.get("/api/held-news-silence")
+
+    assert resp.status_code == 200, resp.data
+    data = resp.get_json()
+    assert set(data) >= {"generated_at", "windows_h", "n_tickers",
+                         "verdict_counts", "tickers"}
+    by_tk = {r["ticker"]: r for r in data["tickers"]}
+    # NVDA is a book ticker; two distinct live sources -> NORMAL, not DARK/ECHO.
+    assert "NVDA" in by_tk
+    assert by_tk["NVDA"]["verdict"] == "NORMAL"
+    # The synthetic backtest row did not add a third source.
+    assert by_tk["NVDA"]["distinct_sources"]["24h"] == 2
+    # A book ticker with no coverage at all is reported DARK.
+    assert any(r["verdict"] == "DARK" for r in data["tickers"])

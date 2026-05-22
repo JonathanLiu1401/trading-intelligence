@@ -5,7 +5,17 @@ published during market-closed hours (after 4:00 PM ET / before 9:30 AM ET).
 These are the articles most likely to cause gap moves at the next open.
 
 Design: bounded idx_first_seen scan, read-only, USB-safe.
-Output: /home/zeph/logs/overnight_gaps.json
+
+Two consumers share the same logic:
+  * the CLI (``python3 -m analytics.overnight_gap_scanner``) writes the ranked
+    digest to ``/home/zeph/logs/overnight_gaps.json``;
+  * the dashboard endpoint ``/api/overnight-gaps`` calls ``build_overnight_gaps``
+    directly on a live ``_ro_query`` so the operator sees pre-open gap risk
+    without waiting for the next CLI run.
+
+``build_overnight_gaps`` is the single source of truth — pure, never raises,
+no DB and no file I/O. ``main()`` owns the DB read + JSON write and delegates
+the ranking to the builder so the CLI and the endpoint can never disagree.
 """
 from __future__ import annotations
 
@@ -22,6 +32,10 @@ DB_PATH = Path(__file__).resolve().parents[1] / "data" / "articles.db"
 OUT_PATH = Path("/home/zeph/logs/overnight_gaps.json")
 SCAN_LIMIT = 5000
 TOP_N = 10
+# An article needs at least this much signal to count toward a gap candidate;
+# below it the row is overnight noise (urgency 0, near-zero ml_score).
+MIN_URGENCY = 1
+MIN_ML_SCORE = 0.3
 ET = ZoneInfo("America/New_York")
 
 TICKER_RE = re.compile(r"\b\$?([A-Z]{2,5})\b")
@@ -83,6 +97,104 @@ def extract_tickers(title: str) -> list[str]:
     return out
 
 
+def _coerce_urgency(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_ml(value) -> float:
+    try:
+        return float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def build_overnight_gaps(rows, now: datetime | None = None,
+                         top_n: int = TOP_N) -> dict:
+    """Pure: rank overnight gap candidates from raw article rows.
+
+    ``rows`` is an iterable of ``(first_seen, title, urgency, ml_score,
+    source)`` tuples — the exact projection ``main()`` and the
+    ``/api/overnight-gaps`` endpoint both read. Callers are responsible for
+    applying the live-only SQL filter; the builder does not see ``url``.
+
+    Returns the JSON-ready digest: ``generated_at``, ``scanned`` (rows in),
+    ``overnight_articles_24h`` (rows inside the 24h window that fell in a
+    market-closed ET slot), and ``gap_candidates`` (top-N tickers ranked by
+    ``max_urgency*2 + count + max_ml``). Pure — no DB, no file I/O, never
+    raises on malformed rows (a bad row is skipped, not fatal)."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    rows = list(rows or [])
+
+    # ticker -> {count, max_urgency, max_ml, articles[]}
+    ticker_data: dict[str, dict] = defaultdict(
+        lambda: {"count": 0, "max_urgency": 0, "max_ml": 0.0, "articles": []}
+    )
+    overnight_count = 0
+
+    for row in rows:
+        try:
+            first_seen, title, urgency, ml_score, source = row
+        except (TypeError, ValueError):
+            # A malformed row is skipped — a diagnostic must never raise.
+            continue
+
+        ts = _parse_ts(first_seen)
+        if ts is None or ts < cutoff:
+            continue
+        if not _is_overnight(ts):
+            continue
+
+        overnight_count += 1
+        urg = _coerce_urgency(urgency)
+        ml = _coerce_ml(ml_score)
+
+        # Only track articles with some signal — an overnight row at urgency 0
+        # and near-zero ml_score is noise, not a gap catalyst.
+        if urg < MIN_URGENCY and ml < MIN_ML_SCORE:
+            continue
+
+        for tk in extract_tickers(title or ""):
+            d = ticker_data[tk]
+            d["count"] += 1
+            d["max_urgency"] = max(d["max_urgency"], urg)
+            d["max_ml"] = max(d["max_ml"], ml)
+            if len(d["articles"]) < 3:
+                d["articles"].append({
+                    "title": title,
+                    "source": source,
+                    "first_seen": first_seen,
+                    "urgency": urg,
+                    "ml_score": round(ml, 4),
+                })
+
+    # Rank by (max_urgency * 2 + count + max_ml).
+    ranked = sorted(
+        ticker_data.items(),
+        key=lambda kv: (kv[1]["max_urgency"] * 2 + kv[1]["count"] + kv[1]["max_ml"]),
+        reverse=True,
+    )[:top_n]
+
+    return {
+        "generated_at": now.isoformat(),
+        "scanned": len(rows),
+        "overnight_articles_24h": overnight_count,
+        "gap_candidates": [
+            {
+                "ticker": tk,
+                "article_count": d["count"],
+                "max_urgency": d["max_urgency"],
+                "max_ml_score": round(d["max_ml"], 4),
+                "top_articles": d["articles"],
+            }
+            for tk, d in ranked
+        ],
+    }
+
+
 def main() -> int:
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=20)
     conn.execute("PRAGMA query_only=ON")
@@ -99,76 +211,14 @@ def main() -> int:
         print("overnight_gap_scanner: no rows", file=sys.stderr)
         return 1
 
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=24)
-
-    # ticker -> {count, max_urgency, max_ml, articles[]}
-    ticker_data: dict[str, dict] = defaultdict(
-        lambda: {"count": 0, "max_urgency": 0, "max_ml": 0.0, "articles": []}
-    )
-    overnight_count = 0
-    skipped = 0
-
-    for first_seen, title, urgency, ml_score, source in rows:
-        ts = _parse_ts(first_seen)
-        if ts is None or ts < cutoff:
-            skipped += 1
-            continue
-
-        if not _is_overnight(ts):
-            continue
-
-        overnight_count += 1
-        tickers = extract_tickers(title or "")
-        urgency = urgency or 0
-        ml = float(ml_score) if ml_score is not None else 0.0
-
-        # Only track articles with some signal
-        if urgency < 1 and ml < 0.3:
-            continue
-
-        for tk in tickers:
-            d = ticker_data[tk]
-            d["count"] += 1
-            d["max_urgency"] = max(d["max_urgency"], urgency)
-            d["max_ml"] = max(d["max_ml"], ml)
-            if len(d["articles"]) < 3:
-                d["articles"].append({
-                    "title": title,
-                    "source": source,
-                    "first_seen": first_seen,
-                    "urgency": urgency,
-                    "ml_score": round(ml, 4),
-                })
-
-    # Rank by (max_urgency * 2 + count + max_ml)
-    ranked = sorted(
-        ticker_data.items(),
-        key=lambda kv: (kv[1]["max_urgency"] * 2 + kv[1]["count"] + kv[1]["max_ml"]),
-        reverse=True,
-    )[:TOP_N]
-
-    result = {
-        "generated_at": now.isoformat(),
-        "scanned": len(rows),
-        "overnight_articles_24h": overnight_count,
-        "gap_candidates": [
-            {
-                "ticker": tk,
-                "article_count": d["count"],
-                "max_urgency": d["max_urgency"],
-                "max_ml_score": round(d["max_ml"], 4),
-                "top_articles": d["articles"],
-            }
-            for tk, d in ranked
-        ],
-    }
+    result = build_overnight_gaps(rows)
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUT_PATH.write_text(json.dumps(result, indent=2))
 
-    print(f"overnight_gap_scanner: {overnight_count} overnight articles in last 24h")
-    print(f"gap candidates ({len(ranked)}):")
+    print(f"overnight_gap_scanner: {result['overnight_articles_24h']} "
+          f"overnight articles in last 24h")
+    print(f"gap candidates ({len(result['gap_candidates'])}):")
     for item in result["gap_candidates"]:
         print(
             f"  {item['ticker']:6s} count={item['article_count']} "
