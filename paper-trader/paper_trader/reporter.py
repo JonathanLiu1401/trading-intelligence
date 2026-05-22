@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 import shutil
 import subprocess
@@ -3001,6 +3002,113 @@ def _no_decision_reasons_line(store) -> str:
         return ""
 
 
+# Detail-string → coarse bucket for a BLOCKED decision. The detail text is
+# written by ``strategy._execute`` / ``strategy._enforce_risk_pre_trade`` — see
+# those for the canonical phrases. Matched case-insensitively as a substring;
+# the FIRST matching entry wins, so order is load-bearing ("no option price"
+# must precede "no price for" because the former contains "price" too — the
+# tuple order below resolves it correctly).
+_BLOCK_REASON_BUCKETS: tuple[tuple[str, str], ...] = (
+    ("insufficient cash", "insufficient cash"),
+    ("no option price", "no option price"),
+    ("no price for", "no price"),
+    ("exceeds held", "oversell"),
+    ("ambiguous", "ambiguous option close"),
+    ("no matching open", "no position to close"),
+    ("to close", "no position to close"),
+    ("missing strike", "malformed option"),
+    ("not numeric", "malformed field"),
+    ("qty must be", "malformed field"),
+    ("unknown action", "unknown action"),
+)
+
+
+def _classify_block_reason(detail: str | None) -> str:
+    """Coarse, operator-actionable bucket for a BLOCKED decision's free-text
+    detail string.
+
+    The detail is written by ``strategy._execute`` /
+    ``strategy._enforce_risk_pre_trade`` (e.g.
+    ``"insufficient cash (have $12.00, need $480.00)"``, ``"no price for
+    NVDA"``, ``"ambiguous call close for NVDA; ..."``). This folds the
+    long-tail phrasing into a handful of buckets a trader can act on.
+    Unknown / empty detail → ``"other"`` so the caller never silently drops
+    a blocked row from the tally. Pure on the input string, never raises."""
+    s = (detail or "").lower()
+    if not s:
+        return "other"
+    for needle, bucket in _BLOCK_REASON_BUCKETS:
+        if needle in s:
+            return bucket
+    return "other"
+
+
+def _blocked_reasons_line(store, window_hours: float, label: str) -> str:
+    """One-line "WHY did Opus's decisions fail to execute?" for the
+    hourly / daily report.
+
+    ``_session_block`` already shows a bare ``blocked N`` count — but a
+    count alone is not actionable. A book that blocked 3 trades on
+    *insufficient cash* (the desk is fully deployed and Opus keeps trying
+    to add) is a completely different problem from 3 blocks on *no price*
+    (a yfinance outage starving the execution path) or 3 on *oversell*
+    (Opus mis-reading its own position sizes and repeatedly trying to sell
+    more than it holds). The first wants a SELL to free cash; the second
+    is an infra outage; the third is a prompt / context problem. This line
+    names the dominant cause so the operator knows which lever to pull.
+
+    A BLOCKED row's ``action_taken`` ends ``"→ BLOCKED"`` and its
+    ``reasoning`` column carries the JSON blob ``strategy.decide`` writes
+    (``{"decision":..., "detail":...}``); the human-readable block reason
+    is the ``detail`` field. Pure store read — NO network (the Discord-path
+    discipline). Observational only, never gates, adds no caps (invariants
+    #2/#12 — the ``_no_decision_reasons_line`` precedent). Failure contract
+    mirrors the rest of ``reporter``: any fault degrades to ``""`` ("no
+    blocked-reasons line this report"), never an exception ("no Discord
+    summary this report").
+
+    Suppression: silent when nothing blocked in the window — a clean
+    execution path has nothing to report (the silence-when-nothing-
+    actionable precedent; the summary must never become its own lying
+    green light)."""
+    try:
+        since = (datetime.now(timezone.utc)
+                 - timedelta(hours=window_hours)).isoformat()
+        buckets: dict[str, int] = {}
+        n_blocked = 0
+        for d in store.recent_decisions(limit=500):
+            if (d.get("timestamp") or "") < since:
+                continue
+            if "BLOCKED" not in (d.get("action_taken") or "").upper():
+                continue
+            n_blocked += 1
+            detail = ""
+            raw = d.get("reasoning")
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        detail = str(parsed.get("detail") or "")
+                except (ValueError, TypeError):
+                    # Pre-JSON / corrupt reasoning — count it as "other"
+                    # rather than dropping the blocked row from the tally.
+                    detail = ""
+            bucket = _classify_block_reason(detail)
+            buckets[bucket] = buckets.get(bucket, 0) + 1
+        if n_blocked == 0:
+            return ""
+        # Most-frequent bucket first; ties broken alphabetically so the
+        # rendered string is deterministic for a given input.
+        ordered = sorted(buckets.items(), key=lambda kv: (-kv[1], kv[0]))
+        parts = ", ".join(f"{name} ×{cnt}" for name, cnt in ordered)
+        trade_word = "decision" if n_blocked == 1 else "decisions"
+        return (f"**BLOCKED** ◈ {n_blocked} blocked {trade_word} last {label}\n"
+                f"> {parts}")
+    except Exception as e:
+        print(f"[reporter] blocked-reasons line skipped: {e}")
+        return ""
+
+
 def _decision_clock_line(store) -> str:
     """One-line "is there a recurring HOUR-OF-DAY where this trader is
     consistently being starved?" for the hourly / daily report.
@@ -3725,6 +3833,14 @@ def send_hourly_summary() -> bool:
     ndr = _no_decision_reasons_line(store)
     if ndr:
         body += "\n" + ndr
+    # BLOCKED sits right after NO_DECISION CAUSE — the natural pair.
+    # NO_DECISION CAUSE explains why Opus failed to RESPOND; BLOCKED explains
+    # why a decision Opus DID return could not EXECUTE (insufficient cash /
+    # no price / oversell). Both silence-by-default; neither suppresses the
+    # other.
+    bl = _blocked_reasons_line(store, 1.0, "1h")
+    if bl:
+        body += "\n" + bl
     # STREAK sits last among the behavioural blocks — surfaces HOT_HAND
     # (overconfidence trap) or TILT_RISK (loss-cluster bias) from
     # closed round-trip outcomes. Silent on a balanced/young book (the
@@ -3916,6 +4032,12 @@ def send_daily_close() -> bool:
     ndr = _no_decision_reasons_line(store)
     if ndr:
         body += "\n" + ndr
+    # BLOCKED follows NO_DECISION CAUSE on daily close too — see
+    # send_hourly_summary for the rationale (failed to respond vs. failed
+    # to execute). 24h window here to match the daily-close horizon.
+    bl = _blocked_reasons_line(store, 24.0, "24h")
+    if bl:
+        body += "\n" + bl
     # See send_hourly_summary STREAK rationale — daily close mirrors the
     # block placement so the operator sees the same surface on both reports.
     sk = _streak_line(store)
