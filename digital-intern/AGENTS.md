@@ -5,6 +5,97 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-23 hybrid pass #8 (Agent 3) — hourly urgency reaper + urgent_backlog_aging analytics
+
+Debugger + feature-dev + news-analyst pass. Two commits on master.
+
+**Phase 1 (debug) — `a72a658`.** `purge_worker` was only calling
+`ArticleStore.reap_stale_urgent()` on a 6h cadence (inside `purge_old`) plus
+once at startup. A `urgency=1` row that crossed the alerter's 24h fetch
+window could linger un-demoted for up to ~6h past the cutoff — invisible to
+the alert worker (push lost) yet still inflating the dashboard urgent tile.
+Live evidence (2026-05-23 16:30Z): 22 of 81 queued urgency=1 rows were
+already >24h old (some 29-30h), never alerted, awaiting the next purge_old
+fire. Confirmed by watching the daemon log: at 15:34:01Z purge_old fired and
+reaped exactly 22 stale rows in one go — the same number my live audit had
+just measured. Split the cadence: cheap reap (one indexed UPDATE,
+idempotent) now fires hourly between the existing 6h purge_old call, so
+worst-case stuck-urgent-row lifetime drops from ~30h to ~25h. Pinned by
+new `tests/test_purge_worker_hourly_reap.py` (cadence constants ≤ 1h, ≥ 5
+min, < PURGE_INTERVAL, plus 6h fallback wiring cross-check). 3 new tests
+all passing.
+
+**Phase 2 (feature) — `8ed1ad8`.** New `analytics/urgent_backlog_aging.py`:
+the analyst-facing diagnostic the dashboard's existing 3-bucket
+`urgent_queue_health` (queued / near_reap / overdue) lacked. Bins the live
+`urgency=1` rows into fixed-width age buckets across the 24h alerter window
+plus a trailing overdue bucket, so the SHAPE of the queue is visible —
+mass in 0-4h means alerter keeping up, mass in 12-24h means alerter has
+given up, mass past 24h means silent missed pushes. Live evidence
+(2026-05-23 16:30Z) reproduced exactly: of 81 queued, 12 in 0-4h band,
+2/4/9/6 across 4-20h, then 26 in the 20-24h band, then 22 overdue — a
+bimodal distribution the aggregate `llm_fraction` cannot show. Returns a
+structured audit dict (queued / overdue / in_window / oldest_age_h /
+median_age_h / per-bucket counts / stuck_old_fraction / verdict) plus a
+text+bar-chart renderer. CLI: `--json --bucket-hours <N> --strict` (exit 1
+on STUCK_OLD or OVERDUE_LOSS for CI gates). Pure read-side, single SELECT,
+`_LIVE_ONLY_CLAUSE` discipline. 23 regression tests pin the bin edges,
+verdict logic, backtest/opus row isolation, and the read-only invariant.
+
+**Phase 3 (live validation) — user_findings=6.**
+1. **ZERO Sonnet-vetted urgent alerts in last 24h** — all 115 alerted
+   urgent rows carry `score_source='ml'`. The Sonnet urgency_scorer path
+   is dark (same finding as pass #7's finding #2; persisting standing
+   issue — quota throttling or pre-filter eating everything). Not
+   addressed here; left as a finding.
+2. **22 stale urgency=1 rows actively being lost as silent missed pushes**
+   — confirmed by both the live audit and watching the daemon log
+   (15:34:01Z reaping exactly the 22 rows). My Phase 1 fix shortens the
+   worst-case stuck lifetime from ~30h to ~25h going forward.
+3. **Bimodal queue age distribution** — 12 in 0-4h + 26 in 20-24h band
+   means the alerter is barely draining; the new `urgent_backlog_aging`
+   audit surfaces this. The aggregate `llm_fraction` metric cannot.
+4. **Top alert sources are low-credibility forums + bot recaps** —
+   stocktwits 18, reddit 8+, GN: Nvidia 17 (GuruFocus recap mill), GN:
+   dividend buyback 14. The recap/quote-widget gates in `alert_agent`
+   catch some but not all of this — "Nvidia has achieved astonishing
+   dividend growth and remains undervalued" passed every gate and fired
+   BREAKING. Not addressed here.
+5. **ML trainer subprocess timeout (469.9s)** at 15:25:15Z — known
+   `di-ml-trainer-subprocess-timeout` condition, surfaced again. Model
+   can be days stale.
+6. **DB lock storm at 15:33:40Z** — `insert_batch` + `mark_alerted_batch`
+   both retrying on "database is locked" simultaneously. Known
+   `di-insert-batch-lock-contention` condition; the retry decorator
+   absorbs it but if 5 attempts exhaust, that cycle's labels are dropped.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:**
+- `python3 -c "import sys; sys.path.insert(0,'.'); from storage import
+  article_store; from ml import features, model; print('imports OK')"`
+  → `imports OK`.
+- Focused suite covering every module touched: 79 passed (the existing
+  56-test focused suite + 17 stale-urgent-reaper + 3 new
+  test_purge_worker_hourly_reap + 23 new test_urgent_backlog_aging).
+  Full `pytest tests/` not run (~25min under live load and would race
+  the sibling Agent 4 + auto-commit daemon — focused suite covers the
+  invariants).
+
+**Counters:** `bugs_fixed=1` (the 6h reap cadence — daemon.py + 1 new
+regression test), `features_added=1` (`analytics/urgent_backlog_aging.py`
++ 23 tests), `user_findings=6` (see above).
+
+**Staging discipline.** Per-commit, explicit pathspec, no `git add -A`.
+Sibling Agent 4 (`paper-trader/paper_trader/analytics/inverse_pair_conflict.py`)
+and the auto-commit daemon were both active; `git diff --staged --stat`
+verified before each commit to ensure only my own .py + test files were
+included. Untouched: `config/portfolio.json`, `watchers/urgency_scorer.py`,
+`tests/test_urgency_portfolio_prompt.py` (Agent 3 sibling's in-flight diff
+from pass #7), and the paper-trader files.
+
+---
+
 ## 2026-05-23 hybrid pass #7 (Agent 3) — alert + briefing prompt held-book parameterization + cross-prompt parity audit
 
 Debugger + feature-dev + news-analyst pass. Two commits on master.
