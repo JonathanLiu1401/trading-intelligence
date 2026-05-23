@@ -76,6 +76,7 @@ from collectors.tic_foreign_holdings import collect_tic
 from collectors.congress_trades_collector import collect_congress_trades
 from collectors.finra_short_volume import collect_finra_short_volume
 from collectors.market_movers import collect_market_movers
+from collectors.yahoo_trending_tickers import collect_yahoo_trending
 from collectors.fear_greed_collector import collect_fear_greed
 from collectors.crypto_fear_greed_collector import collect_crypto_fear_greed
 from collectors.earnings_surprise_collector import collect_earnings_surprises
@@ -174,6 +175,7 @@ CONGRESS_TRADES_INTERVAL = 3600   # Congressional trading disclosures — once p
 CBOE_UNUSUAL_OPTIONS_INTERVAL = 900  # CBOE unusual options flow — every 15min
 CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog — once per hour
 MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
+YAHOO_TRENDING_INTERVAL = 300     # Yahoo Finance trending tickers (retail attention) every 5min
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
 CRYPTO_FEAR_GREED_INTERVAL = 1800  # Crypto Fear & Greed (alternative.me) every 30min
 EARNINGS_SURPRISE_INTERVAL = 900  # EPS beat/miss scanner every 15min
@@ -260,7 +262,7 @@ ALL_WORKERS = (
     "gdelt", "rss", "web", "reddit", "ticker", "sec_edgar", "sec_edgar_ft", "sec_xbrl",
     "google_news", "nitter", "substack",
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
-    "yahoo_ticker_rss", "market_movers", "wikipedia", "wiki_pageviews", "macro_calendar", "tic", "short_interest",
+    "yahoo_ticker_rss", "market_movers", "yahoo_trending", "wikipedia", "wiki_pageviews", "macro_calendar", "tic", "short_interest",
     "fed_press", "ecb_press", "boj_press", "boe_press", "g10_cb", "global_reg", "whitehouse",
     "usgs_quake", "fda",
     "scorer", "alert", "heartbeat", "purge", "stats",
@@ -288,6 +290,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "massive": MASSIVE_INTERVAL, "newsapi": NEWSAPI_INTERVAL,
     "yahoo_ticker_rss": YAHOO_TICKER_RSS_INTERVAL,
     "market_movers": MARKET_MOVERS_INTERVAL,
+    "yahoo_trending": YAHOO_TRENDING_INTERVAL,
     "unusual_volume": MARKET_MOVERS_INTERVAL,
     "short_squeeze":  MARKET_MOVERS_INTERVAL,
     "fear_greed": FEAR_GREED_INTERVAL,
@@ -1092,6 +1095,28 @@ def market_movers_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(MARKET_MOVERS_INTERVAL)
+
+
+# ── Worker: Yahoo Finance trending tickers — every 5min ─────────────────────
+def yahoo_trending_worker(store: ArticleStore):
+    log.info("[yahoo_trending_worker] started")
+    bo = Backoff("yahoo_trending", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_yahoo_trending()
+            _ingest(store, articles, "yahoo_trending")
+            try:
+                source_health.record_result("yahoo_trending", len(articles))
+            except Exception as he:
+                log.warning(f"[yahoo_trending_worker] source_health error: {he}")
+            _worker_last_ok["yahoo_trending"] = time.time()
+            log.debug(f"[yahoo_trending] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[yahoo_trending_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(YAHOO_TRENDING_INTERVAL)
 
 
 # ── Worker: Unusual Volume screener — every 5min ────────────────────────────
@@ -3670,6 +3695,7 @@ def main():
         ("newsapi",     newsapi_worker),
         ("yahoo_ticker_rss", yahoo_ticker_rss_worker),
         ("market_movers", market_movers_worker),
+        ("yahoo_trending", yahoo_trending_worker),
         ("unusual_volume", unusual_volume_worker),
         ("short_squeeze",  short_squeeze_worker),
         ("short_interest", short_interest_worker),
