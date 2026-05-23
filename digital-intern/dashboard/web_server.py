@@ -1236,6 +1236,165 @@ def _regime_leverage_fit_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _kelly_sizing_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/kelly-sizing` (Kelly-criterion sizing
+    diagnostic — how the current top-position weight compares to a
+    Kelly-optimal allocation derived from realised win-rate × payoff
+    ratio) as compact chat-context lines.
+
+    The portfolio block reports `concentration_top1_pct` as a scalar and
+    `/api/concentration-cap` warns at a fixed threshold, but neither
+    answers the *statistical* sizing question: given my realised edge
+    (the same `payoff_ratio` and `actual_win_rate_pct` `/api/trade-
+    asymmetry` already exposes), what fraction would Kelly allocate to
+    the single best position, and how does the current top weight
+    compare? A 65% concentration is justified by a 13× payoff and 67%
+    win-rate; the same 65% on a flat edge is ruin-risk territory. This
+    is the chat-side surface for that decision.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+    the chat headline — no chat-side re-derived verdict (the
+    ``_decision_paralysis_chat_lines`` precedent). Detail line restates
+    the builder's own ``half_kelly_pct`` / ``full_kelly_pct`` /
+    ``top_position_pct`` / ``top_position_ticker`` — never recomputed.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - non-actionable verdicts (``KELLY_ALIGNED`` / ``None``) → ``[]``: a
+      Kelly-aligned book is silence, matching the
+      ``_decision_paralysis_chat_lines`` silence precedent — never chat
+      filler when the sizing is in the safety cushion
+    - actionable verdicts (``UNDERSIZED`` / ``OVERSIZED`` /
+      ``EXTREMELY_OVERSIZED`` / ``NEGATIVE_EDGE`` / ``INTENT_UNCLEAR``)
+      → builder's verbatim ``headline`` (only when a usable string) + one
+      detail line composed from the builder's own ``half_kelly_pct`` /
+      ``full_kelly_pct`` / ``top_position_pct`` / ``top_position_ticker``
+      (the ``_macro_calendar_chat_lines`` precedent); a missing field
+      degrades silently rather than raises (the
+      ``_paper_trader_position_lines`` precedent)
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"UNDERSIZED", "OVERSIZED", "EXTREMELY_OVERSIZED",
+                  "NEGATIVE_EDGE"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)                  # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    full_k = _num(rep.get("full_kelly_pct"))
+    half_k = _num(rep.get("half_kelly_pct"))
+    top_pct = _num(rep.get("top_position_pct"))
+    top_tk = rep.get("top_position_ticker")
+
+    detail_parts: list[str] = []
+    if half_k is not None:
+        detail_parts.append(f"half-Kelly target {half_k:.1f}%")
+    if full_k is not None:
+        detail_parts.append(f"full-Kelly {full_k:.1f}%")
+    if top_pct is not None:
+        top_line = f"current top {top_pct:.1f}%"
+        if isinstance(top_tk, str) and top_tk.strip():
+            top_line += f" ({top_tk})"
+        detail_parts.append(top_line)
+
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    return lines
+
+
+def _exit_intent_audit_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/exit-intent-audit` (per-closed-sell
+    intent classification → outcome per bucket) as compact chat-context
+    lines.
+
+    `/api/loser-autopsy` classifies losers by an OBJECTIVE failure mode
+    (hold-days × magnitude); `/api/winner-autopsy` looks at entry text
+    on winners; `/api/round-trip-postmortem` judges exit *timing*
+    against the next price drift. None classify the trader's STATED
+    REASON for the sell. The DRAM whipsaw (2026-05-19, -17.7% in 1.1h)
+    was exited with reasoning that cited "raising dry powder" and
+    "post-earnings dip" — the bot was bleeding on DEFENSIVE_CASH_RAISE
+    exits without anything in chat ever surfacing that pattern.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+    the chat headline — no chat-side re-derived verdict (the
+    ``_decision_paralysis_chat_lines`` precedent). Detail line restates
+    the builder's own ``dominant_intent`` + that bucket's own stats
+    (``n``, ``total_pnl_usd``, ``avg_pnl_pct``, ``win_rate_pct``) — never
+    recomputed.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - non-actionable verdicts (``DOMINANT_INTENT_HEALTHY`` / ``None``) →
+      ``[]``: a healthy dominant-intent mix is silence, matching the
+      ``_decision_paralysis_chat_lines`` silence precedent — never chat
+      filler when the most common exit reason is profitable on average
+    - actionable verdicts (``DOMINANT_INTENT_BLEED`` / ``INTENT_UNCLEAR``)
+      → builder's verbatim ``headline`` (only when a usable string) + one
+      detail line composed from the builder's own ``dominant_intent`` +
+      that bucket's stats (the ``_macro_calendar_chat_lines`` precedent);
+      a missing field degrades silently rather than raises (the
+      ``_paper_trader_position_lines`` precedent)
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"DOMINANT_INTENT_BLEED", "INTENT_UNCLEAR"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)                  # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    dominant = rep.get("dominant_intent")
+    buckets = rep.get("buckets") if isinstance(rep.get("buckets"), list) else []
+    dom_bucket = next(
+        (b for b in buckets
+         if isinstance(b, dict) and b.get("intent") == dominant),
+        None,
+    )
+
+    detail_parts: list[str] = []
+    if isinstance(dominant, str) and dominant.strip():
+        detail_parts.append(f"dominant={dominant}")
+    if isinstance(dom_bucket, dict):
+        n = _num(dom_bucket.get("n"))
+        if n is not None:
+            detail_parts.append(f"n={int(n)}")
+        total_pnl = _num(dom_bucket.get("total_pnl_usd"))
+        if total_pnl is not None:
+            detail_parts.append(f"total ${total_pnl:+.2f}")
+        avg_pct = _num(dom_bucket.get("avg_pnl_pct"))
+        if avg_pct is not None:
+            detail_parts.append(f"avg {avg_pct:+.2f}%/trip")
+        wr = _num(dom_bucket.get("win_rate_pct"))
+        if wr is not None:
+            detail_parts.append(f"wr {wr:.0f}%")
+
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    return lines
+
+
 def _realized_vs_unrealized_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/realized-vs-unrealized` (banked-vs-paper
     P&L split) as compact chat-context lines.
@@ -4958,6 +5117,62 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: regime-leverage-fit fetch failed: %s", e)
 
+        # Kelly-criterion sizing — given my realised payoff × win-rate, what
+        # fraction would Kelly allocate to the single best position, and
+        # how does the current top weight compare? The portfolio block
+        # reports concentration_top1_pct as a scalar and concentration-cap
+        # warns at a fixed threshold, but neither answers the *statistical*
+        # sizing question. A 65% concentration is justified by a 13× payoff;
+        # the same 65% on a flat edge is ruin-risk. Block fires ONLY on
+        # UNDERSIZED / OVERSIZED / EXTREMELY_OVERSIZED / NEGATIVE_EDGE
+        # (KELLY_ALIGNED collapses to silence — the
+        # _decision_paralysis_chat_lines silence precedent). Composed
+        # verbatim by the pure _kelly_sizing_chat_lines helper (unit-tested;
+        # SSOT — the builder's own `headline` is the chat headline, no
+        # re-derived verdict). Guarded 3s read; only appears once :8090 is
+        # restarted onto /api/kelly-sizing.
+        kelly_sizing_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/kelly-sizing",
+                    timeout=3) as resp:
+                _ks = json.loads(resp.read().decode("utf-8"))
+            kelly_sizing_block = "\n".join(
+                _kelly_sizing_chat_lines(_ks))
+        except Exception as e:
+            _logger().warning(
+                "chat: kelly-sizing fetch failed: %s", e)
+
+        # Exit-intent audit — per-closed-sell intent classification into
+        # EARNINGS_CLEAR / STOP_LOSS / TARGET_HIT / THESIS_FLIP /
+        # DEFENSIVE_CASH_RAISE / UNCLASSIFIED, rolled up to outcome per
+        # bucket. /api/loser-autopsy classifies losers by OBJECTIVE failure
+        # mode (hold × magnitude), /api/winner-autopsy looks at entry
+        # rationale; neither classifies the trader's STATED REASON for
+        # selling. The DRAM whipsaw (2026-05-19, -17.7% in 1.1h) was
+        # exited citing "raising dry powder" — DEFENSIVE_CASH_RAISE bleed
+        # surfaces here when n≥10 round-trips and the dominant intent has
+        # negative avg P&L. Block fires ONLY on DOMINANT_INTENT_BLEED /
+        # INTENT_UNCLEAR (DOMINANT_INTENT_HEALTHY collapses to silence —
+        # the _decision_paralysis_chat_lines silence precedent). Composed
+        # verbatim by the pure _exit_intent_audit_chat_lines helper
+        # (unit-tested; SSOT — the builder's own `headline` is the chat
+        # headline, no re-derived verdict). Guarded 3s read; only appears
+        # once :8090 is restarted onto /api/exit-intent-audit.
+        exit_intent_audit_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/exit-intent-audit",
+                    timeout=3) as resp:
+                _eia = json.loads(resp.read().decode("utf-8"))
+            exit_intent_audit_block = "\n".join(
+                _exit_intent_audit_chat_lines(_eia))
+        except Exception as e:
+            _logger().warning(
+                "chat: exit-intent-audit fetch failed: %s", e)
+
         # Realized-vs-unrealized P&L split — the "banked vs paper" composition
         # question. Every other P&L block is a scalar (portfolio total pnl%,
         # drawdown%, β-attribution); none answers "of today's gain, how much
@@ -5254,6 +5469,8 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — CASH REDEPLOYMENT LATENCY (post-SELL cash-to-next-BUY interval distribution — the sold-then-sat pathology. A book that sells then sits for 5 days has the same headline cash% as one that redeploys in 6h, but the desk in question is materially different. Surfaced ONLY when SLOW / STALLED, never filler when FAST_REDEPLOY / STEADY. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{cash_redeployment_block}\n\n" if cash_redeployment_block else "")
             + (f"PAPER TRADER — DECISION VAPOR (per-FILLED-decision structural-quality detector — does the reasoning cite specific numbers + catalysts + tickers, or is Opus writing generic 'strong setup, building position' vapor? A vapor trade that fails has nothing for the next decision to learn from — this is the only block that answers 'is the bot thinking, or rationalising?'. Surfaced ONLY when MIXED / VAPOR_DECISIONS, never filler when SPECIFIC. Headline + any VAPOR sample excerpt carry verbatim from the trader endpoint — restate, never re-derive):\n{decision_vapor_block}\n\n" if decision_vapor_block else "")
             + (f"PAPER TRADER — REGIME-LEVERAGE FIT (book-leverage alignment vs prevailing SPY momentum regime. The watchlist is leveraged-ETF-heavy — the structural question 'are we positioned with or against the regime?' is high-stakes and answered nowhere else in chat. A 0% leveraged book during a bull tape is just as structurally wrong as a 40% leveraged book during a bear. Surfaced ONLY when BLIND_LEVERING / DANGEROUS_HEADWIND / MISSED_TAILWIND, never filler when ALIGNED / DEFENSIVE / NEUTRAL. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{regime_leverage_fit_block}\n\n" if regime_leverage_fit_block else "")
+            + (f"PAPER TRADER — KELLY SIZING (Kelly-criterion sizing diagnostic — given my realised win-rate and payoff ratio, what fraction would Kelly allocate to the single best position, and how does the current top weight compare? The portfolio block reports concentration_top1_pct as a scalar and concentration-cap warns at a fixed threshold; neither answers whether ANY fixed threshold is statistically justified by the realised edge. A 65% concentration is justified by a 13× payoff and 67% win-rate; the same 65% on a flat edge is ruin-risk territory. Surfaced ONLY when UNDERSIZED / OVERSIZED / EXTREMELY_OVERSIZED / NEGATIVE_EDGE, never filler when KELLY_ALIGNED. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{kelly_sizing_block}\n\n" if kelly_sizing_block else "")
+            + (f"PAPER TRADER — EXIT-INTENT AUDIT (per-closed-sell intent classification: EARNINGS_CLEAR / STOP_LOSS / TARGET_HIT / THESIS_FLIP / DEFENSIVE_CASH_RAISE / UNCLASSIFIED, rolled up to outcome per bucket. Loser-autopsy classifies losers by OBJECTIVE failure mode (hold × magnitude); winner-autopsy looks at entry rationale; neither classifies the trader's STATED REASON for selling. When the most common stated reason to sell is also a money loser, the desk has a behavioural blind spot the other blocks cannot see. Surfaced ONLY when DOMINANT_INTENT_BLEED / INTENT_UNCLEAR, never filler when DOMINANT_INTENT_HEALTHY. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{exit_intent_audit_block}\n\n" if exit_intent_audit_block else "")
             + (f"PAPER TRADER — REALIZED vs UNREALIZED P&L SPLIT (the banked-vs-paper composition question — of today's net P&L, how much is locked-in realized vs paper that can evaporate on the next adverse mark? A +$50 book that is 100% realized is fundamentally different from the same headline that is 100% open-paper. Surfaced ONLY when DRAWING_DOWN / LEAKING_PAPER / PAPER_HEAVY, never filler when BANKED / BALANCED. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{realized_vs_unrealized_block}\n\n" if realized_vs_unrealized_block else "")
             + (f"PAPER TRADER — WATCHLIST COVERAGE (per-watchlist-ticker attention scan over the recent decision stream — which tickers has the bot stopped looking at? Every other panel is position-centric and never names an IGNORED ticker; this is the only block that surfaces opportunity cost from neglected names. Surfaced ONLY when STAGNANT / CONCENTRATED, never filler when DIVERSIFIED. Headline and the stale-ticker sample carry verbatim from the trader endpoint — restate, never re-derive):\n{watchlist_coverage_block}\n\n" if watchlist_coverage_block else "")
             + (f"PAPER TRADER — CONCENTRATION TRAJECTORY (the slope view of single-name exposure over the last N days — has top-1 weight been RISING, FALLING, or STEADY? Every other concentration surface is point-in-time and reads identically whether the book ramped 30%→65% over a week or jumped 0%→65% in one cycle. Surfaced ONLY when CONCENTRATION_SPIKE / RAMPING_UP / CONCENTRATED_STEADY, never filler when DECONCENTRATING / DIVERSIFIED / BALANCED. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{concentration_trajectory_block}\n\n" if concentration_trajectory_block else "")
