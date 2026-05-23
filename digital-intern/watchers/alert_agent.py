@@ -836,6 +836,101 @@ _RT_WIKIPEDIA_REF = re.compile(
     r"^\s*\[Wikipedia\]\s+",
 )
 
+# "<TICKER> Holdings (Raised|Cut|Lowered|Increased|Trimmed|Boosted) by <Fund> LLC"
+# — the MarketBeat / americanbankingnews.com / tickerreport.com institutional-
+# 13F press mill. Triggered automatically for EVERY 13F filing change against
+# any tracked ticker; ramps up dramatically during 13F filing season (Q1/Q2/
+# Q3/Q4 +45 days). Pure boilerplate: the "fund X moved its position in
+# ticker Y" snippet is generated programmatically with no editorial judgment
+# and is by definition retrospective (the filing was already made public on
+# the SEC site weeks ago).
+#
+# Live evidence (2026-05-23, 48h articles.db scan): 4 such rows reached
+# urgency=2 with ``score_source='ml'`` — e.g.
+#   - "Applied Materials, Inc. $AMAT Holdings Raised by Global Retirement
+#      Partners LLC - MarketBeat" (ml_score 9.x)
+# The MarketBeat credibility tier (0.68) sits ABOVE the 0.45
+# ``ALERT_MIN_LONE_SOURCE_CRED`` bar so the authority gate doesn't catch it;
+# content type IS the failure. The ML urgency head systematically over-scores
+# them because the title is dense with held-ticker mentions, dollar-sign
+# prefixes, and "Holdings"/"Boosted"/"Trimmed" tokens it has learned to
+# associate with high relevance.
+#
+# Discriminator: ``\bholdings\s+(raised|cut|lowered|increased|trimmed|boosted|
+# reduced|decreased|sold|acquired)\s+by\s+\S+(?:\s+\S+){0,5}\s+LLC\b``. The
+# combination of "Holdings <verb> by" + a multi-word fund name + an LLC
+# terminator is the discriminator. The "LLC" anchor is what makes this
+# high-precision — real news mentioning "holdings" doesn't end in "by <fund>
+# LLC". Validated against the must-survive corpus: "Berkshire Hathaway trims
+# AAPL holdings", "Saudi fund increases Tesla stake", "Fund's holdings now
+# 12.3M shares" — none match because none have the "<verb> by <fund> LLC"
+# trailer.
+_RT_HOLDINGS_BY_FUND = re.compile(
+    r"\bholdings\s+(?:raised|cut|lowered|increased|trimmed|boosted|reduced|"
+    r"decreased|sold|acquired)\s+by\s+\S+(?:\s+\S+){0,5}\s+LLC\b",
+    re.IGNORECASE,
+)
+
+# "Why Are Stock Market Futures Down Today, M/D/YY?" — the TipRanks daily
+# pre-market futures-state recap mill template. Same retrospective shape as
+# ``_RT_WHY_TRADING`` ("Why X Stock Is Trading Up Today") but the subject is
+# the market index futures, not a single ticker. By definition retrospective:
+# describes the CURRENT futures state at the time of writing, not a forward-
+# looking event the analyst can act on. The date-stamped header is the SEO
+# mill signature.
+#
+# Live evidence (2026-05-23, 48h scan): "Why Are Stock Market Futures Down
+# Today, 5/21/26? - TipRanks" reached urgency=2 with ``score_source='ml'``
+# (ml_score 9.x). TipRanks credibility tier ~0.65 sits ABOVE the 0.45 bar so
+# the authority gate doesn't catch it; content type IS the failure. Same SEO
+# mill template family as ``_RT_TODAYS_MOVERS`` ("These Stocks Are Today's
+# Movers: ...") and ``_RT_MARKET_TODAY`` ("Stock Market Today, May 18: ...")
+# — daily, date-stamped, retrospective.
+#
+# Discriminator: ``^why\s+are\s+stock\s+market\s+futures\s+(up|down|higher|
+# lower|mixed|moving|moved|moving)\s+today\b``. Anchored ``^`` so a mid-
+# sentence "futures" reference is unaffected. The trailing "today" is the
+# retrospective signature. Validated against the must-survive corpus: "Stock
+# futures edge higher ahead of NVDA earnings", "Pre-market: Futures rally
+# 0.8%", "Fed minutes due; futures rise" all do NOT match.
+_RT_FUTURES_WHY_TODAY = re.compile(
+    r"^\s*why\s+are\s+stock\s+market\s+futures\s+"
+    r"(?:up|down|higher|lower|mixed|moving|moved|sliding|rising|falling)\s+"
+    r"today\b",
+    re.IGNORECASE,
+)
+
+# "Gold/Petrol/Silver Rate Today in <City> Nth <Month> 2026 : ..." — the
+# Business Today (India) daily city-by-city commodity-price feed. Posted
+# automatically for every Indian metro every day, naming the commodity, the
+# city, the date, and the per-gram or per-litre rate. Not even US-market
+# relevant. Pure noise from the analyst's perspective (held book is
+# semiconductors / mega-caps, not Indian retail gold).
+#
+# Live evidence (2026-05-23, 48h scan): 4 such rows reached urgency=2 with
+# ``score_source='ml'`` — e.g.
+#   - "Gold Rate Today in Kolkata 21st May 2026 : 22 & 24 Carat, Gold Price
+#      in Kolkata - Business Today"
+#   - "Gold Rate Today in Kanpur 21st May 2026 : 22 & 24 Carat, Gold Price
+#      in Kanpur - Business Today"
+# Business Today credibility tier (~DEFAULT 0.55) sits ABOVE the 0.45 bar.
+# The ML urgency head over-scores these because the title is dense with "Gold
+# Rate Today" + price/carat tokens, and the "Today" + date stamp pattern that
+# triggered ``_RT_MARKET_TODAY``'s sibling template family.
+#
+# Discriminator: ``^(gold|silver|petrol|diesel|crude\s+oil)\s+(rate|price)\s+
+# today\s+in\s+\S``. The leading commodity-name + "Rate/Price Today in <city>"
+# is the SEO mill signature. Anchored ``^`` so a mid-sentence reference is
+# unaffected. Validated against the must-survive corpus: real macro/wire
+# copy ("Gold prices rally on Fed minutes", "Oil futures gap higher",
+# "Silver surges 8% to 14-year high") does NOT match — none lead with the
+# bracketed "<commodity> Rate Today in <city>" SEO header.
+_RT_DAILY_PRICE_CITY = re.compile(
+    r"^\s*(?:gold|silver|petrol|diesel|crude\s+oil)\s+(?:rate|price)\s+"
+    r"today\s+in\s+\S",
+    re.IGNORECASE,
+)
+
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
@@ -859,6 +954,9 @@ _RECAP_TEMPLATE_PATTERNS = (
     ("is_buy_after", _RT_IS_BUY_AFTER),
     ("street_thinks", _RT_STREET_THINKS),
     ("gf_value_says", _RT_GF_VALUE),
+    ("holdings_by_fund", _RT_HOLDINGS_BY_FUND),
+    ("futures_why_today", _RT_FUTURES_WHY_TODAY),
+    ("daily_price_city", _RT_DAILY_PRICE_CITY),
 )
 
 
