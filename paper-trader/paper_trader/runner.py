@@ -677,10 +677,19 @@ def _no_decision_cause(summary: dict) -> str:
         return "quota/usage limit"
     if summary.get("host_saturated"):
         return "host saturated (skipped claude)"
+    # Whitespace-only raw (rare but observed live when the CLI streams a
+    # blank line before disconnecting) carries no diagnostic value — strip
+    # first and only take the raw-response branch when something prose-y
+    # remains. Otherwise this returned "raw response (first line): " with an
+    # empty body, masking the per-call ``last_claude_fail`` tag the breaker
+    # alert was specifically designed to surface (timeout / empty_stdout /
+    # nonzero_rc / cli_missing / exception).
     raw = summary.get("raw")
-    if isinstance(raw, str) and raw:
-        head = raw.strip().split("\n", 1)[0]
-        return f"raw response (first line): {head[:120]}"
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if stripped:
+            head = stripped.split("\n", 1)[0]
+            return f"raw response (first line): {head[:120]}"
     fail = summary.get("last_claude_fail")
     if isinstance(fail, str) and fail:
         return f"claude no-response ({fail})"

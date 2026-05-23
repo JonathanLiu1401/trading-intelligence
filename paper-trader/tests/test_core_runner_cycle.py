@@ -253,6 +253,30 @@ class TestNoDecisionCause:
                 {"raw": None, "last_claude_fail": code})
             assert code in cause
 
+    def test_whitespace_only_raw_falls_through_to_last_claude_fail(self):
+        """A whitespace-only ``raw`` carries no diagnostic value (the CLI
+        streamed an empty line then disconnected). Historically this took
+        the raw-response branch and returned ``"raw response (first line): "``
+        with an empty body — masking the per-call ``last_claude_fail`` tag the
+        breaker alert exists to surface. The fix strips first and only emits
+        the raw-response branch when something prose-y remains.
+        """
+        for ws in ("", "   ", "\n", "  \n  \t  ", "\n\n\n"):
+            cause = runner._no_decision_cause(
+                {"raw": ws, "last_claude_fail": "empty_stdout"})
+            assert cause == "claude no-response (empty_stdout)", (
+                f"whitespace raw={ws!r} did not fall through to "
+                f"last_claude_fail; got {cause!r}"
+            )
+
+    def test_whitespace_only_raw_empty_when_no_fail_tag(self):
+        """And when both ``raw`` is whitespace AND ``last_claude_fail`` is
+        absent, the cause is the empty string — not a misleading
+        ``raw response (first line): `` line with no payload."""
+        assert runner._no_decision_cause({"raw": "   \n  "}) == ""
+        assert runner._no_decision_cause(
+            {"raw": "", "last_claude_fail": ""}) == ""
+
 
 class TestCircuitBreakerAlert:
     """The breaker historically fired silently — stdout WARNING only.
