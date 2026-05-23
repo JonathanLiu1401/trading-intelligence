@@ -3884,6 +3884,181 @@ def create_app(store=None) -> Flask:
             "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         })
 
+    @app.get("/api/label-quality")
+    def api_label_quality():
+        """Composite ML training-input health view.
+
+        Wires three previously-dark analyzer modules into one endpoint so the
+        operator can answer "are the model's labels still trustworthy?" in
+        one call:
+
+          * ``ml.label_audit.audit`` — strong-pool integrity (Claude-LLM vs
+            heuristic-inferred vs synthetic backtest provenance, column
+            hygiene violations, reconciliation check). The single most load-
+            bearing invariant of the system (CLAUDE.md §5).
+          * ``ml.score_agreement.compute_agreement`` — ml_score vs ai_score
+            agreement on the LLM-graded overlap. The cheap-model drift signal:
+            if ArticleNet stops tracking Sonnet's judgement on items the LLM
+            actually graded, the cheap model is no longer a trustworthy filter.
+
+        Adds a single roll-up ``verdict``:
+          OK         — hygiene clean AND |bias| < 1.0 AND strong-divergence < 15%
+          DIVERGING  — hygiene clean BUT ml/ai disagreement is structurally large
+          DIRTY      — hygiene violations present OR strong-pool buckets fail to
+                       reconcile (this is the analyst's "stop trusting the model"
+                       signal — surfaces immediately, never hidden behind a 2nd-
+                       order metric).
+
+        Read-only against articles.db (one ``mode=ro`` connection per call,
+        WAL-isolated from the daemon's writer — adds zero lock contention).
+        Returns a 200 with degraded ``status`` rather than raising on any
+        partial failure (mirrors the existing `/api/ml-status` discipline).
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+
+        out = {
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "label_audit": None,
+            "score_agreement": None,
+            "verdict": "UNKNOWN",
+            "errors": [],
+        }
+
+        # 1) Strong-pool integrity (label_audit) — needs a `.conn`-bearing
+        # shim. The audit's _RoStore exists exactly for this case but is
+        # private; build our own thin shim around _ro_conn() to keep the
+        # public surface stable.
+        conn = _ro_conn()
+        if conn is None:
+            out["errors"].append("articles_db_unreachable")
+        else:
+            try:
+                from ml.label_audit import audit as _label_audit
+                class _Shim:
+                    pass
+                shim = _Shim()
+                shim.conn = conn
+                out["label_audit"] = _label_audit(shim)
+            except Exception as e:
+                out["errors"].append(f"label_audit:{type(e).__name__}")
+            finally:
+                conn.close()
+
+        # 2) ml_score vs ai_score agreement — operates on rows, not a
+        # connection. Pull the most recent overlap window directly so the
+        # endpoint never imports score_agreement's filesystem-writing run().
+        conn2 = _ro_conn()
+        if conn2 is not None:
+            try:
+                from ml.score_agreement import compute_agreement, _MIN_AI
+                cur = conn2.execute(
+                    "SELECT ml_score, ai_score, title, source, first_seen "
+                    "FROM articles "
+                    "WHERE ml_score IS NOT NULL AND ai_score >= ? "
+                    f"AND {_LIVE_ONLY_SQL} "
+                    "ORDER BY first_seen DESC LIMIT 20000",
+                    (_MIN_AI,),
+                )
+                rows = [
+                    {"ml_score": r[0], "ai_score": r[1],
+                     "title": r[2], "source": r[3], "first_seen": r[4]}
+                    for r in cur.fetchall()
+                ]
+                out["score_agreement"] = compute_agreement(rows)
+            except Exception as e:
+                out["errors"].append(f"score_agreement:{type(e).__name__}")
+            finally:
+                conn2.close()
+
+        # 3) Single roll-up verdict. Hygiene takes precedence over drift —
+        # a column hygiene violation or a non-reconciling pool is a code-
+        # invariant break and must surface as DIRTY even if the cheap model
+        # is currently agreeing with the LLM (today's clean agreement says
+        # nothing about tomorrow's training run).
+        la = out["label_audit"]
+        sa = out["score_agreement"]
+        if isinstance(la, dict) and la.get("ok") is False:
+            out["verdict"] = "DIRTY"
+        elif isinstance(la, dict) and isinstance(sa, dict) and sa.get("n", 0) >= 100:
+            strong_pct = sa.get("strong_disagreement_pct", 0.0) or 0.0
+            bias = abs(sa.get("bias_ml_minus_ai", 0.0) or 0.0)
+            if strong_pct >= 15.0 or bias >= 1.0:
+                out["verdict"] = "DIVERGING"
+            else:
+                out["verdict"] = "OK"
+        elif isinstance(la, dict) and la.get("ok") is True:
+            # Hygiene clean but we don't have enough overlap to judge drift.
+            out["verdict"] = "OK_LOW_OVERLAP"
+
+        return jsonify(out)
+
+    @app.get("/api/active-learning-queue")
+    def api_active_learning_queue():
+        """Surface the model's most-uncertain articles for analyst review.
+
+        The recursive labeler writes ``data/active_learning_queue.jsonl`` —
+        one row per article that the MC-Dropout inference flagged as
+        high-variance ("the model could not make up its mind"). Capped at
+        5000 lines by the labeler. Until now, the queue was consumed only
+        by the labeler itself; an operator had no way to see *what* the
+        model is uncertain about.
+
+        This endpoint returns the most-recent ``limit`` rows (default 25,
+        max 100). Read-only file streaming — never raises on a missing or
+        partially-written JSONL (best-effort, mirrors
+        ``ml.conviction_calibration.load_outcomes`` discipline).
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            limit = max(1, min(100, int(request.args.get("limit", 25))))
+        except (TypeError, ValueError):
+            limit = 25
+
+        queue_path = BASE_DIR / "data" / "active_learning_queue.jsonl"
+        items: list[dict] = []
+        total = 0
+        if queue_path.exists():
+            try:
+                # Tail-read: seek the last ~64 KB × max-limit-headroom bytes
+                # so we never load a 50 MB JSONL into memory for a 25-row
+                # query. 8 KB/row average is a generous bound; this scans
+                # comfortably under 4 MB even for limit=100.
+                approx_row_bytes = 8 * 1024
+                window = approx_row_bytes * (limit + 8)
+                size = queue_path.stat().st_size
+                with queue_path.open("rb") as fh:
+                    fh.seek(max(0, size - window))
+                    tail = fh.read()
+                lines = tail.splitlines()
+                # Drop the first line if we seeked mid-line (small risk: a
+                # partial JSON header would fail json.loads — best-effort).
+                if size > window and lines:
+                    lines = lines[1:]
+                for raw in lines:
+                    try:
+                        items.append(json.loads(raw.decode("utf-8", errors="replace")))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                items = items[-limit:]
+                # Total row count is informative but expensive on a huge
+                # file; the labeler's 5000-cap means a full scan is cheap.
+                with queue_path.open("rb") as fh:
+                    for total, _ in enumerate(fh, start=1):
+                        pass
+            except OSError:
+                items = []
+
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "queue_path": str(queue_path),
+            "total_queued": total,
+            "returned": len(items),
+            "limit": limit,
+            "items": list(reversed(items)),  # newest-first for analyst UX
+        })
+
     @app.get("/api/volume-history")
     def api_volume_history():
         """Hourly article ingest counts for the last 24 hours, live rows only."""

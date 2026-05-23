@@ -7489,6 +7489,53 @@ over implicit derive; defensive on empty action_taken.
 
 ---
 
+## 2026-05-23 feature-dev pass (Agent 4) — `/api/sizing-conviction-calibration`
+
+Does the gate's actually-sized `conviction_pct` (the BUY-only fraction
+in [0,1] persisted into `decision_outcomes.jsonl` since 2026-05-21)
+*predict realized 5d return*, or is the bot sizing on noise? The
+analyzer module `paper_trader/ml/conviction_calibration.py` answered
+this from a CLI but had **no consumer** — its own docstring
+explicitly flags the gap. This endpoint is the consumer.
+
+**Distinct from its neighbours (invariant #10 — do not consolidate):**
+
+- `/api/calibration` — buckets *closed BUY trades* by Opus's stated
+  textual `confidence` (0.0-0.5 / 0.5-0.65 / 0.65-0.8 / 0.8-1.0) and
+  reports win-rate + avg return per bucket. About **Opus's stated
+  confidence axis**, post-trade only.
+- UD's `/api/idea-conviction-calibration` — buckets the **idea-ledger**
+  high/med/low *categorical* conviction tier (a string label) by
+  ledger-derived forward return.
+- This — the gate's **sized fraction** (`conviction_pct` ∈ [0,1])
+  bucketed by quintile vs `forward_return_5d`. The economic-weight
+  question (a 5% bet vs a 40% bet on the same headline) that the other
+  two structurally cannot ask.
+
+Read-only over `data/decision_outcomes.jsonl`. The endpoint is a thin
+plumber — calls `conviction_calibration.analyze(path)` verbatim (single
+source of truth, never re-derives bucket means, Spearman, or
+monotonicity). Verdict ladder matches the analyzer's documented
+contract verbatim (`WELL_CALIBRATED` / `DIRECTIONAL` / `MISCALIBRATED`
+/ `INVERTED` / `INSUFFICIENT_DATA`). Adds only `as_of` + `source_path`
+to the analyzer's dict so the UI can render a freshness badge.
+
+```sh
+curl -s 'http://localhost:8090/api/sizing-conviction-calibration' | python3 -m json.tool
+```
+
+Pinned by `tests/test_sizing_conviction_calibration_endpoint.py` (5
+cases via Flask test_client, per the
+`[paper-trader analytics verification]` memory): WELL_CALIBRATED on
+monotone-rising synthetic outcomes, INVERTED on anti-predictive
+outcomes, INSUFFICIENT below MIN_PAIRS=30, missing-file degrades to
+INSUFFICIENT, SELL/out-of-range/non-finite rows dropped correctly.
+Advisory only — never gates Opus, sizes nothing, adds no caps
+(invariants #2/#12; the `desk_pulse`/`self_review` precedent). Applies
+on next paper-trader restart (`/api/build-info` `stale`/`behind`).
+
+---
+
 ## 2026-05-20 feature-dev pass (Agent 4) — `/api/conviction-deployment-curve`
 
 Does the bot's BUY size scale with the news ai_score at the moment of

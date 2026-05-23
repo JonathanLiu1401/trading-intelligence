@@ -9245,6 +9245,39 @@ def calibration_api():
         return jsonify({"error": str(e)}), 500
 
 
+# Distinct from `/api/calibration` (Opus's stated confidence → win rate on
+# closed trades) and the unified-dashboard's `/api/idea-conviction-calibration`
+# (idea-ledger high/med/low tier → forward return): this is the ONLY view of
+# the gate's actual sized `conviction_pct` (0..1) vs the realized 5d return
+# stored in decision_outcomes.jsonl. The conviction_calibration analyzer's
+# docstring explicitly notes the row has no consumer — this endpoint is it.
+@app.route("/api/sizing-conviction-calibration")
+def sizing_conviction_calibration_api():
+    """Does the gate's sized conviction_pct rank realized 5d return?
+
+    Buckets BUY rows from ``data/decision_outcomes.jsonl`` by
+    ``conviction_pct`` quintile and reports Spearman rank-skill +
+    a top-vs-bottom realized spread. Verdicts:
+
+      WELL_CALIBRATED — strong rank skill AND monotone AND ≥3pp spread
+      DIRECTIONAL     — some rank skill, below the strong bar
+      MISCALIBRATED   — sizing carries no rank skill (variance with no edge)
+      INVERTED        — top-conviction realizes LESS than bottom (anti-predictive)
+      INSUFFICIENT_DATA — fewer than 30 valid BUY rows
+
+    Read-only against the JSONL; never raises (the analyzer absorbs every
+    fault and degrades to ``status='error'`` or ``insufficient_data``)."""
+    try:
+        from .ml.conviction_calibration import analyze
+        outcomes_path = Path(_REPO_DIR) / "data" / "decision_outcomes.jsonl"
+        rep = analyze(outcomes_path)
+        rep["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        rep["source_path"] = str(outcomes_path)
+        return jsonify(rep)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR"}), 500
+
+
 @app.route("/api/drawdown")
 def drawdown_api():
     """Drawdown anatomy: peak/trough, time-in-DD, per-position contribution.
