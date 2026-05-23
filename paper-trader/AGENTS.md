@@ -6,6 +6,132 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #17 (Agent 2) — `evaluate_scorer_oos` failed-pred drop + per-action OOS RMSE
+
+### Phase 1: Debug — 1 bug fixed (e6c4c8b)
+
+`evaluate_scorer_oos` called `scorer.predict()` directly, which returns
+the sentinel `0.0` on prediction failure (untrained scorer, build_features
+shape mismatch from a feature addition without retrain, non-finite output).
+Those fabricated zeros silently contributed `(0.0 - actual)**2` to RMSE,
+biasing the per-cycle skill ledger's `oos_rmse`. The sibling
+`_oos_rank_metrics` and `_oos_multi_horizon_metrics` already prefer
+`predict_with_meta` and drop on `failed=True` — mirrored that discipline
+in `validation.py` so `oos_rmse`, `oos_ic`, and 10d/20d horizon metrics
+all describe the same subset of trustworthy rows. Legacy scorer stubs
+without `predict_with_meta` fall back to the scalar path so existing
+tests (`test_validation.TestEvaluateScorerOos*`) keep working unchanged.
+Two new regression tests pin the failed-pred drop and the legacy fallback.
+
+### Phase 2: Feature — per-action OOS RMSE (ab27170)
+
+The `_ml_decide` conviction gate (CLAUDE.md §5) modulates BUY-only, so the
+gate-relevant magnitude error is the BUY RMSE — the aggregate
+`oos_rmse` can hide a BUY error much worse (or better) than the SELL
+error. Added `buy_rmse` / `sell_rmse` / `buy_n` / `sell_n` to
+`evaluate_scorer_oos`, mirroring the per-action rank-IC breakdown
+already present in `_oos_rank_metrics` (`oos_buy_ic` / `oos_sell_ic`).
+Same label-clamp + SELL-sign-flip discipline; same `_rmse_or_none`
+honest-empty sentinel as every other ledger.
+
+Wired the new metrics through `_train_decision_scorer`'s status string
+(`oos_buy_rmse_n=…` / `oos_buy_rmse=…` / sell equivalents) and
+`_parse_scorer_status` so the per-cycle skill ledger trends BUY RMSE
+and SELL RMSE as separate signals. Old status strings predating this
+wiring degrade to `None` for the new fields — historical ledger rows
+parse clean (same legacy-status discipline as multi-horizon /
+label-clamp / per-action rank-IC precedents). Eight new tests:
+six in `test_validation.TestEvaluateScorerOosPerActionBreakdown` lock
+the breakdown math (conservation: `buy_n + sell_n == n`, default-action
+counts as BUY, label-clamp applied per-action, empty-bucket → None) and
+three in `test_continuous.TestParseScorerStatus` lock the parser tokens.
+
+### Phase 3 findings — live ML state at 2026-05-23
+
+1. **Backtests healthy at the aggregate level.** `backtest.db` has 474
+   complete / 26 failed runs (94.8% success); 471 of those qualify
+   under the `_ml_is_qualified` floor (n_trades ≥ 5, vs_spy_pct
+   populated). Latest completed run_id=100000 at 2026-05-22T06:24 UTC.
+   Across the recent 100 qualifying runs: median `vs_spy_pct` = +69.4%,
+   mean = +180.0%, positive-alpha = 82/100 — the live trader's
+   `_ml_qualify_cache` median-alpha gate (CLAUDE.md §15) sits well above
+   its `ML_QUALIFY_MEDIAN_ALPHA=0.0` floor.
+
+2. **Deployed scorer is well-calibrated.** Sampled OOS deciles on the
+   live 1750-row temporal holdout: every decile's `mean_pred` matches
+   `mean_realized` within ~1pp (d1: pred −9.95 vs realized −9.14; d10:
+   pred +12.39 vs realized +12.28). OOS rank-IC = +0.36 from
+   `baseline_compare`, verdict `MLP_ADDS_SKILL` — beats the best
+   one-liner baseline (`neg_bb` +0.075) by +0.28. The documented
+   `MLP_WORSE_THAN_TRIVIAL` verdict has flipped — the recent retune
+   plus accumulated outcomes have moved the net into genuinely additive
+   territory.
+
+3. **New per-action RMSE breakdown reveals the gate is BETTER than the
+   aggregate suggests.** Ran `evaluate_scorer_oos` on the live OOS slice
+   (n=1750): aggregate `rmse=11.51`, but `buy_rmse=11.29` (n=1501) and
+   `sell_rmse=12.76` (n=249). The BUY-only conviction gate's relevant
+   magnitude error is materially lower than the SELL-side error, and
+   the aggregate was hiding that fact. This is the exact signal pass
+   #17's feature addition was designed to surface.
+
+4. **`predict_calibrated` is documented `DIRECTIONAL_BUT_BIASED` with
+   `vs_raw_bias_reduction=-3.52pp`** (calibration_reliability CLI). The
+   quantile-mapped magnitude is WORSE than the raw `predict()` reading
+   — the rank ordering is preserved but the magnitude correction
+   overshoots OOS. This is a known, persistent issue: the deciles show
+   `calibrated` value diverges from realized in the tails (d10: cal
+   +26.71 vs realized +6.22; d9: cal +15.40 vs realized +5.10). The
+   per-cycle `_append_calibrated_reliability_log` row would surface
+   this as a `DIRECTIONAL_BUT_BIASED` verdict — operators reading the
+   ledger should treat the rank percentile as trustworthy, the
+   calibrated %% magnitude as suspect.
+
+5. **Skill ledgers stalled.** `data/scorer_skill_log.jsonl` has 1 row
+   (mtime 2026-05-21 23:24); `baseline_skill_log.jsonl` 1 row;
+   `conviction_calibration_log.jsonl` / `calibrated_reliability_log.jsonl`
+   / `validation_results.json` don't exist on disk. The continuous loop
+   process (`run_continuous_backtests`) isn't running (last
+   `continuous.log` write 2026-05-18); the deployed `scorer.pkl` was
+   retrained 2026-05-23 01:26 UTC via another path (likely a manual
+   train or a different scheduler). Whatever retrains the scorer is
+   NOT writing skill ledger rows, so the per-cycle trend-of-skill
+   surface is dark. This is the most operationally important finding:
+   the gate-relevant OOS metrics (the very ones pass #17 wired) won't
+   reach the ledger until the continuous loop restarts. Reporting; no
+   safe one-shot fix.
+
+### Test commands for the ML/backtest domain
+
+```bash
+# Focused ML+backtest slice (~22s, what pass #17 ran every iteration):
+python3 -m pytest tests/test_validation.py tests/test_decision_scorer.py \
+    tests/test_continuous.py tests/test_backtest.py
+# → 305 passed
+
+# Per-action OOS RMSE on the live OOS slice (run as a quant researcher):
+python3 -c "
+import json
+from pathlib import Path
+from paper_trader.ml.decision_scorer import DecisionScorer
+from paper_trader.validation import evaluate_scorer_oos, split_outcomes_temporal
+rows = [json.loads(ln) for ln in
+        Path('data/decision_outcomes.jsonl').read_text().splitlines() if ln.strip()]
+_, oos = split_outcomes_temporal(rows, oos_fraction=0.2)
+r = evaluate_scorer_oos(DecisionScorer(), oos)
+print(f'aggregate rmse={r[\"rmse\"]:.2f} buy_rmse={r[\"buy_rmse\"]:.2f} sell_rmse={r[\"sell_rmse\"]:.2f}')"
+
+# Decile reliability of the deployed pickle:
+python3 -m paper_trader.ml.calibration_reliability
+# → DIRECTIONAL_BUT_BIASED on the current pickle (see finding #4 above)
+
+# Trivial-baseline cross-check (does the MLP add real skill?):
+python3 -m paper_trader.ml.baseline_compare
+# → MLP_ADDS_SKILL on the current pickle (rank-IC +0.36 vs neg_bb +0.075)
+```
+
+---
+
 ## 2026-05-23 — Agent 1 (paper-trader core) HYBRID review pass #3
 
 ### Phase 1: Debug — 0 bugs fixed
