@@ -1108,12 +1108,16 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
                 return "BLOCKED", f"insufficient cash (have ${snapshot['cash']:.2f}, need ${notional:.2f})"
             store.record_trade(ticker, "BUY", qty, price, reason)
             store.upsert_position(ticker, "stock", qty, price)
-            store.update_portfolio(snapshot["cash"] - notional, snapshot["total_value"], snapshot["positions"])
+            # positions=None: end-of-cycle _portfolio_snapshot re-marks and
+            # writes the post-trade blend; passing snapshot["positions"] here
+            # would desync portfolio.positions_json from the positions table
+            # (a dashboard read would see the new cash but the pre-trade list).
+            store.update_portfolio(snapshot["cash"] - notional, snapshot["total_value"])
             return "FILLED", f"BUY {qty} {ticker} @ {price:.2f}"
         else:
             store.record_trade(ticker, "SELL", qty, price, reason)
             store.upsert_position(ticker, "stock", -qty, price)
-            store.update_portfolio(snapshot["cash"] + notional, snapshot["total_value"], snapshot["positions"])
+            store.update_portfolio(snapshot["cash"] + notional, snapshot["total_value"])
             return "FILLED", f"SELL {qty} {ticker} @ {price:.2f}"
 
     if action in ("BUY_CALL", "BUY_PUT"):
@@ -1139,7 +1143,9 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
         store.record_trade(ticker, action, qty, opt_px, reason, expiry=expiry,
                            strike=strike_f, option_type=otype)
         store.upsert_position(ticker, otype, qty, opt_px, expiry=expiry, strike=strike_f)
-        store.update_portfolio(snapshot["cash"] - notional, snapshot["total_value"], snapshot["positions"])
+        # positions=None: see the stock-BUY branch — end-of-cycle re-mark
+        # writes the post-trade blend (with the new option contract).
+        store.update_portfolio(snapshot["cash"] - notional, snapshot["total_value"])
         return "FILLED", f"{action} {qty} {ticker} {strike_f}{otype[0].upper()} {expiry} @ {opt_px:.2f}"
 
     if action in ("SELL_CALL", "SELL_PUT"):
@@ -1189,7 +1195,8 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
                            expiry=match["expiry"], strike=match["strike"], option_type=otype)
         store.upsert_position(ticker, otype, -qty, opt_px,
                               expiry=match["expiry"], strike=match["strike"])
-        store.update_portfolio(snapshot["cash"] + notional, snapshot["total_value"], snapshot["positions"])
+        # positions=None: see the stock-BUY branch.
+        store.update_portfolio(snapshot["cash"] + notional, snapshot["total_value"])
         return "FILLED", f"{action} {qty} {ticker} {match['strike']}{otype[0].upper()} {match['expiry']} @ {opt_px:.2f}"
 
     return "BLOCKED", f"unknown action {action}"
