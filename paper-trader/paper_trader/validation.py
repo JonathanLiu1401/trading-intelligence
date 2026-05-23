@@ -571,24 +571,57 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
 
     from paper_trader.ml.decision_scorer import _to_float, PRED_CLAMP_PCT
 
+    # Prefer predict_with_meta so we can drop rows whose prediction COULD NOT
+    # BE PRODUCED (exception path / non-finite output). The scalar `predict()`
+    # returns 0.0 silently in those cases, which would inflate or deflate RMSE
+    # with a fabricated zero prediction. This is the same discipline the
+    # sibling `_oos_rank_metrics` and `_oos_multi_horizon_metrics` already
+    # apply — mirroring it here keeps the cycle's `oos_rmse` consistent with
+    # `oos_ic` (both should describe the same subset of trustworthy rows).
+    # Test fakes without predict_with_meta fall back to the legacy predict()
+    # path so existing tests continue to work unchanged.
+    _pwm = getattr(scorer, "predict_with_meta", None)
+    _use_meta = callable(_pwm)
+
     preds: list[float] = []
     actuals_clamped: list[float] = []
     actuals_raw: list[float] = []
     for r in oos_records:
         try:
-            p = scorer.predict(
-                ml_score=_to_float(r.get("ml_score"), 0.0),
-                rsi=r.get("rsi"),
-                macd=r.get("macd"),
-                mom5=r.get("mom5"),
-                mom20=r.get("mom20"),
-                regime_mult=_to_float(r.get("regime_mult"), 1.0),
-                ticker=str(r.get("ticker") or ""),
-                vol_ratio=r.get("vol_ratio"),
-                bb_pos=r.get("bb_position"),
-                news_urgency=r.get("news_urgency"),
-                news_article_count=r.get("news_article_count"),
-            )
+            if _use_meta:
+                _meta = _pwm(
+                    ml_score=_to_float(r.get("ml_score"), 0.0),
+                    rsi=r.get("rsi"),
+                    macd=r.get("macd"),
+                    mom5=r.get("mom5"),
+                    mom20=r.get("mom20"),
+                    regime_mult=_to_float(r.get("regime_mult"), 1.0),
+                    ticker=str(r.get("ticker") or ""),
+                    vol_ratio=r.get("vol_ratio"),
+                    bb_pos=r.get("bb_position"),
+                    news_urgency=r.get("news_urgency"),
+                    news_article_count=r.get("news_article_count"),
+                )
+                # `failed=True` ⇒ the 0.0 in `pred` is a sentinel, not a real
+                # prediction; drop the row so it cannot contaminate RMSE with
+                # a fabricated zero. Same drop discipline as _oos_rank_metrics.
+                if _meta.get("failed"):
+                    continue
+                p = float(_meta.get("pred", 0.0))
+            else:
+                p = scorer.predict(
+                    ml_score=_to_float(r.get("ml_score"), 0.0),
+                    rsi=r.get("rsi"),
+                    macd=r.get("macd"),
+                    mom5=r.get("mom5"),
+                    mom20=r.get("mom20"),
+                    regime_mult=_to_float(r.get("regime_mult"), 1.0),
+                    ticker=str(r.get("ticker") or ""),
+                    vol_ratio=r.get("vol_ratio"),
+                    bb_pos=r.get("bb_position"),
+                    news_urgency=r.get("news_urgency"),
+                    news_article_count=r.get("news_article_count"),
+                )
             # NaN sentinel default — missing / null / non-finite targets are
             # excluded by the `a == a` guard below, not silently coerced to
             # 0.0 (which would fabricate a flat outcome and bias RMSE).

@@ -563,6 +563,77 @@ class TestEvaluateScorerOos:
         assert result["n"] == 2
         assert result["rmse"] == pytest.approx(0.0, abs=1e-9)
 
+    def test_failed_prediction_dropped_not_zeroed(self):
+        """Regression lock: a scorer row whose `predict_with_meta` returns
+        ``failed=True`` (untrained / shape mismatch / non-finite output) must
+        be DROPPED, not silently contribute (0.0 - actual)^2 to RMSE. The
+        sibling `_oos_rank_metrics` already drops on `failed=True`; this
+        locks the same discipline in `evaluate_scorer_oos` so the per-cycle
+        ledger's `oos_rmse` and `oos_ic` always describe the SAME subset of
+        trustworthy rows.
+
+        Scorer returns +10 for one row (pred OK) and `failed=True` (pred=0.0
+        sentinel) for the next. Actual realized returns are +10 and +10
+        respectively. With the fix: only the first row contributes,
+        RMSE = 0.0. Pre-fix: the sentinel 0.0 contributes (0-10)^2 = 100,
+        RMSE = sqrt(50) ≈ 7.07.
+        """
+        from paper_trader.validation import evaluate_scorer_oos
+
+        class _MetaScorer:
+            is_trained = True
+
+            def __init__(self):
+                self._calls = 0
+
+            def predict_with_meta(self, **_kw):
+                self._calls += 1
+                if self._calls == 1:
+                    return {"pred": 10.0, "raw": 10.0, "clamped": False,
+                            "off_distribution": False, "percentile": None,
+                            "calibrated": None, "failed": False}
+                return {"pred": 0.0, "raw": 0.0, "clamped": True,
+                        "off_distribution": True, "percentile": None,
+                        "calibrated": None, "failed": True}
+
+            def predict(self, **_kw):
+                meta = self.predict_with_meta(**_kw)
+                return meta["pred"]
+
+        records = [
+            {"forward_return_5d": 10.0, "action": "BUY", "ticker": "NVDA"},
+            {"forward_return_5d": 10.0, "action": "BUY", "ticker": "AMD"},
+        ]
+        result = evaluate_scorer_oos(_MetaScorer(), records)
+        # Only the first row contributed; second was dropped on failed=True.
+        assert result["n"] == 1
+        assert result["rmse"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_legacy_scorer_without_predict_with_meta_still_works(self):
+        """Test fakes / legacy stubs that only implement `predict()` (no
+        `predict_with_meta` sibling) must fall back gracefully to the scalar
+        path — never crash on getattr lookup, never silently produce wrong
+        RMSE. Mirrors the same `_use_meta` fallback discipline in
+        `_oos_rank_metrics` / `_oos_multi_horizon_metrics`.
+        """
+        from paper_trader.validation import evaluate_scorer_oos
+
+        class _LegacyScorer:
+            is_trained = True
+
+            def predict(self, **_kw):
+                return 3.0
+            # Deliberately no predict_with_meta
+
+        records = [
+            {"forward_return_5d": 3.0, "action": "BUY", "ticker": "NVDA"},
+            {"forward_return_5d": 5.0, "action": "BUY", "ticker": "AMD"},
+        ]
+        result = evaluate_scorer_oos(_LegacyScorer(), records)
+        # Predictions constant 3; actuals 3 and 5 → errors 0 and 2 → RMSE = sqrt(2)
+        assert result["n"] == 2
+        assert result["rmse"] == pytest.approx((2.0) ** 0.5, abs=1e-9)
+
 
 class TestEvaluateScorerOosLabelClamp:
     """train_scorer clamps training labels to ±PRED_CLAMP_PCT before fit, so
