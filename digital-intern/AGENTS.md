@@ -5,6 +5,91 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-23 hybrid pass #21 (Agent 3) — hyphenated image-credit gap + prefloor pool audit
+
+Debugger + feature-dev + news-analyst pass. Two commits on master.
+
+**Phase 1 (debug) — `7c84850`.** ``_QW_IMAGE_CREDIT`` name-token regex
+required ``[A-Z][a-zA-Z]+`` for every name token, so a hyphenated first
+token (Asian / French conventions: "I-Hwa", "O-Lin", "Jean-Pierre",
+"Marie-Claire") hit ``-`` at the second character and silently leaked
+past the triple-gate defense (alert / briefing / web_scraper). Live
+evidence (2026-05-23 urgency=2 set): "I-Hwa Cheng/Bloomberg" from
+scraped/www.bloomberg.com reached alerted state un-suppressed — and
+Bloomberg's 0.90 source-credibility tier sits well above the 0.45
+lone-source bar so the authority gate cannot catch it; content type IS
+the failure. Fix adds a hyphenated branch to the name-token alternation
+in all three lockstep modules, anchored on a second uppercase letter so
+a stray "I-foo" prose token cannot match.
+
+New `tests/test_quote_widget_regex_parity.py` ALSO pins the byte-identical
+triple-gate parity claim for `_QW_PRICE_GLUE` / `_QW_PCT_PAREN` /
+`_QW_LISTING` / `_QW_IMAGE_CREDIT` / `_QW_QUOTE_PATH` (was untested — drift
+across the three modules is silent and catastrophic), plus two-way parity
+for `_QW_STOCKTWITS_SENTIMENT` / `_QW_SCREENER_TAPE`. 46 new tests pass;
+179 existing alert/briefing/scraper/urgency tests still pass.
+
+**Phase 2 (feature) — `a0b536d`.** New `analytics/prefloor_pool_audit.py`:
+the **strong-label noise pressure** view the existing audit family
+(``quote_widget_audit``, ``recap_template_audit``, ``label_audit``) was
+missing. Those count fingerprint *hits at audit time*; this counts
+*accumulated label-pool contamination* the trainer actually sees.
+
+The pre-filter floors quote-widget / recap-template / Sonnet-omitted rows
+to `ai_score=0.01` with `score_source='llm'` so they exit the LLM queue
+forever. Those rows enter the trainer's strong-label pool because
+`STRONG_LABEL_WHERE` accepts `ai_score > 0` and `0.01 > 0`. Live 30d
+audit: **15,631 of 22,849 score_source='llm' rows are exactly 0.01 →
+68% of the LLM-labeled pool is prefloored noise**. The sample-weight
+exponent (2.0) effectively zeroes these out so the model isn't
+catastrophically broken today, but a new SEO mill class the gates haven't
+caught yet would spike the rate to >>50% in the cycle's new labels and
+silently collapse the ground-truth signal.
+
+Verdict thresholds (window-restricted share): HEALTHY < 70%, ELEVATED
+70-85%, CONTAMINATED ≥ 85%. Per-source top-N attribution surfaces who
+is generating the noise so the analyst can decide which collector to
+throttle or which fingerprint to add. CLI: `--hours <N> --top <N> --json`.
+14 new tests pin canonical predicate, backtest isolation, verdict
+breakpoints, per-source attribution, window restriction, read-only.
+
+**Phase 3 (live validation) — user_findings=6 (3 reportable, 3 acted on).**
+
+Live snapshot (2026-05-23 ~18:30Z):
+
+1. **51 of ~70 collectors flagged DOWN** by `source_health`. Tier-1 feeds
+   silently dark: `sec_edgar*`, `polygon`, `newsapi`, `alphavantage`,
+   `fed_press`, `ecb_press`, `boj_press`, `boe_press`, `macro_calendar`,
+   `fear_greed`, `crypto_fear_greed`, `nitter`, `wikipedia*`,
+   `globenewswire`, `market_movers`, `sec_form4`/`13f`/`xbrl`. The
+   collectors PING alive (the worker cycle completes) — they just return
+   0 articles every cycle (`[polygon] cycle ok (0 new)` is the smoking gun).
+   This is a known-chronic state per the operator's auto-memory (`DI
+   chronic dark collectors`), but **51 is a much wider gap than the
+   memory's 4-source baseline**.
+2. **9% Sonnet vs 91% ML alerts last 24h** (20 score_source='llm' vs 216
+   'ml' in urgent state). The earlier "ZERO Sonnet-vetted urgent alerts"
+   finding has improved (Sonnet is reaching some urgent rows) but the
+   alert volume is still overwhelmingly dominated by the local model's
+   urgency head, not LLM ground truth.
+3. **Real Discord pushes look healthy and relevant** — 45 in last 24h,
+   NVDA earnings night coverage (revenue, buyback, China-exit), MU news
+   (Citi target reset, manufacturing expansion), regulatory (Tulsi
+   Gabbard, fentanyl crackdown). Briefings on cadence (last 4h ago, 50
+   articles each, structured market data + portfolio P&L + sector pulse).
+
+Acted on:
+4. Hyphenated image-credit gap (Phase 1 fix).
+5. Prefloor pool surfaced via Phase 2 audit — live invocation reports
+   22% window share = HEALTHY, top contributors stocktwits/sentiment +
+   YF/day_gainers + reddit/r/buildapc.
+6. Lockstep regex drift risk pinned by Phase 1 parity test (was untested
+   despite docstrings asserting byte-identical parity).
+
+**Counters:** `bugs_fixed=1`, `features_added=1`, `user_findings=6`.
+
+---
+
 ## 2026-05-23 feature pass (Agent 4 / feature-dev) — chat enrichment for concurrent-opus-attribution
 
 Wires paper-trader's new `/api/concurrent-opus-attribution` into the
