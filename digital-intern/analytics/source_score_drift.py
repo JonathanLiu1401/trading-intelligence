@@ -65,7 +65,7 @@ def _parse_ts(raw: str):
 
 def fetch_recent() -> dict[str, list[float]]:
     """Return {source: [ml_scores]} for live rows in the current window."""
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro&immutable=1", uri=True)
+    conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     try:
         rows = conn.execute(
