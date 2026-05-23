@@ -11415,6 +11415,47 @@ def loser_autopsy_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/bag-holding-skill")
+def bag_holding_skill_api():
+    """$-attribution of losses by failure mode — which mode bleeds the
+    account most, in dollars. /api/loser-autopsy reports COUNT per mode
+    and $ per TICKER; this is the missing $ per MODE view. Composes the
+    SSOT (build_round_trips + loser_autopsy._classify, AGENTS.md #10),
+    aggregates loss dollars by KNIFE_CATCH / SLOW_BLEED / STOPPED_OUT /
+    WHIPSAW, computes the BAG_HOLDING_RATIO (SLOW_BLEED $ / total $
+    lost), and emits a verdict (BAG_HOLDER / KNIFE_CATCHER /
+    WHIPSAW_BLEED / DISCIPLINED_CUTTER / MIXED) once n_losers ≥ 8
+    (loser_autopsy STABLE idiom). Advisory only — never gates Opus,
+    adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.bag_holding_skill import build_bag_holding_skill
+        store = get_store()
+        trades = list(reversed(store.recent_trades(2000)))
+        return jsonify(build_bag_holding_skill(trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/risk-adjusted-returns")
+def risk_adjusted_returns_api():
+    """Risk-adjusted returns vs the S&P 500 — port Sharpe/Sortino, S&P
+    Sharpe/Sortino, sharpe alpha, information ratio, and a verdict on
+    risk-adjusted performance. /api/benchmark is point-to-point DOLLAR
+    alpha (path-blind); /api/analytics carries a SCALAR sharpe but no
+    S&P parity or verdict. This is the risk-aware companion: is the
+    bot's return alpha worth the volatility it took on? Sample-size
+    honesty: numerics emit at ≥5 paired daily returns, verdict at ≥7
+    (the benchmark.py / trade_asymmetry STABLE idiom). Advisory only —
+    never gates Opus, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.risk_adjusted_returns import build_risk_adjusted_returns
+        store = get_store()
+        eq = store.equity_curve(limit=2000)
+        return jsonify(build_risk_adjusted_returns(eq))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/winner-autopsy")
 def winner_autopsy_api():
     """Per-closed-winning-round-trip post-mortem — the positive mirror of
