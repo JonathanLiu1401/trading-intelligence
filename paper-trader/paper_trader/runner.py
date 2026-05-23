@@ -62,6 +62,15 @@ _consecutive_no_decisions = 0
 # and re-alarms, which is the correct behaviour (a fresh process SHOULD tell
 # the operator it is still frozen).
 _quota_alert_active = False
+# Companion latch for the consecutive-NO_DECISION circuit-breaker alarm.
+# Same dedupe pattern as `_quota_alert_active`: set True the cycle the breaker
+# fires (a Discord alert went out), cleared on the next real decision (engine
+# is responding again — re-arm so a fresh wedge tomorrow re-alerts). Distinct
+# latch from the quota one because the two failure modes are independent
+# (a wedge is "Claude not responding"; quota is "Claude rejecting") and the
+# operator action differs (a breaker fire wants escalation, a quota wants
+# patience until the reset).
+_breaker_alert_active = False
 
 # Set by the git-watcher thread; checked by the main loop between cycles so
 # a restart never kills a mid-Opus decision call.
@@ -626,8 +635,35 @@ def _open_position_tickers_for_interval(store) -> list[dict]:
         return []
 
 
+def _no_decision_cause(summary: dict) -> str:
+    """Best-effort extraction of the cause-code suffix written into the
+    most recent NO_DECISION row by ``strategy.decide()`` for the breaker
+    alert body. Pure dict lookup over the in-hand summary — no store read
+    (the alert path must stay fast and degrade-safe; mirrors the rest of
+    runner's "never raise from a notification helper" discipline).
+
+    The decision schema buries the cause two ways:
+      * ``summary["host_saturated"]`` True → "skipped — host saturated"
+      * ``summary["quota_exhausted"]`` True → "quota/usage limit"
+      * neither → look at the raw response and the cause tag the strategy
+        emits ("claude returned no response (timeout)" → "timeout",
+        "parse_failed: …" → "parse_failed", etc.)
+
+    Returns ``""`` when no cause is recoverable from the summary."""
+    if summary.get("quota_exhausted"):
+        return "quota/usage limit"
+    if summary.get("host_saturated"):
+        return "host saturated (skipped claude)"
+    raw = summary.get("raw")
+    if isinstance(raw, str) and raw:
+        head = raw.strip().split("\n", 1)[0]
+        return f"raw response (first line): {head[:120]}"
+    return ""
+
+
 def _cycle():
     global _consecutive_no_decisions, _quota_alert_active
+    global _breaker_alert_active
     summary = strategy.decide()
 
     status = summary.get("status", "NO_DECISION")
@@ -661,15 +697,46 @@ def _cycle():
         if status == "NO_DECISION":
             _consecutive_no_decisions += 1
             if _consecutive_no_decisions >= CONSECUTIVE_NO_DECISION_LIMIT:
+                fired_at = _consecutive_no_decisions
                 print(
-                    f"[runner] WARNING: {_consecutive_no_decisions} consecutive "
+                    f"[runner] WARNING: {fired_at} consecutive "
                     f"NO_DECISION cycles — Claude appears wedged; killing stale "
                     f"claude processes to auto-recover"
                 )
                 _kill_stale_claude()
                 _consecutive_no_decisions = 0  # reset after intervention
+                # The breaker historically fired silently — only operator
+                # signal was a stdout WARNING line nobody tails. Surface it
+                # to Discord (the documented "primary surface"). Dedupe
+                # latch matches the quota_alert pattern: one alert per
+                # wedge, cleared on the next real decision. A latched
+                # second breaker fire inside the same outage stays silent
+                # so a long wedge doesn't flood the channel.
+                if not _breaker_alert_active:
+                    cause = _no_decision_cause(summary)
+                    try:
+                        if reporter.send_breaker_fired_alert(fired_at, cause):
+                            _breaker_alert_active = True
+                    except Exception as e:
+                        print(f"[runner] breaker alert failed: {e}")
         else:
             _consecutive_no_decisions = 0
+            # Engine produced a real decision (HOLD, FILLED, BLOCKED) — clear
+            # the breaker latch so a fresh wedge tomorrow re-alerts the
+            # operator. Symmetric with the quota latch's recovery path
+            # (re-arm only on confirmed responsiveness, never on an in-
+            # flight retry).
+            if _breaker_alert_active:
+                ok = False
+                try:
+                    ok = bool(reporter._send(
+                        "✅ **CLAUDE BREAKER CLEARED** ◈ decision engine "
+                        "responding again — live trader resumed"
+                    ))
+                except Exception as e:
+                    print(f"[runner] breaker recovery notice failed: {e}")
+                if ok:
+                    _breaker_alert_active = False
         # Quota recovered → tell the operator once, then re-arm the alarm so a
         # *future* outage alerts again. Only confirm on an actual claude
         # response (status != NO_DECISION); a non-quota timeout is not proof

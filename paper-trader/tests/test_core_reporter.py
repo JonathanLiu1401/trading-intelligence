@@ -943,6 +943,51 @@ class TestSendDecisionLog:
         assert "NO_DECISION" in captured[0]
 
 
+class TestSendBreakerFiredAlert:
+    """The circuit-breaker Discord alarm — fires from runner._cycle when
+    `_consecutive_no_decisions` crosses the threshold. Body must carry
+    the count + cause so the operator can diagnose without grep'ing logs."""
+
+    def test_body_includes_count_and_cause(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        ok = reporter.send_breaker_fired_alert(5, "host saturated (skipped)")
+        assert ok is True
+        body = captured[0]
+        assert "BREAKER FIRED" in body
+        assert "5 consecutive" in body
+        assert "host saturated" in body
+
+    def test_body_safe_without_cause(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        ok = reporter.send_breaker_fired_alert(7)
+        assert ok is True
+        # Body still useful without a cause line — must not append an empty
+        # "last cause: " label.
+        assert "7 consecutive" in captured[0]
+        assert "last cause:" not in captured[0]
+
+    def test_cause_truncated_to_200_chars(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        long_cause = "X" * 500
+        reporter.send_breaker_fired_alert(5, long_cause)
+        # 200-char slice from the body's `cause[:200]` cap (Discord 2000-char
+        # limit defence — the breaker alert body has fixed prefix text plus
+        # the suffix).
+        body = captured[0]
+        assert "X" * 200 in body
+        assert "X" * 201 not in body
+
+    def test_returns_false_when_send_fails(self, monkeypatch):
+        monkeypatch.setattr(reporter, "_send", lambda _msg: False)
+        assert reporter.send_breaker_fired_alert(5, "anything") is False
+
+
 class TestSendDailyCloseBaseline:
     """The daily-close P/L baseline label must track reporter._INITIAL_EQUITY,
     not a hardcoded literal. reporter.py's own header comment makes
