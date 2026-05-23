@@ -5,6 +5,125 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-23 hybrid pass (Agent 3) — `book_alert_coverage` surfaces per-held-position alert-pipeline gaps
+
+**Phase 1 (debug):** read AGENTS.md head + recent passes, daemon.py top,
+storage/article_store.py (full), watchers/alert_agent.py (head + dispatch),
+watchers/urgency_scorer.py, ml/trainer.py, ml/model.py, ml/features.py,
+collectors/web_scraper.py, analysis/claude_analyst.py
+(`_BOOK_TICKERS` / `_book_tickers` / `_book_heat_lines` / `_book_silence_lines`).
+Focused baseline suite (`test_article_store` + `test_urgency_scorer` +
+`test_features` + `test_model` + `test_trainer` + `test_alert_agent`) green
+at 85/85 in 24.18s. Probed live `articles.db` — all four load-bearing
+invariants clean: `synthetic_ever_alerted=0`, `ml_with_ai>0=0`,
+`stuck_urgency1>24h=0`. Every requested Phase-1 assertion is already pinned
+by the existing tests (backtest isolation in `TestBacktestIsolation`,
+ml-vs-llm split in `TestScoreSourceSeparation`, MAX-preserved urgency in
+`TestPreservesAlerted`, model output ranges in `test_model`, trainer label
+sourcing in `TestLabelSourcing`/`TestContinuousLabelSourcing`). **No code
+bug found** — `bugs_fixed=0`, no Phase-1 commit (honest per guard).
+
+**Phase 2 (feature) — `56d1c55`.** Added new pure storage primitive
+`ArticleStore.book_alert_coverage(tickers, hours=24, mentions_only_min=5)`.
+For each requested ticker over the window, returns mention / urgent /
+alerted counts plus a `MENTIONS_ONLY` / `LOW_VOLUME` / `URGENT` / `QUIET`
+verdict. The **novel signal is `MENTIONS_ONLY`** — a held name with
+`mentions >= mentions_only_min` yet ZERO `urgency>=1` classifications.
+Nothing else surfaced this exact coverage gap: `urgent_queue_health`
+tracks queued-but-unpushed (rows that DID reach urgency=1),
+`held_ticker_news_silence` tracks 24h DARK (zero mentions),
+`urgency_label_split_by_ticker` only sees urgent rows. The analyst-facing
+question is "the alert path is silent on this position — is the scorer
+missing real signal, or is the coverage all colour?"; either way the
+position deserves a look.
+
+Whole-word ALL-CAPS matching with optional `$` prefix and `len >= 2` skip —
+byte-identical to `ticker_mention_velocity` / `urgency_label_split_by_ticker` /
+`urgent_queue_health`'s discipline, so the four per-ticker primitives never
+disagree about whether a row touches a held name. Match surface = title +
+decompressed summary. `_LIVE_ONLY_CLAUSE`-scoped (synthetic backtest/opus
+rows cannot inflate any per-ticker figure — pinned by
+`TestBacktestIsolation`). Read-only, single SELECT, decorated with
+`@_retry_on_lock`. NO DB write, no ai_score/ml_score/score_source/urgency
+mutation — pinned by `TestReadOnlyInvariant` snapshotting column state
+across the call.
+
+Pinned by `tests/test_book_alert_coverage.py` (**18 tests, all pass in
+10.18s**): verdict partition (4), backtest isolation (2 — backtest://
+URL and opus_annotation source neither inflate counts nor flip the
+verdict), ticker matching discipline (4), window/counts (3), sort/shape
+(4), read-only mutation guard (1). Sibling primitive sweep
+(article_store + urgency_scorer + features + model + trainer +
+alert_agent + urgency_label_split* + urgent_queue_health +
+ticker_mention_velocity + book_alert_coverage): **154 passed in 114.76s**,
+no regressions.
+
+**Phase 3 (live validation) — user_findings=8.**
+1. **NEW FEATURE LIVE — 7 MENTIONS_ONLY hits on the production held book.**
+   Running `book_alert_coverage(LIVE_PORTFOLIO_TICKERS, hours=24)` against
+   the live articles.db immediately surfaced 7 held names with
+   substantial article volume but ZERO urgency>=1 classifications in 24h:
+   **ORCL** (46 mentions / 0 urgent — Oracle, a live held position),
+   **KLAC** (31 / 0), **WDC** (29 / 0), **LRCX** (28 / 0), **STX** (28 / 0),
+   **SOXX** (18 / 0), **TSEM** (12 / 0). The semis watchlist names
+   (KLAC/WDC/LRCX/STX/SOXX) are getting genuine coverage volume the
+   urgency scorer never escalated — exactly the coverage gap nothing
+   else exposed. ORCL is the most actionable: 46 articles on a live
+   held position with zero urgent calls in 24h.
+2. **Briefing #41 (06:01 UTC, 50 articles, 3081 chars) is high quality** —
+   clean Bloomberg-style with LEAD (Warsh sworn in as Fed Chair) / MACRO
+   (S&P 7,445.72 +0.17%, VIX 16.76, 10Y 4.59%) / PORTFOLIO / SEMIS PULSE
+   (NVDA $219.51, MU $762.10) / TOP SIGNALS / RISK / COVERAGE GAP.
+3. **Briefing PORTFOLIO still blind to held GOOG/COHR/MSFT/NVDL** — same
+   ossified `_BOOK_TICKERS` finding the 2026-05-22 pass logged. Multi-file
+   refactor out of scope.
+4. **Briefing cadence drift**: id41 06:01 / id40 00:55 / id39 14:40 — gaps
+   of 5h, 10.2h. The 10h overnight skip matches the documented Opus-quota
+   pattern.
+5. **Chronic dark collectors** (briefing COVERAGE GAP): Polygon ~208h
+   (1249 empty polls, 0 delivered all session), NewsAPI ~339h (814 empty
+   polls, 0 delivered), SEC 8-K ~10.2h, SEC full-text ~7.8h, AlphaVantage
+   ~12h. Standing external gap per `di-chronic-dark-collectors`.
+6. **score_source skew (24h urgent rows): 20 llm / 264 ml = 7% LLM-vetted,
+   93% ML-only** — chronic "mostly_unverified" pattern. The
+   `[unverified — model-only urgent]` tag already hedges per-row.
+7. **DB lock-contention storm** (logs 08:14-08:22Z): rss / google_news /
+   finnhub / twse_semiconductor workers backing off 5-60s with
+   "database is locked". Self-healing via `_retry_on_lock`; matches
+   `di-insert-batch-lock-contention`.
+8. **Claude no-response on alert path** (logs 08:13Z, 08:15Z): "No response
+   from Claude — skipping" twice. When the alert finally fired (08:28Z) the
+   queue had backed up to 34 items; chronic Claude-starvation pattern.
+   Pipeline otherwise healthy: 1237 live rows/h, 47 sources currently
+   disabled (newly_down=['polymarket']), 105 urgency=2 rows in last 24h,
+   179 urgency=1 backlog (none stuck > 24h).
+
+**Phase 4 (docs):** this section.
+
+**Final verify:** `from storage import article_store; from ml import
+features, model` → `imports OK`. Focused suite (every module touched plus
+sibling per-ticker primitives) **154 passed in 114.76s**; new
+`test_book_alert_coverage` **18 passed in 10.18s**. Full `pytest tests/`
+deferred per the standing concurrent-agent I/O saturation rule (three
+sibling claude HYBRID agents visible in `ps -ef`); the focused suites
+cover every module touched by this change.
+
+**Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=8`.
+
+**Staging discipline.** Per-commit explicit pathspec (`git add
+storage/article_store.py tests/test_book_alert_coverage.py`), no
+`git add -A`. `config/portfolio.json` was modified by the auto-commit
+daemon / trading UI (not this agent), `watchers/urgency_scorer.py` +
+`tests/test_urgency_portfolio_prompt.py` were modified by a sibling agent
+(visible in `git status` before this pass started — held-positions slot
+in the urgency SCORE_PROMPT), and the paper-trader sibling repo had
+concurrent edits (dashboard / store / strategy / runner / multiple
+analytics modules). All untouched — `git diff --staged --stat` was
+verified before commit to confirm only the two intentional files were
+included.
+
+---
+
 ## 2026-05-22 hybrid pass (Agent 3) — price alerts cover every held position
 
 **Phase 1 (fix) — `b61fb4d`.** `price_alert_worker` fired 3% price alerts
