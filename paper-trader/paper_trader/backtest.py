@@ -106,11 +106,31 @@ QUANT_SIGNAL_TICKERS = [
 ]
 
 # Leveraged ETFs that can receive elevated conviction when signals are very strong.
+# Coverage audit: every WATCHLIST ticker that the inline section comments classify
+# as a "Leveraged ETF — Bull" (3x bull / 2x bull / crypto 2x / commodity 2x) MUST
+# appear here so the `_ml_decide` conviction-cap arm (0.40 in bull/sideways) fires
+# uniformly across the documented set. Prior to the audit 18 watchlist
+# leveraged-bull tickers were missing — WANT/MIDU/TNA/UTSL (3x), SAA/UWM/GOOGU/
+# METAU/AAPLU/CONL/SMCI2X/PLTU/USD/ROM/UXI/UYG (2x), and BITX/ETHU (crypto 2x)
+# — silently capped at the regular 0.25 conviction so the documented
+# leveraged-vehicle thesis (CLAUDE.md §3) was unreachable for those names.
+# Inverse leveraged ETFs (SQQQ/SPXS/SOXS/TECS/FNGD/etc.) are intentionally
+# EXCLUDED: the cap-arm gate is `regime in ("bull", "sideways")`, where buying a
+# leveraged-SHORT vehicle is a counter-thesis trade that should NOT receive the
+# elevated bull-conviction cap. The `WATCHLIST_LEVERAGED_BULL` enumeration below
+# pins the coverage so a future watchlist addition surfaces in `_ml_decide`
+# behaviour rather than silently degrading to the regular cap.
 _LEVERAGED_ETFS = {
+    # 3x bull
     "SOXL", "TQQQ", "UPRO", "SPXL", "UDOW", "URTY", "TECL", "FNGU", "CURE", "LABU",
-    "NAIL", "DFEN", "DPST", "FAS", "HIBL",
-    "QLD", "SSO", "MVV", "NVDU", "MSFU", "AMZU", "TSLT", "TSLL",
-    "LNOK", "BOIL", "UCO", "AGQ", "BITU",
+    "NAIL", "DFEN", "DPST", "FAS", "HIBL", "WANT", "MIDU", "TNA", "UTSL",
+    # 2x bull (index / single-stock)
+    "QLD", "SSO", "MVV", "SAA", "UWM",
+    "NVDU", "MSFU", "AMZU", "GOOGU", "METAU", "TSLT", "TSLL",
+    "AAPLU", "CONL", "SMCI2X", "PLTU", "LNOK",
+    "USD", "ROM", "UXI", "UYG",
+    # Crypto / commodity 2x
+    "BITU", "BITX", "ETHU", "BOIL", "UCO", "AGQ",
 }
 # LNOK is a thin OTC name and yfinance often returns nothing → omitted from default fetch.
 
@@ -1017,7 +1037,12 @@ def _rsi(closes: list[float], period: int = 14) -> float | None:
         avg_g = (avg_g * (period - 1) + g) / period
         avg_l = (avg_l * (period - 1) + l) / period
     if avg_l == 0:
-        return 100.0
+        # Strict all-up returns 100; a perfectly FLAT series (no gain AND no
+        # loss across `period` deltas) returned 100.0 too — a spurious
+        # "severely overbought" signal that fed a -1.5 conviction penalty
+        # in `_ml_decide` for any flat name. RSI is undefined at zero
+        # variance; the textbook neutral reading is 50.
+        return 100.0 if avg_g > 0 else 50.0
     rs = avg_g / avg_l
     return 100.0 - (100.0 / (1.0 + rs))
 
