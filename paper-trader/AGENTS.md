@@ -272,6 +272,133 @@ python3 -m paper_trader.analytics.risk_adjusted_returns
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #14 (Agent 2) — `predict_with_meta.failed` + `ml.gate_threshold_sweep`
+
+Two changes, bundled / clean split as per the discipline.
+
+### Bug fix — silent rank-IC contamination from failed scorer predictions
+
+`DecisionScorer.predict_with_meta` returned `pred=0.0` on BOTH the
+exception path (build_features shape mismatch from a feature add
+without retrain — the documented `_predict_err_logged` scenario) and
+the non-finite-output path. The flag dict carried `off_distribution=True`
+in both cases, but the scalar `predict()` returned the same 0.0 with no
+flag at all. `_oos_rank_metrics` and `_oos_multi_horizon_metrics` both
+consumed `predict()` directly — so when a real-world predict failed,
+the fabricated 0.0 silently tied the row at zero, biasing the rank-IC
+toward fake concordance. The `_predict_err_logged` discipline silences
+the warning after the first log so the bug was observable only as a
+quiet `oos_buy_ic` drift, never as a crash.
+
+Fix: added a `failed: bool` field to `predict_with_meta`'s return —
+True only when the prediction couldn't be computed (untrained model,
+exception, non-finite output). False on legitimate clamped outputs
+(low-trust magnitude but trustworthy rank — those rows MUST stay in
+the rank-IC). Both `_oos_rank_metrics` and `_oos_multi_horizon_metrics`
+now prefer `predict_with_meta` via `getattr` (legacy test fakes fall
+back to `predict()` so existing tests pass byte-identically) and drop
+`failed=True` rows from every bucket.
+
+Locked by 3 new tests in `tests/test_decision_scorer.py`
+(`test_predict_exception_is_flagged_low_trust` extended, plus
+`test_failed_flag_is_false_on_legit_clamp` /
+`test_failed_flag_is_true_on_non_finite_output`) and one new test in
+`tests/test_continuous.py::TestOosRankMetrics`
+(`test_failed_predict_with_meta_rows_dropped_not_tied_at_zero`) that
+asserts a fabricated 0.0 from a failed prediction must NOT pull
+rank-IC toward fake concordance.
+
+Phase-1 bundled into commit `c6037e0` with sibling agent work due to
+the documented same-role staging race (memory:
+[PT concurrent same-role staging race]).
+
+### Feature — `paper_trader/ml/gate_threshold_sweep.py` — would different ±boundaries beat the deployed ±10/±5?
+
+The `_ml_decide` conviction gate uses hardcoded ±10% / ±5% boundaries.
+`conviction_calibration` and `gate_realized` confirm the deployed gate
+is MISCALIBRATED, but neither answers: *would a different threshold pair
+deliver a better top-vs-bottom spread?*
+
+New read-only diagnostic + CLI sweeps candidate ±bounds (`{2.5, 5, 7.5,
+10, 12.5, 15, 20}`) over the captured `(gate_scorer_pred,
+forward_return_5d)` pairs, reports per-bound realized spread with a
+500-iter bootstrap 95% CI, and emits one of four verdicts:
+
+| Verdict | Trigger |
+|---|---|
+| `INSUFFICIENT_DATA` | `n_pairs < 60` |
+| `NO_THRESHOLD_HELPS` | best spread ≤ 1pp OR best spread CI overlaps zero OR best spread ≤ 0 |
+| `DEPLOYED_IS_BEST` | best spread positive, significant, but no alt beats ±10 by > 1pp |
+| `ALTERNATIVE_THRESHOLD_BEATS_DEPLOYED` | best > deployed + 1pp AND CI excludes zero |
+
+Verdict on the live 5161-pair OOS slice: **NO_THRESHOLD_HELPS** — every
+candidate's CI overlaps zero, the deployed ±10 actually has spread
+=-0.528pp (top arm UNDERPERFORMS bottom arm by half a point), and no
+boundary rescues the signal. Confirms `baseline_compare`'s
+MLP_WORSE_THAN_TRIVIAL from a complementary angle and gives a quant a
+durable "no, threshold tuning won't fix this" answer.
+
+Operational discipline matches every other `ml/*` diagnostic exactly:
+read-only, never trains, never writes the pickle, never touches
+`build_features` / `N_FEATURES`, never raises (degrades to
+`status='error'` + verdict). Reads only `decision_outcomes.jsonl`; no
+pickle load, no `predict()` calls — uses the captured `gate_scorer_pred`
+field directly, the same data the deployed gate actually sized on at
+decision time. Safe under the live unattended continuous loop.
+
+18 tests in `tests/test_gate_threshold_sweep.py` exercise each verdict
+on a constructed dataset where the right answer is known by
+construction: noise → `NO_THRESHOLD_HELPS`, step at ±10 →
+`DEPLOYED_IS_BEST`, step at ±15 → `ALTERNATIVE_BEATS_DEPLOYED`,
+inverted gate → `NO_THRESHOLD_HELPS` (NOT `DEPLOYED_IS_BEST` — a
+negative spread is harmful, not "best").
+
+Commits: Phase-1 bug fix bundled into `c6037e0`. Phase-2 feature
+landed cleanly as `5f8e66d` ("feat(ml): gate_threshold_sweep — …").
+
+### Phase 3 live-validation findings — durable, quant-actionable
+
+1. **Continuous backtest loop is DEAD.** `scorer_freshness` reports
+   `LOOP_DEAD` (27.62h gap since last cycle, threshold 24h). Only 2
+   runs in last 48h. The conviction gate is ACTIVE
+   (deployed `n_train=4987 >> 500`) so trades WOULD be modulated against
+   a frozen model — but no new outcomes are being produced. This is the
+   precise scenario `scorer_freshness` was built to catch.
+
+2. **Recent runs (after 2026-05-18, run_ids 99001/99002/100000) emit
+   NO `scorer=` token** in `_ml_decide` reasoning, so
+   `gate_scorer_pred` is null for every outcome from those cycles. The
+   sample reasoning `"BUY SOXL: ML+quant: SOXL score=4.00 regime=unknown
+   …  conviction=20%"` lacks the trailing `scorer=±X.X%` token that an
+   active gate emits — meaning `_scorer.is_trained=False` at run time
+   even though the deployed pickle is now trained to `n_train=4987`. My
+   `gate_threshold_sweep` therefore analyzes only the pre-2026-05-18
+   corpus (5161 of 8753 outcomes). The most recent gate-pred row is from
+   `run_id=6242` on 2026-05-18; nothing newer carries it.
+
+3. **Skill metric instability across retrains.** Yesterday's cycle 1
+   ledger row recorded `oos_ic=+0.02` / `oos_buy_ic=0.0` /
+   `MLP_NO_BETTER_THAN_TRIVIAL`. Today's fresh `baseline_compare` run
+   (against the just-retrained `n_train=4987` pickle) reports
+   `MLP_ADDS_SKILL` with `rank_ic=+0.359`. A 0.34 rank-IC swing across
+   ~1000 new training rows is exactly the model-instability AGENTS.md
+   documents (the LITE -89→+32 precedent). Sample size 1, but the swing
+   direction matters: if the model genuinely just added 1000 informative
+   outcomes, fine — but it could equally be a noisy retrain that the
+   next cycle reverses. The `oos_bootstrap_ci` CLI is the appropriate
+   sanity check before any "gate works now" conclusion.
+
+4. **Run 100000 produced 0 trades** (completed, 0% return, 0 trades in
+   47s). Edge case where the chosen random window had no signals at all;
+   `_ml_decide` returned HOLD for every sample day. Not a bug per se,
+   but a quant should be aware that `total_return_pct=0.0` with
+   `n_trades=0` is a real and valid (if uninteresting) backtest outcome.
+
+Counters: bugs_fixed=1 (`failed`-flag silent rank-IC contamination),
+features_added=1 (`gate_threshold_sweep`), user_findings=4.
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #13 (Agent 2) — `_oos_rank_metrics` unknown-regime de-contamination + `ml.wk52_skill`
 
 Two changes, the discipline-mandated separate-commits split.
