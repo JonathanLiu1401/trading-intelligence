@@ -2010,5 +2010,222 @@ class ArticleStore:
             "by_ticker": by_ticker,
         }
 
+    @_retry_on_lock
+    def book_alert_coverage(
+        self,
+        tickers: list[str],
+        hours: int = 24,
+        mentions_only_min: int = 5,
+    ) -> dict:
+        """Per-held-ticker alert-pipeline coverage — the analyst's "is the
+        alert path actually surfacing news on MY positions?" view.
+
+        Sibling to ``urgency_label_split_by_ticker`` (per-ticker LLM-vetted
+        fraction over urgency>=1 only — quality of what reached urgent) and
+        ``ticker_mention_velocity`` (rate-of-change of total mentions); this
+        is the third orthogonal slice — *coverage*, the ratio of urgent
+        classifications to total article volume.
+
+        The novel signal is the ``MENTIONS_ONLY`` verdict — a held name with
+        substantial article volume (>= ``mentions_only_min`` in the window)
+        yet ZERO ``urgency>=1`` classifications. Either the urgency scorer
+        missed real signal on that ticker (a calibration miss), or the
+        coverage is genuinely all low-urgency colour/recap (a coverage-mix
+        problem). Either way, the analyst-facing message is the same: "you
+        appear to have unprocessed news on this position." Nothing else
+        surfaces this — ``urgent_queue_health`` tracks the queued-but-
+        unpushed backlog (rows that DID reach urgency=1), ``held_ticker_
+        news_silence`` tracks 24h DARK (zero mentions at all), and the
+        per-ticker calibration split sees only urgent rows.
+
+        Note on ``urgency=2`` semantics: this column is set by both an
+        actual Discord push (``send_urgent_alert`` → ``mark_alerted_batch``
+        on success) AND by every defense-in-depth gate's unconditional
+        ``mark_alerted_batch`` on suppression (quote-widget / recap-
+        template / low-authority lone / stale / cross-cycle / paraphrase
+        duplicate). So ``alerted`` here counts "rows that exited the urgent
+        queue", not "rows pushed to Discord" — the latter requires joining
+        ``alert_recency.db`` (see ``analytics/alert_delivery_audit.py``).
+        The verdict ladder uses ``urgent >= 1`` (urgency>=1 rows), which is
+        invariant to that ambiguity — "did this ticker ever reach urgent
+        classification this window?" is what matters for the coverage gap.
+
+        Matching is whole-word, ALL-CAPS, optional leading ``$``,
+        ``len >= 2`` — byte-identical to ``urgency_label_split_by_ticker``
+        / ``ticker_mention_velocity`` / ``urgent_queue_health``'s discipline
+        so the four per-ticker primitives never disagree about whether a
+        row touches a held name. Match surface is ``title + decompressed
+        summary`` — same as those siblings.
+
+        Returns::
+
+            {
+              "window_h": int,
+              "mentions_only_min": int,
+              "by_ticker": [
+                {
+                  "ticker": "NVDA",
+                  "mentions": int,            # all live rows mentioning it
+                  "urgent": int,              # urgency>=1 rows
+                  "alerted": int,             # urgency=2 rows (queue-exited)
+                  "latest_mention_age_h": float|None,
+                  "latest_urgent_age_h": float|None,
+                  "verdict": "QUIET"|"LOW_VOLUME"|"MENTIONS_ONLY"|"URGENT",
+                }, ...
+              ],
+              "n_quiet": int,
+              "n_low_volume": int,
+              "n_mentions_only": int,         # the actionable count
+              "n_urgent": int,
+            }
+
+        Sorted worst-first: ``MENTIONS_ONLY`` then ``LOW_VOLUME`` then
+        ``URGENT`` then ``QUIET``; within bucket, descending ``mentions``
+        then alphabetical ticker (deterministic, test-pinnable — same
+        tiebreak discipline as ``urgency_label_split_by_source``).
+
+        Read-only (single SELECT) scoped with ``_LIVE_ONLY_CLAUSE`` so
+        synthetic backtest/opus rows never inflate any per-ticker figure.
+        NO DB write — no ai_score / ml_score / score_source / urgency
+        mutation. All four load-bearing invariants intact by construction.
+        """
+        hours = max(int(hours), 1)
+        mentions_only_min = max(int(mentions_only_min), 1)
+
+        if not tickers:
+            return {
+                "window_h": hours,
+                "mentions_only_min": mentions_only_min,
+                "by_ticker": [],
+                "n_quiet": 0, "n_low_volume": 0,
+                "n_mentions_only": 0, "n_urgent": 0,
+            }
+
+        clean: list[str] = []
+        for raw in tickers:
+            if not raw:
+                continue
+            t = str(raw).strip().upper()
+            if len(t) >= 2 and t not in clean:
+                clean.append(t)
+        if not clean:
+            return {
+                "window_h": hours,
+                "mentions_only_min": mentions_only_min,
+                "by_ticker": [],
+                "n_quiet": 0, "n_low_volume": 0,
+                "n_mentions_only": 0, "n_urgent": 0,
+            }
+
+        now = datetime.now(timezone.utc)
+        since_iso = (now - timedelta(hours=hours)).isoformat()
+        rows = self.conn.execute(
+            "SELECT title, full_text, urgency, first_seen FROM articles "
+            f"WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+            (since_iso,),
+        ).fetchall()
+
+        patterns = {
+            t: re.compile(rf"\b\${{0,1}}{re.escape(t)}\b") for t in clean
+        }
+        # Per-ticker mutable state — counts + most-recent timestamps.
+        state: dict[str, dict] = {
+            t: {"mentions": 0, "urgent": 0, "alerted": 0,
+                "latest_mention": None, "latest_urgent": None}
+            for t in clean
+        }
+
+        for title, blob, urg, first_seen in rows:
+            try:
+                summary = decompress(blob) if blob else ""
+            except Exception:
+                summary = ""
+            hay = f"{title or ''} {summary}"
+            ts: datetime | None = None
+            if first_seen:
+                try:
+                    ts = datetime.fromisoformat(first_seen)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    ts = None
+            try:
+                urg_i = int(urg or 0)
+            except (TypeError, ValueError):
+                urg_i = 0
+            for t, pat in patterns.items():
+                if not pat.search(hay):
+                    continue
+                s = state[t]
+                s["mentions"] += 1
+                if ts is not None and (s["latest_mention"] is None
+                                        or ts > s["latest_mention"]):
+                    s["latest_mention"] = ts
+                if urg_i >= 1:
+                    s["urgent"] += 1
+                    if ts is not None and (s["latest_urgent"] is None
+                                            or ts > s["latest_urgent"]):
+                        s["latest_urgent"] = ts
+                if urg_i >= 2:
+                    s["alerted"] += 1
+
+        def _age_h(ts: datetime | None) -> float | None:
+            if ts is None:
+                return None
+            return round(max(0.0, (now - ts).total_seconds() / 3600.0), 2)
+
+        def _verdict(s: dict) -> str:
+            if s["mentions"] == 0:
+                return "QUIET"
+            if s["urgent"] >= 1:
+                return "URGENT"
+            if s["mentions"] >= mentions_only_min:
+                return "MENTIONS_ONLY"
+            return "LOW_VOLUME"
+
+        # Worst-first verdict ladder so the actionable signal surfaces at
+        # the top — same discipline as urgency_label_split_by_source's
+        # worst-ml-offender-first sort.
+        verdict_rank = {
+            "MENTIONS_ONLY": 0, "LOW_VOLUME": 1,
+            "URGENT": 2, "QUIET": 3,
+        }
+        by_ticker: list[dict] = []
+        n_quiet = n_low = n_mo = n_urgent = 0
+        for t in clean:
+            s = state[t]
+            v = _verdict(s)
+            if v == "QUIET":
+                n_quiet += 1
+            elif v == "LOW_VOLUME":
+                n_low += 1
+            elif v == "MENTIONS_ONLY":
+                n_mo += 1
+            else:
+                n_urgent += 1
+            by_ticker.append({
+                "ticker": t,
+                "mentions": s["mentions"],
+                "urgent": s["urgent"],
+                "alerted": s["alerted"],
+                "latest_mention_age_h": _age_h(s["latest_mention"]),
+                "latest_urgent_age_h": _age_h(s["latest_urgent"]),
+                "verdict": v,
+            })
+        by_ticker.sort(
+            key=lambda r: (verdict_rank[r["verdict"]],
+                           -r["mentions"], r["ticker"])
+        )
+
+        return {
+            "window_h": hours,
+            "mentions_only_min": mentions_only_min,
+            "by_ticker": by_ticker,
+            "n_quiet": n_quiet,
+            "n_low_volume": n_low,
+            "n_mentions_only": n_mo,
+            "n_urgent": n_urgent,
+        }
+
     def close(self):
         self.conn.close()
