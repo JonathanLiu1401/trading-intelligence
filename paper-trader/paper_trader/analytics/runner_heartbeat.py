@@ -51,6 +51,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+# Sentinel for the optional ``last_real_decision_ts`` kwarg. We must
+# distinguish "caller omitted the kwarg" (legacy callers ⇒ byte-identical
+# output, no new keys) from "caller passed an explicit None" (the endpoint
+# always passes through whatever ``store.last_real_decision()`` returns,
+# including None for a fresh book ⇒ emit the keys with None values so the
+# operator's JSON shape is stable across runs).
+_UNSET = object()
+
 OPEN_INTERVAL_S = 1800.0    # mirrors runner.OPEN_INTERVAL_S   (market open)
 CLOSED_INTERVAL_S = 3600.0  # mirrors runner.CLOSED_INTERVAL_S (market closed)
 LAGGING_MULT = 1.25
@@ -256,6 +264,7 @@ def build_runner_heartbeat(
     recent_actions: list[str] | None = None,
     no_decision_storm_threshold: int = NO_DECISION_STORM_THRESHOLD,
     recent_reasons: list[str | None] | None = None,
+    last_real_decision_ts=_UNSET,
 ) -> dict:
     """Verdict on whether the decision loop is still cycling **and deciding**.
 
@@ -283,7 +292,18 @@ def build_runner_heartbeat(
     instead of misdirecting the operator into the action that worsens it.
     Omitting ``recent_reasons`` ⇒ the legacy unconditional "a restart may
     clear a wedged Claude CLI" headline, byte-identical to before.
-    """
+
+    ``last_real_decision_ts`` (optional, the timestamp of the most recent
+    decision row whose ``action_taken`` is NOT NO_DECISION — i.e.
+    ``store.last_real_decision()["timestamp"]``): when supplied, the output
+    additionally carries ``last_real_decision_ts`` /
+    ``secs_since_real_decision`` / ``real_decision_age``. Under IDLE_STORM
+    the bare ``last_decision_ts`` (which advances every cycle, including
+    NO_DECISION) tells the operator "last decision 12m ago" while the
+    engine has not produced an actual FILLED/HOLD/BLOCKED row in days —
+    the exact green-light pathology AGENTS.md HYBRID pass #7 surfaced.
+    Omitting ``last_real_decision_ts`` ⇒ output byte-identical to before
+    these keys existed (no new fields appear on the dict at all)."""
     now = now or datetime.now(timezone.utc)
     expected = OPEN_INTERVAL_S if market_open else CLOSED_INTERVAL_S
     ctx = "market-open" if market_open else "market-closed"
@@ -333,6 +353,29 @@ def build_runner_heartbeat(
             f"HEALTHY — last decision {age} ago, within the {exp_h} {ctx} "
             f"cadence.")
 
+    # Additive real-decision-age overlay. ``last_decision_ts`` advances every
+    # cycle, including a NO_DECISION storm row — so under IDLE_STORM the
+    # cadence-only output says "last decision 12m ago" while the engine has
+    # not actually produced a FILLED/HOLD/BLOCKED row in days. ``store.
+    # last_real_decision()`` answers that question; when its ``timestamp`` is
+    # supplied via ``last_real_decision_ts`` we surface ``secs_since_real_
+    # decision`` so the operator never sees a green light over a brain-dead
+    # engine. Pure additive: omitting the kwarg leaves the dict unchanged
+    # (no new keys), so legacy callers + the test_output_echoes_constants_
+    # and_inputs pin stay green.
+    if last_real_decision_ts is not _UNSET:
+        real_ts = (_parse_ts(last_real_decision_ts)
+                   if last_real_decision_ts is not None else None)
+        if real_ts is not None:
+            real_secs = (now - real_ts).total_seconds()
+            out["last_real_decision_ts"] = real_ts.isoformat(timespec="seconds")
+            out["secs_since_real_decision"] = round(real_secs, 1)
+            out["real_decision_age"] = _humanize(real_secs)
+        else:
+            out["last_real_decision_ts"] = None
+            out["secs_since_real_decision"] = None
+            out["real_decision_age"] = None
+
     # Additive decision-efficacy overlay. The liveness verdict above answers
     # "is the loop cycling?"; this answers "is it actually deciding?". A loop
     # that cycles perfectly but emits NO_DECISION every time is alive-but-
@@ -342,6 +385,24 @@ def build_runner_heartbeat(
     if eff is not None:
         out["decision_efficacy"] = eff
         if eff["verdict"] == "IDLE_STORM":
+            # Real-decision age clause for the IDLE_STORM headline — the
+            # operator-actionable number under a storm. Always appended (cause-
+            # diagnosed or generic) when ``last_real_decision_ts`` was supplied
+            # AND parsed. ``None`` (no real decision ever) renders "never"
+            # which is the right read for a fresh book whose first 24h was all
+            # host-saturated. Computed once here so the three headline arms
+            # below all carry the same suffix.
+            real_age_clause = ""
+            if last_real_decision_ts is not _UNSET:
+                real_secs = out.get("secs_since_real_decision")
+                if real_secs is None:
+                    real_age_clause = (
+                        " The engine has NEVER produced a real decision "
+                        "(only NO_DECISION cycles).")
+                else:
+                    real_age_clause = (
+                        f" Last real (FILLED/HOLD/BLOCKED) decision was "
+                        f"{_humanize(real_secs)} ago.")
             # A wedged-CLI storm IS cleared by a restart (the runner
             # auto-recovery breaker fires at the same threshold); a
             # host-saturation / quota storm is NOT — restarting just adds
@@ -375,4 +436,5 @@ def build_runner_heartbeat(
                     f" ⚠ but the last {n} cycles "
                     f"were ALL NO_DECISION — the engine is cycling, not "
                     f"deciding; a restart may clear a wedged Claude CLI.")
+            out["headline"] += real_age_clause
     return out

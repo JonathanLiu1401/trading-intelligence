@@ -557,3 +557,136 @@ def test_endpoint_idle_storm_host_saturation_no_restart(client):
     assert d["decision_efficacy"]["dominant_cause"] == "host_saturated"
     assert d["restart_recommended"] is False
     assert "will NOT help" in d["headline"]
+
+
+# ═════════════ real-decision-age overlay (additive, 2026-05-23) ═════════════
+#
+# Why this exists: ``last_decision_ts`` advances every NO_DECISION cycle, so
+# under IDLE_STORM the cadence-only output says "last decision 12m ago" while
+# the engine has not produced a FILLED/HOLD/BLOCKED row in days (the documented
+# AGENTS.md HYBRID pass #7 green-light pathology). Wiring
+# ``store.last_real_decision()`` into the heartbeat surfaces the engine's true
+# real-decision age. These pin: backward-compat (omit ⇒ no new keys); the
+# numeric / humanised fields when supplied; the unparseable-fallback to None;
+# the IDLE_STORM headline clause; and the end-to-end Flask endpoint wiring.
+
+
+def test_real_decision_overlay_omitted_is_byte_identical():
+    """Backward compat: with last_real_decision_ts omitted the output is
+    byte-identical to before the parameter existed — no new keys at all.
+    (Explicit None is distinct: it means "the caller asked but the engine has
+    no real decision in history" — those callers DO see the keys, as None.)"""
+    out = build_runner_heartbeat(_ago(600), market_open=True, now=NOW)
+    for k in ("last_real_decision_ts", "secs_since_real_decision",
+              "real_decision_age"):
+        assert k not in out
+
+
+def test_real_decision_overlay_emits_fields_when_supplied():
+    real_ts = _ago(7200)  # 2h ago, parseable
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        last_real_decision_ts=real_ts)
+    assert out["secs_since_real_decision"] == pytest.approx(7200.0)
+    assert out["real_decision_age"] == "2h"
+    # The emitted ts is the ISO of the supplied real-decision-ts (round-tripped
+    # through _parse_ts → isoformat for canonicalisation).
+    assert out["last_real_decision_ts"] is not None
+
+
+def test_real_decision_overlay_unparseable_degrades_to_none():
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        last_real_decision_ts="not-a-timestamp")
+    assert out["last_real_decision_ts"] is None
+    assert out["secs_since_real_decision"] is None
+    assert out["real_decision_age"] is None
+
+
+def test_idle_storm_headline_carries_real_decision_age():
+    """The whole point: under IDLE_STORM, the operator sees the real-decision
+    age in the headline instead of being misled by the bare last_decision_ts
+    that advances every NO_DECISION row."""
+    real_ts = _ago(4 * 3600)  # 4h since the engine last actually decided
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * 6,
+        last_real_decision_ts=real_ts)
+    assert out["decision_efficacy"]["verdict"] == "IDLE_STORM"
+    assert "4h" in out["headline"]
+    assert "real (FILLED/HOLD/BLOCKED)" in out["headline"]
+
+
+def test_idle_storm_headline_says_never_when_no_real_decision_ever():
+    """A fresh book whose first N cycles were ALL host-saturated has no real
+    decision in history at all — the heartbeat must say so plainly (explicit
+    None means the caller asked store.last_real_decision() and got None back)
+    instead of pretending a recent NO_DECISION counts."""
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * 5,
+        last_real_decision_ts=None)
+    assert "NEVER produced a real decision" in out["headline"]
+    # And the keys appear in the JSON as None so an operator polling the
+    # endpoint sees a stable shape.
+    assert out["last_real_decision_ts"] is None
+    assert out["secs_since_real_decision"] is None
+    assert out["real_decision_age"] is None
+
+
+def test_real_decision_overlay_no_clause_outside_idle_storm():
+    """The real-decision clause is informational under IDLE_STORM only;
+    a HEALTHY+PRODUCING loop never carries it (no need to clutter the
+    operator's read with a number that's not actionable)."""
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=["BUY NVDA → FILLED"],
+        last_real_decision_ts=_ago(600))
+    # Fields are still emitted (the operator can read them out of the JSON)
+    # but the headline carries no IDLE_STORM clause.
+    assert out["secs_since_real_decision"] == pytest.approx(600.0)
+    assert "real (FILLED/HOLD/BLOCKED)" not in out["headline"]
+
+
+def test_endpoint_surfaces_real_decision_age(client):
+    """End-to-end: the endpoint must pass store.last_real_decision()'s ts so
+    the operator sees the true engine real-decision age — the documented
+    AGENTS.md HYBRID pass #7 green-light bug fix."""
+    c, s = client
+    # An old FILLED row, then a flood of NO_DECISION rows. recent_decisions
+    # picks up the NO_DECISIONs as the leading run (IDLE_STORM) while
+    # last_real_decision still returns the FILLED.
+    old_ts = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    with s._lock:
+        s.conn.execute(
+            "INSERT INTO decisions (timestamp, market_open, signal_count, "
+            "action_taken, reasoning, portfolio_value, cash) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (old_ts, 0, 0, "BUY NVDA → FILLED", "{}", 1000.0, 100.0),
+        )
+        s.conn.commit()
+    for _ in range(6):
+        s.record_decision(False, 0, "NO_DECISION", _HOST_SAT, 972.0, 6.0)
+    d = c.get("/api/runner-heartbeat").get_json()
+    assert d["decision_efficacy"]["verdict"] == "IDLE_STORM"
+    # The real-decision age is ~3h, NOT the few seconds since the last
+    # NO_DECISION row — the whole reason this wiring exists.
+    assert d["secs_since_real_decision"] is not None
+    assert d["secs_since_real_decision"] >= 3 * 3600 - 60
+    assert d["real_decision_age"] in ("3h", "2h 59m")
+    assert "real (FILLED/HOLD/BLOCKED)" in d["headline"]
+
+
+def test_endpoint_real_decision_none_on_fresh_book(client):
+    """A fresh book with only NO_DECISION rows has no real decision in
+    history — store.last_real_decision returns None and the endpoint passes
+    that through unchanged."""
+    c, s = client
+    for _ in range(3):
+        s.record_decision(False, 0, "NO_DECISION", _HOST_SAT, 1000.0, 1000.0)
+    d = c.get("/api/runner-heartbeat").get_json()
+    # The kwarg WAS supplied (the endpoint always tries the call), so the
+    # fields appear in the JSON — they just read None.
+    assert d["last_real_decision_ts"] is None
+    assert d["secs_since_real_decision"] is None
+    assert d["real_decision_age"] is None
