@@ -1362,10 +1362,12 @@ class GDELTFetcher:
         # would poison a temporarily rate-limited/disconnected date for the
         # rest of the loop's lifetime.
         if success or permanent:
-            try:
-                path.write_text(json.dumps(articles))
-            except Exception:
-                pass
+            # Atomic write — a kill mid-`path.write_text` left a torn GDELT
+            # cache file that the next read silently re-fetched (5s rate
+            # limit), permanently degrading the warm cache for that
+            # (date, keyword). Same atomic idiom as the per-window
+            # PriceCache and the volume-cache persister. Never raises.
+            _atomic_write_json(path, articles)
         if permanent:
             print(f"[gdelt] permanent: {d} outside GDELT coverage — "
                   f"cached empty, no retry")
@@ -1377,6 +1379,36 @@ class GDELTFetcher:
 AV_CACHE_DIR = CACHE_DIR / "alphavantage"
 AV_QUOTA_PATH = CACHE_DIR / "av_quota.json"
 AV_MAX_DAILY = 22  # stay under 25/day limit with margin
+
+
+def _atomic_write_json(path: Path, payload) -> None:
+    """Atomic JSON write via tmp file + ``Path.replace``.
+
+    Mirrors the atomic-write idiom already used by ``train_scorer``
+    (scorer.pkl.tmp), the per-window PriceCache write, the volume-cache
+    persister, the outcomes-file trim, and the validation persister — every
+    one of which documents the same class of "process kill mid-write would
+    corrupt the artifact" failure (OOM/SIGKILL leaves a torn JSON file). The
+    GDELT cache, the Alpha Vantage cache, and the AV cross-restart quota
+    tracker were the last JSON writers in this file still using bare
+    ``path.write_text(json.dumps(...))``: a kill mid-write left a corrupt
+    file, and on the next load the per-file ``except Exception: pass`` guard
+    silently treated the corruption as "no cache" — re-fetching with quota /
+    rate-limit burn (the AV quota guarantee is *cross-restart* per the
+    AV_QUOTA_PATH comment, so a torn quota file silently reset to 0 calls).
+    The tmp file lives in the same directory so ``Path.replace`` is genuinely
+    atomic on POSIX. Never raises — any IO/serialization failure degrades
+    the same way the legacy bare-write would have (the call site already
+    runs inside best-effort try/except blocks, e.g. ``GDELTFetcher.fetch``,
+    ``AlphaVantageNewsFetcher.fetch``, ``_inc_quota``).
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(path)
+    except Exception as e:
+        print(f"[atomic_json] write to {path} failed: {e}")
 
 
 class AlphaVantageNewsFetcher:
@@ -1406,7 +1438,15 @@ class AlphaVantageNewsFetcher:
         with self._lock:
             q = self._quota()
             q["calls"] += 1
-            AV_QUOTA_PATH.write_text(json.dumps(q))
+            # Atomic write — the AV_QUOTA_PATH comment explicitly promises
+            # cross-restart quota tracking, but the bare `write_text` was
+            # NOT atomic: a kill mid-write left a torn JSON file, the next
+            # `_quota` read raised, the `except Exception: pass` fell back
+            # to a fresh `{"date": today, "calls": 0}` — silently resetting
+            # the AV quota counter to 0 and reopening the cap (25/day) for
+            # arbitrary refetches. Same atomic idiom as `train_scorer` /
+            # PriceCache / volume cache / GDELT cache.
+            _atomic_write_json(AV_QUOTA_PATH, q)
 
     def _cache_path(self, ticker: str, d: date) -> Path:
         return AV_CACHE_DIR / f"{d.isoformat()}_{ticker}.json"
@@ -1457,7 +1497,11 @@ class AlphaVantageNewsFetcher:
                 items = [{"title": a.get("title", ""), "url": a.get("url", ""),
                           "source": a.get("source", "")}
                          for a in feed if a.get("title")]
-                path.write_text(json.dumps(items))
+                # Atomic write — a kill mid-`write_text` left a torn AV cache
+                # file; the next read's `except Exception: pass` silently
+                # treated it as "no cache" and re-fetched (charging the
+                # 22/day quota for a name that should have been free).
+                _atomic_write_json(path, items)
                 articles.extend(items)
                 self._inc_quota()
                 time.sleep(1.2)  # AV rate-limit buffer
