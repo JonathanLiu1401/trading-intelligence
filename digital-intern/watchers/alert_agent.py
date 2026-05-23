@@ -42,7 +42,7 @@ FORMAT (use exactly):
 TICKERS:   [affected symbols]
 IMPACT:    [BUY/SELL/WATCH] — [one sentence on direction]
 CONTEXT:   [one sentence of background]
-PORTFOLIO: [specific implication for LITE/MU/MSFT/AXTI/ORCL/TSEM/QBTS]
+PORTFOLIO: [specific implication for any of the analyst's held positions: {held_book}]
 SOURCE:    [source name]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
@@ -56,7 +56,7 @@ CALIBRATION: An article tagged "[unverified — model-only urgent]" was flagged 
 
 CONTINUITY: If an article carries a `related:` line, a standalone 🚨 BREAKING alert on a related developing story ALREADY fired to this analyst within the last few hours — they have already been told the headline event. Frame THIS alert explicitly as a continuation/update of it: lead the HEADLINE with a development verb (ESCALATES / EXTENDS / WIDENS / FOLLOWS), and in CONTEXT state it follows the earlier alert (e.g. "follows ~Nh-ago alert on <prior event>"). Do NOT present it as the first time this story broke. This is what stops the analyst seeing what reads as a duplicate BREAKING for an event they are already tracking.
 
-BOOK: If an article carries a `book:` line, it names live portfolio/watchlist positions the analyst actually has money in (LITE/LNOK/MUU/DRAM/SNDU/MU/MSFT/AXTI/ORCL/TSEM/QBTS/NVDA). That event is directly actionable for the analyst's open risk: the PORTFOLIO line MUST name the listed held ticker(s) and give a concrete directional implication for each, and weight this article's IMPACT above generic macro colour of similar magnitude. Absence of a `book:` line means the event does not touch the held book — keep PORTFOLIO short (sector read-through only, no invented position).
+BOOK: If an article carries a `book:` line, it names live portfolio/watchlist positions the analyst actually has money in ({held_book}). That event is directly actionable for the analyst's open risk: the PORTFOLIO line MUST name the listed held ticker(s) and give a concrete directional implication for each, and weight this article's IMPACT above generic macro colour of similar magnitude. Absence of a `book:` line means the event does not touch the held book — keep PORTFOLIO short (sector read-through only, no invented position).
 
 BOOK VELOCITY: If a `book_velocity:` line ALSO appears on a `book:` alert, it names how many other distinct articles mentioned the same held ticker in the last 60 minutes — the wire is materially CONCENTRATING on that name (momentum / cluster of related developments), so the IMPACT magnitude should reflect that: prefer BUY/SELL over WATCH and state magnitude with more confidence than for a lone event. A `book:` line WITHOUT a `book_velocity:` line means this is the only recent mention — frame it as an isolated headline (use WATCH unless the body itself is unambiguous). Absence of `book_velocity:` is silent (never reproduced as a section).
 
@@ -69,6 +69,27 @@ Output ONLY the alert message."""
 
 
 ALERT_BATCH_SIZE = 5
+
+
+def _held_book_phrase() -> str:
+    """Slash-joined, sorted held/watched tickers for the BREAKING alert prompt's
+    PORTFOLIO + BOOK slots.
+
+    Reads ``ml.features.LIVE_PORTFOLIO_TICKERS`` (config/portfolio.json's
+    positions + option underlyings + sector_watchlist, unioned with the
+    hardcoded fallback) so Sonnet writes PORTFOLIO implications and resolves
+    `book:` tags against the book the analyst *actually* holds, not a frozen
+    literal. The PORTFOLIO/BOOK slots historically hardcoded a held set in the
+    prompt body, so a position added in the trading UI was invisible to the
+    Bloomberg alert formatter — its PORTFOLIO line read "no holdings affected"
+    even on a fresh held name, the exact mirror of the urgency_scorer drift
+    fix. ``sorted`` gives a deterministic, test-pinnable order. Degrades to a
+    minimal semiconductor default only if the live set is somehow empty — an
+    alert prompt must never go out with a blank held-positions slot. Same
+    SSOT (LIVE_PORTFOLIO_TICKERS) as ``urgency_scorer._portfolio_ticker_line``
+    so the two prompts can never disagree on what counts as held."""
+    tickers = sorted(t for t in LIVE_PORTFOLIO_TICKERS if t)
+    return "/".join(tickers) if tickers else "MU/NVDA/MSFT"
 
 # Minimum number of recent (within ``alert_recency.ALERT_RECENCY_TTL_HOURS``)
 # BREAKING alerts mentioning a held ticker before the alert prompt is annotated
@@ -1595,7 +1616,11 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
     # Full date+time so Discord history is unambiguous across day boundaries.
     # Template already appends " UTC", so don't include it here.
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    prompt = ALERT_PROMPT.format(articles_text=articles_text, now_utc=now_utc)
+    prompt = ALERT_PROMPT.format(
+        articles_text=articles_text,
+        now_utc=now_utc,
+        held_book=_held_book_phrase(),
+    )
 
     try:
         message = claude_call(prompt, model=SONNET_MODEL, timeout=60)
