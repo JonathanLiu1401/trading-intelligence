@@ -109,12 +109,31 @@ except Exception:
 # budget is spent. The substring filter keeps this tight — other
 # ``DatabaseError`` flavors (e.g. ``IntegrityError`` "UNIQUE constraint
 # failed") must still propagate, never be silently swallowed.
+#  6. ``OperationalError("cannot commit transaction - SQL statements in
+#     progress")`` — the SAME shared-connection cursor-collision class as
+#     (2)/(3)/(4)/(5), but it surfaces at the ``self.conn.commit()`` step
+#     AFTER the decorated writer's ``executemany`` completes: a sibling
+#     lockless reader cursor on the same ``self.conn``
+#     (``check_same_thread=False``, ~30 daemon threads) is still mid-fetch,
+#     so SQLite refuses the COMMIT because the in-flight prepared statements
+#     would be torn down by the transaction boundary. Live evidence
+#     (2026-05-23 daemon.log): 4 occurrences in one day across
+#     scorer_worker, hackernews_worker and the alert path's
+#     ``mark_alerted_batch`` — the latter's traceback bubbled all the way
+#     to ``[alert] failed to mark stale rows alerted``, leaving the
+#     stale-but-not-marked urgent rows re-fetched every 20s cycle until the
+#     24h reaper. Every decorated method is fully idempotent
+#     (``UPDATE … WHERE id=?`` / ``INSERT OR IGNORE``) so re-executing the
+#     write on retry is safe by the same argument as the other five
+#     flavours; without this string the OperationalError bubbles to the
+#     worker's broad ``except`` and a whole cycle's work is lost.
 _RETRYABLE_DB_ERRORS = (
     "database is locked",
     "another row available",
     "another row pending",
     "no more rows available",
     "not an error",
+    "cannot commit transaction",
 )
 _LOCK_RETRY_ATTEMPTS = 5
 _LOCK_RETRY_BASE_S = 0.25
@@ -136,11 +155,28 @@ def lock_metrics() -> dict:
         return {"lock_retries": _lock_retries, "lock_failures": _lock_failures}
 
 
+# The CPython sqlite3 C bindings sometimes propagate a cursor-collision
+# failure as ``SystemError: error return without exception set`` instead of a
+# proper ``sqlite3.DatabaseError`` — most often at ``self.conn.commit()`` when
+# a sibling lockless reader still holds prepared statements on the shared
+# ``self.conn``. The C code returned an error code but failed to set the
+# Python-level exception state, so CPython raises a bare ``SystemError`` with
+# this canonical message. Live evidence (2026-05-23 daemon.log): 3
+# occurrences from rss_worker / scorer_worker stats during the same
+# writer-contention storm that produced the (6) ``cannot commit transaction``
+# variant. Same idempotent-retry remedy; we only retry the EXACT canonical
+# message to keep the discrimination tight (a real Python internal SystemError
+# is not retryable and must propagate).
+_SYSTEMERROR_RETRYABLE_SUBSTR = "error return without exception set"
+
+
 def _retry_on_lock(func):
     """Decorator: retry transient DB errors (``database is locked`` /
-    shared-connection ``another row available``) with exp backoff + jitter.
-    Non-retryable ``DatabaseError`` flavors (IntegrityError, etc.) propagate.
-    See ``_RETRYABLE_DB_ERRORS`` for the full rationale."""
+    shared-connection ``another row available`` / cursor-collision
+    ``SystemError: error return without exception set``) with exp backoff +
+    jitter. Non-retryable ``DatabaseError`` flavors (IntegrityError, etc.)
+    propagate. See ``_RETRYABLE_DB_ERRORS`` and
+    ``_SYSTEMERROR_RETRYABLE_SUBSTR`` for the full rationale."""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         last = None
@@ -154,21 +190,30 @@ def _retry_on_lock(func):
                 if not any(s in str(e).lower() for s in _RETRYABLE_DB_ERRORS):
                     raise
                 last = e
-                if attempt + 1 < _LOCK_RETRY_ATTEMPTS:
-                    global _lock_retries
-                    with _lock_metrics_lock:
-                        _lock_retries += 1
-                    # Exponential backoff: 0.25, 0.5, 1.0, 2.0, ... capped at 4s.
-                    # Add jitter in [0.5x, 1.5x) so concurrent retriers desync.
-                    delay = min(_LOCK_RETRY_BASE_S * (2 ** attempt), _LOCK_RETRY_CAP_S)
-                    delay *= 0.5 + random.random()
-                    _log.warning(
-                        f"[article_store] {func.__name__}: transient DB error "
-                        f"{str(e)[:60]!r} "
-                        f"(attempt {attempt + 1}/{_LOCK_RETRY_ATTEMPTS}); "
-                        f"retrying in {delay:.2f}s"
-                    )
-                    time.sleep(delay)
+            except SystemError as e:
+                # Narrow discrimination: only the canonical C-binding cursor-
+                # collision message (see _SYSTEMERROR_RETRYABLE_SUBSTR). Any
+                # other SystemError is a genuine Python internal bug and
+                # MUST propagate unmolested — broadly catching SystemError
+                # would mask serious failures.
+                if _SYSTEMERROR_RETRYABLE_SUBSTR not in str(e).lower():
+                    raise
+                last = e
+            if attempt + 1 < _LOCK_RETRY_ATTEMPTS:
+                global _lock_retries
+                with _lock_metrics_lock:
+                    _lock_retries += 1
+                # Exponential backoff: 0.25, 0.5, 1.0, 2.0, ... capped at 4s.
+                # Add jitter in [0.5x, 1.5x) so concurrent retriers desync.
+                delay = min(_LOCK_RETRY_BASE_S * (2 ** attempt), _LOCK_RETRY_CAP_S)
+                delay *= 0.5 + random.random()
+                _log.warning(
+                    f"[article_store] {func.__name__}: transient DB error "
+                    f"{str(last)[:60]!r} "
+                    f"(attempt {attempt + 1}/{_LOCK_RETRY_ATTEMPTS}); "
+                    f"retrying in {delay:.2f}s"
+                )
+                time.sleep(delay)
         assert last is not None
         global _lock_failures
         with _lock_metrics_lock:
