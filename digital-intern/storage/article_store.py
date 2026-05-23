@@ -2227,5 +2227,156 @@ class ArticleStore:
             "n_urgent": n_urgent,
         }
 
+    @_retry_on_lock
+    def source_recap_pollution(
+        self,
+        recap_matcher,
+        hours: int = 24,
+        min_total: int = 5,
+        top_n: int = 20,
+    ) -> dict:
+        """Per-source recap-template pollution rate — the analyst's "which
+        feeds should I prune?" view.
+
+        ``urgency_label_split_by_source`` reports per-source LLM-vetted
+        fraction over urgency>=1 rows — the *verification* angle. This
+        complements it with the *content-type* angle: of a source's urgent
+        rows in the window, what fraction match a recap/SEO template the
+        urgency head over-scores (the same fingerprint set the alert and
+        briefing layers gate against — see
+        ``watchers.alert_agent._RECAP_TEMPLATE_PATTERNS`` and
+        ``analysis.claude_analyst._BRIEFING_RECAP_TEMPLATE_PATTERNS``,
+        kept in lockstep by ``tests/test_briefing_recap_template.py``).
+        A source with high recap_rate is generating model-detectable
+        noise the operator can act on (prune the collector, lower its
+        cadence, deprioritise its source_cred floor).
+
+        ``recap_matcher`` is an injected callable ``(title) -> bool`` so
+        the storage layer never imports the analysis or watchers gates
+        (storage is below both; an import would invert the dependency
+        graph). The dashboard / CLI caller passes the SSOT matcher; tests
+        pass a stub. A row whose title raises in the matcher is treated
+        as non-recap (best-effort — a buggy matcher must never bring
+        down the metric).
+
+        Returns::
+
+            {
+              "window_h":      int,
+              "min_total":     int,
+              "by_source": [
+                {
+                  "source":      str,
+                  "total":       int,    # urgent rows in the window
+                  "recap":       int,    # of those, recap_matcher hits
+                  "recap_rate":  float,  # recap / total
+                  "fingerprints": {name: count, ...},
+                },
+                ...
+              ],
+              "total_urgent":   int,    # over all sources (no min_total)
+              "total_recap":    int,    # over all sources (no min_total)
+              "global_rate":    float,  # total_recap / total_urgent
+            }
+
+        ``fingerprints`` carries the per-template count when the matcher
+        returns the ``(hit, name)`` tuple form (the canonical signature of
+        ``_looks_like_recap_template`` in both the alert and briefing
+        gates). A boolean-only matcher still works — its hits land under
+        the synthetic name ``""`` (empty string) — but the SSOT matchers
+        always emit names so the dashboard can break each source's
+        pollution down by fingerprint and target the worst contributor.
+
+        ``min_total`` bounds the per-source result list to sources that
+        had at least N urgent rows in the window — a source with 1 urgent
+        row of which 1 is recap reads "100% polluted" without volume to
+        justify the verdict. ``top_n`` caps the response size; rows are
+        worst-recap-rate-first with alphabetical-source tiebreak (the same
+        deterministic discipline as ``urgency_label_split_by_source`` /
+        ``ticker_mention_velocity`` so the dashboard ordering is stable
+        cycle-to-cycle).
+
+        Read-only (single SELECT) scoped with ``_LIVE_ONLY_CLAUSE`` so
+        synthetic backtest/opus rows never inflate either ratio. NO DB
+        write — no ai_score / ml_score / score_source / urgency mutation.
+        All four load-bearing invariants intact by construction.
+        """
+        hours = max(int(hours), 1)
+        min_total = max(int(min_total), 1)
+        top_n = max(int(top_n), 0)
+
+        since_iso = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        rows = self.conn.execute(
+            "SELECT source, title FROM articles "
+            f"WHERE urgency >= 1 AND first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+            (since_iso,),
+        ).fetchall()
+
+        per_source: dict[str, dict] = {}
+        total_urgent = 0
+        total_recap = 0
+        for source, title in rows:
+            src = source or ""
+            bucket = per_source.setdefault(
+                src, {"total": 0, "recap": 0, "fingerprints": {}}
+            )
+            bucket["total"] += 1
+            total_urgent += 1
+            # Matcher may be bool-returning OR (bool, name)-returning — both
+            # forms supported (the alert / briefing SSOT matchers all return
+            # the tuple form ``(hit, name)``; a simpler boolean matcher
+            # used by tests / dashboards still works). A matcher exception
+            # is degraded to "no hit" — pollution metrics must never crash
+            # because the upstream regex set raised.
+            try:
+                result = recap_matcher(title or "")
+            except Exception:
+                continue
+            if isinstance(result, tuple):
+                hit = bool(result[0])
+                name = (result[1] if len(result) > 1 and result[1] else "")
+            else:
+                hit = bool(result)
+                name = ""
+            if not hit:
+                continue
+            bucket["recap"] += 1
+            total_recap += 1
+            if name:
+                bucket["fingerprints"][name] = (
+                    bucket["fingerprints"].get(name, 0) + 1
+                )
+
+        materialised: list[dict] = []
+        for src, b in per_source.items():
+            if b["total"] < min_total:
+                continue
+            materialised.append({
+                "source": src,
+                "total": b["total"],
+                "recap": b["recap"],
+                "recap_rate": round(b["recap"] / b["total"], 4),
+                "fingerprints": dict(b["fingerprints"]),
+            })
+
+        # Worst-recap-rate first; alphabetical tiebreak — same deterministic
+        # discipline as ``urgency_label_split_by_source``.
+        materialised.sort(
+            key=lambda r: (-r["recap_rate"], -r["recap"], r["source"])
+        )
+
+        return {
+            "window_h": hours,
+            "min_total": min_total,
+            "by_source": materialised[: top_n] if top_n else materialised,
+            "total_urgent": total_urgent,
+            "total_recap": total_recap,
+            "global_rate": (
+                round(total_recap / total_urgent, 4) if total_urgent else 0.0
+            ),
+        }
+
     def close(self):
         self.conn.close()
