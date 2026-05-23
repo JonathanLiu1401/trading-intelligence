@@ -61,9 +61,8 @@ def _parse_ts(raw: str):
 def fetch_recent_scores():
     """Return (current_window_avg, current_n, sample_total) using one
     bounded, index-served query. Returns (None, 0, n) if no scored rows."""
-    conn = sqlite3.connect(
-        f"file:{DB_PATH}?mode=ro&immutable=1", uri=True
-    )
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         rows = conn.execute(
             "SELECT ml_score, first_seen FROM articles "

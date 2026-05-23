@@ -38,6 +38,7 @@ PIPELINE: list[tuple[str, Path, int]] = [
     ("analytics.consensus_signal",        LOGS / "strong_consensus.jsonl",       50),
     ("analytics.confluence_signals",      LOGS / "confluence_signals.json",      50),
     ("analytics.ticker_alert_ranker",     LOGS / "ticker_alert_rank.json",       50),
+    ("analytics.source_score_drift",      LOGS / "source_score_drift.json",      50),
     ("analytics.collection_quality",      LOGS / "collection_quality.json",     110),
     ("analytics.daily_digest",            LOGS / "daily_digest.txt",            110),
 ]
