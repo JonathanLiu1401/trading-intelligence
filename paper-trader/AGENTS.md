@@ -6,6 +6,119 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 HYBRID core (Agent 1) — `/api/news-corroboration-skill` wired + concurrent-agent commit collision
+
+**Phase 1 — bug audit (bugs_fixed: 0)**
+
+Read `runner.py`, `reporter.py`, `signals.py`, `strategy.py`,
+`dashboard.py`, `market.py`, `store.py` (full) plus the analytics
+directory. Dispatched a focused subagent on strategy.py/dashboard.py/
+reporter.py/analytics — the one reported finding (urgent articles
+with `ai_score < 1.0` skipped in `_ml_live_opinion`, strategy.py:1314)
+was investigated and confirmed to be intentional design (the threshold
+is a noise floor; see the rationale comment block at strategy.py:1304-
+1309 which already pinned the previous bug-fix on this code path).
+No Phase-1 commit (the 0-bug guard explicitly permits this when an
+honest investigation finds nothing — the AGENTS.md-documented discipline
+used by ≥6 prior HYBRID passes since 2026-05-21).
+
+**Phase 2 — feature (features_added: 1) — `/api/news-corroboration-skill`**
+
+Wired the pre-existing-but-orphaned `paper_trader/analytics/
+news_corroboration_skill.py` builder (282 lines, 43 unit tests
+already passing) into the dashboard:
+
+* New helper `_corroborating_article_count_index(trades, lookback_hours)`
+  in `dashboard.py` — per-trade count of distinct articles mentioning
+  the trade's ticker in the window `[trade_ts - lookback_hours,
+  trade_ts)` (STRICTLY before the decision microsecond; INCLUSIVE on
+  the lower edge). Re-uses the same `articles.db` live-only join shape
+  as `_freshest_article_age_index` (word-boundary ticker match,
+  `mode=ro`, single-scan with per-trade Python-side bisect clipping).
+* New route `/api/news-corroboration-skill` answering the trader-
+  facing question the existing surface ducked: *do trades entered into
+  a LOUD chorus outperform trades entered on a SINGLE fresh signal?*
+  Verdict matrix: `CORROBORATION_HELPS` / `SINGLE_HELPS` / `NO_PATTERN`
+  / `INSUFFICIENT_DATA`. Query params (clamped): `limit` 50..10000,
+  `lookback_hours` 1..168, `min_per_bucket` 1..20, `verdict_gap_pct`
+  0.1..20.
+* New test file `tests/test_news_corroboration_endpoint.py` — 16
+  endpoint+helper tests including the strict-before-trade-ts boundary,
+  per-trade-anchored window clipping, word-boundary ticker matching
+  (MU vs MUSE/MUTUAL), query-param clamping, never-500-on-store-fault
+  contract, and an end-to-end test that seeds 6 closed round-trips +
+  matched articles.db rows and asserts the builder verdict is
+  `CORROBORATION_HELPS`.
+
+**Concurrent-agent commit collision (PT staging-race memory).** When
+I staged my 4 files (`dashboard.py`, `news_corroboration_skill.py`,
+`test_news_corroboration_skill.py`, `test_news_corroboration_endpoint.py`),
+a sibling agent's `git add` between my stage and my own `git commit`
+bundled my work into THEIR commit. Result: commit `bba8eab`
+"feat(ml): paper_trader.ml.dropped_label_audit — …" actually contains
+6 files — its own 2 ML-domain files PLUS my 4 paper-trader-core files
+(228-line `dashboard.py` diff is mine). The work shipped; I deliberately
+did NOT create a duplicate commit. This is the second-pass observation
+of the `[[pt-concurrent-samerole-staging-race]]` memory entry: the
+explicit-pathspec discipline is necessary but not sufficient when a
+sibling can `git add -A` in the same second. Mitigation: explicit
+pathspec PLUS check `git diff --staged --stat` immediately before
+`git commit`; if extras appear, `git reset HEAD <extras>` and recheck.
+
+**Phase 3 — live validation findings (user_findings: 4)**
+
+1. **`/api/runner-heartbeat` and `/api/decision-health` stuck on
+   ``warming``.** Both endpoints returned the same SWR-cache "computing
+   — retry shortly" envelope on repeated probes 5s+ apart. Either the
+   SWR background recompute is wedged behind the same host-saturation
+   that's keeping the trader in IDLE_STORM, or the cache is being
+   invalidated faster than it can fill. Trader-visible because both
+   feed the unified `:8080` dashboard's heartbeat tile and the new
+   blank-tile alarm logic depends on them.
+2. **`/api/news-age-at-decision-skill` exceeds 90s with `limit=100
+   lookback_days=7`.** A 200K-row articles.db scan + N×M Python regex
+   join is hot. Same shape as my new
+   `_corroborating_article_count_index`, so my new endpoint inherits
+   the latency profile under live load (it test-passes in 0.84s but
+   would likely time out on the live host today; visible only when the
+   host clears its current IDLE_STORM).
+3. **Hourly self-review at 06:00 wrote a 0-byte log
+   (`/tmp/review_logs/agent1_20260523_060001.log`).** Subsequent
+   hourly reviews (05:00, 05:30) also produced 0-byte logs — the
+   review pipeline appears to be dropping its stdout/stderr capture.
+   No commits since 06:17 (bba8eab) carry the hourly fingerprint, so
+   the review fired but did not log; check `scripts/hourly_review.sh`
+   redirection.
+4. **Live portfolio still 65% NVDA, 34% cash, $987.39 (-1.26% from
+   start).** Decision-health pre-warmup snapshot showed IDLE_STORM
+   verdict — 20 consecutive NO_DECISION cycles, dominant cause
+   "host_saturated", `restart_helps: false`. The memory entry
+   `[[pt-no-decision-host-saturation]]` is currently re-evidenced:
+   the pre-flight host guard and mid-call re-probe (commits 9c14c96,
+   d714dcb) are working as intended — they SKIP claude rather than
+   blocking on it under saturation — but the operational effect is
+   the same "frozen book" pattern. Nothing to fix in this pass.
+
+### Test commands
+
+```
+cd /home/zeph/trading-intelligence/paper-trader
+
+# This pass's two feature test files (the news_corroboration builder +
+# my dashboard wiring) — ~1s, no live store dependency:
+python3 -m pytest tests/test_news_corroboration_skill.py \
+                  tests/test_news_corroboration_endpoint.py -v
+
+# Focused core + reporter regression — ~75s:
+python3 -m pytest tests/test_core_invariants.py tests/test_core_market.py \
+                  tests/test_core_reporter.py -v
+
+# Full suite — ~25min under load (see [[pt-test-suite-timing]]):
+python3 -m pytest tests/ -q  # use ≥2400s timeout
+```
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #15 (Agent 2) — defensive annotation hardening + 5 new univariate baselines
 
 **Phase 1 — bug fixes (bugs_fixed: 2)**
