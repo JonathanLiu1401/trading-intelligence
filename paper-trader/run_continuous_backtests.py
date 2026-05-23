@@ -2072,10 +2072,19 @@ def _opus_annotate(engine: "BacktestEngine", top_runs: list[BacktestRun],
         return 0
 
     # Build outcome lookup: (sim_date, ticker) -> forward_return_5d
+    # Use `.get()` everywhere: a missing key from a future record-shape change
+    # would otherwise KeyError out of this background annotation thread (no
+    # outer catch wraps lines 2074-2105) and silently drop the entire
+    # cycle's Opus annotations. A None lookup result is already filtered
+    # downstream (`if fwd is not None`), so .get() degrades gracefully.
     outcome_lookup: dict[tuple, float] = {}
     for o in (outcome_records or []):
         if o.get("run_id") == winner.run_id:
-            outcome_lookup[(o["sim_date"], o["ticker"])] = o["forward_return_5d"]
+            sim_date_o = o.get("sim_date")
+            ticker_o = o.get("ticker")
+            fwd_o = o.get("forward_return_5d")
+            if sim_date_o and ticker_o and fwd_o is not None:
+                outcome_lookup[(sim_date_o, ticker_o)] = fwd_o
 
     # Build enriched decision log — all actions, not just BUY/SELL
     decision_lines = []
@@ -2414,11 +2423,20 @@ def _llm_annotate_outcomes(
         trades = []
         run_records = [r for r in outcome_records if r.get("run_id") == run.run_id][:max_trades]
         for r in run_records:
+            # `r.get('forward_return_5d', 0)` only defaults on a MISSING
+            # key — an explicit None value (a malformed record, or a future
+            # record-shape change) hits `None:.1f` → TypeError, which is
+            # caught by the outer except at line 2469 and silently drops
+            # the WHOLE cycle's LLM annotations for that batch. `or 0`
+            # coerces None to a safe numeric. Same hardening idiom used
+            # in `_inject_and_train` for ai_score / weight.
+            ml_score_v = r.get("ml_score") or 0
+            fwd_v = r.get("forward_return_5d") or 0
             trades.append(
                 f"  {r.get('ticker','?')} {r.get('action','BUY')}: "
-                f"ml_score={r.get('ml_score', 0):.1f}, "
+                f"ml_score={ml_score_v:.1f}, "
                 f"rsi={r.get('rsi') or '?'}, "
-                f"5d_return={r.get('forward_return_5d', 0):.1f}%"
+                f"5d_return={fwd_v:.1f}%"
             )
         return f"{label} (total return: {run.total_return_pct:.1f}%):\n" + "\n".join(trades or ["  (no trades)"])
 

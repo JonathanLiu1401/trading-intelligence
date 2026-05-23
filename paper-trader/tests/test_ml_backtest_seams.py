@@ -223,3 +223,129 @@ class TestLlmAnnotateRunIsolation:
         )
         out = rcb._llm_annotate_outcomes(None, winner, loser, recs, cycle=1)
         assert [r["llm_quality_label"] for r in out] == [0, 0]
+
+    def test_none_forward_return_does_not_raise_or_drop_batch(self, monkeypatch):
+        """Regression lock: a single outcome row with `forward_return_5d=None`
+        used to format-string-crash inside the prompt builder
+        (``f\"{None:.1f}%\"``), which was caught by the outer except and
+        DROPPED THE WHOLE CYCLE'S annotations silently.
+
+        The harden coerces None to 0 only for the prompt display — the
+        actual training-time row carries the real None forward.
+        Annotations on the OTHER rows must still apply.
+        """
+        import anthropic
+
+        winner, loser = self._runs()
+        recs = [
+            # malformed: explicit None forward_return_5d (the live ledger
+            # cannot produce this today, but a future record-shape change
+            # might. The fix protects against it.)
+            {"run_id": 1, "ticker": "NVDA", "action": "BUY",
+             "ml_score": None, "rsi": 40, "forward_return_5d": None},
+            # well-formed neighbour in the same batch
+            {"run_id": 3, "ticker": "AMD", "action": "SELL",
+             "ml_score": 1.0, "rsi": 70, "forward_return_5d": -2.0},
+        ]
+        text = "AMD SELL: CONDEMN poor exit timing"
+        monkeypatch.setattr(anthropic, "Anthropic", _fake_anthropic(text))
+        out = rcb._llm_annotate_outcomes(None, winner, loser, recs, cycle=1)
+        # The malformed row gets neutral. The well-formed row STILL receives
+        # its CONDEMN label — the whole batch is not silently dropped.
+        by = {(r["run_id"], r["ticker"]): r["llm_quality_label"] for r in out}
+        assert by[(3, "AMD")] == -1
+        assert by[(1, "NVDA")] == 0
+        # The None field is preserved untouched in the returned records.
+        nvda = next(r for r in out if r["run_id"] == 1)
+        assert nvda["forward_return_5d"] is None
+
+
+class TestOpusAnnotateOutcomeLookupDefensive:
+    """Regression lock for the outcome_lookup builder inside _opus_annotate.
+
+    Previously used direct ``o["sim_date"]`` / ``o["forward_return_5d"]``
+    dict access. A malformed record (missing key) would KeyError out of
+    this background daemon thread (no outer try wraps lines 2074-2105),
+    silently dropping the entire cycle's Opus annotations. The hardened
+    code uses ``.get()`` everywhere and only inserts complete entries.
+    """
+
+    def test_records_with_missing_keys_do_not_crash(self, monkeypatch, tmp_path):
+        """A missing 'sim_date' / 'ticker' / 'forward_return_5d' on ANY record
+        must not raise out of `_opus_annotate`. Short-circuits the subprocess
+        path so we only exercise the lookup-build phase."""
+        # Short-circuit: claude binary "not present" → returns 0 before any
+        # outcome_lookup work runs. Instead we directly exercise the helper
+        # logic by monkey-patching `shutil.which` to return a path AND
+        # mocking subprocess.run to return a valid empty JSON response.
+        import shutil
+        import subprocess
+        from types import SimpleNamespace
+
+        winner = BacktestRun(run_id=42, seed=42,
+                             start_date="2025-01-01", end_date="2025-12-31",
+                             total_return_pct=10.0)
+
+        # Engine with an in-memory sqlite store containing a single decision.
+        import sqlite3
+        import paper_trader.backtest as bt
+        store = bt.BacktestStore.__new__(bt.BacktestStore)
+        store.conn = sqlite3.connect(":memory:")
+        store.conn.row_factory = sqlite3.Row
+        store.conn.executescript(bt.SCHEMA)
+        store.conn.commit()
+        import threading as _th
+        store._lock = _th.Lock()
+        store.conn.execute(
+            "INSERT INTO backtest_decisions "
+            "(run_id, sim_date, action, ticker, qty, total_value, reasoning, status) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (42, "2025-06-01", "BUY", "NVDA", 1.0, 1000.0, "test", "FILLED"),
+        )
+        store.conn.commit()
+        engine = SimpleNamespace(store=store)
+
+        # Outcome records mixing well-formed, missing keys, and None values.
+        outcome_records = [
+            # missing sim_date
+            {"run_id": 42, "ticker": "NVDA", "forward_return_5d": 5.0},
+            # missing ticker
+            {"run_id": 42, "sim_date": "2025-06-01", "forward_return_5d": 5.0},
+            # missing forward_return_5d
+            {"run_id": 42, "sim_date": "2025-06-02", "ticker": "AMD"},
+            # explicit None values
+            {"run_id": 42, "sim_date": None, "ticker": None,
+             "forward_return_5d": None},
+            # well-formed (this one SHOULD make it into the lookup)
+            {"run_id": 42, "sim_date": "2025-06-01", "ticker": "NVDA",
+             "forward_return_5d": 7.5},
+            # wrong run_id (filtered out by the run_id == winner.run_id guard)
+            {"run_id": 999, "sim_date": "2025-06-01", "ticker": "TSLA",
+             "forward_return_5d": 3.0},
+        ]
+
+        # Force `shutil.which("claude")` to return a path so the early
+        # exit doesn't fire; mock subprocess.run to return a no-op response
+        # that has no trade_labels (so no extra annotation rows are written).
+        monkeypatch.setattr(rcb.shutil, "which", lambda _: "/usr/bin/claude")
+        def _fake_run(*a, **k):
+            return SimpleNamespace(
+                returncode=0,
+                stdout='{"trade_labels": [], "overall_lesson": ""}',
+                stderr="",
+            )
+        monkeypatch.setattr(rcb.subprocess, "run", _fake_run)
+        # Redirect WINNER_JSONL to a temp file so we don't pollute real data.
+        monkeypatch.setattr(rcb, "WINNER_JSONL", tmp_path / "winner.jsonl")
+        # Silence the news context query (it would otherwise try to open
+        # the live articles DB).
+        monkeypatch.setattr(rcb, "_query_news_context", lambda *a, **k: [])
+
+        # The critical assertion: _opus_annotate runs to completion. Prior
+        # to the fix, the first malformed record raised KeyError.
+        n_written = rcb._opus_annotate(engine, [winner], cycle=99,
+                                       outcome_records=outcome_records)
+        # No lesson and no trade_labels → 0 rows. The contract under test
+        # is "did not raise", not the write count itself.
+        assert isinstance(n_written, int)
+        assert n_written == 0
