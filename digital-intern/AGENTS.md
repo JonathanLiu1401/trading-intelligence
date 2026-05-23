@@ -5,6 +5,86 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-23 feature-dev pass (Agent 4) — `/api/label-quality` + `/api/active-learning-queue`
+
+Two dark analyzer modules + one dark JSONL queue surfaced as
+operator-facing endpoints. Every one was an existing capability with
+no consumer.
+
+### `/api/label-quality` — composite ML training-input health view
+
+Composes three previously-DARK modules into a single roll-up so the
+operator can answer "are the model's labels still trustworthy?" in one
+call:
+
+- `ml/label_audit.py::audit` — strong-pool integrity (CLAUDE.md §5
+  invariant): `score_source='ml'`-into-`ai_score` hygiene violations,
+  the heuristic-inferred trust gap, synthetic vs LLM provenance
+  composition, and the bucket reconciliation cross-check.
+- `ml/score_agreement.py::compute_agreement` — `ml_score` vs
+  `ai_score` Pearson/Spearman + RMSE + bias + strong-divergence
+  exemplars on the LLM-graded overlap. The drift signal: if ArticleNet
+  stops tracking Sonnet's judgement, the cheap model is no longer a
+  trustworthy filter.
+
+Single roll-up `verdict` (precedence):
+- `DIRTY` — hygiene violations present OR strong-pool buckets fail to
+  reconcile. Surfaces immediately, never hidden behind a 2nd-order
+  metric (this is the analyst's "stop trusting the model" signal).
+- `DIVERGING` — hygiene clean BUT (`|bias_ml_minus_ai| ≥ 1.0` OR
+  `strong_disagreement_pct ≥ 15%`) AND overlap `n ≥ 100`.
+- `OK` — clean AND drift within thresholds with sufficient overlap.
+- `OK_LOW_OVERLAP` — hygiene clean but not enough Sonnet-graded rows
+  to judge drift (honest "no verdict yet"; mirrors `news_edge` /
+  `trade_asymmetry` sample-size-honesty convention).
+
+Read-only against `articles.db` (one `mode=ro` connection per call,
+WAL-isolated from the daemon's writer — adds zero lock contention).
+Per-analyzer errors absorbed into a JSON `errors` list, never raises
+into a 500 (mirrors the existing `/api/ml-status` discipline). Calls
+the analyzer modules verbatim — no re-derivation (the
+`signal_followthrough` / `source_edge` SSOT discipline).
+
+```sh
+curl -s 'http://localhost:8080/api/label-quality' | python3 -m json.tool
+```
+
+### `/api/active-learning-queue?limit=N` — surface uncertain articles
+
+The recursive labeler writes `data/active_learning_queue.jsonl` (one
+row per MC-Dropout-high-variance article — what the model could not
+make up its mind about). Capped at 5000 lines by the labeler.
+Previously, the queue was consumed only by the labeler itself; the
+analyst had no way to see *what* the model is uncertain about.
+
+Returns the most-recent `limit` rows (default 25, max 100), newest
+first. Tail-reads the JSONL (8 KB/row window) so even a 5000-line file
+streams in milliseconds. Malformed lines skipped, missing file returns
+empty `items` — never raises. Total raw line count returned alongside
+`returned` so the UI can render "showing N of M".
+
+```sh
+curl -s 'http://localhost:8080/api/active-learning-queue?limit=10' | python3 -m json.tool
+```
+
+### Coverage
+
+- `tests/test_label_quality_endpoint.py` — 4 cases via Flask
+  `test_client`: clean pool with tight agreement returns `OK`, a
+  single hygiene violation escalates to `DIRTY`, systematic
+  ml-vs-ai divergence on 300+ rows escalates to `DIVERGING`, empty DB
+  degrades gracefully.
+- `tests/test_active_learning_queue_endpoint.py` — 6 cases: newest-
+  first ordering, default limit=25, clamp to 100, invalid-limit
+  fallback, missing file returns empty, malformed line skipped not
+  fatal.
+
+Advisory only — observational endpoints, neither gates the trader nor
+the daemon's workers, neither modifies the labels or queue. Applies
+on next digital-intern restart (the documented pattern).
+
+---
+
 ## 2026-05-23 hybrid pass #21 (Agent 3) — hyphenated image-credit gap + prefloor pool audit
 
 Debugger + feature-dev + news-analyst pass. Two commits on master.
