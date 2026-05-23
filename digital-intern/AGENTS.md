@@ -5,6 +5,512 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-23 hybrid pass #6 (Agent 3) — recursive-labeler noise-floor re-promotion fix + per-held-ticker recap pollution metric
+
+**Phase 1 (fix).** `bugs_fixed=1` — commit `b6e1fef`.
+
+Read files: AGENTS.md head (pass #5 / #4 / #3), `daemon.py` (workers +
+supervisor + reaper-startup hook), `storage/article_store.py` (full —
+`_LIVE_ONLY_CLAUSE`, every `update_*_batch` urgency state machine, the
+6+ DB-lock retry classes, `reap_stale_urgent`, all five analytics
+primitives + `source_recap_pollution`), `watchers/alert_agent.py` (full —
+20 recap fingerprints + 6 quote-widget fingerprints + the 6-stage
+dispatch gate stack), `watchers/urgency_scorer.py` (full — Sonnet
+prompt with the sibling agent's portfolio-tickers WIP, the quote-widget
++ recap-template pre-filter), `ml/features.py` (full —
+`LIVE_PORTFOLIO_TICKERS` SSOT, `_DOMAIN_CRED`, `_PREFIX_ALIASES`,
+`_LOW_AUTHORITY_DOMAINS`), `ml/model.py` (MC-Dropout heads, warm-start
+LR, early-stop), `ml/trainer.py` (full — `STRONG_LABEL_WHERE` excludes
+`score_source='ml'`, subprocess isolation, label-weight exponent),
+`collectors/web_scraper.py` (full — 4 quote-widget fingerprints),
+`analysis/claude_analyst.py` recap-mirror patterns + `_BOOK_TICKERS` +
+`_BOOK_UNIVERSE` union. Baseline `test_article_store +
+test_urgency_scorer + test_features + test_model + test_trainer +
+test_urgency_portfolio_prompt + test_source_recap_pollution` →
+**80/80 green in 102s**.
+
+**Live evidence of the bug.** A read-only scan of the USB `articles.db`
+quantified the recursive-labeler's contamination of the trainer's
+strong-label pool:
+
+  - 15,628 rows currently carry `ai_score=0.01 score_source='llm'` —
+    the urgency_scorer's pre-floor sentinel for quote-widget +
+    recap-template fingerprint hits, plus the anti-loop floor for
+    Sonnet-omitted indices.
+  - The recursive labeler's `_fetch_round1_candidates` selects
+    `ai_score < 2.0` ordered by oldest first, so it re-fetches every
+    pre-floored row on every 4h cycle and sends them BACK to Sonnet
+    via its OWN prompt path (no quote-widget / recap pre-filter).
+  - Of the last 5000 LLM-tagged scored rows, 17 are quote-widget-shaped
+    titles re-promoted into the 4.0-8.0 range —
+    `NVDANVIDIA Corporation227.13-8.61(-3.65%)` got recursive-labeled to
+    `ai_score=8.0` (urgent territory; would have fired a 🚨 BREAKING
+    push had the alert gate not also re-suppressed it at output time),
+    `INTCIntel Corporation109.07-6.86(-5.92%)` to 4.0, multiple
+    `BTC-USDBitcoin USD...` rows to 4.0-5.0, multiple `NOK Nokia Oyj...`
+    rows to 4.0. The pre-floor was being silently undone every 4h.
+
+**Fix.** Two-layer defence-in-depth in
+`ml/recursive_labeler.py::_fetch_round1_candidates`:
+
+1. **SQL noise-sentinel exclusion** — change `ai_score < 2.0` to
+   `(ai_score = 0 OR ai_score >= 0.5) AND ai_score < 2.0`. Sonnet
+   returns integer 0..10 scores clamped to `max(0.01, ...)`, so
+   `ai_score = 0.01` is the unambiguous noise-floor sentinel (never a
+   legitimate Sonnet output). The new predicate keeps `ai_score = 0`
+   (genuine unlabeled — the primary target) and `ai_score >= 0.5`
+   (legitimate low Sonnet labels — 1.0, 1.5 — the active-learning
+   pool), excluding only the sentinel band.
+2. **Python-side fingerprint check** — import
+   `_looks_like_quote_widget` + `_looks_like_recap_template` from
+   `watchers.alert_agent` (the SAME SSOT helpers the urgency_scorer
+   pre-filter uses) and drop fingerprint matches from the candidate
+   list. Catches rows that reached the labeler with `ai_score=0
+   score_source=NULL` because the scorer worker hadn't yet
+   Sonnet-routed them (scorer backlog scenario). Regex-tightening
+   anti-drift: a new fingerprint added to the alert path engages here
+   automatically. Local import; an ImportError silently degrades to
+   "no filter" so a transient import path issue can never break the
+   whole 4h labeling cycle.
+
+All four load-bearing invariants intact (read-only fetch — no DB write,
+no ai_score/ml_score/score_source/urgency mutation; backtest exclusion
+unchanged in the same WHERE clause).
+
+**Tests added (5 new):**
+- `test_excludes_noise_floor_sentinel`: pins the SQL filter — `ai_score=0.01`
+  excluded, `ai_score=0` / `1.0` / `1.5` kept
+- `test_excludes_quote_widget_fingerprints_at_ai_score_zero`: pins the
+  Python-side fingerprint check on `ai_score=0` rows (the case the SQL
+  filter doesn't catch)
+- `test_excludes_recap_template_fingerprints_at_ai_score_zero`: same
+  for recap-template fingerprints (why_trading / quick_glance /
+  market_today)
+
+`test_recursive_labeler.py` → **20/20 green**. Broader baseline
+(12 files) → **192/192 green**.
+
+**Phase 2 (feature).** `features_added=1` — commit `d1b523e`.
+
+Added `ArticleStore.ticker_recap_pollution(tickers, recap_matcher, hours,
+min_total, top_n)` — **per-held-ticker recap-template pollution rate**.
+Sibling to `source_recap_pollution` (per-collector content-type angle);
+this is the per-held-ticker complement, the natural slice for the
+analyst persona "I depend on these alerts to react to events affecting
+MY positions". A held name whose urgent rows are 80% recap-template
+post-earnings mill content is materially less actionable than one with
+5% recap — neither the aggregate metric nor the per-source slice
+surfaces this.
+
+Completes the four-primitive per-held-ticker view:
+- `urgency_label_split_by_ticker` → calibration (LLM-vetted fraction)
+- `ticker_mention_velocity` → momentum (rate-of-change)
+- `book_alert_coverage` → yield (urgent / total coverage)
+- `ticker_recap_pollution` → **content type (recap / real news)** ← NEW
+
+Design discipline mirrors `source_recap_pollution`:
+- injected matcher (storage layer must not import analysis/watchers
+  gates — would invert the dependency graph; SSOT matchers are wrapped
+  by callers with a `(title-string -> dict)` adapter, byte-identical
+  to `test_source_recap_pollution`'s convention)
+- bool OR `(bool, name)` matcher signatures both supported
+- buggy matcher degrades to "no hit" (metric must never crash)
+- `_LIVE_ONLY_CLAUSE` scoped (backtest/opus excluded by SQL)
+- `min_total` volume floor; `top_n` response cap
+- worst-recap-rate-first + alphabetical-ticker tiebreak (deterministic
+  cycle-to-cycle ordering, same discipline as the four other per-ticker
+  primitives)
+- ticker match is whole-word, ALL-CAPS, optional `$`, `len >= 2` over
+  `title + summary` — byte-identical to the four sibling primitives
+- multi-attribution counting: a single recap row mentioning two held
+  names counts toward both per-ticker buckets, but the global total
+  counts the row ONCE (matches `source_recap_pollution`'s
+  row-counted total)
+- all four load-bearing invariants intact (read-only)
+
+Tests (18 new, all green): per-ticker counts, sort order, volume floor,
+top_n cap, both matcher signatures, buggy-matcher degradation, backtest
+exclusion, urgency>=1 only, window correctness, title+summary surface,
+short ticker filter, multi-attribution global counting, alert-side SSOT
+parity, briefing-side SSOT parity, no-mention ticker omitted.
+
+Broader baseline (13 files + the new test file) → **255/255 green**.
+
+**Live evidence the metric is immediately actionable.** Running against
+the 24h window over 23 held/watched tickers
+(`config/portfolio.json` ∪ `_FALLBACK_PORTFOLIO_TICKERS`):
+
+  - **MU**:   2/5  = 40.0% recap  (`why_trading_today=2`)
+  - **AXTI**: 1/4  = 25.0% recap  (`gf_value_says=1` — GuruFocus mill)
+  - **DRAM**: 1/15 =  6.7% recap  (`wikipedia_ref=1`)
+  - **NVDA**: 1/33 =  3.0% recap  (`heres_what_happened=1`)
+  - **AMD / LITE / MSFT / QBTS**: 0% recap
+  - Global: 6/89 = 6.7%
+
+The operator now knows MU's urgent stream is 8x noisier than NVDA's —
+a quantitative answer to "should I weight per-position urgent rows by
+content type?" that no other primitive surfaces.
+
+**Phase 3 (live user validation).** `user_findings=6`.
+
+1. **Collection healthy** — 2,347 articles/h from 293 distinct sources
+   in the last hour (live USB `articles.db` scan). Top productive feeds:
+   stocktwits, GN: Nasdaq, GN: IPO, GN: earnings,
+   scraped/finance.yahoo.com, reddit/r/buildapc, GN: Federal Reserve.
+   Matches AGENTS.md history's healthy-baseline pattern.
+
+2. **CALIBRATION ALARM — LLM-vetted fraction has collapsed.** Live 24h
+   urgent rows: 265 ML-only (91.7%), 24 LLM-vetted (8.3%). The
+   `urgency_label_split` metric existed BEFORE this finding and is
+   working as designed; the alarm is that the rate has degraded from
+   pass #5's ~29% to today's 8.3% — Sonnet is essentially dark for the
+   alert path. Cause is likely Claude CLI quota throttling (no log
+   tail available; the daemon runs as a long-lived manual process —
+   `di-stale-manual-daemon`). The analyst's standalone-push channel is
+   now ~92% unverified-model-only. Already documented in chat /
+   briefing via the existing `urgency_label_split` block, but the
+   degradation cadence (29% → 8.3% over ~5h) warrants attention.
+
+3. **Latest briefing quality is excellent.** The 2026-05-23 09:33 UTC
+   heartbeat: 50 articles, 3270 chars. LEAD names NVDA aftermath
+   (-1.90% despite $80B buyback + 25-fold dividend), $20B Vera CPU
+   reveal, Trump chip-tariff overhang, risk-on chip tape (Nikkei
+   +2.68% / SoftBank +11.89% / QCOM +11.60% / AXTI +16.37%). The
+   PORTFOLIO table maps the live held universe correctly including
+   the pass-#3 GOOG / COHR / NVDL union; per-ticker NOTE column reads
+   honestly with `N/A — no catalyst this window` for silent positions
+   (no fabricated implications). TOP SIGNALS contains 5 real
+   headlines, NO recap-template noise — the briefing-layer recap gate
+   from pass #5 is working as designed. COVERAGE GAP, THROUGHPUT
+   DEGRADATION, ALERT VELOCITY sections present and honest.
+
+4. **Dark sources match the standing memory** — `Polygon` 228h dark
+   (0 delivered all session), `NewsAPI` 364h dark (0 all session),
+   `Nitter` 110h dark, `Massive` 5.3h dark, dozens of
+   `yfinance/<aggregator>` + `GDELT/<host>` channels 248h dark.
+   Matches `[di-chronic-dark-collectors]` memory — standing external
+   gap, NOT a fresh bug. Briefing's COVERAGE GAP block surfaces this
+   to the analyst.
+
+5. **The new `ticker_recap_pollution` metric is the most actionable
+   per-held-ticker signal added to the analytics suite in weeks** —
+   live numbers (Phase 2 evidence above) immediately answer "is MY
+   book's urgent stream signal or noise?" per position. MU at 40%
+   recap is a concrete operator action item (treat MU urgent alerts
+   with suspicion, or downgrade the `why_trading_today` fingerprint
+   threshold further).
+
+6. **One urgency=2 recap-shaped row in the live alert window** —
+   "Why Micron (MU) Stock Is Trading Up Today" reached urgency=2 in
+   the last 1h. This is NOT a fresh bug: the recap-template gate
+   unconditionally marks suppressed rows urgency=2 so they exit the
+   queue (`recap_suppressed → store.mark_alerted_batch(...)` in
+   `watchers/alert_agent.py`), so urgency=2 means "exited queue via
+   push OR suppression" — distinguishing requires `alert_recency.db`
+   inspection. The briefing's TOP SIGNALS does NOT contain this row
+   (the briefing-layer gate from pass #5 is working). Likely the
+   suppression path; would need pushed-alert audit to confirm.
+
+Counters: `bugs_fixed=1 | features_added=1 | user_findings=6`.
+
+---
+
+## 2026-05-23 hybrid pass #5 (Agent 3) — briefing recap-template drift fix + per-source recap pollution metric
+
+**Phase 1 (fix).** `bugs_fixed=1` — commit `09a3d8e`.
+
+Read AGENTS.md head, `daemon.py` (first 1180 lines — workers/supervisor/
+ingest/heartbeat path), `storage/article_store.py` (full 2232 lines —
+`_LIVE_ONLY_CLAUSE`, every `update_*_batch` state machine,
+`reap_stale_urgent`, all five analytics primitives + the existing per-ticker
+slices), `watchers/alert_agent.py` (full 1524 lines — all 15 recap
+fingerprints + 6 quote-widget fingerprints + the dispatch pipeline),
+`watchers/urgency_scorer.py` (full — quote-widget + recap pre-filter, the
+sibling agent's portfolio-ticker WIP), `ml/features.py` (full —
+`LIVE_PORTFOLIO_TICKERS` SSOT, `_DOMAIN_CRED`, `_PREFIX_ALIASES`,
+`_LOW_AUTHORITY_DOMAINS`), `ml/model.py` (full — MC-Dropout heads, warm-
+start LR, early-stop), `ml/trainer.py` (full — `STRONG_LABEL_WHERE`
+excludes `score_source='ml'`, label-weight exponent, subprocess isolation,
+in-process stub-aware fallback), `collectors/web_scraper.py` (full — 4
+quote-widget fingerprints), `analysis/claude_analyst.py` recap-mirror
+patterns. Baseline `test_article_store + test_urgency_scorer +
+test_features + test_model + test_trainer` → **61/61 green in 52s**.
+
+**Live diff to verify briefing/alert recap parity:** ran a per-fingerprint
+comparison of every regex in `watchers.alert_agent._RECAP_TEMPLATE_PATTERNS`
+(16 entries) against `analysis.claude_analyst._BRIEFING_RECAP_TEMPLATE_PATTERNS`
+(9 entries) — and a 9-row live noise test corpus confirmed all 9 missing /
+stale-regex hits silently bypassed the briefing's `_filter_recap_template_noise`.
+
+A 7-day `articles.db` audit quantified the drift impact (live ml_score
+column per fingerprint that the briefing layer had NO gate for):
+
+  - `why_just_moved`        26 rows, e.g. "Why Micron Stock Just Popped Again"
+  - `why_pct_after`         35 rows (TSEM/LITE/AXTI 7-30% post-event recaps, ml 9.6–9.9)
+  - `todays_movers_list`    74 rows ("These Stocks Are Today's Movers: ...")
+  - `is_buy_after`          91 rows ("Is X a Buy After Their Latest Earnings...")
+  - `earnings_tomorrow`     49 rows ("X Reports Earnings Tomorrow: What To Expect")
+  - `earnings_call_no_year`  356 rows ("NVIDIA Q1 Earnings Call Highlights" — strict regex required year)
+  - `earnings_transcript`   349 rows ("Nvidia Q1 2027 Earnings Transcript" — strict regex required "Call")
+  - `why_is_pct_since`     105 rows ("Why is X down N% since last earnings...")
+  - `why_stock_is_after`     4 rows — TWO of them reached `urgency=2` with `ml_score 9.81 / 9.97`
+                                    ("Why Nvidia Stock Is Barely Moving After Earnings Crushed Expectations")
+
+The drift had a clear blast radius: the alert path's recap gates pre-floor
+these to `ai_score=0.01`, so `get_top_for_briefing`'s
+`COALESCE(NULLIF(ai_score, 0), ml_score, 0) DESC` ordering reads the
+`ml_score=9+` and the row scores straight into the briefing top-50 pool.
+The briefing — the analyst's PRIMARY consumed product — was silently
+admitting hundreds of retrospective-recap rows as TOP SIGNALS.
+
+**Fix.** Ported byte-identical regex source for all 7 missing fingerprints
+from `watchers/alert_agent.py` to `analysis/claude_analyst.py`, plus the
+relaxed `_BRIEFING_RT_EARNINGS_CALL` (year + "call" both optional, matching
+the alert side's 2026-05-20 relaxation). All four load-bearing invariants
+preserved (no DB write, no ai_score/ml_score/score_source/urgency mutation;
+backtest exclusion upstream in `_LIVE_ONLY_CLAUSE`).
+
+New regression test file `tests/test_briefing_recap_template.py` additions:
+  - `test_briefing_gate_catches_drift_patterns`: pins 14 live-evidence rows by exact fingerprint name
+  - `test_briefing_drift_patterns_preserve_must_survive_corpus`: pins 14 real breaking / forward-looking titles that must NOT match
+  - `test_alert_and_briefing_recap_tuples_have_same_length`: structural anti-drift — the two tuple lengths must match; future asymmetry fails BEFORE prod
+
+`test_briefing_recap_template.py + test_alert_recap_template.py = 70/70 green`. Broader
+baseline (10 files + the new test file) → **169/169 green**.
+
+**Phase 2 (feature).** `features_added=1` — commit `7d5e249`.
+
+Added `ArticleStore.source_recap_pollution(recap_matcher, hours, min_total, top_n)` —
+the **per-source recap-template noise leaderboard**. Sibling to
+`urgency_label_split_by_source` (per-collector *verification* angle — LLM-vetted
+fraction); this is the orthogonal *content-type* angle: of each source's urgent
+rows, what fraction match a recap/SEO-template fingerprint the urgency head
+over-scores (uses the same SSOT recap-template set as the alert and briefing
+gates, kept in lockstep by Phase 1's structural anti-drift test).
+
+The metric answers the analyst's "which feeds should I prune?" question that
+the verification metric cannot — a source can be 100% LLM-vetted and still
+pump 80% retrospective recap noise the analyst has to wade through.
+
+Design:
+- **Recap matcher is INJECTED** (callable taking title → bool or (bool, name)) so
+  the storage layer never imports analysis or watchers (would invert the
+  dependency graph). Production callers pass the SSOT matcher from either layer;
+  tests pass stubs.
+- **Buggy matcher degrades to no-hit** — a matcher that raises must NEVER
+  crash the metric. Pollution surface must survive a regex compile failure.
+- **`_LIVE_ONLY_CLAUSE`-scoped** (backtest/opus rows EXCLUDED — pinned by
+  `test_backtest_rows_excluded_invariant`). All four load-bearing invariants
+  intact by construction (read-only, no mutation).
+- **Worst-recap-rate-first ordering** with alphabetical-source tiebreak — matches
+  the deterministic-tiebreak convention of `urgency_label_split_by_source`,
+  `ticker_mention_velocity`, `book_alert_coverage` so dashboard ordering is
+  stable cycle-to-cycle.
+- **`min_total` volume floor** excludes "1/1 = 100% polluted" no-volume sources
+  from the per-source list while still counting them in the global rate.
+- **`top_n` caps response size** for dashboard pagination.
+
+Tests (14 new, all green): per-source counts, min_total floor, sort order,
+tuple vs boolean matcher signatures, buggy matcher degradation, 24h window,
+backtest exclusion invariant, urgency>=1 filter, empty window structure,
+alert-side SSOT matcher parity, briefing-side SSOT matcher parity, top_n cap.
+
+**Broader baseline (10 files + the two new test files) → 183/183 green.**
+
+**Phase 3 (live user validation).** `user_findings=5`.
+
+1. **Collection rate healthy** — 2,122 articles/h from 280 distinct sources
+   in the last hour (live `articles.db` scan). Top productive feeds:
+   `stocktwits`, `GN: Nasdaq`, `GN: IPO`, `scraped/finance.yahoo.com`,
+   `reddit/r/buildapc`.
+
+2. **Chronic dark collectors** — `gdelt_gkg/*` (14 hosts) dark ~155h (>6 days);
+   `reddit/r/GlobalMarkets` dark 224h (>9 days); Polygon dark 228h (0 delivered
+   all session); NewsAPI dark 364h (0 delivered all session); Nitter dark
+   110h (0 delivered all session). Matches the `[di-chronic-dark-collectors]`
+   memory — known external gap, NOT a fresh bug. The 5h briefing already
+   reports this in its **COVERAGE GAP** section so the analyst sees it.
+
+3. **Latest briefing quality is excellent** — 50 articles in the 09:33 UTC
+   heartbeat, real headline LEAD (NVDA earnings night + Trump tariff
+   overhang), accurate PORTFOLIO table mapping the live held universe,
+   honest COVERAGE GAP + THROUGHPUT DEGRADATION + ALERT VELOCITY sections.
+   No quote-widget / recap-template noise in TOP SIGNALS — the suppression
+   gates are working as designed.
+
+4. **DB-lock contention is chronic but handled** — `database is locked` /
+   `another row available` retries every few seconds in the live daemon
+   log; the `_retry_on_lock` decorator absorbs them all (no data loss
+   observed). Matches `[di-insert-batch-lock-contention]` memory.
+
+5. **The new `source_recap_pollution` metric is immediately actionable on
+   live data** — running it against the 24h live window surfaces specific
+   noise feeders: `Yahoo Finance` 66.7% recap (2/3 — earnings_call_recap),
+   `scraped/finance.yahoo.com` 20% (heres_what_happened),
+   `Finnhub/Yahoo` 18.2% (quick_glance_metrics + why_trading_today),
+   `GN: Nvidia` 7.9% (3 quick_glance_metrics rows during NVDA earnings
+   night). Global 24h rate: 5.6% (16/288). The operator can now prune
+   noise feeders quantitatively instead of by eyeball.
+
+---
+
+## 2026-05-23 hybrid pass #4 (Agent 3) — `[Wikipedia]` recap fingerprint
+
+**Phase 1 (fix).** `bugs_fixed=0`. Read AGENTS.md head + the 4 most recent
+passes, daemon.py top (workers + supervisor + heartbeat path),
+storage/article_store.py (full — `_LIVE_ONLY_CLAUSE`, every `update_*_batch`
+state machine, `reap_stale_urgent`, every `score_source` enforcement point),
+watchers/urgency_scorer.py (full — quote-widget + recap pre-filter, sibling
+agent's portfolio-tickers WIP), watchers/alert_agent.py (full head + all 14
+recap fingerprints + 6 quote-widget fingerprints + the dispatch path),
+ml/features.py (full — `LIVE_PORTFOLIO_TICKERS` SSOT, `_DOMAIN_CRED`,
+`_PREFIX_ALIASES`, `_LOW_AUTHORITY_DOMAINS`), ml/model.py + ml/trainer.py
+(full — `STRONG_LABEL_WHERE` excludes `score_source='ml'`, label-weight
+exponent, MC-Dropout heads, subprocess isolation), collectors/web_scraper.py
+(full — 4 quote-widget fingerprints), analysis/claude_analyst.py recap mirror
+spot read (`_BRIEFING_RECAP_TEMPLATE_PATTERNS`, `_BRIEFING_RT_*`,
+`_filter_recap_template_noise`). Baseline `tests/test_article_store +
+test_urgency_scorer + test_features + test_model + test_trainer +
+test_urgency_portfolio_prompt` → **66/66 green in 79s**.
+
+Live `articles.db` invariant scan (sqlite over USB DB): zero rows with
+`url LIKE 'backtest://%'` reaching `urgency>=1`; zero
+`score_source='ml'` rows with `ai_score > 0`; zero `urgency=1` rows older
+than 24h (the reaper machinery is working as designed). All four
+load-bearing defences intact.
+
+No clean Phase 1 bug found worth touching code for — the mature suite of
+recap / quote-widget / cred / dedup / reaper / subprocess-isolation gates
+covers every documented failure class and the live scan shows no fresh
+invariant violation. Per the per-commit guard: no Phase 1 commit.
+
+**Phase 2 (feature) — committed `555e8aa`.** `features_added=1`.
+
+The 7-day live `articles.db` audit surfaced a noise pattern none of the
+existing 14 recap fingerprints catch: the `collectors/wikipedia_collector`
+**`[Wikipedia]` recent-changes prefix** firing as urgent BREAKING.
+Wikipedia (cred=0.60) sits **above** the 0.45 `ALERT_MIN_LONE_SOURCE_CRED`
+bar so the source-authority gate does not catch it — content type IS the
+failure, exactly the class `_RT_HERES_WHAT_HAPPENED` (pass #2) addresses
+for the Motley Fool retrospective tail.
+
+Live evidence (2026-05-23, 7-day scan):
+
+  - `[Wikipedia] DRAM (musician)` at `ml_score=10.0` urgency=2 — pure
+    musician disambiguation page, not even semiconductor-related; the
+    urgency head max-scored it because "DRAM" is a learned semis keyword
+    + the (often ticker-shaped) title triggered high-relevance pattern
+    recognition.
+  - `[Wikipedia] Nvidia RTX` at `ml_score=8.6` urgency=2 — long-standing
+    GPU-product reference page, not a fresh product launch.
+
+Both rows reached urgency=2 on the live daemon and would have fired
+Bloomberg-style 🚨 BREAKING pushes — the analyst's single biggest noise
+complaint class, "encyclopedic reference content treated as breaking
+news".
+
+**Critical preservation: the sibling `collectors/wikipedia_pageviews`
+collector — which IS a useful predictive signal** (2.5σ pageview surges on
+tracked companies' Wikipedia pages reliably precede breaking news on the
+underlying name) — emits titles in a DIFFERENT shape:
+`"Wiki pageview SURGE NVDA (NVIDIA_Corporation): 12,345 vs 4,567 baseline
+(z=+3.2, x2.7) 2026-05-23"`. No leading `[Wikipedia]` bracket. So the
+pageview signal is preserved verbatim and only the encyclopedic
+recent-changes content is dropped. Pinned by
+`test_pageview_signal_specifically_preserved`.
+
+The fix:
+
+  - `watchers/alert_agent.py`: added `_RT_WIKIPEDIA_REF =
+    re.compile(r"^\s*\[Wikipedia\]\s+")` to `_RECAP_TEMPLATE_PATTERNS`
+    tuple (positioned after `heres_what_happened`, before
+    `earnings_tomorrow_preview` — no precedence conflict, the patterns
+    are mutually exclusive on their discriminators).
+  - `analysis/claude_analyst.py`: lockstep mirror
+    `_BRIEFING_RT_WIKIPEDIA_REF` added to
+    `_BRIEFING_RECAP_TEMPLATE_PATTERNS` with **byte-identical regex
+    source**. Mirrors the anti-import-cycle discipline (analysis layer
+    must not pull the watchers+ml import graph, same convention as the
+    `_RT_HERES_WHAT_HAPPENED` lockstep added in 75c632d).
+
+All four load-bearing invariants preserved (no DB write, no
+ai_score/ml_score/score_source/urgency mutation; backtest:// /
+`backtest_` / `opus_annotation*` exclusion via `_LIVE_ONLY_CLAUSE` is
+upstream of these formatter-side gates and untouched).
+
+New regression test file `tests/test_alert_wikipedia_ref.py` (10 tests)
+pins:
+- 11 Wikipedia noise titles all matched (including both live failure cases,
+  leading-whitespace tolerance, ticker-shaped titles, disambiguation pages).
+- 10 must-survive titles all NOT matched: the wikipedia_pageviews signal
+  shape (the critical preservation), real wire headlines mentioning
+  Wikipedia mid-text, bracketed source tags from other publishers
+  (`[Reuters]` / `[BREAKING]`), forward-looking question-form headlines.
+- The wikipedia_pageviews predictive signal is explicitly pinned
+  preserved in its own test.
+- Lockstep parity between `alert_agent` and `claude_analyst` gates
+  (both gates agree on every noise + must-survive title; both
+  fingerprint registries include `wikipedia_ref`; byte-identical regex
+  source via `test_registry_byte_identical_pattern_source`).
+- End-to-end `_filter_recap_template_noise` partition correctness with
+  the caller-input-unchanged invariant on both alert and briefing
+  sides.
+
+Targeted regression (alert + briefing + recap + book tag + features +
+model + trainer + store + urgency + book_universe + book_alert_coverage):
+**334 passed in 7.77s, 0 failed**.
+
+**Phase 3 (live validation).** `user_findings=5`. Inspected
+`articles.db`, `logs/daemon.log`, and the most-recent saved briefing
+directly:
+
+1. **Sonnet labeling almost dark in last 6h** — 1 LLM-vetted urgent vs
+   32 ML-only urgent (3% verified rate). The aggregate calibration
+   metric `urgency_label_split` already surfaces this but the gap
+   widened materially in the last few hours; combined with the existing
+   99% synthetic strong-label-pool finding
+   (memory `di-training-pool-synthetic-skew`), the model is training on
+   its own + backtest distributions and the alert channel is essentially
+   unmoderated. The Phase 2 `[Wikipedia]` fix and prior recap
+   fingerprints catch the worst content-type failure modes, but a
+   process-level "Sonnet dark" alarm would be the natural next ask
+   (deferred — would need a stricter "no LLM in N min" verdict than
+   `urgency_label_split_trend` currently emits).
+2. **Wikipedia ref-content reaching urgency=2 confirmed** — the Phase 2
+   fix targets this exact live failure. `[Wikipedia] DRAM (musician)`
+   (ml=10.0) + `[Wikipedia] Nvidia RTX` (ml=8.6) reached urgency=2 over
+   the 7-day audit window. Will be suppressed on the next daemon
+   restart (long-running manual process per
+   memory `di-stale-manual-daemon`).
+3. **Briefing cadence intermittent again** — last 5 saved briefings:
+   09:39Z today, then a **27.6h gap** to 06:01Z 2026-05-22, then 5h
+   gaps. The briefing-save failures under DB-lock storm finding from
+   pass #2 recurred — the analyst received the push (Discord) but
+   `save_briefing` exhausted retries so the saved-briefings table
+   reads as if briefings never fired. Briefing CONTENT quality remains
+   high (50 articles, 3270 chars, LEAD names NVDA + buyback + Vera CPU
+   + tariff overhang + risk-on chip tape with Nikkei +2.68% / SoftBank
+   +11.89% / QCOM +11.60% / AXTI +16.37%; MACRO block has full
+   indices/yields/BTC/gold/oil; PORTFOLIO block names the live held
+   universe including the GOOG / COHR / NVDL pass-#3 additions).
+4. **DB-lock contention warnings recurring** — `stats: lock retry
+   exhausted` fired twice in today's window (10:13Z), each one degrading
+   /api/stats for one poll cycle; `[google_news_worker] error: database
+   is locked; backing off 5s` at 10:16Z. Self-recovers via the
+   `@_retry_on_lock` decorator + worker back-off; matches standing
+   memory `di-insert-batch-lock-contention`, not a regression.
+5. **110 urgency=1 queued, 16 dispatched/suppressed in last 1h** — at
+   the current dispatch rate the queue would need ~7h to clear, but the
+   24h reaper machinery (`reap_stale_urgent`) will demote unalerted
+   rows before then. The mature gate stack (quote-widget + recap +
+   low-authority-lone) absorbs most of these without a Discord push; the
+   analyst receives a manageable stream and the queue depth is a
+   sponging measure, not a backlog crisis.
+
+Counters: `bugs_fixed=0 | features_added=1 | user_findings=5`.
+
+---
+
 ## 2026-05-23 hybrid pass #3 (Agent 3) — live `_BOOK_TICKERS` union (GOOG / COHR / NVDL)
 
 **Phase 1 (fix).** `bugs_fixed=0`. Read AGENTS.md head, daemon.py top
