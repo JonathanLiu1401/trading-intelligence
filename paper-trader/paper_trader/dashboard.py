@@ -17245,5 +17245,173 @@ def forced_hold_attribution_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/frozen-mark-execution-skill")
+def frozen_mark_execution_skill_api():
+    """Frozen-mark execution skill — flags FILLED trade clusters that all
+    executed at the EXACT same float price within a short window.
+
+    When ``market.get_price`` falls through to a cached yfinance close
+    (overnight, pre-market, weekend, brief upstream stall), every BUY
+    or SELL Opus issues over the next few hours routes to the same
+    bit-identical float. The book records what *looks* like alpha-
+    attempt repositioning (BUY → SELL → BUY round-trips) but the cluster
+    nets zero P&L per share because the price literally never moved.
+
+    Live evidence (2026-05-23): 5 NVDA trades 2026-05-20T21:10 →
+    2026-05-21T10:00 (a 13-hour overnight stretch) all filled at
+    exactly ``$223.43499755859375`` — a BUY/BUY/SELL/BUY/BUY sequence
+    that yielded zero realized P&L on the same-price round-trip.
+
+    Verdict ladder (test-locked):
+
+      * ``CLEAN`` — frozen_trade_pct < ``occasional_pct`` (default 5).
+      * ``OCCASIONAL`` — between CLEAN and HEAVY.
+      * ``FROZEN_MARK_HEAVY`` — ≥ ``heavy_pct`` (default 25) of
+        in-window FILLS belonged to a frozen-mark cluster.
+      * ``INSUFFICIENT_DATA`` — fewer than 5 classifiable trades.
+
+    Query params (clamped):
+      ``window_days`` — analysis window, 1..365 (default 30)
+      ``cluster_min`` — min trades per cluster, 2..20 (default 2)
+      ``cluster_span_hours`` — max wall-clock span across a cluster,
+        0.5..168 (default 24)
+      ``occasional_pct`` / ``heavy_pct`` — verdict thresholds, 0..100
+
+    Distinct from neighbouring endpoints:
+      * ``mark_integrity`` — % of DISPLAYED book held at a stale mark
+        (snapshot, never reads ``trades``).
+      * ``rebuy_regret`` / ``reentry_velocity`` — same-ticker SELL→BUY
+        $ regret / timing, no price-equality filter.
+      * ``churn`` — overall trade frequency without the price-discovery
+        context this skill exists to surface.
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.frozen_mark_execution_skill import (
+            build_frozen_mark_execution_skill,
+            DEFAULT_WINDOW_DAYS,
+            DEFAULT_CLUSTER_MIN,
+            DEFAULT_CLUSTER_SPAN_HOURS,
+            DEFAULT_OCCASIONAL_PCT,
+            DEFAULT_HEAVY_PCT,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        def _qi(name, default, lo, hi):
+            try:
+                v = int(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        window_days = _qf("window_days", DEFAULT_WINDOW_DAYS, 1.0, 365.0)
+        cluster_min = _qi("cluster_min", DEFAULT_CLUSTER_MIN, 2, 20)
+        cluster_span_hours = _qf(
+            "cluster_span_hours", DEFAULT_CLUSTER_SPAN_HOURS, 0.5, 168.0,
+        )
+        occasional_pct = _qf("occasional_pct", DEFAULT_OCCASIONAL_PCT, 0.0, 100.0)
+        heavy_pct = _qf("heavy_pct", DEFAULT_HEAVY_PCT, 0.0, 100.0)
+
+        store = get_store()
+        # 2000 covers ~6 months of mixed flow at current ~10 trades/day
+        # ceiling; the in-builder window_days filter will narrow further.
+        trades = store.recent_trades(limit=2000) or []
+
+        return jsonify(build_frozen_mark_execution_skill(
+            trades,
+            window_days=window_days,
+            cluster_min=cluster_min,
+            cluster_span_hours=cluster_span_hours,
+            occasional_pct=occasional_pct,
+            heavy_pct=heavy_pct,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR"}), 500
+
+
+@app.route("/api/closed-market-fill-skill")
+def closed_market_fill_skill_api():
+    """Closed-market fill skill — what share of FILLED trades fired while
+    NYSE was CLOSED (overnight, weekend, half-day after-hours, holiday)?
+
+    Why this isn't redundant. ``market.get_price`` falls through to the
+    last-known yfinance close when NYSE is closed. A BUY fired at 02:00
+    ET on a Wednesday fills against Tuesday's 16:00 close — there is no
+    live bid-ask, no liquidity test, and no real price discovery. Pair
+    this with ``frozen_mark_execution_skill`` (which catches the
+    *effect* — clusters at the SAME float price) and the trade tape's
+    economic illusion is fully diagnosed.
+
+    Live evidence (2026-05-23): 4 of 5 NVDA BUYs in the rolling tape
+    fired while ``market_open=0``, all at the same yfinance close.
+
+    Verdict ladder:
+
+      * ``SESSION_ALIGNED`` — closed_pct ≤ ``aligned_pct`` (default 25).
+      * ``BALANCED`` — between aligned and ``after_hours_pct`` (50).
+      * ``AFTER_HOURS_HEAVY`` — between after_hours and
+        ``dominated_pct`` (75).
+      * ``OVERNIGHT_DOMINATED`` — closed_pct ≥ dominated_pct.
+      * ``INSUFFICIENT_DATA`` — < 5 FILLs in the window.
+
+    Distinct from:
+      * ``decision_clock`` — distribution of DECISION cycles by
+        hour-of-day, including NO_DECISIONs; doesn't filter to FILLs
+        or consult ``is_market_open``.
+      * ``decision_weekday`` — by weekday, same surface.
+
+    Query params (clamped):
+      ``window_days`` — 1..365 (default 30)
+      ``aligned_pct`` / ``after_hours_pct`` / ``dominated_pct`` —
+        verdict thresholds, 0..100
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.closed_market_fill_skill import (
+            build_closed_market_fill_skill,
+            DEFAULT_WINDOW_DAYS,
+            DEFAULT_ALIGNED_PCT,
+            DEFAULT_AFTER_HOURS_PCT,
+            DEFAULT_DOMINATED_PCT,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        window_days = _qf("window_days", DEFAULT_WINDOW_DAYS, 1.0, 365.0)
+        aligned_pct = _qf("aligned_pct", DEFAULT_ALIGNED_PCT, 0.0, 100.0)
+        after_hours_pct = _qf(
+            "after_hours_pct", DEFAULT_AFTER_HOURS_PCT, 0.0, 100.0,
+        )
+        dominated_pct = _qf("dominated_pct", DEFAULT_DOMINATED_PCT, 0.0, 100.0)
+
+        store = get_store()
+        trades = store.recent_trades(limit=2000) or []
+
+        return jsonify(build_closed_market_fill_skill(
+            trades,
+            window_days=window_days,
+            aligned_pct=aligned_pct,
+            after_hours_pct=after_hours_pct,
+            dominated_pct=dominated_pct,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR"}), 500
+
+
 if __name__ == "__main__":
     run()
