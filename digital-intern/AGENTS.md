@@ -5,6 +5,89 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-23 hybrid pass #2 (Agent 3) — `heres_what_happened` recap fingerprint
+
+**Phase 1 (fix) — `75c632d` (digital-intern slice).** Read AGENTS.md head,
+daemon.py top, storage/article_store.py (full), watchers/alert_agent.py
+(full, all 14 existing recap fingerprints + 6 quote-widget fingerprints),
+watchers/urgency_scorer.py, ml/trainer.py, ml/model.py, ml/features.py,
+collectors/web_scraper.py, analysis/claude_analyst.py (recap mirror).
+Focused baseline suite green (45/45 article-store + urgency + features,
+16/16 model + trainer, 144/144 alert + briefing recap + quote-widget).
+
+Probed live `articles.db` urgent backlog and surfaced a noise pattern none
+of the existing 14 fingerprints catch: the **Motley Fool / MarketBeat /
+tickerreport.com "Here's What Happened" SEO retrospective tail**. Live
+evidence (2026-05-23, 24h): the row `Nvidia Just Crushed Earnings
+Estimates, but the Stock Fell. Here's What Happened (and What Comes Next)`
+reached urgency=1 syndicated across SIX sources (Motley Fool,
+yfinance/Motley Fool, scraped/finance.yahoo.com, YahooFinance/NVDA,
+GN: earnings, GDELT/fool.com) with ml_score 9.22-9.41 — every copy a
+queued 🚨 BREAKING push on retrospective content. The MarketBeat /
+tickerreport.com variant (`X Stock Price Down N% - Here's What Happened`)
+matches the same template class; 15+ rows in the live 24h window.
+
+Added `_RT_HERES_WHAT_HAPPENED` to `watchers/alert_agent.py` and lockstep
+mirror `_BRIEFING_RT_HERES_WHAT_HAPPENED` to `analysis/claude_analyst.py`.
+Three apostrophe forms covered (ASCII straight `'s`, curly Unicode `’s`,
+bare `s` no apostrophe) plus the `Here is What Happened` form; past-tense
+`happened` is REQUIRED so present-continuous `Here's What's Happening`
+market wraps are NOT matched (validated against the must-survive corpus).
+The urgency_scorer pre-filter picks up the new fingerprint automatically
+via its `from watchers.alert_agent import _looks_like_recap_template`
+import (single-source-of-truth contract). New test file
+`tests/test_alert_heres_what_happened.py` pins:
+- 11 live noise titles all matched (incl. all three apostrophe forms)
+- 11 must-survive headlines all NOT matched (forward-looking question
+  forms, present-continuous market wraps, real wire copy)
+- Lockstep parity test between alert_agent and claude_analyst gates
+- End-to-end `_filter_recap_template_noise` partition correctness with
+  caller-input-unchanged invariant
+
+`bugs_fixed=1` (the new fingerprint is both a fix for the leaking-recap
+class and a feature). All four load-bearing invariants preserved (no DB
+write, no ai_score / ml_score / score_source / urgency mutation).
+
+**Phase 2 (feature).** `features_added=0`. The codebase has 179 test files
+and the gates / analytics surface is very mature (`recap_template_audit`
+exposes 13 fingerprints, `quote_widget_audit` exposes 6,
+`alert_delivery_audit` joins articles + alert_recency,
+`urgency_label_split` has aggregate + per-source + per-ticker +
+per-time-bucket slices, briefing has 20+ augmentation blocks). Reaching
+for a feature when the substantive recap fingerprint already covers the
+analyst's "noise leaking through" pain would be churn. No Phase 2 commit
+(honest per guard).
+
+**Phase 3 (live validation).** `user_findings=5`. Inspected
+`articles.db` and `daemon.log` directly:
+1. **5 queued "Heres What Happened" rows at urgency=1** RIGHT NOW —
+   exactly the failure mode the Phase 1 fix addresses. Will be suppressed
+   once daemon restarts with the new pattern (the daemon is a long-running
+   process — a code change only applies post-restart).
+2. **Briefing save failures under DB-lock storm** — log shows briefing
+   POSTED to Discord at 08:56:22Z but `save_briefing` exhausted 5 retries
+   on `database is locked` (08:56:28Z). The analyst received the push but
+   the trainer never got the briefing-labels signal that 5h cycle. Best-
+   effort behaviour is documented but the chronic lock-storm makes it
+   recur. Standing issue (memory `di-insert-batch-lock-contention`).
+3. **Briefing cadence intermittent** — 26.7h gap between the
+   2026-05-22T06:01 and 2026-05-23T08:56 successful saves. The
+   restart-warm-up + adaptive-lookback code is working (banner "COVERAGE
+   GAP: first briefing in 26.7h ... spans the backlog") but the underlying
+   DB-write failure means the saved-briefings table reads as if briefings
+   never fired.
+4. **Sonnet labeling mostly dark** — 32 ML-only vs 1 LLM-vetted urgent in
+   6h. Documented `di-training-pool-synthetic-skew` — Sonnet quota /
+   throttling. The analyst gets ML-only urgent pushes that may be
+   miscalibrated.
+5. **Zero stuck phantom urgency=1 rows** (>24h) — the
+   `reap_stale_urgent` + `_purge_worker_startup_reap` machinery is
+   working as designed; no false dashboard inflation.
+
+Counters: `bugs_fixed=1 | features_added=0 | user_findings=5`.
+
+---
+
 ## 2026-05-23 hybrid pass (Agent 3) — `book_alert_coverage` surfaces per-held-position alert-pipeline gaps
 
 **Phase 1 (debug):** read AGENTS.md head + recent passes, daemon.py top,
