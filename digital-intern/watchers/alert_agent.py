@@ -866,8 +866,27 @@ _RT_WIKIPEDIA_REF = re.compile(
 # 12.3M shares" — none match because none have the "<verb> by <fund> LLC"
 # trailer.
 _RT_HOLDINGS_BY_FUND = re.compile(
+    # Original MarketBeat variant: "<TICKER> Holdings <verb> by <fund> LLC".
     r"\bholdings\s+(?:raised|cut|lowered|increased|trimmed|boosted|reduced|"
     r"decreased|sold|acquired)\s+by\s+\S+(?:\s+\S+){0,5}\s+LLC\b",
+    re.IGNORECASE,
+)
+# Sibling MarketBeat variant: "<N> Shares (in|of) <Company> $TICKER (Bought|
+# Sold|Acquired|Disposed) by <fund> LLC" — same 13F-press-mill template, just
+# rephrased around "Shares Bought" instead of "Holdings Boosted". Live
+# evidence (2026-05-23, urgency=1 queue): "100,000 Shares in Oracle
+# Corporation $ORCL Bought by Mizuho Markets Americas LLC" (AlphaVantage/
+# MarketBeat channel). Same retrospective non-event: a 13F filing change
+# already published to SEC weeks ago. Discriminator: "Shares (in|of) ...
+# (Bought|Sold|Acquired|Disposed) by ... LLC" — the LLC terminator anchors
+# precision (validated zero false positives on the must-survive corpus:
+# "AAPL shares bought heavily by institutions", "Berkshire bought 100k MU
+# shares", "Insider buys 500k shares of NVDA" all lack the trailing "<fund>
+# LLC" structure).
+_RT_SHARES_BOUGHT_BY = re.compile(
+    r"\bshares\s+(?:in|of)\s+\S+(?:\s+\S+){0,5}\s+"
+    r"(?:bought|sold|acquired|disposed|purchased)\s+by\s+"
+    r"\S+(?:\s+\S+){0,5}\s+LLC\b",
     re.IGNORECASE,
 )
 
@@ -955,6 +974,7 @@ _RECAP_TEMPLATE_PATTERNS = (
     ("street_thinks", _RT_STREET_THINKS),
     ("gf_value_says", _RT_GF_VALUE),
     ("holdings_by_fund", _RT_HOLDINGS_BY_FUND),
+    ("shares_bought_by", _RT_SHARES_BOUGHT_BY),
     ("futures_why_today", _RT_FUTURES_WHY_TODAY),
     ("daily_price_city", _RT_DAILY_PRICE_CITY),
 )
