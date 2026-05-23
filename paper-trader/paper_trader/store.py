@@ -458,6 +458,49 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def last_real_decision(self) -> dict | None:
+        """Most recent decision row where the engine actually decided something
+        — the one row a trader's "when did this thing last *do* anything?"
+        question wants answered.
+
+        Filters out NO_DECISION cycles (those represent the engine cycling on
+        cadence without producing a parseable Claude response: quota /
+        host-saturated / timeout / parse miss — the documented IDLE_STORM
+        regime). FILLED / HOLD / BLOCKED rows count as real decisions; a HOLD
+        is a *deliberate* choice and a BLOCKED is a real decision the
+        risk-check rejected, both meaningfully different from a NO_DECISION.
+        Returns ``None`` when no real decision exists in history (a
+        fresh-boot book whose first 24h was all host-saturated cycles — the
+        existence of THIS pathology is what motivated the method: a trader
+        watching the live ``/api/state`` heartbeat "HEALTHY — last decision
+        6m ago" sees a green light, but ``recent_decisions(1)[0]`` is a
+        ``NO_DECISION``; the engine has not actually decided anything for
+        days). A targeted SQL — no Python-side filter, no scanning the whole
+        table — so an old corpus stays cheap.
+
+        Ordered by ``timestamp DESC, id DESC`` (same tie-break as
+        ``recent_decisions`` / ``recent_trades`` — same-microsecond rows
+        keep insertion order, the canonical ordering).
+
+        Returns the full row shape ``recent_decisions`` returns (same
+        columns) so callers can read ``timestamp`` / ``action_taken`` /
+        ``reasoning`` / ``portfolio_value`` / ``cash`` directly. ``None``
+        on no match keeps the additive contract: any builder that wants
+        this signal can degrade-safely treat None as "engine has never
+        decided" — the missing-data fallback every analytics builder
+        already implements.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM decisions "
+                "WHERE action_taken IS NOT NULL "
+                "AND action_taken != '' "
+                "AND action_taken != 'NO_DECISION' "
+                "AND action_taken NOT LIKE 'NO_DECISION%' "
+                "ORDER BY timestamp DESC, id DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+
     # ─── equity curve ──────────────────────────────────────────
     def record_equity_point(self, total_value: float, cash: float, sp500: float | None):
         with self._lock:
