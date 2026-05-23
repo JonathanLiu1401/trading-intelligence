@@ -68,6 +68,38 @@ class TestHoldingsByFundFingerprint:
         assert not hit, f"holdings_by_fund regex false-positive on {title!r} (matched={fp})"
 
 
+class TestSharesBoughtByFingerprint:
+    """Sibling MarketBeat 13F press-mill variant: "<N> Shares (in|of)
+    <X> $TICKER (Bought|Sold|Acquired|Disposed) by <fund> LLC". Spotted in
+    2026-05-23 live urgency=1 queue ("100,000 Shares in Oracle Corporation
+    $ORCL Bought by Mizuho Markets Americas LLC") after the v2 fingerprint
+    addition — different verbal frame ("Shares Bought" vs "Holdings
+    Boosted") but same SEO mill template, same "<fund> LLC" terminator."""
+
+    @pytest.mark.parametrize("title", [
+        "100,000 Shares in Oracle Corporation $ORCL Bought by Mizuho Markets Americas LLC",
+        "50,000 Shares of Nvidia Corporation $NVDA Acquired by Vanguard Group LLC",
+        "1.2M Shares of Micron Technology $MU Sold by State Street Corp LLC",
+        "Shares of Microsoft Disposed by Renaissance Technologies LLC",
+        "300,000 Shares in Tesla $TSLA Purchased by JP Morgan Asset Management LLC",
+    ])
+    def test_shares_bought_mill_titles_match(self, title):
+        hit, fp = _looks_like_recap_template(_art(title))
+        assert hit, f"shares-bought-by mill leaked: {title!r}"
+        assert fp == "shares_bought_by"
+
+    @pytest.mark.parametrize("title", [
+        "AAPL shares bought heavily by institutions",        # no "<fund> LLC"
+        "Berkshire bought 100k MU shares",                   # no "Shares (in|of)"
+        "Insider buys 500k shares of NVDA",                  # no "<fund> LLC"
+        "Nvidia shares acquired by Buffett",                 # no "<fund> LLC"
+        "100,000 shares of LITE rallied 8% on Q1 beat",      # no "<verb> by <fund> LLC"
+    ])
+    def test_must_survive_shares_mentions(self, title):
+        hit, fp = _looks_like_recap_template(_art(title))
+        assert not hit, f"shares_bought_by false-positive on {title!r} (matched={fp})"
+
+
 class TestFuturesWhyTodayFingerprint:
     """TipRanks daily pre-market futures-state recap mill."""
 
@@ -137,6 +169,9 @@ class TestNewFingerprintsRegistered:
 
     def test_daily_price_city_registered(self):
         assert "daily_price_city" in [n for n, _ in _RECAP_TEMPLATE_PATTERNS]
+
+    def test_shares_bought_by_registered(self):
+        assert "shares_bought_by" in [n for n, _ in _RECAP_TEMPLATE_PATTERNS]
 
 
 class TestFilterFunctionPartitions:
