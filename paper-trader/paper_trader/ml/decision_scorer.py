@@ -750,6 +750,27 @@ def train_scorer(records: list[dict]) -> dict:
     # (ticker, sim_date) alone silently discarded one of the pair — and with
     # opposing personas (momentum vs contrarian) trading the same names, that
     # collision is hit constantly.
+    #
+    # Tie-break precedence is `(has_valid_label, return_pct)` rather than
+    # `return_pct` alone: an externally injected / corrupted row whose
+    # `forward_return_5d` is null/NaN/inf would otherwise WIN dedup if its
+    # run's `return_pct` was highest, and then the validation loop below would
+    # drop it for a missing label — silently throwing away the surviving real
+    # outcomes for that (ticker, sim_date, action) key. Production data has
+    # 0 such rows today (`_compute_decision_outcomes` only emits walk-back
+    # validated finite outcomes), but the guard makes the "valid label always
+    # beats missing label" invariant explicit and refactor-proof rather than
+    # emergent. Boolean-as-int comparison: True > False, so a valid-labelled
+    # record always wins regardless of run return_pct.
+    def _has_valid_label(rec: dict) -> bool:
+        v = rec.get("forward_return_5d")
+        if isinstance(v, bool) or v is None:
+            return False
+        try:
+            return math.isfinite(float(v))
+        except (TypeError, ValueError):
+            return False
+
     seen: dict[tuple, dict] = {}
     for r in records:
         key = (
@@ -757,8 +778,14 @@ def train_scorer(records: list[dict]) -> dict:
             str(r.get("sim_date") or ""),
             str(r.get("action") or "BUY").upper(),
         )
-        rp = _to_float(r.get("return_pct"), 0.0)
-        if key not in seen or rp > _to_float(seen[key].get("return_pct"), 0.0):
+        cand_prec = (_has_valid_label(r), _to_float(r.get("return_pct"), 0.0))
+        if key not in seen:
+            seen[key] = r
+            continue
+        cur = seen[key]
+        cur_prec = (_has_valid_label(cur),
+                    _to_float(cur.get("return_pct"), 0.0))
+        if cand_prec > cur_prec:
             seen[key] = r
     records = list(seen.values())
 
