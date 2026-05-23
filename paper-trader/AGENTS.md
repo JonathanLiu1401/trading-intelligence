@@ -6,6 +6,126 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #21 (Agent 2) — `_rsi` flat-series neutrality, `_LEVERAGED_ETFS` coverage audit, `stop_out_audit`
+
+### Phase 1: Debug — 2 bugs fixed (9ee81b7)
+
+**Bug 1: `_rsi` returned 100.0 on a perfectly FLAT series.** When `avg_l ==
+0` (no losses across the lookback) the function unconditionally returned
+100.0 — but for a stock with literally zero variance both `avg_g` and
+`avg_l` are zero, and the textbook semantics for RSI at zero variance is
+*neutral* (50), not "severely overbought" (100). The spurious 100 then
+fed a -1.5 conviction penalty in `_ml_decide` for any flat name. Fix
+returns 50.0 only when both `avg_g == 0` and `avg_l == 0`; strict-all-up
+(100) and strict-all-down (0) are unchanged.
+
+**Bug 2: `_LEVERAGED_ETFS` was missing 18 leveraged-bull tickers.** The
+WATCHLIST inline section comments classify ~50 tickers as leveraged-bull
+ETFs (3x bull / 2x bull / crypto 2x / commodity 2x), but `_LEVERAGED_ETFS`
+only carried ~28 of them. The 18 missing names — WANT/MIDU/TNA/UTSL (3x),
+SAA/UWM/GOOGU/METAU/AAPLU/CONL/SMCI2X/PLTU/USD/ROM/UXI/UYG (2x), BITX/ETHU
+(crypto 2x) — silently dropped to the regular 0.25 conviction cap in
+`_ml_decide` instead of the documented 0.40 leveraged-bull cap, so the
+leveraged-vehicle thesis (CLAUDE.md §3) was unreachable for those names.
+Fix completes the coverage and pins it with three drift guards: a
+WATCHLIST_LEVERAGED_BULL → ⊆ _LEVERAGED_ETFS test, an inverse-leveraged
+exclusion test (no SQQQ/SPXS/etc. silently flipped into the bull cap),
+and a _LEVERAGED_ETFS ⊆ WATCHLIST typo guard.
+
+7 new regression tests in `tests/test_ml_backtest_review_20260523.py`.
+Pre-existing 701 ML/backtest tests unchanged.
+
+### Phase 2: Feature — `stop_out_audit` analyzer + behavioural cap test (e83a2b6)
+
+The 2026-05-23 `_compute_decision_outcomes` field-additions
+(`forward_intraperiod_min_5d` / `forward_intraperiod_max_5d`) were
+**captured-but-unused** — no analyzer consumed them, so the documented
+intent ("unlock risk-adjusted analytics: did a +5% endpoint mask a -15%
+intraperiod drawdown that the stop would have caught") was structurally
+not measurable. `paper_trader/ml/stop_out_audit.py` is the first
+consumer.
+
+For each BUY row that carries a finite `forward_intraperiod_min_5d`:
+- If `intra_min <= -STOP_PCT` (default 8%, matching `backtest._buy`'s
+  `stop_loss=price*0.92`), realized return *with stop* is `-STOP_PCT`
+  (the optimistic-stop assumption — a real fill on a gap-down is
+  WORSE, so this is the UPPER BOUND on the stop's benefit).
+- Else the position rides to the 5d endpoint and `forward_return_5d`
+  is captured.
+
+Verdicts: `STOP_HELPS` (benefit ≥ +0.30pp), `STOP_HURTS` (≤ -0.30pp),
+`STOP_NEUTRAL` (within ±0.30pp — sampling noise on 1000-trade aggregates
+at σ(target) ≈ 12pp), `INSUFFICIENT_DATA` (< 30 BUYs with intraperiod
+data). Read-only: never trains, never writes the pickle, never enters a
+trade path — same operational discipline as `baseline_compare` /
+`calibration` / `gate_audit`.
+
+CLI: `python3 -m paper_trader.ml.stop_out_audit [--json] [--stop 5.0]
+[--margin 0.5] [--min-buys 50]`. Returns 0 only on decisive
+(HELPS/HURTS) verdicts so a shell caller can gate on `$?` (the
+`decision_scorer --explain` / `host_guard` precedent). 25 tests in
+`tests/test_stop_out_audit.py` pin pure-function stop math, all 4
+verdicts, BUY-only filtering, SELL exclusion, missing-field drops,
+unparseable-row tolerance, and custom-stop-percentage handling.
+
+**Plus** a `TestLeveragedConvictionCap::test_bitx_in_bull_regime_gets_
+leveraged_cap` behavioural test that pins BITX (one of the 18
+Phase-1-added tickers) actually receiving the 0.40 leveraged cap in
+`_ml_decide` under a bull regime — closes the "set membership ≠ cap arm
+fired" coverage gap a Phase-1-only audit could not catch.
+
+### Phase 3: Live validation — quant researcher view
+
+Spot-checked the deployed stack against the persisted skill ledgers:
+
+- **`scorer_skill_log.jsonl`** (1 row): `oos_rmse=13.77 > val_rmse=11.61`
+  (textbook overfit), `oos_ic=0.02`, **`oos_buy_ic=0.0`** (the
+  gate-relevant rank metric). The deployed gate is sizing on noise on
+  BUYs — the documented `MLP_NO_BETTER_THAN_TRIVIAL` state. SELL rank-IC
+  is mildly positive (`oos_sell_ic=0.16`, n=111) and sideways-regime
+  rank-IC is mildly positive (`oos_sideways_ic=0.06`) — those are not
+  the gate path (gate is BUY-only) but they're the only OOS slices that
+  carry any rank skill.
+- **`baseline_skill_log.jsonl`** (1 row): verdict
+  `MLP_NO_BETTER_THAN_TRIVIAL`, MLP rank-IC 0.12 vs best baseline
+  (`neg_bb`) 0.07, gap +0.047 — below the `IC_MARGIN=0.05` decisiveness
+  bar. The 17-feature MLP does NOT clear a one-line Bollinger
+  mean-reversion baseline by a margin a quant would underwrite sizing
+  variance for.
+- **`stop_out_audit`** correctly reports `INSUFFICIENT_DATA`: 7205 BUYs
+  in `data/decision_outcomes.jsonl` (8753 total rows), **0 with the
+  intraperiod field** — every existing outcome row pre-dates the
+  2026-05-23 `_compute_decision_outcomes` field. Activates as the
+  rolling 5000-record tail is dominated by post-feature rows.
+- **`backtest.db`**: 500 runs total, 474 complete / 26 failed, median
+  return +64.8% / median vs_spy +42.0% over 1yr, 78.3% beat SPY. With
+  OOS skill at ~0, this aggregate is heavily window/regime selection
+  rather than realized edge. Orphan-reaper marked runs 5981-5985 as
+  "failed" despite carrying real returns (+101% / -4% / +47% / +33% /
+  +31%) and 1000+ trades each — those are reaped OOM-kill rows, not
+  data faults, but the dashboard's complete-only aggregate misses them.
+- **Continuous loop dormant**: last cycle was 2026-05-18; runs after that
+  date (99001 / 99002 / 100000 / 90001) are one-shot smoke/manual runs,
+  not cycle activity. The `scripts/hourly_review.sh` Opus saturation
+  documented in pass #20 likely contributes; the continuous loop has not
+  recovered since.
+- **Deployed scorer pickle is current**: `n_train=4987`, calibrated path
+  live (both `pred_quantiles` and `label_quantiles` populated), pred range
+  [-30.20, +50.00] across the last 1000 outcomes — clamp arm engaged on
+  the upper end. In-sample decile monotonicity is strong (top decile
+  realized +13.3pp matches predicted +13.3pp), but OOS rank-IC says it
+  doesn't generalize.
+
+### Counters
+
+bugs_fixed=2, features_added=1 (`stop_out_audit` analyzer + CLI),
+user_findings=5 (gate sizing on noise per OOS log; MLP fails baseline
+gap; intraperiod field is dark in the live corpus; continuous loop has
+not run since 2026-05-18; orphan-reaped runs 5981-5985 carry real returns
+the dashboard's complete-only aggregate misses).
+
+---
+
 ## 2026-05-23 feature pass (Agent 4 / feature-dev) — `/api/concurrent-opus-attribution`
 
 New `paper_trader/analytics/concurrent_opus_attribution.py` +
