@@ -108,6 +108,32 @@ def _aligned_pred_target(value: float, forward_return_5d: float,
 #   mom5           — 5-day momentum carry
 #   rsi_meanrev    — classic RSI mean-reversion: -(rsi - 50)
 #   neg_bb         — Bollinger mean-reversion: -bb_position
+#   macd           — MACD signal-line value (positive = bullish crossover)
+#   vol_ratio_dev  — volume surge: |vol_ratio - 1|·sign(mom5); a high vol
+#                    spike PLUS rising momentum is the classic breakout
+#                    signal. Stand-alone vol_ratio has no sign — flipping
+#                    on mom5 turns it into an action-aligned predictor.
+#   neg_wk52       — bubble-top mean-reversion: -(wk52_pos - 0.5). The
+#                    `_ml_decide` 52-week-high gate (CLAUDE.md §15 / the
+#                    bubble_gate_skill module) hypothesizes a high wk52
+#                    is a SELL signal; if true, this baseline carries
+#                    positive rank-IC by construction.
+#   news_urgency   — raw article urgency (higher = more urgent news);
+#                    captures whether 0-100 article urgency univariately
+#                    rank-predicts forward returns. Currently uncovered.
+#   news_count     — article volume (1+ articles vs no news). News-quiet
+#                    decisions vs news-rich ones may rank-correlate with
+#                    return. Currently uncovered.
+#
+# These additions close a real coverage gap surfaced by a quant audit
+# (May 2026): the deployed MLP has near-zero OOS rank-IC across the
+# whole 17-feature input vector, BUT only 5 of those features were
+# tested as univariate one-liners. The other 5 numeric inputs
+# (macd, vol_ratio, news_urgency, news_article_count, wk52_pos) had
+# no baseline — so when MLP rank-IC is at noise, a reader couldn't
+# tell whether the missing predictive signal lived in an untested
+# feature OR no feature carries univariate signal at all. This makes
+# the answer decisive.
 BASELINES: dict[str, callable] = {
     "constant_zero": lambda r: 0.0,
     "ml_score": lambda r: _to_float(r.get("ml_score"), 0.0),
@@ -115,6 +141,14 @@ BASELINES: dict[str, callable] = {
     "mom5": lambda r: _to_float(r.get("mom5"), 0.0),
     "rsi_meanrev": lambda r: -(_to_float(r.get("rsi"), 50.0) - 50.0),
     "neg_bb": lambda r: -_to_float(r.get("bb_position"), 0.0),
+    "macd": lambda r: _to_float(r.get("macd"), 0.0),
+    "vol_ratio_dev": (
+        lambda r: (_to_float(r.get("vol_ratio"), 1.0) - 1.0)
+                  * (1.0 if _to_float(r.get("mom5"), 0.0) >= 0 else -1.0)
+    ),
+    "neg_wk52": lambda r: -(_to_float(r.get("wk52_pos"), 0.5) - 0.5),
+    "news_urgency": lambda r: _to_float(r.get("news_urgency"), 50.0),
+    "news_count": lambda r: _to_float(r.get("news_article_count"), 0.0),
 }
 
 

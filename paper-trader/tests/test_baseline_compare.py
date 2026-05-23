@@ -332,3 +332,160 @@ class TestReadOnlyDiscipline:
             if isinstance(mod, (ast.Import, ast.ImportFrom)):
                 txt = ast.dump(mod)
                 assert "train_scorer" not in txt
+
+
+class TestExtendedBaselines:
+    """Lock-in for the 5 univariate baselines added in the May 2026 quant
+    audit: macd, vol_ratio_dev, neg_wk52, news_urgency, news_count.
+
+    Each closes a specific coverage gap (numeric features the original 5
+    baselines never tested as univariate one-liners). Validates each
+    baseline's lambda computes the documented expression AND produces the
+    expected rank-IC sign on a synthetic monotone target.
+    """
+
+    def _ext_rec(self, i, *, forward, action="BUY", regime_mult=1.0,
+                 ml_score=5.0, mom5=0.0, mom20=0.0, rsi=50.0, bb=0.0,
+                 macd=0.0, vol_ratio=1.0, wk52_pos=0.5,
+                 news_urgency=None, news_article_count=None,
+                 ticker="NVDA"):
+        return {
+            "run_id": 1, "sim_date": f"2020-{1 + i // 28:02d}-"
+                                     f"{1 + i % 28:02d}",
+            "ticker": ticker, "action": action,
+            "ml_score": ml_score, "rsi": rsi, "macd": macd,
+            "mom5": mom5, "mom20": mom20,
+            "regime_mult": regime_mult, "vol_ratio": vol_ratio,
+            "bb_position": bb, "wk52_pos": wk52_pos,
+            "news_urgency": news_urgency,
+            "news_article_count": news_article_count,
+            "forward_return_5d": forward,
+        }
+
+    # ─── macd ────────────────────────────────────────────────────────
+    def test_macd_baseline_predicts_when_correlated(self):
+        # macd = i+1 (monotone ↑), target = i+1 (monotone ↑) → ic = +1.0.
+        # Only macd varies — all other baselines are degenerate.
+        recs = [self._ext_rec(i, forward=i + 1, regime_mult=i + 1,
+                              macd=i + 1, mom20=7.0)
+                for i in range(40)]
+        rep = bc.scorer_baseline_compare(_EchoRegime(), recs, oos_only=False)
+        rows = {b["name"]: b for b in rep["baselines"]}
+        assert rows["macd"]["rank_ic"] == 1.0
+        assert rows["macd"]["degenerate"] is False
+
+    def test_macd_constant_is_degenerate(self):
+        # macd=0.0 across all rows → degenerate.
+        recs = [self._ext_rec(i, forward=i + 1, regime_mult=i + 1,
+                              mom20=-(i + 1), macd=0.0)
+                for i in range(40)]
+        rep = bc.scorer_baseline_compare(_EchoRegime(), recs, oos_only=False)
+        rows = {b["name"]: b for b in rep["baselines"]}
+        assert rows["macd"]["degenerate"] is True
+        assert rows["macd"]["rank_ic"] is None
+
+    # ─── vol_ratio_dev (vol surge × sign(mom5)) ────────────────────────
+    def test_vol_ratio_dev_signed_by_mom5(self):
+        # |vol_ratio - 1| · sign(mom5) → row's prediction. With vol_ratio = 2
+        # everywhere (so |dev| = 1) and mom5 alternating ±1, the prediction
+        # alternates ±1.
+        # Set target so positive mom5 rows beat negative mom5 rows
+        # → ic = +1.0 (the breakout-with-momentum hypothesis).
+        recs = []
+        for i in range(40):
+            pos = i % 2 == 0
+            recs.append(self._ext_rec(
+                i, forward=10.0 if pos else -10.0,
+                regime_mult=i + 1,           # only non-constant for MLP
+                mom5=1.0 if pos else -1.0,
+                vol_ratio=2.0,
+                mom20=7.0,                   # constant → degenerate
+            ))
+        rep = bc.scorer_baseline_compare(_EchoRegime(), recs, oos_only=False)
+        rows = {b["name"]: b for b in rep["baselines"]}
+        # Signed vol-deviation should rank-predict the target with positive IC.
+        assert rows["vol_ratio_dev"]["rank_ic"] is not None
+        assert rows["vol_ratio_dev"]["rank_ic"] > 0.5
+
+    def test_vol_ratio_neutral_yields_zero_pred(self):
+        # vol_ratio=1.0 → |dev|=0 → prediction is 0.0 for every row →
+        # degenerate (constant zero vector).
+        recs = [self._ext_rec(i, forward=i + 1, regime_mult=i + 1,
+                              vol_ratio=1.0, mom5=1.0, mom20=7.0)
+                for i in range(40)]
+        rep = bc.scorer_baseline_compare(_EchoRegime(), recs, oos_only=False)
+        rows = {b["name"]: b for b in rep["baselines"]}
+        assert rows["vol_ratio_dev"]["degenerate"] is True
+
+    # ─── neg_wk52 (bubble-top mean-reversion) ──────────────────────────
+    def test_neg_wk52_inverts_wk52_pos(self):
+        # wk52_pos = i/40 (monotone ↑) → neg_wk52 = -(i/40 - 0.5) ↓ →
+        # against a target ↑ → ic = -1.0 (anti-correlated).
+        recs = [self._ext_rec(i, forward=i + 1, regime_mult=i + 1,
+                              wk52_pos=i / 40.0, mom20=7.0)
+                for i in range(40)]
+        rep = bc.scorer_baseline_compare(_EchoRegime(), recs, oos_only=False)
+        rows = {b["name"]: b for b in rep["baselines"]}
+        assert rows["neg_wk52"]["rank_ic"] == -1.0
+
+    def test_neg_wk52_default_when_missing(self):
+        # No wk52_pos field → _to_float defaults to 0.5 → neg_wk52 = 0 →
+        # degenerate.
+        recs = [self._ext_rec(i, forward=i + 1, regime_mult=i + 1,
+                              mom20=-(i + 1))
+                for i in range(40)]
+        # Strip wk52_pos to simulate legacy / no-field rows.
+        for r in recs:
+            r.pop("wk52_pos", None)
+        rep = bc.scorer_baseline_compare(_EchoRegime(), recs, oos_only=False)
+        rows = {b["name"]: b for b in rep["baselines"]}
+        assert rows["neg_wk52"]["degenerate"] is True
+
+    # ─── news_urgency / news_count ─────────────────────────────────────
+    def test_news_urgency_baseline_when_correlated(self):
+        # news_urgency = i (monotone ↑), target = i+1 → ic = +1.0.
+        recs = [self._ext_rec(i, forward=i + 1, regime_mult=i + 1,
+                              news_urgency=float(i),
+                              news_article_count=1.0, mom20=7.0)
+                for i in range(40)]
+        rep = bc.scorer_baseline_compare(_EchoRegime(), recs, oos_only=False)
+        rows = {b["name"]: b for b in rep["baselines"]}
+        assert rows["news_urgency"]["rank_ic"] == 1.0
+        assert rows["news_urgency"]["degenerate"] is False
+
+    def test_news_count_baseline_when_correlated(self):
+        # news_article_count = i (monotone ↑), target = i+1 → ic = +1.0.
+        recs = [self._ext_rec(i, forward=i + 1, regime_mult=i + 1,
+                              news_article_count=float(i),
+                              mom20=7.0)
+                for i in range(40)]
+        rep = bc.scorer_baseline_compare(_EchoRegime(), recs, oos_only=False)
+        rows = {b["name"]: b for b in rep["baselines"]}
+        assert rows["news_count"]["rank_ic"] == 1.0
+
+    def test_news_fields_missing_default_constant(self):
+        # No news_urgency / news_article_count → defaults: urgency=50,
+        # count=0 → both degenerate.
+        recs = [self._ext_rec(i, forward=i + 1, regime_mult=i + 1,
+                              mom20=-(i + 1))
+                for i in range(40)]
+        rep = bc.scorer_baseline_compare(_EchoRegime(), recs, oos_only=False)
+        rows = {b["name"]: b for b in rep["baselines"]}
+        assert rows["news_urgency"]["degenerate"] is True
+        assert rows["news_count"]["degenerate"] is True
+
+    # ─── sanity: extended baselines are present in the report ─────────
+    def test_all_extended_baselines_appear_in_report(self):
+        recs = [self._ext_rec(i, forward=i + 1, regime_mult=i + 1,
+                              mom20=-(i + 1))
+                for i in range(40)]
+        rep = bc.scorer_baseline_compare(_EchoRegime(), recs, oos_only=False)
+        names = {b["name"] for b in rep["baselines"]}
+        # The 5 new baselines:
+        for new_baseline in ("macd", "vol_ratio_dev", "neg_wk52",
+                             "news_urgency", "news_count"):
+            assert new_baseline in names, f"missing: {new_baseline}"
+        # The original 6 are still there:
+        for orig in ("constant_zero", "ml_score", "mom20", "mom5",
+                     "rsi_meanrev", "neg_bb"):
+            assert orig in names, f"original missing: {orig}"
