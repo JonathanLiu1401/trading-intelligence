@@ -493,14 +493,37 @@ class DecisionScorer:
         90.0 means "in the top decile of how bullish this model ever gets".
 
         Returns None when the model carries no quantile table (legacy
-        pickle written before this field existed) or ``raw`` is non-finite
-        — never raises."""
+        pickle written before this field existed), ``raw`` is non-finite,
+        or the persisted ``pred_quantiles`` table is COLLAPSED to a single
+        value (``q.max() == q.min()`` — the synthetic-clobber footprint
+        documented in the 2026-05-23 finding #1, where a smoke-test
+        retrain wrote 101 identical entries and every prediction silently
+        mapped to 0 or 100 percentile via ``np.interp``'s clamp behaviour
+        on a non-strictly-increasing ``xp``). The analytics-side
+        ``stack_liveness.pred_collapsed`` check detects the on-disk
+        pickle state externally; this guard is the internal complement so
+        ``predict_percentile()`` / ``predict_calibrated()`` themselves
+        degrade to a truthful ``None`` rather than silently surface
+        fabricated rank values to every dashboard consumer. Never raises.
+        """
         q = self._pred_quantiles
         try:
             if q is None or len(q) < 2 or not np.isfinite(raw):
                 return None
+            # Collapsed-quantile guard. `np.interp(x, xp, fp)` requires `xp`
+            # to be monotonically increasing; on a constant `xp` it returns
+            # `fp[0]` for x < xp[0], `fp[-1]` for x >= xp[0]. That maps every
+            # real prediction to 0 or 100 percentile — fake rank information
+            # the gate-relevant `predict_with_meta.calibrated` field then
+            # interpolates through. Honest fail: return None so the OOS
+            # `failed=False` legitimately-clamped path still works, but
+            # rank-derived consumers see "no rank available" rather than a
+            # fabricated extreme.
+            q_arr = np.asarray(q, dtype=np.float64)
+            if float(q_arr.max()) <= float(q_arr.min()):
+                return None
             pcts = np.linspace(0.0, 100.0, len(q))
-            return round(float(np.interp(float(raw), q, pcts)), 2)
+            return round(float(np.interp(float(raw), q_arr, pcts)), 2)
         except Exception:
             return None
 
