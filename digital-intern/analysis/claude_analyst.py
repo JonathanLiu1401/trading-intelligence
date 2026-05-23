@@ -1685,6 +1685,36 @@ _BRIEFING_RT_IS_BUY_AFTER = re.compile(
     re.IGNORECASE,
 )
 
+# Algorithmic-mill v2 fingerprints — lockstep mirror of watchers.alert_agent
+# additions (2026-05-23 live audit). Briefing layer MUST carry the same set or
+# the per-domain cap admits these into the TOP SIGNALS pool. Anti-drift test
+# `test_alert_and_briefing_recap_tuples_have_same_length` enforces this
+# structurally. Same byte-identical regexes as the alert side — see
+# alert_agent._RT_HOLDINGS_BY_FUND / _RT_SHARES_BOUGHT_BY /
+# _RT_FUTURES_WHY_TODAY / _RT_DAILY_PRICE_CITY for full live evidence.
+_BRIEFING_RT_HOLDINGS_BY_FUND = re.compile(
+    r"\bholdings\s+(?:raised|cut|lowered|increased|trimmed|boosted|reduced|"
+    r"decreased|sold|acquired)\s+by\s+\S+(?:\s+\S+){0,5}\s+LLC\b",
+    re.IGNORECASE,
+)
+_BRIEFING_RT_SHARES_BOUGHT_BY = re.compile(
+    r"\bshares\s+(?:in|of)\s+\S+(?:\s+\S+){0,5}\s+"
+    r"(?:bought|sold|acquired|disposed|purchased)\s+by\s+"
+    r"\S+(?:\s+\S+){0,5}\s+LLC\b",
+    re.IGNORECASE,
+)
+_BRIEFING_RT_FUTURES_WHY_TODAY = re.compile(
+    r"^\s*why\s+are\s+stock\s+market\s+futures\s+"
+    r"(?:up|down|higher|lower|mixed|moving|moved|sliding|rising|falling)\s+"
+    r"today\b",
+    re.IGNORECASE,
+)
+_BRIEFING_RT_DAILY_PRICE_CITY = re.compile(
+    r"^\s*(?:gold|silver|petrol|diesel|crude\s+oil)\s+(?:rate|price)\s+"
+    r"today\s+in\s+\S",
+    re.IGNORECASE,
+)
+
 _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _BRIEFING_RT_WHY_TRADING),
     ("why_did_stock", _BRIEFING_RT_WHY_DID),
@@ -1707,6 +1737,10 @@ _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("is_buy_after", _BRIEFING_RT_IS_BUY_AFTER),
     ("street_thinks", _BRIEFING_RT_STREET_THINKS),
     ("gf_value_says", _BRIEFING_RT_GF_VALUE),
+    ("holdings_by_fund", _BRIEFING_RT_HOLDINGS_BY_FUND),
+    ("shares_bought_by", _BRIEFING_RT_SHARES_BOUGHT_BY),
+    ("futures_why_today", _BRIEFING_RT_FUTURES_WHY_TODAY),
+    ("daily_price_city", _BRIEFING_RT_DAILY_PRICE_CITY),
 )
 
 
