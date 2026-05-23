@@ -6,6 +6,159 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #22 (Agent 2) — atomic JSON writes + `failed_run_audit`
+
+### Phase 1: Debug — 3 bug sites fixed (one class) (253c2d9)
+
+GDELT cache (`paper_trader/backtest.py:1366`), AV cache (`:1460`), and
+the AV cross-restart quota tracker (`:1409`) wrote JSON files via bare
+`path.write_text(json.dumps(...))`. A SIGKILL/OOM mid-write left a torn
+file; the next read's `except Exception: pass` guard silently treated
+corruption as "no cache", forcing a network refetch that burned the 5s
+GDELT rate limit / 22-call AV daily quota — or, worst, reset the AV
+cross-restart quota counter to 0, defeating the explicit guarantee
+documented in the AV_QUOTA_PATH comment.
+
+Added `_atomic_write_json(path, payload)` helper (tmp + Path.replace,
+the same idiom train_scorer / PriceCache / volume cache already use) and
+routed the three writers through it. 11 new tests in
+`tests/test_atomic_json_writes.py` pin: round-trip, no lingering `.tmp`,
+parent-dir creation, non-serializable payload degrades cleanly, no torn
+intermediate visible to concurrent reader, `_inc_quota` end-to-end,
+GDELT positive + negative cache writes, AV cache write + quota bump.
+
+### Phase 2: Feature — `failed_run_audit` analyzer + CLI (b649df2, refined e508337)
+
+The dashboard's complete-only median `vs_spy_pct` silently excludes
+OOM-reaped runs that carry real trade data (pass #21 finding: runs
+5981-5985 marked 'failed' despite real trades). `paper_trader/ml/failed_run_audit.py`
+is the first analyzer to surface and quantify that bias.
+
+For each `status='failed'` row it classifies LIKELY_OOM_REAPED (notes
+contain `[reaped]` OR `n_trades >= MIN_TRADES_FOR_REAL_RUN=100`) vs
+GENUINE_FAILURE (no trade data, no reaper marker). The classifier
+deliberately does NOT use `vs_spy_pct` as a signal — that column's
+`REAL NOT NULL DEFAULT 0` schema means reaped rows carry the placeholder
+0.0 (`finalize_run` is the only writer, and reaped rows never reach
+it). Trade count is the load-bearing signal because the engine writes
+`backtest_trades` rows independently of finalization.
+
+Verdict ladder: `INSUFFICIENT_DATA` / `NO_FAILED_RUNS` /
+`ALL_GENUINE_FAILURE` / `MIXED_REAPED_AND_FAILURE` (20-80% reaped) /
+`MOSTLY_OOM_REAPED` (≥80% reaped). CLI exits 2 on adverse verdicts
+(the `host_guard` / `scorer_pickle_smoke` precedent).
+
+`bias_shift_pct` reports the delta the dashboard's median would shift
+if hidden rows were re-included — gated on `_has_real_vs_spy` (which
+requires `completed_at IS NOT NULL`) so placeholder 0.0 values never
+contaminate the estimate. Operator-actionable, not opinion.
+
+35 tests in `tests/test_failed_run_audit.py` pin: every verdict
+boundary, the classifier's signal precedence, the realistic pass #21
+footprint (placeholder vs_spy → bias_shift=None, honest), the
+hypothetical real-vs_spy case (bias_shift computable), negative-bias
+case (dashboard overstates by -37.5pp on synthetic), live production
+footprint reproduction, and the never-raises contract.
+
+### Phase 3: Live validation findings — quant researcher view
+
+1. **`failed_run_audit` on live state: MOSTLY_OOM_REAPED.** 26/26
+   `status='failed'` rows are OOM-reaped (all carry `[reaped: orphaned
+   running row]` notes from `_reap_orphaned_runs`). Each has 94-4768
+   trades and a real `total_return_pct` (some absurdly high: run 6224
+   = +2767%, 6222 = +2026% — leveraged-ETF compounding over multi-year
+   windows without exit cleanup), but `vs_spy_pct=0.0` is the schema
+   placeholder. The realized alpha of the hidden slice is UNKNOWN —
+   the analyzer honestly reports `bias_shift_pct=None`. The dashboard's
+   published complete-median `vs_spy_pct=+41.97%` (n=474) is COMPUTED
+   ON A BIASED SAMPLE; the true median across all real runs cannot be
+   recovered from the existing data.
+
+2. **Deployed scorer pickle is healthy + recent.** `scorer_pickle_smoke`
+   reports HEALTHY (n_train=4987, predict spread 42.43pp across the
+   probe grid, both quantile tables span real ranges). The pkl was
+   retrained 7.6h before pass #22 start (07:20 UTC) — happens
+   OUTSIDE the continuous loop (which is dormant since 2026-05-18),
+   so something is writing scorer.pkl out-of-band (manual session
+   retrain or sibling process). No `scorer_skill_log.jsonl` row was
+   appended for the 07:20 retrain; the ledger remains at cycle 1.
+
+3. **Gate-relevant BUY rank-IC is 0.0 (literally).** The single row in
+   `scorer_skill_log.jsonl` (2026-05-22 cycle 1 retrain) reports
+   `oos_buy_ic=0.0` and `oos_buy_dir_acc=0.48` — the gate is sizing
+   100% on noise on its BUY arm (the only arm the conviction gate
+   acts on). `oos_sell_ic=0.16` is positive but unused (gate is
+   BUY-only). The `baseline_compare` verdict reads
+   `MLP_NO_BETTER_THAN_TRIVIAL` (MLP rank_ic=0.122 vs `neg_bb`
+   baseline=0.075, gap=+0.047 — below the 0.05 decisive threshold).
+
+4. **Feature contribution attribution reveals heavy non-linearity.**
+   `decision_scorer --explain --ticker NVDA --ml-score 5 --rsi 55
+   --mom5 3 --mom20 7` returns predicted +0.57% with
+   `interaction_residual=-15.15%` (vs sum-of-contributions +5.08%
+   baseline). The MLP's non-additive interactions reduce the
+   prediction by 15pp from the linear-attribution expectation. A
+   quant reading the attribution panel should treat the per-feature
+   contributions as misleading on this model — interactions, not
+   features, drive most of the prediction.
+
+5. **Persistent dark fields confirmed.** `forward_intraperiod_min_5d` /
+   `forward_intraperiod_max_5d`: 0/8753 outcome rows populated (the
+   2026-05-23 pass #18 field write-side runs only inside the dormant
+   continuous loop). `llm_quality_label`: 0/8753 non-zero
+   (`pipeline_dark` state; documented in pass #19/20). BUY:SELL
+   skew = 7205:1548 ≈ 4.6:1.
+
+### How `failed_run_audit` works
+
+Read-only sibling to `deploy_audit` / `scorer_pickle_smoke` /
+`stop_out_audit`. No train, no pickle write, no trade path. Safe to run
+against the live unattended loop. Inspects only `backtest.db` and
+returns a dict matching every other analyzer's contract.
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Live run (exit 2 if MOSTLY_OOM_REAPED / MIXED_REAPED_AND_FAILURE):
+python3 -m paper_trader.ml.failed_run_audit
+python3 -m paper_trader.ml.failed_run_audit --json
+python3 -m paper_trader.ml.failed_run_audit --db /path/to/other.db
+```
+
+The verdict ladder, suspect_run_ids (capped at 50), and bias_shift_pct
+are documented in the module docstring. `is_failed_runs_hidden()`
+mirrors `is_deploy_stale` / `is_pickle_smoke_failed` for a future
+per-cycle ledger row.
+
+### Test commands for this pass
+
+```bash
+python3 -m pytest tests/test_atomic_json_writes.py -v        # 11 tests (0.6s)
+python3 -m pytest tests/test_failed_run_audit.py -v          # 35 tests (0.8s)
+
+# Targeted regression for related surfaces:
+python3 -m pytest tests/test_decision_scorer.py \
+    tests/test_backtest.py tests/test_ml_backtest_seams.py \
+    tests/test_ml_macd_avquota_seams.py tests/test_atomic_json_writes.py \
+    tests/test_continuous.py tests/test_failed_run_audit.py \
+    tests/test_scorer_pickle_smoke.py -q
+# → 431 passed
+```
+
+### Counters
+
+bugs_fixed=3 (atomic-write fix in 3 places: GDELT cache / AV cache /
+AV quota tracker — one class, three sites + the Phase-3 placeholder-
+vs_spy correction), features_added=1 (`failed_run_audit` analyzer +
+CLI + `is_failed_runs_hidden` boolean), user_findings=5 (live
+MOSTLY_OOM_REAPED with ALL placeholder vs_spy; continuous loop still
+dormant for 5+ days; out-of-band scorer retrain at 07:20 UTC without
+ledger row; OOS BUY rank-IC=0.0 — gate sizing on noise; MLP attribution
+shows -15.15pp interaction residual on a sensible NVDA input — per-feature
+attribution is misleading on this model).
+
+---
+
 ## 2026-05-23 core HYBRID pass (Agent 1) — `/api/state` position enrichment (`pl_pct` + `market_value` + hold time)
 
 ### Phase 1: Debug — 0 bugs fixed
