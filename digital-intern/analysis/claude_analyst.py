@@ -1561,6 +1561,18 @@ _BRIEFING_RT_QUICK_GLANCE = re.compile(
     r"\ba\s+quick\s+glance\s+at\s+(?:key\s+)?(?:financial\s+)?metrics\b",
     re.IGNORECASE,
 )
+# "<headline>. Here's What Happened" — Motley Fool / MarketBeat retrospective
+# tail; lockstep mirror of watchers.alert_agent._RT_HERES_WHAT_HAPPENED. Live
+# evidence (2026-05-23): "Nvidia Just Crushed Earnings Estimates, but the
+# Stock Fell. Here's What Happened" syndicated 6×, ml_score 9.22-9.41 — would
+# enter the briefing's top-50 digest pool as a fresh TOP SIGNAL despite being
+# a retrospective post-event explainer. Three apostrophe forms covered;
+# past-tense "happened" required so present-continuous "Here's What's
+# Happening" market wraps are NOT matched.
+_BRIEFING_RT_HERES_WHAT_HAPPENED = re.compile(
+    r"\bhere(?:[s'’]+|\s+is)?\s+what\s+happened\b",
+    re.IGNORECASE,
+)
 
 _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _BRIEFING_RT_WHY_TRADING),
@@ -1568,6 +1580,7 @@ _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("market_today_dated", _BRIEFING_RT_MARKET_TODAY),
     ("earnings_call_recap", _BRIEFING_RT_EARNINGS_CALL),
     ("quick_glance_metrics", _BRIEFING_RT_QUICK_GLANCE),
+    ("heres_what_happened", _BRIEFING_RT_HERES_WHAT_HAPPENED),
     ("street_thinks", _BRIEFING_RT_STREET_THINKS),
     ("gf_value_says", _BRIEFING_RT_GF_VALUE),
 )

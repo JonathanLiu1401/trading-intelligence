@@ -764,6 +764,42 @@ _RT_QUICK_GLANCE = re.compile(
     re.IGNORECASE,
 )
 
+# "<headline>. Here's What Happened" — the Motley Fool / MarketBeat /
+# tickerreport.com SEO retrospective tail. By definition past-tense ("What
+# HAPPENED"), and the phrase itself is the discriminator: a real wire copy
+# names the event in the headline, NEVER trails with a generic "Here's What
+# Happened" hook.
+#
+# Live evidence (2026-05-23, 24h articles.db scan): the Motley Fool variant
+# "Nvidia Just Crushed Earnings Estimates, but the Stock Fell. Here's What
+# Happened (and What Comes Next)" reached urgency=1 syndicated across 6
+# sources (Motley Fool, yfinance/Motley Fool, scraped/finance.yahoo.com,
+# YahooFinance/NVDA, GN: earnings, GDELT/fool.com — all above the 0.45 lone-
+# source bar, so the authority gate cannot catch it). ML scored 9.22-9.41
+# and would have fired a 🚨 BREAKING push on the next alert cycle.
+#
+# MarketBeat / tickerreport.com variant: "Costco Wholesale (NASDAQ:COST)
+# Stock Price Down 2.1% - Here's What Happened - MarketBeat" — same
+# retrospective shape, also syndicated across GN: + GDELT. These pre-event
+# rows were urgency=0 in the snapshot (ml_score < 8.0) but are the same
+# template class; pre-emptively gating them costs nothing.
+#
+# Discriminator: \bhere(?:[s'’]+|\s+is)?\s+what\s+happened\b. Three apostrophe
+# forms covered (ASCII straight ', curly ’, no apostrophe with bare s),
+# plus the longer "Here is What Happened" form. Past-tense "happened" is
+# REQUIRED — "Here's What's Happening" (present continuous) is a different
+# template (live market wraps, often forward-looking) and is NOT matched.
+# Substring (not anchored) since the phrase appears mid-headline, exactly
+# like ``_RT_EARNINGS_CALL`` / ``_RT_QUICK_GLANCE`` / ``_RT_GF_VALUE``.
+# Validated against the must-survive corpus: "Fed surprises with 50bp cut",
+# "MU earnings blow past estimates", "Nvidia Q1 revenue rises 22%", "Trump
+# signs executive order on chips" — none contain the trailing "Here's What
+# Happened" SEO hook, so none match.
+_RT_HERES_WHAT_HAPPENED = re.compile(
+    r"\bhere(?:[s'’]+|\s+is)?\s+what\s+happened\b",
+    re.IGNORECASE,
+)
+
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
@@ -780,6 +816,7 @@ _RECAP_TEMPLATE_PATTERNS = (
     ("market_today_dated", _RT_MARKET_TODAY),
     ("earnings_call_recap", _RT_EARNINGS_CALL),
     ("quick_glance_metrics", _RT_QUICK_GLANCE),
+    ("heres_what_happened", _RT_HERES_WHAT_HAPPENED),
     ("earnings_tomorrow_preview", _RT_EARNINGS_TOMORROW),
     ("todays_movers_list", _RT_TODAYS_MOVERS),
     ("is_buy_after", _RT_IS_BUY_AFTER),
