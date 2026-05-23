@@ -72,6 +72,7 @@ from collectors.short_interest_collector import collect_short_interest
 from collectors.wikipedia_collector import collect_wikipedia
 from collectors.wikipedia_pageviews import collect_wikipedia_pageviews
 from collectors.macro_calendar_collector import collect_macro_calendar
+from collectors.tic_foreign_holdings import collect_tic
 from collectors.congress_trades_collector import collect_congress_trades
 from collectors.finra_short_volume import collect_finra_short_volume
 from collectors.market_movers import collect_market_movers
@@ -166,6 +167,7 @@ YAHOO_TICKER_RSS_INTERVAL = 240   # Yahoo per-ticker RSS every 4min
 WIKIPEDIA_INTERVAL  = 600         # Wikipedia recent-changes filter every 10min
 WIKI_PAGEVIEWS_INTERVAL = 3600    # Wikipedia pageview z-score surge alerts once per hour
 MACRO_CALENDAR_INTERVAL = 3600    # FOMC/BLS macro event calendar — once per hour
+TIC_INTERVAL            = 21600   # TIC foreign Treasury holdings — 6h (monthly release)
 FOREX_FACTORY_CAL_INTERVAL = 3600  # Forex Factory economic calendar — once per hour
 FINRA_SHORT_INTERVAL    = 3600    # FINRA RegSHO short volume — once per hour (daily file)
 CONGRESS_TRADES_INTERVAL = 3600   # Congressional trading disclosures — once per hour
@@ -258,7 +260,7 @@ ALL_WORKERS = (
     "gdelt", "rss", "web", "reddit", "ticker", "sec_edgar", "sec_edgar_ft", "sec_xbrl",
     "google_news", "nitter", "substack",
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
-    "yahoo_ticker_rss", "market_movers", "wikipedia", "wiki_pageviews", "macro_calendar", "short_interest",
+    "yahoo_ticker_rss", "market_movers", "wikipedia", "wiki_pageviews", "macro_calendar", "tic", "short_interest",
     "fed_press", "ecb_press", "boj_press", "boe_press", "g10_cb", "global_reg", "whitehouse",
     "usgs_quake", "fda",
     "scorer", "alert", "heartbeat", "purge", "stats",
@@ -296,7 +298,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "yield_curve": YIELD_CURVE_INTERVAL,
     "g10_yields": G10_YIELDS_INTERVAL,
     "short_interest": SHORT_INTEREST_INTERVAL,
-    "wikipedia": WIKIPEDIA_INTERVAL, "wiki_pageviews": WIKI_PAGEVIEWS_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL,
+    "wikipedia": WIKIPEDIA_INTERVAL, "wiki_pageviews": WIKI_PAGEVIEWS_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL, "tic": TIC_INTERVAL,
     "cisa_kev": CISA_KEV_INTERVAL,
     "benzinga_analyst": BENZINGA_INTERVAL,
     "fed_press": FED_PRESS_INTERVAL,
@@ -1597,6 +1599,27 @@ def macro_calendar_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(MACRO_CALENDAR_INTERVAL)
+
+
+def tic_worker(store: ArticleStore):
+    log.info("[tic_worker] started")
+    bo = Backoff("tic", base=120.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_tic()
+            _ingest(store, articles, "tic")
+            try:
+                source_health.record_result("tic_foreign_holdings", len(articles))
+            except Exception as he:
+                log.warning(f"[tic_worker] source_health error: {he}")
+            _worker_last_ok["tic"] = time.time()
+            log.debug(f"[tic] cycle ok ({len(articles)} new articles)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[tic_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(TIC_INTERVAL)
 
 
 def forex_factory_cal_worker(store: ArticleStore):
@@ -3652,6 +3675,7 @@ def main():
         ("wikipedia",   wikipedia_worker),
         ("wiki_pageviews", wiki_pageviews_worker),
         ("macro_calendar", macro_calendar_worker),
+        ("tic",            tic_worker),
         ("forex_factory_cal", forex_factory_cal_worker),
         ("finra_short",   finra_short_worker),
         ("congress_trades", congress_trades_worker),
