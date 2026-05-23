@@ -206,8 +206,20 @@ def _fetch_briefing_samples(
 
     combined = " ||| ".join((b.get("text") or "").lower() for b in briefings)
 
+    # Defense-in-depth: live-only filter on the candidate scan.
+    # Briefings are derived from get_top_for_briefing (already live-only) so the
+    # title prefix should only ever match live news in practice, but a synthetic
+    # backtest title whose 40-char prefix happens to collide with briefing prose
+    # would otherwise be added to the strong-label pool at rel=4.5 — mutating a
+    # synthetic row's existing fractional outcome label (SELL=0.5/opus=2.5) and
+    # silently poisoning the training signal. Mirrors the same defense-in-depth
+    # discipline ``update_scores_from_labels`` carries (storage/article_store.py
+    # — "this is the partial-filter regression class trend_velocity.py
+    # violates"); zero behaviour change on live rows, all four invariants intact.
+    from storage.article_store import _LIVE_ONLY_CLAUSE
     cur = store.conn.execute(
         "SELECT title, full_text, source, published FROM articles "
+        f"WHERE {_LIVE_ONLY_CLAUSE} "
         "ORDER BY first_seen DESC LIMIT 5000"
     )
     for title, blob, src, published in cur.fetchall():
