@@ -10157,3 +10157,108 @@ touched.
 UI (not this agent) and the paper-trader sibling repo had concurrent
 edits — both left untouched; `git diff --staged --name-only` verified
 before each commit that only this agent's files were included.
+
+## 2026-05-23 — Hybrid pass (immutable=1 leftovers + batch_runner wiring)
+
+**Phase 1 (debug+fix) — bugs_fixed=1.** Commit `cdd8d4a` two passes
+prior removed `file:…?mode=ro&immutable=1` from `score_drift_detector`
+and `source_score_drift` because the immutable flag promises SQLite
+the file will never change — on the actively-written ~1.6 GB production
+`articles.db` (WAL, ~30 writers) it causes intermittent "database disk
+image is malformed" errors. That sweep MISSED two more files using
+the exact same pattern:
+  - `analytics/junk_source_detector.py:30-32`
+  - `analytics/source_lead_time.py:93`
+
+Both were standalone CLI tools so the bug was latent until an operator
+ran them. Fixed both to use plain `file:{DB}?mode=ro` (no immutable) —
+matches the canonical pattern ~50 other analytics modules already use.
+Added `tests/test_sqlite_immutable_guard.py` as a static regression
+guard: scans every production .py file under analytics/analysis/
+collectors/core/dashboard/ml/scripts/storage/watchers and fails if
+`immutable=1` ever appears on a `sqlite3.connect` line again. Allows
+the flag in explanatory comments (it's part of the WHY-documentation,
+not the bug) and in tests/ (legitimate frozen-fixture builds use it
+correctly). Commit `b669736`.
+
+**Phase 2 (feature) — features_added=1.** The two fixed CLI tools sat
+outside `analytics/batch_runner.PIPELINE` so their outputs were
+permanently stale unless an operator ran them by hand. Now that the
+immutable=1 crash hazard is gone, both are safe to run hourly — wired
+both into PIPELINE so the analyst gets standing visibility into
+(a) which collectors flood the DB with near-identical titles
+(`junk_source_detector` — uniqueness ratio < 50% over a 6 k-row
+sample) and (b) which source tends to print a story FIRST when many
+feeds eventually carry it (`source_lead_time` — Jaccard-clustered
+near-duplicates with earliest-mention per cluster). Both are bounded
+SCAN_LIMIT reads via `idx_first_seen` — no full-table scan, safe to
+run alongside the live writers. Output paths in PIPELINE match the
+scripts' actual `OUT` / `OUT_PATH` constants so `_is_fresh`'s mtime
+check works correctly. `tests/test_batch_runner_pipeline.py` pins the
+wiring (7 tests: both modules present, output paths match, structural
+guards on PIPELINE entries — arity, types, uniqueness of modules and
+output paths). Commit `5d3a633`.
+
+**Phase 3 (live validation) — user_findings=6.**
+1. **Briefing quality is high.** Briefing #44 (2026-05-23 20:08 UTC,
+   50 articles, 2639 chars) reads as a coherent Bloomberg-style
+   morning brief: LEAD names Warsh-as-Fed-Chair + post-NVDA-print
+   sector rotation, MACRO/PORTFOLIO/SEMIS PULSE blocks all populated,
+   TOP SIGNALS correctly ranks Fed regime change + Citi $840 DRAM
+   call + NVDA $10T-cap thesis as 9.0s with timestamps.
+2. **Scoring funnel is keeping up.** 24h window: 12,198 live articles
+   total, only 281 unscored (2.3%), 433 LLM-labeled (3.5%), 11,484
+   ML-labeled (94.1%). ML is doing the bulk and Sonnet only sees
+   uncertain items — by design.
+3. **All 48 workers alive.** `supervisor_state.json` shows ok=48
+   dead=0, no crashes_5m, and only `sec_xbrl` / `tic` /
+   `short_interest` "stale > 1h" — all three have 6 h polling
+   cadences so this is correct, not a problem.
+4. **Top urgent sources are legit.** `GN: Nvidia` 39/251 urgent
+   (NVDA earnings night context), `GN: Federal Reserve` 11/302 (Warsh
+   confirmation), `GN: earnings` 8/365 — all earnings-week signals,
+   not noise. `stocktwits` correctly stays at 2.2% urgent ratio
+   (30/1390).
+5. **Known persisting issues (memory notes, NOT new bugs).**
+   - 53 dark sources reported by `collector_rate_monitor` —
+     `di-chronic-dark-collectors` standing external gap.
+   - 61 urgency=1 rows older than 24h — the
+     `di-stale-urgent-reaper-oscillation` failure mode (reaper
+     demotes them but a re-promoter recreates without freshness
+     guard).
+   - Mild lock-contention WARNINGs every cycle (e.g.
+     `benzinga_analyst_worker error: database is locked`) — handled
+     by `@_retry_on_lock` and recovers within one retry budget.
+6. **In-flight portfolio-ticker wiring (NOT this agent).** Working
+   copy contains a sibling-agent change wiring
+   `ml.features.LIVE_PORTFOLIO_TICKERS` into
+   `urgency_scorer._portfolio_ticker_line()` so Sonnet's URGENT
+   class names the analyst's actual held book — verified the tests
+   pass (`tests/test_urgency_portfolio_prompt.py` 5/5) and left
+   the WIP untouched per staging discipline.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:** `from storage import article_store; from ml import
+features, model` → `imports OK`. Focused suites:
+`test_sqlite_immutable_guard` 2 pass, `test_batch_runner_pipeline` 7
+pass, plus `test_article_store` / `test_features` / `test_model` /
+`test_trainer` / `test_urgency_portfolio_prompt` — total **63 pass /
+0 fail** in 14.8 s. Full `pytest tests/` deferred (it routinely
+exceeds the 2-minute test timeout under concurrent-agent I/O — known
+test-suite-timing pattern). The focused suites cover every module
+touched in this pass and every invariant the task specifies.
+
+**Counters:** `bugs_fixed=1`, `features_added=1`, `user_findings=6`.
+
+**Staging discipline.** Per-commit explicit pathspec, no `git add -A`.
+Working copy carried four sets of foreign edits at the time of
+commit: (1) sibling-agent in-flight portfolio-ticker prompt work
+(`watchers/urgency_scorer.py`, `tests/test_urgency_portfolio_prompt.py`),
+(2) trading-UI / auto-commit-daemon update to `config/portfolio.json`,
+(3) sibling-agent dashboard endpoints (`dashboard/web_server.py`,
+`tests/test_active_learning_queue_endpoint.py`,
+`tests/test_label_quality_endpoint.py`), and (4) cross-repo paper-trader
+edits. All four were left untouched. `git diff --staged --name-only`
+verified before each commit that only this agent's three files (Phase
+1) and two files (Phase 2) were staged.
