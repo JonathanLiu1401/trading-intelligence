@@ -2963,7 +2963,21 @@ def heartbeat_worker(store: ArticleStore):
                 # health_line / banner — never folded into the saved
                 # `briefing` text, so it can't reach the trainer's
                 # title-prefix label scan.
-                coverage_line = _format_portfolio_coverage(source_articles)
+                #
+                # Pass the LIVE held/watched union (positions + option
+                # underlyings + sector_watchlist from config/portfolio.json,
+                # ∪ the static PORTFOLIO_TICKERS fallback) instead of letting
+                # the function default to the frozen static tuple. The static
+                # tuple alone was silently dropping positions added in the
+                # trading UI (GOOG/COHR/NVDL on 2026-05-23) — the briefing's
+                # coverage line then read 12/12 covered when the analyst's
+                # *actual* book had 3 silent names with money at risk. The
+                # function default stays as the static tuple for back-compat
+                # with the unit tests that pin it; this caller — the live
+                # heartbeat path — uses the union.
+                coverage_line = _format_portfolio_coverage(
+                    source_articles, tickers=_price_alert_universe()
+                )
                 # Label-calibration line: of urgency>=1 rows in the last 5h,
                 # what fraction carried a real LLM ground-truth label vs only
                 # a model self-prediction? Silent on healthy/quiet windows,

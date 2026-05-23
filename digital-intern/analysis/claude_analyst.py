@@ -1663,13 +1663,31 @@ _BOOK_TICKERS: tuple[str, ...] = (
     "LITE", "LNOK", "MUU", "DRAM", "SNDU",
     "MU", "MSFT", "AXTI", "ORCL", "TSEM", "QBTS", "NVDA",
 )
+# Live held/watched universe — same single source of truth the urgency
+# SCORE_PROMPT and ml.features portfolio-relevance features already use
+# (config/portfolio.json's positions + option underlyings + sector_watchlist,
+# unioned with the hardcoded fallback). The static ``_BOOK_TICKERS`` literal
+# alone was silently drifting behind the trading UI: a 2026-05-23 live read
+# showed GOOG / COHR / NVDL held in portfolio.json yet absent from the static
+# tuple, so briefing rows mentioning those open positions never received the
+# ``[BOOK:]`` tag (Opus had no signal these touched the analyst's book) and
+# they could never light up ``_book_heat_lines``' concentration signal.
+# _BOOK_UNIVERSE is the UNION — static first in their canonical order, then
+# live-only additions in deterministic alphabetical order. Anti-drift parity
+# of _BOOK_TICKERS with daemon.PORTFOLIO_TICKERS is unchanged (and still
+# pinned by test_briefing_book_tag.py); the universe only EXTENDS the matching
+# set, it never shrinks or reorders the static core.
+from ml.features import LIVE_PORTFOLIO_TICKERS as _LIVE_PORTFOLIO_TICKERS
+_BOOK_UNIVERSE: tuple[str, ...] = _BOOK_TICKERS + tuple(
+    sorted(set(_LIVE_PORTFOLIO_TICKERS) - set(_BOOK_TICKERS))
+)
 # Longest-first alternation so the regex prefers \bMUU\b over \bMU\b and the
 # word boundaries keep "MU" from matching inside "Micron"/"MUSEUM" — the exact
 # case-sensitive convention daemon._format_portfolio_coverage and
 # ml.features._LIVE_RE already use (financial copy writes tickers uppercase).
 _BOOK_RE = re.compile(
     r"\b(?:"
-    + "|".join(re.escape(t) for t in sorted(set(_BOOK_TICKERS),
+    + "|".join(re.escape(t) for t in sorted(set(_BOOK_UNIVERSE),
                                              key=len, reverse=True))
     + r")\b"
 )
@@ -1678,18 +1696,21 @@ _BOOK_RE = re.compile(
 def _book_tickers(article: dict) -> list[str]:
     """Held/watchlist tickers mentioned in a digest row's title+summary.
 
-    Returns them in canonical ``_BOOK_TICKERS`` order (stable cycle-to-cycle),
-    de-duplicated. Empty list when the row touches no held name. Pure and
-    side-effect-free — reads only ``title``/``summary`` via .get(), never
-    mutates the article (heartbeat_worker feeds the same dicts onward to the
-    briefing-label / training path, so read-only is load-bearing)."""
+    Returns them in canonical ``_BOOK_UNIVERSE`` order (static
+    ``_BOOK_TICKERS`` first in their existing order — stable cycle-to-cycle —
+    then live-only additions from config/portfolio.json in deterministic
+    alphabetical order). De-duplicated. Empty list when the row touches no
+    held name. Pure and side-effect-free — reads only ``title``/``summary``
+    via .get(), never mutates the article (heartbeat_worker feeds the same
+    dicts onward to the briefing-label / training path, so read-only is
+    load-bearing)."""
     blob = f"{article.get('title') or ''} {article.get('summary') or ''}"
     if not blob.strip():
         return []
     hits = set(_BOOK_RE.findall(blob))
     if not hits:
         return []
-    return [t for t in _BOOK_TICKERS if t in hits]
+    return [t for t in _BOOK_UNIVERSE if t in hits]
 
 
 # ── Held-book concentration ("BOOK HEAT") ────────────────────────────────────
@@ -1739,7 +1760,11 @@ def _book_heat_lines(
             continue  # snapshot/synthetic row — same guard as the [BOOK:] tag
         for t in _book_tickers(a):
             counts[t] = counts.get(t, 0) + 1
-    rank = {t: i for i, t in enumerate(_BOOK_TICKERS)}
+    # Rank over the full universe (static core + live additions) so a heat-only
+    # live-added position (GOOG / COHR / NVDL via config/portfolio.json) gets a
+    # deterministic tie-break position rather than collapsing to the
+    # ``len(rank)`` fallback below all static names regardless of mention order.
+    rank = {t: i for i, t in enumerate(_BOOK_UNIVERSE)}
     hot = sorted(
         ((t, n) for t, n in counts.items() if n >= min_stories),
         key=lambda tn: (-tn[1], rank.get(tn[0], len(rank))),

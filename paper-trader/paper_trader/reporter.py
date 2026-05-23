@@ -1944,6 +1944,79 @@ def _host_pulse_line() -> str:
         return ""
 
 
+def _starvation_trend_line() -> str:
+    """One-line "is the host-saturation storm WORSENING or RECOVERING?" for
+    the hourly / daily report — the temporal companion to ``_host_pulse_line``.
+
+    ``_host_pulse_line`` answers the *aggregate* question: "is the box
+    saturated right now?" (CLEAR / SATURATED / STARVED). It cannot answer
+    the orthogonal *direction-of-travel* question every operator asks next:
+    *should I intervene now, or wait for the storm to pass?* A 100%
+    aggregate starvation rate could be a steady wall (intervene — kill the
+    sibling Opus jobs) or a tail end (wait — the box is clearing); the
+    actions diverge entirely. ``host_guard.recent_starvation_trend`` splits
+    the recent decision tape into halves and emits ``WORSENING``,
+    ``STABLE``, or ``RECOVERING`` — but the operator who lives in Discord
+    never opens ``/api/host-guard`` to see it.
+
+    Composes ``host_guard.recent_starvation_trend()`` **verbatim** (single
+    source of truth, AGENTS.md invariant #10 — the state/headline/rates are
+    the builder's, never re-derived here, so this Discord line and
+    ``/api/host-guard`` can never drift). Pure ``host_guard`` reads — its
+    own read-only ``decisions`` probe, **NO network** (the Discord-path
+    discipline; the ``_host_pulse_line`` precedent). Observational only,
+    never gates, adds no caps (invariants #2/#12 — the ``_host_pulse_line``
+    precedent). Failure contract mirrors the rest of ``reporter``: any
+    builder fault degrades to ``""`` ("no trend line this report"),
+    **never** an exception ("no Discord summary this report").
+
+    Suppression — surface ONLY actionable trend verdicts:
+
+      * ``WORSENING``  — storm intensifying → ⚠️ fires (ACT NOW signal).
+      * ``RECOVERING`` — storm clearing → ✅ fires (WAIT signal).
+      * ``STABLE`` with a high (≥30%) baseline starvation rate → fires
+        (a steady 100% wall is a distinct alarm from the ``_host_pulse_line``
+        snapshot — the storm isn't passing on its own).
+      * ``STABLE`` with a near-zero baseline (<30%) → silent (nothing
+        unusual is happening — the ``_capital_pulse_line`` FREE-not-bleeding
+        suppression precedent — the summary must never become its own lying
+        green light).
+      * ``INSUFFICIENT`` (<10 cycles per half) → silent (the builder's own
+        verdict-withheld bucket — never publish a trend on tiny samples).
+    """
+    try:
+        from . import host_guard
+        rt = host_guard.recent_starvation_trend()
+        if not isinstance(rt, dict):
+            return ""
+        state = rt.get("state")
+        headline = rt.get("headline") or ""
+        if not state or not headline:
+            return ""
+        if state == "INSUFFICIENT":
+            return ""
+        if state == "STABLE":
+            # Silent on quiet stability — fire only on a sustained high-rate
+            # storm (≥30% baseline). The builder reports rates in fraction.
+            try:
+                newer = float(rt.get("newer_rate") or 0.0)
+                older = float(rt.get("older_rate") or 0.0)
+            except (TypeError, ValueError):
+                return ""
+            if max(newer, older) < 0.30:
+                return ""
+        if state == "WORSENING":
+            tag = "⚠️ WORSENING"
+        elif state == "RECOVERING":
+            tag = "✅ RECOVERING"
+        else:
+            tag = "STABLE"
+        return f"**STARVATION TREND** ◈ {tag}\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] starvation-trend line skipped: {e}")
+        return ""
+
+
 def _realized_pl_today(trades_newest_first: list[dict], today: str
                        ) -> tuple[float, int, int] | None:
     """True realized P/L from round-trips that *closed* today (UTC).
@@ -3898,6 +3971,17 @@ def send_hourly_summary() -> bool:
     hp = _host_pulse_line()
     if hp:
         body += "\n" + hp
+    # STARVATION TREND sits right AFTER HOST — host pulse names the
+    # aggregate state (CLEAR / SATURATED / STARVED); starvation-trend names
+    # the direction of travel (WORSENING / STABLE-with-storm / RECOVERING).
+    # The two together give the operator the full picture: HOST says "is the
+    # box saturated?", TREND says "should I intervene now or wait?". Both
+    # can be silent independently (silence-when-nothing-actionable); neither
+    # suppresses the other (a SATURATED host that is RECOVERING is a
+    # different action signal from a SATURATED host that is WORSENING).
+    stt = _starvation_trend_line()
+    if stt:
+        body += "\n" + stt
     # IDLE sits right AFTER HOST — host pulse names the CAUSE (saturated /
     # starved); idle-opportunity names what was MISSED while the cause held.
     # Both can be silent independently (silence-when-nothing-actionable);
@@ -4110,6 +4194,17 @@ def send_daily_close() -> bool:
     hp = _host_pulse_line()
     if hp:
         body += "\n" + hp
+    # STARVATION TREND sits right AFTER HOST — host pulse names the
+    # aggregate state (CLEAR / SATURATED / STARVED); starvation-trend names
+    # the direction of travel (WORSENING / STABLE-with-storm / RECOVERING).
+    # The two together give the operator the full picture: HOST says "is the
+    # box saturated?", TREND says "should I intervene now or wait?". Both
+    # can be silent independently (silence-when-nothing-actionable); neither
+    # suppresses the other (a SATURATED host that is RECOVERING is a
+    # different action signal from a SATURATED host that is WORSENING).
+    stt = _starvation_trend_line()
+    if stt:
+        body += "\n" + stt
     # IDLE sits right AFTER HOST — host pulse names the CAUSE (saturated /
     # starved); idle-opportunity names what was MISSED while the cause held.
     # Both can be silent independently (silence-when-nothing-actionable);

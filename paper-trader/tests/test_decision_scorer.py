@@ -155,9 +155,45 @@ class TestPredictionClamp:
         assert math.isfinite(m["pred"])
         assert m["off_distribution"] is True
         assert m["clamped"] is True
+        # The `failed` flag was added so OOS rank-metric consumers can
+        # distinguish a fabricated 0.0 (exception path) from a real flat
+        # prediction. Without this, _oos_rank_metrics tied every exception
+        # row at zero — silent rank-IC contamination.
+        assert m["failed"] is True
         # predict()'s float contract is unchanged — still the safe 0.0.
         assert s.predict(ml_score=0.0, rsi=50, macd=0.0, mom5=0.0,
                          mom20=0.0, regime_mult=1.0, ticker="NVDA") == 0.0
+
+    def test_failed_flag_is_false_on_legit_clamp(self):
+        # A clamped prediction (raw exceeded ±PRED_CLAMP_PCT) is low-trust
+        # on MAGNITUDE but the rank is still trustworthy — OOS rank-IC must
+        # KEEP these rows. `failed` distinguishes the magnitude-clamp case
+        # (failed=False, off_distribution=True) from the model-cannot-score
+        # case (failed=True, off_distribution=True).
+        s = _trained_scorer_returning(-89.292)
+        m = s.predict_with_meta(ml_score=0.0, rsi=50, macd=0.0, mom5=0.0,
+                                mom20=0.0, regime_mult=1.0, ticker="LITE")
+        assert m["off_distribution"] is True
+        assert m["clamped"] is True
+        assert m["failed"] is False
+        # And on a fully in-distribution prediction the row is fully trusted.
+        s2 = _trained_scorer_returning(2.5)
+        m2 = s2.predict_with_meta(ml_score=0.0, rsi=50, macd=0.0, mom5=0.0,
+                                  mom20=0.0, regime_mult=1.0, ticker="NVDA")
+        assert m2["off_distribution"] is False
+        assert m2["clamped"] is False
+        assert m2["failed"] is False
+
+    def test_failed_flag_is_true_on_non_finite_output(self):
+        # The non-finite (inf/nan) branch produces a fabricated 0.0 too —
+        # `failed=True` so OOS rank-IC drops the row instead of tying it
+        # at zero.
+        for bad in (float("inf"), float("-inf"), float("nan")):
+            s = _trained_scorer_returning(bad)
+            m = s.predict_with_meta(ml_score=0.0, rsi=50, macd=0.0, mom5=0.0,
+                                    mom20=0.0, regime_mult=1.0, ticker="NVDA")
+            assert m["failed"] is True
+            assert m["off_distribution"] is True
 
     def test_untrained_scorer_meta_is_safe(self):
         # Regression guard: the untrained short-circuit must run BEFORE the
@@ -168,10 +204,12 @@ class TestPredictionClamp:
                                 mom20=None, regime_mult=1.0, ticker="NVDA")
         # `percentile` (2026-05-21 rank-calibration) and `calibrated`
         # (quantile-mapping calibration) are additive keys; both None here
-        # because an untrained scorer carries no quantile tables.
+        # because an untrained scorer carries no quantile tables. `failed`
+        # (additive 2026-05-23 flag) is True because an untrained scorer
+        # produced no real prediction; the 0.0 is a safe-fallback sentinel.
         assert m == {"pred": 0.0, "raw": 0.0, "clamped": False,
                      "off_distribution": False, "percentile": None,
-                     "calibrated": None}
+                     "calibrated": None, "failed": True}
 
 
 # ─────────────────────── _to_float ───────────────────────────
