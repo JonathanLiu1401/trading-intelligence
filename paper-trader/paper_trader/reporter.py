@@ -628,6 +628,52 @@ def send_breaker_cleared_alert(*, elapsed_s: int | float | None = None) -> bool:
     return _send(body)
 
 
+def send_quota_recovered_alert(*, elapsed_s: int | float | None = None) -> bool:
+    """Operator confirmation: the Claude CLI quota latch has cleared because the
+    decision engine just produced a real (HOLD / FILLED / BLOCKED) decision
+    after a usage/quota outage.
+
+    Mirror of ``send_breaker_cleared_alert`` for the orthogonal failure mode.
+    Historically the recovery notice for quota was a bare ``_send("✅ **CLAUDE
+    QUOTA RECOVERED** ◈ decision engine responding again — live trader
+    resumed")`` with NO elapsed time. A trader pulled away from Discord during
+    a multi-hour quota outage gets the cleared ping but no answer to the first
+    question every PM asks: "how bad was it?" — the same gap
+    ``send_breaker_cleared_alert`` already closes for the wedge bracket.
+    Adding the same ``_format_elapsed`` token here closes the loop so the
+    bracket of a quota outage (EXHAUSTED → RECOVERED) is self-describing
+    without the operator scrolling the channel to time it.
+
+    ``elapsed_s`` is the wall-clock seconds since the FIRST quota cycle in the
+    just-cleared run (``runner._quota_first_ts`` at the time of the recovery
+    cycle — the caller captures it BEFORE resetting the ts marker; see the
+    ``_quota_alert_active`` recovery block in ``runner._cycle``). ``None``
+    (legacy callers, ts not captured) suppresses the duration token — the
+    alert still ships with the bare cleared confirmation, byte-compatible
+    with the prior literal so a downgrade to the unconditional form is a
+    one-keyword edit, not a re-design.
+
+    Same additive failure contract as the rest of ``reporter``: never raises
+    (any fault propagates from ``_send`` which already records and degrades).
+    Returns the ``_send`` ok/False boolean so the caller (the runner) can
+    dedupe the ``_quota_alert_active`` latch on a confirmed send only —
+    matching the breaker latch's retry semantics exactly (a transient
+    openclaw failure leaves the latch armed so the next cycle retries the
+    recovery notice, never silently drops it)."""
+    duration_token = _format_elapsed(elapsed_s)
+    if duration_token:
+        body = (
+            f"✅ **CLAUDE QUOTA RECOVERED** ◈ decision engine responding "
+            f"again after ~{duration_token} dark — live trader resumed"
+        )
+    else:
+        body = (
+            "✅ **CLAUDE QUOTA RECOVERED** ◈ decision engine responding "
+            "again — live trader resumed"
+        )
+    return _send(body)
+
+
 def send_quota_alert(detail: str = "") -> bool:
     """One-shot alarm: the Claude CLI is rejecting every decision with a
     quota / usage-limit error, so the live trader is making NO trades and

@@ -80,6 +80,18 @@ _breaker_alert_active = False
 # None whenever the engine produces a real decision. Module global (in-memory
 # only — a fresh process re-derives it on its next NO_DECISION).
 _no_decision_first_ts: datetime | None = None
+# Companion to ``_no_decision_first_ts`` for the quota-exhaustion path.
+# The quota cycle deliberately resets ``_no_decision_first_ts`` to None on
+# every quota tick (so a NON-quota wedge that follows starts its own clock
+# fresh — see the quota arm of ``_cycle``), so the breaker's timestamp is
+# unusable for the orthogonal quota bracket. This dedicated marker captures
+# the wall-clock instant of the FIRST quota cycle in the current outage and
+# is reset by the next real decision (HOLD / FILLED / BLOCKED) — exactly
+# mirroring the breaker pattern one dimension over. Feeds the
+# ``send_quota_recovered_alert(elapsed_s)`` token so the operator gets the
+# same self-describing EXHAUSTED→RECOVERED bracket the breaker FIRED→CLEARED
+# pair already provides.
+_quota_first_ts: datetime | None = None
 
 # Set by the git-watcher thread; checked by the main loop between cycles so
 # a restart never kills a mid-Opus decision call.
@@ -678,6 +690,7 @@ def _no_decision_cause(summary: dict) -> str:
 def _cycle():
     global _consecutive_no_decisions, _quota_alert_active
     global _breaker_alert_active, _no_decision_first_ts
+    global _quota_first_ts
     summary = strategy.decide()
 
     status = summary.get("status", "NO_DECISION")
@@ -696,6 +709,13 @@ def _cycle():
         # must still re-arm so a NON-quota wedge that follows starts its own
         # clock from THIS cycle (not from a stale quota-era ts).
         _no_decision_first_ts = None
+        # Anchor the quota outage clock at the FIRST quota cycle so the
+        # recovery message can render the real elapsed duration. The breaker
+        # path uses ``_no_decision_first_ts`` for this; quota has its own
+        # marker because the quota arm just reset ``_no_decision_first_ts``
+        # to None one line up.
+        if _quota_first_ts is None:
+            _quota_first_ts = datetime.now(timezone.utc)
         if not _quota_alert_active:
             try:
                 detail = ""
@@ -796,16 +816,29 @@ def _cycle():
         # latch only on successful send makes the next decide() cycle retry
         # the recovery notice; the latch itself dedupes so we never spam.
         if _quota_alert_active and status != "NO_DECISION":
+            # Capture elapsed BEFORE clearing the ts marker — same discipline
+            # as the breaker recovery path one block up. The send may fail
+            # transiently (openclaw down) so the latch stays armed; the ts is
+            # also kept armed in that case so a successful retry next cycle
+            # still ships the real wedge duration. Only on confirmed send
+            # success do we clear both the latch AND the ts (a fresh quota
+            # outage that follows starts its own clock).
+            quota_elapsed_s: int | None = None
+            if _quota_first_ts is not None:
+                quota_elapsed_s = int(
+                    (datetime.now(timezone.utc)
+                     - _quota_first_ts).total_seconds()
+                )
             ok = False
             try:
-                ok = bool(reporter._send(
-                    "✅ **CLAUDE QUOTA RECOVERED** ◈ decision engine responding "
-                    "again — live trader resumed"
+                ok = bool(reporter.send_quota_recovered_alert(
+                    elapsed_s=quota_elapsed_s,
                 ))
             except Exception as e:
                 print(f"[runner] quota recovery notice failed: {e}")
             if ok:
                 _quota_alert_active = False
+                _quota_first_ts = None  # re-arm: next outage starts fresh
 
     try:
         if summary.get("auto_exits") or summary.get("status") == "FILLED":
