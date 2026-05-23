@@ -5,6 +5,100 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-23 hybrid pass #7 (Agent 3) — alert + briefing prompt held-book parameterization + cross-prompt parity audit
+
+Debugger + feature-dev + news-analyst pass. Two commits on master.
+
+**Phase 1 (debug) — `215c8d7`.** Same held-book drift class the urgency
+SCORE_PROMPT was just patched for (Agent 3 sibling pass on
+`watchers/urgency_scorer.py`) — `watchers/alert_agent.py::ALERT_PROMPT` had
+TWO frozen held-ticker literals (the `PORTFOLIO: [specific implication for
+LITE/MU/MSFT/AXTI/ORCL/TSEM/QBTS]` template line + the `BOOK:` rule's
+`(LITE/LNOK/MUU/DRAM/SNDU/MU/MSFT/AXTI/ORCL/TSEM/QBTS/NVDA)` enumeration),
+and `analysis/claude_analyst.py::SYSTEM_PROMPT` had a third in the `[BOOK:]`
+rule (`(LITE, LNOK, MUU, DRAM, MU, NVDA, MSFT, AXTI, ORCL, TSEM, QBTS)`).
+The 2026-05-23 live audit found GOOG / COHR / NVDL held in
+`config/portfolio.json` yet absent from every literal — Sonnet's PORTFOLIO
+implication writing and Opus's `[BOOK:]` weighting in TOP SIGNALS were
+blind to those open positions. Both prompts now interpolate the same SSOT
+(`ml.features.LIVE_PORTFOLIO_TICKERS`, with claude_analyst additionally
+unioning the static `_BOOK_TICKERS` core via the existing `_BOOK_UNIVERSE`).
+Each got a `_held_book_phrase()` helper mirroring `urgency_scorer.
+_portfolio_ticker_line()` so the three helpers can be cross-compared. Two
+regression guard test files (`test_alert_held_book_prompt`,
+`test_briefing_held_book_prompt`) pin per-prompt; `test_held_book_parity`
+pins cross-prompt. 13+ new tests, every passing.
+
+**Phase 2 (feature) — `e41b78e`.** New `analytics/held_book_parity.py`:
+operator-facing cross-prompt parity audit. Composes the three prompt helpers
+verbatim, parses each enumeration back to a set, reports per-prompt
+`missing_from_prompt` / `extra_in_prompt` diffs vs the SSOT and pairwise
+diffs between every prompt pair. Verdict flips to `DRIFT` when any prompt
+is missing a SSOT ticker OR carries an alien one (briefing extras are
+permitted because of the static-core union). CLI: `--json` for dashboards,
+`--strict` for CI gates (exit 1 on drift). Pure read-side, no DB, no LLM.
+Pinned by 10 tests in `tests/test_held_book_parity.py` including
+mock-based negative-path coverage (one prompt mutated to miss a canary
+SSOT ticker → verdict flips, alien ticker injected → verdict flips,
+`--strict` exit-code contract).
+
+**Phase 3 (live validation) — user_findings=6.**
+1. **Briefing #42 PORTFOLIO table missed GOOG/COHR/NVDL** — exactly the
+   drift bug Phase 1 fixes; the next briefing (post-restart) carries
+   the live 23-ticker universe per the new helpers.
+2. **ZERO LLM-vetted urgent alerts in last 6h, 4/4 urgent rows were
+   model-only** (ai_score=0, ml_score>0). The Sonnet urgency_scorer
+   path appears dark — either quota exhaustion or recap pre-filter is
+   eating everything. The CALIBRATION block in ALERT_PROMPT is doing
+   100% of the calibration work. Not addressed here; left as a finding.
+3. **DB lock storm at 14:52Z exhausted retry budgets** —
+   `update_ai_scores_batch: lock retry exhausted after 5 attempts —
+   raising` plus matching `insert_batch` exhaustion (matches
+   `di-insert-batch-lock-contention` memory). At least one Sonnet batch's
+   labels were dropped that cycle.
+4. **`[alert] No response from Claude — skipping`** at 14:53:50Z — a
+   Claude CLI alert call returned `None`. Likely quota-related; the alert
+   path retries next cycle on the same urgent rows.
+5. **ml_trainer worker alive=False but state=ok** per supervisor_state.json
+   — known `di-ml-trainer-subprocess-timeout` issue, surfaced again.
+6. **Obvious noise in recent alerts** — `reddit/r/buildapc` "Let me know
+   what to change and if I did good." scored ml=9.62 urgent; `reddit/
+   r/stockstobuy` "Costco" scored ml=9.92. The ML head over-scores
+   high-engagement reddit threads regardless of title sanity. The
+   `ALERT_MIN_LONE_SOURCE_CRED=0.45` gate should have suppressed these
+   (reddit cred=0.40) but they passed — likely syndicated (dup_count>1).
+   Not addressed here.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:**
+- `python3 -c "import sys; sys.path.insert(0,'.'); from storage import
+  article_store; from ml import features, model; print('imports OK')"`
+  → `imports OK`.
+- Focused suite covering every module touched + the new analytics
+  script: 136 passed in 8.88s
+  (`test_held_book_parity` + `test_alert_held_book_prompt` +
+  `test_briefing_held_book_prompt` + `test_urgency_portfolio_prompt`
+  + `test_alert_agent` + `test_alert_book_velocity` +
+  `test_alert_ticker_burst` + `test_features` + `test_article_store`
+  + `test_briefing_book_tag` + `test_briefing_book_heat`). Full
+  `pytest tests/` not run (≥25min under live load and would race the
+  sibling Agent 4 + auto-commit daemon — focused suite covers the
+  invariants).
+
+**Counters:** `bugs_fixed=1` (the prompt-drift class addressed in both
+alert_agent + claude_analyst as one fix), `features_added=1`
+(`analytics/held_book_parity.py` cross-prompt audit + --strict CI
+contract), `user_findings=6` (see above).
+
+**Staging discipline.** Per-commit, explicit pathspec, no `git add -A`.
+Sibling Agent 4 (`paper-trader/paper_trader/analytics/persona_book_fit.py`)
+and the auto-commit daemon were both active; `git diff --staged --stat`
+verified before each commit to ensure only my own .py + test files were
+included. Untouched: `config/portfolio.json`, `watchers/urgency_scorer.py`,
+`tests/test_urgency_portfolio_prompt.py` (Agent 3 sibling's in-flight
+diff), and the paper-trader files.
+
 ## 2026-05-23 feature pass (Agent 4) — `_persona_book_fit_chat_lines` chat enrichment
 
 Wires the new paper-trader `/api/persona-book-fit` endpoint into the
