@@ -6,6 +6,178 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #11 (Agent 2) — `calibration_reliability` + dedup tiebreaker hardening
+
+### Phase 1 — fix: `train_scorer` dedup must prefer rows with finite `forward_return_5d`
+
+`train_scorer`'s `(ticker, sim_date, action)` dedup previously kept the
+candidate with the highest `return_pct` *unconditionally*. If that survivor
+also carried a null/NaN/inf `forward_return_5d` (an externally injected /
+corrupted row), the subsequent label-validation pass dropped it — silently
+losing ALL training signal for that key, even when a sibling record on a
+lower-return run carried a real finite label. Strengthened the tiebreaker
+to `(has_valid_label, return_pct)` so a valid-labelled record always wins
+the precedence comparison regardless of run return. Behaviour is unchanged
+when every candidate has (or every candidate lacks) a valid label — the
+historical `return_pct` tiebreaker contract pinned by
+`test_dedup_survivor_is_highest_return_record` still holds. Production
+`decision_outcomes.jsonl` has 0 such rows today (`_compute_decision_outcomes`
+only emits walk-back-validated finite outcomes), but the guard makes the
+invariant explicit and refactor-proof. Four new tests in `TestTrainScorer`
+pin the tie-break behaviour, the all-invalid collision survivor count, and
+the all-valid regression-guard in both candidate orders. Commit `4cd04d1`.
+`bugs_fixed = 1`.
+
+### Phase 2 — feature: `paper_trader/ml/calibration_reliability.py` (`predict_calibrated` reliability analyzer + per-cycle ledger)
+
+**The gap.** Pass #10 added `DecisionScorer.predict_calibrated`
+(quantile-mapped honest magnitude) but the CLAIM — calibrated value
+delivers honest 5d % on the empirical label support — was untested OOS:
+the existing `calibration` module bins by raw `predict()` and the scorer
+skill ledger only trends scalar `oos_rmse` / `oos_ic`. A quant trusting a
+calibrated `+X%` could not see whether the quantile mapping actually
+narrows magnitude bias or makes it worse OOS.
+
+**The fix.** New module `paper_trader/ml/calibration_reliability.py` —
+pure, never-raises, read-only mirror of `calibration.py`'s discipline:
+
+  * `calibrated_reliability_report(triples)` — per-decile
+    `mean_calibrated_pred` vs `mean_realized` on the SAME temporal holdout
+    `_train_decision_scorer` uses (SSOT — split mismatch impossible);
+  * `vs_raw_bias_reduction` = raw mean |decile error| − calibrated mean
+    |decile error| on the IDENTICAL decile bins. Positive ⇒ calibration
+    helped; negative ⇒ quantile mapping made magnitudes WORSE OOS.
+  * `scorer_calibrated_reliability_oos(scorer, records)` — wrapper that
+    reuses `paper_trader.validation.split_outcomes_temporal` (the EXACT
+    split the ledger's `oos_rmse`/`oos_ic` use).
+  * `analyze(outcomes_path, oos_only=True)` — convenience entry point
+    matching the sibling `baseline_compare.analyze` /
+    `llm_annotation_skill.analyze` shape.
+
+CLI: `python3 -m paper_trader.ml.calibration_reliability [--in-sample]`
+— exit 0 only on `WELL_CALIBRATED` / `WEAK_SIGNAL` so shell callers can
+gate on `$?`. Verdict thresholds (MIN_PAIRS, SPEARMAN_GOOD,
+MONOTONE_GOOD, BIAS_TOL_PCT) are imported verbatim from `calibration.py`
+— single source of truth so a threshold tune propagates automatically.
+
+Wired as a per-cycle JSONL row via `_append_calibrated_reliability_log`
+in `run_continuous_backtests.py` (`data/calibrated_reliability_log.jsonl`),
+mirroring the existing scorer/baseline/llm-annotation ledger discipline
+byte-for-byte: best-effort (never raises), honest gap rows on degradation,
+atomic bounded trim (2× `CALIBRATED_RELIABILITY_LOG_KEEP=2000`), module-
+level path for test redirection, exact same wiring pattern in `main()` so
+a refactor cannot silently re-orphan it. `calibrated_dark` is the
+quant-decisive boolean a reading operator cares about: True ⇒
+`predict_calibrated` produced zero finite triples this cycle (legacy
+pickle, untrained scorer, no outcomes), False ⇒ the calibrated path is
+alive and the row carries real data.
+
+**Live evidence at merge** (deployed `n=4987` scorer, 1750-row OOS holdout):
+
+```
+[oos] VERDICT: DIRECTIONAL_BUT_BIASED
+  n=1750 spearman=0.36 monotone=0.89
+  calibrated_decile_err=5.6pp  raw_decile_err=2.1pp  bias_reduction=-3.52pp
+  d10 cal[+18.79,+50.00]  cal=+26.71  raw=+19.01  realized=+6.22
+  d 9 cal[+12.20,+18.74]  cal=+15.40  raw=+8.43   realized=+5.10
+  d 1 cal[-34.31,-10.64]  cal=-17.02  raw=-9.44   realized=-9.24
+```
+
+The calibrated value is rank-skilled (Spearman 0.36, monotone 0.89) but
+its magnitude is LESS accurate than raw `predict()` on this OOS slice —
+the quantile mapping pulls top-decile predictions out to +26% when realized
+is only +6%, because the training-set label distribution has fatter tails
+than the OOS holdout window. A reading quant should now treat
+`predict_calibrated` as the *rank* signal, not the magnitude — the
+analyzer makes this visible per-cycle for the first time.
+
+26 new tests (21 in `tests/test_calibration_reliability.py`, 5 ledger +
+1 wiring regression in `tests/test_continuous.py`). Commit `ada9b26`.
+`features_added = 1`.
+
+### Phase 3 — live validation findings (`user_findings = 4`)
+
+1. **Continuous loop is DEAD — no process, log stale 5 days.**
+   `continuous.log` last write 2026-05-18 12:03 with run 6243 mid-cycle.
+   No `run_continuous_backtests` process visible in `ps -ef`. Most recent
+   "real" completed run is 99002 from today 06:24 — but that's a manual
+   single-persona test run (round ID), not from the instrumented cycle
+   loop. The most recent ACTUAL loop runs are 6236–6242 from 2026-05-18.
+   This is why all three skill-log files (`scorer_skill_log.jsonl`,
+   `baseline_skill_log.jsonl`, `llm_annotation_skill_log.jsonl`) hold
+   exactly **1 row each** — the loop only completed one cycle since the
+   ledgers were instrumented. Not a code fix; needs an operator restart.
+
+2. **Deployed scorer pickle predated pass #10 — `predict_calibrated` was
+   DARK in production.** The on-disk `data/ml/decision_scorer.pkl` carried
+   `pred_quantiles` but no `label_quantiles` (n=3987 trained before the
+   pass-#10 schema bump). Every consumer of `predict_calibrated` —
+   dashboard panels, the CLI, `predict_with_meta`'s `"calibrated"` key —
+   was reading `None` for every prediction. Self-healed by training one
+   cycle on the existing 5000-record outcomes tail (the loop's normal
+   per-cycle work); the pickle is now n=4987 and both quantile tables
+   are populated. The new `calibrated_reliability_log.jsonl` will surface
+   any future regression to this dark state via `calibrated_dark=True`.
+
+3. **`predict_calibrated` makes OOS magnitudes WORSE, not better.** OOS
+   reliability report (1750-row holdout) reports `vs_raw_bias_reduction
+   = -3.52pp` — the quantile-mapped magnitude has *larger* mean |decile
+   error| (5.6pp) than raw `predict()` (2.1pp). The MLP under-disperses
+   (early-stopping pulls predictions toward the training mean), so raw
+   predictions are closer to realized than the fatter-tailed empirical
+   label support the calibration pulls them out to. Pass #10's claim
+   that calibration is the honest *magnitude* reading does NOT hold OOS
+   on this data — only the *rank* (`predict_percentile`) does. The
+   calibrated value should be read as a rank proxy, not a magnitude.
+   The new ledger makes this trendable; if a future retune narrows the
+   pred/label dispersion gap, `vs_raw_bias_reduction` will swing
+   positive and the verdict will flip to `WELL_CALIBRATED`.
+
+4. **`decision_outcomes.jsonl` persona diversity is poor.** Of 8753
+   records, 7413 (~85%) carry `persona=None` (pre-dating the persona-
+   capture wiring); the 1340 populated rows are 100% Momentum Trader
+   (all from the single manual run 99002). The "ensemble committee"
+   framing in `CLAUDE.md` is currently empirically reduced to one
+   persona's training signal because `RUNS_PER_CYCLE=1` throttle plus
+   the recent loop-dead state means there hasn't been cycle-driven
+   persona rotation since the persona field was added. The
+   `oos_persona` slice in any per-persona diagnostic
+   (`persona_skill`, `persona_leaderboard`) will look nearly empty.
+
+### How `calibration_reliability` works (reference)
+
+| Method | Returns | Use it for |
+|--------|---------|-----------|
+| `calibrated_reliability_report(triples)` | full report dict | hand-fed (calibrated_pred, raw_pred, realized) triples |
+| `scorer_calibrated_reliability(scorer, records)` | full report dict | in-sample over decision_outcomes-shaped records |
+| `scorer_calibrated_reliability_oos(scorer, records)` | report + `oos_n/train_n/oos_fraction` | the honest OOS view (the only verdict to trust) |
+| `analyze(outcomes_path, oos_only=True)` | report + `scorer_n_train`, `outcomes_n`, `slice` | one-call entry point for the per-cycle ledger / CLI |
+| `_cli(argv)` | exit code (0 if WELL_CALIBRATED/WEAK_SIGNAL) | `python3 -m paper_trader.ml.calibration_reliability [--in-sample]` |
+
+### How to run / interpret (Agent 2 domain)
+
+- **Run a backtest manually:** `python3 run_backtests.py` (10 parallel
+  year-long runs) or `python3 run_continuous_backtests.py` (instrumented
+  cycle loop — currently NOT running, see finding #1).
+- **Explain one prediction:** `python3 -m paper_trader.ml.decision_scorer
+  --explain --ticker NVDA --ml-score 3 --rsi 35 --json` — prints raw,
+  clamped, percentile, and (now that the pickle is current) the calibrated
+  5d return.
+- **Interpret a backtest run:** `total_return_pct` is raw return;
+  `vs_spy_pct` is alpha — but treat it as invalid when `notes` carries
+  `benchmark_unavailable`.
+- **Check calibration honesty:** `python3 -m paper_trader.ml.calibration_reliability
+  --in-sample` — emits the per-decile reliability table for both the OOS
+  holdout (the trustworthy view) and the in-sample sanity check, with the
+  `vs_raw_bias_reduction` metric showing whether quantile mapping is a
+  real improvement or cosmetic on the current corpus.
+- **Test the domain:** `python3 -m pytest tests/ -k "ml or backtest or
+  scorer or gate or calibration or calibrated or continuous" -q` (~354
+  in the focused set; `tests/test_calibration_reliability.py` is the new
+  21-test file for this pass + 5 ledger tests in `tests/test_continuous.py`).
+
+---
+
 ## 2026-05-22 — Agent 1 (paper-trader core) HYBRID review pass #3
 
 ### Phase 1: Bug fix — `bb_position` threshold miscalibrated in the live system prompt
