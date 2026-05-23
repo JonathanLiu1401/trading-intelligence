@@ -1775,6 +1775,23 @@ def _ml_decide(
                     best_score = adj_s
                     break
 
+    # Populate quant for buy_ticker BEFORE any gate evaluates it. A sentiment-
+    # only buy_ticker (outside QUANT_SIGNAL_TICKERS ∪ portfolio.positions)
+    # silently bypassed both the 52-week-high gate below AND the CONTRARIAN
+    # RSI flip a few lines later, because `quant.get(buy_ticker, {})` returned
+    # an empty dict — `wk52_pos`/`rsi` lookups read None and the isinstance
+    # guards failed open. Same lazy fetch the later scorer-feature parity
+    # block already used (and which is now redundant — kept idempotent via
+    # the `not in quant` check below). Empirically ~21% of all BUYs in the
+    # live decision_outcomes.jsonl tail are sentiment-only picks (XLF/XLV/XLI/
+    # ARKK/BTC-USD/NVDU/AMZU/METAU/CONL), so this gap silently disarmed the
+    # bubble gate for the leveraged-single-stock 2x names where a 52w peak
+    # buy is most dangerous.
+    if buy_ticker and buy_ticker not in quant:
+        _extra_q = _get_quant_signals(sim_date, [buy_ticker], prices)
+        if buy_ticker in _extra_q:
+            quant[buy_ticker] = _extra_q[buy_ticker]
+
     # 52-week-high gate: suppress buys when the ticker is at an extended high.
     # Prevents buying into bubble peaks where news clusters at market tops
     # (e.g. dot-com 2000) causing underperformance vs shuffled baselines.
@@ -1825,25 +1842,11 @@ def _ml_decide(
 
         # DecisionScorer nudge: only modulate conviction once the model has seen
         # enough real outcomes (≥500 records). With fewer, it is too noisy to gate.
-        # Training/inference feature parity: a buy_ticker outside
-        # `QUANT_SIGNAL_TICKERS ∪ portfolio.positions` (a sentiment-only pick
-        # — empirically ~21% of all BUYs across the live `decision_outcomes.jsonl`
-        # tail; classic examples: XLF/XLV/XLI sector ETFs, ARKK, BTC-USD,
-        # leveraged single-stock 2x names like NVDU/AMZU/METAU/CONL — would
-        # otherwise feed `build_features` the (rsi=50/macd=0/mom=0/bb=0)
-        # neutral defaults at inference while the training-time outcome row
-        # carries the REAL indicators (`_compute_decision_outcomes` calls
-        # `_get_quant_signals(sim_date, [ticker], ...)` per outcome, with no
-        # WATCHLIST subset). The scorer then trains on a feature manifold the
-        # gate never visits, and predicts at a manifold the model never saw.
-        # Single extra `_get_quant_signals` call on miss — cheap (one ticker,
-        # cached PriceCache series). The score-adjustment loop is deliberately
-        # left at the original (covered) tickers so this fix changes ONLY the
-        # scorer feature vector, not `best_score` / persona / regime decisions.
-        if buy_ticker not in quant:
-            _extra_q = _get_quant_signals(sim_date, [buy_ticker], prices)
-            if buy_ticker in _extra_q:
-                quant[buy_ticker] = _extra_q[buy_ticker]
+        # Training/inference feature parity for sentiment-only buy_tickers is
+        # now guaranteed by the lazy `_get_quant_signals` fetch a few blocks
+        # above (executed BEFORE the wk52 gate so the gate doesn't no-op on
+        # empty quant). The scorer feature vector inherits the populated
+        # `quant[buy_ticker]` entry by construction.
         q_buy = quant.get(buy_ticker, {})
         buy_news_count = ticker_article_count.get(buy_ticker, 0)
         buy_news_urg = ticker_max_urgency.get(buy_ticker, 0.0)
