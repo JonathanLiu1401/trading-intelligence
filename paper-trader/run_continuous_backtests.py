@@ -993,10 +993,19 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
         buy_acts: list[float] = []
         sell_preds: list[float] = []
         sell_acts: list[float] = []
-        # Per-regime buckets — keyed by the decoded `regime_mult`. A record
-        # whose regime_mult is absent or not one of {0.3,0.6,1.0} lands in
-        # no bucket (honest — the corpus genuinely cannot place it) but is
-        # still counted in the aggregate above.
+        # Per-regime buckets — keyed by the explicit ``regime_label`` when
+        # present (the 2026-05-19 feature), with the legacy ``regime_mult``
+        # decode as fallback for rows that pre-date the label field. The two
+        # encodings overlap (mult=1.0 ⇔ "bull") EXCEPT for "unknown":
+        # ``_market_regime`` emits "unknown" with mult=1.0 for the early days
+        # of any backtest window (SPY has <200 closes), so the mult-only
+        # decode silently bucketed those into "bull". Live audit of
+        # ``data/decision_outcomes.jsonl`` shows 182 ``regime_label='unknown'``
+        # rows out of 576 in the would-be-bull bucket (~32%) — a real silent
+        # contamination of the regime-conditional skill metric. By preferring
+        # ``regime_label`` we drop those into the no-bucket fall-through
+        # honestly, while legacy rows (no label field, ~7400 of the corpus)
+        # keep their mult-based bucket assignment unchanged.
         _REGIME_BY_MULT = {0.3: "bear", 0.6: "sideways", 1.0: "bull"}
         regime_preds: dict[str, list[float]] = {
             "bull": [], "sideways": [], "bear": []}
@@ -1043,12 +1052,21 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
                     else:
                         buy_preds.append(p)
                         buy_acts.append(a)
-                    # Regime bucket — exact float match on the decode table.
-                    # regime_mult is written by `_compute_decision_outcomes`
-                    # from a fixed {0.3,0.6,1.0} set, so an exact lookup is
-                    # safe; anything else (legacy/None) is simply not bucketed.
-                    _reg = _REGIME_BY_MULT.get(
-                        _to_float(r.get("regime_mult"), -1.0))
+                    # Regime bucket — prefer the explicit ``regime_label``
+                    # (2026-05-19 outcome field). Fall back to the
+                    # ``regime_mult`` decode ONLY when the label is absent
+                    # (pre-feature legacy rows). An explicit ``"unknown"``
+                    # label is intentionally dropped from every bucket —
+                    # that is the documented unknown-regime fall-through
+                    # the mult-only path silently mis-bucketed as "bull".
+                    _label = r.get("regime_label")
+                    if _label in regime_preds:
+                        _reg = _label
+                    elif _label is None:
+                        _reg = _REGIME_BY_MULT.get(
+                            _to_float(r.get("regime_mult"), -1.0))
+                    else:
+                        _reg = None  # "unknown" or any other label
                     if _reg is not None:
                         regime_preds[_reg].append(p)
                         regime_acts[_reg].append(a)

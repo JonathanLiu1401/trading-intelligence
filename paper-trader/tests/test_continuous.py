@@ -1111,6 +1111,80 @@ class TestOosRankMetrics:
         assert out["buy_rank_ic"] is None
         assert out["sell_rank_ic"] is None
 
+    def test_regime_unknown_label_is_not_bucketed_as_bull(self):
+        """Bug fix: `_market_regime` returns "unknown" with regime_mult=1.0
+        for the early days of any backtest window (SPY <200 closes). The
+        prior mult-only bucketing decoded 1.0 → "bull", silently
+        contaminating the regime_bull_* metric with no-skill unknown-regime
+        rows (live audit: 182/576 ≈32% of bull bucket rows are unknown).
+        After the fix an explicit regime_label="unknown" is dropped from
+        every regime bucket — bull_n excludes them. The aggregate still
+        counts them (they're real OOS observations, just unbucketed)."""
+        scorer = self._scorer_returning([1.0, -1.0, 0.5])
+        records = [
+            # Genuine bull (regime_label='bull' + mult=1.0) → bull bucket
+            {"forward_return_5d": 2.0, "action": "BUY", "ticker": "NVDA",
+             "regime_mult": 1.0, "regime_label": "bull"},
+            # Unknown (mult=1.0 but label='unknown') → MUST be excluded
+            {"forward_return_5d": -1.5, "action": "BUY", "ticker": "AMD",
+             "regime_mult": 1.0, "regime_label": "unknown"},
+            # Another bull → bull bucket
+            {"forward_return_5d": 1.0, "action": "BUY", "ticker": "MU",
+             "regime_mult": 1.0, "regime_label": "bull"},
+        ]
+        out = rcb._oos_rank_metrics(scorer, records)
+        # Aggregate counts ALL three (they are real observations).
+        assert out["n"] == 3
+        # Bull bucket: only the two with explicit regime_label='bull'.
+        assert out["regime_bull_n"] == 2
+        # Unknown row contributed to neither sideways nor bear either.
+        assert out["regime_sideways_n"] == 0
+        assert out["regime_bear_n"] == 0
+
+    def test_regime_label_overrides_mult_when_present(self):
+        """When `regime_label` and `regime_mult` disagree (a malformed row
+        or future encoding change), the explicit label wins. Locks the
+        precedence rule the fix establishes."""
+        scorer = self._scorer_returning([1.0, -1.0])
+        records = [
+            # Contradiction: mult=1.0 (would decode to "bull") but label says "bear".
+            # Label must win — row goes to bear bucket, not bull.
+            {"forward_return_5d": 2.0, "action": "BUY", "ticker": "NVDA",
+             "regime_mult": 1.0, "regime_label": "bear"},
+            # mult=0.3 + label="bull" (the reverse contradiction) → bull bucket.
+            {"forward_return_5d": -1.0, "action": "BUY", "ticker": "AMD",
+             "regime_mult": 0.3, "regime_label": "bull"},
+        ]
+        out = rcb._oos_rank_metrics(scorer, records)
+        assert out["regime_bear_n"] == 1
+        assert out["regime_bull_n"] == 1
+        # The mult-decoded buckets would have been swapped — confirm the
+        # label-driven assignment differs from the mult-driven one.
+        assert out["regime_sideways_n"] == 0
+
+    def test_regime_label_absent_falls_back_to_mult_decode(self):
+        """Legacy rows (pre-2026-05-19, before `regime_label` was added)
+        carry no label field — they MUST keep their mult-based bucket
+        assignment so the historical corpus (~7400 rows live) is not
+        retroactively re-bucketed (which would destabilize the trend the
+        skill ledger surfaces)."""
+        scorer = self._scorer_returning([1.0, -1.0, 0.5])
+        records = [
+            # No regime_label key — fall back to mult=1.0 → bull
+            {"forward_return_5d": 2.0, "action": "BUY", "ticker": "NVDA",
+             "regime_mult": 1.0},
+            # No label — mult=0.6 → sideways
+            {"forward_return_5d": -1.5, "action": "BUY", "ticker": "AMD",
+             "regime_mult": 0.6},
+            # No label — mult=0.3 → bear
+            {"forward_return_5d": 1.0, "action": "BUY", "ticker": "MU",
+             "regime_mult": 0.3},
+        ]
+        out = rcb._oos_rank_metrics(scorer, records)
+        assert out["regime_bull_n"] == 1
+        assert out["regime_sideways_n"] == 1
+        assert out["regime_bear_n"] == 1
+
 
 # ──────────────────── _oos_multi_horizon_metrics direct ────────────
 
