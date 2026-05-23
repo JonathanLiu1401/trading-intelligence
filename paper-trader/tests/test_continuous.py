@@ -1185,6 +1185,70 @@ class TestOosRankMetrics:
         assert out["regime_sideways_n"] == 1
         assert out["regime_bear_n"] == 1
 
+    def test_failed_predict_with_meta_rows_dropped_not_tied_at_zero(self):
+        """The honesty fix: when a real DecisionScorer's predict_with_meta
+        reports ``failed=True`` (model raised internally / non-finite output),
+        the row's ``pred=0.0`` is a fallback sentinel — including it in the
+        rank-IC computation ties the row at zero, fabricating concordance
+        with every other row whose realized actual is also near zero. The
+        OOS metric must drop such rows.
+
+        This was a silent contamination bug: the scalar ``predict()`` path
+        returns the same 0.0 with no flag, so before this fix every failed
+        prediction silently biased ``oos_buy_ic`` toward zero (the
+        ``_predict_err_logged`` discipline already swallows the warning
+        after the first log, so the bug was observable only as a quiet
+        metric drift, never as a crash).
+        """
+        class _MetaScorer:
+            is_trained = True
+
+            def __init__(self):
+                self.calls = 0
+
+            def predict_with_meta(self, **_kw):
+                self.calls += 1
+                # First and third succeed; second one "fails" inside the
+                # real scorer (exception path) — predict_with_meta returns
+                # pred=0.0 but flags failed=True.
+                if self.calls == 2:
+                    return {"pred": 0.0, "raw": 0.0, "clamped": True,
+                            "off_distribution": True, "percentile": None,
+                            "calibrated": None, "failed": True}
+                return {"pred": 0.5 if self.calls == 1 else -0.5,
+                        "raw": 0.5 if self.calls == 1 else -0.5,
+                        "clamped": False, "off_distribution": False,
+                        "percentile": None, "calibrated": None,
+                        "failed": False}
+
+            # The scalar fallback should NEVER be hit when predict_with_meta
+            # is callable on the scorer — assert that here so a regression
+            # back to predict() is detected by this test.
+            def predict(self, **_kw):
+                raise AssertionError("legacy predict() must not be called "
+                                     "when predict_with_meta is available")
+
+        records = [
+            {"forward_return_5d": 1.0, "action": "BUY", "ticker": "NVDA"},
+            # The middle row "fails" inside predict_with_meta — must be
+            # dropped, not tied at zero against the realized 2.0 actual.
+            {"forward_return_5d": 2.0, "action": "BUY", "ticker": "AMD"},
+            {"forward_return_5d": -1.0, "action": "BUY", "ticker": "MU"},
+        ]
+        out = rcb._oos_rank_metrics(_MetaScorer(), records)
+        # Only 2 of 3 records contribute — the failed middle row is dropped.
+        assert out["n"] == 2
+        # Both surviving pairs are concordant (+,+; -,-) so rank-IC must
+        # be +1.0. Critically — had the failed row been tied at zero, the
+        # rank-IC would have been pulled toward ~0.50 (three preds [0.5, 0,
+        # -0.5] vs actuals [1, 2, -1]: spearman much weaker than 1.0).
+        assert out["rank_ic"] == pytest.approx(1.0)
+        # And dir_acc — concordance of signs — would also be diluted
+        # (the failed row at p=0 carries no sign, so it would be excluded
+        # from dir_acc by the existing `p != 0.0 and a != 0.0` guard, but
+        # only after silently inflating the n_total / rank space).
+        assert out["dir_acc"] == pytest.approx(1.0)
+
 
 # ──────────────────── _oos_multi_horizon_metrics direct ────────────
 

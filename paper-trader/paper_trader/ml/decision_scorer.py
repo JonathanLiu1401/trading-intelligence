@@ -364,13 +364,21 @@ class DecisionScorer:
         """Predicted 5d forward return (%) plus calibration metadata.
 
         Returns ``{"pred", "raw", "clamped", "off_distribution",
-        "percentile", "calibrated"}``:
+        "percentile", "calibrated", "failed"}``:
         - ``pred``  — the value callers should act on (clamped, always finite)
         - ``raw``   — the model's unbounded output (for diagnostics / honesty)
         - ``clamped`` — True when ``|raw| > PRED_CLAMP_PCT`` (or non-finite)
-        - ``off_distribution`` — alias of ``clamped``; a True here means the
-          model extrapolated past the empirical label support and the point
-          estimate should be treated as low-trust, not gospel.
+        - ``off_distribution`` — True when the prediction is low-trust, either
+          because the model extrapolated past the empirical label support OR
+          the prediction could not be computed at all. ``off_distribution=True``
+          means "do not treat ``pred`` as gospel"; the ``failed`` flag below
+          tells you WHICH side of that bucket the row landed in.
+        - ``failed`` — True only when the prediction could not be produced
+          (untrained model, predict raised, raw was non-finite). False on any
+          successful prediction, including off-distribution clamps. The OOS
+          rank-IC computations consume this to drop fabricated 0.0 fallbacks
+          (they would otherwise dilute the rank metric with tied zeros) WITHOUT
+          dropping legitimately extreme but trustworthy clamped predictions.
         - ``percentile`` — where ``raw`` falls (0..100) within the training
           set's own prediction distribution, or None for legacy pickles that
           carry no quantile table. The OOS calibration verdict is
@@ -394,7 +402,7 @@ class DecisionScorer:
         if not self._trained or self._model is None:
             return {"pred": 0.0, "raw": 0.0, "clamped": False,
                     "off_distribution": False, "percentile": None,
-                    "calibrated": None}
+                    "calibrated": None, "failed": True}
         try:
             X = np.array(
                 [build_features(ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
@@ -418,25 +426,36 @@ class DecisionScorer:
             # result. Flag it low-trust like the non-finite branch does, so
             # honesty panels (/api/scorer-predictions, the conviction board)
             # never render a broken scorer's safe-fallback 0.0 as a confident
-            # in-distribution call. predict()'s scalar contract is unchanged
-            # (still 0.0); only the meta trust flags move.
+            # in-distribution call. ``failed=True`` is the specific signal OOS
+            # rank-metric consumers need: a fabricated 0.0 here is NOT a real
+            # prediction (the scalar predict() path returns that same 0.0 with
+            # no flag, so without ``failed`` the OOS rank-IC would tie every
+            # exception row at zero — fake concordance that biases the metric).
+            # predict()'s scalar contract is unchanged (still 0.0).
             return {"pred": 0.0, "raw": 0.0, "clamped": True,
                     "off_distribution": True, "percentile": None,
-                    "calibrated": None}
+                    "calibrated": None, "failed": True}
 
         # A non-finite model output (inf/nan from a pathological feature
         # vector) is unusable — treat it as a 0% / off-distribution result
-        # rather than letting nan propagate silently through max/min.
+        # rather than letting nan propagate silently through max/min. Same
+        # ``failed=True`` discipline as the exception branch above: the 0.0
+        # fallback is NOT a real prediction; flag it so OOS rank-IC consumers
+        # drop the row rather than tying it at zero.
         if not np.isfinite(raw):
             return {"pred": 0.0, "raw": raw, "clamped": True,
                     "off_distribution": True, "percentile": None,
-                    "calibrated": None}
+                    "calibrated": None, "failed": True}
         clamped_pred = max(-PRED_CLAMP_PCT, min(PRED_CLAMP_PCT, raw))
         was_clamped = abs(raw) > PRED_CLAMP_PCT
+        # A legitimate clamped prediction (raw exceeded ±50 but was a real,
+        # finite model output) is low-trust on MAGNITUDE but still has a
+        # trustworthy rank — `failed=False` so OOS rank-IC retains it.
         return {"pred": clamped_pred, "raw": raw, "clamped": was_clamped,
                 "off_distribution": was_clamped,
                 "percentile": self._raw_to_percentile(raw),
-                "calibrated": self._raw_to_calibrated(raw)}
+                "calibrated": self._raw_to_calibrated(raw),
+                "failed": False}
 
     def predict(
         self,

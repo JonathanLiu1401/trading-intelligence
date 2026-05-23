@@ -867,19 +867,48 @@ def _oos_multi_horizon_metrics(scorer, oos_records: list[dict],
         # with the realized-window choice). Bucket realizations per horizon.
         per_horizon_preds: dict[int, list[float]] = {h: [] for h in horizons}
         per_horizon_acts: dict[int, list[float]] = {h: [] for h in horizons}
+        # Prefer predict_with_meta so we can drop rows whose prediction COULD
+        # NOT BE PRODUCED (exception path / non-finite output). The scalar
+        # ``predict()`` returns 0.0 silently in both cases, which would
+        # otherwise tie every failed-prediction row at zero — fake rank
+        # concordance that biases the metric (rare in production but the
+        # `_predict_err_logged` discipline already silences after the first
+        # log, so the bug is observable as a quiet drift, not a crash).
+        # Test fakes / Dummy stubs without predict_with_meta fall back to the
+        # legacy predict() path so existing tests continue to work unchanged.
+        _pwm_h = getattr(scorer, "predict_with_meta", None)
+        _use_meta_h = callable(_pwm_h)
         for r in oos_records:
             try:
-                p = scorer.predict(
-                    ml_score=_to_float(r.get("ml_score"), 0.0),
-                    rsi=r.get("rsi"), macd=r.get("macd"),
-                    mom5=r.get("mom5"), mom20=r.get("mom20"),
-                    regime_mult=_to_float(r.get("regime_mult"), 1.0),
-                    ticker=str(r.get("ticker") or ""),
-                    vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
-                    news_urgency=r.get("news_urgency"),
-                    news_article_count=r.get("news_article_count"),
-                )
-                p = float(p)
+                if _use_meta_h:
+                    _meta = _pwm_h(
+                        ml_score=_to_float(r.get("ml_score"), 0.0),
+                        rsi=r.get("rsi"), macd=r.get("macd"),
+                        mom5=r.get("mom5"), mom20=r.get("mom20"),
+                        regime_mult=_to_float(r.get("regime_mult"), 1.0),
+                        ticker=str(r.get("ticker") or ""),
+                        vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
+                        news_urgency=r.get("news_urgency"),
+                        news_article_count=r.get("news_article_count"),
+                    )
+                    # `failed=True` ⇒ the 0.0 in `pred` is a sentinel, not a
+                    # real prediction; drop the row from EVERY horizon so it
+                    # cannot contaminate any rank-IC computation.
+                    if _meta.get("failed"):
+                        continue
+                    p = float(_meta.get("pred", 0.0))
+                else:
+                    p = scorer.predict(
+                        ml_score=_to_float(r.get("ml_score"), 0.0),
+                        rsi=r.get("rsi"), macd=r.get("macd"),
+                        mom5=r.get("mom5"), mom20=r.get("mom20"),
+                        regime_mult=_to_float(r.get("regime_mult"), 1.0),
+                        ticker=str(r.get("ticker") or ""),
+                        vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
+                        news_urgency=r.get("news_urgency"),
+                        news_article_count=r.get("news_article_count"),
+                    )
+                    p = float(p)
                 if p != p:  # NaN — defensive; predict_with_meta caller would
                     continue  # neutralize but pure predict() is unguarded
                 is_sell = str(r.get("action") or "BUY").upper() == "SELL"
@@ -1011,18 +1040,47 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
             "bull": [], "sideways": [], "bear": []}
         regime_acts: dict[str, list[float]] = {
             "bull": [], "sideways": [], "bear": []}
+        # Prefer predict_with_meta to drop rows whose prediction COULD NOT BE
+        # PRODUCED (exception path / non-finite output) — see the matching
+        # comment in `_oos_multi_horizon_metrics` above for the full rationale.
+        # The scalar ``predict()`` returns 0.0 silently on both failure paths,
+        # which would otherwise contribute fake rank ties at zero (the
+        # `_predict_err_logged` discipline silences the warning after the first
+        # log, so the bug is observable as quiet metric drift, not a crash).
+        # Test fakes / Dummy stubs without predict_with_meta fall back to the
+        # legacy predict() path so existing tests continue to work unchanged.
+        _pwm = getattr(scorer, "predict_with_meta", None)
+        _use_meta = callable(_pwm)
         for r in oos_records:
             try:
-                p = scorer.predict(
-                    ml_score=_to_float(r.get("ml_score"), 0.0),
-                    rsi=r.get("rsi"), macd=r.get("macd"),
-                    mom5=r.get("mom5"), mom20=r.get("mom20"),
-                    regime_mult=_to_float(r.get("regime_mult"), 1.0),
-                    ticker=str(r.get("ticker") or ""),
-                    vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
-                    news_urgency=r.get("news_urgency"),
-                    news_article_count=r.get("news_article_count"),
-                )
+                if _use_meta:
+                    _meta = _pwm(
+                        ml_score=_to_float(r.get("ml_score"), 0.0),
+                        rsi=r.get("rsi"), macd=r.get("macd"),
+                        mom5=r.get("mom5"), mom20=r.get("mom20"),
+                        regime_mult=_to_float(r.get("regime_mult"), 1.0),
+                        ticker=str(r.get("ticker") or ""),
+                        vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
+                        news_urgency=r.get("news_urgency"),
+                        news_article_count=r.get("news_article_count"),
+                    )
+                    # `failed=True` ⇒ the 0.0 in `pred` is a sentinel, not a
+                    # real prediction; drop the row from EVERY bucket (aggregate,
+                    # buy/sell, regime) so it cannot contaminate any rank-IC.
+                    if _meta.get("failed"):
+                        continue
+                    p = float(_meta.get("pred", 0.0))
+                else:
+                    p = scorer.predict(
+                        ml_score=_to_float(r.get("ml_score"), 0.0),
+                        rsi=r.get("rsi"), macd=r.get("macd"),
+                        mom5=r.get("mom5"), mom20=r.get("mom20"),
+                        regime_mult=_to_float(r.get("regime_mult"), 1.0),
+                        ticker=str(r.get("ticker") or ""),
+                        vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
+                        news_urgency=r.get("news_urgency"),
+                        news_article_count=r.get("news_article_count"),
+                    )
                 # NaN sentinel default so a missing/non-finite forward return
                 # is *dropped* by the `a == a` guard below, not silently
                 # coerced to 0.0 (which would poison rank_ic with fabricated

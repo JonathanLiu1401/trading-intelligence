@@ -5,6 +5,154 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-23 hybrid pass #3 (Agent 3) — live `_BOOK_TICKERS` union (GOOG / COHR / NVDL)
+
+**Phase 1 (fix).** `bugs_fixed=0`. Read AGENTS.md head, daemon.py top
+(workers + supervisor + heartbeat path), storage/article_store.py (full —
+`_LIVE_ONLY_CLAUSE`, `update_*_batch` MAX(urgency,?) state machine,
+`reap_stale_urgent`, all `score_source` enforcement points),
+watchers/urgency_scorer.py (full — quote-widget + recap pre-filter, the
+sibling agent's in-progress portfolio-tickers change), ml/features.py
+(full — `LIVE_PORTFOLIO_TICKERS` SSOT load + `_DOMAIN_CRED` rescue tier),
+ml/model.py + ml/trainer.py (full — STRONG_LABEL_WHERE excludes
+`score_source='ml'`, label-weight exponent, MC-Dropout heads),
+ml/inference.py, collectors/web_scraper.py (full — 4 quote-widget
+fingerprints), analysis/claude_analyst.py spot reads (`_BOOK_TICKERS`,
+`_book_heat_lines`, `_format_portfolio_coverage` callsite at 2966).
+Baseline `tests/test_urgency_portfolio_prompt.py + test_urgency_scorer +
+test_article_store + test_features + test_model + test_trainer` →
+**66/66 green**. The `MAX(urgency,?)` re-promote / reaper-demote
+oscillation noted in memory `di-stale-urgent-reaper-oscillation` does NOT
+recur on the current code path (the reaper only touches rows whose
+ai_score/ml_score are already set, so `get_unscored` can never re-fetch
+them — verified by reading the SELECT filters and re-checking the
+`update_*_batch` write set).
+
+No clean Phase 1 bug found worth touching the code for (the load-bearing
+defences are intact: `_LIVE_ONLY_CLAUSE` applied in every live SELECT and
+strong-label-write path; `update_ml_scores_batch` uses
+`COALESCE(score_source, 'ml')` so 'llm' / 'briefing_boost' is never
+downgraded; `score_source='ml'` is *excluded* from
+`_fetch_training_data`'s STRONG_LABEL_WHERE, so the feedback loop is
+closed). Per the per-commit guard: no Phase 1 commit.
+
+**Phase 2 (feature) — committed.** `features_added=1`. Closes the
+`_BOOK_TICKERS` drift class flagged by memory `di-portfolio-ticker-drift`:
+features.py was already SSOT-ified, the sibling agent fixed the urgency
+SCORE_PROMPT, and the price-alert universe already used the union — but
+two analyst-visible paths were still reading the **static literal**:
+
+  - `claude_analyst._BOOK_TICKERS` / `_BOOK_RE` powering the per-row
+    `[BOOK: ...]` newswire tag the Opus briefing prioritises around AND
+    `_book_heat_lines` (the "MU — 6 distinct stories" concentration
+    block).
+  - `daemon._format_portfolio_coverage(source_articles)` (the Discord
+    "📊 Book in digest" coverage line) called with the default static
+    tuple at the heartbeat callsite.
+
+Live 2026-05-23 read: `config/portfolio.json` holds **GOOG / COHR / NVDL**
+as open positions and **LRCX / AMAT / KLAC / AMD / WDC / STX / SMH / SOXX**
+on the watchlist — all silent in the static `_BOOK_TICKERS` tuple. Last 5h
+digest had AMD=24 / KLAC=9 / AMAT=5 / STX=5 / WDC=4 / COHR=2 / LRCX=2 /
+NVDL=1 / SMH=2 / SOXX=2 mentions, **none of which got the [BOOK:] tag**.
+For the analyst persona whose system this is, GOOG / COHR / NVDL news is
+exactly the "events affecting MY positions" class — silently missing the
+book signal is the highest-impact known drift.
+
+The fix:
+
+  - `analysis/claude_analyst.py`: added `_BOOK_UNIVERSE` = the union of
+    static `_BOOK_TICKERS` (preserved in canonical order — anti-drift
+    parity with `daemon.PORTFOLIO_TICKERS` still pinned by
+    `test_briefing_book_tag.py`) and live-only tickers from
+    `ml.features.LIVE_PORTFOLIO_TICKERS` (sorted alphabetically at the
+    tail for deterministic ordering). `_BOOK_RE` now scans the universe.
+    `_book_tickers()` returns canonical-order results over the universe
+    so the per-row `[BOOK:]` tag picks up live additions. `_book_heat_lines`
+    ranks over the universe so a live-only ticker concentration is
+    surfaced (and gets a deterministic tie-break position, not the
+    `len(rank)` fallback).
+  - `daemon.py`: the heartbeat callsite at line 2966 now passes
+    `tickers=_price_alert_universe()` to `_format_portfolio_coverage`
+    instead of relying on the static default — same SSOT helper price
+    alerts already use, no new helper introduced.
+
+The function default in `_format_portfolio_coverage` is **unchanged**
+(stays as static `PORTFOLIO_TICKERS` for the unit-test fixture path —
+`test_default_tickers_is_the_live_portfolio` keeps passing byte-for-byte
+without weakening it). The static `_BOOK_TICKERS` and
+`daemon.PORTFOLIO_TICKERS` literals are byte-identical to before — the
+existing parity test stays green. Live behaviour ONLY at the heartbeat
+callsite and the universe-scoped scanners.
+
+All four load-bearing invariants preserved (no DB write, no ai_score /
+ml_score / score_source / urgency mutation; backtest:// / `backtest_` /
+`opus_annotation*` exclusion via `_LIVE_ONLY_CLAUSE` is upstream of these
+read-only helpers and untouched).
+
+New regression test file `tests/test_book_universe_live.py` (11 tests)
+pins:
+- `_BOOK_TICKERS` parity with `daemon.PORTFOLIO_TICKERS` preserved.
+- `_BOOK_UNIVERSE` contains every live portfolio ticker, static core
+  remains the canonical prefix, tail is deterministic alphabetical.
+- `_BOOK_RE` matches a live-only ticker; `_book_tickers()` returns it.
+- Static-first canonical order preserved when a static ticker and a
+  live-only ticker both appear.
+- `_book_heat_lines` registers heat for a live-only ticker at the
+  3-distinct-story threshold.
+- `daemon._format_portfolio_coverage(..., tickers=_price_alert_universe())`
+  surfaces live additions in the "Book in digest:" head, not the silent
+  tail.
+- `_price_alert_universe()` is the canonical SSOT helper the heartbeat
+  uses (superset of static `PORTFOLIO_TICKERS` AND
+  `LIVE_PORTFOLIO_TICKERS`).
+
+Targeted regression (`tests/ -k "book or briefing or coverage or alert or
+feature or model or trainer or store or urgency"`): **1188 passed, 0
+failed in 129s**. Focused book/briefing slice: **205 passed in 6s**.
+
+**Phase 3 (live validation).** `user_findings=4`. Read `articles.db` and
+`logs/daemon.log` + `logs/supervisor_state.json` directly:
+
+1. **Live `_BOOK_TICKERS` drift confirmed** — GOOG / COHR / NVDL held in
+   `config/portfolio.json` positions, plus 8 sector_watchlist additions
+   (LRCX / AMAT / KLAC / AMD / WDC / STX / SMH / SOXX). Last 5h: AMD had
+   24 digest mentions, KLAC 9, AMAT 5 — *none* `[BOOK:]`-tagged before
+   this pass. This is the Phase 2 fix; will take effect on next daemon
+   restart (long-running manual process per memory
+   `di-stale-manual-daemon`).
+2. **Chronic dark collectors persist** — `sec_edgar`, `polygon`,
+   `newsapi`, `nitter`, **`finnhub`** all at **0 articles in last 6h**.
+   `finnhub` is a new addition to the dark set (was moderate-volume
+   historically); the others all match standing memory note
+   `di-chronic-dark-collectors`. Workers are alive in
+   `supervisor_state.json` (last_ok pings recent — alphavantage=734s,
+   newsapi=1592s, sec_edgar=318s, polygon=240s, nitter=318s, finnhub=
+   318s) — "alive but mute". External API gap, not a fresh bug.
+3. **ML head dominates urgent alerts** — every one of the 8 most-recent
+   `urgency=2` rows in the last 24h carries `score_source='ml'`, `ai_score
+   = 0.0`. The Sonnet `urgency_scorer` is producing zero ground-truth
+   urgent labels right now — combined with the existing 99% synthetic
+   strong-label-pool finding (memory `di-training-pool-synthetic-skew`),
+   the model is essentially training on its own + backtest synthetic
+   distributions. Calibration risk that the briefing's
+   `_format_label_calibration` line already surfaces — keep watching.
+4. **DB-lock contention warnings persist** — recent log shows
+   `[article_store] stats: transient DB error 'another row available'`
+   retries plus `[dxy_worker] error: database is locked; backing off 240s`.
+   Matches standing memory `di-insert-batch-lock-contention`. Self-
+   recovers via the `@_retry_on_lock` decorator + worker back-off; not a
+   regression.
+
+Briefing quality (latest at 09:33 UTC, 50 articles, 3270 chars): high.
+LEAD names NVDA earnings aftermath ($80B buyback + 25-fold dividend + new
+Vera CPU revenue stream + Trump-tariff overhang), MACRO block has indices /
+yields / BTC / gold / oil, PORTFOLIO block has per-ticker P&L with story
+counts and option chains. The analyst persona's "Bloomberg-style breaking
++ 5h briefing" experience is intact and useful.
+
+---
+
 ## 2026-05-23 hybrid pass #2 (Agent 3) — `heres_what_happened` recap fingerprint
 
 **Phase 1 (fix) — `75c632d` (digital-intern slice).** Read AGENTS.md head,
