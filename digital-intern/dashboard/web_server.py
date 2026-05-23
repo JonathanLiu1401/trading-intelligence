@@ -1164,6 +1164,53 @@ def _watchlist_news_silence_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _concurrent_opus_attribution_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/concurrent-opus-attribution` (per-parent-
+    tree breakdown of concurrent ``claude --model claude-opus`` subprocesses
+    saturating the host) as compact chat-context lines.
+
+    Why this block exists. The chat already carries the host-saturation
+    *count* (via `/api/host-guard` surfaced indirectly through
+    runner-heartbeat headlines) but no chat block answers the operator's
+    next question: WHICH parent tree owns the rogue Opus, and which
+    targeted-kill command will restore the live runner's decision call?
+    The 2026-05-23 17:47 paralysis (>55h frozen, 17 concurrent Opus all
+    rooted in `scripts/hourly_review.sh`) made the gap explicit — every
+    existing block describes the *consequence* (NO_DECISION storm,
+    decision drought, alpha drift) and none names the rogue parent.
+
+    SSOT (paper-trader invariant #10): the builder's own `headline` is
+    the chat headline verbatim, and the `recommendation` string passes
+    through unchanged. Detail line restates the dominant-culprit's own
+    fields (n_opus, kill_command) — no chat-side re-derived verdict.
+
+    Pure / total — exactly the ``_decision_paralysis_chat_lines`` contract:
+
+    - non-dict → ``[]``
+    - non-actionable verdicts (``NO_OPUS`` / ``CLEAN`` / ``BENIGN``) → ``[]``.
+      Healthy or within host_guard's own threshold — never chat filler.
+    - ``ELEVATED`` / ``SATURATED`` → builder's verbatim ``headline`` + one
+      detail line restating the builder's own `recommendation`. SATURATED
+      is the operator-critical case the >55h paralysis exposed.
+    """
+    if not isinstance(rep, dict):
+        return []
+    actionable = {"ELEVATED", "SATURATED"}
+    if rep.get("verdict") not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)              # verbatim SSOT — invariant #10
+
+    recommendation = rep.get("recommendation")
+    if isinstance(recommendation, str) and recommendation.strip():
+        lines.append("  " + recommendation)  # verbatim restatement
+
+    return lines
+
+
 def _cash_redeployment_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/cash-redeployment-latency-skill` (post-SELL
     cash-to-next-BUY latency distribution; the sold-then-sat pathology) as
@@ -5305,6 +5352,30 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: watchlist-news-silence fetch failed: %s", e)
 
+        # Concurrent-Opus attribution — the host-saturation parent-tree
+        # breakdown. /api/host-guard reports the COUNT of concurrent Opus
+        # but not WHICH parent trees own them. Without that the operator
+        # either kills indiscriminately (also nukes the legitimate runner
+        # Opus) or waits hours for the storm to clear. Fires ONLY on
+        # ELEVATED / SATURATED (NO_OPUS / CLEAN / BENIGN collapse to
+        # silence — the silence precedent, never chat filler when the
+        # host is within host_guard's own threshold). Headline +
+        # recommendation carry verbatim from the trader endpoint —
+        # restate, never re-derive. Only appears once :8090 restarts onto
+        # /api/concurrent-opus-attribution.
+        concurrent_opus_attribution_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/concurrent-opus-attribution",
+                    timeout=3) as resp:
+                _coa = json.loads(resp.read().decode("utf-8"))
+            concurrent_opus_attribution_block = "\n".join(
+                _concurrent_opus_attribution_chat_lines(_coa))
+        except Exception as e:
+            _logger().warning(
+                "chat: concurrent-opus-attribution fetch failed: %s", e)
+
         # Post-SELL cash-redeployment latency — the sold-then-sat pathology.
         # /api/risk reports cash_pct as a *snapshot*, but a book that sells
         # into a thesis weakening then sits for 5 days has the same headline
@@ -5731,6 +5802,7 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — PERSONA-BOOK FIT (does the live book's weight distribution mirror a backtest-persona rated DRAG by the persona-leaderboard? Every other block analyses position-by-position fitness; none surface the whole-book archetype-overlap angle. A book that mirrors a known underperforming persona is structurally adding variance, not alpha, regardless of how reasonable each individual trade looked at entry. Surfaced ONLY when ALIGNED_DRAG, never filler when ALIGNED_EDGE / ALIGNED_FLAT / NO_BOOK / WEAK_OVERLAP / INSUFFICIENT_PERSONA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{persona_book_fit_block}\n\n" if persona_book_fit_block else "")
             + (f"PAPER TRADER — INVERSE-PAIR CONFLICT (leveraged-long + leveraged-inverse ETFs of the same underlying family simultaneously held — TQQQ+SQQQ, SOXL+SOXS, SPXL+SPXS, FNGU+FNGD, TECL+TECS. Directional exposure largely cancels but both sleeves keep paying leverage decay every single day. etf-lookthrough reports the net single-name outcome but not the carry-waste fact; correlation-cluster-warning flags positively-correlated clusters and lets the negatively-correlated pair through; regime-leverage-fit reads 'high leveraged %' without distinguishing a paired book from a clean one-sided bet. Surfaced ONLY when CARRY_WASTE, never filler when CLEAN / NO_BOOK / OPPOSING_UNLEVERED. Headline + worst-family fields carry verbatim from the trader endpoint — restate, never re-derive):\n{inverse_pair_conflict_block}\n\n" if inverse_pair_conflict_block else "")
             + (f"PAPER TRADER — WATCHLIST NEWS SILENCE (per-WATCHLIST-ticker live-news coverage map. Of the ~47 tickers Opus is allowed to consider this cycle, how many had ZERO live articles in the last 24h, and which are mention-storming? Complements held-news-silence by surfacing the UNIVERSE blind spot every other panel ignores — a silent name in the prompt looks operationally equivalent to a well-covered one and Opus has no way to know whether silence means 'nothing happened' or 'the collector failed'. Surfaced ONLY when BLIND_UNIVERSE / SPARSE_COVERAGE, never filler when WELL_COVERED / NO_DATA. Headline + silent / hot lists carry verbatim from the trader endpoint — restate, never re-derive):\n{watchlist_news_silence_block}\n\n" if watchlist_news_silence_block else "")
+            + (f"PAPER TRADER — CONCURRENT-OPUS ATTRIBUTION (per-parent-tree breakdown of concurrent ``claude --model claude-opus`` subprocesses on the box — /api/host-guard reports the count but not WHICH parent trees own them, so killing safely requires either inspecting every PID or blanket ``pkill -9 claude`` which also nukes the legitimate live runner Opus. This block names the rogue parent (hourly_review.sh / continuous backtest / runner / digital-intern daemon / unknown) and prescribes the exact targeted-kill command. Surfaced ONLY when ELEVATED / SATURATED, never filler when NO_OPUS / CLEAN / BENIGN. Headline and recommendation carry verbatim from the trader endpoint — restate, never re-derive):\n{concurrent_opus_attribution_block}\n\n" if concurrent_opus_attribution_block else "")
             + (f"PAPER TRADER — CASH REDEPLOYMENT LATENCY (post-SELL cash-to-next-BUY interval distribution — the sold-then-sat pathology. A book that sells then sits for 5 days has the same headline cash% as one that redeploys in 6h, but the desk in question is materially different. Surfaced ONLY when SLOW / STALLED, never filler when FAST_REDEPLOY / STEADY. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{cash_redeployment_block}\n\n" if cash_redeployment_block else "")
             + (f"PAPER TRADER — DECISION VAPOR (per-FILLED-decision structural-quality detector — does the reasoning cite specific numbers + catalysts + tickers, or is Opus writing generic 'strong setup, building position' vapor? A vapor trade that fails has nothing for the next decision to learn from — this is the only block that answers 'is the bot thinking, or rationalising?'. Surfaced ONLY when MIXED / VAPOR_DECISIONS, never filler when SPECIFIC. Headline + any VAPOR sample excerpt carry verbatim from the trader endpoint — restate, never re-derive):\n{decision_vapor_block}\n\n" if decision_vapor_block else "")
             + (f"PAPER TRADER — REGIME-LEVERAGE FIT (book-leverage alignment vs prevailing SPY momentum regime. The watchlist is leveraged-ETF-heavy — the structural question 'are we positioned with or against the regime?' is high-stakes and answered nowhere else in chat. A 0% leveraged book during a bull tape is just as structurally wrong as a 40% leveraged book during a bear. Surfaced ONLY when BLIND_LEVERING / DANGEROUS_HEADWIND / MISSED_TAILWIND, never filler when ALIGNED / DEFENSIVE / NEUTRAL. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{regime_leverage_fit_block}\n\n" if regime_leverage_fit_block else "")

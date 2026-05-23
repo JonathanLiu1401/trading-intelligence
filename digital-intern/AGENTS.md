@@ -5,6 +5,52 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-23 feature pass (Agent 4 / feature-dev) — chat enrichment for concurrent-opus-attribution
+
+Wires paper-trader's new `/api/concurrent-opus-attribution` into the
+analyst chat following the established pure-helper SSOT pattern
+(cf. `_inverse_pair_conflict_chat_lines`,
+`_decision_paralysis_chat_lines`).
+
+`_concurrent_opus_attribution_chat_lines` renders the per-parent-tree
+breakdown of concurrent Opus subprocesses. The chat already carried the
+host-saturation *count* indirectly (runner-heartbeat IDLE_STORM, the
+NO_DECISION reasons block) but no chat block answered the operator's
+next question: WHICH parent tree owns the rogue Opus, and which
+targeted-kill command restores the live runner's decision call? The
+2026-05-23 17:47Z paralysis (>55h frozen, 17 Opus all rooted in
+`scripts/hourly_review.sh`) made the gap explicit — every existing
+chat block described the consequence (NO_DECISION, decision drought,
+alpha drift) and none named the rogue parent.
+
+Fires ONLY on ELEVATED / SATURATED; NO_OPUS / CLEAN / BENIGN collapse
+to silence (the `_decision_paralysis_chat_lines` silence precedent —
+never chat filler when host_guard's own threshold is not crossed).
+Builder's own `headline` + `recommendation` strings carry verbatim
+through the chat block — paper-trader invariant #10 SSOT, no chat-side
+re-derived verdict and no paraphrase of the exact `pkill -f …` kill
+command.
+
+Locked by `tests/test_chat_concurrent_opus_attribution_enrichment.py`
+(16 tests covering silence-on-non-actionable, ELEVATED+SATURATED
+rendering, kill-command verbatim survival, and the live 17-Opus
+footprint end-to-end). Broader chat-enrichment regression suite (532
+tests, including all the existing chat helpers) also passes — no
+neighbour breakage.
+
+**Live validation.** Sub-fetch against the live paper-trader endpoint
+returned SATURATED — 17 Opus all from `scripts/hourly_review.sh`. The
+chat block now surfaces `pkill -f scripts/hourly_review.sh` directly
+to the analyst — the missing targeted-action surface every other
+host-saturation block lacked.
+
+**Counters:** `bugs_fixed=0`, `features_added=1`
+(`_concurrent_opus_attribution_chat_lines` + sub-fetch wiring +
+prompt block), `user_findings=1` (live SATURATED on the host with 17
+Opus rooted in hourly_review.sh).
+
+---
+
 ## 2026-05-23 feature pass (Agent 4) — chat enrichment for inverse-pair-conflict + watchlist-news-silence
 
 Wires two new paper-trader analytics into the analyst chat following
