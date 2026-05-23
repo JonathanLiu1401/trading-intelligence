@@ -150,6 +150,23 @@ LLM_ANNOTATION_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 CALIBRATED_RELIABILITY_LOG = ROOT / "data" / "calibrated_reliability_log.jsonl"
 CALIBRATED_RELIABILITY_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 
+# Per-cycle conviction-sizing calibration ledger. ``conviction_calibration``
+# already answers, durably, the most economically decisive question about the
+# `_ml_decide` gate's sizing arm (×0.6 / ×0.85 / ×1.15 / ×1.3) on top of the
+# base conviction rule (min(0.25, ml_score/20) regular, min(0.40, ml_score/15)
+# leveraged-bull): *does the bot's higher-conviction (25–40% of book) call
+# realize higher 5-day return than its low-conviction probes?* The CLI verdict
+# on the current 1173-row OOS slice is ``MISCALIBRATED`` (spearman +0.011 —
+# sizing is variance with no compensating realized edge) but until this ledger
+# landed there was NO durable per-cycle trend so the most directly operational
+# question about the conviction sizing rule was invisible to an unattended
+# operator. Same testability rule as the sibling skill logs (module-level so
+# tests can redirect), same best-effort discipline (a ledger write must never
+# break the loop), same atomic tmp + ``.replace`` trim idiom every other
+# ledger uses.
+CONVICTION_CALIBRATION_LOG = ROOT / "data" / "conviction_calibration_log.jsonl"
+CONVICTION_CALIBRATION_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 EARLIEST_WINDOW_START = date(1993, 2, 1)  # SPY inception — ~30+ years of history
 WINDOW_END_BUFFER_DAYS = 180  # never end a window within 6 months of today
 MIN_WINDOW_YEARS = 1
@@ -1756,6 +1773,123 @@ def _append_calibrated_reliability_log(cycle: int, win_start: date,
         return False
 
 
+def _append_conviction_calibration_log(cycle: int, win_start: date,
+                                       win_end: date,
+                                       outcomes_path: "Path | str | None" = None
+                                       ) -> bool:
+    """Append one structured row to the per-cycle conviction-sizing
+    calibration ledger.
+
+    Answers, durably and per-cycle: *does the gate's then-applied
+    ``conviction_pct`` actually predict realized return, or is sizing
+    pure variance with no compensating edge?* Reuses
+    ``conviction_calibration.analyze`` verbatim so the persisted verdict
+    equals what the read-only CLI reports — a built-in no-drift
+    cross-check the sibling ``_append_baseline_skill_log`` /
+    ``_append_llm_annotation_skill_log`` / ``_append_calibrated_reliability_log``
+    pattern already establishes.
+
+    Why this matters: the existing skill ledgers trend the SCORER's rank
+    skill (does the model's prediction rank realized return?). The
+    gate's economic effect is a different question entirely — its sizing
+    rule scales bets from ~5% (low ml_score) to 25%-40% (leveraged ETF +
+    bull regime), so a tiny rank-IC bump cannot reveal whether THE BOT
+    REALLY MAKES MORE MONEY WHEN IT SIZES UP. ``conviction_calibration``
+    is the analyzer that DOES answer that — its current CLI verdict on
+    the live 1173-row OOS slice is ``MISCALIBRATED`` (spearman +0.011,
+    top-bottom realized spread -0.15pp) — but until this wiring landed
+    that was a one-shot CLI output, not a trendable per-cycle signal. A
+    skeptical quant needs to know the moment the sizing rule starts to
+    work (or stops working), not the moment they happen to remember to
+    run the CLI.
+
+    Best-effort and idempotent-safe: every fault is swallowed (a ledger
+    write must NEVER break the continuous loop — the
+    ``_append_scorer_skill_log`` discipline). On any fault we still emit
+    an honest row with ``status='error' verdict='INSUFFICIENT_DATA'`` so
+    a gap in the trend is visible, not silent. Bounded growth: when the
+    file exceeds 2× ``CONVICTION_CALIBRATION_LOG_KEEP`` it is atomically
+    rewritten via the decision_outcomes trim idiom (tmp + ``.replace`` so
+    a torn truncate cannot lose skill history).
+
+    The ``sizing_dark`` boolean mirrors the sibling ledgers' ``*_dark``
+    flag (``pipeline_dark`` / ``calibrated_dark``): True when zero BUY
+    rows carry a parseable ``conviction_pct`` (the documented state
+    before the 2026-05-21 ``_parse_conviction_pct`` feature shipped —
+    historical outcomes have no conviction field, so older corpora plus
+    the sub-gate cycles look ``sizing_dark`` honestly). False means the
+    analyzer actually had data to work with.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        try:
+            from paper_trader.ml import conviction_calibration as _cc
+            rep = _cc.analyze(outcomes_path)
+        except Exception as exc:
+            rep = {
+                "status": "error", "verdict": "INSUFFICIENT_DATA",
+                "hint": f"conviction_calibration unavailable: "
+                        f"{type(exc).__name__}",
+                "n": 0, "spearman": None,
+                "mean_conviction": None, "mean_realized": None,
+                "top_minus_bottom_realized_pct": None,
+                "monotone_fraction": None,
+                "n_dropped_action": None, "n_dropped_conviction": None,
+                "n_dropped_return": None,
+            }
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA"}
+
+        # ``sizing_dark`` is True when no BUY rows carried a parseable
+        # ``conviction_pct``. Historical outcome rows (cycles before the
+        # ``_parse_conviction_pct`` feature shipped) have no conviction
+        # field at all and surface here honestly. Once the corpus is
+        # dominated by post-feature rows the boolean flips on its own —
+        # no manual reset needed.
+        n_obs = int(rep.get("n") or 0)
+        sizing_dark = (n_obs == 0)
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": rep.get("verdict"),
+            "n": n_obs,
+            "spearman": rep.get("spearman"),
+            "mean_conviction": rep.get("mean_conviction"),
+            "mean_realized": rep.get("mean_realized"),
+            "top_minus_bottom_realized_pct":
+                rep.get("top_minus_bottom_realized_pct"),
+            "monotone_fraction": rep.get("monotone_fraction"),
+            "n_dropped_conviction": rep.get("n_dropped_conviction"),
+            "sizing_dark": sizing_dark,
+        }
+        CONVICTION_CALIBRATION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with CONVICTION_CALIBRATION_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in
+                     CONVICTION_CALIBRATION_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > CONVICTION_CALIBRATION_LOG_KEEP * 2:
+                kept = lines[-CONVICTION_CALIBRATION_LOG_KEEP:]
+                tmp = CONVICTION_CALIBRATION_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(CONVICTION_CALIBRATION_LOG)
+        except Exception as e:
+            print(f"[continuous] conviction-calibration-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] conviction-calibration-log append failed: {e}")
+        return False
+
+
 def _parse_published_date(published) -> date | None:
     """Parse a `published` value (ISO or RFC822) into a date; None if unparseable."""
     if not published:
@@ -2662,6 +2796,22 @@ def main() -> None:
         # the calibration step is a real improvement or cosmetic. Best-
         # effort by construction; never breaks the loop.
         _append_calibrated_reliability_log(cycle, win_start, win_end)
+
+        # Durable per-cycle conviction-sizing calibration ledger. The
+        # ``_ml_decide`` gate scales bets from ~5% (low ml_score) to
+        # 25–40% (leveraged-bull) and then ×0.6/×0.85/×1.15/×1.3 modulates
+        # on the deployed scorer's prediction (invariant #5). Whether that
+        # economic weight actually realizes higher 5d return is the most
+        # directly operational ML question — but until this wiring landed
+        # it was CLI-only, with no durable trend an unattended loop could
+        # surface. The current CLI verdict on the live 1173-row OOS slice
+        # is ``MISCALIBRATED`` (spearman +0.011 — sizing is variance with
+        # no compensating realized edge, the ``GATE_INEFFECTIVE`` shape).
+        # This row makes that state visible in the trend and surfaces the
+        # cycle-by-cycle ``top_minus_bottom_realized_pct`` so a quant can
+        # tell whether the sizing rule starts to work or stays flat. Best-
+        # effort by construction; never breaks the loop.
+        _append_conviction_calibration_log(cycle, win_start, win_end)
 
         ml_status = _try_train_ml() if winner else "no winner"
         print(f"[continuous] ml: {ml_status}")
