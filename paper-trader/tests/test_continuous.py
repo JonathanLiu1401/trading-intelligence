@@ -1586,6 +1586,60 @@ class TestParseScorerStatus:
         assert p["oos_sell_dir_acc"] is None
         assert p["oos_sell_ic"] is None
 
+    def test_parses_label_dropped_count(self):
+        """`n_label_dropped` token is parsed as int (the pass #16 wiring
+        surfaces the per-cycle count of training rows dropped due to
+        invalid/non-finite ``forward_return_5d``). A silent corruption
+        would otherwise shrink the training set without observable
+        signal — the cycle status still reads ``status=ok`` and the
+        skill ledger's ``train_n`` is the POST-drop count."""
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=708 "
+             "oos_rmse=12.40 oos_diracc=0.55 oos_ic=+0.03 "
+             "n_label_clamped=27 n_label_dropped=42")
+        p = rcb._parse_scorer_status(s)
+        assert p["status"] == "ok"
+        assert p["n_label_clamped"] == 27
+        assert p["n_label_dropped"] == 42      # int, not float
+
+    def test_label_dropped_zero_distinct_from_none(self):
+        """An EXPLICIT ``n_label_dropped=0`` (clean batch this cycle) MUST
+        parse as int 0, NOT as None — None means "the status string predates
+        the wiring", 0 means "the wiring is live and the batch was clean".
+        This distinction is load-bearing for the ledger's trend (a clean
+        cycle should NOT look like a legacy row)."""
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=708 "
+             "oos_rmse=12.40 oos_diracc=0.55 oos_ic=+0.03 "
+             "n_label_clamped=0 n_label_dropped=0")
+        p = rcb._parse_scorer_status(s)
+        assert p["n_label_dropped"] == 0
+        assert p["n_label_dropped"] is not None    # explicit 0 ≠ None
+
+    def test_legacy_status_without_label_dropped_parses_cleanly(self):
+        """Pre-feature status strings (cycles before pass #16) carry no
+        ``n_label_dropped=`` token; parser MUST default it to None so
+        historical skill-log rows still load (the multi-horizon /
+        label-clamp legacy-status discipline, applied here too)."""
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=708 "
+             "oos_rmse=12.40 oos_diracc=0.55 oos_ic=+0.03 "
+             "n_label_clamped=27")  # no dropped token
+        p = rcb._parse_scorer_status(s)
+        assert p["status"] == "ok"
+        assert p["n_label_clamped"] == 27
+        assert p["n_label_dropped"] is None
+
+    def test_label_dropped_substring_boundary(self):
+        """``oos_n`` parsing MUST NOT swallow values from ``n_label_dropped=``
+        (the substring-boundary discipline pinned for ``oos_buy_n`` etc.).
+        Without the ``(?:^|\\s)`` anchor, a string like
+        ``train_n=10 ... n_label_dropped=99`` could match
+        ``n=99`` for either ``train_n`` or ``oos_n``."""
+        s = ("scorer ok train_n=10 val_rmse=1.0 oos_n=5 "
+             "n_label_dropped=99")
+        p = rcb._parse_scorer_status(s)
+        assert p["train_n"] == 10   # NOT 99
+        assert p["oos_n"] == 5      # NOT 99
+        assert p["n_label_dropped"] == 99
+
 
 class TestAppendScorerSkillLog:
     def test_trained_row_has_accurate_gate_active_flag(self, tmp_path, monkeypatch):
