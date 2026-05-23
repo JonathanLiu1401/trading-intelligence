@@ -7607,6 +7607,88 @@ def position_blowup_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/trim-simulator")
+@swr_cached("trim_simulator", 45.0)
+def trim_simulator_api():
+    """Per-position trim ladder with scorer-EV math — the "how much should I
+    sell now" card. Builds on the (existing) ``/api/suggestion-impact``
+    single-rung 50% projection by adding three rungs (25/50/75% of qty by
+    default) PER held name and layering the DecisionScorer 5-day forward-
+    return prediction onto each rung as ``ev_avoided_loss_usd`` /
+    ``ev_forgone_upside_usd``. Surfaces the per-position verdict
+    (RECOMMEND_EXIT / RECOMMEND_TRIM / NEUTRAL / HOLD) synthesising scorer
+    pred sign+magnitude × current weight, and a recommended rung. Reuses
+    ``build_trim_simulator`` verbatim (SSOT, AGENTS.md #10 — the panel and
+    the ``-m paper_trader.analytics.trim_simulator`` CLI can never disagree).
+    Observational only — never gates Opus, adds no caps (AGENTS.md #2/#12).
+
+    Scorer predictions are sourced via the same ``/api/scorer-predictions``
+    in-process handler so the panel and the scorer card can never disagree;
+    if it fails or returns no preds the ladder still renders (per-position
+    scorer fields become ``None``, verdict falls back to weight-only triage).
+    """
+    try:
+        from .analytics.trim_simulator import build_trim_simulator
+        store = get_store()
+        pf = store.get_portfolio()
+        # Pull scorer predictions through the existing in-process handler.
+        # Calling the wrapper directly hits its own @swr_cached 60s, so the
+        # cost here is sub-millisecond after the first warm.
+        preds: list[dict] = []
+        try:
+            sp_resp = scorer_predictions_api()
+            sp_data = sp_resp.get_json() if hasattr(sp_resp, "get_json") else {}
+            if isinstance(sp_data, dict) and not sp_data.get("error"):
+                preds = list(sp_data.get("predictions") or [])
+        except Exception:
+            preds = []
+        result = build_trim_simulator(
+            store.open_positions(),
+            float(pf.get("total_value") or 0.0),
+            preds,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/concentration-cap")
+@swr_cached("concentration_cap", 30.0)
+def concentration_cap_api():
+    """Per-name concentration-cap rebalance recommender.
+
+    Given the current book + a configurable per-name cap (default 25.0%;
+    override via ``?cap_pct=N``, clamped [1, 100]), compute the exact
+    ``shares_to_trim`` and ``cash_freed_usd`` for each over-cap name to land
+    at the cap. Returns baseline + projected top1/top3 so the operator sees
+    whether one trim cycle is enough or another name is queued to climb past
+    the cap. Pure / never-raises. Reuses ``build_concentration_cap`` verbatim
+    (SSOT, AGENTS.md #10). Observational only — never gates Opus, adds no
+    caps (AGENTS.md #2/#12).
+
+    Complementary to ``/api/trim-simulator``: that one is the *scorer-EV-driven*
+    ladder; this one is the *mechanical* per-name cap math.
+    """
+    try:
+        from .analytics.concentration_cap import (
+            DEFAULT_CAP_PCT, build_concentration_cap,
+        )
+        try:
+            cap = float(request.args.get("cap_pct", DEFAULT_CAP_PCT))
+        except (TypeError, ValueError):
+            cap = DEFAULT_CAP_PCT
+        store = get_store()
+        pf = store.get_portfolio()
+        result = build_concentration_cap(
+            store.open_positions(),
+            float(pf.get("total_value") or 0.0),
+            cap,
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def _articles_db_path() -> Path | None:
     """Resolve the digital-intern articles.db through the SAME freshness-aware
     single source of truth the live trader uses (``signals._db_path()``).
@@ -13734,6 +13816,19 @@ def _swr_prewarm():
         # The prewarm==@swr_cached invariant locks it here so the first poll
         # after a restart never cold-stalls on {"warming": true}.
         ("position_blowup", position_blowup_api),
+        # trim_simulator @swr_cached 45s — per-position trim ladder with
+        # scorer-EV math (avoided_loss / forgone_upside per rung). Reuses the
+        # scorer_predictions in-process call, so a cold cache after restart
+        # can compound two warming stalls in a row — prewarm both. Same
+        # freeze-triage cold-stall blind spot the prewarm==@swr_cached
+        # invariant locks against.
+        ("trim_simulator", trim_simulator_api),
+        # concentration_cap @swr_cached 30s — mechanical per-name cap
+        # rebalance recommender, sibling of position_blowup / risk on the
+        # concentration-triage row. The prewarm==@swr_cached invariant locks
+        # it here so first poll after a restart never cold-stalls on
+        # {"warming": true}.
+        ("concentration_cap", concentration_cap_api),
         # etf-lookthrough @swr_cached 30s — pure compute, no I/O, but the
         # prewarm==@swr_cached invariant locks every cached endpoint here so
         # the first poll after a restart never cold-stalls on {"warming":
