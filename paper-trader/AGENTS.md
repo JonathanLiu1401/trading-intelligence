@@ -6,6 +6,168 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 feature-dev pass (Agent 4) — `/api/trim-simulator` + `/api/concentration-cap`
+
+Two complementary actionable endpoints fill the gap between the existing
+*observational* concentration surfaces (`/api/risk`, `/api/position-blowup`,
+`/api/scorer-predictions`, `/api/disagreement`) and the operator's actual
+mid-cycle question on the current 65.7% NVDA + scorer-EXIT (~-22.6% 5d) book:
+**how many shares should I sell right now, and what does each trim size
+cost me?** Two complementary lenses on the same question:
+
+### `/api/trim-simulator` — per-position trim ladder with scorer-EV math
+
+**The gap.** `/api/suggestion-impact` already projects a single trim rung
+(default 50%) ONLY for tickers the suggestions engine flagged as TRIM/EXIT,
+and never layers the DecisionScorer's calibrated 5-day forward-return
+prediction onto each rung. So for the live concentrated book, the operator
+had no "trim K shares to cap downside at $X while forgoing $Y of upside"
+ladder for every held name. The disagreement panel ("scorer says EXIT NVDA
+at -18.28%") and the position-blowup ladder ("NVDA -25% costs $-163") could
+each be read in isolation, but no surface composed them into the per-rung
+trade-EV the operator actually needs to size.
+
+**The fix.** `paper_trader/analytics/trim_simulator.py` exports the pure /
+never-raises `build_trim_simulator(positions, total_value, scorer_predictions,
+*, rungs=(0.25, 0.50, 0.75))`. Per held position, three rungs (default
+25/50/75% of qty) with `shares_to_trim`, `cash_freed_usd`,
+`remaining_market_value_usd`, `new_weight_pct`, plus the scorer-EV math:
+`ev_kept_5d_usd` / `ev_freed_5d_usd` (signed `pred% × $`), and the operator-
+readable positive magnitudes `ev_avoided_loss_usd` (pred<0) /
+`ev_forgone_upside_usd` (pred>0). A per-position verdict (`RECOMMEND_EXIT`
+/ `RECOMMEND_TRIM` / `NEUTRAL` / `HOLD`) synthesises scorer pred sign+
+magnitude × current weight; a `recommended_rung` picks the deepest rung for
+EXIT bias and the middle rung for TRIM bias (the existing
+`suggestion_impact` 50% default, but here it's one rung in a ladder, not
+the only option). Sort: EXIT first, then TRIM, then by descending weight —
+operator's first read is the biggest pending action.
+
+Per-position verdict thresholds (module constants — change in one place):
+
+* `EXIT_PRED_PCT = -10.0` — scorer pred ≤ this is the EXIT bias floor.
+* `TRIM_PRED_PCT = -5.0` — scorer pred ≤ this is the TRIM bias floor.
+* `HOLD_PRED_PCT = 3.0` — scorer pred ≥ this is the HOLD bias floor.
+* `CONCENTRATED_WEIGHT_PCT = 40.0` — weight at-or-above this is concentrated.
+* `HEAVY_WEIGHT_PCT = 25.0` — weight at-or-above this is heavy.
+
+Book-level state ladder: `NO_DATA` → `ALL_HOLD` → `TRIM_RECOMMENDED` →
+`EXIT_RECOMMENDED`. Headline format (top name + its recommended rung):
+
+```
+Trim simulator (TRIM_RECOMMENDED): NVDA (65.4% of book, scorer -2.4% 5d)
+— trim 1.5 shares (50%) frees $322.88, weight 65.4%→32.7%, avoids ~$7.69
+expected loss.
+```
+
+**Route** `/api/trim-simulator` — `@swr_cached("trim_simulator", 45.0)`, a
+thin passthrough that pulls scorer predictions through the existing
+in-process `scorer_predictions_api()` handler (SSOT — the trim panel and
+the scorer card can never disagree). If scorer-predictions fails or returns
+an error body, the ladder still renders with `None` EV fields and the
+verdict falls back to the weight-only triage. Reuses
+`build_trim_simulator` verbatim (SSOT, invariant #10 — the panel and the
+`-m paper_trader.analytics.trim_simulator` CLI can never disagree).
+Registered in `_swr_prewarm.targets` so the panel never cold-stalls on
+`{"warming": true}` post-restart (the `prewarm == @swr_cached` invariant).
+
+**Tests** — `tests/test_trim_simulator.py` (36 tests): NO_DATA degradation
+(empty / None / zero-tv / garbage-tv / all-zero rows / malformed rows);
+rung arithmetic (default 25/50/75 rungs, shares = qty × frac, cash_freed
+= MV × frac, complement, new_weight, options ×100, market_value-preferred
+SSOT); scorer-EV (negative pred → avoided_loss only, positive → forgone
+upside only, missing pred → None EV fields, case-insensitive ticker
+lookup, malformed pred degraded); verdict ladder (EXIT on bearish+heavy,
+TRIM on bearish alone, TRIM on concentration alone, HOLD on bullish,
+NEUTRAL on flat, threshold inclusive at -10); ordering by verdict
+urgency then weight; headline composition; rung cleaning (unit-interval
+filter, dedup+sort, custom rungs); endpoint passthrough / NO_DATA→200 /
+builder-raise→500 / scorer-failure degrade / SSOT parity via the
+unwrapped handler / prewarm registration.
+
+### `/api/concentration-cap` — mechanical per-name cap rebalance recommender
+
+**The gap.** `/api/risk` flags concentration_top1 by *weight* and severity;
+`/api/position-blowup` quantifies *single-name shock damage*. Neither
+answers the **mechanical** question: *if I set a per-name cap of K%, exactly
+how many shares of each over-cap name do I need to sell?* The current book
+needs that math four ways a week, and nobody had wired it up.
+
+**The fix.** `paper_trader/analytics/concentration_cap.py` exports the pure
+/ never-raises `build_concentration_cap(positions, total_value, cap_pct)`.
+For each over-cap name, returns `shares_to_trim`, `cash_freed_usd`,
+`target_market_value_usd`, `weight_pct_reduction`; plus baseline + projected
+top1/top3 (total_value preserved — trimmed equity → cash) so the operator
+sees whether one trim cycle is enough or another name is queued to climb
+past the cap. Cap clamped `[MIN_CAP_PCT=1.0, MAX_CAP_PCT=100.0]`, garbage
+falls back to `DEFAULT_CAP_PCT=25.0`. Sorted worst-first by
+`weight_pct_reduction`. State ladder: `NO_DATA` → `AT_CAP` → `OVER_CAP`.
+
+Headline format:
+
+```
+Concentration cap (25.0%): 1 over-cap; largest NVDA 65.4% — trim 1.8532
+shares to free $398.90; book top1 65.4%→25.0%.
+```
+
+**Route** `/api/concentration-cap?cap_pct=N` (clamped [1, 100], garbage →
+default 25). `@swr_cached("concentration_cap", 30.0)`, thin passthrough
+over the builder. Registered in `_swr_prewarm.targets`.
+
+**Tests** — `tests/test_concentration_cap.py` (25 tests): NO_DATA degradation
+(empty / None / zero-tv / all-zero / garbage); trim arithmetic (exact
+shares-to-trim, total_cash_freed sum, baseline top1/top3, projected top1
+equals cap, options ×100); cap clamp (low/high/garbage); inclusive
+boundary at exactly cap%; worst-first ordering; headline composition;
+endpoint default-cap parse, `?cap_pct=` query parse, garbage cap →
+default, exception → 500, SSOT parity via unwrapped handler, prewarm
+registration.
+
+### Distinct from neighbours (invariant #10 — do not "consolidate")
+
+| Surface | Question it answers |
+|---|---|
+| `/api/risk` | Is the book concentrated *as a weight*? |
+| `/api/position-blowup` | What does a single-name *shock* cost me at -10/-25/-50/-100%? |
+| `/api/stress-scenarios` | What does a SPY/sector shock cost me? |
+| `/api/scorer-predictions` | What's the scorer's 5d return prediction per held name? |
+| `/api/disagreement` | Where does the scorer say EXIT/TRIM while Opus stays long? |
+| `/api/suggestion-impact` | Single-rung 50% trim projection for tickers the suggestions engine flagged TRIM/EXIT |
+| `/api/liquidation-preview` | Full-book exit — cash freed and realized P/L if I closed everything |
+| **`/api/trim-simulator`** | **Per-held-name 3-rung ladder × scorer-EV math** — fills the multi-rung × scorer-EV × all-positions gap |
+| **`/api/concentration-cap`** | **Mechanical per-name cap math** — fills the "exact qty to trim to hit K%" gap |
+
+Both are **observational only** — never gate Opus, add no caps (invariants
+#2/#12). Both are pure / never-raise (the position_blowup discipline) and
+ship CLIs (`python3 -m paper_trader.analytics.trim_simulator` /
+`paper_trader.analytics.concentration_cap [--cap=K]`) for desk-terminal use
+when `:8090` is wedged.
+
+### Live evidence at merge (2026-05-23 ~08:28 UTC)
+
+`-m paper_trader.analytics.trim_simulator` on the live book (NVDA 65.4% of
+$987.39, scorer pred -2.4% 5d, RECOMMEND_TRIM via the concentration arm):
+
+```
+Trim simulator (TRIM_RECOMMENDED): NVDA (65.4% of book, scorer -2.4% 5d) —
+trim 1.5 shares (50%) frees $322.88, weight 65.4%→32.7%, avoids ~$7.69
+expected loss.
+```
+
+`-m paper_trader.analytics.concentration_cap --cap=25`:
+
+```
+Concentration cap (25.0%): 1 over-cap; largest NVDA 65.4% — trim 1.8532
+shares to free $398.90; book top1 65.4%→25.0%.
+```
+
+Combined regression — 36 trim_simulator + 25 concentration_cap + 6
+`test_swr_prewarm_coverage` + 11 `test_position_blowup` (sibling untouched)
++ 17 `test_suggestion_impact` (sibling untouched) + 34
+`test_core_dashboard_helpers` (dashboard-touch regression) — **all 129
+green** at merge.
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #11 (Agent 2) — `calibration_reliability` + dedup tiebreaker hardening
 
 ### Phase 1 — fix: `train_scorer` dedup must prefer rows with finite `forward_return_5d`
