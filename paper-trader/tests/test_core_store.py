@@ -298,6 +298,115 @@ class TestDecisions:
         assert actions == ["second", "first"]
 
 
+class TestLastRealDecision:
+    """``store.last_real_decision`` answers a trader's question
+    ``recent_decisions(1)[0]`` cannot: "when did the engine actually decide
+    something, not just cycle?" Without this, a 24h NO_DECISION storm reads as
+    "last decision 6m ago" — a green light on the operator's primary surface
+    while the engine has not produced a parseable Claude response for days.
+    These tests pin the filter, the ordering, and the None contract."""
+
+    def test_none_when_empty(self, fresh_store):
+        """A fresh book with no decisions returns None — not an exception,
+        not a fabricated empty row."""
+        assert fresh_store.last_real_decision() is None
+
+    def test_filters_out_no_decision(self, fresh_store):
+        """A book whose entire decision history is NO_DECISION rows returns
+        None — the exact 24h IDLE_STORM regime the method is built to
+        diagnose."""
+        for _ in range(10):
+            fresh_store.record_decision(
+                False, 0, "NO_DECISION",
+                "skipped claude call — host saturated", 1000.0, 1000.0,
+            )
+        assert fresh_store.last_real_decision() is None
+
+    def test_returns_most_recent_filled(self, fresh_store):
+        """Walk through a typical sequence: a real BUY → many NO_DECISIONs
+        → the real BUY is the one returned (not the most recent
+        NO_DECISION row that ``recent_decisions(1)`` would surface)."""
+        # Real BUY (action verb + → status — the canonical record_decision
+        # shape strategy._execute writes).
+        fresh_store.record_decision(
+            True, 5, "BUY NVDA → FILLED", "earnings", 1000.0, 500.0,
+        )
+        # Many NO_DECISION cycles after the real decision.
+        for _ in range(20):
+            fresh_store.record_decision(
+                False, 0, "NO_DECISION",
+                "skipped claude call — host saturated", 990.0, 500.0,
+            )
+        # recent_decisions(1) returns a NO_DECISION row — the documented
+        # IDLE_STORM "green light" failure mode.
+        assert fresh_store.recent_decisions(1)[0]["action_taken"] == "NO_DECISION"
+        # last_real_decision returns the actual BUY.
+        last = fresh_store.last_real_decision()
+        assert last is not None
+        assert last["action_taken"] == "BUY NVDA → FILLED"
+        assert last["reasoning"] == "earnings"
+
+    def test_includes_hold_and_blocked(self, fresh_store):
+        """HOLD and BLOCKED are *real* decisions — a deliberate hold or a
+        risk-rejected trade are meaningfully different from a cycle that
+        couldn't even produce a parseable Claude response. The filter must
+        keep them; only the literal NO_DECISION cycle is excluded."""
+        fresh_store.record_decision(True, 5, "HOLD MU → HOLD", "wait", 1000.0, 500.0)
+        # NO_DECISION newer than the HOLD — must be filtered out so the
+        # HOLD is what's returned.
+        fresh_store.record_decision(False, 0, "NO_DECISION", "skipped", 1000.0, 500.0)
+        last = fresh_store.last_real_decision()
+        assert last is not None
+        assert last["action_taken"] == "HOLD MU → HOLD"
+
+        # BLOCKED — same contract.
+        fresh_store.record_decision(
+            True, 5, "SELL NVDA → BLOCKED", "oversell", 1000.0, 500.0,
+        )
+        fresh_store.record_decision(False, 0, "NO_DECISION", "skipped", 1000.0, 500.0)
+        last = fresh_store.last_real_decision()
+        assert last is not None
+        assert last["action_taken"] == "SELL NVDA → BLOCKED"
+
+    def test_picks_newest_real_decision(self, fresh_store):
+        """When multiple real decisions exist, returns the most recent —
+        same ``ORDER BY timestamp DESC, id DESC`` semantics as
+        ``recent_decisions``."""
+        fresh_store.record_decision(True, 5, "BUY AMD → FILLED", "first", 1000.0, 500.0)
+        fresh_store.record_decision(True, 5, "BUY NVDA → FILLED", "second", 1000.0, 500.0)
+        fresh_store.record_decision(True, 5, "HOLD MU → HOLD", "third", 1000.0, 500.0)
+        last = fresh_store.last_real_decision()
+        assert last is not None
+        assert last["action_taken"] == "HOLD MU → HOLD"
+        assert last["reasoning"] == "third"
+
+    def test_filters_no_decision_prefix_rows(self, fresh_store):
+        """Some historical rows carry a NO_DECISION-prefixed action_taken
+        (e.g. ``"NO_DECISION (host saturated)"`` — defensive against the
+        free-text column shape; AGENTS.md invariant #11). The filter's
+        ``NOT LIKE 'NO_DECISION%'`` arm catches these too."""
+        fresh_store.record_decision(True, 5, "BUY NVDA → FILLED", "real", 1000.0, 500.0)
+        # Prefix variant - must still be filtered.
+        fresh_store.record_decision(
+            False, 0, "NO_DECISION (host saturated)", "", 1000.0, 500.0,
+        )
+        last = fresh_store.last_real_decision()
+        assert last is not None
+        assert last["action_taken"] == "BUY NVDA → FILLED"
+
+    def test_empty_string_action_filtered(self, fresh_store):
+        """A row with an empty ``action_taken`` (defensive — never written
+        by strategy.py, but the schema allows NULL/empty so the test pins
+        the filter) is treated as not-a-real-decision."""
+        # Real BUY.
+        fresh_store.record_decision(True, 5, "BUY NVDA → FILLED", "real", 1000.0, 500.0)
+        # Empty action_taken — must be filtered out.
+        fresh_store.record_decision(False, 0, "", "", 1000.0, 500.0)
+        last = fresh_store.last_real_decision()
+        assert last is not None
+        assert last["action_taken"] == "BUY NVDA → FILLED"
+
+
 class TestUpdatePositionMarks:
     def test_marks_persist(self, fresh_store):
         fresh_store.upsert_position("NVDA", "stock", qty=10, avg_cost=100.0)
