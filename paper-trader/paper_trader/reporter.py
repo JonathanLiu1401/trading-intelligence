@@ -592,6 +592,42 @@ def send_breaker_fired_alert(consecutive: int, last_reason: str = "",
     return _send(body)
 
 
+def send_breaker_cleared_alert(*, elapsed_s: int | float | None = None) -> bool:
+    """Operator confirmation: the consecutive-NO_DECISION breaker latch has
+    cleared because the decision engine just produced a real (HOLD / FILLED /
+    BLOCKED) decision.
+
+    ``send_breaker_fired_alert`` carries the wedge duration on the way INTO an
+    outage; the recovery message historically said only "responding again" with
+    no sense of how long the bot was actually dark. A trader pulled away from
+    Discord during a multi-hour starvation storm gets the cleared ping but no
+    answer to the first question: "how bad was it?". Mirroring the same
+    ``_format_elapsed`` token on the recovery side closes the loop so the
+    bracket of an outage (FIRED → CLEARED) is self-describing without the
+    operator scrolling the channel to time it.
+
+    ``elapsed_s`` is the wall-clock seconds since the FIRST NO_DECISION in the
+    just-cleared run (``runner._no_decision_first_ts`` at the time of the
+    recovery cycle — the caller captures it BEFORE resetting the ts marker;
+    see the ``_breaker_alert_active`` recovery block in ``runner._cycle``).
+    ``None`` (legacy callers, ts not captured) suppresses the duration token —
+    the alert still ships with the bare cleared confirmation, byte-compatible
+    with the prior literal so a downgrade to the unconditional form is a
+    one-keyword edit, not a re-design."""
+    duration_token = _format_elapsed(elapsed_s)
+    if duration_token:
+        body = (
+            f"✅ **CLAUDE BREAKER CLEARED** ◈ decision engine responding "
+            f"again after ~{duration_token} dark — live trader resumed"
+        )
+    else:
+        body = (
+            "✅ **CLAUDE BREAKER CLEARED** ◈ decision engine "
+            "responding again — live trader resumed"
+        )
+    return _send(body)
+
+
 def send_quota_alert(detail: str = "") -> bool:
     """One-shot alarm: the Claude CLI is rejecting every decision with a
     quota / usage-limit error, so the live trader is making NO trades and

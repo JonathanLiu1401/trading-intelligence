@@ -339,6 +339,51 @@ class TestCircuitBreakerAlert:
             runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
         assert len(breaker_setup["fired"]) == 2
 
+    def test_recovery_alert_receives_real_wedge_duration(
+            self, breaker_setup, monkeypatch):
+        """The recovery message must close the FIRED→CLEARED bracket with the
+        actual wall-clock wedge duration. The runner must capture
+        ``_no_decision_first_ts`` BEFORE resetting it (otherwise the cleared
+        notice always degrades to the no-duration fallback). Mock the new
+        ``send_breaker_cleared_alert`` so we see exactly what elapsed_s the
+        runner passed."""
+        # Trip the breaker first so the latch is armed.
+        self._run_no_decision_cycles(
+            runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
+        # Force a deterministic wedge-start that's ~7 minutes in the past, so
+        # the recovery message renders "after ~7m dark" instead of ~0s.
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        wedge_started = _dt.now(_tz.utc) - _td(seconds=420)
+        monkeypatch.setattr(runner, "_no_decision_first_ts", wedge_started)
+        # Capture the elapsed_s the runner passes to the cleared alert. The
+        # real send_breaker_cleared_alert is exercised by the dedicated
+        # reporter test class — here we want to assert the runner's kwarg
+        # plumbing, not duplicate body formatting.
+        cleared_calls: list = []
+
+        def _fake_cleared(**kwargs):
+            cleared_calls.append(kwargs)
+            return True
+
+        monkeypatch.setattr(
+            runner.reporter, "send_breaker_cleared_alert", _fake_cleared
+        )
+        # One real decision drives recovery.
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()
+        assert runner._breaker_alert_active is False
+        # The recovery alert must have been called EXACTLY once with a
+        # non-None elapsed_s in the right ballpark (>=420s, < a bit more
+        # because the recovery cycle itself takes a moment of wall clock).
+        assert len(cleared_calls) == 1
+        elapsed_s = cleared_calls[0].get("elapsed_s")
+        assert isinstance(elapsed_s, int)
+        assert 420 <= elapsed_s < 600
+        # And the wedge-start ts is reset for the NEXT outage to start fresh.
+        assert runner._no_decision_first_ts is None
+
     def test_quota_path_does_not_trip_breaker_alert(self, breaker_setup,
                                                      monkeypatch):
         """Quota-exhausted cycles intentionally keep the counter at 0

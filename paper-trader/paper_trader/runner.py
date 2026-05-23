@@ -753,6 +753,17 @@ def _cycle():
                     except Exception as e:
                         print(f"[runner] breaker alert failed: {e}")
         else:
+            # Capture the wedge duration BEFORE clearing _no_decision_first_ts
+            # — the breaker-cleared Discord notice needs to know how long the
+            # bot was actually dark, and the ts is the only source of that
+            # wall-clock figure (consecutive_no_decisions has already been
+            # zeroed by the breaker-fire path under a sustained storm).
+            recovery_elapsed_s: int | None = None
+            if _breaker_alert_active and _no_decision_first_ts is not None:
+                recovery_elapsed_s = int(
+                    (datetime.now(timezone.utc)
+                     - _no_decision_first_ts).total_seconds()
+                )
             _consecutive_no_decisions = 0
             _no_decision_first_ts = None  # re-arm: next outage starts fresh
             # Engine produced a real decision (HOLD, FILLED, BLOCKED) — clear
@@ -763,9 +774,8 @@ def _cycle():
             if _breaker_alert_active:
                 ok = False
                 try:
-                    ok = bool(reporter._send(
-                        "✅ **CLAUDE BREAKER CLEARED** ◈ decision engine "
-                        "responding again — live trader resumed"
+                    ok = bool(reporter.send_breaker_cleared_alert(
+                        elapsed_s=recovery_elapsed_s
                     ))
                 except Exception as e:
                     print(f"[runner] breaker recovery notice failed: {e}")

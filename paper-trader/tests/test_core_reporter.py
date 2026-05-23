@@ -1030,6 +1030,77 @@ class TestSendBreakerFiredAlert:
         assert reporter._format_elapsed("garbage") == ""
 
 
+class TestSendBreakerClearedAlert:
+    """Recovery confirmation that closes the FIRED→CLEARED bracket. A trader
+    pulled away from Discord during a multi-hour storm gets a CLEARED ping —
+    it must answer "how long was the bot dark?" (the FIRED side already
+    does this; the recovery side historically didn't)."""
+
+    def test_includes_duration_when_elapsed_known(self, monkeypatch):
+        # 4500s wedge → "1h15m" via _format_elapsed; the body must surface
+        # that real wall-clock figure, not the historical bare "responding
+        # again" line that left the operator without a duration anchor.
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        ok = reporter.send_breaker_cleared_alert(elapsed_s=4500)
+        assert ok is True
+        body = captured[0]
+        assert "CLAUDE BREAKER CLEARED" in body
+        assert "after ~1h15m dark" in body
+        assert "responding again" in body
+        assert "live trader resumed" in body
+
+    def test_omits_duration_when_elapsed_none(self, monkeypatch):
+        # Legacy/None elapsed → byte-compatible with the prior literal text
+        # so an upstream migration that drops the kwarg never regresses to a
+        # garbled message. Must NOT fabricate a "~" duration token.
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        ok = reporter.send_breaker_cleared_alert(elapsed_s=None)
+        assert ok is True
+        body = captured[0]
+        assert body == (
+            "✅ **CLAUDE BREAKER CLEARED** ◈ decision engine "
+            "responding again — live trader resumed"
+        )
+        assert "~" not in body
+        assert "dark" not in body
+
+    def test_negative_elapsed_falls_back_to_undecorated_body(self, monkeypatch):
+        # A negative figure (wall-clock step-back hazard) must NOT render as a
+        # bogus "after ~-Xm dark" — _format_elapsed already returns "" on
+        # negative input; this test pins that the caller honours that contract.
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        reporter.send_breaker_cleared_alert(elapsed_s=-30)
+        body = captured[0]
+        assert "after" not in body
+        assert "~" not in body
+
+    def test_subminute_wedge_renders_zero_minutes(self, monkeypatch):
+        # A wedge clamped at 30s should still surface duration as "0m" rather
+        # than silently dropping it — _format_elapsed buckets sub-minute to
+        # "0m" (test_format_elapsed_buckets pins that), and the cleared body
+        # must trust that token instead of inventing its own threshold.
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        reporter.send_breaker_cleared_alert(elapsed_s=30)
+        body = captured[0]
+        assert "after ~0m dark" in body
+
+    def test_returns_false_when_send_fails(self, monkeypatch):
+        # The runner uses this return value to decide whether to clear the
+        # _breaker_alert_active latch — a transient openclaw failure must
+        # propagate False so the latch stays armed and the recovery retries
+        # next cycle (the same symmetry the quota recovery path uses).
+        monkeypatch.setattr(reporter, "_send", lambda _msg: False)
+        assert reporter.send_breaker_cleared_alert(elapsed_s=600) is False
+
+
 class TestSendDailyCloseBaseline:
     """The daily-close P/L baseline label must track reporter._INITIAL_EQUITY,
     not a hardcoded literal. reporter.py's own header comment makes
