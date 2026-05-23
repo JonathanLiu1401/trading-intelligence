@@ -6,6 +6,135 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 — Agent 1 (HYBRID core) — starvation-trend Discord surface
+
+**Phase 1 — bug fix (bugs_fixed: 0)**
+
+Honest investigation across `runner.py`, `reporter.py`, `signals.py`,
+`strategy.py`, `market.py`, `store.py` (read in full, again) plus the
+dashboard SWR plumbing and the analytics index. 30+ prior HYBRID passes
+have already cleared every observable defect; the marginal core bug is
+exhausted. No Phase-1 commit (the commit guard explicitly permits
+`bugs_fixed=0` when honest effort finds nothing — the AGENTS.md-
+documented discipline; multiple prior agents the same day used this
+0-bug path).
+
+One latent-but-not-active issue noted for future agents:
+`analytics/buying_power._position_mark_value` uses
+``px = _f(current_price) or _f(avg_cost)`` — for a position where
+`current_price=0.0` (the schema default OR a legitimately-marked
+worthless expired option) the `or` falls through to ``avg_cost`` and
+overstates value. Not exercised in production because every live caller
+passes the enriched snapshot (which has ``market_value`` set explicitly)
+— the fallback only fires against raw ``open_positions()`` rows. Mark
+as a defensive cleanup target, not a fix this pass (the documented
+"no spurious fix" Phase-1 discipline).
+
+**Phase 2 — feature (features_added: 1)**
+
+`reporter._starvation_trend_line` — the temporal companion to
+`_host_pulse_line` on the Discord surface. `_host_pulse_line` answers the
+*aggregate* question ("is the box saturated right now?"); the new line
+answers the *direction-of-travel* question ("WORSENING / STABLE-with-
+storm / RECOVERING") that determines the operator's lever:
+
+* `WORSENING` → ⚠️ **act now** — the storm is intensifying; kill sibling
+  Opus jobs.
+* `RECOVERING` → ✅ **wait** — the box is clearing; give it a few more
+  cycles before intervening.
+* `STABLE` with high baseline (≥30%) → fires (a sustained 100% wall is
+  a distinct alarm from the snapshot — the storm isn't passing on its
+  own).
+* `STABLE` low / `INSUFFICIENT` → silent (the silence-when-nothing-
+  actionable discipline; never become a lying green light).
+
+Composes `host_guard.recent_starvation_trend()` verbatim (single source
+of truth, AGENTS.md invariant #10 — the state/headline/rates are the
+builder's, never re-derived here, so this Discord line and
+`/api/host-guard` can never drift). Pure `host_guard` reads — NO
+network (the Discord-path discipline). Wired into BOTH
+`send_hourly_summary` and `send_daily_close` right after the HOST line
+so a top-down read goes "is the box saturated? — yes; which way is it
+going? — worsening". 17 new tests in
+`tests/test_starvation_trend_line.py` lock the verdict ladder, the 30%
+baseline boundary (inclusive), `INSUFFICIENT`-silence, builder-fault
+silence, both hourly + daily wiring, and the load-bearing
+HOST→TREND→IDLE→CAPITAL ordering. 406 prior reporter tests still green.
+
+**Live state at commit:** the box is 100% saturated (15 concurrent Opus
+including this very agent and parallel HYBRID/review siblings), 0%→0%
+delta — `STABLE` at the high baseline, so the new line correctly fires
+the sustained-storm alarm. This is the exact 2026-05-18 -5.87% alpha
+bleed pathology, now visible from Discord one dimension over from the
+existing HOST aggregate.
+
+**Phase 3 — live validation findings (live trader 09:53 UTC)**
+
+1. **Host saturation is the dominant pathology — STABLE at 100%.**
+   `/api/host-guard` shows 15 concurrent Opus (limit 4), 100% of the
+   last 120 decisions never reached Opus,
+   `starvation_by_cause={"host_skip": 115, "model_empty": 3,
+   "cli_nonzero_rc": 2}`. The new Phase-2 line emits the
+   `STARVATION TREND ◈ STABLE` alarm — the trader is in a sustained-
+   storm wall, not a tail end. ops lever (not code): reduce concurrent
+   Opus. The trader cannot resolve this by trading.
+2. **Trader pinned in NVDA at 65% concentration, -1.26% P/L.** Book
+   $987.39, cash $341.64, last fill 2026-05-21T10:00 (47.8h ago). 0
+   actions since.
+3. **`/api/risk` warming/slow on cold cache.** First hit returned
+   `{"warming": true, "error": "computing — retry shortly"}` for >30 s;
+   `/api/feed-health` recovered in the same window. Not a bug
+   per se (SWR is designed to degrade-safe) but the cold-cache budget
+   (`_SWR_COLD_BUDGET_S=2.0`) may be too tight for the risk endpoint's
+   composite work. Marked for future investigation.
+4. **Runner 1 commit behind HEAD with this feature.** `/api/healthz`
+   `boot_sha=fbd338d`, `head_sha=c6037e0`, `behind=1`. The git-watcher
+   restart will fire within ~3 min and the Phase-2 line will be live.
+5. **systemd `paper-trader.service` in expected crash loop.**
+   `journalctl --user -u paper-trader` shows restart counter 7+ with
+   `exit-code 1` every ~15 s — this is the documented
+   systemd-vs-manual-singleton pattern (the manual instance holds the
+   advisory lock, so the systemd-managed copy fails fast and is
+   relaunched). Not a fresh bug.
+6. **The auto-commit daemon bundled this pass's work into
+   `c6037e0`** (alongside two sibling agents' commits). My code shipped
+   under the briefing-agent's commit message — the documented
+   concurrent-staging hazard. Files attributable to this pass:
+   `paper-trader/paper_trader/reporter.py` (+95 lines — the new line
+   + hourly/daily wiring) and
+   `paper-trader/tests/test_starvation_trend_line.py` (+294 lines —
+   the 17 new tests). The work is in main; only the commit-message
+   attribution drifted, which is the lesser problem (per the
+   `pt-concurrent-samerole-staging-race.md` memory).
+
+### Test commands
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+# Phase-2 feature lock (this pass):
+python3 -m pytest tests/test_starvation_trend_line.py -v        # 17 green
+
+# Core regression slice (~30s under load):
+python3 -m pytest tests/test_core_runner.py tests/test_core_runner_cycle.py \
+                  tests/test_core_strategy.py tests/test_core_market.py \
+                  tests/test_core_store.py tests/test_core_signals.py \
+                  tests/test_starvation_trend_line.py -q
+# 447 passed
+
+# Full reporter regression (3-5min under load):
+python3 -m pytest tests/test_core_reporter.py -q                 # 406 green
+
+# Live trader pulse:
+curl -s http://localhost:8090/api/host-guard | jq '.pulse, .starvation_by_cause'
+python3 -c "from paper_trader import reporter; print(reporter._starvation_trend_line())"
+```
+
+### Counters
+
+bugs_fixed=0 · features_added=1 · user_findings=6
+
+---
+
 ## 2026-05-23 feature-dev pass (Agent 4) — `/api/bag-holding-skill` + `/api/risk-adjusted-returns`
 
 Two new analytics modules answering desk questions nothing else
