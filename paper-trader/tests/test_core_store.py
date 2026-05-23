@@ -73,6 +73,51 @@ class TestCashBookkeeping:
         assert pf["cash"] == INITIAL_CASH - 500.0
         assert pf["total_value"] == INITIAL_CASH  # mark-to-market not yet applied
 
+    def test_update_portfolio_positions_none_preserves_existing_json(self, fresh_store):
+        """``positions=None`` updates cash/total_value but does NOT touch
+        ``positions_json``. Used by strategy._execute mid-trade so the
+        positions list written at the start of the cycle (by
+        ``_portfolio_snapshot``) is not overwritten with a stale snapshot."""
+        seeded = [
+            {"ticker": "NVDA", "type": "stock", "qty": 5, "avg_cost": 100.0,
+             "current_price": 110.0, "unrealized_pl": 50.0, "market_value": 550.0},
+        ]
+        fresh_store.update_portfolio(
+            cash=450.0, total_value=1000.0, positions=seeded)
+        # Cash-only update via positions=None (omitted)
+        fresh_store.update_portfolio(cash=320.0, total_value=1000.0)
+        pf = fresh_store.get_portfolio()
+        assert pf["cash"] == 320.0
+        assert pf["total_value"] == 1000.0
+        # positions_json must still carry the seeded list — NOT cleared to []
+        assert pf["positions"] == seeded
+
+    def test_update_portfolio_positions_none_default(self, fresh_store):
+        """The default of `positions=None` (omitted) preserves positions_json
+        — back-compat guard for new callers that forget to pass positions."""
+        seeded = [{"ticker": "MU", "type": "stock", "qty": 2,
+                   "avg_cost": 50.0, "current_price": 55.0,
+                   "unrealized_pl": 10.0, "market_value": 110.0}]
+        fresh_store.update_portfolio(cash=890.0, total_value=1000.0,
+                                     positions=seeded)
+        fresh_store.update_portfolio(cash=800.0, total_value=1000.0)
+        pf = fresh_store.get_portfolio()
+        assert pf["positions"] == seeded
+        assert pf["cash"] == 800.0
+
+    def test_update_portfolio_positions_empty_list_clears_json(self, fresh_store):
+        """Empty list `[]` MUST clear positions_json — distinct from None.
+        A None silently preserves; an empty list explicitly empties."""
+        seeded = [{"ticker": "AMD", "type": "stock", "qty": 3,
+                   "avg_cost": 100.0, "current_price": 110.0,
+                   "unrealized_pl": 30.0, "market_value": 330.0}]
+        fresh_store.update_portfolio(cash=670.0, total_value=1000.0,
+                                     positions=seeded)
+        fresh_store.update_portfolio(cash=1000.0, total_value=1000.0,
+                                     positions=[])
+        pf = fresh_store.get_portfolio()
+        assert pf["positions"] == []
+
 
 class TestUpsertPosition:
     def test_first_buy_creates_position(self, fresh_store):

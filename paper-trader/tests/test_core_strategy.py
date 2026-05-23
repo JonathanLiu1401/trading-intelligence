@@ -587,6 +587,90 @@ class TestExecuteBuy:
         assert "qty" in detail.lower()
 
 
+class TestExecutePortfolioJsonConsistency:
+    """``_execute`` updates cash mid-cycle but MUST NOT overwrite
+    ``portfolio.positions_json`` with the pre-trade snapshot list — that
+    list never includes the just-bought lot, so a dashboard /api/portfolio
+    poll in the brief window before end-of-cycle re-mark would otherwise
+    see the post-trade cash alongside the pre-trade position list (a
+    "where did my money go?" UX hole). The fix: ``update_portfolio`` with
+    ``positions=None`` leaves the column untouched."""
+
+    def test_buy_does_not_clobber_seeded_positions_json(self, fresh_store, monkeypatch):
+        # Seed positions_json with a known cached state (the "pre-trade" list
+        # written by _portfolio_snapshot at the start of the cycle).
+        seeded = [
+            {"ticker": "OLD", "type": "stock", "qty": 1, "avg_cost": 10.0,
+             "current_price": 10.0, "unrealized_pl": 0.0, "market_value": 10.0},
+        ]
+        fresh_store.update_portfolio(cash=1000.0, total_value=1010.0,
+                                      positions=seeded)
+        monkeypatch.setattr(market, "get_price", lambda t: 50.0)
+        snap = {"cash": 1000.0, "total_value": 1010.0, "positions": seeded}
+        decision = {"action": "BUY", "ticker": "AMD", "qty": 4, "reasoning": "t"}
+        status, _ = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        pf = fresh_store.get_portfolio()
+        # Cash dropped (1000 - 4*50 = 800), but positions_json is unchanged —
+        # the end-of-cycle _portfolio_snapshot writes the fresh list.
+        assert pf["cash"] == 800.0
+        assert pf["positions"] == seeded
+
+    def test_sell_does_not_clobber_seeded_positions_json(self, fresh_store, monkeypatch):
+        seeded = [
+            {"ticker": "AMD", "type": "stock", "qty": 5, "avg_cost": 100.0,
+             "current_price": 120.0, "unrealized_pl": 100.0, "market_value": 600.0},
+        ]
+        fresh_store.upsert_position("AMD", "stock", qty=5, avg_cost=100.0)
+        fresh_store.update_portfolio(cash=500.0, total_value=1100.0,
+                                      positions=seeded)
+        monkeypatch.setattr(market, "get_price", lambda t: 120.0)
+        snap = {"cash": 500.0, "total_value": 1100.0, "positions": seeded}
+        decision = {"action": "SELL", "ticker": "AMD", "qty": 5, "reasoning": ""}
+        status, _ = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        pf = fresh_store.get_portfolio()
+        # Cash up by 5*120=600 → 1100, positions_json untouched.
+        assert pf["cash"] == 1100.0
+        assert pf["positions"] == seeded
+
+    def test_buy_call_does_not_clobber_seeded_positions_json(self, fresh_store,
+                                                              monkeypatch):
+        seeded = [
+            {"ticker": "GUARD", "type": "stock", "qty": 1, "avg_cost": 1.0,
+             "current_price": 1.0, "unrealized_pl": 0.0, "market_value": 1.0},
+        ]
+        fresh_store.update_portfolio(cash=1000.0, total_value=1001.0,
+                                      positions=seeded)
+        monkeypatch.setattr(market, "get_option_price",
+                            lambda t, e, s, ot: 5.0)
+        snap = {"cash": 1000.0, "total_value": 1001.0, "positions": seeded}
+        decision = {"action": "BUY_CALL", "ticker": "NVDA", "qty": 1,
+                    "strike": 600, "expiry": "2026-12-19", "reasoning": ""}
+        status, _ = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        pf = fresh_store.get_portfolio()
+        assert pf["cash"] == 500.0      # 1000 - 5*1*100
+        assert pf["positions"] == seeded  # unchanged
+
+    def test_execute_does_not_invent_positions_when_cache_empty(self,
+                                                                  fresh_store,
+                                                                  monkeypatch):
+        # An empty seeded positions_json must stay empty after _execute —
+        # the bug-fix invariant: _execute never *writes* the positions_json,
+        # so an empty/stale cache stays exactly as it was. End-of-cycle
+        # _portfolio_snapshot is the only writer of positions_json after
+        # this fix.
+        fresh_store.update_portfolio(cash=1000.0, total_value=1000.0,
+                                      positions=[])
+        monkeypatch.setattr(market, "get_price", lambda t: 50.0)
+        snap = {"cash": 1000.0, "total_value": 1000.0, "positions": []}
+        decision = {"action": "BUY", "ticker": "AMD", "qty": 2, "reasoning": "t"}
+        status, _ = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        assert fresh_store.get_portfolio()["positions"] == []
+
+
 class TestExecuteSell:
     def test_sell_increases_cash_and_closes_position(self, fresh_store, monkeypatch):
         monkeypatch.setattr(market, "get_price", lambda t: 120.0)

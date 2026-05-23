@@ -191,12 +191,28 @@ class Store:
             "last_updated": row["last_updated"],
         }
 
-    def update_portfolio(self, cash: float, total_value: float, positions: list):
+    def update_portfolio(self, cash: float, total_value: float,
+                         positions: list | None = None):
+        """``positions=None`` writes ONLY cash + total_value and preserves the
+        existing ``positions_json`` column. Used by ``strategy._execute`` mid-
+        cycle, where the post-trade enriched position blend is computed by the
+        end-of-cycle ``_portfolio_snapshot`` re-mark; writing the pre-trade
+        snapshot list here would briefly desync ``portfolio.positions_json``
+        from the underlying ``positions`` table (a dashboard /api/portfolio
+        poll in that window saw the new lot's cash impact but the pre-trade
+        position list — missing the just-bought lot, or still showing the
+        just-sold one). Default ``None`` is back-compat for fresh callers."""
         with self._lock:
-            self.conn.execute(
-                "UPDATE portfolio SET cash=?, total_value=?, positions_json=?, last_updated=? WHERE id=1",
-                (cash, total_value, json.dumps(positions), _now()),
-            )
+            if positions is None:
+                self.conn.execute(
+                    "UPDATE portfolio SET cash=?, total_value=?, last_updated=? WHERE id=1",
+                    (cash, total_value, _now()),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE portfolio SET cash=?, total_value=?, positions_json=?, last_updated=? WHERE id=1",
+                    (cash, total_value, json.dumps(positions), _now()),
+                )
             self.conn.commit()
 
     # ─── trades ────────────────────────────────────────────────
