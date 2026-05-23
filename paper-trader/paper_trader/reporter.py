@@ -517,6 +517,45 @@ def send_decision_log(summary: dict) -> bool:
     return _send("\n".join(parts))
 
 
+def send_breaker_fired_alert(consecutive: int, last_reason: str = "") -> bool:
+    """Operator-actionable alarm: the consecutive-NO_DECISION circuit
+    breaker just fired and reaped any stale claude subprocess.
+
+    The breaker (``runner._cycle``'s ``_kill_stale_claude`` path) is the
+    bot's last line of defence against a wedged Claude CLI eating every
+    decision — but historically it logged ONLY to stdout. A trader
+    watching Discord (the documented "primary surface" — see
+    ``send_quota_alert``'s rationale) had no idea five cycles in a row
+    had been silently lost and the runner had just SIGKILL'd its own
+    claude child. That makes the worst class of failure ("looks alive,
+    silently bleeding") MORE invisible, not less.
+
+    Distinct from ``send_quota_alert``: quota exhaustion is a
+    self-explanatory "we know why, no point retrying", whereas a breaker
+    fire signals "we tried to recover and we don't know if it worked" —
+    so this alert carries the cause-code suffix (timeout / nonzero_rc /
+    empty_stdout / cli_missing / exception / parse failure) for
+    operator diagnosis.
+
+    Dedupe is the caller's job (mirrors the quota path's
+    ``_quota_alert_active`` latch): runner sets a latch True after
+    sending and clears it on the next real decision, so a long wedge
+    fires once per outage, not every cycle.
+    """
+    body = (
+        "⚠️ **CLAUDE BREAKER FIRED** ◈ "
+        f"{consecutive} consecutive NO_DECISION cycles — runner reaped "
+        "any stale `claude` subprocess to auto-recover\n"
+        "The decision engine has been silently failing every cycle for "
+        f"~{consecutive * 30} minutes (open-market cadence). Open positions "
+        "are still marked-to-market; no new trades have fired. The next "
+        "real decision clears this latch."
+    )
+    if last_reason:
+        body += f"\n_last cause: {last_reason[:200]}_"
+    return _send(body)
+
+
 def send_quota_alert(detail: str = "") -> bool:
     """One-shot alarm: the Claude CLI is rejecting every decision with a
     quota / usage-limit error, so the live trader is making NO trades and

@@ -195,3 +195,150 @@ class TestCycleDispatch:
         assert calls["trade_alert"] == []
         assert calls["decision_log"] == []
         assert calls["send"] == []
+
+
+class TestNoDecisionCause:
+    """Pin the cause-suffix the breaker alert body carries — wrong cause
+    text means the operator misdiagnoses (e.g. blames Anthropic for a
+    host-saturation problem they can fix themselves)."""
+
+    def test_quota_takes_priority(self):
+        cause = runner._no_decision_cause(
+            {"quota_exhausted": True, "host_saturated": True, "raw": "ignored"}
+        )
+        assert cause == "quota/usage limit"
+
+    def test_host_saturated_over_raw(self):
+        cause = runner._no_decision_cause(
+            {"quota_exhausted": False, "host_saturated": True, "raw": "X"}
+        )
+        assert "host saturated" in cause
+
+    def test_raw_first_line_returned_when_no_flags(self):
+        cause = runner._no_decision_cause(
+            {"quota_exhausted": False, "host_saturated": False,
+             "raw": "parse_failed: <prose>\nmore lines\nhere"})
+        assert cause.startswith("raw response (first line)")
+        assert "parse_failed" in cause
+        assert "more lines" not in cause          # only first line surfaces
+
+    def test_empty_summary_yields_empty_string(self):
+        assert runner._no_decision_cause({}) == ""
+
+    def test_non_string_raw_yields_empty_string(self):
+        assert runner._no_decision_cause({"raw": None}) == ""
+        assert runner._no_decision_cause({"raw": 42}) == ""
+
+    def test_raw_first_line_truncated_to_120_chars(self):
+        long = "A" * 500
+        cause = runner._no_decision_cause({"raw": long})
+        # 120-char cap from the slice — body fits the Discord alert
+        assert cause.endswith("A" * 120)
+        assert len(cause) < 200
+
+
+class TestCircuitBreakerAlert:
+    """The breaker historically fired silently — stdout WARNING only.
+    These tests pin the Discord-side dispatch + the dedupe latch (matches
+    the quota alarm's `_quota_alert_active` discipline)."""
+
+    @pytest.fixture
+    def breaker_setup(self, monkeypatch):
+        # Reset module globals between tests so state doesn't leak.
+        monkeypatch.setattr(runner, "_consecutive_no_decisions", 0)
+        monkeypatch.setattr(runner, "_breaker_alert_active", False)
+        monkeypatch.setattr(runner, "_quota_alert_active", False)
+        alerts = {"fired": [], "send": []}
+        monkeypatch.setattr(runner.reporter, "send_breaker_fired_alert",
+                            lambda n, cause="": alerts["fired"].append((n, cause)) or True)
+        monkeypatch.setattr(runner.reporter, "_send",
+                            lambda m: alerts["send"].append(m) or True)
+        # No-op the actual subprocess kill — we only care about the alert.
+        monkeypatch.setattr(runner, "_kill_stale_claude", lambda: None)
+        monkeypatch.setattr(runner, "get_store", lambda: _FakeStore([]))
+        return alerts
+
+    def _run_no_decision_cycles(self, n, monkeypatch, summary_extra=None):
+        extra = summary_extra or {}
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "NO_DECISION", "decision": None, **extra})
+        for _ in range(n):
+            runner._cycle()
+
+    def test_breaker_fires_alert_at_threshold(self, breaker_setup, monkeypatch):
+        """5 consecutive NO_DECISION cycles fire ONE Discord alert."""
+        self._run_no_decision_cycles(
+            runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
+        assert len(breaker_setup["fired"]) == 1
+        n, cause = breaker_setup["fired"][0]
+        assert n == runner.CONSECUTIVE_NO_DECISION_LIMIT
+        # Latch is set so the NEXT breaker fire stays silent.
+        assert runner._breaker_alert_active is True
+        # Counter resets after the breaker fires.
+        assert runner._consecutive_no_decisions == 0
+
+    def test_breaker_dedupes_within_outage(self, breaker_setup, monkeypatch):
+        """A second breaker fire inside the same outage stays silent —
+        the alert latch prevents flooding the channel on a long wedge."""
+        # First breaker fire — alert
+        self._run_no_decision_cycles(
+            runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
+        # Second breaker fire — latched, no NEW alert
+        self._run_no_decision_cycles(
+            runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
+        assert len(breaker_setup["fired"]) == 1
+
+    def test_real_decision_clears_latch_and_re_arms(self, breaker_setup,
+                                                    monkeypatch):
+        """A real decision clears `_breaker_alert_active` (sends recovery
+        notice) so the NEXT wedge re-alerts the operator."""
+        self._run_no_decision_cycles(
+            runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
+        assert runner._breaker_alert_active is True
+        # One real (HOLD) decision — latch should clear and a recovery
+        # notice should hit Discord.
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()
+        assert runner._breaker_alert_active is False
+        # Recovery notice landed (contains "CLEARED").
+        assert any("CLEARED" in m for m in breaker_setup["send"])
+        # NEXT wedge re-alerts.
+        self._run_no_decision_cycles(
+            runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
+        assert len(breaker_setup["fired"]) == 2
+
+    def test_quota_path_does_not_trip_breaker_alert(self, breaker_setup,
+                                                     monkeypatch):
+        """Quota-exhausted cycles intentionally keep the counter at 0
+        (the breaker pkill is futile against a quota outage). The
+        breaker alert must NEVER fire on a pure quota outage — that has
+        its own alarm (send_quota_alert)."""
+        self._run_no_decision_cycles(
+            10, monkeypatch, summary_extra={"quota_exhausted": True})
+        assert breaker_setup["fired"] == []           # no breaker alert
+        assert runner._breaker_alert_active is False  # latch never armed
+
+    def test_reporter_failure_does_not_set_latch(self, breaker_setup,
+                                                  monkeypatch):
+        """A Discord-send failure must leave the latch False so the
+        next cycle re-tries the alert (mirrors the quota-alert path's
+        symmetric latch discipline)."""
+        # Send returns False → latch stays False.
+        monkeypatch.setattr(runner.reporter, "send_breaker_fired_alert",
+                            lambda n, cause="": False)
+        self._run_no_decision_cycles(
+            runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
+        assert runner._breaker_alert_active is False
+
+    def test_alert_carries_cause_suffix(self, breaker_setup, monkeypatch):
+        """The Discord alert body carries the cause code so the operator
+        knows whether to wait, restart, escalate to Anthropic, etc."""
+        self._run_no_decision_cycles(
+            runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch,
+            summary_extra={"host_saturated": True})
+        assert len(breaker_setup["fired"]) == 1
+        _n, cause = breaker_setup["fired"][0]
+        assert "host saturated" in cause
