@@ -233,15 +233,26 @@ to surface:
   `portfolio_pct`
 * `n_equity_samples` — STABLE gate (3 minimum to see a peak/trough)
 
-Verdict ladder (STABLE only; precedence tested):
+Verdict ladder (STABLE only; precedence tested — WHIPSAW > LIFTED >
+DODGED > SLOW_BLEED > QUIET > MIXED):
 | Verdict | Trigger | Operator reading |
 |---------|---------|------------------|
 | `WHIPSAW_TRAP` | DD ≤ -2.0% AND range ≥ 4.0% | tradeable mid-drought dip you couldn't act on |
+| `LIFTED_BLIND` | intra_drought_max_gain ≥ +2.0% | peaked materially above start at some point — lucky tape |
 | `DODGED_DROP` | DD ≤ -2.0% AND end-to-start ≥ -0.5% | bottomed then recovered while frozen — survived blind |
-| `LIFTED_BLIND` | end-to-start ≥ +2.0% AND DD > -2.0% | book gained materially while paralyzed (lucky tape) |
 | `SLOW_BLEED` | end-to-start ≤ -2.0% AND range < 4.0% | smooth slide; parent `alpha_pct` captures it |
 | `QUIET_DROUGHT` | range < 1.0% | nothing happened — silence-when-nothing-actionable |
 | `MIXED` | none of the above | catch-all |
+
+LIFTED gates on `intra_drought_max_gain_pct` (peak above start) rather
+than `end_to_start_pct` — on a monotonic-up path, start IS the trough,
+so DD ≈ -gain/(1+gain) and any ≥+2% net gain pushes DD past -2.0% into
+DODGED's actionable-DD gate, making the end-to-start arm essentially
+dead in production. `max_gain` is the path-shape-invariant "did the
+book ever go up materially" signal. LIFTED beats DODGED in precedence
+so a V-shape that bottoms scary and recovers beyond start gets the
+"net up" headline, not the mid-drought scare. The advisor caught this
+mid-pass; the boundary-inclusivity test pins the +2.0% LIFT gate.
 
 Below STABLE: `state=INSUFFICIENT`, numerics still emitted (the
 `risk_adjusted_returns` two-tier idiom). When no `current_drought` is
@@ -249,16 +260,16 @@ ongoing: `state="NO_DROUGHT"` and verdict withheld — the
 `_host_pulse_line` / `_macro_calendar_chat_lines` silence-when-nothing-
 actionable precedent.
 
-Locked by `tests/test_drought_path_risk.py` (**31 tests, all pass in
-0.6s**): state/sample-size gate (8), path arithmetic — peak/trough/DD/
+Locked by `tests/test_drought_path_risk.py` (**35 tests, all pass in
+0.64s**): state/sample-size gate (8), path arithmetic — peak/trough/DD/
 range with V/inverse-V/monotonic/window-exclusion/nonpositive-rejection
-(6), verdict ladder all 6 arms (6), verdict precedence + boundary
-inclusivity at the -2.0 DD and 4.0 range thresholds (6), invariants —
-no input mutation / never raises on garbage / output shape (3), SSOT
-round-trip with real `build_decision_drought` (1, integration). Adjacent
-SSOT regression
+(6), verdict ladder all 6 arms incl. the give-back LIFTED path (7),
+verdict precedence + boundary inclusivity at the -2.0 DD / 4.0 range /
++2.0 LIFT thresholds (9), invariants — no input mutation / never raises
+on garbage / output shape / drought echo (4), SSOT round-trip with real
+`build_decision_drought` (1, integration). Adjacent SSOT regression
 (`test_decision_drought + test_idle_opportunity + test_capital_paralysis
-+ test_drought_path_risk`): **90 passed in 0.97s**.
++ test_drought_path_risk`): **94 passed in 0.93s**.
 
 ### Live state at 2026-05-23 10:00 UTC (via `app.test_client()`)
 
