@@ -1573,6 +1573,23 @@ _BRIEFING_RT_HERES_WHAT_HAPPENED = re.compile(
     r"\bhere(?:[s'’]+|\s+is)?\s+what\s+happened\b",
     re.IGNORECASE,
 )
+# "[Wikipedia] <article title>" — lockstep mirror of
+# ``watchers.alert_agent._RT_WIKIPEDIA_REF``. The ``collectors.wikipedia_collector``
+# emits encyclopedic recent-changes rows with this exact prefix, and the ML
+# urgency head over-scores them because the (often ticker-shaped) title plus
+# semis-keyword summary tokens trip its high-relevance pattern recognition.
+# Live evidence (2026-05-23, 7-day articles.db scan): ``[Wikipedia] DRAM
+# (musician)`` at ml_score=10.0 (musician disambiguation page, not semis) and
+# ``[Wikipedia] Nvidia RTX`` at ml_score=8.6 (long-standing reference page)
+# both reached urgency=2, so both would score straight into the briefing's
+# top-50 pool and could surface as fresh TOP SIGNALS despite being
+# encyclopedic reference content, not news. The sibling
+# ``collectors.wikipedia_pageviews`` collector — which IS a useful predictive
+# signal — emits titles like ``"Wiki pageview SURGE NVDA (NVIDIA_Corporation):
+# ..."`` without the leading bracketed-source tag, so its rows are NOT caught.
+_BRIEFING_RT_WIKIPEDIA_REF = re.compile(
+    r"^\s*\[Wikipedia\]\s+",
+)
 
 _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _BRIEFING_RT_WHY_TRADING),
@@ -1581,6 +1598,7 @@ _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("earnings_call_recap", _BRIEFING_RT_EARNINGS_CALL),
     ("quick_glance_metrics", _BRIEFING_RT_QUICK_GLANCE),
     ("heres_what_happened", _BRIEFING_RT_HERES_WHAT_HAPPENED),
+    ("wikipedia_ref", _BRIEFING_RT_WIKIPEDIA_REF),
     ("street_thinks", _BRIEFING_RT_STREET_THINKS),
     ("gf_value_says", _BRIEFING_RT_GF_VALUE),
 )

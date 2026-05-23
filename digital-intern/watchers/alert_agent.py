@@ -800,6 +800,42 @@ _RT_HERES_WHAT_HAPPENED = re.compile(
     re.IGNORECASE,
 )
 
+# "[Wikipedia] <article title>" — the canonical title prefix emitted by
+# ``collectors.wikipedia_collector`` for recent-changes mainspace edits. By
+# definition encyclopedic reference content, NOT breaking news: a Wikipedia
+# article describes a stable subject and is editable by anyone, so a fresh
+# revision is rarely tied to a market-moving event. The ML urgency head
+# demonstrably over-scores them because the (often ticker-shaped) title plus
+# semis-keyword summary tokens trip its high-relevance pattern recognition.
+#
+# Live evidence (2026-05-23, 7-day articles.db scan): two rows reached
+# urgency=2 with ``score_source='ml'``:
+#   - ``[Wikipedia] DRAM (musician)`` at ml_score=10.0 — a pure musician
+#     disambiguation page, not even semiconductor-related; the urgency head
+#     scored max because "DRAM" is a learned semis keyword. The Wikipedia
+#     credibility tier (0.60) sits ABOVE the 0.45 ``ALERT_MIN_LONE_SOURCE_CRED``
+#     bar so the authority gate doesn't catch it; content type IS the failure.
+#   - ``[Wikipedia] Nvidia RTX`` at ml_score=8.6 — a long-standing GPU-product
+#     reference page (not a fresh product launch), same over-scoring class.
+#
+# Discriminator: anchored ``^\s*\[Wikipedia\]\s+`` matches the
+# wikipedia_collector's exact tag convention. Critically, the SIBLING
+# ``collectors.wikipedia_pageviews`` collector — which IS a useful predictive
+# signal ("a 2.5σ surge on $NVDA's Wikipedia article reliably tracks/precedes
+# breaking news") — emits titles in a DIFFERENT shape:
+# ``"Wiki pageview SURGE NVDA (NVIDIA_Corporation): 12,345 vs 4,567 baseline
+#   (z=+3.2, x2.7) 2026-05-23"``. No leading ``[Wikipedia]`` bracket, so the
+# pageview-spike signal is preserved verbatim and only the encyclopedic
+# recent-changes content is dropped.
+#
+# Validated against the must-survive corpus: real wire headlines that happen
+# to mention Wikipedia mid-sentence ("Wikipedia adds new NVDA reference page
+# after IPO", "MU references Wikipedia in 10-K filing") are NOT matched
+# because they lack the leading bracketed-source tag.
+_RT_WIKIPEDIA_REF = re.compile(
+    r"^\s*\[Wikipedia\]\s+",
+)
+
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
@@ -817,6 +853,7 @@ _RECAP_TEMPLATE_PATTERNS = (
     ("earnings_call_recap", _RT_EARNINGS_CALL),
     ("quick_glance_metrics", _RT_QUICK_GLANCE),
     ("heres_what_happened", _RT_HERES_WHAT_HAPPENED),
+    ("wikipedia_ref", _RT_WIKIPEDIA_REF),
     ("earnings_tomorrow_preview", _RT_EARNINGS_TOMORROW),
     ("todays_movers_list", _RT_TODAYS_MOVERS),
     ("is_buy_after", _RT_IS_BUY_AFTER),
