@@ -16102,6 +16102,234 @@ def news_age_at_decision_skill_api():
         }), 500
 
 
+def _corroborating_article_count_index(
+    trades_oldest_first: list[dict],
+    lookback_hours: float = 24.0,
+) -> dict:
+    """Map each trade.id → count of distinct articles mentioning the trade's
+    ticker in the ``lookback_hours`` window strictly before the trade
+    timestamp.
+
+    Re-uses the same articles.db join shape as
+    ``_freshest_article_age_index`` (live-only filter, mode=ro,
+    word-boundary title match). Missing DB / no matching article / parse
+    failure all degrade to ``0`` so the builder routes those into
+    ``NO_NEWS`` (the news_corroboration_skill ``_bucket_for`` contract).
+
+    The lookback window is anchored on each trade individually — articles
+    older than ``trade_ts - lookback_hours`` are excluded from that trade's
+    count even if they sit inside the global scan window (set wider so a
+    single articles.db scan covers every trade in the ledger)."""
+    import re as _re
+    out: dict[int, int] = {}
+    if not trades_oldest_first:
+        return out
+    tickers = {
+        (t.get("ticker") or "").upper()
+        for t in trades_oldest_first
+        if isinstance(t.get("ticker"), str) and t.get("ticker").strip()
+    }
+    tickers.discard("")
+    if not tickers:
+        for t in trades_oldest_first:
+            tid = t.get("id")
+            if isinstance(tid, int):
+                out[tid] = 0
+        return out
+    # Articles since (oldest_trade_ts - lookback_hours). One DB scan
+    # covers every trade — per-trade clipping happens in Python below.
+    try:
+        oldest_ts = trades_oldest_first[0].get("timestamp")
+        oldest_dt = datetime.fromisoformat(
+            str(oldest_ts).replace("Z", "+00:00")
+        )
+        if oldest_dt.tzinfo is None:
+            oldest_dt = oldest_dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        oldest_dt = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    since = (oldest_dt - timedelta(hours=lookback_hours)).isoformat()
+    path = _articles_db_path()
+    if path is None:
+        for t in trades_oldest_first:
+            tid = t.get("id")
+            if isinstance(tid, int):
+                out[tid] = 0
+        return out
+    timelines: dict[str, list[datetime]] = {t: [] for t in tickers}
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        rows = conn.execute(
+            "SELECT title, first_seen FROM articles "
+            "WHERE first_seen >= ? AND ai_score > 0 "
+            "AND url NOT LIKE 'backtest://%' "
+            "AND source NOT LIKE 'backtest_%' "
+            "AND source NOT LIKE 'opus_annotation%' "
+            "ORDER BY first_seen ASC LIMIT 200000",
+            (since,),
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    patterns = {t: _re.compile(rf"\b{_re.escape(t)}\b") for t in tickers}
+    for title, fs in rows:
+        if not isinstance(title, str) or not isinstance(fs, str):
+            continue
+        try:
+            fs_dt = datetime.fromisoformat(fs.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if fs_dt.tzinfo is None:
+            fs_dt = fs_dt.replace(tzinfo=timezone.utc)
+        for tkr, rx in patterns.items():
+            if rx.search(title):
+                timelines[tkr].append(fs_dt)
+    import bisect as _bisect
+    window = timedelta(hours=lookback_hours)
+    for t in trades_oldest_first:
+        tid = t.get("id")
+        if not isinstance(tid, int):
+            continue
+        tkr = (t.get("ticker") or "").upper()
+        if not tkr or tkr not in timelines or not timelines[tkr]:
+            out[tid] = 0
+            continue
+        try:
+            trade_dt = datetime.fromisoformat(
+                str(t.get("timestamp")).replace("Z", "+00:00")
+            )
+            if trade_dt.tzinfo is None:
+                trade_dt = trade_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            out[tid] = 0
+            continue
+        timeline = timelines[tkr]
+        # Articles with first_seen in [trade_dt - window, trade_dt) — strictly
+        # before the trade (we never count an article that landed at or after
+        # the decision microsecond as "corroborating" that decision).
+        hi = _bisect.bisect_left(timeline, trade_dt)
+        lo = _bisect.bisect_left(timeline, trade_dt - window)
+        out[tid] = max(0, hi - lo)
+    return out
+
+
+@app.route("/api/news-corroboration-skill")
+def news_corroboration_skill_api():
+    """News-corroboration skill — does Opus need a chorus, or does it pick
+    winners on a single fresh signal?
+
+    For each FILLED BUY/SELL, counts the number of distinct articles
+    mentioning the trade's ticker in the ``lookback_hours`` window
+    strictly before the trade timestamp, then pairs each count with the
+    trade's realized return (closed round-trip pnl_pct via the
+    ``round_trips`` SSOT, or mark-to-current on still-open positions).
+
+    Verdict matrix: ``CORROBORATION_HELPS`` (CHORUS+ mean ≥ SINGLE mean +
+    ``verdict_gap_pct``), ``SINGLE_HELPS`` (CHORUS+ underperforms SINGLE
+    by the same threshold), ``NO_PATTERN`` (both buckets full but within
+    tolerance), ``INSUFFICIENT_DATA`` (either bucket below
+    ``min_per_bucket``).
+
+    Buckets: ``NO_NEWS`` (0), ``SINGLE`` (1), ``SMALL_CHORUS`` (2-3),
+    ``CHORUS`` (4-9), ``FLOOD`` (10+). The verdict compares CHORUS+
+    (CHORUS ∪ FLOOD) vs SINGLE — the two operational extremes.
+
+    Existing neighbours each see a *different* slice:
+      * ``/api/news-age-at-decision-skill`` — freshness of the freshest
+        article. Says nothing about how many articles agreed.
+      * ``/api/news-themes`` — per-ticker decayed-score snapshot *now*,
+        not a per-trade outcome.
+      * ``/api/signal-followthrough`` — acted-on vs ignored selection
+        edge, not corroboration count vs outcome.
+
+    Query params (clamped):
+      ``limit`` — trade lookback row cap, 50..10000 (default 2000)
+      ``lookback_hours`` — articles-before-trade window, 1..168
+        (default 24)
+      ``min_per_bucket`` — verdict gate, 1..20 (default 3)
+      ``verdict_gap_pct`` — mean-return gap (pp) for a directional
+        verdict, 0.1..20 (default 2.0)
+
+    Pure read — never raises. Articles outside the
+    ``RETENTION_DAYS=90`` window are unavailable; trades whose article
+    history fell off retention degrade to NO_NEWS rather than crash.
+    Observational only — never gates Opus, no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.news_corroboration_skill import (
+            build_news_corroboration_skill,
+            MIN_PER_BUCKET,
+            VERDICT_GAP_PCT,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        limit = int(_qf("limit", 2000.0, 50.0, 10000.0))
+        lookback_hours = _qf("lookback_hours", 24.0, 1.0, 168.0)
+        min_per_bucket = int(_qf(
+            "min_per_bucket", float(MIN_PER_BUCKET), 1.0, 20.0,
+        ))
+        verdict_gap_pct = _qf(
+            "verdict_gap_pct", VERDICT_GAP_PCT, 0.1, 20.0,
+        )
+
+        store = get_store()
+        trades = store.recent_trades(limit=limit) or []
+        trades_oldest_first = list(reversed(trades))
+
+        realized = _build_realized_pct_index(trades_oldest_first)
+        counts = _corroborating_article_count_index(
+            trades_oldest_first, lookback_hours=lookback_hours,
+        )
+
+        samples = []
+        for t in trades_oldest_first:
+            tid = t.get("id")
+            if not isinstance(tid, int):
+                continue
+            r = realized.get(tid)
+            if not r:
+                continue
+            realized_pct = r.get("realized_pct")
+            if realized_pct is None:
+                continue
+            samples.append({
+                "trade_id": tid,
+                "trade_ts": t.get("timestamp"),
+                "ticker": t.get("ticker"),
+                "action": t.get("action"),
+                "article_count": counts.get(tid, 0),
+                "realized_pct": realized_pct,
+                "closed": r.get("closed", False),
+            })
+
+        return jsonify(build_news_corroboration_skill(
+            samples,
+            min_per_bucket=min_per_bucket,
+            verdict_gap_pct=verdict_gap_pct,
+        ))
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "n_samples": 0,
+            "buckets": {},
+            "thresholds": {},
+            "samples": [],
+        }), 500
+
+
 @app.route("/api/conviction-language-skill")
 def conviction_language_skill_api():
     """Conviction-language skill — is Opus' confidence language
