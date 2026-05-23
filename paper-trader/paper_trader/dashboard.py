@@ -17339,6 +17339,176 @@ def catalyst_expiry_skill_api():
         }), 500
 
 
+@app.route("/api/watchlist-news-silence-skill")
+def watchlist_news_silence_skill_api():
+    """Watchlist news silence — per-WATCHLIST-ticker live-news coverage
+    map. For each ticker Opus is allowed to consider, classify
+    SILENT / STALE / LIVE / HOT against the last ``hours`` window and
+    roll up to BLIND_UNIVERSE / SPARSE_COVERAGE / WELL_COVERED.
+
+    Complements digital-intern's ``/api/held-news-silence`` (held-only)
+    and trader-side ``/api/position-news-cooldown`` (post-trade
+    silence) — surfaces the *universe*-wide blind-spot question every
+    other surface ignores: of the ~47 tickers Opus may pick from, how
+    many have ZERO recent news flow, and which are mention-storming?
+
+    Query params (clamped):
+      ``hours`` — lookback window, 1..168 (default 24)
+      ``hot_n`` — mention-storm threshold, 1..50 (default 8)
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.watchlist_news_silence import (
+            build_watchlist_news_silence,
+            DEFAULT_HOURS,
+            HOT_N,
+            SIGNAL_GRADE_SCORE,
+        )
+        from . import signals as _signals
+        from .strategy import WATCHLIST
+
+        def _qi(name, default, lo, hi):
+            try:
+                v = int(float(request.args.get(name, default)))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        hours = _qi("hours", DEFAULT_HOURS, 1, 168)
+        hot_n = _qi("hot_n", HOT_N, 1, 50)
+
+        per_ticker: dict[str, dict] = {}
+        conn = _signals._connect_ro()
+        if conn is not None:
+            try:
+                import re as _re
+                from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+                since = (_dt.now(_tz.utc) - _td(hours=hours)).isoformat()
+                rows = conn.execute(
+                    "SELECT title, full_text, ai_score, first_seen FROM articles "
+                    "WHERE first_seen >= ? AND ai_score > 0 "
+                    "AND url NOT LIKE 'backtest://%' "
+                    "AND source NOT LIKE 'backtest_%' "
+                    "AND source NOT LIKE 'opus_annotation%' "
+                    "ORDER BY first_seen DESC",
+                    (since,),
+                ).fetchall()
+                upper_tickers = [(t or "").upper() for t in WATCHLIST if t]
+                patterns = {
+                    t: _re.compile(rf"(?:\$|\b){_re.escape(t)}\b")
+                    for t in upper_tickers
+                }
+                now_utc = _dt.now(_tz.utc)
+                for t in upper_tickers:
+                    per_ticker[t] = {
+                        "n_in_window": 0,
+                        "n_signal_grade": 0,
+                        "max_score": 0.0,
+                        "hours_since_last": None,
+                        "last_seen_iso": None,
+                    }
+                for r in rows:
+                    title = r["title"] or ""
+                    full = _signals._decompress(r["full_text"])
+                    raw_body = f"{title} {full}"
+                    upper_body = raw_body.upper()
+                    score = float(r["ai_score"] or 0.0)
+                    fs = r["first_seen"]
+                    age_h = None
+                    try:
+                        dt_fs = _dt.fromisoformat(
+                            (fs or "").strip().replace("Z", "+00:00")
+                        )
+                        if dt_fs.tzinfo is None:
+                            dt_fs = dt_fs.replace(tzinfo=_tz.utc)
+                        age_h = (now_utc - dt_fs).total_seconds() / 3600.0
+                    except (TypeError, ValueError):
+                        age_h = None
+                    for t in upper_tickers:
+                        if patterns[t].search(upper_body) or \
+                                _signals._alias_match(raw_body, t):
+                            bucket = per_ticker[t]
+                            bucket["n_in_window"] += 1
+                            if score >= SIGNAL_GRADE_SCORE:
+                                bucket["n_signal_grade"] += 1
+                            if score > bucket["max_score"]:
+                                bucket["max_score"] = score
+                            if bucket["hours_since_last"] is None and age_h is not None:
+                                bucket["hours_since_last"] = age_h
+                                bucket["last_seen_iso"] = fs
+            except Exception as e:
+                print(f"[watchlist-news-silence] scan failed (degrading): {e}")
+            finally:
+                conn.close()
+
+        return jsonify(build_watchlist_news_silence(
+            WATCHLIST,
+            per_ticker,
+            hours=hours,
+            hot_n=hot_n,
+        ))
+    except Exception as e:
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "by_ticker": [],
+            "silent_tickers": [],
+            "hot_storms": [],
+        }), 500
+
+
+@app.route("/api/inverse-pair-conflict-skill")
+def inverse_pair_conflict_skill_api():
+    """Inverse-pair conflict detector — flag simultaneously held
+    leveraged-long + leveraged-inverse ETFs of the same underlying family
+    (TQQQ+SQQQ, SOXL+SOXS, SPXL+SPXS, FNGU+FNGD, TECL+TECS, TNA+TZA).
+
+    Why this lens. The live ``WATCHLIST`` is leveraged-ETF heavy — when
+    Opus opens both sides of the same underlying the directional
+    exposure largely cancels but the book pays leverage decay on BOTH
+    sleeves. Every existing risk surface misses it:
+    ``etf_lookthrough`` reports the net effective single-name outcome
+    but not the carry-waste fact; ``regime_leverage_fit_skill`` reads
+    "high leveraged %" without distinguishing a paired book from a
+    clean one-sided bet; ``sector_exposure`` puts both into
+    ``broad_lev`` with no opposing-sign awareness; ``correlation_*``
+    flags positively-correlated clusters and lets the negatively-
+    correlated TQQQ/SQQQ pair through.
+
+    Verdict ladder (exactly-testable):
+
+      * ``NO_BOOK`` — no open stock positions.
+      * ``CLEAN`` — no family has both an opposing-sign pair.
+      * ``OPPOSING_UNLEVERED`` — at least one family has a 1x core (QQQ,
+        SPY) plus the leveraged inverse — directional offset without
+        compounding leverage decay.
+      * ``CARRY_WASTE`` — at least one family has a leveraged-long ETF
+        AND a leveraged-inverse ETF — both sides pay the issuer.
+
+    Per-family report carries ``long_holdings`` / ``inverse_holdings``,
+    ``cancelled_delta_usd`` / ``net_delta_usd``, and a practitioner
+    ballpark ``daily_drag_estimate_usd``. Pure read — never raises.
+    Observational only — never gates Opus, no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.inverse_pair_conflict import build_inverse_pair_conflict
+        store = get_store()
+        positions = store.open_positions() or []
+        return jsonify(build_inverse_pair_conflict(positions))
+    except Exception as e:
+        return jsonify({
+            "state": "ERROR",
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "conflicts": [],
+            "n_conflicts": 0,
+        }), 500
+
+
 @app.route("/api/hourly-pnl-fingerprint")
 def hourly_pnl_fingerprint_api():
     """Hourly P&L fingerprint — bucket equity-curve cycle deltas by

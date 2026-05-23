@@ -6,6 +6,96 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 feature pass (Agent 4) — inverse-pair conflict + watchlist-news-silence
+
+Two new advisory analytics covering structural blind spots the existing
+138-module analytics surface missed.
+
+**Feature 1 — `paper_trader/analytics/inverse_pair_conflict.py` +
+`/api/inverse-pair-conflict-skill`.** Detects simultaneously held
+leveraged-long + leveraged-inverse ETFs of the same underlying family
+(TQQQ+SQQQ, SOXL+SOXS, SPXL+SPXS, FNGU+FNGD, TECL+TECS, TNA+TZA) — the
+carry-waste pathology a leveraged-ETF-heavy WATCHLIST exposes the book
+to. Pure builder (`_safe` discipline; never raises); taxonomy derived
+from `etf_lookthrough._ETF_LOOKTHROUGH` so the family map is SSOT.
+Verdict ladder: `NO_BOOK` / `CLEAN` / `OPPOSING_UNLEVERED` (1x core +
+leveraged inverse — single decay tab) / `CARRY_WASTE` (both leveraged
+— both pay). Per-family report carries signed-leverage deltas
+(`long_delta_usd` / `inverse_delta_usd`), `cancelled_delta_usd`,
+`net_delta_usd`, severity bucket (HIGH ≥80% cancellation of bigger
+side; MEDIUM ≥40%; LOW), and a practitioner-ballpark
+`daily_drag_estimate_usd` (6bps/day per 3x sleeve, 3bps/day per 2x,
+0bps/day per 1x core). Why it complements existing risk surfaces:
+`etf_lookthrough` reports the net single-name outcome but not the
+carry-waste fact; `correlation_cluster_warning` flags positively-
+correlated clusters and lets the negatively-correlated TQQQ/SQQQ pair
+through; `regime_leverage_fit_skill` reads "high leveraged %" without
+distinguishing a paired book from a clean one-sided bet;
+`sector_exposure` puts both into `broad_lev` with no opposing-sign
+awareness. Live: book = 1 NVDA position only → `CLEAN` (correct).
+16 pure-builder tests in `tests/test_inverse_pair_conflict.py` pin
+every verdict, both severity boundaries, the carry-waste-precedence
+rule, and the never-raises contract on garbage rows / options /
+non-family tickers.
+
+**Feature 2 — `paper_trader/analytics/watchlist_news_silence.py` +
+`/api/watchlist-news-silence-skill?hours=H&hot_n=N`.** Per-WATCHLIST-
+ticker live-news coverage map: of the ~47 tickers Opus is allowed to
+consider, how many had ZERO live articles in the last H hours, and
+which are mention-storming? Per-ticker bucket: `SILENT` (zero) /
+`STALE` (newest > 12h) / `LIVE` (recent, n < 8) / `HOT` (n ≥ 8).
+Universe verdict: `NO_DATA` / `BLIND_UNIVERSE` (≥50% silent) /
+`SPARSE_COVERAGE` (20-50%) / `WELL_COVERED` (<20%). Complements
+digital-intern's `/api/held-news-silence` (held-only) by surfacing
+the UNIVERSE blind spot every other surface ignores: Opus sees AMD
+(38 articles, max_score 8.5) and AMAT (zero articles, never seen)
+in the same prompt and the prompt makes them look operationally
+equivalent. Endpoint performs one bulk scan against `articles.db`
+(mirroring `signals.ticker_sentiments`'s SQL+regex pattern with the
+`_LIVE_ONLY_CLAUSE` invariant) and passes the per-ticker summary
+into a pure builder; on DB-unreadable the per_ticker dict degrades
+to {} and every watchlist ticker classifies SILENT (operator-
+actionable default). Live (6h window): `BLIND_UNIVERSE — 39/48
+silent (81%)`; storms = NVDA, MU — confirms the structural blind
+spot in real time. 21 tests in `tests/test_watchlist_news_silence.py`
+pin per-ticker classification, every universe verdict + its
+threshold boundaries, silent / hot ordering and caps, dedup /
+non-string entry handling, and the never-raises contract.
+
+**Chat enrichment.** Two new pure helpers in
+`digital-intern/dashboard/web_server.py`:
+`_inverse_pair_conflict_chat_lines` (fires on CARRY_WASTE only;
+silence on CLEAN / NO_BOOK / OPPOSING_UNLEVERED — the
+`_persona_book_fit_chat_lines` silence precedent) and
+`_watchlist_news_silence_chat_lines` (fires on BLIND_UNIVERSE /
+SPARSE_COVERAGE; silence on WELL_COVERED / NO_DATA). Both follow
+the SSOT pattern (paper-trader invariant #10): builder's own
+`headline` carries verbatim; detail lines restate the builder's own
+fields (cancelled_delta_usd, daily_drag, severity / silent list,
+storm list) without re-derivation. Guarded 3s sub-fetches; appears
+once `:8090` restarts onto the new endpoints. 31 tests in
+`tests/test_chat_inverse_pair_conflict_enrichment.py` +
+`tests/test_chat_watchlist_news_silence_enrichment.py`.
+
+**Tests run.** Scoped paper-trader regression: 175 passed
+(`test_inverse_pair_conflict + test_watchlist_news_silence +
+test_etf_lookthrough + test_sector_exposure + test_persona_book_fit
++ test_add_discipline + test_regime_leverage_fit_skill`). DI scoped:
+73 passed (the two new chat enrichment files + the existing chat
+enrichment neighbours). Full pytest tests/ untimeable in this
+window (paper_trader_full_suite_untimeable memory).
+
+**Staging discipline.** Per-commit, explicit pathspec, no `git
+add -A`. The auto-commit daemon was active; `git diff --staged
+--stat` verified before each commit to ensure only my own .py and
+test files were included.
+
+**Counters:** `features_added=2` (the two skill analytics +
+endpoints), `chat_blocks_added=2` (the two SSOT chat helpers wired),
+`bugs_fixed=0`.
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #19 (Agent 2) — `gate_risk_profile` analyzer
 
 ### Phase 1: Debug — 0 bugs fixed
