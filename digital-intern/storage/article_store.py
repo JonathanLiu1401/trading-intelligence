@@ -2423,5 +2423,211 @@ class ArticleStore:
             ),
         }
 
+    @_retry_on_lock
+    def ticker_recap_pollution(
+        self,
+        tickers: list[str],
+        recap_matcher,
+        hours: int = 24,
+        min_total: int = 3,
+        top_n: int = 20,
+    ) -> dict:
+        """Per-held-ticker recap-template pollution rate — the analyst's
+        "which of MY positions' urgent streams are noise?" view.
+
+        Sibling to ``source_recap_pollution`` (per-collector — "which
+        feeders to prune?"); per-ticker is the natural complement for the
+        analyst persona "I depend on these alerts to react to events
+        affecting MY positions". A held ticker whose urgent rows are 80%
+        recap-template (post-earnings "Why X Stock Just Popped" mill
+        content) is materially less actionable than one with 5% recap —
+        even if the *aggregate* and per-source rates look fine, the
+        per-ticker view is what answers the persona's actual question.
+
+        Sibling row shape to ``urgency_label_split_by_ticker`` (per-held-
+        ticker LLM-vetted fraction — the *verification* angle) and
+        ``book_alert_coverage`` (per-held-ticker urgent-yield over total
+        coverage). The four per-held-ticker primitives now answer:
+
+          * ``urgency_label_split_by_ticker`` — "is my book's urgent stream
+            LLM-vetted?" (calibration)
+          * ``ticker_mention_velocity`` — "is my book's coverage rate
+            accelerating?" (momentum)
+          * ``book_alert_coverage`` — "did my book's volume actually reach
+            urgent?" (yield)
+          * ``ticker_recap_pollution`` — "is my book's urgent stream real
+            news or recap mill content?" (content type)
+
+        ``recap_matcher`` is an injected callable ``(title) -> bool`` or
+        ``(title) -> (bool, name)`` — the SAME signature and SSOT discipline
+        as ``source_recap_pollution`` (storage layer must not import the
+        analysis or watchers gates; the caller passes the SSOT matcher from
+        either layer). A row whose title raises in the matcher degrades to
+        "no hit" — pollution metrics must never crash because the upstream
+        regex set raised.
+
+        Matching is whole-word, ALL-CAPS, optional leading ``$``,
+        ``len >= 2`` — byte-identical to
+        ``urgency_label_split_by_ticker`` / ``ticker_mention_velocity`` /
+        ``urgent_queue_health`` / ``book_alert_coverage`` so the five
+        per-ticker primitives never disagree about whether a row touches
+        a held name. Match surface is ``title + decompressed summary`` —
+        same as those siblings (ensures a ticker mentioned ONLY in body
+        text still counts).
+
+        Returns::
+
+            {
+              "window_h":      int,
+              "min_total":     int,
+              "by_ticker": [
+                {
+                  "ticker":      str,
+                  "total":       int,     # urgent rows mentioning ticker
+                  "recap":       int,     # of those, recap_matcher hits
+                  "recap_rate":  float,   # recap / total
+                  "fingerprints": {name: count, ...},
+                },
+                ...
+              ],
+              "total_urgent":   int,     # over all matched tickers (no min_total)
+              "total_recap":    int,     # over all matched tickers (no min_total)
+              "global_rate":    float,   # total_recap / total_urgent
+            }
+
+        ``min_total`` excludes tickers with fewer than N urgent rows from
+        the verdict list — a held name with one urgent row of which one is
+        recap reads "100% polluted" without volume to justify the verdict.
+        ``top_n`` caps the response size; worst-recap-rate-first with
+        alphabetical-ticker tiebreak — same deterministic discipline as
+        ``source_recap_pollution`` / ``urgency_label_split_by_source`` so
+        the dashboard ordering is stable cycle-to-cycle.
+
+        Read-only (single SELECT) scoped with ``_LIVE_ONLY_CLAUSE`` so
+        synthetic backtest/opus rows never inflate either ratio. NO DB
+        write — no ai_score / ml_score / score_source / urgency mutation.
+        All four load-bearing invariants intact by construction.
+        """
+        hours = max(int(hours), 1)
+        min_total = max(int(min_total), 1)
+        top_n = max(int(top_n), 0)
+
+        if not tickers:
+            return {
+                "window_h": hours, "min_total": min_total,
+                "by_ticker": [],
+                "total_urgent": 0, "total_recap": 0, "global_rate": 0.0,
+            }
+
+        clean: list[str] = []
+        for raw in tickers:
+            if not raw:
+                continue
+            t = str(raw).strip().upper()
+            if len(t) >= 2 and t not in clean:
+                clean.append(t)
+        if not clean:
+            return {
+                "window_h": hours, "min_total": min_total,
+                "by_ticker": [],
+                "total_urgent": 0, "total_recap": 0, "global_rate": 0.0,
+            }
+
+        since_iso = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        rows = self.conn.execute(
+            "SELECT title, full_text FROM articles "
+            f"WHERE urgency >= 1 AND first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+            (since_iso,),
+        ).fetchall()
+
+        # Whole-word, ALL-CAPS, optional leading $ — byte-identical to the
+        # other per-ticker primitives. Compiled once per ticker, outside
+        # the row scan, so each match is O(len(hay)) regardless of ticker
+        # count.
+        patterns = {
+            t: re.compile(rf"\b\${{0,1}}{re.escape(t)}\b") for t in clean
+        }
+        per_ticker: dict[str, dict] = {
+            t: {"total": 0, "recap": 0, "fingerprints": {}} for t in clean
+        }
+        total_urgent = 0
+        total_recap = 0
+
+        for title, blob in rows:
+            try:
+                summary = decompress(blob) if blob else ""
+            except Exception:
+                summary = ""
+            hay = f"{title or ''} {summary}"
+            # Match recap fingerprints ONCE per row (matcher is title-only,
+            # mirrors ``_looks_like_recap_template``'s signature). Then
+            # increment every held-ticker bucket whose pattern matches the
+            # row. A single recap row mentioning two held names counts
+            # toward both — same multi-attribution discipline as
+            # ``urgency_label_split_by_ticker`` and ``book_alert_coverage``.
+            try:
+                result = recap_matcher(title or "")
+            except Exception:
+                result = (False, "")
+            if isinstance(result, tuple):
+                hit = bool(result[0])
+                name = (result[1] if len(result) > 1 and result[1] else "")
+            else:
+                hit = bool(result)
+                name = ""
+
+            row_matched_any_ticker = False
+            for t, pat in patterns.items():
+                if not pat.search(hay):
+                    continue
+                row_matched_any_ticker = True
+                b = per_ticker[t]
+                b["total"] += 1
+                if hit:
+                    b["recap"] += 1
+                    if name:
+                        b["fingerprints"][name] = (
+                            b["fingerprints"].get(name, 0) + 1
+                        )
+            # Global totals: count the ROW once (not per matching ticker),
+            # so total_urgent matches the raw urgent-row count of rows that
+            # touch ANY held name in the input set — comparable to the
+            # source-side ``total_urgent`` (which is also row-counted, not
+            # bucket-summed).
+            if row_matched_any_ticker:
+                total_urgent += 1
+                if hit:
+                    total_recap += 1
+
+        materialised: list[dict] = []
+        for t in clean:
+            b = per_ticker[t]
+            if b["total"] < min_total:
+                continue  # held name with too-few urgent rows — no verdict
+            materialised.append({
+                "ticker": t,
+                "total": b["total"],
+                "recap": b["recap"],
+                "recap_rate": round(b["recap"] / b["total"], 4),
+                "fingerprints": dict(b["fingerprints"]),
+            })
+
+        materialised.sort(
+            key=lambda r: (-r["recap_rate"], -r["recap"], r["ticker"])
+        )
+
+        return {
+            "window_h": hours,
+            "min_total": min_total,
+            "by_ticker": materialised[: top_n] if top_n else materialised,
+            "total_urgent": total_urgent,
+            "total_recap": total_recap,
+            "global_rate": (
+                round(total_recap / total_urgent, 4) if total_urgent else 0.0
+            ),
+        }
+
     def close(self):
         self.conn.close()
