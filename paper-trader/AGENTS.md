@@ -6,6 +6,189 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #13 (Agent 2) — `_oos_rank_metrics` unknown-regime de-contamination + `ml.wk52_skill`
+
+Two changes, the discipline-mandated separate-commits split.
+
+### Bug fix — `_oos_rank_metrics` regime bucketing silently mis-bucketed `regime_label='unknown'` rows as `bull`
+
+`run_continuous_backtests.py::_oos_rank_metrics` decoded the regime
+bucket from the legacy `regime_mult` float (0.3=bear / 0.6=sideways /
+1.0=bull). But `_market_regime` returns `"unknown"` with multiplier
+1.0 for the early days of any backtest window (SPY <200 closes), and
+`_compute_decision_outcomes` writes both `regime_mult=1.0` AND
+`regime_label='unknown'` for those rows. The mult-only decode then
+silently lumped them into the bull bucket. Live audit of
+`data/decision_outcomes.jsonl`:
+
+```
+regime_label breakdown: {None: 7413, 'unknown': 182, 'bull': 394, 'sideways': 544, 'bear': 220}
+```
+
+So 182 unknown rows out of the would-be-bull bucket (~32% of the
+post-2026-05-19 bull bucket) were silently contaminating
+`regime_bull_rank_ic` — pure no-skill noise inflating the metric a
+quant uses to read whether the scorer works per market state. Fix:
+prefer `regime_label` when present (the 2026-05-19 outcome field),
+fall back to `regime_mult` only when the label is absent (legacy
+pre-feature rows, ~7400 of the corpus). An explicit `"unknown"` label
+is dropped from every bucket honestly.
+
+Locked by 3 new tests in `TestOosRankMetrics`:
+* `test_regime_unknown_label_is_not_bucketed_as_bull` — the headline
+  contract: an explicit `regime_label='unknown'` does NOT increment
+  `regime_bull_n`.
+* `test_regime_label_overrides_mult_when_present` — precedence rule
+  (label wins over mult when both encode a real regime but disagree).
+* `test_regime_label_absent_falls_back_to_mult_decode` — legacy
+  compatibility, so the historical 7413-row tail is not retroactively
+  re-bucketed.
+
+```bash
+python3 -m pytest tests/test_continuous.py::TestOosRankMetrics -v
+# 14 passed including 3 new tests
+```
+
+### Feature — `paper_trader/ml/wk52_skill.py` — bubble-top gate's premise verification
+
+`backtest._ml_decide` carries a 52-week-high gate that **suppresses**
+BUYs when `wk52_pos > 0.80` (the bubble-top gate, code comment:
+"prevents buying into bubble peaks where news clusters at market tops
+causing underperformance"). The premise was assumed, never measured.
+`wk52_pos` has been persisted to every BUY outcome row since
+2026-05-21 but nothing reads it back — until now.
+
+New read-only diagnostic + CLI buckets BUY decisions by `wk52_pos`
+quintile and reports realized 5d returns per bucket, plus a strict
+gate-zone cut (in-zone `wk52 > 0.80` vs out-of-zone) — the exact
+counterfactual the gate's economic value rides on. Verdict ladder:
+
+| Verdict | Trigger |
+|---------|---------|
+| `BUBBLE_GATE_JUSTIFIED` | spearman ≤ -0.15 AND top-bot ≤ -2pp |
+| `BUBBLE_GATE_HARMFUL` | spearman ≥ +0.15 AND top-bot ≥ +2pp |
+| `BUBBLE_GATE_INEFFECTIVE` | \|spearman\| < 0.05 AND \|top-bot\| < 1pp |
+| `DIRECTIONAL_FOR_GATE` | weak negative — premise weakly supported |
+| `DIRECTIONAL_AGAINST_GATE` | weak positive — gate may be removing winners |
+| `INSUFFICIENT_DATA` | <30 BUY rows with `wk52_pos` AND `forward_return_5d` |
+
+Same operational discipline as `ml/conviction_calibration.py`:
+read-only, never trains, never writes the pickle, never touches
+`build_features` / `N_FEATURES`, never raises (degrades to
+`status='error'` + verdict). Imports `_spearman` from `calibration` so
+this and the in-sample diagnostic share one tie-aware rank correlation
+(the `calibration._spearman` single-source-of-truth precedent). 17
+tests in `tests/test_wk52_skill.py` cover each verdict ladder rung,
+dropped-row counters, strict-vs-loose threshold inequality, JSONL
+streaming + corrupt-line skip, CLI exit codes for shell gating.
+
+```bash
+python3 -m paper_trader.ml.wk52_skill
+# VERDICT: BUBBLE_GATE_INEFFECTIVE  (spearman -0.004, top-bot -0.77pp)
+# gate-zone: in-zone n=226 mean=+1.05%  vs  out-zone n=891 mean=+0.48%
+# →  trades the gate suppresses realize +0.57pp BETTER than out-of-zone.
+
+python3 -m pytest tests/test_wk52_skill.py -v
+# 17 passed
+```
+
+### Phase 3 findings — live ML state at 2026-05-23
+
+A different state than pass #12 reported — much improved scorer skill
+but the gate's economic translation still broken.
+
+1. **Scorer skill has continued to improve dramatically.** Live CLI
+   `python3 -m paper_trader.ml.calibration --oos` on `n=8753` (full
+   corpus, current pickle at `n_train=4987`):
+   `VERDICT: DIRECTIONAL_BUT_BIASED  spearman=0.256 pearson=0.264
+   monotone=1.0 mean_abs_decile_err=3.86pp`. Spearman cleared the
+   `SPEARMAN_GOOD=0.15` bar by a wide margin, decile-monotone is 1.0
+   (every decile of pred ranks correctly). Decile-error is 3.86pp >
+   3.0pp `WELL_CALIBRATED` bar, so the verdict stops short of fully
+   calibrated, but rank skill is unambiguously real.
+
+2. **`baseline_compare` reports `MLP_ADDS_SKILL`** — MLP rank_ic
+   `+0.359` vs best one-liner (`neg_bb`) `+0.075`, gap `+0.284` ≫
+   `IC_MARGIN=0.05`. The deployed 17-feature net is genuinely additive
+   OOS. This is the inverse of AGENTS.md's long-documented
+   `MLP_WORSE_THAN_TRIVIAL` plateau — the corpus growth + anti-overfit
+   retune have moved the model from net-negative-complexity to clearly
+   useful.
+
+3. **The conviction gate's sizing rule remains `MISCALIBRATED`** —
+   `python3 -m paper_trader.ml.conviction_calibration` on the 1173 BUY
+   rows reports `spearman=+0.011 top-bot=-0.15pp`. Bucket 4 (mid
+   17–23% sizing) realizes +1.57% while bucket 5 (top 23–40%, the
+   leveraged-bull arm) realizes only +0.35%. **The scorer's rank skill
+   is real (finding #1+2) but the gate's sizing rule fails to
+   translate it into economic weight.** The arms (`×0.6`/`×0.85`/
+   `×1.15`/`×1.3` on `±10`/`±5`) are too coarse to capture the model's
+   0.36 spearman — or the base sizing formula
+   (`min(0.25, ml_score/20)` / `min(0.40, ml_score/15)`) is the source
+   of the anti-edge.
+
+4. **`wk52_skill` (this pass's new diagnostic) flags the bubble-top
+   gate as not justified on captured data.** The aggregate verdict is
+   `BUBBLE_GATE_INEFFECTIVE` (spearman -0.004) but the gate-zone cut
+   reveals in-zone (wk52>0.80, the trades the gate WOULD have
+   suppressed) realized +1.05% mean while out-of-zone realized +0.48%
+   — the suppressed trades realized +0.57pp BETTER. The gate's
+   protection is mildly harmful on the corpus.
+
+5. **Continuous loop is actively running** — `continuous.log` shows
+   run 6243 mid-execution (1311/2516 sample days, currently year-2000
+   sim dates). Scorer.pkl mtime is 2026-05-23 01:26 (today). The
+   scorer ledger is the only thing 2 days stale because run 6243 has
+   not finished its first cycle since pass #12.
+
+6. **GDELT tier-3 fallback floods continuous.log with rate-limit and
+   `ConnectionResetError(104)` retries.** Persistent 40–60s sleeps;
+   likely the local DB is sparse for the current window's date range.
+   Tier-3 is a slow fallback by design (CLAUDE.md §5) so this is not
+   blocking the loop, but it can mask real errors in log triage.
+
+### Operational implication
+
+The pass #12 narrative ("scorer dramatically improved but gate sizing
+remained MISCALIBRATED") still holds and is now reinforced by the
+larger corpus. The decisive next operational change is **NOT** more
+scorer hyper-parameter tuning — the scorer's rank skill is excellent.
+The change is to **rebuild the conviction sizing rule keyed to the
+scorer's percentile rank rather than its raw % bucket**, so the gate
+translates the 0.36 spearman into actual economic weight. `wk52_skill`
+adds a second testable insight: the bubble-top gate may be removing
+slightly profitable trades and is a candidate for tightening (raise
+threshold to 0.85+) or removal.
+
+### Counters
+
+bugs_fixed=1 · features_added=1 · user_findings=6
+
+### Commands for the ML/backtest domain
+
+```bash
+# Full focused suite (covers Phase 1 + Phase 2 + adjacent):
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_continuous.py tests/test_decision_scorer.py \
+                  tests/test_ml_backtest_coverage.py tests/test_wk52_skill.py \
+                  tests/test_conviction_calibration.py tests/test_calibration.py \
+                  tests/test_backtest.py tests/test_baseline_compare.py \
+                  tests/test_calibration_reliability.py -q
+# 359 passed (pre-feature) → 376 passed (post-Phase-2)
+
+# Just this pass's lock tests:
+python3 -m pytest tests/test_continuous.py::TestOosRankMetrics -v
+python3 -m pytest tests/test_wk52_skill.py -v
+
+# Live diagnostics, no-network, read-only:
+python3 -m paper_trader.ml.wk52_skill            # bubble-top gate's premise
+python3 -m paper_trader.ml.conviction_calibration  # gate's sizing rule
+python3 -m paper_trader.ml.calibration --oos       # scorer's rank skill
+python3 -m paper_trader.ml.baseline_compare        # MLP vs one-liners
+```
+
+---
+
 ## 2026-05-23 — Agent 1 (HYBRID core) — breaker-CLEARED wedge duration
 
 **Phase 1 — bug fix (bugs_fixed: 0)**
