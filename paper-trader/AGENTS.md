@@ -6,6 +6,114 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #19 (Agent 2) — `gate_risk_profile` analyzer
+
+### Phase 1: Debug — 0 bugs fixed
+
+622 ML/backtest tests pass cleanly on entry. The codebase is mature; the
+patterns inspected (substring matches in BUY_PHRASES, `_Dummy` stub
+completeness, regime-mult bucket precision, `_market_regime` fallback,
+walk-back collision guards in `_fwd_intraperiod_extremes`) are either
+already covered by tests or are intentional, documented design choices.
+Held to the explicit Phase 1 guard rather than manufacturing a "bug".
+
+### Phase 2: Feature — `paper_trader/ml/gate_risk_profile.py` (0047046)
+
+Read-only sibling to `gate_realized.py`. `gate_realized` grades the
+gate's bigger bets purely on **mean** of realized 5d return; a quant
+cannot size off mean alone. Per acted arm the new analyzer reports
+`n`, `win_rate`, `mean`, `median`, `p10`/`p25`/`p75`/`p90`,
+`mean_win`/`mean_loss`, `stdev`, `sharpe` (`mean / stdev`),
+`expected_value` (win-rate-weighted blend — must equal `mean` by
+construction; a deviation flags a pipeline bug). The verdict ladder
+grades **risk-adjusted** behavior:
+
+| Verdict | Trigger |
+|---------|---------|
+| `WIN_RATE_INVERTED` | `tail.win_rate < head.win_rate − 0.05` — the ×1.30 arm is right LESS often than the ×0.60 arm |
+| `SHARPE_UNDEFINED_ARM` | one extreme arm has zero return variance (stdev=0 ⇒ sharpe undefined) — risk-adjusted comparison structurally not computable |
+| `UNFAVORABLE_RISK` | `tail.sharpe − head.sharpe < −0.10` — bigger bets carry WORSE risk-adjusted reward |
+| `RISK_INDIFFERENT` | `|sharpe spread| ≤ 0.10` — neither edge nor inversion; reallocating variance, not edge |
+| `RISK_PROPORTIONAL` | `tail.sharpe − head.sharpe > +0.10` AND win-rate not inverted — the ×1.30 arm carries better risk-adjusted reward |
+
+Precedence is explicit and exact-value testable. The `abstained` bucket
+(off-distribution) is reported but never folded into the verdict —
+same honesty discipline as `gate_realized`. SSOT for arms imported from
+`gate_audit.gate_arm` (no drift across the gate diagnostic family;
+parity with `gate_realized` is locked by a per-arm-n test).
+
+CLI: `python3 -m paper_trader.ml.gate_risk_profile [--all]` — exits 2 on
+the actionable adverse verdicts (`WIN_RATE_INVERTED` / `UNFAVORABLE_RISK`)
+so cron consumers can branch. 29 tests in `tests/test_gate_risk_profile.py`
+pin metric values against hand-computed numerics and lock all five
+verdicts plus the deploy-stale `GATE_CAPTURE_NOT_YET_POPULATED` state.
+
+Live OOS run on the deployed corpus (n=328): `RISK_INDIFFERENT`
+(sharpe spread +0.052). Full-corpus run (n=5161): also `RISK_INDIFFERENT`
+(sharpe spread −0.009; per-arm Sharpe range 0.10–0.16). A real finding:
+the `mild_tailwind` (×1.15) arm posts the *lowest* OOS Sharpe of any
+arm (−0.05) and the lowest OOS win rate (38.5%), yet the gate sizes
+it UP. No existing analyzer surfaces this — `gate_realized`'s mean
+view shows arms posting similar means (the ×1.15 arm reads −0.51%,
+within noise of its peers); the risk-adjusted view shows the asymmetry.
+
+### Phase 3 findings — live ML state at 2026-05-23 (Agent 2 / pass #19)
+
+1. **Continuous loop is dormant.** No `run_continuous_backtests`
+   process running. `continuous.log` last write 2026-05-18 12:03 — 5
+   days stale. The previous pass's restoration (pass #18: train_n=4987,
+   gate_active=True) was the most recent training; nothing has driven
+   the per-cycle ML pipeline since. `decision_outcomes.jsonl` has not
+   grown since 2026-05-21 23:24. `scorer_skill_log.jsonl` has exactly
+   1 row (cycle 1, 2026-05-22). `forward_intraperiod_min/max_5d`
+   (added pass #18) appear on 0/8753 outcomes — the writer exists, but
+   no cycle has run to invoke it. No fix attempted (restarting the
+   continuous loop is operational, not in this pass's scope; reported
+   for the operator).
+
+2. **Heuristic `ml_score` carries near-zero rank skill on its own.**
+   Spearman(ml_score, forward_return_5d) on 7205 OOS BUY decisions =
+   **+0.0061**. The 10 ml_score deciles' mean realized 5d returns are
+   all in the [+0.35%, +1.74%] band with no monotone trend. This is the
+   strongest single news-derived feature the DecisionScorer ingests, and
+   on the live corpus it has essentially no rank-predictive content — a
+   sanity check on the documented baseline (`baseline_compare` MLP-vs-
+   one-liner finding). Not a code defect — surfaced because it sets
+   the ceiling on what the scorer can extract from this feature set.
+
+3. **`gate_risk_profile` reveals the new finding** (see Phase 2
+   summary): the ×1.15 `mild_tailwind` arm posts the worst OOS Sharpe
+   AND worst OOS win rate of any acted arm, yet sizes UP. The
+   conviction gate's middle-positive arm appears to be the weakest
+   link. No existing diagnostic surfaced this because they grade by
+   mean, not by Sharpe or win rate. Pure observation — no fix because
+   the gate's multiplier ratios are intentional design (see CLAUDE.md
+   §6); the analyzer makes the trade-off visible.
+
+4. **`forward_intraperiod_min/max_5d` columns are empty corpus-wide**
+   (0/8753 nonnull). The fields are defined and tested but exclusively
+   populated by `_compute_decision_outcomes`, which only runs inside the
+   dormant continuous loop. Finding #1 explains it.
+
+5. **`llm_quality_label` is 0 on all 8753 rows** — the documented
+   `pipeline_dark` state confirmed by direct corpus inspection. The
+   `_llm_annotate_outcomes` path is currently producing zero non-zero
+   labels (per `LLM_ANNOTATION_SKILL_LOG` design and the silent
+   `except Exception`).
+
+### Tests
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader && \
+  python3 -m pytest tests/test_gate_risk_profile.py -v
+# 29 passed
+```
+
+Full ml/backtest suite: `python3 -m pytest tests/ -k "ml or backtest or scorer or gate" -q`
+— 1031 passed.
+
+---
+
 ## 2026-05-23 paper-trader core HYBRID pass #7 (Agent 1) — _no_decision_cause whitespace + last_real_decision() primitive
 
 ### Phase 1: Debug — 1 bug fixed (5ffd69a)
