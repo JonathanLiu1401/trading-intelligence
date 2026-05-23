@@ -533,8 +533,9 @@ def split_outcomes_temporal(
 
 def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
     """Compute RMSE of `scorer` predictions against actual `forward_return_5d`
-    on a held-out set. Returns ``{"n": int, "rmse": float|None,
-    "rmse_unclamped": float|None}``.
+    on a held-out set. Returns ``{"n", "rmse", "rmse_unclamped", "buy_n",
+    "buy_rmse", "sell_n", "sell_rmse"}`` (all float|None metrics, ints for the
+    counts; the legacy ``n``/``rmse``/``rmse_unclamped`` keys are unchanged).
 
     Records whose `forward_return_5d` is missing or non-finite are DROPPED,
     not coerced to 0.0 — mirroring the NaN-sentinel discipline that
@@ -561,12 +562,26 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
     surfaced alongside ``rmse`` (the primary headline metric) so a quant who
     wants the raw real-world error can still see it — additive, not
     destructive.
+
+    **Per-action breakdown (2026-05-23 feature).** The ``_ml_decide``
+    conviction gate is BUY-only (CLAUDE.md §6), so the gate-relevant
+    quantity is the BUY error — the aggregate RMSE can hide a BUY error
+    that's much worse (or much better) than the SELL error. ``buy_rmse``
+    and ``sell_rmse`` mirror the per-action rank-IC breakdown already
+    present in ``_oos_rank_metrics`` (``oos_buy_n``/``oos_buy_ic``/
+    ``oos_sell_n``/``oos_sell_ic``) so the skill ledger can trend BUY
+    error and SELL error as separate signals. Both use the same
+    label-clamp + SELL-sign-flip discipline as the aggregate.
     """
     if not oos_records:
-        return {"n": 0, "rmse": None, "rmse_unclamped": None}
+        return {"n": 0, "rmse": None, "rmse_unclamped": None,
+                "buy_n": 0, "buy_rmse": None,
+                "sell_n": 0, "sell_rmse": None}
     if not getattr(scorer, "is_trained", False):
         return {"n": len(oos_records), "rmse": None,
                 "rmse_unclamped": None,
+                "buy_n": 0, "buy_rmse": None,
+                "sell_n": 0, "sell_rmse": None,
                 "error": "scorer not trained"}
 
     from paper_trader.ml.decision_scorer import _to_float, PRED_CLAMP_PCT
@@ -586,6 +601,14 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
     preds: list[float] = []
     actuals_clamped: list[float] = []
     actuals_raw: list[float] = []
+    # Per-action buckets — populated alongside the aggregate so we never
+    # do a second predict pass (the predict call is the expensive step;
+    # the bucket split is free). Mirrors the buy/sell rank-IC discipline
+    # in `_oos_rank_metrics`.
+    buy_preds: list[float] = []
+    buy_actuals: list[float] = []
+    sell_preds: list[float] = []
+    sell_actuals: list[float] = []
     for r in oos_records:
         try:
             if _use_meta:
@@ -638,14 +661,23 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
                 actuals_raw.append(af)
                 # Mirror train_scorer's symmetric label clamp so RMSE describes
                 # the same target space the model was trained against.
-                actuals_clamped.append(
-                    max(-PRED_CLAMP_PCT, min(PRED_CLAMP_PCT, af))
-                )
+                af_clamped = max(-PRED_CLAMP_PCT, min(PRED_CLAMP_PCT, af))
+                actuals_clamped.append(af_clamped)
+                # Per-action bucket using the SAME clamped target as the
+                # aggregate so buy_rmse and rmse are computed apples-to-apples.
+                if action == "SELL":
+                    sell_preds.append(pf)
+                    sell_actuals.append(af_clamped)
+                else:
+                    buy_preds.append(pf)
+                    buy_actuals.append(af_clamped)
         except Exception:
             continue
 
     if not preds:
         return {"n": 0, "rmse": None, "rmse_unclamped": None,
+                "buy_n": 0, "buy_rmse": None,
+                "sell_n": 0, "sell_rmse": None,
                 "error": "no predictable records"}
 
     arr_p = np.array(preds, dtype=np.float64)
@@ -653,4 +685,20 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
     arr_a_raw = np.array(actuals_raw, dtype=np.float64)
     rmse = float(np.sqrt(np.mean((arr_p - arr_a_clamped) ** 2)))
     rmse_unclamped = float(np.sqrt(np.mean((arr_p - arr_a_raw) ** 2)))
-    return {"n": len(preds), "rmse": rmse, "rmse_unclamped": rmse_unclamped}
+
+    def _rmse_or_none(ps: list[float], acs: list[float]) -> float | None:
+        if not ps:
+            return None
+        arr_p_b = np.array(ps, dtype=np.float64)
+        arr_a_b = np.array(acs, dtype=np.float64)
+        return float(np.sqrt(np.mean((arr_p_b - arr_a_b) ** 2)))
+
+    return {
+        "n": len(preds),
+        "rmse": rmse,
+        "rmse_unclamped": rmse_unclamped,
+        "buy_n": len(buy_preds),
+        "buy_rmse": _rmse_or_none(buy_preds, buy_actuals),
+        "sell_n": len(sell_preds),
+        "sell_rmse": _rmse_or_none(sell_preds, sell_actuals),
+    }

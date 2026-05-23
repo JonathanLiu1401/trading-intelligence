@@ -1586,6 +1586,53 @@ class TestParseScorerStatus:
         assert p["oos_sell_dir_acc"] is None
         assert p["oos_sell_ic"] is None
 
+    def test_parses_per_action_rmse_tokens(self):
+        """The 2026-05-23 per-action OOS RMSE wiring adds oos_buy_rmse_n/
+        oos_buy_rmse and oos_sell_* equivalents. Parser must extract them
+        as int counts + float RMSEs. The conviction gate (#5) is BUY-only,
+        so the gate-relevant headline magnitude error is oos_buy_rmse."""
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=708 "
+             "oos_rmse=12.40 "
+             "oos_buy_rmse_n=600 oos_buy_rmse=11.80 "
+             "oos_sell_rmse_n=108 oos_sell_rmse=15.20 "
+             "oos_diracc=0.55 oos_ic=+0.03")
+        p = rcb._parse_scorer_status(s)
+        assert p["status"] == "ok"
+        # Aggregate unchanged.
+        assert p["oos_rmse"] == pytest.approx(12.40)
+        # New per-action RMSE fields.
+        assert p["oos_buy_rmse_n"] == 600
+        assert p["oos_buy_rmse"] == pytest.approx(11.80)
+        assert p["oos_sell_rmse_n"] == 108
+        assert p["oos_sell_rmse"] == pytest.approx(15.20)
+
+    def test_legacy_status_without_per_action_rmse_tokens_parses_cleanly(self):
+        """A pre-2026-05-23 status string omits oos_buy_rmse_*/oos_sell_rmse_*
+        tokens; parser must yield None so historical ledger rows still load
+        (same legacy-status discipline as every sibling token addition)."""
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=708 "
+             "oos_rmse=12.40 oos_diracc=0.55 oos_ic=+0.03")
+        p = rcb._parse_scorer_status(s)
+        assert p["status"] == "ok"
+        assert p["oos_buy_rmse_n"] is None
+        assert p["oos_buy_rmse"] is None
+        assert p["oos_sell_rmse_n"] is None
+        assert p["oos_sell_rmse"] is None
+
+    def test_per_action_rmse_na_when_one_action_absent(self):
+        """A status where only BUYs exist: oos_sell_rmse=n/a. The parser
+        must yield (real float, None) rather than crash on the n/a token."""
+        s = ("scorer ok train_n=3540 val_rmse=5.20 oos_n=600 "
+             "oos_rmse=12.40 "
+             "oos_buy_rmse_n=600 oos_buy_rmse=11.80 "
+             "oos_sell_rmse_n=0 oos_sell_rmse=n/a "
+             "oos_diracc=0.55 oos_ic=+0.03")
+        p = rcb._parse_scorer_status(s)
+        assert p["status"] == "ok"
+        assert p["oos_buy_rmse"] == pytest.approx(11.80)
+        assert p["oos_sell_rmse"] is None  # n/a degrades to None
+        assert p["oos_sell_rmse_n"] == 0
+
     def test_parses_label_dropped_count(self):
         """`n_label_dropped` token is parsed as int (the pass #16 wiring
         surfaces the per-cycle count of training rows dropped due to

@@ -1234,6 +1234,15 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
     # reported to the operator as `scorer err` (a false "scorer broken" signal
     # that would make an operator think the conviction gate never engages).
     oos_rmse_s = "n/a"
+    # Per-action OOS RMSE — the conviction gate (#5) is BUY-only, so the
+    # gate-relevant error magnitude is the BUY RMSE. An aggregate RMSE can
+    # hide a BUY error much worse (or better) than the SELL error.
+    # Additive in the status string — the legacy `oos_rmse` token is
+    # unchanged so every existing parser keeps working.
+    oos_buy_rmse_s = "n/a"
+    oos_buy_rmse_n = 0
+    oos_sell_rmse_s = "n/a"
+    oos_sell_rmse_n = 0
     if result.get("status") == "ok" and oos_records:
         try:
             from paper_trader.validation import evaluate_scorer_oos
@@ -1244,6 +1253,16 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
             r = oos.get("rmse")
             if r is not None and r == r:
                 oos_rmse_s = f"{r:.2f}"
+            # Per-action breakdown — additive; legacy `oos_rmse` token above
+            # is the aggregate over all actions and is unchanged.
+            oos_buy_rmse_n = int(oos.get("buy_n") or 0)
+            oos_sell_rmse_n = int(oos.get("sell_n") or 0)
+            br = oos.get("buy_rmse")
+            if br is not None and br == br:
+                oos_buy_rmse_s = f"{br:.2f}"
+            sr = oos.get("sell_rmse")
+            if sr is not None and sr == sr:
+                oos_sell_rmse_s = f"{sr:.2f}"
         except Exception as exc:
             oos_rmse_s = f"n/a (oos-eval err: {type(exc).__name__})"
 
@@ -1354,6 +1373,10 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
     label_dropped = result.get("n_label_dropped", 0)
     return (f"scorer {result['status']} train_n={result['n']} "
             f"val_rmse={val_s} oos_n={len(oos_records)} oos_rmse={oos_rmse_s} "
+            f"oos_buy_rmse_n={oos_buy_rmse_n} "
+            f"oos_buy_rmse={oos_buy_rmse_s} "
+            f"oos_sell_rmse_n={oos_sell_rmse_n} "
+            f"oos_sell_rmse={oos_sell_rmse_s} "
             f"oos_diracc={oos_diracc_s} oos_ic={oos_ic_s} "
             f"oos_n_10={oos_n_10} oos_diracc_10={oos_diracc_10_s} "
             f"oos_ic_10={oos_ic_10_s} oos_n_20={oos_n_20} "
@@ -1403,6 +1426,11 @@ def _parse_scorer_status(status: str) -> dict:
         # so historical skill-ledger rows parse cleanly.
         "oos_buy_n": None, "oos_buy_dir_acc": None, "oos_buy_ic": None,
         "oos_sell_n": None, "oos_sell_dir_acc": None, "oos_sell_ic": None,
+        # Per-action OOS RMSE (2026-05-23 feature). The conviction gate is
+        # BUY-only, so the gate-relevant magnitude error is BUY RMSE.
+        # None on older status strings — historical ledger rows parse clean.
+        "oos_buy_rmse_n": None, "oos_buy_rmse": None,
+        "oos_sell_rmse_n": None, "oos_sell_rmse": None,
         # Per-regime OOS rank-IC. None on older status strings predating
         # the regime-breakdown wiring — historical ledger rows parse clean.
         "oos_bull_n": None, "oos_bull_ic": None,
@@ -1462,6 +1490,15 @@ def _parse_scorer_status(status: str) -> dict:
         out["oos_buy_ic"] = _num("oos_buy_ic")
         out["oos_sell_dir_acc"] = _num("oos_sell_diracc")
         out["oos_sell_ic"] = _num("oos_sell_ic")
+        # Per-action OOS RMSE — int counts, float rmse. The status string
+        # uses `oos_buy_rmse_n` / `oos_buy_rmse` (and SELL equivalents) so
+        # both keys parse cleanly even when one is "n/a".
+        obrn = _num("oos_buy_rmse_n")
+        osrn = _num("oos_sell_rmse_n")
+        out["oos_buy_rmse_n"] = int(obrn) if obrn is not None else None
+        out["oos_sell_rmse_n"] = int(osrn) if osrn is not None else None
+        out["oos_buy_rmse"] = _num("oos_buy_rmse")
+        out["oos_sell_rmse"] = _num("oos_sell_rmse")
         # Per-regime — int counts, float rank-IC. Old status strings omit
         # the tokens entirely and degrade to None via the `_num` regex miss.
         for _reg in ("bull", "sideways", "bear"):
@@ -1487,6 +1524,8 @@ def _parse_scorer_status(status: str) -> dict:
             "oos_ic_20": None,
             "oos_buy_n": None, "oos_buy_dir_acc": None, "oos_buy_ic": None,
             "oos_sell_n": None, "oos_sell_dir_acc": None, "oos_sell_ic": None,
+            "oos_buy_rmse_n": None, "oos_buy_rmse": None,
+            "oos_sell_rmse_n": None, "oos_sell_rmse": None,
             "oos_bull_n": None, "oos_bull_ic": None,
             "oos_sideways_n": None, "oos_sideways_ic": None,
             "oos_bear_n": None, "oos_bear_ic": None,

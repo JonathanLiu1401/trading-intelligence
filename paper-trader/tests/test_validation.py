@@ -743,3 +743,118 @@ class TestEvaluateScorerOosLabelClamp:
         assert result["rmse"] is None
         assert result["rmse_unclamped"] is None
 
+
+class TestEvaluateScorerOosPerActionBreakdown:
+    """Per-action OOS RMSE (2026-05-23 feature): the gate is BUY-only, so
+    the gate-relevant magnitude error is the BUY RMSE. An aggregate RMSE
+    can hide a BUY error much worse (or better) than the SELL error.
+    Mirrors the per-action rank-IC breakdown in `_oos_rank_metrics`.
+    """
+
+    def _scorer_predicting(self, value: float):
+        class _FixedScorer:
+            is_trained = True
+
+            def predict(self, **_kw):
+                return value
+        return _FixedScorer()
+
+    def test_buy_and_sell_rmse_computed_separately(self):
+        """Two BUYs with error 2, two SELLs (after sign-flip) with error 4.
+        buy_rmse = 2.0, sell_rmse = 4.0, aggregate rmse = sqrt(10) ≈ 3.16.
+        """
+        from paper_trader.validation import evaluate_scorer_oos
+        result = evaluate_scorer_oos(
+            self._scorer_predicting(0.0),
+            [
+                {"forward_return_5d": 2.0, "action": "BUY", "ticker": "NVDA"},
+                {"forward_return_5d": -2.0, "action": "BUY", "ticker": "AMD"},
+                # SELL: realized -4 → flipped to +4 → error |0 - 4| = 4
+                {"forward_return_5d": -4.0, "action": "SELL", "ticker": "MU"},
+                {"forward_return_5d": 4.0, "action": "SELL", "ticker": "INTC"},
+            ],
+        )
+        assert result["n"] == 4
+        assert result["buy_n"] == 2
+        assert result["sell_n"] == 2
+        assert result["buy_rmse"] == pytest.approx(2.0, abs=1e-9)
+        assert result["sell_rmse"] == pytest.approx(4.0, abs=1e-9)
+        # Aggregate: sqrt(mean(4,4,16,16)) = sqrt(10) ≈ 3.162
+        assert result["rmse"] == pytest.approx((10.0) ** 0.5, abs=1e-9)
+
+    def test_empty_returns_per_action_zeros(self):
+        from paper_trader.validation import evaluate_scorer_oos
+        result = evaluate_scorer_oos(self._scorer_predicting(0.0), [])
+        assert result["buy_n"] == 0
+        assert result["sell_n"] == 0
+        assert result["buy_rmse"] is None
+        assert result["sell_rmse"] is None
+
+    def test_only_buys_sell_rmse_is_none(self):
+        """If no SELL records exist in the OOS slice, sell_rmse must be
+        honestly None, not a fabricated 0.0 that would mislead a quant.
+        """
+        from paper_trader.validation import evaluate_scorer_oos
+        result = evaluate_scorer_oos(
+            self._scorer_predicting(1.0),
+            [
+                {"forward_return_5d": 2.0, "action": "BUY", "ticker": "NVDA"},
+            ],
+        )
+        assert result["buy_n"] == 1
+        assert result["sell_n"] == 0
+        assert result["buy_rmse"] == pytest.approx(1.0, abs=1e-9)
+        assert result["sell_rmse"] is None
+        # Aggregate equals buy_rmse when there are no SELLs.
+        assert result["rmse"] == pytest.approx(1.0, abs=1e-9)
+
+    def test_only_sells_buy_rmse_is_none(self):
+        """Mirror: a SELL-only slice has buy_rmse=None."""
+        from paper_trader.validation import evaluate_scorer_oos
+        result = evaluate_scorer_oos(
+            self._scorer_predicting(2.0),
+            [
+                {"forward_return_5d": -1.0, "action": "SELL", "ticker": "MU"},
+            ],
+        )
+        assert result["buy_n"] == 0
+        assert result["sell_n"] == 1
+        assert result["buy_rmse"] is None
+        # Pred 2, actual -1 flipped to +1, error 1.
+        assert result["sell_rmse"] == pytest.approx(1.0, abs=1e-9)
+
+    def test_buy_rmse_uses_same_label_clamp_as_aggregate(self):
+        """A BUY with |forward_return_5d|=175 contributes to buy_rmse under
+        the SAME ±PRED_CLAMP_PCT clamp as the aggregate rmse — apples-to-apples
+        with train_scorer's clamped labels. Pre-clamp pred=50 vs raw=175 →
+        error 125; post-clamp pred=50 vs clamped=50 → error 0.
+        """
+        from paper_trader.validation import evaluate_scorer_oos
+        result = evaluate_scorer_oos(
+            self._scorer_predicting(50.0),
+            [
+                {"forward_return_5d": 175.0, "action": "BUY", "ticker": "MSTR"},
+            ],
+        )
+        assert result["buy_n"] == 1
+        assert result["buy_rmse"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_buy_n_plus_sell_n_equals_aggregate_n(self):
+        """Conservation: every counted row falls into exactly one action
+        bucket. This is the structural invariant a quant would check first.
+        """
+        from paper_trader.validation import evaluate_scorer_oos
+        records = [
+            {"forward_return_5d": 1.0, "action": "BUY", "ticker": "NVDA"},
+            {"forward_return_5d": 2.0, "action": "BUY", "ticker": "AMD"},
+            {"forward_return_5d": -3.0, "action": "SELL", "ticker": "MU"},
+            # Unspecified action defaults to BUY (matches the existing
+            # `str(r.get("action") or "BUY").upper()` convention).
+            {"forward_return_5d": 4.0, "ticker": "INTC"},
+        ]
+        result = evaluate_scorer_oos(self._scorer_predicting(0.0), records)
+        assert result["n"] == result["buy_n"] + result["sell_n"]
+        # Default-action BUY counts in the BUY bucket, not SELL.
+        assert result["buy_n"] == 3
+        assert result["sell_n"] == 1
+
