@@ -560,6 +560,144 @@ class TestStarvationByCause:
         assert "by cause:" not in out
 
 
+# ── recent_starvation_trend — temporal direction of the storm ────────────────
+# The aggregate rate hides direction: 50% could be a clearing storm (100%→0%)
+# or an intensifying one (0%→100%). The operator's action diverges across the
+# two cases, so a separate verdict is required.
+
+def _seed_decisions(db_path, rows):
+    """Insert decisions rows in the given order. The LAST tuple becomes the
+    NEWEST row (highest id), matching the live-trader insert order."""
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "action_taken TEXT, reasoning TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO decisions (action_taken, reasoning) VALUES (?, ?)", rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestStarvationTrend:
+    """``recent_starvation_trend`` splits the recent decisions into two
+    equal halves (older/newer by row id) and reports the rate delta. Pins
+    each verdict ladder rung against deterministic seeded DBs."""
+
+    _STARV_ROW = ("NO_DECISION", "skipped claude call — host saturated: x")
+    _OK_ROW = ("BUY NVDA → FILLED", "ok")
+
+    def test_worsening_when_newer_half_has_more_starvation(self, tmp_path):
+        db = tmp_path / "pt.db"
+        # 20 older rows: all OK; 20 newer rows: all starved.
+        # Order matters — last inserted is newest.
+        rows = [self._OK_ROW] * 20 + [self._STARV_ROW] * 20
+        _seed_decisions(db, rows)
+        out = hg.recent_starvation_trend(db, limit=120)
+        assert out["ok"] is True
+        assert out["state"] == "WORSENING"
+        assert out["newer_rate"] == 1.0
+        assert out["older_rate"] == 0.0
+        assert out["delta"] == 1.0
+        assert "WORSENING" in out["headline"]
+
+    def test_recovering_when_newer_half_has_less_starvation(self, tmp_path):
+        db = tmp_path / "pt.db"
+        # 20 older rows: all starved; 20 newer rows: all OK.
+        rows = [self._STARV_ROW] * 20 + [self._OK_ROW] * 20
+        _seed_decisions(db, rows)
+        out = hg.recent_starvation_trend(db, limit=120)
+        assert out["state"] == "RECOVERING"
+        assert out["newer_rate"] == 0.0
+        assert out["older_rate"] == 1.0
+        assert out["delta"] == -1.0
+        assert "RECOVERING" in out["headline"]
+
+    def test_stable_when_delta_below_threshold(self, tmp_path):
+        db = tmp_path / "pt.db"
+        # 20 older: 10 starved (50%); 20 newer: 11 starved (55%).
+        # Delta 5pp < _TREND_DELTA (10pp) → STABLE.
+        older = [self._STARV_ROW] * 10 + [self._OK_ROW] * 10
+        newer = [self._STARV_ROW] * 11 + [self._OK_ROW] * 9
+        _seed_decisions(db, older + newer)
+        out = hg.recent_starvation_trend(db, limit=120)
+        assert out["state"] == "STABLE"
+        # 50% → 55% (delta 0.05)
+        assert abs(out["delta"] - 0.05) < 1e-6
+
+    def test_insufficient_below_min_half(self, tmp_path):
+        db = tmp_path / "pt.db"
+        # 9 rows per half (under _TREND_MIN_HALF=10). The function still
+        # returns rates, but state must be INSUFFICIENT.
+        rows = [self._OK_ROW] * 9 + [self._STARV_ROW] * 9
+        _seed_decisions(db, rows)
+        out = hg.recent_starvation_trend(db, limit=120)
+        assert out["ok"] is True
+        assert out["state"] == "INSUFFICIENT"
+        # Even with a real-direction signal in the data, the verdict
+        # suppresses to INSUFFICIENT because the sample is too small.
+        assert "need" in out["headline"]
+
+    def test_empty_db_is_insufficient_not_error(self, tmp_path):
+        db = tmp_path / "pt.db"
+        _seed_decisions(db, [])
+        out = hg.recent_starvation_trend(db, limit=120)
+        # ok=True (read worked, no rows) but state stays INSUFFICIENT.
+        assert out["ok"] is True
+        assert out["state"] == "INSUFFICIENT"
+
+    def test_missing_db_returns_safe_default(self):
+        out = hg.recent_starvation_trend("/no/such/db.path")
+        assert out["ok"] is False
+        assert out["state"] == "INSUFFICIENT"
+        # Never raises — caller can still render the line.
+
+    def test_threshold_exactly_at_floor_is_worsening(self, tmp_path):
+        db = tmp_path / "pt.db"
+        # delta == +0.10 exactly should classify WORSENING (>= boundary).
+        # 20 older: 0 starved; 20 newer: 2 starved (10%).
+        older = [self._OK_ROW] * 20
+        newer = [self._STARV_ROW] * 2 + [self._OK_ROW] * 18
+        _seed_decisions(db, older + newer)
+        out = hg.recent_starvation_trend(db, limit=120)
+        # delta is exactly 0.10 → WORSENING (boundary inclusive).
+        assert out["state"] == "WORSENING"
+
+    def test_main_cli_renders_trend_line_when_mature(self, tmp_path, capsys,
+                                                       monkeypatch):
+        db = tmp_path / "pt.db"
+        # Mature INTENSIFYING storm — must produce a trend line.
+        rows = [self._OK_ROW] * 20 + [self._STARV_ROW] * 20
+        _seed_decisions(db, rows)
+        monkeypatch.setattr(hg, "_DEFAULT_DB", db)
+        monkeypatch.setattr(hg, "probe", lambda: {
+            "opus_count": 2, "mem_available_mb": 8000.0,
+            "swap_used_pct": 5.0, "load1": 1.0, "load5": 1.0,
+            "load15": 1.0, "cpus": 16, "load_per_cpu": 0.1,
+        })
+        hg.main([])
+        out = capsys.readouterr().out
+        assert "trend:" in out
+        assert "WORSENING" in out
+
+    def test_main_cli_suppresses_trend_line_when_insufficient(
+            self, tmp_path, capsys, monkeypatch):
+        db = tmp_path / "pt.db"
+        # Only 4 decisions — INSUFFICIENT, no trend line.
+        rows = [self._OK_ROW] * 2 + [self._STARV_ROW] * 2
+        _seed_decisions(db, rows)
+        monkeypatch.setattr(hg, "_DEFAULT_DB", db)
+        monkeypatch.setattr(hg, "probe", lambda: {
+            "opus_count": 1, "mem_available_mb": 8000.0,
+            "swap_used_pct": 5.0, "load1": 1.0, "load5": 1.0,
+            "load15": 1.0, "cpus": 16, "load_per_cpu": 0.1,
+        })
+        hg.main([])
+        out = capsys.readouterr().out
+        assert "trend:" not in out
+
+
 # ── _NOT_TICKERS — no duplicate tokens ───────────────────────────────────────
 # The set deduplicates at runtime but duplicate literals in the source code
 # are a maintenance smell: a future editor adding a new token may not notice
