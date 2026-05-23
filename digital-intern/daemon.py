@@ -124,6 +124,7 @@ from collectors.nasdaq_ipo_calendar import collect_nasdaq_ipo
 from collectors.putcall_ratio_collector import collect_putcall_ratio
 from collectors.bls_collector import collect_bls
 from collectors.bea_collector import collect_bea
+from collectors.federal_register_collector import collect_federal_register
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -213,6 +214,7 @@ G10_CB_INTERVAL         = 1800    # Bank of Canada + RBA press / speeches RSS �
 GLOBAL_REG_INTERVAL     = 1800    # FSB, FCA, Fed research notes/papers — every 30min
 UN_NEWS_INTERVAL        = 1800    # UN News economic/climate/regional feeds — every 30min
 BIS_INTERVAL            = 1800    # BIS press releases, speeches, research — every 30min
+FED_REG_INTERVAL        = 1800    # Federal Register BIS/OFAC/FTC/FCC/NIST rules — every 30min
 BLS_INTERVAL            = 3600    # BLS macro series (CPI, unemployment, payrolls) — once per hour
 BEA_INTERVAL            = 3600    # BEA macro releases (GDP, trade, personal income) — once per hour
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
@@ -327,6 +329,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "g10_cb": G10_CB_INTERVAL,
     "global_reg": GLOBAL_REG_INTERVAL,
     "bis": BIS_INTERVAL,
+    "federal_register": FED_REG_INTERVAL,
     "bls": BLS_INTERVAL,
     "bea": BEA_INTERVAL,
     "globenewswire": GLOBENEWSWIRE_INTERVAL,
@@ -1967,6 +1970,27 @@ def bea_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(BEA_INTERVAL)
+
+
+def federal_register_worker(store: ArticleStore):
+    log.info("[federal_register_worker] started")
+    bo = Backoff("federal_register", base=120.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_federal_register()
+            _ingest(store, articles, "federal_register")
+            try:
+                source_health.record_result("federal_register", len(articles))
+            except Exception as he:
+                log.warning(f"[federal_register_worker] source_health error: {he}")
+            _worker_last_ok["federal_register"] = time.time()
+            log.debug(f"[federal_register] cycle ok ({len(articles)} new regulatory actions)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[federal_register_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(FED_REG_INTERVAL)
 
 
 def whitehouse_worker(store: ArticleStore):
@@ -3915,6 +3939,7 @@ def main():
         ("boe_press",   boe_press_worker),
         ("bls",         bls_worker),
         ("bea",         bea_worker),
+        ("federal_register", federal_register_worker),
         ("whitehouse",  whitehouse_worker),
         ("g10_cb",      g10_cb_worker),
         ("global_reg",  global_reg_worker),
