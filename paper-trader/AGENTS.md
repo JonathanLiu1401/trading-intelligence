@@ -6,6 +6,136 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 feature-dev (Agent 4) — `/api/frozen-mark-execution-skill` + `/api/closed-market-fill-skill`
+
+**Phase 1 — live exploration (user_findings: 3)**
+
+Probed the live store directly (`paper_trader.db?mode=ro`) and found
+three observable pathologies the existing endpoint surface does *not*
+catch:
+
+1. **5 NVDA trades all at exactly `$223.43499755859375`.** The cluster
+   spans 2026-05-20T21:10 → 2026-05-21T10:00 (a 12.8h overnight
+   window): BUY 1 → BUY 0.5 → SELL 4.5 → BUY 2 → BUY 1. Net qty delta
+   = 0.0 across the whole cluster — the desk burned 5 decision cycles
+   re-shuffling the same shares against a literally frozen yfinance
+   close. `rebuy_regret` / `reentry_velocity` / `churn` / `mark_integrity`
+   each catch an adjacent angle but none flags the bit-identical-price
+   cluster.
+2. **`market_open` distribution heavily skewed CLOSED.** 218 of the
+   last 281 decisions fired with `decisions.market_open = 0`; 4 of the
+   5 NVDA BUYs *and* the 1 SELL — i.e. ALL of the frozen-mark cluster's
+   FILLs — landed during overnight/pre-market. `decision_clock` /
+   `decision_weekday` distribute *decision cycles* by hour of day but
+   don't filter to FILLs or consult `is_market_open`.
+3. **No existing endpoint partitions FILLs by NYSE session state.**
+   Closest are `mark_integrity` (DISPLAYED book stale-mark share —
+   never reads `trades`) and `decision_clock` (cycles by hour).
+
+**Phase 2 — features (features_added: 2)**
+
+`paper_trader/analytics/frozen_mark_execution_skill.py` (314 lines) +
+`tests/test_frozen_mark_execution_skill.py` (43 tests, 0.80s). Route
+`/api/frozen-mark-execution-skill`. Detects FILLED trade clusters at
+the EXACT same float price within a `cluster_span_hours` (default 24h)
+window. Float equality must be bit-identical — one penny of real price
+discovery breaks the cluster. Verdict ladder:
+
+| Verdict | Trigger |
+|---|---|
+| `CLEAN` | frozen_trade_pct < `occasional_pct` (5%) |
+| `OCCASIONAL` | between CLEAN and HEAVY |
+| `FROZEN_MARK_HEAVY` | frozen_trade_pct ≥ `heavy_pct` (25%) |
+| `INSUFFICIENT_DATA` | < 5 classifiable trades in window |
+
+Per-cluster summary surfaces ticker, price, n_trades, span_hours,
+action_mix, buy_qty / sell_qty / qty_net, `realized_pnl_inside_cluster`
+(structurally 0 by the constant-price invariant — the headline
+diagnostic). Sliding-window grouping prevents distant-in-time re-visits
+of the same round price from merging. Live-parity test replays the
+2026-05-21 NVDA cluster verbatim and asserts `FROZEN_MARK_HEAVY` +
+n_clusters=1 + worst_cluster_n_trades=5 + qty_net=0.0.
+
+`paper_trader/analytics/closed_market_fill_skill.py` (267 lines) +
+`tests/test_closed_market_fill_skill.py` (22 tests, 0.83s). Route
+`/api/closed-market-fill-skill`. Partitions every FILL by
+`market.is_market_open(trade_ts)` and further splits the CLOSED bucket
+into overnight / weekend / holiday using the live
+`NYSE_HOLIDAYS_2026` set. Verdict ladder:
+
+| Verdict | Trigger |
+|---|---|
+| `SESSION_ALIGNED` | closed_pct ≤ `aligned_pct` (25) |
+| `BALANCED` | aligned..`after_hours_pct` (50) |
+| `AFTER_HOURS_HEAVY` | after_hours..`dominated_pct` (75) |
+| `OVERNIGHT_DOMINATED` | ≥ dominated_pct |
+| `INSUFFICIENT_DATA` | < 5 FILLs in window |
+
+`is_open_fn` is injectable for tests (default = live
+`paper_trader.market.is_market_open`, NYSE calendar + half-days + 2026
+holidays). Test-injected `is_open_fn` that raises is caught and bucketed
+as CLOSED so the route never 500s on a calendar fault. Per-ticker
+breakdown sorted by `closed_pct` DESC. Notional sums too. Live-parity
+test replays the 5 NVDA fills against the real `is_market_open` and
+asserts `OVERNIGHT_DOMINATED` + n_closed=5 + overnight subbucket=5.
+
+**Live signal on first hit** (Flask `test_client` against the running
+`paper_trader.db`, 2026-05-23T13:42 UTC):
+
+* `/api/frozen-mark-execution-skill`: 1 cluster, NVDA at $223.4350,
+  n_trades=5, span_hours=12.85, buy_qty=4.5, sell_qty=4.5,
+  **qty_net=0.0**. The book recorded 5 alpha-attempt trades that, in
+  aggregate, moved zero shares at a constant price.
+* `/api/closed-market-fill-skill`: 66.7% of 12 in-window FILLs closed,
+  8 overnight / 0 weekend / 0 holiday, NVDA at 100% closed (7/7),
+  verdict `AFTER_HOURS_HEAVY`.
+
+These are pure-read advisory endpoints (AGENTS.md #2/#12) — never gate
+Opus, never write back, never raise. Mirror the
+`cash_redeployment_latency_skill` / `decision_vapor_skill` builder
+split exactly: helper module owns pure logic + DEFAULT_* constants +
+MIN_*_FOR_VERDICT floors; the dashboard route forwards query params via
+`_qf` / `_qi` clamps. Both routes verified via Flask test_client; the
+live service at :8090 will not see them until restart (`paper-trader
+chronic stale` memory).
+
+**Phase 3 — test discipline (tests_added: 65)**
+
+| Suite | Tests | Time |
+|---|---|---|
+| `test_frozen_mark_execution_skill.py` | 43 | 0.80s |
+| `test_closed_market_fill_skill.py` | 22 | 0.83s |
+| **Combined** | **65** | **1.6s** |
+
+Coverage classes (each suite):
+* Helpers — `_parse_iso`, `_safe_float` (NaN/inf/bool/str all rejected),
+  `_normalize_trade` (HOLD/NO_DECISION dropped), `_closed_subbucket`
+  (weekend/overnight/holiday boundary).
+* Verdict ladder — every rung explicitly hit + INSUFFICIENT_DATA floor.
+* Boundary semantics — one-penny price difference splits a cluster;
+  cluster_span_hours gap breaks contiguity; cluster_min raises floor.
+* Threshold overrides — scrambled (heavy<occasional, dominated<aligned)
+  thresholds widen rather than raise; per-arg promotions tested.
+* Defensive degradation — None / {} / wrong types / NaN / inf / garbage
+  strings all degrade without raising.
+* Live-data parity — both suites replay the 2026-05-21 NVDA cluster
+  verbatim and pin the verdict. If the executor stops writing
+  bit-identical prices or `market.is_market_open` changes calendar,
+  these break loud.
+* Flask route smoke — `test_client` exercise + invalid-param clamping
+  test, both checking the envelope keys are stable on either path.
+
+Adjacent regression sweep:
+* `tests/ -k "skill"` (815 tests) — all pass.
+* `tests/test_dashboard*.py tests/test_*_endpoint.py` (293 tests) —
+  all pass.
+
+**Counters**
+
+bugs_fixed=0 · features_added=2 · tests_added=65 · user_findings=3
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #16 (Agent 2) — `n_label_dropped` ledger wiring + `dropped_label_audit` triage CLI
 
 **Phase 1 — bug fix (bugs_fixed: 1)**
