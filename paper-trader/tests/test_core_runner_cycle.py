@@ -442,3 +442,175 @@ class TestCircuitBreakerAlert:
             lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
         runner._cycle()
         assert runner._no_decision_first_ts is None
+
+
+class TestQuotaOutageRecovery:
+    """The quota EXHAUSTED → RECOVERED bracket. Mirror of the breaker
+    FIRED → CLEARED tests one dimension over: quota is a distinct failure
+    mode from a wedged CLI (the claude process exited fast, non-zero,
+    pkill is futile), so it has its own latch (`_quota_alert_active`),
+    its own elapsed-time anchor (`_quota_first_ts`), and its own
+    recovery message (`send_quota_recovered_alert`)."""
+
+    @pytest.fixture
+    def quota_setup(self, monkeypatch):
+        # Reset all module globals between tests so state doesn't leak.
+        monkeypatch.setattr(runner, "_consecutive_no_decisions", 0)
+        monkeypatch.setattr(runner, "_breaker_alert_active", False)
+        monkeypatch.setattr(runner, "_quota_alert_active", False)
+        monkeypatch.setattr(runner, "_no_decision_first_ts", None)
+        monkeypatch.setattr(runner, "_quota_first_ts", None)
+        alerts = {
+            "fired_quota": [],
+            "recovered_quota": [],
+            "fired_breaker": [],
+            "send": [],
+        }
+        monkeypatch.setattr(
+            runner.reporter, "send_quota_alert",
+            lambda detail="": (
+                alerts["fired_quota"].append(detail) or True
+            ),
+        )
+        monkeypatch.setattr(
+            runner.reporter, "send_quota_recovered_alert",
+            lambda *, elapsed_s=None: (
+                alerts["recovered_quota"].append(elapsed_s) or True
+            ),
+        )
+        # send_breaker_fired_alert must accept the same kwargs the runner
+        # passes — the quota path must NEVER fire it, but the stub still
+        # has to match the signature so a misrouted call records cleanly.
+        monkeypatch.setattr(
+            runner.reporter, "send_breaker_fired_alert",
+            lambda n, cause="", *, elapsed_s=None: (
+                alerts["fired_breaker"].append((n, cause, elapsed_s))
+                or True
+            ),
+        )
+        monkeypatch.setattr(runner.reporter, "_send",
+                            lambda m: alerts["send"].append(m) or True)
+        monkeypatch.setattr(runner, "_kill_stale_claude", lambda: None)
+        monkeypatch.setattr(runner, "get_store", lambda: _FakeStore([]))
+        return alerts
+
+    def _run_quota_cycles(self, n, monkeypatch):
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "NO_DECISION", "decision": None,
+                     "quota_exhausted": True})
+        for _ in range(n):
+            runner._cycle()
+
+    def test_first_quota_cycle_anchors_first_ts(
+            self, quota_setup, monkeypatch):
+        """The first quota cycle of an outage MUST set ``_quota_first_ts``
+        so the recovery message can later render the real wedge duration.
+        Without this anchor, ``send_quota_recovered_alert`` always degrades
+        to the no-duration fallback."""
+        assert runner._quota_first_ts is None
+        self._run_quota_cycles(1, monkeypatch)
+        assert runner._quota_first_ts is not None
+
+    def test_quota_first_ts_does_not_re_anchor_on_later_cycles(
+            self, quota_setup, monkeypatch):
+        """A multi-cycle quota outage must NOT keep re-anchoring on every
+        cycle (that would silently collapse the elapsed duration to ~0 at
+        recovery and defeat the bracket close — the whole point of the
+        feature). The anchor is set once on the FIRST quota cycle and held
+        until the outage clears."""
+        self._run_quota_cycles(1, monkeypatch)
+        first = runner._quota_first_ts
+        assert first is not None
+        # Drive 4 more quota cycles — the anchor must be the SAME instance.
+        self._run_quota_cycles(4, monkeypatch)
+        assert runner._quota_first_ts is first
+
+    def test_recovery_passes_elapsed_s_and_clears_anchor(
+            self, quota_setup, monkeypatch):
+        """A real decision after a quota outage must (a) fire the recovery
+        alert with a non-None ``elapsed_s`` reflecting the actual outage
+        duration, and (b) reset both the latch AND the ``_quota_first_ts``
+        anchor so the NEXT outage starts its own clock fresh.
+        Mirrors the breaker test_recovery_alert_receives_real_wedge_duration
+        contract one dimension over."""
+        # Force a deterministic outage start ~7 minutes in the past.
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        outage_started = _dt.now(_tz.utc) - _td(seconds=420)
+        monkeypatch.setattr(runner, "_quota_first_ts", outage_started)
+        monkeypatch.setattr(runner, "_quota_alert_active", True)
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()
+        # Recovery alert fired exactly once with a real elapsed_s.
+        assert len(quota_setup["recovered_quota"]) == 1
+        elapsed_s = quota_setup["recovered_quota"][0]
+        assert isinstance(elapsed_s, int)
+        assert 420 <= elapsed_s < 600
+        # Latch cleared AND anchor reset for the next outage.
+        assert runner._quota_alert_active is False
+        assert runner._quota_first_ts is None
+
+    def test_failed_recovery_send_leaves_latch_and_anchor_armed(
+            self, quota_setup, monkeypatch):
+        """Symmetric with the breaker recovery path: a transient openclaw
+        failure on the recovery message must leave BOTH the latch AND
+        ``_quota_first_ts`` armed so the next cycle retries with the
+        real (now slightly longer) elapsed-time figure intact. Without
+        this, an openclaw blip at recovery time silently buries the
+        EXHAUSTED→RECOVERED bracket forever."""
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        outage_started = _dt.now(_tz.utc) - _td(seconds=200)
+        monkeypatch.setattr(runner, "_quota_first_ts", outage_started)
+        monkeypatch.setattr(runner, "_quota_alert_active", True)
+        # Send returns False → latch + anchor must stay.
+        monkeypatch.setattr(
+            runner.reporter, "send_quota_recovered_alert",
+            lambda *, elapsed_s=None: False,
+        )
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()
+        assert runner._quota_alert_active is True
+        assert runner._quota_first_ts is outage_started
+
+    def test_recovery_when_anchor_missing_still_alerts(
+            self, quota_setup, monkeypatch):
+        """If ``_quota_first_ts`` was somehow not captured (legacy DB-restart
+        or test seam dropped it), the recovery must STILL fire — just with
+        elapsed_s=None. The latch must still clear on a successful send so
+        the operator gets the "we're back" message even without duration
+        context. Mirrors the breaker recovery's None-elapsed fallback."""
+        monkeypatch.setattr(runner, "_quota_first_ts", None)
+        monkeypatch.setattr(runner, "_quota_alert_active", True)
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()
+        assert len(quota_setup["recovered_quota"]) == 1
+        assert quota_setup["recovered_quota"][0] is None
+        assert runner._quota_alert_active is False
+
+    def test_quota_recovery_does_not_fire_on_no_decision(
+            self, quota_setup, monkeypatch):
+        """A NO_DECISION cycle that isn't a quota miss (timeout / parse fail)
+        must NOT clear the quota latch — only a CONFIRMED claude response
+        (HOLD / FILLED / BLOCKED) proves the quota is back. Pre-feature
+        behavior was the same; pin it so the new helper can't accidentally
+        be wired into the no-decision path."""
+        from datetime import datetime as _dt, timezone as _tz
+        anchor = _dt.now(_tz.utc)
+        monkeypatch.setattr(runner, "_quota_first_ts", anchor)
+        monkeypatch.setattr(runner, "_quota_alert_active", True)
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "NO_DECISION", "decision": None,
+                     "quota_exhausted": False})
+        runner._cycle()
+        # No recovery alert.
+        assert quota_setup["recovered_quota"] == []
+        # Latch + anchor preserved for the eventual real recovery cycle.
+        assert runner._quota_alert_active is True
+        assert runner._quota_first_ts is anchor

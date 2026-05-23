@@ -6046,3 +6046,94 @@ class TestHourlySummaryFeedHealth:
         body = captured[0]
         assert "**DAILY CLOSE**" in body
         assert "⚠️ **FEED HEALTH** ◈ STALE_FEED" in body
+
+
+class TestSendQuotaRecoveredAlert:
+    """Recovery confirmation that closes the EXHAUSTED→RECOVERED bracket for
+    the quota outage path. Mirror of TestSendBreakerClearedAlert: a trader
+    pulled away from Discord during a multi-hour quota outage gets a
+    RECOVERED ping — it must answer "how long was the bot dark?" (the
+    breaker side already does this; the quota recovery side historically
+    didn't — bare "responding again" with no duration anchor)."""
+
+    def test_includes_duration_when_elapsed_known(self, monkeypatch):
+        # 4500s outage → "1h15m" via _format_elapsed; the body must surface
+        # the real wall-clock figure so the trader can assess the impact
+        # of the quota window they just woke up to.
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        ok = reporter.send_quota_recovered_alert(elapsed_s=4500)
+        assert ok is True
+        body = captured[0]
+        assert "CLAUDE QUOTA RECOVERED" in body
+        assert "after ~1h15m dark" in body
+        assert "responding again" in body
+        assert "live trader resumed" in body
+
+    def test_omits_duration_when_elapsed_none(self, monkeypatch):
+        # Legacy/None elapsed → byte-compatible with the literal text used
+        # by the pre-feature inline `_send("✅ **CLAUDE QUOTA RECOVERED** ◈
+        # decision engine responding again — live trader resumed")` call
+        # site so a downgrade to the unconditional form is a one-keyword
+        # edit and never garbles the message.
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        ok = reporter.send_quota_recovered_alert(elapsed_s=None)
+        assert ok is True
+        body = captured[0]
+        assert body == (
+            "✅ **CLAUDE QUOTA RECOVERED** ◈ decision engine responding "
+            "again — live trader resumed"
+        )
+        assert "~" not in body
+        assert "dark" not in body
+
+    def test_negative_elapsed_falls_back_to_undecorated_body(self, monkeypatch):
+        # A negative figure (wall-clock step-back hazard the runner-state
+        # sidecar already hardens against) must NOT render as a bogus
+        # "after ~-Xm dark" — _format_elapsed already returns "" on
+        # negative input; this test pins that the caller honours that contract.
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        reporter.send_quota_recovered_alert(elapsed_s=-30)
+        body = captured[0]
+        assert "after" not in body
+        assert "~" not in body
+
+    def test_subminute_outage_renders_zero_minutes(self, monkeypatch):
+        # A quota outage that clears in <60s should still surface duration
+        # as "0m" rather than dropping the token — _format_elapsed buckets
+        # sub-minute to "0m" (TestSendBreakerFiredAlert.test_format_elapsed_buckets
+        # pins that), and this caller trusts that token instead of
+        # inventing its own threshold.
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        reporter.send_quota_recovered_alert(elapsed_s=30)
+        body = captured[0]
+        assert "after ~0m dark" in body
+
+    def test_returns_false_when_send_fails(self, monkeypatch):
+        # The runner uses this return value to decide whether to clear the
+        # _quota_alert_active latch — a transient openclaw failure must
+        # propagate False so the latch stays armed and the recovery retries
+        # next cycle (the same symmetry the breaker recovery path uses).
+        monkeypatch.setattr(reporter, "_send", lambda _msg: False)
+        assert reporter.send_quota_recovered_alert(elapsed_s=600) is False
+
+    def test_large_outage_renders_days_hours(self, monkeypatch):
+        # Multi-day quota outages must render the d+h bucket, not collapse
+        # to ~Xh or get clamped — pins the _format_elapsed d/h bucket pass-
+        # through (a quota plan reset that takes >24h is operationally
+        # plausible on a long-tail outage).
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        reporter.send_quota_recovered_alert(
+            elapsed_s=86400 + 3600 * 5  # 1d5h
+        )
+        body = captured[0]
+        assert "after ~1d5h dark" in body
