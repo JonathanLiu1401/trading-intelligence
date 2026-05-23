@@ -1829,6 +1829,172 @@ class TestAppendLlmAnnotationSkillLog:
             outcomes_path=tmp_path / "nope.jsonl") is False
 
 
+class TestAppendCalibratedReliabilityLog:
+    """The per-cycle ``predict_calibrated`` reliability ledger — answers
+    "is the calibrated-magnitude reading delivering honest %, and does the
+    calibration step measurably narrow bias vs raw predict()" durably and
+    per-cycle so a quant can trend the calibration's OOS quality. Mirrors
+    the sibling ``_append_baseline_skill_log`` / ``_append_llm_annotation_skill_log``
+    discipline: best-effort, honest gap rows, atomic bounded trim, never
+    breaks the loop.
+    """
+
+    def test_legacy_scorer_persists_dark_row(self, tmp_path, monkeypatch):
+        # The documented live state: deployed pickle (n=3987) predates
+        # pass #10 so has no ``label_quantiles`` table → every
+        # ``predict_calibrated`` returns None → no triples can be built →
+        # ``calibrated_dark=True``. The ledger must STILL append the row so
+        # the darkness is visible in the trend.
+        log = tmp_path / "calibrated_reliability_log.jsonl"
+        monkeypatch.setattr(rcb, "CALIBRATED_RELIABILITY_LOG", log)
+
+        # analyze() stub returns the documented legacy-pickle degradation
+        # shape ourselves so the test doesn't depend on the deployed pickle.
+        from paper_trader.ml import calibration_reliability as cr
+
+        def _legacy_dark(outcomes_path=None, oos_only=True, n_buckets=10):
+            return {
+                "status": "insufficient_data",
+                "verdict": "INSUFFICIENT_DATA",
+                "n": 0,
+                "oos_n": 0,
+                "spearman": None,
+                "monotone_fraction": None,
+                "mean_abs_decile_error": None,
+                "raw_mean_abs_decile_error": None,
+                "vs_raw_bias_reduction": None,
+                "scorer_n_train": 3987,
+                "outcomes_n": 8753,
+                "slice": "oos",
+                "buckets": [],
+                "hint": "scorer pickle predates label_quantiles",
+            }
+
+        monkeypatch.setattr(cr, "analyze",
+                            lambda *a, **k: _legacy_dark(*a, **k))
+
+        assert rcb._append_calibrated_reliability_log(
+            cycle=33, win_start=date(2020, 1, 2), win_end=date(2025, 1, 2),
+            outcomes_path=tmp_path / "nope.jsonl") is True
+        row = json.loads(log.read_text().strip())
+        assert row["cycle"] == 33
+        assert row["verdict"] == "INSUFFICIENT_DATA"
+        assert row["calibrated_dark"] is True
+        assert row["n"] == 0
+        assert row["scorer_n_train"] == 3987
+        assert row["outcomes_n"] == 8753
+
+    def test_directional_row_includes_bias_reduction(self, tmp_path,
+                                                     monkeypatch):
+        # When the calibrated path is alive AND measurably narrows bias vs
+        # raw predict(), the ledger row carries the numeric reduction so a
+        # quant can trend it. SSOT cross-check: the persisted bias_reduction
+        # equals what calibration_reliability.analyze returned.
+        log = tmp_path / "calibrated_reliability_log.jsonl"
+        monkeypatch.setattr(rcb, "CALIBRATED_RELIABILITY_LOG", log)
+
+        from paper_trader.ml import calibration_reliability as cr
+        directional = {
+            "status": "ok",
+            "verdict": "WELL_CALIBRATED",
+            "n": 500,
+            "oos_n": 500,
+            "spearman": 0.4,
+            "monotone_fraction": 0.9,
+            "mean_abs_decile_error": 1.2,
+            "raw_mean_abs_decile_error": 4.8,
+            "vs_raw_bias_reduction": 3.6,
+            "scorer_n_train": 4987,
+            "outcomes_n": 5000,
+            "slice": "oos",
+            "buckets": [],
+            "hint": "calibrated tracks realized within tolerance",
+        }
+        monkeypatch.setattr(cr, "analyze",
+                            lambda *a, **k: dict(directional))
+
+        rcb._append_calibrated_reliability_log(
+            cycle=44, win_start=date(2018, 6, 1), win_end=date(2023, 6, 1),
+            outcomes_path=tmp_path / "outcomes.jsonl")
+        row = json.loads(log.read_text().strip())
+        assert row["verdict"] == "WELL_CALIBRATED"
+        assert row["calibrated_dark"] is False
+        assert row["mean_abs_decile_error"] == 1.2
+        assert row["raw_mean_abs_decile_error"] == 4.8
+        assert row["vs_raw_bias_reduction"] == 3.6  # SSOT cross-check
+        assert row["scorer_n_train"] == 4987
+
+    def test_analyze_exception_degrades_to_honest_row_not_crash(
+            self, tmp_path, monkeypatch):
+        log = tmp_path / "calibrated_reliability_log.jsonl"
+        monkeypatch.setattr(rcb, "CALIBRATED_RELIABILITY_LOG", log)
+
+        def _boom(*a, **k):
+            raise RuntimeError("simulated calibration_reliability failure")
+
+        from paper_trader.ml import calibration_reliability as cr
+        monkeypatch.setattr(cr, "analyze", _boom)
+
+        assert rcb._append_calibrated_reliability_log(
+            cycle=55, win_start=date(2012, 1, 3), win_end=date(2013, 1, 3),
+            outcomes_path=tmp_path / "missing.jsonl") is True
+        row = json.loads(log.read_text().strip())
+        assert row["status"] == "error"
+        assert row["verdict"] == "INSUFFICIENT_DATA"
+        assert row["calibrated_dark"] is True
+        assert row["cycle"] == 55
+
+    def test_bounded_trim_rewrites_when_past_2x_keep(self, tmp_path,
+                                                     monkeypatch):
+        log = tmp_path / "calibrated_reliability_log.jsonl"
+        monkeypatch.setattr(rcb, "CALIBRATED_RELIABILITY_LOG", log)
+        monkeypatch.setattr(rcb, "CALIBRATED_RELIABILITY_LOG_KEEP", 4)
+        # 9 pre-seeded rows (> 2×4) ⇒ next append triggers a rewrite.
+        log.write_text("\n".join(json.dumps({"cycle": i}) for i in range(9))
+                       + "\n")
+        rcb._append_calibrated_reliability_log(
+            cycle=77, win_start=date(2012, 1, 3), win_end=date(2013, 1, 3),
+            outcomes_path=tmp_path / "nope.jsonl")
+        lines = [l for l in log.read_text().splitlines() if l.strip()]
+        assert len(lines) == 4  # trimmed to CALIBRATED_RELIABILITY_LOG_KEEP
+        assert json.loads(lines[-1])["cycle"] == 77  # newest survives
+
+    def test_directory_created_when_missing(self, tmp_path, monkeypatch):
+        # The ledger's parent dir is created on first write (mirrors every
+        # sibling _append_* function). A fresh repo with no data/ dir must
+        # not break the first cycle.
+        log = tmp_path / "nested" / "deep" / "calibrated_reliability_log.jsonl"
+        monkeypatch.setattr(rcb, "CALIBRATED_RELIABILITY_LOG", log)
+
+        from paper_trader.ml import calibration_reliability as cr
+        monkeypatch.setattr(cr, "analyze",
+                            lambda *a, **k: {"status": "insufficient_data",
+                                             "verdict": "INSUFFICIENT_DATA",
+                                             "n": 0})
+
+        assert rcb._append_calibrated_reliability_log(
+            cycle=1, win_start=date(2020, 1, 1), win_end=date(2020, 6, 1),
+            outcomes_path=tmp_path / "nope.jsonl") is True
+        assert log.exists()
+
+    def test_never_raises_on_unwritable_path(self, tmp_path, monkeypatch):
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x")
+        monkeypatch.setattr(rcb, "CALIBRATED_RELIABILITY_LOG",
+                            blocker / "sub" / "cal.jsonl")
+        # Even when the parent path can't be created, the function must
+        # swallow the OSError and return False — never raise. Mirrors the
+        # discipline of every sibling _append_*_skill_log function.
+        from paper_trader.ml import calibration_reliability as cr
+        monkeypatch.setattr(cr, "analyze",
+                            lambda *a, **k: {"status": "insufficient_data",
+                                             "verdict": "INSUFFICIENT_DATA",
+                                             "n": 0})
+        assert rcb._append_calibrated_reliability_log(
+            1, date(2000, 1, 3), date(2001, 1, 3),
+            outcomes_path=tmp_path / "nope.jsonl") is False
+
+
 # ──────────────── winner_training.jsonl bounded trim ────────────
 
 class TestTrimWinnerJsonl:
@@ -1911,6 +2077,18 @@ class TestCycleWiringRegression:
         import inspect
         src = inspect.getsource(rcb.main)
         assert "_append_llm_annotation_skill_log(" in src
+
+    def test_main_invokes_calibrated_reliability_ledger(self):
+        # The calibrated-reliability ledger surfaces whether
+        # ``predict_calibrated`` (pass #10) actually delivers honest 5d
+        # magnitudes OOS AND whether it measurably narrows bias vs raw
+        # predict() on the same OOS pairs. CLI-only until this wiring; lock
+        # the call so a future refactor cannot silently re-orphan it (the
+        # exact failure mode every sibling ledger suffered until each was
+        # wired into main()).
+        import inspect
+        src = inspect.getsource(rcb.main)
+        assert "_append_calibrated_reliability_log(" in src
 
     def test_main_reaps_orphans_per_cycle_not_only_at_startup(self):
         # Live finding: 15 rows stuck 'running' for 35h because the reaper

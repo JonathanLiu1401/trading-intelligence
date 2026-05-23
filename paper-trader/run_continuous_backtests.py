@@ -133,6 +133,23 @@ BASELINE_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 LLM_ANNOTATION_SKILL_LOG = ROOT / "data" / "llm_annotation_skill_log.jsonl"
 LLM_ANNOTATION_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 
+# Per-cycle ``predict_calibrated`` reliability ledger. Pass #10 added
+# ``DecisionScorer.predict_calibrated`` (quantile-mapped honest magnitude
+# reading) — the CLAIM is that the calibrated value delivers an honest 5d
+# return on the empirical label support, but until ``calibration_reliability``
+# landed the claim was untested out-of-sample: the existing ``calibration``
+# module bins by raw ``predict()`` and the scorer skill ledger only trends
+# scalar ``oos_rmse`` / ``oos_ic``. This appends one structured JSONL row per
+# cycle so a quant can trend whether the calibrated value's decile-binned
+# realized-vs-predicted gap is improving, holding, or degrading — AND
+# whether the calibration step measurably narrows the bias vs the raw
+# ``predict()`` reading on the SAME OOS pairs (``vs_raw_bias_reduction``).
+# Same testability rule as the sibling skill logs (module-level so tests can
+# redirect), same best-effort discipline (a ledger write must never break
+# the loop).
+CALIBRATED_RELIABILITY_LOG = ROOT / "data" / "calibrated_reliability_log.jsonl"
+CALIBRATED_RELIABILITY_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 EARLIEST_WINDOW_START = date(1993, 2, 1)  # SPY inception — ~30+ years of history
 WINDOW_END_BUFFER_DAYS = 180  # never end a window within 6 months of today
 MIN_WINDOW_YEARS = 1
@@ -1644,6 +1661,101 @@ def _append_llm_annotation_skill_log(cycle: int, win_start: date, win_end: date,
         return False
 
 
+def _append_calibrated_reliability_log(cycle: int, win_start: date,
+                                       win_end: date,
+                                       outcomes_path: "Path | str | None" = None
+                                       ) -> bool:
+    """Append one structured row to the per-cycle ``predict_calibrated``
+    reliability ledger.
+
+    Answers, durably and per-cycle: *does ``predict_calibrated`` actually
+    deliver an honest 5-day magnitude reading on data the calibration table
+    never saw, and does it measurably narrow the bias vs raw ``predict()``?*
+    Reuses ``calibration_reliability.analyze`` verbatim (OOS slice by
+    default) so the persisted verdict equals the CLI's by construction —
+    a built-in no-drift cross-check, the same idiom the sibling
+    ``_append_baseline_skill_log`` / ``_append_llm_annotation_skill_log``
+    use.
+
+    Best-effort and idempotent-safe: every fault is swallowed (a ledger
+    write must NEVER break the continuous loop — the same discipline as
+    every other ``_append_*_skill_log``). An untrained scorer, a legacy
+    pickle (no ``label_quantiles``), or a missing outcomes file all degrade
+    to a ``status='insufficient_data' verdict='INSUFFICIENT_DATA'`` row
+    rather than getting skipped — so a gap in the trend (the documented
+    "deployed scorer predates pass #10, calibrated path is dark" state) is
+    visible, not silent. Bounded growth: when the file exceeds
+    2× ``CALIBRATED_RELIABILITY_LOG_KEEP`` it is atomically rewritten via
+    the same tmp+``.replace`` idiom every sibling ledger uses.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        try:
+            from paper_trader.ml import calibration_reliability as _cr
+            rep = _cr.analyze(outcomes_path, oos_only=True)
+        except Exception as exc:
+            rep = {
+                "status": "error", "verdict": "INSUFFICIENT_DATA",
+                "hint": f"calibration_reliability unavailable: "
+                        f"{type(exc).__name__}",
+                "n": 0, "spearman": None, "monotone_fraction": None,
+                "mean_abs_decile_error": None,
+                "raw_mean_abs_decile_error": None,
+                "vs_raw_bias_reduction": None,
+            }
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA"}
+
+        # ``calibrated_dark`` is the boolean a quant cares about for the
+        # current state — mirrors the LLM-annotation ledger's
+        # ``pipeline_dark``. True ⇒ ``predict_calibrated`` produced ZERO
+        # finite triples this cycle (legacy pickle, untrained scorer, or
+        # no outcomes), so every dashboard/CLI consumer of the calibrated
+        # value is rendering None for every prediction; False ⇒ the
+        # calibrated path is alive and the report carries real data.
+        calibrated_dark = (rep.get("n") or 0) == 0
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": rep.get("verdict"),
+            "n": rep.get("n"),
+            "oos_n": rep.get("oos_n"),
+            "spearman": rep.get("spearman"),
+            "monotone_fraction": rep.get("monotone_fraction"),
+            "mean_abs_decile_error": rep.get("mean_abs_decile_error"),
+            "raw_mean_abs_decile_error": rep.get("raw_mean_abs_decile_error"),
+            "vs_raw_bias_reduction": rep.get("vs_raw_bias_reduction"),
+            "scorer_n_train": rep.get("scorer_n_train"),
+            "outcomes_n": rep.get("outcomes_n"),
+            "calibrated_dark": calibrated_dark,
+        }
+        CALIBRATED_RELIABILITY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with CALIBRATED_RELIABILITY_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in CALIBRATED_RELIABILITY_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > CALIBRATED_RELIABILITY_LOG_KEEP * 2:
+                kept = lines[-CALIBRATED_RELIABILITY_LOG_KEEP:]
+                tmp = CALIBRATED_RELIABILITY_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(CALIBRATED_RELIABILITY_LOG)
+        except Exception as e:
+            print(f"[continuous] calibrated-reliability-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] calibrated-reliability-log append failed: {e}")
+        return False
+
+
 def _parse_published_date(published) -> date | None:
     """Parse a `published` value (ISO or RFC822) into a date; None if unparseable."""
     if not published:
@@ -2534,6 +2646,22 @@ def main() -> None:
         # policy tuning effort into a column that is never populated. Best-
         # effort by construction; never breaks the loop.
         _append_llm_annotation_skill_log(cycle, win_start, win_end)
+
+        # Durable per-cycle ``predict_calibrated`` reliability ledger.
+        # ``calibration_reliability.analyze`` reports whether the quantile-
+        # mapped calibrated value (pass #10) actually delivers honest 5d
+        # magnitudes on the temporal-OOS holdout AND whether it measurably
+        # narrows the bias vs raw ``predict()`` on the same OOS pairs
+        # (``vs_raw_bias_reduction``). Until now an operator had to run the
+        # CLI to see either. The most directly operational state —
+        # ``calibrated_dark`` (the deployed pickle predates pass #10, so
+        # every consumer of the calibrated value reads None for every
+        # prediction) — was invisible without inspecting the pickle. This
+        # row makes that darkness obvious in the trend and surfaces the
+        # cycle-by-cycle bias-reduction signal so a quant can tell whether
+        # the calibration step is a real improvement or cosmetic. Best-
+        # effort by construction; never breaks the loop.
+        _append_calibrated_reliability_log(cycle, win_start, win_end)
 
         ml_status = _try_train_ml() if winner else "no winner"
         print(f"[continuous] ml: {ml_status}")
