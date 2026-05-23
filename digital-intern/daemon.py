@@ -95,6 +95,7 @@ from collectors.sector_etf_momentum import collect as collect_sector_etf
 from collectors.cisa_kev_collector import collect_cisa_kev
 from collectors.benzinga_analyst_collector import collect_benzinga_analyst
 from collectors.ftc_doj_collector import collect_ftc_doj
+from collectors.eia_collector import collect_eia
 from collectors.fed_press_collector import collect_fed_press
 from collectors.ecb_press_collector import collect_ecb_press
 from collectors.boj_press_collector import collect_boj_press
@@ -202,6 +203,7 @@ SECTOR_ETF_INTERVAL     = 600     # Sector ETF momentum snapshot every 10min
 COMMODITY_FUTURES_INTERVAL = 600  # Commodity futures price monitor every 10min
 BENZINGA_INTERVAL       = 300     # Benzinga analyst-ratings RSS sweep every 5min
 FTC_DOJ_INTERVAL        = 1800    # FTC + DOJ ATR press releases — every 30min
+EIA_INTERVAL            = 1800    # EIA Today in Energy + press releases — every 30min
 FED_PRESS_INTERVAL      = 1800    # Federal Reserve press / speech / testimony RSS — every 30min
 ECB_PRESS_INTERVAL      = 1800    # ECB press releases RSS — every 30min
 BOJ_PRESS_INTERVAL      = 1800    # Bank of Japan press / speech / MPM RSS — every 30min
@@ -273,7 +275,7 @@ ALL_WORKERS = (
     "google_news", "nitter", "substack",
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
     "yahoo_ticker_rss", "market_movers", "yahoo_trending", "wikipedia", "wiki_pageviews", "macro_calendar", "tic", "short_interest",
-    "fed_press", "ecb_press", "boj_press", "boe_press", "bls", "bea", "g10_cb", "global_reg", "whitehouse",
+    "fed_press", "ecb_press", "boj_press", "boe_press", "eia", "bls", "bea", "g10_cb", "global_reg", "whitehouse",
     "usgs_quake", "fda",
     "scorer", "alert", "heartbeat", "purge", "stats",
     "ml_trainer", "continuous_trainer", "recursive_labeler", "price_alert",
@@ -317,6 +319,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "benzinga_analyst": BENZINGA_INTERVAL,
     "ftc_doj": FTC_DOJ_INTERVAL,
     "fed_press": FED_PRESS_INTERVAL,
+    "eia": EIA_INTERVAL,
     "ecb_press": ECB_PRESS_INTERVAL,
     "boj_press": BOJ_PRESS_INTERVAL,
     "boe_press": BOE_PRESS_INTERVAL,
@@ -1817,6 +1820,27 @@ def ftc_doj_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(FTC_DOJ_INTERVAL)
+
+
+def eia_worker(store: ArticleStore):
+    log.info("[eia_worker] started")
+    bo = Backoff("eia", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_eia()
+            _ingest(store, articles, "eia")
+            try:
+                source_health.record_result("eia", len(articles))
+            except Exception as he:
+                log.warning(f"[eia_worker] source_health error: {he}")
+            _worker_last_ok["eia"] = time.time()
+            log.debug(f"[eia] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[eia_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(EIA_INTERVAL)
 
 
 def fed_press_worker(store: ArticleStore):
@@ -3884,6 +3908,7 @@ def main():
         ("insider_cluster", insider_cluster_worker),
         ("benzinga_analyst", benzinga_analyst_worker),
         ("ftc_doj",     ftc_doj_worker),
+        ("eia",         eia_worker),
         ("fed_press",   fed_press_worker),
         ("ecb_press",   ecb_press_worker),
         ("boj_press",   boj_press_worker),
