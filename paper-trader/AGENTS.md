@@ -6,6 +6,73 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 feature pass (Agent 4 / feature-dev) — `/api/concurrent-opus-attribution`
+
+New `paper_trader/analytics/concurrent_opus_attribution.py` +
+`/api/concurrent-opus-attribution`. Per-parent-tree breakdown of every
+live `claude --model claude-opus` subprocess on the box, with a
+targeted-kill recommendation per non-legitimate group.
+
+`/api/host-guard` reports the *count* (`opus_count=17` on the live state
+at 2026-05-23 18:29Z) and verdict SATURATED above
+`DEFAULT_MAX_OPUS=4`. It does NOT tell the operator WHICH parent trees
+own those 17 processes — so killing safely requires either inspecting
+each PID via `ps -ef` or blanket `pkill -9 claude`, which also nukes the
+legitimate live runner Opus and every feature-dev agent in flight. The
+live PARALYSIS at 2026-05-23 17:47Z (>55h frozen, 17 Opus, 100%
+NO_DECISION) made the gap explicit: every existing block describes the
+*consequence* (NO_DECISION storm, decision drought, alpha drift) and
+none names the rogue parent.
+
+Verdict ladder (Opus count, aligned with `host_guard.DEFAULT_MAX_OPUS`):
+
+| Verdict     | Opus count                                            |
+|-------------|-------------------------------------------------------|
+| `NO_OPUS`   | 0 — host clean                                        |
+| `CLEAN`     | 1 — the live runner itself                            |
+| `BENIGN`    | 2-4 — within host_guard's own threshold               |
+| `ELEVATED`  | 5-8 — above guard, not yet swap-thrashing             |
+| `SATURATED` | ≥9 — multi-pool storm; live runner is starved         |
+
+Per-group report carries: `parent_marker`, `parent_label`, `n_opus`,
+`pids` (sorted), `is_legitimate` (True only for `runner` ≤1 and
+`backtest` ≤`_CLAUDE_SEM=3`), and `kill_command` (the exact shell
+command — `pkill -f scripts/hourly_review.sh` for script-rooted groups;
+`kill <PID PID …>` for chain-fallthrough `unknown` groups). The pure
+builder is split from the endpoint's `/proc` walk (the `host_guard.probe`
+/ endpoint contract) — tests inject a synthetic process table; the
+endpoint owns the I/O. NOT swr-cached (host state changes per second).
+Never raises; advisory only — no path to `_execute()` (AGENTS.md
+#2 / #12 — the `host_guard` precedent).
+
+**Live validation (2026-05-23 18:29Z).** Endpoint reports
+`SATURATED — 17 concurrent Opus, 17 from non-legitimate parents — host
+is saturated by hourly self-review (scripts/hourly_review.sh) (17 Opus).
+Targeted kill: pkill -f scripts/hourly_review.sh.` All 17 PIDs traced
+through the parent chain to `scripts/hourly_review.sh`. This is real,
+immediately actionable intelligence the existing 165-endpoint surface
+did not carry.
+
+19 tests in `tests/test_concurrent_opus_attribution.py` pin the verdict
+ladder, parent-chain walk (including nested bash → bash → script chains
+matching the live /proc footprint), group ordering, legitimacy logic,
+dominant-culprit selection that skips the legitimate runner group, kill
+template rendering, never-raises on garbage rows, the marker override,
+and the endpoint wiring (test_client with a monkeypatched
+`scan_proc_table`).
+
+The digital-intern chat surface gets a companion
+`_concurrent_opus_attribution_chat_lines` helper that sub-fetches this
+endpoint with a 3s timeout and renders SATURATED / ELEVATED into chat
+context (silent on NO_OPUS / CLEAN / BENIGN — the silence precedent).
+See `digital-intern/AGENTS.md` 2026-05-23 chat-enrichment pass.
+
+**Counters:** bugs_fixed=0, features_added=1
+(`/api/concurrent-opus-attribution`), user_findings=1 (live SATURATED
+verdict with 17 Opus rooted in hourly_review.sh).
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #20 (Agent 2) — collapsed-quantile guard + scorer_pickle_smoke
 
 ### Phase 1: Debug — 1 bug fixed (bc5135a)

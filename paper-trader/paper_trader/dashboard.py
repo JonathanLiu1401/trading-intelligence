@@ -11251,6 +11251,41 @@ def host_guard_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/concurrent-opus-attribution")
+def concurrent_opus_attribution_api():
+    """Group every live ``claude --model claude-opus`` subprocess by its
+    spawning parent tree and prescribe the exact targeted-kill command per
+    group.
+
+    ``/api/host-guard`` reports the *count* (``opus_count=17``) and the
+    SATURATED verdict. It does not tell the operator WHICH parent trees own
+    those 17 processes, so killing safely requires either (a) inspecting
+    ``ps -ef`` manually per PID or (b) blanket ``pkill -9 claude`` which
+    also nukes the legitimate live runner Opus and every feature-dev agent
+    in flight. This endpoint closes the gap: walks ``/proc`` once, attributes
+    every Opus to its root parent (``hourly_review.sh`` / continuous
+    backtest / runner / digital-intern daemon / unknown), and emits the
+    operator-copyable kill command per non-legitimate group.
+
+    Pure-builder split: the endpoint owns the ``/proc`` walk (network-/IO-
+    side); the builder is deterministic on the synthetic process table
+    tests inject. Mirrors the host_guard endpoint contract — never raises
+    into the dashboard. NOT swr-cached (host process state changes by the
+    second; staleness defeats the purpose). Read-only / observational —
+    advisory, no path to ``_execute()``."""
+    try:
+        from .analytics import concurrent_opus_attribution as _attr
+        from datetime import datetime, timezone
+        procs = _attr.scan_proc_table()
+        out = _attr.build_concurrent_opus_attribution(
+            procs,
+            as_of=datetime.now(timezone.utc).isoformat(),
+        )
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/capital-paralysis")
 @swr_cached("capital-paralysis", 30.0)
 def capital_paralysis_api():
