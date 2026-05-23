@@ -1528,14 +1528,21 @@ _BRIEFING_RT_MARKET_TODAY = re.compile(
     r"dec(?:ember)?)\s+\d{1,2}\b",
     re.IGNORECASE,
 )
-# "Q1 2026 Earnings Call Highlights" — GuruFocus / Seeking Alpha transcript-
-# summary template (substring — appears mid-headline). Quarter + year bounded
-# so a normal earnings preview ("Q1 earnings preview", "Q1 ahead of") never
-# matches; the discriminator verbs are highlights|recap|takeaways|transcript|
-# summary, NOT preview|ahead.
+# "Q1 2026 Earnings Call Highlights" / "Q1 Earnings Call Highlights" /
+# "Q1 2027 Earnings Transcript" — GuruFocus / Seeking Alpha / Globe-and-Mail
+# transcript-summary template (substring — appears mid-headline). Year and
+# the "call " bridge are BOTH optional — lockstep with the relaxed alert-side
+# ``_RT_EARNINGS_CALL`` (2026-05-20 NVDA earnings-day evidence: the briefing
+# layer's stricter prior form missed "NVIDIA Q1 Earnings Call Highlights" (no
+# year) and "Nvidia (NVDA) Q1 2027 Earnings Transcript" (no "Call"), and a
+# 7-day live audit found ~700 such rows reaching ml_score 8+ that would have
+# entered the top-50 digest pool. The discriminator stays the recap-noun list
+# ``highlights|recap|takeaways|transcript|summary|review`` so forward-looking
+# titles ("Q1 Earnings Preview", "earnings call begins at 5pm ET") never
+# match. Byte-identical to ``watchers.alert_agent._RT_EARNINGS_CALL``.
 _BRIEFING_RT_EARNINGS_CALL = re.compile(
-    r"\bq[1-4]\s*20\d{2}\s+earnings\s+call\s+(?:highlights|recap|takeaways|"
-    r"transcript|summary)\b",
+    r"\bq[1-4](?:\s*(?:fy\s*)?20\d{2})?\s+earnings\s+(?:call\s+)?"
+    r"(?:highlights|recap|takeaways|transcript|summary|review)\b",
     re.IGNORECASE,
 )
 # "Here['s|is] What the Street Thinks About <X>" — InsiderMonkey opinion-mill.
@@ -1591,14 +1598,113 @@ _BRIEFING_RT_WIKIPEDIA_REF = re.compile(
     r"^\s*\[Wikipedia\]\s+",
 )
 
+# Drift-closure patterns — lockstep mirrors of the seven recap fingerprints the
+# alert path (``watchers.alert_agent``) added between 2026-05-19 and 2026-05-21
+# that the briefing layer was never updated with. Each regex is byte-identical
+# to its alert-side twin (same anti-import-cycle duplication discipline as the
+# original briefing-side mirrors above). The drift was real and recently
+# evidenced: a 7-day live audit found 26 ``why_just_moved``, 35 ``why_pct_after``,
+# 74 ``todays_movers_list``, 91 ``is_buy_after``, 49 ``earnings_tomorrow_preview``,
+# 105 ``why_is_pct_since``, and 4 ``why_stock_is_after`` rows that the urgency
+# scorer pre-floored for the alert path (so their ai_score=0.01) but whose
+# ml_score (often 9+) still made COALESCE(ai_score, ml_score) push them into
+# the briefing's top-50 digest. The briefing — the analyst's PRIMARY consumed
+# product — was missing every one of these gates.
+
+# "Why <X> Stock {just|now|today|finally|...} {popped|surged|...}" — Motley
+# Fool variant where the subject moves past-tense without "Did" between Why
+# and the subject. Live failure: "Why Micron Stock Just Popped Again" was
+# Sonnet-scored urgent and fired a real Discord push.
+_BRIEFING_RT_WHY_JUST_MOVED = re.compile(
+    r"^\s*why\s+.+?\s+stock\s+"
+    r"(?:just|now|today|finally|suddenly|then|recently|already)\s+"
+    r"(?:popped|surged|jumped|soared|crashed|tumbled|plunged|sank|fell|"
+    r"dropped|climbed|spiked|slid|slipped|rallied|tanked|plummeted|"
+    r"nosedived|hammered|skyrocketed|rocketed|rebounded)\b",
+    re.IGNORECASE,
+)
+# "Why Is <X> {up|down|higher|lower} N.N% Since Last <event>" — Zacks /
+# Seeking Alpha post-event price-attribution. Live failure: "Why Is AGNC
+# Investment (AGNC) Down 7.2% Since Last Earnings Report?".
+_BRIEFING_RT_WHY_IS_PCT_SINCE = re.compile(
+    r"^\s*why\s+is\s+.+?\s+(?:up|down|higher|lower)\s+"
+    r"\d+(?:\.\d+)?\s*%\s+since\b",
+    re.IGNORECASE,
+)
+# "Why <X> Stock Is <state-verb> After <event>" — Barron's / MSN / Yahoo
+# post-event explainer. Live failure: "Why Nvidia Stock Is Barely Moving
+# After Earnings Crushed Expectations" reached urgency=2 with ml_score 9.97
+# and would have surfaced in the briefing as a TOP SIGNAL despite being
+# retrospective.
+_BRIEFING_RT_WHY_STOCK_IS_AFTER = re.compile(
+    r"^\s*why\s+.+?\s+stock\s+is\s+"
+    r"(?:still\s+|barely\s+|now\s+|finally\s+|just\s+|currently\s+|"
+    r"actually\s+|suddenly\s+|hardly\s+|so\s+|really\s+)?"
+    r"(?:moving|trading|sliding|sinking|tumbling|crashing|plunging|"
+    r"jumping|surging|soaring|rising|falling|climbing|dropping|"
+    r"rallying|spiking|tanking|skyrocketing|nosediving|"
+    r"up|down|higher|lower|flat|stuck|red|green|bid|offered)"
+    r"\b.*?"
+    r"\bafter\b.*?\b"
+    r"(?:earnings|results|report|quarter|q[1-4]|beat|miss|guidance)\b",
+    re.IGNORECASE,
+)
+# "Why <X> Is <up|down|...> N.N% After <event>" — Zacks / StockStory variant
+# lacking the "Stock" token. Live failure: "Why AXT (AXTI) Is Down 14.2%
+# After Betting Big On AI-Focused Indium Phosphide Expansion" syndicated
+# heavily; "Why Tower Semiconductor (TSEM) Is Up 29.8% After ..." too.
+_BRIEFING_RT_WHY_PCT_AFTER = re.compile(
+    r"^\s*why\s+.+?\s+(?:is|are|was|were)\s+"
+    r"(?:up|down|higher|lower)\s+"
+    r"\d+(?:\.\d+)?\s*%\s+"
+    r"after\b",
+    re.IGNORECASE,
+)
+# "<X> Reports Earnings Tomorrow: What To Expect" — FinancialContent /
+# StockStory / MSN / TradingView SEO-mill earnings-preview. By definition
+# NOT breaking ("tomorrow"). Live failure: 49 such rows in 7 days, several
+# with ml_score 8+.
+_BRIEFING_RT_EARNINGS_TOMORROW = re.compile(
+    r"\breports?\s+earnings\s+tomorrow\s*:\s*what\s+to\s+expect\b",
+    re.IGNORECASE,
+)
+# "These Stocks Are Today's Movers: Nvidia, Micron, ..." — Barron's daily
+# column heavily syndicated. Live failure: 74 such rows in 7 days, the
+# Marketwatch + Finnhub/Yahoo copies ml_score 9.29 and 4.6.
+_BRIEFING_RT_TODAYS_MOVERS = re.compile(
+    r"^\s*these\s+stocks\s+are\s+today['’]?s\s+(?:top\s+|biggest\s+)?movers\s*:",
+    re.IGNORECASE,
+)
+# "Is <X> a Buy After <Earnings|Q1|Results|...>" — Motley Fool / Yahoo /
+# TipRanks post-event valuation question. Live failure: 91 such rows in
+# 7 days; "Is Nvidia a Buy After Their Latest Earnings Report?" fired a
+# real BREAKING push on the alert side.
+_BRIEFING_RT_IS_BUY_AFTER = re.compile(
+    r"^\s*(?:\S+\s+)?is\s+(?:\w+\s+){0,2}a\s+(?:buy|sell|hold)\b.*?"
+    r"\bafter\b.*?\b(?:earnings|results|report|quarter|q[1-4])\b",
+    re.IGNORECASE,
+)
+
 _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _BRIEFING_RT_WHY_TRADING),
     ("why_did_stock", _BRIEFING_RT_WHY_DID),
+    ("why_just_moved", _BRIEFING_RT_WHY_JUST_MOVED),
+    ("why_is_pct_since", _BRIEFING_RT_WHY_IS_PCT_SINCE),
+    # ``why_stock_is_after`` is the strictly more-specific sibling of
+    # ``why_pct_after`` (the title has a ``Stock`` token AND a state verb AND
+    # an earnings-noun terminator) — must run first so a title like
+    # "Why NVDA Stock Is Down 3% After Q1 Earnings" gets the more-precise
+    # fingerprint name (mirrors the alert-side ordering).
+    ("why_stock_is_after", _BRIEFING_RT_WHY_STOCK_IS_AFTER),
+    ("why_pct_after", _BRIEFING_RT_WHY_PCT_AFTER),
     ("market_today_dated", _BRIEFING_RT_MARKET_TODAY),
     ("earnings_call_recap", _BRIEFING_RT_EARNINGS_CALL),
     ("quick_glance_metrics", _BRIEFING_RT_QUICK_GLANCE),
     ("heres_what_happened", _BRIEFING_RT_HERES_WHAT_HAPPENED),
     ("wikipedia_ref", _BRIEFING_RT_WIKIPEDIA_REF),
+    ("earnings_tomorrow_preview", _BRIEFING_RT_EARNINGS_TOMORROW),
+    ("todays_movers_list", _BRIEFING_RT_TODAYS_MOVERS),
+    ("is_buy_after", _BRIEFING_RT_IS_BUY_AFTER),
     ("street_thinks", _BRIEFING_RT_STREET_THINKS),
     ("gf_value_says", _BRIEFING_RT_GF_VALUE),
 )
