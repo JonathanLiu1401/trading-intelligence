@@ -6,6 +6,228 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 — Agent 1 (HYBRID core) — wedge-elapsed + starvation_trend
+
+**Phase 1 — bug fix (bugs_fixed: 2)**
+
+1. `reporter.send_breaker_fired_alert` hardcoded `consecutive * 30`
+   minutes as the wedge duration — under `dynamic_interval` per-cycle
+   gaps run 60s..90min, so the legacy body could overstate by 30x
+   (storm cadence) or understate by 3x (quiet-closed). `runner._cycle`
+   now tracks `_no_decision_first_ts` at the first NO_DECISION in the
+   run and passes real wall-clock elapsed to the reporter; body now
+   renders `1h15m` from the actual ts delta. New `_format_elapsed`
+   bucketises seconds into `m` / `h+m` / `d+h`.
+2. `runner._no_decision_cause` returned `""` when `raw is None` —
+   exactly the dominant empty/timeout branch — so the breaker Discord
+   alert went out with NO diagnostic suffix on the most common
+   failure. `strategy.decide()` now surfaces `last_claude_fail` in the
+   summary; the runner reads it as a fallback so the alert shows the
+   per-call cause (`timeout` / `nonzero_rc` / `empty_stdout` /
+   `cli_missing` / `exception`).
+
+**Phase 2 — feature (features_added: 1)**
+
+`host_guard.recent_starvation_trend()` — splits the last N decisions
+into older/newer halves by row id and reports `WORSENING /
+RECOVERING / STABLE / INSUFFICIENT` based on the rate delta (10pp
+noise floor). The aggregate `recent_starvation_rate` hides
+direction: 50% could be a clearing storm (100%→0%) or an
+intensifying one (0%→100%), and the operator's action diverges.
+CLI now prints a `trend:` line under the per-cause breakdown when
+mature (≥10 decisions per half), suppressed otherwise.
+
+**Phase 3 — live validation (user_findings: 3)**
+
+1. Live trader in IDLE_STORM: 100% NO_DECISION for 120+ cycles,
+   dominant cause `host_saturated` (13–15 concurrent Opus, 90–95%
+   swap). `recent_starvation_trend()` against the live DB reads
+   `STABLE 100%→100%` — persistent storm, not clearing.
+2. NVDA position is 65.4% of book (`concentration_severity=HIGH`).
+   Both `/api/trim-simulator` and `/api/concentration-cap` (the
+   sibling agent's new endpoints) correctly recommend a trim, but
+   Opus is the only thing that can act on it — and Opus is starved.
+3. Singleton lock is doing its job — systemd retries every cycle and
+   gets refused by the legitimate runner. `runner.log` spam is
+   expected (see `pt-systemd-vs-manual-restart-spam` memory).
+
+**Counters:** bugs_fixed=2 · features_added=1 · user_findings=3
+
+---
+
+## 2026-05-23 ML+backtest HYBRID pass #12 (Agent 2) — `conviction_calibration` per-cycle ledger + `_LstsqModel.predict` 1D fix
+
+Two changes, one in each of the agent's three hats.
+
+### Bug fix — `_LstsqModel.predict` 1D contract violation
+
+The numpy weighted-least-squares fallback used when sklearn is
+unavailable (`paper_trader/ml/decision_scorer.py::_LstsqModel`) crashed
+on a 1D feature vector with `ValueError: all the input arrays must have
+same number of dimensions, but the array at index 0 has 1 dimension(s)
+and the array at index 1 has 2 dimension(s)`. Production paths inside
+`DecisionScorer` batch through `np.array([…])` so this is a latent
+contract violation vs `sklearn.neural_network.MLPRegressor.predict`
+(which accepts both 1D and 2D), but any caller passing a single feature
+vector — test fakes, ad-hoc tooling, future diagnostics — would silently
+kill its run. One-line shim: reshape 1D → `(1,n)` before the
+`np.hstack` with the bias column. Locked by two new tests:
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_ml_backtest_coverage.py::TestLstsqFallbackScorer -v
+# 7 passed including the new test_fallback_model_predict_accepts_1d_input
+# and test_fallback_model_predict_1d_and_2d_agree (1e-5 tolerance)
+```
+
+### Feature — `_append_conviction_calibration_log` per-cycle ledger
+
+`paper_trader/ml/conviction_calibration.py` already answers, durably,
+the most economically decisive question about the `_ml_decide` gate's
+sizing arm:
+
+> Does the bot's higher-conviction call (sized 25-40 % of book) realize
+> higher 5-day return than its low-conviction probe (sized ~5 %), or is
+> the entire sizing rule pure variance with no compensating realized
+> edge?
+
+The analyzer's read-only CLI on the live `data/decision_outcomes.jsonl`
+1173-BUY-row OOS slice reports `MISCALIBRATED  (spearman +0.011,
+top-bot=-0.15pp)` — the `GATE_INEFFECTIVE` shape from `gate_audit`.
+Empirically, bucket 4 (mid-conviction 17-23 %) realizes +1.57 %  while
+bucket 5 (highest conviction 23-40 %) realizes only +0.35 % — so the
+biggest bets actually realize WORSE than mid-bets.
+
+That state was CLI-only until this pass. Mirrors every other
+`_append_*_skill_log` ledger this codebase already has (scorer skill,
+baseline compare, llm-annotation skill, calibrated reliability):
+
+* `run_continuous_backtests.py::_append_conviction_calibration_log` —
+  module-level so tests can redirect `CONVICTION_CALIBRATION_LOG`;
+  best-effort, never raises into the loop; honest `status='error'` rows
+  on analyzer fault; atomic `tmp + .replace` trim at
+  `2× CONVICTION_CALIBRATION_LOG_KEEP=2000`; `sizing_dark` boolean
+  mirrors the sibling `*_dark` flags (True ⇒ zero BUY rows with a
+  parseable `conviction_pct` — the documented pre-2026-05-21 state of
+  every legacy outcome row).
+* Wired into `main()` immediately after
+  `_append_calibrated_reliability_log` so a quant can trend whether the
+  sizing rule starts to work (or worsens) right next to the scorer's
+  own calibration trend.
+* Test pack `tests/test_continuous.py::TestAppendConvictionCalibrationLog`
+  + a new `TestCycleWiringRegression::test_main_invokes_conviction_calibration_ledger`
+  source-level wiring lock so a future refactor cannot silently
+  re-orphan the call (the exact failure mode every sibling ledger
+  suffered until each was wired).
+
+```bash
+# Verify the ledger end-to-end
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_continuous.py -v -k "Conviction or conviction" 2>&1 | tail -15
+# 8 passed: sizing_dark, directional, miscalibrated, error-degrades,
+# bounded-trim, missing-dir, unwritable-path, main-wiring
+
+# Read the current CLI verdict (the row the ledger now persists per cycle):
+python3 -m paper_trader.ml.conviction_calibration
+
+# After the continuous loop runs once, the new ledger file appears:
+ls -la data/conviction_calibration_log.jsonl
+
+# Trend (ad-hoc, JSONL one-per-cycle):
+cat data/conviction_calibration_log.jsonl \
+  | python3 -c "import sys,json
+for ln in sys.stdin:
+    r=json.loads(ln)
+    print(f\"cycle={r['cycle']:4} verdict={r['verdict']:<22} \"
+          f\"spear={r['spearman']:+.3f} top-bot={r['top_minus_bottom_realized_pct']:+.2f}pp n={r['n']:5}\")"
+```
+
+### Phase 3 findings (live state at 2026-05-23 01:30 UTC)
+
+1. **Continuous backtest loop NOT actively running.** Most recent
+   complete `backtest_runs` rows: `100000 / 99001 / 90001` are all
+   0 % return / 0 trades / 5 decisions each (smoke-test runs); the last
+   *productive* run was `99002` (May 22 06:24 UTC, +328 %,  1714 trades,
+   Momentum Trader persona). `data/scorer_skill_log.jsonl` last updated
+   2026-05-21 (2 days stale) but `data/ml/decision_scorer.pkl` was
+   retrained 2026-05-23 01:26 UTC — so retrains are coming from
+   somewhere outside the continuous loop (manual `_train_decision_scorer`
+   invocations or a parallel pass). My new ledger will start filling
+   once the continuous loop is back up.
+
+2. **Scorer health has IMPROVED dramatically vs the last ledger row.**
+   `data/scorer_skill_log.jsonl` (May 21) showed `oos_ic=0.02`
+   (essentially noise) on `oos_n=1000`. Today's live re-run of
+   `python3 -m paper_trader.ml.calibration --oos` reports
+   `VERDICT: WELL_CALIBRATED  spearman=0.36 mean_abs_decile_err=2.1pp`
+   on `oos_n=1750` — the spearman cleared `SPEARMAN_GOOD=0.30` and
+   `mean_abs_decile_err < BIAS_TOL_PCT=3.0`, both bars. Similarly
+   `baseline_compare` reports `MLP_ADDS_SKILL` (MLP rank_ic 0.36 vs
+   best one-liner `neg_bb` 0.07, gap +0.28 ≫ `IC_MARGIN=0.05`). The
+   net is genuinely additive OOS now. **Until the continuous loop runs
+   again, the per-cycle ledgers will all stay stale and show the
+   pre-improvement state.**
+
+3. **The MISCALIBRATED conviction finding is the decisive operational
+   gap.** The scorer's PREDICTION ranks realized return well now
+   (rank_ic 0.36) but the gate's actual `conviction_pct` SIZING does
+   not (rank_ic 0.011). Mid-bucket (17-23 % sizing) realizes BEST
+   (+1.57 %); top-bucket (23-40 %, the leveraged-bull arm) realizes
+   WORST (+0.35 %). The `_ml_decide` arms (`×0.6`/`×0.85`/`×1.15`/`×1.3`
+   on `±10`/`±5`) are too coarse to capture the model's 0.36 rank — or
+   the base sizing formula (`min(0.25, score/20)` regular,
+   `min(0.40, score/15)` leveraged-bull) is the source of the
+   anti-edge. **A future fix would be a finer sizing rule keyed to the
+   scorer's percentile rather than its raw % bucket.** My new ledger
+   makes the moment-of-change visible.
+
+4. **`gdelt` 5s-rate-limit + ConnectionReset spam in
+   `continuous.log`.** Tail shows steady `[gdelt] rate-limited`
+   followed by 20-60s sleeps and at least one
+   `ConnectionResetError(104)`. Tier-3 is a slow fallback by design (the
+   3-tier `_fetch_signals` in `backtest.py` only hits it when local DB
+   is empty), but a flood of these in the log can mask real errors. Not
+   urgent.
+
+### How to interpret the new ledger
+
+| row field | meaning |
+|-----------|---------|
+| `verdict` | `WELL_CALIBRATED` / `DIRECTIONAL` / `MISCALIBRATED` / `INVERTED` / `INSUFFICIENT_DATA` |
+| `n` | BUY rows with both `conviction_pct` AND `forward_return_5d` |
+| `spearman` | rank-IC of `conviction_pct` vs realized 5-day return |
+| `top_minus_bottom_realized_pct` | top-bucket mean realized minus bottom-bucket mean realized, in pp. Positive ⇒ sizing makes money; negative ⇒ ANTI-edge |
+| `monotone_fraction` | fraction of adjacent buckets where realized rises |
+| `sizing_dark` | True when zero parseable conviction rows in corpus |
+
+A persistent `MISCALIBRATED` AND `gate_active=True` (from
+`scorer_skill_log`) means the loop is sizing real money on an arm the
+data says doesn't work. The pair of ledgers makes that joint state
+trendable.
+
+### Commands for the ML/backtest domain
+
+```bash
+# Full local ML / backtest suite:
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/ -v -k "ml or backtest or scorer or continuous or calibration or conviction" 2>&1 | tail -20
+# 872 passed (2026-05-23)
+
+# Just this pass's regression coverage:
+python3 -m pytest tests/test_continuous.py -v -k "Conviction or conviction or Wiring" 2>&1 | tail -15
+python3 -m pytest tests/test_ml_backtest_coverage.py -v 2>&1 | tail -15
+
+# Live diagnostics, no-network, read-only:
+python3 -m paper_trader.ml.conviction_calibration          # gate's sizing rule
+python3 -m paper_trader.ml.calibration --oos               # scorer's rank skill
+python3 -m paper_trader.ml.baseline_compare                # MLP vs one-liners
+python3 -m paper_trader.ml.calibration_reliability         # predict_calibrated
+python3 -m paper_trader.ml.deploy_audit                    # source-vs-pickle
+python3 -m paper_trader.ml.decision_scorer --feature-importance
+```
+
+---
+
 ## 2026-05-23 — Agent 4 (feature-dev) — `/api/profit-ladder` + `/api/open-lot-aging`
 
 Two complementary per-position diagnostics, both targeting gaps the
