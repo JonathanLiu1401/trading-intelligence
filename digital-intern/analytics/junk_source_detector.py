@@ -27,8 +27,13 @@ TITLE_PREFIX_LEN = 70     # chars used to define "unique" title
 
 
 def main() -> None:
+    # Plain ``mode=ro`` (no ``immutable=1``): the immutable flag promises SQLite
+    # the file will never change, which on the actively-written production
+    # ``articles.db`` causes intermittent "database disk image is malformed"
+    # errors (commit ``cdd8d4a`` fixed the same hazard in
+    # score_drift_detector / source_score_drift; this script was missed).
     conn = sqlite3.connect(
-        f"file:{DB}?mode=ro&immutable=1", uri=True
+        f"file:{DB}?mode=ro", uri=True, timeout=15
     )
     try:
         rows = conn.execute(
