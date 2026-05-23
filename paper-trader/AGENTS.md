@@ -96,6 +96,93 @@ endpoints), `chat_blocks_added=2` (the two SSOT chat helpers wired),
 
 ---
 
+## 2026-05-23 paper-trader core HYBRID pass #8 (Agent 1) — heartbeat real-decision wiring + /api/last-real-decision
+
+### Phase 1: Debug — 1 bug fixed (f9ec630)
+
+`/api/runner-heartbeat` returned a misleading green light under IDLE_STORM.
+`last_decision_ts` advances every NO_DECISION cycle, so the cadence headline
+read "HEALTHY — last decision 12m ago" while the engine had not actually
+produced a FILLED/HOLD/BLOCKED row in 53+ hours. The exact green-light
+pathology pass #7 surfaced; the store-side `last_real_decision()` primitive
+(2317b8f) was prepared for it but the call sites were left to a follow-up.
+
+Fix: wired `store.last_real_decision()` into both
+`build_runner_heartbeat()` (new `last_real_decision_ts` kwarg, sentinel-
+defaulted for byte-identical back-compat) and the `/api/runner-heartbeat`
+endpoint. Under IDLE_STORM the headline now appends a "Last real
+(FILLED/HOLD/BLOCKED) decision was 53h 34m ago" clause and the response
+gains `secs_since_real_decision` / `last_real_decision_ts` /
+`real_decision_age` keys.
+
+Tests: 7 new in `tests/test_runner_heartbeat.py` pin the additive contract
+(omit ⇒ no new keys), the numeric/humanised fields, the unparseable-ts
+degrade, the IDLE_STORM headline clause arms (with age / "NEVER" /
+suppressed-outside-storm), and the end-to-end Flask endpoint wiring. 45/45
+heartbeat tests pass.
+
+### Phase 2: Feature — `/api/last-real-decision` (203abc2)
+
+New dedicated endpoint wraps `store.last_real_decision()` with a verdict
+ladder (NEVER / FRESH / DELAYED / STALE) keyed off the same
+OPEN_INTERVAL_S / CLOSED_INTERVAL_S × LAGGING_MULT/STALLED_MULT cadence
+math the heartbeat uses, plus parsed `ticker` / `action_verb` / `status`
+from the free-text `action_taken`. A trader asking "when did the bot
+actually do something?" previously had to hand-roll SQL into
+`paper_trader.db`; this puts the answer behind one curl.
+
+Distinct surface from `/api/runner-heartbeat` (cycling-or-not) and
+`/api/decision-drought` (P&L cost of inaction). Pure read, never raises;
+error envelope on any fault. 9 new tests in
+`tests/test_last_real_decision_endpoint.py` pin every verdict band, the
+HOLD/BLOCKED inclusion, the NO_DECISION skip, and the no-arrow fallback.
+
+### Phase 3 — live state at 2026-05-23 15:34 UTC
+
+1. **CRITICAL — 53h 34m IDLE_STORM drought.** Last real decision: BUY NVDA
+   FILLED at 2026-05-21 10:00 UTC. The loop has cycled ~155 NO_DECISION
+   times since. Cause: host saturation (multiple parallel Opus review/
+   HYBRID agents on a 16-CPU/15GB box). Open NVDA position has bled
+   -$24.55 unrealized (-2.49%) while completely unsupervised by Opus.
+   Total portfolio -$12.61 vs $1000 start.
+
+2. **The new heartbeat clause works on live.** Pulling
+   `/api/runner-heartbeat` now returns the headline:
+   `"… ⚠ but the last 20 cycles were ALL NO_DECISION … Last real
+   (FILLED/HOLD/BLOCKED) decision was 53h 34m ago."` — the previously-
+   misleading "8m ago" cadence number is now correctly accompanied by
+   the real engine drought.
+
+3. **/api/last-real-decision returns the full row + STALE verdict.** The
+   endpoint correctly surfaces the NVDA BUY FILLED row from 2026-05-21,
+   age 53h 33m, verdict STALE, action_verb BUY, status FILLED — exactly
+   the operator-actionable shape this surface was built for.
+
+4. **Runner restart spam in logs.** ~14 "another paper trader is already
+   running … refusing to start a second trader" lines around the time
+   the prior PID gracefully exited on git-watcher-detected new commits.
+   Three distinct PIDs (300168 → 318571 → 327930) over a few minutes,
+   each holding the lock until either dying or being killed by a manual
+   restart loop. This is the documented `pt-systemd-vs-manual-restart-
+   spam` pattern; no code fix needed (operator-side launcher concern).
+
+5. **Discord delivery HEALTHY.** `/api/notify-health` confirms last send
+   ok at 15:33:34 UTC, 0 consecutive failures.
+
+### Tests
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader && \
+  python3 -m pytest tests/test_runner_heartbeat.py \
+  tests/test_last_real_decision_endpoint.py -v
+# 54 passed
+```
+
+Focused-core regression (heartbeat + SWR + runner cycle + store +
+event-readiness + dashboard helpers + invariants): 309/309 pass.
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #19 (Agent 2) — `gate_risk_profile` analyzer
 
 ### Phase 1: Debug — 0 bugs fixed
