@@ -6,6 +6,173 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #18 (Agent 2) — wk52 gate sentiment-only bypass + intraperiod-extreme outcomes
+
+### Phase 1: Debug — 1 bug fixed (620fc7b)
+
+`_ml_decide` only pre-computed quant indicators (RSI/MACD/momentum/BB/
+`wk52_pos`) for tickers in `QUANT_SIGNAL_TICKERS ∪ portfolio.positions`.
+When the news scorer picked a *sentiment-only* watchlist ticker — XLF /
+XLV / XLI / ARKK / BTC-USD / NVDU / AMZU / METAU / CONL (every sector
+ETF + every single-stock 2x-leveraged keyword target, ~21 % of all BUYs
+in the live `decision_outcomes.jsonl` tail) — the 52-week-high gate at
+line 1782 read `quant.get(buy_ticker, {}).get("wk52_pos")` and got
+`None`. The `isinstance(None, (int, float))` guard then failed open and
+the gate silently no-op'd. A separate "feature-parity" block lazily
+fetched quant for the *scorer prediction* at line 1843, but it ran
+**after** the wk52 gate (and after the CONTRARIAN-persona RSI flip),
+so the indicators that block produced never reached the suppression
+check. Concrete consequence: a sentiment-only BUY of XLF at the
+52-week high passed straight through the gate — exactly opposite to
+the bubble-top suppression the gate was designed for — and the
+CONTRARIAN's RSI > 65 sell-flip was disarmed for the same ticker class.
+
+Surgical fix: move the lazy `_get_quant_signals` fetch to **before**
+the wk52 gate. Both gates now see the same populated `quant[buy_ticker]`
+they always saw for `QUANT_SIGNAL_TICKERS` membership. The duplicate
+"scorer feature parity" block at line 1843 is now redundant and was
+removed (the up-front fetch already covers it). No behavioural change
+for any `QUANT_SIGNAL_TICKERS ∪ portfolio.positions` ticker — that path
+already had populated quant. Five new tests in
+`tests/test_ml_decide_wk52_gate_sentiment_only.py` pin both arms of the
+fix: a 300-day synthetic XLF series at `wk52_pos = 1.0` → BUY suppressed
+to HOLD (the bug case); the same input with `wk52_pos < 0.80` → still
+BUYs (counterfactual — proves the suppression is the gate, not an
+unrelated guard); CONTRARIAN reasoning now carries `RSI=<num>` not
+`RSI=N/A` for sentiment-only buys. Verified the new test FAILS on the
+pre-fix code and PASSES after.
+
+### Phase 2: Feature — intraperiod min/max return on outcome rows (31549bb)
+
+DecisionScorer trains on the 5d *endpoint* return, but a +5 % endpoint
+trade that drew -15 % mid-window is a fundamentally different trade
+from one that grinded straight up to +5 %. The endpoint reading silently
+hides:
+
+* Trades that **would have been stopped out** before the endpoint
+  materialized (intraperiod min below the implied -8 % stop the
+  `_buy` defaults seed).
+* Trades whose **realized peak was captured** by `take_profit` before
+  a reversal (intraperiod max far above the endpoint).
+
+Added two additive fields to every BUY/SELL outcome row in
+`_compute_decision_outcomes`:
+
+* `forward_intraperiod_min_5d` — worst realized %-return at any close
+  in `[sim_d+1, sim_d+5]` relative to `sim_d` close
+* `forward_intraperiod_max_5d` — best realized %-return over the same
+  window
+
+Same operational discipline as the 2026-05-18 `forward_return_10d/20d`
+precedent: `build_features` / `train_scorer` ignore unknown dict keys,
+so this is **zero-risk** for the gate/trade path. Existing scorer
+behaviour is byte-identical. Same defensive contract as `_fwd_ret_h` —
+walk-back collision guard, partial coverage honored, returns
+`(None, None)` only when no forward close resolves. Four new tests in
+`tests/test_outcome_intraperiod_extremes.py` pin exact values against
+synthetic price series: monotone-rising window → min=+1 %, max=+5 %
+(day 1 / day 5 extremes); V-shape -10 % trough + 5 % recovery → min=-10,
+max=+5, endpoint=+5 (the trade shape the field is built to expose);
+both keys always present in the dict (downstream consumers never
+KeyError on missing field).
+
+### Phase 3 findings — live ML state at 2026-05-23 (Agent 2)
+
+1. **CRITICAL — deployed `decision_scorer.pkl` was clobbered by a
+   synthetic n=39 training run** at 2026-05-23 07:03. Smoking gun
+   from the pickle internals: **all 101 `pred_quantiles` collapsed to
+   the same value `18.934`** (a single-output model that predicts the
+   same number for every input), and `label_quantiles` read 1, 2, …,
+   39 — **sequential integers**, not real forward returns. The pkl
+   `n_train` was 39 while pass #17's scorer skill log reported the
+   healthy cycle 1 retrain at `train_n=3987`. No `scorer_skill_log.jsonl`
+   row was written for the 07:03 retrain, so whatever process did it
+   ran **outside the continuous loop** (a one-off script, a test that
+   didn't hit the conftest `SCORER_PATH` redirect, or a parallel agent's
+   smoke run that landed in the prod path). The real
+   `decision_outcomes.jsonl` (8753 rows) was intact.
+
+   **Fixed in this pass**: retrained from the real corpus's trailing
+   5000 rows in-session — restored `n_train=4987`, `val_rmse=10.50`,
+   `gate_active=True`. The corrected pickle's predictions look
+   coherent again (NVDA neutral input → -0.28 %, percentile 42.78,
+   calibrated -0.65).
+
+2. **MLP NOW ADDS GENUINE OOS SKILL** — verdict shift from the
+   long-documented `MLP_WORSE_THAN_TRIVIAL`. After the in-session
+   restoration, `baseline_compare` returns **MLP_ADDS_SKILL** on the
+   OOS slice: `MLP rank_ic = +0.359` vs best one-line baseline
+   `neg_bb` at +0.075 (gap +0.284, well above the 0.05 threshold).
+   `calibration --oos` returns **WELL_CALIBRATED** (`mean_abs_decile_err
+   = 2.1pp`, `spearman = 0.36`). The 17-feature model is now
+   genuinely additive on out-of-sample data — the conviction gate is
+   earning its keep on the *current* corpus. Operators reading the
+   skill ledger should expect `verdict='MLP_ADDS_SKILL'` going forward.
+
+3. **Conviction sizing STILL `MISCALIBRATED`** (the gate's
+   `×0.6/×0.85/×1.15/×1.3` modulation arm). `conviction_calibration`
+   reports `spearman = +0.011`, top minus bottom realized = -0.15 pp.
+   Even though the scorer's *ranks* now carry real OOS skill (finding
+   #2), the **translation from rank to sizing fraction** does not
+   extract value. This is the documented `GATE_INEFFECTIVE` shape —
+   the scorer can pick winners, but the gate's sizing rule doesn't
+   capitalize on the picks proportionally. The Phase 1 wk52 fix
+   doesn't change this; only a sizing-rule revision (or a
+   prediction→conviction calibration step) would.
+
+4. **Continuous loop is OFFLINE** — `scorer_skill_log.jsonl` has just
+   1 row (cycle 1, 2026-05-22T06:24:32) and `continuous.log` last
+   wrote 2026-05-18. The Phase 1 wk52 bug fix and the Phase 2
+   intraperiod fields will **not appear in outcomes** until the loop
+   restarts. The live trader's `_ml_is_qualified` gate consults
+   `backtest.db` (1 h cached); no new completed runs have arrived in
+   ~30 hours.
+
+5. **LLM annotation pipeline is dark** — `continuous.log` repeatedly
+   logs `LLM annotation failed: "Could not resolve authentication
+   method"` (`ANTHROPIC_API_KEY` is unset on the host). Matches the
+   documented `pipeline_dark` state recorded by
+   `_append_llm_annotation_skill_log`. Result: every outcome row's
+   `llm_quality_label = 0` and the 3×/0.1× sample-weight multipliers
+   in `train_scorer` never fire on real labels.
+
+### How to run / interpret (refresh for the ML/backtest domain)
+
+```bash
+# Verify the deployed scorer is sane (catches the finding #1 footprint):
+python3 -c "
+import pickle, numpy as np
+with open('data/ml/decision_scorer.pkl', 'rb') as f: s = pickle.load(f)
+pq = np.asarray(s.get('pred_quantiles', []))
+lq = np.asarray(s.get('label_quantiles', []))
+print(f\"n_train={s['n_train']}\")
+print(f\"pred_quantiles range: [{pq.min():.2f}, {pq.max():.2f}], collapsed={pq.min()==pq.max()}\")
+print(f\"label_quantiles range: [{lq.min():.2f}, {lq.max():.2f}]\")
+print(f\"label_quantiles look-like-integers={all(abs(v-round(v))<1e-6 for v in lq)}\")"
+
+# Manual retrain from real corpus (the in-session fix from finding #1):
+python3 -c "
+import json
+from paper_trader.ml.decision_scorer import train_scorer
+records = [json.loads(l) for l in open('data/decision_outcomes.jsonl') if l.strip()][-5000:]
+print(train_scorer(records))"
+
+# Run the full ML/backtest test slice (~24 s, what this pass ran):
+python3 -m pytest tests/test_backtest.py tests/test_continuous.py \
+    tests/test_decision_scorer.py tests/test_outcome_intraperiod_extremes.py \
+    tests/test_ml_decide_wk52_gate_sentiment_only.py tests/test_integration_backtest.py
+# → 347 passed (this pass)
+```
+
+When the continuous loop restarts, the Phase 1 wk52 fix will fire on
+sentiment-only buys at extended highs (XLF/XLV/XLI/ARKK/BTC-USD/NVDU/
+AMZU/METAU/CONL primarily) — expect a small reduction in BUY counts
+for that class. The Phase 2 intraperiod fields will appear on new
+outcome rows; legacy rows continue to read `None` for both keys
+(downstream consumers should `.get(...)` not `[...]`).
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #17 (Agent 2) — `evaluate_scorer_oos` failed-pred drop + per-action OOS RMSE
 
 ### Phase 1: Debug — 1 bug fixed (e6c4c8b)
