@@ -10728,6 +10728,50 @@ def idle_opportunity_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/drought-path-risk")
+def drought_path_risk_api():
+    """Intra-drought path shape — peak/trough/drawdown/range while the bot
+    was frozen.
+
+    ``/api/decision-drought`` reports point-to-point ``port_pct`` /
+    ``spy_pct`` / ``alpha_pct`` for each drought — the *endpoint* difference
+    between drought start and drought end. That is path-blind: a 47h drought
+    that smoothly slid to -2.4% looks identical to one that bottomed at
+    -6.5% mid-drought and recovered to -2.4%. The desk's reading of the two
+    is NOT the same; the second one is a survived near-miss the trader was
+    blind to. This endpoint composes the canonical
+    ``build_decision_drought.current_drought`` block (verbatim SSOT —
+    AGENTS.md #10, the ``/api/idle-opportunity`` precedent — so the two
+    endpoints can never disagree on what counts as an ongoing drought) and
+    walks the equity_curve points inside that window to surface the
+    missing path-shape view: ``peak_equity`` / ``trough_equity`` /
+    ``intra_drought_drawdown_pct`` (peak-to-trough) / ``range_pct`` /
+    ``end_to_start_pct``, then classifies into WHIPSAW_TRAP / DODGED_DROP /
+    LIFTED_BLIND / SLOW_BLEED / QUIET_DROUGHT / MIXED once
+    ``n_equity_samples >= 3`` (STABLE gate). Withholds the verdict (state
+    INSUFFICIENT) below the gate so a 1-point drought never gets a path
+    label. ``state="NO_DROUGHT"`` collapses to silence — the
+    silence-when-nothing-actionable precedent (``_host_pulse_line`` /
+    ``_macro_calendar_chat_lines``).
+
+    Observational only — never gates Opus, never injected into the decision
+    prompt, no caps (AGENTS.md invariants #2/#12 — the
+    ``/api/idle-opportunity`` / ``/api/capital-paralysis`` /
+    ``/api/shadow-vs-claude`` precedent).
+    """
+    try:
+        from .analytics.drought_path_risk import build_drought_path_risk
+        from .analytics.decision_drought import build_decision_drought
+        store = get_store()
+        equity = store.equity_curve(limit=5000)
+        dd = build_decision_drought(
+            store.recent_decisions(limit=3000), equity,
+        )
+        return jsonify(build_drought_path_risk(dd, equity))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/news-action-funnel")
 def news_action_funnel_api():
     """Per-ticker funnel of loud-articles → decisions → fills → P&L over the
@@ -16924,6 +16968,53 @@ def weekday_pnl_fingerprint_api():
             "error": str(e),
             "buckets": [],
         }), 500
+
+
+@app.route("/api/forced-hold-attribution")
+def forced_hold_attribution_api():
+    """Forced-vs-chosen attribution on every currently OPEN position.
+
+    For each open position, partitions the decision cycles since it was
+    opened into ``blind`` (NO_DECISION — Opus could not act) vs
+    ``sighted`` (any real decision row) and emits per-position +
+    aggregate verdicts: ``FORCED_HOLD`` / ``PARTIALLY_FORCED`` /
+    ``MIXED`` / ``CHOSEN_HOLD``.
+
+    Answers the trader's question: "Is my NVDA on the book because
+    Opus is choosing to ride it, or because the box has been
+    host-saturated all day and Opus literally can't issue a SELL?"
+
+    Neighbour endpoints solve different problems:
+
+    * ``/api/hold-discipline`` — disposition trap (held past empirical
+      median losing hold), reads age, not agency.
+    * ``/api/no-decision-recovery`` — wedge run-lengths across the
+      WHOLE tape, does not attribute wedges to OPEN positions.
+    * ``/api/today-action-tape`` — flat aggregate of today's cycles,
+      not partitioned by which position was on the book.
+
+    Pure builder; network in the endpoint. Advisory only — never gates
+    Opus, never adds caps (AGENTS.md #2/#12 — the ``hold_discipline``
+    endpoint precedent).
+    """
+    try:
+        from .analytics.forced_hold_attribution import (
+            build_forced_hold_attribution,
+        )
+
+        try:
+            window = int(request.args.get("window") or 500)
+        except (TypeError, ValueError):
+            window = 500
+        window = max(1, min(window, 5000))
+
+        store = get_store()
+        return jsonify(build_forced_hold_attribution(
+            store.open_positions(),
+            store.recent_decisions(window),
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
