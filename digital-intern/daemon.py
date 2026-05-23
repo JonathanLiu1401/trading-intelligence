@@ -114,6 +114,8 @@ from collectors.usaspending_contracts_collector import collect_usaspending_contr
 from collectors.unusual_volume_collector import collect_unusual_volume
 from collectors.short_squeeze_monitor import collect_short_squeeze
 from collectors.twse_semiconductor import collect_twse_semiconductor
+from collectors.nasdaq_ipo_calendar import collect_nasdaq_ipo
+from collectors.putcall_ratio_collector import collect_putcall_ratio
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -181,6 +183,8 @@ G10_YIELDS_INTERVAL     = 3600    # G10 sovereign yields every 1h (FRED daily/mo
 COT_INTERVAL            = 6 * 3600  # CFTC COT report — weekly release, check 6-hourly
 TWSE_INTERVAL           = 3600    # Taiwan Stock Exchange semis — hourly (market open 09:00–13:30 TW)
 SHORT_INTEREST_INTERVAL = 21600   # highshortinterest.com every 6h (data updates ~2/month)
+NASDAQ_IPO_INTERVAL     = 3600    # Nasdaq IPO calendar - hourly
+PUTCALL_RATIO_INTERVAL  = 600     # Market put/call ratio - every 10min
 VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
 DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
 INSIDER_CLUSTER_INTERVAL = 600    # EDGAR Form 4 cluster-buy scan every 10min
@@ -313,6 +317,8 @@ WORKER_POLL_INTERVAL_SECS = {
     "sec_form4": SEC_FORM4_INTERVAL,
     "usgs_quake": USGS_QUAKE_INTERVAL,
     "nasdaq_halts": NASDAQ_HALTS_INTERVAL,
+    "nasdaq_ipo":      NASDAQ_IPO_INTERVAL,
+    "putcall_ratio":   PUTCALL_RATIO_INTERVAL,
     "fda": FDA_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
@@ -1171,6 +1177,50 @@ def twse_semiconductor_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(TWSE_INTERVAL)
+
+
+# ── Worker: Nasdaq IPO calendar — every 1h ──────────────────────────────────
+def nasdaq_ipo_worker(store: ArticleStore):
+    log.info("[nasdaq_ipo_worker] started")
+    bo = Backoff("nasdaq_ipo", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_nasdaq_ipo()
+            _ingest(store, articles, "nasdaq_ipo")
+            try:
+                source_health.record_result("nasdaq_ipo", len(articles))
+            except Exception as he:
+                log.warning(f"[nasdaq_ipo_worker] source_health error: {he}")
+            _worker_last_ok["nasdaq_ipo"] = time.time()
+            log.debug(f"[nasdaq_ipo] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[nasdaq_ipo_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(NASDAQ_IPO_INTERVAL)
+
+
+# ── Worker: Market put/call ratio — every 10min ─────────────────────────────
+def putcall_ratio_worker(store: ArticleStore):
+    log.info("[putcall_ratio_worker] started")
+    bo = Backoff("putcall_ratio", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_putcall_ratio()
+            _ingest(store, articles, "putcall_ratio")
+            try:
+                source_health.record_result("putcall_ratio", len(articles))
+            except Exception as he:
+                log.warning(f"[putcall_ratio_worker] source_health error: {he}")
+            _worker_last_ok["putcall_ratio"] = time.time()
+            log.debug(f"[putcall_ratio] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[putcall_ratio_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(PUTCALL_RATIO_INTERVAL)
 
 
 # ── Worker: Crypto Fear & Greed Index — every 30min ─────────────────────────
@@ -3628,6 +3678,8 @@ def main():
         ("usgs_quake",  usgs_quake_worker),
         ("nasdaq_halts", nasdaq_halts_worker),
         ("twse_semiconductor", twse_semiconductor_worker),
+        ("nasdaq_ipo",   nasdaq_ipo_worker),
+        ("putcall_ratio", putcall_ratio_worker),
         ("fda",         fda_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
