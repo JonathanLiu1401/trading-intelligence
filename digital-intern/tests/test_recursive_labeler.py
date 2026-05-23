@@ -178,3 +178,84 @@ class TestFetchRound1Candidates:
         ids = {a["_id"] for a in out}
         assert ids == {"weak", "zero"}
         assert "strong" not in ids
+
+    def test_excludes_noise_floor_sentinel(self, store):
+        """ai_score=0.01 is the urgency-scorer pre-floor + anti-loop sentinel.
+        Re-fetching these into the recursive labeler sends already-judged-noise
+        rows back to Sonnet (quota waste + re-promotion risk). The SQL filter
+        excludes the exact 0.01 value while keeping ai_score=0 (genuine
+        unlabeled) and ai_score>=0.5 (genuine low Sonnet labels)."""
+        # The exact pre-floor sentinel — must be excluded.
+        _insert_raw(store, id="qw_floor", url="https://x.com/qw",
+                    title="NVDANVIDIA Corporation227.13-8.61(-3.65%)",
+                    ai_score=0.01)
+        _insert_raw(store, id="rt_floor", url="https://x.com/rt",
+                    title="Why Nvidia (NVDA) Stock Is Trading Up Today",
+                    ai_score=0.01)
+        # Genuine unlabeled — must be included.
+        _insert_raw(store, id="zero", url="https://x.com/zero",
+                    title="Federal Reserve announces emergency rate decision",
+                    ai_score=0.0)
+        # Genuine low Sonnet label (1.0, 1.5) — must be included for active
+        # learning re-scoring (these are the borderline cases the labeler is
+        # designed to revisit).
+        _insert_raw(store, id="low1", url="https://x.com/low1",
+                    title="ECB rate decision week — analyst consensus split",
+                    ai_score=1.0)
+        _insert_raw(store, id="low15", url="https://x.com/low15",
+                    title="MU outlook hazy ahead of next quarter",
+                    ai_score=1.5)
+
+        out = recursive_labeler._fetch_round1_candidates(store, limit=50)
+        ids = {a["_id"] for a in out}
+        # Noise-floor sentinels excluded; genuine unlabeled and low-label kept.
+        assert ids == {"zero", "low1", "low15"}
+        assert "qw_floor" not in ids
+        assert "rt_floor" not in ids
+
+    def test_excludes_quote_widget_fingerprints_at_ai_score_zero(self, store):
+        """A quote-widget-shaped row with ai_score=0 (scorer worker hadn't
+        Sonnet-routed it yet) must NOT be re-routed by the recursive labeler.
+        Defense-in-depth: a fingerprint match overrides the SQL-only filter
+        so the recursive labeler can never reintroduce the exact noise the
+        urgency_scorer pre-floor exists to prevent."""
+        _insert_raw(store, id="qw0", url="https://x.com/qw0",
+                    # Quote-widget price-glue fingerprint.
+                    title="BTC-USDBitcoin USD78,012.91-2,471.37(-3.07%)",
+                    ai_score=0.0)
+        _insert_raw(store, id="qw1", url="https://x.com/qw1",
+                    # Quote-widget parenthesised-%-change fingerprint.
+                    title="Bitcoin slides on rate fears (-3.07%) widget",
+                    ai_score=0.0)
+        _insert_raw(store, id="real", url="https://x.com/real",
+                    title="Micron beats Q1 estimates on HBM demand",
+                    ai_score=0.0)
+        out = recursive_labeler._fetch_round1_candidates(store, limit=50)
+        ids = {a["_id"] for a in out}
+        # Both quote-widget rows filtered; real headline kept.
+        assert "real" in ids
+        assert "qw0" not in ids
+        assert "qw1" not in ids
+
+    def test_excludes_recap_template_fingerprints_at_ai_score_zero(self, store):
+        """Recap-template SEO mill rows that escaped the urgency_scorer pre-floor
+        (rare, but possible when the scorer worker is behind) must not be
+        promoted by recursive-labeler re-scoring. Same single-source-of-truth
+        recap fingerprint set as the alert path's _filter_recap_template_noise."""
+        _insert_raw(store, id="rt_why_trading", url="https://x.com/rt1",
+                    title="Why Micron Stock Is Trading Up Today",
+                    ai_score=0.0)
+        _insert_raw(store, id="rt_quick_glance", url="https://x.com/rt2",
+                    title="NVIDIA Earnings: A Quick Glance at Key Metrics",
+                    ai_score=0.0)
+        _insert_raw(store, id="rt_market_today", url="https://x.com/rt3",
+                    title="Stock Market Today, May 18: Micron Falls",
+                    ai_score=0.0)
+        _insert_raw(store, id="real", url="https://x.com/real",
+                    title="Apple unveils new chip family at WWDC",
+                    ai_score=0.0)
+        out = recursive_labeler._fetch_round1_candidates(store, limit=50)
+        ids = {a["_id"] for a in out}
+        assert ids == {"real"}, (
+            "every recap-template fingerprint must be skipped"
+        )
