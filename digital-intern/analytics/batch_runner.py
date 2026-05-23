@@ -39,6 +39,15 @@ PIPELINE: list[tuple[str, Path, int]] = [
     ("analytics.confluence_signals",      LOGS / "confluence_signals.json",      50),
     ("analytics.ticker_alert_ranker",     LOGS / "ticker_alert_rank.json",       50),
     ("analytics.source_score_drift",      LOGS / "source_score_drift.json",      50),
+    # Junk-source detector and source-lead-time were CLI-only standalones; both
+    # now use the safe ``mode=ro`` connect pattern (b669736), so they're cheap
+    # to run hourly and give the analyst standing visibility into (a) which
+    # collectors flood the DB with near-identical titles and (b) which source
+    # tends to print a story FIRST when many feeds eventually carry it. Both
+    # are bounded SCAN_LIMIT reads via idx_first_seen — no full-table scan,
+    # safe to run alongside the live writers.
+    ("analytics.junk_source_detector",    LOGS / "junk_source_report.json",     110),
+    ("analytics.source_lead_time",        LOGS / "source_lead_time.json",       110),
     ("analytics.collection_quality",      LOGS / "collection_quality.json",     110),
     ("analytics.daily_digest",            LOGS / "daily_digest.txt",            110),
 ]
