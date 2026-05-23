@@ -84,12 +84,20 @@ def _classify_failed_row(row: dict) -> str:
       1. ``notes`` contains ``"[reaped"`` — set by
          ``run_continuous_backtests._reap_orphaned_runs`` for rows whose
          ``status='running'`` exceeded 6h (the explicit reaper marker)
-      2. ``n_trades >= MIN_TRADES_FOR_REAL_RUN`` AND a non-null vs_spy_pct
-         — the structural signal: a row with 100+ trades and a populated
-         benchmark was productive at the time of death; "engine crashed
-         before deciding anything" doesn't fit.
+      2. ``n_trades >= MIN_TRADES_FOR_REAL_RUN`` — the structural signal:
+         100+ trades means the engine was productively running, so the
+         row carries real partial trade data even if ``finalize_run``
+         never executed.
 
     Either signal alone is sufficient; both False ⇒ GENUINE_FAILURE.
+
+    Note that ``vs_spy_pct`` is NOT a reliable classification signal: the
+    ``backtest_runs`` schema declares it ``REAL NOT NULL DEFAULT 0``, so a
+    row whose ``finalize_run`` never executed (the OOM-reaped case)
+    carries the placeholder ``0.0``, not ``NULL``. Use ``n_trades`` and
+    the reaper marker instead — the trade-count signal is the load-bearing
+    one because the engine writes ``backtest_trades`` rows as they fill,
+    independent of finalization.
     """
     notes = str(row.get("notes") or "")
     if "[reaped" in notes:
@@ -98,11 +106,40 @@ def _classify_failed_row(row: dict) -> str:
         n_trades = int(row.get("n_trades") or 0)
     except (TypeError, ValueError):
         n_trades = 0
-    vs_spy = row.get("vs_spy_pct")
-    has_benchmark = vs_spy is not None
-    if n_trades >= MIN_TRADES_FOR_REAL_RUN and has_benchmark:
+    if n_trades >= MIN_TRADES_FOR_REAL_RUN:
         return "LIKELY_OOM_REAPED"
     return "GENUINE_FAILURE"
+
+
+def _has_real_vs_spy(row: dict) -> bool:
+    """True if a row's ``vs_spy_pct`` is a real finalize_run-written
+    value (not the schema's NOT NULL DEFAULT 0 placeholder).
+
+    ``finalize_run`` is the only writer that populates ``completed_at``.
+    A row with ``completed_at IS NULL`` carries the schema's
+    DEFAULT 0 for vs_spy_pct — treating that as realized alpha
+    contaminates the bias_shift calculation (live evidence: 26/26 failed
+    rows on the production backtest.db carry vs_spy_pct=0.0 from the
+    default, not from real benchmarks). Only rows that completed —
+    however briefly — carry a vs_spy_pct that should feed the bias
+    estimate.
+
+    An honest 0.0 vs_spy_pct from a completed run (extremely rare —
+    SPY benchmark hard-flat) is correctly kept; an honest +0.001 from
+    a thin-window completed run is kept; only the placeholder ``0.0``
+    from a never-finalized OOM-reaped row is excluded. The completed_at
+    check is the load-bearing distinguisher.
+    """
+    if row.get("completed_at") is None:
+        return False
+    v = row.get("vs_spy_pct")
+    if v is None:
+        return False
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return False
+    return fv == fv  # NaN guard
 
 
 def _median(values: list[float]) -> float | None:
@@ -149,6 +186,7 @@ def analyze(backtest_db: Path | str | None = None) -> dict:
         "n_oom_reaped": 0,
         "n_genuine": 0,
         "oom_reaped_pct": None,
+        "n_oom_with_real_vs_spy": 0,
         "hidden_median_vs_spy": None,
         "hidden_max_vs_spy": None,
         "hidden_min_vs_spy": None,
@@ -181,7 +219,7 @@ def analyze(backtest_db: Path | str | None = None) -> dict:
             conn.row_factory = sqlite3.Row
             failed_rows = conn.execute(
                 "SELECT run_id, n_trades, vs_spy_pct, total_return_pct, "
-                "       notes "
+                "       notes, completed_at "
                 "FROM backtest_runs WHERE status='failed' "
                 "ORDER BY run_id ASC"
             ).fetchall()
@@ -223,16 +261,27 @@ def analyze(backtest_db: Path | str | None = None) -> dict:
 
         # Hidden-slice stats — the vs_spy_pct distribution of OOM-reaped
         # rows is what the dashboard's complete-only aggregate excludes.
+        # Filter to rows whose vs_spy_pct is a real finalize_run value
+        # (completed_at populated), not the schema's NOT NULL DEFAULT 0
+        # placeholder. Live evidence: 26/26 production failed rows carry
+        # vs_spy_pct=0.0 from the default — treating those as realized
+        # alpha would silently shift bias_shift_pct toward 0 (the
+        # placeholder value), badly misreporting the dashboard's true
+        # overstatement.
         hidden_vs_spy: list[float] = []
+        n_oom_with_real_vs_spy = 0
         for d in oom_reaped:
+            if not _has_real_vs_spy(d):
+                continue
             v = d.get("vs_spy_pct")
-            if v is not None:
-                try:
-                    fv = float(v)
-                except (TypeError, ValueError):
-                    continue
-                if fv == fv:  # NaN guard
-                    hidden_vs_spy.append(fv)
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv == fv:  # NaN guard
+                hidden_vs_spy.append(fv)
+                n_oom_with_real_vs_spy += 1
+        out["n_oom_with_real_vs_spy"] = n_oom_with_real_vs_spy
 
         if hidden_vs_spy:
             out["hidden_median_vs_spy"] = round(_median(hidden_vs_spy), 3)
@@ -294,12 +343,23 @@ def analyze(backtest_db: Path | str | None = None) -> dict:
             bias_str = (f" Dashboard median vs_spy would shift "
                         f"{sign}{out['bias_shift_pct']:.2f}pp if hidden "
                         f"rows were re-included.")
+        if hidden_vs_spy:
+            hidden_str = (f"; their hidden median vs_spy = "
+                          f"{out['hidden_median_vs_spy']} "
+                          f"(n={n_oom_with_real_vs_spy} with a real "
+                          f"finalize_run benchmark out of "
+                          f"{len(oom_reaped)} OOM-reaped).")
+        else:
+            hidden_str = (f"; ALL {len(oom_reaped)} OOM-reaped rows carry "
+                          f"the schema's vs_spy_pct=0.0 placeholder "
+                          f"(never finalized), so the realized alpha of "
+                          f"the hidden slice is UNKNOWN — bias_shift "
+                          f"is not computable.")
         out["hint"] = (
             f"{len(oom_reaped)}/{len(failed_rows)} failed rows "
             f"({100 * oom_pct:.1f}%) look OOM-reaped (n_trades >= "
-            f"{MIN_TRADES_FOR_REAL_RUN} or [reaped] in notes); their "
-            f"hidden median vs_spy = "
-            f"{out['hidden_median_vs_spy']}." + bias_str
+            f"{MIN_TRADES_FOR_REAL_RUN} or [reaped] in notes)"
+            + hidden_str + bias_str
         )
         return out
 
@@ -311,6 +371,7 @@ def analyze(backtest_db: Path | str | None = None) -> dict:
             "n_oom_reaped": 0,
             "n_genuine": 0,
             "oom_reaped_pct": None,
+            "n_oom_with_real_vs_spy": 0,
             "hidden_median_vs_spy": None,
             "hidden_max_vs_spy": None,
             "hidden_min_vs_spy": None,
