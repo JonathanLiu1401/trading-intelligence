@@ -6,6 +6,245 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 paper-trader core HYBRID pass #7 (Agent 1) — _no_decision_cause whitespace + last_real_decision() primitive
+
+### Phase 1: Debug — 1 bug fixed (5ffd69a)
+
+`runner._no_decision_cause` is the cause-suffix carried into the
+breaker Discord alert body; that suffix is what differentiates "escalate
+to Anthropic" from "stop running 4 parallel review agents". When
+`strategy.decide()` recorded a *whitespace-only* `raw` (rare but
+observed live when the claude CLI streams a blank line before
+disconnecting), the helper took the raw-response branch and returned
+`"raw response (first line): "` with an empty body — masking the
+per-call `last_claude_fail` tag (timeout / empty_stdout / nonzero_rc /
+cli_missing / exception) the breaker alert was designed to surface.
+
+Surgical fix: strip first; only emit the raw-response branch when
+something prose-y remains. Otherwise fall through to the existing
+`last_claude_fail` arm. Two new tests in
+`tests/test_core_runner_cycle.py::TestNoDecisionCause` pin both arms:
+whitespace raw + a fail tag falls through to
+`claude no-response (<fail>)`; whitespace raw with no fail tag yields
+`""` (not a misleading empty body line).
+
+### Phase 2: Feature — `Store.last_real_decision()` primitive (2317b8f)
+
+A trader watching `/api/state` during a host-saturation IDLE_STORM
+sees "HEALTHY — last decision 6m ago" because `recent_decisions(1)[0]`
+is the most recent ROW (which is a NO_DECISION cycle), but the engine
+has not actually decided anything for hours or days. Live state at
+2026-05-23 14:49 UTC: 155 consecutive NO_DECISION cycles over 52.5h —
+a green light on the operator's primary surface while the engine is
+brain-dead.
+
+`Store.last_real_decision()` answers the question that green light
+hides: "when did the engine last produce a parseable Claude response,
+not just cycle?". Targeted SQL filters NO_DECISION rows
+(`action_taken NOT LIKE 'NO_DECISION%' AND != ''`) so an old corpus
+stays cheap; same `ORDER BY timestamp DESC, id DESC` tie-break as
+`recent_decisions`. Returns the full row shape; `None` on no match
+(additive contract — callers degrade-safely treat None as "engine
+has never decided"). FILLED / HOLD / BLOCKED all count as real
+(HOLD is deliberate agency, BLOCKED is a risk-rejected real trade —
+meaningfully different from a NO_DECISION cycle).
+
+This is the primitive an "engine real-decision-age" surface needs
+(heartbeat line, dashboard endpoint, etc.); the call sites are left
+to a follow-up to avoid conflict with concurrent dashboard.py edits.
+7 new tests in `tests/test_core_store.py::TestLastRealDecision` pin
+the filter (NO_DECISION + NO_DECISION-prefix variants + empty
+excluded), ordering (newest-first), the include set (FILLED/HOLD/
+BLOCKED), and the `None` contract on a fresh / all-NO_DECISION book.
+
+### Phase 3 findings — live state at 2026-05-23 14:49 UTC
+
+1. **CRITICAL — 52.55h PARALYSIS drought, -2.98% alpha bleed vs SPY.**
+   `/api/decision-drought` reports ongoing PARALYSIS: 155 cycles
+   since 2026-05-21 10:14 UTC, 100% NO_DECISION. Portfolio -2.43%,
+   SPY +0.56% (-2.98% alpha). **Cause is operational, not code**:
+   `/api/host-guard` reports 17 concurrent Opus subprocesses,
+   swap 92%, load1 28.56 on 16 CPUs. The fix is to stop running
+   4 parallel review/HYBRID agents simultaneously; the bot cannot
+   resolve this by trading.
+
+2. **The diagnostic stack is excellent.** Five orthogonal endpoints
+   converge on the correct verdict — `/api/decision-drought`
+   (PARALYSIS, 52.5h), `/api/host-guard` (SATURATED, 17 Opus),
+   `/api/no-decision-reasons` (host_saturated 94%),
+   `/api/runner-heartbeat` (IDLE_STORM, `restart_helps=false`),
+   `/api/state.decision_efficacy` (100%/20). None recommend a
+   restart — correct, the action would worsen it.
+
+3. **NVDA position thesis is stale.** Held 3 shares at avg $223.43
+   since 2026-05-21 10:00 UTC; now $215.25 (-2.49% unrealized).
+   Thesis was Q1 earnings catalyst, played out ~4 days ago. No real
+   decision has touched the lot since the original BUY (52.5h ago).
+   `_thesis_drift` in the Opus prompt would surface this — but Opus
+   has not been called in 52.5h so the drift verdict is never reaching
+   a decision. The freeze itself is the bigger problem.
+
+4. **The breaker latch state is opaque from the API surface.** The
+   runner's `_breaker_alert_active` / `_quota_alert_active` /
+   `_no_decision_first_ts` module globals are checked internally for
+   dedupe but not exposed via `/api/runner-heartbeat`. An operator
+   cannot independently verify "is the latch currently armed?".
+   Future addition: a small additive `latches` sub-block on the
+   heartbeat — mirror the `singleton_lock` / `notify` pattern the
+   endpoint already adds.
+
+5. **The hourly Discord summary correctly surfaces the drought.**
+   `_host_pulse_line` fires SATURATED, `_heartbeat_line` fires
+   IDLE_STORM with the non-restart-helping headline,
+   `_starvation_trend_line` fires (rate 100%), `_capital_pulse_line`
+   fires PINNED, `_drawdown_line` fires (book off high). The
+   operator's primary surface is fully informed; nothing missing
+   here.
+
+### Phase 4: docs (this entry); no code change.
+
+---
+
+## 2026-05-23 feature pass (Agent 4) — `/api/persona-book-fit` + `/api/stack-liveness`
+
+### Feature 1: `/api/persona-book-fit` — does the live book look like a persona rated DRAG?
+
+`/api/persona-leaderboard` already grades each of the 10 backtest personas
+EDGE / FLAT / DRAG / INSUFFICIENT from historical `backtest_runs`, but no
+surface closed the loop on the *live* book: "this open portfolio looks
+most like persona X — which is rated Y." A book whose weight distribution
+mirrors a DRAG persona is structurally adding variance not alpha, even if
+every individual trade looked reasonable at entry. That mismatch was
+invisible from every other panel.
+
+New endpoint at `/api/persona-book-fit` (thin Flask wrapper over a pure
+builder in `paper_trader/analytics/persona_book_fit.py`). The builder
+overlays the open-position market-value-weight distribution onto each
+persona's `_PERSONA_BOOSTS` archetype, picks the dominant persona by
+boost-weighted overlap score, looks that persona's verdict up in the
+existing persona-leaderboard report verbatim (SSOT — same source the
+operator already trusts), and emits one verdict:
+
+| Verdict             | Meaning                                                                       |
+|---------------------|-------------------------------------------------------------------------------|
+| `NO_BOOK`           | No open stock positions to fit                                                |
+| `WEAK_OVERLAP`      | Best-fit overlap < `MIN_DOMINANT_OVERLAP_PCT` (30%) — book is idiosyncratic   |
+| `INSUFFICIENT_PERSONA` | Dominant persona has too few leaderboard runs                              |
+| `ALIGNED_DRAG`      | Dominant persona is rated DRAG — surfaces top-3 EDGE alternatives             |
+| `ALIGNED_FLAT`      | Dominant persona is rated FLAT — weak positive edge                           |
+| `ALIGNED_EDGE`      | Dominant persona is rated EDGE                                                |
+
+Pure builder; no yfinance / articles.db / scorer touch — same network-free
+contract as `desk_pulse`. Never raises. Advisory only — never gates Opus,
+never adds caps (invariants #2 / #12). On `ALIGNED_DRAG` it additionally
+surfaces up to `TOP_EDGE_ALTERNATIVES` (3) EDGE-rated personas the book
+does NOT mirror — a rotation hint, not a recommendation.
+
+**Live evidence.** Against the live book (NVDA 100% on a $645 stock leg),
+the endpoint correctly reports `dominant='ESG / Thematic'` /
+`'Momentum Trader'` (which boost NVDA) and a coherent ALIGNED_* verdict
+based on the current leaderboard state. Verified end-to-end via Flask
+test client.
+
+**Tests:** `tests/test_persona_book_fit.py` — 18 tests, all green. Locks
+the full verdict ladder (NO_BOOK / WEAK_OVERLAP / INSUFFICIENT_PERSONA /
+ALIGNED_DRAG / ALIGNED_FLAT / ALIGNED_EDGE), the dominant-persona overlap
+math (raw_score = Σ book_weight × boost; argmax; alphabetical tiebreak),
+the threshold exactness around `MIN_DOMINANT_OVERLAP_PCT`, the
+runner-up-counterfactual reporting, the DRAG alternatives-don't-include-
+dominant rule, and the never-raises contract on malformed / None /
+non-numeric inputs. Plus a route-envelope test asserting status + verdict
++ headline shape.
+
+### Feature 2: `/api/stack-liveness` — single "is the whole stack alive?" stoplight
+
+The documented chronic operational pathology of this two-service stack is
+that *something* always lies — paper-trader runs but its boot SHA is 40
+commits behind HEAD, intern runs but `/healthz` blocks 60s on a hung
+worker, `articles.db` exists but its newest row is 6 hours old,
+`decision_scorer.pkl` exists but a synthetic n=39 run clobbered it (the
+2026-05-23 finding #1 footprint). Each was reachable from a separate
+endpoint; no single surface answered "is anything wrong with the stack
+right now?"
+
+New endpoint at `/api/stack-liveness` (thin Flask wrapper over a pure
+builder in `paper_trader/analytics/stack_liveness.py`). Composes signals
+every other panel already exposes — `runner_heartbeat` (loop liveness),
+`build-info` (trader SHA staleness), a lightweight pickle inspection of
+`decision_scorer.pkl` (n_train + pred_quantiles collapse check — the
+synthetic-clobber footprint), `:8080/api/healthz` reachability with a 2s
+total timeout, and articles.db newest `first_seen` age — and reduces them
+to one HEALTHY / DEGRADED / DARK / UNKNOWN verdict plus a per-component
+breakdown. The constituents remain the authoritative source of truth
+(`desk_pulse` router precedent); the new endpoint mints no new opinion.
+
+Component thresholds (module-owned, test-read so a retune cannot
+false-fail):
+
+- `TRADER_SHA_DEGRADED_BEHIND = 1` — any commit behind HEAD ⇒ DEGRADED
+- `SCORER_PKL_MIN_N_TRAIN = 100` — below the meaningful-prediction floor ⇒ DEGRADED
+- `ARTICLES_DB_DEGRADED_MIN = 30.0` min / `ARTICLES_DB_DARK_MIN = 120.0` min
+
+Top-level verdict = worst component. Tie-break in documented operational
+priority: `trader_loop > scorer_pkl > trader_sha > intern > articles_db`
+(a dead trader_loop dominates a dead intern — you can't trade either way,
+but a dead intern is observable from cache). Never raises; every probe
+failure degrades to UNKNOWN. Advisory only — has no path to `_execute()`.
+
+**Live evidence.** Against the live system, the endpoint returns 200 with
+coherent per-component verdicts; on the smoke run captured during this
+pass, the trader_loop was HEALTHY, articles_db HEALTHY (4.4 min old), and
+intern surfaced as DARK transiently (timing during smoke — recovers on
+next probe).
+
+**Tests:** `tests/test_stack_liveness.py` — 24 tests, all green. Locks
+each component's status mapping (DEGRADED-on-stale-SHA,
+DARK-on-collapsed-pkl, DARK-on-STALLED-loop, DEGRADED-on-LAGGING,
+DEGRADED-on-IDLE_STORM, DARK-on-unreachable-intern, DARK-on-≥120min-
+articles.db), the worst-component-wins reduction (DARK > DEGRADED >
+UNKNOWN > HEALTHY), the priority tiebreak (trader_loop wins over intern
+when both DARK), and the never-raises contract on all-None inputs. Plus a
+route-envelope test asserting components dict has all 5 keys.
+
+### Bonus: digital-intern chat enrichment (separate repo)
+
+Wired both endpoints' SSOT into `/api/chat` via the established pure-
+helper pattern (`_persona_book_fit_chat_lines` in digital-intern's
+`dashboard/web_server.py`, locked by `tests/test_chat_persona_book_fit_
+enrichment.py` — 20 tests, all green). Silence on non-actionable verdicts
+(ALIGNED_EDGE / ALIGNED_FLAT / NO_BOOK / WEAK_OVERLAP /
+INSUFFICIENT_PERSONA all collapse to `[]` — the `_event_readiness_chat_
+lines` precedent, never chat filler when the book is well-aligned).
+Surfaces ALIGNED_DRAG verbatim with the builder's own headline + a
+detail line restating the builder's own fields (overlap_pct, runner_up).
+Only appears once `:8090` is restarted onto `/api/persona-book-fit`.
+
+### Verification
+
+```bash
+# pure-builder + route tests
+python3 -m pytest tests/test_persona_book_fit.py tests/test_stack_liveness.py -v
+# → 42 passed
+
+# digital-intern chat helper tests
+cd /home/zeph/trading-intelligence/digital-intern
+python3 -m pytest tests/test_chat_persona_book_fit_enrichment.py
+# → 20 passed
+
+# regression — related sibling tests
+python3 -m pytest tests/test_persona_leaderboard_20260517.py \
+    tests/test_persona_leaderboard_endpoint.py tests/test_desk_pulse.py \
+    tests/test_runner_heartbeat.py tests/test_build_info.py tests/test_persona_skill.py
+# → 107 passed
+```
+
+When `paper-trader.service` restarts onto this commit, both new endpoints
+become reachable; until then the chat enrichment block falls back to
+silence (the standard "only appears once :8090 is restarted onto …"
+precedent in this AGENTS.md).
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #18 (Agent 2) — wk52 gate sentiment-only bypass + intraperiod-extreme outcomes
 
 ### Phase 1: Debug — 1 bug fixed (620fc7b)

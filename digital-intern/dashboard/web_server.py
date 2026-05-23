@@ -971,6 +971,64 @@ def _decision_paralysis_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _persona_book_fit_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/persona-book-fit` (does the live book look
+    like a backtest persona that actually carries alpha, or one rated DRAG?)
+    as compact chat-context lines.
+
+    The chat carries forward Kelly-sizing, regime-leverage fit, exit-intent
+    audit — every block analyses *position-by-position* fitness — but no
+    block surfaces the **structural** question of whether the entire book's
+    weight distribution mirrors a persona archetype that historically loses
+    money. ALIGNED_DRAG is the only "your book IS the persona that doesn't
+    work" signal in the desk; nowhere else is this surfaced.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` string
+    is the verbatim chat headline — no chat-side re-derived verdict that
+    could drift from the trader endpoint. The dominant persona name + the
+    EDGE alternatives carry through verbatim from the builder
+    (``_event_readiness_chat_lines`` recommended_action precedent).
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]``
+    - non-actionable verdicts (``ALIGNED_EDGE`` / ``ALIGNED_FLAT`` /
+      ``NO_BOOK`` / ``WEAK_OVERLAP`` / ``INSUFFICIENT_PERSONA``) → ``[]``.
+      Only ``ALIGNED_DRAG`` is worth surfacing — every other verdict is
+      either healthy (silence — the ``_event_readiness_chat_lines``
+      precedent) or insufficient (never chat filler).
+    - ``ALIGNED_DRAG`` → builder's verbatim ``headline`` + one detail line
+      restating the builder's own fields (overlap_pct, runner_up).
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") != "ALIGNED_DRAG":
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)             # verbatim SSOT — invariant #10
+
+    dom = rep.get("dominant")
+    runner_up = rep.get("runner_up")
+    detail = []
+    if isinstance(dom, dict):
+        ov = dom.get("overlap_pct")
+        if isinstance(ov, (int, float)) and not isinstance(ov, bool):
+            detail.append(f"dominant overlap {ov:.1f}%")
+    if isinstance(runner_up, dict):
+        ru_name = runner_up.get("persona")
+        ru_ov = runner_up.get("overlap_pct")
+        if isinstance(ru_name, str) and isinstance(ru_ov, (int, float)) \
+                and not isinstance(ru_ov, bool):
+            detail.append(f"runner-up {ru_name} ({ru_ov:.1f}%)")
+    if detail:
+        lines.append("  " + " | ".join(detail))
+
+    return lines
+
+
 def _cash_redeployment_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/cash-redeployment-latency-skill` (post-SELL
     cash-to-next-BUY latency distribution; the sold-then-sat pathology) as
@@ -5043,6 +5101,30 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: decision-paralysis fetch failed: %s", e)
 
+        # Persona-book-fit — the structural "does the live book mirror a
+        # backtest persona rated DRAG by the leaderboard?" question. Every
+        # other block analyses position-by-position fitness; none surface
+        # the whole-book archetype-overlap angle. Composed verbatim by the
+        # pure _persona_book_fit_chat_lines helper (unit-tested; SSOT —
+        # the builder's own headline is the chat headline, no re-derived
+        # verdict). Guarded 3s read; ALIGNED_EDGE / ALIGNED_FLAT / NO_BOOK
+        # / WEAK_OVERLAP / INSUFFICIENT_PERSONA payloads silently omit the
+        # block (the _decision_paralysis_chat_lines silence precedent —
+        # never chat filler when the book is well-aligned). Only appears
+        # once :8090 is restarted onto /api/persona-book-fit.
+        persona_book_fit_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/persona-book-fit",
+                    timeout=3) as resp:
+                _pbf = json.loads(resp.read().decode("utf-8"))
+            persona_book_fit_block = "\n".join(
+                _persona_book_fit_chat_lines(_pbf))
+        except Exception as e:
+            _logger().warning(
+                "chat: persona-book-fit fetch failed: %s", e)
+
         # Post-SELL cash-redeployment latency — the sold-then-sat pathology.
         # /api/risk reports cash_pct as a *snapshot*, but a book that sells
         # into a thesis weakening then sits for 5 days has the same headline
@@ -5466,6 +5548,7 @@ def create_app(store=None) -> Flask:
             + (f"MACRO CALENDAR — FOMC RATE DECISION (the single biggest MARKET-WIDE event; it moves the whole book at once, leveraged ETFs most violently — surfaced only when one is actually within the 14d horizon):\n{macro_calendar_block}\n\n" if macro_calendar_block else "")
             + (f"PAPER TRADER — EVENT READINESS (will the live trader actually be able to react before the next earnings print? Joins earnings-risk + decision-velocity + Claude-empty rate + the *current* NO_DECISION streak into a single per-event verdict — surfaced ONLY when BLIND / DEGRADED / IMMINENT_OVERDUE, never as filler when the pipeline is healthy. Recommended_action carries verbatim from the trader endpoint — restate, never re-derive):\n{event_readiness_block}\n\n" if event_readiness_block else "")
             + (f"PAPER TRADER — DECISION PARALYSIS (consecutive HOLD-only / NO_DECISION runs on the live decision loop — a stacked HOLD_LOCK block reads HEALTHY on runner-heartbeat and decision-health 24h aggregate but means Opus decided every cycle and never moved the book. Surfaced ONLY when HOLD_LOCK / IDLE_STORM / PASSIVE_LOOP, never filler when ACTIVE. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{decision_paralysis_block}\n\n" if decision_paralysis_block else "")
+            + (f"PAPER TRADER — PERSONA-BOOK FIT (does the live book's weight distribution mirror a backtest-persona rated DRAG by the persona-leaderboard? Every other block analyses position-by-position fitness; none surface the whole-book archetype-overlap angle. A book that mirrors a known underperforming persona is structurally adding variance, not alpha, regardless of how reasonable each individual trade looked at entry. Surfaced ONLY when ALIGNED_DRAG, never filler when ALIGNED_EDGE / ALIGNED_FLAT / NO_BOOK / WEAK_OVERLAP / INSUFFICIENT_PERSONA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{persona_book_fit_block}\n\n" if persona_book_fit_block else "")
             + (f"PAPER TRADER — CASH REDEPLOYMENT LATENCY (post-SELL cash-to-next-BUY interval distribution — the sold-then-sat pathology. A book that sells then sits for 5 days has the same headline cash% as one that redeploys in 6h, but the desk in question is materially different. Surfaced ONLY when SLOW / STALLED, never filler when FAST_REDEPLOY / STEADY. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{cash_redeployment_block}\n\n" if cash_redeployment_block else "")
             + (f"PAPER TRADER — DECISION VAPOR (per-FILLED-decision structural-quality detector — does the reasoning cite specific numbers + catalysts + tickers, or is Opus writing generic 'strong setup, building position' vapor? A vapor trade that fails has nothing for the next decision to learn from — this is the only block that answers 'is the bot thinking, or rationalising?'. Surfaced ONLY when MIXED / VAPOR_DECISIONS, never filler when SPECIFIC. Headline + any VAPOR sample excerpt carry verbatim from the trader endpoint — restate, never re-derive):\n{decision_vapor_block}\n\n" if decision_vapor_block else "")
             + (f"PAPER TRADER — REGIME-LEVERAGE FIT (book-leverage alignment vs prevailing SPY momentum regime. The watchlist is leveraged-ETF-heavy — the structural question 'are we positioned with or against the regime?' is high-stakes and answered nowhere else in chat. A 0% leveraged book during a bull tape is just as structurally wrong as a 40% leveraged book during a bear. Surfaced ONLY when BLIND_LEVERING / DANGEROUS_HEADWIND / MISSED_TAILWIND, never filler when ALIGNED / DEFENSIVE / NEUTRAL. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{regime_leverage_fit_block}\n\n" if regime_leverage_fit_block else "")
