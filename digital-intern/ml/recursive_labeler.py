@@ -141,12 +141,44 @@ def _fetch_round1_candidates(store, limit: int) -> list[dict]:
 
     Excludes backtest replays and Opus annotation rows — those carry historical
     labels from offline runs and must not be re-scored against the live model.
+
+    Also excludes the noise-floor sentinel (``ai_score = 0.01``). The urgency
+    scorer's quote-widget / recap-template pre-filter floors fingerprint-matched
+    rows to ``ai_score = 0.01`` with ``score_source='llm'`` so they exit the
+    Sonnet queue WITHOUT a real LLM call (see
+    ``watchers.urgency_scorer.score_batch``). The Sonnet anti-loop floor for
+    omitted indices uses the SAME 0.01 sentinel. Before this exclusion, the
+    recursive labeler — which uses a different prompt path that does NOT apply
+    those pre-filters — re-fetched every pre-floored row on every 4h cycle and
+    sent them straight to Sonnet again. Live evidence (2026-05-23, 7-day scan
+    of the USB DB): 15,628 ``ai_score=0.01 score_source='llm'`` rows in the
+    labeler's target window, AND 17 known quote-widget-shaped rows
+    (``NVDANVIDIA Corporation227.13-8.61(-3.65%)`` etc.) got recursive-labeled
+    BACK UP into the 4.0-8.0 range — one NVDA tape at ai_score=8.0 (urgent
+    territory), poisoning the trainer's strong-label pool with
+    ``score_source='llm'`` labels for patently-not-prose rows the pre-floor
+    explicitly identified as noise.
+
+    Defense-in-depth: a Python-side fingerprint check (the SAME single source
+    of truth the urgency scorer's pre-filter uses, imported from
+    ``watchers.alert_agent``) catches rows missed by the SQL sentinel exclusion
+    — e.g. a quote-widget row that reached the recursive labeler with
+    ``ai_score=0 score_source=NULL`` because the scorer worker hadn't yet
+    Sonnet-routed it. The fingerprint set is regex-tightening-anti-drift
+    (every gate uses the same tuple), so a future fingerprint addition
+    propagates here automatically.
     """
     from storage.article_store import decompress
+    # Sonnet returns integer scores 0..10 (the SCORE_PROMPT example shows int
+    # values). The urgency_scorer clamps to ``max(0.01, min(score, 10.0))`` so
+    # ``ai_score == 0.01`` is the unambiguous noise-floor sentinel — never a
+    # legitimate Sonnet output. ``ai_score = 0`` is "unscored" (the labeler's
+    # primary target); ``ai_score >= 0.5`` keeps genuinely-low Sonnet labels
+    # (1, 1.5) in the re-label pool for active learning.
     cur = store.conn.execute(
         "SELECT id, url, title, source, full_text, ai_score "
         "FROM articles "
-        "WHERE ai_score < 2.0 "
+        "WHERE (ai_score = 0 OR ai_score >= 0.5) AND ai_score < 2.0 "
         "AND url NOT LIKE 'backtest://%' "
         "AND source NOT LIKE 'backtest_%' "
         "AND source NOT LIKE 'opus_annotation%' "
@@ -154,16 +186,47 @@ def _fetch_round1_candidates(store, limit: int) -> list[dict]:
         "LIMIT ?",
         (limit,),
     )
+    # Defense-in-depth: a row that reached this path with ai_score=0 and a
+    # quote-widget / recap-template-shaped title (e.g. scorer worker backlog
+    # never Sonnet-routed it) must NOT be re-labeled — that would reintroduce
+    # the exact noise the urgency_scorer pre-floor exists to prevent. Reuse
+    # the SSOT fingerprint helpers from the alert path so a regex tightening
+    # there automatically engages here (same anti-drift discipline as the
+    # urgency_scorer's pre-filter). Import is local so a transient ImportError
+    # cannot break the whole recursive_labeler worker.
+    try:
+        from watchers.alert_agent import (
+            _looks_like_quote_widget, _looks_like_recap_template,
+        )
+    except Exception:
+        _looks_like_quote_widget = lambda _a: False  # noqa: E731
+        _looks_like_recap_template = lambda _a: (False, "")  # noqa: E731
     out = []
+    skipped_qw = 0
+    skipped_rt = 0
     for r in cur.fetchall():
         aid, url, title, source, blob, ai_score = r
         if not url or not title:
             continue
-        out.append({
+        summary = decompress(blob) if blob else ""
+        candidate = {
             "_id": aid, "url": url, "link": url, "title": title,
-            "source": source or "",
-            "summary": decompress(blob) if blob else "",
-        })
+            "source": source or "", "summary": summary,
+        }
+        if _looks_like_quote_widget(candidate):
+            skipped_qw += 1
+            continue
+        rt_hit, _rt_name = _looks_like_recap_template(candidate)
+        if rt_hit:
+            skipped_rt += 1
+            continue
+        out.append(candidate)
+    if skipped_qw or skipped_rt:
+        log.info(
+            f"[recursive_labeler] pre-filter skipped {skipped_qw} quote-widget "
+            f"+ {skipped_rt} recap-template row(s) — avoided wasted Sonnet "
+            f"calls + training-pool noise re-promotion"
+        )
     return out
 
 
