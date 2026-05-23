@@ -6,6 +6,58 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 — Agent 1 (HYBRID core) — breaker-CLEARED wedge duration
+
+**Phase 1 — bug fix (bugs_fixed: 0)**
+
+No genuine bugs found. Core suite (201 tests) green in 6s; reporter +
+runner_cycle suite (431 tests) green in 56s. The Phase-1 commit guard
+allows zero fixes when the diff would be empty, and this codebase is
+mature enough that any "fix" would be invented work.
+
+**Phase 2 — feature (features_added: 1)**
+
+`reporter.send_breaker_cleared_alert(elapsed_s=...)` — the FIRED side
+of the consecutive-NO_DECISION breaker alert carries the real
+wall-clock wedge duration (`send_breaker_fired_alert(..., elapsed_s=)`),
+but the CLEARED side historically said only "responding again" with no
+anchor for how long the bot was actually dark. A trader pulled away
+from Discord during a multi-hour storm got the cleared ping but had to
+scroll the channel to time the FIRED→CLEARED bracket. The new helper
+mirrors `_format_elapsed` so the body now reads `after ~1h15m dark`.
+`runner._cycle` captures `_no_decision_first_ts` BEFORE the reset so
+the recovery cycle has the actual figure. 5 reporter tests + 1 runner
+cycle test pin the contract (omits duration on None, no fabricated
+token on negative, sub-minute → `0m`, returns False propagates).
+
+**Phase 3 — live validation (user_findings: 4)**
+
+1. **Live trader IDLE_STORM** (the headline finding). `/api/runner-heartbeat`
+   shows `IDLE_STORM` — 20/20 NO_DECISION (100%), `host_saturated`,
+   `restart_helps: false`. `/api/host-guard` confirms 16 concurrent
+   Opus jobs, swap 100%, 100% of last 120 decisions never reached
+   Opus. The desk is frozen by the very HYBRID/review agents running
+   this session — documented #1 pathology playing out in real time;
+   the system correctly diagnoses (`restart_helps=false`) and points
+   the operator at the ops fix (reduce concurrent Opus). Do not try
+   to fix; do not kill sibling agents.
+2. **Stale boot**: pid 3980674 booted on `326a764`, on-disk HEAD is
+   `6e49e12` (my own commit just landed), `behind: 2`. The git-watcher
+   will graceful-restart between cycles; under saturation that may
+   take a while. Operator-visible as `stale: true` on `/api/healthz`.
+3. **systemd restart spam** (4300+ restarts in journalctl): the
+   single-instance lock correctly refuses the systemd-managed
+   instance because the real trader is running as a manual process.
+   Documented in `pt-systemd-vs-manual-restart-spam` memory; benign.
+4. **Discord channel HEALTHY** — last send 16m ago, 0 consecutive
+   failures. The operator-facing surface is alive (so the new
+   CLEARED-with-duration message will land when the storm finally
+   clears).
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=4
+
+---
+
 ## 2026-05-23 — Agent 1 (HYBRID core) — wedge-elapsed + starvation_trend
 
 **Phase 1 — bug fix (bugs_fixed: 2)**
