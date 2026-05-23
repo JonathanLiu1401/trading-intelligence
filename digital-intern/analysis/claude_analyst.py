@@ -1044,7 +1044,7 @@ RULES:
 - A newswire row ALSO tagged "[echo]" alongside "[syndicated xN]" is a calibration warning: those N copies all came from ONE source (a single outlet self-syndicating slight title variants of the same wire) — NOT independent corroboration. Down-weight: do not lead a "[syndicated xN] [echo]" row over a comparable single-but-credible row, and never treat the N count as cross-outlet confirmation when choosing the LEAD or ranking TOP SIGNALS. An untagged "[syndicated xN]" (no [echo]) means the N copies WERE distinct outlets — full corroboration credit applies.
 - A newswire row tagged "[model]" carries a score set by the local relevance model ONLY, with NO LLM verification; that model demonstrably over-scores forum/wiki/social rows. Treat an untagged (LLM-vetted) row as materially more trustworthy than a "[model]" row of equal or near-equal score: prefer untagged rows for the LEAD and rank them above "[model]" rows of similar score in TOP SIGNALS. NEVER make a lone "[model]" row the LEAD when an untagged row of comparable score exists.
 - A newswire row tagged "[ALERTED]" ALREADY fired a standalone 🚨 BREAKING push to the analyst within the last few hours — it is a developing/continued story the analyst has ALREADY been told about, NOT new news. Do NOT make an "[ALERTED]" row the LEAD when any untagged story of comparable importance exists; rank a fresh untagged story above an "[ALERTED]" one of similar score in TOP SIGNALS; and frame any "[ALERTED]" item explicitly as continuation (e.g. "follows the earlier alert", "developing") — never as if it just broke. This is what separates new desk intel from a rehash of an alert already delivered.
-- A newswire row tagged "[BOOK: TICKER,...]" names live portfolio/watchlist positions the analyst actually holds money in (LITE, LNOK, MUU, DRAM, MU, NVDA, MSFT, AXTI, ORCL, TSEM, QBTS). A "[BOOK:...]" row is directly actionable for the analyst's open risk: weight it ABOVE a same-score untagged general-market row when choosing the LEAD and ordering TOP SIGNALS, always reflect its named ticker(s) in the PORTFOLIO table with a concrete implication, and never bury a "[BOOK:...]" item below generic macro colour of similar magnitude. Absence of the tag means the row does not touch the held book.
+- A newswire row tagged "[BOOK: TICKER,...]" names live portfolio/watchlist positions the analyst actually holds money in ({held_book}). A "[BOOK:...]" row is directly actionable for the analyst's open risk: weight it ABOVE a same-score untagged general-market row when choosing the LEAD and ordering TOP SIGNALS, always reflect its named ticker(s) in the PORTFOLIO table with a concrete implication, and never bury a "[BOOK:...]" item below generic macro colour of similar magnitude. Absence of the tag means the row does not touch the held book.
 - If a "BOOK HEAT" block is present, it ranks the analyst's held names by how many DISTINCT stories this window touched each one. Concentration on a single held name is itself a magnitude signal, independent of any one row's score: strongly prefer the most-concentrated held name for the LEAD when it has any material story, rank its stories up in TOP SIGNALS, and give that ticker a concrete forward-looking implication in the PORTFOLIO table. This is a ranking/weighting hint only — do NOT echo a literal "BOOK HEAT" section in the output (unlike COVERAGE GAP).
 - If a "BOOK SILENCE" block is present, it lists held tickers with ZERO mentions this 5h window — the analyst has open risk on those names but no incoming catalyst this window. In the PORTFOLIO table, mark each silent ticker with a brief honest "N/A — no catalyst this window" (or similar terse note, never a fabricated implication or hedge filler like "continued caution"). Silent names should NOT lead and should NOT outrank a ticker with material news in TOP SIGNALS. This is an honesty/composition hint only — do NOT echo a literal "BOOK SILENCE" section in the output (same as BOOK HEAT / AGING TOP ROWS, unlike COVERAGE GAP).
 - If an "AGING TOP ROWS" block is present, it names the highest-ranked digest rows whose deterministic wall-clock age (time since the story hit our wire) is several hours old — a ground-truth recency cross-check, independent of any row's score or decay rank. An aging top row is a developing/continued story, NOT one that just broke: do NOT make it the LEAD as if it were fresh when a comparably-important newer row exists, frame it explicitly as developing in the LEAD and TOP SIGNALS, and never imply a multi-hour-old item happened moments ago. This is a ranking/framing hint only — do NOT echo a literal "AGING TOP ROWS" section in the output (same as BOOK HEAT, unlike COVERAGE GAP).
@@ -2550,9 +2550,32 @@ def analyze(articles, stock_data, earnings):
         macro_calendar_events=_collect_macro_calendar_events(),
         ml_freshness=_collect_ml_freshness(),
     )
-    full_prompt = f"{SYSTEM_PROMPT}\n\n---\nDATA INPUT:\n{payload}"
+    full_prompt = (
+        SYSTEM_PROMPT.format(held_book=_held_book_phrase())
+        + f"\n\n---\nDATA INPUT:\n{payload}"
+    )
     result = claude_call(full_prompt, model=MODEL, timeout=180)
     return result or "[analyst] No response from Claude."
+
+
+def _held_book_phrase() -> str:
+    """Comma-joined, canonical-ordered held/watchlist universe for SYSTEM_PROMPT's
+    ``[BOOK:]``-tag rule.
+
+    Reads the module-local ``_BOOK_UNIVERSE`` (the SSOT union of the static
+    canonical ``_BOOK_TICKERS`` core with ``ml.features.LIVE_PORTFOLIO_TICKERS``
+    — config/portfolio.json's positions + option underlyings + sector_watchlist),
+    in its canonical order so the prompt is test-pinnable. The rule historically
+    enumerated a frozen literal; a position added in the trading UI (e.g.
+    GOOG/COHR/NVDL on the 2026-05-23 audit) was invisible to Opus when it had to
+    decide which rows were "directly actionable" — the analyst's open risk on
+    those names was scored as generic news. Same SSOT
+    (``LIVE_PORTFOLIO_TICKERS``) the urgency_scorer and alert_agent prompts use,
+    so all three never silently disagree on what counts as held. Degrades to the
+    canonical static core only when the universe is somehow empty — a briefing
+    prompt must never go out with a blank held-positions slot."""
+    tickers = [t for t in _BOOK_UNIVERSE if t]
+    return ", ".join(tickers) if tickers else ", ".join(_BOOK_TICKERS)
 
 
 if __name__ == "__main__":
