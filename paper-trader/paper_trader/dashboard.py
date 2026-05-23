@@ -17530,5 +17530,202 @@ def closed_market_fill_skill_api():
         return jsonify({"error": str(e), "verdict": "ERROR"}), 500
 
 
+@app.route("/api/persona-book-fit")
+def api_persona_book_fit():
+    """Persona-Book Fit — does the live portfolio look like a persona that
+    actually carries alpha, or like a documented DRAG?
+
+    ``/api/persona-leaderboard`` already grades each of the 10 backtest
+    personas EDGE / FLAT / DRAG / INSUFFICIENT from historical
+    ``backtest_runs``. This sibling closes the loop on the *live* book:
+    overlays the open-position weight distribution onto each persona's
+    ``_PERSONA_BOOSTS`` archetype, picks the dominant persona, looks its
+    verdict up in the leaderboard, and surfaces a single ALIGNED_EDGE /
+    ALIGNED_FLAT / ALIGNED_DRAG / INSUFFICIENT_PERSONA / WEAK_OVERLAP /
+    NO_BOOK verdict. On ALIGNED_DRAG it additionally surfaces up to
+    ``TOP_EDGE_ALTERNATIVES`` EDGE personas the book does NOT resemble —
+    a rotation hint, not a recommendation. Pure read; the builder is
+    network-free (the endpoint owns the ``BACKTEST_DB`` and store reads,
+    the ``thesis_drift`` split). Advisory only — never gates Opus, never
+    excludes a ticker (AGENTS.md invariants #2 / #12).
+    """
+    try:
+        from .analytics.persona_book_fit import build_persona_book_fit
+        from .backtest import PERSONAS, _PERSONA_BOOSTS
+        from paper_trader.ml.persona_leaderboard import (
+            _load_runs, persona_leaderboard,
+        )
+
+        store = get_store()
+        positions = store.open_positions()
+
+        db = Path(str(BACKTEST_DB))
+        runs = _load_runs(db) if db.exists() else []
+        leaderboard_report = persona_leaderboard(runs)
+
+        persona_names = {idx: meta["name"] for idx, meta in PERSONAS.items()}
+        report = build_persona_book_fit(
+            positions=positions,
+            persona_archetypes=_PERSONA_BOOSTS,
+            persona_names=persona_names,
+            leaderboard_report=leaderboard_report,
+        )
+        report["as_of"] = datetime.now(timezone.utc).isoformat()
+        return jsonify(report)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR",
+                        "headline": f"ERROR — {e}"}), 500
+
+
+def _scorer_pkl_summary() -> dict:
+    """Lightweight pickle inspection for the stack-liveness scorer component.
+
+    Returns ``{exists, n_train, pred_collapsed, error}``. Never raises —
+    every failure mode degrades to a populated error string so the
+    downstream component verdict can still classify.
+    """
+    try:
+        from .ml.decision_scorer import SCORER_PATH
+        pkl_path = Path(str(SCORER_PATH))
+    except Exception as e:
+        return {"exists": False, "n_train": None, "pred_collapsed": None,
+                "error": f"SCORER_PATH unresolved: {e}"}
+    if not pkl_path.exists():
+        return {"exists": False, "n_train": None, "pred_collapsed": None,
+                "error": None}
+    try:
+        import pickle
+        with pkl_path.open("rb") as f:
+            blob = pickle.load(f)
+    except Exception as e:
+        return {"exists": True, "n_train": None, "pred_collapsed": None,
+                "error": f"pickle load failed: {e}"}
+    n_train = blob.get("n_train") if isinstance(blob, dict) else None
+    pq = blob.get("pred_quantiles") if isinstance(blob, dict) else None
+    collapsed = None
+    try:
+        if pq is not None:
+            pq_list = list(pq)
+            if len(pq_list) >= 2:
+                lo, hi = min(pq_list), max(pq_list)
+                collapsed = bool(abs(float(hi) - float(lo)) < 1e-9)
+    except Exception:
+        collapsed = None
+    return {"exists": True, "n_train": n_train, "pred_collapsed": collapsed,
+            "error": None}
+
+
+def _intern_reachable(url: str = "http://127.0.0.1:8080/api/healthz",
+                       timeout_s: float = 2.0) -> tuple[bool, str | None]:
+    """Short-timeout probe of digital-intern's dashboard. Returns
+    (reachable, error_str_or_None). Never raises.
+    """
+    try:
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+            body = resp.read(256)
+            if 200 <= resp.status < 300 and (b"ok" in body or b"true" in body):
+                return True, None
+            return False, f"http {resp.status}"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+def _articles_db_age_minutes() -> float | None:
+    """Minutes since the newest row in digital-intern's articles.db, or None
+    on any failure. Never raises.
+
+    Resolves the DB path via digital-intern's article_store helper when
+    available — the same SSOT for USB-vs-local — so a USB unmount cannot
+    silently make the answer wrong.
+    """
+    try:
+        try:
+            from storage.article_store import _db_path  # digital-intern SSOT
+            db = Path(_db_path())
+        except Exception:
+            di_repo = Path("/home/zeph/trading-intelligence/digital-intern")
+            db = di_repo / "data" / "articles.db"
+        if not db.exists():
+            return None
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        try:
+            row = conn.execute(
+                "SELECT first_seen FROM articles ORDER BY first_seen DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None
+        ts = row[0]
+        if isinstance(ts, str) and ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        dt = datetime.fromisoformat(ts) if isinstance(ts, str) else None
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+        return max(0.0, delta)
+    except Exception:
+        return None
+
+
+@app.route("/api/stack-liveness")
+def api_stack_liveness():
+    """Single "is the whole trading stack alive?" stoplight verdict.
+
+    Composes signals every other panel already exposes —
+    ``runner_heartbeat`` (loop liveness), ``build-info`` (trader SHA
+    staleness), ``decision_scorer.pkl`` (synthetic-clobber footprint),
+    digital-intern dashboard reachability, articles.db freshness — and
+    reduces them to one HEALTHY / DEGRADED / DARK verdict plus a
+    per-component breakdown. The constituent diagnostics remain the
+    authoritative source of truth; this endpoint mints no new opinion
+    (``desk_pulse`` router precedent). Advisory only — never gates the
+    live loop, never adds caps (AGENTS.md invariants #2 / #12). Never
+    raises — every component degrades to UNKNOWN on a probe failure.
+    """
+    try:
+        from .analytics.stack_liveness import build_stack_liveness
+        from .analytics.runner_heartbeat import build_runner_heartbeat
+        from . import market as _mkt
+
+        store = get_store()
+        head, behind = _head_sha_and_behind()
+        build_info = {
+            "boot_sha": _BOOT_SHA, "head_sha": head, "behind": behind,
+            "stale": bool(_BOOT_SHA and head and head != _BOOT_SHA),
+        }
+
+        decs = store.recent_decisions(20)
+        last_ts = decs[0].get("timestamp") if decs else None
+        recent_actions = [d.get("action_taken") for d in decs]
+        recent_reasons = [d.get("reasoning") for d in decs]
+        now_utc = datetime.now(timezone.utc)
+        rh = build_runner_heartbeat(
+            last_ts, _mkt.is_market_open(now_utc), now=now_utc,
+            recent_actions=recent_actions, recent_reasons=recent_reasons,
+        )
+
+        scorer_info = _scorer_pkl_summary()
+        intern_ok, intern_err = _intern_reachable()
+        age_min = _articles_db_age_minutes()
+
+        report = build_stack_liveness(
+            build_info=build_info,
+            runner_heartbeat=rh,
+            scorer_pkl_info=scorer_info,
+            intern_reachable=intern_ok,
+            intern_error=intern_err,
+            articles_db_age_minutes=age_min,
+        )
+        report["as_of"] = now_utc.isoformat()
+        return jsonify(report)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR",
+                        "headline": f"ERROR — {e}"}), 500
+
+
 if __name__ == "__main__":
     run()

@@ -5,6 +5,38 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-23 feature pass (Agent 4) — `_persona_book_fit_chat_lines` chat enrichment
+
+Wires the new paper-trader `/api/persona-book-fit` endpoint into the
+analyst chat following the established pure-helper SSOT pattern (cf.
+`_event_readiness_chat_lines`, `_decision_paralysis_chat_lines`).
+
+The chat already carries forward Kelly-sizing, regime-leverage fit,
+exit-intent audit — every block analyses *position-by-position* fitness —
+but no block surfaced the **structural** question of whether the entire
+book's weight distribution mirrors a persona archetype that historically
+loses money. `ALIGNED_DRAG` is the only "your book IS the persona that
+doesn't work" signal in the desk.
+
+Helper at `dashboard/web_server.py::_persona_book_fit_chat_lines`, locked
+by `tests/test_chat_persona_book_fit_enrichment.py` (20 tests, all green).
+Standard contract:
+
+- non-dict → `[]`
+- non-actionable verdicts (`ALIGNED_EDGE` / `ALIGNED_FLAT` / `NO_BOOK` /
+  `WEAK_OVERLAP` / `INSUFFICIENT_PERSONA`) → `[]` — silence when the book
+  is well-aligned (the `_event_readiness_chat_lines` precedent, never
+  chat filler)
+- `ALIGNED_DRAG` → verbatim builder `headline` (SSOT — invariant #10) +
+  one detail line restating the builder's own `overlap_pct` and
+  `runner_up` fields
+
+Wired into the chat prompt assembly via a guarded 3s sub-fetch of
+`http://127.0.0.1:8090/api/persona-book-fit`; appears once paper-trader
+restarts onto the new endpoint.
+
+---
+
 ## 2026-05-23 hybrid pass #6 (Agent 3) — recursive-labeler noise-floor re-promotion fix + per-held-ticker recap pollution metric
 
 **Phase 1 (fix).** `bugs_fixed=1` — commit `b6e1fef`.
