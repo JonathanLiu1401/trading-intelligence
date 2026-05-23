@@ -85,6 +85,7 @@ from collectors.manifold_collector import collect_manifold
 from collectors.collector_rate_monitor import collect_rate_alerts
 from collectors.yield_curve_collector import collect_yield_curve
 from collectors.g10_sovereign_yields import collect_g10_yields
+from collectors.fred_collector import collect_fred
 from collectors.cftc_cot_collector import collect_cftc_cot
 from collectors.vix_term_structure import collect as collect_vix_ts
 from collectors.dxy_collector import collect as collect_dxy
@@ -188,6 +189,7 @@ MANIFOLD_INTERVAL       = 1800    # Manifold Markets prediction markets every 30
 RATE_MONITOR_INTERVAL   = 3600    # per-collector silence detector — hourly
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
 G10_YIELDS_INTERVAL     = 3600    # G10 sovereign yields every 1h (FRED daily/monthly)
+FRED_MACRO_INTERVAL     = 3600    # FRED macro series (claims, M2, rig count, etc.) — hourly
 COT_INTERVAL            = 6 * 3600  # CFTC COT report — weekly release, check 6-hourly
 TWSE_INTERVAL           = 3600    # Taiwan Stock Exchange semis — hourly (market open 09:00–13:30 TW)
 SHORT_INTEREST_INTERVAL = 21600   # highshortinterest.com every 6h (data updates ~2/month)
@@ -308,6 +310,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "rate_monitor": RATE_MONITOR_INTERVAL,
     "yield_curve": YIELD_CURVE_INTERVAL,
     "g10_yields": G10_YIELDS_INTERVAL,
+    "fred_macro": FRED_MACRO_INTERVAL,
     "short_interest": SHORT_INTEREST_INTERVAL,
     "wikipedia": WIKIPEDIA_INTERVAL, "wiki_pageviews": WIKI_PAGEVIEWS_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL, "tic": TIC_INTERVAL,
     "cisa_kev": CISA_KEV_INTERVAL,
@@ -1409,6 +1412,27 @@ def g10_yields_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(G10_YIELDS_INTERVAL)
+
+
+def fred_macro_worker(store: ArticleStore):
+    log.info("[fred_macro_worker] started")
+    bo = Backoff("fred_macro", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_fred()
+            _ingest(store, articles, "fred_macro")
+            try:
+                source_health.record_result("fred_macro", len(articles))
+            except Exception as he:
+                log.warning(f"[fred_macro_worker] source_health error: {he}")
+            _worker_last_ok["fred_macro"] = time.time()
+            log.debug(f"[fred_macro] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[fred_macro_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(FRED_MACRO_INTERVAL)
 
 
 def cftc_cot_worker(store: ArticleStore):
@@ -3842,6 +3866,7 @@ def main():
         ("rate_monitor", rate_monitor_worker),
         ("yield_curve", yield_curve_worker),
         ("g10_yields",  g10_yields_worker),
+        ("fred_macro",  fred_macro_worker),
         ("cftc_cot",    cftc_cot_worker),
         ("vix_ts",      vix_ts_worker),
         ("dxy",         dxy_worker),

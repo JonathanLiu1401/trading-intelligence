@@ -51,6 +51,21 @@ FRED_SERIES = {
     "T5YIE": "5-Year breakeven inflation rate (%)",
     "T10YIE": "10-Year breakeven inflation rate (%)",
     "T5YIFR": "5-Year, 5-Year forward inflation expectation rate (%)",
+    # Labor market leading indicators (weekly — highest-frequency macro signal).
+    # Initial claims spike precedes payroll weakness by ~4-8 weeks; continued
+    # claims persistent rise signals the labour market has already turned.
+    "ICSA": "Initial jobless claims (weekly, SA)",
+    "CCSA": "Continued jobless claims (weekly, SA)",
+    # Consumer demand + housing activity (monthly).
+    "UMCSENT": "Univ. of Michigan consumer sentiment index",
+    "RSXFS": "Advance retail sales ex-food-services (MoM %)",
+    "HOUST": "Housing starts (SAAR, thousands)",
+    # Monetary conditions (monthly/weekly).
+    "M2SL": "M2 money supply ($ billions, SA)",
+    "WALCL": "Fed total assets / balance sheet ($ millions, weekly)",
+    # Energy price signals (weekly/daily).
+    "DCOILBRENTEU": "Brent crude oil price ($/bbl, weekly)",
+    "GASREGCOVW": "US regular conventional gasoline price ($/gal, weekly)",
 }
 
 # Yield-curve spread emitted as a separate synthetic article series. The
