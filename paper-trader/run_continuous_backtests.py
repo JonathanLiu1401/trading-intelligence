@@ -574,6 +574,74 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
             return None
         return round(engine.prices.returns_pct(ticker, sim_d, ed), 4)
 
+    def _fwd_intraperiod_extremes(
+        ticker: str, sim_d: date, idx: int, h: int = 5
+    ) -> tuple[float | None, float | None]:
+        """Return ``(min_pct, max_pct)`` realized return reached at ANY
+        close between sim_d+1 and sim_d+h trading days, relative to
+        sim_d's close.
+
+        Read-only research signal (additive, 2026-05-23). The DecisionScorer
+        trains on the 5d *endpoint* return — but a trade with a +5% 5d return
+        that drew down -15% mid-window is a very different trade from one
+        that grinded straight up to +5%. Persisting the intraperiod extremes
+        unlocks risk-adjusted analytics:
+
+          * **forward_intraperiod_min_5d** — worst realized drawdown across
+            the window. A high-conviction BUY whose intraperiod min is
+            below the gate's implied -8% stop (the documented stop_loss
+            band from ``_buy``) would have been stopped out in live
+            execution even when the endpoint reading is positive; the field
+            makes that condition queryable from the corpus.
+          * **forward_intraperiod_max_5d** — best realized peak across the
+            window. Pairs with the min so a downstream analyzer can compute
+            captured-upside ratio (``forward_return_5d / forward_intraperiod_max_5d``)
+            — high-conviction calls that peak then crater have ratio ≪ 1.0.
+
+        Same defensive contract as ``_fwd_ret_h``: a None here never blocks
+        the 5d field that the scorer trains on. ``build_features`` /
+        ``train_scorer`` ignore unknown dict keys, so adding these columns
+        is zero-risk for the gate/trade path — pure additive instrumentation
+        (the same 2026-05-18 ``forward_return_10d/20d`` precedent).
+
+        Returns ``(None, None)`` when the sim-side resolved close is missing
+        OR the entire forward window has no resolvable closes; partial
+        coverage (some but not all of the 1..h days have data) is honored —
+        any close that resolves contributes to the running extremes.
+        Tickers with very thin/foreign calendars therefore degrade
+        gracefully rather than dropping the whole outcome row.
+        """
+        sim_res = engine.prices.resolved_close_date(ticker, sim_d)
+        if sim_res is None:
+            return None, None
+        sim_close = engine.prices.price_on(ticker, sim_d)
+        if not sim_close or sim_close <= 0:
+            return None, None
+        min_pct: float | None = None
+        max_pct: float | None = None
+        for k in range(1, h + 1):
+            ti = idx + k
+            if ti < 0 or ti >= len(trading_days):
+                continue
+            day = trading_days[ti]
+            day_res = engine.prices.resolved_close_date(ticker, day)
+            # Same walk-back collision guard as the endpoint computations:
+            # a day whose walk-back resolves to sim_d (or earlier) tells us
+            # nothing forward, so skip it.
+            if day_res is None or day_res <= sim_res:
+                continue
+            day_close = engine.prices.price_on(ticker, day)
+            if day_close is None:
+                continue
+            pct = (day_close - sim_close) / sim_close * 100.0
+            if min_pct is None or pct < min_pct:
+                min_pct = pct
+            if max_pct is None or pct > max_pct:
+                max_pct = pct
+        if min_pct is None or max_pct is None:
+            return None, None
+        return round(min_pct, 4), round(max_pct, 4)
+
     for run in top_runs:
         try:
             # Hold the store lock — the background _opus_annotate thread may
@@ -764,6 +832,19 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
             except Exception:
                 _persona_name = None
 
+            # Additive intraperiod-extreme capture (read-only research signal,
+            # 2026-05-23 feature — same `forward_return_10d/20d` precedent:
+            # `build_features` / `train_scorer` ignore unknown dict keys, so
+            # no retrain required and no risk of feature-vector drift).
+            # Unlocks risk-adjusted analysis the 5d endpoint cannot answer:
+            #   * Did a +5% endpoint reading mask a -15% intraperiod drawdown
+            #     (the trade would have been stopped out before the endpoint)?
+            #   * Did a -3% endpoint reading mask a +12% intraperiod peak (the
+            #     `take_profit` field could have captured the gain before the
+            #     reversal)?
+            # Computed once per outcome row alongside the existing 5d field.
+            intra_min, intra_max = _fwd_intraperiod_extremes(
+                ticker, sim_d, idx, h=5)
             outcomes.append({
                 "run_id": run.run_id,
                 "persona": _persona_name,
@@ -822,6 +903,14 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
                 # history (<60 closes) for this ticker at sim_date.
                 "wk52_pos": q.get("wk52_pos"),
                 "pct_from_52h": q.get("pct_from_52h"),
+                # Intraperiod extremes — worst drawdown / best peak reached at
+                # any close between sim_d+1 and sim_d+5 trading days, relative
+                # to sim_d close (signed %). None when the window has no
+                # resolvable closes (thin/foreign ticker calendar, run end);
+                # partial coverage is honored (any resolving day contributes).
+                # See `_fwd_intraperiod_extremes` for the full rationale.
+                "forward_intraperiod_min_5d": intra_min,
+                "forward_intraperiod_max_5d": intra_max,
                 "return_pct": run.total_return_pct,
             })
 
