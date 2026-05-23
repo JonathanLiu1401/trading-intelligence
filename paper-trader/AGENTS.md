@@ -6,6 +6,164 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #20 (Agent 2) — collapsed-quantile guard + scorer_pickle_smoke
+
+### Phase 1: Debug — 1 bug fixed (bc5135a)
+
+`DecisionScorer._raw_to_percentile` silently fed `np.interp` a non-strictly-
+increasing `xp` whenever the persisted `pred_quantiles` table collapsed to a
+single value — the exact 2026-05-23 finding #1 footprint where a synthetic
+n=39 retrain wrote 101 identical entries (every entry was 18.934). `np.interp`
+on a constant `xp` clamps every prediction to fp[0] (0.0) or fp[-1] (100.0),
+so `predict_percentile()` and `predict_calibrated()` returned fabricated
+extreme ranks while every existing test passed.
+
+The analytics-side `stack_liveness.pred_collapsed` detects this on-disk
+pickle state externally; the fix adds the internal complement so the scorer
+itself degrades to truthful None on rank-derived consumer fields (percentile /
+calibrated) when the pred_quantiles table is collapsed. `predict()`'s scalar
+contract is UNCHANGED — a collapsed table is a diagnostic artifact, not a
+model failure, so the conviction gate (which reads `pred` not `percentile`)
+is unaffected.
+
+4 new tests in `tests/test_scorer_percentile.py::TestCollapsedQuantileGuard`
+pin both arms: collapsed at the internal `_raw_to_percentile` /
+`_raw_to_calibrated` level, the consumer-visible `predict_with_meta` path,
+and a healthy-counterfactual proving the guard fires ONLY on the degenerate
+case (a real trained scorer's non-collapsed table continues to produce
+finite percentiles).
+
+### Phase 2: Feature — `paper_trader.ml.scorer_pickle_smoke` (committed bundled in be92167 due to concurrent-agent staging race)
+
+Sibling to `deploy_audit` (architecture drift) and `scorer_freshness` (loop
+heartbeat). Those answer "is the deployed config right?" / "is the loop
+still retraining?" — but neither catches the third class of pathology the
+2026-05-23 finding #1 exposed: **the pickle exists, the architecture
+matches, the loop is alive, yet the pickle's internals are bogus** because
+a smoke-test or synthetic retrain wrote a degenerate model.
+
+Verdict ladder (precedence-ordered, first-match wins so the exit code
+reflects the WORST observed condition):
+
+| Verdict | Trigger | Exit |
+|---------|---------|------|
+| `INSUFFICIENT_DATA` | no pickle on disk | 0 |
+| `UNREADABLE_PICKLE` | load failed (torn write, sklearn-absent host, non-dict layout, missing `model` key) | 0 |
+| `LSTSQ_FALLBACK` | numpy lstsq deployed; MLP probes N/A | 0 |
+| `INSUFFICIENT_N_TRAIN` | `n_train < MIN_N_TRAIN=100` — synthetic-clobber footprint (n=39 lands here) | 2 |
+| `COLLAPSED_PRED_QUANTILES` | `pred_quantiles max == min` | 2 |
+| `COLLAPSED_LABEL_QUANTILES` | `label_quantiles max == min` | 2 |
+| `DEGENERATE_PREDICTIONS` | predict spread across the bullish→bearish probe grid < `DEGENERATE_PRED_VAR_THRESHOLD=0.5pp` (model is essentially constant) | 2 |
+| `HEALTHY` | every probe passes | 0 |
+
+The predict-variance probe runs through `DecisionScorer.predict_with_meta`
+(SSOT — same load + scaler + predict path the conviction gate uses) on a
+5-point `ml_score ∈ [-10, -5, 0, 5, 10]` grid with NVDA as the ticker.
+A real trained net MUST emit varying predictions across this range (OOS
+rank-IC ~0.36); a constant predictor produces spread ≈ 0 and triggers
+`DEGENERATE_PREDICTIONS`.
+
+`is_pickle_smoke_failed()` is the sibling-style convenience boolean
+(`True` on adverse, `False` on HEALTHY, `None` on can't-tell — mirrors
+`deploy_audit.is_deploy_stale`).
+
+20 tests in `tests/test_scorer_pickle_smoke.py` lock every verdict
+boundary, the precedence ordering (n_train < floor wins over collapsed
+quantiles wins over degenerate predictions), the never-raises contract,
+and the CLI exit-code shell-gate.
+
+Live OOS run on the deployed pickle: `HEALTHY`, n_train=4987, predict
+spread 42.43pp across the probe grid, both quantile tables span a real
+range (pred [-54.45, +53.51], label [-50.0, +50.0]). The 2026-05-23
+finding #1 footprint is no longer present — pass #18's manual restore is
+still the deployed model.
+
+CLI: `python3 -m paper_trader.ml.scorer_pickle_smoke [--json] [--scorer-path PATH]`
+
+### Phase 3 findings — live ML state at 2026-05-23 (Agent 2 / pass #20)
+
+1. **Continuous loop STILL dormant (33h+ since last cycle).**
+   `scorer_freshness` reads `LOOP_DEAD` — last cycle was #1 at
+   2026-05-22 06:24, `continuous.log` last write 2026-05-18 12:03 (5+
+   days). The conviction gate is still ACTIVE (deployed n_train=4987
+   ≥ 500), so trades are being modulated against a frozen model.
+   Unchanged from pass #18 / #19 findings. No fix attempted (restarting
+   the continuous loop is operational, not in this pass's scope).
+
+2. **`scorer_pickle_smoke` reports HEALTHY** — the 2026-05-23 finding
+   #1 synthetic-clobber footprint is NOT recurring. Pass #18's manual
+   in-session restore (`train_n=4987`, val_rmse=10.50) is still the
+   deployed model. The new smoke tool would catch a recurrence
+   immediately (n=39 → INSUFFICIENT_N_TRAIN exit 2; collapsed quantiles
+   → COLLAPSED_PRED_QUANTILES exit 2).
+
+3. **`forward_intraperiod_min/max_5d` STILL empty corpus-wide** —
+   0/8753 rows populated. Pass #18 added the columns, pass #19
+   noted they're empty (loop dormant), this pass confirms unchanged.
+   Finding #1 explains it.
+
+4. **`llm_quality_label` STILL 0 across all 8753 rows** — the documented
+   `pipeline_dark` state. `ANTHROPIC_API_KEY` unset; the silent
+   `except Exception` in `_llm_annotate_outcomes` hides it every cycle.
+   `_append_llm_annotation_skill_log` already captures this in
+   `data/llm_annotation_skill_log.jsonl` as `pipeline_dark=True`.
+
+5. **`backtest_runs` recent slot has degenerate `n_trades=0` placeholders.**
+   Runs 100000 / 99001 / 90001 are `total_return_pct=0 vs_spy=-1.08
+   n_trades=0` — `run_one` recorded a row but `_ml_decide` never
+   produced a single fill. The healthy run 99002 (328% return, 1714
+   trades) confirms the engine is occasionally productive when alive;
+   these zero-trade slots are the dormant-loop's last-batch artifacts
+   from May 22 cycle 1.
+
+6. **`gate_risk_profile` reproduces pass #19's finding** — the ×1.15
+   `mild_tailwind` arm has the WORST OOS Sharpe (-0.051) AND lowest
+   win rate (38.5%) across the 5 arms (n=39 acted). Mean (-0.51%) is
+   within noise of peers, so `gate_realized` (which judges by mean)
+   misses it. The aggregate verdict on the OOS captured slice is
+   `RISK_INDIFFERENT` (sharpe spread +0.052 ≤ 0.10).
+
+### How the DecisionScorer works (refresh, 2026-05-23 pass #20)
+
+Same canonical architecture documented in CLAUDE.md §6 and pass #16. The
+new addition this pass: the rank/calibrated path (`predict_percentile` /
+`predict_calibrated` / `predict_with_meta.percentile|calibrated`) now
+includes an explicit collapsed-quantile guard at `_raw_to_percentile`. A
+deployed pickle whose `pred_quantiles` collapsed to a single value
+(synthetic-clobber footprint) returns None on every rank-derived
+consumer field rather than fabricating extreme percentiles. `predict()`'s
+scalar contract is unchanged — the conviction gate is unaffected.
+
+### Test commands for the ML/backtest domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+# Focused: ~6.5min full ml/backtest slice
+python3 -m pytest tests/ -v -k "ml or backtest or scorer"
+# Pass #20 deliverables:
+python3 -m pytest tests/test_scorer_pickle_smoke.py -v       # 20 tests (3.4s)
+python3 -m pytest tests/test_scorer_percentile.py -v         # 17 tests (4.7s)
+# Pass #20 CLI:
+python3 -m paper_trader.ml.scorer_pickle_smoke
+python3 -m paper_trader.ml.scorer_pickle_smoke --json
+```
+
+### Reaffirmed invariants
+
+- CLAUDE.md §6 invariant #5 — DecisionScorer only gates after
+  `n_train >= 500 AND off_distribution=False`. The Phase 1 guard does
+  not touch the gate path (only the rank/calibrated derivations).
+- `predict()`'s float scalar contract is preserved — only
+  `predict_percentile` / `predict_calibrated` / `predict_with_meta`'s
+  `percentile` and `calibrated` fields degrade to None on a collapsed
+  quantile table.
+
+### Counters
+
+bugs_fixed=1 · features_added=1 · user_findings=6
+
+---
+
 ## 2026-05-23 feature pass (Agent 4) — inverse-pair conflict + watchlist-news-silence
 
 Two new advisory analytics covering structural blind spots the existing
