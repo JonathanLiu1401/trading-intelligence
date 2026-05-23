@@ -93,6 +93,7 @@ from collectors.openinsider_cluster import collect as collect_insider_cluster
 from collectors.sector_etf_momentum import collect as collect_sector_etf
 from collectors.cisa_kev_collector import collect_cisa_kev
 from collectors.benzinga_analyst_collector import collect_benzinga_analyst
+from collectors.ftc_doj_collector import collect_ftc_doj
 from collectors.fed_press_collector import collect_fed_press
 from collectors.ecb_press_collector import collect_ecb_press
 from collectors.boj_press_collector import collect_boj_press
@@ -198,6 +199,7 @@ INSIDER_CLUSTER_INTERVAL = 600    # EDGAR Form 4 cluster-buy scan every 10min
 SECTOR_ETF_INTERVAL     = 600     # Sector ETF momentum snapshot every 10min
 COMMODITY_FUTURES_INTERVAL = 600  # Commodity futures price monitor every 10min
 BENZINGA_INTERVAL       = 300     # Benzinga analyst-ratings RSS sweep every 5min
+FTC_DOJ_INTERVAL        = 1800    # FTC + DOJ ATR press releases — every 30min
 FED_PRESS_INTERVAL      = 1800    # Federal Reserve press / speech / testimony RSS — every 30min
 ECB_PRESS_INTERVAL      = 1800    # ECB press releases RSS — every 30min
 BOJ_PRESS_INTERVAL      = 1800    # Bank of Japan press / speech / MPM RSS — every 30min
@@ -310,6 +312,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "wikipedia": WIKIPEDIA_INTERVAL, "wiki_pageviews": WIKI_PAGEVIEWS_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL, "tic": TIC_INTERVAL,
     "cisa_kev": CISA_KEV_INTERVAL,
     "benzinga_analyst": BENZINGA_INTERVAL,
+    "ftc_doj": FTC_DOJ_INTERVAL,
     "fed_press": FED_PRESS_INTERVAL,
     "ecb_press": ECB_PRESS_INTERVAL,
     "boj_press": BOJ_PRESS_INTERVAL,
@@ -1771,6 +1774,27 @@ def cisa_kev_worker(store: ArticleStore):
 # per day), so 30min is high enough to avoid worsening the chronic
 # insert_batch lock contention and low enough to catch a same-hour FOMC /
 # ECB / BoJ decision before the next briefing cycle.
+def ftc_doj_worker(store: ArticleStore):
+    log.info("[ftc_doj_worker] started")
+    bo = Backoff("ftc_doj", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_ftc_doj()
+            _ingest(store, articles, "ftc_doj")
+            try:
+                source_health.record_result("ftc_doj", len(articles))
+            except Exception as he:
+                log.warning(f"[ftc_doj_worker] source_health error: {he}")
+            _worker_last_ok["ftc_doj"] = time.time()
+            log.debug(f"[ftc_doj] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[ftc_doj_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(FTC_DOJ_INTERVAL)
+
+
 def fed_press_worker(store: ArticleStore):
     log.info("[fed_press_worker] started")
     bo = Backoff("fed_press", base=60.0, cap=900.0)
@@ -3834,6 +3858,7 @@ def main():
         ("cisa_kev",    cisa_kev_worker),
         ("insider_cluster", insider_cluster_worker),
         ("benzinga_analyst", benzinga_analyst_worker),
+        ("ftc_doj",     ftc_doj_worker),
         ("fed_press",   fed_press_worker),
         ("ecb_press",   ecb_press_worker),
         ("boj_press",   boj_press_worker),
