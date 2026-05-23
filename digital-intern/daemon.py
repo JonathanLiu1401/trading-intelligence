@@ -3164,6 +3164,20 @@ def _purge_worker_startup_reap(store) -> int:
 
 
 # ── Worker W9: Purge old data every 6h ──────────────────────────────────────
+# Cheap urgency=1 reaper cadence BETWEEN full 6h purges. The full purge is
+# heavy (DELETE + WAL TRUNCATE) and only fires every 6h, so without an
+# in-between cadence a urgency=1 row that aged out of the alerter's 24h
+# fetch window can linger un-demoted for up to ~6 hours past the cutoff —
+# invisible to the alert worker (push lost) yet still inflating the
+# dashboard's urgent tile and the ``overdue`` count in
+# ``urgent_queue_health``. Live evidence (2026-05-23 16:30Z): 22 of 81
+# queued urgency=1 rows were >24h old (some 29-30h old), never alerted,
+# awaiting the next purge_old fire. ``reap_stale_urgent`` is idempotent +
+# cheap (one indexed UPDATE) so running it hourly costs nothing while
+# shrinking the worst-case stuck-urgent-row lifetime from ~30h to ~25h.
+URGENT_REAP_INTERVAL = 3600
+
+
 def purge_worker(store: ArticleStore):
     log.info("[purge_worker] started")
     # Startup reap: catch up phantom urgency=1 rows that aged out between
@@ -3177,14 +3191,39 @@ def purge_worker(store: ArticleStore):
     # split, ``min(PURGE_INTERVAL, 300)`` was capping the loop at 5 min and
     # firing ``purge_old`` 72× more often than intended.
     last_purge = time.time()
+    # Startup reap counts as the most recent reap; pin ``last_reap`` to now so
+    # the hourly cadence below doesn't immediately re-fire on the first tick.
+    last_reap = time.time()
     while _running:
         _worker_last_ok["purge"] = time.time()
         _sleep(300)
+        # Hourly cheap reap BETWEEN full 6h purges. Without this, a
+        # urgency=1 row that aged past the alerter's 24h fetch window stays
+        # urgency=1 until the next purge_old fires — up to ~6 additional
+        # hours of invisible inflation on the urgent tile. The reap is one
+        # indexed UPDATE so even a no-op cycle costs essentially nothing.
+        if time.time() - last_reap >= URGENT_REAP_INTERVAL:
+            try:
+                with _store_lock:
+                    n = store.reap_stale_urgent()
+                if n:
+                    log.info(
+                        f"[purge_worker] hourly-reaped {n} aged urgency=1 "
+                        f"row(s) (first_seen older than the alerter's 24h "
+                        f"window — never pushed, now demoted to urgency=0)"
+                    )
+                last_reap = time.time()
+            except Exception as e:
+                log.warning(f"[purge_worker] hourly reap failed: {e}")
         if time.time() - last_purge < PURGE_INTERVAL:
             continue
         try:
             with _store_lock:
                 store.purge_old()
+            # purge_old internally calls reap_stale_urgent — sync ``last_reap``
+            # to ``now`` so we don't redundantly re-fire the cheap reap a few
+            # minutes later.
+            last_reap = time.time()
             # Sweep away legacy per-query gdelt:* health keys (now recorded
             # as a single aggregate "gdelt" key). Idempotent: 0 rows after
             # the first pass.
