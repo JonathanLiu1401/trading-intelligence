@@ -164,3 +164,70 @@ class TestBackwardCompatibility:
         scorer, _ = trained_scorer
         assert scorer._raw_to_percentile(float("nan")) is None
         assert scorer._raw_to_percentile(float("inf")) is None
+
+
+class TestCollapsedQuantileGuard:
+    """The 2026-05-23 finding #1 footprint: a synthetic n=39 retrain clobbered
+    `data/ml/decision_scorer.pkl` with 101 IDENTICAL `pred_quantiles` (every
+    entry was 18.934). Without an internal guard, `np.interp` on a constant
+    `xp` clamps to fp[0] (0.0) or fp[-1] (100.0) for every real prediction —
+    so `predict_percentile()` and `predict_calibrated()` silently surface
+    fabricated extreme ranks while looking healthy to every existing test.
+    These tests pin the honest degrade-to-None behaviour."""
+
+    def test_raw_to_percentile_none_when_pred_quantiles_collapsed(self):
+        """A pred_quantiles table with every entry equal must return None —
+        no real rank information is available, mirror legacy-pickle behaviour."""
+        s = DecisionScorer()
+        s._trained = True
+        s._n_train = 100
+        # 101-entry collapsed table — exactly the synthetic-clobber footprint.
+        s._pred_quantiles = np.asarray([18.934] * 101, dtype=np.float64)
+        s._label_quantiles = np.asarray(np.linspace(-5.0, 5.0, 101),
+                                        dtype=np.float64)
+        # Any raw value (below, at, above the collapsed point) — all None.
+        for raw in (-50.0, 0.0, 18.934, 50.0):
+            assert s._raw_to_percentile(raw) is None, raw
+
+    def test_raw_to_calibrated_none_when_pred_quantiles_collapsed(self):
+        """Calibrated reading derives from `_raw_to_percentile`; the same
+        collapsed table must cascade to a None calibrated magnitude
+        (not the lq[0]/lq[-1] fabricated extreme that np.interp would
+        otherwise produce when its xp clamps to 0/100)."""
+        s = DecisionScorer()
+        s._trained = True
+        s._n_train = 100
+        s._pred_quantiles = np.asarray([5.0] * 101, dtype=np.float64)
+        s._label_quantiles = np.asarray(np.linspace(-10.0, 10.0, 101),
+                                        dtype=np.float64)
+        for raw in (-50.0, 0.0, 5.0, 50.0):
+            assert s._raw_to_calibrated(raw) is None, raw
+
+    def test_predict_with_meta_calibrated_none_on_collapsed_pred_quantiles(
+            self, trained_scorer):
+        """End-to-end: a real trained scorer whose pred_quantiles got
+        replaced by the collapsed footprint must surface None in the
+        consumer-visible `percentile` / `calibrated` fields."""
+        scorer, _ = trained_scorer
+        scorer._pred_quantiles = np.asarray([7.5] * 101, dtype=np.float64)
+        meta = scorer.predict_with_meta(
+            ml_score=5.0, rsi=50.0, macd=0.0, mom5=0.0, mom20=0.0,
+            regime_mult=1.0, ticker="NVDA")
+        assert meta["percentile"] is None
+        assert meta["calibrated"] is None
+        # predict()'s scalar contract is UNCHANGED — a collapsed quantile
+        # table is a diagnostic artifact, not a model failure, so the gate
+        # (which reads `pred` not `percentile`) is unaffected.
+        assert meta["failed"] is False
+        assert isinstance(meta["pred"], float)
+
+    def test_healthy_quantiles_still_work(self, trained_scorer):
+        """Sanity counterfactual: an honest non-collapsed table from a real
+        train_scorer run continues to produce finite percentiles (proves the
+        guard fires ONLY on the degenerate case, not on every healthy run)."""
+        scorer, _ = trained_scorer
+        assert scorer._pred_quantiles is not None
+        q = np.asarray(scorer._pred_quantiles, dtype=np.float64)
+        assert float(q.max()) > float(q.min())  # not collapsed
+        pct = scorer._raw_to_percentile(float(q[50]))  # median raw
+        assert pct is not None and 0.0 <= pct <= 100.0
