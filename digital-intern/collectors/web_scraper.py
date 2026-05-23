@@ -274,7 +274,17 @@ _QW_LISTING = re.compile(
 # ``analysis.claude_analyst._QW_IMAGE_CREDIT`` — the documented lockstep
 # triple-gate (collectors must not pull the watchers/ml import graph).
 _QW_IMAGE_CREDIT = re.compile(
-    r"^\s*[A-Z][a-zA-Z]+(?:\s+(?:[A-Z]\.?|[A-Z][a-zA-Z]+))+"
+    # Name-token alternation: a hyphenated form (I-Hwa, O-Lin, Jean-Pierre)
+    # OR a plain Capitalized run (Tomohiro, Cheng). The hyphenated branch
+    # exists because Asian / French given-name conventions place the hyphen
+    # *inside* the first token, and the prior `[A-Z][a-zA-Z]+` requirement
+    # silently missed every such name — live evidence (2026-05-23 urgency=2
+    # set): "I-Hwa Cheng/Bloomberg" reached alerted state un-suppressed
+    # because the name-token regex demanded ≥1 letter immediately after the
+    # capital and hit `-` first. The hyphen branch is anchored on a
+    # second uppercase letter so a stray "I-foo" prose token cannot match.
+    r"^\s*(?:[A-Z][a-zA-Z]*(?:-[A-Z][a-zA-Z]+)+|[A-Z][a-zA-Z]+)"
+    r"(?:\s+(?:[A-Z]\.?|(?:[A-Z][a-zA-Z]*(?:-[A-Z][a-zA-Z]+)+|[A-Z][a-zA-Z]+)))+"
     r"(?:/(?:AFP|Reuters|Getty\s+Images|AP|Bloomberg|EPA|TASS|"
     r"WireImage|Shutterstock|Polaris|Bloomberg\s+News))+"
     r"\s*$"
