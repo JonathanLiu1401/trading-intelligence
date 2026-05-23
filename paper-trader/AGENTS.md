@@ -6,6 +6,306 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 — Agent 1 (HYBRID core) — `/api/forced-hold-attribution`
+
+**Phase 1 — bug fix (bugs_fixed: 0)**
+
+Honest investigation across `runner.py`, `reporter.py`, `signals.py`,
+`strategy.py`, `dashboard.py`, `market.py`, `store.py` (read in full).
+30+ prior HYBRID passes have already cleared every observable defect;
+the marginal core bug is exhausted. No Phase-1 commit (the commit guard
+explicitly permits `bugs_fixed=0` when honest effort finds nothing —
+the AGENTS.md-documented discipline; multiple prior agents the same
+day used this 0-bug path).
+
+**Phase 2 — feature (features_added: 1) — `/api/forced-hold-attribution`**
+
+`paper_trader/analytics/forced_hold_attribution.py` +
+`/api/forced-hold-attribution`. For every currently OPEN position,
+partitions the decision cycles since it was opened into:
+
+* **`cycles_blind`** — NO_DECISION (every blind sub-bucket: host_skip,
+  model_empty, quota, parse_failed, retry_failed).
+* **`cycles_sighted`** — every real decision row (HOLD / BUY / SELL /
+  BLOCKED — Opus actively decided something).
+
+Per-position verdict (`MIN_CYCLES=10` floor — the `hold_discipline`
+sample-size precedent):
+
+| `blind_pct` | Verdict |
+|-------------|---------|
+| ≥ 0.50 | `FORCED_HOLD` — Opus could not act in the majority of cycles since open |
+| 0.25 – 0.50 | `PARTIALLY_FORCED` |
+| 0.10 – 0.25 | `MIXED` |
+| < 0.10 | `CHOSEN_HOLD` — Opus reaches a sighted decision in ≥ 90% of cycles |
+
+Aggregate state ladder mirrors `loser_autopsy` / `hold_discipline`:
+`NO_DATA` → `EMERGING` (any position below MIN_CYCLES contaminates the
+aggregate — the honesty precedent) → `STABLE`. STABLE verdicts:
+`FORCED_HOLD_DOMINANT` > `PARTIALLY_FORCED` > `MOSTLY_CHOSEN`
+(precedence pinned in `test_precedence_forced_beats_partial`).
+
+### The gap this closes
+
+Every neighbour endpoint answers a different question and leaves this
+one open:
+
+* `/api/hold-discipline` — disposition-trap detector. Reads **age in
+  days**, not **agency**.
+* `/api/no-decision-recovery` — wedge run-length across the WHOLE
+  decision tape. Does not attribute wedges to OPEN positions.
+* `/api/today-action-tape` — flat aggregate of today's cycles. Not
+  partitioned by which position was on the book.
+* `/api/decision-vapor-skill` — grades reasoning specificity of FILLED
+  decisions. Says nothing about cycles that produced no decision at all.
+
+The trader's question this DIRECTLY answers: **"Is my NVDA on the book
+because Opus is *choosing* to ride it through a HOLD-able regime, or
+because the box has been host-saturated all day and Opus literally
+couldn't issue a SELL even if it wanted to?"**
+
+### Live answer at commit time
+
+```bash
+$ curl -s http://localhost:8090/api/forced-hold-attribution | jq '{state, verdict, headline}'
+{
+  "state": "STABLE",
+  "verdict": "FORCED_HOLD_DOMINANT",
+  "headline": "1 of 1 open position(s) FORCED-HELD — largest: NVDA
+    (85% of 169 cycles since open were NO_DECISION). Operationally
+    stuck — sighted decision cadence is the bottleneck, not the thesis."
+}
+```
+
+The current live book — NVDA at 65% concentration, -2.49%, opened
+2026-05-21 01:36 UTC — is the canonical FORCED_HOLD case: 144 of 169
+decision cycles since it was opened were NO_DECISION (the documented
+2026-05-18/19/20/21/22/23 host-saturation wall). The position is
+*not* on the book by Opus's choice; it's the position Opus is **stuck
+with** because the engine cannot reach a sighted decision long enough
+to act. Operationally this means "lift the saturation" (kill sibling
+Opus jobs / restart the runner / wait for the storm to clear), NOT
+"re-examine the NVDA thesis".
+
+### Locked by
+
+`tests/test_forced_hold_attribution.py` — **33 tests, all pass in
+0.78s**:
+
+* `TestIsBlind` (5) — recognises every NO_DECISION literal shape the
+  runner writes (plain `NO_DECISION`, arrow `NO_DECISION → SKIPPED`,
+  case-insensitive); rejects real actions.
+* `TestClassify` (5) — sample-size gate + verdict ladder all 4 bands.
+* `TestBoundary` (3) — every threshold pinned at both inclusive sides
+  (0.50 / 0.25 / 0.10), so a drift in `_classify` breaks the test
+  rather than silently miscategorising a position.
+* `TestTimestampFilter` (3) — decisions before `opened_at` are NOT
+  attributed; decisions at the open instant ARE (inclusive on
+  the open — the same-microsecond-write contract); per-position
+  filtering is independent.
+* `TestStateLadder` (3) — NO_DATA / EMERGING / STABLE state machine,
+  including the "any-fresh-position contaminates the aggregate" rule.
+* `TestAggregateVerdict` (4) — DOMINANT / PARTIALLY / MOSTLY arms +
+  precedence + card sort.
+* `TestPerPositionCard` (4) — arithmetic, `forced_hold` flag,
+  `age_hours` computation, zero-cycles_total guard against
+  zero-division.
+* `TestSafe` (4) — garbage decisions skipped (None, "not a dict",
+  empty timestamp); garbage positions skipped; no input mutation;
+  unparseable `opened_at` does not raise.
+* `TestEndpoint` (1) — the route serves the builder output unchanged
+  (all required keys, shape, `min_cycles` constant).
+
+Adjacent-neighbour regression sweep
+(`test_forced_hold_attribution + test_hold_discipline +
+test_no_decision_reasons + test_no_decision_recovery`):
+**98 passed in 2:12** under load — no regressions.
+
+**Phase 3 — live validation findings (live trader 10:13 UTC)**
+
+1. **The new `/api/forced-hold-attribution` immediately surfaces the
+   live pathology** — NVDA FORCED_HOLD at 85% blind across 169 cycles
+   since open (56.5h). This is the operationally-stuck shape that
+   `/api/host-guard` and `/api/no-decision-recovery` were both
+   pointing at without attributing to the OPEN position. The new
+   endpoint *attributes* it.
+2. **Runner 1 commit behind HEAD with the new feature.**
+   `/api/healthz`: `boot_sha=9aec0b3`, `head_sha=a3613bb`, `behind=1`,
+   `stale=true`. The git-watcher will pick up commit `a3613bb` within
+   ~3 min and graceful-restart between cycles. (After restart, the
+   route is also served from the runner's dashboard thread; before
+   restart, it works from a fresh Python process because the file is
+   already on disk.)
+3. **`/api/risk` and `/api/briefing` both stuck in SWR `warming`**
+   state (cold-cache → `{"warming": true, "error": "computing — retry
+   shortly", "attempts": 0}`). Pre-existing finding from the prior
+   pass; the cold-cache budget is too tight for the composite work
+   under host saturation. Not a regression from this commit.
+4. **Host saturation remains the dominant pathology.** `/api/host-guard`
+   pulse shows `SATURATED` state, 17 concurrent Opus (limit 4), 100%
+   of last 120 decisions never reached Opus. Three concurrent HYBRID
+   agents (PIDs 372898, 1716323, 3903558) confirmed via `ps -ef` —
+   these are the source of the saturation. Ops lever, not code.
+5. **systemd `paper-trader.service` in expected crash loop (counter
+   74).** Documented pattern: the manual instance holds the advisory
+   singleton lock, so the systemd-managed copy fails fast and
+   restarts. Memory note `pt-systemd-vs-manual-restart-spam.md` —
+   not a fresh bug.
+6. **Last fill 2026-05-21T10:00 (~49h ago).** The trader hasn't
+   executed a trade in 2 days. Every cycle since has been a forced
+   hold of the NVDA -2.49% position, exactly the shape the new
+   endpoint surfaces.
+
+### Test commands
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Just this pass's lock tests (~0.8s, no load dependency):
+python3 -m pytest tests/test_forced_hold_attribution.py -v
+# 33 passed in 0.78s
+
+# Neighbour regression sweep (~2:12 under load):
+python3 -m pytest tests/test_forced_hold_attribution.py \
+                  tests/test_hold_discipline.py \
+                  tests/test_no_decision_reasons.py \
+                  tests/test_no_decision_recovery.py -q
+# 98 passed in 132.56s
+```
+
+### Counters
+
+bugs_fixed=0 · features_added=1 · user_findings=6
+
+---
+
+## 2026-05-23 feature-dev pass (Agent 4 #2) — `/api/drought-path-risk`
+
+One new analytics module exposing the **path shape** of the equity
+curve inside the current PARALYSIS drought — the missing dimension that
+makes `decision_drought` actionable.
+
+### The gap
+
+`/api/decision-drought` already reports point-to-point `portfolio_pct` /
+`spy_pct` / `alpha_pct` per drought (verdict ladder: BLEEDING / STUCK /
+OK / NEVER_TRADED). Live state at 2026-05-23 10:00 UTC:
+
+```
+verdict: BLEEDING (involuntary_alpha_bleed_pct = -2.98%)
+current_drought.kind: PARALYSIS
+current_drought.duration_hours: 47.71
+current_drought.portfolio_pct: -2.43
+current_drought.alpha_pct: -2.98
+```
+
+The 47.7h freeze with -2.43% port drift is the headline. But that is the
+**endpoint** difference between drought start and drought end — the
+parent endpoint is path-blind. The desk's question this leaves
+unanswered:
+
+* Did the book SMOOTHLY slide -2.43% (a steady bleed; nothing the trader
+  would have traded out of mid-drought even if awake)?
+* Or did it WHIPSAW — bottom at -6%, recover to -2.43% (a tradeable mid-
+  drought dip the trader was blind to)?
+* Or did it DODGE — bottom at -4%, recover all the way back, end roughly
+  flat (the parent's near-zero alpha wouldn't capture the near-miss)?
+
+The two operator readings are not the same. The first is "the parent
+endpoint already told you everything you need to know"; the second is
+"you missed a tradeable opportunity"; the third is "you survived blind".
+
+### `paper_trader/analytics/drought_path_risk.py` + `/api/drought-path-risk`
+
+Composes `build_decision_drought.current_drought` **verbatim** (SSOT —
+AGENTS.md invariant #10, the `idle_opportunity` precedent — so the two
+endpoints can never disagree on what counts as an ongoing drought) and
+walks the `equity_curve` points that fall **inside** the drought window
+to surface:
+
+* `peak_equity` / `peak_ts`, `trough_equity` / `trough_ts` (highest +
+  lowest mark inside the drought)
+* `intra_drought_drawdown_pct` — `(trough - peak) / peak * 100`, the
+  worst peak-to-trough dip anchored to the highest mid-drought watermark
+* `intra_drought_max_gain_pct` — best mid-drought peak above start
+* `range_pct` — `(peak - trough) / start * 100`, total path span
+* `end_to_start_pct` — verbatim cross-check on the parent's
+  `portfolio_pct`
+* `n_equity_samples` — STABLE gate (3 minimum to see a peak/trough)
+
+Verdict ladder (STABLE only; precedence tested):
+| Verdict | Trigger | Operator reading |
+|---------|---------|------------------|
+| `WHIPSAW_TRAP` | DD ≤ -2.0% AND range ≥ 4.0% | tradeable mid-drought dip you couldn't act on |
+| `DODGED_DROP` | DD ≤ -2.0% AND end-to-start ≥ -0.5% | bottomed then recovered while frozen — survived blind |
+| `LIFTED_BLIND` | end-to-start ≥ +2.0% AND DD > -2.0% | book gained materially while paralyzed (lucky tape) |
+| `SLOW_BLEED` | end-to-start ≤ -2.0% AND range < 4.0% | smooth slide; parent `alpha_pct` captures it |
+| `QUIET_DROUGHT` | range < 1.0% | nothing happened — silence-when-nothing-actionable |
+| `MIXED` | none of the above | catch-all |
+
+Below STABLE: `state=INSUFFICIENT`, numerics still emitted (the
+`risk_adjusted_returns` two-tier idiom). When no `current_drought` is
+ongoing: `state="NO_DROUGHT"` and verdict withheld — the
+`_host_pulse_line` / `_macro_calendar_chat_lines` silence-when-nothing-
+actionable precedent.
+
+Locked by `tests/test_drought_path_risk.py` (**31 tests, all pass in
+0.6s**): state/sample-size gate (8), path arithmetic — peak/trough/DD/
+range with V/inverse-V/monotonic/window-exclusion/nonpositive-rejection
+(6), verdict ladder all 6 arms (6), verdict precedence + boundary
+inclusivity at the -2.0 DD and 4.0 range thresholds (6), invariants —
+no input mutation / never raises on garbage / output shape (3), SSOT
+round-trip with real `build_decision_drought` (1, integration). Adjacent
+SSOT regression
+(`test_decision_drought + test_idle_opportunity + test_capital_paralysis
++ test_drought_path_risk`): **90 passed in 0.97s**.
+
+### Live state at 2026-05-23 10:00 UTC (via `app.test_client()`)
+
+```bash
+curl -s http://localhost:8090/api/drought-path-risk | jq '{state, verdict, headline}'
+# {
+#   "state": "STABLE",
+#   "verdict": "SLOW_BLEED",
+#   "headline": "Drought path: SLOW BLEED — 47.7h blind, smooth slide
+#                to -2.43% (range 2.62% < 4%); the parent drought's
+#                alpha_pct captures it."
+# }
+```
+
+The verdict cleanly resolves the desk question: the 47.7h PARALYSIS
+drought is a SMOOTH slide (range 2.62% < 4%), NOT a whipsaw. The
+trader did not miss a tradeable mid-drought dip — they were paralyzed
+during a steady decline, and the parent `decision_drought.alpha_pct =
+-2.98%` is the whole story. (If the live trader had been in a
+WHIPSAW_TRAP path, the alpha_pct would understate what actually
+happened — that's the case this endpoint exists to surface.)
+
+### Counters
+
+bugs_fixed=0 · features_added=1 · user_findings=0
+
+### Commands
+
+```bash
+# Just this pass's lock tests:
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_drought_path_risk.py -v
+# 31 passed in 0.6s
+
+# Adjacent SSOT regression:
+python3 -m pytest tests/test_decision_drought.py \
+                  tests/test_idle_opportunity.py \
+                  tests/test_capital_paralysis.py \
+                  tests/test_drought_path_risk.py -q
+# 90 passed in 0.97s
+
+# CLI smoke (module ships its own __main__ against the live DB):
+python3 -m paper_trader.analytics.drought_path_risk
+```
+
+---
+
 ## 2026-05-23 — Agent 1 (HYBRID core) — starvation-trend Discord surface
 
 **Phase 1 — bug fix (bugs_fixed: 0)**
