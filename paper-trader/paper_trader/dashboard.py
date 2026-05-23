@@ -11434,6 +11434,73 @@ def trade_asymmetry_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/kelly-sizing")
+def kelly_sizing_api():
+    """Kelly-criterion sizing diagnostic — given my realised win-rate and
+    payoff ratio, what fraction would Kelly allocate to the single best
+    position, and how does my CURRENT top-position weight compare?
+    /api/trade-asymmetry already emits payoff_ratio and actual_win_rate_pct
+    — this composes them into full-Kelly (p − q/b), half-Kelly (the
+    standard practitioner recommendation), and quarter-Kelly, and benchmarks
+    the current top-position weight (from /api/risk's concentration_top1)
+    against the half-Kelly target. /api/concentration-cap warns at a fixed
+    threshold; this answers whether ANY fixed threshold is statistically
+    justified by the realised edge. Verdict (UNDERSIZED / KELLY_ALIGNED /
+    OVERSIZED / EXTREMELY_OVERSIZED / NEGATIVE_EDGE) is withheld until
+    n≥20 round-trips (trade_asymmetry STABLE idiom) and only when a
+    payoff ratio is defined (both wins and losses present). Advisory only
+    — never gates Opus, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.kelly_sizing import build_kelly_sizing
+        store = get_store()
+        # Same trades convention as /api/analytics & /api/trade-asymmetry:
+        # oldest → newest so build_round_trips can fold in sequence.
+        trades = list(reversed(store.recent_trades(2000)))
+        # Top-position weight: derive the same way /api/risk does so the two
+        # endpoints agree on what "top position" means. Done inline (not via
+        # an HTTP call to /api/risk) so this endpoint stays self-contained
+        # and observable when the risk SWR cache is warming.
+        positions = store.open_positions()
+        pf = store.get_portfolio()
+        total_value = float(pf.get("total_value") or 0.0)
+        rows, _ = _portfolio_rows_from_positions(positions)
+        top1_pct, _, top1_ticker = _conc_top1_top3(rows, total_value)
+        return jsonify(build_kelly_sizing(
+            trades,
+            top_position_pct=top1_pct if rows else None,
+            top_position_ticker=top1_ticker,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/exit-intent-audit")
+def exit_intent_audit_api():
+    """Exit-intent audit — classify each closed sell by the stated
+    *intent* in its exit reason and roll up outcome per intent bucket.
+    /api/loser-autopsy classifies losers by an OBJECTIVE failure mode
+    (hold-days × magnitude); /api/winner-autopsy looks at entry reasons
+    on winners; /api/round-trip-postmortem judges whether the exit was
+    well-timed against the next price drift. None classify the trader's
+    STATED reason for selling. This module fills that gap: deterministic
+    substring matching into EARNINGS_CLEAR / STOP_LOSS / TARGET_HIT /
+    THESIS_FLIP / DEFENSIVE_CASH_RAISE / UNCLASSIFIED, then per-bucket
+    P&L, win-rate, median hold. Verdict (DOMINANT_INTENT_BLEED /
+    DOMINANT_INTENT_HEALTHY / INTENT_UNCLEAR) is withheld until n≥10
+    closed round-trips AND the dominant bucket has ≥3 trips, so a thin
+    pattern can't mislead. Advisory only — never gates Opus, adds no
+    caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.exit_intent_audit import build_exit_intent_audit
+        store = get_store()
+        # Same trades convention as /api/loser-autopsy & /api/trade-asymmetry:
+        # oldest → newest so build_round_trips can fold in sequence.
+        trades = list(reversed(store.recent_trades(2000)))
+        return jsonify(build_exit_intent_audit(trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/loser-autopsy")
 def loser_autopsy_api():
     """Per-closed-losing-round-trip post-mortem — the desk question no panel
@@ -13098,6 +13165,56 @@ def reasoning_themes_api():
         out = build_reasoning_themes(
             decisions, top_k=top_k, include_bigrams=include_bigrams,
         )
+        out["window_limit"] = limit
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/reasoning-action-verbs")
+def reasoning_action_verbs_api():
+    """Single-decision internal consistency: does Opus's natural-language
+    reasoning *verb* agree with the structured ``action`` field on the same
+    decision row?
+
+    Complements the existing reasoning surfaces — ``/api/reasoning-themes``
+    (topic distribution across decisions), ``/api/reasoning-coherence``
+    (pair-wise Jaccard stability between consecutive HOLDs), and
+    ``/api/decision-confidence`` (aggregate self-rated conviction). None of
+    those grade the *within-row* mismatch this endpoint exposes: a row whose
+    structured action is ``HOLD`` while the prose verbalises a buy/sell
+    intent (or vice-versa) is the exact LLM failure mode that slips past
+    a JSON-parsing reviewer but reads alarming to a human operator. The
+    builder counts BUY / SELL / HOLD cue verbs inside each
+    ``decision.reasoning`` text (with negation- and hedge-window dropping —
+    "would not add" / "would add IF earnings beat" carry zero votes),
+    classifies the dominant leaning, and tags any mismatch against the
+    structured action with a specific verdict
+    (``BULLISH_INSIDE_HOLD`` / ``BEARISH_INSIDE_HOLD`` /
+    ``BEARISH_INSIDE_BUY`` / ``BULLISH_INSIDE_SELL`` /
+    ``DIRECTION_INSIDE_NO_DECISION``).
+
+    ``state`` ladder: ``INSUFFICIENT`` (< 10 parseable) → ``CLEAN`` (< 5%
+    mismatch) → ``MILD`` (5-15%) → ``NOTABLE`` (15-30%) → ``ALARMING``
+    (≥ 30%).
+
+    ``?limit=`` decisions to scan (clamped 5..500, default 100). Pure
+    builder, cheap (no yfinance / no LLM) — not behind the SWR cache.
+    Observational only — never gates Opus, never injected into the
+    decision prompt (invariants #2/#12; the ``reasoning_themes`` /
+    ``decision_confidence`` precedent)."""
+    try:
+        from .analytics.reasoning_action_verbs import (
+            build_reasoning_action_verbs,
+        )
+        try:
+            limit = int(request.args.get("limit", 100))
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(5, min(500, limit))
+        store = get_store()
+        decisions = store.recent_decisions(limit=limit)
+        out = build_reasoning_action_verbs(decisions)
         out["window_limit"] = limit
         return jsonify(out)
     except Exception as e:

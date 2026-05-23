@@ -132,6 +132,106 @@ python3 -m paper_trader.ml.baseline_compare
 
 ---
 
+## 2026-05-23 — Agent 1 (paper-trader core) HYBRID review pass #4
+
+### Phase 1: Debug — 1 bug fixed (54a4cc4)
+
+Orphaned analytics module: `tests/test_reasoning_action_verbs.py` was
+committed in `93e7a7a` ("test(reasoning_action_verbs): cover untested
+action-verb consistency builder") with 69 unit tests, but the
+implementation it pins —
+`paper_trader/analytics/reasoning_action_verbs.py` — was never staged.
+The local working tree still carried the file as `??`, so the 69 tests
+passed in CI / locally, but a fresh `git clone` failed immediately with
+`ModuleNotFoundError: paper_trader.analytics.reasoning_action_verbs`.
+Staged and shipped the 514-line implementation; the test suite is now
+honest about what is on disk. No behaviour change for any live caller —
+nothing imported the builder yet.
+
+### Phase 2: Feature — `/api/reasoning-action-verbs` (this pass)
+
+Wired the previously-orphan analytics module to the dashboard surface
+as a new SWR-bypass JSON endpoint, following the
+`/api/reasoning-themes` / `/api/decision-confidence` pattern verbatim
+(single-source-of-truth, invariant #10 — the route forwards the
+builder's own state / by_verdict / mismatches payload unmodified).
+
+Why it matters to a live trader: every existing reasoning surface
+grades a *cross-decision* dimension —
+`/api/reasoning-themes` (topic distribution), `/api/reasoning-coherence`
+(pairwise stability between consecutive HOLDs), `/api/decision-
+confidence` (aggregate self-rated conviction). None catches the
+*within-row* failure mode where Opus's structured action says HOLD but
+the natural-language prose verbalises a buy/sell intent (or vice-versa)
+— the canonical LLM "action-verb lapse" that produces a row a
+JSON-parser accepts but a human operator reads as alarming.
+
+The builder counts BUY / SELL / HOLD cue verbs inside each
+`decision.reasoning`, drops cues that are negated ("would not add"
+within a 3-word window) or hedged ("would add IF earnings beat" inside
+a 3-word window), classifies the dominant leaning, and tags any
+mismatch with a specific verdict (`BULLISH_INSIDE_HOLD` /
+`BEARISH_INSIDE_HOLD` / `BEARISH_INSIDE_BUY` / `BULLISH_INSIDE_SELL` /
+`DIRECTION_INSIDE_NO_DECISION`).
+
+State ladder: `INSUFFICIENT` (< 10 parseable) → `CLEAN` (< 5%
+mismatch) → `MILD` (5-15%) → `NOTABLE` (15-30%) → `ALARMING` (≥ 30%).
+`?limit=` decisions to scan (clamped 5..500, default 100). Pure
+builder, cheap (no yfinance / no LLM) — not behind the SWR cache.
+Observational only — never gates Opus, never injected into the
+decision prompt (invariants #2/#12).
+
+6 new endpoint tests in `tests/test_reasoning_action_verbs_endpoint.py`
+pin the wiring: empty book → `INSUFFICIENT` (never 500); `?limit=`
+clamped low / high / garbage-falls-back-to-default; a 12-row
+CONSISTENT HOLD set surfaces zero mismatches and `state=CLEAN`; a
+9-CONSISTENT + 1 BULLISH-prose-inside-HOLD set surfaces
+`BULLISH_INSIDE_HOLD` with the cue + snippet payload populated. Plus
+the 69 pre-existing builder tests now actually have an implementation
+to test against.
+
+### Phase 3: Live validation findings (live trader ~14:00 UTC)
+
+1. **Live trader frozen at NO_DECISION storm — 6 consecutive
+   NO_DECISION rows over the last 21 minutes** (13:40 → 14:01 UTC).
+   Dashboard `:8090` is *listening* but `curl /api/runner-heartbeat`
+   times out at 8s — the warm path is starving under host saturation
+   (sibling Opus HYBRID agents, this pass included, plus the live
+   trader's Opus call all competing for the same machine). Documented
+   #1 pathology — `pt-no-decision-host-saturation` memory.
+2. **Last real trade was 2026-05-21T10:00 (60h+ ago).** The current
+   book is the 2026-05-21 NVDA cluster the previous pass already
+   flagged via `/api/frozen-mark-execution-skill`: 5 trades at exactly
+   `$223.43499755859375`, net qty delta 0 (a frozen-mark churn the
+   `/api/closed-market-fill-skill` route additionally flagged as
+   `OVERNIGHT_DOMINATED`).
+3. **NVDA −$24.55 unrealized, book $987.39.** Concentration still
+   HIGH at ~68% of book in NVDA stock; price $215.25 vs avg cost
+   $223.43 (−3.66%). Real exposure the trader sees on every cycle.
+4. **Discord delivery dark.** Not directly verifiable from inside this
+   process, but the live runner has been NO_DECISION-only for 21 min;
+   the per-cycle Discord posts (trade alerts, decision log) cannot
+   fire on a row that produced no decision. `reporter.notify_health()`
+   path is the surface to check — exposed via `/api/runner-heartbeat`
+   when the warm path is responsive.
+
+No quick safe Phase-3 fix — all four findings are operational state
+(host saturation + paralysed book) or known cosmetic conditions, not
+fresh code defects. The wedge will clear when the sibling HYBRID
+agents finish.
+
+### Test commands
+
+```
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/ -v                                                # full (~25min under load)
+python3 -m pytest tests/test_core_*.py -q                                  # core slice (946 tests)
+python3 -m pytest tests/test_reasoning_action_verbs.py -q                  # builder unit tests (69)
+python3 -m pytest tests/test_reasoning_action_verbs_endpoint.py -q         # this pass's endpoint (6)
+```
+
+---
+
 ## 2026-05-23 — Agent 1 (paper-trader core) HYBRID review pass #3
 
 ### Phase 1: Debug — 0 bugs fixed
