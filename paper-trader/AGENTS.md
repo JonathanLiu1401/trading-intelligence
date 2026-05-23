@@ -6,6 +6,218 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #16 (Agent 2) — `n_label_dropped` ledger wiring + `dropped_label_audit` triage CLI
+
+**Phase 1 — bug fix (bugs_fixed: 1)**
+
+`decision_scorer.train_scorer` has *always* returned
+`n_label_dropped` in its result dict (the count of training rows
+discarded because `forward_return_5d` was null/NaN/inf/unparseable),
+but `_train_decision_scorer` in `run_continuous_backtests.py` only
+surfaced `n_label_clamped` in its returned status string. A silent
+corruption that drops a chunk of training rows was invisible — the
+cycle status still reads `status=ok` and the skill ledger's
+`train_n` is the POST-drop count, so a quant could not tell whether
+a sudden drop in `train_n` was from fewer outcomes computed this
+cycle or from rows being silently discarded by the
+label-validation pass.
+
+Wired the existing count into the status string (just before the
+trailing `n_label_clamped` token) and into `_parse_scorer_status`'s
+dict via the same substring-anchored `_num` extraction. Legacy
+status strings (cycles before this wiring) omit the token and
+degrade to `None`, mirroring the multi-horizon / per-action /
+label-clamp precedents. 4 new tests in
+`TestParseScorerStatus` pin the parsing, the explicit-zero-vs-None
+distinction, legacy compatibility, and the substring-boundary
+safety vs `train_n` / `oos_n`. 117/117 `test_continuous` tests pass.
+Commit `2a1bc04`.
+
+**Phase 2 — feature (features_added: 1) — `paper_trader.ml.dropped_label_audit`**
+
+`paper_trader/ml/dropped_label_audit.py` + 33-test lock at
+`tests/test_dropped_label_audit.py`. Pairs with the Phase 1 ledger
+trend: when the ledger's `n_label_dropped` spikes the operator
+needs to find WHICH rows + WHY immediately — but no existing tool
+replays `train_scorer`'s exact label-validation logic.
+
+Replays the trainer's rejection loop verbatim (the bool / None /
+float-cast / `math.isfinite` checks in the same order) and
+classifies each rejected row by the FIRST trigger that fires:
+
+| Reason | Trigger |
+|---|---|
+| `missing_key` | `"forward_return_5d"` not in the row dict |
+| `explicit_null` | value is JSON `null` (Python `None`) |
+| `bool_value` | Python `bool` (trainer rejects bool because True/False would become 1.0/0.0 labels) |
+| `unparseable` | `float(value)` raises `TypeError` / `ValueError` (e.g. a string `"n/a"`) |
+| `nan` | parses to `float('nan')` |
+| `positive_inf` | parses to `+float('inf')` |
+| `negative_inf` | parses to `-float('inf')` |
+
+Verdict ladder (precedence-ordered, first-match wins, exactly
+testable):
+
+| Verdict | Trigger |
+|---|---|
+| `CLEAN` | zero rows would be dropped |
+| `LOW_DROP_RATE` | drop rate ≤ 0.5% — acceptable noise |
+| `ELEVATED_DROP_RATE` | drop rate > 0.5% but ≤ 5% — investigate |
+| `HIGH_DROP_RATE` | drop rate > 5% — corruption likely |
+| `INSUFFICIENT_DATA` | < 30 parsed rows in the tail |
+
+CLI prints sample rows per reason (capped via `--samples`) so
+triage is grep-ready. Exit 0 on CLEAN/LOW/INSUFFICIENT, 1 otherwise
+— shell-gateable like `host_guard` / `scorer_health` CLIs.
+
+Single-source-of-truth: imports `MAX_OUTCOMES_FOR_TRAINING` from
+`run_continuous_backtests` so the audited tail matches the
+trainer's window exactly, never drifts.
+
+Locked by:
+* `TestClassifyDrop` (12) — per-reason classifier on every shape
+  (accepts valid finite/zero/negative/int, rejects each
+  category incl. numeric strings: `"3.5"`→accept, `"nan"`→nan,
+  `"inf"`→positive_inf).
+* `TestPrecedence` (2) — bool BEFORE None ordering, missing-key
+  beats every other check.
+* `TestParity` (1, integration) — end-to-end: `train_scorer`'s
+  actual `n_label_dropped` equals this module's count for each
+  rejection reason. The load-bearing invariant.
+* `TestAnalyzeReport` (10) — verdict ladder thresholds, per-reason
+  exhaustive + mutually exclusive (sum equals `n_dropped`),
+  samples capped, tail bound, missing file → `no_file`, malformed
+  JSON lines skipped.
+* `TestCli` (6) — exit code contract for shell gating, JSON
+  output validity.
+* `TestNeverRaises` (2) — diagnostic discipline.
+
+Live state: 0/5000 dropped against the deployed
+`decision_outcomes.jsonl` → `CLEAN`. Commit `bba8eab`.
+
+**Phase 3 — live validation findings (user_findings: 5)**
+
+1. **LOOP_DEAD persists.** `scorer_freshness` reports
+   `VERDICT: LOOP_DEAD (no continuous cycle in 30.7h (>24.0h) —
+   run_continuous_backtests.py is almost certainly down; last
+   cycle was #1 — the conviction gate is ACTIVE, so trades are
+   being modulated against this frozen model)`. `ps aux` confirms
+   no `run_continuous_backtests.py` process is alive. The live
+   trader IS running.
+2. **The deployed scorer is the strongest it has EVER been.**
+   `calibration --oos` reads `WELL_CALIBRATED` (spearman 0.359,
+   monotone 0.89, decile error 2.12pp) and `baseline_compare`
+   reads `MLP_ADDS_SKILL` (MLP rank_ic +0.359 vs best baseline
+   `neg_bb` +0.075 — gap +0.284). `gate_audit` reads
+   `GATE_EFFECTIVE` with strong_tailwind realized +5.86% vs
+   strong_headwind -16.97% (spread +22.83pp, monotone arms). The
+   deployed (n_train=4987) model has decisively cleared every
+   prior pass's `MLP_NO_BETTER_THAN_TRIVIAL` plateau.
+3. **`scorer_health` still reads `NOISE_GATE_ACTIVE`** because
+   `gate_realized` and `gate_calibration` consume the HISTORICAL
+   `gate_scorer_pred` values captured at decision time under
+   older (weaker) scorers. Today's model is good; the historical
+   gate-capture corpus reflects the older models' weaker calls.
+   This is the documented finding from pass #15 (still true) —
+   the diagnostic compositions are pinned to the historical view
+   by design (else they'd retroactively rewrite history).
+4. **5.2% backtest failure rate** — 26/500 runs in `backtest.db`
+   are `status='failed'`, concentrated around 2026-05-18 (the
+   loop's last real cycle batch). Unchanged from pass #15.
+5. **Out-of-band retrain widened** — the deployed pickle is now
+   n_train=4987 (was 3987 at the only logged cycle), retrained
+   1.95h before this pass landed. Still NO corresponding
+   skill-log entry: `scorer_skill_log.jsonl` carries exactly 1
+   row (cycle 1, `train_n=3987`). Someone retrained without
+   going through the normal cycle path — no `_opus_annotate`,
+   no `_inject_and_train`, no validation cycle. The new Phase 1
+   `n_label_dropped` token will populate as soon as the
+   continuous loop is revived; until then the ledger remains
+   1-deep and the calibration-improvement signal lives only in
+   the deployed pickle, not the trend.
+
+### How the DecisionScorer works (canonical, 2026-05-23)
+
+- **Architecture.** sklearn `MLPRegressor(hidden=(32,16), alpha=1e-2,
+  early_stopping=True, validation_fraction=0.15, n_iter_no_change=25)`.
+  Fallback: numpy weighted least-squares linear model. Persisted to
+  `data/ml/decision_scorer.pkl` atomically (`.pkl.tmp` + `.replace`).
+- **Features (10 numeric + 7 sector one-hot = 17 total).**
+  `ml_score, rsi, macd, mom5, mom20, regime_mult, vol_ratio, bb_pos,
+  news_urgency, news_article_count` + `sector_{tech,energy,financials,
+  healthcare,commodities,crypto,other}`. Defaults for missing inputs
+  are in `build_features` (rsi=50, bb=0, urgency=50, count=1, etc.).
+- **Target.** 5-trading-day forward return (%), clamped to
+  ±`PRED_CLAMP_PCT`=50 at both train and inference. SELL action
+  flips target sign so the model learns one "goodness of THIS
+  action" target.
+- **Output.** `predict()` returns a scalar % (always finite,
+  clamped). `predict_with_meta()` adds `{raw, clamped,
+  off_distribution, percentile, calibrated, failed}` for honesty
+  panels. `predict_calibrated()` and `predict_percentile()`
+  quantile-map raw predictions onto realized-return /
+  training-prediction distributions using 101-point quantile tables
+  persisted in the pickle (legacy pickles without these degrade to
+  `None` gracefully).
+- **Conviction gate** (`backtest._ml_decide`). Only modulates BUY
+  conviction when `is_trained AND n_train >= 500 AND NOT
+  off_distribution`. Arms: `p<-10 ×0.6`, `p<0 ×0.85`, `0..5
+  unchanged`, `p>5 ×1.15`, `p>10 ×1.3` (capped at 0.95). Never
+  CANCELS a trade.
+
+### How to run backtests + read results
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 run_backtests.py                    # one-shot 10 parallel year-long runs
+python3 run_continuous_backtests.py         # continuous loop (the LOOP_DEAD note above)
+
+# Diagnostics — all read-only, never train, never touch the trade path:
+python3 -m paper_trader.ml.scorer_freshness     # is the loop alive?
+python3 -m paper_trader.ml.scorer_health        # one-shot is-the-gate-worth-it
+python3 -m paper_trader.ml.calibration --oos    # temporal OOS calibration
+python3 -m paper_trader.ml.baseline_compare     # MLP vs 11 univariate baselines
+python3 -m paper_trader.ml.deploy_audit         # deployed pickle vs MLP_CONFIG
+python3 -m paper_trader.ml.decision_scorer --explain --ticker NVDA ...  # one-prediction attribution
+python3 -m paper_trader.ml.gate_audit           # on-OOS conviction-gate effectiveness
+python3 -m paper_trader.ml.sector_skill         # per-sector OOS skill breakdown
+python3 -m paper_trader.ml.gate_utilization     # gate-arm population on OOS
+python3 -m paper_trader.ml.dropped_label_audit  # pass #16 — WHY rows would drop from training
+python3 -m paper_trader.ml.dropped_label_audit --samples 5 --json  # JSON triage
+
+# Inspect backtest.db (no sqlite3 binary on this host):
+python3 -c "import sqlite3;c=sqlite3.connect('file:backtest.db?mode=ro',uri=True);print(*c.execute('SELECT run_id,status,total_return_pct,vs_spy_pct,n_trades FROM backtest_runs ORDER BY run_id DESC LIMIT 10'))"
+```
+
+### Test commands for the ML / backtest domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/ -v -k "ml or backtest or scorer"             # focused (~6.5min)
+python3 -m pytest tests/test_decision_scorer.py -v                    # 65 tests on the scorer (4.7s)
+python3 -m pytest tests/test_continuous.py -v                         # 117 tests on the cycle (~3.6s)
+python3 -m pytest tests/test_dropped_label_audit.py -v                # pass #16 lock (33 tests, 2.6s)
+python3 -m pytest tests/test_ml_backtest_seams.py -v                  # defensive seams
+python3 -m pytest tests/test_baseline_compare.py -v                   # baseline rank-IC tests
+```
+
+### Reaffirmed invariants
+
+- CLAUDE.md §6 invariant #5 — DecisionScorer only gates after
+  `n_train >= 500 AND off_distribution=False`.
+- CLAUDE.md §6 invariant #2 — backtest articles always carry
+  `urgency=0` (never bumped by Opus annotations).
+- The `for/else` retry in `_inject_and_train` is correctly
+  structured: 4 attempts, lock-only retries on attempts 0..2,
+  fall-through `else` returns the "locked after 4 attempts"
+  status only when every attempt was a lock (never a real error).
+
+### Counters
+
+bugs_fixed=1 · features_added=1 · user_findings=5
+
+---
+
 ## 2026-05-23 HYBRID core (Agent 1) — `/api/news-corroboration-skill` wired + concurrent-agent commit collision
 
 **Phase 1 — bug audit (bugs_fixed: 0)**
