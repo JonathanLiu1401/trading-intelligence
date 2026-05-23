@@ -77,6 +77,62 @@ class TestLabelSourcing:
         assert (y_rel == 6.0).all()
 
 
+class TestBriefingSamplesBacktestIsolation:
+    """``_fetch_briefing_samples`` derives extra training labels by matching
+    article-title prefixes against recent Opus heartbeat briefings. Pre-fix the
+    candidate scan was an unfiltered ``ORDER BY first_seen DESC LIMIT 5000`` —
+    the only live-pool read in the trainer module without ``_LIVE_ONLY_CLAUSE``.
+
+    Briefings derive from ``get_top_for_briefing`` (live-only) so the title
+    prefix should only ever match live news in practice; a synthetic backtest
+    row's 40-char title prefix happening to collide with briefing prose was
+    rare but possible — exactly the partial-filter regression class
+    ``analytics/trend_velocity.py`` violates and the rest of the codebase pins
+    via defense-in-depth. If the filter is ever removed this fails by surfacing
+    the synthetic row as a 4.5 training label.
+    """
+
+    def test_synthetic_titles_in_briefing_text_do_not_become_labels(self, store):
+        # Save a briefing whose text contains a 40-char prefix that ALSO exists
+        # as a synthetic backtest row's title. Without the live-only filter, the
+        # synthetic row would be re-labeled rel=4.5 (4.5-tag re-injection on a
+        # row whose REAL outcome label is 0.5 SELL-loser).
+        unique_prefix = "Nvidia accelerates DRAM HBM3e supply chai"
+        synth_title = unique_prefix + "n shifts after Q1"
+        # 30 LLM rows so the function doesn't bail on too-few-samples.
+        for i in range(30):
+            _insert(store, id=f"llm{i}", title=f"llm article {i} long enough",
+                    ai_score=6.0, score_source="llm")
+        # Synthetic backtest row carrying its own fractional outcome label.
+        _insert(store, id="bt_loser", title=synth_title, ai_score=0.5,
+                score_source=None,
+                url="backtest://run_77/2026-05-21/SELL/NVDA",
+                source="backtest_run_77_loser")
+        # Briefing that mentions the synthetic title prefix verbatim.
+        with store._write_lock:
+            store.conn.execute(
+                "INSERT INTO briefings (ts, text, article_count) VALUES (?,?,?)",
+                ("2026-05-21T12:00:00+00:00",
+                 f"Opus heartbeat. Top: {unique_prefix} matters today.",
+                 1),
+            )
+            store.conn.commit()
+
+        texts, articles, rels, urgs = trainer._fetch_briefing_samples(store)
+        # The synthetic row's title MUST NOT appear among the briefing-derived
+        # positive labels; the live-only clause excludes the row from the scan.
+        for a, r in zip(articles, rels):
+            assert a["title"] != synth_title, (
+                f"synthetic backtest row leaked into briefing-derived training "
+                f"labels (would inject rel=4.5 over its real 0.5 SELL outcome)"
+            )
+        # And the synthetic row's source tag must never appear in this output.
+        for a in articles:
+            assert not a["source"].startswith("backtest_"), (
+                "backtest_ source tag in briefing-derived training pool"
+            )
+
+
 class TestSampleWeights:
     def test_high_relevance_weighs_more_than_low(self):
         """The fit loss is sample-weighted by (y_rel/10)^EXP — a 9.0 article
