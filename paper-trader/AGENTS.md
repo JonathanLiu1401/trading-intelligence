@@ -6,6 +6,153 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 core HYBRID pass (Agent 1) — `/api/state` position enrichment (`pl_pct` + `market_value` + hold time)
+
+### Phase 1: Debug — 0 bugs fixed
+
+Read AGENTS.md, ran the focused core test suite (`test_core_runner` /
+`test_core_strategy` / `test_core_signals` / `test_core_market` /
+`test_core_store` / `test_core_reporter` / `test_core_dashboard_*`) —
+**911 tests passed**, no regressions or latent crashes uncovered. The
+core surfaces (runner singleton-lock, strategy decide/parse/execute,
+signals split-brain resolver, market half-day calendar, store
+WAL/portfolio resilience, reporter Discord delivery, host_guard
+saturation predicates) have been hardened by ~20 prior HYBRID passes;
+the new bugs in this surface are now rare enough that an honest
+"nothing to fix" Phase 1 is the right answer.
+
+Bug hunts I worked through (all fine):
+- `_no_decision_cause` whitespace-raw masking (fixed in 5ffd69a);
+  `quota_first_ts` / `_no_decision_first_ts` reset interleavings
+  (the documented quota → wedge → real-decision ladder is correct);
+- `_extract_tickers` regex on multi-word and non-ticker ALLCAPS
+  (NYSE/NASDAQ correctly not extracted because of `\b` semantics);
+- `get_prices` MultiIndex branch on single-ticker bulk (the 4c59f0a
+  fix is intact; both branches converge through `get_price` fallback);
+- `_recheck_singleton_lock` lock-fd identity (the runner only ever
+  re-acquires from the `degraded` state, so no self-deadlock);
+- `_init_portfolio` corrupt-row recovery (the existing `_bad(row)`
+  re-read + safe-default fallback in `get_portfolio` is well-tested
+  by `TestGetPortfolioResilience` and self-heals on next write).
+
+### Phase 2: Feature — `_enrich_open_position` for `/api/state` (3146b58)
+
+`/api/state` returned RAW `positions` table rows that lacked the three
+trader-essential derived fields any consumer reading the endpoint must
+otherwise re-derive (and re-derive inconsistently):
+
+| Missing field    | Why traders care                                          |
+|------------------|-----------------------------------------------------------|
+| `pl_pct`         | per-position % return — sized off `(cur - avg)/avg`       |
+| `market_value`   | lot dollar value — Σ-able across the book                 |
+| `hold_seconds` / `hold_days` | how long this lot has been held — disposition-effect ammo |
+
+The dashboard JS at line 2566 (`const totalVal = (p.current_price || 0)
+* (p.qty || 0) * mult`) re-derived `market_value` client-side; the
+positions table left `P/L %` blank because no consumer carried it; the
+digital-intern cross-port `/api/portfolio` fetch had no usable
+per-position % return either.
+
+`paper_trader/dashboard._enrich_open_position(p)` composes the exact
+same arithmetic `strategy._mark_to_market` uses — × 100 multiplier for
+options (so a leveraged ETF and a 1-contract option don't read the same
+dollar value), `None` rather than `0.00` when `avg_cost == 0` (a free
+position must NOT misread as "flat"). `hold_seconds` is `int`-floored;
+`hold_days` is rounded to 4 places (mirrors `store.closed_positions`'s
+own precedent). The helper is wired into `/api/state` and the
+dashboard's open-positions table now shows two new columns: **P/L %**
+and **held** (compact m/h/d label).
+
+Pure on the input row — no store reads, no network, never raises.
+Degrade-safe contract mirrors the rest of the dashboard: a non-numeric
+column falls through to `None`/`0` for the affected field, the rest of
+the row stays intact, and the endpoint can NEVER 500 on a single
+corrupt row.
+
+**15 tests in `tests/test_open_position_enrichment.py`** pin:
+- stock + call + put pl_pct/market_value math against known inputs
+  (NVDA at 215.25 vs 223.435 → exactly -3.66%; NVDA 220C 2026-06 at
+  7.50 vs 5.00 → +50.0% and $1500 market_value);
+- `avg_cost == 0` → `pl_pct=None` (NOT a misleading 0.00 / +inf);
+- `current_price == 0` → `market_value=0.0`, `pl_pct=-100.0` (the
+  honest read for an unpriced lot or pre-first-mark new position);
+- corrupted row (string `qty` / `avg_cost` / `current_price`) →
+  degrades to `None`/`0.0`, never raises a 500;
+- helper does NOT mutate the input row in-place (consumers may chain);
+- all existing fields (`id`, `strike`, `expiry`, `closed_at`,
+  `unrealized_pl`) pass through untouched;
+- hold-duration edge cases: Z-suffix ISO, naive ISO treated as UTC,
+  future `opened_at` (clock-stepped-back) clamps to 0 (NOT negative),
+  unparseable / missing → `None`;
+- end-to-end through a Flask test client: opening a real lot and
+  applying a mark surfaces correct `pl_pct` + `market_value` +
+  `hold_seconds` on `/api/state.positions[0]`.
+
+### Phase 3: Live validation — trader's view
+
+Verified the live trader running on the box:
+- `/api/runner-heartbeat` reads `verdict=HEALTHY` (loop is cycling)
+  but `decision_efficacy.verdict=IDLE_STORM` — the last 20 cycles
+  were ALL `NO_DECISION` (cause: host saturation).
+  `last_real_decision_ts = 2026-05-21T10:00:54Z` → **59h 13m without
+  a real (FILLED/HOLD/BLOCKED) decision** in a market-closed window
+  but cycling every ~30 min.
+- `/api/host-guard` reports `SATURATED — 12 concurrent Opus`,
+  `opus_count=12 > DEFAULT_MAX_OPUS=4`. Pre-flight guard correctly
+  skipping every claude call this cycle (the 9c14c96 +
+  d714dcb mid-call re-probe is the right defence).
+- `/api/concurrent-opus-attribution` correctly fingerprints the
+  storm: **12/12 Opus traced to `scripts/hourly_review.sh`**.
+  Targeted-kill recommendation: `pkill -f scripts/hourly_review.sh`
+  (the live runner is NOT in that group — it would survive).
+- `/api/build-info` reads `boot_sha=4c1a9ec head_sha=3146b58
+  behind=1 stale=true` — my own commit just landed and the running
+  process needs a restart to pick it up (git-watcher will fire on the
+  next ≥180s poll). End-to-end verification of the new `pl_pct` /
+  `market_value` fields lands on next boot; the test client already
+  proves the new code is correct.
+- `/api/portfolio` book health: NVDA 3 shares @ avg $223.44 marked at
+  $215.25 → **−$24.55 unrealized (−2.49% of equity)**. Cash $341.64
+  (34.6%), total $987.39, pnl_vs_start −1.26%.
+- `/api/risk` correctly fires `concentration_warning=true,
+  severity=HIGH` (NVDA 65.4% of stock book).
+- `/api/benchmark` reads `LAGGING −2.22pp` vs S&P buy-and-hold
+  ($987.39 vs $1009.59 if same $1000 had bought ^GSPC at inception).
+- `/api/closed-positions` summary coherent: 2 lots closed (TQQQ
+  +$7.42 / 1.51d, DRAM −$0.45 / 0.05d) → win rate 50%, total
+  realized P/L +$6.97, median hold 0.78d.
+- `/api/notify-health` reads `HEALTHY — last send OK` (the 2026-05-17
+  `env node` PATH outage is closed).
+- Discord cross-fetch CORS headers present (`Access-Control-Allow-
+  Origin: *`).
+
+### Counters
+
+bugs_fixed=0, features_added=1 (`/api/state` position enrichment +
+dashboard P/L % + held columns), user_findings=4:
+1. Live trader stuck **IDLE_STORM for ~59h** — host saturated by
+   `scripts/hourly_review.sh` (12 concurrent Opus). Targeted kill
+   `pkill -f scripts/hourly_review.sh` would restore the live
+   trader's decision capacity. The trader's auto-recovery breaker
+   correctly identifies this as a non-trader-recoverable problem
+   (`restart_helps=false`).
+2. `/api/build-info` flags the dashboard process as 1 commit stale.
+   The git-watcher in `runner.py` will deferred-restart at the next
+   3min poll → my new `/api/state.positions[].pl_pct` /
+   `.market_value` / `.hold_seconds` fields will go live then.
+3. Book sits at **HIGH concentration** (NVDA 65.4%) and is
+   **LAGGING SPY by 2.22pp**. Both the `concentration_warning`
+   and the `LAGGING` benchmark verdict are correctly surfaced.
+4. **No clear bugs in core files** — 911 focused core tests pass;
+   the surface is mature enough that a fresh Phase-1 hunt finds
+   only already-fixed bugs (e.g. the per-call `_last_claude_fail`
+   reset, the strike-not-numeric guard, the bb_position
+   stretched-band label). Discord delivery + singleton lock +
+   split-brain resolver + half-day calendar + WAL store all read
+   healthy.
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #21 (Agent 2) — `_rsi` flat-series neutrality, `_LEVERAGED_ETFS` coverage audit, `stop_out_audit`
 
 ### Phase 1: Debug — 2 bugs fixed (9ee81b7)
