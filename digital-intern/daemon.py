@@ -101,6 +101,7 @@ from collectors.whitehouse_collector import collect_whitehouse
 from collectors.g10_central_banks_collector import collect_g10_central_banks
 from collectors.global_regulators_collector import collect_global_regulators
 from collectors.imf_bis_worldbank_collector import collect_imf_bis_worldbank
+from collectors.un_news_collector import collect_un_news
 from collectors.globenewswire_collector import collect_globenewswire
 from collectors.short_seller_collector import collect_short_sellers
 from collectors.financial_blogs_collector import collect_financial_blogs
@@ -203,6 +204,7 @@ BOE_PRESS_INTERVAL      = 1800    # Bank of England press / publications RSS —
 WHITEHOUSE_INTERVAL     = 1800    # White House executive orders / proclamations / briefings — every 30min
 G10_CB_INTERVAL         = 1800    # Bank of Canada + RBA press / speeches RSS — every 30min
 GLOBAL_REG_INTERVAL     = 1800    # FSB, FCA, Fed research notes/papers — every 30min
+UN_NEWS_INTERVAL        = 1800    # UN News economic/climate/regional feeds — every 30min
 BIS_INTERVAL            = 1800    # BIS press releases, speeches, research — every 30min
 BLS_INTERVAL            = 3600    # BLS macro series (CPI, unemployment, payrolls) — once per hour
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
@@ -2030,6 +2032,28 @@ def bis_worker(store: ArticleStore):
         _sleep(BIS_INTERVAL)
 
 
+
+# ── Worker: UN News — economic/climate/regional RSS feeds — every 30min ──────
+def un_news_worker(store: ArticleStore):
+    log.info("[un_news_worker] started")
+    bo = Backoff("un_news", base=60.0, cap=900.0)
+    while True:
+        try:
+            articles = collect_un_news()
+            _ingest(store, articles, "un_news")
+            try:
+                source_health.record_result("un_news", len(articles))
+            except Exception as he:
+                log.warning(f"[un_news_worker] source_health error: {he}")
+            _worker_last_ok["un_news"] = time.time()
+            log.debug(f"[un_news] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[un_news_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.advance()
+        _sleep(UN_NEWS_INTERVAL)
+
+
 # ── Worker: GlobeNewswire financial press releases — every 10min ─────────────
 def globenewswire_worker(store: ArticleStore):
     log.info("[globenewswire_worker] started")
@@ -3756,6 +3780,7 @@ def main():
         ("g10_cb",      g10_cb_worker),
         ("global_reg",  global_reg_worker),
         ("bis",         bis_worker),
+        ("un_news",     un_news_worker),
         ("globenewswire", globenewswire_worker),
         ("short_seller", short_seller_worker),
         ("financial_blogs", financial_blogs_worker),
