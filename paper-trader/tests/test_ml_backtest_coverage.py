@@ -252,3 +252,58 @@ class TestLstsqFallbackScorer:
             regime_mult=1.0, ticker="NVDA",
         )
         assert pred == pred  # not NaN
+
+    def test_fallback_model_predict_accepts_1d_input(self, monkeypatch):
+        # ``_LstsqModel.predict`` should mirror sklearn's
+        # ``MLPRegressor.predict`` 1D/2D acceptance. The bare
+        # ``np.hstack([X, ones((len(X), 1))])`` previously raised
+        # ValueError on a 1D feature vector — mixed-dimension hstack is
+        # rejected by numpy — silently breaking any caller (test fake,
+        # ad-hoc tooling, future diagnostic) that hands in a single
+        # vector. Production paths inside DecisionScorer always batch, so
+        # this regression-locks the public contract.
+        import numpy as np
+
+        from paper_trader.ml.decision_scorer import (
+            DecisionScorer, build_features, train_scorer,
+        )
+
+        _force_no_sklearn(monkeypatch)
+        train_scorer(_linear_records(60))
+        scorer = DecisionScorer()
+
+        feat_1d = np.array(
+            build_features(5.0, 50.0, 0.0, 0.0, 0.0, 1.0, "NVDA"),
+            dtype=np.float32,
+        )
+        assert feat_1d.ndim == 1, "test invariant: feature vec is 1D"
+        scaled_1d = scorer._scaler.transform(feat_1d)
+        # _LstsqScaler.transform broadcasts; the 1D output must round-trip
+        # through _LstsqModel.predict without the hstack ValueError.
+        out = scorer._model.predict(scaled_1d)
+        assert out.shape == (1,), f"unexpected shape: {out.shape}"
+        assert np.all(np.isfinite(out))
+
+    def test_fallback_model_predict_1d_and_2d_agree(self, monkeypatch):
+        # The 1D shim must not change the prediction. Same feature
+        # vector handed in as 1D vs 2D must produce the same scalar.
+        import numpy as np
+
+        from paper_trader.ml.decision_scorer import (
+            DecisionScorer, build_features, train_scorer,
+        )
+
+        _force_no_sklearn(monkeypatch)
+        train_scorer(_linear_records(60))
+        scorer = DecisionScorer()
+
+        feat = build_features(7.0, 55.0, 0.1, 1.0, 2.0, 1.0, "AMD")
+        x_1d = np.array(feat, dtype=np.float32)
+        x_2d = np.array([feat], dtype=np.float32)
+        scaled_1d = scorer._scaler.transform(x_1d)
+        scaled_2d = scorer._scaler.transform(x_2d)
+        out_1d = scorer._model.predict(scaled_1d)
+        out_2d = scorer._model.predict(scaled_2d)
+        assert out_1d.shape == (1,)
+        assert out_2d.shape == (1,)
+        assert abs(float(out_1d[0]) - float(out_2d[0])) < 1e-5

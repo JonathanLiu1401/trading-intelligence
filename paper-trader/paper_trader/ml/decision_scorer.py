@@ -197,6 +197,17 @@ class _LstsqModel:
 
     def predict(self, Xin) -> np.ndarray:
         X = np.asarray(Xin, dtype=np.float32)
+        # Mirror sklearn's `MLPRegressor.predict` 1D/2D acceptance so a
+        # caller that hands in a single feature vector (shape (n,)) doesn't
+        # crash on the np.hstack mixed-dimension error
+        # ("ValueError: all the input arrays must have same number of
+        # dimensions") that bare 1D + ones((len(X), 1)) produces. Production
+        # paths inside DecisionScorer always batch (predict_with_meta wraps
+        # build_features in `np.array([…])`; feature_contributions vstacks),
+        # so this is a robustness fix for the public contract — same shape
+        # acceptance as the sklearn path the lstsq fallback substitutes for.
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
         Xa = np.hstack([X, np.ones((len(X), 1), dtype=np.float32)])
         return Xa @ self.w_
 
