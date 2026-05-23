@@ -517,7 +517,30 @@ def send_decision_log(summary: dict) -> bool:
     return _send("\n".join(parts))
 
 
-def send_breaker_fired_alert(consecutive: int, last_reason: str = "") -> bool:
+def _format_elapsed(secs: int | float | None) -> str:
+    """Compact wedge-duration label: ``42m`` / ``1h32m`` / ``2d4h``.
+
+    ``None`` / negative / non-numeric → ``""`` so the caller suppresses the
+    elapsed token entirely (degrade-safe — the alert still ships without it).
+    Sub-minute clamps to ``0m`` so a 30s wedge reads cleanly, not as ``""``."""
+    try:
+        s = float(secs) if secs is not None else None
+    except (TypeError, ValueError):
+        return ""
+    if s is None or s < 0:
+        return ""
+    s_i = int(s)
+    if s_i < 3600:
+        return f"{s_i // 60}m"
+    if s_i < 86400:
+        h, m = divmod(s_i, 3600)
+        return f"{h}h{m // 60}m"
+    d, rem = divmod(s_i, 86400)
+    return f"{d}d{rem // 3600}h"
+
+
+def send_breaker_fired_alert(consecutive: int, last_reason: str = "",
+                              *, elapsed_s: int | float | None = None) -> bool:
     """Operator-actionable alarm: the consecutive-NO_DECISION circuit
     breaker just fired and reaped any stale claude subprocess.
 
@@ -537,17 +560,30 @@ def send_breaker_fired_alert(consecutive: int, last_reason: str = "") -> bool:
     empty_stdout / cli_missing / exception / parse failure) for
     operator diagnosis.
 
+    ``elapsed_s`` is the REAL wall-clock seconds since the first
+    NO_DECISION in this run (``runner._no_decision_first_ts``). Under
+    dynamic_interval the per-cycle gap varies 60s..90min so the
+    old hardcoded ``consecutive * 30`` minutes wildly mis-stated the
+    freeze duration during a high-cadence storm OR a quiet-closed wedge.
+    ``None`` (legacy callers, ts not captured) suppresses the duration
+    token — the alert still ships with the count + cause only.
+
     Dedupe is the caller's job (mirrors the quota path's
     ``_quota_alert_active`` latch): runner sets a latch True after
     sending and clears it on the next real decision, so a long wedge
     fires once per outage, not every cycle.
     """
+    duration_token = _format_elapsed(elapsed_s)
+    duration_clause = (
+        f"The decision engine has been silently failing for ~{duration_token}. "
+        if duration_token
+        else "The decision engine has been silently failing every cycle. "
+    )
     body = (
         "⚠️ **CLAUDE BREAKER FIRED** ◈ "
         f"{consecutive} consecutive NO_DECISION cycles — runner reaped "
         "any stale `claude` subprocess to auto-recover\n"
-        "The decision engine has been silently failing every cycle for "
-        f"~{consecutive * 30} minutes (open-market cadence). Open positions "
+        f"{duration_clause}Open positions "
         "are still marked-to-market; no new trades have fired. The next "
         "real decision clears this latch."
     )

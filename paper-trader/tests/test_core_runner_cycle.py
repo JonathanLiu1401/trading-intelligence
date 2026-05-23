@@ -236,6 +236,23 @@ class TestNoDecisionCause:
         assert cause.endswith("A" * 120)
         assert len(cause) < 200
 
+    def test_last_claude_fail_used_when_raw_is_none(self):
+        """When raw is None (timeout/empty/CLI), the strategy's per-call
+        ``last_claude_fail`` tag becomes the cause — previously this path
+        returned ``""`` and the breaker alert went out with no diagnostic."""
+        cause = runner._no_decision_cause(
+            {"raw": None, "last_claude_fail": "timeout"})
+        assert "timeout" in cause
+        assert cause.startswith("claude no-response")
+
+    def test_last_claude_fail_each_bucket_surfaces(self):
+        """Cover the five distinct strategy cause codes."""
+        for code in ("timeout", "nonzero_rc", "empty_stdout", "cli_missing",
+                     "exception"):
+            cause = runner._no_decision_cause(
+                {"raw": None, "last_claude_fail": code})
+            assert code in cause
+
 
 class TestCircuitBreakerAlert:
     """The breaker historically fired silently — stdout WARNING only.
@@ -248,9 +265,17 @@ class TestCircuitBreakerAlert:
         monkeypatch.setattr(runner, "_consecutive_no_decisions", 0)
         monkeypatch.setattr(runner, "_breaker_alert_active", False)
         monkeypatch.setattr(runner, "_quota_alert_active", False)
+        # Reset wedge-elapsed tracker so prior tests can't leak a stale ts.
+        monkeypatch.setattr(runner, "_no_decision_first_ts", None)
         alerts = {"fired": [], "send": []}
-        monkeypatch.setattr(runner.reporter, "send_breaker_fired_alert",
-                            lambda n, cause="": alerts["fired"].append((n, cause)) or True)
+        # Capture elapsed_s too — runner now passes it as a kwarg so the
+        # Discord body carries the real wall-clock wedge duration.
+        monkeypatch.setattr(
+            runner.reporter, "send_breaker_fired_alert",
+            lambda n, cause="", *, elapsed_s=None: (
+                alerts["fired"].append((n, cause, elapsed_s)) or True
+            ),
+        )
         monkeypatch.setattr(runner.reporter, "_send",
                             lambda m: alerts["send"].append(m) or True)
         # No-op the actual subprocess kill — we only care about the alert.
@@ -271,8 +296,12 @@ class TestCircuitBreakerAlert:
         self._run_no_decision_cycles(
             runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
         assert len(breaker_setup["fired"]) == 1
-        n, cause = breaker_setup["fired"][0]
+        n, cause, elapsed_s = breaker_setup["fired"][0]
         assert n == runner.CONSECUTIVE_NO_DECISION_LIMIT
+        # elapsed_s is wall-clock seconds since the first NO_DECISION in this
+        # run — small (cycles run back-to-back in the test) but must be int,
+        # never None, when the breaker fires within the same process lifetime.
+        assert isinstance(elapsed_s, int) and elapsed_s >= 0
         # Latch is set so the NEXT breaker fire stays silent.
         assert runner._breaker_alert_active is True
         # Counter resets after the breaker fires.
@@ -328,7 +357,7 @@ class TestCircuitBreakerAlert:
         symmetric latch discipline)."""
         # Send returns False → latch stays False.
         monkeypatch.setattr(runner.reporter, "send_breaker_fired_alert",
-                            lambda n, cause="": False)
+                            lambda n, cause="", *, elapsed_s=None: False)
         self._run_no_decision_cycles(
             runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
         assert runner._breaker_alert_active is False
@@ -340,5 +369,31 @@ class TestCircuitBreakerAlert:
             runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch,
             summary_extra={"host_saturated": True})
         assert len(breaker_setup["fired"]) == 1
-        _n, cause = breaker_setup["fired"][0]
+        _n, cause, _elapsed = breaker_setup["fired"][0]
         assert "host saturated" in cause
+
+    def test_last_claude_fail_propagates_to_cause(self, breaker_setup,
+                                                    monkeypatch):
+        """When raw is None (no parse-able response) but the strategy set
+        a per-call cause code (timeout / nonzero_rc / cli_missing / …),
+        the breaker alert surfaces the code instead of a blank ``""``."""
+        self._run_no_decision_cycles(
+            runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch,
+            summary_extra={"raw": None, "last_claude_fail": "cli_missing"})
+        assert len(breaker_setup["fired"]) == 1
+        _n, cause, _elapsed = breaker_setup["fired"][0]
+        # The cause string is built by _no_decision_cause from summary fields.
+        assert "cli_missing" in cause
+
+    def test_real_decision_resets_wedge_elapsed_marker(self, breaker_setup,
+                                                        monkeypatch):
+        """Once the engine produces a real decision, ``_no_decision_first_ts``
+        must reset to None so the NEXT wedge starts its elapsed-time clock
+        from a fresh first-NO_DECISION (not from the stale prior outage)."""
+        self._run_no_decision_cycles(2, monkeypatch)
+        assert runner._no_decision_first_ts is not None
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()
+        assert runner._no_decision_first_ts is None

@@ -71,6 +71,15 @@ _quota_alert_active = False
 # operator action differs (a breaker fire wants escalation, a quota wants
 # patience until the reset).
 _breaker_alert_active = False
+# Wall-clock timestamp (UTC) of the first NO_DECISION in the current run of
+# consecutive NO_DECISION cycles. Used by the breaker Discord alarm to
+# surface the REAL elapsed-time of the wedge instead of multiplying the count
+# by a hardcoded 30-min cadence — under dynamic_interval the actual cycle gap
+# is anywhere from 60s (earnings window) to 90 min (quiet-closed), so the old
+# ``consecutive * 30`` math wildly mis-stated the freeze duration. Reset to
+# None whenever the engine produces a real decision. Module global (in-memory
+# only — a fresh process re-derives it on its next NO_DECISION).
+_no_decision_first_ts: datetime | None = None
 
 # Set by the git-watcher thread; checked by the main loop between cycles so
 # a restart never kills a mid-Opus decision call.
@@ -642,14 +651,16 @@ def _no_decision_cause(summary: dict) -> str:
     (the alert path must stay fast and degrade-safe; mirrors the rest of
     runner's "never raise from a notification helper" discipline).
 
-    The decision schema buries the cause two ways:
+    The decision schema buries the cause four ways:
       * ``summary["host_saturated"]`` True → "skipped — host saturated"
       * ``summary["quota_exhausted"]`` True → "quota/usage limit"
-      * neither → look at the raw response and the cause tag the strategy
-        emits ("claude returned no response (timeout)" → "timeout",
-        "parse_failed: …" → "parse_failed", etc.)
+      * ``summary["raw"]`` is non-empty → parse failure, surface the first line
+      * ``summary["last_claude_fail"]`` set (raw is None) → empty/timeout/CLI
+        cause from strategy._claude_call's per-call tag (timeout / nonzero_rc /
+        empty_stdout / cli_missing / exception) — distinct from a parse miss.
 
-    Returns ``""`` when no cause is recoverable from the summary."""
+    Returns ``""`` only when NONE of the four channels carry a cause (a
+    historical row from before this field landed, or a truly opaque miss)."""
     if summary.get("quota_exhausted"):
         return "quota/usage limit"
     if summary.get("host_saturated"):
@@ -658,12 +669,15 @@ def _no_decision_cause(summary: dict) -> str:
     if isinstance(raw, str) and raw:
         head = raw.strip().split("\n", 1)[0]
         return f"raw response (first line): {head[:120]}"
+    fail = summary.get("last_claude_fail")
+    if isinstance(fail, str) and fail:
+        return f"claude no-response ({fail})"
     return ""
 
 
 def _cycle():
     global _consecutive_no_decisions, _quota_alert_active
-    global _breaker_alert_active
+    global _breaker_alert_active, _no_decision_first_ts
     summary = strategy.decide()
 
     status = summary.get("status", "NO_DECISION")
@@ -678,6 +692,10 @@ def _cycle():
         # will execute until the quota resets). Keep the breaker counter at 0
         # so a quota outage can never trip it.
         _consecutive_no_decisions = 0
+        # Quota path never reaches the breaker, but the wedge-elapsed marker
+        # must still re-arm so a NON-quota wedge that follows starts its own
+        # clock from THIS cycle (not from a stale quota-era ts).
+        _no_decision_first_ts = None
         if not _quota_alert_active:
             try:
                 detail = ""
@@ -696,8 +714,21 @@ def _cycle():
         # quiet market does NOT trip the breaker — only repeated Claude failures.
         if status == "NO_DECISION":
             _consecutive_no_decisions += 1
+            if _no_decision_first_ts is None:
+                _no_decision_first_ts = datetime.now(timezone.utc)
             if _consecutive_no_decisions >= CONSECUTIVE_NO_DECISION_LIMIT:
                 fired_at = _consecutive_no_decisions
+                # Real elapsed-time since the first NO_DECISION in this run.
+                # Falls back to None (the alert renders without the elapsed
+                # token) when, somehow, the first-ts was not captured.
+                elapsed_s: int | None
+                if _no_decision_first_ts is not None:
+                    elapsed_s = int(
+                        (datetime.now(timezone.utc)
+                         - _no_decision_first_ts).total_seconds()
+                    )
+                else:
+                    elapsed_s = None
                 print(
                     f"[runner] WARNING: {fired_at} consecutive "
                     f"NO_DECISION cycles — Claude appears wedged; killing stale "
@@ -715,12 +746,15 @@ def _cycle():
                 if not _breaker_alert_active:
                     cause = _no_decision_cause(summary)
                     try:
-                        if reporter.send_breaker_fired_alert(fired_at, cause):
+                        if reporter.send_breaker_fired_alert(
+                            fired_at, cause, elapsed_s=elapsed_s,
+                        ):
                             _breaker_alert_active = True
                     except Exception as e:
                         print(f"[runner] breaker alert failed: {e}")
         else:
             _consecutive_no_decisions = 0
+            _no_decision_first_ts = None  # re-arm: next outage starts fresh
             # Engine produced a real decision (HOLD, FILLED, BLOCKED) — clear
             # the breaker latch so a fresh wedge tomorrow re-alerts the
             # operator. Symmetric with the quota latch's recovery path

@@ -1844,6 +1844,12 @@ def decide() -> dict:
         # NO_DECISION for the auto-recovery breaker (reaping stale claude procs
         # is the right response to a saturated box either way).
         "host_saturated": host_sat,
+        # Cause code from the most recent ``_claude_call`` this cycle (None on
+        # success). Surfaced so ``runner._no_decision_cause`` can label a
+        # raw=None NO_DECISION with a SPECIFIC cause (timeout / nonzero_rc /
+        # empty_stdout / cli_missing / exception) in the breaker Discord alert
+        # instead of degrading to ``""``. Single-cycle state, never sticky.
+        "last_claude_fail": _last_claude_fail,
     }
 
     if not decision:

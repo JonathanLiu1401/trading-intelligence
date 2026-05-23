@@ -987,6 +987,48 @@ class TestSendBreakerFiredAlert:
         monkeypatch.setattr(reporter, "_send", lambda _msg: False)
         assert reporter.send_breaker_fired_alert(5, "anything") is False
 
+    def test_elapsed_s_renders_real_duration(self, monkeypatch):
+        """A non-None ``elapsed_s`` produces the actual elapsed token, not
+        the legacy hardcoded ``consecutive * 30`` minutes. 4500s = 1h15m."""
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        reporter.send_breaker_fired_alert(5, elapsed_s=4500)
+        body = captured[0]
+        assert "1h15m" in body
+        # The old text "150 minutes" (5 * 30) must NOT appear — the bug was
+        # exactly this kind of cadence-multiplication that misled operators
+        # during dynamic-interval cycles.
+        assert "150 minutes" not in body
+
+    def test_elapsed_s_none_omits_duration_clause(self, monkeypatch):
+        """Legacy callers (no elapsed_s) get a generic 'every cycle' clause
+        with no fabricated duration — never invent a wedge length."""
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        reporter.send_breaker_fired_alert(5)
+        body = captured[0]
+        # No "~Xm" or "~Xh" token at all
+        assert "~" not in body or "~" in body and "every cycle" in body
+        # Generic clause is present so the message still reads cleanly
+        assert "every cycle" in body
+
+    def test_format_elapsed_buckets(self):
+        """Compact duration label: m / h+m / d+h."""
+        assert reporter._format_elapsed(0) == "0m"
+        assert reporter._format_elapsed(59) == "0m"
+        assert reporter._format_elapsed(60) == "1m"
+        assert reporter._format_elapsed(3599) == "59m"
+        assert reporter._format_elapsed(3600) == "1h0m"
+        assert reporter._format_elapsed(3660) == "1h1m"
+        assert reporter._format_elapsed(86400) == "1d0h"
+        assert reporter._format_elapsed(86400 + 3600 * 4) == "1d4h"
+        # Degrade-safe — None / negative / non-numeric → empty
+        assert reporter._format_elapsed(None) == ""
+        assert reporter._format_elapsed(-5) == ""
+        assert reporter._format_elapsed("garbage") == ""
+
 
 class TestSendDailyCloseBaseline:
     """The daily-close P/L baseline label must track reporter._INITIAL_EQUITY,
