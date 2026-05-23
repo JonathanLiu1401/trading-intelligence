@@ -12712,6 +12712,164 @@ def round_trip_postmortem_api():
         return jsonify({"error": str(e), "state": "ERROR"}), 500
 
 
+@app.route("/api/last-real-decision")
+def last_real_decision_api():
+    """Single dedicated surface for "when did the engine last actually
+    decide something?".
+
+    ``store.last_real_decision()`` returns the most recent decision row
+    whose ``action_taken`` is NOT a NO_DECISION cycle (FILLED / HOLD /
+    BLOCKED — see store.last_real_decision docstring). This endpoint wraps
+    it with the trader-actionable rendering: the row plus its computed
+    age (seconds + humanised) and a verdict ladder so a panel poll can
+    branch on a single bucket.
+
+    Verdict ladder (advisory only, never gates):
+
+      * ``NEVER``       — no real decision in history at all (a fresh-boot
+        book whose first 24h was all NO_DECISION storms — the documented
+        IDLE_STORM regime; the engine has never produced anything);
+      * ``FRESH``       — within the expected runner cadence
+        (``OPEN_INTERVAL_S`` open / ``CLOSED_INTERVAL_S`` closed) ×
+        ``LAGGING_MULT``;
+      * ``DELAYED``     — between LAGGING and STALLED cadence multiples
+        (the engine made a real decision, but the gap is longer than
+        normal);
+      * ``STALE``       — past STALLED_MULT × expected, i.e. the
+        cadence-only heartbeat would call this STALLED for the bare
+        ``last_decision_ts`` — and ALL the more so for the real-decision
+        ts. The IDLE_STORM smoking gun: the loop is cycling (the
+        decisions table grows) but real decisions are not.
+
+    The fields ``ticker`` / ``action_verb`` / ``status`` come from
+    parsing the free-text ``action_taken`` (AGENTS.md invariant #11)
+    via ``reporter._decision_action_verb`` + a status split. Pure read,
+    never raises — any fault degrades to a valid ERROR envelope so the
+    panel renders, the upstream proxy can read it, and the operator sees
+    the diagnostic instead of a 500.
+
+    Distinct from ``/api/runner-heartbeat`` (which answers "is the loop
+    CYCLING?") and from ``/api/decision-drought`` (which prices the P&L
+    cost of inaction): this answers "what was the most recent ACTUAL
+    decision and how long ago?", a question the dashboard could only
+    answer until now by hand-rolling SQL into ``paper_trader.db``."""
+    try:
+        from .analytics.runner_heartbeat import (
+            OPEN_INTERVAL_S, CLOSED_INTERVAL_S, LAGGING_MULT, STALLED_MULT,
+            _humanize,
+        )
+        from . import market as _mkt
+        from . import reporter as _reporter
+        store = get_store()
+        try:
+            row = store.last_real_decision()
+        except Exception as e:
+            return jsonify({
+                "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "service": "paper_trader",
+                "verdict": "ERROR",
+                "headline": f"store error: {e}",
+                "row": None,
+            }), 500
+        now_utc = datetime.now(timezone.utc)
+        market_open = _mkt.is_market_open(now_utc)
+        expected = OPEN_INTERVAL_S if market_open else CLOSED_INTERVAL_S
+
+        if row is None:
+            return jsonify({
+                "as_of": now_utc.isoformat(timespec="seconds"),
+                "service": "paper_trader",
+                "verdict": "NEVER",
+                "headline": "The engine has never produced a real decision "
+                            "(no FILLED/HOLD/BLOCKED row in history; only "
+                            "NO_DECISION cycles).",
+                "row": None,
+                "secs_since": None,
+                "age": None,
+                "ticker": None,
+                "action_verb": None,
+                "status": None,
+                "expected_interval_s": expected,
+                "market_open": market_open,
+            })
+
+        ts_str = row.get("timestamp")
+        secs: float | None = None
+        age_str: str | None = None
+        try:
+            if ts_str:
+                ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                secs = max(0.0, (now_utc - ts).total_seconds())
+                age_str = _humanize(secs)
+        except (TypeError, ValueError):
+            secs = None
+            age_str = None
+
+        action_taken = row.get("action_taken") or ""
+        verb = _reporter._decision_action_verb(action_taken)
+        ticker: str | None = None
+        status: str | None = None
+        head = action_taken.split("→", 1)
+        if len(head) == 2:
+            status = head[1].strip() or None
+            verb_seg = head[0].strip().split()
+            if len(verb_seg) >= 2:
+                ticker = verb_seg[1].upper() or None
+            elif len(verb_seg) == 1 and verb_seg[0]:
+                ticker = None
+
+        if secs is None:
+            verdict = "STALE"
+            headline = (
+                f"Real-decision row present but timestamp is unparseable "
+                f"({ts_str!r}); treating as STALE.")
+        elif secs > STALLED_MULT * expected:
+            verdict = "STALE"
+            headline = (
+                f"STALE — last real decision was {age_str} ago, past the "
+                f"{_humanize(STALLED_MULT * expected)} cadence-stall "
+                f"threshold. The loop may still be cycling but the engine "
+                f"is not actually deciding.")
+        elif secs > LAGGING_MULT * expected:
+            verdict = "DELAYED"
+            headline = (
+                f"DELAYED — last real decision was {age_str} ago, past the "
+                f"{_humanize(LAGGING_MULT * expected)} normal cadence. The "
+                f"engine is still active but slower than expected.")
+        else:
+            verdict = "FRESH"
+            headline = (
+                f"FRESH — last real decision was {age_str} ago, within the "
+                f"{_humanize(expected)} expected cadence.")
+
+        return jsonify({
+            "as_of": now_utc.isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "verdict": verdict,
+            "headline": headline,
+            "row": row,
+            "secs_since": round(secs, 1) if secs is not None else None,
+            "age": age_str,
+            "ticker": ticker,
+            "action_verb": verb,
+            "status": status,
+            "expected_interval_s": expected,
+            "market_open": market_open,
+            "lagging_mult": LAGGING_MULT,
+            "stalled_mult": STALLED_MULT,
+        })
+    except Exception as e:
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "verdict": "ERROR",
+            "headline": f"endpoint error: {e}",
+            "row": None,
+        }), 500
+
+
 @app.route("/api/runner-heartbeat")
 @swr_cached("runner-heartbeat", 20.0)
 def runner_heartbeat_api():
