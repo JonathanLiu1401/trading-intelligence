@@ -89,8 +89,14 @@ def _cluster(rows: list[tuple]) -> list[list[tuple]]:
 # --- main -----------------------------------------------------------------
 
 def compute() -> dict:
-    # Open read-only immutable to avoid WAL lock contention (mirrors score_drift_detector).
-    conn = sqlite3.connect(f"file:{DB}?mode=ro&immutable=1", uri=True)
+    # Plain ``mode=ro`` (no ``immutable=1``): the immutable flag promises
+    # SQLite the file will never change, which on the actively-written
+    # production ``articles.db`` causes intermittent "database disk image is
+    # malformed" errors (commit ``cdd8d4a`` fixed the same hazard in
+    # score_drift_detector / source_score_drift; this script was missed).
+    # ``mode=ro`` alone gives the read-only guarantee without the malformed-DB
+    # risk.
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=15)
     try:
         raw = conn.execute(
             "SELECT id, source, title, urgency, first_seen "
