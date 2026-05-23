@@ -432,6 +432,118 @@ def test_alert_and_briefing_gates_agree_on_six_live_titles():
         )
 
 
+def test_briefing_gate_catches_drift_patterns():
+    """Lockstep-drift regression test. Until this fix the briefing
+    ``_BRIEFING_RECAP_TEMPLATE_PATTERNS`` tuple was 7 patterns smaller than the
+    alert ``_RECAP_TEMPLATE_PATTERNS`` tuple AND its earnings-call regex was
+    stricter (year + literal "call" REQUIRED) than the alert side (both made
+    optional after live 2026-05-20 evidence). A 7-day live audit found
+    hundreds of rows reaching ml_score 8+ that the urgency_scorer pre-floored
+    for the alert path but whose ml_score still let them surface as briefing
+    TOP SIGNALS via COALESCE(ai_score, ml_score). Re-introducing the drift
+    will fail this test on each missing fingerprint.
+
+    The titles below are LIVE evidence rows that exhibited the drift symptom
+    (multi-figure ml_score with ai_score floored to 0.01)."""
+    drift_cases = [
+        # why_just_moved — Motley Fool variant
+        ("Why Micron Stock Just Popped Again", "why_just_moved"),
+        ("Why Constellation Energy Stock Just Popped", "why_just_moved"),
+        # why_is_pct_since — Zacks/MSN variant
+        ("Why Is AGNC Investment (AGNC) Down 7.2% Since Last Earnings Report?",
+         "why_is_pct_since"),
+        ("Why is Grocery Outlet (GO) up 13.9% since last earnings report?",
+         "why_is_pct_since"),
+        # why_stock_is_after — Barron's/MSN post-event explainer
+        ("Why Nvidia Stock Is Barely Moving After Earnings Crushed Expectations",
+         "why_stock_is_after"),
+        # why_pct_after — Zacks/StockStory variant without "Stock"
+        ("Why AXT (AXTI) Is Down 14.2% After Betting Big On AI-Focused "
+         "Indium Phosphide Expansion", "why_pct_after"),
+        ("Why Tower Semiconductor (TSEM) Is Up 29.8% After $1.3 Billion "
+         "Silicon Photonics Deals", "why_pct_after"),
+        # earnings_tomorrow_preview — FinancialContent/StockStory SEO mill
+        ("NVIDIA Reports Earnings Tomorrow: What To Expect",
+         "earnings_tomorrow_preview"),
+        ("Rumble (RUM) Reports Earnings Tomorrow: What To Expect",
+         "earnings_tomorrow_preview"),
+        # todays_movers_list — Barron's daily column (curly + ASCII apostrophe)
+        ("These Stocks Are Today's Movers: Nvidia, Micron, Intel, Meta",
+         "todays_movers_list"),
+        ("These Stocks Are Today’s Movers: Intel, Boeing, Cerebras",
+         "todays_movers_list"),
+        # is_buy_after — Motley Fool/TipRanks/Yahoo post-event valuation
+        ("Is Nvidia a Buy After Their Latest Earnings Report?", "is_buy_after"),
+        ("Is Brookfield Corp a Buy After Their Latest Earnings Report?",
+         "is_buy_after"),
+        # earnings_call_recap relaxed: year + "call" both optional
+        ("NVIDIA Q1 Earnings Call Highlights", "earnings_call_recap"),
+        ("Nvidia (NVDA) Q1 2027 Earnings Transcript - The Globe and Mail",
+         "earnings_call_recap"),
+    ]
+    for title, expected in drift_cases:
+        hit, name = _looks_like_recap_template({"title": title})
+        assert hit, f"briefing drift — {title!r} not caught"
+        assert name == expected, (
+            f"briefing drift — {title!r}: expected fingerprint "
+            f"{expected!r}, got {name!r}"
+        )
+
+
+def test_briefing_drift_patterns_preserve_must_survive_corpus():
+    """The 7 added patterns + the relaxed earnings_call regex must NOT
+    catch forward-looking previews, real ongoing-move analysis, or the
+    macro/wire breaking headlines the analyst's primary product needs.
+    Mirrors the alert-side ``test_*_does_not_over_catch`` discipline.
+    """
+    must_survive = [
+        # forward-looking previews
+        "Nvidia Q1 earnings preview: all eyes on data center",
+        "Q3 2026 earnings preview",
+        "Nvidia Q1 earnings preview",
+        "MU Q2 earnings ahead of print",
+        # real ongoing-move analysis (no % + since/after trio)
+        "Why is the rally fading?",
+        "Why investors are bullish on Nvidia",
+        "Why MU beat Q3 estimates",
+        # forward-looking valuation (Before, not After)
+        "Is NVDA a Buy Before Earnings?",
+        "Is AMD a Buy",
+        # forward-looking question with "could/may/might"
+        "Why X stock could rise after earnings",
+        "Why NVDA Stock Could Rise 10% After Q1",
+        # real breaking with "tomorrow" but no SEO suffix
+        "Nvidia Earnings Today: Wall Street Expects EPS to Jump",
+        # mid-sentence "today's high"
+        "Tesla hits today's high",
+        # earnings preview NOT recap
+        "Nvidia Earnings Are Hours Away. Here Are 3 Things to Watch",
+    ]
+    for title in must_survive:
+        hit, name = _looks_like_recap_template({"title": title})
+        assert not hit, (
+            f"briefing gate over-caught must-survive {title!r} "
+            f"with fingerprint {name!r}"
+        )
+
+
+def test_alert_and_briefing_recap_tuples_have_same_length():
+    """Hard structural anti-drift check: the alert and briefing recap-template
+    tuples must have the same length. A new pattern added to one but not the
+    other (the exact failure class this test catches) makes the lengths
+    diverge. Names need not be byte-identical (each layer's lockstep mirror
+    is allowed local naming) but a length mismatch always means a pattern is
+    missing on one side."""
+    from watchers.alert_agent import _RECAP_TEMPLATE_PATTERNS
+    from analysis.claude_analyst import _BRIEFING_RECAP_TEMPLATE_PATTERNS
+    assert len(_BRIEFING_RECAP_TEMPLATE_PATTERNS) == len(_RECAP_TEMPLATE_PATTERNS), (
+        f"recap-template tuple length drift: alert has "
+        f"{len(_RECAP_TEMPLATE_PATTERNS)} patterns, briefing has "
+        f"{len(_BRIEFING_RECAP_TEMPLATE_PATTERNS)} — at least one pattern is "
+        f"missing on one side"
+    )
+
+
 def test_alert_and_briefing_gates_agree_on_must_survive_corpus():
     """Symmetric anti-drift check: any real breaking headline the alert path
     survives MUST also survive the briefing gate. A briefing-side false-
