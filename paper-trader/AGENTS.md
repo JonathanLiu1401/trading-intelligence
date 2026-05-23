@@ -6,6 +6,93 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 — Agent 1 (paper-trader core) HYBRID review pass #3
+
+### Phase 1: Debug — 0 bugs fixed
+
+Read the seven core files in full (`runner`, `reporter`, `signals`,
+`strategy`, the dashboard surface, `market`, `store`) plus tail of
+`AGENTS.md`. Ran the core test slice — 848 tests green. After 30+
+prior review passes the marginal core bug is genuinely exhausted; no
+defect found that wouldn't either (a) duplicate an existing
+suppressed-by-design behaviour, or (b) require inventing a hypothetical
+edge case to trigger. Per the per-commit guard, no Phase-1 commit
+(`bugs_fixed=0`).
+
+### Phase 2: Feature — `send_quota_recovered_alert(elapsed_s)`
+
+Closed a real asymmetry: the breaker FIRED→CLEARED bracket carries
+the elapsed wedge duration via `send_breaker_cleared_alert(elapsed_s)`,
+but the orthogonal quota EXHAUSTED→RECOVERED bracket historically
+shipped the bare inline `_send("✅ **CLAUDE QUOTA RECOVERED** ◈ decision
+engine responding again — live trader resumed")` with NO duration
+anchor. A trader pulled away from Discord during a multi-hour quota
+outage woke up to the recovery ping with no answer to "how long was
+the bot dark?".
+
+- `reporter.send_quota_recovered_alert(*, elapsed_s)` mirrors
+  `send_breaker_cleared_alert` exactly: renders
+  `"after ~1h15m dark"` via `_format_elapsed` for a real elapsed,
+  degrades to the byte-compatible bare literal when `elapsed_s` is
+  None / negative (the wall-clock step-back hazard the
+  `_format_elapsed` contract already covers).
+- `runner._quota_first_ts` companions `_no_decision_first_ts` one
+  dimension over: anchored on the FIRST quota cycle (the quota arm
+  just reset `_no_decision_first_ts`), held until the outage clears,
+  reset to None only on a confirmed-send recovery so a transient
+  openclaw blip leaves BOTH the latch AND the anchor armed for the
+  next-cycle retry — matching the breaker recovery's symmetric retry
+  semantics exactly.
+- 6 new `TestSendQuotaRecoveredAlert` cases + 6 new
+  `TestQuotaOutageRecovery` cases pin the body formatting, the
+  first-cycle anchor, the no-re-anchor invariant, the
+  clear-on-success contract, the failed-recovery retry semantics, and
+  the "anchor missing still alerts" fallback. Full core suite green
+  (848 tests).
+
+Commit `c05a713`.
+
+### Phase 3: Live validation findings (live trader ~13:46 UTC)
+
+1. **HOST_SATURATED — 14 concurrent Opus, 100% NO_DECISION over the
+   last 120 cycles.** `/api/host-guard`: load5 14.92, swap 77.7%,
+   `mem_available_mb` 5441. `/api/runner-heartbeat`:
+   `IDLE_STORM ◈ verdict=IDLE_STORM`, dominant cause `host_saturated`,
+   `restart_helps=False`. The documented #1 pathology; this very
+   HYBRID pass is contributing to the load alongside the sibling
+   Agent 2 (ML+backtests) HYBRID run. Not a code bug.
+2. **NVDA concentration HIGH (65.4%).** `/api/risk`
+   `concentration_severity=HIGH`, single-name stock book over the
+   60% threshold; position −$24.55 unrealized (−2.49%), book
+   $987.39. Real exposure the trader sees on every risk_mirror block.
+3. **Runner `stale: true` by 3 commits.** `/api/healthz`
+   `boot_sha=8590322`, `head_sha=c05a713`, `behind=3`. The
+   git-watcher restart will fire onto this pass's commit at the next
+   cycle boundary; the runner is currently still cycling (decisions
+   landing every ~30 min). Expected deferred-restart behaviour.
+4. **`paper-trader.service` systemd unit restart-looping.**
+   `journalctl --user-unit paper-trader` shows the unit hitting
+   `status=1/FAILURE` every ~17s because the manual singleton-locked
+   instance is the legitimate runner — the unit can't acquire the
+   flock and exits cleanly. Documented cosmetic noise per
+   `pt-systemd-vs-manual-restart-spam` memory; not a fresh bug.
+
+`/api/source-edge` SWR-warming under the storm — degraded read, not
+broken. No quick safe Phase-3 fix — all four findings are operational
+state or known cosmetic conditions, not code defects.
+
+### Test commands
+
+```
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/ -v                                      # full (~25min under load)
+python3 -m pytest tests/test_core_*.py -q                        # core slice (848 tests)
+python3 -m pytest tests/test_core_reporter.py -q -k QuotaRecover # this pass's reporter (6 tests)
+python3 -m pytest tests/test_core_runner_cycle.py -q -k QuotaOutage # this pass's runner (6 tests)
+```
+
+---
+
 ## 2026-05-23 feature-dev (Agent 4) — `/api/frozen-mark-execution-skill` + `/api/closed-market-fill-skill`
 
 **Phase 1 — live exploration (user_findings: 3)**
