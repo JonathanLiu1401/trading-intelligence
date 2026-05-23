@@ -5,6 +5,59 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-23 feature pass (Agent 4) — chat enrichment for inverse-pair-conflict + watchlist-news-silence
+
+Wires two new paper-trader analytics into the analyst chat following
+the established pure-helper SSOT pattern (cf.
+`_persona_book_fit_chat_lines`, `_decision_paralysis_chat_lines`).
+
+`_inverse_pair_conflict_chat_lines` renders paper-trader's
+`/api/inverse-pair-conflict-skill` — the leveraged-long + leveraged-
+inverse carry-waste detector (TQQQ+SQQQ, SOXL+SOXS, SPXL+SPXS,
+FNGU+FNGD, TECL+TECS, TNA+TZA). The structural risk surface every
+existing block missed: etf-lookthrough reports the NET single-name
+outcome but not the carry-waste fact; correlation-cluster-warning
+flags POSITIVELY-correlated clusters and lets the negatively-
+correlated TQQQ/SQQQ pair through; regime-leverage-fit reads "high
+leveraged %" without distinguishing a paired book from a clean
+one-sided bet. Fires ONLY on `CARRY_WASTE`; `CLEAN` / `NO_BOOK` /
+`OPPOSING_UNLEVERED` collapse to silence (the silence precedent —
+never chat filler).
+
+`_watchlist_news_silence_chat_lines` renders paper-trader's
+`/api/watchlist-news-silence-skill` — the per-WATCHLIST-ticker
+live-news coverage map. Of the ~47 tickers Opus may pick from each
+cycle, how many had ZERO live articles in the last 24h and which are
+mention-storming? Complements digital-intern's own
+`/api/held-news-silence` (held-only) by surfacing the UNIVERSE blind
+spot every other surface ignores. Fires ONLY on `BLIND_UNIVERSE` /
+`SPARSE_COVERAGE`; `WELL_COVERED` / `NO_DATA` collapse to silence.
+
+Both helpers follow the SSOT pattern (paper-trader invariant #10):
+the builder's own `headline` carries verbatim; detail lines restate
+the builder's own fields without re-derivation. Guarded 3s
+sub-fetches; appears once `:8090` restarts onto the new endpoints.
+
+Locked by `tests/test_chat_inverse_pair_conflict_enrichment.py` (15
+tests) + `tests/test_chat_watchlist_news_silence_enrichment.py` (16
+tests). All 31 green; broader chat-enrichment regression suite (73
+tests covering the new pair + adjacent neighbours
+`_persona_book_fit_chat_lines`, `_cash_redeployment_chat_lines`) also
+passes.
+
+**Live validation (6h window).** `/api/watchlist-news-silence-skill`
+on the current trader corpus: `BLIND_UNIVERSE — 39/48 silent (81%)`;
+storms = NVDA, MU. This is real, actionable intelligence the
+existing surfaces did not carry — Opus is being asked to choose
+between NVDA (mention storm) and ~39 other watchlist names with
+zero news flow, and the prompt makes them look equally available.
+
+**Counters:** `bugs_fixed=0`, `features_added=2` (the two chat
+enrichment helpers + prompt wiring), `user_findings=1` (live
+BLIND_UNIVERSE on 81% of the watchlist).
+
+---
+
 ## 2026-05-23 hybrid pass #8 (Agent 3) — hourly urgency reaper + urgent_backlog_aging analytics
 
 Debugger + feature-dev + news-analyst pass. Two commits on master.

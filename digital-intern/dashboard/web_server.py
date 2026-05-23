@@ -1029,6 +1029,141 @@ def _persona_book_fit_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _inverse_pair_conflict_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/inverse-pair-conflict-skill` (leveraged
+    long + leveraged inverse of the same underlying family simultaneously
+    held — the carry-waste pathology) as compact chat-context lines.
+
+    Why this block exists. The watchlist is leveraged-ETF heavy
+    (TQQQ/SQQQ, SOXL/SOXS, SPXL/SPXS, FNGU/FNGD, TECL/TECS) and Opus has
+    full sizing autonomy. When the bot opens both sides of the same
+    underlying the directional exposure largely cancels but the book
+    keeps paying leverage decay on BOTH sleeves. Every other risk block
+    misses this:
+    - regime-leverage-fit reads "high leveraged %" without distinguishing
+      paired vs one-sided
+    - etf-lookthrough reports the net single-name outcome, not the carry
+      waste fact
+    - sector-exposure puts both into the same ``broad_lev`` bucket
+    - correlation-cluster-warning flags positively-correlated clusters
+      and lets the negatively-correlated TQQQ/SQQQ pair through
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+    the chat headline; the worst-family `family_label` and dollar
+    cancellation magnitudes pass through verbatim — no chat-side
+    re-derived verdict.
+
+    Pure / total — exactly the ``_decision_paralysis_chat_lines`` contract:
+
+    - non-dict → ``[]``
+    - non-actionable verdicts (``NO_BOOK`` / ``CLEAN`` /
+      ``OPPOSING_UNLEVERED``) → ``[]``. OPPOSING_UNLEVERED is silenced
+      because a 1x core + leveraged inverse pays only ONE decay tab —
+      operationally distinct from the both-sides-burn CARRY_WASTE case
+      and not worth the chat slot. Only CARRY_WASTE is loud.
+    - ``CARRY_WASTE`` → builder's verbatim ``headline`` + one detail line
+      restating the builder's own per-family fields (``cancelled_delta_usd``,
+      ``daily_drag_estimate_usd``, ``severity``).
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") != "CARRY_WASTE":
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)              # verbatim SSOT — invariant #10
+
+    conflicts = rep.get("conflicts")
+    if isinstance(conflicts, list):
+        # Surface the worst CARRY_WASTE conflict (already sorted by
+        # cancelled_delta_usd DESC inside the builder, so the first
+        # CARRY_WASTE in the list is the worst). Restate fields verbatim.
+        worst = next(
+            (c for c in conflicts
+             if isinstance(c, dict)
+             and c.get("classification") == "CARRY_WASTE"),
+            None,
+        )
+        if worst is not None:
+            detail = []
+            cancelled = worst.get("cancelled_delta_usd")
+            if isinstance(cancelled, (int, float)) and not isinstance(cancelled, bool):
+                detail.append(f"cancelled Δ ${cancelled:g}")
+            drag = worst.get("daily_drag_estimate_usd")
+            if isinstance(drag, (int, float)) and not isinstance(drag, bool):
+                detail.append(f"~${drag:g}/day drag")
+            sev = worst.get("severity")
+            if isinstance(sev, str) and sev:
+                detail.append(f"severity {sev}")
+            if detail:
+                lines.append("  " + " | ".join(detail))
+
+    return lines
+
+
+def _watchlist_news_silence_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/watchlist-news-silence-skill` (per-
+    WATCHLIST-ticker live-news coverage map; how many of the ~47 names
+    Opus can choose from had zero recent news flow) as compact chat-
+    context lines.
+
+    Why this block exists. The chat already carries the held-news-silence
+    block (digital-intern's own /api/held-news-silence), but the trader's
+    UNIVERSE is far bigger than the book — and a silent-universe blind
+    spot is the structural pathology behind a stretch of stale decisions:
+    Opus is being asked to choose between AMD (38 articles, max_score 8.5)
+    and AMAT (zero articles) and the prompt makes them look equally
+    available. This is the chat-side mirror of the universe-coverage gap.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+    the chat headline. The silent_tickers + hot_storms sub-lists pass
+    through verbatim (cap-respected).
+
+    Pure / total — exactly the ``_decision_paralysis_chat_lines`` contract:
+
+    - non-dict → ``[]``
+    - non-actionable verdicts (``WELL_COVERED`` / ``NO_DATA``) → ``[]``.
+      Healthy or insufficient — never chat filler.
+    - ``BLIND_UNIVERSE`` / ``SPARSE_COVERAGE`` → builder's verbatim
+      ``headline`` + one detail line listing the top silent tickers and
+      the top hot-storm tickers (so the analyst can see WHICH names are
+      dark vs WHICH names are over-flooded).
+    """
+    if not isinstance(rep, dict):
+        return []
+    actionable = {"BLIND_UNIVERSE", "SPARSE_COVERAGE"}
+    if rep.get("verdict") not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)              # verbatim SSOT — invariant #10
+
+    detail = []
+    silent = rep.get("silent_tickers")
+    if isinstance(silent, list) and silent:
+        # Cap at 8 inline so the chat line stays readable. The builder
+        # already capped at 10; we slice to 8 here for line length.
+        sample = [t for t in silent if isinstance(t, str)][:8]
+        if sample:
+            detail.append("silent: " + ", ".join(sample))
+    storms = rep.get("hot_storms")
+    if isinstance(storms, list) and storms:
+        names = [
+            s.get("ticker") for s in storms
+            if isinstance(s, dict) and isinstance(s.get("ticker"), str)
+        ][:3]
+        if names:
+            detail.append("storms: " + ", ".join(names))
+    if detail:
+        lines.append("  " + " | ".join(detail))
+
+    return lines
+
+
 def _cash_redeployment_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/cash-redeployment-latency-skill` (post-SELL
     cash-to-next-BUY latency distribution; the sold-then-sat pathology) as
@@ -5125,6 +5260,51 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: persona-book-fit fetch failed: %s", e)
 
+        # Inverse-pair-conflict — the leveraged carry-waste structural
+        # block. When the bot holds TQQQ AND SQQQ simultaneously the
+        # directional exposure cancels but both sleeves keep paying
+        # leverage decay (etf-lookthrough reports the net outcome but
+        # not the carry-waste fact; correlation-cluster catches positive
+        # correlation only). Fires ONLY on CARRY_WASTE; CLEAN / NO_BOOK
+        # / OPPOSING_UNLEVERED collapse to silence (the silence
+        # precedent — never chat filler when the book is one-sided).
+        # Headline + worst-family details carry verbatim. Only appears
+        # once :8090 restarts onto /api/inverse-pair-conflict-skill.
+        inverse_pair_conflict_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/inverse-pair-conflict-skill",
+                    timeout=3) as resp:
+                _ipc = json.loads(resp.read().decode("utf-8"))
+            inverse_pair_conflict_block = "\n".join(
+                _inverse_pair_conflict_chat_lines(_ipc))
+        except Exception as e:
+            _logger().warning(
+                "chat: inverse-pair-conflict fetch failed: %s", e)
+
+        # Watchlist news silence — the universe-blind-spot block. Of the
+        # ~47 tickers Opus may choose from, how many had ZERO live
+        # articles in the last 24h, and which are mention-storming?
+        # Complements digital-intern's own /api/held-news-silence
+        # (held-only) by surfacing the UNIVERSE-wide coverage map. Fires
+        # ONLY on BLIND_UNIVERSE / SPARSE_COVERAGE; WELL_COVERED /
+        # NO_DATA collapse to silence. Headline + silent / hot lists
+        # carry verbatim. Only appears once :8090 restarts onto
+        # /api/watchlist-news-silence-skill.
+        watchlist_news_silence_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/watchlist-news-silence-skill",
+                    timeout=3) as resp:
+                _wns = json.loads(resp.read().decode("utf-8"))
+            watchlist_news_silence_block = "\n".join(
+                _watchlist_news_silence_chat_lines(_wns))
+        except Exception as e:
+            _logger().warning(
+                "chat: watchlist-news-silence fetch failed: %s", e)
+
         # Post-SELL cash-redeployment latency — the sold-then-sat pathology.
         # /api/risk reports cash_pct as a *snapshot*, but a book that sells
         # into a thesis weakening then sits for 5 days has the same headline
@@ -5549,6 +5729,8 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — EVENT READINESS (will the live trader actually be able to react before the next earnings print? Joins earnings-risk + decision-velocity + Claude-empty rate + the *current* NO_DECISION streak into a single per-event verdict — surfaced ONLY when BLIND / DEGRADED / IMMINENT_OVERDUE, never as filler when the pipeline is healthy. Recommended_action carries verbatim from the trader endpoint — restate, never re-derive):\n{event_readiness_block}\n\n" if event_readiness_block else "")
             + (f"PAPER TRADER — DECISION PARALYSIS (consecutive HOLD-only / NO_DECISION runs on the live decision loop — a stacked HOLD_LOCK block reads HEALTHY on runner-heartbeat and decision-health 24h aggregate but means Opus decided every cycle and never moved the book. Surfaced ONLY when HOLD_LOCK / IDLE_STORM / PASSIVE_LOOP, never filler when ACTIVE. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{decision_paralysis_block}\n\n" if decision_paralysis_block else "")
             + (f"PAPER TRADER — PERSONA-BOOK FIT (does the live book's weight distribution mirror a backtest-persona rated DRAG by the persona-leaderboard? Every other block analyses position-by-position fitness; none surface the whole-book archetype-overlap angle. A book that mirrors a known underperforming persona is structurally adding variance, not alpha, regardless of how reasonable each individual trade looked at entry. Surfaced ONLY when ALIGNED_DRAG, never filler when ALIGNED_EDGE / ALIGNED_FLAT / NO_BOOK / WEAK_OVERLAP / INSUFFICIENT_PERSONA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{persona_book_fit_block}\n\n" if persona_book_fit_block else "")
+            + (f"PAPER TRADER — INVERSE-PAIR CONFLICT (leveraged-long + leveraged-inverse ETFs of the same underlying family simultaneously held — TQQQ+SQQQ, SOXL+SOXS, SPXL+SPXS, FNGU+FNGD, TECL+TECS. Directional exposure largely cancels but both sleeves keep paying leverage decay every single day. etf-lookthrough reports the net single-name outcome but not the carry-waste fact; correlation-cluster-warning flags positively-correlated clusters and lets the negatively-correlated pair through; regime-leverage-fit reads 'high leveraged %' without distinguishing a paired book from a clean one-sided bet. Surfaced ONLY when CARRY_WASTE, never filler when CLEAN / NO_BOOK / OPPOSING_UNLEVERED. Headline + worst-family fields carry verbatim from the trader endpoint — restate, never re-derive):\n{inverse_pair_conflict_block}\n\n" if inverse_pair_conflict_block else "")
+            + (f"PAPER TRADER — WATCHLIST NEWS SILENCE (per-WATCHLIST-ticker live-news coverage map. Of the ~47 tickers Opus is allowed to consider this cycle, how many had ZERO live articles in the last 24h, and which are mention-storming? Complements held-news-silence by surfacing the UNIVERSE blind spot every other panel ignores — a silent name in the prompt looks operationally equivalent to a well-covered one and Opus has no way to know whether silence means 'nothing happened' or 'the collector failed'. Surfaced ONLY when BLIND_UNIVERSE / SPARSE_COVERAGE, never filler when WELL_COVERED / NO_DATA. Headline + silent / hot lists carry verbatim from the trader endpoint — restate, never re-derive):\n{watchlist_news_silence_block}\n\n" if watchlist_news_silence_block else "")
             + (f"PAPER TRADER — CASH REDEPLOYMENT LATENCY (post-SELL cash-to-next-BUY interval distribution — the sold-then-sat pathology. A book that sells then sits for 5 days has the same headline cash% as one that redeploys in 6h, but the desk in question is materially different. Surfaced ONLY when SLOW / STALLED, never filler when FAST_REDEPLOY / STEADY. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{cash_redeployment_block}\n\n" if cash_redeployment_block else "")
             + (f"PAPER TRADER — DECISION VAPOR (per-FILLED-decision structural-quality detector — does the reasoning cite specific numbers + catalysts + tickers, or is Opus writing generic 'strong setup, building position' vapor? A vapor trade that fails has nothing for the next decision to learn from — this is the only block that answers 'is the bot thinking, or rationalising?'. Surfaced ONLY when MIXED / VAPOR_DECISIONS, never filler when SPECIFIC. Headline + any VAPOR sample excerpt carry verbatim from the trader endpoint — restate, never re-derive):\n{decision_vapor_block}\n\n" if decision_vapor_block else "")
             + (f"PAPER TRADER — REGIME-LEVERAGE FIT (book-leverage alignment vs prevailing SPY momentum regime. The watchlist is leveraged-ETF-heavy — the structural question 'are we positioned with or against the regime?' is high-stakes and answered nowhere else in chat. A 0% leveraged book during a bull tape is just as structurally wrong as a 40% leveraged book during a bear. Surfaced ONLY when BLIND_LEVERING / DANGEROUS_HEADWIND / MISSED_TAILWIND, never filler when ALIGNED / DEFENSIVE / NEUTRAL. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{regime_leverage_fit_block}\n\n" if regime_leverage_fit_block else "")
