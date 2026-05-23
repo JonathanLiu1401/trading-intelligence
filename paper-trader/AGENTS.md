@@ -6,6 +6,168 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #15 (Agent 2) — defensive annotation hardening + 5 new univariate baselines
+
+**Phase 1 — bug fixes (bugs_fixed: 2)**
+
+Two defensive fixes in `run_continuous_backtests.py`:
+
+1. **`_opus_annotate.outcome_lookup` direct dict access** (lines
+   2074-2078). Previously used `o["sim_date"]` / `o["ticker"]` /
+   `o["forward_return_5d"]`. Lines 2074-2105 sit OUTSIDE any
+   try/except — a missing key from a future record-shape change
+   KeyError'd out of the background daemon thread, silently dropping
+   the cycle's Opus annotations. The hardened code uses `.get()` with
+   a "all three fields present" guard before insertion. A None lookup
+   was already filtered downstream so the change is purely defensive.
+
+2. **`_llm_annotate_outcomes` format-string crash on `None`** (line 2421).
+   `r.get('forward_return_5d', 0):.1f` only defaults on a MISSING key
+   — an explicit None hits `None:.1f` → TypeError, caught by the outer
+   except, dropping the WHOLE batch's LLM labels. Coerced via `or 0`
+   for display only; the actual record's None forward stays untouched.
+
+Two new test classes: `TestOpusAnnotateOutcomeLookupDefensive` mocks
+the engine + subprocess to exercise the lookup-build phase with
+malformed records; `test_none_forward_return_does_not_raise_or_drop_batch`
+pins the LLM-batch hardening. Both pass and add 2 regression locks
+to the 602-test focused suite. Commit `6c0a33d`.
+
+**Phase 2 — feature (features_added: 1)**
+
+`baseline_compare.BASELINES` was extended from 6 baselines to 11. The
+original (`constant_zero`, `ml_score`, `mom20`, `mom5`, `rsi_meanrev`,
+`neg_bb`) tested only 4 of the 10 numeric features the deployed MLP
+sees. The 5 additions close that gap:
+
+| New baseline | Captures | Univariate gap closed |
+|---|---|---|
+| `macd` | MACD signal-line value | `macd` slot 2 |
+| `vol_ratio_dev` | `|vol_ratio − 1| · sign(mom5)` — breakout-with-momentum | `vol_ratio` slot 6 |
+| `neg_wk52` | `−(wk52_pos − 0.5)` — bubble-top mean-reversion | `wk52_pos` (gate hypothesis from CLAUDE.md §15) |
+| `news_urgency` | Raw article urgency (0..100) | `news_urgency` slot 8 |
+| `news_count` | Article volume | `news_article_count` slot 9 |
+
+Live run on the deployed OOS slice (n=1750) confirmed the gap was real:
+`news_urgency` reads rank-IC +0.063, `news_count` +0.054 (dir_acc 0.67),
+`vol_ratio_dev` −0.100 (mild inversion). None of those features had a
+univariate baseline before — when MLP rank-IC was at noise an operator
+couldn't tell whether the predictive signal lived in an untested feature
+or no feature carried univariate signal at all. The same call also
+locks the deployed MLP at +0.359 rank-IC on the OOS slice — decisively
+above the new best single baseline (`neg_bb` +0.075), so verdict reads
+MLP_ADDS_SKILL. 9 new tests in `TestExtendedBaselines` pin each lambda's
+math + rank-IC sign on deterministic synthetic data; the existing
+26-test suite remains byte-identical. Commit `fe93ee8`.
+
+**Phase 3 — live validation findings (user_findings: 6)**
+
+1. **CRITICAL — LOOP_DEAD.** `python3 -m paper_trader.ml.scorer_freshness`
+   reads `VERDICT: LOOP_DEAD (no continuous cycle in 27.99h (>24.0h) —
+   run_continuous_backtests.py is almost certainly down; last cycle was
+   #1 — the conviction gate is ACTIVE, so trades are being modulated
+   against this frozen model)`. `ps aux` confirms no
+   `run_continuous_backtests.py` process is alive. The live trader IS
+   running (lock file fresh; runner_state.json `last_hourly` ~hours ago).
+2. **Scorer was retrained out-of-band.** Pickle is 1.95h fresh
+   (`n_train=4987`), yet `scorer_skill_log.jsonl` has exactly 1 row
+   (cycle 1, `train_n=3987`). Someone retrained without going through
+   the normal cycle path — no skill-log entry, no opus_annotate, no
+   inject_and_train, no validation cycle. The model is fresh; the
+   ledger isn't.
+3. **Deployed scorer reads WELL_CALIBRATED on the temporal OOS slice.**
+   `python3 -m paper_trader.ml.calibration --oos` returns spearman
+   0.3588, decile error 2.12pp, monotone 0.89 — far stronger than the
+   only logged cycle (oos_ic=0.02). Either the retrain genuinely
+   improved skill, or the cycle's metric methodology differs from
+   `calibration --oos`. Worth a reconciliation pass when the loop
+   restarts.
+4. **scorer_health reads NOISE_GATE_ACTIVE despite the calibrated
+   model.** `gate_realized=GATE_INEFFECTIVE`, `gate_calibration=
+   MISCALIBRATED` (spearman +0.047). Reason: those diagnostics consume
+   the HISTORICAL `gate_scorer_pred` values captured at decision time
+   under older (weaker) scorers. Today's model is good; the historical
+   gate-capture corpus reflects the older models' weaker calls.
+5. **5.2% backtest failure rate.** 26/500 runs in backtest.db are
+   `status='failed'`, concentrated around 2026-05-18 (the loop's last
+   real cycle batch).
+6. **News features carry real univariate signal.** From the Phase 2
+   addition: `news_urgency` rank-IC +0.063, `news_count` +0.054 with
+   dir_acc 0.67 — the highest of any non-MLP baseline. Quant-actionable
+   insight that the deployed MLP is correctly leveraging (its +0.359
+   rank-IC is well above the news features), but the standalone
+   univariate skill is now first-class visible in the baseline_compare
+   diagnostic.
+
+### How the DecisionScorer works (canonical, 2026-05-23)
+
+- **Architecture.** sklearn `MLPRegressor(hidden=(32,16), alpha=1e-2,
+  early_stopping=True, validation_fraction=0.15, n_iter_no_change=25)`.
+  Fallback: numpy weighted least-squares linear model. Persisted to
+  `data/ml/decision_scorer.pkl` atomically (`.pkl.tmp` + `.replace`).
+- **Features (10 numeric + 7 sector one-hot = 17 total).**
+  `ml_score, rsi, macd, mom5, mom20, regime_mult, vol_ratio, bb_pos,
+  news_urgency, news_article_count` + `sector_{tech,energy,financials,
+  healthcare,commodities,crypto,other}`. Defaults for missing inputs
+  are in `build_features` (rsi=50, bb=0, urgency=50, count=1, etc.).
+- **Target.** 5-trading-day forward return (%), clamped to
+  ±`PRED_CLAMP_PCT`=50 at both train and inference. SELL action flips
+  target sign so the model learns one "goodness of THIS action" target.
+- **Output.** `predict()` returns a scalar % (always finite, clamped).
+  `predict_with_meta()` adds `{raw, clamped, off_distribution,
+  percentile, calibrated, failed}` for honesty panels.
+  `predict_calibrated()` and `predict_percentile()` quantile-map raw
+  predictions onto realized-return / training-prediction distributions
+  using 101-point quantile tables persisted in the pickle (legacy
+  pickles without these degrade to `None` gracefully).
+- **Conviction gate** (`backtest._ml_decide`). Only modulates BUY
+  conviction when `is_trained AND n_train >= 500 AND NOT
+  off_distribution`. Arms: `p<-10 ×0.6`, `p<0 ×0.85`, `0..5 unchanged`,
+  `p>5 ×1.15`, `p>10 ×1.3` (capped at 0.95). Never CANCELS a trade.
+
+### How to run backtests + read results
+
+```
+cd /home/zeph/trading-intelligence/paper-trader
+python3 run_backtests.py                    # one-shot 10 parallel year-long runs
+python3 run_continuous_backtests.py         # continuous loop (the LOOP_DEAD note above)
+
+# Diagnostics — all read-only, never train, never touch the trade path:
+python3 -m paper_trader.ml.scorer_freshness     # is the loop alive?
+python3 -m paper_trader.ml.scorer_health        # one-shot is-the-gate-worth-it
+python3 -m paper_trader.ml.calibration --oos    # temporal OOS calibration
+python3 -m paper_trader.ml.baseline_compare     # MLP vs 11 univariate baselines
+python3 -m paper_trader.ml.deploy_audit         # deployed pickle vs MLP_CONFIG
+python3 -m paper_trader.ml.decision_scorer --explain --ticker NVDA ...  # one-prediction attribution
+
+# Inspect backtest.db (no sqlite3 binary on this host):
+python3 -c "import sqlite3;c=sqlite3.connect('file:backtest.db?mode=ro',uri=True);print(*c.execute('SELECT run_id,status,total_return_pct,vs_spy_pct,n_trades FROM backtest_runs ORDER BY run_id DESC LIMIT 10'))"
+```
+
+### Test commands for the ML / backtest domain
+
+```
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/ -v -k "ml or backtest or scorer"             # focused (~6.5min)
+python3 -m pytest tests/test_baseline_compare.py -v                    # this pass's feature (30 tests)
+python3 -m pytest tests/test_ml_backtest_seams.py -v                   # this pass's defensive fixes (8 tests)
+python3 -m pytest tests/test_decision_scorer.py tests/test_scorer_calibrated.py tests/test_scorer_percentile.py -v
+```
+
+### Reaffirmed invariants
+
+- CLAUDE.md §6 invariant #5 — DecisionScorer only gates after
+  `n_train >= 500 AND off_distribution=False`.
+- CLAUDE.md §6 invariant #2 — backtest articles always carry
+  `urgency=0` (never bumped by Opus annotations).
+- The `for/else` retry in `_inject_and_train` is correctly structured:
+  4 attempts, lock-only retries on attempts 0..2, fall-through `else`
+  returns the "locked after 4 attempts" status only when every attempt
+  was a lock (never a real error). Verified by re-reading lines
+  2315-2361 and matching the existing `TestInjectAndTrain*` tests.
+
+---
+
 ## 2026-05-23 — Agent 1 (HYBRID core) — `/api/forced-hold-attribution`
 
 **Phase 1 — bug fix (bugs_fixed: 0)**
