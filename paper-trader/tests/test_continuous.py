@@ -1995,6 +1995,193 @@ class TestAppendCalibratedReliabilityLog:
             outcomes_path=tmp_path / "nope.jsonl") is False
 
 
+class TestAppendConvictionCalibrationLog:
+    """The per-cycle conviction-sizing calibration ledger — answers
+    "does the gate's then-applied ``conviction_pct`` actually predict
+    realized 5d return?" durably and per-cycle. Mirrors the sibling
+    ledgers' discipline (best-effort, honest gap rows, atomic bounded
+    trim, never breaks the loop, SSOT cross-check vs the analyzer)."""
+
+    def test_sizing_dark_row_when_no_conviction_rows(self, tmp_path,
+                                                     monkeypatch):
+        # The pre-2026-05-21 corpus state: every outcome row predates the
+        # ``_parse_conviction_pct`` feature so the analyzer reports n=0
+        # → ``sizing_dark=True``. The ledger MUST still append the row so
+        # the darkness is visible in the trend (mirrors the documented
+        # ``calibrated_dark`` precedent — INSUFFICIENT_DATA does not mean
+        # silent).
+        log = tmp_path / "conviction_calibration_log.jsonl"
+        monkeypatch.setattr(rcb, "CONVICTION_CALIBRATION_LOG", log)
+
+        from paper_trader.ml import conviction_calibration as cc
+
+        def _dark(outcomes_path=None, n_buckets=5):
+            return {
+                "status": "insufficient_data",
+                "verdict": "INSUFFICIENT_DATA",
+                "n": 0, "n_dropped_action": 0, "n_dropped_conviction": 8753,
+                "n_dropped_return": 0, "spearman": None,
+                "mean_conviction": None, "mean_realized": None,
+                "top_minus_bottom_realized_pct": None,
+                "monotone_fraction": None,
+                "buckets": [],
+                "hint": "no BUY rows with conviction_pct",
+            }
+
+        monkeypatch.setattr(cc, "analyze", lambda *a, **k: _dark(*a, **k))
+
+        assert rcb._append_conviction_calibration_log(
+            cycle=12, win_start=date(2020, 1, 2), win_end=date(2025, 1, 2),
+            outcomes_path=tmp_path / "nope.jsonl") is True
+        row = json.loads(log.read_text().strip())
+        assert row["cycle"] == 12
+        assert row["verdict"] == "INSUFFICIENT_DATA"
+        assert row["sizing_dark"] is True
+        assert row["n"] == 0
+        assert row["n_dropped_conviction"] == 8753
+
+    def test_directional_row_persists_spread_and_spearman(self, tmp_path,
+                                                          monkeypatch):
+        # When the gate's sizing rule actually ranks realized returns, the
+        # row carries the numeric spread + spearman so a quant can trend
+        # the magnitude. SSOT cross-check: persisted fields equal what
+        # conviction_calibration.analyze returned.
+        log = tmp_path / "conviction_calibration_log.jsonl"
+        monkeypatch.setattr(rcb, "CONVICTION_CALIBRATION_LOG", log)
+
+        directional = {
+            "status": "ok", "verdict": "DIRECTIONAL",
+            "n": 600, "n_dropped_action": 1200, "n_dropped_conviction": 0,
+            "n_dropped_return": 0, "spearman": 0.083,
+            "mean_conviction": 0.18, "mean_realized": 1.5,
+            "top_minus_bottom_realized_pct": 1.7,
+            "monotone_fraction": 0.75,
+            "buckets": [],
+            "hint": "some rank skill on sizing",
+        }
+        from paper_trader.ml import conviction_calibration as cc
+        monkeypatch.setattr(cc, "analyze", lambda *a, **k: dict(directional))
+
+        rcb._append_conviction_calibration_log(
+            cycle=22, win_start=date(2018, 6, 1), win_end=date(2023, 6, 1),
+            outcomes_path=tmp_path / "outcomes.jsonl")
+        row = json.loads(log.read_text().strip())
+        assert row["verdict"] == "DIRECTIONAL"
+        assert row["sizing_dark"] is False
+        # SSOT cross-checks
+        assert row["spearman"] == 0.083
+        assert row["top_minus_bottom_realized_pct"] == 1.7
+        assert row["mean_conviction"] == 0.18
+        assert row["monotone_fraction"] == 0.75
+        assert row["n"] == 600
+
+    def test_miscalibrated_row_matches_current_live_state(self, tmp_path,
+                                                          monkeypatch):
+        # Lock the current production verdict's persisted shape. The CLI
+        # on the live 1173-row OOS slice reports:
+        #   VERDICT: MISCALIBRATED  spearman=+0.011  top-bot=-0.15pp
+        # The row should faithfully record that miscalibration so the
+        # moment the gate starts to work (or worsens further) is visible.
+        log = tmp_path / "conviction_calibration_log.jsonl"
+        monkeypatch.setattr(rcb, "CONVICTION_CALIBRATION_LOG", log)
+
+        live_like = {
+            "status": "ok", "verdict": "MISCALIBRATED",
+            "n": 1173, "n_dropped_action": 1548,
+            "n_dropped_conviction": 6032, "n_dropped_return": 0,
+            "spearman": 0.011, "mean_conviction": 0.156,
+            "mean_realized": 0.65,
+            "top_minus_bottom_realized_pct": -0.15,
+            "monotone_fraction": 0.50,
+            "buckets": [],
+            "hint": "GATE_INEFFECTIVE",
+        }
+        from paper_trader.ml import conviction_calibration as cc
+        monkeypatch.setattr(cc, "analyze", lambda *a, **k: dict(live_like))
+
+        rcb._append_conviction_calibration_log(
+            cycle=99, win_start=date(2019, 1, 2), win_end=date(2024, 1, 2),
+            outcomes_path=tmp_path / "outcomes.jsonl")
+        row = json.loads(log.read_text().strip())
+        assert row["verdict"] == "MISCALIBRATED"
+        assert row["sizing_dark"] is False
+        assert row["n"] == 1173
+        assert row["spearman"] == 0.011
+        # Negative spread is the explicit anti-edge signal.
+        assert row["top_minus_bottom_realized_pct"] == -0.15
+
+    def test_analyze_exception_degrades_to_honest_error_row(self, tmp_path,
+                                                             monkeypatch):
+        log = tmp_path / "conviction_calibration_log.jsonl"
+        monkeypatch.setattr(rcb, "CONVICTION_CALIBRATION_LOG", log)
+
+        def _boom(*a, **k):
+            raise RuntimeError("simulated conviction_calibration failure")
+
+        from paper_trader.ml import conviction_calibration as cc
+        monkeypatch.setattr(cc, "analyze", _boom)
+
+        assert rcb._append_conviction_calibration_log(
+            cycle=55, win_start=date(2012, 1, 3), win_end=date(2013, 1, 3),
+            outcomes_path=tmp_path / "missing.jsonl") is True
+        row = json.loads(log.read_text().strip())
+        assert row["status"] == "error"
+        assert row["verdict"] == "INSUFFICIENT_DATA"
+        assert row["sizing_dark"] is True
+        assert row["cycle"] == 55
+
+    def test_bounded_trim_rewrites_when_past_2x_keep(self, tmp_path,
+                                                     monkeypatch):
+        log = tmp_path / "conviction_calibration_log.jsonl"
+        monkeypatch.setattr(rcb, "CONVICTION_CALIBRATION_LOG", log)
+        monkeypatch.setattr(rcb, "CONVICTION_CALIBRATION_LOG_KEEP", 4)
+        # 9 pre-seeded rows (> 2×4) ⇒ next append triggers a rewrite.
+        log.write_text("\n".join(json.dumps({"cycle": i}) for i in range(9))
+                       + "\n")
+        from paper_trader.ml import conviction_calibration as cc
+        monkeypatch.setattr(cc, "analyze",
+                            lambda *a, **k: {"status": "insufficient_data",
+                                             "verdict": "INSUFFICIENT_DATA",
+                                             "n": 0})
+
+        rcb._append_conviction_calibration_log(
+            cycle=77, win_start=date(2012, 1, 3), win_end=date(2013, 1, 3),
+            outcomes_path=tmp_path / "nope.jsonl")
+        lines = [l for l in log.read_text().splitlines() if l.strip()]
+        assert len(lines) == 4
+        assert json.loads(lines[-1])["cycle"] == 77
+
+    def test_directory_created_when_missing(self, tmp_path, monkeypatch):
+        log = (tmp_path / "nested" / "deep"
+               / "conviction_calibration_log.jsonl")
+        monkeypatch.setattr(rcb, "CONVICTION_CALIBRATION_LOG", log)
+
+        from paper_trader.ml import conviction_calibration as cc
+        monkeypatch.setattr(cc, "analyze",
+                            lambda *a, **k: {"status": "insufficient_data",
+                                             "verdict": "INSUFFICIENT_DATA",
+                                             "n": 0})
+
+        assert rcb._append_conviction_calibration_log(
+            cycle=1, win_start=date(2020, 1, 1), win_end=date(2020, 6, 1),
+            outcomes_path=tmp_path / "nope.jsonl") is True
+        assert log.exists()
+
+    def test_never_raises_on_unwritable_path(self, tmp_path, monkeypatch):
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x")
+        monkeypatch.setattr(rcb, "CONVICTION_CALIBRATION_LOG",
+                            blocker / "sub" / "cc.jsonl")
+        from paper_trader.ml import conviction_calibration as cc
+        monkeypatch.setattr(cc, "analyze",
+                            lambda *a, **k: {"status": "insufficient_data",
+                                             "verdict": "INSUFFICIENT_DATA",
+                                             "n": 0})
+        assert rcb._append_conviction_calibration_log(
+            1, date(2000, 1, 3), date(2001, 1, 3),
+            outcomes_path=tmp_path / "nope.jsonl") is False
+
+
 # ──────────────── winner_training.jsonl bounded trim ────────────
 
 class TestTrimWinnerJsonl:
@@ -2089,6 +2276,18 @@ class TestCycleWiringRegression:
         import inspect
         src = inspect.getsource(rcb.main)
         assert "_append_calibrated_reliability_log(" in src
+
+    def test_main_invokes_conviction_calibration_ledger(self):
+        # The conviction-sizing calibration ledger surfaces whether the
+        # gate's then-applied ``conviction_pct`` (the economic weight of
+        # each bet) actually predicts realized 5d return. CLI-only until
+        # this wiring; lock the call so a future refactor cannot silently
+        # re-orphan it. The CLI's current verdict is MISCALIBRATED — a
+        # quant cannot trend that improving or worsening without the
+        # durable per-cycle row.
+        import inspect
+        src = inspect.getsource(rcb.main)
+        assert "_append_conviction_calibration_log(" in src
 
     def test_main_reaps_orphans_per_cycle_not_only_at_startup(self):
         # Live finding: 15 rows stuck 'running' for 35h because the reaper
