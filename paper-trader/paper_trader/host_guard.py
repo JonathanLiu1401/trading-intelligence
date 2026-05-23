@@ -372,6 +372,147 @@ def recent_starvation_rate(db_path: str | os.PathLike | None = None,
     return out
 
 
+# Minimum sample size per half before a trend verdict is published. With
+# fewer than this, a 1-cycle blip would dominate either half and produce
+# noise verdicts. The aggregate functions still return their counts; only
+# the verdict text is suppressed.
+_TREND_MIN_HALF = 10
+
+# Rate-delta thresholds for the trend verdict (each half's starvation rate
+# measured in fraction, not percent — matches recent_starvation_rate's
+# ``rate`` field). +0.10 absolute swing in either direction is the noise
+# floor below which we read STABLE (a 10-percentage-point change over a
+# windowed half is unambiguously a real shift, not jitter).
+_TREND_DELTA = 0.10
+
+
+def recent_starvation_trend(db_path: str | os.PathLike | None = None,
+                             limit: int = 120) -> dict:
+    """Direction of travel for the recent starvation rate: is the storm
+    WORSENING, STABLE, or RECOVERING?
+
+    Splits the last ``limit`` decisions into two equal halves (older /
+    newer by row id) and compares the per-half starvation rate. The
+    ``newer`` half is interpreted as "what just happened" — a rising rate
+    means the storm is intensifying, a falling rate means it is clearing.
+    An operator deciding whether to KILL the parallel Opus jobs vs WAIT
+    for the storm to pass needs THIS, not the aggregate snapshot: a 50%
+    aggregate rate could be 100%→0% (already recovered) or 0%→100%
+    (intensifying), and the actions diverge.
+
+    Distinct from ``recent_starvation_rate`` (point-in-time aggregate)
+    and from ``recent_starvation_by_cause`` (per-class breakdown over the
+    full window): this answers the temporal question those two can't.
+
+    Returns:
+        ``{"state": <INSUFFICIENT|WORSENING|STABLE|RECOVERING>,
+           "older_rate": <0..1>, "newer_rate": <0..1>,
+           "older_n": <int>, "newer_n": <int>,
+           "delta": <newer - older>, "headline": <operator one-liner>,
+           "ok": <bool>}``
+
+    Insufficient-data semantics (mirrors ``host_saturated`` mem==0
+    "unknown → don't cry wolf"): when either half has < ``_TREND_MIN_HALF``
+    decisions, ``state="INSUFFICIENT"`` and the headline reads "not enough
+    history" — the caller suppresses the trend line entirely rather than
+    publish a verdict based on a tiny sample.
+
+    Degrade-safe: any DB failure returns the empty shape with ``ok=False``
+    (the ``recent_starvation_rate`` precedent — never raises)."""
+    path = str(db_path) if db_path is not None else str(_DEFAULT_DB)
+    out = {
+        "state": "INSUFFICIENT",
+        "older_rate": 0.0,
+        "newer_rate": 0.0,
+        "older_n": 0,
+        "newer_n": 0,
+        "delta": 0.0,
+        "headline": "Not enough decisions to compute a starvation trend.",
+        "ok": False,
+    }
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = conn.execute(
+                "SELECT action_taken, reasoning FROM decisions "
+                "ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return out
+    n = len(rows)
+    if n == 0:
+        # ok=True so the caller distinguishes "DB read worked, no rows" from
+        # "DB read failed". Verdict stays INSUFFICIENT (no trend possible).
+        out["ok"] = True
+        return out
+    # rows[0] is newest (ORDER BY id DESC). Newer half = first half of rows.
+    half = n // 2
+    if half == 0:
+        out["ok"] = True
+        out["newer_n"] = n
+        out["headline"] = (
+            f"Only {n} recent decision(s) — need ≥{_TREND_MIN_HALF * 2} "
+            "for a trend."
+        )
+        return out
+    newer = rows[:half]
+    older = rows[half:half * 2]   # equal halves; drops odd row when n is odd
+
+    def _starved_count(half_rows) -> int:
+        return sum(
+            1
+            for a, r in half_rows
+            if (a or "") == "NO_DECISION"
+            and (r or "").startswith(_STARVATION_PREFIXES)
+        )
+
+    newer_s = _starved_count(newer)
+    older_s = _starved_count(older)
+    newer_rate = round(newer_s / len(newer), 3) if newer else 0.0
+    older_rate = round(older_s / len(older), 3) if older else 0.0
+    delta = round(newer_rate - older_rate, 3)
+    out.update(
+        ok=True,
+        older_rate=older_rate, older_n=len(older),
+        newer_rate=newer_rate, newer_n=len(newer),
+        delta=delta,
+    )
+    if len(newer) < _TREND_MIN_HALF or len(older) < _TREND_MIN_HALF:
+        out["state"] = "INSUFFICIENT"
+        out["headline"] = (
+            f"Only {len(newer)}/{len(older)} (newer/older) decision(s) — "
+            f"need ≥{_TREND_MIN_HALF} per half for a trend verdict."
+        )
+        return out
+    if delta >= _TREND_DELTA:
+        out["state"] = "WORSENING"
+        out["headline"] = (
+            f"Starvation WORSENING: {older_rate * 100:.0f}%→"
+            f"{newer_rate * 100:.0f}% (+{delta * 100:.0f}pp over the last "
+            f"{len(newer)} cycles); the storm is intensifying — "
+            "the bot cannot resolve this by trading."
+        )
+    elif delta <= -_TREND_DELTA:
+        out["state"] = "RECOVERING"
+        out["headline"] = (
+            f"Starvation RECOVERING: {older_rate * 100:.0f}%→"
+            f"{newer_rate * 100:.0f}% ({delta * 100:+.0f}pp over the last "
+            f"{len(newer)} cycles); the box is clearing — give it a few "
+            "more cycles before intervening."
+        )
+    else:
+        out["state"] = "STABLE"
+        out["headline"] = (
+            f"Starvation STABLE: {older_rate * 100:.0f}%→"
+            f"{newer_rate * 100:.0f}% ({delta * 100:+.0f}pp over the last "
+            f"{len(newer)} cycles); rate is not moving."
+        )
+    return out
+
+
 def recent_starvation_by_cause(db_path: str | os.PathLike | None = None,
                                 limit: int = 120) -> dict:
     """Read-only: bucket the last ``limit`` decisions' starvation cells by
@@ -555,6 +696,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     snap = snapshot()
     cause = recent_starvation_by_cause()
+    trend = recent_starvation_trend()
     if "--json" in argv:
         import json
 
@@ -566,6 +708,7 @@ def main(argv: list[str] | None = None) -> int:
         out = dict(snap)
         out["recent_starvation_rate"] = recent_starvation_rate()
         out["recent_starvation_by_cause"] = cause
+        out["recent_starvation_trend"] = trend
         print(json.dumps(out, indent=2, sort_keys=True))
     else:
         p = snap["probe"]
@@ -607,6 +750,10 @@ def main(argv: list[str] | None = None) -> int:
                     f"{label}={n}" for label, n in non_zero
                 )
                 print(f"    by cause: {by_cause_str}")
+            # Trend line — only when the verdict is mature. INSUFFICIENT
+            # samples → suppress, mirroring "never cry wolf" elsewhere.
+            if trend.get("ok") and trend.get("state") != "INSUFFICIENT":
+                print(f"    trend: {trend['headline']}")
         elif er["ok"]:
             # Starvation probe failed but empty probe ok — degrade to the
             # narrower line rather than printing nothing.
