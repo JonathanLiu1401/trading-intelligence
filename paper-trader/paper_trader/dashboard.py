@@ -12764,10 +12764,23 @@ def runner_heartbeat_api():
         # verdict diagnose its cause — a host-saturation / quota storm is not
         # cleared by a restart, so the heartbeat must not recommend one.
         recent_reasons = [d.get("reasoning") for d in decs]
+        # Timestamp of the most recent NON-NO_DECISION row, so the builder can
+        # surface the engine's true real-decision age under an IDLE_STORM
+        # (a documented green-light pathology — bare last_decision_ts advances
+        # every NO_DECISION cycle and reads "12m ago" while the actual engine
+        # has not decided in days). The store-side primitive added in 2317b8f;
+        # this wires it into the operator's primary surface. Pure read,
+        # degrade-safe — None on a fresh book or any fault.
+        try:
+            last_real = store.last_real_decision()
+            last_real_ts = last_real.get("timestamp") if last_real else None
+        except Exception:
+            last_real_ts = None
         now_utc = datetime.now(timezone.utc)
         hb = build_runner_heartbeat(
             last_ts, _mkt.is_market_open(now_utc), now=now_utc,
-            recent_actions=recent_actions, recent_reasons=recent_reasons)
+            recent_actions=recent_actions, recent_reasons=recent_reasons,
+            last_real_decision_ts=last_real_ts)
         # Additive: the single-instance-lock state of THE PROCESS SERVING
         # THIS DASHBOARD (the dashboard runs in a runner thread). A runner
         # that booted degraded (no flock — invariant #19 fail-open) may be
