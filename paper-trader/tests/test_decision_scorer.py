@@ -558,6 +558,73 @@ class TestTrainScorer:
         assert result["n_label_dropped"] == 5
         assert result["n"] == 35  # 40 input - 5 dropped, no dedup collisions
 
+    def test_dedup_prefers_valid_label_over_higher_return_with_null(self):
+        # Defence-in-depth tie-break: when two records share a dedup key
+        # (ticker, sim_date, action) and one carries a valid forward_return_5d
+        # while the other carries `None` (externally injected / corrupted /
+        # legacy row), the dedup MUST keep the valid-label one — even if the
+        # null row's run_return was higher. The pre-fix logic kept the
+        # higher-return run unconditionally; the null row then failed the
+        # label-validation pass below and ALL training signal for that key
+        # was silently lost. Production data has 0 such rows today
+        # (_compute_decision_outcomes only emits walk-back-validated finite
+        # outcomes), but the guard makes the invariant explicit so any future
+        # ingest path that mixes null labels with real ones cannot silently
+        # erase the real signal.
+        rec_null_high = _synthetic_outcome(return_pct=100, fwd=0.0)  # fwd overwritten below
+        rec_null_high["forward_return_5d"] = None
+        rec_valid_low = _synthetic_outcome(return_pct=10, fwd=8.0)
+        # Pad with 30 distinct sim_dates so we clear the 30-record threshold.
+        pad = [_synthetic_outcome(sim_date=f"2025-08-{i+1:02d}", ticker="AMD")
+               for i in range(30)]
+        result = train_scorer([rec_null_high, rec_valid_low] + pad)
+        # The null record must have lost the tie-break; the valid +8 record
+        # was retained, so no label was dropped from the NVDA collision.
+        assert result["status"] == "ok"
+        # 30 pad + 1 deduped NVDA = 31 training rows; n_label_dropped must
+        # stay at 0 (the null candidate was discarded by dedup, not by the
+        # label-validation pass — so it never reaches the drop counter).
+        assert result["n"] == 31
+        assert result["n_label_dropped"] == 0
+
+    def test_dedup_invalid_only_collision_still_drops_label(self):
+        # When EVERY candidate for a dedup key has an invalid label, the
+        # survivor (any of them — order shouldn't matter) still gets dropped
+        # by the label-validation pass. n_label_dropped reflects the single
+        # collision survivor, not every input collision row — by design.
+        # Verifies the dedup fix didn't accidentally start counting every
+        # invalid-input row.
+        a = _synthetic_outcome(return_pct=100)
+        a["forward_return_5d"] = None
+        b = _synthetic_outcome(return_pct=10)
+        b["forward_return_5d"] = float("nan")
+        # Pad with 30 valid distinct records.
+        pad = [_synthetic_outcome(sim_date=f"2025-09-{i+1:02d}", ticker="AMD")
+               for i in range(30)]
+        result = train_scorer([a, b] + pad)
+        assert result["status"] == "ok"
+        assert result["n_label_dropped"] == 1   # one survivor of the two-row collision
+        assert result["n"] == 30
+
+    def test_dedup_with_valid_labels_still_uses_return_pct(self):
+        # Tie-break regression guard: when BOTH candidates carry valid labels
+        # the tiebreaker must remain `return_pct` (the historical contract
+        # that test_dedup_survivor_is_highest_return_record pins). The
+        # additional `has_valid_label` precedence dimension must not change
+        # behaviour in the all-valid case.
+        rec_lo = _synthetic_outcome(return_pct=-10, fwd=-5.0)
+        rec_hi = _synthetic_outcome(return_pct=50, fwd=15.0)
+        pad = [_synthetic_outcome(sim_date=f"2025-10-{i+1:02d}", ticker="AMD",
+                                  fwd=0.0, ml_score=0.0, mom5=0.0)
+               for i in range(30)]
+        # Order matters for regression: if lo is seen first, the precedence
+        # check at the second pass must still flip in favour of hi.
+        result_lo_first = train_scorer([rec_lo, rec_hi] + pad)
+        result_hi_first = train_scorer([rec_hi, rec_lo] + pad)
+        assert result_lo_first["status"] == "ok"
+        assert result_hi_first["status"] == "ok"
+        assert result_lo_first["n"] == result_hi_first["n"] == 31
+
     def test_persists_to_scorer_path(self, tmp_path, monkeypatch):
         """After training, the pickle must exist and contain {model, scaler, n_train}."""
         import paper_trader.ml.decision_scorer as ds
