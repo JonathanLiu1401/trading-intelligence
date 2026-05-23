@@ -1340,6 +1340,18 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
     # outlier rate of the training tail (a sudden spike correlates with
     # MSTR/leveraged-ETF crash/rip weeks polluting the corpus).
     label_clamped = result.get("n_label_clamped", 0)
+    # Label-drop count surfaced too. `train_scorer` already returns it but
+    # the status string previously only surfaced `n_label_clamped`. A silent
+    # corruption (a malformed outcomes batch with non-finite/null
+    # `forward_return_5d`) would shrink the effective training set without
+    # ANY observable signal — the cycle status still reads `status=ok` and
+    # the skill ledger's `train_n` is the POST-drop count, so the
+    # operator could not tell whether a sudden drop in `train_n` was from
+    # fewer outcomes computed this cycle or from rows being silently
+    # discarded by the label-validation pass. Trending the count lets a
+    # quant catch corruption immediately (a non-zero spike) instead of
+    # only seeing the symptom (val_rmse drift, oos_ic noise).
+    label_dropped = result.get("n_label_dropped", 0)
     return (f"scorer {result['status']} train_n={result['n']} "
             f"val_rmse={val_s} oos_n={len(oos_records)} oos_rmse={oos_rmse_s} "
             f"oos_diracc={oos_diracc_s} oos_ic={oos_ic_s} "
@@ -1353,7 +1365,8 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
             f"oos_bull_n={oos_bull_n} oos_bull_ic={oos_bull_ic_s} "
             f"oos_sideways_n={oos_sideways_n} oos_sideways_ic={oos_sideways_ic_s} "
             f"oos_bear_n={oos_bear_n} oos_bear_ic={oos_bear_ic_s} "
-            f"n_label_clamped={label_clamped}")
+            f"n_label_clamped={label_clamped} "
+            f"n_label_dropped={label_dropped}")
 
 
 def _parse_scorer_status(status: str) -> dict:
@@ -1396,6 +1409,10 @@ def _parse_scorer_status(status: str) -> dict:
         "oos_sideways_n": None, "oos_sideways_ic": None,
         "oos_bear_n": None, "oos_bear_ic": None,
         "n_label_clamped": None,
+        # Label-drop count from `train_scorer` (pass #16, 2026-05-23). None
+        # on older status strings predating the wiring — historical
+        # ledger rows therefore parse cleanly.
+        "n_label_dropped": None,
     }
     try:
         s = str(status or "").strip()
@@ -1455,6 +1472,12 @@ def _parse_scorer_status(status: str) -> dict:
         # (cycles before the clamp landed) omit it — degrades to None cleanly.
         nlc = _num("n_label_clamped")
         out["n_label_clamped"] = int(nlc) if nlc is not None else None
+        # Label-drop count — same parse pattern. Older status strings
+        # (cycles before pass #16 wired it) omit the token and degrade to
+        # None via the `_num` regex miss, so historical ledger rows parse
+        # cleanly under the new schema.
+        nld = _num("n_label_dropped")
+        out["n_label_dropped"] = int(nld) if nld is not None else None
     except Exception:
         return {
             "status": "unparseable", "train_n": None, "val_rmse": None,
@@ -1468,6 +1491,7 @@ def _parse_scorer_status(status: str) -> dict:
             "oos_sideways_n": None, "oos_sideways_ic": None,
             "oos_bear_n": None, "oos_bear_ic": None,
             "n_label_clamped": None,
+            "n_label_dropped": None,
         }
     return out
 
