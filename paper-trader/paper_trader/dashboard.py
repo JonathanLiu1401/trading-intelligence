@@ -272,6 +272,69 @@ def _classify(ticker: str) -> str:
     return SECTOR_MAP.get(ticker.upper(), "other")
 
 
+def _enrich_open_position(p: dict, *, _now: datetime | None = None) -> dict:
+    """Return ``p`` augmented with computed-on-read derived fields.
+
+    ``store.open_positions()`` returns raw ``positions`` table rows that carry
+    ``current_price`` and ``unrealized_pl`` (the last ``update_position_marks``
+    write) but NOT the trader-essential derived fields a script / cross-port
+    consumer otherwise has to re-derive (and re-derive inconsistently):
+
+      * ``market_value`` — dollar value of the lot
+        (``current_price * qty * mult`` where ``mult`` is 100 for options,
+        1 for stock). Mirrors the ``_mark_to_market`` formula exactly so the
+        endpoint and the live snapshot can never disagree on a lot's worth.
+      * ``pl_pct`` — position-level % return (``(cur - avg) / avg * 100``).
+        ``None`` when ``avg_cost`` is zero or non-numeric — a trader reading
+        ``None`` correctly understands "no meaningful base" rather than a
+        misleading ``0.00%``.
+      * ``hold_seconds`` / ``hold_days`` — wall-clock time since
+        ``opened_at`` (``None`` for missing/unparseable). ``hold_days`` is
+        rounded to 4 places (the ``store.closed_positions`` precedent).
+
+    Pure on the input row — no store reads, no network, never raises. Any
+    non-numeric input falls through to ``None`` / ``0`` for the affected
+    field, never a 500. ``_now`` is injectable for deterministic tests.
+    """
+    out = dict(p)
+    ptype = (p.get("type") or "").lower()
+    mult = 100.0 if ptype in ("call", "put") else 1.0
+    try:
+        qty = float(p.get("qty") or 0.0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    try:
+        cur = float(p.get("current_price") or 0.0)
+    except (TypeError, ValueError):
+        cur = 0.0
+    try:
+        avg = float(p.get("avg_cost") or 0.0)
+    except (TypeError, ValueError):
+        avg = 0.0
+    out["market_value"] = round(cur * qty * mult, 4)
+    out["pl_pct"] = (round((cur - avg) / avg * 100.0, 4)
+                    if avg > 0 else None)
+    out["hold_seconds"] = None
+    out["hold_days"] = None
+    opened_at = p.get("opened_at")
+    if opened_at:
+        try:
+            op = datetime.fromisoformat(
+                str(opened_at).strip().replace("Z", "+00:00"))
+            if op.tzinfo is None:
+                op = op.replace(tzinfo=timezone.utc)
+            now_dt = _now or datetime.now(timezone.utc)
+            # max(0, ...) clamps a future ``opened_at`` (wall-clock stepped
+            # back — the documented clock-skew hazard) to 0 rather than
+            # rendering a negative hold time.
+            secs = max(0.0, (now_dt - op).total_seconds())
+            out["hold_seconds"] = int(secs)
+            out["hold_days"] = round(secs / 86400.0, 4)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 @app.after_request
 def _cors(resp):
     # Cross-port fetch from Digital Intern dashboard (8080 → 8090).
@@ -1819,7 +1882,8 @@ TEMPLATE = r"""
             <th>ticker</th><th>type</th><th class="num">qty</th>
             <th class="num">avg</th><th class="num">now</th>
             <th class="num">total $</th><th class="num">% port</th>
-            <th class="num">P/L</th>
+            <th class="num">P/L</th><th class="num">P/L %</th>
+            <th class="num">held</th>
           </tr></thead><tbody></tbody>
         </table>
         </div>
@@ -2562,17 +2626,38 @@ async function refresh() {
     const cls = (p.unrealized_pl || 0) >= 0 ? "pos" : "neg";
     const label = p.type === "stock" ? p.type :
                   `${p.type.toUpperCase()} ${p.strike}/${p.expiry}`;
+    // Prefer the endpoint-enriched market_value (single source of truth with
+    // strategy._mark_to_market); fall back to the client-side computation
+    // for any older/cached payload that doesn't carry it yet.
     const mult = (p.type === "call" || p.type === "put") ? 100 : 1;
-    const totalVal = (p.current_price || 0) * (p.qty || 0) * mult;
+    const totalVal = (p.market_value != null) ? p.market_value
+                     : (p.current_price || 0) * (p.qty || 0) * mult;
     const pctPort = portTotal > 0 ? (totalVal / portTotal * 100) : 0;
+    // P/L % is endpoint-derived; null when avg_cost==0 (no meaningful base).
+    const plPct = p.pl_pct;
+    const plPctCls = plPct == null ? "" : (plPct >= 0 ? "pos" : "neg");
+    const plPctTxt = plPct == null ? "—"
+                     : (plPct >= 0 ? "+" : "") + fmt(plPct, 2) + "%";
+    // Hold age — endpoint-derived hold_seconds. Compact m/h/d label so the
+    // disposition effect (riding losers, cutting winners) is visible at the
+    // top of the page, not buried in a dashboard panel.
+    const hs = p.hold_seconds;
+    let heldTxt = "—";
+    if (hs != null && hs >= 0) {
+      if (hs < 3600) heldTxt = Math.floor(hs / 60) + "m";
+      else if (hs < 86400) heldTxt = Math.floor(hs / 3600) + "h";
+      else heldTxt = Math.floor(hs / 86400) + "d";
+    }
     return `<tr><td>${p.ticker}</td><td>${label}</td>
       <td class="num">${fmt(p.qty,4)}</td>
       <td class="num">${fmt(p.avg_cost)}</td>
       <td class="num">${fmt(p.current_price)}</td>
       <td class="num">${dollar(totalVal)}</td>
       <td class="num">${fmt(pctPort,1)}%</td>
-      <td class="num ${cls}">${fmt(p.unrealized_pl)}</td></tr>`;
-  }).join("") || `<tr><td colspan="8" class="muted">no positions</td></tr>`;
+      <td class="num ${cls}">${fmt(p.unrealized_pl)}</td>
+      <td class="num ${plPctCls}">${plPctTxt}</td>
+      <td class="num">${heldTxt}</td></tr>`;
+  }).join("") || `<tr><td colspan="10" class="muted">no positions</td></tr>`;
 
   const trBody = document.querySelector("#trades-tbl tbody");
   trBody.innerHTML = r.trades.map(t => {
@@ -6260,7 +6345,13 @@ def state():
     `{"warming":true}` placeholder (it skips the tick and self-heals)."""
     store = get_store()
     pf = store.get_portfolio()
-    positions = store.open_positions()
+    # Enrich each raw positions-table row with derived fields (market_value,
+    # pl_pct, hold_seconds, hold_days) so the dashboard panels and every
+    # cross-port consumer read the SAME numbers without re-deriving them
+    # client-side (the dashboard's positions table re-derived market_value
+    # at line 2566; the digital-intern dashboard cross-fetch otherwise has
+    # no way to surface per-position %P/L or hold time).
+    positions = [_enrich_open_position(p) for p in store.open_positions()]
     trades = store.recent_trades(40)
     decisions = store.recent_decisions(20)
     eq = store.equity_curve(5000)  # full history for accurate chart
