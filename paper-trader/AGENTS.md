@@ -6,6 +6,143 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 feature-dev pass (Agent 4) — `/api/bag-holding-skill` + `/api/risk-adjusted-returns`
+
+Two new analytics modules answering desk questions nothing else
+surfaces. Both follow the pure-builder + endpoint + STABLE-gated
+verdict + headline pattern established by `loser_autopsy.py` /
+`benchmark.py` / `decision_vapor_skill.py` (AGENTS.md invariant #10 —
+single source of truth, no consolidation).
+
+### `paper_trader/analytics/bag_holding_skill.py` + `/api/bag-holding-skill`
+
+The **dollar-weighted** view on the `loser_autopsy._classify`
+failure-mode taxonomy. `loser_autopsy` reports COUNT per mode and $
+per TICKER; this is the missing $ per MODE answer. A book with one
+`KNIFE_CATCH` at -$50 and nine `WHIPSAW` losses at -$0.30 each has
+"WHIPSAW dominates" by mode-count (the `loser_autopsy` reading) but
+the actual bleed is the one knife catch — this module gives the
+operator that view.
+
+Imports `_classify` from `loser_autopsy` (SSOT, never reimplemented)
+and `build_round_trips` from `round_trips` (the same SSOT every
+trade-side builder consumes — `loser_autopsy`, `trade_asymmetry`,
+`winner_autopsy`, `round_trip_postmortem`). Aggregates by mode:
+`n`, `loss_usd`, `share_of_loss`, `avg_loss_pct`, `avg_hold_days`,
+`worst_loss_usd` + `worst_ticker`, `tickers` (distinct names hitting
+the mode). Surfaces three top-level ratios: `bag_holding_ratio`
+(SLOW_BLEED share), `knife_catch_ratio`, `whipsaw_ratio`.
+
+Verdict ladder (STABLE only, `n_losers ≥ 8` — the loser_autopsy
+sample-size precedent):
+| Verdict | Trigger |
+|---------|---------|
+| `BAG_HOLDER` | SLOW_BLEED share ≥ 0.60 — literally holding bags |
+| `KNIFE_CATCHER` | KNIFE_CATCH share ≥ 0.50 — entry thesis is the problem |
+| `WHIPSAW_BLEED` | WHIPSAW share ≥ 0.40 — cutting noise too tight |
+| `DISCIPLINED_CUTTER` | SLOW_BLEED ≤ 0.20 AND WHIPSAW ≤ 0.40 |
+| `MIXED` | none of the above arms triggers cleanly |
+
+Verdict precedence is documented and tested: BAG_HOLDER beats
+KNIFE_CATCHER beats WHIPSAW_BLEED beats DISCIPLINED_CUTTER beats
+MIXED. Below STABLE: state=EMERGING, numerics emitted, verdict
+withheld (the loser_autopsy idiom). Empty-mode rows are still
+emitted with n=0/loss=0/share=0.0 so the dashboard can render a
+complete 4-mode grid.
+
+Locked by `tests/test_bag_holding_skill.py` (**22 tests, all pass
+in 0.5s**): state/sample-size gate (4), verdict ladder all 5 arms
+(6), boundary inclusivity at BAG_HOLDER_RATIO=0.60 (2), per-mode
+row aggregation (4), invariants — winners excluded, sub-cent wash
+is not a loss, no input mutation, never raises on garbage (4),
+output shape (2). Adjacent SSOT-neighbor sweep
+(`test_loser_autopsy + test_round_trips + test_trade_asymmetry +
+test_drawdown + test_benchmark + test_tail_risk + test_recovery`):
+**163 passed in 2.1s**, no regressions.
+
+### `paper_trader/analytics/risk_adjusted_returns.py` + `/api/risk-adjusted-returns`
+
+The risk-aware companion to `/api/benchmark`. `/api/benchmark` is
+point-to-point dollar alpha (path-blind: smooth +3pp climb vs +3pp
+finish reached by -10pp drawdown and recovery look identical).
+`/api/analytics` carries scalar `sharpe_annualized` /
+`sortino_annualized` but no S&P parity, no information ratio, no
+verdict, no headline. This module fills that gap.
+
+Composes daily-return series for the portfolio (last EOD `total_value`
+per UTC date — the `analytics_api` by_day convention) and the S&P 500
+(`sp500_price` on the same paired dates). Computes annualized Sharpe
+(mean / std × √252, population stddev, matching the existing
+analytics_api formula exactly so the two never drift), annualized
+Sortino (downside-RMS-scaled-by-full-sample, identical convention),
+sharpe alpha (port − sp), sortino alpha, and the information ratio
+(active return Sharpe per Grinold).
+
+Sample-size gate is two-tiered, the benchmark.py / trade_asymmetry
+precedent:
+* `< EMIT_MIN_DAYS=5` → state=INSUFFICIENT, numerics None
+* `EMIT_MIN_DAYS ≤ n < STABLE_MIN_DAYS=7` → state=EMITTING, numerics
+  present, verdict withheld
+* `≥ STABLE_MIN_DAYS=7` → state=STABLE, verdict emitted
+
+Verdict ladder (STABLE only):
+| Verdict | Trigger |
+|---------|---------|
+| `OUTPERFORMING_RISK_ADJUSTED` | sharpe_alpha > +0.25 |
+| `LAGGING_RISK_ADJUSTED` | sharpe_alpha < -0.25 |
+| `TRACKING_RISK_ADJUSTED` | \|sharpe_alpha\| ≤ 0.25 (or Sharpe undefined) |
+
+Paired-day arithmetic: a day where either the port or the S&P row is
+missing/<=0 is dropped from BOTH series (so the two arms cannot drift
+in length). The 0/-1 nonpositive screen runs in `_by_day_last`
+before any return arithmetic, so a corrupt $0 yfinance mark cannot
+contaminate the Sharpe denominator.
+
+Locked by `tests/test_risk_adjusted_returns.py` (**18 tests, all pass
+in 0.2s**): state/sample-size gate (5), verdict ladder all 4 arms
+(4), Sharpe/Sortino/information-ratio arithmetic against hand-computed
+expected values (3), by-day rules — last-write-wins per UTC date,
+paired-only counting, nonpositive value filter (3), output shape +
+no-mutation + never-raises-on-garbage (3).
+
+### Live state at 2026-05-23 09:30 UTC
+
+```bash
+curl -s http://localhost:8090/api/bag-holding-skill | jq '{state,verdict,headline}'
+# {"state":"EMERGING","verdict":null,"headline":"Emerging — 1 of 8 losing round-trips for a stable bag-holding read (verdict withheld). …"}
+
+curl -s http://localhost:8090/api/risk-adjusted-returns | jq '{state,n_paired_days,headline}'
+# {"state":"INSUFFICIENT","n_paired_days":4,"headline":"Risk-adjusted view maturing — 4 paired daily returns …"}
+```
+
+Both gates engaging correctly against the live book: the trader has
+1 closed losing round-trip (below 8-loser STABLE bar) and 4 paired
+daily equity points (below 5-day Sharpe emit bar, the live trader's
+known "shallow/lumpy" equity curve — the
+`paper_trader_equity_curve_shallow` memory note). Both surfaces will
+roll into EMITTING / EMERGING / STABLE as the book accumulates;
+nothing else to do operationally.
+
+### Counters
+
+bugs_fixed=0 · features_added=2 · user_findings=0
+
+### Commands
+
+```bash
+# Just this pass's lock tests:
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_bag_holding_skill.py \
+                  tests/test_risk_adjusted_returns.py -v
+# 40 passed in 0.6s
+
+# CLI smoke (each module ships its own __main__):
+python3 -m paper_trader.analytics.bag_holding_skill
+python3 -m paper_trader.analytics.risk_adjusted_returns
+```
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #13 (Agent 2) — `_oos_rank_metrics` unknown-regime de-contamination + `ml.wk52_skill`
 
 Two changes, the discipline-mandated separate-commits split.
