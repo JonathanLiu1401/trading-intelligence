@@ -6,6 +6,219 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 — Agent 4 (feature-dev) — `/api/profit-ladder` + `/api/open-lot-aging`
+
+Two complementary per-position diagnostics, both targeting gaps the
+existing 150+ endpoints leave wide open.
+
+### Gap 1: `/api/profit-ladder` — symmetric upside to `position_blowup`
+
+`position_blowup` shocks each held name DOWN at -10/-25/-50/-100 % and
+quantifies the dollar damage. Nothing surfaces the symmetric UPSIDE
+question — *if THIS name rallies +25 %, what does it pay me; if I trim
+HALF at that rung, how much do I lock in and how much do I leave on
+the table for the +50 % rung?* `recovery` is book-level (path back to
+even, flattens per-position); `cost_basis_ladder` is per-lot at the
+CURRENT mark (says nothing about future shocks); `trim_simulator`
+trims at the CURRENT mark (never at a future rung); `earnings_war_room`
+is calendar-gated to dated catalysts.
+
+New `paper_trader/analytics/profit_ladder.py::build_profit_ladder`:
+per-position +5/+10/+25/+50/+100 % shocks with a `trim_schedule`
+sub-block at each rung carrying the realized-vs-unrealized split if
+the operator trims 25 / 50 / 100 % AT that rung. Pure arithmetic,
+options ×100 multiplier honored, never raises. Aggregate verdict
+ladder: `NO_DATA` / `RECOVERY_BOOK` (every position underwater) /
+`MIXED_BOOK` / `IN_PROFIT` / `BIG_WINNERS` (≥1 position whose +25 %
+rung adds >10 % of book). Rows sorted most-upside-first by
+`max_gain_usd` so the operator's first read is the biggest dollar-
+upside name.
+
+New plain (`@app.route`, not `@swr_cached`) `/api/profit-ladder` —
+pure-Python compute, no I/O, no slow yfinance call ⇒ no SWR needed,
+no prewarm-coverage invariant entry needed. Wired right after
+`/api/position-blowup` (the symmetric sibling).
+
+### Gap 2: `/api/open-lot-aging` — the time dimension `cost_basis_ladder` leaves out
+
+`cost_basis_ladder` reconstructs FIFO lots with per-lot P&L AT the
+current mark. It says nothing about HOW LONG each lot has been held —
+exactly the disposition-pathology question the next decision needs
+answered. `holding_period_distribution` covers CLOSED round-trips
+(post-mortem); `add_discipline` measures BUY-cadence on averaging-in;
+`catalyst_expiry_skill` flags dated catalysts. None of them tells the
+operator how OLD each *currently-open* lot is.
+
+New `paper_trader/analytics/open_lot_aging.py::build_open_lot_aging`:
+per-lot age in days, bucketed FRESH (<1d) / NORMAL (<7d) / MATURE
+(<30d) / STALE (≥30d). STALE lots additionally earn a `STALE_RED` /
+`STALE_GREEN` / `STALE_FLAT` tag based on per-lot P&L sign, flagging
+the two disposition-pathology quadrants — old underwater (overdue
+cut, the "averaging-down anchor" pattern) vs old green (overdue trim
+or genuine hold; either way RE-affirm consciously). Per-position
+verdict rolls up the lot verdicts with STALE_RED dominating
+STALE_GREEN (more decision-relevant pathology). Aggregate book
+verdict (`NO_DATA` / `FRESH_BOOK` / `NORMAL_BOOK` / `AGING_BOOK` /
+`STALE_BOOK`) driven by share-of-open-lot-$ stale or
+mature-or-worse. The `attention` array lists only the
+operator-actionable verdicts (STALE_*, MATURE_MIX), oldest-first.
+
+**SSOT discipline:** reuses
+`cost_basis_ladder._reconstruct_lots` / `_position_key` /
+`_trade_key` verbatim — the two builders see byte-identical FIFO
+lots (`test_lots_match_cost_basis_ladder_byte_for_byte` locks this).
+A drift in one would silently misrepresent the other; pinning prevents
+that class of bug.
+
+### Live evidence at merge (2026-05-23 ~08:30 UTC, 1-position book)
+
+```
+$ python3 -c "from paper_trader.dashboard import app; ..."
+/api/profit-ladder: RECOVERY_BOOK — NVDA (65.4% of book) +10% pays
+    $+64.58 (+6.54% of book), +25% pays $+161.44 (+16.35%), +50% pays
+    $+322.88 (+32.70%).
+/api/open-lot-aging: NORMAL_BOOK — oldest open lot is NVDA at 2.3
+    days; 0.0% of open-lot $ is STALE (≥30d), 0.0% is MATURE-or-worse.
+```
+
+The +25 % profit-ladder figure (`+$161.44 / +16.35 % of book`) is the
+exact byte-positive mirror of `/api/position-blowup`'s
+`−25 % costs $-161.44 (-16.35 % of book)` for the same position —
+both builders read the same `total_value` and `weight_pct`, so the
+SSOT mirror is structural, not a coincidence.
+
+### Tests — pure-helper, no Flask, no live process
+
+* `tests/test_profit_ladder.py` — 16 tests pinning the shock
+  arithmetic (exact +10/+25/+50/+100 % rungs against expected
+  $ figures), the trim-yield realized/unrealized split (incl. the
+  underwater-trim path that locks a LOSS, not a gain), the options
+  ×100 multiplier (caught a real double-multiplication bug in the
+  first draft — `cash_freed_usd` was 100× too high), the
+  most-upside-first sort, all five aggregate verdicts (RECOVERY_BOOK
+  / MIXED_BOOK / IN_PROFIT / BIG_WINNERS at the 10 % threshold), the
+  NO_DATA degradation contract, and a `_z(-0.0) → 0.0` signed-zero
+  fold check. Plus an endpoint-parity test asserting byte-identical
+  output between the route and the direct builder call (modulo
+  `as_of`).
+* `tests/test_open_lot_aging.py` — 30 tests pinning the bucket
+  boundaries (left-closed: FRESH `[0,1)`, NORMAL `[1,7)`, MATURE
+  `[7,30)`, STALE `[30,∞)`), the STALE_RED/GREEN/FLAT classification,
+  per-position verdict roll-up (STALE_RED dominates STALE_GREEN, the
+  load-bearing precedence), every aggregate verdict (FRESH_BOOK /
+  NORMAL_BOOK / AGING_BOOK / STALE_BOOK at the 50 %-of-dollars
+  threshold), the oldest-first sort, attention-list filtering
+  (FRESH/NORMAL excluded), the options ×100 multiplier in
+  `total_lot_value_usd`, malformed-trade resilience, and the
+  byte-for-byte SSOT parity with `cost_basis_ladder` lots. Plus the
+  same endpoint-parity test pattern.
+
+Both files pass green (46/46). Sibling sweep
+(`test_swr_prewarm_coverage`, `test_position_blowup`,
+`test_cost_basis_ladder`): 47/47, no regressions.
+
+### Counters
+
+`bugs_fixed=0` (no existing bug touched), `features_added=2`,
+`user_findings=0` (live system was healthy at probe; the
+NO_DECISION-storm + chronic dark collectors pattern is documented
+elsewhere).
+
+---
+
+## 2026-05-23 — Agent 1 (paper-trader core) HYBRID review pass #4
+
+`bugs_fixed = 1`, `features_added = 1`, `user_findings = 5`.
+
+### Phase 1 — fix: mid-trade `portfolio.positions_json` staleness (`9c3ea26`)
+
+`strategy._execute` updates cash mid-cycle by calling
+`store.update_portfolio(cash, total, snapshot["positions"])` immediately
+after `record_trade` + `upsert_position`. The third arg was the
+**pre-trade** snapshot list assembled by `_portfolio_snapshot` at the top
+of the cycle — it never includes the just-bought lot (or still carries
+the just-sold one). A `/api/portfolio` poll in the brief window before
+the end-of-cycle re-mark therefore saw the post-trade cash alongside a
+stale position list — a "where did my money go?" UX hole.
+
+`store.update_portfolio(cash, total_value, positions=None)` (new default)
+writes ONLY cash + total_value and preserves the existing column. The
+four `_execute` call sites (stock BUY/SELL, BUY_CALL/BUY_PUT,
+SELL_CALL/SELL_PUT) drop the stale arg. `_portfolio_snapshot` at end-of-
+cycle stays the only writer of `positions_json`. `positions=[]` still
+explicitly clears (distinct from None).
+
+7 new tests: 3 in `TestCashBookkeeping` pin the None/[]/omitted semantics;
+4 in `TestExecutePortfolioJsonConsistency` pin every `_execute` action
+(BUY, SELL, BUY_CALL, empty-cache).
+
+### Phase 2 — feat: Discord alert when consecutive-NO_DECISION breaker fires (`b214025`)
+
+The auto-recovery circuit breaker (`runner._cycle._kill_stale_claude`
+path) reaps a wedged claude subprocess after 5 consecutive NO_DECISION
+cycles — but only logged a stdout WARNING. The trader (who lives in
+Discord, the documented "primary surface") had no idea five cycles in a
+row were silently lost and the runner had just SIGKILL'd its own claude
+child. Worst-class failure mode ("looks alive, silently bleeding") made
+MORE invisible.
+
+New `reporter.send_breaker_fired_alert(consecutive, cause)` posts a
+Discord alarm with the count + cause code (timeout / nonzero_rc /
+empty_stdout / host_saturated / quota / raw-response head). runner
+calls it from the breaker-fire branch with a `_breaker_alert_active`
+dedupe latch mirroring `_quota_alert_active`: ONE alert per outage,
+cleared on the next real decision which also posts "CLAUDE BREAKER
+CLEARED". Quota-exhausted cycles do NOT trip the breaker alert (quota
+has its own dedicated alarm).
+
+11 new tests across `test_core_runner_cycle.py` and
+`test_core_reporter.py` — cause-suffix priority, latch dedupe within
+outage, real-decision clears latch + re-arms, quota path stays silent,
+reporter failure leaves latch False (retry next cycle), 200-char cause
+cap.
+
+### Phase 3 — live findings (recorded, no fix commit)
+
+Live state polled 2026-05-23 ~08:40 UTC:
+
+1. **Live IDLE_STORM in progress** — `/api/decision-health` reports
+   `verdict=CRITICAL`, `no_decision_rate_24h=100%` (31/31 cycles); last
+   FILL was `2026-05-21T10:00 NVDA BUY` (46.7h ago). `/api/host-guard`
+   confirms `SATURATED` with 16 concurrent Opus jobs, 92% swap used —
+   the new Phase 2 breaker alert (5+ consecutive) would have fired here.
+2. **Runner is `behind: 4` commits** — `/api/build-info` reports
+   `boot_sha=ada9b26 head_sha=593fdc2 stale=true`. Git-watcher will
+   honor a deferred restart next cycle boundary; the deadman force-exit
+   after `RESTART_GRACE_S=600` is the safety net.
+3. **NVDA at 65.4% of book** — `/api/risk` flags `concentration_severity=
+   HIGH`, one 25% gap = −$165 (−16.5% of book). The sibling Agent 4
+   pass added `/api/trim-simulator` + `/api/concentration-cap` to make
+   this actionable; on the live book they recommend EXIT (scorer says
+   −22.6% 5d).
+4. **SWR endpoints cold-stall under load** — `/api/runner-heartbeat`
+   and `/api/briefing` both returned `{"warming": true, "attempts": 0}`
+   on first poll; recovered in <10s. Expected under the IDLE_STORM
+   (the prewarm cache backgrounds get starved by the same 16 concurrent
+   Opus).
+5. **Untracked sibling-agent file `paper_trader/analytics/
+   reasoning_action_verbs.py`** contains a dead generator at
+   `lines 446-448` (a `sum(1 ... for _ in range(c))` immediately
+   overwritten by the correct `sum(c for ...)` on line 449 — both
+   compute the same value, the first is just wasted work with a
+   misleading comment). Not fixed here because the file is owned by
+   another in-flight HYBRID agent; safe one-line cleanup for that
+   author or a follow-up pass.
+
+### Phase 4 — docs + final verify
+
+`python3 -c "from paper_trader import signals, reporter, strategy,
+runner; print('imports OK')"` → OK. Focused 657-test sweep across
+`test_core_*` green; pre-existing unrelated failure in
+`test_concentration_cap.py::test_projected_top1_swaps_when_another_takes_over`
+is a sibling agent's WIP, not in scope here.
+
+---
+
 ## 2026-05-23 feature-dev pass (Agent 4) — `/api/trim-simulator` + `/api/concentration-cap`
 
 Two complementary actionable endpoints fill the gap between the existing

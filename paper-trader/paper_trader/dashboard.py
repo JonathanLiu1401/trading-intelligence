@@ -7607,6 +7607,39 @@ def position_blowup_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/profit-ladder")
+def profit_ladder_api():
+    """Per-position UPSIDE shock ladder + trim-yield schedule — the
+    symmetric complement to ``/api/position-blowup``.
+
+    Every held name is shocked at +5/+10/+25/+50/+100 % and each rung
+    carries a trim_schedule with realized-vs-unrealized split at 25 /
+    50 / 100 % trim fractions. Answers the trader's "if I'm right, what
+    does it pay me — and what does trimming HALF at +25 % lock in?"
+    question that ``position_blowup`` (downside only), ``recovery``
+    (book-level path back to even), ``cost_basis_ladder`` (lots at the
+    CURRENT mark), and ``trim_simulator`` (trims at the CURRENT mark,
+    never at a future rung) all leave unanswered.
+
+    Aggregate verdict: NO_DATA / RECOVERY_BOOK / MIXED_BOOK /
+    IN_PROFIT / BIG_WINNERS. Pure arithmetic over the currently-marked
+    book; reuses ``build_profit_ladder`` verbatim (SSOT, AGENTS.md #10
+    — the panel and the ``-m paper_trader.analytics.profit_ladder``
+    CLI can never disagree). Observational only — never gates Opus,
+    adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.profit_ladder import build_profit_ladder
+        store = get_store()
+        pf = store.get_portfolio()
+        result = build_profit_ladder(
+            store.open_positions(),
+            float(pf.get("total_value") or 0.0),
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/trim-simulator")
 @swr_cached("trim_simulator", 45.0)
 def trim_simulator_api():
@@ -16583,6 +16616,47 @@ def cost_basis_ladder_api():
             "positions": [],
             "harvestable": [],
             "thresholds": {},
+        }), 500
+
+
+@app.route("/api/open-lot-aging")
+def open_lot_aging_api():
+    """Per-open-lot age + bucket — the time dimension
+    ``cost_basis_ladder`` deliberately leaves out.
+
+    Each FIFO-reconstructed lot is bucketed FRESH (<1d) / NORMAL
+    (<7d) / MATURE (<30d) / STALE (≥30d). STALE lots additionally
+    earn a STALE_RED / STALE_GREEN / STALE_FLAT tag based on per-lot
+    P&L sign, flagging the two disposition-pathology quadrants — old
+    underwater (overdue cut, "averaging-down anchor") vs old green
+    (overdue trim or genuine hold; either way RE-affirm consciously).
+    Per-position verdict rolls up the lot verdicts; aggregate book
+    verdict (FRESH_BOOK / NORMAL_BOOK / AGING_BOOK / STALE_BOOK) is
+    driven by the share of open-lot dollars that are stale or
+    mature-or-worse.
+
+    Reuses ``cost_basis_ladder``'s ``_reconstruct_lots`` primitive
+    (SSOT — the two builders see byte-identical lots). The
+    ``attention`` array lists only the verdicts that warrant a
+    different next-action, oldest-first.
+
+    Pure read — never raises. Observational only — never gates Opus,
+    adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.open_lot_aging import build_open_lot_aging
+        store = get_store()
+        positions = store.open_positions() or []
+        # 2000 trades covers ~6 months of mixed live flow — same cap
+        # the sibling cost-basis-ladder endpoint uses.
+        trades = store.recent_trades(limit=2000) or []
+        return jsonify(build_open_lot_aging(positions, trades))
+    except Exception as e:
+        return jsonify({
+            "state": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "positions": [],
+            "attention": [],
         }), 500
 
 
