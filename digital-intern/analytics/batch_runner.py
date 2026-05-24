@@ -38,6 +38,7 @@ PIPELINE: list[tuple[str, Path, int]] = [
     ("analytics.consensus_signal",        LOGS / "strong_consensus.jsonl",       50),
     ("analytics.confluence_signals",      LOGS / "confluence_signals.json",      50),
     ("analytics.ticker_alert_ranker",     LOGS / "ticker_alert_rank.json",       50),
+    ("analytics.ticker_anomaly_detector", LOGS / "ticker_anomaly.json",          50),
     ("analytics.source_score_drift",      LOGS / "source_score_drift.json",      50),
     # Junk-source detector and source-lead-time were CLI-only standalones; both
     # now use the safe ``mode=ro`` connect pattern (b669736), so they're cheap
