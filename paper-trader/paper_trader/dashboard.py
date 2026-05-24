@@ -10422,6 +10422,73 @@ def scorer_confidence_api():
         return jsonify({"error": str(e), "buckets": [], "positions": []}), 500
 
 
+@app.route("/api/setup-analogues")
+@swr_cached("setup-analogues", 90.0)
+def setup_analogues_api():
+    """Empirical conditional return distribution from historical analogues.
+
+    For a given ticker (default: first held stock, else first watchlist ticker
+    with quant signals available), bucket the ``decision_outcomes.jsonl``
+    corpus by (rsi, mom20, regime) and return the realized 5d return
+    distribution for the matching cell.  This is the non-parametric companion
+    to ``/api/scorer-confidence``: that endpoint bands by *predicted value*
+    ("when the MLP says +5%, how off is it?"), this one bands by *feature
+    context* ("when setup looks like THIS, what's the historical return
+    distribution?").  If the MLP point estimate disagrees with the bucket
+    median, that's a legitimate trust signal.
+
+    Query params:
+      ``ticker`` — override the default (any string; matched literally).
+      ``action`` — default ``BUY``; one of BUY/SELL/BUY_CALL/SELL_CALL/etc.
+      ``min_matches`` — verdict floor; default 20.
+    """
+    try:
+        from .analytics.setup_analogues import (
+            build_setup_analogues, DEFAULT_MIN_MATCHES)
+        from .strategy import get_quant_signals_live, WATCHLIST
+
+        ticker = (request.args.get("ticker") or "").strip().upper() or None
+        action = (request.args.get("action") or "BUY").strip().upper()
+        try:
+            min_matches = int(request.args.get("min_matches")
+                              or DEFAULT_MIN_MATCHES)
+        except (TypeError, ValueError):
+            min_matches = DEFAULT_MIN_MATCHES
+
+        if not ticker:
+            # Prefer a held stock so the card reflects the live book.  Fall
+            # back to the first watchlist ticker we can fetch quant for.
+            store = get_store()
+            held = sorted({
+                p["ticker"] for p in store.open_positions()
+                if p.get("type") == "stock" and (p.get("qty") or 0) > 0
+            })
+            ticker = held[0] if held else (
+                WATCHLIST[0] if WATCHLIST else "SPY")
+
+        quant_all = get_quant_signals_live([ticker]) or {}
+        q = quant_all.get(ticker) or {}
+        # Regime multiplier mirrors _live_scorer_predictions's derivation.
+        regime_mult = 1.0
+        try:
+            spy_mom = (get_quant_signals_live(["SPY"]).get("SPY") or {}).get("mom_5d")
+            if isinstance(spy_mom, (int, float)):
+                regime_mult = max(0.7, min(1.3, 1.0 + spy_mom * 0.075))
+        except Exception:
+            pass
+
+        outcomes = _load_decision_outcomes()
+        out = build_setup_analogues(
+            outcomes, ticker=ticker, action=action,
+            rsi=q.get("rsi"), mom20=q.get("mom_20d"),
+            regime_mult=regime_mult, min_matches=min_matches)
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "INSUFFICIENT_DATA",
+                        "n_matches": 0,
+                        "headline": "setup-analogues failed to build"}), 500
+
+
 @app.route("/api/baseline-compare")
 @swr_cached("baseline-compare", 90.0)
 def baseline_compare_api():
