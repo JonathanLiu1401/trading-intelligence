@@ -72,6 +72,7 @@ from collectors.short_interest_collector import collect_short_interest
 from collectors.wikipedia_collector import collect_wikipedia
 from collectors.wikipedia_pageviews import collect_wikipedia_pageviews
 from collectors.macro_calendar_collector import collect_macro_calendar
+from collectors.opex_calendar_collector import collect_opex_calendar
 from collectors.tic_foreign_holdings import collect_tic
 from collectors.congress_trades_collector import collect_congress_trades
 from collectors.finra_short_volume import collect_finra_short_volume
@@ -188,6 +189,7 @@ YAHOO_TICKER_RSS_INTERVAL = 240   # Yahoo per-ticker RSS every 4min
 WIKIPEDIA_INTERVAL  = 600         # Wikipedia recent-changes filter every 10min
 WIKI_PAGEVIEWS_INTERVAL = 3600    # Wikipedia pageview z-score surge alerts once per hour
 MACRO_CALENDAR_INTERVAL = 3600    # FOMC/BLS macro event calendar — once per hour
+OPEX_CALENDAR_INTERVAL  = 3600    # Options expiration calendar — once per hour
 TIC_INTERVAL            = 21600   # TIC foreign Treasury holdings — 6h (monthly release)
 FOREX_FACTORY_CAL_INTERVAL = 3600  # Forex Factory economic calendar — once per hour
 FINRA_SHORT_INTERVAL    = 3600    # FINRA RegSHO short volume — once per hour (daily file)
@@ -1765,6 +1767,27 @@ def macro_calendar_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(MACRO_CALENDAR_INTERVAL)
+
+
+def opex_calendar_worker(store: ArticleStore):
+    log.info("[opex_calendar_worker] started")
+    bo = Backoff("opex_calendar", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_opex_calendar()
+            _ingest(store, articles, "opex_calendar")
+            try:
+                source_health.record_result("opex_calendar", len(articles))
+            except Exception as he:
+                log.warning(f"[opex_calendar_worker] source_health error: {he}")
+            _worker_last_ok["opex_calendar"] = time.time()
+            log.debug(f"[opex_calendar] cycle ok ({len(articles)} new events)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[opex_calendar_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(OPEX_CALENDAR_INTERVAL)
 
 
 def tic_worker(store: ArticleStore):
@@ -4236,6 +4259,7 @@ def main():
         ("wikipedia",   wikipedia_worker),
         ("wiki_pageviews", wiki_pageviews_worker),
         ("macro_calendar", macro_calendar_worker),
+        ("opex_calendar",  opex_calendar_worker),
         ("tic",            tic_worker),
         ("forex_factory_cal", forex_factory_cal_worker),
         ("finra_short",   finra_short_worker),
