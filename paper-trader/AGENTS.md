@@ -25029,3 +25029,151 @@ python3 -m paper_trader.ml.llm_annotation_skill    # LLM pipeline dark/live?
   documented whole-file `git add` race with sibling Agent 1 (paper_trader
   core) and Agent 4 (feature-dev), both visible in `git status` at
   commit time with their own modified/untracked work in flight.
+
+
+---
+
+## 2026-05-24 agent4 (feature-dev) pass — all-cash tenure + recycled-ticker P&L
+
+Two new advisory analytics + endpoints. Both fill a gap the existing
+178-endpoint surface didn't ask about and both surface a LIVE failure
+mode visible the moment they go up. Both follow the pure-builder +
+endpoint-wires-the-store pattern of `initiation_drought` /
+`no_decision_recovery` (AGENTS.md invariants #2/#12 — observational
+only, never gates Opus, no caps, no path to `_execute()`).
+
+### `/api/all-cash-streak` (`paper_trader/analytics/all_cash_streak.py`)
+
+Contiguous-streak measure of "how long has the book held **nothing**?".
+Different from `/api/cash-drag` (time-weighted AVERAGE cash inside
+fixed rolling 24h/168h/720h windows — partial-cash periods dilute a
+fully flat period, so it answers "what cash cost on average"),
+`/api/cash-conviction-fit` (per-cycle sizing-vs-signal fit), and
+`/api/cash-redeployment-latency-skill` (per-SELL hours-to-redeploy).
+None of those describe the **book-level** "we have held nothing for
+9h and SPY did Y%" question the operator asks the moment the
+`/api/portfolio` panel shows `positions=[]`.
+
+Walks `store.equity_curve()` oldest→newest, runs the `total_value ≈
+cash` (within `_FLAT_EPSILON_USD = $0.50`) contiguous-streak detector,
+reports the current streak (if any) and a newest-first history of
+completed streaks (capped at 20). Each streak record carries `hours`,
+`n_points`, `cash_usd`, `spy_return_pct` (with the `benchmark.py`
+≥2-marks honesty floor), and `alpha_cost_usd` (cash × SPY_return /
+100; sign convention POSITIVE means cash COST you money, NEGATIVE
+means cash SAVED you money — mirrors the `cash_drag` headline
+discipline so the UI never has to invert).
+
+Verdict ladder: `NO_DATA` / `INSUFFICIENT_HISTORY` (< 3 curve points)
+/ `NOT_ALL_CASH` / `BRIEF_HOLDOUT` (< 6h) / `EXTENDED_HOLDOUT`
+(< 48h) / `PROLONGED_HOLDOUT` (≥ 48h). Live ground-truth at ship
+time: `EXTENDED_HOLDOUT` — book has held nothing for **9.1h** on
+$987.39 cash across 45 contiguous all-cash equity_curve points (SPY
+flat over the streak window, weekend). Until this analytic shipped,
+that "we just rolled into a 9-hour sidelining" fact was reconstructable
+only by hand-walking the equity_curve.
+
+Full coverage in `tests/test_all_cash_streak.py` (19 tests including
+flat-epsilon boundary, multi-streak aggregate-hours arithmetic,
+history-cap at `_MAX_HISTORY`, SPY-marks honesty floor, negative-SPY
+"cash saved" sign, malformed-row never-raises).
+
+### `/api/recycled-ticker-pnl` (`paper_trader/analytics/recycled_ticker_pnl.py`)
+
+Per-ticker realized P&L across **recycled** names — answers the
+question this pass's prior sibling analytic (`/api/initiation-drought`,
+shipped earlier 2026-05-24) raises but doesn't price: **does the
+bot's recycling habit actually make money?** The live shape that
+drove this is the 9-buys / 3-distinct-names / 67%-re-cycle ledger
+that `initiation_drought` graded `RECYCLING`. None of the existing
+P&L analytics decompose by recycled name:
+
+- `/api/round-trips` is the raw closed-trip list (no per-name aggregate)
+- `/api/repeat-loser` only flags current losing streaks
+- `/api/trade-asymmetry` is book-wide expectancy
+- `/api/pnl-attribution` is OPEN-position attribution (β + idiosyncratic)
+- `/api/per-ticker-skill` is ML scorer rank-IC, not realized trader P&L
+- `/api/round-trip-postmortem` is per-recently-closed-trip post-exit move
+
+Reuses the canonical `analytics.round_trips.build_round_trips`
+(AGENTS.md #10 SSOT — never re-derived) for closed-round-trip
+grouping. For each ticker with ≥2 round-trips (recycled), aggregates
+cost / proceeds / realized P&L, win/loss/wash split (using
+`trade_asymmetry`'s ±$0.50 wash band), best/worst trip, avg hold
+days, and per-ticker bookends. Stock + options round-trips share
+a ticker bucket (a NVDA stock RT plus a NVDA call RT both count as
+NVDA recycling).
+
+Per-ticker verdict ladder: `PROFITABLE_RECYCLE` (cumulative net ≥
++$1 AND win_rate > 50%) / `DRAG_RECYCLE` (net ≤ -$1 OR win_rate <
+34% AND net < 0) / `NEUTRAL_RECYCLE`. Overall: `WORTH_THE_CHURN` /
+`CHURN_NEUTRAL` / `CHURN_DRAG` / `NO_RECYCLED_NAMES` / `NO_DATA`.
+Live ground-truth at ship time: `CHURN_DRAG` — NVDA recycled 2x
+for net **-$19.58** realized, 0/2 wins. Worst-realized-first ordering
+puts NVDA at the top; the headline cites the worst offender.
+
+Defensive wrapping around `build_round_trips` (which raises on
+non-numeric `qty`/`price` cells) preserves the never-raises contract
+on the dashboard endpoint — degrades to a coherent `NO_DATA` envelope
+rather than 500.
+
+Full coverage in `tests/test_recycled_ticker_pnl.py` (17 tests
+including `WORTH_THE_CHURN` / `CHURN_DRAG` / `CHURN_NEUTRAL` /
+`NO_RECYCLED_NAMES` ladder, win-rate-below-34% drag classification,
+multi-ticker net-counts-only-recycled-names invariant, sorted
+worst-first ordering, option/stock shared-bucket arithmetic, full
+per-ticker record shape, malformed-rows never-raises, plus a
+live-shape regression case reproducing the 3-recycled-names mixed-
+outcome ledger).
+
+### Why these two
+
+`/api/all-cash-streak` is the loudest possible thing on the dashboard
+the moment the book is flat — and right now it IS flat. The prior
+177 endpoints could each describe a *symptom* of being all-cash
+(cash_drag, decision_drought, idle_opportunity) but none said
+"contiguous flat for 9.1h on $987 — here is the SPY benchmark over
+that exact window." A trader needs that one-line surface.
+
+`/api/recycled-ticker-pnl` is the natural follow-on to
+`/api/initiation-drought`: the latter says "you have recycled 6 buys
+across 3 names in 113 hours"; this says "and those recycles have cost
+you $20 net on NVDA". Together they let an operator decide whether
+the recycling is a habit worth keeping (`WORTH_THE_CHURN`) or a
+pattern to break (`CHURN_DRAG` on the live ledger).
+
+### Test commands
+
+```
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_all_cash_streak.py tests/test_recycled_ticker_pnl.py -v
+# focused regression on adjacent analytics (235 tests, ~1.6s):
+python3 -m pytest tests/test_all_cash_streak.py tests/test_recycled_ticker_pnl.py \
+  tests/test_round_trips.py tests/test_initiation_drought.py \
+  tests/test_first_trade_after_drought.py tests/test_realized_vs_unrealized.py \
+  tests/test_cash_drag.py tests/test_cash_conviction_fit.py \
+  tests/test_cash_redeployment_latency_skill.py tests/test_trade_asymmetry.py \
+  tests/test_repeat_loser.py tests/test_round_trip_postmortem.py -q
+# dashboard wiring (46 tests):
+python3 -m pytest tests/test_dashboard_swr.py tests/test_dashboard_threaded.py \
+  tests/test_all_cash_streak.py tests/test_recycled_ticker_pnl.py -q
+```
+
+### Staging discipline
+
+Per-commit explicit pathspec, no `git add -A`. At commit time the
+working copy carried multiple sets of foreign edits (sibling agents:
+modifications to `paper_trader/backtest.py`, `paper_trader/reporter.py`;
+an in-flight `/api/passive-signal-density` route added to
+`paper_trader/dashboard.py` whose companion `analytics/
+passive_signal_density.py` + test were still untracked; cross-repo
+`digital-intern/` files; `tests/test_regime_leverage_fit_reporter.py`).
+All left untouched. The sibling's `/api/passive-signal-density` route
+would have imported a module not yet committed, so to keep a clean
+`dashboard.py` diff this pass ran `git checkout HEAD --
+paper_trader/dashboard.py` first to drop the foreign in-flight route,
+then re-applied only this agent's two new route additions. `git diff
+--staged --name-only` verified before commit that only this agent's
+files were staged: the two new analytics modules, their two new test
+files, this AGENTS.md update, and the dashboard.py endpoint wiring
+(clean +59-line diff, only this agent's two routes).

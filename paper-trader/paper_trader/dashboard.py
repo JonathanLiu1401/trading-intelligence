@@ -13835,6 +13835,65 @@ def first_trade_after_drought_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/all-cash-streak")
+def all_cash_streak_api():
+    """Contiguous all-cash streak — how long has the book held nothing?
+
+    The existing cash analytics describe different shapes: /api/cash-drag
+    is time-weighted AVERAGE cash inside fixed rolling windows;
+    /api/cash-conviction-fit is the per-cycle sizing-vs-signal fit;
+    /api/cash-redeployment-latency-skill is a per-SELL hours-to-redeploy
+    metric. None surface the **book-level contiguous-streak** — "the bot
+    has held NOTHING for X hours and SPY did Y% in that window." This
+    walks ``equity_curve`` to find the current streak (or the most
+    recently completed one) and reports the SPY benchmark + alpha cost
+    over the exact streak window. Verdict ladder:
+    NOT_ALL_CASH / BRIEF_HOLDOUT / EXTENDED_HOLDOUT / PROLONGED_HOLDOUT /
+    INSUFFICIENT_HISTORY / NO_DATA. Pure builder, full coverage in
+    tests/test_all_cash_streak.py. Advisory only — never gates Opus,
+    adds no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.all_cash_streak import build_all_cash_streak
+        store = get_store()
+        return jsonify(build_all_cash_streak(store.equity_curve(limit=5000)))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/recycled-ticker-pnl")
+def recycled_ticker_pnl_api():
+    """Per-ticker realized P&L across recycled names — does the recycling pay?
+
+    /api/initiation-drought surfaces THAT the bot is recycling (9 buys,
+    3 distinct names, 67% re-cycle on 2026-05-24 was the live shape
+    that drove this analytic to ship). It does NOT answer **whether the
+    recycling actually makes money**. /api/round-trips is the raw closed
+    list with no per-ticker aggregate; /api/repeat-loser tracks current
+    losing streaks only; /api/trade-asymmetry is book-wide expectancy
+    without per-name decomposition; /api/per-ticker-skill is the ML
+    scorer's per-ticker rank-IC, not realized trader P&L.
+
+    Groups closed round-trips (reusing the canonical
+    ``analytics.round_trips.build_round_trips`` helper) by ticker. For
+    each ticker with ≥2 round-trips, surfaces cumulative cost/proceeds/
+    realized P&L, win rate, best/worst trip, avg hold days, and a
+    PROFITABLE_RECYCLE / NEUTRAL_RECYCLE / DRAG_RECYCLE per-ticker
+    verdict. Overall verdict: WORTH_THE_CHURN / CHURN_NEUTRAL /
+    CHURN_DRAG / NO_RECYCLED_NAMES / NO_DATA. Pure builder, full coverage
+    in tests/test_recycled_ticker_pnl.py. Advisory only — never gates
+    Opus, adds no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.recycled_ticker_pnl import build_recycled_ticker_pnl
+        store = get_store()
+        # build_round_trips wants oldest→newest; recent_trades is newest-first.
+        trades = list(reversed(store.recent_trades(limit=5000)))
+        return jsonify(build_recycled_ticker_pnl(trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/churn")
 def churn_api():
     """Overtrading & same-name re-entry churn — the turnover question.
