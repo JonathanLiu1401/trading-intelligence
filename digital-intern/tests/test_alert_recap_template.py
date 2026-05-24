@@ -559,6 +559,93 @@ class TestHelperCatchesLiveNoise:
             assert hit, f"missed whats-next-after recap: {t!r}"
             assert name == "whats_next_after"
 
+    def test_subject_led_pct_after_recap(self):
+        """SUBJECT-led sibling of why_pct_after / why_stock_is_after — the
+        MarketBeat / simplywall.st / bloomingbit / Yahoo recap mill states the
+        price-attribution as fact (no leading ``Why``), so the existing
+        Why-anchored gates miss it.
+
+        Live evidence (2026-05-22..24, 7d articles.db urgency=2 scan, all
+        fired or queued for BREAKING push):
+          - "D-Wave Quantum (QBTS) Is Up 44.5% After $100 Million Planned
+             Federal Equity Investment - simplywall.st" — ai=9.0 (Sonnet
+             over-scored), urgency=2 alerted
+          - "NVIDIA (NASDAQ:NVDA) Shares Down 1.9% After Analyst Downgrade -
+             MarketBeat" — ml=9.98 score_source='ml', urgency=2
+          - "Lumentum (NASDAQ:LITE) Shares Down 8.8% After Insider Selling -
+             MarketBeat" — ml=9.63 score_source='ml', urgency=2 (held position!)
+          - "MakeMyTrip (MMYT) Is Down 7.8% After Mixed FY26 Earnings ..." —
+             ml=9.87 score_source='ml', urgency=2
+
+        Pin the live failure cases plus plausible same-template siblings —
+        any future regex tightening that re-admits one fails this suite."""
+        for t in (
+            # Live failure cases — exact titles that fired or queued.
+            "D-Wave Quantum (QBTS) Is Up 44.5% After $100 Million Planned "
+            "Federal Equity Investment - What's Changed - simplywall.st",
+            "NVIDIA (NASDAQ:NVDA) Shares Down 1.9% After Analyst Downgrade - MarketBeat",
+            "Lumentum (NASDAQ:LITE) Shares Down 8.8% After Insider Selling - MarketBeat",
+            "MakeMyTrip (MMYT) Is Down 7.8% After Mixed FY26 Earnings Under "
+            "Travel Disruptions And Ongoing Investments",
+            # Same template, other tickers / directions / verb-bridge variants.
+            "Apple Inc (AAPL) Stock Is Up 5.2% After Strong Q1",
+            "Tesla (NASDAQ:TSLA) Shares Down 12% After Delivery Miss",
+            "Oracle (ORCL) Is Higher 6% After Cloud Beat",
+            "AMD (NASDAQ:AMD) Stock Was Down 3.5% After Foundry Loss",
+            "Intel Stock Is Now Up 2.1% After Guidance Beat",
+            "Micron (MU) Are Down 4% After Memory Glut Warning",
+            "QBTS Stock Was Higher 8% After SEC Approval",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed subject-pct-after recap: {t!r}"
+            assert name == "subject_pct_after", (
+                f"wrong fingerprint for {t!r}: got {name!r}"
+            )
+
+    def test_subject_pct_after_does_not_overcatch_real_breaking(self):
+        """The subject_pct_after pattern must NOT catch real wire copy. The
+        QUAD discriminator (1..6 subject tokens + Shares/Stock/Is/Are/Was/Were
+        + Up/Down/Higher/Lower + ``\\d+%`` + ``after``) is what makes the gate
+        precise — any real news that fails one element survives.
+
+        Critical false-positive guard: a real BREAKING headline with a
+        trailing price footer ("Nvidia Beats Estimates ...; Shares Up 0.2%
+        After Hours") has the verb bridge 9+ tokens from start, beyond the
+        ≤6 subject-lead cap, so does NOT match — the BREAKING verb at the
+        front (``Beats``) is what the analyst needs to see."""
+        for t in (
+            # Real news with trailing price footer — verb bridge too far in.
+            "Nvidia Beats Estimates With $81.62 Billion in Q1 Revenue; Shares Up 0.2% After Hours - bloomingbit",
+            "Fed cuts rates 50bp; stocks up 2% after surprise announcement",
+            # Missing digit %.
+            "Tesla shares jump after earnings beat",
+            "Stock futures edge higher ahead of Nvidia earnings",
+            "MU shares halted on pending news",
+            # Missing direction word.
+            "NVDA Shares 2.1% After Q1",
+            # Missing ``after``.
+            "QBTS Is Up 44.5% Today",
+            "NVDA Shares Down 1.9% On Downgrade",
+            # No verb bridge — just %/move language in prose.
+            "MU revenue rises 22% after Q1 beats consensus",
+            "Nvidia Q1 revenue rises 22% to $35.1 billion, beats estimates",
+            # Why-led — caught by the sibling pattern, NOT this one.
+            "Why NVDA Is Up 5.2% After New AI Chip Launch",
+            "Why Nvidia Stock Is Barely Moving After Earnings Crushed Expectations",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            if t.lstrip().lower().startswith("why"):
+                # The Why-led variants SHOULD be caught — by a sibling.
+                assert hit, f"why-led variant unexpectedly not caught: {t!r}"
+                assert name != "subject_pct_after", (
+                    f"why-led {t!r} stolen by subject_pct_after (should be "
+                    f"why_*): got name={name!r}"
+                )
+                continue
+            assert not hit, (
+                f"subject_pct_after over-caught real news: {t!r} (name={name})"
+            )
+
 
 # ── _looks_like_recap_template: real breaking headlines MUST survive ───────
 

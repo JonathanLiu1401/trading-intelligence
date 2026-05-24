@@ -1756,6 +1756,34 @@ _BRIEFING_RT_EARNINGS_RELEASE_PT = re.compile(
     r"\bprice\s+target\b",
     re.IGNORECASE,
 )
+# "<Subject> (TICKER) (Is|Are|Shares|Stock Is) (Up|Down|Higher|Lower) N.N%
+# After <event>" — lockstep mirror of watchers.alert_agent._RT_SUBJECT_PCT_AFTER.
+# SUBJECT-led sibling of why_pct_after / why_stock_is_after which require a
+# leading ``^Why`` anchor; the MarketBeat / simplywall.st / bloomingbit / Yahoo
+# recap mill states the price-attribution as fact (no leading ``Why``). Live
+# evidence (2026-05-22..24, 7d articles.db urgency=2 scan):
+#   - "D-Wave Quantum (QBTS) Is Up 44.5% After $100M Federal Equity Investment"
+#   - "NVIDIA (NASDAQ:NVDA) Shares Down 1.9% After Analyst Downgrade"
+#   - "Lumentum (NASDAQ:LITE) Shares Down 8.8% After Insider Selling" (HELD!)
+#   - "MakeMyTrip (MMYT) Is Down 7.8% After Mixed FY26 Earnings"
+# Without this gate the per-domain cap admits them into the briefing's top-50
+# digest pool — surfacing post-event price-attribution recap as fresh TOP
+# SIGNALS despite being retrospective. Byte-identical regex to the alert side
+# (anti-drift discipline, enforced structurally by
+# ``test_alert_and_briefing_recap_tuples_have_same_length``).
+_BRIEFING_RT_SUBJECT_PCT_AFTER = re.compile(
+    r"^(?!\s*why\b)"
+    r"\s*\S+(?:\s+\S+){0,5}?\s+"
+    r"(?:"
+        r"(?:shares|stock)(?:\s+(?:is|was|now|currently)){0,2}\s+"
+        r"(?:up|down|higher|lower)"
+        r"|"
+        r"(?:is|are|was|were)\s+(?:up|down|higher|lower)"
+    r")\s+"
+    r"\d+(?:\.\d+)?\s*%\s+"
+    r"after\b",
+    re.IGNORECASE,
+)
 
 _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _BRIEFING_RT_WHY_TRADING),
@@ -1769,6 +1797,10 @@ _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     # fingerprint name (mirrors the alert-side ordering).
     ("why_stock_is_after", _BRIEFING_RT_WHY_STOCK_IS_AFTER),
     ("why_pct_after", _BRIEFING_RT_WHY_PCT_AFTER),
+    # SUBJECT-led sibling — lockstep mirror of the alert path's same-named
+    # gate. The negative ``(?!\s*why\b)`` lookahead keeps it mutually
+    # exclusive with the Why-led siblings above.
+    ("subject_pct_after", _BRIEFING_RT_SUBJECT_PCT_AFTER),
     ("market_today_dated", _BRIEFING_RT_MARKET_TODAY),
     ("earnings_call_recap", _BRIEFING_RT_EARNINGS_CALL),
     ("quick_glance_metrics", _BRIEFING_RT_QUICK_GLANCE),
