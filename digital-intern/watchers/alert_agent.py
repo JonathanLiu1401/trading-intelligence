@@ -981,6 +981,50 @@ _RT_DAILY_PRICE_CITY = re.compile(
     re.IGNORECASE,
 )
 
+# "What is/'s Next After <X> {Trounces|Crushes|Beats|...} Expectations/Earnings"
+# — Baystreet.ca / Investorideas / GuruFocus post-event valuation-question SEO
+# mill. By definition retrospective: the print is named ("After NVIDIA Trounces
+# Expectations") and the article asks what comes next; the move was already in
+# the market when this was written. Same retrospective shape as
+# ``_RT_IS_BUY_AFTER`` (post-event valuation question) and
+# ``_RT_HERES_WHAT_HAPPENED`` (post-event explainer).
+#
+# Live evidence (2026-05-23 17:39:55Z, articles.db urgency=2 set): the exact
+# row "Baystreet . ca - What is Next After NVIDIA Trounces Expectations" from
+# the ``GDELT/baystreet.ca`` collector reached urgency=2 with
+# ``score_source='ml'``, ml_score=10.0. Baystreet credibility tier (DEFAULT
+# 0.55) sits ABOVE the 0.45 ``ALERT_MIN_LONE_SOURCE_CRED`` bar so the
+# source-authority gate doesn't catch it; content type IS the failure. The
+# same Baystreet "What is Next After NVIDIA Trounces Expectations" was scored
+# repeatedly across the NVDA earnings-week window — a recurring SEO syndication
+# the ML urgency head over-scores because "NVIDIA" + "Expectations" + a
+# question-form title trip its high-relevance pattern recognition.
+#
+# Discriminator: ``\bwhat(?:'s|\s+is)?\s+next\s+after\b`` (the "next after"
+# bridge is the post-event anchor — a real ongoing question without "after"
+# is unaffected) + a post-event terminator from a closed list (``trounces|
+# crushes|beats|beat|beating|expectations|earnings|results|report|quarter|
+# q[1-4]|miss(?:es|ed)?|ipo|guidance``). The "after" requirement is what
+# makes this safe — "What's next for the rally?" / "What's Next for Apple"
+# do NOT match because they lack the retrospective anchor. Validated against
+# the must-survive corpus: real macro questions ("What's next for the chip
+# cycle?", "What comes next after Q3?", "Fed cuts rates 25bp; Powell
+# signals more") all do NOT match because none combine the leading
+# "What's/Is Next After" bridge with a post-event terminator. The "What
+# is Next After Q1 Earnings" form fires, which is also legitimately
+# retrospective — Q1 earnings already happened.
+#
+# Substring (not anchored ^) so the GDELT-style prefix "Baystreet . ca - ..."
+# is matched — the actual live failure form. Validated against the live
+# noise corpus and the must-survive corpus.
+_RT_WHATS_NEXT_AFTER = re.compile(
+    r"\bwhat(?:'s|\s+is)?\s+next\s+after\b.*?\b"
+    r"(?:trounces?|trounced|crushes?|crushed|beats?|beating|"
+    r"expectations?|earnings|results|report|quarter|q[1-4]|"
+    r"miss(?:es|ed)?|ipo|guidance)\b",
+    re.IGNORECASE,
+)
+
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
@@ -1008,6 +1052,7 @@ _RECAP_TEMPLATE_PATTERNS = (
     ("shares_bought_by", _RT_SHARES_BOUGHT_BY),
     ("futures_why_today", _RT_FUTURES_WHY_TODAY),
     ("daily_price_city", _RT_DAILY_PRICE_CITY),
+    ("whats_next_after", _RT_WHATS_NEXT_AFTER),
 )
 
 

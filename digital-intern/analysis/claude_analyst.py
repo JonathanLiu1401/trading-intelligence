@@ -1724,6 +1724,20 @@ _BRIEFING_RT_DAILY_PRICE_CITY = re.compile(
     r"today\s+in\s+\S",
     re.IGNORECASE,
 )
+# "What is/'s Next After <X> {Trounces|...} Expectations/Earnings" — lockstep
+# mirror of watchers.alert_agent._RT_WHATS_NEXT_AFTER. The alert path was
+# silently shipping the regex defined-but-unused (never added to the patterns
+# tuple); fixed alongside this briefing-side addition. Live evidence
+# (2026-05-23, articles.db urgency=2 set): "Baystreet . ca - What is Next
+# After NVIDIA Trounces Expectations" landed score_source='ml', ml_score=10.0
+# — without this mirror it would surface as a TOP SIGNAL in the briefing.
+_BRIEFING_RT_WHATS_NEXT_AFTER = re.compile(
+    r"\bwhat(?:'s|\s+is)?\s+next\s+after\b.*?\b"
+    r"(?:trounces?|trounced|crushes?|crushed|beats?|beating|"
+    r"expectations?|earnings|results|report|quarter|q[1-4]|"
+    r"miss(?:es|ed)?|ipo|guidance)\b",
+    re.IGNORECASE,
+)
 
 _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _BRIEFING_RT_WHY_TRADING),
@@ -1751,6 +1765,7 @@ _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("shares_bought_by", _BRIEFING_RT_SHARES_BOUGHT_BY),
     ("futures_why_today", _BRIEFING_RT_FUTURES_WHY_TODAY),
     ("daily_price_city", _BRIEFING_RT_DAILY_PRICE_CITY),
+    ("whats_next_after", _BRIEFING_RT_WHATS_NEXT_AFTER),
 )
 
 
