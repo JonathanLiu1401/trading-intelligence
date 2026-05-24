@@ -6402,6 +6402,37 @@ def watchlist_opportunities_api():
         return jsonify({"error": str(e), "opportunities": []}), 500
 
 
+@app.route("/api/persistent-watchlist-opportunity")
+@swr_cached("persistent-watchlist-opportunity", 60.0)
+def persistent_watchlist_opportunity_api():
+    """Watchlist names that have held elevated news heat for many CONTIGUOUS
+    hours while the book has zero exposure — the TIME-aged complement to
+    `/api/watchlist-opportunities` (snapshot) and `/api/idle-opportunity`
+    (drought-only). Surfaces "I keep missing NVDA" before it shows up as a
+    realized opportunity-cost number. Uses a single 48h-wide signals fetch;
+    the pure SSOT bins per (ticker, hour) and reports the *current* and
+    *longest* contiguous hot-run per name. Observational only —
+    never gates Opus, no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.persistent_watchlist_opportunity import (
+            DEFAULT_WINDOW_HOURS,
+            build_persistent_watchlist_opportunity,
+        )
+        from .strategy import WATCHLIST as _WATCHLIST
+        from . import signals as _sig
+        store = get_store()
+        held = {str(p.get("ticker") or "").upper()
+                for p in store.open_positions() if (p.get("qty") or 0) > 0}
+        sigs = _sig.get_top_signals(
+            n=2000, hours=int(DEFAULT_WINDOW_HOURS), min_score=0.0)
+        out = build_persistent_watchlist_opportunity(
+            _WATCHLIST, held, sigs)
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e), "opportunities": [],
+                        "state": "ERROR"}), 500
+
+
 @app.route("/api/state")
 @swr_cached("state", 15.0)
 def state():
