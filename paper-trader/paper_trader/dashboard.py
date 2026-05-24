@@ -9494,6 +9494,78 @@ def benchmark_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/cash-drag")
+@swr_cached("cash_drag", 30.0)
+def cash_drag_api():
+    """Rolling cash opportunity cost vs the S&P 500.
+
+    The companion to ``/api/benchmark``: that one says "lifetime alpha is
+    -2.22pp"; this one breaks the idle-cash component out into per-window
+    USD numbers — "in the last 24h sitting in cash, you cost yourself
+    $1.23 vs holding SPY". The dimension benchmark doesn't carry.
+
+    Composes ``cash_drag.build_cash_drag`` **verbatim** (single source of
+    truth — the arithmetic lives in the analytics module, this endpoint
+    never re-derives it; the ``benchmark`` / ``drawdown`` builder/endpoint
+    split). Reads the same ``store.equity_curve`` rows that benchmark
+    reads, so the two endpoints can never disagree about what data was
+    available. Pure & DB-only — no network.
+
+    Sample-size-honest: per-window arms emit INSUFFICIENT (with a span
+    headline) when a window has < 2 benchmarkable points or covers less
+    than 60% of the requested hours. The top-level verdict is the WORST
+    OK verdict so a one-line UI banner surfaces the most-costly window.
+    """
+    try:
+        from .analytics.cash_drag import build_cash_drag
+        store = get_store()
+        eq = store.equity_curve(limit=5000)
+        return jsonify(build_cash_drag(eq))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/market-closure-window")
+def market_closure_window_api():
+    """NYSE closure-window planning surface.
+
+    Every other "is the market open" surface in this stack is a boolean
+    (runner cadence, MARKET_OPEN flag, briefing card). This one frames
+    the gap *itself* as the object: ``closure_class`` (OPEN / OVERNIGHT
+    / WEEKEND / HOLIDAY_EXTENDED) + ``closure_hours`` + holidays inside
+    the window. A 64h Memorial Day weekend reads structurally different
+    from a 17h overnight, and the bot is currently sitting through one
+    without any surface that names it.
+
+    Composes ``market_closure.build_market_closure`` **verbatim** — the
+    calendar walk lives in the analytics module + ``market.py`` helpers
+    (``previous_session_close`` / ``next_session_open`` / the
+    NYSE_HOLIDAYS_2026 table). No I/O, never raises.
+
+    Deliberately NOT @swr_cached — the call is a pure calendar walk;
+    caching it for 30s would only obscure tick-edge transitions
+    (closure_class flipping OPEN ↔ CLOSED at the bell). The notify_health
+    / alarm_latches precedent.
+    """
+    try:
+        from .analytics.market_closure import build_market_closure
+        return jsonify(build_market_closure())
+    except Exception as e:
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "is_market_open": False,
+            "closure_class": "UNKNOWN",
+            "closure_hours": 0.0,
+            "hours_since_close": 0.0,
+            "secs_until_open": None,
+            "prev_close_ts_utc": None,
+            "next_open_ts_utc": None,
+            "holidays_in_window": [],
+            "headline": f"market-closure endpoint error: {e}",
+            "verdict": "UNKNOWN",
+        }), 500
+
+
 @app.route("/api/earnings-risk")
 def earnings_risk_api():
     """Upcoming earnings cross-referenced against held positions + watchlist.

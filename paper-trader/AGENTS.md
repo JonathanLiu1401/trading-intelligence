@@ -6,6 +6,187 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 feature pass (Agent 4) — `/api/cash-drag` + `/api/market-closure-window`
+
+Two new dashboard surfaces shipped, each closing a structural gap the
+existing 250+ endpoint surface had not covered. Both follow the
+`analytics/<name>.py` pure-builder + `dashboard.py` thin-endpoint split
+that `benchmark.py` and `drawdown.py` pioneered — the builder owns the
+arithmetic & verdict, the endpoint single-sources verbatim (invariant
+#10). 32 new tests; 0 regressions in the 166-test scoped neighbour
+suite (`-k "cash_drag or market_closure or benchmark or core_market or
+alarm_latches"`).
+
+### Feature 1: `/api/cash-drag` — rolling cash opportunity cost vs the S&P 500
+
+`paper_trader/analytics/cash_drag.py::build_cash_drag(equity_curve,
+windows_h=(24, 168, 720))`. The companion to `/api/benchmark`: that one
+says "lifetime alpha is -2.22pp" — true, structural, but blunt. This one
+breaks the idle-cash component out into per-window USD numbers. For each
+window the builder computes:
+
+* `avg_cash_usd` — **time-weighted** mean of the `cash` column
+  (trapezoidal between consecutive `equity_curve` rows), so a short
+  spike at one end does not dominate a long stretch of zero cash at
+  the other (which a simple mean would). A failing test pins this
+  weighting: rows `[0, 0, 1000]` spanning 19.5h must yield ~$115
+  (trapezoidal), not ~$333 (simple mean).
+* `sp500_return_pct` — `(sp_close / sp_open - 1) * 100` across the
+  first and last benchmarkable rows in window.
+* `cash_drag_usd` = `avg_cash_usd * sp500_return_pct / 100`. Sign
+  convention: POSITIVE = cash COST you money (SPY rose while idle);
+  NEGATIVE = cash SAVED you money (SPY fell, being out paid off).
+
+Per-window verdicts `COSTLY_CASH` / `HELPFUL_CASH` / `NEUTRAL`
+(absolute drag inside the $0.50 band) / `INSUFFICIENT` (window has
+< 2 benchmarkable points OR spans < 60% of the requested hours — the
+sample-size-honest precedent from `benchmark.py`). The TOP-LEVEL
+verdict is the most-costly OK window so a single-line UI banner
+surfaces the highest-pain window without the consumer iterating.
+
+Live-corpus snapshot at ship time (`equity_curve` 441 benchmarkable
+points, ~5d depth — the documented shallow-history regime):
+
+```
+24h:  NEUTRAL  — SPY +0.00% (weekend, market closed)
+168h: COSTLY_CASH — cash cost $3.28 (SPY +0.96%, avg cash $341.86)
+720h: INSUFFICIENT — 441 pts spanning 124.7h
+```
+
+→ top-level `COSTLY_CASH`. The 168h number says: of the dollars sitting
+in cash during the last week (avg $341), SPY moving +0.96% means the
+idle component cost the book $3.28. The lifetime `/api/benchmark` says
+-$22.20 vs SPY — `cash_drag` answers *how much of that came from cash
+specifically* on the per-window resolution `benchmark` does not carry.
+
+Locked by `tests/test_cash_drag.py` (14 cases):
+state ladder (NO_DATA on empty / all-unparseable rows; INSUFFICIENT
+when span < 60% of window or single point); arithmetic pins
+(`costly_cash_when_spy_rises` — SPY +1%, $1000 cash → exact $10 drag;
+`helpful_cash_when_spy_falls` symmetric; `neutral_band_absorbs_tiny_drag`
+— $0.05 stays NEUTRAL; `time_weighted_average_weights_long_intervals`
+— trapezoidal vs simple mean discriminator); window filter
+(`only_in_window_rows_count` — a 48h-old row outside the 24h window
+must NOT shift the anchor); top-verdict picker (`worst_costly_window`
+when both 24h and 168h are COSTLY); endpoint contract (NO_DATA envelope
+on empty store; verdict pass-through to confirm the endpoint never
+re-derives; 500 + error envelope on store failure).
+
+Endpoint: `/api/cash-drag` decorated `@swr_cached("cash_drag", 30.0)`
+(read-only, ~ms-scale arithmetic, 30s TTL matches `/api/benchmark`).
+
+### Feature 2: `/api/market-closure-window` — NYSE closure-window planner
+
+`paper_trader/analytics/market_closure.py::build_market_closure(now)`
+plus a new symmetric helper `paper_trader/market.py::previous_session_close`
+that walks the NYSE_HOLIDAYS_2026 / NYSE_HALF_DAYS_2026 / weekday
+calendar BACKWARD (mirror of the existing `next_session_close`).
+
+The gap surfaced: every other "is the market open" panel in this stack
+is a **boolean** (runner cadence, MARKET_OPEN prompt flag, briefing
+card). None of them framed the closure **gap** as the object itself.
+The bot is right now sitting through a 89.5h Memorial Day weekend
+closure with the Opus reasoning writing "MRVL earnings in 2.8d gives a
+setup to size into Tuesday open" — it is *implicitly* reasoning about
+the closure window without any analytical surface that names it. The
+new endpoint emits:
+
+* `closure_class` — `OPEN` / `OVERNIGHT` (≤24h, no holiday) / `WEEKEND`
+  (>24h, no holiday) / `HOLIDAY_EXTENDED` (any holiday inside the gap,
+  regardless of length) / `UNKNOWN` (calendar walk failed → safe-
+  defaults envelope, mirrors `/api/alarm-latches` degrade contract).
+* `closure_hours` — wall-clock hours between previous close and next
+  open. `0.0` when OPEN.
+* `hours_since_close` — float hours since the previous close (advances
+  during the gap; the "how long has the bell been silent" number).
+* `holidays_in_window` — list of ISO dates that hit
+  `NYSE_HOLIDAYS_2026` strictly inside the gap (the closing & opening
+  dates are excluded — only holidays that are NEITHER endpoint count).
+* `prev_close_ts_utc` / `next_open_ts_utc` / `secs_until_open` — the
+  raw timestamps so a UI consumer can render a countdown without
+  re-deriving the calendar.
+* `headline` — single-source one-liner the dashboard, chat and
+  Discord render verbatim.
+
+Live snapshot at ship time:
+
+```
+closure_class: HOLIDAY_EXTENDED
+closure_hours: 89.5
+holidays_in_window: ["2026-05-25"]
+headline: "HOLIDAY_EXTENDED — 89.5h closure (Fri 16:00 ET → Tue 09:30 ET);
+          NYSE holiday in window: 2026-05-25; next bell in 55h57m."
+```
+
+A normal weeknight closure → `OVERNIGHT` (~17.5h); a normal weekend
+→ `WEEKEND` (~65.5h); Memorial Day / Labor Day / July 4 weekends
+→ `HOLIDAY_EXTENDED`. The class itself is the actionable read — the
+operator confirms at a glance whether the bot is sized correctly for
+the gap class without scrolling the briefing card.
+
+Locked by `tests/test_market_closure.py` (18 cases):
+`previous_session_close` helper (yesterday-close mid-session,
+today-close past today's close, Friday-close on Saturday, skips Memorial
+Day holiday → walks back to Friday, half-day at 13:00 ET on
+2026-11-27); `_holidays_in_window` (Memorial Day in Fri→Tue,
+empty for a normal weekend, boundary dates excluded, None-safe);
+`build_market_closure` classification (OPEN inside session, OVERNIGHT
+17–18h, WEEKEND no-holiday 64–67h, HOLIDAY_EXTENDED Memorial Day
+88–91h with `"2026-05-25"` in the list, half-day Friday Thanksgiving →
+WEEKEND not HOLIDAY_EXTENDED because the gap contains no NYSE holiday,
+`secs_until_open` strictly decreasing toward the bell across two
+sample times, calendar-walk failure degrades to UNKNOWN). Endpoint
+contract (envelope key contract, classification in documented set, 500
+envelope shape on builder failure).
+
+Endpoint: `/api/market-closure-window` — **deliberately NOT
+@swr_cached** (pure calendar walk; caching for 30s would obscure
+tick-edge OPEN ↔ CLOSED transitions at the bell — the
+`notify_health` / `alarm_latches` precedent).
+
+### Files touched
+
+* `paper_trader/market.py` — `previous_session_close(now)` added (symmetric
+  to `next_session_close`; pure, no I/O, defensive 14-day backward walk).
+* `paper_trader/analytics/cash_drag.py` — NEW.
+* `paper_trader/analytics/market_closure.py` — NEW.
+* `paper_trader/dashboard.py` — `/api/cash-drag` (after `/api/benchmark`)
+  and `/api/market-closure-window` (after the cash-drag block).
+* `tests/test_cash_drag.py` — NEW (14 cases).
+* `tests/test_market_closure.py` — NEW (18 cases).
+* `AGENTS.md` — this entry.
+
+### Test commands
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_cash_drag.py tests/test_market_closure.py -v
+# → 32 passed
+
+# Scoped neighbour regression check:
+python3 -m pytest tests/ -k "cash_drag or market_closure or benchmark \
+                              or core_market or alarm_latches" -q
+# → 166 passed, 0 regressions
+```
+
+Live verification via Flask `test_client` (bypasses the SWR cache and
+the documented "live :8090 runs many commits behind" stale-restart
+hazard):
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -c "from paper_trader import dashboard; \
+  c = dashboard.app.test_client(); \
+  print(c.get('/api/cash-drag').get_json()); \
+  print(c.get('/api/market-closure-window').get_json())"
+```
+
+The endpoints serving on the running :8090 will 404 until the git-watcher
+restart cycle deploys the new commit (the documented stale-runner
+pattern).
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #25 (Agent 2) — `_raw_to_calibrated` symmetric collapsed-label guard + `gate_arm_historical`
 
 ### Phase 1: Debug — 1 bug fixed (1af59f9)
