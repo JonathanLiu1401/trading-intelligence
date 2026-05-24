@@ -71,11 +71,27 @@ _BOOK_TICKERS: tuple[str, ...] = (
     "MU", "MSFT", "AXTI", "ORCL", "TSEM", "QBTS", "NVDA",
 )
 
+# Live held/watched universe — union of the static literal with
+# config/portfolio.json's positions + option underlyings + sector_watchlist
+# (the same SSOT urgency_scorer / ml.features / analysis.claude_analyst use).
+# The static tuple alone was silently drifting behind the trading UI: a
+# 2026-05-23 live read showed GOOG / COHR / NVDL / AMD / AMAT / KLAC / LRCX /
+# NVDL / SMH / SOXX / STX / WDC held in portfolio.json yet absent from the
+# static tuple, so concentration/HHI and the under-covered list never saw any
+# article about those open positions. Anti-drift parity of ``_BOOK_TICKERS``
+# with claude_analyst's static tuple is unchanged (and still pinned by
+# test_book_ticker_parity); the universe only EXTENDS the matching set.
+# Mirrors analysis.claude_analyst._BOOK_UNIVERSE byte-for-byte.
+from ml.features import LIVE_PORTFOLIO_TICKERS as _LIVE_PORTFOLIO_TICKERS
+_BOOK_UNIVERSE: tuple[str, ...] = _BOOK_TICKERS + tuple(
+    sorted(set(_LIVE_PORTFOLIO_TICKERS) - set(_BOOK_TICKERS))
+)
+
 # Longest-first alternation so the regex prefers \bMUU\b over \bMU\b — same
 # convention as analysis.claude_analyst._BOOK_RE / ml.features._LIVE_RE.
 _BOOK_RE = re.compile(
     r"\b(?:"
-    + "|".join(re.escape(t) for t in sorted(set(_BOOK_TICKERS),
+    + "|".join(re.escape(t) for t in sorted(set(_BOOK_UNIVERSE),
                                              key=len, reverse=True))
     + r")\b"
 )
@@ -96,7 +112,7 @@ SNAPSHOT_PATH = Path("/home/zeph/logs/ticker_concentration.json")
 
 def _book_hits(title: Optional[str]) -> list[str]:
     """Return the held tickers mentioned in ``title``, in canonical
-    ``_BOOK_TICKERS`` order, de-duplicated. Empty when nothing matches.
+    ``_BOOK_UNIVERSE`` order, de-duplicated. Empty when nothing matches.
 
     The production ``articles`` table stores title and zlib-compressed
     full_text but no separate summary column — decompressing full_text per
@@ -109,7 +125,7 @@ def _book_hits(title: Optional[str]) -> list[str]:
     hits = set(_BOOK_RE.findall(title))
     if not hits:
         return []
-    return [t for t in _BOOK_TICKERS if t in hits]
+    return [t for t in _BOOK_UNIVERSE if t in hits]
 
 
 def _hhi(shares_pct: list[float]) -> float:
@@ -183,7 +199,7 @@ def compute(now: Optional[datetime] = None, scan_limit: int = SCAN_LIMIT) -> dic
     ]
     over_saturated.sort(key=lambda t: tickers[t]["pct_share"], reverse=True)
 
-    under_covered = [t for t in _BOOK_TICKERS if t not in tickers]
+    under_covered = [t for t in _BOOK_UNIVERSE if t not in tickers]
 
     return {
         "generated_at": now.isoformat(),
