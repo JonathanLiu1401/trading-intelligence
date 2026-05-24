@@ -54,6 +54,13 @@ PIPELINE: list[tuple[str, Path, int]] = [
     ("analytics.market_closed_watchlist", LOGS / "market_closed_watchlist.json", 110),
     ("analytics.stale_source_alerter",   LOGS / "source_freshness.json",        110),
     ("analytics.dedup_savings_report",   LOGS / "dedup_savings_report.json",    110),
+    # Urgency-spike detector: tracks 15-min urgent-article rate vs 6h baseline.
+    # Needs successive runs to accumulate baseline; state stored in
+    # /home/zeph/logs/.urgency_spike_state.json.
+    ("analytics.urgency_spike_detector", LOGS / "urgency_spike.json",           50),
+    # Per-source quality snapshot: avg ai/ml/kw scores + urgency fraction
+    # across the 8,000 most recent live rows.
+    ("analytics.source_quality",         LOGS / "source_quality.json",          50),
 ]
 
 TIMEOUT_S = 60  # per-module hard timeout
