@@ -141,6 +141,7 @@ from collectors.cftc_press_collector import collect_cftc_press
 from collectors.finviz_collector import collect_finviz
 from collectors.seekingalpha_collector import collect_seekingalpha
 from collectors.rsi_extremes_collector import collect_rsi_extremes
+from collectors.aaii_sentiment_collector import collect as collect_aaii_sentiment
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -247,6 +248,7 @@ CFTC_PRESS_INTERVAL    = 1800     # CFTC press + enforcement releases — every 
 FINVIZ_INTERVAL        = 300      # Finviz per-ticker news table (round-robin batch) — every 5min
 SEEKINGALPHA_INTERVAL  = 300      # Seeking Alpha breaking-news RSS — every 5min
 RSI_EXTREMES_INTERVAL  = 900      # RSI overbought/oversold signals — every 15min
+AAII_SENTIMENT_INTERVAL = 3600 * 6  # AAII weekly survey — re-check every 6h (deduped by date)
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
 SHORT_SELLER_INTERVAL   = 1800    # Short-seller research reports (rare, high-priority) — every 30min
 FINANCIAL_BLOGS_INTERVAL = 600    # InvestorPlace, Motley Fool, Nasdaq RSS — every 10min
@@ -387,6 +389,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "fda": FDA_INTERVAL,
     "seekingalpha": SEEKINGALPHA_INTERVAL,
     "rsi_extremes": RSI_EXTREMES_INTERVAL,
+    "aaii_sentiment": AAII_SENTIMENT_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
     "ml_trainer": ML_TRAIN_INTERVAL,
@@ -2427,6 +2430,28 @@ def rsi_extremes_worker(store: ArticleStore):
         _sleep(RSI_EXTREMES_INTERVAL)
 
 
+# ── Worker: AAII Investor Sentiment Survey — every 6h (weekly data, deduped) ─
+def aaii_sentiment_worker(store: ArticleStore):
+    log.info("[aaii_sentiment_worker] started")
+    bo = Backoff("aaii_sentiment", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_aaii_sentiment()
+            _ingest(store, articles, "aaii/sentiment_survey")
+            try:
+                source_health.record_result("aaii_sentiment", len(articles))
+            except Exception as he:
+                log.warning(f"[aaii_sentiment_worker] source_health error: {he}")
+            _worker_last_ok["aaii_sentiment"] = time.time()
+            log.debug(f"[aaii_sentiment] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[aaii_sentiment_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(AAII_SENTIMENT_INTERVAL)
+
+
 # ── Worker: FDA press releases + MedWatch safety alerts — every 30min ────────
 def fda_worker(store: ArticleStore):
     log.info("[fda_worker] started")
@@ -4359,6 +4384,7 @@ def main():
         ("fda",         fda_worker),
         ("seekingalpha", seekingalpha_worker),
         ("rsi_extremes", rsi_extremes_worker),
+        ("aaii_sentiment", aaii_sentiment_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
