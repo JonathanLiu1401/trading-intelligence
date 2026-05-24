@@ -2752,5 +2752,259 @@ class ArticleStore:
             ),
         }
 
+    @_retry_on_lock
+    def cross_book_event_pulse(
+        self,
+        tickers: list[str],
+        hours: int = 24,
+        min_tickers: int = 2,
+        top_n: int = 20,
+    ) -> dict:
+        """Articles whose title+summary mention ``>= min_tickers`` distinct
+        held tickers — the analyst's "what events impact MULTIPLE of my
+        positions simultaneously?" view.
+
+        This is the missing cross-position primitive: every other
+        per-ticker metric (``urgency_label_split_by_ticker``,
+        ``ticker_mention_velocity``, ``urgent_queue_health``,
+        ``book_alert_coverage``) slices by ONE ticker at a time, so a single
+        wire like "MU, STX, WDC, SNDK stocks sink as Samsung strike ripples
+        rattle red-hot AI memory chip trade" — which simultaneously affects
+        three held names — splits into three independent per-ticker rows.
+        The analyst-facing question "what concentrated-risk events are
+        actually happening across the book today?" has no answer.
+
+        Live evidence (2026-05-24, 24h, real production snapshot): 50 of
+        4,946 live rows carried 2+ held tickers in the title alone — a
+        small but meaningful basket of cross-position events buried in the
+        per-ticker noise. The standout urgent row above (urgency=2,
+        score_source='ml', source='GN: semiconductor') hit three of the
+        analyst's memory positions in one go; nothing in the existing
+        primitive set surfaces it as a single "basket" event.
+
+        Articles are grouped by their canonical ticker basket (sorted
+        tuple of held tickers mentioned). Repeated coverage of the SAME
+        basket collapses into one row, so 5 syndicated copies of the
+        Samsung-strike story show as ``count=5`` on the ``(MU, STX, WDC)``
+        basket — preserving the recurring-coverage signal without
+        flooding the digest.
+
+        Matching is whole-word, ALL-CAPS, optional leading ``$``,
+        ``len >= 2`` — byte-identical to ``urgency_label_split_by_ticker``
+        / ``ticker_mention_velocity`` / ``urgent_queue_health`` /
+        ``book_alert_coverage`` so the five per-ticker primitives never
+        disagree about whether a row touches a held name. Match surface
+        is ``title + decompressed summary``.
+
+        Returns::
+
+            {
+              "window_h": int,
+              "min_tickers": int,
+              "by_basket": [
+                {
+                  "basket": ["MU", "STX", "WDC"],     # sorted, deterministic
+                  "basket_size": int,
+                  "count": int,                       # distinct articles in window
+                  "urgent_count": int,                # urgency >= 1 subset
+                  "alerted_count": int,               # urgency = 2 subset
+                  "max_score": float,                 # max COALESCE(ai_score, ml_score)
+                  "newest_age_h": float | None,
+                  "sample_title": str,                # representative title
+                  "sample_source": str,
+                  "score_sources": {"llm": N, "ml": N, ...},
+                },
+                ...
+              ],
+              "total_baskets": int,
+              "total_articles": int,                  # rows fulfilling min_tickers
+            }
+
+        Sorted strongest-event-first: descending ``urgent_count``, then
+        ``basket_size``, then ``count``, then alphabetical first ticker
+        (deterministic, test-pinnable — same tiebreak discipline as
+        ``urgency_label_split_by_source``).
+
+        Read-only (single SELECT) scoped with ``_LIVE_ONLY_CLAUSE`` so the
+        synthetic backtest/opus rows never inflate any basket figure (a
+        backtest title like "NVDA NVDA NVDA" + "MU MU MU" would otherwise
+        manufacture a fake ``(MU, NVDA)`` urgent basket every cycle the
+        runner injected). NO DB write — no ai_score / ml_score /
+        score_source / urgency mutation. All four load-bearing invariants
+        intact by construction.
+        """
+        hours = max(int(hours), 1)
+        min_tickers = max(int(min_tickers), 2)
+        top_n = max(int(top_n), 0)
+
+        if not tickers:
+            return {
+                "window_h": hours,
+                "min_tickers": min_tickers,
+                "by_basket": [],
+                "total_baskets": 0,
+                "total_articles": 0,
+            }
+
+        clean: list[str] = []
+        for raw in tickers:
+            if not raw:
+                continue
+            t = str(raw).strip().upper()
+            if len(t) >= 2 and t not in clean:
+                clean.append(t)
+        if not clean:
+            return {
+                "window_h": hours,
+                "min_tickers": min_tickers,
+                "by_basket": [],
+                "total_baskets": 0,
+                "total_articles": 0,
+            }
+
+        now = datetime.now(timezone.utc)
+        since_iso = (now - timedelta(hours=hours)).isoformat()
+        rows = self.conn.execute(
+            "SELECT title, full_text, urgency, ai_score, ml_score, "
+            "       score_source, source, first_seen "
+            "FROM articles "
+            f"WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+            (since_iso,),
+        ).fetchall()
+
+        # One regex over the held-ticker alternation — same convention as
+        # ticker_mention_velocity / urgency_label_split_by_ticker etc.
+        patterns = {
+            t: re.compile(rf"\b\${{0,1}}{re.escape(t)}\b") for t in clean
+        }
+
+        # basket (sorted-tuple) -> aggregated state
+        baskets: dict[tuple[str, ...], dict] = {}
+        total_articles = 0
+
+        for (title, blob, urg, ai_score, ml_score,
+             src_tag, source, first_seen) in rows:
+            try:
+                summary = decompress(blob) if blob else ""
+            except Exception:
+                summary = ""
+            hay = f"{title or ''} {summary}"
+            hits = sorted(t for t, pat in patterns.items() if pat.search(hay))
+            if len(hits) < min_tickers:
+                continue
+            basket = tuple(hits)
+            total_articles += 1
+
+            try:
+                urg_i = int(urg or 0)
+            except (TypeError, ValueError):
+                urg_i = 0
+            try:
+                ai_f = float(ai_score or 0.0)
+            except (TypeError, ValueError):
+                ai_f = 0.0
+            try:
+                ml_f = float(ml_score) if ml_score is not None else 0.0
+            except (TypeError, ValueError):
+                ml_f = 0.0
+            # Display score uses COALESCE(NULLIF(ai_score,0), ml_score, 0)
+            # — the same convention get_unalerted_urgent / get_top_for_briefing
+            # carry, so the basket pulse's max_score matches what the alert
+            # and briefing paths would render for the same row.
+            row_score = ai_f if ai_f > 0 else ml_f
+
+            ts: datetime | None = None
+            if first_seen:
+                try:
+                    ts = datetime.fromisoformat(first_seen)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    ts = None
+
+            slot = baskets.get(basket)
+            if slot is None:
+                slot = {
+                    "basket": list(basket),
+                    "basket_size": len(basket),
+                    "count": 0,
+                    "urgent_count": 0,
+                    "alerted_count": 0,
+                    "max_score": 0.0,
+                    "newest_ts": None,
+                    "sample_title": "",
+                    "sample_source": "",
+                    "_sample_score": -1.0,
+                    "score_sources": {
+                        "llm": 0, "ml": 0, "briefing_boost": 0, "null": 0,
+                    },
+                }
+                baskets[basket] = slot
+            slot["count"] += 1
+            if urg_i >= 1:
+                slot["urgent_count"] += 1
+            if urg_i >= 2:
+                slot["alerted_count"] += 1
+            if row_score > slot["max_score"]:
+                slot["max_score"] = row_score
+            if ts is not None and (
+                slot["newest_ts"] is None or ts > slot["newest_ts"]
+            ):
+                slot["newest_ts"] = ts
+            # Sample title is the highest-scoring representative — same
+            # discipline as briefing_coverage_audit's max-urgency sample.
+            # Tie keeps the FIRST seen so the digest is deterministic.
+            if row_score > slot["_sample_score"]:
+                slot["_sample_score"] = row_score
+                slot["sample_title"] = title or ""
+                slot["sample_source"] = source or ""
+            key = (src_tag if src_tag in ("llm", "ml", "briefing_boost")
+                   else "null")
+            slot["score_sources"][key] += 1
+
+        out: list[dict] = []
+        for basket, slot in baskets.items():
+            age_h: float | None
+            if slot["newest_ts"] is None:
+                age_h = None
+            else:
+                age_h = round(
+                    max(0.0, (now - slot["newest_ts"]).total_seconds() / 3600.0),
+                    2,
+                )
+            out.append({
+                "basket": slot["basket"],
+                "basket_size": slot["basket_size"],
+                "count": slot["count"],
+                "urgent_count": slot["urgent_count"],
+                "alerted_count": slot["alerted_count"],
+                "max_score": round(slot["max_score"], 3),
+                "newest_age_h": age_h,
+                "sample_title": slot["sample_title"],
+                "sample_source": slot["sample_source"],
+                "score_sources": slot["score_sources"],
+            })
+
+        # Strongest-event-first: urgent_count desc → basket_size desc →
+        # count desc → alphabetical first ticker (deterministic tiebreak).
+        out.sort(
+            key=lambda r: (
+                -r["urgent_count"], -r["basket_size"], -r["count"],
+                r["basket"][0] if r["basket"] else "",
+            )
+        )
+        if top_n:
+            sliced = out[:top_n]
+        else:
+            sliced = out
+
+        return {
+            "window_h": hours,
+            "min_tickers": min_tickers,
+            "by_basket": sliced,
+            "total_baskets": len(out),
+            "total_articles": total_articles,
+        }
+
     def close(self):
         self.conn.close()
