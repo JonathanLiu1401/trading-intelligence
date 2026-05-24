@@ -1,6 +1,6 @@
 {
   "_account": {
-    "last_updated": "2026-05-21T00:27 PDT"
+    "last_updated": "2026-05-21T11:11 PDT (fills confirmed via Futubull)"
   },
   "_note": "Sao's trading portfolio - updated via UI",
   "options": [
@@ -31,37 +31,37 @@
       "type": "etf_leveraged"
     },
     {
-      "avg_cost": 887.119,
-      "notes": "Lumentum - photonics/semis; +$3,000 queued market open 2026-05-21 (pending fill)",
-      "qty": 0.1908,
+      "avg_cost": 876.681,
+      "notes": "Lumentum - photonics/semis; 3.615 shares @ 876.681 avg (blended, filled 2026-05-21)",
+      "qty": 3.615,
       "ticker": "LITE",
       "type": "stock"
     },
     {
-      "avg_cost": 0,
-      "notes": "Direxion Daily MU Bull 2X - 5 shares queued market open 2026-05-21 (pending fill)",
+      "avg_cost": 514.54,
+      "notes": "Direxion Daily MU Bull 2X - 5 shares @ 514.54, filled 2026-05-21",
       "qty": 5,
       "ticker": "MUU",
       "type": "etf_leveraged"
     },
     {
-      "avg_cost": 0,
-      "notes": "$2,000 queued market open 2026-05-21 (pending fill)",
-      "qty": 0,
+      "avg_cost": 424.665,
+      "notes": "Microsoft - 4.7095 shares @ 424.665, filled 2026-05-21 ($2,000)",
+      "qty": 4.7095,
       "ticker": "MSFT",
       "type": "stock"
     },
     {
-      "avg_cost": 0,
-      "notes": "$3,000 queued market open 2026-05-21 (pending fill)",
-      "qty": 0,
+      "avg_cost": 381.93,
+      "notes": "Alphabet-C - 7.8548 shares @ 381.93, filled 2026-05-21 ($3,000)",
+      "qty": 7.8548,
       "ticker": "GOOG",
       "type": "stock"
     },
     {
-      "avg_cost": 0,
-      "notes": "$2,000 queued market open 2026-05-21 (pending fill)",
-      "qty": 0,
+      "avg_cost": 362.631,
+      "notes": "Coherent - 5.5152 shares @ 362.631, filled 2026-05-21 ($2,000)",
+      "qty": 5.5152,
       "ticker": "COHR",
       "type": "stock"
     }
