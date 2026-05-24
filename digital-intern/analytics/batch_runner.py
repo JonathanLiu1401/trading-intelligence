@@ -53,6 +53,7 @@ PIPELINE: list[tuple[str, Path, int]] = [
     ("analytics.daily_digest",            LOGS / "daily_digest.txt",            110),
     ("analytics.market_closed_watchlist", LOGS / "market_closed_watchlist.json", 110),
     ("analytics.stale_source_alerter",   LOGS / "source_freshness.json",        110),
+    ("analytics.dedup_savings_report",   LOGS / "dedup_savings_report.json",    110),
 ]
 
 TIMEOUT_S = 60  # per-module hard timeout
