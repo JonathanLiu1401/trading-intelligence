@@ -13264,6 +13264,71 @@ def no_decision_recovery_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/initiation-drought")
+def initiation_drought_api():
+    """Watchlist-exploration drought — distinct tickers ever opened vs WATCHLIST.
+
+    The existing droughts each describe a different shape of inactivity:
+    /api/decision-drought prices the alpha cost of NO_DECISION cycles,
+    /api/concentration-trajectory tracks $-HHI of OPEN positions, /api/churn
+    grades round-trip turnover. None answer "has the bot stopped *initiating*
+    new ideas on the watchlist?" — the 13-trades-all-on-NVDA+TQQQ pathology
+    visible on 2026-05-24 when the live WATCHLIST exposes 50+ names.
+
+    A *BUY* is an INITIATION if the ticker has not been bought before; else a
+    RE-CYCLE. The endpoint returns time since the last initiation, recycles
+    accumulated since, total distinct tickers ever, watchlist coverage % when
+    the live ``WATCHLIST`` is importable, and an
+    EXPLORING / STEADY / RECYCLING / STUCK_ON_NAMES verdict. Full builder
+    coverage in tests/test_initiation_drought.py. Advisory only — never gates
+    Opus, adds no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.initiation_drought import build_initiation_drought
+        try:
+            from .strategy import WATCHLIST as _LIVE_WATCHLIST
+        except Exception:
+            _LIVE_WATCHLIST = None
+        store = get_store()
+        return jsonify(build_initiation_drought(
+            store.recent_trades(2000), watchlist=_LIVE_WATCHLIST,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/first-trade-after-drought")
+def first_trade_after_drought_api():
+    """Quality of the first FILLED trade after each NO_DECISION drought.
+
+    /api/no-decision-recovery grades how long droughts last; /api/decision-drought
+    prices the alpha cost. Neither asks **what happens immediately after**:
+    when the bot resumes, is it a panic-flip of a recent SELL, a recycle of
+    a familiar name, or a fresh-ticker initiation?
+
+    Pairs each completed NO_DECISION run of ≥5 cycles with the first trade
+    strictly after it and contrasts the post-drought new-ticker / flip
+    rates against the rest of the ledger. Verdict ladder:
+    DROUGHT_EXPLORATION (arguably healthy) /
+    STEADY_RECOVERY / PANIC_RECYCLE / PANIC_FLIP. Withheld until ≥3
+    post-drought fills accumulate (the trade_asymmetry / churn STABLE
+    idiom). Pure builder, full coverage in
+    tests/test_first_trade_after_drought.py. Advisory only — never gates
+    Opus, adds no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.first_trade_after_drought import (
+            build_first_trade_after_drought,
+        )
+        store = get_store()
+        return jsonify(build_first_trade_after_drought(
+            store.recent_decisions(500),
+            store.recent_trades(500),
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/churn")
 def churn_api():
     """Overtrading & same-name re-entry churn — the turnover question.
