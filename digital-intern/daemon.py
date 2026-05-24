@@ -78,6 +78,7 @@ from collectors.finra_short_volume import collect_finra_short_volume
 from collectors.market_movers import collect_market_movers
 from collectors.yahoo_trending_tickers import collect_yahoo_trending
 from collectors.fear_greed_collector import collect_fear_greed
+from collectors.appstore_finance_ranks import collect_appstore_finance_ranks
 from collectors.crypto_fear_greed_collector import collect_crypto_fear_greed
 from collectors.binance_funding_collector import collect_crypto_funding
 from collectors.coingecko_collector import collect_coingecko
@@ -198,6 +199,7 @@ POLYMARKET_INTERVAL     = 900     # Polymarket prediction markets every 15min
 MANIFOLD_INTERVAL       = 1800    # Manifold Markets prediction markets every 30min
 RATE_MONITOR_INTERVAL   = 3600    # per-collector silence detector — hourly
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
+APPSTORE_FINANCE_INTERVAL = 86400  # Apple App Store Finance rankings — once per day
 G10_YIELDS_INTERVAL     = 3600    # G10 sovereign yields every 1h (FRED daily/monthly)
 FRED_MACRO_INTERVAL     = 3600    # FRED macro series (claims, M2, rig count, etc.) — hourly
 COT_INTERVAL            = 6 * 3600  # CFTC COT report — weekly release, check 6-hourly
@@ -1835,6 +1837,27 @@ def cboe_unusual_options_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(CBOE_UNUSUAL_OPTIONS_INTERVAL)
+
+
+def appstore_finance_ranks_worker(store: ArticleStore):
+    log.info("[appstore_finance_ranks_worker] started")
+    bo = Backoff("appstore_finance_ranks", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_appstore_finance_ranks()
+            _ingest(store, articles, "appstore_finance_ranks")
+            try:
+                source_health.record_result("appstore_finance_ranks", len(articles))
+            except Exception as he:
+                log.warning(f"[appstore_finance_ranks_worker] source_health error: {he}")
+            _worker_last_ok["appstore_finance_ranks"] = time.time()
+            log.debug(f"[appstore_finance_ranks] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[appstore_finance_ranks_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(APPSTORE_FINANCE_INTERVAL)
 
 
 def congress_trades_worker(store: ArticleStore):
@@ -4078,6 +4101,7 @@ def main():
         ("finra_short",   finra_short_worker),
         ("congress_trades", congress_trades_worker),
         ("cboe_unusual_options", cboe_unusual_options_worker),
+        ("appstore_finance_ranks", appstore_finance_ranks_worker),
         ("cisa_kev",    cisa_kev_worker),
         ("insider_cluster", insider_cluster_worker),
         ("benzinga_analyst", benzinga_analyst_worker),
