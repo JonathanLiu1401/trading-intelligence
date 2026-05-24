@@ -4147,6 +4147,16 @@ def send_hourly_summary() -> bool:
     eo = _exit_only_streak_line(store)
     if eo:
         body += "\n" + eo
+    # SIGNAL-RICH PASSIVE sits right after EXIT-ONLY — the orthogonal
+    # book-wide structural pattern. EXIT-ONLY reads "engine is only firing
+    # SELLs"; SIGNAL-RICH PASSIVE reads "engine is firing NOTHING during
+    # a loud news window" (median signal_count high inside the current
+    # HOLD/NO_DECISION run). The builder's own DEAFENING_SILENCE arm is
+    # the silence-by-default trigger; every other verdict stays mute so
+    # the hourly never becomes its own lying green light.
+    ps = _passive_signal_density_line(store)
+    if ps:
+        body += "\n" + ps
     # REPEAT_LOSER sits right after STREAK — the per-ticker companion to
     # the aggregate run. STREAK says "you're on a 4-loss run"; REPEAT_LOSER
     # says "and 3 of those 4 are on LITE — stop adding to LITE". Both
@@ -4358,6 +4368,13 @@ def send_daily_close() -> bool:
     eo = _exit_only_streak_line(store)
     if eo:
         body += "\n" + eo
+    # SIGNAL-RICH PASSIVE follows EXIT-ONLY on daily close too — see
+    # send_hourly_summary for the rationale (orthogonal book-wide
+    # structural sibling: loud news + silent engine). DEAFENING_SILENCE
+    # only — every other verdict stays silent.
+    ps = _passive_signal_density_line(store)
+    if ps:
+        body += "\n" + ps
     # REPEAT_LOSER follows STREAK on daily close too — see send_hourly_summary
     # for the rationale (aggregate vs per-ticker tilt).
     rl = _repeat_loser_line(store)
