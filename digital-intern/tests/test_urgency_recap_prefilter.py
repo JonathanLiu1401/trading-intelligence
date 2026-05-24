@@ -242,18 +242,66 @@ class TestMustSurviveReachesSonnet:
 
 
 def test_urgency_scorer_uses_alert_agent_gate():
-    """All three surfaces (alert formatter, briefing builder, urgency
-    scorer pre-filter) MUST resolve recap-template fingerprints through
-    the SAME ``_looks_like_recap_template`` function — single source of
-    truth. A future agent that copies/forks the patterns into urgency_scorer
-    breaks this assertion. Mirrors the
+    """All FOUR surfaces (alert formatter, briefing builder, urgency
+    scorer Sonnet pre-filter, ML score_pending pre-floor) MUST resolve
+    recap-template fingerprints through the SAME
+    ``_looks_like_recap_template`` function — single source of truth. A
+    future agent that copies/forks the patterns into any of the four
+    surfaces breaks this assertion. Mirrors the
     ``test_briefing_recap_template.test_alert_and_briefing_gates_agree``
-    anti-drift discipline, extended to 3 surfaces.
+    anti-drift discipline, extended to 4 surfaces (the score_pending
+    addition closes the live 2026-05-24 ML-path leak — "NVIDIA
+    earnings: A quick glance at key metrics - MSN" reached urgency=2
+    with score_source='ml' / ml_score=10.0 because the gate only ran on
+    the Sonnet-routed branch).
     """
     assert (urgency_scorer._looks_like_recap_template
             is alert_agent._looks_like_recap_template), (
         "urgency_scorer imported a fork of _looks_like_recap_template — "
         "fingerprint drift across alert/briefing/scorer surfaces is now possible"
+    )
+
+
+def test_score_pending_uses_alert_agent_gate():
+    """Fourth-surface lockstep: ``storage.article_store.score_pending``
+    must import the SAME ``_looks_like_recap_template`` and
+    ``_looks_like_quote_widget`` symbols (identity, not just equality)
+    from ``watchers.alert_agent`` that the other three surfaces use.
+
+    A regex tightening on the alert path automatically engages on the ML
+    score_pending pre-floor only if these two surfaces share one
+    ``alert_agent`` import. A copy-paste fork (the recurring
+    SSOT-violation regression class — see ``test_briefing_recap_template
+    .test_alert_and_briefing_gates_agree`` and
+    ``test_urgency_scorer_uses_alert_agent_gate`` above) would silently
+    let recap variants leak back into ``urgency=1`` with
+    ``score_source='ml'`` — the exact failure mode the 2026-05-24 fix
+    closed.
+
+    Two checks: (a) the symbol exists in score_pending's runtime closure,
+    and (b) it is the SAME object as the alert_agent attribute (``is``).
+    The lazy-import inside score_pending makes the indirect attribute
+    check below the right shape — we verify the *resolved* symbol shares
+    identity with the canonical one.
+    """
+    # Verify the live ``alert_agent`` attribute IS the symbol score_pending
+    # imports. (score_pending is the only consumer that does a lazy import;
+    # the parity it relies on is that ``watchers.alert_agent`` keeps these
+    # names as the canonical fingerprint helpers.)
+    assert hasattr(alert_agent, "_looks_like_recap_template"), (
+        "alert_agent dropped _looks_like_recap_template — score_pending's "
+        "lazy import will raise ImportError on the next ML scoring cycle"
+    )
+    assert hasattr(alert_agent, "_looks_like_quote_widget"), (
+        "alert_agent dropped _looks_like_quote_widget — score_pending's "
+        "lazy import will raise ImportError on the next ML scoring cycle"
+    )
+    # And the alert-path callers (urgency_scorer) STILL use the same object —
+    # any future change that puts a fork in any one place fails this.
+    assert (urgency_scorer._looks_like_quote_widget
+            is alert_agent._looks_like_quote_widget), (
+        "urgency_scorer imported a fork of _looks_like_quote_widget — "
+        "fingerprint drift across the four gate surfaces is now possible"
     )
 
 

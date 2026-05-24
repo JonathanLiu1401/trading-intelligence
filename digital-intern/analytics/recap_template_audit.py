@@ -3,7 +3,7 @@
 The recap / preview / transcript-summary template class
 ("Why X Stock Is Trading Up Today", "Q1 2026 Earnings Call Highlights",
 "Stock Market Today, May 18: ...", "Here What the Street Thinks ...",
-"GF Value Says ...") is now gated on THREE surfaces — see the lockstep
+"GF Value Says ...") is now gated on FOUR surfaces — see the lockstep
 parity test in ``tests/test_urgency_recap_prefilter.py``:
 
   1. ``watchers.urgency_scorer.score_batch`` — pre-filters BEFORE the
@@ -12,8 +12,17 @@ parity test in ``tests/test_urgency_recap_prefilter.py``:
      🚨 BREAKING pushes on caught rows.
   3. ``analysis.claude_analyst._build_payload`` — drops recap rows from
      the 5h Opus heartbeat newswire.
+  4. ``storage.article_store.score_pending`` — pre-floors before the ML
+     urgency head writes ``urgency=1`` with ``score_source='ml'`` on the
+     model-confident urgent branch (``needs_llm=False``,
+     ``sc.urgency >= 8``) that bypassed surface 1 entirely. Live
+     evidence (2026-05-24): "NVIDIA earnings: A quick glance at key
+     metrics - MSN" matched ``_RT_QUICK_GLANCE`` yet reached
+     ``urgency=2`` with ``ml_score=10.0`` because surface 1 only sees
+     the Sonnet-routed branch. See ``tests/test_score_pending::
+     test_score_pending_prefloor_recap_and_quote_widget``.
 
-All three resolve fingerprints through one source of truth
+All four resolve fingerprints through one source of truth
 (``alert_agent._looks_like_recap_template``). This module is the
 *calibration view* analysts and the dashboard need to ANSWER:
 

@@ -5,7 +5,7 @@ price-tick titles ("NVDANVIDIA Corporation227.13-8.61(-3.65%)"),
 parenthesised percent-change tapes ("NQ=FNasdaq 100 Jun
 2629,215.25-472.50(-1.59%)"), Moomoo/Futu share-card listings ("$NVIDIA
 (NVDA.US)$ - Moomoo"), and Yahoo screener-tape leads
-("[YF/most_actives] MU ...") — is now gated on three surfaces, mirroring
+("[YF/most_actives] MU ...") — is now gated on FOUR surfaces, mirroring
 the recap-template gate audited by ``analytics.recap_template_audit``:
 
   1. ``collectors.web_scraper._looks_like_quote_widget`` — drops at
@@ -16,9 +16,18 @@ the recap-template gate audited by ``analytics.recap_template_audit``:
      google_news / market_movers).
   3. ``watchers.alert_agent.send_urgent_alert`` — suppresses standalone
      🚨 BREAKING pushes on caught rows.
+  4. ``storage.article_store.score_pending`` — pre-floors before the ML
+     urgency head writes ``urgency=1`` with ``score_source='ml'`` (the
+     model-confident urgent path that bypassed surfaces 1-3 on rows the
+     scrapers/yahoo_ticker_rss/finnhub didn't gate at ingestion). Live
+     evidence (2026-05-24) showed a recap-template title reaching
+     ``urgency=2`` with ``ml_score=10.0`` because surface 2 only ran on
+     the LLM-bound branch; the symmetric ML-path pre-floor closes the
+     gap. See ``tests/test_score_pending::
+     test_score_pending_prefloor_recap_and_quote_widget``.
 
-The urgency_scorer and alert_agent surfaces resolve fingerprints through
-ONE source of truth (``alert_agent._looks_like_quote_widget`` and the
+All four surfaces resolve fingerprints through ONE source of truth
+(``alert_agent._looks_like_quote_widget`` and the
 ``_QUOTE_WIDGET_TITLE_PATTERNS`` tuple). This module is the
 *calibration view* analysts and the dashboard need to ANSWER:
 
