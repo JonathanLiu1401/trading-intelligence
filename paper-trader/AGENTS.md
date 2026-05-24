@@ -6,6 +6,117 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 core HYBRID pass #4 (Agent 1) — `runner.alarm_latch_headline` helper
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Read AGENTS.md (first 200 lines of 24k), `paper_trader/runner.py`,
+`paper_trader/reporter.py` (the chunks I needed plus headline blocks),
+`paper_trader/signals.py`, `paper_trader/strategy.py` (first 1200
+lines), `paper_trader/market.py`, `paper_trader/store.py`, and the
+core test fixtures in `tests/conftest.py`.
+
+Ran the focused core-test slice (`tests/test_core_runner*.py`,
+`tests/test_core_signals.py`, `tests/test_core_market.py`,
+`tests/test_core_store.py`, `tests/test_core_strategy.py`,
+`tests/test_core_reporter.py`, plus the heartbeat + market-phase /
+negcache / closure suite) — 877 pass clean in ~28s baseline. No new
+genuine bug surfaced in this pass that wasn't already pinned by an
+existing test. Sibling agents have modifications staged in
+`paper_trader/{backtest,dashboard,reporter}.py` (+173 / +29 / +122
+lines for the passive-signal-density wiring, briefing-cadence-trend
+primitive, regime-leverage-fit reporter wiring) plus several untracked
+analytics + tests modules — per the `pt-concurrent-samerole-staging-
+race` memory I stayed completely off those files (explicit-pathspec
+staging discipline).
+
+Set `bugs_fixed = 0` honestly, no Phase 1 commit.
+
+### Phase 2 — Feature: `runner.alarm_latch_headline()` operator headline
+
+New `alarm_latch_headline(state=None) -> str` in `paper_trader/runner.py`
+alongside the existing `alarm_latch_state()`. The companion helper that
+formats the latch-state snapshot into a single operator-facing sentence:
+
+  * `""` — no latch held (silence-when-nothing-actionable; the latch
+    surface must never become a green light).
+  * `"⚠️ CLAUDE BREAKER held (47m) — operator alerted; waiting for the
+    next real decision to clear."` — one latch held with its outage
+    duration.
+  * `"⚠️ CLAUDE BREAKER held (47m) · QUOTA latch held (3h12m) — …"` —
+    both held; canonical order breaker before quota.
+
+**Why this matters (Phase 3 #2 below):** the dashboard already builds
+an ad-hoc inline headline in `/api/alarm-latches` (dashboard.py:264-282)
+but **omits the wall-clock outage durations** that `alarm_latch_state()`
+already exposes (`breaker_outage_s`, `quota_outage_s`). A trader pulled
+away from Discord during a multi-hour wedge cares first about *how long*
+each latch has been held — without that, the dashboard banner answers
+"is there an outage?" but not "how bad?". This new helper closes that
+gap and gives any future banner / chat status surface a single-sourced
+helper to call. The existing inline construction continues to work
+unchanged (no dashboard.py edit; that file has sibling-agent
+modifications in flight).
+
+Includes a tiny local `_fmt_outage_seconds` helper (mirrors
+`reporter._format_elapsed`'s contract but stays in runner.py so the
+runner-side path never imports the dirty/large reporter module — same
+`pt-concurrent-samerole-staging-race` discipline).
+
+Test coverage (21 new tests, all green —
+`tests/test_alarm_latch_headline.py`):
+
+* `_fmt_outage_seconds`: None / negative / non-numeric → `""`;
+  sub-minute clamps to `"0m"`; minute, hour+minute, day+hour windows
+  pin (60→`"1m"`, 3600→`"1h0m"`, 86400→`"1d0h"`, 2d4h);
+  fractional seconds floor via `int(float(...))`; numeric string
+  coerces.
+* `alarm_latch_headline`: no-latch → `""`; non-dict state → `""`;
+  default `state=None` reads `alarm_latch_state()` at call time
+  (monkeypatched); breaker-only with/without duration; quota-only
+  with/without duration; both joined with `" · "` in canonical order;
+  garbage duration drops just the parenthetical (latch name still
+  ships); a stray `any_active=True` with both flags False does NOT
+  fabricate a headline (defensive against divergent state dicts);
+  property-style never-raises check across `None / "x" / 0 / [] / ()
+  / {} / NaN / object()` durations.
+
+Commit `9996c38`: `feat(runner): alarm_latch_headline — operator banner
+with outage durations`. Test suite passes (168 runner-adjacent green,
+21 new).
+
+### Phase 3 — Live user findings (user_findings = 3)
+
+1. **Live trader is HEALTHY** (runner pid 1979631 — the same PID across
+   the pass). `/api/runner-heartbeat` reports `verdict=HEALTHY`,
+   `decision_efficacy.verdict=PRODUCING` (19/20 recent cycles produced
+   a decision), Discord delivery `HEALTHY`, singleton lock acquired,
+   no breaker/quota latches active. Last real decision 9m ago, within
+   the 60m market-closed cadence (weekend NY phase).
+
+2. **`/api/alarm-latches` headline omits outage durations even when
+   present.** The endpoint already returns `breaker_outage_s` /
+   `quota_outage_s` as fields, but the inline headline at
+   `dashboard.py:271-275` only emits the `"⚠️ CLAUDE BREAKER held"`
+   label without the parenthesised duration. The new
+   `runner.alarm_latch_headline` helper closes this — a future
+   dashboard pass (or any banner consumer) can swap the inline string
+   for `runner.alarm_latch_headline(latches)` and get the durations
+   for free without touching the latch-derivation logic. Not folded
+   into a fix commit this pass because `dashboard.py` carries
+   sibling-agent in-flight edits (the `pt-concurrent-samerole-staging-
+   race` discipline).
+
+3. **Dashboard responsiveness is bursty under sibling-agent load.**
+   `/api/runner-heartbeat` and `/api/state` timed out at 5-20s in the
+   first probe window (three concurrent Opus agents on this same box;
+   load avg routinely 5-10 during a hybrid pass) but returned cleanly
+   at the end of the pass. The known operational pathology per memory
+   `pt-no-decision-host-saturation` / `pt-portfolio-equity-
+   divergence` — not a bug.
+
+---
+
 ## 2026-05-24 core HYBRID pass #3 (Agent 1) — SWR prewarm gap fix + `_passive_signal_density_line` wiring regression-lock
 
 ### Phase 1 — Debug: bugs_fixed = 1
