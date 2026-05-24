@@ -389,6 +389,19 @@ def get_quant_signals_live(tickers: list[str]) -> dict[str, dict]:
 # actionable precedent.
 _BB_BAND_THRESHOLD = 0.9
 
+# RSI overbought / oversold rendering thresholds. The SYSTEM_PROMPT already
+# tells Opus "RSI > 70 = overbought" and "RSI < 30 = oversold", but the
+# prompt's quant block renders ``rsi=72.5`` as a bare float — Opus has to
+# mentally re-threshold every row. Labelling the actionable extremes directly
+# in the rendered token mirrors the ``_bb_label`` precedent (the same kind of
+# render-side enrichment as ``held=`` / signal ``age=``), so Opus sees the
+# stretched state immediately on the line it reads. Observational only
+# (invariants #2/#12). Inclusive boundaries (``>=`` / ``<=``) match the
+# prompt text ("RSI > 70" / "RSI < 30" round to the textbook 70 / 30 marks
+# the SYSTEM_PROMPT names).
+_RSI_OVERBOUGHT = 70.0
+_RSI_OVERSOLD = 30.0
+
 
 def _bb_label(x) -> str:
     """Render bb_position with a band annotation when stretched.
@@ -410,6 +423,31 @@ def _bb_label(x) -> str:
     return str(x)
 
 
+def _rsi_label(x) -> str:
+    """Render RSI with an overbought/oversold annotation when extreme.
+
+    ``None`` → ``"?"``. ``x >= _RSI_OVERBOUGHT`` (70) → ``"<x> (overbought)"``;
+    ``x <= _RSI_OVERSOLD`` (30) → ``"<x> (oversold)"``. Mid-range values
+    render as the bare number so a healthy book stays quiet — the
+    silence-when-nothing-actionable precedent the ``_bb_label`` /
+    ``_hold_age_str`` token enrichments already follow. Degrade-safe — a
+    non-numeric value falls through to its string form, never raises (mirrors
+    ``_bb_label`` exactly: the only legitimate non-numeric input is the
+    pre-rendered ``"?"`` sentinel the ``_v`` helper emits when ``get`` finds
+    no key, but a malformed cache row would otherwise crash decide())."""
+    if x is None:
+        return "?"
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    if v >= _RSI_OVERBOUGHT:
+        return f"{x} (overbought)"
+    if v <= _RSI_OVERSOLD:
+        return f"{x} (oversold)"
+    return str(x)
+
+
 def _format_quant_signals(sigs: dict[str, dict]) -> str:
     if not sigs:
         return "  (no quant signals available)"
@@ -418,7 +456,7 @@ def _format_quant_signals(sigs: dict[str, dict]) -> str:
     def _pct(x):
         return "?" if x is None else f"{x}%"
     return "\n".join(
-        f"  {tk}: rsi={_v(q.get('rsi'))}  macd={_v(q.get('MACD'))}/{_v(q.get('macd_signal'))}  "
+        f"  {tk}: rsi={_rsi_label(q.get('rsi'))}  macd={_v(q.get('MACD'))}/{_v(q.get('macd_signal'))}  "
         f"ma_cross={_v(q.get('MA_cross'))}  bb_position={_bb_label(q.get('bb_position'))}  "
         f"vol_ratio={_v(q.get('vol_ratio'))}  mom_5d={_pct(q.get('mom_5d'))}  "
         f"mom_20d={_pct(q.get('mom_20d'))}  "
