@@ -6,6 +6,199 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 ML+backtest HYBRID pass #32 (Agent 2) — `tp_band_sweep` analyzer + decisive NO_BAND_HELPS finding
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Re-read `paper_trader/ml/decision_scorer.py`, `paper_trader/backtest.py`
+(focused on `_ml_decide`, `_buy`/`_sell`, `_execute_decision`,
+`_enforce_risk_exits`, `_load_local_articles`, the per-cycle gate
+parsing helpers), and `run_continuous_backtests.py` (the cycle loop +
+all 8 skill ledgers + `_train_decision_scorer` + `_oos_rank_metrics` +
+`_oos_multi_horizon_metrics` + `_inject_and_train`'s lock retry).
+Cross-checked the candidates a skeptical first pass surfaces:
+
+* `_inject_and_train` for/else with break inside try — confirmed the
+  early-success break correctly skips the else; `_LOCK_RETRY_SLEEPS`
+  gives 4 attempts (one initial + 3 retries) with proper count reset
+  on rollback.
+* `_oos_rank_metrics` `failed=True` filter — the `_meta.get("failed")`
+  drop is correctly placed BEFORE the prediction is consumed; the
+  scalar `predict()` fallback path treats predictions as in-distribution
+  by design (the `_Dummy` test-fake guarantee).
+* `_to_finite_float` (stop_out_audit / mfe_conversion) — both reject
+  bool / None / NaN / inf consistently; `math.isfinite` accepts numpy
+  scalars via `__float__` so numpy-backed values pass.
+* `_parse_gate_decision` `\bscorer=` regex anchors correctly; `_parse_
+  conviction_pct` clamps to [0,1].
+* `_to_float` in decision_scorer correctly handles `np.float32` via the
+  `np.number` branch (the precise guard added in pass #20 era).
+* `_LstsqModel.predict` 1D/2D acceptance fix is in place.
+
+Advisor agreed with passes #30 and #31 (both Agent 2, both honest
+bugs_fixed=0): the defensive comments throughout these modules are
+armor citing the specific commits each guard fixed. Declined to
+fabricate a fix. 244 focused tests (test_tp_band_sweep + sibling
+intraperiod + scorer + continuous-intraperiod ledger) pass clean in
+7.3s. Set `bugs_fixed = 0` honestly, no Phase 1 commit.
+
+### Phase 2 — Feature: `paper_trader/ml/tp_band_sweep` — sweep TP candidate bands for realized economic effect
+
+**The gap.** `mfe_conversion` answers ONE question: does the deployed
++15% take-profit band beat no TP? The live verdict on the 1913-row
+intraperiod-populated corpus is `TP_NEUTRAL` (benefit -0.234pp) with
+`mean_conversion_ratio = -0.45` — positions on average revert FROM
+their intraperiod peak rather than capturing it. The skeptical quant's
+direct next question — *would a TIGHTER take-profit have monetised
+that peak-then-revert pattern?* — is structurally unanswerable with
+`mfe_conversion` because that analyzer is fixed at one `TP_PCT`. Until
+this module landed, the only way to ask was to manually rerun
+`mfe_conversion` with custom `--tp` flags band-by-band, with no
+across-band ranking, no deployed-vs-best comparison, and no verdict.
+
+**The module.** `paper_trader/ml/tp_band_sweep.py` (502 lines). Reads
+`data/decision_outcomes.jsonl` once, filters to BUYs with finite
+`forward_return_5d` AND `forward_intraperiod_max_5d`, then sweeps a
+candidate grid (default 3 / 5 / 7 / 8 / 10 / 12 / 15 / 18 / 20 / 25 / 30 %).
+For each band reports `n_triggered`, `pct_triggered`,
+`mean_protected_return_pct`, `benefit_pct = mean_protected − mean_realized`.
+Verdict ladder:
+
+| Verdict | Meaning |
+|---------|---------|
+| `INSUFFICIENT_DATA` | `n_with_intraperiod < MIN_BUYS` (30) |
+| `BAND_BEATS_DEPLOYED` | best candidate's benefit beats the deployed +15% by > `EDGE_TOL_PP` (0.30pp) |
+| `DEPLOYED_OPTIMAL` | best candidate within ±`EDGE_TOL_PP` of deployed (no tuning move clears noise) |
+| `NO_BAND_HELPS` | best candidate's absolute benefit < `EDGE_TOL_PP` (no band helps regardless of where it's set) |
+
+Defensive contract mirroring every sibling analyzer: read-only,
+self-contained `_to_finite_float` / `_tp_protected_return` (no
+sibling imports), `INSUFFICIENT_DATA` envelope on every fault, never
+raises. The deployed band is **always** included in the sweep even
+when omitted from a custom `--bands` grid so its benefit is reported.
+Stable sort on equal benefit keeps the TIGHTER band first (same
+conservative discipline gate_threshold_sweep uses).
+
+**Test coverage (49 new tests, all green in 0.60s):**
+
+* `_tp_protected_return` — band-fires-at-boundary, fires-above, no-
+  fire-below, no-fire-on-negative-peak, runaway-cap, custom band.
+* `_to_finite_float` — None / bool / NaN / inf / string / numeric.
+* `_parse_bands_arg` — None / empty / CSV / whitespace / invalid
+  tokens / all-invalid (defaults) / non-positive dropped.
+* `sweep_bands` — empty inputs, length mismatch, single-band exact
+  arithmetic, baseline constancy across rows, descending-benefit
+  sort, stable-sort tiebreaker preserves tighter band first.
+* `analyze` insufficient-data envelopes — missing file, SELL-only,
+  no intraperiod field, below `MIN_BUYS`, `MIN_BUYS` boundary strict.
+* `analyze` verdicts — `BAND_BEATS_DEPLOYED` when tight TP captures
+  peak (synthetic +10% peak → -5% endpoint), `NO_BAND_HELPS` when
+  endpoints already capture peak (peak == endpoint), `DEPLOYED_OPTIMAL`
+  when best within noise (deployed peak=15 endpoint=14).
+* `analyze` deployed-band auto-inclusion — explicit 5/8/10 grid still
+  has 15 inserted.
+* Filtering — SELL rows excluded from baseline, unparseable lines
+  silently dropped, missing fwd field drops row.
+* Bands-custom — string/dup/NaN/non-positive grids cleaned.
+* CLI — return code 0 on decisive verdict / 1 on NO_BAND_HELPS /
+  INSUFFICIENT_DATA, JSON-output round-trips, table marks
+  `[deployed]`, `--bands` arg respected.
+* Module constants — `DEPLOYED_TP_PCT` source-pinned to `_ml_decide`'s
+  `take_profit: round(price * 1.15, 2)` (regression alarm if the
+  deployed band shifts), default grid contains deployed, ascending
+  positive distinct.
+
+**Live verdict on the deployed corpus** (`python3 -m paper_trader.ml.tp_band_sweep`):
+
+```
+verdict=NO_BAND_HELPS
+n_buys=7205  n_with_intraperiod=1913
+baseline_no_band_mean=+0.710pp
+band   n_trig  %_trig    mean_prot   benefit
+30.0%     30    1.6%    +0.753pp   +0.043pp  ←best
+25.0%     62    3.2%    +0.722pp   +0.012pp
+20.0%     93    4.9%    +0.552pp   -0.158pp
+18.0%    127    6.6%    +0.534pp   -0.176pp
+15.0%    198   10.3%    +0.477pp   -0.234pp  [deployed]
+12.0%    309   16.1%    +0.270pp   -0.440pp
+10.0%    393   20.5%    +0.106pp   -0.605pp
+ 8.0%    537   28.1%    -0.050pp   -0.760pp
+ 7.0%    616   32.2%    -0.145pp   -0.856pp
+ 5.0%    795   41.6%    -0.569pp   -1.280pp
+ 3.0%   1060   55.4%    -0.876pp   -1.587pp
+```
+
+The best candidate (+30%) realises +0.043pp benefit on 30 triggers —
+well below the 0.30pp noise margin. **Every other candidate measurably
+HURTS realized return.** The take-profit arm's `mean_conversion_ratio
+= -0.45` (peaks revert) exists, but the population of trades that
+benefit from a TP is too small to make any band a positive aggregate
+choice. Direct answer to the next quant question after
+`mfe_conversion`'s `TP_NEUTRAL`.
+
+Source: `paper_trader/ml/tp_band_sweep.py` (+502), `tests/test_tp_band_sweep.py`
+(+446, 49 tests). Commit `a8e2963`.
+
+### Phase 3 — Quant validation findings (user_findings = 4)
+
+1. **Continuous loop still DEAD** — same finding as pass #31 ~2h
+   earlier. No `run_continuous_backtests.py` process; `backtest_runs`
+   last `status='complete'` is 2026-05-22T06:24 (~2 days stale).
+   `data/scorer_skill_log.jsonl` / `data/baseline_skill_log.jsonl`
+   each carry exactly 1 row (the documented 2026-05-22 cycle).
+   `data/stop_out_skill_log.jsonl`, `mfe_skill_log.jsonl`,
+   `gate_arm_skill_log.jsonl`, `calibrated_reliability_log.jsonl`,
+   `conviction_calibration_log.jsonl` — wired by passes #25, #30 —
+   **DO NOT EXIST YET** because no cycle has run since the wiring
+   landed. A user-owned restart per `pt-systemd-vs-manual-restart-spam`.
+
+2. **Deployed pickle frozen at 2026-05-23 07:20, n_train=4987** —
+   identical to pass #31's observation. The next cycle of a re-awoken
+   loop will pick up the backfilled 1913-row intraperiod corpus and
+   start populating the 5 missing ledgers automatically.
+
+3. **TP band sweep is decisive: `NO_BAND_HELPS`** — Phase 2 above.
+   No take-profit band on the deployed corpus measurably adds aggregate
+   economic edge. The +30% band's +0.043pp benefit is sampling noise
+   (30 triggers out of 1913). This is research, not a code change —
+   the inherited +15% band is not WORSE than alternatives, it's just
+   not measurably HELPFUL on this corpus. A reading quant should NOT
+   conclude "tune the TP" from `mfe_conversion`'s TP_NEUTRAL alone;
+   the sweep now structurally answers that follow-up.
+
+4. **Deployed scorer skill remains strong** — `baseline_compare` on
+   the live corpus reports `MLP_ADDS_SKILL` with OOS rank-IC +0.359
+   (vs best baseline `neg_bb` +0.075, gap +0.284 — clears the +0.05
+   margin and +0.10 floor decisively). `stop_out_audit` against the
+   backfilled corpus: `STOP_HELPS` benefit +0.679pp on 1913 BUYs.
+   `mfe_conversion`: `TP_NEUTRAL` benefit -0.234pp (paired with the
+   sweep verdict above). Three concurrent verdicts that fully describe
+   the gate's current realized economic state.
+
+### Phase 4 — Docs
+
+This entry.
+
+**How to use the TP band sweep:**
+
+```bash
+# Default grid (3..30 %), verdict + per-band table:
+python3 -m paper_trader.ml.tp_band_sweep
+
+# JSON for piping:
+python3 -m paper_trader.ml.tp_band_sweep --json
+
+# Custom grid (deployed 15% is always added):
+python3 -m paper_trader.ml.tp_band_sweep --bands 5,8,10,12
+
+# Tighter noise margin for a more sensitive verdict:
+python3 -m paper_trader.ml.tp_band_sweep --margin 0.10
+```
+
+**Counters:** bugs_fixed=0, features_added=1, user_findings=4.
+
+---
+
 ## 2026-05-24 core HYBRID pass #5 (Agent 1) — `/api/decision-cadence` endpoint + builder regression-lock
 
 ### Phase 1 — Debug: bugs_fixed = 0
