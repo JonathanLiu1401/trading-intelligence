@@ -1178,7 +1178,7 @@ class ArticleStore:
             deleted = cur.rowcount
             self.conn.commit()
             if deleted > 0:
-                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")  # TRUNCATE blocks readers; PASSIVE doesn't
                 print(f"[store] Purged {deleted} articles older than {RETENTION_DAYS} days")
         return deleted
 
