@@ -12291,6 +12291,47 @@ def exit_only_streak_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/decision-cadence")
+def decision_cadence_api():
+    """Decision-cadence advisor — what tier is the runner's dynamic
+    sleep ladder in RIGHT NOW, when did it last decide, and when is the
+    next cycle expected? Mirrors the runner's authoritative
+    ``compute_interval`` predicates so the trader's view and the actual
+    sleep cannot drift. Verdict ladder: NO_DATA / ON_SCHEDULE /
+    ELAPSED_NORMAL (cycle imminent) / OVERDUE (past
+    ``OVERDUE_MULT × sleep_s`` — loop wedged). Advisory only — never
+    gates Opus, never blocks a trade (AGENTS.md #2/#12 — same
+    observational contract as ``/api/runner-heartbeat`` /
+    ``/api/last-real-decision`` next to it).
+
+    The natural companion to ``/api/last-real-decision`` (which says
+    "the engine has not done anything in 6h") and
+    ``/api/runner-heartbeat`` (which says "the runner is healthy") —
+    this endpoint answers the third question every trader actually
+    asks ("so when is it going to TRY again?") without the operator
+    tailing the runner log to read the ``[interval] tier=…`` line.
+    """
+    try:
+        from .analytics.decision_cadence import build_decision_cadence
+        store = get_store()
+        positions = store.open_positions()
+        # ``recent_decisions(limit=1)[0]`` is the most recent decisions row
+        # regardless of verb (NO_DECISION counts here — this surface
+        # measures the LOOP cadence, not the engine's hit rate).
+        # ``last_real_decision`` would WRONGLY mask a wedged loop that
+        # keeps cycling NO_DECISION at the expected cadence.
+        last_ts: str | None = None
+        try:
+            recent = store.recent_decisions(limit=1)
+            if recent:
+                last_ts = recent[0].get("timestamp")
+        except Exception:
+            last_ts = None
+        return jsonify(build_decision_cadence(positions, last_ts))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/repeat-loser")
 def repeat_loser_api():
     """Per-ticker losing-streak detector — the per-ticker companion to
