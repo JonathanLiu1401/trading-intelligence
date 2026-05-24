@@ -260,6 +260,150 @@ python3 -m pytest tests/test_cycle_gap_summary.py -v
 
 ---
 
+## 2026-05-24 ML+backtest HYBRID pass #34 (Agent 2) — `_append_persona_skill_log` per-cycle per-persona decision-signal skill ledger
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Audited `paper_trader/ml/decision_scorer.py`, `paper_trader/backtest.py`,
+`run_continuous_backtests.py` (the ML+backtest agent's three core files)
+plus `_opus_annotate`, `_llm_annotate_outcomes`, `_inject_and_train`, and
+`_run_validation_async`. The code is **extraordinarily defended**: every
+`_to_float` and `_atomic_write_json` callsite has comments tying its
+guard to a past incident, every regex has a `\b` word-boundary anchor,
+every quantile-table consumer has a collapsed-array guard, every cache
+loader has a type guard and atomic writer. No new bug worth fixing was
+identified that didn't already have a comment + test pinning the
+existing defense. Per the Phase 1 commit guard, no commit was made for
+Phase 1 (only AGENTS.md edits would have changed) — the AGENTS.md note
+is rolled into the Phase 2 commit instead.
+
+Baseline test suite: `python3 -m pytest tests/ -k "ml or backtest or
+scorer"` → 778 passed, 0 failed (108–264s depending on load).
+
+### Phase 2 — Feature: `_append_persona_skill_log` per-cycle ledger
+
+`paper_trader/ml/persona_skill.py::persona_skill` already CLI-reports
+each persona's decision-level rank skill (the action-aligned Spearman
+between `ml_score` and `forward_return_5d`, with the same
+SELL-sign-flip discipline as `train_scorer` / `evaluate_scorer_oos` /
+`_oos_rank_metrics`). Until this wiring landed, the analyzer was
+**CLI-only** with no durable per-cycle trend — and the single most
+operationally decisive state (`HAS_INVERTED_PERSONA`: at least one
+persona whose stronger signal predicts WORSE realized outcomes — the
+actionable red flag for pruning that persona's `_PERSONA_BOOSTS`
+entry) was invisible to an unattended operator.
+
+The new `_append_persona_skill_log(cycle, win_start, win_end, …)`
+follows the **exact** sibling-ledger pattern:
+
+- **SSOT cross-check** — reuses `persona_skill.persona_skill` verbatim
+  so the persisted `verdict` / `inverted_personas` / `score_ic` per
+  persona equal the read-only CLI's by construction.
+- **Best-effort discipline** — every fault is swallowed (a ledger write
+  must NEVER break the continuous loop, the documented
+  `_append_scorer_skill_log` / `_post_discord` / validation-persister
+  contract). An analyzer crash, non-dict return, or missing outcomes
+  file all degrade to an honest `status='error' verdict='INSUFFICIENT_DATA'`
+  row.
+- **`signal_dark` boolean** — mirrors sibling `pipeline_dark` /
+  `calibrated_dark` / `sizing_dark` / `stop_dark` / `tp_dark` /
+  `gate_dark` flags. True when zero personas reach
+  `MIN_OUTCOMES_PER_PERSONA` (the analyzer's stable-sample bar).
+- **Flat top-line fields** — `top_persona` + `top_score_ic` (the
+  leader on signal skill, skipping `INSUFFICIENT` entries) and
+  `n_inverted` (count of anti-predictive personas), so a JSON consumer
+  doesn't need to parse the nested `personas` list to answer the two
+  most-decisive questions. The full nested list ships intact for
+  forensics (mirroring the gate-arm ledger's `arms` precedent).
+- **Atomic bounded trim** — `PERSONA_SKILL_LOG_KEEP=2000` rows, tmp +
+  `.replace` when the file exceeds 2× the cap. A torn truncate cannot
+  lose skill history.
+
+Wired into `main()` immediately after `_append_gate_arm_skill_log` so
+every cycle's loop body now emits the per-persona ledger row. A new
+test file `tests/test_continuous_persona_skill_ledger.py` (separate
+from `test_continuous.py` to mitigate the documented same-role HYBRID
+staging-race pattern) pins:
+
+- INSUFFICIENT_DATA dark row + `signal_dark=True`
+- HAS_INVERTED_PERSONA verdict round-trip with `inverted_personas`
+  list + `n_inverted` count preserved
+- HEALTHY verdict with `top_persona` + `top_score_ic` flat extraction
+- `top_persona` skips `INSUFFICIENT` entries (avoids unstable-IC
+  masquerade)
+- Analyzer-crash degrade to honest row, never bubble
+- Non-dict analyzer return normalization
+- Bounded trim past 2× cap rewrites to last KEEP rows
+- Nested-dir creation on first write
+- **`main()` wiring regression** — source-level assertion that
+  `_append_persona_skill_log(` appears in `main()` body (orphan
+  detection)
+- **Constants module-level for testability** — `PERSONA_SKILL_LOG`
+  + `PERSONA_SKILL_LOG_KEEP` exposed
+- **Analyzer contract pinning** — every key the ledger reads
+  (`status`, `verdict`, `n_records`, `n_personas`, `personas`,
+  `inverted_personas`, and per-row `persona/n/score_ic/verdict`)
+  asserted present on the analyzer's documented return shape
+
+13 new tests, all green. Full ledger-suite cross-check
+(`tests/test_continuous*.py`) → 145 passed.
+
+### Phase 3 — Quant researcher validation
+
+Read live state, not source.
+
+| Signal | State | Source | Verdict shift vs prior |
+|---|---|---|---|
+| Deployed scorer | `n_train=4987`, fresh pickle (2026-05-23) | `data/ml/decision_scorer.pkl` | gate is active (>=500) |
+| Calibration | `DIRECTIONAL_BUT_BIASED` decile_err 3.9pp > 3.0pp | `python3 -m paper_trader.ml.calibration` | unchanged (textbook MLP magnitude bias) |
+| Baseline compare | **`MLP_ADDS_SKILL`** — rank_ic +0.359 vs best baseline +0.075 (ic_gap +0.284 > 0.05) | `python3 -m paper_trader.ml.baseline_compare` | **flipped from `MLP_WORSE_THAN_TRIVIAL`** in `data/baseline_skill_log.jsonl` cycle 1 (2026-05-22). Net positive — the 17-feature MLP now genuinely beats the best one-liner OOS |
+| Persona skill | `HEALTHY` verdict — `Sector Rotator` is SIGNAL_EDGE leader (+0.172, win_rate 56%); 5 personas NO_SIGNAL_EDGE; NO inverted personas | `python3 -m paper_trader.ml.persona_skill` | actionable — sector rotation is the cycle's edge |
+| Continuous loop | Cycle 5 in progress (started 2026-05-18 18:25, run 6243 day 1311/2516); 500 backtests in DB, 474 complete, 26 failed | `continuous.log` + `backtest.db` | long cycles (3–35 min/cycle observed) — bottlenecked on GDELT rate-limit chatter and digital-intern article-store lock |
+| LLM annotation | **DARK** — auth-failure for at least 4 cycles, 0 endorsed / 0 condemned per cycle | `continuous.log` | confirms `pipeline_dark` memory; the LLM sample-weight multiplier (×3 / ×0.1) is structurally absent from training |
+| Inject + train | Frequent `inject err: database locked after 4 attempts` and `trainer timeout (injected 2476)` | `continuous.log` | chronic articles.db lock contention with digital-intern daemon — known |
+
+### Phase 4 — Docs (this entry)
+
+`user_findings = 4` (the actionable ones — most-decisive first):
+
+1. **The MLP gate is NOW adding skill** (rank_ic +0.36, ic_gap +0.28) —
+   the long-documented `MLP_NO_BETTER_THAN_TRIVIAL` baseline-compare
+   finding (live as recently as cycle 1 / 2026-05-22) appears to have
+   reversed as `decision_outcomes.jsonl` grew from 7.7k → 8.7k and the
+   model was retrained on the larger tail. The new per-cycle
+   `baseline_skill_log` should make this trend visible once the
+   continuous loop completes a fresh cycle.
+2. **Persona signal skill is concentrated in `Sector Rotator`**
+   (+0.172 score_ic) — the other 5 stable personas (Momentum, ESG,
+   Pure Speculator, Value Investor, Quant) are at noise. The new
+   `persona_skill_log` will trend this. A future explicit decision
+   could rebalance `_PERSONA_BOOSTS` to favor Sector Rotator, but
+   that is a strategy change, not an audit.
+3. **Calibration is still DIRECTIONAL_BUT_BIASED** — magnitude error
+   3.9pp > 3.0pp; this is the documented bias state. `predict_calibrated`
+   (pass #10's quantile-mapped magnitude reading) addresses it, but
+   most consumers still call raw `predict()`. The new `_ml_decide`
+   gate bucket assignment uses raw `predict()` and would benefit from
+   switching to `predict_calibrated()` once the calibrated reliability
+   ledger confirms stable bias reduction.
+4. **LLM annotation pipeline DARK for cycles 4+** — auth-failure
+   surface in `continuous.log` is structural. Until fixed, the
+   training weight multiplier (×3 ENDORSE / ×0.1 CONDEMN) is zero
+   signal — every row weights 1×, the documented production state.
+
+Test verify: `python3 -m pytest tests/ -k "ml or backtest or scorer"`
+→ 778 passed (Phase 1 + 2 done). New
+`tests/test_continuous_persona_skill_ledger.py` → 13 passed in 0.72s.
+
+Files changed:
+- `run_continuous_backtests.py` — added `PERSONA_SKILL_LOG`,
+  `PERSONA_SKILL_LOG_KEEP`, `_append_persona_skill_log()`, wired into
+  `main()` after `_append_gate_arm_skill_log()`.
+- `tests/test_continuous_persona_skill_ledger.py` — new test file with
+  3 test classes / 13 tests.
+
+---
+
 ## 2026-05-24 ML+backtest HYBRID pass #33 (Agent 2) — `DecisionScorer.feature_group_contributions` operator triage roll-up
 
 ### Phase 1 — Debug: bugs_fixed = 0
