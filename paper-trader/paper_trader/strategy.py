@@ -220,7 +220,16 @@ def _rsi_live(closes: list[float], period: int = 14) -> float | None:
         avg_g = (avg_g * (period - 1) + g) / period
         avg_l = (avg_l * (period - 1) + l) / period
     if avg_l == 0:
-        return 100.0
+        # Strict all-up returns 100. A perfectly FLAT series (no gain AND no
+        # loss across the lookback) historically also returned 100 — a spurious
+        # "severely overbought" signal that fed the wrong adjustment into the
+        # ML advisor's `rsi > 67 → adj -= 1.5` arm for any flat name (a weekend
+        # snapshot, a low-volume ticker, or any stretch where every close
+        # matched the prior close). RSI is undefined at zero variance; the
+        # textbook neutral reading is 50. Mirrors the same fix already applied
+        # to backtest._rsi (pass #21, commit 9ee81b7) — the live `_rsi_live`
+        # was the missed sibling.
+        return 100.0 if avg_g > 0 else 50.0
     rs = avg_g / avg_l
     return 100.0 - (100.0 / (1.0 + rs))
 
