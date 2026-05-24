@@ -796,13 +796,21 @@ class DecisionScorer:
                     "error": str(e)}
 
 
-def train_scorer(records: list[dict]) -> dict:
+def train_scorer(records: list[dict], path: "Path | None" = None) -> dict:
     """Train DecisionScorer on outcome records.
 
     Each record must have: ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
     forward_return_5d. Optional: action (BUY/SELL — SELL flips target sign so the
     model learns "goodness of THIS action"), return_pct (overall backtest run
     quality, used to weight samples). Returns stats dict.
+
+    ``path`` overrides the deployed ``SCORER_PATH`` for one call. Default (None)
+    pickles to the deployed path — preserves the existing contract every cycle
+    of the continuous loop and every test that monkey-patched the module-level
+    constant. The override exists so diagnostic analyzers (the learning-curve
+    sweep) can train into a throwaway temp file without trampling the live
+    pickle the conviction gate reads; the same atomic tmp+``.replace`` idiom
+    is used regardless of which path is targeted.
     """
     if not records:
         return {"status": "insufficient_data", "n": 0}
@@ -1043,7 +1051,8 @@ def train_scorer(records: list[dict]) -> dict:
         model = _LstsqModel(w)
         val_rmse = float("nan")
 
-    SCORER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    out_path = path if path is not None else SCORER_PATH
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     # Atomic write: a torn pickle (process killed mid-write, or a backtest
     # thread loading the file concurrently) would leave DecisionScorer
     # permanently untrained. Write to a temp file then atomically replace.
@@ -1097,12 +1106,12 @@ def train_scorer(records: list[dict]) -> dict:
         print(f"[decision_scorer] label-quantile build failed: {e}")
         label_quantiles = None
 
-    _tmp = SCORER_PATH.with_suffix(".pkl.tmp")
+    _tmp = out_path.with_suffix(".pkl.tmp")
     with _tmp.open("wb") as f:
         pickle.dump({"model": model, "scaler": scaler, "n_train": n_pickle,
                      "pred_quantiles": pred_quantiles,
                      "label_quantiles": label_quantiles}, f)
-    _tmp.replace(SCORER_PATH)
+    _tmp.replace(out_path)
 
     return {"status": "ok", "n": n_pickle, "val_rmse": val_rmse,
             "n_label_clamped": n_label_clamped,

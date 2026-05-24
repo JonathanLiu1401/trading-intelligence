@@ -132,6 +132,8 @@ from collectors.putcall_ratio_collector import collect_putcall_ratio
 from collectors.bls_collector import collect_bls
 from collectors.bea_collector import collect_bea
 from collectors.federal_register_collector import collect_federal_register
+from collectors.treasury_auctions import collect_treasury_auctions
+from collectors.arxiv_qfin_collector import collect_arxiv_qfin
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -229,6 +231,8 @@ BIS_INTERVAL            = 1800    # BIS press releases, speeches, research — e
 FED_REG_INTERVAL        = 1800    # Federal Register BIS/OFAC/FTC/FCC/NIST rules — every 30min
 BLS_INTERVAL            = 3600    # BLS macro series (CPI, unemployment, payrolls) — once per hour
 BEA_INTERVAL            = 3600    # BEA macro releases (GDP, trade, personal income) — once per hour
+TREASURY_AUCTIONS_INTERVAL = 1800  # UST auction announcements from TreasuryDirect — every 30min
+ARXIV_QFIN_INTERVAL    = 3600     # arXiv q-fin + econ new papers (weekday evenings) — hourly
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
 SHORT_SELLER_INTERVAL   = 1800    # Short-seller research reports (rare, high-priority) — every 30min
 FINANCIAL_BLOGS_INTERVAL = 600    # InvestorPlace, Motley Fool, Nasdaq RSS — every 10min
@@ -2098,6 +2102,48 @@ def bea_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(BEA_INTERVAL)
+
+
+def treasury_auctions_worker(store: ArticleStore):
+    log.info("[treasury_auctions_worker] started")
+    bo = Backoff("treasury_auctions", base=120.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_treasury_auctions()
+            _ingest(store, articles, "treasury_auctions")
+            try:
+                source_health.record_result("treasury_auctions", len(articles))
+            except Exception as he:
+                log.warning(f"[treasury_auctions_worker] source_health error: {he}")
+            _worker_last_ok["treasury_auctions"] = time.time()
+            log.debug(f"[treasury_auctions] cycle ok ({len(articles)} new auctions)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[treasury_auctions_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(TREASURY_AUCTIONS_INTERVAL)
+
+
+def arxiv_qfin_worker(store: ArticleStore):
+    log.info("[arxiv_qfin_worker] started")
+    bo = Backoff("arxiv_qfin", base=300.0, cap=3600.0)
+    while _running:
+        try:
+            articles = collect_arxiv_qfin()
+            _ingest(store, articles, "arxiv_qfin")
+            try:
+                source_health.record_result("arxiv_qfin", len(articles))
+            except Exception as he:
+                log.warning(f"[arxiv_qfin_worker] source_health error: {he}")
+            _worker_last_ok["arxiv_qfin"] = time.time()
+            log.debug(f"[arxiv_qfin] cycle ok ({len(articles)} new papers)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[arxiv_qfin_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(ARXIV_QFIN_INTERVAL)
 
 
 def federal_register_worker(store: ArticleStore):
@@ -4114,6 +4160,8 @@ def main():
         ("boe_press",   boe_press_worker),
         ("bls",         bls_worker),
         ("bea",         bea_worker),
+        ("treasury_auctions", treasury_auctions_worker),
+        ("arxiv_qfin",  arxiv_qfin_worker),
         ("federal_register", federal_register_worker),
         ("whitehouse",  whitehouse_worker),
         ("g10_cb",      g10_cb_worker),
