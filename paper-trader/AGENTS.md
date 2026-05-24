@@ -6,6 +6,112 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 ML+backtest HYBRID pass #33 (Agent 2) — `DecisionScorer.feature_group_contributions` operator triage roll-up
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Audited `paper_trader/ml/decision_scorer.py`, `paper_trader/backtest.py`,
+`run_continuous_backtests.py` for fresh bugs (regex-parse robustness in
+`_parse_gate_decision` / `_parse_conviction_pct`, walk-back collision
+guards in `_compute_decision_outcomes`, dedup precedence in `train_scorer`,
+quantile-table collapse guards in `_raw_to_*`, off-distribution
+propagation through the `_ml_decide` gate, untrained / null / NaN /
+non-finite handling across `_to_float` and `predict_with_meta`). All
+checked paths are well-defended; no new code-bug worth fixing was
+identified. The ML/backtest analytics surface is also heavily saturated
+(22+ read-only analyzers, ~327 tests).
+
+### Phase 2 — Feature: `feature_group_contributions()`
+
+Net-new public method on `DecisionScorer` plus a `--groups` CLI flag.
+Rolls the 17 per-feature `feature_contributions()` rows into 5 operator-
+facing buckets that map 1:1 to the trader's mental model of the inputs:
+
+```
+ml_score  — the ArticleNet trade-thesis score itself     (1 feature)
+quant     — purely-technical price signals                (6 features:
+            rsi, macd, mom5, mom20, vol_ratio, bb_pos)
+regime    — SPY 50/200 market-regime multiplier           (1 feature)
+news      — news_urgency + news_article_count             (2 features)
+sector    — the 7-way sector one-hot                      (7 features)
+```
+
+The per-feature view answers "which input is moving this prediction?";
+the per-group view answers the orthogonal triage question *"is the scorer
+leaning on news, on quant signals, on the trade thesis, or on the sector
+bias?"* — at a glance, without scanning a 17-row table.
+
+`FEATURE_GROUPS` and `FEATURE_GROUP_MAP` are module-level constants with
+an import-time `assert` pinning them in lockstep with `FEATURE_NAMES` (the
+same drift-guard `FEATURE_NAMES` itself uses against `build_features()`).
+A NEW build_features column without a `FEATURE_GROUP_MAP` entry fails the
+test `test_map_covers_every_feature_name` AND the import-time assert.
+
+Algebraic identity (pinned by `test_sum_of_groups_equals_sum_of_features`):
+
+```
+sum(group.contribution for group in groups)
+    == sum(feature.contribution for feature in contributions)
+    == pred_raw - pred_baseline - interaction_residual
+```
+
+`share_pct` is `|contribution| / sum(|contribution|) × 100`, so groups
+whose features cancel internally still surface their net signal (a literal
+`signed / sum_of_signed` denominator would misreport offsetting groups).
+Sums to ~100.0 across all groups whenever there's any signal at all.
+
+#### CLI
+
+```bash
+# Per-prediction view, now with --groups operator triage roll-up:
+python3 -m paper_trader.ml.decision_scorer \
+    --ticker NVDA --ml-score 2.5 --rsi 55 --macd 0.5 \
+    --mom5 2.0 --mom20 3.0 --news-urgency 70 \
+    --news-article-count 3 --groups
+
+# JSON for piping (includes a new `group_attribution` field when --groups
+# is set):
+python3 -m paper_trader.ml.decision_scorer --ticker NVDA --groups --json
+```
+
+#### Tests
+
+```bash
+# 19 new tests (~9s, all offline):
+python3 -m pytest tests/test_decision_scorer_feature_groups.py -v
+
+# Full decision_scorer slice (~15s):
+python3 -m pytest tests/ -v -k "decision_scorer or feature_groups" \
+    --ignore=tests/test_cycle_gap_summary.py
+```
+
+### Phase 3 — User findings: user_findings = 2
+
+1. **Scorer pickle staleness vs outcome freshness.** `data/ml/decision_scorer.pkl`
+   mtime was 2026-05-23 07:20 while `data/decision_outcomes.jsonl` is fresh
+   (2026-05-24 04:00). Scorer-skill ledger (`data/scorer_skill_log.jsonl`)
+   last wrote 2026-05-21 23:24. The `scorer_freshness.py` diagnostic is the
+   right tool for this exact symptom — runs `python3 -m paper_trader.ml.scorer_freshness`
+   to verify, but verdict is likely `STALE_PKL` / `LOOP_STALLED`. Not a code
+   bug — an ops state worth surfacing on the next dashboard look.
+
+2. **`continuous.log` is 6 days stale** (last write 2026-05-18 12:03) while
+   the outcomes file is fresh — suggests the live continuous loop is running
+   from a different log destination or was restarted with logging redirected
+   elsewhere. Not a code defect, but the documented `tail -f continuous.log`
+   troubleshooting workflow no longer reflects current loop state.
+
+### Files touched
+
+- `paper_trader/ml/decision_scorer.py` (FEATURE_GROUPS + FEATURE_GROUP_MAP
+  module constants, `feature_group_contributions` method, `--groups` CLI flag,
+  CLI table rendering)
+- `tests/test_decision_scorer_feature_groups.py` (19 tests covering map
+  invariants, untrained degradation, trained roll-up correctness, sector
+  aggregation, JSON safety)
+
+---
+
 ## 2026-05-24 core HYBRID pass #6 (Agent 1) — `/api/swr-cache-health` operator endpoint
 
 ### Phase 1 — Debug: bugs_fixed = 0
