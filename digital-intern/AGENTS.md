@@ -5,6 +5,106 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-24 hybrid pass #29 (Agent 3) — analytics.ml_training_health: trainer cycle health snapshot
+
+Debugger + feature-dev + news-analyst pass. **No Phase 1 commit** — the
+codebase is mature (143 focused-suite tests green at pass start; every
+load-bearing invariant the prompt called out — backtest isolation in
+`get_unalerted_urgent` / `get_top_for_briefing` / `get_unscored`, ai_score
+vs ml_score separation in `update_ml_scores_batch`, `score_source` tagging,
+the urgency state machine — is already pinned by the existing suite).
+Scanned the alert pipeline, urgency-scorer pre-floor, the LLM/ML
+score-source flow, the recap-template fingerprint set, the
+shared-connection cursor-collision retry decorator, and the trainer's
+strong-pool predicate; none reproduce as a bug on the current HEAD.
+
+**Phase 2 (feature) — committed in `82856fe`:**
+
+- `analytics/ml_training_health.py::compute_ml_training_health(records,
+  *, now, window_h, stale_age_h, dead_age_h, error_heavy_pct)` — the
+  missing primitive for the local-model training pipeline. The trainer
+  writes per-cycle metrics to `data/ml/training_metrics.jsonl`
+  (`ml/trainer.py::_log_metrics`) but no analytics surface reads it.
+  Sibling primitives leave a genuine gap:
+  - `storage.article_store.briefing_health` — 5h Opus pipeline cadence.
+    Cannot detect a wedged local trainer.
+  - `analytics.ml_score_calibration` — threshold sweep over labels
+    already in the DB. Says nothing about *whether the trainer ran*.
+  - `analytics.label_audit` / `analytics.score_agreement` — strong-pool
+    integrity and ml-vs-llm drift. Diagnoses what the model *learned*,
+    not whether it's still learning.
+
+  Returns a 10-key dict (`window_h`, `last_train_age_h`,
+  `last_continuous_age_h`, `train_in_window`, `continuous_in_window`,
+  `errors_in_window`, `total_in_window`, `val_loss_trend`, `diverging`,
+  `verdict`) with a closed 6-string verdict alphabet, precedence
+  high → low:
+  - `NO_DATA` — log empty / missing (a brand-new daemon must not false-
+    flag as DEAD).
+  - `DEAD` — last successful `phase=train` > 48h ago. The documented
+    `[DI ml-trainer subprocess timeout]` failure mode.
+  - `STALE` — last successful `phase=train` between 12h and 48h ago.
+  - `ERROR_HEAVY` — >50% of records in the window have `status != 'ok'`.
+  - `DIVERGING` — last 3 train `val_loss` values strictly increasing
+    each by >= 5% — model getting worse cycle-over-cycle.
+  - `HEALTHY` — last < 12h ago AND none of the above.
+
+  Pure builder takes `records` by value so unit tests inject synthetic
+  inputs without touching the filesystem; `compute(window_h, metrics_
+  path, now)` is the file-reader orchestrator. Malformed JSONL lines
+  silently skipped; missing file → `NO_DATA`. Read-only: no DB / network
+  / model touch. Pinned by 25 tests in `tests/test_ml_training_health.py`
+  covering the verdict ladder (incl. DEAD-outranks-DIVERGING precedence),
+  divergence math (strict-monotone + 3-step minimum + ratio threshold),
+  shape contract (required keys, val_loss_trend cap-5, window_h clamp),
+  file reader robustness (missing / malformed / tail-limit), and the
+  "no DB import" anti-coupling claim.
+
+  None of the four load-bearing invariants are touched: read-only on a
+  JSONL log, no DB connection, never mutates ai_score / ml_score /
+  score_source / urgency.
+
+**Phase 3 (live user validation) — user_findings=3:**
+
+1. **NEW ml_training_health on live log:** verdict=**DEAD** — last
+   successful train **51.01h ago**. `val_loss` trend (newest→oldest)
+   `[2.19, 0.64, 0.84, 1.17, 1.49]` — the most-recent run was *more
+   than 3× worse* than the prior best, so the trainer would also have
+   verdicted `DIVERGING` if the staleness ladder hadn't outranked it.
+   This is the production failure mode the `[DI ml-trainer subprocess
+   timeout]` memory documents; until this pass the analyst had no
+   queryable surface for it (the dashboard's `/api/ml-status` only
+   checks `model.fitted`, not "did the trainer last cycle succeed?").
+2. **Tier-1 collector dark gap matches standing memory.** 7-day source
+   freshness shows `rss` collector dark since 2026-05-17 02:57Z,
+   `polygon` dark since same instant, `google_news` and `newsapi` at
+   0/7d. Same `[DI chronic dark collectors]` baseline — not a fresh
+   bug. `finnhub` / `sec_edgar` / `web` / `alphavantage` / `reddit`
+   all fresh (last hour to last day).
+3. **Alert pipeline healthy.** 1045 articles ingested in last 1h (in
+   line with 174/h baseline); 4/5 of recent 6h urgent rows are
+   LLM-vetted at ai_score 8-9 (real NVDA earnings night content,
+   QBTS quantum rally, NVDA $80B buyback authorization, $9B White
+   House Blackwell order). One ml-only commodity_futures alert at
+   ml_score=6.32. Briefings: HEALTHY verdict, 4 in last 24h, newest
+   4.63h ago. Urgent queue: 0 queued / 0 overdue. Lock contention:
+   0 retries / 0 failures.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:** `from storage import article_store; from ml import
+features, model` → `imports OK`. Focused suite:
+`tests/test_ml_training_health.py` (25) +
+`tests/test_article_store.py` + `tests/test_briefing_health.py` +
+`tests/test_urgency_scorer.py` + `tests/test_features.py` +
+`tests/test_alert_agent.py` + `tests/test_model.py` +
+`tests/test_trainer.py` + `tests/test_web_scraper.py` = **143 pass /
+0 fail** in 7.2s.
+
+**Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=3`.
+
+---
+
 ## 2026-05-24 feature-dev pass (Agent 4) — NO-DECISION-REASONS + ROUND-TRIP-POSTMORTEM + CASH-DRAG chat enrichments
 
 Three chat blocks shipped, each piping an existing paper-trader endpoint that
