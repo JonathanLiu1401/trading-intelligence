@@ -102,6 +102,7 @@ from collectors.eia_collector import collect_eia
 from collectors.shipping_intelligence import collect_shipping_news
 from collectors.fed_press_collector import collect_fed_press
 from collectors.fed_research_collector import collect_fed_research
+from collectors.energy_news_collector import collect_energy_news
 from collectors.ecb_press_collector import collect_ecb_press
 from collectors.boj_press_collector import collect_boj_press
 from collectors.boe_press_collector import collect_boe_press
@@ -224,6 +225,7 @@ EIA_INTERVAL            = 1800    # EIA Today in Energy + press releases — eve
 SHIPPING_INTELLIGENCE_INTERVAL = 1800  # shipping RSS (Freightos, Splash247, Hellenic) — every 30min
 FED_PRESS_INTERVAL      = 1800    # Federal Reserve press / speech / testimony RSS — every 30min
 FED_RESEARCH_INTERVAL   = 3600    # Fed FEDS/IFDP working papers + full press_all — every 60min
+ENERGY_NEWS_INTERVAL    = 600         # energy/oil news feeds every 10min
 ECB_PRESS_INTERVAL      = 1800    # ECB press releases RSS — every 30min
 BOJ_PRESS_INTERVAL      = 1800    # Bank of Japan press / speech / MPM RSS — every 30min
 BOE_PRESS_INTERVAL      = 1800    # Bank of England press / publications RSS — every 30min
@@ -348,6 +350,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "ftc_doj": FTC_DOJ_INTERVAL,
     "fed_press": FED_PRESS_INTERVAL,
     "fed_research": FED_RESEARCH_INTERVAL,
+    "energy_news": ENERGY_NEWS_INTERVAL,
     "eia": EIA_INTERVAL,
     "shipping_intelligence": SHIPPING_INTELLIGENCE_INTERVAL,
     "ecb_press": ECB_PRESS_INTERVAL,
@@ -2025,6 +2028,27 @@ def fed_research_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(FED_RESEARCH_INTERVAL)
+
+
+def energy_news_worker(store: ArticleStore):
+    log.info("[energy_news_worker] started")
+    bo = Backoff("energy_news", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_energy_news()
+            _ingest(store, articles, "energy_news")
+            try:
+                source_health.record_result("energy_news", len(articles))
+            except Exception as he:
+                log.warning(f"[energy_news_worker] source_health error: {he}")
+            _worker_last_ok["energy_news"] = time.time()
+            log.debug(f"[energy_news] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[energy_news_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(ENERGY_NEWS_INTERVAL)
 
 
 def ecb_press_worker(store: ArticleStore):
@@ -4226,6 +4250,7 @@ def main():
         ("shipping_intelligence", shipping_intelligence_worker),
         ("fed_press",   fed_press_worker),
         ("fed_research", fed_research_worker),
+        ("energy_news",  energy_news_worker),
         ("ecb_press",   ecb_press_worker),
         ("boj_press",   boj_press_worker),
         ("boe_press",   boe_press_worker),
