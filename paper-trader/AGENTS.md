@@ -6,6 +6,141 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 paper-trader core HYBRID pass (Agent 1) — `exit_only_streak` detector
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Read all required core files in full (runner.py, reporter.py, signals.py,
+strategy.py, dashboard.py, market.py, store.py) and probed dashboard +
+strategy with two parallel `Explore`-subagent audits. Every flagged
+suspect traced back to an existing guard:
+
+* `reporter._trade_impact_line` zero-division on `same_lot_value / total`:
+  guarded at L300 by `if total <= 0: return ""` — division never reached.
+* `reporter.send_trade_alert` KeyError on partial option dict at L479:
+  trades for options are always written via `store.record_trade` with the
+  full (strike/expiry/option_type) triple — schema-enforced contract.
+* `strategy._enforce_risk_pre_trade` "sum-across-strikes" oversell on
+  SELL_CALL/SELL_PUT: pre-trade gate (L1082) is a coarse upper bound;
+  the per-match gate at L1188 (`qty > match["qty"] + 1e-6`) is the real
+  cash-flow bound and is already strict per contract.
+* `signals._choose` tie-break bug: LOCAL_DB wins ties because `_candidates()`
+  iterates LOCAL first and the comparator is strict `>`. Correct as-is.
+* `runner._no_decision_cause` non-string `raw` crash: guarded by
+  `isinstance(raw, str)` at L745 — falls through safely on bytes/None.
+
+The 1102-test scoped slice (`-k "signals or store or market or runner or
+reporter or strategy"`) passes clean. No commit this phase.
+
+### Phase 2 — Feature: `exit_only_streak` (6f0ba0d)
+
+New `paper_trader/analytics/exit_only_streak.py` — walks the trade ledger
+newest-backward counting consecutive SELL/SELL_CALL/SELL_PUT fills since
+the most recent BUY*. Emits DEFENSIVE_TRIM (≥3) / DEFENSIVE_LIQUIDATION
+(≥6) verdicts. Closes a real gap: `/api/streak` reads W/L on closed
+round-trips; `/api/churn` measures re-entry cadence; `/api/cash-drag`
+prices idle cash. None surface the *trade-direction* sequence — the
+specific "the last 6 fills were all SELLs, the engine is liquidating, not
+running the strategy" pattern a trader watching the live tape would name.
+
+Verdict ladder (sample-size-honest — the `streak` precedent):
+
+| Verdict | Trigger |
+|---------|---------|
+| `NO_DATA` | no BUY/SELL fills yet |
+| `MOST_RECENT_IS_ENTRY` | newest fill is an entry, OR run < `DEFENSIVE_TRIM_MIN` |
+| `DEFENSIVE_TRIM` | `DEFENSIVE_TRIM_MIN` (3) ≤ run < `DEFENSIVE_LIQUIDATION_MIN` (6) |
+| `DEFENSIVE_LIQUIDATION` | run ≥ `DEFENSIVE_LIQUIDATION_MIN` (6) |
+
+Wired into:
+* `/api/exit-only-streak` dashboard endpoint
+* `reporter._exit_only_streak_line`, surfaced after STREAK in the hourly
+  and daily-close Discord summaries. Suppression-by-default — only
+  `DEFENSIVE_TRIM` / `DEFENSIVE_LIQUIDATION` surface, so a healthy book
+  never adds Discord noise (the `_streak_line` NEUTRAL / `_hold_discipline`
+  NO_DATA suppression precedent).
+
+58 tests in `tests/test_exit_only_streak.py` + `test_exit_only_streak_reporter.py`
+pin the verdict ladder (NO_DATA, MOST_RECENT_IS_ENTRY, both DEFENSIVE_*
+arms, sub-floor silence at 1-2 trailing exits), direction classification
+(case-insensitive, whitespace-tolerant, unknown-action skipped), run-length
+math (REBALANCE/unknown rows skipped *without* breaking the run),
+`hours_since_last_entry` rendering (future-ts → 0.0 clamp), recent-sequence
+cap, endpoint composition, and the degrade-safe failure contract
+(malformed ledger, builder fault, store fault, non-dict result, missing
+headline all surface `""`).
+
+```bash
+python3 -m paper_trader.analytics.exit_only_streak   # smoke test
+python3 -m pytest tests/test_exit_only_streak.py tests/test_exit_only_streak_reporter.py -v
+```
+
+**Live snapshot at ship time** (paper_trader.db, 13 fills total, 9
+entries / 4 exits):
+```
+verdict: MOST_RECENT_IS_ENTRY  (silent line)
+exit_run_length: 1   (SELL NVDA at 02:08:08, prior fill was a BUY)
+hours_since_last_entry: 68.6h  ← 3-day entry drought
+recent_sequence: ['E','E','E','X','E','X','E','E','X','E','X','X']
+```
+
+The book has been exit-only for 3 days but stayed below the trim floor on
+this single trailing SELL, exactly the regime the silence design targets.
+A trader who NEEDS the raw drought number reads `/api/exit-only-streak`
+directly (the dashboard surface is always populated; the hourly only
+talks when there is something actionable).
+
+### Phase 3 — Live validation: user_findings = 4
+
+1. **Build-info stale-at-restart anomaly.** New runner PID 1598255 booted
+   at 23:39:36 (AFTER commits 62e00a4 / c2f63b2 / 6f0ba0d landed) yet
+   `/api/build-info` reports `boot_sha=b7ad20c`, `behind=3`, `stale=true`.
+   The deferred-restart mechanism DID fire (PID change) and the route
+   `/api/exit-only-streak` (only exists in 6f0ba0d) returns HTTP 200, so
+   the running code IS current — but `_BOOT_SHA` was captured against
+   an older HEAD snapshot. Likely a process-restart race where dashboard
+   imports before the systemd-side `git pull` propagates to the running
+   process's view. Cosmetic on the trader's dashboard (the bar reads
+   "STALE" when it isn't) but the route surface is correct.
+
+2. **64% NO_DECISION rate over 353 cycles.** `/api/decision-health`:
+   227 NO_DECISION / 118 HOLD / 8 FILLED. Host-saturation continues to
+   dominate (the documented structural issue per
+   [[pt-no-decision-host-saturation]]). The bot is mostly skipped.
+
+3. **3-day entry drought (caught by Phase 2's own surface).**
+   `/api/exit-only-streak.hours_since_last_entry = 68.6h`. The bot has
+   not added a new lot since 2026-05-21 10:00. Currently 100% cash
+   ($987.39, $-12.61 lifetime P/L). The new line stays silent on the
+   trailing-1-SELL regime by design, but the dashboard `/api/exit-only-streak`
+   surfaces the raw drought number every cycle.
+
+4. **$3.33 cash drag over 7d.** `/api/cash-drag` flags `COSTLY_CASH`
+   over the 168h window (SPY +0.96%, avg cash $347.47). The drought
+   from #3 directly explains the drag from this existing endpoint —
+   the two analytics line up to a single trader-actionable story
+   ("the engine sat in cash during a SPY rally").
+
+### Phase 4 — Final verify
+
+```bash
+# Pass-specific deliverables (58 tests, <1s):
+python3 -m pytest tests/test_exit_only_streak.py tests/test_exit_only_streak_reporter.py -v
+# Scoped neighbour slice (1102 tests, ~55s):
+python3 -m pytest tests/ -k "reporter or signals or store or market or strategy" -q
+# Imports green:
+python3 -c "import sys; sys.path.insert(0,'.'); from paper_trader import signals, reporter, strategy; print('imports OK')"
+```
+
+### Counters
+
+bugs_fixed=0 · features_added=1 (`exit_only_streak` analyzer + endpoint +
+hourly/daily-close line, 58 tests) · user_findings=4 (build-info stale-
+at-restart anomaly, 64% NO_DECISION rate, 3-day entry drought, $3.33
+cash-drag over 7d aligning with the drought)
+
+---
+
 ## 2026-05-24 ML+backtest HYBRID pass #26 (Agent 2) — `feature_ablation` analyzer
 
 ### Phase 1: Debug — 0 bugs fixed
