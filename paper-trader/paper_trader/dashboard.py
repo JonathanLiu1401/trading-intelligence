@@ -749,123 +749,181 @@ TEMPLATE = r"""
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%230d0d0d'/%3E%3Cline x1='7' y1='15' x2='7' y2='18' stroke='%2300d4ff' stroke-width='1.5'/%3E%3Crect x='5.5' y='18' width='3' height='7' rx='0.5' fill='%2300d4ff'/%3E%3Cline x1='7' y1='25' x2='7' y2='27' stroke='%2300d4ff' stroke-width='1.5'/%3E%3Cline x1='15' y1='12' x2='15' y2='15' stroke='%23ff3c4c' stroke-width='1.5'/%3E%3Crect x='13.5' y='15' width='3' height='6' rx='0.5' fill='%23ff3c4c'/%3E%3Cline x1='15' y1='21' x2='15' y2='24' stroke='%23ff3c4c' stroke-width='1.5'/%3E%3Cline x1='23' y1='5' x2='23' y2='8' stroke='%2300ff9f' stroke-width='1.5'/%3E%3Crect x='21.5' y='8' width='3' height='12' rx='0.5' fill='%2300ff9f'/%3E%3Cline x1='23' y1='20' x2='23' y2='23' stroke='%2300ff9f' stroke-width='1.5'/%3E%3Cpolyline points='7,21 15,17 23,11' stroke='%23ffd700' stroke-width='1.2' fill='none' stroke-dasharray='2,1.5'/%3E%3C/svg%3E">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Outfit:wght@400;500;600;700&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=JetBrains+Mono:wght@400;500;600&family=DM+Sans:wght@400;500;600;700&display=swap');
     :root {
       color-scheme: dark;
-      --bg: #0c0d0f;
-      --bg-panel: #111316;
-      --bg-elevated: #17191d;
-      --bg-hover: #1c1f24;
-      --bg-input: #0e1012;
-      --border: rgba(255,255,255,0.07);
-      --border-strong: rgba(255,255,255,0.13);
-      --text: #dde1e7;
-      --text-secondary: #8b929d;
-      --text-muted: #50565f;
-      --amber: #f0b429;
-      --amber-dim: rgba(240,180,41,0.12);
-      --cyan: #0acdff;
-      --cyan-dim: rgba(10,205,255,0.12);
-      --green: #00c896;
-      --green-dim: rgba(0,200,150,0.12);
-      --red: #ff4455;
-      --red-dim: rgba(255,68,85,0.12);
-      --blue: #4d9eff;
-      --blue-dim: rgba(77,158,255,0.12);
-      --yellow: #fbbf24;
-      --yellow-dim: rgba(251,191,36,0.12);
-      --pink: #f472b6;
-      --font-sans: 'Outfit', system-ui, sans-serif;
-      --font-mono: 'DM Mono', 'JetBrains Mono', monospace;
-      --font-display: 'Syne', system-ui, sans-serif;
-      --radius: 8px;
-      --radius-sm: 5px;
+      /* ── Bloomberg Black palette ── */
+      --bg: #000000;
+      --bg-panel: #080808;
+      --bg-elevated: #0f0f0f;
+      --bg-hover: #141414;
+      --bg-input: #050505;
+      --border: #1e1e1e;
+      --border-strong: #2a2a2a;
+      --border-bright: #2a2a2a;
+      --text: #c8cdd4;
+      --text-secondary: #6b7280;
+      --text-muted: #3d4450;
+      --cyan: #00d4e8;
+      --cyan-dim: rgba(0,212,232,0.08);
+      --cyan-glow: rgba(0,212,232,0.15);
+      --green: #00e676;
+      --green-dim: rgba(0,230,118,0.10);
+      --red: #ff1744;
+      --red-dim: rgba(255,23,68,0.10);
+      --gold: #ffd740;
+      --gold-dim: rgba(255,215,64,0.08);
+      /* legacy aliases kept so existing class color refs still resolve cleanly */
+      --amber: #ffd740;
+      --amber-dim: rgba(255,215,64,0.08);
+      --blue: #00d4e8;
+      --blue-dim: rgba(0,212,232,0.08);
+      --yellow: #ffd740;
+      --yellow-dim: rgba(255,215,64,0.08);
+      --pink: #ff5cb3;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+      --font-display: 'Bebas Neue', 'Impact', sans-serif;
+      --font-sans: 'DM Sans', system-ui, sans-serif;
+      --font-body: 'DM Sans', system-ui, sans-serif;
+      --radius: 0px;     /* terminal — no rounded corners */
+      --radius-sm: 0px;
     }
     * { box-sizing: border-box; }
     html { overflow-x: hidden; max-width: 100%; }
     body { overflow-x: hidden; }
     body {
       margin: 0; padding: 0;
-      font-family: var(--font-sans);
+      font-family: var(--font-body);
       background: var(--bg); color: var(--text);
-      font-size: 15px; line-height: 1.5;
+      font-size: 14px; line-height: 1.5;
+      letter-spacing: 0.005em;
     }
-    .brand, h1, h2, h3 { font-family: var(--font-display); }
-    .page-content { padding: 24px; max-width: 1600px; width: 100%; }
+    /* Subtle scanline overlay — CRT terminal feel without obscuring data */
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,0.05) 2px,
+        rgba(0,0,0,0.05) 4px
+      );
+      pointer-events: none; z-index: 9999;
+    }
+    .brand { font-family: var(--font-display); letter-spacing: 0.18em; }
+    h1, h2, h3 { font-family: var(--font-display); letter-spacing: 0.12em; }
+    .page-content { padding: 20px; max-width: 1600px; width: 100%; position: relative; z-index: 1; }
     .topbar {
       background: var(--bg-panel);
-      border-bottom: 1px solid var(--border);
-      padding: 0 20px; height: 48px;
-      display: flex; align-items: center; gap: 2px;
+      border-bottom: 1px solid var(--border-bright);
+      padding: 0 20px; height: 44px;
+      display: flex; align-items: center; gap: 0;
       position: sticky; top: 0; z-index: 100; margin: 0;
       overflow: hidden; max-width: 100%;
+      font-family: var(--font-mono);
     }
     .brand {
-      font-weight: 700; color: var(--amber);
-      font-size: 13px; letter-spacing: 0.08em;
+      font-weight: 400; color: var(--cyan);
+      font-size: 18px; letter-spacing: 0.22em;
       text-transform: uppercase;
-      margin-right: 16px; flex-shrink: 0;
+      margin-right: 20px; flex-shrink: 0;
+      text-shadow: 0 0 12px rgba(0,212,232,0.35);
     }
     .topbar a {
       color: var(--text-secondary); text-decoration: none;
-      font-size: 13px; font-weight: 500;
-      padding: 5px 12px; border-radius: var(--radius-sm);
-      transition: color 0.15s, background 0.15s;
+      font-size: 11px; font-weight: 500; letter-spacing: 0.12em;
+      text-transform: uppercase;
+      padding: 6px 14px;
+      transition: color 0.12s, background 0.12s, border-color 0.12s;
       white-space: nowrap;
+      border-bottom: 2px solid transparent;
+      font-family: var(--font-mono);
     }
-    .topbar a:hover { color: var(--text); background: var(--bg-hover); }
-    .topbar a.active { color: var(--amber); background: var(--amber-dim); }
-    h1 { margin: 0 0 4px; font-size: 22px; font-weight: 600; color: var(--text); }
-    .sub { color: var(--text-secondary); font-size: 13px; margin-bottom: 20px; }
+    .topbar a:hover { color: var(--text); background: var(--cyan-dim); }
+    .topbar a.active {
+      color: var(--cyan); background: transparent;
+      border-bottom: 2px solid var(--cyan);
+      text-shadow: 0 0 6px var(--cyan-glow);
+    }
+    h1 {
+      margin: 0 0 4px; font-size: 34px; font-weight: 400;
+      color: #ffffff; letter-spacing: 0.16em; text-transform: uppercase;
+    }
+    .sub { color: var(--text-secondary); font-size: 12px; margin-bottom: 20px;
+      font-family: var(--font-mono); letter-spacing: 0.04em; }
     nav.tabs {
-      display: flex; gap: 2px; margin-bottom: 18px;
+      display: flex; gap: 0; margin-bottom: 18px;
       border-bottom: 1px solid var(--border);
       overflow-x: auto; -webkit-overflow-scrolling: touch; flex-wrap: nowrap;
     }
     nav.tabs a {
-      padding: 8px 16px; color: var(--text-secondary); text-decoration: none;
-      border-bottom: 2px solid transparent; font-size: 13px; font-weight: 500;
-      cursor: pointer; transition: color 0.15s; margin-bottom: -1px;
+      padding: 10px 20px; color: var(--text-secondary); text-decoration: none;
+      border-bottom: 2px solid transparent;
+      font-family: var(--font-mono); font-size: 11px;
+      font-weight: 500; text-transform: uppercase; letter-spacing: 0.14em;
+      cursor: pointer; transition: color 0.12s, border-color 0.12s;
+      margin-bottom: -1px;
     }
-    nav.tabs a.active { color: var(--amber); border-bottom-color: var(--amber); }
+    nav.tabs a.active {
+      color: var(--cyan); border-bottom-color: var(--cyan);
+      text-shadow: 0 0 6px var(--cyan-glow);
+    }
     nav.tabs a:hover { color: var(--text); }
     .tab-pane { display: none; }
     .tab-pane.active { display: block; }
     .grid {
-      display: grid; gap: 18px;
+      display: grid; gap: 14px;
       grid-template-columns: 1fr 1fr;
     }
     @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
     .card {
       background: var(--bg-panel); border: 1px solid var(--border);
-      border-radius: var(--radius); padding: 18px 20px;
+      border-radius: 0; padding: 16px 18px;
       overflow-x: auto; -webkit-overflow-scrolling: touch;
+      position: relative;
     }
     .card h2 {
-      margin: 0 0 14px; font-size: 11px; font-weight: 600;
-      color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.1em;
-    }
-    .stat-row { display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 12px; }
-    .stat { flex: 1 1 120px; }
-    .stat .v {
+      margin: 0 0 14px;
       font-family: var(--font-mono);
-      font-size: 24px; color: var(--text); font-weight: 500;
-      font-variant-numeric: tabular-nums;
-      min-width: 0; max-width: 100%;
+      font-size: 11px; font-weight: 600;
+      color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.16em;
+      border-left: 3px solid var(--cyan);
+      padding-left: 10px; line-height: 1.1;
     }
-    .stat .l { color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .stat-row { display: flex; gap: 22px; flex-wrap: wrap; margin-bottom: 14px; }
+    .stat { flex: 1 1 130px; }
+    .stat .v {
+      font-family: var(--font-display);
+      font-size: 30px; color: #ffffff; font-weight: 400;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.04em;
+      min-width: 0; max-width: 100%; line-height: 1.05;
+    }
+    .stat .l {
+      color: var(--text-muted); font-size: 10px;
+      text-transform: uppercase; letter-spacing: 0.16em;
+      font-family: var(--font-mono); margin-bottom: 3px;
+    }
     .pos, .pl { color: var(--green); }
     .neg { color: var(--red); }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .pos.v, .neg.v { text-shadow: 0 0 14px currentColor; opacity: 0.95; }
+    table {
+      width: 100%; border-collapse: collapse; font-size: 12px;
+      font-family: var(--font-mono);
+    }
     th {
-      text-align: left; padding: 0 10px 10px;
-      font-size: 11px; font-weight: 600; color: var(--text-muted);
-      text-transform: uppercase; letter-spacing: 0.08em;
+      text-align: left; padding: 0 10px 9px;
+      font-family: var(--font-mono);
+      font-size: 10px; font-weight: 600; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: 0.14em;
       border-bottom: 1px solid var(--border-strong);
     }
     td {
-      padding: 8px 10px; border-bottom: 1px solid var(--border);
-      font-size: 13px;
+      padding: 7px 10px; border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
     }
     td.num {
       text-align: right;
@@ -877,18 +935,19 @@ TEMPLATE = r"""
     canvas { max-width: 100%; max-height: 280px; }
     .pill {
       display: inline-flex; align-items: center;
-      padding: 2px 8px; border-radius: 4px;
+      padding: 2px 8px; border-radius: 0;
       background: var(--bg-elevated); color: var(--text-secondary);
-      font-size: 11px; font-weight: 500; letter-spacing: 0.04em;
-      font-family: var(--font-sans);
+      font-size: 10px; font-weight: 500; letter-spacing: 0.1em;
+      font-family: var(--font-mono); text-transform: uppercase;
+      border: 1px solid var(--border-strong);
     }
-    .pill.buy { background: var(--green-dim); color: var(--green); }
-    .pill.sell { background: var(--red-dim); color: var(--red); }
+    .pill.buy { background: var(--green-dim); color: var(--green); border-color: var(--green); }
+    .pill.sell { background: var(--red-dim); color: var(--red); border-color: var(--red); }
     .pill.hold { background: var(--bg-elevated); color: var(--text-secondary); }
-    .pill.run { background: var(--blue-dim); color: var(--blue); }
-    .pill.status-running  { background: var(--blue-dim); color: var(--blue); }
-    .pill.status-complete { background: var(--green-dim); color: var(--green); }
-    .pill.status-failed   { background: var(--red-dim); color: var(--red); }
+    .pill.run { background: var(--cyan-dim); color: var(--cyan); border-color: var(--cyan); }
+    .pill.status-running  { background: var(--cyan-dim); color: var(--cyan); border-color: var(--cyan); }
+    .pill.status-complete { background: var(--green-dim); color: var(--green); border-color: var(--green); }
+    .pill.status-failed   { background: var(--red-dim); color: var(--red); border-color: var(--red); }
     .pill.status-pending  { background: var(--bg-elevated); color: var(--text-secondary); }
     .spinner {
       display: inline-block; width: 10px; height: 10px;
@@ -898,19 +957,86 @@ TEMPLATE = r"""
     }
     @keyframes spin { to { transform: rotate(360deg); } }
     .progress-wrap {
-      margin: 8px 0; height: 4px; background: var(--bg-elevated);
-      border-radius: 4px; overflow: hidden;
+      margin: 8px 0; height: 3px; background: var(--bg-elevated);
+      border-radius: 0; overflow: hidden;
+      border: 1px solid var(--border);
     }
     .progress-bar {
-      height: 100%; background: linear-gradient(90deg, var(--amber), var(--cyan));
+      height: 100%; background: var(--cyan);
+      box-shadow: 0 0 8px var(--cyan-glow);
       transition: width 0.4s ease;
     }
-    .progress-label { font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
+    .progress-label {
+      font-family: var(--font-mono);
+      font-size: 10px; color: var(--text-muted);
+      margin-bottom: 4px; letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    /* ── SL / TP distance bars on position rows ── */
+    .sl-bar-wrap, .tp-bar-wrap {
+      width: 64px; height: 3px; background: #181818;
+      margin-top: 3px; border: 1px solid var(--border);
+    }
+    .sl-bar { height: 100%; background: var(--red);
+      box-shadow: 0 0 4px rgba(255,23,68,0.4);
+      transition: width 0.3s; }
+    .tp-bar { height: 100%; background: var(--green);
+      box-shadow: 0 0 4px rgba(0,230,118,0.4);
+      transition: width 0.3s; }
+    .sl-label, .tp-label {
+      font-family: var(--font-mono); font-size: 10px;
+      letter-spacing: 0.04em; opacity: 0.9; line-height: 1.1;
+    }
+    .sl-label { color: var(--red); }
+    .tp-label { color: var(--green); }
+    /* ── MACD signal flag — gold glow on cross events ── */
+    .macd-flag {
+      color: var(--gold); text-shadow: 0 0 8px rgba(255,215,64,0.6);
+      font-weight: 600; letter-spacing: 0.06em;
+    }
+    .macd-up { color: var(--green); }
+    .macd-down { color: var(--red); }
+    /* ── Trade outcomes — win/loss saturation bar ── */
+    .outcomes-bar {
+      display: flex; height: 8px; width: 100%;
+      background: var(--bg-elevated); border: 1px solid var(--border);
+      margin: 8px 0 4px; overflow: hidden;
+    }
+    .outcomes-wins { background: var(--green); box-shadow: inset 0 0 6px rgba(0,230,118,0.5); }
+    .outcomes-losses { background: var(--red); box-shadow: inset 0 0 6px rgba(255,23,68,0.5); }
+    /* ── Monkey rank stat card highlight ── */
+    .stat.monkey-rank {
+      border-left: 3px solid var(--gold);
+      padding-left: 10px;
+      background: linear-gradient(90deg, var(--gold-dim), transparent);
+    }
+    .stat.monkey-rank .v { color: var(--gold); text-shadow: 0 0 12px rgba(255,215,64,0.4); }
+    .compute-mini-btn {
+      background: transparent; border: 1px solid var(--cyan);
+      color: var(--cyan); padding: 3px 10px;
+      font-family: var(--font-mono); font-size: 10px;
+      text-transform: uppercase; letter-spacing: 0.12em;
+      cursor: pointer; transition: background 0.15s;
+    }
+    .compute-mini-btn:hover { background: var(--cyan-dim); }
+    /* ── Leaderboard ranking accents ── */
+    tr.lb-rank-1 td { background: rgba(255,215,64,0.05); }
+    tr.lb-rank-1 td:first-child { border-left: 3px solid var(--gold); color: var(--gold); font-weight: 600; }
+    tr.lb-monkey td { color: var(--text-muted); font-style: italic; }
+    .lb-badge {
+      display: inline-block; padding: 1px 6px;
+      font-family: var(--font-mono); font-size: 9px;
+      letter-spacing: 0.14em; text-transform: uppercase;
+      border: 1px solid var(--text-muted); color: var(--text-muted);
+      margin-left: 6px;
+    }
+    .lb-badge.baseline { border-color: var(--gold); color: var(--gold); }
     tr.bt-row { cursor: pointer; }
     tr.bt-row:hover td { background: var(--bg-hover); }
-    tr.bt-row.best td { background: var(--green-dim); }
-    tr.bt-row.beat td:first-child { border-left: 2px solid var(--green); }
-    tr.bt-row.miss td:first-child { border-left: 2px solid var(--red); }
+    tr.bt-row.best td { background: var(--gold-dim); }
+    tr.bt-row.best td:first-child { border-left: 3px solid var(--gold); }
+    tr.bt-row.beat td:first-child { border-left: 3px solid var(--green); }
+    tr.bt-row.miss td:first-child { border-left: 3px solid var(--red); }
     #bt-trades { margin-top: 14px; display: none; }
     #bt-trades.show { display: block; }
     .bt-headline {
@@ -943,33 +1069,38 @@ TEMPLATE = r"""
       min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .bt-legend-row .ret { font-size: 11px; font-variant-numeric: tabular-nums; font-family: var(--font-mono); }
     .bt-btn {
-      background: var(--bg-elevated); color: var(--text);
-      border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
-      padding: 3px 8px; font-size: 11px; cursor: pointer;
-      text-transform: uppercase; letter-spacing: 0.5px;
-      font-family: var(--font-sans);
+      background: transparent; color: var(--cyan);
+      border: 1px solid var(--cyan); border-radius: 0;
+      padding: 3px 9px; font-size: 10px; cursor: pointer;
+      text-transform: uppercase; letter-spacing: 0.14em;
+      font-family: var(--font-mono);
     }
-    .bt-btn:hover { background: var(--bg-hover); }
+    .bt-btn:hover { background: var(--cyan-dim); }
     .bt-filter-chip {
-      background: var(--bg-elevated); color: var(--text-secondary);
-      border: 1px solid var(--border); border-radius: 99px;
-      padding: 3px 10px; font-size: 11px; cursor: pointer;
-      font-family: var(--font-sans); transition: all 0.15s;
+      background: transparent; color: var(--text-secondary);
+      border: 1px solid var(--border-strong); border-radius: 0;
+      padding: 4px 11px; font-size: 10px; cursor: pointer;
+      font-family: var(--font-mono); letter-spacing: 0.12em;
+      text-transform: uppercase;
+      transition: all 0.12s;
     }
-    .bt-filter-chip:hover { border-color: var(--cyan); color: var(--text); }
+    .bt-filter-chip:hover { border-color: var(--cyan); color: var(--cyan); }
     .bt-filter-chip.active {
-      background: rgba(10,205,255,0.12); border-color: var(--cyan);
-      color: var(--cyan); font-weight: 600;
+      background: var(--cyan-dim); border-color: var(--cyan);
+      color: var(--cyan); font-weight: 500;
+      box-shadow: inset 0 0 8px rgba(0,212,232,0.1);
     }
     .bt-tabs {
-      display: flex; gap: 2px; margin-bottom: 12px;
+      display: flex; gap: 0; margin-bottom: 12px;
       border-bottom: 1px solid var(--border);
     }
     .bt-tabs a {
-      padding: 8px 14px; color: var(--text-secondary); cursor: pointer; font-size: 13px;
+      padding: 9px 16px; color: var(--text-secondary); cursor: pointer;
+      font-family: var(--font-mono); font-size: 11px;
       border-bottom: 2px solid transparent; font-weight: 500;
+      text-transform: uppercase; letter-spacing: 0.14em;
     }
-    .bt-tabs a.active { color: var(--amber); border-bottom-color: var(--amber); }
+    .bt-tabs a.active { color: var(--cyan); border-bottom-color: var(--cyan); }
     .bt-subpane { display: none; }
     .bt-subpane.active { display: block; }
     .bt-section { display: none; }
@@ -977,9 +1108,14 @@ TEMPLATE = r"""
     tr.bt-row.selected td { background: var(--bg-elevated) !important; }
     .pill.status-running { animation: pulse 1.5s ease-in-out infinite; }
     @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.55;} }
+    @keyframes pulse-glow {
+      0%,100% { box-shadow: 0 0 0 0 rgba(0,230,118,0.7), 0 0 8px rgba(0,230,118,0.6); }
+      50%     { box-shadow: 0 0 0 6px rgba(0,230,118,0), 0 0 12px rgba(0,230,118,0.9); }
+    }
     .live-dot {
       display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-      background: var(--green); margin-right: 6px; animation: pulse 1.5s infinite;
+      background: var(--green); margin-right: 6px;
+      animation: pulse-glow 1.6s infinite;
     }
     th.sortable-h { cursor: pointer; user-select: none; }
     th.sortable-h:hover { color: var(--text); }
@@ -987,21 +1123,24 @@ TEMPLATE = r"""
     th.sortable-h.sort-desc::after { content: " ▼"; font-size: 11px; }
     select, input[type="text"], input[type="number"] {
       background: var(--bg-input); color: var(--text);
-      border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
-      padding: 6px 10px; font-size: 13px; font-family: var(--font-sans);
+      border: 1px solid var(--border-strong); border-radius: 0;
+      padding: 6px 10px; font-size: 12px;
+      font-family: var(--font-mono); letter-spacing: 0.04em;
     }
+    select:focus, input:focus { outline: none; border-color: var(--cyan); }
     button, .btn {
-      background: var(--bg-elevated); color: var(--text);
-      border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
-      padding: 6px 14px; font-size: 13px; font-family: var(--font-sans);
-      cursor: pointer; transition: background 0.15s;
+      background: transparent; color: var(--cyan);
+      border: 1px solid var(--cyan); border-radius: 0;
+      padding: 6px 14px; font-size: 11px;
+      font-family: var(--font-mono); font-weight: 500;
+      text-transform: uppercase; letter-spacing: 0.14em;
+      cursor: pointer; transition: background 0.15s, color 0.15s;
     }
-    button:hover, .btn:hover { background: var(--bg-hover); }
+    button:hover, .btn:hover { background: var(--cyan-dim); color: var(--cyan); }
     button.primary, .btn-primary {
-      background: var(--amber-dim);
-      border-color: rgba(240,180,41,0.3);
-      color: var(--amber);
+      background: var(--cyan); color: #000;
     }
+    button.primary:hover, .btn-primary:hover { background: var(--cyan); opacity: 0.85; }
     /* === Mobile-first responsive additions ============================== */
     .nav-hamburger {
       display: none; flex-direction: column; justify-content: space-between;
@@ -1014,21 +1153,25 @@ TEMPLATE = r"""
     }
     .nav-drawer {
       position: fixed; top: 0; left: -280px; width: 280px; height: 100vh;
-      background: var(--bg-panel); border-right: 1px solid #1e2028;
+      background: var(--bg-panel); border-right: 1px solid var(--border-bright);
       z-index: 1000; transition: left 0.25s ease; overflow-y: auto; padding: 20px 0;
     }
     .nav-drawer.open { left: 0; }
     .nav-drawer-header {
-      font-family: var(--font-display); font-weight: 700; color: var(--amber);
-      font-size: 13px; letter-spacing: 0.1em; padding: 0 20px 20px;
-      border-bottom: 1px solid #1e2028; margin-bottom: 8px;
+      font-family: var(--font-display); font-weight: 400; color: var(--cyan);
+      font-size: 18px; letter-spacing: 0.22em; padding: 0 20px 20px;
+      border-bottom: 1px solid var(--border-bright); margin-bottom: 8px;
+      text-shadow: 0 0 12px rgba(0,212,232,0.35);
     }
     .nav-drawer a {
       display: block; padding: 12px 20px; color: var(--text-secondary);
-      text-decoration: none; font-size: 14px; transition: all 0.15s;
+      text-decoration: none; font-size: 12px;
+      font-family: var(--font-mono); letter-spacing: 0.12em;
+      text-transform: uppercase; transition: all 0.15s;
     }
     .nav-drawer a:hover, .nav-drawer a.active {
-      color: var(--text); background: var(--bg-elevated);
+      color: var(--cyan); background: var(--cyan-dim);
+      border-left: 3px solid var(--cyan); padding-left: 17px;
     }
     .nav-overlay {
       display: none; position: fixed; inset: 0;
@@ -1175,6 +1318,11 @@ TEMPLATE = r"""
         <div class="stat"><div class="l">vs SPY (same period)</div><div class="v" id="vs-spy-live">—</div></div>
         <div class="stat"><div class="l">max drawdown</div><div class="v" id="live-maxdd">—</div></div>
         <div class="stat"><div class="l">cash deployed</div><div class="v" id="live-deployed">—</div></div>
+        <div class="stat monkey-rank" id="monkey-stat">
+          <div class="l">🐒 monkey rank</div>
+          <div class="v" id="monkey-pct">—</div>
+          <div class="muted" id="monkey-sub" style="font-size:10px;font-family:var(--font-mono);letter-spacing:0.06em;margin-top:1px;">active rnd</div>
+        </div>
       </div>
       <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">
         <span style="color:#0acdff;">●</span> Portfolio (% from start) &nbsp;
@@ -1998,6 +2146,7 @@ TEMPLATE = r"""
           <thead><tr>
             <th>ticker</th><th>type</th><th class="num">qty</th>
             <th class="num">avg</th><th class="num">now</th>
+            <th class="num">SL</th><th class="num">TP</th>
             <th class="num">total $</th><th class="num">% port</th>
             <th class="num">P/L</th><th class="num">P/L %</th>
             <th class="num">held</th>
@@ -2018,6 +2167,61 @@ TEMPLATE = r"""
       </div>
     </div>
 
+    <!-- ─── MACD signal scanner ─── -->
+    <div class="card" id="macd-card" style="margin-top:18px;">
+      <h2 style="display:flex;justify-content:space-between;align-items:center;">
+        <span>MACD Signals
+          <span class="muted" style="font-size:10px;text-transform:none;letter-spacing:normal;font-weight:normal;border-left:none;padding-left:6px;">— per-ticker momentum scan · ⚡ = high-conviction cross-up below zero</span>
+        </span>
+        <button class="bt-btn" id="macd-toggle" onclick="toggleMacdPanel()">▼</button>
+      </h2>
+      <div id="macd-body">
+        <div class="table-scroll">
+          <table id="macd-tbl">
+            <thead><tr>
+              <th>ticker</th>
+              <th class="num">price</th>
+              <th class="num">RSI</th>
+              <th class="num">MACD hist</th>
+              <th>EMA200</th>
+              <th>signal</th>
+              <th class="muted">headline</th>
+            </tr></thead>
+            <tbody><tr><td colspan="7" class="muted">loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── Trade outcomes analytics ─── -->
+    <div class="card" id="outcomes-card" style="margin-top:18px;">
+      <h2 style="display:flex;justify-content:space-between;align-items:center;">
+        <span>Trade outcomes
+          <span class="muted" style="font-size:10px;text-transform:none;letter-spacing:normal;font-weight:normal;border-left:none;padding-left:6px;">— closed round-trip statistics · win rate · expectancy · hard-exit attribution</span>
+        </span>
+        <span id="outcomes-headline" class="muted" style="font-size:11px;font-family:var(--font-mono);text-transform:none;letter-spacing:0.04em;">—</span>
+      </h2>
+      <div id="outcomes-body">
+        <div class="stat-row" id="outcomes-stats">
+          <div class="stat"><div class="l">round trips</div><div class="v" id="oc-n">—</div></div>
+          <div class="stat"><div class="l">win rate</div><div class="v" id="oc-winrate">—</div></div>
+          <div class="stat"><div class="l">expectancy</div><div class="v" id="oc-expect">—</div></div>
+          <div class="stat"><div class="l">profit factor</div><div class="v" id="oc-pf">—</div></div>
+        </div>
+        <div class="outcomes-bar" id="oc-bar" title="wins (green) vs losses (red)">
+          <div class="outcomes-wins" style="width:0%"></div>
+          <div class="outcomes-losses" style="width:0%"></div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:24px;margin-top:10px;font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);letter-spacing:0.04em;">
+          <span>avg win: <span class="pos" id="oc-avgwin">—</span></span>
+          <span>avg loss: <span class="neg" id="oc-avgloss">—</span></span>
+          <span>last 20: <span id="oc-last20">—</span></span>
+          <span>hard SL exits: <span class="neg" id="oc-slx">—</span></span>
+          <span>hard TP exits: <span class="pos" id="oc-tpx">—</span></span>
+        </div>
+      </div>
+    </div>
+
     <div class="card" style="margin-top:18px;">
       <h2>Decision log</h2>
       <div class="table-scroll">
@@ -2033,6 +2237,32 @@ TEMPLATE = r"""
 
   <!-- ────── Backtests pane ────── -->
   <div id="tab-backtests" class="tab-pane">
+
+    <!-- ─── Model leaderboard (prominent, top of pane) ─── -->
+    <div class="card" id="lb-card" style="margin-bottom:18px;">
+      <h2 style="display:flex;justify-content:space-between;align-items:center;">
+        <span>Model leaderboard
+          <span class="muted" style="font-size:10px;text-transform:none;letter-spacing:normal;font-weight:normal;border-left:none;padding-left:6px;">— ranked by avg total return % · 🐒 random baseline anchored at the bottom</span>
+        </span>
+        <span class="muted" id="lb-meta" style="font-size:11px;font-family:var(--font-mono);text-transform:none;letter-spacing:0.04em;">—</span>
+      </h2>
+      <div class="table-scroll">
+        <table id="lb-tbl">
+          <thead><tr>
+            <th style="width:42px;">#</th>
+            <th>model</th>
+            <th class="num">n runs</th>
+            <th class="num">avg %</th>
+            <th class="num">best %</th>
+            <th class="num">worst %</th>
+            <th class="num">vs SPY</th>
+            <th class="num">beats 🐒</th>
+          </tr></thead>
+          <tbody><tr><td colspan="8" class="muted">loading leaderboard…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
     <div class="bt-tabs" style="margin-bottom:14px;">
       <a id="bt-section-runs-link" class="active" onclick="showBtSection('runs')">Backtest Runs</a>
       <a id="bt-section-model-rankings-link" onclick="showBtSection('model-rankings')">🏆 Model Rankings</a>
@@ -2771,16 +3001,42 @@ async function refresh() {
       else if (hs < 86400) heldTxt = Math.floor(hs / 3600) + "h";
       else heldTxt = Math.floor(hs / 86400) + "d";
     }
+    // ── SL / TP distance bars ──
+    // Stored on the position when Opus opens it with stop_loss / take_profit.
+    // Distance bar fills as price approaches the level (closer = wider bar).
+    let slCell = `<span class="muted" style="font-size:10px;opacity:0.4;">—</span>`;
+    let tpCell = `<span class="muted" style="font-size:10px;opacity:0.4;">—</span>`;
+    try {
+      const cp = +p.current_price || 0;
+      const sl = +p.stop_loss_price || 0;
+      const tp = +p.take_profit_price || 0;
+      if (sl > 0 && cp > 0) {
+        const slDist = (cp - sl) / sl * 100;
+        // Fill bar inversely to safety margin — closer to SL = fuller bar.
+        // Cap visual at 10% distance from SL so danger reads at-a-glance.
+        const slFill = Math.max(0, Math.min(100, (1 - Math.min(slDist, 10) / 10) * 100));
+        slCell = `<div class="sl-label">${fmt(sl,2)}<br><span style="opacity:0.7">${(slDist>=0?'-':'+')}${Math.abs(slDist).toFixed(1)}%</span></div>
+                  <div class="sl-bar-wrap"><div class="sl-bar" style="width:${slFill.toFixed(0)}%;"></div></div>`;
+      }
+      if (tp > 0 && cp > 0) {
+        const tpDist = (tp - cp) / cp * 100;
+        const tpFill = Math.max(0, Math.min(100, (1 - Math.min(Math.abs(tpDist), 10) / 10) * 100));
+        tpCell = `<div class="tp-label">${fmt(tp,2)}<br><span style="opacity:0.7">+${tpDist.toFixed(1)}%</span></div>
+                  <div class="tp-bar-wrap"><div class="tp-bar" style="width:${tpFill.toFixed(0)}%;"></div></div>`;
+      }
+    } catch (e) { /* degrade silently if endpoint lacks fields */ }
     return `<tr><td>${p.ticker}</td><td>${label}</td>
       <td class="num">${fmt(p.qty,4)}</td>
       <td class="num">${fmt(p.avg_cost)}</td>
       <td class="num">${fmt(p.current_price)}</td>
+      <td class="num">${slCell}</td>
+      <td class="num">${tpCell}</td>
       <td class="num">${dollar(totalVal)}</td>
       <td class="num">${fmt(pctPort,1)}%</td>
       <td class="num ${cls}">${fmt(p.unrealized_pl)}</td>
       <td class="num ${plPctCls}">${plPctTxt}</td>
       <td class="num">${heldTxt}</td></tr>`;
-  }).join("") || `<tr><td colspan="10" class="muted">no positions</td></tr>`;
+  }).join("") || `<tr><td colspan="12" class="muted">no positions</td></tr>`;
 
   const trBody = document.querySelector("#trades-tbl tbody");
   trBody.innerHTML = r.trades.map(t => {
@@ -6177,9 +6433,239 @@ async function refreshScorecard() {
     rows.length ? rows.join("") : "<tr><td colspan='3' class='muted' style='padding:6px;'>—</td></tr>";
 }
 
+// ───────── Top-of-backtests Model Leaderboard ─────────
+async function refreshLeaderboard() {
+  const tbody = document.querySelector("#lb-tbl tbody");
+  if (!tbody) return;
+  try {
+    const data = await fetch(API_PREFIX + "/api/model-rankings").then(r => r.json());
+    const models = (data && data.models) || [];
+    if (!models.length) {
+      tbody.innerHTML = `<tr><td colspan="8" class="muted">no completed runs yet</td></tr>`;
+      return;
+    }
+    // Pull out monkey baselines to compute "beats 🐒" per AI model.
+    // model_id "monkey_random" + "monkey_active" are the two baselines.
+    const monkey = models.filter(m => /monkey/i.test(m.model_id));
+    const ai = models.filter(m => !/monkey/i.test(m.model_id));
+    const monkeyAvg = monkey.length
+      ? monkey.reduce((a,m) => a + (m.avg_return_pct||0), 0) / monkey.length
+      : null;
+
+    // Sort AI by avg_return_pct desc; append monkeys at the bottom (italic baseline).
+    ai.sort((a,b) => (b.avg_return_pct||0) - (a.avg_return_pct||0));
+    monkey.sort((a,b) => (b.avg_return_pct||0) - (a.avg_return_pct||0));
+    const ordered = [...ai, ...monkey];
+
+    const fmtPct = v => (v == null ? "—" : (v>0?"+":"") + Number(v).toFixed(2) + "%");
+    const clsFor = v => (v == null ? "muted" : (v>0?"pos":(v<0?"neg":"")));
+    tbody.innerHTML = ordered.map((m, i) => {
+      const isMonkey = /monkey/i.test(m.model_id);
+      const rowCls = [];
+      if (i === 0 && !isMonkey) rowCls.push("lb-rank-1");
+      if (isMonkey) rowCls.push("lb-monkey");
+      const rank = isMonkey ? "🐒" : (i + 1);
+      const display = (m.display_name || m.model_id || "—")
+        + (isMonkey ? ` <span class="lb-badge baseline">RANDOM BASELINE</span>` : "");
+      const beatsMonkey = (monkeyAvg != null && !isMonkey)
+        ? ((m.avg_return_pct||0) > monkeyAvg ? "✓" : "—") : "—";
+      const beatsCls = beatsMonkey === "✓" ? "pos" : "muted";
+      return `<tr class="${rowCls.join(' ')}">
+        <td>${rank}</td>
+        <td>${display}</td>
+        <td class="num">${m.runs || 0}</td>
+        <td class="num ${clsFor(m.avg_return_pct)}">${fmtPct(m.avg_return_pct)}</td>
+        <td class="num ${clsFor(m.best_return_pct)}">${fmtPct(m.best_return_pct)}</td>
+        <td class="num ${clsFor(m.median_return_pct)}">${fmtPct(m.median_return_pct)}</td>
+        <td class="num ${clsFor(m.avg_vs_spy_pct)}">${fmtPct(m.avg_vs_spy_pct)}</td>
+        <td class="num ${beatsCls}">${beatsMonkey}</td>
+      </tr>`;
+    }).join("");
+    const meta = document.getElementById("lb-meta");
+    if (meta) meta.textContent = `${ai.length} AI models · ${monkey.length} baselines`;
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="8" class="muted">failed to load leaderboard</td></tr>`;
+  }
+}
+
+// ───────── MACD signals panel ─────────
+// Reads /api/sector-pulse (already exists; returns ticker rsi/macd/mom).
+// MACD-strategy extras (macd_hist, ema200_above, hist_cross_up, macd_below_zero_cross)
+// degrade gracefully: rendered if the endpoint adds them, hidden otherwise.
+async function refreshMacd() {
+  try {
+    const r = await fetch(API_PREFIX + "/api/sector-pulse").then(r => r.json());
+    const tbody = document.querySelector("#macd-tbl tbody");
+    if (!tbody) return;
+    const rows = (r && r.tickers) || [];
+    if (!rows.length) {
+      tbody.innerHTML = `<tr><td colspan="7" class="muted">no tickers</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = rows.map(t => {
+      const rsi = t.rsi;
+      const rsiTxt = rsi == null ? "—" : Number(rsi).toFixed(1);
+      const rsiCls = rsi == null ? "muted"
+        : (rsi >= 70 ? "neg" : (rsi <= 30 ? "pos" : ""));
+      // macd_hist may not exist on this endpoint — fall back to macd_signal.
+      const macdHist = (t.macd_hist != null) ? t.macd_hist : t.macd;
+      const macdTxt = macdHist == null ? "—"
+        : (macdHist >= 0 ? "+" : "") + Number(macdHist).toFixed(3);
+      const macdCls = macdHist == null ? "muted"
+        : (macdHist > 0 ? "macd-up" : "macd-down");
+      // ema200_above is bool|null. If we don't have it, leave blank.
+      let ema200Cell = `<span class="muted">—</span>`;
+      if (t.ema200_above === true) ema200Cell = `<span class="macd-up">ABOVE ▲</span>`;
+      else if (t.ema200_above === false) ema200Cell = `<span class="macd-down">BELOW ▼</span>`;
+      // ⚡ flag when momentum is turning from oversold below the zero line.
+      let sigCell = "";
+      const cross = t.macd_below_zero_cross === true;
+      const upcross = t.hist_cross_up === true;
+      if (cross && t.ema200_above) {
+        sigCell = `<span class="macd-flag">⚡ CROSS_NEG · HIGH CONV</span>`;
+      } else if (cross) {
+        sigCell = `<span class="macd-flag">⚡ CROSS_NEG</span>`;
+      } else if (upcross) {
+        sigCell = `<span class="macd-up">HIST↑</span>`;
+      } else if (rsi != null && rsi >= 70) {
+        sigCell = `<span class="neg">OVERBOUGHT</span>`;
+      } else if (rsi != null && rsi <= 30) {
+        sigCell = `<span class="pos">OVERSOLD</span>`;
+      } else {
+        sigCell = `<span class="muted">—</span>`;
+      }
+      const px = t.price == null ? "—" : "$" + Number(t.price).toFixed(2);
+      const headline = (t.top_headline || "").replace(/[<>]/g,'').slice(0,72);
+      return `<tr>
+        <td><b>${t.ticker}</b></td>
+        <td class="num">${px}</td>
+        <td class="num ${rsiCls}">${rsiTxt}</td>
+        <td class="num ${macdCls}">${macdTxt}</td>
+        <td>${ema200Cell}</td>
+        <td>${sigCell}</td>
+        <td class="muted" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${headline}</td>
+      </tr>`;
+    }).join("");
+  } catch (e) { /* graceful degrade */ }
+}
+function toggleMacdPanel() {
+  const body = document.getElementById("macd-body");
+  const btn = document.getElementById("macd-toggle");
+  if (!body || !btn) return;
+  if (body.style.display === "none") {
+    body.style.display = ""; btn.textContent = "▼";
+  } else {
+    body.style.display = "none"; btn.textContent = "▶";
+  }
+}
+
+// ───────── Trade outcomes panel ─────────
+// Pulls /api/round-trips (already exists) and derives win rate / expectancy /
+// profit factor / hard-exit attribution from the closed round-trip stream.
+async function refreshOutcomes() {
+  try {
+    const r = await fetch(API_PREFIX + "/api/round-trips").then(r => r.json());
+    if (!r) return;
+    const rts = r.round_trips || r.trips || r.items || [];
+    if (!rts.length) {
+      document.getElementById("outcomes-headline").textContent = "no closed round trips yet";
+      return;
+    }
+    const wins = rts.filter(t => (t.pnl_usd ?? t.pnl ?? 0) > 0);
+    const losses = rts.filter(t => (t.pnl_usd ?? t.pnl ?? 0) < 0);
+    const n = rts.length;
+    const winRate = n ? wins.length / n * 100 : 0;
+    const sumWin = wins.reduce((a,t) => a + (t.pnl_usd ?? t.pnl ?? 0), 0);
+    const sumLossAbs = Math.abs(losses.reduce((a,t) => a + (t.pnl_usd ?? t.pnl ?? 0), 0));
+    const avgWinPct = wins.length
+      ? wins.reduce((a,t) => a + (t.pnl_pct ?? 0), 0) / wins.length : 0;
+    const avgLossPct = losses.length
+      ? losses.reduce((a,t) => a + (t.pnl_pct ?? 0), 0) / losses.length : 0;
+    // Expectancy in % units: p_win * avg_win% - p_loss * |avg_loss%|
+    const expectancyPct = (winRate/100) * avgWinPct
+                        + (1 - winRate/100) * avgLossPct;
+    const pf = sumLossAbs > 0 ? sumWin / sumLossAbs : (sumWin > 0 ? Infinity : 0);
+    // Hard SL/TP exits — count rows whose exit reason mentions them.
+    const slX = rts.filter(t => /stop|SL|stop_loss/i.test(t.exit_reason || t.reason || "")).length;
+    const tpX = rts.filter(t => /take_profit|TP|target/i.test(t.exit_reason || t.reason || "")).length;
+    // Last-20 win rate gives a rolling read separate from all-time.
+    const last20 = rts.slice(0, 20);
+    const last20WR = last20.length
+      ? last20.filter(t => (t.pnl_usd ?? t.pnl ?? 0) > 0).length / last20.length * 100
+      : 0;
+
+    document.getElementById("oc-n").textContent = String(n);
+    const wr = document.getElementById("oc-winrate");
+    wr.textContent = winRate.toFixed(1) + "%";
+    wr.className = "v " + (winRate >= 50 ? "pos" : (winRate >= 40 ? "" : "neg"));
+    const exp = document.getElementById("oc-expect");
+    exp.textContent = (expectancyPct >= 0 ? "+" : "") + expectancyPct.toFixed(2) + "%";
+    exp.className = "v " + (expectancyPct >= 0 ? "pos" : "neg");
+    const pfEl = document.getElementById("oc-pf");
+    pfEl.textContent = isFinite(pf) ? pf.toFixed(2) : "∞";
+    pfEl.className = "v " + (pf >= 1.5 ? "pos" : (pf >= 1.0 ? "" : "neg"));
+    document.getElementById("oc-avgwin").textContent = "+" + avgWinPct.toFixed(2) + "%";
+    document.getElementById("oc-avgloss").textContent = avgLossPct.toFixed(2) + "%";
+    document.getElementById("oc-last20").textContent = last20.length
+      ? last20WR.toFixed(0) + "% (" + last20.length + ")" : "—";
+    document.getElementById("oc-slx").textContent = String(slX);
+    document.getElementById("oc-tpx").textContent = String(tpX);
+    // Saturation bar — wins (green) | losses (red)
+    const bar = document.getElementById("oc-bar");
+    if (bar) {
+      bar.innerHTML = `<div class="outcomes-wins" style="width:${winRate.toFixed(1)}%"></div>
+                       <div class="outcomes-losses" style="width:${(100-winRate).toFixed(1)}%"></div>`;
+    }
+    document.getElementById("outcomes-headline").textContent =
+      `${n} closed · ${wins.length}W / ${losses.length}L · last 20: ${last20WR.toFixed(0)}%`;
+  } catch (e) { /* graceful degrade — leave dashes */ }
+}
+
+// ───────── Monkey-rank stat (header card) ─────────
+async function refreshMonkeyRank() {
+  try {
+    const r = await fetch(API_PREFIX + "/api/monkey-benchmark").then(r => r.json());
+    const v = document.getElementById("monkey-pct");
+    const sub = document.getElementById("monkey-sub");
+    if (!v) return;
+    if (!r || r.status === "not_computed") {
+      v.textContent = "—";
+      sub.innerHTML = `<button class="compute-mini-btn" onclick="triggerMonkeyCompute(event)">Compute</button>`;
+      return;
+    }
+    const rankings = r.ai_rankings || [];
+    if (!rankings.length) {
+      v.textContent = "—";
+      sub.textContent = "no AI runs in window";
+      return;
+    }
+    // Headline: best run's "beats X% of active monkeys" — the meaningful one.
+    const beatsList = rankings
+      .map(x => x?.vs_active_random?.beats_pct_of_monkeys)
+      .filter(x => x != null);
+    if (!beatsList.length) { v.textContent = "—"; sub.textContent = "—"; return; }
+    const best = Math.max(...beatsList);
+    v.textContent = best.toFixed(1) + "%";
+    sub.textContent = `beats vs ${r.n_monkeys ? r.n_monkeys.toLocaleString() : "—"} monkeys`;
+  } catch (e) { /* graceful degrade */ }
+}
+async function triggerMonkeyCompute(ev) {
+  ev && ev.stopPropagation();
+  const sub = document.getElementById("monkey-sub");
+  try {
+    await fetch(API_PREFIX + "/api/monkey-benchmark/run", { method: "POST" });
+    sub.textContent = "computing…";
+    setTimeout(refreshMonkeyRank, 65000);
+  } catch (e) { sub.textContent = "compute failed"; }
+}
+
 // ───────── boot ─────────
 refresh();
 refreshSignals();
+refreshMacd();
+refreshOutcomes();
+refreshMonkeyRank();
+refreshLeaderboard();
 refreshAnalytics();
 refreshSectorPulse();
 refreshBriefing();
@@ -6266,6 +6752,10 @@ setInterval(refreshSourceEdge, 300_000);
 setInterval(refreshScorecard, 60_000);
 setInterval(refreshSessionDelta, 60_000);
 setInterval(refreshGlobalStale, 60_000);
+setInterval(refreshMacd, 60_000);
+setInterval(refreshOutcomes, 120_000);
+setInterval(refreshMonkeyRank, 300_000);
+setInterval(refreshLeaderboard, 180_000);
 showTab(INITIAL_TAB || "trader");
 </script>
 </div><!-- /.page-content -->
@@ -19273,39 +19763,173 @@ def api_monkey_benchmark_run():
 
 _MONKEY_TEMPLATE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"/>
-<title>🐒 Monkey Baseline · Paper Trader</title>
+<title>MONKEY BENCHMARK · PAPER TRADER</title>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=JetBrains+Mono:wght@400;500;600&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
- :root{color-scheme:dark}
+ :root{
+   color-scheme:dark;
+   --bg:#000; --bg-panel:#080808; --bg-elevated:#0f0f0f;
+   --border:#1e1e1e; --border-bright:#2a2a2a;
+   --cyan:#00d4e8; --cyan-dim:rgba(0,212,232,0.08); --cyan-glow:rgba(0,212,232,0.15);
+   --green:#00e676; --red:#ff1744; --gold:#ffd740;
+   --text:#c8cdd4; --text-muted:#3d4450; --text-secondary:#6b7280;
+   --font-mono:'JetBrains Mono','Fira Code',monospace;
+   --font-display:'Bebas Neue','Impact',sans-serif;
+   --font-body:'DM Sans',system-ui,sans-serif;
+ }
  *{box-sizing:border-box;margin:0;padding:0}
- body{background:#0c0d0f;color:#e8eaed;font:14px/1.5 "Outfit",system-ui,sans-serif;padding:20px;max-width:1100px;margin:0 auto}
- h1{font:700 28px/1.1 "Syne",sans-serif;letter-spacing:-.5px;margin-bottom:6px}
- h2{font:600 13px/1 "Syne",sans-serif;text-transform:uppercase;letter-spacing:1.5px;color:#7d828c;margin:26px 0 10px}
- a{color:#00d4ff;text-decoration:none}a:hover{text-decoration:underline}
- .sub{color:#7d828c;font-size:13px;margin-bottom:18px}
- .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
- button{background:#00d4ff;color:#04222b;border:0;padding:8px 16px;border-radius:7px;font:600 13px "Outfit";cursor:pointer}
- button:disabled{background:#33414a;color:#7d828c;cursor:wait}
- .card{background:#111316;border:1px solid rgba(255,255,255,.07);border-radius:12px;padding:18px 22px;margin-bottom:14px}
- .pos{color:#00ff9f}.neg{color:#ff3c4c}.muted{color:#7d828c}
- table{width:100%;border-collapse:collapse;font:13px "DM Mono",monospace;margin-top:8px}
- th{text-align:left;color:#7d828c;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.1)}
- td{padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.05)}
- .num{text-align:right}
- .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;background:#17191d}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-top:12px}
- .kpi{background:#0e1012;border:1px solid rgba(255,255,255,.06);border-radius:9px;padding:12px}
- .kpi .v{font:600 22px "DM Mono",monospace}.kpi .l{font-size:11px;color:#7d828c;text-transform:uppercase;letter-spacing:1px}
- .err{color:#ff3c4c;padding:20px;text-align:center}
- .hint{color:#7d828c;font-size:12px;margin-top:8px}
+ body{
+   background:var(--bg);color:var(--text);
+   font:14px/1.5 var(--font-body);min-height:100vh;
+   padding:0;margin:0;letter-spacing:0.005em;
+ }
+ body::before{
+   content:'';position:fixed;inset:0;
+   background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.05) 2px,rgba(0,0,0,0.05) 4px);
+   pointer-events:none;z-index:9999;
+ }
+ .wrap{max-width:1200px;margin:0 auto;padding:32px 24px 80px;position:relative;z-index:1}
+ .topnav{
+   display:flex;align-items:center;gap:18px;
+   border-bottom:1px solid var(--border-bright);
+   padding:0 24px;height:44px;background:var(--bg-panel);
+   font-family:var(--font-mono);font-size:11px;letter-spacing:0.14em;
+   text-transform:uppercase;
+ }
+ .topnav .brand{
+   color:var(--cyan);font-family:var(--font-display);font-size:18px;letter-spacing:0.22em;
+   text-shadow:0 0 12px var(--cyan-glow);
+ }
+ .topnav a{color:var(--text-secondary);text-decoration:none;
+   padding:6px 14px;border-bottom:2px solid transparent;transition:all 0.12s;}
+ .topnav a:hover{color:var(--cyan);}
+ .breadcrumb{
+   font-family:var(--font-mono);font-size:10px;letter-spacing:0.18em;
+   color:var(--text-muted);text-transform:uppercase;margin-bottom:18px;
+ }
+ .breadcrumb a{color:var(--cyan);text-decoration:none}
+ .breadcrumb a:hover{text-decoration:underline}
+
+ /* ── HERO ── */
+ .hero{
+   text-align:center;
+   padding:38px 0 26px;
+   border:1px solid var(--border);
+   margin-bottom:24px;
+   background:linear-gradient(180deg,rgba(0,212,232,0.04) 0%,transparent 60%);
+   position:relative;
+ }
+ .hero::before{
+   content:'';position:absolute;left:0;top:0;width:100%;height:1px;
+   background:linear-gradient(90deg,transparent,var(--cyan),transparent);
+   opacity:0.6;
+ }
+ .hero-label{
+   font-family:var(--font-mono);font-size:11px;color:var(--text-muted);
+   text-transform:uppercase;letter-spacing:0.32em;margin-bottom:6px;
+ }
+ .hero-number{
+   font-family:var(--font-display);font-size:128px;line-height:0.9;
+   color:var(--cyan);letter-spacing:0.04em;font-weight:400;
+   text-shadow:0 0 32px var(--cyan-glow);
+   margin:8px 0;
+ }
+ .hero-number.muted-num{color:var(--text-muted);text-shadow:none}
+ .hero-tag{
+   font-family:var(--font-mono);font-size:13px;color:var(--text);
+   letter-spacing:0.08em;margin-top:4px;
+ }
+ .hero-sub{
+   color:var(--text-muted);font-size:12px;font-family:var(--font-mono);
+   letter-spacing:0.06em;margin-top:6px;
+ }
+ .hero-meta{
+   display:flex;justify-content:center;gap:24px;flex-wrap:wrap;
+   margin-top:22px;font-family:var(--font-mono);font-size:10px;
+   color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.14em;
+ }
+ .hero-meta span b{color:var(--text);font-weight:500}
+
+ /* ── PANELS ── */
+ .panel{
+   background:var(--bg-panel);border:1px solid var(--border);
+   padding:16px 18px;margin-bottom:20px;border-radius:0;
+ }
+ .panel h2{
+   font-family:var(--font-mono);font-size:11px;font-weight:600;
+   text-transform:uppercase;letter-spacing:0.16em;color:var(--text-muted);
+   border-left:3px solid var(--cyan);padding-left:10px;
+   margin-bottom:14px;line-height:1.1;
+ }
+ .row2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+ @media (max-width:880px){.row2{grid-template-columns:1fr}.hero-number{font-size:84px}}
+
+ /* ── TABLES ── */
+ table{
+   width:100%;border-collapse:collapse;font-family:var(--font-mono);
+   font-size:11px;font-variant-numeric:tabular-nums;
+ }
+ th{
+   text-align:left;color:var(--text-muted);font-weight:600;font-size:10px;
+   text-transform:uppercase;letter-spacing:0.14em;padding:6px 10px 8px;
+   border-bottom:1px solid var(--border-bright);
+ }
+ td{padding:6px 10px;border-bottom:1px solid var(--border)}
+ td.label{color:var(--text);font-weight:500}
+ td.num{text-align:right}
+ .pos{color:var(--green)}.neg{color:var(--red)}.muted{color:var(--text-secondary)}
+ .gold{color:var(--gold)}
+ .pill{
+   display:inline-block;padding:2px 8px;
+   font-family:var(--font-mono);font-size:10px;font-weight:500;
+   text-transform:uppercase;letter-spacing:0.12em;
+   background:var(--cyan-dim);color:var(--cyan);
+   border:1px solid var(--cyan);
+ }
+ .pill.muted-pill{background:var(--bg-elevated);color:var(--text-secondary);border-color:var(--border-strong);}
+
+ /* ── DISTRIBUTION VIZ ── */
+ .dist{
+   font-family:var(--font-mono);font-size:11px;line-height:1.8;
+   color:var(--text);background:var(--bg-elevated);
+   padding:14px 16px;border:1px solid var(--border);
+   white-space:pre;overflow-x:auto;
+ }
+ .dist .lbl{color:var(--text-muted);margin-right:8px}
+ .dist .bar{color:var(--cyan)}
+ .dist .empty{color:#181818}
+ .dist .here{color:var(--gold);font-weight:600;letter-spacing:0.04em}
+
+ /* ── BUTTONS ── */
+ .actions{
+   display:flex;gap:12px;flex-wrap:wrap;align-items:center;
+   margin-top:24px;padding-top:22px;border-top:1px solid var(--border);
+ }
+ button{
+   background:transparent;color:var(--cyan);
+   border:1px solid var(--cyan);padding:9px 22px;border-radius:0;
+   font-family:var(--font-mono);font-size:11px;font-weight:500;
+   text-transform:uppercase;letter-spacing:0.16em;
+   cursor:pointer;transition:all 0.15s;
+ }
+ button:hover{background:var(--cyan-dim);box-shadow:0 0 12px var(--cyan-glow)}
+ button:disabled{border-color:var(--text-muted);color:var(--text-muted);cursor:wait}
+ .err{color:var(--red);padding:24px;text-align:center;border:1px solid var(--red);font-family:var(--font-mono);font-size:12px}
+ .hint{color:var(--text-secondary);font-size:10px;font-family:var(--font-mono);letter-spacing:0.06em;margin-top:12px;line-height:1.6}
+ .loading{color:var(--text-muted);font-family:var(--font-mono);font-size:11px;letter-spacing:0.14em;text-transform:uppercase;padding:60px 0;text-align:center}
 </style></head><body>
-<div class="bar">
- <h1>🐒 10,000 Monkey Random Baseline</h1>
- <span style="flex:1"></span>
- <a href="{{ api_prefix }}/backtests">← Backtests</a>
+<div class="topnav">
+  <span class="brand">◈ TRADING STACK</span>
+  <a href="{{ api_prefix }}/">Paper Trader</a>
+  <a href="{{ api_prefix }}/backtests">Backtests</a>
+  <span style="flex:1"></span>
+  <span style="color:var(--text-muted)">monkey baseline</span>
 </div>
-<div class="sub">Compare AI backtest returns against 10,000 randomly-trading monkeys on the same window. AI beats &gt;90% → real edge; ~50% → market beta.</div>
-<div id="root"><div class="muted">loading…</div></div>
+<div class="wrap">
+  <div class="breadcrumb"><a href="{{ api_prefix }}/backtests">← Backtests</a> &nbsp;/&nbsp; Monkey Benchmark</div>
+  <div id="root"><div class="loading">— loading benchmark —</div></div>
+</div>
 <script>
 const API_PREFIX={{ api_prefix|tojson }};
 const fmt=n=>(n==null?'—':(n>0?'+':'')+n.toFixed(1)+'%');
@@ -19313,97 +19937,162 @@ const cls=n=>n==null?'muted':(n>0?'pos':(n<0?'neg':''));
 const esc=s=>(s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 async function trigger(){
- const btn=document.getElementById('runBtn');
- if(!btn) return;
- btn.disabled=true; btn.textContent='computing…';
- try{
-  const r=await fetch(API_PREFIX+'/api/monkey-benchmark/run',{method:'POST'});
-  const j=await r.json();
-  btn.textContent='triggered — refresh in ~60s';
-  setTimeout(()=>location.reload(),65000);
- }catch(e){
-  btn.disabled=false; btn.textContent='retry';
-  alert('Failed to trigger: '+e);
- }
+  const btn=document.getElementById('runBtn');
+  if(!btn) return;
+  btn.disabled=true; btn.textContent='computing…';
+  try{
+    await fetch(API_PREFIX+'/api/monkey-benchmark/run',{method:'POST'});
+    btn.textContent='triggered — refresh in ~60s';
+    setTimeout(()=>location.reload(),65000);
+  }catch(e){
+    btn.disabled=false; btn.textContent='retry';
+    alert('Failed to trigger: '+e);
+  }
 }
 
-function statsRow(label, s){
- if(!s||!s.n) return '';
- return `<tr><td><strong>${label}</strong></td>
-  <td class="num ${cls(s.median_pct)}">${fmt(s.median_pct)}</td>
-  <td class="num ${cls(s.mean_pct)}">${fmt(s.mean_pct)}</td>
-  <td class="num">${fmt(s.p10_pct)}</td>
-  <td class="num">${fmt(s.p25_pct)}</td>
-  <td class="num">${fmt(s.p75_pct)}</td>
-  <td class="num">${fmt(s.p90_pct)}</td>
-  <td class="num">${fmt(s.p95_pct)}</td>
-  <td class="num">${fmt(s.p99_pct)}</td>
-  <td class="num">${fmt(s.min_pct)}</td>
-  <td class="num">${fmt(s.max_pct)}</td>
- </tr>`;
+// Build an ASCII-art distribution row.
+// Width 28 chars. The fill represents the percentile's position vs min..max,
+// not the value's magnitude. The "here" marker shows where the AI median lands.
+function distBar(label, pct, span, aiMark){
+  if (pct == null || span == null) return '';
+  const min = span.min, max = span.max;
+  const w = 28;
+  if (max <= min) return '';
+  const pos = Math.max(0, Math.min(w, Math.round((pct - min)/(max - min) * w)));
+  const filled = '█'.repeat(pos);
+  const empty  = '░'.repeat(w - pos);
+  const here = (aiMark != null && Math.abs(pct - aiMark) < (max - min)/w)
+    ? ` <span class="here">← YOU ARE HERE (AI: ${fmt(aiMark)})</span>` : '';
+  return `<div><span class="lbl">${label.padEnd(5)}</span><span class="bar">${filled}</span><span class="empty">${empty}</span>  ${fmt(pct)}${here}</div>`;
+}
+
+function statsTableRows(s){
+  if (!s || !s.n) return '<tr><td colspan="2" class="muted">no data</td></tr>';
+  const rows = [
+    ['median',  s.median_pct],
+    ['mean',    s.mean_pct],
+    ['p10',     s.p10_pct],
+    ['p25',     s.p25_pct],
+    ['p75',     s.p75_pct],
+    ['p90',     s.p90_pct],
+    ['p95',     s.p95_pct],
+    ['p99',     s.p99_pct],
+    ['min',     s.min_pct],
+    ['max',     s.max_pct],
+    ['n',       s.n],
+  ];
+  return rows.map(([k,v]) => {
+    if (k === 'n') return `<tr><td class="label">${k}</td><td class="num">${(v||0).toLocaleString()}</td></tr>`;
+    return `<tr><td class="label">${k}</td><td class="num ${cls(v)}">${fmt(v)}</td></tr>`;
+  }).join('');
 }
 
 async function load(){
- const root=document.getElementById('root');
- let d;try{const r=await fetch(API_PREFIX+'/api/monkey-benchmark');d=await r.json();}
- catch(e){root.innerHTML='<div class="err">failed to load</div>';return;}
+  const root=document.getElementById('root');
+  let d;
+  try{const r=await fetch(API_PREFIX+'/api/monkey-benchmark');d=await r.json();}
+  catch(e){root.innerHTML='<div class="err">failed to load benchmark</div>';return;}
 
- if(d.status==='not_computed'){
-  root.innerHTML=`<div class="card">
-   <div class="muted">${esc(d.message||'No benchmark cached yet.')}</div>
-   <div style="margin-top:14px"><button id="runBtn" onclick="trigger()">Compute now</button></div>
-  </div>`;
-  return;
- }
+  if(d.status==='not_computed'){
+    root.innerHTML = `
+      <div class="hero">
+        <div class="hero-label">monkey benchmark</div>
+        <div class="hero-number muted-num">NOT&nbsp;COMPUTED</div>
+        <div class="hero-tag">Run the 10,000-monkey baseline to evaluate AI edge.</div>
+        <div class="hero-sub">${esc(d.message||'No benchmark cached yet.')}</div>
+        <div class="actions" style="justify-content:center;border-top:none;padding-top:14px;">
+          <button id="runBtn" onclick="trigger()">Compute now</button>
+        </div>
+      </div>`;
+    return;
+  }
 
- const rp=d.random_portfolio||{}, ar=d.active_random||{};
- const rankings=d.ai_rankings||[];
- const rpMed=rp.median_pct, arMed=ar.median_pct;
- const aiRets=rankings.map(x=>x.ai_return_pct);
- const beatsRp=aiRets.length?aiRets.filter(r=>r>rpMed).length/aiRets.length*100:null;
- const beatsAr=aiRets.length?aiRets.filter(r=>r>arMed).length/aiRets.length*100:null;
- const bestAi=aiRets.length?Math.max(...aiRets):null;
- const bestIdx=bestAi!=null?aiRets.indexOf(bestAi):-1;
- const bestRpRank=bestIdx>=0?rankings[bestIdx].vs_random_portfolio.beats_pct_of_monkeys:null;
- const bestArRank=bestIdx>=0?rankings[bestIdx].vs_active_random.beats_pct_of_monkeys:null;
+  const rp = d.random_portfolio || {};
+  const ar = d.active_random || {};
+  const rankings = d.ai_rankings || [];
+  const aiRets = rankings.map(x => x.ai_return_pct);
+  const bestAi = aiRets.length ? Math.max(...aiRets) : null;
+  const bestIdx = bestAi != null ? aiRets.indexOf(bestAi) : -1;
+  const bestRpRank = bestIdx >= 0 ? rankings[bestIdx].vs_random_portfolio?.beats_pct_of_monkeys : null;
+  const bestArRank = bestIdx >= 0 ? rankings[bestIdx].vs_active_random?.beats_pct_of_monkeys : null;
+  // Headline number: best AI vs active-random monkey distribution.
+  const headlinePct = bestArRank;
+  const headlineTxt = headlinePct == null ? '—' : headlinePct.toFixed(1) + '%';
 
- root.innerHTML=`
-  <div class="card">
-   <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:10px">
-    <div>
-     <div class="pill">Window ${esc(d.window?.start)} → ${esc(d.window?.end)}</div>
-     <div class="pill" style="margin-left:6px">${d.n_tickers} tickers</div>
-     <div class="pill" style="margin-left:6px">${d.n_monkeys.toLocaleString()} monkeys</div>
+  // Distribution span for ASCII chart (active_random).
+  const arSpan = (ar && ar.n) ? {min: ar.min_pct, max: ar.max_pct} : null;
+  const rpSpan = (rp && rp.n) ? {min: rp.min_pct, max: rp.max_pct} : null;
+  const aiMedian = aiRets.length ? (() => {
+    const s = [...aiRets].sort((a,b)=>a-b);
+    const m = Math.floor(s.length/2);
+    return s.length % 2 ? s[m] : (s[m-1]+s[m])/2;
+  })() : null;
+
+  root.innerHTML = `
+    <div class="hero">
+      <div class="hero-label">your best ai backtest beats</div>
+      <div class="hero-number">${esc(headlineTxt)}</div>
+      <div class="hero-tag">of ${(d.n_monkeys||0).toLocaleString()} randomly-trading monkeys
+        <span class="muted">(active-random distribution)</span></div>
+      ${bestAi != null ? `<div class="hero-sub">best AI return: <b class="${cls(bestAi)}" style="color:inherit">${fmt(bestAi)}</b> · also beats ${bestRpRank == null ? '—' : bestRpRank.toFixed(1)+'%'} of buy-and-hold monkeys</div>` : ''}
+      <div class="hero-meta">
+        <span>window <b>${esc(d.window?.start)} → ${esc(d.window?.end)}</b></span>
+        <span>universe <b>${d.n_tickers||0}</b> tickers</span>
+        <span>monkeys <b>${(d.n_monkeys||0).toLocaleString()}</b></span>
+        <span>AI runs <b>${aiRets.length}</b> in window</span>
+        <span>computed <b>${esc((d.generated_at||'').slice(0,16).replace('T',' '))}</b> UTC</span>
+      </div>
     </div>
-    <div class="muted">computed ${esc((d.generated_at||'').slice(0,19).replace('T',' '))} UTC · ${d.elapsed_s}s</div>
-   </div>
-   <table>
-    <thead><tr><th>Distribution</th><th class="num">Median</th><th class="num">Mean</th><th class="num">p10</th><th class="num">p25</th><th class="num">p75</th><th class="num">p90</th><th class="num">p95</th><th class="num">p99</th><th class="num">min</th><th class="num">max</th></tr></thead>
-    <tbody>${statsRow('Random Portfolio (buy & hold)',rp)}${statsRow('Active Random Trader',ar)}</tbody>
-   </table>
-  </div>
 
-  <div class="card">
-   <h2>AI Edge vs Monkeys</h2>
-   ${aiRets.length===0
-     ? `<div class="muted">No AI backtest runs match this window yet (${esc(d.window?.start)} → ${esc(d.window?.end)}). Rankings will populate once continuous backtests draw this window.</div>`
-     : `<div class="grid">
-        <div class="kpi"><div class="v ${cls(beatsRp-50)}">${beatsRp.toFixed(0)}%</div><div class="l">of AI runs beat<br>random-portfolio median</div></div>
-        <div class="kpi"><div class="v ${cls(beatsAr-50)}">${beatsAr.toFixed(0)}%</div><div class="l">of AI runs beat<br>active-random median</div></div>
-        <div class="kpi"><div class="v ${cls(bestAi)}">${fmt(bestAi)}</div><div class="l">best AI return</div></div>
-        <div class="kpi"><div class="v ${cls(bestRpRank-90)}">${bestRpRank.toFixed(1)}%</div><div class="l">best beats this many<br>random portfolios</div></div>
-        <div class="kpi"><div class="v ${cls(bestArRank-90)}">${bestArRank.toFixed(1)}%</div><div class="l">best beats this many<br>active monkeys</div></div>
-        <div class="kpi"><div class="v">${aiRets.length}</div><div class="l">AI runs<br>in this window</div></div>
-       </div>`}
-   <div class="hint">Each AI backtest run uses Opus-annotated personas + DecisionScorer gates. Monkeys make uniformly-random buy/sell choices. Real alpha = consistently beating the right tail of the monkey distribution.</div>
-  </div>
+    <div class="row2">
+      <div class="panel">
+        <h2>Random Portfolio (buy &amp; hold)</h2>
+        <table><tbody>${statsTableRows(rp)}</tbody></table>
+      </div>
+      <div class="panel">
+        <h2>Active Random Trader</h2>
+        <table><tbody>${statsTableRows(ar)}</tbody></table>
+      </div>
+    </div>
 
-  <div class="card">
-   <h2>Refresh</h2>
-   <button id="runBtn" onclick="trigger()">Compute now</button>
-   <div class="hint">Auto-refreshes once per day from the continuous backtest loop. Manual refresh takes ~30s for the configured window.</div>
-  </div>
- `;
+    <div class="panel">
+      <h2>Return distribution — active random monkeys</h2>
+      <div class="dist">${
+        arSpan ? [
+          distBar('p10', ar.p10_pct, arSpan, null),
+          distBar('p25', ar.p25_pct, arSpan, null),
+          distBar('med', ar.median_pct, arSpan, aiMedian),
+          distBar('p75', ar.p75_pct, arSpan, null),
+          distBar('p90', ar.p90_pct, arSpan, null),
+          distBar('p95', ar.p95_pct, arSpan, null),
+        ].join('') : '<span class="muted">no distribution data</span>'
+      }</div>
+      <div class="hint">Each bar shows where the percentile lands on the min→max return axis. The gold marker pin-points where the AI median sits in this distribution — the further right of "med", the more edge.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Return distribution — buy &amp; hold monkeys</h2>
+      <div class="dist">${
+        rpSpan ? [
+          distBar('p10', rp.p10_pct, rpSpan, null),
+          distBar('p25', rp.p25_pct, rpSpan, null),
+          distBar('med', rp.median_pct, rpSpan, aiMedian),
+          distBar('p75', rp.p75_pct, rpSpan, null),
+          distBar('p90', rp.p90_pct, rpSpan, null),
+          distBar('p95', rp.p95_pct, rpSpan, null),
+        ].join('') : '<span class="muted">no distribution data</span>'
+      }</div>
+    </div>
+
+    <div class="panel">
+      <h2>Compute new benchmark</h2>
+      <div class="hint">Auto-refreshes once per day from the continuous backtest loop. Manual refresh runs the 10,000-monkey simulation against the configured window (~30s).</div>
+      <div class="actions">
+        <button id="runBtn" onclick="trigger()">Compute now</button>
+        <a href="{{ api_prefix }}/backtests" style="color:var(--cyan);text-decoration:none;font-family:var(--font-mono);font-size:11px;letter-spacing:0.16em;text-transform:uppercase;border:1px solid var(--border-bright);padding:9px 22px;">← back to dashboard</a>
+      </div>
+    </div>
+  `;
 }
 load();
 </script></body></html>
