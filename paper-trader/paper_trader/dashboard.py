@@ -226,6 +226,83 @@ def notify_health_api():
         }), 500
 
 
+@app.route("/api/alarm-latches")
+def alarm_latches_api():
+    """In-process silent-failure alarm-latch snapshot.
+
+    Exposes ``runner.alarm_latch_state()`` so the operator can see whether
+    THIS process is currently holding the consecutive-NO_DECISION breaker
+    latch and/or the Claude quota latch — the dedupe state that turns a
+    fresh outage into a silent one (one alert per wedge, by design).
+
+    Composes ``runner.alarm_latch_state`` **verbatim** (single source of
+    truth — the latch logic lives in runner.py, this endpoint never
+    re-derives it). The same data is also nested under ``latches`` in
+    ``/api/runner-heartbeat`` (mirrors the ``notify`` / ``singleton_lock``
+    pattern) — but that endpoint is SWR-cached (20s TTL), so an operator
+    checking "is the latch held *right now*?" needs the in-process
+    counters without a cached delay. This endpoint is **deliberately NOT
+    @swr_cached**: ``runner.alarm_latch_state`` is a pure module-global
+    read (no I/O, no store hop), exactly like ``notify_health``.
+
+    Failure contract: any import / call fault degrades to a valid-shaped
+    envelope with safe defaults so the panel can render and the operator
+    sees the fault, never a 500 that the upstream digital-intern dashboard
+    would render as 'endpoint dark' (the ``notify_health_api`` precedent).
+    """
+    try:
+        from . import runner as _runner
+        latches = _runner.alarm_latch_state()
+        if not isinstance(latches, dict):
+            latches = {}
+        # Derive a human headline so a dashboard banner has a one-line
+        # sentence without re-deriving the verdict — the single-sourcing
+        # discipline mirrored from ``/api/notify-health`` and the
+        # ``singleton_lock`` wiring in ``/api/runner-heartbeat``. The
+        # actionable case is "any latch held"; an idle process emits a
+        # neutral OK line so the panel never goes dark.
+        any_active = bool(latches.get("any_active"))
+        if any_active:
+            bits = []
+            if latches.get("breaker_active"):
+                bits.append("CLAUDE BREAKER held")
+            if latches.get("quota_active"):
+                bits.append("QUOTA latch held")
+            headline = (
+                "⚠️ " + " · ".join(bits)
+                + " — operator alerted; waiting for the next real "
+                "decision to clear."
+            )
+            verdict = "LATCHED"
+        else:
+            headline = (
+                "OK — no silent-failure alarm latches held; the engine "
+                "is responding."
+            )
+            verdict = "CLEAR"
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "verdict": verdict,
+            "headline": headline,
+            **latches,
+        })
+    except Exception as e:
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "verdict": "ERROR",
+            "headline": f"alarm-latches endpoint error: {e}",
+            "breaker_active": False,
+            "quota_active": False,
+            "any_active": False,
+            "consecutive_no_decisions": 0,
+            "breaker_threshold": None,
+            "breaker_outage_s": None,
+            "quota_outage_s": None,
+        }), 500
+
+
 # Static sector classification for analytics + sector-pulse cards.
 # Keyed by the symbols we actually use in the watchlist + portfolio.
 SECTOR_MAP = {
@@ -13137,6 +13214,24 @@ def runner_heartbeat_api():
             nh = _reporter.notify_health()
             if isinstance(nh, dict):
                 hb["notify"] = nh
+        except Exception:
+            pass
+        # Additive: alarm-latch state. The breaker / quota Discord alarms
+        # dedupe via in-process latches (one alert per wedge). A trader sees
+        # the FIRED/CLEARED Discord bracket but cannot tell whether the latch
+        # is CURRENTLY held without scrolling — yet that's exactly the
+        # question heartbeat readers ask ("is the engine in a silent-failure
+        # state right now?"). Mirrors the ``notify`` / ``singleton_lock``
+        # additive pattern: pure read of runner module globals, never
+        # overrides the existing verdict; any fault degrades to no block
+        # (the singleton_lock precedent). The dedicated ``/api/alarm-latches``
+        # endpoint serves the SAME data uncached for the operator who wants
+        # the in-process counters without the 20s SWR delay.
+        try:
+            from . import runner as _runner
+            latches = _runner.alarm_latch_state()
+            if isinstance(latches, dict):
+                hb["latches"] = latches
         except Exception:
             pass
         return jsonify(hb)
