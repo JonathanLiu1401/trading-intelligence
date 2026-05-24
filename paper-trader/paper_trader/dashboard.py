@@ -11993,6 +11993,30 @@ def streak_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/exit-only-streak")
+def exit_only_streak_api():
+    """Exit-only-streak detector — consecutive SELLs since the last entry at
+    the book level. /api/streak reads W/L on closed round-trips; /api/churn
+    measures re-entry cadence; /api/cash-drag measures the cost of idle
+    cash. None surface the *trade-direction* sequence: "the last 6 fills
+    were all SELLs — the engine is liquidating, not running the strategy".
+    Consumes the single source of truth (``recent_trades`` →
+    ``build_exit_only_streak``, AGENTS.md #10), walks the trade ledger
+    newest-backward counting consecutive SELL/SELL_CALL/SELL_PUT fills
+    before the most recent BUY*, and emits a DEFENSIVE_TRIM (≥3) /
+    DEFENSIVE_LIQUIDATION (≥6) verdict. Advisory only — never gates Opus,
+    never injected into the decision prompt, adds no caps (AGENTS.md
+    #2/#12)."""
+    try:
+        from .analytics.exit_only_streak import build_exit_only_streak
+        store = get_store()
+        # Same trades convention as /api/streak: oldest → newest.
+        trades = list(reversed(store.recent_trades(2000)))
+        return jsonify(build_exit_only_streak(trades))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/repeat-loser")
 def repeat_loser_api():
     """Per-ticker losing-streak detector — the per-ticker companion to

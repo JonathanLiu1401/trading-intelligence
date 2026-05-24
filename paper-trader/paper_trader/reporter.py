@@ -3630,6 +3630,49 @@ def _streak_line(store) -> str:
         return ""
 
 
+def _exit_only_streak_line(store) -> str:
+    """One-line "is the bot in liquidation-only mode?" for the hourly /
+    daily report.
+
+    ``_streak_line`` flags WIN/LOSS clusters on closed round-trips; this
+    line flags the orthogonal structural pattern: consecutive EXITs at
+    the book level with no offsetting entry. A trader watching the live
+    tape sees "SELL NVDA, SELL AMD, SELL MU — and nothing else for 14h"
+    and rightly asks "is the engine paused, or is it just defensively
+    cycling out?" — no existing panel answers that question.
+
+    Composes ``build_exit_only_streak`` **verbatim** (single source of
+    truth, AGENTS.md invariant #10) over the EXACT same store read
+    ``_streak_line`` uses (``recent_trades(2000)`` reversed oldest-
+    first, per the builder contract). Pure store reads only — NO
+    network (the Discord-path discipline). Observational only, never
+    gates (invariants #2 / #12 — the ``_streak_line`` precedent).
+
+    Suppression: surface ONLY ``DEFENSIVE_TRIM`` (≥3 trailing exits)
+    and ``DEFENSIVE_LIQUIDATION`` (≥6) — anything below the trim
+    floor or a most-recent-entry book stays silent so the hourly
+    summary never becomes its own lying green light (the
+    ``_streak_line`` / ``_hold_discipline_line`` NO_DATA / NEUTRAL
+    suppression precedent).
+    """
+    try:
+        from .analytics.exit_only_streak import build_exit_only_streak
+        trades = list(reversed(store.recent_trades(2000)))
+        es = build_exit_only_streak(trades)
+        if not isinstance(es, dict):
+            return ""
+        verdict = es.get("verdict")
+        if verdict not in ("DEFENSIVE_TRIM", "DEFENSIVE_LIQUIDATION"):
+            return ""
+        headline = es.get("headline") or ""
+        if not headline:
+            return ""
+        return f"**EXIT-ONLY** ◈ {verdict}\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] exit-only-streak line skipped: {e}")
+        return ""
+
+
 def _ago(seconds: float) -> str:
     """Compact human age: `45m` / `3h` / `2d`. Sub-minute reads `0m`."""
     seconds = max(0.0, float(seconds))
@@ -4095,6 +4138,15 @@ def send_hourly_summary() -> bool:
     sk = _streak_line(store)
     if sk:
         body += "\n" + sk
+    # EXIT-ONLY sits right after STREAK — the structural sibling. STREAK
+    # reads W/L of *closed round-trips*; EXIT-ONLY reads *book-level
+    # direction*: "the last N fills were all SELLs — engine is liquidating
+    # only, not running the strategy". Both can surface independently (a
+    # liquidation streak can be a string of wins OR losses; a tilt run can
+    # include a mix of entries and exits).
+    eo = _exit_only_streak_line(store)
+    if eo:
+        body += "\n" + eo
     # REPEAT_LOSER sits right after STREAK — the per-ticker companion to
     # the aggregate run. STREAK says "you're on a 4-loss run"; REPEAT_LOSER
     # says "and 3 of those 4 are on LITE — stop adding to LITE". Both
@@ -4300,6 +4352,12 @@ def send_daily_close() -> bool:
     sk = _streak_line(store)
     if sk:
         body += "\n" + sk
+    # EXIT-ONLY follows STREAK on daily close too — same structural sibling
+    # placement as the hourly. Silent unless DEFENSIVE_TRIM / LIQUIDATION
+    # (the suppression precedent).
+    eo = _exit_only_streak_line(store)
+    if eo:
+        body += "\n" + eo
     # REPEAT_LOSER follows STREAK on daily close too — see send_hourly_summary
     # for the rationale (aggregate vs per-ticker tilt).
     rl = _repeat_loser_line(store)
