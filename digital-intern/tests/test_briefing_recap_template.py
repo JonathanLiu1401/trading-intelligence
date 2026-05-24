@@ -488,6 +488,18 @@ def test_briefing_gate_catches_drift_patterns():
          "Inc. (NYSE:HD) Price Target To US$378.32", "earnings_release_pt"),
         ("Earnings Release: Here's Why Analysts Raised Their NVIDIA "
          "Price Target", "earnings_release_pt"),
+        # gurufocus_recap — GoogleNews/GuruFocus algorithmic post-earnings
+        # mill (2026-05-23 NVDA earnings night, 5 distinct rows reached
+        # urgency=2 across the GoogleNews/GuruFocus / GN: Nvidia / GN:
+        # earnings channels; all above the 0.45 lone-source bar).
+        ("NVIDIA (NVDA) Reports Robust Earnings While Valuation Appears At - GuruFocus",
+         "gurufocus_recap"),
+        ("NVIDIA (NVDA) Reports Strong Earnings Amid AI Investment Surge - GuruFocus",
+         "gurufocus_recap"),
+        ("NVIDIA (NVDA) Stock Faces Setback Despite Strong Earnings Report - GuruFocus",
+         "gurufocus_recap"),
+        ("NVIDIA (NVDA) Exceeds Earnings Expectations with Strong Future O - GuruFocus",
+         "gurufocus_recap"),
     ]
     for title, expected in drift_cases:
         hit, name = _looks_like_recap_template({"title": title})
@@ -526,6 +538,14 @@ def test_briefing_drift_patterns_preserve_must_survive_corpus():
         "Tesla hits today's high",
         # earnings preview NOT recap
         "Nvidia Earnings Are Hours Away. Here Are 3 Things to Watch",
+        # gurufocus_recap must NOT catch real wires that say "Reports Record"
+        # / "reports record quarter" — Record is NOT in the qualitative-adj
+        # list, so legit wires using the same verb survive.
+        "NVIDIA Reports Record $81.62 Billion Revenue as Gaming Income Disappears",
+        "AMD reports record Q1 revenue, raises guidance",
+        "Lumentum reports best EPS quarter in five years",
+        "Tesla stock drops 5% on margin miss",
+        "Apple beats Q4 earnings, raises FY outlook",
     ]
     for title in must_survive:
         hit, name = _looks_like_recap_template({"title": title})

@@ -1141,6 +1141,73 @@ _RT_SUBJECT_PCT_AFTER = re.compile(
     re.IGNORECASE,
 )
 
+# "<Subject> (TICKER) (Reports|Posts) <Adjective> Earnings/Quarter/Results/Q[1-4]"
+# AND "<Subject> Stock Faces Setback Despite ..." AND "<Subject> Exceeds Earnings
+# Expectations ..." — the GuruFocus / "GoogleNews/GuruFocus" algorithmic
+# post-earnings-recap mill. Triggered automatically for every quarterly print
+# across the tracked universe, with a templated qualitative adjective the wires
+# never use ("Reports Robust Earnings", "Stock Faces Setback Despite Strong
+# Earnings Report"). Same retrospective-recap class as ``_RT_EARNINGS_CALL``
+# (post-earnings transcript summary) and ``_RT_HERES_WHAT_HAPPENED`` (post-event
+# explainer) — the print has crossed the wire and the move is already in the
+# market by the time the GuruFocus mill posts the qualitative summary.
+#
+# Live evidence (2026-05-23, 7d articles.db urgency=2 scan — all NVDA earnings
+# night syndication on the ``GoogleNews/GuruFocus`` / ``GN: Nvidia`` /
+# ``GN: earnings`` channels, all above the 0.45 lone-source bar so the
+# authority gate doesn't catch them; content type IS the failure):
+#   - "NVIDIA (NVDA) Reports Robust Earnings While Valuation Appears At -
+#      GuruFocus"           ml=9.98 score_source='ml' (urgency=2)
+#   - "NVIDIA (NVDA) Reports Robust Earnings While Valuation Appears At -
+#      GuruFocus" (dup)     ml=9.98 score_source='ml' (urgency=2)
+#   - "NVIDIA (NVDA) Reports Strong Earnings Amid AI Investment Surge -
+#      GuruFocus"           ml=9.26 score_source='ml' (urgency=2)
+#   - "NVIDIA (NVDA) Stock Faces Setback Despite Strong Earnings Report -
+#      GuruFocus"           ml=9.83 score_source='ml' (urgency=2)
+#   - "NVIDIA (NVDA) Exceeds Earnings Expectations with Strong Future O -
+#      GuruFocus"           ai=8.00 score_source='llm' (Sonnet over-scored
+#                                                       — same SEO mill template)
+#
+# Discriminator: three orthogonal sub-templates the GuruFocus mill cycles
+# through, unified into one regex so all three count as the same fingerprint:
+#
+#   1. ``\bReports\s+(Robust|Strong|Solid|Mixed|Weak|Modest|Disappointing)\s+
+#       (Earnings|Quarter|Results|Q[1-4])\b``
+#      Real wires don't use qualitative adjectives — they cite specifics
+#      ("Reports Record $81.6B Revenue", "Beats Q1 Estimates by $5B"). The
+#      closed adjective list is the SEO-mill signature.
+#   2. ``\bStock\s+Faces\s+Setback\s+Despite\b``
+#      "Faces Setback Despite" is editorial framing wire copy avoids — real
+#      news says "stock falls", "shares slip", "stock drops on weak guidance".
+#   3. ``\b(Exceeds|Outperforms?)\s+Earnings\s+Expectations\b``
+#      "Exceeds Earnings Expectations" is unusually formal — real wires say
+#      "beats estimates", "tops EPS forecast", "blows past consensus".
+#
+# Substring (not anchored ^) so the trailing "- GuruFocus" attribution and
+# any subject lead are tolerated — exactly the live failure shape. Validated
+# against the must-survive corpus: "Nvidia Q1 revenue rises 22% to $35.1
+# billion", "NVIDIA Reports Record $81.62 Billion Revenue", "Nvidia tops Q1
+# earnings", "Nvidia Beats Estimates With $81.62 Billion in Q1 Revenue",
+# "Apple shares fall after weak guidance", "AMD reports record Q1 revenue",
+# "Lumentum delivers strong quarter, beats EPS estimates" — none match,
+# because none use the templated qualitative adjective + earnings-noun pair,
+# the "Stock Faces Setback Despite" editorial framing, or the formal
+# "Exceeds Earnings Expectations" phrase.
+#
+# Pure read-side: no DB write, no ai_score/ml_score/score_source/urgency
+# mutation. All four load-bearing invariants intact by construction.
+_RT_GURUFOCUS_RECAP = re.compile(
+    r"\b("
+    r"Reports\s+(?:Robust|Strong|Solid|Mixed|Weak|Modest|Disappointing)\s+"
+    r"(?:Earnings|Quarter|Results|Q[1-4])"
+    r"|"
+    r"Stock\s+Faces\s+Setback\s+Despite"
+    r"|"
+    r"(?:Exceeds|Outperforms?)\s+Earnings\s+Expectations"
+    r")\b",
+    re.IGNORECASE,
+)
+
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
@@ -1177,6 +1244,7 @@ _RECAP_TEMPLATE_PATTERNS = (
     ("daily_price_city", _RT_DAILY_PRICE_CITY),
     ("whats_next_after", _RT_WHATS_NEXT_AFTER),
     ("earnings_release_pt", _RT_EARNINGS_RELEASE_PT),
+    ("gurufocus_recap", _RT_GURUFOCUS_RECAP),
 )
 
 
