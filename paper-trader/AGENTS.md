@@ -6,6 +6,130 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 paper-trader core HYBRID pass (Agent 1) — `_last_claude_fail` per-cycle reset + `/api/alarm-latches`
+
+### Phase 1: Debug — 1 bug fixed (7d524bd)
+
+`strategy.decide()` historically reset only `_quota_exhausted` at cycle entry; the
+companion `_last_claude_fail` module global was set by `_claude_call` and never
+re-cleared by `decide()` itself. The host-saturated pre-flight path skips
+`_claude_call` entirely, so a previous cycle's tag (timeout / nonzero_rc /
+empty_stdout / cli_missing / exception) would leak into THIS cycle's
+`summary["last_claude_fail"]` and the persisted `decisions.reasoning` body
+"claude returned no response (...)". The visible Discord-alert effect was
+masked by `runner._no_decision_cause`'s priority ladder on the host-saturated
+arm (host check wins, the stale tag never gets rendered), but the per-cycle
+contract was broken for any non-host fault that happened to follow a
+host-saturated cycle — the stale tag would then be the rendered cause.
+
+Fix: clear `_last_claude_fail` at the top of `decide()` alongside
+`_quota_exhausted`. Pinned by `TestDecidePerCycleReset` in
+`tests/test_core_strategy.py` (2 cases — one for each global, both driving
+`decide()` through the host_saturated short-circuit so the reset is
+exercised on the leakiest path).
+
+### Phase 2: Feature — `runner.alarm_latch_state()` + `/api/alarm-latches` + heartbeat `latches` block (b188e7c)
+
+The runner dedupes the two silent-failure Discord alarm classes via
+module-global latches: `_breaker_alert_active` (consecutive-NO_DECISION
+circuit breaker) and `_quota_alert_active` (Claude quota exhaustion).
+Discord shows the FIRED→CLEARED bracket; a trader who returns mid-outage
+otherwise has no surface to answer "is the latch held *right now*?".
+Without that read the operator has to scroll Discord or `ps`-grep the
+runner to know whether they are inside a deduped wedge.
+
+New surface:
+
+* `runner.alarm_latch_state()` — pure read of module globals;
+  emits `breaker_active`, `quota_active`, `any_active`,
+  `consecutive_no_decisions`, `breaker_threshold`, `breaker_outage_s`,
+  `quota_outage_s`. Future ts clamped to 0 (the documented clock-skew
+  hazard); garbage ts degrades to None. Never raises.
+* `/api/alarm-latches` — dedicated **un-cached** endpoint (mirrors
+  `/api/notify-health` — the in-process counter must be fresh; the SWR
+  cache on `/api/runner-heartbeat` would otherwise serve a stale latch
+  read up to 20s old). Composes the runner accessor verbatim (invariant
+  #10) and adds a verdict (CLEAR / LATCHED) + a human headline that names
+  WHICH latches are held (e.g. "CLAUDE BREAKER held · QUOTA latch held").
+* `/api/runner-heartbeat` additive `latches` block — nested next to the
+  existing `notify` / `singleton_lock` siblings, so panels that already
+  poll the heartbeat surface the latch state without a second round-trip.
+
+Failure contract mirrors `/api/notify-health`: a fault degrades to a
+valid-shaped ERROR envelope (HTTP 500 on exception, 200 with safe
+defaults otherwise), never a 500 that the upstream cross-fetch would
+render as 'endpoint dark'.
+
+Locked by `TestAlarmLatchState` in `tests/test_core_runner.py` (7 cases
+incl. future-ts clamp + garbage-input degrade + the dual-latch
+`any_active` flag) and `tests/test_core_dashboard_alarm_latches.py`
+(8 endpoint + heartbeat cases — clean / breaker-only / quota-only /
+both / not-cached / failure-path / heartbeat-additive).
+
+### Phase 3 findings — trader-view live state ~02:35 UTC
+
+Confirmed via curl against `:8090`:
+
+* `/api/state`: $987.39 cash, 0 open positions, last trade was a clean
+  thesis-broken SELL NVDA @ $215.25 ("MACD turned bearish, 5d momentum
+  -4.43%, post-earnings reaction was negative... book is 100% single-name
+  in SEMIS at 65.4% concentration"). The reasoning is *exactly* the
+  trader-quality narrative a live operator expects — not an Opus shrug.
+* `/api/last-real-decision`: HOLD CASH 5m ago — "no high-score signals
+  (last 2h empty), ML advisor conviction only 6% on MU which would
+  require ~76% portfolio allocation for a single share — risk/reward
+  mismatch. MRVL earnings in 2.9d worth waiting for fresh catalysts at
+  the open." Patient cash hold is the right call here.
+* `/api/decision-health`: action mix 2.3% FILLED · 31.4% HOLD · 66.3%
+  NO_DECISION lifetime; 81.2 cycles/day. The NO_DECISION % is the
+  documented host-saturation pathology (66% lifetime / 40% last-20).
+* `/api/no-decision-reasons`: 8/20 NO_DECISIONs all 100% `host_saturated`
+  — the documented #1 silent-failure mode (concurrent HYBRID review
+  agents + backtest committee starving the 15 GB box). Recommendation
+  is correctly "wait for the storm to clear; a runner restart does NOT
+  help" — the pre-flight + mid-call host-guard pair is working.
+* `/api/build-info`: `boot_sha=7d524bd`, `head=b188e7c`, `behind=3`.
+  Runner is on stale code (my Phase-1 SHA); git-watcher will deploy.
+  The new `/api/alarm-latches` 404s as expected until the restart lands.
+* `/api/notify-health`: UNKNOWN — no Discord message attempted yet this
+  process (uptime ~5m at the time of the probe). HEALTHY once the first
+  hourly fires ~55m from boot.
+* `/api/runner-heartbeat`: HEALTHY, last decision 5m ago, market closed
+  (60m cadence). Cached payload age 298s — the documented 20s TTL was
+  exceeded by ~280s under host-saturation, which is itself a signal: the
+  dashboard's background SWR rebuild has been queued behind the storm.
+
+Operational note: the runner.log tail shows a `[runner] starting paper
+trader / another paper trader is already running (pid=1222712);
+refusing to start a second trader` — the singleton-lock guard is doing
+its job against repeated launcher attempts. Not a new finding; the
+`/api/launcher-restart-loop` endpoint already exists for this class.
+
+### Counters
+
+- bugs fixed: 1 (per-cycle reset of `_last_claude_fail` in `decide()`)
+- features added: 1 (alarm-latch accessor + endpoint + heartbeat block)
+- user findings: 3 (NO_DECISION host-saturation dominant, runner on
+  stale code awaiting git-watcher deploy, launcher-restart attempts
+  visible in log — all known / documented, no new fixes)
+
+### Test commands
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_core_strategy.py::TestDecidePerCycleReset -v
+python3 -m pytest tests/test_core_runner.py::TestAlarmLatchState -v
+python3 -m pytest tests/test_core_dashboard_alarm_latches.py -v
+python3 -m pytest tests/test_core_runner.py tests/test_core_market.py \
+                  tests/test_core_signals.py tests/test_core_strategy.py \
+                  tests/test_core_store.py tests/test_core_reporter.py \
+                  tests/test_core_dashboard_alarm_latches.py \
+                  tests/test_core_dashboard_notify_health.py -q
+# 850 passed
+```
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #23 (Agent 2) — `train_scorer` `llm_quality_label` robustness + `feature_correlation_audit`
 
 ### Bug fix: `train_scorer` crashed on corrupted `llm_quality_label`
