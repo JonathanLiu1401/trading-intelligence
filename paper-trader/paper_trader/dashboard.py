@@ -14994,6 +14994,27 @@ def _swr_prewarm():
         ("realized-vs-unrealized", realized_vs_unrealized_api),
         ("concentration-trajectory", concentration_trajectory_api),
         ("today-action-tape", today_action_tape_api),
+        # cash_drag / opportunity-cost / persistent-watchlist-opportunity
+        # were @swr_cached by later commits but never added to this prewarm
+        # list — same freeze-triage cold-stall blind spot the
+        # test_swr_prewarm_coverage invariant locks against. A trader who
+        # opens these panels right after a restart got {"warming": true}
+        # for one full TTL cycle. cash_drag is a slow equity-curve scan,
+        # opportunity-cost rebuilds NO_DECISION/HOLD-CASH outcomes against
+        # forward returns (the slowest pure-DB shape on this surface), and
+        # persistent-watchlist-opportunity runs an articles.db SELECT over
+        # a multi-day window per watchlist ticker.
+        ("cash_drag", cash_drag_api),
+        ("opportunity-cost", opportunity_cost_api),
+        ("persistent-watchlist-opportunity", persistent_watchlist_opportunity_api),
+        # setup-analogues @swr_cached 90s — bands the decision_outcomes
+        # corpus by (rsi, mom20, regime) and computes a feature-context
+        # return distribution. _load_decision_outcomes scans the JSONL on
+        # every miss; first poll after a restart is exactly when the
+        # operator is sanity-checking the MLP point estimate against the
+        # historical distribution. Same freeze-triage cold-stall blind
+        # spot test_swr_prewarm_coverage locks against.
+        ("setup-analogues", setup_analogues_api),
     ]
     for name, wrapper in targets:
         try:
