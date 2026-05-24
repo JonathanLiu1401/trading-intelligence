@@ -5,6 +5,108 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-24 hybrid pass #34 (Agent 3) — gurufocus_recap gate + pushed_alert_gate_regret
+
+Debugger + feature-dev + news-analyst pass. 3234 tests green at start;
++13 GuruFocus gate tests + 12 regret-audit tests = 3259 at end.
+All four load-bearing invariants intact (backtest isolation, ml_score
+vs ai_score, score_source, urgency state machine).
+
+**Phase 1 (bug fix) — committed via auto-commit in `c037a3e`:**
+
+Live evidence (2026-05-23, 7d articles.db urgency=2 scan — NVDA earnings
+night syndication on GoogleNews/GuruFocus / GN: Nvidia / GN: earnings):
+5 distinct GuruFocus algorithmic-mill rows reached urgency=2 with the
+existing recap gates missing them:
+  * "NVIDIA (NVDA) Reports Robust Earnings While Valuation Appears At -
+     GuruFocus" (ml=9.98 score_source='ml', urgency=2 ×2)
+  * "NVIDIA (NVDA) Reports Strong Earnings Amid AI Investment Surge -
+     GuruFocus" (ml=9.26 score_source='ml', urgency=2)
+  * "NVIDIA (NVDA) Stock Faces Setback Despite Strong Earnings Report -
+     GuruFocus" (ml=9.83 score_source='ml', urgency=2)
+  * "NVIDIA (NVDA) Exceeds Earnings Expectations with Strong Future O -
+     GuruFocus" (ai=8.00 score_source='llm' — Sonnet over-scored same
+     SEO template)
+
+All sources above the 0.45 `ALERT_MIN_LONE_SOURCE_CRED` bar (GoogleNews
+0.62) so the authority gate cannot catch them; content type IS the
+failure. Existing `earnings_call_recap` requires the transcript-verb
+list (highlights|recap|takeaways|transcript|summary|review); the
+GuruFocus qualitative-adjective mill ("Reports Robust", "Stock Faces
+Setback Despite", "Exceeds Earnings Expectations") never matches.
+
+Added `_RT_GURUFOCUS_RECAP` to `watchers.alert_agent._RECAP_TEMPLATE_PATTERNS`
+plus lockstep mirror in `analysis.claude_analyst._BRIEFING_RECAP_TEMPLATE_PATTERNS`
+(structural parity enforced by `test_alert_and_briefing_recap_tuples_have_same_length`).
+
+Discriminator (three orthogonal sub-templates unified into one regex):
+  1. `Reports (Robust|Strong|Solid|Mixed|Weak|Modest|Disappointing)
+      (Earnings|Quarter|Results|Q[1-4])` — closed qualitative-adjective
+      list is the SEO-mill signature; real wires cite specifics ("Reports
+      Record $81.6B Revenue", "Beats Q1 Estimates by $5B").
+  2. `Stock Faces Setback Despite` — editorial framing wire copy avoids.
+  3. `(Exceeds|Outperforms?) Earnings Expectations` — formal phrasing
+      real wires don't use ("beats estimates", "tops EPS forecast").
+
+13 new tests pin all 4 live failures + sibling adjective/sub-template
+variants and verify must-survive corpus (record-quarter wires, real
+beats/tops headlines, macro breaking) survives unchanged on BOTH the
+alert and briefing gates.
+
+**Phase 2 (feature) — committed in `120ec25`:**
+
+`analytics.pushed_alert_gate_regret` — retrospective gate-coverage audit
+on the canonical Discord-push ledger (`alert_recency.db`). Iterates the
+`alerted_sig` table in window — every row a real Discord push because
+`record_alerted` is only called after `discord_send` succeeds — and runs
+every saved title through the CURRENT `_looks_like_quote_widget` +
+`_looks_like_recap_template` fingerprint sets. Output: total pushes,
+would_suppress count, per-fingerprint attribution, top-20 offender
+titles sorted newest-first.
+
+Sibling gap: `alert_delivery_audit` grades what queued vs delivered
+AT QUEUE TIME (a push that fired before a gate existed is out of scope);
+`recap_template_audit` walks articles.db urgency>=1; `recap_noise_by_
+source` is per-feeder. None is per-PUSH retrospective. This module is
+the missing axis — empirically measures how much noise reduction the
+gate-engineering work has given the analyst over time.
+
+Live audit (24h, 2026-05-24): 36 pushes scored, 4 (11.1%) would now be
+suppressed by today's gates that didn't exist when they fired —
+gurufocus_recap × 2 (today's Phase 1 fix), earnings_release_pt × 1
+(SimplyWallSt SEO mill, Home Depot row), subject_pct_after × 1 (D-Wave
+Quantum simplywall.st recap).
+
+Pure-builder design: `build_regret_report(pushed_titles)` takes a list
+of `{title, age_hours}` dicts (the exact shape `alert_recency.recent_alerts`
+returns) — fully unit-testable without SQLite. `main()` wires the live
+`alert_recency.db` to it.
+
+12 new tests pin: empty-input shape (every fingerprint bucket pre-
+seeded), gurufocus_recap / quote_widget attribution, mixed-batch
+partition correctness, must-survive corpus stays in would_keep,
+offender-list sorted newest-first, capped at 20, DB-shell end-to-end
+via tmp_path sqlite, missing-DB silent degrade.
+
+CLI: `python3 -m analytics.pushed_alert_gate_regret [--hours 24]`.
+
+**Phase 3 (live validation) — 3 findings:**
+
+1. **Gate system empirically working.** 24h snapshot shows 52 ML-only
+   urgency=2 rows but only 36 actual Discord pushes (`pushed_alert_gate_regret`
+   ledger) — ~16 rows absorbed by defense-in-depth gates before reach
+   the analyst. The gate-engineering layer is the dominant noise filter.
+2. **Score-source split remains 70% ML-only** (52 ML / 22 LLM in 24h).
+   Consistent with prior-pass trend; Sonnet quota / cost throttling, not
+   a new regression. The new `pushed_alert_gate_regret.would_suppress_rate`
+   makes the noise-reduction trend measurable over time.
+3. **Ingestion healthy.** 1451/hr, 5529/24h. Top sources: stocktwits,
+   nasdaq_earnings_calendar, GN topic feeds, scraped/finance.yahoo.com,
+   AlphaVantage/MarketBeat. Last briefing 04:54 UTC (3.6h ago — well
+   within 5h cadence target).
+
+---
+
 ## 2026-05-24 hybrid pass #33 (Agent 3) — subject_pct_after recap leak + recap_noise_by_source
 
 Debugger + feature-dev + news-analyst pass. 3221 tests green at pass start;
