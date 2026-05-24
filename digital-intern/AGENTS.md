@@ -5,6 +5,139 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-24 hybrid pass #25 (Agent 3) — pushed_ticker_label_split: per-held-ticker push calibration
+
+Debugger + feature-dev + news-analyst pass. **No Phase 1 commit** — the
+codebase is mature; the existing test suite (2753/2753 green) already
+pins every invariant the prompt called out (backtest isolation in
+`get_unalerted_urgent` / `get_top_for_briefing` / `get_unscored`,
+ai_score vs ml_score separation in `update_ml_scores_batch`,
+`score_source` tagging, etc.). The two same-title duplicate-alert
+patterns I scanned for in `articles.db` (18-copy "$80B buyback", 13-copy
+"Nvidia Q1 results...") turned out to be **gate-suppressed urgency=2
+rows draining the queue, not duplicate Discord pushes** —
+`alert_recency.db` shows only 41 distinct pushed signatures in 3 days,
+all `hits=1`, confirming the existing cross-cycle dedup is working as
+designed.
+
+**Phase 2 (feature) — auto-committed into sibling commit `b188e7c`** by
+the auto-commit daemon (the `[DI shared-repo concurrency]` /
+`[PT concurrent same-role staging race]` hazard; the daemon's
+`git add -A` rolled my untracked files into a sibling agent's
+paper-trader feature commit before I could stage explicitly). The two
+files (visible in `git show --stat b188e7c`):
+
+- `analytics/pushed_ticker_label_split.py` — per-held-ticker push
+  calibration at the intersection of three existing primitives, each of
+  which leaves a real gap:
+  - `storage.article_store.urgency_label_split_by_ticker` is gate-noise-
+    inflated (urgency>=1 includes rows defense-in-depth gates marked
+    alerted to drain the queue — a ticker with 50 ml-only urgency=1 rows
+    the recap gate filtered reads identically to one with 50 real
+    Discord pushes).
+  - `watchers.alert_recency.pushed_ticker_breakdown` is push-correct but
+    carries NO `score_source` dimension.
+  - `analytics.alert_delivery_audit.delivered_by_source` has both push-
+    correctness AND `score_source` — but only aggregated, not
+    per-held-ticker.
+
+  This module is the missing third-axis slice. It joins `articles.db`
+  urgency=2 rows in window against `alert_recency.db` alerted
+  signatures, folds syndicated copies into one push per signature (with
+  LLM-vetted copy winning attribution over ML-only), then partitions per
+  held ticker by `score_source`. Pure
+  `compute_pushed_ticker_label_split(urgent_rows, alerted_sigs, tickers)`
+  is the unit-tested contract; `run()` is the dual-DB read-only shell
+  (mirrors `alert_delivery_audit.run_audit`'s shape). CLI:
+  `python3 -m analytics.pushed_ticker_label_split [--hours 6]`.
+
+  Load-bearing invariants: `_LIVE_ONLY_CLAUSE` duplicated verbatim from
+  `storage/article_store.py` (test pins drift); both DBs opened
+  `mode=ro`; no DB write; no `ai_score` / `ml_score` / `score_source` /
+  `urgency` mutation. All four invariants intact by construction.
+
+  Live smoke result on the 6h window at pass time:
+  `total_pushes=4, NVDA=2 (both llm-vetted, llm_fraction=1.0),
+  22 other held names silent` — gives the analyst per-position
+  calibration that no existing primitive surfaced.
+
+- `tests/test_pushed_ticker_label_split.py` — 15 cases pin:
+  empty inputs (no tickers / no urgent / no alerted_sigs), the
+  push-vs-gate-marked discrimination (signature-not-in-alerted_sigs
+  rows MUST be dropped — the load-bearing invariant), score_source
+  attribution (ml / llm / mixed / null), the syndication fold (3
+  urgent copies same sig collapse to 1 push, LLM-vetted wins), ticker
+  matching surface (title + summary, whole-word, substring guard for
+  MUTUAL/DAMD), most-ml-first sort order, the canonical
+  `LIVE_ONLY_CLAUSE` parity assertion (anti-drift), and the run()
+  shell degrading gracefully on a missing recency DB.
+
+**Phase 3 (live user validation):**
+
+1. **Ingestion healthy.** Last 1h: 408 articles, 54 ML-scored, 23
+   LLM-labeled, 0 currently alerted. Throughput in line with prior
+   hybrid-pass snapshots.
+2. **Alert calibration concern (already known).** Last 24h
+   `urgency=2` rows: 51 ml-only, 18 llm-vetted (26% LLM-vetted, 74%
+   ML-only) — matches the persistent `mostly_unverified` pattern
+   already pinned in commit `bcf9e7d`'s `urgency_label_split` docstring.
+   The new `pushed_ticker_label_split` analytics module is the next
+   natural surface: now the analyst can see which of THEIR HELD NAMES
+   carry that 74% ml-only push rate.
+3. **Briefings are high quality.** The last two 5h Opus briefings
+   cite specific tickers with % moves (AMD +3.99%, QCOM +11.60%, AXTI
+   +16.37%), name concrete catalysts (Warsh sworn in as Fed Chair,
+   Huang's $200B CPU TAM call at COMPUTEX, Citi's $840 DRAM-surge
+   target, Corsair adopting Chinese DRAM), and frame continuation
+   ("developing post-print regime, not a fresh break") — actionable
+   intelligence, not generic prose.
+4. **9325 dark sources in 7d**, dominated by the `gdelt_gkg/*`
+   channel (iheart.com 63k, joker.com 13k, etc.) — all stopped
+   2026-05-17 02:57Z. Matches the `[DI chronic dark collectors]`
+   standing memory note; not a fresh bug.
+5. **Supervisor healthy.** `logs/supervisor_state.json` shows
+   `ok=49 dead=0` — every worker alive.
+6. **Dedup IS working — earlier suspicion was a false positive.**
+   `articles.db` shows 18 copies of one headline at urgency=2, but
+   `alert_recency.db` shows it pushed exactly ONCE (hits=1). The
+   defense-in-depth gates (quote_widget / recap_template /
+   low_authority / stale_published / cross-cycle paraphrase) absorbed
+   the other 17 by calling `mark_alerted_batch` to drain the queue —
+   exactly as designed. The system's anti-noise discipline is one of
+   its strongest features; the duplicate-alerts pain pattern the
+   `[PT NO_DECISION host saturation]` memory documents for paper-
+   trader is NOT happening on the digital-intern alert path.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:** `from storage import article_store; from ml import
+features, model` → `imports OK`. Focused suite:
+`tests/test_pushed_ticker_label_split.py` (15) +
+`tests/test_alert_delivery_audit.py` (existing siblings) +
+`tests/test_article_store.py` + `tests/test_features.py` +
+`tests/test_urgency_scorer.py` + `tests/test_trainer.py` +
+`tests/test_model.py` + `tests/test_alert_recency.py` = **113 pass /
+0 fail** in 11.2 s. Full `pytest tests/` (run at task start before
+any code change) = **2753 pass / 0 fail** in 149 s.
+
+**Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=6`.
+
+**Staging discipline note.** Intended explicit-pathspec stage
+(`git add analytics/pushed_ticker_label_split.py
+tests/test_pushed_ticker_label_split.py` from
+`/home/zeph/trading-intelligence/digital-intern`) was pre-empted by
+the auto-commit daemon, which bundled my two untracked files into a
+sibling agent's paper-trader commit (`b188e7c` — original message
+"feat: /api/alarm-latches + latches block"). Code is durable
+(`git log --all -- analytics/pushed_ticker_label_split.py` shows it
+under that commit). Did NOT attempt to rewrite history or split the
+commit — would risk corrupting the sibling agent's pushed work for
+no functional gain. This is the same hazard pattern documented in
+`[DI shared-repo concurrency]` / `[PT concurrent same-role staging
+race]` memory entries.
+
+---
+
 ## 2026-05-24 hybrid pass #24 (Agent 3) — kw_ai_divergence scale + urgency_drought tz parse + endpoints
 
 Debugger + feature-dev + news-analyst pass. Three commits on master
