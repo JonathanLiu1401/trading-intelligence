@@ -1421,8 +1421,17 @@ def _ml_live_opinion(
 
 def decide() -> dict:
     """Run one decision cycle. Returns summary dict for logging."""
-    global _quota_exhausted
+    global _quota_exhausted, _last_claude_fail
     _quota_exhausted = False  # per-cycle: reflects only THIS cycle's claude attempts
+    # Per-cycle: a host_saturated pre-flight skip leaves `_claude_call` UN-called,
+    # so the module-global tag set by the previous cycle's failed call would
+    # otherwise leak into THIS cycle's ``summary["last_claude_fail"]`` and
+    # ``decisions.reasoning`` "claude returned no response (...)" body. The
+    # priority ladder in ``runner._no_decision_cause`` masks the visible effect
+    # on the host-saturated path (host check wins), but a non-host fault that
+    # happened to follow a host-saturated cycle would still emit the stale tag.
+    # Reset here so the per-cycle contract holds regardless of which arm fires.
+    _last_claude_fail = None
     store = get_store()
     market_open = market.is_market_open()
 

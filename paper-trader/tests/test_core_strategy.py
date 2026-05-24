@@ -245,6 +245,116 @@ class TestLastClaudeFail:
         assert strategy._last_claude_fail is None
 
 
+class TestDecidePerCycleReset:
+    """``decide()`` is per-cycle for its module-global failure tags.
+    ``_quota_exhausted`` has always been reset at decide() entry. The
+    companion ``_last_claude_fail`` historically was NOT — set inside
+    ``_claude_call`` and never re-cleared on a cycle that skipped the call
+    entirely (the pre-flight ``host_saturated`` path). A prior cycle's tag
+    then leaked into the new cycle's ``summary["last_claude_fail"]`` and
+    into the ``decisions.reasoning`` "claude returned no response (...)"
+    text. The visible effect was masked on the host-saturated arm by
+    runner._no_decision_cause's priority ladder, but the per-cycle
+    contract was broken for any non-host fault that followed a
+    host-saturated cycle.
+
+    Locks the per-cycle reset for BOTH globals so a future regression
+    that drops either reset is caught by CI.
+    """
+
+    def test_decide_clears_quota_exhausted_at_entry(self, monkeypatch):
+        # Simulate leftover state from a prior cycle that hit a quota wall.
+        strategy._quota_exhausted = True
+        # Make decide() take the short host_sat path so the test doesn't
+        # actually call out to claude / yfinance / etc.
+        monkeypatch.setattr(strategy, "host_saturated",
+                            lambda: (True, "host saturated: load=99"))
+        # Stub every external touchpoint to a deterministic empty.
+        monkeypatch.setattr(strategy.market, "is_market_open", lambda: False)
+        monkeypatch.setattr(strategy, "_portfolio_snapshot",
+                            lambda store: {"cash": 1000.0, "total_value": 1000.0,
+                                            "open_value": 0.0, "positions": []})
+        monkeypatch.setattr(strategy.signals, "get_top_signals",
+                            lambda *a, **k: [])
+        monkeypatch.setattr(strategy.signals, "get_urgent_articles",
+                            lambda *a, **k: [])
+        monkeypatch.setattr(strategy.signals, "ticker_sentiments",
+                            lambda *a, **k: [])
+        monkeypatch.setattr(strategy.market, "get_prices", lambda *a, **k: {})
+        monkeypatch.setattr(strategy.market, "get_futures_price",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(strategy.market, "benchmark_sp500", lambda: None)
+        monkeypatch.setattr(strategy, "get_quant_signals_live",
+                            lambda *a, **k: {})
+        class _FakeStore:
+            def open_positions(self): return []
+            def get_portfolio(self):
+                return {"cash": 1000.0, "total_value": 1000.0,
+                        "positions": [], "last_updated": ""}
+            def recent_trades(self, n=2000): return []
+            def recent_decisions(self, limit=3000): return []
+            def equity_curve(self, limit=5000): return []
+            def record_decision(self, *a, **k): return 1
+            def record_equity_point(self, *a, **k): return None
+        monkeypatch.setattr(strategy, "get_store", lambda: _FakeStore())
+        summary = strategy.decide()
+        # The skip path produces a NO_DECISION; _quota_exhausted must NOT be
+        # leaked into summary["quota_exhausted"] from the prior cycle.
+        assert summary["status"] == "NO_DECISION"
+        assert summary["quota_exhausted"] is False, (
+            "decide() leaked stale _quota_exhausted from a prior cycle")
+
+    def test_decide_clears_last_claude_fail_at_entry(self, monkeypatch):
+        """The per-cycle reset must also clear ``_last_claude_fail`` so a
+        cycle that takes the host_saturated pre-flight skip path (no
+        ``_claude_call`` invocation) does not surface the prior cycle's
+        timeout/empty/rc!=0 tag in this cycle's summary. The host-saturated
+        arm of ``_no_decision_cause`` historically masked the visible Discord
+        breaker-alert effect, but the per-cycle contract was still broken on
+        any subsequent non-host fault path."""
+        strategy._last_claude_fail = "timeout"  # leftover from a prior cycle
+        strategy._quota_exhausted = False
+        monkeypatch.setattr(strategy, "host_saturated",
+                            lambda: (True, "host saturated: load=99"))
+        monkeypatch.setattr(strategy.market, "is_market_open", lambda: False)
+        monkeypatch.setattr(strategy, "_portfolio_snapshot",
+                            lambda store: {"cash": 1000.0, "total_value": 1000.0,
+                                            "open_value": 0.0, "positions": []})
+        monkeypatch.setattr(strategy.signals, "get_top_signals",
+                            lambda *a, **k: [])
+        monkeypatch.setattr(strategy.signals, "get_urgent_articles",
+                            lambda *a, **k: [])
+        monkeypatch.setattr(strategy.signals, "ticker_sentiments",
+                            lambda *a, **k: [])
+        monkeypatch.setattr(strategy.market, "get_prices", lambda *a, **k: {})
+        monkeypatch.setattr(strategy.market, "get_futures_price",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(strategy.market, "benchmark_sp500", lambda: None)
+        monkeypatch.setattr(strategy, "get_quant_signals_live",
+                            lambda *a, **k: {})
+        class _FakeStore:
+            def open_positions(self): return []
+            def get_portfolio(self):
+                return {"cash": 1000.0, "total_value": 1000.0,
+                        "positions": [], "last_updated": ""}
+            def recent_trades(self, n=2000): return []
+            def recent_decisions(self, limit=3000): return []
+            def equity_curve(self, limit=5000): return []
+            def record_decision(self, *a, **k): return 1
+            def record_equity_point(self, *a, **k): return None
+        monkeypatch.setattr(strategy, "get_store", lambda: _FakeStore())
+        summary = strategy.decide()
+        assert summary["status"] == "NO_DECISION"
+        assert summary["host_saturated"] is True
+        # The fix: _last_claude_fail must NOT carry over from the prior
+        # cycle into this cycle's summary.
+        assert summary["last_claude_fail"] is None, (
+            "decide() leaked stale _last_claude_fail from a prior cycle — "
+            "the per-cycle reset regressed")
+        # And the module global itself is also clean post-cycle.
+        assert strategy._last_claude_fail is None
+
+
 # ─────────────────────────── indicator helpers ───────────────────────────
 
 class TestRSILive:
