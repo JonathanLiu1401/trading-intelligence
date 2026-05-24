@@ -186,6 +186,28 @@ STOP_OUT_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 MFE_SKILL_LOG = ROOT / "data" / "mfe_skill_log.jsonl"
 MFE_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 
+# Per-cycle gate-arm historical skill ledger. ``gate_arm_historical.analyze``
+# answers the documented quant-decisive question about the conviction gate
+# arms (×0.6 / ×0.85 / ×1.0 / ×1.15 / ×1.3): *do the arms the gate actually
+# fired at decision time (decoded from the persisted ``gate_scorer_pred``)
+# realize differentiated economic outcomes, or is the bucketing just noise?*
+# This is the truth-aware sibling of ``gate_audit`` — it reads the gate's
+# real then-deployed prediction rather than re-predicting with today's
+# pickle, so it pinpoints the gate's actual historical economic effect
+# (the quantity ``gate_pnl`` itself documents as outside its verdict
+# scope). The current OOS slice verdict is ``GATE_INEFFECTIVE`` (×1.30 arm
+# +3.99% vs ×0.60 arm +4.12% — spread -0.13pp, sub-tolerance) and the
+# scorer's strong measured rank-IC (+0.48 OOS) does NOT translate into
+# arm-bucket skill (``arm_monotone_fraction=0.5``) — exactly the kind of
+# state a skeptical quant needs trended per cycle to see whether bucket
+# tuning recovers economic edge. Until this wiring landed it was CLI-only
+# with no durable trend. Same testability rule as the sibling skill logs
+# (module-level so tests can redirect), same best-effort discipline (a
+# ledger write must never break the loop), same atomic tmp + ``.replace``
+# trim idiom every other ledger uses.
+GATE_ARM_SKILL_LOG = ROOT / "data" / "gate_arm_skill_log.jsonl"
+GATE_ARM_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 # Per-cycle conviction-sizing calibration ledger. ``conviction_calibration``
 # already answers, durably, the most economically decisive question about the
 # `_ml_decide` gate's sizing arm (×0.6 / ×0.85 / ×1.15 / ×1.3) on top of the
@@ -2365,6 +2387,155 @@ def _append_mfe_skill_log(cycle: int, win_start: date, win_end: date,
         return False
 
 
+def _append_gate_arm_skill_log(cycle: int, win_start: date, win_end: date,
+                               outcomes_path: "Path | str | None" = None
+                               ) -> bool:
+    """Append one structured row to the per-cycle gate-arm historical skill
+    ledger.
+
+    Answers, durably and per-cycle: *do the conviction gate's arms
+    (×0.6 / ×0.85 / ×1.0 / ×1.15 / ×1.3) — bucketed by the gate's TRUE
+    then-deployed prediction (``gate_scorer_pred``, not a counterfactual
+    re-predict with today's pickle) — realize differentiated economic
+    outcomes, or is the bucketing just noise?* Reuses
+    ``gate_arm_historical.analyze`` verbatim so the persisted verdict
+    equals the read-only CLI's by construction — a built-in no-drift
+    cross-check, the same idiom every sibling ``_append_*_skill_log``
+    uses.
+
+    Why this matters: the deployed scorer carries strong measured OOS
+    rank-IC (+0.48 on the live OOS tail) — but ``gate_arm_historical``
+    reports ``GATE_INEFFECTIVE`` because the actual bucket assignment
+    only captures ~1% of that rank skill (the ×1.30 arm realizes
+    +3.99% vs the ×0.60 arm's +4.12%, spread -0.13pp). That gap is the
+    most economically decisive *unmonitored* fact about the gate: the
+    model ranks but the buckets don't extract. A skeptical quant needs
+    to know if/when bucket tuning recovers economic edge — and the
+    moment historic data sees the arms diverge (a real ``GATE_EFFECTIVE``
+    cycle) — without manually invoking the CLI. The
+    ``arm_monotone_fraction`` (1.0 = perfectly ordered, 0.5 = coin
+    flip) is the single best one-shot signal of bucket health.
+
+    Best-effort and idempotent-safe: every fault is swallowed (a ledger
+    write must NEVER break the continuous loop — the same discipline as
+    every other ``_append_*_skill_log``). On any fault we still emit an
+    honest row with ``status='error' verdict='INSUFFICIENT_DATA'`` so a
+    gap in the trend is visible, not silent. Bounded growth: when the
+    file exceeds 2× ``GATE_ARM_SKILL_LOG_KEEP`` it is atomically
+    rewritten via the tmp+``.replace`` idiom every sibling ledger uses.
+
+    The ``gate_dark`` boolean mirrors the sibling ledgers' ``*_dark``
+    flags (``pipeline_dark`` / ``calibrated_dark`` / ``sizing_dark`` /
+    ``stop_dark`` / ``tp_dark``): True when zero BUY rows carry a
+    parseable ``gate_scorer_pred`` (the documented state before the
+    2026-05-18 ``_parse_gate_decision`` feature shipped, or any cycle
+    where ``n_train<500`` so the gate never acted). False means the
+    analyzer actually had real then-deployed-prediction data to
+    bucket.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        try:
+            from paper_trader.ml import gate_arm_historical as _gah
+            rep = _gah.analyze(outcomes_path, oos_only=True)
+        except Exception as exc:
+            rep = {
+                "status": "error", "verdict": "INSUFFICIENT_DATA",
+                "hint": f"gate_arm_historical unavailable: "
+                        f"{type(exc).__name__}",
+                "n": 0, "arms": [],
+                "strong_tailwind_minus_headwind_pp": None,
+                "arm_monotone_fraction": None,
+                "n_dropped_no_gate_pred": 0,
+                "n_dropped_off_dist": 0,
+                "n_dropped_no_return": 0,
+            }
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA"}
+
+        # ``gate_dark`` is True when zero BUYs carried a parseable
+        # ``gate_scorer_pred`` — the historical corpus pre-dates the
+        # 2026-05-18 capture, or every recent cycle ran sub-gate
+        # (``n_train<500``). Once post-capture rows accumulate the
+        # boolean flips on its own. Same logic as sibling ``*_dark``.
+        n_obs = int(rep.get("n") or 0)
+        gate_dark = (n_obs == 0)
+
+        # Extract per-arm realized returns into flat columns so a JSON
+        # consumer can query without parsing the nested ``arms`` list.
+        # The list still ships intact for completeness; the flat columns
+        # are the ergonomic surface (``mean_x06`` / ``mean_x13`` etc.).
+        # Use 2-decimal mapped keys per multiplier to keep the schema
+        # stable even if ``_ARM_MULT`` ever extends.
+        arms = rep.get("arms") or []
+        _MULT_TO_KEY = {0.6: "x06", 0.85: "x085", 1.0: "x10",
+                        1.15: "x115", 1.3: "x13"}
+        per_arm_mean: dict[str, float | None] = {}
+        per_arm_n: dict[str, int] = {}
+        for a in arms:
+            try:
+                mult = float(a.get("multiplier") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            key = _MULT_TO_KEY.get(round(mult, 2))
+            if key is None:
+                continue
+            mr = a.get("mean_realized")
+            try:
+                per_arm_mean[f"mean_{key}"] = (None if mr is None
+                                               else round(float(mr), 4))
+            except (TypeError, ValueError):
+                per_arm_mean[f"mean_{key}"] = None
+            try:
+                per_arm_n[f"n_{key}"] = int(a.get("n") or 0)
+            except (TypeError, ValueError):
+                per_arm_n[f"n_{key}"] = 0
+
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": rep.get("verdict"),
+            "n": n_obs,
+            "slice": rep.get("slice"),
+            "outcomes_n": rep.get("outcomes_n"),
+            "strong_tailwind_minus_headwind_pp":
+                rep.get("strong_tailwind_minus_headwind_pp"),
+            "arm_monotone_fraction": rep.get("arm_monotone_fraction"),
+            "n_dropped_no_gate_pred": rep.get("n_dropped_no_gate_pred"),
+            "n_dropped_off_dist": rep.get("n_dropped_off_dist"),
+            "n_dropped_no_return": rep.get("n_dropped_no_return"),
+            "gate_dark": gate_dark,
+            **per_arm_mean,
+            **per_arm_n,
+        }
+        GATE_ARM_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with GATE_ARM_SKILL_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in
+                     GATE_ARM_SKILL_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > GATE_ARM_SKILL_LOG_KEEP * 2:
+                kept = lines[-GATE_ARM_SKILL_LOG_KEEP:]
+                tmp = GATE_ARM_SKILL_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(GATE_ARM_SKILL_LOG)
+        except Exception as e:
+            print(f"[continuous] gate-arm-skill-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] gate-arm-skill-log append failed: {e}")
+        return False
+
+
 def _parse_published_date(published) -> date | None:
     """Parse a `published` value (ISO or RFC822) into a date; None if unparseable."""
     if not published:
@@ -3331,6 +3502,21 @@ def main() -> None:
         # dominated by pre-feature rows. Best-effort; never breaks the
         # loop.
         _append_mfe_skill_log(cycle, win_start, win_end)
+
+        # Durable per-cycle gate-arm historical skill ledger.
+        # ``gate_arm_historical.analyze`` answers the documented
+        # quant-decisive question: *do the conviction gate's arms
+        # (×0.6 / ×0.85 / ×1.0 / ×1.15 / ×1.3) — bucketed by the gate's
+        # TRUE then-deployed prediction — realize differentiated
+        # economic outcomes, or is the bucketing just noise?* The
+        # current OOS verdict is ``GATE_INEFFECTIVE``: the deployed
+        # scorer carries strong OOS rank-IC (+0.48) but the bucket
+        # assignment captures only a -0.13pp spread between the ×1.30
+        # arm and the ×0.60 arm. Until this wiring landed that gap was
+        # CLI-only with no durable trend — a quant could not see the
+        # moment bucket tuning recovers real arm divergence. Best-effort
+        # by construction; never breaks the loop.
+        _append_gate_arm_skill_log(cycle, win_start, win_end)
 
         ml_status = _try_train_ml() if winner else "no winner"
         print(f"[continuous] ml: {ml_status}")
