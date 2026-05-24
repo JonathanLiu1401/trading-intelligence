@@ -150,6 +150,42 @@ LLM_ANNOTATION_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 CALIBRATED_RELIABILITY_LOG = ROOT / "data" / "calibrated_reliability_log.jsonl"
 CALIBRATED_RELIABILITY_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 
+# Per-cycle stop-out skill ledger. ``stop_out_audit`` already answers,
+# durably, the most economically decisive question about the inherited
+# ``backtest._buy`` ``stop_loss = price * 0.92`` band (the -8% downside
+# arm) — *does the stop actually save more from limited-loss trades than
+# it costs in prematurely-exited recoveries, or is it variance-only chop
+# the gate would do better without?* The verdict (STOP_HELPS / STOP_HURTS /
+# STOP_NEUTRAL / INSUFFICIENT_DATA) consumes the 2026-05-23
+# ``forward_intraperiod_min_5d`` column, but until this ledger landed the
+# audit was a CLI-only signal an operator had to manually invoke. The
+# historical 8753-row corpus pre-dates the intraperiod feature, so the
+# *immediate* state is INSUFFICIENT_DATA on every cycle — the ledger
+# surfaces THAT honestly (``stop_dark=True``) so the moment new
+# post-feature outcome rows accumulate enough to flip the verdict is
+# observable in the trend, not invisible. Same testability rule as the
+# sibling skill logs (module-level so tests can redirect), same best-
+# effort discipline (a ledger write must never break the loop), same
+# atomic tmp + ``.replace`` trim idiom every other ledger uses.
+STOP_OUT_SKILL_LOG = ROOT / "data" / "stop_out_skill_log.jsonl"
+STOP_OUT_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
+# Per-cycle MFE-conversion / take-profit skill ledger. Sibling to
+# ``STOP_OUT_SKILL_LOG`` on the matching upside arm: ``mfe_conversion``
+# answers *does the inherited ``take_profit = price * 1.15`` band
+# (+15% upside arm) capture more upside than it forfeits in trades that
+# would have recovered further?* The verdict (TP_HELPS / TP_HURTS /
+# TP_NEUTRAL / INSUFFICIENT_DATA) consumes the matching 2026-05-23
+# ``forward_intraperiod_max_5d`` column. Same wiring rationale — without
+# the per-cycle ledger the take-profit's realized economic effect was a
+# CLI-only one-shot answer. The mean MFE-conversion ratio (endpoint / mfe)
+# is the textbook quant "did this trade's peak get captured" signal a
+# skeptical quant rides; persisting it per cycle makes that trendable.
+# Same testability / best-effort / atomic-trim discipline as every
+# sibling ledger.
+MFE_SKILL_LOG = ROOT / "data" / "mfe_skill_log.jsonl"
+MFE_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 # Per-cycle conviction-sizing calibration ledger. ``conviction_calibration``
 # already answers, durably, the most economically decisive question about the
 # `_ml_decide` gate's sizing arm (×0.6 / ×0.85 / ×1.15 / ×1.3) on top of the
@@ -2118,6 +2154,217 @@ def _append_conviction_calibration_log(cycle: int, win_start: date,
         return False
 
 
+def _append_stop_out_skill_log(cycle: int, win_start: date,
+                                win_end: date,
+                                outcomes_path: "Path | str | None" = None
+                                ) -> bool:
+    """Append one structured row to the per-cycle stop-out skill ledger.
+
+    Answers, durably and per-cycle: *is the inherited ``backtest._buy``
+    ``stop_loss = price * 0.92`` band (the -8% downside arm) a real
+    defensive arm — saving more from limited-loss trades than it costs
+    in prematurely-exited recoveries — or is it variance-only chop?*
+    Reuses ``stop_out_audit.analyze`` verbatim so the persisted verdict
+    equals the read-only CLI's by construction — a built-in no-drift
+    cross-check, the same idiom every sibling
+    ``_append_*_skill_log`` / ``_append_*_calibration_log`` uses.
+
+    Best-effort and idempotent-safe: every fault is swallowed (a ledger
+    write must NEVER break the continuous loop — the documented
+    ``_append_scorer_skill_log`` discipline). On any fault we still emit
+    an honest row with ``status='error' verdict='INSUFFICIENT_DATA'`` so
+    a gap in the trend is visible, not silent. Bounded growth: when the
+    file exceeds 2× ``STOP_OUT_SKILL_LOG_KEEP`` it is atomically
+    rewritten via the decision_outcomes trim idiom (tmp + ``.replace``
+    so a torn truncate cannot lose skill history).
+
+    The ``stop_dark`` boolean mirrors the sibling ledgers' ``*_dark``
+    flag (``pipeline_dark`` / ``calibrated_dark`` / ``sizing_dark``):
+    True when zero BUY rows carry a finite ``forward_intraperiod_min_5d``
+    (the documented current state — the 8753-row historical corpus
+    pre-dates the 2026-05-23 intraperiod feature, so older corpora
+    look ``stop_dark`` honestly). False means the analyzer actually had
+    intraperiod data to work with.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        try:
+            from paper_trader.ml import stop_out_audit as _soa
+            rep = _soa.analyze(outcomes_path)
+        except Exception as exc:
+            rep = {
+                "status": "error", "verdict": "INSUFFICIENT_DATA",
+                "hint": f"stop_out_audit unavailable: {type(exc).__name__}",
+                "stop_pct": None, "n_buys": 0, "n_with_intraperiod": 0,
+                "n_stop_triggered": 0, "pct_stop_triggered": None,
+                "mean_realized_return_pct": None,
+                "mean_stop_protected_return_pct": None,
+                "stop_benefit_pct": None,
+                "median_realized_return_pct": None,
+                "median_stop_protected_return_pct": None,
+            }
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA"}
+
+        # ``stop_dark`` is True when zero BUYs carry a finite
+        # ``forward_intraperiod_min_5d`` — the documented "older
+        # corpora pre-date the 2026-05-23 feature" state. Once the
+        # rolling 5000-record training tail is dominated by post-feature
+        # rows the boolean flips on its own — no manual reset needed.
+        n_intra = int(rep.get("n_with_intraperiod") or 0)
+        stop_dark = (n_intra == 0)
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": rep.get("verdict"),
+            "stop_pct": rep.get("stop_pct"),
+            "n_buys": rep.get("n_buys"),
+            "n_with_intraperiod": n_intra,
+            "n_stop_triggered": rep.get("n_stop_triggered"),
+            "pct_stop_triggered": rep.get("pct_stop_triggered"),
+            "mean_realized_return_pct": rep.get("mean_realized_return_pct"),
+            "mean_stop_protected_return_pct":
+                rep.get("mean_stop_protected_return_pct"),
+            "stop_benefit_pct": rep.get("stop_benefit_pct"),
+            "median_realized_return_pct":
+                rep.get("median_realized_return_pct"),
+            "median_stop_protected_return_pct":
+                rep.get("median_stop_protected_return_pct"),
+            "stop_dark": stop_dark,
+        }
+        STOP_OUT_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with STOP_OUT_SKILL_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in
+                     STOP_OUT_SKILL_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > STOP_OUT_SKILL_LOG_KEEP * 2:
+                kept = lines[-STOP_OUT_SKILL_LOG_KEEP:]
+                tmp = STOP_OUT_SKILL_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(STOP_OUT_SKILL_LOG)
+        except Exception as e:
+            print(f"[continuous] stop-out-skill-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] stop-out-skill-log append failed: {e}")
+        return False
+
+
+def _append_mfe_skill_log(cycle: int, win_start: date, win_end: date,
+                          outcomes_path: "Path | str | None" = None
+                          ) -> bool:
+    """Append one structured row to the per-cycle MFE-conversion /
+    take-profit skill ledger.
+
+    Answers, durably and per-cycle: *does the inherited ``backtest._buy``
+    ``take_profit = price * 1.15`` band (the +15% upside arm) capture
+    more upside than it forfeits in trades that would have recovered
+    further? And what fraction of the intraperiod peak (MFE — Maximum
+    Favorable Excursion) does the 5d endpoint actually retain?* The
+    mean-conversion-ratio question is the textbook quant signal for
+    "peak then crater" trade shape — a low ratio means a TP would have
+    captured peaks the bot let revert. Reuses ``mfe_conversion.analyze``
+    verbatim so the persisted verdict / ratio equal the CLI's by
+    construction — same SSOT cross-check pattern every sibling ledger
+    follows.
+
+    Same defensive contract as ``_append_stop_out_skill_log``: best-
+    effort, honest gap rows when the intraperiod corpus is empty
+    (``tp_dark=True``), atomic bounded trim, never breaks the loop.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        try:
+            from paper_trader.ml import mfe_conversion as _mfe
+            rep = _mfe.analyze(outcomes_path)
+        except Exception as exc:
+            rep = {
+                "status": "error", "verdict": "INSUFFICIENT_DATA",
+                "hint": f"mfe_conversion unavailable: {type(exc).__name__}",
+                "tp_pct": None, "n_buys": 0, "n_with_intraperiod": 0,
+                "n_tp_triggered": 0, "pct_tp_triggered": None,
+                "n_positive_mfe": 0, "n_reverted": 0, "pct_reverted": None,
+                "mean_realized_return_pct": None,
+                "mean_tp_protected_return_pct": None,
+                "tp_benefit_pct": None,
+                "median_realized_return_pct": None,
+                "median_tp_protected_return_pct": None,
+                "mean_mfe_pct": None, "median_mfe_pct": None,
+                "mean_conversion_ratio": None,
+                "median_conversion_ratio": None,
+            }
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA"}
+
+        # ``tp_dark`` mirrors the stop-out ledger's ``stop_dark``. True
+        # when zero BUYs carry a finite ``forward_intraperiod_max_5d``
+        # — the documented current state until post-feature rows
+        # dominate the training tail.
+        n_intra = int(rep.get("n_with_intraperiod") or 0)
+        tp_dark = (n_intra == 0)
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": rep.get("verdict"),
+            "tp_pct": rep.get("tp_pct"),
+            "n_buys": rep.get("n_buys"),
+            "n_with_intraperiod": n_intra,
+            "n_tp_triggered": rep.get("n_tp_triggered"),
+            "pct_tp_triggered": rep.get("pct_tp_triggered"),
+            "n_positive_mfe": rep.get("n_positive_mfe"),
+            "n_reverted": rep.get("n_reverted"),
+            "pct_reverted": rep.get("pct_reverted"),
+            "mean_realized_return_pct": rep.get("mean_realized_return_pct"),
+            "mean_tp_protected_return_pct":
+                rep.get("mean_tp_protected_return_pct"),
+            "tp_benefit_pct": rep.get("tp_benefit_pct"),
+            "median_realized_return_pct":
+                rep.get("median_realized_return_pct"),
+            "median_tp_protected_return_pct":
+                rep.get("median_tp_protected_return_pct"),
+            "mean_mfe_pct": rep.get("mean_mfe_pct"),
+            "median_mfe_pct": rep.get("median_mfe_pct"),
+            "mean_conversion_ratio": rep.get("mean_conversion_ratio"),
+            "median_conversion_ratio": rep.get("median_conversion_ratio"),
+            "tp_dark": tp_dark,
+        }
+        MFE_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with MFE_SKILL_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in MFE_SKILL_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > MFE_SKILL_LOG_KEEP * 2:
+                kept = lines[-MFE_SKILL_LOG_KEEP:]
+                tmp = MFE_SKILL_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(MFE_SKILL_LOG)
+        except Exception as e:
+            print(f"[continuous] mfe-skill-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] mfe-skill-log append failed: {e}")
+        return False
+
+
 def _parse_published_date(published) -> date | None:
     """Parse a `published` value (ISO or RFC822) into a date; None if unparseable."""
     if not published:
@@ -3058,6 +3305,32 @@ def main() -> None:
         # tell whether the sizing rule starts to work or stays flat. Best-
         # effort by construction; never breaks the loop.
         _append_conviction_calibration_log(cycle, win_start, win_end)
+
+        # Durable per-cycle stop-out skill ledger. ``stop_out_audit``
+        # answers whether the inherited ``_buy`` ``stop_loss = price * 0.92``
+        # band actually saves more from limited-loss trades than it costs
+        # in prematurely-exited recoveries — the single most directly
+        # operational risk-management question about the gate. Until this
+        # wiring landed it was CLI-only, with no durable trend an
+        # unattended loop could surface; the historical 8753-row corpus
+        # pre-dates the 2026-05-23 intraperiod feature so the immediate
+        # state is INSUFFICIENT_DATA (``stop_dark=True``) on every cycle.
+        # The ledger surfaces THAT honestly so the moment new post-feature
+        # outcome rows accumulate enough to flip the verdict is visible in
+        # the trend. Best-effort by construction; never breaks the loop.
+        _append_stop_out_skill_log(cycle, win_start, win_end)
+
+        # Durable per-cycle MFE-conversion / take-profit skill ledger.
+        # Sibling to the stop-out ledger on the matching upside arm:
+        # answers whether the inherited ``take_profit = price * 1.15``
+        # band captures more upside than it forfeits AND what fraction
+        # of the intraperiod peak the 5d endpoint actually retains (the
+        # textbook quant "peak then crater" signal). Same operational
+        # rationale — CLI-only until this wiring, and the immediate
+        # state is ``tp_dark=True`` on every cycle while the corpus is
+        # dominated by pre-feature rows. Best-effort; never breaks the
+        # loop.
+        _append_mfe_skill_log(cycle, win_start, win_end)
 
         ml_status = _try_train_ml() if winner else "no winner"
         print(f"[continuous] ml: {ml_status}")
