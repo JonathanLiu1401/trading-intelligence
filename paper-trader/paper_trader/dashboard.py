@@ -12372,6 +12372,46 @@ def decision_cadence_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/cycle-gap-summary")
+def cycle_gap_summary_api():
+    """Historical view of inter-decision gaps vs the dynamic cadence floor —
+    the missing companion to ``/api/decision-cadence``.
+
+    ``/api/decision-cadence`` answers "is the CURRENT cycle on schedule?".
+    This endpoint answers the orthogonal historical question: "of the LAST
+    N cycles, how many actually fired on the schedule the runner asked
+    for? Was the loop SMOOTH or did it lurch through long gaps?". Walks
+    the last 100 decision rows newest→oldest, summarises pairwise gaps
+    (median / p95 / max / worst), and emits a 4-state verdict:
+
+      * ``NO_DATA``      — < 2 decisions in the window
+      * ``INSUFFICIENT`` — fewer than ``MIN_GAPS`` (8) usable gaps
+      * ``SMOOTH``       — cadence within the expected window
+      * ``JITTERY``      — coefficient of variation > 1.0 (lurchy)
+      * ``STALLED``      — any single gap ≥ ``STALL_GAP_S`` (10800s)
+                           OR p95 ≥ ``STALL_P95_S`` (7200s — longest
+                           healthy tier, indicating multiple wedges)
+
+    Pure read — no DB writes, no network. Advisory only — never gates
+    Opus, never blocks a trade (AGENTS.md #2/#12 — same observational
+    contract as ``/api/decision-cadence`` next to it). Tests pinned in
+    ``tests/test_cycle_gap_summary.py``.
+    """
+    try:
+        from .analytics.cycle_gap_summary import (
+            DEFAULT_LIMIT,
+            build_cycle_gap_summary,
+        )
+        store = get_store()
+        # ``recent_decisions(limit=N)`` is newest-first — exactly the
+        # orientation ``build_cycle_gap_summary`` consumes.
+        return jsonify(build_cycle_gap_summary(
+            store.recent_decisions(limit=DEFAULT_LIMIT)
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/repeat-loser")
 def repeat_loser_api():
     """Per-ticker losing-streak detector — the per-ticker companion to
