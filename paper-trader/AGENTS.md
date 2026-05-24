@@ -22482,3 +22482,76 @@ python3 -m pytest tests/ -v                                  # full (~25min unde
 python3 -m pytest tests/test_core_market.py -q -k GetPricesBulk   # Phase 1 fix
 python3 -m pytest tests/test_runner_heartbeat.py -q               # Phase 2 feature
 ```
+
+
+---
+
+## 2026-05-24 agent4 (feature-dev) pass — watchlist-exploration drought
+
+Two new advisory analytics + endpoints. Both surface failure modes that
+the existing 176-endpoint surface didn't ask about. Both follow the pure-
+builder + endpoint-wires-the-store pattern of `no_decision_recovery`
+(AGENTS.md invariants #2/#12 — never gates Opus, no caps, no path to
+`_execute()`).
+
+### `/api/initiation-drought` (`paper_trader/analytics/initiation_drought.py`)
+
+Time since the bot last *initiated* a position on a NET-NEW ticker, vs
+re-cycles of names it's already bought. Different from
+`/api/decision-drought` (NO_DECISION pace + $ alpha), `/api/concentration-
+trajectory` ($-HHI of OPEN positions) and `/api/churn` (round-trip
+turnover). Answers **"is the bot still exploring its watchlist or has it
+become obsessed with a handful of names?"** — currently surfacing
+`RECYCLING` for the live book (9 buys / 3 distinct names — DRAM, NVDA,
+TQQQ — last new entry 105 hours ago, watchlist coverage 6.25% of 48
+names).
+
+Verdict ladder: `NO_DATA` / `INSUFFICIENT_HISTORY` / `EXPLORING` /
+`STEADY` / `RECYCLING` / `STUCK_ON_NAMES`. Watchlist coverage % is
+populated when `strategy.WATCHLIST` is importable, with a 20-name
+`watchlist_unseen` sample. Inputs are `store.recent_trades(2000)`
+newest-first plus the optional watchlist list. Builder is pure, the
+endpoint owns the store read (the `no_decision_recovery` split). Full
+coverage in `tests/test_initiation_drought.py` (19 tests including
+canonical-predicate drift, recycle arithmetic, watchlist case/dedupe,
+EXPLORING-beats-RECYCLING tie-break).
+
+### `/api/first-trade-after-drought` (`paper_trader/analytics/first_trade_after_drought.py`)
+
+Characterises the first FILLED trade after each completed NO_DECISION
+drought (≥5 cycles by default). For each post-drought trade, records
+whether it was on a brand-new ticker and whether it was a flip of a
+SELL within the prior 24 hours. Compares post-drought new-rate and
+flip-rate against the rest of the ledger and surfaces a verdict:
+`DROUGHT_EXPLORATION` (post-drought first-trades are mostly fresh
+tickers — arguably healthy), `STEADY_RECOVERY`, `PANIC_RECYCLE`
+(post-drought first-trades skew heavily to familiar names; the live
+shape currently — 0% new-name rate vs 33% normal), `PANIC_FLIP`
+(post-drought first-trades are mostly same-ticker reversals).
+Withheld until ≥3 post-drought fills accumulate (the
+`trade_asymmetry` / `churn` STABLE idiom). Per-event records
+(`drought_end_ts`, `trade_ts`, `is_new_ticker`, `is_flip`) are capped
+at 20 newest-first.
+
+Inputs: `store.recent_decisions(500)` newest-first and
+`store.recent_trades(500)` newest-first. Builder is pure and uses the
+canonical `_is_no_decision` predicate verbatim (drift-locked by unit
+test, AGENTS.md invariant #10 single-source-of-truth idiom). Full
+coverage in `tests/test_first_trade_after_drought.py` (17 tests
+including PANIC_FLIP / DROUGHT_EXPLORATION ladder, flip-window
+boundary, shared-trade dedupe across back-to-back droughts,
+open-drought-at-end exclusion).
+
+### Why these two
+
+The unified dashboard already prices the cost of NO_DECISION storms in
+alpha (`/api/decision-drought` `alpha_pct`) and grades how long they
+last (`/api/no-decision-recovery`). What it didn't have was a view
+of **what the bot does between storms** — does it explore the
+watchlist or recycle the same two names? **And what does it do the
+moment a storm ends** — open a fresh idea or grab a familiar name?
+The 2026-05-24 12:13 UTC live snapshot proved both questions were
+load-bearing: the bot has explored 6% of its 48-name watchlist over
+6 days and 0% of its post-drought trades are on net-new names — both
+invisible in the existing surface.
+
