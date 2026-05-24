@@ -214,6 +214,47 @@ def next_session_open(now: datetime | None = None) -> datetime | None:
     return None
 
 
+def previous_session_close(now: datetime | None = None) -> datetime | None:
+    """The most recent NYSE session close at or before ``now`` (16:00 ET
+    regular / 13:00 ET half-day).
+
+    Returns a UTC-aware datetime, or ``None`` when no NYSE close day can
+    be found within 14 backward days (defensive cap; the calendar has no
+    >4-day gap). Mirror of ``next_session_close`` walking the opposite
+    direction:
+
+      * Mid-session weekday → YESTERDAY's close (today's close is in the
+        future and so is not "previous").
+      * Past today's close (e.g. 17:00 ET) → TODAY's close (the bell that
+        just rang).
+      * Weekend / holiday → the LAST trading day's close before now.
+      * Half-day → 13:00 ET, not 16:00, on the half-day itself.
+
+    Pure: walks NYSE_HOLIDAYS_2026 / NYSE_HALF_DAYS_2026 / weekday from
+    ``now`` backward, no I/O. Used by the closure-window analytics to
+    measure "how long has the bell been silent" without the caller
+    re-deriving the holiday calendar.
+    """
+    now_utc = (now or datetime.now(UTC)).astimezone(UTC)
+    now_ny = now_utc.astimezone(NY)
+    candidate = now_ny.date()
+    for _ in range(14):
+        is_trading_day = (
+            candidate.weekday() < 5
+            and candidate not in NYSE_HOLIDAYS_2026
+        )
+        if is_trading_day:
+            close_min = close_minute(candidate)
+            close_dt_ny = datetime(
+                candidate.year, candidate.month, candidate.day,
+                close_min // 60, close_min % 60, tzinfo=NY,
+            )
+            if close_dt_ny <= now_ny:
+                return close_dt_ny.astimezone(UTC)
+        candidate = candidate - timedelta(days=1)
+    return None
+
+
 def _cached_price(ticker: str) -> float | None:
     rec = _PRICE_CACHE.get(ticker)
     if rec and time.time() - rec[1] < _PRICE_TTL:
