@@ -6,6 +6,137 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #23 (Agent 2) — `train_scorer` `llm_quality_label` robustness + `feature_correlation_audit`
+
+### Bug fix: `train_scorer` crashed on corrupted `llm_quality_label`
+
+`paper_trader/ml/decision_scorer.py::train_scorer` previously did
+`int(r.get("llm_quality_label") or 0)` — a single
+`decision_outcomes.jsonl` row with a string label ("ENDORSE"), list,
+dict, or any non-int-coercible scalar raised `ValueError`. The outer
+`_train_decision_scorer` try/except surfaced "scorer err: invalid
+literal for int()" and the **entire per-cycle retrain was silently
+skipped** until the bad row was manually purged from the 5000-record
+tail. The conviction gate (invariant #5) then froze for the duration
+because the deployed pickle's `n_train` stopped advancing past 500.
+
+Mirrors the `forward_return_5d` validation discipline a few lines
+above: try `int(...)` and degrade to the no-label arm (weight ×1.0) on
+any failure, rather than poisoning the whole batch with one row.
+Locked by `tests/test_scorer_llm_label_robustness.py` (7 tests covering
+string, list, dict, float-as-int, bool, None, and weight-arm fallback).
+
+### Feature: `paper_trader.ml.feature_correlation_audit`
+
+A new read-only diagnostic that asks: *are the scorer's 10 numeric
+inputs INDEPENDENT degrees of freedom, or are several effectively the
+same signal in different units?* The existing analyzers cover model
+architecture (`linear_probe`, `baseline_compare`) and feature
+importance (`feature_importance`) but none measure cross-input
+redundancy in the feature SPACE itself.
+
+```bash
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.feature_correlation_audit
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.feature_correlation_audit --oos
+cd /home/zeph/paper-trader && python3 -m paper_trader.ml.feature_correlation_audit --json
+```
+
+Verdict thresholds (textbook econometrics):
+
+| Verdict | Trigger |
+|---------|---------|
+| `INSUFFICIENT_DATA` | < 50 joint-complete rows |
+| `LOW_COLLINEARITY` | all pairs `|spearman| < 0.5` AND all VIF < 5 |
+| `MODERATE_COLLINEARITY` | any pair `|spearman| ∈ [0.5, 0.8)` OR any VIF ∈ [5, 10) |
+| `SEVERE_COLLINEARITY` | any pair `|spearman| ≥ 0.8` OR any VIF ≥ 10 |
+
+**Finding on the live corpus (run during this pass):** verdict =
+`SEVERE_COLLINEARITY`. Top pairs (n=370 joint-complete rows):
+
+```
+rsi           ↔ bb_position    +0.9056
+rsi           ↔ mom20          +0.8406
+mom5          ↔ bb_position    +0.7484
+mom20         ↔ bb_position    +0.7369
+rsi           ↔ mom5           +0.6440
+max VIF (rsi) = 9.29   (bb_position = 7.39)
+```
+
+`rsi` and `bb_position` carry ≈82% shared variance — they are
+effectively one signal in two units. The 10-feature MLP has fewer than
+10 effective inputs, which is a *structural* feature-space ceiling
+separate from architecture / training tuning. This is the
+quant-actionable explanation a reader has been missing for why a
+17-dim model historically did not consistently beat a one-liner.
+
+Counterpoint: the latest deployed pickle on the live corpus reports
+`MLP_ADDS_SKILL` (MLP rank_ic 0.36 vs best baseline `neg_bb` 0.075) —
+so the redundancy is real but the MLP is still recovering signal from
+the remaining independent inputs (`ml_score`, `macd`, `regime_mult`,
+`vol_ratio`, `news_urgency`, `news_count`, sector one-hot). Removing
+either `rsi` OR `bb_position` from `build_features` is a candidate
+follow-up — `linear_probe` then becomes a clean discriminator for
+whether dimensionality reduction recovers more skill.
+
+Locked by `tests/test_feature_correlation_audit.py` — 15 tests
+covering Spearman (perfect ±1, constant→0, short series), VIF
+(independent ~1.0, perfectly collinear explodes, constant column
+returns None), and the analyze() pipeline (insufficient data, low,
+severe, pair ordering, schema coverage).
+
+### Quant findings during validation (live corpus + deployed pickle)
+
+| Analyzer | Verdict | Headline number |
+|----------|---------|------------------|
+| `calibration --oos` | `WELL_CALIBRATED` | OOS Spearman 0.359, decile error 2.1pp |
+| `baseline_compare` | `MLP_ADDS_SKILL` | MLP rank_ic 0.359 vs best 1-liner 0.075 |
+| `gate_audit` | `GATE_EFFECTIVE` | tail−head spread +22.8pp on OOS |
+| `conviction_calibration` | `MISCALIBRATED` | base sizing rank_ic +0.011 (variance only) |
+| `feature_correlation_audit` (new) | `SEVERE_COLLINEARITY` | rsi↔bb_position Spearman 0.91 |
+
+The combined read: the *scorer* is in better shape than the historical
+"MLP_NO_BETTER_THAN_TRIVIAL" finding, and the *gate's multiplier*
+correctly differentiates good and bad bets (+22.8pp realized spread
+between strong_headwind and strong_tailwind arms) — but the *base
+conviction rule* (`min(0.25, ml_score/20)`) sizes randomly with no
+edge. The feature space carries cross-input redundancy that puts a
+structural ceiling on what model architecture alone can recover.
+
+### Operational finding (worth flagging to the operator)
+
+The continuous backtest loop is **not running**. Evidence:
+
+- `continuous.log` is from 2026-05-18 (5 days old)
+- `data/decision_outcomes.jsonl` last touched 2026-05-21
+- `data/scorer_skill_log.jsonl` contains exactly **one** row
+  (2026-05-22) — the per-cycle ledger has been dark for 24h+
+- `data/validation_results.json` does not exist (validation runs
+  every 10 cycles and we have not had 10 cycles since the ledger
+  was wired)
+
+The deployed pickle (`data/ml/decision_scorer.pkl`, last touched
+2026-05-23 07:20 with `n_train=4987`) appears to have been retrained
+out-of-band (manual `train_scorer` invocation), so the gate is alive
+on a current model — but the per-cycle skill trend a quant uses to
+catch regressions is effectively dark right now. The
+`run_continuous_backtests.py` process needs to be restarted.
+
+### Test commands
+
+```bash
+# Focused ML/backtest slice (~3.5 min):
+cd /home/zeph/trading-intelligence/paper-trader && \
+  python3 -m pytest tests/ -k "ml or backtest or scorer" --no-header -q
+# → 732 passed during this pass (was 659 before adding the two new files)
+
+# New tests only (~2s):
+cd /home/zeph/trading-intelligence/paper-trader && \
+  python3 -m pytest tests/test_scorer_llm_label_robustness.py tests/test_feature_correlation_audit.py -v
+# → 22 passed
+```
+
+---
+
 ## 2026-05-24 feature-dev pass (Agent 4) — `/api/decision-conditionals` — FORWARD-intent reasoning surface
 
 One new analyzer + endpoint surfaces the FORWARD slice of the reasoning
