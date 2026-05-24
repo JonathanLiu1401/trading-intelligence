@@ -16,6 +16,7 @@ from paper_trader.analytics.feed_health import (
     BLIND_STREAK_MIN,
     STALE_HOURS,
     SPLIT_BRAIN_GAP_H,
+    LIVE_MIN_SCORE,
 )
 
 NOW = datetime(2026, 5, 16, 14, 0, 0, tzinfo=timezone.utc)
@@ -268,3 +269,131 @@ def test_constants_echoed():
     assert out["blind_streak_min"] == BLIND_STREAK_MIN
     assert out["stale_hours"] == STALE_HOURS
     assert out["split_brain_gap_h"] == SPLIT_BRAIN_GAP_H
+    assert out["live_min_score"] == LIVE_MIN_SCORE
+
+
+# ─── UNSCORED_FEED sub-classification (digital-intern ML scorer down) ───────
+
+
+class TestUnscoredFeed:
+    """When a fresh DB is carrying rows but none clear the live trader's
+    ai_score gate, the operator action is "restart the ML scorer", not
+    "restart the collector". The classic BLIND headline conflated both
+    failure modes; the new ``unscored_feed`` flag + headline clause splits
+    them. Pure-builder callers that omit ``resolved_scored_2h`` must keep
+    their byte-identical pre-fix output (backwards-compatible)."""
+
+    def _feed_with_scored(self, live_2h, scored_2h, resolved_age_h=0.1):
+        f = _feed(resolved_age_h=resolved_age_h, live_2h=live_2h)
+        # Caller proves the scored count — distinct from omitting it (None
+        # → silent on the new dimension, byte-identical legacy behaviour).
+        f["resolved_scored_2h"] = scored_2h
+        return f
+
+    def test_unscored_flag_when_articles_arriving_but_zero_scored(self):
+        # 5-decision BLIND streak + fresh DB with 183 rows but 0 scored ≥4.0
+        # — the live 2026-05-24 pathology. Should set unscored_feed=True
+        # and surface a "restart scorer not collector" clause in the BLIND
+        # headline; the existing BLIND prefix stays byte-identical.
+        out = build_feed_health(
+            [_dec(i, 0) for i in range(5)],
+            self._feed_with_scored(live_2h=183, scored_2h=0),
+            now=NOW,
+        )
+        assert out["verdict"] == "BLIND"
+        assert out["unscored_feed"] is True
+        assert out["resolved_scored_2h"] == 0
+        assert "articles ARRIVING (183 in the last 2h)" in out["headline"]
+        assert "ai_score>=4.0" in out["headline"]
+        assert "scoring pipeline appears down" in out["headline"]
+        assert "restart the scorer" in out["headline"]
+        # The pre-fix BLIND prefix is preserved (additive contract — the new
+        # clause is *appended*, not a rewrite).
+        assert "BLIND — 5 consecutive decision(s) with 0 signals" in out["headline"]
+
+    def test_unscored_flag_FALSE_when_some_articles_scored(self):
+        # Fresh feed, some rows DO clear the gate — this is NOT the
+        # scorer-down case (whatever else is wrong, it's not "scorer dead").
+        out = build_feed_health(
+            [_dec(i, 0) for i in range(5)],
+            self._feed_with_scored(live_2h=183, scored_2h=12),
+            now=NOW,
+        )
+        assert out["verdict"] == "BLIND"
+        assert out["unscored_feed"] is False
+        assert out["resolved_scored_2h"] == 12
+        # No unscored clause emitted in the headline
+        assert "scoring pipeline" not in out["headline"]
+        assert "restart the scorer" not in out["headline"]
+
+    def test_unscored_flag_FALSE_when_no_articles_at_all(self):
+        # Truly no rows — this is the collector-down case (or systemic
+        # quiet), NOT the scorer-down case. The "unscored" gate must NOT
+        # fire here — "0 of 0 scored" is technically vacuous but emitting
+        # "restart the scorer" against a dead collector is the wrong
+        # action.
+        out = build_feed_health(
+            [_dec(i, 0) for i in range(5)],
+            self._feed_with_scored(live_2h=0, scored_2h=0),
+            now=NOW,
+        )
+        assert out["verdict"] == "BLIND"
+        assert out["unscored_feed"] is False
+        assert "scoring pipeline" not in out["headline"]
+
+    def test_unscored_clause_also_appended_to_stale_feed_headline(self):
+        # When the feed is BOTH stale AND every row is unscored (the
+        # double failure), the STALE_FEED headline picks up the same
+        # clause so the operator gets the diagnosis on either verdict
+        # rail (BLIND or STALE_FEED — verdict precedence still locked).
+        out = build_feed_health(
+            [_dec(1, 0), _dec(2, 0)],   # 2 streak — below BLIND threshold
+            self._feed_with_scored(
+                live_2h=20, scored_2h=0, resolved_age_h=STALE_HOURS + 1.0),
+            now=NOW,
+        )
+        assert out["verdict"] == "STALE_FEED"
+        assert out["unscored_feed"] is True
+        assert "scoring pipeline appears down" in out["headline"]
+        # The pre-fix STALE_FEED prefix is preserved.
+        assert "STALE_FEED — newest live article" in out["headline"]
+
+    def test_unscored_clause_NOT_appended_to_healthy_headline(self):
+        # Defensive: HEALTHY verdict means the trader IS receiving signals;
+        # the unscored clause would be nonsensical here. It must stay
+        # silent regardless of the scored_2h value.
+        out = build_feed_health(
+            [_dec(1, 5), _dec(2, 3)],
+            self._feed_with_scored(live_2h=183, scored_2h=0,
+                                   resolved_age_h=0.2),
+            now=NOW,
+        )
+        assert out["verdict"] == "HEALTHY"
+        assert "scoring pipeline" not in out["headline"]
+
+    def test_missing_scored_count_is_byte_identical_legacy_behaviour(self):
+        # Pure-builder caller that doesn't pass the new field (every
+        # existing test fixture). ``unscored_feed`` is False, the
+        # ``resolved_scored_2h`` echo is None, and the BLIND headline is
+        # the verbatim pre-fix string (no appended clause). This is the
+        # backward-compat contract — feeding tests below this class kept
+        # passing exactly because they never go through this gate.
+        decs = [_dec(i, 0) for i in range(14)]
+        out = build_feed_health(decs, _feed(resolved_age_h=20.0, live_2h=0),
+                                now=NOW)
+        assert out["verdict"] == "BLIND"
+        assert out["unscored_feed"] is False
+        assert out["resolved_scored_2h"] is None
+        assert "scoring pipeline" not in out["headline"]
+
+    def test_non_numeric_scored_count_falls_back_to_None(self):
+        # Defensive against a malformed feed dict from any callsite —
+        # garbage in resolved_scored_2h must NOT raise; degrade to None
+        # (legacy-byte-identical behaviour: no new clause).
+        f = _feed(resolved_age_h=0.1, live_2h=183)
+        f["resolved_scored_2h"] = "garbage"
+        out = build_feed_health([_dec(i, 0) for i in range(5)], f, now=NOW)
+        assert out["verdict"] == "BLIND"
+        assert out["unscored_feed"] is False
+        assert out["resolved_scored_2h"] is None
+        assert "scoring pipeline" not in out["headline"]
