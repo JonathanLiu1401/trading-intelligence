@@ -11001,6 +11001,182 @@ def idle_opportunity_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/opportunity-cost")
+@swr_cached("opportunity-cost", 300.0)
+def opportunity_cost_api():
+    """Grade past HOLD-CASH / NO_DECISION sit-outs against forward returns.
+
+    ``/api/idle-opportunity`` lists the high-score articles that arrived
+    during a CURRENT drought; ``/api/decision-drought`` reports the cumulative
+    drift cost. Neither answers the operator's hindsight-aware follow-up:
+    *when the bot sat in cash, did the watchlist actually run, or did sitting
+    in cash earn its keep?* This endpoint grades each historical sit-out by
+    the top-news-heat watchlist ticker's 1d/3d forward return from the
+    decision moment, then aggregates a single verdict over the window:
+    MISSED_ALPHA (≥50% of sit-outs preceded a runner + mean 3d ≥ +2%),
+    DEFENSIVE_WIN (≥50% dodged a drawdown + mean 3d ≤ -2%), or NEUTRAL.
+
+    Pure SSOT in ``analytics/opportunity_cost_skill.py``; this endpoint owns
+    only the IO seams (decisions row pull, articles.db read, daily-price
+    history fetch). Forward returns use the SAME daily-history cache
+    (``_daily_history_cached``) ``signal_followthrough`` / ``source_edge`` /
+    ``news_edge`` use — yfinance is hit at most once per ticker per TTL so a
+    long sit-out window with the same top ticker repeatedly costs one fetch.
+
+    Query params (clamped):
+      ``window_hours`` — sit-out lookback, 24..720 (default 168 = 7 days).
+      ``min_decisions`` — verdict gate, 3..50 (default 5 = the analytics
+        module's MIN_DECISIONS_FOR_VERDICT — too few sit-outs to grade and
+        the verdict is NO_DATA).
+      ``lookback_hours`` — news-heat look-back window per decision, 0.5..6
+        (default 2 — mirrors the live ``decide()`` window strategy.decide
+        feeds Opus).
+
+    Observational only — never gates Opus, no caps (AGENTS.md #2/#12).
+    Read-only against articles.db (live-only clause) + yfinance daily bars.
+    """
+    try:
+        from .analytics.opportunity_cost_skill import (
+            DEFAULT_WINDOW_HOURS,
+            MIN_DECISIONS_FOR_VERDICT,
+            build_opportunity_cost_skill,
+            top_ticker_by_heat,
+        )
+        from .strategy import WATCHLIST as _WATCHLIST
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        def _qi(name, default, lo, hi):
+            try:
+                v = int(float(request.args.get(name, default)))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        window_hours = _qf("window_hours", DEFAULT_WINDOW_HOURS, 24.0, 720.0)
+        min_decisions = _qi("min_decisions", MIN_DECISIONS_FOR_VERDICT, 3, 50)
+        lookback_hours = _qf("lookback_hours", 2.0, 0.5, 6.0)
+
+        store = get_store()
+        # 3000 decisions covers ~5d at the 60s-open cadence; trim to the
+        # window inside the builder. Mirrors decision_drought's pull size.
+        decisions = store.recent_decisions(limit=3000) or []
+
+        # Articles within the analysis window — single read; the per-decision
+        # top_ticker_at callback then filters in-memory to each decision's
+        # short look-back window. Same live-only clause every news-IO
+        # endpoint uses (invariant #3).
+        now_utc = datetime.now(timezone.utc)
+        cutoff = (now_utc - timedelta(hours=window_hours + lookback_hours)
+                  ).isoformat()
+        articles: list[dict] = []
+        path = _articles_db_path()
+        if path is not None:
+            try:
+                conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
+                                       timeout=5)
+                conn.row_factory = sqlite3.Row
+                try:
+                    rows = conn.execute(
+                        "SELECT title, ai_score, urgency, first_seen, url, "
+                        "source FROM articles WHERE first_seen >= ? "
+                        "AND url NOT LIKE 'backtest://%' "
+                        "AND source NOT LIKE 'backtest_%' "
+                        "AND source NOT LIKE 'opus_annotation%' "
+                        "ORDER BY first_seen DESC LIMIT 50000",
+                        (cutoff,),
+                    ).fetchall()
+                finally:
+                    conn.close()
+                for r in rows:
+                    articles.append({
+                        "title": r["title"] or "",
+                        "ai_score": r["ai_score"],
+                        "urgency": r["urgency"],
+                        "first_seen": r["first_seen"],
+                        "url": r["url"],
+                        "source": r["source"],
+                    })
+            except Exception:
+                articles = []
+
+        watchlist = list(_WATCHLIST)
+
+        # top_ticker_at — pure-helper SSOT (test-locked separately).
+        def _top_ticker_at(ts_end):
+            return top_ticker_by_heat(
+                articles, watchlist, ts_end,
+                lookback_hours=lookback_hours,
+            )
+
+        # Forward returns from the daily-history cache. Returns
+        # (fwd_1d_pct, fwd_3d_pct) where each is the % change from the
+        # first session at-or-after ts to the 1st / 3rd subsequent
+        # session. The cache is shared with news_edge / signal_followthrough
+        # so a repeated top ticker pays one yfinance fetch per TTL.
+        _hist_cache: dict[str, list[tuple[str, float]]] = {}
+
+        def _hist(tk: str) -> list[tuple[str, float]]:
+            if tk in _hist_cache:
+                return _hist_cache[tk]
+            try:
+                h = _daily_history_cached(tk)
+            except Exception:
+                h = []
+            _hist_cache[tk] = h
+            return h
+
+        def _forward_returns_for(ticker, ts_end):
+            try:
+                bars = _hist(ticker)
+                if not bars:
+                    return (None, None)
+                target = ts_end.date().isoformat()
+                # First session AT-OR-AFTER target (NYSE skips weekends &
+                # holidays — the daily bars list reflects that).
+                idx = None
+                for i, (d, _) in enumerate(bars):
+                    if d >= target:
+                        idx = i
+                        break
+                if idx is None or idx >= len(bars) - 1:
+                    return (None, None)
+                base = float(bars[idx][1])
+                if base <= 0:
+                    return (None, None)
+                fwd_1d = None
+                fwd_3d = None
+                if idx + 1 < len(bars):
+                    try:
+                        fwd_1d = 100.0 * (float(bars[idx + 1][1]) - base) / base
+                    except Exception:
+                        fwd_1d = None
+                if idx + 3 < len(bars):
+                    try:
+                        fwd_3d = 100.0 * (float(bars[idx + 3][1]) - base) / base
+                    except Exception:
+                        fwd_3d = None
+                return (fwd_1d, fwd_3d)
+            except Exception:
+                return (None, None)
+
+        return jsonify(build_opportunity_cost_skill(
+            decisions,
+            top_ticker_at=_top_ticker_at,
+            forward_returns_for=_forward_returns_for,
+            now=now_utc,
+            window_hours=window_hours,
+            min_decisions=min_decisions,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e), "verdict": "ERROR"}), 500
+
+
 @app.route("/api/drought-path-risk")
 def drought_path_risk_api():
     """Intra-drought path shape — peak/trough/drawdown/range while the bot
@@ -17636,6 +17812,119 @@ def decision_conditionals_api():
             "n_stale": 0,
             "intents": [],
             "by_kind": {},
+        }), 500
+
+
+@app.route("/api/intent-followthrough")
+def intent_followthrough_api():
+    """Intent-followthrough — does the bot actually do what it says it will?
+
+    The observational follow-up to ``/api/decision-conditionals`` (which
+    extracts STANDING conditional intents from reasoning prose). Every other
+    reasoning skill panel grades the *text* — ``decision-vapor-skill``
+    measures specificity, ``thesis-drift`` re-tests the open-position
+    thesis, ``exit-intent-audit`` classifies CLOSED sells by motive,
+    ``reasoning-coherence`` measures HOLD-to-HOLD stability — but **none**
+    of them grade the *bridge from text to action*. A bot that emits crisp
+    "wait for X, then buy Y" statements every cycle but never executes Y
+    has perfect decision_vapor and zero followthrough — and only this
+    endpoint catches the gap.
+
+    For every actionable intent (``watch-for`` / ``ready-to`` / ``will-if`` /
+    ``look-for`` / ``rotate-into`` / ``if-then``) the builder joins against
+    the trade tape and classifies FOLLOWED / PENDING / ABANDONED. Verdict
+    ladder over the resolved bucket (FOLLOWED + ABANDONED, PENDING
+    excluded — verdict on those isn't in yet):
+
+      * ``DISCIPLINED`` — followthrough rate ≥ ``discipline_floor`` (66%).
+      * ``DRIFTING`` — rate in [drifting_floor, discipline_floor) (33-66%).
+      * ``ABANDONED`` — rate < ``drifting_floor`` AND ≥ ``abandoned_min_n``
+        (3) abandoned intents — the bot states plans it does not execute.
+      * ``NO_RESOLVED`` — intents present, all still PENDING in window.
+      * ``NO_DATA`` — no decisions / no intents in window.
+
+    Abstention intents (``preserve-for`` / ``too-early-to``) are scored on
+    a separate ``abstention`` sub-counter (preserve_deployed /
+    preserve_dead / restraint_held / restraint_broken).
+
+    Query params (clamped):
+      ``window_hours`` — decision lookback, 1..168 (default 24).
+      ``eval_window_hours`` — per-intent followthrough window, 1..72
+        (default 12 — half the standard 24h analysis window).
+      ``stale_hours`` — intent stale-cutoff, 1..168 (default 12).
+      ``max_intents`` — return cap, 1..50 (default 30).
+
+    Pure SSOT in ``analytics/intent_followthrough_skill.py``; this endpoint
+    owns only the IO seam (decisions + trades pull). Composes the
+    ``decision_conditionals`` extractor verbatim — the two endpoints can
+    never disagree on what counts as an intent (invariant #10).
+    Observational only — never gates Opus, no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.intent_followthrough_skill import (
+            DEFAULT_ABANDONED_MIN_N,
+            DEFAULT_DISCIPLINE_FLOOR,
+            DEFAULT_DRIFTING_FLOOR,
+            DEFAULT_EVAL_WINDOW_HOURS,
+            DEFAULT_MAX_INTENTS,
+            DEFAULT_STALE_HOURS,
+            DEFAULT_WINDOW_HOURS,
+            build_intent_followthrough,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        def _qi(name, default, lo, hi):
+            try:
+                v = int(float(request.args.get(name, default)))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        window_hours = _qf("window_hours", DEFAULT_WINDOW_HOURS, 1.0, 168.0)
+        eval_window_hours = _qf("eval_window_hours",
+                                DEFAULT_EVAL_WINDOW_HOURS, 1.0, 72.0)
+        stale_hours = _qf("stale_hours", DEFAULT_STALE_HOURS, 1.0, 168.0)
+        max_intents = _qi("max_intents", DEFAULT_MAX_INTENTS, 1, 50)
+
+        store = get_store()
+        # 500 decisions covers the same row count the sibling
+        # decision-conditionals endpoint uses. 2000 trades covers months
+        # at the live trader's pace, enough for any window <= 168h.
+        decisions = store.recent_decisions(limit=500) or []
+        trades = store.recent_trades(limit=2000) or []
+
+        return jsonify(build_intent_followthrough(
+            decisions,
+            trades,
+            window_hours=window_hours,
+            stale_hours=stale_hours,
+            eval_window_hours=eval_window_hours,
+            discipline_floor=DEFAULT_DISCIPLINE_FLOOR,
+            drifting_floor=DEFAULT_DRIFTING_FLOOR,
+            abandoned_min_n=DEFAULT_ABANDONED_MIN_N,
+            max_intents=max_intents,
+        ))
+    except Exception as e:
+        return jsonify({
+            "state": "NO_DATA",
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "n_intents": 0,
+            "n_actionable": 0,
+            "n_followed": 0,
+            "n_pending": 0,
+            "n_abandoned": 0,
+            "followthrough_rate": None,
+            "abstention": {},
+            "by_kind": {},
+            "intents": [],
         }), 500
 
 
