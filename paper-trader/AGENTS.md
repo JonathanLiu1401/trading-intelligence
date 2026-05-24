@@ -6,6 +6,320 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 ML+backtest HYBRID pass #31 (Agent 2) — `gate_arm_skill_log` per-cycle ledger + GATE_INEFFECTIVE+strong-rank-IC paradox finding
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Read AGENTS.md, `paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py`, `run_continuous_backtests.py` in full
+(multi-page). Verified the recently uncommitted yfinance
+schema-tolerant `_parse_yf_news_item` helper in backtest.py is a
+genuine bug fix for the late-2024 yfinance API schema change — but
+declined to commit since the working-tree modification is another
+agent's (`pt-concurrent-samerole-staging-race` discipline). My commit
+boundary therefore covers only `run_continuous_backtests.py` (additive
+function + wiring) and a new test file.
+
+Re-validated:
+* `_to_float` edge cases — Python bool, numpy bool, numpy number,
+  inf/NaN, Decimal — all correctly return default (no implicit
+  coercion).
+* `_train_decision_scorer`'s OOS-eval guard chain: `_oos_rank_metrics`,
+  `_oos_multi_horizon_metrics`, `evaluate_scorer_oos` each
+  independently try/except-wrapped — a diagnostic crash never poisons
+  the cycle's training status.
+* `_get_decision_scorer` `_Dummy` fallback path: `predict_with_meta`
+  absent → falls back to `predict()` and treats as in-distribution.
+
+Set `bugs_fixed = 0` honestly, no Phase 1 commit. 222 decision_scorer
++ continuous + intraperiod + gate-arm-ledger slice tests pass clean
+in ~9s.
+
+### Phase 2 — Feature: per-cycle gate-arm historical skill ledger (185bc93)
+
+New `_append_gate_arm_skill_log` in `run_continuous_backtests.py`
+wiring the existing `paper_trader/ml/gate_arm_historical.analyze`
+analyzer into the cycle loop as a durable per-cycle JSONL ledger
+(`data/gate_arm_skill_log.jsonl`).
+
+**Why this matters (Phase 3 #1 below):** the deployed scorer carries
+strong measured OOS rank-IC (+0.484 on the most recent 1000
+sim_date-sorted rows, BUY-only +0.448). But the gate's ACTUAL
+historical bucket assignment — decoded from the persisted
+`gate_scorer_pred` field rather than re-predicting with today's
+pickle — has verdict `GATE_INEFFECTIVE`:
+* ×0.6 arm (strong_headwind, n=9): mean realized +4.12%
+* ×0.85 arm (mild_headwind, n=122): +0.89%
+* ×1.0 arm (neutral, n=136): +2.52%
+* ×1.15 arm (mild_tailwind, n=39): -0.51%
+* ×1.3 arm (strong_tailwind, n=22): +3.99%
+* Spread (×1.3 − ×0.6): **-0.13pp** (below ±1.0pp tolerance)
+* `arm_monotone_fraction`: 0.5 (coin flip)
+
+The model ranks but the buckets don't extract economic edge. This is
+the single most economically decisive *unmonitored* fact about the
+gate: a quant needs to know the moment bucket tuning recovers real
+arm divergence — without manually invoking the CLI. Until this
+wiring landed it was CLI-only with no durable trend.
+
+Same `_append_*_skill_log` discipline as every sibling ledger:
+* Best-effort by construction — a ledger write must NEVER break the
+  loop (wrapped try/except, returns False on handled fault).
+* Honest INSUFFICIENT_DATA "gap row" with `gate_dark=True` when zero
+  BUYs carry a parseable `gate_scorer_pred` — so the absence of
+  data is itself visible in the trend, not silent.
+* Bounded atomic trim — file rewritten via tmp + `.replace` when it
+  exceeds 2× `GATE_ARM_SKILL_LOG_KEEP=2000`.
+* SSOT cross-check — persisted verdict / spread / monotone_fraction
+  equal what the analyzer returned (the `gate_arm_historical` CLI's
+  `--json` output and the persisted ledger row stay byte-for-byte
+  consistent).
+* Per-arm flat columns (`mean_x06`, `mean_x085`, `mean_x10`,
+  `mean_x115`, `mean_x13` + `n_x*`) for ergonomic JSON consumption
+  without nested-list parsing.
+
+Wired in `main()` after `_append_mfe_skill_log` (the canonical
+placement: all skill ledgers run before `_try_train_ml`'s ArticleNet
+side effect, so a ledger crash can never poison ArticleNet retraining).
+
+Test coverage (12 new tests, all green —
+`tests/test_continuous_gate_arm_ledger.py`):
+* INSUFFICIENT_DATA dark row persists with `gate_dark=True`
+* GATE_INEFFECTIVE verdict — SSOT cross-check that persisted spread
+  / monotone_fraction / per-arm `mean_x*` values equal what the
+  analyzer returned (no drift)
+* GATE_EFFECTIVE positive-spread sign preservation
+* GATE_HARMFUL inverted-spread sign preservation
+* Analyzer-exception degrades to honest error row (never raises out)
+* Bounded trim at 2× KEEP rewrites atomically
+* Directory created on first write
+* Unwritable parent returns False (discipline contract)
+* Source-level wiring assertion: `_append_gate_arm_skill_log(`
+  appears in `main()` — orphan-function regression guard, same
+  pattern `TestCycleWiringRegression` /
+  `TestIntraperiodLedgerWiring` use
+* Module-level constants pinned for testability
+* Analyzer-side contract pinned (keys the ledger reads must exist)
+
+### Phase 3 — Quant validation findings (user_findings = 4)
+
+1. **STRONG OOS rank-IC AND GATE_INEFFECTIVE simultaneously — the
+   paradox finding.** The deployed `n_train=4987` pickle carries
+   real predictive skill OOS: +0.484 rank-IC on the most recent
+   1000 sim_date-sorted rows (BUY-only +0.448, all-action verdict
+   `MLP_ADDS_SKILL` from `baseline_compare` on the OOS slice with
+   ic_gap of +0.284 vs the best one-line baseline). But the
+   conviction gate's actual then-deployed bucket assignment fails
+   to capture that rank skill: `gate_arm_historical` reports
+   `GATE_INEFFECTIVE` with a -0.13pp spread between the ×1.30 and
+   ×0.60 arms. Likely root cause: the threshold bands (-10/-5/+5/+10)
+   are miscalibrated to the deployed prediction distribution
+   (measured p10=-5.92, p50=-0.30, p90=+7.27 — most predictions
+   land in the -5 to +5 "unchanged" zone, leaving the extreme
+   arms with tiny sample sizes n=9 and n=22). The new
+   `gate_arm_skill_log` will now trend whether bucket tuning
+   recovers economic edge. Quant-actionable: a `gate_threshold_sweep`
+   analyzer (exists) re-run on the current pickle could identify
+   bands that match the empirical p25/p75 (≈ -2/+3) rather than
+   the fixed ±5/±10.
+
+2. **Continuous loop is throttled, ~0.5 cycle/day.** Confirms pass
+   #30 finding #2: all per-cycle ledgers have only 1 row from
+   2026-05-21, and 4 of 7 sibling ledgers (calibrated_reliability,
+   conviction_calibration, stop_out, mfe) don't even have files on
+   disk yet — they were wired in passes #10/#19/#30 but the loop
+   hasn't completed a cycle since to create those files. My new
+   `gate_arm_skill_log.jsonl` will be in the same state until the
+   loop completes a cycle. The active run (cycle 6243, sim_date
+   2000-11-21 of a long window) is heavily throttled by GDELT
+   rate-limiting (continuous.log shows constant 20-60s
+   `[gdelt] rate-limited` sleeps).
+
+3. **Backtest history is healthy on the productive cycles.**
+   Recent 10 completes range from +31% to +580% absolute return
+   (vs SPY +233% to +424% on the same windows) with trade counts
+   703–2736 — robust productive runs. The 26 failed / 474 complete
+   ratio is healthy. But the most recent completes (runs 99001,
+   90001, 100000) all returned +0.00% with 0 trades — those look
+   like sentinel "engine ran but never traded" sessions, possibly
+   from windows where the engine's signal threshold never fires.
+   Worth a focused look in a future pass.
+
+4. **Intraperiod corpus still 0/8753.** Same documented state as
+   pass #30: the 2026-05-23 `forward_intraperiod_min_5d/max_5d`
+   feature has zero corpus penetration in 8753 historical outcome
+   rows. Both new ledgers (stop_out / mfe) correctly report
+   `stop_dark=True` / `tp_dark=True` against the live data. Once
+   the loop completes ~10 cycles of new outcomes the rolling
+   5000-row tail will start to flip them. My new gate_arm ledger
+   is unaffected — it reads `gate_scorer_pred` (2026-05-18
+   feature) which has wider corpus penetration (n=328 OOS gate
+   pairs vs 0 intraperiod).
+
+### Phase 4 — Docs
+
+This entry. Wired the new ledger into the cycle loop. Source files
+touched: `run_continuous_backtests.py` (+186 lines: GATE_ARM_SKILL_LOG
++ GATE_ARM_SKILL_LOG_KEEP constants, `_append_gate_arm_skill_log`
+function, `main()` wiring), new
+`tests/test_continuous_gate_arm_ledger.py` (+440 lines, 12 tests).
+Existing analyzer `paper_trader/ml/gate_arm_historical.py` unchanged
+(wiring is purely additive).
+
+How to read the new ledger:
+
+```bash
+# Once new cycles run, trend whether the gate's arms actually
+# realize differentiated economic outcomes:
+tail -n 20 data/gate_arm_skill_log.jsonl | jq '{cycle, verdict, strong_tailwind_minus_headwind_pp, arm_monotone_fraction, gate_dark, mean_x06, mean_x13}'
+
+# The CLI it wraps (one-shot, same verdict):
+python3 -m paper_trader.ml.gate_arm_historical --json
+```
+
+Counters: bugs_fixed=0, features_added=1
+(`_append_gate_arm_skill_log` + ledger + 12 tests), user_findings=4
+(deployed scorer +0.48 OOS rank-IC paradox vs GATE_INEFFECTIVE
+buckets — actionable; loop throttling; 0/0/0 trade sentinel runs;
+intraperiod corpus still 0/8753).
+
+---
+
+## 2026-05-24 feature-dev pass (Agent 4) — `setup_analogues` empirical conditional-return distribution
+
+Feature-dev pass. Read CLAUDE.md + AGENTS.md head + `dashboard.py` /
+`scorer_confidence.py` / `baseline_compare.py` to scope. The 152-module
+`paper_trader/analytics/` surface already buckets the corpus by *predicted
+value* (scorer_confidence) and benchmarks the scorer against one-line
+rules (baseline_compare), but no module conditions the realized-return
+distribution on the **current ticker's feature context** — i.e., "this
+exact (rsi, mom20, regime) cell has happened N times in the 8753-row
+history; here are the empirical p25/p50/p75 / win-rate." That's the
+non-parametric companion to the MLP point estimate the trader was
+missing.
+
+### Phase 2 — Feature: `paper_trader/analytics/setup_analogues.py`
++ `/api/setup-analogues` endpoint.
+
+Pure builder `build_setup_analogues(outcomes, *, ticker, action, rsi,
+mom20, regime_mult, min_matches=20, now=None)` — coarse 4×4×3 bucket grid
+on the existing `decision_outcomes.jsonl` features (RSI low / mid_low /
+mid_high / overbought × mom20 deep_neg / neg / pos / strong × regime
+bear / sideways / bull), returns the realized 5d-return distribution
+for the matching cell with the closed verdict alphabet `STRONG_EDGE` /
+`EDGE` / `NEUTRAL` / `HEADWIND` / `STRONG_HEADWIND` / `INSUFFICIENT_DATA`.
+Trader-perspective semantics: BUY wins on `forward_return_5d > 0`, SELL
+wins on `forward_return_5d < 0`, options track the underlying direction.
+`trader_median_pct` sign-flips for SELL so a successful sell reads as a
+positive trader median.
+
+Endpoint reuses the existing `_load_decision_outcomes` + the
+`get_quant_signals_live` + SPY-mom regime-mult derivation in lockstep
+with `_live_scorer_predictions` (the same wiring `/api/scorer-confidence`
+uses) so the bucket the dashboard reports is the bucket Opus would see.
+Default ticker resolves to the first held stock, else `WATCHLIST[0]`,
+else SPY.
+
+Why this is not `scorer_confidence.py`. That module measures **how
+wrong the MLP usually is** by bucketing residuals on prediction band —
+it answers "how much should I trust the +5% estimate?" This module
+measures **what the corpus says directly** by bucketing on feature
+context — "have I seen a setup like this before, and what happened?"
+The two reads are complementary: when the MLP point estimate disagrees
+with the bucket median, that disagreement is itself a useful trust
+signal (the operator can ask: which one is the corpus-supported answer?).
+
+Why this is not `calibration.py` or `baseline_compare.py`. Those
+benchmark **the scorer** against quantile decile rank skill or one-line
+rules. They tell the trader whether the MLP earns its complexity —
+they cannot tell the trader, *"given these specific RSI/mom20/regime
+values right now, what's the empirical return distribution?"*
+
+Test coverage (51 tests, all green):
+- **Unit (tests/test_setup_analogues.py, 43 tests):**
+  - Bucket-edge ladder: low/mid_low/mid_high/overbought × deep_neg/neg/
+    pos/strong × bear/sideways/bull with both-side boundary checks
+  - Action win semantics: BUY/SELL/BUY_CALL/SELL_PUT, unknown-action
+    default-to-BUY fallback
+  - Pure-Python percentile correctness (empty / single / known
+    quartiles / negatives — no numpy dep, matches sibling pure
+    builders)
+  - Builder shape contract: required keys present even on empty input
+  - Bucket-only matching: rows from a different cell don't pool in;
+    action filter excludes other actions; missing feature drops to
+    action-only with 0 matches; malformed rows silently skipped
+  - Verdict ladder precedence: STRONG_EDGE / EDGE / NEUTRAL / HEADWIND
+    / STRONG_HEADWIND / INSUFFICIENT_DATA with synthetic distributions
+    that hit each rung
+  - SELL semantics: trader_median_pct sign-flips, win_rate counts
+    down-moves as wins
+  - `min_matches` caller-controlled threshold: same data, different
+    floor, different verdict
+  - File reader: missing file / malformed JSONL / tail-limit honored
+  - Anti-coupling: source contains no DB, model, network, or store
+    imports (the read-only diagnostic claim, falsifiable)
+  - Live-corpus smoke: builder runs against the real 8753-row corpus
+    without surprise
+
+- **Endpoint (tests/test_setup_analogues_endpoint.py, 8 tests):**
+  - Required-keys contract via Flask test client
+  - Default-setup routing into the synthetic STRONG_EDGE cell
+  - `ticker` / `action` / `min_matches` query params route correctly
+  - SELL with no SELL rows ⇒ INSUFFICIENT_DATA (does NOT degrade to a
+    BUY verdict — the analyst-fooling failure mode)
+  - CORS header stamped (digital-intern chat + unified dashboard
+    cross-read it)
+  - Read fault degrades to `verdict=INSUFFICIENT_DATA` body, never a
+    bare-stack 500 (panel must always find `verdict` to render)
+  - Builder spy proves the endpoint is a faithful thin wrapper — the
+    Flask handler does NOT re-derive buckets or stats inside itself
+
+### Phase 3 — Live validation (verified via Flask test client, per
+the `paper-trader-analytics-verification` memory — module __main__ /
+CLI smoke hits an empty DB; only the test client touches the real
+8753-row corpus).
+
+Real-corpus result on the densest bucket cell `(mid_high RSI, pos
+mom20, sideways regime)`: **1313 analogues**, median **+0.87%**, p25
+**-2.04%**, p75 **+3.95%**, win rate **60%** → verdict NEUTRAL. The
+worst observed analogue was **-38.6%** and the best **+37.8%** — the
+spread the MLP point estimate buries in a single number.
+
+Note on the live-state query (rsi=53, mom20=7.4, regime=bull, SPY
+mom_5d ⇒ regime_mult 1.066): zero analogues in the (mid_high, pos,
+bull) cell out of 3335 BUY rows. This is an honest, useful finding —
+the historical corpus contains very few bull-regime setups (most of
+the 8753 rows are sideways / bear backtest windows), so the bot is
+currently operating in a feature region the empirical distribution
+cannot meaningfully condition on. The `INSUFFICIENT_DATA` verdict
+collapse is exactly the desired honesty floor, not a bug.
+
+### Phase 4 — Docs
+
+This entry. No live `dashboard.py` HTML card wired this pass — the
+endpoint is JSON-only and the chat enrichment path can pick it up in
+a follow-up pass once `:8090` restarts (per the
+`paper-trader-chronic-stale` memory, the endpoint won't be live on
+the running `:8090` until manual restart anyway).
+
+**Note for the operator:** the new endpoint will not be reachable on
+the live `:8090` process until paper-trader is restarted (the boot SHA
+is older than this commit). Test-client smoke confirms the route is
+sound on this revision; live-curl verification is intentionally
+post-restart.
+
+### Files touched
+- `paper_trader/analytics/setup_analogues.py` (new, 268 lines)
+- `paper_trader/dashboard.py` (+69 lines — one new route)
+- `tests/test_setup_analogues.py` (new, 43 tests)
+- `tests/test_setup_analogues_endpoint.py` (new, 8 tests)
+- `AGENTS.md` (this entry)
+
+**Counters:** `bugs_fixed=0`, `features_added=1`, `tests_added=51`,
+`user_findings=1` (the corpus-coverage finding above).
+
+---
+
 ## 2026-05-24 ML+backtest HYBRID pass #30 (Agent 2) — stop-out + MFE per-cycle skill ledgers + strict-OOS calibration finding
 
 ### Phase 1 — Debug: bugs_fixed = 0
