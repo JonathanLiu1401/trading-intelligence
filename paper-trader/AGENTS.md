@@ -6,6 +6,91 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-23 ML+backtest HYBRID pass #25 (Agent 2) — `_raw_to_calibrated` symmetric collapsed-label guard + `gate_arm_historical`
+
+### Phase 1: Debug — 1 bug fixed (1af59f9)
+
+`DecisionScorer._raw_to_percentile` already short-circuits to None when
+the persisted `pred_quantiles` table collapses to a single value (the
+pass #20 "synthetic n=39 clobber" footprint). The symmetric degeneracy
+on `label_quantiles` had NO guard: `np.interp` over a constant `fp`
+array silently returned that constant for every rank, so a degenerate
+single-label corpus surfaced as e.g. `calibrated=7.0%` for every
+prediction regardless of input rank — fake magnitude with no honest
+"I can't tell" sentinel for dashboard / `calibration_reliability`
+consumers. The fix mirrors the pred-side guard verbatim; new tests pin
+both the now-correct None behaviour AND the unchanged healthy path AND
+the end-to-end cascade through `predict_with_meta` / `predict_calibrated`.
+
+```bash
+# Phase 1 regression suite — fast (10s):
+python3 -m pytest tests/test_ml_backtest_review_20260523_agent2.py \
+  tests/test_scorer_calibrated.py tests/test_scorer_percentile.py -v
+# → 105 passed
+```
+
+### Phase 2: Feature — 1 added (aaef6d6)
+
+New `paper_trader/ml/gate_arm_historical.py` — **truth-aware** sibling
+of `gate_audit`. Buckets BUY outcomes by the conviction gate's ACTUAL
+then-deployed prediction (the persisted `gate_scorer_pred` field from
+the 2026-05-18 `_parse_gate_decision` capture) instead of re-predicting
+with today's model. Reuses `gate_audit.gate_arm` / `EDGE_TOL_PP` /
+`MIN_TOTAL` / `MIN_ARM_N` so the verdict semantics are byte-identical
+to `gate_effectiveness_report` — the only difference is WHICH prediction
+the buckets see (historical truth vs counterfactual reconstruction).
+
+```bash
+# Full-corpus view (uses every gated BUY ever recorded):
+python3 -m paper_trader.ml.gate_arm_historical --all
+# OOS-slice view (last 20% temporally):
+python3 -m paper_trader.ml.gate_arm_historical
+# JSON for programmatic consumers:
+python3 -m paper_trader.ml.gate_arm_historical --all --json
+# Tests (15 tests, <1s):
+python3 -m pytest tests/test_gate_arm_historical.py -v
+```
+
+### Phase 3: Live validation — 4 findings
+
+1. **Historical gate is GATE_INEFFECTIVE.** Full corpus (5161 gated
+   BUYs): strong_tailwind ×1.30 realized +1.62% vs strong_headwind ×0.60
+   realized +2.06% — spread **-0.44pp**, arm_monotone_fraction = 0.50.
+   OOS slice (328 rows): -0.13pp spread. The production gate's biggest
+   bets have NOT been realizing higher returns than its smallest.
+
+2. **Major divergence: reconstructed vs historical gate verdict.**
+   `gate_audit` (re-predict with today's model) reports `GATE_EFFECTIVE`
+   on the same OOS slice — spread **+22.83pp**, monotone=1.0. But the
+   historical view says the gate was ineffective in production. Today's
+   model retrospectively "knows" how those decisions panned out; the
+   gate at the time did not. This is precisely the gate_pnl-documented
+   reconstruction residual, quantified for the first time. **Reading
+   gate_audit alone overstates gate skill by ~23pp.**
+
+3. **Continuous loop is sluggish.** Last completed run in `backtest.db`
+   was 2026-05-22 06:24:20 (>24h before this audit). The skill ledger
+   has only ONE row over the trailing week. Cycles are running far below
+   the documented ~144/day target. Operational, not a code bug.
+
+4. **41% of outcomes carry no gate prediction.** 5165/8753 outcomes have
+   `gate_scorer_pred`; the remaining 3588 are sub-gate cycles (the
+   scorer wasn't trained yet) plus SELL/HOLD rows. The historical
+   analyzer drops them honestly with per-class counts in the report; the
+   reconstruction-based `gate_audit` ALSO can't measure the gate's
+   effect on those rows but doesn't surface that — another quiet
+   advantage of the truth-aware view.
+
+### Phase 4: Final verify
+
+```bash
+# Focused ml+backtest slice:
+python3 -m pytest tests/ -v -k "ml or backtest or scorer or gate or continuous"
+# → all green; new file additions = 1 bug fix + 1 feature + 20 new tests
+```
+
+---
+
 ## 2026-05-24 paper-trader core HYBRID pass (Agent 1) — `_last_claude_fail` per-cycle reset + `/api/alarm-latches`
 
 ### Phase 1: Debug — 1 bug fixed (7d524bd)
