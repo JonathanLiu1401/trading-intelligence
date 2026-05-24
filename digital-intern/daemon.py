@@ -79,6 +79,7 @@ from collectors.market_movers import collect_market_movers
 from collectors.yahoo_trending_tickers import collect_yahoo_trending
 from collectors.fear_greed_collector import collect_fear_greed
 from collectors.crypto_fear_greed_collector import collect_crypto_fear_greed
+from collectors.binance_funding_collector import collect_crypto_funding
 from collectors.earnings_surprise_collector import collect_earnings_surprises
 from collectors.polymarket_collector import collect as collect_polymarket
 from collectors.manifold_collector import collect_manifold
@@ -187,6 +188,7 @@ MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active eve
 YAHOO_TRENDING_INTERVAL = 300     # Yahoo Finance trending tickers (retail attention) every 5min
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
 CRYPTO_FEAR_GREED_INTERVAL = 1800  # Crypto Fear & Greed (alternative.me) every 30min
+CRYPTO_FUNDING_INTERVAL   = 1800  # OKX perpetual funding rates every 30min
 EARNINGS_SURPRISE_INTERVAL = 900  # EPS beat/miss scanner every 15min
 POLYMARKET_INTERVAL     = 900     # Polymarket prediction markets every 15min
 MANIFOLD_INTERVAL       = 1800    # Manifold Markets prediction markets every 30min
@@ -313,6 +315,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "short_squeeze":  MARKET_MOVERS_INTERVAL,
     "fear_greed": FEAR_GREED_INTERVAL,
     "crypto_fear_greed": CRYPTO_FEAR_GREED_INTERVAL,
+    "crypto_funding":   CRYPTO_FUNDING_INTERVAL,
     "earnings_surprise": EARNINGS_SURPRISE_INTERVAL,
     "polymarket": POLYMARKET_INTERVAL,
     "rate_monitor": RATE_MONITOR_INTERVAL,
@@ -1318,6 +1321,28 @@ def crypto_fear_greed_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(CRYPTO_FEAR_GREED_INTERVAL)
+
+
+# ── Worker: OKX Perpetual Funding Rates — every 30min ────────────────────────
+def crypto_funding_worker(store: ArticleStore):
+    log.info("[crypto_funding_worker] started")
+    bo = Backoff("crypto_funding", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_crypto_funding()
+            _ingest(store, articles, "crypto_funding")
+            try:
+                source_health.record_result("crypto_funding", len(articles))
+            except Exception as he:
+                log.warning(f"[crypto_funding_worker] source_health error: {he}")
+            _worker_last_ok["crypto_funding"] = time.time()
+            log.debug(f"[crypto_funding] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[crypto_funding_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(CRYPTO_FUNDING_INTERVAL)
 
 
 def earnings_surprise_worker(store: ArticleStore):
@@ -3958,6 +3983,7 @@ def main():
         ("short_interest", short_interest_worker),
         ("fear_greed",  fear_greed_worker),
         ("crypto_fear_greed", crypto_fear_greed_worker),
+        ("crypto_funding",   crypto_funding_worker),
         ("earnings_surprise", earnings_surprise_worker),
         ("polymarket",  polymarket_worker),
         ("manifold",    manifold_worker),
