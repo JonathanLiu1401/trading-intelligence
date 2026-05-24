@@ -14720,8 +14720,16 @@ def _feed_db_probe(db_path: str, want_counts: bool = False) -> dict:
     canonical AGENTS.md invariant #1/#3 fragment, mirroring signals.py and
     data_feed_api) — a planted backtest:// row must never read as the freshest
     article or the split-brain detector would be defeated by training data.
-    Returns ``{exists, newest, live_2h, live_24h}``; never raises."""
-    out = {"exists": False, "newest": None, "live_2h": 0, "live_24h": 0}
+    Returns ``{exists, newest, live_2h, live_24h, live_scored_2h}``; never
+    raises. ``live_scored_2h`` counts articles in the 2h window with
+    ``ai_score >= LIVE_MIN_SCORE`` (the same gate the live trader feeds Opus
+    via signals.get_top_signals) so build_feed_health can distinguish "feed
+    arriving but unscored" (ML pipeline down — restart the scorer) from "no
+    articles" (collector down — restart digital-intern). Only computed when
+    ``want_counts`` is True (the resolved-DB probe), zero on other
+    candidates."""
+    out = {"exists": False, "newest": None, "live_2h": 0, "live_24h": 0,
+           "live_scored_2h": 0}
     try:
         from pathlib import Path as _P
         if not _P(db_path).exists():
@@ -14754,6 +14762,22 @@ def _feed_db_probe(db_path: str, want_counts: bool = False) -> dict:
                 out["live_24h"] = int(conn.execute(
                     f"SELECT COUNT(*) FROM articles WHERE "
                     f"first_seen >= ? AND {live_clause}", (s24,)
+                ).fetchone()[0] or 0)
+                # Match strategy.decide()'s ai_score >= 4.0 gate so the
+                # endpoint can prove "X rows in window but 0 of them pass
+                # the live trader's gate" — the digital-intern-scorer-down
+                # case. Imported lazily to avoid an import-cycle hazard
+                # (feed_health imports nothing from dashboard); a missing
+                # symbol or import error degrades to scored=0 (the new
+                # builder gate then treats it as a real zero-pass, which
+                # is the correct call for this codepath since we've still
+                # confirmed the DB exists and the live trader hits this
+                # same threshold).
+                from .analytics.feed_health import LIVE_MIN_SCORE
+                out["live_scored_2h"] = int(conn.execute(
+                    f"SELECT COUNT(*) FROM articles WHERE "
+                    f"first_seen >= ? AND ai_score >= ? AND {live_clause}",
+                    (s2, LIVE_MIN_SCORE)
                 ).fetchone()[0] or 0)
         finally:
             conn.close()
@@ -14827,6 +14851,14 @@ def feed_health_api():
             "resolved_newest": resolved_probe["newest"],
             "resolved_live_2h": resolved_probe["live_2h"],
             "resolved_live_24h": resolved_probe["live_24h"],
+            # Scored-row count for the same 2h window the trader feeds Opus
+            # — lets build_feed_health distinguish "ML scorer down" (rows
+            # arriving, none scored) from "collector down" (no rows at
+            # all). Pure-builder fixture tests don't pass this field and
+            # see the byte-identical pre-fix headline; the endpoint always
+            # passes it so the unified surface gets the new clause when
+            # the live root cause is the scorer.
+            "resolved_scored_2h": resolved_probe.get("live_scored_2h", 0),
             "legacy_path": (legacy_str if legacy_probe
                             and legacy_probe["exists"] else None),
             "legacy_newest": legacy_probe["newest"] if legacy_probe else None,

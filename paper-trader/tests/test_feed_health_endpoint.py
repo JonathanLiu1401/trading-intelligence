@@ -118,3 +118,53 @@ def test_endpoint_flags_blind_split_brain(split_brain_client):
     assert d["legacy_newest_age_h"] >= 19.0
     assert d["resolved_live_2h"] == 1            # the fresh DB does carry news
     assert "split-brain" in d["headline"]
+
+
+def test_feed_db_probe_counts_scored_rows():
+    """``live_scored_2h`` must count only rows with ai_score >= LIVE_MIN_SCORE
+    in the 2h window, AND honour the live-only clause (a fresher backtest://
+    row never counts even if its ai_score is high)."""
+    import tempfile
+    from paper_trader.analytics.feed_health import LIVE_MIN_SCORE
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "articles.db"
+        _make_db(db, [
+            # Three live rows in window, two clear the gate, one below.
+            ("a1", "https://x/1", "scored hi", "rss", 5.0, 0, _iso(0.5)),
+            ("a2", "https://x/2", "scored mid", "rss", 4.0, 0, _iso(0.4)),
+            ("a3", "https://x/3", "below gate", "rss", 3.9, 0, _iso(0.3)),
+            # Out-of-window live row — counts in 24h, NOT in 2h.
+            ("a4", "https://x/4", "old hi", "rss", 9.0, 0, _iso(3.0)),
+            # Synthetic backtest row with a great score — must NOT count.
+            ("bt", "backtest://run/1", "synth hi", "rss", 9.9, 0, _iso(0.2)),
+        ])
+        from paper_trader.dashboard import _feed_db_probe
+        out = _feed_db_probe(str(db), want_counts=True)
+        assert out["exists"] is True
+        # 3 live rows in window; 2 of them clear ai_score>=4.0 (the backtest
+        # row is excluded by the live-only clause)
+        assert out["live_2h"] == 3
+        assert out["live_scored_2h"] == 2
+        assert out["live_24h"] == 4  # 3 in 2h + 1 at 3h
+        # The constant the probe gates on must be the same one the live
+        # trader feeds Opus — pin it explicitly so a drift in either place
+        # fails this test (not just the new clause).
+        assert LIVE_MIN_SCORE == 4.0
+
+
+def test_feed_db_probe_no_counts_skips_scored_query():
+    """``want_counts=False`` (the path the non-resolved candidates take) must
+    NOT issue the scored-count query — keeps the per-candidate probe lean."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "articles.db"
+        _make_db(db, [("a1", "https://x/1", "x", "rss", 5.0, 0, _iso(0.5))])
+        from paper_trader.dashboard import _feed_db_probe
+        out = _feed_db_probe(str(db), want_counts=False)
+        # newest is still computed (it's the only field other candidates
+        # contribute to split-brain), but counts default to 0.
+        assert out["exists"] is True
+        assert out["newest"] is not None
+        assert out["live_2h"] == 0
+        assert out["live_24h"] == 0
+        assert out["live_scored_2h"] == 0

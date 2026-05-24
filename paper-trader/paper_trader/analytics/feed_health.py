@@ -61,6 +61,17 @@ STALE_HOURS = 6.0
 # news period. 6h ≫ the 2h decision window and ≫ any real collector gap.
 SPLIT_BRAIN_GAP_H = 6.0
 
+# The ai_score threshold ``strategy.decide()`` feeds Opus via
+# ``signals.get_top_signals(hours=2, min_score=4.0)`` (mirror this literal in
+# both places — see strategy.py:1501 and decision_context.py:197). Used by the
+# UNSCORED_FEED sub-classification below: when the article DB is fresh and
+# carrying rows, but the trader is BLIND because every row's ai_score sits
+# below the gate, the operator action is "fix digital-intern scoring", NOT
+# "fix the collector / restart the runner" — the two root causes the existing
+# BLIND headline ("183 live article(s) in the last 2h") conflates into one
+# misleading "feed looks alive" line.
+LIVE_MIN_SCORE = 4.0
+
 
 def _parse_ts(ts: str | None) -> datetime | None:
     """ISO-8601 → tz-aware UTC; None on anything unparseable."""
@@ -112,6 +123,26 @@ def build_feed_health(decisions: list[dict], feed: dict,
     resolved_age = _age_h(resolved_newest, now)
     live_2h = int(feed.get("resolved_live_2h") or 0)
     live_24h = int(feed.get("resolved_live_24h") or 0)
+    # ``resolved_scored_2h`` — articles in the 2h window whose ai_score >=
+    # LIVE_MIN_SCORE (the same gate strategy.decide() feeds Opus). Optional:
+    # callers (the endpoint) supply it; pure-builder tests / legacy callers
+    # that omit it leave us with ``None``, which suppresses the new
+    # UNSCORED_FEED clause entirely (backwards-compatible). Comparing
+    # ``None == 0`` is False in Python, so the gate below ``raw_scored == 0``
+    # only fires when the caller explicitly told us "I counted, it was zero".
+    raw_scored = feed.get("resolved_scored_2h")
+    try:
+        scored_2h = int(raw_scored) if raw_scored is not None else None
+    except (TypeError, ValueError):
+        scored_2h = None
+    # UNSCORED_FEED: the DB is carrying articles but NONE pass the live
+    # trader's ai_score gate. Distinct from "no articles at all" — the
+    # operator action is "fix the ML scorer", not "fix the collector". We
+    # only assert this when both (a) the caller supplied an explicit scored
+    # count AND (b) raw articles are present AND (c) zero of them are scored.
+    unscored_feed = bool(
+        scored_2h is not None and live_2h > 0 and scored_2h == 0
+    )
 
     # Consecutive most-recent decisions whose signal_count is exactly 0. A
     # missing/None signal_count (partial dict, never a real row — schema is
@@ -220,6 +251,29 @@ def build_feed_health(decisions: list[dict], feed: dict,
             f"running process — RESTART the paper-trader so it reads the "
             f"fresh feed (check /api/build-info `stale`).")
 
+    # UNSCORED_FEED diagnostic clause — appended to BLIND / STALE_FEED only
+    # when the caller proved that articles are arriving but none pass the
+    # live trader's gate. Distinguishes "collector is down" from "scorer is
+    # down" — two failure modes the old "N live article(s) in the last 2h"
+    # snippet conflated into one ambiguous line ("looks alive, silently
+    # bleeding" — the canonical hardest-to-spot pathology). A trader reading
+    # the bare BLIND headline against a fresh DB and 183 live rows would
+    # plausibly conclude "feed is fine, just no high-score news" — but the
+    # observed live root cause (2026-05-24 hybrid pass) was every article
+    # arriving with ai_score=0.0, i.e. the digital-intern ML pipeline had
+    # silently stopped scoring. Surfacing the distinction tells the operator
+    # *which* upstream to restart. Suppressed (empty) when ``scored_2h`` is
+    # unknown — the pure-builder fixture path that doesn't pass the new field
+    # keeps its byte-identical pre-fix headline.
+    unscored_clause = ""
+    if unscored_feed:
+        unscored_clause = (
+            f" — articles ARRIVING ({live_2h} in the last 2h) but NONE pass "
+            f"the ai_score>={LIVE_MIN_SCORE:.1f} gate the live trader feeds "
+            f"Opus; the digital-intern ML scoring pipeline appears down — "
+            f"restart the scorer, not the collector."
+        )
+
     if verdict == "NO_DATA":
         headline = (
             "NO_DATA — no resolved article DB"
@@ -231,13 +285,13 @@ def build_feed_health(decisions: list[dict], feed: dict,
             f"the trader is flying blind. Newest live article in "
             f"{resolved_path} is {age_txt}; {live_2h} live article(s) in the "
             f"last 2h (the get_top_signals window strategy.decide() feeds "
-            f"Opus){split_clause}")
+            f"Opus){unscored_clause}{split_clause}")
     elif verdict == "STALE_FEED":
         headline = (
             f"STALE_FEED — newest live article in {resolved_path} is "
             f"{age_txt} (>{STALE_HOURS:.0f}h); the trader's 2h signal window "
             f"holds {live_2h} article(s). {blind_streak} most-recent "
-            f"decision(s) already saw 0 signals{split_clause}")
+            f"decision(s) already saw 0 signals{unscored_clause}{split_clause}")
     else:
         headline = (
             f"HEALTHY — newest live article {age_txt}; {live_2h} live "
@@ -255,6 +309,14 @@ def build_feed_health(decisions: list[dict], feed: dict,
         "resolved_newest_age_h": resolved_age,
         "resolved_live_2h": live_2h,
         "resolved_live_24h": live_24h,
+        # Sub-classification: the article DB is fresh and carrying rows but
+        # NONE pass the live trader's ai_score gate (the digital-intern ML
+        # scoring pipeline is silently down). None == "caller did not supply
+        # the scored count this build", which suppresses the new headline
+        # clause entirely so legacy/test callers see the byte-identical
+        # pre-fix output. The endpoint passes resolved_scored_2h.
+        "resolved_scored_2h": scored_2h,
+        "unscored_feed": unscored_feed,
         "split_brain": split_brain,
         "legacy_path": legacy_path,
         "legacy_newest_age_h": legacy_age,
@@ -267,4 +329,5 @@ def build_feed_health(decisions: list[dict], feed: dict,
         "blind_streak_min": BLIND_STREAK_MIN,
         "stale_hours": STALE_HOURS,
         "split_brain_gap_h": SPLIT_BRAIN_GAP_H,
+        "live_min_score": LIVE_MIN_SCORE,
     }
