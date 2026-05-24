@@ -5,6 +5,112 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-24 hybrid pass #33 (Agent 3) — subject_pct_after recap leak + recap_noise_by_source
+
+Debugger + feature-dev + news-analyst pass. 3221 tests green at pass start;
+3234 at end (+13). All four load-bearing invariants intact.
+
+**Phase 1 (bug fix) — committed in `4b5f4ba`:**
+
+Live evidence (2026-05-22..24, 7d articles.db urgency=2 scan): 5 alerted
+SUBJECT-led recap-mill rows the existing `^Why`-anchored gates miss — content
+states the price-attribution as fact, not as a question:
+  * "D-Wave Quantum (QBTS) Is Up 44.5% After $100M Federal Equity Investment"
+    (simplywall.st, ai=9.0, Sonnet over-scored)
+  * "NVIDIA (NASDAQ:NVDA) Shares Down 1.9% After Analyst Downgrade"
+    (MarketBeat, ml=9.98 score_source='ml')
+  * "Lumentum (NASDAQ:LITE) Shares Down 8.8% After Insider Selling"
+    (MarketBeat, ml=9.63 — HELD position, direct analyst noise)
+  * "MakeMyTrip (MMYT) Is Down 7.8% After Mixed FY26 Earnings"
+    (ml=9.87, pure SEO spam — not held)
+
+All four sources sit above the 0.45 `ALERT_MIN_LONE_SOURCE_CRED` bar so the
+authority gate cannot catch them; content type IS the failure.
+
+Added `_RT_SUBJECT_PCT_AFTER` to `watchers.alert_agent._RECAP_TEMPLATE_PATTERNS`
+plus lockstep mirror in `analysis.claude_analyst._BRIEFING_RECAP_TEMPLATE_PATTERNS`
+(structural parity enforced by `test_alert_and_briefing_recap_tuples_have_same_length`).
+Discriminator: `^(?!Why\b)` + 1..6 subject tokens + `(Shares|Stock(?: Is/Was/Now)?|
+Is|Are|Was|Were) (Up|Down|Higher|Lower) \d+(?:\.\d+)?% after`.
+
+The ≤6-token subject lead is what keeps this safe against real news with a
+trailing price footer ("Nvidia Beats Estimates ...; Shares Up 0.2% After
+Hours") — the verb bridge is 9+ tokens in, beyond the cap, so the BREAKING
+verb at the front survives. Validated against the must-survive corpus and
+against the live failure cases (boundary-pinned in tests).
+
+2 new tests pin all 4 live failures + sibling variants (Apple/Tesla/AMD/Intel/
+Micron/QBTS) and verify the over-catch guard against real wire copy.
+
+**Phase 2 (feature) — committed in `88373a5`:**
+
+`analytics.recap_noise_by_source` — per-source content-aware noise factory
+detector. For every source with ≥ MIN_PER_SOURCE=20 high-relevance rows
+(`ai_score >= 5 OR ml_score >= 8`) in the 72h lookback, computes the
+fraction matching ANY `_RECAP_TEMPLATE_PATTERNS` fingerprint. Sources above
+30% are flagged as noise factories the operator should consider gating at
+the collector layer.
+
+Distinct signal from `junk_source_detector` (raw title-uniqueness). MarketBeat,
+simplywall.st, GuruFocus, bloomingbit emit content-diverse but structurally-
+retrospective titles, so the uniqueness-ratio detector passes them unchanged.
+This module is exactly that gap.
+
+Live audit (72h, 1523 rows scanned, 12 sources evaluated): no source crossed
+the 30% bar — the existing pre-floor gates suppress SEO-mill rows before they
+reach the high-relevance pool. Top offenders are YahooFinance/NVDA (15.0%,
+top: `is_buy_after / earnings_call_recap / why_trading_today`) and
+Finnhub/Yahoo (11.8%, top: `earnings_call_recap / is_buy_after /
+quick_glance_metrics`) — content-diverse aggregators mixing legit wires with
+recap-mill rebroadcasts.
+
+Pure-builder design: `build_report(rows)` takes a list of
+`(source, title, ai_score, ml_score)` tuples — fully unit-testable without
+SQLite. `main()` wires the live DB to it. SSOT imports
+`_RECAP_TEMPLATE_PATTERNS` directly so new gates added there are
+auto-tracked here on next run.
+
+11 new tests pin pure-recap detection, sample-size floor, threshold boundary,
+fingerprint breakdown ordering, worst-offender ordering, None-source
+normalisation, and report metadata keys.
+
+CLI: `python3 -m analytics.recap_noise_by_source`.
+
+**Phase 3 (live validation) — 7 findings:**
+
+1. **Subject-led recap leak fixed** (Phase 1 above). Future SUBJECT-led
+   "Shares Up/Down N% After" / "Is Up/Down N% After" mill rows are pre-
+   floored to `ai_score=0.01` by the existing urgency_scorer SSOT pre-floor.
+2. **Briefing health is good.** Latest 04:54 UTC, 50 articles; lead correctly
+   synthesises post-NVDA rotation into laggards (QCOM/AXTI/QBTS rip, NVDA
+   fades for 2nd session). Content includes MACRO table, PORTFOLIO table
+   (LITE/LNOK/MUU/MU/NVDA), SEMIS PULSE, TOP SIGNALS with timestamps and
+   scores, and RISK/CATALYST forward guidance — actionable analyst product.
+3. **Briefing cadence variable.** Last 5 briefings: 04:54, 20:18, 14:52,
+   09:39 (May 23), then 06:01 (May 22) — a ~28h gap between the last May 22
+   briefing and the next one. Recent cadence ~5-8h vs the 5h target — the
+   `briefing_cadence_trend` signal flags this as SLIPPING but
+   `briefing_health` reports HEALTHY at point-in-time (most recent <5h ago).
+4. **Ingestion rate strong.** 1411 articles/hr, 5489/24h live (backtest
+   excluded). Top sources: stocktwits (135/hr), GN topic feeds (76-82/hr),
+   scraped/finance.yahoo.com (45/hr), AlphaVantage/MarketBeat (38/hr).
+5. **Alert volume reasonable.** 74 alerts in 24h, 15 mention held tickers
+   by title heuristic. urgent_queue (urgency=1) is empty — the alert worker
+   is keeping up with the pre-floor gates working.
+6. **Score-source distribution healthy.** Last 24h: ml=4540 (84%),
+   llm=387 (7%), None=562 (10% — within scoring window). Sonnet quota
+   conserved for grey-zone routing as designed.
+7. **External source 401/403 errors are widespread but non-fatal.** OECD,
+   IMF, Motley Fool, Investors Business Daily, Hedgeye, TSMC, Seeking Alpha,
+   Politico, BusinessWire, congress_trades — most are paywall/UA blocks
+   from premium feeds. Wikipedia + FRED occasional read-timeouts. The
+   GDELT/dailypolitical.com / GDELT/tickerreport.com silence is GOOD —
+   they're explicitly down-rated by `_LOW_AUTHORITY_DOMAINS` (0.25).
+
+**Counters:** bugs_fixed=1 features_added=1 user_findings=7. All 3234 tests pass.
+
+---
+
 ## 2026-05-24 hybrid pass #32 (Agent 3) — commodity_futures urgency-threshold drift + collector_direct_urgent_audit
 
 Debugger + feature-dev + news-analyst pass. Codebase is mature (3120 tests
