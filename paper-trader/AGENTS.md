@@ -6,6 +6,124 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 core HYBRID pass #7 (Agent 1) — `/api/cycle-gap-summary` historical companion to `/api/decision-cadence`
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Re-read `runner.py`, `reporter.py`, `signals.py`, `strategy.py`,
+`dashboard.py`, `market.py`, `store.py`. The codebase remains heavily
+hardened (519 tests pass clean across the focused set I ran). Recent
+passes #4 / #6 already honestly reported `bugs_fixed = 0` for the same
+files; the defensive comments throughout cite the specific commits each
+guard fixed. Advisor concurred: declined to fabricate a fix. Set
+`bugs_fixed = 0` honestly, no Phase 1 commit.
+
+### Phase 2 — Feature: `/api/cycle-gap-summary` — historical view of inter-decision gaps vs the dynamic cadence floor
+
+**The gap.** `/api/decision-cadence` (commit `02ef1c5`) answers "is the
+CURRENT cycle on schedule against the dynamic-interval tier?". No
+existing surface answers the orthogonal historical question every
+portfolio manager asks when the live `/api/runner-heartbeat` headline
+looks fine: **"of the LAST N cycles, how many actually fired on the
+schedule the runner asked for? Was the loop SMOOTH or did it lurch
+through long gaps?"**. The neighbouring surfaces each cover a piece:
+`runner-heartbeat` is the most-recent decision pulse,
+`decision-paralysis` is HOLD/NO_DECISION STREAK length,
+`decision-clock` is per-NY-hour count concentration,
+`decision-efficacy` is share of cycles that produced any decision —
+none summarise the inter-decision GAP distribution over a window.
+
+**The module.** `paper_trader/analytics/cycle_gap_summary.py` (362
+lines). Pure builder over `recent_decisions(limit=50)` rows
+(newest-first, matching the convention every sibling builder uses).
+Walks pairwise gaps older→newer (so a wall-clock step-back clamps to
+0, never a negative cycle gap — the `signals._age_hours` /
+`decision_cadence` hardening precedent), summarises
+median/mean/p95/max/min/stdev/CoV, surfaces the worst gap's
+start_ts/end_ts/gap_s, and emits a 4-state verdict ladder:
+
+| Verdict        | Trigger |
+|----------------|---------|
+| `NO_DATA`      | < 2 decisions in the window |
+| `INSUFFICIENT` | fewer than `MIN_GAPS` (8) usable gaps |
+| `STALLED`      | max gap ≥ `STALL_GAP_S` (10800s — pure wedge) OR p95 ≥ `STALL_P95_S` (7200s — sustained tail above the longest healthy tier) |
+| `JITTERY`      | coefficient of variation > `JITTERY_CV` (1.0) |
+| `SMOOTH`       | neither stalled nor jittery |
+
+**Threshold calibration from live data.** First draft used an
+"if p95 ≥ 6× median" rule and tripped STALLED on the live 49-gap
+window (median 350s OPEN-tier mixed with p95 3870s QUIET_CLOSED-tier).
+The verdict was wrong because legitimate dynamic-interval tier
+transitions LEGITIMATELY produce that spread — not a wedge. Switched
+to an ABSOLUTE p95 threshold (7200s, above the longest healthy
+QUIET_CLOSED tier of 5400s) so only sustained tail wedges trip the
+rule. The live verdict is now `JITTERY` (high CoV from legitimate
+tier mix) — an accurate, trader-useful read instead of a false alarm.
+
+Wired into `dashboard.py` as `/api/cycle-gap-summary` (placed
+adjacent to `/api/decision-cadence` per the natural-companion pattern
+— both observational-only, both pure-store reads, both honour
+invariants #2/#12). Same failure contract as every sibling endpoint:
+500-on-builder-fault → JSON error envelope (test-pinned).
+
+**Test coverage (29 new tests, all green in 0.6s):**
+- `_median` / `_percentile` / `_stdev` exact-arithmetic unit tests
+- Each verdict (`NO_DATA` / `INSUFFICIENT` / `SMOOTH` / `JITTERY` /
+  `STALLED`) plus boundary discipline (`MIN_GAPS` exact)
+- Both STALLED triggers (max rule + p95 rule), STALLED-over-JITTERY
+  precedence, SMOOTH-over-JITTERY when CoV < threshold
+- Threshold echo always present (even on NO_DATA envelope)
+- Clock-step-back gap clamps to 0 (never negative)
+- Garbage-row tolerance (mixed bad/good rows produce valid envelope)
+- Naive `now` argument treated as UTC
+- Headline format starts with the verdict name (so a Discord/dashboard
+  caller can colourise by leading token)
+- Coefficient of variation is `None` on `median=0` (degenerate
+  identical-ts case — JITTERY can't fire, SMOOTH wins)
+
+### Phase 3 — Live validation findings (user_findings = 4)
+
+1. **Live `/api/cycle-gap-summary` returns `JITTERY` with CoV 3.55.**
+   The current window straddles the 16:00 ET close, so the median is
+   350s (intra-session) and the max is 5415s (~QUIET_CLOSED).
+   That CoV is normal for a regime-spanning window; the verdict
+   correctly distinguishes "lurchy by design" from "wedged" (would
+   have shown `STALLED` under the first-draft p95-multiplier rule).
+2. **Parallel HYBRID agents detected via `ps`.** Agent 2
+   (ML+backtests) and Agent 4 (feature-dev) are running concurrently
+   on the same tree. Respected the
+   `pt-concurrent-samerole-staging-race` memory: committed with
+   explicit pathspec, never `git add -A`, never touched the sibling-
+   in-flight files (`paper_trader/reporter.py` and
+   `paper_trader/backtest.py` both have uncommitted sibling edits).
+3. **Dashboard endpoints uniformly healthy.** `/api/state`,
+   `/api/portfolio`, `/api/runner-heartbeat`,
+   `/api/decision-cadence`, `/api/risk`, `/api/swr-cache-health`,
+   `/api/cycle-gap-summary` all returned 200 in under 30ms post-
+   restart. The git-watcher correctly picked up my push and
+   restarted the runner; the dashboard re-bound `:8090` within 15s.
+4. **NO_DECISION rate sustained at 25%** (15/20 last cycles produced
+   a decision). `decision_efficacy.verdict` is `PRODUCING` so this
+   is non-actionable, but worth recording — a creeping rise would be
+   visible against this baseline.
+
+### Phase 4 — Counters
+
+bugs_fixed = 0 · features_added = 1 · user_findings = 4
+
+```bash
+# Hit the new endpoint:
+curl -s localhost:8090/api/cycle-gap-summary | jq
+
+# CLI smoke (against the live decisions table):
+python3 -m paper_trader.analytics.cycle_gap_summary
+
+# Tests:
+python3 -m pytest tests/test_cycle_gap_summary.py -v
+```
+
+---
+
 ## 2026-05-24 ML+backtest HYBRID pass #33 (Agent 2) — `DecisionScorer.feature_group_contributions` operator triage roll-up
 
 ### Phase 1 — Debug: bugs_fixed = 0
