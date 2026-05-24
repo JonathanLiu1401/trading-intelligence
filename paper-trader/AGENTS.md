@@ -6,6 +6,113 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 core HYBRID pass #6 (Agent 1) — `/api/swr-cache-health` operator endpoint
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Audited `runner.py`, `signals.py`, `strategy.py`, `dashboard.py`, `market.py`,
+`store.py` for new bugs. The codebase is heavily tested (913 core tests pass)
+and the new helpers added in passes #1-#5 (alarm latches, passive signal
+density, regime-leverage fit) already cover the corners I would have
+targeted. No real-bug fixes worth committing.
+
+### Phase 2 — Feature: `/api/swr-cache-health` — operator view of SWR cache table
+
+**Gap.** `dashboard._SWR_STATE` is the in-process table of every
+`@swr_cached` endpoint's last-good-build timestamp, `fail_count`,
+`last_error`, `last_error_ts`, and `last_ok_ts`. When a background rebuild
+keeps raising (a yfinance hang, a digital-intern lock, an analytics-builder
+regression) the panel stays on its last good payload indefinitely while the
+failures accumulate — silently. The existing `_SWR_FAIL_LOG_EVERY` throttle
+writes a stderr line on the 1st and every 10th consecutive failure, but the
+operator must be tailing the log to see it; nothing surfaced this on the
+dashboard itself. Live evidence: the very first `/api/state` curl in this
+pass returned `cache_age_s: 9329.9s` (2.6 h since the last successful
+rebuild) — exactly the silently-stale pattern this endpoint is built to
+expose.
+
+**Surface.** `paper_trader/analytics/dashboard_cache_health.py` exposes a
+pure `build_cache_health(swr_state, now=None)` builder that takes the raw
+`_SWR_STATE` dict and emits a verdict-tagged snapshot. Per-entry verdict
+ladder pinned in tests:
+
+  * **`NEVER_BUILT`** — entry has no `data` (cold start, never polled).
+  * **`FAILING`** — `fail_count >= 3` consecutive rebuild failures; the
+    panel will not self-heal until the handler stops raising.
+  * **`STALE`** — has data and last successful build is older than 600 s
+    (10× the longest swr_cached TTL — STRICTLY older, the threshold is
+    HEALTHY-inclusive).
+  * **`HEALTHY`** — has data, last good build is fresh, `fail_count` below
+    the threshold.
+  * **`ERROR`** — per-entry parse fault (a fifth verdict, distinct from
+    FAILING — the error is in OUR code, not the cached endpoint's).
+
+Aggregate ladder: `HEALTHY` (no FAILING entries), `DEGRADED` (≥1 FAILING
+but ≥1 HEALTHY), `FAILED` (every data-bearing entry is FAILING), `NO_DATA`
+(empty state). `NEVER_BUILT` and `STALE` do not count against the
+aggregate — only persistent-failure is operator-actionable.
+
+`/api/swr-cache-health` composes the builder verbatim over `_SWR_STATE`
+and is **deliberately NOT @swr_cached** (the `notify_health_api` /
+`alarm_latches_api` precedent): the builder is a pure dict scan over module
+globals with no I/O, so caching would add cost without benefit AND would
+hide the cache table's own health behind itself. Failure contract degrades
+to a valid-shaped ERROR envelope, never a 500.
+
+Entries in the response are sorted FAILING-first, then ERROR / STALE /
+NEVER_BUILT / HEALTHY, then by key — the operator's eye lands on the
+actionable rows first.
+
+### Phase 3 — Live validation findings (user_findings = 5)
+
+1. **`/api/state` SWR cache was 2.6h stale at first curl.** Background
+   rebuilds had not refreshed in 2h 36m. First curl took 7.9s (cold-ish);
+   a second curl 1s later was 3.6ms (now-fresh cache). Working-as-intended
+   under SWR semantics but exactly the kind of "is anyone polling this?"
+   diagnostic the new `/api/swr-cache-health` endpoint surfaces.
+
+2. **`/api/runner-heartbeat` headline disagrees with itself.** The header
+   string reads `HEALTHY — last decision 6m ago` while `real_decision_age`
+   on the same response says `2h 52m`. Both are correct but they read from
+   different fields (`last_decision_ts` includes NO_DECISION rows;
+   `last_real_decision_ts` is HOLD/FILLED/BLOCKED only). A trader scanning
+   the headline sees a green light over a 3-hour silent stretch. Not a bug
+   I'm fixing in this pass — the field semantics are documented — but worth
+   noting as a UX gap.
+
+3. **`latches.consecutive_no_decisions` (=1) and
+   `decision_efficacy.consecutive_no_decision` (=2) disagree on the same
+   payload.** Different source dicts polled at slightly different times.
+   Confusing but cosmetic.
+
+4. **systemd `paper-trader.service` is in a restart loop (counter=1277).**
+   The manual launch under PID 2066845 holds the singleton flock; the
+   systemd-spawned instance fails to acquire it and exits 1, retries 15s
+   later forever. Documented in the `pt-systemd-vs-manual-restart-spam`
+   memory — known, expected, not actionable.
+
+5. **`continuous.log` is full of GDELT throttling / connection-reset
+   retries.** This is the expected free-tier rate-limiting behaviour
+   (`GDELT_RATE_LIMIT_S = 5.5`); the backtest loop tolerates it via the
+   3-attempt retry. Not actionable.
+
+### Phase 4 — Counters
+
+bugs_fixed = 0 · features_added = 1 · user_findings = 5
+
+```bash
+# Hit the new endpoint:
+curl -s localhost:8090/api/swr-cache-health | jq
+
+# CLI smoke (against the live dashboard's _SWR_STATE):
+python3 -m paper_trader.analytics.dashboard_cache_health
+
+# Tests:
+python3 -m pytest tests/test_dashboard_cache_health.py -v
+```
+
+---
+
 ## 2026-05-24 ML+backtest HYBRID pass #32 (Agent 2) — `tp_band_sweep` analyzer + decisive NO_BAND_HELPS finding
 
 ### Phase 1 — Debug: bugs_fixed = 0
