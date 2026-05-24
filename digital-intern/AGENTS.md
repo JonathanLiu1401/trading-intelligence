@@ -5,6 +5,107 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-24 hybrid pass #30 (Agent 3) — ArticleStore.briefing_cadence_trend: early-warning sibling to briefing_health
+
+Debugger + feature-dev + news-analyst pass. **No Phase 1 commit** — the
+codebase is mature (143 focused-suite tests green at pass start, 582 briefing-
+related tests green after my +23). Every load-bearing invariant the prompt
+called out (backtest isolation in `get_unalerted_urgent` / `get_top_for_briefing` /
+`get_unscored`, ai_score vs ml_score separation in `update_ml_scores_batch`,
+`score_source` tagging, urgency state machine) is already pinned by the
+existing suite. Scanned the alert pipeline (quote-widget / recap-template /
+low-authority / cross-cycle / paraphrase suppression gates), urgency-scorer
+pre-floor, the recap-template fingerprint set, the shared-connection cursor-
+collision retry decorator, and the strong-pool predicate. None reproduce as
+a bug on current HEAD; observed `database is locked` lock-retry-exhausted
+events in the rolling daemon logs match the documented
+`[DI insert_batch lock contention]` memory.
+
+**Phase 2 (feature) — committed in `247a535`:**
+
+- `storage/article_store.py::briefing_cadence_trend(last_n=10,
+  expected_cadence_h=5.0)` — the *trend* sibling to `briefing_health`. The
+  prior pass shipped `briefing_health` (point-in-time freshness verdict over
+  the most recent briefing). It is correct on what it measures but cannot
+  detect a path that **just produced** a briefing yet has been materially
+  slipping for the last 10 cycles. Live evidence pulled at pass time:
+
+      intervals_h: 5.26, 6.26, 10.23, 7.08, 10.26, 5.09, 27.64, 5.21, 5.43, 8.61
+      mean 9.11h (82% slower than the 5h HEARTBEAT_INTERVAL)
+      max 27.64h (a 5x miss — one stalled cycle near pass start)
+
+  `briefing_health` on the same DB returned verdict=`HEALTHY`
+  (most-recent 5.34h ago, count_in_window 3 >= 60% floor of 4.8 expected).
+  Both are correct on what they measure; the trend is the missing axis.
+
+  Returns a 9-key dict (`expected_cadence_h`, `last_n`, `n_intervals`,
+  `intervals_h`, `mean_interval_h`, `max_interval_h`, `p50_interval_h`,
+  `drift_pct`, `verdict`) with a closed 4-string verdict alphabet,
+  precedence high → low (mirrors `ml_training_health`'s severity ladder):
+
+  - `NO_DATA` — fewer than 2 intervals (need at least 2 to draw a trend;
+    a single gap could be a transient and is already the STALE regime).
+  - `DRIFTING` — `mean > 1.5 * expected_cadence_h` (50%+ slow on average).
+  - `SLIPPING` — `mean > 1.2 * expected_cadence_h` OR
+    `max > 2.0 * expected_cadence_h` (20%+ slow on average, OR a single
+    gap >= 2 cadences — early warning, exactly the pattern that flipped to
+    DEAD once in the live evidence above).
+  - `ON_CADENCE` — everything else.
+
+  Pure SELECT on the `briefings` table (write-once, never touched by
+  backtest paths). Read-only — no DB write, no ai_score / ml_score /
+  score_source / urgency mutation. All four load-bearing invariants intact
+  by construction. Pinned by 23 tests in `tests/test_briefing_cadence_trend.py`:
+  verdict ladder including the DRIFTING-outranks-SLIPPING precedence
+  guard and a live-evidence reproducer; interval-math correctness (chrono
+  ordering newest-last, last_n cap, mean/p50/max consistency, drift_pct
+  sign convention, zero-gap handling); parameter clamps (last_n floor,
+  expected_cadence_h floor); defensive timestamp parsing; result-shape
+  stability across NO_DATA and populated states; read-only contract on
+  the articles table.
+
+**Phase 3 (live user validation) — user_findings=3:**
+
+1. **NEW briefing_cadence_trend on live log: verdict=DRIFTING.** Live evidence
+   above. The briefing path reads HEALTHY by `briefing_health` (most recent
+   5.34h ago) but the trend exposes that the prior 10 briefings averaged
+   9.11h gaps with one 27.64h stall — exactly the pre-warning gap the new
+   primitive fills, and now queryable.
+2. **`ml_training_health` still DEAD.** Last successful train **51.68h ago**.
+   Same documented `[DI ml-trainer subprocess timeout]` failure mode as the
+   prior pass observed. `val_loss_trend` (newest→oldest)
+   `[2.19, 0.64, 0.84, 1.17, 1.49]` — the most-recent run is more than 3x
+   worse than the prior best. The trainer-cycle DEAD verdict has not
+   recovered since the previous pass; this is the standing condition the
+   `ml_training_health` primitive correctly surfaces.
+3. **Alert pipeline healthy; ingestion strong.** 1076 articles ingested in
+   last hour from 162 distinct sources. 24h urgent split 51% LLM-vetted
+   (21 LLM / 20 ML-only of 41 urgent rows) — borderline but recovered
+   above the chronic ~29% baseline. Latest briefing covers the post-NVDA
+   rotation cleanly (QCOM +11.6%, AXTI +16.4%, QBTS +14.2% as rotation
+   beneficiaries; Samsung memory strike ripple as TOP SIGNAL #1).
+   `urgent_queue_health`: 0 queued, 0 overdue. Lock contention
+   counters 0/0 (process freshly restarted; the chronic lock-retry-
+   exhaustion pattern is documented in `[DI insert_batch lock contention]`
+   and still observed in the rolling `daemon.log.*` files but does not
+   currently affect any urgent path).
+
+**Phase 4 (docs):** this section.
+
+**Final verify:** `from storage import article_store; from ml import
+features, model` → `imports OK`. Focused suite:
+`tests/test_briefing_cadence_trend.py` (23) +
+`tests/test_article_store.py` + `tests/test_briefing_health.py` +
+`tests/test_urgency_scorer.py` + `tests/test_features.py` +
+`tests/test_alert_agent.py` + `tests/test_model.py` +
+`tests/test_trainer.py` + `tests/test_web_scraper.py` +
+`tests/test_ml_training_health.py` = **166 pass / 0 fail** in 8.0s.
+Full briefing-related sweep (`-k briefing`): **582 pass / 0 fail** in 18.2s.
+
+**Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=3`.
+
+---
+
 ## 2026-05-24 hybrid pass #29 (Agent 3) — analytics.ml_training_health: trainer cycle health snapshot
 
 Debugger + feature-dev + news-analyst pass. **No Phase 1 commit** — the
