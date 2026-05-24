@@ -5,6 +5,92 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-24 hybrid pass #32 (Agent 3) — commodity_futures urgency-threshold drift + collector_direct_urgent_audit
+
+Debugger + feature-dev + news-analyst pass. Codebase is mature (3120 tests
+green at pass start). Every load-bearing invariant is well-pinned; finding a
+new bug required tracing actually-noisy alerts in the live DB.
+
+**Phase 1 (bug fix) — committed in `630669a`:**
+
+Live evidence: 5 alerted `commodity_futures` rows in 30 days, all at
+`kw_score` 6.00-6.18 — barely-above-threshold price moves (Brent +2.3%,
+WTI +2.4%, Copper +2.0%) firing BREAKING Discord pushes the analyst would
+not consider breaking. The collector hard-coded
+`urgency = 1 if score >= 6.0 else 0`, bypassing the system-wide
+`URGENT_THRESHOLD=8.0` that `watchers.urgency_scorer` and the ML
+`score_pending` path both enforce. Other direct-write collectors
+(`dxy`, `vix_term_structure`, `sector_etf`) were checked and explicitly
+NOT changed — their `kw_score` formulas never reach 6.0 in practice
+(advisor caught the over-fit blanket-fix tendency before commit).
+
+The fix imports `URGENT_THRESHOLD` from `watchers.urgency_scorer` so the
+link is explicit and a future shift cannot silently re-drift this
+collector out of alignment. 5 new tests pin boundary behaviour (Brent
+2.3% → urgency=0, Brent 6%+ → urgency=1) and that the literal `6.0` /
+the absent `URGENT_THRESHOLD` reference cannot reappear.
+
+**Phase 2 (feature) — committed in `b2f4122`:**
+
+`analytics.collector_direct_urgent_audit` — per-source verdict on which
+collectors fire urgent rows that NEITHER Sonnet NOR the local model
+endorse as urgent. The 30-day commodity_futures bug would have been
+flagged on day 1: a 168h live run reports `commodity_futures` as the
+sole suspect (5/5 uncorroborated, fraction=1.0) — the only suspect
+across 132 sources, exactly the noise pattern the new test gate locks
+in. Two failure modes fold into one verdict:
+  * `kw_only` — collector wrote urgency=1, pipeline never scored
+  * `ml_below_threshold` — collector wrote urgency=1, scorer assigned
+    `ml_score < URGENT_THRESHOLD` (the commodity pattern verbatim)
+
+Read-only, `_LIVE_ONLY_CLAUSE`-filtered, no write paths touched. 17 tests
+cover the classifier, aggregator, suspect filter, and an end-to-end run
+against an in-memory SQLite store (with backtest-row exclusion assertion).
+
+CLI: `python3 -m analytics.collector_direct_urgent_audit --hours 168`.
+
+**Phase 3 (live validation) — 5 findings:**
+
+1. **Commodity noise fixed** (Phase 1 + Phase 2 above). Audit now reports
+   `commodity_futures` as the sole 100%-uncorroborated suspect; the
+   Phase 1 cutoff change means future 2-2.5% moves no longer fire
+   BREAKING pushes.
+2. **Briefing health is good.** Latest at 04:54 UTC, 50 articles, Bloomberg-
+   style lead correctly synthesises post-NVDA rotation into laggards
+   (QCOM/AXTI/QBTS/AMD up, NVDA fading). 4 briefings in 24h vs the
+   theoretical 4.8 (~5h cadence), well within healthy band.
+3. **Collection rate strong:** 1306 articles in last hour vs 177/h
+   baseline. Held-ticker coverage solid (NVDA 77, MU 38, QBTS 24,
+   AXTI 17 in 24h).
+4. **ML-vs-LLM urgent ratio remains ~75% ML.** 989 ML-only vs 332 LLM-
+   confirmed alerts in DB. Already partially addressed by the
+   `[unverified — model-only urgent]` calibration tag in
+   `watchers.alert_agent.ALERT_PROMPT`; the new audit is the missing
+   measurement primitive that turns the ratio into per-source signal.
+5. **Load-bearing invariants intact.** Zero backtest rows in urgent
+   queue, zero `ml_score` writes that landed in `ai_score`, zero LLM
+   rows wrongly tagged `score_source='ml'`. All three invariants the
+   pass instructions named as critical verify clean.
+
+**Phase 4 — final verify:**
+
+- `python3 -c "from storage import article_store; from ml import features,
+  model; print('imports OK')"` → green.
+- Focused: `test_commodity_urgency_threshold` 5 pass,
+  `test_collector_direct_urgent_audit` 17 pass,
+  `test_article_store` 13 pass, `test_alert_agent` 26 pass.
+- Full `pytest tests/`: **3142 pass / 0 fail in 133s** (up from 3120 at
+  pass start → +22 new tests).
+
+**Staging discipline.** Per-commit explicit pathspec. Working copy carried
+foreign uncommitted changes at start (`dashboard/web_server.py`
+auto-commit-daemon edits; sibling-agent untracked files in
+`analytics/`, `collectors/`, paper-trader). All left untouched.
+`git diff --staged` verified before each commit that only this agent's
+files were staged (Phase 1: 2 files, Phase 2: 2 files).
+
+---
+
 ## 2026-05-24 hybrid pass #31 (Agent 3) — score_pending ML-path recap/quote-widget pre-floor (FOURTH gate surface)
 
 Debugger + feature-dev + news-analyst pass. The codebase is mature (179
@@ -157,6 +243,126 @@ features, model` → `imports OK`. Focused suite:
 `tests/test_recap_template_audit.py` = **179 pass / 0 fail** in 10.0s.
 
 **Counters:** `bugs_fixed=1`, `features_added=1`, `user_findings=4`.
+
+---
+
+## 2026-05-24 feature-dev pass #2 (Agent 4) — TRADE-ASYMMETRY + REBUY-REGRET + SCORER-vs-BOOK chat enrichments
+
+Three chat blocks shipped, each piping an existing paper-trader endpoint
+that was *not yet wired to the chat* into `/api/chat`. Each fills a
+distinct structural gap not covered by the ~38 existing chat blocks
+(the prior pass shipped passive-signal-density / news-to-trade-lag /
+catalyst-expiry; this extends the same lane).
+
+- `_trade_asymmetry_chat_lines` pipes `/api/trade-asymmetry` (the
+  payoff-ratio + disposition-effect diagnostic — are we cutting winners
+  short while letting losers run?). Every other realised-P&L block
+  reduces closed trips to either an aggregate (`analytics_block`'s
+  win_rate / profit_factor) or a per-bucket count (`exit_intent_audit`
+  by stated reason); none surface the classic PAYOFF_TRAP pathology
+  (high win-rate hiding negative expectancy because small wins / large
+  losses) or the DISPOSITION_BLEED pathology (winners cut shorter than
+  losers). Fires ONLY on `PAYOFF_TRAP` / `DISPOSITION_BLEED` — every
+  other verdict (`EDGE_POSITIVE`, `FLAT`, null when EMERGING / NO_DATA)
+  collapses to silence, matching the `_decision_paralysis_chat_lines`
+  silence precedent (the builder's own `stable_min_round_trips=20`
+  gate keeps thin samples silent). Headline passes verbatim from the
+  trader endpoint; detail line restates `payoff_ratio` /
+  `actual_win_rate_pct` / `breakeven_win_rate_pct` /
+  `avg_winner_hold_days` / `avg_loser_hold_days` from the endpoint's
+  *own* fields — never a recomputation.
+
+- `_rebuy_regret_chat_lines` pipes `/api/rebuy-regret` (the DOLLAR
+  question on sell-then-rebuy hops — did the bot sell low and buy back
+  higher?). `reentry-velocity` already covers cadence (CHURN_RISK /
+  STABLE); `round-trip-postmortem` grades whether the SELL was
+  well-timed against the next drift; neither answers whether the
+  actual BUY that followed came at a materially worse price. Fires
+  ONLY on `REGRETTING` — `SAVINGS` / `NET_NEUTRAL` / `NO_DATA` /
+  `NO_REBUYS` / `ERROR` collapse to silence. Headline passes verbatim
+  from the trader endpoint; worst-ticker detail picks MAX
+  `net_regret_usd` (only when positive — negative regret = SAVINGS and
+  would contradict the REGRETTING headline) from the endpoint's
+  `per_ticker` array.
+
+- `_scorer_book_disagreement_chat_lines` pipes `/api/disagreement` (the
+  scorer-vs-Opus per-position disagreement panel — does the bot's OWN
+  ML, the one already trained on its outcomes, currently agree with
+  what it's holding?). This is the meta-question complementing
+  `_baseline_compare_chat_lines` (which answers "does the scorer have
+  OOS skill?") — the chat already carries the SKILL verdict but had
+  been blind to the CURRENT-BOOK ALIGNMENT verdict. A HIGH-severity row
+  is the live decision loop sitting on a position the scorer would
+  EXIT/TRIM. Fires ONLY when ≥1 HIGH-severity row exists after the
+  off-distribution pre-filter — `off_distribution=True` rows are
+  clamped extrapolation per the trader endpoint's own docstring, NOT a
+  real scorer/Opus fight, and a chat alert from such a row would
+  misrepresent the conflict (the dashboard panel keeps them visible
+  for completeness; the chat must not). `scorer_trained=False` /
+  MEDIUM-only / ALIGNED-only books all collapse to silence —
+  MEDIUM-only is deliberately kept silent so the chat alert stays
+  sharp (the three-tier severity ladder mirrors the trader's own).
+  Since the trader endpoint ships no top-level `headline` string the
+  chat composes one restating only endpoint fields (`counts.HIGH` +
+  worst row's `ticker` / `scorer_verdict` / `last_action`) — the
+  `_passive_signal_density_chat_lines` headline-composition precedent
+  for endpoints that ship counts without a headline. Worst-row
+  selection is MIN `scorer_pred_5d_pct` (scorer wants OUT hardest)
+  with alphabetical tie-break by ticker for deterministic chat output.
+
+Each helper is a pure / total function — non-dict / missing keys /
+unparseable numbers degrade to silence or the safe subset, never raising
+into the chat handler. Each is pinned by a dedicated `test_chat_*_enrichment.py`
+unit-test file (24 + 27 + 26 = 77 new tests), following the established
+`_decision_paralysis_chat_lines` / `_catalyst_expiry_chat_lines` test
+shape: verbatim-headline SSOT lock (when the trader endpoint ships one),
+single/multi-verdict actionable-only gate (every non-actionable verdict
+in the trader endpoint's documented alphabet collapses to silence), worst-
+sample selection discriminator, and pure/total robustness against garbage
+inputs.
+
+Wired into the system_prompt assembly after `_catalyst_expiry_chat_lines`,
+following the established prompt-block discipline (one introductory
+sentence per block explaining *what* the verdict surfaces and *why* the
+silence default is correct, then the block's own content).
+
+**Source files touched (digital-intern only):**
+- `dashboard/web_server.py` (+~240 lines: 3 helper functions, 3 fetch
+  blocks, 3 system_prompt f-string entries)
+- `tests/test_chat_trade_asymmetry_enrichment.py` (new, 24 tests)
+- `tests/test_chat_rebuy_regret_enrichment.py` (new, 27 tests)
+- `tests/test_chat_scorer_book_disagreement_enrichment.py` (new, 26 tests)
+
+**Phase 3 — live user findings (user_findings = 3):**
+
+1. **`/api/trade-asymmetry` is `EMERGING` (4 of 20 round-trips)** — my
+   new chat block correctly collapses to silence under the builder's
+   own n≥20 STABLE gate. Live trader headline reads "$-3.15/trade
+   expectancy, 0.4957 payoff ratio (verdict withheld until n≥20)";
+   the chat block will surface the verdict the moment the 20th
+   round-trip closes. The 4-trip sample is informative but not
+   actionable, and the chat helper correctly does not present a
+   premature verdict to the analyst.
+
+2. **`/api/rebuy-regret` is `NET_NEUTRAL`** (1 re-entry event with
+   $0.00 net regret — the 2026-05-21 02:13 NVDA SELL→01:36 NVDA BUY
+   round-trip with `price_delta=0.0`, `gap_hours=0.37`). My new chat
+   block correctly stays silent — a neutral re-entry record is not
+   chat filler. The block will fire the moment a re-entry actually
+   loses money.
+
+3. **`/api/disagreement` returns `scorer_trained=True` but
+   `n_positions=0`** (the book is empty — the documented 100%-cash
+   state since the 02:08 NVDA SELL). My new chat block correctly
+   collapses to silence — no positions means no disagreements to
+   surface. The block will fire the moment Opus puts on a position
+   the scorer would EXIT/TRIM with HIGH-severity confidence.
+
+**Final verify:** focused suite (3 new test files) = **77 pass / 0 fail**
+in 0.32s. Full `-k chat_` sweep: **876 pass / 0 fail** in 4.74s — no
+regressions in the 799 prior chat-enrichment tests.
+
+**Counters:** `bugs_fixed=0`, `features_added=3`, `user_findings=3`.
 
 ---
 

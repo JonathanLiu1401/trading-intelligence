@@ -2950,6 +2950,267 @@ def _catalyst_expiry_chat_lines(rep) -> list[str]:
     return lines
 
 
+_TA_REAL_VERDICTS = ("PAYOFF_TRAP", "DISPOSITION_BLEED")
+
+
+def _trade_asymmetry_chat_lines(rep) -> list[str]:
+    """Render paper-trader's ``/api/trade-asymmetry`` (the payoff /
+    win-rate / disposition diagnostic — are we cutting winners short
+    while letting losers run?) as compact chat-context lines.
+
+    The chat already carries ``_baseline_compare_chat_lines`` (does the
+    scorer have OOS skill?), ``_realized_vs_unrealized_chat_lines``
+    (banked vs paper), ``_exit_intent_audit_chat_lines`` (which intent
+    bucket bleeds), and ``_kelly_sizing_chat_lines`` (sizing fit to the
+    realised edge). None expose the classic disposition-effect /
+    payoff-trap pathology — a high win-rate made of small wins and large
+    losses (negative expectancy hiding under a positive record), or a
+    winner / loser hold-time skew that says the desk is patient with
+    losers and impatient with winners. ``_kelly_sizing_chat_lines``
+    consumes payoff_ratio downstream but reads it as a fixed input, not
+    a verdict in its own right.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline``
+    passes through UNCHANGED — no chat-side re-derived verdict that
+    could drift from the trader endpoint (the
+    ``_decision_paralysis_chat_lines`` precedent). The detail line
+    restates the endpoint's OWN ``payoff_ratio`` /
+    ``actual_win_rate_pct`` / ``breakeven_win_rate_pct`` /
+    ``avg_winner_hold_days`` / ``avg_loser_hold_days`` fields — never a
+    recomputation.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - ``verdict`` not in {"PAYOFF_TRAP", "DISPOSITION_BLEED"} → ``[]``:
+      EDGE_POSITIVE / FLAT / null (EMERGING / NO_DATA) all collapse to
+      silence — only the actionable behavioural-edge pathologies are
+      surfaced (the ``_decision_paralysis_chat_lines`` silence
+      precedent — a healthy or sample-thin record is not chat filler;
+      the trader endpoint's own ``stable_min_round_trips=20`` gate
+      already withholds the verdict label when n is too small).
+    - actionable verdict → builder's verbatim ``headline`` (only when a
+      usable string) + one detail line restating the numeric fields
+      above; each missing numeric simply drops its own fragment, never
+      raises (the ``_decision_paralysis_chat_lines`` precedent).
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") not in _TA_REAL_VERDICTS:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)              # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    pr = _num(rep.get("payoff_ratio"))
+    awr = _num(rep.get("actual_win_rate_pct"))
+    bwr = _num(rep.get("breakeven_win_rate_pct"))
+    wh = _num(rep.get("avg_winner_hold_days"))
+    lh = _num(rep.get("avg_loser_hold_days"))
+
+    parts: list[str] = []
+    if pr is not None:
+        parts.append(f"payoff {pr:.2f}")
+    if awr is not None and bwr is not None:
+        parts.append(f"win-rate {awr:.1f}% (need {bwr:.1f}% to break even)")
+    elif awr is not None:
+        parts.append(f"win-rate {awr:.1f}%")
+    if wh is not None and lh is not None:
+        parts.append(f"winner hold {wh:.2f}d / loser hold {lh:.2f}d")
+    if parts:
+        lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
+def _rebuy_regret_chat_lines(rep) -> list[str]:
+    """Render paper-trader's ``/api/rebuy-regret`` (sell-then-rebuy DOLLAR
+    regret quantifier — did the desk save or lose money on the
+    close→re-entry hop?) as compact chat-context lines.
+
+    ``/api/reentry-velocity`` (already wired upstream) covers the cadence
+    question (how fast does the bot re-enter after a sell — CHURN_RISK
+    vs STABLE). This is the orthogonal DOLLAR question: a bot that
+    re-enters fast at materially worse price is bleeding edge that no
+    other block exposes. ``round_trip_postmortem`` grades the next
+    drift post-exit (was the sell premature?); this grades the actual
+    BUY that followed (sold low and bought back higher?). Sign
+    convention follows the trader endpoint: ``net_regret_usd > 0``
+    means LOST money on the round-trip-to-re-entry hop.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline``
+    passes through UNCHANGED — no chat-side re-derived verdict that
+    could drift from the trader endpoint. The worst-ticker detail
+    restates the ticker's own ``net_regret_usd`` from the endpoint's
+    ``per_ticker`` array — never a recomputation.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - ``verdict`` not in {"REGRETTING"} → ``[]``: SAVINGS / NET_NEUTRAL /
+      NO_DATA / NO_REBUYS / ERROR collapse to silence — only the
+      money-losing case is actionable (the
+      ``_decision_paralysis_chat_lines`` silence precedent — a saving
+      or flat re-entry record is not chat filler).
+    - REGRETTING → builder's verbatim ``headline`` (only when a usable
+      string) + one detail line restating the worst per-ticker entry's
+      ``ticker`` / ``n_events`` / ``net_regret_usd``. Missing fields
+      degrade silently.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") != "REGRETTING":
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)              # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    per_ticker = (rep.get("per_ticker")
+                  if isinstance(rep.get("per_ticker"), list) else [])
+    worst: dict | None = None
+    worst_regret: float = float("-inf")
+    for r in per_ticker:
+        if not isinstance(r, dict):
+            continue
+        nr = _num(r.get("net_regret_usd"))
+        if nr is None:
+            continue
+        if nr > worst_regret:
+            worst_regret = nr
+            worst = r
+    if worst is not None and worst_regret > 0:
+        tk = worst.get("ticker") or "?"
+        n = worst.get("n_events")
+        n_s = f" over {int(n)} event(s)" if isinstance(n, int) and n > 0 else ""
+        lines.append(
+            f"  worst → {tk}: ${worst_regret:,.2f} net regret{n_s}"
+        )
+
+    return lines
+
+
+def _scorer_book_disagreement_chat_lines(rep) -> list[str]:
+    """Render paper-trader's ``/api/disagreement`` (the scorer-vs-Opus
+    per-position disagreement panel — where does the bot's own ML say
+    EXIT/TRIM while Opus is still long?) as compact chat-context lines.
+
+    The chat already carries ``_baseline_compare_chat_lines`` (does the
+    bot's 17-feature DecisionScorer have OOS skill at all?) and the
+    behavioural / thesis-drift / hold-discipline blocks (each open
+    position graded against its own rationale or P/L). None answer the
+    meta question: **does the bot's own ML — the one already trained on
+    its outcomes — currently agree with the actual book?** A
+    HIGH-severity row is the red flag: the live decision loop is sitting
+    on a position the scorer would EXIT/TRIM. Both panels point at the
+    same desk; this is the one that calls out when they disagree.
+
+    Pre-filter: rows where ``off_distribution=True`` are dropped — per
+    the trader endpoint's own docstring those are "clamped extrapolation"
+    (a feature vector outside the trained distribution), not a real
+    scorer/Opus fight. They surface on the dashboard for completeness
+    but a chat alert from a clamped row would misrepresent the conflict.
+
+    SSOT (paper-trader invariant #10): the surfaced row's ``ticker`` /
+    ``scorer_verdict`` / ``last_action`` / ``scorer_pred_5d_pct`` all
+    pass through verbatim from the trader endpoint — no chat-side
+    re-derived classification. The composed headline only restates
+    ``counts.HIGH`` and the worst row's own fields — never a metric the
+    endpoint did not already emit. Unlike most chat-block siblings the
+    trader endpoint ships no top-level ``headline`` string (per
+    `disagreement_api`'s implementation), so the headline is composed
+    here from endpoint-emitted counts + the worst row's verbatim
+    fields rather than passed through; the composition is still SSOT
+    in the sense that no NEW numeric is derived chat-side.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - ``scorer_trained=False`` (the builder's own qualification gate —
+      mirrors the trader endpoint's empty-``rows`` behaviour when the
+      scorer is unqualified) → ``[]``
+    - zero HIGH-severity rows post-filter → ``[]``: ALIGNED-only or
+      MEDIUM-only books collapse to silence (the
+      ``_decision_paralysis_chat_lines`` silence precedent — never chat
+      filler when the bot's ML is on board with what it's holding).
+      MEDIUM-only is deliberately kept silent here: it mirrors the
+      trader's own three-tier severity ladder, where MEDIUM is "mild
+      discomfort" and only HIGH is "the ML is screaming"; surfacing
+      MEDIUM in chat would dilute the signal.
+    - ≥1 HIGH row → a composed headline restating the trader endpoint's
+      own ``counts.HIGH`` + the worst row's ticker / scorer_verdict /
+      last_action; one detail line restating the same row's
+      ``scorer_pred_5d_pct``. Missing fields drop their own fragment,
+      never raise.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if not rep.get("scorer_trained"):
+        return []
+    rows = rep.get("rows")
+    if not isinstance(rows, list):
+        return []
+
+    high = [
+        r for r in rows
+        if isinstance(r, dict)
+        and r.get("severity") == "HIGH"
+        and not r.get("off_distribution")
+    ]
+    if not high:
+        return []
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    def _row_key(r: dict) -> tuple[float, str]:
+        # Worst = most negative scorer prediction (scorer wants OUT hardest).
+        # Tie-break alphabetically by ticker for deterministic chat output.
+        p = _num(r.get("scorer_pred_5d_pct"))
+        return (p if p is not None else 0.0, str(r.get("ticker") or ""))
+
+    high.sort(key=_row_key)
+    worst = high[0]
+
+    counts = (rep.get("counts")
+              if isinstance(rep.get("counts"), dict) else {})
+    n_high_raw = counts.get("HIGH")
+    n_high = (n_high_raw if isinstance(n_high_raw, int) and n_high_raw >= 0
+              else len(high))
+
+    tk = worst.get("ticker") or "?"
+    verdict_label = worst.get("scorer_verdict") or "?"
+    last_act = worst.get("last_action") or "?"
+
+    plural = "" if n_high == 1 else "s"
+    headline = (
+        f"Scorer vs book: {n_high} HIGH-severity scorer/Opus conflict"
+        f"{plural} — {tk} (scorer: {verdict_label}, last Opus action: "
+        f"{last_act})."
+    )
+    lines = [headline]
+
+    pred = _num(worst.get("scorer_pred_5d_pct"))
+    if pred is not None:
+        lines.append(
+            f"  worst → {tk}: scorer 5d {pred:+.2f}% vs Opus {last_act}"
+        )
+
+    return lines
+
+
 def _norm_title(t: Any) -> str:
     return str(t or "").strip().casefold()
 
@@ -7128,6 +7389,88 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: catalyst-expiry-skill fetch failed: %s", e)
 
+        # Trade-asymmetry — the payoff / win-rate / disposition diagnostic.
+        # Every other realised-P&L block (analytics_block, behavioural,
+        # streak, exit-intent-audit) reduces closed trips to either an
+        # aggregate or a per-bucket count. None expose the classic
+        # payoff-trap / disposition-bleed pathology — a high win-rate made
+        # of small wins and large losses, or a winner/loser hold-time skew
+        # that says the desk is impatient with winners. Composed verbatim
+        # by the pure _trade_asymmetry_chat_lines helper (unit-tested;
+        # SSOT — the builder's own ``headline`` is the chat headline,
+        # detail-line numerics restate the endpoint's own payoff_ratio /
+        # actual_win_rate_pct / breakeven_win_rate_pct / hold-day fields,
+        # no chat-side re-derivation). Guarded 3s read; EDGE_POSITIVE /
+        # FLAT / EMERGING / NO_DATA collapse to silence (the
+        # _decision_paralysis_chat_lines silence precedent — never chat
+        # filler when the record is healthy or sample-thin).
+        trade_asymmetry_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/trade-asymmetry",
+                    timeout=3) as resp:
+                _ta = json.loads(resp.read().decode("utf-8"))
+            trade_asymmetry_block = "\n".join(
+                _trade_asymmetry_chat_lines(_ta))
+        except Exception as e:
+            _logger().warning("chat: trade-asymmetry fetch failed: %s", e)
+
+        # Rebuy-regret — the DOLLAR question on sell-then-rebuy hops.
+        # reentry-velocity (upstream) grades the CADENCE of re-entries
+        # (CHURN_RISK / STABLE); round-trip-postmortem grades whether the
+        # SELL was well-timed against the next drift; neither answers
+        # "did the actual BUY that followed the sell come at a worse
+        # price?" — the canonical sold-low-bought-high failure mode.
+        # Composed verbatim by the pure _rebuy_regret_chat_lines helper
+        # (unit-tested; SSOT — the builder's own ``headline`` is the chat
+        # headline, no chat-side re-derived verdict). Guarded 3s read;
+        # SAVINGS / NET_NEUTRAL / NO_DATA / NO_REBUYS / ERROR collapse to
+        # silence (the _decision_paralysis_chat_lines silence precedent
+        # — never chat filler when re-entries are saving money or flat).
+        rebuy_regret_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/rebuy-regret",
+                    timeout=3) as resp:
+                _rr = json.loads(resp.read().decode("utf-8"))
+            rebuy_regret_block = "\n".join(
+                _rebuy_regret_chat_lines(_rr))
+        except Exception as e:
+            _logger().warning("chat: rebuy-regret fetch failed: %s", e)
+
+        # Scorer-vs-book disagreement — the meta question the chat had
+        # been blind to: does the bot's OWN ML (the 17-feature
+        # DecisionScorer that ``_baseline_compare_chat_lines`` grades for
+        # OOS skill) currently agree with the actual book? A HIGH-severity
+        # row is the live decision loop sitting on a position the scorer
+        # would EXIT/TRIM — the trader endpoint already exposes this
+        # ("scorer-vs-Opus disagreement panel" per its docstring) and the
+        # dashboard surfaces it, but the chat had been blind to it; the
+        # analyst could never ask "is the bot's ML on board with what
+        # it's holding?". Composed verbatim by the pure
+        # _scorer_book_disagreement_chat_lines helper (unit-tested; SSOT
+        # — the worst row's ticker / scorer_verdict / last_action /
+        # scorer_pred_5d_pct pass through unchanged, headline is composed
+        # only from counts.HIGH + the worst row's own fields). Guarded
+        # 3s read; off_distribution rows (clamped extrapolation, per the
+        # trader endpoint's own docstring) are pre-filtered out so a
+        # chat alert never misrepresents a clamped row as a real
+        # scorer/Opus fight; scorer_trained=False / zero HIGH rows
+        # collapse to silence.
+        scorer_book_disagreement_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/disagreement",
+                    timeout=3) as resp:
+                _sbd = json.loads(resp.read().decode("utf-8"))
+            scorer_book_disagreement_block = "\n".join(
+                _scorer_book_disagreement_chat_lines(_sbd))
+        except Exception as e:
+            _logger().warning("chat: disagreement fetch failed: %s", e)
+
         now_iso = datetime.now(timezone.utc).isoformat()
         system_prompt = (
             "You are a market intelligence analyst with access to a real-time news feed, "
@@ -7183,6 +7526,9 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — PASSIVE-SIGNAL DENSITY (the smoking-gun read for 'engine idle during loud news' — decision-paralysis surfaces the FACT of a HOLD-only run; passive-signal-density discriminates whether the news during that run was QUIET (informed passive — correct silence) or LOUD (deafening silence — engine sat on its hands while a real news window was open). Surfaced ONLY when DEAFENING_SILENCE, never filler when INFORMED_PASSIVE / SIGNAL_RICH_PASSIVE / NO_PASSIVE_RUN / INSUFFICIENT / NO_DATA. Mirrors the trader-side Discord block (reporter._passive_signal_density_line) so the two surfaces never disagree on what is the alert. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{passive_signal_density_block}\n\n" if passive_signal_density_block else "")
             + (f"PAPER TRADER — NEWS-TO-TRADE LAG (is the bot actually reacting to fresh news, or is it consistently 2h+ behind? trade-attribution enumerates per-trade article precedence; this block compresses that to one reactivity verdict over recent FILLED trades. A book trading 2h+ behind the wire on leveraged ETFs has bled significant edge before the entry. Surfaced ONLY when DELAYED, never filler when REACTIVE_FAST / REACTIVE / NO_ATTRIBUTION / NO_DATA — 'unmeasurable' is not an alert. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{news_to_trade_lag_block}\n\n" if news_to_trade_lag_block else "")
             + (f"PAPER TRADER — CATALYST EXPIRY (per-open-position catalyst-class + age vs catalyst-type expiry window — a position opened on an earnings beat that has sat for 5 days is on a STALE thesis even if it's still green, because earnings beats price-in within ~2 days. thesis_drift verdicts each position on P/L-since-entry; hold_discipline flags losers overstayed; only this block tracks the *catalyst clock*. Selling at small green on a zombie thesis is rational; selling at -1% on an INTACT structural thesis is not. Surfaced ONLY when ZOMBIE_HOLDINGS, never filler when ALL_FRESH / STRUCTURAL_BOOK / MIXED_BOOK / NO_DATA. Headline + worst-zombie ticker/days/class carry verbatim from the trader endpoint — restate, never re-derive):\n{catalyst_expiry_block}\n\n" if catalyst_expiry_block else "")
+            + (f"PAPER TRADER — TRADE ASYMMETRY (the payoff-ratio / disposition-effect diagnostic — are we cutting winners short while letting losers run? Every other realised-P&L block reduces closed trips to an aggregate or a per-bucket count; none expose the classic payoff-trap pathology where a high win-rate hides a negative expectancy (small wins, big losses). Surfaced ONLY when PAYOFF_TRAP / DISPOSITION_BLEED, never filler when EDGE_POSITIVE / FLAT / EMERGING / NO_DATA — the builder's own n≥20 gate keeps thin samples silent. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{trade_asymmetry_block}\n\n" if trade_asymmetry_block else "")
+            + (f"PAPER TRADER — REBUY REGRET (the DOLLAR question on sell-then-rebuy hops: did the bot sell low and buy back higher? reentry-velocity grades CADENCE (CHURN_RISK / STABLE); round-trip-postmortem grades whether the SELL was well-timed against the next drift; only this block grades whether the actual BUY that followed came at a materially worse price. Surfaced ONLY when REGRETTING, never filler when SAVINGS / NET_NEUTRAL / NO_DATA / NO_REBUYS — re-entries that save money or net flat are not chat filler. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{rebuy_regret_block}\n\n" if rebuy_regret_block else "")
+            + (f"PAPER TRADER — SCORER vs BOOK DISAGREEMENT (the meta question — does the bot's OWN ML (the 17-feature DecisionScorer that ML-GATE-HONESTY grades for OOS skill) currently agree with what it's holding? A HIGH-severity row means the live decision loop is sitting on a position the scorer would EXIT/TRIM — the dashboard already surfaces this panel but the chat had been blind to it. Surfaced ONLY when ≥1 HIGH-severity row exists (clamped off-distribution rows pre-filtered to avoid misrepresenting extrapolation as a real fight); ALIGNED-only / MEDIUM-only / scorer_trained=False collapse to silence. Worst row's ticker / scorer_verdict / last_action / scorer_pred_5d_pct pass through verbatim from the trader endpoint — restate, never re-derive):\n{scorer_book_disagreement_block}\n\n" if scorer_book_disagreement_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "
