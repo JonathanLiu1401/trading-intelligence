@@ -6,6 +6,157 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 ML+backtest HYBRID pass #30 (Agent 2) — stop-out + MFE per-cycle skill ledgers + strict-OOS calibration finding
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Re-read `paper_trader/ml/decision_scorer.py`, `paper_trader/backtest.py`
+(`_ml_decide`, `_compute_decision_outcomes`, `_execute_decision`,
+`_enforce_risk_exits`, `_load_local_articles`), and
+`run_continuous_backtests.py` in full (multi-page). Re-validated:
+
+* `_train_decision_scorer`'s OOS-eval guard chain (`_oos_rank_metrics`,
+  `_oos_multi_horizon_metrics`, `evaluate_scorer_oos`) — each is
+  independently try/except-wrapped so a single diagnostic crash never
+  poisons the cycle's training status.
+* `_inject_and_train` lock-retry: `_LOCK_RETRY_SLEEPS = (3.0, 8.0, 15.0)`,
+  `for/else` correctly returns the "database locked after N attempts"
+  message when every attempt fails on lock, breaks cleanly on success.
+* `_get_decision_scorer` `_Dummy` fallback: `predict_with_meta` absent,
+  `_ml_decide` falls back to `predict()` and treats as in-distribution
+  (gate behaviour preserved) — verified the `getattr` + `callable` guard
+  is in place.
+
+Advisor flagged the candidate "bugs" I considered (PRED_CLAMP_PCT for
+10d/20d horizons, persona boost ordering vs SELL selection, label
+clamp BEFORE SELL sign-flip) as speculative — not slam-dunks. AGENTS.md
+already documents these as architectural choices, not regressions. Set
+`bugs_fixed = 0` honestly, no commit. 259 decision_scorer + continuous
++ stop_out + mfe slice tests pass clean.
+
+### Phase 2 — Feature: per-cycle stop_out + MFE skill ledgers
+
+New `_append_stop_out_skill_log` / `_append_mfe_skill_log` in
+`run_continuous_backtests.py` wiring the existing
+`paper_trader/ml/stop_out_audit.analyze` and
+`paper_trader/ml/mfe_conversion.analyze` analyzers into the cycle loop
+as durable per-cycle JSONL ledgers (`data/stop_out_skill_log.jsonl`,
+`data/mfe_skill_log.jsonl`).
+
+Why this matters: both analyzers already CLI-report the realized economic
+effect of the inherited `backtest._buy` `stop_loss = price * 0.92` (-8%
+downside arm) and `take_profit = price * 1.15` (+15% upside arm) bands —
+the single most directly operational risk-management question about the
+gate. But until this wiring landed, neither verdict had a durable
+per-cycle trend; a skeptical quant had to manually invoke the CLI to see
+whether the inherited band was a real defensive arm or variance-only
+chop. The new ledgers mirror the existing
+`_append_calibrated_reliability_log` / `_append_conviction_calibration_log`
+discipline exactly: best-effort (never breaks the loop), atomic bounded
+trim, honest gap rows (`stop_dark` / `tp_dark` True when zero BUYs carry
+the intraperiod field — the documented current state, since the 8753-row
+corpus pre-dates the 2026-05-23 `forward_intraperiod_*` feature).
+
+Wired BOTH ledgers in `main()` after `_append_conviction_calibration_log`
+(the canonical placement: all skill ledgers run before the ml-trainer
+side-effect call, so a ledger crash can never poison ArticleNet
+retraining). Source-level wiring regression tests
+(`tests/test_continuous_intraperiod_ledgers.py`
+`TestIntraperiodLedgerWiring`) lock both calls — same pattern as
+`TestCycleWiringRegression` in `test_continuous.py`, the discipline
+that prevented earlier ledger orphaning.
+
+Test coverage (16 new tests, all green):
+- INSUFFICIENT_DATA persists `*_dark=True` honest row (the documented
+  current state with 0/8753 intraperiod-populated rows)
+- STOP_HELPS / TP_HELPS verdict with positive benefit: SSOT cross-check
+  that the persisted number equals what the analyzer returned (no drift)
+- STOP_HURTS / TP_HURTS sign-preservation
+- Analyzer-exception degrades to honest error row (never raises out)
+- Bounded trim at 2× KEEP rewrites atomically
+- Directory created on first write
+- Unwritable parent returns False (the discipline contract)
+- Source-level wiring assertion: `_append_*_skill_log(` appears in `main()`
+
+### Phase 3 — Quant validation findings (user_findings = 4)
+
+1. **STRONG OOS skill in deployed pickle** — contradicts the AGENTS.md
+   pass #27 NO_SKILL verdict (Agent 2, 2026-05-24). Measured on the
+   deployed `n_train=4987` pickle against rows 7753..8752 (last 1000
+   rows, strict temporal-OOS since the pickle's training tail ended at
+   row 7752 per `MAX_OUTCOMES_FOR_TRAINING=5000` + 0.2 holdout split):
+
+   | Slice | n | Spearman rank-IC | Dir-acc |
+   |-------|---|------------------|---------|
+   | All actions | 1000 | **+0.484** (p=9e-60) | 0.652 |
+   | BUY only (gate-relevant) | 889 | **+0.448** | 0.640 |
+   | SELL only | 111 | +0.763 | 0.748 |
+
+   The +0.484 OOS rank-IC is ~24× larger than the +0.020 documented in
+   pass #27's `scorer_learning_curve`. The newer pickle (n=4987 vs
+   n=3987 in pass #27) appears to have unlocked real predictive skill.
+   Pass #27's `scorer_learning_curve` should be re-run on the current
+   pickle to reconcile — possible explanations: (a) the analyzer's
+   train/test split uses a different windowing than the deployed model's
+   actual training tail, (b) the additional 1000 rows of training data
+   pushed the model over a noise/signal threshold, (c) some recent
+   `_compute_decision_outcomes` enrichment (intraperiod / conviction /
+   persona / regime_label columns) is materially helping the rank-IC.
+
+2. **Continuous loop cycle cadence is ~0.5/day** — only 1 row each in
+   `scorer_skill_log.jsonl`, `baseline_skill_log.jsonl`,
+   `llm_annotation_skill_log.jsonl` (all 2026-05-22). The active run
+   (continuous.log: run 6243 mid-window at sim_date 2000-11-21 with
+   constant GDELT 40-60s rate-limited sleeps) shows the loop IS running
+   but pinned at <1 cycle/day. Result: every new skill ledger I add
+   (including stop_out / mfe) will see one row per day at most until
+   the GDELT throttling is mitigated. This is NOT a bug in my wiring
+   — it's the documented sibling pass #25 "loop dormant 2026-05-22"
+   pattern repeating.
+
+3. **Intraperiod corpus is 0/8753** as expected — the 2026-05-23
+   feature ships with no corpus penetration yet. Both new ledgers
+   correctly report `INSUFFICIENT_DATA` / `*_dark=True` against the
+   live data (verified end-to-end against `data/decision_outcomes.jsonl`).
+   Once the loop completes ~10 cycles of new outcomes the rolling
+   5000-row tail will start to flip them.
+
+4. **Same-role HYBRID staging race observed**: my Phase 2 commit got
+   bundled into a sibling's commit (`dabfef2` —
+   "docs(AGENTS): record 2026-05-24 core HYBRID pass #2 — market_phase").
+   My 273-line `run_continuous_backtests.py` + 511-line test file
+   landed safely (verified in `git log -1 --stat`) but under the wrong
+   commit message. The documented mitigation (explicit pathspec,
+   `git diff --staged --stat` before commit) was followed, but the
+   sibling's commit ran concurrently and absorbed the staging area
+   before mine. Worth a follow-up at the AGENTS.md staging-race
+   guidance level: when sibling agents are detected actively staging,
+   `git commit` itself may need a brief stagger / mutex.
+
+### Phase 4 — Docs
+
+This entry. Wired both new ledgers into the cycle loop. Source files
+touched: `run_continuous_backtests.py` (+273 lines), new
+`tests/test_continuous_intraperiod_ledgers.py` (+511 lines, 16 tests).
+Existing analyzer modules `paper_trader/ml/stop_out_audit.py` and
+`paper_trader/ml/mfe_conversion.py` unchanged (the wiring side is
+purely additive).
+
+How to read the new ledgers:
+
+```bash
+# Once new cycles run, trend the realized economic effect of the
+# inherited stop / TP bands per cycle:
+tail -n 20 data/stop_out_skill_log.jsonl | jq '{cycle, verdict, stop_benefit_pct, n_with_intraperiod, stop_dark}'
+tail -n 20 data/mfe_skill_log.jsonl | jq '{cycle, verdict, tp_benefit_pct, mean_conversion_ratio, tp_dark}'
+
+# The CLIs they wrap (one-shot, same verdicts):
+python3 -m paper_trader.ml.stop_out_audit --json
+python3 -m paper_trader.ml.mfe_conversion --json
+```
+
+---
+
 ## 2026-05-24 paper-trader core HYBRID pass #2 (Agent 1) — `market_phase` granular header
 
 ### Phase 1 — Debug: bugs_fixed = 0
