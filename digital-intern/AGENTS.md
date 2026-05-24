@@ -5,6 +5,88 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-24 hybrid pass #26 (Agent 3) — ArticleStore.briefing_health: 5h Opus pipeline health snapshot
+
+Debugger + feature-dev + news-analyst pass. **No Phase 1 commit** — the
+codebase remains mature (full suite 2768 → 2781 green after my +13 tests,
+no regressions). Every load-bearing invariant the prompt called out is
+already pinned by the existing suite (backtest isolation in
+`get_unalerted_urgent` / `get_top_for_briefing` / `get_unscored`, ai_score
+vs ml_score separation in `update_ml_scores_batch`, `score_source` tagging,
+the urgency state machine). I scanned the alert pipeline, urgency-scorer
+pre-floor, the LLM/ML score-source flow, the reaper / re-promoter
+oscillation noted in memory, and the `update_*_batch` MAX(urgency,?)
+contracts — none reproduce as a bug on the current HEAD; the user-memory
+notes either describe historical conditions or are surfaced cleanly by the
+existing observability primitives.
+
+**Phase 2 (feature) — committed in `bb02cd7`:**
+
+- `storage/article_store.py::briefing_health(window_h=24)` — the missing
+  primitive for the 5h Opus heartbeat-briefing path. Existing siblings
+  cover other surfaces but leave a real gap:
+  - `source_freshness` — per-collector liveness ("which feeds went dark?").
+    Cannot detect a Claude/Opus outage.
+  - `urgent_queue_health` — what's queued for the alert path. Unrelated
+    to the briefing path.
+  - `urgency_label_split*` — alert-path calibration. Doesn't track
+    briefing health.
+
+  Returns a 5-key dict (`window_h`, `last_briefing_age_h`,
+  `count_in_window`, `expected_in_window`, `verdict`) with a closed
+  4-string verdict alphabet:
+  - `NO_DATA` — empty briefings table (distinct from DEAD: a just-started
+    daemon must not false-flag an outage).
+  - `DEAD` — last briefing > 12h ago (two full 5h cadences missed).
+  - `STALE` — 6-12h since last OR count below 60%-of-expected floor.
+  - `HEALTHY` — newest < 6h ago AND count meets floor.
+
+  Single `MAX(ts) + COUNT(*)` SELECT bounded by window, with a fallback
+  `MAX(ts)` on an empty window so DEAD vs NO_DATA are honestly
+  distinguished. `_expect_row`-guarded against the shared-connection
+  cursor-state corruption class. Pinned by 13 tests in
+  `tests/test_briefing_health.py` covering the verdict ladder, window
+  parameter clamping, the read-only contract (does NOT mutate ai_score /
+  ml_score / score_source / urgency), backtest-isolation defense-in-depth
+  (a synthetic article in the articles table can never perturb the
+  briefings view), and the closed-alphabet result-shape invariant.
+
+  Load-bearing invariants intact: read-only single SELECT, no DB write,
+  no ai_score/ml_score/score_source/urgency mutation, the briefings table
+  is unrelated to backtest paths (synthetic rows live in articles only)
+  so backtest isolation is trivially N/A.
+
+**Phase 3 (live user validation):**
+
+1. **NEW briefing_health on live DB:** `HEALTHY` verdict, last briefing
+   0.89h ago, count_in_window=4 — the heartbeat path is healthy. The
+   primitive runs cleanly on the production DB.
+2. **urgent_queue_health:** 0 queued — the alert pipeline is keeping
+   pace, no near-reap or overdue urgent rows being silently dropped.
+3. **urgency_label_split (24h):** 47 urgent rows, 20 llm-vetted /
+   27 ml-only / 0 briefing_boost / 0 null — llm_fraction=0.43, the
+   persistent `mostly_unverified` pattern already documented in
+   `urgency_label_split`'s docstring. Not a fresh issue.
+4. **Recent 12h alerts inspected:** mostly real NVDA earnings night
+   coverage (record $81.6B revenue, $80B buyback, JPMorgan target reset,
+   Citi DRAM-surge upgrade for MU, Samsung strike memory-chip ripple) —
+   all genuinely market-relevant and actionable. One leaked
+   `"Baystreet . ca - What is Next After NVIDIA Trounces Expectations"`
+   ML-only at ml=10.0; an unstaged regex from a sibling agent
+   (`_RT_WHATS_NEXT_AFTER` in `watchers/alert_agent.py`) catches this
+   in the next pass — outside my scope.
+5. **Daemon log:** recent errors limited to known transient classes
+   (`database is locked` retries via the article_store retry decorator,
+   FRED yield-curve timeouts via collector backoff). No new failure
+   modes surfaced.
+
+**Counters:** bugs_fixed=0, features_added=1, user_findings=3
+(briefing path healthy / urgent queue empty / persistent 57% ml-only
+push rate — the per-held-name slice of this last gap is already addressed
+by sibling agent's `pushed_ticker_label_split` from pass #25).
+
+---
+
 ## 2026-05-24 hybrid pass #25 (Agent 3) — pushed_ticker_label_split: per-held-ticker push calibration
 
 Debugger + feature-dev + news-analyst pass. **No Phase 1 commit** — the
