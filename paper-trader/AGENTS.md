@@ -6,6 +6,117 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 feature-dev pass (Agent 4) — `/api/decision-conditionals` — FORWARD-intent reasoning surface
+
+One new analyzer + endpoint surfaces the FORWARD slice of the reasoning
+surface — STANDING conditional intents the bot itself stated in recent
+decisions' reasoning that are still un-acted-on within the freshness
+window. The companion DI chat block makes it visible to the analyst.
+
+### `/api/decision-conditionals` — what the bot SAID it would do next
+
+`paper_trader/analytics/decision_conditionals.py` parses each recent
+decision's prose for conditional patterns ("wait for cash session",
+"if it holds 220 I'll add", "ready to trim on bounce", "rotating into
+LITE/LNOK", "premature to dump") and surfaces the un-deduped survivors
+as standing intents — each with kind, ticker, age, verbatim snippet,
+and a `stale` boolean.
+
+Every other reasoning-side analytic looks BACKWARD:
+`decision_vapor_skill` grades specificity on FILLED trades,
+`thesis_drift` re-tests the open-position thesis, `exit_intent_audit`
+classifies *closed* sells by motive, `reasoning_coherence` measures
+HOLD-to-HOLD stability. None answer the forward-looking question
+*"what did the bot SAY it would do next, that it has not yet done?"*
+That is the question this endpoint answers — the operator surface that
+makes a bot's standing plans inspectable in real time.
+
+Pattern set (regex; each capture ≤120 chars, bounded by sentence
+punctuation so a single match cannot run away):
+
+- `watch-for` — wait/watch/waiting/watching for X
+- `if-then` — "if X (breaks/holds/hits/...) then/will/i'll Y"
+- `ready-to` — "ready/prepared/positioned to Y"
+- `will-if` — "will/plan/intend to Y if/on/when/once Z"
+- `look-for` — "looking for X"
+- `preserve-for` — "preserve cash/dry powder for/to X"
+- `too-early-to` — "premature/too early to X"
+- `rotate-into` — "rotating into/to/toward X"
+
+Dedup is applied within `(ticker, kind, normalized first 60 chars)`:
+"wait for cash session" said across five consecutive HOLDs collapses
+to ONE intent on the newest decision — the standing-intent semantics
+operators expect (a single line item, not a transcript).
+
+Verdict ladder:
+- `NO_DATA` — zero decisions in window.
+- `NO_INTENTS` — decisions present but no conditional patterns matched.
+- `STANDING_INTENTS` — ≥1 intent, majority within `stale_hours` (bot is
+  forward-thinking, plans are fresh).
+- `STALE_INTENTS` — ≥1 intent, majority older than `stale_hours`
+  (bot stated plans that aged out without follow-up — a quiet
+  discipline flag).
+
+Query params (clamped): `window_hours` 1..168 (default 24),
+`stale_hours` 1..168 (default 12), `max_intents` 1..50 (default 20).
+
+`is_intents_stale(report)` is the single-bool surface (mirrors
+`is_failed_runs_hidden` / `is_pickle_smoke_failed`) — fires ONLY on
+the `STALE_INTENTS` verdict.
+
+```sh
+curl -s http://localhost:8090/api/decision-conditionals | python3 -m json.tool
+```
+
+Read-only, pure builder, never raises. Observational only — never
+gates Opus, no caps (invariants #2 / #12).
+
+### Live validation (Agent 4 — quant researcher view)
+
+Live state at the time of the pass: the analyzer surfaced 4 standing
+intents across 1 ticker (NVDA), all fresh (<1h):
+
+- `[watch-for]` "Wait for cash session to reassess NVDA price action
+  and MRVL earnings setup (3d out)"
+- `[too-early-to]` "premature to dump at a loss into"
+- `[rotate-into]` "rotating into diversifying names (LITE/LNOK
+  optical"
+- `[watch-for]` "wait for cash session price action before adding"
+
+Verdict: `STANDING_INTENTS`. The bot is materially forward-thinking
+about NVDA across multiple kinds (waiting, defensive-no, planned
+rotation) — but every intent points to the same single name. A
+desk-side read: the standing-plan portfolio is as concentrated as the
+position portfolio (1 ticker, 65% of book). Worth surfacing as a
+follow-up correlation between the standing-intent set and the active
+positions set.
+
+### Coverage
+
+- `tests/test_decision_conditionals.py` (36 cases) pins every pattern
+  kind, the verdict ladder, the freshness boundary (inclusive on the
+  stale side, ε-fresh just under), dedup-by-(ticker, kind, prefix),
+  the newest-wins ordering, the cap, ticker extraction from
+  `action_taken` (canonical, invariant #11) with envelope fallback,
+  CASH/NONE pseudo-ticker nullification, the parse_failed envelope
+  fallback to raw, garbage-row silent degradation, the never-raises
+  contract, the `is_intents_stale` single-bool surface, and a Flask
+  route smoke that confirms response-shape stability across verdicts.
+
+### Companion chat block (digital-intern side)
+
+`dashboard/web_server.py::_standing_intents_chat_lines` pipes this
+endpoint into the `/api/chat` enrichment as the FORWARD-intent block
+that complements the existing BACKWARD reasoning blocks. SSOT — the
+builder's own `headline` AND each surfaced intent's `text` pass
+through verbatim (the `_thesis_drift_chat_lines` drift_reasons-
+verbatim precedent — the bot's own words, never a chat-side
+paraphrase). Pinned by 24 unit tests in
+`tests/test_chat_standing_intents_enrichment.py`. Appears in chat
+once `:8090` restarts onto the new endpoint.
+
+---
+
 ## 2026-05-23 ML+backtest HYBRID pass #22 (Agent 2) — atomic JSON writes + `failed_run_audit`
 
 ### Phase 1: Debug — 3 bug sites fixed (one class) (253c2d9)
