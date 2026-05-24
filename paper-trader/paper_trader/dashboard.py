@@ -2084,6 +2084,12 @@ TEMPLATE = r"""
               <button class="bt-filter-chip" data-min="3.5" data-max="5.5" onclick="setBtWinFilter(this)">4–5yr</button>
               <button class="bt-filter-chip" data-min="5.5" data-max="99" onclick="setBtWinFilter(this)">6–10yr</button>
             </div>
+            <span style="color:var(--text-secondary);margin-left:8px;">Model:</span>
+            <div id="bt-model-filter" style="display:flex;gap:4px;flex-wrap:wrap;">
+              <button class="bt-filter-chip active" data-model="all" onclick="setBtModelFilter(this)">All</button>
+              <button class="bt-filter-chip" data-model="ai" onclick="setBtModelFilter(this)">AI only</button>
+              <button class="bt-filter-chip" data-model="monkey" onclick="setBtModelFilter(this)">🐒 Monkeys only</button>
+            </div>
             <div style="display:flex;gap:3px;margin-left:auto;">
               <button id="mode-agg" class="bt-filter-chip active" onclick="setChartMode('aggregate')">Distribution</button>
               <button id="mode-ind" class="bt-filter-chip" onclick="setChartMode('individual')">Individual</button>
@@ -2818,6 +2824,10 @@ let btDetailSubtab = "trades";
 let btSpyBaseline = null;
 let btCurvesCache = {};              // run_id → normalized curve array
 let btWinMinYears = 0, btWinMaxYears = 99; // window-length filter
+let btModelFilter = "all"; // "all" | "ai" | "monkey"
+const MONKEY_MODEL_IDS = new Set(["monkey_random", "monkey_active"]);
+
+function isMonkeyRun(r) { return r && MONKEY_MODEL_IDS.has(r.model_id || ""); }
 
 function btRunColor(runId, idx) { return RUN_COLORS[idx % RUN_COLORS.length]; }
 function hexToRgba(hex, a) {
@@ -2839,13 +2849,25 @@ function setBtWinFilter(el) {
   redrawChart();
 }
 
-// Returns runs passing the current window-length filter
+// Returns runs passing the current window-length + model filter
 function filteredRuns() {
   return btRuns.filter(r => {
+    if (btModelFilter === "ai" && isMonkeyRun(r)) return false;
+    if (btModelFilter === "monkey" && !isMonkeyRun(r)) return false;
     if (!r.duration_days) return btWinMinYears === 0;
     const yrs = r.duration_days / 365.25;
     return yrs >= btWinMinYears && yrs < btWinMaxYears;
   });
+}
+
+// Model filter chip handler — re-fetches the list with ?model=<v>
+function setBtModelFilter(el) {
+  document.querySelectorAll("#bt-model-filter .bt-filter-chip").forEach(b => b.classList.remove("active"));
+  el.classList.add("active");
+  btModelFilter = el.dataset.model || "all";
+  // The /api/backtests endpoint honors ?model=ai|monkey|all; re-fetch so
+  // the client-side list matches what the server returned for this cut.
+  loadBacktests();
 }
 
 // Lazily fetch curves for an array of run_ids not yet in cache.
@@ -2920,7 +2942,9 @@ async function loadModelProgress() {
 
 async function loadBacktests() {
   try {
-    const r = await fetch(API_PREFIX + "/api/backtests").then(r => r.json());
+    const url = API_PREFIX + "/api/backtests"
+      + (btModelFilter && btModelFilter !== "all" ? `?model=${btModelFilter}` : "");
+    const r = await fetch(url).then(r => r.json());
     btRuns = r.runs || [];
     btSpyBaseline = r.spy_baseline != null ? r.spy_baseline : null;
     btLastUpdated = Date.now();
@@ -3011,17 +3035,19 @@ function renderLegend() {
   // Show the most-recent `limit` runs (sorted by run_id desc)
   const chartRuns = [...vis].sort((a,b) => b.run_id - a.run_id).slice(0, limit);
   wrap.innerHTML = chartRuns.map((r, i) => {
-    const color = btRunColor(r.run_id, i);
+    const monkey = isMonkeyRun(r);
+    const color = monkey ? "#7a7a7a" : btRunColor(r.run_id, i);
     const hidden = btHiddenRuns.has(r.run_id);
     const selected = btSelectedRunId === r.run_id;
     const ann = r.annualized_return_pct;
     const retCls = (ann || 0) >= 0 ? "pos" : "neg";
     const retTxt = ann != null ? ((ann >= 0 ? "+" : "") + fmt(ann) + "%/yr") : "—";
     const durYrs = r.duration_days ? (r.duration_days / 365.25).toFixed(1) + "yr" : "";
+    const prefix = monkey ? "🐒 " : "";
     return `<div class="bt-legend-row${hidden ? ' hidden-run' : ''}${selected ? ' selected' : ''}" onclick="selectRun(${r.run_id})">
       <input type="checkbox" aria-label="Toggle visibility of backtest run #${r.run_id}" ${hidden ? '' : 'checked'} onclick="event.stopPropagation();toggleRun(${r.run_id})">
       <span class="bt-swatch" style="background:${color};"></span>
-      <span class="name">#${r.run_id} <span class="muted" style="font-size:10px;">${durYrs}</span>${r.status === 'running' ? ' <span class="spinner" style="width:8px;height:8px;border-width:1px;margin:0 0 0 4px;"></span>' : ''}</span>
+      <span class="name">${prefix}#${r.run_id} <span class="muted" style="font-size:10px;">${durYrs}</span>${r.status === 'running' ? ' <span class="spinner" style="width:8px;height:8px;border-width:1px;margin:0 0 0 4px;"></span>' : ''}</span>
       <span class="ret ${retCls}">${retTxt}</span>
     </div>`;
   }).join("") || `<div class="muted" style="font-size:12px;">no runs match filter</div>`;
@@ -3179,21 +3205,28 @@ async function drawBacktestChart() {
       return d <= maxDay ? last : null;
     });
     const isRunning = r.status === "running";
-    const color = btRunColor(r.run_id, i);
+    const monkey = isMonkeyRun(r);
+    // Monkey runs render in a muted grey so AI run colors stay visually
+    // dominant when both kinds are shown together.
+    const color = monkey ? "#7a7a7a" : btRunColor(r.run_id, i);
     const isHidden = btHiddenRuns.has(r.run_id);
     const isSelected = btSelectedRunId === r.run_id;
     const dim = hasSelection && !isSelected;
     const durYrs = r.duration_days ? (r.duration_days/365.25).toFixed(1)+"yr" : "";
     const ann = r.annualized_return_pct;
     const annTxt = ann != null ? ` (${(ann>=0?"+":"")+ann.toFixed(1)}%/yr ann.)` : "";
+    const prefix = monkey ? "🐒 " : "";
+    const monkeyAlpha = 0.30;  // monkey runs draw at 30% opacity
     return {
-      label: `#${r.run_id} ${durYrs}${annTxt}`,
+      label: `${prefix}#${r.run_id} ${durYrs}${annTxt}`,
       data,
       runId: r.run_id,
       kind: "run",
-      borderColor: dim ? hexToRgba(color, 0.18) : color,
+      borderColor: dim
+        ? hexToRgba(color, 0.18)
+        : (monkey ? hexToRgba(color, monkeyAlpha) : color),
       backgroundColor: hexToRgba(color, 0.04),
-      borderWidth: isSelected ? 3.5 : (dim ? 0.8 : 1.5),
+      borderWidth: isSelected ? 3.5 : (dim ? 0.8 : (monkey ? 0.8 : 1.5)),
       borderDash: isRunning ? [5, 4] : [],
       pointRadius: 0, pointHoverRadius: 5,
       tension: 0.15, fill: false,
@@ -6777,6 +6810,14 @@ def backtests_api():
         # Strip equity curves from the list — clients fetch curves lazily via
         # /api/backtests/curves when needed. This cuts payload from ~5MB to ~50KB.
         runs = store.all_runs(include_curves=False)
+        # Optional model filter so the dashboard can show AI-only / monkey-only
+        # cuts side by side without two SQL paths.
+        model_filter = (request.args.get("model") or "all").lower()
+        _MONKEY_IDS = ("monkey_random", "monkey_active")
+        if model_filter == "ai":
+            runs = [r for r in runs if (r.get("model_id") or "") not in _MONKEY_IDS]
+        elif model_filter == "monkey":
+            runs = [r for r in runs if (r.get("model_id") or "") in _MONKEY_IDS]
         completed = [r for r in runs if r.get("status") == "complete"]
         # spy_baseline is computed over the *full* completed set so it stays
         # stable regardless of which page is requested.
