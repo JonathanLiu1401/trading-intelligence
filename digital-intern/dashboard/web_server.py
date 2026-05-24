@@ -2715,6 +2715,241 @@ def _cash_drag_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _passive_signal_density_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/passive-signal-density` (the smoking-gun
+    detector for "engine idle while news is loud") into compact chat lines.
+
+    The chat already carries decision_paralysis (the FACT we are not
+    deciding — by streak length) and idle_opportunity (forward signals
+    we are missing right now). Neither answers the structural question
+    behind a multi-hour passive run: **was the news QUIET (informed
+    passive — correct silence) or LOUD (deafening silence — engine sat
+    on its hands during a real news window)?** A 38-cycle passive run
+    in the first regime is the bot doing its job; in the second it is a
+    book-wide failure to participate. The trader endpoint already
+    answers this and exposes the `DEAFENING_SILENCE` verdict — the chat
+    has been blind to it.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+    the chat headline — no chat-side re-derived verdict that could
+    drift from the trader endpoint (the ``_decision_paralysis_chat_lines``
+    precedent). The detail line restates the trader endpoint's *own*
+    ``median_signal_count`` / ``n_passive`` / ``high_signal_threshold``
+    fields — never a recomputation.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - verdict not in {"DEAFENING_SILENCE"} → ``[]``: INFORMED_PASSIVE /
+      SIGNAL_RICH_PASSIVE / NO_PASSIVE_RUN / INSUFFICIENT / NO_DATA
+      collapse to silence — only the LOUD-news-and-idle-engine case is
+      actionable, the ``_decision_paralysis_chat_lines`` silence
+      precedent (never chat filler when the engine is quiet for the
+      right reason, or when there is no passive run to grade).
+      SIGNAL_RICH_PASSIVE is borderline (some signal, no trade) but is
+      kept silent here to mirror the trader-side Discord block contract
+      (`reporter._passive_signal_density_line` — only DEAFENING_SILENCE
+      ships) so the two surfaces never disagree on what is "the alert".
+    - actionable (DEAFENING_SILENCE) → builder's verbatim ``headline``
+      (only when a usable string) + a numeric detail line restating
+      median signals / passive run length / high-signal threshold.
+      Missing fields degrade silently.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") != "DEAFENING_SILENCE":
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    median = _num(rep.get("median_signal_count"))
+    n_passive = _num(rep.get("n_passive"))
+    threshold = _num(rep.get("high_signal_threshold"))
+    parts: list[str] = []
+    if median is not None:
+        parts.append(f"median {median:g} signals/cycle")
+    if n_passive is not None:
+        parts.append(f"{int(n_passive)} passive cycles")
+    if threshold is not None:
+        parts.append(f"high-signal floor >{int(threshold)}")
+    if parts:
+        lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
+def _news_to_trade_lag_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/news-to-trade-lag` (distribution of the
+    freshest plausibly-causal article's minutes-before each FILLED trade)
+    into compact chat lines.
+
+    The chat already carries decision_vapor (per-decision reasoning
+    quality), exit_intent_audit (per-sell stated-reason classification),
+    and trade_attribution-derived blocks. None answer the *reactivity*
+    question: when a real catalyst hits the wire, does the bot act in 30
+    minutes — or two hours later, by which time the leverage has bled
+    and the price has moved? A book that consistently trades 2h+ behind
+    the news is structurally different from one that reacts in 30min,
+    and only this block surfaces that gap.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+    the chat headline — no chat-side re-derived verdict that could
+    drift from the trader endpoint. The detail line restates the
+    trader's *own* ``median_lag_minutes`` / ``p75_lag_minutes`` /
+    ``n_attributed`` fields — never a recomputation.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - verdict not in {"DELAYED"} → ``[]``: REACTIVE_FAST / REACTIVE
+      collapse to silence (the bot is reacting on time — no
+      intervention needed); NO_ATTRIBUTION / NO_DATA / ERROR also
+      collapse to silence — "unmeasurable" is not an alert (the
+      ``_baseline_compare_chat_lines`` INSUFFICIENT_DATA → silent-but-
+      honest precedent), and a sample of 1 trade with no attributed
+      news must not become chat filler.
+    - actionable (DELAYED) → builder's verbatim ``headline`` (only when
+      a usable string) + a percentile detail line restating
+      median / p75 lag in minutes + the attributed-trade count.
+      Missing fields degrade silently.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") != "DELAYED":
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    median = _num(rep.get("median_lag_minutes"))
+    p75 = _num(rep.get("p75_lag_minutes"))
+    n_att = _num(rep.get("n_attributed"))
+    parts: list[str] = []
+    if median is not None:
+        parts.append(f"median lag {median:.0f}min")
+    if p75 is not None:
+        parts.append(f"p75 {p75:.0f}min")
+    if n_att is not None:
+        parts.append(f"n={int(n_att)} attributed trades")
+    if parts:
+        lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
+def _catalyst_expiry_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/catalyst-expiry-skill` (per-open-position
+    catalyst-class + age vs catalyst-type expiry window) into compact
+    chat lines.
+
+    The chat already carries thesis_drift (P/L-driven verdict on each
+    open position) and hold_discipline (a losing position overstayed
+    the desk's median losing-cut). Neither tracks the *catalyst clock*:
+    a position opened on an earnings beat that has now sat for 5 days is
+    on a STALE thesis even if it's still green — earnings beats price-in
+    within ~2 days, so the original alpha source has decayed and the
+    holding is now riding sympathy / momentum, not the named catalyst.
+    Selling at a small green on a zombie thesis is rational; selling at
+    -1% on an INTACT structural thesis is not. The chat had no surface
+    for the catalyst-expiry distinction until now.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+    the chat headline — no chat-side re-derived verdict that could
+    drift from the trader endpoint. The detail line surfaces ONE worst
+    zombie position by restating its *own* ``ticker`` / ``days_held`` /
+    ``catalyst_class`` fields — never a recomputation. Worst is defined
+    as the ZOMBIE position with the largest ``days_held`` (the most
+    aged thesis is the most exposed to catalyst-decay).
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - verdict not in {"ZOMBIE_HOLDINGS"} → ``[]``: ALL_FRESH /
+      STRUCTURAL_BOOK / MIXED_BOOK / NO_DATA collapse to silence — a
+      book whose catalysts have not yet expired (or a structural book
+      with no time markers, or no book at all) is not actionable, the
+      ``_decision_paralysis_chat_lines`` silence precedent (never chat
+      filler when the book has nothing aged out).
+    - actionable (ZOMBIE_HOLDINGS) → builder's verbatim ``headline``
+      (only when a usable string) + a detail line surfacing the single
+      worst zombie position (largest days_held among ZOMBIE rows; ties
+      broken alphabetically by ticker for stability). Missing positions
+      / non-dict positions / unparseable days_held degrade silently.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") != "ZOMBIE_HOLDINGS":
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    positions = rep.get("positions")
+    if isinstance(positions, list):
+        # Worst zombie = largest days_held; ties broken alphabetically by
+        # ticker for stability (so the same DB yields the same chat line).
+        worst: dict | None = None
+        worst_days = -1.0
+        worst_ticker = ""
+        for p in positions:
+            if not isinstance(p, dict):
+                continue
+            if p.get("verdict") != "ZOMBIE":
+                continue
+            days = _num(p.get("days_held"))
+            if days is None:
+                continue
+            tk = str(p.get("ticker") or "")
+            if (days > worst_days) or (
+                days == worst_days and (worst_ticker == "" or tk < worst_ticker)
+            ):
+                worst = p
+                worst_days = days
+                worst_ticker = tk
+        if worst is not None:
+            tk = worst.get("ticker")
+            cls = worst.get("catalyst_class")
+            parts: list[str] = []
+            if isinstance(tk, str) and tk:
+                parts.append(tk)
+            if worst_days >= 0:
+                parts.append(f"{worst_days:.1f}d held")
+            if isinstance(cls, str) and cls:
+                parts.append(f"catalyst {cls}")
+            if parts:
+                lines.append("  worst zombie → " + " | ".join(parts))
+
+    return lines
+
+
 def _norm_title(t: Any) -> str:
     return str(t or "").strip().casefold()
 
@@ -6804,6 +7039,95 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: cash-drag fetch failed: %s", e)
 
+        # Passive-signal-density — the smoking-gun read for "engine idle
+        # during loud news". decision-paralysis / streak surface the FACT
+        # of a multi-cycle HOLD-only run; neither answers whether the
+        # news during that run was QUIET (informed passive — correct
+        # silence) or LOUD (deafening silence — engine sat on its hands
+        # while a real news window was open). The trader endpoint
+        # already discriminates these and emits DEAFENING_SILENCE; the
+        # chat had been blind to that verdict. Block fires ONLY on
+        # DEAFENING_SILENCE — INFORMED_PASSIVE / SIGNAL_RICH_PASSIVE /
+        # NO_PASSIVE_RUN / INSUFFICIENT / NO_DATA all collapse to
+        # silence, mirroring the trader-side Discord block
+        # (reporter._passive_signal_density_line — same single-verdict
+        # contract, so the two surfaces never disagree on what is "the
+        # alert"). Composed verbatim by the pure
+        # _passive_signal_density_chat_lines helper (unit-tested; SSOT
+        # — the builder's own headline is the chat headline). Guarded
+        # 3s read; only appears once :8090 is restarted onto
+        # /api/passive-signal-density.
+        passive_signal_density_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/passive-signal-density",
+                    timeout=3) as resp:
+                _psd = json.loads(resp.read().decode("utf-8"))
+            passive_signal_density_block = "\n".join(
+                _passive_signal_density_chat_lines(_psd))
+        except Exception as e:
+            _logger().warning(
+                "chat: passive-signal-density fetch failed: %s", e)
+
+        # News-to-trade lag — is the bot actually reacting to fresh
+        # news, or is it consistently 2h behind? trade-attribution
+        # enumerates per-trade article precedence; this block compresses
+        # that to one reactivity verdict. A book trading 2h+ behind the
+        # wire on leveraged ETFs has bled significant edge before the
+        # entry — and only this block surfaces it. Block fires ONLY on
+        # DELAYED — REACTIVE_FAST / REACTIVE collapse to silence (the
+        # bot is reacting on time, no intervention), NO_ATTRIBUTION /
+        # NO_DATA / ERROR also collapse (unmeasurable is not an alert).
+        # Composed verbatim by the pure _news_to_trade_lag_chat_lines
+        # helper (unit-tested; SSOT — the builder's own headline is
+        # the chat headline, no re-derived verdict). Guarded 3s read;
+        # only appears once :8090 is restarted onto
+        # /api/news-to-trade-lag.
+        news_to_trade_lag_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/news-to-trade-lag",
+                    timeout=3) as resp:
+                _ntl = json.loads(resp.read().decode("utf-8"))
+            news_to_trade_lag_block = "\n".join(
+                _news_to_trade_lag_chat_lines(_ntl))
+        except Exception as e:
+            _logger().warning(
+                "chat: news-to-trade-lag fetch failed: %s", e)
+
+        # Catalyst-expiry — per-open-position catalyst-class + age vs
+        # catalyst-type expiry window. thesis_drift verdicts each open
+        # position on P/L-since-entry; hold_discipline flags losers
+        # overstayed past the desk's median losing-cut. Neither tracks
+        # the *catalyst clock* — a position opened on an earnings beat
+        # that has now sat for 5 days is on a STALE thesis even if it's
+        # still green, because earnings beats price-in within ~2 days.
+        # The chat had no surface for the catalyst-decay distinction
+        # until now. Block fires ONLY on ZOMBIE_HOLDINGS — ALL_FRESH /
+        # STRUCTURAL_BOOK / MIXED_BOOK / NO_DATA collapse to silence
+        # (the _decision_paralysis_chat_lines silence precedent, never
+        # chat filler when the book has nothing aged out). Composed
+        # verbatim by the pure _catalyst_expiry_chat_lines helper
+        # (unit-tested; SSOT — the builder's own headline is the chat
+        # headline AND the worst zombie's own ticker / days_held /
+        # catalyst_class fields are restated verbatim, no chat-side
+        # re-derivation). Guarded 3s read; only appears once :8090 is
+        # restarted onto /api/catalyst-expiry-skill.
+        catalyst_expiry_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/catalyst-expiry-skill",
+                    timeout=3) as resp:
+                _ce = json.loads(resp.read().decode("utf-8"))
+            catalyst_expiry_block = "\n".join(
+                _catalyst_expiry_chat_lines(_ce))
+        except Exception as e:
+            _logger().warning(
+                "chat: catalyst-expiry-skill fetch failed: %s", e)
+
         now_iso = datetime.now(timezone.utc).isoformat()
         system_prompt = (
             "You are a market intelligence analyst with access to a real-time news feed, "
@@ -6856,6 +7180,9 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — NO_DECISION CAUSE ATTRIBUTION (when the live trader is silent for a stretch, the operator's first follow-up to decision-paralysis is 'WHY is it empty?'. The trader endpoint buckets the recent NO_DECISION rows into host_saturated / cli_nonzero_rc / parse_failed / claude_timeout / claude_empty / blocked / unknown and emits a verbatim recommendation — host saturation requires reducing parallel Opus jobs, NOT a runner restart; a parse_failed cluster is a prompt-shape bug, not a host issue. Surfaced ONLY when DOMINANT (one bucket exceeds the threshold), never filler when NORMAL / MIXED (diffuse causes do not yield a specific recommendation). Headline carries verbatim from the trader endpoint AND already contains the recommendation — restate, never re-derive):\n{no_decision_reasons_block}\n\n" if no_decision_reasons_block else "")
             + (f"PAPER TRADER — ROUND-TRIP POSTMORTEM (per closed exit, the post-exit price drift verdict CORRECT / PREMATURE / MISSED_RUNNER / WHIPSAW / NEUTRAL — was the sell well-timed relative to the NEXT drift? Every existing realized-P&L surface — winner_autopsy, loser_autopsy, streak, scorecard — reduces a closed trip to a P&L number; only this block asks 'did the price keep running against the bot after the sell?'. A trade closed at -0.1% looks fine on track-record yet reads catastrophic if the name rallied +5% the hour after. Surfaced ONLY when ≥1 PREMATURE / MISSED_RUNNER / WHIPSAW trip exists, never filler when all CORRECT / NEUTRAL. Top-level headline AND the surfaced worst trip's own per-row headline both carry verbatim from the trader endpoint — restate, never re-derive):\n{round_trip_postmortem_block}\n\n" if round_trip_postmortem_block else "")
             + (f"PAPER TRADER — CASH DRAG (SPY-benchmarked $ cost of sitting in cash per rolling window — 'while you sat at avg cash $X over the last Yh, SPY ran +Z% — that's $W of beta you forfeited by being out'. Complements cash_pct snapshots, cash_redeployment latency, and opportunity_cost (signal-specific): this is the BENCHMARKED dollar-cost answer to 'is sitting in cash actually costing me?'. Surfaced ONLY when COSTLY_CASH, never filler when NEUTRAL / HELPFUL_CASH / INSUFFICIENT / NO_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{cash_drag_block}\n\n" if cash_drag_block else "")
+            + (f"PAPER TRADER — PASSIVE-SIGNAL DENSITY (the smoking-gun read for 'engine idle during loud news' — decision-paralysis surfaces the FACT of a HOLD-only run; passive-signal-density discriminates whether the news during that run was QUIET (informed passive — correct silence) or LOUD (deafening silence — engine sat on its hands while a real news window was open). Surfaced ONLY when DEAFENING_SILENCE, never filler when INFORMED_PASSIVE / SIGNAL_RICH_PASSIVE / NO_PASSIVE_RUN / INSUFFICIENT / NO_DATA. Mirrors the trader-side Discord block (reporter._passive_signal_density_line) so the two surfaces never disagree on what is the alert. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{passive_signal_density_block}\n\n" if passive_signal_density_block else "")
+            + (f"PAPER TRADER — NEWS-TO-TRADE LAG (is the bot actually reacting to fresh news, or is it consistently 2h+ behind? trade-attribution enumerates per-trade article precedence; this block compresses that to one reactivity verdict over recent FILLED trades. A book trading 2h+ behind the wire on leveraged ETFs has bled significant edge before the entry. Surfaced ONLY when DELAYED, never filler when REACTIVE_FAST / REACTIVE / NO_ATTRIBUTION / NO_DATA — 'unmeasurable' is not an alert. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{news_to_trade_lag_block}\n\n" if news_to_trade_lag_block else "")
+            + (f"PAPER TRADER — CATALYST EXPIRY (per-open-position catalyst-class + age vs catalyst-type expiry window — a position opened on an earnings beat that has sat for 5 days is on a STALE thesis even if it's still green, because earnings beats price-in within ~2 days. thesis_drift verdicts each position on P/L-since-entry; hold_discipline flags losers overstayed; only this block tracks the *catalyst clock*. Selling at small green on a zombie thesis is rational; selling at -1% on an INTACT structural thesis is not. Surfaced ONLY when ZOMBIE_HOLDINGS, never filler when ALL_FRESH / STRUCTURAL_BOOK / MIXED_BOOK / NO_DATA. Headline + worst-zombie ticker/days/class carry verbatim from the trader endpoint — restate, never re-derive):\n{catalyst_expiry_block}\n\n" if catalyst_expiry_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "

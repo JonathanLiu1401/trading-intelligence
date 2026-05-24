@@ -5,6 +5,110 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-24 feature-dev pass (Agent 4) — PASSIVE-SIGNAL-DENSITY + NEWS-TO-TRADE-LAG + CATALYST-EXPIRY chat enrichments
+
+Three chat blocks shipped, each piping an existing paper-trader endpoint
+that was *not yet wired to the chat* into `/api/chat`. Each fills a
+distinct structural gap not covered by the ~35 existing chat blocks.
+
+- `_passive_signal_density_chat_lines` pipes `/api/passive-signal-density`
+  (the smoking-gun discriminator for "engine idle during loud news" — the
+  trader-side Discord block from reporter._passive_signal_density_line
+  already ships this verdict, but the chat was blind to it). Fires ONLY
+  on `DEAFENING_SILENCE` — every other verdict (`INFORMED_PASSIVE`,
+  `SIGNAL_RICH_PASSIVE`, `NO_PASSIVE_RUN`, `INSUFFICIENT`, `NO_DATA`)
+  collapses to silence, matching the trader-side Discord block contract
+  so the two surfaces never disagree on what is "the alert". Headline
+  passes verbatim from the trader endpoint (paper-trader invariant #10);
+  detail line restates median signals / passive-run length / high-signal
+  threshold from the endpoint's *own* fields.
+
+- `_news_to_trade_lag_chat_lines` pipes `/api/news-to-trade-lag`
+  (distribution of the freshest plausibly-causal article's
+  minutes-before each FILLED trade — the reactivity verdict on whether
+  the desk acts within minutes of fresh news or consistently 2h+
+  behind). Fires ONLY on `DELAYED` — `REACTIVE_FAST` / `REACTIVE` /
+  `NO_ATTRIBUTION` / `NO_DATA` / `ERROR` collapse to silence
+  ("unmeasurable" is not the same as "slow", so the chat must not
+  become filler when sample is too small to grade). Headline verbatim;
+  detail restates median / p75 lag minutes + attributed-trade count.
+
+- `_catalyst_expiry_chat_lines` pipes `/api/catalyst-expiry-skill`
+  (per-open-position catalyst-class + age vs catalyst-type expiry
+  window — the catalyst-clock view the chat had been blind to). Fires
+  ONLY on `ZOMBIE_HOLDINGS` — `ALL_FRESH` / `STRUCTURAL_BOOK` /
+  `MIXED_BOOK` / `NO_DATA` collapse to silence (never chat filler when
+  the book has nothing aged out). Headline verbatim; worst-zombie
+  detail line surfaces the single ZOMBIE position with the largest
+  `days_held` (ties broken alphabetically by ticker for deterministic
+  chat output across runs), restating ticker / days_held /
+  catalyst_class verbatim from the endpoint's *own* per-position fields.
+
+Each helper is a pure / total function — non-dict / missing keys /
+unparseable numbers degrade to silence or the safe subset, never raising
+into the chat handler. Each is pinned by a dedicated `test_chat_*_enrichment.py`
+unit-test file (28 + 28 + 28 = 84 new tests), following the established
+`_cash_drag_chat_lines` / `_round_trip_postmortem_chat_lines` test
+shape: verbatim-headline SSOT lock, single-verdict gate (only the
+actionable verdict emits, every other verdict in the trader endpoint's
+documented alphabet collapses to silence), worst-sample selection
+discriminator, and pure/total robustness against garbage inputs. The
+single-verdict contract for `_passive_signal_density_chat_lines` carries
+an explicit `test_single_verdict_contract_matches_trader_discord_block`
+regression-lock so the chat block and the trader-side Discord block stay
+in sync if the trader verdict ladder is ever extended; for
+`_news_to_trade_lag_chat_lines`, `test_no_attribution_with_single_trade_is_silence`
+locks the falsifiable contract against the exact live state at pass
+time (1 trade, NO_ATTRIBUTION → silence).
+
+Wired into the system_prompt assembly after `_cash_drag_chat_lines`,
+following the established prompt-block discipline (one introductory
+sentence per block explaining *what* the verdict surfaces and *why*
+the silence default is correct, then the block's own content).
+
+**Source files touched (digital-intern only):**
+- `dashboard/web_server.py` (+~240 lines: 3 helper functions, 3 fetch
+  blocks, 3 system_prompt f-string entries)
+- `tests/test_chat_passive_signal_density_enrichment.py` (new, 28 tests)
+- `tests/test_chat_news_to_trade_lag_enrichment.py` (new, 28 tests)
+- `tests/test_chat_catalyst_expiry_enrichment.py` (new, 28 tests)
+
+**Phase 3 — live user findings (user_findings = 3):**
+
+1. **Live trader is 100% cash and has been for ~8h since the 02:08
+   NVDA SELL.** `/api/catalyst-expiry-skill` returns `NO_DATA` (no
+   open positions); my new chat block correctly collapses to silence
+   on this — never filler when there is no book to grade. The block
+   will surface the moment the bot puts on a position whose catalyst
+   class is dated (EARNINGS / PRODUCT / MACRO / REGULATORY) and that
+   position then ages past the 3-day zombie floor.
+
+2. **`/api/passive-signal-density` verdict is `INFORMED_PASSIVE`**
+   (median 0 signals/cycle over 38 passive cycles since the 02:08
+   SELL NVDA exit). My new chat block correctly stays silent — engine
+   is quiet for the *right* reason (no signals to act on). The
+   trader-side Discord block has been silent for the same reason; the
+   chat surface now mirrors that contract so the two never disagree.
+
+3. **`/api/news-to-trade-lag` verdict is `NO_ATTRIBUTION`** (1 FILLED
+   trade — the 02:08 NVDA SELL — with no attributed live news; the
+   single-sample fact "unmeasurable" is the truthful verdict here).
+   My new chat block correctly stays silent — a 1-trade sample with
+   no attribution is not "the desk is slow", and the silence locks
+   the `test_no_attribution_with_single_trade_is_silence` contract
+   against this exact live state.
+
+**Final verify:** focused suite
+`tests/test_chat_passive_signal_density_enrichment.py` +
+`tests/test_chat_news_to_trade_lag_enrichment.py` +
+`tests/test_chat_catalyst_expiry_enrichment.py` = **84 pass / 0 fail**
+in 0.33s. Full `-k chat_` sweep: **799 pass / 0 fail** in 5.44s — no
+regressions in the existing 715 chat-enrichment tests.
+
+**Counters:** `bugs_fixed=0`, `features_added=3`, `user_findings=3`.
+
+---
+
 ## 2026-05-24 hybrid pass #30 (Agent 3) — ArticleStore.briefing_cadence_trend: early-warning sibling to briefing_health
 
 Debugger + feature-dev + news-analyst pass. **No Phase 1 commit** — the
