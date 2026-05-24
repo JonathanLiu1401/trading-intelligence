@@ -19183,5 +19183,196 @@ def api_stack_liveness():
                         "headline": f"ERROR — {e}"}), 500
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# 🐒 10,000-monkey random baseline — gold-standard edge validator.
+#
+# Compares AI backtest returns against 10,000 randomly-trading "monkeys" on
+# the same window/universe. If the AI beats >90% of monkeys → real edge;
+# ~50% → no edge / market beta. Cache lives at data/monkey_benchmark.json,
+# refreshed via `python3 run_monkey_benchmark.py` (also auto-refreshed once
+# per day from run_continuous_backtests.py). Standalone page at
+# /monkey-benchmark — deliberately NOT a new tab in the SPA TEMPLATE so it
+# can't merge-conflict the 19k-line dashboard. (Same precedent as
+# /ticker/<sym>.)
+# ─────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/monkey-benchmark")
+def api_monkey_benchmark():
+    """Return cached monkey-benchmark results."""
+    from .analytics.monkey_benchmark import load_cached
+    cached = load_cached()
+    if cached is None:
+        return jsonify({
+            "status": "not_computed",
+            "message": "Run `python3 run_monkey_benchmark.py` to compute "
+                       "(takes ~30s for 10k monkeys × 5y window).",
+        }), 202
+    return jsonify(cached)
+
+
+@app.route("/api/monkey-benchmark/run", methods=["POST", "OPTIONS"])
+def api_monkey_benchmark_run():
+    """Trigger a background recomputation of the monkey benchmark."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    import threading
+    def _run():
+        try:
+            subprocess.run(
+                ["python3", "run_monkey_benchmark.py"],
+                cwd=str(Path(__file__).resolve().parent.parent),
+                timeout=600,
+            )
+        except Exception as e:
+            print(f"[monkey] background run failed: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started",
+                    "message": "Recomputation triggered; refresh in ~60s."})
+
+
+_MONKEY_TEMPLATE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/>
+<title>🐒 Monkey Baseline · Paper Trader</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+ :root{color-scheme:dark}
+ *{box-sizing:border-box;margin:0;padding:0}
+ body{background:#0c0d0f;color:#e8eaed;font:14px/1.5 "Outfit",system-ui,sans-serif;padding:20px;max-width:1100px;margin:0 auto}
+ h1{font:700 28px/1.1 "Syne",sans-serif;letter-spacing:-.5px;margin-bottom:6px}
+ h2{font:600 13px/1 "Syne",sans-serif;text-transform:uppercase;letter-spacing:1.5px;color:#7d828c;margin:26px 0 10px}
+ a{color:#00d4ff;text-decoration:none}a:hover{text-decoration:underline}
+ .sub{color:#7d828c;font-size:13px;margin-bottom:18px}
+ .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
+ button{background:#00d4ff;color:#04222b;border:0;padding:8px 16px;border-radius:7px;font:600 13px "Outfit";cursor:pointer}
+ button:disabled{background:#33414a;color:#7d828c;cursor:wait}
+ .card{background:#111316;border:1px solid rgba(255,255,255,.07);border-radius:12px;padding:18px 22px;margin-bottom:14px}
+ .pos{color:#00ff9f}.neg{color:#ff3c4c}.muted{color:#7d828c}
+ table{width:100%;border-collapse:collapse;font:13px "DM Mono",monospace;margin-top:8px}
+ th{text-align:left;color:#7d828c;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.1)}
+ td{padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.05)}
+ .num{text-align:right}
+ .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;background:#17191d}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-top:12px}
+ .kpi{background:#0e1012;border:1px solid rgba(255,255,255,.06);border-radius:9px;padding:12px}
+ .kpi .v{font:600 22px "DM Mono",monospace}.kpi .l{font-size:11px;color:#7d828c;text-transform:uppercase;letter-spacing:1px}
+ .err{color:#ff3c4c;padding:20px;text-align:center}
+ .hint{color:#7d828c;font-size:12px;margin-top:8px}
+</style></head><body>
+<div class="bar">
+ <h1>🐒 10,000 Monkey Random Baseline</h1>
+ <span style="flex:1"></span>
+ <a href="{{ api_prefix }}/backtests">← Backtests</a>
+</div>
+<div class="sub">Compare AI backtest returns against 10,000 randomly-trading monkeys on the same window. AI beats &gt;90% → real edge; ~50% → market beta.</div>
+<div id="root"><div class="muted">loading…</div></div>
+<script>
+const API_PREFIX={{ api_prefix|tojson }};
+const fmt=n=>(n==null?'—':(n>0?'+':'')+n.toFixed(1)+'%');
+const cls=n=>n==null?'muted':(n>0?'pos':(n<0?'neg':''));
+const esc=s=>(s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+async function trigger(){
+ const btn=document.getElementById('runBtn');
+ if(!btn) return;
+ btn.disabled=true; btn.textContent='computing…';
+ try{
+  const r=await fetch(API_PREFIX+'/api/monkey-benchmark/run',{method:'POST'});
+  const j=await r.json();
+  btn.textContent='triggered — refresh in ~60s';
+  setTimeout(()=>location.reload(),65000);
+ }catch(e){
+  btn.disabled=false; btn.textContent='retry';
+  alert('Failed to trigger: '+e);
+ }
+}
+
+function statsRow(label, s){
+ if(!s||!s.n) return '';
+ return `<tr><td><strong>${label}</strong></td>
+  <td class="num ${cls(s.median_pct)}">${fmt(s.median_pct)}</td>
+  <td class="num ${cls(s.mean_pct)}">${fmt(s.mean_pct)}</td>
+  <td class="num">${fmt(s.p10_pct)}</td>
+  <td class="num">${fmt(s.p25_pct)}</td>
+  <td class="num">${fmt(s.p75_pct)}</td>
+  <td class="num">${fmt(s.p90_pct)}</td>
+  <td class="num">${fmt(s.p95_pct)}</td>
+  <td class="num">${fmt(s.p99_pct)}</td>
+  <td class="num">${fmt(s.min_pct)}</td>
+  <td class="num">${fmt(s.max_pct)}</td>
+ </tr>`;
+}
+
+async function load(){
+ const root=document.getElementById('root');
+ let d;try{const r=await fetch(API_PREFIX+'/api/monkey-benchmark');d=await r.json();}
+ catch(e){root.innerHTML='<div class="err">failed to load</div>';return;}
+
+ if(d.status==='not_computed'){
+  root.innerHTML=`<div class="card">
+   <div class="muted">${esc(d.message||'No benchmark cached yet.')}</div>
+   <div style="margin-top:14px"><button id="runBtn" onclick="trigger()">Compute now</button></div>
+  </div>`;
+  return;
+ }
+
+ const rp=d.random_portfolio||{}, ar=d.active_random||{};
+ const rankings=d.ai_rankings||[];
+ const rpMed=rp.median_pct, arMed=ar.median_pct;
+ const aiRets=rankings.map(x=>x.ai_return_pct);
+ const beatsRp=aiRets.length?aiRets.filter(r=>r>rpMed).length/aiRets.length*100:null;
+ const beatsAr=aiRets.length?aiRets.filter(r=>r>arMed).length/aiRets.length*100:null;
+ const bestAi=aiRets.length?Math.max(...aiRets):null;
+ const bestIdx=bestAi!=null?aiRets.indexOf(bestAi):-1;
+ const bestRpRank=bestIdx>=0?rankings[bestIdx].vs_random_portfolio.beats_pct_of_monkeys:null;
+ const bestArRank=bestIdx>=0?rankings[bestIdx].vs_active_random.beats_pct_of_monkeys:null;
+
+ root.innerHTML=`
+  <div class="card">
+   <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:10px">
+    <div>
+     <div class="pill">Window ${esc(d.window?.start)} → ${esc(d.window?.end)}</div>
+     <div class="pill" style="margin-left:6px">${d.n_tickers} tickers</div>
+     <div class="pill" style="margin-left:6px">${d.n_monkeys.toLocaleString()} monkeys</div>
+    </div>
+    <div class="muted">computed ${esc((d.generated_at||'').slice(0,19).replace('T',' '))} UTC · ${d.elapsed_s}s</div>
+   </div>
+   <table>
+    <thead><tr><th>Distribution</th><th class="num">Median</th><th class="num">Mean</th><th class="num">p10</th><th class="num">p25</th><th class="num">p75</th><th class="num">p90</th><th class="num">p95</th><th class="num">p99</th><th class="num">min</th><th class="num">max</th></tr></thead>
+    <tbody>${statsRow('Random Portfolio (buy & hold)',rp)}${statsRow('Active Random Trader',ar)}</tbody>
+   </table>
+  </div>
+
+  <div class="card">
+   <h2>AI Edge vs Monkeys</h2>
+   ${aiRets.length===0
+     ? `<div class="muted">No AI backtest runs match this window yet (${esc(d.window?.start)} → ${esc(d.window?.end)}). Rankings will populate once continuous backtests draw this window.</div>`
+     : `<div class="grid">
+        <div class="kpi"><div class="v ${cls(beatsRp-50)}">${beatsRp.toFixed(0)}%</div><div class="l">of AI runs beat<br>random-portfolio median</div></div>
+        <div class="kpi"><div class="v ${cls(beatsAr-50)}">${beatsAr.toFixed(0)}%</div><div class="l">of AI runs beat<br>active-random median</div></div>
+        <div class="kpi"><div class="v ${cls(bestAi)}">${fmt(bestAi)}</div><div class="l">best AI return</div></div>
+        <div class="kpi"><div class="v ${cls(bestRpRank-90)}">${bestRpRank.toFixed(1)}%</div><div class="l">best beats this many<br>random portfolios</div></div>
+        <div class="kpi"><div class="v ${cls(bestArRank-90)}">${bestArRank.toFixed(1)}%</div><div class="l">best beats this many<br>active monkeys</div></div>
+        <div class="kpi"><div class="v">${aiRets.length}</div><div class="l">AI runs<br>in this window</div></div>
+       </div>`}
+   <div class="hint">Each AI backtest run uses Opus-annotated personas + DecisionScorer gates. Monkeys make uniformly-random buy/sell choices. Real alpha = consistently beating the right tail of the monkey distribution.</div>
+  </div>
+
+  <div class="card">
+   <h2>Refresh</h2>
+   <button id="runBtn" onclick="trigger()">Compute now</button>
+   <div class="hint">Auto-refreshes once per day from the continuous backtest loop. Manual refresh takes ~30s for the configured window.</div>
+  </div>
+ `;
+}
+load();
+</script></body></html>
+"""
+
+
+@app.route("/monkey-benchmark")
+def monkey_benchmark_page():
+    return render_template_string(_MONKEY_TEMPLATE, api_prefix=_api_prefix())
+
+
 if __name__ == "__main__":
     run()

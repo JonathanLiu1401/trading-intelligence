@@ -3742,6 +3742,59 @@ def main() -> None:
             except Exception as e:
                 print(f"[continuous] validation dispatch failed: {e}")
 
+        # 🐒 Monkey-benchmark auto-refresh — once per day, in background.
+        # Validates whether AI runs are beating a 10k-random-trader baseline.
+        # Always non-fatal: the continuous loop never depends on it.
+        try:
+            from paper_trader.analytics.monkey_benchmark import (
+                load_cached as _monkey_load_cached,
+                run_and_cache as _monkey_run_and_cache,
+                default_window as _monkey_default_window,
+            )
+            from paper_trader.backtest import (
+                WATCHLIST as _MONKEY_WATCHLIST,
+                BACKTEST_DB as _MONKEY_BACKTEST_DB,
+            )
+            import datetime as _dt
+            cached = _monkey_load_cached()
+            stale = cached is None
+            if not stale:
+                try:
+                    gen_at = (cached.get("generated_at") or "").rstrip("Z")
+                    age_h = ((_dt.datetime.utcnow()
+                              - _dt.datetime.fromisoformat(gen_at))
+                             .total_seconds() / 3600)
+                    stale = age_h > 24
+                except Exception:
+                    stale = True
+            if stale:
+                m_start, m_end = _monkey_default_window()
+                m_ai_returns: list[float] = []
+                try:
+                    _mc = sqlite3.connect(str(_MONKEY_BACKTEST_DB), timeout=5)
+                    _mr = _mc.execute(
+                        "SELECT total_return_pct FROM backtest_runs "
+                        "WHERE status='complete' AND total_return_pct IS NOT NULL "
+                        "AND start_date = ? AND end_date = ? "
+                        "ORDER BY run_id DESC",
+                        (m_start, m_end),
+                    ).fetchall()
+                    _mc.close()
+                    m_ai_returns = [r[0] for r in _mr if r[0] is not None]
+                except Exception as _e:
+                    print(f"[monkey] AI-returns fetch failed: {_e}")
+                import threading as _threading
+                _threading.Thread(
+                    target=_monkey_run_and_cache,
+                    args=(_MONKEY_WATCHLIST, m_start, m_end),
+                    kwargs={"ai_returns": m_ai_returns},
+                    daemon=True, name=f"monkey-{cycle}",
+                ).start()
+                print(f"[monkey] refresh triggered in background "
+                      f"({m_start} → {m_end}, {len(m_ai_returns)} matching AI runs)")
+        except Exception as e:
+            print(f"[monkey] background refresh failed (non-fatal): {e}")
+
         elapsed = time.time() - t0
         if winner:
             print(f"[continuous] {_now()} cycle {cycle} done in {elapsed/60:.1f}min. "
