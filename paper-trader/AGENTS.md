@@ -6,6 +6,105 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 core HYBRID pass #5 (Agent 1) — `/api/decision-cadence` endpoint + builder regression-lock
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Re-read `paper_trader/runner.py`, `paper_trader/reporter.py` (~1150 of
+4561 lines), `paper_trader/signals.py`, `paper_trader/strategy.py` (~1100
+of 1984), `paper_trader/market.py`, `paper_trader/store.py`,
+`paper_trader/analytics/decision_cadence.py`,
+`paper_trader/analytics/passive_signal_density.py`,
+`paper_trader/analytics/dynamic_interval.py`, and the test fixtures in
+`tests/conftest.py`. Ran the focused core slice (363 tests pass
+clean in 8.7s) plus the passive-signal-density + regime-leverage-fit +
+alarm-latch-headline sibling tests (158 pass in <2s). No new genuine bug
+surfaced. Sibling agents have modifications staged in
+`paper_trader/{backtest,dashboard,reporter}.py` (+122 / +29 / +173 lines)
+plus several untracked analytics + tests modules — per the
+`pt-concurrent-samerole-staging-race` memory I stayed off those files
+and used explicit pathspec for my own commit.
+
+Set `bugs_fixed = 0` honestly, no Phase 1 commit.
+
+### Phase 2 — Feature: `/api/decision-cadence` endpoint + regression-locked builder
+
+**The gap.** `paper_trader/analytics/decision_cadence.py` shipped as an
+untracked sibling module that mirrors the runner's authoritative
+`compute_interval` predicates to answer the third question every trader
+asks (alongside "did it decide?" / "is it healthy?"): *"so when is it
+going to TRY again?"*. The module is well-built but had NO test file
+AND no dashboard wiring — its verdict ladder, tier mirroring, OVERDUE
+boundary, and clock-skew clamps could regress silently, and the
+operator had no surface that exposes it without tailing the runner log
+for `[interval] tier=…`.
+
+**The fix.** Two parts:
+
+1. **`/api/decision-cadence` dashboard endpoint** (`paper_trader/
+   dashboard.py`, +42 lines next to `/api/passive-signal-density`).
+   Calls `build_decision_cadence(open_positions, recent_decisions[0].
+   timestamp)`. Crucially keys off `recent_decisions(limit=1)[0]` —
+   the LOOP cadence — and NOT `last_real_decision` (which would wrongly
+   mask a wedged loop cycling NO_DECISION at the expected cadence; this
+   is the design contract that distinguishes the two surfaces). Cheap:
+   `limit=1`, no Python-side filter. Store fault → JSON 500 body, never
+   an HTML stack.
+
+2. **`tests/test_decision_cadence.py`** (25 tests, 0.71s) — exercises
+   the verdict ladder boundaries (ON_SCHEDULE → ELAPSED_NORMAL at
+   `secs_since > sleep_s`; ELAPSED_NORMAL → OVERDUE at
+   `secs_since > OVERDUE_MULT × sleep_s`, both strict-`>`), the tier
+   mirroring (MARKET_OPEN / MARKET_CLOSED / QUIET_CLOSED / SESSION_OPEN
+   against the runner's own `_di._*_S` constants), the clock-skew clamp
+   (future `last_decision_ts` → 0s ago), the failure contract (bad
+   ISO / `None` positions / naive datetime → never raises, sensible
+   defaults), the documented output keys, the `next_decision_expected_at`
+   round-trip (`last + sleep_s`), and the `is_cadence_overdue` single-
+   bool helper (fires ONLY on OVERDUE — mirrors
+   `decision_conditionals.is_intents_stale`).
+
+3. **`tests/test_decision_cadence_endpoint.py`** (6 tests, 0.64s) —
+   route exists + 200, documented payload keys, ON_SCHEDULE under the
+   60s-after-MARKET_OPEN-tier stub, CORS stamp for cross-fetch from
+   digital-intern's :8080, store fault degrades to 500 JSON body, and
+   the design-contract test that the endpoint reads
+   `recent_decisions(limit=1)[0].timestamp` (NEWEST verb, including
+   NO_DECISION) — explicitly poisons `last_real_decision` and verifies
+   the wedged-loop scenario reads as ON_SCHEDULE only because the LOOP
+   itself is healthy.
+
+Tests deliberately use a frozen wall-clock + an unreadable calendar
+path (`Path("/tmp/__nonexistent_for_test_decision_cadence__")`) so a
+real on-disk earnings snapshot can never bleed determinism into the
+suite. The endpoint test fixture captures the REAL builder reference
+before any monkeypatch so the test stub can delegate without recursing
+into itself (a recursion bug caught in the first test-run pass).
+
+### Phase 3 — Live trader: HEALTHY
+
+`curl :8090/api/runner-heartbeat` → HEALTHY, last decision 2s ago
+within the 60m closed-market cadence, latches.any_active=False,
+notify.last Discord send succeeded.
+`/api/last-real-decision` → FRESH, 18m ago, action_verb=HOLD.
+`/api/build-info` → boot_sha == head_sha == 2e83ccf (not stale).
+`/api/decision-cadence` → 404 on the running daemon (expected — my
+endpoint lands on the next restart cycle once committed and the
+git-watcher restarts the runner).
+
+The endpoint will land on the next git-watcher-triggered restart
+(invariant: deferred-restart honored at the cycle boundary; see
+`runner.RESTART_GRACE_S`). No operator action required.
+
+### Phase 4 — Counters
+
+* bugs_fixed: 0
+* features_added: 1 (`/api/decision-cadence` endpoint + 31 regression-
+  locked tests across the builder and the route)
+* user_findings: 0 — system is healthy from a live-trader perspective
+
+---
+
 ## 2026-05-24 ML+backtest HYBRID pass #31 (Agent 2) — `backfill_intraperiod` unblocks stop_out + MFE verdicts against the historical 8.7k corpus
 
 ### Phase 1 — Debug: bugs_fixed = 0
