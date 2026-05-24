@@ -6,7 +6,89 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
-## 2026-05-24 ML+backtest HYBRID pass #31 (Agent 2) — `gate_arm_skill_log` per-cycle ledger + GATE_INEFFECTIVE+strong-rank-IC paradox finding
+## 2026-05-24 core HYBRID pass #3 (Agent 1) — SWR prewarm gap fix + `_passive_signal_density_line` wiring regression-lock
+
+### Phase 1 — Debug: bugs_fixed = 1
+
+Found `test_swr_prewarm_coverage::test_every_swr_cached_endpoint_is_prewarmed`
+failing on master against 4 missing endpoints — three reported in the
+initial run (`cash_drag`, `opportunity-cost`,
+`persistent-watchlist-opportunity`) plus a fourth (`setup-analogues`)
+that surfaced once the module re-imported with the fresh fix.
+
+Each of the four endpoints carries `@swr_cached(...)` but was never added
+to `_swr_prewarm`'s targets list, so the first poll after every restart
+cold-stalled with `{"warming": true}` — exactly the freeze-triage blind
+spot the test invariant exists to lock against. A trader who opens
+`/api/cash_drag` or `/api/opportunity-cost` right after a restart got a
+"computing — retry shortly" placeholder for one full TTL cycle (30s /
+300s / 60s / 90s respectively) instead of real data.
+
+Surgical fix: 4 prewarm-list additions in `paper_trader/dashboard.py`
+with rationale comments matching the existing prewarm-block discipline
+(per-endpoint TTL + cold-stall surface + sibling cross-reference).
+
+Commit `1d05bb0`: `fix(dashboard): prewarm 4 missing @swr_cached endpoints
+to close cold-stall blind spot`. Test suite passes (`6891 passed, 1
+skipped`).
+
+### Phase 2 — Feature: `_passive_signal_density_line` wiring regression-lock
+
+While reading reporter.py during Phase 1, found
+`_passive_signal_density_line(store)` defined at line 3633 — the
+DEAFENING_SILENCE Discord block builder — but NEVER called from any
+`send_*` path. The companion `_exit_only_streak_line` IS wired into both
+`send_hourly_summary` and `send_daily_close`. So the alert the builder
+was designed to ship (book-wide "engine sitting on hands during a loud
+news window") never actually reached Discord. Concurrent sibling-agent
+commit `3c2ba5d` already added the wiring; this pass adds the test that
+locks both wirings into place so a typo or accidental removal cannot
+silently re-orphan the alert.
+
+`tests/test_passive_signal_density_reporter.py` (11 tests):
+* silence on NO_DATA / NO_PASSIVE_RUN / INSUFFICIENT / INFORMED_PASSIVE /
+  SIGNAL_RICH_PASSIVE (silence-by-default; never a lying green light)
+* formatted block on DEAFENING_SILENCE — header + blockquote headline
+* degrade-safe contract: silent on missing headline / non-dict result /
+  builder exception (never crashes the hourly)
+* source-level wiring assertions for BOTH send_hourly_summary and
+  send_daily_close — same `inspect.getsource` regression-lock pattern
+  used by `test_blocked_reasons_reporter` and friends
+
+Commit `b9d3377`: `feat(reporter): regression-lock
+_passive_signal_density_line wiring into hourly + daily`.
+
+### Phase 3 — Live user findings (user_findings = 4)
+
+1. **Live trader is HEALTHY** (runner pid 1971405). `/api/runner-heartbeat`
+   reports `verdict=HEALTHY`, `decision_efficacy.verdict=PRODUCING`
+   (19/20 recent cycles produced a decision), Discord delivery
+   `HEALTHY`, singleton lock acquired, no breaker/quota latches active.
+
+2. **Engine is BLIND per /api/feed-health.** 15 consecutive decisions
+   with 0 signals. BUT 73 live articles exist in the last 2h window
+   `get_top_signals` reads — the articles are landing in `articles.db`
+   correctly, none of them clear `min_score >= 4.0`. This is *probably*
+   weekend-quiet news but worth re-checking once mkt re-opens — if the
+   blind streak persists into a Monday open, the `min_score=4.0` floor
+   is too tight for the digital-intern ML scorer's current calibration.
+
+3. **Portfolio is LAGGING the S&P 500 by 2.22pp** ($987.39 vs $1009.59
+   for a $1000 buy-and-hold). best_alpha was +1.65pp on 2026-05-20;
+   the desk gave it all back through the recent NVDA round-trip cycle
+   (BUY $223.43 / SELL $215.25). The thesis-broken exit was the right
+   call (P/L -3.66%, MACD turned bearish, 65.4% single-name
+   concentration past the 60% heavy mark) but the resulting 100% cash
+   posture has been compounding under-performance since.
+
+4. **/api/passive-signal-density verdict is INFORMED_PASSIVE** (median 0
+   signals/cycle over 36 passive cycles, since the 02:08 SELL NVDA
+   exit). The Discord wiring I added in Phase 2 is correctly silent
+   — the engine is quiet for the right reason (no signals to act on),
+   not for the wrong reason (loud news + idle engine). DEAFENING_SILENCE
+   is the only verdict that fires the new Discord block.
+
+
 
 ### Phase 1 — Debug: bugs_fixed = 0
 
