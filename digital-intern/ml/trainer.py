@@ -277,7 +277,7 @@ def _fetch_training_data(
         "SELECT title, full_text, ai_score, source, published "
         "FROM articles "
         f"WHERE {STRONG_LABEL_WHERE} "
-        "ORDER BY first_seen DESC LIMIT 15000"
+        "ORDER BY first_seen DESC LIMIT 100000"
     )
     for title, blob, ai, src, published in cur.fetchall():
         summary = decompress(blob) if blob else ""
@@ -748,7 +748,7 @@ def train_continuous(store, heartbeat=None) -> dict:
         "SELECT title, full_text, ai_score, source, published "
         "FROM articles "
         f"WHERE {STRONG_LABEL_WHERE} "
-        "ORDER BY first_seen DESC LIMIT 15000"
+        "ORDER BY first_seen DESC LIMIT 100000"
     )
     for title, blob, ai, src, published in cur.fetchall():
         summary = decompress(blob) if blob else ""
