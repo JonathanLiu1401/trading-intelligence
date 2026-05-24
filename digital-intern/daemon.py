@@ -139,6 +139,8 @@ from collectors.treasury_auctions import collect_treasury_auctions
 from collectors.arxiv_qfin_collector import collect_arxiv_qfin
 from collectors.cftc_press_collector import collect_cftc_press
 from collectors.finviz_collector import collect_finviz
+from collectors.seekingalpha_collector import collect_seekingalpha
+from collectors.rsi_extremes_collector import collect_rsi_extremes
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -243,6 +245,8 @@ TREASURY_AUCTIONS_INTERVAL = 1800  # UST auction announcements from TreasuryDire
 ARXIV_QFIN_INTERVAL    = 3600     # arXiv q-fin + econ new papers (weekday evenings) — hourly
 CFTC_PRESS_INTERVAL    = 1800     # CFTC press + enforcement releases — every 30min
 FINVIZ_INTERVAL        = 300      # Finviz per-ticker news table (round-robin batch) — every 5min
+SEEKINGALPHA_INTERVAL  = 300      # Seeking Alpha breaking-news RSS — every 5min
+RSI_EXTREMES_INTERVAL  = 900      # RSI overbought/oversold signals — every 15min
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
 SHORT_SELLER_INTERVAL   = 1800    # Short-seller research reports (rare, high-priority) — every 30min
 FINANCIAL_BLOGS_INTERVAL = 600    # InvestorPlace, Motley Fool, Nasdaq RSS — every 10min
@@ -381,6 +385,8 @@ WORKER_POLL_INTERVAL_SECS = {
     "nasdaq_earnings": NASDAQ_EARNINGS_INTERVAL,
     "putcall_ratio":   PUTCALL_RATIO_INTERVAL,
     "fda": FDA_INTERVAL,
+    "seekingalpha": SEEKINGALPHA_INTERVAL,
+    "rsi_extremes": RSI_EXTREMES_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
     "ml_trainer": ML_TRAIN_INTERVAL,
@@ -2377,6 +2383,50 @@ def nasdaq_halts_worker(store: ArticleStore):
         _sleep(NASDAQ_HALTS_INTERVAL)
 
 
+# ── Worker: Seeking Alpha breaking-news RSS — every 5min ─────────────────────
+def seekingalpha_worker(store: ArticleStore):
+    log.info("[seekingalpha_worker] started")
+    bo = Backoff("seekingalpha", base=5.0, cap=300.0)
+    while _running:
+        try:
+            articles = collect_seekingalpha()
+            _ingest(store, articles, "seekingalpha")
+            try:
+                source_health.record_result("seekingalpha", len(articles))
+            except Exception as he:
+                log.warning(f"[seekingalpha_worker] source_health error: {he}")
+            _worker_last_ok["seekingalpha"] = time.time()
+            log.debug(f"[seekingalpha] cycle ok ({len(articles)} new articles)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[seekingalpha_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SEEKINGALPHA_INTERVAL)
+
+
+# ── Worker: RSI extremes screener — every 15min ───────────────────────────────
+def rsi_extremes_worker(store: ArticleStore):
+    log.info("[rsi_extremes_worker] started")
+    bo = Backoff("rsi_extremes", base=30.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_rsi_extremes()
+            _ingest(store, articles, "rsi_extremes")
+            try:
+                source_health.record_result("rsi_extremes", len(articles))
+            except Exception as he:
+                log.warning(f"[rsi_extremes_worker] source_health error: {he}")
+            _worker_last_ok["rsi_extremes"] = time.time()
+            log.debug(f"[rsi_extremes] cycle ok ({len(articles)} signals)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[rsi_extremes_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(RSI_EXTREMES_INTERVAL)
+
+
 # ── Worker: FDA press releases + MedWatch safety alerts — every 30min ────────
 def fda_worker(store: ArticleStore):
     log.info("[fda_worker] started")
@@ -4307,6 +4357,8 @@ def main():
         ("nasdaq_earnings", nasdaq_earnings_worker),
         ("putcall_ratio", putcall_ratio_worker),
         ("fda",         fda_worker),
+        ("seekingalpha", seekingalpha_worker),
+        ("rsi_extremes", rsi_extremes_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),

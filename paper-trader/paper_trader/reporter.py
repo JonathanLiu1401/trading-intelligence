@@ -3630,6 +3630,53 @@ def _streak_line(store) -> str:
         return ""
 
 
+def _passive_signal_density_line(store) -> str:
+    """One-line "is the engine ignoring rich news flow?" for the hourly /
+    daily report.
+
+    The book-wide companion to ``_exit_only_streak_line``. That one flags
+    consecutive EXITs (defensive cycling); this one flags the orthogonal
+    structural pattern: a passive run (HOLDs + NO_DECISIONs) over which
+    the median ``signal_count`` was HIGH. A trader watching the live tape
+    sees "the engine is in HOLD_LOCK for 12 cycles, and every cycle had
+    15-19 scored articles — what's it waiting for?" — no existing panel
+    answers that question at the book level (``/api/news-action-funnel``
+    is per-ticker; ``/api/decision-paralysis`` reports streak length only).
+
+    Composes ``build_passive_signal_density`` **verbatim** (single source
+    of truth, AGENTS.md invariant #10) over ``store.recent_decisions``
+    (newest-first, matching the builder contract). Pure store reads only —
+    NO network (the Discord-path discipline). Observational only, never
+    gates (invariants #2 / #12 — the ``_exit_only_streak_line`` precedent).
+
+    Suppression: surface ONLY ``DEAFENING_SILENCE`` — anything below
+    (NO_PASSIVE_RUN, INSUFFICIENT, INFORMED_PASSIVE, SIGNAL_RICH_PASSIVE)
+    stays silent so the hourly summary never becomes its own lying green
+    light. The ``_exit_only_streak_line`` / ``_hold_discipline_line`` /
+    ``_streak_line`` silence precedent — operator reads the dashboard
+    endpoint when they want the full ladder; the hourly only talks when
+    there is something actionable.
+    """
+    try:
+        from .analytics.passive_signal_density import (
+            build_passive_signal_density,
+        )
+        decisions = store.recent_decisions(limit=500)
+        ps = build_passive_signal_density(decisions)
+        if not isinstance(ps, dict):
+            return ""
+        verdict = ps.get("verdict")
+        if verdict != "DEAFENING_SILENCE":
+            return ""
+        headline = ps.get("headline") or ""
+        if not headline:
+            return ""
+        return f"**SIGNAL-RICH PASSIVE** ◈ {verdict}\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] passive-signal-density line skipped: {e}")
+        return ""
+
+
 def _exit_only_streak_line(store) -> str:
     """One-line "is the bot in liquidation-only mode?" for the hourly /
     daily report.
@@ -3929,6 +3976,115 @@ def _fmt_trade_stamp(ts_iso: str | None, now: datetime | None = None) -> str:
     return f"{stamp} · {_ago(delta)} ago" if delta > 0 else stamp
 
 
+def _regime_leverage_fit_line(store) -> str:
+    """One-line "is the book's leverage class aligned with the current SPY
+    20d regime?" for the hourly / daily report.
+
+    ``/api/regime-leverage-fit-skill`` (and its digital-intern chat block,
+    ``_regime_leverage_fit_chat_lines``) made the structural verdict
+    auditable on the dashboard / chat — but the operator lives in Discord
+    and never opens those (the exact dashboard→Discord gap
+    ``_cash_conviction_fit_line`` / ``_concentration_line`` /
+    ``_heartbeat_line`` each closed, one dimension over: cash-vs-signal,
+    then concentration, then runner pulse, now leverage-vs-regime). The
+    recurring backtest finding (AGENTS.md) is that the bot's alpha is
+    largely a leveraged-bull-window artifact; a static ``leveraged_pct``
+    scalar misses the FIT — a 0% leveraged book during a bull tape is
+    just as structurally wrong as a 40% leveraged book during a bear,
+    and the 100%-cash drought regime (the live 2026-05-24 state) is the
+    exact pattern this surface is built to catch.
+
+    Composes ``build_regime_leverage_fit_skill`` **verbatim** (single
+    source of truth, AGENTS.md invariant #10 — the verdict / headline are
+    the builder's, never re-derived here, so this Discord line, the
+    dashboard endpoint, and the chat helper can never tell different
+    stories). Feeds it the SAME shape the endpoint does:
+    ``store.get_portfolio()`` for cash + total_value, ``store.open_positions``
+    for the held-only book, ``store.recent_trades`` for the leveraged-buy
+    flow window, and ``get_quant_signals_live(["SPY"])`` for the 20d
+    momentum regime input. Observational only, never gates, adds no caps
+    (invariants #2/#12 — the ``_cash_conviction_fit_line`` precedent).
+    Failure contract mirrors the rest of ``reporter``: any builder /
+    store / network fault degrades to ``""`` ("no regime-fit line this
+    report"), **never** an exception ("no Discord summary this report").
+
+    Suppression — surface ONLY the three actionable verdicts (mirrors the
+    ``_regime_leverage_fit_chat_lines`` chat-side contract so the two
+    surfaces fire on the SAME set of states; the summary must never
+    become its own lying green light — the ``_cash_conviction_fit_line``
+    suppression precedent):
+
+      * ``BLIND_LEVERING``     — recent BUY flow into leveraged names in
+        a bear / sideways regime (active deterioration; highest priority).
+      * ``DANGEROUS_HEADWIND`` — static high leveraged exposure in a
+        bear regime (decay drag compounds against the book).
+      * ``MISSED_TAILWIND``    — bull regime but underexposed to leverage
+        (the live 100%-cash-during-SPY-rally state).
+
+    ``ALIGNED`` (correctly tailwinded), ``DEFENSIVE`` (correctly
+    de-risked), ``NEUTRAL`` (mid-band / ambiguous regime + flow), and
+    ``NO_DATA`` (empty everything) all stay silent.
+    """
+    try:
+        from .analytics.regime_leverage_fit_skill import (
+            build_regime_leverage_fit_skill,
+        )
+        pf = store.get_portfolio() or {}
+        cash_usd = pf.get("cash")
+        total_value_usd = pf.get("total_value")
+        # ``store.open_positions()`` is the SSOT for "what is currently
+        # held" (the ``_cash_conviction_fit_line`` precedent — the snapshot
+        # ``pf["positions"]`` can be a cycle stale under the documented
+        # equity-freshness divergence).
+        try:
+            open_positions = [
+                p for p in (store.open_positions() or [])
+                if isinstance(p, dict) and not p.get("closed_at")
+            ]
+        except Exception:
+            open_positions = []
+        try:
+            trades = store.recent_trades(limit=2000) or []
+        except Exception:
+            trades = []
+        # SPY 20d momentum via the same live quant path the endpoint uses
+        # — one yfinance fetch (briefly cached upstream by the strategy
+        # cycle, which calls the same helper every 60s during open). Any
+        # fault → None so the builder degrades to NEUTRAL / NO_DATA and
+        # this line stays silent rather than raising into the summary.
+        spy_mom_20d = None
+        try:
+            from .strategy import get_quant_signals_live
+            spy_q = (get_quant_signals_live(["SPY"]) or {}).get("SPY") or {}
+            mv = spy_q.get("mom_20d")
+            if isinstance(mv, (int, float)):
+                spy_mom_20d = float(mv)
+        except Exception:
+            spy_mom_20d = None
+
+        result = build_regime_leverage_fit_skill(
+            open_positions,
+            cash_usd,
+            total_value_usd,
+            spy_mom_20d,
+            trades,
+        )
+        if not isinstance(result, dict):
+            return ""
+        verdict = result.get("verdict")
+        if verdict not in (
+            "BLIND_LEVERING", "DANGEROUS_HEADWIND", "MISSED_TAILWIND",
+        ):
+            return ""
+        headline = result.get("headline")
+        if not isinstance(headline, str) or not headline.strip():
+            return ""
+        return f"**REGIME FIT** ◈ {verdict}\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] regime-leverage-fit line skipped: {e}")
+        return ""
+
+
 def send_hourly_summary() -> bool:
     store = get_store()
     pf = store.get_portfolio()
@@ -4106,6 +4262,17 @@ def send_hourly_summary() -> bool:
     cn = _concentration_line(store)
     if cn:
         body += "\n" + cn
+    # REGIME FIT sits right after CONCENTRATION — both are book-structure
+    # risk surfaces. CONCENTRATION says "is the book over-weight a single
+    # name?"; REGIME FIT says "is the book's leverage CLASS aligned with
+    # the current SPY 20d regime — am I levering into a headwind or
+    # missing a tailwind?". Both can be silent independently (only
+    # SINGLE_NAME_RISK fires for CONCENTRATION; only BLIND_LEVERING /
+    # DANGEROUS_HEADWIND / MISSED_TAILWIND fire here, mirroring the chat
+    # helper); neither suppresses the other.
+    rlf = _regime_leverage_fit_line(store)
+    if rlf:
+        body += "\n" + rlf
     pa = _position_attention_line(store)
     if pa:
         body += "\n" + pa
@@ -4337,6 +4504,12 @@ def send_daily_close() -> bool:
     cn = _concentration_line(store)
     if cn:
         body += "\n" + cn
+    # REGIME FIT follows CONCENTRATION on daily close too — see
+    # send_hourly_summary for the placement rationale (single-name weight
+    # vs. leverage-class fit against the SPY 20d regime).
+    rlf = _regime_leverage_fit_line(store)
+    if rlf:
+        body += "\n" + rlf
     pa = _position_attention_line(store)
     if pa:
         body += "\n" + pa

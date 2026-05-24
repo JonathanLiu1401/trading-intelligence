@@ -2331,6 +2331,95 @@ class BacktestRun:
 LOCAL_ARTICLES_DB = Path(__file__).resolve().parent.parent.parent / "digital-intern" / "data" / "articles.db"
 
 
+def _parse_yf_news_item(item: dict) -> tuple[str, str, float | None]:
+    """Extract ``(title, url, pub_ts)`` from one ``yf.Ticker(...).news`` entry.
+
+    yfinance changed its news payload in late 2024:
+
+      * **Legacy** (pre-late-2024) — flat top-level keys::
+
+            {"title": "...", "link": "...",
+             "providerPublishTime": <unix-ts>}
+
+      * **Current** — nested under ``content``::
+
+            {"id": "...",
+             "content": {"title": "...",
+                         "canonicalUrl": {"url": "..."},
+                         "clickThroughUrl": {"url": "..."},
+                         "pubDate": "2026-05-24T01:50:00Z"}}
+
+    The prior backtest reader only looked at the legacy top-level keys, so
+    every current-schema entry came back as ``title=""`` and was dropped at
+    the ``if not title: continue`` guard — Tier 2 of ``_fetch_signals`` went
+    dark for every recent sim_date. This helper reads the current schema
+    first (where it exists) and falls back to legacy fields, so both shapes
+    work without a schema-version branch at the call site.
+
+    Returns a 3-tuple of ``(title:str, url:str, pub_ts:float|None)``:
+
+      * ``title`` — empty string when absent in BOTH shapes (the caller's
+        ``if not title: continue`` is the documented filter).
+      * ``url`` — empty string when neither ``canonicalUrl.url`` /
+        ``clickThroughUrl.url`` (new) nor ``link`` (legacy) is present.
+        Empty-URL items still flow through (the caller skips dedup on "").
+      * ``pub_ts`` — Unix epoch seconds (float) when parseable, else
+        ``None``. The new schema uses an ISO-8601 ``pubDate`` string; the
+        legacy schema used ``providerPublishTime`` as a Unix timestamp. We
+        try both; an unparseable date degrades to ``None`` (the caller's
+        forward-leakage guard only filters when ``pub_ts`` is a number).
+
+    Pure, total — never raises (a per-item parse failure is the caller's
+    cue to skip that item, mirroring the existing GDELT / volume / AV cache
+    type-guard discipline).
+    """
+    content = item.get("content") if isinstance(item, dict) else None
+    if not isinstance(content, dict):
+        content = {}
+
+    # title: prefer new-schema, fall back to legacy top-level
+    title = content.get("title") or item.get("title") or ""
+    if not isinstance(title, str):
+        title = str(title)
+
+    # url: try canonicalUrl.url, then clickThroughUrl.url, then legacy link.
+    # Both new-schema URL fields are dicts; either may be None.
+    url = ""
+    for key in ("canonicalUrl", "clickThroughUrl"):
+        candidate = content.get(key)
+        if isinstance(candidate, dict):
+            u = candidate.get("url")
+            if isinstance(u, str) and u:
+                url = u
+                break
+    if not url:
+        legacy_link = item.get("link") or content.get("link")
+        if isinstance(legacy_link, str):
+            url = legacy_link
+
+    # pub_ts: legacy providerPublishTime is already epoch-seconds; new-schema
+    # pubDate is an ISO-8601 string we parse to a UTC epoch float. Either may
+    # be missing.
+    pub_ts: float | None = None
+    legacy_ts = item.get("providerPublishTime")
+    if isinstance(legacy_ts, (int, float)):
+        pub_ts = float(legacy_ts)
+    else:
+        pub_date_iso = content.get("pubDate") or content.get("displayTime")
+        if isinstance(pub_date_iso, str) and pub_date_iso:
+            try:
+                # Normalize the trailing 'Z' (RFC 3339) to '+00:00' for
+                # `fromisoformat`. Python <3.11 doesn't accept the literal
+                # 'Z' suffix; manual strip is portable across 3.10+.
+                iso = pub_date_iso.rstrip("Z")
+                if iso != pub_date_iso:
+                    iso = iso + "+00:00"
+                pub_ts = datetime.fromisoformat(iso).timestamp()
+            except (TypeError, ValueError):
+                pub_ts = None
+    return title, url, pub_ts
+
+
 class BacktestEngine:
     _VALID_MODEL_PREFIXES = ("ml_quant", "claude-", "hf/")
     # Class-level default so callers that bypass __init__ via
@@ -2955,11 +3044,24 @@ class BacktestEngine:
         """Supplement GDELT with yfinance ticker news. No rate limits, no API key.
 
         Returns headlines published on or before `sim_date` scored by the keyword
-        heuristic. Filters by `providerPublishTime` so a recent-but-still-historical
-        sim_date cannot pick up news published after it (avoiding forward leakage
-        that would contaminate the DecisionScorer training set).
-        Only fetched for dates within the last 30 days because yfinance keeps a
-        short retention window per ticker.
+        heuristic. Filters by the article's publish timestamp so a
+        recent-but-still-historical sim_date cannot pick up news published after
+        it (avoiding forward leakage that would contaminate the DecisionScorer
+        training set). Only fetched for dates within the last 30 days because
+        yfinance keeps a short retention window per ticker.
+
+        Schema-tolerant. yfinance changed its ``Ticker.news`` payload in late
+        2024: the legacy flat shape (``{title, link, providerPublishTime}``)
+        was replaced with a nested ``{id, content: {title, canonicalUrl: {url},
+        pubDate, …}}`` shape. The prior implementation read only the legacy
+        top-level keys, so every NVDA/SPY/etc. headline silently came back as
+        ``title=""`` and was dropped at the ``if not title: continue`` guard
+        — Tier 2 of ``_fetch_signals`` went dark. The helper below extracts
+        title/url/pub_ts from BOTH shapes (new schema wins when present,
+        legacy fields are a fallback), so a future schema rollback or any
+        residual provider returning the legacy shape still works. Same
+        defensive try/except contract — a parse failure on one item drops
+        that item, never the whole ticker's news.
         """
         cutoff = date.today() - timedelta(days=30)
         if sim_date < cutoff:
@@ -2975,9 +3077,10 @@ class BacktestEngine:
             try:
                 news = yf.Ticker(tk).news or []
                 for n in news[:10]:
-                    title = n.get("title", "")
-                    url = n.get("link", "")
-                    pub_ts = n.get("providerPublishTime")
+                    try:
+                        title, url, pub_ts = _parse_yf_news_item(n)
+                    except Exception:
+                        continue
                     # Skip dedup for empty URLs — otherwise a single empty
                     # string in `seen` silently swallows EVERY subsequent
                     # URL-less yfinance article (only the first survives),
@@ -2987,7 +3090,8 @@ class BacktestEngine:
                         continue
                     if url and url in seen:
                         continue
-                    if isinstance(pub_ts, (int, float)) and pub_ts > sim_end_ts:
+                    if (isinstance(pub_ts, (int, float))
+                            and pub_ts > sim_end_ts):
                         continue  # future news — would leak forward into training
                     if url:
                         seen.add(url)
