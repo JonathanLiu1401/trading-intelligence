@@ -5,6 +5,161 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-24 hybrid pass #31 (Agent 3) — score_pending ML-path recap/quote-widget pre-floor (FOURTH gate surface)
+
+Debugger + feature-dev + news-analyst pass. The codebase is mature (179
+focused-suite tests green at pass start). Every load-bearing invariant
+(backtest isolation in `get_unalerted_urgent` / `get_top_for_briefing` /
+`get_unscored`, ai_score vs ml_score separation, score_source tagging,
+urgency state machine) is already pinned by existing tests. But the
+audit-by-tracing-the-noisy-source approach surfaced a real, surgical bug
+that all 30+ prior passes had missed.
+
+**Phase 1 (bug fix) — committed in `262b655`:**
+
+Live evidence at pass time: `GN: Nvidia` produced 13 ML-only urgents vs
+3 LLM-vetted in the last 24h (19% LLM-vetted, far worse than the chronic
+30% baseline). Pulling the actual titles surfaced
+`"NVIDIA earnings: A quick glance at key metrics - MSN"` at urgency=2
+with `score_source='ml'`, `ml_score=10.0`.
+
+Tracing: that title MATCHES the `_RT_QUICK_GLANCE` recap-template
+fingerprint that `watchers.urgency_scorer.score_batch`'s pre-floor
+exists to floor to noise (ai_score=0.01, urgency=0) BEFORE the Sonnet
+call. So why did it reach urgency=2 with `score_source='ml'`?
+
+Because the ML path bypasses the gate entirely. `score_pending`
+(storage/article_store.py:1190) takes unscored rows, runs the urgency
+head, and:
+
+  * If `sc.needs_llm=True`: leaves the row for the Sonnet path
+    (urgency_scorer.score_batch). The recap-template gate runs here.
+  * If `sc.needs_llm=False` and `sc.urgency >= 8`: writes
+    `ml_score=final / urgency=1 / score_source='ml'` directly — with no
+    fingerprint gate.
+
+So a recap-template title the model is CONFIDENT about (which is
+exactly the class the urgency head over-scores per the alert_agent.py
+documented evidence) writes urgency=1 without ever passing the gate
+that exists to stop it. The alert formatter's defense-in-depth
+recap-template gate suppresses the Discord push (so the analyst doesn't
+see a 🚨 BREAKING on a recap), but:
+
+  * The row still polluted `urgency_label_split` / `urgent_queue_health`
+    metrics — the analyst's "ml-only urgent rate is 70%+" perception.
+  * The alert worker still fetched + decompressed + formatted it before
+    suppressing.
+  * The `urgency=2` mark from the formatter-side suppression
+    indistinguishable in the DB from an actually-pushed alert
+    (the audit family already documents this ambiguity).
+
+Fix: mirror the urgency_scorer pre-floor in `score_pending`. Before
+running inference, partition the batch into pseudo-articles
+(quote-widget OR recap-template fingerprint hit) and real articles.
+Pseudo-articles get `ml_score=0.01 / urgency=0 / score_source='ml'`
+(lockstep with the LLM path's `ai_score=0.01 / score_source='llm'`).
+Real articles continue through the existing inference path unchanged.
+
+Single source of truth for the fingerprint set (lazy import from
+`watchers.alert_agent` — same SSOT `urgency_scorer` uses, no new
+import cycle: `watchers.alert_agent → ml.features` has no back-edge
+into storage). All four load-bearing invariants preserved by
+construction.
+
+Pinned by `tests/test_score_pending::
+test_score_pending_prefloor_recap_and_quote_widget`: monkeypatches
+`score_articles` to return urgency=10 for every batch row and asserts
+the recap/quote-widget rows (a) never reach the stub (`assert
+art["_id"] not in {"recap_qg","recap_wd","quote_widget"}` inside the
+stub), (b) end up as ml_score=0.01 / urgency=0 / score_source='ml',
+while the real urgent control row still promotes to urgency=1.
+
+**Phase 2 (feature) — committed in `3a02074`:**
+
+Two changes documenting + regression-locking the new FOURTH gate
+surface:
+
+* `analytics/quote_widget_audit.py` and `analytics/recap_template_
+  audit.py` docstring updates — both modules previously claimed "gated
+  on THREE surfaces". After 262b655 there are FOUR. Live evidence
+  embedded in both docstrings (the same QUICK_GLANCE example).
+
+* `tests/test_urgency_recap_prefilter.py::
+  test_score_pending_uses_alert_agent_gate` — extends the SSOT
+  lockstep parity guard from 3 surfaces to 4. Asserts:
+  - `alert_agent` still exposes both `_looks_like_recap_template` and
+    `_looks_like_quote_widget` (score_pending's lazy import would
+    otherwise raise ImportError on the next ML scoring cycle), and
+  - `urgency_scorer._looks_like_quote_widget IS
+    alert_agent._looks_like_quote_widget` (identity, not equality —
+    a copy-paste fork into score_pending would break the cross-gate
+    regex-tightening contract).
+
+  Anti-drift insurance: extends the recurring SSOT-violation regression
+  guard class (test_briefing_recap_template, test_urgency_recap_
+  prefilter) to the new fourth gate. A future regex tightening on the
+  alert path will continue to automatically engage on the ML path.
+
+**Phase 3 (live user validation) — user_findings=4:**
+
+1. **Bug fix is materially impactful on live data.** Of the 52 ml-only
+   urgent rows in the last 24h, **12 (23%)** would have been pre-floored
+   by the new gate had it been in place. Concrete examples
+   (caught by `_RT_QUICK_GLANCE` / `_RT_WHY_TRADING` /
+   `_RT_IS_BUY_AFTER` / `_RT_QUICK_GLANCE`):
+   - "NVIDIA earnings: A quick glance at key metrics - MSN"
+     (urgency=2, ml_score=10.0)
+   - "Why Did Micron Stock Drop Today?" pattern variants
+   - "Nvidia (NVDA) Reports Robust Earnings While Valuation Appears At
+     - GuruFocus"
+   The chronic 30% LLM-vetted floor was a STRUCTURAL artefact of these
+   12 rows over-counting the ml-only side every 24h. After 262b655,
+   future windows should show a noticeably higher LLM-vetted fraction
+   on the noisy GN: collectors.
+
+2. **External RSS source soft-dark cluster.** MarketWatch (4 feeds —
+   Economy, StocksToWatch, Tech, etc.), Barron's Real-Time + Barron's
+   Tech, Quartz, IMF News, OECD News, HardwareLuxx all returning
+   `403 Forbidden` or SSL cert errors in the last 1h of daemon.log.
+   Likely publisher-side RSS-access tightening (known industry trend),
+   not a daemon bug. Consider pruning these feed URLs from
+   `config/sources.json` so the rss_collector doesn't keep retrying
+   feeds the publishers have walled off.
+
+3. **Long-dark reddit cluster.** 7 reddit/r/* subreddits dark for
+   200h+ (reddit/r/AIstocks, GlobalMarkets, ethfinance, Biotechplays,
+   AsianStocks, stockanalysis, HFEA — between 206h and 246h since
+   last live row). Mirrors / extends the documented
+   `[DI chronic dark collectors]` standing condition. Not a fresh bug;
+   no operator action needed beyond the existing cleanup task.
+
+4. **Briefing pipeline HEALTHY (4 in 24h, latest 5.9h ago).** Slightly
+   below the 5h cadence floor (expected ~5), matches prior pass #30's
+   `briefing_cadence_trend=DRIFTING` finding. Latest briefing covers
+   the post-NVDA rotation cleanly (LEAD: QCOM +11.60%, AXTI +16.37%,
+   QBTS +14.22% rotation beneficiaries; AMD +3.99% as fade survivor).
+   Briefing quality from analyst-perspective: useful and accurate —
+   the LEAD identifies a tradeable rotation theme, MACRO/PORTFOLIO/
+   SEMIS PULSE/TOP SIGNALS sections all populated. Held tickers were
+   quiet last 6h (1 urgent each for NVDA and QBTS), consistent with
+   a post-earnings-night low-news window.
+
+**Phase 4 (docs):** this section.
+
+**Final verify:** `from storage import article_store; from ml import
+features, model` → `imports OK`. Focused suite:
+`tests/test_score_pending.py` (3) +
+`tests/test_article_store.py` + `tests/test_urgency_scorer.py` +
+`tests/test_alert_agent.py` + `tests/test_trainer.py` +
+`tests/test_urgency_recap_prefilter.py` (12) +
+`tests/test_briefing_health.py` + `tests/test_briefing_cadence_trend.py` +
+`tests/test_briefing_recap_template.py` + `tests/test_quote_widget_audit.py` +
+`tests/test_recap_template_audit.py` = **179 pass / 0 fail** in 10.0s.
+
+**Counters:** `bugs_fixed=1`, `features_added=1`, `user_findings=4`.
+
+---
+
 ## 2026-05-24 feature-dev pass (Agent 4) — PASSIVE-SIGNAL-DENSITY + NEWS-TO-TRADE-LAG + CATALYST-EXPIRY chat enrichments
 
 Three chat blocks shipped, each piping an existing paper-trader endpoint
