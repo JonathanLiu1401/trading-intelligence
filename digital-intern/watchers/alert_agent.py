@@ -1065,6 +1065,82 @@ _RT_EARNINGS_RELEASE_PT = re.compile(
     re.IGNORECASE,
 )
 
+# "<Subject> (TICKER) (Is|Are|Shares|Stock Is) (Up|Down|Higher|Lower) N.N%
+# After <event>" — the SUBJECT-LED price-attribution recap mill (MarketBeat /
+# simplywall.st / bloomingbit / Yahoo). Sibling of ``_RT_WHY_PCT_AFTER`` and
+# ``_RT_WHY_STOCK_IS_AFTER`` which both require a leading ``^Why`` anchor; this
+# is the same retrospective shape WITHOUT the ``Why`` lead — the price-attribution
+# is stated as fact, not as a question.
+#
+# Live evidence (2026-05-22..24, 7d articles.db urgency=2 scan):
+#   - "D-Wave Quantum (QBTS) Is Up 44.5% After $100 Million Planned Federal
+#      Equity Investment - simplywall.st" — Sonnet-scored ai=9.0, fired BREAKING
+#   - "NVIDIA (NASDAQ:NVDA) Shares Down 1.9% After Analyst Downgrade -
+#      MarketBeat" — ml=9.98 score_source='ml', urgency=2
+#   - "Lumentum (NASDAQ:LITE) Shares Down 8.8% After Insider Selling -
+#      MarketBeat" — ml=9.63 score_source='ml', urgency=2 (held position!)
+#   - "MakeMyTrip (MMYT) Is Down 7.8% After Mixed FY26 Earnings Under Travel
+#      Disruptions And Ongoing Investments" — ml=9.87 score_source='ml',
+#      urgency=2 (not held, pure SEO mill spam)
+#
+# All four sources are above the 0.45 ``ALERT_MIN_LONE_SOURCE_CRED`` bar
+# (MarketBeat 0.68, simplywall.st defaults to 0.55, Google News 0.62) so the
+# authority gate does not catch them; content type IS the failure. By the time
+# the headline says "Shares Down 1.9% After Downgrade", the downgrade and the
+# move are both in the rear-view — exactly the post-hoc recap shape
+# ``_RT_WHY_PCT_AFTER`` catches in its ``^Why`` variant.
+#
+# Discriminator (the QUINT): subject lead (NOT ``^Why`` — that is the existing
+# sibling's territory) ≤6 tokens + state-verb bridge (Shares/Stock + optional
+# Is/Was/Now + Up/Down/Higher/Lower OR bare Is/Are/Was/Were + Up/Down/Higher/
+# Lower) + explicit ``\d+(?:\.\d+)?%`` move + ``\bafter\b`` retrospective
+# anchor. The ≤6 token subject limit is what makes this safe against a real
+# news headline that happens to mention "Shares Up N% After Hours" as a footer:
+# "Nvidia Beats Estimates With $81.62 Billion in Q1 Revenue; Shares Up 0.2%
+# After Hours - bloomingbit" requires 9 leading tokens to reach "Shares" and
+# does NOT match — the BREAKING news verb ("Beats Estimates") is at the front,
+# and the price-tick clause is the trailer, exactly the shape the analyst
+# wants to keep.
+#
+# Validated against the must-survive corpus: "Nvidia Beats Estimates ...; Shares
+# Up 0.2% After Hours" (9 tokens to verb — too far), "Fed cuts rates 50bp;
+# stocks up 2% after surprise announcement" (semicolon-separated commentary,
+# not subject-verb), "MU revenue rises 22% after Q1 beats consensus" (no
+# Is/Are/Shares verb bridge), "Tesla shares jump after earnings beat" (no
+# digit %), "Stock futures edge higher ahead of Nvidia earnings" (no digit %),
+# "Why Nvidia Stock Is Down 3% After Q1 Earnings" (caught by sibling
+# ``_RT_WHY_STOCK_IS_AFTER`` — the ``^Why`` negative-lookahead anchors that
+# division of labour) — none match.
+#
+# Pure read-side: no DB write, no ai_score/ml_score/score_source/urgency
+# mutation. All four load-bearing invariants intact by construction.
+_RT_SUBJECT_PCT_AFTER = re.compile(
+    # NEGATIVE lookahead: not leading with "Why" — those are caught by
+    # _RT_WHY_PCT_AFTER / _RT_WHY_STOCK_IS_AFTER. Keeps the gate strictly
+    # orthogonal to the existing Why-led siblings.
+    r"^(?!\s*why\b)"
+    # Subject lead — 1..6 tokens. Lazy quantifier finds the verb bridge as
+    # early as possible so a forward-news headline with a trailing footer
+    # ("... ; Shares Up 0.2% After Hours") with the verb 9+ tokens in does
+    # NOT match.
+    r"\s*\S+(?:\s+\S+){0,5}?\s+"
+    # State-verb bridge — either:
+    #   "<TICKER> Shares Down" / "Stock Is Up" / "Stock Was Higher" / "Stock Now Lower"
+    #   "Stock Is Now Up" / "Shares Was Currently Down" — 0..2 modifier tokens
+    #   "<Subject> Is Up" / "Are Down" / "Was Higher" / "Were Lower"
+    r"(?:"
+        r"(?:shares|stock)(?:\s+(?:is|was|now|currently)){0,2}\s+"
+        r"(?:up|down|higher|lower)"
+        r"|"
+        r"(?:is|are|was|were)\s+(?:up|down|higher|lower)"
+    r")\s+"
+    # Explicit move magnitude required — distinguishes recap from forward news.
+    r"\d+(?:\.\d+)?\s*%\s+"
+    # Retrospective anchor — same as the Why-led sibling.
+    r"after\b",
+    re.IGNORECASE,
+)
+
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
@@ -1078,6 +1154,13 @@ _RECAP_TEMPLATE_PATTERNS = (
     # whichever fires, the row is suppressed identically.
     ("why_stock_is_after", _RT_WHY_STOCK_IS_AFTER),
     ("why_pct_after", _RT_WHY_PCT_AFTER),
+    # SUBJECT-led sibling of the two Why-led ``...PCT_AFTER`` gates — same
+    # retrospective price-attribution shape WITHOUT the leading ``Why`` anchor
+    # (MarketBeat / simplywall.st / bloomingbit / Yahoo recap mill). Strictly
+    # orthogonal: the regex's ``(?!\s*why\b)`` negative lookahead keeps it
+    # mutually exclusive with the Why-led siblings, so whichever the title
+    # leads with, exactly one fingerprint fires.
+    ("subject_pct_after", _RT_SUBJECT_PCT_AFTER),
     ("market_today_dated", _RT_MARKET_TODAY),
     ("earnings_call_recap", _RT_EARNINGS_CALL),
     ("quick_glance_metrics", _RT_QUICK_GLANCE),
