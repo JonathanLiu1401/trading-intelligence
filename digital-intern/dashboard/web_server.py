@@ -583,6 +583,75 @@ _BC_REAL_VERDICTS = (
 )
 
 
+_SE_REAL_VERDICTS = ("EDGE_FOUND", "NO_EDGE")
+
+
+def _news_source_edge_chat_lines(rep) -> list[str]:
+    """Render paper-trader's ``/api/source-edge`` (the read-only per-collector
+    predictive-edge diagnostic — which of digital-intern's ~17 news sources'
+    scored headlines actually precede the SPY-abnormal move?) as compact
+    chat-context lines.
+
+    The chat already carries ML GATE HONESTY (does the DecisionScorer beat a
+    one-liner OOS?) which grades the *gate*; this is its read-COLLECTOR
+    companion: even if the gate works, are the *inputs feeding it* edge-bearing
+    or wire-noise? An analyst answering "should I trust this MarketWatch
+    headline?" or "which sources actually move the tape?" has no other surface
+    to compose this from — the per-source verdict only lives in the trader
+    endpoint and the JS-only ``se-card`` dashboard panel.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` string
+    is composed **verbatim** — no chat-side re-derived verdict that could
+    drift from the trader endpoint. ``best_source`` / ``worst_source`` and
+    the per-source pp/horizon math already live inside the headline; we never
+    reconstruct them here.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict, missing/unknown ``verdict`` → ``[]`` (block omitted, never
+      an exception into the chat handler)
+    - ``INSUFFICIENT_DATA`` / ``NO_DATA`` → ONE honest withheld line; the
+      module's ``headline`` is **not** surfaced (the trader endpoint never
+      raises and a fault/empty-DB branch may put a stack/exception string
+      in adjacent fields — keep the withheld line minimal & opaque so a
+      pipeline fault cannot leak into the analyst prompt, mirroring the
+      ``_baseline_compare_chat_lines`` INSUFFICIENT_DATA contract)
+    - ``EDGE_FOUND`` / ``NO_EDGE`` → the verdict headline + the module's
+      verbatim ``headline`` line (which already encodes best/worst source,
+      pp at ref horizon, sample counts, and graded/total counts); a missing
+      headline simply drops the second line, never raises
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    if verdict in ("INSUFFICIENT_DATA", "NO_DATA"):
+        return [
+            "News-source edge: insufficient resolved history — verdict "
+            "withheld."
+        ]
+    if verdict not in _SE_REAL_VERDICTS:
+        return []
+
+    lookback = rep.get("lookback_days")
+    ref = rep.get("reference_horizon")
+    n_resolved = rep.get("n_resolved")
+    tag_bits: list[str] = []
+    if isinstance(lookback, int):
+        tag_bits.append(f"{lookback}d lookback")
+    if isinstance(ref, int):
+        tag_bits.append(f"{ref}d ref")
+    if isinstance(n_resolved, int):
+        tag_bits.append(f"n_resolved={n_resolved}")
+    tag = f" ({', '.join(tag_bits)})" if tag_bits else ""
+
+    lines = [f"News-source edge{tag}: {verdict}"]
+
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(f"  {headline}")          # verbatim SSOT — invariant #10
+    return lines
+
+
 def _baseline_compare_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/baseline-compare` (the read-only OOS-skill
     diagnostic — does the 17-feature DecisionScorer beat a one-line rule out
@@ -6439,6 +6508,28 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: baseline-compare fetch failed: %s", e)
 
+        # News-source edge — which of digital-intern's ~17 collectors actually
+        # precede SPY-abnormal moves vs which are wire-noise? ML-gate-honesty
+        # above grades the GATE; this is its read-COLLECTOR companion: an
+        # analyst answering "should I trust this MarketWatch headline?" or
+        # "which sources actually move the tape?" has no other surface to
+        # compose this from — the per-source verdict only lives in the trader
+        # endpoint and the JS-only se-card dashboard panel. Composed verbatim
+        # by the pure _news_source_edge_chat_lines helper (unit-tested; SSOT
+        # — no re-derived verdict). Guarded 3s sub-fetch like every sibling;
+        # a stale/absent trader silently omits the block.
+        news_source_edge_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/source-edge",
+                    timeout=3) as resp:
+                _se = json.loads(resp.read().decode("utf-8"))
+            news_source_edge_block = "\n".join(
+                _news_source_edge_chat_lines(_se))
+        except Exception as e:
+            _logger().warning("chat: source-edge fetch failed: %s", e)
+
         # Correlation / factor concentration — does the held book move as
         # ONE bet however many tickers are on it? /api/risk (carried in the
         # analytics block above) reports NAME-level concentration; this is
@@ -7489,6 +7580,7 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER ANALYTICS:\n{analytics_block}\n\n" if analytics_block else "")
             + (f"PAPER TRADER — BEHAVIOURAL DIAGNOSIS (the bot's own self-review verdicts):\n{behavioural_block}\n\n" if behavioural_block else "")
             + (f"PAPER TRADER — ML GATE HONESTY (does the DecisionScorer that modulates the bot's live position sizing beat a one-line rule OUT OF SAMPLE? the analytics above report the flattering in-sample story; this is the generalization-relevant verdict):\n{baseline_compare_block}\n\n" if baseline_compare_block else "")
+            + (f"PAPER TRADER — NEWS-SOURCE EDGE (the read-COLLECTOR companion to ML GATE HONESTY — even if the gate works, are the inputs feeding it edge-bearing or wire-noise? Per-collector predictive-edge leaderboard across digital-intern's ~17 sources: which collectors' scored headlines actually precede the SPY-abnormal move at the reference horizon, and which are weakest? The analyst can answer 'should I trust this source's headline?' or 'which collectors actually move the tape?' from no other surface in chat — this verdict lives only in the trader endpoint and the JS-only se-card dashboard panel. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{news_source_edge_block}\n\n" if news_source_edge_block else "")
             + (f"PAPER TRADER — FACTOR CONCENTRATION (the held book's pairwise return correlation + effective-independent-bets count; complements /api/risk's NAME-level view — a 59/41 book that is concentrated by weight may STILL be a single FACTOR bet if both names move as one):\n{correlation_block}\n\n" if correlation_block else "")
             + (f"PAPER TRADER — OPEN-POSITION THESIS DRIFT (every holding re-tested against the verbatim reason it was opened for, graded INTACT/WEAKENING/BROKEN by P/L since entry + live quant/momentum; an INTACT book collapses to silence so this block ONLY fires when at least one held position is materially off its entry thesis — drift_reasons carry verbatim from the trader endpoint, never re-derived):\n{thesis_drift_block}\n\n" if thesis_drift_block else "")
             + (f"PAPER TRADER — PRIORITISED ACTION PLAN (the bot's own next-session game plan):\n{game_plan_block}\n\n" if game_plan_block else "")
