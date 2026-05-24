@@ -6,6 +6,107 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 paper-trader core HYBRID pass (Agent 1) — `_rsi_label` overbought/oversold annotation
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Read all required core files in full (runner.py, reporter.py, signals.py,
+strategy.py, dashboard.py, market.py, store.py) and AGENTS.md. The
+preceding 2026-05-24 core pass (`exit_only_streak`, commit 6f0ba0d) had
+already produced bugs_fixed=0 against a fresh two-subagent audit; a
+second pass over the same files turned up no new surgical fix worth
+landing. The full core slice (`tests/test_core_{runner,strategy,signals,
+market,store,reporter}.py`) — 835 tests — passes clean in ~30s.
+
+Concurrent sibling agent work observed at boot time (Agent 2 ML+backtest,
+Agent 4 feature-dev) is in-flight on `paper_trader/reporter.py`
+(adding `_passive_signal_density_line` + `_regime_leverage_fit_line`)
+and `paper_trader/dashboard.py` (adding `/api/passive-signal-density`),
+plus new analytics files (`passive_signal_density.py`,
+`decision_cadence.py`) and their tests. To respect the
+`pt-concurrent-samerole-staging-race` discipline (sibling whole-file
+git add between stage and commit can bundle their work into mine), this
+pass is scoped to files NO sibling is touching: `strategy.py` and
+`tests/test_core_strategy.py` only.
+
+### Phase 2 — Feature: `_rsi_label` (71d8c16)
+
+New `paper_trader.strategy._rsi_label` mirrors the existing `_bb_label`
+render-side enrichment exactly, one indicator over. The SYSTEM_PROMPT
+already names "RSI > 70 = overbought" and "RSI < 30 = oversold", but the
+rendered TECHNICAL SIGNALS block emits bare floats like ``rsi=72.5`` —
+Opus has to mentally re-threshold every row. Wired into
+`_format_quant_signals` where the ``rsi=...`` token is built so the
+labelled state reaches the live decision prompt directly.
+
+Token rendering ladder (mirrors `_bb_label`):
+
+| Input | Rendering |
+|-------|-----------|
+| `None` | `?` |
+| `rsi >= _RSI_OVERBOUGHT` (70) | `<x> (overbought)` |
+| `rsi <= _RSI_OVERSOLD` (30) | `<x> (oversold)` |
+| `30 < rsi < 70` | bare `<x>` (silence-when-nothing-actionable) |
+| non-numeric | `str(x)` (degrade-safe — never raises into `decide()`) |
+
+Inclusive boundaries (`>=` / `<=`) match the textbook 70 / 30 marks the
+SYSTEM_PROMPT names — a strict `>` / `<` would un-label exactly-70 /
+exactly-30 rows. Silence on a neutral RSI follows the
+`_bb_label` / `_hold_age_str` / `_streak_line` precedent — the prompt
+only adds an annotation when there is something actionable.
+
+9 new tests in `tests/test_core_strategy.py::TestRsiLabel` pin:
+`None → "?"`, mid-range bare (50, 45.5, 65, 35 — straddle the
+thresholds), both extremes labelled (72, 72.5, 85.1, 28, 28.3, 15),
+inclusive boundary at exactly 70 / 30, no overbought↔oversold
+sign-flip (75 → no oversold; 25 → no overbought), degrade to str for
+non-numeric, end-to-end propagation through `_format_quant_signals`
+(both arms + the None pass-through that
+`test_pct_vs_v_field_coercion` locks one class up).
+
+```bash
+python3 -m pytest tests/test_core_strategy.py -v -k "RsiLabel or FormatQuant or BbLabel"
+```
+
+### Phase 3 — Live user validation: user_findings = 3
+
+Probed `:8090` with every panel and tailed the runner via the journal
+on PID 1657104 (the manually-launched runner that holds the singleton
+flock; the systemd unit is enabled but repeatedly bounced off the lock
+— restart counter 1035+, the documented
+`pt-systemd-vs-manual-restart-spam` memory note; do NOT fix).
+
+1. **/api/host-guard reports STARVED 75% over 120 decisions** —
+   `state="STARVED"`, 4 concurrent Opus subprocesses (3 HYBRID review
+   agents + the backtest committee), load1=11.93 on 16 CPUs. This is
+   the documented #1 NO_DECISION cause (memory:
+   `pt-no-decision-host-saturation`) and the panel's
+   `headline` surfaces it correctly — observational, no bug.
+2. **/api/decision-paralysis reports PASSIVE_LOOP** — 22 consecutive
+   HOLD/NO_DECISION cycles, last active 7.04h ago (SELL NVDA at
+   02:08 UTC). Healthy passive cycle on a closed market — the panel
+   `headline` again surfaces it correctly.
+3. **/api/runner-heartbeat reports HEALTHY but `last_real_decision` is
+   DELAYED** — last decision 31m ago (within the 60m closed cadence,
+   HEALTHY), but `last_real_decision_ts` is 2h 1m ago (past the 75m
+   normal cadence). Both signals are independently correct — the engine
+   IS cycling, but every recent cycle is `HOLD CASH → HOLD`. No fix
+   warranted; the dual surface is by design.
+
+All 25 probed endpoints respond 200 with non-stale bodies; the slowest
+is `/api/disagreement` at 859ms (single yfinance fetch on a
+zero-position book — acceptable). The earlier `news-corroboration`
+404 in the probe was a probe-typo: the real endpoint is
+`/api/news-corroboration-skill`. Not a bug.
+
+### Phase 4 — Docs and verify
+
+`tests/test_core_strategy.py` + the rest of the core slice pass —
+844 tests (was 835 + 9 new RSI tests) in ~19s. Full repo suite was
+verified green at session start. AGENTS.md updated above (this pass).
+
+---
+
 ## 2026-05-24 paper-trader core HYBRID pass (Agent 1) — `exit_only_streak` detector
 
 ### Phase 1 — Debug: bugs_fixed = 0
