@@ -1025,6 +1025,46 @@ _RT_WHATS_NEXT_AFTER = re.compile(
     re.IGNORECASE,
 )
 
+# "Earnings Release: Here's Why Analysts <Cut|Raised|Lowered|...> Their
+# <Company> Price Target..." — the SimplyWallSt / scraped-Yahoo-syndication
+# SEO-mill post-earnings analyst-action recap template. By definition
+# retrospective: the print already happened ("Earnings Release:"), the
+# analyst-action has been announced, and the article is summarising what
+# the Street did AFTER the fact — there is no forward-looking trade the
+# analyst can make from this.
+#
+# Live evidence (2026-05-24, 30-day articles.db scan): 9 such rows landed
+# in the DB; the canonical noisiest copy was
+# "Earnings Release: Here's Why Analysts Cut Their The Home Depot, Inc.
+#  (NYSE:HD) Price Target To US$378.32" — one reached urgency=2 at
+# ``ml_score=9.83`` via the scraped/finance.yahoo.com channel (cred=0.65 —
+# well above the 0.45 ``ALERT_MIN_LONE_SOURCE_CRED`` bar, so the
+# source-authority gate cannot catch it; content type IS the failure).
+# Sibling templates for TELA, KROS, CuriosityStream (CURI), Intuit (INTU)
+# show the SimplyWallSt SEO mill posts the same shape for every quarterly
+# print across the entire small-cap universe — a recurring, evidence-backed
+# noise class.
+#
+# Discriminator: anchored ``^Earnings Release\s*:\s*Here(?:'s|s)?\s+Why\s+
+# Analysts\b`` + analyst-action verb + ``Price Target`` terminator. The
+# colon-bounded "Earnings Release:" lead + "Here's Why Analysts" bridge +
+# "Price Target" trailer is the SimplyWallSt SEO mill's exact triple
+# signature. Validated against the must-survive corpus: real wire copy
+# does not use this prefix — "MU price target raised 15% by Citi",
+# "Analysts cut their PT on Tesla after Q1 miss", "Q1 Earnings Release
+# shows record revenue", "Earnings preview: HD reports tomorrow" all
+# do NOT match because none combine the ``^Earnings Release:`` lead
+# with the ``Here's Why Analysts <verb>`` bridge AND the ``Price Target``
+# terminator.
+_RT_EARNINGS_RELEASE_PT = re.compile(
+    r"^\s*earnings\s+release\s*:\s*"
+    r"here(?:[s'’]+|\s+is)?\s+why\s+analysts\s+"
+    r"(?:cut|raised|lowered|increased|boosted|reduced|trimmed|hiked|"
+    r"slashed|maintained|reiterated|downgraded|upgraded)\s+.+?"
+    r"\bprice\s+target\b",
+    re.IGNORECASE,
+)
+
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
@@ -1053,6 +1093,7 @@ _RECAP_TEMPLATE_PATTERNS = (
     ("futures_why_today", _RT_FUTURES_WHY_TODAY),
     ("daily_price_city", _RT_DAILY_PRICE_CITY),
     ("whats_next_after", _RT_WHATS_NEXT_AFTER),
+    ("earnings_release_pt", _RT_EARNINGS_RELEASE_PT),
 )
 
 

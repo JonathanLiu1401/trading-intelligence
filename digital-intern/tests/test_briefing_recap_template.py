@@ -480,6 +480,14 @@ def test_briefing_gate_catches_drift_patterns():
         ("NVIDIA Q1 Earnings Call Highlights", "earnings_call_recap"),
         ("Nvidia (NVDA) Q1 2027 Earnings Transcript - The Globe and Mail",
          "earnings_call_recap"),
+        # earnings_release_pt — SimplyWallSt / scraped/finance.yahoo.com
+        # SEO mill (2026-05-24 live evidence: scraped/finance.yahoo.com
+        # row at ml_score=9.83 — "Earnings Release: Here's Why Analysts
+        # Cut Their The Home Depot, Inc. (NYSE:HD) Price Target ...").
+        ("Earnings Release: Here's Why Analysts Cut Their The Home Depot, "
+         "Inc. (NYSE:HD) Price Target To US$378.32", "earnings_release_pt"),
+        ("Earnings Release: Here's Why Analysts Raised Their NVIDIA "
+         "Price Target", "earnings_release_pt"),
     ]
     for title, expected in drift_cases:
         hit, name = _looks_like_recap_template({"title": title})
