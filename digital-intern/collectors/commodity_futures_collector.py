@@ -26,6 +26,22 @@ from pathlib import Path
 
 import yfinance as yf
 
+# Align the direct-write urgency cutoff with the system-wide URGENT_THRESHOLD
+# (8.0) the Sonnet path (watchers.urgency_scorer) and the ML score_pending path
+# both enforce. The prior literal 6.0 cutoff was a real noise source: a
+# 30-day live audit found 5 alerted commodity rows, all at kw_score 6.00-6.18
+# — barely-above-threshold moves (Brent +2.3%, WTI +2.4%, Copper +2.0%) that
+# fired BREAKING pushes the analyst would call routine commodity volatility.
+# The kw_score formula caps at base(5.0) + 3.0 = 8.0, so an alert now
+# corresponds to a ≥3× threshold move (≈6% for oil) — the magnitude that
+# actually warrants a BREAKING push. Import keeps the link explicit so a
+# future change to URGENT_THRESHOLD propagates here automatically.
+import sys as _sys
+_BASE_DIR_FOR_IMPORT = Path(__file__).resolve().parent.parent
+if str(_BASE_DIR_FOR_IMPORT) not in _sys.path:
+    _sys.path.insert(0, str(_BASE_DIR_FOR_IMPORT))
+from watchers.urgency_scorer import URGENT_THRESHOLD  # noqa: E402
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "articles.db"
 SOURCE = "commodity_futures"
@@ -176,7 +192,7 @@ def collect(conn: sqlite3.Connection | None = None) -> list[dict]:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     article_id, url, title, SOURCE, ts,
-                    score, 1 if score >= 6.0 else 0,
+                    score, 1 if score >= URGENT_THRESHOLD else 0,
                     compressed, ts,
                 ),
             )
