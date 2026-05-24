@@ -897,6 +897,114 @@ class TestRecheckSingletonLock:
                       "have_lock": True, "degraded": False}
 
 
+class TestAlarmLatchState:
+    """``alarm_latch_state()`` — in-process silent-failure alarm-latch
+    snapshot. The runner dedupes the breaker / quota Discord alarms via
+    two module-global latches (``_breaker_alert_active``,
+    ``_quota_alert_active``); a trader watching Discord sees the FIRED /
+    CLEARED bracket but cannot tell whether the latch is CURRENTLY held.
+    This accessor surfaces the state next to ``singleton_lock_state``
+    / ``reporter.notify_health`` so the operator sees the full
+    silent-failure picture on the heartbeat / dedicated endpoint."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_latch_globals(self, monkeypatch):
+        monkeypatch.setattr(runner, "_breaker_alert_active", False)
+        monkeypatch.setattr(runner, "_quota_alert_active", False)
+        monkeypatch.setattr(runner, "_consecutive_no_decisions", 0)
+        monkeypatch.setattr(runner, "_no_decision_first_ts", None)
+        monkeypatch.setattr(runner, "_quota_first_ts", None)
+
+    def test_clean_state_returns_all_false(self):
+        st = runner.alarm_latch_state()
+        assert st == {
+            "breaker_active": False,
+            "quota_active": False,
+            "any_active": False,
+            "consecutive_no_decisions": 0,
+            "breaker_threshold": runner.CONSECUTIVE_NO_DECISION_LIMIT,
+            "breaker_outage_s": None,
+            "quota_outage_s": None,
+        }
+
+    def test_breaker_active_surfaced(self, monkeypatch):
+        # 12-minute wedge: first NO_DECISION was 720s ago.
+        from datetime import datetime, timezone, timedelta
+        first = datetime.now(timezone.utc) - timedelta(seconds=720)
+        monkeypatch.setattr(runner, "_breaker_alert_active", True)
+        monkeypatch.setattr(runner, "_consecutive_no_decisions", 0)  # post-fire reset
+        monkeypatch.setattr(runner, "_no_decision_first_ts", first)
+        st = runner.alarm_latch_state()
+        assert st["breaker_active"] is True
+        assert st["quota_active"] is False
+        assert st["any_active"] is True
+        # Outage seconds within ±2 of 720 to absorb test-execution delay.
+        assert st["breaker_outage_s"] is not None
+        assert abs(st["breaker_outage_s"] - 720) <= 2
+
+    def test_quota_active_surfaced(self, monkeypatch):
+        # 90-minute quota outage: first quota cycle was 5400s ago.
+        from datetime import datetime, timezone, timedelta
+        first = datetime.now(timezone.utc) - timedelta(seconds=5400)
+        monkeypatch.setattr(runner, "_quota_alert_active", True)
+        monkeypatch.setattr(runner, "_quota_first_ts", first)
+        st = runner.alarm_latch_state()
+        assert st["quota_active"] is True
+        assert st["any_active"] is True
+        assert st["quota_outage_s"] is not None
+        assert abs(st["quota_outage_s"] - 5400) <= 2
+
+    def test_consecutive_count_surfaced_pre_breaker(self, monkeypatch):
+        # 3 consecutive NO_DECISIONs — below the threshold; breaker not
+        # fired yet, so the latch is NOT held, but the count is surfaced
+        # so a trader can see the engine approaching a wedge.
+        monkeypatch.setattr(runner, "_breaker_alert_active", False)
+        monkeypatch.setattr(runner, "_consecutive_no_decisions", 3)
+        st = runner.alarm_latch_state()
+        assert st["breaker_active"] is False
+        assert st["consecutive_no_decisions"] == 3
+        # Sanity: the threshold is a meaningful positive integer.
+        assert isinstance(st["breaker_threshold"], int)
+        assert st["breaker_threshold"] >= 1
+
+    def test_future_outage_ts_clamps_to_zero_not_negative(self, monkeypatch):
+        """A wall-clock step-back (the documented clock-skew hazard) could
+        leave ``_no_decision_first_ts`` in the future. The accessor must
+        clamp the rendered outage seconds to 0 rather than emit a
+        misleading negative duration."""
+        from datetime import datetime, timezone, timedelta
+        future = datetime.now(timezone.utc) + timedelta(minutes=30)
+        monkeypatch.setattr(runner, "_breaker_alert_active", True)
+        monkeypatch.setattr(runner, "_no_decision_first_ts", future)
+        st = runner.alarm_latch_state()
+        assert st["breaker_outage_s"] == 0, (
+            "outage seconds rendered negative under a wall-clock step-back")
+
+    def test_pure_read_never_raises_on_garbage_ts(self, monkeypatch):
+        """A corrupt ts (a non-datetime mistakenly assigned by a future
+        bug) must NOT propagate an exception out of the accessor — the
+        dashboard reads this on every heartbeat poll."""
+        monkeypatch.setattr(runner, "_no_decision_first_ts", "not-a-ts")
+        # Must not raise.
+        st = runner.alarm_latch_state()
+        # And the outage is reported as None (unparseable), not garbage.
+        assert st["breaker_outage_s"] is None
+
+    def test_both_latches_active_any_active_true(self, monkeypatch):
+        """Both classes of silent failure simultaneously: any_active is the
+        lean single-bit flag a dashboard banner can key off."""
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc)
+        monkeypatch.setattr(runner, "_breaker_alert_active", True)
+        monkeypatch.setattr(runner, "_quota_alert_active", True)
+        monkeypatch.setattr(runner, "_no_decision_first_ts", ts)
+        monkeypatch.setattr(runner, "_quota_first_ts", ts)
+        st = runner.alarm_latch_state()
+        assert st["breaker_active"] is True
+        assert st["quota_active"] is True
+        assert st["any_active"] is True
+
+
 class TestOpenPositionTickersForInterval:
     """``_open_position_tickers_for_interval`` replaces an inline raw-sqlite
     read in ``main()``. It must:

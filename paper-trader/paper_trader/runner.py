@@ -182,6 +182,64 @@ def singleton_lock_state() -> dict:
     }
 
 
+def alarm_latch_state() -> dict:
+    """Best-effort snapshot of this process's silent-failure alarm latches.
+
+    The runner dedupes two Discord alarm classes via in-memory latches:
+
+      * ``_breaker_alert_active`` — the consecutive-NO_DECISION circuit
+        breaker fired; further breaker alarms stay silent until a real
+        decision (HOLD/FILLED/BLOCKED) lands.
+      * ``_quota_alert_active`` — Claude rejected with a usage/quota limit;
+        further quota alarms stay silent until a real decision lands.
+
+    A trader watching Discord sees the FIRED/CLEARED bracket but cannot tell
+    whether the latch is CURRENTLY held without scrolling. The dashboard's
+    ``/api/runner-heartbeat`` already exposes the lock and Discord-delivery
+    health; this accessor surfaces the orthogonal silent-failure latch state
+    next to them so the operator gets the full liveness picture in one read.
+
+    Returned fields:
+
+      * ``breaker_active`` — bool, ``_breaker_alert_active``
+      * ``quota_active`` — bool, ``_quota_alert_active``
+      * ``consecutive_no_decisions`` — running count toward the threshold
+      * ``breaker_threshold`` — ``CONSECUTIVE_NO_DECISION_LIMIT`` (= 5)
+      * ``breaker_outage_s`` — int seconds since the FIRST NO_DECISION in
+        the current wedge run (None when no wedge in progress)
+      * ``quota_outage_s`` — int seconds since the FIRST quota cycle in the
+        current quota outage (None when no quota outage in progress)
+      * ``any_active`` — bool, True iff either latch is held (the lean
+        single-bit flag a dashboard banner can key off)
+
+    Pure read of module globals — never raises, safe from any thread.
+    Mirrors ``singleton_lock_state``'s discipline. A wall-clock step-back
+    (the documented clock-skew hazard the sidecar already hardens against)
+    clamps the outage durations to 0 rather than rendering negative.
+    """
+    now = datetime.now(timezone.utc)
+
+    def _age_s(ts):
+        if ts is None:
+            return None
+        try:
+            return max(0, int((now - ts).total_seconds()))
+        except (TypeError, AttributeError):
+            return None
+
+    breaker = bool(_breaker_alert_active)
+    quota = bool(_quota_alert_active)
+    return {
+        "breaker_active": breaker,
+        "quota_active": quota,
+        "any_active": breaker or quota,
+        "consecutive_no_decisions": int(_consecutive_no_decisions),
+        "breaker_threshold": CONSECUTIVE_NO_DECISION_LIMIT,
+        "breaker_outage_s": _age_s(_no_decision_first_ts),
+        "quota_outage_s": _age_s(_quota_first_ts),
+    }
+
+
 def _acquire_singleton_lock(path=_LOCK_PATH) -> SingletonLock:
     """Try to take the exclusive runner lock.
 
