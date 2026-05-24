@@ -859,6 +859,18 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    macro_calendar_block: str | None = None,
                    buying_power_block: str | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
+    # Granular trading-day phase (see market.market_phase). The header
+    # historically carried only the binary MARKET_OPEN — but a decision at
+    # the opening bell, the closing half-hour, or mid-session live in three
+    # very different liquidity/spread regimes. Surfacing the phase lets Opus
+    # calibrate conviction directly. Degrade-safe: any market.py fault leaves
+    # the phase token blank (the line still ships, byte-identical to before
+    # for the MARKET_OPEN line that follows).
+    try:
+        phase = market.market_phase()
+    except Exception as e:
+        print(f"[strategy] market_phase failed (non-fatal): {e}")
+        phase = ""
     pos_lines = []
     for p in snapshot["positions"]:
         # When the live price was unavailable the position is marked at cost,
@@ -1000,9 +1012,10 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # before it sees the prices it would fund against. Observational only.
     bp_section = f"{buying_power_block}\n" if buying_power_block else ""
 
+    phase_line = f"MARKET_PHASE: {phase}\n" if phase else ""
     return f"""TIME (UTC): {now}
 MARKET_OPEN: {market_open}
-S&P 500 BENCHMARK: {sp}
+{phase_line}S&P 500 BENCHMARK: {sp}
 
 PORTFOLIO:
   cash: ${snapshot['cash']:.2f}

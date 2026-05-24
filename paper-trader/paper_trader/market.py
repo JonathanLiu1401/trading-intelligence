@@ -44,6 +44,21 @@ _REGULAR_CLOSE_MIN = 16 * 60       # 16:00 ET, minutes since ET midnight
 _EARLY_CLOSE_MIN = 13 * 60         # 13:00 ET half-day close
 _OPEN_MIN = 9 * 60 + 30            # 09:30 ET open
 
+# Granular phase windows around the NYSE session. The trader's prompt header
+# historically carried only the binary ``MARKET_OPEN: True/False`` — but a
+# decision at 09:31 ET (whipsaw-prone opening minute), 15:45 ET (closing
+# rebalance flow + after-close earnings about to print) and 11:00 ET (deep
+# mid-session, normal book) live in three very different liquidity / spread
+# regimes and a portfolio manager calibrates conviction differently in each.
+# Mid-session lasts from 10:00 ET to ``close - CLOSING_HALF_HOUR_MIN`` (so a
+# half-day's CLOSING_HALF_HOUR is 12:30-13:00 ET, not 15:30-16:00). Pre-/
+# post-market windows mirror the typical extended-hours bands U.S. brokers
+# expose (04:00-09:30 ET and 16:00-20:00 ET); outside those is OVERNIGHT.
+_OPENING_BELL_MIN = 30             # first 30 min of the session
+_CLOSING_HALF_HOUR_MIN = 30        # last 30 min of the session
+_PRE_MARKET_OPEN_MIN = 4 * 60      # 04:00 ET — common ECN pre-market open
+_AFTER_HOURS_CLOSE_MIN = 20 * 60   # 20:00 ET — common ECN after-hours close
+
 
 def is_half_day(d: date) -> bool:
     """True if ``d`` is a known NYSE early-close (1:00 p.m. ET) session."""
@@ -56,6 +71,54 @@ def close_minute(d: date) -> int:
     or full holiday has no session — callers gate that separately via
     ``is_market_open``; this only answers 'when does the bell ring'."""
     return _EARLY_CLOSE_MIN if d in NYSE_HALF_DAYS_2026 else _REGULAR_CLOSE_MIN
+
+
+def market_phase(now: datetime | None = None) -> str:
+    """Granular trading-day phase for ``now`` (UTC tz-aware; default real wall
+    clock). Returns ONE of:
+
+      * ``"WEEKEND"``          — Saturday/Sunday (no session of any kind)
+      * ``"HOLIDAY"``          — known full NYSE holiday
+      * ``"PRE_MARKET"``       — trading day, 04:00 ≤ NY-time < 09:30
+      * ``"OPENING_BELL"``     — trading day, 09:30 ≤ NY-time < 10:00
+      * ``"MID_SESSION"``      — trading day, 10:00 ≤ NY-time < close-30min
+      * ``"CLOSING_HALF_HOUR"`` — trading day, close-30min ≤ NY-time < close
+      * ``"AFTER_CLOSE"``      — trading day, close ≤ NY-time < 20:00
+      * ``"OVERNIGHT"``        — trading day evening/early morning outside
+                                  the pre/after windows above (20:00 ≤
+                                  NY-time < 04:00 next day)
+
+    Half-day handling is automatic — ``CLOSING_HALF_HOUR`` is 12:30-13:00 ET
+    on a known half-day (not 15:30-16:00) because ``close_minute`` resolves
+    to 13:00 there, so ``MID_SESSION`` ends at 12:30 ET and ``AFTER_CLOSE``
+    begins at 13:00 ET on those days. The same ``is_market_open`` calendar
+    drives the trading-day vs holiday/weekend split, so the phase view and
+    ``MARKET_OPEN`` can never disagree about whether today is a session day.
+
+    Pure: derived from the NY-tz wall clock and the holiday/half-day sets.
+    No I/O. Never raises on a valid tz-aware ``now`` — the timezone math is
+    deterministic. Designed for the live decision prompt's header (so Opus
+    sees the granular phase, not just a binary open/closed)."""
+    now = (now or datetime.now(UTC)).astimezone(NY)
+    if now.weekday() >= 5:
+        return "WEEKEND"
+    if now.date() in NYSE_HOLIDAYS_2026:
+        return "HOLIDAY"
+    minutes = now.hour * 60 + now.minute
+    close_min = close_minute(now.date())
+    if minutes < _PRE_MARKET_OPEN_MIN:
+        return "OVERNIGHT"
+    if minutes < _OPEN_MIN:
+        return "PRE_MARKET"
+    if minutes < _OPEN_MIN + _OPENING_BELL_MIN:
+        return "OPENING_BELL"
+    if minutes < close_min - _CLOSING_HALF_HOUR_MIN:
+        return "MID_SESSION"
+    if minutes < close_min:
+        return "CLOSING_HALF_HOUR"
+    if minutes < _AFTER_HOURS_CLOSE_MIN:
+        return "AFTER_CLOSE"
+    return "OVERNIGHT"
 
 _PRICE_CACHE: dict[str, tuple[float, float]] = {}  # ticker -> (price, ts)
 _PRICE_TTL = 30.0  # seconds
