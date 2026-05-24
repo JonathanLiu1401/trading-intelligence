@@ -140,6 +140,43 @@ FEATURE_NAMES = [
 ] + [f"sector_{s}" for s in SECTORS]
 assert len(FEATURE_NAMES) == N_FEATURES, "FEATURE_NAMES drifted from build_features()"
 
+# Operational feature groups for at-a-glance prediction triage.
+#
+# `feature_contributions()` returns 17 per-feature contributions — useful
+# for forensics but noisy for a researcher who wants to answer "is the
+# scorer leaning on news, on quant signals, on the sector bias, or on the
+# trade-thesis ml_score?". `feature_group_contributions()` rolls the 17
+# features into 5 semantic buckets that map 1:1 to the *operator's* mental
+# model of the inputs:
+#
+#   ml_score  — the ArticleNet trade-thesis score itself (1 feature)
+#   quant     — purely-technical price signals (6 features)
+#   regime    — SPY-50/200 market-regime multiplier (1 feature)
+#   news      — news-context features (urgency + article count, 2 features)
+#   sector    — sector one-hot (7 features — a 60% sector_tech contribution
+#               is a sector bias, not 7 unrelated signals)
+#
+# A FEATURE_GROUP_MAP entry must exist for every name in FEATURE_NAMES; the
+# assert below is the same drift-guard FEATURE_NAMES itself uses against
+# build_features(). FEATURE_GROUPS is the canonical display order
+# (matches the FEATURE_NAMES axis: thesis → quant → regime → news → sector).
+FEATURE_GROUPS: tuple[str, ...] = (
+    "ml_score", "quant", "regime", "news", "sector",
+)
+FEATURE_GROUP_MAP: dict[str, str] = {
+    "ml_score": "ml_score",
+    "rsi": "quant", "macd": "quant", "mom5": "quant", "mom20": "quant",
+    "vol_ratio": "quant", "bb_pos": "quant",
+    "regime_mult": "regime",
+    "news_urgency": "news", "news_article_count": "news",
+}
+for _s in SECTORS:
+    FEATURE_GROUP_MAP[f"sector_{_s}"] = "sector"
+assert set(FEATURE_GROUP_MAP.keys()) == set(FEATURE_NAMES), \
+    "FEATURE_GROUP_MAP drifted from FEATURE_NAMES"
+assert set(FEATURE_GROUP_MAP.values()) == set(FEATURE_GROUPS), \
+    "FEATURE_GROUPS drifted from FEATURE_GROUP_MAP values"
+
 # A 5-trading-day forward return is physically bounded. Across the 9,000+
 # real outcomes in data/decision_outcomes.jsonl the distribution is
 # p1=-25%, p99=+32%, and only ~0.4% of samples exceed |50%| (those are
@@ -725,6 +762,121 @@ class DecisionScorer:
                     "pred_baseline": 0.0, "interaction_residual": 0.0,
                     "off_distribution": True, "error": str(e)}
 
+    def feature_group_contributions(
+        self,
+        ml_score: float,
+        rsi: float | None,
+        macd: float | None,
+        mom5: float | None,
+        mom20: float | None,
+        regime_mult: float,
+        ticker: str,
+        vol_ratio: float | None = None,
+        bb_pos: float | None = None,
+        news_urgency: float | None = None,
+        news_article_count: float | None = None,
+    ) -> dict:
+        """Per-group signed attribution for one prediction.
+
+        Thin operator-facing roll-up of ``feature_contributions``: sums the
+        17 per-feature contributions into the 5 ``FEATURE_GROUPS`` buckets
+        (``ml_score``, ``quant``, ``regime``, ``news``, ``sector``). The
+        per-feature view answers "which input is driving this prediction?";
+        this answers the orthogonal triage question "is the scorer leaning
+        on news, on quant signals, on the trade thesis, or on the sector
+        bias?" — at a glance, without scanning a 17-row table.
+
+        Algebraic identity (sum-of-groups = sum-of-features):
+
+            sum(group.contribution for group in groups)
+                == sum(feature.contribution for feature in contributions)
+                == pred_raw - pred_baseline - interaction_residual
+
+        Returns a JSON-safe dict ``{"trained", "groups", "pred",
+        "pred_baseline", "interaction_residual", "off_distribution"}``.
+        Each ``groups[i]`` carries ``{"group", "contribution",
+        "share_pct", "n_features"}`` where ``share_pct`` is
+        ``|contribution| / sum(|contribution|)`` as a 0..100 share (so
+        groups whose contributions cancel internally show ``|net|/|all|``
+        — the operator-meaningful "how much net signal does this group
+        contribute" rather than the misleading "0%" a literal share would
+        report). ``share_pct`` sums to 100.0 across all groups when the
+        per-group denominator is non-zero, and to 0.0 in the degenerate
+        all-zero case (e.g. an untrained or zeroed-contribution row).
+
+        ``groups`` is sorted by ``-|contribution|`` so the dominant group
+        always comes first — same display ordering as
+        ``feature_contributions``. ``trained=False`` (no model) yields an
+        empty groups list, mirroring the parent method. Every failure path
+        degrades to an ``error`` field, never an exception."""
+        contrib = self.feature_contributions(
+            ml_score=ml_score, rsi=rsi, macd=macd, mom5=mom5, mom20=mom20,
+            regime_mult=regime_mult, ticker=ticker, vol_ratio=vol_ratio,
+            bb_pos=bb_pos, news_urgency=news_urgency,
+            news_article_count=news_article_count,
+        )
+        if not contrib.get("trained"):
+            return {"trained": False, "groups": [], "pred": 0.0,
+                    "pred_baseline": 0.0, "interaction_residual": 0.0,
+                    "off_distribution": False}
+        if not contrib.get("contributions"):
+            # Either off-distribution (model raised / non-finite) or some
+            # other failure inside feature_contributions; propagate the
+            # honest signal up (no contributions means no groups).
+            out = {"trained": True, "groups": [], "pred": contrib.get("pred", 0.0),
+                   "pred_baseline": contrib.get("pred_baseline", 0.0),
+                   "interaction_residual": contrib.get("interaction_residual", 0.0),
+                   "off_distribution": bool(contrib.get("off_distribution"))}
+            if contrib.get("error"):
+                out["error"] = contrib["error"]
+            return out
+        try:
+            # Defense-in-depth: an unknown feature name in the contributions
+            # list (would only happen if FEATURE_NAMES drifts at runtime
+            # without FEATURE_GROUP_MAP updating, despite the module-level
+            # assert) lands in a synthetic 'unknown' bucket so the group
+            # totals still add correctly rather than silently losing rows.
+            sums: dict[str, float] = {g: 0.0 for g in FEATURE_GROUPS}
+            counts: dict[str, int] = {g: 0 for g in FEATURE_GROUPS}
+            for row in contrib["contributions"]:
+                feat = row["feature"]
+                grp = FEATURE_GROUP_MAP.get(feat, "unknown")
+                if grp not in sums:
+                    sums[grp] = 0.0
+                    counts[grp] = 0
+                sums[grp] += float(row["contribution"])
+                counts[grp] += 1
+            denom = sum(abs(v) for v in sums.values())
+            rows: list[dict] = []
+            for grp in (*FEATURE_GROUPS, "unknown"):
+                if grp not in sums:
+                    continue
+                # Drop the synthetic 'unknown' bucket if nothing landed
+                # there — keeps the operator-facing payload clean in the
+                # 99.99% case where FEATURE_GROUP_MAP is complete.
+                if grp == "unknown" and counts[grp] == 0:
+                    continue
+                share = (abs(sums[grp]) / denom * 100.0) if denom > 0 else 0.0
+                rows.append({
+                    "group": grp,
+                    "contribution": round(sums[grp], 4),
+                    "share_pct": round(share, 2),
+                    "n_features": counts[grp],
+                })
+            rows.sort(key=lambda r: -abs(r["contribution"]))
+            return {
+                "trained": True,
+                "pred": contrib.get("pred", 0.0),
+                "pred_baseline": contrib.get("pred_baseline", 0.0),
+                "interaction_residual": contrib.get("interaction_residual", 0.0),
+                "off_distribution": bool(contrib.get("off_distribution")),
+                "groups": rows,
+            }
+        except Exception as e:
+            return {"trained": True, "groups": [], "pred": 0.0,
+                    "pred_baseline": 0.0, "interaction_residual": 0.0,
+                    "off_distribution": True, "error": str(e)}
+
     @property
     def is_trained(self) -> bool:
         return self._trained
@@ -1167,6 +1319,11 @@ def _build_arg_parser():
                         "relies on most (mean-|first-layer-weight| for the "
                         "MLP, |coef| for the lstsq fallback). Ignores all "
                         "per-prediction args.")
+    p.add_argument("--groups", action="store_true", dest="groups",
+                   help="In per-prediction mode, also print the per-group "
+                        "(ml_score / quant / regime / news / sector) "
+                        "attribution roll-up — operator triage view of "
+                        "what's driving this prediction.")
     p.add_argument("--ticker", default="",
                    help="Ticker symbol — drives the 7-way sector one-hot.")
     p.add_argument("--ml-score", type=float, default=0.0, dest="ml_score",
@@ -1234,17 +1391,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     meta = scorer.predict_with_meta(**common)
     contrib = scorer.feature_contributions(**common)
+    groups = scorer.feature_group_contributions(**common) if args.groups else None
 
     if args.json:
         import json
 
-        print(json.dumps({
+        payload = {
             "trained": scorer.is_trained,
             "n_train": scorer.n_train,
             "ticker": args.ticker,
             "prediction": meta,
             "attribution": contrib,
-        }, indent=2, sort_keys=True))
+        }
+        if groups is not None:
+            payload["group_attribution"] = groups
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0 if (scorer.is_trained
                      and not meta.get("off_distribution")) else 1
 
@@ -1283,6 +1444,14 @@ def main(argv: list[str] | None = None) -> int:
                   f"{r['contribution']:>+16.4f}")
     elif contrib.get("error"):
         print(f"  attribution unavailable: {contrib['error']}")
+    if groups is not None and groups.get("groups"):
+        print("  per-group attribution (operator triage):")
+        print(f"    {'group':<12}{'contribution':>14}{'share':>10}{'n_feats':>10}")
+        for g in groups["groups"]:
+            print(f"    {g['group']:<12}{g['contribution']:>+14.4f}"
+                  f"{g['share_pct']:>9.2f}%{g['n_features']:>10}")
+    elif groups is not None and groups.get("error"):
+        print(f"  group attribution unavailable: {groups['error']}")
     return 1 if off else 0
 
 
