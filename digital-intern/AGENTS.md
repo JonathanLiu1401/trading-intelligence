@@ -315,6 +315,83 @@ surfaced in the threshold strings the UI displays).
 
 ---
 
+## 2026-05-24 feature-dev pass (Agent 4) — INTENT-FOLLOWTHROUGH + OPPORTUNITY-COST chat enrichments
+
+Two chat blocks shipped, both pairing freshly-wired paper-trader endpoints
+(see paper-trader `AGENTS.md` for the trader-side surfaces): 
+
+- `_intent_followthrough_chat_lines` pipes paper-trader's new
+  `/api/intent-followthrough` (does the bot actually execute the STANDING
+  conditional intents it stated?) into the `/api/chat` enrichment.
+- `_opportunity_cost_chat_lines` pipes paper-trader's new
+  `/api/opportunity-cost` (graded HOLD-CASH / NO_DECISION sit-outs vs
+  forward returns of the top-news watchlist ticker) into the same.
+
+### `_intent_followthrough_chat_lines` — the say-do gap detector
+
+The observational companion to `_standing_intents_chat_lines` (which
+lists the STANDING intents themselves). That block answers *what did the
+bot SAY it would do next?*; this block answers *did the bot ACTUALLY do
+it?* A bot that emits crisp "wait for X, then buy Y" statements every
+cycle but never executes Y has perfect specificity on
+`_decision_vapor_chat_lines` and zero followthrough — only this block
+catches the gap.
+
+Block contract:
+- Fires ONLY on `DRIFTING` / `ABANDONED`. `DISCIPLINED` / `NO_DATA` /
+  `NO_RESOLVED` / `ERROR` collapse to silence — the
+  `_decision_paralysis_chat_lines` silence precedent, never chat filler
+  when the bot is following through.
+- SSOT (paper-trader invariant #10): the builder's own `headline` passes
+  verbatim. Detail line restates the builder's own count fields
+  (`n_followed` / `n_abandoned` / `followthrough_rate`) plus surfaces
+  abstention sub-counters (`preserve_dead` / `restraint_broken`) when > 0.
+- Guarded 3s sub-fetch like every sibling block; appears once `:8090` is
+  restarted onto `/api/intent-followthrough`.
+
+### `_opportunity_cost_chat_lines` — the hindsight cash-discipline read
+
+The chat already carries idle-opportunity (current drought) and
+`cash_pct` (snapshot) but neither answers *did past cash discipline
+COST or SAVE alpha?* A persistent `MISSED_ALPHA` verdict means cash
+discipline is COSTING alpha; a persistent `DEFENSIVE_WIN` means it's
+SAVING the book. Neither shows up as a discrete signal anywhere else.
+
+Block contract:
+- Fires ONLY on `MISSED_ALPHA` / `DEFENSIVE_WIN`. `NEUTRAL` / `NO_DATA` /
+  `ERROR` collapse to silence — the silence precedent, never chat filler
+  when sit-outs are neutral.
+- SSOT (paper-trader invariant #10): the builder's own `headline` passes
+  verbatim. Detail line restates the builder's own `stats` fields
+  (`n_classified` / `missed_pct` / `defensive_pct` / `mean_fwd_3d_pct`)
+  plus, when relevant, the count of sit-outs too recent to grade
+  (`n_sitout_total - n_classified`).
+- Guarded 3s sub-fetch; appears once `:8090` is restarted onto
+  `/api/opportunity-cost`.
+
+Pinned by `tests/test_chat_intent_followthrough_enrichment.py` +
+`tests/test_chat_opportunity_cost_enrichment.py` (53 cases combined):
+verbatim SSOT for headline, silence on non-actionable verdicts, defensive
+degradation on non-dict / garbage stats / missing keys, detail-line
+arithmetic pins (signed mean 3d, ratio of unrated sit-outs, abstention
+sub-counter surfacing), NO chat helper ever raises into the chat handler.
+
+### Test commands
+
+```bash
+cd /home/zeph/trading-intelligence/digital-intern
+python3 -m pytest \
+    tests/test_chat_intent_followthrough_enrichment.py \
+    tests/test_chat_opportunity_cost_enrichment.py -v
+# → 53 passed
+
+# Full chat-enrichment regression sweep:
+python3 -m pytest tests/ -k chat -q
+# → 609 passed, 0 regressions
+```
+
+---
+
 ## 2026-05-24 feature-dev pass (Agent 4) — STANDING-INTENTS chat enrichment
 
 `dashboard/web_server.py::_standing_intents_chat_lines` pipes paper-trader's
@@ -10616,3 +10693,120 @@ commit: (1) sibling-agent in-flight portfolio-ticker prompt work
 edits. All four were left untouched. `git diff --staged --name-only`
 verified before each commit that only this agent's three files (Phase
 1) and two files (Phase 2) were staged.
+
+---
+
+## 2026-05-24 hybrid pass #27 — book-universe drift fix + cross-position event pulse
+
+**Phase 1 (bug) — bugs_fixed=1.** `analytics/ticker_concentration.py` and
+`analytics/briefing_coverage_audit.py` each carried a static
+`_BOOK_TICKERS` tuple of 12 historical positions. That tuple was the
+sole source for their `_BOOK_RE` regex AND for `under_covered`
+iteration, so any held name added later via the trading UI / written
+to `config/portfolio.json` was silently invisible to both analytics.
+A live snapshot on 2026-05-24 showed 11 held / watchlisted tickers
+(AMAT, AMD, COHR, GOOG, KLAC, LRCX, NVDL, SMH, SOXX, STX, WDC)
+present in portfolio.json yet absent from the literal — so a
+concentration audit for "what fraction of book-mentioning urgent
+articles touch NVDL" returned zero (because no NVDL article ever
+registered as a book-mention), and a briefing coverage audit on the
+same NVDL article filed it as out-of-universe rather than missed
+coverage. Same regression class as `analysis.claude_analyst`'s pre-
+2026-05-23 static `_BOOK_TICKERS` (already fixed there by
+`_BOOK_UNIVERSE`); both analytics modules were the next-in-line
+consumers and had drifted the same way. Fix: add `_BOOK_UNIVERSE`
+mirroring `claude_analyst._BOOK_UNIVERSE` byte-for-byte (static
+literal first in their existing canonical order — parity test
+preserved — then alphabetically-sorted live-only additions). Both
+modules use `_BOOK_UNIVERSE` for `_BOOK_RE` and `under_covered`
+iteration; static `_BOOK_TICKERS` literals unchanged so the
+existing `test_book_ticker_parity` / `TestBookTickerParityWithClaudeAnalyst`
+drift guards still pass. 6 new tests pin: `_BOOK_UNIVERSE` parity
+with claude_analyst, the static-then-sorted-extension shape, and a
+live-config regression case that asserts a config-only ticker
+actually registers in the audits. Commit `4318788`.
+
+**Phase 2 (feature) — features_added=1.** Added
+`ArticleStore.cross_book_event_pulse(tickers, hours, min_tickers,
+top_n)` — the missing cross-position primitive. Every other per-
+ticker metric (`urgency_label_split_by_ticker`,
+`ticker_mention_velocity`, `urgent_queue_health`,
+`book_alert_coverage`) slices by ONE ticker at a time, so a single
+wire like "MU, STX, WDC, SNDK stocks sink as Samsung strike ripples
+rattle red-hot AI memory chip trade" splits into three independent
+per-ticker rows. The analyst-facing question "what events touched
+MULTIPLE of my positions simultaneously today?" had no answer. Live
+evidence (2026-05-24 24h): 50 of 4,946 live rows carried 2+ held
+tickers in the title alone — 39 distinct basket-events. The urgent
+(MU, STX, WDC) Samsung-strike basket lands as the #1 event the
+primitive surfaces (urgency=1, max_score=9.94, count=4 — three
+syndicated copies of one event correctly collapsed into one row).
+Pure read, scoped with `_LIVE_ONLY_CLAUSE`; no DB write, no
+ai_score/ml_score/score_source/urgency mutation. Same per-ticker
+hygiene as the four sibling primitives (whole-word, optional `$`,
+len>=2). 18 new tests pin: basket grouping (sorted-tuple key never
+order-dependent), backtest isolation (a "NVDA NVDA NVDA / MU MU MU"
+backtest row never manufactures a fake (MU,NVDA) basket), ticker
+hygiene, deterministic strongest-event-first sort (urgent_count
+desc → basket_size desc → count desc → alphabetical first ticker),
+score_sources tally, read-only invariant. Commit `c2f63b2`.
+
+**Phase 3 (live validation) — user_findings=4.**
+1. **Cross-position primitive validated against real flow.** Live run
+   surfaced 39 basket-events in 24h; the #1 was the exact Samsung-
+   strike (MU, STX, WDC) wire that the analyst's COVERAGE-GAP block
+   in briefing #45 already cited as the lead semis miss. The new
+   primitive elevates that single concentrated-risk event to position
+   1 in a queryable view — proves the gap was real.
+2. **Briefing path healthy.** Briefing #45 (2026-05-24 04:54 UTC,
+   50 articles, 2751 chars) reads as coherent post-NVDA-earnings
+   morning brief: LEAD names the rotation broadening into laggards,
+   MACRO/PORTFOLIO/SEMIS PULSE blocks all populated, TOP SIGNALS
+   correctly ranks Samsung-strike basket (9.94), NVDA $9B WH order
+   (9.0), QBTS rally (6.93). 45 briefings on record, last-age ~5h.
+3. **Long-dead scraped sources (config drift).** Six historically-
+   live scraped/* targets went silent on 2026-05-13/14 and never
+   recovered: `WSJ Tech`, `scraped/ir.amd.com`, `scraped/spectrum.
+   ieee.org`, `scraped/www.theregister.com`, `scraped/www.cboe.com`,
+   `scraped/www.barchart.com`. ~10+ days of zero rows each; likely
+   selector breakage or site change. Distinct from
+   `di-chronic-dark-collectors` (which covers SEC EDGAR / Polygon /
+   Finnhub / Nitter — API-class dark sources). Worth a manual review
+   of `collectors/web_scraper.py` SCRAPE_TARGETS to drop or repair.
+4. **Urgent-alert calibration gap recurring.** 24h `urgency>=1`
+   live-only: 22 LLM-vetted vs 52 ML-only (71% unverified) — the
+   same `mostly_unverified` rate the dashboard `/api/urgency-label-
+   split` has reported for days. Not a fresh regression — Sonnet
+   urgency_scorer is either throttled or under-firing on certain
+   classes (forum/wiki/sentiment-screener rows the ML head
+   over-scores).
+
+**Phase 4 (docs):** this section.
+
+**Final verify:** `from storage import article_store; from ml import
+features, model` → `imports OK`. Focused suites:
+`test_cross_book_event_pulse` 18 pass, `test_ticker_concentration`
+13 pass, `test_briefing_coverage_audit` 45 pass (incl. 3 new
+universe-parity / live-config tests), plus `test_article_store` /
+`test_features` / `test_model` / `test_trainer` /
+`test_urgency_scorer`. Full `pytest tests/` ran end-to-end:
+**2,858 pass / 0 fail in 88 s** (compared with 2,781 pre-pass —
+all 77 new tests this pass pass cleanly, no regression on the prior
+suite).
+
+**Counters:** `bugs_fixed=1`, `features_added=1`, `user_findings=4`.
+
+**Staging discipline.** Per-commit explicit pathspec, no `git add -A`.
+Working copy carried multiple sets of foreign edits at commit time:
+(1) sibling-agent modifications to `watchers/alert_agent.py` (the
+"What is Next After NVIDIA Trounces Expectations" recap-template
+pattern + `_QW_IMAGE_CREDIT` hyphenated-name fix), (2) sibling-agent
+new untracked files (`analytics/held_alert_reaction_latency.py`,
+`collectors/shipping_intelligence.py`,
+`tests/test_chat_intent_followthrough_enrichment.py`,
+`tests/test_chat_opportunity_cost_enrichment.py`), (3) sibling-agent
+dashboard endpoints (`dashboard/web_server.py`), (4) trading-UI
+config updates, and (5) cross-repo paper-trader edits. All five were
+left untouched. `git diff --staged --name-only` verified before each
+commit that only this agent's files were staged (Phase 1: 4 files,
+Phase 2: 2 files).

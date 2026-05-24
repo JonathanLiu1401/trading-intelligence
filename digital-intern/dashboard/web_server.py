@@ -1211,6 +1211,169 @@ def _concurrent_opus_attribution_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _intent_followthrough_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/intent-followthrough` (does the bot
+    actually execute its own STANDING conditional intents?) as compact
+    chat-context lines.
+
+    Complements `_standing_intents_chat_lines` (which lists the intents
+    themselves) with the observational follow-up: of the actionable
+    intents the bot stated, how many were FOLLOWED by a matching trade
+    inside the evaluation window, how many ABANDONED, and what's the
+    aggregate followthrough rate. A bot that emits crisp "wait for X,
+    then buy Y" statements but never executes Y has perfect specificity
+    on decision-vapor and zero followthrough — only this block catches
+    the say-do gap.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+    the chat headline — no chat-side re-derived verdict (the
+    ``_decision_paralysis_chat_lines`` precedent). Detail line restates
+    the builder's *own* count fields (n_followed / n_abandoned /
+    followthrough_rate / abstention.preserve_dead /
+    abstention.restraint_broken) — never a recomputation (the
+    ``_event_readiness_chat_lines`` precedent).
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - non-actionable verdicts (``DISCIPLINED`` / ``NO_DATA`` /
+      ``NO_RESOLVED`` / ``ERROR``) → ``[]``: a disciplined desk is silence,
+      matching the ``_decision_paralysis_chat_lines`` silence precedent —
+      never chat filler when the bot is following through. ``NO_RESOLVED``
+      collapses because the verdict isn't in yet (intents still pending);
+      ``ERROR`` collapses because the endpoint's error envelope carries no
+      actionable signal
+    - actionable verdicts (``DRIFTING`` / ``ABANDONED``) → builder's
+      verbatim ``headline`` (only when a usable string) + one detail line
+      composed from the builder's count fields. A missing field degrades
+      silently rather than raises (the ``_paper_trader_position_lines``
+      precedent)
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"DRIFTING", "ABANDONED"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)                  # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    n_followed = _num(rep.get("n_followed"))
+    n_abandoned = _num(rep.get("n_abandoned"))
+    n_pending = _num(rep.get("n_pending"))
+    rate = _num(rep.get("followthrough_rate"))
+    abst = rep.get("abstention") if isinstance(rep.get("abstention"),
+                                                dict) else {}
+    preserve_dead = _num(abst.get("n_preserve_dead"))
+    restraint_broken = _num(abst.get("n_restraint_broken"))
+
+    detail_parts: list[str] = []
+    if (n_followed is not None and n_abandoned is not None and rate is not None
+            and (n_followed + n_abandoned) > 0):
+        detail_parts.append(
+            f"followed {int(n_followed)} / abandoned {int(n_abandoned)} "
+            f"({100.0 * rate:.0f}% followthrough)"
+        )
+    elif n_followed is not None and n_abandoned is not None:
+        detail_parts.append(
+            f"followed {int(n_followed)} / abandoned {int(n_abandoned)}"
+        )
+    if n_pending is not None and n_pending > 0:
+        detail_parts.append(f"{int(n_pending)} pending")
+    if preserve_dead is not None and preserve_dead > 0:
+        detail_parts.append(f"{int(preserve_dead)} dry-powder dead-weight")
+    if restraint_broken is not None and restraint_broken > 0:
+        detail_parts.append(f"{int(restraint_broken)} restraint broken")
+
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    return lines
+
+
+def _opportunity_cost_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/opportunity-cost` (graded HOLD-CASH /
+    NO_DECISION sit-outs vs forward returns of the top-news watchlist
+    ticker) as compact chat-context lines.
+
+    The chat already carries forward-looking gap analytics (idle-opportunity
+    during a current drought, cash_pct in the portfolio block, the FORWARD
+    intent surface via standing-intents) but no block surfaces the
+    *hindsight* read: of the sit-outs the bot already made, did they earn
+    their keep, or did the watchlist run while we sat? A persistent
+    MISSED_ALPHA verdict means cash discipline is COSTING alpha; a
+    persistent DEFENSIVE_WIN means cash discipline is SAVING the book.
+    Neither shows up as a discrete signal anywhere else.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is
+    the chat headline — no chat-side re-derived verdict (the
+    ``_decision_paralysis_chat_lines`` precedent). Detail line restates
+    the builder's *own* `stats` fields (missed_pct / defensive_pct /
+    mean_fwd_3d_pct / n_classified) — never a recomputation.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - non-actionable verdicts (``NEUTRAL`` / ``NO_DATA`` / ``ERROR``) →
+      ``[]``: a neutral cash discipline is silence, matching the
+      ``_decision_paralysis_chat_lines`` silence precedent — never chat
+      filler when the bot's sit-outs are neither costing nor earning
+      material alpha
+    - actionable verdicts (``MISSED_ALPHA`` / ``DEFENSIVE_WIN``) → builder's
+      verbatim ``headline`` (only when a usable string) + one detail line
+      composed from `stats`. A missing field degrades silently rather than
+      raises (the ``_paper_trader_position_lines`` precedent)
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"MISSED_ALPHA", "DEFENSIVE_WIN"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)                  # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    stats = rep.get("stats") if isinstance(rep.get("stats"), dict) else {}
+    n_classified = _num(stats.get("n_classified"))
+    missed_pct = _num(stats.get("missed_pct"))
+    defensive_pct = _num(stats.get("defensive_pct"))
+    mean_3d = _num(stats.get("mean_fwd_3d_pct"))
+    n_sitout = _num(stats.get("n_sitout_total"))
+
+    detail_parts: list[str] = []
+    if (n_classified is not None and missed_pct is not None
+            and defensive_pct is not None):
+        detail_parts.append(
+            f"{int(n_classified)} sit-outs graded "
+            f"(missed {missed_pct:.0f}% / defensive {defensive_pct:.0f}%)"
+        )
+    if mean_3d is not None:
+        detail_parts.append(f"mean 3d {mean_3d:+.2f}%")
+    if n_sitout is not None and n_classified is not None and n_sitout > n_classified:
+        detail_parts.append(
+            f"{int(n_sitout - n_classified)} too recent to grade"
+        )
+
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    return lines
+
+
 def _cash_redeployment_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/cash-redeployment-latency-skill` (post-SELL
     cash-to-next-BUY latency distribution; the sold-then-sat pathology) as
@@ -5617,6 +5780,56 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: decision-paralysis fetch failed: %s", e)
 
+        # Intent-followthrough — the say-do gap. /api/decision-conditionals
+        # lists the STANDING intents; this block grades whether they were
+        # actually executed. A bot that emits crisp "wait for X, then buy
+        # Y" statements but never executes Y has perfect decision-vapor
+        # specificity and zero followthrough; only this block catches it.
+        # Fires ONLY on DRIFTING / ABANDONED (DISCIPLINED / NO_DATA /
+        # NO_RESOLVED / ERROR collapse to silence — the silence precedent,
+        # never chat filler when the bot is following through). Composed
+        # verbatim by the pure _intent_followthrough_chat_lines helper
+        # (unit-tested; SSOT — the builder's own `headline` is the chat
+        # headline, no re-derived verdict). Guarded 3s read; appears once
+        # :8090 is restarted onto /api/intent-followthrough.
+        intent_followthrough_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/intent-followthrough",
+                    timeout=3) as resp:
+                _ift = json.loads(resp.read().decode("utf-8"))
+            intent_followthrough_block = "\n".join(
+                _intent_followthrough_chat_lines(_ift))
+        except Exception as e:
+            _logger().warning(
+                "chat: intent-followthrough fetch failed: %s", e)
+
+        # Opportunity-cost — the hindsight read on past sit-outs. The chat
+        # already carries idle-opportunity (current drought) and cash_pct
+        # (snapshot) but neither answers "did past HOLD-CASH calls actually
+        # save money?". A persistent MISSED_ALPHA verdict says cash
+        # discipline is COSTING alpha; a persistent DEFENSIVE_WIN says it's
+        # SAVING the book. Fires ONLY on MISSED_ALPHA / DEFENSIVE_WIN
+        # (NEUTRAL / NO_DATA / ERROR collapse to silence — the silence
+        # precedent, never chat filler when sit-outs are neutral). Composed
+        # verbatim by the pure _opportunity_cost_chat_lines helper
+        # (unit-tested; SSOT — the builder's own `headline` is the chat
+        # headline, no re-derived verdict). Guarded 3s read; appears once
+        # :8090 is restarted onto /api/opportunity-cost.
+        opportunity_cost_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/opportunity-cost",
+                    timeout=3) as resp:
+                _oc = json.loads(resp.read().decode("utf-8"))
+            opportunity_cost_block = "\n".join(
+                _opportunity_cost_chat_lines(_oc))
+        except Exception as e:
+            _logger().warning(
+                "chat: opportunity-cost fetch failed: %s", e)
+
         # Persona-book-fit — the structural "does the live book mirror a
         # backtest persona rated DRAG by the leaderboard?" question. Every
         # other block analyses position-by-position fitness; none surface
@@ -6182,6 +6395,8 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — CONCENTRATION TRAJECTORY (the slope view of single-name exposure over the last N days — has top-1 weight been RISING, FALLING, or STEADY? Every other concentration surface is point-in-time and reads identically whether the book ramped 30%→65% over a week or jumped 0%→65% in one cycle. Surfaced ONLY when CONCENTRATION_SPIKE / RAMPING_UP / CONCENTRATED_STEADY, never filler when DECONCENTRATING / DIVERSIFIED / BALANCED. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{concentration_trajectory_block}\n\n" if concentration_trajectory_block else "")
             + (f"PAPER TRADER — STREAK (current win/loss run + historical extremes on closed round-trips — the behavioural-edge read no other surface carries. Surfaced ONLY when HOT_HAND / TILT_RISK, never filler when NEUTRAL or EMERGING; verdict is gated to ≥8 closed round-trips so a 3-trip 'streak' stays silent. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{streak_block}\n\n" if streak_block else "")
             + (f"PAPER TRADER — STANDING INTENTS (the FORWARD slice of the reasoning surface — conditional intents the bot itself stated in recent decisions' reasoning ('wait for cash session', 'rotating into LITE/LNOK', 'premature to dump') that are still STANDING within the freshness window without follow-up action. Every other reasoning block looks BACKWARD (vapor on FILLED, thesis-drift on opens, exit-intent on closed sells); none answers 'what did the bot SAY it would do next, that it has not yet done?'. Surfaced ONLY when STANDING_INTENTS / STALE_INTENTS, never filler when NO_INTENTS / NO_DATA. Headline AND each surfaced intent text pass verbatim from the trader endpoint — restate, never re-derive; the bot's own words, never a chat-side paraphrase. ``[stale]`` tag flags plans that aged past the freshness window without action):\n{standing_intents_block}\n\n" if standing_intents_block else "")
+            + (f"PAPER TRADER — INTENT FOLLOWTHROUGH (the observational companion to STANDING INTENTS — of the actionable intents the bot stated, did it actually execute them? A bot that emits crisp 'wait for X, then buy Y' statements every cycle but never executes Y has perfect specificity on decision-vapor and zero followthrough; only this block catches the say-do gap. Surfaced ONLY when DRIFTING / ABANDONED, never filler when DISCIPLINED / NO_DATA / NO_RESOLVED. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{intent_followthrough_block}\n\n" if intent_followthrough_block else "")
+            + (f"PAPER TRADER — OPPORTUNITY COST (the hindsight read on past HOLD-CASH / NO_DECISION sit-outs — when the bot sat in cash, did the top-news watchlist ticker run without it, or did sitting in cash dodge a drawdown? The chat already carries cash_pct snapshots and idle-opportunity (current drought) but neither answers 'did past cash discipline COST or SAVE alpha?'. Surfaced ONLY when MISSED_ALPHA / DEFENSIVE_WIN, never filler when NEUTRAL / NO_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{opportunity_cost_block}\n\n" if opportunity_cost_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "
