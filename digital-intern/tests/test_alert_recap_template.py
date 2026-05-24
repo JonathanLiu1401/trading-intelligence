@@ -453,6 +453,37 @@ class TestHelperCatchesLiveNoise:
             assert hit, f"missed why-stock-is-after recap: {t!r}"
             assert name == "why_stock_is_after"
 
+    def test_whats_next_after_baystreet_seo_mill(self):
+        """Live evidence (2026-05-23 17:39:55Z, articles.db urgency=2 set):
+        "Baystreet . ca - What is Next After NVIDIA Trounces Expectations"
+        reached urgency=2 (score_source='ml', ml_score=10.0) — Baystreet sits
+        at SOURCE_CRED 0.55 (DEFAULT), ABOVE the 0.45 lone-source bar so the
+        source-authority gate did not catch it. The pattern was defined in
+        alert_agent.py but never wired into ``_RECAP_TEMPLATE_PATTERNS`` so
+        every live "What's Next After ..." mill row sailed through.
+
+        Pin the live failure-case PLUS plausible same-template siblings (other
+        verbs / tickers / post-event terminators). The "after" + post-event
+        terminator is the retrospective anchor — must-survive corpus (no
+        "after" / no terminator) is unaffected."""
+        for t in (
+            # Live failure case — exact title from the GDELT/baystreet.ca feed.
+            "Baystreet . ca - What is Next After NVIDIA Trounces Expectations",
+            "What is Next After NVIDIA Trounces Expectations",
+            "What's Next After NVIDIA Crushes Earnings",
+            # Same template, other tickers / verbs / recap terminators.
+            "What is Next After AMD Beats Q3 Expectations",
+            "What's next after Apple beat Q4 earnings",
+            "What's Next After Tesla Misses Q3 Results",
+            "What is Next After Lumentum's Q1 Report",
+            "What is Next After Snowflake's IPO",
+            "What is Next After Cisco Trounced Guidance",
+            "What is Next After NVDA Q1 Earnings",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed whats-next-after recap: {t!r}"
+            assert name == "whats_next_after"
+
 
 # ── _looks_like_recap_template: real breaking headlines MUST survive ───────
 
@@ -689,6 +720,36 @@ class TestHelperPreservesRealBreaking:
             assert not hit, (
                 f"false-positive on why-stock-is-after pattern: {t!r} "
                 f"(name={name})"
+            )
+
+    def test_whats_next_after_does_not_catch_forward_looking(self):
+        """Forward-looking "What's next" or "Next after <non-event>" headlines
+        are real ongoing analyst questions — they must NOT be caught. The
+        retrospective anchor is BOTH the leading "what(?:'s|\\s+is)? next
+        after" bridge AND a post-event terminator (trounces/crushes/beats/
+        earnings/results/quarter/q1-q4/miss/ipo/guidance). Lose either and the
+        title falls through."""
+        for t in (
+            # "What's next" without "after" — generic forward question.
+            "What's next for the chip cycle?",
+            "What's next for Apple in 2026",
+            "What's next for the AI rally",
+            # "What's next AFTER <non-event-terminator>" — the "after" is
+            # there but the terminator isn't an earnings/recap noun.
+            "What's next after the Fed cut rates",
+            "What is next after the China trade deal",
+            "What's next after the new product launch",
+            # Real macro / forward questions about earnings season.
+            "What comes next after Q3 results were already digested",  # uses "comes next", not "is/'s next"
+            # Real breaking story with similar tokens but wrong shape.
+            "Fed cuts rates 25bp; Powell signals more",
+            "MU earnings beat: what we learned",
+            # "Next earnings" without the "what's/is next after" bridge.
+            "Nvidia next earnings call set for August 28",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert not hit, (
+                f"false-positive on whats-next-after pattern: {t!r} (name={name})"
             )
 
     def test_why_just_moved_does_not_catch_forward_looking(self):
