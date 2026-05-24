@@ -208,6 +208,26 @@ MFE_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 GATE_ARM_SKILL_LOG = ROOT / "data" / "gate_arm_skill_log.jsonl"
 GATE_ARM_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 
+# Per-cycle per-persona decision-signal skill ledger. ``persona_skill.analyze``
+# already answers, durably, the single quant-decisive question about the
+# 10 personas the engine cycles through: *within each persona's own
+# decisions, does a stronger signal (``ml_score``, action-aligned) actually
+# rank-predict a better realized outcome — i.e. is the persona's return
+# real signal skill or pure leveraged-beta dispersion?* The standalone
+# ``persona_leaderboard`` aggregates run-level ``vs_spy_pct`` but AGENTS.md
+# repeatedly warns that a +1000% / -80% per-run swing is leverage luck,
+# NOT strategy skill. ``persona_skill`` is the decision-level honest
+# answer — but until this wiring landed it was CLI-only with no durable
+# per-cycle trend an unattended operator could see, and the single most
+# directly operational state (``HAS_INVERTED_PERSONA`` — at least one
+# persona's signal is ANTI-predictive, the data for a pruning decision)
+# was visible only via manual invocation. Same testability rule as the
+# sibling skill logs (module-level so tests can redirect), same best-
+# effort discipline (a ledger write must never break the loop), same
+# atomic tmp + ``.replace`` trim idiom every other ledger uses.
+PERSONA_SKILL_LOG = ROOT / "data" / "persona_skill_log.jsonl"
+PERSONA_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 # Per-cycle conviction-sizing calibration ledger. ``conviction_calibration``
 # already answers, durably, the most economically decisive question about the
 # `_ml_decide` gate's sizing arm (×0.6 / ×0.85 / ×1.15 / ×1.3) on top of the
@@ -2536,6 +2556,153 @@ def _append_gate_arm_skill_log(cycle: int, win_start: date, win_end: date,
         return False
 
 
+def _append_persona_skill_log(cycle: int, win_start: date, win_end: date,
+                              outcomes_path: "Path | str | None" = None
+                              ) -> bool:
+    """Append one structured row to the per-cycle per-persona
+    decision-signal skill ledger.
+
+    Answers, durably and per-cycle, the decisive question
+    ``persona_leaderboard`` *cannot*: within each persona's own decisions,
+    does the persona's signal actually rank-predict realized outcomes, or
+    is the persona's return pure leveraged-beta noise? Reuses
+    ``persona_skill.persona_skill`` verbatim so the persisted verdict
+    equals the read-only CLI's by construction — a built-in no-drift
+    cross-check the sibling ``_append_*_skill_log`` pattern already
+    establishes.
+
+    Why this matters: the ``persona_leaderboard`` ledger aggregates
+    run-level ``vs_spy_pct`` but a single persona routinely posts +1000%
+    on one window and -80% on the next — that dispersion is leveraged
+    beta, NOT demonstrated signal skill. The decision-level rank-IC the
+    ``persona_skill`` analyzer computes IS the honest signal: it asks
+    whether a higher signal precedes a better realized outcome on the
+    persona's OWN choices. The single most-decisive state — at least
+    one persona is ANTI-predictive (``HAS_INVERTED_PERSONA``: a persona
+    where the stronger its signal, the WORSE its 5d outcome) — is the
+    actionable red flag the operator needs trended, not buried in a CLI
+    output an unattended loop never invokes.
+
+    Best-effort and idempotent-safe: every fault is swallowed (a ledger
+    write must NEVER break the continuous loop — the same discipline
+    every sibling ``_append_*_skill_log`` follows). On any fault we
+    still emit an honest row with ``status='error'
+    verdict='INSUFFICIENT_DATA'`` so a gap in the trend is visible, not
+    silent. Bounded growth: when the file exceeds
+    2× ``PERSONA_SKILL_LOG_KEEP`` it is atomically rewritten via the
+    tmp+``.replace`` idiom every sibling ledger uses.
+
+    The ``signal_dark`` boolean mirrors the sibling ledgers' ``*_dark``
+    flags (``pipeline_dark`` / ``calibrated_dark`` / ``sizing_dark`` /
+    ``stop_dark`` / ``tp_dark`` / ``gate_dark``): True when zero
+    personas have a stable IC (``n_personas == 0`` — every persona has
+    fewer than ``MIN_OUTCOMES_PER_PERSONA`` rows, or the corpus has
+    fewer than ``MIN_RECORDS`` aligned outcomes overall). False means
+    the analyzer actually had per-persona data to bucket.
+
+    Captures three flat top-line fields a consumer can query without
+    parsing the nested ``personas`` list: ``top_persona`` /
+    ``top_score_ic`` (the best-IC persona — the leader on the decision
+    signal) and ``n_inverted`` (count of anti-predictive personas — the
+    actionable red flag). The full ``personas`` list still ships as a
+    nested field for forensics, mirroring the gate-arm ledger's
+    ``arms`` precedent.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        outcomes_path = Path(outcomes_path)
+        try:
+            from paper_trader.ml.persona_skill import (
+                persona_skill as _persona_skill,
+                _load_outcomes as _load_persona_outcomes,
+            )
+            recs = _load_persona_outcomes(outcomes_path)
+            rep = _persona_skill(recs)
+        except Exception as exc:
+            rep = {
+                "status": "error", "verdict": "INSUFFICIENT_DATA",
+                "hint": f"persona_skill unavailable: {type(exc).__name__}",
+                "n_records": 0, "n_personas": 0,
+                "personas": [], "inverted_personas": [],
+            }
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA",
+                   "n_records": 0, "n_personas": 0,
+                   "personas": [], "inverted_personas": []}
+
+        # ``signal_dark`` is True when no persona meets the stable-sample
+        # bar — same logic as sibling ``*_dark`` flags.
+        n_personas = int(rep.get("n_personas") or 0)
+        signal_dark = (n_personas == 0)
+
+        # Pull out the top persona (highest score_ic) as a flat top-line
+        # field so a JSON consumer doesn't need to parse the nested
+        # ``personas`` list to answer "who's leading on signal skill".
+        # ``personas`` is already sorted by ``score_ic`` desc with
+        # INSUFFICIENT entries sunk last (per ``persona_skill``).
+        top_persona: str | None = None
+        top_score_ic: float | None = None
+        personas_list = rep.get("personas") or []
+        for p in personas_list:
+            v = p.get("verdict") if isinstance(p, dict) else None
+            if v == "INSUFFICIENT":
+                continue
+            try:
+                top_persona = str(p.get("persona") or "") or None
+                top_score_ic = (None if p.get("score_ic") is None
+                                else round(float(p.get("score_ic")), 4))
+            except (TypeError, ValueError):
+                top_persona = None
+                top_score_ic = None
+            break
+
+        inverted_list = rep.get("inverted_personas") or []
+        n_inverted = (len(inverted_list)
+                      if isinstance(inverted_list, list) else 0)
+
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": rep.get("verdict"),
+            "n_records": rep.get("n_records"),
+            "n_personas": n_personas,
+            "top_persona": top_persona,
+            "top_score_ic": top_score_ic,
+            "n_inverted": n_inverted,
+            "inverted_personas": inverted_list
+                if isinstance(inverted_list, list) else [],
+            "personas": personas_list
+                if isinstance(personas_list, list) else [],
+            "signal_dark": signal_dark,
+        }
+        PERSONA_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with PERSONA_SKILL_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in
+                     PERSONA_SKILL_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > PERSONA_SKILL_LOG_KEEP * 2:
+                kept = lines[-PERSONA_SKILL_LOG_KEEP:]
+                tmp = PERSONA_SKILL_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(PERSONA_SKILL_LOG)
+        except Exception as e:
+            print(f"[continuous] persona-skill-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] persona-skill-log append failed: {e}")
+        return False
+
+
 def _parse_published_date(published) -> date | None:
     """Parse a `published` value (ISO or RFC822) into a date; None if unparseable."""
     if not published:
@@ -3517,6 +3684,19 @@ def main() -> None:
         # moment bucket tuning recovers real arm divergence. Best-effort
         # by construction; never breaks the loop.
         _append_gate_arm_skill_log(cycle, win_start, win_end)
+
+        # Durable per-cycle per-persona decision-signal skill ledger.
+        # ``persona_skill.persona_skill`` answers the decisive question
+        # ``persona_leaderboard`` *cannot*: within each persona's own
+        # decisions, does the persona's signal actually rank-predict
+        # realized outcomes, or is the per-persona return pure leveraged
+        # beta? Until this wiring landed it was CLI-only with no durable
+        # trend — and the single most operational state
+        # (``HAS_INVERTED_PERSONA`` — at least one persona whose signal
+        # is ANTI-predictive, the actionable red flag) was invisible to
+        # an unattended operator. Best-effort by construction; never
+        # breaks the loop.
+        _append_persona_skill_log(cycle, win_start, win_end)
 
         ml_status = _try_train_ml() if winner else "no winner"
         print(f"[continuous] ml: {ml_status}")
