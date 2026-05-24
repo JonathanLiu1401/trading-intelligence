@@ -107,6 +107,193 @@ verified green at session start. AGENTS.md updated above (this pass).
 
 ---
 
+## 2026-05-24 ML+backtest HYBRID pass #27 (Agent 2) — `scorer_learning_curve` analyzer
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Re-read `paper_trader/ml/decision_scorer.py`, `paper_trader/backtest.py`,
+and `run_continuous_backtests.py` in full this session (advisor flag —
+"don't just read decision_scorer.py"). Re-validated the surfaces that
+prior advisor flags hit:
+
+* `_inject_and_train` lock retry: `for/else` + `range(4)` + `break` on
+  success — correct. Lock-retry sleeps fire on attempts 0,1,2; attempt 3
+  exits naturally to `else` clause, which returns the documented
+  "database locked after N attempts" error. No bug.
+* `_compute_decision_outcomes` ml_score regex `r"\bscore=([0-9.+-]+)"`:
+  pattern accepts garbage like `1.2+3` but `float()` would raise →
+  swallowed silently → ml_score stays at 0.0. `_ml_decide` emits clean
+  `:.2f` decimals so production never hits this. Defensive code is
+  correct.
+* `_oos_rank_metrics` predict-with-meta path: drops `failed=True` rows
+  before bucketing into aggregate/buy/sell/regime — verified the drop
+  is consistent across all four buckets. No silent fake-zero ties.
+* `_LstsqModel.predict` 1D-vs-2D acceptance: pinned by existing tests;
+  0d numpy scalar would crash but no production path passes one.
+
+No code change. 271 ml+backtest+scorer slice tests pass clean.
+
+### Phase 2 — Feature: `scorer_learning_curve` analyzer
+
+New `paper_trader/ml/scorer_learning_curve.py` — the quant-decisive
+follow-up to `baseline_compare`'s `MLP_NO_BETTER_THAN_TRIVIAL` verdict:
+*does the gap close as the corpus grows, or is the architecture (not data
+quantity) the bottleneck?* No prior analyzer answers this — every existing
+OOS diagnostic evaluates one fixed train size (whatever the deployed
+pickle was trained on).
+
+Sweeps DecisionScorer across `LADDER = (250, 500, 1000, 2500, 5000, ALL)`
+training sizes. Each rung trains `--seeds` (default 3) MLPs with different
+`MLP_CONFIG.random_state` values on the trailing-n slice of the in-sample
+portion (the same selection strategy as `MAX_OUTCOMES_FOR_TRAINING`),
+evaluates each against a sim_date-sorted holdout via
+`validation.split_outcomes_temporal` (single source of truth shared with
+every sibling analyzer), reports mean ± std rank-IC per rung.
+
+Shape-aware verdict ladder:
+
+| Verdict | Trigger |
+|---------|---------|
+| `MONOTONE_LEARNING` | strictly improving across rungs AND end > start by ≥ `LEARNING_DELTA=0.04` |
+| `U_SHAPED` | interior peak that drops at the largest n by ≥ `DELTA_TOL=0.02` (stale-data tail) |
+| `DEGRADING` | end < start by ≥ `LEARNING_DELTA` with no interior peak |
+| `SATURATED` | endpoints within `LEARNING_DELTA`; mid within `DELTA_TOL` of end |
+| `NO_SKILL` | every mean rank-IC below `MIN_SKILL_IC=0.05` |
+| `INSUFFICIENT_DATA` | corpus < `MIN_TOTAL=800` rows OR holdout < 30 rows |
+
+Refactor to enable safe training: added `train_scorer(records, path=None)`
+override to `decision_scorer.py`. Default behavior preserved (None ⇒
+deployed `SCORER_PATH`). The analyzer trains into a per-rung temp pickle
+so the deployed scorer.pkl is NEVER touched — verified by an explicit
+test that pre-checks a sentinel path on tmp_path and asserts it remains
+non-existent after a full sweep.
+
+```bash
+# Default (3 seeds, table output):
+python3 -m paper_trader.ml.scorer_learning_curve
+# Tighter variance (slower):
+python3 -m paper_trader.ml.scorer_learning_curve --seeds 5
+# Machine-readable:
+python3 -m paper_trader.ml.scorer_learning_curve --json
+# 24 new tests (~30s):
+python3 -m pytest tests/test_scorer_learning_curve.py -v
+```
+
+Tests pin (24 cases):
+- `NO_SKILL` on a pure-noise corpus (leakage=0.0)
+- Strong-signal corpus (leakage=0.7) yields max rank-IC > +0.10
+- `U_SHAPED` NOT misread as `DEGRADING` (verdict-logic unit test)
+- Deployed pickle ISOLATION (sentinel `SCORER_PATH` unwritten after sweep)
+- `SCORER_PATH` AND `MLP_CONFIG.random_state` restored on
+  `train_scorer` exception (per-rung crash never leaks state)
+- Chronological holdout (reverse-appended corpus still produces
+  sim_date-sorted OOS slice)
+- `train_n_actual ≤ train_n_requested` (dedup hasn't been bypassed)
+- CLI exit code = 1 only on `INSUFFICIENT_DATA`; useful verdicts
+  (including `NO_SKILL` and `DEGRADING`) exit 0
+
+**Live finding (8753-row corpus, n_holdout=1312, seeds=1):**
+
+```
+verdict = NO_SKILL  n_total=8753  n_holdout=1312  seeds=1
+     train_n    actual     mean_IC    std_IC   mean_DA   n_pairs     seeds
+         250       221     +0.0201    0.0000    0.5202      1312         1
+         500       459     -0.0149    0.0000    0.5065      1312         1
+        1000       951     +0.0067    0.0000    0.4996      1312         1
+        2500      2278     -0.0109    0.0000    0.5149      1312         1
+        5000      4732     -0.0178    0.0000    0.5141      1312         1
+        7441      6893     +0.0052    0.0000    0.5286      1312         1
+```
+
+Every rung sits in [-0.018, +0.020]. **Collecting more outcomes will not
+close the gap.** The architecture / feature set is the ceiling.
+
+### Phase 3 — Live validation: user_findings = 5
+
+1. **OOS contamination is ~80%, not 43% as pass #26 estimated.**
+   `split_outcomes_temporal(oos_fraction=0.2)` (used by every CLI OOS
+   analyzer) picks the most recent 1750 sim_date-sorted rows. The
+   deployed pickle was trained on the trailing 5000 APPEND-order rows.
+   Direct overlap count: **1340 / 1689 (79.3%) of CLI-OOS rows are
+   IN-SAMPLE for the deployed pickle.** Concrete:
+   - `baseline_compare --oos`: reports `MLP_ADDS_SKILL` (rank_ic=+0.359,
+     beats best baseline by +0.284) — 80% contaminated.
+   - `calibration --oos`: reports `WELL_CALIBRATED` (spearman=0.359) —
+     80% contaminated.
+   - `gate_audit`: reports `GATE_EFFECTIVE` (strong_tailwind +5.86%
+     vs strong_headwind -16.97%, spread +22.83pp) — 80% contaminated.
+   - `feature_ablation` (pass #26): reports `LOAD_BEARING_DETECTED`
+     (baseline IC=+0.359) — 80% contaminated.
+   - `scorer_learning_curve` (this pass): reports `NO_SKILL`
+     (max rank-IC=+0.020 across every n) — uses its OWN strict
+     holdout, ZERO contamination, this is the honest reading.
+
+   **The published `oos_ic` of +0.36 is 18× the strict-OOS reading.**
+   Every operator dashboard / Discord briefing that surfaces those
+   metrics is overstating the scorer's generalization by an order of
+   magnitude. The conviction gate (invariant #5) is sizing real capital
+   on a signal that has near-zero strict OOS rank skill.
+
+2. **Continuous loop is STILL DARK** (third pass in a row to report
+   this; same as #25, #26). Last completed cycle: 2026-05-22 06:24:32.
+   `data/decision_outcomes.jsonl` mtime: 2026-05-21 23:24:24. No
+   `calibrated_reliability_log.jsonl` / `conviction_calibration_log.jsonl`
+   files exist on disk despite wired appenders.
+   `ps aux | grep run_continuous_backtests` — no process running.
+
+3. **Recent-200-row Spearman = +0.5791** between deployed-pickle
+   prediction and SELL-flipped forward return. Looks GREAT, is FAKE —
+   those rows are last-appended (~99% in-sample for the pickle by
+   construction). This is the smoking gun a quant would catch: a
+   memorization signature presenting as held-out skill.
+
+4. **Stale skill ledger fed by stale loop.** `scorer_skill_log.jsonl`
+   has exactly ONE row (cycle 1, 2026-05-22) showing `oos_ic=0.02`,
+   `MLP_NO_BETTER_THAN_TRIVIAL`-equivalent. THIS is the honest reading
+   from `_train_decision_scorer`'s rigorous temporal-OOS split (the
+   trainer's internal split is on the trailing 5000 rows; OOS is the
+   trailing 1000 of those — held out before training). +0.02 matches
+   `scorer_learning_curve`'s NO_SKILL verdict by construction (same
+   honest split idea, applied per-rung). The skill log is correct; the
+   CLI analyzers are inflated.
+
+5. **Restart cost of the deployed pickle is now negligible.** Pass #26
+   verified the deployed pickle is `DEPLOYED_MATCHES_SOURCE` and
+   `HEALTHY`. The strict-OOS finding above flips the operational
+   interpretation: it's "healthy" only in the sense that it predicts
+   in-sample training data well. On data it has never seen, it's at
+   noise. A fresh retrain on the current 8753-row corpus (single
+   seed, deploy_audit compliant) would produce the same NO_SKILL
+   strict OOS — but the dashboard / scorer ledger would update so the
+   `MLP_ADDS_SKILL` headlines stop being self-flattering.
+
+### Phase 4 — Final verify
+
+```bash
+# New deliverable (24 tests, ~30s):
+python3 -m pytest tests/test_scorer_learning_curve.py -v
+# Full scorer/backtest slice (434 tests, ~3.5min):
+python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+    tests/test_continuous.py tests/test_scorer_learning_curve.py \
+    tests/test_scorer_calibrated.py tests/test_scorer_freshness.py \
+    tests/test_scorer_health.py tests/test_scorer_honesty.py \
+    tests/test_decision_scorer_attribution.py tests/test_baseline_compare.py \
+    tests/test_feature_ablation.py -q
+# New CLI smoke (no-network, ~30s on real corpus):
+python3 -m paper_trader.ml.scorer_learning_curve --seeds 1
+```
+
+### Counters
+
+bugs_fixed=0 · features_added=1 (`scorer_learning_curve` analyzer +
+`train_scorer(path=...)` refactor, 24 tests) · user_findings=5 (~80%
+OOS contamination inflates every CLI analyzer by ~18×, loop dark
+since 2026-05-22, recent-200-row contaminated Spearman +0.58, skill
+ledger's honest oos_ic=0.02 matches new analyzer's NO_SKILL verdict,
+deployed pickle is "healthy in-sample" but at noise strict-OOS)
+
+---
+
 ## 2026-05-24 paper-trader core HYBRID pass (Agent 1) — `exit_only_streak` detector
 
 ### Phase 1 — Debug: bugs_fixed = 0
