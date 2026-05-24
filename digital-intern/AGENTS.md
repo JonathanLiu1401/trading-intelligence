@@ -5,6 +5,101 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-24 hybrid pass #24 (Agent 3) — kw_ai_divergence scale + urgency_drought tz parse + endpoints
+
+Debugger + feature-dev + news-analyst pass. Three commits on master
+(`bcf9e7d`, dashboard-code bundled into `1e40076` by the auto-commit
+daemon, `126bcea`).
+
+**Phase 1 (debug) — `bcf9e7d`.** Two latent bugs in recently-added dark
+analyzers:
+
+1. `analytics/kw_ai_divergence.py` — `AI_LOW=0.15` / `AI_HIGH=0.50` were
+   on a 0..1 scale that never landed. `ai_score` is 0..10 per CLAUDE.md
+   and `triage/heuristic_scorer.py`'s docstring (`Range: 0.0 – 10.0`).
+   `AI_HIGH=0.5` matched Sonnet's "engaged at all" floor (`ai_score=1.0`)
+   as a hidden gem, so the hidden_gems list became "anything Sonnet rated
+   `>=1`" — pure noise the analyst could not action. Re-scaled to
+   `AI_LOW=1.5` / `AI_HIGH=6.0` so the analyzer means what its docstring
+   claims (Sonnet's `RELEVANT` band starts at 5). Also switched the
+   hardcoded local DB_PATH to `storage._get_db_path()` for parity with
+   the sibling `urgency_drought` analyzer (USB-aware, fallback-aware) —
+   the symlink in `data/articles.db` masked the diff today, but on a
+   fresh checkout / CI sandbox the script would have silently scanned an
+   empty local file and emitted a meaningless snapshot.
+
+2. `analytics/urgency_drought.py::_parse_ts` — the "no tz offset present"
+   check looked only for `"+"` in the tail, so a NEGATIVE-tz string like
+   `"2026-05-23T18:00:00-05:00"` had `+00:00` blindly appended
+   (`...-05:00+00:00`) and silently raised `ValueError` — returning
+   `None`. In production `first_seen` is always written as
+   `datetime.now(timezone.utc).isoformat()` (UTC + `+00:00`) so this
+   never fired live, but the function is a public parser — any non-UTC
+   row from a migration or external import would silently classify as
+   `status='unknown'`. Replaced the heuristic with a compiled regex
+   matching signed offsets in either `±HH:MM` or `±HHMM` form.
+
+Coverage: 22 new cases pin both classes
+(`tests/test_kw_ai_divergence.py` — threshold constants on 0..10 scale,
+regime classification incl. "Sonnet engaged at low relevance is NOT a
+hidden gem" regression pin, backtest isolation;
+`tests/test_urgency_drought.py` — positive/negative/no-colon offset, Z
+suffix, naive, space separator, end-to-end status not falling to
+unknown on a negative-tz `first_seen`).
+
+**Phase 2 (feature) — dashboard code bundled into `1e40076`;
+tests in `126bcea`.** Two new `/api/*` endpoints surface the now-fixed
+dark analyzers to the dashboard:
+
+- `/api/kw-ai-divergence` wraps `analytics.kw_ai_divergence.compute()` —
+  per-source false_positive / hidden_gem split. Until this endpoint the
+  snapshot only landed in `/home/zeph/logs/kw_ai_divergence.json`
+  (SSH-only). Same "expose dark analyzer" shape as the 2026-05-23
+  `/api/label-quality` + `/api/active-learning-queue` pass.
+
+- `/api/urgency-drought` wraps `analytics.urgency_drought.compute()` —
+  elapsed-since-last-urgent monitor. Until this endpoint the snapshot
+  was cron-written JSON, invisible to the dashboard.
+
+Both compute on demand (bounded reads, indexed lookups, ~100ms),
+absorb exceptions into 200 with an `error` key (mirrors
+`/api/ml-status` graceful-degrade), and stamp their own `as_of` so a
+UI caller can show "this view was computed at" alongside the analyzer's
+`generated_at`. Coverage: 6 cases in
+`tests/test_kw_ai_divergence_endpoint.py` (empty-DB → 200, real
+classification, error → 200, drought OK / ALERT regimes, 0..10 scale
+surfaced in the threshold strings the UI displays).
+
+**Phase 3 (live analyst validation).** Production DB inspection
+(2026-05-23 23:45 UTC):
+
+- Healthy: ingest 312 rows/h · briefings firing every ~5h with rich
+  NVDA-earnings-night analyst-grade content · alerts 2–6/hour with no
+  quiet zones · zero stuck `urgency=1` rows · most-recent urgent
+  carries both LLM-vetted (NVDA earnings, ai_score=9) and ML-only.
+
+- Standing dark-source / calibration findings (no quick safe fix
+  available in this pass — recorded for the operator):
+  - `Finnhub/Finnhub` collector DARK 5 days (last
+    `2026-05-18T16:22Z`). Per CLAUDE.md, Finnhub is a key per-ticker
+    source; likely API quota / auth lapse.
+  - `scraped/www.bloomberg.com` DARK ~27h (last
+    `2026-05-22T19:20Z`) — possible scraper selector breakage or
+    anti-bot escalation. Bloomberg is the highest-credibility scraped
+    source (cred 0.90).
+  - LLM-vetted fraction over urgent rows in last 24h is 26%
+    (18 `llm` / 51 `ml`) — 74% ML-only / unverified urgent pushes.
+    Below the LLM ground-truth threshold the analyst persona would
+    expect; the alert prompt's CALIBRATION block already hedges
+    per-row, but the aggregate fact deserves a standing eye.
+  - StockTwits drowning — 297 rows in 24h, #1 source by volume,
+    likely forum noise. Already gated for lone-source urgent
+    suppression (cred 0.30 < 0.45) but inflates the ML scoring queue.
+
+**Phase 4 (docs).** This entry.
+
+---
+
 ## 2026-05-24 feature-dev pass (Agent 4) — STANDING-INTENTS chat enrichment
 
 `dashboard/web_server.py::_standing_intents_chat_lines` pipes paper-trader's
