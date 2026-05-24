@@ -174,17 +174,35 @@ def build_decision_health(decisions: list[dict]) -> dict:
         }
 
     # ── recent decision tape ────────────────────────────────────────────
+    # The bucketing predicate is the same SSOT used for the verdict_reason
+    # below: a NO_DECISION row in the tape always carries the same cause
+    # label the verdict line attributes. Import once (small, leaf-graph
+    # safe) so each NO_DECISION row in the recent[] tape carries the
+    # actionable cause an operator triaging the dashboard's tape would
+    # otherwise have to cross-reference with /api/no-decision-reasons.
+    from .no_decision_reasons import _bucket_for as _nd_bucket_for_recent
     for r in decisions[:18]:
         cat, verb = _classify(r.get("action_taken"))
         ts = _parse_ts(r.get("timestamp"))
-        out["recent"].append({
+        row = {
             "timestamp": ts.isoformat(timespec="seconds") if ts else r.get("timestamp"),
             "category": cat,
             "action": r.get("action_taken"),
             "confidence": _confidence(r.get("reasoning")),
             "signal_count": r.get("signal_count"),
             "market_open": bool(r.get("market_open")),
-        })
+        }
+        # Enrich NO_DECISION rows with their bucket cause + a short label
+        # so a trader scrolling the recent tape can see "this 3-row run was
+        # all host_saturated" vs "this looks parser-flaky" at a glance.
+        # Additive — non-NO_DECISION rows keep the legacy shape (no new
+        # keys, byte-compatible with the existing dashboard JS in
+        # refreshDecisionHealth which ignores unknown fields).
+        if cat == "NO_DECISION":
+            bucket = _nd_bucket_for_recent(r.get("reasoning"))
+            row["cause"] = bucket
+            row["cause_label"] = _BUCKET_LABEL.get(bucket, bucket)
+        out["recent"].append(row)
 
     # ── verdict — judged on the freshest window with ≥10 samples ────────
     judged = w24 if w24["total"] >= 10 else (w7d if w7d["total"] >= 10 else wall)

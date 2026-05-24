@@ -256,6 +256,88 @@ class TestHoursInWindow:
         assert hours_in_window(None, now, "7d") is False
 
 
+class TestRecentTapeCauseEnrichment:
+    """Each NO_DECISION row in the recent[] tape carries its bucket cause.
+
+    Without this, a trader scrolling the dashboard's recent-decisions tape
+    sees a wall of "NO_DECISION" rows but cannot tell whether they're
+    clustered by host saturation, model timeout, or parser failure — the
+    triage signal that determines what to do next.
+    """
+
+    def test_no_decision_row_carries_cause_and_label(self):
+        rows = _fresh_rows(
+            n_nd=1, n_real=0,
+            nd_reason="skipped claude call — host saturated: 8 concurrent",
+        )
+        rep = build_decision_health(rows)
+        nd_recents = [r for r in rep["recent"] if r["category"] == "NO_DECISION"]
+        assert len(nd_recents) == 1
+        assert nd_recents[0]["cause"] == "host_saturated"
+        assert "host saturation" in nd_recents[0]["cause_label"].lower()
+
+    def test_quota_rows_bucket_to_quota_exhausted(self):
+        rows = _fresh_rows(
+            n_nd=1, n_real=0,
+            nd_reason="claude quota/usage limit exhausted (no decision)",
+        )
+        rep = build_decision_health(rows)
+        nd = [r for r in rep["recent"] if r["category"] == "NO_DECISION"]
+        assert nd[0]["cause"] == "quota_exhausted"
+        assert "quota" in nd[0]["cause_label"].lower()
+
+    def test_each_no_decision_bucket_distinct_in_tape(self):
+        """Mixed-cause tape: every row preserves its own cause attribution."""
+        now = datetime.now(timezone.utc)
+        rows = [
+            {"timestamp": (now - timedelta(minutes=1)).isoformat(),
+             "action_taken": "NO_DECISION",
+             "reasoning": "skipped claude call — host saturated"},
+            {"timestamp": (now - timedelta(minutes=2)).isoformat(),
+             "action_taken": "NO_DECISION",
+             "reasoning": "claude returned no response (timeout)"},
+            {"timestamp": (now - timedelta(minutes=3)).isoformat(),
+             "action_taken": "NO_DECISION",
+             "reasoning": "parse_failed: { malformed"},
+            {"timestamp": (now - timedelta(minutes=4)).isoformat(),
+             "action_taken": "NO_DECISION",
+             "reasoning": "claude quota/usage limit exhausted"},
+        ]
+        rep = build_decision_health(rows)
+        causes = [r.get("cause") for r in rep["recent"] if r["category"] == "NO_DECISION"]
+        assert causes == [
+            "host_saturated", "model_timeout", "parse_failed", "quota_exhausted",
+        ]
+
+    def test_hold_filled_rows_keep_legacy_shape_no_cause(self):
+        """A HOLD or FILLED row must NOT carry a cause field — the
+        enrichment is purely NO_DECISION-specific. Existing dashboard JS
+        that doesn't know about `cause` for non-NO_DECISION rows must
+        continue to work unchanged."""
+        rows = _fresh_rows(
+            n_nd=0, n_real=3,
+            nd_reason="ignored",
+        )
+        rep = build_decision_health(rows)
+        for r in rep["recent"]:
+            if r["category"] != "NO_DECISION":
+                assert "cause" not in r
+                assert "cause_label" not in r
+
+    def test_unknown_reasoning_buckets_to_other(self):
+        """A NO_DECISION with reasoning we don't know how to classify still
+        gets a cause — the 'other' bucket — so the column is never None."""
+        rows = [
+            {"timestamp": datetime.now(timezone.utc).isoformat(),
+             "action_taken": "NO_DECISION",
+             "reasoning": "something totally unprecedented happened"},
+        ]
+        rep = build_decision_health(rows)
+        nd = [r for r in rep["recent"] if r["category"] == "NO_DECISION"]
+        assert nd[0]["cause"] == "other"
+        assert nd[0]["cause_label"]  # non-empty label
+
+
 class TestBucketLabelsCoverAllBuckets:
     """The verdict_reason renders a label per canonical bucket — any new
     bucket added to no_decision_reasons but missing a label here would fall
