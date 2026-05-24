@@ -7,6 +7,11 @@ feedparser's `agent=` kwarg. Falls back gracefully on any error.
 In addition to the recent 8-K RSS feed, we also query the EDGAR full-text
 search API (efts.sec.gov) per portfolio ticker to catch S-1, 10-Q, DEF 14A,
 SC 13G etc. filings that the 8-K stream misses.
+
+Keyword fallback: 8-K filings that don't match portfolio tickers are still
+kept when they contain high-priority item types (acquisitions, bankruptcies,
+delisting notices, CEO changes, Reg FD disclosures, etc.) so the source
+produces articles even during quiet portfolio periods.
 """
 import hashlib
 import json
@@ -32,6 +37,29 @@ EDGAR_USER_AGENT = os.environ.get(
     "SEC_USER_AGENT",
     "Digital-Intern-Daemon contact@digital-intern.local",
 )
+
+# 8-K item keywords that are market-moving regardless of portfolio membership.
+# Matched case-insensitively against the filing summary.
+_HIGH_PRIORITY_ITEMS = [
+    "Item 1.01",   # Entry into Material Definitive Agreement
+    "Item 1.02",   # Termination of Material Definitive Agreement
+    "Item 1.03",   # Bankruptcy or Receivership
+    "Item 2.01",   # Completion of Acquisition or Disposition of Assets
+    "Item 2.06",   # Material Impairments
+    "Item 3.01",   # Notice of Delisting
+    "Item 4.01",   # Changes in Registrant's Certifying Accountant
+    "Item 5.01",   # Changes in Control of Registrant
+    "Item 5.02",   # Departure/Appointment of Directors/Officers
+    "Item 7.01",   # Regulation FD Disclosure
+]
+
+
+def _is_high_priority(summary: str) -> str | None:
+    """Return the first matching priority item tag, or None."""
+    for item in _HIGH_PRIORITY_ITEMS:
+        if item.lower() in summary.lower():
+            return item
+    return None
 
 
 def _load_relevant_tickers() -> set[str]:
@@ -93,10 +121,15 @@ def _mark_seen(conn, aid: str, link: str, title: str, source: str):
 
 
 def collect_sec_edgar() -> list:
-    """Scrape the EDGAR 8-K RSS feed, return only filings matching tracked tickers."""
+    """Scrape the EDGAR 8-K RSS feed.
+
+    Keeps filings that either:
+    (a) mention a tracked portfolio/watchlist ticker, OR
+    (b) contain a high-priority 8-K item type (acquisition, bankruptcy, CEO
+        change, delisting, Reg FD, etc.) — so the source produces articles
+        even when none of the filers are in the current portfolio.
+    """
     tickers = _load_relevant_tickers()
-    if not tickers:
-        return []
 
     parsed = feedparser.parse(EDGAR_URL, agent=EDGAR_USER_AGENT)
     if getattr(parsed, "bozo", 0) and not parsed.entries:
@@ -112,35 +145,47 @@ def collect_sec_edgar() -> list:
         if not title or not link:
             continue
 
+        # Try portfolio ticker match first.
         haystack = f"{title} {summary}".upper()
-        matched = None
+        matched_ticker = None
         for tkr in tickers:
             if len(tkr) <= 2:
-                # Use simple boundary check for very short tickers (e.g. "MU")
                 if f"({tkr})" in haystack or f" {tkr} " in haystack:
-                    matched = tkr
+                    matched_ticker = tkr
                     break
             else:
                 if tkr in haystack:
-                    matched = tkr
+                    matched_ticker = tkr
                     break
-        if not matched:
-            continue
+
+        # Fallback: keep any high-priority event type even without ticker match.
+        priority_item = None
+        if not matched_ticker:
+            priority_item = _is_high_priority(summary)
+            if not priority_item:
+                continue
 
         aid = _article_id(link, title)
         if _is_seen(conn, aid):
             continue
 
         published = entry.get("updated") or entry.get("published") or ""
+        if matched_ticker:
+            article_title = f"[8-K {matched_ticker}] {title}"
+            source_label = "SEC EDGAR"
+        else:
+            article_title = f"[8-K {priority_item}] {title}"
+            source_label = "SEC EDGAR/events"
+
         new_articles.append({
-            "title": f"[8-K {matched}] {title}",
+            "title": article_title,
             "link": link,
             "summary": summary,
             "published": published,
-            "source": "SEC EDGAR",
-            "_ticker": matched,
+            "source": source_label,
+            "_ticker": matched_ticker or "",
         })
-        _mark_seen(conn, aid, link, title, "SEC EDGAR")
+        _mark_seen(conn, aid, link, title, source_label)
 
     conn.commit()
     conn.close()
