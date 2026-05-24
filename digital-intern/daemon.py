@@ -80,6 +80,7 @@ from collectors.yahoo_trending_tickers import collect_yahoo_trending
 from collectors.fear_greed_collector import collect_fear_greed
 from collectors.crypto_fear_greed_collector import collect_crypto_fear_greed
 from collectors.binance_funding_collector import collect_crypto_funding
+from collectors.coingecko_collector import collect_coingecko
 from collectors.earnings_surprise_collector import collect_earnings_surprises
 from collectors.polymarket_collector import collect as collect_polymarket
 from collectors.manifold_collector import collect_manifold
@@ -191,6 +192,7 @@ YAHOO_TRENDING_INTERVAL = 300     # Yahoo Finance trending tickers (retail atten
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
 CRYPTO_FEAR_GREED_INTERVAL = 1800  # Crypto Fear & Greed (alternative.me) every 30min
 CRYPTO_FUNDING_INTERVAL   = 1800  # OKX perpetual funding rates every 30min
+COINGECKO_INTERVAL        = 1800  # CoinGecko crypto market snapshot every 30min
 EARNINGS_SURPRISE_INTERVAL = 900  # EPS beat/miss scanner every 15min
 POLYMARKET_INTERVAL     = 900     # Polymarket prediction markets every 15min
 MANIFOLD_INTERVAL       = 1800    # Manifold Markets prediction markets every 30min
@@ -320,6 +322,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "fear_greed": FEAR_GREED_INTERVAL,
     "crypto_fear_greed": CRYPTO_FEAR_GREED_INTERVAL,
     "crypto_funding":   CRYPTO_FUNDING_INTERVAL,
+    "coingecko":        COINGECKO_INTERVAL,
     "earnings_surprise": EARNINGS_SURPRISE_INTERVAL,
     "polymarket": POLYMARKET_INTERVAL,
     "rate_monitor": RATE_MONITOR_INTERVAL,
@@ -1327,6 +1330,28 @@ def crypto_fear_greed_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(CRYPTO_FEAR_GREED_INTERVAL)
+
+
+# ── Worker: CoinGecko Crypto Market Snapshot — every 30min ──────────────────
+def coingecko_worker(store: ArticleStore):
+    log.info("[coingecko_worker] started")
+    bo = Backoff("coingecko", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_coingecko()
+            _ingest(store, articles, "coingecko")
+            try:
+                source_health.record_result("coingecko", len(articles))
+            except Exception as he:
+                log.warning(f"[coingecko_worker] source_health error: {he}")
+            _worker_last_ok["coingecko"] = time.time()
+            log.debug(f"[coingecko] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[coingecko_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(COINGECKO_INTERVAL)
 
 
 # ── Worker: OKX Perpetual Funding Rates — every 30min ────────────────────────
@@ -4032,6 +4057,7 @@ def main():
         ("fear_greed",  fear_greed_worker),
         ("crypto_fear_greed", crypto_fear_greed_worker),
         ("crypto_funding",   crypto_funding_worker),
+        ("coingecko",        coingecko_worker),
         ("earnings_surprise", earnings_surprise_worker),
         ("polymarket",  polymarket_worker),
         ("manifold",    manifold_worker),
