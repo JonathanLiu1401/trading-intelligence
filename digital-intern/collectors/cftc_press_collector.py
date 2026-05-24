@@ -44,7 +44,8 @@ DB_PATH = BASE_DIR / "data" / "seen_articles.db"
 # briefing code that already groups on "fed_" / "ecb_" can trivially also
 # group on "cftc_".
 CFTC_FEEDS = {
-    "cftc_press": "https://www.cftc.gov/rss/PressReleases.xml",
+    "cftc_press": "https://www.cftc.gov/RSS/RSSGP/rssgp.xml",
+    "cftc_enforcement": "https://www.cftc.gov/RSS/RSSENF/rssenf.xml",
 }
 
 FETCH_TIMEOUT = 12  # seconds; bounds a slow/dead feed so it can't starve the worker

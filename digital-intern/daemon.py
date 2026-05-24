@@ -134,6 +134,8 @@ from collectors.bea_collector import collect_bea
 from collectors.federal_register_collector import collect_federal_register
 from collectors.treasury_auctions import collect_treasury_auctions
 from collectors.arxiv_qfin_collector import collect_arxiv_qfin
+from collectors.cftc_press_collector import collect_cftc_press
+from collectors.finviz_collector import collect_finviz
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -233,6 +235,8 @@ BLS_INTERVAL            = 3600    # BLS macro series (CPI, unemployment, payroll
 BEA_INTERVAL            = 3600    # BEA macro releases (GDP, trade, personal income) — once per hour
 TREASURY_AUCTIONS_INTERVAL = 1800  # UST auction announcements from TreasuryDirect — every 30min
 ARXIV_QFIN_INTERVAL    = 3600     # arXiv q-fin + econ new papers (weekday evenings) — hourly
+CFTC_PRESS_INTERVAL    = 1800     # CFTC press + enforcement releases — every 30min
+FINVIZ_INTERVAL        = 300      # Finviz per-ticker news table (round-robin batch) — every 5min
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
 SHORT_SELLER_INTERVAL   = 1800    # Short-seller research reports (rare, high-priority) — every 30min
 FINANCIAL_BLOGS_INTERVAL = 600    # InvestorPlace, Motley Fool, Nasdaq RSS — every 10min
@@ -2144,6 +2148,48 @@ def arxiv_qfin_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(ARXIV_QFIN_INTERVAL)
+
+
+def cftc_press_worker(store: ArticleStore):
+    log.info("[cftc_press_worker] started")
+    bo = Backoff("cftc_press", base=120.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_cftc_press()
+            _ingest(store, articles, "cftc_press")
+            try:
+                source_health.record_result("cftc_press", len(articles))
+            except Exception as he:
+                log.warning(f"[cftc_press_worker] source_health error: {he}")
+            _worker_last_ok["cftc_press"] = time.time()
+            log.debug(f"[cftc_press] cycle ok ({len(articles)} new items)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[cftc_press_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(CFTC_PRESS_INTERVAL)
+
+
+def finviz_worker(store: ArticleStore):
+    log.info("[finviz_worker] started")
+    bo = Backoff("finviz", base=60.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_finviz()
+            _ingest(store, articles, "finviz")
+            try:
+                source_health.record_result("finviz", len(articles))
+            except Exception as he:
+                log.warning(f"[finviz_worker] source_health error: {he}")
+            _worker_last_ok["finviz"] = time.time()
+            log.debug(f"[finviz] cycle ok ({len(articles)} new items)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[finviz_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(FINVIZ_INTERVAL)
 
 
 def federal_register_worker(store: ArticleStore):
@@ -4162,6 +4208,8 @@ def main():
         ("bea",         bea_worker),
         ("treasury_auctions", treasury_auctions_worker),
         ("arxiv_qfin",  arxiv_qfin_worker),
+        ("cftc_press",  cftc_press_worker),
+        ("finviz",      finviz_worker),
         ("federal_register", federal_register_worker),
         ("whitehouse",  whitehouse_worker),
         ("g10_cb",      g10_cb_worker),
