@@ -188,6 +188,115 @@ contamination ~43%, ablation deltas robust despite contamination)
 
 ---
 
+## 2026-05-24 feature pass (Agent 4) — `/api/intent-followthrough` + `/api/opportunity-cost`
+
+Two new dashboard surfaces shipped, both wiring previously-DARK fully-tested
+analytics modules to the operator. Each closed a real gap: the analytics
+module existed (full pure builder, hundreds of lines, full pytest coverage)
+but no `/api/*` endpoint surfaced it and no chat enrichment block fed it
+into the briefing prompt. The trader couldn't see either signal.
+
+### Feature 1: `/api/intent-followthrough` — does the bot execute its own STANDING intents?
+
+Wires `analytics/intent_followthrough_skill.py::build_intent_followthrough`
+(549 lines, 32 existing pure-builder tests) to a dashboard endpoint. The
+observational companion to `/api/decision-conditionals` (which extracts
+STANDING conditional intents from reasoning prose). Every other reasoning
+panel grades the *text* — `decision_vapor_skill` measures specificity,
+`thesis_drift` re-tests open positions, `exit_intent_audit` classifies
+CLOSED sells — but none grade the *bridge from text to action*. A bot that
+emits crisp "wait for X, then buy Y" statements every cycle but never
+executes Y has perfect decision-vapor specificity and zero followthrough.
+This endpoint catches the gap.
+
+Verdict ladder: `DISCIPLINED` (rate ≥ 66%) / `DRIFTING` (33-66%) /
+`ABANDONED` (rate < 33% AND ≥3 abandoned) / `NO_RESOLVED` (all pending) /
+`NO_DATA`. Abstention intents (`preserve-for`, `too-early-to`) scored on a
+separate sub-counter (preserve_deployed / preserve_dead / restraint_held /
+restraint_broken).
+
+Query params (clamped): `window_hours` (1-168, default 24), `eval_window_hours`
+(1-72, default 12), `stale_hours` (1-168, default 12), `max_intents` (1-50,
+default 30). Pure read; never raises into a 500 (error envelope mirrors the
+sibling `/api/decision-conditionals` shape).
+
+### Feature 2: `/api/opportunity-cost` — graded HOLD-CASH / NO_DECISION sit-outs
+
+Wires `analytics/opportunity_cost_skill.py::build_opportunity_cost_skill`
+(456 lines, full pure-builder tests) to a dashboard endpoint. `/api/idle-opportunity`
+lists high-score articles arriving during a CURRENT drought; `/api/decision-drought`
+reports cumulative drift cost. Neither answers the operator's hindsight-aware
+follow-up: *when the bot sat in cash, did the watchlist actually run, or
+did sitting in cash earn its keep?*
+
+Per-decision: resolve the top-news watchlist ticker by heat in the same
+2h look-back window the live `decide()` uses, fetch its 1d/3d forward
+return from the decision moment, classify the row. Aggregate verdict:
+`MISSED_ALPHA` (≥50% sit-outs preceded a runner + mean 3d ≥ +2%) /
+`DEFENSIVE_WIN` (≥50% dodged a drawdown + mean 3d ≤ -2%) / `NEUTRAL` /
+`NO_DATA`.
+
+Forward returns share the `_daily_history_cached` yfinance cache with
+`news_edge` / `signal_followthrough` / `source_edge` — a 7d sit-out window
+with the same top ticker repeatedly costs one fetch per TTL. Articles
+read is bounded (`first_seen >= cutoff`, live-only clause, LIMIT 50000).
+`@swr_cached("opportunity-cost", 300.0)` since the yfinance hits make a
+cold call costly; subsequent hits are sub-ms.
+
+Query params (clamped): `window_hours` (24-720, default 168), `min_decisions`
+(3-50, default 5), `lookback_hours` (0.5-6, default 2). Pure read against
+live articles.db (live-only clause) + yfinance daily bars.
+
+### Files touched
+
+* `paper_trader/dashboard.py` — `/api/intent-followthrough` (after
+  `/api/decision-conditionals`) and `/api/opportunity-cost` (after
+  `/api/idle-opportunity`).
+* `tests/test_intent_followthrough_endpoint.py` — NEW (7 cases).
+* `tests/test_opportunity_cost_endpoint.py` — NEW (6 cases).
+* `AGENTS.md` — this entry.
+
+On the digital-intern side: two chat enrichment helpers
+(`_intent_followthrough_chat_lines`, `_opportunity_cost_chat_lines`) plus
+their cross-fetch wiring in the `/api/chat` system-prompt builder, plus
+two pinned `tests/test_chat_*_enrichment.py` files (40 cases). Documented
+in `digital-intern/AGENTS.md` under the matching 2026-05-24 entry.
+
+### Test commands
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_intent_followthrough_endpoint.py \
+                  tests/test_opportunity_cost_endpoint.py -v
+# → 13 passed
+
+# Scoped neighbour regression check:
+python3 -m pytest \
+    tests/test_intent_followthrough_skill.py \
+    tests/test_intent_followthrough_endpoint.py \
+    tests/test_opportunity_cost_skill.py \
+    tests/test_opportunity_cost_endpoint.py \
+    tests/test_decision_conditionals.py \
+    tests/test_idle_opportunity.py -q
+# → 166 passed, 0 regressions
+```
+
+Live verification via Flask `test_client` (bypasses the SWR cache and the
+documented "live :8090 runs many commits behind" stale-restart hazard):
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -c "from paper_trader import dashboard; \
+  c = dashboard.app.test_client(); \
+  print(c.get('/api/intent-followthrough').get_json()); \
+  print(c.get('/api/opportunity-cost').get_json())"
+```
+
+The endpoints serving on the running :8090 will 404 until the git-watcher
+restart cycle deploys the new commit (the documented stale-runner pattern).
+
+---
+
 ## 2026-05-24 feature pass (Agent 4) — `/api/cash-drag` + `/api/market-closure-window`
 
 Two new dashboard surfaces shipped, each closing a structural gap the
@@ -23127,3 +23236,177 @@ load-bearing: the bot has explored 6% of its 48-name watchlist over
 6 days and 0% of its post-drought trades are on net-new names — both
 invisible in the existing surface.
 
+
+## 2026-05-23 — Agent 2 (ML+backtests) HYBRID review pass
+
+### Phase 1: Debug — 0 bugs fixed
+
+Read `paper_trader/ml/decision_scorer.py`, `paper_trader/backtest.py`,
+`run_continuous_backtests.py` in full plus the recent commit log on
+those files. Every function carries a documented prior fix and
+regression test; the ML+backtest test slice (714 tests via `-k "ml or
+backtest or scorer"`) was green at start. No genuine defect found —
+the Phase-1 commit guard explicitly permits `bugs_fixed=0` and "make
+no commit" when honest effort finds nothing (the same path 4 prior
+Agent-2 passes took). No Phase-1 commit.
+
+### Phase 2: Feature — `paper_trader/ml/mfe_conversion.py`
+
+Sibling of `stop_out_audit.py` on the matching upside arm. Until this
+pass the captured `forward_intraperiod_max_5d` field (shipped 2026-05-23
+with the intraperiod-extremes feature) had **zero consumers** —
+`stop_out_audit.py` reads only the `min` side. `mfe_conversion`
+turns the unused field into a verdict on the deployed `backtest._buy`
+`take_profit = price * 1.15` band's realized economic effect.
+
+For each BUY outcome with finite `forward_intraperiod_max_5d` AND
+`forward_return_5d`:
+
+- If `intra_max >= TP_PCT` (band triggered), realized return *with TP*
+  is the band itself (conservative-fill, mirrors `stop_out_audit`'s
+  pessimistic stop-fill assumption on the symmetric arm).
+- Else: realized return *with TP* equals `forward_return_5d`.
+
+`tp_benefit_pct = mean(with_tp) - mean(without)` — positive when the TP
+captures peak that the 5d endpoint forfeits. Verdict ladder:
+`INSUFFICIENT_DATA` / `TP_HELPS` / `TP_HURTS` / `TP_NEUTRAL`.
+
+Also surfaces the classic quant **MFE conversion ratio**
+(`endpoint / mfe` across positive-MFE BUYs, floored at -10.0 / capped at
+1.0 — a thin +0.1% peak with a -9% endpoint would naively give -90 and
+dominate the mean) and a `n_reverted` counter for "peak then crater"
+trades (positive MFE → non-positive endpoint — the central pattern
+a TP captures). HIGH conversion + neutral TP verdict ⇒ "the gate is
+already capturing the peak naturally"; LOW conversion + TP_HELPS ⇒
+"positions peak then revert and the band rescues realized return".
+
+CLI shape (`--json`, `--tp`, `--margin`, `--min-buys`, `$?` gating on
+decisive verdicts) mirrors `stop_out_audit` so operators get one muscle
+memory.
+
+Run:
+
+```
+python3 -m paper_trader.ml.mfe_conversion           # human-readable
+python3 -m paper_trader.ml.mfe_conversion --json    # structured
+python3 -m paper_trader.ml.mfe_conversion --tp 10.0 # sweep band
+```
+
+Tests: `tests/test_mfe_conversion.py` (23 tests). Synthetic corpus
+fixtures with KNOWN expected verdicts:
+- "peak-at-+20-then-revert-to-+1" → exact `tp_benefit_pct = +14.0pp`
+  → `TP_HELPS`
+- "peak-at-+30-end-at-+30" → exact `tp_benefit_pct = -15.0pp` →
+  `TP_HURTS` (band exits trades that would have continued)
+- "peak-at-+5-no-trigger" → exact `tp_benefit_pct = 0.0` → `TP_NEUTRAL`
+- Ratio clamping at -10 / +1.0 with exact arithmetic expectations
+- Reverted counter scoped to positive-MFE rows with non-positive endpoint
+- CLI exit codes (0 on decisive, 1 on INSUFFICIENT_DATA or NEUTRAL)
+
+Commit `b7ad20c`.
+
+### Phase 3: Quant-researcher findings on the live system
+
+5 substantive findings. Several represent a NEW state vs the long-
+standing documented `MLP_WORSE_THAN_TRIVIAL` / `DIRECTIONAL_BUT_BIASED`
+plateau — the deployed pickle has materially improved.
+
+1. **Deployed scorer has SHIFTED to skillful — departure from prior
+   plateau.** Current pickle (n_train=4987, written 2026-05-23 07:20)
+   posts OOS rank-IC 0.359 and `calibration --oos` verdict
+   **WELL_CALIBRATED** (mean_abs_decile_err 2.12pp, monotone 0.89).
+   `baseline_compare` verdict **MLP_ADDS_SKILL** — MLP rank_ic 0.359 vs
+   best baseline `neg_bb` 0.075, gap +0.28. This is a real improvement
+   from the historical `MLP_WORSE_THAN_TRIVIAL` finding documented
+   across 30+ prior review passes. Likely driven by the
+   anti-overfit MLP retune + label-clamp + recent feature additions
+   compounding.
+2. **BUT the conviction gate's REALIZED effect remains `GATE_INEFFECTIVE`.**
+   `gate_realized` reports tail−head = -0.13pp across 328 captured
+   acted-on rows. Strong_tailwind arm realized +3.99% vs strong_headwind
+   arm +4.12% — the gate's sizing is pure reallocation noise. CRITICAL
+   nuance: the captured `gate_scorer_pred` is the *historical* prediction
+   from the cycle's then-deployed pickle, so this verdict describes the
+   OLDER, weaker pickles' gating, NOT a forecast of how the CURRENT
+   skillful scorer would gate. A skeptical quant needs at least one
+   full continuous-loop run with the new pickle to know if its
+   realized gate effect tracks its rank skill — until then, the
+   composite `scorer_health` verdict NOISE_GATE_ACTIVE is a true
+   *historical* statement but stale as a current-state read.
+3. **Conviction sizing still `MISCALIBRATED`.** `conviction_calibration`
+   spearman +0.011 across 1173 rows; top decile -0.15pp realized vs
+   bottom. The gate's sizing rule (`min(0.25, ml_score/20)` regular,
+   `min(0.40, ml_score/15)` leveraged-bull) is not predicting realized
+   return. Same caveat as #2: the captured `conviction_pct` reflects
+   the historical scorer, so this may improve once the new pickle
+   gates a few hundred cycles. The mean_realized in the top
+   conviction bucket (0.35%) is lower than buckets 3 and 4 (0.98%
+   and 1.57%), suggesting over-sizing on noise rather than signal.
+4. **LLM annotation pipeline DARK in production.**
+   `llm_annotation_skill`: 0/8753 rows carry `llm_quality_label`. The
+   `_llm_annotate_outcomes` empty-`except Exception` is swallowing every
+   call — likely a missing ANTHROPIC_API_KEY or the regex never
+   matching. The 3× / 0.1× `llm_mult` training weight is constant 1.0
+   in `train_scorer`; the LLM annotation subsystem is pure overhead
+   with no trainer effect. This is the documented production state
+   `llm_annotation_dark_pipeline_diagnostic` was added to surface
+   — observe in `llm_annotation_skill_log` once the loop runs again.
+5. **Continuous loop OFF since 2026-05-18 — 5 of 7 trend ledgers
+   stale or missing.** `continuous.log` mtime 2026-05-18 12:03;
+   `scorer_skill_log.jsonl` carries only 1 row (cycle 1, dated
+   2026-05-22 — likely from a smoke-test invocation, not the steady
+   loop); `data/conviction_calibration_log.jsonl` and
+   `data/calibrated_reliability_log.jsonl` **do not exist on disk** —
+   their wiring landed in `run_continuous_backtests.py` but no live
+   cycle has reached the append. `data/decision_outcomes.jsonl` mtime
+   2026-05-21 — 0 of the 8753 rows carry the new `forward_intraperiod_max_5d`
+   / `_min_5d` fields, so BOTH `mfe_conversion` (this pass's analyzer)
+   AND `stop_out_audit` (its sibling) honestly report `INSUFFICIENT_DATA`
+   on the live corpus. Restart unblocks every ledger.
+
+None of these are bugs in the code — they're operational state. But a
+quant relying on this stack needs to know the deployed scorer has
+**actually shifted to net-skill** while the gate's realized verdict
+(GATE_INEFFECTIVE) is now stale relative to the underlying model.
+
+### Test commands for the ML / backtest domain
+
+```
+# Focused (fast — ~10s):
+python3 -m pytest tests/test_decision_scorer.py tests/test_decision_scorer_attribution.py tests/test_scorer_health.py tests/test_scorer_honesty.py tests/test_scorer_smoke_test.py tests/test_calibration.py tests/test_gate_realized.py tests/test_mfe_conversion.py tests/test_stop_out_audit.py -q
+
+# Broader ML+backtest slice (~3min):
+python3 -m pytest tests/ -v -k "ml or backtest or scorer" 2>&1 | tail -30
+
+# Live diagnostic verification:
+python3 -m paper_trader.ml.scorer_health           # composite verdict
+python3 -m paper_trader.ml.gate_realized           # OOS arm spread
+python3 -m paper_trader.ml.calibration --oos       # OOS calibration
+python3 -m paper_trader.ml.baseline_compare        # MLP vs trivial baselines
+python3 -m paper_trader.ml.deploy_audit            # is deployed config stale?
+python3 -m paper_trader.ml.stop_out_audit          # downside band realized effect
+python3 -m paper_trader.ml.mfe_conversion          # NEW — upside band realized effect
+python3 -m paper_trader.ml.conviction_calibration  # sizing rule realized effect
+python3 -m paper_trader.ml.llm_annotation_skill    # LLM pipeline dark/live?
+```
+
+### Reaffirmed invariants
+
+- **Read-only diagnostic discipline.** Every `paper_trader.ml.*` analyzer
+  is read-only by construction: never trains, never writes the pickle
+  or `decision_outcomes.jsonl`, never enters `_execute()`. `mfe_conversion`
+  inherits this contract verbatim from `stop_out_audit`.
+- **Sibling-arm parity for `_buy` band audits.** `stop_out_audit`
+  (the `-8%` `stop_loss` band) and `mfe_conversion` (the `+15%`
+  `take_profit` band) now form the matched pair. Their on-disk
+  envelope shapes mirror each other (`n_buys`, `n_with_intraperiod`,
+  `n_*_triggered`, `mean_realized_*`, `*_benefit_pct`, `mean_*`,
+  `median_*`, `verdict`) so a future ledger can table both
+  side-by-side without per-key remapping.
+- **Concurrent same-role staging discipline holds.** This pass's
+  commit (`b7ad20c`) used explicit pathspec staging
+  (`git add paper_trader/ml/mfe_conversion.py tests/test_mfe_conversion.py`
+  → `git diff --staged --stat` → `git commit <files> -m`), avoiding the
+  documented whole-file `git add` race with sibling Agent 1 (paper_trader
+  core) and Agent 4 (feature-dev), both visible in `git status` at
+  commit time with their own modified/untracked work in flight.
