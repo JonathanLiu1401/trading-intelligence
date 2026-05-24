@@ -240,6 +240,86 @@ def alarm_latch_state() -> dict:
     }
 
 
+def _fmt_outage_seconds(secs) -> str:
+    """Compact outage-duration label: ``42m`` / ``1h32m`` / ``2d4h``.
+
+    Mirrors ``reporter._format_elapsed``'s contract but stays in runner.py
+    so the runner-side ``alarm_latch_headline`` never imports the (huge,
+    frequently-edited) reporter module. ``None`` / negative / non-numeric
+    → ``""`` so callers suppress the duration token entirely (degrade-safe).
+    Sub-minute clamps to ``0m`` so a 30s wedge reads cleanly, not as ``""``.
+    Never raises."""
+    try:
+        s = float(secs) if secs is not None else None
+    except (TypeError, ValueError):
+        return ""
+    if s is None or s < 0:
+        return ""
+    s_i = int(s)
+    if s_i < 3600:
+        return f"{s_i // 60}m"
+    if s_i < 86400:
+        h, m = divmod(s_i, 3600)
+        return f"{h}h{m // 60}m"
+    d, rem = divmod(s_i, 86400)
+    return f"{d}d{rem // 3600}h"
+
+
+def alarm_latch_headline(state: dict | None = None) -> str:
+    """One-line operator headline derived from ``alarm_latch_state()``.
+
+    The companion to ``alarm_latch_state``: that function exposes
+    individual booleans + outage counters; this one formats them into
+    the single human sentence an operator banner (or a Discord status
+    embed) can render verbatim. The dashboard already builds an
+    ad-hoc inline headline in ``/api/alarm-latches``, but that one
+    omits the wall-clock outage durations — a trader pulled away from
+    Discord during a multi-hour wedge cares first about *how long*
+    each latch has been held.
+
+    Contract:
+      * No latch held → ``""`` (silence-when-nothing-actionable; the
+        caller renders no headline rather than a misleading "OK" line).
+      * One or both latches held → ``"⚠️ CLAUDE BREAKER held (47m) ·
+        QUOTA latch held (3h12m) — operator alerted; waiting for the
+        next real decision to clear."`` Each held latch carries its
+        own outage-duration parenthetical when the duration field is
+        present and non-negative; a missing/garbage duration drops the
+        parenthetical but the latch-name token still ships.
+
+    Pure formatting over the state dict — no I/O, no store reads. When
+    ``state`` is omitted, defaults to a fresh ``alarm_latch_state()``
+    read. Degrade-safe: a non-dict ``state`` returns ``""`` rather than
+    raising. Never raises (mirrors the rest of runner's notification-
+    helper discipline)."""
+    try:
+        if state is None:
+            state = alarm_latch_state()
+        if not isinstance(state, dict):
+            return ""
+        breaker = bool(state.get("breaker_active"))
+        quota = bool(state.get("quota_active"))
+        if not (breaker or quota):
+            return ""
+        bits: list[str] = []
+        if breaker:
+            dur = _fmt_outage_seconds(state.get("breaker_outage_s"))
+            bits.append(
+                f"CLAUDE BREAKER held ({dur})" if dur else "CLAUDE BREAKER held"
+            )
+        if quota:
+            dur = _fmt_outage_seconds(state.get("quota_outage_s"))
+            bits.append(
+                f"QUOTA latch held ({dur})" if dur else "QUOTA latch held"
+            )
+        return (
+            "⚠️ " + " · ".join(bits)
+            + " — operator alerted; waiting for the next real decision to clear."
+        )
+    except Exception:
+        return ""
+
+
 def _acquire_singleton_lock(path=_LOCK_PATH) -> SingletonLock:
     """Try to take the exclusive runner lock.
 
