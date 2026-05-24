@@ -48,6 +48,7 @@ from paper_trader.backtest import (
 RUNS_PER_CYCLE = 1  # throttled to 1 — load avg 37+, reduce system pressure
 TOP_RUNS_TO_TRAIN = 1  # only keep best single run per cycle when throttled
 KEEP_LAST_RUNS = 500
+N_MONKEY_BT_PER_CYCLE = 20  # monkey runs added to backtest.db each cycle
 MAX_OUTCOMES_FOR_TRAINING = 5000  # cap decision_outcomes.jsonl tail used per retrain
 COOLDOWN_SECONDS = 600  # throttled from 300s — 10 min cooldown to give box breathing room
 DISCORD_CHANNEL = "channel:1496099475838603324"
@@ -3794,6 +3795,40 @@ def main() -> None:
                       f"({m_start} → {m_end}, {len(m_ai_returns)} matching AI runs)")
         except Exception as e:
             print(f"[monkey] background refresh failed (non-fatal): {e}")
+
+        # Persist a small batch of monkey simulations to backtest.db each
+        # cycle so the dashboard can show them next to the AI runs as a
+        # baseline. Uses `_monkey_default_window()` (the most data-rich cached
+        # window) rather than this cycle's random window — `_load_prices`
+        # requires a price-cache file that fully covers `[start, end]`, and
+        # `_pick_window` ranges 1993→present so most cycles wouldn't have
+        # one. Always non-fatal: a missing cache or DB hiccup must never stop
+        # the loop. The function trims to ≤500 monkey rows in FIFO order
+        # itself, so unbounded accumulation is impossible.
+        # Seed differs across processes (epoch-keyed XOR with cycle) so a
+        # loop restart that resets `cycle` to 0 still produces fresh runs.
+        try:
+            from paper_trader.analytics.monkey_benchmark import (
+                run_monkey_backtests_to_db, default_window as _mk_default_window,
+            )
+            from paper_trader.backtest import (
+                WATCHLIST as _MK_WATCHLIST,
+                BACKTEST_DB as _MK_BACKTEST_DB,
+            )
+            mk_start, mk_end = _mk_default_window()
+            mk_seed_offset = (cycle_seed + cycle) & 0xFFFFFFFF
+            n_inserted = run_monkey_backtests_to_db(
+                tickers=_MK_WATCHLIST,
+                start_date=mk_start,
+                end_date=mk_end,
+                backtest_db_path=str(_MK_BACKTEST_DB),
+                n_runs=N_MONKEY_BT_PER_CYCLE,
+                seed_offset=mk_seed_offset,
+            )
+            print(f"[monkey_bt] inserted {n_inserted} monkey runs "
+                  f"({mk_start}→{mk_end}) into backtest.db")
+        except Exception as e:
+            print(f"[monkey_bt] backtest insertion failed (non-fatal): {e}")
 
         elapsed = time.time() - t0
         if winner:

@@ -20,8 +20,10 @@ meaningless.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import re
+import sqlite3 as _sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
@@ -361,3 +363,134 @@ def load_cached() -> dict | None:
         return json.loads(_CACHE_OUT.read_text())
     except Exception:
         return None
+
+
+# ── persisted monkey runs (for dashboard side-by-side AI comparison) ───────
+
+def _trading_days(start: str, n: int) -> list[str]:
+    """Generate `n` weekday date strings starting from `start` (Mon–Fri only).
+
+    Not holiday-aware; this is for chart x-axis labels on monkey runs whose
+    equity-curve length is driven by the price-cache window, not the calendar.
+    """
+    dt = _dt.date.fromisoformat(start)
+    days: list[str] = []
+    while len(days) < n:
+        if dt.weekday() < 5:
+            days.append(dt.isoformat())
+        dt += _dt.timedelta(days=1)
+    return days
+
+
+def run_monkey_backtests_to_db(
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+    backtest_db_path: str,
+    n_runs: int = 20,
+    k_picks: int = 3,
+    seed_offset: int = 0,
+    max_monkey_runs: int = 500,
+) -> int:
+    """Run N equal-weight buy-and-hold monkey simulations and persist each as
+    a row in ``backtest_runs`` (``model_id='monkey_random'``) so the dashboard
+    can render them side-by-side with the AI backtests on the same window.
+
+    Old monkey rows are pruned in FIFO order so total monkey count stays at
+    or under ``max_monkey_runs`` after this call returns.
+
+    Returns the number of rows inserted (0 if the window has too few tickers).
+    """
+    prices = _load_prices(start_date, end_date, tickers)
+    if len(prices) < k_picks:
+        print(f"[monkey_bt] too few tickers ({len(prices)}) — skipping")
+        return 0
+    ticker_list = list(prices.keys())
+
+    conn = _sqlite3.connect(backtest_db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+
+    try:
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM backtest_runs "
+            "WHERE model_id IN ('monkey_random','monkey_active')"
+        ).fetchone()[0]
+        if existing + n_runs > max_monkey_runs:
+            to_delete = existing + n_runs - max_monkey_runs
+            oldest_ids = conn.execute(
+                "SELECT run_id FROM backtest_runs "
+                "WHERE model_id IN ('monkey_random','monkey_active') "
+                "ORDER BY run_id ASC LIMIT ?",
+                (to_delete,),
+            ).fetchall()
+            for (old_id,) in oldest_ids:
+                conn.execute("DELETE FROM backtest_runs WHERE run_id=?", (old_id,))
+                conn.execute("DELETE FROM backtest_trades WHERE run_id=?", (old_id,))
+                conn.execute("DELETE FROM backtest_decisions WHERE run_id=?", (old_id,))
+            conn.commit()
+
+        max_id_row = conn.execute("SELECT MAX(run_id) FROM backtest_runs").fetchone()
+        next_id = int((max_id_row[0] or 0)) + 1
+
+        # SPY benchmark for the window (used as the vs_spy comparison anchor)
+        spy_return_pct = 0.0
+        if "SPY" in prices and len(prices["SPY"]) > 1 and prices["SPY"][0] > 0:
+            spy = prices["SPY"]
+            spy_return_pct = round((spy[-1] / spy[0] - 1) * 100, 2)
+
+        inserted = 0
+        for i in range(n_runs):
+            run_id = next_id + i
+            seed = seed_offset + i
+            rng = np.random.default_rng(seed)
+            picks_idx = rng.choice(len(ticker_list), size=k_picks, replace=False)
+            picks = [ticker_list[j] for j in picks_idx]
+
+            n_days = min(len(prices[t]) for t in picks)
+            date_list = _trading_days(start_date, n_days)
+
+            equity_curve: list[dict] = []
+            for d in range(n_days):
+                portfolio_val = INITIAL_CASH * sum(
+                    prices[t][d] / prices[t][0] for t in picks
+                ) / k_picks
+                equity_curve.append({"date": date_list[d], "value": round(portfolio_val, 2)})
+
+            final_value = equity_curve[-1]["value"] if equity_curve else INITIAL_CASH
+            total_return_pct = round((final_value / INITIAL_CASH - 1) * 100, 2)
+            vs_spy_pct = round(total_return_pct - spy_return_pct, 2)
+
+            now = _dt.datetime.utcnow().isoformat() + "Z"
+            conn.execute(
+                "INSERT INTO backtest_runs "
+                "(run_id, seed, start_date, end_date, start_value, final_value, "
+                "total_return_pct, spy_return_pct, vs_spy_pct, n_trades, n_decisions, "
+                "status, started_at, completed_at, equity_curve_json, model_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, seed, start_date, end_date, INITIAL_CASH, final_value,
+                 total_return_pct, spy_return_pct, vs_spy_pct,
+                 k_picks,      # one BUY per pick; no SELL row recorded
+                 1,            # one allocation decision
+                 "complete", now, now, json.dumps(equity_curve), "monkey_random"),
+            )
+
+            invest_per = INITIAL_CASH / k_picks
+            for t in picks:
+                p0 = prices[t][0]
+                if p0 <= 0:
+                    continue
+                qty = invest_per / p0
+                conn.execute(
+                    "INSERT INTO backtest_trades "
+                    "(run_id, sim_date, ticker, action, qty, price, value, reason) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (run_id, start_date, t, "BUY", round(qty, 4), round(p0, 4),
+                     round(invest_per, 2), f"monkey_random k={k_picks}"),
+                )
+            inserted += 1
+
+        conn.commit()
+        return inserted
+    finally:
+        conn.close()
