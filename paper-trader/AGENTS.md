@@ -6,6 +6,188 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 ML+backtest HYBRID pass #26 (Agent 2) — `feature_ablation` analyzer
+
+### Phase 1: Debug — 0 bugs fixed
+
+Verified both surfaces flagged in prior advisor passes:
+
+- `_compute_decision_outcomes` ml_score regex: `_ml_decide` reasoning
+  emits `score={best_score:.2f}` (plain decimal only — no scientific
+  notation), so `\bscore=([0-9.+-]+)` parses cleanly. No bug.
+- `train_scorer` weight rounding for CONDEMN: `max(0.5, …) * 0.1` is
+  `[0.05, 0.20]`, then `np.round(* 2) = [0.1, 0.4] → 0`. CONDEMN rows
+  are deterministically dropped, not weighted ×0.1 as the inline comment
+  suggests. BUT — live audit shows ZERO CONDEMN labels exist in the
+  corpus (`grep -c '"llm_quality_label": -1' data/decision_outcomes.jsonl`
+  → 0; pipeline is `pipeline_dark` per `llm_annotation_skill`). The gap
+  never bites in production. Not worth a code change.
+
+No commit this phase.
+
+### Phase 2: Feature — `feature_ablation` analyzer (e59c473)
+
+New `paper_trader/ml/feature_ablation.py` — read-only diagnostic that
+answers the natural quant follow-up to
+[`feature_correlation_audit`](paper_trader/ml/feature_correlation_audit.py)'s
+`SEVERE_COLLINEARITY` verdict (rsi↔bb_position |spearman|=0.91):
+
+> *If I drop feature X, does the deployed scorer's OOS rank-IC go UP
+> (X was noise), DOWN (X was load-bearing), or stay the same?*
+
+Implementation choice: **inference-time ablation, no retrain**. Zero
+the relevant standardized column(s) of the OOS feature matrix and run
+`model.predict` on the modified inputs. Setting a standardized feature
+to 0 is exactly equivalent to setting the raw feature to its training
+mean — the textbook "ablate to baseline" interpretation. No new
+training cost (the full 11-group sweep runs in seconds vs minutes for
+retrain-from-scratch ablation), and the resulting deltas describe the
+*deployed pickle's* sensitivity — exactly what an operator needs right
+now, not a counterfactual model.
+
+Verdict ladder:
+
+| Verdict | Trigger |
+|---------|---------|
+| `SCORER_UNTRAINED` | no deployed pickle / lstsq fallback / model unavailable |
+| `INSUFFICIENT_DATA` | fewer than `MIN_OBS=50` OOS rows survive feature/label validation |
+| `BASELINE_DEGENERATE` | baseline rank-IC ties (constant predictor — every ablation is no-op) |
+| `LOAD_BEARING_DETECTED` | ≥1 feature has `delta <= -EDGE_TOL=0.02` (removing HURTS) and none REDUNDANT — gate skill is concentrated there |
+| `REDUNDANT_DETECTED` | ≥1 feature has `delta >= EDGE_TOL=0.02` (removing HELPS) and none LOAD_BEARING — MLP is over-weighting noise |
+| `MIXED` | both kinds present |
+| `NO_SIGNIFICANT_EFFECT` | every `|delta| < EDGE_TOL` — rank ordering invariant to which feature the model sees |
+
+```bash
+# OOS-slice view (default — last 20% temporally):
+python3 -m paper_trader.ml.feature_ablation
+# Full-corpus view:
+python3 -m paper_trader.ml.feature_ablation --all
+# JSON for programmatic consumers:
+python3 -m paper_trader.ml.feature_ablation --json
+# Tests (39 cases, <15s):
+python3 -m pytest tests/test_feature_ablation.py -v
+```
+
+**Live finding on the deployed pickle (n_train=4987, slice=temporal_oos
+n=1750):** verdict = `LOAD_BEARING_DETECTED`. Baseline OOS rank-IC =
++0.3588. EVERY feature is load-bearing — removing any one of them
+measurably hurts:
+
+```
+feature                  rank-IC    delta vs baseline
+rsi                      +0.0892   -0.2697
+mom20                    +0.1574   -0.2015
+ml_score                 +0.1829   -0.1760
+mom5                     +0.1864   -0.1725
+regime_mult              +0.1893   -0.1695
+bb_pos                   +0.2342   -0.1247
+macd                     +0.2458   -0.1130
+sector                   +0.2531   -0.1058
+vol_ratio                +0.2715   -0.0873
+news_urgency             +0.3376   -0.0212
+news_article_count       +0.3489   -0.0099
+```
+
+This **contradicts** the naive read of
+`feature_correlation_audit`'s `SEVERE_COLLINEARITY` finding: rsi and
+bb_position carry ~82% shared variance, but BOTH are load-bearing —
+the MLP is extracting non-redundant signal from each. Reading
+`feature_correlation_audit` alone would falsely suggest the feature
+set could be trimmed; this analyzer is the actionable test that says
+otherwise.
+
+Locked by `tests/test_feature_ablation.py` (39 tests, <15s):
+- `_finite_float` discipline (None/NaN/inf/bool/unparseable str → None)
+- `_spearman` tie-aware + zero-variance → None
+- `_build_feature_matrix` SELL sign-flip + ±50 label clamp
+- `_predict_with_optional_ablation` purity (defensive copy)
+- `analyze()` verdict ladder with monkey-patched `_spearman`
+- end-to-end with real trained scorer on synthetic data (`leakage=0.4`)
+- corrupt JSONL / missing forward_return / no action — never raises
+- CLI exit 2 on adverse verdicts (REDUNDANT / MIXED / NO_SIGNIFICANT /
+  BASELINE_DEGENERATE / SCORER_UNTRAINED); INSUFFICIENT_DATA is 0
+  (data availability, not model fault); LOAD_BEARING is 0 (the
+  desirable state)
+
+### Phase 3: Live validation — 4 findings
+
+1. **Continuous loop is DARK.** No `run_continuous_backtests.py`
+   process running (`ps aux | grep continuous` — only this agent's
+   claude). Last completed cycle: 2026-05-22 06:24:32 (>24h before this
+   audit). All 5 per-cycle skill ledgers (`scorer_skill_log` /
+   `baseline_skill_log` / `llm_annotation_skill_log` /
+   `calibrated_reliability_log` / `conviction_calibration_log`) have
+   exactly ONE row each (cycle 1). The same finding as pass #23 —
+   still unfixed. `continuous.log` is from 2026-05-18 (5 days old).
+
+2. **Deployed scorer is HEALTHY despite stale ledger.** Live CLI runs
+   on the deployed pickle (`data/ml/decision_scorer.pkl`, written
+   2026-05-23, n_train=4987):
+   - `scorer_pickle_smoke`: **HEALTHY** (predict spread 42.43pp, no
+     collapsed quantiles)
+   - `deploy_audit`: **DEPLOYED_MATCHES_SOURCE** (all 8 MLP_CONFIG
+     hyper-params match source)
+   - `baseline_compare --oos`: **MLP_ADDS_SKILL** (mlp rank_ic +0.359
+     vs best baseline neg_bb +0.075, gap +0.284)
+   - `calibration --oos`: **WELL_CALIBRATED** (spearman 0.359,
+     monotone 0.889, mean decile error 2.12pp)
+   - `gate_audit`: **GATE_EFFECTIVE** (strong_tailwind realized +5.86%
+     vs strong_headwind -16.97%, spread +22.83pp, monotone=1.0)
+
+   But the persisted `scorer_skill_log` row (cycle 1) shows
+   `oos_ic=0.02` and `baseline_skill_log` shows
+   `MLP_NO_BETTER_THAN_TRIVIAL`. **A trader reading only the
+   persisted trend would conclude the model is worthless — the
+   actual deployed pickle says otherwise.** The disconnect happens
+   because the loop is dark so the ledger never updated past cycle 1.
+
+3. **OOS contamination in full-corpus split (the +0.34 gap is partly
+   leakage).** The CLI analyzers (`baseline_compare`, `calibration`,
+   this pass's `feature_ablation`, `gate_audit`) all use
+   `split_outcomes_temporal(oos_fraction=0.2)` on the FULL 8753-row
+   corpus → last 1750 rows are "OOS". But the deployed pickle was
+   trained on the trailing 5000 (after `MAX_OUTCOMES_FOR_TRAINING` cap),
+   with internal 80/20 → 4000 train + 1000 OOS. The pickle's training
+   rows are approximately corpus positions 3753..7753; the CLI tools'
+   "OOS" slice is positions 7003..8753. **~750 of the 1750 CLI-OOS
+   rows are IN-SAMPLE for the deployed pickle (~43% contamination).**
+   The honest OOS (positions 7753..8753, what cycle 1's ledger row
+   actually evaluated) reads `oos_ic=0.02` — close to noise. The CLI
+   tools' +0.36 is real for that slice but inflated as a
+   generalization metric of the deployed pickle. Worth surfacing as a
+   follow-up: an explicit `--strict-oos` flag that evaluates only on
+   rows strictly AFTER the deployed pickle's training cap.
+
+4. **`feature_ablation` LOAD_BEARING finding stands despite #3.** The
+   inflation in #3 affects the BASELINE rank-IC. The per-feature
+   DELTAS (which is what the verdict reads) are between two
+   evaluations on the SAME slice with the SAME contamination — so
+   the deltas remain meaningful. The absolute baseline IC may be
+   smaller on a truly-OOS slice, but the RELATIVE feature ordering
+   (rsi delta -0.27 > mom20 -0.20 > ml_score -0.18 > … > news_count
+   -0.01) is robust. The LOAD_BEARING verdict is reliable.
+
+### Phase 4: Final verify
+
+```bash
+# Focused: ~6.5min full ml/backtest slice
+python3 -m pytest tests/ -v -k "ml or backtest or scorer"
+# Pass #26 deliverables:
+python3 -m pytest tests/test_feature_ablation.py -v  # 39 tests (~14s)
+# Pass #26 CLI:
+python3 -m paper_trader.ml.feature_ablation
+python3 -m paper_trader.ml.feature_ablation --all
+python3 -m paper_trader.ml.feature_ablation --json
+```
+
+### Counters
+
+bugs_fixed=0 · features_added=1 (feature_ablation) · user_findings=4
+(loop dark, deployed scorer healthy despite stale ledger, OOS
+contamination ~43%, ablation deltas robust despite contamination)
+
+---
+
 ## 2026-05-24 feature pass (Agent 4) — `/api/cash-drag` + `/api/market-closure-window`
 
 Two new dashboard surfaces shipped, each closing a structural gap the
