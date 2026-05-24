@@ -5,6 +5,166 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-24 feature-dev pass (Agent 4) — NO-DECISION-REASONS + ROUND-TRIP-POSTMORTEM + CASH-DRAG chat enrichments
+
+Three chat blocks shipped, each piping an existing paper-trader endpoint that
+was *not yet wired to the chat* into `/api/chat`. Triggered by the live
+operational state at pass start: live book in 100% cash for ~5 days,
+`/api/decision-health` showing **63% NO_DECISION over the trailing 24h**,
+`/api/no-decision-reasons` confirming `host_saturated` as 95% of those rows
+(live trader competing with `scripts/hourly_review.sh` and the backtest
+committee for the 3-process `_CLAUDE_SEM` semaphore), `/api/cash-drag`
+reporting `COSTLY_CASH` on the 168h window. The chat had been silent on all
+three of these failure modes — visible on the trader dashboard, invisible
+to the conversational surface.
+
+- `_no_decision_reasons_chat_lines` pipes `/api/no-decision-reasons`
+  (per-bucket histogram of recent NO_DECISION causes — host_saturated /
+  cli_nonzero_rc / parse_failed / claude_timeout / claude_empty / blocked
+  / unknown) into the chat enrichment.
+- `_round_trip_postmortem_chat_lines` pipes `/api/round-trip-postmortem`
+  (post-exit price-drift verdict per closed round-trip — CORRECT /
+  PREMATURE / MISSED_RUNNER / WHIPSAW / NEUTRAL) into the same.
+- `_cash_drag_chat_lines` pipes `/api/cash-drag` (SPY-benchmarked dollar
+  cost of sitting in cash per rolling window) into the same.
+
+### `_no_decision_reasons_chat_lines` — the *why am I silent?* attribution
+
+The chat already carries `_decision_paralysis_chat_lines` (the FACT we
+are not deciding) and `_alert_confidence_trend_chat_lines` /
+`_event_readiness_chat_lines` (availability signals). Neither answers the
+operator's first follow-up: *is it the runner's fault, or is the box
+saturated by review agents / backtests?* The trader endpoint buckets the
+cause and emits a verbatim `recommendation` — host saturation requires
+**reducing parallel Opus jobs, NOT a runner restart**; a `parse_failed`
+cluster is a prompt-shape bug, not a host issue; a `cli_nonzero_rc`
+cluster is the Claude CLI returning errors and a restart probably
+*does* help. The chat-side surface lets the analyst answer "why is the
+bot silent right now?" without parsing daemon logs.
+
+Block contract:
+- Fires ONLY on `DOMINANT` (one bucket exceeds the builder's own
+  `DOMINANT_THRESHOLD_PCT` of the NO_DECISION rows). `NO_DATA` /
+  `NORMAL` / `MIXED` collapse to silence — the
+  `_decision_paralysis_chat_lines` silence precedent, never chat
+  filler when the bot is deciding or when the cause is diffuse (MIXED
+  is the "no single cause owns this" state where the recommendation
+  would be hand-wavy).
+- SSOT (paper-trader invariant #10): the builder's own `headline`
+  passes verbatim AND already inlines the trader endpoint's
+  `recommendation` text — no chat-side re-derived verdict, no chat-
+  side re-derived recommendation, that could drift from `:8090`.
+- Detail line restates the top 3 buckets from the trader endpoint's
+  own `buckets` dict (`"<bucket>: N"` counts; ranked desc by count;
+  zero-count buckets and unparseable counts skipped); missing /
+  non-dict `buckets` degrades silently (the `_paper_trader_position_
+  lines` precedent).
+- Guarded 3s sub-fetch like every sibling; appears once `:8090` is
+  restarted onto `/api/no-decision-reasons`.
+
+### `_round_trip_postmortem_chat_lines` — the falsifiable exit-timing read
+
+Every existing realized-P&L chat surface — `_streak_chat_lines`,
+`_realized_vs_unrealized_chat_lines`, the trader's own
+`winner-autopsy` / `loser-autopsy` / `scorecard` — reduces a closed
+round-trip to a P&L number. None ask the falsifiable hindsight
+question: *did the price keep moving against the bot after the sell?*
+Selling DRAM at -0.1% looks fine on track-record; it reads
+catastrophic if DRAM rallied +5% the hour after the sell. The chat
+block surfaces that gap so the analyst can answer "should we have
+held that exit?" without re-pricing every trip manually.
+
+Block contract:
+- Fires ONLY when ≥1 `PREMATURE` / `MISSED_RUNNER` / `WHIPSAW` trip
+  exists in the recent window. All-`CORRECT` / `NEUTRAL` ladders +
+  `state` in `{NO_DATA, INSUFFICIENT}` collapse to silence — the
+  `_decision_paralysis_chat_lines` silence precedent, never chat
+  filler when exits are timing fine.
+- SSOT (paper-trader invariant #10): the builder's top-level
+  `headline` AND the surfaced worst-trip's *own per-row* `headline`
+  BOTH pass through verbatim — no chat-side paraphrase of the bot's
+  own per-trip narrative (the `_decision_vapor_chat_lines` /
+  `_thesis_drift_chat_lines` verbatim-passthrough precedent).
+- Worst-trip selection: the trip with the LARGEST absolute
+  `post_exit_drift_pct` among the unfavourable verdicts (the most
+  painful sample by definition); `CORRECT` / `NEUTRAL` trips are
+  explicitly NOT candidates (a CORRECT trip with a -20% drift was a
+  good exit, not a worst sample).
+- Guarded 3s sub-fetch; appears once `:8090` is restarted onto
+  `/api/round-trip-postmortem`.
+
+### `_cash_drag_chat_lines` — the SPY-benchmarked $ cost of sitting
+
+The chat already carries idle-cash snapshots (the `/api/risk`
+`cash_pct` in the portfolio block), `_cash_redeployment_chat_lines`
+(the post-SELL sit pathology), and `_opportunity_cost_chat_lines`
+(signal-specific hindsight). None surface the **benchmarked dollar
+cost** — "while you sat at avg cash $358 over the last 168h, SPY ran
++0.96% — that's $3.44 of beta you forfeited by being out". That's the
+answer to "is sitting in cash actually costing me?" the operator asks
+at the end of a multi-day cash stretch.
+
+Block contract:
+- Fires ONLY when top-level `state == "OK"` AND top-level `verdict ==
+  "COSTLY_CASH"`. `NEUTRAL` / `HELPFUL_CASH` / `INSUFFICIENT` /
+  `NO_DATA` collapse to silence — cash that SAVED money or had no
+  benchmark to compare against is not actionable (the silence
+  precedent — never chat filler when cash is fine or unscored).
+- SSOT (paper-trader invariant #10): the builder's own top-level
+  `headline` passes verbatim; the detail line restates the worst
+  window's *own* fields (`window_hours` / `sp500_return_pct` /
+  `avg_cash_usd` / `cash_drag_usd`) — never a recomputation
+  (`_macro_calendar_chat_lines` field-passthrough precedent).
+- Worst-window selection: highest `cash_drag_usd` among the
+  `COSTLY_CASH`-verdict windows (ties broken by longer
+  `window_hours` — longer windows are weightier evidence);
+  `HELPFUL_CASH` / `NEUTRAL` / `INSUFFICIENT` windows are explicitly
+  NOT candidates for the detail line.
+- Guarded 3s sub-fetch; appears once `:8090` is restarted onto
+  `/api/cash-drag`.
+
+Pinned by `tests/test_chat_no_decision_reasons_enrichment.py` +
+`tests/test_chat_round_trip_postmortem_enrichment.py` +
+`tests/test_chat_cash_drag_enrichment.py` (87 cases combined):
+verbatim SSOT for headline (+ worst-trip headline for RTP), silence on
+non-actionable verdicts, worst-sample selection, defensive degradation
+on non-dict / garbage stats / missing keys / unparseable counts, NO
+chat helper ever raises into the chat handler. None of the four
+load-bearing digital-intern invariants are touched (read-only on the
+trader sub-fetch; no DB write, no live alert path, no model train
+path).
+
+### Test commands
+
+```bash
+cd /home/zeph/trading-intelligence/digital-intern
+python3 -m pytest \
+    tests/test_chat_no_decision_reasons_enrichment.py \
+    tests/test_chat_round_trip_postmortem_enrichment.py \
+    tests/test_chat_cash_drag_enrichment.py -v
+# → 87 passed in 0.3s
+
+# Full chat-enrichment regression sweep:
+python3 -m pytest tests/ -k chat_ -q
+# → 694 passed, 0 regressions
+
+# Full suite (excluding the load-sensitive backtest-isolation suite):
+python3 -m pytest tests/ -q --ignore=tests/test_dashboard_backtest_isolation.py
+# → 2944 passed
+```
+
+### Latent footprint when :8090 is upgraded
+
+Live `:8090` was confirmed running the round-trip-postmortem, no-decision-
+reasons, and cash-drag endpoints during this pass (curl-verified). The
+blocks will surface in the very next chat once the digital-intern daemon
+is restarted to pick up the new helpers (the standard sibling contract —
+see [[project_paper_trader_chronic_stale]] for the parallel "shipped
+fixes are inert until manual restart" failure mode on the trader side).
+Until restart, the existing chat behaviour is byte-unchanged.
+
+---
+
 ## 2026-05-24 hybrid pass #26 (Agent 3) — ArticleStore.briefing_health: 5h Opus pipeline health snapshot
 
 Debugger + feature-dev + news-analyst pass. **No Phase 1 commit** — the
