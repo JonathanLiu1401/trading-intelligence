@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS source_health (
     consecutive_failures INTEGER DEFAULT 0,
     total_articles INTEGER DEFAULT 0,
     disabled INTEGER DEFAULT 0,
-    last_success TEXT
+    last_success TEXT,
+    fetch_attempts INTEGER DEFAULT 0,
+    fetch_successes INTEGER DEFAULT 0
 );
 """
 
@@ -101,6 +103,10 @@ def _connect() -> sqlite3.Connection:
             cols = [r[1] for r in conn.execute("PRAGMA table_info(source_health)").fetchall()]
             if cols and "last_success" not in cols:
                 conn.execute("ALTER TABLE source_health ADD COLUMN last_success TEXT")
+            if cols and "fetch_attempts" not in cols:
+                conn.execute("ALTER TABLE source_health ADD COLUMN fetch_attempts INTEGER DEFAULT 0")
+            if cols and "fetch_successes" not in cols:
+                conn.execute("ALTER TABLE source_health ADD COLUMN fetch_successes INTEGER DEFAULT 0")
         except Exception:
             pass
         conn.commit()
@@ -135,6 +141,8 @@ def record_result(source: str, article_count: int) -> None:
                 (source,),
             ).fetchone()
 
+            success_inc = 1 if article_count > 0 else 0
+
             if row is None:
                 if article_count > 0:
                     cons_fail = 0
@@ -146,9 +154,10 @@ def record_result(source: str, article_count: int) -> None:
                     last_success = None
                 conn.execute(
                     """INSERT INTO source_health
-                       (source, last_seen, consecutive_failures, total_articles, disabled, last_success)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (source, now, cons_fail, article_count, disabled, last_success),
+                       (source, last_seen, consecutive_failures, total_articles, disabled, last_success,
+                        fetch_attempts, fetch_successes)
+                       VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+                    (source, now, cons_fail, article_count, disabled, last_success, success_inc),
                 )
             else:
                 cur_fail, cur_disabled = row[0], row[1]
@@ -164,7 +173,9 @@ def record_result(source: str, article_count: int) -> None:
                                consecutive_failures = ?,
                                total_articles = total_articles + ?,
                                disabled = ?,
-                               last_success = ?
+                               last_success = ?,
+                               fetch_attempts = fetch_attempts + 1,
+                               fetch_successes = fetch_successes + 1
                            WHERE source = ?""",
                         (now, new_fail, article_count, new_disabled, now, source),
                     )
@@ -176,7 +187,8 @@ def record_result(source: str, article_count: int) -> None:
                            SET last_seen = ?,
                                consecutive_failures = ?,
                                total_articles = total_articles + ?,
-                               disabled = ?
+                               disabled = ?,
+                               fetch_attempts = fetch_attempts + 1
                            WHERE source = ?""",
                         (now, new_fail, article_count, new_disabled, source),
                     )
@@ -270,7 +282,8 @@ def get_health_report() -> dict:
         try:
             rows = conn.execute(
                 """SELECT source, last_seen, consecutive_failures,
-                          total_articles, disabled, last_success
+                          total_articles, disabled, last_success,
+                          fetch_attempts, fetch_successes
                    FROM source_health
                    ORDER BY source"""
             ).fetchall()
@@ -283,14 +296,64 @@ def get_health_report() -> dict:
                 pass
     report: dict[str, dict] = {}
     for r in rows:
+        attempts = r[6] or 0
+        successes = r[7] or 0
         report[r[0]] = {
             "last_seen": r[1],
             "consecutive_failures": r[2],
             "total_articles": r[3],
             "disabled": bool(r[4]),
             "last_success": r[5],
+            "fetch_attempts": attempts,
+            "fetch_successes": successes,
+            "reliability": round(successes / attempts, 3) if attempts > 0 else None,
         }
     return report
+
+
+def get_reliability_report(min_attempts: int = 5) -> list[dict]:
+    """Return sources sorted by fetch success rate (ascending — worst first).
+
+    Only sources with at least ``min_attempts`` recorded passes are included so
+    brand-new or barely-polled sources don't pollute the ranking.
+
+    Each entry: {source, reliability, fetch_attempts, fetch_successes, disabled}
+    """
+    with _lock:
+        try:
+            conn = _connect()
+        except Exception:
+            return []
+        try:
+            rows = conn.execute(
+                """SELECT source, fetch_attempts, fetch_successes, disabled
+                   FROM source_health
+                   WHERE fetch_attempts >= ?
+                   ORDER BY source""",
+                (min_attempts,),
+            ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    out: list[dict] = []
+    for source, attempts, successes, disabled in rows:
+        attempts = attempts or 0
+        successes = successes or 0
+        reliability = round(successes / attempts, 3) if attempts > 0 else 0.0
+        out.append({
+            "source": source,
+            "reliability": reliability,
+            "fetch_attempts": attempts,
+            "fetch_successes": successes,
+            "disabled": bool(disabled),
+        })
+    out.sort(key=lambda r: (r["reliability"], r["source"]))
+    return out
 
 
 # A source whose last_seen is fresh (still being polled) but whose
@@ -454,5 +517,11 @@ def reset_source(source: str) -> None:
 
 if __name__ == "__main__":
     import json
-    print(json.dumps(get_health_report(), indent=2))
-    print("Disabled:", get_disabled_sources())
+    print("=== Reliability Report (worst first, min 5 attempts) ===")
+    rel = get_reliability_report(min_attempts=5)
+    for r in rel[:20]:
+        pct = f"{r['reliability']*100:.1f}%"
+        dis = " [DISABLED]" if r["disabled"] else ""
+        print(f"  {r['source']:<35} {pct:>7}  ({r['fetch_successes']}/{r['fetch_attempts']}){dis}")
+    print(f"\n  ...{len(rel)} sources total with >=5 attempts")
+    print("\n=== Disabled:", get_disabled_sources())
