@@ -1097,6 +1097,53 @@ def _compute_technical_indicators(ticker: str, sim_date: date,
     # of recomputing the full EMA chain.
     macd_signal_val: float | None = macd_res[2] if macd_res else None
 
+    # Enhanced MACD features (12/26/9 + EMA200 filter — mirrors strategy.py's
+    # live get_quant_signals_live so the live trader and the DecisionScorer
+    # see the same shape). Recomputing the full EMA chain here costs ~0; the
+    # alternative would be to plumb the values out of _macd(), but _macd()
+    # already collapses to a 3-tuple and bolting on 3 more values risks
+    # breaking external consumers.
+    macd_hist: float | None = None
+    hist_cross_up: bool = False
+    macd_below_zero_cross: bool = False
+    try:
+        if len(closes) >= 35:
+            e12 = _ema(closes, 12)
+            e26 = _ema(closes, 26)
+            if e12 and e26:
+                offset = len(e12) - len(e26)
+                macd_line = [e12[i + offset] - e26[i] for i in range(len(e26))]
+                if len(macd_line) >= 9:
+                    sig = _ema(macd_line, 9)
+                    if sig:
+                        sig_len = len(sig)
+                        ml_aligned = macd_line[-sig_len:]
+                        macd_hist = ml_aligned[-1] - sig[-1]
+                        if len(ml_aligned) >= 2 and len(sig) >= 2:
+                            hist_prev = ml_aligned[-2] - sig[-2]
+                            hist_curr = ml_aligned[-1] - sig[-1]
+                            hist_cross_up = bool(
+                                hist_prev < 0 and hist_curr > 0
+                            )
+                            macd_below_zero_cross = bool(
+                                hist_cross_up and ml_aligned[-1] < 0
+                            )
+    except Exception:
+        macd_hist = None
+        hist_cross_up = False
+        macd_below_zero_cross = False
+
+    # 200-day EMA filter — confirms long-term trend; preferred long entries
+    # require ema200_above=True (the textbook MACD-strategy filter).
+    ema200_above: bool | None = None
+    try:
+        if len(closes) >= 200:
+            e200 = _ema(closes, 200)
+            if e200:
+                ema200_above = bool(closes[-1] > e200[-1])
+    except Exception:
+        ema200_above = None
+
     ma_cross = None
     if len(closes) >= 200:
         ma50 = sum(closes[-50:]) / 50
@@ -1173,6 +1220,13 @@ def _compute_technical_indicators(ticker: str, sim_date: date,
         "mom_20d": round(mom_20d, 2) if mom_20d is not None else None,
         "wk52_pos": round(wk52_pos, 2) if wk52_pos is not None else None,
         "vol_ratio": round(vol_ratio, 2) if vol_ratio is not None else None,
+        # Enhanced MACD signals (mirrors strategy.py get_quant_signals_live).
+        # Consumed by DecisionScorer.build_features so the scorer learns the
+        # MACD-zero-cross + EMA200-filter setup.
+        "macd_hist": round(macd_hist, 4) if macd_hist is not None else None,
+        "hist_cross_up": hist_cross_up,
+        "macd_below_zero_cross": macd_below_zero_cross,
+        "ema200_above": ema200_above,
     }
 
 

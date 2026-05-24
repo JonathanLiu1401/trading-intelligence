@@ -128,15 +128,24 @@ INTENTIONALLY_OTHER: frozenset[str] = frozenset({
     "XLI",      # industrials sector ETF itself — no industrials enum
 })
 
-N_FEATURES = 10 + len(SECTORS)  # 10 base (quant + news_urgency + news_article_count) + 7 sector one-hot = 17
+N_FEATURES = 10 + len(SECTORS) + 3  # 10 base + 7 sector one-hot + 3 enhanced MACD = 20
 
 # Human-readable name per build_features() output slot, in order. Single
 # source of truth shared by feature_contributions() (and any future
 # attribution consumer) so a feature reorder can't silently mislabel an
 # attribution panel. Kept in lockstep with build_features()'s return list.
+# The 3 enhanced MACD features (ema200_above, hist_cross_up,
+# macd_below_zero_cross) are inserted AFTER the 10 base numeric features
+# but BEFORE the 7 sector one-hot block — preserves the invariant "the last
+# len(SECTORS) entries are the sector one-hot", which several attribution
+# consumers (and the existing per-sector test) rely on. Existing pickles
+# ARE shape-mismatched (17 → 20 input dim); predict_with_meta catches the
+# shape error and degrades to failed=True / pred=0.0 until the next
+# continuous-loop retrain rebuilds the model on the new 20-feature vector.
 FEATURE_NAMES = [
     "ml_score", "rsi", "macd", "mom5", "mom20", "regime_mult",
     "vol_ratio", "bb_pos", "news_urgency", "news_article_count",
+    "ema200_above", "hist_cross_up", "macd_below_zero_cross",
 ] + [f"sector_{s}" for s in SECTORS]
 assert len(FEATURE_NAMES) == N_FEATURES, "FEATURE_NAMES drifted from build_features()"
 
@@ -169,6 +178,11 @@ FEATURE_GROUP_MAP: dict[str, str] = {
     "vol_ratio": "quant", "bb_pos": "quant",
     "regime_mult": "regime",
     "news_urgency": "news", "news_article_count": "news",
+    # Enhanced MACD / EMA200 features land in the "quant" bucket — they are
+    # purely-technical price signals, same family as RSI / MACD / momentum.
+    "ema200_above": "quant",
+    "hist_cross_up": "quant",
+    "macd_below_zero_cross": "quant",
 }
 for _s in SECTORS:
     FEATURE_GROUP_MAP[f"sector_{_s}"] = "sector"
@@ -281,6 +295,21 @@ def _to_float(v, default: float) -> float:
     return default
 
 
+def _bool_to_float(v) -> float:
+    """Bool → 1.0/0.0; None/non-bool → 0.0. Matches the spec for the 3
+    enhanced MACD features: missing data is treated as "signal not present"
+    rather than imputed positive."""
+    if v is True:
+        return 1.0
+    if v is False:
+        return 0.0
+    # Be tolerant of stringified bools / 0/1 ints if a caller pre-coerces.
+    try:
+        return 1.0 if float(v) > 0.0 else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def build_features(
     ml_score: float,
     rsi: float | None,
@@ -293,8 +322,19 @@ def build_features(
     bb_pos: float | None = None,
     news_urgency: float | None = None,
     news_article_count: float | None = None,
+    ema200_above: bool | None = None,
+    hist_cross_up: bool | None = None,
+    macd_below_zero_cross: bool | None = None,
 ) -> list[float]:
-    """Build a fixed-length feature vector for one decision."""
+    """Build a fixed-length feature vector for one decision.
+
+    The 3 enhanced MACD features are appended AFTER the sector one-hot so
+    the existing 10+7 feature ordering is preserved — only the tail grows.
+    Existing pickles trained on 17 features will fail to predict on the
+    20-feature input (shape mismatch); predict_with_meta catches this and
+    degrades to failed=True / pred=0.0 until the next retrain rebuilds the
+    model on the new vector (the continuous loop's per-cycle retrain picks
+    this up automatically)."""
     rsi_v = _to_float(rsi, 50.0)
     macd_v = _to_float(macd, 0.0)
     mom5_v = _to_float(mom5, 0.0)
@@ -305,8 +345,13 @@ def build_features(
     bb_v = max(-2.0, min(2.0, _to_float(bb_pos, 0.0)))
     urg_v = max(0.0, min(100.0, _to_float(news_urgency, 50.0)))
     cnt_v = max(0.0, min(20.0, _to_float(news_article_count, 1.0)))
-    return [_to_float(ml_score, 0.0), rsi_v, macd_v, mom5_v, mom20_v,
-            _to_float(regime_mult, 1.0), vol_v, bb_v, urg_v, cnt_v] + sector_oh
+    ema200_above_f = _bool_to_float(ema200_above)
+    hist_cross_up_f = _bool_to_float(hist_cross_up)
+    macd_below_zero_cross_f = _bool_to_float(macd_below_zero_cross)
+    return ([_to_float(ml_score, 0.0), rsi_v, macd_v, mom5_v, mom20_v,
+             _to_float(regime_mult, 1.0), vol_v, bb_v, urg_v, cnt_v,
+             ema200_above_f, hist_cross_up_f, macd_below_zero_cross_f]
+            + sector_oh)
 
 
 class DecisionScorer:
@@ -397,6 +442,9 @@ class DecisionScorer:
         bb_pos: float | None = None,
         news_urgency: float | None = None,
         news_article_count: float | None = None,
+        ema200_above: bool | None = None,
+        hist_cross_up: bool | None = None,
+        macd_below_zero_cross: bool | None = None,
     ) -> dict:
         """Predicted 5d forward return (%) plus calibration metadata.
 
@@ -445,7 +493,10 @@ class DecisionScorer:
                 [build_features(ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
                                 vol_ratio=vol_ratio, bb_pos=bb_pos,
                                 news_urgency=news_urgency,
-                                news_article_count=news_article_count)],
+                                news_article_count=news_article_count,
+                                ema200_above=ema200_above,
+                                hist_cross_up=hist_cross_up,
+                                macd_below_zero_cross=macd_below_zero_cross)],
                 dtype=np.float32,
             )
             if self._scaler is not None:
@@ -507,6 +558,9 @@ class DecisionScorer:
         bb_pos: float | None = None,
         news_urgency: float | None = None,
         news_article_count: float | None = None,
+        ema200_above: bool | None = None,
+        hist_cross_up: bool | None = None,
+        macd_below_zero_cross: bool | None = None,
     ) -> float:
         """Return predicted 5d forward return (%), clamped to the empirical
         label support (see ``PRED_CLAMP_PCT``). Returns 0.0 if not trained.
@@ -517,6 +571,8 @@ class DecisionScorer:
             ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
             vol_ratio=vol_ratio, bb_pos=bb_pos, news_urgency=news_urgency,
             news_article_count=news_article_count,
+            ema200_above=ema200_above, hist_cross_up=hist_cross_up,
+            macd_below_zero_cross=macd_below_zero_cross,
         )["pred"]
 
     def _raw_to_percentile(self, raw: float) -> float | None:
@@ -622,6 +678,9 @@ class DecisionScorer:
         bb_pos: float | None = None,
         news_urgency: float | None = None,
         news_article_count: float | None = None,
+        ema200_above: bool | None = None,
+        hist_cross_up: bool | None = None,
+        macd_below_zero_cross: bool | None = None,
     ) -> float | None:
         """Quantile-mapped reading of one prediction: the realized 5-day
         forward return (%) at the rank the raw prediction occupies.
@@ -642,6 +701,8 @@ class DecisionScorer:
             ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
             vol_ratio=vol_ratio, bb_pos=bb_pos, news_urgency=news_urgency,
             news_article_count=news_article_count,
+            ema200_above=ema200_above, hist_cross_up=hist_cross_up,
+            macd_below_zero_cross=macd_below_zero_cross,
         )["calibrated"]
 
     def predict_percentile(
@@ -657,6 +718,9 @@ class DecisionScorer:
         bb_pos: float | None = None,
         news_urgency: float | None = None,
         news_article_count: float | None = None,
+        ema200_above: bool | None = None,
+        hist_cross_up: bool | None = None,
+        macd_below_zero_cross: bool | None = None,
     ) -> float | None:
         """Rank-calibrated reading of one prediction: the percentile (0..100)
         the raw forward-return estimate occupies in the training-set
@@ -676,6 +740,8 @@ class DecisionScorer:
             ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
             vol_ratio=vol_ratio, bb_pos=bb_pos, news_urgency=news_urgency,
             news_article_count=news_article_count,
+            ema200_above=ema200_above, hist_cross_up=hist_cross_up,
+            macd_below_zero_cross=macd_below_zero_cross,
         )["percentile"]
 
     def feature_contributions(
@@ -691,6 +757,9 @@ class DecisionScorer:
         bb_pos: float | None = None,
         news_urgency: float | None = None,
         news_article_count: float | None = None,
+        ema200_above: bool | None = None,
+        hist_cross_up: bool | None = None,
+        macd_below_zero_cross: bool | None = None,
     ) -> dict:
         """Per-feature signed attribution for one prediction.
 
@@ -719,6 +788,8 @@ class DecisionScorer:
                 ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
                 vol_ratio=vol_ratio, bb_pos=bb_pos, news_urgency=news_urgency,
                 news_article_count=news_article_count,
+                ema200_above=ema200_above, hist_cross_up=hist_cross_up,
+                macd_below_zero_cross=macd_below_zero_cross,
             )
             x = np.array([raw_feat], dtype=np.float32)
             if self._scaler is not None:
@@ -775,6 +846,9 @@ class DecisionScorer:
         bb_pos: float | None = None,
         news_urgency: float | None = None,
         news_article_count: float | None = None,
+        ema200_above: bool | None = None,
+        hist_cross_up: bool | None = None,
+        macd_below_zero_cross: bool | None = None,
     ) -> dict:
         """Per-group signed attribution for one prediction.
 
@@ -814,6 +888,8 @@ class DecisionScorer:
             regime_mult=regime_mult, ticker=ticker, vol_ratio=vol_ratio,
             bb_pos=bb_pos, news_urgency=news_urgency,
             news_article_count=news_article_count,
+            ema200_above=ema200_above, hist_cross_up=hist_cross_up,
+            macd_below_zero_cross=macd_below_zero_cross,
         )
         if not contrib.get("trained"):
             return {"trained": False, "groups": [], "pred": 0.0,
@@ -1068,6 +1144,9 @@ def train_scorer(records: list[dict], path: "Path | None" = None) -> dict:
             bb_pos=r.get("bb_position"),
             news_urgency=r.get("news_urgency"),
             news_article_count=r.get("news_article_count"),
+            ema200_above=r.get("ema200_above"),
+            hist_cross_up=r.get("hist_cross_up"),
+            macd_below_zero_cross=r.get("macd_below_zero_cross"),
         ))
         # Symmetric label clamp — mirror the inference-side ±PRED_CLAMP_PCT
         # clamp at train time. predict() always clamps its output to

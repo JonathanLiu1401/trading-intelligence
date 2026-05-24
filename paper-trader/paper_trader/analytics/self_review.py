@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from .trade_asymmetry import build_trade_asymmetry
 from .capital_paralysis import build_capital_paralysis
 from .open_attribution import build_open_attribution
+from .trade_outcomes import build_trade_outcomes_block
 
 
 def _safe(fn, *args, **kwargs) -> dict:
@@ -120,6 +121,19 @@ def build_self_review(portfolio: dict,
 
     body = [ln for ln in (_asym_line(asym), _capital_line(cap), _attr_line(oa))
             if ln]
+
+    # Round-trip outcomes block — win rate / expectancy / profit factor +
+    # hard-exit (SL/TP) counts. Composed verbatim from the trade_outcomes
+    # builder (single source of truth, invariant #10); a fresh book with no
+    # round-trips yields None so the section is silent until there's
+    # something honest to say (the existing "silence when nothing
+    # actionable" precedent _asym_line / _attr_line already follow).
+    try:
+        outcomes_block = build_trade_outcomes_block(trades or [])
+    except Exception:
+        outcomes_block = None
+    if outcomes_block:
+        body.append("  " + outcomes_block.replace("\n", "\n  "))
 
     if body:
         prompt_block = _PREAMBLE + "\n" + "\n".join(body)

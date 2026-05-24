@@ -33,17 +33,19 @@ CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker);
 
 CREATE TABLE IF NOT EXISTS positions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker          TEXT NOT NULL,
-    type            TEXT NOT NULL,
-    qty             REAL NOT NULL,
-    avg_cost        REAL NOT NULL,
-    current_price   REAL DEFAULT 0,
-    unrealized_pl   REAL DEFAULT 0,
-    expiry          TEXT,
-    strike          REAL,
-    opened_at       TEXT NOT NULL,
-    closed_at       TEXT,
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker            TEXT NOT NULL,
+    type              TEXT NOT NULL,
+    qty               REAL NOT NULL,
+    avg_cost          REAL NOT NULL,
+    current_price     REAL DEFAULT 0,
+    unrealized_pl     REAL DEFAULT 0,
+    expiry            TEXT,
+    strike            REAL,
+    opened_at         TEXT NOT NULL,
+    closed_at         TEXT,
+    stop_loss_price   REAL,
+    take_profit_price REAL,
     UNIQUE(ticker, type, expiry, strike)
 );
 CREATE INDEX IF NOT EXISTS idx_pos_open ON positions(closed_at) WHERE closed_at IS NULL;
@@ -117,6 +119,22 @@ class Store:
         self.conn = _connect()
         self._lock = threading.Lock()
         self._init_portfolio()
+        # Safe column migration — idempotent. SCHEMA above uses
+        # CREATE TABLE IF NOT EXISTS, which does NOT add new columns to an
+        # existing positions table. ALTER TABLE on every startup; swallow the
+        # "duplicate column name" error once the column already exists.
+        for col, sql_type in (
+            ("stop_loss_price", "REAL"),
+            ("take_profit_price", "REAL"),
+        ):
+            try:
+                with self._lock:
+                    self.conn.execute(
+                        f"ALTER TABLE positions ADD COLUMN {col} {sql_type}"
+                    )
+                    self.conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists — fresh DB or prior boot ran the ALTER
 
     def _init_portfolio(self):
         with self._lock:
@@ -243,7 +261,13 @@ class Store:
 
     # ─── positions ─────────────────────────────────────────────
     def upsert_position(self, ticker: str, type_: str, qty: float, avg_cost: float,
-                        expiry: str | None = None, strike: float | None = None) -> None:
+                        expiry: str | None = None, strike: float | None = None,
+                        stop_loss_price: float | None = None,
+                        take_profit_price: float | None = None) -> None:
+        """Apply a position delta. ``qty=0`` is the metadata-only mode used by
+        the BUY path to set ``stop_loss_price`` / ``take_profit_price`` on an
+        existing open lot without changing its size — only fields explicitly
+        passed (non-None) are written; everything else is preserved."""
         with self._lock:
             existing = self.conn.execute(
                 "SELECT id, qty, avg_cost FROM positions "
@@ -260,10 +284,39 @@ class Store:
                     )
                 else:
                     blended = (existing["qty"] * existing["avg_cost"] + qty * avg_cost) / new_qty if qty > 0 else existing["avg_cost"]
-                    self.conn.execute(
-                        "UPDATE positions SET qty=?, avg_cost=? WHERE id=?",
-                        (new_qty, blended, existing["id"]),
-                    )
+                    # qty=0 is the metadata-only path — preserve qty/avg_cost.
+                    if qty == 0:
+                        # Only touch SL/TP when explicitly supplied; this is
+                        # the post-BUY "stamp the hard exits on the just-
+                        # opened lot" call from strategy._execute.
+                        set_clauses = []
+                        params: list = []
+                        if stop_loss_price is not None:
+                            set_clauses.append("stop_loss_price=?")
+                            params.append(stop_loss_price)
+                        if take_profit_price is not None:
+                            set_clauses.append("take_profit_price=?")
+                            params.append(take_profit_price)
+                        if set_clauses:
+                            params.append(existing["id"])
+                            self.conn.execute(
+                                f"UPDATE positions SET {', '.join(set_clauses)} WHERE id=?",
+                                params,
+                            )
+                    else:
+                        set_clauses = ["qty=?", "avg_cost=?"]
+                        params = [new_qty, blended]
+                        if stop_loss_price is not None:
+                            set_clauses.append("stop_loss_price=?")
+                            params.append(stop_loss_price)
+                        if take_profit_price is not None:
+                            set_clauses.append("take_profit_price=?")
+                            params.append(take_profit_price)
+                        params.append(existing["id"])
+                        self.conn.execute(
+                            f"UPDATE positions SET {', '.join(set_clauses)} WHERE id=?",
+                            params,
+                        )
             else:
                 if qty > 0:
                     # No open lot for this key. A prior fully-closed lot with
@@ -284,16 +337,36 @@ class Store:
                     if closed:
                         self.conn.execute(
                             "UPDATE positions SET qty=?, avg_cost=?, current_price=0, "
-                            "unrealized_pl=0, opened_at=?, closed_at=NULL WHERE id=?",
-                            (qty, avg_cost, _now(), closed["id"]),
+                            "unrealized_pl=0, opened_at=?, closed_at=NULL, "
+                            "stop_loss_price=?, take_profit_price=? WHERE id=?",
+                            (qty, avg_cost, _now(), stop_loss_price,
+                             take_profit_price, closed["id"]),
                         )
                     else:
                         self.conn.execute(
-                            "INSERT INTO positions (ticker, type, qty, avg_cost, expiry, strike, opened_at) "
-                            "VALUES (?,?,?,?,?,?,?)",
-                            (ticker, type_, qty, avg_cost, expiry, strike, _now()),
+                            "INSERT INTO positions (ticker, type, qty, avg_cost, expiry, strike, opened_at, stop_loss_price, take_profit_price) "
+                            "VALUES (?,?,?,?,?,?,?,?,?)",
+                            (ticker, type_, qty, avg_cost, expiry, strike,
+                             _now(), stop_loss_price, take_profit_price),
                         )
             self.conn.commit()
+
+    def positions_needing_hard_exit(self) -> list[dict]:
+        """Open stock positions whose current_price breaches SL or TP.
+
+        Read-only; pure SQL on the positions table. Skips options (only stock
+        type is hard-exited), zero-qty lots, lots without SL/TP set, and lots
+        with no fresh mark (current_price > 0 is the snapshot freshness
+        proxy). Caller is responsible for executing the SELL."""
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT * FROM positions WHERE closed_at IS NULL AND type='stock' "
+                "AND qty > 0 AND stop_loss_price IS NOT NULL "
+                "AND take_profit_price IS NOT NULL AND current_price > 0 "
+                "AND (current_price <= stop_loss_price OR current_price >= take_profit_price)"
+            )
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
 
     def close_position(self, position_id: int):
         with self._lock:
