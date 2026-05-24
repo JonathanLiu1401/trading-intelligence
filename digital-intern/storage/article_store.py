@@ -967,6 +967,167 @@ class ArticleStore:
         }
 
     @_retry_on_lock
+    def briefing_cadence_trend(
+        self, last_n: int = 10, expected_cadence_h: float = 5.0
+    ) -> dict:
+        """Per-interval briefing cadence trend — the *trend* sibling to
+        ``briefing_health``.
+
+        ``briefing_health`` answers "is the MOST RECENT briefing fresh?" in
+        verdict form. It is point-in-time: a path that just produced a
+        briefing 5h ago reads HEALTHY even if the prior 10 briefings averaged
+        9h gaps (Opus quota throttling, Claude CLI auth lapsing intermittently,
+        the heartbeat_worker getting blocked on a slow DB read). This is
+        early-warning that has so far been invisible to every operator-facing
+        surface — the analyst would only learn the path was degrading once it
+        flipped to STALE/DEAD, by which point briefings have been missing
+        for hours.
+
+        Live evidence (2026-05-24 pull, last 11 intervals in the briefings
+        table)::
+
+            5.21, 5.26, 6.26, 10.23, 7.08, 10.26, 5.09, 27.64, 5.21, 5.43, 8.61
+
+        mean ≈ 8.75h (75% slower than the 5h ``HEARTBEAT_INTERVAL``), max
+        27.64h (a 5x miss). ``briefing_health`` on this same pull returned
+        verdict=HEALTHY (most recent 5.15h ago, count_in_window 3 >= 60%
+        floor of 4.8 expected). Both are correct on what they measure; the
+        trend is the missing axis.
+
+        Sibling to ``briefing_health`` exactly as ``source_throughput`` is
+        sibling to ``source_freshness`` — point-in-time freshness vs the
+        first-derivative degradation rate. Same disciplines: pure SELECT,
+        ``_LIVE_ONLY_CLAUSE`` not needed (briefings table is Opus-write only;
+        never touched by backtest paths) but documented intent below.
+
+        Returns::
+
+            {
+              "expected_cadence_h":  float,
+              "last_n":              int,
+              "n_intervals":         int,         # actual intervals computed
+              "intervals_h":         [float,...], # chronological, newest LAST
+              "mean_interval_h":     float | None,
+              "max_interval_h":      float | None,
+              "p50_interval_h":      float | None,
+              "drift_pct":           float | None,
+                  # (mean - expected) / expected * 100 — positive = slipping
+              "verdict": "ON_CADENCE" | "SLIPPING" | "DRIFTING" | "NO_DATA",
+            }
+
+        Verdict semantics (chosen to be a strict pre-warning of
+        ``briefing_health.STALE``/``DEAD``, never a post-hoc duplicate):
+
+          * ``NO_DATA`` — fewer than 2 intervals (need at least 2 to draw a
+            trend; a single gap could be a transient and is already the
+            ``briefing_health.STALE`` regime).
+          * ``DRIFTING`` — ``mean > 1.5 * expected`` (50%+ slower than
+            expected on average — the path is materially slipping, even if
+            the most recent briefing happened to fire).
+          * ``SLIPPING`` — ``mean > 1.2 * expected`` OR
+            ``max > 2.0 * expected`` (early warning: 20% slower on average,
+            or a single gap >= 2 cadences — exactly what flipped to DEAD
+            once in the live evidence above).
+          * ``ON_CADENCE`` — everything else.
+
+        Read-only (single SELECT). NO DB write — no
+        ai_score / ml_score / score_source / urgency mutation. All four
+        load-bearing invariants intact by construction.
+        """
+        last_n = max(int(last_n), 1)
+        # 0.01h ≈ 36s — well below any plausible production cadence and above
+        # the 2-decimal rounding floor used in the return field, so the clamp
+        # always yields a strictly-positive returned value (a divide-by-zero
+        # in drift_pct cannot occur on a misconfigured caller).
+        expected_cadence_h = max(float(expected_cadence_h), 0.01)
+
+        # last_n+1 rows yield last_n intervals (a row pair per gap).
+        # Briefings are write-once / append-only by ``save_briefing``, so
+        # ORDER BY id DESC is identical to ORDER BY ts DESC except in the
+        # exotic case of a clock skew — id-ordering is the authoritative
+        # write-order signal (same discipline as ``get_briefings_for_training``).
+        rows = self.conn.execute(
+            "SELECT ts FROM briefings ORDER BY id DESC LIMIT ?",
+            (last_n + 1,),
+        ).fetchall()
+
+        # Parse + filter to UTC-aware datetimes. Defensive against corrupt
+        # rows (same discipline as ``briefing_health``'s
+        # ``fromisoformat`` guard) — bad rows are silently dropped, not
+        # raised, so an analytics caller never crashes on a malformed
+        # briefings table.
+        parsed: list[datetime] = []
+        for (ts_str,) in rows:
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str)
+            except (ValueError, TypeError):
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            parsed.append(ts)
+
+        # Reverse to chronological order (oldest first) for natural interval
+        # computation. Each interval is ``parsed[i+1] - parsed[i]`` — the
+        # gap an analyst would draw on a timeline.
+        parsed.reverse()
+        intervals_h: list[float] = []
+        for i in range(len(parsed) - 1):
+            delta_s = (parsed[i + 1] - parsed[i]).total_seconds()
+            # Defensive non-negative clamp — a future clock-skew + id-order
+            # mismatch must never produce a negative interval that breaks
+            # the mean / drift_pct math.
+            intervals_h.append(round(max(0.0, delta_s / 3600.0), 2))
+
+        n_intervals = len(intervals_h)
+        if n_intervals < 2:
+            return {
+                "expected_cadence_h": round(expected_cadence_h, 2),
+                "last_n": last_n,
+                "n_intervals": n_intervals,
+                "intervals_h": intervals_h,
+                "mean_interval_h": None,
+                "max_interval_h": None,
+                "p50_interval_h": None,
+                "drift_pct": None,
+                "verdict": "NO_DATA",
+            }
+
+        mean_h = sum(intervals_h) / n_intervals
+        max_h = max(intervals_h)
+        # p50 = median. Sorted list; ``//2`` is exactly right for both even
+        # and odd n_intervals since we just want the middle ordered value
+        # (no interpolation — operator-readable round-trip to a real bucket).
+        sorted_h = sorted(intervals_h)
+        p50_h = sorted_h[n_intervals // 2]
+        drift_pct = round(
+            (mean_h - expected_cadence_h) / expected_cadence_h * 100.0, 1
+        )
+
+        # Verdict ladder: most-severe first (same discipline as
+        # ``ml_training_health``'s NO_DATA > DEAD > STALE > … precedence).
+        if mean_h > 1.5 * expected_cadence_h:
+            verdict = "DRIFTING"
+        elif (mean_h > 1.2 * expected_cadence_h
+              or max_h > 2.0 * expected_cadence_h):
+            verdict = "SLIPPING"
+        else:
+            verdict = "ON_CADENCE"
+
+        return {
+            "expected_cadence_h": round(expected_cadence_h, 2),
+            "last_n": last_n,
+            "n_intervals": n_intervals,
+            "intervals_h": intervals_h,
+            "mean_interval_h": round(mean_h, 2),
+            "max_interval_h": round(max_h, 2),
+            "p50_interval_h": round(p50_h, 2),
+            "drift_pct": drift_pct,
+            "verdict": verdict,
+        }
+
+    @_retry_on_lock
     def count_unscored(self, min_kw: float = 0.0) -> int:
         """Count articles still pending the scorer. Mirrors ``get_unscored``'s
         filter (ai_score=0 AND ml_score IS NULL AND kw_score>=min_kw AND
