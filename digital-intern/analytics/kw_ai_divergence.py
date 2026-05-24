@@ -29,18 +29,53 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "articles.db"
+BASE = Path(__file__).resolve().parents[1]
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+# Resolve the same DB the daemon uses (USB-preferred via
+# storage.article_store._get_db_path), with a fallback to the local
+# data/articles.db symlink that has historically been the manual path. The
+# urgency_drought sibling already uses this helper — without it, this script
+# would silently target an empty local file on a host where the data/ symlink
+# is absent (e.g. fresh checkout, CI sandbox) and emit a meaningless snapshot.
+try:
+    from storage.article_store import _get_db_path as _resolve_db_path
+except Exception:
+    _resolve_db_path = None
+
+DB_PATH = (
+    Path(_resolve_db_path()) if _resolve_db_path is not None
+    else Path(__file__).resolve().parent.parent / "data" / "articles.db"
+)
 LOG_DIR = Path("/home/zeph/logs")
 OUT_PATH = LOG_DIR / "kw_ai_divergence.json"
 
 SCAN_LIMIT = 6000       # bounded idx_first_seen scan
+# Both kw_score and ai_score live on the SAME 0..10 scale
+# (triage/heuristic_scorer.py docstring: "Range: 0.0 – 10.0";
+# articles.db.ai_score is set to Sonnet's 0..10 integer by urgency_scorer +
+# bulk-updated by the trainer with the same magnitude). The previous
+# AI_LOW=0.15 / AI_HIGH=0.50 were leftover from a 0..1 normalisation that
+# never landed: AI_HIGH=0.5 then matched ai_score=1.0 (the bottom of
+# Sonnet's "engaged at all" output) as a "hidden gem", so the hidden-gem
+# list became "anything Sonnet rated >=1" — pure noise. Re-scale to the
+# real ai_score range so the analyser does what the docstring says:
+#   * false_positive: kw fired strongly (>=5) AND Sonnet either never
+#     engaged (ai_score == 0 — unscored) OR engaged and floored to noise
+#     (urgency_scorer's 0.01 anti-loop floor). AI_LOW=1.5 captures both
+#     cases without sweeping in genuine "Sonnet said 2/10 relevant" rows.
+#   * hidden_gem: Sonnet rated relevant (>=6 — its mid-relevance floor)
+#     AND keyword barely fired (kw_score < 3.0). 6.0 is the same
+#     "relevant" threshold the urgency prompt's RELEVANT band starts at.
 KW_HIGH = 5.0           # kw_score threshold for "keyword fired strongly"
-AI_LOW = 0.15           # ai_score ceiling for "AI found little signal"
-AI_HIGH = 0.50          # ai_score floor for "AI found strong signal"
+AI_LOW = 1.5            # ai_score ceiling for "AI found little signal"
+AI_HIGH = 6.0           # ai_score floor for "AI found strong signal"
 KW_LOW = 3.0            # kw_score ceiling for "keyword almost missed it"
 
 _LIVE_ONLY = (
