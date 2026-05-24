@@ -453,6 +453,81 @@ class TestHelperCatchesLiveNoise:
             assert hit, f"missed why-stock-is-after recap: {t!r}"
             assert name == "why_stock_is_after"
 
+    def test_earnings_release_price_target_simplywallst_mill(self):
+        """Live evidence (2026-05-24, 30-day articles.db scan): 9 such rows
+        from the SimplyWallSt / scraped/finance.yahoo.com / GN: earnings
+        channel; one reached urgency=2 at ml_score=9.83 on the
+        scraped/finance.yahoo.com row (cred 0.65 — above the 0.45 lone-source
+        bar; content type IS the failure). The canonical noisiest copy:
+        "Earnings Release: Here's Why Analysts Cut Their The Home Depot, Inc.
+         (NYSE:HD) Price Target To US$378.32".
+
+        Pin the live failure-case plus same-template siblings across other
+        verbs (raised / lowered / boosted / trimmed) and tickers
+        (TELA, KROS, CURI, INTU). The discriminator is the SimplyWallSt
+        triple signature: ``^Earnings Release:`` + ``Here's Why Analysts
+        <verb>`` + ``Price Target`` — must-survive corpus below is the
+        wider gate against false-positives on real PT-change wire copy."""
+        for t in (
+            # Live failure case — exact title from the live DB.
+            "Earnings Release: Here's Why Analysts Cut Their The Home Depot, Inc. "
+            "(NYSE:HD) Price Target To US$378.32",
+            # Sibling live rows (TELA, KROS, CURI, INTU).
+            "Earnings Release: Here's Why Analysts Cut Their TELA Bio, Inc. "
+            "(NASDAQ:TELA) Price Target To US$2.25",
+            "Earnings Release: Here's Why Analysts Cut Their Keros Therapeutics, "
+            "Inc. (NASDAQ:KROS) Price Target",
+            "Earnings Release: Here's Why Analysts Cut Their CuriosityStream Inc. "
+            "(NASDAQ:CURI) Price Target",
+            "Earnings Release: Here's Why Analysts Cut Their Intuit Inc. "
+            "(NASDAQ:INTU) Price Target To US$700.00",
+            # Same template, other verbs the SEO mill rotates through.
+            "Earnings Release: Here's Why Analysts Raised Their NVIDIA Corp "
+            "(NASDAQ:NVDA) Price Target To US$200.00",
+            "Earnings Release: Here's Why Analysts Lowered Their AMD "
+            "(NASDAQ:AMD) Price Target",
+            "Earnings Release: Here's why analysts boosted their Apple Inc. "
+            "(NASDAQ:AAPL) price target",
+            # Apostrophe variants (ASCII straight + curly + bare s).
+            "Earnings Release: Heres Why Analysts Trimmed Their MU "
+            "(NASDAQ:MU) Price Target",
+            "Earnings Release: Here’s Why Analysts Hiked Their TSLA Price Target",
+            "Earnings Release: Here is Why Analysts Slashed Their META Price Target",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed earnings-release PT recap: {t!r}"
+            assert name == "earnings_release_pt"
+
+    def test_earnings_release_pt_does_not_catch_real_pt_changes(self):
+        """The new gate must NOT catch real wire copy about analyst PT
+        changes — the discriminator is the SimplyWallSt SEO mill's
+        leading ``^Earnings Release:`` + ``Here's Why Analysts <verb>`` +
+        ``Price Target`` triple. Real wire copy about PT actions does
+        not lead with this exact SEO prefix."""
+        for t in (
+            # Real PT-change wires — no "Earnings Release:" lead.
+            "MU price target raised 15% by Citi",
+            "Citi raises NVDA price target to $250",
+            "Analysts cut their PT on Tesla after Q1 miss",
+            "JPMorgan resets Nvidia stock price target after earnings",
+            "MU PT lifted to $190 at Morgan Stanley on DRAM surge",
+            # "Earnings Release" tokens but no "Here's Why Analysts" bridge.
+            "Earnings Release shows MU beat Q3 estimates",
+            "Q1 Earnings Release: NVDA crushes guidance",
+            # "Here's Why Analysts" mid-sentence — no "Earnings Release:" lead.
+            "MU surges: here's why analysts cut their bearish thesis",
+            # "Earnings Release: Here's Why" but no analysts/PT trio.
+            "Earnings Release: Here's why MU shares are surging today",
+            "Earnings Release: Here's Why The Stock Is Down 10%",
+            # Real forward-looking analyst question.
+            "Will analysts raise NVDA price target after Q1?",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert not hit, (
+                f"false-positive on earnings-release PT pattern: {t!r} "
+                f"(name={name!r})"
+            )
+
     def test_whats_next_after_baystreet_seo_mill(self):
         """Live evidence (2026-05-23 17:39:55Z, articles.db urgency=2 set):
         "Baystreet . ca - What is Next After NVIDIA Trounces Expectations"

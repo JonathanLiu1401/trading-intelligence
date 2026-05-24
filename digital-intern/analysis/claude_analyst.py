@@ -1738,6 +1738,24 @@ _BRIEFING_RT_WHATS_NEXT_AFTER = re.compile(
     r"miss(?:es|ed)?|ipo|guidance)\b",
     re.IGNORECASE,
 )
+# "Earnings Release: Here's Why Analysts <verb> Their <Company> Price Target"
+# — lockstep mirror of watchers.alert_agent._RT_EARNINGS_RELEASE_PT. Live
+# evidence (2026-05-24, 30-day articles.db scan): 9 such SimplyWallSt
+# SEO-mill rows, one reaching urgency=2 at ml_score=9.83 via
+# scraped/finance.yahoo.com. Without this gate, the per-domain cap admits
+# them into the briefing's top-50 digest pool — surfacing post-event
+# analyst-action recap as fresh TOP SIGNALS despite being retrospective.
+# Byte-identical to the alert-side regex (anti-drift discipline,
+# enforced structurally by
+# ``test_alert_and_briefing_recap_tuples_have_same_length``).
+_BRIEFING_RT_EARNINGS_RELEASE_PT = re.compile(
+    r"^\s*earnings\s+release\s*:\s*"
+    r"here(?:[s'’]+|\s+is)?\s+why\s+analysts\s+"
+    r"(?:cut|raised|lowered|increased|boosted|reduced|trimmed|hiked|"
+    r"slashed|maintained|reiterated|downgraded|upgraded)\s+.+?"
+    r"\bprice\s+target\b",
+    re.IGNORECASE,
+)
 
 _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _BRIEFING_RT_WHY_TRADING),
@@ -1766,6 +1784,7 @@ _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("futures_why_today", _BRIEFING_RT_FUTURES_WHY_TODAY),
     ("daily_price_city", _BRIEFING_RT_DAILY_PRICE_CITY),
     ("whats_next_after", _BRIEFING_RT_WHATS_NEXT_AFTER),
+    ("earnings_release_pt", _BRIEFING_RT_EARNINGS_RELEASE_PT),
 )
 
 
