@@ -546,17 +546,29 @@ class DecisionScorer:
         to whatever realized return its rank actually corresponds to.
 
         Returns None when either quantile table is absent (legacy pickle),
-        ``raw`` is non-finite, or anything else fails — never raises, the
-        same discipline as ``_raw_to_percentile``."""
+        ``raw`` is non-finite, the persisted ``label_quantiles`` table is
+        COLLAPSED to a single value (``lq.max() == lq.min()``), or anything
+        else fails — never raises, the same discipline as
+        ``_raw_to_percentile``. The collapsed-label guard mirrors the
+        collapsed-pred guard in ``_raw_to_percentile``: ``np.interp`` over a
+        constant ``fp`` array would silently return that constant for every
+        rank, fabricating a single magnitude for every prediction (so a
+        degenerate single-label corpus surfaced as e.g. ``calibrated=7.0%``
+        for an entire dashboard regardless of input rank). Returning None
+        instead lets honesty-aware consumers degrade gracefully — the same
+        contract a legacy pre-feature pickle already promised."""
         lq = self._label_quantiles
         try:
             if lq is None or len(lq) < 2:
                 return None
+            lq_arr = np.asarray(lq, dtype=np.float64)
+            if float(lq_arr.max()) <= float(lq_arr.min()):
+                return None
             pct = self._raw_to_percentile(raw)
             if pct is None:
                 return None
-            pcts = np.linspace(0.0, 100.0, len(lq))
-            return round(float(np.interp(float(pct), pcts, lq)), 4)
+            pcts = np.linspace(0.0, 100.0, len(lq_arr))
+            return round(float(np.interp(float(pct), pcts, lq_arr)), 4)
         except Exception:
             return None
 
