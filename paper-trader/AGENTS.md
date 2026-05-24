@@ -6,6 +6,284 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 ML+backtest HYBRID pass #31 (Agent 2) — `backfill_intraperiod` unblocks stop_out + MFE verdicts against the historical 8.7k corpus
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Re-read `paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py` (`_ml_decide`, `_buy`/`_sell`,
+`_enforce_risk_exits`, `_compute_decision_outcomes`,
+`_fwd_intraperiod_extremes`, `_execute_decision`,
+`_load_local_articles`), and `run_continuous_backtests.py` (all skill
+ledgers + the cycle loop) in full. Cross-checked the candidates a
+skeptical first pass surfaces:
+
+* `_buy` blends `avg_cost` on accumulation, `_sell` doesn't recompute
+  it — verified the `del` on `qty ≤ 1e-6` path means a SELL-to-zero
+  followed by a fresh BUY always takes the `else` branch (new
+  position), so no cost-basis corruption is reachable.
+* `_inject_and_train` for/else loop with `break` inside try — verified
+  the early-success `break` correctly skips the `else` and the
+  documented `_LOCK_RETRY_SLEEPS=(3.0, 8.0, 15.0)` gives 4 attempts
+  (one initial + 3 retries) with proper count reset on rollback.
+* `_compute_decision_outcomes` walk-back-collision guard
+  (`end_res <= sim_res`) — strictly stronger than the prior collision
+  check, both 5d and intraperiod paths protected.
+
+Advisor agreed: pass #30 (also Agent 2, 2h earlier) committed
+`bugs_fixed=0` honestly for the same reasons; the comments in this file
+are armor citing the specific commits each defensive guard fixed.
+Declined to fabricate a fix. 174 focused decision_scorer + backtest +
+scorer-honesty + scorer-calibrated tests pass clean (148.95s).
+
+### Phase 2 — Feature: `paper_trader/ml/backfill_intraperiod` — populate intraperiod fields in the historical corpus
+
+**The gap.** Pass #30 wired `_append_stop_out_skill_log` and
+`_append_mfe_skill_log` into the cycle loop, but `stop_out_audit` /
+`mfe_conversion` consume `forward_intraperiod_min_5d` /
+`forward_intraperiod_max_5d` — a 2026-05-23 feature that the historical
+8753-row `decision_outcomes.jsonl` corpus does NOT carry (verified:
+`grep -c forward_intraperiod_min_5d data/decision_outcomes.jsonl → 0`).
+Both ledgers structurally report INSUFFICIENT_DATA / `stop_dark=True` /
+`tp_dark=True` on every cycle until enough post-feature rows
+accumulate in the rolling 5000-row trainer tail — at the documented
+<1 cycle/day cadence that's months, AND the loop is currently DEAD
+(see Phase 3 finding #1, no `run_continuous_backtests.py` process,
+skill ledgers stale since 2026-05-22).
+
+**The fix.** New `paper_trader.ml.backfill_intraperiod` reads the
+existing `data/backtest_cache/prices_*.json` per-window price caches
+(no yfinance, no DB, no network — pure offline) and replicates
+`_fwd_intraperiod_extremes` semantics exactly: walk-back resolution
+matching `PriceCache.price_on` (7-day cap), collision guard matching
+`resolved_close_date`, trading-day anchor matching
+`_build_trading_days`'s SPY-or-densest-series fallback. Computes
+`(min_pct, max_pct)` for every eligible BUY/SELL row missing the
+fields. Additive only: a row already carrying finite intraperiod
+values is NEVER overwritten.
+
+**Atomicity.** Rewrite mirrors the `decision_outcomes.jsonl` trim
+idiom from `run_continuous_backtests.py` exactly: write
+`.backfill_tmp`, `Path.replace`. Before rewrite the input file's
+mtime + size are re-checked; if either changed during the read→write
+window the backfill ABORTS with `status='aborted_concurrent_write'`
+and the file is left untouched — defensive against a re-awoken
+continuous loop appending rows mid-backfill.
+
+**Test coverage (32 new tests, all green in 0.59s):**
+* Walk-back semantics — exact hit, fallback within 7 days, beyond
+  7 days returns None, empty series.
+* `compute_intraperiod_extremes` — monotone-up series produces
+  (+1.0, +5.0)%; V-shape (100→90→80→110→130→120) produces
+  (-20.0, +30.0)% on EXACT pytest.approx values; collision returns
+  None; partial-coverage (k=1,3,5 only) still works.
+* `load_price_caches` — unions multiple files, ignores `_meta`, skips
+  corrupt files, returns empty on missing dir.
+* `build_trading_days` — densest-series fallback when SPY absent,
+  empty when no prices.
+* `analyze` + `apply_backfill` — verdict transitions
+  (NOTHING_TO_BACKFILL / READY_TO_BACKFILL / NO_PRICE_CACHE /
+  BACKFILLED / ABORTED_CONCURRENT_WRITE), no-overwrite invariant
+  pinned by sentinel values that differ from computed truth,
+  HOLD passthrough, no-write-when-nothing-eligible (mtime stable),
+  unparseable-line passthrough, atomic — no tmp file left behind,
+  every existing field preserved verbatim.
+* `_is_finite` — rejects bool/None/NaN/inf, accepts numeric strings.
+
+**Dry-run against the live corpus:** 2269 / 8753 rows backfillable
+(26% — the 5 existing cache windows cover 2002-2005 and 2020-2025),
+0 walk-back collisions, 6484 outside the cached date range.
+
+**Applied to the live corpus** (data/ is gitignored — operational
+delivery, no commit needed). After backfill:
+
+| Analyzer | Verdict pre-backfill | Verdict post-backfill |
+|----------|----------------------|------------------------|
+| `stop_out_audit` | `INSUFFICIENT_DATA` (0/8753) | **`STOP_HELPS`**  `stop_benefit_pct=+0.68pp`, n_with_intra=1913 |
+| `mfe_conversion` | `INSUFFICIENT_DATA` (0/8753) | **`TP_NEUTRAL`**  `tp_benefit_pct=-0.23pp`, mean_conversion_ratio=-0.45 |
+
+The -8% stop measurably improves aggregate realized return by
++0.68pp on 1913 BUYs — a real economic finding that was structurally
+unanswerable for as long as the corpus had 0 intraperiod coverage.
+The +15% take-profit band lands in the noise band (TP_NEUTRAL,
+within ±0.30pp BENEFIT_MARGIN), with `mean_conversion_ratio=-0.45`
+suggesting the +15% target is too aggressive (the average BUY's 5d
+endpoint reverts FROM the intraperiod peak rather than capturing it).
+
+Source files touched: `paper_trader/ml/backfill_intraperiod.py`
+(+698 lines), `tests/test_backfill_intraperiod.py` (+550 lines, 32
+tests). Commit `4321f4b`. The next cycle of a re-awakened continuous
+loop picks up the backfilled corpus automatically — no consumer
+change required (`stop_out_audit` / `mfe_conversion` /
+`_append_stop_out_skill_log` / `_append_mfe_skill_log` all read the
+same `decision_outcomes.jsonl`).
+
+### Phase 3 — Quant validation findings (user_findings = 5)
+
+1. **Continuous loop is DEAD.** No `run_continuous_backtests.py`
+   process is running. The 8 per-cycle skill ledgers wired across
+   recent passes (scorer / baseline / llm_annotation /
+   calibrated_reliability / conviction_calibration / stop_out / mfe
+   / gate_arm) each carry exactly ONE row, all timestamped
+   2026-05-22T06:24 UTC (~2 days stale). `backtest_runs` table's
+   most recent `status='complete'` is the same timestamp; no
+   `status='running'` rows (clean state, no orphans). Until the
+   loop restarts, every skill-trend signal an unattended quant relies
+   on is frozen — including the four I and pass #30 wired in
+   the past two days. The `pt-systemd-vs-manual-restart-spam` memory
+   notes the trader is a manual process and the unit is disabled,
+   so this is a user-owned restart, not an action this agent should
+   take.
+
+2. **Strong deployed scorer skill — corroborates pass #30 finding #1
+   AND contradicts the stale SCORER_SKILL_LOG row.** Measured
+   directly on the live `data/decision_outcomes.jsonl` tail (1000
+   most-recent BUY rows, deployed pickle `n_train=4987`):
+
+   | Metric | Value |
+   |--------|-------|
+   | BUY OOS rank-IC | **+0.4477** (p ≈ 2×10⁻⁵⁰) |
+   | Decile 1 realized | -10.15% |
+   | Decile 10 realized | +12.27% |
+   | Top-bottom spread | **~22pp** |
+   | Pred range | -30.20 to +50.00 (std 6.41) |
+   | Realized range | -48.28 to +39.73 (std 11.99) |
+
+   The single SCORER_SKILL_LOG row (cycle 1, 2026-05-22) reports
+   `oos_ic=0.02`. That row was written by the prior `n_train=3987`
+   pickle. The current `n_train=4987` pickle is materially better.
+   Pass #30 already noted this gap; the 2-days-stale ledger has
+   not closed it. Any trend reading off the on-disk ledger
+   massively understates current skill — `scorer_learning_curve`
+   should be re-run on the current pickle and the verdict
+   reconciled.
+
+3. **`stop_out_audit` flips to `STOP_HELPS` once intraperiod data
+   exists.** Already documented in Phase 2 above. The inherited
+   `backtest._buy` `stop_loss = price * 0.92` band measurably saves
+   realized return — +0.68pp aggregate on 1913 backfilled BUYs.
+   This is the FIRST direct economic verdict on the documented stop;
+   for as long as the corpus had 0/8753 intraperiod coverage every
+   cycle of pass #30's `_append_stop_out_skill_log` would have
+   persisted `INSUFFICIENT_DATA` / `stop_dark=True`.
+
+4. **`mfe_conversion` lands `TP_NEUTRAL` with `mean_conversion_ratio
+   = -0.45`.** The +15% `take_profit` band the engine writes onto
+   every BUY isn't measurably better than letting trades ride (within
+   the ±0.30pp noise band). The negative conversion ratio is the
+   quantitatively decisive signal: on average the 5d endpoint
+   *reverts FROM* the intraperiod peak rather than capturing it,
+   suggesting either (a) +15% is too aggressive a target for the
+   engine's typical hold profile, or (b) the +15% target rarely
+   actually fires before mean-reversion drags the close back down.
+   A read-only sizing-rule review candidate (this is research, not
+   a "fix this" finding).
+
+5. **Live trader's NO_DECISION rate is 60% over the past 24h** (228
+   of 380 cycles past 24h returned no decision, only 8 / 2.1%
+   actually filled). Matches the documented
+   `pt-no-decision-host-saturation` failure mode. Out of scope for
+   this ML+backtest pass (Agent 1's territory) but worth flagging
+   because it directly affects the rate at which new
+   `decision_outcomes.jsonl` rows accumulate — and therefore the
+   rate at which the per-cycle skill ledgers refresh. A trader
+   refreshing ledgers daily would not see new data even when the
+   continuous loop wakes up, because the live trader is itself
+   silent 60% of the time.
+
+### Phase 4 — Docs
+
+This entry. The `paper_trader.ml` package now lists `backfill_intraperiod`
+under the `python3 -m paper_trader.ml` index (the `__main__` launcher
+discovers it automatically via the existing `ast`-parse-docstring
+mechanism — no launcher change needed).
+
+**How the ML decision scorer works** (compact reference for new
+agents — full detail in CLAUDE.md §6 and decision_scorer.py
+docstrings):
+
+* `DecisionScorer` (paper_trader/ml/decision_scorer.py) — sklearn
+  `MLPRegressor(32, 16)` with L2 `alpha=0.01` + early stopping
+  (anti-overfit config, see MLP_CONFIG comment). 17 features:
+  10 base (8 quant + news_urgency + news_article_count) + 7-way
+  sector one-hot. Trained on `data/decision_outcomes.jsonl` rows
+  (the BUY/SELL decisions every backtest run records, joined with
+  their actual 5-trading-day forward returns). Pickled atomically
+  to `data/ml/decision_scorer.pkl` with 101-point pred + label
+  quantile tables for `predict_calibrated` / `predict_percentile`.
+  Output clamped to ±50pp.
+* The conviction gate (`_ml_decide` in `paper_trader/backtest.py`)
+  acts on the scorer's prediction ONLY when `n_train >= 500`
+  (invariant #5) AND the prediction is in-distribution
+  (`off_distribution=False`). When active, it modulates the trade's
+  conviction (never blocks): `< -10% → ×0.6`, `< 0% → ×0.85`,
+  `> 5% → ×1.15`, `> 10% → ×1.3` (capped at 0.95).
+* Per-cycle retrain — `run_continuous_backtests.main` runs
+  `_train_decision_scorer` on the last `MAX_OUTCOMES_FOR_TRAINING`
+  (5000) outcomes after every cycle, then resets the singleton
+  under `_DECISION_SCORER_LOCK` so the next cycle picks up the
+  fresh pickle.
+
+**How to run backtests manually:**
+
+```bash
+# One-shot batch (10 parallel year-long sims, write to backtest.db):
+cd /home/zeph/trading-intelligence/paper-trader
+python3 run_backtests.py
+
+# Continuous loop (the production loop — RUNS_PER_CYCLE=1 throttled,
+# COOLDOWN_SECONDS=600, random window per cycle):
+python3 run_continuous_backtests.py
+```
+
+The continuous loop is currently MANUAL (the systemd unit is
+disabled per `pt-systemd-vs-manual-restart-spam`). Restarting it is
+a user decision, not an agent action — see Phase 3 finding #1.
+
+**How to interpret backtest results** (the dashboard at :8090
+renders the full panel set; for CLI / shell triage):
+
+```bash
+# Backtest grid + filter for recent successes:
+sqlite3 backtest.db "SELECT run_id, total_return_pct, vs_spy_pct, status,
+  completed_at FROM backtest_runs WHERE status='complete'
+  ORDER BY run_id DESC LIMIT 20;"
+
+# Per-cycle skill ledgers (each is one JSONL row per cycle):
+for f in data/scorer_skill_log.jsonl data/baseline_skill_log.jsonl \
+         data/llm_annotation_skill_log.jsonl data/stop_out_skill_log.jsonl \
+         data/mfe_skill_log.jsonl data/conviction_calibration_log.jsonl \
+         data/calibrated_reliability_log.jsonl data/gate_arm_skill_log.jsonl; do
+  echo "--- $f ---"
+  tail -1 "$f" 2>/dev/null | jq '{cycle, timestamp, verdict, gate_active}'
+done
+
+# The 22+ read-only analyzers (every one supports --json for piping):
+python3 -m paper_trader.ml                          # index
+python3 -m paper_trader.ml stop_out_audit --json
+python3 -m paper_trader.ml mfe_conversion --json
+python3 -m paper_trader.ml baseline_compare         # MLP vs trivial baselines
+python3 -m paper_trader.ml calibration --oos        # OOS calibration deciles
+python3 -m paper_trader.ml gate_audit               # gate arms' realized P&L
+python3 -m paper_trader.ml decision_scorer --feature-importance
+python3 -m paper_trader.ml backfill_intraperiod --dry-run
+```
+
+**Test commands for the ML/backtest domain:**
+
+```bash
+# All ML / backtest / scorer tests (~2-5 min depending on system load):
+python3 -m pytest tests/ -v -k "ml or backtest or scorer" --tb=short
+
+# Focused on this pass's new module:
+python3 -m pytest tests/test_backfill_intraperiod.py -v
+
+# Full suite (~25 min under load — see pt-test-suite-timing memory):
+python3 -m pytest tests/ -v
+```
+
+---
+
 ## 2026-05-24 core HYBRID pass #4 (Agent 1) — `runner.alarm_latch_headline` helper
 
 ### Phase 1 — Debug: bugs_fixed = 0
