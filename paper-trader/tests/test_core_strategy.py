@@ -374,6 +374,25 @@ class TestRSILive:
         assert rsi is not None
         assert 0.0 <= rsi <= 100.0
 
+    def test_flat_series_returns_neutral_50(self):
+        # Perfectly flat series → zero variance, avg_g == avg_l == 0. RSI is
+        # textbook-undefined; the documented contract (mirrors backtest._rsi
+        # after pass #21 / commit 9ee81b7) is to return the neutral midpoint
+        # 50.0, NOT the previous spurious 100.0 ("severely overbought" on a
+        # name that literally hasn't moved). The bug fed a -1.5 conviction
+        # nudge into the live ML advisor for any flat watchlist ticker.
+        flat = [100.0] * 30
+        assert strategy._rsi_live(flat, period=14) == 50.0
+
+    def test_strict_all_down_returns_zero(self):
+        # Strict monotone DECREASING series — every diff is a loss, avg_g == 0
+        # but avg_l > 0. Classic RSI formula → 0.0. Distinct from the flat
+        # case: the avg_l > 0 branch is exercised here, not the avg_l == 0
+        # early-return.
+        closes = [float(30 - i) for i in range(30)]  # 30, 29, 28, ..., 1
+        rsi = strategy._rsi_live(closes, period=14)
+        assert rsi == 0.0
+
 
 class TestEMALive:
     def test_returns_empty_for_short(self):
