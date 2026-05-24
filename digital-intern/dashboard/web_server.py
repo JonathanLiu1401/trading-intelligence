@@ -971,6 +971,106 @@ def _decision_paralysis_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _idle_opportunity_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/idle-opportunity` (high-score watchlist
+    arrivals during the *current* NO_DECISION drought) as compact chat-
+    context lines.
+
+    The chat already carries `_decision_paralysis_chat_lines` (the loop is
+    alive but nothing happens) and `_opportunity_cost_chat_lines` (the
+    backward forward-return read on past sit-outs). Neither answers the
+    *right-now* version: while the bot is *currently* dark, are
+    high-score watchlist signals arriving on names it could have acted on?
+    A decision-storm with the SPY tape running is structurally different
+    from a decision-storm with the tape quiet — and only `idle-opportunity`
+    measures that difference live. The endpoint exists; this wrapper closes
+    the chat-prompt gap (the documented `_*_chat_lines` SSOT/test pattern).
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` string
+    is the verbatim chat headline — no re-derived verdict. The detail line
+    restates the builder's *own* fields (drought.duration_hours,
+    missed_top_ticker, missed_top_score) — never a recomputation (the
+    ``_event_readiness_chat_lines`` / ``_decision_paralysis_chat_lines``
+    precedent). Held-name regret is called out with a `(HELD)` suffix on
+    the ticker, mirroring the trader-side ``opportunities[].held`` field
+    so the chat can answer "the bot was dark on MY OWN position's news"
+    without re-deriving holdings.
+
+    Pure / total — exactly the ``_decision_paralysis_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never an exception into the chat
+      handler)
+    - non-actionable verdicts (``NO_DATA`` / ``NO_DROUGHT`` / ``OK`` with
+      zero missed signals) → ``[]``: a healthy decision loop or an honest
+      silence is silence in the chat (the
+      ``_event_readiness_chat_lines`` / ``_decision_paralysis_chat_lines``
+      silence precedent — never chat filler when nothing is wrong)
+    - actionable (``OK`` with ``n_opportunities > 0``) → builder's verbatim
+      ``headline`` (only when a usable string) + one detail line restating
+      drought duration, NO_DECISION count, top missed ticker + score from
+      the builder's OWN fields; a missing field degrades to a "?"
+      placeholder rather than raises (the
+      ``_paper_trader_position_lines`` precedent)
+    """
+    if not isinstance(rep, dict):
+        return []
+    state = rep.get("state")
+    # Silence on healthy / drought-clear / no-regret states.
+    if state in (None, "NO_DATA", "NO_DROUGHT", "ERROR"):
+        return []
+    n_opps = rep.get("n_opportunities")
+    # Reject bool explicitly (Python's True passes isinstance(_, int)) and
+    # non-integer types — the field is a count, not a flag.
+    if (not isinstance(n_opps, int) or isinstance(n_opps, bool)
+            or n_opps <= 0):
+        # OK with zero missed signals — the "silence is honest" branch
+        # the builder's own headline already labels. Chat carries it as
+        # silence to match.
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)                  # verbatim SSOT — invariant #10
+
+    def _num(v):
+        return (v if isinstance(v, (int, float)) and not isinstance(v, bool)
+                else None)
+
+    drought = rep.get("drought") if isinstance(rep.get("drought"), dict) else {}
+    dur = _num(drought.get("duration_hours"))
+    nd = _num(drought.get("n_no_decision"))
+    top_tk = rep.get("missed_top_ticker")
+    top_score = _num(rep.get("missed_top_score"))
+
+    # If the top opportunity flags ``held=True`` (the bot was dark on a
+    # name we OWN), surface that — the chat-side version of the operator's
+    # "the bot was blind on MY position" question. Read from the row
+    # itself, not a re-derived predicate.
+    held_suffix = ""
+    opps = rep.get("opportunities")
+    if isinstance(opps, list) and opps and isinstance(opps[0], dict):
+        if opps[0].get("held") is True:
+            held_suffix = " (HELD)"
+
+    detail_parts: list[str] = []
+    if dur is not None:
+        detail_parts.append(f"drought {dur:.1f}h")
+    if nd is not None:
+        detail_parts.append(f"{int(nd)} NO_DECISION")
+    if isinstance(top_tk, str) and top_tk.strip():
+        if top_score is not None:
+            detail_parts.append(
+                f"loudest {top_tk}{held_suffix} @ {top_score:.1f}")
+        else:
+            detail_parts.append(f"loudest {top_tk}{held_suffix}")
+
+    if detail_parts:
+        lines.append("  " + " | ".join(detail_parts))
+
+    return lines
+
+
 def _persona_book_fit_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/persona-book-fit` (does the live book look
     like a backtest persona that actually carries alpha, or one rated DRAG?)
@@ -6071,6 +6171,32 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: opportunity-cost fetch failed: %s", e)
 
+        # Idle-opportunity — the RIGHT-NOW companion to opportunity-cost.
+        # opportunity-cost grades PAST sit-outs by forward return (hindsight);
+        # idle-opportunity grades the CURRENT drought by what's arriving on
+        # the watchlist while the bot is dark. A decision-storm with the
+        # tape running is structurally different from a decision-storm with
+        # the tape quiet, and that difference is only visible live —
+        # opportunity-cost can't see it for hours yet. Composed verbatim by
+        # the pure _idle_opportunity_chat_lines helper (unit-tested; SSOT —
+        # the builder's own `headline` is the chat headline, no re-derived
+        # verdict). Guarded 3s read; NO_DATA / NO_DROUGHT / OK-with-zero
+        # silently omit the block (the _decision_paralysis_chat_lines
+        # silence precedent — never chat filler when the loop is filling
+        # or nothing was actually missed).
+        idle_opportunity_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/idle-opportunity",
+                    timeout=3) as resp:
+                _io = json.loads(resp.read().decode("utf-8"))
+            idle_opportunity_block = "\n".join(
+                _idle_opportunity_chat_lines(_io))
+        except Exception as e:
+            _logger().warning(
+                "chat: idle-opportunity fetch failed: %s", e)
+
         # Persona-book-fit — the structural "does the live book mirror a
         # backtest persona rated DRAG by the leaderboard?" question. Every
         # other block analyses position-by-position fitness; none surface
@@ -6726,6 +6852,7 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — STANDING INTENTS (the FORWARD slice of the reasoning surface — conditional intents the bot itself stated in recent decisions' reasoning ('wait for cash session', 'rotating into LITE/LNOK', 'premature to dump') that are still STANDING within the freshness window without follow-up action. Every other reasoning block looks BACKWARD (vapor on FILLED, thesis-drift on opens, exit-intent on closed sells); none answers 'what did the bot SAY it would do next, that it has not yet done?'. Surfaced ONLY when STANDING_INTENTS / STALE_INTENTS, never filler when NO_INTENTS / NO_DATA. Headline AND each surfaced intent text pass verbatim from the trader endpoint — restate, never re-derive; the bot's own words, never a chat-side paraphrase. ``[stale]`` tag flags plans that aged past the freshness window without action):\n{standing_intents_block}\n\n" if standing_intents_block else "")
             + (f"PAPER TRADER — INTENT FOLLOWTHROUGH (the observational companion to STANDING INTENTS — of the actionable intents the bot stated, did it actually execute them? A bot that emits crisp 'wait for X, then buy Y' statements every cycle but never executes Y has perfect specificity on decision-vapor and zero followthrough; only this block catches the say-do gap. Surfaced ONLY when DRIFTING / ABANDONED, never filler when DISCIPLINED / NO_DATA / NO_RESOLVED. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{intent_followthrough_block}\n\n" if intent_followthrough_block else "")
             + (f"PAPER TRADER — OPPORTUNITY COST (the hindsight read on past HOLD-CASH / NO_DECISION sit-outs — when the bot sat in cash, did the top-news watchlist ticker run without it, or did sitting in cash dodge a drawdown? The chat already carries cash_pct snapshots and idle-opportunity (current drought) but neither answers 'did past cash discipline COST or SAVE alpha?'. Surfaced ONLY when MISSED_ALPHA / DEFENSIVE_WIN, never filler when NEUTRAL / NO_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{opportunity_cost_block}\n\n" if opportunity_cost_block else "")
+            + (f"PAPER TRADER — IDLE OPPORTUNITY (the RIGHT-NOW companion to OPPORTUNITY COST — opportunity-cost grades PAST sit-outs by forward return (hindsight, takes hours to mature); idle-opportunity grades the CURRENT NO_DECISION drought by what HIGH-SCORE watchlist signals are arriving while the bot is dark. A decision-storm with the tape running is structurally different from a decision-storm with the tape quiet, and that difference is invisible to every other block until forward returns mature. A held-name (HELD) tag flags 'the bot was blind on news for a position WE OWN'. Surfaced ONLY when a missed signal exists (NO_DATA / NO_DROUGHT / OK-with-zero collapse to silence — never filler when the loop is filling or nothing is actually being missed). Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{idle_opportunity_block}\n\n" if idle_opportunity_block else "")
             + (f"PAPER TRADER — NO_DECISION CAUSE ATTRIBUTION (when the live trader is silent for a stretch, the operator's first follow-up to decision-paralysis is 'WHY is it empty?'. The trader endpoint buckets the recent NO_DECISION rows into host_saturated / cli_nonzero_rc / parse_failed / claude_timeout / claude_empty / blocked / unknown and emits a verbatim recommendation — host saturation requires reducing parallel Opus jobs, NOT a runner restart; a parse_failed cluster is a prompt-shape bug, not a host issue. Surfaced ONLY when DOMINANT (one bucket exceeds the threshold), never filler when NORMAL / MIXED (diffuse causes do not yield a specific recommendation). Headline carries verbatim from the trader endpoint AND already contains the recommendation — restate, never re-derive):\n{no_decision_reasons_block}\n\n" if no_decision_reasons_block else "")
             + (f"PAPER TRADER — ROUND-TRIP POSTMORTEM (per closed exit, the post-exit price drift verdict CORRECT / PREMATURE / MISSED_RUNNER / WHIPSAW / NEUTRAL — was the sell well-timed relative to the NEXT drift? Every existing realized-P&L surface — winner_autopsy, loser_autopsy, streak, scorecard — reduces a closed trip to a P&L number; only this block asks 'did the price keep running against the bot after the sell?'. A trade closed at -0.1% looks fine on track-record yet reads catastrophic if the name rallied +5% the hour after. Surfaced ONLY when ≥1 PREMATURE / MISSED_RUNNER / WHIPSAW trip exists, never filler when all CORRECT / NEUTRAL. Top-level headline AND the surfaced worst trip's own per-row headline both carry verbatim from the trader endpoint — restate, never re-derive):\n{round_trip_postmortem_block}\n\n" if round_trip_postmortem_block else "")
             + (f"PAPER TRADER — CASH DRAG (SPY-benchmarked $ cost of sitting in cash per rolling window — 'while you sat at avg cash $X over the last Yh, SPY ran +Z% — that's $W of beta you forfeited by being out'. Complements cash_pct snapshots, cash_redeployment latency, and opportunity_cost (signal-specific): this is the BENCHMARKED dollar-cost answer to 'is sitting in cash actually costing me?'. Surfaced ONLY when COSTLY_CASH, never filler when NEUTRAL / HELPFUL_CASH / INSUFFICIENT / NO_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{cash_drag_block}\n\n" if cash_drag_block else "")
