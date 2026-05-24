@@ -1196,14 +1196,65 @@ class ArticleStore:
         try:
             # Lazy import to avoid circular imports at module load
             from ml.inference import score_articles
+            # Single source of truth for the recap-template / quote-widget
+            # fingerprint set. Live evidence (2026-05-24): "NVIDIA earnings:
+            # A quick glance at key metrics - MSN" (matches _RT_QUICK_GLANCE)
+            # reached urgency=2 with score_source='ml' and ml_score=10.0 —
+            # the recap-template pre-floor in urgency_scorer.score_batch
+            # catches this title on the Sonnet path, but ML-confident urgent
+            # rows (needs_llm=False, sc.urgency >= 8) bypass that gate and
+            # set urgency=1 directly here. Mirror the same pre-floor on the
+            # ML path so the analyst's standalone urgent push channel and
+            # the urgent-queue health metrics aren't polluted by the same
+            # class of pseudo-articles the LLM path already suppresses.
+            # Lazy import: watchers.alert_agent → ml.features → no cycle
+            # back into storage. Floor value 0.01 + score_source='ml'
+            # mirrors urgency_scorer's pre-floor semantics (it writes
+            # ai_score=0.01 score_source='llm' on the LLM path — the model
+            # equivalent is ml_score=0.01 score_source='ml').
+            from watchers.alert_agent import (
+                _looks_like_quote_widget,
+                _looks_like_recap_template,
+            )
             while True:
                 batch = self.get_unscored(limit=batch_size, min_kw=0.0)
                 if not batch:
                     break
-                scores = score_articles(batch)
+
+                # Pre-floor recap-template / quote-widget pseudo-articles
+                # BEFORE inference. They never warrant urgency=1 regardless
+                # of what the urgency head predicts, and skipping inference
+                # also saves GPU cycles on rows that would just be floored.
+                pre_floor: list[tuple[str, float, int]] = []
+                real_batch: list = []
+                for art in batch:
+                    aid = art.get("_id")
+                    if not aid:
+                        continue
+                    if _looks_like_quote_widget(art):
+                        pre_floor.append((aid, 0.01, 0))
+                        continue
+                    hit, _name = _looks_like_recap_template(art)
+                    if hit:
+                        pre_floor.append((aid, 0.01, 0))
+                        continue
+                    real_batch.append(art)
+                if pre_floor:
+                    self.update_ml_scores_batch(pre_floor)
+                    total += len(pre_floor)
+
+                if not real_batch:
+                    # The whole batch was pseudo-articles; the rows are now
+                    # ml_score=0.01 so get_unscored will not re-fetch them.
+                    # Loop continues to drain the rest of the backlog; if the
+                    # next get_unscored is empty the outer ``if not batch``
+                    # breaks. Nothing to score this iteration.
+                    continue
+
+                scores = score_articles(real_batch)
                 updates = []
                 ts_updates = []
-                for art, sc in zip(batch, scores):
+                for art, sc in zip(real_batch, scores):
                     aid = art.get("_id")
                     if not aid:
                         continue

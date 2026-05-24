@@ -154,3 +154,104 @@ def test_score_pending_noop_when_model_unfitted(store, monkeypatch):
     # rel_std==99 sentinel → time_sensitivity must NOT be persisted (not a real
     # prediction).
     assert ts is None
+
+
+def test_score_pending_prefloor_recap_and_quote_widget(store, monkeypatch):
+    """Recap-template and quote-widget pseudo-articles MUST NOT reach urgency=1
+    via the ML path, even when the urgency head would have scored them >= 8.
+
+    Live evidence (2026-05-24): ``NVIDIA earnings: A quick glance at key
+    metrics - MSN`` (matches the ``_RT_QUICK_GLANCE`` recap-template regex)
+    reached urgency=2 with score_source='ml' and ml_score=10.0 — the LLM path
+    already pre-floors this class in ``urgency_scorer.score_batch``, but a
+    model-confident urgent (``needs_llm=False``, ``sc.urgency >= 8``) bypassed
+    the gate and wrote urgency=1 directly. This regression guard pins the
+    matching pre-floor on the ML path: a recap-template title that the model
+    would have called urgent must be floored to ``ml_score=0.01 / urgency=0``
+    without ever invoking the urgency head's score.
+
+    score_articles is monkeypatched to return ``urgency=10`` for every row in
+    the batch — without the pre-floor, the recap/quote-widget rows would write
+    ``ml_score=10.0 / urgency=1`` and the assertion would fail. WITH the pre-
+    floor, those rows are short-circuited before the stub runs, so they are
+    never present in the ``batch`` ``score_articles`` sees.
+    """
+    # Two genuine recap-template hits (canonical _RT_QUICK_GLANCE fingerprint
+    # + canonical _RT_WHY_DID fingerprint), one quote-widget (canonical
+    # _QW_PCT_PAREN fingerprint), and one real urgent control article.
+    _insert(store, id="recap_qg", url="https://reuters.com/qg",
+            title="NVIDIA Earnings: A Quick Glance at Key Metrics",
+            source="rss")
+    _insert(store, id="recap_wd", url="https://reuters.com/wd",
+            title="Why Did Micron Stock Drop Today?",
+            source="rss")
+    _insert(store, id="quote_widget", url="https://yahoo.com/q",
+            title="NVDA NVIDIA Corporation 227.13 -8.61 (-3.65%)",
+            source="rss")
+    _insert(store, id="real_urgent", url="https://reuters.com/r",
+            title="Fed cuts rates 50bps in emergency move",
+            source="rss")
+
+    seen_ids: list[str] = []
+
+    def _fake_score_articles(batch):
+        # The pre-floor must drop the pseudo-article rows BEFORE inference.
+        # If a recap/quote-widget row shows up here, the gate is broken.
+        for art in batch:
+            seen_ids.append(art["_id"])
+            assert art["_id"] not in {"recap_qg", "recap_wd", "quote_widget"}, (
+                f"recap/quote-widget row {art['_id']!r} reached score_articles "
+                f"— pre-floor gate is broken"
+            )
+        # Every surviving row gets a confident-urgent label so we can prove the
+        # gate is what stopped the pseudo-articles, not the model's own logic.
+        return [
+            ArticleScore(relevance=9.0, urgency=10.0, rel_std=0.1,
+                         urg_std=0.1, needs_llm=False,
+                         confident_noise=False, time_sensitivity=0.9)
+            for _ in batch
+        ]
+
+    import ml.inference as _inf
+    monkeypatch.setattr(_inf, "score_articles", _fake_score_articles)
+
+    n = store.score_pending(batch_size=500)
+
+    # Three pre-floored + one real model-scored = 4 writes total.
+    assert n == 4
+
+    # The pseudo-articles were short-circuited: ml_score=0.01, urgency stays 0,
+    # score_source='ml'. None of them should appear in ``seen_ids`` (the gate
+    # ran before inference); the stub's hard assertion above proves that, and
+    # the row values below pin the floor write itself.
+    for aid in ("recap_qg", "recap_wd", "quote_widget"):
+        ai, ml, src, urg, _ = _row(store, aid)
+        assert ai == 0, (
+            f"{aid}: ai_score must remain 0 — invariant 'model never writes "
+            f"ai_score' is what protects the trainer's label pool"
+        )
+        assert ml == pytest.approx(0.01), (
+            f"{aid}: pre-floor must write ml_score=0.01 (noise floor — "
+            f"matches urgency_scorer.score_batch's pre-floor semantics)"
+        )
+        assert src == "ml", (
+            f"{aid}: pre-floor must tag score_source='ml' (the analyst can "
+            f"see ml-only rows in urgency_label_split — this row is one)"
+        )
+        assert urg == 0, (
+            f"{aid}: pre-floor MUST keep urgency=0 — this is the bug being "
+            f"fixed: a 10.0 urgency head prediction on a recap-template title "
+            f"would otherwise bump urgency=1 → reach alert_worker → analyst "
+            f"sees a 🚨 BREAKING on retrospective recap content"
+        )
+
+    # The real urgent article goes through the full ML path unchanged: model
+    # ml_score=10.0, urgency promoted to 1.
+    ai, ml, src, urg, _ = _row(store, "real_urgent")
+    assert ai == 0
+    assert ml == pytest.approx(10.0)
+    assert src == "ml"
+    assert urg == 1, (
+        "real urgent article must still bump urgency to 1 — the pre-floor "
+        "must be precise (only the recap/quote-widget class), never blanket"
+    )
