@@ -131,6 +131,25 @@ QUANT_TICKERS_LIVE = [
 
 FUTURES = ["ES=F", "NQ=F", "CL=F", "GC=F"]
 
+# Hard stop-loss / take-profit configuration (MACD-strategy 1.5:1 R:R).
+# Stocks: 2% SL / 3% TP. Leveraged ETFs: 4% SL / 6% TP (wider because
+# leveraged ETF intraday volatility is 2-3x the underlying — a 2% stop on
+# SOXL is the equivalent of ~0.7% on SOXX and would scalp out on noise).
+# Exit is documented in SYSTEM_PROMPT ("HARD EXITS" section) so Opus is
+# aware of the autonomy carve-out (invariant #12: change the prompt when
+# adding silent caps).
+_LEVERAGED_ETFS_SL = frozenset({
+    "TQQQ", "SOXL", "UPRO", "SPXL", "UDOW", "URTY", "TECL", "FNGU",
+    "LABU", "NAIL", "CURE", "DFEN", "HIBL", "MIDU", "TNA", "WANT",
+    "FAS", "FOTU", "PILL", "RETL", "DPST", "KORU", "UTSL",
+    "QLD", "SSO", "NVDU", "MSFU", "AMZU", "TSLL", "CONL", "BITU", "ETHU",
+    "SOXS", "TECS", "SPXU", "SQQQ", "SPXS", "FNGD",
+})
+_SL_PCT_STANDARD = 0.02
+_TP_PCT_STANDARD = 0.03
+_SL_PCT_LEVERAGED = 0.04
+_TP_PCT_LEVERAGED = 0.06
+
 SYSTEM_PROMPT = """You are managing a paper trading portfolio with $1000 starting capital.
 Your ONLY goal is maximum profit. You have complete freedom over position sizing,
 risk, leverage, and timing. There are NO enforced limits. You can:
@@ -158,6 +177,17 @@ THINK LIKE A HEDGE FUND MANAGER WHO WANTS ASYMMETRIC RETURNS.
 Small, safe trades will not outperform. Take calculated risks.
 High conviction = large size. Low conviction = stay cash.
 
+HARD EXITS (AUTOMATIC — CANNOT BE OVERRIDDEN): New stock positions you open
+are automatically sold when:
+- Price falls 2% below entry price (4% for leveraged ETFs) → stop-loss
+- Price rises 3% above entry price (6% for leveraged ETFs) → take-profit
+These exits execute BEFORE you receive the prompt each cycle (i.e. the snapshot
+you see already reflects them). If a position has disappeared from your
+portfolio since last cycle, it was hard-exited at SL or TP. Set entries with
+awareness that these limits enforce themselves — the resulting 1.5:1 risk-to-
+reward is the only mechanical exit discipline on the book; everything else
+remains your call.
+
 Respond with a SINGLE JSON object — no prose, no markdown fences. Schema:
 
 {
@@ -178,6 +208,13 @@ TECHNICAL SIGNAL INTERPRETATION (use alongside news, not in isolation):
   long opportunity if news/thesis supports it.
 - MACD signal crossovers confirm momentum: positive macd_signal with rising price is bullish
   confirmation; negative macd_signal with falling price is bearish confirmation.
+- MACD histogram zero-cross while below zero: when hist_cross_up=True AND macd_below_zero_cross=True
+  AND ema200_above=True, this is a HIGH-QUALITY entry signal — momentum is turning from oversold
+  while the long-term trend is intact. Weight this heavily for new entries (it is the literal
+  textbook 12/26/9 + EMA200-filter setup). The ⚡MACD_CROSS_NEG token in a quant line marks it.
+- ema200_above=True means price is above the 200-day EMA — confirms long-term uptrend; prefer
+  longs only when True. ema200_above=False = below EMA200 (no long-trend support; avoid new
+  longs unless news catalyst is exceptional).
 - Bollinger Band squeezes (bb_position near 0 after a tight range) often precede breakouts;
   bb_position approaching +1 or -1 means price is at the upper/lower Bollinger band (2 standard
   deviations from the 20-day mean) — stretched conditions and elevated reversal risk.
@@ -311,6 +348,10 @@ def get_quant_signals_live(tickers: list[str]) -> dict[str, dict]:
 
             # Expanded signals (lowercase keys per spec)
             macd_signal_val = None
+            macd_hist = None
+            macd_line_val = None
+            hist_cross_up = False
+            macd_below_zero_cross = False
             try:
                 if len(closes) >= 35:
                     e12 = _ema_live(closes, 12)
@@ -322,8 +363,40 @@ def get_quant_signals_live(tickers: list[str]) -> dict[str, dict]:
                             sig = _ema_live(macd_line, 9)
                             if sig:
                                 macd_signal_val = round(sig[-1], 2)
+                                # Align macd_line to the signal series length
+                                # (sig is an EMA(9) of macd_line, so it's
+                                # shorter). The last sig_len values of
+                                # macd_line are the ones with a matching sig.
+                                sig_len = len(sig)
+                                ml_aligned = macd_line[-sig_len:]
+                                macd_line_val = round(ml_aligned[-1], 4)
+                                macd_hist = round(ml_aligned[-1] - sig[-1], 4)
+                                if len(ml_aligned) >= 2 and len(sig) >= 2:
+                                    hist_prev = ml_aligned[-2] - sig[-2]
+                                    hist_curr = ml_aligned[-1] - sig[-1]
+                                    hist_cross_up = bool(
+                                        hist_prev < 0 and hist_curr > 0
+                                    )
+                                    macd_below_zero_cross = bool(
+                                        hist_cross_up and ml_aligned[-1] < 0
+                                    )
             except Exception:
                 macd_signal_val = None
+                macd_hist = None
+                macd_line_val = None
+                hist_cross_up = False
+                macd_below_zero_cross = False
+
+            # 200-day EMA filter — confirms long-term trend; prefer longs only
+            # when price is above EMA200 (classic MACD strategy filter).
+            ema200_above: bool | None = None
+            try:
+                if len(closes) >= 200:
+                    e200 = _ema_live(closes, 200)
+                    if e200:
+                        ema200_above = bool(closes[-1] > e200[-1])
+            except Exception:
+                ema200_above = None
 
             bb_position = None
             try:
@@ -371,6 +444,15 @@ def get_quant_signals_live(tickers: list[str]) -> dict[str, dict]:
                 "mom_5d": mom_5d,
                 "mom_20d": mom_20d,
                 "wk52_pos": wk52_pos,
+                # Enhanced MACD signals (12/26/9 + EMA200 filter) — high-quality
+                # entry signal when hist crosses up while below zero AND price
+                # sits above EMA200 (momentum turning from oversold inside an
+                # intact long-term uptrend).
+                "macd_hist": macd_hist,
+                "macd_line_val": macd_line_val,
+                "hist_cross_up": hist_cross_up,
+                "macd_below_zero_cross": macd_below_zero_cross,
+                "ema200_above": ema200_above,
             }
             _QUANT_CACHE[t] = (rec, _time.time())
             out[t] = rec
@@ -455,12 +537,25 @@ def _format_quant_signals(sigs: dict[str, dict]) -> str:
         return "?" if x is None else x
     def _pct(x):
         return "?" if x is None else f"{x}%"
+    def _ema200(x):
+        if x is True:
+            return "above"
+        if x is False:
+            return "below"
+        return "?"
+    def _cross_flag(q):
+        # Only fire the loud token when both the up-cross AND the below-zero
+        # condition hold — the classic "MACD turn from oversold" entry. Silent
+        # otherwise so a healthy book stays quiet (the _bb_label precedent).
+        return "  ⚡MACD_CROSS_NEG" if q.get("macd_below_zero_cross") else ""
     return "\n".join(
         f"  {tk}: rsi={_rsi_label(q.get('rsi'))}  macd={_v(q.get('MACD'))}/{_v(q.get('macd_signal'))}  "
         f"ma_cross={_v(q.get('MA_cross'))}  bb_position={_bb_label(q.get('bb_position'))}  "
         f"vol_ratio={_v(q.get('vol_ratio'))}  mom_5d={_pct(q.get('mom_5d'))}  "
         f"mom_20d={_pct(q.get('mom_20d'))}  "
-        f"wk52_pos={_v(q.get('wk52_pos'))}  52h={_pct(q.get('pct_from_52h'))}  52l={_pct(q.get('pct_from_52l'))}"
+        f"wk52_pos={_v(q.get('wk52_pos'))}  52h={_pct(q.get('pct_from_52h'))}  52l={_pct(q.get('pct_from_52l'))}  "
+        f"ema200={_ema200(q.get('ema200_above'))}  macd_hist={_v(q.get('macd_hist'))}"
+        f"{_cross_flag(q)}"
         for tk, q in sorted(sigs.items())
     )
 
@@ -1102,6 +1197,59 @@ QUANT (held positions — RSI + MACD direction):
 Return JSON only."""
 
 
+def _check_and_execute_hard_exits(store: "Store", snap: dict) -> list[str]:
+    """Execute mandatory SL/TP exits BEFORE Opus sees the prompt this cycle.
+
+    Surveys ``store.positions_needing_hard_exit()`` (open stock lots whose
+    last-marked current_price has breached the per-lot stop_loss_price /
+    take_profit_price set when the lot was opened). For each breached lot:
+    records a SELL at the current marked price, decrements the position via
+    ``upsert_position`` (negative qty closes the lot), and credits cash.
+    Updates ``snap['cash']`` in place so any caller that already has the
+    pre-exit snapshot in hand sees the post-exit cash for sizing logic; the
+    caller still re-snapshots when ``hard_exits`` is non-empty so positions
+    + total_value are refreshed too.
+
+    Returns the list of tickers that were force-sold this cycle (for the
+    Discord notification + the runner's auto_exits tag). Non-fatal by
+    construction — any failure logs and returns whatever exits succeeded
+    before the fault, so a single bad row never blocks the cycle's decision.
+    """
+    exits: list[str] = []
+    try:
+        positions = store.positions_needing_hard_exit()
+        for pos in positions:
+            ticker = pos["ticker"]
+            try:
+                qty = float(pos["qty"])
+                price = float(pos["current_price"])
+                sl = float(pos["stop_loss_price"])
+                tp = float(pos["take_profit_price"])
+            except (TypeError, ValueError) as e:
+                print(f"[strategy] hard-exit: non-numeric row for {ticker}: {e}")
+                continue
+            if qty <= 0 or price <= 0:
+                continue
+            is_sl = price <= sl
+            exit_type = "HARD_SL" if is_sl else "HARD_TP"
+            threshold = sl if is_sl else tp
+            reason = (f"{exit_type}: price {price:.2f} "
+                      f"{'<=' if is_sl else '>='} threshold {threshold:.2f}")
+            cash = float(snap.get("cash", 0) or 0.0)
+            total_value = float(snap.get("total_value", 0) or 0.0)
+            notional = price * qty
+            store.record_trade(ticker, "SELL", qty, price, reason)
+            store.upsert_position(ticker, "stock", -qty, price)
+            new_cash = cash + notional
+            store.update_portfolio(new_cash, total_value)
+            snap["cash"] = new_cash
+            exits.append(ticker)
+            print(f"[strategy] {reason}")
+    except Exception as e:
+        print(f"[strategy] hard-exit check failed (non-fatal): {e}")
+    return exits
+
+
 def _enforce_risk_pre_trade(decision: dict, snapshot: dict) -> tuple[bool, str]:
     """Basic sanity only — can't sell more than you own. No position/option/cash caps."""
     action = decision.get("action", "HOLD")
@@ -1168,6 +1316,27 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
                 return "BLOCKED", f"insufficient cash (have ${snapshot['cash']:.2f}, need ${notional:.2f})"
             store.record_trade(ticker, "BUY", qty, price, reason)
             store.upsert_position(ticker, "stock", qty, price)
+            # Stamp hard SL/TP on the just-opened (or blended) lot. Pass
+            # qty=0 — metadata-only path — so the size is not touched, only
+            # the SL/TP fields. Re-entries blend price into the avg_cost; the
+            # SL/TP fields are RE-anchored to the new blended-cost basis so a
+            # winning add doesn't keep the SL pinned to the original entry
+            # (or, conversely, an averaging-down add doesn't keep TP too low
+            # to ever fire). Non-fatal.
+            _sl_pct = (_SL_PCT_LEVERAGED if ticker in _LEVERAGED_ETFS_SL
+                       else _SL_PCT_STANDARD)
+            _tp_pct = (_TP_PCT_LEVERAGED if ticker in _LEVERAGED_ETFS_SL
+                       else _TP_PCT_STANDARD)
+            _sl_price = round(price * (1 - _sl_pct), 4)
+            _tp_price = round(price * (1 + _tp_pct), 4)
+            try:
+                store.upsert_position(
+                    ticker, "stock", 0, price,
+                    stop_loss_price=_sl_price,
+                    take_profit_price=_tp_price,
+                )
+            except Exception as _e:
+                print(f"[strategy] failed to set SL/TP for {ticker}: {_e}")
             # positions=None: end-of-cycle _portfolio_snapshot re-marks and
             # writes the post-trade blend; passing snapshot["positions"] here
             # would desync portfolio.positions_json from the positions table
@@ -1496,7 +1665,14 @@ def decide() -> dict:
     market_open = market.is_market_open()
 
     snap = _portfolio_snapshot(store)
-    auto_exits: list[str] = []  # disabled — Opus has full autonomy
+    # Hard stop-loss / take-profit guard — executes BEFORE Opus sees the
+    # prompt. Defined in SYSTEM_PROMPT ("HARD EXITS" section) so Opus knows
+    # the autonomy carve-out (invariant #12 — when adding silent caps, the
+    # prompt must teach them). Re-snapshot when something fired so cash +
+    # positions + total_value all reflect the post-exit book.
+    auto_exits: list[str] = _check_and_execute_hard_exits(store, snap)
+    if auto_exits:
+        snap = _portfolio_snapshot(store)
 
     top = signals.get_top_signals(20, hours=2, min_score=4.0)
     urgent = signals.get_urgent_articles(minutes=30)

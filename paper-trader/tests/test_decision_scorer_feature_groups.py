@@ -58,11 +58,15 @@ class TestFeatureGroupMapInvariants:
         assert FEATURE_GROUP_MAP["ml_score"] == "ml_score"
 
     def test_quant_group_has_expected_features(self):
-        """The quant group must be exactly the 6 technical signals."""
+        """The quant group must be exactly the 9 technical signals — the 6
+        classic indicators plus the 3 enhanced MACD signals added with the
+        MACD-strategy 1.5:1 R:R improvement."""
         quant_features = {f for f, g in FEATURE_GROUP_MAP.items()
                           if g == "quant"}
         assert quant_features == {"rsi", "macd", "mom5", "mom20",
-                                  "vol_ratio", "bb_pos"}
+                                  "vol_ratio", "bb_pos",
+                                  "ema200_above", "hist_cross_up",
+                                  "macd_below_zero_cross"}
 
     def test_news_group_has_exactly_two_features(self):
         news_features = {f for f, g in FEATURE_GROUP_MAP.items()
@@ -210,14 +214,16 @@ class TestTrainedPath:
 
     def test_n_features_per_group_matches_map(self, trained_scorer):
         """The n_features field must report the actual count of features
-        in each group (1 / 6 / 1 / 2 / 7)."""
+        in each group (1 / 9 / 1 / 2 / 7) — 9 quant features after the
+        MACD-strategy improvement added ema200_above / hist_cross_up /
+        macd_below_zero_cross to the quant bucket."""
         out = trained_scorer.feature_group_contributions(
             ml_score=2.0, rsi=55.0, macd=0.1, mom5=1.0, mom20=2.0,
             regime_mult=1.0, ticker="NVDA",
             vol_ratio=1.0, bb_pos=0.0,
             news_urgency=50.0, news_article_count=2.0,
         )
-        expected = {"ml_score": 1, "quant": 6, "regime": 1, "news": 2,
+        expected = {"ml_score": 1, "quant": 9, "regime": 1, "news": 2,
                     "sector": 7}
         actual = {g["group"]: g["n_features"] for g in out["groups"]}
         assert actual == expected
