@@ -10970,3 +10970,138 @@ config updates, and (5) cross-repo paper-trader edits. All five were
 left untouched. `git diff --staged --name-only` verified before each
 commit that only this agent's files were staged (Phase 1: 4 files,
 Phase 2: 2 files).
+
+
+---
+
+## 2026-05-24 — HYBRID pass #28 (recap-pattern wiring + news_fatigue unified score)
+
+**Counters:** `bugs_fixed=1`, `features_added=1`, `user_findings=4`.
+
+### Phase 1 — Debug & fix (1 bug)
+
+Wired `_RT_WHATS_NEXT_AFTER` into the recap-template tuples on BOTH the
+alert path (`watchers/alert_agent._RECAP_TEMPLATE_PATTERNS`) and the
+briefing path (`analysis/claude_analyst._BRIEFING_RECAP_TEMPLATE_PATTERNS`).
+The regex was defined at `watchers/alert_agent.py:1020` with full
+documentation citing the live failure (2026-05-23 17:39:55Z, Baystreet.ca
+"What is Next After NVIDIA Trounces Expectations" reaching urgency=2 with
+score_source='ml', ml_score=10.0) but never added to the patterns tuple —
+dead code on both surfaces. Every `What's Next After <X>
+{Trounces|Crushes|Beats|Earnings|...}` SEO-mill row was sailing through
+both the standalone breaking-push and the 5h Opus TOP SIGNALS digest.
+
+The lockstep `test_alert_and_briefing_recap_tuples_have_same_length`
+drift test caught the asymmetry immediately when only the alert side
+was patched — so the briefing-side `_BRIEFING_RT_WHATS_NEXT_AFTER` mirror
+was added too, byte-identical to the alert-side regex.
+
+Added 2 test classes covering:
+- Positive corpus: the live failure-case title plus 9 same-template
+  siblings (different tickers / verbs / post-event terminators).
+- Must-survive corpus: forward-looking "What's next" without "after",
+  "Next after <non-event>", "What comes next after Q3" (uses "comes
+  next", not "is/'s next"), real macro breaking — none match.
+
+Live verification against `articles.db` urgency=2 (last 7d): the new
+regex matches exactly the 1 historical row that was the documented
+failure case. Every future copy is now suppressed.
+
+### Phase 2 — Feature dev (1 feature)
+
+Refactored `analytics/news_fatigue.py` to use the unified
+`COALESCE(NULLIF(ai_score, 0), ml_score)` score and added 16 pure-builder
+tests. The original (commit `f42582a`) read `ai_score` only, which
+excludes ~92% of the live scored corpus — every ML-only article carries
+`score_source='ml'`, `ml_score` set, `ai_score=0`. A 2026-05-24 live
+audit found **4,915** scored rows in 24h but only **375** with
+`ai_score > 0`, so the analyzer was operating on 7.6% of the available
+signal. Every ML-only row contributed 0 to the fatigue mean by
+construction, dragging both windows toward noise and making the
+recent-vs-prior delta dominated by which window happened to catch the
+rare LLM-vetted rows.
+
+Refactor specifics:
+- Extracted pure `compute_news_fatigue(rows, now=None, ...)` mirroring
+  the `analytics.held_ticker_news_silence.compute_silence` /
+  `analytics.held_alert_reaction_latency.compute_held_alert_reaction_latency`
+  discipline (pure-builder pattern lets tests assert specific output
+  values without spinning up a sqlite fixture).
+- Switched to the canonical unified read documented in
+  `storage/article_store.py::update_ml_scores_batch`. A row with
+  `ai_score=0 AND ml_score=NULL` (unscored) returns `None` and drops out
+  of both windows — preventing zero-padding of the mean.
+- Removed the inert `ai_score IS NOT NULL` filter (column is
+  `REAL DEFAULT 0`, never NULL in practice).
+- SQL now selects `ml_score` too; `_LIVE_ONLY_CLAUSE` unchanged so
+  backtest isolation intact.
+
+Live verification post-refactor: against the production `articles.db`
+the analyzer now surfaces **LRCX** (Lam Research, semi-equipment
+watchlist name) as fatigued — `prior_avg=3.9`, `recent_avg=2.0`,
+`drop=1.9` over 20 mentions in 24h. The previous `ai_score`-only
+version returned **0 fatigued tickers** on the same window because
+most LRCX coverage carries `score_source='ml'` and contributed 0 to
+the mean. This is the first real signal the analyzer has surfaced
+since it shipped — exactly the kind of "story burning out" the
+operator-facing docstring promises.
+
+Backtest isolation, ml/ai score split, and `score_source` semantics
+all unchanged (read-only — never writes `ai_score`, `ml_score`,
+`score_source`, or `urgency`).
+
+### Phase 3 — Live validation (4 findings)
+
+Against `/media/zeph/projects/digital-intern/db/articles.db`,
+`2026-05-24T09:21Z` snapshot:
+
+1. **Pipeline health: GREEN.** 1,037 articles in last 1h (live-only,
+   excluding backtest_/opus_annotation_). 0 urgent-pending rows
+   (`urgency=1` queue is clean). 74 BREAKING pushes in last 24h.
+   Latest 5h Opus briefing reads as quality analyst content (post-NVDA
+   rotation thesis, names held position AXTI +16.37%).
+
+2. **Critical invariants intact.** 0 backtest URL / source leaks into
+   `urgency >= 1` rows. 0 `score_source='ml'` rows with `ai_score > 0`
+   (model predictions not polluting LLM labels). The two load-bearing
+   invariants the alert pipeline depends on are clean.
+
+3. **AlphaVantage cluster dark.** 15+ `AlphaVantage/*` sources silent
+   for 4h+: `AD HOC NEWS`, `Barron's`, `Benzinga`, `Business Wire`,
+   `FinancialContent`, `IndexBox`, `Investing.com`, `MSN`,
+   `MarketWatch`, `Quiver Quantitative`, `Simply Wall Street`,
+   `StockStory`, `StocksToTrade`, `TIKR.com`, `TechStock²`. The free
+   AlphaVantage NEWS_SENTIMENT quota is 25/day so partial silence is
+   expected, but the breadth here suggests the worker may have
+   throttled itself for the day — recurring `chronic dark collectors`
+   memory item, not a fresh regression.
+
+4. **ML-alert ratio confirmed at 75% unverified.** 985 ML-only alerts
+   vs 325 LLM-vetted in last 7d. The existing CALIBRATION block in
+   `ALERT_PROMPT` already handles this — every ML-only row gets the
+   `[unverified — model-only urgent]` tag in the prompt context so
+   Sonnet hedges CONTEXT/IMPACT honestly. The system is calibrated
+   for the ratio, but the trend is worth tracking. (Same observation
+   as the prior pass — recurring, not a fresh regression.)
+
+### Phase 4 — Docs & verify
+
+This section. Final verify:
+- `python3 -c "from storage import article_store; from ml import
+  features, model"` → `imports OK`.
+- Focused suites: `test_alert_recap_template` 49 pass,
+  `test_briefing_recap_template` (incl. drift test) clean,
+  `test_news_fatigue` 16 pass, plus `test_article_store` /
+  `test_features` / `test_model` / `test_trainer` /
+  `test_urgency_scorer` all green.
+- Full `pytest tests/`: **2,963 pass / 0 fail in ~77s** (up from
+  2,858 last pass → +103 new tests: 87 from Phase 1 additions ago + 16
+  this pass net).
+
+**Staging discipline.** Per-commit explicit pathspec. Working copy
+carried foreign uncommitted changes at start (sibling-agent files —
+`analytics/held_alert_reaction_latency.py`,
+`collectors/shipping_intelligence.py`, plus cross-repo paper-trader
+edits). All left untouched. `git diff --staged` verified before each
+commit that only this agent's files were staged (Phase 1: 3 files,
+Phase 2: 2 files).
