@@ -27,6 +27,7 @@ Output:      /home/zeph/logs/urgency_drought.json
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -43,12 +44,25 @@ WARN_HOURS = 4.0
 ALERT_HOURS = 12.0
 
 
+_TZ_OFFSET = re.compile(r"[+-]\d{2}:?\d{2}$")
+
+
 def _parse_ts(raw: str) -> datetime | None:
+    """Tolerant ISO-8601 / SQLite-default-format parser. Live ``first_seen``
+    values are always written as ``datetime.now(timezone.utc).isoformat()``
+    (UTC + ``+00:00``), but the helper accepts the wider set the same column
+    can hold across migrations / external imports — naive (assumed UTC),
+    space-separator, ``Z`` suffix, or any signed offset (``+09:00`` /
+    ``-05:00``). The earlier check ``"+" not in s[10:]`` only detected
+    positive offsets, so a string like ``"2026-05-23T18:00:00-05:00"`` had
+    ``+00:00`` blindly appended (``...-05:00+00:00``) and silently parsed as
+    ``None`` — a latent defense-in-depth gap surfaced as ``status='unknown'``
+    on any non-UTC row this script may ever encounter."""
     if not raw:
         return None
     try:
         s = str(raw).replace(" ", "T")
-        if "+" not in s[10:] and not s.endswith("Z"):
+        if not _TZ_OFFSET.search(s) and not s.endswith("Z"):
             s += "+00:00"
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
