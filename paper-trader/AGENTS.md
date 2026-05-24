@@ -6,6 +6,167 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 paper-trader core HYBRID pass #2 (Agent 1) — `market_phase` granular header
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Read AGENTS.md + all required core files in full (runner.py, reporter.py,
+signals.py, strategy.py, dashboard.py, market.py, store.py) plus
+`analytics/dynamic_interval.py` (the runner's sleep planner — directly
+relevant to the new header phase wiring). The earlier 2026-05-24 core
+pass (`_rsi_label`, commit 71d8c16, bugs_fixed=0) had already produced
+no surgical fix; a fresh audit of the same surface plus the runner
+breaker/quota/`_no_decision_first_ts` interplay and the
+`_should_retry_parse` / `_parse_decision` interaction turned up no new
+landable fix. The full core slice (`tests/test_core_{runner,strategy,
+signals,market,store,reporter}.py`) — 844 tests — passes clean in ~22s.
+
+Concurrent sibling agent work observed at boot time (visible in
+`git diff --stat`): paper_trader/reporter.py (+173 lines —
+`_passive_signal_density_line` / `_regime_leverage_fit_line`),
+paper_trader/dashboard.py (+29 — `/api/passive-signal-density`),
+paper_trader/backtest.py (+122), plus new analytics
+(`decision_cadence.py`, `passive_signal_density.py`) and their tests.
+To respect the `pt-concurrent-samerole-staging-race` discipline (sibling
+whole-file `git add` between my stage and commit bundles their work
+into mine), this pass is scoped to files NO sibling is touching:
+`paper_trader/market.py` and `paper_trader/strategy.py` (plus a new
+`tests/test_market_phase.py`) only.
+
+### Phase 2 — Feature: `market.market_phase` + `MARKET_PHASE:` header line (d34ef9c)
+
+`market.market_phase(now)` returns one of `WEEKEND` / `HOLIDAY` /
+`PRE_MARKET` / `OPENING_BELL` / `MID_SESSION` / `CLOSING_HALF_HOUR` /
+`AFTER_CLOSE` / `OVERNIGHT`. Wired into the live decision prompt via
+`strategy._build_payload`'s header — a new `MARKET_PHASE: <token>` line
+sits between `MARKET_OPEN:` and the `S&P 500 BENCHMARK:` line so Opus
+calibrates conviction by the granular phase instead of re-deriving it
+from the TIME (UTC) ISO string every cycle.
+
+Phase windows on a regular session day:
+
+| Window | NY-time range |
+|--------|---------------|
+| `OVERNIGHT` | 20:00 → 04:00 (next morning) |
+| `PRE_MARKET` | 04:00 → 09:30 |
+| `OPENING_BELL` | 09:30 → 10:00 (first 30 min) |
+| `MID_SESSION` | 10:00 → close − 30 min |
+| `CLOSING_HALF_HOUR` | close − 30 min → close |
+| `AFTER_CLOSE` | close → 20:00 |
+
+Half-day handling is automatic — `CLOSING_HALF_HOUR` is 12:30 → 13:00 ET
+on a known NYSE early-close day, NOT 15:30 → 16:00, because
+`close_minute()` already resolves to 13:00 there. So `MID_SESSION` ends
+at 12:30 ET and `AFTER_CLOSE` begins at 13:00 ET on day-after-Thanksgiving
+/ Christmas-Eve — the prompt's phase view and the runner's actual sleep
+cadence (which also reads `market.is_market_open` via `dynamic_interval`)
+cannot disagree about when the bell rings.
+
+Degrade-safe by construction: any `market.market_phase` fault is logged
+and the new line is silently dropped, byte-identical to the pre-feature
+header for the MARKET_OPEN line that follows; never raises into
+`decide()` (mirrors every other `_build_payload` advisory block — the
+"non-fatal by construction" contract).
+
+```bash
+python3 -m pytest tests/test_market_phase.py -v    # 37 tests, ~0.7s
+```
+
+37 tests pin (5 classes):
+- `TestMarketPhaseTradingDay` (17): every phase boundary (the 03:59/04:00
+  flip, 09:29/09:30, 09:59/10:00, 15:29/15:30, 15:59/16:00, 19:59/20:00)
+  + each mid-window sample. Boundary inclusivity rules pinned:
+  04:00 / 09:30 / 10:00 / 15:30 are LOWER-inclusive; 16:00 / 20:00 are
+  UPPER-exclusive (the `is_market_open` precedent).
+- `TestMarketPhaseHalfDay` (8): the 12:30 ET shift of `CLOSING_HALF_HOUR`,
+  the 13:00 ET `AFTER_CLOSE` start on 2026-11-27 (day after Thanksgiving),
+  and the verification that 16:00 ET on a half-day does NOT re-open into
+  CLOSING_HALF_HOUR (still AFTER_CLOSE).
+- `TestMarketPhaseNonTradingDays` (6): WEEKEND wins on Saturday/Sunday
+  regardless of NY hour; HOLIDAY wins over PRE_MARKET / MID_SESSION on
+  Thanksgiving / New Year's Day / Good Friday.
+- `TestMarketPhaseTimezoneInjection` (2): a UTC tz-aware input resolves
+  correctly through the NY tz conversion (14:30 UTC EDT = 10:30 ET =
+  MID_SESSION); no-arg path always returns one of the 8 documented
+  tokens (the prompt header relies on this invariant).
+- `TestPhaseWiredIntoPrompt` (4): every token reaches the prompt; a
+  raising `market_phase` degrades to a missing line, NOT to a missing
+  prompt; the header order is `MARKET_OPEN < MARKET_PHASE < S&P` so a
+  later refactor cannot silently re-order the tokens.
+
+### Phase 3 — Live user validation: user_findings = 4
+
+Probed `:8090` with every relevant panel and tailed the live decision
+context via `/api/decision-context`. The runner is the manually-launched
+singleton (the systemd unit bounces off the flock — restart counter
+keeps climbing — see `pt-systemd-vs-manual-restart-spam` memory note;
+do NOT fix).
+
+1. **Engine is fully cash (`$987.39`), no positions, last real trade
+   ~7.5h ago** (SELL NVDA → FILLED at 02:08 UTC). 28 consecutive
+   passive cycles (HOLD or NO_DECISION). `/api/runner-heartbeat`
+   reports HEALTHY (last decision 3m ago, within the 60m closed
+   cadence). `decision_paralysis` correctly flags PASSIVE_LOOP but
+   the sibling Agent 4's new `/api/passive-signal-density` panel
+   nuances it as `INFORMED_PASSIVE — 28 passive cycles with median 0.0
+   signals/cycle (≤3). Engine is correctly quiet during a quiet news
+   window.` So the engine's HOLD is the CORRECT behaviour, not
+   pathology — an important read because the bare "28 cycles all HOLD"
+   line on the dashboard looks alarming in isolation.
+
+2. **/api/feed-health says BLIND (7 cycles with 0 signals) but the
+   pipeline is NOT down.** Newest live article is 0.0h old; the local
+   articles.db candidate has 68 live articles in the last 2h. The
+   reason the trader sees 0 signals is the `get_top_signals` filter
+   `ai_score >= 4.0` — the news IS arriving, it is just below the
+   high-conviction threshold. A trader reading only the BLIND headline
+   could mistakenly conclude the digital-intern daemon is broken when
+   it is actually just a quiet news window. **Not a bug per the BLIND
+   definition** (`signal_count=0`); worth noting that BLIND ≠ "feed
+   down" and the `decision_paralysis.INFORMED_PASSIVE` reading
+   correctly disambiguates.
+
+3. **/api/host-guard reports 70% starvation rate over last 120
+   decisions** (`state=STARVED`, host clear NOW with 4 concurrent
+   Opus subprocesses). This is the documented #1 NO_DECISION cause
+   (see `pt-no-decision-host-saturation` memory note). 93% of the 14
+   NO_DECISION rows in the last 50 cycles were `host_saturated`. The
+   pre-flight + mid-call host guard (9c14c96 + d714dcb) is correctly
+   absorbing them — the dominant `no_decision_reasons` bucket is the
+   distinct `host_saturated` cause-code, NOT the historical "claude
+   returned no response" empty-bucket smear, so the breaker is not
+   trying to reap procs that never existed.
+
+4. **`/api/build-info` reports stale=True, behind=2, head=d34ef9c
+   (this commit), boot=4ff132e.** The git-watcher's 3-min poll has not
+   yet detected the new commit; once it does the deferred-restart
+   pipeline will bounce the runner on the new code so the
+   MARKET_PHASE line lands in the live prompt. The deadman safety-net
+   (RESTART_GRACE_S = 600s) protects against a wedged main loop never
+   honouring the restart — observational, no fix.
+
+All 25 probed endpoints respond 200 with non-stale bodies; the
+slowest is `/api/disagreement` at ~860ms (single yfinance fetch on a
+zero-position book — acceptable).
+
+### Phase 4 — Docs and verify
+
+`tests/test_market_phase.py` (37 new) + the full core slice
+(`tests/test_core_{runner,strategy,signals,market,store,reporter}.py`
++ test_market_phase) — **881 tests pass in ~22s**. AGENTS.md updated
+above (this pass).
+
+### Counters
+
+bugs_fixed=0 · features_added=1 (`market.market_phase` + the
+`MARKET_PHASE:` prompt header line — 37 tests) · user_findings=4
+(engine correctly passive on a quiet news window; BLIND ≠ feed down;
+host_saturated is the #1 NO_DECISION cause and the pre-/mid-call
+guard is absorbing it correctly; runner is stale on this commit, the
+git-watcher will bounce it within 3 min).
+
+---
+
 ## 2026-05-24 paper-trader core HYBRID pass (Agent 1) — `_rsi_label` overbought/oversold annotation
 
 ### Phase 1 — Debug: bugs_fixed = 0
