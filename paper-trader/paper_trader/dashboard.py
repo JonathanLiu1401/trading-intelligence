@@ -303,6 +303,46 @@ def alarm_latches_api():
         }), 500
 
 
+@app.route("/api/swr-cache-health")
+def swr_cache_health_api():
+    """Operator snapshot of the dashboard's SWR cache table.
+
+    Surfaces which ``@swr_cached`` endpoints have stale or silently
+    failing background rebuilds — the failure mode where a panel keeps
+    serving its last good payload while the rebuild raises every cycle
+    (``dashboard._SWR_FAIL_LOG_EVERY`` only logs to stderr, which the
+    operator must be tailing to see). Composes
+    ``analytics.dashboard_cache_health.build_cache_health`` over the
+    in-process ``_SWR_STATE``.
+
+    Deliberately NOT @swr_cached (the ``notify_health_api`` /
+    ``alarm_latches_api`` precedent): the builder is a pure dict scan
+    over module globals — no I/O — so caching would add cost without
+    benefit AND would hide the cache table's own health behind itself.
+
+    Failure contract mirrors the rest of the operator endpoints: any
+    fault degrades to a valid-shaped ERROR envelope so the panel can
+    render and the operator sees the fault, never a 500.
+    """
+    try:
+        from .analytics.dashboard_cache_health import build_cache_health
+        snap = build_cache_health(_SWR_STATE)
+        if not isinstance(snap, dict):
+            raise TypeError(f"builder returned {type(snap).__name__}")
+        return jsonify({"service": "paper_trader", **snap})
+    except Exception as e:
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "state": "ERROR",
+            "verdict": "ERROR",
+            "headline": f"swr-cache-health endpoint error: {e}",
+            "entries": [],
+            "summary": {"total": 0, "healthy": 0, "stale": 0,
+                        "failing": 0, "never_built": 0, "error": 0},
+        }), 500
+
+
 # Static sector classification for analytics + sector-pulse cards.
 # Keyed by the symbols we actually use in the watchlist + portfolio.
 SECTOR_MAP = {
