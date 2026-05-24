@@ -1293,3 +1293,184 @@ class TestLlmWeightReplication:
             f"every unlabeled rep should be 2 (weight 1.0 × 2 scaling); "
             f"got {rep}"
         )
+
+
+# ─────────────────────── DecisionScorer.feature_importance ──────────
+#
+# The instance method `DecisionScorer.feature_importance` was previously
+# untested even though it powers the CLI `--feature-importance` mode and
+# is consumed by `paper_trader.ml.dead_sector_audit`. These tests pin the
+# JSON-shape contract (sorted, normalized, no exceptions) every consumer
+# relies on.
+
+class TestFeatureImportanceMethod:
+    def test_untrained_scorer_returns_empty_payload(self):
+        s = DecisionScorer()
+        imp = s.feature_importance()
+        assert imp["trained"] is False
+        assert imp["method"] is None
+        assert imp["n_train"] == 0
+        assert imp["importances"] == []
+
+    def test_trained_scorer_returns_full_feature_set(self, tmp_path,
+                                                     monkeypatch):
+        # Train on a synthetic monotone signal so the model has real (not
+        # noise) input-layer weights.
+        import paper_trader.ml.decision_scorer as ds
+        monkeypatch.setattr(ds, "SCORER_PATH", tmp_path / "imp.pkl")
+        recs = []
+        for i in range(60):
+            recs.append(_synthetic_outcome(
+                ticker="NVDA", sim_date=f"2025-01-{(i % 28) + 1:02d}",
+                ml_score=float(i % 5), fwd=float(i % 5) * 2.0))
+        for i in range(60):
+            recs.append(_synthetic_outcome(
+                ticker="SOXL", sim_date=f"2025-02-{(i % 28) + 1:02d}",
+                ml_score=float(i % 5), fwd=float(i % 5) * 2.0))
+        result = train_scorer(recs)
+        assert result["status"] == "ok"
+        s = DecisionScorer()
+        imp = s.feature_importance()
+        assert imp["trained"] is True
+        # Every one of the N_FEATURES slots must surface — coverage is a
+        # CONTRACT not a courtesy. A missing slot breaks consumers
+        # (dead_sector_audit) that join on FEATURE_NAMES.
+        assert len(imp["importances"]) == N_FEATURES
+        names = {r["feature"] for r in imp["importances"]}
+        assert names == set(FEATURE_NAMES)
+
+    def test_importances_sorted_desc_by_raw_value(self, tmp_path, monkeypatch):
+        import paper_trader.ml.decision_scorer as ds
+        monkeypatch.setattr(ds, "SCORER_PATH", tmp_path / "imp_sort.pkl")
+        recs = [_synthetic_outcome(sim_date=f"2025-01-{i+1:02d}",
+                                   ml_score=float(i % 7), fwd=float(i % 7))
+                for i in range(40)]
+        recs += [_synthetic_outcome(ticker="AMD",
+                                    sim_date=f"2025-02-{i+1:02d}",
+                                    ml_score=float(i % 7), fwd=float(i % 7))
+                 for i in range(40)]
+        train_scorer(recs)
+        s = DecisionScorer()
+        rows = s.feature_importance()["importances"]
+        for a, b in zip(rows[:-1], rows[1:]):
+            assert a["importance"] >= b["importance"], (
+                f"importances not sorted descending: {a} then {b}")
+
+    def test_normalized_shares_sum_to_one(self, tmp_path, monkeypatch):
+        import paper_trader.ml.decision_scorer as ds
+        monkeypatch.setattr(ds, "SCORER_PATH", tmp_path / "imp_norm.pkl")
+        recs = [_synthetic_outcome(sim_date=f"2025-01-{i+1:02d}",
+                                   ml_score=float(i % 5), fwd=float(i % 5))
+                for i in range(40)]
+        recs += [_synthetic_outcome(ticker="AMD",
+                                    sim_date=f"2025-02-{i+1:02d}",
+                                    ml_score=float(i % 5), fwd=float(i % 5))
+                 for i in range(40)]
+        train_scorer(recs)
+        s = DecisionScorer()
+        rows = s.feature_importance()["importances"]
+        total = sum(r["importance_normalized"] for r in rows)
+        # Rounded to 6 places per-feature, so the sum can drift slightly.
+        assert abs(total - 1.0) < 1e-3, (
+            f"normalized importances must sum to ~1.0; got {total}")
+
+    def test_nan_weight_does_not_poison_importance_payload(self):
+        # Regression: a NaN/Inf entry in the model's weight vector (from a
+        # rank-deficient lstsq solve or pathological MLP fit) used to
+        # silently propagate through `raw.sum()` → `total=NaN` →
+        # `norm=NaN` → JSON-unserialisable output AND unstable sort.
+        # The guard must replace non-finite cells with 0.0 so the payload
+        # stays well-formed: every importance is finite, the sort is
+        # deterministic, and the normalized shares sum to ~1.0.
+        from paper_trader.ml.decision_scorer import _LstsqScaler, _LstsqModel
+        import numpy as np
+        import math
+        s = DecisionScorer()
+        # weights: [NaN, 1, 1, ..., 1, bias=99]
+        weights = np.array(
+            [float("nan")] + [1.0] * (N_FEATURES - 1) + [99.0],
+            dtype=np.float32)
+        s._model = _LstsqModel(weights)
+        s._scaler = _LstsqScaler(
+            mean=np.zeros(N_FEATURES, dtype=np.float32),
+            std=np.ones(N_FEATURES, dtype=np.float32))
+        s._trained = True
+        s._n_train = 500
+        imp = s.feature_importance()
+        rows = imp["importances"]
+        # Every importance is finite (the bug was NaN-poisoning).
+        for r in rows:
+            assert math.isfinite(r["importance"]), (
+                f"non-finite importance leaked through: {r}")
+            assert math.isfinite(r["importance_normalized"]), (
+                f"non-finite normalized share leaked through: {r}")
+        # Normalized shares sum to ~1.0 across all N_FEATURES entries
+        # (the NaN feature contributes 0 to the sum but is still in the row
+        # list so the consumer sees the full feature set).
+        total = sum(r["importance_normalized"] for r in rows)
+        assert abs(total - 1.0) < 1e-3, (
+            f"normalized shares must sum to ~1.0 even with NaN weights; "
+            f"got {total}")
+        # The NaN-weight feature lands at importance=0 and ranks LAST in
+        # the descending sort (everyone else has importance=1.0).
+        assert rows[-1]["feature"] == FEATURE_NAMES[0]
+        assert rows[-1]["importance"] == 0.0
+
+    def test_lstsq_fallback_path_returns_lstsq_method(self):
+        # The numpy lstsq fallback (sklearn-absent host) uses a different
+        # importance-extraction path: |coef| of the single linear layer,
+        # excluding the bias term. Pin both the method label AND the right
+        # feature count so a refactor cannot silently drop the bias-strip.
+        from paper_trader.ml.decision_scorer import _LstsqScaler, _LstsqModel
+        import numpy as np
+        s = DecisionScorer()
+        # Synthesise a deterministic weight vector: w[i] = i, bias = 99.
+        weights = np.array(list(range(N_FEATURES)) + [99.0],
+                           dtype=np.float32)
+        s._model = _LstsqModel(weights)
+        s._scaler = _LstsqScaler(
+            mean=np.zeros(N_FEATURES, dtype=np.float32),
+            std=np.ones(N_FEATURES, dtype=np.float32))
+        s._trained = True
+        s._n_train = 500
+        imp = s.feature_importance()
+        assert imp["method"] == "lstsq_abs_weight"
+        assert len(imp["importances"]) == N_FEATURES
+        # The bias (99.0) must NOT bleed into any feature's importance.
+        assert all(r["importance"] < 99.0
+                   for r in imp["importances"]), (
+            "bias term must be stripped — w[:N_FEATURES] only")
+        # First feature (w[0]=0) should be the smallest importance after
+        # sorting (sorted desc by importance).
+        last = imp["importances"][-1]
+        assert last["feature"] == FEATURE_NAMES[0]
+        assert last["importance"] == 0.0
+
+
+# ─────────────────────── _to_float robustness ──────────────────────
+#
+# The actual data corpus passed through `_to_float` includes corrupt /
+# malformed cells from JSONL. These tests pin the contract that EVERY
+# unparseable input degrades to default rather than raising — a single
+# bad row must never abort training (the documented `train_scorer`
+# wedge-vector that the codebase's defensive coding aims to prevent).
+
+class TestToFloatRobustness:
+    def test_list_returns_default(self):
+        assert _to_float([1, 2, 3], -1.5) == -1.5
+
+    def test_dict_returns_default(self):
+        assert _to_float({"a": 1}, -1.5) == -1.5
+
+    def test_negative_zero_passthrough(self):
+        # -0.0 is a finite, valid float. Must not be conflated with the
+        # `False` short-circuit at the top of _to_float (which uses
+        # isinstance(v, bool) — False is bool, -0.0 is float).
+        assert _to_float(-0.0, 5.0) == 0.0
+
+    def test_large_int_passthrough(self):
+        # Python ints have arbitrary precision; math.isfinite accepts any int.
+        # The numeric promotion must not lose information for any reasonable
+        # int that fits in a float64.
+        v = 10**12
+        assert _to_float(v, -1.0) == float(v)

@@ -779,6 +779,18 @@ class DecisionScorer:
                         "n_train": int(self._n_train), "importances": [],
                         "error": f"importance len {raw.size} != "
                                  f"N_FEATURES {N_FEATURES}"}
+            # Non-finite weights (NaN/Inf from a degenerate lstsq solve on a
+            # rank-deficient design, or pathological MLP coefs from training
+            # on contaminated inputs) would otherwise poison everything
+            # downstream: `raw.sum()` is NaN, `norm = raw/total` is NaN,
+            # `json.dumps` then either emits non-standard "NaN" or raises,
+            # and `sort(key=raw)` becomes order-dependent (NaN compares
+            # unpredictably). Replace with 0.0 so the feature shows as
+            # zero importance but the JSON contract — sortable, sums to 1.0,
+            # all finite — holds. Mirrors the `_to_float`/`predict_with_meta`
+            # discipline: never raise on a degenerate input; degrade to a
+            # safe sentinel and let downstream consumers see honest zeros.
+            raw = np.where(np.isfinite(raw), raw, 0.0)
             total = float(raw.sum())
             norm = (raw / total) if total > 0 else raw
             rows = [
