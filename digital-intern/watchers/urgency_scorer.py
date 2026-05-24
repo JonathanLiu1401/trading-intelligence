@@ -9,6 +9,16 @@ from email.utils import parsedate_to_datetime
 
 from core.claude_cli import claude_call
 from core.json_extract import extract_json_array
+# Live held/watched ticker universe — the SAME single source of truth the
+# model's portfolio features and the alert path's ``book:`` tag already use
+# (loaded from config/portfolio.json, unioned with a hardcoded fallback). The
+# urgency SCORE_PROMPT historically hardcoded the held set, so a position
+# added in the trading UI was invisible to Sonnet's urgency scoring — its
+# earnings beat/miss was scored as generic sector news, never URGENT, and the
+# analyst got no standalone push for their own open risk. ml.features is
+# already in this module's import graph (pulled transitively via the
+# watchers.alert_agent import above), so this adds no new dependency.
+from ml.features import LIVE_PORTFOLIO_TICKERS
 # Single source of truth for the recap-template AND quote-widget fingerprint
 # sets — defined in alert_agent and re-used here so urgency_scorer, the alert
 # formatter, and the briefing builder can never silently drift in WHICH titles
@@ -45,7 +55,7 @@ MAX_TRAILING_OMISSIONS = 5
 SCORE_PROMPT = """You are a real-time financial news urgency classifier. Score each article 0-10.
 
 URGENT (8-10): Breaking news that will move markets NOW:
-- Earnings beats/misses for: LITE, MU, MSFT, AXTI, ORCL, TSEM, QBTS, NVDA, AMD, TSM, SK Hynix, Samsung, Micron
+- Earnings beats/misses for the analyst's HELD POSITIONS: {portfolio_tickers}. Also sector peers (AMD, TSM, SK Hynix, Samsung, Micron)
 - Fed surprise decisions, emergency rate changes
 - Major analyst upgrades/downgrades (PT change >15%) on tracked stocks
 - Memory/DRAM pricing shock (ASP move >5%)
@@ -73,6 +83,20 @@ Articles:
 {articles_json}
 
 Respond ONLY with a JSON array: [{{"index": 0, "score": 9, "reason": "MU earnings beat"}}, ...]"""
+
+
+def _portfolio_ticker_line() -> str:
+    """Comma-joined, sorted held/watched tickers for the SCORE_PROMPT.
+
+    Reads ``ml.features.LIVE_PORTFOLIO_TICKERS`` (config/portfolio.json's
+    positions + option underlyings + sector_watchlist, unioned with a
+    hardcoded fallback) so Sonnet scores earnings urgency against the book the
+    analyst *actually* holds, not a frozen literal. ``sorted`` gives a
+    deterministic, test-pinnable order. Degrades to a minimal semiconductor
+    default only if the live set is somehow empty — a urgency-scoring prompt
+    must never go out with a blank held-positions slot."""
+    tickers = sorted(t for t in LIVE_PORTFOLIO_TICKERS if t)
+    return ", ".join(tickers) if tickers else "MU, NVDA, MSFT"
 
 
 def _article_age_hours(article: dict) -> float:
@@ -217,7 +241,10 @@ def score_batch(articles: list, store) -> int:
         for i, a in enumerate(articles)
     ]
 
-    prompt = SCORE_PROMPT.format(articles_json=json.dumps(payload, ensure_ascii=False))
+    prompt = SCORE_PROMPT.format(
+        articles_json=json.dumps(payload, ensure_ascii=False),
+        portfolio_tickers=_portfolio_ticker_line(),
+    )
 
     try:
         raw = claude_call(prompt, model=SONNET_MODEL, timeout=120)
