@@ -544,6 +544,108 @@ class TestBbLabel:
         assert "band" not in out2
 
 
+class TestRsiLabel:
+    """`_rsi_label` annotates an extreme RSI reading with the
+    overbought/oversold label the SYSTEM_PROMPT already names, mirroring the
+    `_bb_label` render-side enrichment. Only the actionable extremes
+    (>=70 / <=30) get a label; mid-range values stay bare — the
+    silence-when-nothing-actionable contract. Critical because a regression
+    that silently swallowed the label (or, worse, inverted it) would feed
+    Opus the *opposite* signal: "rsi=72 (oversold)" makes a textbook
+    overbought condition read as a long signal."""
+
+    def test_none_renders_question_mark(self):
+        # Mirrors `_bb_label(None)` — the `_v` precedent: a missing key reads
+        # as `"?"`, not `"None"` or an empty token Opus would silently parse
+        # as zero. Loses-the-guard regression: `_rsi_label(None)` → "None".
+        assert strategy._rsi_label(None) == "?"
+
+    def test_mid_range_has_no_label(self):
+        # Neutral RSI carries no annotation — silence-when-nothing-actionable.
+        # A regression that labelled every value (e.g. dropping the
+        # threshold gate) would clutter every row in the prompt's TECHNICAL
+        # SIGNALS block with "(overbought)" / "(oversold)" noise.
+        assert strategy._rsi_label(50) == "50"
+        assert strategy._rsi_label(45.5) == "45.5"
+        assert strategy._rsi_label(65) == "65"  # below 70 threshold
+        assert strategy._rsi_label(35) == "35"  # above 30 threshold
+        assert "overbought" not in strategy._rsi_label(50)
+        assert "oversold" not in strategy._rsi_label(50)
+
+    def test_overbought_labelled(self):
+        # At/above 70 → overbought annotation. Inclusive boundary matches
+        # the textbook 70 mark the SYSTEM_PROMPT names ("RSI > 70 =
+        # overbought") — a strict `>` would un-label exactly-70 rows even
+        # though that is the canonical threshold.
+        assert strategy._rsi_label(72) == "72 (overbought)"
+        assert strategy._rsi_label(72.5) == "72.5 (overbought)"
+        assert strategy._rsi_label(85.1) == "85.1 (overbought)"
+        assert "overbought" in strategy._rsi_label(70)
+        assert "overbought" in strategy._rsi_label(99.9)
+
+    def test_oversold_labelled(self):
+        # At/below 30 → oversold annotation (mirrors the upper-band gate).
+        assert strategy._rsi_label(28) == "28 (oversold)"
+        assert strategy._rsi_label(28.3) == "28.3 (oversold)"
+        assert strategy._rsi_label(15) == "15 (oversold)"
+        assert "oversold" in strategy._rsi_label(30)
+        assert "oversold" in strategy._rsi_label(0.5)
+
+    def test_just_inside_threshold_is_bare(self):
+        # 69.9 < 70 → bare; 70 → overbought. 30.1 > 30 → bare; 30 →
+        # oversold. Pins both boundaries — a regression to a strict `>` /
+        # `<` (off-by-one against the textbook gate) would fail here.
+        assert strategy._rsi_label(69.9) == "69.9"
+        assert "overbought" not in strategy._rsi_label(69.9)
+        assert "overbought" in strategy._rsi_label(70)
+        assert strategy._rsi_label(30.1) == "30.1"
+        assert "oversold" not in strategy._rsi_label(30.1)
+        assert "oversold" in strategy._rsi_label(30)
+
+    def test_overbought_and_oversold_dont_collide(self):
+        # An overbought reading must NEVER read as oversold (or vice versa).
+        # Tests against a sign-flipped regression on the comparator.
+        assert "oversold" not in strategy._rsi_label(75)
+        assert "overbought" not in strategy._rsi_label(25)
+
+    def test_non_numeric_degrades_to_string(self):
+        # Mirror of the `_bb_label` degrade-safety contract — a malformed
+        # cache row must fall through to its str form, never raise into
+        # decide() (the format helper is on the live decision hot path).
+        assert strategy._rsi_label("weird") == "weird"
+
+    def test_appears_in_quant_block(self):
+        # End-to-end: the label reaches the rendered TECHNICAL SIGNALS block,
+        # so Opus reads the annotated state directly. Two rows — one
+        # stretched (NVDA overbought), one mid (MU bare) — pin both arms in
+        # the rendered output, not just the unit-level helper.
+        out = strategy._format_quant_signals({
+            "NVDA": {"rsi": 72.5, "bb_position": 0.1},
+        })
+        assert "rsi=72.5 (overbought)" in out
+        out2 = strategy._format_quant_signals({
+            "MU": {"rsi": 50, "bb_position": 0.2},
+        })
+        assert "rsi=50 " in out2
+        assert "overbought" not in out2
+        assert "oversold" not in out2
+        # Oversold also propagates end-to-end.
+        out3 = strategy._format_quant_signals({
+            "BIIB": {"rsi": 25.0, "bb_position": -0.1},
+        })
+        assert "rsi=25.0 (oversold)" in out3
+
+    def test_none_rsi_in_quant_block_still_question_mark(self):
+        # Regression guard: rsi=None used to flow through `_v` (→ "?"). The
+        # rewire to `_rsi_label` must preserve that exact rendering so the
+        # `test_pct_vs_v_field_coercion` contract one class up still holds.
+        out = strategy._format_quant_signals({
+            "NVDA": {"rsi": None, "bb_position": 0.1},
+        })
+        assert "rsi=?" in out
+        assert "rsi=?%" not in out
+
+
 class TestBollingerPositionCalibration:
     """`get_quant_signals_live` computes `bb_position = (last - sma20) /
     (2 * sd20)`, so a price sitting *on* the upper/lower Bollinger band (2
