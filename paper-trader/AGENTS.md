@@ -6,6 +6,142 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 core HYBRID pass #8 (Agent 1) — `feed_health` UNSCORED clause: distinguish "ML scorer down" from "collector down"
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Re-read `runner.py`, `reporter.py`, `signals.py`, `strategy.py`,
+`market.py`, `store.py` and the relevant slice of `dashboard.py`
+(`_feed_db_probe` + `feed_health_api`). The codebase remains heavily
+hardened — 877 core tests pass clean, 468 feed/dashboard/signal tests
+pass clean, no actionable defect surfaced through close reading or live
+endpoint smoke. Set `bugs_fixed=0`, moved on (sunk-cost grazing trap).
+
+### Phase 2 — feat: `feed_health` `resolved_scored_2h` / `unscored_feed` + new BLIND/STALE_FEED clause
+
+**Live root cause this closes:** the BLIND headline historically said
+`"{N} live article(s) in the last 2h"`, which a trader reading on
+Discord plausibly interprets as "feed is fine, just no high-score
+news". The observed 2026-05-24 pathology (confirmed by direct DB
+query — 184 live articles in window, ALL with `ai_score=0.0`, 37
+consecutive BLIND cycles) was the digital-intern ML scoring pipeline
+silently down — collector fine, scorer dead. The old headline gave
+NO signal which upstream to restart.
+
+**What landed:**
+
+- `LIVE_MIN_SCORE = 4.0` constant in `analytics/feed_health.py`
+  (mirrors `strategy.decide()`'s `signals.get_top_signals(min_score=4.0)`).
+- `_feed_db_probe(want_counts=True)` now also returns `live_scored_2h`
+  — articles in the 2h window passing `ai_score >= LIVE_MIN_SCORE`.
+- `build_feed_health` reads `feed["resolved_scored_2h"]` and emits a
+  new boolean `unscored_feed` = `(scored_2h is not None AND
+  live_2h > 0 AND scored_2h == 0)`. When True, the BLIND **or**
+  STALE_FEED headline gains a clause naming the digital-intern ML
+  scorer as the failure point and prescribing the right operator
+  action ("restart the scorer, not the collector").
+- Pure-builder callers / fixture tests that don't pass the new field
+  see `unscored_feed=False` and byte-identical pre-fix headlines —
+  additive contract preserved (all 18 pre-existing
+  `tests/test_feed_health.py` cases still pass unchanged).
+- New output echoes: `resolved_scored_2h`, `unscored_feed`,
+  `live_min_score` (the constant — same echo discipline as
+  `blind_streak_min` / `stale_hours` / `split_brain_gap_h`).
+
+**Test coverage added (9 new cases):**
+
+- `TestUnscoredFeed::test_unscored_flag_when_articles_arriving_but_zero_scored`
+  — locks the live 2026-05-24 pathology shape end-to-end.
+- `TestUnscoredFeed::test_unscored_flag_FALSE_when_some_articles_scored`
+  — gate must NOT fire when ≥1 row scored.
+- `TestUnscoredFeed::test_unscored_flag_FALSE_when_no_articles_at_all`
+  — distinguishes scorer-down (rows present, none scored) from
+  collector-down (no rows). "0 of 0 scored" must NOT emit
+  "restart the scorer" against a dead collector.
+- `TestUnscoredFeed::test_unscored_clause_also_appended_to_stale_feed_headline`
+  — the clause works on either verdict rail (verdict precedence
+  unchanged).
+- `TestUnscoredFeed::test_unscored_clause_NOT_appended_to_healthy_headline`
+  — defensive: trader receiving signals must not see the clause.
+- `TestUnscoredFeed::test_missing_scored_count_is_byte_identical_legacy_behaviour`
+  — backward-compat contract pin.
+- `TestUnscoredFeed::test_non_numeric_scored_count_falls_back_to_None`
+  — degrades safely on a malformed feed dict.
+- `test_feed_db_probe_counts_scored_rows` — endpoint-side: counts
+  honour the live-only clause (a fresher synthetic backtest:// row
+  with ai_score=9.9 must NOT count) and the LIVE_MIN_SCORE gate.
+- `test_feed_db_probe_no_counts_skips_scored_query` — the
+  `want_counts=False` path (used for non-resolved candidates) keeps
+  the per-candidate probe lean.
+
+### Phase 3 — Live trader findings (user_findings = 5)
+
+Hit the live `:8090` dashboard endpoints as a trader would:
+
+1. **TRADER BLIND — 37 consecutive 0-signal decisions**
+   (`/api/feed-health`). Articles ARE arriving (184 in last 2h)
+   but every row has `ai_score=0.0` — digital-intern ML scoring
+   pipeline is silently down. Trader is making decisions on pure
+   quant signals (RSI/MACD only — no news context). This is the
+   exact failure mode the new UNSCORED clause exists to surface;
+   once the runner restarts onto the new code (`/api/build-info`
+   currently `stale: true, behind: 1` — git-watcher will bounce
+   shortly), the next BLIND alert will name the scorer as the
+   culprit.
+2. **Runner HEALTHY** — `/api/runner-heartbeat` verdict HEALTHY,
+   last decision 21m ago, on-schedule for the 60m closed-market
+   cadence, holds the singleton lock, no breaker/quota latches,
+   Discord delivery HEALTHY.
+3. **Book 100% cash, $987.39 (-1.26% P/L)** — Opus correctly
+   refusing to deploy without news context. The combination of
+   BLIND feed + 100% cash is internally consistent (the
+   `MISSED_TAILWIND` regime-fit line in `_regime_leverage_fit_line`
+   also catches this same defensive posture from the leverage
+   dimension).
+4. **`/api/state` flat schema** — fields are nested under `portfolio`
+   (`d["portfolio"]["cash"]`), not flat at the top level. Documented
+   shape, not a bug; flagged because a script newcomer would expect
+   the flat shape.
+5. **Build is `stale: true, behind: 1`** — committed fix `cd6647a`
+   has not yet been picked up by the running runner (boot_sha
+   `8378d37`). The git-watcher (180s poll + 600s deadman) will
+   restart the runner between cycles to deploy the new UNSCORED
+   clause. Confirms the deferred-restart machinery itself is
+   working as designed.
+
+### Phase 4 — verify
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_feed_health.py tests/test_feed_health_endpoint.py -v
+# 29 passed
+python3 -m pytest tests/ -q -k "feed_health or dashboard or signal"
+# 468 passed
+```
+
+### Files touched
+
+- `paper_trader/analytics/feed_health.py` (+67 lines)
+- `paper_trader/dashboard.py` (+36 lines — `_feed_db_probe` +
+  `feed_health_api` only)
+- `tests/test_feed_health.py` (+129 lines — new `TestUnscoredFeed`
+  class + `live_min_score` constant echo assert)
+- `tests/test_feed_health_endpoint.py` (+50 lines)
+
+Total: 278 inserts, 4 deletes. Single commit `cd6647a`.
+
+### Why no `reporter.py` Discord-side change
+
+`reporter._feed_health_line` (pass #22, commit `7e94...`) already
+composes `build_feed_health` verbatim and forwards `headline` as-is
+to the hourly / daily-close summary. The new UNSCORED clause is part
+of `headline`, so Discord automatically picks it up the next time
+the verdict is BLIND or STALE_FEED — no `reporter.py` change needed
+(invariant #10: single source of truth at the builder; reporter is
+pure passthrough).
+
+---
+
 ## 2026-05-24 core HYBRID pass #7 (Agent 1) — `/api/cycle-gap-summary` historical companion to `/api/decision-cadence`
 
 ### Phase 1 — Debug: bugs_fixed = 0

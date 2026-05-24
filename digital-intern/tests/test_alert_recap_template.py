@@ -602,6 +602,91 @@ class TestHelperCatchesLiveNoise:
                 f"wrong fingerprint for {t!r}: got {name!r}"
             )
 
+    def test_gurufocus_recap_post_earnings_mill(self):
+        """Live evidence (2026-05-23, 7d articles.db urgency=2 scan — NVDA
+        earnings night syndication on GoogleNews/GuruFocus / GN: Nvidia /
+        GN: earnings, all above the 0.45 lone-source bar so the authority
+        gate cannot catch them; content type IS the failure):
+          - "NVIDIA (NVDA) Reports Robust Earnings While Valuation Appears
+             At - GuruFocus"  ml=9.98 score_source='ml' (urgency=2 ×2)
+          - "NVIDIA (NVDA) Reports Strong Earnings Amid AI Investment Surge
+             - GuruFocus"     ml=9.26 score_source='ml' (urgency=2)
+          - "NVIDIA (NVDA) Stock Faces Setback Despite Strong Earnings Report
+             - GuruFocus"     ml=9.83 score_source='ml' (urgency=2)
+          - "NVIDIA (NVDA) Exceeds Earnings Expectations with Strong Future O
+             - GuruFocus"     ai=8.00 score_source='llm' (urgency=2,
+                                              Sonnet over-scored same template)
+
+        Pin all four live failures plus same-template siblings across other
+        qualitative adjectives (Mixed / Solid / Weak / Modest / Disappointing)
+        and across the three orthogonal sub-templates. The qualitative
+        adjective + earnings-noun pair / "Stock Faces Setback Despite" /
+        "Exceeds Earnings Expectations" are SEO-mill specific — real wires
+        cite specifics, not editorial qualifiers."""
+        for t in (
+            # Live failure cases — exact titles that reached urgency=2.
+            "NVIDIA (NVDA) Reports Robust Earnings While Valuation Appears At - GuruFocus",
+            "NVIDIA (NVDA) Reports Strong Earnings Amid AI Investment Surge - GuruFocus",
+            "NVIDIA (NVDA) Stock Faces Setback Despite Strong Earnings Report - GuruFocus",
+            "NVIDIA (NVDA) Exceeds Earnings Expectations with Strong Future O - GuruFocus",
+            # Same template, other qualitative adjectives the mill rotates.
+            "AMD (AMD) Reports Mixed Earnings Despite Sector Tailwind - GuruFocus",
+            "Lumentum (LITE) Reports Solid Q1 Results - GuruFocus",
+            "MakeMyTrip (MMYT) Reports Weak Quarter Despite Travel Recovery - GuruFocus",
+            "ORCL Reports Modest Earnings, Margins Compress - GuruFocus",
+            "Tesla (TSLA) Reports Disappointing Earnings as Margins Compress",
+            # Other sub-template — Stock Faces Setback Despite.
+            "Micron (MU) Stock Faces Setback Despite Strong DRAM Outlook",
+            # Other sub-template — Exceeds/Outperforms Earnings Expectations.
+            "AMD Exceeds Earnings Expectations on Data-Center Strength",
+            "MSFT Outperforms Earnings Expectations Amid Azure Growth",
+            "Lumentum Outperform Earnings Expectations With Solid Margins",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed GuruFocus post-earnings recap: {t!r}"
+            assert name == "gurufocus_recap", (
+                f"wrong fingerprint for {t!r}: got {name!r}"
+            )
+
+    def test_gurufocus_recap_does_not_catch_real_earnings_wires(self):
+        """The GuruFocus gate must NOT catch real wire copy. The qualitative
+        adjective + earnings-noun pair / "Stock Faces Setback Despite" /
+        "Exceeds Earnings Expectations" trio is the SEO-mill signature; real
+        wires cite specifics (record $X revenue, beats estimates by $Y) and
+        avoid the editorial qualifiers."""
+        for t in (
+            # Real specifics — no qualitative adjective + earnings-noun pair.
+            "NVIDIA Reports Record $81.62 Billion Revenue as Gaming Income Disappears",
+            "Nvidia Q1 revenue rises 22% to $35.1 billion, beats estimates",
+            "Nvidia (NVDA) tops Q1 earnings and revenue estimates - MSN",
+            "Nvidia Beats Estimates With $81.62 Billion in Q1 Revenue",
+            # Real "Reports Record" / "Reports Best" — Record/Best NOT in
+            # the qualitative-adjective list, so legit wires survive.
+            "AMD reports record Q1 revenue, raises guidance",
+            "NVIDIA reports record quarter results across segments",
+            "Lumentum reports best EPS quarter in five years",
+            # Real "beats" / "tops" / "blows past" wires.
+            "MU earnings blow past estimates",
+            "Apple beats Q4 earnings, raises FY outlook",
+            "Tesla tops Q1 EPS forecast on automotive margins",
+            # Real wires using "Stock falls" / "Stock drops" — not the
+            # SEO-mill "Stock Faces Setback Despite" editorial framing.
+            "Apple shares fall after weak guidance",
+            "Tesla stock drops 5% on margin miss",
+            "Lumentum stock falls on telecom outlook cut",
+            # Real wires using "beats" / "tops" — not "Exceeds Earnings
+            # Expectations" formal framing.
+            "Nvidia beats Q1 estimates by $5B",
+            "MSFT tops EPS forecast for fifth consecutive quarter",
+            # Macro / unrelated.
+            "Fed cuts rates by 50bp, citing labor weakness",
+            "Trump signs executive order on chip exports",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert not hit, (
+                f"GuruFocus gate over-caught real wire: {t!r} (name={name!r})"
+            )
+
     def test_subject_pct_after_does_not_overcatch_real_breaking(self):
         """The subject_pct_after pattern must NOT catch real wire copy. The
         QUAD discriminator (1..6 subject tokens + Shares/Stock/Is/Are/Was/Were

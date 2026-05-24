@@ -1785,6 +1785,30 @@ _BRIEFING_RT_SUBJECT_PCT_AFTER = re.compile(
     re.IGNORECASE,
 )
 
+# "<Subject> (TICKER) Reports <Adj> Earnings/Quarter/Results/Q[1-4]" / "Stock
+# Faces Setback Despite ..." / "Exceeds Earnings Expectations ..." — lockstep
+# mirror of ``watchers.alert_agent._RT_GURUFOCUS_RECAP``. The GuruFocus /
+# "GoogleNews/GuruFocus" algorithmic post-earnings-recap mill fires for every
+# quarterly print with a templated qualitative adjective the wires never use
+# (live evidence 2026-05-23, NVDA earnings night: 5 distinct GuruFocus rows
+# reached urgency=2 on the alert-path scan — see full evidence in
+# ``alert_agent._RT_GURUFOCUS_RECAP`` block comment). Without this mirror the
+# per-domain cap admits them into the briefing's top-50 digest pool —
+# surfacing post-event qualitative recap as fresh TOP SIGNALS despite being
+# retrospective. Byte-identical regex to the alert side (anti-drift discipline,
+# enforced structurally by ``test_alert_and_briefing_recap_tuples_have_same_length``).
+_BRIEFING_RT_GURUFOCUS_RECAP = re.compile(
+    r"\b("
+    r"Reports\s+(?:Robust|Strong|Solid|Mixed|Weak|Modest|Disappointing)\s+"
+    r"(?:Earnings|Quarter|Results|Q[1-4])"
+    r"|"
+    r"Stock\s+Faces\s+Setback\s+Despite"
+    r"|"
+    r"(?:Exceeds|Outperforms?)\s+Earnings\s+Expectations"
+    r")\b",
+    re.IGNORECASE,
+)
+
 _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _BRIEFING_RT_WHY_TRADING),
     ("why_did_stock", _BRIEFING_RT_WHY_DID),
@@ -1817,6 +1841,7 @@ _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("daily_price_city", _BRIEFING_RT_DAILY_PRICE_CITY),
     ("whats_next_after", _BRIEFING_RT_WHATS_NEXT_AFTER),
     ("earnings_release_pt", _BRIEFING_RT_EARNINGS_RELEASE_PT),
+    ("gurufocus_recap", _BRIEFING_RT_GURUFOCUS_RECAP),
 )
 
 
