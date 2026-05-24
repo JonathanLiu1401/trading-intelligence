@@ -844,6 +844,129 @@ class ArticleStore:
         ]
 
     @_retry_on_lock
+    def briefing_health(self, window_h: int = 24) -> dict:
+        """Heartbeat-briefing pipeline health snapshot.
+
+        The 5h Opus briefing is the analyst's primary synthesised intelligence
+        product. When the briefing path goes dark — Opus quota exhausted,
+        Claude CLI auth lapsed, persistent network failures, or the heartbeat
+        worker itself wedged — the dashboard's ``/api/briefings`` simply
+        returns an older briefing and the analyst doesn't realise the digest
+        is stale. Existing siblings:
+
+          * ``source_freshness`` — per-collector liveness ("which feeds went
+            dark?"); cannot detect a Claude-side outage.
+          * ``urgent_queue_health`` — what's queued for the alert path;
+            unrelated to the briefing path.
+          * ``urgency_label_split*`` — alert calibration; doesn't track
+            briefing health.
+
+        This is the missing primitive: one query that turns the briefings
+        table into an analyst-actionable "is the briefing path healthy?"
+        verdict. Built purely from the ``briefings`` table (no article
+        cross-join needed; the table only carries Opus-generated text and is
+        never touched by backtest paths — synthetic rows live in
+        ``articles`` only).
+
+        ``HEARTBEAT_INTERVAL = 5h`` (see ``daemon.py``) is the production
+        cadence, so ``expected_in_window`` is ``window_h / 5``. The verdict
+        ladder is deliberately conservative — a single skipped briefing
+        (Claude transient empty response, see ``heartbeat_worker``'s
+        ``startswith("[analyst]")`` skip) is normal and must not flag DEAD.
+
+        Returns::
+
+            {
+              "window_h":           int,
+              "last_briefing_age_h": float | None,    # None when no briefings ever
+              "count_in_window":    int,
+              "expected_in_window": float,             # window_h / 5h cadence
+              "verdict":            "HEALTHY" | "STALE" | "DEAD" | "NO_DATA",
+            }
+
+        Verdict semantics:
+          * ``NO_DATA`` — the briefings table is empty (fresh DB, first cycle
+            hasn't fired yet). Distinct from DEAD: the analyst should NOT
+            interpret an empty table as an outage on a just-started daemon.
+          * ``DEAD`` — last briefing age > 12h. Two full 5h cadences have
+            elapsed; the path is materially down and the analyst is
+            operating on a stale digest.
+          * ``STALE`` — last briefing age between 6h and 12h, OR count is
+            below 60% of expected (e.g. <3 in 24h). One cadence skipped or
+            persistent under-production — early-warning, not yet DEAD.
+          * ``HEALTHY`` — everything else. Last < 6h ago AND count meets the
+            60%-of-expected floor.
+
+        Read-only (single MAX + COUNT SELECT). NO DB write — no
+        ai_score / ml_score / score_source / urgency mutation. All four
+        load-bearing invariants intact by construction.
+        """
+        window_h = max(int(window_h), 1)
+        now = datetime.now(timezone.utc)
+        since = (now - timedelta(hours=window_h)).isoformat()
+
+        # MAX(ts) + COUNT(*) bounded by the window in one round trip.
+        # Aggregates always yield exactly one row, so ``_expect_row`` is
+        # the right guard against shared-connection cursor-state corruption
+        # (same discipline as ``stats`` / ``stats_since``).
+        row = _expect_row(self.conn.execute(
+            "SELECT MAX(ts), COUNT(*) FROM briefings WHERE ts >= ?",
+            (since,),
+        ))
+        newest_in_window, count_in_window = row[0], int(row[1] or 0)
+
+        # When the window is empty, look beyond it for the overall most-
+        # recent briefing — needed to distinguish DEAD (one stale briefing
+        # >12h ago) from NO_DATA (no briefings ever recorded).
+        if newest_in_window is None:
+            overall = _expect_row(self.conn.execute(
+                "SELECT MAX(ts) FROM briefings"
+            ))[0]
+        else:
+            overall = newest_in_window
+
+        last_age_h: float | None = None
+        if overall:
+            try:
+                ts = datetime.fromisoformat(overall)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                last_age_h = round(
+                    max(0.0, (now - ts).total_seconds() / 3600.0), 2
+                )
+            except (ValueError, TypeError):
+                # Unparseable timestamp in the briefings table — treat as
+                # NO_DATA rather than crashing. The save path always writes
+                # ``datetime.now(timezone.utc).isoformat()`` so a corrupt
+                # value is the only way this branch fires.
+                last_age_h = None
+
+        # 5h cadence is the daemon's HEARTBEAT_INTERVAL — duplicated here
+        # rather than imported (the storage layer must not pull the daemon /
+        # collectors graph; mirrors ``_briefing_domain_key`` duplicating
+        # ml.features). 60% floor matches the analyst-meaningful "we lost
+        # ~2 of 5 expected briefings in 24h is concerning" threshold.
+        expected_in_window = round(window_h / 5.0, 2)
+        min_count_healthy = max(1, int(0.6 * expected_in_window))
+
+        if last_age_h is None:
+            verdict = "NO_DATA"
+        elif last_age_h > 12.0:
+            verdict = "DEAD"
+        elif last_age_h > 6.0 or count_in_window < min_count_healthy:
+            verdict = "STALE"
+        else:
+            verdict = "HEALTHY"
+
+        return {
+            "window_h": window_h,
+            "last_briefing_age_h": last_age_h,
+            "count_in_window": count_in_window,
+            "expected_in_window": expected_in_window,
+            "verdict": verdict,
+        }
+
+    @_retry_on_lock
     def count_unscored(self, min_kw: float = 0.0) -> int:
         """Count articles still pending the scorer. Mirrors ``get_unscored``'s
         filter (ai_score=0 AND ml_score IS NULL AND kw_score>=min_kw AND
