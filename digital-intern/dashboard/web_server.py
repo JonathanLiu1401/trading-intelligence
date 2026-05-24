@@ -2374,6 +2374,247 @@ def _earnings_shock_chat_lines(es) -> list[str]:
     return lines
 
 
+def _no_decision_reasons_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/no-decision-reasons` (per-bucket histogram
+    of recent NO_DECISION causes — host_saturated / cli_nonzero_rc / parse_
+    failed / claude_timeout / claude_empty / blocked / unknown) as compact
+    chat-context lines.
+
+    The chat already carries the decision-paralysis FACT ("we are not
+    deciding") and the runner-heartbeat AVAILABILITY signal. Neither answers
+    the operator's first follow-up: **WHY is the bot empty? is it the
+    runner's fault, or is the box saturated by review agents / backtests?**
+    The trader endpoint already buckets the cause and emits a verbatim
+    `recommendation` — host saturation requires reducing parallel Opus jobs,
+    not a runner restart; a parse_failed cluster is a prompt-shape bug, not
+    a host issue. The chat-side surface lets the analyst answer "why is the
+    bot silent right now?" without parsing daemon logs.
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` is the
+    chat headline — no chat-side re-derived verdict that could drift from
+    the trader endpoint (the ``_decision_paralysis_chat_lines`` precedent).
+    The ``recommendation`` text is already inlined into the builder's
+    headline (`"<n>/<N> cycles NO_DECISION; dominant cause: <bucket> (P%) —
+    <recommendation>"`) so the headline alone is self-contained and
+    actionable.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - state in {None, NO_DATA, NORMAL, MIXED} → ``[]``: only DOMINANT is
+      actionable (one bucket exceeds the builder's own
+      ``DOMINANT_THRESHOLD_PCT`` of the NO_DECISION rows); MIXED is the
+      "no single cause owns this" state where the recommendation would be
+      hand-wavy, matching the ``_decision_paralysis_chat_lines`` silence
+      precedent — never chat filler when the cause is diffuse.
+    - state DOMINANT → builder's verbatim ``headline`` (only when a usable
+      string) + an optional detail line restating the top 3 buckets from
+      ``buckets`` (counts only, no re-derivation of percentages); a missing
+      / non-dict ``buckets`` degrades silently (the
+      ``_paper_trader_position_lines`` precedent).
+    """
+    if not isinstance(rep, dict):
+        return []
+    state = rep.get("state")
+    if state != "DOMINANT":
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    buckets = rep.get("buckets")
+    if isinstance(buckets, dict) and buckets:
+        ranked: list[tuple[str, int]] = []
+        for k, v in buckets.items():
+            if not isinstance(k, str):
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            try:
+                n = int(v)
+            except Exception:
+                continue
+            if n > 0:
+                ranked.append((k, n))
+        ranked.sort(key=lambda kv: kv[1], reverse=True)
+        if ranked:
+            top = ", ".join(f"{k}: {n}" for k, n in ranked[:3])
+            lines.append(f"  bucket counts → {top}")
+
+    return lines
+
+
+def _round_trip_postmortem_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/round-trip-postmortem` (post-exit drift
+    verdict per closed round-trip — CORRECT / PREMATURE / MISSED_RUNNER /
+    WHIPSAW / NEUTRAL) as compact chat-context lines.
+
+    Every existing realized-P&L chat surface reduces a closed trip to a
+    P&L number: winner_autopsy / loser_autopsy / streak / scorecard all
+    answer *what closed* and *at what dollar*. None ask the falsifiable
+    hindsight question: **was the exit good — did the price keep moving
+    against the bot after the sell?** Selling DRAM at -0.1% looks fine on
+    track-record; it reads catastrophically if DRAM rallied +5% the hour
+    after the sell. This block fills that gap so the analyst can answer
+    "should we have held that exit?" without re-pricing trips manually.
+
+    SSOT (paper-trader invariant #10): the builder's own top-level
+    ``headline`` is the chat headline AND the surfaced worst-trip's own
+    per-row ``headline`` passes through verbatim — no chat-side paraphrase
+    of the bot's own per-trip narrative (the ``_decision_vapor_chat_lines``
+    /  ``_thesis_drift_chat_lines`` verbatim-passthrough precedent).
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - state in {None, NO_DATA, INSUFFICIENT} → ``[]``: insufficient post-
+      exit drift history means the verdict is silently withheld, not
+      fabricated (the ``baseline_compare`` INSUFFICIENT_DATA → silent-but-
+      honest precedent).
+    - state OK with zero PREMATURE / MISSED_RUNNER / WHIPSAW trips → ``[]``:
+      an all-CORRECT/NEUTRAL exit ladder is silence, matching the
+      ``_decision_paralysis_chat_lines`` silence precedent — never chat
+      filler when exits are timing fine.
+    - actionable (≥1 unfavourable trip) → builder's verbatim top-level
+      ``headline`` + the verbatim ``headline`` of the single worst trip
+      (largest absolute post-exit drift among the unfavourable verdicts),
+      ticker passthrough for traceability. Missing fields degrade silently.
+    """
+    if not isinstance(rep, dict):
+        return []
+    state = rep.get("state")
+    if state != "OK":                      # only OK carries a usable verdict
+        return []
+    trips = rep.get("trips")
+    if not isinstance(trips, list) or not trips:
+        return []
+
+    unfavourable = {"PREMATURE", "MISSED_RUNNER", "WHIPSAW"}
+
+    def _drift_mag(t):
+        d = t.get("post_exit_drift_pct") if isinstance(t, dict) else None
+        if isinstance(d, bool) or not isinstance(d, (int, float)):
+            return -1.0
+        return abs(float(d))
+
+    bad = [
+        t for t in trips
+        if isinstance(t, dict) and t.get("verdict") in unfavourable
+    ]
+    if not bad:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    # Pick the trip with the largest absolute post-exit drift among the
+    # unfavourable verdicts (the most painful sample, by definition).
+    worst = max(bad, key=_drift_mag)
+    worst_headline = worst.get("headline")
+    if isinstance(worst_headline, str) and worst_headline.strip():
+        lines.append(f"  • {worst_headline}")
+
+    return lines
+
+
+def _cash_drag_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/cash-drag` (SPY-benchmarked $ cost of
+    sitting in cash, per rolling window) as compact chat-context lines.
+
+    The chat already carries idle-cash snapshots (the ``/api/risk`` cash_pct
+    in the portfolio block), cash_redeployment latency (the post-SELL sit
+    pathology) and opportunity_cost (signal-specific hindsight). None
+    surface the BENCHMARKED dollar cost — "while you sat at avg cash $358
+    over the last 168h, SPY ran +0.96% — that's $3.44 of beta you forfeited
+    by being out". That's the answer to "is sitting in cash actually costing
+    me?" the operator asks at the end of a multi-day cash stretch.
+
+    SSOT (paper-trader invariant #10): the builder's own top-level
+    ``headline`` is the chat headline — no chat-side re-derived verdict
+    that could drift from the trader endpoint (the
+    ``_decision_paralysis_chat_lines`` precedent). The detail line restates
+    the worst window's *own* fields (window_hours / sp500_return_pct /
+    avg_cash_usd / cash_drag_usd) — never a recomputation
+    (``_macro_calendar_chat_lines`` field-passthrough precedent).
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - state != "OK" or top-level verdict not in {"COSTLY_CASH"} → ``[]``:
+      NEUTRAL / HELPFUL_CASH / INSUFFICIENT / NO_DATA collapse to silence
+      — cash that SAVED you money or had no benchmark to compare against
+      is not actionable (the ``_decision_paralysis_chat_lines`` silence
+      precedent — never chat filler when cash is fine or unscored).
+    - actionable (COSTLY_CASH) → builder's verbatim ``headline`` (only when
+      a usable string) + a worst-window detail line from ``windows`` (the
+      single COSTLY_CASH window with the highest cash_drag_usd; ties
+      broken by longer window_hours). Missing windows / fields degrade
+      silently (the ``_paper_trader_position_lines`` precedent).
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("state") != "OK":
+        return []
+    if rep.get("verdict") != "COSTLY_CASH":
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    windows = rep.get("windows")
+    if isinstance(windows, list):
+        # Find the worst COSTLY_CASH window — highest drag $, ties broken
+        # by longer window_hours (longer windows are weightier evidence).
+        best: dict | None = None
+        best_drag = -1.0
+        best_hours = -1.0
+        for w in windows:
+            if not isinstance(w, dict):
+                continue
+            if w.get("state") != "OK" or w.get("verdict") != "COSTLY_CASH":
+                continue
+            drag = _num(w.get("cash_drag_usd"))
+            hrs = _num(w.get("window_hours"))
+            if drag is None:
+                continue
+            hkey = hrs if hrs is not None else -1.0
+            if (drag > best_drag) or (drag == best_drag and hkey > best_hours):
+                best = w
+                best_drag = drag
+                best_hours = hkey
+        if best is not None:
+            hrs = _num(best.get("window_hours"))
+            spy = _num(best.get("sp500_return_pct"))
+            avg = _num(best.get("avg_cash_usd"))
+            drag = _num(best.get("cash_drag_usd"))
+            parts: list[str] = []
+            if hrs is not None:
+                parts.append(f"window {hrs:.0f}h")
+            if spy is not None:
+                parts.append(f"SPY {spy:+.2f}%")
+            if avg is not None:
+                parts.append(f"avg cash ${avg:,.0f}")
+            if drag is not None:
+                parts.append(f"drag ${drag:,.2f}")
+            if parts:
+                lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
 def _norm_title(t: Any) -> str:
     return str(t or "").strip().casefold()
 
@@ -6349,6 +6590,94 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: alert-confidence-trend enrichment failed: %s", e)
 
+        # NO_DECISION cause attribution — when the bot is silent for a
+        # stretch, the operator's first question is "WHY?". The chat
+        # already carries decision-paralysis (the FACT we are not deciding)
+        # and runner-heartbeat (the availability signal) but neither
+        # answers "is it the runner's fault, or is the box saturated by
+        # review agents / backtest committee?". The trader endpoint
+        # buckets the cause and emits a verbatim recommendation
+        # (host_saturated requires reducing parallel Opus jobs, NOT a
+        # runner restart; a parse_failed cluster is a prompt-shape bug,
+        # not a host issue). Block fires ONLY on DOMINANT (NO_DATA /
+        # NORMAL / MIXED collapse to silence — the
+        # _decision_paralysis_chat_lines silence precedent, never chat
+        # filler when the bot is deciding or when the cause is diffuse).
+        # Composed verbatim by the pure _no_decision_reasons_chat_lines
+        # helper (unit-tested; SSOT — the builder's own `headline` is
+        # the chat headline AND already contains the recommendation
+        # verbatim, no chat-side re-derivation). Guarded 3s read; only
+        # appears once :8090 is restarted onto /api/no-decision-reasons.
+        no_decision_reasons_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/no-decision-reasons",
+                    timeout=3) as resp:
+                _ndr = json.loads(resp.read().decode("utf-8"))
+            no_decision_reasons_block = "\n".join(
+                _no_decision_reasons_chat_lines(_ndr))
+        except Exception as e:
+            _logger().warning(
+                "chat: no-decision-reasons fetch failed: %s", e)
+
+        # Round-trip post-mortem — was each closed exit timed correctly
+        # relative to the *next* price drift? Every existing realized-P&L
+        # chat surface (winner_autopsy / loser_autopsy / streak / scorecard)
+        # reduces a closed trip to a P&L number; none answer the falsifiable
+        # hindsight question "did the price keep moving against the bot
+        # after the sell?". A trade closed at -0.1% looks fine on
+        # track-record; it reads catastrophic if the name rallied +5% the
+        # hour after. Block fires ONLY when ≥1 PREMATURE / MISSED_RUNNER /
+        # WHIPSAW trip exists (all-CORRECT / NEUTRAL ladders collapse to
+        # silence — the _decision_paralysis_chat_lines silence precedent,
+        # never chat filler when exits are timing fine). Composed verbatim
+        # by the pure _round_trip_postmortem_chat_lines helper (unit-tested;
+        # SSOT — the builder's top-level `headline` AND the worst trip's
+        # own per-row `headline` pass through verbatim, no chat-side
+        # paraphrase). Guarded 3s read; only appears once :8090 is
+        # restarted onto /api/round-trip-postmortem.
+        round_trip_postmortem_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/round-trip-postmortem",
+                    timeout=3) as resp:
+                _rtp = json.loads(resp.read().decode("utf-8"))
+            round_trip_postmortem_block = "\n".join(
+                _round_trip_postmortem_chat_lines(_rtp))
+        except Exception as e:
+            _logger().warning(
+                "chat: round-trip-postmortem fetch failed: %s", e)
+
+        # Cash drag — SPY-benchmarked $ cost of sitting in cash, per
+        # rolling window. The chat already carries idle-cash snapshots
+        # (/api/risk cash_pct), cash_redeployment latency (the post-SELL
+        # sit pathology), and opportunity_cost (signal-specific hindsight).
+        # None surface the BENCHMARKED dollar cost — "while you sat at avg
+        # cash $358 over the last 168h, SPY ran +0.96% — that's $3.44 of
+        # beta you forfeited by being out". That's the answer to "is
+        # sitting in cash actually costing me?" the operator asks at the
+        # end of a multi-day cash stretch. Block fires ONLY on COSTLY_CASH
+        # (NEUTRAL / HELPFUL_CASH / INSUFFICIENT / NO_DATA collapse to
+        # silence — the _decision_paralysis_chat_lines silence precedent,
+        # never chat filler when cash saved you money or there's no
+        # benchmark). Composed verbatim by the pure _cash_drag_chat_lines
+        # helper (unit-tested; SSOT — the builder's own `headline` is the
+        # chat headline, no re-derived verdict). Guarded 3s read; only
+        # appears once :8090 is restarted onto /api/cash-drag.
+        cash_drag_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/cash-drag",
+                    timeout=3) as resp:
+                _cd = json.loads(resp.read().decode("utf-8"))
+            cash_drag_block = "\n".join(_cash_drag_chat_lines(_cd))
+        except Exception as e:
+            _logger().warning(
+                "chat: cash-drag fetch failed: %s", e)
+
         now_iso = datetime.now(timezone.utc).isoformat()
         system_prompt = (
             "You are a market intelligence analyst with access to a real-time news feed, "
@@ -6397,6 +6726,9 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — STANDING INTENTS (the FORWARD slice of the reasoning surface — conditional intents the bot itself stated in recent decisions' reasoning ('wait for cash session', 'rotating into LITE/LNOK', 'premature to dump') that are still STANDING within the freshness window without follow-up action. Every other reasoning block looks BACKWARD (vapor on FILLED, thesis-drift on opens, exit-intent on closed sells); none answers 'what did the bot SAY it would do next, that it has not yet done?'. Surfaced ONLY when STANDING_INTENTS / STALE_INTENTS, never filler when NO_INTENTS / NO_DATA. Headline AND each surfaced intent text pass verbatim from the trader endpoint — restate, never re-derive; the bot's own words, never a chat-side paraphrase. ``[stale]`` tag flags plans that aged past the freshness window without action):\n{standing_intents_block}\n\n" if standing_intents_block else "")
             + (f"PAPER TRADER — INTENT FOLLOWTHROUGH (the observational companion to STANDING INTENTS — of the actionable intents the bot stated, did it actually execute them? A bot that emits crisp 'wait for X, then buy Y' statements every cycle but never executes Y has perfect specificity on decision-vapor and zero followthrough; only this block catches the say-do gap. Surfaced ONLY when DRIFTING / ABANDONED, never filler when DISCIPLINED / NO_DATA / NO_RESOLVED. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{intent_followthrough_block}\n\n" if intent_followthrough_block else "")
             + (f"PAPER TRADER — OPPORTUNITY COST (the hindsight read on past HOLD-CASH / NO_DECISION sit-outs — when the bot sat in cash, did the top-news watchlist ticker run without it, or did sitting in cash dodge a drawdown? The chat already carries cash_pct snapshots and idle-opportunity (current drought) but neither answers 'did past cash discipline COST or SAVE alpha?'. Surfaced ONLY when MISSED_ALPHA / DEFENSIVE_WIN, never filler when NEUTRAL / NO_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{opportunity_cost_block}\n\n" if opportunity_cost_block else "")
+            + (f"PAPER TRADER — NO_DECISION CAUSE ATTRIBUTION (when the live trader is silent for a stretch, the operator's first follow-up to decision-paralysis is 'WHY is it empty?'. The trader endpoint buckets the recent NO_DECISION rows into host_saturated / cli_nonzero_rc / parse_failed / claude_timeout / claude_empty / blocked / unknown and emits a verbatim recommendation — host saturation requires reducing parallel Opus jobs, NOT a runner restart; a parse_failed cluster is a prompt-shape bug, not a host issue. Surfaced ONLY when DOMINANT (one bucket exceeds the threshold), never filler when NORMAL / MIXED (diffuse causes do not yield a specific recommendation). Headline carries verbatim from the trader endpoint AND already contains the recommendation — restate, never re-derive):\n{no_decision_reasons_block}\n\n" if no_decision_reasons_block else "")
+            + (f"PAPER TRADER — ROUND-TRIP POSTMORTEM (per closed exit, the post-exit price drift verdict CORRECT / PREMATURE / MISSED_RUNNER / WHIPSAW / NEUTRAL — was the sell well-timed relative to the NEXT drift? Every existing realized-P&L surface — winner_autopsy, loser_autopsy, streak, scorecard — reduces a closed trip to a P&L number; only this block asks 'did the price keep running against the bot after the sell?'. A trade closed at -0.1% looks fine on track-record yet reads catastrophic if the name rallied +5% the hour after. Surfaced ONLY when ≥1 PREMATURE / MISSED_RUNNER / WHIPSAW trip exists, never filler when all CORRECT / NEUTRAL. Top-level headline AND the surfaced worst trip's own per-row headline both carry verbatim from the trader endpoint — restate, never re-derive):\n{round_trip_postmortem_block}\n\n" if round_trip_postmortem_block else "")
+            + (f"PAPER TRADER — CASH DRAG (SPY-benchmarked $ cost of sitting in cash per rolling window — 'while you sat at avg cash $X over the last Yh, SPY ran +Z% — that's $W of beta you forfeited by being out'. Complements cash_pct snapshots, cash_redeployment latency, and opportunity_cost (signal-specific): this is the BENCHMARKED dollar-cost answer to 'is sitting in cash actually costing me?'. Surfaced ONLY when COSTLY_CASH, never filler when NEUTRAL / HELPFUL_CASH / INSUFFICIENT / NO_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{cash_drag_block}\n\n" if cash_drag_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "
