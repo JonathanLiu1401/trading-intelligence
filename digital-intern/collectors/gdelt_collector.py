@@ -11,7 +11,7 @@ GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 MAX_RECORDS = 250       # GDELT API hard limit per query
 TIMESPAN = "10080"      # 7 days in minutes — maximise coverage; SQLite dedupes repeats
 REQUEST_TIMEOUT = 20
-MAX_WORKERS = 30
+MAX_WORKERS = 10  # throttled from 30 — USB DB can't handle 30 concurrent writers
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "seen_articles.db"
