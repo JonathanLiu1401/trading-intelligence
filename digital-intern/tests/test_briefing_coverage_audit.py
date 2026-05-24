@@ -470,3 +470,59 @@ class TestBookTickerParityWithClaudeAnalyst:
         # operator sees different tickers as "top miss".
         from analysis.claude_analyst import _BOOK_TICKERS as CA_BOOK
         assert tuple(_BOOK_TICKERS) == tuple(CA_BOOK)
+
+    def test_audit_book_universe_parity(self):
+        """The *matching* universe (static literal ∪ portfolio.json) is what
+        determines whether an urgent NVDL article registers as a held-name
+        miss. It MUST equal claude_analyst._BOOK_UNIVERSE so the audit and the
+        briefing's own _book_tickers can never disagree about whether an
+        urgent live-config-only row touched the book. Drift here is the
+        exact regression class the union fix exists to prevent (live config
+        additions silently invisible to the coverage audit)."""
+        from analytics.briefing_coverage_audit import _BOOK_UNIVERSE
+        from analysis.claude_analyst import _BOOK_UNIVERSE as CA_UNIVERSE
+        assert _BOOK_UNIVERSE == CA_UNIVERSE
+
+
+class TestLiveConfigTickersMatched:
+    """Pin the live-config regression: a held name added via
+    config/portfolio.json (e.g. NVDL/GOOG/COHR) must be recognised by
+    ``_book_tickers_in_text``. Before the union fix the static literal
+    silently dropped 11 held / watchlisted names, so an urgent NVDL article
+    was treated as out-of-universe rather than missed coverage."""
+
+    def test_live_only_ticker_matched_in_text(self):
+        from analytics.briefing_coverage_audit import _BOOK_UNIVERSE
+        live_only = sorted(set(_BOOK_UNIVERSE) - set(_BOOK_TICKERS))
+        if not live_only:
+            import pytest
+            pytest.skip("no config-only held tickers on this host")
+        tkr = live_only[0]
+        hits = _book_tickers_in_text(f"{tkr} jumps 7% on guidance raise")
+        assert tkr in hits, (
+            f"live config ticker {tkr!r} invisible to _book_tickers_in_text — "
+            "the static _BOOK_TICKERS regression is back"
+        )
+
+    def test_live_only_ticker_appears_in_audit_missed(self):
+        """End-to-end: a briefing that omits a live-only-held ticker but an
+        urgent article that mentions it produces a missed-coverage row for
+        that ticker. The pre-fix audit silently dropped the article at the
+        regex step and the analyst saw no signal at all."""
+        from analytics.briefing_coverage_audit import _BOOK_UNIVERSE
+        live_only = sorted(set(_BOOK_UNIVERSE) - set(_BOOK_TICKERS))
+        if not live_only:
+            import pytest
+            pytest.skip("no config-only held tickers on this host")
+        tkr = live_only[0]
+        briefing = _briefing("Macro view today; mentions of NVDA and MU only.")
+        article = _art(f"{tkr} surges on AI demand", urgency=2)
+        report = build_briefing_coverage_audit(
+            briefing, [article],
+            window_start=WINDOW_START, window_end=NOW, now=NOW,
+        )
+        missed_tkrs = {m["ticker"] for m in report["missed"]}
+        assert tkr in missed_tkrs, (
+            f"live config ticker {tkr!r} not flagged as missed coverage — "
+            "regex/iteration is still using the static-only universe"
+        )

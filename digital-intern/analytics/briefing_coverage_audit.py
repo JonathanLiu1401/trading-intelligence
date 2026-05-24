@@ -55,11 +55,28 @@ _BOOK_TICKERS: tuple[str, ...] = (
     "LITE", "LNOK", "MUU", "DRAM", "SNDU",
     "MU", "MSFT", "AXTI", "ORCL", "TSEM", "QBTS", "NVDA",
 )
+# Live held/watched universe — union of the static literal with
+# config/portfolio.json's positions + option underlyings + sector_watchlist
+# (the same SSOT urgency_scorer / ml.features / analysis.claude_analyst use).
+# The static tuple alone was silently drifting behind the trading UI: a
+# 2026-05-23 live read showed 11 held / watchlisted names (AMAT, AMD, COHR,
+# GOOG, KLAC, LRCX, NVDL, SMH, SOXX, STX, WDC) absent from the static tuple
+# so an urgent article about NVDL or GOOG never registered as a held-name
+# urgent ticker — coverage_ratio could never flag it as missed by the
+# briefing, and the analyst was blind to the gap. Anti-drift parity of
+# ``_BOOK_TICKERS`` with claude_analyst's static tuple is unchanged (and
+# still pinned); the universe only EXTENDS the matching set, it never
+# shrinks or reorders the static core. Mirrors
+# analysis.claude_analyst._BOOK_UNIVERSE byte-for-byte.
+from ml.features import LIVE_PORTFOLIO_TICKERS as _LIVE_PORTFOLIO_TICKERS
+_BOOK_UNIVERSE: tuple[str, ...] = _BOOK_TICKERS + tuple(
+    sorted(set(_LIVE_PORTFOLIO_TICKERS) - set(_BOOK_TICKERS))
+)
 # Longest-first alternation so the regex prefers ``\bMUU\b`` over ``\bMU\b``,
 # matching ``_BOOK_RE`` in claude_analyst exactly.
 _BOOK_RE = re.compile(
     r"\b(?:"
-    + "|".join(re.escape(t) for t in sorted(set(_BOOK_TICKERS),
+    + "|".join(re.escape(t) for t in sorted(set(_BOOK_UNIVERSE),
                                              key=len, reverse=True))
     + r")\b"
 )

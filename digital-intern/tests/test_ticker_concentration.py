@@ -67,8 +67,11 @@ def test_empty_db_yields_zero_mentions(patched_db):
     assert report["tickers"] == {}
     assert report["hhi"] == 0
     assert report["over_saturated"] == []
-    # Every held ticker is under-covered when the corpus is empty.
-    assert set(report["under_covered"]) == set(ticker_concentration._BOOK_TICKERS)
+    # Every held ticker is under-covered when the corpus is empty. The audit
+    # tracks the LIVE universe (static literal + config/portfolio.json), not
+    # just the static literal — a held name added in the trading UI must
+    # still register as under-covered when no news mentions it.
+    assert set(report["under_covered"]) == set(ticker_concentration._BOOK_UNIVERSE)
 
 
 def test_book_ticker_parity():
@@ -79,6 +82,71 @@ def test_book_ticker_parity():
     from analysis import claude_analyst
 
     assert ticker_concentration._BOOK_TICKERS == claude_analyst._BOOK_TICKERS
+
+
+def test_book_universe_parity_with_analyst():
+    """_BOOK_UNIVERSE is the matching set actually used by _BOOK_RE and
+    under_covered. It MUST equal claude_analyst._BOOK_UNIVERSE so the
+    concentration/HHI metrics, the under-covered list, and the briefing's BOOK
+    tag all defend the same live held set. Drift here is the exact bug the
+    union exists to prevent (live config additions silently invisible to one
+    side of the system)."""
+    from analysis import claude_analyst
+
+    assert ticker_concentration._BOOK_UNIVERSE == claude_analyst._BOOK_UNIVERSE
+
+
+def test_book_universe_extends_static_with_live_additions():
+    """_BOOK_UNIVERSE must be a SUPERSET of the static _BOOK_TICKERS (the
+    universe only extends, never shrinks). Every live config-only ticker
+    appears in the universe in deterministic alphabetical order after the
+    static core. Pinned shape regression: live additions are appended after
+    the static tuple, never interleaved."""
+    from ml.features import LIVE_PORTFOLIO_TICKERS
+    static = set(ticker_concentration._BOOK_TICKERS)
+    universe = set(ticker_concentration._BOOK_UNIVERSE)
+    assert static <= universe
+    live_only = LIVE_PORTFOLIO_TICKERS - static
+    assert live_only <= universe
+    n = len(ticker_concentration._BOOK_TICKERS)
+    assert ticker_concentration._BOOK_UNIVERSE[:n] == ticker_concentration._BOOK_TICKERS
+    extension = list(ticker_concentration._BOOK_UNIVERSE[n:])
+    assert extension == sorted(extension)
+
+
+def test_live_only_ticker_registers_mentions(patched_db, monkeypatch):
+    """A held ticker added via config/portfolio.json but absent from the
+    static _BOOK_TICKERS literal must still be counted by the concentration
+    audit. Live-evidenced regression (2026-05-23): NVDL/GOOG/COHR were in
+    portfolio.json yet invisible to this analytics — every NVDL headline
+    was silently dropped at _book_hits and the analyst had no concentration/
+    HHI signal for those held positions."""
+    # Pick the first config-only ticker if any exist; skip when the live
+    # universe matches the static set exactly.
+    config_only = sorted(
+        set(ticker_concentration._BOOK_UNIVERSE)
+        - set(ticker_concentration._BOOK_TICKERS)
+    )
+    if not config_only:
+        pytest.skip("no config-only held tickers to verify on this host")
+    tkr = config_only[0]
+
+    db, build = patched_db
+    rows = [
+        ("a1", "https://x/1", f"{tkr} jumps on upbeat guide", "rss", 7.0, 0),
+        ("a2", "https://x/2", f"{tkr} earnings shock", "rss", 8.5, 2),
+        ("a3", "https://x/3", "weather report", "rss", 1.0, 0),
+    ]
+    build(rows)
+    report = ticker_concentration.compute()
+    assert report["scanned"] == 3
+    # The live-only ticker must register, NOT be silently dropped.
+    assert tkr in report["tickers"], (
+        f"live config ticker {tkr!r} invisible to ticker_concentration — "
+        "the static _BOOK_TICKERS regression is back"
+    )
+    assert report["tickers"][tkr]["n_mentions"] == 2
+    assert report["tickers"][tkr]["n_urgent"] == 1
 
 
 def test_basic_mention_counting(patched_db):
@@ -180,9 +248,10 @@ def test_under_covered_lists_zero_mention_held_tickers(patched_db):
     ]
     build(rows)
     report = ticker_concentration.compute()
-    # NVDA was mentioned; every other held ticker should be under-covered.
+    # NVDA was mentioned; every other held ticker (across the LIVE universe,
+    # static literal ∪ portfolio.json) should be under-covered.
     expected_uncovered = [
-        t for t in ticker_concentration._BOOK_TICKERS if t != "NVDA"
+        t for t in ticker_concentration._BOOK_UNIVERSE if t != "NVDA"
     ]
     assert report["under_covered"] == expected_uncovered
 
