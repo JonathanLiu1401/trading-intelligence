@@ -5,6 +5,50 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-24 feature-dev pass (Agent 4) — STANDING-INTENTS chat enrichment
+
+`dashboard/web_server.py::_standing_intents_chat_lines` pipes paper-trader's
+new `/api/decision-conditionals` (STANDING conditional intents extracted
+from recent decisions' reasoning prose) into the `/api/chat` enrichment.
+
+Answers the forward-looking operator question no other reasoning chat
+block answers: *"what did the bot SAY it would do next, that it has
+not yet done?"*
+
+Every other reasoning-side chat block looks BACKWARD:
+`_decision_vapor_chat_lines` grades specificity on FILLED trades,
+`_thesis_drift_chat_lines` re-tests the open-position thesis,
+`_exit_intent_audit_chat_lines` classifies CLOSED sells by motive.
+None answered the FORWARD slice — the explicit conditional intents the
+bot itself stated ("wait for the cash session", "rotating into
+LITE/LNOK", "premature to dump") that are still STANDING within the
+freshness window without follow-up action.
+
+Block contract:
+- Fires ONLY on `STANDING_INTENTS` / `STALE_INTENTS`. `NO_INTENTS` /
+  `NO_DATA` collapse to silence — the `_decision_paralysis_chat_lines`
+  silence precedent, never chat filler when the bot is reasoning
+  without forward commitments.
+- SSOT (paper-trader invariant #10): the builder's own `headline`
+  passes verbatim AND each surfaced intent's `text` field passes
+  verbatim — no chat-side paraphrase of the bot's own words (the
+  `_thesis_drift_chat_lines` drift_reasons verbatim-passthrough
+  precedent).
+- Each surfaced intent line: `[kind] TICKER (age) [stale]?: text`,
+  capped at 3 intents.
+- Guarded 3s sub-fetch like every sibling block; appears once `:8090`
+  is restarted onto `/api/decision-conditionals`.
+
+Pinned by `tests/test_chat_standing_intents_enrichment.py` (24 cases):
+verbatim SSOT for both headline and intent text, silence on
+non-actionable verdicts, defensive degradation on non-dict / garbage
+intent rows, stale-tagging on STALE_INTENTS, cap-at-3 with order
+preservation, missing-ticker → "—" rendering, missing-age → "(?)"
+rendering, both actionable verdicts produce output, NO chat helper
+ever raises into the chat handler.
+
+---
+
 ## 2026-05-23 feature-dev pass (Agent 4) — `/api/label-quality` + `/api/active-learning-queue`
 
 Two dark analyzer modules + one dark JSONL queue surfaced as

@@ -17303,6 +17303,86 @@ def decision_vapor_skill_api():
         }), 500
 
 
+@app.route("/api/decision-conditionals")
+def decision_conditionals_api():
+    """Decision-conditionals — STANDING conditional intents extracted from
+    recent decisions' reasoning prose. The forward-intent companion to
+    ``decision-vapor-skill`` (specificity), ``thesis-drift`` (open-thesis
+    integrity), and ``exit-intent-audit`` (post-hoc sell motives).
+
+    Surfaces "what did the bot SAY it would do next, that it has not yet
+    done?" — a question no other endpoint answers.
+
+    Verdict ladder:
+
+      * ``STANDING_INTENTS`` — ≥1 intent, majority within freshness window
+        (bot is actively forward-thinking).
+      * ``STALE_INTENTS`` — ≥1 intent, majority older than ``stale_hours``
+        without follow-up (bot stated plan, never executed).
+      * ``NO_INTENTS`` — decisions present but no conditional patterns hit.
+      * ``NO_DATA`` — no decisions in window.
+
+    Query params (clamped):
+      ``window_hours`` — analysis window, 1..168 (default 24 = 1 day).
+      ``stale_hours`` — intent stale-cutoff, 1..168 (default 12).
+      ``max_intents`` — return cap, 1..50 (default 20).
+
+    Pure read — never raises. Observational only — never gates Opus, no
+    caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.decision_conditionals import (
+            build_decision_conditionals,
+            DEFAULT_WINDOW_HOURS,
+            DEFAULT_STALE_HOURS,
+            DEFAULT_MAX_INTENTS,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        def _qi(name, default, lo, hi):
+            try:
+                v = int(float(request.args.get(name, default)))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        window_hours = _qf("window_hours", DEFAULT_WINDOW_HOURS, 1.0, 168.0)
+        stale_hours = _qf("stale_hours", DEFAULT_STALE_HOURS, 1.0, 168.0)
+        max_intents = _qi("max_intents", DEFAULT_MAX_INTENTS, 1, 50)
+
+        store = get_store()
+        # 500 rows covers ~21d at the 1h-closed cadence and ~7-10d at the
+        # 60s-open cadence — the same row-limit ``decision_vapor_skill_api``
+        # uses for the sibling reasoning scan.
+        decisions = store.recent_decisions(limit=500) or []
+
+        return jsonify(build_decision_conditionals(
+            decisions,
+            window_hours=window_hours,
+            stale_hours=stale_hours,
+            max_intents=max_intents,
+        ))
+    except Exception as e:
+        return jsonify({
+            "state": "NO_DATA",
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "n_decisions_scanned": 0,
+            "n_intents_raw": 0,
+            "n_intents": 0,
+            "n_stale": 0,
+            "intents": [],
+            "by_kind": {},
+        }), 500
+
+
 @app.route("/api/cost-basis-ladder")
 def cost_basis_ladder_api():
     """Cost-basis ladder — per-open-position FIFO lot reconstruction
