@@ -910,9 +910,24 @@ def train_scorer(records: list[dict]) -> dict:
         # Sample weight from overall run quality:
         # +200% run → 2.0×, 0% → 1.0×, -100%+ → 0.5×.
         rp = _to_float(r.get("return_pct"), 0.0)
-        # LLM annotation multiplier: endorsed → 3x signal, condemned → 0.1x
-        # `or 0` guards against an explicit JSON null in the record.
-        llm_label = int(r.get("llm_quality_label") or 0)
+        # LLM annotation multiplier: endorsed → 3x signal, condemned → 0.1x.
+        # Defensive parse: a corrupted record carrying a string label
+        # ("ENDORSE") or any non-int (list / dict) used to crash `int(...)`
+        # with ValueError, which the outer caller (`_train_decision_scorer`)
+        # then surfaced as `scorer err: invalid literal for int()` — wedging
+        # the per-cycle retrain (CLAUDE.md §6) and freezing the conviction
+        # gate (#5) until the bad row was manually purged. Mirror the
+        # `forward_return_5d` validation discipline above: a single bad
+        # value silently degrades to "no label" (weight ×1.0) rather than
+        # poisoning the whole batch.
+        _raw_label = r.get("llm_quality_label")
+        if isinstance(_raw_label, bool) or _raw_label is None:
+            llm_label = 0
+        else:
+            try:
+                llm_label = int(_raw_label)
+            except (TypeError, ValueError):
+                llm_label = 0
         llm_mult = {1: 3.0, -1: 0.1, 0: 1.0}.get(llm_label, 1.0)
         weights.append(max(0.5, min(2.0, 1.0 + rp / 200.0)) * llm_mult)
 
