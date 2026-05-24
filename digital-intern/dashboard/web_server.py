@@ -1965,6 +1965,86 @@ def _streak_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _standing_intents_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/decision-conditionals` (STANDING conditional
+    intents extracted from recent decisions' reasoning) as compact chat lines.
+
+    Every other reasoning-side chat block looks BACKWARD at what was said and
+    done: ``_decision_vapor_chat_lines`` grades reasoning specificity on
+    FILLED trades, ``_thesis_drift_chat_lines`` re-tests the open-position
+    thesis, ``_exit_intent_audit_chat_lines`` classifies *closed* sells by
+    stated motive. None surface the FORWARD slice — the explicit conditional
+    intents the bot itself stated ("wait for the cash session", "rotating
+    into LITE/LNOK", "premature to dump") and that are still STANDING
+    (within freshness window) without a follow-up action.
+
+    Answers the operator question no other block answers: *"what did the bot
+    SAY it would do next, that it has not yet done?"*
+
+    SSOT (paper-trader invariant #10): the builder's own ``headline`` passes
+    through verbatim — no chat-side re-derived verdict (the
+    ``_decision_paralysis_chat_lines`` precedent). Detail lines restate up
+    to 3 intent snippets verbatim from ``intents`` — also no re-derivation
+    (the ``_thesis_drift_chat_lines`` drift_reasons-verbatim precedent).
+
+    Pure / total — same contract as the sibling helpers:
+
+    - non-dict / missing ``verdict`` → ``[]`` (silence, never raises into the
+      chat handler)
+    - non-actionable verdicts (``NO_DATA`` / ``NO_INTENTS``) → ``[]``: a
+      desk whose bot stated nothing forward-looking is silence, matching
+      the ``_decision_paralysis_chat_lines`` silence precedent — never
+      chat filler
+    - actionable verdicts (``STANDING_INTENTS`` / ``STALE_INTENTS``) →
+      builder's verbatim ``headline`` + up to 3 newest intent snippets
+      (each: kind, ticker, age, verbatim text) so the analyst can read
+      the bot's own words rather than a chat-side paraphrase. STALE_INTENTS
+      additionally tags the line with ``[stale]`` so the operator can see
+      at a glance which standing plans aged out without follow-up.
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    actionable = {"STANDING_INTENTS", "STALE_INTENTS"}
+    if verdict not in actionable:
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(f"Standing intents: {headline}")  # verbatim SSOT — invariant #10
+
+    intents = rep.get("intents")
+    if not isinstance(intents, list):
+        return lines  # headline-only is honest; degrade rather than raise
+
+    shown = 0
+    for it in intents:
+        if not isinstance(it, dict):
+            continue
+        kind = it.get("kind")
+        ticker = it.get("ticker")
+        text = it.get("text")
+        age = it.get("age_hours")
+        is_stale = bool(it.get("stale"))
+        if not isinstance(kind, str) or not isinstance(text, str) or not text.strip():
+            continue
+        # Compose: "  • [watch-for] NVDA (0.3h): wait for cash session ..."
+        # The text is already builder-clipped to ≤120 chars.
+        tk = (ticker if isinstance(ticker, str) and ticker else "—")
+        if isinstance(age, (int, float)) and not isinstance(age, bool):
+            age_s = f"{float(age):.1f}h"
+        else:
+            age_s = "?"
+        tag = " [stale]" if is_stale else ""
+        lines.append(f"  • [{kind}] {tk} ({age_s}){tag}: {text}")
+        shown += 1
+        if shown >= 3:
+            break
+
+    return lines
+
+
 def _thesis_drift_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/thesis-drift` (every open position re-tested
     against the verbatim reason it was opened for, graded INTACT / WEAKENING /
@@ -4059,6 +4139,85 @@ def create_app(store=None) -> Flask:
             "items": list(reversed(items)),  # newest-first for analyst UX
         })
 
+    @app.get("/api/kw-ai-divergence")
+    def api_kw_ai_divergence():
+        """Surface the kw vs ai divergence analyzer to the dashboard.
+
+        The ``analytics/kw_ai_divergence.py`` module finds two regimes worth
+        knowing:
+
+          * ``false_positives`` — kw_score fired strongly (>=KW_HIGH) but
+            Sonnet found no signal (ai_score <= AI_LOW). High counts from a
+            source mean its vocabulary trips keywords without substance —
+            ideal "which feeders to prune" input.
+          * ``hidden_gems`` — Sonnet rated relevant (>=AI_HIGH) but the
+            keyword filter almost missed it (kw_score < KW_LOW). Tells the
+            analyst which topics the keyword dictionary under-weights.
+
+        Until this endpoint, the analyzer's snapshot only landed in
+        ``/home/zeph/logs/kw_ai_divergence.json`` — readable only via SSH.
+        Same shape as the sibling ``/api/label-quality`` /
+        ``/api/active-learning-queue`` "expose dark analyzer" endpoints
+        added in the 2026-05-23 feature-dev pass.
+
+        Computes on demand (bounded SCAN_LIMIT=6000 read, idx_first_seen
+        served, ~100ms). Returns the analyzer's full payload verbatim plus
+        the ``as_of`` timestamp this endpoint stamped — so a UI caller can
+        tell whether the displayed figures are seconds old or stale. Errors
+        absorbed into a 200 with an ``error`` key (mirrors the existing
+        ``/api/ml-status`` / ``/api/label-quality`` discipline).
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            from analytics.kw_ai_divergence import compute as _compute
+            payload = _compute()
+        except Exception as e:
+            return jsonify({
+                "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "error": f"{type(e).__name__}:{e}",
+                "false_positives": None,
+                "hidden_gems": None,
+            })
+        # Stamp our own as_of so the UI can show "this view was computed at"
+        # alongside whatever ``generated_at`` the analyzer wrote. Preserve
+        # the analyzer's keys verbatim — never re-derive a verdict.
+        payload["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return jsonify(payload)
+
+    @app.get("/api/urgency-drought")
+    def api_urgency_drought():
+        """Surface the urgency drought monitor to the dashboard.
+
+        The ``analytics/urgency_drought.py`` module tracks elapsed time since
+        the LAST urgency>=2 (pushed) and LAST urgency>=1 (queued) live row.
+        A long drought means the LLM triage / alert pipeline went silent
+        (quota exhaustion, Sonnet throttle, scoring backlog) — the analyst's
+        "is the standalone-push channel still alive?" view, complementary to
+        the urgent_queue_health backlog view (which counts what's queued,
+        not how long ago anything reached the head).
+
+        Until this endpoint, the drought monitor's snapshot only landed in
+        ``/home/zeph/logs/urgency_drought.json`` (cron-written). Same
+        compute-on-demand discipline as the sibling kw_ai_divergence
+        endpoint above — two indexed ``ORDER BY first_seen DESC LIMIT 1``
+        reads, negligible cost. Read-only WAL connection, never contends
+        with the daemon's writer.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            from analytics.urgency_drought import compute as _compute
+            payload = _compute()
+        except Exception as e:
+            return jsonify({
+                "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "error": f"{type(e).__name__}:{e}",
+                "status": "unknown",
+            })
+        payload["as_of"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return jsonify(payload)
+
     @app.get("/api/volume-history")
     def api_volume_history():
         """Hourly article ingest counts for the last 24 hours, live rows only."""
@@ -5787,6 +5946,41 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: streak fetch failed: %s", e)
 
+        # Standing intents — the FORWARD slice of the reasoning surface.
+        # Every other reasoning chat block looks backward: decision-vapor
+        # grades specificity on FILLED trades, thesis-drift re-tests the
+        # open-position thesis, exit-intent-audit classifies CLOSED sells.
+        # None surface the FORWARD slice — the explicit conditional intents
+        # the bot itself stated ("wait for the cash session", "rotating
+        # into LITE/LNOK", "premature to dump") that are still STANDING
+        # without follow-up action. Answers the operator question no other
+        # block answers: "what did the bot SAY it would do next, that it has
+        # not yet done?" Fires ONLY on STANDING_INTENTS / STALE_INTENTS
+        # (NO_INTENTS / NO_DATA collapse to silence — the _decision_
+        # paralysis_chat_lines silence precedent, never chat filler when
+        # the bot is reasoning without forward commitments). Composed
+        # verbatim by the pure _standing_intents_chat_lines helper
+        # (unit-tested; SSOT — the builder's own `headline` is the chat
+        # headline AND each surfaced intent's text passes through verbatim
+        # — no chat-side paraphrase of the bot's own words, the
+        # _thesis_drift_chat_lines drift_reasons verbatim-passthrough
+        # precedent). STALE intents tag-line ``[stale]`` so the operator
+        # can see plans that aged out without action at a glance. Guarded
+        # 3s read; only appears once :8090 is restarted onto
+        # /api/decision-conditionals.
+        standing_intents_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/decision-conditionals",
+                    timeout=3) as resp:
+                _si = json.loads(resp.read().decode("utf-8"))
+            standing_intents_block = "\n".join(
+                _standing_intents_chat_lines(_si))
+        except Exception as e:
+            _logger().warning(
+                "chat: decision-conditionals fetch failed: %s", e)
+
         # "What materially changed since you last looked" — the one temporal-
         # change view. Every sub-fetch above is a current-state snapshot; this
         # lets the chat answer "what happened while I was away / since I last
@@ -5987,6 +6181,7 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — WATCHLIST COVERAGE (per-watchlist-ticker attention scan over the recent decision stream — which tickers has the bot stopped looking at? Every other panel is position-centric and never names an IGNORED ticker; this is the only block that surfaces opportunity cost from neglected names. Surfaced ONLY when STAGNANT / CONCENTRATED, never filler when DIVERSIFIED. Headline and the stale-ticker sample carry verbatim from the trader endpoint — restate, never re-derive):\n{watchlist_coverage_block}\n\n" if watchlist_coverage_block else "")
             + (f"PAPER TRADER — CONCENTRATION TRAJECTORY (the slope view of single-name exposure over the last N days — has top-1 weight been RISING, FALLING, or STEADY? Every other concentration surface is point-in-time and reads identically whether the book ramped 30%→65% over a week or jumped 0%→65% in one cycle. Surfaced ONLY when CONCENTRATION_SPIKE / RAMPING_UP / CONCENTRATED_STEADY, never filler when DECONCENTRATING / DIVERSIFIED / BALANCED. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{concentration_trajectory_block}\n\n" if concentration_trajectory_block else "")
             + (f"PAPER TRADER — STREAK (current win/loss run + historical extremes on closed round-trips — the behavioural-edge read no other surface carries. Surfaced ONLY when HOT_HAND / TILT_RISK, never filler when NEUTRAL or EMERGING; verdict is gated to ≥8 closed round-trips so a 3-trip 'streak' stays silent. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{streak_block}\n\n" if streak_block else "")
+            + (f"PAPER TRADER — STANDING INTENTS (the FORWARD slice of the reasoning surface — conditional intents the bot itself stated in recent decisions' reasoning ('wait for cash session', 'rotating into LITE/LNOK', 'premature to dump') that are still STANDING within the freshness window without follow-up action. Every other reasoning block looks BACKWARD (vapor on FILLED, thesis-drift on opens, exit-intent on closed sells); none answers 'what did the bot SAY it would do next, that it has not yet done?'. Surfaced ONLY when STANDING_INTENTS / STALE_INTENTS, never filler when NO_INTENTS / NO_DATA. Headline AND each surfaced intent text pass verbatim from the trader endpoint — restate, never re-derive; the bot's own words, never a chat-side paraphrase. ``[stale]`` tag flags plans that aged past the freshness window without action):\n{standing_intents_block}\n\n" if standing_intents_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "
