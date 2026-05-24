@@ -2306,7 +2306,7 @@ Respond as JSON with this schema (no markdown fences):
 
     try:
         r = subprocess.run(
-            ["claude", "--model", "claude-opus-4-7", "--print",
+            ["claude", "--model", "claude-sonnet-4-6", "--print",
              "--permission-mode", "bypassPermissions"],
             input=prompt, capture_output=True, text=True, timeout=240,
             env={**os.environ, "HOME": "/home/zeph"},
