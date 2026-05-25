@@ -1883,6 +1883,92 @@ class ArticleStore:
         }
 
     @_retry_on_lock
+    def recent_ml_only_urgent(
+        self, hours: int = 24, limit: int = 50
+    ) -> list[dict]:
+        """Live audit list of UNVERIFIED urgent rows — ``urgency>=1`` rows
+        whose ai_score is still 0 and whose only score is the model's own
+        ``ml_score`` (``score_source='ml'``) — for the analyst's "what
+        slipped past Sonnet verification?" review.
+
+        Sibling to ``urgent_score_distribution`` (calibration histogram,
+        aggregated counts) and ``urgency_label_split_by_source``
+        (per-source LLM-vetted fraction). Those answer
+        *how much* and *from where*; this returns *the actual titles*,
+        newest first — a focused audit primitive the analyst can paste
+        into a triage channel to ask "is this Sonnet missing something
+        real, or noise the gates correctly suppressed?".
+
+        Practical motivation (live evidence 2026-05-25 24h window): 56
+        ml-only urgent rows reached ``urgency>=1`` un-LLM-verified, of
+        which ~26 were the NVDA $80B buyback wire saturation. The
+        aggregate metrics tell the analyst the rate is elevated but not
+        which specific titles to look at; this method does.
+
+        Returns one row per article (newest ``first_seen`` first), capped
+        at ``limit``::
+
+            [
+              {
+                "id": str, "title": str, "url": str, "source": str,
+                "ml_score": float, "ai_score": float,    # ai_score==0 always
+                "urgency": int,
+                "first_seen": str,
+                "age_hours": float,
+              },
+              ...
+            ]
+
+        Filter semantics — ``score_source='ml'`` AND ``urgency>=1`` AND
+        ``_LIVE_ONLY_CLAUSE`` — match the corpus the analyst cares about:
+        live news the ML head escalated to urgent that no LLM
+        independently labeled. Synthetic backtest/opus rows are excluded
+        by construction (load-bearing invariant #1).
+
+        Read-only (single SELECT). NO DB write — no ai_score / ml_score
+        / score_source / urgency mutation. All four load-bearing
+        invariants intact by construction.
+        """
+        hours = max(int(hours), 1)
+        limit = max(int(limit), 1)
+        now = datetime.now(timezone.utc)
+        since_iso = (now - timedelta(hours=hours)).isoformat()
+        cur = self.conn.execute(
+            "SELECT id, title, url, source, ml_score, ai_score, urgency, "
+            "first_seen FROM articles "
+            "WHERE urgency >= 1 AND score_source = 'ml' "
+            "AND first_seen >= ? "
+            f"AND {_LIVE_ONLY_CLAUSE} "
+            "ORDER BY first_seen DESC LIMIT ?",
+            (since_iso, limit),
+        )
+        rows = cur.fetchall()
+        out: list[dict] = []
+        for r in rows:
+            aid, title, url, source, ml_score, ai_score, urgency, first_seen = r
+            age_h = 0.0
+            if first_seen:
+                try:
+                    dt = datetime.fromisoformat(first_seen)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    age_h = max(0.0, (now - dt).total_seconds() / 3600.0)
+                except (ValueError, TypeError):
+                    age_h = 0.0
+            out.append({
+                "id": aid or "",
+                "title": title or "",
+                "url": url or "",
+                "source": source or "",
+                "ml_score": float(ml_score or 0.0),
+                "ai_score": float(ai_score or 0.0),
+                "urgency": int(urgency or 0),
+                "first_seen": first_seen or "",
+                "age_hours": round(age_h, 2),
+            })
+        return out
+
+    @_retry_on_lock
     def urgency_label_split_by_source(
         self, hours: int = 24, top_n: int = 15
     ) -> dict:
