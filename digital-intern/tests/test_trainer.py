@@ -302,3 +302,45 @@ class TestTrainOrchestration:
         assert second["n"] == 40
         # Both calls reached model.fit with the same (n, dim) shape.
         assert model.fit_calls == [((40, 23), 40), ((40, 23), 40)]
+
+    def test_cache_invalidates_when_synthetic_rows_added(self, store,
+                                                         monkeypatch, tmp_path):
+        """The n_labeled cache key MUST count rows matching ``STRONG_LABEL_WHERE``
+        — not just score_source IN ('llm','briefing_boost'). Pre-fix:
+        synthetic backtest_/opus_annotation rows (CLAUDE.md §5 training signal)
+        were invisible to the cache drift check, so a heavy backtest-injection
+        burst would NEVER invalidate the cache and the trainer would silently
+        keep training on the old matrix.
+
+        Build a small cache (low n_labeled), then add >5% synthetic backtest
+        rows. The next train() must see a fresh _fetch_training_data call
+        (model.fit_calls reflects the new row count), proving the cache was
+        invalidated."""
+        model = self._patch(monkeypatch, tmp_path)
+        # Initial cache: 40 LLM rows.
+        for i in range(40):
+            _insert(store, id=f"llm{i}", title=f"llm article {i} long enough",
+                    ai_score=7.0, score_source="llm")
+        first = trainer.train(store)
+        assert first["status"] == "ok"
+        first_shape = model.fit_calls[-1][0]
+        assert first_shape[0] == 40
+
+        # Add 10 synthetic backtest winners (25% of strong pool — well above the
+        # 5% drift threshold). Pre-fix: n_labeled is unchanged (still 40), drift
+        # is 0%, cache stays "fresh", and trainer never sees the new rows.
+        for i in range(10):
+            _insert(store, id=f"bt{i}", title=f"backtest winner row {i} ok",
+                    ai_score=5.0, score_source=None,
+                    url=f"backtest://run_1/d/BUY/MU{i}",
+                    source=f"backtest_run_1_winner")
+
+        second = trainer.train(store)
+        assert second["status"] == "ok"
+        # Cache must have invalidated → fresh fetch returns 40+10=50 rows.
+        second_shape = model.fit_calls[-1][0]
+        assert second_shape[0] == 50, (
+            f"cache was not invalidated when synthetic rows arrived; "
+            f"shape was {second_shape}, expected 50 rows. The trainer is "
+            f"blind to fresh backtest-injection signal."
+        )

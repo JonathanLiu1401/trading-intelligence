@@ -914,6 +914,8 @@ class TestAlarmLatchState:
         monkeypatch.setattr(runner, "_consecutive_no_decisions", 0)
         monkeypatch.setattr(runner, "_no_decision_first_ts", None)
         monkeypatch.setattr(runner, "_quota_first_ts", None)
+        monkeypatch.setattr(runner, "_quota_outage_count", 0)
+        monkeypatch.setattr(runner, "_breaker_outage_count", 0)
 
     def test_clean_state_returns_all_false(self):
         st = runner.alarm_latch_state()
@@ -925,6 +927,8 @@ class TestAlarmLatchState:
             "breaker_threshold": runner.CONSECUTIVE_NO_DECISION_LIMIT,
             "breaker_outage_s": None,
             "quota_outage_s": None,
+            "quota_outage_count": 0,
+            "breaker_outage_count": 0,
         }
 
     def test_breaker_active_surfaced(self, monkeypatch):

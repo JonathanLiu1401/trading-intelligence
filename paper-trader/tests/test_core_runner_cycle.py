@@ -804,3 +804,156 @@ class TestQuotaOutageRecovery:
                      "decision": {"action": "SELL", "ticker": "NVDA"}})
         runner._cycle()
         assert runner._quota_first_ts is None
+
+
+class TestOutageCounters:
+    """Session-scoped distinct-outage counters. ``_quota_outage_count`` and
+    ``_breaker_outage_count`` increment ONCE per outage on the edge that
+    flips the latch True (i.e., the moment the operator alert actually
+    delivers). They are NOT incremented when the alert send fails (the
+    documented invariant: the count must reflect what the operator was
+    actually told about, never silent failures)."""
+
+    @pytest.fixture
+    def counter_setup(self, monkeypatch):
+        # Reset every alarm / latch field and both counters between tests.
+        monkeypatch.setattr(runner, "_consecutive_no_decisions", 0)
+        monkeypatch.setattr(runner, "_breaker_alert_active", False)
+        monkeypatch.setattr(runner, "_quota_alert_active", False)
+        monkeypatch.setattr(runner, "_no_decision_first_ts", None)
+        monkeypatch.setattr(runner, "_quota_first_ts", None)
+        monkeypatch.setattr(runner, "_quota_outage_count", 0)
+        monkeypatch.setattr(runner, "_breaker_outage_count", 0)
+        sends = {"quota": [], "breaker": [], "send": []}
+        monkeypatch.setattr(
+            runner.reporter, "send_quota_alert",
+            lambda detail="", *, store=None:
+                sends["quota"].append(detail) or True,
+        )
+        monkeypatch.setattr(
+            runner.reporter, "send_breaker_fired_alert",
+            lambda n, cause="", *, elapsed_s=None, store=None:
+                sends["breaker"].append((n, cause)) or True,
+        )
+        monkeypatch.setattr(
+            runner.reporter, "send_quota_recovered_alert",
+            lambda *, elapsed_s=None: True,
+        )
+        monkeypatch.setattr(
+            runner.reporter, "send_breaker_cleared_alert",
+            lambda *, elapsed_s=None: True,
+        )
+        monkeypatch.setattr(runner.reporter, "_send",
+                            lambda m: sends["send"].append(m) or True)
+        monkeypatch.setattr(runner, "_kill_stale_claude", lambda: None)
+        monkeypatch.setattr(runner, "get_store", lambda: _FakeStore([]))
+        return sends
+
+    def test_quota_outage_count_increments_on_first_alerted_cycle(
+            self, counter_setup, monkeypatch):
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "NO_DECISION", "decision": None,
+                     "quota_exhausted": True})
+        assert runner._quota_outage_count == 0
+        runner._cycle()
+        assert runner._quota_outage_count == 1
+        # Latch is held — further cycles in the same outage must not
+        # double-count.
+        runner._cycle()
+        runner._cycle()
+        assert runner._quota_outage_count == 1
+        assert len(counter_setup["quota"]) == 1  # only one Discord alert
+
+    def test_quota_outage_count_does_not_increment_on_failed_delivery(
+            self, counter_setup, monkeypatch):
+        """A ``send_quota_alert`` that returns False (transient openclaw /
+        Discord blip) must NOT increment the counter. The invariant is that
+        the count reflects outages the operator was told about; a silent
+        failure that never reached Discord is the orphan-anchor case, NOT a
+        legitimate counted outage. Confirms the counter never disagrees
+        with what's actually visible on Discord."""
+        monkeypatch.setattr(
+            runner.reporter, "send_quota_alert",
+            lambda detail="", *, store=None: False,  # delivery failed
+        )
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "NO_DECISION", "decision": None,
+                     "quota_exhausted": True})
+        runner._cycle()
+        assert runner._quota_outage_count == 0
+        assert runner._quota_alert_active is False
+        # And the orphan-anchor cleanup fires on the next non-quota cycle
+        # (the Phase 1 fix this Phase 2 feature builds on).
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()
+        assert runner._quota_first_ts is None
+        # Still zero — the silent quota outage never counted.
+        assert runner._quota_outage_count == 0
+
+    def test_quota_outage_count_increments_per_outage_not_per_cycle(
+            self, counter_setup, monkeypatch):
+        """A second DISTINCT outage after a recovery must increment the
+        counter to 2. Pins the "edge-triggered" semantics: count fires on
+        every False→True latch transition, not on every quota cycle."""
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "NO_DECISION", "decision": None,
+                     "quota_exhausted": True})
+        runner._cycle()
+        assert runner._quota_outage_count == 1
+        # Recovery — real decision lands.
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()
+        assert runner._quota_alert_active is False
+        # New, distinct outage.
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "NO_DECISION", "decision": None,
+                     "quota_exhausted": True})
+        runner._cycle()
+        assert runner._quota_outage_count == 2
+
+    def test_breaker_outage_count_increments_on_threshold_reached(
+            self, counter_setup, monkeypatch):
+        """The breaker counter mirrors the quota counter one dimension over.
+        Increments once on the cycle that pushes the consecutive count over
+        the threshold AND that cycle actually delivers the breaker alert.
+        Subsequent NO_DECISION cycles in the same wedge do not re-count
+        (the latch dedupes them)."""
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "NO_DECISION", "decision": None,
+                     "quota_exhausted": False})
+        # 5 NO_DECISION cycles trips the breaker (CONSECUTIVE_NO_DECISION_LIMIT).
+        for _ in range(runner.CONSECUTIVE_NO_DECISION_LIMIT):
+            runner._cycle()
+        assert runner._breaker_outage_count == 1
+        # Latch is held. More NO_DECISIONs must not re-count.
+        for _ in range(3):
+            runner._cycle()
+        assert runner._breaker_outage_count == 1
+
+    def test_counters_surface_in_alarm_latch_state(
+            self, counter_setup, monkeypatch):
+        """Both counters must be exposed by ``alarm_latch_state`` so any
+        operator surface (the ``/api/alarm-latches`` endpoint, the Discord
+        hourly summary, a chat helper) reads the same number. Pins the API
+        shape so downstream consumers can rely on the keys' presence."""
+        monkeypatch.setattr(runner, "_quota_outage_count", 2)
+        monkeypatch.setattr(runner, "_breaker_outage_count", 1)
+        st = runner.alarm_latch_state()
+        assert st["quota_outage_count"] == 2
+        assert st["breaker_outage_count"] == 1
+        # Both counters present even when fresh-boot zero — never `None` /
+        # `KeyError` (the dashboard panel must always render).
+        monkeypatch.setattr(runner, "_quota_outage_count", 0)
+        monkeypatch.setattr(runner, "_breaker_outage_count", 0)
+        st = runner.alarm_latch_state()
+        assert st["quota_outage_count"] == 0
+        assert st["breaker_outage_count"] == 0

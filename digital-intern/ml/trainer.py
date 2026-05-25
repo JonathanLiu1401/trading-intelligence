@@ -410,10 +410,18 @@ def _train_impl(store, force: bool = False) -> dict:
     t0 = time.time()
 
     # Count current labeled articles to decide whether to use disk cache.
+    # Must match what ``_fetch_training_data`` actually pulls (``STRONG_LABEL_WHERE``):
+    # LLM-sourced + briefing_boost + legacy integer-valued + synthetic
+    # backtest/opus rows. Counting only score_source IN ('llm','briefing_boost')
+    # would undercount the pool during heavy backtest injection runs: synthetic
+    # rows entering the training pool would never bump ``n_labeled``, the cache
+    # drift check (5%) would think the dataset is fresh, and the just-injected
+    # backtest training signal would be invisible to the trainer until something
+    # else moved the LLM count. CLAUDE.md §5 names the synthetic rows as
+    # load-bearing training signal — the cache key must reflect them.
     try:
         n_labeled = store.conn.execute(
-            "SELECT COUNT(*) FROM articles WHERE ai_score > 0 "
-            "AND score_source IN ('llm','briefing_boost')"
+            f"SELECT COUNT(*) FROM articles WHERE {STRONG_LABEL_WHERE}"
         ).fetchone()[0]
     except Exception:
         n_labeled = 0
