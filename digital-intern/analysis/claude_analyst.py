@@ -1809,6 +1809,31 @@ _BRIEFING_RT_GURUFOCUS_RECAP = re.compile(
     re.IGNORECASE,
 )
 
+# "<Subject> stock (continues|keeps|stays|remains) ... after <event>" —
+# lockstep mirror of ``watchers.alert_agent._RT_STOCK_CONTINUES_AFTER``.
+# The SUBJECT-led post-event continued-state recap mill; sibling of
+# ``subject_pct_after`` (which requires an explicit %), this catches the
+# same retrospective shape WITHOUT a percent. Live evidence (2026-05-22..25,
+# 7d articles.db scan + alert_recency.db push audit): the exact title
+# "Nvidia stock continues to struggle after earnings, but analysts remain
+# firmly bullish" fired 4 distinct Discord pushes in 3 days across 4
+# syndication channels (Invezz, CryptoRank, MSN, TradingView) at
+# ``score_source='ml'``, ml_score 9.81-9.99. Without this mirror the
+# per-domain cap admits the recap into the briefing's top-50 digest pool
+# — surfacing post-event continued-state recap as fresh TOP SIGNALS despite
+# being retrospective. Byte-identical regex to the alert side (anti-drift
+# discipline, enforced structurally by
+# ``test_alert_and_briefing_recap_tuples_have_same_length``).
+_BRIEFING_RT_STOCK_CONTINUES_AFTER = re.compile(
+    r"^(?!\s*why\b)"
+    r"\s*\S+(?:\s+\S+){0,4}\s+stock\s+"
+    r"(?:continues|keeps|stays|remains)\b.*?"
+    r"\bafter\b.*?\b"
+    r"(?:earnings|results|report|quarter|q[1-4]|beat|miss|guidance|"
+    r"downgrade|upgrade|announcement|filing|merger|sec|fcc|fda)\b",
+    re.IGNORECASE,
+)
+
 _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _BRIEFING_RT_WHY_TRADING),
     ("why_did_stock", _BRIEFING_RT_WHY_DID),
@@ -1842,6 +1867,12 @@ _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("whats_next_after", _BRIEFING_RT_WHATS_NEXT_AFTER),
     ("earnings_release_pt", _BRIEFING_RT_EARNINGS_RELEASE_PT),
     ("gurufocus_recap", _BRIEFING_RT_GURUFOCUS_RECAP),
+    # SUBJECT-led post-event continued-state recap — lockstep mirror of the
+    # alert-side ``stock_continues_after`` gate. See
+    # ``_BRIEFING_RT_STOCK_CONTINUES_AFTER`` for full live evidence and the
+    # discriminator rationale. Anti-drift structural test:
+    # ``test_alert_and_briefing_recap_tuples_have_same_length``.
+    ("stock_continues_after", _BRIEFING_RT_STOCK_CONTINUES_AFTER),
 )
 
 

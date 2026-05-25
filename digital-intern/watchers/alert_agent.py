@@ -1208,6 +1208,83 @@ _RT_GURUFOCUS_RECAP = re.compile(
     re.IGNORECASE,
 )
 
+# "<Subject> stock (continues|keeps|stays|remains) ... after <event>" — the
+# Invezz / CryptoRank / MSN / TradingView post-event continued-state recap
+# template. Sibling of ``_RT_SUBJECT_PCT_AFTER`` (which requires an explicit
+# move magnitude) — this catches the SAME retrospective shape WITHOUT a
+# percent: the title states the stock is in an ongoing post-event state, so
+# the move already happened and the article is summarising the lingering
+# reaction. By definition retrospective: the "after earnings/guidance/..."
+# anchor places the original event BEFORE the article and the state-
+# continuation verb names what the stock IS still doing AFTER it.
+#
+# Live evidence (2026-05-22..25, 7d articles.db scan + alert_recency.db push
+# audit): the exact title "Nvidia stock continues to struggle after earnings,
+# but analysts remain firmly bullish" fired 4 distinct Discord BREAKING pushes
+# in 3 days across 4 syndication channels (Invezz, CryptoRank, MSN,
+# TradingView) — all ``score_source='ml'`` ml_score 9.81-9.99 (urgency head
+# over-scored the headline because the NVDA + "earnings" + "bullish" tokens
+# trip its high-relevance pattern). Each push was the same retrospective
+# recap of an already-priced-in move, and ``alert_recency.db`` confirms a
+# real push at 2026-05-25T00:57 — exactly the noise complaint the existing
+# recap-gate family was built to solve, on a fingerprint no sibling caught:
+#
+#   * ``_RT_SUBJECT_PCT_AFTER`` requires ``\d+(?:\.\d+)?\s*%`` — this title
+#     has no explicit percent, so the gate didn't fire.
+#   * ``_RT_WHY_STOCK_IS_AFTER`` requires a leading ``^Why`` — this title
+#     leads with the subject (no Why).
+#   * ``_RT_WHATS_NEXT_AFTER`` requires "what's/is next after" — different
+#     phrasing entirely.
+#
+# Empirical false-positive bar (2026-05-25 audit, 55,488 titles in last 7
+# days): ZERO false positives. The full 30-day urgency=2 set (1340 titles)
+# matched only the 4 canonical "Nvidia stock continues to struggle after
+# earnings" syndication copies — exactly the target failure, nothing else.
+#
+# Discriminator (the QUAD): subject lead (≤5 tokens, NOT "Why" — that is the
+# existing siblings' territory) + literal ``stock`` token + state-continuation
+# verb from a closed list (``continues|keeps|stays|remains``) + ``\bafter\b``
+# anchor + earnings/event noun terminator from the established recap-family
+# list (``earnings|results|report|quarter|q[1-4]|beat|miss|guidance|downgrade|
+# upgrade|announcement|filing|merger|sec|fcc|fda``). The state-continuation
+# verb is what distinguishes recap from forward news: real wire copy says
+# "stock nears", "stock extends rally", "stock could soar", "stock to watch"
+# — none of those verbs are in the closed list.
+#
+# Validated must-survive corpus (all the recent real pushes that share
+# similar token patterns but are forward-looking or describe a fresh event):
+#   * "JPMorgan lifts Nvidia target to $280 after record quarter" — analyst
+#     action verb ``lifts``, not a state-continuation verb. NO MATCH.
+#   * "Bank of America revamps Nvidia stock price target after earnings" —
+#     after "stock" comes "price", not a state-continuation verb. NO MATCH.
+#   * "All eyes on NVDA stock as Q1 report looms" — after "stock" comes
+#     "as", forward-looking. NO MATCH.
+#   * "Nvidia stock continues rallying on AI demand" — no "after" + earnings
+#     anchor. NO MATCH.
+#   * "Apple Stock Could Soar After Earnings" — ``Could Soar`` not in the
+#     state-continuation verb list. NO MATCH.
+#   * "Apple stock still has room to run after Q1 earnings" — ``still`` is
+#     deliberately NOT in the verb list (too ambiguous between forward
+#     "still has room" and retrospective "still falling"). NO MATCH.
+#
+# Pure read-side: no DB write, no ai_score/ml_score/score_source/urgency
+# mutation. All four load-bearing invariants intact by construction.
+_RT_STOCK_CONTINUES_AFTER = re.compile(
+    # NEGATIVE lookahead — leave the ``^Why ...`` form to _RT_WHY_STOCK_IS_AFTER.
+    r"^(?!\s*why\b)"
+    # Subject lead — 1..5 tokens before the literal ``stock`` token. Lazy so
+    # a forward-news headline with a trailing footer doesn't false-match.
+    r"\s*\S+(?:\s+\S+){0,4}\s+stock\s+"
+    # State-continuation verb — closed list. ``still`` deliberately excluded
+    # (too ambiguous; see must-survive corpus comment above).
+    r"(?:continues|keeps|stays|remains)\b.*?"
+    # Retrospective anchor + earnings/event noun terminator.
+    r"\bafter\b.*?\b"
+    r"(?:earnings|results|report|quarter|q[1-4]|beat|miss|guidance|"
+    r"downgrade|upgrade|announcement|filing|merger|sec|fcc|fda)\b",
+    re.IGNORECASE,
+)
+
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
@@ -1245,6 +1322,14 @@ _RECAP_TEMPLATE_PATTERNS = (
     ("whats_next_after", _RT_WHATS_NEXT_AFTER),
     ("earnings_release_pt", _RT_EARNINGS_RELEASE_PT),
     ("gurufocus_recap", _RT_GURUFOCUS_RECAP),
+    # SUBJECT-led post-event continued-state recap — sibling of
+    # ``subject_pct_after`` (which requires explicit %); catches the same
+    # retrospective shape WITHOUT a percent. The state-continuation verb
+    # (continues|keeps|stays|remains) is the discriminator that distinguishes
+    # this from forward news with similar tokens. See _RT_STOCK_CONTINUES_AFTER
+    # for live evidence (the same "Nvidia stock continues to struggle after
+    # earnings" recap pushed 4× across syndication channels in 3 days).
+    ("stock_continues_after", _RT_STOCK_CONTINUES_AFTER),
 )
 
 
