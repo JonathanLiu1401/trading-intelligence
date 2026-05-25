@@ -408,6 +408,91 @@ class TestCircuitBreakerAlert:
         # And the wedge-start ts is reset for the NEXT outage to start fresh.
         assert runner._no_decision_first_ts is None
 
+    def test_failed_recovery_send_leaves_breaker_anchor_armed(
+            self, breaker_setup, monkeypatch):
+        """Symmetric with ``TestQuotaOutageRecovery.test_failed_recovery_send
+        _leaves_latch_and_anchor_armed``: a Discord send failure on the
+        breaker recovery notice must leave BOTH the latch AND
+        ``_no_decision_first_ts`` armed so the next cycle retries with the
+        real (slightly longer) elapsed-time figure intact.
+
+        Without this, an openclaw blip at recovery time silently buries
+        the FIRED→CLEARED bracket forever — the next cycle's retry would
+        render the bare "responding again" body with no "after ~Xh dark"
+        close, because `_no_decision_first_ts` had already been reset to
+        None unconditionally. This was an asymmetry against the quota
+        recovery path (which correctly only clears its anchor on
+        confirmed send success — see ``_quota_first_ts`` handling)."""
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        wedge_started = _dt.now(_tz.utc) - _td(seconds=900)
+        monkeypatch.setattr(runner, "_no_decision_first_ts", wedge_started)
+        monkeypatch.setattr(runner, "_breaker_alert_active", True)
+        # send_breaker_cleared_alert returns False → latch + anchor must
+        # both stay so the next cycle can retry with elapsed_s intact.
+        monkeypatch.setattr(
+            runner.reporter, "send_breaker_cleared_alert",
+            lambda *, elapsed_s=None: False,
+        )
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()
+        assert runner._breaker_alert_active is True
+        assert runner._no_decision_first_ts is wedge_started
+
+    def test_failed_recovery_then_success_passes_full_elapsed(
+            self, breaker_setup, monkeypatch):
+        """End-to-end: first recovery cycle fails (latch + anchor stay
+        armed), second cycle succeeds and passes the FULL elapsed_s from
+        the original wedge start — not a truncated value reflecting only
+        the gap since the failed first attempt. Pins that the anchor
+        survives the retry gap."""
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        wedge_started = _dt.now(_tz.utc) - _td(seconds=600)
+        monkeypatch.setattr(runner, "_no_decision_first_ts", wedge_started)
+        monkeypatch.setattr(runner, "_breaker_alert_active", True)
+        cleared_calls: list = []
+
+        def _flaky_cleared(*, elapsed_s=None):
+            cleared_calls.append(elapsed_s)
+            # First call fails, all subsequent calls succeed.
+            return len(cleared_calls) > 1
+
+        monkeypatch.setattr(
+            runner.reporter, "send_breaker_cleared_alert", _flaky_cleared
+        )
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()                                  # first send fails
+        assert runner._breaker_alert_active is True
+        assert runner._no_decision_first_ts is wedge_started
+        runner._cycle()                                  # retry succeeds
+        assert runner._breaker_alert_active is False
+        assert runner._no_decision_first_ts is None
+        # Two send attempts; both elapsed_s carry the wedge-start ts (not
+        # truncated to 0s). The second is >= the first because wall clock
+        # advanced.
+        assert len(cleared_calls) == 2
+        assert all(isinstance(e, int) and e >= 600 for e in cleared_calls)
+        assert cleared_calls[1] >= cleared_calls[0]
+
+    def test_real_decision_with_no_latch_resets_anchor(
+            self, breaker_setup, monkeypatch):
+        """Sub-threshold path: a wedge ran for a couple of cycles (no
+        breaker fire, no latch armed), then the engine recovers. The
+        anchor must still reset unconditionally so the NEXT outage starts
+        its own clock — the latch-on path's symmetric protection only
+        kicks in once the operator alert went out."""
+        self._run_no_decision_cycles(2, monkeypatch)
+        assert runner._no_decision_first_ts is not None
+        assert runner._breaker_alert_active is False
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()
+        assert runner._no_decision_first_ts is None
+
     def test_quota_path_does_not_trip_breaker_alert(self, breaker_setup,
                                                      monkeypatch):
         """Quota-exhausted cycles intentionally keep the counter at 0
