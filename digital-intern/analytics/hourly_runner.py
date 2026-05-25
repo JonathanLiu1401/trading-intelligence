@@ -64,6 +64,7 @@ def main() -> int:
         ("source_health_report",      "analytics.source_health_report",      "main"),
         ("breaking_news_alerter",     "analytics.breaking_news_alerter",     "main"),
         ("ticker_score_acceleration", "analytics.ticker_score_acceleration", "main"),
+        ("premarket_brief",           "analytics.premarket_brief",           "main"),
     ]
 
     for short_name, mod_path, fn_name in module_specs:
