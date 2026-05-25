@@ -209,6 +209,34 @@ MFE_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 GATE_ARM_SKILL_LOG = ROOT / "data" / "gate_arm_skill_log.jsonl"
 GATE_ARM_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 
+# Per-cycle gate economic-counterfactual ledger. ``gate_pnl.analyze`` answers
+# the single quant-decisive question every existing gate diagnostic
+# structurally *cannot*: *aggregated across all five arms and weighted by
+# how often each fires, does the conviction-gate multiplier overlay
+# (×0.6 / ×0.85 / ×1.0 / ×1.15 / ×1.3) actually ADD or SUBTRACT realized
+# return versus not gating at all?* ``gate_audit`` reports the per-arm mean
+# returns and a verdict driven solely by the strong-tailwind-minus-headwind
+# spread — that deliberately ignores both the three middle arms AND the
+# arm-frequency mix. ``gate_arm_historical`` reports per-arm means weighted
+# by the gate's TRUE then-deployed prediction (not today's pickle) but
+# still does not roll up to one economic number. ``gate_pnl`` rolls all
+# five arms into the multiplier-weighted realized mean Σmᵢrᵢ/Σmᵢ minus
+# the equal-base mean(rᵢ) — the assumption-free "did the reallocation
+# pay" signal a quant deciding *whether to keep the gate* actually asks.
+#
+# Verdict ladder: ``INSUFFICIENT_DATA`` / ``GATE_SUBTRACTS_RETURN`` /
+# ``GATE_RETURN_NEUTRAL`` / ``GATE_ADDS_RETURN`` (thresholded at the
+# shared ``EDGE_TOL_PP=1.0pp`` band — equal to ``gate_audit`` for
+# cross-tool comparability). Until this wiring landed the verdict was
+# CLI-only with no durable per-cycle trend — exactly the same
+# operator-blind state the sibling ``_append_gate_arm_skill_log``
+# closed for the arms breakdown. Same testability rule as every sibling
+# ledger (module-level so tests can redirect), same best-effort
+# discipline (a ledger write must never break the loop), same atomic
+# tmp + ``.replace`` trim idiom every other ledger uses.
+GATE_PNL_SKILL_LOG = ROOT / "data" / "gate_pnl_skill_log.jsonl"
+GATE_PNL_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 # Per-cycle per-persona decision-signal skill ledger. ``persona_skill.analyze``
 # already answers, durably, the single quant-decisive question about the
 # 10 personas the engine cycles through: *within each persona's own
@@ -2596,6 +2624,143 @@ def _append_gate_arm_skill_log(cycle: int, win_start: date, win_end: date,
         return False
 
 
+def _append_gate_pnl_skill_log(cycle: int, win_start: date, win_end: date,
+                               outcomes_path: "Path | str | None" = None
+                               ) -> bool:
+    """Append one structured row to the per-cycle gate economic-counterfactual
+    ledger.
+
+    Answers, durably and per-cycle: *aggregated across all five conviction
+    gate arms (×0.6 / ×0.85 / ×1.0 / ×1.15 / ×1.3) and weighted by how
+    often each fires, does the multiplier overlay net ADD or SUBTRACT
+    realized return on the sized fills, or is the reallocation pure
+    variance with no economic edge?* Reuses ``gate_pnl.analyze`` verbatim
+    (OOS slice by default — the trustworthy, generalization-relevant view
+    every sibling ledger uses) so the persisted verdict equals the
+    read-only CLI's by construction — a built-in no-drift cross-check,
+    the same SSOT idiom every sibling ``_append_*_skill_log`` follows.
+
+    Why this matters and how it differs from sibling gate ledgers:
+
+      * ``gate_arm_skill_log`` (``gate_arm_historical``) reports per-arm
+        mean realized returns and ``arm_monotone_fraction``, bucketed by
+        the gate's TRUE then-deployed prediction. That answers
+        "do the buckets separate?", NOT "does the reallocation pay?". A
+        gate can score ``GATE_INEFFECTIVE`` on bucket spread while the
+        portfolio-level *summed* effect is meaningfully positive (or
+        negative) — what matters for the keep/kill decision.
+      * ``gate_audit`` (CLI-only) reports the two-extreme spread and
+        ignores both the three middle arms AND how often each fires.
+      * Existing ``oos_ic`` / ``oos_rmse`` ledgers measure rank skill,
+        not realized economic effect. Strong rank can co-exist with a
+        gate that hurts realized return.
+
+    ``gate_pnl`` is the assumption-free roll-up: equal-base
+    ``Σ mᵢrᵢ / Σ mᵢ`` minus ``mean(rᵢ)``. Verdict ladder is
+    ``INSUFFICIENT_DATA`` / ``GATE_SUBTRACTS_RETURN`` /
+    ``GATE_RETURN_NEUTRAL`` / ``GATE_ADDS_RETURN`` at
+    ``EDGE_TOL_PP=1.0pp``. Captures both the verdict-driving
+    ``equal_weight_gate_contribution_pp`` and the secondary,
+    reconstruction-approximate ``sized_gate_contribution_pp`` (the
+    AGENTS.md "never folded into verdict" honesty pattern).
+
+    Best-effort and idempotent-safe: every fault is swallowed (a ledger
+    write must NEVER break the continuous loop — the documented
+    ``_append_scorer_skill_log`` / ``_post_discord`` / validation
+    persister discipline). An untrained scorer, a missing outcomes file,
+    or a record below ``MIN_TOTAL=30`` all degrade to
+    ``status='error'/INSUFFICIENT_DATA`` with ``gate_pnl_dark=True`` so
+    a gap in the trend is visible, not silent. Bounded growth: when the
+    file exceeds 2× ``GATE_PNL_SKILL_LOG_KEEP`` it is atomically
+    rewritten via the tmp+``.replace`` idiom every sibling ledger uses.
+
+    The ``gate_pnl_dark`` boolean mirrors the sibling ledgers' ``*_dark``
+    flags (``pipeline_dark`` / ``calibrated_dark`` / ``sizing_dark`` /
+    ``stop_dark`` / ``tp_dark`` / ``gate_dark`` /
+    ``signal_dark``). True when ``gate_pnl.analyze`` returned zero
+    usable ``(pred, realized)`` pairs — the documented
+    pre-``n_train>=500`` cycles, or when no outcomes file exists yet.
+    False means the analyzer actually had data to roll up.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        try:
+            from paper_trader.ml import gate_pnl as _gp
+            rep = _gp.analyze(outcomes_path, oos_only=True)
+        except Exception as exc:
+            rep = {
+                "status": "error", "verdict": "INSUFFICIENT_DATA",
+                "hint": f"gate_pnl unavailable: {type(exc).__name__}",
+                "n": 0, "gate_off_mean_pct": None,
+                "gate_on_mean_pct": None,
+                "equal_weight_gate_contribution_pp": None,
+                "sized_gate_contribution_pp": None,
+                "sized_n": 0, "avg_gate_multiplier": None,
+            }
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA",
+                   "n": 0,
+                   "equal_weight_gate_contribution_pp": None,
+                   "sized_gate_contribution_pp": None,
+                   "sized_n": 0}
+
+        n_obs = int(rep.get("n") or 0)
+        # ``gate_pnl_dark`` is True when the analyzer had no usable pairs to
+        # roll up — pre-``n_train>=500`` cycles, missing outcomes file, or
+        # an entirely sub-MIN_TOTAL slice. Mirrors sibling ``*_dark`` flags.
+        gate_pnl_dark = (n_obs == 0)
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": rep.get("verdict"),
+            "n": n_obs,
+            "slice": rep.get("slice"),
+            "n_records_considered": rep.get("n_records_considered"),
+            "n_train": rep.get("n_train"),
+            "gate_off_mean_pct": rep.get("gate_off_mean_pct"),
+            "gate_on_mean_pct": rep.get("gate_on_mean_pct"),
+            # The verdict-driving headline — equal-base contribution in
+            # percentage points. Negative ⇒ the overlay net sizes toward
+            # losers and not gating would have realized more on these
+            # sized fills.
+            "equal_weight_gate_contribution_pp":
+                rep.get("equal_weight_gate_contribution_pp"),
+            # Secondary, reconstruction-approximate. Reported but NEVER
+            # folded into the verdict (the gate_pnl honesty pattern).
+            "sized_gate_contribution_pp":
+                rep.get("sized_gate_contribution_pp"),
+            "sized_n": rep.get("sized_n"),
+            "avg_gate_multiplier": rep.get("avg_gate_multiplier"),
+            "gate_pnl_dark": gate_pnl_dark,
+        }
+        GATE_PNL_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with GATE_PNL_SKILL_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in
+                     GATE_PNL_SKILL_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > GATE_PNL_SKILL_LOG_KEEP * 2:
+                kept = lines[-GATE_PNL_SKILL_LOG_KEEP:]
+                tmp = GATE_PNL_SKILL_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(GATE_PNL_SKILL_LOG)
+        except Exception as e:
+            print(f"[continuous] gate-pnl-skill-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] gate-pnl-skill-log append failed: {e}")
+        return False
+
+
 def _append_persona_skill_log(cycle: int, win_start: date, win_end: date,
                               outcomes_path: "Path | str | None" = None
                               ) -> bool:
@@ -3811,6 +3976,23 @@ def main() -> None:
         # moment bucket tuning recovers real arm divergence. Best-effort
         # by construction; never breaks the loop.
         _append_gate_arm_skill_log(cycle, win_start, win_end)
+
+        # Durable per-cycle gate economic-counterfactual ledger. The
+        # sibling roll-up to ``_append_gate_arm_skill_log``:
+        # ``gate_pnl.analyze`` answers the keep-or-kill question every
+        # per-arm view structurally cannot — *aggregated across all five
+        # arms and weighted by how often each fires, does the multiplier
+        # overlay net ADD or SUBTRACT realized return vs not gating?* A
+        # gate can read ``GATE_INEFFECTIVE`` (per-arm view) while the
+        # *summed* effect is meaningfully positive or negative — which
+        # is what matters for the keep-or-kill decision. Verdict ladder:
+        # ``INSUFFICIENT_DATA`` / ``GATE_SUBTRACTS_RETURN`` /
+        # ``GATE_RETURN_NEUTRAL`` / ``GATE_ADDS_RETURN`` at
+        # ``EDGE_TOL_PP=1.0pp``. Until this wiring landed the verdict
+        # was CLI-only with no durable trend — same operator-blind
+        # state ``_append_gate_arm_skill_log`` closed for the arms
+        # breakdown. Best-effort by construction; never breaks the loop.
+        _append_gate_pnl_skill_log(cycle, win_start, win_end)
 
         # Durable per-cycle per-persona decision-signal skill ledger.
         # ``persona_skill.persona_skill`` answers the decisive question
