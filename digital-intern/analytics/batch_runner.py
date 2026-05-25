@@ -69,6 +69,10 @@ PIPELINE: list[tuple[str, Path, int]] = [
     # Urgency drought: time since last urgency>=2 article — catches pipeline
     # stalls (quota exhaustion, scoring backlog) before they're noticed manually.
     ("analytics.urgency_drought",         LOGS / "urgency_drought.json",         50),
+    # ML coverage rate: fraction of articles in the last 1h that have a valid
+    # ml_score > 0. Catches scoring outages earlier than score_drift_detector
+    # (which emits NO-DATA instead of ALERT when scoring stops entirely).
+    ("analytics.ml_coverage_rate",        LOGS / "ml_coverage.json",             50),
 ]
 
 TIMEOUT_S = 60  # per-module hard timeout
