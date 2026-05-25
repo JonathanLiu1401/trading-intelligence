@@ -6,6 +6,152 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-25 core HYBRID pass #40 (Agent 1) — orphan `_quota_first_ts` fix + session outage counters
+
+### Phase 1 — Debug: bugs_fixed = 1
+
+**Bug: `_quota_first_ts` gets orphaned when `send_quota_alert` fails on
+the first quota cycle.** Live failure mode: when the first cycle of a
+quota outage's `send_quota_alert` returns False (transient openclaw /
+Discord blip), `_quota_alert_active` stays False but `_quota_first_ts`
+was already anchored. On every subsequent non-quota cycle the recovery
+branch skipped (its `_quota_alert_active` predicate is False), so the
+anchor stayed stuck forever. A FUTURE quota outage (which re-anchors
+only when `_quota_first_ts is None`) inherited the stale timestamp,
+producing a wildly inflated `elapsed_s` on its recovery alert (the gap
+between BOTH outages, not the new one).
+
+Reproduced in a Python REPL by patching `send_quota_alert → False` on
+cycle 1, then running cycles 2 (HOLD) → 3 (quota succeeds) → 4 (HOLD
+recovery). The recovery's `_quota_first_ts` was the cycle-1 timestamp,
+not the cycle-3 one — `elapsed_s` rendered the wrong duration.
+
+Fix (`runner.py` non-quota else arm, just after the breaker-anchor
+cleanup): symmetric to the breaker anchor's "no latch held → drop the
+anchor" cleanup. When the non-quota branch fires and
+`_quota_alert_active` is False but `_quota_first_ts` is set, clear the
+anchor so the next outage starts fresh. Three new pin tests in
+`TestQuotaOutageRecovery`:
+* `test_orphan_quota_anchor_cleared_when_latch_never_armed`
+* `test_orphan_quota_anchor_does_not_break_armed_recovery`
+* `test_orphan_quota_anchor_cleared_on_blocked_decision`
+
+Committed as `d1648c2`. All existing 39 + 3 new tests in
+`tests/test_core_runner_cycle.py` pass.
+
+### Phase 2 — Feature: session outage counters
+
+`_quota_outage_count` and `_breaker_outage_count` module globals in
+`runner.py`, incremented on the EDGE that flips the alert latch from
+False → True (i.e., the cycle the operator-facing Discord alert
+actually delivers). NOT incremented when alert send fails — the
+counters reflect outages the operator was actually told about, never
+silent failures (the orphan-anchor case from Phase 1).
+
+Surfaced via `alarm_latch_state()` so any operator surface (the
+`/api/alarm-latches` endpoint, the Discord hourly summary, a chat
+helper) reads the same number. Distinct from the active-latch booleans:
+those say "is there an outage right NOW?", the counters say "how many
+have happened SINCE BOOT?". A trader paged on a fresh outage uses the
+count to gauge "is this isolated or recurring?" without scrolling
+Discord history.
+
+Counters are in-memory only — consistent with the latch semantics (a
+fresh process re-derives state from scratch). A count of N=2 reads as
+"the desk took 2 hits since the last clean boot."
+
+5 new pin tests in `TestOutageCounters` (`tests/test_core_runner_cycle.py`):
+* `test_quota_outage_count_increments_on_first_alerted_cycle` — count
+  fires once per outage; the latch dedupes additional in-outage cycles
+* `test_quota_outage_count_does_not_increment_on_failed_delivery` —
+  silent-failure invariant
+* `test_quota_outage_count_increments_per_outage_not_per_cycle` —
+  edge-triggered semantics across recover-then-re-outage
+* `test_breaker_outage_count_increments_on_threshold_reached` — mirror
+  for the breaker arm
+* `test_counters_surface_in_alarm_latch_state` — API shape pin
+
+Committed in `9acfae4` (bundled with another agent's
+`scorer_learning_curve` commit via a concurrent staging race — the
+documented `PT concurrent same-role staging race` pattern from
+`~/.claude/projects/.../memory/MEMORY.md`. Code is intact; the commit
+title is misleading. Future agents reading the log: the outage-counter
+feature landed in `9acfae4` despite that commit's title naming
+`scorer_learning_curve`).
+
+### Phase 3 — Live trader findings (user_findings = 6)
+
+Verified by hitting the live `:8090` dashboard during the cycle.
+
+1. **Book currently 100% cash ($987.39, -1.26% vs $1000 start).** Last
+   FILLED trade was 2026-05-24 SELL NVDA × 3 at $215.25 with reasoning
+   "Thesis BROKEN per drift analysis: P/L -3.66%, MACD turned bearish,
+   post-earnings reaction was negative despite the beat. Book was 100%
+   single-name in SEMIS at 65.4% concentration." Trader-perspective:
+   this was a disciplined thesis-drift exit, not panic. Good behaviour.
+
+2. **43h DELIBERATE_HOLD drought** (`/api/decision-drought`). 126
+   cycles since 2026-05-24 02:25, 105 HOLD, 21 NO_DECISION. The engine
+   has been choosing not to trade for the last day-and-a-half. Memorial
+   Day 2026-05-25 is a NYSE_HOLIDAY (full close) — so the majority of
+   HOLDs are correct ("market is closed — no fills possible"). Trader-
+   perspective: NOT a bug, the engine is reasoning correctly about
+   session state.
+
+3. **24% NO_DECISION rate over last 50 cycles**
+   (`/api/no-decision-reasons`). Dominant cause is `cli_nonzero_rc` at
+   58.3% — the documented "transient upstream API error or auth blip,
+   wait one or two cycles" pattern. With 4 concurrent Opus subprocesses
+   (this HYBRID + the sibling ML agent + hourly review + live trader's
+   own Opus call) on a 16-CPU box with 1.1 GB available RAM, this is
+   host saturation, not a strategy bug. The `/api/host-guard`
+   `starvation_rate_pct=17.5%` confirms.
+
+4. **Host borderline saturated.** `load1=14.46, load5=18.24,
+   load_per_cpu=0.9, opus_count=4, mem_available_mb=1125`. The pulse
+   verdict is CLEAR — but a 4-Opus + 18-load steady state is borderline.
+   When the sibling HYBRID agents complete the load will drop back to
+   `~load1<5`.
+
+5. **The new outage counters are live in production.** `curl
+   :8090/api/alarm-latches` returns `quota_outage_count: 0` and
+   `breaker_outage_count: 0` alongside the existing latch state.
+   Currently zero (the running process is freshly booted; counters
+   reset on every restart per the documented semantics).
+
+6. **Runner is several commits behind HEAD** (boot SHA in `build_info`
+   is older than `head_sha`; `build_info.stale=True`). The git-watcher
+   will restart on the next ~3-min poll so the live runner picks up my
+   Phase 2 counter feature alongside other sibling-agent landings.
+
+### Phase 4 — Counters
+
+bugs_fixed = 1 · features_added = 1 · user_findings = 6
+
+```bash
+# Run my pinning + feature tests (~22s):
+python3 -m pytest tests/test_core_runner_cycle.py -q
+
+# Run focused alarm-latch surfaces (~1s):
+python3 -m pytest tests/test_core_dashboard_alarm_latches.py \
+    tests/test_alarm_latch_headline.py tests/test_core_runner.py -q
+
+# Live sanity checks (with a running paper-trader on :8090):
+curl -s http://localhost:8090/api/alarm-latches | python3 -m json.tool
+curl -s http://localhost:8090/api/runner-heartbeat | python3 -m json.tool
+```
+
+### Files touched
+
+- `paper_trader/runner.py` (+42 / -3 — orphan cleanup + outage counters)
+- `tests/test_core_runner_cycle.py` (+229 — 8 new pin tests across 2
+  classes)
+- `tests/test_core_runner.py` (+4 — shape pin update for the 2 new
+  counter keys in `TestAlarmLatchState`)
+- `AGENTS.md` (this entry)
+
+---
+
 ## 2026-05-25 ML+backtest HYBRID pass #40 (Agent 2) — `confidence_skill` + scorer_learning_curve NO_SKILL fix
 
 HYBRID pass. One fix + one feature shipped.
