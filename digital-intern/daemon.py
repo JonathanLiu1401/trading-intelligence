@@ -132,6 +132,7 @@ from collectors.short_squeeze_monitor import collect_short_squeeze
 from collectors.twse_semiconductor import collect_twse_semiconductor
 from collectors.nasdaq_ipo_calendar import collect_nasdaq_ipo
 from collectors.nasdaq_earnings_calendar import collect as collect_nasdaq_earnings
+from collectors.nasdaq_dividend_calendar import collect_nasdaq_dividends
 from collectors.putcall_ratio_collector import collect_putcall_ratio
 from collectors.bls_collector import collect_bls
 from collectors.bea_collector import collect_bea
@@ -217,8 +218,9 @@ FRED_MACRO_INTERVAL     = 3600    # FRED macro series (claims, M2, rig count, et
 COT_INTERVAL            = 6 * 3600  # CFTC COT report — weekly release, check 6-hourly
 TWSE_INTERVAL           = 3600    # Taiwan Stock Exchange semis — hourly (market open 09:00–13:30 TW)
 SHORT_INTEREST_INTERVAL = 21600   # highshortinterest.com every 6h (data updates ~2/month)
-NASDAQ_IPO_INTERVAL     = 3600    # Nasdaq IPO calendar - hourly
-NASDAQ_EARNINGS_INTERVAL = 3600  # Nasdaq earnings calendar - hourly
+NASDAQ_IPO_INTERVAL      = 3600   # Nasdaq IPO calendar - hourly
+NASDAQ_EARNINGS_INTERVAL = 3600   # Nasdaq earnings calendar - hourly
+NASDAQ_DIVIDEND_INTERVAL = 3600   # Nasdaq dividend/split calendar - hourly
 PUTCALL_RATIO_INTERVAL  = 600     # Market put/call ratio - every 10min
 VIX_TS_INTERVAL         = 600     # VIX term structure snapshot every 10min
 DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
@@ -386,8 +388,9 @@ WORKER_POLL_INTERVAL_SECS = {
     "sec_ma_deals": SEC_MA_DEALS_INTERVAL,
     "usgs_quake": USGS_QUAKE_INTERVAL,
     "nasdaq_halts": NASDAQ_HALTS_INTERVAL,
-    "nasdaq_ipo":      NASDAQ_IPO_INTERVAL,
-    "nasdaq_earnings": NASDAQ_EARNINGS_INTERVAL,
+    "nasdaq_ipo":       NASDAQ_IPO_INTERVAL,
+    "nasdaq_earnings":  NASDAQ_EARNINGS_INTERVAL,
+    "nasdaq_dividends": NASDAQ_DIVIDEND_INTERVAL,
     "putcall_ratio":   PUTCALL_RATIO_INTERVAL,
     "fda": FDA_INTERVAL,
     "seekingalpha": SEEKINGALPHA_INTERVAL,
@@ -1294,6 +1297,28 @@ def nasdaq_ipo_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(NASDAQ_IPO_INTERVAL)
+
+
+# ── Worker: NASDAQ Dividend & Split Calendar — broad market, hourly ──────────
+def nasdaq_dividends_worker(store: ArticleStore):
+    log.info("[nasdaq_dividends_worker] started")
+    bo = Backoff("nasdaq_dividends", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_nasdaq_dividends()
+            _ingest(store, articles, "nasdaq_dividends")
+            try:
+                source_health.record_result("nasdaq_dividends", len(articles))
+            except Exception as he:
+                log.warning(f"[nasdaq_dividends_worker] source_health error: {he}")
+            _worker_last_ok["nasdaq_dividends"] = time.time()
+            log.debug(f"[nasdaq_dividends] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[nasdaq_dividends_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(NASDAQ_DIVIDEND_INTERVAL)
 
 
 # ── Worker: NASDAQ Earnings Calendar — broad market, hourly ─────────────────
@@ -4404,8 +4429,9 @@ def main():
         ("usgs_quake",  usgs_quake_worker),
         ("nasdaq_halts", nasdaq_halts_worker),
         ("twse_semiconductor", twse_semiconductor_worker),
-        ("nasdaq_ipo",   nasdaq_ipo_worker),
-        ("nasdaq_earnings", nasdaq_earnings_worker),
+        ("nasdaq_ipo",       nasdaq_ipo_worker),
+        ("nasdaq_earnings",  nasdaq_earnings_worker),
+        ("nasdaq_dividends", nasdaq_dividends_worker),
         ("putcall_ratio", putcall_ratio_worker),
         ("fda",         fda_worker),
         ("seekingalpha", seekingalpha_worker),
