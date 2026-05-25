@@ -61,6 +61,7 @@ PIPELINE: list[tuple[str, Path, int]] = [
     # Per-source quality snapshot: avg ai/ml/kw scores + urgency fraction
     # across the 8,000 most recent live rows.
     ("analytics.source_quality",         LOGS / "source_quality.json",          50),
+    ("analytics.volume_quality_divergence", LOGS / "volume_quality_divergence.json", 50),
 ]
 
 TIMEOUT_S = 60  # per-module hard timeout
