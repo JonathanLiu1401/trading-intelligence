@@ -6,6 +6,202 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 core HYBRID pass #9 (Agent 1) — hard SL/TP test coverage + `/api/hard-exit-summary`
+
+### Phase 1 — Test: bugs_fixed = 0 (test coverage for newly-landed feature)
+
+Re-read `runner.py`, `reporter.py`, `signals.py`, `strategy.py`,
+`market.py`, `store.py`, plus the relevant dashboard slices. The
+codebase remains heavily hardened (844 core tests pass clean across
+the six core files). I did not find a defect worth a "fix:" commit
+on close reading. Honest bugs_fixed=0.
+
+**But the freshly-landed hard SL/TP enforcement (commit `3176d2f`,
+2026-05-24 — `feat: MACD improvements — enhanced signals, hard SL/TP,
+trade outcomes analytics`) shipped with ZERO test coverage on the live
+trading path.** This is the single most load-bearing risk-management
+addition in months: every BUY auto-stamps `stop_loss_price` /
+`take_profit_price`, and every cycle BEFORE Opus sees the prompt the
+runner force-sells any lot whose mark has breached the 2/3% (standard)
+or 4/6% (leveraged) threshold. A regression here silently re-prices
+every auto-exit and a trader has no signal until equity diverges
+from expectation.
+
+**What landed (`tests/test_hard_sl_tp.py`, 30 cases):**
+
+- `TestSLTPConstants` (7) — pin literal 2/3% and 4/6%; lock the
+  1.5:1 R:R invariant the MACD-strategy hangs on; verify
+  `_LEVERAGED_ETFS_SL` has the headline 3x bulls/bears and does NOT
+  contain non-leveraged tickers (would otherwise silently widen the
+  stops on NVDA/AAPL/SPY).
+- `TestPositionsNeedingHardExit` (10) — the SQL surface. Exact
+  boundary semantics (`current_price <= stop_loss_price` inclusive
+  must trigger), null-SL guard (legacy lots untouched), stale-mark
+  guard (`current_price == 0` is the freshness proxy — a fresh BUY
+  would otherwise instantly exit), option/closed-lot exclusion.
+- `TestCheckAndExecuteHardExits` (6) — the runner-side executor.
+  Asserts exact cash deltas, lot closure, SELL trade row with
+  `HARD_SL` / `HARD_TP` reason prefix, multi-lot single-cycle exits,
+  zero-qty no-op, non-fatal contract on store exceptions.
+- `TestBuyStampsSLTP` (4) — end-to-end through `_execute()`: fresh
+  BUY stamps the right SL/TP per percentage tier, leveraged-vs-
+  standard discrimination works, an ADD re-anchors SL/TP to the
+  LATEST price (so a winning add doesn't keep SL pinned to the
+  original entry), and a BUY → mark-falls-to-SL chain executes the
+  auto-exit cleanly.
+- `TestUpsertPositionSLTPSemantics` (3) — the `qty=0` metadata-only
+  path sets only SL/TP (does NOT touch size), `qty=0` with no SL/TP
+  args is a pure no-op (preserves existing SL/TP), and the closed-lot
+  reactivation path correctly carries through SL/TP on the new BUY.
+
+30/30 pass; total test count moves 7468 → 7498.
+
+### Phase 2 — feat: `/api/hard-exit-summary` — operator discipline visibility
+
+**The gap.** The hard SL/TP enforcement is silent by design (each
+event posts `**AUTO RISK EXIT** \`TICKER\`` to Discord and that's
+all). No surface aggregates the discipline:
+
+  * Are mechanical exits dominating discretionary closes (the
+    `mechanical_share` question — a bot leaving every exit to SL/TP
+    is a different beast from one where SL/TP fire only 10% of the
+    time)?
+  * Is SL outpacing TP (entries are bad — bot getting stopped out
+    repeatedly) or vice versa (entries landing in winners)?
+  * Which tickers are repeat-offenders on the SL side (a
+    strategy-level signal)?
+  * When did the last hard SL / TP fire (situational awareness)?
+
+`/api/closed-positions` shows per-lot realized P/L but does not
+bucket by exit reason. `trade_outcomes.py` counts `n_hard_sl` /
+`n_hard_tp` but only as raw counts wired into `self_review` — no
+P/L attribution, no per-ticker breakdown, no operator-actionable
+verdict.
+
+**The module.** `paper_trader/analytics/hard_exit_summary.py` (280
+lines). Pure builder over `store.recent_trades(N)` (newest-first,
+matching the convention every sibling builder uses). Walks every
+SELL trade and buckets by reason marker (`HARD_SL` / `HARD_TP` /
+discretionary). Surfaces a 5-state verdict ladder:
+
+| Verdict        | Trigger |
+|----------------|---------|
+| `NO_HARD_EXITS`| 0 hard exits — discipline guard armed but untested |
+| `INSUFFICIENT` | < `MIN_FOR_VERDICT` (3) hard exits — accumulating |
+| `TP_HEAVY`     | TP share ≥ 0.65 — winners dominate; entries landing in trends |
+| `SL_HEAVY`     | TP share ≤ 0.35 — losers dominate; review entry timing |
+| `BALANCED`     | between the two thresholds — mechanical discipline working both ways |
+
+`mechanical_share` is the orthogonal cell — what fraction of ALL
+SELLs were mechanical (TP+SL) vs. discretionary. The discipline
+ratio and mechanical share together answer different operator
+questions; surfacing both lets the trader read the book's
+mechanical posture in one panel.
+
+Echoes live thresholds (`tp_heavy_threshold` / `sl_heavy_threshold`
+/ `min_for_verdict`) so a dashboard consumer renders them next to
+the verdict — same echo discipline `/api/feed-health` follows for
+`live_min_score` / `blind_streak_min`.
+
+Wired into `dashboard.py` as `/api/hard-exit-summary` (placed
+adjacent to `/api/swr-cache-health` per the operator-endpoint
+clustering pattern). Deliberately NOT `@swr_cached` — pure scan
+over `recent_trades(2000)`; an operator opening this panel during
+a sequence of breaches needs the freshest count, not a 20s-old
+cache (the `notify_health_api` precedent).
+
+**Test coverage added (29 cases in `tests/test_hard_exit_summary.py`):**
+
+- `TestClassifyExitReason` (6) — marker classification, including
+  the empty/None degrade-safe contract and substring-safe matching.
+- `TestVerdict` (6) — the verdict ladder boundaries, including
+  `MIN_FOR_VERDICT` inclusive-promotion (so a future tweak surfaces
+  in tests).
+- `TestBuildHardExitSummary` (16) — empty-ledger no-op, BUY rows
+  ignored even when the marker text appears in the BUY reason,
+  cash delta math per class, TP_HEAVY / SL_HEAVY / BALANCED
+  threshold transitions, mechanical-share with discretionary mix,
+  newest-first `last_hard_*` picking, per-ticker breakdown sort,
+  non-numeric value degrade-safe, option-sell discretionary
+  bucketing, `state=ERROR` envelope on a malformed input (the
+  builder MUST never raise), threshold echo.
+- `TestHardExitSummaryEndpoint` (1) — Flask test client hits the
+  endpoint against an isolated empty store and asserts the
+  envelope shape + `NO_HARD_EXITS` verdict.
+
+29/29 pass; total test count moves 7498 → 7527.
+
+### Phase 3 — Live trader findings (user_findings = 5)
+
+Hit the live `:8090` endpoints as a trader would (runner pid=98851,
+boot_sha `839a8d6`, head behind by 3 — git-watcher will restart
+shortly to deploy the new endpoint):
+
+1. **Book 100% cash, $987.39 (-1.26% P/L) for ~22 hours.** Last
+   trade was 2026-05-24 02:08 UTC (NVDA SELL on broken thesis); every
+   decision since is `HOLD CASH`. The book is internally consistent
+   with the bot's defensive posture (`/api/state` portfolio matches
+   `/api/runner-heartbeat` HEALTHY), but a trader returning to the
+   desk should know this is a *deliberate* all-cash stance, not a
+   wedge.
+2. **`/api/runner-heartbeat` HEALTHY** — last decision 6m ago,
+   on-schedule for the 60m closed-market cadence (CLOSED_INTERVAL_S
+   per `runner.py`), holds the singleton lock (pid=98851 — manual
+   process, NOT the systemd unit which is in busy-loop restart
+   mode per the memory note), no breaker/quota latches, Discord
+   delivery HEALTHY.
+3. **`/api/host-guard` reads PROBE-CLEAR but PULSE-STARVED** — the
+   live /proc probe says `host clear` (load1=21.22 on 16 CPU, opus=4
+   concurrent, mem=6.2GB free), but the decision-log pulse reads
+   STARVED: 29% of the last 120 decisions never reached Opus. The
+   `/api/no-decision-reasons` dominant bucket is `host_saturated`
+   (86% of NO_DECISIONs). The box has calmed but the damage is in
+   the log — exactly the intermittent-storm pattern the pulse layer
+   exists to surface. Trader-visible because it means out-of-band
+   review/HYBRID agents are silently stealing live-trader capacity.
+4. **`/api/feed-health` HEALTHY** — 509 live articles in 2h, 22
+   scored (`live_min_score=4.0`), unscored_feed=False. The ML scorer
+   is keeping up but the scored-rate is only 4.3% (22/509) — a future
+   detector could flag the *ratio* as a separate signal once a
+   baseline exists.
+5. **My new `/api/hard-exit-summary` is on disk but not yet served
+   by the running runner** (`/api/build-info` `stale: true, behind:
+   3`). The git-watcher (180s poll + 600s deadman) will deploy
+   between cycles. Confirms the deferred-restart machinery itself
+   is working as designed.
+
+### Phase 4 — verify
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_hard_sl_tp.py tests/test_hard_exit_summary.py -v
+# 59 passed
+python3 -m pytest tests/test_core_strategy.py tests/test_core_store.py \
+  tests/test_core_dashboard_notify_health.py -q
+# 265 passed
+```
+
+### Files touched
+
+- `paper_trader/analytics/hard_exit_summary.py` (NEW, 280 lines)
+- `paper_trader/dashboard.py` (+60 lines — `hard_exit_summary_api` only)
+- `tests/test_hard_sl_tp.py` (NEW, 440 lines — 30 cases)
+- `tests/test_hard_exit_summary.py` (NEW, 338 lines — 29 cases)
+
+Total: 1118 inserts, 0 deletes. Two commits: `839a8d6` (Phase 1
+tests) and `bb25af8` (Phase 2 feature + tests).
+
+### Why no `reporter.py` Discord-side change
+
+A trader reads `/api/hard-exit-summary` from the dashboard; folding
+this into the hourly Discord summary is a natural extension once
+some hard exits have actually fired (today the book is 0-trade for
+24h). Deferring the reporter line keeps the additive contract
+clean — the Discord surface only gains the line when the panel
+itself has data to summarise.
+
+---
+
 ## 2026-05-24 core HYBRID pass #8 (Agent 1) — `feed_health` UNSCORED clause: distinguish "ML scorer down" from "collector down"
 
 ### Phase 1 — Debug: bugs_fixed = 0
