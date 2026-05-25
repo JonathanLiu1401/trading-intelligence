@@ -125,6 +125,7 @@ from collectors.forex_factory_calendar import collect as collect_forex_factory_c
 from collectors.sec_13f_collector import collect_13f_filings
 from collectors.sec_insider_form4 import collect_sec_form4
 from collectors.sec_ma_deals_collector import collect_sec_ma_deals
+from collectors.sec_keyword_signals import collect_sec_keyword_signals
 from collectors.nasdaq_halts_collector import collect_nasdaq_halts
 from collectors.fda_collector import collect_fda
 from collectors.usaspending_contracts_collector import collect_usaspending_contracts
@@ -267,6 +268,7 @@ SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h
 SEC_13F_INTERVAL        = 1800      # SEC 13F institutional holdings — every 30min (quarterly season)
 SEC_FORM4_INTERVAL      = 300       # SEC Form 4 insider transactions (portfolio tickers) — every 5min
 SEC_MA_DEALS_INTERVAL   = 1800      # SEC M&A deal detector (market-wide keyword search) — every 30min
+SEC_KEYWORD_SIGNALS_INTERVAL = 1800  # SEC EFTS keyword signals (going concern, material weakness, etc.) — every 30min
 USGS_QUAKE_INTERVAL     = 1800    # USGS M≥5 earthquake feed every 30min (insurance/semis/energy catalyst)
 NASDAQ_HALTS_INTERVAL   = 120     # NASDAQ/UTP trading halt+resume feed every 2min
 FDA_INTERVAL            = 1800    # FDA press releases + MedWatch safety alerts — every 30min
@@ -392,6 +394,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "sec_13f": SEC_13F_INTERVAL,
     "sec_form4": SEC_FORM4_INTERVAL,
     "sec_ma_deals": SEC_MA_DEALS_INTERVAL,
+    "sec_keyword_signals": SEC_KEYWORD_SIGNALS_INTERVAL,
     "usgs_quake": USGS_QUAKE_INTERVAL,
     "nasdaq_halts": NASDAQ_HALTS_INTERVAL,
     "nasdaq_ipo":       NASDAQ_IPO_INTERVAL,
@@ -2766,6 +2769,27 @@ def sec_ma_deals_worker(store: ArticleStore):
         _sleep(SEC_MA_DEALS_INTERVAL)
 
 
+# ── Worker: SEC EDGAR full-text keyword signals — every 30min ──────────────
+def sec_keyword_signals_worker(store: ArticleStore):
+    log.info("[sec_keyword_signals_worker] started")
+    bo = Backoff("sec_keyword_signals", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_sec_keyword_signals()
+            _ingest(store, articles, "sec_keyword_signals")
+            try:
+                source_health.record_result("sec_keyword_signals", len(articles))
+            except Exception as he:
+                log.warning(f"[sec_keyword_signals_worker] source_health error: {he}")
+            _worker_last_ok["sec_keyword_signals"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[sec_keyword_signals_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SEC_KEYWORD_SIGNALS_INTERVAL)
+
+
 # ── Worker: Hacker News front-page + finance/business stories — every 5min ──
 def hackernews_worker(store: ArticleStore):
     log.info("[hackernews_worker] started")
@@ -4475,6 +4499,7 @@ def main():
         ("sec_13f",     sec_13f_worker),
         ("sec_form4",   sec_form4_worker),
         ("sec_ma_deals", sec_ma_deals_worker),
+        ("sec_keyword_signals", sec_keyword_signals_worker),
         ("usgs_quake",  usgs_quake_worker),
         ("nasdaq_halts", nasdaq_halts_worker),
         ("twse_semiconductor", twse_semiconductor_worker),
