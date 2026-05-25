@@ -3916,6 +3916,51 @@ def _sector_pulse_chat_lines(pulse: Any) -> list:
     return lines
 
 
+_SECTOR_COHERENCE_MAX_CHAT_LINES = 5
+
+
+def _sector_coherence_chat_lines(rep: Any) -> list:
+    """Render the per-sector coherence report as compact chat lines.
+
+    Silence-on-healthy in the ``_sector_pulse_chat_lines`` /
+    ``_macro_calendar_chat_lines`` mould: only surface sectors whose
+    verdict is actionable (MACRO_BULL / MACRO_BEAR / TILT_BULL / TILT_BEAR).
+    SPLIT and INSUFFICIENT collapse to silence — a chat block whose only
+    contribution is "we don't know" is filler, never information.
+
+    Pure / total — the ``_tail_risk_chat_lines`` contract: non-dict /
+    empty / no actionable sectors → ``[]`` (block omitted, never an
+    exception into the chat handler).
+    """
+    if not isinstance(rep, dict):
+        return []
+    sectors = rep.get("sectors")
+    if not isinstance(sectors, list) or not sectors:
+        return []
+    actionable = [
+        s for s in sectors
+        if isinstance(s, dict)
+        and s.get("verdict") in
+        ("MACRO_BULL", "MACRO_BEAR", "TILT_BULL", "TILT_BEAR")
+    ]
+    if not actionable:
+        return []
+    lines = []
+    for s in actionable[:_SECTOR_COHERENCE_MAX_CHAT_LINES]:
+        try:
+            lead = s.get("lead_headline") or ""
+            lead_cut = (lead[:120] + "…") if len(lead) > 120 else lead
+            lines.append(
+                f"{s.get('sector', '?')} {s.get('verdict')} "
+                f"({s.get('n_bull')}↑/{s.get('n_bear')}↓ of "
+                f"{s.get('n_classified')} classified, "
+                f"{s.get('coherence_pct')}% coh) · {lead_cut}"
+            )
+        except Exception:  # noqa: BLE001 — a chat block must never raise
+            continue
+    return lines
+
+
 _PORTFOLIO_SIGNALS_MAX_HEADLINES = 5
 
 
@@ -4809,6 +4854,47 @@ def create_app(store=None) -> Flask:
             for r in rows
         ]
         return jsonify(_aggregate_sector_pulse(arts, window_hours=hours))
+
+    @app.get("/api/sector-coherence")
+    def api_sector_coherence():
+        """Per-sector bullish/bearish coherence — the structural companion
+        to ``/api/sector-pulse``. PULSE answers "where is the wire
+        concentrated?"; COHERENCE answers "is the concentration agreeing
+        on a direction (macro story, sector-wide positioning is the trade)
+        or split (idiosyncratic catalysts, name-level only)?". Pure SQL
+        over the same live-only article rows; honours ``_LIVE_ONLY_SQL``
+        so backtest-injected rows are excluded. ``?hours=`` clamped 1..168.
+        Observational only — never gates Opus.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            hours = int(request.args.get("hours", 24))
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(168, hours))
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT title, ai_score, urgency, first_seen FROM articles "
+                f"WHERE first_seen >= ? AND {_LIVE_ONLY_SQL} "
+                "ORDER BY first_seen DESC LIMIT 4000",
+                (since,),
+            )
+        except sqlite3.Error:
+            rows = []
+        arts = [
+            {"title": r[0] or "", "ai_score": float(r[1] or 0),
+             "urgency": int(r[2] or 0), "first_seen": r[3]}
+            for r in rows
+        ]
+        try:
+            from analysis.sector_coherence import build_sector_coherence
+            return jsonify(build_sector_coherence(arts, window_hours=hours))
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     @app.get("/api/portfolio-signals")
     def api_portfolio_signals():
@@ -6417,6 +6503,11 @@ def create_app(store=None) -> Flask:
         # price heatmap (fetched below) is dark. Best-effort; a read failure
         # simply omits the block.
         sector_pulse_block = ""
+        # Companion block: sector COHERENCE — is the wire actually agreed on
+        # a direction in the lit sectors, or is the concentration mostly
+        # idiosyncratic (in which case sector-wide positioning is wrong)?
+        # Reuses the same SQL fetch as sector-pulse so we don't double-query.
+        sector_coherence_block = ""
         try:
             sp_since = (
                 datetime.now(timezone.utc) - timedelta(hours=24)
@@ -6430,13 +6521,21 @@ def create_app(store=None) -> Flask:
                 "ORDER BY first_seen DESC LIMIT 4000",
                 (sp_since,),
             )
-            sp = _aggregate_sector_pulse(
-                [{"title": r[0] or "", "ai_score": float(r[1] or 0),
-                  "urgency": int(r[2] or 0), "first_seen": r[3]}
-                 for r in sp_rows],
-                window_hours=24,
-            )
+            sp_arts = [
+                {"title": r[0] or "", "ai_score": float(r[1] or 0),
+                 "urgency": int(r[2] or 0), "first_seen": r[3]}
+                for r in sp_rows
+            ]
+            sp = _aggregate_sector_pulse(sp_arts, window_hours=24)
             sector_pulse_block = "\n".join(_sector_pulse_chat_lines(sp))
+            try:
+                from analysis.sector_coherence import build_sector_coherence
+                sc = build_sector_coherence(sp_arts, window_hours=24)
+                sector_coherence_block = "\n".join(
+                    _sector_coherence_chat_lines(sc))
+            except Exception as e2:  # noqa: BLE001 — never sink the chat
+                _logger().warning(
+                    "chat: sector-coherence build failed: %s", e2)
         except Exception as e:  # noqa: BLE001 — never sink the chat
             _logger().warning("chat: sector-pulse fetch failed: %s", e)
 
@@ -7892,6 +7991,7 @@ def create_app(store=None) -> Flask:
             + (f"ALERT-CONFIDENCE TREND (urgent-story clusters whose unique-source count is GROWING or FADING vs the prior 6-24h half; corroboration that's still expanding is the highest-trust read — a single-source story is usually PR not news, a fading story has been priced):\n{alert_trend_block}\n\n" if alert_trend_block else "")
             + (f"PAPER TRADER OPTIONS GREEKS (Black-Scholes, live IV):\n{greeks_block}\n\n" if greeks_block else "")
             + (f"NEWS SECTOR PULSE (native — where the wire is concentrated right now, recency-weighted, last 24h; independent of the price heatmap below so it survives a stale/down paper-trader):\n{sector_pulse_block}\n\n" if sector_pulse_block else "")
+            + (f"NEWS SECTOR COHERENCE (per-sector bullish/bearish stance dispersion across the same 24h wire — the companion to PULSE that answers the structural question PULSE cannot: is the concentration a MACRO STORY all agreeing on direction (sector-wide positioning is the trade) or IDIOSYNCRATIC catalysts pulling in different directions (sector-wide positioning is the wrong move, name-level only)? Surfaced ONLY when at least one sector reaches MACRO_BULL / MACRO_BEAR / TILT_BULL / TILT_BEAR; SPLIT / INSUFFICIENT / no-news collapses to silence. Headline + per-sector verdict carry verbatim from the builder — restate, never re-derive):\n{sector_coherence_block}\n\n" if sector_coherence_block else "")
             + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP (paper-trader price momentum):\n{heatmap_block}\n\n" if heatmap_block else "")
             + (f"EARNINGS RADAR (scheduled gap risk):\n{earnings_block}\n\n" if earnings_block else "")
             + (f"PAPER TRADER — PRE-EARNINGS DOLLARIZED 1σ SHOCK (per HELD imminent print: 'if NVDA gaps the typical 1σ on its release, the book moves $X / Y% of equity' — the forward $-at-risk view that complements the EARNINGS RADAR's timing-only listing):\n{earnings_shock_block}\n\n" if earnings_shock_block else "")

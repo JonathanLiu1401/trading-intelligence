@@ -8324,6 +8324,26 @@ def tail_risk_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/portfolio-beta")
+def portfolio_beta_api():
+    """Market-model regression on paired daily portfolio/SPY returns:
+    β, α (daily and annualised), R², SE(β), and a rolling-30d β vs
+    all-time β regime-shift probe. ``/api/analytics`` already publishes
+    ``sp500_beta`` + ``sp500_correlation`` as bare scalars; this is the
+    richer panel — α answers "is there edge beyond beta?", R² says how
+    much of the book is index-explained, SE(β) gates how much to trust
+    the scalar, and rolling vs all-time flags re-rating. Honesty-gated
+    (NO_DATA/INSUFFICIENT/OK, mirrors ``build_tail_risk``);
+    observational only — never gates Opus (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.portfolio_beta import build_portfolio_beta
+        store = get_store()
+        result = build_portfolio_beta(store.equity_curve(5000))
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/recovery")
 def recovery_api():
     """Path back to even: per-position breakeven %/$ + the book rally
