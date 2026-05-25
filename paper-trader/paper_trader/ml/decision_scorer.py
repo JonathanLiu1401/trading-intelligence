@@ -7,9 +7,10 @@ cannot learn. Trained on actual backtest BUY/SELL decisions with their real
 
 Architecture: regularized sklearn MLPRegressor (32, 16) — L2 alpha + early
 stopping (anti-overfit, 2026-05-18; see the train_scorer config comment) — on
-17 features (10 numeric: 8 quant + 2 news signals (urgency, article_count) +
-7-way sector one-hot). Falls back to a numpy weighted least-squares linear
-model when sklearn is unavailable.
+20 features (10 base numeric: 8 quant + 2 news signals (urgency,
+article_count); 3 enhanced MACD/EMA200 booleans (ema200_above,
+hist_cross_up, macd_below_zero_cross); 7-way sector one-hot). Falls back
+to a numpy weighted least-squares linear model when sklearn is unavailable.
 """
 from __future__ import annotations
 
@@ -328,13 +329,20 @@ def build_features(
 ) -> list[float]:
     """Build a fixed-length feature vector for one decision.
 
-    The 3 enhanced MACD features are appended AFTER the sector one-hot so
-    the existing 10+7 feature ordering is preserved — only the tail grows.
-    Existing pickles trained on 17 features will fail to predict on the
-    20-feature input (shape mismatch); predict_with_meta catches this and
-    degrades to failed=True / pred=0.0 until the next retrain rebuilds the
-    model on the new vector (the continuous loop's per-cycle retrain picks
-    this up automatically)."""
+    Slot order matches FEATURE_NAMES exactly: 10 base numeric features,
+    then the 3 enhanced MACD/EMA200 booleans, then the 7-way sector
+    one-hot tail. Concretely:
+    ``[ml_score, rsi, macd, mom5, mom20, regime_mult, vol_ratio, bb_pos,
+       news_urgency, news_article_count,
+       ema200_above, hist_cross_up, macd_below_zero_cross,
+       sector_tech, sector_energy, …, sector_other]``.
+    The invariant "the last len(SECTORS) entries are the sector one-hot"
+    is preserved (several attribution consumers and the per-sector test
+    rely on it). Existing pickles trained on the legacy 17-feature
+    vector will fail to predict on the 20-feature input (shape mismatch);
+    predict_with_meta catches this and degrades to failed=True / pred=0.0
+    until the next retrain rebuilds the model on the new vector (the
+    continuous loop's per-cycle retrain picks this up automatically)."""
     rsi_v = _to_float(rsi, 50.0)
     macd_v = _to_float(macd, 0.0)
     mom5_v = _to_float(mom5, 0.0)
