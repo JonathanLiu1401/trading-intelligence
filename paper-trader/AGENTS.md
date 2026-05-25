@@ -6,6 +6,113 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-25 feature-dev pass #3 (Agent 4) — `rotation_skill` (paired SELL→BUY alpha)
+
+Feature-dev pass. Two endpoints shipped across both repos; only the
+paper-trader change is logged here (the digital-intern change ships
+`/api/publish-lag` + two chat enrichment blocks — see that repo's
+AGENTS.md).
+
+**Phase 1 — feature (paper-trader):** `/api/rotation-skill`.
+
+The 150-endpoint surface had a real gap on the *paired-rotation* axis:
+
+* `cash_redeployment_latency_skill` — measures the *time* between SELL
+  and next-BUY. Says nothing about whether the rotation was *skilled*.
+  A FAST_REDEPLOY desk that rotates DRAM → MSTR while DRAM rips and
+  MSTR sags is fast AND lazy.
+* `round_trip_postmortem` — measures post-exit drift on the SAME ticker.
+  Per-position, not paired. A "PREMATURE" exit of X is judged in
+  isolation from what we bought instead.
+* `rebuy_regret` / `reentry_velocity` — SAME-name re-entry. Rotation
+  skill targets the CROSS-ticker case.
+* `trade_attribution` / `pnl_attribution` — book-level P&L breakdown,
+  not paired-rotation alpha.
+
+This pass fills the gap with **rotation alpha** —
+`(Y_return_since_BUY) − (X_return_since_SELL)` over `forward_days` (default
+5d). Positive alpha = skilled rotation; negative alpha = lazy rotation.
+
+Pair-detection rules (test-locked, mirror
+`cash_redeployment_latency_skill` discipline so cross-tool reads agree):
+
+1. Walk SELLs chronologically; for each find the earliest subsequent BUY
+   within `pairing_max_h` (default 24h) that is a DIFFERENT ticker.
+   Same-ticker rebuy is `rebuy_regret` territory, not a rotation.
+2. Cash-conservation gate (loose by default): `|ΔNotional| / sell_notional`
+   in `[cash_ratio_lo, cash_ratio_hi]` (0.3..3.0). Tight matching would
+   reject legitimate consolidations / scale-ins.
+3. Maturity gate: SELLs younger than `forward_days + 1d` go to
+   `n_window_edge` (the forward window has not elapsed).
+4. Forward prices fetched via yfinance daily history per unique ticker
+   (one-shot batch, in-endpoint cache). yfinance failures fall into
+   `n_unpriced` — pairs degrade gracefully toward INSUFFICIENT_DATA.
+
+Verdict ladder:
+
+* `LAZY_ROTATION` — median alpha ≤ -1.5pp AND ≥ 60% negative pairs.
+* `SKILLED_ROTATION` — median alpha ≥ +1.5pp AND ≥ 60% positive pairs.
+* `NET_NEGATIVE` — median alpha ≤ -0.3pp.
+* `NET_POSITIVE` — median alpha ≥ +0.3pp.
+* `NEUTRAL` — |median alpha| < 0.3pp.
+* `INSUFFICIENT_DATA` — fewer than 3 scored pairs.
+
+Live verification (default knobs against `paper_trader.db`):
+```
+verdict=INSUFFICIENT_DATA, n_sells_in_window=4, n_pairs_detected=2,
+n_pairs_scored=0, n_window_edge=1, n_unpriced=1
+```
+Correct silence — the live book is flat / recent post-SELL and the live
+sample is sparse. The endpoint emits `INSUFFICIENT_DATA` exactly when
+expected; the chat block correctly stays quiet at this verdict.
+
+**Phase 2 — chat enrichment (digital-intern side):**
+`_rotation_skill_chat_lines` helper + 3s guarded urlopen of
+`http://127.0.0.1:8090/api/rotation-skill` + system_prompt block.
+Fires only on `LAZY_ROTATION` / `NET_NEGATIVE` — the silence-on-healthy
+precedent matches `_cash_redeployment_chat_lines`. Locked by 19 unit
+tests in `tests/test_chat_rotation_skill_enrichment.py`. Block appears
+once `:8090` restarts onto `/api/rotation-skill`.
+
+**Test coverage added (paper-trader):**
+
+```
+tests/test_rotation_skill.py                              # 26 tests
+```
+
+Pins the verdict ladder boundaries, the pair-detection rules
+(same-ticker exclusion, pairing window, cash-mismatch gate, window-edge
+exclusion), the alpha definition (buy% − sell%), envelope shape /
+SSOT discipline, and total-function defense (never raises on garbage
+input or a price_at that throws).
+
+**Files touched (this repo only):**
+
+* `paper_trader/analytics/rotation_skill.py` (NEW, +414 lines —
+  the pure builder + verdict ladder).
+* `paper_trader/dashboard.py` (+~140 lines — `/api/rotation-skill`
+  endpoint with yfinance-backed `price_at` callable; mirrors
+  `cash_redeployment_latency_skill_api` skeleton).
+* `tests/test_rotation_skill.py` (NEW, +281 lines — 26 tests).
+* `AGENTS.md` (this entry).
+
+26/26 rotation tests pass; scoped re-run with sibling
+`cash_redeployment_latency_skill` + dashboard endpoint tests is
+50/50 green at end.
+
+**Phase 3 — live finding:** `Finnhub` collector shows median publish→
+first_seen latency of **12,515 minutes (~8.7 days)** on the
+digital-intern side (surfaced by the sibling `/api/publish-lag`
+endpoint shipped in the same pass). That's a real stale-feed pathology —
+Finnhub items are being scored against the wall clock at briefing time
+with publisher-dated timestamps that are days old, getting the same
+`time_sensitivity` weight as fresh wire copy. Worth investigation by
+the next ops pass (likely a collector that's reading from a digest
+cache rather than the live API, or one that's mis-parsing the
+`published` field).
+
+---
+
 ## 2026-05-25 ML+backtest HYBRID pass #38 (Agent 2) — `_rsi`/`_macd` NaN/steady-state hardening + `macd_setup_skill`
 
 ### Phase 1 — Debug: bugs_fixed = 3

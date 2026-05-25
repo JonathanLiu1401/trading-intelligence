@@ -18678,6 +18678,145 @@ def cash_redeployment_latency_skill_api():
         }), 500
 
 
+@app.route("/api/rotation-skill")
+def rotation_skill_api():
+    """Rotation skill — when the desk SELLs X and within hours BUYs a
+    *different* ticker Y, does Y outperform X over the next ``forward_days``?
+
+    The sister to ``cash_redeployment_latency_skill`` on the *return-spread*
+    axis: that endpoint says HOW FAST cash redeploys; this one says whether
+    the redeployment was SKILLED (paired-rotation alpha measured at the
+    forward horizon). A FAST_REDEPLOY desk that rotates DRAM → MSTR while
+    DRAM rips and MSTR sags is fast AND lazy — both verdicts together
+    diagnose the right pathology.
+
+    Verdict matrix:
+
+      * ``LAZY_ROTATION`` — median alpha ≤ -1.5pp AND ≥ 60% negative pairs.
+      * ``SKILLED_ROTATION`` — median alpha ≥ +1.5pp AND ≥ 60% positive pairs.
+      * ``NET_NEGATIVE`` — median alpha ≤ -0.3pp.
+      * ``NET_POSITIVE`` — median alpha ≥ +0.3pp.
+      * ``NEUTRAL`` — |median alpha| < 0.3pp.
+      * ``INSUFFICIENT_DATA`` — fewer than 3 scored pairs in window.
+
+    Forward prices are fetched once per unique ticker via yfinance daily
+    history (``Close`` at the forward date or the next trading day). On
+    yfinance failure the affected pair falls into ``n_unpriced`` and the
+    verdict falls back gracefully toward INSUFFICIENT_DATA.
+
+    Query params (clamped):
+      ``window_days`` 1..365 default 60
+      ``pairing_max_h`` 1..168 default 24
+      ``forward_days`` 1..30 default 5
+      ``cash_ratio_lo`` 0..1 default 0.3
+      ``cash_ratio_hi`` 1..20 default 3.0
+
+    Pure read — never raises. Observational only — never gates Opus,
+    no caps (AGENTS.md #2/#12).
+    """
+    try:
+        from .analytics.rotation_skill import (
+            build_rotation_skill,
+            DEFAULT_WINDOW_DAYS,
+            DEFAULT_PAIRING_MAX_H,
+            DEFAULT_FORWARD_DAYS,
+            DEFAULT_CASH_RATIO_LO,
+            DEFAULT_CASH_RATIO_HI,
+        )
+
+        def _qf(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return max(lo, min(hi, v))
+
+        window_days = _qf("window_days", DEFAULT_WINDOW_DAYS, 1.0, 365.0)
+        pairing_max_h = _qf("pairing_max_h", DEFAULT_PAIRING_MAX_H, 1.0, 168.0)
+        forward_days = _qf("forward_days", DEFAULT_FORWARD_DAYS, 1.0, 30.0)
+        cash_ratio_lo = _qf("cash_ratio_lo", DEFAULT_CASH_RATIO_LO, 0.0, 1.0)
+        cash_ratio_hi = _qf("cash_ratio_hi", DEFAULT_CASH_RATIO_HI, 1.0, 20.0)
+
+        store = get_store()
+        trades = store.recent_trades(limit=2000) or []
+
+        # Per-ticker yfinance daily-history cache used by price_at. We pull a
+        # window covering [oldest_sell, now + a few days] once per ticker and
+        # then look up the forward-date Close. Failures degrade gracefully —
+        # the affected pair becomes UNPRICED, never raises.
+        try:
+            import yfinance as yf
+        except Exception:
+            yf = None
+
+        _hist_cache: dict[str, list[tuple[str, float]]] = {}
+
+        def _load_history(ticker: str) -> list[tuple[str, float]]:
+            if ticker in _hist_cache:
+                return _hist_cache[ticker]
+            entries: list[tuple[str, float]] = []
+            if yf is None:
+                _hist_cache[ticker] = entries
+                return entries
+            try:
+                hist = yf.Ticker(ticker).history(
+                    period=f"{int(window_days) + int(forward_days) + 14}d",
+                    interval="1d",
+                    auto_adjust=False,
+                )
+                if hist is not None and not hist.empty:
+                    for ts, row in hist["Close"].dropna().items():
+                        try:
+                            date_str = ts.strftime("%Y-%m-%d")
+                            entries.append((date_str, float(row)))
+                        except Exception:
+                            continue
+            except Exception:
+                entries = []
+            _hist_cache[ticker] = entries
+            return entries
+
+        def price_at(ticker: str, ts) -> float | None:
+            if not isinstance(ticker, str) or not ticker:
+                return None
+            try:
+                target_date = ts.strftime("%Y-%m-%d")
+            except Exception:
+                return None
+            entries = _load_history(ticker)
+            if not entries:
+                return None
+            best: float | None = None
+            for d, p in entries:
+                if d >= target_date:
+                    best = p
+                    break
+            if best is None and entries:
+                last_d, last_p = entries[-1]
+                if last_d >= target_date:
+                    best = last_p
+            return best
+
+        return jsonify(build_rotation_skill(
+            trades,
+            price_at=price_at,
+            window_days=window_days,
+            pairing_max_h=pairing_max_h,
+            forward_days=forward_days,
+            cash_ratio_lo=cash_ratio_lo,
+            cash_ratio_hi=cash_ratio_hi,
+        ))
+    except Exception as e:
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"error: {e}",
+            "error": str(e),
+            "stats": {},
+            "thresholds": {},
+            "pairs": [],
+        }), 500
+
+
 @app.route("/api/decision-vapor-skill")
 def decision_vapor_skill_api():
     """Decision-vapor skill — for FILLED decisions, does the reasoning
