@@ -5,6 +5,92 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-25 hybrid pass #35 (Agent 3) — pushed_alert_event_concentration
+
+Debugger + feature-dev + news-analyst pass. 3268 tests green at start;
++29 new event-concentration tests + 87 sibling tests added by parallel
+agents = 3384 at end. All four load-bearing invariants intact (backtest
+isolation, ml_score vs ai_score, score_source, urgency state machine).
+
+**Phase 1 (bug fix) — no commit, 0 bugs found:**
+
+Honest survey: explicit-invariant test coverage already complete
+(`test_article_store::test_get_unalerted_urgent_excludes_backtest_urls`,
+`::test_update_ml_scores_batch_sets_ml`, `test_features::EXTRA_FEATURE_DIM
+== 15`, `::days_since_published_*`, `test_model.py` relevance/urgency
+range, `test_label_audit::STRONG_LABEL_WHERE`, `test_trainer::
+LABEL_WEIGHT_EXPONENT`). The codebase is mature and what remains is
+tuning, not bugs.
+
+**Phase 2 (feature) — committed in `9bb502f`:**
+
+`analytics.pushed_alert_event_concentration` — per-(held-ticker ×
+event-class) Discord-push concentration audit. The missing axis next to
+`pushed_ticker_breakdown` (flat per-ticker, no event axis),
+`alert_delivery_audit` (aggregate fingerprint attribution), and
+`pushed_alert_gate_regret` (fingerprint coverage drift).
+
+Live evidence (2026-05-24, alert_recency.db, this audit):
+  ```
+  NVDA × BUYBACK: 3 pushes in last 6.0h (newest 0.51h ago)
+   - "Nvidia's Board Just Authorized an Additional $80 Billion Buyback..."
+   - "Nvidia posts record $81.6B revenue, unveils $80B buyback plan - MSN"
+   - "Nvidia posts $81.6B quarter, unveils $80B buyback plan - MSN"
+  ```
+
+Three BREAKING pushes for the SAME NVDA-buyback event within 2.5h. The
+canonical signatures pairwise share fewer salient tokens than the
+conservative paraphrase Jaccard threshold (`PARAPHRASE_MIN_JACCARD = 0.75`
+documented as the antonym-flip safety bar) — so cross-cycle paraphrase
+suppression correctly let them through. The analyst persona's #1
+documented noise complaint, reproduced on the path that thought
+duplicates were solved.
+
+Closed-vocabulary event taxonomy: EARNINGS / BUYBACK / GUIDANCE /
+RATING / RATE with specificity ordering (RATING wins over EARNINGS
+when a title contains both). Held-ticker resolution uses ticker
+spellings AND a tight evidence-only company-name alias map (live:
+"Nvidia" appears in 5/8 NVDA pushes; ticker-only matching silently
+missed them all). Pure-builder `build_concentration_report(pushed,
+live_tickers, …)` takes the exact `recent_alerts()` shape and is fully
+unit-testable without SQLite.
+
+29 new tests pin: empty-input shape, event-class taxonomy precedence
+(RATING > GUIDANCE > BUYBACK > EARNINGS), word-boundary anti-substring
+leak, company-name alias resolution, the verbatim NVDA-buyback live
+failure, sort/cap discipline (pushes-desc, alphabetical tiebreak),
+tmp_path end-to-end smoke.
+
+CLI: `python3 -m analytics.pushed_alert_event_concentration [--hours 6]`.
+Default window matches `ALERT_RECENCY_TTL_HOURS` so the audit measures
+the same window the live paraphrase gate already operates on.
+
+Load-bearing invariants intact by construction: read-only across the
+board, no articles.db touch at all, alert_recency.db opened mode=ro.
+
+**Phase 3 (live validation) — 3 findings:**
+
+1. **NVDA × BUYBACK push concentration confirmed live.** New audit
+   surfaces `3 pushes in last 6.0h (newest 0.51h ago)` — the same wire
+   event paraphrased into 3 distinct Discord pushes within 30 minutes.
+   The existing paraphrase gate (`partition_paraphrase_alerted`)
+   correctly returned None for each pair (Jaccard 0.60 < 0.75 threshold);
+   this audit is the surface that quantifies the gap without changing
+   suppression behavior.
+2. **Briefing cadence slipping.** Last 7 intervals (h): 17.03, 8.61,
+   5.43, 5.21, 27.64, 5.09, 10.26. Mean ~11.3h vs the 5h
+   `HEARTBEAT_INTERVAL` target — `briefing_cadence_trend` would flag
+   this as DRIFTING. Latest briefing 2.85h old → point-in-time HEALTHY,
+   but the trend is materially slipping. Sibling alerts (Claude quota
+   exhaustion, "skip" returns) likely the cause; no code change here.
+3. **Ingestion healthy.** 2578 articles/hr live (last 1h). 20
+   urgency=2 in 24h (11 LLM + 9 ML) — ~0.05% pass rate, appropriately
+   aggressive given the volume. Latest briefing format intact
+   (Bloomberg-style LEAD / MACRO table / PORTFOLIO / SEMIS PULSE / TOP
+   SIGNALS), 50 articles surfaced.
+
+---
+
 ## 2026-05-25 feature-dev pass (Agent 4) — chat system-fitness triad
 
 Feature-dev pass. 983 chat-enrichment tests green at start; +87 new
