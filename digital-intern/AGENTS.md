@@ -5,6 +5,102 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-25 hybrid pass #40 (Agent 3) — trainer cache fix + recent_ml_only_urgent audit
+
+Debugger + feature-dev + news-analyst pass. 125 tests in the critical sweep
+green at start; 125+14=139 green at end. All four load-bearing invariants
+intact.
+
+**Phase 1 (bug fix) — committed in 9acfae4 (bundled by auto-commit daemon):**
+
+`ml/trainer.py::_train_impl` — the dataset cache invalidation key counted
+`score_source IN ('llm','briefing_boost')` but `_fetch_training_data` actually
+pulls rows matching `STRONG_LABEL_WHERE`, which also includes synthetic
+backtest_/opus_annotation rows (CLAUDE.md §5 load-bearing training signal)
+and legacy integer-valued ai_score rows.
+
+Effect: during a paper-trader backtest-injection burst with no concurrent
+new LLM labels, synthetic rows arrived in the training pool but `n_labeled`
+stayed constant. The 5%-drift cache check treated the on-disk dataset as
+fresh and ArticleNet kept training on stale matrices — the just-injected
+backtest winner signal stayed invisible until LLM activity resumed.
+
+Fix counts on the same `STRONG_LABEL_WHERE` predicate the fetch uses. Pinned
+by `test_cache_invalidates_when_synthetic_rows_added` — builds a 40-row
+cache, adds 10 synthetic backtest winners (25% drift, well above 5%
+threshold), asserts the next `train()` call sees the fresh shape (50 rows).
+
+**Phase 2 (feature) — committed in b1c818c:**
+
+`ArticleStore.recent_ml_only_urgent(hours=24, limit=50)` — live audit list
+of UNVERIFIED urgent rows (`urgency>=1` AND `score_source='ml'`) for the
+analyst's "what slipped past Sonnet verification?" review.
+
+Sibling to `urgent_score_distribution` (calibration histogram, aggregated
+counts) and `urgency_label_split_by_source` (per-source LLM-vetted rates).
+Those answer *how much* and *from where*; this returns the ACTUAL TITLES
+newest first — a focused audit primitive the analyst can paste into a
+triage channel.
+
+Live verification (24h window, real articles.db at the moment of the pass):
+```
+20 rows returned. Top samples:
+  age=0.8h ml=9.9 [stocktwits/sentiment]  | [StockTwits Sentiment] QBTS Bullish...
+  age=0.8h ml=9.9 [GN: dividend buyback]  | Nvidia unveils $80B buyback, 25x dividend hike...
+  age=0.9h ml=9.4 [GN: Nvidia]            | Nvidia Had Another 'Usual' Quarter: How to Play...
+  age=1.2h ml=10.0 [Finnhub/Yahoo]         | Applied Materials AMAT Sees Quarterly Revenue...
+  age=1.5h ml=9.9 [yfinance/Motley Fool]   | Why Did Nvidia Raise Its Dividend by 2,400%?
+```
+
+The StockTwits one is a pre-gate historic row (regex matches it now); the
+"Why Did Nvidia Raise..." row is the `_RT_WHY_DID` gate gap (regex requires
+"Stock" between subject and verb, but this title omits it).
+
+Pinned by 14 tests covering: empty-DB / non-urgent / urgency=1 / urgency=2
+inclusion, llm and briefing_boost exclusion, newest-first ordering, hours-
+window filter, limit, hours-zero clamp, plus the load-bearing backtest
+isolation invariants (backtest:// URLs, backtest_ source, opus_annotation*
+source all excluded) and read-only mutation guard.
+
+**Phase 3 (live user-analyst observations) — 4 findings:**
+
+1. **Briefing cadence is DRIFTING.** `briefing_cadence_trend(last_n=10)`
+   reports verdict=DRIFTING, mean_interval_h=10.59 (expected 5.0),
+   drift_pct=+111.9%, max gap 27.64h. The point-in-time `briefing_health`
+   reads HEALTHY because the latest briefing is 4.18h old, but the trend
+   axis is clearly broken. This is the exact use case
+   `briefing_cadence_trend` was built for, and it's surfacing the gap.
+
+2. **NVDA buyback wire saturation in unverified urgent.** 14 ml-only
+   urgent rows from "GN: Nvidia" + 12 from "GN: dividend buyback" in last
+   24h — same event (NVDA $80B buyback), multiple syndications, NONE
+   Sonnet-verified. The recap-template gate misses three distinct
+   subjective-framing-after-event recap shapes the existing `_RT_*`
+   patterns don't catch: "How to Play NVDA Stock After Q1 Earnings",
+   "80 billion reasons to buy Nvidia after its monster earnings report",
+   "Why Did Nvidia Raise Its Dividend by 2,400%?". Worth a future pass
+   to extend the patterns, but conservatively scoped to avoid catching
+   legit headlines.
+
+3. **Stale urgent queue at 0.** Reaper is healthy — no urgency=1 row has
+   aged past 2h without alerting. The `di-stale-urgent-reaper-oscillation`
+   memory note remains current architecture but live evidence shows zero
+   current breach.
+
+4. **High-velocity collectors are operating.** Top collectors last hour
+   produced 233 (GN: Nasdaq) / 201 (GN: earnings) / 191 (stocktwits) /
+   167 (GN: oil prices) / 152 (GN: IPO) rows. The system is keeping up.
+
+**Files touched (this repo only):**
+
+- `ml/trainer.py` — `n_labeled` cache count uses STRONG_LABEL_WHERE.
+- `tests/test_trainer.py` — new `test_cache_invalidates_when_synthetic_rows_added`.
+- `storage/article_store.py` — new `recent_ml_only_urgent` method.
+- `tests/test_recent_ml_only_urgent.py` (new) — 14 tests.
+- `AGENTS.md` (this entry).
+
+---
+
 ## 2026-05-25 feature-dev pass #3 (Agent 4) — `/api/publish-lag` + two new chat enrichment blocks
 
 Feature-dev pass. Two new chat blocks (`PUBLISH LAG` from this repo,
