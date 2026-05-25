@@ -973,6 +973,22 @@ def _cycle():
                     _no_decision_first_ts = None  # re-arm only on confirmed send
             else:
                 _no_decision_first_ts = None  # no latch — anchor not needed for retry
+            # Defensive cleanup of ``_quota_first_ts``. The quota arm above
+            # anchors ``_quota_first_ts`` on the FIRST quota cycle of an
+            # outage, but ``_quota_alert_active`` only flips True when
+            # ``send_quota_alert`` actually delivers (the
+            # never-spam-without-delivery contract on line 879). A transient
+            # openclaw failure on the very first quota cycle leaves the
+            # latch False AND ``_quota_first_ts`` set — the recovery branch
+            # below skips (its `_quota_alert_active` predicate is False), so
+            # the anchor would stay stuck forever and a FUTURE quota
+            # outage's recovery alert would render a wildly inflated
+            # elapsed_s (the gap between BOTH outages, not the new one).
+            # Symmetric to the breaker-anchor reset on line 975: when no
+            # latch is held, the anchor carries no surviving payload — drop
+            # it so the next outage starts a fresh clock.
+            if not _quota_alert_active and _quota_first_ts is not None:
+                _quota_first_ts = None
         # Quota recovered → tell the operator once, then re-arm the alarm so a
         # *future* outage alerts again. Only confirm on an actual claude
         # response (status != NO_DECISION); a non-quota timeout is not proof

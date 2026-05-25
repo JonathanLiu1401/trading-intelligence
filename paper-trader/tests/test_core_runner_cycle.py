@@ -728,3 +728,79 @@ class TestQuotaOutageRecovery:
         # Latch + anchor preserved for the eventual real recovery cycle.
         assert runner._quota_alert_active is True
         assert runner._quota_first_ts is anchor
+
+    def test_orphan_quota_anchor_cleared_when_latch_never_armed(
+            self, quota_setup, monkeypatch):
+        """An ``_quota_first_ts`` set on the first quota cycle but whose
+        alert ``send_quota_alert`` REJECTED (returned False — transient
+        openclaw / Discord blip) leaves ``_quota_alert_active`` False yet
+        the anchor armed. On the next non-quota cycle the recovery branch
+        skips (its ``_quota_alert_active`` predicate is False), so the
+        anchor would otherwise stay stuck forever — and a FUTURE quota
+        outage (which would re-anchor only if ``_quota_first_ts is None``)
+        would inherit the stale timestamp, producing a wildly inflated
+        ``elapsed_s`` on its recovery alert (the gap between BOTH outages,
+        not the new one).
+
+        Symmetric with the breaker anchor's "no latch → reset" cleanup on
+        the non-quota else arm (runner.py:975). Pin the cleanup so this
+        regression cannot return."""
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        # Simulate the "alert send failed on first quota cycle" residue:
+        # anchor is set but the latch never armed.
+        orphan_anchor = _dt.now(_tz.utc) - _td(seconds=400)
+        monkeypatch.setattr(runner, "_quota_first_ts", orphan_anchor)
+        monkeypatch.setattr(runner, "_quota_alert_active", False)
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()
+        # Recovery must NOT have fired (latch was False to begin with — there
+        # was no outage in the operator's view to "recover" from).
+        assert quota_setup["recovered_quota"] == []
+        # Anchor must be cleared so the NEXT quota outage starts a fresh
+        # clock with the correct first-quota-cycle timestamp.
+        assert runner._quota_first_ts is None
+
+    def test_orphan_quota_anchor_does_not_break_armed_recovery(
+            self, quota_setup, monkeypatch):
+        """The orphan-anchor cleanup must not interfere with a LEGITIMATE
+        armed recovery on the same cycle. When ``_quota_alert_active`` is
+        True (a real outage WAS alerted) and a real decision arrives, the
+        recovery branch must fire normally AND clear both fields — exactly
+        as before. The new cleanup only fires when the latch was never
+        armed in the first place."""
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        outage_started = _dt.now(_tz.utc) - _td(seconds=500)
+        monkeypatch.setattr(runner, "_quota_first_ts", outage_started)
+        monkeypatch.setattr(runner, "_quota_alert_active", True)
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "HOLD", "decision": {"action": "HOLD"}})
+        runner._cycle()
+        # Recovery fired with a real elapsed_s.
+        assert len(quota_setup["recovered_quota"]) == 1
+        assert quota_setup["recovered_quota"][0] is not None
+        assert 500 <= quota_setup["recovered_quota"][0] < 700
+        # Both fields cleared by the legitimate recovery — the new cleanup
+        # branch does not re-fire on an already-cleared anchor.
+        assert runner._quota_alert_active is False
+        assert runner._quota_first_ts is None
+
+    def test_orphan_quota_anchor_cleared_on_blocked_decision(
+            self, quota_setup, monkeypatch):
+        """Same orphan-cleanup must also fire when the engine returns a
+        BLOCKED (real decision, just risk-rejected). The cleanup keys on the
+        latch state, not the status string — any non-quota path through
+        ``_cycle`` must drop a stale anchor when the latch was never armed.
+        """
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        orphan_anchor = _dt.now(_tz.utc) - _td(seconds=300)
+        monkeypatch.setattr(runner, "_quota_first_ts", orphan_anchor)
+        monkeypatch.setattr(runner, "_quota_alert_active", False)
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "BLOCKED",
+                     "decision": {"action": "SELL", "ticker": "NVDA"}})
+        runner._cycle()
+        assert runner._quota_first_ts is None
