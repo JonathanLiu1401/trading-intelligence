@@ -27,6 +27,12 @@ try:
 except ImportError:
     _DEDUP_AVAILABLE = False
 
+try:
+    from collectors.url_canonicalizer import canonical_article_id as _canonical_article_id
+    _CANON_AVAILABLE = True
+except ImportError:
+    _CANON_AVAILABLE = False
+
 # Module logger — uses central logger if available, falls back to stdlib.
 try:
     from core.logger import get_logger
@@ -683,7 +689,7 @@ class ArticleStore:
                 title = art.get("title", "")
                 if not url or not title:
                     continue
-                aid = article_id(url, title)
+                aid = _canonical_article_id(url, title) if _CANON_AVAILABLE else article_id(url, title)
                 summary = art.get("summary", "")
                 self.conn.execute(
                     "INSERT OR IGNORE INTO articles "
