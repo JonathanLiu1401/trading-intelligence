@@ -6,6 +6,151 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 core HYBRID pass #10 (Agent 1) — preflight cmdline-scan fix + `health_check` CLI
+
+### Phase 1 — fix: bugs_fixed = 1 (preflight false-positive PID scan)
+
+**Bug:** `paper_trader/preflight.py::_running_runner_pids` used substring
+matching on `/proc/<pid>/cmdline`. The HYBRID review agents are launched as
+`claude --print "...paper_trader.runner..."` — their own prompt text
+contains the runner module string, so they false-positived as runner
+processes. Observed live this session: preflight reported "runner alive
+(pid 115544, 118618)" where 118618 was a Claude HYBRID agent, NOT a
+runner. Worst case (real runner dies, agents still running): preflight
+keeps reporting "alive" and the DOWN verdict never fires — exactly the
+silent-failure mode preflight exists to surface.
+
+**Fix:** replaced the substring filter with a tokenised pure predicate
+`_cmdline_is_runner(cmdline)`. argv[0] basename must be `python` /
+`pythonN` / `pythonN.M` (rejects `claude --print "..."`), AND either a
+`-m` flag immediately followed by `paper_trader.runner` (module mode) OR
+an argv token ending in `/runner.py` whose path contains `paper` (script
+mode, both `paper-trader/` and `paper_trader/`).
+
+**Live verified:** `python3 -m paper_trader.preflight` now reports only
+pid 127012 (the actual runner). Sister false-positives in
+`analytics/concurrent_opus_attribution.py` left for a follow-up pass —
+that file has 320 lines of existing tests and the substring is used in
+parent-chain walking, a slightly different semantics.
+
+**Tests (33 cases in `tests/test_preflight.py` — new file):** 16
+`_cmdline_is_runner` cases pin every documented false-positive (Claude
+agent prompts, unrelated `/tmp/runner.py`, wrong `-m` module, bare
+grep, empty cmdlines) and every real launch form (module + script
+mode, both path spellings, all python version suffixes); 14
+`build_preflight` cases lock the router precedence
+(DOWN > DEGRADED > HEALTHY > NO_DATA), exit-code mapping, and
+constituent-dict pass-through; 3 scan-loop cases cover the
+no-/proc → None, empty-glob → [], and live-host regression-backstop.
+
+### Phase 2 — feat: `python3 -m paper_trader.health_check` — unified offline+online health verdict
+
+**The gap.** Two adjacent operator commands exist and BOTH have to be
+run in sequence to get a complete picture:
+
+  * `python3 -m paper_trader.preflight` (offline) — loop liveness +
+    NO_DECISION reliability + feed freshness + runner-process presence.
+    Works exactly when the Flask dashboard does NOT.
+  * `python3 -m paper_trader.should_restart` (online) — dashboard-fed
+    fusion of supervision (stale code) + heartbeat-restart (wedged loop
+    / dark Discord / degraded lock) + host-pulse (saturation).
+
+They overlap on heartbeat and diverge on the rest. The trader at the
+open wants ONE command — not two — and wants the WORST verdict + the
+union of remediation actions in one place.
+
+**The module.** `paper_trader/health_check.py` (250 lines). Pure router
+over the two existing children. Maps each child verdict into a unified
+state token (HEALTHY / NO_DATA / DEGRADED / OPS_ONLY / RESTART / DOWN),
+picks the worst by precedence (DOWN > RESTART > {OPS_ONLY, DEGRADED} >
+HEALTHY > NO_DATA, first-reported wins ties so the more specific
+narrative drives the headline), and surfaces the chosen child's
+headline + remediation action **verbatim** (single source of truth —
+mints no opinion, the `preflight` / `trader_scorecard` discipline).
+Exits with the worst child's exit code (RESTART → 1 so it composes in
+shell guards: `health_check || systemctl --user restart paper-trader`).
+
+**Live verified:** against the running trader the fused command
+correctly reported `RESTART RECOMMENDED — supervision UNSUPERVISED —
+Running current code but with NO restart safety net`, with the
+preflight-side DEGRADED (reliability CRITICAL 55%) AND the should-
+restart-side ops note (host saturated, swap 91%, 26% of last 120
+decisions never reached Opus) both folded into the SAME payload. Each
+child run alone would have omitted the other's narrative — exactly the
+operator confusion this closes.
+
+**Tests (32 in `tests/test_health_check.py` — new file):** 12 child→
+state mapper cases, 5 `_worse` precedence cases, and 15
+`build_health_check` end-to-end cases covering every state, the
+both-failure NO_DATA degrade, single-child-failure preserve-the-other
+behaviour, payload identity, the action-list join for OPS_ONLY, and a
+complete state↔exit-code matrix.
+
+### Phase 3 — Live trader findings (user_findings = 5)
+
+Hit the live `:8090` endpoints + the new `health_check` CLI as a
+trader would (runner pid=127012, boot_sha=d93c6d5, current head):
+
+1. **Phase 1 and Phase 2 are DEPLOYED.** The git-watcher correctly
+   triggered a deferred restart between cycles to apply commits 2bb23eb
+   and d93c6d5. `/api/build-info` confirms `boot_sha == head_sha`. The
+   deferred-restart deadman machinery works as designed.
+
+2. **Host pulse SATURATED right now** — swap 91% (>90% threshold);
+   26% of the last 120 decisions never reached Opus. The 3 concurrent
+   HYBRID review agents (myself included) are starving the live
+   trader's Opus call. Documented pathology; bot cannot resolve by
+   trading — ops must reduce review/backtest agent load.
+
+3. **Reliability CRITICAL persists** — 55.0% parse-fail over 427
+   cycles, −2.98% alpha bled. Structural consequence of finding #2.
+   The MACD strategy + cash-defensive posture is keeping P/L only
+   −1.26% despite this drag.
+
+4. **Book pinned 100% cash at $987.39** for ~23 hours. The last trade
+   (NVDA SELL 2026-05-24 02:08) was deliberate. No fresh signal has
+   been strong enough to trigger a BUY since — defensive posture is
+   intentional, not wedged.
+
+5. **Discord delivery HEALTHY** — `/api/notify-health` reports
+   `last Discord send succeeded` 26s before the check. Reporter→Discord
+   path intact.
+
+### Phase 4 — verify
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_preflight.py tests/test_health_check.py \
+                  tests/test_should_restart.py -v
+# 93 passed
+python3 -c "import sys; sys.path.insert(0,'.'); \
+            from paper_trader import signals, reporter, strategy, \
+            preflight, health_check; print('imports OK')"
+```
+
+### Files touched
+
+- `paper_trader/preflight.py` (Phase 1 fix — +50/-6 lines)
+- `tests/test_preflight.py` (NEW, 392 lines — 33 cases)
+- `paper_trader/health_check.py` (NEW, 250 lines)
+- `tests/test_health_check.py` (NEW, 313 lines — 32 cases)
+
+Two commits: `2bb23eb` (Phase 1) and `d93c6d5` (Phase 2). Both stage
+ONLY the files this agent touched (explicit pathspec per the
+documented concurrent-agent staging discipline).
+
+### Concurrent-agent discipline (process note)
+
+Three same-role HYBRID agents ran on this tree this session — Agent 2
+(ML+backtest) committed pass #36 to AGENTS.md while this agent was
+working. Both this agent's commits used explicit pathspec; sibling
+work (dashboard.py edits, new `analytics/portfolio_beta.py` +
+`tests/test_portfolio_beta.py`, three digital-intern edits, Agent 2's
+AGENTS.md entry) was visible in `git status` throughout and was NOT
+bundled into either of this agent's commits.
+
+---
+
 ## 2026-05-24 ML+backtest HYBRID pass #36 (Agent 2) — `_append_gate_pnl_skill_log` per-cycle gate economic-counterfactual ledger
 
 ### Phase 1 — Debug: bugs_fixed = 0

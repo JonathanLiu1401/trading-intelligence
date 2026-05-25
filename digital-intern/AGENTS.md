@@ -12159,3 +12159,67 @@ carried foreign uncommitted changes at start (sibling-agent files —
 edits). All left untouched. `git diff --staged` verified before each
 commit that only this agent's files were staged (Phase 1: 3 files,
 Phase 2: 2 files).
+
+## 2026-05-24 Agent 4 (feature-dev) — `/api/sector-coherence` + chat enrichment
+
+**What:** per-sector bullish/bearish stance dispersion across the same 24h
+live wire that `/api/sector-pulse` already aggregates. PULSE answers "where
+is the wire concentrated?"; COHERENCE answers the structural follow-up
+PULSE cannot: "is the concentration a **MACRO STORY** all agreeing on a
+direction (sector-wide positioning is the trade) or **IDIOSYNCRATIC**
+catalysts pulling in different directions (sector-wide positioning is the
+wrong move, name-level only)?". For each sector, classify each headline
+bull / bear / neutral (high-precision word-bounded keyword list — "surge",
+"upgrade", "beats" / "plunge", "downgrade", "missed" / etc.), compute
+`coherence_pct = max(bull, bear) / classified × 100` over the
+*opinionated* set, and emit a verdict ladder:
+MACRO_BULL / MACRO_BEAR (≥ 70% coherence + ≥ 3 classified) →
+TILT_BULL / TILT_BEAR (55–69%) → SPLIT (< 55%) → INSUFFICIENT (< 3
+classified). Per-sector `lead_headline` is the highest-`ai_score`
+opinionated row so the operator reads the thesis source without leaving
+chat.
+
+**Why this gap:** the existing chat surface (30+ enrichment blocks
+already!) has rich coverage of where the wire is and what the trader
+holds, but it carries no read on whether *the wire itself agrees on a
+direction*. The trader question "is the SOXL macro trade real or am I
+buying the headline of a sector full of opposing catalysts" had no
+answer in any existing block.
+
+**Files:**
+* `analysis/sector_coherence.py` — pure builder
+  `build_sector_coherence(articles, window_hours=None, now=None)`.
+  Reuses `dashboard.web_server._SECTOR_MAP` + `_extract_tickers` verbatim
+  (SSOT — coherence and pulse can never tag the same article to different
+  sectors). Bull/bear word lists kept deliberately small and
+  high-precision; tied counts ⇒ neutral (refusing to pick is more honest
+  than alternating on word order).
+* `dashboard/web_server.py` — three additions:
+  1. `_sector_coherence_chat_lines(rep)` helper next to
+     `_sector_pulse_chat_lines` — silence-on-healthy (SPLIT / INSUFFICIENT
+     collapse to silence per the `_sector_pulse_chat_lines` /
+     `_macro_calendar_chat_lines` precedent), only MACRO_* and TILT_*
+     emit a line.
+  2. `/api/sector-coherence` endpoint — same `_ro_query` +
+     `_LIVE_ONLY_SQL` plumbing as `/api/sector-pulse` (one of the four
+     load-bearing invariants). `?hours=` clamped 1..168 like its sibling.
+  3. Chat handler wires the new block into the prompt right after
+     `NEWS SECTOR PULSE` — reuses the same SQL fetch so we don't
+     double-query the WAL DB.
+* `tests/test_sector_coherence.py` — 20 pure-helper tests (no Flask,
+  matching the chat-enrichment pattern memory). Pins the bull/bear
+  classifier (incl. case-insensitive + tie-is-neutral + non-string-safe),
+  the verdict ladder, the `coherence_pct = max/classified` invariant
+  (NOT `max/total` — a sector with 3 bull + 10 neutral is 100% coherent,
+  not 23%), the MACRO_COHERENCE_PCT=70.0 boundary, and the chat helper's
+  silence-on-non-actionable contract.
+
+**Tests:** 20 new (test_sector_coherence) + sanity-rerun of
+test_sector_pulse + test_chat_coverage_gap_enrichment (22 adjacent
+chat-pattern tests) all green.
+
+**Staging:** explicit per-file pathspec — `analysis/sector_coherence.py`,
+`dashboard/web_server.py`, `tests/test_sector_coherence.py`, this AGENTS.md
+update. No `git add -A` (concurrent-agent footgun memory; the DI suite
+chronic noise from sibling agents' dirty rss_collector/daemon files would
+get swept in).
