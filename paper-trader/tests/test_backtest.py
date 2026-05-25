@@ -1822,3 +1822,123 @@ class TestMergeSecCacheTypeGuards:
         assert added == 1
         assert "2024-06-15" in result
         assert result["2024-06-15"][0]["title"] == "Valid 8-K"
+
+
+class TestEnhancedMacdFeaturePlumbing:
+    """Pins the wiring that closed the 2026-05-24 ML+backtest pass #35 finding:
+    the 3 enhanced MACD features (``ema200_above`` / ``hist_cross_up`` /
+    ``macd_below_zero_cross``) accepted by ``DecisionScorer.build_features``
+    were never plumbed into the inference (``_ml_decide``) OR training-data
+    capture (``_compute_decision_outcomes``) path. They defaulted to None →
+    0.0 at both sides, and the deployed scorer's first-layer ``mean|w|`` for
+    those 3 input neurons was *exactly* 0.000000 (vs 0.3–0.5 for every live
+    feature) — 3 model slots permanently dead-trained on constant zero.
+
+    These tests prevent that regression: any future change that drops the
+    keys from either side will fail loudly. Pinning both endpoints (inference
+    *and* training capture) means the model can never silently re-stagnate
+    on dead features again."""
+
+    def test_ml_decide_passes_enhanced_macd_to_scorer(self, synthetic_prices,
+                                                      monkeypatch):
+        """``_ml_decide``'s scorer call must forward ema200_above /
+        hist_cross_up / macd_below_zero_cross from the quant signal block.
+
+        Captures the kwargs that ``_ml_decide`` passes to the scorer's
+        ``predict_with_meta`` and asserts all 3 enhanced MACD keys are
+        present. Their values come from the synthetic-fixture's quant
+        block (None / False because the 51-day window is below the
+        minimum-history threshold for those signals) — what we pin here
+        is that the keys are *passed*, not their specific values; the
+        defaulting behaviour is build_features' own contract."""
+        import paper_trader.backtest as bt
+
+        captured: dict = {}
+
+        class _CapturingScorer:
+            is_trained = True
+            _n_train = 1000  # ≥ 500 so the gate engages and uses meta path
+
+            def predict_with_meta(self, **kw):
+                captured.update(kw)
+                return {"pred": 0.0, "raw": 0.0,
+                        "clamped": False, "off_distribution": False}
+
+            def predict(self, **kw):
+                captured.update(kw)
+                return 0.0
+
+        monkeypatch.setattr(bt, "_DECISION_SCORER", _CapturingScorer(),
+                            raising=False)
+
+        p = bt.SimPortfolio(cash=100_000.0)
+        rng = random.Random(0)
+        d = synthetic_prices.trading_days[-1]
+        articles = [{
+            "title": "Nvidia beats earnings, guidance raised, "
+                     "semiconductor surge",
+            "score": 10.0, "tickers": ["NVDA"],
+        }]
+        decision = bt._ml_decide(d, p, articles, synthetic_prices,
+                                 run_id=1, rng=rng)
+        # Pre-conditions for the assertion to be meaningful — the scorer
+        # path is only exercised on a BUY.
+        assert decision["action"] == "BUY"
+        assert decision["ticker"] == "NVDA"
+        # The fix: all 3 enhanced MACD keys must reach the scorer.
+        # Before the fix these were missing entirely (the dict had only 11
+        # keys), so the scorer used build_features' default (None → 0.0).
+        for key in ("ema200_above", "hist_cross_up", "macd_below_zero_cross"):
+            assert key in captured, (
+                f"_ml_decide failed to pass enhanced MACD feature "
+                f"{key!r} to the scorer — captured keys: "
+                f"{sorted(captured.keys())}"
+            )
+
+    def test_compute_decision_outcomes_captures_enhanced_macd(
+            self, synthetic_prices, tmp_path):
+        """``_compute_decision_outcomes`` must persist all 3 enhanced MACD
+        signals into the outcome dict so ``train_scorer`` can read them
+        back via ``r.get(...)`` for the next retrain. Before the fix the
+        keys were absent, so every training record carried None → 0.0
+        defaults and the model couldn't learn from them even if the
+        signal was present in the quant block."""
+        from run_continuous_backtests import _compute_decision_outcomes
+        from paper_trader.backtest import BacktestRun
+        import paper_trader.backtest as bt
+
+        engine = bt.BacktestEngine.__new__(bt.BacktestEngine)
+        engine.start = synthetic_prices.start
+        engine.end = synthetic_prices.end
+        engine.prices = synthetic_prices
+        engine.store = bt.BacktestStore(tmp_path / "bt_macd.db")
+
+        days = synthetic_prices.trading_days
+        engine.store.upsert_run(404, 1, "running",
+                                synthetic_prices.start,
+                                synthetic_prices.end)
+        engine.store.conn.execute(
+            "INSERT INTO backtest_decisions (run_id, sim_date, action, ticker, "
+            "qty, confidence, reasoning, status, detail, cash, total_value, "
+            "signal_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (404, days[0].isoformat(), "BUY", "NVDA", 1.0, 0.5,
+             "ML+quant: score=1.50 regime=bull", "FILLED", "", 1000, 1000, 1))
+        engine.store.conn.commit()
+        try:
+            run = BacktestRun(run_id=404, seed=1,
+                              start_date=synthetic_prices.start.isoformat(),
+                              end_date=synthetic_prices.end.isoformat(),
+                              total_return_pct=5.0, status="complete")
+            outcomes = _compute_decision_outcomes(engine, [run])
+        finally:
+            engine.store.conn.close()
+        assert len(outcomes) == 1
+        out = outcomes[0]
+        for key in ("ema200_above", "hist_cross_up", "macd_below_zero_cross"):
+            assert key in out, (
+                f"_compute_decision_outcomes failed to persist enhanced "
+                f"MACD feature {key!r} — outcome keys: "
+                f"{sorted(out.keys())}. Without this key, the next "
+                f"retrain reads None → 0.0 default and the model can't "
+                f"learn the feature even if the quant block has it."
+            )

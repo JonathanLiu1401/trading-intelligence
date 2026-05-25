@@ -1986,6 +1986,21 @@ def _ml_decide(
             bb_pos=q_buy.get("bb_position"),
             news_urgency=buy_news_urg if buy_news_count else None,
             news_article_count=float(buy_news_count) if buy_news_count else None,
+            # Enhanced MACD / EMA200 features — `build_features` accepts these
+            # as inputs to the 17-th/18-th/19-th feature slots of the deployed
+            # scorer, but until this hook landed `_ml_decide` did NOT pass them
+            # in, so the inference call defaulted them to None → 0.0 and the
+            # corresponding model weights (verified directly via the deployed
+            # pickle's `coefs_[0]`: mean |w| = EXACTLY 0.000000 for all three)
+            # were dead-trained on always-zero inputs. Pairing this with the
+            # matching `_compute_decision_outcomes` capture closes the loop so
+            # the next retrain can actually learn these features. None when
+            # `_compute_technical_indicators` had insufficient history for the
+            # buy ticker (same fall-through as the sibling rsi/macd lookups
+            # already use).
+            ema200_above=q_buy.get("ema200_above"),
+            hist_cross_up=q_buy.get("hist_cross_up"),
+            macd_below_zero_cross=q_buy.get("macd_below_zero_cross"),
         )
         # Prefer predict_with_meta so we can see the scorer's own trust flag.
         # The MLP head is unbounded; AGENTS.md documents it extrapolating to
