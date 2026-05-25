@@ -1030,6 +1030,228 @@ class TestSendBreakerFiredAlert:
         assert reporter._format_elapsed("garbage") == ""
 
 
+class TestBookExposureLine:
+    """The book-exposure line appended to operator alarms (breaker fired /
+    quota exhausted). The trader paged about a frozen engine needs to know
+    WHAT is frozen (cash %, biggest position, unrealized P/L), not just
+    THAT it is frozen — the dashboard answers this but the operator on
+    a pager is not at a dashboard. Helper must be degrade-safe by
+    construction so it never masks the outage it exists to surface."""
+
+    def _fake_store(self, *, total=None, cash=None, positions=None):
+        """Minimal store stub returning the exact shape ``_book_exposure_line``
+        consumes."""
+        class _S:
+            def get_portfolio(self_):
+                return {"total_value": total, "cash": cash}
+
+            def open_positions(self_):
+                return list(positions or [])
+        return _S()
+
+    def test_returns_empty_when_store_is_none(self):
+        """Legacy callers (no store) get the original no-context body — must
+        be byte-identical so backwards compatibility is preserved."""
+        assert reporter._book_exposure_line(None) == ""
+
+    def test_returns_empty_when_total_value_non_positive(self):
+        """A zero / negative / missing total_value can't carry a meaningful
+        from-start P/L; suppress rather than render a misleading line."""
+        for bad in (None, 0, -1.0, "garbage"):
+            s = self._fake_store(total=bad, cash=0.0, positions=[])
+            assert reporter._book_exposure_line(s) == ""
+
+    def test_all_cash_book_renders_100_pct_cash(self):
+        """No open positions → "100% cash" branch with from-start P/L."""
+        s = self._fake_store(total=1010.0, cash=1010.0, positions=[])
+        line = reporter._book_exposure_line(s)
+        assert line == "book: $1010.00 (+1.00% from start) · 100% cash"
+
+    def test_single_position_renders_biggest(self):
+        """One held lot → "1 position · biggest TICKER X% (Y% unrealized)"."""
+        pos = [{
+            "ticker": "NVDA", "type": "stock", "qty": 3.0,
+            "current_price": 215.0, "avg_cost": 200.0,
+        }]
+        s = self._fake_store(total=1000.0, cash=355.0, positions=pos)
+        line = reporter._book_exposure_line(s)
+        # 3 * 215 = 645; 645/1000 = 64.5%; unrealized = (215-200)/200 = +7.50%
+        assert "1 position" in line
+        assert "biggest NVDA 64.5%" in line
+        assert "+7.50% unrealized" in line
+
+    def test_multi_position_picks_largest_by_market_value(self):
+        """The biggest-by-market-value lot wins, not biggest by qty or alpha."""
+        pos = [
+            # 5 * 50 = $250 stake — smaller MV
+            {"ticker": "AAA", "type": "stock", "qty": 5.0,
+             "current_price": 50.0, "avg_cost": 50.0},
+            # 1 * 700 = $700 stake — bigger MV despite smaller qty
+            {"ticker": "BBB", "type": "stock", "qty": 1.0,
+             "current_price": 700.0, "avg_cost": 600.0},
+        ]
+        s = self._fake_store(total=1000.0, cash=50.0, positions=pos)
+        line = reporter._book_exposure_line(s)
+        assert "2 positions" in line
+        assert "biggest BBB" in line
+        # 700/1000 = 70.0%
+        assert "70.0%" in line
+
+    def test_option_position_uses_100x_multiplier(self):
+        """An option contract's market value is qty × price × 100."""
+        pos = [{
+            "ticker": "NVDA", "type": "call", "qty": 1.0,
+            "current_price": 3.0, "avg_cost": 2.0,
+            "strike": 700, "expiry": "2026-06-19",
+        }]
+        # 1 * 3 * 100 = $300
+        s = self._fake_store(total=1000.0, cash=700.0, positions=pos)
+        line = reporter._book_exposure_line(s)
+        assert "30.0%" in line  # 300/1000
+
+    def test_zero_qty_position_skipped(self):
+        """Torn / closing-lot rows (qty=0) must not contribute to the held
+        count or biggest-by-MV pick. ``store.open_positions`` already filters
+        qty>0 in SQL but the helper must defend against a non-store caller."""
+        pos = [
+            {"ticker": "ZERO", "type": "stock", "qty": 0.0,
+             "current_price": 9999.0, "avg_cost": 1.0},
+            {"ticker": "NVDA", "type": "stock", "qty": 1.0,
+             "current_price": 200.0, "avg_cost": 200.0},
+        ]
+        s = self._fake_store(total=1000.0, cash=800.0, positions=pos)
+        line = reporter._book_exposure_line(s)
+        assert "1 position" in line          # ZERO row dropped
+        assert "biggest NVDA" in line
+
+    def test_stale_mark_falls_back_to_avg_cost(self):
+        """``current_price`` missing / zero → fall back to ``avg_cost`` so a
+        stale-mark lot still contributes to the weight count. Mirrors the
+        ``_concentration_line`` precedent."""
+        pos = [{
+            "ticker": "NVDA", "type": "stock", "qty": 2.0,
+            "current_price": None, "avg_cost": 250.0,
+        }]
+        # 2 * 250 = $500 stake using avg_cost
+        s = self._fake_store(total=1000.0, cash=500.0, positions=pos)
+        line = reporter._book_exposure_line(s)
+        assert "50.0%" in line
+
+    def test_unrealized_pct_omitted_when_uncomputable(self):
+        """If avg_cost or current_price are non-numeric / zero, the unrealized
+        token is dropped (but the weight line still ships)."""
+        pos = [{
+            "ticker": "NVDA", "type": "stock", "qty": 2.0,
+            "current_price": 250.0, "avg_cost": None,  # no basis to compare
+        }]
+        s = self._fake_store(total=1000.0, cash=500.0, positions=pos)
+        line = reporter._book_exposure_line(s)
+        assert "biggest NVDA" in line
+        assert "unrealized" not in line  # no parenthetical when not computable
+
+    def test_store_fault_degrades_silently(self):
+        """A raising store must NOT propagate — alarms cannot mask the outage
+        they exist to surface. Helper returns ``""`` so the caller emits the
+        original no-context body."""
+        class _BrokenStore:
+            def get_portfolio(self):
+                raise RuntimeError("db locked")
+        assert reporter._book_exposure_line(_BrokenStore()) == ""
+
+    def test_from_start_pl_uses_initial_equity_constant(self):
+        """The from-start P/L is computed against ``_INITIAL_EQUITY`` (==
+        ``INITIAL_CASH``, invariant #12) — not a fabricated baseline. Pin
+        it so a future change to either constant breaks loudly."""
+        s = self._fake_store(total=reporter._INITIAL_EQUITY * 1.05,
+                              cash=reporter._INITIAL_EQUITY * 1.05,
+                              positions=[])
+        line = reporter._book_exposure_line(s)
+        assert "+5.00% from start" in line
+
+
+class TestBreakerFiredAlertWithBookExposure:
+    """The book exposure line is appended to ``send_breaker_fired_alert``
+    when a store is supplied — the trader paged about a wedged engine
+    needs to see the unattended book in the same Discord message."""
+
+    def test_exposure_appended_when_store_supplied(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        class _S:
+            def get_portfolio(self):
+                return {"total_value": 990.0, "cash": 990.0}
+            def open_positions(self):
+                return []
+        reporter.send_breaker_fired_alert(5, "host saturated", store=_S())
+        body = captured[0]
+        assert "BREAKER FIRED" in body
+        assert "host saturated" in body
+        # Exposure footer present.
+        assert "book: $990.00" in body
+        assert "100% cash" in body
+
+    def test_no_store_preserves_legacy_body(self, monkeypatch):
+        """Legacy callers (no store kwarg) get a body byte-compatible with
+        before this feature landed — no spurious exposure-line italics."""
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        reporter.send_breaker_fired_alert(5, "host saturated")
+        body = captured[0]
+        assert "book:" not in body
+
+    def test_broken_store_does_not_drop_alert(self, monkeypatch):
+        """If the store read fails, the alert MUST still go out — the
+        exposure line is enrichment, not a precondition."""
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        class _BrokenStore:
+            def get_portfolio(self):
+                raise RuntimeError("locked")
+        ok = reporter.send_breaker_fired_alert(5, "cause", store=_BrokenStore())
+        assert ok is True
+        body = captured[0]
+        assert "BREAKER FIRED" in body
+        assert "book:" not in body  # exposure dropped, alert kept
+
+
+class TestQuotaAlertWithBookExposure:
+    """Same exposure-line enrichment for ``send_quota_alert``: a quota
+    outage freezes the book exactly the same way a wedged CLI does, so
+    the operator needs the same book context in the alarm body."""
+
+    def test_exposure_appended_when_store_supplied(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        class _S:
+            def get_portfolio(self):
+                return {"total_value": 1050.0, "cash": 500.0}
+            def open_positions(self):
+                return [{
+                    "ticker": "NVDA", "type": "stock", "qty": 2.5,
+                    "current_price": 220.0, "avg_cost": 200.0,
+                }]
+        reporter.send_quota_alert("Opus + Sonnet both rejected",
+                                  store=_S())
+        body = captured[0]
+        assert "QUOTA EXHAUSTED" in body
+        assert "book: $1050.00" in body
+        # 2.5 * 220 = $550 = 52.4% of $1050
+        assert "biggest NVDA 52.4%" in body
+        assert "+10.00% unrealized" in body
+
+    def test_no_store_preserves_legacy_body(self, monkeypatch):
+        captured = []
+        monkeypatch.setattr(reporter, "_send",
+                            lambda msg: captured.append(msg) or True)
+        reporter.send_quota_alert("rejected")
+        body = captured[0]
+        assert "book:" not in body
+
+
 class TestSendBreakerClearedAlert:
     """Recovery confirmation that closes the FIRED→CLEARED bracket. A trader
     pulled away from Discord during a multi-hour storm gets a CLEARED ping —
