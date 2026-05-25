@@ -115,6 +115,7 @@ from collectors.global_regulators_collector import collect_global_regulators
 from collectors.imf_bis_worldbank_collector import collect_imf_bis_worldbank
 from collectors.un_news_collector import collect_un_news
 from collectors.globenewswire_collector import collect_globenewswire
+from collectors.prnewswire_collector import collect as collect_prnewswire
 from collectors.short_seller_collector import collect_short_sellers
 from collectors.financial_blogs_collector import collect_financial_blogs
 from collectors.hackernews_collector import collect_hackernews
@@ -264,6 +265,7 @@ SEEKINGALPHA_INTERVAL  = 300      # Seeking Alpha breaking-news RSS — every 5m
 RSI_EXTREMES_INTERVAL  = 900      # RSI overbought/oversold signals — every 15min
 AAII_SENTIMENT_INTERVAL = 3600 * 6  # AAII weekly survey — re-check every 6h (deduped by date)
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
+PRNEWSWIRE_INTERVAL     = 600     # PR Newswire press releases (general + financial feeds) — every 10min
 SHORT_SELLER_INTERVAL   = 1800    # Short-seller research reports (rare, high-priority) — every 30min
 FINANCIAL_BLOGS_INTERVAL = 600    # InvestorPlace, Motley Fool, Nasdaq RSS — every 10min
 HACKERNEWS_INTERVAL     = 300     # Hacker News front-page + finance/business stories — every 5min
@@ -393,6 +395,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "bls": BLS_INTERVAL,
     "bea": BEA_INTERVAL,
     "globenewswire": GLOBENEWSWIRE_INTERVAL,
+    "prnewswire": PRNEWSWIRE_INTERVAL,
     "short_seller": SHORT_SELLER_INTERVAL,
     "financial_blogs": FINANCIAL_BLOGS_INTERVAL,
     "hackernews": HACKERNEWS_INTERVAL,
@@ -2712,6 +2715,28 @@ def globenewswire_worker(store: ArticleStore):
         _sleep(GLOBENEWSWIRE_INTERVAL)
 
 
+# ── Worker: PR Newswire press releases — every 10min ────────────────────────
+def prnewswire_worker(store: ArticleStore):
+    log.info("[prnewswire_worker] started")
+    bo = Backoff("prnewswire", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_prnewswire()
+            _ingest(store, articles, "prnewswire")
+            try:
+                source_health.record_result("prnewswire", len(articles))
+            except Exception as he:
+                log.warning(f"[prnewswire_worker] source_health error: {he}")
+            _worker_last_ok["prnewswire"] = time.time()
+            log.debug(f"[prnewswire] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[prnewswire_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(PRNEWSWIRE_INTERVAL)
+
+
 # ── Worker: Short-seller research reports — every 30min ─────────────────────
 def short_seller_worker(store: ArticleStore):
     log.info("[short_seller_worker] started")
@@ -4564,6 +4589,7 @@ def main():
         ("bis",         bis_worker),
         ("un_news",     un_news_worker),
         ("globenewswire", globenewswire_worker),
+        ("prnewswire",  prnewswire_worker),
         ("short_seller", short_seller_worker),
         ("financial_blogs", financial_blogs_worker),
         ("hackernews",     hackernews_worker),
