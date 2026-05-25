@@ -229,6 +229,27 @@ GATE_ARM_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 PERSONA_SKILL_LOG = ROOT / "data" / "persona_skill_log.jsonl"
 PERSONA_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 
+# Per-cycle dead-feature audit ledger. ``dead_feature_audit.audit_dead_features``
+# answers, durably and per-cycle, the question every existing diagnostic
+# misses: *did the most-recently-retrained model actually LEARN from each of
+# the 20 input features the build_features contract advertises, or are some
+# slots dead-trained on constant zero?* This is the model-level complement
+# to ``feature_importance``'s data-level permutation reading. The class of
+# bug it catches is exactly the pass-#35 finding: a feature added to
+# ``DecisionScorer.build_features`` whose values are never plumbed into
+# ``_compute_decision_outcomes`` (training capture) or ``_ml_decide``
+# (inference) — the StandardScaler sees a constant-zero column, divides
+# by ~zero std, and L2 alpha drives every weight to *exactly* 0.0 (the
+# deployed pickle had 3 such slots, mean|w|=0.000000 each, until pass #35
+# closed the loop). Until this wiring landed there was NO durable per-cycle
+# signal an unattended operator could trend to catch the next regression
+# of this class. Same testability rule as the sibling skill logs
+# (module-level so tests can redirect), same best-effort discipline (a
+# ledger write must never break the loop), same atomic tmp+``.replace``
+# trim idiom every other ledger uses.
+DEAD_FEATURE_AUDIT_LOG = ROOT / "data" / "dead_feature_audit_log.jsonl"
+DEAD_FEATURE_AUDIT_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 # Per-cycle conviction-sizing calibration ledger. ``conviction_calibration``
 # already answers, durably, the most economically decisive question about the
 # `_ml_decide` gate's sizing arm (×0.6 / ×0.85 / ×1.15 / ×1.3) on top of the
@@ -990,6 +1011,24 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
                 # See `_fwd_intraperiod_extremes` for the full rationale.
                 "forward_intraperiod_min_5d": intra_min,
                 "forward_intraperiod_max_5d": intra_max,
+                # Enhanced MACD / EMA200 features (the 3 added to build_features
+                # alongside the legacy 10 numeric + 7 sector). They are computed
+                # by `_compute_technical_indicators` and surfaced through
+                # `_get_quant_signals`, but were never captured in the outcome
+                # rows — so every training record carried None → 0.0 default and
+                # every inference call defaulted them the same way. Verified by
+                # introspecting the deployed scorer's first-layer weights: mean
+                # |w| for these 3 input neurons was EXACTLY 0.000000 vs ~0.3-0.5
+                # for every live feature (the MLP correctly learned constant-
+                # zero inputs have no information). Persisting them here closes
+                # the training side of that gap so the next retrain has real
+                # variance to fit on. The inference-side fix in `_ml_decide`
+                # closes the prediction side. None for tickers whose technical-
+                # indicator window had insufficient history (the same convention
+                # as the sibling `wk52_pos` / `vol_ratio` keys above).
+                "ema200_above": q.get("ema200_above"),
+                "hist_cross_up": q.get("hist_cross_up"),
+                "macd_below_zero_cross": q.get("macd_below_zero_cross"),
                 "return_pct": run.total_return_pct,
             })
 
@@ -2704,6 +2743,93 @@ def _append_persona_skill_log(cycle: int, win_start: date, win_end: date,
         return False
 
 
+def _append_dead_feature_audit_log(cycle: int, win_start: date,
+                                    win_end: date) -> bool:
+    """Append one structured row to the per-cycle dead-feature-audit ledger.
+
+    Calls ``dead_feature_audit.audit_dead_features`` against the just-
+    retrained deployed pickle and persists the verdict (OK / HAS_DEAD /
+    NOT_TRAINED / SHAPE_MISMATCH / UNKNOWN_MODEL / ERROR), the count of
+    dead features, and (when HAS_DEAD) the list of feature names whose
+    first-layer ``mean |w| ≤ DEAD_EPS``. The flat ``n_features_dead`` and
+    list-shaped ``dead_features`` mirror the sibling ledgers' two-tier
+    "summary + forensics" pattern (``gate_arm_skill_log`` /
+    ``persona_skill_log``).
+
+    Why this matters: the pass-#35 finding was that 3 of 20 input slots
+    were dead-trained on constant zero for an unknown number of cycles —
+    invisible to every existing diagnostic. With this ledger, the moment a
+    feature plumbing regression happens (or a fresh build_features slot is
+    added without backfilling the outcomes JSONL) the verdict flips to
+    ``HAS_DEAD`` on the NEXT retrain and an operator sees it in the trend.
+
+    Best-effort and idempotent-safe: every fault is swallowed (a ledger
+    write must NEVER break the continuous loop — same discipline every
+    sibling ``_append_*_skill_log`` follows). Bounded growth: when the file
+    exceeds 2× ``DEAD_FEATURE_AUDIT_LOG_KEEP`` it is atomically rewritten
+    via the tmp+``.replace`` idiom every sibling ledger uses.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        try:
+            from paper_trader.ml.dead_feature_audit import audit_dead_features
+            rep = audit_dead_features()
+        except Exception as exc:
+            rep = {
+                "verdict": "ERROR",
+                "method": None,
+                "n_train": 0,
+                "n_features_total": None,
+                "n_features_dead": 0,
+                "dead_features": [],
+                "error": f"audit_dead_features unavailable: "
+                         f"{type(exc).__name__}",
+            }
+        if not isinstance(rep, dict):
+            rep = {"verdict": "ERROR", "method": None,
+                   "n_features_dead": 0, "dead_features": []}
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "verdict": rep.get("verdict"),
+            "method": rep.get("method"),
+            "n_train": rep.get("n_train"),
+            "n_features_total": rep.get("n_features_total"),
+            "n_features_dead": rep.get("n_features_dead"),
+            # Flat boolean for trend cuts: True ⇒ at least one input
+            # slot of the deployed model was dead-trained on constant
+            # zero. Mirrors the sibling ledgers' ``*_dark`` flag
+            # convention (``signal_dark`` / ``stop_dark`` / etc.).
+            "has_dead": (rep.get("verdict") == "HAS_DEAD"),
+            "dead_features": (rep.get("dead_features") or []),
+            "eps": rep.get("eps"),
+        }
+        if rep.get("error"):
+            row["error"] = rep["error"]
+        DEAD_FEATURE_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with DEAD_FEATURE_AUDIT_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in
+                     DEAD_FEATURE_AUDIT_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > DEAD_FEATURE_AUDIT_LOG_KEEP * 2:
+                kept = lines[-DEAD_FEATURE_AUDIT_LOG_KEEP:]
+                tmp = DEAD_FEATURE_AUDIT_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(DEAD_FEATURE_AUDIT_LOG)
+        except Exception as e:
+            print(f"[continuous] dead-feature-audit-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] dead-feature-audit-log append failed: {e}")
+        return False
+
+
 def _parse_published_date(published) -> date | None:
     """Parse a `published` value (ISO or RFC822) into a date; None if unparseable."""
     if not published:
@@ -3698,6 +3824,24 @@ def main() -> None:
         # an unattended operator. Best-effort by construction; never
         # breaks the loop.
         _append_persona_skill_log(cycle, win_start, win_end)
+
+        # Durable per-cycle dead-feature audit of the just-retrained model.
+        # Catches the pass-#35 class of bug systematically: a feature added
+        # to ``DecisionScorer.build_features`` whose values are never plumbed
+        # into ``_compute_decision_outcomes`` (training capture) or
+        # ``_ml_decide`` (inference) trains on constant zero, the
+        # StandardScaler scales it to ~0, and L2 alpha drives every weight to
+        # exactly 0.0. Existing diagnostics (``feature_importance``
+        # permutation reading, ``calibration``, ``gate_audit``) don't surface
+        # this — they all read DOWNSTREAM (model output / metrics), not the
+        # model's own first-layer weights. Until this wiring landed, the 3
+        # dead enhanced-MACD slots were invisible to the unattended loop for
+        # an unknown number of cycles. Best-effort by construction; never
+        # breaks the loop (the ``_append_*`` discipline every sibling
+        # ledger follows). Runs AFTER the persona ledger and BEFORE
+        # ``_try_train_ml`` so the audit sees the freshly-retrained pickle
+        # this cycle just wrote.
+        _append_dead_feature_audit_log(cycle, win_start, win_end)
 
         ml_status = _try_train_ml() if winner else "no winner"
         print(f"[continuous] ml: {ml_status}")
