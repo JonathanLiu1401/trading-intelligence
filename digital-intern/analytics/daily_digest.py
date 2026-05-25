@@ -16,7 +16,7 @@ DB = Path(__file__).resolve().parents[1] / "data" / "articles.db"
 OUT = Path("/home/zeph/logs/daily_digest.txt")
 TOP_N = 5
 WINDOW_HOURS = 24
-SCAN_LIMIT = 20000
+SCAN_LIMIT = 8000
 
 
 def _score(row) -> float:
@@ -41,22 +41,18 @@ def compute():
         f"""
         SELECT id, title, source, url, urgency, ai_score, ml_score, kw_score, first_seen
           FROM articles
-         WHERE id IN (SELECT id FROM articles ORDER BY id DESC LIMIT ?)
-           AND urgency >= 2
+         WHERE urgency >= 2
            AND {_LIVE_ONLY_CLAUSE}
-           AND datetime(replace(first_seen,'T',' ')) >= datetime('now', ?)
+           AND first_seen >= datetime('now', '-24 hours')
         """,
-        (SCAN_LIMIT, cutoff),
     ).fetchall()
 
     total_real = conn.execute(
         f"""
         SELECT COUNT(*) FROM articles
-         WHERE id IN (SELECT id FROM articles ORDER BY id DESC LIMIT ?)
-           AND {_LIVE_ONLY_CLAUSE}
-           AND datetime(replace(first_seen,'T',' ')) >= datetime('now', ?)
+         WHERE {_LIVE_ONLY_CLAUSE}
+           AND first_seen >= datetime('now', '-24 hours')
         """,
-        (SCAN_LIMIT, cutoff),
     ).fetchone()[0]
     conn.close()
 
