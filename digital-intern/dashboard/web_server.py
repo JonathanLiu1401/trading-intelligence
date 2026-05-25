@@ -3002,6 +3002,254 @@ def _feed_health_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _hourly_pnl_fingerprint_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/hourly-pnl-fingerprint` (the per-hour-of-day
+    alpha-vs-SPY fingerprint) into compact chat-context lines.
+
+    The chat carries ~50 paper-trader analytics blocks for book/decisions/
+    skills/news/sectors, but NOTHING answers the structural question
+    "WHEN in the trading day has this bot actually earned alpha vs SPY?".
+    A live trader with a clear MORNING_EDGE / AFTERNOON_EDGE fingerprint
+    should be acting differently at hour 11 than at hour 15; the chat can
+    answer "is now a good time to be aggressive?" only when this empirical
+    time-of-day verdict is in the prompt. A FLAT_CLOCK book has no
+    discernible hour-of-day edge — the silence precedent is correct,
+    don't fill the chat with non-actionable readings.
+
+    SSOT (paper-trader invariant #10): the builder's own top-level
+    ``headline`` is the chat headline — no chat-side re-derivation of the
+    verdict labeling or the spread numeric. The detail line restates only
+    the builder's own ``best_hour`` / ``worst_hour`` / ``alpha_spread_pp``
+    / ``n_alpha_samples`` fields verbatim.
+
+    Pure / total — exactly the ``_feed_health_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - top-level ``verdict`` not in {"MORNING_EDGE", "MIDDAY_EDGE",
+      "AFTERNOON_EDGE", "OFF_HOURS_EDGE"} → ``[]``: FLAT_CLOCK /
+      INSUFFICIENT_DATA / NO_SPY_DATA / ERROR collapse to silence (the
+      ``_feed_health_chat_lines`` silence precedent — never chat filler
+      when the fingerprint is flat or the sample is too small).
+    - actionable → builder's verbatim ``headline`` (only when a usable
+      string) + a detail line restating best_hour / worst_hour /
+      alpha_spread_pp / n_alpha_samples. Missing fields degrade silently.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") not in (
+        "MORNING_EDGE", "MIDDAY_EDGE", "AFTERNOON_EDGE", "OFF_HOURS_EDGE",
+    ):
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    def _hour_phrase(hr, suffix):
+        if not isinstance(hr, dict):
+            return None
+        h = hr.get("hour")
+        if isinstance(h, bool) or not isinstance(h, (int, float)):
+            return None
+        alpha = _num(hr.get("mean_alpha_pct"))
+        n = _num(hr.get("n_alpha_samples"))
+        chunks = [f"{suffix} hour {int(h):02d}"]
+        if alpha is not None:
+            chunks.append(f"alpha {alpha:+.3f}%")
+        if n is not None:
+            chunks.append(f"n={int(n)}")
+        return " ".join(chunks)
+
+    parts: list[str] = []
+    best = _hour_phrase(rep.get("best_hour"), "best")
+    if best:
+        parts.append(best)
+    worst = _hour_phrase(rep.get("worst_hour"), "worst")
+    if worst:
+        parts.append(worst)
+    spread = _num(rep.get("alpha_spread_pp"))
+    if spread is not None:
+        parts.append(f"spread {spread:.2f}pp")
+    n_alpha = _num(rep.get("n_alpha_samples"))
+    if n_alpha is not None:
+        parts.append(f"n_alpha={int(n_alpha)}")
+    if parts:
+        lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
+def _weekday_pnl_fingerprint_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/weekday-pnl-fingerprint` (the per-weekday
+    alpha-vs-SPY fingerprint) into compact chat-context lines.
+
+    Companion to ``_hourly_pnl_fingerprint_chat_lines`` — the chat carries
+    ~50 paper-trader analytics blocks but nothing answers "is TODAY
+    historically a good day for this bot vs SPY?". A live trader with a
+    WEEKDAY_EDGE on Wed and a -0.13pp drag on Fri should be sizing
+    differently on those days; the chat can answer "should I be more
+    cautious today?" only when this DOW verdict is in the prompt. A
+    FLAT_WEEK book has no discernible weekday edge — the silence
+    precedent is correct, don't fill the chat with FLAT readings.
+
+    SSOT (paper-trader invariant #10): the builder's own top-level
+    ``headline`` is the chat headline — no chat-side re-derivation. The
+    detail line restates only the builder's own ``best_weekday`` /
+    ``worst_weekday`` / ``alpha_spread_pp`` / ``n_alpha_samples`` fields.
+
+    Pure / total — exactly the ``_hourly_pnl_fingerprint_chat_lines``
+    contract:
+
+    - non-dict → ``[]``
+    - top-level ``verdict`` not in {"WEEKDAY_EDGE", "WEEKEND_EDGE"} →
+      ``[]``: FLAT_WEEK / INSUFFICIENT_DATA / NO_SPY_DATA / ERROR
+      collapse to silence (the hourly precedent — never chat filler
+      when the fingerprint is flat or the sample is too small).
+    - actionable → builder's verbatim ``headline`` + detail-line.
+      Missing fields degrade silently.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") not in ("WEEKDAY_EDGE", "WEEKEND_EDGE"):
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    def _wd_phrase(wd, suffix):
+        if not isinstance(wd, dict):
+            return None
+        name = wd.get("weekday_name")
+        if not isinstance(name, str) or not name.strip():
+            return None
+        alpha = _num(wd.get("mean_alpha_pct"))
+        n = _num(wd.get("n_alpha_samples"))
+        chunks = [f"{suffix} {name}"]
+        if alpha is not None:
+            chunks.append(f"alpha {alpha:+.3f}%")
+        if n is not None:
+            chunks.append(f"n={int(n)}")
+        return " ".join(chunks)
+
+    parts: list[str] = []
+    best = _wd_phrase(rep.get("best_weekday"), "best")
+    if best:
+        parts.append(best)
+    worst = _wd_phrase(rep.get("worst_weekday"), "worst")
+    if worst:
+        parts.append(worst)
+    spread = _num(rep.get("alpha_spread_pp"))
+    if spread is not None:
+        parts.append(f"spread {spread:.2f}pp")
+    n_alpha = _num(rep.get("n_alpha_samples"))
+    if n_alpha is not None:
+        parts.append(f"n_alpha={int(n_alpha)}")
+    if parts:
+        lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
+def _cash_conviction_fit_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/cash-conviction-fit` (the cash-level-vs-
+    loudest-live-signal calibration check) into compact chat-context lines.
+
+    The chat already carries `cash_pct` (point-in-time), `all_cash_streak`
+    (chronic-flat duration), `cash_redeployment` (post-SELL latency), and
+    `cash_drag` (SPY-benchmarked dollar). None of those answer the
+    structural calibration question: "is the CURRENT cash level wrong
+    given the loudest CURRENT live signal right now?". A book at 95%
+    cash while ai_score 9.2 NVDA screams is structurally wrong in a way
+    none of the other surfaces flag — and a book at 0% cash with the
+    loudest signal only ai 5.5 is overdeployed for that conviction.
+
+    SSOT (paper-trader invariant #10): the builder's own top-level
+    ``headline`` is the chat headline — no chat-side re-derivation of
+    the verdict naming or threshold logic. The detail line restates only
+    the builder's own ``cash_pct`` / ``cash_usd`` / ``top_signal.ticker``
+    / ``top_signal.ai_score`` / ``last_decision.verb`` / ``age_min``
+    fields verbatim.
+
+    Pure / total — exactly the ``_feed_health_chat_lines`` contract:
+
+    - non-dict → ``[]``
+    - top-level ``verdict`` not in {"IDLE_DESPITE_SURGE", "OVERDEPLOYED",
+      "IDLE_LOW_CONVICTION"} → ``[]``: BALANCED / NO_DATA collapse to
+      silence — the silence precedent (never chat filler when the cash
+      level fits the conviction, and NO_DATA is a probe-side defect).
+    - actionable → builder's verbatim ``headline`` + a detail-line
+      restating book + signal + last-decision fields. Missing fields
+      degrade silently.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") not in (
+        "IDLE_DESPITE_SURGE", "OVERDEPLOYED", "IDLE_LOW_CONVICTION",
+    ):
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    parts: list[str] = []
+    port = rep.get("portfolio")
+    if isinstance(port, dict):
+        cash_pct = _num(port.get("cash_pct"))
+        if cash_pct is not None:
+            parts.append(f"cash {cash_pct:.0f}%")
+        cash_usd = _num(port.get("cash_usd"))
+        if cash_usd is not None:
+            parts.append(f"${cash_usd:,.0f}")
+    sig = rep.get("top_signal")
+    if isinstance(sig, dict):
+        tkr = sig.get("ticker")
+        score = _num(sig.get("ai_score"))
+        if isinstance(tkr, str) and tkr.strip() and score is not None:
+            parts.append(f"top={tkr} ai={score:.1f}")
+        elif isinstance(tkr, str) and tkr.strip():
+            parts.append(f"top={tkr}")
+        elif score is not None:
+            parts.append(f"top_ai={score:.1f}")
+    last = rep.get("last_decision")
+    if isinstance(last, dict):
+        verb = last.get("verb")
+        age = _num(last.get("age_min"))
+        if isinstance(verb, str) and verb.strip() and age is not None:
+            parts.append(f"last={verb} {age:.0f}m ago")
+        elif isinstance(verb, str) and verb.strip():
+            parts.append(f"last={verb}")
+    if parts:
+        lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
 def _passive_signal_density_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/passive-signal-density` (the smoking-gun
     detector for "engine idle while news is loud") into compact chat lines.
@@ -7961,6 +8209,71 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: feed-health fetch failed: %s", e)
 
+        # Hourly-PnL fingerprint — WHEN in the trading day has this bot
+        # actually earned alpha vs SPY? The chat carries dozens of
+        # book/decisions/skills blocks but is BLIND to the structural
+        # time-of-day verdict — a MORNING_EDGE bot should be more
+        # aggressive at hour 11 than at hour 15, and the chat can answer
+        # "is now a good time to lean into this signal?" only when this
+        # empirical hourly verdict is in the prompt. Fires ONLY on
+        # MORNING_EDGE / MIDDAY_EDGE / AFTERNOON_EDGE / OFF_HOURS_EDGE
+        # (FLAT_CLOCK / INSUFFICIENT_DATA / NO_SPY_DATA collapse to
+        # silence). Composed verbatim by the pure
+        # _hourly_pnl_fingerprint_chat_lines helper (unit-tested; SSOT —
+        # the builder's own `headline` is the chat headline, no
+        # re-derived verdict). Guarded 3s read.
+        hourly_pnl_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/hourly-pnl-fingerprint",
+                    timeout=3) as resp:
+                _hp = json.loads(resp.read().decode("utf-8"))
+            hourly_pnl_block = "\n".join(_hourly_pnl_fingerprint_chat_lines(_hp))
+        except Exception as e:
+            _logger().warning("chat: hourly-pnl-fingerprint fetch failed: %s", e)
+
+        # Weekday-PnL fingerprint — is TODAY historically a good day
+        # for this bot vs SPY? Companion to the hourly fingerprint — the
+        # chat carries no DOW-edge verdict, so the analyst can't answer
+        # "should I be more cautious today?" with empirical-edge data.
+        # Fires ONLY on WEEKDAY_EDGE / WEEKEND_EDGE (FLAT_WEEK /
+        # INSUFFICIENT_DATA / NO_SPY_DATA collapse to silence). Composed
+        # verbatim by the pure _weekday_pnl_fingerprint_chat_lines
+        # helper (unit-tested; SSOT). Guarded 3s read.
+        weekday_pnl_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/weekday-pnl-fingerprint",
+                    timeout=3) as resp:
+                _wp = json.loads(resp.read().decode("utf-8"))
+            weekday_pnl_block = "\n".join(_weekday_pnl_fingerprint_chat_lines(_wp))
+        except Exception as e:
+            _logger().warning("chat: weekday-pnl-fingerprint fetch failed: %s", e)
+
+        # Cash-conviction fit — is the CURRENT cash level wrong given the
+        # loudest CURRENT live signal right now? The chat carries
+        # cash_pct (point-in-time), all_cash_streak (chronic-flat
+        # duration), cash_redeployment (post-SELL latency), cash_drag
+        # (SPY-benchmarked dollar). None of those answer the structural
+        # calibration question — a book 95% cash while ai_score 9.2
+        # screams is structurally wrong in a way none of the other
+        # surfaces flag. Fires ONLY on IDLE_DESPITE_SURGE / OVERDEPLOYED
+        # / IDLE_LOW_CONVICTION (BALANCED / NO_DATA collapse to silence).
+        # Composed verbatim by the pure _cash_conviction_fit_chat_lines
+        # helper (unit-tested; SSOT). Guarded 3s read.
+        cash_conviction_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/cash-conviction-fit",
+                    timeout=3) as resp:
+                _cc = json.loads(resp.read().decode("utf-8"))
+            cash_conviction_block = "\n".join(_cash_conviction_fit_chat_lines(_cc))
+        except Exception as e:
+            _logger().warning("chat: cash-conviction-fit fetch failed: %s", e)
+
         now_iso = datetime.now(timezone.utc).isoformat()
         system_prompt = (
             "You are a market intelligence analyst with access to a real-time news feed, "
@@ -7978,6 +8291,9 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — DISCORD-DELIVERY HEALTH (operator-fitness — when DEGRADED, trade alerts / hourly summaries / daily-close posts are silently being dropped: the analyst is talking about a book whose ops surface is DARK and any 'consider trimming X' recommendation never reaches the operator. Surfaced ONLY when DEGRADED, never filler when HEALTHY / UNKNOWN. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{notify_health_block}\n\n" if notify_health_block else "")
             + (f"PAPER TRADER — ALL-CASH STREAK (the chronic-flat-book surface — cash_pct snapshots are point-in-time; cash_redeployment latency is the post-SELL sit; opportunity_cost is signal-specific hindsight; cash_drag is SPY-benchmarked dollar; none answer 'how long has the book ACTUALLY been 100% cash right now, and at what compounding alpha cost so far?'. A book flat for 2h vs 6 days reads identically on cash_pct yet the second case is a strong 'decision loop too risk-off / something is wrong' tell. Surfaced ONLY when EXTENDED_HOLDOUT / PROLONGED_HOLDOUT, never filler when BRIEF_HOLDOUT / NOT_ALL_CASH / NO_DATA / INSUFFICIENT_HISTORY. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{all_cash_streak_block}\n\n" if all_cash_streak_block else "")
             + (f"PAPER TRADER — FEED HEALTH (the live-news pipeline fitness — every downstream block assumes the feed is alive; when feed-health is BLIND (consecutive 0-signal decisions), STALE_FEED (newest article > stale_hours old), or UNSCORED (articles arriving but ai_score=0 — digital-intern ML scoring pipeline silently down), every other verdict becomes interpretively suspect: CASH_REDEPLOYMENT=STALLED means something different when the bot is BLIND vs when the wire is live. The analyst must flag this BEFORE answering 'what should we do?' because the right answer becomes 'restart the scorer' or 'wait for the feed', not 'trim NVDA'. The UNSCORED-clause is already part of the headline under BLIND/STALE_FEED. Surfaced ONLY when BLIND / STALE_FEED, never filler when HEALTHY / NO_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{feed_health_block}\n\n" if feed_health_block else "")
+            + (f"PAPER TRADER — TIME-OF-DAY EDGE (the per-hour-of-day alpha-vs-SPY fingerprint over the bot's equity-curve history — 'WHEN in the trading day has this bot actually earned alpha?'. The chat carries dozens of book/decisions/skills blocks but no temporal-edge verdict; a MORNING_EDGE bot should be more aggressive at the best alpha hour and lighter at the worst-alpha hour, and the analyst can answer 'is now a good time to lean into this signal?' only with this empirical hour-of-day view. Surfaced ONLY when MORNING_EDGE / MIDDAY_EDGE / AFTERNOON_EDGE / OFF_HOURS_EDGE (i.e. a non-flat fingerprint with adequate samples), never filler when FLAT_CLOCK / INSUFFICIENT_DATA / NO_SPY_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{hourly_pnl_block}\n\n" if hourly_pnl_block else "")
+            + (f"PAPER TRADER — DAY-OF-WEEK EDGE (the per-weekday alpha-vs-SPY fingerprint over the bot's equity-curve history — 'is TODAY historically a good day for this bot vs SPY?'. Companion to TIME-OF-DAY EDGE — answers 'should I be more cautious today?' on a different time axis. Surfaced ONLY when WEEKDAY_EDGE / WEEKEND_EDGE (non-flat fingerprint with adequate samples), never filler when FLAT_WEEK / INSUFFICIENT_DATA / NO_SPY_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{weekday_pnl_block}\n\n" if weekday_pnl_block else "")
+            + (f"PAPER TRADER — CASH-CONVICTION FIT (is the CURRENT cash level wrong given the loudest CURRENT live signal? The chat already carries cash_pct (point-in-time), all_cash_streak (chronic-flat duration), cash_redeployment (post-SELL latency), cash_drag (SPY-benchmarked dollar) — none of those answer the structural calibration question. A book 95% cash while ai_score 9.2 screams is structurally wrong in a way none of the other cash surfaces flag, and a fully-deployed book against a 5.5 loudest-live signal is overdeployed for that conviction. Surfaced ONLY when IDLE_DESPITE_SURGE / OVERDEPLOYED / IDLE_LOW_CONVICTION, never filler when BALANCED / NO_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{cash_conviction_block}\n\n" if cash_conviction_block else "")
             + (f"PAPER TRADER — WHAT MATERIALLY CHANGED SINCE YOU LAST LOOKED (ranked, last 6h):\n{session_delta_block}\n\n" if session_delta_block else "")
             + (f"PAPER TRADER ANALYTICS:\n{analytics_block}\n\n" if analytics_block else "")
             + (f"PAPER TRADER — BEHAVIOURAL DIAGNOSIS (the bot's own self-review verdicts):\n{behavioural_block}\n\n" if behavioural_block else "")
