@@ -67,11 +67,55 @@ from .store import DB_PATH
 _RANK = {"HEALTHY": 0, "NO_DATA": 0, "DEGRADED": 2, "DOWN": 3}
 
 # The runner is launched either as ``python3 -m paper_trader.runner`` or via
-# the systemd unit's ``paper-trader/runner.py``; match either form. Mirrors
-# the cmdline pattern AGENTS.md's "Common failure modes" row documents for
-# locating the runner's true stdout.
-_RUNNER_CMDLINE_MARKERS = ("paper_trader.runner", "paper-trader/runner.py",
-                           "paper_trader/runner.py")
+# the systemd unit's ``paper-trader/runner.py``. Substring matching against
+# free-form text is unsafe: agent prompts and unrelated processes routinely
+# contain those exact strings as discussion text (HYBRID review agents have
+# the prompt "from paper_trader.runner import main" passed as a positional
+# arg to ``claude --print``, which then false-positives as a runner). The
+# fix is to tokenise the cmdline and require the marker to occupy the right
+# argv slot — a python interpreter as argv[0] AND either a ``-m`` flag
+# followed by ``paper_trader.runner`` OR an argv token ending in
+# ``runner.py`` whose path also contains a ``paper`` segment.
+_RUNNER_MODULE = "paper_trader.runner"
+
+
+def _cmdline_is_runner(cmdline: str) -> bool:
+    """True iff ``cmdline`` is an actual paper-trader runner invocation.
+
+    Pure / testable. Tokenises on whitespace (``/proc/<pid>/cmdline`` is
+    NUL-separated; the caller already replaced NULs with spaces). The rules:
+
+      * argv[0] basename must be ``python`` / ``pythonN`` / ``pythonN.M``
+        (rejects ``claude --print "...paper_trader.runner..."`` which has
+        argv[0] == ``claude``);
+      * AND either
+        - a ``-m`` token is immediately followed by ``paper_trader.runner``
+          (module-mode launch), OR
+        - some argv token is a path ending in ``/runner.py`` (or bare
+          ``runner.py``) whose containing path segment matches ``paper``
+          (catches both ``paper-trader/runner.py`` and
+          ``paper_trader/runner.py``; rejects an unrelated
+          ``/some/other/runner.py``).
+    """
+    parts = (cmdline or "").split()
+    if not parts:
+        return False
+    argv0_base = os.path.basename(parts[0])
+    # python / python3 / python3.12 / python3.13 …  — never ``claude``,
+    # ``bash``, ``vim``, etc.
+    if not (argv0_base == "python" or argv0_base.startswith("python")):
+        return False
+    # Module-mode: "-m" immediately followed by the package path.
+    for i, tok in enumerate(parts[1:], start=1):
+        if tok == "-m" and i + 1 < len(parts) and parts[i + 1] == _RUNNER_MODULE:
+            return True
+    # Script-mode: a token whose basename is runner.py AND whose path
+    # contains a ``paper`` segment (matches both paper-trader/runner.py
+    # and paper_trader/runner.py; rejects bare /tmp/runner.py).
+    for tok in parts[1:]:
+        if os.path.basename(tok) == "runner.py" and "paper" in tok:
+            return True
+    return False
 
 
 def _running_runner_pids() -> list[int] | None:
@@ -98,7 +142,7 @@ def _running_runner_pids() -> list[int] | None:
                     "utf-8", "replace")
         except (OSError, IOError):
             continue  # process exited mid-scan / permission — skip, don't die
-        if any(m in cmdline for m in _RUNNER_CMDLINE_MARKERS):
+        if _cmdline_is_runner(cmdline):
             pids.append(pid)
     return pids
 
