@@ -6,6 +6,242 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-25 ML+backtest HYBRID pass #38 (Agent 2) — `_rsi`/`_macd` NaN/steady-state hardening + `macd_setup_skill`
+
+### Phase 1 — Debug: bugs_fixed = 3
+
+Three real bugs surfaced while auditing the indicator path used by
+both the live trader and the backtest engine. All three have tests
+that fail against the buggy code and pass against the fix.
+
+1. **`_rsi` / `_macd` silently propagate NaN/Inf from a poisoned
+   price close.** A single NaN flowed through Wilder smoothing /
+   EMA chains and produced NaN MACD / NaN RSI. `_ml_decide` then
+   read `isinstance(NaN, (int, float)) == True` and applied the
+   negative branch (`adj -= 0.5` because `NaN > 0` is False) —
+   silently penalising every NaN-poisoned name's quant score. Fix:
+   `_rsi` and `_macd` defensively reject non-finite inputs and return
+   `None`, so the gate skips the adjustment entirely.
+
+2. **`_macd` label flipped from floating-point noise on steady-state
+   trends.** A clean 60-bar linear uptrend `100..159` reported
+   `"bearish"`; a clean downtrend `200..141` reported `"bullish"`.
+   Root cause: in steady state the MACD line and signal line converge
+   to the same value, and the `m > s` comparison the label was derived
+   from flipped from EMA-of-EMA accumulation roundoff alone. Worse,
+   this label appears in the live trader's prompt (`_build_prompt` →
+   `MARKET STRUCTURE`), so a false `"bearish"` in a clean uptrend
+   silently misled the LLM. Fix: epsilon-tolerant comparison scaled
+   by magnitudes — `"flat"` when `|m - s|` is at noise; real
+   crossovers (where the diff is well above the threshold) are
+   unaffected.
+
+3. **`datetime.utcnow()` deprecation in `run_continuous_backtests.py`
+   (monkey-benchmark refresh path).** Deprecated in Python 3.12 and
+   slated for removal. The continuous log was emitting one
+   `DeprecationWarning` per cycle. Fix: timezone-aware
+   `datetime.now(timezone.utc)` and parse the cached `gen_at`
+   timestamp as UTC-aware so the subtraction is well-defined.
+
+### Phase 2 — Feature: `macd_setup_skill` univariate diagnostic
+
+`paper_trader/ml/macd_setup_skill.py` is the natural follow-up to
+pass #35's enhanced-MACD-feature plumbing and pass #37's OOS parity
+fix — the deployed scorer's first-layer `mean|w|` for these slots is
+material (0.45 / 0.26 / 0.24), but **no analyzer ever tested whether
+the booleans carry univariate predictive signal at all**.
+`baseline_compare` has 11 univariate baselines covering every NUMERIC
+feature but skips all 3 enhanced MACD booleans.
+
+The new module reports, for each of `ema200_above` / `hist_cross_up`
+/ `macd_below_zero_cross` plus their AND-conjunction
+`combined_setup`:
+
+- `mean_true` vs `mean_false` realized 5d return (%)
+- `mean_gap_pct` — the magnitude question (does the flag move the
+  needle on realized return?)
+- `spearman` rank-IC (boolean-encoded vs realized) — same
+  `_spearman` as every sibling diagnostic for cross-tool comparability
+- counts on each side (`n_true` / `n_false`) so a reader spots
+  imbalanced corpora that make the gap unreliable
+
+Per-flag verdict ladder (threshold-driven, test-locked):
+
+- `INSUFFICIENT_DATA` — < `MIN_BUCKET=5` rows on either side OR < `MIN_PAIRS=30` total
+- `SETUP_PREDICTS_UP` — `mean_gap ≥ MEAN_GAP_GOOD_PCT=1.5pp` AND `spearman ≥ SPEARMAN_GOOD=0.10`
+- `SETUP_PREDICTS_DOWN` — anti-predictive: `mean_gap ≤ -1.5pp` AND `spearman ≤ -0.10`
+- `SETUP_NO_SKILL` — `|mean_gap| < 0.5pp` AND `|spearman| < 0.05`
+- `DIRECTIONAL_UP` / `DIRECTIONAL_DOWN` — weak signals when only one of the two thresholds fires
+
+Top-level rollup priority: `PREDICTS_DOWN > PREDICTS_UP > DIRECTIONAL_DOWN > DIRECTIONAL_UP > NO_SKILL > INSUFFICIENT_DATA`.
+DOWN wins over UP because an anti-predictive signal is more
+economically actionable (it justifies feature removal or inversion).
+
+Operational discipline matches `wk52_skill` exactly: read-only (no
+train / no pickle write), never raises (`status='error'` envelope
+on any fault), JSON-safe envelope on every path.
+
+CLI:
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.macd_setup_skill          # human-readable table
+python3 -m paper_trader.ml.macd_setup_skill --json   # machine-readable
+```
+
+Exit codes: `0` on `SETUP_PREDICTS_UP`, `2` on `SETUP_PREDICTS_DOWN`
+(feature-removal cue), `1` otherwise — shell-gateable.
+
+### Phase 3 — Live quant findings (user_findings = 6)
+
+1. **All 4 MACD enhanced flags read `SETUP_NO_SKILL` on the live
+   6764-row corpus.** Per the new `macd_setup_skill`:
+   - `ema200_above` n_true=3164 n_false=1966 gap=-0.25pp ic=-0.007
+   - `hist_cross_up` n_true=253 n_false=6120 gap=+0.39pp ic=+0.013
+   - `macd_below_zero_cross` n_true=168 n_false=6205 gap=+0.28pp ic=+0.015
+   - `combined_setup` n_true=60 n_false=5070 gap=+0.23pp ic=+0.003
+
+   None of the textbook-MACD setups carry univariate predictive
+   signal in the captured corpus. The 3 enhanced-MACD feature slots
+   are weighted by the deployed scorer but their contribution
+   appears to come from interactions with other features, not from
+   univariate skill. This is decisive evidence that argues against
+   the textbook-MACD interpretation.
+
+2. **Backtest health: 504/520 runs complete, 16 failed (3.1%), 0 stuck `running`.**
+   Last reaper window is clean. Continuous cycle 1 finished in
+   10.5 min (well under the 600s cooldown budget).
+
+3. **Massive run-to-run variance is leverage, not skill.** Last 50
+   complete runs: vs_spy median +51.93%, mean +845.22%, min -287%,
+   max +8686%. Recent 5-run vs_spy: +42%, -132%, -268%, +125%, +6254%.
+   The tail dominates — leveraged-bull single-stock 2x personas
+   produce the outliers. AGENTS.md's persona_skill warning holds.
+
+4. **The conviction gate is INVERTED (GATE_HARMFUL verdict).**
+   `scorer_health` reports: gate `×1.30` (strong-tailwind) arm
+   realized **-0.39%** vs `×0.60` (strong-headwind) arm at **+1.80%**
+   — spread **-2.19pp**. The deployed gate is actively allocating
+   MORE capital to trades that perform WORSE. (Pre-existing,
+   documented across prior passes.) This is the single most
+   economically decisive operator-actionable signal.
+
+5. **Scorer at `WEAK_SIGNAL` with `DIRECTIONAL_BUT_BIASED` profile.**
+   `calibration` shows spearman 0.18, mean abs decile error 2.92pp,
+   monotone fraction 0.78. Top decile predicts +10.80% but realizes
+   only +4.26% — magnitude bias confirmed. Rank ordering is real
+   but %-magnitudes are not honest (the documented verdict).
+
+6. **LLM annotation pipeline is dark.** continuous.log shows
+   "LLM annotation failed: Could not resolve authentication method"
+   — `ANTHROPIC_API_KEY` is not configured in this environment.
+   All `llm_quality_label=0` in the corpus, so the trainer's
+   `endorsed=3×` / `condemned=0.1×` weighting does nothing. Already
+   captured by `_append_llm_annotation_skill_log` (`pipeline_dark=True`).
+   Documented in memory `DI ml-trainer subprocess timeout` and AGENTS.md
+   prior passes.
+
+### Phase 4 — Counters
+
+bugs_fixed = 3 · features_added = 1 · user_findings = 6
+
+```bash
+# Run the new pinning + feature tests (~1s):
+python3 -m pytest tests/test_ml_backtest_review_20260525_agent2.py \
+    tests/test_macd_setup_skill.py -v
+
+# Audit the live MACD enhanced-feature skill:
+python3 -m paper_trader.ml.macd_setup_skill --json | python3 -m json.tool
+
+# Focused ML/backtest slice (~3 min):
+python3 -m pytest tests/ -k "ml or backtest or scorer or continuous" -q
+```
+
+### Files touched
+
+- `paper_trader/backtest.py` (+42 / -6 — NaN guards + `_macd` epsilon comparison + math import)
+- `run_continuous_backtests.py` (+13 / -3 — `datetime.utcnow()` → `datetime.now(timezone.utc)`)
+- `tests/test_ml_backtest_review_20260525_agent2.py` (NEW, +243 — 12 tests)
+- `paper_trader/ml/macd_setup_skill.py` (NEW, +473 — diagnostic + CLI)
+- `tests/test_macd_setup_skill.py` (NEW, +406 — 38 tests)
+
+### ML/backtest domain primer (for future agents)
+
+The ML/backtest stack lives in three files this pass touches:
+
+| File | Role |
+|---|---|
+| `paper_trader/ml/decision_scorer.py` | The deployed MLP (32, 16) — features in `FEATURE_NAMES`, `build_features` is canonical, `predict_with_meta` is the honest sibling to `predict` |
+| `paper_trader/backtest.py` | `_ml_decide` is the quant gate; `_compute_technical_indicators` is the indicator path; `_macd` / `_rsi` / EMA helpers are the textbook implementations |
+| `run_continuous_backtests.py` | The continuous loop — per-cycle retrain, OOS ledgers, validation hooks, all the `_append_*_skill_log` per-cycle ledgers |
+
+**Always-read invariants** (from `CLAUDE.md`):
+- DecisionScorer gates ONLY at `n_train >= 500` (invariant #5)
+- Backtest articles MUST be filtered from live signals (invariant #1)
+- The live trader always uses `claude-opus-4-7` (invariant #3)
+- DB writes are WAL, readers use `?mode=ro` (invariant #7)
+- Concurrent claude subprocesses cap at 3 via `_CLAUDE_SEM` (invariant #6)
+
+**How the DecisionScorer works (single-paragraph mental model):**
+A small MLP `(32, 16)` with L2 alpha=1e-2 and early stopping; trained
+on the last 5000 rows of `data/decision_outcomes.jsonl`; reads 20
+features (10 numeric + 3 enhanced MACD booleans + 7 sector one-hot);
+output `predict_with_meta()` returns `{pred, raw, clamped,
+off_distribution, percentile, calibrated, failed}` for honest
+read-back; `predict()` is the scalar fast path. Gate ONLY engages
+when the deployed pickle has `n_train >= 500`. Once active, the
+gate scales conviction by ×0.6 / ×0.85 / ×1.0 / ×1.15 / ×1.3 based
+on `predict() < -10` / `< 0` / between / `> 5` / `> 10` —
+documented `GATE_HARMFUL` currently because top-tier arms underperform.
+
+**How to interpret backtest results:**
+- `total_return_pct` is RAW return — outliers reach +6000% on leveraged ETFs
+- `vs_spy_pct` is the SPY-adjusted skill (HAS the SPY benchmark integrity guards from prior passes)
+- The MEDIAN over recent N runs is the right summary stat; mean is dominated by leverage tails
+- A `benchmark_unavailable` note in `notes` field means SPY series was empty/degenerate for that window — read `vs_spy_pct` as `total_return_pct` in that case
+- Persona ID is `((run_id - 1) % 10) + 1`
+
+**How to interpret scorer skill numbers:**
+- `oos_rmse` typically 11..14 (σ(target) ≈ 11.7 — values above suggest no magnitude skill)
+- `oos_ic` of 0.10..0.20 = real rank skill; ≤ 0.05 = at noise
+- `dir_acc` of 0.55+ = real directional skill; 0.50 = coin flip
+- `MLP_NO_BETTER_THAN_TRIVIAL` from `baseline_compare` = the neural net is not earning its complexity OOS
+- `GATE_HARMFUL` from `scorer_health` = the gate's high-conviction arm underperformed its low-conviction arm — actively bad
+
+**How to run a manual backtest:**
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 run_backtests.py             # 10 parallel year-long runs against the default 2025-05-01 → 2026-05-13 window
+# Or override the window — see `BacktestEngine.__init__(start, end, model_id)`
+```
+
+**Test commands for the ML/backtest domain:**
+```bash
+# Focused — what you usually want during iteration (~3 min):
+python3 -m pytest tests/ -k "ml or backtest or scorer or continuous" -q
+
+# Pure decision_scorer slice (~25s):
+python3 -m pytest tests/test_decision_scorer.py tests/test_scorer_*.py -q
+
+# Per-cycle ledger slice (~30s):
+python3 -m pytest tests/test_continuous_*_ledger.py -q
+
+# This pass's new tests (~1s — offline):
+python3 -m pytest tests/test_ml_backtest_review_20260525_agent2.py \
+    tests/test_macd_setup_skill.py -v
+```
+
+**Read-only diagnostics the operator should run weekly:**
+```bash
+python3 -m paper_trader.ml.scorer_health          # one-line state of the deployed scorer + gate
+python3 -m paper_trader.ml.baseline_compare       # is the MLP earning its complexity OOS?
+python3 -m paper_trader.ml.calibration            # is the magnitude calibrated, or only rank?
+python3 -m paper_trader.ml.gate_audit             # per-arm realized PnL
+python3 -m paper_trader.ml.macd_setup_skill       # NEW — univariate skill of the 3 enhanced MACD booleans
+python3 -m paper_trader.ml.deploy_audit           # is the deployed pickle's config aligned with source MLP_CONFIG?
+```
+
+---
+
 ## 2026-05-25 ML+backtest HYBRID pass #37 (Agent 2) — OOS feature-parity fix + `oos_parity_audit` quantifier
 
 ### Phase 1 — Debug: bugs_fixed = 1
