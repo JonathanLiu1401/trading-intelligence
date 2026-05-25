@@ -5,6 +5,237 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-25 feature-dev pass #2 (Agent 4) — TIME-OF-DAY + DAY-OF-WEEK + CASH-CONVICTION-FIT chat triad
+
+Feature-dev pass. 1019 chat-enrichment tests green at start; +107 new
+chat-enrichment tests = 1132 in the chat+dashboard+web_server+
+portfolio_signals+sector_pulse sweep at end. All four load-bearing
+invariants intact.
+
+**Phase 1 (feature) — three new chat enrichment helpers + wiring:**
+
+The chat handler carries ~50 paper-trader analytics blocks (book /
+decisions / skills / news / sectors) and a new operator-fitness
+triad (notify-health / all-cash-streak / feed-health) added earlier
+today, but was BLIND to two structural surfaces every empirical
+trader cares about: WHEN in the trading day / week does this bot
+actually earn alpha vs SPY, and is the CURRENT cash level wrong for
+the CURRENT loudest live signal? Three new blocks fill that gap, all
+following the existing `_*_chat_lines` SSOT pattern (cf.
+`_feed_health_chat_lines`):
+
+1. `_hourly_pnl_fingerprint_chat_lines` — paper-trader
+   `/api/hourly-pnl-fingerprint`. Fires ONLY on MORNING_EDGE /
+   MIDDAY_EDGE / AFTERNOON_EDGE / OFF_HOURS_EDGE (FLAT_CLOCK /
+   INSUFFICIENT_DATA / NO_SPY_DATA / ERROR collapse to silence).
+   Headline + best_hour / worst_hour / alpha_spread_pp /
+   n_alpha_samples detail. 38 unit tests. Live evidence at start:
+   `verdict=FLAT_CLOCK, alpha_spread_pp=0.136` — correctly silent.
+2. `_weekday_pnl_fingerprint_chat_lines` — paper-trader
+   `/api/weekday-pnl-fingerprint`. Fires ONLY on WEEKDAY_EDGE /
+   WEEKEND_EDGE (FLAT_WEEK / INSUFFICIENT_DATA / NO_SPY_DATA /
+   ERROR collapse to silence). Headline + best_weekday / worst_weekday
+   / alpha_spread_pp / n_alpha_samples detail. 29 unit tests. Live at
+   start: `verdict=FLAT_WEEK, alpha_spread_pp=0.158` — correctly silent.
+3. `_cash_conviction_fit_chat_lines` — paper-trader
+   `/api/cash-conviction-fit`. Fires ONLY on IDLE_DESPITE_SURGE /
+   OVERDEPLOYED / IDLE_LOW_CONVICTION (BALANCED / NO_DATA collapse
+   to silence). Headline + cash_pct / cash_usd / top_signal /
+   last_decision detail. 40 unit tests. Live at start:
+   `verdict=BALANCED, cash 100% vs top signal 6.0` — correctly silent.
+
+All three:
+- Pure / total — non-dict / missing keys / non-numeric values never
+  raise (matches the established silence-on-bad-input contract).
+- Healthy / non-actionable collapses to `[]` so a working / flat
+  system stays out of the chat — never filler (the
+  `_feed_health_chat_lines` silence precedent).
+- Headline is the trader endpoint's verbatim string (paper-trader
+  invariant #10) — no chat-side re-derived verdict.
+- Wired into the chat handler with a 3s guarded urlopen, same
+  fetch-guard discipline as every existing block.
+- Placed in the system_prompt immediately after FEED HEALTH —
+  temporal-edge + conviction-fit context-qualify every downstream
+  analytics block.
+
+**Phase 2 (live validation) — 3 findings:**
+
+1. **No empirical hour-of-day edge yet.** `/api/hourly-pnl-fingerprint`
+   reports `verdict=FLAT_CLOCK, alpha_spread_pp=0.136` (best hour 11
+   +0.04%/cycle × 18 vs worst hour 10 -0.10%/cycle × 13). 90
+   alpha-samples — past the 60-sample floor but the spread is too
+   tight to call edge. The chat will correctly stay silent until
+   accumulated history opens the spread past 0.50pp.
+2. **No empirical DOW edge yet.** `/api/weekday-pnl-fingerprint`
+   reports `verdict=FLAT_WEEK, alpha_spread_pp=0.158` (best Wed
+   +0.03% × 25 vs worst Fri -0.13% × 13). Same correct-silence
+   regime — the block fires when a real DOW pattern emerges.
+3. **Cash level fits conviction right now.** `/api/cash-conviction-fit`
+   reports `verdict=BALANCED, cash 100% vs top signal 6.0 ORCL`.
+   The chat will correctly stay silent — and would surface
+   IDLE_DESPITE_SURGE the moment the loudest live signal crosses
+   the 8.0 threshold while the book stays >40% cash.
+
+**Test coverage added:**
+
+```
+tests/test_chat_hourly_pnl_fingerprint_enrichment.py     # 38 tests
+tests/test_chat_weekday_pnl_fingerprint_enrichment.py    # 29 tests
+tests/test_chat_cash_conviction_fit_enrichment.py        # 40 tests
+```
+
+Each file pins: pure/total contract (non-dict, empty dict, missing
+fields, bool-as-int defense), silence on non-actionable verdicts,
+verbatim SSOT headline pass-through, detail-line field composition,
+plus a live-fixture regression test against the exact JSON shape
+observed at start (FLAT_CLOCK / FLAT_WEEK / BALANCED).
+
+**Files touched (this repo only):**
+
+- `dashboard/web_server.py` — three new module-level `_*_chat_lines`
+  helpers (~210 lines) + three new fetch+wire blocks in the chat
+  handler closure (~78 lines) + three new conditional `+ f"PAPER
+  TRADER — ..."` blocks in the system_prompt (~3 lines).
+- `tests/test_chat_hourly_pnl_fingerprint_enrichment.py` (new).
+- `tests/test_chat_weekday_pnl_fingerprint_enrichment.py` (new).
+- `tests/test_chat_cash_conviction_fit_enrichment.py` (new).
+- `AGENTS.md` (this entry).
+- `CLAUDE.md` (dashboard chat-enrichment description line for the
+  new three blocks).
+
+No paper-trader changes — the endpoints already exist and are
+healthy; this work is purely the chat-side surfacing layer.
+
+---
+
+## 2026-05-25 hybrid pass #39 (Agent 3) — urgent_score_distribution (calibration-axis sibling)
+
+Debugger + feature-dev + news-analyst pass. 0 bugs found worth committing
+(the four load-bearing invariants are densely tested already; targeted
+re-run of the critical-file suite — `test_article_store.py`,
+`test_urgency_scorer.py`, `test_features.py`, `test_model.py`,
+`test_trainer.py`, `test_score_pending.py` — was 64/64 green at start
+and 80/80 with the new `test_urgent_score_distribution.py` at end). All
+four load-bearing invariants intact.
+
+**Phase 1 (bug fix):** none committed. Mirrors the prior pass #38's honest
+zero — the codebase has so many prior passes pinning the obvious bug
+classes (cursor-collision retry on every shared-`self.conn` reader,
+`_LIVE_ONLY_CLAUSE` everywhere a backtest row could leak, ml/llm column
+separation pinned by `test_score_pending`, recap/quote-widget pre-floor
+on both ML and Sonnet paths) that a careful read of the critical files
+found nothing worth committing. Faking a "code-tidy" commit to inflate
+the counter would be the exact debt-creating noise the analyst persona
+complains about.
+
+**Phase 2 (feature) — committed in `e75c401`:**
+
+`urgent_score_distribution(hours=24)` — the missing CALIBRATION-AXIS
+sibling to `urgency_label_split`. That existing metric reports the
+LLM-vetted FRACTION (by source-tag); this one reports HOW HIGH urgent
+scores are bucketed [0,5) / [5,7) / [7,8) / [8,9) / [9,10] with the
+per-bucket score_source split. Answers an analyst question NO existing
+surface answers: are urgency calls clustered at the 8.0 threshold
+(borderline / over-confident urgency head) or skewed toward 9-10
+(strong calls)?
+
+The score the histogram buckets is the SAME unified score
+`COALESCE(NULLIF(ai_score,0), ml_score, 0)` that `get_unalerted_urgent`
+and `get_top_for_briefing`'s ORDER BY use — so the histogram aligns with
+the score the alerter / briefing reader actually saw. Anti-bug: an
+ml-only urgent row (ai_score=0, ml_score=9.5) buckets by ml_score; an
+ai-scored row buckets by ai_score regardless of any prior ml_score
+value (test_ai_score_preferred_over_ml_score).
+
+Verdict ladder (most-severe-first, same discipline as
+`briefing_health` / `label_production_rate`):
+
+* `NO_DATA` — no urgent rows in the window. Distinct from
+  BORDERLINE_HEAVY: an empty window is NOT a calibration failure.
+* `BORDERLINE_HEAVY` — `borderline_fraction > 0.7` (over 70% of urgent
+  calls at the 8.0 threshold; the "over-confident urgency head firing
+  every borderline call" failure mode).
+* `MIXED` — `borderline_fraction > 0.4` (40-70% — warning regime).
+* `WELL_CALIBRATED` — everything else.
+
+**Live verification (24h window, real articles.db at the moment of the
+pass):**
+```
+total=59, buckets[8,9)={llm:8, ml:8}, buckets[9,10]={llm:9, ml:33}
+borderline_fraction=0.2712, strong_fraction=0.7119 → WELL_CALIBRATED
+```
+
+Surface verdict is fine, but the slice unmasked a real finding the
+aggregate `urgency_label_split` cannot: the ML-only fraction is
+**concentrated in the STRONG bucket (79% ML-only in [9,10] vs 50% in
+[8,9))**. So the urgency head is producing high-confidence (9+) urgent
+calls that aren't being LLM-verified — not borderline noise but the
+top-confidence tier. This is exactly the "ML head over-scores
+forum/wiki/social rows" failure mode CLAUDE.md repeatedly references,
+now quantified at the score-magnitude axis.
+
+Also surfaced: **1 row at score < 5 with urgency=1** — the existence
+proof of the documented `di-stale-urgent-reaper-oscillation`
+issue (a 12-day-old urgency=1 row whose ai_score was the LLM original
+but whose unified-score is now bucketed by ml_score < 5).
+
+**Files changed:**
+* `storage/article_store.py` — new `@_retry_on_lock`-decorated method
+  right after `label_production_rate` (its score-magnitude sibling).
+  Same four-bucket discipline for the per-bucket source split
+  (`llm`/`ml`/`briefing_boost`/`null`) so a downstream renderer can
+  iterate the existing keyset.
+* `tests/test_urgent_score_distribution.py` — 16 focused tests pinning:
+  empty-DB NO_DATA verdict, the 8.0/9.0/10.0 bucket boundaries (10
+  inclusive at the right edge), the COALESCE precedence (ai_score wins
+  over ml_score; ml-only rows still bucket by ml_score), the four
+  verdict branches, the per-bucket score_source split, the load-bearing
+  `_LIVE_ONLY_CLAUSE` invariant (backtest/opus rows excluded), the
+  window boundary, and `hours<=0` clamping.
+
+**Phase 3 (live user-analyst observations):**
+
+1. **System is healthy overall.** Latest article 0min ago; 59 urgent
+   rows in 24h; ~46min since last Opus briefing (7 briefings in 48h is
+   80% of 5h-cadence expected — `briefing_cadence_trend` would read
+   `SLIPPING` but `briefing_health` would read `HEALTHY`; both surfaces
+   already carry this exactly correctly).
+
+2. **Quantified the ML-only failure mode.** Aggregate
+   `urgency_label_split` showed 23 LLM vs 43 ML in 24h
+   (~35% LLM-vetted); `urgent_score_distribution` revealed the ML-only
+   share is heavily concentrated in [9,10] (33 of 42 = 79% ML-only)
+   rather than uniformly distributed. The analyst-action ("Sonnet/recursive
+   labeller need to prioritise high-score ml-only rows for verification")
+   is now grounded by a number.
+
+3. **Stale-urgent backlog confirmed (20 rows, 284h+ old, urgency=1).**
+   The `di-stale-urgent-reaper-oscillation` memory note describes the
+   exact mechanism; the urgent_score_distribution NO_DATA-distinct
+   bucket [0,5) caught one such row directly. Not fixing on this pass —
+   it's a separate structural issue affecting reap_stale_urgent ↔
+   urgency_scorer interaction, and the memory note marks it as
+   tracked.
+
+4. **The chronic dark-collector pattern persists** (also documented in
+   memory: `di-chronic-dark-collectors`). Outside the scope of this
+   feature pass; the existing `source_freshness` already surfaces it.
+
+**Staging:** explicit per-file pathspec —
+`storage/article_store.py`, `tests/test_urgent_score_distribution.py`.
+NEVER `git add -A`: at start of the pass `dashboard/web_server.py` had
+been touched by a concurrent agent and untracked files
+(`analytics/urgent_event_saturation.py`,
+`tests/test_urgent_event_saturation.py`) belong to a sibling HYBRID
+agent; a whole-tree add would have swept them into MY commit
+(the `pt-concurrent-samerole-staging-race` memory note in action).
+AGENTS.md addendum committed separately afterwards (matches the prior
+pass cadence).
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=4.
+
+---
+
 ## 2026-05-25 hybrid pass #38 (Agent 3) — label_production_rate (per-minute LLM throughput verdict)
 
 Debugger + feature-dev + news-analyst pass. 0 bugs found (the four
