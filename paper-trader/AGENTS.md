@@ -6,6 +6,237 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-24 ML+backtest HYBRID pass #36 (Agent 2) — `_append_gate_pnl_skill_log` per-cycle gate economic-counterfactual ledger
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Audited `paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py`, `run_continuous_backtests.py` (the three
+ML+backtest core files) end-to-end. The code is **extraordinarily
+defended** — every `_to_float` callsite carries a comment tying its
+guard to a past incident, every `\b...=` regex pins its
+word-boundary discipline, every quantile-table consumer has a
+collapsed-array guard, every cache loader has a type guard + atomic
+writer, the per-cycle ledger wiring is bounded + best-effort by
+construction. Suspect spots I checked (the `_get_decision_scorer`
+double-checked-lock, the `_buy`/`_sell` cash/qty math, the
+`_compute_decision_outcomes` regime decode, the `train_scorer` SELL
+sign-flip + symmetric label clamp, the `_oos_rank_metrics`
+per-regime float-key lookup) all turned out to be already-correct
+with explanatory comments. Honest `bugs_fixed=0`. Per the Phase 1
+commit guard, no commit was made for Phase 1 (only AGENTS.md edits
+would have changed) — the AGENTS.md note is rolled into the
+Phase 2 commit.
+
+Concurrent agents observed at boot (4 sibling claude processes per
+`ps`: Agent 1 core, Agent 3 digital-intern, Agent 4 feature-dev,
+this one) — the documented `pt-concurrent-samerole-staging-race`
+pattern. Mitigated by explicit pathspec staging + separate test
+file (no shared `test_continuous.py` edit).
+
+### Phase 2 — Feature: `_append_gate_pnl_skill_log` per-cycle ledger
+
+`paper_trader/ml/gate_pnl.py::analyze` already CLI-reports the single
+quant-decisive question every existing gate diagnostic structurally
+*cannot* answer: *aggregated across all five conviction-gate arms
+(×0.6 / ×0.85 / ×1.0 / ×1.15 / ×1.3) and weighted by how often each
+fires, does the multiplier overlay net **ADD** or **SUBTRACT**
+realized return vs not gating at all?*
+
+`gate_audit` reports the strong-tailwind-minus-headwind spread —
+**deliberately ignoring** both the three middle arms AND the arm-
+frequency mix (a gate can read `GATE_EFFECTIVE` on the spread while
+the *summed* effect is negative if the populous middle arms shrink
+toward the winners). `gate_arm_historical` reports per-arm means
+bucketed by the gate's **TRUE then-deployed prediction** but still
+does not roll up to one economic number. `gate_pnl` rolls all five
+arms into the assumption-free `Σmᵢrᵢ/Σmᵢ − mean(rᵢ)` — the
+keep-or-kill signal a quant deciding whether to remove the gate
+actually asks.
+
+Until this wiring landed the verdict was **CLI-only** with no
+durable per-cycle trend — exactly the same operator-blind state
+`_append_gate_arm_skill_log` closed for the arms breakdown.
+
+The new `_append_gate_pnl_skill_log(cycle, win_start, win_end, …)`
+follows the **exact** sibling-ledger pattern:
+
+- **SSOT cross-check** — reuses `gate_pnl.analyze` verbatim so the
+  persisted verdict / contribution equal the read-only CLI's by
+  construction (a built-in no-drift cross-check).
+- **OOS slice by default** — uses `validation.split_outcomes_temporal`
+  (the trustworthy, generalization-relevant view every sibling
+  ledger uses).
+- **Best-effort discipline** — every fault swallowed (a ledger
+  write must NEVER break the continuous loop). An analyzer crash,
+  non-dict return, missing outcomes file, or sub-`MIN_TOTAL=30`
+  slice all degrade to an honest
+  `status='error' verdict='INSUFFICIENT_DATA'` row.
+- **`gate_pnl_dark` boolean** — mirrors sibling `pipeline_dark` /
+  `calibrated_dark` / `sizing_dark` / `stop_dark` / `tp_dark` /
+  `gate_dark` / `signal_dark` flags. True when zero usable
+  `(pred, realized)` pairs roll up.
+- **Flat top-line fields** — `equal_weight_gate_contribution_pp`
+  (the verdict-driving headline), `sized_gate_contribution_pp`
+  (the secondary, reconstruction-approximate number — reported
+  but never folded into the verdict, the `gate_pnl` honesty
+  pattern), `gate_off_mean_pct`, `gate_on_mean_pct`,
+  `avg_gate_multiplier`, `sized_n`, `slice`,
+  `n_records_considered`, `n_train`.
+- **Atomic bounded trim** — `GATE_PNL_SKILL_LOG_KEEP=2000` rows,
+  tmp + `.replace` when the file exceeds 2× the cap. Torn truncate
+  cannot lose history.
+
+Wired into `main()` immediately **after** `_append_gate_arm_skill_log`
+(the sibling per-arm view) and **before** `_append_persona_skill_log`,
+so every cycle's loop body now emits both the per-arm and the
+roll-up rows. A new test file
+`tests/test_continuous_gate_pnl_ledger.py` (separate from
+`test_continuous.py` / `test_continuous_gate_arm_ledger.py` to
+mitigate the documented same-role HYBRID staging-race pattern)
+pins:
+
+- All 4 verdict-ladder branches round-trip exactly
+  (INSUFFICIENT_DATA / GATE_ADDS_RETURN / GATE_SUBTRACTS_RETURN /
+  GATE_RETURN_NEUTRAL), including sign preservation of the
+  equal-weight contribution.
+- Analyzer-exception ⇒ honest error row; non-dict return ⇒ honest
+  INSUFFICIENT.
+- Bounded trim at 2× cap; first-write parent-dir creation;
+  unwritable-parent degrade-to-False; `outcomes_path=None`
+  resolves to `ROOT/data/decision_outcomes.jsonl`.
+- Source-level wiring regression: `main()` MUST call
+  `_append_gate_pnl_skill_log(` somewhere; module-level constants
+  (the testability rule).
+- Analyzer-side contract: `gate_pnl_report([])` returns the full
+  key surface the ledger reads; `MIN_TOTAL=30` floor preserved so
+  `gate_pnl_dark` stays semantically meaningful.
+
+14/14 pass in 1.42s; 210/210 continuous+gate_pnl regression
+tests pass in 26s; zero regressions.
+
+### Phase 3 — Live quant findings (user_findings = 6)
+
+Ran the new analyzer against the live corpus and inspected the
+running continuous loop (pid 57023, started 16:18 UTC):
+
+1. **Live `gate_pnl` verdict: `GATE_RETURN_NEUTRAL`** —
+   equal-weight contribution **+0.11pp** on 1683 OOS pairs (within
+   ±1.0pp band). `gate_off_mean=+0.44%`, `gate_on_mean=+0.55%`,
+   `avg_gate_multiplier=1.0147`. The conviction-gate multiplier
+   overlay is **pure sizing variance** on the current OOS slice —
+   not gating would have realized statistically indistinguishable
+   returns. Consistent with the long-documented `GATE_INEFFECTIVE`
+   per-arm reading (×1.30 +3.99% vs ×0.60 +4.12%, spread -0.13pp):
+   scorer ranks but bucket-weighted aggregate barely moves.
+2. **`data/gate_pnl_skill_log.jsonl` does NOT exist yet** — the
+   running continuous loop holds the OLD code (process started
+   before commit). New wiring takes effect on next process restart
+   (git-watcher's deferred-restart machinery will pick this up
+   between cycles per the documented 180s poll + 600s deadman).
+   Confirmed the analyzer + ledger work correctly via direct
+   invocation; first persisted row will appear on the next cycle
+   after restart.
+3. **OOS SELL rank-IC turned NEGATIVE in latest cycle (-0.06)**
+   while BUY remained positive (+0.12). For SELL decisions the
+   scorer's predictions slightly anti-rank realized outcomes. The
+   BUY-only conviction gate doesn't act on SELL so no immediate
+   harm, but the asymmetry is worth trending — already captured
+   by the existing `scorer_skill_log`'s `oos_sell_ic` column.
+4. **MLP barely beats baselines but verdict reads NO_BETTER**
+   across last 3 cycles: cycle 3 `mlp_rank_ic=0.0748` vs
+   `news_count` baseline `0.0405`, `ic_gap=+0.0343`. The MLP DOES
+   beat the best baseline by 0.034 IC — yet `baseline_compare`
+   still emits `MLP_NO_BETTER_THAN_TRIVIAL` across all 3 cycles.
+   Possible verdict-threshold calibration tension in
+   `baseline_compare`'s tolerance band — worth a separate
+   close-read pass.
+5. **`regime_bear_n=2` in OOS, with `regime_bear_ic=1.0`** —
+   meaningless IC on n=2. The continuous loop's `_pick_window`
+   ranges 1993→present and the SPY 50/200 regime decode produces
+   very few bear-regime decisions across the persona-driven runs
+   (most overlaps land bull/sideways). The per-regime ledger
+   column is structurally noisy for `bear` — a downstream
+   consumer must require `regime_bear_n >= 30` (or similar) to
+   trust the value.
+6. **GDELT pre-2015 windows: connection storm + permanent-empty
+   cache** — visible in `continuous.log` as a flood of
+   `[gdelt] rate-limited` (3× retry, ~60s sleep) followed by
+   `[gdelt] permanent: ... outside GDELT coverage — cached empty,
+   no retry`. GDELT only covers 2015+, but `_pick_window` picks
+   back to 1993 (`EARLIEST_WINDOW_START`). The empty-cache
+   short-circuit works once written, but each *new* (date,
+   keyword) combination pays the 60s tax. Could be fixed by
+   gating the GDELT call on `sim_date >= 2015-01-01` in
+   `GDELTFetcher`. Not in scope for this ML+backtest pass
+   (collector-side concern) — flagged for a future surgical pass.
+
+### Phase 4 — Counters
+
+`bugs_fixed = 0 · features_added = 1 · user_findings = 6`
+
+```bash
+# Run the new pinning + wiring tests (1.4s):
+python3 -m pytest tests/test_continuous_gate_pnl_ledger.py -v
+
+# Run all continuous + gate_pnl regression (26s):
+python3 -m pytest tests/ -k "continuous or gate_pnl" -q
+
+# Sanity check the analyzer against the live corpus:
+python3 -m paper_trader.ml.gate_pnl
+```
+
+### Files touched
+
+- `run_continuous_backtests.py` (+182 — `GATE_PNL_SKILL_LOG`
+  constant + `_append_gate_pnl_skill_log` helper + `main()` wiring)
+- `tests/test_continuous_gate_pnl_ledger.py` (NEW, +463 — 14 cases)
+
+Total: 645 inserts, 0 deletes. Single commit `088ade2`.
+
+### Refresher — how the per-cycle ledger family works
+
+Every cycle of `run_continuous_backtests.py::main` writes one
+structured row to a sibling JSONL ledger in `data/`:
+
+| Ledger | Answers | Verdict ladder |
+|--------|---------|----------------|
+| `scorer_skill_log.jsonl` | OOS RMSE / dir_acc / rank_IC (per-action + per-regime) | `scorer ok / scorer err` |
+| `baseline_skill_log.jsonl` | Does the MLP beat a one-line `ml_score` rule? | `MLP_DOMINATES` / `MLP_NO_BETTER_THAN_TRIVIAL` / `MLP_WORSE_THAN_TRIVIAL` |
+| `calibrated_reliability_log.jsonl` | Does `predict_calibrated()` deliver honest 5d magnitudes? | `CALIBRATED_RELIABLE` / `CALIBRATED_BIASED` / `INSUFFICIENT_DATA` |
+| `conviction_calibration_log.jsonl` | Does higher conviction predict higher realized return? | `CALIBRATED` / `MISCALIBRATED` |
+| `stop_out_skill_log.jsonl` | Does the −8% stop save more than it forfeits? | `STOP_HELPS` / `STOP_HURTS` / `STOP_NEUTRAL` |
+| `mfe_skill_log.jsonl` | Does the +15% take-profit capture more than it forfeits? | `TP_HELPS` / `TP_HURTS` / `TP_NEUTRAL` |
+| `gate_arm_skill_log.jsonl` | Do the five gate arms (×0.6..×1.3) realize differentiated returns? | `GATE_EFFECTIVE` / `GATE_INEFFECTIVE` / `GATE_HARMFUL` |
+| **`gate_pnl_skill_log.jsonl`** *(NEW pass #36)* | **Does the gate net ADD or SUBTRACT realized return when rolled up across all arms?** | **`GATE_ADDS_RETURN` / `GATE_RETURN_NEUTRAL` / `GATE_SUBTRACTS_RETURN`** |
+| `persona_skill_log.jsonl` | Per-persona decision-signal rank skill | `HAS_INVERTED_PERSONA` flag |
+| `llm_annotation_skill_log.jsonl` | Are LLM ENDORSE/CONDEMN labels predictive of realized return? | `pipeline_dark` flag + IC |
+| `dead_feature_audit_log.jsonl` | Are any input slots dead-trained on constant zero? | `OK` / `HAS_DEAD` / `NOT_TRAINED` |
+
+Every ledger carries a `*_dark` boolean (`gate_pnl_dark` *(NEW)*,
+`gate_dark`, `stop_dark`, `tp_dark`, `sizing_dark`,
+`calibrated_dark`, `pipeline_dark`, `signal_dark`) — True when the
+analyzer had no usable rollup data this cycle. A *gap* in the
+trend is always visible, never silent — the "honest gap rows"
+discipline every sibling ledger follows.
+
+### Test commands for the ML/backtest domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Focused ML/backtest slice (~30s under low load):
+python3 -m pytest tests/ -k "ml or backtest or scorer" -q
+
+# Per-cycle ledger slice (~26s):
+python3 -m pytest tests/ -k "continuous or ledger" -q
+
+# Full slice (~25 min under load — use only at end of pass):
+python3 -m pytest tests/ -q
+```
+
+---
+
 ## 2026-05-24 core HYBRID pass #9 (Agent 1) — hard SL/TP test coverage + `/api/hard-exit-summary`
 
 ### Phase 1 — Test: bugs_fixed = 0 (test coverage for newly-landed feature)
@@ -26313,3 +26544,53 @@ then re-applied only this agent's two new route additions. `git diff
 files were staged: the two new analytics modules, their two new test
 files, this AGENTS.md update, and the dashboard.py endpoint wiring
 (clean +59-line diff, only this agent's two routes).
+
+## 2026-05-24 Agent 4 (feature-dev) — `/api/portfolio-beta`
+
+**What:** richer market-model panel that complements the two bare scalars
+`/api/analytics` already publishes (`sp500_beta`, `sp500_correlation`).
+This endpoint computes the full regression story: β, daily and annualised
+α (the part of the book's return *not* explained by SPY), R² (how much of
+the variance SPY actually explains), SE(β) (so a 1.4 β with a 0.6 SE is
+not a number to hedge against), and a rolling-30d β vs all-time β
+**regime-shift probe** that flags structural re-rating the bare scalar
+would smooth over.
+
+**Why this gap:** AGENTS architecture map already flagged "✗ Beta/alpha
+per position not tracked live (only vs backtest baseline)" and the
+`/api/analytics` scalars cannot answer:
+
+* "Is there desk alpha beyond passive beta?" → needs the regression
+  intercept, which the existing endpoint never computes.
+* "How much should I trust this β?" → needs SE.
+* "Has the book re-rated this week?" → needs rolling vs all-time.
+
+**Files:**
+* `paper_trader/analytics/portfolio_beta.py` — pure builder
+  `build_portfolio_beta(equity_curve, now=None, rolling_window=30)`.
+  Population variance + identical paired-day walk to `analytics_api`'s 4d
+  block, so the rounded β here matches `/api/analytics` exactly on the
+  same input (SSOT — locked by `TestSSOTParityWithAnalyticsAPI`).
+  Honesty-gated (NO_DATA / INSUFFICIENT / OK) like `build_tail_risk` /
+  `build_correlation` — verdict withheld below MIN_RETURNS=20 paired
+  observations. CLI parity with `drawdown` / `benchmark` (read-only,
+  `?mode=ro`).
+* `paper_trader/dashboard.py` — `/api/portfolio-beta` route mirrors the
+  `/api/tail-risk` shape exactly; advisory only, never injected into the
+  decision prompt (CLAUDE.md invariants #2 / #12).
+* `tests/test_portfolio_beta.py` — 15 tests. Hand-computed fixture
+  `r_p = 2 × r_s` pins β=2.00, R²=1.00, α=0.00, SE=0.00 exactly. Separate
+  fixture for the anti-correlated case (β=-1.0). Regime-shift test
+  switches β=0.5 → β=2.0 mid-series to verify the rolling-30d probe
+  fires. Honesty-gate branches all pinned. Flask `test_client` smoke
+  locks the endpoint contract (matches the analytics-verification memory:
+  module `__main__` smoke hits an empty `data/` DB; the live endpoint
+  contract must be verified via test_client).
+
+**Tests:** 15 new (test_portfolio_beta) + sanity-rerun of the 39 adjacent
+analytics tests (`test_tail_risk` + `test_drawdown` + `test_core_analytics`)
+all green.
+
+**Staging:** explicit per-file pathspec — `paper_trader/analytics/
+portfolio_beta.py`, `paper_trader/dashboard.py`, `tests/test_portfolio_beta.py`,
+this AGENTS.md update. No `git add -A` (concurrent-agent footgun memory).
