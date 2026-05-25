@@ -932,12 +932,18 @@ def _cycle():
                      - _no_decision_first_ts).total_seconds()
                 )
             _consecutive_no_decisions = 0
-            _no_decision_first_ts = None  # re-arm: next outage starts fresh
             # Engine produced a real decision (HOLD, FILLED, BLOCKED) — clear
             # the breaker latch so a fresh wedge tomorrow re-alerts the
             # operator. Symmetric with the quota latch's recovery path
             # (re-arm only on confirmed responsiveness, never on an in-
-            # flight retry).
+            # flight retry). The ``_no_decision_first_ts`` anchor is held
+            # armed until the send confirms — otherwise a transient
+            # openclaw failure here loses the duration token forever (the
+            # next cycle's retry would render the bare "responding again"
+            # body with no "after ~Xh dark" close on the FIRED→CLEARED
+            # bracket). When NO latch is held (sub-threshold wedge that
+            # never alarmed), reset the anchor unconditionally so the next
+            # outage starts its own clock fresh.
             if _breaker_alert_active:
                 ok = False
                 try:
@@ -948,6 +954,9 @@ def _cycle():
                     print(f"[runner] breaker recovery notice failed: {e}")
                 if ok:
                     _breaker_alert_active = False
+                    _no_decision_first_ts = None  # re-arm only on confirmed send
+            else:
+                _no_decision_first_ts = None  # no latch — anchor not needed for retry
         # Quota recovered → tell the operator once, then re-arm the alarm so a
         # *future* outage alerts again. Only confirm on an actual claude
         # response (status != NO_DECISION); a non-quota timeout is not proof
