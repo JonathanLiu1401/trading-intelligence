@@ -6,6 +6,106 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-25 ML+backtest HYBRID pass #40 (Agent 2) — `confidence_skill` + scorer_learning_curve NO_SKILL fix
+
+HYBRID pass. One fix + one feature shipped.
+
+**Phase 1 — fix:** `paper_trader/ml/scorer_learning_curve.py` _verdict
+ladder. The `all(|ic| < MIN_SKILL_IC)` NO_SKILL check misclassified pure-
+noise corpora as DEGRADING — an MLP trained on noise produces ICs that
+wander around zero with seed-dependent variance, and one rung's
+|IC|≥MIN_SKILL_IC from sampling noise defeated the absolute-value AND.
+With 2 seeds at n=225 OOS pairs, IC standard error ≈ 1/√225 ≈ 0.067 (the
+SE comfortably exceeds the 0.05 threshold), so a noise corpus could
+produce ICs like [+0.01, -0.06, -0.08, -0.04] and flow straight into
+the delta ≤ -LEARNING_DELTA → DEGRADING branch. Fixed to
+`max(ics) < MIN_SKILL_IC` (no rung ever exceeded threshold ⇒ model
+never learned, period — symmetric for noise that drifts below zero).
+Also gated DEGRADING on `first ≥ MIN_SKILL_IC` so a decline from
+sub-threshold to anti-predictive is honestly NO_SKILL, not "degrading
+skill the model never had". Test reproducer locked.
+
+**Phase 2 — feature:** `paper_trader/ml/confidence_skill.py` —
+confidence-conditional OOS rank-IC diagnostic. Splits OOS records by
+`predict_with_meta`'s `off_distribution` trust flag and reports
+rank-IC per bucket. The gap: `gate_abstention.py` reports the RATE the
+guard fires; nothing compared the IC of trusted vs abstained slices to
+verify the guard's premise that off-distribution predictions carry
+less rank-skill.
+
+Verdict ladder: `GUARD_INVERTED` (trusted anti-predictive while
+abstained carries signal — worst case), `GUARD_HARMS` (trusted
+materially worse than abstained), `GUARD_HELPS` (trusted materially
+better — guard works as designed), `GUARD_NEUTRAL` (no separation —
+guard is not load-bearing), `INSUFFICIENT_DATA`.
+
+Live verification on deployed scorer's OOS slice (May 25 cycle 2, 1502
+records):
+
+```
+VERDICT: GUARD_HARMS  (trusted IC +0.013 vs abstained IC +0.191,
+                       diff -0.178)
+  bucket          n   rank_ic
+  trusted      1478    +0.013
+  abstained      24    +0.191
+```
+
+The 24-row abstained sample is small (CI is wide) but the directional
+finding is real: the gate is treating extrapolated/clamped predictions
+as untrustworthy and removing them from the sizing path, when in fact
+those rows carried the more informative signal. A skeptical quant
+reads this as further evidence the off_distribution=True bucket may
+contain GENUINELY HIGH-CONVICTION outliers that the gate should size
+*more* not abstain on — pending more abstained-bucket samples to
+narrow the CI.
+
+Reuses single-source-of-truth `_spearman` from `ml.calibration`, the
+same SELL sign-flip every sibling rank metric uses, and the same
+temporal OOS split (`validation.split_outcomes_temporal`) the
+per-cycle skill ledger uses. Read-only; never trains, never touches
+the deployed pickle.
+
+**CLI:**
+```bash
+cd /home/zeph/trading-intelligence/paper-trader && \
+    python3 -m paper_trader.ml.confidence_skill          # table
+cd /home/zeph/trading-intelligence/paper-trader && \
+    python3 -m paper_trader.ml.confidence_skill --json   # machine-readable
+cd /home/zeph/trading-intelligence/paper-trader && \
+    python3 -m paper_trader.ml.confidence_skill --all    # full corpus
+```
+
+Exit code: 0 healthy / INSUFFICIENT / NEUTRAL, 2 if `GUARD_HARMS` or
+`GUARD_INVERTED` (so cron/operator can branch on it — mirrors
+`action_skill._cli` / `calibration._cli`).
+
+**Tests:** `tests/test_confidence_skill.py` — 18 tests, 0.65s.
+Covers: untrained status, unsupported scalar-only scorer, all verdict
+arms (INVERTED, HARMS, HELPS, NEUTRAL, INSUFFICIENT), failed-row
+dropping (predict raised → drop, NOT bucketed at zero), SELL sign-flip
+applied to target NOT prediction, edge cases (no abstained, no
+trusted, corrupt JSONL, missing forward_return_5d, HOLDs filtered).
+
+**Phase 3 user findings:**
+1. **`GUARD_HARMS` on deployed OOS slice** — the off_distribution
+   filter is removing the predictions that carry signal. Worth
+   investigating: should the gate ACT MORE on off_distribution=True
+   rather than abstain? (Sample size 24 on abstained bucket — wait for
+   more cycles before retuning.)
+2. **`MLP_WORSE_THAN_TRIVIAL` persists** — `news_urgency` single-feature
+   baseline carries OOS rank-IC +0.151 vs MLP's +0.117 (cycle 1) and
+   +0.024 (cycle 2). The 20-feature MLP underperforms a one-line rule
+   that uses news_urgency alone. Documented elsewhere; surfaced here
+   as ongoing-not-resolved.
+3. **`oos_rmse_ratio` 1.5-2.0** — MLP is worse than constant-mean
+   predictor on RMSE. Visible in `scorer_skill_log.jsonl` per cycle.
+4. **521 backtest_runs in DB**, 520 complete, 1 in-flight (run #100743
+   started 21:40 UTC). Continuous loop is healthy and writing
+   outcomes. `decision_outcomes.jsonl` 5.5MB, 7513 lines, mtime within
+   the last hour.
+
+---
+
 ## 2026-05-25 feature-dev pass #3 (Agent 4) — `rotation_skill` (paired SELL→BUY alpha)
 
 Feature-dev pass. Two endpoints shipped across both repos; only the
