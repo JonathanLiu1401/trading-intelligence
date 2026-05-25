@@ -1744,6 +1744,145 @@ class ArticleStore:
         }
 
     @_retry_on_lock
+    def urgent_score_distribution(self, hours: int = 24) -> dict:
+        """Score-magnitude histogram of urgent rows over the recent window —
+        the missing CALIBRATION-AXIS sibling to ``urgency_label_split``.
+
+        ``urgency_label_split`` reports the LLM-vetted fraction (which source-
+        tagged the urgency). ``urgent_score_distribution`` reports HOW HIGH
+        those scores are: a flood at the 8.0 threshold means urgency calls are
+        clustered at the boundary (liberal threshold use, low-confidence
+        urgent), while a healthy distribution skews toward 9-10 (strong calls).
+        Live evidence (2026-05-25, articles.db 24h pull): of 66 urgency=2 rows
+        the score distribution is the analyst's only way to tell whether
+        Sonnet/ML are scoring genuine 9-10 events or borderline 8.0 calls; the
+        existing sliced-by-source metrics are silent on the magnitude axis.
+        A persistent 8.0 spike under high ml-only fraction is the same
+        "over-confident urgency head firing every borderline call" failure
+        mode this CLAUDE.md repeatedly traces to recap-template / forum noise.
+
+        Buckets the unified score (``COALESCE(NULLIF(ai_score,0), ml_score, 0)``
+        — same convention as ``get_unalerted_urgent`` and
+        ``get_top_for_briefing``'s ordering, so the histogram aligns with the
+        score the alerter / briefing reader actually saw) into the five
+        analyst-meaningful ranges:
+
+          * ``[0, 5)``     — sub-threshold; should be empty by construction
+                              (the urgency head only fires at >= 8.0). A
+                              non-zero count here is a load-bearing-invariant
+                              violation; surfaced explicitly so a regression
+                              becomes visible.
+          * ``[5, 7)``     — sub-urgent prose-quality; same caveat as above.
+          * ``[7, 8)``     — sub-threshold borderline; should also be empty.
+          * ``[8, 9)``     — borderline urgent (the Sonnet `>= URGENT_THRESHOLD`
+                              boundary; the ML urgency head's `>= 8.0`).
+          * ``[9, 10]``    — strong urgent.
+
+        Returned per-bucket entries carry both the bucket boundaries and the
+        score_source split inside the bucket (so the analyst can see "of the
+        87 borderline-8 rows, 80 are ML-only and only 7 are LLM-vetted" — the
+        most diagnostic single view of the unverified-rate problem). Aggregate
+        ``borderline_fraction`` (rows in `[8, 9)` / total) gives a single
+        scalar verdict the dashboard can render.
+
+        Verdict ladder (mirrors briefing_health / label_production_rate
+        most-severe-first conservative discipline):
+
+          * ``NO_DATA``        — no urgent rows in the window. Distinct from
+                                 BORDERLINE_HEAVY: the analyst should not
+                                 interpret an empty window as a calibration
+                                 failure.
+          * ``BORDERLINE_HEAVY`` — `borderline_fraction > 0.7` (most urgent
+                                   calls are at the threshold; the urgency
+                                   classifier is liberal — the "many 8.0
+                                   urgent" failure mode).
+          * ``MIXED``          — `borderline_fraction > 0.4` (40-70% at the
+                                 threshold; warning regime).
+          * ``WELL_CALIBRATED`` — everything else (most urgent calls are
+                                  comfortably above the threshold).
+
+        Read-only (single SELECT) with ``_LIVE_ONLY_CLAUSE`` so synthetic
+        backtest/opus rows never inflate either side. Decorated with
+        ``@_retry_on_lock`` for the documented shared-connection cursor-
+        collision class. NO DB write — no ai_score / ml_score / score_source /
+        urgency mutation. All four load-bearing invariants intact by
+        construction.
+
+        Returns::
+
+            {
+              "window_h":             int,
+              "total":                int,
+              "buckets": [ {lo, hi, count, by_source: {llm, ml, briefing_boost, null}}, ... ],
+              "borderline_fraction":  float,   # bucket [8,9) / total
+              "strong_fraction":      float,   # bucket [9,10] / total
+              "verdict":              "WELL_CALIBRATED" | "MIXED" | "BORDERLINE_HEAVY" | "NO_DATA",
+            }
+        """
+        hours = max(int(hours), 1)
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        rows = self.conn.execute(
+            "SELECT COALESCE(NULLIF(ai_score, 0), ml_score, 0) AS score, "
+            "score_source "
+            "FROM articles "
+            f"WHERE urgency>=1 AND first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+            (since,),
+        ).fetchall()
+
+        # Five bucket boundaries (lo inclusive, hi exclusive except the last
+        # which is inclusive at 10 — clamp on ai_score is [0, 10]).
+        bucket_defs = (
+            (0.0, 5.0), (5.0, 7.0), (7.0, 8.0), (8.0, 9.0), (9.0, 10.0),
+        )
+        buckets: list[dict] = []
+        for lo, hi in bucket_defs:
+            buckets.append({
+                "lo": lo, "hi": hi, "count": 0,
+                "by_source": {"llm": 0, "ml": 0,
+                              "briefing_boost": 0, "null": 0},
+            })
+
+        for score, src_tag in rows:
+            s = float(score or 0.0)
+            # Locate bucket — the final bucket includes 10.0 (inclusive hi).
+            for idx, (lo, hi) in enumerate(bucket_defs):
+                last = (idx == len(bucket_defs) - 1)
+                if s >= lo and (s < hi if not last else s <= hi):
+                    bucket = buckets[idx]
+                    bucket["count"] += 1
+                    key = (src_tag if src_tag in ("llm", "ml", "briefing_boost")
+                           else "null")
+                    bucket["by_source"][key] += 1
+                    break
+
+        total = sum(b["count"] for b in buckets)
+        # Bucket index 3 is [8, 9); index 4 is [9, 10].
+        borderline = buckets[3]["count"]
+        strong = buckets[4]["count"]
+        borderline_fraction = round(borderline / total, 4) if total else 0.0
+        strong_fraction = round(strong / total, 4) if total else 0.0
+
+        if total == 0:
+            verdict = "NO_DATA"
+        elif borderline_fraction > 0.7:
+            verdict = "BORDERLINE_HEAVY"
+        elif borderline_fraction > 0.4:
+            verdict = "MIXED"
+        else:
+            verdict = "WELL_CALIBRATED"
+
+        return {
+            "window_h": int(hours),
+            "total": total,
+            "buckets": buckets,
+            "borderline_fraction": borderline_fraction,
+            "strong_fraction": strong_fraction,
+            "verdict": verdict,
+        }
+
+    @_retry_on_lock
     def urgency_label_split_by_source(
         self, hours: int = 24, top_n: int = 15
     ) -> dict:
