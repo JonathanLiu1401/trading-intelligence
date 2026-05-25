@@ -7056,6 +7056,92 @@ def persistent_watchlist_opportunity_api():
                         "state": "ERROR"}), 500
 
 
+@app.route("/api/off-watchlist-mentions")
+@swr_cached("off-watchlist-mentions", 60.0)
+def off_watchlist_mentions_api():
+    """Tickers the wire is talking about that are NOT on the watchlist —
+    universe-expansion radar (orthogonal to /api/watchlist-opportunities
+    which is bounded TO the watchlist). Reuses each article's `tickers`
+    field (signals._extract_tickers SSOT) so it never drifts from the
+    live trader's own extraction. One signals fetch; pure builder tallies
+    per ticker. Currently-held names are also excluded (a held off-watch
+    ADR is already position-tracked elsewhere). Advisory only — never
+    gates Opus, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.off_watchlist_mentions import build_off_watchlist_mentions
+        from .strategy import WATCHLIST as _WATCHLIST
+        from . import signals as _sig
+        store = get_store()
+        held = {str(p.get("ticker") or "").upper()
+                for p in store.open_positions() if (p.get("qty") or 0) > 0}
+        sigs = _sig.get_top_signals(n=300, hours=24, min_score=0.0)
+        out = build_off_watchlist_mentions(_WATCHLIST, held, sigs)
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e), "discoveries": []}), 500
+
+
+@app.route("/api/spy-valuation")
+@swr_cached("spy-valuation", 300.0)
+def spy_valuation_api():
+    """S&P 500 structural-valuation regime (Shiller CAPE / trailing P/E /
+    historical-mean ratio) — the macro backdrop nothing else surfaces.
+
+    digital-intern's market_valuation_collector writes a synthetic article
+    daily (source='market_valuation', url='internal://market_valuation/…')
+    with the latest readings; this endpoint parses the most recent one
+    out of articles.db and returns a discrete regime read
+    (EXTREME_OVERVALUED / EXPENSIVE / FAIR_VALUE / UNDERVALUED /
+    DEEPLY_UNDERVALUED). The article reaches Opus only when it happens to
+    win the briefing's top-N ranking; this surface guarantees the operator
+    can see it on demand. 5-minute SWR cache because the underlying value
+    moves daily at best.
+
+    Distinct from every neighbour: macro_calendar/event_calendar are
+    EVENT-centric (rate decisions, earnings); sector_pulse/sector_exposure
+    describe the BOOK; this is the structural starting point — "what
+    regime am I trading INTO?". Advisory only — never gates Opus, adds
+    no caps (AGENTS.md #2/#12)."""
+    try:
+        import sqlite3
+        from .analytics.spy_valuation import build_spy_valuation
+        from . import signals as _sig
+        path = _sig._db_path()
+        article = None
+        if path.exists():
+            try:
+                # 15s busy_timeout — matches signals.py convention; under
+                # heavy digital-intern WAL-checkpoint contention this query
+                # has been observed taking up to ~25s. The endpoint's
+                # 300s SWR cache absorbs the slow first fetch; subsequent
+                # hits are sub-ms.
+                conn = sqlite3.connect(f"file:{path}?mode=ro",
+                                        uri=True, timeout=15)
+                try:
+                    row = conn.execute(
+                        "SELECT title, url, first_seen, published "
+                        "FROM articles WHERE source='market_valuation' "
+                        "ORDER BY first_seen DESC LIMIT 1"
+                    ).fetchone()
+                    if row:
+                        article = {
+                            "title": row[0],
+                            "url": row[1],
+                            "first_seen": row[2],
+                            "published": row[3],
+                        }
+                finally:
+                    conn.close()
+            except sqlite3.Error as e:
+                # Match the signals.py degrade-soft pattern — a locked or
+                # missing news DB returns NO_DATA, never aborts a render.
+                print(f"[spy_valuation] news DB read failed: {e}")
+        return jsonify(build_spy_valuation(article))
+    except Exception as e:
+        return jsonify({"error": str(e), "state": "ERROR",
+                        "regime": None}), 500
+
+
 @app.route("/api/state")
 @swr_cached("state", 15.0)
 def state():
