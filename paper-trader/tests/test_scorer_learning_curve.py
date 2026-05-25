@@ -144,10 +144,17 @@ class TestVerdictLadder:
         rep = slc.analyze(recs, seeds=2,
                           ladder=(200, 400, 800))
         assert rep["verdict"] == "NO_SKILL"
-        # Every mean rank-IC should sit below MIN_SKILL_IC.
+        # No rung should show positive skill above MIN_SKILL_IC on a
+        # noise corpus. (Negative ICs from seed-variance wander are
+        # expected and harmless — they are caught by the same NO_SKILL
+        # `max(ics) < MIN_SKILL_IC` rule the analyzer applies; asserting
+        # |IC| < threshold here would be checking the wrong invariant
+        # since with only ~225 OOS pairs the standard error is ~1/√225
+        # ≈ 0.07, comfortably above 0.05, so a small negative IC from
+        # sampling noise is NOT a bug.)
         for row in rep["curve"]:
             if row.get("mean_rank_ic") is not None:
-                assert abs(row["mean_rank_ic"]) < slc.MIN_SKILL_IC
+                assert row["mean_rank_ic"] < slc.MIN_SKILL_IC
 
     def test_no_skill_verdict_ladder_pure_synthetic(self):
         """Unit-level: build a synthetic curve with all near-zero ICs

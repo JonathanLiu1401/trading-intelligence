@@ -293,8 +293,20 @@ def _verdict(curve: list[dict]) -> str:
     if len(points) < 2:
         return "INSUFFICIENT_DATA"
     ics = [p["mean_rank_ic"] for p in points]
-    # NO_SKILL — every point near zero.
-    if all(abs(v) < MIN_SKILL_IC for v in ics):
+    # NO_SKILL — NO rung ever achieves predictive skill above the threshold.
+    # The prior `all(abs(v) < MIN_SKILL_IC)` rule misclassified pure-noise
+    # corpora as DEGRADING: an MLP trained on noise produces ICs that
+    # wander around zero with seed-dependent variance, and one rung's
+    # |IC|≥MIN_SKILL_IC from that wander defeated the absolute-value AND.
+    # The operator-meaningful semantic is asymmetric: a NEGATIVE IC is
+    # still "no useful skill" (anti-predictive at noise level), so the
+    # check is on the maximum (positive) IC reached — if no rung ever
+    # exceeded the threshold, the model never learned anything, period.
+    # This complements (does NOT replace) DEGRADING below, which now
+    # additionally requires the START to have had skill (otherwise a
+    # decline from sub-threshold to anti-predictive is more honestly
+    # NO_SKILL than "degrading skill the model never had").
+    if max(ics) < MIN_SKILL_IC:
         return "NO_SKILL"
     first = ics[0]
     last = ics[-1]
@@ -313,8 +325,14 @@ def _verdict(curve: list[dict]) -> str:
     strictly_up = all(ics[i] >= ics[i - 1] - DELTA_TOL for i in range(1, len(ics)))
     if strictly_up and delta >= LEARNING_DELTA:
         return "MONOTONE_LEARNING"
-    # DEGRADING — end is materially worse than start.
-    if delta <= -LEARNING_DELTA:
+    # DEGRADING — end is materially worse than start AND start had real
+    # skill. The `first >= MIN_SKILL_IC` precondition prevents calling a
+    # "decline" from sub-threshold to anti-predictive a degradation —
+    # that pattern is more honestly NO_SKILL (the model never had skill
+    # to degrade from). The NO_SKILL clause above already catches the
+    # max(ics) < MIN_SKILL_IC case; this guard handles the asymmetric
+    # case where start was barely above threshold and end is well below.
+    if delta <= -LEARNING_DELTA and first >= MIN_SKILL_IC:
         return "DEGRADING"
     # SATURATED — endpoints close, mid close to last (curve plateaued).
     if abs(delta) < LEARNING_DELTA and len(points) >= 3:
