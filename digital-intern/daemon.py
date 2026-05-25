@@ -117,6 +117,7 @@ from collectors.short_seller_collector import collect_short_sellers
 from collectors.financial_blogs_collector import collect_financial_blogs
 from collectors.hackernews_collector import collect_hackernews
 from collectors.market_breadth_collector import collect_market_breadth
+from collectors.market_valuation_collector import collect as collect_market_valuation
 from collectors.sec_xbrl_financials import collect_sec_xbrl_financials
 from collectors.usgs_earthquake_collector import collect_usgs_earthquakes
 from collectors.forex_factory_calendar import collect as collect_forex_factory_cal
@@ -254,6 +255,7 @@ SHORT_SELLER_INTERVAL   = 1800    # Short-seller research reports (rare, high-pr
 FINANCIAL_BLOGS_INTERVAL = 600    # InvestorPlace, Motley Fool, Nasdaq RSS — every 10min
 HACKERNEWS_INTERVAL     = 300     # Hacker News front-page + finance/business stories — every 5min
 MARKET_BREADTH_INTERVAL = 3600    # Finviz market breadth (% above MAs, new highs/lows) — hourly
+MARKET_VALUATION_INTERVAL = 3600 * 4  # S&P 500 P/E, CAPE, earnings yield — every 4h (multpl.com)
 USASPENDING_INTERVAL    = 3600    # USASpending.gov federal contract awards — hourly (new awards rare)
 SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
 SEC_13F_INTERVAL        = 1800      # SEC 13F institutional holdings — every 30min (quarterly season)
@@ -377,6 +379,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "hackernews": HACKERNEWS_INTERVAL,
     "usaspending": USASPENDING_INTERVAL,
     "market_breadth": MARKET_BREADTH_INTERVAL,
+    "market_valuation": MARKET_VALUATION_INTERVAL,
     "sec_xbrl": SEC_XBRL_INTERVAL,
     "sec_13f": SEC_13F_INTERVAL,
     "sec_form4": SEC_FORM4_INTERVAL,
@@ -2757,6 +2760,28 @@ def market_breadth_worker(store: ArticleStore):
         _sleep(MARKET_BREADTH_INTERVAL)
 
 
+# ── Worker: S&P 500 market valuation (CAPE, P/E, earnings yield) — every 4h ──
+def market_valuation_worker(store: ArticleStore):
+    log.info("[market_valuation_worker] started")
+    bo = Backoff("market_valuation", base=300.0, cap=3600.0)
+    while _running:
+        try:
+            articles = collect_market_valuation()
+            _ingest(store, articles, "market_valuation")
+            try:
+                source_health.record_result("market_valuation", len(articles))
+            except Exception as he:
+                log.warning(f"[market_valuation_worker] source_health error: {he}")
+            _worker_last_ok["market_valuation"] = time.time()
+            log.debug(f"[market_valuation] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[market_valuation_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(MARKET_VALUATION_INTERVAL)
+
+
 # ── Worker: Portfolio P/L snapshot — every 5min ─────────────────────────────
 def portfolio_pl_worker(store: ArticleStore):
     log.info("[portfolio_pl_worker] started")
@@ -4370,7 +4395,8 @@ def main():
         ("financial_blogs", financial_blogs_worker),
         ("hackernews",     hackernews_worker),
         ("usaspending",    usaspending_worker),
-        ("market_breadth", market_breadth_worker),
+        ("market_breadth",    market_breadth_worker),
+        ("market_valuation",  market_valuation_worker),
         ("sec_xbrl",    sec_xbrl_worker),
         ("sec_13f",     sec_13f_worker),
         ("sec_form4",   sec_form4_worker),
