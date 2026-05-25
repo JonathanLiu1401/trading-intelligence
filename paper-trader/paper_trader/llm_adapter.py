@@ -28,7 +28,7 @@ _CLAUDE_SEM = threading.Semaphore(2)   # max 2 concurrent claude subprocesses (O
 _HF_SEM = threading.Semaphore(3)       # max 3 concurrent HF API calls
 
 
-def call_llm(model_id: str, prompt: str, timeout: int = 90) -> str | None:
+def call_llm(model_id: str, prompt: str, timeout: int = None) -> str | None:
     """Route prompt to the right LLM backend. Returns raw response string or None."""
     if model_id.startswith("hf/"):
         return _hf_call(model_id[3:], prompt, timeout)
@@ -48,7 +48,7 @@ def _claude_call(model_id: str, prompt: str, retries: int = 1) -> str | None:
                     ["claude", "--model", model_id, "--print",
                      "--permission-mode", "bypassPermissions"],
                     input=prompt, capture_output=True, text=True,
-                    timeout=150,
+                    timeout=None,  # no timeout — wait as long as Opus needs
                 )
                 if r.returncode == 0 and r.stdout.strip():
                     return r.stdout.strip()

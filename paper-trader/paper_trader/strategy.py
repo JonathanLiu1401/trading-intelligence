@@ -31,11 +31,10 @@ except Exception:  # pragma: no cover - stdlib-only module, import can't fail
 
 MODEL = "claude-opus-4-7"
 FALLBACK_MODEL = "claude-sonnet-4-6"
-FALLBACK_TIMEOUT_S = 60
-DECISION_TIMEOUT_S = 180
-# Retry uses a shorter budget so a parse-failure rescue can't blow past the
-# next 60s open-market cycle. Worst case adds DECISION_TIMEOUT_S + RETRY = 225s.
-RETRY_TIMEOUT_S = 45
+FALLBACK_TIMEOUT_S = None   # no timeout — wait as long as Opus needs
+DECISION_TIMEOUT_S = None   # no timeout — wait as long as Opus needs
+# Retry uses no timeout; Opus is given unlimited time to respond.
+RETRY_TIMEOUT_S = None   # no timeout — wait as long as Opus needs
 # Cap the raw-response excerpt we write back into decisions.reasoning. Long
 # enough to diagnose JSON / prose / truncation, short enough to keep the DB lean.
 RAW_CAPTURE_CHARS = 1000
@@ -208,6 +207,9 @@ TECHNICAL SIGNAL INTERPRETATION (use alongside news, not in isolation):
   long opportunity if news/thesis supports it.
 - MACD signal crossovers confirm momentum: positive macd_signal with rising price is bullish
   confirmation; negative macd_signal with falling price is bearish confirmation.
+- MACD label "flat" means the MACD line is sitting on the signal line at machine precision — no
+  momentum signal at all (a steady-state trend or a quiet tape). Treat "flat" as no MACD bias:
+  do NOT count it as bullish OR bearish; conviction should come from RSI / news / catalyst alone.
 - MACD histogram zero-cross while below zero: when hist_cross_up=True AND macd_below_zero_cross=True
   AND ema200_above=True, this is a HIGH-QUALITY entry signal — momentum is turning from oversold
   while the long-term trend is intact. Weight this heavily for new entries (it is the literal
@@ -1129,6 +1131,24 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # before it sees the prices it would fund against. Observational only.
     bp_section = f"{buying_power_block}\n" if buying_power_block else ""
 
+    # Watchlist MACD breadth — one-line market-structure roll-up derived
+    # from the same quant_signals the per-name TECHNICAL block renders.
+    # Surfaces the macro "is the tape trending or stalled?" question Opus
+    # would otherwise have to tally row-by-row. Observational only
+    # (invariants #2/#12 — sibling to sector_exposure / risk_mirror).
+    # Computed AFTER the quant_signals filter above so the breadth tracks
+    # the same names-in-play set Opus sees per-row.
+    try:
+        from .analytics.macd_breadth import (
+            build_macd_breadth, render_prompt_line,
+        )
+        breadth_snap = build_macd_breadth(quant_signals)
+        breadth_line = render_prompt_line(breadth_snap)
+    except Exception as e:
+        print(f"[strategy] macd_breadth failed (non-fatal): {e}")
+        breadth_line = ""
+    breadth_section = f"{breadth_line}\n" if breadth_line else ""
+
     phase_line = f"MARKET_PHASE: {phase}\n" if phase else ""
     return f"""TIME (UTC): {now}
 MARKET_OPEN: {market_open}
@@ -1148,7 +1168,7 @@ FUTURES:
 {chr(10).join(fut_lines)}
 
 TECHNICAL SIGNALS (RSI/MACD/MA cross/vol ratio/52w proximity):
-{_format_quant_signals(quant_signals or {})}
+{breadth_section}{_format_quant_signals(quant_signals or {})}
 
 TICKER SENTIMENT (last 4h, from scored news):
 {chr(10).join(sent_lines) if sent_lines else '  (no scored mentions)'}
