@@ -343,6 +343,66 @@ def swr_cache_health_api():
         }), 500
 
 
+@app.route("/api/hard-exit-summary")
+def hard_exit_summary_api():
+    """Operator visibility into the hard SL/TP enforcement (commit
+    3176d2f, 2026-05-24).
+
+    The auto-exit feature silently closes any stock lot whose mark
+    breaches the 2%/3% (standard) or 4%/6% (leveraged) threshold
+    stamped at entry. The runner posts a one-line trade alert per
+    event but no surface aggregates the discipline. This endpoint
+    answers:
+
+      * Are mechanical exits dominating discretionary closes
+        (``mechanical_share`` ≈ 1.0 = bot leaving every exit to SL/TP)?
+      * Is SL outpacing TP (entries are bad — bot getting stopped out)
+        or vice versa (entries landing in winners)?
+      * Which tickers are repeat-offenders on the SL side?
+      * When did the last hard SL / TP fire (situational awareness)?
+
+    Composes ``analytics.hard_exit_summary.build_hard_exit_summary``
+    verbatim — single source of truth (invariant #10), so this endpoint
+    and any future Discord / reporter line key off the same builder.
+
+    Deliberately NOT @swr_cached — the builder is a pure scan over a
+    bounded ``recent_trades(2000)`` payload and the operator opening
+    this panel during a sequence of breaches needs the freshest count,
+    not a 20s-old cache (the ``notify_health_api`` precedent).
+
+    Failure contract mirrors the rest of the operator endpoints: any
+    fault degrades to a valid ERROR envelope so the panel can render
+    and the operator sees the fault, never a 500."""
+    try:
+        from .analytics.hard_exit_summary import build_hard_exit_summary
+        st = get_store()
+        snap = build_hard_exit_summary(st.recent_trades(2000))
+        if not isinstance(snap, dict):
+            raise TypeError(f"builder returned {type(snap).__name__}")
+        return jsonify({"service": "paper_trader", **snap})
+    except Exception as e:
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "state": "ERROR",
+            "verdict": "ERROR",
+            "headline": f"hard-exit-summary endpoint error: {e}",
+            "error": str(e),
+            "n_hard_sl": 0,
+            "n_hard_tp": 0,
+            "n_discretionary_sells": 0,
+            "n_total_hard": 0,
+            "realized_sl_usd": 0.0,
+            "realized_tp_usd": 0.0,
+            "net_hard_notional_usd": 0.0,
+            "discipline_ratio": None,
+            "mechanical_share": None,
+            "last_hard_sl": None,
+            "last_hard_tp": None,
+            "top_tickers": [],
+        }), 500
+
+
 # Static sector classification for analytics + sector-pulse cards.
 # Keyed by the symbols we actually use in the watchlist + portfolio.
 SECTOR_MAP = {
