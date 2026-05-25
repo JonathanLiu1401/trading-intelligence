@@ -73,6 +73,10 @@ PIPELINE: list[tuple[str, Path, int]] = [
     # ml_score > 0. Catches scoring outages earlier than score_drift_detector
     # (which emits NO-DATA instead of ALERT when scoring stops entirely).
     ("analytics.ml_coverage_rate",        LOGS / "ml_coverage.json",             50),
+    # ML score hourly heatmap: 24-bucket signal intensity timeline over the
+    # past 24h. Identifies peak-signal UTC hours where avg ml_score exceeds
+    # (daily_mean + 0.5*std). Useful for knowing when the best news arrives.
+    ("analytics.ml_score_hourly_heatmap", LOGS / "ml_score_hourly_heatmap.json", 110),
 ]
 
 TIMEOUT_S = 60  # per-module hard timeout
