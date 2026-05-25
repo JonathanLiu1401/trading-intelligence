@@ -139,6 +139,7 @@ from collectors.putcall_ratio_collector import collect_putcall_ratio
 from collectors.bls_collector import collect_bls
 from collectors.bea_collector import collect_bea
 from collectors.federal_register_collector import collect_federal_register
+from collectors.trade_policy_collector import collect_trade_policy
 from collectors.treasury_auctions import collect_treasury_auctions
 from collectors.arxiv_qfin_collector import collect_arxiv_qfin
 from collectors.cftc_press_collector import collect_cftc_press
@@ -248,6 +249,7 @@ GLOBAL_REG_INTERVAL     = 1800    # FSB, FCA, Fed research notes/papers — ever
 UN_NEWS_INTERVAL        = 1800    # UN News economic/climate/regional feeds — every 30min
 BIS_INTERVAL            = 1800    # BIS press releases, speeches, research — every 30min
 FED_REG_INTERVAL        = 1800    # Federal Register BIS/OFAC/FTC/FCC/NIST rules — every 30min
+TRADE_POLICY_INTERVAL   = 1800    # USTR + CBP + Commerce AD/CVD trade actions — every 30min
 BLS_INTERVAL            = 3600    # BLS macro series (CPI, unemployment, payrolls) — once per hour
 BEA_INTERVAL            = 3600    # BEA macro releases (GDP, trade, personal income) — once per hour
 TREASURY_AUCTIONS_INTERVAL = 1800  # UST auction announcements from TreasuryDirect — every 30min
@@ -381,6 +383,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "global_reg": GLOBAL_REG_INTERVAL,
     "bis": BIS_INTERVAL,
     "federal_register": FED_REG_INTERVAL,
+    "trade_policy": TRADE_POLICY_INTERVAL,
     "bls": BLS_INTERVAL,
     "bea": BEA_INTERVAL,
     "globenewswire": GLOBENEWSWIRE_INTERVAL,
@@ -2390,6 +2393,26 @@ def whitehouse_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(WHITEHOUSE_INTERVAL)
+
+
+def trade_policy_worker(store: ArticleStore):
+    log.info("[trade_policy_worker] started")
+    bo = Backoff("trade_policy", base=120.0, cap=1800.0)
+    while _running:
+        try:
+            new_count = collect_trade_policy()
+            try:
+                source_health.record_result("trade_policy", new_count)
+            except Exception as he:
+                log.warning(f"[trade_policy_worker] source_health error: {he}")
+            _worker_last_ok["trade_policy"] = time.time()
+            log.debug(f"[trade_policy] cycle ok ({new_count} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[trade_policy_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(TRADE_POLICY_INTERVAL)
 
 
 def g10_cb_worker(store: ArticleStore):
@@ -4484,6 +4507,7 @@ def main():
         ("finviz",      finviz_worker),
         ("federal_register", federal_register_worker),
         ("whitehouse",  whitehouse_worker),
+        ("trade_policy", trade_policy_worker),
         ("g10_cb",      g10_cb_worker),
         ("global_reg",  global_reg_worker),
         ("bis",         bis_worker),
