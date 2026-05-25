@@ -93,6 +93,24 @@ _no_decision_first_ts: datetime | None = None
 # pair already provides.
 _quota_first_ts: datetime | None = None
 
+# Session-scoped tally of how many DISTINCT outages this process has alerted
+# the operator about. Incremented once per outage on the transition from
+# "not alerted" to "alerted" (i.e., the cycle that flips ``_breaker_alert_active``
+# / ``_quota_alert_active`` from False to True). NOT incremented when an alert
+# send returns False (the orphan-anchor cleanup branch — see invariant on
+# runner.py:977) so the counters only reflect outages the operator was
+# actually told about; a delivery failure that the trader never saw must not
+# inflate "occurred N times this session" to mean "the trader saw N notices."
+# Used by ``alarm_latch_state()`` so an operator on Discord can quickly see
+# whether a fresh outage is an isolated event or the Nth this session — the
+# trend signal a bare in-the-moment latch read can never carry. Reset on
+# every fresh process boot — consistent with the latch semantics (a restart
+# is the documented operator action for stuck state, so a count of N=2
+# means "the desk took 2 hits since the last clean boot"). Module globals,
+# never persisted to the sidecar (the latches themselves aren't, either).
+_quota_outage_count: int = 0
+_breaker_outage_count: int = 0
+
 # Set by the git-watcher thread; checked by the main loop between cycles so
 # a restart never kills a mid-Opus decision call.
 _restart_requested = threading.Event()
@@ -237,6 +255,15 @@ def alarm_latch_state() -> dict:
         "breaker_threshold": CONSECUTIVE_NO_DECISION_LIMIT,
         "breaker_outage_s": _age_s(_no_decision_first_ts),
         "quota_outage_s": _age_s(_quota_first_ts),
+        # Session counters — how many DISTINCT outages this process has
+        # alerted the operator about (per the counter's invariant: only
+        # incremented when the alert actually delivered). Distinct from
+        # the active-latch booleans above: those say "is there an outage
+        # right NOW?", these say "how many have happened SINCE BOOT?". A
+        # trader paged on a fresh outage uses the count to gauge "is
+        # this isolated or recurring?" without scrolling Discord history.
+        "quota_outage_count": int(_quota_outage_count),
+        "breaker_outage_count": int(_breaker_outage_count),
     }
 
 
@@ -837,7 +864,7 @@ def _no_decision_cause(summary: dict) -> str:
 def _cycle():
     global _consecutive_no_decisions, _quota_alert_active
     global _breaker_alert_active, _no_decision_first_ts
-    global _quota_first_ts
+    global _quota_first_ts, _quota_outage_count, _breaker_outage_count
     summary = strategy.decide()
 
     status = summary.get("status", "NO_DECISION")
@@ -878,6 +905,13 @@ def _cycle():
                 # legacy no-context body (helper returns ``""``).
                 if reporter.send_quota_alert(detail, store=get_store()):
                     _quota_alert_active = True  # dedupe until recovery
+                    # Count the outage on the EDGE — the moment the latch
+                    # flipped from False → True (i.e., the alert actually
+                    # delivered). A delivery failure does NOT count here:
+                    # the counter must reflect outages the operator was
+                    # actually told about, not silent ones (those go to
+                    # the orphan-anchor cleanup path on runner.py:977).
+                    _quota_outage_count += 1
             except Exception as e:
                 print(f"[runner] quota alert failed: {e}")
     else:
@@ -933,6 +967,12 @@ def _cycle():
                             store=get_store(),
                         ):
                             _breaker_alert_active = True
+                            # Same edge-counting discipline as
+                            # ``_quota_outage_count`` (runner.py quota arm):
+                            # only count delivered alerts so the operator-
+                            # visible count never disagrees with what they
+                            # actually saw on Discord.
+                            _breaker_outage_count += 1
                     except Exception as e:
                         print(f"[runner] breaker alert failed: {e}")
         else:
