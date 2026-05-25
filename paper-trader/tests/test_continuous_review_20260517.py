@@ -28,6 +28,42 @@ import paper_trader.backtest as bt
 import run_continuous_backtests as rcb
 
 
+# ───────────────────────── FakeScorer signature parity ─────────────────────
+
+
+class TestFakeScorerSignatureParity:
+    """Regression guard against the silent class of failure where a test
+    fake's ``predict()`` signature drifts behind the real DecisionScorer's.
+
+    The bug this prevents: when ``_oos_rank_metrics`` (or any other
+    consumer) is extended to pass a NEW kwarg to predict(), every fake
+    scorer that doesn't accept the new kwarg raises TypeError inside the
+    metric's ``try: ... except Exception: continue`` block. The row is
+    silently dropped — n=0, dir_acc=None — which then looks like the
+    metric is broken rather than like the fake is stale.
+
+    This test asserts every kwarg the real DecisionScorer.predict accepts
+    is also accepted by the local _FakeScorer. New features added to the
+    real signature force the fake to be updated; otherwise existing tests
+    drift silently.
+    """
+
+    def test_fake_scorer_accepts_every_real_predict_kwarg(self):
+        import inspect
+        from paper_trader.ml.decision_scorer import DecisionScorer
+        real_params = set(inspect.signature(
+            DecisionScorer.predict).parameters.keys()) - {"self"}
+        fake_params = set(inspect.signature(
+            _FakeScorer.predict).parameters.keys()) - {"self"}
+        missing = real_params - fake_params
+        assert not missing, (
+            f"_FakeScorer.predict is missing kwargs the real scorer accepts: "
+            f"{sorted(missing)}. _oos_rank_metrics / evaluate_scorer_oos pass "
+            f"every kwarg through; a missing arg here causes silent row drops "
+            f"and n=0 / None metrics."
+        )
+
+
 # ───────────────────────── orphaned-run reaper ─────────────────────────────
 
 class TestReapOrphanedRuns:
@@ -82,7 +118,13 @@ class _FakeScorer:
 
     def predict(self, ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
                 vol_ratio=None, bb_pos=None, news_urgency=None,
-                news_article_count=None):
+                news_article_count=None,
+                ema200_above=None, hist_cross_up=None,
+                macd_below_zero_cross=None):
+        # The 3 enhanced MACD kwargs (pass #35) are now passed by
+        # `_oos_rank_metrics` to mirror `_ml_decide` exactly. Without these
+        # accepted here, the test fake raises TypeError, the try/except in
+        # the metric drops every row, and n=0 silently masks rank-IC bugs.
         return float(ml_score)
 
 
