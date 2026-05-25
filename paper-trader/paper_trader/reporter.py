@@ -539,8 +539,91 @@ def _format_elapsed(secs: int | float | None) -> str:
     return f"{d}d{rem // 3600}h"
 
 
+def _book_exposure_line(store) -> str:
+    """One-line "what is sitting unattended while the engine is dark?" for
+    the operator alarm path (breaker fired / quota exhausted).
+
+    The fired/exhausted alerts historically told the trader "engine is
+    frozen, open positions still marked-to-market" — but never NAMED what
+    those open positions actually ARE. A trader paged at 3am about a
+    frozen book cannot judge whether to intervene without knowing if it's
+    100% cash (safe to wait), 100% NVDA pinned at -3% (probably should
+    liquidate by hand), or hedged. ``/api/state`` answers this on the
+    dashboard, but the operator being paged is by definition NOT in front
+    of a dashboard — the alert that woke them is their only surface.
+
+    Composes ``store.get_portfolio`` + ``store.open_positions`` directly,
+    using the last-stored ``current_price`` on each row (no extra
+    mark-to-market — the alarm path must stay zero-latency, same
+    discipline as ``_trade_impact_line``). Falls back to ``avg_cost`` when
+    the mark is stale or zero (the ``_concentration_line`` precedent).
+    Observational only, never gates, no caps (invariants #2/#12).
+
+    Failure contract mirrors the rest of ``reporter``: any builder /
+    store fault degrades to ``""`` ("no exposure line on this alarm"),
+    **never** an exception ("no alarm this outage") — a notification
+    helper must never be able to mask the outage it exists to surface.
+    A missing ``store`` (legacy caller) is also ``""`` so the original
+    no-context body ships byte-identical to before this enrichment.
+    """
+    if store is None:
+        return ""
+    try:
+        pf = store.get_portfolio() or {}
+        try:
+            total = float(pf.get("total_value") or 0.0)
+        except (TypeError, ValueError):
+            total = 0.0
+        if total <= 0:
+            return ""
+        pl_pct = (total - _INITIAL_EQUITY) / _INITIAL_EQUITY * 100.0
+        positions = store.open_positions() or []
+        held: list[dict] = []
+        for p in positions:
+            try:
+                q = float(p.get("qty") or 0.0)
+            except (TypeError, ValueError):
+                q = 0.0
+            if q <= 0:
+                continue
+            ptype = (p.get("type") or "").lower()
+            mult = 100.0 if ptype in ("call", "put") else 1.0
+            cur = 0.0
+            for k in ("current_price", "avg_cost"):
+                try:
+                    v = float(p.get(k) or 0.0)
+                except (TypeError, ValueError):
+                    v = 0.0
+                if v > 0:
+                    cur = v
+                    break
+            held.append({**p, "_market_value": cur * q * mult})
+        n = len(held)
+        if n == 0:
+            return f"book: ${total:.2f} ({pl_pct:+.2f}% from start) · 100% cash"
+        biggest = max(held, key=lambda p: p["_market_value"])
+        bw_pct = (biggest["_market_value"] / total * 100.0) if total > 0 else 0.0
+        bt = biggest.get("ticker") or "?"
+        upl_pct = None
+        try:
+            ac = float(biggest.get("avg_cost") or 0.0)
+            cp = float(biggest.get("current_price") or 0.0)
+            if ac > 0 and cp > 0:
+                upl_pct = (cp - ac) / ac * 100.0
+        except (TypeError, ValueError):
+            upl_pct = None
+        upl_tok = f" ({upl_pct:+.2f}% unrealized)" if upl_pct is not None else ""
+        n_word = "position" if n == 1 else "positions"
+        return (f"book: ${total:.2f} ({pl_pct:+.2f}% from start) · "
+                f"{n} {n_word} · biggest {bt} {bw_pct:.1f}%{upl_tok}")
+    except Exception as e:
+        print(f"[reporter] book-exposure line skipped: {e}")
+        return ""
+
+
 def send_breaker_fired_alert(consecutive: int, last_reason: str = "",
-                              *, elapsed_s: int | float | None = None) -> bool:
+                              *, elapsed_s: int | float | None = None,
+                              store=None) -> bool:
     """Operator-actionable alarm: the consecutive-NO_DECISION circuit
     breaker just fired and reaped any stale claude subprocess.
 
@@ -589,6 +672,9 @@ def send_breaker_fired_alert(consecutive: int, last_reason: str = "",
     )
     if last_reason:
         body += f"\n_last cause: {last_reason[:200]}_"
+    exposure = _book_exposure_line(store)
+    if exposure:
+        body += f"\n_{exposure}_"
     return _send(body)
 
 
@@ -674,7 +760,7 @@ def send_quota_recovered_alert(*, elapsed_s: int | float | None = None) -> bool:
     return _send(body)
 
 
-def send_quota_alert(detail: str = "") -> bool:
+def send_quota_alert(detail: str = "", *, store=None) -> bool:
     """One-shot alarm: the Claude CLI is rejecting every decision with a
     quota / usage-limit error, so the live trader is making NO trades and
     the portfolio is frozen at its last marks.
@@ -694,6 +780,9 @@ def send_quota_alert(detail: str = "") -> bool:
     )
     if detail:
         body += f"\n_{detail[:300]}_"
+    exposure = _book_exposure_line(store)
+    if exposure:
+        body += f"\n_{exposure}_"
     return _send(body)
 
 

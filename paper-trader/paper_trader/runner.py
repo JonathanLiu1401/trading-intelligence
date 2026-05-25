@@ -869,7 +869,14 @@ def _cycle():
                 d = summary.get("decision")
                 if not d:
                     detail = "Opus + Sonnet fallback both rejected with a usage/quota limit."
-                if reporter.send_quota_alert(detail):
+                # Pass the store so the alert body carries a one-line
+                # snapshot of what the unattended book holds — the
+                # operator paged on a quota outage needs to know what is
+                # frozen (cash %, biggest position, unrealized P/L), not
+                # just THAT it is frozen. Store fetch is best-effort:
+                # any fault inside _book_exposure_line degrades to the
+                # legacy no-context body (helper returns ``""``).
+                if reporter.send_quota_alert(detail, store=get_store()):
                     _quota_alert_active = True  # dedupe until recovery
             except Exception as e:
                 print(f"[runner] quota alert failed: {e}")
@@ -913,8 +920,17 @@ def _cycle():
                 if not _breaker_alert_active:
                     cause = _no_decision_cause(summary)
                     try:
+                        # Pass the store so the alert body carries a
+                        # one-line snapshot of what the unattended book
+                        # holds (cash %, biggest position, unrealized
+                        # P/L). The operator paged about a wedge needs
+                        # to know what is frozen, not just THAT it is.
+                        # Store fetch is best-effort: any fault inside
+                        # _book_exposure_line degrades to the legacy
+                        # no-context body (helper returns ``""``).
                         if reporter.send_breaker_fired_alert(
                             fired_at, cause, elapsed_s=elapsed_s,
+                            store=get_store(),
                         ):
                             _breaker_alert_active = True
                     except Exception as e:

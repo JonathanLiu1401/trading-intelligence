@@ -294,9 +294,13 @@ class TestCircuitBreakerAlert:
         alerts = {"fired": [], "send": []}
         # Capture elapsed_s too — runner now passes it as a kwarg so the
         # Discord body carries the real wall-clock wedge duration.
+        # ``store`` is also accepted (runner now passes the live store so
+        # the alert body carries a one-line book-exposure snapshot) but
+        # we don't assert on it from this fixture's call log — the
+        # exposure plumbing is exercised directly in test_core_reporter.py.
         monkeypatch.setattr(
             runner.reporter, "send_breaker_fired_alert",
-            lambda n, cause="", *, elapsed_s=None: (
+            lambda n, cause="", *, elapsed_s=None, store=None: (
                 alerts["fired"].append((n, cause, elapsed_s)) or True
             ),
         )
@@ -511,7 +515,8 @@ class TestCircuitBreakerAlert:
         symmetric latch discipline)."""
         # Send returns False → latch stays False.
         monkeypatch.setattr(runner.reporter, "send_breaker_fired_alert",
-                            lambda n, cause="", *, elapsed_s=None: False)
+                            lambda n, cause="", *, elapsed_s=None,
+                            store=None: False)
         self._run_no_decision_cycles(
             runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
         assert runner._breaker_alert_active is False
@@ -577,7 +582,7 @@ class TestQuotaOutageRecovery:
         }
         monkeypatch.setattr(
             runner.reporter, "send_quota_alert",
-            lambda detail="": (
+            lambda detail="", *, store=None: (
                 alerts["fired_quota"].append(detail) or True
             ),
         )
@@ -592,7 +597,7 @@ class TestQuotaOutageRecovery:
         # has to match the signature so a misrouted call records cleanly.
         monkeypatch.setattr(
             runner.reporter, "send_breaker_fired_alert",
-            lambda n, cause="", *, elapsed_s=None: (
+            lambda n, cause="", *, elapsed_s=None, store=None: (
                 alerts["fired_breaker"].append((n, cause, elapsed_s))
                 or True
             ),
