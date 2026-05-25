@@ -1646,6 +1646,98 @@ class ArticleStore:
         }
 
     @_retry_on_lock
+    def label_production_rate(self, window_min: int = 60) -> dict:
+        """Per-``score_source`` label-production rate over the recent window.
+
+        Time-derivative companion to ``urgency_label_split``: that method counts
+        urgency>=1 rows by source-tag and is silent on whether Sonnet is actively
+        labelling NON-urgent traffic. A live failure mode the existing surfaces
+        cannot catch is "Sonnet has gone silent for the last 30 minutes" — the
+        aggregate urgency-split still shows yesterday's labels, but the
+        per-minute LLM rate just dropped to zero across the whole live corpus.
+
+        Counts EVERY article ``first_seen >= now - window_min`` grouped by
+        ``score_source``, including unlabeled rows (NULL bucket). Counts are
+        keyed off ``first_seen`` rather than the label-write moment because
+        ``score_source`` carries no timestamp of its own — the production
+        pipeline always labels an article within a few cycles of insertion, so
+        in any window much larger than the scoring cadence the two are
+        operationally equivalent. Same proxy ``urgency_label_split`` already
+        relies on; documented for the analyst-persona reader.
+
+        Returns::
+
+            {
+              "window_min":         int,
+              "total":              int,       # all live articles in window
+              "by_source":          {"llm": N, "ml": N, "briefing_boost": N,
+                                     "null": N},
+              "rate_per_min":       float,     # total / window_min
+              "llm_rate_per_min":   float,     # (llm + briefing_boost) / window_min
+              "unscored_fraction":  float,     # null / total
+              "verdict":            "HEALTHY" | "THROTTLED" | "DARK" | "NO_DATA",
+            }
+
+        Verdict ladder (mirrors the conservative most-severe-first discipline
+        of ``briefing_health`` / ``briefing_cadence_trend``):
+
+          * ``NO_DATA`` — no articles in the window. The collectors are dark,
+            not the LLM; refuse to flag the LLM path on absent input.
+          * ``DARK`` — articles exist but ``llm_rate_per_min == 0``. The Sonnet
+            urgency_scorer has produced zero labels this window; the analyst's
+            unverified-rate jumped to 100%.
+          * ``THROTTLED`` — ``llm_rate_per_min`` < 0.05 (less than one LLM
+            label per 20 min on average — Sonnet is alive but moving slowly,
+            often the "quota exhausted, retry after backoff" regime).
+          * ``HEALTHY`` — everything else.
+
+        Read-only (single GROUP BY SELECT) with ``_LIVE_ONLY_CLAUSE`` so the
+        synthetic backtest/opus rows never inflate either side. NO DB write,
+        no ai_score/ml_score/score_source/urgency mutation — all four
+        load-bearing invariants intact by construction.
+        """
+        window_min = max(int(window_min), 1)
+        since = (
+            datetime.now(timezone.utc) - timedelta(minutes=window_min)
+        ).isoformat()
+        rows = self.conn.execute(
+            "SELECT score_source, COUNT(*) FROM articles "
+            f"WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE} "
+            "GROUP BY score_source",
+            (since,),
+        ).fetchall()
+        by_source: dict[str, int] = {
+            "llm": 0, "ml": 0, "briefing_boost": 0, "null": 0,
+        }
+        for src, n in rows:
+            key = src if src in ("llm", "ml", "briefing_boost") else "null"
+            by_source[key] += int(n or 0)
+        total = sum(by_source.values())
+        llm_total = by_source["llm"] + by_source["briefing_boost"]
+        rate_per_min = round(total / window_min, 3)
+        llm_rate_per_min = round(llm_total / window_min, 3)
+        unscored_fraction = (
+            round(by_source["null"] / total, 4) if total else 0.0
+        )
+        if total == 0:
+            verdict = "NO_DATA"
+        elif llm_total == 0:
+            verdict = "DARK"
+        elif llm_rate_per_min < 0.05:
+            verdict = "THROTTLED"
+        else:
+            verdict = "HEALTHY"
+        return {
+            "window_min": window_min,
+            "total": total,
+            "by_source": by_source,
+            "rate_per_min": rate_per_min,
+            "llm_rate_per_min": llm_rate_per_min,
+            "unscored_fraction": unscored_fraction,
+            "verdict": verdict,
+        }
+
+    @_retry_on_lock
     def urgency_label_split_by_source(
         self, hours: int = 24, top_n: int = 15
     ) -> dict:
