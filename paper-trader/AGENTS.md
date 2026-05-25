@@ -260,6 +260,142 @@ python3 -m pytest tests/test_cycle_gap_summary.py -v
 
 ---
 
+## 2026-05-24 ML+backtest HYBRID pass #35 (Agent 2) — enhanced MACD plumbing fix + `dead_feature_audit` per-cycle ledger
+
+### Phase 1 — Debug: bugs_fixed = 1
+
+Audit revealed a **real, high-impact bug** the prior 34 passes missed:
+the 3 enhanced MACD features accepted by
+`DecisionScorer.build_features` (`ema200_above` / `hist_cross_up` /
+`macd_below_zero_cross`) were **never plumbed into the inference path
+(`_ml_decide`) or the training-data capture
+(`_compute_decision_outcomes`)**. Both sides defaulted them to
+`None → 0.0`; the StandardScaler then divided a constant-zero column
+by `std + 1e-8`, producing effectively zero input. Result: the MLP's
+first-layer weights for those 3 input neurons converged to **exactly
+0.000000** (verified directly against the deployed pickle).
+
+Three model slots permanently dead. Three feature names advertised
+in the build_features contract carried zero signal in every prediction
+the live `_ml_decide` gate ever made.
+
+**Fix (commit `1a30911`, attribution mixed due to same-tree race
+documented below):**
+- `paper_trader/backtest.py::_ml_decide` now forwards the 3 enhanced
+  MACD keys from `q_buy` (the populated quant block) to the scorer's
+  `predict_with_meta` call.
+- `run_continuous_backtests.py::_compute_decision_outcomes` now
+  persists the 3 enhanced MACD signals to every outcome row.
+- **Pinning tests** (`tests/test_backtest.py::TestEnhancedMacdFeature
+  Plumbing`): one captures the kwargs `_ml_decide` passes to a fake
+  scorer and asserts all 3 keys are present; another asserts every
+  outcome dict contains all 3 keys. Any future regression that drops
+  the keys from either side fails loudly.
+
+### Phase 2 — Feature: `dead_feature_audit` + per-cycle ledger
+
+`paper_trader/ml/dead_feature_audit.py` audits the deployed pickle's
+**first-layer weights** for features the model never learned from —
+the model-level complement to `feature_importance`'s data-level
+permutation reading. Verdict ladder: `OK / HAS_DEAD / NOT_TRAINED /
+SHAPE_MISMATCH / UNKNOWN_MODEL / ERROR`. Threshold `DEAD_EPS = 1e-6`
+(live trained features land at 0.27–0.49; constant-input features
+land at *exactly* 0.0 — five orders of magnitude separation).
+
+CLI:
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.dead_feature_audit            # human-readable
+python3 -m paper_trader.ml.dead_feature_audit --json     # machine-readable
+```
+
+Exit code 0 when `OK` / `NOT_TRAINED`, 1 otherwise (shell-gateable).
+
+Wired into the continuous loop as `_append_dead_feature_audit_log`
+(after `_append_persona_skill_log`, before `_try_train_ml`),
+producing `data/dead_feature_audit_log.jsonl`. Same testability
+rule, best-effort discipline, and atomic tmp+`.replace` trim
+idiom as every sibling skill ledger. Mandatory fields:
+`cycle / timestamp / window_start / window_end / verdict / method /
+n_train / n_features_total / n_features_dead / has_dead /
+dead_features / eps`.
+
+**10 new tests** pin:
+- All 6 verdict-ladder paths (NOT_TRAINED / OK / HAS_DEAD via real
+  train_scorer / SHAPE_MISMATCH / UNKNOWN_MODEL / non-finite weights).
+- "Never raises" guarantee — even a model whose `coefs_` access
+  raises produces an envelope (verdict UNKNOWN_MODEL or ERROR).
+- The ledger writes correct JSON, propagates HAS_DEAD honestly,
+  survives an exception in `audit_dead_features` (still appends an
+  ERROR row), and trims at 2× the keep cap.
+
+### Phase 3 — Live quant findings (user_findings = 6)
+
+1. **`dead_feature_audit` against live pickle: HAS_DEAD with
+   `n_dead=7/20`.** The 3 enhanced-MACD slots the Phase-1 fix
+   targets (mean|w|=0.000000 each, will recover on the next
+   retrain) PLUS 4 sector slots with zero historical coverage
+   (`sector_energy / sector_healthcare / sector_commodities /
+   sector_other`). Once persona-driven runs accumulate outcomes
+   in those sectors, the audit will trend them back to non-dead.
+2. **Conviction calibration is INVERTED at the ml_score quartile
+   level.** Across the last 5000 outcomes' BUYs (n=3897): Q1
+   (lowest ml_score, mean 1.03) realised +0.97% 5d; Q4 (highest,
+   mean 3.35) realised +0.89%. Delta = **-0.086pp** — higher
+   conviction signals predicted slightly WORSE outcomes. This is
+   the data-level evidence behind the long-documented
+   `MISCALIBRATED` verdict (`conviction_calibration` /
+   `baseline_compare`).
+3. **Conviction sizing carries a real but modest edge.** Q1
+   (5% sized) +0.95% vs Q4 (22% sized) +1.12% — +0.17pp on
+   sizing. The gate's ×0.85 / ×1.15 / ×1.3 sizing arms do
+   capture *some* economic edge despite the rank-skill picture.
+4. **vs_spy_pct over last 200 complete runs: median +55%, p25
+   +11%, p75 +206%, min -170%, max +1347%.** Median alpha
+   genuinely positive but dispersion enormous — `persona_skill`
+   warning about leveraged-beta noise vs strategy skill stands.
+5. **1 backtest run stuck `status='running'`** in `backtest.db`
+   (run_id=100000+ range). Within the 6h reaper window so will
+   be cleaned up on the next continuous-loop restart by
+   `_reap_orphaned_runs`. Not actionable.
+6. **Same-tree HYBRID staging race PLAYED OUT for real.**
+   I staged my 5 paper-trader files with explicit pathspec
+   (never `git add -A`), but commit `1a30911`'s message body
+   describes Agent 3's chat-enrichment feature while its diff
+   stat contains ONLY my paper-trader files. Agent 3 ran a
+   bulk-stage between my `git add` and the commit. My work IS
+   durable (pushed to remote) but mis-attributed in the commit
+   message. Memory `pt-concurrent-samerole-staging-race` is
+   correctly documented; the only mitigation would be a
+   process-level lock between concurrent same-role agents.
+
+### Phase 4 — Counters
+
+bugs_fixed = 1 · features_added = 1 · user_findings = 6
+
+```bash
+# Run the new pinning + ledger tests:
+python3 -m pytest tests/test_dead_feature_audit.py tests/test_backtest.py \
+    -k "TestEnhancedMacd or dead_feature" -v
+# 12 passed in <15s
+
+# Audit the live deployed pickle:
+python3 -m paper_trader.ml.dead_feature_audit
+```
+
+### Files touched
+
+- `paper_trader/backtest.py` (+15 — 3 enhanced MACD keys in `_ml_decide`)
+- `paper_trader/ml/dead_feature_audit.py` (NEW, +233)
+- `run_continuous_backtests.py` (+144 — outcome capture + ledger constant + helper + main wiring)
+- `tests/test_backtest.py` (+120 — TestEnhancedMacdFeaturePlumbing)
+- `tests/test_dead_feature_audit.py` (NEW, +394)
+
+Total: 906 inserts, 0 deletes. Single commit `1a30911` (attribution
+mixed — see finding #6).
+
+---
+
 ## 2026-05-24 ML+backtest HYBRID pass #34 (Agent 2) — `_append_persona_skill_log` per-cycle per-persona decision-signal skill ledger
 
 ### Phase 1 — Debug: bugs_fixed = 0
