@@ -198,10 +198,13 @@ inline with the live source phrase that drove each entry.
 comparable: "loudest off-watchlist heat 12.4 vs top WATCHLIST heat 9.1
 = time to add the ADR".
 
-Live shape on 2026-05-25 (300 articles scanned, 216 unique off-watch
-tickers found, 12 surfaced after thresholds): XOVR (Cathie Wood
-crossover ETF), META, INTU, LOW — all real tickers Opus has no surface
-to discover today.
+Live shape on 2026-05-25 (cold fetch via Flask test client against the
+running `articles.db`): 300 articles scanned, 216 unique off-watch
+tickers found, 12 surfaced after thresholds. Pre-filter top included
+the named noise tokens (MSN/TSX/EUV/CAPEX/EPYC) along with real
+discoveries XOVR (Cathie Wood crossover ETF), META, INTU, IP, LOW — the
+filter strips the former, the latter stay, and the operator gets a
+clean rotation surface Opus has no other way to discover.
 
 ### `/api/spy-valuation` — S&P 500 structural-valuation regime
 
