@@ -145,6 +145,7 @@ from collectors.finviz_collector import collect_finviz
 from collectors.seekingalpha_collector import collect_seekingalpha
 from collectors.rsi_extremes_collector import collect_rsi_extremes
 from collectors.aaii_sentiment_collector import collect as collect_aaii_sentiment
+from collectors.sec_keyword_monitor import collect as collect_sec_keyword_monitor
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -183,6 +184,7 @@ WORKER_HEALTH_STALE_SECS = 15 * 60  # mark worker stale in heartbeat if no succe
 SEC_EDGAR_INTERVAL  = 300         # SEC 8-K RSS sweep every 5min
 SEC_EDGAR_FT_INTERVAL = 900       # SEC full-text per-ticker every 15min
 SEC_ACTIVIST_INTERVAL = 600       # SEC activist/M&A special filings every 10min
+SEC_KEYWORD_INTERVAL  = 3600      # SEC 8-K keyword event scanner (layoffs/M&A/breach) once per hour
 GOOGLE_NEWS_INTERVAL = 120        # Google News per-ticker pass every 2min
 NITTER_INTERVAL     = 180         # Nitter twitter mirror every 3min
 SUBSTACK_INTERVAL   = 600         # Substack newsletters every 10min
@@ -338,6 +340,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "reddit": REDDIT_INTERVAL, "stocktwits": STOCKTWITS_INTERVAL, "ticker": TICKER_INTERVAL,
     "sec_edgar": SEC_EDGAR_INTERVAL, "sec_edgar_ft": SEC_EDGAR_FT_INTERVAL,
     "sec_activist": SEC_ACTIVIST_INTERVAL,
+    "sec_keyword": SEC_KEYWORD_INTERVAL,
     "google_news": GOOGLE_NEWS_INTERVAL, "nitter": NITTER_INTERVAL,
     "substack": SUBSTACK_INTERVAL, "finnhub": FINNHUB_INTERVAL,
     "alphavantage": ALPHAVANTAGE_INTERVAL, "polygon": POLYGON_INTERVAL,
@@ -973,6 +976,27 @@ def sec_activist_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(SEC_ACTIVIST_INTERVAL)
+
+
+# ── Worker: SEC Keyword Event Monitor — once per hour ────────────────────────
+def sec_keyword_worker(store: ArticleStore):
+    log.info("[sec_keyword_worker] started")
+    bo = Backoff("sec_keyword", base=30.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_sec_keyword_monitor()
+            _ingest(store, articles, "sec_keyword")
+            try:
+                source_health.record_result("sec_keyword", len(articles))
+            except Exception as he:
+                log.warning(f"[sec_keyword_worker] source_health error: {he}")
+            _worker_last_ok["sec_keyword"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[sec_keyword_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SEC_KEYWORD_INTERVAL)
 
 
 # ── Worker: Nitter / Twitter — every 3min ───────────────────────────────────
@@ -4374,6 +4398,7 @@ def main():
         ("sec_edgar",   sec_edgar_worker),
         ("sec_edgar_ft", sec_edgar_ft_worker),
         ("sec_activist", sec_activist_worker),
+        ("sec_keyword", sec_keyword_worker),
         ("google_news", google_news_worker),
         ("nitter",      nitter_worker),
         ("substack",    substack_worker),
