@@ -5,6 +5,122 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-25 hybrid pass #36 (Agent 3) — stock_continues_after recap gate
+
+Debugger + feature-dev + news-analyst pass. ~3260 tests green at start; +16
+new gate tests = ~3276 at end. All four load-bearing invariants intact
+(backtest isolation, ml_score vs ai_score, score_source, urgency state).
+
+**Phase 1 (bug fix) — no commit, 0 bugs found:**
+
+Honest survey: explicit-invariant test coverage already complete
+(`test_article_store::test_get_unalerted_urgent_excludes_backtest_urls`,
+`::test_update_ml_scores_batch_sets_ml`, `test_features::EXTRA_FEATURE_DIM
+== 15`, `::days_since_published_*`, `test_model.py` relevance/urgency
+range, `test_trainer::test_excludes_ml_scored_rows`,
+`::test_high_relevance_weighs_more_than_low`). The codebase is mature
+and what remains is tuning, not bugs.
+
+**Phase 2 (feature) — committed in `4c5e113`:**
+
+`stock_continues_after` — the SUBJECT-led post-event continued-state recap
+fingerprint. Sibling of `subject_pct_after` (which requires an explicit %)
+— this catches the SAME retrospective shape WITHOUT a percent.
+
+Live evidence (2026-05-22..25, alert_recency.db push audit + 7d articles.db
+scan): the exact title
+
+  > Nvidia stock continues to struggle after earnings, but analysts remain
+  > firmly bullish
+
+fired 4 distinct Discord BREAKING pushes in 3 days across 4 syndication
+channels (Invezz, CryptoRank, MSN, TradingView). Every copy
+`score_source='ml'` ml_score 9.81-9.99. The exact push at
+`2026-05-25T00:57:21.367611+00:00` is recorded in `alert_recency.db` —
+verified live, ~30 min before the gate landed.
+
+No existing recap-family sibling caught this:
+  * `subject_pct_after` requires `\d+(?:\.\d+)?\s*%` — no explicit move.
+  * `why_stock_is_after` / `why_pct_after` require a leading `^Why`.
+  * `whats_next_after` requires "what's/is next after" phrasing.
+
+Discriminator: subject lead (≤5 tokens, NOT `^Why` — strict negative
+lookahead keeps it orthogonal to the Why-led siblings) + literal `stock`
+token + state-continuation verb from a closed list
+(`continues|keeps|stays|remains`) + `\bafter\b` retrospective anchor +
+earnings/event-noun terminator. The state-continuation verb closed list is
+what distinguishes recap from forward news ("nears", "extends rally",
+"could soar", "to watch" — none in the list, so real wire copy survives).
+
+Empirical false-positive bar (2026-05-25 audit): ZERO false positives
+across 55,488 titles in the last 7 days; the full 30-day urgency=2 set
+(1340 titles) matched only the 4 canonical "Nvidia stock continues to
+struggle after earnings" syndication copies — exactly the target failure,
+nothing else.
+
+Byte-identical regex on both the alert side
+(`watchers.alert_agent._RT_STOCK_CONTINUES_AFTER`) AND the briefing side
+(`analysis.claude_analyst._BRIEFING_RT_STOCK_CONTINUES_AFTER`), per the
+lockstep / anti-drift discipline structurally enforced by
+`test_alert_and_briefing_recap_tuples_have_same_length` (now `25 == 25`).
+
+16 new tests pin: all 4 syndication copies of the live failure match (both
+sides), 6 family-variant generalisations (other state-cont verbs / event
+terminators), 8 real recent push titles must NOT match (verbatim from
+`alert_recency.db` — JPMorgan PT lift / BoA PT revamp / "NVDA stock as Q1
+report looms" / etc.), 10 forward-looking corpus stays unflagged
+(including the `still`-edge case `still has room to run after earnings`
+which is deliberately not caught), gate registration on both sides, SSOT
+parity between alert and briefing gates on the same input, and
+empty/None title defensive contract.
+
+Load-bearing invariants intact by construction: pure read-side, no DB
+write, no ai_score/ml_score/score_source/urgency mutation, no
+articles.db touch.
+
+**Phase 3 (live validation) — 4 findings:**
+
+1. **Live failure validated**: `alert_recency.db` records the exact target
+   title pushed at `2026-05-25T00:57:21` (`ml_score=9.8`,
+   `score_source='ml'`), ~30 min before the gate landed. With the new
+   code deployed, this push is suppressed. The Phase 2 commit is a
+   measurable noise reduction, not a hypothetical fix.
+2. **Briefing cadence DRIFTING**: last 10 intervals (h): 6.26, 10.23,
+   7.08, 10.26, 5.09, 27.64, 5.21, 5.43, 8.61, 17.03. Mean 10.28h vs
+   `HEARTBEAT_INTERVAL=5h` (drift +105.7%, max 27.64h gap).
+   `briefing_cadence_trend` would flag DRIFTING. Latest briefing 3.82h
+   old — point-in-time HEALTHY but trend materially slipping. Likely
+   Claude quota / auth lapse; no code change here (already-known
+   sibling condition).
+3. **Ingestion healthy**: 341 articles/hr last 1h, ~696/hr peak last 4h.
+   Live-only filtering working. 24h split: 12 LLM-labeled urgent + 12
+   ML-labeled = 24 total alerts, ~50% ML-only fraction. The new gate
+   should reduce ML-only push count going forward (the canonical target
+   was ML-only).
+4. **Source health (informational)**: 1094 of 1402 known live-source
+   tags had zero rows in last 6h. Most are sparse-tail aggregator hosts
+   (`GDELT/<random-host>.com` firehose — normal). YahooFinance/NVDA
+   showed dark which is unexpected but did not break flow elsewhere.
+   2 urgency=1 rows >24h old (consistent with the documented
+   `di-stale-urgent-reaper-oscillation` memory). Daemon log clean — no
+   ERROR / Traceback in last 300 lines.
+
+**Files touched:**
+
+- `watchers/alert_agent.py` — `_RT_STOCK_CONTINUES_AFTER` definition +
+  registration in `_RECAP_TEMPLATE_PATTERNS` (alert-path canonical).
+- `analysis/claude_analyst.py` — `_BRIEFING_RT_STOCK_CONTINUES_AFTER` +
+  registration in `_BRIEFING_RECAP_TEMPLATE_PATTERNS` (briefing-path
+  byte-identical mirror).
+- `tests/test_recap_stock_continues_after.py` (new, 222 lines, 16 tests).
+- `AGENTS.md` (this entry).
+
+No other repo changes — `urgency_scorer.py` already imports
+`_looks_like_recap_template` from `alert_agent` (single source of truth)
+so the pre-Sonnet pre-floor for this fingerprint engages automatically.
+
+---
+
 ## 2026-05-25 hybrid pass #35 (Agent 3) — pushed_alert_event_concentration
 
 Debugger + feature-dev + news-analyst pass. 3268 tests green at start;
