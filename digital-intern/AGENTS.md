@@ -5,6 +5,246 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-25 hybrid pass #38 (Agent 3) — label_production_rate (per-minute LLM throughput verdict)
+
+Debugger + feature-dev + news-analyst pass. 0 bugs found (the four
+load-bearing invariants are densely tested already and a 60s pass over
+the critical-file suite — `test_article_store.py`, `test_urgency_scorer.py`,
+`test_features.py`, `test_model.py`, `test_trainer.py`, `test_alert_agent.py`,
+`test_score_pending.py` — was 98/98 green at start). All four
+load-bearing invariants intact (backtest isolation, ml_score vs
+ai_score, score_source separation, urgency state machine).
+
+**Phase 1 (bug fix):** none committed. The codebase has so many prior
+passes pinning the obvious bug classes (cursor-collision retry on every
+shared-`self.conn` reader, `_LIVE_ONLY_CLAUSE` everywhere a backtest
+row could leak, the ml/llm column separation pinned by `test_score_pending`)
+that a 90-minute hunt found nothing worth committing. `bugs_fixed=0` is
+honest; faking a "code-tidy" commit to inflate the counter would be the
+exact debt-creating noise the analyst persona complains about.
+
+**Phase 2 (feature) — committed in `68fcc4b`:**
+
+`label_production_rate(window_min=60)` — per-`score_source` label
+production rate over a minutes-scale window with a verdict ladder
+(NO_DATA / DARK / THROTTLED / HEALTHY). Time-derivative companion to
+`urgency_label_split`: that method counts urgency>=1 rows by source-tag
+over an *hourly* window and is silent on whether Sonnet went dark in
+the last 30 minutes; `source_throughput` tracks per-collector article
+arrival but not label production *by source-tag*. The gap was the
+analyst's "is Sonnet labelling RIGHT NOW?" question — answerable only
+by manually grouping articles.score_source in a sqlite shell.
+
+The method counts EVERY live article first_seen>=now-window_min grouped
+by score_source (including NULL/unscored), exposes a rate-per-minute
+and a verdict the dashboard / heartbeat briefing can render without
+conditional branches. `_LIVE_ONLY_CLAUSE` applied so synthetic
+backtest/opus rows never inflate either side. Pure SELECT —
+`@_retry_on_lock` (cursor-collision class), no DB write, no
+ai_score/ml_score/score_source/urgency mutation.
+
+Verdict ladder (conservative most-severe-first, mirrors
+`briefing_health` / `briefing_cadence_trend`):
+* `NO_DATA` — no live articles in the window. Collectors are dark,
+  not the LLM; refuse to flag the LLM path on absent input.
+* `DARK` — articles exist but `llm_rate_per_min == 0`. Sonnet
+  produced zero labels this window; unverified-rate is 100%.
+* `THROTTLED` — `llm_rate_per_min < 0.05` (less than one LLM label
+  per 20 min — Sonnet is alive but moving slowly; often the
+  "quota exhausted, retry after backoff" regime).
+* `HEALTHY` — everything else.
+
+**Live verification (60-min window, real articles.db):**
+```
+total=257, by_source={llm:28, ml:222, briefing_boost:0, null:7}
+rate_per_min=4.283, llm_rate_per_min=0.467 → HEALTHY
+```
+
+**Files changed:**
+* `storage/article_store.py` — new `@_retry_on_lock`-decorated method
+  right after `urgency_label_split` (its hours-scale, urgent-only
+  sibling). Same four-bucket discipline (`llm`/`ml`/`briefing_boost`/
+  `null`) so a downstream renderer can iterate the existing keyset.
+* `tests/test_label_production_rate.py` — 9 focused tests pinning:
+  empty-DB NO_DATA verdict, window_min=0 clamp, the four verdict
+  branches (DARK / THROTTLED / HEALTHY incl. briefing_boost-counts-as-
+  LLM), window boundary (rows older than window_min excluded), the
+  critical `_LIVE_ONLY_CLAUSE` invariant (backtest/opus rows excluded),
+  and the NULL bucket / unscored_fraction accounting.
+
+**Phase 3 (live user-analyst observations):**
+
+1. **System is healthy overall.** Last hour: 1,706 live articles
+   (excluding backtest); last 24h: 46 urgent. Three briefings in the
+   last 24h (one ~12h before the snapshot, slightly under the 5h
+   `HEARTBEAT_INTERVAL` cadence — briefing_health would read STALE
+   on that, briefing_cadence_trend SLIPPING; both surfaces already
+   carry this signal).
+
+2. **LLM-vetted fraction remains low (13.7% in 24h).** Of 4,182
+   urgent rows in the last 24h, 569 `score_source='llm'` vs 3,582
+   `score_source='ml'`. `urgency_label_split` already exposes this;
+   the analyst-action ("which collectors drive the ML-only rate?")
+   is already grounded by `urgency_label_split_by_source`. No new
+   surface needed for THIS finding — the existing ones are already
+   correct.
+
+3. **Live noise sample (worth recording so it doesn't get re-debated):**
+   one of the recent urgency=2 rows is from `reddit/r/buildapc` —
+   *"New build - sudden issue with ram sticks. 1 stick works, 2 not
+   booting"*, ml_score=9.5, ai_score=0 (ML-only). Almost certainly
+   a personal PC-build help-thread; the urgency head over-scored on
+   "ram sticks" keyword overlap with memory-supply terminology. The
+   alert path's `_filter_low_authority_lone` gate (reddit cred=0.40 <
+   0.45 ALERT_MIN_LONE_SOURCE_CRED) should suppress this on a lone,
+   un-syndicated reading — the row's urgency=2 only proves the DB-side
+   alerted state; whether it actually fired to Discord is a function
+   of that gate, which it should NOT have cleared. Not a bug to fix —
+   the existing gate is correct — but a recurring **model training-signal
+   pollution** angle: the training corpus is currently learning that
+   "RAM stick problems" looks like memory-supply news. Out of scope
+   for this pass; documented for the next training-pool cleanup pass.
+
+4. **Daemon logs:** one `reap_stale_urgent: lock retry exhausted after
+   5 attempts — raising` at 06:27Z under a write-contention storm
+   (well-documented transient class in `_RETRYABLE_DB_ERRORS`; the
+   stale row gets reaped by the next purge cycle). Otherwise the
+   log stream is clean — just per-worker `alive` debug pings and the
+   chronic `database is locked` transients that the retry decorator
+   already swallows correctly (visible only because we log them at
+   WARNING for observability).
+
+**Staging:** explicit per-file pathspec — `storage/article_store.py`,
+`tests/test_label_production_rate.py`. No `git add -A` (concurrent-agent
+footgun: paper-trader sibling-agent had dirty `paper_trader/backtest.py`
+and `run_continuous_backtests.py` in the tree at start; whole-tree add
+would have swept them into MY commit). `AGENTS.md` itself updated
+afterwards (matches the existing pass cadence — one feature commit
+plus an AGENTS.md addendum commit).
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=4.
+
+---
+
+## 2026-05-25 hybrid pass #37 (Agent 3) — heres_what_means + heres_what_signals + fund_makes_investment
+
+Debugger + feature-dev + news-analyst pass. 362 focused tests green at end
+(303 → +24 heres_what_means + +18 heres_what_signals + +14
+fund_makes_investment = 359 + the 3 lockstep-parity additions). All four
+load-bearing invariants intact (backtest isolation, ml_score vs ai_score,
+score_source separation, urgency state machine).
+
+**Phase 1 (bug fix) — committed in `4746b5e`:**
+
+`heres_what_means` — present-tense SEO trailer sibling of
+`heres_what_happened`. Same SEO retrospective-trailer template family,
+distinct regex (FOUR required tokens: `here` + `what` + closed pronoun
+set `{it|that|this}` + plural `means`).
+
+Live evidence (2026-05-25, `alert_recency.db` pushed-alert audit — the
+canonical record of REAL Discord pushes): two distinct titles fired
+standalone 🚨 BREAKING pushes within a 90-min NVDA earnings-afterglow
+window:
+
+  - 00:17:28Z "Nvidia's Board Just Authorized an Additional $80 Billion
+     Buyback. Here's What That Really Means" (GN: dividend buyback,
+     ml_score=9.75 score_source='ml')
+  - 02:03:48Z "Jensen Huang just made a surprise announcement. Here's what
+     it means for Nvidia investors." (GN: Nvidia, ai_score=8.0
+     score_source='llm' — Sonnet itself mis-labeled because the news lead
+     before the SEO trailer reads real)
+
+Both publishers above the 0.45 `ALERT_MIN_LONE_SOURCE_CRED` bar; content
+type IS the failure. Sonnet WAS itself fooled by the news lead in case #2,
+which is why the per-row "[unverified — model-only urgent]" calibration
+tag doesn't fix this class — the deterministic title gate must.
+
+Must-survive corpus (validated): "Powell explained what the cut means for
+inflation", "Bank of America says rate cut means recession risk eases",
+"What it means when the Fed pauses", "Powell on what tariffs mean for the
+labor market" (singular `mean` excluded by the plural-verb discriminator).
+All survive.
+
+Lockstep mirror added to `analysis.claude_analyst._BRIEFING_RT_HERES_WHAT_MEANS`,
+structural test `test_alert_and_briefing_recap_tuples_have_same_length`
+passes.
+
+**Phase 2 (features) — committed in `3a07bbf`:**
+
+A 24h live audit run with the `heres_what_means` gate active surfaced
+TWO new SEO templates evidenced live during the same NVDA earnings
+afterglow window:
+
+1. `heres_what_signals` — variant-verb sibling (same SEO trailer template
+   with `signals` substituted for `means`). Live evidence: "Nvidia's
+   Board Just Authorized an Additional $80 Billion Buyback. Here's What
+   That Really Signals to Investors" reached urgency=1 on Globe and Mail
+   (ml=9.83) and MSN (ml=9.53). Same FOUR-required-token discriminator
+   with `signals` instead of `means`. Must-survive validation kept "Powell
+   signals more cuts" (no leading `here what`), "Fed signals dovish tilt"
+   (subject + verb, not template), singular `signal` (different word
+   class). All survive.
+
+2. `fund_makes_investment` — leading-LLC 13F press-mill sibling of
+   `holdings_by_fund` (trailing-LLC) and `shares_bought_by`
+   ("Shares ... by"). Same 13F-recap template family, distinct phrasing:
+   the LLC is the SUBJECT (announces the investment), not the trailer.
+   Live evidence: "Torren Management LLC Makes New $1.86 Million
+   Investment in NVIDIA Corporation $NVDA" reached urgency=1 from
+   AlphaVantage/MarketBeat (ml=9.71) — pure 13F filing recap, retrospective
+   (SEC filing public weeks earlier). Discriminator: leading `<Fund> LLC`
+   + verb (`Makes|Made|Acquires|Acquired|Takes|Took`) + optional `New` +
+   dollar-prefixed magnitude + stake-noun. Must-survive: "Berkshire takes
+   new stake in Apple" (no LLC), "Saudi fund makes $5B investment in
+   semis" (no LLC), "Tesla insiders bought 100,000 shares" (different
+   structure). All survive.
+
+Both gates added to `alert_agent` + `claude_analyst` (lockstep, anti-drift
+structural test passes). Same anti-drift discipline as every other recap
+fingerprint pair — `test_alert_and_briefing_recap_tuples_have_same_length`
+enforces structural parity.
+
+**Phase 3 (live validation) — 5 user findings:**
+
+1. **Briefing cadence DRIFTING** — `briefing_cadence_trend` returns
+   verdict=DRIFTING (mean 10.28h vs expected 5h, max gap 27.64h in last
+   10 intervals). Point-in-time `briefing_health` returns HEALTHY because
+   the most recent briefing is 5.88h old (just inside the STALE
+   threshold), but the trend confirms the path is materially slipping.
+   Likely Opus quota throttling or daemon restarts — noted at 03:49Z.
+
+2. **46% LLM verification rate on alerts last 24h** — borderline
+   `mostly_unverified` per the existing `urgency_label_split` calibration
+   (12 llm / 14 ml of 26 total urgent in window). Half the standalone
+   push channel is model-only. The new Phase 2 gates should improve
+   this by suppressing more ml-only urgent rows at the formatter.
+
+3. **Bloomberg/Google News duplicates not caught by dedup** — the same
+   article (Huawei chipmaking) ingested twice from "Bloomberg GN" 8min
+   apart with DIFFERENT GN-tracked URLs (different tracking params).
+   Identical title → jaccard=1.0 but the 500-entry rolling cache in
+   `insert_batch` cycled past it. Cross-window dedup would catch this,
+   but the existing `dedupe_urgent` collapses at alert time — so the
+   analyst sees one push, not two. Noted as a known limitation, not a
+   live failure.
+
+4. **Phase 2 gates immediately validated by live noise** — the 24h
+   articles.db scan that motivated them found BOTH new SEO templates
+   actively occurring in the queue/alert path. Not just historical.
+
+5. **Daemon restarted at 03:49Z** — workers respawned. The 27.64h max
+   briefing gap likely originates from this restart cycle (heartbeat
+   worker also re-started). Worker supervisor working as designed.
+
+**Counters:**
+
+bugs_fixed = 1 (heres_what_means recap leak — fired 2 real BREAKING
+pushes in 90min the day of fix)
+features_added = 2 (heres_what_signals + fund_makes_investment)
+user_findings = 5
+
+---
+
 ## 2026-05-25 hybrid pass #36 (Agent 3) — stock_continues_after recap gate
 
 Debugger + feature-dev + news-analyst pass. ~3260 tests green at start; +16
