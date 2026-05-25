@@ -1590,6 +1590,22 @@ _BRIEFING_RT_HERES_WHAT_HAPPENED = re.compile(
     r"\bhere(?:[s'’]+|\s+is)?\s+what\s+happened\b",
     re.IGNORECASE,
 )
+# "<headline>. Here's What It Means [for X]" / "Here's What That Really Means" —
+# lockstep mirror of ``watchers.alert_agent._RT_HERES_WHAT_MEANS``. Present-
+# tense SEO-trailer sibling of ``_BRIEFING_RT_HERES_WHAT_HAPPENED`` (which only
+# catches the past-tense "happened" form). Live evidence (2026-05-25, alert_
+# recency.db pushed-alert audit): "Nvidia's Board Just Authorized an Additional
+# $80 Billion Buyback. Here's What That Really Means" and "Jensen Huang just
+# made a surprise announcement. Here's what it means for Nvidia investors."
+# fired standalone 🚨 BREAKING pushes within 90 minutes — without this
+# briefing-side mirror the per-domain cap admits them into the briefing's
+# top-50 digest pool. Byte-identical regex to the alert side (anti-drift
+# discipline, enforced structurally by
+# ``test_alert_and_briefing_recap_tuples_have_same_length``).
+_BRIEFING_RT_HERES_WHAT_MEANS = re.compile(
+    r"\bhere(?:[s'’]+|\s+is)?\s+what\s+(?:it|that|this)(?:\s+really)?\s+means\b",
+    re.IGNORECASE,
+)
 # "[Wikipedia] <article title>" — lockstep mirror of
 # ``watchers.alert_agent._RT_WIKIPEDIA_REF``. The ``collectors.wikipedia_collector``
 # emits encyclopedic recent-changes rows with this exact prefix, and the ML
@@ -1854,6 +1870,9 @@ _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("earnings_call_recap", _BRIEFING_RT_EARNINGS_CALL),
     ("quick_glance_metrics", _BRIEFING_RT_QUICK_GLANCE),
     ("heres_what_happened", _BRIEFING_RT_HERES_WHAT_HAPPENED),
+    # Present-tense SEO-trailer sibling — lockstep mirror of the alert path's
+    # same-named gate. See ``_BRIEFING_RT_HERES_WHAT_MEANS`` for live evidence.
+    ("heres_what_means", _BRIEFING_RT_HERES_WHAT_MEANS),
     ("wikipedia_ref", _BRIEFING_RT_WIKIPEDIA_REF),
     ("earnings_tomorrow_preview", _BRIEFING_RT_EARNINGS_TOMORROW),
     ("todays_movers_list", _BRIEFING_RT_TODAYS_MOVERS),

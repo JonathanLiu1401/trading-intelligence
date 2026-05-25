@@ -831,6 +831,59 @@ _RT_HERES_WHAT_HAPPENED = re.compile(
     re.IGNORECASE,
 )
 
+# "<headline>. Here's What It Means [for X]" / "Here's What That Really Means" —
+# present-tense SEO trailer sibling of ``_RT_HERES_WHAT_HAPPENED`` (which only
+# catches the past-tense "happened" form). Same SEO retrospective-trailer
+# template family, distinct regex.
+#
+# Live evidence (2026-05-25, alert_recency.db pushed-alert audit — the
+# canonical record of REAL Discord pushes): two distinct titles fired
+# standalone 🚨 BREAKING pushes within a 90-minute window of NVDA earnings
+# afterglow:
+#   - "Nvidia's Board Just Authorized an Additional $80 Billion Buyback.
+#      Here's What That Really Means" at 00:17:28Z (GN: dividend buyback,
+#      ml_score=9.75 score_source='ml')
+#   - "Jensen Huang just made a surprise announcement. Here's what it means
+#      for Nvidia investors." at 02:03:48Z (GN: Nvidia, ai_score=8.0
+#      score_source='llm' — Sonnet ALSO mis-labeled this as urgent because
+#      the news lead before the SEO trailer was real, even though the rest
+#      of the title adds nothing actionable)
+# Both publishers sit above the 0.45 ``ALERT_MIN_LONE_SOURCE_CRED`` bar so
+# the source-authority gate doesn't catch them; content type IS the failure.
+# By the time a headline trails with "Here's what it means", the lead has
+# already named the event and the trailer is filler — the SEO trailer adds
+# zero new information the analyst can trade on.
+#
+# Discriminator: ``\bhere(?:[s'’]+|\s+is)?\s+what\s+(?:it|that|this)(?:\s+really)?
+# \s+means\b``. FOUR required tokens (``here`` + ``what`` + closed pronoun set +
+# ``means``) — the closed pronoun set (``it``/``that``/``this``) is what makes
+# this safe against real news that uses "means" mid-sentence ("Bank of America
+# says rate cut means recession risk eases"). The leading ``here`` anchor
+# excludes leading-``what`` constructions ("What it means when the Fed pauses",
+# "What does this mean for traders?"). The plural ``means`` (verb) is REQUIRED
+# — singular ``mean`` (noun) is a different word class and doesn't appear in
+# this template ("Powell on what tariffs mean for the labor market" is NOT
+# caught because it uses ``mean`` not ``means``). Three apostrophe forms
+# covered for the Here['s|s|is] alternation (ASCII straight ', curly ’, no
+# apostrophe), mirroring ``_RT_HERES_WHAT_HAPPENED``.
+#
+# Validated against the must-survive corpus: "Powell explained what the cut
+# means for inflation" (no leading ``here``), "Analysts weigh in on what the
+# buyback means" (no leading ``here``), "What it means when the Fed pauses"
+# (leading ``what`` not ``here``), "Bank of America says rate cut means
+# recession risk eases" (no ``here what`` lead-in), "What does this mean for
+# traders?" (no ``means`` — uses ``mean``), "Powell on what tariffs mean for
+# the labor market" (no ``means`` — uses ``mean``). All survive.
+#
+# Defense-in-depth: a byte-identical twin lives in
+# ``analysis.claude_analyst._BRIEFING_RT_HERES_WHAT_MEANS`` — the documented
+# lockstep, enforced structurally by
+# ``test_alert_and_briefing_recap_tuples_have_same_length``.
+_RT_HERES_WHAT_MEANS = re.compile(
+    r"\bhere(?:[s'’]+|\s+is)?\s+what\s+(?:it|that|this)(?:\s+really)?\s+means\b",
+    re.IGNORECASE,
+)
+
 # "[Wikipedia] <article title>" — the canonical title prefix emitted by
 # ``collectors.wikipedia_collector`` for recent-changes mainspace edits. By
 # definition encyclopedic reference content, NOT breaking news: a Wikipedia
@@ -1309,6 +1362,11 @@ _RECAP_TEMPLATE_PATTERNS = (
     ("earnings_call_recap", _RT_EARNINGS_CALL),
     ("quick_glance_metrics", _RT_QUICK_GLANCE),
     ("heres_what_happened", _RT_HERES_WHAT_HAPPENED),
+    # Present-tense SEO-trailer sibling of ``heres_what_happened``. Distinct
+    # regex, distinct fingerprint name so per-template audit counters
+    # (``analytics.recap_template_audit`` etc.) bucket each variant separately.
+    # See ``_RT_HERES_WHAT_MEANS`` for live evidence.
+    ("heres_what_means", _RT_HERES_WHAT_MEANS),
     ("wikipedia_ref", _RT_WIKIPEDIA_REF),
     ("earnings_tomorrow_preview", _RT_EARNINGS_TOMORROW),
     ("todays_movers_list", _RT_TODAYS_MOVERS),
