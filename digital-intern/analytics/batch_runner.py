@@ -62,6 +62,13 @@ PIPELINE: list[tuple[str, Path, int]] = [
     # across the 8,000 most recent live rows.
     ("analytics.source_quality",         LOGS / "source_quality.json",          50),
     ("analytics.volume_quality_divergence", LOGS / "volume_quality_divergence.json", 50),
+    # Cold-start ticker detector: tickers seen in the last 60 min that had zero
+    # mentions in the prior 6h. Surfaces newly-emerging symbols before they
+    # appear in trend_velocity's top-5.
+    ("analytics.ticker_first_mention",    LOGS / "ticker_first_mention.json",    50),
+    # Urgency drought: time since last urgency>=2 article — catches pipeline
+    # stalls (quota exhaustion, scoring backlog) before they're noticed manually.
+    ("analytics.urgency_drought",         LOGS / "urgency_drought.json",         50),
 ]
 
 TIMEOUT_S = 60  # per-module hard timeout
