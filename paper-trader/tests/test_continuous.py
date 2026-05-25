@@ -2703,3 +2703,254 @@ class TestWalkBackInversionGuard:
                     # forward computation: positive sign matches SPY's
                     # monotonic rise (we used 100 + idx for SPY).
                     assert o["forward_return_10d"] >= -50.0
+
+
+# ─── OOS-inference feature parity with _ml_decide (pass #36 fix) ──────────
+
+class TestOosFeatureParityEnhancedMacd:
+    """Pin: the 3 enhanced MACD features (``ema200_above`` / ``hist_cross_up``
+    / ``macd_below_zero_cross``) captured by ``_compute_decision_outcomes``
+    (pass #35) and forwarded by ``_ml_decide`` (pass #35) MUST also be
+    forwarded by every OOS-evaluation predict call — otherwise the per-cycle
+    scorer-skill ledger reports OOS metrics computed on a degraded feature
+    vector (defaulted None → 0.0) while the live gate predicts with the real
+    signal. The deployed pickle's first-layer ``mean|w|`` for these slots is
+    non-zero (≈0.45 / 0.26 / 0.24), so the bias is real, not cosmetic. These
+    tests are the OOS-side complement of ``TestEnhancedMacdFeaturePlumbing``.
+    """
+
+    @staticmethod
+    def _capturing_scorer(returns: float = 0.0):
+        """Return (scorer, captured) where every predict_with_meta call
+        records its kwargs into ``captured`` and returns a fixed prediction.
+        """
+        captured: list[dict] = []
+
+        class _Capturing:
+            is_trained = True
+            _n_train = 1000
+
+            def predict_with_meta(self, **kw):
+                captured.append(dict(kw))
+                return {"pred": returns, "raw": returns, "clamped": False,
+                        "off_distribution": False, "percentile": None,
+                        "calibrated": None, "failed": False}
+
+            def predict(self, **kw):  # never expected, but mirror real shape
+                captured.append(dict(kw))
+                return returns
+
+        return _Capturing(), captured
+
+    def test_oos_rank_metrics_forwards_enhanced_macd_kwargs(self):
+        """``_oos_rank_metrics`` predict_with_meta call must include all 3
+        enhanced MACD kwargs with the row's actual values — defaulting to
+        None at the scorer is a different prediction than the live gate
+        produces because the model's weights for those slots are non-zero.
+        """
+        scorer, captured = self._capturing_scorer(returns=0.5)
+        record = {
+            "forward_return_5d": 1.0,
+            "action": "BUY",
+            "ticker": "NVDA",
+            "ml_score": 2.0, "rsi": 55.0, "macd": 0.02,
+            "mom5": 1.5, "mom20": 3.0,
+            "regime_mult": 1.0,
+            "vol_ratio": 1.2, "bb_position": 0.3,
+            "news_urgency": 80.0, "news_article_count": 4.0,
+            # The 3 enhanced MACD features — captured by
+            # `_compute_decision_outcomes` since pass #35 and surfaced
+            # here as True/False booleans like the real outcome rows do.
+            "ema200_above": True,
+            "hist_cross_up": True,
+            "macd_below_zero_cross": False,
+        }
+        rcb._oos_rank_metrics(scorer, [record])
+        assert len(captured) == 1, "expected exactly one predict call"
+        kw = captured[0]
+        for key in ("ema200_above", "hist_cross_up",
+                    "macd_below_zero_cross"):
+            assert key in kw, (
+                f"_oos_rank_metrics dropped enhanced MACD kwarg {key!r} "
+                f"— captured keys: {sorted(kw.keys())}"
+            )
+        # And the VALUES must reach the scorer untouched. Pre-fix the
+        # kwarg was absent entirely, so build_features defaulted to None
+        # → 0.0; post-fix the real True/False reaches the scorer.
+        assert kw["ema200_above"] is True
+        assert kw["hist_cross_up"] is True
+        assert kw["macd_below_zero_cross"] is False
+
+    def test_oos_multi_horizon_forwards_enhanced_macd_kwargs(self):
+        """Same parity contract for the 10d/20d horizon metric path."""
+        scorer, captured = self._capturing_scorer(returns=0.5)
+        record = {
+            "forward_return_10d": 1.0,
+            "forward_return_20d": 1.5,
+            "action": "BUY",
+            "ticker": "NVDA",
+            "ema200_above": True,
+            "hist_cross_up": False,
+            "macd_below_zero_cross": True,
+        }
+        rcb._oos_multi_horizon_metrics(scorer, [record], horizons=(10, 20))
+        assert len(captured) == 1, "predict should be called once per row"
+        kw = captured[0]
+        for key in ("ema200_above", "hist_cross_up",
+                    "macd_below_zero_cross"):
+            assert key in kw, (
+                f"_oos_multi_horizon_metrics dropped enhanced MACD kwarg "
+                f"{key!r} — captured keys: {sorted(kw.keys())}"
+            )
+        assert kw["ema200_above"] is True
+        assert kw["hist_cross_up"] is False
+        assert kw["macd_below_zero_cross"] is True
+
+    def test_oos_rank_metrics_legacy_predict_fallback_forwards_enhanced_macd(
+            self):
+        """Test fakes without ``predict_with_meta`` fall back to the
+        scalar ``predict()`` path. That fallback must also forward the
+        enhanced MACD kwargs so a future Dummy / unit-test scorer doesn't
+        silently lose feature signal.
+        """
+        captured: list[dict] = []
+
+        class _LegacyScorer:
+            is_trained = True
+
+            def predict(self, **kw):
+                captured.append(dict(kw))
+                return 0.4
+
+        record = {
+            "forward_return_5d": 1.0,
+            "action": "BUY",
+            "ticker": "NVDA",
+            "ema200_above": True,
+            "hist_cross_up": True,
+            "macd_below_zero_cross": False,
+        }
+        rcb._oos_rank_metrics(_LegacyScorer(), [record])
+        assert len(captured) == 1
+        kw = captured[0]
+        for key in ("ema200_above", "hist_cross_up",
+                    "macd_below_zero_cross"):
+            assert key in kw, (
+                f"legacy predict fallback dropped {key!r} — captured "
+                f"keys: {sorted(kw.keys())}"
+            )
+
+    def test_evaluate_scorer_oos_forwards_enhanced_macd_kwargs(self):
+        """The matching ``validation.evaluate_scorer_oos`` path —
+        responsible for the ledger's ``oos_rmse`` / ``oos_buy_rmse`` /
+        ``oos_sell_rmse`` tokens — must also forward the enhanced MACD
+        kwargs. Without this, RMSE is computed against a feature vector
+        the live gate would never produce."""
+        from paper_trader import validation
+
+        scorer, captured = self._capturing_scorer(returns=0.3)
+        record = {
+            "forward_return_5d": 1.0,
+            "action": "BUY",
+            "ticker": "NVDA",
+            "ema200_above": False,
+            "hist_cross_up": True,
+            "macd_below_zero_cross": True,
+        }
+        validation.evaluate_scorer_oos(scorer, [record])
+        assert len(captured) == 1, "evaluate_scorer_oos predicts once per row"
+        kw = captured[0]
+        for key in ("ema200_above", "hist_cross_up",
+                    "macd_below_zero_cross"):
+            assert key in kw, (
+                f"evaluate_scorer_oos dropped enhanced MACD kwarg "
+                f"{key!r} — captured keys: {sorted(kw.keys())}"
+            )
+        assert kw["ema200_above"] is False
+        assert kw["hist_cross_up"] is True
+        assert kw["macd_below_zero_cross"] is True
+
+    def test_oos_metric_value_changes_when_enhanced_macd_signal_changes(self):
+        """End-to-end pin: holding every other feature constant, varying ONLY
+        ``ema200_above`` MUST change the trained scorer's OOS prediction —
+        otherwise the OOS-side fix is cosmetic. Uses a real trained scorer
+        (the lstsq fallback path; deterministic and fast) so this also
+        confirms the model actually consumes the kwarg the OOS path now
+        forwards. Pre-fix the value was constant (defaulted None → 0.0 at
+        the scorer regardless of what the outcome row carried) and this
+        assertion would fail.
+        """
+        # Build a small synthetic training set where ema200_above is the
+        # ONLY signal carrying information: rows with ema200_above=True
+        # have a positive realized return, False have a negative one.
+        # 30 rows = train_scorer's `len(records) < 30` floor.
+        records = []
+        for i in range(15):
+            records.append({
+                "ticker": "NVDA", "sim_date": f"2025-01-{i+1:02d}",
+                "action": "BUY",
+                "ml_score": 1.0, "rsi": 50.0, "macd": 0.0,
+                "mom5": 0.0, "mom20": 0.0, "regime_mult": 1.0,
+                "vol_ratio": 1.0, "bb_position": 0.0,
+                "news_urgency": 50.0, "news_article_count": 1.0,
+                "ema200_above": True, "hist_cross_up": False,
+                "macd_below_zero_cross": False,
+                "forward_return_5d": 5.0,
+            })
+        for i in range(15):
+            records.append({
+                "ticker": "NVDA", "sim_date": f"2025-02-{i+1:02d}",
+                "action": "BUY",
+                "ml_score": 1.0, "rsi": 50.0, "macd": 0.0,
+                "mom5": 0.0, "mom20": 0.0, "regime_mult": 1.0,
+                "vol_ratio": 1.0, "bb_position": 0.0,
+                "ema200_above": False, "hist_cross_up": False,
+                "macd_below_zero_cross": False,
+                "news_urgency": 50.0, "news_article_count": 1.0,
+                "forward_return_5d": -5.0,
+            })
+
+        from paper_trader.ml.decision_scorer import (
+            train_scorer, DecisionScorer)
+        # Use a throwaway pickle path so we never touch the live deployed
+        # scorer (the AGENTS.md "do not race the loop's pickle" rule).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_pkl = Path(tmpdir) / "scorer.pkl"
+            result = train_scorer(records, path=tmp_pkl)
+            assert result["status"] == "ok", result
+            # Reload via the SCORER_PATH redirect so DecisionScorer picks
+            # up the throwaway pickle, not the live deployed one.
+            from paper_trader.ml import decision_scorer as _ds
+            orig_path = _ds.SCORER_PATH
+            _ds.SCORER_PATH = tmp_pkl
+            # The DecisionScorer module-level _LOAD_CACHE is keyed by
+            # (path, mtime, size) so reading the redirected file gets a
+            # fresh load — no manual cache clear needed.
+            try:
+                scorer = _ds.DecisionScorer()
+                assert scorer.is_trained
+                # Same record, only ema200_above flipped — prediction
+                # must differ if the OOS path's kwarg actually reaches
+                # the model.
+                kwargs = dict(
+                    ml_score=1.0, rsi=50.0, macd=0.0, mom5=0.0, mom20=0.0,
+                    regime_mult=1.0, ticker="NVDA",
+                    vol_ratio=1.0, bb_pos=0.0,
+                    news_urgency=50.0, news_article_count=1.0,
+                    hist_cross_up=False, macd_below_zero_cross=False,
+                )
+                p_true = scorer.predict(ema200_above=True, **kwargs)
+                p_false = scorer.predict(ema200_above=False, **kwargs)
+                # The signal is the only thing varying — the prediction
+                # must change. A tolerant >0.5pp gap accommodates lstsq
+                # noise but proves the kwarg is consumed.
+                assert abs(p_true - p_false) > 0.5, (
+                    f"prediction did not respond to ema200_above kwarg: "
+                    f"true={p_true:+.3f}%, false={p_false:+.3f}%"
+                )
+                # And the sign is the trained direction (True → positive,
+                # False → negative) so this isn't accidental noise.
+                assert p_true > p_false
+            finally:
+                _ds.SCORER_PATH = orig_path

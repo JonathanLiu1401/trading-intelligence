@@ -611,6 +611,18 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
     sell_actuals: list[float] = []
     for r in oos_records:
         try:
+            # OOS-inference feature parity with `_ml_decide` (pass #35).
+            # The 3 enhanced MACD features (ema200_above / hist_cross_up /
+            # macd_below_zero_cross) are now captured by
+            # `_compute_decision_outcomes` and forwarded by the live gate,
+            # but were previously stripped at OOS-RMSE evaluation time —
+            # biasing the reported RMSE away from what the live gate
+            # actually predicts on the same row. The deployed model's
+            # first-layer weights for these slots are meaningful
+            # (mean|w| ≈ 0.45/0.26/0.24), so defaulting them to None → 0.0
+            # systematically shifted OOS magnitudes vs production. Pass
+            # them through so val_rmse / oos_rmse describe apples-to-apples
+            # against the gate's true behaviour.
             if _use_meta:
                 _meta = _pwm(
                     ml_score=_to_float(r.get("ml_score"), 0.0),
@@ -624,6 +636,9 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
                     bb_pos=r.get("bb_position"),
                     news_urgency=r.get("news_urgency"),
                     news_article_count=r.get("news_article_count"),
+                    ema200_above=r.get("ema200_above"),
+                    hist_cross_up=r.get("hist_cross_up"),
+                    macd_below_zero_cross=r.get("macd_below_zero_cross"),
                 )
                 # `failed=True` ⇒ the 0.0 in `pred` is a sentinel, not a real
                 # prediction; drop the row so it cannot contaminate RMSE with
@@ -644,6 +659,9 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
                     bb_pos=r.get("bb_position"),
                     news_urgency=r.get("news_urgency"),
                     news_article_count=r.get("news_article_count"),
+                    ema200_above=r.get("ema200_above"),
+                    hist_cross_up=r.get("hist_cross_up"),
+                    macd_below_zero_cross=r.get("macd_below_zero_cross"),
                 )
             # NaN sentinel default — missing / null / non-finite targets are
             # excluded by the `a == a` guard below, not silently coerced to

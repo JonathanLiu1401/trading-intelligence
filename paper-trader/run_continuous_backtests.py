@@ -1115,6 +1115,17 @@ def _oos_multi_horizon_metrics(scorer, oos_records: list[dict],
         _use_meta_h = callable(_pwm_h)
         for r in oos_records:
             try:
+                # OOS-inference feature parity with `_ml_decide` (pass #35).
+                # The 3 enhanced MACD features (ema200_above / hist_cross_up /
+                # macd_below_zero_cross) are now plumbed in BOTH training
+                # capture (`_compute_decision_outcomes`) AND live inference,
+                # but until they were forwarded here too the OOS-rank metric
+                # was computed on a degraded vector — the model's first-layer
+                # weights for these slots are non-zero (live mean|w|≈0.26
+                # /0.24 /0.45) so defaulting them to None → 0.0 systematically
+                # biased the OOS prediction away from what the live gate
+                # actually sees. Pass them through so OOS rank-IC describes
+                # the same prediction the deployed gate uses on the same row.
                 if _use_meta_h:
                     _meta = _pwm_h(
                         ml_score=_to_float(r.get("ml_score"), 0.0),
@@ -1125,6 +1136,9 @@ def _oos_multi_horizon_metrics(scorer, oos_records: list[dict],
                         vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
                         news_urgency=r.get("news_urgency"),
                         news_article_count=r.get("news_article_count"),
+                        ema200_above=r.get("ema200_above"),
+                        hist_cross_up=r.get("hist_cross_up"),
+                        macd_below_zero_cross=r.get("macd_below_zero_cross"),
                     )
                     # `failed=True` ⇒ the 0.0 in `pred` is a sentinel, not a
                     # real prediction; drop the row from EVERY horizon so it
@@ -1142,6 +1156,9 @@ def _oos_multi_horizon_metrics(scorer, oos_records: list[dict],
                         vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
                         news_urgency=r.get("news_urgency"),
                         news_article_count=r.get("news_article_count"),
+                        ema200_above=r.get("ema200_above"),
+                        hist_cross_up=r.get("hist_cross_up"),
+                        macd_below_zero_cross=r.get("macd_below_zero_cross"),
                     )
                     p = float(p)
                 if p != p:  # NaN — defensive; predict_with_meta caller would
@@ -1288,6 +1305,12 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
         _use_meta = callable(_pwm)
         for r in oos_records:
             try:
+                # OOS-inference feature parity with `_ml_decide` (pass #35).
+                # The 3 enhanced MACD features are now captured by
+                # `_compute_decision_outcomes` and forwarded by the live
+                # gate, but were previously stripped here — biasing OOS
+                # rank-IC away from the gate's actual prediction. Same
+                # rationale as `_oos_multi_horizon_metrics` above.
                 if _use_meta:
                     _meta = _pwm(
                         ml_score=_to_float(r.get("ml_score"), 0.0),
@@ -1298,6 +1321,9 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
                         vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
                         news_urgency=r.get("news_urgency"),
                         news_article_count=r.get("news_article_count"),
+                        ema200_above=r.get("ema200_above"),
+                        hist_cross_up=r.get("hist_cross_up"),
+                        macd_below_zero_cross=r.get("macd_below_zero_cross"),
                     )
                     # `failed=True` ⇒ the 0.0 in `pred` is a sentinel, not a
                     # real prediction; drop the row from EVERY bucket (aggregate,
@@ -1315,6 +1341,9 @@ def _oos_rank_metrics(scorer, oos_records: list[dict]) -> dict:
                         vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
                         news_urgency=r.get("news_urgency"),
                         news_article_count=r.get("news_article_count"),
+                        ema200_above=r.get("ema200_above"),
+                        hist_cross_up=r.get("hist_cross_up"),
+                        macd_below_zero_cross=r.get("macd_below_zero_cross"),
                     )
                 # NaN sentinel default so a missing/non-finite forward return
                 # is *dropped* by the `a == a` guard below, not silently
