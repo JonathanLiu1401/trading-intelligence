@@ -25,7 +25,7 @@ import json
 import re
 import sqlite3 as _sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -328,7 +328,11 @@ def run_and_cache(
     ar_stats = compute_stats(ar_returns)
 
     result = {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        # ``datetime.utcnow()`` is deprecated in Python 3.12 and slated for
+        # removal. Use a tz-aware UTC stamp and emit the same ``...Z`` shape
+        # the consumer (``run_continuous_backtests`` cache-age check) already
+        # tolerates — sibling fix to AGENTS.md pass #38 ``run_continuous``.
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "window": {"start": start_date, "end": end_date},
         "n_tickers": len(prices),
         "tickers_used": sorted(prices.keys()),
@@ -461,7 +465,11 @@ def run_monkey_backtests_to_db(
             total_return_pct = round((final_value / INITIAL_CASH - 1) * 100, 2)
             vs_spy_pct = round(total_return_pct - spy_return_pct, 2)
 
-            now = _dt.datetime.utcnow().isoformat() + "Z"
+            # ``datetime.utcnow()`` is deprecated (Python 3.12+) — tz-aware
+            # UTC with the same ``...Z`` shape preserves the existing column
+            # value. Sibling fix to AGENTS.md pass #38 ``run_continuous``.
+            now = (_dt.datetime.now(_dt.timezone.utc)
+                   .isoformat().replace("+00:00", "Z"))
             conn.execute(
                 "INSERT INTO backtest_runs "
                 "(run_id, seed, start_date, end_date, start_value, final_value, "

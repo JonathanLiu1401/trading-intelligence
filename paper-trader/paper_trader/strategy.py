@@ -272,6 +272,18 @@ def _rsi_live(closes: list[float], period: int = 14) -> float | None:
 
 
 def _macd_live(closes: list[float]) -> str | None:
+    """Return ``"bullish"`` / ``"bearish"`` / ``"flat"`` (or None when there
+    are too few closes).
+
+    Epsilon-tolerant comparison so a steady-state linear trend (where the
+    MACD line and signal line converge to the same value at machine
+    precision) reports ``"flat"`` rather than flapping to bullish/bearish
+    from EMA accumulation roundoff alone. The naive ``macd > signal``
+    comparison polluted Opus's prompt with a false ``macd=bullish`` /
+    ``macd=bearish`` label on flat or slow-trending names, silently
+    misleading the decision engine. Mirrors the ``backtest._macd`` fix
+    documented in AGENTS.md pass #38; the live ``_macd_live`` was the
+    missed sibling."""
     if len(closes) < 35:
         return None
     ema12 = _ema_live(closes, 12)
@@ -285,7 +297,17 @@ def _macd_live(closes: list[float]) -> str | None:
     signal = _ema_live(macd_line, 9)
     if not signal:
         return None
-    return "bullish" if macd_line[-1] > signal[-1] else "bearish"
+    m = macd_line[-1]
+    s = signal[-1]
+    # Tolerance scales with the magnitudes involved so real crossovers
+    # (m - s well above the noise floor) are unaffected.
+    tol = 1e-9 * max(abs(m), abs(s), 1.0)
+    diff = m - s
+    if diff > tol:
+        return "bullish"
+    if diff < -tol:
+        return "bearish"
+    return "flat"
 
 
 _QUANT_CACHE: dict[str, tuple[dict, float]] = {}
