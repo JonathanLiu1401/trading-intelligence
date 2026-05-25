@@ -4116,9 +4116,19 @@ def main() -> None:
             stale = cached is None
             if not stale:
                 try:
-                    gen_at = (cached.get("generated_at") or "").rstrip("Z")
-                    age_h = ((_dt.datetime.utcnow()
-                              - _dt.datetime.fromisoformat(gen_at))
+                    # `monkey_benchmark.run_and_cache` writes
+                    # `datetime.utcnow().isoformat() + "Z"`, a naive ISO
+                    # string with a trailing Z. Parse it as timezone-aware
+                    # UTC so the subtraction below uses a single timezone
+                    # discipline and avoids the deprecated
+                    # `datetime.utcnow()` (slated for removal in a future
+                    # Python release).
+                    gen_at_raw = (cached.get("generated_at") or "")
+                    gen_at = gen_at_raw.rstrip("Z")
+                    gen_dt = _dt.datetime.fromisoformat(gen_at)
+                    if gen_dt.tzinfo is None:
+                        gen_dt = gen_dt.replace(tzinfo=_dt.timezone.utc)
+                    age_h = ((_dt.datetime.now(_dt.timezone.utc) - gen_dt)
                              .total_seconds() / 3600)
                     stale = age_h > 24
                 except Exception:

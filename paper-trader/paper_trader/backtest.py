@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -1019,6 +1020,17 @@ def _ema(values: list[float], period: int) -> list[float]:
 def _rsi(closes: list[float], period: int = 14) -> float | None:
     if len(closes) <= period:
         return None
+    # Reject non-finite closes (NaN / ±Inf from a poisoned price cache or a
+    # bad yfinance row). The Wilder smoothing chain below propagates NaN
+    # silently — every downstream comparison (`avg_l == 0`, `100/(1+rs)`)
+    # collapses to NaN, which then passes _ml_decide's `isinstance(rsi,
+    # (int, float))` guard and feeds the negative branch (`adj -= 0.5`
+    # because `NaN > 0` is False). Returning None instead skips the quant
+    # adjustment honestly so a single poisoned close doesn't silently
+    # penalise every name. Mirrors the discipline `_macd` already follows.
+    for c in closes:
+        if c is None or not math.isfinite(c):
+            return None
     gains, losses = 0.0, 0.0
     # initial averages over first `period` deltas
     for i in range(1, period + 1):
@@ -1048,9 +1060,23 @@ def _rsi(closes: list[float], period: int = 14) -> float | None:
 
 
 def _macd(closes: list[float]) -> tuple[str, float, float] | None:
-    """Return (label, macd, signal). label is 'bullish'/'bearish'/'flat'."""
+    """Return (label, macd, signal). label is 'bullish'/'bearish'/'flat'.
+
+    Non-finite closes (NaN/±Inf from a poisoned price cache) yield None
+    rather than propagating silently — same defensive contract as `_rsi`.
+    The label uses an epsilon tolerance so a steady-state linear trend
+    (where the macd line and signal line converge to the same value and
+    only floating-point roundoff separates them) is reported as ``"flat"``
+    instead of fabricating a bullish/bearish verdict from EMA
+    accumulation order. The threshold is scaled by the magnitudes
+    involved so real crossovers — even small ones — stay
+    classified correctly.
+    """
     if len(closes) < 35:
         return None
+    for c in closes:
+        if c is None or not math.isfinite(c):
+            return None
     ema12 = _ema(closes, 12)
     ema26 = _ema(closes, 26)
     if not ema12 or not ema26:
@@ -1065,7 +1091,19 @@ def _macd(closes: list[float]) -> tuple[str, float, float] | None:
         return None
     m = macd_line[-1]
     s = signal_line[-1]
-    label = "bullish" if m > s else "bearish" if m < s else "flat"
+    # Epsilon-tolerant comparison so a steady-state linear trend (m ≈ s
+    # at machine precision) reports "flat" rather than flapping to
+    # bullish/bearish from EMA accumulation roundoff. Tolerance scales
+    # with the magnitudes involved so real crossovers (m - s well above
+    # the noise floor) are unaffected.
+    tol = 1e-9 * max(abs(m), abs(s), 1.0)
+    diff = m - s
+    if diff > tol:
+        label = "bullish"
+    elif diff < -tol:
+        label = "bearish"
+    else:
+        label = "flat"
     return (label, m, s)
 
 
