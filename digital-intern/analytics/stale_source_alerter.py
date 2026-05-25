@@ -22,6 +22,14 @@ the MAX and the 24h-count comparisons are correct lexicographic string
 compares, then do the staleness arithmetic in Python with timezone-aware
 UTC datetimes.
 
+To keep the per-source ``GROUP BY`` off a full table scan on the 2M-row
+articles table, the SQL restricts rows to the last 3 days via
+``first_seen >= datetime('now', '-3 days')``. ``idx_first_seen`` handles
+that range scan. Sources unseen in 3 days are definitively stale (the
+threshold is 120 min), so nothing healthy is lost; truly dead collectors
+just fall out of the result and don't get a per-source row, which is
+acceptable for a freshness monitor.
+
 Standalone:   ``python3 -m analytics.stale_source_alerter``
 Importable:   ``from analytics.stale_source_alerter import compute_freshness``
 """
@@ -119,6 +127,12 @@ def compute_freshness(now: datetime | None = None) -> dict:
     # take a write lock on the production DB.
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
+        # Restrict to the last 3 days via idx_first_seen so the GROUP BY does
+        # not scan the entire 2M-row table. The staleness threshold is 120
+        # min, so any source not seen in 3 days is definitively stale — we
+        # do not lose any healthy source by the truncation, and stale
+        # collectors still surface (just with last_seen = NULL → is_stale
+        # True via the unparseable branch).
         rows = conn.execute(
             f"""
             SELECT source,
@@ -127,7 +141,8 @@ def compute_freshness(now: datetime | None = None) -> dict:
                             THEN 1 ELSE 0 END)                          AS count_24h,
                    COUNT(*)                                             AS total
             FROM articles
-            WHERE {_LIVE_ONLY_CLAUSE}
+            WHERE first_seen >= datetime('now', '-3 days')
+              AND {_LIVE_ONLY_CLAUSE}
               AND source IS NOT NULL
               AND source != ''
             GROUP BY source
