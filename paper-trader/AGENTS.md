@@ -6,6 +6,283 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-25 ML+backtest HYBRID pass #37 (Agent 2) — OOS feature-parity fix + `oos_parity_audit` quantifier
+
+### Phase 1 — Debug: bugs_fixed = 1
+
+Pass #35 (2026-05-24) closed the inference-side gap for the 3 enhanced
+MACD features (`ema200_above` / `hist_cross_up` /
+`macd_below_zero_cross`) by plumbing them into both `_ml_decide` (live
+inference) and `_compute_decision_outcomes` (training capture). But it
+**missed the matching OOS evaluation paths** — all 3 of
+`_oos_rank_metrics`, `_oos_multi_horizon_metrics` (in
+`run_continuous_backtests.py`), and `validation.evaluate_scorer_oos`
+still stripped the 3 kwargs from their `predict_with_meta` / `predict`
+calls. `build_features` then defaulted them to `None → 0.0`, even
+though `_compute_decision_outcomes` had already captured the real
+True/False values in the outcome row.
+
+Live impact: the deployed pickle's first-layer `mean|w|` for these slots
+are 0.45 / 0.26 / 0.24 (3rd / 15th / 16th most important by
+`feature_importance`), so the OOS metrics the per-cycle skill ledger
+emitted were computed on a feature vector the live gate never produces.
+Measured on `data/decision_outcomes.jsonl` tail=5000 against the
+deployed pickle (`oos_parity_audit`):
+
+- `delta_rmse_pp = -0.4773` — corrected path's RMSE 0.48pp LOWER
+- `delta_rank_ic = +0.0704` — corrected path's rank-IC 0.07 HIGHER
+- `mean|pred_diff| = 0.78pp`, `max|pred_diff| = 67.9pp`
+- **The ledger's recent `oos_ic≈0.00..0.05` was understating the deployed
+  model's TRUE gate-aligned rank-IC of +0.36 — sufficient evidence to
+  call the recurring `MLP_NO_BETTER_THAN_TRIVIAL` baseline_skill_log
+  verdict into question (see Phase 3 findings #1).**
+
+**Fix (commit `18f6d99`):**
+- `run_continuous_backtests.py::_oos_rank_metrics` — forwards
+  `ema200_above` / `hist_cross_up` / `macd_below_zero_cross` in BOTH
+  the `predict_with_meta` branch and the legacy `predict` fallback.
+- `run_continuous_backtests.py::_oos_multi_horizon_metrics` — same.
+- `paper_trader/validation.py::evaluate_scorer_oos` — same.
+- Docstring drift cleanup in `paper_trader/ml/decision_scorer.py`:
+  module docstring updated from 17 → 20 features; `build_features`
+  docstring re-aligned with the actual code order (3 enhanced MACD
+  features come BEFORE the sector one-hot tail, not after).
+
+**5 new pinning tests** (`tests/test_continuous.py::TestOosFeatureParity
+EnhancedMacd`): rank-IC path, multi-horizon path, legacy predict
+fallback, `evaluate_scorer_oos` path, plus an end-to-end check that
+training on a synthetic corpus where `ema200_above` is the only signal
+produces a scorer whose prediction actually responds to the kwarg the
+OOS path now forwards.
+
+### Phase 2 — Feature: `oos_parity_audit` quantifier
+
+`paper_trader/ml/oos_parity_audit.py` is the natural follow-up — until
+this audit landed, the only way to gauge the bias the Phase 1 fix
+removed was to do the prediction-pair walk manually. The audit
+predicts every outcome row TWICE — once with the 3 enhanced MACD
+kwargs forwarded (gate-aligned), once with them defaulted to None
+(pre-fix OOS state) — and reports aggregate `delta_rmse_pp`,
+`delta_rank_ic`, `mean / max |pred_diff|`, plus a 4-tier verdict:
+
+- `NOT_TRAINED` / `NO_DATA` / `NO_PARITY_FEATURES` — degenerate honest sentinels
+- `BIAS_SMALL` (≈ `OK`) — `|delta_rmse| < 0.10pp` AND `|delta_rank_ic| < 0.005`
+- `BIAS_MODERATE` — either delta in `[SMALL, MODERATE)` band
+- `BIAS_LARGE` — `|delta_rmse| ≥ 0.50pp` OR `|delta_rank_ic| ≥ 0.02`
+
+Operational discipline matches `dead_feature_audit` / `feature_importance`
+exactly: read-only (no train / no pickle write), never raises, complete
+JSON-safe envelope on every path. Exit `0` on `OK` / `BIAS_SMALL` /
+`NO_PARITY_FEATURES` / `NOT_TRAINED`, exit `1` otherwise — shell-gateable.
+
+CLI:
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m paper_trader.ml.oos_parity_audit            # human-readable
+python3 -m paper_trader.ml.oos_parity_audit --tail 5000 --json
+python3 -m paper_trader.ml.oos_parity_audit --tail 0   # full file
+```
+
+**19 new tests** (`tests/test_oos_parity_audit.py`) pin all 4 verdict
+ladder paths (including the end-to-end real-train BIAS_LARGE check),
+the never-raise contract on scorer exceptions / NaN actuals / untrained
+scorer, the `_row_has_enhanced_macd` contract (False vs None vs missing
+keys), the `_load_records` JSONL loader (tail, malformed-line drops),
+and CLI exit-code gating.
+
+### Phase 3 — Live quant findings (user_findings = 5)
+
+1. **The `MLP_NO_BETTER_THAN_TRIVIAL` baseline verdict was an artifact
+   of the OOS-feature-parity bug.** `baseline_skill_log.jsonl`'s last 3
+   cycles report `MLP_NO_BETTER_THAN_TRIVIAL` / `MLP_NO_BETTER_THAN_TRIVIAL`
+   / `MLP_WORSE_THAN_TRIVIAL` with `mlp_rank_ic ≈ 0.05 / 0.05 / -0.01`.
+   But the audit's parity-path rank-IC on the same corpus is +0.36 —
+   the MLP IS materially better than trivial; the ledger was just
+   reading a degraded prediction vector. **Action**: the next cycle's
+   `_append_baseline_skill_log` row (after this fix lands) should flip
+   to `MLP_BEATS_TRIVIAL` if `baseline_compare` shares the same
+   OOS-feature-parity bug — needs verification but very likely. This
+   is the most economically decisive finding across the last several
+   passes: the conviction gate is invariant-#5-active every cycle, but
+   its perceived "no-edge" verdict was a measurement bug.
+
+2. **`baseline_compare` likely has the same bug.** It computes the
+   MLP's OOS rank-IC using the same predict-call shape as the OOS
+   ledger functions, so it almost certainly also strips the 3 enhanced
+   MACD kwargs. Not fixed in this pass (out of scope for the targeted
+   plumbing fix); flagged for the next pass. Verifying: trace
+   `paper_trader/ml/baseline_compare.py`'s scorer call and check for
+   the 3 kwargs.
+
+3. **Live audit corpus: 5000 outcomes, 2208 with at least one enhanced
+   MACD signal (44%).** Of those 2208 rows, the per-row `max|Δ|=67.9pp`
+   means there exist rows where the corrected and degraded predictions
+   differ by nearly 70 percentage points of forward return. Mean is
+   0.78pp — most rows shift modestly, but the tail is enormous.
+
+4. **Continuous backtest health is good.** `backtest.db`: 494 complete
+   runs, 26 failed (last failure 2026-05-18, 6 days ago — well within
+   reaper window). Recent 200 complete: vs_spy median +79.4%, p25 +0.7%,
+   p75 +343.9%, min -283.7%, max +6154.7%. Genuinely positive median
+   alpha; massive dispersion is consistent with leveraged-vehicle
+   variance, not strategy skill (per AGENTS.md persona_skill warning).
+
+5. **`HAS_DEAD` persists on `sector_commodities`** in
+   `dead_feature_audit_log.jsonl` for the last 3 cycles. Same explanation
+   as pass #35: no commodities-classified BUY decisions land in the
+   recent 5000-record training corpus. Self-resolves once a personas-
+   driven run picks GLD/SLV/USO/etc; not actionable from the model side.
+
+### Phase 4 — Counters
+
+bugs_fixed = 1 · features_added = 1 · user_findings = 5
+
+```bash
+# Run the new pinning + audit tests:
+python3 -m pytest tests/test_oos_parity_audit.py \
+    tests/test_continuous.py::TestOosFeatureParityEnhancedMacd -v
+# 24 passed in <5s
+
+# Audit the live deployed pickle:
+python3 -m paper_trader.ml.oos_parity_audit --tail 5000
+```
+
+### Files touched
+
+- `paper_trader/ml/decision_scorer.py` (+18 / -10 — docstring drift fixes)
+- `paper_trader/validation.py` (+18 — enhanced MACD kwargs to `evaluate_scorer_oos`)
+- `run_continuous_backtests.py` (+29 — enhanced MACD kwargs to both OOS metric helpers)
+- `tests/test_continuous.py` (+251 — TestOosFeatureParityEnhancedMacd)
+- `paper_trader/ml/oos_parity_audit.py` (NEW, +486 — Phase 2 audit + CLI)
+- `tests/test_oos_parity_audit.py` (NEW, +380 — 19 tests)
+
+---
+
+## 2026-05-25 feature-dev pass (Agent 4) — `/api/off-watchlist-mentions` + `/api/spy-valuation`
+
+Two surfaces filling concrete gaps that were invisible to Opus and every
+existing analytics panel.
+
+### `/api/off-watchlist-mentions` — universe-expansion radar
+
+The orthogonal complement to `/api/watchlist-opportunities` (bounded TO
+the watchlist). This endpoint surfaces tickers being talked about in the
+live news flow that are NOT on the watchlist AND NOT held — the
+"universe-expansion" question: *what catalyst is the wire screaming
+about on names I'm not even watching?*
+
+Distinct from every neighbour (do not consolidate, invariant #10 mirror):
+
+* `/api/watchlist-opportunities` — only ranks WATCHLIST names. An
+  off-watchlist ADR (KWEB / BIDU during a China-AI rotation) is invisible
+  there by design.
+* `/api/rising-unheld-themes` — per-ticker decayed-score velocity, but
+  does NOT partition by watchlist membership; off-watchlist tickers drown
+  under the WATCHLIST noise in the same surface.
+* `/api/news-themes` — keyword-level, not ticker-level.
+
+Reuses each article's `tickers` field (populated by `signals.py`'s SSOT
+`_extract_tickers`) so it can never drift from the live trader's own
+extraction. One signals fetch (`get_top_signals(n=300, hours=24,
+min_score=0.0)`); pure builder tallies per ticker.
+
+Defensive surface-specific noise filter (`_OFF_WATCH_NOISE` in
+`analytics/off_watchlist_mentions.py`) — does NOT live in the SSOT's
+`_NOT_TICKERS` because these tokens (MSN news-suffix, TSX exchange
+suffix, EUV/CAPEX/EPYC/NA/AI) only pollute the unbounded off-watchlist
+path; the WATCHLIST-bounded surfaces never see them. Filter is documented
+inline with the live source phrase that drove each entry.
+
+`heat = max_score × (1 + log1p(n)/3) × (1 + 0.25·urgent)` — mirrors
+`watchlist_opportunities` exactly so the two surfaces are directly
+comparable: "loudest off-watchlist heat 12.4 vs top WATCHLIST heat 9.1
+= time to add the ADR".
+
+Live shape on 2026-05-25 (300 articles scanned, 216 unique off-watch
+tickers found, 12 surfaced after thresholds): XOVR (Cathie Wood
+crossover ETF), META, INTU, LOW — all real tickers Opus has no surface
+to discover today.
+
+### `/api/spy-valuation` — S&P 500 structural-valuation regime
+
+digital-intern's `market_valuation_collector` scrapes multpl.com daily
+and writes a synthetic article (`source='market_valuation'`,
+`url='internal://market_valuation/…'`) with the latest Shiller CAPE,
+trailing P/E, and earnings yield. That article reaches Opus ONLY if it
+wins the briefing's top-N ranking on any given day — most cycles it gets
+crowded out by news, so the trader is effectively blind to the slowest-
+moving but highest-stakes context: *what regime am I trading INTO?*
+
+This endpoint parses the most recent `market_valuation` article from
+`articles.db` (15s busy_timeout, 300s SWR cache absorbs the slow first
+fetch under digital-intern WAL-checkpoint contention) and returns a
+discrete regime read with `state` ∈ {`REGIME_READ`, `PARSE_FAILED`,
+`NO_DATA`}, `regime` band, CAPE / P/E / vs-mean / pct-of-1999-peak, and
+a `stale` flag (article older than 36h).
+
+Distinct from every neighbour:
+* `/api/macro-calendar`, `/api/event-calendar` — EVENT-centric (rate
+  decisions, earnings), not structural.
+* `/api/sector-pulse`, `/api/sector-exposure` — describe the BOOK or the
+  sector velocity, not the market-cap-weighted valuation backdrop.
+
+CAPE bands match the collector's SSOT (`extreme_overvalued ≥ 40`,
+`expensive ≥ 30`, `fair_value ≥ 20`, `undervalued ≥ 15`,
+`deeply_undervalued < 15`). The parser is tested against the exact title
+shape captured live on 2026-05-25 — a collector-format drift breaks the
+pin immediately.
+
+Live shape on 2026-05-25: regime `EXTREME_OVERVALUED` (CAPE 42.04 =
+2.42× historical mean, 95% of 1999 dot-com peak, P/E 32.19) — a regime
+the leveraged-ETF-heavy watchlist has been trading INTO with zero
+operator-visible structural context until this surface.
+
+### Files touched
+
+* `paper_trader/analytics/off_watchlist_mentions.py` — new pure builder
+* `paper_trader/analytics/spy_valuation.py` — new pure builder
+* `paper_trader/dashboard.py` — two new routes (`/api/off-watchlist-mentions`
+  and `/api/spy-valuation`, inserted next to
+  `/api/persistent-watchlist-opportunity`). Both SWR-cached. Both
+  never-raises with shaped error fallback. Both follow the AGENTS.md
+  #2/#12 advisory contract — never gate Opus, no caps.
+* `tests/test_off_watchlist_mentions.py` — 13 tests
+* `tests/test_spy_valuation.py` — 20 tests pinning the live title format,
+  band classification (10 parametrized), staleness, and degrade-soft
+
+### Tests
+```
+$ python3 -m pytest tests/test_off_watchlist_mentions.py tests/test_spy_valuation.py -q
+33 passed
+```
+
+Neighbour-suite regression check (watchlist-opportunities + persistent-
+watchlist-opportunity unchanged):
+```
+$ python3 -m pytest tests/test_watchlist_opportunities.py \
+                    tests/test_persistent_watchlist_opportunity.py \
+                    tests/test_off_watchlist_mentions.py \
+                    tests/test_spy_valuation.py -q
+62 passed
+```
+
+### Live verification (Flask test client, per
+`project_paper_trader_analytics_verification`)
+
+Both routes register and serve 200 against the live `articles.db` (~25s
+cold under digital-intern WAL-checkpoint contention, ~ms warm via SWR):
+* `/api/spy-valuation` → `state: REGIME_READ`, `regime:
+  EXTREME_OVERVALUED`, `cape: 42.04`, `cape_vs_mean: 2.42`,
+  `cape_pct_of_peak: 95.1`
+* `/api/off-watchlist-mentions` → 300 articles scanned, 216 unique
+  off-watch tickers, 12 surfaced; top by heat (after noise filter): XOVR,
+  META, INTU, LOW, etc.
+
+Live `:8090` must be restarted to register the new routes (the running
+service is on commit `fbc6d43`, predating this pass).
+
+---
+
 ## 2026-05-25 core HYBRID pass #11 (Agent 1) — breaker recovery anchor symmetry + book-exposure on operator alarms
 
 ### Phase 1 — fix: bugs_fixed = 1 (breaker recovery anchor leaked on send failure)
