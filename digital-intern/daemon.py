@@ -86,6 +86,7 @@ from collectors.coingecko_collector import collect_coingecko
 from collectors.earnings_surprise_collector import collect_earnings_surprises
 from collectors.polymarket_collector import collect as collect_polymarket
 from collectors.manifold_collector import collect_manifold
+from collectors.kalshi_collector import collect as collect_kalshi
 from collectors.collector_rate_monitor import collect_rate_alerts
 from collectors.yield_curve_collector import collect_yield_curve
 from collectors.g10_sovereign_yields import collect_g10_yields
@@ -210,6 +211,7 @@ COINGECKO_INTERVAL        = 1800  # CoinGecko crypto market snapshot every 30min
 EARNINGS_SURPRISE_INTERVAL = 900  # EPS beat/miss scanner every 15min
 POLYMARKET_INTERVAL     = 900     # Polymarket prediction markets every 15min
 MANIFOLD_INTERVAL       = 1800    # Manifold Markets prediction markets every 30min
+KALSHI_INTERVAL         = 1800    # Kalshi CFTC-regulated markets every 30min
 RATE_MONITOR_INTERVAL   = 3600    # per-collector silence detector — hourly
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
 APPSTORE_FINANCE_INTERVAL = 86400  # Apple App Store Finance rankings — once per day
@@ -351,6 +353,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "coingecko":        COINGECKO_INTERVAL,
     "earnings_surprise": EARNINGS_SURPRISE_INTERVAL,
     "polymarket": POLYMARKET_INTERVAL,
+    "kalshi": KALSHI_INTERVAL,
     "rate_monitor": RATE_MONITOR_INTERVAL,
     "yield_curve": YIELD_CURVE_INTERVAL,
     "g10_yields": G10_YIELDS_INTERVAL,
@@ -1474,6 +1477,26 @@ def polymarket_worker(store: ArticleStore):
 
 
 # ── Worker: Manifold Markets prediction markets — every 30min ─────────────────
+def kalshi_worker(store: ArticleStore):
+    log.info("[kalshi_worker] started")
+    bo = Backoff("kalshi", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_kalshi()
+            _ingest(store, articles, "kalshi")
+            try:
+                source_health.record_result("kalshi", len(articles))
+            except Exception as he:
+                log.warning(f"[kalshi_worker] source_health error: {he}")
+            _worker_last_ok["kalshi"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[kalshi_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(KALSHI_INTERVAL)
+
+
 def manifold_worker(store: ArticleStore):
     log.info("[manifold_worker] started")
     bo = Backoff("manifold", base=30.0, cap=600.0)
@@ -4371,6 +4394,7 @@ def main():
         ("coingecko",        coingecko_worker),
         ("earnings_surprise", earnings_surprise_worker),
         ("polymarket",  polymarket_worker),
+        ("kalshi",      kalshi_worker),
         ("manifold",    manifold_worker),
         ("rate_monitor", rate_monitor_worker),
         ("yield_curve", yield_curve_worker),
