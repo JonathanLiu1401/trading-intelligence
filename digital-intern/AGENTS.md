@@ -5,6 +5,109 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-25 feature-dev pass #3 (Agent 4) — `/api/publish-lag` + two new chat enrichment blocks
+
+Feature-dev pass. Two new chat blocks (`PUBLISH LAG` from this repo,
+`ROTATION SKILL` cross-fetched from paper-trader's `:8090`) added to the
+already-rich chat enrichment stack. 1132 chat-enrichment tests green at
+start; +38 new tests = 1170 in the chat+dashboard+web_server+
+portfolio_signals+sector_pulse sweep at end. All four load-bearing
+invariants intact.
+
+**Phase 1 (feature) — `/api/publish-lag` endpoint:**
+
+The existing `analytics/publish_lag_audit.py` module had been computing
+per-collector publish→first_seen latency for some time, dumping a
+snapshot to `/home/zeph/logs/publish_lag.json` via a standalone CLI —
+but **never exposed as an endpoint and never surfaced in chat**.
+`collector-health` says *whether* a collector is ingesting; publish-lag
+says *how stale the items it ingests are* — a 30-min RSS poll seeing
+publisher-dated 6h-old items reads HEALTHY on collector-health but is
+feeding ArticleNet stale news. This pass wraps the builder with a
+verdict + headline so the chat / ops surfaces read the same SSOT.
+
+Verdict ladder (most-severe-first):
+
+* `STALE_FEEDS` — stalest collector median lag > 60min AND its sample
+  count ≥ 10. The collector is consistently lagged enough to bleed into
+  briefing freshness.
+* `MIXED` — stalest median > 15min but ≤ 60min. Some lag but not
+  structural failure.
+* `FRESH` — every reported collector's median ≤ 15min.
+* `NO_DATA` — zero parseable-lag samples OR no collector cleared
+  `MIN_PER_COLLECTOR=5`.
+
+Live verification at end-of-pass:
+```
+verdict=STALE_FEEDS
+headline="stalest: Finnhub p50=12515.6m (n=10); freshest: stocktwits p50=6.6m"
+rows_with_parseable_lag=67, 3 collectors reported
+```
+
+**Real finding worth flagging:** the Finnhub collector has a median lag
+of ~8.7 days. That's not "slightly slow" — that's a sign Finnhub items
+are being scored at briefing time with publisher-dated timestamps from a
+week ago and getting the same `time_sensitivity` weight as fresh wire
+copy. Likely a collector reading from a digest cache or mis-parsing the
+`published` field. **The next ops pass should diagnose this — this
+pass surfaces it but does not fix the underlying collector** (out of
+scope for a feature-dev pass).
+
+**Phase 2 (chat enrichment) — two new blocks:**
+
+1. `_publish_lag_chat_lines` — composes the new `/api/publish-lag`
+   envelope **intra-process** (no urlopen — the endpoint lives on THIS
+   dashboard, no :8090 dependency). Fires ONLY on `STALE_FEEDS` /
+   `MIXED`. SSOT: the endpoint's own `headline` is the chat headline;
+   detail line restates only the stalest collector's own counts (n /
+   median / p90 / >60m_pct). 18 unit tests.
+2. `_rotation_skill_chat_lines` — composes paper-trader's
+   `:8090/api/rotation-skill` (3s guarded urlopen, same fetch-guard
+   discipline as every other paper-trader block). Fires ONLY on
+   `LAZY_ROTATION` / `NET_NEGATIVE`. SSOT: trader endpoint's `headline`
+   verbatim; detail line restates the `stats` block's median /
+   p25/p75 alpha + negative-pair counts. 20 unit tests. Appears once
+   `:8090` restarts onto `/api/rotation-skill`.
+
+Both:
+- Pure / total — non-dict / missing keys / non-numeric values never
+  raise (the established silence-on-bad-input contract).
+- Silence-on-healthy is the precedent — every other `_*_chat_lines`
+  helper collapses healthy verdicts to `[]`.
+- Headline is the endpoint's verbatim string — never a chat-side
+  re-derived verdict (paper-trader invariant #10).
+- Placed in the system_prompt immediately after FEED HEALTH —
+  data-pipeline / structural-skill blocks cluster together so the
+  analyst sees the gating context before downstream verdicts.
+
+**Test coverage added:**
+
+```
+tests/test_chat_publish_lag_enrichment.py         # 18 tests
+tests/test_chat_rotation_skill_enrichment.py      # 20 tests
+```
+
+Each file pins: pure/total contract (non-dict, empty dict, missing
+fields, bool-as-int defense), silence on non-actionable verdicts,
+verbatim SSOT headline pass-through, detail-line field composition.
+
+**Files touched (this repo only):**
+
+- `dashboard/web_server.py` — two new module-level `_*_chat_lines`
+  helpers (~150 lines), the new `/api/publish-lag` endpoint inside
+  `create_app()` (~120 lines), two new fetch+wire blocks in the chat
+  handler closure (~80 lines incl. the intra-process compute), two
+  new conditional `+ f"…"` blocks in the system_prompt.
+- `tests/test_chat_publish_lag_enrichment.py` (new).
+- `tests/test_chat_rotation_skill_enrichment.py` (new).
+- `AGENTS.md` (this entry).
+
+No paper-trader changes are committed *from this repo* — the
+companion endpoint `/api/rotation-skill` ships in the paper-trader
+repo's same-day pass #3 entry.
+
+---
+
 ## 2026-05-25 feature-dev pass #2 (Agent 4) — TIME-OF-DAY + DAY-OF-WEEK + CASH-CONVICTION-FIT chat triad
 
 Feature-dev pass. 1019 chat-enrichment tests green at start; +107 new

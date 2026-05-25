@@ -4209,6 +4209,141 @@ def _sector_coherence_chat_lines(rep: Any) -> list:
     return lines
 
 
+def _publish_lag_chat_lines(rep: Any) -> list[str]:
+    """Render the ``/api/publish-lag`` envelope as compact chat-context lines.
+
+    The companion to ``stale_source_alerter`` (which answers "is this collector
+    still ingesting at all?") on the *latency* axis: when a collector DOES
+    ingest, how far behind the publisher clock is it? A 30-min RSS poll reading
+    publisher-dated items from 6h ago is still ingesting but is feeding
+    ArticleNet stale news — items that score the same `time_sensitivity`
+    weight as fresh wire copy, and end up in briefings as if they were live.
+    No other chat block surfaces this latency dimension.
+
+    SSOT (paper-trader invariant #10): the endpoint's own top-level
+    ``headline`` is the chat headline. The detail lines restate the endpoint's
+    own per-collector counts verbatim — never a chat-side re-derived verdict.
+
+    Pure / total — the ``_cash_redeployment_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises)
+    - verdict not in {``STALE_FEEDS``, ``MIXED``} → ``[]``: FRESH / NO_DATA /
+      ERROR collapse to silence — the ``_decision_paralysis_chat_lines``
+      silence precedent. A healthy ingest pipeline is filler.
+    - actionable → builder's verbatim ``headline`` + one detail line composed
+      from the stalest collector's own n / median / p90 fields.
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    if verdict not in ("STALE_FEEDS", "MIXED"):
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)
+
+    stalest = rep.get("ranked_stalest")
+    if isinstance(stalest, list) and stalest:
+        top = stalest[0] if isinstance(stalest[0], dict) else {}
+        try:
+            name = str(top.get("collector", "?"))[:32]
+            n = top.get("n")
+            med = top.get("median_lag_min")
+            p90 = top.get("p90_lag_min")
+            stale60 = top.get("stale_60m_pct")
+            parts: list[str] = []
+            if isinstance(n, (int, float)) and not isinstance(n, bool):
+                parts.append(f"n={int(n)}")
+            if isinstance(med, (int, float)) and not isinstance(med, bool):
+                parts.append(f"median={float(med):.1f}m")
+            if isinstance(p90, (int, float)) and not isinstance(p90, bool):
+                parts.append(f"p90={float(p90):.1f}m")
+            if isinstance(stale60, (int, float)) and not isinstance(stale60, bool):
+                parts.append(f">60m={float(stale60):.0f}%")
+            if parts:
+                lines.append(f"  STALE {name}: " + " | ".join(parts))
+        except Exception:
+            pass
+    return lines
+
+
+def _rotation_skill_chat_lines(rep: Any) -> list[str]:
+    """Render paper-trader's ``/api/rotation-skill`` envelope as compact
+    chat-context lines.
+
+    The sibling to ``_cash_redeployment_chat_lines`` on the return-spread
+    axis: cash_redeployment says HOW FAST the desk recycles freed capital;
+    this one says whether the recycling was SKILLED (paired-rotation alpha
+    measured at the forward horizon). A FAST_REDEPLOY desk that rotates
+    DRAM → MSTR while DRAM rips and MSTR sags is fast AND lazy — both chat
+    blocks together diagnose the right pathology.
+
+    SSOT (paper-trader invariant #10): the endpoint's own ``headline`` is
+    the chat headline — no chat-side re-derived verdict (the
+    ``_cash_redeployment_chat_lines`` precedent).
+
+    Pure / total — the ``_cash_redeployment_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted)
+    - verdict not in {``LAZY_ROTATION``, ``NET_NEGATIVE``} → ``[]``:
+      SKILLED_ROTATION / NET_POSITIVE / NEUTRAL / INSUFFICIENT_DATA / ERROR
+      collapse to silence — a profitable / neutral rotation cadence is the
+      silence precedent. Surfacing only the actionable-bad verdicts matches
+      every other ``_*_chat_lines`` helper.
+    - actionable → builder's verbatim ``headline`` + one detail line composed
+      from the endpoint's own ``stats`` (median, p25/p75 alpha, n_negative).
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    if verdict not in ("LAZY_ROTATION", "NET_NEGATIVE"):
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)
+
+    def _num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    stats = rep.get("stats") if isinstance(rep.get("stats"), dict) else {}
+    median_pp = _num(stats.get("median_alpha_pp"))
+    p25_pp = _num(stats.get("p25_alpha_pp"))
+    p75_pp = _num(stats.get("p75_alpha_pp"))
+    n_neg = _num(stats.get("n_negative"))
+    n_scored = _num(stats.get("n_pairs_scored"))
+    neg_pct = _num(stats.get("negative_alpha_pct"))
+
+    parts: list[str] = []
+    if median_pp is not None and p25_pp is not None and p75_pp is not None:
+        parts.append(
+            f"alpha p25/median/p75 = {p25_pp:+.2f}/{median_pp:+.2f}/{p75_pp:+.2f}pp"
+        )
+    elif median_pp is not None:
+        parts.append(f"median alpha {median_pp:+.2f}pp")
+    if n_neg is not None and n_scored is not None and n_scored > 0:
+        if neg_pct is not None:
+            parts.append(
+                f"{int(n_neg)}/{int(n_scored)} rotations destroyed value "
+                f"({neg_pct:.0f}%)"
+            )
+        else:
+            parts.append(
+                f"{int(n_neg)}/{int(n_scored)} rotations destroyed value"
+            )
+    if parts:
+        lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
 _PORTFOLIO_SIGNALS_MAX_HEADLINES = 5
 
 
@@ -5445,6 +5580,129 @@ def create_app(store=None) -> Flask:
         )
         out["window_hours"] = hours
         return jsonify(out)
+
+    @app.get("/api/publish-lag")
+    def api_publish_lag():
+        """Per-collector publish→first_seen latency snapshot.
+
+        Wraps ``analytics.publish_lag_audit.compute()`` (existing builder) with
+        a verdict + headline so chat + ops surfaces can read the same SSOT.
+        ``collector-health`` says *whether* a collector is ingesting;
+        publish-lag says *how stale the items it ingests are* — a 30-min RSS
+        poll seeing publisher-dated 6h-old items reads HEALTHY on
+        collector-health but is feeding ArticleNet stale news.
+
+        Verdict ladder (most-severe-first):
+
+          * ``STALE_FEEDS`` — stalest collector median lag > ``STALE_MEDIAN_MIN``
+            (60min) AND its sample count ≥ ``MIN_OBS`` (10). The collector is
+            consistently lagged enough to bleed into briefing freshness.
+          * ``MIXED`` — stalest median lag > ``MIXED_MEDIAN_MIN`` (15min) but
+            below STALE_MEDIAN_MIN. Some lag but not a structural failure.
+          * ``FRESH`` — every reported collector's median lag ≤ MIXED_MEDIAN_MIN.
+          * ``NO_DATA`` — zero parseable-lag samples OR no collector cleared
+            ``MIN_PER_COLLECTOR``.
+
+        Pure read — never raises. Observational only. The underlying
+        ``publish_lag_audit.compute()`` snapshot is bounded by
+        ``SCAN_LIMIT=5000`` (recent-id slice), sub-second on the USB DB.
+
+        Query params (clamped):
+          ``scan_limit`` 500..20000 default 5000.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            scan_limit = int(request.args.get("scan_limit", 5000))
+        except (TypeError, ValueError):
+            scan_limit = 5000
+        scan_limit = max(500, min(20000, scan_limit))
+
+        # Verdict thresholds — pinned here so chat surfaces / tests / callers
+        # read the same constants. Mirror the publish_lag_audit module's
+        # bucket boundaries (5m fresh / 60m stale) so the verdict + the
+        # stats panel agree on what "stale" means.
+        STALE_MEDIAN_MIN = 60.0
+        MIXED_MEDIAN_MIN = 15.0
+        MIN_OBS = 10
+
+        try:
+            from analytics.publish_lag_audit import compute as _pl_compute
+            rep = _pl_compute(scan_limit=scan_limit)
+        except Exception as e:
+            return jsonify({
+                "verdict": "ERROR",
+                "headline": f"error: {e}",
+                "error": str(e),
+                "collectors": {},
+                "ranked_freshest": [],
+                "ranked_stalest": [],
+            }), 500
+
+        collectors = rep.get("collectors") if isinstance(rep.get("collectors"), dict) else {}
+        if not collectors or not rep.get("rows_with_parseable_lag"):
+            verdict = "NO_DATA"
+            headline = (
+                f"no parseable-lag samples in last {scan_limit} rows "
+                f"(scanned {rep.get('scanned', 0)})"
+            )
+        else:
+            ranked_stalest = rep.get("ranked_stalest") or []
+            ranked_freshest = rep.get("ranked_freshest") or []
+            stalest = ranked_stalest[0] if ranked_stalest else None
+            freshest = ranked_freshest[0] if ranked_freshest else None
+
+            stalest_med = (stalest.get("median_lag_min")
+                           if isinstance(stalest, dict) else None)
+            stalest_n = (stalest.get("n")
+                         if isinstance(stalest, dict) else 0)
+
+            if (isinstance(stalest_med, (int, float))
+                    and stalest_med > STALE_MEDIAN_MIN
+                    and isinstance(stalest_n, int) and stalest_n >= MIN_OBS):
+                verdict = "STALE_FEEDS"
+                headline = (
+                    f"stalest: {stalest['collector']} p50="
+                    f"{stalest_med:.1f}m (n={stalest_n})"
+                )
+                if isinstance(freshest, dict):
+                    fmed = freshest.get("median_lag_min")
+                    if isinstance(fmed, (int, float)):
+                        headline += (
+                            f"; freshest: {freshest['collector']} p50="
+                            f"{fmed:.1f}m"
+                        )
+            elif (isinstance(stalest_med, (int, float))
+                    and stalest_med > MIXED_MEDIAN_MIN):
+                verdict = "MIXED"
+                headline = (
+                    f"mixed: stalest {stalest['collector']} p50="
+                    f"{stalest_med:.1f}m; "
+                    f"{len(collectors)} collectors reported"
+                )
+            else:
+                verdict = "FRESH"
+                headline = (
+                    f"fresh: all {len(collectors)} reported collectors "
+                    f"median ≤ {MIXED_MEDIAN_MIN:g}m"
+                )
+
+        return jsonify({
+            "verdict": verdict,
+            "headline": headline,
+            "as_of": rep.get("generated_at"),
+            "scanned": rep.get("scanned"),
+            "rows_with_parseable_lag": rep.get("rows_with_parseable_lag"),
+            "scan_limit": rep.get("scan_limit"),
+            "collectors": rep.get("collectors"),
+            "ranked_freshest": rep.get("ranked_freshest"),
+            "ranked_stalest": rep.get("ranked_stalest"),
+            "thresholds": {
+                "stale_median_min": STALE_MEDIAN_MIN,
+                "mixed_median_min": MIXED_MEDIAN_MIN,
+                "min_obs": MIN_OBS,
+            },
+        })
 
     @app.get("/api/collector-health")
     def api_collector_health():
@@ -8209,6 +8467,84 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: feed-health fetch failed: %s", e)
 
+        # Publish-lag — per-collector publish→first_seen latency. Sibling to
+        # FEED HEALTH and COLLECTOR HEALTH on the latency dimension: feed-health
+        # asks "is the wire alive?", collector-health asks "is each source
+        # ingesting?", this one asks "when each source DOES ingest, how stale
+        # are the items it sees?". A 30-min RSS poll feeding 6h-old items reads
+        # HEALTHY on both other surfaces but is silently bleeding stale rows
+        # into briefings. Composed verbatim by the pure _publish_lag_chat_lines
+        # helper (unit-tested; SSOT — the endpoint's own `headline` is the
+        # chat headline, no re-derived verdict). Read intra-process (the
+        # endpoint lives on THIS dashboard) — no urlopen needed, no :8090
+        # restart dependency. STALE_FEEDS / MIXED actionable; FRESH / NO_DATA /
+        # ERROR collapse to silence (the _feed_health_chat_lines precedent).
+        publish_lag_block = ""
+        try:
+            from analytics.publish_lag_audit import compute as _pl_compute
+            _pl = _pl_compute()
+            # Mirror the endpoint's verdict-ladder inline so the chat block
+            # reads the same SSOT as the /api/publish-lag response.
+            _collectors = _pl.get("collectors") or {}
+            if _collectors and _pl.get("rows_with_parseable_lag"):
+                _stalest = (_pl.get("ranked_stalest") or [None])[0]
+                _freshest = (_pl.get("ranked_freshest") or [None])[0]
+                _sm = _stalest.get("median_lag_min") if isinstance(_stalest, dict) else None
+                _sn = _stalest.get("n") if isinstance(_stalest, dict) else 0
+                if (isinstance(_sm, (int, float)) and _sm > 60.0
+                        and isinstance(_sn, int) and _sn >= 10):
+                    _v = "STALE_FEEDS"
+                    _h = (f"stalest: {_stalest['collector']} p50={_sm:.1f}m "
+                          f"(n={_sn})")
+                    if isinstance(_freshest, dict):
+                        _fm = _freshest.get("median_lag_min")
+                        if isinstance(_fm, (int, float)):
+                            _h += (f"; freshest: {_freshest['collector']} "
+                                   f"p50={_fm:.1f}m")
+                elif isinstance(_sm, (int, float)) and _sm > 15.0:
+                    _v = "MIXED"
+                    _h = (f"mixed: stalest {_stalest['collector']} "
+                          f"p50={_sm:.1f}m; {len(_collectors)} collectors "
+                          f"reported")
+                else:
+                    _v = "FRESH"
+                    _h = ""
+                _pl_envelope = {
+                    "verdict": _v,
+                    "headline": _h,
+                    "ranked_stalest": _pl.get("ranked_stalest"),
+                }
+                publish_lag_block = "\n".join(
+                    _publish_lag_chat_lines(_pl_envelope))
+        except Exception as e:
+            _logger().warning("chat: publish-lag fetch failed: %s", e)
+
+        # Rotation skill — when the desk SELLs X and within hours BUYs a
+        # *different* ticker Y, does Y outperform X over the next 5d? The
+        # return-spread sibling to cash_redeployment_latency: that endpoint
+        # says HOW FAST cash redeploys; this one says whether the
+        # redeployment was SKILLED (paired-rotation alpha at the forward
+        # horizon). A FAST_REDEPLOY desk that rotates DRAM→MSTR while DRAM
+        # rips and MSTR sags is fast AND lazy — both verdicts together
+        # diagnose the right pathology. Composed verbatim by the pure
+        # _rotation_skill_chat_lines helper (unit-tested; SSOT — the
+        # endpoint's own `headline` is the chat headline, no re-derived
+        # verdict). Guarded 3s read; only appears once :8090 is restarted
+        # onto /api/rotation-skill. LAZY_ROTATION / NET_NEGATIVE actionable;
+        # SKILLED_ROTATION / NET_POSITIVE / NEUTRAL / INSUFFICIENT_DATA
+        # collapse to silence.
+        rotation_skill_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/rotation-skill",
+                    timeout=3) as resp:
+                _rs = json.loads(resp.read().decode("utf-8"))
+            rotation_skill_block = "\n".join(
+                _rotation_skill_chat_lines(_rs))
+        except Exception as e:
+            _logger().warning("chat: rotation-skill fetch failed: %s", e)
+
         # Hourly-PnL fingerprint — WHEN in the trading day has this bot
         # actually earned alpha vs SPY? The chat carries dozens of
         # book/decisions/skills blocks but is BLIND to the structural
@@ -8291,6 +8627,8 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — DISCORD-DELIVERY HEALTH (operator-fitness — when DEGRADED, trade alerts / hourly summaries / daily-close posts are silently being dropped: the analyst is talking about a book whose ops surface is DARK and any 'consider trimming X' recommendation never reaches the operator. Surfaced ONLY when DEGRADED, never filler when HEALTHY / UNKNOWN. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{notify_health_block}\n\n" if notify_health_block else "")
             + (f"PAPER TRADER — ALL-CASH STREAK (the chronic-flat-book surface — cash_pct snapshots are point-in-time; cash_redeployment latency is the post-SELL sit; opportunity_cost is signal-specific hindsight; cash_drag is SPY-benchmarked dollar; none answer 'how long has the book ACTUALLY been 100% cash right now, and at what compounding alpha cost so far?'. A book flat for 2h vs 6 days reads identically on cash_pct yet the second case is a strong 'decision loop too risk-off / something is wrong' tell. Surfaced ONLY when EXTENDED_HOLDOUT / PROLONGED_HOLDOUT, never filler when BRIEF_HOLDOUT / NOT_ALL_CASH / NO_DATA / INSUFFICIENT_HISTORY. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{all_cash_streak_block}\n\n" if all_cash_streak_block else "")
             + (f"PAPER TRADER — FEED HEALTH (the live-news pipeline fitness — every downstream block assumes the feed is alive; when feed-health is BLIND (consecutive 0-signal decisions), STALE_FEED (newest article > stale_hours old), or UNSCORED (articles arriving but ai_score=0 — digital-intern ML scoring pipeline silently down), every other verdict becomes interpretively suspect: CASH_REDEPLOYMENT=STALLED means something different when the bot is BLIND vs when the wire is live. The analyst must flag this BEFORE answering 'what should we do?' because the right answer becomes 'restart the scorer' or 'wait for the feed', not 'trim NVDA'. The UNSCORED-clause is already part of the headline under BLIND/STALE_FEED. Surfaced ONLY when BLIND / STALE_FEED, never filler when HEALTHY / NO_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{feed_health_block}\n\n" if feed_health_block else "")
+            + (f"DIGITAL INTERN — PUBLISH LAG (per-collector publish→first_seen latency. The companion to FEED HEALTH and COLLECTOR HEALTH on the latency dimension: feed-health asks 'is the wire alive?', collector-health asks 'is each source ingesting?', this asks 'when each source DOES ingest, how stale are the items?'. A 30-min RSS poll feeding 6h-old items reads HEALTHY on both other surfaces but is silently bleeding stale rows into briefings — items that score the same time_sensitivity weight as fresh wire copy. Surfaced ONLY when STALE_FEEDS / MIXED (stalest collector median > 60m AND n≥10, or median > 15m), never filler when FRESH / NO_DATA. Headline carries verbatim from THIS dashboard's intra-process compute() — restate, never re-derive):\n{publish_lag_block}\n\n" if publish_lag_block else "")
+            + (f"PAPER TRADER — ROTATION SKILL (when the desk SELLs X and within hours BUYs a different ticker Y, did Y outperform X over the next 5d? The return-spread sibling to CASH REDEPLOYMENT LATENCY: that block says HOW FAST cash redeploys; this one says whether the redeployment was SKILLED. A FAST_REDEPLOY desk that rotates DRAM→MSTR while DRAM rips and MSTR sags is fast AND lazy — both verdicts together diagnose the right pathology. Distinct from round_trip_postmortem (per-position post-exit drift, no pair) and rebuy_regret / reentry_velocity (same-ticker, not cross-ticker). Surfaced ONLY when LAZY_ROTATION / NET_NEGATIVE, never filler when SKILLED_ROTATION / NET_POSITIVE / NEUTRAL / INSUFFICIENT_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{rotation_skill_block}\n\n" if rotation_skill_block else "")
             + (f"PAPER TRADER — TIME-OF-DAY EDGE (the per-hour-of-day alpha-vs-SPY fingerprint over the bot's equity-curve history — 'WHEN in the trading day has this bot actually earned alpha?'. The chat carries dozens of book/decisions/skills blocks but no temporal-edge verdict; a MORNING_EDGE bot should be more aggressive at the best alpha hour and lighter at the worst-alpha hour, and the analyst can answer 'is now a good time to lean into this signal?' only with this empirical hour-of-day view. Surfaced ONLY when MORNING_EDGE / MIDDAY_EDGE / AFTERNOON_EDGE / OFF_HOURS_EDGE (i.e. a non-flat fingerprint with adequate samples), never filler when FLAT_CLOCK / INSUFFICIENT_DATA / NO_SPY_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{hourly_pnl_block}\n\n" if hourly_pnl_block else "")
             + (f"PAPER TRADER — DAY-OF-WEEK EDGE (the per-weekday alpha-vs-SPY fingerprint over the bot's equity-curve history — 'is TODAY historically a good day for this bot vs SPY?'. Companion to TIME-OF-DAY EDGE — answers 'should I be more cautious today?' on a different time axis. Surfaced ONLY when WEEKDAY_EDGE / WEEKEND_EDGE (non-flat fingerprint with adequate samples), never filler when FLAT_WEEK / INSUFFICIENT_DATA / NO_SPY_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{weekday_pnl_block}\n\n" if weekday_pnl_block else "")
             + (f"PAPER TRADER — CASH-CONVICTION FIT (is the CURRENT cash level wrong given the loudest CURRENT live signal? The chat already carries cash_pct (point-in-time), all_cash_streak (chronic-flat duration), cash_redeployment (post-SELL latency), cash_drag (SPY-benchmarked dollar) — none of those answer the structural calibration question. A book 95% cash while ai_score 9.2 screams is structurally wrong in a way none of the other cash surfaces flag, and a fully-deployed book against a 5.5 loudest-live signal is overdeployed for that conviction. Surfaced ONLY when IDLE_DESPITE_SURGE / OVERDEPLOYED / IDLE_LOW_CONVICTION, never filler when BALANCED / NO_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{cash_conviction_block}\n\n" if cash_conviction_block else "")
