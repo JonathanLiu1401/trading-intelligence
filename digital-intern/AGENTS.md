@@ -5,6 +5,100 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-25 feature-dev pass (Agent 4) — chat system-fitness triad
+
+Feature-dev pass. 983 chat-enrichment tests green at start; +87 new
+chat-enrichment tests = 1070 chat-enrichment-test total at end (1019
+tests green in the chat+dashboard+web_server+portfolio_signals+
+sector_pulse sweep). All four load-bearing invariants intact.
+
+**Phase 1 (feature) — three new chat enrichment helpers + wiring:**
+
+The chat handler carries ~50 paper-trader analytics blocks
+(book/decisions/skills/news/sectors) but was BLIND to the
+operator-fitness layer that gates how to interpret every other block.
+Three new system-fitness blocks fill that gap, all following the
+existing `_*_chat_lines` SSOT pattern (cf. `_cash_drag_chat_lines`,
+`_decision_paralysis_chat_lines`):
+
+1. `_notify_health_chat_lines` — paper-trader `/api/notify-health`.
+   Fires ONLY on DEGRADED (Discord channel DARK). Headline +
+   consecutive_failures / last_error / restart_recommended detail.
+   24 unit tests. Live evidence at start: `verdict=DEGRADED, last_error="openclaw timeout (60s)"`.
+2. `_all_cash_streak_chat_lines` — paper-trader `/api/all-cash-streak`.
+   Fires ONLY on EXTENDED_HOLDOUT / PROLONGED_HOLDOUT (book chronically
+   flat). Headline + flat hours / cash_usd / SPY return / alpha_cost
+   detail. 32 unit tests. Live at start: `verdict=EXTENDED_HOLDOUT,
+   current_streak.hours_elapsed_to_now=22.23`.
+3. `_feed_health_chat_lines` — paper-trader `/api/feed-health`. Fires
+   ONLY on BLIND / STALE_FEED (UNSCORED clause already part of the
+   builder headline so it's carried automatically). Headline + newest
+   age / live_2h / scored_2h / blind_streak / unscored_feed /
+   restart_recommended detail. 31 unit tests.
+
+All three:
+- Pure / total — non-dict / missing keys / non-numeric values never
+  raise (matches the established silence-on-bad-input contract).
+- Healthy collapses to `[]` so a working system stays out of the
+  chat — never filler (the `_decision_paralysis_chat_lines` silence
+  precedent).
+- Headline is the trader endpoint's verbatim string (paper-trader
+  invariant #10) — no chat-side re-derived verdict.
+- Wired into the chat handler with a 3s guarded urlopen, same
+  fetch-guard discipline as every existing block.
+- Placed in the system_prompt immediately after PAPER TRADER LIVE
+  STATE — operator-fitness reads context-qualify every downstream
+  analytics block.
+
+**Phase 2 (live validation) — 2 findings:**
+
+1. **Notify currently DEGRADED.** `/api/notify-health` reports
+   `verdict=DEGRADED, consecutive_failures=1, last_error="openclaw
+   timeout (60s)"`. The chat enrichment will surface this once
+   :8080 picks up the new code — until restart, the analyst is
+   answering questions about a book whose Discord ops surface is
+   dark. `restart_recommended=false` because it's only 1 failure;
+   if the streak climbs the existing trader-side restart logic
+   will bump it.
+2. **Book has been 100% cash 22.2h.** `/api/all-cash-streak`
+   reports `verdict=EXTENDED_HOLDOUT, cash_usd=$987.39, SPY
+   +0.00%, alpha_cost_usd=$0`. The new block will name the
+   chronic-flat condition in chat (separate from the cash_drag /
+   cash_redeployment blocks which carry the dollar / latency
+   stories and stayed silent because SPY didn't move).
+
+**Test coverage added:**
+
+```
+tests/test_chat_notify_health_enrichment.py     # 24 tests
+tests/test_chat_all_cash_streak_enrichment.py   # 32 tests
+tests/test_chat_feed_health_enrichment.py       # 31 tests
+```
+
+Each file pins: pure/total contract (non-dict, empty dict, missing
+fields, bool-as-int defense), silence on non-actionable verdicts,
+verbatim SSOT headline pass-through, detail-line field composition,
+plus a live-fixture regression test against the exact JSON shape
+observed at start.
+
+**Files touched (this repo only):**
+
+- `dashboard/web_server.py` — three new module-level `_*_chat_lines`
+  helpers (~220 lines) + three new fetch+wire blocks in the chat
+  handler closure (~75 lines) + three new conditional `+ f"PAPER
+  TRADER — ..."` blocks in the system_prompt (~3 lines).
+- `tests/test_chat_notify_health_enrichment.py` (new, 175 lines).
+- `tests/test_chat_all_cash_streak_enrichment.py` (new, 233 lines).
+- `tests/test_chat_feed_health_enrichment.py` (new, 245 lines).
+- `AGENTS.md` (this entry).
+- `CLAUDE.md` (dashboard chat-enrichment description line for the
+  new three blocks).
+
+No paper-trader changes — the endpoints already exist and are
+healthy; this work is purely the chat-side surfacing layer.
+
+---
+
 ## 2026-05-24 hybrid pass #34 (Agent 3) — gurufocus_recap gate + pushed_alert_gate_regret
 
 Debugger + feature-dev + news-analyst pass. 3234 tests green at start;

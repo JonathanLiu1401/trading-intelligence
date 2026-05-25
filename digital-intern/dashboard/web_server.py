@@ -2784,6 +2784,224 @@ def _cash_drag_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _notify_health_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/notify-health` (the Discord-channel
+    delivery health of the live trader) as compact chat-context lines.
+
+    The chat carries every flavour of book / decision / skill analytics
+    but is blind to the operator-fitness question "is the trader even
+    able to reach Discord right now?". A DEGRADED channel means trade
+    alerts, hourly summaries, and daily-close posts are silently being
+    dropped — the analyst is talking about a book whose ops surface is
+    DARK, and recommendations like "consider trimming TQQQ here" never
+    reach the operator. That is a top-priority context every other block
+    glosses over.
+
+    SSOT (paper-trader invariant #10): the builder's own top-level
+    ``headline`` is the chat headline — the trader endpoint already
+    composes the "Discord channel DARK — N consecutive send failure(s),
+    last OK <ts>, last error: <msg>" form with the right tone. The
+    detail line restates only the builder's own ``consecutive_failures``
+    / ``last_error`` / ``restart_recommended`` fields verbatim — never
+    a recomputation (the ``_macro_calendar_chat_lines`` field-passthrough
+    precedent).
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted, never raises into the chat handler)
+    - top-level verdict not in {"DEGRADED"} → ``[]``: HEALTHY / UNKNOWN
+      collapse to silence (the ``_decision_paralysis_chat_lines`` silence
+      precedent — never chat filler when the channel is working).
+    - actionable (DEGRADED) → builder's verbatim ``headline`` (only when
+      a usable string) + a one-line detail restating builder fields.
+      Missing fields degrade silently to the safe subset.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") != "DEGRADED":
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    parts: list[str] = []
+    n = rep.get("consecutive_failures")
+    if isinstance(n, (int, float)) and not isinstance(n, bool):
+        parts.append(f"consecutive_failures={int(n)}")
+    last_err = rep.get("last_error")
+    if isinstance(last_err, str) and last_err.strip():
+        # Cap long error strings so a multi-line traceback can't blow the
+        # chat block — defensive, mirrors the AGENTS.md raw_capture_chars
+        # discipline on the trader side.
+        msg = last_err.strip()
+        if len(msg) > 160:
+            msg = msg[:157] + "..."
+        parts.append(f"last_error={msg!r}")
+    rr = rep.get("restart_recommended")
+    if isinstance(rr, bool):
+        parts.append(f"restart_recommended={'YES' if rr else 'no'}")
+    if parts:
+        lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
+def _all_cash_streak_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/all-cash-streak` (the chronic-flat-book
+    surface) as compact chat-context lines.
+
+    The chat carries cash_pct (point-in-time), cash_redeployment latency
+    (post-SELL sit), opportunity_cost (signal-specific hindsight), and
+    cash_drag (SPY-benchmarked dollar cost). None of those answer the
+    OPERATOR-VISIBILITY question "how long has the bot ACTUALLY been
+    100% cash, and at what compounding alpha cost so far?". The book
+    looks identical at 100% cash whether it's been flat for 2h or 6 days,
+    yet the second case is a strong "is anything broken / is the
+    decision loop too risk-off?" signal the analyst should call out
+    when answering "what's been going on?".
+
+    SSOT (paper-trader invariant #10): the builder's own top-level
+    ``headline`` is the chat headline ("all-cash 22.2h on $987.39; SPY
+    +0.00% → no alpha cost — EXTENDED_HOLDOUT") — no chat-side
+    re-derivation. The detail line restates only the builder's own
+    current_streak fields (``hours_elapsed_to_now`` / ``cash_usd`` /
+    ``spy_return_pct`` / ``alpha_cost_usd``) verbatim — never a
+    recomputation.
+
+    Pure / total — exactly the ``_cash_drag_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted)
+    - ``state`` != "OK" → ``[]``: builder didn't run cleanly, stay silent
+    - top-level ``verdict`` not in {"EXTENDED_HOLDOUT",
+      "PROLONGED_HOLDOUT"} → ``[]``: BRIEF_HOLDOUT / NOT_ALL_CASH /
+      NO_DATA / INSUFFICIENT_HISTORY collapse to silence (short flats
+      and not-flat books are not chat filler).
+    - actionable → builder's verbatim ``headline`` (only when a usable
+      string) + a detail line from ``current_streak`` (the single
+      currently-running streak; missing fields degrade silently).
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("state") != "OK":
+        return []
+    if rep.get("verdict") not in ("EXTENDED_HOLDOUT", "PROLONGED_HOLDOUT"):
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    cs = rep.get("current_streak")
+    if isinstance(cs, dict):
+        def _num(v):
+            if isinstance(v, bool):
+                return None
+            if isinstance(v, (int, float)):
+                return float(v)
+            return None
+
+        parts: list[str] = []
+        hrs = _num(cs.get("hours_elapsed_to_now"))
+        if hrs is None:
+            hrs = _num(cs.get("hours"))
+        if hrs is not None:
+            parts.append(f"flat {hrs:.1f}h")
+        cash = _num(cs.get("cash_usd"))
+        if cash is not None:
+            parts.append(f"cash ${cash:,.2f}")
+        spy = _num(cs.get("spy_return_pct"))
+        if spy is not None:
+            parts.append(f"SPY {spy:+.2f}%")
+        ac = _num(cs.get("alpha_cost_usd"))
+        if ac is not None:
+            parts.append(f"alpha_cost ${ac:,.2f}")
+        if parts:
+            lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
+def _feed_health_chat_lines(rep) -> list[str]:
+    """Render paper-trader's `/api/feed-health` (the live-news pipeline
+    fitness surface) as compact chat-context lines.
+
+    The chat carries dozens of decision/book/skill analytics that all
+    assume the news feed is alive. When `/api/feed-health` flips to
+    BLIND (N consecutive 0-signal decisions), STALE_FEED (newest live
+    article > stale_hours old), or fires the UNSCORED clause (live
+    articles arriving but ai_score=0 — digital-intern ML scoring
+    pipeline silently down), every downstream block's verdicts become
+    interpretively suspect — a CASH_REDEPLOYMENT verdict of STALLED
+    means a different thing if the bot is BLIND vs if the wire is live.
+    The analyst needs to flag this BEFORE answering "what should we
+    do?" because the right answer becomes "restart the scorer" or
+    "wait for the feed to recover", not "trim NVDA". This block is the
+    operator-fitness layer that gates every other read.
+
+    SSOT (paper-trader invariant #10): the builder's own top-level
+    ``headline`` is the chat headline — the trader endpoint already
+    composes the right wording for each verdict AND already appends
+    the UNSCORED-clause sub-message under BLIND / STALE_FEED. No
+    chat-side re-derivation. The detail line restates only the
+    builder's own counts (``resolved_live_2h`` / ``resolved_scored_2h``
+    / ``blind_streak`` / ``resolved_newest_age_h``) verbatim.
+
+    Pure / total — exactly the ``_baseline_compare_chat_lines`` contract:
+
+    - non-dict → ``[]`` (block omitted)
+    - top-level ``verdict`` not in {"BLIND", "STALE_FEED"} → ``[]``:
+      HEALTHY / NO_DATA collapse to silence (the
+      ``_decision_paralysis_chat_lines`` silence precedent — never
+      chat filler when the feed is working; NO_DATA is a probe-side
+      defect, not an actionable feed-health verdict).
+    - actionable → builder's verbatim ``headline`` (only when a usable
+      string) + a one-line detail restating builder fields. Missing
+      fields degrade silently to the safe subset.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") not in ("BLIND", "STALE_FEED"):
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    parts: list[str] = []
+    age = _num(rep.get("resolved_newest_age_h"))
+    if age is not None:
+        parts.append(f"newest age {age:.1f}h")
+    live = _num(rep.get("resolved_live_2h"))
+    if live is not None:
+        parts.append(f"live_2h={int(live)}")
+    scored = _num(rep.get("resolved_scored_2h"))
+    if scored is not None:
+        parts.append(f"scored_2h={int(scored)}")
+    bs = _num(rep.get("blind_streak"))
+    if bs is not None and bs > 0:
+        parts.append(f"blind_streak={int(bs)}")
+    if rep.get("unscored_feed") is True:
+        parts.append("unscored_feed=YES")
+    rr = rep.get("restart_recommended")
+    if isinstance(rr, bool) and rr:
+        parts.append("restart_recommended=YES")
+    if parts:
+        lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
 def _passive_signal_density_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/passive-signal-density` (the smoking-gun
     detector for "engine idle while news is loud") into compact chat lines.
@@ -7562,6 +7780,88 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: disagreement fetch failed: %s", e)
 
+        # Notify-health — is Discord delivery from the trader healthy?
+        # Every other block describes the BOOK / DECISIONS / SKILLS the
+        # analyst can reason about; none answer the operator-fitness
+        # question "can the trader even reach its own ops channel right
+        # now?". A DEGRADED notify means trade alerts, hourly summaries
+        # and daily-close posts are being silently dropped — the
+        # analyst is talking about a book whose ops surface is DARK and
+        # recommendations like "consider trimming TQQQ here" never
+        # reach the operator. Block fires ONLY on DEGRADED (HEALTHY /
+        # UNKNOWN collapse to silence — the _decision_paralysis_chat_lines
+        # silence precedent, never chat filler when the channel works).
+        # Composed verbatim by the pure _notify_health_chat_lines helper
+        # (unit-tested; SSOT — the builder's own `headline` is the chat
+        # headline, no re-derived verdict). Guarded 3s read.
+        notify_health_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/notify-health",
+                    timeout=3) as resp:
+                _nh = json.loads(resp.read().decode("utf-8"))
+            notify_health_block = "\n".join(_notify_health_chat_lines(_nh))
+        except Exception as e:
+            _logger().warning("chat: notify-health fetch failed: %s", e)
+
+        # All-cash streak — how long has the live trader actually been
+        # 100% cash, and at what compounding alpha cost so far? The
+        # chat carries cash_pct (point-in-time), cash_redeployment
+        # latency (post-SELL sit), opportunity_cost (signal-specific
+        # hindsight) and cash_drag (SPY-benchmarked dollar). None
+        # answer the OPERATOR-VISIBILITY question "is the book
+        # CHRONICALLY flat right now?". A book that has been flat for
+        # 2h looks identical on cash_pct to one that has been flat for
+        # 6 days yet the second case is a strong "decision loop too
+        # risk-off / something is wrong" tell. Block fires ONLY on
+        # EXTENDED_HOLDOUT / PROLONGED_HOLDOUT (BRIEF_HOLDOUT /
+        # NOT_ALL_CASH / NO_DATA / INSUFFICIENT_HISTORY collapse to
+        # silence). Composed verbatim by the pure
+        # _all_cash_streak_chat_lines helper (unit-tested; SSOT — the
+        # builder's own `headline` is the chat headline). Guarded 3s
+        # read.
+        all_cash_streak_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/all-cash-streak",
+                    timeout=3) as resp:
+                _acs = json.loads(resp.read().decode("utf-8"))
+            all_cash_streak_block = "\n".join(_all_cash_streak_chat_lines(_acs))
+        except Exception as e:
+            _logger().warning("chat: all-cash-streak fetch failed: %s", e)
+
+        # Feed-health — the live-news pipeline fitness layer. Every
+        # downstream block (decision/book/skill/news analytics) assumes
+        # the feed is alive. When `/api/feed-health` flips to BLIND
+        # (N consecutive 0-signal decisions), STALE_FEED (newest live
+        # article > stale_hours old), or fires the UNSCORED clause
+        # (articles arriving but ai_score=0 — digital-intern ML scoring
+        # pipeline silently down), every other block's verdicts become
+        # interpretively suspect — CASH_REDEPLOYMENT=STALLED means
+        # something different when the bot is BLIND vs when the wire
+        # is live. The analyst must flag this BEFORE answering "what
+        # should we do?" because the right answer becomes "restart the
+        # scorer" or "wait for the feed", not "trim NVDA". The
+        # UNSCORED-clause sub-message is already part of the builder's
+        # `headline` under BLIND/STALE_FEED. Block fires ONLY on BLIND
+        # / STALE_FEED (HEALTHY / NO_DATA collapse to silence — never
+        # chat filler when the feed works; NO_DATA is a probe-side
+        # defect, not an actionable verdict). Composed verbatim by
+        # the pure _feed_health_chat_lines helper (unit-tested; SSOT).
+        # Guarded 3s read.
+        feed_health_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/feed-health",
+                    timeout=3) as resp:
+                _fh = json.loads(resp.read().decode("utf-8"))
+            feed_health_block = "\n".join(_feed_health_chat_lines(_fh))
+        except Exception as e:
+            _logger().warning("chat: feed-health fetch failed: %s", e)
+
         now_iso = datetime.now(timezone.utc).isoformat()
         system_prompt = (
             "You are a market intelligence analyst with access to a real-time news feed, "
@@ -7576,6 +7876,9 @@ def create_app(store=None) -> Flask:
             f"{portfolio_block}\n\n"
             "PAPER TRADER LIVE STATE (separate $1000 sim run by Opus 4.7 every 30 min):\n"
             f"{paper_trader_block}\n\n"
+            + (f"PAPER TRADER — DISCORD-DELIVERY HEALTH (operator-fitness — when DEGRADED, trade alerts / hourly summaries / daily-close posts are silently being dropped: the analyst is talking about a book whose ops surface is DARK and any 'consider trimming X' recommendation never reaches the operator. Surfaced ONLY when DEGRADED, never filler when HEALTHY / UNKNOWN. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{notify_health_block}\n\n" if notify_health_block else "")
+            + (f"PAPER TRADER — ALL-CASH STREAK (the chronic-flat-book surface — cash_pct snapshots are point-in-time; cash_redeployment latency is the post-SELL sit; opportunity_cost is signal-specific hindsight; cash_drag is SPY-benchmarked dollar; none answer 'how long has the book ACTUALLY been 100% cash right now, and at what compounding alpha cost so far?'. A book flat for 2h vs 6 days reads identically on cash_pct yet the second case is a strong 'decision loop too risk-off / something is wrong' tell. Surfaced ONLY when EXTENDED_HOLDOUT / PROLONGED_HOLDOUT, never filler when BRIEF_HOLDOUT / NOT_ALL_CASH / NO_DATA / INSUFFICIENT_HISTORY. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{all_cash_streak_block}\n\n" if all_cash_streak_block else "")
+            + (f"PAPER TRADER — FEED HEALTH (the live-news pipeline fitness — every downstream block assumes the feed is alive; when feed-health is BLIND (consecutive 0-signal decisions), STALE_FEED (newest article > stale_hours old), or UNSCORED (articles arriving but ai_score=0 — digital-intern ML scoring pipeline silently down), every other verdict becomes interpretively suspect: CASH_REDEPLOYMENT=STALLED means something different when the bot is BLIND vs when the wire is live. The analyst must flag this BEFORE answering 'what should we do?' because the right answer becomes 'restart the scorer' or 'wait for the feed', not 'trim NVDA'. The UNSCORED-clause is already part of the headline under BLIND/STALE_FEED. Surfaced ONLY when BLIND / STALE_FEED, never filler when HEALTHY / NO_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{feed_health_block}\n\n" if feed_health_block else "")
             + (f"PAPER TRADER — WHAT MATERIALLY CHANGED SINCE YOU LAST LOOKED (ranked, last 6h):\n{session_delta_block}\n\n" if session_delta_block else "")
             + (f"PAPER TRADER ANALYTICS:\n{analytics_block}\n\n" if analytics_block else "")
             + (f"PAPER TRADER — BEHAVIOURAL DIAGNOSIS (the bot's own self-review verdicts):\n{behavioural_block}\n\n" if behavioural_block else "")
