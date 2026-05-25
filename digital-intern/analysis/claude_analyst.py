@@ -1606,6 +1606,36 @@ _BRIEFING_RT_HERES_WHAT_MEANS = re.compile(
     r"\bhere(?:[s'’]+|\s+is)?\s+what\s+(?:it|that|this)(?:\s+really)?\s+means\b",
     re.IGNORECASE,
 )
+# Variant-verb sibling — lockstep mirror of
+# ``watchers.alert_agent._RT_HERES_WHAT_SIGNALS``. Same SEO trailer template
+# with ``signals`` instead of ``means``. Live evidence (2026-05-25, 24h
+# articles.db urgent scan with the heres_what_means gate active): two MSN /
+# Globe and Mail variants reached urgency=1 with ml_score 9.5-9.8 carrying
+# this verb variant — without this mirror the per-domain cap admits them
+# into the briefing's top-50 digest pool.
+_BRIEFING_RT_HERES_WHAT_SIGNALS = re.compile(
+    r"\bhere(?:[s'’]+|\s+is)?\s+what\s+(?:it|that|this)(?:\s+really)?\s+signals\b",
+    re.IGNORECASE,
+)
+# Leading "<Fund> LLC Makes New $X Investment in <Co>" — lockstep mirror of
+# ``watchers.alert_agent._RT_FUND_MAKES_INVESTMENT``. The same 13F press-mill
+# template family as ``_BRIEFING_RT_HOLDINGS_BY_FUND`` /
+# ``_BRIEFING_RT_SHARES_BOUGHT_BY``, with a distinct phrasing (the LLC
+# announces the investment, not the trailer). Live evidence (2026-05-25):
+# "Torren Management LLC Makes New $1.86 Million Investment in NVIDIA
+# Corporation $NVDA" reached urgency=1 from AlphaVantage/MarketBeat —
+# without this mirror the per-domain cap admits it into the briefing's
+# top-50 digest pool as a fresh TOP SIGNAL despite being retrospective
+# 13F-filing recap.
+_BRIEFING_RT_FUND_MAKES_INVESTMENT = re.compile(
+    r"\S+(?:\s+\S+){0,5}\s+LLC\s+"
+    r"(?:Makes|Made|Acquires|Acquired|Takes|Took)\s+"
+    r"(?:New\s+)?\$?[\d,.]+(?:\s*[KMB])?\s+"
+    r"(?:Million\s+|Billion\s+)?"
+    r"(?:Position|Investment|Stake|Shares?|Holdings?)\s+"
+    r"(?:in|of)\b",
+    re.IGNORECASE,
+)
 # "[Wikipedia] <article title>" — lockstep mirror of
 # ``watchers.alert_agent._RT_WIKIPEDIA_REF``. The ``collectors.wikipedia_collector``
 # emits encyclopedic recent-changes rows with this exact prefix, and the ML
@@ -1873,6 +1903,13 @@ _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     # Present-tense SEO-trailer sibling — lockstep mirror of the alert path's
     # same-named gate. See ``_BRIEFING_RT_HERES_WHAT_MEANS`` for live evidence.
     ("heres_what_means", _BRIEFING_RT_HERES_WHAT_MEANS),
+    # Variant-verb sibling — lockstep mirror of the alert-side same-named gate.
+    # See ``_BRIEFING_RT_HERES_WHAT_SIGNALS`` for live evidence.
+    ("heres_what_signals", _BRIEFING_RT_HERES_WHAT_SIGNALS),
+    # 13F press-mill leading-LLC variant — lockstep mirror of the alert-side
+    # same-named gate. See ``_BRIEFING_RT_FUND_MAKES_INVESTMENT`` for live
+    # evidence.
+    ("fund_makes_investment", _BRIEFING_RT_FUND_MAKES_INVESTMENT),
     ("wikipedia_ref", _BRIEFING_RT_WIKIPEDIA_REF),
     ("earnings_tomorrow_preview", _BRIEFING_RT_EARNINGS_TOMORROW),
     ("todays_movers_list", _BRIEFING_RT_TODAYS_MOVERS),

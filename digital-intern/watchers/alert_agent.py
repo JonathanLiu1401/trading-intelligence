@@ -884,6 +884,96 @@ _RT_HERES_WHAT_MEANS = re.compile(
     re.IGNORECASE,
 )
 
+# "<headline>. Here's What [It|That|This] Really Signals [to|for] X" —
+# variant-verb sibling of ``_RT_HERES_WHAT_MEANS`` (same SEO-trailer template
+# family with the verb ``signals`` instead of ``means``). The Global &
+# Mail / MSN financial-content syndicator uses the "Signals" verb as a
+# substitute for "Means" on the same post-event explainer template — the
+# trailer adds nothing actionable beyond the news lead. Discovered live
+# in a 24h scan run alongside the ``_RT_HERES_WHAT_MEANS`` rollout.
+#
+# Live evidence (2026-05-25, articles.db 24h urgent scan with the
+# heres_what_means gate active): two NEW rows reached urgency=1 with
+# ml_score 9.5-9.8 carrying the same SEO trailer template but with
+# ``signals`` instead of ``means``:
+#   - "Nvidia's Board Just Authorized an Additional $80 Billion Buyback.
+#      Here's What That Really Signals to Investors. - The Globe and Mail"
+#      (ml_score=9.83, score_source='ml', GN: dividend buyback)
+#   - "Nvidia's board just authorized an additional $80 billion buyback.
+#      Here's what that really signals to investors. - MSN"
+#      (ml_score=9.53, score_source='ml', GN: Nvidia)
+# Both publishers above the 0.45 ``ALERT_MIN_LONE_SOURCE_CRED`` bar — the
+# source-authority gate doesn't catch them; content type IS the failure.
+#
+# Discriminator: identical structure to ``_RT_HERES_WHAT_MEANS`` but with
+# the verb ``signals`` — FOUR required tokens (``here`` + ``what`` + closed
+# pronoun set + ``signals``). The plural ``signals`` (verb form) is REQUIRED
+# — singular ``signal`` (noun: "rate cut signal") is a different word class
+# and is NOT matched.
+#
+# Must-survive corpus (validated): "Powell signals more cuts after rate
+# decision" (no ``here`` + leading lead, not template), "Fed signals dovish
+# tilt after CPI miss" (no ``here what``), "What this signals for the AI
+# trade" (no ``here``), "Earnings results signal continued growth"
+# (singular ``signal``, no ``here what``). All survive.
+#
+# Defense-in-depth: byte-identical twin in
+# ``analysis.claude_analyst._BRIEFING_RT_HERES_WHAT_SIGNALS`` — same lockstep
+# discipline enforced by ``test_alert_and_briefing_recap_tuples_have_same_length``.
+_RT_HERES_WHAT_SIGNALS = re.compile(
+    r"\bhere(?:[s'’]+|\s+is)?\s+what\s+(?:it|that|this)(?:\s+really)?\s+signals\b",
+    re.IGNORECASE,
+)
+
+# "<Fund Name> LLC Makes New $X Million/Billion Investment in <Company>" —
+# MarketBeat / americanbankingnews / AlphaVantage 13F press-mill SIBLING of
+# ``_RT_HOLDINGS_BY_FUND`` and ``_RT_SHARES_BOUGHT_BY``. The same 13F press
+# pipeline rephrases the institutional disclosure as a "<Fund LLC> Makes
+# New $X Investment in <Company>" headline, which neither existing gate
+# catches because:
+#   - ``_RT_HOLDINGS_BY_FUND`` requires "Holdings <verb> by <fund> LLC" —
+#     the trailing-LLC structure; this template leads with the LLC.
+#   - ``_RT_SHARES_BOUGHT_BY`` requires "Shares (in|of) ... bought by
+#     <fund> LLC" — the "Shares ... by" prefix; this template uses
+#     "Makes/Acquired ... Investment in" instead.
+#
+# Live evidence (2026-05-25, articles.db 24h urgent scan): "Torren
+# Management LLC Makes New $1.86 Million Investment in NVIDIA Corporation
+# $NVDA" reached urgency=1 (ml_score=9.71, score_source='ml',
+# AlphaVantage/MarketBeat) — pure 13F filing recap, by definition
+# retrospective (the SEC filing was already public weeks before the
+# headline was generated). The MarketBeat credibility tier (0.68) sits
+# above the 0.45 lone-source bar so the source-authority gate doesn't
+# catch it; content type IS the failure, identical class to the two
+# existing 13F-mill gates.
+#
+# Discriminator: leading "<Fund> LLC" (the LLC is the announcer, NOT the
+# trailer) + an action verb (``Makes|Made|Acquires|Acquired|Takes|Took``)
+# + optional ``New`` + a dollar-prefixed magnitude (``$X[.X][KMB]``) +
+# magnitude qualifier (``Million|Billion``)? + a stake-noun
+# (``Position|Investment|Stake|Shares|Holdings``) + ``in|of``. The LLC
+# anchor at the LEAD + the dollar-magnitude figure together are the
+# discriminator — real news doesn't lead with "<Fund> LLC Makes
+# $X Investment in <Co>". Validated against the must-survive corpus:
+# "Berkshire Hathaway takes new stake in Apple" (no LLC), "Saudi fund
+# makes $5B investment in semis" (no LLC), "Tesla insiders bought 100,000
+# shares" (different structure), "BlackRock Holdings now 12.3M shares of
+# NVDA" (different structure). All survive.
+#
+# Defense-in-depth: byte-identical twin in
+# ``analysis.claude_analyst._BRIEFING_RT_FUND_MAKES_INVESTMENT`` — same
+# lockstep discipline enforced by
+# ``test_alert_and_briefing_recap_tuples_have_same_length``.
+_RT_FUND_MAKES_INVESTMENT = re.compile(
+    r"\S+(?:\s+\S+){0,5}\s+LLC\s+"
+    r"(?:Makes|Made|Acquires|Acquired|Takes|Took)\s+"
+    r"(?:New\s+)?\$?[\d,.]+(?:\s*[KMB])?\s+"
+    r"(?:Million\s+|Billion\s+)?"
+    r"(?:Position|Investment|Stake|Shares?|Holdings?)\s+"
+    r"(?:in|of)\b",
+    re.IGNORECASE,
+)
+
 # "[Wikipedia] <article title>" — the canonical title prefix emitted by
 # ``collectors.wikipedia_collector`` for recent-changes mainspace edits. By
 # definition encyclopedic reference content, NOT breaking news: a Wikipedia
@@ -1367,6 +1457,12 @@ _RECAP_TEMPLATE_PATTERNS = (
     # (``analytics.recap_template_audit`` etc.) bucket each variant separately.
     # See ``_RT_HERES_WHAT_MEANS`` for live evidence.
     ("heres_what_means", _RT_HERES_WHAT_MEANS),
+    # Variant-verb sibling — present-tense ``signals`` form of the same SEO
+    # trailer template. See ``_RT_HERES_WHAT_SIGNALS`` for live evidence.
+    ("heres_what_signals", _RT_HERES_WHAT_SIGNALS),
+    # MarketBeat / AlphaVantage 13F press-mill — leading "<Fund> LLC Makes
+    # New $X Investment in <Co>" sibling of holdings_by_fund / shares_bought_by.
+    ("fund_makes_investment", _RT_FUND_MAKES_INVESTMENT),
     ("wikipedia_ref", _RT_WIKIPEDIA_REF),
     ("earnings_tomorrow_preview", _RT_EARNINGS_TOMORROW),
     ("todays_movers_list", _RT_TODAYS_MOVERS),
