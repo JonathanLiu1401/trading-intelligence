@@ -48,7 +48,10 @@ def _parse(ts: str | None) -> datetime | None:
     if not ts:
         return None
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00").replace(" ", "T"))
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00").replace(" ", "T"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except ValueError:
         return None
 
