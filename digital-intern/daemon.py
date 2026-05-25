@@ -83,6 +83,7 @@ from collectors.appstore_finance_ranks import collect_appstore_finance_ranks
 from collectors.crypto_fear_greed_collector import collect_crypto_fear_greed
 from collectors.binance_funding_collector import collect_crypto_funding
 from collectors.coingecko_collector import collect_coingecko
+from collectors.defillama_tvl_collector import collect_defillama_tvl
 from collectors.earnings_surprise_collector import collect_earnings_surprises
 from collectors.polymarket_collector import collect as collect_polymarket
 from collectors.manifold_collector import collect_manifold
@@ -214,6 +215,7 @@ FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
 CRYPTO_FEAR_GREED_INTERVAL = 1800  # Crypto Fear & Greed (alternative.me) every 30min
 CRYPTO_FUNDING_INTERVAL   = 1800  # OKX perpetual funding rates every 30min
 COINGECKO_INTERVAL        = 1800  # CoinGecko crypto market snapshot every 30min
+DEFILLAMA_TVL_INTERVAL    = 3600  # DeFiLlama DeFi TVL signals every 60min
 EARNINGS_SURPRISE_INTERVAL = 900  # EPS beat/miss scanner every 15min
 POLYMARKET_INTERVAL     = 900     # Polymarket prediction markets every 15min
 MANIFOLD_INTERVAL       = 1800    # Manifold Markets prediction markets every 30min
@@ -361,6 +363,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "crypto_fear_greed": CRYPTO_FEAR_GREED_INTERVAL,
     "crypto_funding":   CRYPTO_FUNDING_INTERVAL,
     "coingecko":        COINGECKO_INTERVAL,
+    "defillama_tvl":    DEFILLAMA_TVL_INTERVAL,
     "earnings_surprise": EARNINGS_SURPRISE_INTERVAL,
     "polymarket": POLYMARKET_INTERVAL,
     "kalshi": KALSHI_INTERVAL,
@@ -1464,6 +1467,28 @@ def coingecko_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(COINGECKO_INTERVAL)
+
+
+# ── Worker: DeFiLlama TVL — every 60min ──────────────────────────────────────
+def defillama_tvl_worker(store: ArticleStore):
+    log.info("[defillama_tvl_worker] started")
+    bo = Backoff("defillama_tvl", base=120.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_defillama_tvl()
+            _ingest(store, articles, "defillama_tvl")
+            try:
+                source_health.record_result("defillama_tvl", len(articles))
+            except Exception as he:
+                log.warning(f"[defillama_tvl_worker] source_health error: {he}")
+            _worker_last_ok["defillama_tvl"] = time.time()
+            log.debug(f"[defillama_tvl] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[defillama_tvl_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(DEFILLAMA_TVL_INTERVAL)
 
 
 # ── Worker: OKX Perpetual Funding Rates — every 30min ────────────────────────
@@ -4489,6 +4514,7 @@ def main():
         ("crypto_fear_greed", crypto_fear_greed_worker),
         ("crypto_funding",   crypto_funding_worker),
         ("coingecko",        coingecko_worker),
+        ("defillama_tvl",    defillama_tvl_worker),
         ("earnings_surprise", earnings_surprise_worker),
         ("polymarket",  polymarket_worker),
         ("kalshi",      kalshi_worker),
