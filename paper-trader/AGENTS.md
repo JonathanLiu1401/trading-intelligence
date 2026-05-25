@@ -6,6 +6,167 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-25 core HYBRID pass #11 (Agent 1) — breaker recovery anchor symmetry + book-exposure on operator alarms
+
+### Phase 1 — fix: bugs_fixed = 1 (breaker recovery anchor leaked on send failure)
+
+**Bug:** `runner._cycle`'s breaker-cleared recovery branch reset
+`_no_decision_first_ts = None` **unconditionally** before calling
+`send_breaker_cleared_alert`. When the Discord send returned False
+(transient openclaw blip — observed live: notify-health verdict was
+DEGRADED with "openclaw timeout (60s)" on the previous process), the
+latch correctly stayed armed for a next-cycle retry, but the elapsed-time
+anchor was already gone. So the retry would render the bare
+"responding again" body with **no `after ~Xh dark` close** on the
+FIRED→CLEARED bracket — silently burying the wedge duration on every
+recovery that hit a transient openclaw blip.
+
+Asymmetric against the quota recovery path one block down, which
+correctly only clears `_quota_first_ts` on confirmed send success
+(`TestQuotaOutageRecovery.test_failed_recovery_send_leaves_latch_and_anchor_armed`
+already pinned that discipline). The breaker path's docstring even said
+"Symmetric with the quota latch's recovery path" — but the implementation
+disagreed with the comment.
+
+**Fix:** breaker path now mirrors the quota discipline. The anchor is
+reset only inside the `if ok:` block (alongside the latch clear), so a
+failed send leaves BOTH the latch AND the timer armed for retry. A
+sub-threshold wedge (cleared before the breaker armed any latch) still
+resets the anchor unconditionally in an `else` branch so the next outage
+starts its own clock fresh.
+
+**Tests (3 new in `tests/test_core_runner_cycle.py`):**
+* `test_failed_recovery_send_leaves_breaker_anchor_armed` — mirror of
+  the existing quota test
+* `test_failed_recovery_then_success_passes_full_elapsed` — end-to-end:
+  flaky first send / successful retry passes the FULL wedge elapsed
+  (not a truncated value reflecting only the gap since the failed try)
+* `test_real_decision_with_no_latch_resets_anchor` — sub-threshold
+  path still resets unconditionally
+
+### Phase 2 — feat: features_added = 1 (book-exposure line on operator alarms)
+
+**The gap.** The breaker FIRED + quota EXHAUSTED alarms historically told
+the trader the engine was frozen but never NAMED what the unattended
+book held. A trader paged at 3am cannot judge whether to intervene
+without knowing if the frozen book is 100% cash (safe to wait), 100%
+NVDA pinned at -3% (probably worth liquidating by hand), or hedged.
+`/api/state` answers this on the dashboard — but the operator being
+paged is by definition NOT in front of a dashboard; the alert that woke
+them is their only surface.
+
+**The helper.** `reporter._book_exposure_line(store)` composes
+`store.get_portfolio()` plus `store.open_positions()` using the
+last-stored `current_price` on each row (no extra mark-to-market — the
+alarm path stays zero-latency, mirroring the `_trade_impact_line`
+discipline). Renders one of:
+* `book: $1010.00 (+1.00% from start) · 100% cash`
+* `book: $987.39 (-1.26% from start) · 1 position · biggest NVDA 65.4% (-3.66% unrealized)`
+
+Wired into `send_breaker_fired_alert(store=...)` and
+`send_quota_alert(store=...)`; both pass it from `runner._cycle` via
+`get_store()`. Legacy callers (no kwarg) get the original no-context
+body byte-identical so backwards compatibility is preserved. Failure
+contract mirrors the rest of reporter: any store fault inside the
+helper degrades to `""` so the alarm itself never gets dropped — a
+notification helper must never mask the outage it exists to surface.
+
+**Tests (16 new in `tests/test_core_reporter.py`):**
+* `TestBookExposureLine` (11) — all-cash / single / multi / option ×100
+  multiplier / zero-qty skip / stale-mark `avg_cost` fallback /
+  uncomputable unrealized / store-fault degrades silently /
+  `_INITIAL_EQUITY` baseline
+* `TestBreakerFiredAlertWithBookExposure` (3) — exposure appended when
+  store supplied, legacy body preserved without it, broken store does
+  NOT drop the alert
+* `TestQuotaAlertWithBookExposure` (2) — exposure appended for the
+  quota path, legacy preserved
+
+Existing fixtures in `tests/test_core_runner_cycle.py` updated to
+accept the new `store=` kwarg on the monkeypatched alert lambdas.
+
+### Phase 3 — Live trader findings (user_findings = 5)
+
+Hit the live `:8090` endpoints as a trader would (runner pid=191336,
+boot_sha=18f6d99, 2 commits behind HEAD — git-watcher will pick up
+this session's commits within minutes via the deferred-restart path):
+
+1. **Discord delivery was DEGRADED on the prior process** — the
+   previous heartbeat fetched at session start carried
+   `notify.verdict=DEGRADED, last_error=openclaw timeout (60s),
+   consecutive_failures=1, last_ok_ts=null`. The current process
+   (restarted ~5 min into the session, presumably to apply commit
+   18f6d99) reads `UNKNOWN — no Discord message attempted yet` — fresh
+   process, not enough data to call it chronic. Worth a watch on the
+   next hourly summary attempt to confirm openclaw is stable.
+
+2. **NO_DECISION 24h rate 54.7%** — `/api/decision-health` reports
+   237 / 433 cycles (54.7%) returned NO_DECISION over the window. This
+   is the documented #1 live pathology (host saturation from sibling
+   Claude agents — 4 concurrent Opus processes per `/api/empty-claude-
+   rate`, including this HYBRID review session). Recent 6h rate is
+   much better (5.6%) — storms are episodic, not constant.
+
+3. **Cycle cadence JITTERY (CoV 1.92)** —
+   `/api/cycle-gap-summary` flags wide gap variance (median 675s,
+   stdev 1293s). Documented as transient host saturation; the
+   dynamic-interval tier mix shifts cycle gaps anywhere from 60s
+   (earnings window) to 90min (quiet-closed), so high CoV is partly
+   correct behaviour.
+
+4. **Book pinned 100% cash 25.5 hours** — last fill was a thesis-
+   driven NVDA SELL on 2026-05-24 02:08; the bot has been
+   deliberately defensive ("Thesis BROKEN per drift analysis ... AMD
+   is overbought ... right move is cash" per the reasoning column).
+   The desk is intentional, not wedged.
+
+5. **Lagging SPY by -2.22pp from start** — `/api/benchmark` reads
+   $987.39 vs $1009.59 buy-and-hold; ahead-in-window only 36.4%.
+   Defensive posture has a real cost vs the index in this window.
+
+### Phase 4 — verify
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_core_reporter.py \
+                  tests/test_core_runner.py \
+                  tests/test_core_runner_cycle.py \
+                  tests/test_core_strategy.py \
+                  tests/test_core_store.py \
+                  tests/test_core_signals.py \
+                  tests/test_core_market.py -q
+# 896 passed in ~95s under host load
+python3 -c "import sys; sys.path.insert(0,'.'); \
+            from paper_trader import signals, reporter, strategy; \
+            print('imports OK')"
+```
+
+### Files touched
+
+- `paper_trader/runner.py` (Phase 1 + Phase 2 wiring — +25/-3 lines)
+- `paper_trader/reporter.py` (Phase 2 helper + alert kwargs — +91/-2 lines)
+- `tests/test_core_runner_cycle.py` (Phase 1 tests + fixture kwarg
+  updates — +94/-4 lines, two commits)
+- `tests/test_core_reporter.py` (Phase 2 tests — +222 lines)
+
+Two commits: `6305351` (Phase 1 fix) and `2ddf1d9` (Phase 2 feat).
+Both staged ONLY the files this agent touched (explicit pathspec per
+the documented concurrent-agent staging discipline). Sibling work
+(dashboard.py edits from Agent 4, new `analytics/` files from Agents 2
+& 4, three digital-intern edits) was visible in `git status` throughout
+and was NOT bundled into either of this agent's commits.
+
+### Concurrent-agent discipline (process note)
+
+Four same-role HYBRID-style agents ran on this tree this session per
+`ps -ef | grep claude`: Agent 1 core (this one), Agent 2 ML+backtest,
+Agent 3 digital-intern, Agent 4 feature-dev. Both this agent's commits
+used explicit pathspec staging — `git reset HEAD` first when a stray
+sibling edit appeared in the staged set, then `git add` with explicit
+file paths only.
+
+---
+
 ## 2026-05-24 core HYBRID pass #10 (Agent 1) — preflight cmdline-scan fix + `health_check` CLI
 
 ### Phase 1 — fix: bugs_fixed = 1 (preflight false-positive PID scan)
