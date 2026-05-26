@@ -575,11 +575,15 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
     """
     if not oos_records:
         return {"n": 0, "rmse": None, "rmse_unclamped": None,
+                "target_std": None, "target_std_unclamped": None,
+                "rmse_ratio": None,
                 "buy_n": 0, "buy_rmse": None,
                 "sell_n": 0, "sell_rmse": None}
     if not getattr(scorer, "is_trained", False):
         return {"n": len(oos_records), "rmse": None,
                 "rmse_unclamped": None,
+                "target_std": None, "target_std_unclamped": None,
+                "rmse_ratio": None,
                 "buy_n": 0, "buy_rmse": None,
                 "sell_n": 0, "sell_rmse": None,
                 "error": "scorer not trained"}
@@ -694,6 +698,8 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
 
     if not preds:
         return {"n": 0, "rmse": None, "rmse_unclamped": None,
+                "target_std": None, "target_std_unclamped": None,
+                "rmse_ratio": None,
                 "buy_n": 0, "buy_rmse": None,
                 "sell_n": 0, "sell_rmse": None,
                 "error": "no predictable records"}
@@ -703,6 +709,35 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
     arr_a_raw = np.array(actuals_raw, dtype=np.float64)
     rmse = float(np.sqrt(np.mean((arr_p - arr_a_clamped) ** 2)))
     rmse_unclamped = float(np.sqrt(np.mean((arr_p - arr_a_raw) ** 2)))
+
+    # σ of the OOS target (SAME label space the RMSE is computed against —
+    # clamped + SELL sign-flipped). This is the canonical "predict the mean"
+    # constant-baseline a quant should compare RMSE against: a model with
+    # rmse >= target_std is worse-than-trivial (no skill over constant
+    # mean-predictor of the target). Surfacing it alongside rmse lets the
+    # per-cycle skill ledger trend the documented MLP_NO_BETTER_THAN_TRIVIAL
+    # condition automatically — until now that comparison required running
+    # `baseline_compare` from the CLI. `ddof=0` (population std) matches
+    # numpy's default and the implicit "mean over n" used by rmse, so the
+    # ratio rmse/target_std is on identical denominators.
+    #
+    # `target_std_unclamped` mirrors `rmse_unclamped`: the std of the raw
+    # (un-clamped) targets so a quant who wants the real-world baseline can
+    # see it next to `rmse_unclamped`. Same pattern as the rmse_unclamped
+    # additive: the primary headline is the clamped pair (apples-to-apples
+    # with how the model was trained); the unclamped pair is honesty for
+    # readers asking "what's the raw, pre-clamp error vs raw spread."
+    target_std = float(np.std(arr_a_clamped))
+    target_std_unclamped = float(np.std(arr_a_raw))
+    # Skill ratio: rmse divided by the constant-mean baseline. Convention:
+    # < 1.0 means the model beats the constant predictor (skill); >= 1.0
+    # means no skill (the documented MLP_NO_BETTER_THAN_TRIVIAL state).
+    # None on the degenerate target_std==0 case (every OOS row has the
+    # exact same target — impossible in real data but defensible against
+    # a future synthetic corpus). Quants triage on this ratio over raw
+    # RMSE because RMSE's scale depends on the noisy 5d-return target's
+    # natural variance (which itself drifts across regimes).
+    rmse_ratio = (rmse / target_std) if target_std > 0 else None
 
     def _rmse_or_none(ps: list[float], acs: list[float]) -> float | None:
         if not ps:
@@ -715,6 +750,9 @@ def evaluate_scorer_oos(scorer, oos_records: list[dict]) -> dict:
         "n": len(preds),
         "rmse": rmse,
         "rmse_unclamped": rmse_unclamped,
+        "target_std": target_std,
+        "target_std_unclamped": target_std_unclamped,
+        "rmse_ratio": rmse_ratio,
         "buy_n": len(buy_preds),
         "buy_rmse": _rmse_or_none(buy_preds, buy_actuals),
         "sell_n": len(sell_preds),

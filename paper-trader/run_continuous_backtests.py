@@ -1507,6 +1507,18 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
     oos_buy_rmse_n = 0
     oos_sell_rmse_s = "n/a"
     oos_sell_rmse_n = 0
+    # σ(target) + RMSE/σ skill ratio — the canonical "predict the constant
+    # mean" baseline a quant should compare a regressor against. The
+    # documented MLP_NO_BETTER_THAN_TRIVIAL state means `oos_rmse_ratio`
+    # is hovering at ≥ 1.0 in production right now; until this token landed
+    # an operator had to compute it manually from oos_rmse and a separate
+    # `baseline_compare` CLI invocation. Persisting it per cycle makes the
+    # net-skill state visible in the trend (and the dashboard) automatically.
+    # Same n/a discipline as every other oos_ token: a None metric (degenerate
+    # zero target_std, untrained scorer, or post-train diagnostic crash)
+    # renders as "n/a" rather than a fabricated number.
+    oos_target_std_s = "n/a"
+    oos_rmse_ratio_s = "n/a"
     if result.get("status") == "ok" and oos_records:
         try:
             from paper_trader.validation import evaluate_scorer_oos
@@ -1527,6 +1539,12 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
             sr = oos.get("sell_rmse")
             if sr is not None and sr == sr:
                 oos_sell_rmse_s = f"{sr:.2f}"
+            ts = oos.get("target_std")
+            if ts is not None and ts == ts:
+                oos_target_std_s = f"{ts:.2f}"
+            ratio = oos.get("rmse_ratio")
+            if ratio is not None and ratio == ratio:
+                oos_rmse_ratio_s = f"{ratio:.3f}"
         except Exception as exc:
             oos_rmse_s = f"n/a (oos-eval err: {type(exc).__name__})"
 
@@ -1637,6 +1655,8 @@ def _train_decision_scorer(outcome_records: list[dict]) -> str:
     label_dropped = result.get("n_label_dropped", 0)
     return (f"scorer {result['status']} train_n={result['n']} "
             f"val_rmse={val_s} oos_n={len(oos_records)} oos_rmse={oos_rmse_s} "
+            f"oos_target_std={oos_target_std_s} "
+            f"oos_rmse_ratio={oos_rmse_ratio_s} "
             f"oos_buy_rmse_n={oos_buy_rmse_n} "
             f"oos_buy_rmse={oos_buy_rmse_s} "
             f"oos_sell_rmse_n={oos_sell_rmse_n} "
@@ -1695,6 +1715,13 @@ def _parse_scorer_status(status: str) -> dict:
         # None on older status strings — historical ledger rows parse clean.
         "oos_buy_rmse_n": None, "oos_buy_rmse": None,
         "oos_sell_rmse_n": None, "oos_sell_rmse": None,
+        # σ(target) baseline + RMSE/σ skill ratio (2026-05-25 feature). The
+        # canonical "predict the constant mean" baseline a quant should
+        # compare a regressor's RMSE against. `oos_rmse_ratio < 1.0` ⇒ the
+        # model carries skill; `≥ 1.0` ⇒ MLP_NO_BETTER_THAN_TRIVIAL (the
+        # documented production state). None on older status strings —
+        # historical ledger rows parse cleanly.
+        "oos_target_std": None, "oos_rmse_ratio": None,
         # Per-regime OOS rank-IC. None on older status strings predating
         # the regime-breakdown wiring — historical ledger rows parse clean.
         "oos_bull_n": None, "oos_bull_ic": None,
@@ -1763,6 +1790,12 @@ def _parse_scorer_status(status: str) -> dict:
         out["oos_sell_rmse_n"] = int(osrn) if osrn is not None else None
         out["oos_buy_rmse"] = _num("oos_buy_rmse")
         out["oos_sell_rmse"] = _num("oos_sell_rmse")
+        # σ(target) + RMSE/σ skill ratio — additive 2026-05-25 tokens.
+        # Older status strings (cycles before this wiring) omit them and
+        # the `_num` regex miss degrades cleanly to None. Floats — no
+        # int cast (target_std is a real-valued std, ratio is unitless).
+        out["oos_target_std"] = _num("oos_target_std")
+        out["oos_rmse_ratio"] = _num("oos_rmse_ratio")
         # Per-regime — int counts, float rank-IC. Old status strings omit
         # the tokens entirely and degrade to None via the `_num` regex miss.
         for _reg in ("bull", "sideways", "bear"):
@@ -1790,6 +1823,7 @@ def _parse_scorer_status(status: str) -> dict:
             "oos_sell_n": None, "oos_sell_dir_acc": None, "oos_sell_ic": None,
             "oos_buy_rmse_n": None, "oos_buy_rmse": None,
             "oos_sell_rmse_n": None, "oos_sell_rmse": None,
+            "oos_target_std": None, "oos_rmse_ratio": None,
             "oos_bull_n": None, "oos_bull_ic": None,
             "oos_sideways_n": None, "oos_sideways_ic": None,
             "oos_bear_n": None, "oos_bear_ic": None,
