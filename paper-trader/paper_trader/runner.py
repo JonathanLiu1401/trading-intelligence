@@ -641,14 +641,25 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 def _deferred_restart_overdue(requested_monotonic: float | None,
                               now_monotonic: float,
-                              grace_s: float = RESTART_GRACE_S) -> bool:
+                              grace_s: float = RESTART_GRACE_S,
+                              call_active: bool = False) -> bool:
     """True when a deferred restart was requested and the main loop has NOT
     honored it within ``grace_s`` seconds (so the watcher must force-exit).
 
     Pure predicate over monotonic clocks (immune to the wall-clock step-back
     the Phase-1 sidecar fix hardens against). ``requested_monotonic`` is None
-    until a restart has been requested → never overdue."""
+    until a restart has been requested → never overdue.
+
+    ``call_active=True`` defers force-exit: a healthy in-flight ``claude``
+    subprocess (``strategy.is_claude_call_active``) means the loop is making
+    progress, not wedged. With ``strategy.DECISION_TIMEOUT_S = None`` a
+    legitimate Opus call can exceed ``grace_s``; killing it would shoot the
+    trader mid-decision. The watcher re-probes each cycle so the deadman
+    fires the *first* tick after the call returns if the restart is still
+    unhonored — same end behaviour, just no longer collateral damage."""
     if requested_monotonic is None:
+        return False
+    if call_active:
         return False
     return (now_monotonic - requested_monotonic) >= grace_s
 
@@ -699,7 +710,17 @@ def _git_watcher():
             requested_at = time.monotonic()
             while True:
                 time.sleep(180)
-                if _deferred_restart_overdue(requested_at, time.monotonic()):
+                # Skip force-exit while a claude subprocess is still working
+                # (timeouts are None now — a legitimate slow Opus call can
+                # legitimately outlast RESTART_GRACE_S). The watcher will
+                # re-fire the next 180s tick once the call returns.
+                try:
+                    from . import strategy as _strat
+                    call_active = _strat.is_claude_call_active()
+                except Exception:
+                    call_active = False
+                if _deferred_restart_overdue(requested_at, time.monotonic(),
+                                             call_active=call_active):
                     print(
                         f"[runner] WARNING: deferred restart still unhonored "
                         f">{int(RESTART_GRACE_S)}s after request — main loop "

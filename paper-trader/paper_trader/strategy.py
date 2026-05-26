@@ -55,6 +55,27 @@ _ml_qualify_cache: tuple[bool, str, float] | None = None
 # (decision → retry → Sonnet fallback, or this cycle's call vs. the next).
 _active_claude_proc: subprocess.Popen | None = None
 
+
+def is_claude_call_active() -> bool:
+    """True when a `claude` subprocess this process started is still running.
+
+    Used by the runner's git-watcher deadman to distinguish a *wedged* main
+    loop (worth force-exiting) from a *legitimately slow* in-flight Opus call
+    (must not be killed). Reads the live ``Popen.poll()`` — never raises, safe
+    from the watcher thread. With ``DECISION_TIMEOUT_S = None`` (commit
+    82bb195: "wait indefinitely for model response") a healthy decision can
+    legitimately take longer than ``RESTART_GRACE_S``; without this signal
+    the deadman would tear down the trader mid-thought. Returns False when no
+    claude call has run this process or the prior one has already exited
+    (the next cycle's deferred-restart check then proceeds normally)."""
+    proc = _active_claude_proc
+    if proc is None:
+        return False
+    try:
+        return proc.poll() is None
+    except Exception:
+        return False
+
 # Set True by _claude_call when the CLI rejects an attempt with a quota /
 # usage-limit error (a *distinct* failure from a timeout or a parse miss — it
 # never self-recovers within the cycle, and the auto-recovery circuit breaker's
