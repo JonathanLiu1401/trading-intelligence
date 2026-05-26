@@ -6,6 +6,203 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-26 ML+backtest HYBRID pass #42 (Agent 2) — multi-horizon intraperiod extremes
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Read `decision_scorer.py`, `run_continuous_backtests.py`, and the
+load-bearing slabs of `backtest.py` (`_ml_decide`, `_buy`/`_sell`/
+`_enforce_risk_exits`, `PriceCache`, technical indicators,
+`_compute_decision_outcomes`, the gate kill-switch landed in pass #41).
+Candidates considered and rejected after careful trace:
+
+* `_should_gate_modulate_conviction` has a *theoretical* check-then-unpack
+  race on the unlocked `_gate_skill_cache` read (between
+  `if _gate_skill_cache is not None` and `gate, reason, ts = _gate_skill_cache`,
+  another thread could `_reset_gate_skill_cache()` to `None`). But
+  `_reset_gate_skill_cache` is exclusively a test seam — production
+  paths never touch it — and no current test exercises the cache from
+  multiple threads concurrently. Zero observable impact. Not a fix.
+
+* `_buy` blends `avg_cost` with `(existing["qty"] * existing["avg_cost"]
+  + qty * price) / new_qty` — a `qty = -existing["qty"]` would divide by
+  zero. But `_ml_decide` only ever emits positive `qty` (rounded from a
+  positive notional clamped to `portfolio.cash * 0.95`), so the only
+  caller can't hit this. By design.
+
+* `pred_quantiles` are computed on `model.predict(scaler.transform(X))`
+  using the FULL X (train + val fold). The docstring says "training set"
+  but the code's actually predicting on the full deduped corpus
+  including the held-out val slice. A minor wording mismatch, not a
+  functional bug — quantile calibration is more honest when computed on
+  the same distribution the model will see at inference (which is
+  unaffected by where the val/train split lands).
+
+Set `bugs_fixed = 0` and move on per the commit guard.
+
+### Phase 2 — Feature: multi-horizon intraperiod extremes (`features_added = 1`)
+
+`_compute_decision_outcomes` already persists `forward_intraperiod_min_5d`
+and `forward_intraperiod_max_5d` (the 5d window's signed %-change
+extremes relative to sim_d close). Pairs feed `stop_out_audit` (does the
+inherited `_buy` `stop_loss = price * 0.92` band — the −8% downside arm
+— actually save more from limited-loss trades than it costs in
+prematurely-exited recoveries?) and `mfe_conversion` (does the matching
+`take_profit = price * 1.15` band capture more upside than it forfeits
+in trades that would have recovered further?).
+
+But a quant researcher considering **longer-window** stop/take-profit
+bands (e.g. would a -10% stop with a 10d window capture MORE protection
+than the current -8% / 5d?) had to recompute extremes MANUALLY from the
+price cache because the outcome corpus only carried the 5d snapshot.
+Every existing 5d-window analyzer is structurally blind to multi-horizon
+band geometry.
+
+**The fix.** `_compute_decision_outcomes` now also calls
+`_fwd_intraperiod_extremes` with `h=10` and `h=20`, persisting four new
+keys alongside the existing 5d pair:
+
+* `forward_intraperiod_min_10d` / `forward_intraperiod_max_10d`
+* `forward_intraperiod_min_20d` / `forward_intraperiod_max_20d`
+
+Same None semantics as the 5d pair (None when the horizon window has no
+resolvable closes, partial coverage honored). Pairs naturally with
+`forward_return_10d` / `forward_return_20d` so a horizon-conditional
+analyzer (longer-window stop sweep, captured-upside ratio across
+holding periods) has the full endpoint + extremes set.
+
+**Why this is safe for training.** `build_features` / `train_scorer`
+ignore unknown dict keys (the same precedent set by the 2026-05-18
+`forward_return_10d/20d` and 2026-05-19 `regime_label` / `persona`
+additions, and the 2026-05-21 `conviction_pct` capture). Zero risk of
+feature-vector drift; the DecisionScorer's 20-feature input is
+unchanged. Pure additive research instrumentation.
+
+**Tests** in `tests/test_outcome_intraperiod_multihorizon.py` (6 new):
+
+* `TestMultiHorizonExtremesPresent` — schema invariant: both new pairs
+  always exist in the outcome dict.
+* `TestMonotoneRising` — monotone-rising price puts min at day 1 and
+  max at horizon endpoint, across h=5/10/20.
+* `TestVshapeMultiHorizon` — V-shape with -15% trough at day 3 and
+  +20% peak at day 15 — exercises the distinct values each horizon
+  captures (5d sees only the trough; 20d sees both the trough AND
+  the +20% peak).
+* `TestWindowRunsPastHistory` — 18-day history with sim_d at day 0:
+  5d/10d full coverage, 20d partial (honored) — pins partial-coverage
+  semantics.
+* `TestExtremesOnSellRow` — SELL rows also get the multi-horizon
+  fields (downstream analyzers apply their own SELL semantics).
+* `TestMonotonicityAcrossHorizons` — sanity invariant: across longer
+  horizons, the realized min cannot increase and the max cannot
+  decrease (a longer window strictly contains the shorter one).
+
+### Phase 3 — Live quant findings (`user_findings = 4`)
+
+1. **Kill switch is firing in 100% of recent BUYs.** Trailing-20
+   `oos_buy_ic` median = +0.0150 (threshold |0.03|), so
+   `_should_gate_modulate_conviction` reports `(False, "median
+   oos_buy_ic=+0.015 over last 20 cycles is below |0.03| — gate
+   killed")`. Verified live: all 90 most recent BUYs in
+   `decision_outcomes.jsonl` carry `gate_off_dist=True`. The 2026-05-25
+   pass-#41 kill-switch is doing exactly what it was designed to do —
+   the deployed scorer's BUY-side rank skill is statistically at noise,
+   so the gate's per-arm sizing modulation is short-circuited.
+
+2. **`MLP_NO_BETTER_THAN_TRIVIAL` persists as the production verdict.**
+   Latest `baseline_skill_log.jsonl` row: `verdict =
+   MLP_NO_BETTER_THAN_TRIVIAL`, `mlp_rank_ic = -0.009`,
+   `best_baseline = news_count` (ic = +0.013), `ic_gap = -0.022`. A
+   one-line rule (raw `news_count`) carries marginally more OOS rank
+   skill than the trained MLP. Consistent with the kill-switch verdict.
+
+3. **LLM annotation pipeline DARK.** Latest `continuous.log` shows
+   `[continuous] LLM annotation failed: "Could not resolve
+   authentication method"` — the Anthropic API key isn't set in the
+   current shell environment, so 0/N decisions get an ENDORSE/CONDEMN
+   label. Training weighting reduces to the documented `CURRENT_TIED`
+   state. Not actionable from this code review pass (env-config issue),
+   but `llm_annotation_skill_log.jsonl` was specifically wired to
+   surface this in the trend — it should already be reporting "dark"
+   verdicts.
+
+4. **34.4% of recent BUYs hit at least -8% intraperiod drawdown within
+   5d.** Of the last 90 BUYs: mean `forward_return_5d` = -1.747%,
+   median = -2.542%, stdev = 9.59%. Among them 31/90 (34.4%) hit an
+   intraperiod min ≤ -8% (the inherited `_buy` `stop_loss = price *
+   0.92` band would have triggered a stop-out on them). The multi-
+   horizon extremes added in Phase 2 will let the next `stop_out_audit`
+   sweep test whether a wider band (e.g. -10%) over a longer window
+   (10d, 20d) saves more than it costs.
+
+### Phase 4 — Counters
+
+* `bugs_fixed = 0`
+* `features_added = 1`
+* `user_findings = 4`
+
+### Files touched
+
+* `run_continuous_backtests.py` — call `_fwd_intraperiod_extremes` with
+  `h=10` and `h=20` alongside the existing `h=5`, persist the 4 new
+  keys in every outcome dict.
+* `tests/test_outcome_intraperiod_multihorizon.py` — new test file,
+  6 tests covering schema presence, monotone-rising values across all
+  three horizons, V-shape with distinct extremes per horizon, partial-
+  coverage semantics, SELL action symmetry, and the
+  longer-horizon-contains-shorter monotonicity invariant.
+
+### ML/backtest domain — multi-horizon intraperiod extremes (operator reference)
+
+**How to use the new fields.** Every BUY/SELL row in
+`data/decision_outcomes.jsonl` written after 2026-05-26 carries 6
+intraperiod extreme fields total (3 horizons × min/max):
+
+```
+forward_intraperiod_min_5d   forward_intraperiod_max_5d
+forward_intraperiod_min_10d  forward_intraperiod_max_10d
+forward_intraperiod_min_20d  forward_intraperiod_max_20d
+```
+
+Each is signed %-change relative to sim_d's close, capturing the worst
+drawdown (min) and best peak (max) reached at ANY close between
+sim_d+1 and sim_d+h trading days. None when the window has no
+resolvable closes for the ticker; partial coverage is honored
+(any close that resolves contributes to the running extremes).
+
+**What this unlocks.** Horizon-conditional stop / take-profit sweep:
+
+```python
+# Conservative: how often does a -8% band trigger within 5d vs 20d?
+import json
+with open('data/decision_outcomes.jsonl') as f:
+    rows = [json.loads(l) for l in f if l.strip()]
+buys = [r for r in rows if r.get('action') == 'BUY']
+n5  = sum(1 for r in buys if (r.get('forward_intraperiod_min_5d')  or 0) <= -8.0)
+n10 = sum(1 for r in buys if (r.get('forward_intraperiod_min_10d') or 0) <= -8.0)
+n20 = sum(1 for r in buys if (r.get('forward_intraperiod_min_20d') or 0) <= -8.0)
+print(f"-8% trigger rate: 5d={n5/len(buys):.1%}  10d={n10/len(buys):.1%}  20d={n20/len(buys):.1%}")
+```
+
+**Test commands for the multi-horizon feature:**
+
+```
+$ python3 -m pytest tests/test_outcome_intraperiod_multihorizon.py -v
+$ python3 -m pytest tests/test_outcome_intraperiod_extremes.py \
+    tests/test_backfill_intraperiod.py \
+    tests/test_continuous_intraperiod_ledgers.py -v
+```
+
+**Operational discipline.** The legacy historical corpus (~8000 rows
+pre-2026-05-26) carries None for these 4 new fields — same as it
+carries None for the older 5d intraperiod pair before that feature
+landed on 2026-05-23. A future `backfill_intraperiod.py`-style
+back-population helper would close this gap; until then, longer-horizon
+analyzers should expect the empty-corpus / `INSUFFICIENT_DATA` verdict
+on the historical tail and gradually warm up as new cycles accumulate.
+
+---
+
 ## 2026-05-25 ML+backtest HYBRID pass #41 (Agent 2) — gate no-skill kill-switch
 
 ### Phase 1 — Debug: bugs_fixed = 0
