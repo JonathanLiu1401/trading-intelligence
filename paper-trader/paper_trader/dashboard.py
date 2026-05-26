@@ -7985,16 +7985,39 @@ def model_progress():
 
     Groups completed runs into cycles of RUNS_PER_CYCLE=5 by run_id order.
     Labels use actual run_id ranges so trimming old runs does not renumber cycles.
+
+    Reads ``backtest.db`` in **read-only** mode (``file:…?mode=ro``) and never
+    runs DDL/migrations. The previous implementation instantiated a full
+    ``BacktestStore()`` per request, which runs ``PRAGMA journal_mode=WAL``,
+    a ``CREATE TABLE IF NOT EXISTS`` executescript and idempotent
+    ``ALTER TABLE`` migrations on every dashboard hit. Under the live
+    continuous-backtest committee (5 parallel writers every 60s) every one
+    of those DDL statements contended for the writer lock and the request
+    timed out at the 30s SQLite busy_timeout — observed live: ``curl
+    /api/model-progress`` returned HTTP 000 (connection dropped) on every
+    poll, leaving the Model Progress chart permanently blank. A read-only
+    connection (the ``signals.py`` / ``api_model_rankings`` precedent)
+    never takes a writer lock and the SELECT against the WAL DB always
+    completes in milliseconds even while the committee is mid-write.
+    Also closes the connection in a ``try/finally`` — the prior code
+    leaked one connection per request.
     """
     try:
-        from .backtest import BacktestStore
-        store = BacktestStore()
-        rows = store.conn.execute(
-            "SELECT run_id, total_return_pct, completed_at FROM backtest_runs "
-            "WHERE status='complete' ORDER BY run_id"
-        ).fetchall()
+        if not BACKTEST_DB.exists():
+            return jsonify({"cycles": [], "total_runs": 0})
+        conn = sqlite3.connect(
+            f"file:{BACKTEST_DB}?mode=ro", uri=True, timeout=5
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT run_id, total_return_pct, completed_at FROM backtest_runs "
+                "WHERE status='complete' ORDER BY run_id"
+            ).fetchall()
+        finally:
+            conn.close()
         if not rows:
-            return jsonify({"cycles": []})
+            return jsonify({"cycles": [], "total_runs": 0})
 
         cycle_size = 5  # RUNS_PER_CYCLE
         cycles = []
