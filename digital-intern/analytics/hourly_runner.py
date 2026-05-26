@@ -66,6 +66,7 @@ def main() -> int:
         ("ticker_score_acceleration", "analytics.ticker_score_acceleration", "main"),
         ("premarket_brief",           "analytics.premarket_brief",           "main"),
         ("ticker_cold_case_detector", "analytics.ticker_cold_case_detector", "main"),
+        ("signal_cascade_detector",   "analytics.signal_cascade_detector",   "main"),
     ]
 
     for short_name, mod_path, fn_name in module_specs:
