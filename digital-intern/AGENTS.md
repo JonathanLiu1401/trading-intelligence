@@ -5,6 +5,174 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-26 feature pass — /api/ticker-velocity + /api/ticker-comentions (live-wire volume + pair axes)
+
+Feature-dev pass (Agent 4). Two new native DI endpoints + chat blocks
+that close the remaining wire-axis gaps that the recent
+`sentiment-reversal` / `ticker-score-dispersion` pair didn't cover —
+**arrival volume** and **pair co-mention**. Both are clean refactors of
+pre-existing CLI-only `analytics/` snapshot writers (the same playbook
+the prior pass used to expose `sentiment_reversal`).
+
+**The wire-axis map after this pass.** Four orthogonal per-ticker live
+surfaces now exist as endpoint + chat block, each describing a different
+property of the same article stream:
+
+| Axis | Endpoint | Question it answers |
+|---|---|---|
+| Directional flip | `/api/sentiment-reversal` | did avg ml_score cross sign across two 2h windows? |
+| Intra-window consensus | `/api/ticker-score-dispersion` | are this window's articles agreeing on the score? |
+| Arrival volume | `/api/ticker-velocity` *(new)* | which tickers' raw arrival count is accelerating? |
+| Pair co-mention | `/api/ticker-comentions` *(new)* | is the velocity idiosyncratic or part of a basket move? |
+
+A BREAKING name on `ticker-velocity` that also surfaces in
+`ticker-comentions` SECTOR_BURST is a sector-basket move; the same
+BREAKING name without a pair partner is an idiosyncratic catalyst.
+That distinction is invisible to any prior surface.
+
+**`/api/ticker-velocity`** — refactor of CLI-only
+`analytics/ticker_velocity_runner.py` (previously dumped to
+`/home/zeph/logs/ticker_velocity.json` but never wired). Pure builder
+`build_ticker_velocity(articles, window_min=120, top_n=10, now=None)`
+discovers top-N tickers by raw mention count over the full
+`2 * window_min` window (canonical `_LIVE_ONLY_CLAUSE`), then per
+ticker computes recent/prior counts, Laplace-smoothed ratio
+`(recent+1)/(prior+1)`, `newest_age_s`, and a per-ticker
+BREAKING/WARMING/QUIET classifier. Top-level verdict ladder:
+
+* `BREAKING`   — best ticker ratio ≥ 4.0 AND recent ≥ 5.
+* `WARMING`    — best ratio ≥ 2.0 AND recent ≥ 3.
+* `QUIET`      — every ticker below thresholds.
+* `NO_DATA`    — no live articles in the window.
+
+`?window_min=` clamped 30..720 (default 120). The endpoint chat block
+fires ONLY on BREAKING / WARMING (silence-on-healthy precedent).
+
+**Why this is not a clone.** `ticker_score_acceleration` already
+exists as a CLI module — but it operates on the *ml_score* slope across
+four 30-min sub-windows (a SCORE-momentum signal). `ticker-velocity` is
+ARRIVAL-count-based: a brand-new burst of headlines arrives before the
+score-based surfaces have anything to score. `keyword_surge` works on
+narrative keywords (not tickers), `trend_velocity` shares the
+numerator/denominator shape but is JSON-only AND carries a
+long-standing partial-filter bug that lets `opus_annotation*` /
+`backtest://` rows leak through (so a backtest injection burst could
+fire a phantom BREAKING). This module is the end-to-end clean version
+wired to the endpoint + chat block.
+
+**`/api/ticker-comentions`** — refactor of CLI-only
+`analytics/ticker_comentions.py` (previously dumped to
+`/home/zeph/logs/ticker_comentions.json` but never wired). Pure builder
+`build_ticker_comentions(articles, window_hours=2, top_n=10, now=None)`
+extracts ticker pairs per title (deduped, alphabetically canonicalised
+so MU+NVDA == NVDA+MU), counts pair occurrences and solo totals in the
+window, and computes `lift = co_count / min(solo_a, solo_b)`. Verdict
+ladder:
+
+* `SECTOR_BURST`   — top pair lift ≥ 0.7 AND co_count ≥ 4. The rarer
+                      ticker's mentions are mostly co-mentioning the
+                      other; the wire is treating them as one trade.
+* `COUPLED_NAMES`  — top pair co_count ≥ 2 but below burst.
+* `DISCONNECTED`   — no pair reached the minimum.
+* `NO_DATA`        — no live articles in the window.
+
+`?hours=` clamped 1..24 (default 2). Chat block fires ONLY on
+COUPLED_NAMES / SECTOR_BURST.
+
+**Why this is not a clone.** `sector_pulse` is a TAXONOMY-driven sector
+heatmap (sector membership is hardcoded in `_SECTOR_MAP`). This is
+DISCOVERED from pair co-occurrence in titles, so an emerging
+TSMC+NVDA+MU semis basket appears as a pair burst *before* it shows
+up as a sector-pulse spike — and an off-taxonomy pair (CRWD+ZS in a
+sec-stack story) shows up here but never on sector-pulse.
+
+**STOP-extension correctness.** Both refactors carry a local
+`_EXTRA_STOP` that augments `trend_velocity.STOP` with noise tokens
+the volume axis amplifies more than the score axis: DRAM, NAND, HDD,
+SSD, RAM, CPU, GPU, PCB, PCIe, AG, TD, AD, HOC, AOL, ATM, TSMC. The
+"AD" + "HOC" pair from "ad hoc" headlines was firing a phantom
+SECTOR_BURST in early live smoke — empirical validation of the
+extension. Both files apply the same joined set so the
+velocity / comentions surfaces never disagree on the ticker universe.
+
+**Chat enrichment:** two new native blocks `NEWS TICKER VELOCITY` and
+`NEWS TICKER COMENTIONS` injected into the `/api/chat` system prompt
+right after `NEWS TICKER-SCORE DISPERSION` — the four wire-axis blocks
+cluster contiguously so the analyst reads them in order. Both follow
+the silence-on-healthy contract (QUIET / DISCONNECTED / NO_DATA collapse
+to silence) and the SSOT contract (headline + per-row numbers pass
+through verbatim from the builder; no chat-side re-derived verdict).
+
+**Live verification (real `articles.db`, after the STOP extension):**
+
+```
+ticker-velocity verdict=BREAKING headline="BREAKING: HK 0→6 (ratio 7.00, newest 1269s ago)"
+  top tickers: HK / YF (both BREAKING) / QBTS (WARMING) / NOK / QQQ / BTC / NVDA / AMD / BB / SOXX
+
+ticker-comentions verdict=SECTOR_BURST headline="SECTOR_BURST: QQQ+SPY co=4 lift=1.00 (a_total=5 b_total=4)"
+  top pairs: QQQ+SPY / HK+LANZA / NVDA+QQQ / NVDA+SPY / QBTS+RGTI
+```
+
+The QQQ+SPY pair (broad-market ETFs co-mentioned at 1.0 lift) is the
+correct read of the current wire — `sentiment-reversal` / `dispersion`
+would not have surfaced it. QBTS+RGTI is the quantum-computing basket
+the velocity-only surface picks up but only the comentions axis can
+classify as a basket move.
+
+**Files (digital-intern only):**
+
+- `analytics/ticker_velocity_runner.py` — refactored to expose
+  `build_ticker_velocity(articles, ...)` pure builder while preserving
+  the CLI snapshot side effect. STOP extension restored.
+- `analytics/ticker_comentions.py` — refactored to expose
+  `build_ticker_comentions(articles, ...)` pure builder while
+  preserving the CLI snapshot side effect. Local `extract_tickers`
+  override applies the joined STOP set.
+- `dashboard/web_server.py` — five additions:
+  1. `_ticker_velocity_chat_lines(rep)` helper.
+  2. `_ticker_comentions_chat_lines(rep)` helper.
+  3. `/api/ticker-velocity` endpoint — `_ro_query` + `_LIVE_ONLY_SQL`.
+  4. `/api/ticker-comentions` endpoint — same plumbing, `?hours=`
+     clamped 1..24.
+  5. Chat handler wires both native blocks into the prompt directly
+     after `NEWS TICKER-SCORE DISPERSION`.
+- `tests/test_ticker_velocity.py` — 17 pure-helper tests pinning the
+  verdict ladder, per-ticker classification, Laplace smoothing,
+  ranking, window cutoff, stopword filter, and chat helper
+  silence/verbatim contract.
+- `tests/test_ticker_comentions.py` — 15 pure-helper tests pinning
+  the verdict ladder, MIN_PAIR_COUNT gate, lift computation, pair
+  canonicalisation, window cutoff, dedup, and chat helper
+  silence/verbatim contract.
+- `tests/test_ticker_velocity_comentions_endpoint.py` — 9 Flask
+  `test_client` smoke tests pinning the endpoint shapes, `?window_min=`
+  / `?hours=` clamps, and `_LIVE_ONLY_SQL` filter (backtest:// /
+  backtest_* / opus_annotation* rows must not leak through —
+  cross-system invariant mirrors paper-trader signals.py).
+
+**Tests:** 47 new (17+15+9 + 6 invariant/edge — counted across files
+as `47 passed in 0.47s`); scoped sweep
+`-k "trend_velocity or sentiment_reversal or ticker_score or
+ticker_velocity or ticker_comentions or chat"` reports `1223 passed`
+(no regressions). Broader chat-enrichment sweep
+`-k "sentiment_reversal or ticker_score_dispersion or ticker_velocity
+or ticker_comentions or chat or web_server or sector_pulse or
+sector_coherence"` reports `1250 passed`. Module `__main__` smoke
+deliberately avoided per the project-memory verification rule.
+
+**Staging:** explicit per-file pathspec —
+`analytics/ticker_velocity_runner.py`,
+`analytics/ticker_comentions.py`, `dashboard/web_server.py`,
+`tests/test_ticker_velocity.py`, `tests/test_ticker_comentions.py`,
+`tests/test_ticker_velocity_comentions_endpoint.py`, this `AGENTS.md`
+update. No `git add -A` (concurrent-agent footgun memory). The live
+`:8080` daemon must be restarted for the new endpoints to be served;
+until then the chat handler's `try/except` swallows the import-or-build
+failure and the block silently collapses (the silence precedent — no
+chat regression).
+
+---
+
 ## 2026-05-26 feature pass — /api/sentiment-reversal + /api/ticker-score-dispersion (per-ticker wire-consistency pair)
 
 Feature-dev pass. The 30+ existing chat-enrichment blocks have rich
