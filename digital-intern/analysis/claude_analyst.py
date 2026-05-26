@@ -1880,6 +1880,24 @@ _BRIEFING_RT_STOCK_CONTINUES_AFTER = re.compile(
     re.IGNORECASE,
 )
 
+# Lockstep mirror of ``watchers.alert_agent._RT_ZACKS_HIGHLIGHTS`` — the Zacks
+# Investment Research recurring SEO blog wrap-up template. See the alert-side
+# regex for full live evidence (4 urgency=2 fires on 2026-05-26 + 101 leaks
+# in 30 days). Byte-identical regex; the briefing path needs the same gate
+# because the same Zacks blog post crosses both surfaces — Opus saw "The
+# Zacks Analyst Blog Highlights NVDA, FTEC, VGT, SMH, IYW and XLK" as a TOP
+# SIGNAL with the same ml_score 9.83 that earned it a BREAKING alert.
+# Anti-drift structurally pinned by
+# ``test_alert_and_briefing_recap_tuples_have_same_length``.
+_BRIEFING_RT_ZACKS_HIGHLIGHTS = re.compile(
+    r"^\s*(?:"
+    r"the\s+zacks\s+analyst\s+blog\s+highlights"
+    r"|"
+    r"zacks(?:\.com)?\s+featured\s+highlights"
+    r")\b",
+    re.IGNORECASE,
+)
+
 _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _BRIEFING_RT_WHY_TRADING),
     ("why_did_stock", _BRIEFING_RT_WHY_DID),
@@ -1929,6 +1947,11 @@ _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     # discriminator rationale. Anti-drift structural test:
     # ``test_alert_and_briefing_recap_tuples_have_same_length``.
     ("stock_continues_after", _BRIEFING_RT_STOCK_CONTINUES_AFTER),
+    # Zacks SEO blog-highlights mill — lockstep mirror of the alert-side
+    # ``zacks_highlights`` gate. See ``_BRIEFING_RT_ZACKS_HIGHLIGHTS`` for
+    # the live evidence (4 urgency=2 fires + 101 leaks in 30d). Anti-drift
+    # structural test: ``test_alert_and_briefing_recap_tuples_have_same_length``.
+    ("zacks_highlights", _BRIEFING_RT_ZACKS_HIGHLIGHTS),
 )
 
 

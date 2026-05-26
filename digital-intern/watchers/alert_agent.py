@@ -1428,6 +1428,62 @@ _RT_STOCK_CONTINUES_AFTER = re.compile(
     re.IGNORECASE,
 )
 
+# "The Zacks Analyst Blog Highlights <TICKERS>" / "Zacks.com featured highlights
+# include <TICKERS>" — the Zacks Investment Research recurring SEO blog wrap-up
+# template. By definition retrospective: a "Blog Highlights" / "featured
+# highlights" post lists tickers the Zacks editorial team is covering THIS WEEK
+# / THIS DAY — there is no underlying breaking event, just an editorial roundup.
+# Cross-syndicated by every Zacks-republishing channel (yfinance/Zacks,
+# YahooFinance/<TICKER>, Finnhub/Yahoo, GoogleNews/* variants) so the same
+# template surfaces 4-6 times for the same blog post within hours.
+#
+# Live evidence (2026-05-26, articles.db 30-day urgency scan): 4 distinct
+# urgency=2 (alerted state) rows from this template family today alone, with
+# 101 additional urgency=0 rows leaking the same template in 30 days:
+#   - 2026-05-26T10:35:20Z ``Finnhub/Yahoo`` "Zacks.com featured highlights
+#     include Micron Technology, Murphy USA and Vertiv" ml_score=9.9 urgency=2
+#   - 2026-05-26T09:40:31Z ``YahooFinance/NVDA`` "The Zacks Analyst Blog
+#     Highlights NVDA, FTEC, VGT, SMH, IYW and XLK" ml_score=9.9 urgency=2
+#   - 2026-05-26T09:35:40Z ``yfinance/Zacks`` (same NVDA blog) ml_score=9.83
+#     urgency=2
+#   - 2026-05-26T08:54:55Z ``yfinance/Zacks`` "Zacks.com featured highlights
+#     include Micron Technology, Murphy USA and Vertiv" ml_score=9.5 urgency=2
+# All four publishers above the 0.45 ``ALERT_MIN_LONE_SOURCE_CRED`` bar so the
+# source-authority gate doesn't catch them; the ML urgency head over-scores
+# them because the title is dense with held tickers (NVDA + MU + KLA + LITE
+# appear in nearly every Zacks blog highlights post — the model's
+# portfolio_flag/ticker_count/ticker_density features fire hard). The
+# cross-cycle dedup doesn't merge them because the source-attribution suffix
+# (" - The Globe and Mail", " - Yahoo Finance") varies between syndications.
+#
+# Discriminator: two anchored leads (the Zacks SEO template has two canonical
+# title forms; both must be caught):
+#   1. ``^The\s+Zacks\s+Analyst\s+Blog\s+Highlights\b`` — the "Analyst Blog
+#      Highlights" prefix is the Zacks-specific signature.
+#   2. ``^Zacks(?:\.com)?\s+featured\s+highlights\b`` — the "Zacks featured
+#      highlights" / "Zacks.com featured highlights" prefix is the alternate
+#      Zacks SEO template form. The ``.com`` is optional to handle both
+#      published variants.
+# Anchored ``^`` so a mid-sentence reference ("Bank of America says Zacks
+# highlights NVDA in their year-end note") is NOT caught. Validated against
+# the must-survive corpus: real wire copy never leads with this Zacks-specific
+# SEO header — "Nvidia reports record Q1", "Zacks raises MU price target to
+# $200", "MU added to Zacks Rank 1 list" all do NOT match because none lead
+# with "The Zacks Analyst Blog Highlights" or "Zacks(.com) featured highlights".
+#
+# Defense-in-depth: a byte-identical twin lives in
+# ``analysis.claude_analyst._BRIEFING_RT_ZACKS_HIGHLIGHTS`` — the documented
+# lockstep, enforced structurally by
+# ``test_alert_and_briefing_recap_tuples_have_same_length``.
+_RT_ZACKS_HIGHLIGHTS = re.compile(
+    r"^\s*(?:"
+    r"the\s+zacks\s+analyst\s+blog\s+highlights"
+    r"|"
+    r"zacks(?:\.com)?\s+featured\s+highlights"
+    r")\b",
+    re.IGNORECASE,
+)
+
 _RECAP_TEMPLATE_PATTERNS = (
     ("why_trading_today", _RT_WHY_TRADING),
     ("why_did_stock", _RT_WHY_DID),
@@ -1484,6 +1540,13 @@ _RECAP_TEMPLATE_PATTERNS = (
     # for live evidence (the same "Nvidia stock continues to struggle after
     # earnings" recap pushed 4× across syndication channels in 3 days).
     ("stock_continues_after", _RT_STOCK_CONTINUES_AFTER),
+    # Zacks SEO blog-highlights mill — distinct from every other recap gate
+    # (no Why-led prefix, no PCT, no earnings-noun terminator). The two
+    # canonical lead forms (``The Zacks Analyst Blog Highlights ...`` /
+    # ``Zacks(.com) featured highlights include ...``) are the Zacks-specific
+    # signature. See ``_RT_ZACKS_HIGHLIGHTS`` for the full live evidence
+    # (4 urgency=2 fires today + 101 leaks in 30d).
+    ("zacks_highlights", _RT_ZACKS_HIGHLIGHTS),
 )
 
 
