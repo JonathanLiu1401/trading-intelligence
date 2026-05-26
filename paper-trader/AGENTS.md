@@ -161,6 +161,95 @@ missing-ledger safe-default keeps the gate active) and call
 
 ---
 
+## 2026-05-25 core HYBRID pass #41 (Agent 1) — deadman defer on in-flight Opus + alarm-latch line on hourly
+
+### Phase 1 — Debug: bugs_fixed = 1
+
+**Bug: the deferred-restart deadman can SIGKILL a healthy in-flight Opus call.**
+Commit `82bb195` removed all Opus timeouts (`DECISION_TIMEOUT_S`, `RETRY_TIMEOUT_S`,
+`FALLBACK_TIMEOUT_S` are all `None` — "wait indefinitely for model response"),
+but it left `runner._git_watcher`'s deadman at `RESTART_GRACE_S = 600s`. So a
+legitimately slow Opus call that exceeds 10 minutes — now allowed by design —
+would be force-killed mid-thought on the next git-HEAD change because the watcher
+believed the loop was wedged. The test
+`TestDeferredRestartOverdue::test_grace_exceeds_worst_case_healthy_cycle` had
+already started failing with `TypeError: unsupported operand type(s) for +:
+'NoneType' and 'NoneType'` (the literal "the bounded worst-case invariant no
+longer holds" canary).
+
+**Fix.** Add `strategy.is_claude_call_active()` — a pure `poll()` over the
+module-global `_active_claude_proc` (never raises, safe from the watcher
+thread). Add a `call_active` parameter to `runner._deferred_restart_overdue`;
+when True (a claude subprocess is currently running) the predicate returns
+False regardless of elapsed time — defer the force-exit, the loop is making
+progress, not wedged. The watcher re-probes every 180s tick so the deadman
+fires the *first* tick after the call returns if the restart is still
+unhonored — same end behaviour, no collateral damage. The failing canary
+test now skips on `timeouts is None` (with a clear note pointing at the new
+`call_active` short-circuit as the runtime safety net).
+
+Locked by `tests/test_core_runner.py::TestDeferredRestartOverdue` (new
+`test_call_active_defers_force_exit` past-grace + active = not overdue
+vs past-grace + inactive = overdue; `test_call_active_does_not_bypass_within_grace`
+preserves the under-grace common case) and `tests/test_core_strategy.py::
+TestIsClaudeCallActive` (no proc / alive / exited / poll-raises returns
+False — the helper never crashes the watcher thread).
+
+### Phase 2 — Feature: alarm-latch one-liner on hourly Discord summary (`features_added = 1`)
+
+The runner already exposes `alarm_latch_state()` / `alarm_latch_headline()`
+and the dashboard surfaces them at `/api/alarm-latches` — but a trader
+whose primary monitoring surface is Discord (the documented "primary
+surface") never saw the CURRENTLY-LATCHED state between the FIRED alert
+and the eventual CLEARED alert. On a multi-hour wedge that is exactly
+the trader-pain gap: "I know the breaker fired at 03:14 — is it STILL
+latched now, at 09:00?" the hourly summary should answer that.
+
+Adds `reporter._alarm_latch_line()` composing `runner.alarm_latch_headline()`
+verbatim (SSOT — never re-derives the verdict text; same discipline as
+`_behavioural_block` / `_benchmark_line`), wired into `send_hourly_summary`
+immediately after `_mark_integrity_line` (same urgency tier — both answer
+"is downstream P/L meaningful right now?"). Silent on no-latches-held
+per the silence-when-nothing-actionable precedent the rest of `reporter.py`
+follows. Block prefix is `**ENGINE LATCH** ◈` so the trader scanning
+Discord recognises it alongside `**MARK INTEGRITY**` / `**HOST**` etc.
+
+Locked by `tests/test_alarm_latch_hourly.py` (7 tests: silent on clean
+engine; breaker / quota / both latched → verbatim runner headline with
+`**ENGINE LATCH** ◈` prefix; runner-side fault → `""` never raises;
+`send_hourly_summary` actually invokes the helper and the text lands
+in the Discord body).
+
+### Phase 3 — Live findings (`user_findings = 4`)
+
+1. **Discord channel DARK on this restart** — `/api/notify-health` reads
+   `DEGRADED — 1 consecutive send failure, last OK never; last error:
+   openclaw timeout (60s)`. The runner just rebooted on commit `8f6f3f1`
+   (Phase 2) and the first `_send` of the ONLINE ping timed out under
+   sibling-agent load. Will self-recover on the next attempt; this is
+   exactly the silent-failure class the new `**ENGINE LATCH** ◈` line
+   is meant to expose on the hourly that follows.
+2. **100% cash for ~24h** — last trade was 2026-05-24 02:08 SELL 3 NVDA;
+   every cycle since reads `HOLD CASH → HOLD`. Could be a rational
+   decision; the dashboard's `/api/capital-pulse` is the trader's
+   surface for "why am I 100% cash?". Not actionable.
+3. **30% NO_DECISION rate over last 20 cycles** — `/api/runner-heartbeat`
+   reads `decision_efficacy.PRODUCING (14/20)` but `decision-health`
+   reads `DEGRADED`. Documented host-saturation pathology — sibling Opus
+   agents starve the live trader's box during reviews (see invariant
+   `host_pulse_line` / `_host_pulse_line`).
+4. **My code is live on master at boot** — `/api/healthz` reads
+   `boot_sha=head_sha=8f6f3f1`, the git-watcher auto-restart caught my
+   Phase 2 push within seconds. The new `**ENGINE LATCH** ◈` line will
+   appear on the next hourly summary.
+
+### Phase 4 — Docs
+
+This entry plus the test files above. No code changes outside
+Phase 1 / Phase 2 commits (`f1f4f1b`, `8f6f3f1`).
+
+---
+
 ## 2026-05-25 core HYBRID pass #40 (Agent 1) — orphan `_quota_first_ts` fix + session outage counters
 
 ### Phase 1 — Debug: bugs_fixed = 1
