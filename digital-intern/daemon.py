@@ -3197,6 +3197,22 @@ def scorer_worker(store: ArticleStore):
                 _worker_last_ok["scorer"] = time.time()
                 _sleep(SCORE_INTERVAL)
                 continue
+            # Pre-floor quote-widget / recap-template pseudo-articles before
+            # inference. The urgency_scorer Sonnet path already does this, and
+            # ArticleStore.score_pending mirrors it — but the production
+            # scorer_worker historically did not, so ML-confident urgent
+            # quote-widget / recap rows reached urgency=2 and were only caught
+            # by the alert-side gates (after polluting urgent_queue_health and
+            # burning alert worker cycles). 48h audit (2026-05-26): 10 such
+            # rows. Same SSOT (ArticleStore.prefloor_pseudo_articles) so a
+            # fingerprint update in alert_agent fires across all three
+            # surfaces without drift.
+            with _store_lock:
+                unscored, _n_pre_floored = store.prefloor_pseudo_articles(unscored)
+            if not unscored:
+                _worker_last_ok["scorer"] = time.time()
+                _sleep(SCORE_INTERVAL)
+                continue
             scores = score_articles(unscored)
             batch = []
             llm_candidates = []
