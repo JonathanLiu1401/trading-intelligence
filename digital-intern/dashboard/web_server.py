@@ -4471,6 +4471,118 @@ def _ticker_score_dispersion_chat_lines(rep: Any) -> list[str]:
 
 _PORTFOLIO_SIGNALS_MAX_HEADLINES = 5
 
+_TICKER_VELOCITY_TOP_SHOWN = 6
+_TICKER_COMENTIONS_TOP_SHOWN = 6
+
+
+def _ticker_velocity_chat_lines(rep: Any) -> list[str]:
+    """Render ``/api/ticker-velocity`` as compact chat-context lines.
+
+    The arrival-count axis sibling of the score-based velocity surfaces:
+    sentiment-reversal asks "did the direction flip?", dispersion asks
+    "do the articles agree within the window?", and *this* answers
+    "which tickers' raw mention volume is accelerating right now?".
+
+    Pure / total — the ``_sentiment_reversal_chat_lines`` contract:
+
+    - non-dict / missing keys → ``[]`` (silence)
+    - verdict in {NO_DATA, QUIET} → ``[]`` (silence — never chat filler
+      when the wire is structurally flat)
+    - verdict BREAKING / WARMING → headline (verbatim from the builder)
+      plus up to ``_TICKER_VELOCITY_TOP_SHOWN`` per-ticker rows restricted
+      to BREAKING/WARMING entries (QUIET rows drop out of the actionable
+      block — same precedent as ``_ticker_score_dispersion_chat_lines``
+      excluding TIGHT rows).
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    if verdict not in ("BREAKING", "WARMING"):
+        return []
+    tickers = rep.get("tickers")
+    if not isinstance(tickers, list) or not tickers:
+        return []
+    headline = rep.get("headline") or f"Ticker velocity {verdict}"
+    lines: list[str] = [str(headline)]
+    shown = 0
+    for r in tickers:
+        if not isinstance(r, dict):
+            continue
+        v = r.get("verdict")
+        if v not in ("BREAKING", "WARMING"):
+            continue
+        try:
+            ratio = float(r.get("ratio"))
+        except (TypeError, ValueError):
+            continue
+        ticker = r.get("ticker") or "?"
+        recent = r.get("recent") or 0
+        prior = r.get("prior") or 0
+        age = r.get("newest_age_s")
+        age_str = (
+            f"newest {age:.0f}s ago"
+            if isinstance(age, (int, float)) else "no hits"
+        )
+        lines.append(
+            f"  {ticker} {v}: prior {int(prior)} → recent {int(recent)} "
+            f"(ratio {ratio:.2f}, {age_str})"
+        )
+        shown += 1
+        if shown >= _TICKER_VELOCITY_TOP_SHOWN:
+            break
+    return lines
+
+
+def _ticker_comentions_chat_lines(rep: Any) -> list[str]:
+    """Render ``/api/ticker-comentions`` as compact chat-context lines.
+
+    The pair-axis sibling of single-ticker velocity / dispersion /
+    reversal: when two tickers light up TOGETHER repeatedly, the move is
+    usually a sector ETF rip / peer-readthrough / M&A pairing rather than
+    a single-name story. None of the per-ticker surfaces can separate
+    "NVDA velocity from idiosyncratic catalysts" from "NVDA velocity as
+    part of a semis basket move" — this one does.
+
+    Pure / total — silence-on-healthy precedent:
+
+    - non-dict → ``[]``
+    - verdict in {NO_DATA, DISCONNECTED} → ``[]``
+    - verdict COUPLED_NAMES / SECTOR_BURST → headline + top pairs
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    if verdict not in ("COUPLED_NAMES", "SECTOR_BURST"):
+        return []
+    top = rep.get("top")
+    if not isinstance(top, list) or not top:
+        return []
+    headline = rep.get("headline") or f"Ticker comentions {verdict}"
+    lines: list[str] = [str(headline)]
+    shown = 0
+    for r in top:
+        if not isinstance(r, dict):
+            continue
+        pair = r.get("pair")
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        try:
+            lift = float(r.get("lift"))
+            co = int(r.get("co_count"))
+            a_total = int(r.get("a_total"))
+            b_total = int(r.get("b_total"))
+        except (TypeError, ValueError):
+            continue
+        a, b = pair
+        lines.append(
+            f"  {a}+{b}: co={co} lift={lift:.2f} "
+            f"(a_total={a_total} b_total={b_total})"
+        )
+        shown += 1
+        if shown >= _TICKER_COMENTIONS_TOP_SHOWN:
+            break
+    return lines
+
 
 def build_portfolio_signals(articles: list, now: datetime | None = None) -> dict:
     """Deterministic, always-fresh per-held-ticker live-news digest.
@@ -5491,6 +5603,97 @@ def create_app(store=None) -> Flask:
             for r in rows
         ]
         return jsonify(build_ticker_score_dispersion(
+            articles, window_hours=hours, now=now))
+
+    @app.get("/api/ticker-velocity")
+    def api_ticker_velocity():
+        """Top tickers by arrival-count velocity (recent vs prior window).
+
+        Pure builder ``analytics.ticker_velocity_runner.build_ticker_velocity``;
+        discovers top-N tickers by raw mention count over the full
+        ``2 * window_min`` window and returns recent/prior counts, ratio,
+        newest_age_s, and per-ticker BREAKING/WARMING/QUIET verdict plus a
+        top-level verdict (BREAKING/WARMING/QUIET/NO_DATA).
+
+        Arrival-axis sibling of ``/api/sentiment-reversal`` (directional
+        cross-window flip) and ``/api/ticker-score-dispersion`` (intra-
+        window consensus). ``?window_min=`` clamped 30..720 (default 120).
+        Honours ``_LIVE_ONLY_SQL`` — backtest-injected rows excluded.
+        Observational only.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            window_min = int(request.args.get("window_min", 120))
+        except (TypeError, ValueError):
+            window_min = 120
+        window_min = max(30, min(720, window_min))
+        from analytics.ticker_velocity_runner import (
+            build_ticker_velocity,
+            FETCH_LIMIT,
+        )
+        now = datetime.now(timezone.utc)
+        cutoff = (
+            now - timedelta(minutes=2 * window_min)
+        ).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT first_seen, title FROM articles "
+                f"WHERE {_LIVE_ONLY_SQL} "
+                "AND first_seen >= ? "
+                "ORDER BY first_seen DESC LIMIT ?",
+                (cutoff, FETCH_LIMIT),
+            )
+        except sqlite3.Error:
+            rows = []
+        articles = [
+            {"first_seen": r[0], "title": r[1]} for r in rows
+        ]
+        return jsonify(build_ticker_velocity(
+            articles, window_min=window_min, now=now))
+
+    @app.get("/api/ticker-comentions")
+    def api_ticker_comentions():
+        """Top ticker pairs co-occurring in recent articles — the sector-axis
+        sibling of single-ticker velocity / dispersion / reversal.
+
+        Pure builder ``analytics.ticker_comentions.build_ticker_comentions``;
+        emits pair list with co_count, solo totals, and ``lift`` (co_count
+        divided by the rarer ticker's total mentions), plus a top-level
+        verdict (SECTOR_BURST / COUPLED_NAMES / DISCONNECTED / NO_DATA).
+        Answers "is NVDA velocity idiosyncratic or part of a semis basket
+        move?" which the per-ticker surfaces cannot.
+
+        ``?hours=`` clamped 1..24 (default 2). Honours ``_LIVE_ONLY_SQL``.
+        Observational only.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            hours = int(request.args.get("hours", 2))
+        except (TypeError, ValueError):
+            hours = 2
+        hours = max(1, min(24, hours))
+        from analytics.ticker_comentions import (
+            build_ticker_comentions,
+            FETCH_LIMIT,
+        )
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(hours=hours)).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT first_seen, title FROM articles "
+                f"WHERE {_LIVE_ONLY_SQL} "
+                "AND first_seen >= ? "
+                "ORDER BY first_seen DESC LIMIT ?",
+                (cutoff, FETCH_LIMIT),
+            )
+        except sqlite3.Error:
+            rows = []
+        articles = [
+            {"first_seen": r[0], "title": r[1]} for r in rows
+        ]
+        return jsonify(build_ticker_comentions(
             articles, window_hours=hours, now=now))
 
     @app.get("/api/portfolio-signals")
@@ -7339,6 +7542,80 @@ def create_app(store=None) -> Flask:
             _logger().warning(
                 "chat: ticker-score-dispersion build failed: %s", e)
 
+        # Native ticker-velocity block — top tickers' raw arrival-count
+        # ratio recent vs prior. The arrival-volume axis sibling of
+        # reversal (cross-window direction) and dispersion (intra-window
+        # consensus). Block fires ONLY on BREAKING / WARMING — QUIET /
+        # NO_DATA collapse to silence (never filler when the wire is
+        # structurally flat).
+        ticker_velocity_block = ""
+        try:
+            from analytics.ticker_velocity_runner import (
+                build_ticker_velocity,
+                FETCH_LIMIT as _TV_LIMIT,
+                WINDOW_MIN as _TV_WIN,
+            )
+            tv_now = datetime.now(timezone.utc)
+            tv_since = (
+                tv_now - timedelta(minutes=2 * _TV_WIN)
+            ).isoformat()
+            tv_rows = _ro_query(
+                "SELECT first_seen, title FROM articles "
+                "WHERE first_seen >= ? "
+                "AND url NOT LIKE 'backtest://%' "
+                "AND source NOT LIKE 'backtest_%' "
+                "AND source NOT LIKE 'opus_annotation%' "
+                "ORDER BY first_seen DESC LIMIT ?",
+                (tv_since, _TV_LIMIT),
+            )
+            tv_arts = [
+                {"first_seen": r[0], "title": r[1]} for r in tv_rows
+            ]
+            tv = build_ticker_velocity(
+                tv_arts, window_min=_TV_WIN, now=tv_now)
+            ticker_velocity_block = "\n".join(
+                _ticker_velocity_chat_lines(tv))
+        except Exception as e:  # noqa: BLE001 — never sink the chat
+            _logger().warning(
+                "chat: ticker-velocity build failed: %s", e)
+
+        # Native ticker-comentions block — top ticker pairs co-occurring
+        # in the last 2h. The sector-axis sibling of single-ticker
+        # velocity/dispersion/reversal: separates idiosyncratic-name
+        # velocity from sector-basket co-movement. Block fires ONLY on
+        # COUPLED_NAMES / SECTOR_BURST — DISCONNECTED / NO_DATA collapse
+        # to silence (never filler when no pair is recurring).
+        ticker_comentions_block = ""
+        try:
+            from analytics.ticker_comentions import (
+                build_ticker_comentions,
+                FETCH_LIMIT as _CM_LIMIT,
+                WINDOW_HOURS as _CM_WIN,
+            )
+            cm_now = datetime.now(timezone.utc)
+            cm_since = (
+                cm_now - timedelta(hours=_CM_WIN)
+            ).isoformat()
+            cm_rows = _ro_query(
+                "SELECT first_seen, title FROM articles "
+                "WHERE first_seen >= ? "
+                "AND url NOT LIKE 'backtest://%' "
+                "AND source NOT LIKE 'backtest_%' "
+                "AND source NOT LIKE 'opus_annotation%' "
+                "ORDER BY first_seen DESC LIMIT ?",
+                (cm_since, _CM_LIMIT),
+            )
+            cm_arts = [
+                {"first_seen": r[0], "title": r[1]} for r in cm_rows
+            ]
+            cm = build_ticker_comentions(
+                cm_arts, window_hours=_CM_WIN, now=cm_now)
+            ticker_comentions_block = "\n".join(
+                _ticker_comentions_chat_lines(cm))
+        except Exception as e:  # noqa: BLE001 — never sink the chat
+            _logger().warning(
+                "chat: ticker-comentions build failed: %s", e)
+
         # Portfolio snapshot
         portfolio = _read_json(BASE_DIR / "data" / "portfolio_pl.json") or {}
 
@@ -8942,6 +9219,8 @@ def create_app(store=None) -> Flask:
             + (f"NEWS SECTOR COHERENCE (per-sector bullish/bearish stance dispersion across the same 24h wire — the companion to PULSE that answers the structural question PULSE cannot: is the concentration a MACRO STORY all agreeing on direction (sector-wide positioning is the trade) or IDIOSYNCRATIC catalysts pulling in different directions (sector-wide positioning is the wrong move, name-level only)? Surfaced ONLY when at least one sector reaches MACRO_BULL / MACRO_BEAR / TILT_BULL / TILT_BEAR; SPLIT / INSUFFICIENT / no-news collapses to silence. Headline + per-sector verdict carry verbatim from the builder — restate, never re-derive):\n{sector_coherence_block}\n\n" if sector_coherence_block else "")
             + (f"NEWS SENTIMENT REVERSAL (native — per-ticker avg ml_score sign-flip between consecutive 2h windows (PREV [4h, 2h ago) → CURR [2h ago, now)). The directional-change view PULSE/COHERENCE cannot compose: those answer the SECTOR-level question, this answers the per-TICKER question 'which positions have just had the news turn against (or toward) the thesis?'. Both windows are gated to ≥ MIN_ARTICLES articles so single-row noise can't fire a flip. Surfaced ONLY when at least one reversal qualifies; zero-reversal windows collapse to silence — never chat filler when the wire is directionally stable. Per-ticker direction + prev → curr means + article counts carry verbatim from the builder — restate, never re-derive):\n{sentiment_reversal_block}\n\n" if sentiment_reversal_block else "")
             + (f"NEWS TICKER-SCORE DISPERSION (native — per-ticker intra-window std-dev of ml_score over the last 24h. The within-window consensus companion to SENTIMENT REVERSAL: reversal asks 'did the direction flip across windows?'; dispersion asks 'are the articles WITHIN the current window AGREEING or DISAGREEING on this ticker?'. A ticker with five articles all scoring 7.5–8.0 is consensus; the same mean spread 1.0–9.5 is contested news — structurally different signals invisible to every other panel that only carries the mean. Surfaced ONLY when MIXED_BOOK / CONFLICTED_NEWS (CONSENSUS / NO_DATA / NO_DISPERSION collapse to silence — never filler when the wire is consistent). Per-ticker n / mean / std / [min, max] carry verbatim from the builder — restate, never re-derive):\n{ticker_score_dispersion_block}\n\n" if ticker_score_dispersion_block else "")
+            + (f"NEWS TICKER VELOCITY (native — top tickers by raw arrival-count ratio recent vs prior, 2h vs 2h prior. The arrival-VOLUME axis sibling of REVERSAL (cross-window direction) and DISPERSION (intra-window consensus): those describe HOW the wire feels about a ticker; this describes HOW MUCH the wire is talking about it. A BREAKING name has both substantial recent count AND a sharp acceleration vs the prior window — the early indicator before the score-based surfaces catch up. Surfaced ONLY when at least one ticker reaches BREAKING / WARMING; QUIET / NO_DATA collapse to silence — never filler when the wire is structurally flat. Per-ticker recent / prior / ratio / newest_age_s carry verbatim from the builder — restate, never re-derive):\n{ticker_velocity_block}\n\n" if ticker_velocity_block else "")
+            + (f"NEWS TICKER COMENTIONS (native — top ticker pairs co-occurring in the last 2h. The SECTOR-axis sibling of single-ticker VELOCITY / DISPERSION / REVERSAL: when two tickers light up TOGETHER repeatedly, it's usually a sector ETF rip, peer-readthrough, or M&A pairing — not a single-name story. Separates 'NVDA velocity from idiosyncratic catalysts' from 'NVDA velocity as part of a semis basket move'. Lift = co_count / min(solo_a, solo_b). Surfaced ONLY when at least one pair reaches COUPLED_NAMES / SECTOR_BURST; DISCONNECTED / NO_DATA collapse to silence — never filler when no pair is recurring. Top pairs' co_count / solo totals / lift carry verbatim from the builder — restate, never re-derive):\n{ticker_comentions_block}\n\n" if ticker_comentions_block else "")
             + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP (paper-trader price momentum):\n{heatmap_block}\n\n" if heatmap_block else "")
             + (f"EARNINGS RADAR (scheduled gap risk):\n{earnings_block}\n\n" if earnings_block else "")
             + (f"PAPER TRADER — PRE-EARNINGS DOLLARIZED 1σ SHOCK (per HELD imminent print: 'if NVDA gaps the typical 1σ on its release, the book moves $X / Y% of equity' — the forward $-at-risk view that complements the EARNINGS RADAR's timing-only listing):\n{earnings_shock_block}\n\n" if earnings_shock_block else "")
