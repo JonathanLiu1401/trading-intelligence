@@ -3659,5 +3659,203 @@ class ArticleStore:
             "total_articles": total_articles,
         }
 
+    @_retry_on_lock
+    def ticker_news_burst(
+        self,
+        tickers: list[str] | None = None,
+        window_h: float = 1.0,
+        baseline_h: float = 24.0,
+    ) -> dict:
+        """Per-ticker news-volume burst detector — "is the wire heating up on
+        my book RIGHT NOW?".
+
+        The 5h Opus briefing summarises news at briefing cadence; the alert
+        path fires on individually-urgent articles. NEITHER answers the
+        between-briefings question: which held tickers have an unusual flurry
+        of mid-relevance news in the last hour, signalling that something is
+        BREWING even if no single article tripped the urgency threshold? Live
+        evidence (2026-05-26): SOXX (semiconductor ETF) at 18× its hourly
+        baseline (9 articles in 1h vs ~0.48 avg over the prior 23h), MU
+        12.67×, QBTS 12.55×, DRAM 10.31×, STX 8× — none surfaced anywhere
+        else in the system.
+
+        Per ticker, compares the volume in the last ``window_h`` hours against
+        the per-hour-normalised baseline from the PRIOR ``baseline_h`` hours
+        (excluding the window). A "spike" of ≥2 with ≥2 articles flags
+        WARMING, ≥5 + ≥3 HOT, ≥10 + ≥5 BLAZING. Zero current activity is
+        COLD. Otherwise NORMAL.
+
+        ``tickers`` defaults to ``ml.features.LIVE_PORTFOLIO_TICKERS`` (the
+        live held + watched set the model and alert ``book:`` tag already
+        use). Pass an explicit list for testing or a non-default universe.
+
+        Read-only, ``_LIVE_ONLY_CLAUSE`` applied: no DB write, no
+        ai_score/ml_score/score_source/urgency mutation, backtest rows
+        excluded — all four load-bearing invariants intact by construction.
+
+        Returns::
+
+            {
+              "window_h":     float,
+              "baseline_h":   float,
+              "n_window":     int,        # total live articles in window
+              "n_baseline":   int,        # total live articles in baseline window
+              "by_ticker":    [
+                {
+                  "ticker":           str,
+                  "count_window":     int,
+                  "count_baseline":   int,
+                  "baseline_per_h":   float,
+                  "spike":            float | None,   # None if no baseline
+                  "verdict":          "BLAZING"|"HOT"|"WARMING"|"NORMAL"|"COLD",
+                },
+                ...
+              ],     # sorted by spike desc, then count_window desc
+              "hottest":      str | None,     # top-spike ticker or None if all COLD
+              "n_hot":        int,            # count with verdict in {HOT, BLAZING}
+            }
+        """
+        window_h = max(float(window_h), 0.05)
+        baseline_h = max(float(baseline_h), window_h * 1.5)
+
+        if tickers is None:
+            # Lazy import: ml.features pulls TF-IDF / numpy graph which we
+            # only want imported on the analytics path (storage layer must
+            # not always pull ml graph).
+            from ml.features import LIVE_PORTFOLIO_TICKERS
+            tickers = sorted(LIVE_PORTFOLIO_TICKERS)
+
+        clean: list[str] = []
+        for raw in tickers or []:
+            if not raw:
+                continue
+            t = str(raw).strip().upper()
+            if len(t) < 2 or len(t) > 8:
+                continue
+            if t not in clean:
+                clean.append(t)
+        if not clean:
+            return {
+                "window_h": round(window_h, 2),
+                "baseline_h": round(baseline_h, 2),
+                "n_window": 0,
+                "n_baseline": 0,
+                "by_ticker": [],
+                "hottest": None,
+                "n_hot": 0,
+            }
+
+        now = datetime.now(timezone.utc)
+        window_start = (now - timedelta(hours=window_h)).isoformat()
+        baseline_start = (
+            now - timedelta(hours=baseline_h + window_h)
+        ).isoformat()
+        # baseline_end = window_start: baseline window is [now-baseline-window, now-window]
+        baseline_end = window_start
+
+        # Compile word-boundary patterns once. Same shape as the existing
+        # urgent_book_breakdown helper above (re.escape + \b). $TICKER and
+        # bare TICKER both match; allCAPS minimum 2 chars filters generic
+        # English words.
+        patterns = {
+            t: re.compile(rf"\b\${{0,1}}{re.escape(t)}\b")
+            for t in clean
+        }
+
+        # Single SELECT pulling only title (cheap — no full_text decompress
+        # because a burst is well-evidenced by headline mentions alone; the
+        # operator can read summaries off the existing /api/articles surface
+        # if they want to drill in).
+        window_rows = self.conn.execute(
+            "SELECT title FROM articles "
+            f"WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+            (window_start,),
+        ).fetchall()
+        baseline_rows = self.conn.execute(
+            "SELECT title FROM articles "
+            f"WHERE first_seen >= ? AND first_seen < ? AND {_LIVE_ONLY_CLAUSE}",
+            (baseline_start, baseline_end),
+        ).fetchall()
+
+        def _count(rows) -> dict[str, int]:
+            counts = {t: 0 for t in clean}
+            for (title,) in rows:
+                if not title:
+                    continue
+                for t, pat in patterns.items():
+                    if pat.search(title):
+                        counts[t] += 1
+            return counts
+
+        c_win = _count(window_rows)
+        c_base = _count(baseline_rows)
+
+        out: list[dict] = []
+        n_hot = 0
+        for t in clean:
+            cw = c_win.get(t, 0)
+            cb = c_base.get(t, 0)
+            base_per_h = cb / baseline_h if baseline_h > 0 else 0.0
+            # Spike is the per-hour-normalised ratio. A floor of 0.5 on
+            # base_per_h prevents division-by-near-zero from blowing up to
+            # absurd ratios on a ticker with one mention every couple days
+            # (e.g. a 1h surge of 2 mentions on a 0.04/h baseline becomes
+            # 50× — analyst-misleading).
+            if cb == 0 and cw == 0:
+                spike: float | None = None
+            elif cb == 0:
+                spike = float(cw) / 0.5  # treat zero baseline as ≤0.5/h
+            else:
+                spike = cw / max(base_per_h, 0.5)
+
+            # Verdict ladder — most-severe first (mirrors briefing_health /
+            # briefing_cadence_trend / urgent_queue_health discipline).
+            if cw == 0:
+                verdict = "COLD"
+            elif spike is not None and spike >= 10.0 and cw >= 5:
+                verdict = "BLAZING"
+                n_hot += 1
+            elif spike is not None and spike >= 5.0 and cw >= 3:
+                verdict = "HOT"
+                n_hot += 1
+            elif spike is not None and spike >= 2.0 and cw >= 2:
+                verdict = "WARMING"
+            else:
+                verdict = "NORMAL"
+
+            out.append({
+                "ticker": t,
+                "count_window": cw,
+                "count_baseline": cb,
+                "baseline_per_h": round(base_per_h, 2),
+                "spike": round(spike, 2) if spike is not None else None,
+                "verdict": verdict,
+            })
+
+        # Sort: spike DESC (None last), then count_window DESC, then ticker.
+        # Deterministic — the analyst always sees the hottest first.
+        out.sort(
+            key=lambda r: (
+                -(r["spike"] if r["spike"] is not None else -1.0),
+                -r["count_window"],
+                r["ticker"],
+            )
+        )
+        hottest = None
+        for r in out:
+            if r["verdict"] in ("BLAZING", "HOT", "WARMING"):
+                hottest = r["ticker"]
+                break
+
+        return {
+            "window_h": round(window_h, 2),
+            "baseline_h": round(baseline_h, 2),
+            "n_window": len(window_rows),
+            "n_baseline": len(baseline_rows),
+            "by_ticker": out,
+            "hottest": hottest,
+            "n_hot": n_hot,
+        }
+
     def close(self):
         self.conn.close()
