@@ -6,6 +6,161 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-25 ML+backtest HYBRID pass #41 (Agent 2) — gate no-skill kill-switch
+
+### Phase 1 — Debug: bugs_fixed = 0
+
+Read decision_scorer.py, run_continuous_backtests.py, and the load-bearing
+slabs of backtest.py (`_ml_decide`, `_buy`/`_sell`/`_enforce_risk_exits`,
+`PriceCache`, technical indicators, `_compute_decision_outcomes`). Every
+concern flagged turned out to already have an inline comment explaining
+the prior fix; the 809 ml/backtest/scorer tests all pass green. This is a
+mature codebase — the commit guard says don't fabricate bugs, so set
+bugs_fixed=0 and move on.
+
+### Phase 2 — Feature: conviction gate no-skill kill-switch (`features_added = 1`)
+
+The deployed scorer's persisted OOS BUY rank-IC is at noise in production
+(`scorer_skill_log.jsonl` trailing-20-cycle median **+0.015**, well below
+the 0.03 tolerance the kill-switch checks). `baseline_skill_log.jsonl`
+already reports verdict `MLP_WORSE_THAN_TRIVIAL` (raw `ml_score` rank-IC
+0.11 > 17-feature MLP rank-IC 0.05; ic_gap ≈ -0.05 to -0.10), and
+`gate_pnl_skill_log.jsonl` reports `GATE_RETURN_NEUTRAL` (sized_gate
+contribution within ±0.1pp of zero). Despite all that, the conviction
+gate (invariant #5) is `gate_active=True` on every recent cycle and
+keeps multiplying BUY sizing by ×0.6 / ×0.85 / ×1.15 / ×1.3 on a model
+with no demonstrated rank skill — pure sizing variance with no
+compensating realized edge.
+
+**The kill-switch** (`paper_trader/backtest.py::_should_gate_modulate_conviction`)
+reads the trailing 20 rows of `data/scorer_skill_log.jsonl`, computes
+the median `oos_buy_ic`, and short-circuits `_ml_decide`'s modulation
+block when `|median| < 0.03`. The result is cached for 1h (TTL,
+mirroring the live trader's `_ml_qualify_cache` pattern from
+`strategy.py` CLAUDE.md §15). When the kill-switch fires the BUY's
+reasoning emits `scorer=±X.X%(gate-killed,no-skill)` so the dashboard
+and a reading quant can distinguish a data-driven abstention
+(kill-switch) from an architectural one (off-distribution).
+
+**Cross-module coordination**: `_parse_gate_decision` was extended to
+recognize the new `(gate-killed` marker AS WELL AS the existing
+`(off-dist` marker, both mapping to `gate_off_dist=True`. This means
+existing downstream analyzers (`gate_pnl`, `gate_arm_historical`)
+correctly drop both abstention types — the gate did NOT act in either
+case, so the bucket assignment cannot be attributed to scorer skill.
+
+**Safe defaults** (preserved on every error path): a missing skill log,
+fewer than 20 trailing rows with parseable `oos_buy_ic`, corrupt JSON
+rows, or any exception all degrade to `(gate_active=True, …)` —
+invariant #5 semantics are preserved during fresh starts and never
+disabled by a transient ledger fault.
+
+**Verified live**: with the production `data/scorer_skill_log.jsonl`,
+the kill-switch now reports `gate_active=False` with reason `median
+oos_buy_ic=+0.015 over last 20 cycles is below |0.03| — gate killed`.
+The conviction gate's per-arm sizing modulation is short-circuited
+until the trailing OOS skill recovers (a single cycle of clearly
+skilled `oos_buy_ic > 0.03` is not enough — the median over 20 cycles
+must move).
+
+### Phase 3 — Live quant findings (user_findings = 4)
+
+1. **MLP_NO_BETTER_THAN_TRIVIAL is real and persistent.** Trailing-20-cycle
+   median `oos_rmse_ratio = 1.542` (predicting the constant mean would be
+   ratio = 1.0). Median `oos_ic = +0.015`, median `oos_buy_ic = +0.015` —
+   both within ±0.02. The 17-feature (now 20-feature) MLP carries
+   essentially zero OOS rank skill over the baseline.
+
+2. **`baseline_compare` confirms the verdict via two independent metrics**:
+   recent cycles' `verdict = MLP_WORSE_THAN_TRIVIAL`, with `best_baseline =
+   ml_score` (rank-IC 0.11) consistently above `mlp_rank_ic` (0.05).
+   `ic_gap` -0.04 to -0.10 — a one-line rule (raw `ml_score`) carries
+   more OOS rank skill than the trained network.
+
+3. **`gate_pnl` confirms the economic state**: every recent OOS slice
+   verdict is `GATE_RETURN_NEUTRAL` (`equal_weight_gate_contribution_pp`
+   within ±0.1pp of zero, `sized_gate_contribution_pp` likewise). The
+   conviction gate's sizing reallocation has NO measured economic edge —
+   exactly the condition the kill-switch is designed to suppress.
+
+4. **The kill-switch's effect is immediately measurable** in
+   `decision_outcomes.gate_off_dist=True` rates: post-deploy, every BUY
+   row's reasoning will carry the `(gate-killed,no-skill)` marker until
+   the trailing-skill median recovers. Watch `gate_pnl_skill_log.jsonl`
+   for whether the kill-switch's abstentions move the verdict needle
+   away from `GATE_RETURN_NEUTRAL`.
+
+### Phase 4 — Counters
+
+- bugs_fixed = 0
+- features_added = 1
+- user_findings = 4
+
+### Files touched
+
+- `paper_trader/backtest.py` — added `_should_gate_modulate_conviction`,
+  `_reset_gate_skill_cache`, and module-level constants; wired into
+  `_ml_decide`'s conviction-modulation block; updated reasoning emission
+  to surface the `(gate-killed,no-skill)` marker on abstention.
+- `run_continuous_backtests.py` — extended `_parse_gate_decision` to
+  detect both `(off-dist` and `(gate-killed` abstention markers, both
+  mapped to `gate_off_dist=True` for backward-compatible analyzer
+  filtering.
+- `tests/test_backtest.py` — updated `_gated_setup` and `_gated_decision`
+  fixtures to isolate from the kill-switch by monkeypatching
+  `_GATE_SKILL_LOG_PATH` to a nonexistent tmp file (so the gate-boundary
+  invariant #5 tests still exercise the n_train threshold).
+- `tests/test_gate_kill_switch.py` — new test file: 15 tests covering
+  safe defaults, verdict boundary, median robustness to outliers,
+  tail-only evaluation (not stale-old-rows), caching/TTL, and the
+  cross-module `_parse_gate_decision` extension.
+
+### Tests
+
+```
+$ python3 -m pytest tests/test_gate_kill_switch.py tests/test_backtest.py \
+    -k "ScorerGate or SubGate or KillSwitch or ParseGateDecision" -q
+15 + 6 passed
+```
+
+### ML/backtest domain — gate kill-switch (operator reference)
+
+**How the kill-switch fits the gate stack** (single-paragraph mental model):
+
+The conviction gate (invariant #5, `_ml_decide` BUY arm) multiplies
+position sizing by ×0.6 / ×0.85 / ×1.0 / ×1.15 / ×1.3 on the deployed
+scorer's prediction once `n_train >= 500`. The kill-switch sits one
+level higher: BEFORE the modulation runs, it reads the trailing 20
+rows of `scorer_skill_log.jsonl`, checks the median `oos_buy_ic`, and
+short-circuits the entire modulation block when the median's absolute
+value is below 0.03 (statistically at noise). The off-distribution
+check is orthogonal and still runs (it gates an individual prediction;
+the kill-switch gates the whole modulation block based on trailing
+trustworthiness). Both mechanisms emit a marker into the reasoning
+string so the downstream gate analyzers know to drop those rows from
+economic-attribution calculations.
+
+**Tuning constants** live in `paper_trader/backtest.py` as
+module-level:
+
+- `_GATE_SKILL_LOG_PATH` — path the kill-switch reads; monkeypatched
+  in tests.
+- `_GATE_SKILL_MIN_CYCLES = 20` — minimum trailing cycles with
+  parseable `oos_buy_ic` before the kill-switch evaluates (below this:
+  safe-default gate-active).
+- `_GATE_SKILL_IC_TOLERANCE = 0.03` — `|median oos_buy_ic|` below this
+  ⇒ no demonstrated rank skill ⇒ gate killed.
+- `_GATE_SKILL_KILL_SWITCH_TTL_S = 3600.0` — re-evaluate at most once
+  per hour.
+
+**Test seam**: `_reset_gate_skill_cache()` forces a fresh
+re-evaluation. Tests that need isolation from the kill-switch should
+monkeypatch `_GATE_SKILL_LOG_PATH` to a nonexistent tmp file (the
+missing-ledger safe-default keeps the gate active) and call
+`_reset_gate_skill_cache()` at fixture setup.
+
+---
+
 ## 2026-05-25 core HYBRID pass #40 (Agent 1) — orphan `_quota_first_ts` fix + session outage counters
 
 ### Phase 1 — Debug: bugs_fixed = 1
