@@ -102,6 +102,7 @@ from collectors.openinsider_cluster import collect as collect_insider_cluster
 from collectors.sector_etf_momentum import collect as collect_sector_etf
 from collectors.cisa_kev_collector import collect_cisa_kev
 from collectors.benzinga_analyst_collector import collect_benzinga_analyst
+from collectors.nyfed_liquidity_collector import collect_nyfed_liquidity
 from collectors.ftc_doj_collector import collect_ftc_doj
 from collectors.eia_collector import collect_eia
 from collectors.shipping_intelligence import collect_shipping_news
@@ -243,6 +244,7 @@ INSIDER_CLUSTER_INTERVAL = 600    # EDGAR Form 4 cluster-buy scan every 10min
 SECTOR_ETF_INTERVAL     = 600     # Sector ETF momentum snapshot every 10min
 COMMODITY_FUTURES_INTERVAL = 600  # Commodity futures price monitor every 10min
 BENZINGA_INTERVAL       = 300     # Benzinga analyst-ratings RSS sweep every 5min
+NYFED_LIQUIDITY_INTERVAL = 3600  # NY Fed RRP + SOMA (Fed balance sheet) — every 60min
 FTC_DOJ_INTERVAL        = 1800    # FTC + DOJ ATR press releases — every 30min
 EIA_INTERVAL            = 1800    # EIA Today in Energy + press releases — every 30min
 SHIPPING_INTELLIGENCE_INTERVAL = 1800  # shipping RSS (Freightos, Splash247, Hellenic) — every 30min
@@ -2085,6 +2087,27 @@ def appstore_finance_ranks_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(APPSTORE_FINANCE_INTERVAL)
+
+
+def nyfed_liquidity_worker(store: ArticleStore):
+    log.info("[nyfed_liquidity_worker] started")
+    bo = Backoff("nyfed_liquidity", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_nyfed_liquidity()
+            _ingest(store, articles, "nyfed_liquidity")
+            try:
+                source_health.record_result("nyfed_liquidity", len(articles))
+            except Exception as he:
+                log.warning(f"[nyfed_liquidity_worker] source_health error: {he}")
+            _worker_last_ok["nyfed_liquidity"] = time.time()
+            log.debug(f"[nyfed_liquidity] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[nyfed_liquidity_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(NYFED_LIQUIDITY_INTERVAL)
 
 
 def congress_trades_worker(store: ArticleStore):
@@ -4626,6 +4649,7 @@ def main():
         ("tic",            tic_worker),
         ("forex_factory_cal", forex_factory_cal_worker),
         ("finra_short",   finra_short_worker),
+        ("nyfed_liquidity", nyfed_liquidity_worker),
         ("congress_trades", congress_trades_worker),
         ("cboe_unusual_options", cboe_unusual_options_worker),
         ("appstore_finance_ranks", appstore_finance_ranks_worker),
