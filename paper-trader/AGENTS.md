@@ -6,6 +6,103 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-26 core HYBRID pass #43 (Agent 1) — /api/model-progress writer-contention fix
+
+### Phase 1 — Debug: `bugs_fixed = 1`
+
+Real, observed-live correctness bug. The Model Progress chart on the
+dashboard was permanently blank because every poll of
+`/api/model-progress` was returning HTTP 000 (curl connection dropped
+after 30s) when the continuous-backtest committee was mid-write.
+
+Root cause: the endpoint instantiated a fresh `BacktestStore()` per
+request, and `BacktestStore.__init__` runs DDL on every connect —
+`PRAGMA journal_mode=WAL`, a full `CREATE TABLE IF NOT EXISTS`
+executescript, and idempotent `ALTER TABLE` migrations. Each of those
+needs the SQLite writer lock briefly. Under the live continuous-backtest
+committee (5 parallel writers every 60s on `backtest.db`) the writer
+lock is heavily contended, so every dashboard hit sat for the full 30s
+`busy_timeout` and curl gave up. Verified live: my test_client mid-cycle
+took ~60s; the live dashboard returned 260ms between cycles — an
+intermittent failure the operator can't distinguish from "panel is fine."
+
+Fix: open `backtest.db` directly in `mode=ro` (the `signals.py` /
+`api_model_rankings` precedent — readers never contend with WAL writers),
+SELECT only, close the connection in a `try/finally`. The prior code
+also leaked one connection per request. Empty-DB / missing-file branches
+now return `{cycles: [], total_runs: 0}` consistently.
+
+Tests (`tests/test_model_progress_endpoint.py`, 8 new):
+
+* missing backtest.db / empty `backtest_runs` both yield the empty shape
+* 10-run aggregation pins per-cycle best/avg/worst + `#N-M` label
+* partial last chunk pins `#N` single-run label
+* non-`complete` rows are excluded
+* the endpoint completes < 3s while a sibling holds an EXCLUSIVE writer
+  lock (the regression case)
+* 50 sequential requests do not exhaust SQLite FDs (leak guard)
+
+Commit: `fix(dashboard): /api/model-progress no longer hangs under
+continuous-backtest writer contention` (d3fcf8b).
+
+Other candidates considered and **rejected** after careful trace:
+
+* `_no_decision_cause` whitespace/edge handling — already covered by
+  `tests/test_core_runner_cycle.py` (None/empty/whitespace/long pinned).
+* `_decision_action_verb` and `_activity_counts` direction-split — fully
+  covered in `tests/test_core_reporter.py`.
+* `_swr_make`'s `last_ok_ts` semantics (set on a non-200 build) —
+  documented behaviour: "no exception" not "200 OK." Not a bug.
+* The expired-option auto-close gap (worthless OTM contracts sit on the
+  book forever until manually SELL'd) — a deliberate feature gap.
+* `send_daily_close` line 4494 raw dict subscripts — schema is NOT NULL
+  so the keys are always present.
+
+### Phase 2 — Feature: `features_added = 0`
+
+168 analytics modules + dozens of endpoints already on the bus. After
+reading runner / strategy / reporter / signals / dashboard / market /
+store in full and probing the live endpoint surface, no high-value
+feature gap remained. The decision-cause taxonomy (`/api/decision-health`,
+`/api/no-decision-reasons`, `/api/empty-claude-rate`, `/api/host-guard`),
+the session-block buy/sell split, the alarm-latch headline on every
+hourly Discord summary, and the granular `MARKET_PHASE` in the prompt
+are all freshly landed. Honest zero.
+
+### Phase 3 — Live trader findings (`user_findings = 3`)
+
+1. **Sustained ~30% NO_DECISION rate driven by host saturation.**
+   `/api/host-guard` reports `state=SATURATED` (5 concurrent Opus,
+   load1=9.89 vs 16 CPUs, swap_used=41.1%). 20% of the last 120 cycles
+   never reached Opus — not a model/quota issue, the box is hosting the
+   continuous-backtest committee + 3 hourly-review/HYBRID agents + the
+   trader at once. This is an OPS knob (reduce out-of-band Opus, or
+   move backtests to a second host), not a code bug. The freeze-triage
+   stack already exposes it crisply.
+
+2. **Book has been 100% cash for 53 hours.** Last fill was
+   `SELL NVDA 3 @ 215.25` on 2026-05-24T02:08. The desk is sitting on
+   -$12.61 (-1.26%) with `all_cash_streak` accruing quietly. The
+   engine IS producing decisions (`HOLD CASH` / `HOLD NVDA → HOLD`),
+   so this is a deliberate stance, not a freeze. A trader watching
+   from Discord would benefit from the all-cash-streak token in the
+   hourly summary. `tests/test_all_cash_streak.py` exists; wiring may
+   already be there — not investigated.
+
+3. **`/api/model-progress` was the single broken panel in the sweep.**
+   Every other endpoint in the
+   `/api/{state, portfolio, risk, runner-heartbeat, decision-health,
+   host-guard, no-decision-reasons, empty-claude-rate, source-edge,
+   disagreement, benchmark, feed-health, backtests, alarm-latches,
+   scorecard}` set returned 200 with sensible, non-stale data within
+   a second. Fix landed — see Phase 1.
+
+### Phase 4 — Docs
+
+This entry. No standalone AGENTS.md commit.
+
+---
+
 ## 2026-05-26 ML+backtest HYBRID pass #42 (Agent 2) — multi-horizon intraperiod extremes
 
 ### Phase 1 — Debug: bugs_fixed = 0
