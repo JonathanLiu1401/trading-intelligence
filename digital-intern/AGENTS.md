@@ -5,6 +5,112 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-26 HYBRID pass — scorer_worker prefloor parity + ticker_news_burst (Agent 3)
+
+Hybrid debug + feature + live-validation pass.
+
+**Phase 1 — fix: pre-floor pseudo-articles in production scorer_worker.**
+`ArticleStore.score_pending` had a quote-widget / recap-template
+pre-floor and `watchers.urgency_scorer.score_batch` had the same gate
+on the Sonnet path — but the production `daemon.scorer_worker` (the
+worker loop that actually drives ML scoring in the daemon) silently
+bypassed both. A 48h live audit found 10 ML-confident urgent rows
+matching quote-widget / recap fingerprints reached `urgency=2` —
+caught by the alert-side gates before Discord push, but only after
+polluting `urgent_queue_health` and burning alert worker cycles.
+
+Extracted the pre-floor into `ArticleStore.prefloor_pseudo_articles(batch)`
+— now a single source of truth called by both `score_pending` (in-store
+driver) and `daemon.scorer_worker` (production worker). A future
+fingerprint update in `watchers.alert_agent._looks_like_quote_widget`
+/ `_looks_like_recap_template` fires across all three surfaces (Sonnet
+LLM, in-store driver, daemon worker) without drift. Locked by
+`tests/test_prefloor_pseudo_articles.py` (8 tests including a source-grep
+guard that the daemon wires the helper — same anti-drift discipline as
+the existing four-surface recap lockstep). Invariants intact: read of
+pre-floor sets `ml_score=0.01`, `urgency=MAX(urgency,0)`,
+`score_source='ml'` via `update_ml_scores_batch` — no ai_score
+mutation, backtest exclusion preserved via the upstream `get_unscored`.
+
+**Phase 2 — feat: `ArticleStore.ticker_news_burst`.** The
+between-briefings analyst surface for "is the wire heating up on my
+book RIGHT NOW?". Live evidence (2026-05-26, 1h vs 23h prior): SOXX
+18×, MU 12.67×, QBTS 12.55×, DRAM 10.31× — none surfaced anywhere
+else in the system. The 5h Opus briefing catches at briefing cadence;
+the alert path catches when one article is individually urgent;
+neither answers the flurry-of-mid-relevance-news question that signals
+"something is brewing" on a held name.
+
+`ticker_news_burst(tickers=None, window_h=1.0, baseline_h=24.0)`
+compares per-ticker mention count in the last window against the
+per-hour-normalised baseline from the prior `baseline_h` hours
+(excluding the window). Defaults to `LIVE_PORTFOLIO_TICKERS` (the live
+held + watched universe). Verdict ladder (most-severe first, mirrors
+`briefing_health` / `briefing_cadence_trend` discipline):
+
+* `BLAZING` — `spike >= 10` AND `count_window >= 5`
+* `HOT`     — `spike >= 5`  AND `count_window >= 3`
+* `WARMING` — `spike >= 2`  AND `count_window >= 2`
+* `COLD`    — `count_window == 0`
+* `NORMAL`  — otherwise
+
+Spike denominator floors at 0.5/h so a 1-mention-every-2-days baseline
+can't blow up to absurd ratios on a 1h surge. `_LIVE_ONLY_CLAUSE`
+applied on both window and baseline queries. Read-only — no
+ai_score/ml_score/score_source/urgency mutation. All four load-bearing
+invariants intact. Pinned by `tests/test_ticker_news_burst.py` (13 tests:
+verdict thresholds, sort order, backtest isolation, word-boundary
+discipline, `$TICKER` prefix, default-tickers fallback, read-only
+invariance, baseline-excludes-window).
+
+**Why this isn't a duplicate of `ticker-velocity`.** The recent
+`/api/ticker-velocity` (Agent 4, same date) discovers top-N tickers by
+raw mention count over a window and rate-acceleration verdict. This
+helper takes the held universe as input (not auto-discovered), uses a
+per-hour-normalised baseline from a SEPARATE longer window (not the
+prior half of the same window), and emits a 5-level verdict ladder
+(BLAZING/HOT/WARMING/NORMAL/COLD). The two are complementary — ticker-
+velocity answers "which tickers ANYWHERE are accelerating", this
+answers "is the wire heating up on my BOOK". Future PR: wire as
+`/api/ticker-news-burst` and chat enrichment; the storage primitive
+exists for any consumer to call now.
+
+**Phase 3 — live-validation findings (news analyst perspective):**
+
+1. **Source freshness — many sources silent 2-5h+ overnight.** 112
+   sources had >2h silence with >5 prior 24h articles. Some are
+   cadence-normal at midnight PDT (arxiv_qfin daily, GoogleNews/MSN
+   sparse). Concerning: `CBOE Unusual Options` silent 5.4h despite a
+   15min interval; `reddit/r/wallstreetbets` and
+   `reddit/r/Economics` silent 4-5h despite high-volume daytime
+   throughput. Likely overnight-quiet but worth a daytime re-check.
+
+2. **Recap noise still leaking through.** "Medinex's (Catalist:OTX)
+   Soft Earnings Don't Show The Whole Picture" reached urgency=2 with
+   `score_source='ml'`, `ml_score=10.0`. Singapore micro-cap not in
+   portfolio universe; "Don't Show The Whole Picture" is an
+   opinion-mill recap framing not yet covered by the
+   `_RECAP_TEMPLATE_PATTERNS` set. Adding the fingerprint needs care
+   to avoid catching legitimate analyst notes; logged as a candidate
+   for a future evidence-backed PR.
+
+3. **High-authority off-topic alerts.** "Aulis Capital's Leung on
+   Healthcare Investments" (Bloomberg Markets, ml_score=9.3) — a
+   healthcare-investments interview on a semis-heavy book. The ML
+   over-scores Bloomberg-tier × proper-noun titles regardless of
+   sector relevance. Existing `_filter_low_authority_lone` only
+   catches LOW-authority lone rows; a sector-relevance dimension would
+   address the high-authority off-topic class.
+
+4. **Briefing terseness.** Latest briefing 2721 chars / 50 articles —
+   ~55 chars per article including ranking metadata. An analyst would
+   benefit from a richer Opus prompt that allocates more tokens per
+   tracked-sector story. Out of scope for this pass.
+
+Counters: bugs_fixed=1, features_added=1, user_findings=4.
+
+---
+
 ## 2026-05-26 feature pass — /api/ticker-velocity + /api/ticker-comentions (live-wire volume + pair axes)
 
 Feature-dev pass (Agent 4). Two new native DI endpoints + chat blocks
