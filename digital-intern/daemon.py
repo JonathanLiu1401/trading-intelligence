@@ -116,6 +116,7 @@ from collectors.whitehouse_collector import collect_whitehouse
 from collectors.g10_central_banks_collector import collect_g10_central_banks
 from collectors.global_regulators_collector import collect_global_regulators
 from collectors.imf_bis_worldbank_collector import collect_imf_bis_worldbank
+from collectors.worldbank_macro_collector import collect_worldbank
 from collectors.un_news_collector import collect_un_news
 from collectors.globenewswire_collector import collect_globenewswire
 from collectors.prnewswire_collector import collect as collect_prnewswire
@@ -259,6 +260,7 @@ G10_CB_INTERVAL         = 1800    # Bank of Canada + RBA press / speeches RSS �
 GLOBAL_REG_INTERVAL     = 1800    # FSB, FCA, Fed research notes/papers — every 30min
 UN_NEWS_INTERVAL        = 1800    # UN News economic/climate/regional feeds — every 30min
 BIS_INTERVAL            = 1800    # BIS press releases, speeches, research — every 30min
+WORLDBANK_INTERVAL      = 21600   # World Bank macro indicators (annual data, EM + G20) — every 6h
 FED_REG_INTERVAL        = 1800    # Federal Register BIS/OFAC/FTC/FCC/NIST rules — every 30min
 TRADE_POLICY_INTERVAL   = 1800    # USTR + CBP + Commerce AD/CVD trade actions — every 30min
 BLS_INTERVAL            = 3600    # BLS macro series (CPI, unemployment, payrolls) — once per hour
@@ -2742,6 +2744,27 @@ def bis_worker(store: ArticleStore):
         _sleep(BIS_INTERVAL)
 
 
+# ── Worker: World Bank macro indicators — G20 + EM economies — every 6h ──────
+def worldbank_worker(store: ArticleStore):
+    log.info("[worldbank_worker] started")
+    bo = Backoff("worldbank", base=120.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_worldbank()
+            _ingest(store, articles, "worldbank")
+            try:
+                source_health.record_result("worldbank", len(articles))
+            except Exception as he:
+                log.warning(f"[worldbank_worker] source_health error: {he}")
+            _worker_last_ok["worldbank"] = time.time()
+            log.debug(f"[worldbank] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[worldbank_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(WORLDBANK_INTERVAL)
+
 
 # ── Worker: UN News — economic/climate/regional RSS feeds — every 30min ──────
 def un_news_worker(store: ArticleStore):
@@ -4677,6 +4700,7 @@ def main():
         ("g10_cb",      g10_cb_worker),
         ("global_reg",  global_reg_worker),
         ("bis",         bis_worker),
+        ("worldbank",   worldbank_worker),
         ("un_news",     un_news_worker),
         ("globenewswire", globenewswire_worker),
         ("prnewswire",  prnewswire_worker),
