@@ -13494,3 +13494,145 @@ chat-pattern tests) all green.
 update. No `git add -A` (concurrent-agent footgun memory; the DI suite
 chronic noise from sibling agents' dirty rss_collector/daemon files would
 get swept in).
+
+
+---
+
+## 2026-05-26 — HYBRID pass (zacks_highlights recap gate)
+
+**Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=5`.
+
+### Phase 1 — Debug & fix (0 bugs)
+
+Audited the test list the task names against the existing suite — every
+required assertion is already in place (see `tests/test_article_store.py`
+lines 124/135/145, `tests/test_features.py:13/42/66/76`,
+`tests/test_model.py:11/25/58`, `tests/test_trainer.py:27/137`,
+`tests/test_urgency_scorer.py:37/50/72`). All 3,822 tests green on
+baseline. Per the commit-guard rule, no Phase 1 commit was made — the
+suite already pins every load-bearing invariant the task lists and the
+codebase has been heavily worked across recent passes #38–#43. An honest
+zero rather than synthetic find.
+
+### Phase 2 — Feature dev (1 feature: zacks_highlights recap gate)
+
+**What.** Lockstep alert + briefing recap-template fingerprint for the
+Zacks Investment Research SEO blog-mill template — two canonical title
+forms:
+  - `^The Zacks Analyst Blog Highlights <TICKERS>`
+  - `^Zacks(.com)? featured highlights include <TICKERS>`
+
+**Live evidence (the grounding for picking this over any other addition).**
+On 2026-05-26, four distinct urgency=2 Discord BREAKING pushes fired on
+this exact template family within a 1h45m window (08:54Z → 10:35Z):
+
+| Time (UTC) | Source | ml_score | Title |
+|---|---|---|---|
+| 08:54:55 | yfinance/Zacks | 9.5 | `Zacks.com featured highlights include Micron Technology, Murphy USA and Vertiv` |
+| 09:35:40 | yfinance/Zacks | 9.83 | `The Zacks Analyst Blog Highlights NVDA, FTEC, VGT, SMH, IYW and XLK` |
+| 09:40:31 | YahooFinance/NVDA | 9.9 | (same NVDA blog — different syndication channel) |
+| 10:35:20 | Finnhub/Yahoo | 9.9 | (same MU featured-highlights — different channel) |
+
+A 30-day live scan found **105 total rows** matching the template (4
+alerted, 101 leaking at urgency=0 because they weren't quite at the 8.0
+urgent floor). All four publishers above the 0.45
+`ALERT_MIN_LONE_SOURCE_CRED` bar so the source-authority gate doesn't
+catch them; content type IS the failure. Cross-cycle dedup also misses
+them because the source-attribution suffix (" - The Globe and Mail",
+" - Yahoo Finance") varies between syndications.
+
+The ML urgency head over-scores them because the titles are dense with
+held tickers (NVDA + MU + KLA + LITE appear in nearly every Zacks blog
+highlights post — the model's `portfolio_flag`/`ticker_count`/
+`ticker_density` features fire hard).
+
+**Implementation.** Standard recap-gate triple-layer pattern:
+  - `watchers/alert_agent.py::_RT_ZACKS_HIGHLIGHTS` (the regex)
+  - `watchers/alert_agent.py::_RECAP_TEMPLATE_PATTERNS` (registers
+    `"zacks_highlights"` so the alert-side `_filter_recap_template_noise`
+    catches it)
+  - `analysis/claude_analyst.py::_BRIEFING_RT_ZACKS_HIGHLIGHTS` +
+    `_BRIEFING_RECAP_TEMPLATE_PATTERNS` (byte-identical regex on the
+    briefing path — anti-drift structurally pinned by the existing
+    `test_alert_and_briefing_recap_tuples_have_same_length` parity test)
+  - `tests/test_recap_zacks_highlights.py` (11 new tests: live failure
+    catches, template variants, must-survive corpus including forward
+    Zacks rating actions, alert/briefing parity, regex anchoring +
+    case-insensitivity)
+
+**Live-DB validation post-commit.** The new gate catches all 4 of today's
+urgency=2 Zacks rows (`_looks_like_recap_template` returns
+`(True, 'zacks_highlights')` on each) and **zero false positives** on a
+2,000-title scan of `zacks`-containing titles that aren't the SEO lead
+(forward Zacks rating actions, mid-sentence Zacks references, real
+breaking wire copy — all survive).
+
+**Invariants.** Pure read-side text drop at the formatter chokepoint. No
+DB write — no `ai_score` / `ml_score` / `score_source` / `urgency`
+mutation. Backtest already filtered upstream by `_LIVE_ONLY_CLAUSE` /
+`_is_synthetic`. All four load-bearing invariants intact by construction.
+Full pytest suite **3,833 pass / 0 fail** (3,822 baseline + 11 new).
+
+### Phase 3 — Live validation (5 user findings)
+
+Against `/media/zeph/projects/digital-intern/db/articles.db` at
+2026-05-26T11:55Z (the live wire WHILE this pass was running):
+
+1. **Pipeline volume HEALTHY.** 2,600 articles in last 1h, 9,216 in last
+   24h. 152 urgency=2 alerted + 19 urgency=1 pending in 24h. Score
+   source split (24h): `ml=8,636 / llm=578 / null=2` — Sonnet rate
+   ~24/h, model rate ~360/h, fully consistent with the documented
+   pre-floor pipeline.
+
+2. **Critical invariants GREEN.** Zero rows with `urgency >= 1` AND a
+   backtest URL/source (the load-bearing #1 invariant). Zero rows with
+   `score_source='ml' AND ai_score > 0` in 30d (the load-bearing #2
+   invariant — model self-predictions never write `ai_score`).
+
+3. **Zacks SEO mill — FIXED THIS PASS.** Was the #1 volume noise leak
+   today (4 BREAKING pushes), now gated by `zacks_highlights`.
+
+4. **ML trainer subprocess timeout failure #3.** Live `daemon.log` line
+   at 11:54:18Z: `[ml_trainer] Retrain failed: subprocess_timeout
+   elapsed_s=652.6`, third consecutive. Known per memory item
+   `DI ml-trainer subprocess timeout` — model going stale under lock
+   storm. Already surfaced via the `ML SCORER STALE` briefing block;
+   reported here for completeness, no new code action.
+
+5. **Source health: 71 disabled/down.** `[source_health] disabled=71
+   stale=0 down=71` repeating unchanged for ≥1h — the chronic external
+   gap (`DI chronic dark collectors` memory: sec_edgar/polygon/newsapi/
+   nitter delivering zero all session). Standing condition, not a
+   fresh regression.
+
+**Other recap variants still slipping through the existing gates** (not
+fixed this pass — each would warrant its own targeted regex with full
+live evidence + must-survive corpus, the standard recap-gate workflow):
+  - `"Here's What I Think Is Going on With Nvidia Stock After ..."`
+    (Motley Fool opinion-recap variant — the `^Here's What I Think` lead
+    is new vs the existing `Here's What Happened` / `Means` / `Signals`
+    siblings)
+  - `"Top N Reasons it Will Rebound"` numbered-list SEO template
+  - `"QuestionQuestion on a build..gpu compatibility..size."` from
+    `scraped/www.anandtech.com` (an Anandtech *forum* thread reaching
+    urgency=1 — the doubled "QuestionQuestion" smells like a scraper
+    bug; would need source-level gate not title-level)
+  - Non-English headlines reaching urgency=2 (one Greek
+    `GDELT/bankingnews.gr` alert today) — the urgency head doesn't know
+    the alert is unreadable to the analyst.
+
+### Phase 4 — Docs & verify
+
+This section. Final verify:
+  - `python3 -c "import sys; sys.path.insert(0,'.'); from storage import article_store; from ml import features, model; print('imports OK')"` → `imports OK`.
+  - `pytest tests/test_recap_zacks_highlights.py tests/test_alert_recap_template.py tests/test_briefing_recap_template.py -v` → 89 pass.
+  - Full `pytest tests/` → **3,833 pass / 0 fail in 130s** (+11 from this pass).
+
+**Staging discipline.** Per-commit explicit pathspec. Working copy
+carried foreign uncommitted change at start
+(`paper-trader/paper_trader/backtest.py` — sibling repo, left untouched)
+plus an untracked `paper_trader/ml/stop_band_sweep.py` (sibling repo,
+left untouched). Single Phase-2 commit staged exactly three files:
+`watchers/alert_agent.py`, `analysis/claude_analyst.py`,
+`tests/test_recap_zacks_highlights.py`. No `git add -A`, no `.json` /
+config / data / logs staged. `git diff --staged` verified before commit.
