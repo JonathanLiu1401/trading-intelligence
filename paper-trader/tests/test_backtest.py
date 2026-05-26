@@ -1295,7 +1295,7 @@ class TestMlDecideScorerGateBoundary:
             }
 
     @pytest.fixture
-    def _gated_setup(self, synthetic_prices, monkeypatch):
+    def _gated_setup(self, synthetic_prices, monkeypatch, tmp_path):
         """Yield a callable that runs _ml_decide with a substituted scorer
         at a given n_train, returning the BUY conviction expressed as
         notional / total_value."""
@@ -1310,7 +1310,27 @@ class TestMlDecideScorerGateBoundary:
                               "semiconductor surge",
                      "score": 10.0, "tickers": ["NVDA"]}]
 
+        # Isolate this test from the per-cycle no-skill kill-switch.
+        # ``_should_gate_modulate_conviction`` defaults to gate-active when
+        # the skill ledger is missing, so pointing the module-level path
+        # at a nonexistent tmp file gives us the same gate-active default
+        # the n_train>=500 boundary is supposed to test. Without this the
+        # production ``data/scorer_skill_log.jsonl`` (median oos_buy_ic ≈
+        # 0 ⇒ kill-switch fires) would short-circuit the modulation block
+        # and the conviction would stay at 0.25 regardless of n_train.
+        # Reset the cache too — a sibling test might have left a verdict
+        # cached under the prior path.
+        monkeypatch.setattr(
+            bt, "_GATE_SKILL_LOG_PATH", tmp_path / "no_skill_log.jsonl",
+            raising=False,
+        )
+        bt._reset_gate_skill_cache()
+
         def _run(n_train: int) -> float:
+            # Force-reset the kill-switch cache before each sub-call too,
+            # so the per-test fixture path is honoured even on the
+            # second call within `test_gate_boundary_difference`.
+            bt._reset_gate_skill_cache()
             monkeypatch.setattr(
                 bt, "_DECISION_SCORER",
                 self._FakeScorer(HEADWIND_PRED, n_train),
@@ -1390,7 +1410,7 @@ class TestMlDecideSubGateReasoning:
             }
 
     @pytest.fixture
-    def _gated_decision(self, synthetic_prices, monkeypatch):
+    def _gated_decision(self, synthetic_prices, monkeypatch, tmp_path):
         """Yield a callable that runs _ml_decide with a substituted scorer
         at a given n_train, returning the full decision dict (NOT just
         conviction) so the test can inspect the reasoning string."""
@@ -1403,7 +1423,19 @@ class TestMlDecideSubGateReasoning:
                               "semiconductor surge",
                      "score": 10.0, "tickers": ["NVDA"]}]
 
+        # Isolate from the no-skill kill-switch — see
+        # ``TestMlDecideScorerGateBoundary._gated_setup`` for the full
+        # rationale. The reasoning string this test inspects must show
+        # the genuine sub-gate vs gate-active distinction, NOT the
+        # kill-switch's `(gate-killed,no-skill)` marker.
+        monkeypatch.setattr(
+            bt, "_GATE_SKILL_LOG_PATH", tmp_path / "no_skill_log.jsonl",
+            raising=False,
+        )
+        bt._reset_gate_skill_cache()
+
         def _run(n_train: int) -> dict:
+            bt._reset_gate_skill_cache()
             monkeypatch.setattr(
                 bt, "_DECISION_SCORER",
                 self._FakeScorer(HEADWIND_PRED, n_train),

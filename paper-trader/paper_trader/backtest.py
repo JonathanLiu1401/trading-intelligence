@@ -1761,6 +1761,144 @@ def _get_decision_scorer():
     return _DECISION_SCORER
 
 
+# ─────────────────────────── gate kill-switch ───────────────────────────
+# Why this exists: the conviction gate (#5) modulates BUY sizing by ×0.6 /
+# ×0.85 / ×1.0 / ×1.15 / ×1.3 on the deployed scorer's prediction once
+# n_train >= 500. But the deployed scorer's persisted OOS BUY rank-IC is
+# ~0 in production (`scorer_skill_log.jsonl` running median ≈ -0.01 over
+# trailing cycles; `baseline_compare` reports MLP_WORSE_THAN_TRIVIAL).
+# Under that condition the gate's per-arm reallocation is variance with no
+# compensating realized edge — `gate_pnl_skill_log` already trends a
+# GATE_INEFFECTIVE / GATE_SUBTRACTS_RETURN verdict in OOS. This kill-switch
+# reads the same per-cycle ledger and short-circuits the gate's conviction
+# modulation when trailing OOS BUY rank-IC is statistically at noise.
+#
+# Behaviour matrix:
+#   - Ledger absent / unreadable / fewer than _GATE_SKILL_MIN_CYCLES rows
+#     with parseable `oos_buy_ic`: the kill-switch DEFAULTS to gate-active
+#     (preserves invariant #5 semantics for the first few hundred cycles
+#     after a fresh start, and never disables the gate due to a transient
+#     ledger fault).
+#   - Median |oos_buy_ic| < _GATE_SKILL_IC_TOLERANCE: the modulation block
+#     is short-circuited — conviction is left untouched. The reasoning
+#     string still surfaces `scorer=X%(gate-killed,no-skill)` so an
+#     operator (and `_parse_gate_decision`) can see the gate deliberately
+#     abstained on noise rather than acting.
+#   - Median |oos_buy_ic| >= tolerance: gate stays active. Existing
+#     ×0.6/×0.85/×1.15/×1.3 modulation is applied unchanged.
+#
+# Cached for 1h (TTL) so the JSONL read happens at most once per hour
+# regardless of the per-decision cadence — mirrors the live trader's
+# `_ml_qualify_cache` pattern in `strategy.py` (CLAUDE.md §15).
+_GATE_SKILL_LOG_PATH = ROOT / "data" / "scorer_skill_log.jsonl"
+_GATE_SKILL_MIN_CYCLES = 20      # min trailing cycles with parseable oos_buy_ic
+_GATE_SKILL_IC_TOLERANCE = 0.03  # |median buy IC| below this ⇒ no demonstrated skill
+_GATE_SKILL_KILL_SWITCH_TTL_S = 3600.0  # recheck every hour
+_gate_skill_cache: tuple[bool, str, float] | None = None
+_GATE_SKILL_CACHE_LOCK = threading.Lock()
+
+
+def _reset_gate_skill_cache() -> None:
+    """Test seam: clear the kill-switch cache so a fresh re-evaluation runs.
+    Production callers never need this — the TTL handles staleness."""
+    global _gate_skill_cache
+    with _GATE_SKILL_CACHE_LOCK:
+        _gate_skill_cache = None
+
+
+def _should_gate_modulate_conviction() -> tuple[bool, str]:
+    """Return ``(gate_active, reason)``.
+
+    Reads the trailing ``_GATE_SKILL_MIN_CYCLES`` rows of
+    ``scorer_skill_log.jsonl`` and computes the median of ``oos_buy_ic``.
+    When the median's absolute value is below ``_GATE_SKILL_IC_TOLERANCE``,
+    the scorer's BUY-side rank skill is statistically at noise and the
+    conviction gate's ×0.6/×0.85/×1.15/×1.3 modulation is variance with no
+    compensating edge — return ``(False, …)`` to short-circuit it in
+    ``_ml_decide``.
+
+    Defaults to ``(True, …)`` on any fault (missing ledger, unparseable
+    rows, fewer than the minimum trailing cycles with parseable
+    ``oos_buy_ic``). That preserves invariant #5 semantics during fresh
+    starts and never disables the gate due to a transient ledger fault.
+
+    Cached for ``_GATE_SKILL_KILL_SWITCH_TTL_S`` (1h) — the per-decision
+    cadence is up to 10 calls per sim_date and the ledger updates only
+    once per backtest cycle, so re-reading per-decision wastes IO and
+    blocks the run thread.
+    """
+    global _gate_skill_cache
+    now = time.time()
+    if _gate_skill_cache is not None:
+        gate, reason, ts = _gate_skill_cache
+        if now - ts < _GATE_SKILL_KILL_SWITCH_TTL_S:
+            return gate, reason
+
+    def _set(result: tuple[bool, str]) -> tuple[bool, str]:
+        global _gate_skill_cache
+        with _GATE_SKILL_CACHE_LOCK:
+            _gate_skill_cache = (result[0], result[1], now)
+        return result
+
+    try:
+        if not _GATE_SKILL_LOG_PATH.exists():
+            return _set((True, "skill ledger missing — default gate-active"))
+        # Tail the file: only the last ~MIN_CYCLES rows matter, but the ledger
+        # is capped at SCORER_SKILL_LOG_KEEP=2000 rows by the continuous loop,
+        # so reading the whole file is bounded. Use a deque to avoid O(n²)
+        # over splitlines if the cap ever loosens.
+        from collections import deque as _deque
+        with _GATE_SKILL_LOG_PATH.open("r") as fh:
+            tail = list(
+                _deque((ln for ln in fh if ln.strip()),
+                       maxlen=_GATE_SKILL_MIN_CYCLES * 3)
+            )
+        ics: list[float] = []
+        for ln in tail:
+            try:
+                row = json.loads(ln)
+            except Exception:
+                continue
+            v = row.get("oos_buy_ic")
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(fv):
+                continue
+            ics.append(fv)
+        if len(ics) < _GATE_SKILL_MIN_CYCLES:
+            return _set((True,
+                         f"only {len(ics)}/{_GATE_SKILL_MIN_CYCLES} valid "
+                         f"oos_buy_ic rows — default gate-active"))
+        # Keep only the most-recent MIN_CYCLES rows (the tail deque may have
+        # held more if rows were repeated; the deque is FIFO so the right
+        # slice is already the most recent).
+        recent = ics[-_GATE_SKILL_MIN_CYCLES:]
+        # Median is robust to a single outlier cycle (sklearn convergence
+        # warning, a rare regime). A trimmed mean would also work but
+        # median is the textbook "is the central tendency at noise" reading.
+        recent_sorted = sorted(recent)
+        mid = len(recent_sorted) // 2
+        if len(recent_sorted) % 2 == 1:
+            median_ic = recent_sorted[mid]
+        else:
+            median_ic = (recent_sorted[mid - 1] + recent_sorted[mid]) / 2.0
+        if abs(median_ic) < _GATE_SKILL_IC_TOLERANCE:
+            return _set((False,
+                         f"median oos_buy_ic={median_ic:+.3f} over last "
+                         f"{len(recent)} cycles is below "
+                         f"|{_GATE_SKILL_IC_TOLERANCE}| — gate killed"))
+        return _set((True,
+                     f"median oos_buy_ic={median_ic:+.3f} over last "
+                     f"{len(recent)} cycles — gate active"))
+    except Exception as exc:
+        return _set((True, f"kill-switch read error ({exc}) — default "
+                     f"gate-active"))
+
+
 def _ml_decide(
     sim_date: date,
     portfolio: "SimPortfolio",
@@ -2063,7 +2201,19 @@ def _ml_decide(
             scorer_pred = float(_scorer.predict(**_feat))
             scorer_off_dist = False
         _scorer_n = getattr(_scorer, "_n_train", 0)
-        if _scorer.is_trained and _scorer_n >= 500 and not scorer_off_dist:
+        # Per-cycle no-skill kill-switch (2026-05-25 feature). When the
+        # trailing-OOS BUY rank-IC is statistically at noise the gate's
+        # per-arm sizing reallocation is variance with no compensating
+        # realized edge — see `_should_gate_modulate_conviction` for the
+        # full economic rationale and CLAUDE.md §6 / §15 for the supporting
+        # diagnostics that already trend this state. Defaults to gate-active
+        # on any fault (missing ledger, parse error, insufficient trailing
+        # cycles) so invariant #5 semantics are preserved during fresh
+        # starts and never disabled by a transient read fault.
+        _gate_modulate_active, _gate_kill_reason = (
+            _should_gate_modulate_conviction())
+        if (_scorer.is_trained and _scorer_n >= 500 and not scorer_off_dist
+                and _gate_modulate_active):
             # Scorer adjusts conviction only — never cancels the trade.
             # The LLM already chose this ticker via ML score + quant analysis.
             # Blocking based on 5d forward-return predictions sabotages leveraged
@@ -2100,6 +2250,21 @@ def _ml_decide(
             # deliberately abstained on an off-distribution extrapolation
             # rather than silently treating a clamped ±50 as a real signal.
             scorer_note = f" scorer={scorer_pred:+.1f}%(off-dist,gate-skipped)"
+        elif not _gate_modulate_active:
+            # No-skill kill-switch fired: the scorer's trailing OOS BUY
+            # rank-IC is statistically at noise, so the gate's
+            # ×0.6/×0.85/×1.15/×1.3 modulation was short-circuited
+            # (conviction left untouched). Surfaced via the
+            # `(gate-killed,no-skill)` marker so the dashboard / a reading
+            # quant can distinguish a data-driven abstention (kill-switch)
+            # from an architectural one (off-distribution).
+            # `_parse_gate_decision` was extended in run_continuous_backtests.py
+            # to detect `(gate-killed` AS WELL AS `(off-dist` and set
+            # ``gate_off_dist=True`` for either marker, so downstream
+            # ``gate_pnl`` / ``gate_arm_historical`` analyzers correctly drop
+            # both abstention types — the gate did NOT act in either case,
+            # so the bucket assignment cannot be attributed to scorer skill.
+            scorer_note = f" scorer={scorer_pred:+.1f}%(gate-killed,no-skill)"
         else:
             scorer_note = f" scorer={scorer_pred:+.1f}%"
         return {

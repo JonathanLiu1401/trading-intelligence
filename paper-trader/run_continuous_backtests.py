@@ -531,11 +531,19 @@ def _parse_gate_decision(reasoning: str | None) -> tuple[float | None, bool | No
 
     ``backtest._ml_decide`` ends a BUY's reasoning with one of:
 
-      * `` scorer=±X.X%``                          — the *then-deployed*
+      * `` scorer=±X.X%``                            — the *then-deployed*
         pickle's predicted 5d return the gate actually modulated conviction on
-      * `` scorer=±X.X%(off-dist,gate-skipped)``   — the off-distribution
+      * `` scorer=±X.X%(off-dist,gate-skipped)``     — the off-distribution
         guard fired, so the gate **abstained** (conviction left untouched)
-      * *(nothing)*                                — the cycle's scorer was
+      * `` scorer=±X.X%(gate-killed,no-skill)``      — the per-cycle no-skill
+        kill-switch (`backtest._should_gate_modulate_conviction`) fired
+        because the scorer's trailing OOS BUY rank-IC is at noise; the gate
+        **abstained** (conviction left untouched). Same semantics as the
+        off-dist abstention from any downstream analyzer's perspective —
+        the gate did NOT act, so the bucket assignment cannot be
+        attributed to scorer skill and the row must be dropped from
+        ``gate_pnl`` / ``gate_arm_historical`` analyses.
+      * *(nothing)*                                  — the cycle's scorer was
         untrained / ``n_train < 500``; no gate acted at all
 
     SELL/HOLD reasoning never carries ``scorer=`` (the gate is BUY-only).
@@ -543,9 +551,14 @@ def _parse_gate_decision(reasoning: str | None) -> tuple[float | None, bool | No
     Returns ``(gate_scorer_pred, gate_off_dist)``:
       * ``gate_scorer_pred`` — the float % the gate saw, or ``None`` when no
         ``scorer=`` token was emitted (untrained / sub-gate cycle, or SELL)
-      * ``gate_off_dist``    — ``True`` if the off-distribution abstention
-        marker followed it, ``False`` if a real prediction was acted on,
-        ``None`` when there was no gate decision to characterize
+      * ``gate_off_dist``    — ``True`` when EITHER abstention marker
+        followed the ``scorer=`` token (``(off-dist`` from the
+        off-distribution branch OR ``(gate-killed`` from the no-skill
+        kill-switch). Both indicate the gate abstained, so the legacy field
+        name is kept for backward-compat (existing analyzers that drop
+        ``gate_off_dist=True`` rows correctly drop both abstention types).
+        ``False`` if a real prediction was acted on, ``None`` when there was
+        no gate decision to characterize.
 
     Why this matters: every existing gate diagnostic (``gate_audit``,
     ``gate_pnl``) must RE-PREDICT with **today's** deployed pickle on the
@@ -573,9 +586,12 @@ def _parse_gate_decision(reasoning: str | None) -> tuple[float | None, bool | No
             pred: float | None = float(m.group(1))
         except (TypeError, ValueError):
             pred = None
-        # The abstention marker only ever trails a `scorer=` token, so it is
-        # only meaningful once one was emitted.
-        off_dist = "(off-dist" in reasoning
+        # Abstention marker only ever trails a `scorer=` token, so it is
+        # only meaningful once one was emitted. Both abstention types
+        # (off-distribution clamp and the no-skill kill-switch) map to
+        # ``off_dist=True`` so existing analyzers that filter on this
+        # field correctly drop both — the gate did NOT act in either case.
+        off_dist = ("(off-dist" in reasoning) or ("(gate-killed" in reasoning)
         return pred, off_dist
     except Exception:
         return None, None
