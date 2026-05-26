@@ -1708,3 +1708,45 @@ class TestWatchlistHygiene:
         for t in ("NVDU", "MSFU", "AMZU", "TSLL"):
             assert t in strategy.WATCHLIST
             assert t in strategy.SYSTEM_PROMPT
+
+
+class TestIsClaudeCallActive:
+    """``strategy.is_claude_call_active`` is the runner's deadman safety
+    signal: when a claude subprocess is in flight, the git-watcher must NOT
+    force-exit the loop past RESTART_GRACE_S (timeouts are None now —
+    "wait indefinitely" — so a healthy slow Opus call can legitimately
+    outlast the grace).
+    """
+
+    def teardown_method(self, _m):
+        # Reset the module global between tests so a stale proc handle from
+        # one test never leaks into the next (the existing autouse fixture
+        # doesn't touch this attribute).
+        strategy._active_claude_proc = None
+
+    def test_no_active_proc(self):
+        strategy._active_claude_proc = None
+        assert strategy.is_claude_call_active() is False
+
+    def test_proc_alive(self):
+        class _FakeProc:
+            def poll(self_inner):
+                return None  # None means still running
+        strategy._active_claude_proc = _FakeProc()
+        assert strategy.is_claude_call_active() is True
+
+    def test_proc_exited(self):
+        class _FakeProc:
+            def poll(self_inner):
+                return 0  # exited cleanly
+        strategy._active_claude_proc = _FakeProc()
+        assert strategy.is_claude_call_active() is False
+
+    def test_poll_raises_returns_false(self):
+        # A degenerate handle whose poll() throws must not crash the watcher
+        # (the helper is called from the daemon thread between cycles).
+        class _ExplodingProc:
+            def poll(self_inner):
+                raise OSError("proc was reaped externally")
+        strategy._active_claude_proc = _ExplodingProc()
+        assert strategy.is_claude_call_active() is False
