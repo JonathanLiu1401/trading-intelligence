@@ -5,6 +5,130 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-26 hybrid pass #41 (Agent 3) — briefing_text_overlap_trend content staleness verdict
+
+Debugger + feature-dev + news-analyst pass. 3678 tests in the full
+suite green at start (full sweep took 131s, no failures); +19 new
+tests = 3697 in the suite at end. All four load-bearing invariants
+intact.
+
+**Phase 1 (debug):** baseline sweep clean — full 3678-test suite
+passed with zero failures. No real bugs found in the code paths
+required to read (daemon.py, storage/article_store.py,
+watchers/alert_agent.py, watchers/urgency_scorer.py, ml/trainer.py,
+ml/model.py, ml/features.py, collectors/web_scraper.py,
+analysis/claude_analyst.py). Every requested test from the brief
+already exists and passes: backtest-isolation tests
+(`test_get_unalerted_urgent_excludes_backtest_urls`,
+`test_get_top_for_briefing_excludes_backtest`,
+`test_get_unscored_excludes_backtest`), kw_score classification
+(`test_high_score_marked_urgent` / `test_low_score_not_urgent`),
+the 15-extra-dim contract (`test_feature_dim_is_exactly_15`),
+zero-density (`test_ticker_density_zero_with_no_portfolio_mentions`),
+freshness (`test_days_since_published_zero_when_just_published` /
+`_grows_with_age` / `_clipped_at_one`), the score_source=ml exclusion
+(`test_excludes_ml_scored_rows`), and the high-relevance weight
+gradient (`test_high_relevance_weighs_more_than_low`). bugs_fixed=0.
+
+**Phase 2 (feature) — committed in e80ad46:**
+
+`ArticleStore.briefing_text_overlap_trend(last_n=6)` — per-pair token
+Jaccard across the most-recent N briefings — the *content-staleness*
+sibling to `briefing_cadence_trend`.
+
+`briefing_cadence_trend` answers "are briefings firing on schedule?".
+This sibling answers "if a briefing fires, is it carrying fresh
+content or recapping the prior one?". A 5h Opus briefing technically
+ON_CADENCE can still be functionally useless to the analyst if it
+recaps the same handful of events as the previous one — they have
+already been told everything. This surfaces that pattern as a single
+verdict.
+
+Verdict ladder (most-severe first, mirroring `briefing_cadence_trend`):
+* `REPETITIVE` — mean Jaccard > 0.60 OR max > 0.75.
+* `WARMING` — mean > 0.45 (early warning, notable overlap).
+* `FRESH` — everything else.
+* `NO_DATA` — fewer than 2 briefings (need a pair).
+
+Tokenisation: lowercased alphanumeric runs of length >= 5. The length
+floor strips common stop words and the heavy noise tail of 1-4 char
+tokens (tickers, "the", "and", numbers, separators) so the Jaccard
+actually reflects whether the same companies/events are being
+re-discussed, not whether both briefings say "the".
+
+Live verification at end-of-pass (real briefings table, last 6 rows):
+```
+pair_jaccards = [0.294, 0.273, 0.220, 0.290, 0.376]
+mean=0.291  max=0.376  verdict=FRESH
+```
+
+Briefings are correctly producing diverse content — the new metric
+gives the analyst direct evidence the briefing path is not recycling,
+complementing the cadence-side verdict.
+
+Pinned by 19 tests in `tests/test_briefing_text_overlap_trend.py`
+covering: verdict ladder (FRESH / WARMING / REPETITIVE / NO_DATA,
+including the max-rule alone path), pair ordering (newest LAST,
+chronological), tokenisation (case-insensitive, short tokens dropped,
+ticker handling), `last_n` clamp to minimum 2, defensive parsing
+(empty / None briefing text doesn't crash), result shape (closed key
+set, closed verdict alphabet), and load-bearing invariants
+(read-only, no article-row mutation, backtest rows untouched).
+
+**Phase 3 (live news-analyst observations) — 5 findings:**
+
+1. **Briefings are FRESH (new metric).** `briefing_text_overlap_trend`
+   on the live table returns `verdict=FRESH, mean_jaccard=0.29,
+   max=0.38`. The 5h Opus briefing is producing diverse content —
+   the metric this pass added is correctly silent on a healthy
+   briefing path.
+
+2. **NVDA earnings wire saturation visible LIVE in ml-only urgent.**
+   Top 4 ML-only urgent rows in the last 1.5h are all the same NVDA
+   $80B buyback / Q1 earnings event syndicated 4 different ways:
+   - "NVIDIA projects $91B Q2 revenue while outlining $80B buyback..." [9.99]
+   - "Nvidia (NVDA) tops Q1 earnings and revenue estimates - MSN" [9.95]
+   - "Nvidia unveils $80B buyback, 25x dividend hike on record earnings - MSN" [9.97]
+   - "Nvidia posts record $81.6B quarter, unveils $80B buyback - MSN" [9.99]
+   All from `GN: dividend buyback` and `GN: Nvidia` Google News feeds.
+   This is exactly the pattern a concurrent sibling agent's untracked
+   `analytics/urgent_event_saturation.py` is designed to detect — the
+   per-(held-ticker × event-class) urgent saturation audit. Worth
+   confirming that module lands.
+
+3. **Urgent calibration is 85% ML-only.** 122 urgency=2 rows in the
+   last 24h: 18 `score_source='llm'` (15%), 104 `score_source='ml'`
+   (85%). Same `mostly_unverified` regime documented in prior passes —
+   the new `briefing_text_overlap_trend` does not change this read.
+   The analyst's Discord push channel is 5+ alerts/h with most of
+   them not Sonnet-vetted.
+
+4. **State-of-market pseudo-events reaching ml-urgent.** The DXY
+   collector's `dxy | USD regime: soft (DXY 95-100) | DXY 99.24
+   (-0.08% d/d)` row was urgency=2 ml_score=9.88 — that's a state
+   summary, not breaking news. Similar to the YF screener-tape /
+   StockTwits sentiment pseudo-article gates already in place; the
+   DXY regime line is structurally a digest row, not a wire push.
+   Worth a future defense-in-depth fingerprint on the alert_agent
+   side. (Not fixed this pass — outside the surgical scope of a
+   pure-feature commit and concurrent agents are active in
+   `dashboard/web_server.py`.)
+
+5. **Collection rate healthy.** 529 articles in last 1h (live).
+   Top collectors: stocktwits 291, GN: earnings 262, GN: Nasdaq 253,
+   GN: oil prices 194, GN: IPO 191, GN: Nvidia 139, GN: Federal
+   Reserve 136. System is keeping up; no traceback / silent
+   collector deaths in the recent log window (only known DB lock
+   contention warnings that the `@_retry_on_lock` decorator handles).
+
+**Files touched (this repo only):**
+
+- `storage/article_store.py` — new `briefing_text_overlap_trend` method.
+- `tests/test_briefing_text_overlap_trend.py` (new) — 19 tests.
+- `AGENTS.md` (this entry).
+
+---
+
 ## 2026-05-25 hybrid pass #40 (Agent 3) — trainer cache fix + recent_ml_only_urgent audit
 
 Debugger + feature-dev + news-analyst pass. 125 tests in the critical sweep
