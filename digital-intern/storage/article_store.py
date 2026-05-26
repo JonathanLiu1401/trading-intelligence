@@ -1134,6 +1134,111 @@ class ArticleStore:
         }
 
     @_retry_on_lock
+    def briefing_text_overlap_trend(self, last_n: int = 6) -> dict:
+        """Per-pair token Jaccard across the ``last_n`` most recent briefings —
+        the *content-staleness* sibling to ``briefing_cadence_trend``.
+
+        ``briefing_cadence_trend`` asks "are briefings firing on schedule?";
+        this asks "if a briefing fires, is it carrying fresh content or
+        recapping the prior one?". A 5h Opus briefing technically ON_CADENCE
+        can still be functionally useless to the analyst if it recaps the
+        same handful of events as the previous one — they have already been
+        told everything. This surfaces that pattern as a single verdict.
+
+        Sibling discipline to ``briefing_cadence_trend`` / ``briefing_health``:
+        pure SELECT, ``_LIVE_ONLY_CLAUSE`` not needed (briefings table is
+        Opus-write only; never touched by backtest paths). Read-only, no
+        ai_score / ml_score / score_source / urgency mutation.
+
+        Tokenisation: lowercased alphanumeric runs of length >= 5. Length
+        floor strips common stop words and the heavy noise tail of 1-4 char
+        tokens (tickers, "the", "and", numbers, separators) so the Jaccard
+        actually reflects whether the same companies / events are being
+        re-discussed, not whether both briefings say "the".
+
+        Returns::
+
+            {
+              "last_n":         int,
+              "n_pairs":        int,
+              "pair_jaccards":  [float, ...],  # chronological, newest LAST
+              "mean_jaccard":   float | None,
+              "max_jaccard":    float | None,
+              "verdict": "FRESH" | "WARMING" | "REPETITIVE" | "NO_DATA",
+            }
+
+        Verdict semantics (mirrors ``briefing_cadence_trend``'s
+        most-severe-first ladder):
+          * ``NO_DATA``    — fewer than 2 briefings (need a pair).
+          * ``REPETITIVE`` — mean > 0.60 OR max > 0.75. Briefings are
+            substantially recycling content.
+          * ``WARMING``    — mean > 0.45. Early-warning: notable overlap
+            but not yet a recap problem.
+          * ``FRESH``      — everything else.
+        """
+        last_n = max(int(last_n), 2)
+
+        rows = self.conn.execute(
+            "SELECT text FROM briefings ORDER BY id DESC LIMIT ?",
+            (last_n,),
+        ).fetchall()
+
+        # Reverse to chronological order (oldest first) — pairs are
+        # then (older, newer), so ``pair_jaccards[-1]`` is the freshest
+        # comparison. Defensive against corrupt rows: empty / None text
+        # silently yields an empty token set (no crash on a malformed
+        # briefings row, same discipline as ``briefing_cadence_trend``).
+        texts: list[str] = [(r[0] or "") for r in rows]
+        texts.reverse()
+
+        token_re = re.compile(r"[a-z0-9]{5,}")
+        token_sets: list[frozenset] = [
+            frozenset(token_re.findall(t.lower())) for t in texts
+        ]
+
+        pair_jaccards: list[float] = []
+        for i in range(len(token_sets) - 1):
+            a, b = token_sets[i], token_sets[i + 1]
+            if not a and not b:
+                pair_jaccards.append(0.0)
+                continue
+            inter = len(a & b)
+            union = len(a | b)
+            pair_jaccards.append(
+                round(inter / union, 3) if union else 0.0
+            )
+
+        n_pairs = len(pair_jaccards)
+        if n_pairs < 1:
+            return {
+                "last_n": last_n,
+                "n_pairs": 0,
+                "pair_jaccards": [],
+                "mean_jaccard": None,
+                "max_jaccard": None,
+                "verdict": "NO_DATA",
+            }
+
+        mean_j = sum(pair_jaccards) / n_pairs
+        max_j = max(pair_jaccards)
+
+        if mean_j > 0.60 or max_j > 0.75:
+            verdict = "REPETITIVE"
+        elif mean_j > 0.45:
+            verdict = "WARMING"
+        else:
+            verdict = "FRESH"
+
+        return {
+            "last_n": last_n,
+            "n_pairs": n_pairs,
+            "pair_jaccards": pair_jaccards,
+            "mean_jaccard": round(mean_j, 3),
+            "max_jaccard": round(max_j, 3),
+            "verdict": verdict,
+        }
+
+    @_retry_on_lock
     def count_unscored(self, min_kw: float = 0.0) -> int:
         """Count articles still pending the scorer. Mirrors ``get_unscored``'s
         filter (ai_score=0 AND ml_score IS NULL AND kw_score>=min_kw AND
