@@ -91,6 +91,7 @@ from collectors.manifold_collector import collect_manifold
 from collectors.kalshi_collector import collect as collect_kalshi
 from collectors.collector_rate_monitor import collect_rate_alerts
 from collectors.yield_curve_collector import collect_yield_curve
+from collectors.yield_curve_spread_collector import collect_yield_curve_spreads
 from collectors.g10_sovereign_yields import collect_g10_yields
 from collectors.fred_collector import collect_fred
 from collectors.cftc_cot_collector import collect_cftc_cot
@@ -225,6 +226,7 @@ MANIFOLD_INTERVAL       = 1800    # Manifold Markets prediction markets every 30
 KALSHI_INTERVAL         = 1800    # Kalshi CFTC-regulated markets every 30min
 RATE_MONITOR_INTERVAL   = 3600    # per-collector silence detector — hourly
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
+YIELD_CURVE_SPREAD_INTERVAL = 3600  # 2Y-10Y & 3M-10Y inversion tracker every 1h (FRED)
 APPSTORE_FINANCE_INTERVAL = 86400  # Apple App Store Finance rankings — once per day
 G10_YIELDS_INTERVAL     = 3600    # G10 sovereign yields every 1h (FRED daily/monthly)
 FRED_MACRO_INTERVAL     = 3600    # FRED macro series (claims, M2, rig count, etc.) — hourly
@@ -374,6 +376,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "kalshi": KALSHI_INTERVAL,
     "rate_monitor": RATE_MONITOR_INTERVAL,
     "yield_curve": YIELD_CURVE_INTERVAL,
+    "yield_curve_spread": YIELD_CURVE_SPREAD_INTERVAL,
     "g10_yields": G10_YIELDS_INTERVAL,
     "fred_macro": FRED_MACRO_INTERVAL,
     "short_interest": SHORT_INTEREST_INTERVAL,
@@ -1665,6 +1668,27 @@ def yield_curve_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(YIELD_CURVE_INTERVAL)
+
+
+def yield_curve_spread_worker(store: ArticleStore):
+    log.info("[yield_curve_spread_worker] started")
+    bo = Backoff("yield_curve_spread", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_yield_curve_spreads()
+            _ingest(store, articles, "yield_curve_spread")
+            try:
+                source_health.record_result("yield_curve_spread", len(articles))
+            except Exception as he:
+                log.warning(f"[yield_curve_spread_worker] source_health error: {he}")
+            _worker_last_ok["yield_curve_spread"] = time.time()
+            log.debug(f"[yield_curve_spread] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[yield_curve_spread_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(YIELD_CURVE_SPREAD_INTERVAL)
 
 
 def g10_yields_worker(store: ArticleStore):
@@ -4587,6 +4611,7 @@ def main():
         ("manifold",    manifold_worker),
         ("rate_monitor", rate_monitor_worker),
         ("yield_curve", yield_curve_worker),
+        ("yield_curve_spread", yield_curve_spread_worker),
         ("g10_yields",  g10_yields_worker),
         ("fred_macro",  fred_macro_worker),
         ("cftc_cot",    cftc_cot_worker),
