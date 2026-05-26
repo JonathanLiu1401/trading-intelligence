@@ -323,13 +323,50 @@ class TestDeferredRestartOverdue:
     def test_grace_exceeds_worst_case_healthy_cycle(self):
         """The grace must be safely above the longest *healthy* cycle so a
         slow-but-live loop is never force-killed. Worst case ≈ the strategy
-        claude budgets (180 + 45 + 60) + the 180s watcher poll cadence."""
+        claude budgets (180 + 45 + 60) + the 180s watcher poll cadence.
+
+        When timeouts are None (commit 82bb195 — "wait indefinitely for model
+        response") the bounded worst-case no longer exists; the in-flight
+        ``call_active`` short-circuit on ``_deferred_restart_overdue`` is the
+        runtime safety net instead, and ``test_call_active_defers_force_exit``
+        covers it. Skip rather than fabricate a bogus comparison."""
         from paper_trader import strategy
-        worst_healthy = (strategy.DECISION_TIMEOUT_S
-                         + strategy.RETRY_TIMEOUT_S
-                         + strategy.FALLBACK_TIMEOUT_S
-                         + 180)
+        timeouts = (strategy.DECISION_TIMEOUT_S,
+                    strategy.RETRY_TIMEOUT_S,
+                    strategy.FALLBACK_TIMEOUT_S)
+        if any(t is None for t in timeouts):
+            pytest.skip(
+                "claude timeouts are None (indefinite wait); the bounded "
+                "worst-case invariant is replaced by the call_active "
+                "deadman short-circuit"
+            )
+        worst_healthy = sum(timeouts) + 180  # type: ignore[arg-type]
         assert runner.RESTART_GRACE_S > worst_healthy
+
+    def test_call_active_defers_force_exit(self):
+        """When a claude subprocess is actively running, the deadman must NOT
+        force-exit — even past grace. With ``DECISION_TIMEOUT_S = None`` a
+        slow but healthy Opus call can outlast ``RESTART_GRACE_S`` and we
+        would otherwise SIGKILL a legit decision mid-thought."""
+        # Past grace but call is active → deferred, never overdue.
+        assert runner._deferred_restart_overdue(
+            100.0, 100.0 + 5000.0, grace_s=600.0, call_active=True,
+        ) is False
+        # Same elapsed, but no active call → overdue (the existing semantics).
+        assert runner._deferred_restart_overdue(
+            100.0, 100.0 + 5000.0, grace_s=600.0, call_active=False,
+        ) is True
+
+    def test_call_active_does_not_bypass_within_grace(self):
+        """``call_active`` is a *defer* only, not a noop. Within grace the
+        result is False either way — the new flag must not accidentally
+        invert behaviour for the under-grace common case."""
+        assert runner._deferred_restart_overdue(
+            100.0, 100.0 + 100.0, grace_s=600.0, call_active=True,
+        ) is False
+        assert runner._deferred_restart_overdue(
+            100.0, 100.0 + 100.0, grace_s=600.0, call_active=False,
+        ) is False
 
 
 class TestKillStaleClaude:
