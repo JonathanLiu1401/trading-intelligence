@@ -6,6 +6,235 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-26 ML+backtest HYBRID pass #43 (Agent 2) — sector mapping fix + multi-horizon stop-band sweep
+
+### Phase 1 — Debug: `bugs_fixed = 1`
+
+**Bug: 34 newly-added watchlist tickers silently mapped to `sector_other`.**
+The uncommitted ``paper_trader/backtest.py`` ``WATCHLIST`` diff that this
+session inherited added 34 names — power semis / GaN / SiC (NVTS, MPWR,
+WOLF, STM, MCHP, AMBA, SWKS, QRVO), AI infrastructure / accelerators /
+EDA / semi-test (SMCI, AVGO, ARM, MRVL, CDNS, SNPS, AEHR, COHU), quantum
+compute (IONQ, RGTI, QUBT, ARQQ, QMCO), space + eVTOL (RKLB, LUNR, AST,
+ACHR, JOBY), nuclear small-caps (OKLO, NNE), AI software / next-gen
+comms (SOUN, BBAI, ASTS), medical-imaging / surgical robotics (BFLY,
+PRCT), and the second 2x-NVDA leveraged ETF (NVDX). Every one of them
+silently mapped to ``sector_other`` in ``decision_scorer.SECTOR_MAP``.
+
+The existing ``TestSectorMapping::test_watchlist_coverage`` (the
+regression-lock added when the prior batch of 41 tickers — LRCX/BABA/
+RIVN/QLD/BRK-B/SPXS… — had the same problem) was failing with
+``AssertionError: 34 WATCHLIST tickers have no SECTOR_MAP entry``. This
+is the exact regression the test was designed to catch: collapsing
+semi-equipment with utilities/defense/Toyota in one bucket erases every
+learnable sector-conditional pattern.
+
+**Fix.** Add explicit ``SECTOR_MAP`` entries for the 32 names that have
+clear sector fit (tech for semis/AI infra/quantum/space-eVTOL/AI
+software/2x-NVDA; healthcare for BFLY/PRCT) and add OKLO/NNE (nuclear
+small-caps with no utility/energy enum) to ``INTENTIONALLY_OTHER`` — the
+same convention UTSL already follows. Two new pin tests
+(``test_2026_05_26_watchlist_additions_classified``,
+``test_2026_05_26_additions_dont_break_other_invariants``) lock the
+classification so a future revert is caught explicitly. All 75
+``test_decision_scorer.py`` tests now green; all 181 sector-related
+tests across the broader slice pass.
+
+Other candidates considered and **rejected**:
+
+* ``test_train_scorer_references_the_constant`` fails under specific
+  -k filter combinations (pytest test-pollution where ``ds.train_scorer``
+  appears bound to the ``feature_importance`` method's source). Passes
+  in isolation and as part of normal test runs. Pre-existing flake, not
+  caused by my changes; not in this pass's scope.
+
+Commit: ``fix(ml/scorer): classify 34 new watchlist tickers, restore
+sector signal`` (960065f).
+
+### Phase 2 — Feature: multi-horizon stop-band sweep + per-cycle ledger (`features_added = 1`)
+
+The pass-#42 author (last cycle) shipped ``forward_intraperiod_min_10d``
+/ ``forward_intraperiod_min_20d`` / ``forward_intraperiod_max_10d`` /
+``forward_intraperiod_max_20d`` alongside the existing 5d pair and
+explicitly flagged the next step:
+
+> "The multi-horizon extremes added in Phase 2 will let the next
+> ``stop_out_audit`` sweep test whether a wider band (e.g. -10%) over a
+> longer window (10d, 20d) saves more than it costs."
+
+This pass lands that consumer.
+
+**``paper_trader/ml/stop_band_sweep.py``** — sweeps a 2-D grid of
+candidate STOP bands × horizons (5d/10d/20d) on the BUY-row corpus,
+reporting per-cell realized return and benefit-vs-no-stop. Default
+grid: bands {3, 5, 7, 8, 10, 12, 15, 20} × horizons {5d, 10d, 20d} =
+24 cells. Verdict ladder mirrors ``tp_band_sweep`` exactly:
+
+| Verdict | Meaning |
+|---------|---------|
+| ``INSUFFICIENT_DATA`` | deployed horizon's intraperiod coverage < ``MIN_BUYS`` (corpus warm-up state). |
+| ``CELL_BEATS_DEPLOYED`` | best ``(band, horizon)`` cell's benefit clears deployed by > ``EDGE_TOL_PP`` (0.30pp). Tuning move available. |
+| ``DEPLOYED_OPTIMAL`` | deployed cell is within ±``EDGE_TOL_PP`` of best — no tuning move clears noise. |
+| ``NO_BAND_HELPS`` | every candidate cell's benefit < ``EDGE_TOL_PP`` — no stop, on any band or horizon, measurably improves realized return on this corpus. |
+
+Read-only by construction — never trains, never touches the pickle,
+never enters a trade path. Same operational discipline as every sibling
+analyzer.
+
+**``run_continuous_backtests._append_stop_band_sweep_log``** — per-cycle
+durable ledger so the verdict becomes trendable. Flattens ``best_cell``
+to top-level columns (``best_stop_pct`` / ``best_horizon`` /
+``best_benefit_pct``) so a JSONL consumer can query without unpacking
+the nested dict. Best-effort by construction (an analyzer crash still
+emits an honest ``sweep_dark=True`` row so a gap in the trend is never
+silent), bounded by the same tmp+``.replace`` trim idiom every sibling
+``_append_*_skill_log`` uses. Wired into ``main()`` immediately after
+``_append_mfe_skill_log``.
+
+**Tests** in ``tests/test_stop_band_sweep.py`` (63) and
+``tests/test_continuous_stop_band_sweep_ledger.py`` (8):
+
+* Pure-function arithmetic: ``_stop_protected_return`` (stop fires at
+  exactly band, below band, never fires; sign-preserving), ``sweep_cells``
+  per-cell stats with hand-computed expected values, baseline constant
+  across bands, per-horizon baselines distinct.
+* ``_coerce_bands`` / ``_coerce_horizons``: deployed always inserted,
+  duplicates removed, non-positive / non-finite / non-string dropped.
+* ``analyze`` verdict ladder: missing file / no BUYs / below
+  ``MIN_BUYS`` → ``INSUFFICIENT_DATA``; tight stop caps crashes →
+  ``CELL_BEATS_DEPLOYED``; no drawdowns → ``NO_BAND_HELPS``; deployed
+  IS best within noise → ``DEPLOYED_OPTIMAL``.
+* Multi-horizon: partial coverage honored (row contributes to 5d sweep
+  but is dropped from 10d when its 10d field is missing); per-horizon
+  baselines distinct; longer-horizon discovers cells the deployed
+  short-horizon analyzer structurally cannot.
+* Line tolerance (corrupt JSON line doesn't abort), SELL row exclusion,
+  non-finite intra_min drops just that row.
+* CLI: exit 0 on decisive verdicts, 1 on neutral; ``--json`` parseable;
+  ``--horizons`` restricts sweep but deployed-horizon auto-inserted.
+* Module constants SSOT cross-check: ``DEPLOYED_STOP_PCT == 8.0``
+  matches ``backtest._buy``'s ``stop_loss = price * 0.92``; ``MIN_BUYS``
+  matches ``tp_band_sweep``.
+* Ledger helper: insufficient-data persists ``sweep_dark`` row,
+  ``CELL_BEATS_DEPLOYED`` round-trips the best cell SSOT, analyzer-crash
+  best-effort envelope, missing-module tolerance, bounded trim,
+  ``main()`` wiring smoke check.
+
+Commit: ``feat(ml): multi-horizon stop-band sweep + per-cycle ledger``
+(7d46543).
+
+### Phase 3 — Live quant findings (`user_findings = 4`)
+
+1. **``stop_band_sweep`` verdict on the production corpus: ``CELL_BEATS_DEPLOYED``.**
+   On the live 7318-BUY ``decision_outcomes.jsonl`` (5d full coverage,
+   10d/20d ~5645 each), the best cell is **(-3%, 5d)** at **+0.979pp**
+   benefit vs deployed **(-8%, 5d)** at **+0.454pp** — a **+0.525pp**
+   gap, well above the 0.30pp noise margin. The new ledger persists
+   this so a quant can watch the verdict evolve as the corpus
+   accumulates and bands of opposite signs (10d/20d wider bands)
+   surface. **Actionable** — a tuning move to tighten ``_buy``'s
+   ``stop_loss`` from 0.92 to ~0.97 is supported by the data, but
+   gated on operator-level review (the analyzer reports an UPPER bound
+   on the benefit since gap-down fills would realize worse than band).
+
+2. **``MLP_NO_BETTER_THAN_TRIVIAL`` is the persistent verdict in
+   ``baseline_skill_log``.** Latest 3 rows: ``mlp_rank_ic`` between
+   +0.002 and +0.054, best one-liner (``news_count`` / ``ml_score``)
+   between +0.027 and +0.046, ``ic_gap`` in [-0.026, +0.008] — at
+   noise. The deployed MLP carries essentially zero OOS rank skill
+   over the simplest possible baseline, consistent with the pass-#41
+   ``MLP_WORSE_THAN_TRIVIAL`` and pass-#42 ``MLP_NO_BETTER_THAN_TRIVIAL``
+   findings.
+
+3. **Gate kill-switch is firing every cycle.** Trailing-20-cycle
+   ``oos_buy_ic`` median = **+0.0000** (threshold |0.03|). The
+   pass-#41 kill-switch short-circuits the conviction modulation
+   block on every BUY, exactly as designed when the trailing OOS
+   rank-IC is statistically at noise.
+
+4. **DIRECTIONAL_BUT_BIASED is real but dominated by in-sample fit.**
+   Decile calibration on the most recent 2000 BUYs shows beautiful
+   monotonicity: D0 mean pred -13.7% / mean actual -5.4%; D9 mean
+   pred +12.0% / mean actual +7.2%; deciles strictly increasing in
+   between. The rank ordering looks great BUT this is dominated by
+   in-sample fit (the tail of the corpus the just-retrained pickle
+   was trained on). True temporal-OOS rank-IC stays at noise (#3),
+   which is the honest generalization signal. Pass #42 already
+   captured this state as ``DIRECTIONAL_BUT_BIASED``; the live numbers
+   confirm it persists.
+
+### Phase 4 — Counters
+
+* ``bugs_fixed = 1``
+* ``features_added = 1``
+* ``user_findings = 4``
+
+### Files touched
+
+* ``paper_trader/ml/decision_scorer.py`` — 32 new ``SECTOR_MAP`` entries
+  (power semis, AI infra, quantum, space-eVTOL, AI software, 2x-NVDA,
+  medical-AI), 2 new ``INTENTIONALLY_OTHER`` entries (OKLO, NNE
+  nuclear).
+* ``paper_trader/ml/stop_band_sweep.py`` — new multi-horizon stop-band
+  sweep analyzer (uncommitted at session start; landed with full
+  test coverage and per-cycle wiring).
+* ``run_continuous_backtests.py`` — ``STOP_BAND_SWEEP_LOG`` /
+  ``STOP_BAND_SWEEP_LOG_KEEP`` constants, ``_append_stop_band_sweep_log``
+  helper, ``main()`` invocation after ``_append_mfe_skill_log``.
+* ``tests/test_decision_scorer.py`` — 2 new tests pinning the 2026-05-26
+  watchlist classification.
+* ``tests/test_stop_band_sweep.py`` — 63 new tests.
+* ``tests/test_continuous_stop_band_sweep_ledger.py`` — 8 new tests.
+
+### Test commands for the ML/backtest domain
+
+```
+$ python3 -m pytest tests/test_decision_scorer.py -v
+$ python3 -m pytest tests/test_stop_band_sweep.py -v
+$ python3 -m pytest tests/test_continuous_stop_band_sweep_ledger.py -v
+$ python3 -m pytest tests/ -v -k "ml or backtest or scorer or stop_band"
+```
+
+### ML/backtest domain — multi-horizon stop-band sweep (operator reference)
+
+**What it answers.** ``stop_out_audit`` measures the deployed (-8%, 5d)
+stop's economic effect. ``stop_band_sweep`` extends that to a 2-D grid
+× horizons so a quant can ask "is there a (band, horizon) cell that
+beats the deployed cell on realized return?" without manually
+recomputing extremes from price data. The verdict ladder mirrors
+``tp_band_sweep`` exactly.
+
+**How to run it.**
+
+```bash
+cd /home/zeph/paper-trader
+
+# Default grid + horizons.
+python3 -m paper_trader.ml.stop_band_sweep
+python3 -m paper_trader.ml.stop_band_sweep --json
+
+# Custom grid — deployed (-8%, 5d) is auto-inserted.
+python3 -m paper_trader.ml.stop_band_sweep --bands 5,8,10 --horizons 5d,10d
+```
+
+**How to read the verdict.**
+
+| Verdict | What to do |
+|---------|------------|
+| ``CELL_BEATS_DEPLOYED`` | A specific ``(band, horizon)`` cell beats deployed by > 0.30pp. Surface the gap to the operator; the analyzer reports an UPPER bound (gap-down fills realize worse than band, so this is the optimistic estimate). |
+| ``DEPLOYED_OPTIMAL`` | Deployed is best within noise — no tuning move. |
+| ``NO_BAND_HELPS`` | Every band's benefit is sub-noise — stops are not adding edge on this corpus. |
+| ``INSUFFICIENT_DATA`` | Deployed-horizon intraperiod coverage < 30. Accumulate more post-2026-05-23 outcome rows or run ``paper_trader.ml.backfill_intraperiod`` (5d only). |
+
+**The per-cycle ledger** at ``data/stop_band_sweep_log.jsonl`` carries
+one structured row per cycle with verdict, best cell flattened to top-
+level columns, deployed-cell benefit, per-horizon coverage and baseline.
+``sweep_dark=True`` mirrors the sibling ledgers' ``*_dark`` flags — the
+corpus warm-up state where the deployed horizon's intraperiod coverage
+hasn't yet cleared ``MIN_BUYS``.
+
+---
+
 ## 2026-05-26 core HYBRID pass #43 (Agent 1) — /api/model-progress writer-contention fix
 
 ### Phase 1 — Debug: `bugs_fixed = 1`
