@@ -270,11 +270,11 @@ def cycle_spy(monkeypatch):
     calls = {"quota_alert": 0, "send": [], "killed": 0}
 
     monkeypatch.setattr(runner.reporter, "send_quota_alert",
-                        lambda detail="": calls.__setitem__("quota_alert",
+                        lambda detail="", **kwargs: calls.__setitem__("quota_alert",
                                                              calls["quota_alert"] + 1) or True)
     monkeypatch.setattr(runner.reporter, "_send",
                         lambda m: calls["send"].append(m) or True)
-    monkeypatch.setattr(runner.reporter, "send_trade_alert", lambda t: True)
+    monkeypatch.setattr(runner.reporter, "send_trade_alert", lambda *a, **k: True)
     monkeypatch.setattr(runner.reporter, "send_decision_log", lambda s: True)
     monkeypatch.setattr(runner, "_kill_stale_claude",
                         lambda: calls.__setitem__("killed", calls["killed"] + 1))
@@ -364,7 +364,7 @@ class TestCycleQuotaRecoveryUndelivered:
         calls = {"quota_alert": 0, "send": [], "send_attempts": 0}
         monkeypatch.setattr(
             runner.reporter, "send_quota_alert",
-            lambda detail="": calls.__setitem__(
+            lambda detail="", **kwargs: calls.__setitem__(
                 "quota_alert", calls["quota_alert"] + 1) or True,
         )
 
@@ -413,7 +413,8 @@ class TestCycleQuotaRecoveryUndelivered:
         contract: latch stays set, retry next cycle."""
         calls = {"send": [], "raised": 0}
         monkeypatch.setattr(
-            runner.reporter, "send_quota_alert", lambda detail="": True)
+            runner.reporter, "send_quota_alert",
+            lambda detail="", **kwargs: True)
 
         def _boom(m):
             calls["send"].append(m)
