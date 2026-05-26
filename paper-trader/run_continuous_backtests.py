@@ -187,6 +187,22 @@ STOP_OUT_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 MFE_SKILL_LOG = ROOT / "data" / "mfe_skill_log.jsonl"
 MFE_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 
+# Per-cycle multi-horizon stop-band sweep ledger. ``stop_band_sweep.analyze``
+# answers the natural extension of ``stop_out_audit``: *across a 2-D grid
+# of candidate STOP bands × horizons (5d/10d/20d), is there a (band,
+# horizon) cell that measurably beats the deployed (-8%, 5d) cell on
+# realized return?* The pass #42 author explicitly flagged this as the
+# next step after the 2026-05-26 multi-horizon intraperiod-extremes
+# feature landed — without a per-cycle ledger the verdict (CELL_BEATS_DEPLOYED
+# / DEPLOYED_OPTIMAL / NO_BAND_HELPS / INSUFFICIENT_DATA) is only available
+# via manual CLI invocation, exactly the unobservable-state the sibling
+# ledgers were built to fix. Same testability rule as the sibling skill
+# logs (module-level so tests can redirect), same best-effort discipline
+# (a ledger write must never break the loop), same atomic tmp+``.replace``
+# trim idiom every other ledger uses.
+STOP_BAND_SWEEP_LOG = ROOT / "data" / "stop_band_sweep_log.jsonl"
+STOP_BAND_SWEEP_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 # Per-cycle gate-arm historical skill ledger. ``gate_arm_historical.analyze``
 # answers the documented quant-decisive question about the conviction gate
 # arms (×0.6 / ×0.85 / ×1.0 / ×1.15 / ×1.3): *do the arms the gate actually
@@ -2584,6 +2600,121 @@ def _append_mfe_skill_log(cycle: int, win_start: date, win_end: date,
         return False
 
 
+def _append_stop_band_sweep_log(cycle: int, win_start: date, win_end: date,
+                                outcomes_path: "Path | str | None" = None
+                                ) -> bool:
+    """Append one structured row to the per-cycle multi-horizon stop-band
+    sweep ledger.
+
+    Answers, durably and per-cycle: *across a 2-D grid of candidate STOP
+    bands (3-20%) × horizons (5d/10d/20d), is there a (band, horizon)
+    cell that measurably beats the deployed (-8%, 5d) cell on realized
+    return?* This is the multi-horizon extension of the sibling
+    ``_append_stop_out_skill_log`` — the same question with a wider
+    instrumentation lens. Verdict ladder mirrors the analyzer:
+    ``INSUFFICIENT_DATA`` / ``NO_BAND_HELPS`` / ``DEPLOYED_OPTIMAL`` /
+    ``CELL_BEATS_DEPLOYED``.
+
+    Why this matters: the pass #42 author shipped the 10d/20d
+    forward_intraperiod_min/max fields specifically so a multi-horizon
+    sweep would become possible. Until this wiring landed the verdict
+    was a CLI-only one-shot — a quant could not see the moment a
+    longer-window or tighter band starts to dominate the deployed cell.
+    The ``best_cell`` keys flatten the answer to one line per cycle so
+    the trend is immediately readable (``best_stop_pct`` /
+    ``best_horizon`` / ``best_benefit_pct``).
+
+    Best-effort and idempotent-safe (the ``_append_scorer_skill_log``
+    discipline — a ledger write must NEVER break the continuous loop).
+    On any fault we still emit an honest row with ``status='error'
+    verdict='INSUFFICIENT_DATA'`` so a gap in the trend is visible, not
+    silent. Bounded growth: when the file exceeds 2× ``STOP_BAND_SWEEP_LOG_KEEP``
+    it is atomically rewritten via the tmp+``.replace`` idiom every
+    sibling ledger uses.
+
+    The ``sweep_dark`` boolean mirrors the sibling ledgers' ``*_dark``
+    flags: True when the deployed horizon's intraperiod coverage is
+    below ``MIN_BUYS`` (the documented state while the post-2026-05-23
+    intraperiod corpus is still warming up). False means the analyzer
+    actually had enough deployed-horizon data to evaluate.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        try:
+            from paper_trader.ml import stop_band_sweep as _sbs
+            rep = _sbs.analyze(outcomes_path)
+        except Exception as exc:
+            rep = {
+                "status": "error", "verdict": "INSUFFICIENT_DATA",
+                "hint": f"stop_band_sweep unavailable: {type(exc).__name__}",
+                "n_buys": 0,
+                "n_with_intraperiod_per_horizon": {},
+                "baseline_no_stop_mean_pct_per_horizon": {},
+                "best_cell": None,
+                "deployed_cell_benefit_pct": None,
+            }
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA"}
+
+        # ``sweep_dark`` is True when verdict is INSUFFICIENT_DATA — the
+        # deployed-horizon coverage hasn't yet cleared the min_buys
+        # threshold. Once enough post-2026-05-23 outcome rows accumulate
+        # the boolean flips on its own.
+        verdict = rep.get("verdict") or "INSUFFICIENT_DATA"
+        sweep_dark = (verdict == "INSUFFICIENT_DATA")
+
+        # Flatten the best cell to top-level columns — `best_cell` itself
+        # is a nested dict, but a JSONL consumer wants single-column
+        # access for `jq '.best_benefit_pct'` style queries.
+        best = rep.get("best_cell") or {}
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": verdict,
+            "deployed_stop_pct": rep.get("deployed_stop_pct"),
+            "deployed_horizon": rep.get("deployed_horizon"),
+            "deployed_cell_benefit_pct": rep.get("deployed_cell_benefit_pct"),
+            "best_stop_pct": best.get("stop_pct"),
+            "best_horizon": best.get("horizon"),
+            "best_benefit_pct": best.get("benefit_pct"),
+            "best_n_triggered": best.get("n_triggered"),
+            "best_pct_triggered": best.get("pct_triggered"),
+            "best_mean_protected_return_pct":
+                best.get("mean_protected_return_pct"),
+            "n_buys": rep.get("n_buys"),
+            "n_with_intraperiod_per_horizon":
+                rep.get("n_with_intraperiod_per_horizon"),
+            "baseline_no_stop_mean_pct_per_horizon":
+                rep.get("baseline_no_stop_mean_pct_per_horizon"),
+            "sweep_dark": sweep_dark,
+        }
+        STOP_BAND_SWEEP_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with STOP_BAND_SWEEP_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in STOP_BAND_SWEEP_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > STOP_BAND_SWEEP_LOG_KEEP * 2:
+                kept = lines[-STOP_BAND_SWEEP_LOG_KEEP:]
+                tmp = STOP_BAND_SWEEP_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(STOP_BAND_SWEEP_LOG)
+        except Exception as e:
+            print(f"[continuous] stop-band-sweep-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] stop-band-sweep-log append failed: {e}")
+        return False
+
+
 def _append_gate_arm_skill_log(cycle: int, win_start: date, win_end: date,
                                outcomes_path: "Path | str | None" = None
                                ) -> bool:
@@ -4070,6 +4201,17 @@ def main() -> None:
         # dominated by pre-feature rows. Best-effort; never breaks the
         # loop.
         _append_mfe_skill_log(cycle, win_start, win_end)
+
+        # Durable per-cycle multi-horizon stop-band sweep ledger. Sibling
+        # of ``_append_stop_out_skill_log`` with a wider lens: instead of
+        # one deployed (band, horizon) pair, it sweeps a 2-D grid of
+        # candidate STOP bands × horizons (5d/10d/20d) and emits
+        # ``CELL_BEATS_DEPLOYED`` / ``DEPLOYED_OPTIMAL`` / ``NO_BAND_HELPS``.
+        # Pass #42 (2026-05-26) added the 10d/20d intraperiod fields and
+        # explicitly flagged this sweep as the next step; until this
+        # wiring landed the verdict was CLI-only. Best-effort by
+        # construction; never breaks the loop.
+        _append_stop_band_sweep_log(cycle, win_start, win_end)
 
         # Durable per-cycle gate-arm historical skill ledger.
         # ``gate_arm_historical.analyze`` answers the documented
