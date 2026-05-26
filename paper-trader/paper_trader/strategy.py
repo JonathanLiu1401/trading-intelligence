@@ -55,6 +55,16 @@ _ml_qualify_cache: tuple[bool, str, float] | None = None
 # (decision → retry → Sonnet fallback, or this cycle's call vs. the next).
 _active_claude_proc: subprocess.Popen | None = None
 
+# Monotonic timestamp of when the most recent ``_claude_call`` subprocess was
+# launched (``time.monotonic()`` at Popen). Cleared back to None in the same
+# ``finally`` block that resets ``_active_claude_proc``. Read by
+# ``claude_call_state()`` so the operator surface (runner heartbeat) can show
+# "Opus has been thinking for N minutes" while the deadman is patient — the
+# distinguishing signal between "slow but live" and "wedged" the trader
+# otherwise has no view of. Monotonic clock (not wall-clock) so a wall-clock
+# step-back during a long call does not render a negative elapsed.
+_active_claude_started_at: float | None = None
+
 
 def is_claude_call_active() -> bool:
     """True when a `claude` subprocess this process started is still running.
@@ -75,6 +85,53 @@ def is_claude_call_active() -> bool:
         return proc.poll() is None
     except Exception:
         return False
+
+
+def claude_call_state() -> dict:
+    """Best-effort snapshot of the currently-running ``_claude_call`` (if any).
+
+    Surfaces three fields:
+      * ``active`` — bool, identical to ``is_claude_call_active()`` (same
+        ``Popen.poll() is None`` check).
+      * ``elapsed_s`` — int seconds since the in-flight subprocess was
+        launched (``time.monotonic`` baseline), or ``None`` when no call is
+        active OR the start ts was never captured.
+      * ``pid`` — process id of the in-flight subprocess, or ``None``.
+
+    The runner heartbeat consumes this so the operator can distinguish
+    "Opus has been thinking for 4 minutes" (healthy, indefinite-timeout
+    decision in progress) from "engine is wedged" (no active call, just a
+    stale ``secs_since_last_decision``). Under ``DECISION_TIMEOUT_S = None``
+    those two states are otherwise indistinguishable from outside.
+
+    Pure read of module globals — never raises, safe from any thread (the
+    dashboard reads it from its request thread). Mirrors the discipline of
+    ``runner.singleton_lock_state`` / ``runner.alarm_latch_state``.
+    """
+    proc = _active_claude_proc
+    started = _active_claude_started_at
+    active = False
+    pid: int | None = None
+    if proc is not None:
+        try:
+            active = proc.poll() is None
+        except Exception:
+            active = False
+        try:
+            pid = int(proc.pid) if active else None
+        except Exception:
+            pid = None
+    elapsed_s: int | None = None
+    if active and started is not None:
+        try:
+            elapsed_s = max(0, int(time.monotonic() - started))
+        except Exception:
+            elapsed_s = None
+    return {
+        "active": active,
+        "elapsed_s": elapsed_s,
+        "pid": pid,
+    }
 
 # Set True by _claude_call when the CLI rejects an attempt with a quota /
 # usage-limit error (a *distinct* failure from a timeout or a parse miss — it
@@ -607,7 +664,8 @@ def _format_quant_signals(sigs: dict[str, dict]) -> str:
 
 def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
                  model: str = MODEL) -> str | None:
-    global _active_claude_proc, _quota_exhausted, _last_claude_fail
+    global _active_claude_proc, _active_claude_started_at
+    global _quota_exhausted, _last_claude_fail
     # Reset per-call so a success after a failure cannot leak the stale code
     # into the next cycle's diagnostic reason text.
     _last_claude_fail = None
@@ -625,6 +683,7 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
         except Exception as e:
             print(f"[strategy] failed killing stale claude proc: {e}")
     _active_claude_proc = None
+    _active_claude_started_at = None
     try:
         proc = subprocess.Popen(
             ["claude", "--model", model, "--print",
@@ -635,6 +694,7 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
             text=True,
         )
         _active_claude_proc = proc
+        _active_claude_started_at = time.monotonic()
         try:
             stdout, stderr = proc.communicate(input=prompt, timeout=timeout_s)
         except subprocess.TimeoutExpired:
@@ -648,6 +708,7 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
             return None
         finally:
             _active_claude_proc = None
+            _active_claude_started_at = None
         if proc.returncode != 0:
             # The claude CLI frequently exits non-zero with an EMPTY stderr and
             # the real error written to stdout, which produced useless blank
@@ -679,6 +740,7 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
     except Exception as e:
         print(f"[strategy] claude exception: {e}")
         _active_claude_proc = None
+        _active_claude_started_at = None
         _last_claude_fail = "exception"
         return None
 
