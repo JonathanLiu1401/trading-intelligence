@@ -14445,6 +14445,21 @@ def runner_heartbeat_api():
                 hb["latches"] = latches
         except Exception:
             pass
+        # Additive: live ``claude`` call state. With ``DECISION_TIMEOUT_S=None``
+        # a healthy Opus call can legitimately run for minutes; a trader looking
+        # at the bare ``secs_since_last_decision`` cannot tell "Opus is thinking"
+        # (good, indefinite-timeout decision in progress) from "engine wedged"
+        # (no active call). ``strategy.claude_call_state()`` answers exactly that
+        # — pure read of process-local globals tracking the in-flight Popen +
+        # its monotonic start ts. Same additive pattern as latches /
+        # singleton_lock / notify above: any fault degrades to no block.
+        try:
+            from . import strategy as _strategy
+            ccs = _strategy.claude_call_state()
+            if isinstance(ccs, dict):
+                hb["claude_call"] = ccs
+        except Exception:
+            pass
         return jsonify(hb)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
