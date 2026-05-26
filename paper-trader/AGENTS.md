@@ -6,6 +6,111 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-26 core HYBRID pass #44 (Agent 1) — `claude_call` heartbeat field + test_quota_guard mock fix
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=2
+
+### Phase 1 — test_quota_guard mocks were stale after the `store=` kwarg landed
+
+`runner._cycle` now calls `reporter.send_quota_alert(detail, store=get_store())`
+(operator alarm body carries a one-line snapshot of the unattended book).
+The test fixtures in `tests/test_quota_guard.py` still mocked the function
+with `lambda detail=""` — 7 tests failed with
+`TypeError: <lambda>() got an unexpected keyword argument 'store'` because
+the new kwarg blew through. Same mock pattern in two places:
+
+- `cycle_spy` fixture (`test_quota_guard.py:272-274`) — used by 4 tests.
+- `TestCycleQuotaRecoveryUndelivered._fixture` (`:364-368`) — used by 3 tests.
+
+Fix is the same forward-compatible `lambda detail="", **kwargs: …` shape the
+file already uses for `send_trade_alert` (`lambda *a, **k: True`). Also
+upgraded `send_trade_alert` mock from `lambda t:` to `lambda *a, **k:` so the
+post-trade snapshot/store kwargs don't break that path either. All 29
+quota-guard tests pass; full `tests/test_core_*` + `tests/test_runner_heartbeat*`
++ `tests/test_quota_guard.py` regression (941 tests) green.
+
+### Phase 2 — `claude_call` block on `/api/runner-heartbeat`: distinguish thinking from wedged
+
+Under `DECISION_TIMEOUT_S = None` (commit `82bb195`, "remove all Opus
+timeouts — wait indefinitely for model response") a healthy decision can
+legitimately run for minutes. From the heartbeat the operator only sees
+`secs_since_last_decision` rising — they cannot tell **"Opus is currently
+thinking"** (good, indefinite-timeout decision in progress) from
+**"engine is wedged"** (no active subprocess, just a stale cadence
+counter). Those two states are otherwise indistinguishable from outside
+the process under indefinite timeouts.
+
+The runner's git-watcher deadman already uses `strategy.is_claude_call_active()`
+for exactly this distinction — it defers force-exit while a call is in
+flight (`runner._deferred_restart_overdue(call_active=True)` short-circuits
+to False). This surfaces the *same* signal to the dashboard.
+
+Wiring:
+
+- `strategy._active_claude_started_at: float | None` — monotonic timestamp
+  set after `subprocess.Popen` in `_claude_call`, cleared in the same
+  `finally` that resets `_active_claude_proc`. Cleared on the exception
+  path too. Monotonic clock (not wall-clock) so a wall-clock step-back
+  during a long call cannot render a negative elapsed.
+- `strategy.claude_call_state() -> dict` — returns
+  `{active: bool, elapsed_s: int|None, pid: int|None}`. `active` is the
+  same `Popen.poll() is None` predicate as `is_claude_call_active()`.
+  Pure read of process-local globals, never raises (mirrors the
+  discipline of `runner.singleton_lock_state` / `alarm_latch_state`).
+- `runner_heartbeat_api` appends `hb["claude_call"] = ccs` in the same
+  additive style as `latches` / `singleton_lock` / `notify`: any fault
+  (e.g. import error from a stale runtime) degrades to "no block on this
+  payload", never an exception out of the endpoint.
+- `is_claude_call_active()` is left byte-compatible (the deadman calls
+  it by name; the boolean contract is locked by tests).
+
+12 new tests in `tests/test_claude_call_state.py` cover:
+- inactive / exited / active state transitions
+- elapsed-None hardening (missing start ts) + future-ts clamp to 0
+- poll-exception degrade to inactive
+- legacy `is_claude_call_active` unchanged
+- 3 `/api/runner-heartbeat` integration tests (idle, thinking, fault)
+
+### Phase 3 — live user findings (2026-05-26 07:47 ET probe)
+
+1. **Live process running stale code (boot_sha 960065f, 2 commits behind
+   HEAD cc5f3f6).** `/api/desk-pulse` correctly surfaces this. The
+   git-watcher will detect on its next 180s tick and schedule a deferred
+   restart between cycles (deadman force-exits if still unhonored after
+   `RESTART_GRACE_S = 600`). No operator action needed — the system
+   self-heals.
+2. **NO_DECISION rate 30-45% in recent 50-cycle windows, dominant cause
+   `cli_nonzero_rc` (68%) per `/api/no-decision-reasons`.** This is an
+   upstream Claude API stability issue — the `cli_nonzero_rc` headline
+   correctly tells the operator that restarting the runner does NOT fix
+   it. Not a code bug; a real upstream regime. The new `claude_call`
+   block (this pass) makes the in-flight state visible *during* such
+   storms so a single bad call no longer hides behind a stale cadence
+   counter.
+
+### Phase 4 — run
+
+```
+cd /home/zeph/trading-intelligence/paper-trader
+# Live trader
+python3 -m paper_trader.runner
+# Focused tests (~30-100s)
+python3 -m pytest tests/test_core_strategy.py tests/test_core_runner_cycle.py \
+                  tests/test_core_reporter.py tests/test_claude_call_state.py \
+                  tests/test_quota_guard.py tests/test_runner_heartbeat.py -v
+```
+
+Probe the new heartbeat field once the runner is restarted on new code:
+
+```
+curl -s http://localhost:8090/api/runner-heartbeat | \
+  python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('claude_call'))"
+# → {"active": false, "elapsed_s": null, "pid": null} when idle
+# → {"active": true,  "elapsed_s": 142,  "pid": 12345}  when Opus is thinking
+```
+
+---
+
 ## 2026-05-26 ML+backtest HYBRID pass #43 (Agent 2) — sector mapping fix + multi-horizon stop-band sweep
 
 ### Phase 1 — Debug: `bugs_fixed = 1`
