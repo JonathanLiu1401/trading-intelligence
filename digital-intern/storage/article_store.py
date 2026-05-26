@@ -1298,6 +1298,53 @@ class ArticleStore:
             for r in rows
         ]
 
+    def prefloor_pseudo_articles(
+        self, batch: list[dict]
+    ) -> tuple[list[dict], int]:
+        """Pre-floor quote-widget / recap-template pseudo-articles BEFORE scoring.
+
+        Partitions ``batch`` into (real, pseudo). Pseudo-articles get
+        ``ml_score=0.01``, ``urgency=0``, ``score_source='ml'`` via
+        ``update_ml_scores_batch`` so they exit the unscored queue but never
+        warrant urgency=1 regardless of what the urgency head would predict.
+        Returns ``(real_articles, n_pre_floored)``.
+
+        Single source of truth for the ML-path pre-floor, called by:
+          * ``score_pending`` — the one-shot in-store inference driver
+          * ``daemon.scorer_worker`` — the production worker loop
+
+        Without this defense on the daemon worker path, a 48h audit
+        (2026-05-26) found 10 ML-confident quote-widget / recap-template rows
+        reached ``urgency=2`` (alerted state). The alert gates caught them
+        before Discord push, but only after polluting urgent_queue_health and
+        burning alert worker cycles. Mirrors the LLM-path pre-floor in
+        ``watchers.urgency_scorer.score_batch``.
+
+        Lazy import: ``watchers.alert_agent → ml.features``; no cycle back into
+        storage.
+        """
+        from watchers.alert_agent import (
+            _looks_like_quote_widget,
+            _looks_like_recap_template,
+        )
+        pre_floor: list[tuple[str, float, int]] = []
+        real: list[dict] = []
+        for art in batch:
+            aid = art.get("_id")
+            if not aid:
+                continue
+            if _looks_like_quote_widget(art):
+                pre_floor.append((aid, 0.01, 0))
+                continue
+            hit, _name = _looks_like_recap_template(art)
+            if hit:
+                pre_floor.append((aid, 0.01, 0))
+                continue
+            real.append(art)
+        if pre_floor:
+            self.update_ml_scores_batch(pre_floor)
+        return real, len(pre_floor)
+
     def score_pending(self, batch_size: int = 500) -> int:
         """Run ML inference on all unscored articles. Returns count scored.
         Non-blocking: if another caller already holds the inference lock, returns 0."""
@@ -1307,26 +1354,6 @@ class ArticleStore:
         try:
             # Lazy import to avoid circular imports at module load
             from ml.inference import score_articles
-            # Single source of truth for the recap-template / quote-widget
-            # fingerprint set. Live evidence (2026-05-24): "NVIDIA earnings:
-            # A quick glance at key metrics - MSN" (matches _RT_QUICK_GLANCE)
-            # reached urgency=2 with score_source='ml' and ml_score=10.0 —
-            # the recap-template pre-floor in urgency_scorer.score_batch
-            # catches this title on the Sonnet path, but ML-confident urgent
-            # rows (needs_llm=False, sc.urgency >= 8) bypass that gate and
-            # set urgency=1 directly here. Mirror the same pre-floor on the
-            # ML path so the analyst's standalone urgent push channel and
-            # the urgent-queue health metrics aren't polluted by the same
-            # class of pseudo-articles the LLM path already suppresses.
-            # Lazy import: watchers.alert_agent → ml.features → no cycle
-            # back into storage. Floor value 0.01 + score_source='ml'
-            # mirrors urgency_scorer's pre-floor semantics (it writes
-            # ai_score=0.01 score_source='llm' on the LLM path — the model
-            # equivalent is ml_score=0.01 score_source='ml').
-            from watchers.alert_agent import (
-                _looks_like_quote_widget,
-                _looks_like_recap_template,
-            )
             while True:
                 batch = self.get_unscored(limit=batch_size, min_kw=0.0)
                 if not batch:
@@ -1336,23 +1363,9 @@ class ArticleStore:
                 # BEFORE inference. They never warrant urgency=1 regardless
                 # of what the urgency head predicts, and skipping inference
                 # also saves GPU cycles on rows that would just be floored.
-                pre_floor: list[tuple[str, float, int]] = []
-                real_batch: list = []
-                for art in batch:
-                    aid = art.get("_id")
-                    if not aid:
-                        continue
-                    if _looks_like_quote_widget(art):
-                        pre_floor.append((aid, 0.01, 0))
-                        continue
-                    hit, _name = _looks_like_recap_template(art)
-                    if hit:
-                        pre_floor.append((aid, 0.01, 0))
-                        continue
-                    real_batch.append(art)
-                if pre_floor:
-                    self.update_ml_scores_batch(pre_floor)
-                    total += len(pre_floor)
+                real_batch, n_pre_floored = self.prefloor_pseudo_articles(batch)
+                if n_pre_floored:
+                    total += n_pre_floored
 
                 if not real_batch:
                     # The whole batch was pseudo-articles; the rows are now
