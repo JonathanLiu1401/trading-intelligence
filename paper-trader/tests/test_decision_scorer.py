@@ -1097,6 +1097,60 @@ class TestSectorMapping:
         assert f_lrcx[-1] == 0.0
         assert f_nvda[-1] == 0.0
 
+    def test_2026_05_26_watchlist_additions_classified(self):
+        """Pin the 34 watchlist tickers added in the 2026-05-26 backtest.py
+        diff (power semis, AI infra, quantum, space/eVTOL, AI software,
+        medical robotics, nuclear small-caps) so a future reviewer who
+        drops the SECTOR_MAP / INTENTIONALLY_OTHER additions reverts to
+        the regression captured by ``test_watchlist_coverage`` immediately.
+
+        Mirrors the spirit of ``test_specific_high_value_mappings`` for
+        an earlier batch — picks one representative ticker per category."""
+        from paper_trader.ml.decision_scorer import INTENTIONALLY_OTHER
+        # Power-semis / RF — same family as NVDA/AMD/MU.
+        assert SECTOR_MAP["WOLF"] == "tech"
+        assert SECTOR_MAP["MPWR"] == "tech"
+        # AI infra / accelerators / EDA / semi-test.
+        assert SECTOR_MAP["AVGO"] == "tech"
+        assert SECTOR_MAP["SNPS"] == "tech"
+        # Quantum compute — growth-tech tape.
+        assert SECTOR_MAP["IONQ"] == "tech"
+        assert SECTOR_MAP["QUBT"] == "tech"
+        # AI software / next-gen comms — growth-tech tape.
+        assert SECTOR_MAP["SOUN"] == "tech"
+        assert SECTOR_MAP["ASTS"] == "tech"
+        # Space / eVTOL — high-beta speculative growth, ARKK/RIVN bucket.
+        assert SECTOR_MAP["RKLB"] == "tech"
+        assert SECTOR_MAP["JOBY"] == "tech"
+        # 2x NVDA leveraged — same NVDU pattern.
+        assert SECTOR_MAP["NVDX"] == "tech"
+        # Medical AI / surgical robotics — healthcare bucket.
+        assert SECTOR_MAP["BFLY"] == "healthcare"
+        assert SECTOR_MAP["PRCT"] == "healthcare"
+        # Nuclear small-caps — INTENTIONALLY_OTHER (no utility / energy fit).
+        assert "OKLO" in INTENTIONALLY_OTHER
+        assert "NNE" in INTENTIONALLY_OTHER
+
+    def test_2026_05_26_additions_dont_break_other_invariants(self):
+        """build_features for a newly-mapped tech name (RKLB — speculative
+        space) must emit the same sector one-hot as NVDA (both 'tech'),
+        and a newly-mapped healthcare name (BFLY) must match LLY's. Pins
+        the end-to-end encoding invariant for the new batch."""
+        common = dict(ml_score=1.0, rsi=50.0, macd=0.0, mom5=0.0,
+                      mom20=0.0, regime_mult=1.0)
+        sector_idx_start = 10
+        f_rklb = build_features(ticker="RKLB", **common)[sector_idx_start:]
+        f_nvda = build_features(ticker="NVDA", **common)[sector_idx_start:]
+        f_bfly = build_features(ticker="BFLY", **common)[sector_idx_start:]
+        f_lly = build_features(ticker="LLY", **common)[sector_idx_start:]
+        f_oklo = build_features(ticker="OKLO", **common)[sector_idx_start:]
+        # RKLB must match NVDA (both tech), not collapse to sector_other.
+        assert f_rklb == f_nvda
+        # BFLY must match LLY (both healthcare).
+        assert f_bfly == f_lly
+        # OKLO (INTENTIONALLY_OTHER) must land in sector_other (last slot).
+        assert f_oklo[-1] == 1.0
+
 
 # ──────────────────── anti-overfit MLP config (2026-05-18) ────────────────────
 

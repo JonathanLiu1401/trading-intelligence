@@ -87,6 +87,41 @@ SECTOR_MAP: dict[str, str] = {
     # opposite direction). Same pattern existing SOXS/TECS/FNGD already follow.
     "SQQQ": "tech", "SPXS": "tech", "SDOW": "tech", "SRTY": "tech",
     "TZA": "tech", "HIBS": "tech",
+    # Tech: power semis / GaN / SiC / RF semis — same fundamental driver as
+    # NVDA/AMD/MU (silicon cycle, semi-equipment capex). WOLF (Wolfspeed SiC),
+    # MPWR (Monolithic Power), STM (STMicro), NVTS (Navitas), MCHP (Microchip),
+    # AMBA (Ambarella vision SoC), SWKS/QRVO (RF semis).
+    "NVTS": "tech", "MPWR": "tech", "WOLF": "tech", "STM": "tech",
+    "MCHP": "tech", "AMBA": "tech", "SWKS": "tech", "QRVO": "tech",
+    # Tech: AI infrastructure / accelerators / EDA / semi-test — same family
+    # as the deployed NVDA/AMD bucket. SMCI (AI servers), AVGO (Broadcom AI
+    # silicon), ARM, MRVL (Marvell DPU), CDNS/SNPS (EDA), AEHR/COHU (semi
+    # test equipment, group with LITE/AMAT/LRCX).
+    "SMCI": "tech", "AVGO": "tech", "ARM": "tech", "MRVL": "tech",
+    "CDNS": "tech", "SNPS": "tech", "AEHR": "tech", "COHU": "tech",
+    # Tech: quantum compute — speculative growth-tech tape, same momentum-name
+    # bucket as ARKK/PLTR/RIVN. IONQ, RGTI (Rigetti), QUBT (Quantum Computing
+    # Inc), ARQQ (Arqit), QMCO (Quantum Corp data tape — quantum-adjacent).
+    "IONQ": "tech", "RGTI": "tech", "QUBT": "tech", "ARQQ": "tech",
+    "QMCO": "tech",
+    # Tech: AI software / voice / next-gen comms — same growth-tech tape.
+    # SOUN (SoundHound voice AI), BBAI (BigBear AI defense analytics), ASTS
+    # (AST SpaceMobile direct-to-cell satellite), and the legacy AST listing
+    # which is the same underlying — both trade with the satellite-comms tape.
+    "SOUN": "tech", "BBAI": "tech", "ASTS": "tech", "AST": "tech",
+    # Tech: space launch / eVTOL autonomy — high-beta growth-tech speculative
+    # names, same tape as ARKK / RIVN / NIO. RKLB (Rocket Lab), LUNR
+    # (Intuitive Machines lunar lander), ACHR (Archer Aviation eVTOL),
+    # JOBY (Joby Aviation eVTOL).
+    "RKLB": "tech", "LUNR": "tech", "ACHR": "tech", "JOBY": "tech",
+    # Tech: single-stock 2x leveraged NVDA — same NVDU pattern (NVDX is the
+    # second 2x-NVDA-leveraged ETF, mirroring the existing AAPLU/SMCI2X/PLTU
+    # placement).
+    "NVDX": "tech",
+    # Healthcare: medical AI / surgical robotics — clearly healthcare-tape.
+    # BFLY (Butterfly Network hand-held ultrasound), PRCT (Procept BioRobotics
+    # surgical waterjet). Same bucket as LLY/UNH/NVO.
+    "BFLY": "healthcare", "PRCT": "healthcare",
     # Energy
     "XOM": "energy", "CVX": "energy", "XLE": "energy", "USO": "energy", "UNG": "energy",
     "BOIL": "energy", "UCO": "energy", "BP": "energy",
@@ -127,6 +162,11 @@ INTENTIONALLY_OTHER: frozenset[str] = frozenset({
     "DFEN",     # defense 3x — no defense sector (XLI route)
     "UTSL",     # utilities 3x — no utilities sector
     "XLI",      # industrials sector ETF itself — no industrials enum
+    # Nuclear small-caps — they trade like utility-adjacent / spec-energy
+    # hybrids and do NOT co-vary with the XOM/CVX oil&gas bucket; routing
+    # them to "energy" would mis-couple. No utility sector enum either, so
+    # honestly "other" is the right bucket (the same logic UTSL already follows).
+    "OKLO", "NNE",
 })
 
 N_FEATURES = 10 + len(SECTORS) + 3  # 10 base + 7 sector one-hot + 3 enhanced MACD = 20
