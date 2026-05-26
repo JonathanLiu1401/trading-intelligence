@@ -4344,6 +4344,131 @@ def _rotation_skill_chat_lines(rep: Any) -> list[str]:
     return lines
 
 
+def _sentiment_reversal_chat_lines(rep: Any) -> list[str]:
+    """Render ``/api/sentiment-reversal`` as compact chat-context lines.
+
+    The native DI companion to NEWS SECTOR PULSE / NEWS SECTOR COHERENCE —
+    those answer "where is the wire concentrated" and "do the lit sectors
+    agree on direction"; this one answers the per-TICKER directional-flip
+    question neither of them can: which tickers' avg ml_score has just
+    *changed sign* (pos→neg or neg→pos) between the prior 2h window and the
+    current 2h window, with both windows carrying enough articles to make
+    the flip more than noise?
+
+    A sentiment flip is materially different from a high score or a high
+    urgency — those are LEVELS; a flip is a DIRECTIONAL change in the wire's
+    own consensus, and the most actionable read on a position that has been
+    sitting on a thesis the news has now turned against (or toward).
+
+    Pure / total — the ``_sector_coherence_chat_lines`` contract:
+
+    - non-dict / missing ``reversals`` → ``[]`` (silence)
+    - zero reversals → ``[]`` (silence — never chat filler when the windows
+      agree)
+    - any reversals → headline ("N ticker(s) flipped sentiment in the last
+      2h") plus up to ``_SENTIMENT_REVERSAL_TOP_SHOWN`` per-ticker lines
+      verbatim from the builder's own ``reversals`` list (direction, prev
+      avg → curr avg, article counts)
+    """
+    if not isinstance(rep, dict):
+        return []
+    reversals = rep.get("reversals")
+    if not isinstance(reversals, list) or not reversals:
+        return []
+    n = len(reversals)
+    window_h = rep.get("window_hours")
+    win_s = f" {int(window_h)}h" if isinstance(window_h, (int, float)) else ""
+    lines: list[str] = [
+        f"{n} ticker(s) flipped sentiment in the last{win_s} window "
+        f"(prev → curr avg ml_score sign change, both windows ≥ "
+        f"{rep.get('min_articles_per_window', 2)} articles)."
+    ]
+    for r in reversals[:_SENTIMENT_REVERSAL_TOP_SHOWN]:
+        if not isinstance(r, dict):
+            continue
+        ticker = r.get("ticker") or "?"
+        direction = r.get("direction") or "?"
+        try:
+            ap = float(r.get("avg_prev"))
+            ac = float(r.get("avg_curr"))
+            d = float(r.get("delta"))
+        except (TypeError, ValueError):
+            continue
+        n_prev = r.get("articles_prev") or 0
+        n_curr = r.get("articles_curr") or 0
+        lines.append(
+            f"  {ticker} {direction}: prev {ap:+.2f}({n_prev}art) → "
+            f"curr {ac:+.2f}({n_curr}art) Δ{d:+.2f}"
+        )
+    return lines
+
+
+_SENTIMENT_REVERSAL_TOP_SHOWN = 6
+
+
+def _ticker_score_dispersion_chat_lines(rep: Any) -> list[str]:
+    """Render ``/api/ticker-score-dispersion`` as compact chat-context lines.
+
+    Complements ``_sentiment_reversal_chat_lines``: reversal asks "did the
+    direction flip across 2h windows?" (cross-window), this one asks "are
+    the articles WITHIN the current window agreeing or disagreeing on this
+    ticker?" (intra-window). A ticker with five articles all scoring 7.5–8.0
+    is consensus; a ticker with the same mean spread 1.0–9.5 is contested —
+    structurally different signals, identical to every other surface.
+
+    Pure / total — the ``_sentiment_reversal_chat_lines`` contract:
+
+    - non-dict → ``[]`` (silence)
+    - verdict in {NO_DATA, NO_DISPERSION, CONSENSUS} → ``[]`` (silence — a
+      consensus wire is the silence precedent; nothing actionable)
+    - verdict MIXED_BOOK / CONFLICTED_NEWS → headline + per-ticker lines
+      restricted to MIXED/CONFLICTED entries (TIGHT entries collapse from the
+      detail block — same rule as the helper-wide silence: only surface the
+      actionable rows)
+    """
+    if not isinstance(rep, dict):
+        return []
+    verdict = rep.get("verdict")
+    if verdict not in ("MIXED_BOOK", "CONFLICTED_NEWS"):
+        return []
+    tickers = rep.get("tickers")
+    if not isinstance(tickers, list) or not tickers:
+        return []
+    n_conf = rep.get("n_conflicted") or 0
+    n_mix = rep.get("n_mixed") or 0
+    window_h = rep.get("window_hours") or "?"
+    lines: list[str] = [
+        f"Ticker-score dispersion {verdict} over {window_h}h: "
+        f"{int(n_conf)} CONFLICTED / {int(n_mix)} MIXED "
+        f"(tight std ≤ {rep.get('tight_std_threshold')}, "
+        f"conflicted std > {rep.get('conflicted_std_threshold')})."
+    ]
+    shown = 0
+    for r in tickers:
+        if not isinstance(r, dict):
+            continue
+        v = r.get("verdict")
+        if v not in ("CONFLICTED", "MIXED"):
+            continue
+        try:
+            mean = float(r.get("mean"))
+            std = float(r.get("std"))
+            lo = float(r.get("min"))
+            hi = float(r.get("max"))
+        except (TypeError, ValueError):
+            continue
+        ticker = r.get("ticker") or "?"
+        n = r.get("n") or 0
+        lines.append(
+            f"  {ticker} {v}: n={int(n)} mean {mean:+.2f} std {std:.2f} "
+            f"range [{lo:+.2f}, {hi:+.2f}]"
+        )
+        shown += 1
+        if shown >= 8:
+            break
+    return lines
+
+
 _PORTFOLIO_SIGNALS_MAX_HEADLINES = 5
 
 
@@ -5278,6 +5403,95 @@ def create_app(store=None) -> Flask:
             return jsonify(build_sector_coherence(arts, window_hours=hours))
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
+    @app.get("/api/sentiment-reversal")
+    def api_sentiment_reversal():
+        """Per-ticker sentiment-flip detector across two consecutive 2h windows.
+
+        Identifies tickers whose average ml_score has crossed sign
+        (positive → negative or vice versa) between PREV [4h, 2h ago) and
+        CURR [2h ago, now), with both windows carrying at least
+        ``MIN_ARTICLES`` mentions so the flip is more than single-article
+        noise. Read counterpart: NEWS SECTOR PULSE / COHERENCE answer the
+        sector-level question; this is the per-ticker directional-change
+        view neither of them can compose.
+
+        Pure builder lives in ``analytics.sentiment_reversal`` and is
+        unit-tested independently of the DB. Honours ``_LIVE_ONLY_SQL`` —
+        backtest-injected rows are excluded. Observational only.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        from analytics.sentiment_reversal import (
+            build_sentiment_reversal,
+            FETCH_LIMIT,
+            WINDOW_HOURS,
+        )
+        now = datetime.now(timezone.utc)
+        # Same cutoff/limit as the CLI snapshot writer — bounded by the
+        # 4h prev-window so a single fetch covers both windows.
+        cutoff = (now - timedelta(hours=WINDOW_HOURS * 2)).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT first_seen, title, ml_score FROM articles "
+                f"WHERE {_LIVE_ONLY_SQL} "
+                "AND ml_score IS NOT NULL "
+                "AND first_seen >= ? "
+                "ORDER BY first_seen DESC LIMIT ?",
+                (cutoff, FETCH_LIMIT),
+            )
+        except sqlite3.Error:
+            rows = []
+        articles = [
+            {"first_seen": r[0], "title": r[1], "ml_score": r[2]}
+            for r in rows
+        ]
+        return jsonify(build_sentiment_reversal(articles, now=now))
+
+    @app.get("/api/ticker-score-dispersion")
+    def api_ticker_score_dispersion():
+        """Per-ticker intra-window score dispersion — are the articles on
+        each ticker agreeing or disagreeing on the score within the current
+        window?
+
+        Complements ``/api/sentiment-reversal`` (cross-window directional
+        flip) by surfacing the WITHIN-window consensus axis: a ticker with
+        five articles all scoring 7.5–8.0 is consensus-bullish; a ticker
+        with the same mean spread 1.0–9.5 is contested. Pure builder lives
+        in ``analytics.ticker_score_dispersion`` and is unit-tested
+        independently of the DB. ``?hours=`` clamped 1..168 (default 24).
+        Honours ``_LIVE_ONLY_SQL``. Observational only.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            hours = int(request.args.get("hours", 24))
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(168, hours))
+        from analytics.ticker_score_dispersion import (
+            build_ticker_score_dispersion,
+            FETCH_LIMIT,
+        )
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(hours=hours)).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT first_seen, title, ml_score FROM articles "
+                f"WHERE {_LIVE_ONLY_SQL} "
+                "AND ml_score IS NOT NULL "
+                "AND first_seen >= ? "
+                "ORDER BY first_seen DESC LIMIT ?",
+                (cutoff, FETCH_LIMIT),
+            )
+        except sqlite3.Error:
+            rows = []
+        articles = [
+            {"first_seen": r[0], "title": r[1], "ml_score": r[2]}
+            for r in rows
+        ]
+        return jsonify(build_ticker_score_dispersion(
+            articles, window_hours=hours, now=now))
 
     @app.get("/api/portfolio-signals")
     def api_portfolio_signals():
@@ -7045,6 +7259,86 @@ def create_app(store=None) -> Flask:
         except Exception as e:  # noqa: BLE001 — never sink the chat
             _logger().warning("chat: sector-pulse fetch failed: %s", e)
 
+        # Native sentiment-reversal block — per-ticker avg ml_score
+        # sign-flip across two consecutive 2h windows. The directional
+        # counterpart to PULSE/COHERENCE (those answer sector-level
+        # questions) and the cross-window counterpart to dispersion below
+        # (which answers the intra-window consensus question). Pure DI
+        # surface (no :8090 cross-fetch); honours _LIVE_ONLY_SQL. Block
+        # collapses to silence when zero reversals are detected — never
+        # chat filler when both windows agree.
+        sentiment_reversal_block = ""
+        try:
+            from analytics.sentiment_reversal import (
+                build_sentiment_reversal,
+                FETCH_LIMIT as _SR_LIMIT,
+                WINDOW_HOURS as _SR_WIN,
+            )
+            sr_now = datetime.now(timezone.utc)
+            sr_since = (
+                sr_now - timedelta(hours=_SR_WIN * 2)
+            ).isoformat()
+            sr_rows = _ro_query(
+                "SELECT first_seen, title, ml_score FROM articles "
+                "WHERE first_seen >= ? "
+                "AND url NOT LIKE 'backtest://%' "
+                "AND source NOT LIKE 'backtest_%' "
+                "AND source NOT LIKE 'opus_annotation%' "
+                "AND ml_score IS NOT NULL "
+                "ORDER BY first_seen DESC LIMIT ?",
+                (sr_since, _SR_LIMIT),
+            )
+            sr_arts = [
+                {"first_seen": r[0], "title": r[1], "ml_score": r[2]}
+                for r in sr_rows
+            ]
+            sr = build_sentiment_reversal(sr_arts, now=sr_now)
+            sentiment_reversal_block = "\n".join(
+                _sentiment_reversal_chat_lines(sr))
+        except Exception as e:  # noqa: BLE001 — never sink the chat
+            _logger().warning(
+                "chat: sentiment-reversal build failed: %s", e)
+
+        # Native ticker-score-dispersion block — per-ticker intra-window
+        # std-dev of ml_score over the last 24h. Companion to
+        # sentiment-reversal: reversal asks "did the direction flip
+        # across windows?"; dispersion asks "are the articles within the
+        # current window AGREEING or DISAGREEING on the score?". A
+        # CONFLICTED ticker has news pulling in two directions at once —
+        # opposite read of a TIGHT consensus, identical to every other
+        # surface that only carries the mean. Block fires ONLY on
+        # MIXED_BOOK / CONFLICTED_NEWS — CONSENSUS / NO_DATA collapse to
+        # silence (never filler when the wire is consistent).
+        ticker_score_dispersion_block = ""
+        try:
+            from analytics.ticker_score_dispersion import (
+                build_ticker_score_dispersion,
+                FETCH_LIMIT as _DISP_LIMIT,
+            )
+            disp_now = datetime.now(timezone.utc)
+            disp_since = (disp_now - timedelta(hours=24)).isoformat()
+            disp_rows = _ro_query(
+                "SELECT first_seen, title, ml_score FROM articles "
+                "WHERE first_seen >= ? "
+                "AND url NOT LIKE 'backtest://%' "
+                "AND source NOT LIKE 'backtest_%' "
+                "AND source NOT LIKE 'opus_annotation%' "
+                "AND ml_score IS NOT NULL "
+                "ORDER BY first_seen DESC LIMIT ?",
+                (disp_since, _DISP_LIMIT),
+            )
+            disp_arts = [
+                {"first_seen": r[0], "title": r[1], "ml_score": r[2]}
+                for r in disp_rows
+            ]
+            disp = build_ticker_score_dispersion(
+                disp_arts, window_hours=24, now=disp_now)
+            ticker_score_dispersion_block = "\n".join(
+                _ticker_score_dispersion_chat_lines(disp))
+        except Exception as e:  # noqa: BLE001 — never sink the chat
+            _logger().warning(
+                "chat: ticker-score-dispersion build failed: %s", e)
+
         # Portfolio snapshot
         portfolio = _read_json(BASE_DIR / "data" / "portfolio_pl.json") or {}
 
@@ -8646,6 +8940,8 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER OPTIONS GREEKS (Black-Scholes, live IV):\n{greeks_block}\n\n" if greeks_block else "")
             + (f"NEWS SECTOR PULSE (native — where the wire is concentrated right now, recency-weighted, last 24h; independent of the price heatmap below so it survives a stale/down paper-trader):\n{sector_pulse_block}\n\n" if sector_pulse_block else "")
             + (f"NEWS SECTOR COHERENCE (per-sector bullish/bearish stance dispersion across the same 24h wire — the companion to PULSE that answers the structural question PULSE cannot: is the concentration a MACRO STORY all agreeing on direction (sector-wide positioning is the trade) or IDIOSYNCRATIC catalysts pulling in different directions (sector-wide positioning is the wrong move, name-level only)? Surfaced ONLY when at least one sector reaches MACRO_BULL / MACRO_BEAR / TILT_BULL / TILT_BEAR; SPLIT / INSUFFICIENT / no-news collapses to silence. Headline + per-sector verdict carry verbatim from the builder — restate, never re-derive):\n{sector_coherence_block}\n\n" if sector_coherence_block else "")
+            + (f"NEWS SENTIMENT REVERSAL (native — per-ticker avg ml_score sign-flip between consecutive 2h windows (PREV [4h, 2h ago) → CURR [2h ago, now)). The directional-change view PULSE/COHERENCE cannot compose: those answer the SECTOR-level question, this answers the per-TICKER question 'which positions have just had the news turn against (or toward) the thesis?'. Both windows are gated to ≥ MIN_ARTICLES articles so single-row noise can't fire a flip. Surfaced ONLY when at least one reversal qualifies; zero-reversal windows collapse to silence — never chat filler when the wire is directionally stable. Per-ticker direction + prev → curr means + article counts carry verbatim from the builder — restate, never re-derive):\n{sentiment_reversal_block}\n\n" if sentiment_reversal_block else "")
+            + (f"NEWS TICKER-SCORE DISPERSION (native — per-ticker intra-window std-dev of ml_score over the last 24h. The within-window consensus companion to SENTIMENT REVERSAL: reversal asks 'did the direction flip across windows?'; dispersion asks 'are the articles WITHIN the current window AGREEING or DISAGREEING on this ticker?'. A ticker with five articles all scoring 7.5–8.0 is consensus; the same mean spread 1.0–9.5 is contested news — structurally different signals invisible to every other panel that only carries the mean. Surfaced ONLY when MIXED_BOOK / CONFLICTED_NEWS (CONSENSUS / NO_DATA / NO_DISPERSION collapse to silence — never filler when the wire is consistent). Per-ticker n / mean / std / [min, max] carry verbatim from the builder — restate, never re-derive):\n{ticker_score_dispersion_block}\n\n" if ticker_score_dispersion_block else "")
             + (f"DRAM / SEMIS 5d MOMENTUM HEATMAP (paper-trader price momentum):\n{heatmap_block}\n\n" if heatmap_block else "")
             + (f"EARNINGS RADAR (scheduled gap risk):\n{earnings_block}\n\n" if earnings_block else "")
             + (f"PAPER TRADER — PRE-EARNINGS DOLLARIZED 1σ SHOCK (per HELD imminent print: 'if NVDA gaps the typical 1σ on its release, the book moves $X / Y% of equity' — the forward $-at-risk view that complements the EARNINGS RADAR's timing-only listing):\n{earnings_shock_block}\n\n" if earnings_shock_block else "")

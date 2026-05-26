@@ -12,7 +12,14 @@ Design:
   * A reversal requires:
       - sign(avg_curr) != sign(avg_prev)  (actual flip)
       - abs(avg_curr - avg_prev) >= MIN_DELTA  (meaningful magnitude change)
-  * Output written to SNAPSHOT_PATH; summary logged to stdout.
+
+Public surfaces:
+  * ``build_sentiment_reversal(articles, now=None)`` — pure builder.
+    Takes an iterable of ``{"first_seen", "title", "ml_score"}`` dicts and
+    returns the full payload. No DB access, no I/O — used by the Flask
+    endpoint and unit tests.
+  * ``compute()`` — opens articles.db, runs the builder, writes a snapshot
+    JSON to /home/zeph/logs/. Used by the standalone CLI.
 
 Standalone:  python3 -m analytics.sentiment_reversal
 """
@@ -25,6 +32,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Iterable
 
 from storage.article_store import _LIVE_ONLY_CLAUSE
 
@@ -56,10 +64,12 @@ STOP = {
 }
 
 
-def _parse_ts(raw: str) -> datetime | None:
+def _parse_ts(raw) -> datetime | None:
     if not raw:
         return None
-    s = raw.strip().replace("Z", "+00:00")
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    s = str(raw).strip().replace("Z", "+00:00")
     try:
         dt = datetime.fromisoformat(s)
     except ValueError:
@@ -76,12 +86,106 @@ def _extract_tickers(title: str) -> list[str]:
     return [m for m in TICKER_RE.findall(title or "") if m not in STOP and len(m) >= 2]
 
 
-def main() -> int:
-    now = datetime.now(timezone.utc)
-    cutoff_curr = now - timedelta(hours=WINDOW_HOURS)       # 2h ago
-    cutoff_prev = now - timedelta(hours=WINDOW_HOURS * 2)   # 4h ago
+def build_sentiment_reversal(
+    articles: Iterable[dict],
+    now: datetime | None = None,
+) -> dict:
+    """Pure builder.
 
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=20)
+    ``articles`` is any iterable of dicts with at least ``first_seen``,
+    ``title``, and ``ml_score`` keys. Rows with missing/None ``ml_score``
+    or unparseable ``first_seen`` are skipped (counted as ``skipped``).
+
+    Returns a stable shape so the endpoint can ``jsonify`` it directly and
+    chat helpers can assume the keys exist:
+
+      {
+        "generated_at": iso str,
+        "window_hours": int,
+        "rows_scanned": int,
+        "skipped": int,
+        "min_articles_per_window": int,
+        "min_delta": float,
+        "reversals_found": int,
+        "reversals": [
+            {ticker, direction, avg_prev, avg_curr, delta,
+             articles_prev, articles_curr}, ...
+        ],
+      }
+    """
+    now = (now or datetime.now(timezone.utc))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    cutoff_curr = now - timedelta(hours=WINDOW_HOURS)
+    cutoff_prev = now - timedelta(hours=WINDOW_HOURS * 2)
+
+    curr_scores: dict[str, list[float]] = defaultdict(list)
+    prev_scores: dict[str, list[float]] = defaultdict(list)
+    rows_scanned = 0
+    skipped = 0
+
+    for art in articles:
+        rows_scanned += 1
+        ml_score = art.get("ml_score")
+        ts = _parse_ts(art.get("first_seen"))
+        if ts is None or ml_score is None:
+            skipped += 1
+            continue
+        if ts >= cutoff_curr:
+            window = curr_scores
+        elif ts >= cutoff_prev:
+            window = prev_scores
+        else:
+            continue
+        try:
+            score = float(ml_score)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        for ticker in _extract_tickers(art.get("title") or ""):
+            window[ticker].append(score)
+
+    reversals: list[dict] = []
+    for ticker in set(curr_scores) | set(prev_scores):
+        c = curr_scores.get(ticker, [])
+        p = prev_scores.get(ticker, [])
+        if len(c) < MIN_ARTICLES or len(p) < MIN_ARTICLES:
+            continue
+        avg_curr = sum(c) / len(c)
+        avg_prev = sum(p) / len(p)
+        delta = avg_curr - avg_prev
+        if (avg_curr > 0) == (avg_prev > 0):
+            continue
+        if abs(delta) < MIN_DELTA:
+            continue
+        reversals.append({
+            "ticker": ticker,
+            "direction": "neg→pos" if avg_curr > 0 else "pos→neg",
+            "avg_prev": round(avg_prev, 4),
+            "avg_curr": round(avg_curr, 4),
+            "delta": round(delta, 4),
+            "articles_prev": len(p),
+            "articles_curr": len(c),
+        })
+
+    reversals.sort(key=lambda x: abs(x["delta"]), reverse=True)
+    reversals = reversals[:TOP_N]
+
+    return {
+        "generated_at": now.isoformat(),
+        "window_hours": WINDOW_HOURS,
+        "rows_scanned": rows_scanned,
+        "skipped": skipped,
+        "min_articles_per_window": MIN_ARTICLES,
+        "min_delta": MIN_DELTA,
+        "reversals_found": len(reversals),
+        "reversals": reversals,
+    }
+
+
+def _fetch_articles_from_db(db_path: Path) -> list[dict]:
+    """Read live articles from the DB (DESC by first_seen, capped)."""
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=20)
     try:
         rows = conn.execute(
             "SELECT first_seen, title, ml_score FROM articles "
@@ -91,72 +195,31 @@ def main() -> int:
         ).fetchall()
     finally:
         conn.close()
+    return [
+        {"first_seen": r[0], "title": r[1], "ml_score": r[2]}
+        for r in rows
+    ]
 
-    # Bucket articles into PREV and CURR windows
-    curr_scores: dict[str, list[float]] = defaultdict(list)
-    prev_scores: dict[str, list[float]] = defaultdict(list)
-    skipped = 0
 
-    for raw_ts, title, ml_score in rows:
-        ts = _parse_ts(raw_ts)
-        if ts is None or ml_score is None:
-            skipped += 1
-            continue
-        if ts >= cutoff_curr:
-            window = curr_scores
-        elif ts >= cutoff_prev:
-            window = prev_scores
-        else:
-            break  # rows are DESC by first_seen; beyond 4h, stop
+def compute(now: datetime | None = None, db_path: Path | None = None) -> dict:
+    """CLI entry — fetch from DB, build the payload, write snapshot, return it."""
+    db_path = db_path or DB_PATH
+    articles = _fetch_articles_from_db(db_path)
+    payload = build_sentiment_reversal(articles, now=now)
+    try:
+        SNAPSHOT_PATH.write_text(json.dumps(payload, indent=2))
+    except Exception:
+        pass
+    return payload
 
-        for ticker in _extract_tickers(title):
-            window[ticker].append(float(ml_score))
 
-    # Find reversals
-    reversals = []
-    all_tickers = set(curr_scores) | set(prev_scores)
-    for ticker in all_tickers:
-        c_scores = curr_scores.get(ticker, [])
-        p_scores = prev_scores.get(ticker, [])
-        if len(c_scores) < MIN_ARTICLES or len(p_scores) < MIN_ARTICLES:
-            continue
-
-        avg_curr = sum(c_scores) / len(c_scores)
-        avg_prev = sum(p_scores) / len(p_scores)
-        delta = avg_curr - avg_prev
-
-        if (avg_curr > 0) == (avg_prev > 0):
-            continue  # no sign flip
-        if abs(delta) < MIN_DELTA:
-            continue  # too small
-
-        direction = "neg→pos" if avg_curr > 0 else "pos→neg"
-        reversals.append({
-            "ticker": ticker,
-            "direction": direction,
-            "avg_prev": round(avg_prev, 4),
-            "avg_curr": round(avg_curr, 4),
-            "delta": round(delta, 4),
-            "articles_prev": len(p_scores),
-            "articles_curr": len(c_scores),
-        })
-
-    reversals.sort(key=lambda x: abs(x["delta"]), reverse=True)
-    reversals = reversals[:TOP_N]
-
-    snapshot = {
-        "generated_at": now.isoformat(),
-        "window_hours": WINDOW_HOURS,
-        "rows_scanned": len(rows),
-        "skipped": skipped,
-        "min_articles_per_window": MIN_ARTICLES,
-        "min_delta": MIN_DELTA,
-        "reversals_found": len(reversals),
-        "reversals": reversals,
-    }
-    SNAPSHOT_PATH.write_text(json.dumps(snapshot, indent=2))
-
-    print(f"Scanned {len(rows)} rows | reversals: {len(reversals)}")
+def main() -> int:
+    payload = compute()
+    reversals = payload.get("reversals") or []
+    print(
+        f"Scanned {payload.get('rows_scanned', 0)} rows | "
+        f"reversals: {len(reversals)}"
+    )
     if reversals:
         for r in reversals[:5]:
             print(
@@ -167,7 +230,6 @@ def main() -> int:
             )
     else:
         print("  No reversals detected in current windows.")
-
     return 0
 
 

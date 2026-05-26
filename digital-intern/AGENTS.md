@@ -5,6 +5,93 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-26 feature pass — /api/sentiment-reversal + /api/ticker-score-dispersion (per-ticker wire-consistency pair)
+
+Feature-dev pass. The 30+ existing chat-enrichment blocks have rich
+coverage of WHERE the wire is (sector pulse) and WHETHER the wire
+agrees on a SECTOR direction (sector coherence), but had no per-TICKER
+read on either (a) the directional flip across windows, or (b) the
+intra-window score consensus. Two new native DI surfaces close that
+gap with the silence-on-healthy contract.
+
+**`/api/sentiment-reversal`** — refactor of the pre-existing CLI-only
+`analytics/sentiment_reversal.py` snapshot writer (which dumped to
+`/home/zeph/logs/sentiment_reversal.json` but was wired to no endpoint).
+Now exposes a pure builder `build_sentiment_reversal(articles, now=None)`
+used by both the endpoint and the chat block; the CLI `main()` /
+`compute()` path still writes the snapshot, so any cron consumer keeps
+working. Detects tickers whose average ml_score flips sign between
+PREV `[4h, 2h ago)` and CURR `[2h ago, now)`, gated to ≥ `MIN_ARTICLES`
+(=2) in each window and `|delta| ≥ MIN_DELTA` (=0.15) so single-row
+noise can't fire a phantom flip.
+
+**`/api/ticker-score-dispersion`** — new `analytics/ticker_score_dispersion.py`.
+Per-ticker intra-window std-dev of ml_score over `?hours=` (default 24,
+clamped 1..168). The within-window companion: reversal asks "did the
+direction flip across windows?"; dispersion asks "are the articles
+WITHIN the current window AGREEING or DISAGREEING on this ticker?".
+A ticker with five articles all 7.5–8.0 is consensus; the same mean
+spread 1.0–9.5 is contested news — structurally different signals,
+identical mean. Per-ticker bins TIGHT (std ≤ 0.75) / MIXED / CONFLICTED
+(std > 1.75); top-level verdict NO_DATA / NO_DISPERSION / CONSENSUS /
+MIXED_BOOK / CONFLICTED_NEWS.
+
+**Chat enrichment:** two new native blocks `NEWS SENTIMENT REVERSAL` and
+`NEWS TICKER-SCORE DISPERSION` injected into the `/api/chat` system
+prompt right after `NEWS SECTOR COHERENCE` (the sibling native blocks).
+Both follow the silence-on-healthy contract — zero reversals / CONSENSUS
+/ NO_DATA collapse to silence, never chat filler. Per-ticker numbers
+restated verbatim from the builder (SSOT — no chat-side re-derived
+verdict, the `_sector_coherence_chat_lines` precedent).
+
+**Files (digital-intern only):**
+* `analytics/sentiment_reversal.py` — refactored to expose
+  `build_sentiment_reversal(articles, now=None)` pure builder while
+  preserving the CLI snapshot side effect.
+* `analytics/ticker_score_dispersion.py` — NEW pure builder
+  `build_ticker_score_dispersion(articles, window_hours=24, now=None)`
+  + CLI `compute()` / `main()`. Honours `_LIVE_ONLY_CLAUSE`.
+* `dashboard/web_server.py` — five additions:
+  1. `_sentiment_reversal_chat_lines(rep)` helper (silence on zero
+     reversals; top-N detail rows capped by
+     `_SENTIMENT_REVERSAL_TOP_SHOWN`).
+  2. `_ticker_score_dispersion_chat_lines(rep)` helper (silence on
+     CONSENSUS / NO_DATA / NO_DISPERSION; TIGHT detail rows excluded
+     from the actionable block).
+  3. `/api/sentiment-reversal` endpoint — `_ro_query` + `_LIVE_ONLY_SQL`
+     pipeline, single 4h fetch bounded by `WINDOW_HOURS * 2`.
+  4. `/api/ticker-score-dispersion` endpoint — same plumbing, `?hours=`
+     clamped 1..168.
+  5. Chat handler wires both native blocks into the prompt directly
+     after `NEWS SECTOR COHERENCE`.
+* `tests/test_sentiment_reversal.py` — 17 pure-helper tests pinning the
+  sign-flip detection, MIN_DELTA / MIN_ARTICLES gates, window cutoff,
+  ranking, null safety, and the chat helper's silence/verbatim contract.
+* `tests/test_ticker_score_dispersion.py` — 15 pure-helper tests pinning
+  the verdict ladder, per-ticker bin thresholds, ranking
+  (CONFLICTED > MIXED > TIGHT), window respect, null safety, and the
+  chat helper's silence/verbatim contract.
+* `tests/test_sentiment_reversal_endpoint.py` — 5 Flask `test_client`
+  smoke tests pinning the endpoint shape + the `_LIVE_ONLY_SQL` filter
+  (backtest:// / backtest_* / opus_annotation* rows must not leak
+  through; cross-system invariant mirrors paper-trader signals.py).
+
+**Tests:** 32 new pure-helper + 5 endpoint smoke = 37 new. Scoped
+`-k "sentiment_reversal or ticker_score_dispersion or chat or web_server"`
+sweep (1172 tests) all green. Module __main__ smoke deliberately
+avoided per the project-memory verification rule.
+
+**Staging:** explicit per-file pathspec — `analytics/sentiment_reversal.py`,
+`analytics/ticker_score_dispersion.py`, `dashboard/web_server.py`,
+`tests/test_sentiment_reversal.py`, `tests/test_ticker_score_dispersion.py`,
+`tests/test_sentiment_reversal_endpoint.py`, this `AGENTS.md` update.
+No `git add -A` (concurrent-agent footgun memory). The live `:8080`
+daemon must be restarted for the new endpoints to be served; until then
+the chat handler's `try/except` swallows the import-or-build failure and
+the block silently collapses (the silence precedent — no chat regression).
+
+---
+
 ## 2026-05-26 hybrid pass #41 (Agent 3) — briefing_text_overlap_trend content staleness verdict
 
 Debugger + feature-dev + news-analyst pass. 3678 tests in the full
