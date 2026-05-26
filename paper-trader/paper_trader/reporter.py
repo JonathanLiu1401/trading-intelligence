@@ -4174,6 +4174,39 @@ def _regime_leverage_fit_line(store) -> str:
         return ""
 
 
+def _alarm_latch_line() -> str:
+    """One-line "is the engine silently latched?" surface for the hourly
+    Discord summary.
+
+    The runner already exposes ``alarm_latch_state()`` / ``alarm_latch_headline()``
+    and the dashboard surfaces them at ``/api/alarm-latches`` — but a trader
+    whose primary monitoring surface is Discord (the documented "primary
+    surface") never sees the LATCHED state between the FIRED alert and the
+    eventual CLEARED alert. On a multi-hour wedge that is exactly the gap:
+    "I know it fired at 03:14 — is it STILL latched now, at 09:00?". The
+    hourly summary is where that answer belongs.
+
+    Silent on no-latches-held — mirrors the ``_mark_integrity_line`` /
+    ``_drawdown_line`` silence-when-nothing-actionable precedent. Composes
+    ``runner.alarm_latch_headline`` **verbatim** (single source of truth —
+    the latch headline logic lives in runner.py, this line never re-derives
+    it; same SSOT discipline as ``_behavioural_block`` / ``_benchmark_line``).
+
+    Failure contract mirrors the rest of ``reporter``: any import / call
+    fault degrades to ``""`` ("no latch line this report"), **never** an
+    exception ("no Discord summary this report")."""
+    try:
+        from . import runner as _runner
+        state = _runner.alarm_latch_state()
+        headline = _runner.alarm_latch_headline(state)
+        if not headline:
+            return ""
+        return f"**ENGINE LATCH** ◈ {headline}"
+    except Exception as e:
+        print(f"[reporter] alarm-latch line skipped: {e}")
+        return ""
+
+
 def send_hourly_summary() -> bool:
     store = get_store()
     pf = store.get_portfolio()
@@ -4232,6 +4265,17 @@ def send_hourly_summary() -> bool:
     mi = _mark_integrity_line(store)
     if mi:
         body += "\n" + mi
+    # ENGINE LATCH sits right after MARK INTEGRITY — same urgency tier:
+    # both answer "is downstream P/L meaningful right now?". If the
+    # consecutive-NO_DECISION breaker or the Claude quota latch is held,
+    # the engine is silently frozen and every other analytics block below
+    # describes a stale book. A trader who only sees Discord never knew
+    # this between the FIRED alert and the eventual CLEARED — now they
+    # do, on every hourly. Silent on no-latches-held (the silence-when-
+    # nothing-actionable precedent).
+    al = _alarm_latch_line()
+    if al:
+        body += "\n" + al
     # FEED HEALTH sits right after MARK INTEGRITY — same urgency tier (both
     # tell the operator "the inputs feeding every downstream signal are
     # compromised"). Silent on HEALTHY / NO_DATA per the silence-when-nothing-
