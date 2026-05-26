@@ -987,8 +987,27 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
             #     `take_profit` field could have captured the gain before the
             #     reversal)?
             # Computed once per outcome row alongside the existing 5d field.
+            #
+            # Multi-horizon capture (2026-05-26 feature). The 5d field above
+            # already feeds `stop_out_audit` / `mfe_conversion`, but those
+            # answer only one question: "does the inherited 5d-window stop /
+            # take-profit pay?". A quant researcher considering longer-window
+            # stop bands (e.g. would a -10% stop with a 10d window capture
+            # MORE protection than the current -8% / 5d?) had to recompute
+            # extremes manually from price data because the outcome corpus
+            # only carried the 5d snapshot. Adding 10d / 20d extremes
+            # alongside the existing `forward_return_10d/20d` endpoint pair
+            # unlocks horizon-conditional stop / take-profit analysis with
+            # ZERO change to training (`build_features` / `train_scorer`
+            # ignore unknown dict keys — the additive-keys precedent).
+            # Each helper call loops at most `h` trading days, so cost
+            # is bounded; None semantics are identical to the 5d field.
             intra_min, intra_max = _fwd_intraperiod_extremes(
                 ticker, sim_d, idx, h=5)
+            intra_min_10, intra_max_10 = _fwd_intraperiod_extremes(
+                ticker, sim_d, idx, h=10)
+            intra_min_20, intra_max_20 = _fwd_intraperiod_extremes(
+                ticker, sim_d, idx, h=20)
             outcomes.append({
                 "run_id": run.run_id,
                 "persona": _persona_name,
@@ -1055,6 +1074,17 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
                 # See `_fwd_intraperiod_extremes` for the full rationale.
                 "forward_intraperiod_min_5d": intra_min,
                 "forward_intraperiod_max_5d": intra_max,
+                # Multi-horizon intraperiod extremes (10d / 20d). Same shape
+                # and None semantics as the 5d pair above: None when the
+                # horizon window has no resolvable closes, partial coverage
+                # honored. Pairs with `forward_return_10d` /
+                # `forward_return_20d` so a horizon-conditional analyzer
+                # (longer-window stop / take-profit sweep, captured-upside
+                # ratio over multiple holding periods) has the full pair.
+                "forward_intraperiod_min_10d": intra_min_10,
+                "forward_intraperiod_max_10d": intra_max_10,
+                "forward_intraperiod_min_20d": intra_min_20,
+                "forward_intraperiod_max_20d": intra_max_20,
                 # Enhanced MACD / EMA200 features (the 3 added to build_features
                 # alongside the legacy 10 numeric + 7 sector). They are computed
                 # by `_compute_technical_indicators` and surfaced through
