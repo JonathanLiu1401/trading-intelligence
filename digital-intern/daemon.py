@@ -143,6 +143,7 @@ from collectors.unusual_volume_collector import collect_unusual_volume
 from collectors.short_squeeze_monitor import collect_short_squeeze
 from collectors.twse_semiconductor import collect_twse_semiconductor
 from collectors.nasdaq_ipo_calendar import collect_nasdaq_ipo
+from collectors.ipo_lockup_expiry_collector import collect_ipo_lockup_expiry
 from collectors.nasdaq_earnings_calendar import collect as collect_nasdaq_earnings
 from collectors.nasdaq_dividend_calendar import collect_nasdaq_dividends
 from collectors.putcall_ratio_collector import collect_putcall_ratio
@@ -241,6 +242,7 @@ COT_INTERVAL            = 6 * 3600  # CFTC COT report — weekly release, check 
 TWSE_INTERVAL           = 3600    # Taiwan Stock Exchange semis — hourly (market open 09:00–13:30 TW)
 SHORT_INTEREST_INTERVAL = 21600   # highshortinterest.com every 6h (data updates ~2/month)
 NASDAQ_IPO_INTERVAL      = 3600   # Nasdaq IPO calendar - hourly
+IPO_LOCKUP_EXPIRY_INTERVAL = 3600 # IPO lockup expiry alerts - hourly
 NASDAQ_EARNINGS_INTERVAL = 3600   # Nasdaq earnings calendar - hourly
 NASDAQ_DIVIDEND_INTERVAL = 3600   # Nasdaq dividend/split calendar - hourly
 PUTCALL_RATIO_INTERVAL  = 600     # Market put/call ratio - every 10min
@@ -430,6 +432,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "usgs_quake": USGS_QUAKE_INTERVAL,
     "nasdaq_halts": NASDAQ_HALTS_INTERVAL,
     "nasdaq_ipo":       NASDAQ_IPO_INTERVAL,
+    "ipo_lockup_expiry": IPO_LOCKUP_EXPIRY_INTERVAL,
     "nasdaq_earnings":  NASDAQ_EARNINGS_INTERVAL,
     "nasdaq_dividends": NASDAQ_DIVIDEND_INTERVAL,
     "putcall_ratio":   PUTCALL_RATIO_INTERVAL,
@@ -1381,6 +1384,28 @@ def nasdaq_ipo_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(NASDAQ_IPO_INTERVAL)
+
+
+# ── Worker: IPO Lockup Expiry — hourly, alerts on 180-day insider unlocks ────
+def ipo_lockup_expiry_worker(store: ArticleStore):
+    log.info("[ipo_lockup_expiry_worker] started")
+    bo = Backoff("ipo_lockup_expiry", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_ipo_lockup_expiry()
+            _ingest(store, articles, "ipo_lockup_expiry")
+            try:
+                source_health.record_result("ipo_lockup_expiry", len(articles))
+            except Exception as he:
+                log.warning(f"[ipo_lockup_expiry_worker] source_health error: {he}")
+            _worker_last_ok["ipo_lockup_expiry"] = time.time()
+            log.debug(f"[ipo_lockup_expiry] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[ipo_lockup_expiry_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(IPO_LOCKUP_EXPIRY_INTERVAL)
 
 
 # ── Worker: NASDAQ Dividend & Split Calendar — broad market, hourly ──────────
@@ -4819,6 +4844,7 @@ def main():
         ("nasdaq_halts", nasdaq_halts_worker),
         ("twse_semiconductor", twse_semiconductor_worker),
         ("nasdaq_ipo",       nasdaq_ipo_worker),
+        ("ipo_lockup_expiry", ipo_lockup_expiry_worker),
         ("nasdaq_earnings",  nasdaq_earnings_worker),
         ("nasdaq_dividends", nasdaq_dividends_worker),
         ("putcall_ratio", putcall_ratio_worker),
