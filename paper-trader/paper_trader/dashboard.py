@@ -7477,6 +7477,73 @@ def closed_positions_api():
     })
 
 
+@app.route("/api/today-realized-pl")
+def today_realized_pl_api():
+    """Today's realized P/L — what did the desk actually BANK today (NY tz)?
+
+    The orthogonal sibling of ``/api/closed-positions`` (unbounded by date)
+    and ``/api/today-action-tape`` (action counts only, no per-lot P/L
+    framing). Answers the morning operator's first click: "how did
+    yesterday close out — what did I lock in, on which names, and what
+    won vs lost?".
+
+    Filters ``store.closed_positions(limit)`` to lots whose ``closed_at``
+    falls on TODAY in NY-session time (the canonical trading day), then
+    rolls up: ``net_realized_usd`` / ``net_realized_pct``, ``n_winners``
+    / ``n_losers`` / ``n_scratch`` / ``n_closes``, ``biggest_win`` /
+    ``biggest_loss``, ``avg_hold_seconds`` / ``avg_hold_hours``, and a
+    sorted ``closes`` array (best-first).
+
+    Verdict ladder mirrors the silence-by-default Discord helper precedent:
+    ``NO_CLOSES_TODAY`` (no closures), ``WINNING_DAY`` (net > +1¢),
+    ``LOSING_DAY`` (net < -1¢), ``BREAKEVEN_DAY`` (|net| ≤ 1¢).
+
+    Single source of truth: the per-lot ``realized_pl`` field is the same
+    one ``store.py``'s round-trip walker emits for ``/api/closed-positions``,
+    so this surface and that one can never disagree on a closed lot's
+    realized P/L. Read-only — never trains, never writes.
+
+    Supports ``?limit=N`` (1..1000, default 500) to bound the closed_positions
+    scan. The default of 500 covers many trading days of closures so a
+    morning click always sees today's full picture even on a busy book.
+    """
+    try:
+        limit = max(1, min(int(request.args.get("limit", 500)), 1000))
+    except (TypeError, ValueError):
+        limit = 500
+    try:
+        from .analytics.today_realized_pl import build_today_realized_pl
+        store = get_store()
+        lots = store.closed_positions(limit=limit)
+        result = build_today_realized_pl(lots)
+        # ``as_of`` mirrors the dashboard endpoint convention so a JS poller
+        # can deduplicate against the build_info `head_sha` lifetime.
+        result["as_of"] = datetime.now(timezone.utc).isoformat()
+        return jsonify(result)
+    except Exception as e:
+        # Never 500 a panel endpoint — the dashboard JS expects a JSON
+        # error envelope (same discipline as /api/hard-exit-summary). The
+        # JS panel renders the headline verbatim so an ERROR is visible
+        # rather than blank.
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"today-realized-pl unavailable: {e}",
+            "ny_date": None,
+            "net_realized_usd": 0.0,
+            "net_realized_pct": None,
+            "n_closes": 0,
+            "n_winners": 0,
+            "n_losers": 0,
+            "n_scratch": 0,
+            "biggest_win": None,
+            "biggest_loss": None,
+            "avg_hold_seconds": None,
+            "avg_hold_hours": None,
+            "closes": [],
+            "as_of": datetime.now(timezone.utc).isoformat(),
+        })
+
+
 @app.route("/api/data-feed")
 @swr_cached("data-feed", 30.0)
 def data_feed_api():
