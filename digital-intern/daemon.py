@@ -164,6 +164,7 @@ from collectors.rsi_extremes_collector import collect_rsi_extremes
 from collectors.aaii_sentiment_collector import collect as collect_aaii_sentiment
 from collectors.sec_keyword_monitor import collect as collect_sec_keyword_monitor
 from collectors.dtcc_ftd_collector import collect_dtcc_ftd
+from collectors.etf_fund_flows import collect_etf_flows
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -298,6 +299,7 @@ MARKET_BREADTH_INTERVAL = 3600    # Finviz market breadth (% above MAs, new high
 MARKET_VALUATION_INTERVAL = 3600 * 4  # S&P 500 P/E, CAPE, earnings yield — every 4h (multpl.com)
 USASPENDING_INTERVAL    = 3600    # USASpending.gov federal contract awards — hourly (new awards rare)
 SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
+ETF_FUND_FLOWS_INTERVAL = 3600      # ETF shares-outstanding delta → fund flows — hourly
 SEC_13F_INTERVAL        = 1800      # SEC 13F institutional holdings — every 30min (quarterly season)
 SEC_FORM4_INTERVAL      = 300       # SEC Form 4 insider transactions (portfolio tickers) — every 5min
 SEC_MA_DEALS_INTERVAL   = 1800      # SEC M&A deal detector (market-wide keyword search) — every 30min
@@ -448,6 +450,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "rsi_extremes": RSI_EXTREMES_INTERVAL,
     "aaii_sentiment": AAII_SENTIMENT_INTERVAL,
     "dtcc_ftd": DTCC_FTD_INTERVAL,
+    "etf_fund_flows": ETF_FUND_FLOWS_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
     "ml_trainer": ML_TRAIN_INTERVAL,
@@ -2875,6 +2878,28 @@ def dtcc_ftd_worker(store: ArticleStore):
         _sleep(DTCC_FTD_INTERVAL)
 
 
+# ── Worker: ETF fund flows via shares-outstanding delta — hourly ──────────────
+def etf_fund_flows_worker(store: ArticleStore):
+    log.info("[etf_fund_flows_worker] started")
+    bo = Backoff("etf_fund_flows", base=120.0, cap=3600.0)
+    while _running:
+        try:
+            articles = collect_etf_flows()
+            _ingest(store, articles, "etf_fund_flows")
+            try:
+                source_health.record_result("etf_fund_flows", len(articles))
+            except Exception as he:
+                log.warning(f"[etf_fund_flows_worker] source_health error: {he}")
+            _worker_last_ok["etf_fund_flows"] = time.time()
+            log.debug(f"[etf_fund_flows_worker] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[etf_fund_flows_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(ETF_FUND_FLOWS_INTERVAL)
+
+
 # ── Worker: FDA press releases + MedWatch safety alerts — every 30min ────────
 def fda_worker(store: ArticleStore):
     log.info("[fda_worker] started")
@@ -4954,6 +4979,7 @@ def main():
         ("rsi_extremes", rsi_extremes_worker),
         ("aaii_sentiment", aaii_sentiment_worker),
         ("dtcc_ftd",    dtcc_ftd_worker),
+        ("etf_fund_flows", etf_fund_flows_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
