@@ -1796,6 +1796,124 @@ def _cash_conviction_fit_line(store) -> str:
         return ""
 
 
+# ── Deployment-plan Discord helper ─────────────────────────────────────
+# Floor for the cash share of the book under which the deployment-plan
+# headline is suppressed. The deployment plan is most actionable when
+# meaningful capital is sidelined; when the book is already mostly
+# deployed (cash < 50% of total) the line becomes recurring chatter
+# (a half-cash book sees a fresh plan every cycle but the actionable
+# decision is "trim and rotate", not "deploy this $200 leftover"). 50%
+# is the same threshold the live trader operates around — a book
+# settled below it is "fully invested by the gate's own math".
+_DEPLOY_PLAN_CASH_PCT_FLOOR = 50.0
+
+# Localhost endpoint timeout. Generous enough for the scorer-opportunities
+# SWR refresh path (yfinance hits across the WATCHLIST), short enough that
+# a wedged dashboard never blocks the hourly summary. Failure mode is
+# graceful (urlopen raises → helper returns "").
+_DEPLOY_PLAN_HTTP_TIMEOUT_S = 3.0
+
+# Localhost URL — same host:port the dashboard binds to (see
+# ``paper_trader.dashboard.run``). The runner starts the dashboard in a
+# thread of the same process so this is in-process IPC via Flask's WSGI
+# rather than a real network hop. Centralising the URL here so a future
+# port change in dashboard.run() can update both surfaces.
+_DEPLOY_PLAN_URL = "http://localhost:8090/api/deployment-plan"
+
+
+def _deployment_plan_line(store) -> str:
+    """One-line "here's what the gate wants to do with the idle cash" for
+    the hourly / daily report.
+
+    Closes a real dashboard→Discord gap. ``/api/deployment-plan`` already
+    composes the scorer slate × half-Kelly × concentration/sector/leverage
+    caps into a concrete buy list (READY / GATED verdicts), but a trader
+    on Discord never sees it. The 2026-05-27 live book shape — flat for
+    19h on $1167.71 cash with a READY plan to deploy $817 across 4 names
+    at blended +7.13% — exposed the gap: the operator knew they were
+    sidelined but had no surfaced answer to "and what does the gate think
+    I should do?".
+
+    Composes ``/api/deployment-plan``'s own ``headline`` verbatim (single
+    source of truth, AGENTS.md invariant #10 — never re-derived, so this
+    Discord line and the dashboard endpoint can never disagree on
+    "deploy $X across N name(s) for blended +Y%").
+
+    Suppression — fire ONLY when the line is actionable:
+
+      * cash share of book < ``_DEPLOY_PLAN_CASH_PCT_FLOOR`` (50%) → silent
+        (book is already mostly deployed; the plan would only redirect a
+        small leftover and adds noise to the hourly).
+      * verdict ``NO_OPPORTUNITIES`` / ``INSUFFICIENT_CASH`` / ``PENDING``
+        / ``ERROR`` → silent (the dashboard endpoint surfaces the
+        diagnostic; the Discord summary must never become a recurring
+        "no opportunities" / "still computing" alarm).
+      * ``n_plan == 0`` → silent (defensive: GATED is the right verdict
+        when every candidate was blocked by caps, but with no rows the
+        line has nothing to say).
+      * ``READY`` / ``GATED`` with ``n_plan >= 1`` AND a non-empty
+        ``headline`` → fires.
+
+    Localhost HTTP is the deliberate choice over inlining the scorer
+    pipeline: it shares the dashboard's SWR cache (so the hourly summary
+    doesn't trigger a fresh scorer pass on the hot path) and degrades
+    gracefully on a wedged dashboard (timeout → ""). Observational only,
+    never gates Opus, adds no caps (invariants #2/#12). Failure contract
+    mirrors the rest of ``reporter``: any fault → ``""``, never an
+    exception ("no Discord summary this report")."""
+    try:
+        pf = store.get_portfolio()
+        try:
+            cash = float(pf.get("cash") or 0.0)
+            total = float(pf.get("total_value") or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        if total <= 0:
+            return ""
+        cash_pct = cash / total * 100.0
+        if cash_pct < _DEPLOY_PLAN_CASH_PCT_FLOOR:
+            return ""
+
+        # Localhost HTTP to reuse the dashboard's SWR-cached endpoint —
+        # avoids re-running the full scorer pipeline on the summary hot
+        # path. Failure (dashboard down / timeout / bad JSON) degrades
+        # to silence by construction. Import inside the function so a
+        # missing urllib in some stripped runtime would not break the
+        # reporter module import.
+        import json
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen(
+                _DEPLOY_PLAN_URL, timeout=_DEPLOY_PLAN_HTTP_TIMEOUT_S
+            ) as resp:
+                if getattr(resp, "status", 200) != 200:
+                    return ""
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            print(f"[reporter] deployment-plan endpoint unavailable: {e}")
+            return ""
+
+        if not isinstance(data, dict):
+            return ""
+        verdict = data.get("verdict")
+        if verdict not in ("READY", "GATED"):
+            return ""
+        try:
+            n_plan = int(data.get("n_plan") or 0)
+        except (TypeError, ValueError):
+            n_plan = 0
+        if n_plan < 1:
+            return ""
+        headline = data.get("headline") or ""
+        if not headline:
+            return ""
+        return f"**DEPLOY PLAN** ◈ {verdict}\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] deployment-plan line skipped: {e}")
+        return ""
+
+
 def _concentration_line(store) -> str:
     """One-line "is the book dangerously concentrated in one name?" for the
     hourly / daily report.
@@ -4392,6 +4510,19 @@ def send_hourly_summary() -> bool:
     cf = _cash_conviction_fit_line(store)
     if cf:
         body += "\n" + cf
+    # DEPLOY PLAN sits right after CASH FIT — both are cash-deployment
+    # surfaces, one dimension over. CASH FIT says "is the *size* of my
+    # current cash appropriate for today's loudest signal?"; DEPLOY
+    # PLAN says "and here is the gate's concrete buy list to deploy
+    # that idle cash". Independently suppressed: CASH FIT fires on
+    # per-cycle sizing mismatch (IDLE_DESPITE_SURGE / OVERDEPLOYED);
+    # DEPLOY PLAN fires on cash share ≥ 50% AND verdict in
+    # {READY, GATED} — so a partially-deployed book in line with the
+    # signal stays silent on CASH FIT but still surfaces the plan
+    # when there is meaningful headroom.
+    dp = _deployment_plan_line(store)
+    if dp:
+        body += "\n" + dp
     cn = _concentration_line(store)
     if cn:
         body += "\n" + cn
@@ -4634,6 +4765,12 @@ def send_daily_close() -> bool:
     cf = _cash_conviction_fit_line(store)
     if cf:
         body += "\n" + cf
+    # DEPLOY PLAN follows CASH FIT on daily close too — see
+    # send_hourly_summary for the CASH-FIT→DEPLOY-PLAN rationale
+    # (size-of-cash-vs-signal vs. concrete buy list for that cash).
+    dp = _deployment_plan_line(store)
+    if dp:
+        body += "\n" + dp
     cn = _concentration_line(store)
     if cn:
         body += "\n" + cn
