@@ -4044,5 +4044,302 @@ class ArticleStore:
             "dark_tickers": dark,
         }
 
+    # ── Title-keyword sentiment direction (the DIRECTIONAL axis) ──────────
+    # ``ticker_news_burst`` measures VOLUME (is the wire heating up on this
+    # ticker?). ``ticker_mention_velocity`` measures RATE-OF-CHANGE. Neither
+    # answers the analyst-persona question "are my held names getting
+    # BULLISH or BEARISH news right now?" — a 10-article surge on NVDA reads
+    # identically in volume whether all 10 are "Nvidia beats earnings" or
+    # all 10 are "Nvidia misses guidance, drops 15%". The two ml_score-
+    # based analytics (``ticker_sentiment_momentum`` / ``sentiment_streak``)
+    # use *score deltas*, which conflate relevance/urgency with direction —
+    # a recap-template floor (ml_score=0.01) reads as "bearish swing" even
+    # though the content has no directional signal at all.
+    #
+    # This is the missing primitive: a TITLE-KEYWORD direction count, the
+    # exact heuristic the analyst applies when skimming a headline list
+    # ("rises" / "beats" / "upgrades" → bullish; "plunges" / "misses" /
+    # "downgrades" → bearish). Orthogonal to volume and to the score-based
+    # sibling — three different axes of the same per-ticker live read.
+    #
+    # Keyword sets are evidence-anchored to common financial-news verbs;
+    # word-boundary anchored so prose ("downgrades" matches but "downgrade
+    # cycle" doesn't substring-leak into a different word). Stopwords (FELL
+    # vs FELT) are not a concern because the pattern is \bword\b. Lowercased
+    # title surface. Same SSOT (LIVE_PORTFOLIO_TICKERS) as ticker_news_burst
+    # / held_ticker_latest_article, same `\b\$?TICKER\b` matcher so the
+    # four held-book surfaces never disagree about what counts as a mention.
+    #
+    # Pure read-side primitive: single SELECT scoped by first_seen and
+    # _LIVE_ONLY_CLAUSE, no ai_score / ml_score / score_source / urgency
+    # mutation, backtest excluded by the SQL clause — all four load-bearing
+    # invariants intact by construction.
+    _BULLISH_KEYWORDS = (
+        # Price-action verbs
+        "surge", "surges", "surged", "surging",
+        "soar", "soars", "soared", "soaring",
+        "rally", "rallies", "rallied", "rallying",
+        "rise", "rises", "rose", "rising",
+        "jump", "jumps", "jumped", "jumping",
+        "climb", "climbs", "climbed", "climbing",
+        "spike", "spikes", "spiked", "spiking",
+        "gain", "gains", "gained", "gaining",
+        "advance", "advances", "advanced",
+        # Earnings / guidance
+        "beat", "beats", "beating", "topped", "tops",
+        "smash", "smashes", "smashed",
+        "exceed", "exceeds", "exceeded",
+        # Analyst actions
+        "upgrade", "upgrades", "upgraded",
+        "raised", "raises", "boost", "boosts", "boosted",
+        # Corporate actions / outlook
+        "buyback", "buybacks", "dividend",
+        "partnership", "contract", "wins", "won", "awarded",
+        "expand", "expansion", "expansionary",
+        "approval", "approved", "approves",
+        "record", "outperform", "bullish",
+        # Breakout / strength markers
+        "breakout", "breakthrough", "strong",
+    )
+    _BEARISH_KEYWORDS = (
+        # Price-action verbs
+        "plunge", "plunges", "plunged", "plunging",
+        "crash", "crashes", "crashed", "crashing",
+        "tumble", "tumbles", "tumbled", "tumbling",
+        "drop", "drops", "dropped", "dropping",
+        "fall", "falls", "fell", "falling",
+        "slide", "slides", "slid", "sliding",
+        "sink", "sinks", "sunk", "sinking",
+        "slump", "slumps", "slumped", "slumping",
+        "decline", "declines", "declined", "declining",
+        "slip", "slips", "slipped", "slipping",
+        # Earnings / guidance
+        "miss", "misses", "missed", "missing",
+        "cut", "cuts", "lowered", "lowers", "slash", "slashed", "slashes",
+        # Analyst actions
+        "downgrade", "downgrades", "downgraded",
+        # Corporate / regulatory pain
+        "layoff", "layoffs", "fired", "terminated",
+        "scandal", "fraud", "probe", "probes", "investigation",
+        "suspended", "suspend", "halt", "halts", "halted",
+        "ban", "banned", "bans",
+        "lawsuit", "lawsuits", "sued", "sue",
+        "recall", "recalls", "recalled",
+        "default", "defaults", "defaulted",
+        "bankruptcy", "bankrupt",
+        "warning", "warns", "warned",
+        "loss", "losses", "downturn",
+        "weak", "bearish", "underperform",
+    )
+
+    @_retry_on_lock
+    def ticker_sentiment_burst(
+        self,
+        tickers: list[str] | None = None,
+        window_h: float = 6.0,
+    ) -> dict:
+        """Per-held-ticker title-keyword sentiment direction in ``window_h``.
+
+        For each ticker mentioned in a live article title in the window,
+        counts how many of those titles also carry a bullish-direction verb
+        (rises, beats, upgrades, ...) vs a bearish-direction verb (plunges,
+        misses, downgrades, ...). A title with NEITHER (e.g. "Nvidia CEO
+        speaks at conference") counts as ``neutral``. Same title can contain
+        both buckets (rare — "Stock falls despite earnings beat"); both are
+        incremented honestly so the analyst sees the mixed signal.
+
+        Verdict ladder — most-severe first (mirrors briefing_health /
+        ticker_news_burst / urgent_queue_health discipline):
+
+          * ``BULLISH`` — bull >= 2 AND bull >= 2 × bear
+          * ``BEARISH`` — bear >= 2 AND bear >= 2 × bull
+          * ``MIXED``   — bull + bear >= 3 and neither dominates 2×
+          * ``QUIET``   — count_window >= 1 but no directional verbs above 1
+          * ``DARK``    — count_window == 0
+
+        Returns per-ticker (sorted by directional intensity desc, then
+        ticker name):
+
+            {
+              "window_h":    float,
+              "n_window":    int,           # total live articles in window
+              "by_ticker":   [
+                {
+                  "ticker":         str,
+                  "count_window":   int,    # total title mentions
+                  "bull":           int,
+                  "bear":           int,
+                  "neutral":        int,
+                  "intensity":      float,  # (bull - bear) / max(bull+bear,1)
+                  "verdict":        "BULLISH"|"BEARISH"|"MIXED"|"QUIET"|"DARK",
+                },
+                ...
+              ],
+              "n_bullish":   int,
+              "n_bearish":   int,
+              "most_bullish": str | None,    # ticker with strongest +intensity ≥ BULLISH bar
+              "most_bearish": str | None,    # ticker with strongest -intensity ≥ BEARISH bar
+            }
+
+        Pure read-side: ``_LIVE_ONLY_CLAUSE`` applied, no DB write, no
+        ai_score / ml_score / score_source / urgency mutation, backtest
+        rows excluded — all four load-bearing invariants intact by
+        construction.
+
+        ``tickers`` defaults to ``ml.features.LIVE_PORTFOLIO_TICKERS``
+        (config/portfolio.json positions + option underlyings +
+        sector_watchlist, unioned with hardcoded fallback) — same SSOT as
+        ``ticker_news_burst`` / ``held_ticker_latest_article`` so the four
+        held-book surfaces stay drift-free.
+        """
+        window_h = max(float(window_h), 0.05)
+
+        if tickers is None:
+            # Lazy import (storage layer must not always pull the ml graph).
+            from ml.features import LIVE_PORTFOLIO_TICKERS
+            tickers = sorted(LIVE_PORTFOLIO_TICKERS)
+
+        clean: list[str] = []
+        seen_upper: set[str] = set()
+        for raw in tickers or []:
+            if not raw:
+                continue
+            t = str(raw).strip().upper()
+            # Same symbol hygiene as ticker_news_burst / held_ticker_latest_article:
+            # 2..8 chars, dedupe by uppercase. Foreign-suffix tickers
+            # ("005930.KS") would blow up the word-boundary regex compile.
+            if len(t) < 2 or len(t) > 8 or t in seen_upper:
+                continue
+            seen_upper.add(t)
+            clean.append(t)
+        if not clean:
+            return {
+                "window_h": round(window_h, 2),
+                "n_window": 0,
+                "by_ticker": [],
+                "n_bullish": 0,
+                "n_bearish": 0,
+                "most_bullish": None,
+                "most_bearish": None,
+            }
+
+        now = datetime.now(timezone.utc)
+        since = (now - timedelta(hours=window_h)).isoformat()
+
+        # \b\$?TICKER\b — same matcher as ticker_news_burst /
+        # held_ticker_latest_article / urgent_book_breakdown so $NVDA matches
+        # NVDA and NVDAQ does not leak. Word-boundaries also keep AMD from
+        # matching AMDOCS.
+        patterns = {
+            t: re.compile(rf"\b\${{0,1}}{re.escape(t)}\b")
+            for t in clean
+        }
+        # Pre-compile the bullish / bearish keyword unions ONCE. Group into
+        # one alternation per direction; case-insensitive; \b-anchored so
+        # "fell" matches but "felt" doesn't (substring-leak class).
+        bull_re = re.compile(
+            r"\b(?:" + "|".join(re.escape(k) for k in self._BULLISH_KEYWORDS) + r")\b",
+            re.IGNORECASE,
+        )
+        bear_re = re.compile(
+            r"\b(?:" + "|".join(re.escape(k) for k in self._BEARISH_KEYWORDS) + r")\b",
+            re.IGNORECASE,
+        )
+
+        rows = self.conn.execute(
+            "SELECT title FROM articles "
+            f"WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+            (since,),
+        ).fetchall()
+
+        counts: dict[str, dict[str, int]] = {
+            t: {"count": 0, "bull": 0, "bear": 0, "neutral": 0} for t in clean
+        }
+        for (title,) in rows:
+            if not title:
+                continue
+            has_bull = bool(bull_re.search(title))
+            has_bear = bool(bear_re.search(title))
+            for t, pat in patterns.items():
+                if not pat.search(title):
+                    continue
+                bucket = counts[t]
+                bucket["count"] += 1
+                if has_bull:
+                    bucket["bull"] += 1
+                if has_bear:
+                    bucket["bear"] += 1
+                if not has_bull and not has_bear:
+                    bucket["neutral"] += 1
+
+        out: list[dict] = []
+        n_bullish = 0
+        n_bearish = 0
+        for t in clean:
+            b = counts[t]
+            cw = b["count"]
+            bull = b["bull"]
+            bear = b["bear"]
+            neutral = b["neutral"]
+            directional = bull + bear
+            # intensity in [-1, +1]: +1 = all-bull, -1 = all-bear, 0 = balanced.
+            # max(directional, 1) avoids divide-by-zero on the zero-direction case.
+            intensity = (bull - bear) / max(directional, 1)
+            # Verdict ladder. Magnitude bar (>= 2) blocks single-mention noise
+            # from flipping verdict; the 2× dominance bar separates BULLISH /
+            # BEARISH from MIXED. QUIET = some mentions but no real signal.
+            if cw == 0:
+                verdict = "DARK"
+            elif bull >= 2 and bull >= 2 * bear:
+                verdict = "BULLISH"
+                n_bullish += 1
+            elif bear >= 2 and bear >= 2 * bull:
+                verdict = "BEARISH"
+                n_bearish += 1
+            elif directional >= 3:
+                verdict = "MIXED"
+            else:
+                verdict = "QUIET"
+            out.append({
+                "ticker": t,
+                "count_window": cw,
+                "bull": bull,
+                "bear": bear,
+                "neutral": neutral,
+                "intensity": round(intensity, 3),
+                "verdict": verdict,
+            })
+
+        # Sort: by absolute intensity desc (strongest direction first), then
+        # by count_window desc, then alphabetical. So a 5-bull-0-bear ticker
+        # surfaces above a 2-bull-0-bear ticker even though both are +1.0.
+        out.sort(
+            key=lambda r: (
+                -abs(r["intensity"]),
+                -r["count_window"],
+                r["ticker"],
+            )
+        )
+
+        most_bullish: str | None = None
+        most_bearish: str | None = None
+        for r in out:
+            if most_bullish is None and r["verdict"] == "BULLISH":
+                most_bullish = r["ticker"]
+            if most_bearish is None and r["verdict"] == "BEARISH":
+                most_bearish = r["ticker"]
+            if most_bullish and most_bearish:
+                break
+
+        return {
+            "window_h": round(window_h, 2),
+            "n_window": len(rows),
+            "by_ticker": out,
+            "n_bullish": n_bullish,
+            "n_bearish": n_bearish,
+            "most_bullish": most_bullish,
+            "most_bearish": most_bearish,
+        }
+
     def close(self):
         self.conn.close()
