@@ -25,7 +25,11 @@ from ml.features import LIVE_PORTFOLIO_TICKERS
 # count as a recap / quote-widget. Same intra-watchers import discipline as
 # alert_agent->alert_recency. Pulls ml.features transitively (cheap — already
 # in the daemon's process graph).
-from watchers.alert_agent import _looks_like_recap_template, _looks_like_quote_widget
+from watchers.alert_agent import (
+    _looks_like_recap_template,
+    _looks_like_quote_widget,
+    _looks_like_stocktwits_chatter,
+)
 
 try:
     from core.logger import get_logger
@@ -189,13 +193,25 @@ def score_batch(articles: list, store) -> int:
     # regex tightening on the alert side automatically engages here.
     quote_widget_articles: list = []
     recap_articles: list = []
+    chatter_articles: list = []
     real_articles: list = []
     for a in articles:
         if _looks_like_quote_widget(a):
             quote_widget_articles.append(a)
             continue
         hit, _name = _looks_like_recap_template(a)
-        (recap_articles if hit else real_articles).append(a)
+        if hit:
+            recap_articles.append(a)
+            continue
+        # Raw stocktwits forum chatter pre-floor (defense-in-depth — the
+        # storage-side prefloor_pseudo_articles helper does the same check
+        # earlier in the ML path; this catches anything that slipped through
+        # an alternate entry path — see _looks_like_stocktwits_chatter docstring
+        # in alert_agent for the live evidence + discriminator).
+        if _looks_like_stocktwits_chatter(a):
+            chatter_articles.append(a)
+            continue
+        real_articles.append(a)
 
     if quote_widget_articles:
         qw_updates: list[tuple[str, float, int]] = [
@@ -219,6 +235,18 @@ def score_batch(articles: list, store) -> int:
         _log.info(
             f"[urgency] pre-floored {len(recap_articles)} recap-template "
             f"row(s) — skipped Sonnet call (would have over-scored to 8+)"
+        )
+
+    if chatter_articles:
+        chatter_updates: list[tuple[str, float, int]] = [
+            (a["_id"], 0.01, 0) for a in chatter_articles if a.get("_id")
+        ]
+        if chatter_updates:
+            store.update_ai_scores_batch(chatter_updates)
+        _log.info(
+            f"[urgency] pre-floored {len(chatter_articles)} stocktwits-chatter "
+            f"row(s) — skipped Sonnet call (forum chatter, urgency head "
+            f"over-scores $TICKER + held-name density on short titles)"
         )
 
     if not real_articles:
