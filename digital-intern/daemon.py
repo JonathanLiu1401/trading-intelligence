@@ -156,6 +156,7 @@ from collectors.federal_register_collector import collect_federal_register
 from collectors.trade_policy_collector import collect_trade_policy
 from collectors.treasury_auctions import collect_treasury_auctions
 from collectors.arxiv_qfin_collector import collect_arxiv_qfin
+from collectors.quant_research_collector import collect_quant_research
 from collectors.cftc_press_collector import collect_cftc_press
 from collectors.finviz_collector import collect_finviz
 from collectors.seekingalpha_collector import collect_seekingalpha
@@ -280,6 +281,7 @@ BLS_INTERVAL            = 3600    # BLS macro series (CPI, unemployment, payroll
 BEA_INTERVAL            = 3600    # BEA macro releases (GDP, trade, personal income) — once per hour
 TREASURY_AUCTIONS_INTERVAL = 1800  # UST auction announcements from TreasuryDirect — every 30min
 ARXIV_QFIN_INTERVAL    = 3600     # arXiv q-fin + econ new papers (weekday evenings) — hourly
+QUANT_RESEARCH_INTERVAL = 3600   # quant blogs: Quantocracy, Alpha Architect, Newfound, Predicting Alpha
 CFTC_PRESS_INTERVAL    = 1800     # CFTC press + enforcement releases — every 30min
 FINVIZ_INTERVAL        = 300      # Finviz per-ticker news table (round-robin batch) — every 5min
 SEEKINGALPHA_INTERVAL  = 300      # Seeking Alpha breaking-news RSS — every 5min
@@ -2565,6 +2567,27 @@ def arxiv_qfin_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(ARXIV_QFIN_INTERVAL)
+
+
+def quant_research_worker(store: ArticleStore):
+    log.info("[quant_research_worker] started")
+    bo = Backoff("quant_research", base=300.0, cap=3600.0)
+    while _running:
+        try:
+            articles = collect_quant_research()
+            _ingest(store, articles, "quant_research")
+            try:
+                source_health.record_result("quant_research", len(articles))
+            except Exception as he:
+                log.warning(f"[quant_research_worker] source_health error: {he}")
+            _worker_last_ok["quant_research"] = time.time()
+            log.debug(f"[quant_research] cycle ok ({len(articles)} new articles)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[quant_research_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(QUANT_RESEARCH_INTERVAL)
 
 
 def cftc_press_worker(store: ArticleStore):
@@ -4892,6 +4915,7 @@ def main():
         ("bea",         bea_worker),
         ("treasury_auctions", treasury_auctions_worker),
         ("arxiv_qfin",  arxiv_qfin_worker),
+        ("quant_research", quant_research_worker),
         ("cftc_press",  cftc_press_worker),
         ("finviz",      finviz_worker),
         ("federal_register", federal_register_worker),
