@@ -343,6 +343,63 @@ def swr_cache_health_api():
         }), 500
 
 
+@app.route("/api/hard-exit-slippage")
+def hard_exit_slippage_api():
+    """Operator visibility into the *calibration* of the hard SL/TP
+    thresholds — the follow-up to ``/api/hard-exit-summary``.
+
+    ``/api/hard-exit-summary`` counts whether the mechanical discipline
+    is firing; this endpoint answers whether the THRESHOLDS THEMSELVES
+    are well-calibrated. The bot stamps a fixed 2/3% (standard) or
+    4/6% (leveraged) trigger at entry, but when price gaps past the
+    threshold the actual fill can be materially away — live evidence
+    2026-05-26: MU TP fired at threshold $773.31 with a fill of $889.50,
+    +15% slippage past the trigger (the "lucky overshoot" — tape, not
+    the threshold, captured the move).
+
+    Composes ``analytics.hard_exit_slippage.build_hard_exit_slippage``
+    verbatim — single source of truth (invariant #10), so this endpoint
+    and any future Discord / reporter line key off the same builder.
+
+    Deliberately NOT @swr_cached — the builder is a pure scan over a
+    bounded ``recent_trades(2000)`` payload and the operator opening
+    this panel during a sequence of fills wants the freshest read, not
+    a 20s-old cache (mirrors ``hard_exit_summary_api``'s precedent).
+
+    Failure contract mirrors the rest of the operator endpoints: any
+    fault degrades to a valid ERROR envelope so the panel can render
+    and the operator sees the fault, never a 500."""
+    try:
+        from .analytics.hard_exit_slippage import build_hard_exit_slippage
+        st = get_store()
+        snap = build_hard_exit_slippage(st.recent_trades(2000))
+        if not isinstance(snap, dict):
+            raise TypeError(f"builder returned {type(snap).__name__}")
+        return jsonify({"service": "paper_trader", **snap})
+    except Exception as e:
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "state": "ERROR",
+            "verdict": "ERROR",
+            "headline": f"hard-exit-slippage endpoint error: {e}",
+            "error": str(e),
+            "n_hard_tp": 0,
+            "n_hard_sl": 0,
+            "n_total_hard": 0,
+            "n_parse_failed": 0,
+            "tp_slippage_median_pct": None,
+            "tp_slippage_p90_pct": None,
+            "tp_slippage_max_pct": None,
+            "sl_slippage_median_pct": None,
+            "sl_slippage_p90_pct": None,
+            "sl_slippage_max_pct": None,
+            "last_hard_tp": None,
+            "last_hard_sl": None,
+            "per_ticker": [],
+        }), 500
+
+
 @app.route("/api/hard-exit-summary")
 def hard_exit_summary_api():
     """Operator visibility into the hard SL/TP enforcement (commit
