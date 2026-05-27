@@ -71,6 +71,7 @@ def main() -> int:
         ("ml_coverage_by_source",     "analytics.ml_coverage_by_source",     "main"),
         ("dow_baseline",              "analytics.dow_baseline",              "main"),
         ("urgency_spike_detector",    "analytics.urgency_spike_detector",    "main"),
+        ("ticker_signal_noise",       "analytics.ticker_signal_noise",       "main"),
     ]
 
     for short_name, mod_path, fn_name in module_specs:
