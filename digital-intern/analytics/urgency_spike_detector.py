@@ -107,15 +107,17 @@ def run() -> dict:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
 
+    # Use ORDER BY first_seen DESC LIMIT (served by idx_first_seen) — fast on
+    # the USB-backed DB, avoids the slow id-subquery pattern.
     rows = conn.execute(
         f"""
         SELECT title, urgency, first_seen
           FROM articles
-         WHERE id IN (SELECT id FROM articles ORDER BY id DESC LIMIT ?)
-           AND {_LIVE_ONLY_CLAUSE}
-           AND datetime(replace(first_seen,'T',' ')) >= datetime('now', ?)
+         WHERE {_LIVE_ONLY_CLAUSE}
+         ORDER BY first_seen DESC
+         LIMIT ?
         """,
-        (SCAN_LIMIT, f"-{BASELINE_HOURS + 1} hours"),
+        (SCAN_LIMIT,),
     ).fetchall()
     conn.close()
 
