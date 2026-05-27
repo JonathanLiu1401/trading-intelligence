@@ -613,12 +613,16 @@ def _parse_gate_decision(reasoning: str | None) -> tuple[float | None, bool | No
     if not reasoning:
         return None, None
     try:
-        # `\bscorer=` (NOT `score=`) — the existing `ml_score` regex relies on
-        # `score=` not being a substring of `scorer=`; this is the dual side
-        # of that documented first-match disambiguation. The `:+.1f` format in
-        # `_ml_decide` always emits an explicit sign, so `[+-]?` + digits/dot
-        # captures `+5.2` / `-50.0` / `+0.0` exactly.
-        m = re.search(r"\bscorer=([+-]?[0-9.]+)%", reasoning)
+        # Negative lookbehind for word char OR hyphen so a future emission
+        # like `gate-scorer=` or `prev-scorer=` cannot accidentally match
+        # (a bare `\b` would fire at the hyphen→word boundary — same gap
+        # `_parse_conviction_pct` documents). `scorer=` (NOT `score=`)
+        # — the existing `ml_score` regex relies on `score=` not being a
+        # substring of `scorer=`; this is the dual side of that documented
+        # first-match disambiguation. The `:+.1f` format in `_ml_decide`
+        # always emits an explicit sign, so `[+-]?` + digits/dot captures
+        # `+5.2` / `-50.0` / `+0.0` exactly.
+        m = re.search(r"(?<![\w-])scorer=([+-]?[0-9.]+)%", reasoning)
         if not m:
             return None, None
         try:
@@ -673,11 +677,13 @@ def _parse_conviction_pct(reasoning: str | None) -> float | None:
     if not reasoning:
         return None
     try:
-        # `\bconviction=` so the token is anchored to a word boundary and a
-        # future emission like `low-conviction=…` cannot accidentally match.
-        # `(\d+)` covers the documented `:.0%` format exactly; a non-integer
-        # would not match and degrade to None (the discipline tests pin).
-        m = re.search(r"\bconviction=(\d+)%", reasoning)
+        # Negative lookbehind for word char OR hyphen so a future emission
+        # like `low-conviction=…` or `high-conviction=…` cannot accidentally
+        # match. The prior `\bconviction=` was insufficient: `\b` matches
+        # between non-word (hyphen) and word (`c`), so it fired inside
+        # `low-conviction=`. `(\d+)` covers the documented `:.0%` format
+        # exactly; a non-integer would not match and degrade to None.
+        m = re.search(r"(?<![\w-])conviction=(\d+)%", reasoning)
         if not m:
             return None
         try:
