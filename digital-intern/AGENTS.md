@@ -5,6 +5,107 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-27 HYBRID pass (Agent 3, pass #3) — `briefing_length_trend` analytics primitive
+
+**Phase 2 feature** — added `ArticleStore.briefing_length_trend(last_n=10)`,
+the *output-density* sibling to `briefing_cadence_trend` and
+`briefing_text_overlap_trend`.
+
+The two existing trend siblings ask "are briefings firing on schedule?"
+and "if a briefing fires, is it fresh or recapping?". Neither answers
+"is the briefing as DETAILED as it used to be, or is Opus producing
+materially shorter output per cycle?". A 30%-shorter briefing is a real
+signal of Opus quota throttling / prompt-context truncation / response
+cutoff — conditions that leave the digest covering FEWER events even
+when it fires ON_CADENCE with FRESH content.
+
+Verdict ladder: `NO_DATA` (n<4) < `STABLE` < `SHRINKING`
+(`recent_median ≤ 0.7 × older_median`) / `GROWING`
+(`recent_median ≥ 1.3 × older_median`). Pure SELECT — read-only, no DB
+write, no ai_score/ml_score/score_source/urgency mutation,
+`_LIVE_ONLY_CLAUSE` not needed (briefings table is Opus-write only;
+synthetic backtest paths never touch it). All four load-bearing
+invariants intact by construction.
+
+Pinned by `tests/test_briefing_length_trend.py` (16 tests): verdict
+ladder, exact 0.70/1.30 boundary cases, result-shape contract, read-only
+invariant on both `briefings` and `articles` tables, defensive parsing
+(zero-length rows, `last_n` clamp). Same shape as the cadence/overlap
+trend tests.
+
+Live DB sanity (2026-05-27): returns `STABLE` `shrink_ratio=0.977`
+across the last 10 briefings (Opus output density is consistent — not
+the failure axis right now). The cadence sibling is the one degrading
+(see Phase 3 finding below).
+
+**Phase 3 — live news-analyst validation findings (this pass):**
+
+1. **Briefing path STALE** — last briefing at 2026-05-27T01:09Z, age
+   11.63h vs 5h expected cadence. `briefing_health()` returns `STALE`.
+   `briefing_cadence_trend()` on the last 11 intervals (gaps: 5.21, 5.26,
+   6.26, 10.23, 7.08, 10.26, 5.09, 27.64, 5.21, 5.43, 8.61, 9.99h, 13.5h)
+   reads as `DRIFTING` (mean ≈ 9.6h, max 27.64h). The new
+   `briefing_length_trend()` reads `STABLE` — so when Opus DOES fire,
+   content quality is consistent; the failure axis is cadence /
+   availability, not density. The three trend siblings are now mutually
+   orthogonal — each catching a distinct degradation mode.
+
+2. **No proactive briefing-staleness alert** — `briefing_health()` /
+   `briefing_cadence_trend()` / `briefing_length_trend()` are queryable
+   primitives but no worker fires a Discord notification when the path
+   degrades. An analyst learns the digest is dark only by checking the
+   dashboard. Worth a future PR (`briefing_health_alert_worker`).
+
+3. **Stocktwits chatter dominating the urgent queue** — 911 stocktwits
+   rows collected in the last hour (top source by 7x). Many ("$MU yum",
+   "$MU lol", "$MU die") reach `urgency=2` via the alert path's
+   `_filter_low_authority_lone` gate (stocktwits `cred=0.30 < 0.45`
+   `ALERT_MIN_LONE_SOURCE_CRED` — so the Discord push IS correctly
+   suppressed). The system works as designed, but the model's urgency
+   head learns to over-score `$TICKER + chatter` titles (ml_score >=
+   9.5 is common for these). Consider adding a stocktwits-chatter
+   fingerprint to `_RECAP_TEMPLATE_PATTERNS` so they're pre-floored at
+   the `urgency_scorer.score_batch` gate, never reaching the urgent
+   queue.
+
+4. **Daemon health is excellent** — `health_report ok=50 dead=0` at
+   12:34:28Z. All 50 supervised workers alive, no crashes in the 5min
+   window, web server responsive, dashboard endpoints returning 200.
+
+5. **Article collection rate healthy** — 4288 net-new articles/hour
+   (excluding backtest_ sources). RSS / web / reddit / scorer core
+   workers all alive. No queue starvation.
+
+6. **Dark collectors documented in the briefing's own COVERAGE GAP
+   block** — SEC EDGAR (~144.8h dark), Polygon (545h dark, 0 delivered
+   all session), NewsAPI (1090h dark, 0 delivered all session), Finnhub
+   (transient). Already a known external API outage pattern — see
+   `memory/di-chronic-dark-collectors.md`.
+
+7. **Last briefing quality assessment** — 2026-05-27T01:09Z briefing
+   reads tight and dense: 2735 chars, 50 articles, accurate market data
+   (MU $1T cap, NVDA -0.22%, BTC -1.80%), portfolio coverage correctly
+   names LITE / LNOK / MUU / DRAM (call C59) with PnL deltas, real news
+   in TOP SIGNALS (MU $1T cap, WDC Evercore target $575, NVDA China
+   gaming-chip ban), RISK/CATALYST section names option IV / gamma
+   risk, and the honest COVERAGE GAP block surfaces the dark collectors.
+   The output is genuinely useful — the staleness is the real problem,
+   not the content.
+
+8. **One transient Claude outage** at 12:34:09Z (`[alert] No response
+   from Claude — skipping`). Single occurrence; alerts have otherwise
+   continued firing. The urgent batch is not marked alerted on this
+   path, so Sonnet retries on the next 20s cycle — correct behaviour
+   under transient outage.
+
+**Phase 1 — bugs fixed: 0.** The codebase is mature; the targeted
+invariants (backtest:// isolation, `ml_score` vs `ai_score` separation,
+`score_source` discipline, urgency mark_alerted correctness) are
+already exhaustively pinned by 3926 collected tests across 262 test
+files. No new bugs found within the surveyed surface.
+
+---
+
 ## 2026-05-27 feature pass (Agent 4) — `/api/ticker-news-burst` endpoint + actionable-opportunities chat block
 
 Feature-dev pass. Wires the previously daemon-only
