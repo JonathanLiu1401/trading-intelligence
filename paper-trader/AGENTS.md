@@ -30192,3 +30192,197 @@ agents' edits to `paper_trader/reporter.py`,
 `tests/test_all_cash_streak_reporter.py` and
 `tests/test_deployment_plan_reporter.py`); all left untouched. No
 `git add -A` (concurrent-agent footgun memory).
+
+
+## 2026-05-27 — Agent 2 (ML+backtests) HYBRID review pass
+
+Three deliverables this pass: one test-isolation fix, one new
+per-cycle quant-research feature, and a tour of live data state from
+a skeptical-quant perspective.
+
+### Fix: test isolation against the gate kill-switch (5 failing tests)
+
+`tests/test_ml_backtest_review.py::TestMlDecideScorerGate` (4 arm
+tests) + `TestMlDecideOffDistributionGate::test_in_distribution_meta_path_still_modulates`
+all FAILED in the current environment. Root cause: the tests describe
+the documented conviction-arm contract (×0.6/×0.85/×1.0/×1.15/×1.3 on
+the deployed scorer's pred), but `_should_gate_modulate_conviction()`
+(the per-cycle no-skill kill-switch added 2026-05-25) reads the LIVE
+`data/scorer_skill_log.jsonl` whose median |oos_buy_ic| is +0.010 —
+below `_GATE_SKILL_IC_TOLERANCE=0.03`. The kill-switch fires (gate
+killed) and `_ml_decide` short-circuits the arm-modulation block,
+leaving conviction at the unmodulated 0.25 — exactly the behaviour
+the kill-switch was DESIGNED to deliver, but orthogonal to the
+contract these tests describe.
+
+Fix: a shared `_force_gate_modulate_active` fixture
+(`monkeypatch.setattr(bt, "_should_gate_modulate_conviction",
+lambda: (True, "test: forced gate-active"))` + cache reset before/
+after) wired into both test classes via `pytestmark = pytest.mark.
+usefixtures(...)`. The kill-switch's own contract is covered in
+`tests/test_gate_kill_switch.py`; these tests now describe ONLY the
+arm-modulation contract, with the kill-switch pinned to a known
+state — the documented test-isolation discipline.
+
+### Feature: `_append_bootstrap_ci_skill_log` + `bootstrap_ci_skill_log.jsonl`
+
+`paper_trader/ml/oos_bootstrap_ci.bootstrap_ci` has existed since pass
+#33 (2026-05-19) as a read-only CLI / dashboard-feeder that returns
+95% bootstrap CIs on the deployed scorer's OOS rank-IC, RMSE, and
+dir-acc. The CI answers the operator-decisive question every
+point-estimate diagnostic ducks: *is the headline +0.05 OOS rank-IC
+a real signal or sampling noise on a ~1000-row holdout?*
+
+Until this pass NOTHING trended the CI verdict per cycle. The
+existing `scorer_skill_log.jsonl` rolls a point estimate (`oos_ic`)
+forward with no uncertainty band, so an operator watching values
+hover in the -0.07..+0.13 range cannot tell whether the OOS skill
+has actually emerged (CI excluding 0) or remains at the noise floor
+(CI straddling 0).
+
+`run_continuous_backtests._append_bootstrap_ci_skill_log` wires
+`bootstrap_ci` into a new per-cycle ledger (the
+`_append_*_skill_log` pattern every sibling ledger follows). Verdict
+ladder:
+
+| Verdict | Trigger |
+|---------|---------|
+| `SKILL_DETECTED`      | rank-IC 95% CI strictly above 0 |
+| `NO_SKILL_DETECTED`   | CI straddles or sits below 0 |
+| `INSUFFICIENT_DATA`   | < `MIN_PAIRS_FOR_CI` (30) valid OOS pairs |
+| `NOT_TRAINED`         | deployed scorer has no pickle / failed load |
+| `ERROR`               | best-effort fallback (bootstrap_ci raised) |
+
+OOS slice is the SAME temporal holdout `_train_decision_scorer`
+evaluates with (via `validation.split_outcomes_temporal`,
+`oos_fraction=0.2`) — operators can join `scorer_skill_log.cycle` to
+`bootstrap_ci_skill_log.cycle` and read the point estimate plus its
+uncertainty bound on the SAME row.
+
+Live ship-time smoke (deployed pickle n_train=3419, 1000-row OOS
+slice, 1000 bootstraps):
+
+```
+rank_ic_point   = +0.061
+rank_ic_ci_low  = -0.003   <- CI straddles 0
+rank_ic_ci_high = +0.120
+verdict         = NO_SKILL_DETECTED
+```
+
+— exact alignment with the deployed `MLP_WORSE_THAN_TRIVIAL` /
+`GATE_INEFFECTIVE` verdicts the existing ledgers report. The
++0.061 point estimate that has decorated `oos_ic` for weeks is
+now visibly NOT distinguishable from a coin flip at the current
+n_oos.
+
+Why this is a separate ledger (and not extra columns in
+`scorer_skill_log`): the bootstrap costs ~1-2s on the live OOS
+slice. Coupling it into `_train_decision_scorer`'s synchronous
+path would couple two unrelated operations and a bootstrap fault
+could mask a successful train. The sibling-ledger pattern keeps
+each post-train diagnostic independently observable, atomically
+trimmed, and never able to block another.
+
+### Files
+
+* `run_continuous_backtests.py` — adds `BOOTSTRAP_CI_SKILL_LOG`,
+  `BOOTSTRAP_CI_SKILL_LOG_KEEP`, `BOOTSTRAP_CI_N` constants;
+  `_append_bootstrap_ci_skill_log()` function; one call in `main()`
+  immediately after `_append_scorer_skill_log()`. ~210 LOC added.
+* `tests/test_bootstrap_ci_skill_log.py` — 9 new tests:
+  - `TestVerdictLadder` (4) — every cell of SKILL_DETECTED /
+    NO_SKILL_DETECTED / INSUFFICIENT_DATA / NOT_TRAINED pinned with
+    synthetic high-correlation / random / under-N / untrained data.
+  - `TestSafeDefaults` (2) — missing outcomes file + corrupt JSON
+    rows emit honest rows, never raise.
+  - `TestBoundedTrim` (2) — atomic `.replace` trim at 2×keep with
+    no `.tmp` leftover.
+  - `TestRowSchema` (1) — every documented field present on the
+    persisted row so downstream consumers can join on `cycle`.
+* `tests/test_ml_backtest_review.py` — adds
+  `_force_gate_modulate_active` fixture + `pytestmark` on the two
+  affected test classes. 5 previously-failing arm tests now pass.
+
+### Tests
+
+77 passed in the immediate sweep (9 new bootstrap-ci tests + the 28
+existing review tests + 40 adjacent gate / scorer / kill-switch
+tests). Full ML/backtest suite at 209 passed in the regression sweep
+(decision_scorer + ml_backtest_review + ml_backtest_agent2_20260527 +
+scorer_calibrated/freshness/honesty/learning_curve/percentile/
+llm_label_robustness + gate_kill_switch). Continuous-loop ledgers
+(test_continuous + test_continuous_intraperiod_ledgers +
+test_continuous_persona_skill_ledger + test_continuous_gate_arm_ledger)
+166 passed.
+
+### Live-data findings (quant-researcher tour)
+
+Tour of `data/decision_outcomes.jsonl` (7329 rows, ~1000 most-recent
+sampled), `data/scorer_skill_log.jsonl` (113 cycles), and the live
+continuous loop (currently cycle running an 8-yr 2014-2022 window):
+
+1. **Persona coverage skew** — last 1000 outcomes carry only 2 of
+   the 10 personas (`GARP=831, Global Macro=169`). With
+   `RUNS_PER_CYCLE=1` (throttled, AGENTS.md 2026-05-18 §"continuous-
+   backtest throttle"), each cycle runs ONE persona's decisions and
+   adds ~250-500 outcomes to the corpus. Over the documented 5000-
+   row training tail, this means the scorer is fit on whichever
+   personas happened to populate the most recent ~10-20 cycles.
+   This is a *structural consequence* of the throttle, not a fresh
+   bug — surfaced here so a quant deciding whether to trust the
+   model's cross-regime / cross-persona transfer knows the
+   training distribution is narrow.
+
+2. **The conviction gate is fully killed on every recent BUY** — the
+   trailing-20-cycles median `|oos_buy_ic|=0.010 < 0.03` tolerance,
+   so `_should_gate_modulate_conviction()` returns
+   `(False, "median oos_buy_ic=+0.010 ... gate killed")`. EVERY recent
+   BUY row's `gate_off_dist=True` and the `scorer=X%(gate-killed,
+   no-skill)` marker is in the reasoning. This is the kill-switch
+   doing its job (reallocating sizing without a compensating realized
+   edge is variance-only chop) — confirmed working as designed.
+
+3. **Recent OOS rank-IC walks aimlessly around 0** — last 30 cycle
+   ledger rows: `oos_ic ∈ {-0.07 .. +0.13}, median ≈ +0.03`. The
+   new `bootstrap_ci_skill_log` will now durably surface whether
+   the per-cycle CI excludes 0 (it does NOT today: `rank_ic_ci_low
+   = -0.003`) — making the documented `MLP_WORSE_THAN_TRIVIAL`
+   state observable as a CI verdict, not a scalar that requires
+   re-running a CLI to interpret.
+
+4. **In-sample decile calibration is monotone-increasing** —
+   `D1: pred=-7.26 actual=-7.20 ... D10: pred=+9.02 actual=+7.66`
+   with Pearson r=0.59 across last 1000 rows. But the OOS rank-IC
+   is ~0 — classic overfitting. Pass #15's anti-overfit retune
+   (alpha=1e-2 + early_stopping, MLP_CONFIG) addresses this but
+   the gap remains visible.
+
+5. **Modern leveraged ETFs (NVDU/TSLT/MSFU/CONL/PLTU/BITU/BITX/
+   ETHU/HIBS/RIVN/COIN/PLTR/SNOW etc.) have no historical price
+   data for older windows** — when the cycle picks a 2014-2019
+   window these tickers are silently missing from `WATCHLIST`'s
+   tradable universe. Each cycle logs ~15 "possibly delisted" 
+   yfinance warnings. Non-bug (these tickers genuinely didn't
+   exist), but worth knowing — the effective WATCHLIST shrinks
+   ~12% on pre-2020 windows.
+
+6. **GDELT rate-limit / connection errors are frequent but
+   handled** — `[gdelt] rate-limited ... attempt 2/3 — sleeping 40s`
+   messages flood the log. The retry+backoff path is working; the
+   warm-cache fallback ensures tier-3 lookups skip on cache miss.
+   No action needed.
+
+### Staging
+
+Explicit per-file pathspec across 2 commits:
+- `fix(tests):` — `tests/test_ml_backtest_review.py` only.
+- `feat:` — `run_continuous_backtests.py` +
+  `tests/test_bootstrap_ci_skill_log.py` only.
+
+Working copy carried foreign uncommitted changes at start (sibling
+agent's edits to `digital-intern/storage/db_health.py`,
+`paper_trader/dashboard.py`, plus untracked
+`paper_trader/analytics/today_realized_pl.py`,
+`tests/test_all_cash_streak_reporter.py`,
+`tests/test_today_realized_pl.py`); all left untouched. No
+`git add -A` (concurrent-agent footgun memory).
