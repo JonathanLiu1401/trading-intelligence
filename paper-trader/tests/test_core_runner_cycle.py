@@ -908,6 +908,67 @@ class TestQuotaOutageRecovery:
         runner._cycle()
         assert runner._quota_first_ts is None
 
+    def test_orphan_quota_anchor_cleared_on_non_quota_no_decision(
+            self, quota_setup, monkeypatch):
+        """Symmetry gap: the orphan-cleanup must ALSO fire when the next
+        cycle is a NON-quota NO_DECISION (timeout / parse fail / host-saturated
+        — anything that didn't go through the quota arm). The original
+        cleanup only ran in the recovery (``else`` / non-NO_DECISION)
+        branch of ``_cycle``, so an orphaned ``_quota_first_ts`` would
+        persist through every subsequent NO_DECISION wedge — surfacing a
+        misleading ``quota_outage_s`` via ``alarm_latch_state()`` while
+        ``quota_active=False``. A trader reading
+        ``/api/alarm-latches`` during a non-quota host-saturation wedge
+        would see a non-null quota outage age that does NOT correspond to
+        a current quota state. The cleanup keys on latch state, not the
+        status string — any non-quota path through ``_cycle`` must drop
+        a stale anchor when the latch was never armed.
+        """
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        # Simulate the "first quota cycle's send failed → orphan anchor
+        # remains, latch never armed" state from the failed-delivery path.
+        orphan_anchor = _dt.now(_tz.utc) - _td(seconds=500)
+        monkeypatch.setattr(runner, "_quota_first_ts", orphan_anchor)
+        monkeypatch.setattr(runner, "_quota_alert_active", False)
+        # Next cycle is a non-quota NO_DECISION (e.g. CLI timeout, parse fail,
+        # host saturated — anything that doesn't set quota_exhausted=True).
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "NO_DECISION", "decision": None,
+                     "quota_exhausted": False})
+        runner._cycle()
+        # Anchor cleaned up so a FUTURE legitimate quota outage starts a
+        # fresh clock from its own first cycle (not from this orphan).
+        assert runner._quota_first_ts is None
+        # Latch still False — nothing to recover from in the operator's view.
+        assert runner._quota_alert_active is False
+        # No recovery alert fired (no outage to recover from).
+        assert quota_setup["recovered_quota"] == []
+
+    def test_orphan_anchor_does_not_clear_active_quota_during_wedge(
+            self, quota_setup, monkeypatch):
+        """Counterpart to the cleanup test: when the quota latch IS armed
+        (we already alerted the operator about an ongoing quota outage),
+        a non-quota NO_DECISION cycle that happens between the alert and
+        the recovery must NOT drop the anchor — the eventual recovery
+        cycle still needs ``_quota_first_ts`` to compute the real elapsed
+        duration for the operator-facing ``EXHAUSTED → RECOVERED`` bracket.
+        The cleanup must key on latch state, exactly mirroring the
+        recovery-branch precedent on runner.py:1051.
+        """
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        ongoing_anchor = _dt.now(_tz.utc) - _td(seconds=900)
+        monkeypatch.setattr(runner, "_quota_first_ts", ongoing_anchor)
+        monkeypatch.setattr(runner, "_quota_alert_active", True)
+        monkeypatch.setattr(
+            runner.strategy, "decide",
+            lambda: {"status": "NO_DECISION", "decision": None,
+                     "quota_exhausted": False})
+        runner._cycle()
+        # Anchor preserved — eventual recovery still needs the duration.
+        assert runner._quota_first_ts is ongoing_anchor
+        assert runner._quota_alert_active is True
+
 
 class TestOutageCounters:
     """Session-scoped distinct-outage counters. ``_quota_outage_count`` and
