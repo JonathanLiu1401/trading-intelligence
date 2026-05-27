@@ -157,6 +157,7 @@ from collectors.seekingalpha_collector import collect_seekingalpha
 from collectors.rsi_extremes_collector import collect_rsi_extremes
 from collectors.aaii_sentiment_collector import collect as collect_aaii_sentiment
 from collectors.sec_keyword_monitor import collect as collect_sec_keyword_monitor
+from collectors.dtcc_ftd_collector import collect_dtcc_ftd
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -276,6 +277,7 @@ FINVIZ_INTERVAL        = 300      # Finviz per-ticker news table (round-robin ba
 SEEKINGALPHA_INTERVAL  = 300      # Seeking Alpha breaking-news RSS — every 5min
 RSI_EXTREMES_INTERVAL  = 900      # RSI overbought/oversold signals — every 15min
 AAII_SENTIMENT_INTERVAL = 3600 * 6  # AAII weekly survey — re-check every 6h (deduped by date)
+DTCC_FTD_INTERVAL       = 3600 * 4  # DTCC fails-to-deliver (bi-monthly, deduped by period) — every 4h
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
 PRNEWSWIRE_INTERVAL     = 600     # PR Newswire press releases (general + financial feeds) — every 10min
 SHORT_SELLER_INTERVAL   = 1800    # Short-seller research reports (rare, high-priority) — every 30min
@@ -432,6 +434,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "seekingalpha": SEEKINGALPHA_INTERVAL,
     "rsi_extremes": RSI_EXTREMES_INTERVAL,
     "aaii_sentiment": AAII_SENTIMENT_INTERVAL,
+    "dtcc_ftd": DTCC_FTD_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
     "ml_trainer": ML_TRAIN_INTERVAL,
@@ -2725,6 +2728,28 @@ def aaii_sentiment_worker(store: ArticleStore):
         _sleep(AAII_SENTIMENT_INTERVAL)
 
 
+# ── Worker: DTCC Fails-to-Deliver (SEC bi-monthly data) — every 4h ───────────
+def dtcc_ftd_worker(store: ArticleStore):
+    log.info("[dtcc_ftd_worker] started")
+    bo = Backoff("dtcc_ftd", base=120.0, cap=3600.0)
+    while _running:
+        try:
+            articles = collect_dtcc_ftd()
+            _ingest(store, articles, "sec/dtcc_ftd")
+            try:
+                source_health.record_result("dtcc_ftd", len(articles))
+            except Exception as he:
+                log.warning(f"[dtcc_ftd_worker] source_health error: {he}")
+            _worker_last_ok["dtcc_ftd"] = time.time()
+            log.debug(f"[dtcc_ftd_worker] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[dtcc_ftd_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(DTCC_FTD_INTERVAL)
+
+
 # ── Worker: FDA press releases + MedWatch safety alerts — every 30min ────────
 def fda_worker(store: ArticleStore):
     log.info("[fda_worker] started")
@@ -4775,6 +4800,7 @@ def main():
         ("seekingalpha", seekingalpha_worker),
         ("rsi_extremes", rsi_extremes_worker),
         ("aaii_sentiment", aaii_sentiment_worker),
+        ("dtcc_ftd",    dtcc_ftd_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
