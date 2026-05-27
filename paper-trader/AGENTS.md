@@ -6,6 +6,170 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-27 ML+backtest HYBRID pass (Agent 2) — `_parse_*` hyphen-prefix fix + `run_risk_metrics` Sharpe/MDD/Calmar
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=6
+
+### Phase 1 — Bug: hyphen-prefix gap in `_parse_conviction_pct` / `_parse_gate_decision` (`bugs_fixed = 1`)
+
+`run_continuous_backtests._parse_conviction_pct`'s docstring explicitly
+claimed `\bconviction=` would reject a future emission like
+`low-conviction=…`. **It did not** — `\b` matches at the hyphen→word
+transition, so the embedded `conviction=50%` token in `low-conviction=50%`
+matched and would have read 0.50 into `decision_outcomes.jsonl` as if
+the gate had genuinely sized that big. The same gap existed in
+`_parse_gate_decision`'s `\bscorer=` regex (would have accidentally
+matched a `gate-scorer=` / `prev-scorer=` token).
+
+Production reasoning strings emitted by `_ml_decide` always have
+whitespace before these tokens, so this was a latent forward-looking bug
+— but the documented protection deserved to actually hold. Replaced both
+with `(?<![\w-])` negative lookbehinds that explicitly reject word chars
+AND hyphens. Behavior on production strings is unchanged; the hyphen-
+prefix protection now matches the docstring.
+
+Tests at `tests/test_ml_backtest_agent2_20260527.py` (57 cases) lock:
+- `_parse_conviction_pct` / `_parse_gate_decision` hyphen-prefix rejection
+- `build_features` clamp ranges for the 4 bounded inputs
+- `_to_float` numpy-type acceptance (np.float32 / np.int32 / np.float64) and bool / nan / inf rejection
+- `_LstsqModel.predict` dual 1D/2D shape contract
+- `predict_with_meta` off-distribution honesty (clamps + failed flag)
+- `train_scorer` label-validation drops null / nan / inf rows; clamps outlier labels
+- `PriceCache.resolved_close_date` walk-back collision guard (paired with `returns_pct=0.0` sentinel)
+- Persona-cycle modulo math (`persona_for(0)`, `persona_for(-5)` non-raising)
+- Gate kill-switch defaults to active on missing / unreadable / sub-MIN_CYCLES ledger
+- `score_article` BUY/SELL phrase scoring + ticker extraction
+
+### Phase 2 — Feature: `paper_trader/ml/run_risk_metrics.py` (`features_added = 1`)
+
+The continuous loop ranks runs by `total_return_pct` — a metric that
+conflates skill with risk. Verified live against production data
+(`backtest.db`): `run_id=101914` shows headline **+3593% return** but
+risk-adjusted reads as +57.06% CAGR / **-61.77% MDD** / Sharpe 1.25 /
+**Calmar 0.92** (ACCEPTABLE, not investment-grade). Pure leveraged-beta
+luck from a 3-trade buy-and-hold-NVDA-from-2016 monkey run.
+
+A quant judges runs by Sharpe / Calmar. New module reads the persisted
+`equity_curve_json` blob and surfaces canonical readings:
+
+- Annualized **Sharpe ratio** (sqrt(252) factor, optional risk-free rate)
+- **Max drawdown** % (peak-to-trough, negative-or-zero)
+- **CAGR**-style annualized return (365.25-day year basis)
+- **Calmar ratio** = CAGR / |MDD|
+- Verdict ladder: `INVESTMENT_GRADE` (Calmar ≥ 1.0) / `ACCEPTABLE` (0.5-1.0) / `MARGINAL` (0-0.5) / `LOSS_MAKING` (< 0)
+
+CLI:
+```bash
+python3 -m paper_trader.ml.run_risk_metrics                      # top 20 by Calmar
+python3 -m paper_trader.ml.run_risk_metrics --rank-by sharpe     # top 20 by Sharpe
+python3 -m paper_trader.ml.run_risk_metrics --run-id 101903      # one-run detail
+python3 -m paper_trader.ml.run_risk_metrics --top 50 --json      # machine-readable
+python3 -m paper_trader.ml.run_risk_metrics --rank-by mdd        # smallest |MDD| first
+python3 -m paper_trader.ml.run_risk_metrics --rf 0.045           # 4.5% risk-free rate
+```
+
+Read-only — never trains, never writes `backtest.db`. The existing
+return-based ranking that drives `_append_top_decisions` is unchanged
+(training target IS realized return by design); this is the analytical
+companion view a quant uses to sanity-check whether a winner is real
+skill or leveraged-beta luck.
+
+Tests at `tests/test_run_risk_metrics.py` (52 cases) lock the metrics
+against analytically-known synthetic equity curves (constant series →
+Sharpe None; perfect smooth growth → MDD 0.0 / Calmar +inf; known
+drawdown amount = -50% peak-to-trough; sqrt(252) annualization factor;
+the 4-band Calmar verdict ladder; full CLI + leaderboard + JSON paths).
+
+### Phase 3 — Live quant validation (`user_findings = 6`)
+
+Inspecting the deployed scorer + recent backtest output as a quant:
+
+1. **MLP_NO_BETTER_THAN_TRIVIAL persists**: `baseline_skill_log.jsonl`
+   trailing cycles show verdicts of `MLP_NO_BETTER_THAN_TRIVIAL` (×2)
+   and `MLP_WORSE_THAN_TRIVIAL` (ic_gap = -0.15) — a raw `ml_score`
+   one-liner outperforms the 20-feature MLP by 15bps of rank-IC on
+   the most recent OOS slice. The conviction gate (invariant #5) is
+   active (`gate_active=True`) every cycle on this net.
+2. **Val/OOS overfit gap persists**: trailing `oos_rmse` 11-13 vs
+   `val_rmse` 7-12, against a target σ ≈ 9 — the anti-overfit retune
+   helped vs the prior (64,32,16) but the magnitude reading still
+   doesn't generalize. `predict_calibrated` (quantile-mapped) is the
+   honest magnitude reading.
+3. **Headline returns mask risk**: `run_id=101914` (+3593% raw)
+   carries -61.77% intraperiod drawdown — Calmar 0.92 ACCEPTABLE,
+   NOT investment-grade. The new `run_risk_metrics` makes this
+   visible at a glance; the continuous loop's `_append_top_decisions`
+   selector still ranks by raw return only.
+4. **Backtest-decision regime field can collapse to `unknown`**: run
+   101903's window had an empty SPY series (the documented
+   `benchmark_unavailable` honesty `notes` correctly FIRED), so all
+   500+ FILLED decisions on that run carry `regime_label=unknown`
+   and `regime_mult=1.0`. The `_oos_rank_metrics` per-regime
+   breakdown correctly DROPS these from the bull/sideways/bear
+   buckets (pass-#19 `regime_label` capture); the aggregate metric
+   still includes them.
+5. **LLM-annotation pipeline still dark**: `llm_annotation_skill_log`
+   latest row reports `verdict=NO_LABELS_PRODUCED`, `n_endorsed=0`,
+   `n_condemned=0`, `pipeline_dark=True` across the trailing 5000
+   outcomes. The `llm_mult` training weight multiplier is structurally
+   inert — every row weights at 1.0× regardless. Long-documented;
+   surfacing for completeness.
+6. **Some leveraged-bull ETFs have no historical price data**:
+   continuous.log shows BITX / BITU / ETHU `no data` for windows
+   pre-2014 (Yahoo "Data doesn't exist" errors). They silently
+   no-op in `_ml_decide` (gate skips when `prices.price_on()` is
+   None). Conviction-gate cap (`_LEVERAGED_ETFS` 40% in bull/sideways)
+   is unreachable for those names in early windows.
+
+### Phase 4 — Files touched
+
+```
+paper_trader/ml/run_risk_metrics.py            (new — 515 lines)
+run_continuous_backtests.py                    (8 lines: 2 regex tightens + comments)
+tests/test_ml_backtest_agent2_20260527.py      (new — 730 lines / 57 tests)
+tests/test_run_risk_metrics.py                 (new — 565 lines / 52 tests)
+AGENTS.md                                      (this section)
+```
+
+### Test commands for the ML/backtest domain
+
+```bash
+# Focused suite for this pass
+python3 -m pytest tests/test_ml_backtest_agent2_20260527.py tests/test_run_risk_metrics.py -v
+
+# Broader ML/backtest regression
+python3 -m pytest tests/ -k "ml or backtest or scorer or continuous or conviction or gate" 2>&1 | tail -5
+
+# Decision_scorer-only (fastest)
+python3 -m pytest tests/test_decision_scorer.py tests/test_decision_scorer_attribution.py tests/test_decision_scorer_feature_groups.py tests/test_scorer_calibrated.py -q
+```
+
+### How to interpret a backtest run's risk metrics
+
+```bash
+# Top 20 runs by Calmar across the most recent 500
+python3 -m paper_trader.ml.run_risk_metrics
+
+# Deep-dive into one specific run
+python3 -m paper_trader.ml.run_risk_metrics --run-id 101903
+# Output: CAGR / MDD / Sharpe / Calmar + verdict + start/end values
+```
+
+Verdict ladder:
+- `INVESTMENT_GRADE` (Calmar ≥ 1.0): annualized return exceeds peak drawdown — investable.
+- `ACCEPTABLE` (0.5-1.0): respectable but the drawdown is large vs return.
+- `MARGINAL` (0-0.5): positive return but drawdown dominates.
+- `LOSS_MAKING` (< 0): negative annualized return.
+- `INSUFFICIENT_DATA`: < 5 equity points or non-finite metrics.
+
+A quant sanity-check: a +3500% headline run with Calmar 0.92 is
+**leveraged-beta luck**, not skill. Cross-reference with `vs_spy_pct`
+in `backtest_runs` — if the run's annualized alpha vs SPY (after
+controlling for leverage exposure) is < 0, treat it as monkey
+performance regardless of total_return_pct.
+
+---
+
 ## 2026-05-27 core HYBRID pass (Agent 1) — `oos_permutation_test` zero-variance guard + `_deployment_plan_line` Discord helper
 
 **Counters:** bugs_fixed=1 · features_added=1 · user_findings=4
