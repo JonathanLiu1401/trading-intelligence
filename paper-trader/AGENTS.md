@@ -6,6 +6,149 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-27 feature pass (Agent 4) — `/api/actionable-opportunities` composite ranker
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=1
+
+### Phase 1 — Live operator-question gap
+
+Live snapshot 2026-05-27 02:49 ET — book 100% cash ($1167.71, 0
+positions). `/api/scorer-opportunities` lists **46** STRONG_HOLD picks
+(AMD +26.1%, MU +24.7%, SMH +22.1%, QQQ +20.6%, SPY +17.8% predicted
+5d return). `/api/suggestions` returns **0** candidates (its pipeline is
+news-mention-driven, `ai_score≥5` over 6h — the wire is quiet on most
+of these names). `/api/persistent-watchlist-opportunity` returns **0**
+candidates (its threshold is `ai_score≥6` HELD for `6h+`).
+
+Three orthogonal unheld-watchlist reads, none agreeing with any other,
+no single surface answering the analyst's actual question: *"of the
+strong scorer picks, which one is the wire ALSO talking about
+right now?"*. The composite ranker fills exactly that gap.
+
+### Phase 2 — Feature: `/api/actionable-opportunities` (`features_added = 1`)
+
+`paper_trader/analytics/actionable_opportunities.py` — pure builder
+`build_actionable_opportunities(scorer_payload, burst_payload,
+persistent_payload, *, now, top_n)`. Every input is treated as
+untrusted (might be `None`, might be `{"error": ...}`, might be a
+missing-key dict) and degrades to "no contribution" rather than raise.
+
+Per-ticker actionability ladder (most-actionable first):
+
+| Verdict                 | Meaning                                                    |
+|-------------------------|------------------------------------------------------------|
+| `HIGH_CONVICTION`       | `pred ≥ STRONG_PRED_PP (10)` AND burst ∈ {BLAZING, HOT, WARMING} |
+| `NEWS_CONFIRMED`        | `pred ≥ MIN_PRED_PP (5)` AND burst ∈ {BLAZING, HOT, WARMING}     |
+| `PERSISTENT_FOLLOWUP`   | `pred ≥ MIN_PRED_PP (5)` AND persistent_hours ≥ 6h                |
+| `SCORER_ONLY`           | `pred ≥ STRONG_PRED_PP (10)` AND burst ∈ {NORMAL, COLD}           |
+| `NEWS_ONLY`             | `pred < MIN_PRED_PP (5)` AND burst ∈ {BLAZING, HOT}               |
+| `WEAK`                  | otherwise                                                  |
+
+Top-level verdict (silence-on-healthy-and-empty precedent):
+
+| Verdict                     | Meaning                                                |
+|-----------------------------|--------------------------------------------------------|
+| `INSUFFICIENT_DATA`         | scorer not qualified (`is_trained=False` or `n_train < gate`) |
+| `HIGH_CONVICTION_FOUND`     | ≥1 HIGH_CONVICTION cell                                |
+| `NEWS_CONFIRMED`            | ≥1 NEWS_CONFIRMED cell, no HIGH_CONVICTION             |
+| `PERSISTENT_FOLLOWUP`       | ≥1 PERSISTENT_FOLLOWUP cell, no higher                 |
+| `SCORER_BUT_NO_NEWS`        | ≥1 SCORER_ONLY but no news-confirmed cell (= the documented live failure mode) |
+| `NEWS_BUT_NO_SCORER`        | ≥1 NEWS_ONLY but no scorer-strong cell                 |
+| `ALL_QUIET`                 | every cell is WEAK                                     |
+
+Composite score = `pred_pp + 2× burst_numeric + 0.5× persistent_hours`
+(`BLAZING`=6, `HOT`=4, `WARMING`=2, else 0). Sorted descending, ties
+broken by `pred_5d_return_pct` desc then ticker alpha.
+
+**Endpoint** `@app.route("/api/actionable-opportunities")` —
+`@swr_cached("actionable-opportunities", 60.0)`. Fans out in-process to
+`/api/scorer-opportunities` and `/api/persistent-watchlist-opportunity`
+via `app.test_client()`, then cross-fetches digital-intern
+`http://127.0.0.1:8080/api/ticker-news-burst?tickers=<csv>` with a
+hard 3s timeout — same guard pattern as the `/api/earnings` reuse in
+`/api/event-calendar`. Outputs a `sources` block (`scorer_ok` /
+`news_burst_ok` / `persistent_ok`) so an operator can distinguish
+"news quiet" from "intern down". `?n=` clamped 1..50 (default 10).
+
+**Read-only** — never writes, never trains, never gates Opus. AGENTS.md
+#2 / #12 invariants intact.
+
+Locked by:
+
+* `tests/test_actionable_opportunities.py` — 25 pure-builder tests
+  pinning the actionability ladder (every transition + edge case), the
+  top-level verdict ladder (every transition including the documented
+  `SCORER_BUT_NO_NEWS` live failure mode), composite-score math,
+  partial-axis degradation (None / error / garbage payloads), shape
+  stability, top_n cap.
+* `tests/test_actionable_opportunities_endpoint.py` — 6 Flask
+  test_client smokes: route registration, SWR warming→populated, source-
+  availability block on intern-unreachable degrade, scorer-unqualified
+  collapse, `?n=` clamping, end-to-end HIGH_CONVICTION via patched
+  sub-fetches.
+
+### Phase 3 — Companion: digital-intern `/api/ticker-news-burst` endpoint
+
+`ArticleStore.ticker_news_burst` was a daemon-only primitive — the
+endpoint was documented as a "Future PR" in the pass #43 entry. Wired
+now via a pure builder in
+`digital-intern/analytics/ticker_news_burst_runner.py` that the Flask
+endpoint can call via `_ro_query` (avoiding the writer-connection race
+that the storage method's `self.conn` path would have introduced;
+mirrors the `ticker_velocity_runner` pattern). 22+7=29 new tests in
+`tests/test_ticker_news_burst_runner.py` +
+`tests/test_ticker_news_burst_endpoint.py` pin the builder verdict
+ladder + the route's `_LIVE_ONLY_SQL` filter + `?window_h` /
+`?baseline_h` / `?tickers` query handling.
+
+### Phase 4 — Chat block: `_actionable_opportunities_chat_lines` on intern
+
+Following the 13+ existing chat enrichment helpers (`_baseline_compare`,
+`_cash_conviction_fit`, `_feed_health`, …) — pure helper at
+`dashboard/web_server.py:_actionable_opportunities_chat_lines`. Fires
+ONLY on actionable verdicts (HIGH_CONVICTION_FOUND / NEWS_CONFIRMED /
+PERSISTENT_FOLLOWUP / SCORER_BUT_NO_NEWS / NEWS_BUT_NO_SCORER) — the
+silence precedent for ALL_QUIET / INSUFFICIENT_DATA / ERROR. Headline
+and `reasons` strings pass through verbatim (SSOT — invariant #10).
+Wired into `/api/chat`'s prompt as "PAPER TRADER — ACTIONABLE
+OPPORTUNITIES" right after CASH-CONVICTION FIT (the structural-
+calibration neighbours). 18 tests in
+`tests/test_chat_actionable_opportunities_enrichment.py` pin the
+silence-on-healthy contract, verbatim headline + reasons passthrough,
+per-row defensive parsing, 3-row cap.
+
+### Phase 5 — Live finding
+
+1. **The cross-confirmation gap is real and currently actionable.**
+   With the book at 100% cash + `/api/scorer-opportunities` showing
+   46 STRONG_HOLD picks + `/api/persistent-watchlist-opportunity`
+   showing 0 + `/api/suggestions` showing 0, the operator-facing
+   `SCORER_BUT_NO_NEWS` verdict will fire as soon as the route is
+   live — making the disagreement explicit. The pre-feature analyst
+   read had to compose three separate APIs to detect this. The
+   composite verdict makes it ONE chat line.
+
+### Files touched
+
+* `paper_trader/analytics/actionable_opportunities.py` (new, ~330 lines)
+* `paper_trader/dashboard.py` — added `/api/actionable-opportunities`
+  route (~95 lines).
+* `tests/test_actionable_opportunities.py` (new, 25 tests)
+* `tests/test_actionable_opportunities_endpoint.py` (new, 6 tests)
+
+(Sibling repo `digital-intern` also touched — see its AGENTS.md for the
+`/api/ticker-news-burst` endpoint + chat block.)
+
+### Test commands
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+python3 -m pytest tests/test_actionable_opportunities.py \
+                  tests/test_actionable_opportunities_endpoint.py -v
+```
+
+---
+
 ## 2026-05-26 ML+backtest HYBRID pass #45 (Agent 2) — scorer-CLI MACD plumb + `persona_regime_skill` per-cycle ledger
 
 **Counters:** bugs_fixed=1 · features_added=1 · user_findings=5
