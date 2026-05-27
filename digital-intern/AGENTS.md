@@ -5,6 +5,127 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-27 feature pass (Agent 4) — `/api/ticker-news-burst` endpoint + actionable-opportunities chat block
+
+Feature-dev pass. Wires the previously daemon-only
+`ArticleStore.ticker_news_burst` analytics surface as a Flask endpoint
+and adds a new chat enrichment block for paper-trader's new
+`/api/actionable-opportunities` composite ranker.
+
+**Phase 1 — `/api/ticker-news-burst` (closes a documented Future PR).**
+
+The 2026-05-26 pass shipped `ArticleStore.ticker_news_burst` (per-ticker
+volume burst vs per-hour baseline — "is the wire heating up on a held
+name RIGHT NOW?") as a storage primitive only. The pass entry said
+*"Future PR: wire as `/api/ticker-news-burst` and chat enrichment"*.
+That endpoint is now live.
+
+New pure builder `analytics/ticker_news_burst_runner.py:build_ticker_news_burst`
+that mirrors the in-process storage method byte-for-byte (same verdict
+ladder, same `baseline_per_h` floor at 0.5, same sort, same
+`_LIVE_ONLY_CLAUSE` semantics) but operates on already-fetched
+`{"first_seen", "title"}` row dicts. The endpoint fetches via
+`_ro_query` so the dashboard read never touches the writer connection
+(the `_ro_query` invariant — see its docstring).
+
+Query parameters:
+
+* `?window_h=` clamped 0.25..12.0 (default 1.0)
+* `?baseline_h=` floored at `1.5 × window_h`, clamped to 168.0 (default 24.0)
+* `?tickers=` optional CSV. When omitted, defaults to
+  `ml.features.LIVE_PORTFOLIO_TICKERS` (the held + watched universe).
+
+Verdict ladder (mirrors the storage method exactly):
+
+* `BLAZING` — `spike ≥ 10` AND `count_window ≥ 5`
+* `HOT` — `spike ≥ 5` AND `count_window ≥ 3`
+* `WARMING` — `spike ≥ 2` AND `count_window ≥ 2`
+* `COLD` — `count_window == 0`
+* `NORMAL` — otherwise
+
+Top-level verdict: `BLAZING` > `HOT` > `WARMING` > `NORMAL` > `NO_DATA`
+(when both windows empty). The endpoint emits a top-level `headline`
+naming the hottest ticker + spike multiple so a chat helper can pass it
+verbatim — same SSOT contract as every other live-wire axis surface.
+
+22 builder tests (`tests/test_ticker_news_burst_runner.py`) +
+7 Flask endpoint tests (`tests/test_ticker_news_burst_endpoint.py`)
+pin: every verdict transition, word-boundary discipline (AUTOMATIC
+must not match `MAT`), `$TICKER` prefix support, future-dated rows
+excluded, unparseable timestamps skipped, baseline excludes window
+edge, `?window_h` / `?baseline_h` clamping, `?tickers=` CSV
+precedence over the default `LIVE_PORTFOLIO_TICKERS`, `_LIVE_ONLY_SQL`
+filter applied (backtest:// rows must not register).
+
+**Phase 2 — `_actionable_opportunities_chat_lines` chat block.**
+
+Paper-trader Agent 4 (same pass) shipped `/api/actionable-opportunities`
+— the composite ranker that crosses three orthogonal axes (scorer
+predicted 5d return × ticker-news-burst from THIS dashboard × persistent-
+watchlist hot-run hours). The chat carries each axis separately; this
+new block is the cross-confirmation synthesis.
+
+The chat helper at
+`dashboard/web_server.py:_actionable_opportunities_chat_lines` follows
+the 13+ existing precedents (`_baseline_compare`,
+`_cash_conviction_fit`, `_feed_health`, `_decision_paralysis`, …):
+
+* Pure / total — `None` / non-dict / missing-key payload yields `[]`.
+* Fires ONLY on actionable verdicts: `HIGH_CONVICTION_FOUND` /
+  `NEWS_CONFIRMED` / `PERSISTENT_FOLLOWUP` / `SCORER_BUT_NO_NEWS` /
+  `NEWS_BUT_NO_SCORER`. `ALL_QUIET` / `INSUFFICIENT_DATA` / `ERROR`
+  collapse to silence — the silence-on-healthy precedent.
+* Builder's top-level `headline` is the chat headline (verbatim — SSOT,
+  invariant #10). Per-ticker `reasons` strings pass through verbatim;
+  the helper does not paraphrase quant / news phrasing.
+* Capped at 3 surfaced ticker rows — the same compactness contract as
+  `_cash_conviction_fit_chat_lines`.
+
+Wired into `/api/chat`'s prompt as the **"PAPER TRADER — ACTIONABLE
+OPPORTUNITIES"** block, immediately after CASH-CONVICTION FIT (its
+nearest structural-calibration neighbour). Guarded 3s `urlopen` fetch
+to `:8090/api/actionable-opportunities`. Falls back to silence on any
+exception (caller never sees a `[chat]` traceback).
+
+The SCORER_BUT_NO_NEWS verdict explicitly documents the live failure
+mode that previously required the analyst to compose three separate
+endpoint reads to detect: scorer screams STRONG_HOLD on dozens of
+names but the wire is silent on every one. Now ONE chat line.
+
+18 tests in `tests/test_chat_actionable_opportunities_enrichment.py`
+pin every verdict-tier silence/emit transition, verbatim
+headline + reasons passthrough, defensive parsing (garbage rows
+skipped, missing reasons, blank headline), 3-row cap, SSOT contract.
+
+**Live evidence.** Live snapshot 2026-05-27 02:49 ET on paper-trader:
+46 STRONG_HOLD scorer picks (AMD +26.1%, MU +24.7%, …), 0
+persistent-watchlist candidates, 0 suggestions, 100% cash book. The
+new `/api/actionable-opportunities` cross-confirms this as
+`SCORER_BUT_NO_NEWS` — the operator can now see the disagreement
+explicitly in chat.
+
+Counters: bugs_fixed=0, features_added=2, user_findings=1.
+
+### Files touched
+
+* `analytics/ticker_news_burst_runner.py` (new, ~220 lines).
+* `dashboard/web_server.py` — added `/api/ticker-news-burst` route,
+  `_actionable_opportunities_chat_lines` helper, and chat-block wiring.
+* `tests/test_ticker_news_burst_runner.py` (new, 22 tests).
+* `tests/test_ticker_news_burst_endpoint.py` (new, 7 tests).
+* `tests/test_chat_actionable_opportunities_enrichment.py` (new, 18 tests).
+
+### Test commands
+
+```bash
+cd /home/zeph/trading-intelligence/digital-intern
+python3 -m pytest tests/test_ticker_news_burst_runner.py \
+                  tests/test_ticker_news_burst_endpoint.py \
+                  tests/test_chat_actionable_opportunities_enrichment.py -v
+```
+
+---
+
 ## 2026-05-26 HYBRID pass — scorer_worker prefloor parity + ticker_news_burst (Agent 3)
 
 Hybrid debug + feature + live-validation pass.
