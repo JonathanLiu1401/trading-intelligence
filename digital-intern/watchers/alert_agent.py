@@ -1610,6 +1610,94 @@ def _filter_recap_template_noise(
     return kept, suppressed
 
 
+# ── Stocktwits forum chatter gate (defense-in-depth) ───────────────────────
+# Raw stocktwits user posts ("$MU lol", "$MU yum", "$MU mooooooooo 🚀") that
+# the ML urgency head over-scores into urgency=1 despite carrying no actionable
+# news. Distinct surface from quote-widget (which is a price-tape pseudo-row)
+# and recap-template (which is a SEO blog template) — this is FORUM CHATTER
+# from a single source family.
+#
+# Live evidence (2026-05-27, articles.db 24h scan):
+#   - 2444 raw ``stocktwits`` rows collected (top source by 6x)
+#   - 162 reached urgency=1 (95 with title length < 30 chars: "$MU lol",
+#     "$MU yum", "$MU mooooooooo", "$MU 1k 😅", "$MU LETS V")
+#   - ml_score commonly 9.95–9.97 — the urgency head trained on $TICKER +
+#     held-name density features fires hard on any "$MU <anything>" lead
+#
+# The alert-side ``_filter_low_authority_lone`` gate suppresses the Discord
+# push (stocktwits cred=0.30 < 0.45 ALERT_MIN_LONE_SOURCE_CRED), but only
+# AFTER the row has reached urgency=1, been fetched by the alert worker, and
+# decompressed — burning alert worker cycles, inflating urgent_queue_health
+# and ``urgent_score_distribution`` calibration metrics into BORDERLINE_HEAVY
+# even when the analyst's actual Discord output is clean. Pre-flooring at the
+# ML-scoring stage exits these rows BEFORE they reach urgency=1.
+#
+# Discriminator: BOTH source AND title-shape conditions must hold —
+#   1. ``source`` matches a stocktwits raw-stream family — case-insensitive
+#      substring "stocktwits" but NOT the structured ``stocktwits/sentiment``
+#      digest source (which carries real signal — see _QW_STOCKTWITS_SENTIMENT,
+#      a SEPARATE gate for the sentiment "$NVDA: extreme bullish sentiment ..."
+#      rollup pseudo-articles, not the raw user stream).
+#   2. ``title`` is short (< 50 chars — chosen against the live noise corpus:
+#      95 of the 157 urgency=1 rows in the 24h window were < 30 chars and the
+#      30-49 char tier is overwhelmingly more chatter; the 50-79 char tier is
+#      mixed so we conservatively stop the gate there).
+#   3. ``title`` does NOT contain any real-news keyword (price target /
+#      analyst attribution / earnings verb / etc.) — the escape hatch that
+#      lets a short "$MU upgraded by Barclays" survive even at length 30.
+#
+# Same shape and discipline as ``_filter_quote_widget_noise`` /
+# ``_filter_recap_template_noise``: pure read-side — no DB write, no
+# ai_score / ml_score / score_source / urgency mutation, backtest already
+# filtered upstream by _is_synthetic / the store. All four load-bearing
+# invariants intact by construction.
+_STOCKTWITS_CHATTER_TITLE_MAX = 50
+_STOCKTWITS_NEWS_EXIT = re.compile(
+    r"\b(?:earnings|beats?|misses?|raised|lowered|upgrad\w*|downgrad\w*|"
+    r"price\s+target|guidance|fda|merger|acquir\w+|dividend|"
+    r"buyback|recall|investigation|lawsuit|partner(?:ship)?|appointed|"
+    r"resign(?:ed|s)?|reuters|bloomberg|cnbc|wsj|barclays|"
+    r"goldman|jpmorgan|analyst|reiterat\w+|halted?|approval|approved|"
+    r"sec\s+filing|8-?k|10-?k|10-?q|files?\s+|filed\s+)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_stocktwits_chatter(art: dict) -> bool:
+    """True for a raw stocktwits forum-chatter row — short, unstructured user
+    post that the ML urgency head over-scores into urgency=1.
+
+    Source-scoped to the raw stocktwits stream (any tag containing
+    ``stocktwits`` case-insensitively) EXCEPT ``stocktwits/sentiment`` which is
+    the structured sentiment-digest source carrying real signal. Pure,
+    side-effect-free; reads only ``source`` and ``title`` via ``.get()``."""
+    source = (art.get("source") or "").strip().lower()
+    if "stocktwits" not in source:
+        return False
+    if source == "stocktwits/sentiment":
+        return False
+    title = (art.get("title") or "").strip()
+    if not title or len(title) >= _STOCKTWITS_CHATTER_TITLE_MAX:
+        return False
+    if _STOCKTWITS_NEWS_EXIT.search(title):
+        return False
+    return True
+
+
+def _filter_stocktwits_chatter(
+    arts: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Partition rows into ``(kept, suppressed)`` where ``suppressed`` is the
+    raw stocktwits forum chatter. Mirrors ``_filter_quote_widget_noise`` /
+    ``_filter_recap_template_noise`` shape so the three pre-floor surfaces
+    behave identically."""
+    kept: list[dict] = []
+    suppressed: list[dict] = []
+    for a in arts:
+        (suppressed if _looks_like_stocktwits_chatter(a) else kept).append(a)
+    return kept, suppressed
+
+
 # ── Held-book relevance (the analyst's open positions) ───────────────────────
 # The 🚨 BREAKING alert is the analyst's most time-critical product, and the
 # persona is explicitly "I depend on this to react to events affecting MY

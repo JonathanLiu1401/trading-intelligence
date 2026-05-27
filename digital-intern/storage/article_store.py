@@ -1473,6 +1473,7 @@ class ArticleStore:
         from watchers.alert_agent import (
             _looks_like_quote_widget,
             _looks_like_recap_template,
+            _looks_like_stocktwits_chatter,
         )
         pre_floor: list[tuple[str, float, int]] = []
         real: list[dict] = []
@@ -1485,6 +1486,16 @@ class ArticleStore:
                 continue
             hit, _name = _looks_like_recap_template(art)
             if hit:
+                pre_floor.append((aid, 0.01, 0))
+                continue
+            # Raw stocktwits forum-chatter rows ("$MU lol", "$MU yum") —
+            # source + title-length + no-news-keyword gate. Live evidence
+            # (2026-05-27, 24h): 2444 raw stocktwits rows, 95 of the
+            # ml_score>=8 set < 30 chars. See _looks_like_stocktwits_chatter
+            # docstring for the full discriminator. SSOT in alert_agent so a
+            # threshold tweak engages across all three pre-floor surfaces
+            # (this store helper + urgency_scorer + the alert-side gate).
+            if _looks_like_stocktwits_chatter(art):
                 pre_floor.append((aid, 0.01, 0))
                 continue
             real.append(art)

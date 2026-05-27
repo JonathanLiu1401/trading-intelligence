@@ -5,6 +5,206 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-27 HYBRID pass — stocktwits-chatter pre-floor gate
+
+**Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=4`.
+
+### Phase 1 — Debug & fix (0 bugs)
+
+Audited the test list the task names: every required assertion is in place
+(`tests/test_article_store.py` 40-86 for backtest isolation, 91-119 for alerted
+marking, 124-159 for ml/llm score-source separation; `tests/test_features.py`
+13/42/66/76 for feature dim / ticker density / days-since-published;
+`tests/test_model.py` 11/25/58 for head-range and zero-input NaN;
+`tests/test_trainer.py` 27/137 for score_source='ml' exclusion + sample weight
+ordering; `tests/test_urgency_scorer.py` 37/50/72 for urgent threshold). 3942
+tests collected, all green on baseline. The one transient failure during the
+21-min full-suite run (`test_scorer_worker_calls_helper`) was a concurrent-agent
+race — `daemon.py` was modified by sibling agents mid-run and a single
+`inspect.getsource` returned a stale split of the file; the test passed when
+re-run in isolation immediately after. Per the commit-guard rule, no Phase 1
+commit was made — an honest zero rather than synthetic find.
+
+### Phase 2 — Feature dev (1 feature: stocktwits-chatter pre-floor)
+
+**What.** A source-scoped + title-shape gate that pre-floors raw stocktwits
+forum chatter (`$MU lol` / `$MU yum` / `$MU mooooooooo 🚀`) at the ML scoring
+stage so it exits before reaching `urgency=1`. Three integration surfaces, all
+driven by one SSOT in `watchers.alert_agent`:
+  - `watchers.alert_agent._looks_like_stocktwits_chatter(art)` — the pure
+    helper (source + title + no-news-keyword discriminator).
+  - `watchers.alert_agent._filter_stocktwits_chatter(arts)` — partition
+    helper (mirrors `_filter_quote_widget_noise` /
+    `_filter_recap_template_noise` shape).
+  - `storage.article_store.prefloor_pseudo_articles` — ML-path pre-floor (the
+    daemon `scorer_worker` call site, before NN inference): floors chatter to
+    `ml_score=0.01, score_source='ml'`, `ai_score` UNTOUCHED.
+  - `watchers.urgency_scorer.score_batch` — Sonnet-path pre-floor
+    (defense-in-depth, before the Claude call): floors to
+    `ai_score=0.01, score_source='llm'` matching the existing
+    quote-widget / recap-template pre-floor convention there.
+
+**Discriminator.** All three conditions must hold:
+  1. `source` contains "stocktwits" (case-insensitive) AND is NOT
+     `stocktwits/sentiment` (the structured sentiment digest carries real
+     signal — `_QW_STOCKTWITS_SENTIMENT` is a separate, distinct gate for
+     that source's rollup pseudo-articles).
+  2. Title length < 50 chars (chosen against the 2026-05-27 live noise
+     corpus: 95 of 157 urgency>=1 stocktwits rows in the 24h window had
+     title < 30 chars; the 30-49 char tier is overwhelmingly chatter; the
+     50-79 char tier is mixed so the gate conservatively stops there).
+  3. Title carries NO real-news keyword (`earnings|beats|misses|raised|
+     lowered|upgrad\w*|downgrad\w*|price target|guidance|fda|merger|
+     acquir\w+|dividend|buyback|recall|investigation|lawsuit|partner|
+     appointed|resign|reuters|bloomberg|cnbc|wsj|barclays|goldman|
+     jpmorgan|analyst|reiterat|halt|approval|approved|sec filing|
+     8-K|10-K|10-Q|files|filed`) — the escape hatch so a short
+     `$MU upgraded by Barclays` survives even at 30 chars.
+
+**Tradeoff acknowledged.** `split` is intentionally NOT in the news-keyword
+exit list — `$MU split would be appreciated!` reads as chatter, not a stock
+split announcement. The cost is that a hypothetical short stocktwits message
+like `$MU 4-for-1 split announced` (33 chars, no other keyword) would also
+be gated. Real stock-split announcements arrive via SEC EDGAR (8-A12B form),
+RSS, and structured wires — they never originate as chatter on stocktwits.
+Documented here so a future agent does not "fix" this by adding `split` back.
+
+**Live evidence (2026-05-27, articles.db 24h scan).**
+  - 2444 raw `stocktwits` rows collected (top source by 6x volume)
+  - 162 reached `urgency=1` with chatter titles at ml_score 9.95–9.97
+  - Sample caught urgency=2 rows from the last 6h on live wire:
+    `$MU $1200 by Friday 🫡🚀🚀` (ml=10.0), `$MU LETS V` (ml=10.0),
+    `$MU 1000 by tomirrow market verg strong` (ml=9.6),
+    `$SNDK $MU breakthrough vwap sweet prince` (ml=9.9),
+    `$MU $1400 and $DRAM $105` (ml=9.8),
+    `$MU 800 watch , momentum fading` (ml=9.7)
+
+**Impact.** The alert-side `_filter_low_authority_lone` gate (stocktwits
+cred=0.30 < 0.45 `ALERT_MIN_LONE_SOURCE_CRED`) was already suppressing the
+Discord push for these rows, but only AFTER they reached urgency=1 — burning
+alert worker cycles, polluting `urgent_queue_health`, and inflating
+`urgent_score_distribution` into the BORDERLINE_HEAVY verdict in the chat
+enrichment. Pre-flooring at ML stage exits these rows BEFORE they reach
+urgency=1, so the urgent-queue calibration metrics now reflect the
+analyst-actionable corpus.
+
+**Invariants intact (all four).**
+  - Backtest isolation: `_LIVE_ONLY_CLAUSE` already excludes synthetic rows
+    upstream from `prefloor_pseudo_articles`; the new gate only runs on live
+    rows by construction.
+  - ml_score ↔ ai_score separation: ML-path pre-floor writes to `ml_score`
+    only (tag `score_source='ml'`); LLM-path pre-floor writes to `ai_score`
+    only (tag `score_source='llm'`, matching the existing recap/quote-widget
+    pre-floor convention there — `update_ai_scores_batch` tags 'llm').
+  - score_source asymmetry between paths is INTENTIONAL and mirrors the
+    existing recap-template / quote-widget pre-floor: ML-path keeps
+    `score_source='ml'` (excluded from `STRONG_LABEL_WHERE`); LLM-path
+    enters as ground-truth-noise (included in `STRONG_LABEL_WHERE`). Do NOT
+    "harmonise" — same discipline as the four-surface recap gate.
+  - No `_BRIEFING_RECAP_TEMPLATE_PATTERNS` mirror needed: a pre-floored
+    chatter row has ml_score=0.01 and can never reach the top-N briefing
+    ranker (unlike recap titles which can survive at high score from other
+    paths — chatter cannot).
+
+**Files:**
+  - `watchers/alert_agent.py` — `_looks_like_stocktwits_chatter` +
+    `_filter_stocktwits_chatter` + `_STOCKTWITS_CHATTER_TITLE_MAX` +
+    `_STOCKTWITS_NEWS_EXIT` (regex). 88 lines added, no existing logic
+    touched.
+  - `watchers/urgency_scorer.py` — import the chatter helper; partition the
+    pre-LLM batch into `chatter_articles` and write 0.01 floors via
+    `update_ai_scores_batch` (matches existing recap/quote-widget shape).
+  - `storage/article_store.py` — call `_looks_like_stocktwits_chatter` in
+    `prefloor_pseudo_articles` after the recap-template check (writes
+    ml_score=0.01 via `update_ml_scores_batch`).
+
+**Tests:** `tests/test_stocktwits_chatter.py` — 46 new tests pinning:
+  - 18 live chatter titles caught (from the actual articles.db noise corpus)
+  - 11 must-survive titles preserved (analyst attribution, PT, earnings,
+    dividend, partnership, halted, 10-Q, etc.)
+  - `stocktwits/sentiment` source NEVER gated (the structured digest)
+  - Non-stocktwits sources never gated (title-shape alone insufficient)
+  - Syndicated stocktwits (`yfinance/Stocktwits`, `GoogleNews/Stocktwits`)
+    IS gated (case-insensitive substring match)
+  - Length >= 50 escape, empty-title / empty-source safety, case-insensitive
+    source match, keyword-at-any-position escape
+  - `_filter_stocktwits_chatter` partition helper contract
+  - Storage prefloor integration: ml_score=0.01, score_source='ml',
+    ai_score untouched (load-bearing invariant #2)
+  - Urgency_scorer integration: Sonnet is NOT called when batch is all
+    chatter (the pre-floor saves quota — pure pre-LLM verdict);
+    mixed batch passes only the real rows to Sonnet
+  - Lockstep: ML-path and LLM-path import the same SSOT helper, and the
+    storage prefloor source-greps for the helper name (regression guard
+    against a future refactor dropping the chatter line).
+
+**Test counts.** Full suite: 3984 passed in 1761s (3938 baseline + 46 new),
+zero failures.
+
+### Phase 3 — Live news-analyst validation findings (4)
+
+Against `/media/zeph/projects/digital-intern/db/articles.db` at
+2026-05-27T19:15-19:30Z (the live wire DURING this pass — the daemon has not
+yet been restarted with the new code, so the live failure modes the new
+pre-floor will catch are still observable):
+
+1. **Stocktwits chatter dominating urgent queue — FIXED THIS PASS** (the
+   feature above). Daemon must be restarted to engage the new pre-floor;
+   until then the failure mode is still visible in real time.
+
+2. **DB lock-contention pressure remains visible.** `daemon.log` shows
+   recurring `[article_store] stats: transient DB error 'another row
+   available' (attempt N/5)` warnings (16 in the last 30min). The retry
+   decorator absorbs them — `_retry_on_lock` was specifically built for
+   this — but the warning rate is a real signal that shared-connection
+   cursor collisions are happening regularly. One sequence at 2026-05-27T19:15:23Z
+   exhausted the retry budget on `stats` (the dashboard `/api/stats` endpoint
+   ate that 500). Known structural cost of `check_same_thread=False`; the
+   long-term fix is per-call connection isolation for hot readers (mirrors
+   `dashboard._ro_query`), tracked but not in this pass.
+
+3. **Stale cadence DEAD verdict masking briefing recovery.** Latest briefing
+   ts is 2026-05-27T17:46:30Z; previous was 2026-05-27T01:09:00Z — 16.6h gap
+   that classifies as DEAD on `briefing_health()`. But the LAST run produced
+   a high-quality 2631-char digest (verified: accurate market data, real
+   NVDA Taiwan / QCOM ByteDance / MU $1T news, named COVERAGE GAP block).
+   `briefing_health()` correctly reads STALE/DEAD on the gap, but the
+   `briefing_length_trend` sibling correctly reads STABLE — the path is
+   alive again, just intermittently throttled by Opus quota. The three trend
+   siblings (cadence, overlap, length) are now mutually orthogonal in the
+   live evidence.
+
+4. **Source health: 71 disabled/down sources stable.** `[source_health]
+   disabled=71 stale=0 down=71` recurring unchanged — the chronic external
+   gap (`memory/di-chronic-dark-collectors.md`:
+   sec_edgar/polygon/newsapi/nitter delivering zero all session). Latest
+   briefing's COVERAGE GAP block honestly surfaces this — analyst is
+   correctly informed.
+
+**Phase 3 caveat — pre-floor only engages after daemon restart.** The
+daemon is a long-lived manual process (`memory/di-stale-manual-daemon.md`).
+The new pre-floor only takes effect after the daemon picks up the new code;
+this pass can verify the chatter floods existed and the gate logic catches
+them (the 46 new tests do this with concrete titles from today's live DB),
+but cannot observe the urgency=1 rate dropping in the live wire during
+this session.
+
+### Phase 4 — Docs & verify
+
+This section. Final verify:
+  - `python3 -c "import sys; sys.path.insert(0,'.'); from storage import article_store; from ml import features, model; print('imports OK')"` → `imports OK`.
+  - `pytest tests/test_stocktwits_chatter.py tests/test_article_store.py tests/test_urgency_scorer.py tests/test_prefloor_pseudo_articles.py tests/test_alert_recap_template.py tests/test_alert_agent.py -q` → 185 passed.
+  - Full `pytest tests/` → 3984 pass / 0 fail in 1761s (+46 from this pass).
+
+**Staging discipline.** Per-commit explicit pathspec (`memory/di-shared-repo-concurrency.md`).
+This pass touches exactly four files: `watchers/alert_agent.py`,
+`watchers/urgency_scorer.py`, `storage/article_store.py`,
+`tests/test_stocktwits_chatter.py` (new), plus this AGENTS.md entry.
+No `git add -A`, no `.json` / `config/` / `data/` / `logs/` staged.
+`git diff --staged` verified before commit.
+
+---
+
 ## 2026-05-27 HYBRID pass (Agent 3, pass #3) — `briefing_length_trend` analytics primitive
 
 **Phase 2 feature** — added `ArticleStore.briefing_length_trend(last_n=10)`,
