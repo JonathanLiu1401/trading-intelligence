@@ -1560,10 +1560,20 @@ _BRIEFING_RT_STREET_THINKS = re.compile(
     r"^\s*here(?:'?s|\s+is)?\s+what\s+the\s+street\s+thinks\b",
     re.IGNORECASE,
 )
-# "(TICKER) Shares Fall 8.8% -- GF Value Says ..." — GuruFocus algorithmic
-# press-mill. "GF Value Says" is unique enough to be a high-precision pattern.
+# "(TICKER) Shares Fall 8.8% -- GF Value Says ..." / "Shares Fall 3.8% --
+# What GF Score Offers" — GuruFocus algorithmic press-mill. Both "GF Value
+# Says" AND "GF Score" are GuruFocus-specific marketing brands; no other
+# publisher uses either phrase as part of a recap title, so the combined
+# alternation is high-precision.
+#
+# Live evidence (2026-05-26): GoogleNews/GuruFocus's "Lumentum Holdings Inc
+# (LITE) Shares Fall 3.8% -- What GF Score Offers - GuruFocus" reached
+# urgency=2 with ml_score=9.66 — fired a 🚨 BREAKING push on a held name
+# (LITE) for a recap-mill stock-move attribution. The previous "Value Says"
+# verbatim discriminator missed the sibling "GF Score" variant. Lockstep
+# twin with ``watchers.alert_agent._RT_GF_VALUE``.
 _BRIEFING_RT_GF_VALUE = re.compile(
-    r"\bgf\s+value\s+says\b",
+    r"\bgf\s+(?:value\s+says|score)\b",
     re.IGNORECASE,
 )
 # "<Company> Earnings: A Quick Glance at Key Metrics" — Zacks post-earnings

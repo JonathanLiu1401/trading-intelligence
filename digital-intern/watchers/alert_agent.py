@@ -521,13 +521,25 @@ _RT_STREET_THINKS = re.compile(
     r"^\s*here(?:'?s|\s+is)?\s+what\s+the\s+street\s+thinks\b",
     re.IGNORECASE,
 )
-# "(TICKER) Shares Fall 8.8% -- GF Value Says ..." — GuruFocus algorithmic
-# press-mill template, posted on every fractional stock-price move. The
-# "GF Value Says" tagline is unique to GuruFocus, so this is a high-
-# precision pattern (no false positives on real headlines that mention
-# value or analyst ratings).
+# "(TICKER) Shares Fall 8.8% -- GF Value Says ..." / "Shares Fall 3.8% -- What
+# GF Score Offers" — GuruFocus algorithmic press-mill templates, posted on
+# every fractional stock-price move. Both ``GF Value Says`` and ``GF Score``
+# are GuruFocus-specific marketing brands (no other publisher uses either
+# phrase as part of a recap title), so the combined pattern is high-precision.
+#
+# Live evidence (2026-05-26, last 24h urgency=2 set on the consumer's
+# articles.db): GoogleNews/GuruFocus's "Lumentum Holdings Inc (LITE) Shares
+# Fall 3.8% -- What GF Score O[ffers] - GuruFocus" reached urgency=2 with
+# ml_score=9.66, source_source='ml' — a real BREAKING push fired on a held
+# ticker (LITE) for a pure recap-mill stock-move attribution. The original
+# ``\bgf\s+value\s+says\b`` discriminator required the ``Value Says`` exact
+# phrase, so the ``GF Score`` sibling variant slipped through. 5 such rows
+# landed in the 7d window before this widening (1 alerted, 4 queued or
+# gate-suppressed at earlier stages). The widened alternation ``(?:value\s+
+# says|score)`` catches both family members while keeping the GuruFocus-
+# unique ``GF `` anchor — real headlines never lead with this phrase.
 _RT_GF_VALUE = re.compile(
-    r"\bgf\s+value\s+says\b",
+    r"\bgf\s+(?:value\s+says|score)\b",
     re.IGNORECASE,
 )
 # "Why <X> Stock {Just|Now|Today|Finally|Suddenly|...} {Popped|Surged|...}"

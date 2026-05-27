@@ -213,6 +213,24 @@ class TestHelperCatchesLiveNoise:
             assert hit, f"missed GF Value recap: {t!r}"
             assert name == "gf_value_says"
 
+    def test_gf_score_variant_gurufocus_mill(self):
+        # Live evidence (2026-05-26, urgency=2 set): GoogleNews/GuruFocus's
+        # "Lumentum Holdings Inc (LITE) Shares Fall 3.8% -- What GF Score
+        # Offers - GuruFocus" reached urgency=2 with ml_score=9.66 — fired
+        # a 🚨 BREAKING push on a held name (LITE). Original regex
+        # required "GF Value Says" verbatim; the sibling "GF Score"
+        # variant slipped through. Symmetric to
+        # tests/test_briefing_recap_template.py:test_gf_score_variant —
+        # the documented lockstep between the alert and briefing surfaces.
+        for t in (
+            "Lumentum Holdings Inc (LITE) Shares Fall 3.8% -- What GF Score Offers - GuruFocus",
+            "AXT Inc (AXTI) Shares Rise 4.2% -- What GF Score Reveals - GuruFocus",
+            "Micron (MU) Shares Down 6.0% -- GF Score Indicates Risk - GuruFocus",
+        ):
+            hit, name = alert_agent._looks_like_recap_template({"title": t})
+            assert hit, f"missed GF Score variant: {t!r}"
+            assert name == "gf_value_says"
+
     def test_earnings_tomorrow_preview_seo_mill(self):
         """Live evidence (2026-05-19/20, 36h articles.db scan, all urgency=2):
         6 distinct hits — DECK + SCVL (neither held; pure SEO spam) fired
