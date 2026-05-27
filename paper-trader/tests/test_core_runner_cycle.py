@@ -132,8 +132,14 @@ class TestCycleDispatch:
 
     def test_auto_exits_fire_independently_of_filled_gate(self, spy):
         """auto_exits opens the outer guard but does NOT imply FILLED:
-        each exit emits its own AUTO RISK EXIT line, while the
-        trade-alert/decision-log stay gated on status == FILLED."""
+        each exit emits its own alert, while the decision-log stays gated
+        on status == FILLED.
+
+        Free-text labels like "SL NVDA -8%" / "TP MU +12%" (no matching
+        SELL trade with HARD_SL/HARD_TP reason) fall back to the bare
+        `**AUTO RISK EXIT** TICKER` text. The rich-alert path is
+        exercised separately in
+        ``test_auto_exit_with_matching_hard_sl_trade_emits_rich_alert``."""
         calls, setup = spy
         summary = {"status": "HOLD", "auto_exits": ["SL NVDA -8%", "TP MU +12%"]}
         store = setup(summary, trades=[{"id": 1, "ticker": "NVDA"}])
@@ -149,6 +155,103 @@ class TestCycleDispatch:
         assert calls["decision_log"] == []
         # Outer guard opened by auto_exits → store *is* consulted.
         assert store.recent_trades_calls == 1
+
+    def test_auto_exit_with_matching_hard_sl_trade_emits_rich_alert(self, spy):
+        """Production-shape auto_exits=["MU"] with the matching SELL trade
+        in the store: the trader gets a FULL trade alert (qty/price/value/
+        reason + post-trade book impact) instead of bare
+        AUTO RISK EXIT MU. This is the new behavior — prior to this change
+        a live HARD_TP that freed $1156.35 emitted zero detail to Discord."""
+        calls, setup = spy
+        hard_tp_trade = {
+            "id": 15, "ticker": "MU", "action": "SELL", "qty": 1.3,
+            "price": 889.5, "value": 1156.35,
+            "reason": "HARD_TP: price 889.50 >= threshold 773.31",
+        }
+        summary = {"status": "HOLD", "auto_exits": ["MU"]}
+        store = setup(summary, trades=[hard_tp_trade])
+
+        runner._cycle()
+
+        # The matching SELL/HARD_TP trade is alerted via the rich path.
+        assert calls["trade_alert"] == [hard_tp_trade]
+        # No bare-text fallback fired.
+        assert calls["send"] == []
+        assert calls["decision_log"] == []
+        assert store.recent_trades_calls == 1
+
+    def test_auto_exit_with_no_matching_trade_falls_back_to_bare_text(self, spy):
+        """When the auto_exit ticker has no matching HARD_SL/HARD_TP SELL
+        in the recent trades (an older trade evicted, or a discretionary
+        SELL that happened to share the ticker), the bare-text fallback
+        keeps the operator informed — byte-identical to the pre-change
+        behavior."""
+        calls, setup = spy
+        # Discretionary SELL (reason is NOT a HARD_* marker) and a BUY —
+        # neither qualifies as a hard exit even though the ticker matches.
+        unrelated = [
+            {"id": 9, "ticker": "MU", "action": "SELL", "qty": 1.0,
+             "price": 700.0, "value": 700.0, "reason": "discretionary trim"},
+            {"id": 8, "ticker": "MU", "action": "BUY", "qty": 1.3,
+             "price": 750.0, "value": 975.0, "reason": "earnings setup"},
+        ]
+        summary = {"status": "HOLD", "auto_exits": ["MU"]}
+        setup(summary, trades=unrelated)
+
+        runner._cycle()
+
+        assert calls["trade_alert"] == []
+        assert calls["send"] == ["**AUTO RISK EXIT** `MU`"]
+
+    def test_auto_exit_plus_filled_emits_both_rich_alerts(self, spy):
+        """A cycle with BOTH a FILLED decision-trade AND an auto-exit must
+        emit TWO rich alerts: the FILLED's (trades[0], the newest) AND the
+        auto-exit's matching HARD_SL/HARD_TP trade. The trader needs to
+        see both fills, not just the FILLED one. Decision log still fires
+        once (gated on status==FILLED)."""
+        calls, setup = spy
+        filled_trade = {
+            "id": 20, "ticker": "NVDA", "action": "BUY", "qty": 0.5,
+            "price": 900.0, "value": 450.0, "reason": "earnings setup",
+        }
+        hard_sl_trade = {
+            "id": 19, "ticker": "SOXL", "action": "SELL", "qty": 5.0,
+            "price": 30.0, "value": 150.0,
+            "reason": "HARD_SL: price 30.00 <= threshold 30.20",
+        }
+        summary = {
+            "status": "FILLED", "decision": {"action": "BUY"},
+            "auto_exits": ["SOXL"],
+            "snapshot": {"cash": 850.0, "total_value": 1300.0, "positions": []},
+        }
+        setup(summary, trades=[filled_trade, hard_sl_trade])
+
+        runner._cycle()
+
+        # Order: FILLED's trade first (trades[0]), then the auto-exit's.
+        assert calls["trade_alert"] == [filled_trade, hard_sl_trade]
+        assert calls["decision_log"] == [summary]
+        assert calls["send"] == []
+
+    def test_auto_exit_only_matches_hard_sl_or_hard_tp_reason(self, spy):
+        """A SELL whose reason starts with neither HARD_SL nor HARD_TP must
+        NOT be promoted to a rich alert. Guards against future discretionary
+        sells that happen to share the auto_exit ticker silently masquerading
+        as a hard-exit alert."""
+        calls, setup = spy
+        # SELL with the SAME ticker but reason is a custom string.
+        rebalance = {
+            "id": 12, "ticker": "TQQQ", "action": "SELL", "qty": 2.0,
+            "price": 80.0, "value": 160.0, "reason": "rebalance into cash",
+        }
+        summary = {"status": "HOLD", "auto_exits": ["TQQQ"]}
+        setup(summary, trades=[rebalance])
+
+        runner._cycle()
+
+        # No rich alert; falls back to bare text.
+        assert calls["trade_alert"] == []
+        assert calls["send"] == ["**AUTO RISK EXIT** `TQQQ`"]
 
     def test_filled_with_empty_trades_skips_alert_keeps_decision_log(self, spy):
         """The `if trades and status == FILLED` guard: an empty
