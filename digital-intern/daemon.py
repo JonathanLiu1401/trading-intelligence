@@ -897,6 +897,14 @@ def stocktwits_sentiment_worker(store: ArticleStore):
             log.warning(f"[stocktwits_sentiment_worker] error: {e}; backing off {bo.peek():.0f}s")
             bo.sleep(lambda: _running)
             continue
+        # Re-scan every 5 min; the per-ticker cursor in the collector prevents
+        # per-ticker hammering, but the WORKER itself still needs a sleep —
+        # without it this loops as fast as the cursor file can be read and
+        # burns CPU + churns the cursor file. Live regression: commit c65e39d
+        # inserted the new stocktwits_trending_symbols_worker BETWEEN this
+        # worker's body and its trailing _sleep(300), leaving this worker with
+        # no sleep at all (hot CPU loop) and double-sleeping the new one.
+        _sleep(300)
 
 
 def stocktwits_trending_symbols_worker(store: ArticleStore):
@@ -916,9 +924,11 @@ def stocktwits_trending_symbols_worker(store: ArticleStore):
             log.warning(f"[stocktwits_trending_symbols] error: {e}; backing off {bo.peek():.0f}s")
             bo.sleep(lambda: _running)
             continue
-        # Poll every 5 minutes — trending list doesn't change faster than that
+        # Poll every 5 minutes — trending list doesn't change faster than that.
+        # (Pre-fix this had a duplicate _sleep(300) that doubled the cadence to
+        # 10 min; see stocktwits_sentiment_worker comment for the c65e39d edit
+        # that scattered them.)
         _sleep(300)
-        _sleep(300)  # re-scan every 5 min; internal cursor prevents per-ticker spam
 
 
 # ── Worker W5: Ticker news — re-fetch every 120s ─────────────────────────────
