@@ -73,6 +73,7 @@ def main() -> int:
         ("urgency_spike_detector",    "analytics.urgency_spike_detector",    "main"),
         ("ticker_signal_noise",       "analytics.ticker_signal_noise",       "main"),
         ("hourly_urgency_quality",    "analytics.hourly_urgency_quality",    "main"),
+        ("ml_confidence_tracker",     "analytics.ml_confidence_tracker",     "main"),
     ]
 
     for short_name, mod_path, fn_name in module_specs:
