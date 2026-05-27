@@ -1090,11 +1090,26 @@ def _cycle():
                 _quota_first_ts = None  # re-arm: next outage starts fresh
 
     try:
-        if summary.get("auto_exits") or summary.get("status") == "FILLED":
-            # post the trade that was just executed
+        auto_exits = summary.get("auto_exits") or []
+        filled = summary.get("status") == "FILLED"
+        if auto_exits or filled:
+            # Fetch enough recent trades to cover BOTH the (optional) FILLED
+            # decision-trade AND every auto-exit we need to render. Each
+            # auto-exit is a SELL with a "HARD_SL: ..." / "HARD_TP: ..." reason
+            # written by strategy._check_and_execute_hard_exits one cycle ago;
+            # before this change auto-exits were posted as a bare
+            # `**AUTO RISK EXIT** TICKER` line — no price, qty, $ amount or
+            # SL/TP context, so the trader (live: MU HARD_TP today freed
+            # $1156.35 with zero detail in Discord) had to dig through the
+            # dashboard to see what just happened. Looking up the matching
+            # trade lets us reuse `send_trade_alert` to render the same
+            # rich body (qty/price/value/reason + post-trade book impact)
+            # the FILLED path already gets. Headroom of +1 covers any
+            # interleaved trades.
             store_ = get_store()
-            trades = store_.recent_trades(1)
-            if trades and summary.get("status") == "FILLED":
+            n_fetch = max(1, len(auto_exits) + (1 if filled else 0) + 1)
+            trades = store_.recent_trades(n_fetch)
+            if trades and filled:
                 # Pass the POST-trade snapshot (strategy.decide() re-marks at
                 # the end of the cycle) + the store so the alert can append
                 # a one-liner with the trade's immediate book impact (lot
@@ -1106,9 +1121,37 @@ def _cycle():
                     snapshot=summary.get("snapshot"),
                     store=store_,
                 )
-            for ax in summary.get("auto_exits") or []:
-                reporter._send(f"**AUTO RISK EXIT** `{ax}`")
-        if summary.get("status") == "FILLED":
+            for ax in auto_exits:
+                # ``ax`` is the ticker symbol from
+                # strategy._check_and_execute_hard_exits. Find the matching
+                # SELL with a HARD_SL/HARD_TP reason — the rich alert is
+                # only sent for a confirmed hard-exit trade, never a
+                # discretionary SELL that happened to share the ticker.
+                # When no match (legacy free-text ax, or trades evicted
+                # before we read them), fall back to the bare text — the
+                # operator still gets a notification, byte-identical to
+                # the pre-change behaviour.
+                match = None
+                if isinstance(ax, str) and ax.strip():
+                    needle = ax.strip().upper()
+                    for t in trades:
+                        if (t.get("ticker") or "").upper() != needle:
+                            continue
+                        if not (t.get("action") or "").upper().startswith("SELL"):
+                            continue
+                        rsn = (t.get("reason") or "").upper()
+                        if rsn.startswith(("HARD_SL", "HARD_TP")):
+                            match = t
+                            break
+                if match is not None:
+                    reporter.send_trade_alert(
+                        match,
+                        snapshot=summary.get("snapshot"),
+                        store=store_,
+                    )
+                else:
+                    reporter._send(f"**AUTO RISK EXIT** `{ax}`")
+        if filled:
             reporter.send_decision_log(summary)
     except Exception as e:
         print(f"[runner] report failed: {e}")
