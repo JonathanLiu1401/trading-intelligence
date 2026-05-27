@@ -996,6 +996,21 @@ def _cycle():
                             _breaker_outage_count += 1
                     except Exception as e:
                         print(f"[runner] breaker alert failed: {e}")
+            # Defensive cleanup of ``_quota_first_ts`` on the NON-quota
+            # NO_DECISION branch. Symmetry gap with the recovery branch
+            # (runner.py:1051): without this, an orphaned ``_quota_first_ts``
+            # left behind by a failed-delivery first quota cycle persists
+            # through every subsequent non-quota NO_DECISION wedge — surfacing
+            # a misleading ``quota_outage_s`` via ``alarm_latch_state()`` to
+            # ``/api/alarm-latches`` while ``quota_active=False``. A trader
+            # reading the dashboard during a host-saturation wedge that
+            # *follows* an unalerted quota cycle would see a non-null quota
+            # outage age that does not correspond to a current quota state.
+            # Key on latch state, not status — exactly mirrors the
+            # ``test_orphan_quota_anchor_cleared_on_blocked_decision``
+            # precedent for the BLOCKED status one branch over.
+            if not _quota_alert_active and _quota_first_ts is not None:
+                _quota_first_ts = None
         else:
             # Capture the wedge duration BEFORE clearing _no_decision_first_ts
             # — the breaker-cleared Discord notice needs to know how long the
