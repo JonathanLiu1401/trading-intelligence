@@ -29175,3 +29175,161 @@ all green.
 **Staging:** explicit per-file pathspec — `paper_trader/analytics/
 portfolio_beta.py`, `paper_trader/dashboard.py`, `tests/test_portfolio_beta.py`,
 this AGENTS.md update. No `git add -A` (concurrent-agent footgun memory).
+
+
+## 2026-05-27 Agent 4 (feature-dev) — `/api/deployment-plan` + `/api/leverage-exposure`
+
+Two complementary endpoints that close the gap between the ML scorer
+slate, the half-Kelly target, and the per-name / sector / leverage
+caps — i.e. the bridge from "what does the model say I should buy?"
+to "what specifically should I deploy across this cash with my book's
+constraints?". Live observation that motivated this pass: paper-trader
+sitting 100% cash ($1167.71 / 16.77% above $1000 start), 12 scorer
+opportunities ranked by `pred_5d_return_pct`, `regime-leverage-fit-skill`
+verdict `MISSED_TAILWIND` (bull tape, 0% leveraged), and `/api/game-plan`
+returning STEADY with `n_actions=0` because it ingests the
+intern-driven `/api/suggestions` list (currently 2 WATCH-only signals
+on SPY/QQQ) and **never reads the scorer's own ranked opportunities**.
+
+### `/api/deployment-plan` (`paper_trader/analytics/deployment_plan.py`)
+
+Multi-trade buy plan that composes:
+
+* `/api/scorer-opportunities` — ML-ranked WATCHLIST names with a
+  `pred_5d_return_pct` and `verdict` (STRONG_HOLD at pred ≥ 3%, HOLD at
+  pred ≥ 1% — see `dashboard._scorer_verdict`).
+* `/api/kelly-sizing` — half-Kelly target as the initial per-name anchor.
+* `/api/concentration-cap` — the same per-name cap (default 25%) the
+  mechanical rebalance recommender uses.
+* `sector_exposure.SECTOR_MAP` — used as a soft secondary per-sector cap.
+* The new `LEVERAGE_FACTOR` map (see below) — combined leveraged-ETF
+  cap so the planner can't quietly stack 100% into +3x or -3x ETFs.
+
+Algorithm:
+
+1. **Filter slate**: drop already-held names; drop verdicts outside
+   `{STRONG_HOLD, HOLD}`; drop names below `min_pred_pct` (default 1%).
+2. **Rank** survivors by `pred_5d_return_pct` desc.
+3. **Budget** = `cash × (1 − reserve_cash_pct/100)` (default 10% reserve).
+4. **Per-candidate target** = `half_kelly_anchor × edge_mult`, clamped
+   to per-name cap, per-sector cap remaining, leveraged cap remaining,
+   and the deployable remainder. `edge_mult = 1.0 + 0.05 × (pred − floor)`
+   bounded [0.5, 2.0] so a +12% pred gets a moderately bigger slice
+   than a +2% pred.
+5. **Stop** when budget < `min_alloc_usd` (default $20) or `max_trades`
+   (default 8) is hit.
+
+Verdict ladder: `NO_OPPORTUNITIES` (slate yielded zero survivors) →
+`INSUFFICIENT_CASH` (deployable below floor) → `GATED` (every survivor
+blocked by caps OR plan shorter than survivor list) → `READY`.
+
+**Response** echoes every effective constraint under `constraints` and
+the implied post-book under `implied_book` (`post_cash_usd`,
+`post_top1_pct`, `post_top3_pct`, `post_leveraged_pct`,
+`blended_pred_5d_return_pct`), plus the SPY regime label and full
+`skipped` / `rejected_by_constraint` lists for diagnostic surfaces.
+
+Query parameters (all optional, all clamped to documented bands):
+`reserve_cash_pct`, `per_name_cap_pct`, `per_sector_cap_pct`,
+`leveraged_cap_pct`, `min_pred_pct`, `min_alloc_usd`, `max_trades`.
+
+Advisory only — never gates Opus, adds no caps, never executes
+(CLAUDE.md invariants #2 / #12). Pure core / never raises.
+
+### `/api/leverage-exposure` (`paper_trader/analytics/leverage_exposure.py`)
+
+Factor-level (+/- 2x, +/- 3x) breakdown of the current book AND the
+scorer opportunity slate. Distinct from
+`/api/regime-leverage-fit-skill`, which reports the book's combined
+leveraged % as a single number, collapses long-lev and inverse-lev
+together, and never inspects the slate.
+
+* **Book** — dollars by factor bucket (`+3`, `-3`, `+2`, `-2`, `1`),
+  with per-bucket ticker list. Reads `market_value` (preferred) or
+  falls back to `qty × current_price` (the concentration_cap
+  precedent).
+* **Slate** — *count* by factor bucket (and equal-weighted
+  `pred_5d_avg_pct` per bucket) because opportunities aren't sized yet.
+  Slate-wide blended `pred_5d_return_pct` so the panel can call out
+  whether the slate's signal-mix is regime-aligned.
+* **Verdict** — `ALIGNED` / `UNDER_LEV` / `OVER_LEV` / `NO_SLATE`, gated
+  by the regime label derived from SPY 20d mom (same thresholds as
+  `regime-leverage-fit-skill`: bull ≥ 3%, bear ≤ −3%).
+
+Pure / never raises / no IO. SSOT for the factor map is
+`leverage_exposure.LEVERAGE_FACTOR`; a CI test
+(`test_factor_map_mirrors_leveraged_etfs_live`) pins it to
+`strategy._LEVERAGED_ETFS_LIVE` so a new leveraged ETF added to the
+trading vocabulary can't silently degrade to 1x.
+
+### Unified-dashboard surfacing
+
+`/home/zeph/unified_dashboard.py` adds:
+
+* `/api/capital-deployment` — single fan-out that composes the two
+  trader endpoints into ONE panel-feed so the landing JS does one
+  upstream fetch. Forwards query string verbatim to the deployment-plan
+  upstream so panel-level constraint overrides reach the planner.
+* **"Capital Deployment" landing panel** — placed between the trader
+  KPI strip and the Position Watchlist (the same visual layer
+  position-ladder occupies). Two-column grid: left column is the
+  ranked plan rows (ticker, alloc $, % of book, pred 5d, sector,
+  verdict) + implied-book line + skipped/gated tally; right column is
+  the leverage table (book vs slate × long-lev / inverse-lev / unlev).
+
+### Why this pass
+
+`/api/game-plan` already exists as a **synthesis** layer over four
+single-concern panels — but its `opportunities` field reads from
+`/api/suggestions` (the intern-driven WATCH list), not from
+`/api/scorer-opportunities`. The two systems disagree by design (the
+suggestions list is news-conviction; the scorer is quant-conviction)
+and a trader sitting all-cash with a bull-tape regime had no single
+place to see the scorer's recommendation reconciled with their
+sizing/concentration rules. This pass fills that bridge — without
+modifying `game-plan` (its `STEADY`/`ACTIONS_PRESENT` semantics are
+behavior-locked by `test_game_plan.py`), and without changing the
+trader's risk model (advisory invariants #2 / #12 preserved).
+
+### Files
+
+* `paper_trader/analytics/leverage_exposure.py` — pure classifier +
+  breakdown builder. Module-level `LEVERAGE_FACTOR` map is SSOT; CI
+  test pins it to `strategy._LEVERAGED_ETFS_LIVE`.
+* `paper_trader/analytics/deployment_plan.py` — pure allocator. All
+  percent inputs clamped to documented bands; effective constraints
+  echoed in the response.
+* `paper_trader/dashboard.py` — `/api/leverage-exposure` and
+  `/api/deployment-plan` routes, plus small `_spy_regime_label()` and
+  `_scorer_opportunities_inline()` helpers shared between them.
+* `/home/zeph/unified_dashboard.py` — `/api/capital-deployment` UD
+  endpoint, `_compute_capital_deployment` router, "Capital Deployment"
+  landing panel HTML + `renderCapitalDeployment` JS + refresh-loop
+  wiring.
+* `tests/test_leverage_exposure.py` — 18 tests. Classifier (3x long,
+  3x inverse, 2x long, 1x default, case-insensitive, garbage input),
+  factor-map drift-lock, book splits, slate splits, verdict ladder
+  branches, Flask endpoint contract.
+* `tests/test_deployment_plan.py` — 17 tests. Verdict ladder
+  (NO_OPPORTUNITIES / INSUFFICIENT_CASH / READY), filter behaviour
+  (skip-held, non-buy-verdict, sub-floor), ranking, per-name +
+  per-sector + leverage caps each enforce independently, implied-book
+  math matches the plan sum, `max_trades` truncation, constraint
+  clamping, garbage-input robustness, Flask endpoint + query-param
+  shapes.
+
+### Tests
+
+35 new (`test_leverage_exposure` 18 + `test_deployment_plan` 17) +
+sanity-rerun of 81 adjacent (`test_kelly_sizing` 21 +
+`test_concentration_cap` 25 + `test_leverage_exposure` 18 +
+`test_deployment_plan` 17 — single 1.25s pytest invocation) all green.
+
+### Staging
+
+Explicit per-file pathspec: `paper_trader/analytics/
+leverage_exposure.py`, `paper_trader/analytics/deployment_plan.py`,
+`paper_trader/dashboard.py`, `tests/test_leverage_exposure.py`,
+`tests/test_deployment_plan.py`, and this AGENTS.md update. The
+`unified_dashboard.py` edits commit separately in `/home/zeph` (a
+different repo). No `git add -A` (concurrent-agent footgun memory).

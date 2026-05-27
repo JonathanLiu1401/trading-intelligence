@@ -20234,6 +20234,197 @@ def api_stack_liveness():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Capital deployment — two complementary endpoints that close the gap
+# between the scorer slate, Kelly sizing, and the concentration policy:
+#
+#   /api/leverage-exposure — book + slate factor breakdown (1x / +2x /
+#                            +3x / -2x / -3x), composable with the
+#                            deployment-plan as a constraint and as a
+#                            standalone "are we positioned for the
+#                            regime?" panel. Differs from
+#                            /api/regime-leverage-fit-skill (which only
+#                            returns a single verdict and the book's
+#                            collapsed leveraged %).
+#
+#   /api/deployment-plan   — multi-trade buy plan synthesising the ML
+#                            scorer slate + Kelly sizing + the per-name /
+#                            per-sector / per-leverage caps into a
+#                            concrete "deploy $A1 into T1, $A2 into T2…"
+#                            recommendation with an implied post-book
+#                            preview. Bridges the gap where /api/game-plan
+#                            silently ignores the scorer.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _spy_regime_label() -> tuple[str, float | None]:
+    """Cheap regime label from SPY's 20-day momentum, mirroring the
+    thresholds in /api/regime-leverage-fit-skill (bull >= 3%, bear <=
+    -3%). Returns (regime, spy_mom_20d) — falls back to ("unknown",
+    None) on any failure. Never raises."""
+    try:
+        from .strategy import get_quant_signals_live
+        spy_q = (get_quant_signals_live(["SPY"]) or {}).get("SPY") or {}
+        mom20 = spy_q.get("mom_20d")
+        if not isinstance(mom20, (int, float)):
+            return "unknown", None
+        m = float(mom20)
+        if m >= 3.0:
+            return "bull", m
+        if m <= -3.0:
+            return "bear", m
+        return "sideways", m
+    except Exception:
+        return "unknown", None
+
+
+def _scorer_opportunities_inline() -> list[dict]:
+    """Re-derive scorer-opportunities via the route handler so the same
+    SWR cache is reused (avoiding a duplicate scorer pass on every
+    deployment-plan request). Returns ``opportunities`` or []."""
+    try:
+        resp = scorer_opportunities_api()
+        data = resp.get_json() if hasattr(resp, "get_json") else {}
+        if isinstance(data, dict):
+            return list(data.get("opportunities") or [])
+    except Exception:
+        pass
+    return []
+
+
+@app.route("/api/leverage-exposure")
+def leverage_exposure_api():
+    """Leverage-factor breakdown of the current book AND the scorer slate.
+
+    Existing ``/api/regime-leverage-fit-skill`` reports the book's
+    leveraged % as a single number (any name in the leveraged-ETF set
+    counts), collapses long-leveraged and inverse-leveraged into one
+    bucket, and never inspects the opportunity slate. This endpoint
+    surfaces the factor-level (+/- 2x, +/- 3x) breakdown for both the
+    book and the slate, with a regime-aware verdict so a trader can see
+    whether the slate's direction-mix actually matches the tape.
+
+    Advisory only — never gates Opus, adds no caps (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.leverage_exposure import build_leverage_exposure
+        store = get_store()
+        positions = store.open_positions()
+        pf = store.get_portfolio()
+        rows, _ = _portfolio_rows_from_positions(positions)
+        # We pass the priced position rows (they carry market_value)
+        # rather than the raw store rows; build_leverage_exposure prefers
+        # market_value but falls back to qty*price for either shape.
+        total_value = float(pf.get("total_value") or 0.0)
+        opportunities = _scorer_opportunities_inline()
+        regime, _spy_mom = _spy_regime_label()
+        return jsonify(build_leverage_exposure(
+            positions=rows,
+            total_value=total_value,
+            opportunities=opportunities,
+            regime=regime,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e),
+                        "verdict": "ERROR",
+                        "headline": f"ERROR — {e}"}), 500
+
+
+@app.route("/api/deployment-plan")
+def deployment_plan_api():
+    """Multi-trade capital-deployment plan composing the ML scorer
+    slate, half-Kelly sizing, and the concentration / sector / leverage
+    caps into a concrete buy list with an implied post-book preview.
+
+    Closes the gap where ``/api/game-plan`` only ingests intern-driven
+    suggestions (the WATCH list) and never reads the scorer's own ranked
+    opportunity set. Composable with ``/api/leverage-exposure``,
+    ``/api/kelly-sizing``, and ``/api/concentration-cap`` — the response
+    echoes every effective constraint so the operator can dial it back.
+
+    Query parameters (all optional, all clamped):
+
+      * ``reserve_cash_pct`` — % cash to hold back (default 10)
+      * ``per_name_cap_pct`` — cap per name as % of book (default 25)
+      * ``per_sector_cap_pct`` — cap per sector (default 40)
+      * ``leveraged_cap_pct`` — combined +/- leveraged cap (default 30)
+      * ``min_pred_pct`` — only deploy on pred_5d >= floor (default 1.0)
+      * ``min_alloc_usd`` — drop trades below this $ (default 20)
+      * ``max_trades`` — max plan length (default 8)
+
+    Advisory only — never gates Opus, never executes (AGENTS.md
+    #2/#12). Never raises — every component degrades to ``ERROR``."""
+    try:
+        from .analytics.deployment_plan import (
+            build_deployment_plan,
+            DEFAULT_RESERVE_CASH_PCT, DEFAULT_PER_NAME_CAP_PCT,
+            DEFAULT_PER_SECTOR_CAP_PCT, DEFAULT_LEVERAGED_CAP_PCT,
+            DEFAULT_MIN_PRED_PCT, DEFAULT_MIN_ALLOC_USD,
+            DEFAULT_MAX_TRADES,
+        )
+
+        def _arg_f(name: str, default: float) -> float:
+            try:
+                return float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        def _arg_i(name: str, default: int) -> int:
+            try:
+                return int(request.args.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        store = get_store()
+        positions = store.open_positions()
+        pf = store.get_portfolio()
+        rows, _ = _portfolio_rows_from_positions(positions)
+        cash = float(pf.get("cash") or 0.0)
+        total_value = float(pf.get("total_value") or 0.0)
+        opportunities = _scorer_opportunities_inline()
+
+        # Reuse the live half-Kelly target so the plan tracks the same
+        # sizing target other panels show. Fall back to the analytics
+        # default if Kelly is in NO_DATA state.
+        kelly_pct = None
+        try:
+            from .analytics.kelly_sizing import build_kelly_sizing
+            trades = list(reversed(store.recent_trades(2000)))
+            top1_pct, _, top1_ticker = _conc_top1_top3(rows, total_value)
+            ksz = build_kelly_sizing(
+                trades,
+                top_position_pct=top1_pct if rows else None,
+                top_position_ticker=top1_ticker,
+            )
+            kelly_pct = ksz.get("half_kelly_pct")
+        except Exception:
+            kelly_pct = None
+
+        result = build_deployment_plan(
+            opportunities=opportunities,
+            positions=rows,
+            cash_usd=cash,
+            total_value=total_value,
+            kelly_pct=kelly_pct,
+            reserve_cash_pct=_arg_f("reserve_cash_pct", DEFAULT_RESERVE_CASH_PCT),
+            per_name_cap_pct=_arg_f("per_name_cap_pct", DEFAULT_PER_NAME_CAP_PCT),
+            per_sector_cap_pct=_arg_f("per_sector_cap_pct", DEFAULT_PER_SECTOR_CAP_PCT),
+            leveraged_cap_pct=_arg_f("leveraged_cap_pct", DEFAULT_LEVERAGED_CAP_PCT),
+            min_pred_pct=_arg_f("min_pred_pct", DEFAULT_MIN_PRED_PCT),
+            min_alloc_usd=_arg_f("min_alloc_usd", DEFAULT_MIN_ALLOC_USD),
+            max_trades=_arg_i("max_trades", DEFAULT_MAX_TRADES),
+        )
+        # Surface the SPY regime + n-of-slate for context.
+        regime, spy_mom = _spy_regime_label()
+        result["regime"] = regime
+        result["spy_mom_20d"] = round(spy_mom, 2) if isinstance(spy_mom, float) else None
+        result["n_opportunities_input"] = len(opportunities)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e),
+                        "verdict": "ERROR",
+                        "headline": f"ERROR — {e}"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 🐒 10,000-monkey random baseline — gold-standard edge validator.
 #
 # Compares AI backtest returns against 10,000 randomly-trading "monkeys" on
