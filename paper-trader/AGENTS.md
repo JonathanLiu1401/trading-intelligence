@@ -6,6 +6,216 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-27 core HYBRID pass (Agent 1, third cycle) — orphan `_quota_first_ts` cleanup symmetry gap + `/api/today-realized-pl`
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=8
+
+### Phase 1 — Bug: orphan `_quota_first_ts` not cleaned on non-quota NO_DECISION (`bugs_fixed = 1`)
+
+The orphan-anchor cleanup at `runner.py:1051` (recovery branch /
+non-NO_DECISION path) keys on the latch state and clears
+`_quota_first_ts` when `_quota_alert_active=False`, exactly mirroring
+the documented invariant ("the count must reflect outages the operator
+was actually told about — never silent failures"). Existing tests pin
+the cleanup for HOLD / FILLED / BLOCKED status, but the symmetric
+**non-quota NO_DECISION** path (timeout / parse fail / host-saturated —
+anything that does NOT set `quota_exhausted=True`) had NO cleanup at
+all.
+
+**Visible symptom.** A first quota cycle whose `send_quota_alert`
+failed left `_quota_first_ts` set with `_quota_alert_active=False`. If
+the very next cycle was a non-quota NO_DECISION, the orphan persisted
+through the entire subsequent wedge. `alarm_latch_state()` then
+returned a non-null `quota_outage_s` while `quota_active=False`,
+exposed via `/api/alarm-latches` — a trader reading the dashboard
+during a host-saturation wedge that follows an unalerted quota cycle
+saw a misleading quota outage age that did NOT correspond to any
+current quota state. The `alarm_latch_headline()` formatter masked the
+inconsistency (it suppresses the quota line when `quota_active=False`)
+but the JSON consumers (any future dashboard panel keyed off
+`quota_outage_s`) still saw the orphan.
+
+**Fix.** Added the same defensive cleanup
+(`if not _quota_alert_active and _quota_first_ts is not None:
+_quota_first_ts = None`) to the `if status == "NO_DECISION":` branch —
+mirrors the established BLOCKED-status precedent
+(`test_orphan_quota_anchor_cleared_on_blocked_decision`).
+
+**Tests.** `tests/test_core_runner_cycle.py` extended with 2 cases:
+- `test_orphan_quota_anchor_cleared_on_non_quota_no_decision` —
+  pre-fix this FAILED (the orphan stayed); post-fix it passes.
+- `test_orphan_anchor_does_not_clear_active_quota_during_wedge` —
+  counterpart pin: when the latch IS armed, a non-quota NO_DECISION
+  cycle between the alert and the recovery must NOT drop the anchor
+  (the eventual recovery still needs `_quota_first_ts` to compute
+  the real elapsed duration for the EXHAUSTED → RECOVERED bracket).
+
+All 11 `TestQuotaOutageRecovery` cases pass post-fix (commit
+`09f3109`).
+
+### Phase 2 — Feature: `/api/today-realized-pl` (`features_added = 1`)
+
+The existing realized-P/L surfaces each describe a different shape —
+none answer the **morning operator's first click**: "how did yesterday
+close out — what did I actually lock in, and on which names?".
+
+| Existing surface              | What it answers                                          |
+|-------------------------------|----------------------------------------------------------|
+| `/api/realized-vs-unrealized` | ALL-TIME realized vs unrealized split since the $1000 start. Headline framing of "today's gain" is misleading — it includes every realized dollar since inception. |
+| `/api/today-action-tape`      | Flat aggregate (n_buys, n_sells, notional_in/out, net_cash_flow) of every decision today — no per-lot P/L framing, no win/loss split. |
+| `/api/closed-positions`       | Every closed lot in history with realized_pl per round-trip — unbounded by date, no day filter. |
+
+The new builder at `paper_trader/analytics/today_realized_pl.py` walks
+`store.closed_positions(N)`, filters to lots whose `closed_at` falls
+on TODAY in NY-session time (the canonical trading day — anchors the
+daily-close report), and emits:
+
+- `net_realized_usd` / `net_realized_pct` (return on capital deployed
+  in today's round-trips; NOT % of starting book)
+- `n_winners` / `n_losers` / `n_scratch` (with a sub-cent breakeven
+  epsilon — float rounding on tiny round-trips routinely produces
+  `net = $0.0009` and calling that a WINNING_DAY would be misleading)
+- `biggest_win` / `biggest_loss` (None when no win / no loss respectively
+  — silence-when-nothing-actionable in the headline)
+- `avg_hold_seconds` / `avg_hold_hours`
+- `closes`: per-lot records sorted by `realized_pl` desc (best first),
+  capped at `_MAX_CLOSES_RENDERED=20` so a very busy day stays bounded
+
+**Verdict ladder:** `NO_CLOSES_TODAY` / `WINNING_DAY` / `LOSING_DAY` /
+`BREAKEVEN_DAY`. Silence-by-default suppression precedent — the morning
+operator's first click should not become a lying green light.
+
+**SSOT (invariant #10):** the per-lot `realized_pl` field is the same
+one `store.py`'s round-trip walker emits for `/api/closed-positions`,
+so this surface and that one can never disagree on a closed lot's
+realized P/L.
+
+**Endpoint contract:** `?limit=N` (1..1000, default 500) bounds the
+`closed_positions` scan. The default 500 covers many trading days of
+closures so a morning click always sees today's full picture even on a
+busy book. ERROR envelope on any builder fault — never 500s (same
+discipline as `/api/hard-exit-summary`).
+
+**Tests** (`tests/test_today_realized_pl.py`, 36 cases): NY-tz date
+filtering (close at 23:00 ET yesterday is NOT today's; close at 00:00
+ET today IS today's), verdict precedence ladder, sub-epsilon scratch
+classification, % calc when total_cost > 0 vs None fallback when zero,
+capped rendering of the `closes` array, headline composition (omits
+"best" on losing days, "worst" on winning days), per-row filtering of
+malformed inputs (non-dict, missing realized_pl, non-numeric pl,
+unparseable closed_at), endpoint envelope contract + invalid
+query-param graceful degradation. Commit `0795e89`.
+
+### Phase 3 — Live trader validation (`user_findings = 8`)
+
+1. **MAJOR: Reactivated positions hide round-trip realized P/L from
+   `/api/closed-positions`.** Live state (2026-05-27, 21:35 UTC) — the
+   live trader's `paper_trader.db` shows MU position id=4 with a
+   single row that has been re-opened multiple times in-place
+   (`store.upsert_position`'s closed-row reactivation path). Two real
+   MU round-trips both hit HARD_TP and produced realized P/L
+   (`2026-05-26 SELL @ 889.50 = +$180`, `2026-05-27 SELL @ 928.41 =
+   +$32`), but neither shows up in `store.closed_positions()` because
+   reactivation overwrites `closed_at` back to NULL. ~$212 of realized
+   gains are invisible to the closed-positions analytics, the per-lot
+   win-rate calc, the autopsy track-record, AND the new
+   `/api/today-realized-pl` endpoint (which inherits the same data
+   gap). The dashboard headline `pnl_vs_start: +$199.52 (+19.95%)`
+   still matches because that is computed from cash + open_value, not
+   from summing closed_positions. **This is the day's most material
+   data-integrity finding.** A real fix would require either (a)
+   walking the trades table to derive round-trips outside the
+   positions table, or (b) stopping the reactivation and creating a
+   fresh row per re-entry (breaks the `UNIQUE(ticker,type,expiry,
+   strike)` constraint for options, so would need schema work). Not
+   safe to land in this pass — flagged for next.
+
+2. **NO_DECISION rate ~44%** (22/50 cycles), dominated by
+   `cli_nonzero_rc` (68%). Known host-saturation pattern
+   ([[pt-no-decision-host-saturation]]). Not a fresh bug.
+
+3. **`paper-trader.service` (systemd) is in a rapid auto-restart
+   loop** (counter ≥ 87, status=1/FAILURE every ~15s). The actual
+   trader runs as a manual process (PID 441139); the systemd unit
+   loop is documented ([[pt-systemd-vs-manual-restart-spam]]) and the
+   memory entry explicitly says don't "fix" it.
+
+4. **MU 77% concentration** — biggest position $928 of $1199 book.
+   Past the `DOMINANT_WEIGHT=60%` threshold; SINGLE_NAME_RISK should
+   be firing on `/api/correlation`. Opus's reasoning explicitly
+   accepts the risk ("1 share = ~77% of book is sized to the
+   momentum thesis"). The `_concentration_line` Discord helper would
+   surface this; verify on the next hourly post.
+
+5. **Engine performance is excellent** — +19.95% from $1000 start in
+   ~8 days, win rate would be excellent if MU round-trips were
+   counted (2 of 3 MU round-trips +20%+).
+
+6. **Opus reasoning quality is high** — each BUY rationale cites ML
+   advisor agreement, technical alignment (RSI/MACD/EMA200/BB), and
+   historical track record by name. Good prompt design at work.
+
+7. **Build SHA caught up** — `boot_sha=924e7ef head_sha=924e7ef
+   behind=0` (the git-watcher works; runner restarted between Phase 2
+   commit and Phase 3 validation, so the new `/api/today-realized-pl`
+   was live for the validation check).
+
+8. **`/api/today-realized-pl` returns `NO_CLOSES_TODAY` on the live
+   book** despite the real MU SELL today. This is finding #1 in
+   another flavor — the new endpoint inherits the upstream
+   `store.closed_positions()` data gap. Once the reactivation issue
+   is addressed (finding #1), this endpoint will start surfacing
+   today's real realized P/L automatically. The endpoint's own logic
+   is correct; the data feeding it is incomplete.
+
+### Phase 4 — Files touched
+
+```
+paper_trader/runner.py                            (+15 lines: orphan _quota_first_ts cleanup in NO_DECISION branch)
+paper_trader/analytics/today_realized_pl.py      (new — 257 lines)
+paper_trader/dashboard.py                         (+67 lines: /api/today-realized-pl route)
+tests/test_core_runner_cycle.py                   (+61 lines: 2 new TestQuotaOutageRecovery cases)
+tests/test_today_realized_pl.py                   (new — 471 lines / 36 tests)
+AGENTS.md                                         (this section)
+```
+
+### Test commands
+
+```bash
+# This pass's focused suite
+python3 -m pytest tests/test_today_realized_pl.py \
+                  tests/test_core_runner_cycle.py::TestQuotaOutageRecovery -v
+
+# Core regression (~3.5 min, 951 passed / 1 skipped)
+python3 -m pytest tests/test_core_*.py tests/test_today_realized_pl.py -q
+
+# The new endpoint live
+curl -s http://localhost:8090/api/today-realized-pl | jq '{verdict, headline, n_closes, net_realized_usd}'
+
+# CLI for ops
+python3 -m paper_trader.analytics.today_realized_pl
+```
+
+### How to interpret `/api/today-realized-pl`
+
+- **`NO_CLOSES_TODAY`** — no closures landed on today's NY date.
+  Dashboard panel renders the headline verbatim; Discord-side
+  consumers should suppress (silence-when-nothing-actionable).
+- **`WINNING_DAY`** — net realized > +1¢ across today's closures.
+  Headline carries `+$X realized over N closes (NW/ML)` and includes
+  `best <ticker> +$Y` and (if any loser) `worst <ticker> -$Z`.
+- **`LOSING_DAY`** — net realized < -1¢. Mirror of WINNING_DAY.
+- **`BREAKEVEN_DAY`** — |net| ≤ 1¢. The sub-cent epsilon catches the
+  float-rounding-from-yfinance-fills edge case where two perfectly
+  symmetric round-trips technically net $0.0009.
+
+`net_realized_pct = net_realized_usd / total_cost_basis_usd * 100`
+(return on TODAY's deployed capital, NOT % of starting book — a
+trader deploying $200 to make $20 reads 10% here, not 2% against the
+$1000 anchor).
+
+---
+
 ## 2026-05-28 ML+backtest HYBRID pass (Agent 2) — `_article_sentiment` false-positive fix + `paper_trader.ml.scorecard` unified health view
 
 **Counters:** bugs_fixed=1 · features_added=1 · user_findings=7
