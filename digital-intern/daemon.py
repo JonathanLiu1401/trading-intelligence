@@ -51,6 +51,7 @@ from collectors.ticker_news import collect_ticker_news
 from collectors.reddit_collector import collect_reddit
 from collectors.stocktwits_collector import collect_stocktwits
 from collectors.stocktwits_sentiment import collect_stocktwits_sentiment
+from collectors.stocktwits_trending_symbols import collect_trending_symbols
 from collectors.web_scraper import scrape_web
 from collectors.stock_data import get_stock_data, _fetch_one
 from collectors.earnings_calendar import get_earnings
@@ -894,6 +895,27 @@ def stocktwits_sentiment_worker(store: ArticleStore):
             log.warning(f"[stocktwits_sentiment_worker] error: {e}; backing off {bo.peek():.0f}s")
             bo.sleep(lambda: _running)
             continue
+
+
+def stocktwits_trending_symbols_worker(store: ArticleStore):
+    log.info("[stocktwits_trending_symbols] started")
+    bo = Backoff("stocktwits_trending_symbols", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_trending_symbols()
+            _ingest(store, articles, "stocktwits/trending_symbols")
+            try:
+                source_health.record_result("stocktwits_trending_symbols", len(articles))
+            except Exception as he:
+                log.warning(f"[stocktwits_trending_symbols] source_health error: {he}")
+            _worker_last_ok["stocktwits_trending_symbols"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[stocktwits_trending_symbols] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        # Poll every 5 minutes — trending list doesn't change faster than that
+        _sleep(300)
         _sleep(300)  # re-scan every 5 min; internal cursor prevents per-ticker spam
 
 
@@ -4766,6 +4788,7 @@ def main():
         ("reddit",      reddit_worker),
         ("stocktwits",  stocktwits_worker),
         ("stocktwits_sentiment", stocktwits_sentiment_worker),
+        ("stocktwits_trending", stocktwits_trending_symbols_worker),
         ("ticker",      ticker_worker),
         ("sec_edgar",   sec_edgar_worker),
         ("sec_edgar_ft", sec_edgar_ft_worker),
