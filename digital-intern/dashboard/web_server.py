@@ -3250,6 +3250,95 @@ def _cash_conviction_fit_chat_lines(rep) -> list[str]:
     return lines
 
 
+def _actionable_opportunities_chat_lines(rep) -> list[str]:
+    """Render paper-trader's ``/api/actionable-opportunities`` — composite
+    ranker for unheld watchlist names that crosses three orthogonal SSOT
+    surfaces — into compact chat-context lines.
+
+    The other unheld-pick blocks in chat each carry ONE axis: scorer-
+    opportunities = pure quant predicted return, persistent-watchlist =
+    contiguous-hours of news heat, watchlist-news-silence = coverage
+    inverse. None answer the analyst's most-common synthesis question:
+    *"of the strong scorer picks, which one is the wire ALSO talking
+    about right now?"*. A NEWS_CONFIRMED or HIGH_CONVICTION_FOUND verdict
+    means the quant model AND the wire agree on a name — high-trust
+    actionability that survives the disagreement no other panel can detect.
+
+    The SCORER_BUT_NO_NEWS verdict is equally important: it documents the
+    failure mode where the scorer screams STRONG_HOLD on many names but
+    the wire is silent on every one (live snapshot 2026-05-27 02:49 ET:
+    46 STRONG_HOLD picks, all news-cold). The analyst can answer "should
+    I act?" with explicit awareness that one axis is hot and the other
+    quiet — neither surface alone surfaces that asymmetry.
+
+    SSOT (paper-trader invariant #10): the builder's own top-level
+    ``headline`` is the chat headline — no chat-side re-derivation of the
+    verdict naming. The detail block restates per-ticker rows in builder
+    field order. ``reasons`` strings pass through verbatim — the bot's
+    own quant + wire phrasing, never a chat-side paraphrase.
+
+    Pure / total — the ``_cash_conviction_fit_chat_lines`` contract:
+
+    - non-dict → ``[]``
+    - top-level ``verdict`` not in {"HIGH_CONVICTION_FOUND",
+      "NEWS_CONFIRMED", "PERSISTENT_FOLLOWUP", "SCORER_BUT_NO_NEWS",
+      "NEWS_BUT_NO_SCORER"} → ``[]``: ALL_QUIET / INSUFFICIENT_DATA /
+      ERROR collapse to silence (the silence-on-healthy precedent;
+      INSUFFICIENT_DATA is a probe-side defect not a verdict).
+    - actionable → builder's verbatim ``headline`` + up to 3 ticker
+      rows with ``reasons`` verbatim. Missing fields degrade silently.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("verdict") not in (
+        "HIGH_CONVICTION_FOUND",
+        "NEWS_CONFIRMED",
+        "PERSISTENT_FOLLOWUP",
+        "SCORER_BUT_NO_NEWS",
+        "NEWS_BUT_NO_SCORER",
+    ):
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    rows = rep.get("by_ticker")
+    if isinstance(rows, list):
+        actionable_levels = {
+            "HIGH_CONVICTION", "NEWS_CONFIRMED", "PERSISTENT_FOLLOWUP",
+            "SCORER_ONLY", "NEWS_ONLY",
+        }
+        surfaced = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("actionability") not in actionable_levels:
+                continue
+            tk = row.get("ticker")
+            if not isinstance(tk, str) or not tk.strip():
+                continue
+            reasons = row.get("reasons")
+            reasons_str = ""
+            if isinstance(reasons, list):
+                # reasons strings carry verbatim from the builder — they
+                # already encode the % / × / hours numbers in compact form
+                kept = [r for r in reasons if isinstance(r, str) and r.strip()]
+                if kept:
+                    reasons_str = "; ".join(kept[:3])
+            verdict_tag = str(row.get("actionability") or "")
+            if reasons_str:
+                lines.append(f"  {tk} [{verdict_tag}] — {reasons_str}")
+            else:
+                lines.append(f"  {tk} [{verdict_tag}]")
+            surfaced += 1
+            if surfaced >= 3:
+                break
+
+    return lines
+
+
 def _passive_signal_density_chat_lines(rep) -> list[str]:
     """Render paper-trader's `/api/passive-signal-density` (the smoking-gun
     detector for "engine idle while news is loud") into compact chat lines.
@@ -5695,6 +5784,82 @@ def create_app(store=None) -> Flask:
         ]
         return jsonify(build_ticker_comentions(
             articles, window_hours=hours, now=now))
+
+    @app.get("/api/ticker-news-burst")
+    def api_ticker_news_burst():
+        """Per-ticker news-volume burst vs per-hour baseline for the held
+        book — answers "is the wire heating up on a held / watched name
+        RIGHT NOW?".
+
+        Live evidence (2026-05-26, 1h vs 23h prior): SOXX 18×, MU 12.67×,
+        QBTS 12.55×, DRAM 10.31× — none surfaced anywhere else in the
+        system because every other live volume surface (ticker-velocity,
+        ticker-comentions, sector-pulse) discovers tickers from the wire
+        rather than taking a known universe.
+
+        Pure builder ``analytics.ticker_news_burst_runner.build_ticker_news_burst``
+        — same verdict ladder, baseline-per-h floor, and sort order as the
+        in-process ``ArticleStore.ticker_news_burst`` storage method so the
+        endpoint and the daemon's analytics surface cannot diverge.
+
+        ``?window_h=`` clamped 0.25..12.0 (default 1.0).
+        ``?baseline_h=`` clamped to ``[1.5 * window_h, 168]`` (default 24).
+        ``?tickers=`` optional CSV; defaults to ``LIVE_PORTFOLIO_TICKERS``
+        (the held + watched universe the daemon's alert ``book:`` tag and
+        ``ticker_news_burst`` already use).
+
+        Honours ``_LIVE_ONLY_SQL`` — backtest-injected rows excluded.
+        Read-only — no ai_score / ml_score / score_source / urgency mutation.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            window_h = float(request.args.get("window_h", 1.0))
+        except (TypeError, ValueError):
+            window_h = 1.0
+        window_h = max(0.25, min(12.0, window_h))
+        try:
+            baseline_h = float(request.args.get("baseline_h", 24.0))
+        except (TypeError, ValueError):
+            baseline_h = 24.0
+        baseline_h = max(window_h * 1.5, min(168.0, baseline_h))
+
+        tickers_arg = (request.args.get("tickers") or "").strip()
+        if tickers_arg:
+            tickers = [t.strip() for t in tickers_arg.split(",") if t.strip()]
+        else:
+            try:
+                from ml.features import LIVE_PORTFOLIO_TICKERS
+                tickers = sorted(LIVE_PORTFOLIO_TICKERS)
+            except Exception:
+                tickers = []
+
+        from analytics.ticker_news_burst_runner import (
+            build_ticker_news_burst,
+            FETCH_LIMIT,
+        )
+        now = datetime.now(timezone.utc)
+        cutoff = (
+            now - timedelta(hours=baseline_h + window_h)
+        ).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT first_seen, title FROM articles "
+                f"WHERE {_LIVE_ONLY_SQL} "
+                "AND first_seen >= ? "
+                "ORDER BY first_seen DESC LIMIT ?",
+                (cutoff, FETCH_LIMIT),
+            )
+        except sqlite3.Error:
+            rows = []
+        articles = [{"first_seen": r[0], "title": r[1]} for r in rows]
+        return jsonify(build_ticker_news_burst(
+            articles,
+            tickers=tickers,
+            window_h=window_h,
+            baseline_h=baseline_h,
+            now=now,
+        ))
 
     @app.get("/api/portfolio-signals")
     def api_portfolio_signals():
@@ -9181,6 +9346,41 @@ def create_app(store=None) -> Flask:
         except Exception as e:
             _logger().warning("chat: cash-conviction-fit fetch failed: %s", e)
 
+        # Actionable opportunities — the composite ranker for UNHELD
+        # watchlist names that crosses three orthogonal axes (scorer
+        # predicted 5d return × this-dashboard's ticker-news-burst ×
+        # persistent-watchlist hot-run). The chat already carries each
+        # axis SEPARATELY (scorer-opportunities, persistent-watchlist
+        # under the trader analytics block, this dashboard's ticker-
+        # velocity / ticker-comentions) but none answer the analyst's
+        # synthesis question: "of the strong scorer picks, which one is
+        # the wire ALSO talking about RIGHT NOW?". A HIGH_CONVICTION /
+        # NEWS_CONFIRMED verdict means quant + wire agree on a name — the
+        # specific cross-confirmation no single panel surfaces. The
+        # SCORER_BUT_NO_NEWS verdict explicitly documents the live-state
+        # disagreement (scorer screaming STRONG_HOLD on dozens of names,
+        # wire silent) so the analyst can answer "should I act?" with
+        # honest source-availability awareness. Fires ONLY on
+        # HIGH_CONVICTION_FOUND / NEWS_CONFIRMED / PERSISTENT_FOLLOWUP /
+        # SCORER_BUT_NO_NEWS / NEWS_BUT_NO_SCORER (ALL_QUIET /
+        # INSUFFICIENT_DATA / ERROR collapse to silence). Composed
+        # verbatim by the pure _actionable_opportunities_chat_lines
+        # helper (unit-tested; SSOT). Guarded 3s read.
+        actionable_opportunities_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/actionable-opportunities",
+                    timeout=3) as resp:
+                _ao = json.loads(resp.read().decode("utf-8"))
+            actionable_opportunities_block = "\n".join(
+                _actionable_opportunities_chat_lines(_ao)
+            )
+        except Exception as e:
+            _logger().warning(
+                "chat: actionable-opportunities fetch failed: %s", e
+            )
+
         now_iso = datetime.now(timezone.utc).isoformat()
         system_prompt = (
             "You are a market intelligence analyst with access to a real-time news feed, "
@@ -9203,6 +9403,7 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — TIME-OF-DAY EDGE (the per-hour-of-day alpha-vs-SPY fingerprint over the bot's equity-curve history — 'WHEN in the trading day has this bot actually earned alpha?'. The chat carries dozens of book/decisions/skills blocks but no temporal-edge verdict; a MORNING_EDGE bot should be more aggressive at the best alpha hour and lighter at the worst-alpha hour, and the analyst can answer 'is now a good time to lean into this signal?' only with this empirical hour-of-day view. Surfaced ONLY when MORNING_EDGE / MIDDAY_EDGE / AFTERNOON_EDGE / OFF_HOURS_EDGE (i.e. a non-flat fingerprint with adequate samples), never filler when FLAT_CLOCK / INSUFFICIENT_DATA / NO_SPY_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{hourly_pnl_block}\n\n" if hourly_pnl_block else "")
             + (f"PAPER TRADER — DAY-OF-WEEK EDGE (the per-weekday alpha-vs-SPY fingerprint over the bot's equity-curve history — 'is TODAY historically a good day for this bot vs SPY?'. Companion to TIME-OF-DAY EDGE — answers 'should I be more cautious today?' on a different time axis. Surfaced ONLY when WEEKDAY_EDGE / WEEKEND_EDGE (non-flat fingerprint with adequate samples), never filler when FLAT_WEEK / INSUFFICIENT_DATA / NO_SPY_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{weekday_pnl_block}\n\n" if weekday_pnl_block else "")
             + (f"PAPER TRADER — CASH-CONVICTION FIT (is the CURRENT cash level wrong given the loudest CURRENT live signal? The chat already carries cash_pct (point-in-time), all_cash_streak (chronic-flat duration), cash_redeployment (post-SELL latency), cash_drag (SPY-benchmarked dollar) — none of those answer the structural calibration question. A book 95% cash while ai_score 9.2 screams is structurally wrong in a way none of the other cash surfaces flag, and a fully-deployed book against a 5.5 loudest-live signal is overdeployed for that conviction. Surfaced ONLY when IDLE_DESPITE_SURGE / OVERDEPLOYED / IDLE_LOW_CONVICTION, never filler when BALANCED / NO_DATA. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{cash_conviction_block}\n\n" if cash_conviction_block else "")
+            + (f"PAPER TRADER — ACTIONABLE OPPORTUNITIES (the composite ranker for UNHELD watchlist names that crosses three orthogonal axes: scorer predicted 5d return × ticker-news-burst (this dashboard's per-held-ticker volume-spike detector) × persistent-watchlist-opportunity hot-run hours. The chat already carries each axis SEPARATELY but none answer the synthesis question 'of the strong scorer picks, which one is the wire ALSO talking about RIGHT NOW?'. HIGH_CONVICTION_FOUND / NEWS_CONFIRMED means quant + wire AGREE on a name — high-trust cross-confirmation. SCORER_BUT_NO_NEWS is the documented live failure mode (46 STRONG_HOLD picks while the wire is silent on every one); surfacing it explicitly lets the analyst answer 'should I act?' with honest source-availability awareness rather than assuming silence means absence-of-signal. Surfaced ONLY when HIGH_CONVICTION_FOUND / NEWS_CONFIRMED / PERSISTENT_FOLLOWUP / SCORER_BUT_NO_NEWS / NEWS_BUT_NO_SCORER, never filler when ALL_QUIET / INSUFFICIENT_DATA / ERROR. Headline + per-ticker `reasons` strings pass verbatim from the trader endpoint — restate, never re-derive):\n{actionable_opportunities_block}\n\n" if actionable_opportunities_block else "")
             + (f"PAPER TRADER — WHAT MATERIALLY CHANGED SINCE YOU LAST LOOKED (ranked, last 6h):\n{session_delta_block}\n\n" if session_delta_block else "")
             + (f"PAPER TRADER ANALYTICS:\n{analytics_block}\n\n" if analytics_block else "")
             + (f"PAPER TRADER — BEHAVIOURAL DIAGNOSIS (the bot's own self-review verdicts):\n{behavioural_block}\n\n" if behavioural_block else "")
