@@ -5,6 +5,111 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-27 HYBRID pass (Agent 3, pass #4) — scorer-killer + worker-sleep regressions
+
+**Counters:** `bugs_fixed=3`, `features_added=1`, `user_findings=5`.
+
+### Phase 1 — Debug & fix (3 distinct bugs across 2 commits)
+
+**Commit 6747a80 — `fix(daemon): stocktwits_sentiment hot-loop + trending double-sleep`.**
+The `c65e39d` commit ("StockTwits trending symbols rank detector") inserted the new
+`stocktwits_trending_symbols_worker` BETWEEN `stocktwits_sentiment_worker`'s body and
+its trailing `_sleep(300)`. The diff cleanly added the new function declaration but
+the existing `_sleep(300)  # re-scan every 5 min; internal cursor prevents per-ticker
+spam` line that previously closed `stocktwits_sentiment_worker` ended up *appended
+after* the new worker's own `_sleep(300)`, leaving two real bugs:
+
+  1. `stocktwits_sentiment_worker` — NO `_sleep` on the success path. Worker
+     hot-CPU-loops on every iteration; with `stocktwits_sentiment` driven by a
+     cursor file in `data/`, the loop hammers the cursor read + the
+     `source_health.record_result` write thousands of times/sec.
+  2. `stocktwits_trending_symbols_worker` — TWO consecutive `_sleep(300)` calls,
+     doubling the intended 5-min cadence to 10 min and halving freshness on the
+     trending-rank signal the new collector exists to measure.
+
+Pinned structurally by `tests/test_daemon_worker_sleeps.py`: an AST walker that
+asserts every `*_worker` function in `daemon.py` has at least one `_sleep(...)` call
+somewhere in its while-loop body, plus exact pacing-sleep counts for both affected
+workers. Caught a near-third regression in `scorer_worker` (multiple `_sleep` calls
+nested behind progress checks — intentional; test was relaxed from "top-level" to
+"any nesting" to keep that pattern legal).
+
+**Commit c8421ab — `fix: source_quality_scorer wrote uncompressed str into full_text BLOB`.**
+Live evidence (`logs/daemon.log` 2026-05-27): `scorer_worker error: a bytes-like
+object is required, not 'str'` recurring 300+ times in one day (every 30s scorer
+cycle). Root cause: `collectors/source_quality_scorer.py::_write_article` passed
+its plain-text `summary` directly into the BLOB-declared `full_text` column.
+SQLite is dynamically typed so the str survived (`typeof='text'` on that single
+row in the live ~2.1M-row DB). `store.get_unscored` then calls `decompress(r[4])`
+on every fetched row — `zlib.decompress` rejects str and raises. The row sits at
+`ai_score=0 / ml_score=NULL`, so it is re-fetched every cycle and crashes the
+*entire* scorer batch each time until the 90-day retention reaper.
+
+Two-layer fix:
+  - **Root cause:** `_write_article` now `zlib.compress`-es the summary before
+    insert, matching every other ingestion path (`storage.article_store.compress`).
+  - **Defense in depth:** `storage.article_store.decompress` now returns a str
+    payload unchanged. Caps the blast radius of any future mis-encoded collector
+    to a missing-decompress step rather than a worker-crashing exception.
+
+Pinned by `tests/test_decompress_str_defense.py` (4 cases including end-to-end
+`get_unscored` survival + the collector-side typeof='blob' contract).
+
+### Phase 2 — Feature dev (1 feature: `full_text_type_audit`)
+
+`storage.db_health.full_text_type_audit(conn)` — surfaces the bug class
+fixed above as a queryable diagnostic so a future regression is caught by
+monitoring rather than by tail-grepping `daemon.log` for the error string.
+Returns `{typeof_counts, non_blob_live, scorer_at_risk, verdict}` where
+`scorer_at_risk` counts TEXT-affinity rows at `ai_score=0 / ml_score IS NULL`
+(the exact set `get_unscored` will re-fetch). `verdict='DEGRADED'` if any such
+row exists. Wired into `health_report()` so the dashboard/CLI JSON snapshot
+exposes it without a new endpoint. `LIVE_ONLY_CLAUSE` applied so backtest /
+opus_annotation rows never inflate the count. Read-only — no DB write, no
+ai_score / ml_score / score_source / urgency mutation. Pinned by
+`tests/test_db_health_full_text_audit.py` (8 cases: OK / DEGRADED branches,
+already-scored exclusion, backtest / opus_annotation exclusion, ml_score-set
+exclusion, multi-row accumulation, health_report integration).
+
+### Phase 3 — Live analyst findings (5)
+
+1. **Hour-06 gap in 2026-05-27 ingestion** — no live articles inserted between
+   05:xx and 07:xx UTC. Possible daemon outage / restart around that window.
+   Not investigated further (no recent log entries from that window).
+2. **94% of urgent items in 24h are ML-only** — 379 ML-source vs 28 LLM-vetted
+   `urgency>=1` in 24h. Of the 282 pushed-alert (urgency=2) rows, 282 are
+   model-only and 14 LLM-vetted. The grey-zone Sonnet routing is rare, so the
+   analyst's Discord push channel is dominated by ML-only calls. By design but
+   worth surfacing — the `_llm_vetted=False` calibration tag in the alert
+   prompt already hedges these.
+3. **Pre-fix stocktwits chatter rows lingering at `urgency=2`** — the
+   chatter pre-floor (`564ae5d`) is forward-only; legacy ml_score≈9.97 chatter
+   rows ("$MU LETS V", "$MU lol", "$MU f me", "@shitstock $MU", etc.) inserted
+   *before* `564ae5d` landed remain in DB at urgency=2 and inflate the recent
+   "alerted" count in dashboards. They will age out at the 24h `reap_stale_urgent`
+   boundary and the 90d retention; no action needed.
+4. **Stocktwits dominates ingestion at 1305 articles/h** — 6x the next collector
+   (`GN: Nasdaq` 286/h). Heavy load on the scorer worker's unscored queue;
+   recent rows are sitting at `ml_score=0.0 / score_source=NULL` waiting to be
+   scored. Worker keeps up but it's a hot path.
+5. **Most recent briefing is high quality** — `2026-05-27T17:46:30Z` 50-article
+   digest: lead headline (NVDA fade post-print), macro table, portfolio P&L,
+   semis pulse, top signals, risk/catalyst, coverage gap (sec_edgar_ft / polygon /
+   newsapi dark), throughput degradation (GN: semiconductor -92% drop). Analyst
+   reads cleanly. No actionable defects.
+
+### Files touched
+
+  - `daemon.py` (Phase 1, +12 / -2)
+  - `storage/article_store.py` (Phase 1 defense, +18 / -2)
+  - `collectors/source_quality_scorer.py` (Phase 1 root-cause, +14 / -2)
+  - `storage/db_health.py` (Phase 2, +71 / -0)
+  - `tests/test_daemon_worker_sleeps.py` (new, +156 lines)
+  - `tests/test_decompress_str_defense.py` (new, +147 lines)
+  - `tests/test_db_health_full_text_audit.py` (new, +185 lines)
+
+---
+
 ## 2026-05-27 HYBRID pass — stocktwits-chatter pre-floor gate
 
 **Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=4`.
