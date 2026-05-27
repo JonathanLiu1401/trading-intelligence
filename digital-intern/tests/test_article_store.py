@@ -157,6 +157,33 @@ class TestScoreSourceSeparation:
         assert row[1] == pytest.approx(7.5)
         assert row[2] == "llm", "ml score must not overwrite llm tag"
 
+    def test_ml_does_not_overwrite_briefing_boost(self, store):
+        """COALESCE guard companion to test_ml_does_not_overwrite_llm:
+        ``briefing_boost`` is the Opus-curation tag set by
+        ``update_scores_from_labels`` for articles surfaced into the heartbeat
+        briefing. The trainer's STRONG_LABEL_WHERE pulls both 'llm' AND
+        'briefing_boost' as ground truth — so silently demoting briefing_boost
+        back to 'ml' on a routine model-score pass would shrink the strong
+        training pool with no test failing. The
+        ``score_source=COALESCE(score_source, 'ml')`` clause in
+        ``update_ml_scores_batch`` is the guard; this test pins it. Mirrors
+        the LLM-preservation invariant for the second strong-label tier."""
+        _insert_raw(store, id="a", url="https://x.com/1", title="x",
+                    source="rss", ai_score=4.5, kw_score=2.0,
+                    score_source="briefing_boost")
+        store.update_ml_scores_batch([("a", 7.5, 0)])
+        row = store.conn.execute(
+            "SELECT ai_score, ml_score, score_source FROM articles WHERE id='a'"
+        ).fetchone()
+        assert row[0] == pytest.approx(4.5), \
+            "Opus briefing-curated ai_score must survive a model rescore"
+        assert row[1] == pytest.approx(7.5), \
+            "model prediction must still be written to ml_score"
+        assert row[2] == "briefing_boost", (
+            "ml score must not demote a briefing_boost row — the trainer's "
+            "strong-label pool would silently shrink"
+        )
+
 
 # ── invariant #4: insert + de-dup ─────────────────────────────────────────────
 class TestInsertCrud:
