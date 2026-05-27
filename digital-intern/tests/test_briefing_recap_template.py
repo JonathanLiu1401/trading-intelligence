@@ -117,6 +117,24 @@ class TestHelperCatchesLiveNoise:
             assert hit, f"missed GF Value recap: {t!r}"
             assert name == "gf_value_says"
 
+    def test_gf_score_variant_gurufocus_mill(self):
+        # Live evidence (2026-05-26 articles.db urgency=2 set): GoogleNews/
+        # GuruFocus's "Lumentum Holdings Inc (LITE) Shares Fall 3.8% -- What
+        # GF Score O[ffers] - GuruFocus" reached urgency=2 with ml_score=9.66
+        # score_source='ml' — fired a 🚨 BREAKING push on a held name (LITE)
+        # for a pure recap-mill stock-move attribution. Previous regex
+        # required "GF Value Says" verbatim; the GuruFocus "GF Score" sibling
+        # template slipped through. The widened alternation catches both
+        # while still keeping the GF anchor (GuruFocus-unique).
+        for t in (
+            "Lumentum Holdings Inc (LITE) Shares Fall 3.8% -- What GF Score Offers - GuruFocus",
+            "AXT Inc (AXTI) Shares Rise 4.2% -- What GF Score Reveals - GuruFocus",
+            "Micron (MU) Shares Down 6.0% -- GF Score Indicates Risk - GuruFocus",
+        ):
+            hit, name = _looks_like_recap_template({"title": t})
+            assert hit, f"missed GF Score variant: {t!r}"
+            assert name == "gf_value_says"
+
 
 # ── _looks_like_recap_template: real breaking headlines MUST survive ───────
 
