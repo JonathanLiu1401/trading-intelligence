@@ -460,6 +460,58 @@ def hard_exit_summary_api():
         }), 500
 
 
+@app.route("/api/exit-proximity")
+def exit_proximity_api():
+    """Forward-looking mechanical-exit proximity for currently-open lots.
+
+    The hard SL/TP machinery (``strategy._check_and_execute_hard_exits``)
+    closes any open stock lot whose mark breaches the per-lot threshold,
+    and ``/api/hard-exit-summary`` aggregates the BACKWARD verdict (which
+    exits already fired). Neither answers the FORWARD question a live
+    trader pages on at 3am: *which of my currently-open lots are within
+    striking distance of a mechanical exit?*
+
+    Composes ``analytics.exit_proximity.build_exit_proximity`` verbatim
+    over ``store.open_positions()`` — same single source of truth a
+    future reporter line keys off. Read-only; uses the last-stored
+    ``current_price`` on each row (no yfinance hop in the request
+    thread — the dashboard panel must stay sub-second; marks refresh
+    every cycle via the runner's ``_portfolio_snapshot`` write-through,
+    so this view is at most a cycle behind).
+
+    Failure contract mirrors the rest of the operator endpoints: any
+    fault degrades to a valid ERROR envelope so the panel can render
+    the diagnostic, never a raw 500. The error envelope ships the same
+    keys the success envelope does (``verdict``, ``headline``,
+    ``n_positions``, ``band_counts``, ``positions``, ``thresholds``)
+    so the JS panel — and any future SWR consumer — can render a
+    single code path off either branch."""
+    try:
+        from .analytics.exit_proximity import build_exit_proximity
+        st = get_store()
+        snap = build_exit_proximity(st.open_positions())
+        if not isinstance(snap, dict):
+            raise TypeError(f"builder returned {type(snap).__name__}")
+        return jsonify({"service": "paper_trader", **snap})
+    except Exception as e:
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "verdict": "ERROR",
+            "headline": f"exit-proximity endpoint error: {e}",
+            "error": str(e),
+            "n_positions": 0,
+            "n_with_sl_tp": 0,
+            "band_counts": {
+                "AT_RISK_SL": 0, "AT_RISK_TP": 0,
+                "NEAR_SL": 0, "NEAR_TP": 0,
+                "MID_BAND": 0, "NO_SL_TP": 0,
+            },
+            "positions": [],
+            "thresholds": {"near_sl_max": 0.25, "near_tp_min": 0.75},
+        }), 500
+
+
 # Static sector classification for analytics + sector-pulse cards.
 # Keyed by the symbols we actually use in the watchlist + portfolio.
 SECTOR_MAP = {
