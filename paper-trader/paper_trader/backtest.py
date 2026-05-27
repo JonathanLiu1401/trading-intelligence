@@ -1657,14 +1657,80 @@ def score_article(article: dict) -> tuple[float, list[str]]:
 _BULLISH_WORDS = {
     "beat", "beats", "surge", "surges", "rally", "rallies", "upgrade", "upgraded",
     "record", "breakout", "buy", "outperform", "strong", "growth", "profit",
-    "dividend", "acqui", "bullish", "higher", "raise", "raised", "exceed",
+    "dividend", "bullish", "higher", "raise", "raised", "exceed",
+    # Explicit acquisition variants. The legacy ``"acqui"`` stem matched
+    # ``acquire/acquires/acquired/acquiring/acquisition/acquisitions`` via
+    # ``startswith`` — but the same ``startswith`` rule silently matched
+    # ``mission`` against ``miss`` (bearish) and ``cute`` against ``cut``
+    # (bearish), poisoning per-article sentiment scoring (verified live:
+    # ``"NVDA upgrade mission critical AI"`` scored 0.0 instead of bullish
+    # because ``upgrade`` and ``mission→miss`` cancelled out). The
+    # ``_article_sentiment`` rewrite below replaces ``startswith`` with a
+    # word-boundary regex that allows only a closed safe-suffix set — which
+    # cannot match ``acqui + sition``, so the stem must be enumerated.
+    "acquire", "acquires", "acquired", "acquiring",
+    "acquisition", "acquisitions",
+    # Same explicit-variant rationale as the bearish-side ``cutting`` /
+    # ``selling`` entries: the regex tail ``ying`` isn't in the safe-suffix
+    # set, so ``buy→buying`` and ``rally→rallying`` would silently lose
+    # coverage. Enumerating the headline-common forms keeps semantics
+    # equivalent to the prior startswith approach for these high-frequency
+    # tokens without re-opening the false-positive class for unrelated
+    # stems.
+    "buying", "rallying",
 }
 _BEARISH_WORDS = {
     "miss", "misses", "plunge", "plunges", "downgrade", "downgraded", "cut",
     "cuts", "layoff", "layoffs", "loss", "losses", "warning", "shortfall",
     "selloff", "sell", "underperform", "weak", "decline", "declines", "crash",
     "lower", "reduce", "reduced", "concern", "concerns", "risk",
+    # Explicit double-consonant verbal nouns / participles whose ending lies
+    # outside ``_SENTIMENT_SAFE_SUFFIX_RE``. ``cut→cutting``,
+    # ``sell→selling``, ``buy→buying`` would naturally fall to the regex word
+    # boundary the safe-suffix rewrite enforces (``\bcut(s|es|ed|ing|...)?\b``
+    # rejects ``cutting`` because ``ting`` isn't a recognised inflection).
+    # Enumerating the common production variants explicitly preserves
+    # coverage on the small handful of headlines that actually appear
+    # (``Fed cutting rates``, ``Hedge fund selling``) — without re-opening
+    # the ``mission/cute/missile`` false-positive class the regex closes.
+    "cutting", "selling",
 }
+
+# Safe suffixes allowed to follow a sentiment stem at a word boundary. The
+# closed set is the textbook English inflection tail — adding ``-s/-es/-ed/-ing``
+# captures the common verb forms (``misses``/``missed``/``missing``),
+# ``-er/-ers/-est`` covers comparative/superlative (``stronger``/``strongest``
+# / ``buyer``/``buyers``), ``-y/-ies`` covers ``rally/rallies``. Critically,
+# this list does NOT include the tails that produced the documented false
+# positives: ``"ion"`` (``mission`` against ``miss``), ``"ile"``
+# (``missile`` against ``miss``), ``"e"`` (``cute`` against ``cut``), or
+# ``"ert"`` (``concert`` would be against ``conc`` if such a stem existed —
+# defense in depth). So a future stem added to either word set CANNOT trip
+# the same class of bug unless its own true derivatives genuinely use one
+# of these endings, in which case the match is legitimate.
+_SENTIMENT_SAFE_SUFFIX_RE = r"(?:s|es|ed|ing|er|ers|est|ly|y|ies|d)?"
+
+
+def _build_sentiment_regex(words: set[str]) -> "re.Pattern[str]":
+    """Build one compiled regex that matches any of ``words`` at a word
+    boundary, optionally followed by one of the ``_SENTIMENT_SAFE_SUFFIX_RE``
+    English-inflection tails.
+
+    Sorts alternatives longest-first because Python's ``re`` is leftmost-FIRST
+    (not leftmost-longest): in the alternation ``(beat|beats)`` the engine
+    commits to ``beat`` even when the input is ``beats``, then backtracks
+    onto the optional suffix to recover the longer match. Longest-first
+    alternation makes the recovery unnecessary and the intent obvious.
+    """
+    sorted_words = sorted(words, key=len, reverse=True)
+    return re.compile(
+        r"\b(?:" + "|".join(re.escape(w) for w in sorted_words) + r")"
+        + _SENTIMENT_SAFE_SUFFIX_RE + r"\b"
+    )
+
+
+_BULLISH_RE = _build_sentiment_regex(_BULLISH_WORDS)
+_BEARISH_RE = _build_sentiment_regex(_BEARISH_WORDS)
 _WORD_TO_TICKER: dict[str, str] = {
     # Tech / semis — map bullish tech headlines straight to leveraged ETFs
     "nvidia": "NVDA", "amd": "AMD", "apple": "AAPL", "microsoft": "MSFT",
@@ -1737,10 +1803,28 @@ _WORD_TO_TICKER_PATTERNS: dict[str, "re.Pattern[str]"] = {
 
 
 def _article_sentiment(title: str) -> float:
-    """Return -1..+1 based on bullish/bearish keyword count in title."""
-    words = set(title.lower().split())
-    bull = sum(1 for w in words if any(w.startswith(b) for b in _BULLISH_WORDS))
-    bear = sum(1 for w in words if any(w.startswith(b) for b in _BEARISH_WORDS))
+    """Return -1..+1 based on bullish/bearish keyword count in title.
+
+    Uses word-boundary regex matching against the compiled bullish/bearish
+    stem regexes (see ``_build_sentiment_regex``). The prior ``startswith``
+    implementation silently flagged ``mission`` as bearish (against ``miss``),
+    ``cute`` as bearish (against ``cut``), and ``missile`` as bearish — verified
+    live: ``"NVDA upgrade mission critical AI"`` scored 0.0 instead of bullish
+    because the upgrade vote was cancelled by ``mission→miss``. Because
+    ``_ml_decide`` multiplies per-article ``raw_score * sentiment`` directly
+    into the per-ticker score, those false negatives poisoned both the daily
+    decision and the ``decision_outcomes.jsonl`` row that retrains the
+    DecisionScorer the gate eventually relies on.
+
+    Matches are deduplicated via ``set`` so a title that repeats the same
+    bullish word twice (``"beats beats earnings"``) counts as one vote per
+    sentiment side — preserving the original set-based dedup semantics.
+    """
+    if not title:
+        return 0.0
+    low = title.lower()
+    bull = len(set(_BULLISH_RE.findall(low)))
+    bear = len(set(_BEARISH_RE.findall(low)))
     total = bull + bear
     if total == 0:
         return 0.0
