@@ -229,6 +229,76 @@ def count_dropped_batches(
     return counts
 
 
+def full_text_type_audit(conn: sqlite3.Connection) -> dict[str, object]:
+    """Per-``typeof(full_text)`` row-count + scorer-impact summary.
+
+    ``full_text`` is declared BLOB and the rest of the pipeline expects
+    zlib-compressed bytes (see ``storage.article_store.compress`` /
+    ``decompress``). SQLite is dynamically typed, so a collector that
+    inserts a plain str leaves a TEXT-affinity value behind the BLOB
+    column — and the next ``store.get_unscored`` call then crashes the
+    *entire* scorer batch with ``a bytes-like object is required, not
+    'str'``. Live regression (2026-05-27):
+    ``collectors.source_quality_scorer`` did exactly this; one row
+    crashed the scorer 300+ times in a day.
+
+    The fix made ``decompress`` defensive, but operators still need a
+    queryable signal so a future re-introduction of the bug is caught by
+    monitoring, not by tail-grepping daemon.log for the error string.
+    This audit answers that question over the live-only set
+    (``LIVE_ONLY_CLAUSE`` — synthetic backtest rows are never counted as
+    live ingestion, see CLAUDE.md §5).
+
+    Returns::
+
+        {
+          "typeof_counts":   {"blob": int, "null": int, "text": int, ...},
+          "non_blob_live":   int,    # live rows whose full_text is not
+                                     # null and not blob — the exact set
+                                     # that can crash the scorer
+          "scorer_at_risk":  int,    # subset of non_blob_live with
+                                     # ai_score=0 AND ml_score IS NULL —
+                                     # rows the scorer will refetch
+          "verdict":         "OK" | "DEGRADED",
+        }
+
+    OK   — ``scorer_at_risk == 0``. The scorer is not blocked by a
+            type-mismatch row right now.
+    DEGRADED — ``scorer_at_risk >= 1``. At least one unscoreable row
+            with a TEXT-affinity ``full_text`` is sitting in the
+            unscored queue; the scorer's next batch will crash on it
+            (or, with the 2026-05-27 ``decompress`` defense, surface
+            the row as plain text — still abnormal).
+
+    Read-only — no DB write, no ai_score / ml_score / score_source /
+    urgency mutation. All four load-bearing invariants intact.
+    """
+    typeof_counts: dict[str, int] = {}
+    for typ, n in conn.execute(
+        "SELECT typeof(full_text), COUNT(*) FROM articles "
+        f"WHERE {LIVE_ONLY_CLAUSE} GROUP BY typeof(full_text)"
+    ):
+        typeof_counts[str(typ)] = int(n or 0)
+
+    non_blob_live = sum(
+        n for typ, n in typeof_counts.items() if typ not in ("blob", "null")
+    )
+    scorer_at_risk = int(conn.execute(
+        "SELECT COUNT(*) FROM articles "
+        f"WHERE typeof(full_text) NOT IN ('blob', 'null') "
+        f"AND ai_score=0 AND ml_score IS NULL "
+        f"AND {LIVE_ONLY_CLAUSE}"
+    ).fetchone()[0] or 0)
+
+    verdict = "DEGRADED" if scorer_at_risk >= 1 else "OK"
+    return {
+        "typeof_counts": typeof_counts,
+        "non_blob_live": non_blob_live,
+        "scorer_at_risk": scorer_at_risk,
+        "verdict": verdict,
+    }
+
+
 def wal_status(db_path: Path) -> dict[str, object]:
     """Size of the main DB and its ``-wal`` sidecar, in MB.
 
@@ -272,6 +342,7 @@ def health_report(
         report["ingestion_by_source"] = by_src
         report["live_articles_in_window"] = sum(by_src.values())
         report["newest_live_age_sec"] = newest_live_age_seconds(conn, now=now)
+        report["full_text_type_audit"] = full_text_type_audit(conn)
         # stale_sources() is deliberately NOT called here: the daemon already
         # runs a [source_health] worker (see logs/daemon.log) that computes the
         # gone-dark set without an expensive DISTINCT scan, and on the
