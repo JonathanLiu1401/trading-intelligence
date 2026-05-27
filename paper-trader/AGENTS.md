@@ -6,6 +6,391 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-28 ML+backtest HYBRID pass (Agent 2) — `_article_sentiment` false-positive fix + `paper_trader.ml.scorecard` unified health view
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=7
+
+### Phase 1 — Bug: `_article_sentiment` per-word `startswith` false positives (`bugs_fixed = 1`)
+
+`paper_trader.backtest._article_sentiment` used per-title-word
+`startswith` against the bullish/bearish stem sets. The pattern silently
+flagged unrelated tokens as bearish: `mission` against `miss`, `missile`
+against `miss`, `cute` against `cut`. Verified live by direct invocation:
+
+```python
+_article_sentiment("NVDA upgrade mission critical AI") == 0.0   # pre-fix
+```
+
+despite the article being plainly bullish (the `upgrade` vote was
+cancelled by a fake `mission→miss` bearish vote). The bug poisoned
+**two** downstream consumers:
+
+1. `_ml_decide` multiplies per-article `raw_score * sentiment` directly
+   into the per-ticker score aggregate. False-zero sentiment on
+   ten-article days silently drops a watchlist ticker out of the daily
+   BUY pool whenever a headline happened to contain `mission/cute/
+   missile`.
+2. The same `_ml_decide` output is what `_compute_decision_outcomes`
+   persists to `data/decision_outcomes.jsonl`, which is the trainer
+   tail the DecisionScorer the gate eventually relies on. The
+   contaminated decisions silently leaked through to the model the
+   conviction gate (invariant #5) modulates real conviction with.
+
+**Fix.** Replaced `startswith` with a word-boundary regex
+(`_BULLISH_RE` / `_BEARISH_RE`) compiled from each stem set, restricted
+to a closed safe-suffix tail (`s|es|ed|ing|er|ers|est|ly|y|ies|d`). The
+key property: `\bmiss(suffix)?\b` matches `miss`, `misses`, `missed`,
+`missing` (legitimate inflections) but NOT `mission`, `missile`
+(non-safe tails — no word boundary after `miss` because the next char
+is a letter). The legacy `"acqui"` stem (no safe-suffix match for
+`-sition`) was replaced with explicit acquisition variants
+(`acquire`, `acquires`, `acquired`, `acquiring`, `acquisition`,
+`acquisitions`). The headline-common forms `cutting` / `selling` /
+`buying` / `rallying` (tails outside the safe-suffix set) were
+enumerated explicitly so the regex tail rejection doesn't lose those
+legitimate matches.
+
+Tests at `tests/test_article_sentiment_falsepos_fix.py` (19 cases) lock:
+- The three documented false positives (`mission`, `cute`, `missile`)
+  are NO LONGER flagged as bearish.
+- The legitimate matches the legacy `startswith` captured all still hit
+  (beats/surges/higher/misses/plunges/lower/acquisitions/etc.).
+- Edge cases: empty string, None, only punctuation, punctuation
+  attached to words, duplicate-word dedup.
+- Regex structural invariants: word boundaries are present, longest-
+  first alternation is sorted, the `acqui` stem was replaced with
+  enumerated variants.
+- `_ml_decide`-shape contract: positive sentiment × positive raw_score
+  produces a positive product (sign discipline).
+
+### Phase 2 — Feature: `paper_trader/ml/scorecard.py` (`features_added = 1`)
+
+A unified read-only quant health view of every per-cycle skill ledger
+the continuous loop maintains. Until this landed, getting a single
+"current ML health" picture required ten separate CLI invocations
+(`baseline_compare`, `calibration_reliability`, `stop_out_audit`,
+`mfe_conversion`, `gate_pnl`, `gate_arm_historical`, `persona_skill`,
+`persona_regime_skill`, `conviction_calibration`,
+`llm_annotation_skill`) — each printing a different verdict format. An
+unattended operator had to remember which CLI answers which question
+and manually fuse them.
+
+`scorecard.collect()` reads the LATEST row of each
+`data/*_skill_log.jsonl` ledger; `scorecard._compute_verdict()` rolls
+the per-section RED/AMBER/GREEN states into one top-level verdict:
+
+- **CRITICAL** — the gate is sizing real conviction
+  (`gate_active=True`) AND either the model reads
+  `MLP_WORSE_THAN_TRIVIAL` OR `gate_pnl` reads
+  `GATE_SUBTRACTS_RETURN`. Exit code 1 so a shell consumer can page.
+- **DEGRADED** — at least one section is RED but the central scorer +
+  gate aren't actively net-negative (e.g. stop band hurts, persona
+  inverted). Triage, not page.
+- **HEALTHY** — every section green or quietly-unknown.
+- **UNKNOWN** — scorer ledger entirely absent (fresh install).
+
+CLI:
+
+```bash
+python3 -m paper_trader.ml.scorecard               # text table
+python3 -m paper_trader.ml.scorecard --json        # machine-readable
+python3 -m paper_trader.ml.scorecard --reasons     # only reason list
+```
+
+Read-only by construction — never trains, never writes
+`backtest.db`, never touches the deployed pickle. Same operational
+discipline as `paper_trader.ml.run_risk_metrics` and
+`paper_trader.ml.deploy_audit`. `operator_summary(verdict)` returns
+a single-line string suitable for verbatim Discord / Slack posting.
+
+Tests at `tests/test_ml_scorecard.py` (11 cases) lock:
+- `collect()` returns every expected section.
+- `_tail_row` reads the LATEST row of a ledger, degrades to None on
+  missing files, skips torn JSON rows defensively.
+- The four verdict states (HEALTHY / DEGRADED / CRITICAL / UNKNOWN)
+  fire on the exact predicate combinations a quant cares about.
+- CRITICAL verdict's reason list includes `MLP_WORSE_THAN_TRIVIAL`
+  when that finding drove it.
+- CLI emits valid JSON under `--json` and a human-readable table
+  otherwise; exit code is 1 on CRITICAL else 0.
+- `operator_summary` is single-line.
+
+### Phase 3 — Live quant validation (`user_findings = 7`)
+
+Running the new scorecard against the deployed scorer + the live skill
+ledgers immediately produces a CRITICAL verdict (this is the system's
+honest current state — the scorecard's job is to surface it):
+
+1. **CRITICAL: gate sizes conviction on a model worse than the σ-baseline.**
+   Deployed scorer's `oos_rmse_ratio=2.125` (RMSE / σ(target)) — a
+   constant mean-predictor would post lower error. Yet `gate_active=True`
+   (`n_train=3772 ≥ 500`), so the conviction gate's
+   ×0.6/×0.85/×1.15/×1.3 modulation is active on real BUY decisions
+   *right now*.
+2. **MLP_WORSE_THAN_TRIVIAL persists**: `baseline_skill_log` latest row
+   reports `ic_gap=-0.0678` — the 20-feature MLP has measurably lower
+   OOS rank-IC than the raw `news_urgency` one-liner baseline.
+3. **`oos_buy_ic=-0.02` — gate-relevant rank skill at noise.** The BUY
+   bucket (the only side the gate acts on) carries essentially zero
+   rank skill on the temporal-OOS slice.
+4. **Conviction sizing MISCALIBRATED**: `spearman=-0.0064` between
+   then-applied conviction and realized 5d return. Worse,
+   `top_minus_bottom_realized_pct=-0.2184` — trades sized HIGHEST
+   realize LOWER than trades sized LOWEST. The sizing rule itself, not
+   just the gate's modulation, is mis-firing.
+5. **TP_HURTS on the take-profit band**: `mfe_skill_log` reports
+   `tp_pct=15.0` band with `pct_reverted=31.5%` (trades that peaked
+   above 15% then reverted) — yet the TP forfeits more upside than it
+   captures across the 3919-row intraperiod corpus. The companion
+   `STOP_HELPS` verdict at -8% confirms the stop arm IS pulling its
+   weight; the take-profit arm isn't.
+6. **LLM-annotation pipeline DARK across 5199 outcomes**:
+   `pipeline_dark=True`, `n_endorsed=0`, `n_condemned=0`. The
+   `llm_mult` training-weight multiplier (3× for ENDORSE, 0.1× for
+   CONDEMN) is structurally inert — every trainer row weights at 1.0×
+   regardless.
+7. **gate_pnl GATE_RETURN_NEUTRAL**: rolled up across all 5 arms and
+   weighted by firing frequency, the gate's
+   `equal_weight_gate_contribution_pp=0.0136` — net economic effect on
+   the sized fills is statistically zero. `avg_gate_multiplier=0.97`
+   confirms the gate is barely modulating.
+
+### Phase 4 — Files touched
+
+```
+paper_trader/backtest.py                                 (~90 lines: regex + safe-suffix
+                                                          rewrite, `acqui` → explicit
+                                                          variants, `cutting`/`selling`/
+                                                          `buying`/`rallying` enumerated)
+paper_trader/ml/scorecard.py                             (new — 434 lines)
+tests/test_article_sentiment_falsepos_fix.py             (new — 188 lines / 19 tests)
+tests/test_ml_scorecard.py                               (new — 210 lines / 11 tests)
+AGENTS.md                                                (this section)
+```
+
+### Test commands for the ML/backtest domain
+
+```bash
+# Focused suite for this pass
+python3 -m pytest tests/test_article_sentiment_falsepos_fix.py \
+                  tests/test_ml_scorecard.py -v
+
+# Broader ML/backtest regression
+python3 -m pytest tests/ -k "ml or backtest or scorer or scorecard or sentiment" 2>&1 | tail -5
+
+# Run the new scorecard live (read-only) to see current health
+python3 -m paper_trader.ml.scorecard                     # text table
+python3 -m paper_trader.ml.scorecard --json              # machine readable
+python3 -m paper_trader.ml.scorecard --reasons           # only the reason list
+```
+
+### How to interpret the scorecard
+
+The TOP-LEVEL verdict (`HEALTHY` / `DEGRADED` / `CRITICAL` / `UNKNOWN`)
+is the single line a triaging operator needs; the per-section table
+below it shows where the verdict came from. Common patterns:
+
+- **CRITICAL with `scorer RED + baseline RED + gate_active=True`** —
+  the documented production state on this branch. The gate is sizing
+  real conviction on a net the data says is worse than a one-liner.
+  Mitigations: (a) extend the gate kill-switch (`_should_gate_modulate_conviction`,
+  `_GATE_SKILL_IC_TOLERANCE`) to fire on `oos_rmse_ratio > 1.5` too —
+  not just IC; (b) retrain the scorer on a fresher / regime-conditional
+  slice.
+- **DEGRADED with `mfe RED` only** — take-profit band is forfeiting
+  upside. Consider widening `take_profit = price * 1.15` to `1.20` or
+  `1.30` and re-checking the `mfe_conversion` verdict next cycle.
+- **CRITICAL with `gate_pnl GATE_SUBTRACTS_RETURN`** — the gate is
+  actively losing money. Set `_GATE_SKILL_IC_TOLERANCE` very high to
+  force the kill-switch active until the underlying scorer recovers.
+
+---
+
+## 2026-05-27 core HYBRID pass (Agent 1, second cycle) — `/api/exit-proximity` route wired + `_exit_proximity_line` Discord helper
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=6
+
+### Phase 1 — Bug: `/api/exit-proximity` route never landed (`bugs_fixed = 1`)
+
+`paper_trader/analytics/exit_proximity.py` ships a fully-tested
+`build_exit_proximity` builder (45 builder cases pass), and
+`tests/test_exit_proximity.py::TestDashboardWiring` was pre-written to
+lock the `/api/exit-proximity` route's contract — but the route itself
+was never added to `dashboard.py`. The 2 wiring tests had been failing
+since the builder landed:
+
+  * `test_route_returns_200_with_full_envelope`
+  * `test_route_error_fallback_does_not_500`
+
+Wired the route in `dashboard.py` right after `hard_exit_summary_api`
+(natural pair — historical vs forward exit views). Follows the same
+ERROR-envelope discipline so the panel can render off either branch
+with one code path. Both tests now green; full file: 47 passed (commit
+`aa17646`).
+
+This unblocks the operator-facing surface gap the builder docstring
+already named: the forward "which of my currently-open lots are within
+striking distance of a mechanical exit?" — invisible to alerts,
+summaries, and anything outside the JS dashboard until now.
+
+### Phase 2 — Feature: `_exit_proximity_line` reporter helper (`features_added = 1`)
+
+The dashboard route alone doesn't reach the operator's primary surface
+(Discord). Closed that gap with a hourly + daily-close helper that
+composes `build_exit_proximity` **verbatim** (single source of truth,
+invariant #10) over `store.open_positions()`.
+
+The live shape that drove this: MU sitting at +2.25% from entry,
+corridor_pos=0.85, dist_to_tp_pct=0.73% (NEAR_TP band), 0.79% from a
+mechanical TP exit firing. Without this helper the operator would have
+learned about the forced exit only from the trade alert AFTER the fact
+— losing the heads-up window forward proximity exists to provide.
+
+**Suppression discipline** (silence-when-not-actionable, mirrors
+`_position_attention_line`):
+
+  * `AT_RISK` (≥1 lot already past SL/TP, mechanical exit imminent on
+    next mark) → fires with ⚠️ (page-worthy)
+  * `NEAR_THRESHOLD` (≥1 lot in the SL or TP quartile) → fires with 🎯
+    (situational, not page-worthy)
+  * `COMFORTABLE` / `NO_DATA` / `NO_SL_TP_SET` → silent (the OK
+    suppression precedent — a midband book must never become its own
+    lying green light)
+  * Empty headline → defensive silence
+
+**Renders up to 3 worst-first per-position rows** with the *closer*
+threshold's signed distance (e.g. `> \`   MU\` NEAR_TP — +0.73% from TP`)
+— gives the operator the exact tickers to triage, not just an aggregate
+count. The builder already sorts AT_RISK before NEAR_*, and within each
+band ranks closer-to-firing first, so the head of `positions` is the
+right slice.
+
+**SSOT (invariant #10):** ships `build_exit_proximity`'s `headline`
+verbatim. The Discord block and `/api/exit-proximity` can never disagree
+on the verdict text.
+
+**Plumbing choice:** direct in-process builder call rather than
+localhost HTTP (the `_deployment_plan_line` pattern). The builder is
+pure (no scorer-opportunities pass, no yfinance hop) so the SWR-cache
+hot-path argument doesn't apply; calling it directly avoids depending
+on the dashboard being up. Mirrors `_position_attention_line` /
+`_concentration_line` discipline. Failure contract: any builder/store
+fault degrades to `""` ("no proximity line this report"), never an
+exception ("no Discord summary this report").
+
+Wired into both `send_hourly_summary` and `send_daily_close` right
+after `POSITION ATTENTION` (the natural pair — both are per-position
+alerts; attention/age + price/threshold; neither suppresses the other).
+18 tests cover suppression at every verdict level, SSOT verbatim
+headline, per-position closer-side rendering, 3-row cap, AT_RISK/MID
+filtering, failure-contract degradation (builder exception, store
+exception, non-dict return, empty headline), and end-to-end wiring
+into both summary surfaces (`tests/test_exit_proximity_reporter.py`).
+
+### Phase 3 — Live validation (`user_findings = 6`)
+
+1. **MU 0.73% from TP — new EXIT PROXIMITY view fires NEAR_TP correctly.**
+   Live `/api/exit-proximity` confirms MU corridor_pos=0.85,
+   `dist_to_tp_pct=0.73%`, `closer_target="TP"`. The new endpoint works
+   correctly out of the gate. Once the git-watcher picks up commit
+   `00ed39e` (currently boot=aa17646, head=00ed39e — 1 commit behind,
+   stale=true) the next hourly summary will surface this as
+   `🎯 EXIT PROXIMITY ◈ NEAR_THRESHOLD` with the per-position closer-
+   threshold row.
+
+2. **NO_DECISION rate 65-70% over last 20 cycles — known host-saturation
+   pain ([[pt-no-decision-host-saturation]]).** `/api/no-decision-reasons`:
+   dominant cause `cli_nonzero_rc` (76% of 29 NO_DECISION cycles in
+   the last 50). Host has been pushing 5-8 concurrent Opus subprocesses
+   today (threshold is 4); the pre-flight guard correctly skipped some
+   calls but the cli_nonzero_rc bucket is upstream-API related, not
+   resolvable by code. Not a fresh bug; long-documented.
+
+3. **Discord delivery HEALTHY now** (last OK 18:33Z), but had a 60s
+   openclaw timeout 5 minutes earlier. `notify_health` correctly tracks
+   it; the `restart_recommended` threshold (3 consecutive failures)
+   isn't tripped. The transient timeout was real but the channel
+   recovered without operator intervention.
+
+4. **Concentration HIGH (76.96% in MU)** — single-name risk is dominant.
+   `/api/risk` `concentration_severity=HIGH`, `concentration_warning=true`.
+   The deployment plan correctly suggests UTSL (3x leveraged util) to
+   diversify but cash share (23%) is below the
+   `_DEPLOY_PLAN_CASH_PCT_FLOOR=50%` floor so the helper stays silent —
+   consistent with its design (a half-deployed book is "fully invested
+   by the gate's math"). The trader is correctly aware via
+   `_concentration_line`.
+
+5. **Build SHA stale** (boot=aa17646, head=00ed39e, behind=1). The
+   git-watcher (3-min poll, 600s deferred-restart grace) will detect
+   and bounce the runner on the next cycle boundary. Healthy behaviour
+   modulo the polling delay.
+
+6. **Intent followthrough DRIFTING (50% — 3/6 followed, 3 abandoned)**.
+   `/api/intent-followthrough` shows the engine is articulating intents
+   (e.g. "wait for cleaner setup", "wait for pullback") but acting on
+   only half of them within the 12h evaluation window. Either the
+   intents are too vague to verify or the engine is changing its mind.
+   Not a code bug; behavioural signal worth tracking longitudinally.
+
+### Phase 4 — Files touched
+
+```
+paper_trader/dashboard.py                          (+52 lines — /api/exit-proximity route)
+paper_trader/reporter.py                           (+115 lines — _exit_proximity_line + 2 wire sites)
+tests/test_exit_proximity_reporter.py              (new — 382 lines / 18 tests)
+AGENTS.md                                          (this section)
+```
+
+### Test commands for the exit-proximity domain
+
+```bash
+# The full proximity surface (builder + dashboard wiring + reporter wiring)
+python3 -m pytest tests/test_exit_proximity.py tests/test_exit_proximity_reporter.py -v
+
+# Focused — just the new reporter wiring (fastest)
+python3 -m pytest tests/test_exit_proximity_reporter.py -v
+
+# Core regression sweep (includes both new + existing reporter / dashboard tests)
+python3 -m pytest tests/test_core_runner.py tests/test_core_runner_cycle.py tests/test_core_market.py tests/test_core_store.py tests/test_core_signals.py tests/test_core_strategy.py tests/test_core_reporter.py tests/test_exit_proximity.py tests/test_exit_proximity_reporter.py -q
+```
+
+### How to read the new `/api/exit-proximity` endpoint
+
+```bash
+# CLI one-shot
+python3 -m paper_trader.analytics.exit_proximity | jq .verdict,.headline
+
+# Live endpoint
+curl -s http://localhost:8090/api/exit-proximity | jq '{verdict, headline, n_positions, band_counts, positions: [.positions[] | {ticker, proximity_band, dist_to_sl_pct, dist_to_tp_pct, corridor_pos}]}'
+```
+
+Verdict ladder:
+- `AT_RISK` (≥1 lot AT_RISK_SL or AT_RISK_TP, mechanical exit imminent on next mark) → page-worthy
+- `NEAR_THRESHOLD` (≥1 lot NEAR_SL or NEAR_TP, in the threshold quartile) → situational
+- `COMFORTABLE` (all priced lots with SL/TP set are MID_BAND) → silent on Discord
+- `NO_SL_TP_SET` (open positions but no SL/TP on any) → silent
+- `NO_DATA` (no open positions) → silent
+
+A live trader's quick triage: a `NEAR_TP` with `dist_to_tp_pct < 1%` is
+"about to lock in profit"; a `NEAR_SL` with `dist_to_sl_pct < 1%` is
+"about to stop out". The closer-threshold token (`+X.XX% from TP` /
+`-X.XX% from SL`) is the actionable number.
+
+### Staging discipline
+
+This pass landed alongside in-flight sibling sessions: an uncommitted
+`tests/test_all_cash_streak_reporter.py` (older sibling, `_all_cash_streak_line`
+helper not yet in reporter.py) and active sibling changes to
+`paper_trader/backtest.py` + `tests/test_ml_backtest_agent2_20260528.py`.
+Per [[pt-concurrent-samerole-staging-race]] both commits used explicit
+pathspec staging (`git add paper_trader/dashboard.py` for Phase 1,
+`git add paper_trader/reporter.py tests/test_exit_proximity_reporter.py`
+for Phase 2) — sibling work stays untracked for its own commit and
+these commits cleanly contain only what this pass authored.
+
+---
+
 ## 2026-05-27 ML+backtest HYBRID pass (Agent 2) — `_parse_*` hyphen-prefix fix + `run_risk_metrics` Sharpe/MDD/Calmar
 
 **Counters:** bugs_fixed=1 · features_added=1 · user_findings=6
