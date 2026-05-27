@@ -251,11 +251,39 @@ def _buy_qty_with_scorer(synthetic_prices, monkeypatch, scorer) -> float:
     return decision["qty"]
 
 
+@pytest.fixture
+def _force_gate_modulate_active(monkeypatch):
+    """Pin `_should_gate_modulate_conviction` to gate-active so the arm-scale
+    tests below describe the documented conviction-arm contract independent
+    of the live `data/scorer_skill_log.jsonl` state.
+
+    Without this, the kill-switch reads the production ledger at import
+    time and — when median |oos_buy_ic| is at noise (the documented
+    MLP_NO_BETTER_THAN_TRIVIAL plateau) — short-circuits the gate's
+    ×0.6/×0.85/×1.15/×1.3 modulation block. The arms-and-thresholds
+    contract under test is orthogonal to the kill-switch (the kill-switch
+    is itself covered in test_gate_kill_switch.py), so we pin it
+    gate-active here. Also resets the kill-switch cache so any sibling
+    test that left stale state can't leak into this fixture's lifetime.
+    """
+    bt._reset_gate_skill_cache()
+    monkeypatch.setattr(bt, "_should_gate_modulate_conviction",
+                        lambda: (True, "test: forced gate-active"))
+    yield
+    bt._reset_gate_skill_cache()
+
+
 class TestMlDecideScorerGate:
     """Locks invariants #5/#6: the gate only engages at n_train ≥ 500 and
     each arm scales the EXACT base conviction (0.25) as documented in
     AGENTS.md's conviction table. base notional = 100_000 * conv;
-    qty = notional / 200."""
+    qty = notional / 200.
+
+    Uses ``_force_gate_modulate_active`` so the kill-switch's read of the
+    live scorer_skill_log.jsonl can't disable the gate during the test —
+    the kill-switch's own behaviour is covered in test_gate_kill_switch.py.
+    """
+    pytestmark = pytest.mark.usefixtures("_force_gate_modulate_active")
 
     def test_gate_inactive_below_500_samples(self, synthetic_prices, monkeypatch):
         # Trained but only 100 samples → predictions too noisy, gate must
@@ -314,7 +342,13 @@ class TestMlDecideOffDistributionGate:
     off_distribution (the unbounded MLP head extrapolated past the empirical
     label support), the conviction gate must ABSTAIN — leave the
     quant-derived conviction untouched — instead of acting on clamped noise.
-    Baseline (no modulation) qty for this fixture is 125.0 (conv 0.25)."""
+    Baseline (no modulation) qty for this fixture is 125.0 (conv 0.25).
+
+    Uses ``_force_gate_modulate_active`` so the kill-switch's read of the
+    live scorer_skill_log.jsonl can't disable the gate during the test —
+    only the off-distribution abstention is the contract under test here.
+    """
+    pytestmark = pytest.mark.usefixtures("_force_gate_modulate_active")
 
     def test_off_distribution_skips_modulation_despite_catastrophic_pred(
             self, synthetic_prices, monkeypatch):
