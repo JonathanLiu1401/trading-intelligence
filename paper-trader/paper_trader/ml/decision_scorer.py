@@ -1470,6 +1470,30 @@ def _build_arg_parser():
                    dest="news_urgency")
     p.add_argument("--news-article-count", type=float, default=None,
                    dest="news_article_count")
+    # Enhanced MACD / EMA200 features. These are real inputs to
+    # ``build_features`` (slots 10/11/12 — see ``FEATURE_NAMES``) and they
+    # carry non-zero learned weights in the deployed pickle (pass #35 closed
+    # the training-side dead-trained gap). Until they were wired here the
+    # CLI silently defaulted them to None → 0.0 via ``_bool_to_float``: the
+    # explainer claimed to attribute a prediction but actually predicted
+    # against a *different* feature vector than the live gate sees for any
+    # name where these signals fire — exactly the operator-blind class of
+    # bug the pass-#35 inference plumb closed for ``_ml_decide``. Three
+    # store_true flags (no value needed — they are booleans by contract);
+    # absence ⇒ None ⇒ ``_bool_to_float`` falls back to 0.0 (the documented
+    # "signal not present" sentinel, unchanged from prior CLI behaviour).
+    p.add_argument("--ema200-above", action="store_true",
+                   dest="ema200_above", default=None,
+                   help="EMA200 long-term trend filter — pass when "
+                        "close > EMA200 (textbook MACD setup filter).")
+    p.add_argument("--hist-cross-up", action="store_true",
+                   dest="hist_cross_up", default=None,
+                   help="MACD histogram crossed up through zero on the "
+                        "latest bar (bullish trigger).")
+    p.add_argument("--macd-below-zero-cross", action="store_true",
+                   dest="macd_below_zero_cross", default=None,
+                   help="MACD line below zero AND hist_cross_up — "
+                        "classic oversold-bottom MACD setup.")
     p.add_argument("--json", action="store_true",
                    help="Emit machine-readable JSON instead of a table.")
     return p
@@ -1515,6 +1539,13 @@ def main(argv: list[str] | None = None) -> int:
         ticker=args.ticker, vol_ratio=args.vol_ratio, bb_pos=args.bb_pos,
         news_urgency=args.news_urgency,
         news_article_count=args.news_article_count,
+        # Enhanced MACD / EMA200 features — see ``_build_arg_parser`` for
+        # the gap this closes. ``None`` (absent flag) plumbs to
+        # ``_bool_to_float``'s 0.0 default, preserving prior CLI behaviour
+        # for names where these signals aren't being passed.
+        ema200_above=args.ema200_above,
+        hist_cross_up=args.hist_cross_up,
+        macd_below_zero_cross=args.macd_below_zero_cross,
     )
     meta = scorer.predict_with_meta(**common)
     contrib = scorer.feature_contributions(**common)
