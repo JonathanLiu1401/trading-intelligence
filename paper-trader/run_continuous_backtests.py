@@ -294,6 +294,29 @@ PERSONA_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 DEAD_FEATURE_AUDIT_LOG = ROOT / "data" / "dead_feature_audit_log.jsonl"
 DEAD_FEATURE_AUDIT_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 
+# Per-cycle (persona × regime) cross-tab skill ledger. Pass #44 shipped
+# the ``persona_regime_skill`` analyzer — the missing intersection of
+# ``persona_skill`` (per-persona aggregate, hides regime structure) and
+# ``regime_audit`` (per-regime aggregate, hides per-persona structure).
+# Neither sibling can answer the actionable question
+# ``persona_regime_skill`` does: *does THIS persona carry signal in THIS
+# regime?* But pass #44 stopped before wiring a per-cycle ledger, so the
+# verdict (``REGIME_CONDITIONAL`` / ``HAS_INVERTED_CELL`` / etc.) was
+# CLI-only — an unattended operator could not trend per-cell signal
+# health, and the most directly operational state
+# (``HAS_INVERTED_CELL`` — a specific persona is anti-predictive in a
+# specific regime, the actionable data for suppressing that
+# persona-in-that-regime) was invisible. The first cycle's live verdict
+# on the production corpus was ``REGIME_CONDITIONAL`` with ESG/sideways
+# at +0.293 IC AND Momentum/bear at -0.137 IC — exactly the kind of
+# state that decays / recovers cycle by cycle and needs trending. This
+# closes the wiring gap mirroring every sibling
+# ``_append_*_skill_log`` pattern: best-effort, honest-gap rows,
+# atomic-bounded trim, SSOT no-drift. Module-level so tests can
+# redirect — the same testability rule as SCORER_SKILL_LOG.
+PERSONA_REGIME_SKILL_LOG = ROOT / "data" / "persona_regime_skill_log.jsonl"
+PERSONA_REGIME_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 # Per-cycle conviction-sizing calibration ledger. ``conviction_calibration``
 # already answers, durably, the most economically decisive question about the
 # `_ml_decide` gate's sizing arm (×0.6 / ×0.85 / ×1.15 / ×1.3) on top of the
@@ -3148,6 +3171,159 @@ def _append_persona_skill_log(cycle: int, win_start: date, win_end: date,
         return False
 
 
+def _append_persona_regime_skill_log(cycle: int, win_start: date,
+                                     win_end: date,
+                                     outcomes_path: "Path | str | None" = None
+                                     ) -> bool:
+    """Append one structured row to the per-cycle (persona × regime)
+    cross-tab decision-signal skill ledger.
+
+    Answers, durably and per-cycle, the actionable question neither
+    sibling ``persona_skill`` (persona-axis aggregate) nor
+    ``regime_audit`` (regime-axis aggregate) can answer:
+    *does THIS persona carry signal in THIS regime?* The aggregate
+    diagnostics hide regime-conditional structure (a persona +0.25 IC in
+    bull but -0.10 IC in bear shows ~0 in the aggregate); this ledger
+    surfaces it.
+
+    Reuses ``persona_regime_skill.analyze`` verbatim so the persisted
+    verdict equals the read-only CLI's by construction — the same
+    no-drift SSOT cross-check every sibling ``_append_*_skill_log``
+    enforces. Captures three flat top-line fields a JSONL consumer can
+    query without parsing the nested ``cells`` list:
+
+      * ``best_cell_*`` — the best stable (persona, regime, score_ic, n)
+        cell — the leader on signal skill in a specific regime.
+      * ``worst_cell_*`` — the worst stable cell — surfaces an
+        anti-predictive regime cell when one exists.
+      * ``n_inverted_cells`` — count of cells where signal is
+        anti-predictive (verdict==``INVERTED``). The single most
+        directly operational state for the persona-suppression
+        decision, mirroring the sibling persona ledger's
+        ``n_inverted`` convention.
+
+    The full ``cells`` / ``inverted_cells`` lists ship as nested fields
+    for forensics, mirroring the gate-arm / persona ledgers'
+    "flat summary + nested forensics" precedent.
+
+    Best-effort and idempotent-safe: every fault is swallowed (a ledger
+    write must NEVER break the continuous loop — the documented
+    ``_append_scorer_skill_log`` / ``_post_discord`` / validation
+    persister discipline). On any fault we still emit an honest row
+    with ``status='error' verdict='INSUFFICIENT_DATA'`` so a gap in
+    the trend is visible, not silent. Bounded growth: when the file
+    exceeds 2× ``PERSONA_REGIME_SKILL_LOG_KEEP`` it is atomically
+    rewritten via the tmp + ``.replace`` idiom every sibling ledger uses.
+
+    The ``signal_dark`` boolean mirrors the sibling ledgers' ``*_dark``
+    flags (``pipeline_dark`` / ``calibrated_dark`` / ``sizing_dark`` /
+    ``stop_dark`` / ``tp_dark`` / ``gate_dark`` / ``signal_dark`` from
+    persona_skill). True when the analyzer found ZERO stable cells
+    (every (persona, regime) bucket below ``MIN_PER_CELL``); False when
+    at least one cell has demonstrable data to evaluate.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        outcomes_path = Path(outcomes_path)
+        try:
+            from paper_trader.ml.persona_regime_skill import (
+                analyze as _prs_analyze,
+                _load_outcomes as _prs_load_outcomes,
+            )
+            recs = _prs_load_outcomes(outcomes_path)
+            rep = _prs_analyze(recs)
+        except Exception as exc:
+            rep = {
+                "status": "error", "verdict": "INSUFFICIENT_DATA",
+                "hint": f"persona_regime_skill unavailable: "
+                        f"{type(exc).__name__}",
+                "n_records": 0, "n_cells": 0, "n_stable_cells": 0,
+                "cells": [], "inverted_cells": [],
+                "best_cell": None, "worst_cell": None,
+                "n_dropped_unknown_regime": 0,
+            }
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA",
+                   "n_records": 0, "n_cells": 0, "n_stable_cells": 0,
+                   "cells": [], "inverted_cells": [],
+                   "best_cell": None, "worst_cell": None,
+                   "n_dropped_unknown_regime": 0}
+
+        # ``signal_dark`` is True when no (persona, regime) cell has
+        # enough rows to be evaluable — mirrors sibling ``*_dark`` flags.
+        n_stable = int(rep.get("n_stable_cells") or 0)
+        signal_dark = (n_stable == 0)
+
+        # Flatten ``best_cell`` / ``worst_cell`` to top-level columns so a
+        # JSONL consumer can query without parsing the nested dict. Both
+        # are None on INSUFFICIENT_DATA / no-stable-cell runs; degrade to
+        # None safely in that case.
+        best = rep.get("best_cell") or {}
+        worst = rep.get("worst_cell") or {}
+        inverted_list = rep.get("inverted_cells") or []
+        n_inverted = (len(inverted_list)
+                      if isinstance(inverted_list, list) else 0)
+
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": rep.get("verdict"),
+            "n_records": rep.get("n_records"),
+            "n_cells": rep.get("n_cells"),
+            "n_stable_cells": n_stable,
+            "n_dropped_unknown_regime": rep.get("n_dropped_unknown_regime"),
+            # Best stable cell — the operator-readable "who leads on
+            # signal skill in which regime" answer at a glance.
+            "best_persona": best.get("persona") if isinstance(best, dict) else None,
+            "best_regime": best.get("regime") if isinstance(best, dict) else None,
+            "best_score_ic": best.get("score_ic") if isinstance(best, dict) else None,
+            "best_n": best.get("n") if isinstance(best, dict) else None,
+            # Worst stable cell — surfaces the actionable red flag when
+            # one cell is anti-predictive.
+            "worst_persona": worst.get("persona") if isinstance(worst, dict) else None,
+            "worst_regime": worst.get("regime") if isinstance(worst, dict) else None,
+            "worst_score_ic": worst.get("score_ic") if isinstance(worst, dict) else None,
+            "worst_n": worst.get("n") if isinstance(worst, dict) else None,
+            # Inverted-cell summary (count) + full list for forensics.
+            "n_inverted_cells": n_inverted,
+            "inverted_cells": inverted_list
+                if isinstance(inverted_list, list) else [],
+            # Full cells list — forensic detail mirroring the persona
+            # ledger's "personas" nested field. Bounded by the analyzer's
+            # natural bucketing (≤ N_personas × 3 regimes = 30 cells max),
+            # so size is fine inline.
+            "cells": rep.get("cells")
+                if isinstance(rep.get("cells"), list) else [],
+            "signal_dark": signal_dark,
+        }
+        PERSONA_REGIME_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with PERSONA_REGIME_SKILL_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in
+                     PERSONA_REGIME_SKILL_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > PERSONA_REGIME_SKILL_LOG_KEEP * 2:
+                kept = lines[-PERSONA_REGIME_SKILL_LOG_KEEP:]
+                tmp = PERSONA_REGIME_SKILL_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(PERSONA_REGIME_SKILL_LOG)
+        except Exception as e:
+            print(f"[continuous] persona-regime-skill-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] persona-regime-skill-log append failed: {e}")
+        return False
+
+
 def _append_dead_feature_audit_log(cycle: int, win_start: date,
                                     win_end: date) -> bool:
     """Append one structured row to the per-cycle dead-feature-audit ledger.
@@ -4257,6 +4433,22 @@ def main() -> None:
         # an unattended operator. Best-effort by construction; never
         # breaks the loop.
         _append_persona_skill_log(cycle, win_start, win_end)
+
+        # Durable per-cycle (persona × regime) cross-tab skill ledger. Pass
+        # #44 shipped ``persona_regime_skill`` — the missing intersection
+        # of ``persona_skill`` and ``regime_audit`` — but skipped per-cycle
+        # wiring, so the verdict (the actionable
+        # ``HAS_INVERTED_CELL`` / ``REGIME_CONDITIONAL`` state) was
+        # CLI-only. This closes the wiring gap so a quant can trend
+        # per-cell signal health and catch INVERTED (persona, regime)
+        # pairs the moment they emerge — the same operator-blind state
+        # every sibling ``_append_*_skill_log`` closed for its own
+        # analyzer. Wired immediately after ``_append_persona_skill_log``
+        # because it is the natural sibling: same data file, same SELL
+        # double-flip, same SSOT (``_spearman`` from calibration,
+        # ``persona_for`` from backtest). Best-effort by construction;
+        # never breaks the loop.
+        _append_persona_regime_skill_log(cycle, win_start, win_end)
 
         # Durable per-cycle dead-feature audit of the just-retrained model.
         # Catches the pass-#35 class of bug systematically: a feature added
