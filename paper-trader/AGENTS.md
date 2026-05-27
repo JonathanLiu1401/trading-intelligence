@@ -6,6 +6,184 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-26 ML+backtest HYBRID pass #45 (Agent 2) — scorer-CLI MACD plumb + `persona_regime_skill` per-cycle ledger
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=5
+
+### Phase 1 — Bug: scorer CLI silently dropped 3 enhanced-MACD features (`bugs_fixed = 1`)
+
+Pass #35 wired `ema200_above` / `hist_cross_up` / `macd_below_zero_cross`
+through `_compute_decision_outcomes` (training) and `_ml_decide`
+(live inference) so the model could LEARN and ACT on those slots. The
+deployed pickle now carries non-zero learned weights for all three
+(`mean|w| ~0.24–0.45`).
+
+But `paper_trader/ml/decision_scorer.py::main` (the CLI explainer) was
+missed: `_build_arg_parser` had **no flags** for them and the `common`
+dict the CLI builds for `predict_with_meta` / `feature_contributions`
+omitted them — so the CLI silently defaulted them to None → 0.0,
+predicting against a *different* feature vector than the live gate sees
+for any name where these signals fire. The per-feature attribution panel
+was a fabrication on those names: the explainer reported each enhanced
+slot at exactly the zero-input baseline contribution, even on a real
+name where the signal mattered.
+
+**Fix.** Three `store_true` flags (`--ema200-above`, `--hist-cross-up`,
+`--macd-below-zero-cross`) plus their addition to the `common` dict.
+`None` default (not `False`) preserves pre-fix behaviour and matches the
+documented "signal not present" sentinel `_bool_to_float` already
+handles.
+
+13 new tests in `tests/test_decision_scorer_cli_macd_features.py` pin:
+argparse accepts each flag and all three together; omitted flags default
+to None; `build_features` responds (slot value changes 0.0 → 1.0 with
+no other slot perturbation); `main()` end-to-end (each flag plumbs
+through to `predict_with_meta` as the corresponding kwarg). All 118
+`test_decision_scorer*` tests pass.
+
+Commit: `fix(scorer-cli): plumb 3 enhanced-MACD features through _build_arg_parser and main()` (77b366b).
+
+### Phase 2 — Feature: per-cycle `persona_regime_skill` ledger (`features_added = 1`)
+
+Pass #44 shipped the analyzer — the missing intersection of
+`persona_skill` (per-persona aggregate, hides regime structure) and
+`regime_audit` (per-regime aggregate, hides per-persona structure). The
+documented live verdict is `REGIME_CONDITIONAL` (ESG/sideways at +0.293
+IC, Momentum/bear at -0.137 IC — both invisible in the aggregates). But
+pass #44 stopped before wiring a per-cycle ledger, so the verdict was
+CLI-only — an unattended operator could not trend per-cell signal
+health, and the most directly operational state (`HAS_INVERTED_CELL` —
+the actionable data for suppressing a persona-in-a-regime) was
+invisible.
+
+`run_continuous_backtests._append_persona_regime_skill_log` closes the
+wiring gap mirroring every sibling `_append_*_skill_log` pattern:
+best-effort, honest `INSUFFICIENT_DATA` gap rows when `signal_dark`,
+atomic bounded trim, SSOT no-drift (persisted verdict equals the
+read-only CLI's by construction).
+
+Captures three flat top-line fields a JSONL consumer can query without
+parsing the nested cells list:
+
+- `best_persona` / `best_regime` / `best_score_ic` / `best_n` — leader
+  on signal skill in a specific regime.
+- `worst_persona` / `worst_regime` / `worst_score_ic` / `worst_n` —
+  surfaces an anti-predictive cell when one exists.
+- `n_inverted_cells` — count of `INVERTED` cells (the single most
+  operational state for persona-suppression decisions).
+
+Full `cells` and `inverted_cells` lists ship as nested fields for
+forensics, mirroring the gate-arm / persona ledgers' precedent. Wired
+immediately after `_append_persona_skill_log` in `main()` — the natural
+sibling: same data file, same SELL double-flip, same SSOT (`_spearman`
+from `calibration`, `persona_for` from `backtest`).
+
+13 new tests in `tests/test_continuous_persona_regime_skill_ledger.py`
+pin: INSUFFICIENT_DATA persists `signal_dark=True` row; HAS_INVERTED_CELL
+/ REGIME_CONDITIONAL / HEALTHY round-trip; analyzer exception and
+non-dict returns degrade safely; bounded trim past 2× KEEP cap;
+nested-dir creation; `main()` wiring regression; module-level constant
+discipline; analyzer-side contract assertion. 120 sibling continuous-
+ledger tests still green.
+
+Commit: `feat(ml): per-cycle (persona × regime) cross-tab skill ledger` (d49f3e7).
+
+### Phase 3 — Live quant findings (`user_findings = 5`)
+
+1. **`MLP_WORSE_THAN_TRIVIAL` persistent across the last 3 cycles**:
+   `ic_gap` = -0.106 / -0.118 / -0.167 (mlp_rank_ic 0.027 / 0.094 /
+   0.093 vs best one-liner ~0.21). The deployed conviction gate is
+   `gate_active=True` (n_train=3655 >= 500) on a net the data says is
+   worse than a free one-liner — sizing on rank skill the model
+   demonstrably lacks. The pass-#41 kill-switch (`_should_gate_modulate_conviction`)
+   should fire on this state; verify in the next live cycle that
+   reasoning strings carry `scorer=…%(gate-killed,no-skill)`.
+
+2. **Sideways-regime OOS rank-IC = -0.11 on n=425 OOS rows** in the
+   most recent cycle: the scorer is anti-predictive in sideways markets
+   at scale. Bear cell (n=9) reports +0.23 — too small to trust.
+   Combined with the persona_regime_skill finding that ESG/sideways is
+   the BEST persona cell (+0.293), this is a real conditional signal:
+   the ESG *persona's* signal works in sideways while the *scorer's*
+   overall sideways prediction is harmful. The new per-cycle ledger
+   will trend whether this divergence narrows.
+
+3. **`persona_regime_skill` live verdict on the 5963-row corpus stays
+   `REGIME_CONDITIONAL`** — confirms pass #44. Best stable cell =
+   ESG / Thematic in sideways (+0.293, n=111); Worst stable cell =
+   Momentum Trader in bear (-0.137, n=186). 2497 rows dropped as
+   `unknown` regime (~30% of the would-be-bucketed set). The new ledger
+   starts populating on the next continuous-loop cycle.
+
+4. **LLM annotation pipeline is dark** in production: `continuous.log`
+   shows "Could not resolve authentication method" on every cycle's
+   `_llm_annotate_outcomes` call. ANTHROPIC_API_KEY is not in the
+   continuous loop process environment. Already trended in
+   `llm_annotation_skill_log.jsonl` as `pipeline_dark=True` — a quant
+   has visibility. Fix is config-level (export the env var into the
+   loop's process), not code.
+
+5. **1 stale `running` backtest row** (#101564, age ~1.4h) — within
+   the `_reap_orphaned_runs` 6h tolerance, will self-heal if the run
+   was actually killed. No action.
+
+### Phase 4 — Counters
+
+* `bugs_fixed = 1`
+* `features_added = 1`
+* `user_findings = 5`
+
+### Files touched
+
+* `paper_trader/ml/decision_scorer.py` — `_build_arg_parser` + `main()`
+  CLI plumbing for the 3 enhanced-MACD features.
+* `run_continuous_backtests.py` — `PERSONA_REGIME_SKILL_LOG` /
+  `PERSONA_REGIME_SKILL_LOG_KEEP` constants, `_append_persona_regime_skill_log`
+  helper, `main()` invocation after `_append_persona_skill_log`.
+* `tests/test_decision_scorer_cli_macd_features.py` — 13 new tests.
+* `tests/test_continuous_persona_regime_skill_ledger.py` — 13 new tests.
+
+### Test commands for the ML/backtest domain
+
+```bash
+# This pass's new tests (fast, ~2s):
+$ python3 -m pytest tests/test_decision_scorer_cli_macd_features.py \
+                    tests/test_continuous_persona_regime_skill_ledger.py -v
+
+# Full decision-scorer slice (~19s):
+$ python3 -m pytest tests/test_decision_scorer.py tests/test_decision_scorer_attribution.py \
+                    tests/test_decision_scorer_feature_groups.py \
+                    tests/test_decision_scorer_cli_macd_features.py -q
+
+# Full continuous-ledger sibling regression (~1.5s):
+$ python3 -m pytest tests/test_continuous*.py tests/test_persona_regime_skill.py \
+                    tests/test_persona_skill.py -q
+
+# Broader focused slice (mature codebase — full suite is ≥25min under load,
+# don't run it as the verifier; use the focused slices instead):
+$ python3 -m pytest tests/ -v -k "ml or backtest or scorer or persona_regime"
+```
+
+### How to run the new analyzer + read the ledger
+
+```bash
+# Live verdict (table or --json):
+$ python3 -m paper_trader.ml.persona_regime_skill
+$ python3 -m paper_trader.ml.persona_regime_skill --json
+
+# Tail the per-cycle ledger as it accumulates:
+$ tail -f data/persona_regime_skill_log.jsonl | \
+    python3 -c "import sys, json; [print({k: r.get(k) for k in ('cycle','verdict','best_persona','best_regime','best_score_ic','worst_persona','worst_score_ic','n_inverted_cells','signal_dark')}) for ln in sys.stdin for r in [json.loads(ln)]]"
+```
+
+A `HAS_INVERTED_CELL` row means at least one (persona, regime) pair is
+ACTIVELY HARMFUL — the more confident that persona is in that regime,
+the worse the realized 5d outcome. The cell is data for a separate,
+explicit suppression decision; this read-only analyzer never changes
+`PERSONAS` / `_PERSONA_BOOSTS` / the gate.
+
+---
+
 ## 2026-05-26 ML+backtest HYBRID pass #44 (Agent 2) — `persona_regime_skill` (persona × regime) cross-tab
 
 **Counters:** bugs_fixed=0 · features_added=1 · user_findings=5
