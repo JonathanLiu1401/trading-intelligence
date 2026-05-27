@@ -3380,6 +3380,105 @@ def _position_attention_line(store) -> str:
         return ""
 
 
+def _exit_proximity_line(store) -> str:
+    """One-line "which open lots are within striking distance of a mechanical
+    exit?" for the hourly / daily report.
+
+    The hard SL/TP machinery (``strategy._check_and_execute_hard_exits``)
+    auto-closes any open stock lot whose mark breaches its per-lot
+    ``stop_loss_price`` / ``take_profit_price``. ``/api/hard-exit-summary``
+    aggregates the BACKWARD discipline (which exits already fired);
+    ``/api/exit-proximity`` (commit ``aa17646``) shipped the FORWARD view
+    but only on the dashboard. The operator lives in Discord and never opens
+    that panel — the exact dashboard→Discord gap ``_position_attention_line``
+    / ``_deployment_plan_line`` each closed for their own per-position /
+    cash-deployment surfaces.
+
+    Composes ``build_exit_proximity`` **verbatim** (single source of truth,
+    AGENTS.md invariant #10 — verdict and headline are the builder's, never
+    re-derived, so this Discord line and ``/api/exit-proximity`` can never
+    tell different stories). **Pure store reads only — NO network** (the
+    Discord-path discipline; mirrors ``_position_attention_line`` /
+    ``_concentration_line``). Observational only, never gates, adds no caps
+    (invariants #2/#12 — the ``_host_pulse_line`` precedent).
+
+    Suppression — fire ONLY when the verdict is actionable, so an
+    actively-comfortable book adds no hourly noise (the summary must never
+    become its own lying green light — the ``_position_attention_line`` OK
+    suppression precedent):
+
+      * ``AT_RISK`` (>=1 lot already past SL or TP — mechanical exit will
+        fire on the next mark) → ALWAYS surfaced (the operator should know
+        a forced exit is imminent, not learn it from the trade alert).
+      * ``NEAR_THRESHOLD`` (>=1 lot in the SL or TP quartile) → surfaced
+        (the operator should know which lots are about to leave the book).
+      * ``COMFORTABLE`` / ``NO_DATA`` / ``NO_SL_TP_SET`` → silent (nothing
+        actionable — the ``_position_attention_line`` OK / INSUFFICIENT_DATA
+        / ``_hold_discipline_line`` NO_DATA suppression precedent).
+
+    Renders up to 3 worst-first per-position lines so the operator sees the
+    exact tickers to triage, not just an aggregate count. The builder
+    already sorts AT_RISK first then NEAR_* (most actionable first), so the
+    head of ``positions`` is the right slice.
+
+    Failure contract mirrors the rest of ``reporter``: any builder/store
+    fault degrades to ``""`` ("no proximity line this report"), **never** an
+    exception ("no Discord summary this report")."""
+    try:
+        from .analytics.exit_proximity import build_exit_proximity
+        ep = build_exit_proximity(store.open_positions())
+        if not isinstance(ep, dict):
+            return ""
+        verdict = ep.get("verdict")
+        if verdict not in ("AT_RISK", "NEAR_THRESHOLD"):
+            return ""
+        headline = ep.get("headline") or ""
+        if not headline:
+            return ""
+        positions = ep.get("positions") or []
+        # Worst-first slice: builder already sorts AT_RISK before NEAR_*,
+        # and within each band ranks closer-to-firing first. Drop rows
+        # that are neither AT_RISK nor NEAR_* so a single AT_RISK lot in
+        # a NEAR_THRESHOLD book still surfaces only the actionable rows.
+        actionable_bands = (
+            "AT_RISK_SL", "AT_RISK_TP", "NEAR_SL", "NEAR_TP",
+        )
+        worst = [
+            p for p in positions
+            if p.get("proximity_band") in actionable_bands
+        ][:3]
+        # AT_RISK uses ⚠️ (mechanical exit imminent — page-worthy);
+        # NEAR_THRESHOLD uses 🎯 (within range — situational). Matches the
+        # ``_position_attention_line`` ⚠️/normal precedent.
+        icon = "⚠️" if verdict == "AT_RISK" else "🎯"
+        lines = [f"{icon} **EXIT PROXIMITY** ◈ {verdict}", f"> {headline}"]
+        for p in worst:
+            tk = p.get("ticker", "?")
+            band = p.get("proximity_band", "?")
+            d_sl = p.get("dist_to_sl_pct")
+            d_tp = p.get("dist_to_tp_pct")
+            # Distances are signed (negative = past threshold). Render
+            # the closer side prominently. ``closer_target`` is the
+            # builder's own verdict on which side is the nearer firing
+            # threshold — single source of truth so a future band-edge
+            # tweak in the builder propagates here automatically.
+            closer = p.get("closer_target", "")
+            if closer == "SL" and d_sl is not None:
+                bits = f"{d_sl:+.2f}% from SL"
+            elif closer == "TP" and d_tp is not None:
+                bits = f"{d_tp:+.2f}% from TP"
+            elif d_sl is not None and d_tp is not None:
+                bits = f"SL {d_sl:+.2f}% / TP {d_tp:+.2f}%"
+            else:
+                bits = ""
+            tail = f" — {bits}" if bits else ""
+            lines.append(f"> `{tk:>6}` {band}{tail}")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[reporter] exit-proximity line skipped: {e}")
+        return ""
+
+
 def _no_decision_reasons_line(store) -> str:
     """One-line "WHY isn't the bot deciding?" for the hourly / daily report.
 
@@ -4540,6 +4639,16 @@ def send_hourly_summary() -> bool:
     pa = _position_attention_line(store)
     if pa:
         body += "\n" + pa
+    # EXIT PROXIMITY sits right after POSITION ATTENTION — both are
+    # per-position alerts. POSITION ATTENTION reads "which lots has Opus
+    # stopped examining?" (age/attention based); EXIT PROXIMITY reads
+    # "which lots are about to leave the book?" (price/threshold based).
+    # Both silence-by-default; neither suppresses the other (a neglected
+    # lot can also be AT_RISK_SL — both lines fire to triage the same
+    # ticker from two angles).
+    ep = _exit_proximity_line(store)
+    if ep:
+        body += "\n" + ep
     dc = _decision_clock_line(store)
     if dc:
         body += "\n" + dc
@@ -4783,6 +4892,12 @@ def send_daily_close() -> bool:
     pa = _position_attention_line(store)
     if pa:
         body += "\n" + pa
+    # EXIT PROXIMITY follows POSITION ATTENTION on daily close too — see
+    # send_hourly_summary for the per-position-pair rationale (attention/age
+    # alongside price/threshold proximity; independent silence).
+    ep = _exit_proximity_line(store)
+    if ep:
+        body += "\n" + ep
     dc = _decision_clock_line(store)
     if dc:
         body += "\n" + dc
