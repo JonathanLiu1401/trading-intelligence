@@ -517,7 +517,24 @@ def compress(text: str) -> bytes:
     return zlib.compress(text.encode("utf-8", errors="replace"), level=6)
 
 
-def decompress(data: bytes) -> str:
+def decompress(data) -> str:
+    """Decompress a zlib-compressed BLOB back to text.
+
+    Defensive against a string slipping into the ``full_text`` column —
+    SQLite has dynamic typing so a collector that forgets to ``compress()``
+    its summary leaves a TEXT-affinity value behind a BLOB-declared
+    column. Live regression (2026-05-27): ``collectors.source_quality_scorer``
+    wrote ``summary`` (a str) directly into ``articles.full_text``, leaving
+    a single row that crashed ``decompress(r[4])`` in ``get_unscored``
+    with ``a bytes-like object is required, not 'str'`` — and because that
+    one row sits at ai_score=0 / ml_score=NULL it is re-fetched on every
+    scorer cycle, taking out the *entire* batch every 30s (300+ WARNING
+    lines/day in daemon.log, scorer effectively dark for that batch).
+    Treating an already-str payload as already-decoded is the only
+    interpretation a future caller could want — it was clearly inserted
+    pre-decompressed. Bytes path is byte-unchanged."""
+    if isinstance(data, str):
+        return data
     return zlib.decompress(data).decode("utf-8", errors="replace")
 
 

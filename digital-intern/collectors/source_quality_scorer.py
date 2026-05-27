@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -109,12 +110,25 @@ def _mark_seen(seen_conn: sqlite3.Connection, article_id: str, link: str, title:
 
 
 def _write_article(title: str, summary: str, link: str) -> bool:
-    """Insert the quality report into articles.db."""
+    """Insert the quality report into articles.db.
+
+    ``full_text`` is declared as BLOB and the rest of the pipeline expects
+    a zlib-compressed payload (see ``storage.article_store.compress`` /
+    ``decompress``). Writing the raw ``summary`` string here leaves a
+    TEXT-affinity value behind a BLOB column (SQLite is dynamically
+    typed) — and the next call to ``store.get_unscored`` then crashes the
+    *entire* scorer batch with ``a bytes-like object is required, not
+    'str'`` because ``decompress`` is wired for bytes. Live regression
+    (2026-05-27): one of these str-typed rows blocked the scorer 300+×
+    /day. Compressing here matches every other ingestion path."""
     try:
         conn = sqlite3.connect(str(ARTICLES_DB), timeout=20, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         now = datetime.now(timezone.utc).isoformat()
+        blob = zlib.compress(
+            (summary or "").encode("utf-8", errors="replace"), level=6,
+        ) if summary else None
         conn.execute(
             """INSERT OR IGNORE INTO articles
                (id, url, title, source, published, kw_score, full_text, first_seen)
@@ -126,7 +140,7 @@ def _write_article(title: str, summary: str, link: str) -> bool:
                 SOURCE_NAME,
                 now,
                 0.0,
-                summary,
+                blob,
                 now,
             ),
         )
