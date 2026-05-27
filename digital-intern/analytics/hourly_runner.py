@@ -67,6 +67,8 @@ def main() -> int:
         ("premarket_brief",           "analytics.premarket_brief",           "main"),
         ("ticker_cold_case_detector", "analytics.ticker_cold_case_detector", "main"),
         ("signal_cascade_detector",   "analytics.signal_cascade_detector",   "main"),
+        ("ml_coverage_rate",          "analytics.ml_coverage_rate",          "main"),
+        ("ml_coverage_by_source",     "analytics.ml_coverage_by_source",     "main"),
     ]
 
     for short_name, mod_path, fn_name in module_specs:
