@@ -6,6 +6,112 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-27 core HYBRID pass (Agent 1) — `/api/hard-exit-slippage` calibration view
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=3
+
+### Phase 1 — Debug & test (`bugs_fixed = 0`)
+
+`tests/test_core_*.py` baseline: **865 passed, 1 skipped** in 30s — no
+real bugs to fix in the core surfaces (`runner.py`, `reporter.py`,
+`signals.py`, `strategy.py`, `dashboard.py`, `market.py`, `store.py`).
+The codebase has been polished through ~45 prior HYBRID passes; the
+remaining quality bar is in features that USE the well-formed data, not
+in fixing the data path itself. No commit at Phase 1.
+
+### Phase 2 — Feature: `/api/hard-exit-slippage` (`features_added = 1`)
+
+**The gap.** `analytics/hard_exit_slippage.py` was committed to disk
+unwired in a prior pass — a complete, well-documented builder with no
+dashboard endpoint, no test coverage, and no callers. The companion
+`/api/hard-exit-summary` answers *"is the mechanical SL/TP discipline
+firing?"*; this builder answers the orthogonal calibration question:
+*"are the THRESHOLDS THEMSELVES well-calibrated against realized
+volatility, or is the tape doing the work the threshold was supposed
+to do?"*
+
+**Live evidence motivating the wiring** (2026-05-26): MU `HARD_TP`
+fired at threshold `$773.31` (a +3% TP off the `$750.79` entry) with
+an **actual fill of `$889.50`** — +15.025% past the trigger. The
+threshold captured only 1/5 of the move; the tape did the rest. With
+1 fire so far the verdict is `INSUFFICIENT` (needs ≥3 for a directional
+read), but as more TPs accumulate this surface will publish
+`LUCKY_OVERSHOOTS` and tell the operator the +3% TP is materially
+under-calibrated for the realized volatility of leveraged + gappy names.
+
+**Verdict ladder:**
+
+| Verdict             | Trigger                                                          |
+|---------------------|------------------------------------------------------------------|
+| `NO_HARD_EXITS`     | empty ledger                                                     |
+| `INSUFFICIENT`      | fewer than `MIN_FOR_VERDICT (3)` hard exits total                |
+| `LUCKY_OVERSHOOTS`  | ≥3 TPs AND TP median slippage ≥ `LUCKY_TP_THRESHOLD_PCT (2.0%)`  |
+| `UNLUCKY_GAPS`      | ≥3 SLs AND SL median slippage ≥ `UNLUCKY_SL_THRESHOLD_PCT (2.0%)`|
+| `CLEAN_FILLS`       | otherwise (thresholds firing at-the-tick)                        |
+
+LUCKY wins on a both-breach tie (asymmetric TP-side gappiness is the
+more frequently-observed operator signal on a leveraged book).
+
+**Wiring** in `dashboard.py` adjacent to `/api/hard-exit-summary`
+(operator-endpoint clustering pattern). Deliberately NOT `@swr_cached`
+— pure scan over bounded `recent_trades(2000)` and the operator
+opening this panel during a sequence of fires needs the freshest
+read, not a 20s-old cache (the existing `/api/hard-exit-summary`
+precedent).
+
+**Tests:** `tests/test_hard_exit_slippage.py` — **48 tests**, all
+passing. Locks the parse / slippage math / verdict precedence /
+percentile interpolation / endpoint envelope (success + ERROR degrade
++ empty ledger). Live MU case (`+15.025%`) baked in as a test
+constant so any future regression of the regex or the math surfaces
+immediately.
+
+### Phase 3 — Live user validation (`user_findings = 3`)
+
+Live state (Sat 03:40 ET, market closed):
+
+* `/api/healthz` ok=true, lock_status=acquired, last_decision_age_s=618
+  (10 min — under hourly review load).
+* `/api/notify-health` HEALTHY, last Discord OK 11 min ago.
+* `/api/alarm-latches` CLEAR, breaker/quota inactive.
+* `/api/portfolio` 100% cash $1167.71 (+16.77% from $1000 start).
+* `/api/decision-cadence` ON_SCHEDULE, QUIET_CLOSED tier, next decision ETA 4773s.
+
+**Findings:**
+
+1. **Recent 3 decisions are `NO_DECISION`** (last real decision 5h+
+   ago) — exactly the MEMORY-documented `PT NO_DECISION host
+   saturation` pattern. The 4-agent HYBRID review cycle (this agent +
+   3 siblings) spawns concurrent Opus subprocesses that starve the
+   live trader's own Opus call. Documented behaviour; alarm-latches
+   stay CLEAR because each individual NO_DECISION clears the counter
+   between cycles under the dynamic-interval cadence. Not a bug, but
+   a real trade-off of the hourly review architecture.
+
+2. **`continuous.log` LLM annotation auth failure**: `[continuous]
+   LLM annotation failed: "Could not resolve authentication method.
+   Expected one of api_key, auth_token, or credentials to be set"`.
+   The Opus annotation step in `run_continuous_backtests.py` ran 0
+   endorsed / 0 condemned this cycle. Out of scope for core (Agent 2
+   owns ML + continuous-backtest), but flagged here so it doesn't
+   silently rot the winner-training pool.
+
+3. **`/api/hard-exit-summary` `INSUFFICIENT` is honest but lonely** —
+   the 1 live HARD_TP (MU) is the only signal we have. As more SL/TP
+   fires accumulate, BOTH surfaces (`summary` and `slippage`) will
+   start publishing directional verdicts; until then a future
+   operator opening the panel sees "1 fire, INSUFFICIENT" which is
+   the correct empirical answer but reads as a non-event.
+
+### Phase 4 — Docs
+
+This section + an entry on `/api/hard-exit-slippage` to the canonical
+endpoint table elsewhere in this file. No bug-fix commit (Phase 1 was
+zero-bug); Phase 2 commit `8970c1d` ships the builder wiring + 48
+tests in a single atomic change.
+
+---
+
 ## 2026-05-27 feature pass (Agent 4) — `/api/actionable-opportunities` composite ranker
 
 **Counters:** bugs_fixed=0 · features_added=1 · user_findings=1
