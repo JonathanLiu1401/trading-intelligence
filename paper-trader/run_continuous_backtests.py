@@ -334,6 +334,32 @@ PERSONA_REGIME_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 CONVICTION_CALIBRATION_LOG = ROOT / "data" / "conviction_calibration_log.jsonl"
 CONVICTION_CALIBRATION_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 
+# Per-cycle bootstrap-CI ledger for the deployed scorer's OOS rank-IC,
+# RMSE, and dir-acc. ``paper_trader/ml/oos_bootstrap_ci.bootstrap_ci``
+# already exists as a CLI / dashboard-feeder, but **nothing trends its
+# verdict per cycle**: every other OOS diagnostic in this loop reports
+# point estimates (``oos_ic``, ``oos_rmse``, ``oos_dir_acc``) that can
+# sit at exactly the noise floor without any signal that the value IS
+# the noise floor. With OOS cycle sizes in the hundreds-to-low-thousands
+# and the documented near-zero underlying skill plateau
+# (``MLP_WORSE_THAN_TRIVIAL`` / ``GATE_INEFFECTIVE``), the operator-
+# decisive question is *whether the rank-IC CI excludes 0 right now and
+# how that has been trending across cycles* — i.e. has the OOS skill
+# become statistically distinguishable from a coin flip, or are the
+# headline +0.05/-0.01/+0.08 reads a sampling-noise walk? The CLI can
+# answer this for one snapshot; the ledger makes it trendable per cycle.
+# Same testability rule as every sibling skill log (module-level so
+# tests can redirect), same best-effort discipline (a ledger write must
+# never break the loop), same atomic tmp + ``.replace`` trim idiom.
+BOOTSTRAP_CI_SKILL_LOG = ROOT / "data" / "bootstrap_ci_skill_log.jsonl"
+BOOTSTRAP_CI_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+# Bootstrap resample count. The default in ``oos_bootstrap_ci`` is 1000
+# for the CLI; we keep it for the per-cycle ledger too because (a) it is
+# the textbook lower bound for stable 2.5%/97.5% percentile estimates,
+# and (b) the per-cycle cost on the live ≈1000-row OOS slice is ~1-2s
+# (Spearman sort dominates), negligible against the 10-min cooldown.
+BOOTSTRAP_CI_N = 1000
+
 EARLIEST_WINDOW_START = date(1993, 2, 1)  # SPY inception — ~30+ years of history
 WINDOW_END_BUFFER_DAYS = 180  # never end a window within 6 months of today
 MIN_WINDOW_YEARS = 1
@@ -2418,6 +2444,194 @@ def _append_conviction_calibration_log(cycle: int, win_start: date,
         return False
 
 
+def _append_bootstrap_ci_skill_log(cycle: int, win_start: date,
+                                    win_end: date,
+                                    outcomes_path: "Path | str | None" = None,
+                                    n_bootstrap: int = BOOTSTRAP_CI_N,
+                                    ci_level: float = 0.95,
+                                    seed: int = 42) -> bool:
+    """Append one structured row to the per-cycle bootstrap-CI ledger.
+
+    Answers, durably and per-cycle, the operator-decisive question every
+    point-estimate OOS diagnostic structurally cannot: *is the deployed
+    scorer's OOS rank-IC statistically distinguishable from a coin flip
+    at this n_oos?* Reuses ``oos_bootstrap_ci.bootstrap_ci`` verbatim —
+    the EXACT read-only path the CLI uses — so the persisted CI bounds
+    equal the CLI's by construction (a built-in no-drift cross-check,
+    the sibling ``_append_baseline_skill_log`` / ``_append_calibrated_reliability_log``
+    pattern). The OOS slice is the same temporal holdout
+    ``_train_decision_scorer`` uses via ``split_outcomes_temporal``, so
+    the CI bounds describe the EXACT records the trustworthy generalization
+    metrics in ``scorer_skill_log.jsonl`` are computed on — operators can
+    cross-read ``oos_ic`` (point) and ``rank_ic_ci_low/_high`` (uncertainty)
+    on the SAME cycle row by joining on ``cycle``.
+
+    Verdict ladder:
+      * ``NOT_TRAINED``       — deployed scorer has no pickle / failed to load
+      * ``INSUFFICIENT_DATA`` — fewer than ``MIN_PAIRS_FOR_CI`` (30) valid OOS pairs
+      * ``SKILL_DETECTED``    — rank-IC 95% CI strictly above 0
+      * ``NO_SKILL_DETECTED`` — rank-IC 95% CI straddles or sits at/below 0
+      * ``ERROR``             — best-effort fallback (the diagnostic raised)
+
+    Why this matters as a separate ledger and not extra columns in
+    ``scorer_skill_log.jsonl``: the bootstrap itself is a *post-train
+    diagnostic* (loads the just-pickled scorer + the trim-bounded
+    outcomes tail) that costs ~1-2s — the existing scorer log is built
+    inside the synchronous train path where adding the bootstrap would
+    couple two unrelated operations. Keeping the CI in its own ledger
+    means the (now slower) CI computation can never block / poison the
+    point-estimate metrics ``_train_decision_scorer`` writes, and a
+    bootstrap-CI consumer can join on ``cycle`` to align both views
+    without forcing a schema migration on every existing consumer
+    (``skill_trend`` / ``gate_audit`` / ``sector_skill`` / etc.).
+
+    Best-effort and idempotent-safe: every fault is swallowed (a ledger
+    write must NEVER break the continuous loop — the
+    ``_append_scorer_skill_log`` discipline). On any fault we still emit
+    an honest row with ``status='error' verdict='ERROR'`` so a gap in
+    the trend is visible, not silent. Bounded growth: when the file
+    exceeds 2× ``BOOTSTRAP_CI_SKILL_LOG_KEEP`` it is atomically rewritten
+    via the decision_outcomes trim idiom (tmp + ``.replace`` so a torn
+    truncate cannot lose skill history).
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        # Default-empty result so EVERY exit path below emits a row — a
+        # gap in the trend is what dies in the dark, never an honest
+        # error-keyed row. Mirrors `_append_conviction_calibration_log`'s
+        # fallback dict construction.
+        result: dict = {
+            "status": "error", "n": 0, "n_bootstrap": 0,
+            "ci_level": float(ci_level),
+            "rmse": {"value": None, "ci_low": None, "ci_high": None},
+            "dir_acc": {"value": None, "ci_low": None, "ci_high": None},
+            "rank_ic": {"value": None, "ci_low": None, "ci_high": None},
+        }
+        verdict = "ERROR"
+        hint: str | None = None
+        try:
+            from paper_trader.ml.decision_scorer import DecisionScorer
+            from paper_trader.ml.oos_bootstrap_ci import (
+                bootstrap_ci, MIN_PAIRS_FOR_CI)
+            from paper_trader.validation import split_outcomes_temporal
+
+            # Load outcomes tail bounded to MAX_OUTCOMES_FOR_TRAINING so the
+            # CI describes the same records the trainer / `scorer_skill_log`
+            # see — older rows describe a stale signal regime per the
+            # documented MAX_OUTCOMES_FOR_TRAINING rationale.
+            outcomes: list[dict] = []
+            p = Path(outcomes_path) if not isinstance(
+                outcomes_path, Path) else outcomes_path
+            if p.exists():
+                lines = [ln for ln in p.read_text().splitlines() if ln.strip()]
+                lines = lines[-MAX_OUTCOMES_FOR_TRAINING:]
+                for ln in lines:
+                    try:
+                        outcomes.append(json.loads(ln))
+                    except Exception:
+                        continue
+
+            # Same temporal split `_train_decision_scorer` uses so the CI
+            # describes the trustworthy generalization slice. A split failure
+            # (validation module missing, malformed corpus) degrades to "no
+            # OOS records" honestly, NOT to "evaluate on all records"
+            # (which would silently include the train fold and fabricate
+            # apparent skill).
+            oos_records: list[dict] = []
+            try:
+                _, oos_records = split_outcomes_temporal(
+                    outcomes, oos_fraction=0.2)
+            except Exception as split_exc:
+                hint = (f"temporal split unavailable: "
+                        f"{type(split_exc).__name__}")
+
+            scorer = DecisionScorer()
+            # bootstrap_ci handles all degenerate cases internally and
+            # returns a well-formed dict — never raises.
+            result = bootstrap_ci(
+                scorer, oos_records,
+                n_bootstrap=int(n_bootstrap),
+                ci_level=float(ci_level),
+                seed=int(seed),
+            )
+            status = result.get("status", "error")
+            if status == "ok":
+                rk = result.get("rank_ic") or {}
+                ic_lo = rk.get("ci_low")
+                # CI excluding 0 ⇒ statistically distinguishable skill.
+                # `ic_lo is not None` guards against a degenerate
+                # bootstrap (constant resamples) where bootstrap_ci returns
+                # CIs as None — treat as no detectable skill, mirroring the
+                # `skill_uncertainty` verdict-ladder discipline.
+                if ic_lo is not None and float(ic_lo) > 0.0:
+                    verdict = "SKILL_DETECTED"
+                else:
+                    verdict = "NO_SKILL_DETECTED"
+            elif status == "scorer_not_trained":
+                verdict = "NOT_TRAINED"
+            elif status == "insufficient_data":
+                verdict = "INSUFFICIENT_DATA"
+            elif status == "empty":
+                # No outcome records on disk yet (fresh continuous-loop start
+                # before the first cycle accumulated outcomes). Honestly
+                # surfaced as INSUFFICIENT_DATA — same semantics from a
+                # downstream consumer's perspective.
+                verdict = "INSUFFICIENT_DATA"
+            else:
+                verdict = "ERROR"
+        except Exception as exc:
+            hint = f"{type(exc).__name__}: {exc}"
+
+        rk = result.get("rank_ic") or {}
+        rm = result.get("rmse") or {}
+        da = result.get("dir_acc") or {}
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": result.get("status"),
+            "verdict": verdict,
+            "n_oos": int(result.get("n") or 0),
+            "n_bootstrap": int(result.get("n_bootstrap") or 0),
+            "ci_level": result.get("ci_level"),
+            "rank_ic_point": rk.get("value"),
+            "rank_ic_ci_low": rk.get("ci_low"),
+            "rank_ic_ci_high": rk.get("ci_high"),
+            "rmse_point": rm.get("value"),
+            "rmse_ci_low": rm.get("ci_low"),
+            "rmse_ci_high": rm.get("ci_high"),
+            "dir_acc_point": da.get("value"),
+            "dir_acc_ci_low": da.get("ci_low"),
+            "dir_acc_ci_high": da.get("ci_high"),
+        }
+        if hint:
+            row["hint"] = hint
+        BOOTSTRAP_CI_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with BOOTSTRAP_CI_SKILL_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in
+                     BOOTSTRAP_CI_SKILL_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > BOOTSTRAP_CI_SKILL_LOG_KEEP * 2:
+                kept = lines[-BOOTSTRAP_CI_SKILL_LOG_KEEP:]
+                tmp = BOOTSTRAP_CI_SKILL_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(BOOTSTRAP_CI_SKILL_LOG)
+        except Exception as e:
+            print(f"[continuous] bootstrap-ci-skill-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] bootstrap-ci-skill-log append failed: {e}")
+        return False
+
+
 def _append_stop_out_skill_log(cycle: int, win_start: date,
                                 win_end: date,
                                 outcomes_path: "Path | str | None" = None
@@ -4357,6 +4571,23 @@ def main() -> None:
         # tell whether the sizing rule starts to work or stays flat. Best-
         # effort by construction; never breaks the loop.
         _append_conviction_calibration_log(cycle, win_start, win_end)
+
+        # Durable per-cycle bootstrap-CI ledger. Answers the operator-
+        # decisive question every point-estimate OOS diagnostic ducks: *is
+        # the deployed scorer's OOS rank-IC statistically distinguishable
+        # from a coin flip at this n_oos?* Reuses
+        # ``oos_bootstrap_ci.bootstrap_ci`` verbatim against the SAME
+        # temporal OOS holdout ``_train_decision_scorer`` evaluates with,
+        # so a quant can join ``scorer_skill_log.cycle`` to
+        # ``bootstrap_ci_skill_log.cycle`` and read the point estimate
+        # AND its 95% CI on the same row. Verdict ladder
+        # SKILL_DETECTED / NO_SKILL_DETECTED / INSUFFICIENT_DATA /
+        # NOT_TRAINED gives an operator an immediate yes/no rather than a
+        # decimal that could be noise. Best-effort by construction; never
+        # breaks the loop. Wired adjacent to ``_append_scorer_skill_log``
+        # because it consumes the SAME OOS slice that ledger reports on —
+        # CI bounds belong next to the point estimates they qualify.
+        _append_bootstrap_ci_skill_log(cycle, win_start, win_end)
 
         # Durable per-cycle stop-out skill ledger. ``stop_out_audit``
         # answers whether the inherited ``_buy`` ``stop_loss = price * 0.92``
