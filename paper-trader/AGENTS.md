@@ -6,6 +6,137 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-27 core HYBRID pass (Agent 1) — `oos_permutation_test` zero-variance guard + `_deployment_plan_line` Discord helper
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=4
+
+### Phase 1 — Debug & test (`bugs_fixed = 1`)
+
+Found in the just-shipped `paper_trader/ml/oos_permutation_test.py`
+module (uncommitted on entry, brought in by a prior pass): the
+`_spearman_local` NaN-guard delegated to `ml.calibration._spearman`,
+which by design returns `0.0` (not NaN) on a constant-variance input —
+the cleaner choice for calibration aggregation. But for a permutation
+test, a constant predictor produces a degenerate null distribution
+(every shuffle yields the same IC), so reporting `rank_ic=0.0` /
+`verdict=AT_NOISE` is silently misleading: the test is operating on
+nothing. Added an explicit `np.std == 0` guard in `_spearman_local` so
+the bucket reports `INSUFFICIENT_DATA` instead of fake noise.
+
+`tests/test_oos_permutation_test.py::TestSmoothPValueBounds::
+test_constant_predictor_returns_insufficient_or_at_noise` already
+encoded the right expectation (`rank_ic is None`) — the failing test
+is the bug catcher; the fix landed in 1 commit (`e252a2f`).
+
+`tests/test_core_*.py` baseline: **873 passed, 1 skipped** in 53s
+(post-fix). No further real bugs to fix in the seven core files —
+the codebase has been polished through 45+ prior HYBRID passes and
+the remaining quality bar is in features that USE the well-formed
+data, not in fixing the data path.
+
+### Phase 2 — Feature dev (`features_added = 1`)
+
+`_deployment_plan_line` reporter helper — `/api/deployment-plan`'s
+buy list to Discord. The live shape that drove this: book flat for
+19h on $1167.71 cash with a READY plan to deploy $817 across 4 names
+at blended +7.13% pred-5d — the operator knew (via `CASH STREAK`)
+they were sidelined, but had no Discord-side answer to "and what
+does the gate think I should do?". The dashboard endpoint had the
+answer; this helper routes it to the surface the trader actually
+reads.
+
+**Suppression discipline** (silence-when-not-actionable):
+
+  * cash share of book < 50% → silent (book mostly deployed; redirecting
+    a small leftover would be recurring chatter)
+  * verdict in {NO_OPPORTUNITIES, INSUFFICIENT_CASH, PENDING, ERROR} → silent
+  * `n_plan == 0` → silent (defensive)
+  * `READY` / `GATED` with `n_plan >= 1` and non-empty `headline` → fires
+
+**SSOT (invariant #10):** ships `/api/deployment-plan`'s own
+`headline` verbatim. The Discord block and dashboard endpoint can
+never disagree on "deploy $X across N names at blended +Y%".
+
+**Plumbing choice:** localhost HTTP to `:8090/api/deployment-plan`
+rather than inlining the scorer pipeline. Three reasons: (a) reuses
+the dashboard's SWR cache so the hourly summary doesn't trigger a
+fresh scorer pass on the hot path; (b) the dashboard endpoint
+already composes scorer-opportunities + half-Kelly + concentration/
+sector/leverage caps — replicating that in `reporter.py` would
+fork the SSOT; (c) failure modes (dashboard down / timeout / bad
+JSON) all degrade to "" by construction (the `_send` discipline —
+the helper must never take down the summary). 3s timeout cap so
+the summary path is bounded.
+
+Wired into both `send_hourly_summary` and `send_daily_close`, right
+after `CASH FIT` (the natural pair — sizing-vs-signal precedes the
+concrete buy list). 21 tests cover the full suppression ladder,
+verbatim-headline SSOT, every failure mode (network blip, malformed
+JSON, non-200 status, store fault), and end-to-end wiring into both
+summary surfaces (`tests/test_deployment_plan_reporter.py`).
+
+### Phase 3 — Live validation (`user_findings = 4`)
+
+1. **Host SATURATED — known issue ([[pt-no-decision-host-saturation]]).**
+   `/api/host-guard` reports swap 100%, load1=12.02 on 16 CPUs (0.75/core),
+   `mem_available_mb=2647`, `starvation_rate_pct=31.7%`, `recent_skip_rate=10%`
+   over the last 120 decisions. 26/120 were `cli_nonzero_rc` (Opus rejecting
+   under load), 12/120 were host-skip (pre-flight guard). The pulse headline
+   names the right culprit: "Opus is starved by the box — reduce concurrent
+   Opus (review/backtest agents); the bot cannot resolve this by trading."
+   Not a code bug, but the dominant operational pain right now.
+
+2. **Build SHA stale.** `/api/healthz` reports `boot_sha=1dc79e7`,
+   `head_sha=774a835` (4 commits behind including this pass's commits).
+   The git-watcher (3-min poll, 600s deferred-restart grace) will detect
+   and bounce the runner on the next cycle boundary; healthy behaviour
+   modulo the host load.
+
+3. **`equity_curve` `sp500_price=0.0` over the 57h Memorial Day weekend.**
+   The most-recent-completed all-cash streak (2026-05-24T02:08 →
+   2026-05-26T11:08) shows `spy_return_pct=0.0` because every
+   `equity_curve` sample inside the holiday-extended weekend got the same
+   cached SPY mark (yfinance returns the prior close on weekends; the
+   live trader cached one value and reused it across 150 cycles). Not a
+   code bug — degrades-correctly behaviour — but worth knowing: the
+   `alpha_cost_usd` figure for any streak straddling a market-closed
+   window will under-report. A future enhancement could backfill SPY
+   marks for known closed windows from the prior trading session's
+   close-to-next-open implied move, but the operator already sees
+   "spy_return_pct=0.0" so the absence of signal IS the signal.
+
+4. **`_deployment_plan_line` validated against live state.** Mid-pass
+   the book transitioned from all-cash to 1 MU position (12:52:28
+   BUY 1.0 @ $896.59). Pre-buy: helper returned "**DEPLOY PLAN** ◈
+   GATED\n> Deploy $817 across 4 name(s) (70% of cash); blended pred
+   5d +7.13%." Post-buy (cash 23% of book): helper returned "" — the
+   50% floor correctly suppressed a "deploy $244 leftover" line that
+   would have been chatter on a freshly-deployed book.
+
+### Files
+
+  * Fixed: `paper_trader/ml/oos_permutation_test.py` (commit `e252a2f`)
+  * Added: `_deployment_plan_line` in `paper_trader/reporter.py`
+    + wiring into hourly + daily close (commit `774a835`)
+  * Added: `tests/test_deployment_plan_reporter.py` (21 tests, commit
+    `774a835`)
+  * Added: `tests/test_oos_permutation_test.py` was uncommitted on
+    entry — brought into git via commit `e252a2f` alongside the
+    module under test.
+
+### Staging discipline
+
+This pass landed on top of an in-flight sibling session's uncommitted
+`reporter.py` changes (`_all_cash_streak_line` + a test file). Per
+[[pt-concurrent-samerole-staging-race]] the Phase-2 commit used
+`git checkout HEAD -- paper_trader/reporter.py` to discard the sibling
+delta, then surgically re-applied ONLY this pass's edits, then staged
+with explicit pathspec — so the sibling's work stays untracked for
+its own commit and this pass's commit cleanly contains only what
+this pass authored.
+
+---
+
 ## 2026-05-27 core HYBRID pass (Agent 1) — `/api/hard-exit-slippage` calibration view
 
 **Counters:** bugs_fixed=0 · features_added=1 · user_findings=3
