@@ -29333,3 +29333,182 @@ leverage_exposure.py`, `paper_trader/analytics/deployment_plan.py`,
 `tests/test_deployment_plan.py`, and this AGENTS.md update. The
 `unified_dashboard.py` edits commit separately in `/home/zeph` (a
 different repo). No `git add -A` (concurrent-agent footgun memory).
+
+
+## 2026-05-27 Agent 4 (feature-dev) — `/api/slate-news-corroboration` + `/api/deployment-plan-conflicts`
+
+Two new pure-builder endpoints that close two distinct read-gaps the
+prior pass's `/api/deployment-plan` + `/api/leverage-exposure` exposed:
+
+1. **`/api/slate-news-corroboration`** — for every name the scorer is
+   recommending in `/api/scorer-opportunities`, cross-join the live
+   `articles.db` news pulse and classify per-name + cohort. Bridges
+   the quant scorer (paper-trader) and the news pipeline (digital-
+   intern) into a single panel-feed.
+2. **`/api/deployment-plan-conflicts`** — audit the proposed
+   `/api/deployment-plan` output for inverse-pair conflicts WITHIN the
+   plan, mirroring `/api/inverse-pair-conflict-skill`'s held-book lens
+   against the *proposed* plan.
+
+### Live evidence (the grounding)
+
+Live trader snapshot at ship time (2026-05-27T12:34Z): 100% cash
+$1167.71, EXTENDED_HOLDOUT 19.27h, bull regime, slate of 12 scorer
+opportunities, planner emitting a 4-name plan: **TECS -3x ($292) +
+NVDU +2x ($58) + AMAT 1x ($292) + NVDA 1x ($175)**.
+
+* `/api/scorer-opportunities` returns 12 names with a baked-in
+  `news_count` integer (a feature value at scoring time), but no
+  headline, no `ai_score`, no live read, no per-name verdict — the
+  operator can't tell whether the model's #1 pick has a *current*
+  narrative behind it or is leaning purely on technicals.
+* The planner's plan above contains **TECS (-3x USTECH inverse) +
+  NVDU (+2x semis long) + AMAT + NVDA (1x semis long)** — a
+  cross-family directional hedge with double-decay carry. No existing
+  surface (`/api/leverage-exposure`, `/api/regime-leverage-fit-skill`,
+  `/api/inverse-pair-conflict-skill` — which only looks at the held
+  book) flags this for the operator.
+
+### `/api/slate-news-corroboration` (`paper_trader/analytics/slate_news_corroboration.py`)
+
+Pure builder `build_slate_news_corroboration(opportunities, news_pulse,
+*, min_pred_pct=1.0, hot_min_count=3, hot_min_score=6.0,
+convergent_min_count=2, convergent_min_score=4.0)`.
+
+Per-name verdict ladder:
+
+| Verdict             | Trigger                                                                  |
+|---------------------|--------------------------------------------------------------------------|
+| `HOT_CONVERGENT`    | pred ≥ floor AND (urgent ≥ 1 OR (n ≥ hot_min_count AND max_score ≥ hot_min_score)) |
+| `CONVERGENT`        | pred ≥ floor AND n ≥ convergent_min_count AND max_score ≥ convergent_min_score      |
+| `THIN_NEWS`         | pred ≥ floor AND 0 < n < convergent_min_count                            |
+| `QUANT_ONLY`        | pred ≥ floor AND n == 0                                                  |
+| `SUB_THRESHOLD`     | pred < floor                                                             |
+
+Overall cohort verdict (only counts buy-cohort = scorer STRONG_HOLD /
+HOLD + pred ≥ floor):
+
+| Verdict                   | Meaning                                                                  |
+|---------------------------|--------------------------------------------------------------------------|
+| `NO_SLATE`                | empty slate OR no buy candidates above floor                             |
+| `STRONG_CORROBORATION`    | ≥ 1 HOT_CONVERGENT AND ≥ 50% of cohort is CONVERGENT or HOT_CONVERGENT   |
+| `QUANT_LEAD`              | ≥ 50% of cohort is QUANT_ONLY                                           |
+| `THIN`                    | ≥ 50% of cohort is THIN_NEWS                                            |
+| `MIXED_CORROBORATION`     | everything else with at least one buy-candidate                          |
+
+The endpoint reuses **`dashboard._ticker_news_pulse`** (the same
+articles.db reader feeding `/api/sector-pulse`) so per-ticker pulse
+semantics never diverge between panels. Reuses
+**`signals._db_path()`** via `_articles_db_path()` (the freshness-aware
+SSOT — the documented split-brain memory fixed everywhere).
+
+Query parameters (all optional, all clamped):
+
+* `hours` — pulse window (default 24, range 1..168)
+* `min_pred_pct`, `hot_min_count`, `hot_min_score`,
+  `convergent_min_count`, `convergent_min_score` — all five tuning
+  knobs of the verdict ladder.
+
+### `/api/deployment-plan-conflicts` (`paper_trader/analytics/deployment_plan_conflicts.py`)
+
+Pure builder `build_deployment_plan_conflicts(plan)` over the plan row
+shape `build_deployment_plan` emits (`ticker` + `alloc_usd` +
+`leverage_factor`). Reuses `inverse_pair_conflict._PAIR_FAMILIES` and
+`_TICKER_INDEX` as SSOT — the held-book audit and the plan audit can
+never disagree on which family a ticker belongs to.
+
+Verdict ladder (most-severe-first; first-match wins):
+
+| Verdict                | Trigger                                                                                       |
+|------------------------|-----------------------------------------------------------------------------------------------|
+| `NO_PLAN`              | empty plan                                                                                    |
+| `CARRY_WASTE`          | any family has BOTH leveraged-long AND leveraged-inverse populated in the plan                |
+| `OPPOSING_UNLEVERED`   | any family has 1x-core + leveraged-inverse (or leveraged-long + 1x-core)                      |
+| `DIRECTIONAL_HEDGE`    | aggregate long-lev $ ≥ `DIRECTIONAL_MIN_PCT` (5%) AND inverse-lev $ ≥ `DIRECTIONAL_MIN_PCT`   |
+| `CLEAN`                | none of the above                                                                             |
+
+Family conflicts are sorted worst-cancelled-first so the operator reads
+the most pathological family at the top. Cancellation severity reuses
+the `inverse_pair_conflict` thresholds verbatim. (One subtlety: the
+`cancelled / gross` ratio is bounded at 0.5 for a perfect dollar offset
+— pinned in test — so the `SEVERITY_HIGH` (≥80%) branch is unreachable
+by construction; `MEDIUM` is the maximum severity in practice. The
+threshold-pin test surfaces this so a future refactor knows it's
+intentional.)
+
+The endpoint **reuses `deployment_plan_api()` as a sub-call** so the
+same SWR cache + query-param parsing is shared (zero duplication of the
+`reserve_cash_pct` / `per_name_cap_pct` / `leveraged_cap_pct` / etc.
+forwarding logic). Forwards every deployment-plan query param verbatim
+so an operator tuning the planner sees the new plan's conflict picture
+without leaving the panel.
+
+The audit response surfaces the planner verdict + cash + regime under
+top-level keys (`planner_verdict`, `planner_headline`,
+`cash_available_usd`, `regime`) so the audit envelope is self-contained
+for a panel render — no second fetch needed.
+
+### Files
+
+* `paper_trader/analytics/slate_news_corroboration.py` — pure builder
+  + verdict ladder (see above). 281 lines.
+* `paper_trader/analytics/deployment_plan_conflicts.py` — pure builder
+  + family + directional-hedge audit. Reuses inverse_pair_conflict
+  taxonomy as SSOT. 280 lines.
+* `paper_trader/dashboard.py` — adds `/api/slate-news-corroboration`
+  + `/api/deployment-plan-conflicts` routes; both wrap with the
+  `try/except → ERROR envelope` convention adjacent endpoints use.
+* `tests/test_slate_news_corroboration.py` — 27 tests. Per-name ladder,
+  cohort ladder, buy-cohort filter (EXIT/TRIM excluded), garbage-input
+  never-raises, pred-floor boundary inclusion, headline contents,
+  Flask test_client smoke (matches the analytics-verification memory:
+  module __main__ smoke hits empty `data/` DB; live endpoint contract
+  verified via test_client), defaults-pinned drift-lock.
+* `tests/test_deployment_plan_conflicts.py` — 31 tests. Verdict ladder
+  (NO_PLAN / CLEAN / CARRY_WASTE / OPPOSING_UNLEVERED /
+  DIRECTIONAL_HEDGE), severity-cap-at-MEDIUM pin, SEMIS-family
+  conflicts (SOXL+SOXS, SMH+SOXS), aggregate-totals-off-taxonomy,
+  garbage-row never-raises, headline-contents, CARRY_WASTE outranks
+  OPPOSING_UNLEVERED, Flask test_client smoke + query-forward
+  (`leveraged_cap_pct=0` forces a CLEAN/NO_PLAN response).
+
+### Why these two
+
+`/api/slate-news-corroboration` answers the operator's first follow-up
+to a scorer slate they've never seen news on: "for the model's top
+picks, is the live wire agreeing?". The prior 209-endpoint surface had
+no single panel that joined the quant ranking with the live narrative
+read.
+
+`/api/deployment-plan-conflicts` is the natural mirror to the held-book
+`/api/inverse-pair-conflict-skill`. The deployment_plan algorithm
+optimises purely on `pred_5d_return_pct` and will ship a plan whose
+leveraged-long + leveraged-inverse sides offset each other — paying
+decay twice for a near-zero net direction. Today's live plan
+(TECS -3x + NVDU +2x + AMAT + NVDA) is precisely this pathology;
+ship-time live verdict on that plan would be **DIRECTIONAL_HEDGE**
+(cross-family hedge, since TECS is in USTECH and NVDU+AMAT+NVDA are
+off-taxonomy single-name semis longs).
+
+### Tests
+
+58 new (`test_slate_news_corroboration` 27 + `test_deployment_plan_conflicts`
+31) + adjacent-analytics regression sweep (`test_deployment_plan` +
+`test_leverage_exposure` + `test_inverse_pair_conflict` +
+`test_kelly_sizing` + `test_concentration_cap`) = **155 passed in
+2.76s** all green. Dashboard wiring (`test_dashboard_swr` +
+`test_dashboard_threaded`) = 10 passed.
+
+### Staging
+
+Explicit per-file pathspec: `paper_trader/analytics/
+slate_news_corroboration.py`, `paper_trader/analytics/
+deployment_plan_conflicts.py`, `paper_trader/dashboard.py`,
+`tests/test_slate_news_corroboration.py`,
+`tests/test_deployment_plan_conflicts.py`, and this AGENTS.md update.
+Working copy carries foreign uncommitted changes at start (sibling
+agents' edits to `paper_trader/reporter.py`,
+`run_continuous_backtests.py`, plus untracked
+`tests/test_all_cash_streak_reporter.py` and
+`tests/test_deployment_plan_reporter.py`); all left untouched. No
+`git add -A` (concurrent-agent footgun memory).

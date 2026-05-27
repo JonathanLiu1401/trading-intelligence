@@ -20424,6 +20424,128 @@ def deployment_plan_api():
                         "headline": f"ERROR — {e}"}), 500
 
 
+@app.route("/api/slate-news-corroboration")
+def slate_news_corroboration_api():
+    """Per-name news-pulse cross-join with the ML scorer's WATCHLIST slate.
+
+    For every ticker the scorer is publishing in /api/scorer-opportunities,
+    look up the live articles.db pulse (count, urgent, max ai_score, top
+    headline + URL) and classify each into HOT_CONVERGENT / CONVERGENT /
+    THIN_NEWS / QUANT_ONLY / SUB_THRESHOLD. Emits an overall verdict over
+    the buy-candidate cohort: STRONG_CORROBORATION / QUANT_LEAD / THIN /
+    MIXED_CORROBORATION / NO_SLATE.
+
+    Reuses ``_ticker_news_pulse`` (the same articles.db reader feeding
+    ``/api/sector-pulse``) so per-ticker pulse semantics never diverge
+    between panels.
+
+    Query parameters (all optional, all clamped):
+
+      * ``hours`` — pulse lookback window (default 24, range 1..168)
+      * ``min_pred_pct`` — pred floor for buy-candidate cohort (default 1.0)
+      * ``hot_min_count`` — articles to qualify as HOT (default 3)
+      * ``hot_min_score`` — max ai_score floor for HOT (default 6.0)
+      * ``convergent_min_count`` — articles to qualify as CONVERGENT (default 2)
+      * ``convergent_min_score`` — max ai_score floor for CONVERGENT (default 4.0)
+
+    Advisory only — never gates Opus, never executes (AGENTS.md #2/#12).
+    Pure core / never raises — degrades to ``ERROR`` envelope."""
+    try:
+        from .analytics.slate_news_corroboration import (
+            build_slate_news_corroboration,
+            DEFAULT_MIN_PRED_PCT,
+            DEFAULT_HOT_MIN_COUNT, DEFAULT_HOT_MIN_SCORE,
+            DEFAULT_CONVERGENT_MIN_COUNT, DEFAULT_CONVERGENT_MIN_SCORE,
+        )
+
+        def _arg_f(name: str, default: float) -> float:
+            try:
+                return float(request.args.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        def _arg_i(name: str, default: int) -> int:
+            try:
+                return int(request.args.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        hours = max(min(_arg_i("hours", 24), 168), 1)
+        opportunities = _scorer_opportunities_inline()
+        tickers = sorted({
+            str(o.get("ticker") or "").upper().strip()
+            for o in opportunities
+            if isinstance(o, dict) and str(o.get("ticker") or "").strip()
+        })
+        pulse = _ticker_news_pulse(tickers, hours=hours) if tickers else {}
+
+        result = build_slate_news_corroboration(
+            opportunities,
+            pulse,
+            min_pred_pct=_arg_f("min_pred_pct", DEFAULT_MIN_PRED_PCT),
+            hot_min_count=_arg_i("hot_min_count", DEFAULT_HOT_MIN_COUNT),
+            hot_min_score=_arg_f("hot_min_score", DEFAULT_HOT_MIN_SCORE),
+            convergent_min_count=_arg_i("convergent_min_count", DEFAULT_CONVERGENT_MIN_COUNT),
+            convergent_min_score=_arg_f("convergent_min_score", DEFAULT_CONVERGENT_MIN_SCORE),
+        )
+        result["window_hours"] = hours
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e),
+                        "verdict": "ERROR",
+                        "headline": f"ERROR — {e}"}), 500
+
+
+@app.route("/api/deployment-plan-conflicts")
+def deployment_plan_conflicts_api():
+    """Audit the current /api/deployment-plan output for INTERNAL
+    inverse-pair conflicts BEFORE the operator executes it.
+
+    ``/api/inverse-pair-conflict-skill`` flags simultaneously-held
+    leveraged-long + leveraged-inverse ETFs in the *held book*. This
+    audit runs the same lens against the *proposed plan* the deployment
+    planner is emitting — catching pathologies like ``TECS + TECL`` in
+    one plan (both decay tabs paid) or a directional cross-family hedge
+    (TECS inverse-3x + NVDU +2x in different families but still net
+    near-zero direction with carry on both sides).
+
+    Reuses ``inverse_pair_conflict._PAIR_FAMILIES`` and ``_TICKER_INDEX``
+    as SSOT — the held-book audit and the plan audit can never disagree
+    on which family a ticker belongs to.
+
+    Forwards all deployment-plan query parameters verbatim
+    (``reserve_cash_pct`` / ``per_name_cap_pct`` / etc.) so an operator
+    tuning the planner can see the new plan's conflict picture without
+    leaving the panel.
+
+    Advisory only — never gates Opus, never modifies the plan
+    (AGENTS.md #2/#12). Pure core / never raises — degrades to
+    ``ERROR`` envelope."""
+    try:
+        from .analytics.deployment_plan_conflicts import (
+            build_deployment_plan_conflicts,
+        )
+        # Reuse the deployment-plan route handler so the same SWR/cache
+        # path and query-param parsing is used (zero duplication).
+        resp = deployment_plan_api()
+        plan_data = resp.get_json() if hasattr(resp, "get_json") else {}
+        if not isinstance(plan_data, dict):
+            plan_data = {}
+        plan_rows = list(plan_data.get("plan") or [])
+        result = build_deployment_plan_conflicts(plan_rows)
+        # Surface the planner verdict + cash for context so the panel
+        # can show both reads side-by-side without a second fetch.
+        result["planner_verdict"] = plan_data.get("verdict")
+        result["planner_headline"] = plan_data.get("headline")
+        result["regime"] = plan_data.get("regime")
+        result["cash_available_usd"] = plan_data.get("cash_available_usd")
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e),
+                        "verdict": "ERROR",
+                        "headline": f"ERROR — {e}"}), 500
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # 🐒 10,000-monkey random baseline — gold-standard edge validator.
 #
