@@ -114,6 +114,7 @@ from collectors.ecb_press_collector import collect_ecb_press
 from collectors.boj_press_collector import collect_boj_press
 from collectors.boe_press_collector import collect_boe_press
 from collectors.whitehouse_collector import collect_whitehouse
+from collectors.ofac_sanctions_collector import collect_ofac_sanctions
 from collectors.g10_central_banks_collector import collect_g10_central_banks
 from collectors.global_regulators_collector import collect_global_regulators
 from collectors.imf_bis_worldbank_collector import collect_imf_bis_worldbank
@@ -258,6 +259,7 @@ ECB_PRESS_INTERVAL      = 1800    # ECB press releases RSS — every 30min
 BOJ_PRESS_INTERVAL      = 1800    # Bank of Japan press / speech / MPM RSS — every 30min
 BOE_PRESS_INTERVAL      = 1800    # Bank of England press / publications RSS — every 30min
 WHITEHOUSE_INTERVAL     = 1800    # White House executive orders / proclamations / briefings — every 30min
+OFAC_INTERVAL           = 1800    # OFAC sanctions designations & enforcement actions — every 30min
 G10_CB_INTERVAL         = 1800    # Bank of Canada + RBA press / speeches RSS — every 30min
 GLOBAL_REG_INTERVAL     = 1800    # FSB, FCA, Fed research notes/papers — every 30min
 UN_NEWS_INTERVAL        = 1800    # UN News economic/climate/regional feeds — every 30min
@@ -2544,6 +2546,27 @@ def whitehouse_worker(store: ArticleStore):
         _sleep(WHITEHOUSE_INTERVAL)
 
 
+def ofac_sanctions_worker(store: ArticleStore):
+    log.info("[ofac_sanctions_worker] started")
+    bo = Backoff("ofac_sanctions", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_ofac_sanctions()
+            _ingest(store, articles, "ofac_sanctions")
+            try:
+                source_health.record_result("ofac_sanctions", len(articles))
+            except Exception as he:
+                log.warning(f"[ofac_sanctions_worker] source_health error: {he}")
+            _worker_last_ok["ofac_sanctions"] = time.time()
+            log.debug(f"[ofac_sanctions] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[ofac_sanctions_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(OFAC_INTERVAL)
+
+
 def trade_policy_worker(store: ArticleStore):
     log.info("[trade_policy_worker] started")
     bo = Backoff("trade_policy", base=120.0, cap=1800.0)
@@ -4721,6 +4744,7 @@ def main():
         ("finviz",      finviz_worker),
         ("federal_register", federal_register_worker),
         ("whitehouse",  whitehouse_worker),
+        ("ofac_sanctions", ofac_sanctions_worker),
         ("trade_policy", trade_policy_worker),
         ("g10_cb",      g10_cb_worker),
         ("global_reg",  global_reg_worker),

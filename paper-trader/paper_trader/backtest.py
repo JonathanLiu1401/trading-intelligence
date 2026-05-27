@@ -57,6 +57,14 @@ WATCHLIST = [
     "SPY", "QQQ", "NVDA", "AMD", "MU", "LITE", "AMAT", "LRCX",
     "SMH", "TSM", "INTC", "QCOM", "AAPL", "MSFT", "META", "GOOGL",
     "AMZN", "TSLA", "CRM", "SNOW", "BTC-USD", "GC=F",
+    # Power semis / GaN / SiC
+    "NVTS", "MPWR", "WOLF", "STM", "MCHP", "AMBA", "SWKS", "QRVO",
+    # AI infrastructure / accelerators
+    "SMCI", "AVGO", "ARM", "MRVL", "CDNS", "SNPS", "AEHR", "COHU",
+    # Quantum computing
+    "IONQ", "RGTI", "QUBT", "ARQQ", "QMCO",
+    # High-momentum speculative / space / autonomy / nuclear
+    "RKLB", "LUNR", "AST", "ACHR", "JOBY", "OKLO", "NNE",
     # Global / ADR
     "BABA", "ASML", "SAP", "NVO", "TM", "SONY", "HSBC", "BP", "RIO", "BHP",
     # US financials
@@ -65,6 +73,8 @@ WATCHLIST = [
     "XOM", "CVX", "LLY", "UNH", "V", "MA",
     # Fintech / crypto-adjacent / speculative
     "SHOP", "SQ", "COIN", "MSTR", "PLTR", "RIVN", "NIO", "ARKK",
+    # AI software / voice / defense tech
+    "SOUN", "BBAI", "ASTS", "BFLY", "PRCT",
     # Macro / commodity ETFs
     "TLT", "GLD", "SLV", "USO", "UNG",
     # Leveraged ETFs — 3x Bull
@@ -74,7 +84,7 @@ WATCHLIST = [
     "DPST", "FAS", "HIBL", "UTSL",                   # banks/financials/high-beta/utilities 3x
     # Leveraged ETFs — 2x Bull
     "QLD", "SSO", "MVV", "SAA", "UWM",               # index 2x
-    "NVDU", "MSFU", "AMZU", "GOOGU", "METAU",        # single-stock 2x (NVDA/MSFT/AMZN/GOOG/META)
+    "NVDU", "NVDX", "MSFU", "AMZU", "GOOGU", "METAU", # single-stock 2x (NVDA/MSFT/AMZN/GOOG/META)
     "TSLT", "AAPLU", "CONL", "TSLL",                 # Tesla/Apple/Coinbase 2x
     "LNOK", "SMCI2X", "PLTU",                        # Nokia/SMCI/Palantir 2x
     "USD", "ROM", "UXI", "UYG",                      # tech/industrial/financial 2x
@@ -96,6 +106,12 @@ QUANT_SIGNAL_TICKERS = [
     # Tech / semis — high-growth mega-caps
     "SPY", "QQQ", "NVDA", "AMD", "MU", "TSM", "AAPL", "MSFT", "META",
     "GOOGL", "TSLA", "CRM", "SNOW",
+    # Power semis / AI infra — new high-growth additions
+    "NVTS", "MPWR", "AVGO", "ARM", "MRVL", "SMCI",
+    # Quantum computing — high-volatility names where momentum signals matter
+    "IONQ", "RGTI", "QUBT",
+    # Momentum speculative — space / voice AI
+    "RKLB", "SOUN", "AST",
     # Speculative growth / crypto-adjacent
     "PLTR", "COIN", "MSTR",
     # Single-stock 2x leveraged
@@ -127,7 +143,7 @@ _LEVERAGED_ETFS = {
     "NAIL", "DFEN", "DPST", "FAS", "HIBL", "WANT", "MIDU", "TNA", "UTSL",
     # 2x bull (index / single-stock)
     "QLD", "SSO", "MVV", "SAA", "UWM",
-    "NVDU", "MSFU", "AMZU", "GOOGU", "METAU", "TSLT", "TSLL",
+    "NVDU", "NVDX", "MSFU", "AMZU", "GOOGU", "METAU", "TSLT", "TSLL",
     "AAPLU", "CONL", "SMCI2X", "PLTU", "LNOK",
     "USD", "ROM", "UXI", "UYG",
     # Crypto / commodity 2x

@@ -10012,6 +10012,125 @@ def scorer_opportunities_api():
         return jsonify({"error": str(e), "opportunities": []}), 500
 
 
+@app.route("/api/actionable-opportunities")
+@swr_cached("actionable-opportunities", 60.0)
+def actionable_opportunities_api():
+    """Composite ranker for unheld watchlist names — combines three orthogonal
+    SSOT surfaces into a single actionability list with explicit verdict.
+
+    The operator's repeated question — *"of the strong scorer picks, which
+    ONE is the wire heating up on RIGHT NOW?"* — is answered by no single
+    existing endpoint:
+
+      * ``/api/scorer-opportunities`` ranks by predicted 5d return but is
+        often divorced from news heat (live live: 46 STRONG_HOLD picks while
+        news is silent on most).
+      * ``/api/persistent-watchlist-opportunity`` requires ai_score≥6
+        persistence — often zero candidates while the scorer is loud.
+      * ``/api/suggestions`` is *news-mention driven*; it returns 0
+        candidates when the wire is quiet even if the scorer screams.
+
+    This endpoint composes ``scorer-opportunities`` + digital-intern's
+    ``/api/ticker-news-burst`` + ``persistent-watchlist-opportunity`` into
+    a per-ticker actionability ladder (HIGH_CONVICTION /
+    NEWS_CONFIRMED / PERSISTENT_FOLLOWUP / SCORER_ONLY / NEWS_ONLY / WEAK)
+    plus a top-level verdict (HIGH_CONVICTION_FOUND / NEWS_CONFIRMED /
+    PERSISTENT_FOLLOWUP / SCORER_BUT_NO_NEWS / NEWS_BUT_NO_SCORER /
+    ALL_QUIET / INSUFFICIENT_DATA).
+
+    Pure builder ``analytics.actionable_opportunities.build_actionable_opportunities``
+    — every input is treated as untrusted and degrades to "no contribution"
+    rather than exception. Composite score = pred_pp + 2× burst_numeric +
+    0.5× persistent_hours; sorted descending.
+
+    ``?n=`` clamped 1..50 (default 10). The intern fetch is guarded with a
+    short timeout — if intern is dark, the news axis collapses to COLD
+    and the verdict naturally falls back to SCORER_BUT_NO_NEWS / ALL_QUIET
+    (never an exception out of the route).
+    """
+    try:
+        from .analytics.actionable_opportunities import (
+            build_actionable_opportunities,
+        )
+
+        try:
+            n_top = max(1, min(50, int(request.args.get("n", 10))))
+        except (TypeError, ValueError):
+            n_top = 10
+
+        # ── Scorer axis: reuse the cached endpoint directly via test_client
+        # would couple Flask test infra into the live request path. Call the
+        # cache key directly via the swr_cached wrapper (same payload the
+        # frontend already polls).
+        scorer_payload: dict | None = None
+        try:
+            with app.test_client() as _c:
+                _resp = _c.get("/api/scorer-opportunities")
+                if _resp.status_code == 200:
+                    scorer_payload = _resp.get_json()
+        except Exception:
+            scorer_payload = None
+
+        # ── Persistent watchlist axis: same in-process reuse.
+        persistent_payload: dict | None = None
+        try:
+            with app.test_client() as _c:
+                _resp = _c.get("/api/persistent-watchlist-opportunity")
+                if _resp.status_code == 200:
+                    persistent_payload = _resp.get_json()
+        except Exception:
+            persistent_payload = None
+
+        # ── News burst axis: live cross-fetch to intern :8080 with a 3s
+        # timeout — same guard pattern as /api/earnings reuse. Build a CSV
+        # of the scorer's candidate tickers so we only ask intern about
+        # names the scorer is already considering.
+        burst_payload: dict | None = None
+        if isinstance(scorer_payload, dict):
+            opps = scorer_payload.get("opportunities") or []
+            tickers = sorted({
+                str(r.get("ticker") or "").upper().strip()
+                for r in opps if isinstance(r, dict) and r.get("ticker")
+            } - {""})
+            if tickers:
+                csv = ",".join(tickers[:60])  # cap URL length defensively
+                try:
+                    import urllib.request as _u
+                    import urllib.parse as _up
+                    import json as _j
+                    url = (
+                        "http://127.0.0.1:8080/api/ticker-news-burst?"
+                        + _up.urlencode({"tickers": csv})
+                    )
+                    with _u.urlopen(url, timeout=3) as resp:
+                        burst_payload = _j.loads(resp.read().decode("utf-8"))
+                except Exception:
+                    burst_payload = None
+
+        out = build_actionable_opportunities(
+            scorer_payload, burst_payload, persistent_payload,
+            top_n=n_top,
+        )
+        # Pass through a thin source-availability block so an operator can
+        # tell whether a SCORER_BUT_NO_NEWS verdict means "news quiet" vs
+        # "intern down" — high-leverage for the operator-supervision case.
+        out["sources"] = {
+            "scorer_ok": isinstance(scorer_payload, dict)
+                         and "error" not in (scorer_payload or {}),
+            "news_burst_ok": isinstance(burst_payload, dict)
+                             and burst_payload.get("verdict") not in (None, "ERROR"),
+            "persistent_ok": isinstance(persistent_payload, dict)
+                             and persistent_payload.get("state") != "ERROR",
+        }
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "verdict": "ERROR",
+            "by_ticker": [],
+        }), 500
+
+
 @app.route("/api/sector-heatmap")
 @swr_cached("sector-heatmap", 90.0)
 def sector_heatmap_api():
