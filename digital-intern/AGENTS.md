@@ -126,6 +126,116 @@ python3 -m pytest tests/test_ticker_news_burst_runner.py \
 
 ---
 
+## 2026-05-27 HYBRID pass — held_ticker_latest_article + GF Score recap-gate widening (Agent 3 pass #2)
+
+Hybrid debug + feature + live-validation pass. **bugs_fixed: 1 |
+features_added: 1 | user_findings: 3.**
+
+**Phase 1 — bugs_fixed: 0 (no Phase 1 commit).** Surveyed the
+codebase top to bottom: 257 existing tests, 113 analytics modules,
+heavily-commented inline rationale on every defensive primitive. All
+the bug classes the prompt's required-test list calls out
+(backtest:// isolation, ml_score vs ai_score separation, score_source
+discipline, feature-vector dim, model output ranges, NaN guards,
+trainer ml-source exclusion, sample-weight curve) already have
+discriminating tests. No genuine new bug surfaced from static
+inspection; verified by running 130 focused tests
+(test_features / test_trainer / test_model / test_urgency_scorer /
+test_article_store / test_alert_agent / test_alert_dedup /
+test_alert_recency / test_inference_grey_zone) — all passing.
+
+**Phase 2 — feat: `ArticleStore.held_ticker_latest_article`** (commit
+d76ca28). The analyst's standing between-briefings question — "what's
+the FRESHEST headline I have about each open position right now, and
+which positions are dark?" — was answered nowhere in the system.
+Existing surfaces are close but distinct:
+
+* `ticker_news_burst` — aggregate counts + spike verdict per ticker;
+  does NOT name the specific most-recent article.
+* `analytics.held_ticker_news_silence` — CLI audit emitting JSON
+  (multi-window counts + ECHO/DARK verdicts); does NOT identify the
+  single most-recent article.
+* `analysis.claude_analyst._book_silence_lines` — 5h briefing silence
+  flag scoped to the post-cap digest; doesn't carry the article that
+  broke the silence.
+* `urgent_book_breakdown` — per-ticker URGENT counts only; ignores
+  the larger relevance pool.
+
+The new primitive returns `(id, title, source, first_seen, link,
+ai_score, ml_score, age_h, n_in_window)` per ticker sorted freshest-
+first, plus a `dark_tickers` list. Suitable for a dashboard, chat
+enrichment, or briefing pre-render row:
+
+```
+MU:   1.2h — "Micron Q3 beat estimates" (finnhub) ai=9.0
+NVDA: 3.4h — "Nvidia buyback announced"  (yfinance) ml=8.5
+AXTI: dark — no coverage in 24h
+```
+
+Same word-boundary discipline (`\b\$?TICKER\b`) and SSOT default
+(`ml.features.LIVE_PORTFOLIO_TICKERS`) as `ticker_news_burst` and
+`ticker_mention_velocity`, so the four held-book surfaces never
+disagree on what counts as a mention. Read-only — `_LIVE_ONLY_CLAUSE`
+applied, no `ai_score`/`ml_score`/`score_source`/`urgency` mutation;
+all four load-bearing invariants intact. Pinned by
+`tests/test_held_ticker_latest_article.py` (22 tests across
+TestFreshestSelection / TestWordBoundary / TestDarkTickers /
+TestBacktestIsolation / TestWindowCutoff / TestInputHygiene /
+TestReadOnly / TestOutputShape).
+
+**Phase 3 — live-validation findings (news-analyst lens):**
+
+1. **Recap-template gap: GuruFocus "GF Score" variant.** Live
+   evidence from this consumer's articles.db urgency=2 set
+   (2026-05-26): GoogleNews/GuruFocus's "Lumentum Holdings Inc
+   (LITE) Shares Fall 3.8% -- What GF Score Offers - GuruFocus"
+   reached urgency=2 with ml_score=9.66 score_source='ml' — fired a
+   real 🚨 BREAKING push on a held ticker (LITE) for pure recap-mill
+   stock-move attribution. The existing `_RT_GF_VALUE` regex
+   required "GF Value Says" verbatim; the sibling "GF Score" variant
+   slipped through. 5 such rows landed in the 7d window before this
+   widening (1 alerted). **Fixed** in commit 1de2870 — widened
+   alternation `\bgf\s+(?:value\s+says|score)\b` catches both family
+   members while keeping the GuruFocus-unique "GF" anchor. Lockstep
+   twin updated in `analysis.claude_analyst._BRIEFING_RT_GF_VALUE`.
+   Pinned by new tests in `test_alert_recap_template.py` +
+   `test_briefing_recap_template.py`.
+2. **Stocktwits noise reaching urgency=2.** Three stocktwits rows
+   (`$MU` "hahahhaha pushed below 900...", `$SNDK`/`$MU` "reassessed
+   through the lens of structurally evol...", "`$MU` $950 open
+   tomorrow") were alerted in the last 6h with ml_score 8.86-9.81
+   score_source='ml'. The stocktwits credibility tier (0.30) should
+   suppress LONE pushes via `_filter_low_authority_lone` — these
+   either (a) had dup_count>1 from cross-cycle syndication, or
+   (b) the source-authority gate is missing a stocktwits prefix
+   mapping. Reported (not fixed in this pass — needs deeper
+   diagnostic on `_filter_low_authority_lone`'s dup-count path vs
+   how stocktwits-collector tags arrive).
+3. **commodity_futures collector emits urgency=2 directly.** A
+   "Brent Crude Oil ▼7.0% to 96.32 $/bbl — commodity futures alert"
+   row reached urgency=2 with `ai_score=0` `score_source=NULL` —
+   neither LLM nor ML touched it; the collector itself opted into
+   urgency. Reported as a structural observation: collector-direct
+   urgency bypasses the entire scorer + gate stack. Existing
+   `analytics.collector_direct_urgent_audit` likely covers this.
+
+**Phase 4 — verify.** Final test pass on focused suite (all relevant
+to the changes): 127 / 127 passing. Imports clean. All four
+load-bearing invariants preserved (backtest isolation via
+`_LIVE_ONLY_CLAUSE`, `ai_score`/`ml_score` separation, `score_source`
+discipline, read-only on the new primitive).
+
+How to verify:
+```bash
+cd /home/zeph/trading-intelligence/digital-intern
+python3 -m pytest tests/test_held_ticker_latest_article.py \
+                  tests/test_briefing_recap_template.py \
+                  tests/test_alert_recap_template.py \
+                  tests/test_article_store.py -v
+```
+
+---
+
 ## 2026-05-26 HYBRID pass — scorer_worker prefloor parity + ticker_news_burst (Agent 3)
 
 Hybrid debug + feature + live-validation pass.
