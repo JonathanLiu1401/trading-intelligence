@@ -3857,5 +3857,192 @@ class ArticleStore:
             "n_hot": n_hot,
         }
 
+    @_retry_on_lock
+    def held_ticker_latest_article(
+        self,
+        tickers: list[str] | None = None,
+        window_h: float = 24.0,
+    ) -> dict:
+        """Per-held-ticker most-recent live article — the analyst's "what's the
+        freshest headline I have about each open position right now?" primitive.
+
+        Existing surfaces answer related but distinct questions:
+
+          * ``ticker_news_burst`` — aggregate volume + spike verdict per ticker;
+            does NOT name the specific most-recent article.
+          * ``analytics.held_ticker_news_silence`` — CLI audit module writing
+            JSON; multi-window counts + ECHO/DARK verdicts, does NOT identify
+            the single most-recent article.
+          * ``analysis.claude_analyst._book_silence_lines`` — 5h briefing
+            silence flag scoped to the post-cap digest; doesn't carry the
+            article that broke the silence.
+          * ``urgent_book_breakdown`` — per-ticker URGENT counts only; ignores
+            the larger relevance pool.
+
+        This primitive returns, per ticker, the single freshest live mention
+        in the last ``window_h`` hours (id, title, source, first_seen, link,
+        ai_score, ml_score, age_h) plus an in-window mention count. Tickers
+        with zero mentions in the window go to ``dark_tickers``. Suitable
+        for a dashboard, chat enrichment, or briefing pre-render line:
+
+            MU:   1.2h — "Micron Q3 beat estimates" (finnhub) ai=9.0
+            NVDA: 3.4h — "Nvidia buyback announced" (yfinance) ml=8.5
+            AXTI: dark — no coverage in 24h
+
+        Match surface: case-insensitive whole-word against ``title`` only —
+        SAME convention as ``ticker_news_burst`` / ``ticker_mention_velocity``
+        / ``ml.features._LIVE_RE`` so the four held-book surfaces never
+        disagree on what counts as a mention. ``$TICKER`` prefix is honored
+        via the same ``\\b\\$?TICKER\\b`` discriminator used by velocity.
+
+        Read-only: single SELECT scoped by ``first_seen >= since`` and
+        ``_LIVE_ONLY_CLAUSE``, no ai_score / ml_score / score_source /
+        urgency mutation, backtest excluded by the SQL clause — all four
+        load-bearing invariants intact by construction.
+
+        ``tickers`` defaults to ``ml.features.LIVE_PORTFOLIO_TICKERS``
+        (config/portfolio.json positions + option underlyings +
+        sector_watchlist, unioned with the hardcoded fallback). Pass an
+        explicit list for testing or a non-default universe.
+
+        Returns::
+
+            {
+              "window_h":    float,
+              "now_iso":     str,                # snapshot wall-clock (UTC)
+              "by_ticker":   [
+                {
+                  "ticker":       str,
+                  "id":           str,
+                  "title":        str,
+                  "source":       str,
+                  "first_seen":   str,
+                  "link":         str,
+                  "ai_score":     float,         # raw, NOT COALESCEd
+                  "ml_score":     float | None,
+                  "latest_age_h": float | None,  # hours since first_seen
+                  "n_in_window":  int,           # total mentions in window
+                },
+                ...
+              ],                                  # sorted freshest-first
+              "dark_tickers": [str, ...],         # held tickers with 0 mentions
+            }
+        """
+        window_h = max(float(window_h), 0.05)
+        if tickers is None:
+            # Lazy import — storage layer must not always pull the ml graph,
+            # same discipline as ``ticker_news_burst``'s lazy import.
+            from ml.features import LIVE_PORTFOLIO_TICKERS
+            tickers = sorted(LIVE_PORTFOLIO_TICKERS)
+
+        clean: list[str] = []
+        seen_upper: set[str] = set()
+        for raw in tickers or []:
+            if not raw:
+                continue
+            t = str(raw).strip().upper()
+            # Same symbol hygiene as ticker_news_burst: 2..8 chars, alphanum.
+            # Filters falsy entries, sub-2-char ambiguous symbols, and
+            # foreign / compound tickers ("005930.KS") that would otherwise
+            # blow up the word-boundary regex compilation.
+            if len(t) < 2 or len(t) > 8 or t in seen_upper:
+                continue
+            seen_upper.add(t)
+            clean.append(t)
+        if not clean:
+            return {
+                "window_h": round(window_h, 2),
+                "now_iso": datetime.now(timezone.utc).isoformat(),
+                "by_ticker": [],
+                "dark_tickers": [],
+            }
+
+        now = datetime.now(timezone.utc)
+        since = (now - timedelta(hours=window_h)).isoformat()
+
+        # \b\$?TICKER\b discriminator — same convention as
+        # ticker_news_burst / ticker_mention_velocity so $NVDA matches NVDA
+        # and NVDAQ does not leak. The {0,1} on the dollar sign anchors a
+        # bounded optional prefix instead of *-style backtracking.
+        patterns = {
+            t: re.compile(rf"\b\${{0,1}}{re.escape(t)}\b")
+            for t in clean
+        }
+
+        # ORDER BY first_seen DESC means the first hit per ticker is
+        # automatically the newest — no per-ticker re-scan needed. Pull only
+        # the metadata fields the consumer needs (no full_text decompress —
+        # the consumer can drill in via the link field if they want body
+        # text; same discipline as ``ticker_news_burst``'s title-only scan).
+        cur = self.conn.execute(
+            "SELECT id, title, source, first_seen, url, ai_score, ml_score "
+            "FROM articles "
+            f"WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE} "
+            "ORDER BY first_seen DESC",
+            (since,),
+        )
+
+        latest: dict[str, dict] = {}
+        counts: dict[str, int] = {t: 0 for t in clean}
+        for row in cur.fetchall():
+            aid, title, src, fs, url, ai, ml = row
+            if not title:
+                continue
+            for t, pat in patterns.items():
+                if pat.search(title):
+                    counts[t] += 1
+                    if t not in latest:
+                        # First hit per ticker = newest (ORDER BY first_seen DESC).
+                        age_h: float | None = None
+                        try:
+                            if fs:
+                                ts = datetime.fromisoformat(fs)
+                                if ts.tzinfo is None:
+                                    ts = ts.replace(tzinfo=timezone.utc)
+                                age_h = round(
+                                    max(0.0, (now - ts).total_seconds() / 3600.0),
+                                    2,
+                                )
+                        except (TypeError, ValueError):
+                            age_h = None
+                        latest[t] = {
+                            "ticker": t,
+                            "id": aid,
+                            "title": title,
+                            "source": src or "",
+                            "first_seen": fs or "",
+                            "link": url or "",
+                            "ai_score": float(ai) if ai is not None else 0.0,
+                            "ml_score": float(ml) if ml is not None else None,
+                            "latest_age_h": age_h,
+                        }
+
+        by_ticker: list[dict] = []
+        dark: list[str] = []
+        for t in clean:
+            if t in latest:
+                row_out = latest[t]
+                row_out["n_in_window"] = counts[t]
+                by_ticker.append(row_out)
+            else:
+                dark.append(t)
+
+        # Freshest-first ordering (smallest age leads). Unknown age (rare —
+        # corrupt first_seen) goes last, then ticker name as the stable
+        # tiebreak. Mirrors ``ticker_news_burst``'s deterministic sort.
+        by_ticker.sort(
+            key=lambda r: (
+                r["latest_age_h"] if r["latest_age_h"] is not None else float("inf"),
+                r["ticker"],
+            )
+        )
+
+        return {
+            "window_h": round(window_h, 2),
+            "now_iso": now.isoformat(),
+            "by_ticker": by_ticker,
+            "dark_tickers": dark,
+        }
+
     def close(self):
         self.conn.close()
