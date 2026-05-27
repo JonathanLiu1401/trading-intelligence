@@ -90,6 +90,7 @@ from collectors.polymarket_collector import collect as collect_polymarket
 from collectors.manifold_collector import collect_manifold
 from collectors.kalshi_collector import collect as collect_kalshi
 from collectors.collector_rate_monitor import collect_rate_alerts
+from collectors.source_quality_scorer import collect as collect_source_quality
 from collectors.yield_curve_collector import collect_yield_curve
 from collectors.yield_curve_spread_collector import collect_yield_curve_spreads
 from collectors.g10_sovereign_yields import collect_g10_yields
@@ -232,6 +233,7 @@ POLYMARKET_INTERVAL     = 900     # Polymarket prediction markets every 15min
 MANIFOLD_INTERVAL       = 1800    # Manifold Markets prediction markets every 30min
 KALSHI_INTERVAL         = 1800    # Kalshi CFTC-regulated markets every 30min
 RATE_MONITOR_INTERVAL   = 3600    # per-collector silence detector — hourly
+SOURCE_QUALITY_INTERVAL = 86400   # source urgency-rate scorer — once per day
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
 YIELD_CURVE_SPREAD_INTERVAL = 3600  # 2Y-10Y & 3M-10Y inversion tracker every 1h (FRED)
 APPSTORE_FINANCE_INTERVAL = 86400  # Apple App Store Finance rankings — once per day
@@ -1686,6 +1688,23 @@ def rate_monitor_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(RATE_MONITOR_INTERVAL)
+
+
+# ── Worker: source quality scorer — once per day ─────────────────────────────
+def source_quality_worker(store: ArticleStore):
+    log.info("[source_quality_worker] started")
+    bo = Backoff("source_quality", base=300.0, cap=3600.0)
+    while _running:
+        try:
+            emitted = collect_source_quality()
+            if emitted:
+                log.info("[source_quality] report emitted")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[source_quality_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SOURCE_QUALITY_INTERVAL)
 
 
 # ── Worker: 10Y-2Y yield-curve inversion monitor — every 1h ─────────────────
@@ -4778,6 +4797,7 @@ def main():
         ("kalshi",      kalshi_worker),
         ("manifold",    manifold_worker),
         ("rate_monitor", rate_monitor_worker),
+        ("source_quality", source_quality_worker),
         ("yield_curve", yield_curve_worker),
         ("yield_curve_spread", yield_curve_spread_worker),
         ("g10_yields",  g10_yields_worker),
