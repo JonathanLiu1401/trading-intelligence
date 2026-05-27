@@ -1239,6 +1239,153 @@ class ArticleStore:
         }
 
     @_retry_on_lock
+    def briefing_length_trend(self, last_n: int = 10) -> dict:
+        """Per-briefing text-length trend — the *output-density* sibling to
+        ``briefing_cadence_trend`` and ``briefing_text_overlap_trend``.
+
+        ``briefing_cadence_trend`` asks "are briefings firing on schedule?";
+        ``briefing_text_overlap_trend`` asks "if a briefing fires, is it
+        fresh or recapping prior content?"; this asks "if a briefing fires
+        with fresh content, is it as DETAILED as it used to be, or is Opus
+        producing materially shorter output per cycle?". A briefing that
+        comes in 30% shorter than the recent baseline is a real signal of
+        Opus quota throttling, prompt-context truncation, or response
+        cutoff — all conditions an analyst should know about because the
+        digest stops covering the news exhaustively even when it fires
+        ON_CADENCE with FRESH content.
+
+        Sibling discipline: pure SELECT, ``_LIVE_ONLY_CLAUSE`` not needed
+        (briefings table is Opus-write only; never touched by backtest
+        paths). Read-only, no ai_score / ml_score / score_source / urgency
+        mutation. All four load-bearing invariants intact by construction.
+
+        Returns::
+
+            {
+              "last_n":         int,
+              "n_briefings":    int,
+              "lengths":        [int, ...],     # chronological, newest LAST
+              "median_length":  int | None,     # over the full window
+              "min_length":     int | None,
+              "max_length":     int | None,
+              "recent_median":  int | None,     # newest half
+              "older_median":   int | None,     # older half
+              "shrink_ratio":   float | None,   # recent_median / older_median
+              "verdict": "STABLE" | "SHRINKING" | "GROWING" | "NO_DATA",
+            }
+
+        Verdict semantics:
+          * ``NO_DATA`` — fewer than 4 briefings (need a meaningful split
+            into "newer half" vs "older half"; below this any verdict would
+            be noise).
+          * ``SHRINKING`` — ``recent_median <= 0.7 * older_median`` (30%+
+            shrink). The Opus output density has dropped materially —
+            quota throttling, truncation, or prompt-context loss.
+          * ``GROWING`` — ``recent_median >= 1.3 * older_median`` (30%+
+            growth). Either Opus prompt is producing more content, or
+            article coverage has gotten broader. Surfaced for symmetry —
+            an analyst surprised by suddenly-longer briefings can use this
+            to spot prompt drift in the other direction.
+          * ``STABLE`` — everything in between.
+        """
+        last_n = max(int(last_n), 1)
+
+        # Briefings are append-only (``save_briefing``), so ORDER BY id DESC
+        # is the authoritative write-order signal — same discipline as
+        # ``briefing_cadence_trend`` / ``briefing_text_overlap_trend``.
+        # LENGTH(text) computed in SQL so we don't decompress / fetch the
+        # full body for what is purely a size statistic.
+        rows = self.conn.execute(
+            "SELECT LENGTH(text) FROM briefings "
+            "ORDER BY id DESC LIMIT ?",
+            (last_n,),
+        ).fetchall()
+
+        # Reverse to chronological order (oldest first) so the split into
+        # older-half / newer-half is unambiguous.
+        lengths: list[int] = []
+        for (n,) in rows:
+            if n is None:
+                continue
+            try:
+                lengths.append(int(n))
+            except (TypeError, ValueError):
+                continue
+        lengths.reverse()
+
+        n_briefings = len(lengths)
+        if n_briefings < 4:
+            return {
+                "last_n": last_n,
+                "n_briefings": n_briefings,
+                "lengths": lengths,
+                "median_length": None,
+                "min_length": None,
+                "max_length": None,
+                "recent_median": None,
+                "older_median": None,
+                "shrink_ratio": None,
+                "verdict": "NO_DATA",
+            }
+
+        sorted_all = sorted(lengths)
+        median_full = sorted_all[n_briefings // 2]
+
+        # Split point: even halves (or older half is 1 larger on odd counts).
+        # The newer half is what the analyst cares about — the recent state.
+        split = n_briefings // 2
+        older = lengths[:split]
+        newer = lengths[split:]
+
+        def _median(xs: list[int]) -> int:
+            return sorted(xs)[len(xs) // 2]
+
+        older_median = _median(older)
+        recent_median = _median(newer)
+
+        # Guard divide-by-zero (briefings.text is NOT NULL in the schema, so
+        # LENGTH > 0 in practice — but a future malformed row could surface
+        # zero. Treat that as NO_DATA rather than crashing the analytics).
+        if older_median <= 0:
+            return {
+                "last_n": last_n,
+                "n_briefings": n_briefings,
+                "lengths": lengths,
+                "median_length": int(median_full),
+                "min_length": min(lengths),
+                "max_length": max(lengths),
+                "recent_median": int(recent_median),
+                "older_median": int(older_median),
+                "shrink_ratio": None,
+                "verdict": "NO_DATA",
+            }
+
+        shrink_ratio = round(recent_median / older_median, 3)
+
+        # Verdict ladder — most-severe first (same discipline as the sibling
+        # trend methods). SHRINKING is the analyst-actionable verdict here:
+        # GROWING is informational only (the digest got bigger).
+        if shrink_ratio <= 0.70:
+            verdict = "SHRINKING"
+        elif shrink_ratio >= 1.30:
+            verdict = "GROWING"
+        else:
+            verdict = "STABLE"
+
+        return {
+            "last_n": last_n,
+            "n_briefings": n_briefings,
+            "lengths": lengths,
+            "median_length": int(median_full),
+            "min_length": min(lengths),
+            "max_length": max(lengths),
+            "recent_median": int(recent_median),
+            "older_median": int(older_median),
+            "shrink_ratio": shrink_ratio,
+            "verdict": verdict,
+        }
+
+    @_retry_on_lock
     def count_unscored(self, min_kw: float = 0.0) -> int:
         """Count articles still pending the scorer. Mirrors ``get_unscored``'s
         filter (ai_score=0 AND ml_score IS NULL AND kw_score>=min_kw AND
