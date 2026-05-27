@@ -6,6 +6,113 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-26 ML+backtest HYBRID pass #44 (Agent 2) — `persona_regime_skill` (persona × regime) cross-tab
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=5
+
+### Phase 1 — Debug: `bugs_fixed = 0`
+
+Read `paper_trader/ml/decision_scorer.py` (1587 lines), `paper_trader/backtest.py` (3451 lines), and `run_continuous_backtests.py` (4446 lines) in full plus the surrounding test surface. The codebase is mature and well-instrumented — 75 ml diagnostic modules, ~17 per-cycle skill ledgers, and a battery of read-only audits. The discipline already pinned by ~40 prior HYBRID passes (atomic writes, `_to_float` NaN/inf rejection, walk-back collision guards, label-clamp symmetry, SSOT cross-checks via `_spearman` / `persona_for`, off-distribution + failed-prediction drops in OOS metrics, the kill-switch's deque-tailed cache, etc.) closes the obvious classes of bug. After thorough analysis no actionable correctness bug surfaced that wasn't already documented and guarded. The full focused slice (283 tests across `test_decision_scorer.py`, `test_scorer_*.py`, `test_backtest.py`, `test_outcome_intraperiod_*.py`, `test_stop_band_sweep.py`, `test_continuous_stop_band_sweep_ledger.py`) is green from a cold start.
+
+Honest report: rather than ship a cosmetic "fix" to inflate the bugs_fixed counter, this pass keeps the counter at 0 and invests the entire diff in the Phase 2 feature.
+
+### Phase 2 — Feature: `persona_regime_skill` (`features_added = 1`)
+
+The missing intersection of two existing reads:
+
+- `paper_trader/ml/persona_skill.py` aggregates each persona's signal skill **across every regime** — it hides a persona that's +0.25 IC in one regime but -0.10 IC in another (the per-regime cells cancel).
+- `paper_trader/ml/regime_audit.py` aggregates each regime's signal skill **across every persona** — it hides a regime where one persona is strong and another is anti-predictive (the per-persona cells cancel).
+
+Neither answers the actionable quant question: *does THIS persona carry signal in THIS regime?* That cross-tab is what `persona_regime_skill` produces, reading the same `decision_outcomes.jsonl` rows the sibling diagnostics already use (both `persona` and `regime_label` are persisted on every post-2026-05-19 row alongside the signed `ml_score` / `forward_return_5d`).
+
+Verdict ladder per cell (mirrors `persona_skill` exactly):
+
+| Verdict          | Meaning                                                |
+|------------------|--------------------------------------------------------|
+| `INSUFFICIENT`   | < `MIN_PER_CELL` (20) aligned outcomes — no stable IC. |
+| `INVERTED`       | `score_ic ≤ -IC_GOOD` — signal anti-predictive in this regime. |
+| `SIGNAL_EDGE`    | `score_ic ≥ IC_GOOD` — real rank-skill in this regime. |
+| `WEAK_SIGNAL`    | `IC_MIN ≤ score_ic < IC_GOOD` — tie-breaker, not primary. |
+| `NO_EDGE`        | `-IC_GOOD < score_ic < IC_MIN` — at noise.            |
+
+Overall verdict:
+
+| Verdict                | Meaning                                                |
+|------------------------|--------------------------------------------------------|
+| `INSUFFICIENT_DATA`    | < `MIN_RECORDS` (30) aligned rows.                     |
+| `HAS_INVERTED_CELL`    | ≥1 cell `INVERTED` — actionable red flag.              |
+| `REGIME_CONDITIONAL`   | ≥1 `SIGNAL_EDGE` AND ≥1 `NO_EDGE/WEAK` — aggregate `persona_skill` HIDES this structure. |
+| `NO_PERSONA_EDGE`      | No cell reaches `SIGNAL_EDGE` on a stable sample.      |
+| `HEALTHY`              | ≥1 `SIGNAL_EDGE` cell, no `INVERTED` cell.             |
+
+**Read-only.** Never trains, never touches `decision_scorer.pkl`, `build_features`, `N_FEATURES`, or any trade path — safe to run against the unattended continuous loop. **SSOT cross-checks:** `persona_for` from `backtest.py`, `_spearman` from `ml.calibration`, regime decode mirrors `regime_audit.REGIME_FROM_MULT`. **"unknown" regime is dropped** (the documented bull-contamination route the aggregate diagnostics silently mis-bucketed).
+
+CLI exit-code contract mirrors `persona_skill._cli` / `regime_audit._cli` so an operator/cron can branch on `$?`: 0 on `HEALTHY` / `INSUFFICIENT_DATA` / `NO_PERSONA_EDGE`, 1 on `REGIME_CONDITIONAL`, 2 on `HAS_INVERTED_CELL`.
+
+44 tests in `tests/test_persona_regime_skill.py` pin the verdict ladder (every transition), the regime decode (label preferred, mult fallback, unknown dropped, float roundoff), the SELL double-flip alignment, `best_cell`/`worst_cell` chosen from stable cells only, the CLI exit codes, and module-constant discipline.
+
+Commit: `feat(ml): persona_regime_skill — (persona × regime) signal-IC cross-tab` (6cbc9d4).
+
+### Phase 3 — Live quant findings (`user_findings = 5`)
+
+1. **`persona_regime_skill` live verdict on the corpus: `REGIME_CONDITIONAL`.** On the 5878-row `decision_outcomes.jsonl`, 4776 records align (1102 dropped as "unknown" regime). Two real findings the aggregate diagnostics structurally hide:
+   - **ESG / Thematic in sideways**: score_ic=**+0.293**, n=111 → `SIGNAL_EDGE`. Real edge in the sideways regime.
+   - **Momentum Trader in bear**: score_ic=**-0.137**, n=186 → `NO_EDGE` (near-inverted). The persona's signal flips sign in the bear regime.
+   - Best stable cell = ESG/sideways (+0.293); worst stable cell = Momentum/bear (-0.137). The aggregate `persona_skill` reports neither of these because they cancel within each axis.
+
+2. **Backtest DB has 2 stale `running` rows: #101437 (>22h old) and #101564 (>30 min).** The `_reap_orphaned_runs(max_age_hours=6.0)` fires at every cycle start and is supposed to catch >6h-old rows, but #101437 has survived through ~22h of cycles. Either the reap dispatch is failing silently or the row's `started_at` is being parsed/compared wrong. Not a code change in this pass — flag for next investigation. The dashboard's "stuck running forever" symptom (CLAUDE.md §11) is still visible.
+
+3. **Monkey-random benchmark crushes the AI strategy in raw return.** Live `backtest_runs` snapshot: monkey_random n=494, avg_ret=+859%, avg_vs_spy=+665% (with **3 trades each**). ml_quant n=24, avg_ret=+303%, avg_vs_spy=+266% (with ~961 trades each). The monkey runs are dominated by 3-coin-flip leveraged-ETF outlier picks over 1-10yr windows (pick TQQQ in 2020 = +5000%), but at face value an unattended quant looking at the dashboard would see "AI strategy NOT clearly beating random". The honest framing: comparing 3-trade and ~961-trade runs at face value is statistically meaningless (different variance regimes), but the absence of any panel that controls for that means the monkey benchmark currently misleads more than it informs.
+
+4. **Two sector slots are dead-trained at exactly 0.0 weight** in the deployed pickle (`mlp_first_layer_mean_abs_weight` audit): `sector_commodities` and `sector_other`. Despite tickers from these buckets being on the watchlist (GLD/SLV/TLT/USO/UNG for commodities; TM/UXI/NAIL/DFEN/UTSL/XLI/OKLO/NNE for "other"), no recent training records exercised those slots enough for L2 alpha=1e-2 to retain non-zero weight. The `dead_feature_audit` ledger should surface this; an operator should verify those rows are being emitted into `decision_outcomes.jsonl` and not silently dropped upstream.
+
+5. **`stop_band_sweep` verdict on the live corpus stays `CELL_BEATS_DEPLOYED`** (latest cycle: best cell (-3%, 5d) at +0.7671pp benefit vs deployed (-8%, 5d) at +0.3025pp — gap +0.4646pp, well above the 0.30pp noise tolerance, n_buys=4667 with full intraperiod coverage). The cycle-by-cycle ledger (pass #43 wired) makes this trendable; an operator-level review of tightening `_buy`'s `stop_loss` from `price * 0.92` toward `price * 0.97` is now supported by accumulating evidence. Caveat documented in the analyzer: gap-down fills realize WORSE than the band, so the reported benefit is an UPPER bound.
+
+### Phase 4 — Counters
+
+* `bugs_fixed = 0` (honest report — see Phase 1)
+* `features_added = 1`
+* `user_findings = 5`
+
+### Files touched
+
+* `paper_trader/ml/persona_regime_skill.py` — new 440-line read-only cross-tab analyzer.
+* `tests/test_persona_regime_skill.py` — 44 new tests.
+
+### Test commands for the ML/backtest domain
+
+```bash
+$ python3 -m pytest tests/test_persona_regime_skill.py -v
+$ python3 -m pytest tests/test_decision_scorer.py tests/test_scorer_*.py -v
+$ python3 -m pytest tests/test_backtest.py tests/test_outcome_intraperiod_*.py tests/test_stop_band_sweep.py -v
+$ python3 -m pytest tests/ -v -k "ml or backtest or scorer or stop_band or persona_regime"
+```
+
+### ML/backtest domain — `persona_regime_skill` (operator reference)
+
+**What it answers.** "Does THIS persona carry signal in THIS regime?" — the intersection question neither `persona_skill` nor `regime_audit` can answer because each aggregates across the other axis. A persona that's profitable in bull but loses in bear is invisible to both, but surfaces immediately here.
+
+**How to run it.**
+
+```bash
+cd /home/zeph/paper-trader
+
+# Default — reads data/decision_outcomes.jsonl, table output
+python3 -m paper_trader.ml.persona_regime_skill
+
+# Machine-readable
+python3 -m paper_trader.ml.persona_regime_skill --json
+
+# Custom corpus
+python3 -m paper_trader.ml.persona_regime_skill --outcomes /path/to/outcomes.jsonl
+```
+
+**How to read the verdict.** A `REGIME_CONDITIONAL` verdict means the aggregate `persona_skill` is hiding regime structure — look at the table for the `SIGNAL_EDGE` and `INVERTED`/`NO_EDGE` cells and consider whether the actionable move (suppress a persona-in-a-regime, boost another) is supported. A `HAS_INVERTED_CELL` verdict means at least one (persona, regime) pair is ACTIVELY HARMFUL — the more confident that persona is in that regime, the worse the realized 5d outcome. The analyzer never changes `PERSONAS` / `_PERSONA_BOOSTS` / the gate — those are explicit strategy-dynamics decisions that need separate review.
+
+**Caveats.** Tickers without enough aligned outcomes per (persona, regime) cell (< `MIN_PER_CELL = 20`) are flagged `INSUFFICIENT` and excluded from `best_cell` / `worst_cell` / the verdict logic. The aggregate verdict is driven by stable cells only — small-sample noise can't drive `HAS_INVERTED_CELL` even if a 5-row cell happens to land at ic=-0.99.
+
+---
+
 ## 2026-05-26 core HYBRID pass #44 (Agent 1) — `claude_call` heartbeat field + test_quota_guard mock fix
 
 **Counters:** bugs_fixed=1 · features_added=1 · user_findings=2
