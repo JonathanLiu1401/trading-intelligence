@@ -6,6 +6,155 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-28 ML+backtest HYBRID pass (Agent 2, second cycle) — `predict_with_meta.gate_arm` decode
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=6
+
+### Phase 1 — no fresh bug surfaced (`bugs_fixed = 0`)
+
+Read all required ML/backtest files in full (`paper_trader/ml/decision_scorer.py`,
+`paper_trader/backtest.py`, `run_continuous_backtests.py`) and traced
+defensively for race conditions, type-coercion edges, regex parsing
+hazards, and atomic-write gaps. The codebase has had 35+ HYBRID cycles
+on these files and every surface a quant researcher worries about
+(walk-back collisions, label-clamp ordering, kill-switch threshold,
+quantile-table corruption, `_to_float` numpy edges, persona indexing,
+gate-arm thresholds) is already pinned by tests. No fix-required bug
+found. `python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py`
+all green (165 tests).
+
+### Phase 2 — `feat:` `gate_arm` + `gate_arm_multiplier` on `predict_with_meta` (commit `9831839`)
+
+`DecisionScorer.predict_with_meta` now returns two additional fields:
+
+- `gate_arm` — name of the conviction-gate arm this prediction would
+  fire (`"strong_headwind"` / `"mild_headwind"` / `"neutral"` /
+  `"mild_tailwind"` / `"strong_tailwind"`)
+- `gate_arm_multiplier` — the float conviction multiplier (`0.60` /
+  `0.85` / `1.00` / `1.15` / `1.30`)
+
+Decoded via the canonical `gate_audit.gate_arm()` helper (lazy import,
+single source of truth — no drift from `_ml_decide`'s live if/elif
+chain). `None` on `failed=True` paths so OOS rank-IC consumers can drop
+broken predictions naturally rather than mis-attributing a "neutral"
+arm. The arm decodes from the CLAUDED prediction (matches what the
+live gate sees from `predict()`), independent of `off_distribution` —
+the live gate may still abstain on off-dist or when the kill-switch
+fires, but the arm decode itself is well-defined.
+
+Why it matters: previously a researcher inspecting "what arm would
+the gate fire for this hypothetical?" had to import `gate_audit` and
+call `gate_arm(meta['pred'])` separately, or re-implement the if/elif
+chain. Now the answer is in the same atomic snapshot as the rest of
+the trust flags (clamp / off-distribution / percentile / calibrated).
+Surfaced in the `--explain` CLI output.
+
+Lock tests: `tests/test_scorer_gate_arm.py` (24 cases) — threshold
+boundaries (15 parameterized at every arm boundary), failed/untrained
+paths (3 cases), off-distribution semantics (1 case), and legacy
+pickle backward-compat (1 case). Plus updated
+`tests/test_decision_scorer.py::test_untrained_scorer_meta_is_safe`
+for the additive keys.
+
+### How to use `predict_with_meta.gate_arm` (canonical reference)
+
+```python
+from paper_trader.ml.decision_scorer import DecisionScorer
+ds = DecisionScorer()
+meta = ds.predict_with_meta(
+    ml_score=2.5, rsi=55.0, macd=0.5, mom5=2.0, mom20=5.0,
+    regime_mult=1.0, ticker="NVDA",
+)
+# meta now carries:
+#   gate_arm: "mild_tailwind"        ← arm name
+#   gate_arm_multiplier: 1.15        ← conviction multiplier
+#   pred: 7.2                        ← clamped prediction
+#   off_distribution: False          ← would the live gate abstain?
+#   gate_arm + off_distribution=True → arm is "what WOULD fire"
+#                                       (live gate would abstain)
+```
+
+Or via CLI:
+
+```bash
+python3 -m paper_trader.ml.decision_scorer --explain \
+    --ticker NVDA --ml-score 3.0 --rsi 60 --mom5 2.0
+# … prints predicted return + percentile + calibrated + GATE ARM line:
+#   gate arm: neutral  (×1.00 conviction multiplier)
+```
+
+When `off_distribution=True` the CLI appends a warning that the live
+gate would abstain. Tests pin the threshold boundaries to the bit:
+
+| `pred` value     | `gate_arm`         | multiplier |
+|------------------|---------------------|------------|
+| `pred < -10`     | `strong_headwind`   | 0.60       |
+| `-10 ≤ pred < 0` | `mild_headwind`     | 0.85       |
+| `0 ≤ pred ≤ 5`   | `neutral`           | 1.00       |
+| `5 < pred ≤ 10`  | `mild_tailwind`     | 1.15       |
+| `pred > 10`      | `strong_tailwind`   | 1.30       |
+
+These match `_ml_decide`'s if/elif chain exactly (and `gate_audit.gate_arm`,
+which the field is decoded through). Boundary semantics: `pred == -10`
+is `mild_headwind` (NOT strong), `pred == 0` and `pred == 5` are both
+`neutral`, `pred == 10` is `mild_tailwind` (NOT strong).
+
+### Phase 3 user findings (live data, 2026-05-28)
+
+1. **Backtests healthy**: last 100 complete runs show 73% beat SPY,
+   median `vs_spy_pct = +213.8%`, mean +667.7%, range -308.9% to
+   +5625.5%. The mean is heavily skewed by leveraged-ETF 3-trade
+   outliers (e.g. one run at +5625%); **median + win rate are the
+   trustworthy aggregates**, NOT the mean.
+2. **Scorer correctly anti-skill — kill-switch firing**:
+   `python3 -m paper_trader.gate_status` reports `INACTIVE` because
+   trailing-20 `oos_buy_ic = -0.015` (below the `+0.03` tolerance).
+   `gate_effectively_active=False` in the latest skill-log row. The
+   Phase-1 kill-switch fix from yesterday's cycle is working as
+   designed.
+3. **High cycle-to-cycle variance in OOS skill**: the latest cycle's
+   `oos_buy_ic = +0.07` (positive!) but the trailing-20 MEDIAN is
+   -0.015 (anti-skill). This is the textbook "noise oscillating
+   around zero" pattern — single-cycle metrics MUST be read with the
+   trailing aggregate, never alone.
+4. **5 dead-ticker yfinance entries**: FNGD / HIBS / BITX / BITU /
+   ETHU for pre-2014 windows (these leveraged ETFs didn't exist
+   in that era — empty-series correctly degrades, no crash).
+5. **GDELT pre-2017 coverage**: the "permanent: outside GDELT
+   coverage — cached empty, no retry" log spam confirms the 2024
+   permanent-coverage short-circuit is working (no infinite retries).
+6. **New `gate_arm` field on `predict_with_meta` confirmed
+   working on real OOS rows**: re-predicted 10 recent
+   `decision_outcomes.jsonl` rows, every prediction got a canonical
+   arm name + multiplier; arm decoded from clamped `pred` matched
+   the boundary table exactly. Field is now available for future
+   diagnostic / dashboard work.
+
+### Focused test commands for this domain (Agent 2 / ML+backtest)
+
+```bash
+# This pass's lock tests (24 + 1 updated, ~6s)
+python3 -m pytest tests/test_scorer_gate_arm.py \
+    tests/test_decision_scorer.py::TestPredictionClamp::test_untrained_scorer_meta_is_safe -v
+
+# Sibling tests for predict_with_meta semantics (~12s)
+python3 -m pytest tests/test_decision_scorer.py \
+    tests/test_scorer_percentile.py \
+    tests/test_scorer_calibrated.py -q
+
+# Scorer + backtest regression (decision_scorer + backtest, ~13s)
+python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py -q
+
+# Inspect a single hypothetical prediction's gate arm
+python3 -m paper_trader.ml.decision_scorer --explain \
+    --ticker NVDA --ml-score 3.0 --rsi 60 --mom5 2.0
+
+# Inspect live gate effective state
+python3 -m paper_trader.gate_status
+```
+
+---
+
 ## 2026-05-28 core HYBRID pass (Agent 1) — sector-pulse SWR + market_phase heartbeat block
 
 **Counters:** bugs_fixed=1 · features_added=1 · user_findings=6
