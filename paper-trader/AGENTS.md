@@ -216,6 +216,160 @@ $1000 anchor).
 
 ---
 
+## 2026-05-28 feature-dev pass (Agent 4) — trades-derived round-trips recover $217.10 of hidden realized P/L
+
+**Counters:** bugs_fixed=0 · features_added=3 · user_findings=3
+
+### Phase 1 — Feature: `paper_trader/analytics/round_trips_derived.py` + 3 endpoints
+
+The 2026-05-27 core pass logged the day's most material data-integrity
+finding: "Reactivated positions hide round-trip realized P/L from
+`/api/closed-positions`" — `upsert_position` reactivates a closed row in
+place when the same `(ticker,type,expiry,strike)` key re-opens, so the
+position row's `closed_at` is overwritten back to NULL on the next BUY
+and every completed round-trip on that row vanishes from
+`closed_positions()`. Live evidence on 2026-05-27 then 5-28: MU position
+id=4's row has been re-opened multiple times in place; ~$212 of realized
+gains were invisible to `/api/closed-positions`, the per-lot win-rate
+calc, the autopsy track-record, AND `/api/today-realized-pl` (which
+inherits the same gap and was returning `NO_CLOSES_TODAY` despite real
+MU SELLs filling). Flagged for next pass, this is that pass.
+
+The trades log is append-only — never reactivated, never overwritten —
+so every completed BUY-to-flat sequence on a key is visible. The new
+pure module walks `store.recent_trades(N)`, groups by
+`(ticker, option_type, expiry, strike)`, and emits one round-trip dict
+per BUY-to-flat slice in the same shape `store.closed_positions(N)`
+returns (so existing builders consume the output unchanged — SSOT).
+
+Three endpoints land:
+
+1. **`/api/round-trips-derived`** — the reactivation-blind sibling of
+   `/api/closed-positions`. Same row shape, same summary rollup;
+   different source. `?limit=N` (1..2000, default 500). ERROR envelope
+   per the never-500 panel-endpoint discipline.
+
+2. **`/api/today-realized-pl-derived`** — same builder
+   (`build_today_realized_pl`) as the canonical endpoint, same envelope,
+   same verdict ladder, fed from the trades-derived list instead of
+   `closed_positions()`. The endpoint that finally surfaces "MU sold
+   for +$31.81 today" when the position row has already been
+   reactivated for the next BUY. `source: "trades-derived"` field
+   distinguishes from the canonical endpoint.
+
+3. **`/api/realized-pl-reconciliation`** — diagnostic. Cross-checks
+   `store.closed_positions()` against `derive_round_trips(trades)`;
+   reports `n_hidden`, `hidden_realized_usd`, `hidden_tickers`, and a
+   one-line headline. Verdicts: `CONSISTENT` / `HIDDEN_REALIZED_PL` /
+   `NO_DATA`. Fingerprint matches on
+   `(ticker, type, expiry, strike, realized_pl_cents, opened_at[:19s])`
+   to absorb the µs-grain gap between `position.closed_at` (set by
+   `upsert_position`'s UPDATE) and the SELL trade's `timestamp` (set
+   ~µs earlier by `record_trade`).
+
+**Live verification (paper_trader.db @ 2026-05-28 05:14 UTC).** Against
+the actual trader DB:
+- `closed_positions()` returns 3 rows: NVDA -$24.55, TQQQ +$7.42,
+  DRAM -$0.45 = net -$17.58.
+- `derive_round_trips(trades)` returns 6 round-trips, 4 wins + 2 losses,
+  net +$199.52.
+- `reconcile` flags 3 hidden round-trips totalling +$217.10:
+  - MU +$180.32 (2026-05-26 BUY 1.3@750.79 → SELL 1.3@889.50)
+  - MU +$31.81 (2026-05-27 BUY 1@896.60 → SELL 1@928.41)
+  - NVDA +$4.97 (2026-05-19 BUY → 2026-05-21 SELL)
+- The trades-derived total +$199.52 matches the portfolio's
+  `pnl_vs_start: +$199.52` headline EXACTLY — first time the realized
+  P/L accounting reconciles with the portfolio-total framing.
+
+**Tests** (`tests/test_round_trips_derived.py`, 40 cases): empty-input
+graceful, single round-trip realized math, open-position non-emission,
+multi-leg (add-buy and partial-sell-then-buy), key isolation across
+tickers / stock-vs-option / two strikes, bad-input tolerance
+(non-dict / missing ticker / missing action / None qty / non-BUY-SELL
+actions), BUY_CALL / BUY_PUT / SELL_CALL / SELL_PUT alias coverage,
+input-order independence, limit clamping, hold-duration parsing,
+reconcile microsecond-gap tolerance, multiple-hidden aggregation,
+endpoint-envelope shape for all 3 routes, and an end-to-end
+reactivation-simulation test that records a complete round-trip then
+reactivates the position and asserts the diagnostic flags it as
+hidden.
+
+**Invariants intact.** Read-only — never writes to the store, never
+trains, never has a path to `_execute()`. Observational only — never
+gates Opus, no caps, never blocks a trade. SSOT with
+`store.closed_positions()`: the walker algorithm is the same shape
+(held-≈0 round-trip identification); every closed-positions row that
+this endpoint surfaces, the canonical endpoint also surfaces (the
+reconciliation test pins it). The reverse is NOT true — reactivated
+lots' historical round-trips only show up in the trades-derived view,
+exactly the data-integrity gap this pass closes.
+
+### Phase 2 — Live findings (3)
+
+1. **MU is currently 77.4% of book** ($928.41 of $1199.52). The 2026-05-27
+   pass already flagged this; still active. Opus's reasoning explicitly
+   accepts the concentration on the momentum thesis.
+2. **Live `pnl_vs_start: +$199.52`** finally reconciles with realized P/L
+   totals — the trades-derived sum equals the headline to the cent
+   (after this pass; pre-fix the realized vs unrealized math was a
+   silent ~$200 mystery).
+3. **Position id=4 (MU) reactivation count is high** — 3+ open/close
+   cycles on the same row since opening. The endpoint surfaces this
+   correctly; a future pass could add a `n_reactivations_per_key`
+   diagnostic (count of distinct `opened_at` values that have lived
+   on the same position id) to flag reactivation hotspots.
+
+### Phase 3 — Files touched
+
+```
+paper_trader/analytics/round_trips_derived.py     (new — 318 lines)
+paper_trader/dashboard.py                         (+159 lines: 3 routes)
+tests/test_round_trips_derived.py                 (new — 552 lines / 40 tests)
+AGENTS.md                                         (this section)
+```
+
+### Test commands
+
+```bash
+# This pass's focused suite
+python3 -m pytest tests/test_round_trips_derived.py -v
+
+# Regression cluster (round-trips + today-realized-pl + postmortem)
+python3 -m pytest tests/test_round_trips_derived.py \
+                  tests/test_today_realized_pl.py \
+                  tests/test_round_trips_pnl.py \
+                  tests/test_round_trip_postmortem.py \
+                  tests/test_round_trip_postmortem_endpoint.py -q
+
+# CLI for ops
+python3 -m paper_trader.analytics.round_trips_derived
+
+# The new endpoints live (after restart)
+curl -s http://localhost:8090/api/realized-pl-reconciliation | jq
+curl -s http://localhost:8090/api/round-trips-derived | jq '.summary'
+curl -s http://localhost:8090/api/today-realized-pl-derived | jq '{verdict,n_closes,net_realized_usd}'
+```
+
+### Operator-facing impact
+
+- `/api/closed-positions` and `/api/today-realized-pl` are unchanged
+  (no regression risk to existing dashboard panels).
+- `/api/round-trips-derived` is the new ground-truth view — use this for
+  any analytic that must include reactivated-lot round-trips
+  (win-rate, autopsy, payoff-ratio, today-realized-pl).
+- `/api/realized-pl-reconciliation` is the diagnostic: a single panel
+  surface to track how much realized P/L is currently invisible to
+  the canonical closed-positions endpoint.
+- The schema-level fix (allow fresh position rows per re-entry; would
+  require removing or qualifying the
+  `UNIQUE(ticker,type,expiry,strike)` constraint for options — see
+  CLAUDE.md §8 invariant #11 and the original 2026-05-27 finding #1)
+  remains the proper long-term resolution. Trades-derived is the
+  data-recovery layer that unblocks every downstream analytic in the
+  meantime.
+
+---
+
 ## 2026-05-28 ML+backtest HYBRID pass (Agent 2) — `_article_sentiment` false-positive fix + `paper_trader.ml.scorecard` unified health view
 
 **Counters:** bugs_fixed=1 · features_added=1 · user_findings=7

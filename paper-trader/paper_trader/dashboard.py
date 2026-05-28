@@ -7544,6 +7544,178 @@ def today_realized_pl_api():
         })
 
 
+@app.route("/api/round-trips-derived")
+def round_trips_derived_api():
+    """Round-trips derived directly from the ``trades`` table — the
+    reactivation-blind sibling of ``/api/closed-positions``.
+
+    ``store.closed_positions`` only sees lots whose ``positions`` row
+    currently carries ``closed_at IS NOT NULL``. But ``upsert_position``
+    reactivates a closed row in place when the same key re-opens — the
+    completed round-trips on that row vanish from /api/closed-positions
+    and every analytic that consumes it (today-realized-pl, win-rate,
+    autopsy track-record). The trades log is append-only so it sees every
+    completed BUY-to-flat sequence on a key; this endpoint walks it and
+    emits the full round-trip ledger.
+
+    Same row shape as ``/api/closed-positions`` so callers can switch
+    sources unchanged: ``ticker, type, qty, avg_cost, expiry, strike,
+    opened_at, closed_at, realized_pl, realized_pl_pct, cost, proceeds,
+    n_trades, hold_seconds, hold_days``. Plus a ``summary`` rollup with the
+    same field shape as ``/api/closed-positions['summary']``.
+
+    Supports ``?limit=N`` (1..2000, default 500) — bounds the trades-table
+    scan and the number of round-trips returned. Read-only — never trains,
+    never writes, never has a path to ``_execute``.
+    """
+    try:
+        limit = max(1, min(int(request.args.get("limit", 500)), 2000))
+    except (TypeError, ValueError):
+        limit = 500
+    try:
+        from .analytics.round_trips_derived import (
+            derive_round_trips,
+            summarize,
+        )
+        store = get_store()
+        # Trade-scan upper bound is generous — most days only see ~10-50
+        # trades, and the walker is O(n) per key. Capped at 5000 rows
+        # (~years of activity) for predictability.
+        trades = store.recent_trades(limit=5000)
+        derived = derive_round_trips(trades, limit=limit)
+        return jsonify({
+            "verdict": "OK",
+            "round_trips": derived,
+            "summary": summarize(derived),
+            "as_of": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        # ERROR envelope (same discipline as /api/today-realized-pl) —
+        # never 500 a panel endpoint.
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"round-trips-derived unavailable: {e}",
+            "round_trips": [],
+            "summary": {
+                "n": 0, "wins": 0, "losses": 0, "flat": 0,
+                "total_realized_pl": 0.0, "total_cost": 0.0,
+                "total_proceeds": 0.0, "win_rate_pct": None,
+                "avg_realized_pl_pct": None,
+            },
+            "as_of": datetime.now(timezone.utc).isoformat(),
+        })
+
+
+@app.route("/api/today-realized-pl-derived")
+def today_realized_pl_derived_api():
+    """Today's realized P/L — the reactivation-blind sibling of
+    ``/api/today-realized-pl``.
+
+    Same builder (``build_today_realized_pl``) as the canonical endpoint,
+    same envelope, same verdict ladder; the only difference is the SOURCE.
+    This one feeds from ``round_trips_derived.derive_round_trips`` which
+    walks the append-only trades log, so it surfaces today's realized P/L
+    even when the underlying position row has been reactivated for a
+    fresh re-entry (the documented limitation of /api/today-realized-pl —
+    see CLAUDE.md §8 invariant on UNIQUE(ticker,type,expiry,strike)).
+
+    Live evidence (2026-05-27): /api/today-realized-pl returned
+    NO_CLOSES_TODAY despite an MU SELL filling for +$31.81 that morning
+    (the position row was reactivated for the next BUY before the
+    closed_positions read landed). This endpoint surfaces that close
+    correctly.
+
+    Same ``?limit=N`` (1..2000, default 500) — bounds the trades-table
+    scan, NOT the today-filter pass (every round-trip in the slice is
+    NY-date filtered after derivation). Same ``as_of`` field.
+    """
+    try:
+        limit = max(1, min(int(request.args.get("limit", 500)), 2000))
+    except (TypeError, ValueError):
+        limit = 500
+    try:
+        from .analytics.round_trips_derived import derive_round_trips
+        from .analytics.today_realized_pl import build_today_realized_pl
+        store = get_store()
+        trades = store.recent_trades(limit=5000)
+        derived = derive_round_trips(trades, limit=limit)
+        result = build_today_realized_pl(derived)
+        result["source"] = "trades-derived"
+        result["as_of"] = datetime.now(timezone.utc).isoformat()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"today-realized-pl-derived unavailable: {e}",
+            "ny_date": None,
+            "net_realized_usd": 0.0,
+            "net_realized_pct": None,
+            "n_closes": 0,
+            "n_winners": 0,
+            "n_losers": 0,
+            "n_scratch": 0,
+            "biggest_win": None,
+            "biggest_loss": None,
+            "avg_hold_seconds": None,
+            "avg_hold_hours": None,
+            "closes": [],
+            "source": "trades-derived",
+            "as_of": datetime.now(timezone.utc).isoformat(),
+        })
+
+
+@app.route("/api/realized-pl-reconciliation")
+def realized_pl_reconciliation_api():
+    """Diagnostic: how many round-trips and how much realized $ are
+    INVISIBLE to ``/api/closed-positions`` because of position-row
+    reactivation?
+
+    Cross-checks ``store.closed_positions()`` (read of the positions
+    table; reactivation-blind) against ``derive_round_trips(trades)``
+    (read of the trades log; append-only so reactivation-aware). The
+    diff is the realized P/L the analyst CANNOT see from the canonical
+    closed-positions surface — silently subtracted from win-rate, the
+    today-realized-pl headline, every autopsy track-record.
+
+    Verdict:
+      * ``CONSISTENT`` — every trades-derived round-trip has a matching
+        closed_positions row.
+      * ``HIDDEN_REALIZED_PL`` — at least one round-trip lives only in
+        the trades log; headline reports the count + total hidden $ +
+        affected tickers.
+      * ``NO_DATA`` — both sources empty (fresh install).
+
+    Read-only — never writes, never restarts, never gates anything.
+    Designed to surface this data-integrity gap to the unified
+    dashboard as a passive panel; the canonical fix
+    (schema-level rework of UNIQUE(ticker,type,expiry,strike) to allow
+    fresh rows per re-entry) is a separate, larger pass.
+    """
+    try:
+        from .analytics.round_trips_derived import (
+            derive_round_trips,
+            reconcile,
+        )
+        store = get_store()
+        trades = store.recent_trades(limit=5000)
+        derived = derive_round_trips(trades)
+        closed = store.closed_positions(limit=500)
+        result = reconcile(closed, derived)
+        result["as_of"] = datetime.now(timezone.utc).isoformat()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({
+            "verdict": "ERROR",
+            "headline": f"realized-pl-reconciliation unavailable: {e}",
+            "n_positions_visible": 0,
+            "n_trades_derived": 0,
+            "n_hidden": 0,
+            "hidden_realized_usd": 0.0,
+            "hidden_tickers": [],
+            "as_of": datetime.now(timezone.utc).isoformat(),
+        })
+
+
 @app.route("/api/data-feed")
 @swr_cached("data-feed", 30.0)
 def data_feed_api():
