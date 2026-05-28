@@ -6,6 +6,147 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-28 core HYBRID pass (Agent 1) — sector-pulse SWR + market_phase heartbeat block
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=6
+
+### Phase 1 — `fix:` SWR-cache `/api/sector-pulse` (commit `09078bd`)
+
+Live curl probing under runner contention found `/api/sector-pulse`
+hanging 8s+ and frequently exceeding the browser's 10s panel timeout.
+Root cause: the hot path makes ~17 synchronous `yfinance` round-trips
+via `get_quant_signals_live` + `market.get_prices` PLUS reads the
+articles DB on every request, with NO caching layer. Every sibling
+yfinance-backed sector card (`/api/risk`, `/api/concentration-cap`,
+`/api/news-edge`, …) already had `@swr_cached`; sector-pulse was the
+last hold-out.
+
+Fix: wrap `sector_pulse_api` with `@swr_cached("sector_pulse", 60.0)`
+(below `@app.route`). 60s TTL fits well inside the underlying 5-min
+quant cache + the live trader's 30-min OPEN_INTERVAL_S, so a sector
+reading is never materially out of date but the panel always loads
+instantly.
+
+Lock tests (`tests/test_sector_pulse_swr.py`, 3 cases): cold→warm
+contract, warm-hit-served-from-cache (mid-test mutation of the
+fetcher does NOT propagate inside TTL), pytest-inert-by-default
+isolation. Also added `"sector_pulse_api"` to
+`tests/test_dashboard_swr.py::test_real_slow_routes_are_wrapped` so a
+future un-wrap is a regression.
+
+Companion (folded into a sibling commit during the staging race —
+ended up in `844d01b feat(pt): /api/backtests/trade-delta` rather than
+its own follow-up): added `sector_pulse`, `actionable-opportunities`,
+`off-watchlist-mentions`, `spy-valuation` to the `_swr_prewarm`
+targets list so `test_swr_prewarm_coverage`'s prewarm == @swr_cached
+invariant stays green and the panel never cold-stalls
+`{"warming": true}` after a restart.
+
+### Phase 2 — `feat:` granular `market_phase` block on `/api/runner-heartbeat` (commit `1276bc0`)
+
+A trader checking the heartbeat in the middle of a trading day needs
+more than the existing `market_open: bool`. **OPENING_BELL** (09:30
+-10:00 ET, whipsaw-prone, wide spreads), **MID_SESSION** (normal
+liquidity), and **CLOSING_HALF_HOUR** (rebalance flow + post-close
+earnings about to print) are three very different regimes a portfolio
+manager calibrates conviction differently in. `market.market_phase()`
+already returns the granular label and Opus reads it in the prompt
+header — but the operator's primary liveness surface didn't carry it.
+
+New `paper_trader/analytics/market_phase_block.py` exposes
+`build_market_phase_block(market_module, now=None)` returning:
+
+| Field | Notes |
+|-------|-------|
+| `phase` | one of WEEKEND / HOLIDAY / PRE_MARKET / OPENING_BELL / MID_SESSION / CLOSING_HALF_HOUR / AFTER_CLOSE / OVERNIGHT |
+| `is_open` | bool — mirrors `market.is_market_open` |
+| `is_half_day` | bool — True iff today (NY) is a 13:00 ET early-close day |
+| `secs_to_close` | int\|None — seconds until next NYSE close |
+| `secs_to_open` | int\|None — seconds until next 09:30 ET open |
+| `headline` | operator-facing single line a banner can render verbatim |
+
+Example headlines:
+- `"MID_SESSION — 4h12m until close · regular session, normal liquidity"`
+- `"OPENING_BELL — 4h25m until close · first 30 minutes — whipsaw-prone, wide spreads"`
+- `"WEEKEND — opens in 1d22h · no session"`
+- `"CLOSING_HALF_HOUR (half-day) — 20m until close · last 30 minutes — rebalance flow + post-close earnings imminent"`
+
+Wired into `runner_heartbeat_api` as an additive block (same
+try/except discipline as the existing `singleton_lock` / `notify` /
+`latches` / `claude_call` blocks). Pure composition over `market.py`'s
+existing calendar functions — no new state, no I/O, no caps
+(invariants #2/#12).
+
+Failure contract: a monkeypatched market module that throws on every
+call returns the `UNKNOWN` shape so the heartbeat endpoint can attach
+the block unconditionally without guarding.
+
+Lock tests (`tests/test_market_phase_block.py`, 18 cases): formatter
+edges, every phase including half-day CLOSING_HALF_HOUR at 12:30 ET,
+holiday handling, degrade-to-UNKNOWN on a broken market module, plus
+the wiring test confirming the block reaches `/api/runner-heartbeat`'s
+response body.
+
+### Phase 3 — Live trader validation (`user_findings = 6`)
+
+1. **`/api/sector-pulse` fix is live** — verified via repeat `curl`;
+   warm hits ~5ms instead of 8s+.
+2. **`market_phase` block is live on `/api/runner-heartbeat`** —
+   currently returns `"phase": "MID_SESSION", "headline":
+   "MID_SESSION — 1h23m until close · regular session, normal
+   liquidity"`. Matches the prompt header Opus already sees.
+3. **NO_DECISION rate elevated** at 80% over the last 20 cycles and
+   52.5% all-time (n=583). `decision_efficacy.verdict = DEGRADED`
+   correctly surfaces this; `/api/host-guard` confirms the cause is
+   the documented host-saturation pattern
+   ([[pt-no-decision-host-saturation]]) — load avg 13.8/20.5/24,
+   2 concurrent `claude` review agents in the last hour.
+4. **MU whipsaw confirmed** — `/api/rebuy-regret` reports
+   `$+7.10 regret on MU (sold $889.5 → re-bought $896.6)`. The
+   detector catches the pattern; Opus has full autonomy and is not
+   yet using the signal to suppress same-day re-entries. Future
+   work: surface this to the prompt as an advisor block.
+5. **Several compute-only endpoints cold-stall under writer-lock
+   contention** — `/api/profit-ladder`, `/api/persona-leaderboard`,
+   `/api/signal-followthrough` curl with `-m 10` → `000` while the
+   runner is mid-`_portfolio_snapshot` (Store._lock contention).
+   Out of scope for this pass — the right fix is probably a bounded
+   read-only connection separate from the writer.
+6. **Build SHA stale** — `boot_sha=e554cf5 head_sha=1276bc0 behind=2`.
+   The git-watcher will trigger the deferred restart after the next
+   3-min check. Until then, sector-pulse + market_phase are loaded
+   from the working tree at the prior restart; once the canonical
+   restart lands they are byte-identical to the committed code.
+
+### Live trader run commands
+
+```bash
+# Start the trader (foreground)
+python3 -m paper_trader.runner
+
+# Dashboard auto-starts on :8090 in a runner-side thread.
+curl -s http://localhost:8090/api/sector-pulse | python3 -m json.tool
+curl -s http://localhost:8090/api/runner-heartbeat | python3 -m json.tool
+
+# Probe the deployed sector-pulse SWR (warm hit < 5ms):
+time curl -s http://localhost:8090/api/sector-pulse > /dev/null
+```
+
+### Run the test suite
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+# Full suite (~25 min under load)
+python3 -m pytest tests/ -v 2>&1 | tail -30
+# This pass's lock tests (~10 s)
+python3 -m pytest tests/test_sector_pulse_swr.py \
+  tests/test_market_phase_block.py \
+  tests/test_swr_prewarm_coverage.py \
+  tests/test_dashboard_swr.py -v
+```
+
+---
+
 ## 2026-05-28 ML+backtest HYBRID pass (Agent 2) — kill-switch anti-skill fix + gate-state CLI + per-cycle kill-switch ledger field
 
 ### Phase 1 — `_should_gate_modulate_conviction` signed-IC threshold
