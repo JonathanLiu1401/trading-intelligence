@@ -207,9 +207,13 @@ class TestPredictionClamp:
         # because an untrained scorer carries no quantile tables. `failed`
         # (additive 2026-05-23 flag) is True because an untrained scorer
         # produced no real prediction; the 0.0 is a safe-fallback sentinel.
+        # `gate_arm` / `gate_arm_multiplier` (additive 2026-05-28 conviction-
+        # gate arm decode) are None for the same reason — an untrained
+        # scorer has no real prediction to bucket into an arm.
         assert m == {"pred": 0.0, "raw": 0.0, "clamped": False,
                      "off_distribution": False, "percentile": None,
-                     "calibrated": None, "failed": True}
+                     "calibrated": None, "failed": True,
+                     "gate_arm": None, "gate_arm_multiplier": None}
 
 
 # ─────────────────────── _to_float ───────────────────────────

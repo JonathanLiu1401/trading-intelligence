@@ -497,7 +497,8 @@ class DecisionScorer:
         """Predicted 5d forward return (%) plus calibration metadata.
 
         Returns ``{"pred", "raw", "clamped", "off_distribution",
-        "percentile", "calibrated", "failed"}``:
+        "percentile", "calibrated", "failed", "gate_arm",
+        "gate_arm_multiplier"}``:
         - ``pred``  — the value callers should act on (clamped, always finite)
         - ``raw``   — the model's unbounded output (for diagnostics / honesty)
         - ``clamped`` — True when ``|raw| > PRED_CLAMP_PCT`` (or non-finite)
@@ -527,6 +528,26 @@ class DecisionScorer:
           support (a +42% raw extrapolation calibrates down to whatever
           realized return its rank actually corresponds to). None for legacy
           pickles that carry no ``label_quantiles`` table.
+        - ``gate_arm`` — name of the conviction-gate arm this prediction
+          would land in (``"strong_headwind"`` / ``"mild_headwind"`` /
+          ``"neutral"`` / ``"mild_tailwind"`` / ``"strong_tailwind"``).
+          Decoded by ``gate_audit.gate_arm`` so the arm name matches the
+          live ``_ml_decide`` if/elif chain to the bit (single source of
+          truth). ``None`` on ``failed=True`` paths — the arm is only
+          meaningful when a real prediction was produced.
+
+          NOTE: the arm is the decoded bucket of the CLAMPED prediction
+          regardless of ``off_distribution``. In production
+          ``_ml_decide`` short-circuits the arm modulation when
+          ``off_distribution=True`` (the gate abstains) AND when the
+          kill-switch is suppressing the gate; the arm reported here
+          is "what WOULD fire absent those abstention guards" — useful
+          for a researcher inspecting how the gate would slot this
+          prediction, distinct from whether the gate's overall guards
+          would actually let the arm act.
+        - ``gate_arm_multiplier`` — the float conviction multiplier the
+          arm would apply (``0.60`` / ``0.85`` / ``1.00`` / ``1.15`` /
+          ``1.30``). Same ``None``-on-failed semantics as ``gate_arm``.
 
         ``predict()`` is the scalar fast path every existing consumer uses;
         this sibling exists for panels that want to surface the trust flag
@@ -535,7 +556,8 @@ class DecisionScorer:
         if not self._trained or self._model is None:
             return {"pred": 0.0, "raw": 0.0, "clamped": False,
                     "off_distribution": False, "percentile": None,
-                    "calibrated": None, "failed": True}
+                    "calibrated": None, "failed": True,
+                    "gate_arm": None, "gate_arm_multiplier": None}
         try:
             X = np.array(
                 [build_features(ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
@@ -570,7 +592,8 @@ class DecisionScorer:
             # predict()'s scalar contract is unchanged (still 0.0).
             return {"pred": 0.0, "raw": 0.0, "clamped": True,
                     "off_distribution": True, "percentile": None,
-                    "calibrated": None, "failed": True}
+                    "calibrated": None, "failed": True,
+                    "gate_arm": None, "gate_arm_multiplier": None}
 
         # A non-finite model output (inf/nan from a pathological feature
         # vector) is unusable — treat it as a 0% / off-distribution result
@@ -581,9 +604,24 @@ class DecisionScorer:
         if not np.isfinite(raw):
             return {"pred": 0.0, "raw": raw, "clamped": True,
                     "off_distribution": True, "percentile": None,
-                    "calibrated": None, "failed": True}
+                    "calibrated": None, "failed": True,
+                    "gate_arm": None, "gate_arm_multiplier": None}
         clamped_pred = max(-PRED_CLAMP_PCT, min(PRED_CLAMP_PCT, raw))
         was_clamped = abs(raw) > PRED_CLAMP_PCT
+        # Decode the conviction-gate arm via the canonical gate_audit helper
+        # (single source of truth, AGENTS.md "no-drift" discipline). Lazy
+        # import — keeps module import cost zero and avoids any possibility
+        # of a circular-import surprise as gate_audit grows. Defensive
+        # `except`: a gate_audit import / decode failure must NEVER break
+        # the prediction path the gate itself depends on; degrade to None
+        # so callers can detect "decode unavailable" rather than render an
+        # inferred-wrong arm. Arm is decoded from the CLAMPED prediction
+        # (matches `_ml_decide` — the gate sees `predict()` which clamps).
+        try:
+            from .gate_audit import gate_arm as _gate_arm_decode
+            _arm, _mult = _gate_arm_decode(clamped_pred)
+        except Exception:
+            _arm, _mult = None, None
         # A legitimate clamped prediction (raw exceeded ±50 but was a real,
         # finite model output) is low-trust on MAGNITUDE but still has a
         # trustworthy rank — `failed=False` so OOS rank-IC retains it.
@@ -591,7 +629,9 @@ class DecisionScorer:
                 "off_distribution": was_clamped,
                 "percentile": self._raw_to_percentile(raw),
                 "calibrated": self._raw_to_calibrated(raw),
-                "failed": False}
+                "failed": False,
+                "gate_arm": _arm,
+                "gate_arm_multiplier": _mult}
 
     def predict(
         self,
@@ -1590,6 +1630,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  calibrated 5d return: {_cal:+.2f}%  (raw quantile-mapped "
               f"onto the realized-return distribution — the honest magnitude; "
               f"preserves rank, corrects the documented % bias)")
+    # Conviction-gate arm — the bucket the live `_ml_decide` if/elif chain
+    # would slot this prediction into. None when prediction failed (untrained
+    # / non-finite). Note: the live gate may still abstain on
+    # off_distribution=True or when the trailing-OOS-IC kill-switch fires,
+    # so this is "the arm absent guards" — a complement to `gate_status` for
+    # an operator inspecting a single hypothetical prediction.
+    _arm = meta.get("gate_arm")
+    _arm_mult = meta.get("gate_arm_multiplier")
+    if _arm is not None and _arm_mult is not None:
+        gate_warn = ""
+        if off:
+            gate_warn = "  (gate would ABSTAIN — off-distribution guard)"
+        print(f"  gate arm: {_arm}  (×{_arm_mult:.2f} conviction "
+              f"multiplier){gate_warn}")
     rows = contrib.get("contributions") or []
     if rows:
         print(f"  baseline={contrib.get('pred_baseline', 0.0):+.2f}%   "
