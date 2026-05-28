@@ -156,14 +156,25 @@ def collect_rss():
     sources = _load_sources()
     feeds = sources.get("rss_feeds", []) if isinstance(sources, dict) else []
 
+    # Pre-filter: skip feeds that are in backoff until their next_retry.
+    backoff_state = _load_backoff()
+    now = datetime.now(timezone.utc).timestamp()
+    active_feeds, skipped = [], 0
+    for feed in feeds:
+        name = feed.get("name", "unknown")
+        entry = backoff_state.get(name)
+        if entry and entry.get("next_retry", 0) > now:
+            skipped += 1
+        else:
+            active_feeds.append(feed)
+    if skipped:
+        print(f"[rss_collector] skipping {skipped} backed-off feeds, "
+              f"fetching {len(active_feeds)}/{len(feeds)}")
+
     # Fetch in parallel — feedparser is HTTP-bound and benefits from threads.
-    # Each future yields the _fetch_feed contract: (name, articles, outcome,
-    # retry_after). We only consume `articles` here; outcome/retry_after exist
-    # for the per-feed backoff helpers (_load_backoff/_cooldown) which are not
-    # yet wired into this function.
     fetched: list = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(_fetch_feed, f): f for f in feeds}
+        futures = {executor.submit(_fetch_feed, f): f for f in active_feeds}
         for future in as_completed(futures):
             try:
                 fetched.append(future.result())
@@ -180,13 +191,26 @@ def collect_rss():
     batches: list = []
     for result in fetched:
         try:
-            _name, arts, _outcome, _retry_after = result
+            name, arts, outcome, retry_after = result
         except (ValueError, TypeError):
             print(f"[rss_collector] skipping malformed feed result: "
                   f"{repr(result)[:120]}")
             continue
+        if outcome == "ok":
+            backoff_state.pop(name, None)
+        else:
+            prev = backoff_state.get(name, {})
+            fails = prev.get("fails", 0) + 1
+            cooldown = _cooldown(outcome, fails, retry_after)
+            backoff_state[name] = {
+                "next_retry": now + cooldown,
+                "fails": fails,
+                "outcome": outcome,
+            }
         if isinstance(arts, list):
             batches.append(arts)
+
+    _save_backoff(backoff_state)
 
     # Dedup in a single SQLite pass after parallel I/O. Layer 2 (per-article)
     # and Layer 3 (per-row DB) ensure one malformed entry or row-level hiccup
