@@ -1879,20 +1879,32 @@ def _get_decision_scorer():
 #     (preserves invariant #5 semantics for the first few hundred cycles
 #     after a fresh start, and never disables the gate due to a transient
 #     ledger fault).
-#   - Median |oos_buy_ic| < _GATE_SKILL_IC_TOLERANCE: the modulation block
-#     is short-circuited — conviction is left untouched. The reasoning
-#     string still surfaces `scorer=X%(gate-killed,no-skill)` so an
-#     operator (and `_parse_gate_decision`) can see the gate deliberately
-#     abstained on noise rather than acting.
-#   - Median |oos_buy_ic| >= tolerance: gate stays active. Existing
-#     ×0.6/×0.85/×1.15/×1.3 modulation is applied unchanged.
+#   - Median oos_buy_ic < _GATE_SKILL_IC_TOLERANCE (signed): the modulation
+#     block is short-circuited — conviction is left untouched. This covers
+#     BOTH near-zero noise (|IC|≈0) AND persistently NEGATIVE (anti-predictive)
+#     skill. Live audit on 2026-05-28 showed the trailing-20 oos_buy_ic
+#     median sitting at -0.06 — strictly anti-predictive — while the gate
+#     stayed active because |IC|=0.06 > tolerance. The gate's arms
+#     (pred < -10 → ×0.6, pred > 10 → ×1.3) assume POSITIVE rank-IC; under
+#     negative IC the modulation directionality is INVERTED vs reality, so
+#     the gate actively HURTS sized return rather than abstaining. The fix
+#     requires demonstrated positive skill above tolerance: anything else
+#     (noise OR anti-skill) → kill. Reasoning string still surfaces
+#     `scorer=X%(gate-killed,no-skill)` so `_parse_gate_decision` and the
+#     dashboard see a single, well-known abstention marker for either case.
+#   - Median oos_buy_ic >= tolerance (strictly positive skill): gate stays
+#     active. Existing ×0.6/×0.85/×1.15/×1.3 modulation is applied unchanged.
 #
 # Cached for 1h (TTL) so the JSONL read happens at most once per hour
 # regardless of the per-decision cadence — mirrors the live trader's
 # `_ml_qualify_cache` pattern in `strategy.py` (CLAUDE.md §15).
 _GATE_SKILL_LOG_PATH = ROOT / "data" / "scorer_skill_log.jsonl"
 _GATE_SKILL_MIN_CYCLES = 20      # min trailing cycles with parseable oos_buy_ic
-_GATE_SKILL_IC_TOLERANCE = 0.03  # |median buy IC| below this ⇒ no demonstrated skill
+# Signed median BUY rank-IC below this ⇒ no demonstrated positive skill →
+# kill the gate. Covers BOTH near-zero noise AND persistently negative
+# (anti-predictive) skill, since the gate's per-arm sizing assumes positive
+# rank-IC and inverts under anti-skill.
+_GATE_SKILL_IC_TOLERANCE = 0.03
 _GATE_SKILL_KILL_SWITCH_TTL_S = 3600.0  # recheck every hour
 _gate_skill_cache: tuple[bool, str, float] | None = None
 _GATE_SKILL_CACHE_LOCK = threading.Lock()
@@ -1910,11 +1922,15 @@ def _should_gate_modulate_conviction() -> tuple[bool, str]:
     """Return ``(gate_active, reason)``.
 
     Reads the trailing ``_GATE_SKILL_MIN_CYCLES`` rows of
-    ``scorer_skill_log.jsonl`` and computes the median of ``oos_buy_ic``.
-    When the median's absolute value is below ``_GATE_SKILL_IC_TOLERANCE``,
-    the scorer's BUY-side rank skill is statistically at noise and the
-    conviction gate's ×0.6/×0.85/×1.15/×1.3 modulation is variance with no
-    compensating edge — return ``(False, …)`` to short-circuit it in
+    ``scorer_skill_log.jsonl`` and computes the **signed median** of
+    ``oos_buy_ic``. When that median is below ``_GATE_SKILL_IC_TOLERANCE``,
+    the gate's modulation has no realized economic edge — either at noise
+    (|IC|≈0, the original case) or strictly anti-predictive (median < 0,
+    the case live data caught on 2026-05-28: trailing-20 median = -0.06).
+    The gate's per-arm sizing assumes POSITIVE rank-IC; under anti-skill
+    the directionality is inverted vs realized returns, so leaving the
+    gate active actively subtracts return rather than abstaining. Return
+    ``(False, …)`` in both cases to short-circuit the modulation in
     ``_ml_decide``.
 
     Defaults to ``(True, …)`` on any fault (missing ledger, unparseable
@@ -1986,11 +2002,22 @@ def _should_gate_modulate_conviction() -> tuple[bool, str]:
             median_ic = recent_sorted[mid]
         else:
             median_ic = (recent_sorted[mid - 1] + recent_sorted[mid]) / 2.0
-        if abs(median_ic) < _GATE_SKILL_IC_TOLERANCE:
+        # Signed threshold (not |median|): the gate is killed for BOTH
+        # near-zero noise AND persistently anti-predictive (median < 0)
+        # skill. The arms (pred<-10 → ×0.6, pred>+10 → ×1.3) assume
+        # positive rank-IC; under negative IC the modulation is
+        # directionally inverted relative to realized returns, so an
+        # active gate subtracts return rather than just being inert. The
+        # previous `abs(median_ic)` guard only protected against the
+        # noise case — live audit on 2026-05-28 caught the gate firing on
+        # trailing-20 median = -0.06 (anti-skill); see the module-level
+        # comment above for the full rationale.
+        if median_ic < _GATE_SKILL_IC_TOLERANCE:
             return _set((False,
                          f"median oos_buy_ic={median_ic:+.3f} over last "
                          f"{len(recent)} cycles is below "
-                         f"|{_GATE_SKILL_IC_TOLERANCE}| — gate killed"))
+                         f"+{_GATE_SKILL_IC_TOLERANCE} (noise or "
+                         f"anti-predictive) — gate killed"))
         return _set((True,
                      f"median oos_buy_ic={median_ic:+.3f} over last "
                      f"{len(recent)} cycles — gate active"))
