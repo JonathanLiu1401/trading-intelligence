@@ -765,6 +765,26 @@ class TestGateKillSwitchDefaults:
         gate, _ = bt._should_gate_modulate_conviction()
         assert gate is True  # median == tolerance ⇒ NOT < tolerance ⇒ active
 
+    def test_reason_string_documents_anti_predictive_branch(
+        self, tmp_path, monkeypatch
+    ):
+        """When the kill-switch fires due to negative IC, the reason
+        string MUST surface the 'noise or anti-predictive' framing so an
+        operator triaging from a shell can distinguish near-zero noise
+        from real anti-skill. The exact wording is the operator's
+        guidance — pin a stable token a downstream parser can grep for."""
+        import paper_trader.backtest as bt
+        import json
+        log_path = tmp_path / "skill.jsonl"
+        rows = [json.dumps({"cycle": i, "oos_buy_ic": -0.10})
+                for i in range(25)]
+        log_path.write_text("\n".join(rows) + "\n")
+        monkeypatch.setattr(bt, "_GATE_SKILL_LOG_PATH", log_path)
+        bt._reset_gate_skill_cache()
+        gate, reason = bt._should_gate_modulate_conviction()
+        assert gate is False
+        assert "anti-predictive" in reason or "noise" in reason
+
     def test_borderline_negative_just_below_tolerance_kills_gate(
         self, tmp_path, monkeypatch
     ):
