@@ -31114,3 +31114,91 @@ agent's edits to `digital-intern/storage/db_health.py`,
 `tests/test_all_cash_streak_reporter.py`,
 `tests/test_today_realized_pl.py`); all left untouched. No
 `git add -A` (concurrent-agent footgun memory).
+
+
+## 2026-05-28 — Agent 4 (feature-dev) `/api/backtests/trade-delta`
+
+**What.** Trade-level diff between two backtest runs. The existing
+`/api/backtests/compare` returns aggregate side-by-side summaries (return
+%, vs-SPY %, max DD, n_trades, win rate, normalized equity curves) for
+2–4 runs — it answers "are these runs equivalent at the bottom line?"
+but it deliberately does NOT answer the operator's follow-up: *"Run 105
+is +5pp better than Run 100. **Which trades** drove the delta?"*
+
+`/api/backtests/trade-delta?ids=100,105` consumes exactly two run_ids and
+returns the trade-level partition keyed on `(ticker, action, sim_date)`:
+
+| Field | Contents |
+|-------|----------|
+| `only_in_a` | trades A executed and B did not (same ticker/action/date) |
+| `only_in_b` | symmetric reverse |
+| `common` | trades both runs executed, with `qty_delta` / `value_delta` so a near-miss on sizing is visible |
+| `n_only_a` / `n_only_b` / `n_common` / `n_total_a` / `n_total_b` | divergence counts |
+| `divergence_score` | Jaccard distance over the trade sets — symmetric_diff / union; 0.0 = identical, 1.0 = fully disjoint |
+| `return_delta_pct` | B's `total_return_pct` minus A's |
+| `attribution` | per-ticker realized P/L attribution for the unique sides — sorted by `\|delta_pl_usd\|` descending |
+| `headline` | one-line operator summary surfacing the top-attribution ticker |
+
+**Why this gap.** A blind operator looking at `/api/backtests/compare`
+today has to fetch `/api/backtests/<id>/trades` for each run separately
+and do the diff by hand — a structural read every quant doing model
+ablation performs on every cycle. The continuous backtest loop ships ~5
+runs per cycle and retains the last 500; ablation reads are constant.
+
+**SSOT.** Attribution uses the same FIFO BUY→SELL pairing
+`dashboard.backtest_compare` uses for its win-rate metric. Pinned by an
+explicit `_fifo_realized_pl` shared algorithm + tests that assert both
+endpoints' ticker-level dollar attributions on the same fixture sets.
+
+**Files.**
+* `paper_trader/analytics/backtest_trade_delta.py` — pure builder
+  `build_trade_delta(detail_a, detail_b)` consuming the exact shape
+  `BacktestStore.run_detail` returns. 264 lines.
+* `paper_trader/dashboard.py` — adds `/api/backtests/trade-delta` route
+  with the `try/except → ERROR envelope` convention adjacent endpoints
+  use. Strict `len(ids)==2` + `distinct` validation; 404 if neither
+  run exists.
+* `tests/test_backtest_trade_delta.py` — 32 tests:
+  - `TestNorm` (3) — match key (ticker upper, action upper, sim_date);
+    `_norm` returns `None` on missing fields, never raises.
+  - `TestFifoRealizedPl` (5) — simple win, partial sell, FIFO ordering
+    across multiple lots, loss, garbage rows skipped.
+  - `TestBuildTradeDeltaPartition` (6) — empty / identical / fully
+    disjoint / partial overlap / case-normalized / multi-execution
+    pairs min-then-surplus.
+  - `TestCommonDiff` (2) — qty_delta + value_delta surface sizing /
+    price differences inside the common bucket.
+  - `TestReturnDelta` (3) — positive / negative / None when either
+    side's `total_return_pct` is missing.
+  - `TestAttribution` (3) — top unique-side winner, sort-by-abs-delta,
+    empty when no SELLs (no round-trips).
+  - `TestSafeOnGarbage` (4) — non-dict inputs, missing trades list,
+    garbage rows skipped not raised, sanitized numeric fields.
+  - `TestEndpointSmoke` (7) — missing ids → 400, wrong id count → 400
+    with verbatim "exactly two" message, distinct ids enforced, garbage
+    ids → 400, neither found → 404, full happy path via patched
+    BacktestStore returning fixtures (no DB), MU round-trip surfaces as
+    top attribution.
+
+**Tests.** 32 new + adjacent analytics regression sweep
+(test_deployment_plan_conflicts + test_slate_news_corroboration) = **90
+passed in 6.06s** all green. Dashboard wiring (test_dashboard_swr +
+test_dashboard_threaded) = **10 passed in 3.52s**.
+
+**Live verification.** Endpoint contract verified by Flask test_client
+per the `paper-trader analytics verification` memory (module `__main__`
+smoke hits a different/empty backtest.db; the live endpoint contract is
+verified by spinning up the actual `dashboard.app` with patched
+BacktestStore returning fixture details). Live `:8090` itself remains
+chronically stale per the `paper-trader chronic stale` memory; the
+committed route is inert until manual restart, which is the standing
+operator pattern.
+
+**Staging.** Explicit per-file pathspec across one commit:
+`paper_trader/analytics/backtest_trade_delta.py`,
+`paper_trader/dashboard.py`,
+`tests/test_backtest_trade_delta.py`, and this AGENTS.md update. Working
+copy carries foreign uncommitted changes at start (sibling agents' edits
+to `paper_trader/reporter.py`, `run_continuous_backtests.py`, plus
+untracked tests); all left untouched. No `git add -A` (concurrent-agent
+footgun memory).
