@@ -9115,8 +9115,21 @@ def _ticker_news_pulse(tickers: list[str], hours: int = 24) -> dict[str, dict]:
 
 
 @app.route("/api/sector-pulse")
+@swr_cached("sector_pulse", 60.0)
 def sector_pulse_api():
-    """Compact semis-sector card: price, day %, RSI, news count, top headline per ticker."""
+    """Compact semis-sector card: price, day %, RSI, news count, top headline per ticker.
+
+    SWR-cached (60s) because the hot path makes ~17 yfinance ``get_prices`` +
+    ``get_quant_signals_live`` round-trips PLUS reads the articles DB on every
+    request — observed live at 8s+ wall-clock and frequently exceeding the
+    browser's 10s panel timeout. yfinance rate-limits transparently into the
+    same TCP connection so this can't be fixed by parallelism; SWR serves the
+    last good snapshot immediately while a single background build refreshes
+    it. The 60s TTL matches the underlying quant-cache TTL (5 min) and the
+    live trader's ``OPEN_INTERVAL_S=1800``, so a sector reading is never
+    materially out of date but the panel always loads instantly. Same SWR
+    pattern as ``/api/risk`` / ``/api/concentration-cap`` — observational
+    only, never gates Opus (invariants #2/#12)."""
     try:
         from . import market
         from .strategy import _QUANT_CACHE, get_quant_signals_live

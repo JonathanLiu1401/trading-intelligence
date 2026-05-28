@@ -215,6 +215,11 @@ def test_real_slow_routes_are_wrapped():
         "scorer_predictions_api", "sector_heatmap_api", "correlation_api",
         "thesis_drift_api", "news_edge_api", "source_edge_api",
         "feed_health_api",
+        # Added 2026-05-28 — sector_pulse was the only sector-card endpoint
+        # still firing ~17 synchronous yfinance round-trips inline (live: 8s+,
+        # browser panel hit its 10s timeout). Same SWR pattern as the others
+        # — a future un-wrap is a regression.
+        "sector_pulse_api",
     }
     for name in wrapped:
         fn = getattr(d, name)
