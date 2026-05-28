@@ -3936,6 +3936,71 @@ def _streak_line(store) -> str:
         return ""
 
 
+def _all_cash_streak_line(store) -> str:
+    """One-line "how long has the book been 100% cash?" for the hourly /
+    daily report.
+
+    ``/api/all-cash-streak`` exposes the contiguous all-cash-tenure
+    verdict on the *dashboard*, but the operator paged on Discord never
+    opens it — the exact dashboard→Discord gap ``_streak_line`` /
+    ``_capital_pulse_line`` / ``_idle_opportunity_line`` each close, one
+    dimension over: hot/tilt round-trip clusters → cash-fraction state →
+    missed signals while idle → *duration* of contiguous sidelined cash.
+    A book that has held NOTHING for 50 hours straight while SPY rallied
+    is the exact under-deployment a desk reviews before adding more risk,
+    yet nothing the Discord operator reads today carries it.
+
+    Composes ``build_all_cash_streak`` **verbatim** (single source of
+    truth, AGENTS.md invariant #10 — the headline / verdict are the
+    builder's, never re-derived here, so this Discord line and
+    ``/api/all-cash-streak`` can never tell different stories) and feeds
+    it the EXACT same store read the endpoint does
+    (``equity_curve(limit=5000)``, the canonical ``build_all_cash_streak``
+    input). **Pure store reads only — NO network** (the Discord-path
+    discipline; the ``_streak_line`` precedent). Observational only,
+    never gates, adds no caps (invariants #2/#12 — the
+    ``_streak_line`` precedent). Failure contract mirrors the rest of
+    ``reporter``: any builder/store fault degrades to ``""`` ("no
+    cash-streak line this report"), **never** an exception ("no Discord
+    summary this report").
+
+    Suppression — surface ONLY the two actionable verdicts a desk acts
+    on, so a freshly-deployed book / brief holdout / insufficient sample
+    adds no hourly noise (the summary must never become its own lying
+    green light — the ``_streak_line`` NEUTRAL/EMERGING/NO_DATA
+    suppression precedent):
+      * ``EXTENDED_HOLDOUT``  (6h–48h contiguous all-cash) → surfaced
+        WITHOUT the ⚠️ prefix — the milder action tier.
+      * ``PROLONGED_HOLDOUT`` (≥48h contiguous all-cash) → surfaced
+        WITH the ⚠️ prefix — action-required tier (the desk has
+        sat silently idle for 2+ days, the operator needs to know).
+      * ``BRIEF_HOLDOUT`` / ``NOT_ALL_CASH`` / ``INSUFFICIENT_HISTORY``
+        / ``NO_DATA`` (and any non-verdict) → silent.
+
+    An empty ``headline`` is also silent — a bare
+    ``**CASH STREAK** ◈ EXTENDED_HOLDOUT`` body with no detail is the
+    kind of half-formed block a trader can't action (the
+    ``_streak_line`` empty-headline-suppression precedent).
+    """
+    try:
+        from .analytics import all_cash_streak as _acs
+        rows = store.equity_curve(limit=5000)
+        result = _acs.build_all_cash_streak(rows)
+        if not isinstance(result, dict):
+            return ""
+        verdict = result.get("verdict")
+        if verdict not in ("EXTENDED_HOLDOUT", "PROLONGED_HOLDOUT"):
+            return ""
+        headline = result.get("headline") or ""
+        if not headline:
+            return ""
+        prefix = "⚠️ " if verdict == "PROLONGED_HOLDOUT" else ""
+        return f"{prefix}**CASH STREAK** ◈ {verdict}\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] all-cash streak line skipped: {e}")
+        return ""
+
+
 def _passive_signal_density_line(store) -> str:
     """One-line "is the engine ignoring rich news flow?" for the hourly /
     daily report.
@@ -4597,9 +4662,22 @@ def send_hourly_summary() -> bool:
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
-    # CASH FIT sits right after CAPITAL — both about cash deployment, one
-    # dimension over. CAPITAL says "the desk *cannot* act" (structural —
-    # PINNED / FREE / BLEEDING from cash %, recent activity, droughts).
+    # CASH STREAK sits right after CAPITAL — both are cash-state surfaces,
+    # one dimension over. CAPITAL reads "is the book *currently* deployed
+    # vs sidelined?" (cash fraction state — PINNED/FREE/BLEEDING).
+    # CASH STREAK reads "and how *long* has the sidelined state held?"
+    # (contiguous all-cash tenure — EXTENDED/PROLONGED only fire). A
+    # FREE book that has held nothing for 50h while SPY rallied is the
+    # exact under-deployment a desk reviews — CAPITAL alone misses
+    # duration; CASH STREAK alone misses the per-cycle state. Both
+    # silence-by-default; neither suppresses the other.
+    acs = _all_cash_streak_line(store)
+    if acs:
+        body += "\n" + acs
+    # CASH FIT sits right after CASH STREAK — all three (CAPITAL, CASH
+    # STREAK, CASH FIT) are cash surfaces, one dimension over each.
+    # CAPITAL says "the desk *cannot* act" (structural — PINNED / FREE /
+    # BLEEDING from cash %, recent activity, droughts).
     # CASH FIT says "the desk *can* act but isn't sized to the live signal"
     # (point-in-time — IDLE_DESPITE_SURGE / OVERDEPLOYED against today's
     # loudest screaming name). Both can be silent independently (silence-
@@ -4868,9 +4946,15 @@ def send_daily_close() -> bool:
     cp = _capital_pulse_line(store)
     if cp:
         body += "\n" + cp
-    # CASH FIT follows CAPITAL on daily close too — see send_hourly_summary
-    # for the CAPITAL→CASH-FIT placement rationale (can the desk act? vs.
-    # is it sized to the live signal?).
+    # CASH STREAK follows CAPITAL on daily close too — see
+    # send_hourly_summary for the CAPITAL→CASH-STREAK rationale (cash
+    # state vs duration of the sidelined run; EXTENDED/PROLONGED only).
+    acs = _all_cash_streak_line(store)
+    if acs:
+        body += "\n" + acs
+    # CASH FIT follows CASH STREAK on daily close too — see send_hourly_summary
+    # for the CASH STREAK→CASH-FIT placement rationale (duration of
+    # sidelined cash vs whether the cash is sized to the live signal).
     cf = _cash_conviction_fit_line(store)
     if cf:
         body += "\n" + cf
