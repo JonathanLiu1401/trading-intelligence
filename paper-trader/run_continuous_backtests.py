@@ -1990,6 +1990,30 @@ def _append_scorer_skill_log(status: str, cycle: int,
             deploy_stale = is_deploy_stale()
         except Exception:
             deploy_stale = None
+        # Kill-switch decision capture (2026-05-28 feature). The conviction
+        # gate has TWO independent guards: (a) ``train_n >= 500`` (the
+        # documented invariant #5 engagement threshold, already surfaced as
+        # ``gate_active``), and (b) ``_should_gate_modulate_conviction``'s
+        # trailing-IC kill-switch (the Phase-1 anti-skill fix's gate). A
+        # quant trending gate health needs to see BOTH — a row with
+        # ``gate_active=True`` but ``gate_killswitch_active=False`` records
+        # the most operationally interesting state ("the n_train threshold
+        # is met but the kill-switch suppressed the modulation this cycle"),
+        # which would otherwise be invisible in any per-cycle JSONL on disk
+        # and only knowable by manually re-running the kill-switch on
+        # historical ledger state. Pure read; the kill-switch is itself
+        # best-effort and never raises — any fault here degrades to None
+        # (the documented acceptable degradation), the same discipline the
+        # rest of ``_append_scorer_skill_log`` follows.
+        try:
+            from paper_trader.backtest import _should_gate_modulate_conviction
+            killswitch_active, killswitch_reason = (
+                _should_gate_modulate_conviction())
+        except Exception as exc:
+            killswitch_active = None
+            killswitch_reason = f"kill-switch read error: {exc}"
+        _gate_active_n = (parsed.get("train_n") is not None
+                          and parsed["train_n"] >= 500)
         row = {
             "cycle": cycle,
             "timestamp": _now(),
@@ -1997,10 +2021,32 @@ def _append_scorer_skill_log(status: str, cycle: int,
             "window_end": win_end.isoformat(),
             # Surfaces the gate state a quant cares about without re-reading
             # the pickle: the gate engages only at train_n >= 500 (#5).
-            "gate_active": (parsed.get("train_n") is not None
-                            and parsed["train_n"] >= 500),
+            "gate_active": _gate_active_n,
             # True ⇒ gate is live on a stale (pre-retune) net — see above.
             "deploy_stale": deploy_stale,
+            # Kill-switch decision (additive 2026-05-28 — see comment above):
+            # the trailing-OOS-IC short-circuit's verdict on whether the
+            # gate should fire THIS cycle. True ⇒ kill-switch is letting the
+            # gate act; False ⇒ trailing skill below tolerance (noise OR
+            # anti-predictive — Phase-1 fix), gate's modulation is
+            # short-circuited; None ⇒ kill-switch read raised.
+            "gate_killswitch_active": killswitch_active,
+            # The reason string the kill-switch returned — captures
+            # `median oos_buy_ic=…` / `skill ledger missing` / etc. so a
+            # quant doesn't have to re-derive WHY a given cycle's gate
+            # turned on or off.
+            "gate_killswitch_reason": killswitch_reason,
+            # The TRUE effective gate state — both guards must say active.
+            # This is the field a researcher should trend to answer "is the
+            # conviction modulation actually firing right now?", with the
+            # individual `gate_active` and `gate_killswitch_active` columns
+            # available to attribute a False here to the right guard.
+            # None when the kill-switch read failed (degrade honestly rather
+            # than fabricate either True or False from partial information).
+            "gate_effectively_active": (
+                _gate_active_n and killswitch_active is True
+                if killswitch_active is not None else None
+            ),
             **parsed,
         }
         SCORER_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
