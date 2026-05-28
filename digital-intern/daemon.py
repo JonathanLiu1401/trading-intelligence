@@ -94,6 +94,7 @@ from collectors.collector_rate_monitor import collect_rate_alerts
 from collectors.source_quality_scorer import collect as collect_source_quality
 from collectors.yield_curve_collector import collect_yield_curve
 from collectors.yield_curve_spread_collector import collect_yield_curve_spreads
+from collectors.credit_spread_collector import collect_credit_spreads
 from collectors.g10_sovereign_yields import collect_g10_yields
 from collectors.fred_collector import collect_fred
 from collectors.fred_production_collector import collect as collect_fred_production
@@ -241,6 +242,7 @@ KALSHI_INTERVAL         = 1800    # Kalshi CFTC-regulated markets every 30min
 RATE_MONITOR_INTERVAL   = 3600    # per-collector silence detector — hourly
 SOURCE_QUALITY_INTERVAL = 86400   # source urgency-rate scorer — once per day
 YIELD_CURVE_INTERVAL    = 3600    # 10Y-2Y spread monitor every 1h (FRED daily)
+CREDIT_SPREAD_INTERVAL   = 3600    # IG/HY/CCC OAS credit spread monitor every 1h (FRED daily)
 YIELD_CURVE_SPREAD_INTERVAL = 3600  # 2Y-10Y & 3M-10Y inversion tracker every 1h (FRED)
 APPSTORE_FINANCE_INTERVAL = 86400  # Apple App Store Finance rankings — once per day
 G10_YIELDS_INTERVAL     = 3600    # G10 sovereign yields every 1h (FRED daily/monthly)
@@ -404,6 +406,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "rate_monitor": RATE_MONITOR_INTERVAL,
     "yield_curve": YIELD_CURVE_INTERVAL,
     "yield_curve_spread": YIELD_CURVE_SPREAD_INTERVAL,
+    "credit_spread": CREDIT_SPREAD_INTERVAL,
     "g10_yields": G10_YIELDS_INTERVAL,
     "fred_macro": FRED_MACRO_INTERVAL,
     "fred_production": FRED_PROD_INTERVAL,
@@ -1794,6 +1797,27 @@ def yield_curve_spread_worker(store: ArticleStore):
         _sleep(YIELD_CURVE_SPREAD_INTERVAL)
 
 
+
+
+def credit_spread_worker(store: ArticleStore):
+    log.info("[credit_spread_worker] started")
+    bo = Backoff("credit_spread", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_credit_spreads()
+            _ingest(store, articles, "credit_spread")
+            try:
+                source_health.record_result("credit_spread", len(articles))
+            except Exception as he:
+                log.warning(f"[credit_spread_worker] source_health error: {he}")
+            _worker_last_ok["credit_spread"] = time.time()
+            log.debug(f"[credit_spread] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[credit_spread_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(CREDIT_SPREAD_INTERVAL)
 def g10_yields_worker(store: ArticleStore):
     log.info("[g10_yields_worker] started")
     bo = Backoff("g10_yields", base=60.0, cap=1800.0)
@@ -4952,6 +4976,7 @@ def main():
         ("source_quality", source_quality_worker),
         ("yield_curve", yield_curve_worker),
         ("yield_curve_spread", yield_curve_spread_worker),
+        ("credit_spread",   credit_spread_worker),
         ("g10_yields",  g10_yields_worker),
         ("fred_macro",  fred_macro_worker),
         ("fred_production", fred_production_worker),
