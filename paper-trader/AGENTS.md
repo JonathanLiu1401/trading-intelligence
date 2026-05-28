@@ -6,6 +6,187 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-28 ML+backtest HYBRID pass (Agent 2) — kill-switch anti-skill fix + gate-state CLI + per-cycle kill-switch ledger field
+
+### Phase 1 — `_should_gate_modulate_conviction` signed-IC threshold
+
+The kill-switch in `paper_trader/backtest.py::_should_gate_modulate_conviction`
+previously used `abs(median_ic) < tolerance` to decide whether to disable the
+conviction gate's per-arm modulation. That treated only NEAR-ZERO IC as "no
+demonstrated skill" — a persistently NEGATIVE oos_buy_ic (anti-predictive
+scorer) had `|IC| > tolerance` and kept the gate ACTIVE, with the per-arm
+sizing (pred<-10 → ×0.6, pred>+10 → ×1.3) firing in the wrong direction
+relative to realized returns.
+
+Live audit on 2026-05-28 (`data/scorer_skill_log.jsonl`): trailing-20
+oos_buy_ic median = **-0.060** — strictly anti-predictive — while the gate
+stayed active. The fix switches to a **signed** comparison
+(`median_ic < tolerance`) so anti-skill ALSO disables the gate, requiring
+demonstrated positive skill to act.
+
+```python
+# paper_trader/backtest.py::_should_gate_modulate_conviction
+if median_ic < _GATE_SKILL_IC_TOLERANCE:
+    return _set((False, "... noise or anti-predictive — gate killed"))
+return _set((True, "... — gate active"))
+```
+
+Lock test: `tests/test_ml_backtest_agent2_20260527.py::TestGateKillSwitchDefaults::test_anti_predictive_skill_kills_gate`
+(median = -0.06, the live observed case) plus borderline / boundary tests.
+
+### Phase 2.1 — `paper_trader.gate_status` CLI
+
+Wraps the live `_should_gate_modulate_conviction()` + deployed
+`DecisionScorer.n_train` read as a one-shot diagnostic. Mirrors
+`paper_trader.ml.decision_scorer` and `paper_trader.host_guard`: read-only
+(never trains, never persists), exit 0 when the gate is effectively active,
+exit 1 otherwise (so shell callers can `gate_status && do-something`).
+
+```bash
+$ python3 -m paper_trader.gate_status
+[gate_status] paper-trader conviction-gate effective state
+  scorer: trained, n_train=3991  (>=500 ? MET)
+  kill-switch: KILLED (gate suppressed)
+    reason: median oos_buy_ic=-0.060 over last 20 cycles is below +0.03 (noise or anti-predictive) — gate killed
+  gate effectively: INACTIVE — conviction modulation is NOT firing
+
+$ python3 -m paper_trader.gate_status --json
+{"gate_effectively_active": false, "killswitch_active": false, ...}
+```
+
+### Phase 2.2 — `scorer_skill_log.jsonl` kill-switch field capture
+
+`run_continuous_backtests.py::_append_scorer_skill_log` now writes three
+additional fields per cycle:
+
+- `gate_killswitch_active` — the kill-switch's verdict (True/False/None)
+- `gate_killswitch_reason` — the reason string returned by the kill-switch
+- `gate_effectively_active` — True iff BOTH `gate_active` (n_train≥500)
+  AND `gate_killswitch_active` are True; None when the kill-switch read
+  failed (honest degradation, no fabrication)
+
+The most operationally interesting state — `gate_active=True` AND
+`gate_killswitch_active=False` (n_train threshold met but kill-switch
+suppressed the modulation) — is the exact JSONL row pattern to query for
+cycles where the kill-switch saved the loop from acting on anti-skill:
+
+```bash
+jq -c 'select(.gate_active and (.gate_killswitch_active == false))' \
+   data/scorer_skill_log.jsonl
+```
+
+### How the DecisionScorer + backtest stack works (canonical reference)
+
+**Two distinct ML models — don't confuse them:**
+
+| | ArticleNet | DecisionScorer |
+|---|---|---|
+| Code | `/home/zeph/digital-intern/ml/model.py` | `paper_trader/ml/decision_scorer.py` |
+| Framework | PyTorch | sklearn `MLPRegressor (32,16)` + numpy lstsq fallback |
+| Input | text features of an article | 20 features: 10 base + 3 enhanced MACD + 7 sector one-hot |
+| Output | relevance/urgency/uncertainty/time_sensitivity | 5-day forward return (%) |
+| Used by | `signals.py` writes `ai_score`/`urgency` into `articles.db` | `_ml_decide` to modulate BUY conviction |
+| Retrain | digital-intern daemon (every 2-3 min) + per-backtest-cycle injection | every continuous-loop cycle |
+
+**The conviction gate's TWO guards** (must BOTH be active for the gate to fire):
+
+1. **n_train guard (invariant #5)**: `_n_train >= 500`. Below this, the
+   scorer's predictions are too noisy to gate on. Surfaced as `gate_active`
+   in the skill ledger row.
+2. **Kill-switch guard** (`backtest._should_gate_modulate_conviction`):
+   trailing-`_GATE_SKILL_MIN_CYCLES=20` median `oos_buy_ic` must be ≥
+   `_GATE_SKILL_IC_TOLERANCE=0.03` (signed — Phase 1 fix). Below this
+   (noise OR anti-predictive), the gate's per-arm modulation is short-
+   circuited and reasoning carries `(gate-killed,no-skill)`. Surfaced as
+   `gate_killswitch_active` in the skill ledger row.
+
+**Live OOS skill on the deployed pickle (2026-05-28):**
+
+- `oos_buy_ic` running median ≈ -0.06 over last 20 cycles → kill-switch
+  killed (post-Phase-1 fix)
+- `oos_rmse_ratio` ≈ 1.30 (RMSE 30% worse than mean baseline →
+  `MLP_NO_BETTER_THAN_TRIVIAL`)
+- `baseline_compare` verdict typically `MLP_WORSE_THAN_TRIVIAL`
+
+The honest interpretation: the current scorer carries no positive OOS rank
+skill, and the kill-switch correctly suppresses gate modulation. Decision
+sizing falls back to the documented base rule
+(`min(0.25, ml_score/20)` regular, `min(0.40, ml_score/15)`
+leveraged-bull) with no gate adjustment.
+
+### How to run backtests + interpret results
+
+```bash
+# One-shot: 10 parallel year-long runs
+python3 run_backtests.py
+
+# Continuous loop (production): 1 run/cycle, 10-min cooldown
+python3 run_continuous_backtests.py
+
+# Inspect deployed scorer + gate state in one command
+python3 -m paper_trader.gate_status
+
+# Score one input with attribution + calibrated reading
+python3 -m paper_trader.ml.decision_scorer --explain --ticker NVDA --ml-score 2.0 --rsi 55 --groups
+
+# Latest cycle's structured skill row
+tail -1 data/scorer_skill_log.jsonl | python3 -m json.tool
+
+# Last N runs — return, vs-SPY alpha, trades, benchmark-availability note
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('file:backtest.db?mode=ro', uri=True, timeout=5)
+for r in conn.execute('SELECT run_id, total_return_pct, vs_spy_pct, n_trades, notes FROM backtest_runs WHERE status=\\\"complete\\\" ORDER BY run_id DESC LIMIT 10').fetchall():
+    print(r)
+"
+```
+
+**Honest reading of backtest aggregates (current sample of 500 runs):**
+
+- avg `total_return_pct` ≈ +500% — DOMINATED by multi-year compounding +
+  leveraged ETF luck (run windows are 1–10 years uniformly).
+- avg `vs_spy_pct` ≈ +340% — looks like huge alpha, but **65% of runs
+  beat SPY**, the rest underperform. The mean is skewed by a small
+  number of 3-trade leveraged-ETF outliers (one recent run +1723% on
+  3 trades).
+- Real skill signal: `vs_spy_pct` median, win rate, and gate-conditional
+  realized P&L from the skill ledgers.
+
+### Focused test commands for this domain
+
+```bash
+# This pass's lock tests (75 tests, ~3s)
+python3 -m pytest tests/test_ml_backtest_agent2_20260527.py tests/test_gate_status_and_killswitch_ledger.py -v
+
+# Broader ML/backtest regression (~5 min, ~1432 tests)
+python3 -m pytest tests/ -q -k "ml or backtest or scorer or gate"
+
+# Decision_scorer-only sanity (fastest)
+python3 -m pytest tests/test_decision_scorer.py -v
+```
+
+### Phase 3 user findings (live data, 2026-05-28)
+
+1. **Kill-switch correctly fires NOW**: post-Phase-1 fix,
+   `gate_status` reports `INACTIVE` because trailing-20
+   `oos_buy_ic = -0.06`. Pre-fix this would have read `ACTIVE`.
+2. **`corr(ml_score, fwd_return_5d) = +0.01`** at corpus level —
+   the input feature carries effectively zero linear signal at
+   aggregate. The 17-feature MLP has no better input signal to
+   amplify.
+3. **`oos_rmse_ratio ≈ 1.30`** — model RMSE 30% above the
+   constant-mean baseline. `MLP_NO_BETTER_THAN_TRIVIAL` is the
+   correct diagnostic verdict.
+4. **Backtest aggregate misleading**: avg vs-SPY +340% is driven by
+   3-trade leveraged-ETF outliers; only 65/100 of recent runs
+   actually beat SPY. Read `vs_spy_pct` median + win rate, not mean.
+5. **2 runs with `benchmark_unavailable` notes** in `backtest_runs`
+   — the documented `notes`-column data-integrity guard catches
+   transient yfinance SPY fetch failures (CLAUDE.md §8 invariant).
+   No bug, working as designed.
+
+---
+
 ## 2026-05-27 core HYBRID pass (Agent 1, fourth cycle) — `_all_cash_streak_line` Discord wiring
 
 **Counters:** bugs_fixed=0 · features_added=1 · user_findings=8
