@@ -5,6 +5,128 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-28 HYBRID pass (Agent 3, pass #6) — `briefing_article_count_trend` primitive
+
+**Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=5`.
+
+### Phase 1 — Debug & fix (0 bugs, honest zero)
+
+Audited the codebase per the task spec. All required tests already comprehensively pinned:
+backtest isolation (`tests/test_article_store.py` TestBacktestIsolation 3 tests),
+score_source separation (TestScoreSourceSeparation 4 tests including the new
+briefing_boost preservation guard), feature dim / ticker density (`tests/test_features.py` 16
+tests), ArticleNetModule output ranges + zero-input finite (`tests/test_model.py`), trainer
+score-source exclusion + synthetic-row inclusion (`tests/test_trainer.py`), urgency threshold
++ no-unalert guard (`tests/test_urgency_scorer.py`). Focused regression suite
+(test_article_store + test_features + test_model + test_trainer + test_urgency_scorer +
+test_alert_agent + test_briefing_article_count_trend) — **98 tests passed in 76.88s, zero
+failures**.
+
+One stale-import bug was spotted (`analytics/options_expiry_pressure.py` line 75 referenced
+undefined `LOOKBACK_H`) but a concurrent agent's auto-committed rewrite (`afe5a50`) had
+already removed the time-cutoff filter entirely, neutralizing the bug before any commit
+window. No commit per the Phase 1 guard rule — honest zero rather than synthetic find.
+
+### Phase 2 — Feature dev (1 feature: `briefing_article_count_trend`)
+
+**What.** `ArticleStore.briefing_article_count_trend(last_n=10)` — per-briefing INPUT-pool-size
+trend, the missing analytics primitive that complements the existing three briefing-trend
+siblings:
+
+  - `briefing_cadence_trend`       — "are briefings firing on schedule?"
+  - `briefing_text_overlap_trend`  — "is the OUTPUT fresh or recapping?"
+  - `briefing_length_trend`        — "is the OUTPUT text getting shorter?"
+
+None answer "is the candidate INPUT pool feeding Opus quietly shrinking, even when cadence
+and output length look HEALTHY?". A briefing that drops from 50→25 candidate articles per
+cycle still reads HEALTHY on the other three trends — but the analyst now gets a normal-
+looking digest that covered ~half the news it usually would.
+
+**Returns.** `{last_n, n_briefings, counts, median_count, min_count, max_count,
+recent_median, older_median, shrink_ratio, verdict}` where `verdict` ∈
+`{STABLE, SHRINKING, GROWING, NO_DATA}`. Verdict ladder mirrors
+`briefing_length_trend` (`<=0.7 shrink_ratio` → SHRINKING, `>=1.3` → GROWING, else STABLE,
+NO_DATA when `n_briefings < 4` or `older_median == 0` divide-by-zero).
+
+**Invariants intact (all four).**
+  - Backtest isolation: not applicable — the `briefings` table is Opus-write only, never
+    touched by backtest paths (same convention as the three existing siblings; documented
+    in the method docstring).
+  - ml_score ↔ ai_score separation: pure SELECT, no write — invariant tautologically intact.
+  - score_source: untouched (read-only).
+  - urgency: untouched (read-only). Pinned by `TestEdgeCases::test_does_not_mutate_articles`.
+
+**Files:**
+  - `storage/article_store.py` — added `briefing_article_count_trend` method after
+    `briefing_length_trend` (+149 lines, single SQL aggregation reading
+    `briefings.article_count` ordered by id desc).
+  - `tests/test_briefing_article_count_trend.py` — 10 new tests pinning: NO_DATA branches
+    (empty / <4 briefings / older_median=0), verdict ladder (STABLE / SHRINKING / GROWING
+    + a borderline-22%-shrink-is-STABLE pin), last_n window cap, read-only mutation
+    invariant, live-evidence scenario.
+
+**Test counts.** New feature suite: 10 passed in 0.39s. Focused regression suite (98 tests):
+**98 passed in 76.88s, zero failures**.
+
+### Phase 3 — Live news-analyst findings (5)
+
+Against `/media/zeph/projects/digital-intern/db/articles.db` at 2026-05-28T17:30Z:
+
+1. **85% of alerts in 24h are ML-only** — 94 of 111 urgency≥1 rows in the last 24h carry
+   `score_source='ml'` with `ai_score=0` (raw unverified ML urgency-head calls). Sonnet
+   urgency-vetting is still rarely engaged — same pattern as pass-4 / pass-5; the
+   `[unverified — model-only urgent]` calibration tag hedges per-row, the new
+   `source_urgent_yield` ranks per-source, but the aggregate unverified-fraction has not
+   moved.
+
+2. **4 BREAKING alerts in 24h fired TWICE for the same headline** —
+   `"The Roundhill Memory ETF (DRAM) Packages Micron, Sandisk, Samsung..."` hit
+   `yfinance/Motley Fool` + `GoogleNews/The Motley Foo[l]` 24min apart;
+   `"St. Louis Fed's Musalem keeps focused on high inflation..."` fired twice 12min apart
+   from the SAME `GN: economy inflation` source; `"Nvidia Stock Slips Despite Taiwan
+   Expansion"` and `"ETFs Primed for Gains on NVIDIA's $150B AI Spending Vow"` each fired
+   twice from different YahooFinance / Finnhub copies. Cross-cycle dedup (`alert_recency`)
+   should suppress these but the second push fires before the first's signature is in the
+   recency DB OR the title hashes diverge by one token. Real noise: the analyst gets a
+   duplicate breaking-news push that reads as a new event.
+
+3. **Briefing cadence has a 16h gap on 2026-05-27** — most recent 8 briefings (newest):
+   `T17:04, T05:28, T23:35, T17:46, T01:09, T11:38, T01:39, T17:32`. The
+   `2026-05-27T17:46:30 → 2026-05-27T01:09:00` gap was 16.6h (3+ missed 5h cadences).
+   `briefing_cadence_trend` would surface this as SLIPPING — no other surface tells the
+   analyst the digest path quietly skipped.
+
+4. **`article_count = 50` constant across all 8 recent briefings** — the new
+   `briefing_article_count_trend` returns STABLE in steady-state because
+   `get_top_for_briefing` always returns exactly 50 candidates when the live pool has at
+   least that many. The value of the new method is signal under DEGRADATION (an empty live
+   pool from a long collector outage, an over-tight pre-filter dropping rows) where the
+   count would drop below 50 — the steady-state STABLE confirms the bookkeeping is correct.
+
+5. **57 `database is locked` retry-exhausted errors in the current daemon.log** — chronic
+   structural pressure documented in `memory/di-insert-batch-lock-contention.md`. Worst
+   methods today: `update_ml_scores_batch` (8 hits), `update_ai_scores_batch` (3),
+   `insert_batch` (4), `reap_stale_urgent` (2). Known issue, not a fresh bug — the
+   `@_retry_on_lock` decorator absorbs >95% of contention; the rare exhaustion is the
+   structural cost of `check_same_thread=False` across ~30 daemon threads.
+
+### Phase 4 — Docs & verify
+
+This section. Final verify:
+  - `python3 -c "import sys; sys.path.insert(0, '.'); from storage import article_store; from ml import features, model; print('imports OK')"` → `imports OK`.
+  - `pytest tests/test_briefing_article_count_trend.py tests/test_article_store.py tests/test_features.py tests/test_model.py tests/test_trainer.py tests/test_urgency_scorer.py tests/test_alert_agent.py -q` → **98 passed in 76.88s**.
+
+**Staging discipline.** Per-commit explicit pathspec (`memory/di-shared-repo-concurrency.md`).
+This pass touches exactly two files: `storage/article_store.py`,
+`tests/test_briefing_article_count_trend.py` (new), plus this AGENTS.md entry. No `git add -A`,
+no `.json` / `config/` / `data/` / `logs/` staged. `git diff --staged` verified before commit.
+Concurrent agents on the same tree during this pass touched
+`analysis/held_wire_balance.py`, `analytics/ml_ai_divergence.py`,
+`collectors/gdpnow_collector.py`, `tests/test_held_wire_balance.py`, and `AGENTS.md` itself
+— deliberately left exactly as found.
+
+---
+
 ## 2026-05-27 HYBRID pass (Agent 3, pass #5) — `source_urgent_yield` analytics primitive
 
 **Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=5`.
