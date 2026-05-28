@@ -14395,3 +14395,110 @@ left untouched). Single Phase-2 commit staged exactly three files:
 `watchers/alert_agent.py`, `analysis/claude_analyst.py`,
 `tests/test_recap_zacks_highlights.py`. No `git add -A`, no `.json` /
 config / data / logs staged. `git diff --staged` verified before commit.
+
+
+## 2026-05-28 — Agent 4 (feature-dev) `/api/held-wire-balance` + chat enrichment
+
+**What.** Per-held-ticker bullish/bearish stance from the same 24h
+live wire `/api/sector-pulse` aggregates. SECTOR COHERENCE answers
+"is the wire agreed on a direction at the sector level?";
+HELD-WIRE-BALANCE answers the per-name follow-up the existing chat
+surface never asks: *"is the wire on MY SPECIFIC HELD names aligned
+with my long bias, or quietly opposing it?"*. A sector can be
+MACRO_BULL while the wire on a held single-name (LITE, AXTI, QBTS)
+is bearish — that structural gap between sector positioning and
+name-level positioning is invisible to every other block.
+
+Per-name verdict ladder: `BULL_LEAN` (≥ 70% bull of classified,
+n_classified ≥ 2) → `BEAR_LEAN` (≥ 70% bear) → `MIXED` (split) →
+`INSUFFICIENT` (< MIN_CLASSIFIED_PER_TICKER=2). Book-level rollup:
+`BOOK_BULL` / `BOOK_BEAR` (≥ 66% of opinionated names lean in one
+direction) / `BOOK_MIXED` / `BOOK_INSUFFICIENT`.
+
+**Why this gap (vs the three adjacent endpoints):**
+* `/api/portfolio-signals` ranks **freshness** per held ticker (which
+  headline to read first) — no directional read.
+* `/api/held-news-silence` reports **coverage** per held ticker
+  (DARK / ECHO / COVERED) — also no directional read.
+* `/api/sector-coherence` reports bull/bear at the **sector** level
+  only — a held single-name does not necessarily ride its sector's
+  coherence.
+
+A trader sizing into a held position needs the per-name read: "the
+wire on *this specific name* agrees with my long bias" vs "the wire is
+quietly bearish on a name I'm long." Until now, the answer required
+hand-reading `/api/portfolio-signals` output.
+
+**SSOT.** The bull/bear classifier is `analysis.sector_coherence._classify`
+**re-exported**, never duplicated — sector-level and per-name reports
+can't silently drift. Same word-bounded high-precision token list
+(SURGE/SOAR/BEAT/UPGRADE… for bull; PLUNGE/MISS/DOWNGRADE/PROBE… for
+bear). Held universe is `ml.features.LIVE_PORTFOLIO_TICKERS` —
+matches `/api/held-news-silence`.
+
+**Chat (silence-on-healthy, `_sector_coherence_chat_lines` mould):**
+only emit when at least one held name reaches `BEAR_LEAN` — the wire
+opposing the desk's long bias on a held position. `BULL_LEAN` names
+are aligned-with-book good news (no operator action needed); `MIXED`
+and `INSUFFICIENT` collapse to silence — chat filler is never
+information. `BOOK_BEAR` prepends the headline so the operator sees
+the book-level verdict before per-name detail.
+
+**Files.**
+* `analysis/held_wire_balance.py` — pure builder
+  `build_held_wire_balance(articles, held_tickers=None, window_hours=None,
+  now=None)`. Garbage-safe: non-list articles, missing held_tickers,
+  malformed rows return a well-formed skeleton. 224 lines.
+* `dashboard/web_server.py` — three additions:
+  1. `_held_wire_balance_chat_lines(rep)` helper (silence-on-healthy).
+  2. `/api/held-wire-balance` endpoint with the same `_ro_query` +
+     `_LIVE_ONLY_SQL` plumbing every adjacent endpoint uses. `?hours=`
+     clamped 1..168.
+  3. Chat handler wires the new block into the prompt **right after**
+     `NEWS SECTOR COHERENCE`, reusing the same 24h `sp_arts` fetch so
+     no extra WAL DB read.
+* `tests/test_held_wire_balance.py` — 34 pure-helper tests (no Flask
+  required for the builder tests per the chat-enrichment pattern
+  memory; Flask test_client used only for endpoint smoke):
+  - `TestPerTickerVerdict` (6) — BULL_LEAN at exact 70% boundary,
+    sub-70% must be MIXED (strict ≥ contract), BEAR_LEAN, 50/50 MIXED,
+    INSUFFICIENT below min, threshold-pin drift-lock.
+  - `TestBookVerdict` (6) — BOOK_BULL / BOOK_BEAR / BOOK_MIXED /
+    BOOK_INSUFFICIENT at exact thresholds, INSUFFICIENT rows excluded
+    from opinionated-count denominator, threshold-pin drift-lock.
+  - `TestBuildHeldWireBalance` (12) — empty / non-list / no held
+    tickers / non-string ticker filter / BULL_LEAN on held / BEAR_LEAN
+    on held / BOOK_BEAR rollup / BOOK_INSUFFICIENT / ticker word-boundary
+    (MU must not match "Micron"/"Museum") / garbage rows skip / multi-
+    ticker in headline counted for each / lead_headline ranked by ai.
+  - `TestSortOrder` (1) — BEAR_LEAN first, then MIXED, BULL_LEAN,
+    INSUFFICIENT last (operator-facing actionability order).
+  - `TestChatLines` (6) — non-dict → [], all-bull → silence, mixed-only
+    → silence, BEAR_LEAN emits line with verdict + counts +
+    coherence_pct + headline, BOOK_BEAR prepends the headline,
+    long lead_headline truncated at 120 chars + ellipsis.
+  - `TestEndpointSmoke` (3) — Flask test_client via the project's
+    `store` conftest fixture (analytics-verification memory: module
+    `__main__` would hit empty `data/` DB), well-formed skeleton, hours
+    clamp at 0/999/garbage, backtest:// + backtest_* + opus_annotation*
+    rows excluded by `_LIVE_ONLY_SQL` invariant.
+
+**Tests.** 34 new + adjacent regression sweep (test_sector_coherence +
+test_sector_pulse) = **70 passed in 2.36s** all green. Chat-handler
+spot-check (test_chat_coverage_gap_enrichment +
+test_chat_baseline_compare_enrichment) = **20 passed**.
+
+**Live verification.** Endpoint contract verified by Flask test_client
+per the `paper-trader analytics verification` memory (also applies on
+the DI side — `python -m analysis.held_wire_balance` would hit the
+empty `data/articles.db` not the USB-mounted live DB). Live `:8080`
+itself was 404 at ship-time — daemon needs restart to pick up the new
+route; the committed code is inert until restart, the standing operator
+pattern.
+
+**Staging.** Explicit per-file pathspec across one commit:
+`analysis/held_wire_balance.py`, `dashboard/web_server.py`,
+`tests/test_held_wire_balance.py`, and this AGENTS.md update. Working
+copy carries foreign uncommitted changes at start (sibling agents'
+edits to `storage/db_health.py`, `collectors/`, plus untracked tests);
+all left untouched. No `git add -A` (concurrent-agent footgun memory).

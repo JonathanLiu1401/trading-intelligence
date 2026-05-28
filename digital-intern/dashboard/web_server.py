@@ -4254,6 +4254,56 @@ def _sector_pulse_chat_lines(pulse: Any) -> list:
 
 
 _SECTOR_COHERENCE_MAX_CHAT_LINES = 5
+_HELD_WIRE_BALANCE_MAX_CHAT_LINES = 5
+
+
+def _held_wire_balance_chat_lines(rep: Any) -> list:
+    """Render the per-held-ticker wire-balance report as compact chat lines.
+
+    Silence-on-healthy in the ``_sector_coherence_chat_lines`` mould: only
+    surface held names whose verdict is ``BEAR_LEAN`` — the case where the
+    wire opposes the desk's long bias on a held position. ``BULL_LEAN``
+    names are aligned-with-book good news (no operator action needed);
+    ``MIXED`` and ``INSUFFICIENT`` collapse to silence — chat filler is
+    never information.
+
+    Pure / total — the ``_sector_coherence_chat_lines`` contract: non-dict
+    / empty / no actionable names → ``[]`` (block omitted, never an
+    exception into the chat handler).
+    """
+    if not isinstance(rep, dict):
+        return []
+    per = rep.get("per_ticker")
+    if not isinstance(per, list) or not per:
+        return []
+    bear = [
+        t for t in per
+        if isinstance(t, dict) and t.get("verdict") == "BEAR_LEAN"
+    ]
+    if not bear:
+        return []
+    lines = []
+    # The BOOK_BEAR headline is the most-actionable single line; prepend it
+    # when the book itself has tipped bearish — operators want the summary
+    # before the per-name detail (mirrors `_sector_coherence_chat_lines`
+    # which surfaces the actionable sector verdicts directly).
+    book_verdict = rep.get("book_verdict")
+    if book_verdict == "BOOK_BEAR":
+        headline = rep.get("headline")
+        if isinstance(headline, str) and headline:
+            lines.append(headline)
+    for t in bear[:_HELD_WIRE_BALANCE_MAX_CHAT_LINES]:
+        try:
+            lead = t.get("lead_headline") or ""
+            lead_cut = (lead[:120] + "…") if len(lead) > 120 else lead
+            lines.append(
+                f"{t.get('ticker', '?')} BEAR_LEAN "
+                f"({t.get('n_bear')}↓ of {t.get('n_classified')} "
+                f"classified, {t.get('coherence_pct')}% coh) · {lead_cut}"
+            )
+        except Exception:  # noqa: BLE001 — a chat block must never raise
+            continue
+    return lines
 
 
 def _sector_coherence_chat_lines(rep: Any) -> list:
@@ -5602,6 +5652,51 @@ def create_app(store=None) -> Flask:
         try:
             from analysis.sector_coherence import build_sector_coherence
             return jsonify(build_sector_coherence(arts, window_hours=hours))
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.get("/api/held-wire-balance")
+    def api_held_wire_balance():
+        """Per-held-ticker bull/bear coherence — the per-name companion to
+        ``/api/sector-coherence``. SECTOR-COHERENCE answers "is the wire
+        agreeing on a direction at the sector level?"; HELD-WIRE-BALANCE
+        answers the per-name follow-up: "is the wire on *my specific held
+        names* aligned with my long bias?".
+
+        Pure SQL over the same live-only article rows; honours
+        ``_LIVE_ONLY_SQL`` so backtest-injected rows are excluded.
+        Held universe is ``ml.features.LIVE_PORTFOLIO_TICKERS`` (matches
+        ``/api/held-news-silence``). ``?hours=`` clamped 1..168 (default 24).
+        Observational only — never gates Opus.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            hours = int(request.args.get("hours", 24))
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(168, hours))
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT title, ai_score, first_seen FROM articles "
+                f"WHERE first_seen >= ? AND {_LIVE_ONLY_SQL} "
+                "ORDER BY first_seen DESC LIMIT 4000",
+                (since,),
+            )
+        except sqlite3.Error:
+            rows = []
+        arts = [
+            {"title": r[0] or "", "ai_score": float(r[1] or 0),
+             "first_seen": r[2]}
+            for r in rows
+        ]
+        try:
+            from analysis.held_wire_balance import build_held_wire_balance
+            return jsonify(build_held_wire_balance(
+                arts, window_hours=hours))
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
@@ -7596,6 +7691,11 @@ def create_app(store=None) -> Flask:
         # idiosyncratic (in which case sector-wide positioning is wrong)?
         # Reuses the same SQL fetch as sector-pulse so we don't double-query.
         sector_coherence_block = ""
+        # Per-held-ticker companion: BEAR_LEAN on a held name = wire opposes
+        # the desk's long bias. Reuses the same 24h sp_arts fetch; initialised
+        # at the outer scope so the f-string reference is always bound even if
+        # the sector-pulse fetch itself raises.
+        held_wire_balance_block = ""
         try:
             sp_since = (
                 datetime.now(timezone.utc) - timedelta(hours=24)
@@ -7624,6 +7724,20 @@ def create_app(store=None) -> Flask:
             except Exception as e2:  # noqa: BLE001 — never sink the chat
                 _logger().warning(
                     "chat: sector-coherence build failed: %s", e2)
+            # Per-held-ticker wire-balance: companion to sector-coherence,
+            # reuses the same 24h article fetch. Silence-on-healthy: only
+            # emits when at least one held name is BEAR_LEAN (wire opposes
+            # the desk's long bias). Healthy/BULL_LEAN names produce no
+            # chat line — the chat-pattern memory `silence-on-healthy`.
+            try:
+                from analysis.held_wire_balance import build_held_wire_balance
+                hwb = build_held_wire_balance(sp_arts, window_hours=24)
+                held_wire_balance_block = "\n".join(
+                    _held_wire_balance_chat_lines(hwb))
+            except Exception as e3:  # noqa: BLE001 — never sink the chat
+                _logger().warning(
+                    "chat: held-wire-balance build failed: %s", e3)
+                held_wire_balance_block = ""
         except Exception as e:  # noqa: BLE001 — never sink the chat
             _logger().warning("chat: sector-pulse fetch failed: %s", e)
 
@@ -9418,6 +9532,7 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER OPTIONS GREEKS (Black-Scholes, live IV):\n{greeks_block}\n\n" if greeks_block else "")
             + (f"NEWS SECTOR PULSE (native — where the wire is concentrated right now, recency-weighted, last 24h; independent of the price heatmap below so it survives a stale/down paper-trader):\n{sector_pulse_block}\n\n" if sector_pulse_block else "")
             + (f"NEWS SECTOR COHERENCE (per-sector bullish/bearish stance dispersion across the same 24h wire — the companion to PULSE that answers the structural question PULSE cannot: is the concentration a MACRO STORY all agreeing on direction (sector-wide positioning is the trade) or IDIOSYNCRATIC catalysts pulling in different directions (sector-wide positioning is the wrong move, name-level only)? Surfaced ONLY when at least one sector reaches MACRO_BULL / MACRO_BEAR / TILT_BULL / TILT_BEAR; SPLIT / INSUFFICIENT / no-news collapses to silence. Headline + per-sector verdict carry verbatim from the builder — restate, never re-derive):\n{sector_coherence_block}\n\n" if sector_coherence_block else "")
+            + (f"HELD-WIRE BALANCE (per-held-ticker bullish/bearish stance from the same 24h wire — the per-NAME companion to SECTOR COHERENCE. SECTOR COHERENCE answers 'is the wire agreed on a direction at the sector level?'; HELD-WIRE BALANCE answers the per-name follow-up 'is the wire on MY SPECIFIC HELD names aligned with my long bias, or quietly opposing it?'. A sector can be MACRO_BULL while the wire on the specific held single-name (LITE, AXTI, QBTS) is bearish — that is the structural gap between sector positioning and name-level positioning, invisible to every other block. Silence-on-healthy: surfaced ONLY when at least one held name reaches BEAR_LEAN (wire opposes the desk's long bias). BULL_LEAN names are aligned-with-book good news — collapse to silence. MIXED / INSUFFICIENT also silence: chat filler is not information. BOOK_BEAR additionally prepends the headline so the operator sees the book-level verdict before the per-name detail. Per-name n_bear / n_classified / coherence_pct / lead_headline carry verbatim from the builder — restate, never re-derive):\n{held_wire_balance_block}\n\n" if held_wire_balance_block else "")
             + (f"NEWS SENTIMENT REVERSAL (native — per-ticker avg ml_score sign-flip between consecutive 2h windows (PREV [4h, 2h ago) → CURR [2h ago, now)). The directional-change view PULSE/COHERENCE cannot compose: those answer the SECTOR-level question, this answers the per-TICKER question 'which positions have just had the news turn against (or toward) the thesis?'. Both windows are gated to ≥ MIN_ARTICLES articles so single-row noise can't fire a flip. Surfaced ONLY when at least one reversal qualifies; zero-reversal windows collapse to silence — never chat filler when the wire is directionally stable. Per-ticker direction + prev → curr means + article counts carry verbatim from the builder — restate, never re-derive):\n{sentiment_reversal_block}\n\n" if sentiment_reversal_block else "")
             + (f"NEWS TICKER-SCORE DISPERSION (native — per-ticker intra-window std-dev of ml_score over the last 24h. The within-window consensus companion to SENTIMENT REVERSAL: reversal asks 'did the direction flip across windows?'; dispersion asks 'are the articles WITHIN the current window AGREEING or DISAGREEING on this ticker?'. A ticker with five articles all scoring 7.5–8.0 is consensus; the same mean spread 1.0–9.5 is contested news — structurally different signals invisible to every other panel that only carries the mean. Surfaced ONLY when MIXED_BOOK / CONFLICTED_NEWS (CONSENSUS / NO_DATA / NO_DISPERSION collapse to silence — never filler when the wire is consistent). Per-ticker n / mean / std / [min, max] carry verbatim from the builder — restate, never re-derive):\n{ticker_score_dispersion_block}\n\n" if ticker_score_dispersion_block else "")
             + (f"NEWS TICKER VELOCITY (native — top tickers by raw arrival-count ratio recent vs prior, 2h vs 2h prior. The arrival-VOLUME axis sibling of REVERSAL (cross-window direction) and DISPERSION (intra-window consensus): those describe HOW the wire feels about a ticker; this describes HOW MUCH the wire is talking about it. A BREAKING name has both substantial recent count AND a sharp acceleration vs the prior window — the early indicator before the score-based surfaces catch up. Surfaced ONLY when at least one ticker reaches BREAKING / WARMING; QUIET / NO_DATA collapse to silence — never filler when the wire is structurally flat. Per-ticker recent / prior / ratio / newest_age_s carry verbatim from the builder — restate, never re-derive):\n{ticker_velocity_block}\n\n" if ticker_velocity_block else "")
