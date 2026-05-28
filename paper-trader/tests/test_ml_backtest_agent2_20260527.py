@@ -686,6 +686,110 @@ class TestGateKillSwitchDefaults:
         gate, reason = bt._should_gate_modulate_conviction()
         assert gate is True
 
+    def test_anti_predictive_skill_kills_gate(self, tmp_path, monkeypatch):
+        """A persistently NEGATIVE oos_buy_ic (anti-predictive scorer)
+        MUST kill the gate. The gate's per-arm sizing (pred<-10 → ×0.6,
+        pred>+10 → ×1.3) assumes positive rank-IC; with anti-skill the
+        modulation directionality is inverted vs realized returns and
+        the gate actively HURTS sized return rather than abstaining.
+        Live data on 2026-05-28 (trailing-20 median oos_buy_ic = -0.06)
+        triggered exactly this fix.
+
+        The prior ``abs(median_ic) < tolerance`` guard left this case
+        gate-active because |-0.06| > 0.03 — the signed-comparison fix
+        catches it (any median < +0.03 → kill)."""
+        import paper_trader.backtest as bt
+        import json
+        log_path = tmp_path / "skill.jsonl"
+        # 25 rows with median = -0.06 (the live observed case)
+        rows = []
+        for i in range(25):
+            rows.append(json.dumps({
+                "cycle": i, "oos_buy_ic": -0.06,
+            }))
+        log_path.write_text("\n".join(rows) + "\n")
+        monkeypatch.setattr(bt, "_GATE_SKILL_LOG_PATH", log_path)
+        bt._reset_gate_skill_cache()
+        gate, reason = bt._should_gate_modulate_conviction()
+        assert gate is False, (
+            f"Anti-predictive median -0.06 must kill the gate; got "
+            f"gate={gate}, reason={reason!r}"
+        )
+        # The reason string must surface the anti-skill / noise framing
+        # so an operator reading the dashboard understands WHY the gate
+        # is suppressed — not just that it is.
+        assert ("killed" in reason.lower()
+                or "noise" in reason.lower()
+                or "anti" in reason.lower())
+
+    def test_strongly_anti_predictive_skill_kills_gate(self, tmp_path,
+                                                       monkeypatch):
+        """Sanity sibling of the -0.06 case: a much larger anti-skill
+        (-0.20) clearly must kill the gate too. Locks the broader
+        semantic that ANY negative median below tolerance disables it,
+        not just borderline cases — so a future refactor to a
+        magnitude-weighted threshold cannot silently re-introduce the
+        "high |IC|" gap."""
+        import paper_trader.backtest as bt
+        import json
+        log_path = tmp_path / "skill.jsonl"
+        rows = []
+        for i in range(25):
+            rows.append(json.dumps({
+                "cycle": i, "oos_buy_ic": -0.20,
+            }))
+        log_path.write_text("\n".join(rows) + "\n")
+        monkeypatch.setattr(bt, "_GATE_SKILL_LOG_PATH", log_path)
+        bt._reset_gate_skill_cache()
+        gate, _ = bt._should_gate_modulate_conviction()
+        assert gate is False
+
+    def test_borderline_positive_at_tolerance_keeps_gate_active(
+        self, tmp_path, monkeypatch
+    ):
+        """Boundary case: positive skill exactly AT the tolerance keeps
+        the gate active. Pins the inclusive-on-positive-side semantic so
+        a future refactor cannot silently shift the threshold."""
+        import paper_trader.backtest as bt
+        import json
+        log_path = tmp_path / "skill.jsonl"
+        rows = []
+        for i in range(25):
+            rows.append(json.dumps({
+                "cycle": i,
+                "oos_buy_ic": bt._GATE_SKILL_IC_TOLERANCE,  # exactly at
+            }))
+        log_path.write_text("\n".join(rows) + "\n")
+        monkeypatch.setattr(bt, "_GATE_SKILL_LOG_PATH", log_path)
+        bt._reset_gate_skill_cache()
+        gate, _ = bt._should_gate_modulate_conviction()
+        assert gate is True  # median == tolerance ⇒ NOT < tolerance ⇒ active
+
+    def test_borderline_negative_just_below_tolerance_kills_gate(
+        self, tmp_path, monkeypatch
+    ):
+        """Boundary case: a tiny negative median just below the
+        positive tolerance (e.g. -0.001) MUST kill the gate. This is
+        the exact gap the old ``abs()`` guard left open: |-0.001| <
+        0.03 → kill (correctly), but a slightly larger anti-skill like
+        -0.04 had |-0.04| > 0.03 → keep active (incorrectly). Pin both
+        sides of the signed threshold."""
+        import paper_trader.backtest as bt
+        import json
+        log_path = tmp_path / "skill.jsonl"
+        rows = []
+        for i in range(25):
+            rows.append(json.dumps({
+                "cycle": i, "oos_buy_ic": -0.04,
+            }))
+        log_path.write_text("\n".join(rows) + "\n")
+        monkeypatch.setattr(bt, "_GATE_SKILL_LOG_PATH", log_path)
+        bt._reset_gate_skill_cache()
+        gate, _ = bt._should_gate_modulate_conviction()
+        # |-0.04| > 0.03 — under the old abs() guard this stayed
+        # active. The signed-threshold fix kills it.
+        assert gate is False
+
 
 # ---------------------------------------------------------------------------
 # Section 10 — heuristic article scorer
