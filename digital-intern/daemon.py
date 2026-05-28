@@ -168,6 +168,7 @@ from collectors.aaii_sentiment_collector import collect as collect_aaii_sentimen
 from collectors.sec_keyword_monitor import collect as collect_sec_keyword_monitor
 from collectors.dtcc_ftd_collector import collect_dtcc_ftd
 from collectors.etf_fund_flows import collect_etf_flows
+from collectors.conference_board_collector import collect_conference_board
 from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
@@ -305,7 +306,8 @@ MARKET_BREADTH_INTERVAL = 3600    # Finviz market breadth (% above MAs, new high
 MARKET_VALUATION_INTERVAL = 3600 * 4  # S&P 500 P/E, CAPE, earnings yield — every 4h (multpl.com)
 USASPENDING_INTERVAL    = 3600    # USASpending.gov federal contract awards — hourly (new awards rare)
 SEC_XBRL_INTERVAL       = 6 * 3600  # SEC XBRL quarterly financials — every 6h (filings rare)
-ETF_FUND_FLOWS_INTERVAL = 3600      # ETF shares-outstanding delta → fund flows — hourly
+ETF_FUND_FLOWS_INTERVAL     = 3600      # ETF shares-outstanding delta → fund flows — hourly
+CONFERENCE_BOARD_INTERVAL   = 3600 * 4  # Conference Board LEI + CCI — every 4h (monthly data, deduped)
 SEC_13F_INTERVAL        = 1800      # SEC 13F institutional holdings — every 30min (quarterly season)
 SEC_FORM4_INTERVAL      = 300       # SEC Form 4 insider transactions (portfolio tickers) — every 5min
 SEC_MA_DEALS_INTERVAL   = 1800      # SEC M&A deal detector (market-wide keyword search) — every 30min
@@ -459,6 +461,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "aaii_sentiment": AAII_SENTIMENT_INTERVAL,
     "dtcc_ftd": DTCC_FTD_INTERVAL,
     "etf_fund_flows": ETF_FUND_FLOWS_INTERVAL,
+    "conference_board": CONFERENCE_BOARD_INTERVAL,
     "scorer": SCORE_INTERVAL,
     "alert": ALERT_CHECK, "heartbeat": 60, "purge": 300, "stats": 60,
     "ml_trainer": ML_TRAIN_INTERVAL,
@@ -2950,6 +2953,28 @@ def etf_fund_flows_worker(store: ArticleStore):
         _sleep(ETF_FUND_FLOWS_INTERVAL)
 
 
+# ── Worker: Conference Board LEI + CCI — every 4h ────────────────────────────
+def conference_board_worker(store: ArticleStore):
+    log.info("[conference_board_worker] started")
+    bo = Backoff("conference_board", base=300.0, cap=3600.0)
+    while _running:
+        try:
+            articles = collect_conference_board()
+            _ingest(store, articles, "conference_board")
+            try:
+                source_health.record_result("conference_board", len(articles))
+            except Exception as he:
+                log.warning(f"[conference_board_worker] source_health error: {he}")
+            _worker_last_ok["conference_board"] = time.time()
+            log.debug(f"[conference_board_worker] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[conference_board_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(CONFERENCE_BOARD_INTERVAL)
+
+
 # ── Worker: FDA press releases + MedWatch safety alerts — every 30min ────────
 def fda_worker(store: ArticleStore):
     log.info("[fda_worker] started")
@@ -5055,6 +5080,7 @@ def main():
         ("aaii_sentiment", aaii_sentiment_worker),
         ("dtcc_ftd",    dtcc_ftd_worker),
         ("etf_fund_flows", etf_fund_flows_worker),
+        ("conference_board", conference_board_worker),
         ("scorer",      scorer_worker),
         ("alert",       alert_worker),
         ("heartbeat",   heartbeat_worker),
