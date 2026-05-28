@@ -2355,6 +2355,105 @@ class ArticleStore:
         }
 
     @_retry_on_lock
+    def source_urgent_yield(
+        self, hours: int = 24, top_n: int = 15, min_total: int = 20,
+    ) -> dict:
+        """Per-source urgent-yield rate — the analyst-facing "which feeds are
+        net SIGNAL vs net NOISE?" metric the existing per-source siblings
+        cannot answer.
+
+        ``source_throughput`` reports volume (how many articles per source);
+        ``urgency_label_split_by_source`` reports the LLM-vetted *fraction*
+        within urgent rows only. Neither tells the analyst what fraction of
+        a source's TOTAL output reaches urgency>=1 — the actual signal-rate.
+        A 50-article/h feed where 5 are urgent (10% yield) is materially
+        different from a 5,000-article/h feed where 5 are urgent (0.1%
+        yield); the latter is a noise firehose burning scorer budget for
+        the same 5 useful articles. This metric ranks sources by yield so
+        the analyst can prune low-yield high-volume feeds with one query
+        instead of cross-correlating two existing primitives by eye.
+
+        Returns one row per source whose article count in the window is
+        at least ``min_total`` (sources below the floor are too low-volume
+        for a stable rate; the noise of small-N would dominate the
+        ranking):
+
+          * ``source``       — verbatim ``articles.source`` value
+          * ``total``        — articles from this source in the window
+          * ``urgent``       — rows with ``urgency >= 1`` (queued OR alerted)
+          * ``alerted``      — rows with ``urgency = 2`` (fired-to-Discord)
+          * ``urgent_pct``   — ``urgent / total * 100`` (rounded 0.01)
+          * ``alerted_pct``  — ``alerted / total * 100`` (rounded 0.01)
+
+        Rows are sorted ``urgent_pct`` desc — highest-yield (signal-rich)
+        feeders surface at the top, lowest-yield (noise-rich) at the
+        bottom of the truncated tail. Alphabetical tiebreak on ``source``
+        for deterministic, test-pinnable ordering (mirrors
+        ``urgency_label_split_by_source``).
+
+        Read-only (single GROUP BY SELECT) with ``_LIVE_ONLY_CLAUSE`` so
+        synthetic backtest/opus rows never inflate either side of the
+        ratio — the exact discipline the partial-filter regression class
+        (``analytics/trend_velocity.py``) violates. NO DB write, no
+        ai_score/ml_score/score_source/urgency mutation. All four
+        load-bearing invariants intact by construction.
+        """
+        # Defensive clamps — matches the convention of sibling analytics
+        # (``urgency_label_split_by_source`` clamps ``top_n``).
+        hours = max(int(hours), 1)
+        top_n = max(int(top_n), 0)
+        min_total = max(int(min_total), 1)
+
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        # Single aggregation pass: per-source counts at each urgency tier.
+        # SUM(CASE …) is the cheapest way to fold three counts into one
+        # GROUP BY (same shape as ``urgency_label_split``'s GROUP BY
+        # score_source). The ``first_seen >= ?`` filter pushes the window
+        # bound down so we never scan beyond the recent partition.
+        rows = self.conn.execute(
+            "SELECT source, "
+            "  COUNT(*) AS total, "
+            "  SUM(CASE WHEN urgency >= 1 THEN 1 ELSE 0 END) AS urgent, "
+            "  SUM(CASE WHEN urgency = 2 THEN 1 ELSE 0 END) AS alerted "
+            "FROM articles "
+            f"WHERE first_seen >= ? AND {_LIVE_ONLY_CLAUSE} "
+            "GROUP BY source",
+            (since,),
+        ).fetchall()
+
+        materialised: list[dict] = []
+        for source, total, urgent, alerted in rows:
+            total = int(total or 0)
+            if total < min_total:
+                continue
+            urgent = int(urgent or 0)
+            alerted = int(alerted or 0)
+            materialised.append({
+                "source": source or "",
+                "total": total,
+                "urgent": urgent,
+                "alerted": alerted,
+                "urgent_pct": round(100.0 * urgent / total, 2),
+                "alerted_pct": round(100.0 * alerted / total, 2),
+            })
+
+        # Highest yield first; alphabetical on ``source`` for deterministic
+        # tiebreak. Mirrors the sort discipline of
+        # ``urgency_label_split_by_source``.
+        materialised.sort(
+            key=lambda r: (-r["urgent_pct"], r["source"])
+        )
+
+        return {
+            "window_h": hours,
+            "min_total": min_total,
+            "by_source": materialised[:top_n],
+            "total_sources_qualifying": len(materialised),
+        }
+
+    @_retry_on_lock
     def urgency_label_split_by_ticker(
         self, tickers: list[str], hours: int = 24
     ) -> dict:
