@@ -97,6 +97,7 @@ from collectors.yield_curve_spread_collector import collect_yield_curve_spreads
 from collectors.g10_sovereign_yields import collect_g10_yields
 from collectors.fred_collector import collect_fred
 from collectors.fred_production_collector import collect as collect_fred_production
+from collectors.gdpnow_collector import collect_gdpnow
 from collectors.fed_liquidity_collector import collect_fed_liquidity
 from collectors.cftc_cot_collector import collect_cftc_cot
 from collectors.vix_term_structure import collect as collect_vix_ts
@@ -245,6 +246,7 @@ APPSTORE_FINANCE_INTERVAL = 86400  # Apple App Store Finance rankings — once p
 G10_YIELDS_INTERVAL     = 3600    # G10 sovereign yields every 1h (FRED daily/monthly)
 FRED_MACRO_INTERVAL     = 3600    # FRED macro series (claims, M2, rig count, etc.) — hourly
 FRED_PROD_INTERVAL      = 3600    # FRED production/inflation depth (Core PCE, INDPRO, etc.) — hourly
+GDPNOW_INTERVAL         = 3600    # Atlanta Fed GDPNow current-quarter GDP estimate — hourly
 FED_LIQUIDITY_INTERVAL  = 3600    # Fed balance sheet, RRP, TGA, bank reserves — hourly
 COT_INTERVAL            = 6 * 3600  # CFTC COT report — weekly release, check 6-hourly
 TWSE_INTERVAL           = 3600    # Taiwan Stock Exchange semis — hourly (market open 09:00–13:30 TW)
@@ -1832,6 +1834,27 @@ def fred_macro_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(FRED_MACRO_INTERVAL)
+
+
+def gdpnow_worker(store: ArticleStore):
+    log.info("[gdpnow_worker] started")
+    bo = Backoff("gdpnow", base=120.0, cap=3600.0)
+    while _running:
+        try:
+            articles = collect_gdpnow()
+            _ingest(store, articles, "gdpnow")
+            try:
+                source_health.record_result("gdpnow", len(articles))
+            except Exception as he:
+                log.warning(f"[gdpnow_worker] source_health error: {he}")
+            _worker_last_ok["gdpnow"] = time.time()
+            log.debug(f"[gdpnow] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[gdpnow_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(GDPNOW_INTERVAL)
 
 
 def fred_production_worker(store: ArticleStore):
@@ -4932,6 +4955,7 @@ def main():
         ("g10_yields",  g10_yields_worker),
         ("fred_macro",  fred_macro_worker),
         ("fred_production", fred_production_worker),
+        ("gdpnow",      gdpnow_worker),
         ("fed_liquidity",  fed_liquidity_worker),
         ("cftc_cot",    cftc_cot_worker),
         ("vix_ts",      vix_ts_worker),
