@@ -56,7 +56,7 @@ def main() -> int:
         ("score_drift_detector",      "analytics.score_drift_detector",      "main"),
         ("ingest_gap_detector",       "analytics.ingest_gap_detector",       "main"),
         ("stale_source_alerter",      "analytics.stale_source_alerter",      "main"),
-        ("source_quality",            "analytics.source_quality",            "compute"),
+        ("source_quality",            "analytics.source_quality",            "main"),
         ("collection_quality",        "analytics.collection_quality",        "main"),
         ("ticker_sentiment_momentum", "analytics.ticker_sentiment_momentum", "main"),
         ("earnings_preheat",          "analytics.earnings_preheat",          "main"),

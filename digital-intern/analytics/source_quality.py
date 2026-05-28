@@ -113,11 +113,18 @@ def write_snapshot(report: dict, path: Path = OUT_PATH) -> Path:
     return path
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Compute the per-source quality report and persist it to disk."""
     report = compute()
     out = write_snapshot(report)
     print(
-        f"source-quality: scanned {report['scanned']} rows "
-        f"({report['sources_reported']} distinct sources); "
-        f"snapshot={out}"
+        f"source_quality: wrote {out} "
+        f"sources={report['sources_reported']} "
+        f"scanned={report['scanned']} "
+        f"ts={report['generated_at']}"
     )
+    return None
+
+
+if __name__ == "__main__":
+    main()
