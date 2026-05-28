@@ -6,6 +6,189 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-27 core HYBRID pass (Agent 1, fourth cycle) — `_all_cash_streak_line` Discord wiring
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=8
+
+### Phase 1 — no fresh bug surfaced (`bugs_fixed = 0`)
+
+Read all required core files (`runner.py`, `reporter.py`, `signals.py`,
+`strategy.py`, `dashboard.py`, `market.py`, `store.py`) and traced the
+recent commit history. The codebase has had 4+ HYBRID cycles in the
+past 24h and the surfaces I'd normally hunt
+(`_check_and_execute_hard_exits` cash/total_value algebra; quota /
+breaker latch interaction; `_db_path` freshness resolver; `_execute`
+hard SL/TP stamping; option-expired intrinsic settlement;
+`_is_quota_exhausted` markers; mid-call host re-probe; sibling
+restart-grace deadman) all already carry their pinned tests and
+defensive doc-comments.
+
+Ran the focused core suite (`test_core_*.py`): **437 passed, 1
+skipped in 35.7s**. No regressions. Honest "no commit" — Phase 1
+guard says explicitly: don't fabricate a bug-fix when the codebase
+is clean. Moved straight to Phase 2.
+
+### Phase 2 — Feature: `_all_cash_streak_line` closes the dashboard→Discord gap (`features_added = 1`)
+
+The `all_cash_streak` analytics builder
+(`paper_trader/analytics/all_cash_streak.py`) computes the
+*contiguous* all-cash-tenure verdict (EXTENDED_HOLDOUT 6-48h /
+PROLONGED_HOLDOUT ≥48h) plus an alpha-cost vs SPY for the streak
+window. It is wired into the dashboard via `/api/all-cash-streak`
+(`dashboard.py:14949`) but the operator paged on Discord never opens
+it — and a TDD test file
+(`tests/test_all_cash_streak_reporter.py`) was sitting *untracked*
+with 13 failing tests expecting `reporter._all_cash_streak_line(store)`
+to exist. Stalled feature from a prior cycle.
+
+The reporter helper closes that gap:
+
+| Existing Discord line | What it reads |
+|-----------------------|---------------|
+| `_capital_pulse_line` | Cash fraction *state* (PINNED / FREE / BLEEDING) |
+| `_idle_opportunity_line` | What was missed while idle |
+| `_cash_conviction_fit_line` | Whether current cash size matches signal |
+| `_all_cash_streak_line` (NEW) | *Duration* of the contiguous all-cash run (EXTENDED / PROLONGED only) |
+
+A FREE book that has held nothing for 50h while SPY rallied is the
+exact under-deployment a desk reviews before adding risk — and
+CAPITAL alone doesn't carry duration, CASH FIT alone doesn't carry
+state-tenure.
+
+**Helper contract:**
+- Composes `build_all_cash_streak` **verbatim** (SSOT invariant #10):
+  uses `store.equity_curve(limit=5000)` — identical to the endpoint.
+- Suppression — only `EXTENDED_HOLDOUT` and `PROLONGED_HOLDOUT`
+  surface. `BRIEF_HOLDOUT` / `NOT_ALL_CASH` / `INSUFFICIENT_HISTORY` /
+  `NO_DATA` / non-dict / empty-headline / builder-exception → `""`
+  (the `_streak_line` / `_hold_discipline_line` silence-by-default
+  precedent — the summary must never become its own lying green
+  light).
+- `PROLONGED_HOLDOUT` carries the `⚠️` prefix (action-required tier);
+  `EXTENDED_HOLDOUT` ships unprefixed (the banked-vs-paper /
+  engine-latch precedent — milder tier rendered without the alarm
+  emoji).
+- Never raises — any builder/store fault degrades to `""` (the
+  rest-of-`reporter` discipline).
+
+**Wiring:**
+- `send_hourly_summary` — right after `_capital_pulse_line` and before
+  `_cash_conviction_fit_line`. The natural sequence in the CAPITAL
+  cluster: state (CAPITAL) → duration (CASH STREAK) → sizing-vs-signal
+  (CASH FIT) → concrete buy list (DEPLOY PLAN).
+- `send_daily_close` — same placement, same rationale. Mirrors the
+  hourly cluster exactly.
+
+**Tests** (`tests/test_all_cash_streak_reporter.py`, 13 cases): both
+helper-level (NO_DATA / INSUFFICIENT / NOT_ALL_CASH / BRIEF /
+EXTENDED / PROLONGED) AND wiring-level (the helper IS called from
+both summary functions; suppression propagates — a silent helper
+leaves no header in the body). The fixture for the BRIEF and
+EXTENDED cases is anchored to `datetime.now(timezone.utc)` (not
+fixed historical timestamps) so the test stays deterministic
+regardless of when it runs — the builder keys its verdict off
+`hours_elapsed_to_now` (now - start_ts), so a fixed
+`"2026-05-27T08:00"` fixture flips from BRIEF to EXTENDED to
+PROLONGED as wall-clock advances. NOW-relative anchoring tests the
+semantic intent. Commit `f49fa78`.
+
+### Phase 3 — Live trader validation (`user_findings = 8`)
+
+Polled live API endpoints + tailed runner activity. Findings:
+
+1. **Live trader IS currently NOT all-cash** — MU position
+   ($928, 77.4% of book). New helper returns `""` on the next
+   hourly per the suppression contract. The historical track
+   shows a 19.41h all-cash streak yesterday (2026-05-26 17:16 →
+   2026-05-27 12:41 UTC), which WOULD have surfaced as
+   `EXTENDED_HOLDOUT` had the helper existed. The feature lands
+   ahead of the next instance.
+
+2. **NO_DECISION rate elevated** — 52% all-time, 44.2% of last
+   120 cycles. Dominant cause: `cli_nonzero_rc` (72%, 18/25 of
+   the last 50). Known host-saturation pattern
+   ([[pt-no-decision-host-saturation]]). The current box reads
+   clear (`opus_count=3`, `load_per_cpu=1.3`, mem 2.2GB avail)
+   but `pulse.state=STARVED` because the decision log still
+   carries the recent storm's damage.
+
+3. **Build SHA stale** — `boot_sha=6b4274b head_sha=f49fa78
+   behind=2`. The runner needs a restart to load my new helper
+   (the git-watcher will request it after the next 180s tick;
+   the deferred restart fires between cycles).
+
+4. **`paper-trader.service` systemd unit in restart loop**
+   (counter ≥29 over ~15s ticks). Known historical
+   ([[pt-systemd-vs-manual-restart-spam]]) — the trader runs as
+   manual PID 706459; the unit fails on singleton-guard
+   rejection by design. Don't "fix".
+
+5. **MU 77.4% concentration → SINGLE_NAME_RISK fires** on
+   `/api/risk` (`concentration_warning=true`,
+   `concentration_severity=HIGH`). Opus's reasoning explicitly
+   accepts it ("1 share = 77% of book is sized to the
+   momentum thesis"). `_concentration_line` would surface this
+   on the next hourly.
+
+6. **`/api/today-realized-pl` reads `NO_CLOSES_TODAY`** despite
+   the MU SELL at 20:09 UTC today — this is finding #1 of the
+   prior cycle (reactivation overwrites `closed_at` back to
+   NULL on re-entry; the closed-positions walker can't see the
+   round-trip). Endpoint logic is correct; the upstream data
+   gap inherits.
+
+7. **`/api/empty-claude-rate` rate_recent_pct=19.5%** — 39/200
+   recent decisions hit the model-empty signature. Trend is
+   improving (last empty was 98.5min ago).
+
+8. **Engine performance excellent** — +19.95% from $1000 start
+   in ~8 days. Concentration thesis on MU has hit HARD_TP
+   twice (locked +20% gains each time), now re-entered for the
+   third pass.
+
+### Phase 4 — Files touched
+
+```
+paper_trader/reporter.py                          (+96 lines: _all_cash_streak_line helper + 2 wiring blocks)
+tests/test_all_cash_streak_reporter.py            (now tracked — 295 lines / 13 tests; 2 fixtures NOW-anchored)
+AGENTS.md                                         (this section)
+```
+
+### Test commands
+
+```bash
+# This pass's focused suite
+python3 -m pytest tests/test_all_cash_streak_reporter.py -v
+
+# Reporter regression (~2 min, 428 passed)
+python3 -m pytest tests/test_core_reporter.py -q
+
+# The new helper live (after runner restart)
+curl -s http://localhost:8090/api/all-cash-streak | jq '{verdict, headline}'
+
+# CLI for ops
+python3 -m paper_trader.analytics.all_cash_streak
+```
+
+### How `_all_cash_streak_line` reads on Discord
+
+A 50h all-cash run with SPY +1.2% during the window:
+```
+⚠️ **CASH STREAK** ◈ PROLONGED_HOLDOUT
+> all-cash 50.3h on $1199.52; SPY +1.20% → cash cost $14.39 — PROLONGED_HOLDOUT
+```
+
+A 12h all-cash run with SPY flat:
+```
+**CASH STREAK** ◈ EXTENDED_HOLDOUT
+> all-cash 12.1h on $1199.52; SPY +0.05% → cash cost $0.60 — EXTENDED_HOLDOUT
+```
+
+A < 6h run, a deployed book, or NO_DATA → no line ships (the
+silence-when-nothing-actionable precedent).
+
+---
+
 ## 2026-05-27 core HYBRID pass (Agent 1, third cycle) — orphan `_quota_first_ts` cleanup symmetry gap + `/api/today-realized-pl`
 
 **Counters:** bugs_fixed=1 · features_added=1 · user_findings=8
