@@ -5,6 +5,128 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-27 HYBRID pass (Agent 3, pass #5) — `source_urgent_yield` analytics primitive
+
+**Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=5`.
+
+### Phase 1 — Debug & fix (0 bugs, honest zero)
+
+Audited the code per the task spec: backtest isolation (`tests/test_article_store.py`
+TestBacktestIsolation), score_source separation (TestScoreSourceSeparation), feature dim /
+ticker density (`tests/test_features.py`), urgency threshold (`tests/test_urgency_scorer.py`),
+trainer score-source exclusion + weight ordering (`tests/test_trainer.py`). All pre-existing
+tests pass on baseline — focused suite 88 tests in 21s, no failures. Reviewed the four most
+likely subtle-bug areas (`score_pending`'s ts_updates condition, `update_scores_from_labels`'s
+MAX clobber semantics, the `_book_tickers` ordering difference between alert_agent and
+claude_analyst, the `_INFER_LOCK` coordination between `score_pending` and
+`daemon.scorer_worker`): each turned out to be deliberate documented behaviour. No commit per
+the Phase 1 guard rule — honest zero rather than synthetic find.
+
+### Phase 2 — Feature dev (1 feature: `source_urgent_yield`)
+
+**What.** `ArticleStore.source_urgent_yield(hours=24, top_n=15, min_total=20)` — per-source
+urgent-yield rate, the missing analytics primitive answering "which feeds are net SIGNAL vs
+net NOISE?" that the two existing per-source siblings cannot:
+
+  - `source_throughput(window_min)` reports **volume** (articles/source) — silent on signal
+  - `urgency_label_split_by_source(hours)` reports **LLM-vetted fraction within urgent rows
+    only** — silent on the urgent/total ratio (the actual signal-rate)
+
+A 50-article/h feed with 5 urgent (10% yield) is materially different from a 5,000-article/h
+feed with 5 urgent (0.1% yield); both look identical in the throughput surface and identical
+again in `urgency_label_split_by_source` (both have 5 urgent rows that may be all-LLM-vetted).
+The new method ranks by yield so the analyst can prune low-yield high-volume feeds with one
+query instead of cross-correlating two existing primitives by eye.
+
+**Returns.** One row per source whose article count in the window is at least `min_total`
+(small-N noise would dominate the ranking otherwise — a 2-article feed with 1 urgent reads
+as 50% yield):
+
+  - `source`, `total`, `urgent` (urgency>=1), `alerted` (urgency=2)
+  - `urgent_pct = 100 * urgent / total`, `alerted_pct = 100 * alerted / total`
+
+Sort: `urgent_pct` desc, `source` alphabetical tiebreak (mirrors
+`urgency_label_split_by_source`'s deterministic convention).
+
+**Live evidence (24h on production DB, min_total=50).**
+  - `GN: Nvidia` 138 articles → 19 urgent → **13.77% yield** (top signal feeder)
+  - `GN: dividend buyback` 67 → 8 → **11.94%** (legitimate corporate-action wire)
+  - `Finnhub/Benzinga` 52 → 6 → **11.54%** (paid wire — high signal density)
+  - `stocktwits` 1135 → 48 → **4.23%** (highest volume but relatively low signal —
+    corroborates the recent chatter pre-floor work; the pre-floor moved the needle from
+    chatter dominating to chatter capped at 4.23%)
+  - `GN: semiconductor` 146 → 6 → **4.11%** (general sector news — expected lower than the
+    held-name-specific GN: Nvidia feed)
+
+**Invariants intact (all four).**
+  - Backtest isolation: `_LIVE_ONLY_CLAUSE` applied so synthetic rows never inflate either
+    side of the ratio. Pinned by `TestBacktestIsolation::test_excludes_backtest_urls`,
+    `test_excludes_backtest_source_tag`, `test_excludes_opus_annotation_source`.
+  - ml_score ↔ ai_score separation: pure SELECT, no write — invariant tautologically intact.
+  - score_source: untouched (read-only).
+  - urgency: untouched (read-only). Pinned by `TestReadOnlyInvariant::test_does_not_mutate_articles`.
+
+**Files:**
+  - `storage/article_store.py` — added `source_urgent_yield` method after
+    `urgency_label_split_by_source` (+99 lines, single SQL aggregation via `SUM(CASE ...)`).
+  - `tests/test_source_urgent_yield.py` — 13 new tests pinning yield calculation, ranking,
+    `min_total` floor, backtest isolation (3 tests), window filter, read-only mutation
+    invariant, top_n cap.
+
+**Test counts.** New feature suite: 13 passed in 0.67s. Focused regression suite
+(test_article_store + test_features + test_model + test_trainer + test_urgency_scorer +
+test_alert_agent + test_source_urgent_yield): 101 passed in 6.01s, zero failures.
+
+### Phase 3 — Live news-analyst findings (5)
+
+Against `/media/zeph/projects/digital-intern/db/articles.db` at 2026-05-28T05:30Z:
+
+1. **94% of alerts in 24h are ML-only** — `urgency_label_split(hours=24)` returns
+   `total=190, llm=20, ml=170, briefing_boost=0, llm_fraction=0.1053`. Same pattern as
+   pass-4. The Sonnet urgency_scorer path is rarely engaged because the ML head's grey-zone
+   routing band (LLM_ZONE_MID_LO..HI = 7.0..8.5 on the urgency head) is narrow. The
+   `[unverified — model-only urgent]` calibration tag in the alert prompt already hedges
+   per-row; the new `source_urgent_yield` adds the orthogonal yield-rate slice.
+
+2. **Briefing path HEALTHY** — `briefing_health(window_h=24)` returns
+   `{last_briefing_age_h: 0.08, count_in_window: 3, expected_in_window: 4.8, verdict:
+   HEALTHY}`. Latest briefing (2026-05-28T05:28Z) leads on the H200 GPU price-drop / NVDA
+   pricing-power crack story; 50 articles, 2737 chars, accurate market data, named held
+   positions (LITE, LNOK, MUU, DRAM CALL C59). Reads cleanly. The 16h gap noted in pass-4
+   has resolved itself — Opus quota recovered.
+
+3. **DB lock-contention pressure persists, low-frequency** — `[twse_semiconductor_worker]
+   error: database is locked; backing off 60s` recurring in `daemon.log`. The `@_retry_on_lock`
+   decorator absorbs most; one error/min surfaces during writer-contention storms. Known
+   structural cost of `check_same_thread=False`; long-term fix is per-call connection
+   isolation for hot readers (mirrors `dashboard._ro_query`). Not a fresh bug.
+
+4. **`source_urgent_yield` immediately surfaces an actionable insight** — running it on the
+   live DB shows GN: Nvidia (13.77%) and GN: dividend buyback (11.94%) are the highest-yield
+   non-mainstream feeders, well above the GDELT / scraped baseline. The Google News
+   topic-feeds approach is producing materially more signal-per-article than the broad GDELT
+   firehose — supports keeping the GN: topic-feed allocation high and considering pruning
+   low-yield high-volume feeds the new method can now rank.
+
+5. **External API throttling — FRED + USB drive** — `[yield_curve_collector] fetch DGS10
+   failed: Read timed out (15s)` and `[fred_production] fetch failed PERMIT/DGORDER: Read
+   timed out (45s)` recurring in 24h. FRED rate-limiting / network blips. Known external
+   chronic-dark pattern (see `memory/di-chronic-dark-collectors.md`); the briefing's COVERAGE
+   GAP block surfaces this honestly.
+
+### Phase 4 — Docs & verify
+
+This section. Final verify:
+  - `python3 -c "import sys; sys.path.insert(0, '.'); from storage import article_store; from ml import features, model; print('imports OK')"` → `imports OK`.
+  - `pytest tests/test_source_urgent_yield.py tests/test_article_store.py tests/test_features.py tests/test_model.py tests/test_trainer.py tests/test_urgency_scorer.py tests/test_alert_agent.py -q` → 101 passed in 6.01s.
+
+**Staging discipline.** Per-commit explicit pathspec (`memory/di-shared-repo-concurrency.md`).
+This pass touches exactly two files: `storage/article_store.py`,
+`tests/test_source_urgent_yield.py` (new), plus this AGENTS.md entry. No `git add -A`,
+no `.json` / `config/` / `data/` / `logs/` staged. `git diff --staged` verified before commit.
+
+---
+
 ## 2026-05-27 HYBRID pass (Agent 3, pass #4) — scorer-killer + worker-sleep regressions
 
 **Counters:** `bugs_fixed=3`, `features_added=1`, `user_findings=5`.
