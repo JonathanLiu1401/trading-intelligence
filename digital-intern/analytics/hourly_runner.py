@@ -74,6 +74,7 @@ def main() -> int:
         ("ticker_signal_noise",       "analytics.ticker_signal_noise",       "main"),
         ("hourly_urgency_quality",    "analytics.hourly_urgency_quality",    "main"),
         ("ml_confidence_tracker",     "analytics.ml_confidence_tracker",     "main"),
+        ("db_lock_tax",               "analytics.db_lock_tax",               "main"),
     ]
 
     for short_name, mod_path, fn_name in module_specs:
