@@ -126,6 +126,7 @@ from collectors.un_news_collector import collect_un_news
 from collectors.globenewswire_collector import collect_globenewswire
 from collectors.prnewswire_collector import collect as collect_prnewswire
 from collectors.short_seller_collector import collect_short_sellers
+from collectors.robinhood_popular_collector import collect_robinhood_popular
 from collectors.financial_blogs_collector import collect_financial_blogs
 from collectors.hackernews_collector import collect_hackernews
 from collectors.clinical_trials_collector import collect_clinical_trials
@@ -291,7 +292,8 @@ AAII_SENTIMENT_INTERVAL = 3600 * 6  # AAII weekly survey — re-check every 6h (
 DTCC_FTD_INTERVAL       = 3600 * 4  # DTCC fails-to-deliver (bi-monthly, deduped by period) — every 4h
 GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
 PRNEWSWIRE_INTERVAL     = 600     # PR Newswire press releases (general + financial feeds) — every 10min
-SHORT_SELLER_INTERVAL   = 1800    # Short-seller research reports (rare, high-priority) — every 30min
+SHORT_SELLER_INTERVAL      = 1800    # Short-seller research reports (rare, high-priority) — every 30min
+ROBINHOOD_POPULAR_INTERVAL = 3600    # Robinhood 100 most-popular (retail sentiment) — hourly, deduped daily
 FINANCIAL_BLOGS_INTERVAL = 600    # InvestorPlace, Motley Fool, Nasdaq RSS — every 10min
 HACKERNEWS_INTERVAL     = 300     # Hacker News front-page + finance/business stories — every 5min
 CLINICAL_TRIALS_INTERVAL = 3600   # ClinicalTrials.gov Phase 3 catalyst tracker (pharma/biotech) — hourly
@@ -356,7 +358,7 @@ ALL_WORKERS = (
     "google_news", "nitter", "substack",
     "finnhub", "alphavantage", "polygon", "massive", "newsapi",
     "yahoo_ticker_rss", "market_movers", "yahoo_trending", "wikipedia", "wiki_pageviews", "macro_calendar", "tic", "short_interest",
-    "fed_press", "ecb_press", "boj_press", "boe_press", "eia", "shipping_intelligence", "bls", "bea", "g10_cb", "global_reg", "whitehouse",
+    "fed_press", "ecb_press", "boj_press", "boe_press", "eia", "shipping_intelligence", "bls", "bea", "g10_cb", "global_reg", "whitehouse", "robinhood_popular",
     "usgs_quake", "fda",
     "scorer", "alert", "heartbeat", "purge", "stats",
     "ml_trainer", "continuous_trainer", "recursive_labeler", "price_alert",
@@ -427,6 +429,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "globenewswire": GLOBENEWSWIRE_INTERVAL,
     "prnewswire": PRNEWSWIRE_INTERVAL,
     "short_seller": SHORT_SELLER_INTERVAL,
+    "robinhood_popular": ROBINHOOD_POPULAR_INTERVAL,
     "financial_blogs": FINANCIAL_BLOGS_INTERVAL,
     "hackernews": HACKERNEWS_INTERVAL,
     "clinical_trials": CLINICAL_TRIALS_INTERVAL,
@@ -3075,6 +3078,28 @@ def short_seller_worker(store: ArticleStore):
         _sleep(SHORT_SELLER_INTERVAL)
 
 
+# ── Worker: Robinhood 100 most-popular (retail sentiment) — hourly ───────────
+def robinhood_popular_worker(store: ArticleStore):
+    log.info("[robinhood_popular_worker] started")
+    bo = Backoff("robinhood_popular", base=120.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_robinhood_popular()
+            _ingest(store, articles, "robinhood_popular")
+            try:
+                source_health.record_result("robinhood_popular", len(articles))
+            except Exception as he:
+                log.warning(f"[robinhood_popular_worker] source_health error: {he}")
+            _worker_last_ok["robinhood_popular"] = time.time()
+            log.debug(f"[robinhood_popular] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[robinhood_popular_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(ROBINHOOD_POPULAR_INTERVAL)
+
+
 # ── Worker: InvestorPlace / Motley Fool / Nasdaq RSS — every 10min ───────────
 def financial_blogs_worker(store: ArticleStore):
     log.info("[financial_blogs_worker] started")
@@ -4955,6 +4980,7 @@ def main():
         ("globenewswire", globenewswire_worker),
         ("prnewswire",  prnewswire_worker),
         ("short_seller", short_seller_worker),
+        ("robinhood_popular", robinhood_popular_worker),
         ("financial_blogs", financial_blogs_worker),
         ("hackernews",     hackernews_worker),
         ("clinical_trials", clinical_trials_worker),
