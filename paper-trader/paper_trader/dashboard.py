@@ -8301,6 +8301,55 @@ def backtest_compare():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/backtests/trade-delta")
+def backtest_trade_delta():
+    """Trade-level diff between two backtest runs.
+
+    Query: ``/api/backtests/trade-delta?ids=100,105`` (exactly two ids,
+    A then B). Returns the trades A made but B didn't (``only_in_a``),
+    the symmetric reverse (``only_in_b``), the shared trades with
+    qty/price deltas (``common``), and a per-ticker realized-P/L
+    attribution over the unique sides — answering the follow-up
+    ``/api/backtests/compare`` *cannot*: which trades drove the
+    return delta?
+
+    Pure aggregation on top of ``BacktestStore.run_detail`` — no new
+    state. The FIFO BUY→SELL pairing is the same algorithm
+    ``backtest_compare`` uses for its win-rate metric (SSOT — keep
+    the two algorithms identical so both endpoints' ticker-level
+    dollar attributions stay consistent).
+    """
+    raw_ids = request.args.get("ids", "").strip()
+    if not raw_ids:
+        return jsonify({"error": "missing ids — e.g. ?ids=100,105"}), 400
+    try:
+        ids = []
+        for tok in raw_ids.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            ids.append(int(tok))
+    except (TypeError, ValueError):
+        return jsonify({"error": "ids must be comma-separated integers"}), 400
+    if len(ids) != 2:
+        return jsonify(
+            {"error": "exactly two ids required — e.g. ?ids=100,105"}
+        ), 400
+    if ids[0] == ids[1]:
+        return jsonify({"error": "ids must be distinct"}), 400
+    try:
+        from .backtest import BacktestStore
+        from .analytics.backtest_trade_delta import build_trade_delta
+        store = BacktestStore()
+        a_detail = store.run_detail(ids[0])
+        b_detail = store.run_detail(ids[1])
+        if a_detail is None and b_detail is None:
+            return jsonify({"error": "neither run found"}), 404
+        return jsonify(build_trade_delta(a_detail, b_detail))
+    except Exception as e:  # noqa: BLE001 — ERROR envelope per house style
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/backtests/<int:run_id>/trades")
 def backtest_trades(run_id: int):
     try:
@@ -16509,6 +16558,27 @@ def _swr_prewarm():
         # historical distribution. Same freeze-triage cold-stall blind
         # spot test_swr_prewarm_coverage locks against.
         ("setup-analogues", setup_analogues_api),
+        # The four endpoints below were @swr_cached but never added to this
+        # prewarm list — same freeze-triage cold-stall blind spot the
+        # test_swr_prewarm_coverage invariant catches. Restored 2026-05-28.
+        #   sector_pulse: ~17 yfinance get_prices + get_quant_signals_live
+        #     round-trips PLUS articles.db read; was the slowest sector card
+        #     on the panel before the SWR wrap (live: 8s+, browser timeout).
+        #   actionable-opportunities: scorer-EV ranking over watchlist —
+        #     articles.db + scorer_predictions joins are slow enough to
+        #     cold-stall.
+        #   off-watchlist-mentions: articles.db SELECT + ticker regex over
+        #     a multi-day window; first poll after a restart is exactly when
+        #     the operator scans for missed rotations.
+        #   spy-valuation: yfinance multi-history fetch — cold yfinance is
+        #     the long-tail latency contributor here.
+        # Each goes back to {"warming": true} for one full TTL after a
+        # restart without this entry; the prewarm==@swr_cached invariant
+        # locks them here so the first poll returns real data.
+        ("sector_pulse", sector_pulse_api),
+        ("actionable-opportunities", actionable_opportunities_api),
+        ("off-watchlist-mentions", off_watchlist_mentions_api),
+        ("spy-valuation", spy_valuation_api),
     ]
     for name, wrapper in targets:
         try:
