@@ -14989,6 +14989,25 @@ def runner_heartbeat_api():
                 hb["claude_call"] = ccs
         except Exception:
             pass
+        # Additive (2026-05-28): granular market-phase block. ``market_open``
+        # is a binary; a trader checking the heartbeat in the middle of a
+        # session needs to know whether it's OPENING_BELL (whipsaw, wide
+        # spreads), MID_SESSION (normal liquidity), or CLOSING_HALF_HOUR
+        # (rebalance flow + post-close earnings imminent) — three regimes a
+        # portfolio manager calibrates conviction differently in. The phase
+        # label already feeds the Opus prompt; this surfaces the same
+        # information to the operator's primary liveness surface plus the
+        # one number a banner needs ("Xm until close" / "opens in Yh"). Same
+        # additive pattern as the singleton_lock / notify / latches /
+        # claude_call blocks: pure composition over ``market.py``'s existing
+        # calendar functions, never overrides the existing verdict.
+        try:
+            from .analytics.market_phase_block import build_market_phase_block
+            mp = build_market_phase_block(_mkt, now=now_utc)
+            if isinstance(mp, dict):
+                hb["market_phase"] = mp
+        except Exception:
+            pass
         return jsonify(hb)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
