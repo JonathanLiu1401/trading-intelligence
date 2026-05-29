@@ -31847,3 +31847,354 @@ Working copy carries foreign uncommitted changes at start (sibling
 agents' edits to `paper_trader/dashboard.py`,
 `paper_trader/reporter.py`, plus digital-intern); all left untouched.
 No `git add -A` per the concurrent-agent footgun memory.
+
+## 2026-05-29 — Agent 2 (ML+backtests) HYBRID review pass
+
+### Phase 1 (debug+fix): no real bugs found
+
+Ran the full ML/backtest test slice (`pytest -k "ml or backtest or
+scorer"`): **1007 passed, 0 failed, 6 sklearn convergence warnings
+(benign)**. The codebase has been through many prior review passes —
+every JSON writer uses the atomic `tmp+.replace` idiom, every cache
+loader has a `isinstance(x, dict|list)` type guard, every analyzer
+has the "never raises, degrades to honest-gap status" discipline.
+Surface bugs are improbable at this maturity. **bugs_fixed=0**, no
+Phase 1 commit per the brief's commit guard.
+
+### Phase 2 (feature): `_append_sector_skill_log` per-cycle ledger
+
+**The gap**: `paper_trader/ml/sector_skill.py` already exposes
+`analyze()` + a `_cli()` that report per-sector OOS rank-IC + verdict
+(`HEALTHY` / `HAS_INVERTED_SECTOR` / `SECTOR_CONCENTRATED` /
+`NO_SECTOR_EDGE` / `INSUFFICIENT_DATA` / `SCORER_UNTRAINED`). It
+answers the decisive sector-level question the aggregate scorer ledger
+cannot: *is the scorer's rank skill UNIFORM across the watchlist, or
+carried by ONE fat sector (the live corpus is ~89% tech)?* But it was
+the **last major skill diagnostic NOT wired into a per-cycle ledger**
+— verdicts were only knowable via manual CLI invocation, so the most
+operational state (`HAS_INVERTED_SECTOR` — a sector whose
+`rank_ic ≤ -0.15` means gating on it is actively harmful) was
+invisible to the unattended loop.
+
+**The wiring**: `run_continuous_backtests.py` gets
+`SECTOR_SKILL_LOG` / `SECTOR_SKILL_LOG_KEEP` module-level constants
+(testability) and a new `_append_sector_skill_log(cycle, win_start,
+win_end, outcomes_path=None)` helper, called in `main()` immediately
+after `_append_persona_regime_skill_log` (the natural sector-axis
+sibling: same outcomes file, same temporal split, same `_spearman`
+SSOT). Follows the sibling `_append_*_skill_log` pattern exactly —
+best-effort never-raises, honest gap rows (`signal_dark=True` when
+corpus < `MIN_RECORDS` or every sector is `SPARSE`), atomic bounded
+trim via `tmp+.replace`, SSOT no-drift (re-uses the analyzer's own
+verdicts/sectors output verbatim).
+
+**Row schema**: flat top-line fields a JSON consumer can query
+without parsing the nested `sectors` list:
+
+* `cycle`, `timestamp`, `window_start`, `window_end`
+* `status`, `verdict` — the analyzer's exact output
+* `n_train`, `n_oos`, `concentrated_sector`
+* `top_sector` / `top_rank_ic` — best non-SPARSE sector (the leader)
+* `n_inverted`, `inverted_sectors` — actionable red flag
+* `sectors` — full per-sector list for forensics (≤ 7)
+* `signal_dark` — mirrors sibling `*_dark` booleans
+
+**Tests** (`tests/test_continuous_sector_skill_ledger.py`, 7 cases):
+`INSUFFICIENT_DATA` persists dark row; `HAS_INVERTED_SECTOR`
+round-trips inverted_sectors + n_inverted unchanged (SSOT
+cross-check); `SECTOR_CONCENTRATED` propagates concentrated_sector;
+all-SPARSE marks `signal_dark`; analyzer crash falls through to
+honest gap envelope; atomic trim at 2× KEEP; module-level constants
+pinned. 7/7 pass; 105 sibling continuous-ledger tests still pass.
+
+**Live smoke** against `data/decision_outcomes.jsonl` (cycle=99999,
+2020-2025 window): verdict=`SECTOR_CONCENTRATED` because tech carries
+860/1113 (77%) of OOS rows at `rank_ic=+0.066` (`WEAK_SIGNAL_EDGE`),
+while crypto's 226 OOS rows have `magnitude_bias=+4.4pp`
+(over-predicts) at `rank_ic=-0.03` (`NO_SIGNAL_EDGE`),
+healthcare/energy/financials all `SPARSE` (n_oos < 20). Exactly the
+kind of state a quant needs trended per cycle.
+
+### Phase 3 (live validation): quant-researcher findings
+
+1. **Scorer is `MLP_WORSE_THAN_TRIVIAL`.** Current
+   `baseline_skill_log.jsonl` tail (cycle=1, 2019-11-04→2021-11-03
+   window): MLP rank-IC = `+0.046`, best single-feature baseline
+   (`news_urgency`) rank-IC = `+0.164`, `ic_gap = -0.119`. The
+   20-feature MLP is structurally **subtracting value** vs a
+   one-line rule. The conviction gate's per-arm sizing
+   (×0.6/×0.85/×1.15/×1.3) would underwrite pure variance with no
+   compensating edge under this state.
+
+2. **`gate_effectively_active=False` for 30/30 recent cycles.** The
+   trailing-OOS-IC kill-switch
+   (`_should_gate_modulate_conviction`) correctly suppresses
+   modulation because `median oos_buy_ic = -0.010 over last 20
+   cycles, below +0.03 tolerance`. The kill-switch is doing its job
+   — the gate is dark (good operational discipline given the
+   no-skill state above).
+
+3. **`HAS_DEAD: sector_commodities`** in
+   `dead_feature_audit_log.jsonl` — 1 of 20 features with
+   `mean_abs_weight = 0.0`. Not a bug — the L2 alpha=1e-2
+   regularization correctly drives constant-near-zero columns to
+   exactly zero. The commodities corpus is too sparse (see live
+   smoke above) for the MLP to learn anything; this is expected
+   behavior, and the dead-feature audit ledger surfaces it
+   honestly per cycle.
+
+4. **Per-window return dispersion is enormous.** Recent backtest
+   runs (run_id 103029–103037) post returns from `+5.86%` to
+   `+1035.17%` in a single cycle's 8 parallel monkey runs. These
+   are the random-monkey reference runs (3 trades, 1 decision
+   each — not the ml_quant strategy), but the dispersion confirms
+   the AGENTS.md warning that per-run returns are leveraged-beta
+   noise, NOT strategy skill. The real `ml_quant` run (103038)
+   posted `+102.09%` with 680 trades and `vs_spy=+50.90%`.
+
+5. **Live tech concentration is structural.** New sector_skill
+   ledger output above: 77% of OOS rows are tech. The headline
+   `oos_ic` from `scorer_skill_log.jsonl` is essentially tech's IC
+   — every `oos_*` number must be read with that caveat. (The
+   ledger's `concentrated_sector` field surfaces this directly
+   from now on.)
+
+6. **yfinance pre-IPO failures are noise.** `continuous.log` has
+   thousands of `$QUBT/$RKLB/$JOBY... possibly delisted` messages
+   for pre-2010 windows. The graceful-degradation path (return
+   empty series, drop from quant signals) is working; these are
+   not real errors.
+
+7. **Two transient engine-init failures observed** in
+   `continuous.log` over the session: SQLite "locking protocol"
+   (one occurrence) and "PriceCache has no trading days —
+   yfinance fetch failed" (one occurrence). Both are caught by
+   the cycle's `try/except`; the loop continues. Worth knowing
+   they exist, no fix needed.
+
+### How the ML/backtest stack works (canonical mini-reference)
+
+**DecisionScorer** (`paper_trader/ml/decision_scorer.py`):
+
+* 20-feature MLPRegressor (32, 16) with L2 alpha=1e-2 +
+  early_stopping (anti-overfit retune, 2026-05-18) — features are
+  10 base numeric (ml_score, rsi, macd, mom5, mom20, regime_mult,
+  vol_ratio, bb_pos, news_urgency, news_article_count) + 3
+  enhanced MACD booleans (ema200_above, hist_cross_up,
+  macd_below_zero_cross) + 7-way sector one-hot.
+* `predict_with_meta(...)` returns `{pred, raw, clamped,
+  off_distribution, percentile, calibrated, failed, gate_arm,
+  gate_arm_multiplier}` — `pred` is clamped to ±`PRED_CLAMP_PCT`
+  (=50%), `calibrated` is the quantile-mapped honest magnitude
+  (since the OOS verdict is `DIRECTIONAL_BUT_BIASED`).
+* `predict()` is the scalar fast path (just `pred`); all live
+  gate callers consume this.
+* `feature_contributions()` / `feature_group_contributions()` —
+  per-feature / per-group signed attribution for one prediction.
+* `feature_importance()` / `feature_group_importance()` —
+  global mean(|first-layer weight|) per feature/group.
+* `train_scorer(records, path=None)` — atomically rewrites
+  `data/ml/decision_scorer.pkl` with the new model + scaler +
+  pred_quantiles + label_quantiles. SELL records flip the label
+  sign so "good" has one consistent meaning.
+
+**Running backtests manually**:
+
+```bash
+# One-shot — 10 parallel year-long runs
+python3 run_backtests.py
+
+# Continuous loop — 1 run per cycle (throttled), 10min cooldown
+python3 run_continuous_backtests.py
+
+# Read-only CLI: explain one scorer prediction
+python3 -m paper_trader.ml.decision_scorer \
+    --ticker NVDA --ml-score 3.5 --rsi 45 --mom5 2.0
+
+# Read-only CLI: per-sector OOS skill (the new ledger's source)
+python3 -m paper_trader.ml.sector_skill
+
+# Read-only CLI: per-persona signal skill
+python3 -m paper_trader.ml.persona_skill
+
+# Compare MLP vs single-feature baselines
+python3 -m paper_trader.ml.baseline_compare
+```
+
+**Interpreting backtest results**:
+
+* `total_return_pct` ⇒ raw run return. **Dispersion is huge** (a
+  single cycle of monkey runs spans +5% to +1000%); a single
+  good/bad run is leverage luck, not strategy skill.
+* `vs_spy_pct` ⇒ run return minus the SPY return for the same
+  window. The actual skill metric. But mind the
+  `benchmark_unavailable` note in `backtest_runs.notes` — when
+  SPY returned 0 for the window (yfinance fetch failed or
+  degenerate walk-back), `vs_spy_pct` is fabricated alpha.
+* `oos_ic` / `oos_buy_ic` in `scorer_skill_log.jsonl` ⇒ the
+  scorer's OOS rank-IC. Read with the sector_skill ledger's
+  `concentrated_sector` flag — if tech holds ≥70% of OOS rows
+  (the current state), the headline IC IS tech's IC.
+* `gate_effectively_active` ⇒ both guards (n_train≥500 AND
+  kill-switch) must say active for the gate to actually modulate
+  conviction. False means the gate did nothing this cycle.
+
+**Test commands for this domain**:
+
+```bash
+# Just the new ledger
+python3 -m pytest tests/test_continuous_sector_skill_ledger.py -v
+
+# All ML/backtest tests (~4 min, ~1007 tests)
+python3 -m pytest tests/ -v -k "ml or backtest or scorer" 2>&1 | tail -20
+
+# All continuous-loop ledger tests
+python3 -m pytest tests/ -v -k "continuous and (skill or ledger)"
+
+# Just the DecisionScorer
+python3 -m pytest tests/test_decision_scorer.py -v
+```
+
+### Staging
+
+Per-file pathspec, two commits expected:
+
+* **Phase 2**: `paper-trader/run_continuous_backtests.py` +
+  `paper-trader/tests/test_continuous_sector_skill_ledger.py` (the
+  new `_append_sector_skill_log` ledger + tests + `main()` wiring).
+* **Phase 4 (this section)**: `paper-trader/AGENTS.md` only.
+
+Working copy at start carried foreign uncommitted changes (sibling
+agents' edits to `paper-trader/paper_trader/dashboard.py`,
+`paper-trader/paper_trader/market.py`, `digital-intern/...`, plus
+new untracked sibling files); all left untouched per the
+concurrent-agent footgun memory. No `git add -A`.
+
+
+## 2026-05-29 — Agent 1 (paper-trader core) HYBRID review pass
+
+Persona: a portfolio manager who depends on this engine every day and
+gets paged when a watchlist row reads `N/A` with no way to tell whether
+the engine is *currently blind* or *just slow*.
+
+### Phase 1 — Bug fix
+
+`market.get_prices()` (the bulk yfinance path) used to surface the raw
+`closes.iloc[-1]` value verbatim. The single-ticker `get_price()` filters
+0/negative as "no quote" (falls back to last-close history), but the
+bulk path didn't. yfinance occasionally hands back `0.0` on a halted /
+illiquid intraday row; that 0 mark fed into `strategy._mark_to_market`
+registered as a **100% loss** against `avg_cost`
+(`pl = (0 - avg_cost) * qty * 1`) and clobbered the snapshot's position
+values silently — the dashboard, the prompt block Opus reads, and the
+equity curve all showed fictitious losses until the next clean fetch
+overwrote the cached `0.0`.
+
+Fix locks the bulk path to the same `> 0` filter the single-ticker
+path uses: a `<= 0` close is treated as missing and falls through to
+`get_price(t)` (which itself filters and degrades gracefully). The
+cache is never poisoned with a 0 mark.
+
+Tests: `tests/test_market_zero_price_filter.py` — 4 tests pinning
+single/negative/multiindex/cache-poison contracts.
+
+### Phase 2 — Feature: `dead_tickers()` introspection
+
+`market._DEAD_CACHE` carries the live trader's "I cannot fetch this
+symbol right now" state and is internal. The only operator signal was
+a one-shot stderr line on the first dead-mark per TTL window. A trader
+looking at a watchlist row showing `N/A` had no way to tell:
+
+* *currently flying blind* on that symbol — still inside the 5-min
+  suppression window, won't even attempt yfinance this cycle, OR
+* *just had a single miss* — cleared on the next attempt.
+
+`market.dead_tickers()` is the inert read other surfaces compose to
+render that view. Each row carries `ticker`, `marked_at_ts`,
+`seconds_dead`, `ttl_remaining_s`. Sorted by ticker for deterministic
+Discord/dashboard rendering. Expired entries are NOT returned (they
+self-recover on the next `get_price` call). Pure read; never mutates
+the cache; never raises.
+
+`/api/dead-tickers` wires it to the operator's primary surface with the
+same SSOT contract (`{as_of, service, n_dark, ttl_seconds, tickers}`
++ ERROR envelope on accessor fault). Deliberately NOT `@swr_cached`:
+the underlying read is a module-global dict scan, the operator wanting
+this number wants the LIVE value (an SWR cache that surfaces a "3 dark"
+payload from 60s ago after a recovery wave is misleading).
+
+Tests:
+
+* `tests/test_market_dead_tickers.py` — 8 tests pinning empty / fresh /
+  expired-excluded / sorted-output / multi-age-rendering / pure-read /
+  clear_dead-drop / wall-clock-step-back-clamp contracts.
+* `tests/test_dashboard_dead_tickers_endpoint.py` — 4 tests pinning
+  endpoint contract via Flask test_client (empty / current / expired-
+  excluded / ERROR-envelope-on-fault).
+
+### Phase 3 — Live trader findings
+
+1. **Live trader is on stale code.** `/api/build-info` reports
+   `boot_sha=99f1bb2` vs `head_sha=171158e` — 5+ commits behind. The
+   new `/api/dead-tickers` returns 404 until the git-watcher's
+   deferred-restart cycle (≤3min loop) honors the HEAD change. This
+   is the documented chronic-stale pattern — the committed feature is
+   inert until the runner restarts onto fresh code.
+
+2. **Decision efficacy is DEGRADED at 55% NO_DECISION.** The
+   `/api/runner-heartbeat` `decision_efficacy` block reads `DEGRADED —
+   55% of the last 20 cycles were NO_DECISION (latest still produced a
+   decision); decision throughput is impaired but the engine is not
+   wedged.` Consistent with the AGENTS.md host-saturation pattern; the
+   alarm latches are all CLEAR (no breaker fire, no quota outage), so
+   the wedge is mid-cycle saturation rather than a full freeze.
+
+3. **Hard SL/TP discipline is working.** `/api/closed-positions`
+   shows a MU lot closed at `-2.45%` (cost $928.41 → proceeds $905.65,
+   $-22.76 realized) — the documented +3%/-2% R:R is enforced and
+   protecting the book from leveraged-ETF whipsaws. NVDA closed at
+   `+0.45%` (cost $640.05 → proceeds $642.90) on a thesis-drift SELL
+   driven by MACD bearish + 5d momentum -4.13%.
+
+Live book at session: cash $660.56, total $1178.70, +17.87% vs the
+$1000 start. One open AMD position (qty=1.0, avg $519.05, ~44% of
+book). Discord delivery HEALTHY (`last Discord send succeeded`).
+
+### Test commands for this domain
+
+```bash
+# Just the new tests
+python3 -m pytest tests/test_market_zero_price_filter.py \
+                  tests/test_market_dead_tickers.py \
+                  tests/test_dashboard_dead_tickers_endpoint.py -v
+
+# All core market + dashboard regression
+python3 -m pytest tests/test_core_market.py \
+                  tests/test_market_negcache.py \
+                  tests/test_core_dashboard_notify_health.py -v
+```
+
+### Staging
+
+Per-file pathspec across two commits:
+
+* **Phase 1**: `paper-trader/paper_trader/market.py` (zero-price
+  filter only) + `paper-trader/tests/test_market_zero_price_filter.py`.
+* **Phase 2**: `paper-trader/paper_trader/market.py` (the
+  `dead_tickers` accessor) + `paper-trader/paper_trader/dashboard.py`
+  (the `/api/dead-tickers` endpoint) + `paper-trader/tests/
+  test_market_dead_tickers.py` + `paper-trader/tests/
+  test_dashboard_dead_tickers_endpoint.py`.
+* **Phase 4 (this section)**: `paper-trader/AGENTS.md` only.
+
+Working copy at start carried foreign uncommitted changes (sibling
+agents' work on `paper-trader/paper_trader/dashboard.py`
+[/api/plan-execution-debt], `paper_trader/analytics/
+plan_execution_debt.py`, `tests/test_plan_execution_debt.py`, plus
+digital-intern siblings, plus the sibling Agent's existing
+`paper-trader/AGENTS.md` section); all left untouched per the
+concurrent-agent footgun memory. For the Phase 2 dashboard commit, I
+reset `dashboard.py` to HEAD, applied ONLY my hunk, committed, then
+restored the sibling's work — so my commit contains exactly one
+endpoint and the sibling's `/api/plan-execution-debt` work stays as
+their pending uncommitted change. No `git add -A`.
