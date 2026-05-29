@@ -150,6 +150,7 @@ from collectors.nasdaq_halts_collector import collect_nasdaq_halts
 from collectors.fda_collector import collect_fda
 from collectors.usaspending_contracts_collector import collect_usaspending_contracts
 from collectors.unusual_volume_collector import collect_unusual_volume
+from collectors.extended_hours_movers import collect as collect_extended_hours_movers
 from collectors.short_squeeze_monitor import collect_short_squeeze
 from collectors.twse_semiconductor import collect_twse_semiconductor
 from collectors.nasdaq_ipo_calendar import collect_nasdaq_ipo
@@ -1378,6 +1379,29 @@ def unusual_volume_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(MARKET_MOVERS_INTERVAL)
+
+
+def extended_hours_movers_worker(store: ArticleStore):
+    log.info("[extended_hours_movers_worker] started")
+    bo = Backoff("extended_hours_movers", base=30.0, cap=900.0)
+    # Run every 10 min — yfinance downloads are heavier than screener API calls
+    INTERVAL = 600
+    while _running:
+        try:
+            articles = collect_extended_hours_movers()
+            _ingest(store, articles, "extended_hours_movers")
+            try:
+                source_health.record_result("extended_hours_movers", len(articles))
+            except Exception as he:
+                log.warning(f"[extended_hours_movers_worker] source_health error: {he}")
+            _worker_last_ok["extended_hours_movers"] = time.time()
+            log.debug(f"[extended_hours_movers] cycle ok ({len(articles)} new)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[extended_hours_movers_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(INTERVAL)
 
 
 def short_squeeze_worker(store: ArticleStore):
@@ -5058,6 +5082,7 @@ def main():
         ("market_movers", market_movers_worker),
         ("yahoo_trending", yahoo_trending_worker),
         ("unusual_volume", unusual_volume_worker),
+        ("extended_hours_movers", extended_hours_movers_worker),
         ("short_squeeze",  short_squeeze_worker),
         ("short_interest", short_interest_worker),
         ("fear_greed",  fear_greed_worker),
