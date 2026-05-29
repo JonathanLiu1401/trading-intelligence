@@ -312,6 +312,27 @@ _NOT_TICKERS = {
     "BLOWS", "CLIMB", "CLIMBED", "CLIMBS", "EDGES", "LOWS",
     "SALES", "SINKS", "SINK", "SLID", "SLIDE", "SLIDES", "SLIP", "SLIPS",
     "SOAR", "SOARED", "TALKS", "TANKS", "TOPPED", "TUMBLE", "TUMBLES",
+    # Exchange / index names — common in financial headlines, NOT public
+    # tickers themselves. Verified live (2026-05-28): "NYSE opens at 9:30 AM
+    # ET" extracted NYSE as a ticker, polluting Opus's ``tickers=`` prompt
+    # block with an exchange code on every market-hours headline. Each entry
+    # below is the bare token form a typical wire headline would produce in
+    # ALLCAPS. Cashtag bypass (``$NYSE`` / ``$DJIA``) remains correct as a
+    # deliberate signal — same asymmetry as the BUY/SELL exemption above.
+    #   NYSE / NASDAQ → exchanges (NASDAQ is 6 chars so the regex already
+    #     misses it, but NYSE is 4 chars and DID extract);
+    #   DJIA / S&P → index names (DJIA is 4 chars, extracts; SP-500 hyphen
+    #     breaks the regex so S&P doesn't extract bare);
+    #   JONES / WALL / STREET — "Dow JONES" / "WALL STREET" headline phrases
+    #     that, when uppercased, extracted these non-ticker tokens (verified
+    #     "JONES BEAT MISSES" → {'JONES'}). State Street trades as STT,
+    #     not STREET; no public ticker for JONES / WALL alone.
+    #   BUYS / SELLS — plural verb forms ("Berkshire BUYS more Apple",
+    #     "Insider SELLS up to $1M") that aren't tickers. Distinct from
+    #     bare BUY / SELL, which DO surface in analyst-rating headlines
+    #     ("RBC upgrades NVDA to BUY") and ARE deliberately preserved as
+    #     non-controversial verbs above.
+    "NYSE", "DJIA", "JONES", "WALL", "STREET", "BUYS", "SELLS",
 }
 
 
