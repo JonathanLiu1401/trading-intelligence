@@ -98,6 +98,7 @@ from collectors.credit_spread_collector import collect_credit_spreads
 from collectors.g10_sovereign_yields import collect_g10_yields
 from collectors.fred_collector import collect_fred
 from collectors.fred_production_collector import collect as collect_fred_production
+from collectors.financial_stress_collector import collect as collect_financial_stress
 from collectors.gdpnow_collector import collect_gdpnow
 from collectors.fed_liquidity_collector import collect_fed_liquidity
 from collectors.cftc_cot_collector import collect_cftc_cot
@@ -108,6 +109,7 @@ from collectors.openinsider_cluster import collect as collect_insider_cluster
 from collectors.sector_etf_momentum import collect as collect_sector_etf
 from collectors.cisa_kev_collector import collect_cisa_kev
 from collectors.benzinga_analyst_collector import collect_benzinga_analyst
+from collectors.credit_rating_collector import collect_credit_ratings
 from collectors.nyfed_liquidity_collector import collect_nyfed_liquidity
 from collectors.ftc_doj_collector import collect_ftc_doj
 from collectors.eia_collector import collect_eia
@@ -267,6 +269,7 @@ INSIDER_CLUSTER_INTERVAL = 600    # EDGAR Form 4 cluster-buy scan every 10min
 SECTOR_ETF_INTERVAL     = 600     # Sector ETF momentum snapshot every 10min
 COMMODITY_FUTURES_INTERVAL = 600  # Commodity futures price monitor every 10min
 BENZINGA_INTERVAL       = 300     # Benzinga analyst-ratings RSS sweep every 5min
+CREDIT_RATING_INTERVAL  = 600     # Moody's/S&P/Fitch rating actions — every 10min
 NYFED_LIQUIDITY_INTERVAL = 3600  # NY Fed RRP + SOMA (Fed balance sheet) — every 60min
 FTC_DOJ_INTERVAL        = 1800    # FTC + DOJ ATR press releases — every 30min
 EIA_INTERVAL            = 1800    # EIA Today in Energy + press releases — every 30min
@@ -420,6 +423,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "wikipedia": WIKIPEDIA_INTERVAL, "wiki_pageviews": WIKI_PAGEVIEWS_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL, "tic": TIC_INTERVAL,
     "cisa_kev": CISA_KEV_INTERVAL,
     "benzinga_analyst": BENZINGA_INTERVAL,
+    "credit_ratings": CREDIT_RATING_INTERVAL,
     "ftc_doj": FTC_DOJ_INTERVAL,
     "fed_press": FED_PRESS_INTERVAL,
     "fed_research": FED_RESEARCH_INTERVAL,
@@ -1009,6 +1013,26 @@ def benzinga_analyst_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(BENZINGA_INTERVAL)
+
+
+def credit_ratings_worker(store: ArticleStore):
+    log.info("[credit_ratings_worker] started")
+    bo = Backoff("credit_ratings", base=5.0, cap=300.0)
+    while _running:
+        try:
+            articles = collect_credit_ratings()
+            _ingest(store, articles, "credit_ratings")
+            try:
+                source_health.record_result("credit_ratings", len(articles))
+            except Exception as he:
+                log.warning(f"[credit_ratings_worker] source_health error: {he}")
+            _worker_last_ok["credit_ratings"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[credit_ratings_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(CREDIT_RATING_INTERVAL)
 
 
 # ── Worker: Google News per-ticker — every 5min ─────────────────────────────
@@ -5075,6 +5099,7 @@ def main():
         ("cisa_kev",    cisa_kev_worker),
         ("insider_cluster", insider_cluster_worker),
         ("benzinga_analyst", benzinga_analyst_worker),
+        ("credit_ratings",  credit_ratings_worker),
         ("ftc_doj",     ftc_doj_worker),
         ("eia",         eia_worker),
         ("shipping_intelligence", shipping_intelligence_worker),
