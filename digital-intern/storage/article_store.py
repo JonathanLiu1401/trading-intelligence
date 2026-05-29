@@ -1552,6 +1552,211 @@ class ArticleStore:
         }
 
     @_retry_on_lock
+    def urgent_count_per_briefing_window_trend(self, last_n: int = 10) -> dict:
+        """Per-briefing-window URGENT-row-count trend — the urgent-flow sibling
+        to the four existing briefing-trend primitives.
+
+        ``briefing_cadence_trend``          asks "are briefings firing on schedule?"
+        ``briefing_text_overlap_trend``     asks "is the OUTPUT fresh or recapping?"
+        ``briefing_length_trend``           asks "is the OUTPUT text getting shorter?"
+        ``briefing_article_count_trend``    asks "is the INPUT POOL feeding Opus shrinking?"
+
+        None of them answers "is the URGENT-flow per briefing window surging or
+        quieting?". An analyst tracking N briefings worth of urgent rate
+        cycle-over-cycle has no single primitive — they have to query
+        ``stats_since`` per window manually and compose the trend by eye. A
+        surge from 5→15 urgent rows per 5h window is exactly the operator-
+        actionable "the wire heated up" signal that should fire without
+        needing the analyst to spot it in the Discord channel.
+
+        For each consecutive pair of briefings (older, newer) in the last N+1
+        records, counts ``urgency>=1`` rows with ``first_seen`` in
+        ``[older.ts, newer.ts)``. Each yielded count corresponds to ONE
+        completed briefing-cadence window. Returns the trend in the same
+        shape as ``briefing_*_trend`` siblings.
+
+        Sibling discipline (mirrors ``briefing_article_count_trend`` verbatim):
+        single SELECT against ``briefings`` for the cadence anchors plus one
+        aggregate SELECT against ``articles`` with ``_LIVE_ONLY_CLAUSE`` so
+        synthetic backtest/opus rows can never inflate the per-window urgent
+        count. Read-only; NO DB write — no ai_score / ml_score / score_source
+        / urgency mutation. All four load-bearing invariants intact by
+        construction.
+
+        Returns::
+
+            {
+              "last_n":         int,
+              "n_windows":      int,
+              "windows": [
+                {
+                  "older_ts":    str,
+                  "newer_ts":    str,
+                  "duration_h":  float,
+                  "urgent_count": int,
+                },
+                ...                              # chronological, newest LAST
+              ],
+              "counts":         [int, ...],     # urgent_count per window
+              "median_count":   int | None,
+              "min_count":      int | None,
+              "max_count":      int | None,
+              "recent_median":  int | None,     # newer half
+              "older_median":   int | None,     # older half
+              "surge_ratio":    float | None,   # recent_median / older_median
+              "verdict": "STABLE" | "SURGING" | "QUIETING" | "NO_DATA",
+            }
+
+        Verdict semantics (same conservative ladder as
+        ``briefing_article_count_trend``, but oriented around the urgent-flow
+        analyst signal — SURGING is the actionable verdict, QUIETING is
+        informational symmetry):
+
+          * ``NO_DATA``   — fewer than 4 windows, OR older_median == 0
+                            (cannot compute a ratio).
+          * ``SURGING``   — ``recent_median >= 1.3 * older_median``. The urgent
+                            flow per window has materially picked up; the wire
+                            is hotter than the older baseline.
+          * ``QUIETING``  — ``recent_median <= 0.7 * older_median``. Urgent
+                            flow has dropped — pipeline issue, or a genuine
+                            calm wire.
+          * ``STABLE``    — everything in between.
+        """
+        last_n = max(int(last_n), 1)
+
+        # last_n+1 briefings yield last_n windows (a window = the gap between
+        # two consecutive briefings). Briefings are append-only (save_briefing)
+        # so ORDER BY id DESC is the authoritative write-order signal — same
+        # discipline as briefing_cadence_trend / briefing_length_trend.
+        rows = self.conn.execute(
+            "SELECT ts FROM briefings ORDER BY id DESC LIMIT ?",
+            (last_n + 1,),
+        ).fetchall()
+
+        # Parse + filter to UTC-aware datetimes, defensive against corrupt rows
+        # (same discipline as briefing_cadence_trend).
+        parsed: list[datetime] = []
+        for (ts_str,) in rows:
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str)
+            except (ValueError, TypeError):
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            parsed.append(ts)
+
+        # Reverse to chronological (oldest first). Pair (parsed[i], parsed[i+1])
+        # = ONE window — first_seen in [older.ts, newer.ts).
+        parsed.reverse()
+        n_windows = max(0, len(parsed) - 1)
+
+        if n_windows < 4:
+            # Same NO_DATA discipline as the sibling trend methods — below 4
+            # windows any verdict would be noise (older_half / newer_half split
+            # has < 2 samples each).
+            return {
+                "last_n": last_n,
+                "n_windows": n_windows,
+                "windows": [],
+                "counts": [],
+                "median_count": None,
+                "min_count": None,
+                "max_count": None,
+                "recent_median": None,
+                "older_median": None,
+                "surge_ratio": None,
+                "verdict": "NO_DATA",
+            }
+
+        windows: list[dict] = []
+        counts: list[int] = []
+        for i in range(n_windows):
+            older = parsed[i]
+            newer = parsed[i + 1]
+            older_iso = older.isoformat()
+            newer_iso = newer.isoformat()
+            duration_h = max(0.0, (newer - older).total_seconds() / 3600.0)
+            # ``_LIVE_ONLY_CLAUSE`` keeps synthetic backtest/opus injection rows
+            # out of the per-window urgent count — exact discipline the
+            # aggregate ``stats_since`` carries (CLAUDE.md §5 load-bearing
+            # invariant #1).
+            cur = self.conn.execute(
+                "SELECT COUNT(*) FROM articles "
+                "WHERE urgency>=1 AND first_seen >= ? AND first_seen < ? "
+                f"AND {_LIVE_ONLY_CLAUSE}",
+                (older_iso, newer_iso),
+            )
+            row = _expect_row(cur)
+            count = int(row[0] or 0)
+            windows.append({
+                "older_ts": older_iso,
+                "newer_ts": newer_iso,
+                "duration_h": round(duration_h, 2),
+                "urgent_count": count,
+            })
+            counts.append(count)
+
+        sorted_all = sorted(counts)
+        median_full = sorted_all[n_windows // 2]
+
+        split = n_windows // 2
+        older_half = counts[:split]
+        newer_half = counts[split:]
+
+        def _median(xs: list[int]) -> int:
+            return sorted(xs)[len(xs) // 2]
+
+        older_median = _median(older_half)
+        recent_median = _median(newer_half)
+
+        # NO_DATA when older_median is zero so surge_ratio cannot
+        # divide-by-zero (the older half can legitimately be all-zero on a
+        # quiet wire — same defensive branch as briefing_article_count_trend
+        # / briefing_length_trend's older_median <= 0 guard).
+        if older_median <= 0:
+            return {
+                "last_n": last_n,
+                "n_windows": n_windows,
+                "windows": windows,
+                "counts": counts,
+                "median_count": int(median_full),
+                "min_count": min(counts),
+                "max_count": max(counts),
+                "recent_median": int(recent_median),
+                "older_median": int(older_median),
+                "surge_ratio": None,
+                "verdict": "NO_DATA",
+            }
+
+        surge_ratio = round(recent_median / older_median, 3)
+
+        # Verdict ladder — most-severe-first (mirrors briefing_*_trend
+        # discipline). SURGING is the analyst-actionable verdict; QUIETING is
+        # informational symmetry.
+        if surge_ratio >= 1.30:
+            verdict = "SURGING"
+        elif surge_ratio <= 0.70:
+            verdict = "QUIETING"
+        else:
+            verdict = "STABLE"
+
+        return {
+            "last_n": last_n,
+            "n_windows": n_windows,
+            "windows": windows,
+            "counts": counts,
+            "median_count": int(median_full),
+            "min_count": min(counts),
+            "max_count": max(counts),
+            "recent_median": int(recent_median),
+            "older_median": int(older_median),
+            "surge_ratio": surge_ratio,
+            "verdict": verdict,
+        }
+
+    @_retry_on_lock
     def count_unscored(self, min_kw: float = 0.0) -> int:
         """Count articles still pending the scorer. Mirrors ``get_unscored``'s
         filter (ai_score=0 AND ml_score IS NULL AND kw_score>=min_kw AND
