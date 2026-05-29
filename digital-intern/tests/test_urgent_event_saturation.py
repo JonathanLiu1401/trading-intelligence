@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,15 @@ from analytics.urgent_event_saturation import (
     SATURATION_THRESHOLD,
 )
 from analytics import urgent_event_saturation as ues
+
+
+def _recent_iso() -> str:
+    """Always-fresh ``first_seen`` value so a SQL load with a 72h cutoff
+    sees the test row. Replaces the original hardcoded "2026-05-25T10:00:00"
+    fixture, which silently aged out of the 72h window once wall-clock
+    crossed 2026-05-28 (the rerun-after-3-days bug — same shape as the
+    test_article_store ``_recent_iso`` discipline)."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 HELD = {"NVDA", "MU", "MSFT", "AXTI", "LITE", "ORCL"}
@@ -307,7 +317,7 @@ def test_load_urgent_rows_excludes_backtest_urls(tmp_path, monkeypatch):
             time_sensitivity REAL, ml_score REAL, score_source TEXT
         )
     """)
-    now = "2026-05-25T10:00:00+00:00"
+    now = _recent_iso()
     # 1 LIVE urgent row (should appear)
     conn.execute(
         "INSERT INTO articles (id, url, title, source, urgency, first_seen) "
@@ -357,7 +367,7 @@ def test_audit_is_read_only_no_db_mutation(tmp_path, monkeypatch):
             time_sensitivity REAL, ml_score REAL, score_source TEXT
         )
     """)
-    now = "2026-05-25T10:00:00+00:00"
+    now = _recent_iso()
     conn.execute(
         "INSERT INTO articles (id, url, title, source, ai_score, ml_score, "
         "urgency, first_seen, score_source) "
