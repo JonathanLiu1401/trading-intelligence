@@ -1,5 +1,133 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-29 core HYBRID pass (Agent 1) — dead_tickers Discord wiring
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=5
+
+### Phase 1 — no fresh bug surfaced (`bugs_fixed = 0`)
+
+Read every required core file in full (runner.py, reporter.py, signals.py,
+strategy.py, dashboard.py, market.py, store.py). Dispatched the
+code-reviewer subagent against the same surfaces with a hard
+"no theoretical / style findings — only real bugs" bar. Result: no
+high-confidence findings.
+
+Baseline confirmed: `python3 -m pytest tests/test_core_strategy.py
+tests/test_core_market.py tests/test_core_store.py tests/test_core_signals.py`
+→ 372 passed in 30.59s.
+
+### Phase 2 — `feat:` `_dead_tickers_line` Discord visibility (commit `e41d47f`)
+
+`market.dead_tickers()` and `/api/dead-tickers` already expose the live
+negative-cache state (symbols yfinance has returned no data for inside
+the last `_DEAD_TTL`=300s window) — but the operator lives in Discord
+and never opens the dashboard. When a watchlist position showed
+`mark=avg P/L=$0.00`, the trader couldn't tell whether it was genuinely
+flat or silently fall-back marked because yfinance was suppressing the
+symbol. The hourly/daily Discord report had no surface for this — the
+same documented dashboard→Discord gap `_mark_integrity_line` /
+`_feed_health_line` / `_drawdown_line` each close one dimension over.
+
+New `_dead_tickers_line(market_mod=None)` composes
+`market.dead_tickers()` **verbatim** (SSOT invariant #10) and surfaces
+it in `send_hourly_summary` + `send_daily_close` right after
+`_feed_health_line` (same urgency tier — input-feed compromise). Format:
+
+```
+⚠️ DEAD TICKERS ◈ 3 watchlist symbols dark on yfinance
+> LITE 4m · MUU 2m · NVDA 12s — engine reads N/A this cycle
+```
+
+Render contract:
+* Worst-first ordering (sort by `seconds_dead` DESC) so the operator's
+  eye lands on the longest-dark symbol — the most-actionable diagnostic
+  for deciding "yfinance outage vs one-off blip".
+* Top-5 explicit; the rest collapse to `+N more`.
+* Empty cache → `""` (silence-when-nothing-actionable; the
+  `_feed_health_line` HEALTHY suppression precedent — a healthy
+  watchlist must never become its own lying green light).
+* Any producer fault (`dead_tickers()` raises / non-list / etc.) →
+  `""` (the reporter additive-line failure contract).
+
+Lock tests (`tests/test_dead_tickers_line.py`, 24 cases): age token
+boundaries (11 parameterized — None, negative clamp, garbage, sub-min,
+exact-min, exact-hour), silence-on-empty + non-list + raising producer
+(3), singular/plural count word (2), ordering-desc shape (1), top-5 cap
+with `+N more` (1), exactly-5 boundary (1), missing-age render (1),
+empty-ticker drop (1), all-empty silence (1), warning icon + actionable
+suffix (1), default-module smoke integration with real `_DEAD_CACHE` (1).
+
+Broader regression: `python3 -m pytest tests/ -k "reporter or hourly
+or daily_close or dead"` → 792 passed in 68.19s.
+
+### Phase 3 — Live trader validation (`user_findings = 5`)
+
+1. **IDLE_STORM regime active right now** — `/api/runner-heartbeat`
+   reports `decision_efficacy.verdict = IDLE_STORM — the last 5
+   cycles were ALL NO_DECISION (65% of the last 20); the loop is
+   cycling but the engine is not deciding`. The TOP-LEVEL `verdict`
+   reads `HEALTHY — last decision 7m ago, within the 60m
+   market-closed cadence` with the warning embedded in the headline.
+   Worth flagging for a future pass: when `consecutive_no_decisions
+   >= breaker_threshold - 1` (=4), the top-level verdict could
+   downgrade to `DEGRADED` so a trader scanning at-a-glance doesn't
+   miss the embedded warning.
+2. **NO_DECISION dominant cause = `cli_nonzero_rc` (72%)** —
+   `/api/no-decision-reasons` reports `32/50 cycles NO_DECISION;
+   dominant cause: cli_nonzero_rc (72%)`. 23 cli_nonzero_rc + 9
+   host_saturated out of 50. This is a SUSTAINED upstream Claude CLI
+   issue, not random noise. The existing `_no_decision_reasons_line`
+   will surface it in the next hourly — operator-visible.
+3. **Trade ledger looks trader-grade and discipline is working** —
+   yesterday's MU HARD_SL fired correctly at $905.65 (threshold
+   $909.84, mechanical 2% SL on a $928.41 entry). NVDA round-trip
+   booked +$2.85 (BUY 3@$213.35 → SELL 3@$214.30) with a 600+ char
+   thesis explicitly flagging the drift signal (MACD bearish, 5d
+   momentum -4.13%). AMD opened at $519.05 last evening, still
+   held at $518.14 (-$0.91 unrealized).
+4. **New `_dead_tickers_line` correctly silent right now** —
+   `/api/dead-tickers` returns `n_dark=0`. The new line returns ""
+   and the next hourly will ship without it. The first time
+   yfinance suppresses a watchlist symbol, the line will fire. The
+   silence contract is hitting end-to-end on the live system.
+5. **Market opens in 9 minutes** (PRE_MARKET phase). If the
+   cli_nonzero_rc storm continues into market hours, expect more
+   clustered NO_DECISIONs while the desk holds AMD. The breaker is
+   armed at threshold 5; current consecutive count is 0 (just
+   recovered from the IDLE_STORM run that drove decision_efficacy
+   to that verdict).
+
+### Phase 4 — Final verify
+
+```
+python3 -c "from paper_trader import signals, reporter, strategy; print('imports OK')"
+python3 -m pytest tests/test_dead_tickers_line.py tests/test_core_strategy.py \
+    tests/test_core_market.py tests/test_core_store.py tests/test_core_signals.py
+```
+→ all 396 pass in 7.41s.
+
+### Focused test commands for this domain (Agent 1 / core)
+
+```bash
+# This pass's lock tests (24, <1s)
+python3 -m pytest tests/test_dead_tickers_line.py -v
+
+# Broader reporter regression (~70s, 792 tests)
+python3 -m pytest tests/ -k "reporter or hourly or daily_close or dead"
+
+# Core baseline (~30s, 372 tests)
+python3 -m pytest tests/test_core_strategy.py tests/test_core_market.py \
+    tests/test_core_store.py tests/test_core_signals.py
+
+# Live trader perspective probes (read-only — never trains, never trades)
+curl -s http://localhost:8090/api/dead-tickers | python3 -m json.tool
+curl -s http://localhost:8090/api/runner-heartbeat | python3 -m json.tool
+curl -s http://localhost:8090/api/no-decision-reasons | python3 -m json.tool
+curl -s http://localhost:8090/api/decision-health | python3 -m json.tool
+```
+
+---
+
 Companion to `CLAUDE.md` aimed at coding agents that touch this repo
 during automated review / fix cycles. Where `CLAUDE.md` documents the
 *system*, this file documents the *workflows*.
