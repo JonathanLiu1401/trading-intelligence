@@ -1,5 +1,109 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-29 core HYBRID pass (Agent 1, second cycle) — PRE_STORM early-warning verdict
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=5
+
+### Phase 1 — no fresh bug surfaced (`bugs_fixed = 0`)
+
+Read every required core file in full (runner.py, reporter.py, signals.py,
+strategy.py, dashboard.py, market.py, store.py). Dispatched the
+code-reviewer subagent against the same surfaces with a hard
+"no theoretical / style findings — only real bugs" bar. Result: no
+high-confidence findings.
+
+Baseline: `python3 -m pytest tests/test_core_strategy.py tests/test_core_market.py
+tests/test_core_store.py tests/test_core_signals.py` → 372 passed in 15.20s.
+
+### Phase 2 — `feat:` PRE_STORM early-warning verdict (commit `9976746`)
+
+The prior pass's user_finding #1 flagged that `/api/runner-heartbeat` goes
+from `decision_efficacy=PRODUCING` straight to `IDLE_STORM` at the breaker
+threshold (5 consecutive NO_DECISIONs). A trader scanning at-a-glance had
+no warning state in between — the first hint of trouble was the breaker
+firing. This pass closes that gap.
+
+New `PRE_STORM` efficacy verdict fires at `consec >= threshold - PRE_STORM_OFFSET`
+(= 4 with the default threshold of 5) — the cycle BEFORE the breaker arms.
+Behaviour contract:
+
+* **Cadence `verdict` unchanged** — the documented liveness/efficacy
+  separation. PRE_STORM lives ONLY in `decision_efficacy.verdict`.
+* **`restart_recommended` stays False** — same back-pressure rule as
+  DEGRADED. The next real decision still clears the latch without operator
+  action (no need to misdirect them into a restart).
+* **Top-level headline gains a ⚠ clause** — `"⚠ the last 4 cycles were
+  NO_DECISION — engine is one miss from the auto-recovery breaker; watching
+  for the next real decision."` Visible AT-A-GLANCE alongside the
+  cadence-driven `HEALTHY —` lead, exactly the gap user_finding #1 named.
+* **Precedence**: PRE_STORM check runs BEFORE the `pct >= 50%` DEGRADED
+  check, so a leading run of 4 with pct=80% reads PRE_STORM (the sharper
+  signal) instead of DEGRADED.
+
+Lock tests (`tests/test_runner_heartbeat.py`, 8 new cases): retune-proof
+constant echo (`PRE_STORM_OFFSET == 1`), PRE_STORM at consec=threshold-1,
+exact boundary to IDLE_STORM at consec=threshold, precedence over DEGRADED
+when pct also high, pass-through to DEGRADED/PRODUCING below threshold-1,
+top-level headline ⚠ visibility without `restart` directive, end-to-end
+through the Flask endpoint with a real Store, STALLED+PRE_STORM coexistence.
+
+Broader regression: `python3 -m pytest tests/test_runner_heartbeat.py
+tests/test_runner_heartbeat_swr.py tests/test_core_*` → 1035 passed,
+1 skipped in 105.99s.
+
+### Phase 3 — Live trader validation (`user_findings = 5`)
+
+1. **Discord delivery currently DEGRADED** — `/api/notify-health` reports
+   `Discord channel DARK — 2 consecutive send failures, last OK never;
+   last error: openclaw timeout (60s)`. The openclaw binary itself works
+   from CLI (`openclaw --version` → `2026.5.7`), so this is the runner's
+   subprocess timing out under host load — likely the same host-saturation
+   class that drives the NO_DECISION storms. The completion-message send
+   may also time out; not fixable mid-pass without a runner restart.
+2. **decision_efficacy = DEGRADED, consec_no_decisions=1** — the just-
+   shipped PRE_STORM verdict is correctly dormant (no storm building right
+   now). When the live trader hits its next 4-consec NO_DECISION run, the
+   operator WILL get the new ⚠ warning ONE cycle before the breaker.
+3. **Live book: long AMD 1 share @ ~$518, +$1.37 unrealized** — desk is
+   active. cash $660.55 / total_value $1180.98 (above the $1000 baseline).
+   Single position; concentration is fine.
+4. **OPENING_BELL phase** — market just opened (NY 09:30 ET). First 30
+   minutes of the session, whipsaw-prone. The new MARKET_PHASE prompt
+   header lets Opus calibrate conviction down for this window.
+5. **dashboard `boot_sha=None`** — `/api/runner-heartbeat` returns no
+   boot_sha in the live JSON shape. The `_git_sha` probe in `dashboard.py`
+   runs at module-load; if it returned None on first call, it stays None
+   forever. Means the existing `build_info.stale` detection is currently
+   silent (cannot tell "this dashboard is running stale code"). Worth a
+   future pass — re-probe lazily on each `/api/build-info` hit instead of
+   caching at boot.
+
+### Phase 4 — Final verify
+
+```
+python3 -c "from paper_trader import signals, reporter, strategy; print('imports OK')"
+python3 -m pytest tests/test_runner_heartbeat.py tests/test_core_strategy.py \
+    tests/test_core_market.py tests/test_core_store.py tests/test_core_signals.py
+```
+
+### Focused test commands for this domain (Agent 1 / core)
+
+```bash
+# This pass's lock tests (8 new tests in test_runner_heartbeat.py, ~14s for 53 total)
+python3 -m pytest tests/test_runner_heartbeat.py -v
+
+# Broader core baseline (~110s, 1035 tests)
+python3 -m pytest tests/test_runner_heartbeat.py tests/test_runner_heartbeat_swr.py \
+    tests/test_core_*
+
+# Live trader perspective probes (read-only — never trains, never trades)
+curl -s http://localhost:8090/api/runner-heartbeat | python3 -m json.tool
+curl -s http://localhost:8090/api/notify-health | python3 -m json.tool
+curl -s http://localhost:8090/api/alarm-latches | python3 -m json.tool
+```
+
+---
+
 ## 2026-05-29 core HYBRID pass (Agent 1) — dead_tickers Discord wiring
 
 **Counters:** bugs_fixed=0 · features_added=1 · user_findings=5
