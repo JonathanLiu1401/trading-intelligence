@@ -164,6 +164,68 @@ def _clear_dead(ticker: str):
     _DEAD_CACHE.pop(ticker, None)
 
 
+def dead_tickers() -> list[dict]:
+    """Snapshot of currently-dark symbols in the negative cache.
+
+    Today ``_DEAD_CACHE`` carries the live trader's "I cannot fetch this
+    symbol right now" state and is internal: the only operator signal is
+    a one-shot stderr line on the first dead-mark per TTL window. A
+    trader monitoring the desk has no way to ask "which of my 50
+    watchlist names is the engine currently flying blind on?" — every
+    cycle, half-silently, the prompt sees ``N/A`` for those tickers and
+    Opus has no idea they are *known broken* vs. *transiently slow*.
+
+    This accessor is the inert read other surfaces (a Discord hourly
+    line, ``/api/dead-tickers``, an operator REPL) compose to render
+    that view. Each row carries:
+
+      * ``ticker``           — the symbol the cache holds (uppercase by
+                                producer convention; reflected verbatim).
+      * ``marked_at_ts``     — UNIX ts when the entry was created /
+                                refreshed (``_mark_dead``'s payload).
+      * ``seconds_dead``     — wall-clock seconds since ``marked_at_ts``
+                                (clamped ≥ 0 against a wall-clock step-
+                                back; the same hardening pattern
+                                ``alarm_latch_state`` uses).
+      * ``ttl_remaining_s``  — seconds until the entry self-expires and
+                                the next ``get_price`` will re-attempt
+                                yfinance (``_DEAD_TTL - seconds_dead``,
+                                clamped ≥ 0).
+
+    Entries whose TTL has *already* elapsed are NOT returned: those
+    will be silently dropped on the next ``_is_dead`` probe and the
+    next ``get_price`` re-fetch will resolve them. The accessor must
+    NOT mutate the cache (no sweep) — operator surfaces expect a
+    snapshot, not a side-effecting purge. Returned sorted by ticker so
+    a Discord line / dashboard table renders deterministically across
+    calls. Pure read; never raises.
+    """
+    now = time.time()
+    out: list[dict] = []
+    # Iterate a snapshot copy so concurrent _mark_dead / _clear_dead from
+    # other threads cannot mutate the dict mid-iteration. _DEAD_CACHE is
+    # only touched from market.py's own helpers (no external writers),
+    # but the runner main thread and the dashboard request threads both
+    # call into this module concurrently.
+    for tk, ts in list(_DEAD_CACHE.items()):
+        try:
+            elapsed = max(0.0, float(now) - float(ts))
+        except (TypeError, ValueError):
+            continue
+        if elapsed >= _DEAD_TTL:
+            # Already past the TTL — would be re-fetched on the very next
+            # get_price() call. Don't report as "dark" (false alarm).
+            continue
+        out.append({
+            "ticker": tk,
+            "marked_at_ts": float(ts),
+            "seconds_dead": int(elapsed),
+            "ttl_remaining_s": int(max(0.0, _DEAD_TTL - elapsed)),
+        })
+    out.sort(key=lambda r: r["ticker"])
+    return out
+
+
 def is_market_open(now: datetime | None = None) -> bool:
     now = (now or datetime.now(UTC)).astimezone(NY)
     if now.weekday() >= 5:

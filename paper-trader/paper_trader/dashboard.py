@@ -226,6 +226,57 @@ def notify_health_api():
         }), 500
 
 
+@app.route("/api/dead-tickers")
+def dead_tickers_api():
+    """Snapshot of watchlist symbols currently dark in market.py's negative
+    cache — the symbols ``get_price`` /  ``get_prices`` is suppressing for
+    ``_DEAD_TTL`` seconds because yfinance returned no data on the last try.
+
+    Today this state is internal: the only operator signal is a one-shot
+    stderr line on the first dead-mark per TTL window. A trader looking at
+    a watchlist row showing ``N/A`` has no way to tell whether the engine
+    is *currently flying blind* on that symbol (still inside the suppression
+    window — won't even try yfinance this cycle) vs. *just had a single
+    miss* (cleared on the next attempt). This endpoint closes that gap so
+    the operator can see at a glance: "3 of 50 watchlist tickers are
+    dark right now; LITE has been dark for 4m, MUU for 12s — yfinance has
+    a real outage on LITE, MUU is fresh".
+
+    Single source of truth (invariant #10): the rows are
+    ``market.dead_tickers()`` verbatim. Pure read of the negative cache
+    — no yfinance, no store hop, no Claude. Deliberately NOT @swr_cached:
+    the underlying read is a module-global dict scan, the operator
+    wanting this number wants the LIVE value (an SWR cache that surfaces
+    a "3 dark" payload from 60s ago after a recovery wave is misleading).
+
+    Failure contract: any import / call fault degrades to an ERROR
+    envelope so the panel can render and the operator sees the fault,
+    never a 500 the upstream dashboard would render as "endpoint dark".
+    """
+    try:
+        from . import market as _mkt
+        rows = _mkt.dead_tickers()
+        if not isinstance(rows, list):
+            rows = []
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "n_dark": len(rows),
+            "ttl_seconds": int(_mkt._DEAD_TTL),
+            "tickers": rows,
+        })
+    except Exception as e:
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "verdict": "ERROR",
+            "headline": f"dead-tickers endpoint error: {e}",
+            "n_dark": 0,
+            "ttl_seconds": 0,
+            "tickers": [],
+        }), 500
+
+
 @app.route("/api/alarm-latches")
 def alarm_latches_api():
     """In-process silent-failure alarm-latch snapshot.
