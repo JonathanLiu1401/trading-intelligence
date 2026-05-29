@@ -6,6 +6,130 @@ during automated review / fix cycles. Where `CLAUDE.md` documents the
 
 ---
 
+## 2026-05-28 core HYBRID pass (Agent 1, second cycle) — ticker noise filter + today P/L attribution line
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=6
+
+### Phase 1 — `fix:` ticker-extractor noise (commit `3310318`)
+
+Live probing of `paper_trader/signals._extract_tickers` against
+typical wire headlines revealed seven false-positive tokens that
+extracted as "tickers" and polluted Opus's `tickers=` prompt block:
+
+| Input | Before | After |
+|-------|--------|-------|
+| `NYSE opens at 9:30 AM ET` | `{'NYSE'}` | `set()` |
+| `DOW JONES rallies on Fed signal` | `{'DOW','JONES'}` | `{'DOW'}` |
+| `WALL STREET ENDS WEEK HIGHER` | `{'WALL','STREET'}` | `set()` |
+| `DJIA closes at record high` | `{'DJIA'}` | `set()` |
+| `Berkshire BUYS more Apple` | `{'AAPL','BUYS'}` | `{'AAPL'}` |
+| `Insider SELLS 1M shares` | `{'SELLS'}` | `set()` |
+
+Each entry verified NOT to collide with a real listed ticker (NYSE
+is the exchange, DJIA is the index name, DIA is the tradeable ETF;
+State Street is `STT`, not `STREET`). Bare `BUY`/`SELL` remain
+preserved as analyst-rating headline tokens — that asymmetry is
+documented inline. Cashtag bypass (`$NYSE` / `$DJIA` / `$BUYS`)
+still works as the deliberate-signal escape hatch — same `AI`/`$AI`
+asymmetry the existing `_ALIAS_UPPER_FALSE_POSITIVES` block pins.
+
+Lock tests (`tests/test_core_signals.py` 5 new pins): exchange/
+index bare-extraction filter, `DOW JONES` not extracting `JONES`
+(while `DOW` still does), `WALL STREET` uppercase test, plurals
+filter with `AAPL` still surfacing via alias path, cashtag bypass
+for all 3 noise families.
+
+### Phase 2 — `feat:` per-ticker attribution of today's realized P/L (commit `399675f`)
+
+The daily-close + hourly summaries already show `Realized P/L
+(today, N round-trips closed, YW/ZL) $A` — but never name WHICH
+ticker drove the day. Live evidence (2026-05-28): MU -$22.76 +
+NVDA +$2.85 = net -$19.91, aggregate line just said "2 closes,
+1W/1L, -$19.91" with no indication MU was the entire drag.
+
+`/api/today-realized-pl-derived` already computes `biggest_win` /
+`biggest_loss` on the dashboard; operator never saw them because
+the dashboard panel isn't where they live. New
+`_today_top_contributors_line(store)` in `paper_trader/reporter.py`
+composes `derive_round_trips` + `build_today_realized_pl` verbatim
+(reactivation-safe SSOT) and surfaces best+worst tickers with $ and
+%. Wired into both `send_hourly_summary` and `send_daily_close`
+right after the banked-vs-paper line (realized-side sibling).
+
+Silence-when-nothing-actionable per the established convention:
+NO_CLOSES_TODAY / BREAKEVEN_DAY / `n_closes < 2` → "" (the SESSION
++ aggregate lines already name a single close; a separate "biggest"
+line for n=1 is duplication, not signal). ✅ icon for WINNING_DAY,
+📉 for LOSING_DAY — matches the existing `_exit_proximity_line`
+icon-by-verdict pattern.
+
+For today's live trade ledger the new line would render as:
+```
+📉 **TODAY P/L** ◈ LOSING_DAY  ($-19.91 over 2 closes, 1W/1L)
+> best `NVDA` $+2.85 (+0.45%) · worst `MU` $-22.76 (-2.45%)
+```
+
+Lock tests (`tests/test_today_top_contributors_line.py`, 11 cases):
+6 silence contracts (no closes / only-open-buy / breakeven / single
+close / None store / raising store), 3 shape pins (winning day,
+losing day, three closes naming only the EXTREMES not mid-pack),
+2 degrade-safety pins (yesterday-only ignored, garbage rows do not
+crash). All 952 `-k "reporter or hourly or daily_close or _line or
+round_trip"` tests pass.
+
+### Phase 3 — Live trader validation (`user_findings = 6`)
+
+1. **Live trader HEALTHY** — runner auto-restarted onto Phase 2
+   commit `399675f` ≤3 min after push (build-info `behind=1` after
+   sibling Agent 4 also landed `57fa806`). `/api/runner-heartbeat`
+   reports `HEALTHY — last decision 7m ago, within the 60m
+   market-closed cadence`. Phase = `OVERNIGHT — opens in 9h55m`.
+2. **Discord channel HEALTHY** — `/api/notify-health` returns
+   `HEALTHY — last Discord send succeeded` at 03:27 UTC. No
+   consecutive failures, no error.
+3. **All alarm latches CLEAR** — `/api/alarm-latches` reports
+   `CLEAR — no silent-failure alarm latches held; the engine is
+   responding`. Breaker outage count = 0 this session.
+4. **Recent trade rationale is genuinely trader-grade** — NVDA
+   SELL reason is a 600+ char thesis explicitly flagging the
+   drift signal: "Thesis explicitly flagged WEAKENING — MACD
+   turned bearish (hist -1.92), 5d momentum -4.13% … Taking the
+   +0.4% off on a broken thesis is not cutting a winner — it's
+   honoring the drift signal." MU was a HARD_SL force-exit at
+   $905.65 (threshold $909.84) — the auto-exit machinery worked
+   as designed without operator intervention.
+5. **NVDA SELL fired at 22:45 UTC = 18:45 ET, AFTER session
+   close** (NYSE 16:00 ET). This is by design per CLAUDE.md
+   invariant #12 (Opus has full autonomy — no hard market-hours
+   gate), but trader-visible: the strategy can execute against
+   post-close yfinance marks during AFTER_CLOSE phase. Not
+   blocking; worth knowing for future calibration discussions.
+6. **Decision efficacy is PRODUCING at 60%** — 12/20 recent
+   cycles produced a decision. `decision_efficacy.verdict =
+   PRODUCING` (above the DEGRADED threshold). Consistent with
+   the documented host-saturation pattern; the just-cycled NO
+   _DECISION pair was followed by a clean HOLD on the next
+   cycle, so the breaker (5 consecutive) is nowhere close.
+
+### Focused test commands for this domain (Agent 1 / core)
+
+```bash
+# This pass's lock tests (16 total, ~3s)
+python3 -m pytest tests/test_core_signals.py \
+    tests/test_today_top_contributors_line.py -v
+
+# Broader signals + reporter regression (~95s)
+python3 -m pytest tests/ -k "reporter or hourly or daily_close or _line or round_trip"
+
+# Live trader perspective probes (read-only — never trains, never trades)
+curl -s http://localhost:8090/api/runner-heartbeat | python3 -m json.tool
+curl -s http://localhost:8090/api/today-realized-pl-derived | python3 -m json.tool
+curl -s http://localhost:8090/api/notify-health | python3 -m json.tool
+curl -s http://localhost:8090/api/alarm-latches | python3 -m json.tool
+```
+
+---
+
 ## 2026-05-28 ML+backtest HYBRID pass (Agent 2, second cycle) — `predict_with_meta.gate_arm` decode
 
 **Counters:** bugs_fixed=0 · features_added=1 · user_findings=6
