@@ -712,7 +712,25 @@ class PriceCache:
                     close = row.get("Close")
                     if close is None or close != close:  # NaN check
                         continue
-                    series[iso] = float(close)
+                    # Treat 0/negative closes as missing rather than poisoning
+                    # the cache. yfinance can return 0.0 on a halted /
+                    # illiquid intraday row (and the bulk path Agent 1 just
+                    # patched in `market.get_prices` had the same class of
+                    # bug). A $0 cached close would propagate into
+                    # `returns_pct` as `(end - 0) / 0` (DivisionByZero — but
+                    # we hit `if not s` first which is True for 0.0 and
+                    # returns a *fabricated* 0.0 outcome) and into
+                    # `_compute_decision_outcomes` as a flat-return training
+                    # row. `_buy(price=0)` would have notional=0. SPY 0-close
+                    # days would still appear in `_build_trading_days` since
+                    # it iterates `spy.keys()` — making them sampled
+                    # decisions with degenerate marks. Filter at the storage
+                    # boundary so neither the cache file NOR the in-memory
+                    # series ever carry a poisoned tick.
+                    close_f = float(close)
+                    if close_f <= 0:
+                        continue
+                    series[iso] = close_f
                 self.prices[t] = series
                 print(f"[price_cache]   {t}: {len(series)} rows")
             except Exception as e:
@@ -784,18 +802,26 @@ class PriceCache:
         self.trading_days = days
 
     def price_on(self, ticker: str, d: date) -> float | None:
-        """Close on `d` if available; else most recent prior close."""
+        """Close on `d` if available; else most recent prior close.
+
+        0/negative cached values (legacy caches built before the storage-side
+        filter landed) are treated as missing and walked back over — the same
+        defensive contract `market.get_price` already follows. The walk-back
+        therefore skips poisoned ticks rather than returning a $0 mark.
+        """
         series = self.prices.get(ticker)
         if not series:
             return None
         iso = d.isoformat()
-        if iso in series:
-            return series[iso]
+        v = series.get(iso)
+        if v is not None and v > 0:
+            return v
         # walk back up to 7 days
         for delta in range(1, 8):
             prior = (d - timedelta(days=delta)).isoformat()
-            if prior in series:
-                return series[prior]
+            v = series.get(prior)
+            if v is not None and v > 0:
+                return v
         return None
 
     def resolved_close_date(self, ticker: str, d: date) -> date | None:
@@ -812,16 +838,20 @@ class PriceCache:
         and looks indistinguishable from a real flat 5-day window. This method
         exposes the resolution so callers can refuse a collision instead.
         Pure read; uses the same 7-day window as ``price_on`` so semantics stay
-        in lockstep (a change to ``price_on``'s window MUST update this too).
+        in lockstep (a change to ``price_on``'s window MUST update this too) —
+        same 0/negative-as-missing filter so the resolved-date and the
+        returned price agree on which day was usable.
         """
         series = self.prices.get(ticker)
         if not series:
             return None
-        if d.isoformat() in series:
+        v = series.get(d.isoformat())
+        if v is not None and v > 0:
             return d
         for delta in range(1, 8):
             prior_d = d - timedelta(days=delta)
-            if prior_d.isoformat() in series:
+            v = series.get(prior_d.isoformat())
+            if v is not None and v > 0:
                 return prior_d
         return None
 
