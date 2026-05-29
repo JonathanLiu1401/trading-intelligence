@@ -71,6 +71,35 @@ class TestClassify:
         assert _classify(123) == "neutral"   # type: ignore
         assert _classify("") == "neutral"
 
+    def test_third_person_singular_bull_forms_classified(self):
+        # Regression: "MU surges" was previously classified neutral because
+        # only "surge"/"surged" lived in _BULL_TERMS while the bear side had
+        # all three forms ("plunge"/"plunges"/"plunged"). The asymmetry tilted
+        # bull headlines neutral on a held name, which silently flipped
+        # held_wire_balance / wire_stance verdicts from BULL_LEAN to MIXED /
+        # INSUFFICIENT. Real headlines on a single ticker overwhelmingly use
+        # 3rd-person singular ("MU surges on HBM", "NVDA upgrades to Buy",
+        # "AMD jumps after deal").
+        for s in ["MU surges on HBM demand",
+                  "NVDA upgrades by analyst",
+                  "AMD jumps after deal",
+                  "INTC raises guidance",
+                  "TSM tops estimates again",
+                  "ARM outperforms peers"]:
+            assert _classify(s) == "bull", s
+
+    def test_third_person_singular_bear_forms_classified(self):
+        # Mirror of the bull-side regression — "MU fell 5%" (irregular past
+        # tense of fall), "NVDA misses estimates" (already covered by
+        # "misses"), and "AMD downgrades to underweight" must each classify
+        # bear. "fell" was missing pre-fix; without it a bear headline using
+        # the irregular past tense scored neutral.
+        for s in ["MU fell 5% on guidance miss",
+                  "AMD downgrades to underweight",
+                  "TSLA drop on softer demand",
+                  "INTC underperforms its peers"]:
+            assert _classify(s) == "bear", s
+
 
 class TestAggregate:
     def test_empty_returns_skeleton(self):

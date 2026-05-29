@@ -66,22 +66,36 @@ MACRO_COHERENCE_PCT = 70.0
 # rely on the regex word-boundary so "outperformed" matches inside
 # "outperformed" but "underperformance" does not match "perform".
 _BULL_TERMS = {
-    "surge", "surged", "rally", "rallies", "rallied", "soar", "soars",
-    "soared", "beat", "beats", "tops", "upgrade", "upgraded", "raised",
-    "boost", "boosts", "boosted", "record", "high", "highs", "outperform",
-    "outperformed", "expansion", "growth", "approves", "approved",
+    # Verb-conjugation completeness — third-person singular ("surges",
+    # "upgrades", "jump") was previously missing on the bull side while the
+    # bear side had its "-s" forms. Live headlines on a single ticker
+    # overwhelmingly use 3rd-person singular ("MU surges", "NVDA upgrades to
+    # Buy"). The asymmetry tilted classifications neutral for genuine bull
+    # news, the exact failure surfaced by test_wire_stance.
+    "surge", "surges", "surged", "rally", "rallies", "rallied",
+    "soar", "soars", "soared", "beat", "beats", "tops", "topped",
+    "upgrade", "upgrades", "upgraded", "raised", "raises",
+    "boost", "boosts", "boosted", "record", "high", "highs",
+    "outperform", "outperforms", "outperformed",
+    "expansion", "growth", "approves", "approved",
     "breakthrough", "wins", "win", "bullish", "buy", "overweight",
-    "strong-buy", "outshines", "jumps", "jumped",
+    "strong-buy", "outshines", "outshone",
+    "jump", "jumps", "jumped",
 }
 _BEAR_TERMS = {
     "plunge", "plunges", "plunged", "tumble", "tumbles", "tumbled", "slump",
-    "slumps", "slumped", "misses", "missed", "downgrade", "downgraded",
+    "slumps", "slumped", "miss", "misses", "missed",
+    "downgrade", "downgrades", "downgraded",
     "cut", "cuts", "lowered", "warning", "warns", "warned", "probe", "fraud",
     "lawsuit", "sues", "sued", "investigation", "recall", "recalls",
     "bankruptcy", "default", "selloff", "sell-off", "low", "lows",
-    "underperform", "underperformed", "bearish", "sell", "underweight",
-    "strong-sell", "falls", "fall", "drops", "dropped", "decline",
-    "declines", "declined", "loss", "losses",
+    "underperform", "underperforms", "underperformed",
+    "bearish", "sell", "underweight", "strong-sell",
+    # "fell" is the irregular past tense of "fall" — heavily used in
+    # headlines ("MU fell 5%") and previously missing on the bear side.
+    "falls", "fall", "fell",
+    "drop", "drops", "dropped",
+    "decline", "declines", "declined", "loss", "losses",
 }
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z\-']{1,}")
 
