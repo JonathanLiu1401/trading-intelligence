@@ -5,6 +5,144 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-29 HYBRID pass (Agent 3, pass #7) — `urgent_count_per_briefing_window_trend` primitive
+
+**Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=6`.
+
+### Phase 1 — Debug & fix (0 bugs, honest zero)
+
+Audited the spec invariants per task description: backtest isolation (`tests/test_article_store.py`),
+score_source separation, feature dim / ticker density (`tests/test_features.py`), ArticleNetModule
+output ranges (`tests/test_model.py`), trainer score-source exclusion + sample-weight ordering
+(`tests/test_trainer.py`), urgency threshold (`tests/test_urgency_scorer.py`). Focused regression
+suite (test_article_store + test_features + test_model + test_trainer + test_urgency_scorer +
+test_alert_agent) — **88 tests passed in 58.99s, zero failures**.
+
+Re-verified `memory/di-portfolio-ticker-drift.md`'s claim that `claude_analyst._BOOK_TICKERS` and
+`daemon.PORTFOLIO_TICKERS` were drifting behind config/portfolio.json. Both static tuples DO still
+exist (test-parity-frozen), but the LIVE-path callers now union with `LIVE_PORTFOLIO_TICKERS`:
+`_BOOK_UNIVERSE` (claude_analyst.py:2060) drives `_BOOK_RE`; `_price_alert_universe()`
+(daemon.py:3757) drives price alerts and is passed to `_format_portfolio_coverage` in the
+heartbeat path (daemon.py:4298). Drift is structurally CLOSED on both sites — the original
+memory was stale. Memory now updated to reflect the actual remaining shape (static-for-tests +
+live-union pattern).
+
+No commit per the Phase 1 guard rule — honest zero rather than synthetic find.
+
+### Phase 2 — Feature dev (1 feature: `urgent_count_per_briefing_window_trend`)
+
+**What.** `ArticleStore.urgent_count_per_briefing_window_trend(last_n=10)` — per-briefing-window
+URGENT-row-count trend. The new method completes the briefing-trend family by adding the
+urgent-flow axis the existing four siblings don't cover:
+
+  - `briefing_cadence_trend`               — schedule integrity ("firing on schedule?")
+  - `briefing_text_overlap_trend`          — output freshness vs recapping
+  - `briefing_length_trend`                — output text length trend
+  - `briefing_article_count_trend`         — INPUT candidate pool size trend
+  - `urgent_count_per_briefing_window_trend` — URGENT flow per 5h window (NEW)
+
+Concretely: for the last `last_n+1` briefings, counts `urgency>=1` rows whose `first_seen` lands
+in each consecutive inter-briefing window `[older.ts, newer.ts)`. An analyst tracking the urgent
+rate cycle-over-cycle previously had to query `stats_since` per window manually and compose the
+trend by eye; a single primitive surfaces SURGING / QUIETING verdicts so the dashboard / chat
+can render it directly.
+
+**Returns.** `{last_n, n_windows, windows, counts, median_count, min_count, max_count,
+recent_median, older_median, surge_ratio, verdict}` where `verdict` ∈
+`{STABLE, SURGING, QUIETING, NO_DATA}`. Verdict ladder mirrors `briefing_article_count_trend`
+exactly (`>=1.3` → SURGING, `<=0.7` → QUIETING, else STABLE, NO_DATA when `n_windows < 4` or
+`older_median == 0`). Each window dict carries `older_ts / newer_ts / duration_h / urgent_count`
+so the dashboard can show actual cadence variance alongside the counts.
+
+**Live evidence (2026-05-29T08:30Z, articles.db 8-briefing pull).**
+
+```
+counts = [49, 135, 170, 27, 9, 61, 13, 5]
+durations_h = [10.0, 13.5, 16.6, 5.8, 5.9, 11.6, 5.1, 5.3]
+older_median = 135, recent_median = 13
+surge_ratio = 0.096 → verdict = QUIETING
+```
+
+Wire materially quieter than 2-3 days ago — median urgent count per window dropped 90%+ across
+the last 8 briefings. No other primitive surfaces this; the analyst would only know by manually
+inspecting Discord push history. Note the window durations vary wildly (5.1h to 16.6h) — the
+companion `briefing_cadence_trend` catches that orthogonal axis; the urgent-count method exposes
+the wire's actual quietness independent of the cadence noise.
+
+**Invariants intact (all four).**
+  - Backtest isolation: `_LIVE_ONLY_CLAUSE` applied to the per-window urgent count so synthetic
+    backtest/opus rows never inflate the trend. Pinned by `TestBacktestIsolation` (3 tests).
+  - ml_score ↔ ai_score separation: pure SELECT, no write — invariant tautologically intact.
+  - score_source: untouched (read-only).
+  - urgency: untouched (read-only). Pinned by `TestReadOnlyInvariant::test_does_not_mutate_articles`.
+
+**Files:**
+  - `storage/article_store.py` — added `urgent_count_per_briefing_window_trend` method after
+    `briefing_article_count_trend` (+205 lines, one SELECT against `briefings` for cadence
+    anchors plus per-window COUNT against `articles` with `_LIVE_ONLY_CLAUSE`).
+  - `tests/test_urgent_count_per_briefing_window_trend.py` — 14 new tests pinning: NO_DATA
+    branches (empty / <4 windows / older_median=0), verdict ladder (STABLE / SURGING / QUIETING
+    + a borderline-22%-stays-stable boundary pin), backtest isolation (url / source_tag /
+    opus_annotation), window boundary semantics (half-open `[older, newer)`, `duration_h`
+    populated), `last_n` window cap, and the read-only mutation invariant.
+
+**Test counts.** New feature suite: **14 passed in 0.33s**. Focused regression including all
+four briefing-trend siblings: **170 passed in 9.75s**, zero failures.
+
+### Phase 3 — Live news-analyst findings (6)
+
+Against `/media/zeph/projects/digital-intern/db/articles.db` at 2026-05-29T08:30Z (read-only):
+
+1. **Urgent flow QUIETING — 90%+ drop across last 8 briefing windows** (the new method's live
+   output). Median urgent count per window dropped from 135 (older 4 windows) to 13 (newer 4
+   windows). Surge ratio 0.096. The wire genuinely calmed in the last ~24h vs. 2-3 days ago —
+   the same period showed multi-day urgent counts of 49-170 per window. Actionable for the
+   analyst: alert load is materially lower right now; less FOMO on a quiet wire.
+
+2. **91% ML-only urgent fraction in 24h** — 79 of 87 urgent rows carry `score_source='ml'`
+   (`ai_score=0`, raw unverified urgency-head calls). Sonnet vetting is rarely engaged — same
+   pattern as passes 4/5/6. The `[unverified — model-only urgent]` calibration tag hedges
+   per-row but the aggregate unverified-fraction has not improved meaningfully.
+
+3. **Briefing cadence wildly uneven — 16.6h max gap** in the 8-window window pull.
+   `briefing_cadence_trend` reads SLIPPING/DRIFTING on this data (three windows of 10h+, two
+   under 5.5h). The new urgent-count trend would over-attribute "QUIETING" to a calm wire if
+   cadence variance is the dominant signal; the per-window `duration_h` field in the dict
+   exposes this so the consumer can judge whether to per-hour-normalize.
+
+4. **20 urgency=1 rows still queued, oldest 23+h old** — at the 24h reaper boundary. Same
+   chronic risk documented in `memory/di-stale-urgent-reaper-oscillation.md`: the reaper will
+   silently demote without delivery. The new method's "recent_median=13" actually captures this
+   — most of recent urgent flow is queue-aged and about to be lost. `urgent_queue_health` would
+   surface the `near_reap` count.
+
+5. **Chronic-dark collectors confirmed: polygon, newsapi, nitter — 0 articles in 24h** (memory
+   `di-chronic-dark-collectors`). Standing external gap, not a fresh bug — the supervisor
+   correctly disabled them (`91 disabled / 10 stale / 93 down` per latest source_health line).
+
+6. **666 "database is locked" lines + 20 retry-exhausted errors in current daemon.log session**
+   — chronic structural pressure documented in `memory/di-insert-batch-lock-contention.md`.
+   Worst-hit method today: `update_ml_scores_batch` (4 exhaustions in the 8h window). The
+   `@_retry_on_lock` decorator absorbs >97% of contention; the rare exhaustion is the
+   structural cost of `check_same_thread=False` across ~30 daemon threads.
+
+### Phase 4 — Docs & verify
+
+This section. Final verify:
+  - `python3 -c "import sys; sys.path.insert(0, '.'); from storage import article_store; from ml import features, model; print('imports OK')"` → `imports OK`.
+  - `pytest tests/test_urgent_count_per_briefing_window_trend.py tests/test_article_store.py tests/test_features.py tests/test_model.py tests/test_trainer.py tests/test_urgency_scorer.py tests/test_alert_agent.py tests/test_briefing_article_count_trend.py tests/test_briefing_cadence_trend.py tests/test_briefing_length_trend.py tests/test_briefing_text_overlap_trend.py -q` → **170 passed in 9.75s**.
+
+**Staging discipline.** Per-commit explicit pathspec (`memory/di-shared-repo-concurrency.md`).
+This pass touched exactly two files: `storage/article_store.py`,
+`tests/test_urgent_count_per_briefing_window_trend.py` (new), plus this AGENTS.md entry. No
+`git add -A`, no `.json` / `config/` / `data/` / `logs/` staged. `git diff --staged` verified
+before commit. Concurrent agents on the same tree during this pass had `analysis/wire_stance.py`,
+`analytics/ml_ai_divergence.py`, `collectors/earnings_transcript_collector.py`,
+`tests/test_wire_stance.py`, and `dashboard/web_server.py` in flight — all deliberately left
+exactly as found.
+
+---
+
 ## 2026-05-28 HYBRID pass (Agent 3, pass #6) — `briefing_article_count_trend` primitive
 
 **Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=5`.
