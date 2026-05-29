@@ -577,6 +577,17 @@ def _book_exposure_line(store) -> str:
         if total <= 0:
             return ""
         pl_pct = (total - _INITIAL_EQUITY) / _INITIAL_EQUITY * 100.0
+        # ``cash`` is the operator's "what can I act with right now" number on
+        # a wedge-page — biggest-position-weight alone tells them how
+        # concentrated the FROZEN book is, but a 70%-biggest line with no
+        # cash split conceals whether 28% is in three small lots or in
+        # cash. Defensive coerce mirrors the ``total`` extraction above —
+        # a NULL / non-numeric cash collapses to 0.0 so the alarm path
+        # always renders the token (never raises).
+        try:
+            cash = float(pf.get("cash") or 0.0)
+        except (TypeError, ValueError):
+            cash = 0.0
         positions = store.open_positions() or []
         held: list[dict] = []
         for p in positions:
@@ -614,8 +625,20 @@ def _book_exposure_line(store) -> str:
             upl_pct = None
         upl_tok = f" ({upl_pct:+.2f}% unrealized)" if upl_pct is not None else ""
         n_word = "position" if n == 1 else "positions"
+        # Cash %. The biggest-position weight tells the operator how
+        # concentrated the FROZEN book is; the cash % tells them how much
+        # dry powder is available if they decide to manually intervene
+        # (close the wedged engine and exit by hand). Both are first-order
+        # questions for a trader paged on a multi-hour quota / breaker
+        # outage, and the dashboard answers both — but the operator on a
+        # pager is by definition not at a dashboard. Clamped to [0, 100]
+        # so a transient mark-to-market wobble (cash briefly > total under
+        # a write race) never renders a >100% token.
+        cash_pct = (cash / total * 100.0) if total > 0 else 0.0
+        cash_pct = max(0.0, min(100.0, cash_pct))
         return (f"book: ${total:.2f} ({pl_pct:+.2f}% from start) · "
-                f"{n} {n_word} · biggest {bt} {bw_pct:.1f}%{upl_tok}")
+                f"{n} {n_word} · cash {cash_pct:.1f}% · "
+                f"biggest {bt} {bw_pct:.1f}%{upl_tok}")
     except Exception as e:
         print(f"[reporter] book-exposure line skipped: {e}")
         return ""

@@ -1168,6 +1168,89 @@ class TestBookExposureLine:
         line = reporter._book_exposure_line(s)
         assert "+5.00% from start" in line
 
+    def test_cash_pct_token_present_when_positions_held(self):
+        """The held-position branch must render an explicit cash %% so a
+        trader paged on a wedge can see the dry-powder split alongside the
+        biggest-position concentration. With $300 cash on a $1000 book that
+        is 30.0%."""
+        pos = [{
+            "ticker": "NVDA", "type": "stock", "qty": 3.5,
+            "current_price": 200.0, "avg_cost": 200.0,
+        }]
+        s = self._fake_store(total=1000.0, cash=300.0, positions=pos)
+        line = reporter._book_exposure_line(s)
+        assert "cash 30.0%" in line
+        # The biggest token still renders — additive, not replacement.
+        assert "biggest NVDA 70.0%" in line
+
+    def test_cash_pct_zero_when_fully_invested(self):
+        """A fully-deployed book renders cash 0.0% — not blank, so the
+        operator never has to infer "is that 0% or did the token break?"."""
+        pos = [{
+            "ticker": "NVDA", "type": "stock", "qty": 5.0,
+            "current_price": 200.0, "avg_cost": 200.0,
+        }]
+        s = self._fake_store(total=1000.0, cash=0.0, positions=pos)
+        line = reporter._book_exposure_line(s)
+        assert "cash 0.0%" in line
+
+    def test_cash_pct_clamps_above_100(self):
+        """A transient mark-to-market write race could leave cash >
+        total_value briefly (the snapshot is mid-flight). The token must
+        never render >100% — that would alarm an operator with a
+        non-physical reading on what is otherwise a healthy mid-cycle
+        snapshot. The all-cash branch (n==0) handles this separately;
+        this test exercises the n>0 path where the inconsistency is
+        most likely (a snapshot whose ``positions`` reflects pre-trade
+        but whose ``cash`` reflects post-trade)."""
+        pos = [{
+            "ticker": "NVDA", "type": "stock", "qty": 1.0,
+            "current_price": 100.0, "avg_cost": 100.0,
+        }]
+        # cash > total: non-physical but observed under write races
+        s = self._fake_store(total=200.0, cash=500.0, positions=pos)
+        line = reporter._book_exposure_line(s)
+        assert "cash 100.0%" in line  # clamped
+        assert "cash 250" not in line  # would-be raw value never leaks
+
+    def test_cash_pct_clamps_below_zero(self):
+        """A negative cash (margin / over-spend) must clamp to 0.0%, not
+        render ``cash -2.3%`` as a real reading."""
+        pos = [{
+            "ticker": "NVDA", "type": "stock", "qty": 1.0,
+            "current_price": 100.0, "avg_cost": 100.0,
+        }]
+        s = self._fake_store(total=100.0, cash=-50.0, positions=pos)
+        line = reporter._book_exposure_line(s)
+        assert "cash 0.0%" in line
+        assert "cash -" not in line
+
+    def test_cash_pct_skipped_in_all_cash_branch(self):
+        """The n==0 branch already says '100% cash' — the cash %% token
+        appears ONLY in the held-positions branch so an all-cash book does
+        not stutter ('100% cash · cash 100.0%')."""
+        s = self._fake_store(total=1010.0, cash=1010.0, positions=[])
+        line = reporter._book_exposure_line(s)
+        assert line == "book: $1010.00 (+1.00% from start) · 100% cash"
+
+    def test_cash_pct_missing_in_portfolio_defaults_to_zero(self):
+        """A store whose ``get_portfolio`` omits the ``cash`` key (legacy
+        callers / fault-tolerant stubs) must NOT crash the helper —
+        defensive coerce yields 0.0% and the rest of the line still
+        ships. Mirrors the helper's discipline that alarm-path code
+        never raises."""
+        class _NoCashStore:
+            def get_portfolio(self):
+                return {"total_value": 1000.0}  # no "cash" key
+            def open_positions(self):
+                return [{
+                    "ticker": "NVDA", "type": "stock", "qty": 1.0,
+                    "current_price": 500.0, "avg_cost": 500.0,
+                }]
+        line = reporter._book_exposure_line(_NoCashStore())
+        assert "cash 0.0%" in line
+        assert "biggest NVDA 50.0%" in line
+
 
 class TestBreakerFiredAlertWithBookExposure:
     """The book exposure line is appended to ``send_breaker_fired_alert``
