@@ -74,6 +74,16 @@ NO_DECISION_STORM_THRESHOLD = 5
 # cycle still produced a decision: not a hard wedge, but the documented
 # elevated-failure regime — surfaced informational, NO restart recommended.
 NO_DECISION_ELEVATED_PCT = 50.0
+# Pre-storm offset: a consecutive run this close to (but not at) the storm
+# threshold surfaces as PRE_STORM — an early-warning verdict the trader sees
+# BEFORE the breaker actually fires, so a desk scanning at-a-glance gets one
+# cycle of advance notice that the engine is on the verge of a wedge. AGENTS.md
+# 2026-05-29 Agent 1 user_finding #1 explicitly flagged this gap: under a
+# building host-saturation storm, ``decision_efficacy.verdict`` reads PRODUCING
+# right up until the IDLE_STORM jump, with no warning state in between. Offset
+# of 1 means PRE_STORM fires at ``consec == threshold - 1`` (= 4 with the
+# default threshold of 5) — the last cycle before the breaker arms.
+PRE_STORM_OFFSET = 1
 
 # Causes for which a paper-trader RESTART is actively counter-productive, not
 # merely useless: a host-saturation storm is cleared by REDUCING concurrent
@@ -151,6 +161,10 @@ def _decision_efficacy(recent_actions: list[str] | None,
       * ``IDLE_STORM`` — the latest ``>= threshold`` cycles were ALL
         NO_DECISION (engine cycling but not deciding — the runner
         auto-recovery-breaker wedge);
+      * ``PRE_STORM``  — the latest ``threshold - PRE_STORM_OFFSET`` to
+        ``threshold - 1`` cycles were ALL NO_DECISION (engine is one miss
+        away from the breaker; early warning, NO restart recommendation —
+        the next real decision still clears it without operator action);
       * ``DEGRADED``   — not a hard storm, but ``>= NO_DECISION_ELEVATED_PCT``
         of the window is NO_DECISION (the documented elevated regime —
         informational, no restart);
@@ -215,7 +229,18 @@ def _decision_efficacy(recent_actions: list[str] | None,
             eff["dominant_cause"] = cause
             eff["restart_helps"] = bool(restart_helps)
         return eff
-    if pct >= NO_DECISION_ELEVATED_PCT:
+    if consec >= max(1, threshold - PRE_STORM_OFFSET):
+        # Pre-storm: a leading run THIS close to the breaker is the early-
+        # warning regime AGENTS.md user_finding #1 flagged — a trader scanning
+        # at-a-glance sees PRE_STORM instead of PRODUCING and knows the engine
+        # is one miss away from the wedge. No restart_recommended: the next
+        # real decision still clears the latch without operator action.
+        verdict = "PRE_STORM"
+        headline = (
+            f"PRE_STORM — the last {consec} cycles were NO_DECISION "
+            f"({pct:.0f}% of the last {window}); one more miss arms the "
+            f"auto-recovery breaker. Engine is on the verge of a wedge.")
+    elif pct >= NO_DECISION_ELEVATED_PCT:
         verdict = "DEGRADED"
         headline = (
             f"DEGRADED — {pct:.0f}% of the last {window} cycles were "
@@ -384,7 +409,19 @@ def build_runner_heartbeat(
                              recent_reasons)
     if eff is not None:
         out["decision_efficacy"] = eff
-        if eff["verdict"] == "IDLE_STORM":
+        if eff["verdict"] == "PRE_STORM":
+            # Early-warning clause folded into the top-level headline so a
+            # trader scanning at-a-glance sees the warning instead of just
+            # a green ``HEALTHY``. NO restart_recommended (the next real
+            # decision still clears the latch — same back-pressure rule
+            # the DEGRADED arm follows). Matches the IDLE_STORM
+            # headline-append style so the bracket reads consistently.
+            n = eff["consecutive_no_decision"]
+            out["headline"] += (
+                f" ⚠ the last {n} cycles were NO_DECISION — "
+                f"engine is one miss from the auto-recovery breaker; "
+                f"watching for the next real decision.")
+        elif eff["verdict"] == "IDLE_STORM":
             # Real-decision age clause for the IDLE_STORM headline — the
             # operator-actionable number under a storm. Always appended (cause-
             # diagnosed or generic) when ``last_real_decision_ts`` was supplied
