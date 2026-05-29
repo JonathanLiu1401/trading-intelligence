@@ -259,6 +259,59 @@ class TestExtractTickers:
         assert "REAL" in signals._extract_tickers("REAL beats on subscriber growth")
         assert "CHIP" in signals._extract_tickers("CHIP lifts full-year guidance")
 
+    def test_exchange_and_index_names_filtered(self):
+        # Exchange and index name tokens that previously leaked into the
+        # ``tickers`` field Opus reads. Each entry is NOT a real public
+        # ticker (NYSE is an exchange, DJIA is the Dow Jones index name);
+        # the cashtag bypass keeps an explicit $NYSE deliberate-signal use
+        # case working. Pin so a future trim cannot re-introduce the live
+        # 2026-05-28 regression where every market-hours "NYSE opens..."
+        # headline polluted the prompt with NYSE-as-a-ticker.
+        for noise in ("NYSE", "DJIA"):
+            out = signals._extract_tickers(f"{noise} opens at 9:30 AM ET")
+            assert noise not in out, (
+                f"{noise!r} should be filtered; got {sorted(out)!r}")
+
+    def test_dow_jones_phrase_does_not_emit_jones(self):
+        # "DOW JONES" headlines previously extracted both DOW (real ticker,
+        # Dow Inc.) and JONES (no such public ticker). The DOW must still
+        # surface (it is a real listed name); JONES must NOT.
+        out = signals._extract_tickers("DOW JONES rallies on Fed signal")
+        assert "DOW" in out
+        assert "JONES" not in out
+
+    def test_wall_street_uppercase_extracts_nothing(self):
+        # ALL-CAPS "WALL STREET" headlines previously emitted both WALL
+        # and STREET — neither is a public ticker (State Street is STT).
+        out = signals._extract_tickers("WALL STREET ENDS WEEK HIGHER")
+        assert "WALL" not in out
+        assert "STREET" not in out
+
+    def test_buys_sells_plural_verb_filtered(self):
+        # Plural verb forms used in headline ledes ("Berkshire BUYS more
+        # Apple", "Insider SELLS up to $1M") are NOT real tickers. Bare
+        # BUY / SELL are deliberately preserved (analyst-rating headlines:
+        # "RBC upgrades NVDA to BUY") — that asymmetry is the documented
+        # rationale in _NOT_TICKERS. AAPL must still surface from the
+        # "Berkshire BUYS more Apple" alias-path so the trader still
+        # gets the news.
+        out = signals._extract_tickers("Berkshire BUYS more Apple")
+        assert "BUYS" not in out
+        assert "AAPL" in out  # alias-path on "Apple"
+
+        out2 = signals._extract_tickers("Insider SELLS up to 1M shares")
+        assert "SELLS" not in out2
+
+    def test_exchange_cashtag_bypass_still_works(self):
+        # The cashtag asymmetry holds for the new entries — a deliberate
+        # $NYSE / $DJIA / $JONES cashtag is an intentional signal even
+        # though the bare token is now filtered. (Mirrors the AI / $AI
+        # asymmetry pin.) Without this, the cashtag override could
+        # silently regress without anyone noticing.
+        assert "NYSE" in signals._extract_tickers("watching $NYSE today")
+        assert "DJIA" in signals._extract_tickers("$DJIA breakout")
+        assert "JONES" in signals._extract_tickers("eyeing $JONES")
+
 
 class TestTickerAliasExtraction:
     """Locks the company-name → ticker alias path. A headline that names a
