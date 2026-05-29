@@ -2923,6 +2923,109 @@ def _feed_health_line(store) -> str:
         return ""
 
 
+def _dead_age_token(secs: int | float | None) -> str:
+    """Compact age token for a dark-ticker entry: ``"12s"`` / ``"4m"`` /
+    ``"2h"``. ``None`` / negative / non-numeric → ``""`` so the caller renders
+    no parenthetical when the producer's clock-skew clamp dropped the field.
+    Bounded above by ``market._DEAD_TTL`` (300s today) so values never reach
+    the hour range in practice; the ``h`` arm is defensive against a future
+    TTL widening."""
+    try:
+        s = float(secs) if secs is not None else None
+    except (TypeError, ValueError):
+        return ""
+    if s is None or s < 0:
+        return ""
+    s_i = int(s)
+    if s_i < 60:
+        return f"{s_i}s"
+    if s_i < 3600:
+        return f"{s_i // 60}m"
+    return f"{s_i // 3600}h"
+
+
+def _dead_tickers_line(market_mod=None) -> str:
+    """One-line ``"which watchlist symbols is the engine flying blind on
+    right now?"`` for the hourly / daily report.
+
+    ``market.dead_tickers()`` exposes the live negative-cache state (symbols
+    yfinance has returned no data for inside the last ``_DEAD_TTL`` window),
+    and ``/api/dead-tickers`` surfaces it on the dashboard. But the operator
+    lives in Discord and never opens the dashboard — the documented gap
+    ``_mark_integrity_line`` / ``_feed_health_line`` / ``_drawdown_line``
+    each close one dimension over. When the engine sees ``N/A`` for a watch-
+    list name, Opus's prompt has no idea whether that name is *known broken*
+    (the dead cache is suppressing yfinance) vs. *transiently slow* (one
+    miss this cycle, will retry next). The trader monitoring Discord
+    historically had to scrape stderr or open the dashboard to see this.
+
+    Composes ``market.dead_tickers()`` **verbatim** (single source of truth,
+    invariant #10 — the rows are the producer's, never re-derived here, so
+    this Discord line and ``/api/dead-tickers`` can never drift). Pure read
+    of the module-global negative cache — NO network, NO store hop (the
+    Discord-path discipline; the ``_feed_health_line`` precedent). Observa-
+    tional only, never gates, adds no caps (invariants #2/#12).
+
+    Suppression contract — the silence-when-nothing-actionable precedent
+    (``_drawdown_line`` at-high-water / ``_feed_health_line`` HEALTHY):
+      * Empty cache (no dark tickers) → ``""``. A healthy watchlist must
+        never become its own lying green light on the hourly.
+      * Any non-empty count → fires; ``⚠️`` icon + the top-5 worst names
+        (sorted by ``seconds_dead`` descending — the longest-dark first
+        is the most actionable signal for an operator deciding "is this
+        a yfinance outage or a one-off blip?").
+
+    Format::
+
+        ⚠️ DEAD TICKERS ◈ 3 watchlist symbol(s) dark on yfinance
+        > LITE 4m · MUU 2m · NVDA 12s — engine reads N/A this cycle
+
+    Failure contract mirrors the rest of ``reporter``: any producer fault
+    degrades to ``""`` ("no dead-tickers line this report"), **never** an
+    exception ("no Discord summary this report"). ``market_mod`` is
+    injectable for deterministic tests; defaults to the real ``market``
+    module imported at module top.
+    """
+    try:
+        m = market_mod if market_mod is not None else market
+        rows = m.dead_tickers()
+        if not isinstance(rows, list) or not rows:
+            return ""
+        # Sort by seconds_dead DESC so the longest-dark surfaces first —
+        # the operator-actionable ordering. ``dead_tickers()`` returns rows
+        # already sorted by ticker; this is a render-side resort.
+        try:
+            ordered = sorted(
+                rows,
+                key=lambda r: (
+                    -(int(r.get("seconds_dead") or 0)
+                      if isinstance(r.get("seconds_dead"), (int, float)) else 0),
+                    str(r.get("ticker") or ""),
+                ),
+            )
+        except Exception:
+            ordered = rows
+        n = len(ordered)
+        word = "symbol" if n == 1 else "symbols"
+        bits: list[str] = []
+        for r in ordered[:5]:
+            tk = str(r.get("ticker") or "").strip()
+            if not tk:
+                continue
+            age = _dead_age_token(r.get("seconds_dead"))
+            bits.append(f"{tk} {age}" if age else tk)
+        if not bits:
+            return ""
+        more = f" +{n - 5} more" if n > 5 else ""
+        return (
+            f"⚠️ **DEAD TICKERS** ◈ {n} watchlist {word} dark on yfinance\n"
+            f"> {' · '.join(bits)}{more} — engine reads N/A this cycle"
+        )
+    except Exception as e:
+        print(f"[reporter] dead-tickers line skipped: {e}")
+        return ""
+
+
 def _merge_stale_marks(open_positions: list[dict],
                        json_positions: list[dict] | None) -> list[dict]:
     """Return ``open_positions`` rows enriched with the ``stale_mark`` flag
@@ -4668,6 +4771,17 @@ def send_hourly_summary() -> bool:
     fh = _feed_health_line(store)
     if fh:
         body += "\n" + fh
+    # DEAD TICKERS sits right after FEED HEALTH — same urgency tier (both
+    # surface input-feed compromise the operator otherwise cannot see). FEED
+    # HEALTH names "the news pipeline is dark / stale"; DEAD TICKERS names
+    # "and/or yfinance is dark on these specific watchlist symbols". A trader
+    # reading the hourly used to have no idea whether a position showing
+    # ``mark=avg P/L=$0.00`` was genuinely flat or silently fall-back marked
+    # because yfinance is suppressing the symbol — this surface closes that.
+    # Silent on empty cache per the silence-when-nothing-actionable precedent.
+    dt = _dead_tickers_line()
+    if dt:
+        body += "\n" + dt
     ns = _next_session_line()
     if ns:
         body += "\n" + ns
@@ -4985,6 +5099,12 @@ def send_daily_close() -> bool:
     fh = _feed_health_line(store)
     if fh:
         body += "\n" + fh
+    # DEAD TICKERS — mirror the hourly placement (right after FEED HEALTH).
+    # See ``send_hourly_summary`` for the rationale: same urgency tier
+    # (input-feed compromise), silence-by-default on an empty cache.
+    dt = _dead_tickers_line()
+    if dt:
+        body += "\n" + dt
     lk = _singleton_lock_line()
     if lk:
         body += "\n" + lk
