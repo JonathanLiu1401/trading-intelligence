@@ -14762,3 +14762,145 @@ pattern.
 copy carries foreign uncommitted changes at start (sibling agents'
 edits to `storage/db_health.py`, `collectors/`, plus untracked tests);
 all left untouched. No `git add -A` (concurrent-agent footgun memory).
+
+## 2026-05-29 Agent 3 (digital-intern) — wire_pulse + score-source ladder tests
+
+**Persona:** debugger + feature developer + news-analyst consumer.
+
+**Counters:** bugs_fixed=0 / features_added=1 / user_findings=5.
+
+### Phase 1 — debugger
+
+The codebase has 4173 tests across the four-agent rotation and 123
+analytics modules; every load-bearing invariant the task brief calls out
+is already pinned. After reading `daemon.py`, `storage/article_store.py`,
+`watchers/{alert_agent,urgency_scorer}.py`, `ml/{trainer,model,features}.py`,
+`collectors/web_scraper.py`, `analysis/claude_analyst.py` in full plus
+`tests/test_{article_store,features,model,urgency_scorer,trainer,
+score_pending,alert_book_tag}.py`, I found NO genuine bugs to fix.
+
+I did add ONE missing test surface that the per-method article-store tests
+collectively don't cover: the **sequential** `score_source` LADDER a real
+article walks through (NULL → 'ml' → 'llm', plus 'briefing_boost' →
+'llm'). `tests/test_score_source_progression.py` (4 tests) pins it. A
+regression that flipped the COALESCE direction in `update_ml_scores_batch`
+would pass every per-method test today but would break this multi-step
+ladder — exactly the kind of cross-method drift the per-method tests
+cannot catch.
+
+The four assertions:
+1. `test_full_progression_null_then_ml_then_llm` — three-step walk; ml_score
+   survives the LLM relabel (per `update_ai_scores_batch` not touching
+   `ml_score`).
+2. `test_ml_after_llm_is_a_no_op_on_score_source` — flipping COALESCE in
+   `update_ml_scores_batch` would corrupt the training pool by re-tagging
+   real Sonnet labels as model self-predictions.
+3. `test_briefing_boost_promoted_to_llm_when_sonnet_speaks` — briefing
+   curation is weaker than a direct Sonnet label.
+4. `test_synthetic_backtest_progression_isolated_from_live_reads` — the
+   ladder is not allowed to override invariant #1; a synthetic row that
+   walks through 'ml'/'llm' is still invisible to `get_unalerted_urgent`
+   and `get_top_for_briefing`.
+
+### Phase 2 — feature
+
+`scripts/wire_pulse.py` + `tests/test_wire_pulse.py` (17 tests).
+
+**Gap the script fills:** the codebase has 120+ analytics modules each
+focused on a slice (`label_production_rate`, `urgency_label_split`,
+`briefing_health`, `source_freshness`, ...). What was missing is a
+**single-line operator pulse** — the "wake-up grep / cron heartbeat /
+Discord status push" view the news-analyst persona needs to confirm at a
+glance that the pipeline didn't quietly die overnight.
+
+Output format (field order is contract — pinned by
+`test_field_order_and_prefix`):
+```
+[wire_pulse <iso_ts>] articles_1h=N urgent_1h=N llm_vetted_pct=NN
+briefing_age_h=N.N last_alert_age_h=N.N → <VERDICT>
+```
+
+**Verdict ladder** (test-pinned in `TestVerdictLadder`):
+* `INGEST_DARK`     — < 30 articles/h. Overrides everything else; no
+                       point grading downstream when nothing flows.
+* `BRIEFING_STALE` — last briefing > 12h (2× the 5h cadence) OR
+                       `briefing_health` reports DEAD.
+* `ALERT_QUIET`    — no urgent rows in last hour AND no Discord push
+                       in last 6h (the `ALERT_RECENCY_TTL_HOURS` floor).
+* `HEALTHY`        — terminal: everything else.
+* `UNKNOWN`        — couldn't read the store.
+
+**Exit codes:** 0=HEALTHY, 1=degraded, 2=store unavailable (cron-friendly).
+
+**JSON mode** (`--json`) emits the full snapshot for machine consumers.
+A partial read (per-primitive exception) leaves that field as `None`
+without crashing the whole rollup.
+
+**Composes existing primitives, no new SQL:**
+* `store.stats_since(hours=1)` → articles_1h, urgent_1h.
+* `store.urgency_label_split(hours=24)` → llm_vetted_pct.
+* `store.briefing_health(window_h=24)` → briefing_age_h, briefing_verdict.
+* `watchers.alert_recency.recent_alerts(ttl_hours=24)` → last_alert_age_h.
+
+Backtest isolation is enforced by every primitive's own `_LIVE_ONLY_CLAUSE`
+scoping — no new direct SQL was written. NO DB write, no ai_score /
+ml_score / score_source / urgency mutation. All four load-bearing
+invariants intact by construction.
+
+### Phase 3 — live validation (news-analyst lens)
+
+Ran against the live `/media/zeph/projects/digital-intern/db/articles.db`:
+
+```
+articles_1h=408 urgent_1h=2 llm_vetted_pct=10.9
+briefing_age_h=0.5 last_alert_age_h=0.32 → HEALTHY
+```
+
+Five analyst-perspective findings recorded as `user_findings`:
+
+1. **`llm_vetted_pct=10.9` is borderline.** Of 91 urgent rows in the last
+   24h, only 8 are LLM-labelled — 83 are model-only (`score_source='ml'`).
+   The `urgency_label_split` docstring explicitly calls this out as the
+   "Sonnet path is dark/quota-throttled" signal. Not a bug — a known
+   calibration concern (`recent_ml_only_urgent`, the `[unverified —
+   model-only urgent]` calibration tag in the alert prompt, and
+   `urgency_label_split_by_source` all exist for exactly this).
+2. **Stocktwits dominates ingest** — 374 of 408 last-hour rows are from
+   `stocktwits` (≈92%). The pre-floor (`_looks_like_stocktwits_chatter`)
+   suppresses the chatter at ML stage; the load is operationally fine but
+   the source mix is heavily skewed.
+3. **One 13F press-mill row reached urgency=2** — "PNC Financial Services
+   Group Inc. Sells 1,423 Shares of Lumentum Holdings Inc. $LITE" from
+   `AlphaVantage/MarketBeat`, `ml_score=9.47`. The exact fingerprint the
+   in-flight `_RT_FUND_STAKE_DELTA` regex (concurrent agent's WIP in
+   `watchers/alert_agent.py` and `analysis/claude_analyst.py`) is meant
+   to suppress. Live evidence that the WIP gate is real.
+4. **`continuous_trainer` last_ok=2190s** flagged DEAD in
+   `_worker_health_snapshot` — the `>1.5×` poll-interval threshold tripped
+   on a slow continuous fit. Not a real failure (the trainer keeps
+   pinging "alive"); a known supervisor-cosmetics finding documented in
+   prior passes.
+5. **Database-lock churn ~15 events / 1000 log lines.** All handled by
+   the `@_retry_on_lock` decorator and the documented six retryable
+   substrings; no traceback leaked through. Operating as designed.
+
+### Phase 4 — docs
+
+This AGENTS.md entry. No CLAUDE.md change (no new invariants).
+
+### Files created (mine — only these were staged)
+
+* `scripts/wire_pulse.py` — 190 LoC.
+* `tests/test_wire_pulse.py` — 17 tests.
+* `tests/test_score_source_progression.py` — 4 tests.
+
+### Files left untouched
+
+Many concurrent-agent WIP edits in flight (`analysis/claude_analyst.py`,
+`watchers/alert_agent.py`, `daemon.py`, `dashboard/web_server.py`, plus
+untracked `analysis/wire_stance.py`, `analytics/ml_ai_divergence.py`,
+`collectors/{earnings_transcript,financial_stress}_collector.py`,
+`tests/test_{alert_fund_stake_delta,wire_stance}.py`); all left exactly
+as-is. No `git add -A` (concurrent-agent staging-race footgun memory).
+Staged only `scripts/wire_pulse.py` + the two new test files by explicit
+pathspec.
