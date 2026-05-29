@@ -701,10 +701,27 @@ class ArticleStore:
                 articles = unique
 
             # ── DB insertion ───────────────────────────────────────────────────
+            # Bulk URL pre-check: fetch which URLs in this batch already exist.
+            # INSERT OR IGNORE only dedupes by id (PRIMARY KEY); the same URL can
+            # arrive under a different id from different collectors and slip through.
+            candidate_urls = [a.get("link", "") for a in articles if a.get("link")]
+            existing_urls: set[str] = set()
+            if candidate_urls:
+                placeholders = ",".join("?" * len(candidate_urls))
+                rows = self.conn.execute(
+                    f"SELECT url FROM articles WHERE url IN ({placeholders})",
+                    candidate_urls,
+                ).fetchall()
+                existing_urls = {r[0] for r in rows}
+
+            skipped_url_dup = 0
             for art in articles:
                 url = art.get("link", "")
                 title = art.get("title", "")
                 if not url or not title:
+                    continue
+                if url in existing_urls:
+                    skipped_url_dup += 1
                     continue
                 aid = _canonical_article_id(url, title) if _CANON_AVAILABLE else article_id(url, title)
                 summary = art.get("summary", "")
@@ -718,7 +735,10 @@ class ArticleStore:
                 )
                 if self.conn.execute("SELECT changes()").fetchone()[0]:
                     inserted += 1
+                    existing_urls.add(url)  # prevent within-batch dups after first insert
             self.conn.commit()
+            if skipped_url_dup:
+                _log.debug("[insert_batch] url-dedup skipped %d articles", skipped_url_dup)
 
         if skipped_dedup:
             self._dedup_skipped += skipped_dedup
