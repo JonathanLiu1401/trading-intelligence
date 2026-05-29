@@ -1301,6 +1301,109 @@ def _realized_vs_unrealized_line(store) -> str:
         return ""
 
 
+def _today_top_contributors_line(store) -> str:
+    """One-line "which tickers drove today's realized P/L?" for the daily
+    close / hourly report.
+
+    The existing ``Realized P/L (today, N round-trips closed, YW/ZL)``
+    line in ``send_daily_close``'s opening code block tells the operator
+    HOW MANY trips closed and the NET dollar figure, but never names
+    WHICH ticker drove the day. For a 4-trip day with 1 large loss and
+    3 small wins, a "$-X realized over 4 closes" line conceals the
+    single-name drag every desk reviews first ("OK we lost net $20, but
+    is that one bad MU trade or did everything bleed?"). ``/api/today-
+    realized-pl-derived`` already surfaces ``biggest_win`` /
+    ``biggest_loss`` on the dashboard — operator just never sees them
+    because the dashboard panel isn't where they live. This closes that
+    dashboard→Discord gap, exactly as ``_exit_proximity_line`` /
+    ``_realized_vs_unrealized_line`` / ``_benchmark_line`` did one
+    dimension over.
+
+    Composes ``derive_round_trips`` + ``build_today_realized_pl``
+    **verbatim** (single source of truth, AGENTS.md invariant #10) —
+    same SSOT ``/api/today-realized-pl-derived`` (the reactivation-safe
+    trades-derived path) feeds off, so this Discord line and that
+    endpoint can never tell different stories about today's biggest
+    contributors. **Pure store reads only — NO network** (the
+    Discord-path discipline; mirrors ``_realized_vs_unrealized_line``).
+    Observational only, never gates, no caps (invariants #2/#12 — the
+    ``_exit_proximity_line`` precedent).
+
+    Suppression — silence-when-nothing-actionable (the summary must
+    never become its own lying green light — the ``_exit_proximity_line``
+    COMFORTABLE / ``_drawdown_line`` at-high-water precedent):
+
+      * ``NO_CLOSES_TODAY`` — nothing closed today, nothing to attribute.
+      * ``BREAKEVEN_DAY``    — net ≈ 0, the aggregate already says it.
+      * ``n_closes < 2``     — single close is named in the prior
+        aggregate line and in the SESSION block; a separate "biggest
+        win" line for a single trip is duplication, not signal.
+      * Anything else        — ``WINNING_DAY`` / ``LOSING_DAY`` with
+        ≥2 closes today: surface the biggest_win + biggest_loss tickers
+        with $ and %.
+
+    Failure contract mirrors the rest of ``reporter``: any
+    builder/store fault degrades to ``""`` ("no contributors line this
+    report"), **never** an exception ("no Discord summary this
+    report"). A missing ``store`` (legacy caller) is also ``""``.
+    """
+    if store is None:
+        return ""
+    try:
+        from .analytics.round_trips_derived import derive_round_trips
+        from .analytics.today_realized_pl import build_today_realized_pl
+        trades = store.recent_trades(5000)
+        # ``derive_round_trips`` is the reactivation-safe path documented
+        # in /api/today-realized-pl-derived: it walks the append-only
+        # trades log instead of relying on closed_positions, so a key
+        # that's been reactivated for a fresh re-entry still surfaces
+        # today's close. limit=500 covers many trading days of trips at
+        # the live ~hourly cadence — bounded enough that even a deep
+        # 5000-trade log doesn't slow the report.
+        derived = derive_round_trips(trades, limit=500)
+        result = build_today_realized_pl(derived)
+        if not isinstance(result, dict):
+            return ""
+        verdict = result.get("verdict")
+        if verdict not in ("WINNING_DAY", "LOSING_DAY"):
+            return ""
+        n_closes = int(result.get("n_closes") or 0)
+        if n_closes < 2:
+            return ""
+        net = float(result.get("net_realized_usd") or 0.0)
+        n_winners = int(result.get("n_winners") or 0)
+        n_losers = int(result.get("n_losers") or 0)
+        bw = result.get("biggest_win")
+        bl = result.get("biggest_loss")
+        # Both contributors named — the full attribution. The builder
+        # already filters scratch (≤±0.005 USD) before returning, so a
+        # named contributor is meaningfully directional.
+        bits: list[str] = []
+        if isinstance(bw, dict) and bw.get("ticker"):
+            pl = float(bw.get("realized_pl") or 0.0)
+            pl_pct = bw.get("realized_pl_pct")
+            pct_tok = (f" ({float(pl_pct):+.2f}%)"
+                       if pl_pct is not None else "")
+            bits.append(f"best `{bw['ticker']}` ${pl:+.2f}{pct_tok}")
+        if isinstance(bl, dict) and bl.get("ticker"):
+            pl = float(bl.get("realized_pl") or 0.0)
+            pl_pct = bl.get("realized_pl_pct")
+            pct_tok = (f" ({float(pl_pct):+.2f}%)"
+                       if pl_pct is not None else "")
+            bits.append(f"worst `{bl['ticker']}` ${pl:+.2f}{pct_tok}")
+        if not bits:
+            return ""
+        icon = "✅" if verdict == "WINNING_DAY" else "📉"
+        win_loss_tok = f"{n_winners}W/{n_losers}L"
+        header = (f"{icon} **TODAY P/L** ◈ {verdict}  "
+                  f"(${net:+.2f} over {n_closes} closes, "
+                  f"{win_loss_tok})")
+        return header + "\n> " + " · ".join(bits)
+    except Exception as e:
+        print(f"[reporter] today-top-contributors line skipped: {e}")
+        return ""
+
+
 def _hold_discipline_line(store) -> str:
     """One-line "am I sitting on a loser past my own cut-time?" for the
     daily close.
@@ -4616,6 +4719,16 @@ def send_hourly_summary() -> bool:
     rvu = _realized_vs_unrealized_line(store)
     if rvu:
         body += "\n" + rvu
+    # TODAY CONTRIBUTORS sits right after BANKED-vs-PAPER on the hourly
+    # too — same placement rationale as the daily close (per-ticker
+    # attribution of today's realized bucket sits naturally beside the
+    # banked-vs-paper diagnostic). Silence-by-default on a quiet day
+    # (NO_CLOSES) or a single trip (the SESSION line already names it),
+    # so the hourly doesn't grow noisier mid-session before the first
+    # second close lands.
+    tc = _today_top_contributors_line(store)
+    if tc:
+        body += "\n" + tc
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx
@@ -4902,6 +5015,15 @@ def send_daily_close() -> bool:
     rvu = _realized_vs_unrealized_line(store)
     if rvu:
         body += "\n" + rvu
+    # TODAY CONTRIBUTORS sits right after BANKED-vs-PAPER — both are
+    # realized-side surfaces. BANKED-vs-PAPER says "is today's net P/L
+    # locked-in vs paper?"; TODAY P/L says "and within today's REALIZED
+    # bucket, which TICKER drove it?" — the per-name attribution the
+    # daily-close aggregate line conceals. Silence-by-default (NO_CLOSES
+    # / BREAKEVEN / single close); neither suppresses the other.
+    tc = _today_top_contributors_line(store)
+    if tc:
+        body += "\n" + tc
     bx = _behavioural_block()
     if bx:
         body += "\n" + bx
