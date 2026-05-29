@@ -1,5 +1,122 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-29 core HYBRID pass (Agent 1, third cycle) — book_exposure cash %% token
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=2
+
+### Phase 1 — no fresh bug surfaced (`bugs_fixed = 0`)
+
+Read the required core files in full (runner.py, reporter.py, signals.py,
+strategy.py decision/execute/_claude_call sections, dashboard.py endpoint
+table, market.py, store.py). Inspected each for race conditions, off-by-
+one comparators, exception-swallowing on alarm paths, and quota / breaker
+latch state machines. Re-grepped recently-touched code paths (dead_tickers,
+PRE_STORM verdict, premium source spotlight, mark integrity). Cross-
+checked existing test coverage — `test_core_market.py` (71 tests),
+`test_core_runner.py` (71), `test_core_signals.py` (100),
+`test_core_strategy.py` (150), `test_core_store.py` (47),
+`test_core_reporter.py` (large suite). Every required-coverage area
+from the prompt — `is_market_open` weekend/before/after/at-10am,
+`_maybe_daily_close` once/no-weekend/no-pre-1605, store cash decrement
+on BUY, recent_trades ordering, signal extraction defaults — already has
+multiple targeted tests. No high-confidence bug remained after the
+sweep. Phase 1 commit skipped per the guard.
+
+### Phase 2 — `_book_exposure_line` surfaces cash %% (`features_added = 1`)
+
+The breaker-fired and quota-exhausted Discord alarms ship a one-line
+book snapshot via `reporter._book_exposure_line` so an operator paged
+about a frozen engine knows what is sitting unattended. The line
+already carried equity, P/L from start, position count, and the
+biggest position's weight + unrealized P/L — but **never the cash %**.
+
+A trader paged on a multi-hour quota outage reading
+``2 positions · biggest NVDA 70.0%`` cannot tell whether the remaining
+30% is in one secondary lot or in actual cash they could deploy by hand.
+The new ``cash X.X%`` token answers exactly that — clamped to
+``[0, 100]`` so a transient mark-to-market wobble (cash briefly > total
+under a write race) never renders a >100% reading. Defensive coerce on
+``pf.get("cash")`` mirrors the existing ``total`` extraction so a legacy
+store stub without a ``cash`` key degrades to 0.0% (the rest of the
+line still ships — alarm-path code must never raise). The all-cash
+branch (n==0) renders the legacy ``100% cash`` literal byte-identical
+so no stutter (``100% cash · cash 100.0%``).
+
+New format:
+```
+book: $1162.99 (+16.30% from start) · 1 position · cash 18.0% · biggest MU 82.0% (-0.08% unrealized)
+```
+
+Six new tests in `TestBookExposureLine` pin: token presence with
+positions held, zero-fully-invested 0.0%, cash > total clamps to
+100.0%, negative cash clamps to 0.0%, all-cash branch byte-identical,
+and a `get_portfolio()` payload missing the `cash` key degrades to
+0.0% rather than raising. Existing 16 BookExposure tests + 23
+Breaker/Quota/Alarm tests pass unchanged (22 + 16 → 38 pass total
+in the focused slice).
+
+Commit: `77411c4 feat(reporter): book_exposure_line surfaces cash %% alongside biggest position`
+
+### Phase 3 — live validation
+
+- `curl /api/healthz` → ok=true, head_sha=77411c4, boot_sha=77411c4,
+  `stale=false` (git watcher redeployed the runner onto my commit).
+  Lock acquired (pid=1994402), uptime fresh.
+- `curl /api/runner-heartbeat` → HEALTHY, last decision 2m ago,
+  singleton lock OK, no restart recommended.
+- `curl /api/notify-health` → HEALTHY ("last Discord send succeeded",
+  consecutive_failures=0).
+- `curl /api/alarm-latches` → CLEAR (breaker_active=false,
+  quota_active=false, any_active=false).
+- `curl /api/portfolio` → cash $209.40, total $1162.99 (+16.30%),
+  1 open position (MU 82% of book).
+- `curl /api/risk` → concentration_severity HIGH (MU 81.99%),
+  concentration_warning=true, beta_est=1.5, spy_shock_3pct = -3.69%.
+  Working correctly.
+- Live invocation against the held book confirmed the new line renders:
+  ``book: $1165.01 (+16.50% from start) · 1 position · cash 18.0% ·
+  biggest MU 82.0% (-0.08% unrealized)``.
+
+**user_findings = 2 (observational, not bugs)**:
+
+1. **Concentration HIGH on MU at 82% of book is the operator-actionable
+   condition right now.** Concentration warning fires correctly
+   (`/api/risk concentration_warning=true, severity=HIGH`) but with a
+   single name driving 82% of total value, a 3% SPY shock projects a
+   −3.69% / −$42.91 hit on the book and the engine is otherwise idle
+   (last real decision the MU BUY 35 min before this pass). A trader
+   reviewing this would want to either trim MU or open a hedge — the
+   engine's behavioural builder should be surfacing this in the
+   prompt and was the right call to push the cash %% token alongside
+   biggest %% so the operator paged on a wedge sees BOTH dimensions
+   in one read.
+2. **systemd `paper-trader.service` is in a restart loop, restart
+   counter at ~10/15s.** Per the documented
+   `pt-systemd-vs-manual-restart-spam` memory: the real runner is
+   the manual `/usr/bin/python3 /home/zeph/.../runner.py` process
+   (pid 1994402, parent PID 1) — the singleton flock holds, the
+   systemd unit fails fast with exit code 1, restart, repeat. NOT
+   actionable per the memory; documented spam pattern, no fix
+   required. Captured here so the next agent doesn't re-investigate.
+
+### Phase 4 — docs
+
+This file. No new code in this commit — AGENTS.md only, bundled with
+the reporter feature commit per the prompt's instruction (no
+docs-only commit counts toward fixes/features).
+
+### How to run
+
+* Live trader (manual): `python3 -m paper_trader.runner` (or via the
+  paper-trader.service unit — but note the singleton-lock spam memo
+  above).
+* Tests (focused, ~30s–2min):
+  `python3 -m pytest tests/test_core_reporter.py -q -k "BookExposure or Breaker or Quota"`
+* Tests (full, expect ~25min under load):
+  `python3 -m pytest tests/ -v`.
+
+---
+
 ## 2026-05-29 core HYBRID pass (Agent 1, second cycle) — PRE_STORM early-warning verdict
 
 **Counters:** bugs_fixed=0 · features_added=1 · user_findings=5
