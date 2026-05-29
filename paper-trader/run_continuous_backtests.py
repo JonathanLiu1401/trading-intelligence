@@ -360,6 +360,30 @@ BOOTSTRAP_CI_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 # (Spearman sort dominates), negligible against the 10-min cooldown.
 BOOTSTRAP_CI_N = 1000
 
+# Per-cycle per-sector OOS skill ledger. ``sector_skill.analyze`` already
+# answers, durably and CLI-readable, the decisive sector-level question a
+# quant researcher asks AFTER seeing the headline scorer rank-IC: *is the
+# scorer's rank skill UNIFORM across the watchlist universe, or carried by
+# one fat sector (typically tech, ~89% of the live decision_outcomes
+# corpus)?* The sibling ``persona_skill`` / ``persona_regime_skill`` /
+# ``dead_feature_audit`` ledgers all close exactly this kind of
+# CLI-only-state gap for an unattended operator. ``sector_skill`` was
+# conspicuously the LAST major skill diagnostic NOT wired into a per-cycle
+# ledger — its verdicts (``HAS_INVERTED_SECTOR`` / ``SECTOR_CONCENTRATED``
+# / ``NO_SECTOR_EDGE`` / ``HEALTHY``) were only knowable by manually
+# invoking ``python3 -m paper_trader.ml.sector_skill``. The single most
+# operational state — ``HAS_INVERTED_SECTOR`` (a sector whose
+# rank-IC ≤ -0.15: the more confident the scorer is, the WORSE the
+# realized 5d outcome — gating on it is actively harmful) — was invisible
+# to the loop. This wiring closes the gap mirroring every sibling
+# ``_append_*_skill_log`` pattern: best-effort, honest-gap rows
+# (``signal_dark=True`` when corpus < MIN_RECORDS or every sector is
+# SPARSE), atomic bounded trim, SSOT no-drift (re-uses the analyzer's own
+# verdicts/sectors output verbatim). Module-level so tests can redirect —
+# the same testability rule as every sibling skill log path constant.
+SECTOR_SKILL_LOG = ROOT / "data" / "sector_skill_log.jsonl"
+SECTOR_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 EARLIEST_WINDOW_START = date(1993, 2, 1)  # SPY inception — ~30+ years of history
 WINDOW_END_BUFFER_DAYS = 180  # never end a window within 6 months of today
 MIN_WINDOW_YEARS = 1
@@ -3590,6 +3614,156 @@ def _append_persona_regime_skill_log(cycle: int, win_start: date,
         return False
 
 
+def _append_sector_skill_log(cycle: int, win_start: date, win_end: date,
+                             outcomes_path: "Path | str | None" = None
+                             ) -> bool:
+    """Append one structured row to the per-cycle per-sector OOS skill ledger.
+
+    Answers, durably and per-cycle, the decisive sector-level question the
+    aggregate scorer ledger cannot: *is the scorer's rank skill carried
+    uniformly across the watchlist universe, or by ONE fat sector (the live
+    corpus is ~89% tech)?* The single most actionable state is
+    ``HAS_INVERTED_SECTOR`` — a sector whose ``rank_ic ≤ -IC_GOOD``: the
+    more confident the scorer is, the WORSE the realized 5d outcome — so
+    gating on it is actively harmful. Until this wiring landed, the
+    sector-level verdict was CLI-only via ``python3 -m
+    paper_trader.ml.sector_skill``; an unattended operator could not trend
+    per-sector signal health and ``HAS_INVERTED_SECTOR`` was invisible.
+
+    Mirrors the sibling ``_append_persona_skill_log`` /
+    ``_append_persona_regime_skill_log`` discipline exactly:
+
+    * SSOT no-drift — reuses ``sector_skill.analyze`` (the same
+      ``_load_outcomes`` + ``split_outcomes_temporal`` path the CLI uses),
+      so the persisted verdict equals the read-only CLI's by construction.
+    * Honest gap rows — on any fault we still emit a row with
+      ``status='error' verdict='INSUFFICIENT_DATA' signal_dark=True`` so a
+      gap in the trend is visible, not silent.
+    * Bounded growth — when the file exceeds
+      2× ``SECTOR_SKILL_LOG_KEEP`` it is atomically rewritten via the
+      tmp+``.replace`` idiom.
+    * Never raises — a ledger write must NEVER break the continuous loop.
+
+    The ``signal_dark`` boolean mirrors every sibling ``*_dark`` flag
+    (``signal_dark`` / ``gate_dark`` / ``stop_dark`` / etc.): True when
+    the analyzer could not produce a stable per-sector reading — either
+    the corpus had < ``MIN_RECORDS`` aligned OOS outcomes
+    (``INSUFFICIENT_DATA``) OR every sector that surfaced is ``SPARSE``
+    (n_oos < ``MIN_OUTCOMES_PER_SECTOR``). False means at least one
+    sector reached a non-SPARSE verdict the analyzer could classify.
+
+    Captures three flat top-line fields a JSON consumer can query without
+    parsing the nested ``sectors`` list:
+      * ``top_sector`` / ``top_rank_ic`` — the best non-SPARSE sector
+        (the leader on the rank-IC bar — the headline number a quant
+        skims first).
+      * ``n_inverted`` — count of anti-predictive sectors (the actionable
+        red flag).
+    The full ``sectors`` list still ships as a nested field for forensics
+    (≤ 7 sectors max — N_SECTORS-bounded), and the ``inverted_sectors``
+    name list ships intact so a grep-trend on a specific sector still
+    works.
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        outcomes_path = Path(outcomes_path)
+        try:
+            from paper_trader.ml.sector_skill import analyze as _sector_skill_analyze
+            rep = _sector_skill_analyze(outcomes_path=outcomes_path)
+        except Exception as exc:
+            rep = {
+                "status": "error", "verdict": "INSUFFICIENT_DATA",
+                "hint": f"sector_skill unavailable: {type(exc).__name__}",
+                "n_train": 0, "n_oos": 0,
+                "concentrated_sector": None,
+                "sectors": [], "inverted_sectors": [],
+            }
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA",
+                   "n_train": 0, "n_oos": 0,
+                   "concentrated_sector": None,
+                   "sectors": [], "inverted_sectors": []}
+
+        sectors_list = rep.get("sectors") or []
+        if not isinstance(sectors_list, list):
+            sectors_list = []
+        # ``signal_dark`` mirrors sibling ``*_dark`` flags: True when no
+        # sector reached a stable (non-SPARSE) sample. The analyzer
+        # ``sectors_out`` is sorted (SPARSE sinks to the bottom), so the
+        # presence of ANY non-SPARSE entry means we have a sector to read.
+        non_sparse_n = sum(
+            1 for s in sectors_list
+            if isinstance(s, dict) and s.get("verdict") != "SPARSE"
+        )
+        signal_dark = (non_sparse_n == 0)
+
+        # Top sector — the leader on rank_ic, skipping SPARSE entries the
+        # same way ``_append_persona_skill_log`` skips ``INSUFFICIENT``.
+        # ``sectors`` is already sorted by ``rank_ic`` desc with SPARSE
+        # sunk last (per ``sector_skill``).
+        top_sector: str | None = None
+        top_rank_ic: float | None = None
+        for s in sectors_list:
+            if not isinstance(s, dict):
+                continue
+            if s.get("verdict") == "SPARSE":
+                continue
+            try:
+                top_sector = str(s.get("sector") or "") or None
+                top_rank_ic = (None if s.get("rank_ic") is None
+                               else round(float(s.get("rank_ic")), 4))
+            except (TypeError, ValueError):
+                top_sector = None
+                top_rank_ic = None
+            break
+
+        inverted_list = rep.get("inverted_sectors") or []
+        if not isinstance(inverted_list, list):
+            inverted_list = []
+        n_inverted = len(inverted_list)
+
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": rep.get("verdict"),
+            "n_train": rep.get("n_train"),
+            "n_oos": rep.get("n_oos"),
+            "concentrated_sector": rep.get("concentrated_sector"),
+            "top_sector": top_sector,
+            "top_rank_ic": top_rank_ic,
+            "n_inverted": n_inverted,
+            "inverted_sectors": inverted_list,
+            "sectors": sectors_list,
+            "signal_dark": signal_dark,
+        }
+        SECTOR_SKILL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with SECTOR_SKILL_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in
+                     SECTOR_SKILL_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > SECTOR_SKILL_LOG_KEEP * 2:
+                kept = lines[-SECTOR_SKILL_LOG_KEEP:]
+                tmp = SECTOR_SKILL_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(SECTOR_SKILL_LOG)
+        except Exception as e:
+            print(f"[continuous] sector-skill-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] sector-skill-log append failed: {e}")
+        return False
+
+
 def _append_dead_feature_audit_log(cycle: int, win_start: date,
                                     win_end: date) -> bool:
     """Append one structured row to the per-cycle dead-feature-audit ledger.
@@ -4732,6 +4906,23 @@ def main() -> None:
         # ``persona_for`` from backtest). Best-effort by construction;
         # never breaks the loop.
         _append_persona_regime_skill_log(cycle, win_start, win_end)
+
+        # Durable per-cycle per-sector OOS skill ledger. ``sector_skill``
+        # already answers per-sector, on the SAME temporal holdout the
+        # scorer-skill ledger uses, *is the scorer's rank skill UNIFORM
+        # across the universe or carried by one fat sector?* — the live
+        # corpus is ~89% tech, and an inverted non-tech sector
+        # (``rank_ic ≤ -0.15``) means gating on that sector is actively
+        # harmful. Until this wiring landed the verdict
+        # (``HAS_INVERTED_SECTOR`` / ``SECTOR_CONCENTRATED`` /
+        # ``NO_SECTOR_EDGE`` / ``HEALTHY``) was CLI-only with no durable
+        # trend; this closes the wiring gap mirroring every sibling
+        # ``_append_*_skill_log`` pattern. Wired immediately after the
+        # persona/regime ledger because it is the natural sector-axis
+        # sibling (same outcomes file, same temporal split, same SSOT
+        # via ``_spearman``). Best-effort by construction; never breaks
+        # the loop.
+        _append_sector_skill_log(cycle, win_start, win_end)
 
         # Durable per-cycle dead-feature audit of the just-retrained model.
         # Catches the pass-#35 class of bug systematically: a feature added
