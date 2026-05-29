@@ -32326,3 +32326,285 @@ reset `dashboard.py` to HEAD, applied ONLY my hunk, committed, then
 restored the sibling's work — so my commit contains exactly one
 endpoint and the sibling's `/api/plan-execution-debt` work stays as
 their pending uncommitted change. No `git add -A`.
+
+
+## 2026-05-29 — Agent 2 (ML+backtests) HYBRID review pass #2
+
+Persona: a quant researcher who relies on this ML and backtest stack to
+decide whether a strategy is worth real capital and is skeptical of
+anything uncalibrated, leaky, or silently broken.
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=8
+
+### Phase 1 — `fix:` PriceCache filters 0/negative closes as missing (commit `16c5f27`)
+
+Agent 1's earlier pass (`0c2da34`) patched the same class of bug in
+`market.get_prices` for the live trader: yfinance occasionally returns
+`0.0` on halted/illiquid intraday rows; the bulk path was storing them
+verbatim and `_mark_to_market` then registered a 100% loss against
+`avg_cost`. The matching gap existed in `PriceCache` for the backtest
+engine:
+
+* A `$0` cached close would short-circuit `returns_pct` via the
+  existing `if not s` guard and fabricate a flat 0.0 outcome —
+  indistinguishable from a real flat 5-day window — that then
+  contaminates `decision_outcomes.jsonl` and the next DecisionScorer
+  retrain.
+* `_buy(price=0)` produces `notional=0`; the blended-avg-cost
+  computation on a subsequent add would divide by the wrong base.
+* `_build_trading_days` iterates `spy.keys()` directly, so a $0 SPY
+  day would still appear as a sampled decision day with a degenerate
+  mark.
+
+Fix locks `PriceCache._load` to `close > 0` at the storage boundary
+(prevents new poison) AND walks back past `series[iso] <= 0` in
+`price_on` + `resolved_close_date` (handles legacy caches built before
+this filter). Audited the current cache: 0 poisoned ticks across 19.9M
+rows — the bug was latent, but matches the live-trader class of
+failure Agent 1 just closed.
+
+Tests: `tests/test_backtest_zero_price_filter.py` — 9 cases pinning
+read-side walk-back, all-zero → None, resolved-date consistency, and
+returns_pct chain-through behavior. Constructs `PriceCache` via
+`__new__` to skip network I/O (the standard test pattern in this
+repo).
+
+### Phase 2 — `feat:` outcome_corpus_health analyzer (commit `1abf8e5`)
+
+**The gap**: every existing ML/backtest analyzer measures model
+OUTPUTS (rank-IC / RMSE / dir-acc / gate-arm distribution / calibration
+spearman / etc.). NONE directly answers the data-quality question that
+PRECEDES every model verdict: *what is the training corpus actually
+made of?* A reading quant looking at `MLP_WORSE_THAN_TRIVIAL` or
+`gate_effectively_active=False` cannot tell whether the verdict
+reflects model weakness or data sparsity — and the operationally
+critical "is `news_urgency` populated in 1% or 99% of training rows?"
+fact was scattered across `dead_feature_audit` (weights only) and
+ad-hoc grep.
+
+**The analyzer** (`paper_trader/ml/outcome_corpus_health.py`) reads
+`data/decision_outcomes.jsonl` and reports:
+
+* per-feature non-null density (every feature in `TRACKED_FEATURES`,
+  with bool-as-present and NaN-as-missing semantics matching
+  `build_features._to_float`)
+* action breakdown (BUY/SELL counts + minority-class data limit)
+* regime breakdown — preferred `regime_label`, legacy `regime_mult`
+  decode fallback for pre-2026-05-19 rows
+* sector breakdown via `SECTOR_MAP` lookup (defensive: `unknown`
+  bucket when ticker absent)
+* persona breakdown (informational)
+* target distribution (`forward_return_5d` mean/std/min/max/p5/p95)
+* date range
+* a verdict ladder with priority order:
+  `INSUFFICIENT_DATA` (corpus < 100) → `NEWS_FEATURES_DARK` (news
+  features < 10% of rows) → `ACTION_IMBALANCED` (BUY or SELL > 85%) →
+  `REGIME_BUCKETS_SPARSE` (bull/sideways/bear bucket < 50 rows) →
+  `TARGET_DEGENERATE` (std < 1.0pp) → `HEALTHY`
+* operator-readable `hints` list explaining each trigger
+
+**Live verdict on the production 6581-row corpus**: `NEWS_FEATURES_DARK`
+(news features in 65/6581 = 1.0% of rows) + `bear` regime bucket
+sparsity (n=36 below the 50-row floor). Both reads explain real
+production constraints documented in prior agent passes.
+
+Pattern matches every sibling analyzer: read-only, never raises (a
+corpus-health writer must be safe to call from any per-cycle ledger
+writer — the `_append_*_skill_log` discipline), JSON-safe output,
+`--json` CLI flag, exits non-zero when verdict != HEALTHY.
+
+Tests (`tests/test_outcome_corpus_health.py`, 19 cases): verdict
+envelope (empty / sub-min / missing file), each verdict trigger
+(news-dark / action-imbalance / regime-sparse / target-degenerate),
+feature-density correctness (numeric / bool / NaN handling),
+regime_mult fallback, never-raises envelope (corrupted JSONL lines /
+malformed rows / unknown labels), CLI exit codes.
+
+### Phase 3 — Live findings (quant-researcher tour)
+
+1. **`MLP_WORSE_THAN_TRIVIAL` durably this cycle.** Latest
+   `baseline_skill_log` row (cycle=1, 2007-05-24→2009-05-23 window,
+   n_oos=1316): MLP rank-IC = +0.0601 vs `news_urgency` single-feature
+   baseline at +0.1519 → `ic_gap=-0.0918`. The 20-feature net is
+   sub-trivial OOS. **And** `news_urgency` wins despite being non-null
+   in only 1% of training rows — strong evidence that when news IS
+   present it carries real signal, but training is starving it.
+
+2. **Bootstrap CI rules out positive skill statistically.** Latest
+   `bootstrap_ci_skill_log`: rank-IC point -0.0491, 95% CI
+   [-0.1133, +0.0156] over n_oos=1000, n_bootstrap=1000 → verdict
+   `NO_SKILL_DETECTED`. The deployed scorer is statistically
+   indistinguishable from a coin flip at this sample size.
+
+3. **`gate_effectively_active=False` for all 3 latest cycles.** The
+   trailing-OOS-IC kill-switch is correctly suppressing the gate
+   (median oos_buy_ic at noise/anti-skill). `gate_active=True` but
+   `gate_killswitch_active=False` → the gate's per-arm modulation is
+   short-circuited. Operational discipline working as designed.
+
+4. **`SECTOR_CONCENTRATED` — tech is 81% of OOS rows.** Latest
+   `sector_skill_log`: tech holds 3662/5265 train + 1075/1316 OOS at
+   rank_ic=+0.0636. The headline aggregate rank-IC IS tech's rank-IC.
+   Every regime-conditional or aggregate metric must be read with
+   this caveat (the new `sector_skill` ledger from Agent 2's first
+   pass surfaces this directly).
+
+5. **`predict_calibrated` is WORSE than raw `predict` right now.**
+   Latest `calibrated_reliability_log`: `mean_abs_decile_error=6.16`
+   vs `raw_mean_abs_decile_error=3.28` → `vs_raw_bias_reduction=-2.88pp`
+   (calibration HURTS by ~3pp). Verdict `MISCALIBRATED`. The
+   quantile-map at this corpus state actively misleads —
+   `monotone_fraction=0.44` (sub-coin-flip). A reading quant should
+   NOT use the calibrated value over raw predict() while this state
+   holds.
+
+6. **`GATE_RETURN_NEUTRAL` — gate barely contributes.** Latest
+   `gate_pnl_skill_log`: gate-on (×1.30/×1.15 arms) realized +0.4455%
+   vs gate-off (×1.0) +0.3321%. Equal-weight contribution +0.1133pp;
+   sized contribution +0.0453pp. With the kill-switch active anyway
+   (finding #3), this is consistent — the gate is dark in production
+   and the residual realized-edge it would carry if it WERE active
+   is sub-edge-tolerance.
+
+7. **`NO_LABELS_PRODUCED` — LLM annotation pipeline dark.** Latest
+   `llm_annotation_skill_log`: 0 endorsed / 0 condemned out of 6581
+   rows. The `llm_mult` sample-weight multiplier in `train_scorer`
+   (3.0 for ENDORSE, 0.1 for CONDEMN, 1.0 for unlabeled) provides
+   ZERO actual lift since the pipeline emits 0 labels. Same darkness
+   the documented `sample_weight_audit` `CURRENT_TIED` verdict
+   describes.
+
+8. **Conviction sizing is `DIRECTIONAL`.** Latest
+   `conviction_calibration_log`: spearman=+0.0732,
+   `top_minus_bottom_realized_pct=+1.04pp`, `monotone_fraction=0.75`.
+   Modest but real signal — the gate sizes UP on calls that DO
+   realize slightly higher returns. Not strong enough to lift the
+   overall MLP verdict but the sizing rule is not pure noise.
+
+### Cross-cutting honest read
+
+The scorer-deployed state is **structurally constrained, not broken**:
+news features dark → MLP missing its strongest single-feature signal
+(documented +0.15 IC for `news_urgency` alone), tech-concentrated
+corpus → aggregate verdicts reflect one sector, leveraged-ETF
+dispersion → per-run dispersion (-125% to +1428% across recent monkey
+runs, +50% to +1064% across recent ml_quant runs) is leverage luck
+more than strategy skill. The kill-switch + clamp + calibration-table
+collapse-guard machinery is correctly preventing the deployment from
+acting on noise. A reading quant should NOT deploy real capital on the
+current ml_quant gate; the moment news features wake up (≥ 10% of
+rows non-null), the `outcome_corpus_health` verdict flips to HEALTHY
+and the picture changes immediately.
+
+### How the ML/backtest stack works (canonical mini-reference)
+
+**DecisionScorer** (`paper_trader/ml/decision_scorer.py`):
+
+* 20-feature MLPRegressor(32,16) + L2 alpha=1e-2 + early_stopping —
+  features: 10 base numeric (ml_score / rsi / macd / mom5 / mom20 /
+  regime_mult / vol_ratio / bb_pos / news_urgency /
+  news_article_count) + 3 enhanced MACD booleans (ema200_above /
+  hist_cross_up / macd_below_zero_cross) + 7-way sector one-hot.
+* `predict_with_meta(...)` returns `{pred, raw, clamped,
+  off_distribution, percentile, calibrated, failed, gate_arm,
+  gate_arm_multiplier}` — `pred` is clamped to ±`PRED_CLAMP_PCT=50`,
+  `calibrated` is the quantile-mapped honest magnitude (with the
+  collapsed-quantile and `MISCALIBRATED` honesty guards).
+* `predict()` is the scalar fast path (just `pred`); all live gate
+  callers consume this.
+* `feature_contributions` / `feature_group_contributions` —
+  per-feature / per-group signed attribution for one prediction.
+* `feature_importance` / `feature_group_importance` — global mean
+  |first-layer weight| per feature / per group.
+* `train_scorer(records, path=None)` — atomically rewrites
+  `data/ml/decision_scorer.pkl` with `{model, scaler, n_train,
+  pred_quantiles, label_quantiles}`. SELL records flip the label
+  sign. Symmetric label clamp at ±50% so val/oos error is
+  apples-to-apples.
+
+**outcome_corpus_health** (new, this pass): pre-model data-quality
+diagnostic. CLI: `python3 -m paper_trader.ml.outcome_corpus_health`.
+Reports per-feature density / action breakdown / regime breakdown /
+sector breakdown / target stats / verdict ladder. Use BEFORE
+interpreting any scorer / baseline / gate verdict to know whether
+the underlying data carries the signal you're asking the model to
+find.
+
+**Running backtests manually**:
+
+```bash
+# One-shot — 10 parallel year-long runs
+python3 run_backtests.py
+
+# Continuous loop — 1 run per cycle (throttled), 10min cooldown
+python3 run_continuous_backtests.py
+
+# Read-only CLI: corpus data quality (new, this pass)
+python3 -m paper_trader.ml.outcome_corpus_health
+python3 -m paper_trader.ml.outcome_corpus_health --json | jq
+
+# Read-only CLI: explain one scorer prediction
+python3 -m paper_trader.ml.decision_scorer \
+    --ticker NVDA --ml-score 3.5 --rsi 45 --mom5 2.0
+
+# Read-only CLI: compare MLP vs single-feature baselines
+python3 -m paper_trader.ml.baseline_compare
+
+# Read-only CLI: per-sector OOS skill
+python3 -m paper_trader.ml.sector_skill
+
+# Read-only CLI: per-persona signal skill
+python3 -m paper_trader.ml.persona_skill
+```
+
+**Interpreting backtest results**:
+
+* `total_return_pct` ⇒ raw run return. **Dispersion is huge** (a
+  single cycle of monkey runs spans -125% to +1428%); a single
+  good/bad run is leverage luck, not strategy skill.
+* `vs_spy_pct` ⇒ run return minus the SPY return for the same
+  window. The actual skill metric. Mind the `benchmark_unavailable`
+  note in `backtest_runs.notes` — when SPY returned 0 for the window
+  (yfinance fetch failed or degenerate walk-back), `vs_spy_pct` is
+  fabricated alpha.
+* `oos_ic` / `oos_buy_ic` in `scorer_skill_log.jsonl` ⇒ the
+  scorer's OOS rank-IC. Read with the `sector_skill` ledger's
+  `concentrated_sector` flag — if tech holds ≥70% of OOS rows
+  (the current state), the headline IC IS tech's IC.
+* `gate_effectively_active` ⇒ both guards (n_train≥500 AND
+  kill-switch) must say active for the gate to actually modulate
+  conviction. False means the gate did nothing this cycle.
+
+**Test commands for this domain**:
+
+```bash
+# Just this pass's new tests
+python3 -m pytest tests/test_backtest_zero_price_filter.py \
+                  tests/test_outcome_corpus_health.py -v
+
+# Focused ML/backtest slice (~3 min, ~290+ tests)
+python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+                  tests/test_continuous.py \
+                  tests/test_outcome_corpus_health.py \
+                  tests/test_backtest_zero_price_filter.py -v
+
+# All ML/backtest tests (full suite tagged)
+python3 -m pytest tests/ -v -k "ml or backtest or scorer"
+```
+
+### Staging
+
+Per-file pathspec across two commits:
+
+* **Phase 1**: `paper-trader/paper_trader/backtest.py` (PriceCache
+  zero-price filter) + `paper-trader/tests/test_backtest_zero_price_filter.py`.
+* **Phase 2**: `paper-trader/paper_trader/ml/outcome_corpus_health.py`
+  (new analyzer) + `paper-trader/tests/test_outcome_corpus_health.py`.
+* **Phase 4 (this section)**: `paper-trader/AGENTS.md` only.
+
+Working copy at start carried foreign uncommitted changes (sibling
+agents' edits to `paper-trader/paper_trader/dashboard.py`,
+`paper-trader/paper_trader/ml/*` analyzers, `digital-intern/...`,
+plus the sibling Agent 1's session-doc additions and various new
+untracked sibling files); all left untouched per the
+concurrent-agent footgun memory. No `git add -A`.
