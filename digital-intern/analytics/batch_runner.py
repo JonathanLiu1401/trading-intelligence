@@ -77,6 +77,9 @@ PIPELINE: list[tuple[str, Path, int]] = [
     # past 24h. Identifies peak-signal UTC hours where avg ml_score exceeds
     # (daily_mean + 0.5*std). Useful for knowing when the best news arrives.
     ("analytics.ml_score_hourly_heatmap", LOGS / "ml_score_hourly_heatmap.json", 110),
+    # Signal trajectory: snapshots momentum_brief each run and classifies active
+    # tickers as RISING / STABLE / FADING based on confluence_score history.
+    ("analytics.signal_trajectory",      LOGS / "signal_trajectory.json",       50),
 ]
 
 TIMEOUT_S = 60  # per-module hard timeout
