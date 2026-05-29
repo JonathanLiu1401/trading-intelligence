@@ -2411,6 +2411,197 @@ class ArticleStore:
         return out
 
     @_retry_on_lock
+    def urgent_syndication_clusters(
+        self, hours: int = 24, min_cluster_size: int = 2, top_n: int = 10,
+    ) -> dict:
+        """Same-story syndication clusters within the urgent queue —
+        the *distinct-events* axis the existing urgent analytics lack.
+
+        ``urgency_label_split`` answers "what fraction of urgent rows are
+        LLM-vetted?"; ``urgent_score_distribution`` answers "are the
+        scores borderline or strong?"; ``urgent_event_saturation``
+        buckets by ``(held_ticker × closed-vocab event-class)``. None of
+        them answers the analyst's "how many DISTINCT events does my
+        urgent queue actually represent?" question — the queue can look
+        full of 24 urgent rows while really being 8 events syndicated
+        across 3 publishers each. Live evidence (2026-05-29, articles.db
+        24h pull): "NVDA Stock Drops 10% From All-Time High" landed
+        urgent×3 across GN: dividend buyback / Finnhub/Yahoo / GN:
+        semiconductor; "NVDA shares fall premarket: CEO Jensen Huang
+        announces" landed urgent×3 across three GN: Nvidia variants —
+        the dedup gate at the alert path correctly suppresses the
+        Discord push, but the analyst reading the queue sees inflated
+        urgency counts and has no surface that tells them "this is 14
+        rows but 5 events".
+
+        SSOT for the signature: the same
+        ``watchers.alert_dedup._signature`` the live alert path already
+        uses to collapse duplicates. Re-using it here means the cluster
+        membership returned by this analytics method is the SAME group
+        the alert gate collapsed at push time — analyst-facing report
+        and live behaviour can never silently disagree on what counts
+        as "the same story". Lazy-imported to keep the storage layer
+        independent of the watchers module load order.
+
+        Returns::
+
+            {
+              "window_h":         int,
+              "total_urgent":     int,
+              "n_clusters":       int,   # signatures with >= min_cluster_size copies
+              "n_clustered_rows": int,   # rows inside any cluster
+              "n_unique_events":  int,   # distinct signatures (clusters + singletons)
+              "syndication_pct":  float, # n_clustered_rows / total_urgent * 100
+              "top_clusters": [
+                {
+                  "signature": str,
+                  "size": int,                # number of urgent rows in this cluster
+                  "lead_title": str,          # highest-effective-score title
+                  "n_sources": int,           # distinct source tags
+                  "sources": [str, ...],      # up to 5
+                  "first_seen": str,          # earliest first_seen across the cluster
+                  "last_seen":  str,          # latest first_seen across the cluster
+                },
+                ...
+              ],
+              "verdict": "HEAVY_SYNDICATION" | "MODERATE" | "LIGHT" | "NO_DATA",
+            }
+
+        Verdict ladder (most-severe-first, mirrors
+        ``urgent_score_distribution`` discipline):
+
+          * ``NO_DATA``           — no urgent rows in the window.
+          * ``HEAVY_SYNDICATION`` — ``syndication_pct >= 40``. Most of
+                                    the urgent queue is the same handful
+                                    of events repeating across sources;
+                                    operator-actionable as "your queue
+                                    inflation is publisher syndication,
+                                    not a flood of events".
+          * ``MODERATE``          — ``syndication_pct >= 20``. Notable
+                                    syndication but the queue still
+                                    carries diverse events.
+          * ``LIGHT``             — everything else (< 20% syndication).
+
+        Read-only (single SELECT) with ``_LIVE_ONLY_CLAUSE`` so
+        synthetic backtest/opus rows never enter the cluster pool.
+        Decorated with ``@_retry_on_lock`` for the documented
+        shared-connection cursor-collision class. NO DB write — no
+        ai_score / ml_score / score_source / urgency mutation. All four
+        load-bearing invariants intact by construction.
+        """
+        hours = max(int(hours), 1)
+        min_cluster_size = max(int(min_cluster_size), 2)
+        top_n = max(int(top_n), 1)
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        rows = self.conn.execute(
+            "SELECT title, source, first_seen, ai_score, ml_score "
+            "FROM articles "
+            f"WHERE urgency>=1 AND first_seen >= ? AND {_LIVE_ONLY_CLAUSE}",
+            (since,),
+        ).fetchall()
+
+        total_urgent = len(rows)
+        if total_urgent == 0:
+            return {
+                "window_h": hours,
+                "total_urgent": 0,
+                "n_clusters": 0,
+                "n_clustered_rows": 0,
+                "n_unique_events": 0,
+                "syndication_pct": 0.0,
+                "top_clusters": [],
+                "verdict": "NO_DATA",
+            }
+
+        # SSOT signature — same function the alert path uses to collapse
+        # duplicates, so the analyst's cluster view matches what the gate
+        # actually merges at push time. Lazy import (storage must not pull
+        # the watchers graph at module load).
+        try:
+            from watchers.alert_dedup import _signature
+        except Exception:  # pragma: no cover - import path defense only
+            _signature = lambda t: (t or "").strip().lower()[:30]
+
+        # Group rows by signature. Empty signatures (untitled / pre-stripped
+        # to nothing) are kept distinct (one bucket per row) so they cannot
+        # collapse into a single phantom cluster that inflates the verdict.
+        groups: dict[str, list[dict]] = {}
+        for idx, (title, source, first_seen, ai_score, ml_score) in enumerate(rows):
+            sig = _signature(title)
+            if not sig:
+                sig = f"__no_sig__{idx}"
+            try:
+                ai = float(ai_score or 0.0)
+            except (TypeError, ValueError):
+                ai = 0.0
+            try:
+                ml = float(ml_score or 0.0)
+            except (TypeError, ValueError):
+                ml = 0.0
+            effective = ai if ai > 0 else ml
+            groups.setdefault(sig, []).append({
+                "title": title or "",
+                "source": source or "",
+                "first_seen": first_seen or "",
+                "effective_score": effective,
+            })
+
+        n_unique_events = len(groups)
+        clusters = [
+            (sig, members) for sig, members in groups.items()
+            if len(members) >= min_cluster_size and not sig.startswith("__no_sig__")
+        ]
+        n_clusters = len(clusters)
+        n_clustered_rows = sum(len(m) for _, m in clusters)
+        syndication_pct = round(
+            n_clustered_rows / total_urgent * 100.0, 1
+        ) if total_urgent else 0.0
+
+        # Largest clusters first; ties broken by lead score (more newsworthy
+        # cluster surfaces first). The lead row is the highest effective
+        # score so the displayed title is the strongest call in the cluster.
+        clusters.sort(
+            key=lambda kv: (-len(kv[1]),
+                            -max((m["effective_score"] for m in kv[1]),
+                                 default=0.0))
+        )
+
+        top_clusters: list[dict] = []
+        for sig, members in clusters[:top_n]:
+            lead = max(members, key=lambda m: m["effective_score"])
+            distinct_sources = sorted({m["source"] for m in members if m["source"]})
+            timestamps = sorted(m["first_seen"] for m in members if m["first_seen"])
+            top_clusters.append({
+                "signature": sig,
+                "size": len(members),
+                "lead_title": lead["title"][:160],
+                "n_sources": len(distinct_sources),
+                "sources": distinct_sources[:5],
+                "first_seen": timestamps[0] if timestamps else "",
+                "last_seen": timestamps[-1] if timestamps else "",
+            })
+
+        if syndication_pct >= 40.0:
+            verdict = "HEAVY_SYNDICATION"
+        elif syndication_pct >= 20.0:
+            verdict = "MODERATE"
+        else:
+            verdict = "LIGHT"
+
+        return {
+            "window_h": hours,
+            "total_urgent": total_urgent,
+            "n_clusters": n_clusters,
+            "n_clustered_rows": n_clustered_rows,
+            "n_unique_events": n_unique_events,
+            "syndication_pct": syndication_pct,
+            "top_clusters": top_clusters,
+            "verdict": verdict,
+        }
+
+    @_retry_on_lock
     def urgency_label_split_by_source(
         self, hours: int = 24, top_n: int = 15
     ) -> dict:
