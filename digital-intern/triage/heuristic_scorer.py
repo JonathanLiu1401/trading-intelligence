@@ -56,13 +56,34 @@ def _term_matches(term: str, text: str) -> bool:
 # ── Portfolio tickers (direct mention = highest priority) ───────────────────
 # Short tickers must match as whole words (regex \b); naive substring match
 # was triggering false positives like "satellite"→"lite", "museum"→"mu".
-PORTFOLIO_TICKERS = {
+#
+# Live extension: union the hardcoded fallback with ml.features.
+# LIVE_PORTFOLIO_TICKERS (config/portfolio.json positions + option underlyings +
+# sector_watchlist). The static set was silently drifting behind the trading
+# UI — a 2026-05-21 portfolio.json read showed GOOG / COHR / NVDL held yet
+# absent here, so any kw_score on those names was missing the +4.0 ticker tier
+# bonus AND the 1.5× portfolio_relevance_multiplier — articles about an open
+# position were scoring like generic sector news. Mirrors the union pattern
+# already used by ml.features._load_portfolio_tickers and the daemon's
+# _price_alert_universe. Best-effort lower-cased; import failure quietly falls
+# back to the static set (a triage hot-path import must never fail because the
+# operator's config file is momentarily mid-write).
+_STATIC_PORTFOLIO_TICKERS = {
     "lite", "lnok", "muu", "dram", "sndu",
     "mu", "msft", "axti", "orcl", "tsem", "qbts", "nvda",
 }
+try:
+    from ml.features import LIVE_PORTFOLIO_TICKERS as _LIVE_PT
+    PORTFOLIO_TICKERS = _STATIC_PORTFOLIO_TICKERS | {t.lower() for t in _LIVE_PT if t}
+except Exception:
+    PORTFOLIO_TICKERS = set(_STATIC_PORTFOLIO_TICKERS)
 PORTFOLIO_NAMES = {
     "micron", "lumentum", "microsoft", "oracle", "tower semiconductor",
     "nvidia", "defiance", "direxion", "t-rex",
+    # Companies that correspond to live-portfolio tickers (GOOG/COHR/NVDL),
+    # so a headline using the company name not the ticker still gets the
+    # portfolio boost.
+    "alphabet", "coherent",
 }
 _PORTFOLIO_TICKER_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(t) for t in PORTFOLIO_TICKERS) + r")\b",
@@ -82,10 +103,23 @@ TIER_PORTFOLIO_PHRASES = {  # 4 pts each — direct portfolio/focus names
 # Bare tickers — must match on word boundaries; substring matching produced
 # false positives ("mu"→"museum") and false negatives ("MU." at end of string
 # was missed by the old " mu " space-padded hack).
-TIER_PORTFOLIO_TICKERS = {
+#
+# Live extension: same union discipline as PORTFOLIO_TICKERS above so a held
+# ticker added in the trading UI inherits the +4.0 ticker tier bonus, not just
+# the +1.5 additive boost. The static base names the semis/memory peer-tier
+# tickers (LRCX/AMAT/KLAC/WDC/STX) that aren't in portfolio.json yet still
+# warrant ticker-tier scoring — the union preserves that.
+_STATIC_TIER_PORTFOLIO_TICKERS = {
     "mu", "wdc", "stx", "lrcx", "amat", "klac", "axti", "orcl", "qbts",
     "lite", "lnok", "muu", "dram", "sndu", "nvda",
 }
+try:
+    from ml.features import LIVE_PORTFOLIO_TICKERS as _LIVE_TPT
+    TIER_PORTFOLIO_TICKERS = _STATIC_TIER_PORTFOLIO_TICKERS | {
+        t.lower() for t in _LIVE_TPT if t
+    }
+except Exception:
+    TIER_PORTFOLIO_TICKERS = set(_STATIC_TIER_PORTFOLIO_TICKERS)
 _TIER_PORTFOLIO_TICKER_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(t) for t in TIER_PORTFOLIO_TICKERS) + r")\b",
     re.I,

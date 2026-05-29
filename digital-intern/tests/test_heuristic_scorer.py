@@ -265,3 +265,46 @@ def test_multi_event_bonus_is_hard_capped():
     )
     assert r["n_events"] >= 4
     assert r["event_bonus"] <= MULTI_EVENT_BONUS_CAP
+
+
+# ── Portfolio-ticker drift: live config/portfolio.json positions must be honored ──
+
+def test_live_portfolio_positions_get_ticker_tier_score():
+    """Held positions read from config/portfolio.json (via ml.features.
+    LIVE_PORTFOLIO_TICKERS) must score at the +4.0 ticker-tier bonus, not just
+    the additive 1.5 boost. Prior bug: PORTFOLIO_TICKERS was a frozen literal
+    so a position added in the trading UI (e.g. GOOG/COHR/NVDL on 2026-05-21)
+    silently fell out of the ticker tier and was scored as generic sector news.
+    """
+    from triage.heuristic_scorer import PORTFOLIO_TICKERS, TIER_PORTFOLIO_TICKERS
+    from ml.features import LIVE_PORTFOLIO_TICKERS
+
+    if not LIVE_PORTFOLIO_TICKERS:
+        # No live config; the union is a no-op and we can't make a meaningful
+        # assertion. The test_features.py fallback test covers the empty case.
+        return
+    # Every live-held ticker must be in BOTH portfolio sets after the union.
+    lowered_live = {t.lower() for t in LIVE_PORTFOLIO_TICKERS}
+    missing_p = lowered_live - PORTFOLIO_TICKERS
+    missing_t = lowered_live - TIER_PORTFOLIO_TICKERS
+    assert not missing_p, (
+        f"Live config tickers missing from PORTFOLIO_TICKERS (heuristic drift): "
+        f"{sorted(missing_p)}"
+    )
+    assert not missing_t, (
+        f"Live config tickers missing from TIER_PORTFOLIO_TICKERS: "
+        f"{sorted(missing_t)}"
+    )
+
+
+def test_static_fallback_tickers_still_present_after_union():
+    """The union must EXTEND the hardcoded fallback, never replace it. Tickers
+    that pre-existed in the static set (LITE/MU/NVDA/...) must still receive
+    the ticker-tier score even if config/portfolio.json is missing or pares
+    them out — the static set is a safety floor."""
+    from triage.heuristic_scorer import PORTFOLIO_TICKERS, TIER_PORTFOLIO_TICKERS
+
+    must_have = {"lite", "lnok", "muu", "dram", "sndu", "mu", "msft",
+                 "axti", "orcl", "tsem", "qbts", "nvda"}
+    assert must_have.issubset(PORTFOLIO_TICKERS)
+    assert must_have.issubset(TIER_PORTFOLIO_TICKERS)
