@@ -690,3 +690,145 @@ def test_endpoint_real_decision_none_on_fresh_book(client):
     assert d["last_real_decision_ts"] is None
     assert d["secs_since_real_decision"] is None
     assert d["real_decision_age"] is None
+
+
+# ═══════════════════ PRE_STORM early-warning (2026-05-29) ════════════════════
+#
+# AGENTS.md 2026-05-29 Agent 1 user_finding #1 flagged that the heartbeat goes
+# from PRODUCING to IDLE_STORM in one step at the breaker threshold — there is
+# no "almost there" verdict. A trader watching the dashboard could miss the
+# transition entirely if they only check at-a-glance. PRE_STORM closes that
+# gap: at ``consec == threshold - PRE_STORM_OFFSET`` (= 4 by default) the
+# efficacy verdict reads PRE_STORM and the top-level headline gains a ⚠
+# clause — but NO restart recommendation (the next real decision still clears
+# it without operator action; same back-pressure rule as DEGRADED).
+
+from paper_trader.analytics.runner_heartbeat import (  # noqa: E402
+    PRE_STORM_OFFSET,
+)
+
+
+def test_pre_storm_offset_constant_is_the_spec():
+    """Retune-proof — the OPEN_INTERVAL_S precedent. Default 1 fires PRE_STORM
+    at threshold-1 (= 4), the cycle BEFORE the breaker arms."""
+    assert PRE_STORM_OFFSET == 1
+
+
+def test_pre_storm_fires_at_threshold_minus_one():
+    """consec == threshold - 1 (= 4) with no preceding real decision → PRE_STORM.
+    NOT IDLE_STORM (consec < threshold), NOT PRODUCING (the early warning is
+    the whole point), no restart recommendation (next real decision clears it)."""
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * 4 + ["HOLD MU → HOLD"])  # consec=4, k=5
+    eff = out["decision_efficacy"]
+    assert eff["verdict"] == "PRE_STORM"
+    assert eff["consecutive_no_decision"] == 4
+    assert eff["window"] == 5
+    assert out["restart_recommended"] is False
+    # Top-level cadence verdict left untouched (the documented separation).
+    assert out["verdict"] == "HEALTHY"
+    # The warning clause IS folded into the top-level headline so a trader
+    # scanning at-a-glance sees the ⚠ even when ``verdict`` reads HEALTHY.
+    assert "⚠" in out["headline"]
+    assert "4 cycles were NO_DECISION" in out["headline"]
+    assert "one miss" in out["headline"]
+
+
+def test_pre_storm_to_idle_storm_boundary_is_exact():
+    """consec=threshold-1 → PRE_STORM; consec=threshold → IDLE_STORM. Locks
+    the ``>= threshold`` predicate so an off-by-one that mutes a real breaker
+    arm is caught. Same retune-proof shape as
+    ``test_storm_threshold_boundary_off_by_one``."""
+    k = NO_DECISION_STORM_THRESHOLD
+    pre = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * (k - 1) + ["HOLD"])
+    assert pre["decision_efficacy"]["verdict"] == "PRE_STORM"
+    assert pre["restart_recommended"] is False
+
+    storm = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * k)
+    assert storm["decision_efficacy"]["verdict"] == "IDLE_STORM"
+    assert storm["restart_recommended"] is True
+
+
+def test_pre_storm_takes_precedence_over_degraded_at_consec_threshold_minus_one():
+    """consec=4 with pct also >= 50% reads PRE_STORM, NOT DEGRADED. The leading-
+    run signal is sharper than the window-fraction signal — a trader cares more
+    that the engine is 1 miss from the breaker than that 80% of the window
+    missed. Verdict ladder ordering pin: PRE_STORM check must run BEFORE the
+    pct >= 50% check in ``_decision_efficacy``."""
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * 4 + ["HOLD"])  # consec=4, pct=80%
+    eff = out["decision_efficacy"]
+    assert eff["verdict"] == "PRE_STORM"      # not DEGRADED
+    assert eff["no_decision_pct"] == 80.0     # pct still computed
+    assert out["restart_recommended"] is False
+
+
+def test_below_pre_storm_threshold_falls_through_to_existing_arms():
+    """consec=threshold-2 (= 3) does NOT fire PRE_STORM — falls through to the
+    existing pct-based DEGRADED / PRODUCING arms. Below-threshold consec must
+    not poison the verdict, otherwise the early warning would creep down and
+    the trader would see PRE_STORM on benign 3-in-a-row blips."""
+    # consec=3 with pct=60% → DEGRADED (existing behaviour)
+    out_deg = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * 3 + ["HOLD", "HOLD"])  # consec=3, pct=60%
+    assert out_deg["decision_efficacy"]["verdict"] == "DEGRADED"
+
+    # consec=3 with pct=30% → PRODUCING (existing behaviour)
+    out_prod = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * 3 + ["HOLD"] * 7)  # consec=3, pct=30%
+    assert out_prod["decision_efficacy"]["verdict"] == "PRODUCING"
+
+
+def test_pre_storm_headline_warning_visible_without_restart_directive():
+    """The whole point of AGENTS.md user_finding #1: a trader scanning at-a-
+    glance must see the warning IN the top-level headline even when the
+    liveness verdict reads HEALTHY. PRE_STORM appends a ⚠ clause but never
+    a 'restart' directive (next real decision clears it)."""
+    out = build_runner_heartbeat(
+        _ago(600), market_open=True, now=NOW,
+        recent_actions=[ND] * 4 + ["HOLD"])
+    head = out["headline"]
+    # The cadence portion ("HEALTHY — last decision …") still leads — the
+    # documented liveness/efficacy separation. The ⚠ clause comes AFTER it.
+    assert head.startswith("HEALTHY")
+    assert "⚠" in head
+    assert "verge" in head.lower() or "miss" in head.lower()
+    # MUST NOT recommend restart (PRE_STORM is informational only).
+    assert "restart" not in head.lower()
+
+
+def test_pre_storm_endpoint_end_to_end(client):
+    """End-to-end through Flask: 4 NO_DECISION rows followed by a HOLD-style
+    row are the early-warning regime — endpoint surfaces PRE_STORM and the ⚠
+    warning, without restart_recommended."""
+    c, s = client
+    s.record_decision(True, 3, "HOLD MU → HOLD", "{}", 1000.0, 100.0)
+    for _ in range(4):
+        s.record_decision(False, 0, "NO_DECISION", _TIMEOUT, 1000.0, 100.0)
+    d = c.get("/api/runner-heartbeat").get_json()
+    assert d["verdict"] == "HEALTHY"
+    assert d["restart_recommended"] is False
+    assert d["decision_efficacy"]["verdict"] == "PRE_STORM"
+    assert d["decision_efficacy"]["consecutive_no_decision"] == 4
+    assert "⚠" in d["headline"]
+
+
+def test_pre_storm_with_stalled_cadence_still_carries_restart():
+    """A STALLED cadence with consec=4 keeps restart_recommended=True
+    (cadence-driven), and efficacy reads PRE_STORM (engine close to wedge).
+    The two layers must coexist — a wedged cadence is the dominant signal but
+    the operator still wants to know the engine is also close to brain-dead."""
+    out = build_runner_heartbeat(
+        _ago(4 * 3600), market_open=True, now=NOW,
+        recent_actions=[ND] * 4 + ["HOLD"])
+    assert out["verdict"] == "STALLED"
+    assert out["restart_recommended"] is True
+    assert out["decision_efficacy"]["verdict"] == "PRE_STORM"
