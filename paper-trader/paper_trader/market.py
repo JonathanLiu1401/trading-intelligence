@@ -390,6 +390,17 @@ def get_prices(tickers: list[str]) -> dict[str, float | None]:
                         closes = data["Close"].dropna()
                     if len(closes):
                         price = float(closes.iloc[-1])
+                        # Zero / negative is not a real mark (halted symbol,
+                        # corrupt yfinance row). Treat it as missing so the
+                        # per-ticker ``get_price(t)`` fallback runs and the
+                        # mark-to-market path sees ``None`` instead of writing
+                        # a $0 mark that immediately reads as a 100% loss in
+                        # ``_mark_to_market`` (the single-ticker ``get_price``
+                        # path already filters this; the bulk path silently
+                        # didn't, so a yfinance hiccup that returned 0 for a
+                        # live ticker briefly wiped the position's mark).
+                        if price <= 0:
+                            price = None
                 except Exception:
                     price = None
                 if price is None:
