@@ -552,7 +552,14 @@ def _append_top_decisions(engine: BacktestEngine, top_runs: list[BacktestRun],
                     "title": f"{action} {row['ticker']} on {row['sim_date']}",
                     "source": f"backtest_cycle_{cycle}_rank{rank}",
                     "ai_score": round(weight * (5.0 if action == "BUY" else 0.5), 2),
-                    "urgency": 1 if rank == 1 else 0,
+                    # CLAUDE.md §8 invariant #2: backtest records always have
+                    # urgency=0. `_inject_and_train` hardcodes urgency=0 when
+                    # writing to articles.db, so a non-zero JSONL value was a
+                    # dead branch in production — but any direct JSONL consumer
+                    # (or a future refactor that propagated the field) would
+                    # silently violate the "live alerts come from live news,
+                    # not training synthesis" guarantee. Pin to 0 at the source.
+                    "urgency": 0,
                     "label": action,
                     "ticker": row["ticker"] or "",
                     "sim_date": row["sim_date"] or "",
@@ -4082,7 +4089,12 @@ Respond as JSON with this schema (no markdown fences):
                 "title": f"Lesson run {winner.run_id} ({winner.total_return_pct:+.1f}%): {lesson[:120]}",
                 "source": f"opus_annotation_cycle_{cycle}",
                 "ai_score": 5.0,
-                "urgency": 1,
+                # CLAUDE.md §8 invariant #2: even an Opus lesson must not bump
+                # urgency — live alerts come from live news, not training
+                # synthesis. `_inject_and_train` already hardcodes 0 on the
+                # write to articles.db; this pins the source-of-record JSONL
+                # to match.
+                "urgency": 0,
                 "label": "LESSON",
                 "return_pct": winner.total_return_pct,
                 "reasoning": lesson,
@@ -4103,7 +4115,12 @@ Respond as JSON with this schema (no markdown fences):
                 "title": f"{action} {tl.get('ticker','')} {tl.get('sim_date','')} [{q}]",
                 "source": f"opus_annotation_cycle_{cycle}",
                 "ai_score": quality_score.get(q, 2.5),
-                "urgency": 1 if q == "GOOD" else 0,
+                # CLAUDE.md §8 invariant #2: even a GOOD Opus annotation must
+                # not bump urgency — live alerts come from live news, not
+                # training synthesis. `_inject_and_train` already hardcodes 0
+                # on the write to articles.db; this pins the source-of-record
+                # JSONL to match.
+                "urgency": 0,
                 "label": action,
                 "ticker": tl.get("ticker", ""),
                 "sim_date": tl.get("sim_date", ""),
