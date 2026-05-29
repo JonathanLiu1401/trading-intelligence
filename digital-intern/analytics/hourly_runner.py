@@ -77,6 +77,7 @@ def main() -> int:
         ("db_lock_tax",               "analytics.db_lock_tax",               "main"),
         ("sector_pulse",              "analytics.sector_pulse",              "main"),
         ("keyword_surge",             "analytics.keyword_surge",             "main"),
+        ("active_ticker_dashboard",   "analytics.active_ticker_dashboard",   "main"),
     ]
 
     for short_name, mod_path, fn_name in module_specs:
