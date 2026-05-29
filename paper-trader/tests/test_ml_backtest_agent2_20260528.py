@@ -661,6 +661,127 @@ class TestPortfolioInvariants:
 # ---------------------------------------------------------------------------
 
 
+class TestFeatureGroupImportance:
+    """The new feature_group_importance() rolls per-feature importance into
+    the 5 FEATURE_GROUPS buckets. Behavioural locks:
+
+    1. Empty / untrained → trained=False, groups=[]
+    2. Trained → groups sum to 1.0 normalized; raw sum = sum of per-feature
+    3. Sector group's n_features == 7 (matches SECTORS)
+    4. Quant group's n_features == 9 (rsi/macd/mom5/mom20/vol_ratio/bb_pos
+       + 3 enhanced MACD)
+    """
+
+    def test_untrained_returns_empty(self):
+        from paper_trader.ml.decision_scorer import DecisionScorer
+
+        s = DecisionScorer.__new__(DecisionScorer)
+        s._model = None
+        s._scaler = None
+        s._trained = False
+        s._n_train = 0
+        s._pred_quantiles = None
+        s._label_quantiles = None
+        out = s.feature_group_importance()
+        assert out["trained"] is False
+        assert out["groups"] == []
+        assert out["n_train"] == 0
+
+    def _build_diverse_training_records(self):
+        """Build >50 distinct (ticker, sim_date, action) records so the
+        dedup-after-min gate (n >= 30) passes."""
+        records = []
+        tickers = ["NVDA", "AMD", "SPY", "TLT", "GLD", "BTC-USD", "XOM",
+                   "LLY", "JPM", "TSLA"]
+        for i in range(60):
+            ticker = tickers[i % len(tickers)]
+            day = (i * 3) % 28 + 1  # spread dates out
+            month = (i // 10) + 1
+            records.append({
+                "ticker": ticker,
+                "sim_date": f"2024-{month:02d}-{day:02d}",
+                "ml_score": (i % 5) * 1.0,
+                "rsi": 30 + (i % 60), "macd": (i - 30) * 0.1,
+                "mom5": (i - 30) * 0.5, "mom20": (i - 30) * 1.0,
+                "regime_mult": 1.0, "vol_ratio": 1.0,
+                "bb_position": ((i % 20) - 10) / 10.0,
+                "news_urgency": 50.0, "news_article_count": 1.0,
+                "forward_return_5d": (i - 30) * 0.3,
+                "action": "BUY",
+            })
+        return records
+
+    def test_trained_sums_to_1_normalized(self, tmp_path):
+        from paper_trader.ml.decision_scorer import (
+            DecisionScorer, train_scorer,
+        )
+        import paper_trader.ml.decision_scorer as ds
+
+        result = train_scorer(self._build_diverse_training_records(),
+                              path=ds.SCORER_PATH)
+        assert result["status"] == "ok", f"train failed: {result}"
+        s = DecisionScorer()
+        out = s.feature_group_importance()
+        assert out["trained"] is True, f"out={out}"
+        assert len(out["groups"]) >= 1
+
+        # Normalized must sum to ~1.0 (rounding tolerance)
+        total_norm = sum(g["importance_normalized"] for g in out["groups"])
+        assert 0.99 <= total_norm <= 1.01, f"normalized sum {total_norm} ≠ 1.0"
+
+    def test_group_n_features_matches_groups_map(self, tmp_path):
+        """sector should aggregate 7 features (one per SECTORS entry);
+        quant should aggregate 9 (rsi, macd, mom5, mom20, vol_ratio, bb_pos
+        + 3 enhanced MACD)."""
+        from paper_trader.ml.decision_scorer import (
+            DecisionScorer, train_scorer, SECTORS,
+        )
+        import paper_trader.ml.decision_scorer as ds
+
+        result = train_scorer(self._build_diverse_training_records(),
+                              path=ds.SCORER_PATH)
+        assert result["status"] == "ok", f"train failed: {result}"
+        s = DecisionScorer()
+        out = s.feature_group_importance()
+        by_name = {g["group"]: g for g in out["groups"]}
+        assert by_name["sector"]["n_features"] == len(SECTORS)
+        # quant features: rsi/macd/mom5/mom20/vol_ratio/bb_pos +
+        # ema200_above/hist_cross_up/macd_below_zero_cross
+        assert by_name["quant"]["n_features"] == 9
+        # ml_score, regime alone
+        assert by_name["ml_score"]["n_features"] == 1
+        assert by_name["regime"]["n_features"] == 1
+        assert by_name["news"]["n_features"] == 2
+
+    def test_group_importance_aggregates_per_feature(self, tmp_path):
+        """Algebraic identity: per-group importance must equal sum of
+        per-feature importance within that group."""
+        from paper_trader.ml.decision_scorer import (
+            DecisionScorer, train_scorer, FEATURE_GROUP_MAP,
+        )
+        import paper_trader.ml.decision_scorer as ds
+
+        result = train_scorer(self._build_diverse_training_records(),
+                              path=ds.SCORER_PATH)
+        assert result["status"] == "ok"
+        s = DecisionScorer()
+        per_feat = s.feature_importance()
+        groups = s.feature_group_importance()
+
+        # Compute expected per-group sums
+        expected = {}
+        for row in per_feat["importances"]:
+            grp = FEATURE_GROUP_MAP[row["feature"]]
+            expected[grp] = expected.get(grp, 0.0) + row["importance"]
+
+        actual = {g["group"]: g["importance"] for g in groups["groups"]}
+        for grp, exp in expected.items():
+            assert grp in actual, f"missing group {grp}"
+            assert actual[grp] == pytest.approx(exp, abs=1e-4), (
+                f"group {grp}: expected {exp}, got {actual[grp]}"
+            )
+
+
 class TestGateArmDecodeBoundaries:
     """The arms (×0.6/×0.85/×1.0/×1.15/×1.3) gate conviction at
     boundaries: pred < -10 → strong_headwind, pred < 0 → mild_headwind,

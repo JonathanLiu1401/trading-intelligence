@@ -1123,6 +1123,86 @@ class DecisionScorer:
                     "n_train": int(self._n_train), "importances": [],
                     "error": str(e)}
 
+    def feature_group_importance(self) -> dict:
+        """Global per-group importance — model-wide companion to
+        ``feature_group_contributions`` (which answers the same question
+        for a single prediction).
+
+        Rolls the ``feature_importance`` per-feature mean |w| into the 5
+        ``FEATURE_GROUPS`` buckets (ml_score / quant / regime / news /
+        sector). Answers the triage question a per-feature table doesn't:
+        *across all training, is the model leaning on news, on quant,
+        on the sector bias, or on the trade thesis?*
+        A sector_tech 0.45 + sector_energy 0.30 + sector_other 0.0 row
+        of per-feature importance reads as "sector is a 6-feature
+        bucket dominated by two non-zero entries" — true at-a-glance.
+
+        Algebraic identity (sum-of-groups = sum-of-features):
+
+            sum(group.importance for group in groups)
+                == sum(feature.importance for feature in importances)
+
+        Returns a JSON-safe dict ``{"trained", "method", "n_train",
+        "groups": [{"group", "importance", "importance_normalized",
+        "n_features"}]}`` sorted desc by raw importance.
+        ``importance_normalized`` sums to 1.0 across all groups so a
+        reader can read it as a share — same convention as
+        ``feature_importance``. Every failure path degrades to an
+        ``error`` field, never an exception (mirrors
+        ``feature_importance`` / ``feature_group_contributions``).
+        """
+        imp = self.feature_importance()
+        if not imp.get("trained"):
+            return {"trained": False, "method": None, "n_train": 0,
+                    "groups": []}
+        if not imp.get("importances"):
+            # Either error path inside feature_importance or no features —
+            # propagate the honest signal up. Carry forward the error so
+            # the caller knows WHY the groups list is empty.
+            out = {"trained": True, "method": imp.get("method"),
+                   "n_train": imp.get("n_train", 0), "groups": []}
+            if imp.get("error"):
+                out["error"] = imp["error"]
+            return out
+        try:
+            sums: dict[str, float] = {g: 0.0 for g in FEATURE_GROUPS}
+            counts: dict[str, int] = {g: 0 for g in FEATURE_GROUPS}
+            for row in imp["importances"]:
+                feat = row["feature"]
+                grp = FEATURE_GROUP_MAP.get(feat, "unknown")
+                if grp not in sums:
+                    sums[grp] = 0.0
+                    counts[grp] = 0
+                sums[grp] += float(row["importance"])
+                counts[grp] += 1
+            total = sum(sums.values())
+            rows: list[dict] = []
+            for grp in (*FEATURE_GROUPS, "unknown"):
+                if grp not in sums:
+                    continue
+                # Drop the synthetic 'unknown' bucket if no features
+                # landed there (FEATURE_GROUP_MAP is normally complete).
+                if grp == "unknown" and counts[grp] == 0:
+                    continue
+                share = (sums[grp] / total) if total > 0 else 0.0
+                rows.append({
+                    "group": grp,
+                    "importance": round(sums[grp], 6),
+                    "importance_normalized": round(share, 6),
+                    "n_features": counts[grp],
+                })
+            rows.sort(key=lambda r: -r["importance"])
+            return {
+                "trained": True,
+                "method": imp.get("method"),
+                "n_train": imp.get("n_train", 0),
+                "groups": rows,
+            }
+        except Exception as e:
+            return {"trained": True, "method": imp.get("method"),
+                    "n_train": imp.get("n_train", 0), "groups": [],
+                    "error": str(e)}
+
 
 def train_scorer(records: list[dict], path: "Path | None" = None) -> dict:
     """Train DecisionScorer on outcome records.
@@ -1552,10 +1632,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.feature_importance:
         imp = scorer.feature_importance()
+        # Compute group-level rollup too — operator triage view of which
+        # bucket (ml_score / quant / regime / news / sector) the trained
+        # model is actually relying on.
+        groups = scorer.feature_group_importance() if args.groups else None
         if args.json:
             import json
 
-            print(json.dumps(imp, indent=2, sort_keys=True))
+            payload = dict(imp)
+            if groups is not None:
+                payload["group_importance"] = groups
+            print(json.dumps(payload, indent=2, sort_keys=True))
             return 0 if imp.get("trained") and not imp.get("error") else 1
         if not imp.get("trained"):
             print("[decision_scorer] model NOT trained — no pickle at "
@@ -1571,6 +1658,15 @@ def main(argv: list[str] | None = None) -> int:
         for r in imp.get("importances") or []:
             print(f"  {r['feature']:<22}{r['importance']:>14.6f}"
                   f"{r['importance_normalized']*100:>9.2f}%")
+        if groups is not None and groups.get("groups"):
+            print("  per-group importance (operator triage):")
+            print(f"    {'group':<12}{'importance':>14}{'share':>10}{'n_feats':>10}")
+            for g in groups["groups"]:
+                print(f"    {g['group']:<12}{g['importance']:>14.6f}"
+                      f"{g['importance_normalized']*100:>9.2f}%"
+                      f"{g['n_features']:>10}")
+        elif groups is not None and groups.get("error"):
+            print(f"  group importance unavailable: {groups['error']}")
         return 0
 
     common = dict(
