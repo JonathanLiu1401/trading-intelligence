@@ -1,5 +1,216 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-29 ML+backtest HYBRID pass (Agent 2) — winner JSONL urgency invariant fix + per-arm Kelly diagnostic
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=5
+
+### Phase 1 — winner_training.jsonl urgency invariant violation (`bugs_fixed = 1`)
+
+CLAUDE.md §8 invariant #2 states: *"Backtest articles always have
+urgency = 0. Even Opus annotations that mark a trade GOOD don't bump
+urgency."* The DB inject path (`_inject_and_train`) already hardcoded
+``urgency=0`` when writing to ``articles.db``, but three upstream
+writers emitted ``urgency=1`` to ``winner_training.jsonl`` itself:
+
+* ``run_continuous_backtests.py:_append_top_decisions`` — ``"urgency":
+  1 if rank == 1 else 0`` for the top backtest run's decisions.
+* ``run_continuous_backtests.py:_opus_annotate`` (lesson row) — hardcoded
+  ``"urgency": 1``.
+* ``run_continuous_backtests.py:_opus_annotate`` (trade label row) —
+  ``"urgency": 1 if q == "GOOD" else 0``.
+
+Production wasn't broken because the DB write path overrides — but any
+direct JSONL consumer or a future refactor that propagated the field
+would silently violate the documented "live alerts come from live news,
+not training synthesis" guarantee. Pinned all three writers to 0 at the
+source-of-record JSONL.
+
+Test-locks in ``tests/test_ml_backtest_agent2_20260529.py`` (13 passing,
+2 skipped). The two skipped tests require a real on-disk scorer pickle
+which conftest sandboxes; they pass under the deployed pickle and skip
+honestly in the test sandbox.
+
+* ``test_append_top_decisions_emits_urgency_zero`` — pins the rank-1
+  branch.
+* ``test_opus_annotate_emits_urgency_zero`` — pins the LESSON and GOOD
+  trade-label branches via a mocked Opus response.
+* ``test_predict_is_idempotent`` — same inputs ⇒ same outputs (skipped
+  when no scorer in sandbox).
+* ``test_sector_one_hot_exact`` — 8 parametrized cases verifying the
+  ``build_features`` sector tail is a true one-hot mapped to the right
+  sector (NVDA→tech, XOM→energy, JPM→financials, LLY→healthcare,
+  GLD→commodities, BTC-USD→crypto, TM→other, unmapped→other).
+* ``test_build_features_total_under_garbage`` — None/NaN/inf/string
+  inputs still produce a finite ``N_FEATURES``-length vector.
+* ``test_predict_with_meta_failed_false_on_real_clamp`` — a real
+  clamped (but finite) prediction reports ``failed=False`` so OOS
+  rank-IC retains it.
+* ``test_compute_decision_outcomes_empty_run_returns_empty`` — no
+  fabricated rows on a run with zero FILLED decisions.
+* ``test_train_scorer_insufficient_data_does_not_overwrite_pickle`` —
+  empty and tiny batches return sentinel statuses without touching the
+  on-disk pickle (would otherwise wipe the deployed model).
+
+Commit: ``d55ed0a``.
+
+### Phase 2 — `paper_trader/ml/gate_arm_kelly.py` (`features_added = 1`)
+
+New read-only analyzer: **per-gate-arm Kelly fraction + per-trade
+Sharpe + win rate**, based on the same captured-then-deployed approach
+as ``gate_realized`` (no re-prediction, off-distribution rows routed to
+a separate ``abstained`` bucket and excluded from the verdict).
+
+**The gap closed.** Existing gate diagnostics (``gate_realized``,
+``gate_audit``, ``gate_pnl``, ``gate_decile_realized``) report per-arm
+**means**. None answer the textbook quant question: *given the realized
+distribution of each arm's outcomes, what does Kelly's criterion say
+the relative sizing across arms should be — and how does that compare
+to the gate's actual ×0.60/×0.85/×1.00/×1.15/×1.30 multiplier ladder?*
+A high realized mean is not the same as high Kelly fraction: an arm
+returning +5% with σ=20% has lower Kelly than an arm returning +3% with
+σ=4%. The current gate multipliers are RANK-based by the scorer's
+predicted-return ordering — they implicitly assume variance is
+comparable across arms.
+
+**Metrics per arm.** ``n``, ``mean_pct``, ``median_pct``, ``stdev_pct``,
+``min/max_pct``, ``sharpe_per_trade`` (mean/stdev, unitless), ``win_rate``
+(strict positives), ``kelly_fraction`` (full Kelly: μ/σ², decimal-
+converted, clamped to [0, KELLY_CAP=1.0], 0 on μ≤0, None on σ≤0), and
+``half_kelly`` (the practical reference).
+
+**Verdict ladder** (driven by the realized-Sharpe spread between the
+two extreme arms, mirroring ``gate_realized``'s spread-based discipline):
+
+| Verdict | Meaning |
+|---------|---------|
+| ``GATE_CAPTURE_NOT_YET_POPULATED`` | 0 rows have ``gate_scorer_pred`` (corpus pre-dates ``60b20d9``) |
+| ``INSUFFICIENT_DATA`` | < ``MIN_TOTAL`` acted rows OR extreme arm < ``MIN_ARM_N`` OR Sharpe undefined |
+| ``KELLY_INVERTED`` | ``strong_tailwind.sharpe − strong_headwind.sharpe < −SHARPE_TOL`` |
+| ``KELLY_AT_NOISE`` | ``|spread| ≤ SHARPE_TOL`` |
+| ``KELLY_ALIGNED`` | ``spread > +SHARPE_TOL`` — gate's bigger bets really do produce higher risk-adjusted return |
+
+**CLI** (mirrors ``gate_realized``):
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.gate_arm_kelly         # OOS 20% tail (default)
+cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.gate_arm_kelly --all   # full corpus
+cd /home/zeph/trading-intelligence/paper-trader && python3 -m paper_trader.ml.gate_arm_kelly --json  # machine-readable
+```
+
+**Tests** — ``tests/test_gate_arm_kelly.py``, 22 passing. Pure Kelly
+formula (exact-value: ``μ=1%, σ=10% → 1.0``; ``μ=1%, σ=20% → 0.25``;
+``μ≤0 → 0``; ``σ≤0 → None``; capped at 1.0), per-arm summary stats on
+``[1,2,3,4,5]`` (mean=3, sample stdev≈1.5811, sharpe≈1.8974, win
+rate=1.0), bucketing (arm boundary correctness against the
+``gate_audit.gate_arm`` SSOT, SELL sign-flip, ``off_dist`` → abstained),
+verdict ladder corners (``GATE_CAPTURE_NOT_YET_POPULATED``,
+``KELLY_ALIGNED`` on synthetic tailwind-wins-by-Sharpe rows,
+``KELLY_INVERTED`` on synthetic headwind-wins-by-Sharpe rows), file IO
+(missing file, garbage-line skip, end-to-end JSON-safe), garbage-input
+safety.
+
+Commit: ``c7b6778``.
+
+### Phase 3 — Live validation findings (`user_findings = 5`)
+
+Read-only inspection of the deployed scorer, the live corpus, and the
+continuous-loop logs from the perspective of a quant researcher.
+
+1. **The conviction gate is FULLY DISABLED on every captured BUY.**
+   Across 5282 captured-BUY rows (every BUY with a non-null
+   ``gate_scorer_pred``), 100% carry ``gate_off_dist=True`` — the gate's
+   abstention guard fires on every single deployed prediction. The
+   ``gate-killed,no-skill`` reasoning marker (kill-switch suppression)
+   accounts for the bulk per the trailing-20 ``oos_buy_ic`` median of
+   ``-0.010`` (below the ``+0.030`` ``_GATE_SKILL_IC_TOLERANCE``). The
+   gate's ×0.6/×0.85/×1.0/×1.15/×1.3 modulation has applied no
+   multiplier to any captured trade. This is the documented kill-switch
+   behaviour under ``MLP_NO_BETTER_THAN_TRIVIAL`` — and it confirms the
+   kill-switch is correctly protecting the trader from the inverted
+   negative-prediction branch (finding #2).
+2. **Negative scorer predictions are ANTI-PREDICTIVE.** Across the same
+   5282 captured BUYs: positive predictions (n=3103, 58.7%) realize
+   positive returns 54.5% of the time — barely above chance. Negative
+   predictions (n=2128, 40.3%) realize negative returns only 44.8% of
+   the time — strictly worse than coin-flip. The scorer's bearish calls
+   are flipped relative to realized 5d returns, exactly the case the
+   kill-switch's signed-threshold (not |median|) check is designed to
+   catch. The direct Spearman rank-IC across all 5282 pairs is +0.024 —
+   noise.
+3. **Recent backtest runs have implausibly wide return dispersion.**
+   The 50 most recent rows of ``backtest.db`` show: median return
+   +410%, max +7510.6%, min -75.7%, 98% positive returns over a 1-year
+   simulated window. Most runs have only 3 trades (low-activity
+   buy-and-hold style), but the mean ``n_trades`` is 46 with a max of
+   1315. The win rate of 49/50 is suggestive of window-selection bias
+   (the random ``_pick_window`` may be skewing toward bull-market eras)
+   and/or leveraged-ETF compounding noise where the persona-seeded
+   tilts (semis 3x / tech 3x) ride a single dominant theme to
+   compounded extreme returns.
+4. **34 ``opus_annotate timeout`` lines in ``continuous.log``.** The
+   Opus annotation pipeline that labels GOOD/NEUTRAL/BAD trades for the
+   ArticleNet feedback loop is failing intermittently. Not blocking the
+   trader (best-effort discipline) but it means the
+   ``winner_training.jsonl`` Opus-labeled records are accumulating more
+   slowly than ``_append_top_decisions`` plain-decision records — the
+   training corpus is becoming less Opus-curated over time.
+5. **The deployed scorer's prediction surface is dominated by sector
+   biases.** A direct CLI probe (``--ticker NVDA --rsi 30 --mom5 2 ...``
+   with strong bullish quant signals + EMA200_above) returns a raw
+   prediction of -45.05%, placing it at the **0.11 percentile** of the
+   training prediction distribution. The deployed pickle passes the
+   ``scorer_pickle_smoke`` HEALTHY check (spread ≈ 31.7pp across a
+   5-probe grid, both quantile tables span a real range, n_train=3837),
+   so the prediction is real, not a degenerate-pickle artifact.
+   Combined with finding #2, this is the documented "the unbounded MLP
+   head is volatile and biased — see ``DIRECTIONAL_BUT_BIASED`` /
+   ``MLP_NO_BETTER_THAN_TRIVIAL``" state, mitigated by the
+   ``predict_calibrated`` quantile-map (which returns -47.36% — still
+   pessimistic but at least mapped onto the realized-label support).
+
+None of these findings are net-new — every one of them is documented
+somewhere in the existing AGENTS.md / CLAUDE.md / skill-log corpus.
+The value of repeating them in a Phase 3 audit is that a skeptical
+quant inspecting the system today should not be surprised: the gate is
+intentionally OFF, the scorer is being protected from itself, and the
+extreme-return backtest dispersion is a known property of the
+window-randomized leveraged universe.
+
+### How the new diagnostic fits the existing stack
+
+* ``gate_audit`` / ``gate_pnl`` — re-predict with today's pickle; report
+  arm spread.
+* ``gate_realized`` — capture-then-deployed, per-arm REALIZED MEAN per
+  arm + verdict on the 5d spread.
+* **``gate_arm_kelly`` (new)** — capture-then-deployed, per-arm
+  RISK-ADJUSTED metrics: Sharpe, Kelly, win rate. Verdict on the
+  Sharpe spread.
+* ``gate_decile_realized`` — capture-then-deployed, by predicted-return
+  decile (not arm).
+* ``gate_realized``'s verdict + this Kelly verdict together answer the
+  full "is the gate's sizing rule justified by realized data?" question
+  the original arm-spread tool cannot — the SAME corpus can produce
+  ``GATE_INEFFECTIVE`` on means (no realized mean edge) AND
+  ``KELLY_ALIGNED`` on Sharpe (the variance differential carries the
+  edge), or vice versa. Reading both surfaces the full picture.
+
+### Test commands for the ML/backtest domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Focused: just the new + key sibling tests (~10s).
+python3 -m pytest tests/test_gate_arm_kelly.py tests/test_ml_backtest_agent2_20260529.py -v
+
+# ML/backtest domain (all decision_scorer + backtest + ml_backtest, ~50s).
+python3 -m pytest tests/test_decision_scorer.py tests/test_decision_scorer_attribution.py \
+    tests/test_decision_scorer_feature_groups.py tests/test_ml_backtest_seams.py \
+    tests/test_backtest.py tests/test_gate_arm_kelly.py
+
+# Continuous-loop suite (~10s).
+python3 -m pytest tests/test_continuous.py
+```
+
 ## 2026-05-29 core HYBRID pass (Agent 1, third cycle) — book_exposure cash %% token
 
 **Counters:** bugs_fixed=0 · features_added=1 · user_findings=2
