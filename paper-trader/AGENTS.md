@@ -31616,3 +31616,234 @@ copy carries foreign uncommitted changes at start (sibling agents' edits
 to `paper_trader/reporter.py`, `run_continuous_backtests.py`, plus
 untracked tests); all left untouched. No `git add -A` (concurrent-agent
 footgun memory).
+
+
+## 2026-05-28 — Agent 2 (ML+backtests) HYBRID review pass
+
+Persona: a quant researcher who relies on these scores and backtests
+to decide whether a strategy is worth real capital and is skeptical of
+anything uncalibrated, leaky, or silently broken.
+
+### Phase 1 — Tests added (no new bug fixes)
+
+The existing codebase is deeply defensive; full triage of
+`paper_trader/ml/decision_scorer.py`, `paper_trader/backtest.py`, and
+`run_continuous_backtests.py` surfaced no actionable code bugs.
+Instead, locked specific business-logic invariants in a new test file:
+
+`tests/test_ml_backtest_agent2_20260528.py` — 32 tests covering:
+
+* **PredictWithMetaBoundedness** — every `pred` field is finite and
+  within ±`PRED_CLAMP_PCT` (50%) regardless of the underlying MLP's
+  raw extrapolation; untrained scorer returns the `failed=True`
+  sentinel so OOS rank-IC consumers can drop the row.
+* **CalibratedMonotonic** — `predict_calibrated` is monotonic in raw
+  (the load-bearing rank-preservation property of the
+  DIRECTIONAL_BUT_BIASED verdict).
+* **BuildFeaturesClamps** — `news_urgency`/`news_article_count`/
+  `bb_pos`/`vol_ratio` clamp at their documented bounds even for
+  malformed inputs.
+* **KillswitchTailCorrectness** — the trailing-OOS-IC kill-switch
+  honors the most recent 20 rows: a recent noise period kills the
+  gate even when older history showed skill (and vice versa).
+* **ScoreArticleBounded** — `score_article` clamps to [0, 5] for
+  arbitrary phrase counts.
+* **TrainScorerInsufficientData** — `insufficient_data` /
+  `insufficient_after_dedup` / `no_valid_labels` sentinels do NOT
+  write a corrupted pickle to disk.
+* **MlDecideHoldFallback** — locks both the "no signal → HOLD" path
+  AND the documented persona-boost-drives-buy behaviour.
+* **SectorOneHot** — `build_features` produces a one-hot sector
+  vector exactly matching `SECTORS` order; unknown tickers land in
+  `sector_other`.
+* **EnforceRiskExits** — stop-loss fires at the breach price; take-
+  profit fires at the breach price; cash accounting is exact.
+* **PortfolioInvariants** — `_buy` decrements cash, `_sell` returns
+  cash, blended avg cost is volume-weighted, partial sells preserve
+  the position.
+* **GateArmDecodeBoundaries** — the canonical `gate_arm` decode
+  matches the `_ml_decide` if/elif chain at every boundary
+  (-10/0/+5/+10 → ×0.6/×0.85/×1.0/×1.15/×1.3).
+
+All 32 pass: `python3 -m pytest tests/test_ml_backtest_agent2_20260528.py -v`.
+
+### Phase 2 — Feature: `feature_group_importance()`
+
+Companion to the existing per-prediction `feature_group_contributions`.
+The per-prediction version answers "for THIS input, which group is the
+scorer leaning on?". The new global method answers the orthogonal
+triage question: *across all training, is the trained model leaning on
+news, on quant, on the sector bias, or on the trade thesis?*
+
+`DecisionScorer.feature_group_importance()` rolls per-feature
+importance (mean |w| for MLP / |coef| for lstsq) into the 5
+`FEATURE_GROUPS` buckets — same `FEATURE_GROUP_MAP` source of truth as
+the per-prediction sibling.
+
+Algebraic identity:
+
+    sum(group.importance for group in groups)
+        == sum(feature.importance for feature in importances)
+
+Returns `{trained, method, n_train, groups: [{group, importance,
+importance_normalized, n_features}]}`. `importance_normalized` sums to
+1.0 across all groups (same convention as `feature_importance`).
+Every failure path degrades to an `error` field, never an exception
+(mirrors `feature_importance` / `feature_group_contributions`).
+
+**Wired into the CLI** via `--groups`:
+
+```bash
+python3 -m paper_trader.ml.decision_scorer --feature-importance --groups
+# Adds a per-group operator-triage roll-up after the per-feature table.
+```
+
+Live output on the currently-deployed pickle:
+
+| Group     | Importance | Share  | n_features |
+|-----------|------------|--------|------------|
+| quant     | 4.054      | 55.56% | 9          |
+| sector    | 1.789      | 24.51% | 7          |
+| news      | 0.636      |  8.71% | 2          |
+| ml_score  | 0.447      |  6.12% | 1          |
+| regime    | 0.372      |  5.09% | 1          |
+
+So 55% of what the model trained on is the technical-quant block; only
+6% is the ArticleNet trade thesis (`ml_score`); only 9% is the news
+context (urgency + article count). This matters for an operator
+deciding whether news collection is worth investment — at current
+training-set composition, marginal news collection returns ~6× less
+model weight per record than equivalent quant signal.
+
+### How the ML decision scorer works (quick reference)
+
+The DecisionScorer is an MLP regressor that maps a 20-element feature
+vector → predicted 5-day forward return %, trained on actual
+backtest BUY/SELL outcomes. Architecture:
+
+* `build_features` — 10 base numeric (ml_score / rsi / macd / mom5 /
+  mom20 / regime_mult / vol_ratio / bb_pos / news_urgency /
+  news_article_count) + 3 enhanced MACD/EMA200 booleans + 7-way
+  sector one-hot.
+* `train_scorer` — fits `MLPRegressor(hidden=(32,16), alpha=1e-2,
+  early_stopping=True)` after temporal 80/20 split. Symmetric label
+  clamp at ±50% so val/oos error is apples-to-apples.
+* `predict_with_meta` — single entry point that returns `pred`
+  (clamped), `raw` (unbounded), `clamped`, `off_distribution`,
+  `failed`, `percentile`, `calibrated`, `gate_arm`,
+  `gate_arm_multiplier`.
+* `predict` — scalar fast path delegating to `predict_with_meta`.
+* `feature_contributions` / `feature_group_contributions` —
+  per-feature / per-group attribution for ONE prediction.
+* `feature_importance` / `feature_group_importance` (NEW) —
+  global per-feature / per-group importance from first-layer weights.
+
+### How to run a backtest manually
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# One-shot 10 parallel year-long backtests:
+python3 run_backtests.py
+
+# Continuous loop (5 parallel runs/cycle, retrain after each):
+python3 run_continuous_backtests.py
+# Logs to continuous.log; SIGTERM/SIGINT exits cleanly between cycles.
+```
+
+### How to interpret backtest results
+
+```bash
+# Recent runs (read-only, via SQLite Python module):
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('backtest.db')
+for r in conn.execute(
+    'SELECT run_id, status, total_return_pct, vs_spy_pct, n_trades FROM backtest_runs ORDER BY run_id DESC LIMIT 20'
+).fetchall(): print(r)
+"
+```
+
+Key metrics:
+
+* **`vs_spy_pct`** is the documented "skill metric" — the live
+  trader's `_ml_is_qualified` gate uses median over the last 20
+  qualifying runs.
+* **AI vs monkey baseline windows are NOT directly comparable** —
+  monkey runs use a fixed default window (`monkey_benchmark.default_window`,
+  currently 2012-2022); AI runs sample from 1993→present-180d.
+  Don't compare median returns across these unless you filter to
+  matching windows.
+
+### Test commands (ML/backtest domain)
+
+```bash
+# Focused ML/backtest suite (typically 30-60s):
+python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+                  tests/test_continuous.py tests/test_ml_backtest_agent2_20260528.py -v
+
+# All ml/backtest suites (290+ tests, ~50s under normal load):
+python3 -m pytest tests/ -v -k "ml or backtest or scorer"
+```
+
+### Phase 3 — Live findings (quant-researcher tour)
+
+1. **The conviction gate has NEVER fired effectively in production.**
+   150 cycles of `data/scorer_skill_log.jsonl` all show
+   `gate_effectively_active=False` — the kill-switch correctly
+   suppresses the gate because trailing-20 median OOS BUY rank-IC
+   sits in the -0.16 .. +0.09 noise band. The conviction modulation
+   feature (×0.6 / ×0.85 / ×1.15 / ×1.3) is effectively dead code in
+   production. This is the kill-switch working AS DESIGNED — but it
+   means the documented invariant #5 ("DecisionScorer modulates BUY
+   conviction once n_train ≥ 500") is conditionally inactive.
+
+2. **`MLP_WORSE_THAN_TRIVIAL` verdict persists.** Latest baseline
+   ledger row: `best_baseline=neg_bb` with rank-IC 0.109 vs the
+   17-feature MLP's 0.044 — a one-line rule (negative Bollinger Band
+   position) carries more OOS rank skill than the trained net.
+   `oos_rmse_ratio=1.272` (RMSE is 27% WORSE than constant-mean
+   baseline).
+
+3. **`sector_other` is dead-trained.** The dead-feature audit ledger
+   confirms `mean_abs_weight=0.0` for the `sector_other` slot. Root
+   cause: only 2 of 5000 training rows map to `sector_other`
+   (all WATCHLIST tickers fit explicit sectors after the sector-map
+   expansion). Not a bug — a data sparsity finding. The deployed
+   pickle's other 19 features carry real weight.
+
+4. **AI run variance dominates the signal.** Last 24 AI runs:
+   total_return p10..p90 spans -52% to +1390%, vs_spy p10..p90
+   -83% to +1298%. Beat-SPY rate is 62% — modest skill but the
+   variance is leveraged-ETF dispersion, not systematic edge. A
+   skeptical quant looking at this distribution would NOT deploy
+   real capital on the ml_quant strategy without a smaller-variance
+   variant.
+
+5. **Cycle counter resets per restart.** The kill-switch ledger
+   shows `cycle=1,2,3,1,1,2,3,...` — the continuous loop is being
+   restarted regularly. Each restart starts cycle at 1; not a bug,
+   but be aware ledger queries that filter by cycle aren't unique
+   without joining `timestamp`.
+
+6. **GDELT permanently dark for pre-2017 dates.** The "permanent:
+   outside GDELT coverage" logs are the documented coverage gap.
+   The fix already in place (negative-cache so they don't retry)
+   is working — they're emitted once per (date, keyword) per
+   cycle but never re-fetched.
+
+### Staging
+
+Per-file pathspec across two commits:
+
+* **Phase 1**: `tests/test_ml_backtest_agent2_20260528.py` (test
+  additions only, no code change).
+* **Phase 2**: `paper_trader/ml/decision_scorer.py` +
+  `tests/test_ml_backtest_agent2_20260528.py` (the new
+  `feature_group_importance` method + tests + CLI wiring).
+* **Phase 4 (this section)**: AGENTS.md only.
+
+Working copy carries foreign uncommitted changes at start (sibling
+agents' edits to `paper_trader/dashboard.py`,
+`paper_trader/reporter.py`, plus digital-intern); all left untouched.
+No `git add -A` per the concurrent-agent footgun memory.
