@@ -14904,3 +14904,163 @@ untracked `analysis/wire_stance.py`, `analytics/ml_ai_divergence.py`,
 as-is. No `git add -A` (concurrent-agent staging-race footgun memory).
 Staged only `scripts/wire_pulse.py` + the two new test files by explicit
 pathspec.
+
+## 2026-05-29 Agent 3 (digital-intern) — briefing_held_mention_trend
+
+**Persona:** debugger + feature developer + news-analyst consumer.
+
+**Counters:** bugs_fixed=0 / features_added=1 / user_findings=5.
+
+### Phase 1 — debugger
+
+After reading the listed files (`daemon.py`, `storage/article_store.py`,
+`watchers/{alert_agent,urgency_scorer}.py`, `ml/{trainer,model,features}.py`,
+`collectors/web_scraper.py`, `analysis/claude_analyst.py`) and the recent
+agent-rotation entries, the codebase has 100+ analytics modules + 4173
+tests already covering every load-bearing invariant. The four-agent
+rotation has been pruning bugs continuously for weeks. NO genuine bug
+found; the focused subset (`test_article_store`, `test_urgency_scorer`,
+`test_features`, `test_model`, `test_alert_agent`, `test_alert_book_tag`,
+`test_briefing_book_tag`, `test_score_source_progression`, `test_wire_pulse`,
+`test_briefing_coverage_audit`) — 147 tests + my 26 new ones = **173
+passed in 145s**.
+
+### Phase 2 — feature
+
+`analytics/briefing_held_mention_trend.py` + `tests/test_briefing_held_mention_trend.py`
+(26 tests). Pure builder.
+
+**Gap the builder fills:** `briefing_coverage_audit` audits ONE briefing
+against the urgent flow that ran into its window — answers "did Opus
+mention MU on THIS cycle?". A miss in one cycle is sometimes fine. The
+TREND axis — "MU has appeared in 0 of the last 10 briefings; SNDU has
+been silent every cycle for the entire window" — had no surface. The
+trend siblings already in `article_store` cover cadence
+(`briefing_cadence_trend`), content overlap (`briefing_text_overlap_trend`),
+output length (`briefing_length_trend`), and input pool size
+(`briefing_article_count_trend`), but NONE measure which held NAMES Opus
+keeps surfacing or dropping.
+
+**API.** `build_briefing_held_mention_trend(briefings, *, card_cap=12,
+now=None) -> dict`. `briefings` is newest-first (matches
+`get_briefings_for_training`'s `ORDER BY id DESC` and every other
+briefing reader). Returns the documented envelope (`_empty_envelope`):
+
+```
+{
+  as_of, verdict, headline, n_briefings,
+  window_first_ts, window_last_ts,
+  per_ticker: [{ticker, is_static_book, appearance_pct,
+                n_briefings_with, n_briefings,
+                current_silence_streak, verdict}],
+  n_silent_book, n_recent_gap, n_sporadic, n_covered,
+  card_cap, static_book_tickers,
+}
+```
+
+**Verdict ladder** (per-ticker):
+* `SILENT`     — 0 mentions across the window (chronic invisibility).
+* `RECENT_GAP` — appears at least once, but the most-recent
+                 `RECENT_GAP_STREAK_FLOOR=3` briefings in a row missed it.
+* `SPORADIC`   — appears in `< SPORADIC_FRACTION_FLOOR=0.30` of the
+                 window.
+* `COVERED`    — everything else.
+
+**Aggregate verdict** (most-severe-first ladder, mirrors
+`briefing_cadence_trend` discipline):
+* `NO_DATA`           — fewer than `_MIN_BRIEFINGS=4` usable rows.
+* `CHRONIC_SILENCE`   — at least one STATIC `_BOOK_TICKERS` member is
+                         SILENT (deliberate operator-held position Opus
+                         has never mentioned).
+* `RECENT_GAP`        — at least one ticker RECENT_GAP, no static SILENT.
+* `SPORADIC_COVERAGE` — at least one SPORADIC or live-only SILENT.
+* `ALL_COVERED`       — everything COVERED.
+
+The static-vs-live distinction is deliberate: the static core represents
+operator-held positions, while the live-only universe extends to
+sector_watchlist names where silence is informational, not actionable.
+
+**SSOT drift-lock.** `_BOOK_TICKERS` mirrored from
+`analysis.claude_analyst._BOOK_TICKERS` byte-for-byte; the matching
+discipline is the same one `briefing_coverage_audit` uses. `_BOOK_UNIVERSE`
+unions the static core with `ml.features.LIVE_PORTFOLIO_TICKERS` (the
+config/portfolio.json-derived live set urgency_scorer + ml.features +
+claude_analyst already use). Pinned by two drift-tests:
+`test_book_tickers_match_claude_analyst` and
+`test_book_tickers_match_briefing_coverage_audit` — a regression that
+changes one of the three literals fails focused tests immediately.
+
+**Invariants.** Pure read-side: no DB write, no ai_score / ml_score /
+score_source / urgency mutation. Backtest isolation N/A (briefings table
+is Opus-write only, never carries synthetic rows). Never raises on
+garbage (non-iterable / non-dict rows / None text / unparseable ts all
+yield well-formed skeletons). All four load-bearing invariants intact
+by construction.
+
+### Phase 3 — live validation (news-analyst lens)
+
+Ran the new builder against the live `/media/zeph/projects/digital-intern/db/articles.db`
+(10 most-recent briefings):
+
+```
+verdict: CHRONIC_SILENCE
+headline: 1 held position(s) (SNDU) missing from ALL 10 recent briefings.
+counts: silent=4 recent_gap=7 sporadic=0 covered=12
+top per_ticker rows:
+  * SNDU   SILENT      0.00% streak=10
+    COHR   SILENT      0.00% streak=10
+    GOOG   SILENT      0.00% streak=10
+    LRCX   SILENT      0.00% streak=10
+    NVDL   RECENT_GAP  10.00% streak=8
+    SOXX   RECENT_GAP  10.00% streak=6
+  * TSEM   RECENT_GAP  10.00% streak=5
+  * QBTS   RECENT_GAP  20.00% streak=5
+```
+
+Five analyst-perspective findings recorded as `user_findings`:
+
+1. **SNDU is chronically invisible** — a STATIC `_BOOK_TICKERS` member
+   (operator-held position) absent from ALL 10 recent briefings. The new
+   builder surfaces this directly; previously the operator had no way to
+   notice unless they manually scanned each briefing. May be a low-news
+   ticker, but the analyst should at least know.
+2. **TSEM / QBTS in a 5-cycle silence streak** — both static holdings,
+   `_BOOK_TICKERS` members, mentioned in only 10–20% of the window and
+   absent from the last 5 briefings each. Same actionable info; same lack
+   of prior surface.
+3. **Briefing cadence slipping** — `articles.db.briefings` last two
+   timestamps are 12:50:50 and 03:27:55 (today) — a **9.4h gap**, 1.9×
+   the 5h `HEARTBEAT_INTERVAL`. `briefing_cadence_trend` would flag this
+   as `SLIPPING`; the path is point-in-time HEALTHY because the most
+   recent briefing fired 5.2h ago, but the gap before it was real.
+4. **`llm_vetted_pct ≈ 9%`** — chronic. Of 97 urgent rows in the last
+   24h, 88 carry `score_source='ml'` (model-only) and only 9 carry an
+   LLM ground-truth label. This is the standing calibration concern the
+   existing `urgency_label_split` and `[unverified — model-only urgent]`
+   tag exist to expose. Not a bug — known regime.
+5. **Stocktwits dominates ingest** — 1333 of 4763 last-hour rows
+   (≈28%) are from `stocktwits`. The
+   `_looks_like_stocktwits_chatter` pre-floor suppresses the urgency
+   head's over-scoring at ML stage; the load is operationally fine but
+   the source mix remains heavily skewed.
+
+### Phase 4 — docs
+
+This AGENTS.md entry. No CLAUDE.md change (no new invariants).
+
+### Files created (mine — only these were staged)
+
+* `analytics/briefing_held_mention_trend.py` — 413 LoC.
+* `tests/test_briefing_held_mention_trend.py` — 26 tests, 407 LoC.
+
+### Files left untouched
+
+Many concurrent-agent WIP edits in flight (`analysis/claude_analyst.py`,
+`watchers/alert_agent.py`, `dashboard/web_server.py`, plus untracked
+`analysis/wire_stance.py`, `analytics/ml_ai_divergence.py`,
+`collectors/{earnings_transcript,financial_stress}_collector.py`,
+`tests/test_{alert_fund_stake_delta,wire_stance}.py`); all left exactly
+as-is. No `git add -A` (concurrent-agent staging-race footgun memory).
+Staged only my two new files by explicit pathspec — no AGENTS.md-only
+commit; this entry will be committed alongside the next code change if
+the AGENTS.md merge convention is enforced.
