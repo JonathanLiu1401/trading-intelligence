@@ -741,6 +741,64 @@ def _parse_gate_decision(reasoning: str | None) -> tuple[float | None, bool | No
         return None, None
 
 
+def _parse_gate_abstention_kind(reasoning: str | None) -> str | None:
+    """Disambiguate the gate's abstention marker into its specific cause.
+
+    ``_parse_gate_decision`` collapses BOTH abstention types into a single
+    ``gate_off_dist=True`` boolean for analyzer back-compat (every existing
+    ``gate_pnl`` / ``gate_arm_historical`` consumer correctly drops the row).
+    That collapse loses real information: a kill-switch abstention (the
+    cycle's trailing OOS BUY rank-IC sat at noise — a *data-driven* guard)
+    is operationally a different signal from an off-distribution clamp (the
+    raw prediction exceeded ±``PRED_CLAMP_PCT`` — an *architectural* guard).
+
+    Live audit on the 2026-05-30 ``decision_outcomes.jsonl`` corpus: 4917 of
+    4917 BUYs (100%) carry ``gate_off_dist=True``, but the legacy field
+    cannot tell us how many were kill-switched vs how many were clamped.
+    The two markers are mutually exclusive in ``_ml_decide``'s if/elif
+    reasoning emission, so the cause IS recoverable — it just wasn't being
+    captured. This parser exposes it as a string label so a downstream
+    analyzer (e.g. a future ``kill_switch_realized``) can attribute the
+    abstention to the specific guard that fired.
+
+    Returns:
+      * ``"clamp"``       — reasoning carries ``(off-dist,gate-skipped)``;
+                            the scorer's raw prediction exceeded
+                            ±``PRED_CLAMP_PCT`` so the off-distribution
+                            guard fired (the scorer itself flagged low
+                            trust; an architectural abstention).
+      * ``"killswitch"``  — reasoning carries ``(gate-killed,no-skill)``;
+                            the per-cycle trailing-OOS-IC kill-switch
+                            fired (a data-driven abstention — the gate sat
+                            out because the model's recent rank skill is
+                            at noise or anti-predictive).
+      * ``None``          — neither marker present (the gate ACTED on a
+                            real prediction, the scorer was sub-gate /
+                            untrained, or there was no decision to
+                            characterize). The caller can join this with
+                            ``gate_scorer_pred`` to distinguish "gate
+                            acted" (pred non-None, kind=None) from "no
+                            gate at all" (pred=None, kind=None).
+
+    Pure, total, never raises (a ledger-feeding parser must not break the
+    cycle — the ``_parse_gate_decision`` / ``_parse_conviction_pct``
+    discipline). ``"clamp"`` takes precedence over ``"killswitch"`` if both
+    markers somehow appeared in the same reasoning — matches the
+    ``_ml_decide`` if/elif emission order, where the off-dist branch fires
+    before the kill-switch branch.
+    """
+    if not reasoning:
+        return None
+    try:
+        if "(off-dist" in reasoning:
+            return "clamp"
+        if "(gate-killed" in reasoning:
+            return "killswitch"
+        return None
+    except Exception:
+        return None
+
+
 def _parse_conviction_pct(reasoning: str | None) -> float | None:
     """Extract the position-sizing **conviction** the gate emitted at decision
     time from a backtest decision's ``reasoning`` string.
@@ -1078,6 +1136,22 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
             # re-predicting with today's pickle (the documented `gate_pnl`
             # reconstruction residual). None on SELL / untrained-cycle rows.
             gate_scorer_pred, gate_off_dist = _parse_gate_decision(reasoning)
+            # Additive abstention disambiguation (2026-05-30 feature). The
+            # legacy ``gate_off_dist`` collapses (off-distribution clamp)
+            # OR (no-skill kill-switch) into a single boolean — that loses
+            # the cause. Live audit shows 4917/4917 BUYs carry
+            # ``gate_off_dist=True`` so the gap is real. ``gate_abstention_kind``
+            # surfaces the specific guard ("clamp" / "killswitch" / None)
+            # so a future kill-switch realized-effect analyzer can ask
+            # "which guard saved or cost us — and was the abstention
+            # justified by the realized 5d return?". Inert to the gate /
+            # trade path (additive dict key, ``build_features`` /
+            # ``train_scorer`` ignore unknown keys — the documented
+            # additive-keys precedent every prior outcome-schema bump
+            # already established). None when no ``scorer=`` token was
+            # emitted (SELL row, untrained-cycle BUY) OR the gate ACTED
+            # on a real prediction (no abstention marker).
+            gate_abstention_kind = _parse_gate_abstention_kind(reasoning)
 
             # Additive sizing capture (read-only research signal, 2026-05-21
             # feature — same `forward_return_10d/20d` precedent: scorer is
@@ -1186,6 +1260,15 @@ def _compute_decision_outcomes(engine: "BacktestEngine",
                 # reasoning) or on SELL (the gate modulates BUY only).
                 "gate_scorer_pred": gate_scorer_pred,
                 "gate_off_dist": gate_off_dist,
+                # Additive (2026-05-30) — disambiguates the OR-collapsed
+                # ``gate_off_dist=True`` into its specific cause. "clamp"
+                # = off-distribution guard; "killswitch" = no-skill
+                # kill-switch; None = gate acted OR no abstention to
+                # characterize. See ``_parse_gate_abstention_kind`` for
+                # the full rationale. Cross-check invariant:
+                # ``gate_off_dist == (gate_abstention_kind is not None)``
+                # for every row where ``gate_scorer_pred is not None``.
+                "gate_abstention_kind": gate_abstention_kind,
                 # Additive — the gate's actual then-applied sizing
                 # (`_parse_conviction_pct`). Fraction in [0,1] (e.g. 0.25
                 # for `conviction=25%`); None on SELL / HOLD rows because
