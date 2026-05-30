@@ -5,6 +5,229 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-30 Agent 3 (digital-intern) — stocktwits longform_chatter analytics
+
+**Persona:** debugger + feature developer + news-analyst consumer.
+
+**Counters:** bugs_fixed=0 / features_added=1 / user_findings=5.
+
+### Phase 1 — debugger (honest zero)
+
+Read the listed core files (`daemon.py`, `storage/article_store.py`,
+`watchers/{alert_agent,urgency_scorer}.py`, `ml/{trainer,model,features}.py`,
+`collectors/web_scraper.py`, `analysis/claude_analyst.py`) and the recent
+agent-rotation entries. The codebase remains mature — 279 test files, ~130
+analytics modules, four-agent rotation pruning bugs continuously. The
+specific invariants the task names are already pinned:
+
+- `tests/test_article_store.py::TestBacktestIsolation` covers
+  `get_unalerted_urgent` / `get_top_for_briefing` / `get_unscored` backtest
+  exclusion (the load-bearing invariant #1).
+- `tests/test_article_store.py::TestScoreSourceSeparation` pins
+  ml_score-vs-ai_score isolation, `update_ml_scores_batch` writes
+  `score_source='ml'`, COALESCE preservation of `llm` AND `briefing_boost`.
+- `tests/test_score_pending.py` covers the in-store score_pending separation
+  AND backtest isolation.
+- `tests/test_urgency_scorer.py` covers the `URGENT_THRESHOLD=8.0` classifier
+  contract.
+- `tests/test_features.py` already has `test_days_since_published_*` and
+  `test_ticker_mention_density_*` with specific-value assertions.
+- `tests/test_model.py::test_zero_input_does_not_nan` plus the
+  `[0,10]`/`[0,1]` range tests.
+- `tests/test_trainer.py` covers the score_source='ml' exclusion + sample
+  weight ordering.
+
+Focused regression suite (test_article_store + test_urgency_scorer +
+test_features + test_model + test_trainer + test_score_source_progression +
+test_alert_agent) — 92 tests passed in 100s, zero failures. **No genuine
+bug found.** Per the Phase 1 commit-guard rule: honest zero, no synthetic
+fix manufactured. bugs_fixed=0, no Phase 1 commit.
+
+### Phase 2 — feature
+
+`analytics/stocktwits_longform_chatter.py` + `tests/test_stocktwits_longform_chatter.py`
+(41 tests, pure read-side builder).
+
+**Gap the builder fills.** `watchers.alert_agent._looks_like_stocktwits_chatter`
+already gates SHORT stocktwits forum chatter (title `len < 50` AND no
+news-keyword from `_STOCKTWITS_NEWS_EXIT`). Its docstring deliberately stops
+at 50 chars because "the 50-79 char tier is mixed".
+
+A live 7d audit found the 50+ char tier is NOT mixed once you ALSO require
+zero news-keyword: **92 of 105 stocktwits rows with title length >= 50 and
+ml_score >= 9 (88%) carried NO news-keyword** from the existing exit regex.
+Live failure samples that reached urgency=2 last 24h (the 50-char cap
+deliberately misses them; cred=0.30 < 0.45 means the alert-side
+`_filter_low_authority_lone` correctly suppressed Discord push, but the
+rows still inflate the urgent backlog, pollute calibration metrics, and
+burn ML cycles):
+
+  - `$IONQ $QBTS $QUBT $RGTI $XRP.X nobody wants to buy your dumb shtcoin.
+     Go knock o...`  (101 chars, ml_score 9.9, urgency=2)
+  - `$QQQ $SPY $SOXX $SOXL $TQQQ ... Deepseek upto 34x cheaper than Cla...`
+                                  (176 chars, ml_score 10.0, urgency=2)
+  - `$MU joining the AI momentum is exactly why I want better alerts ...`
+                                  (200 chars, ml_score 9.9, urgency=2)
+
+**API.**
+
+```
+is_longform_stocktwits_chatter(article) -> bool
+LONGFORM_PREDICATES                                  # ((label, predicate),)
+build_longform_chatter_report(rows, *, now=None,
+                              max_samples_per_pattern=5,
+                              max_uncaught_sources=5) -> dict
+```
+
+Returns the deterministic envelope (verdict ∈
+{`NO_DATA`, `NO_CHATTER`, `CHATTER_LEAKING_PAST_GATE`}, `n_audited`,
+`n_chatter_caught`, `n_uncaught`, `by_predicate{label →
+{count, mean_ml_score, sample_titles[]}}`, `by_uncaught_source[]` ranked
+descending with alphabetical tie-break).
+
+**SSOT discipline (advisor lock-in).** `_STOCKTWITS_NEWS_EXIT` is imported
+verbatim from `watchers.alert_agent` rather than redeclared. The
+`test_news_exit_imported_from_alert_agent` drift-lock pins this with
+`is`-identity — a future agent widening the news-exit list on the alert
+side automatically extends the must-survive corpus for this predicate.
+`LONGFORM_MIN_TITLE_LEN` is also drift-locked equal to
+`alert_agent._STOCKTWITS_CHATTER_TITLE_MAX` so the long-form gate sits
+strictly above the short-form gate's coverage with no overlap or gap.
+
+**Predicate discriminator.** All four must hold (high precision; the
+predicate is the future-wiring candidate, not just an audit):
+  1. `source` substring `stocktwits` (case-insensitive) AND not the
+     structured `stocktwits/sentiment` digest.
+  2. `LONGFORM_MIN_TITLE_LEN (50) <= len(title) < LONGFORM_MAX_TITLE_LEN (300)`.
+  3. `title` does NOT match `_STOCKTWITS_NEWS_EXIT` (SSOT from alert_agent).
+  4. `title` does NOT carry an embedded `http(s)://` URL — a shared link
+     generally means the user pointed at a real article (live audit
+     verified: 4 of the 13 has-news survivors carried real wire URLs).
+
+**Invariants.** Pure read-side: no DB write, no ai_score / ml_score /
+score_source / urgency mutation. Backtest isolation N/A (caller filters
+upstream via `_LIVE_ONLY_CLAUSE`); the predicate cannot match a synthetic
+row by construction (source check requires `stocktwits`). All four
+load-bearing invariants intact by construction.
+
+**Test rigor.** 41 tests assert specific values:
+- predicate positive/negative on verbatim live-DB titles + must-survive
+  corpus (every has-news survivor from the 7d audit: price target, analyst,
+  merger, earnings, bloomberg URL, marketwirenews URL, stocktwits sentiment
+  digest exclusion).
+- boundary tests on length floor (exactly 50 = caught, 49 = not caught,
+  > 300 = not caught).
+- defensive (non-dict / missing keys / None values → False, never raises).
+- verdict ladder transitions (`NO_DATA` / `NO_CHATTER` /
+  `CHATTER_LEAKING_PAST_GATE`).
+- exact `mean_ml_score` arithmetic (e.g. (9.97+9.9+9.5)/3 ≈ 9.79 to 1e-3).
+- `by_uncaught_source` ranking with alphabetical tie-break.
+- `max_samples_per_pattern` cap respected + within-bucket sample dedup.
+- drift locks: `LONGFORM_PREDICATES` length pinned at 1, SSOT
+  `is`-identity of the news-exit regex, floor equals short-form ceiling,
+  envelope keys frozen.
+
+**Why no wiring this pass.** The advisor lock-in was explicit: concurrent
+agent edits are live in `watchers/alert_agent.py`,
+`analysis/claude_analyst.py`, `dashboard/web_server.py` (plus untracked
+`analysis/wire_stance.py`, `analytics/ml_ai_divergence.py`,
+`collectors/{earnings_transcript,financial_stress}_collector.py`,
+`tests/test_{alert_fund_stake_delta,wire_stance}.py`). Wiring the predicate
+into `_looks_like_stocktwits_chatter` would stage a race. Predicate is
+exported (`is_longform_stocktwits_chatter` + `LONGFORM_PREDICATES`) so a
+future agent can wire it into the three pre-floor surfaces in lockstep
+once the WIP edits land — same surgical discipline as the
+`emerging_press_mill` 2026-05-29 pass.
+
+### Phase 3 — live validation (news-analyst lens)
+
+Ran the new builder against
+`/media/zeph/projects/digital-intern/db/articles.db` (7d urgent rows,
+urgency >= 1, live-only filter):
+
+```
+verdict: CHATTER_LEAKING_PAST_GATE
+n_audited: 701
+n_chatter_caught: 33
+n_uncaught: 668
+longform_stocktwits_chatter: count=33 mean_ml=8.977
+  ⟶ $BB The BB 275 Million Automotive Install Playbook Repeated; ...
+  ⟶ Michael Burry Goes After Nvidia Again — Flags 'Temporary' Demand, ...
+  ⟶ @cynicaloptimist @Jblack500 ... $MU $SNDK
+  ⟶ $MU 20% is crazy after running for months. ...
+TOP UNCAUGHT SOURCES:
+  stocktwits                count=139 mean_ml=9.120
+  GN: Nvidia                count= 77 mean_ml=8.814
+  GN: dividend buyback      count= 49 mean_ml=8.016
+  scraped/www.cnbc.com      count= 16 mean_ml=8.842
+  Finnhub/Yahoo             count= 14 mean_ml=7.698
+```
+
+Five analyst-perspective findings recorded as `user_findings`:
+
+1. **33 long-form stocktwits chatter rows leaked past the 50-char cap in
+   the 7d urgent window** (mean ml_score 8.977). They never fired a real
+   Discord push (`_filter_low_authority_lone` correctly suppresses
+   cred=0.30 < 0.45) but they still occupy slots in
+   `get_unalerted_urgent`'s LIMIT 50 set, decompress on every alert cycle,
+   inflate `urgent_score_distribution` to BORDERLINE_HEAVY, and waste GPU
+   inference cycles. The builder verdict is
+   `CHATTER_LEAKING_PAST_GATE` — actionable for an operator/future agent
+   who wants to wire the predicate into the three pre-floor surfaces.
+
+2. **Predicate precision is mixed in samples** — at least one sample
+   ("Michael Burry Goes After Nvidia Again — Flags 'Temporary' Demand,
+   Customer Concentration Risks - Stocktwits") IS a real news headline
+   even though it lacks every `_STOCKTWITS_NEWS_EXIT` keyword. Honest
+   call: the predicate is high-precision against true forum chatter
+   but the SSOT news-exit list isn't exhaustive on "soft" news topics
+   ("demand", "concentration risks", "customer"). Any future wiring
+   should either tighten the predicate further or just use it as a
+   noise-rate diagnostic — not blind-fire on every match.
+
+3. **`update_ai_scores_batch` lock retry exhausted 6× in last 4h of
+   daemon.log** plus `mark_alerted_batch` / `reap_stale_urgent` / `stats`
+   / `update_ml_scores_batch` / `insert_batch` errors — the
+   `di-insert-batch-lock-contention` memory item is still live. Known
+   operational signal, not a fresh bug. The 5-attempt retry budget exits
+   one cycle's work as designed; the next cycle re-fetches.
+
+4. **Briefing cadence currently HEALTHY** — last briefing 4.9h ago
+   (within the 5h `HEARTBEAT_INTERVAL`), and the prior 10-window history
+   reads on-cadence-ish: 5.1h / 5.8h / 9.4h / 5.3h. The single 9.4h gap
+   on 2026-05-29 was the `briefing_cadence_trend.SLIPPING` precedent —
+   one missed cycle. Not a fresh fire.
+
+5. **`heartbeat_worker` started 3 times in 4h** (`logs/daemon.log`
+   2026-05-30T01:00:20Z / 04:11:58Z / 04:12:17Z) — implies the worker
+   has been respawning. The supervisor's crash-tracking would mark this
+   degraded if the rate increased; current rate is borderline. Already
+   covered by the `briefing_pipeline_watchdog` family — operational note,
+   not a fresh bug.
+
+### Phase 4 — docs
+
+This AGENTS.md entry. No CLAUDE.md change (no new invariants).
+
+### Files created (mine — only these were staged + committed)
+
+* `analytics/stocktwits_longform_chatter.py` — 310 LoC.
+* `tests/test_stocktwits_longform_chatter.py` — 41 tests, 400 LoC.
+
+### Files left untouched
+
+Many concurrent-agent WIP edits in flight (`analysis/claude_analyst.py`,
+`watchers/alert_agent.py`, `dashboard/web_server.py`, plus untracked
+`analysis/wire_stance.py`, `analytics/ml_ai_divergence.py`,
+`collectors/{earnings_transcript,financial_stress}_collector.py`,
+`tests/test_{alert_fund_stake_delta,wire_stance}.py`); all left exactly
+as-is. No `git add -A` (concurrent-agent staging-race footgun memory:
+`di-shared-repo-concurrency` + `pt-concurrent-samerole-staging-race`).
+Staged only my two new files by explicit pathspec; this AGENTS.md entry
+will be committed alongside the code per the established convention.
+
+---
+
 ## 2026-05-29 HYBRID pass (Agent 3, pass #7) — `urgent_count_per_briefing_window_trend` primitive
 
 **Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=6`.
@@ -15064,3 +15287,187 @@ as-is. No `git add -A` (concurrent-agent staging-race footgun memory).
 Staged only my two new files by explicit pathspec — no AGENTS.md-only
 commit; this entry will be committed alongside the next code change if
 the AGENTS.md merge convention is enforced.
+
+## 2026-05-30 Agent 3 (digital-intern) — emerging_press_mill
+
+**Persona:** debugger + feature developer + news-analyst consumer.
+
+**Counters:** bugs_fixed=0 / features_added=1 / user_findings=5.
+
+### Phase 1 — debugger
+
+After reading the listed files (`daemon.py`, `storage/article_store.py`,
+`watchers/{alert_agent,urgency_scorer}.py`, `ml/{trainer,model,features}.py`,
+`collectors/web_scraper.py`, `analysis/claude_analyst.py`) and the recent
+agent-rotation entries, the codebase remains mature (278 test files, 129
+analytics modules, four-agent rotation pruning bugs continuously for weeks).
+The focused subset (`test_article_store`, `test_urgency_scorer`,
+`test_features`, `test_model`, `test_alert_agent`, `test_alert_dedup` +
+this pass's 34 new tests) — 139 passed in 70s. **No genuine bug found.**
+
+The visible "wins" in the live DB were known operational signals already
+documented as memory items: the 924s ml_trainer subprocess timeout
+(`di-ml-trainer-subprocess-timeout`), the workers-DEAD storm under DB-lock
+contention, the 9.4h briefing gap (`briefing_cadence_trend.SLIPPING`
+precedent). The cross-cycle BREAKING-alert dedup (alert_recency 6h TTL)
+was verified working — the 3 Micron-Faces urgency=2 rows at 12:59/14:19/18:13
+were queue-marked but only the first ACTUALLY pushed to Discord (recency-db
+hits=1, last_ts=13:01:21Z).
+
+### Phase 2 — feature
+
+`analytics/emerging_press_mill.py` + `tests/test_emerging_press_mill.py`
+(34 tests, 423 LoC test file). Pure read-side builder.
+
+**Gap the builder fills:** `watchers.alert_agent` carries 30+ recap-template
+regexes catching SEO mill / 13F filing-summary / quote-widget / image-credit
+pseudo-articles. Two distinct noise templates were observed firing urgency=2
+in the last 7d despite the existing gates — both novel enough that NO
+existing analytics module surfaces them:
+
+1. **Stock Titan 13D/13G "ownership disclosed" press mill** — the FMR LLC
+   (COHR) row at ml_score 9.96 urgency=2 (2026-05-29 23:42Z). Template:
+   `"(TICKER) reports N shares, N% ownership disclosed"`. The existing
+   `_RT_FUND_STAKE_DELTA` (WIP in concurrent agent's diff) and
+   `_RT_FUND_MAKES_INVESTMENT` catch leading-LLC + delta-verb + stake-noun;
+   this template uses `reports` + `ownership disclosed` (neither in any
+   verb list) and routes magnitude through the `shares, N% ownership
+   disclosed` trailer rather than `in/of <Company>`.
+
+2. **Foreign-language PR Newswire syndication storm** — three Arasan Chip
+   Systems releases in es/de/fr fired urgency=2 within the same minute
+   (2026-05-29 14:19-14:32Z) at ml_score 9.9. A 7d scan confirms a 4th
+   distinct case (CordenPharma French acquisition). The same announcement
+   crosses the wire 2-4 times per release; alert_dedup's signature differs
+   per language, so neither in-batch dedup nor the cross-cycle 6h TTL
+   catches them → 2-4 standalone BREAKING pushes per event.
+
+**API.**
+
+```
+is_ownership_disclosed_press_mill(article) -> bool
+is_foreign_pr_newswire(article) -> bool
+build_emerging_press_mill(rows, *, now=None,
+                          max_samples_per_pattern=3,
+                          max_uncaught_sources=5) -> dict
+```
+
+Returns the deterministic envelope (verdict ∈
+{`NO_DATA`, `ALL_GATED`, `EMERGING_NOISE`}, `n_audited`,
+`n_emerging_caught`, `n_uncaught`, `by_predicate{label→{count, mean_ml_score,
+sample_titles[]}}`, `by_uncaught_source[]` ranked descending with
+alphabetical tie-break). Pure builder over caller-supplied rows — no DB read
+inside.
+
+**Predicate discriminators.**
+
+`_PM_OWNERSHIP_DISCLOSED`: four-token co-occurrence — parenthesised ticker
+`\([A-Z]{1,6}\)` + `reports?` + a digits+units shares count + the literal
+`ownership disclosed` trailer. Real news ("Apple reports earnings beat",
+"FMR confirms ownership of $50B in semis") provably doesn't trip.
+
+`_PM_FOREIGN_SOURCES` + `_PM_FOREIGN_MARKER_WORDS` + `_PM_NON_ASCII`: two-
+stage gate. (a) Source startswith one of {`PR Newswire`, `GlobeNewswire`,
+`BusinessWire`} (the wire-aggregator prefix — accents in a Reuters headline
+about Macron are NOT a press-mill duplicate); AND (b) title contains a
+known non-English announcement verb (es/de/fr/it/nl) OR a Latin-extended /
+CJK character. Word-boundary on `\banuncia\b` so the English `announced`
+past-tense does not collide with Spanish `anuncia`.
+
+**Invariants.** Pure read-side: no DB write, no ai_score / ml_score /
+score_source / urgency mutation. Backtest isolation N/A (caller filters
+upstream via `_LIVE_ONLY_CLAUSE`); builder itself never raises on a leaked
+synthetic row. All four load-bearing invariants intact by construction.
+
+**SSOT / lockstep.** Module deliberately keeps the predicates EXPORTED
+(`is_ownership_disclosed_press_mill` / `is_foreign_pr_newswire` /
+`EMERGING_PREDICATES` tuple) so a future agent can wire them into
+`watchers/alert_agent._RECAP_TEMPLATE_PATTERNS` once the WIP
+`_RT_FUND_STAKE_DELTA` lands — keeps THIS pass surgical to avoid the
+concurrent-agent staging race (memory items
+`pt-concurrent-samerole-staging-race` + `di-shared-repo-concurrency`).
+
+**Test rigor.** 34 tests assert specific values:
+- predicate true/false on verbatim live-DB titles + survives the must-survive
+  corpus (English wire releases, real reporting on foreign topics, real news
+  with overlapping tokens like "Insider ownership disclosed in 13G filing")
+- builder verdict ladder transitions (`NO_DATA`/`ALL_GATED`/`EMERGING_NOISE`)
+- bucket counts, exact `mean_ml_score` arithmetic (e.g. (9.97+9.9+9.95)/3 ≈
+  9.94 to 1e-3)
+- top-N source ranking with alphabetical tie-break order
+- `max_samples_per_pattern` and `max_uncaught_sources` caps respected
+- non-dict / malformed-ml_score rows skipped without raising
+- `EMERGING_PREDICATES` length pinned at 2 (drift-lock)
+- first-match rule (ambiguous row → first predicate wins)
+
+### Phase 3 — live validation (news-analyst lens)
+
+Ran the new builder against `/media/zeph/projects/digital-intern/db/articles.db`
+(7d urgent rows, urgency >= 1, live-only filter):
+
+```
+verdict: EMERGING_NOISE
+n_audited: 697
+n_emerging_caught: 5
+n_uncaught: 692
+BY PREDICATE:
+  ownership_disclosed_press_mill: count=1 mean_ml=9.96
+    ⟶ FMR LLC (COHR) reports 22.6M shares, 12.1% ownership disclosed
+  foreign_pr_newswire: count=4 mean_ml=9.89
+    ⟶ Arasan Chip Systems annonce la première solution IP Sureboot™ ... (fr)
+    ⟶ Arasan Chip Systems kündigt branchenweit erste Sureboot™ ...     (de)
+    ⟶ Arasan Chip Systems anuncia la primera solución IP Sureboot™ ... (es)
+    ⟶ CordenPharma acquiert AmbioPharm pour accroître sa capacité ...   (fr)
+TOP UNCAUGHT SOURCES:
+  stocktwits                count=168 mean_ml=9.072
+  GN: Nvidia                count= 77 mean_ml=8.814
+  GN: dividend buyback      count= 49 mean_ml=8.016
+  ...
+```
+
+Five analyst-perspective findings recorded as `user_findings`:
+
+1. **Cross-language PR Newswire syndication storm is recurring** — 4 distinct
+   foreign-PR press releases in 7d (3 Arasan + 1 CordenPharma) all fired
+   urgency=2 at ml_score 9.8-9.97. The urgency head over-scores non-English
+   prose dense with brand names + product names. The same announcement
+   crosses 2-4× per release as separate signatures, bypassing every existing
+   dedup layer. **The builder catches this; wire into alert_agent gates
+   when WIP lands.**
+2. **Stock Titan 13D/13G "ownership disclosed" press mill fired urgent** —
+   FMR LLC (COHR) at ml_score 9.96 urgency=2. By-definition retrospective
+   (SEC filing was already public). Same noise class as the existing
+   13F-mill gates; verb fingerprint (`reports`) is the gap.
+3. **ML trainer subprocess timeout at 00:19:36Z** — daemon.log:
+   `Retrain failed: subprocess_timeout` after 924.1s (>600s `_TRAIN_TIMEOUT_S`).
+   Known recurring condition (`di-ml-trainer-subprocess-timeout`); ML
+   scoring stays on prior model until the next successful retrain.
+4. **Briefing cadence has one ~9.4h gap** — 2026-05-29 03:27Z → 12:50Z is
+   1.9× the 5h `HEARTBEAT_INTERVAL`. The other recent intervals
+   (5.1h-5.4h) are healthy. `briefing_cadence_trend.SLIPPING` precedent.
+5. **stocktwits dominates the uncaught urgent queue: 168 rows in 7d**
+   (mean_ml 9.07). Already pre-floored at the alert formatter
+   (`_looks_like_stocktwits_chatter`) so no Discord push fires, but the
+   urgency=1 queue still receives them and the scorer still spends ML
+   cycles on them. Operational note, not a fresh bug.
+
+### Phase 4 — docs
+
+This AGENTS.md entry. No CLAUDE.md change (no new invariants).
+
+### Files created (mine — only these were staged + committed)
+
+* `analytics/emerging_press_mill.py` — 386 LoC.
+* `tests/test_emerging_press_mill.py` — 34 tests, 423 LoC.
+
+### Files left untouched
+
+Many concurrent-agent WIP edits in flight (`analysis/claude_analyst.py`,
+`watchers/alert_agent.py`, `dashboard/web_server.py`, plus untracked
+`analysis/wire_stance.py`, `analytics/ml_ai_divergence.py`,
+`collectors/{earnings_transcript,financial_stress}_collector.py`,
+`tests/test_{alert_fund_stake_delta,wire_stance}.py`); all left exactly
+as-is. No `git add -A` (concurrent-agent staging-race footgun memory).
+Staged only my two new files by explicit pathspec; commit pushed to remote
+(commit `9ce1909`). This AGENTS.md entry will be committed in the next
+code change if the AGENTS.md merge convention is enforced.
