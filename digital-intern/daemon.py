@@ -111,6 +111,7 @@ from collectors.openinsider_cluster import collect as collect_insider_cluster
 from collectors.sector_etf_momentum import collect as collect_sector_etf
 from collectors.cisa_kev_collector import collect_cisa_kev
 from collectors.benzinga_analyst_collector import collect_benzinga_analyst
+from collectors.layoff_tracker import collect_layoffs
 from collectors.credit_rating_collector import collect_credit_ratings
 from collectors.nyfed_liquidity_collector import collect_nyfed_liquidity
 from collectors.ftc_doj_collector import collect_ftc_doj
@@ -274,6 +275,7 @@ INSIDER_CLUSTER_INTERVAL = 600    # EDGAR Form 4 cluster-buy scan every 10min
 SECTOR_ETF_INTERVAL     = 600     # Sector ETF momentum snapshot every 10min
 COMMODITY_FUTURES_INTERVAL = 600  # Commodity futures price monitor every 10min
 BENZINGA_INTERVAL       = 300     # Benzinga analyst-ratings RSS sweep every 5min
+LAYOFF_TRACKER_INTERVAL = 600     # Layoff tracker (TechCrunch + Google News) every 10min
 CREDIT_RATING_INTERVAL  = 600     # Moody's/S&P/Fitch rating actions — every 10min
 NYFED_LIQUIDITY_INTERVAL = 3600  # NY Fed RRP + SOMA (Fed balance sheet) — every 60min
 FTC_DOJ_INTERVAL        = 1800    # FTC + DOJ ATR press releases — every 30min
@@ -428,6 +430,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "wikipedia": WIKIPEDIA_INTERVAL, "wiki_pageviews": WIKI_PAGEVIEWS_INTERVAL, "macro_calendar": MACRO_CALENDAR_INTERVAL, "tic": TIC_INTERVAL,
     "cisa_kev": CISA_KEV_INTERVAL,
     "benzinga_analyst": BENZINGA_INTERVAL,
+    "layoff_tracker": LAYOFF_TRACKER_INTERVAL,
     "credit_ratings": CREDIT_RATING_INTERVAL,
     "ftc_doj": FTC_DOJ_INTERVAL,
     "fed_press": FED_PRESS_INTERVAL,
@@ -1018,6 +1021,27 @@ def benzinga_analyst_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(BENZINGA_INTERVAL)
+
+
+# ── Worker: Layoff tracker — every 10min ──────────────────────────────────────
+def layoff_tracker_worker(store: ArticleStore):
+    log.info("[layoff_tracker_worker] started")
+    bo = Backoff("layoff_tracker", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_layoffs()
+            _ingest(store, articles, "layoff_tracker")
+            try:
+                source_health.record_result("layoff_tracker", len(articles))
+            except Exception as he:
+                log.warning(f"[layoff_tracker_worker] source_health error: {he}")
+            _worker_last_ok["layoff_tracker"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[layoff_tracker_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(LAYOFF_TRACKER_INTERVAL)
 
 
 def credit_ratings_worker(store: ArticleStore):
@@ -5173,6 +5197,7 @@ def main():
         ("cisa_kev",    cisa_kev_worker),
         ("insider_cluster", insider_cluster_worker),
         ("benzinga_analyst", benzinga_analyst_worker),
+        ("layoff_tracker",  layoff_tracker_worker),
         ("credit_ratings",  credit_ratings_worker),
         ("ftc_doj",     ftc_doj_worker),
         ("eia",         eia_worker),
