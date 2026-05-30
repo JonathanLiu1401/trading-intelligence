@@ -4685,6 +4685,45 @@ def _regime_leverage_fit_line(store) -> str:
         return ""
 
 
+def _last_fill_line(store) -> str:
+    """One-line "when did the engine last *execute* a trade?" for the hourly
+    / daily Discord summary.
+
+    The runner heartbeat answers "is the decision loop alive?" by tracking
+    ``decisions.timestamp`` cadence; ``/api/last-real-decision`` answers
+    "did the engine produce a HOLD/FILLED/BLOCKED row recently?". Neither
+    surfaces *when the engine last moved money* — a string of HOLDs is a
+    real decision but a static book. The hourly's "Recent trades" block
+    prints the last 5 fills but leaves the operator to compute the age of
+    the newest by hand.
+
+    Composes ``build_last_fill`` **verbatim** (single source of truth, the
+    ``_capital_pulse_line`` / ``_heartbeat_line`` precedent — the headline
+    is the builder's, never re-derived here). Silence-when-nothing-
+    actionable: ``FRESH`` and ``NO_DATA`` are suppressed; only ``STATIC`` /
+    ``FROZEN`` surface. A trader actively trading sees no extra noise; a
+    multi-day stale book gets a one-line summary that names the last fill.
+
+    Failure contract mirrors the rest of ``reporter``: any builder/store
+    fault degrades to ``""`` ("no last-fill line this report"), **never**
+    an exception ("no Discord summary this report")."""
+    try:
+        from .analytics.last_fill import build_last_fill
+        trades = store.recent_trades(1)
+        result = build_last_fill(trades)
+        if not isinstance(result, dict):
+            return ""
+        state = result.get("state")
+        headline = result.get("headline") or ""
+        if state not in ("STATIC", "FROZEN") or not headline:
+            return ""
+        prefix = "⚠️ " if state == "FROZEN" else ""
+        return f"**LAST FILL** ◈ {state}\n> {prefix}{headline}"
+    except Exception as e:
+        print(f"[reporter] last-fill line skipped: {e}")
+        return ""
+
+
 def _alarm_latch_line() -> str:
     """One-line "is the engine silently latched?" surface for the hourly
     Discord summary.
@@ -5043,6 +5082,16 @@ def send_hourly_summary() -> bool:
     rr = _rebuy_regret_line(store)
     if rr:
         body += "\n" + rr
+    # LAST FILL sits last — surfaces the wall-clock age of the most recent
+    # FILLED row when the engine has not executed in over FRESH_HOURS=6h.
+    # The runner heartbeat tracks decision-loop cadence (a string of HOLDs
+    # is healthy from that view) and "Recent trades" prints timestamps the
+    # operator must subtract by hand. This is the orthogonal "engine alive
+    # but not ACTING" surface. Silent on FRESH / NO_DATA per the silence-
+    # when-nothing-actionable precedent.
+    lf = _last_fill_line(store)
+    if lf:
+        body += "\n" + lf
     return _send(body)
 
 
@@ -5292,4 +5341,11 @@ def send_daily_close() -> bool:
     rr = _rebuy_regret_line(store)
     if rr:
         body += "\n" + rr
+    # LAST FILL on daily close too — see send_hourly_summary for the
+    # rationale. A daily close on a frozen book is the natural moment to
+    # surface "the engine has not executed in over N hours" so the
+    # operator's overnight review picks it up.
+    lf = _last_fill_line(store)
+    if lf:
+        body += "\n" + lf
     return _send(body)
