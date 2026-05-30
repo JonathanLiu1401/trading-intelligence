@@ -121,6 +121,7 @@ from collectors.shipping_intelligence import collect_shipping_news
 from collectors.fed_press_collector import collect_fed_press
 from collectors.fed_research_collector import collect_fed_research
 from collectors.energy_news_collector import collect_energy_news
+from collectors.sector_intelligence_collector import collect_sector_intelligence
 from collectors.ecb_press_collector import collect_ecb_press
 from collectors.boj_press_collector import collect_boj_press
 from collectors.boe_press_collector import collect_boe_press
@@ -288,6 +289,7 @@ SHIPPING_INTELLIGENCE_INTERVAL = 1800  # shipping RSS (Freightos, Splash247, Hel
 FED_PRESS_INTERVAL      = 1800    # Federal Reserve press / speech / testimony RSS — every 30min
 FED_RESEARCH_INTERVAL   = 3600    # Fed FEDS/IFDP working papers + full press_all — every 60min
 ENERGY_NEWS_INTERVAL    = 600         # energy/oil news feeds every 10min
+SECTOR_INTEL_INTERVAL   = 900         # mining/offshore/utilities/solar feeds every 15min
 ECB_PRESS_INTERVAL      = 1800    # ECB press releases RSS — every 30min
 BOJ_PRESS_INTERVAL      = 1800    # Bank of Japan press / speech / MPM RSS — every 30min
 BOE_PRESS_INTERVAL      = 1800    # Bank of England press / publications RSS — every 30min
@@ -2629,6 +2631,27 @@ def energy_news_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(ENERGY_NEWS_INTERVAL)
+
+
+def sector_intelligence_worker(store: ArticleStore):
+    log.info("[sector_intelligence_worker] started")
+    bo = Backoff("sector_intelligence", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_sector_intelligence()
+            _ingest(store, articles, "sector_intelligence")
+            try:
+                source_health.record_result("sector_intelligence", len(articles))
+            except Exception as he:
+                log.warning(f"[sector_intelligence_worker] source_health error: {he}")
+            _worker_last_ok["sector_intelligence"] = time.time()
+            log.debug(f"[sector_intelligence] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[sector_intelligence_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SECTOR_INTEL_INTERVAL)
 
 
 def ecb_press_worker(store: ArticleStore):
@@ -5279,6 +5302,7 @@ def main():
         ("fed_press",   fed_press_worker),
         ("fed_research", fed_research_worker),
         ("energy_news",  energy_news_worker),
+        ("sector_intelligence", sector_intelligence_worker),
         ("ecb_press",   ecb_press_worker),
         ("boj_press",   boj_press_worker),
         ("boe_press",   boe_press_worker),
