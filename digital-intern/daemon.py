@@ -146,6 +146,7 @@ from collectors.usgs_earthquake_collector import collect_usgs_earthquakes
 from collectors.forex_factory_calendar import collect as collect_forex_factory_cal
 from collectors.sec_13f_collector import collect_13f_filings
 from collectors.sec_insider_form4 import collect_sec_form4
+from collectors.sec_form144_collector import collect_sec_form144
 from collectors.sec_ma_deals_collector import collect_sec_ma_deals
 from collectors.sec_keyword_signals import collect_sec_keyword_signals
 from collectors.sec_enforcement_collector import collect_sec_enforcement
@@ -324,6 +325,7 @@ ETF_FUND_FLOWS_INTERVAL     = 3600      # ETF shares-outstanding delta → fund 
 CONFERENCE_BOARD_INTERVAL   = 3600 * 4  # Conference Board LEI + CCI — every 4h (monthly data, deduped)
 SEC_13F_INTERVAL        = 1800      # SEC 13F institutional holdings — every 30min (quarterly season)
 SEC_FORM4_INTERVAL      = 300       # SEC Form 4 insider transactions (portfolio tickers) — every 5min
+SEC_FORM144_INTERVAL    = 600       # SEC Form 144 insider intent-to-sell notices — every 10min
 SEC_MA_DEALS_INTERVAL   = 1800      # SEC M&A deal detector (market-wide keyword search) — every 30min
 SEC_KEYWORD_SIGNALS_INTERVAL = 1800  # SEC EFTS keyword signals (going concern, material weakness, etc.) — every 30min
 USGS_QUAKE_INTERVAL     = 1800    # USGS M≥5 earthquake feed every 30min (insurance/semis/energy catalyst)
@@ -463,6 +465,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "sec_xbrl": SEC_XBRL_INTERVAL,
     "sec_13f": SEC_13F_INTERVAL,
     "sec_form4": SEC_FORM4_INTERVAL,
+    "sec_form144": SEC_FORM144_INTERVAL,
     "sec_ma_deals": SEC_MA_DEALS_INTERVAL,
     "sec_keyword_signals": SEC_KEYWORD_SIGNALS_INTERVAL,
     "usgs_quake": USGS_QUAKE_INTERVAL,
@@ -3426,6 +3429,27 @@ def sec_form4_worker(store: ArticleStore):
         _sleep(SEC_FORM4_INTERVAL)
 
 
+# ── Worker: SEC Form 144 insider sell-intent notices — every 10min ───────────
+def sec_form144_worker(store: ArticleStore):
+    log.info("[sec_form144_worker] started")
+    bo = Backoff("sec_form144", base=30.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_sec_form144()
+            _ingest(store, articles, "sec_form144")
+            try:
+                source_health.record_result("sec_form144", len(articles))
+            except Exception as he:
+                log.warning(f"[sec_form144_worker] source_health error: {he}")
+            _worker_last_ok["sec_form144"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[sec_form144_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SEC_FORM144_INTERVAL)
+
+
 # ── Worker: SEC M&A deal detector (market-wide keyword search) — every 30min ─
 def sec_ma_deals_worker(store: ArticleStore):
     log.info("[sec_ma_deals_worker] started")
@@ -5238,6 +5262,7 @@ def main():
         ("sec_xbrl",    sec_xbrl_worker),
         ("sec_13f",     sec_13f_worker),
         ("sec_form4",   sec_form4_worker),
+        ("sec_form144", sec_form144_worker),
         ("sec_ma_deals", sec_ma_deals_worker),
         ("sec_keyword_signals", sec_keyword_signals_worker),
         ("usgs_quake",  usgs_quake_worker),
