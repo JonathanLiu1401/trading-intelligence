@@ -21540,5 +21540,94 @@ def monkey_benchmark_page():
     return render_template_string(_MONKEY_TEMPLATE, api_prefix=_api_prefix())
 
 
+@app.route("/api/position-size-pl-fit")
+def position_size_pl_fit_api():
+    """Realized P&L bucketed by entry size as a fraction of book-at-entry —
+    is the desk Kelly-coherent?
+
+    ``conviction_deployment`` is the forward sizing-intent read (catalyst
+    score → entry size). This endpoint is the matched-pair *backward* read:
+    did those entry sizes actually pay? Buckets every closed round-trip
+    into SMALL/MEDIUM/LARGE/MAX by ``cost / book_at_entry`` (book derived
+    from the latest equity_curve sample at or before opened_at, falling
+    back to $1000 INITIAL_CASH when no covering sample exists). Verdict
+    ladder contrasts big-bet ($) vs small-bet ($) net P&L: KELLY_COHERENT
+    / ANTI_KELLY / BIG_BETS_NEUTRAL / ALL_BLEED / EMERGING / NO_DATA.
+
+    Composes ``analytics.position_size_pl_fit.build`` verbatim. Pure: never
+    trains, never writes, never has a path to ``_execute``.
+    """
+    try:
+        from .analytics.position_size_pl_fit import build
+        st = get_store()
+        snap = build(st.recent_trades(5000),
+                     equity_curve=st.equity_curve(500))
+        if not isinstance(snap, dict):
+            raise TypeError(f"builder returned {type(snap).__name__}")
+        return jsonify({
+            "service": "paper_trader",
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            **snap,
+        })
+    except Exception as e:
+        return jsonify({
+            "service": "paper_trader",
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "verdict": "ERROR",
+            "headline": f"position-size-pl-fit endpoint error: {e}",
+            "error": str(e),
+            "buckets": {},
+            "n_round_trips": 0,
+            "min_for_verdict": 4,
+            "fallback_book_used_count": 0,
+        }), 500
+
+
+@app.route("/api/tape-fit-pl")
+def tape_fit_pl_api():
+    """Realized P&L bucketed by SPY tape direction during the holding period
+    — is the desk's edge real alpha, or pure beta?
+
+    ``portfolio_beta`` measures CURRENT SPY exposure (point-in-time). This
+    endpoint stratifies the realized ledger by what SPY did DURING each
+    closed round-trip: TAILWIND (SPY rose > 0.3% during hold), HEADWIND
+    (SPY fell > 0.3%), FLAT, or UNKNOWN (SPY mark missing at either end).
+    Per-bucket: n, win%, total_pl_usd, avg_pl_pct, avg_hold_days, avg
+    SPY % change. Verdict ladder: ALPHA_VS_TAPE (HEADWIND bucket positive
+    AND book positive) / RIDING_BETA / FIGHTING_TAPE / TAPE_TRAPPED /
+    TAPE_NEUTRAL / EMERGING / NO_DATA. The HEADWIND-positive cases are
+    the alpha proof; RIDING_BETA is the typical retail pattern.
+
+    SPY context comes from the equity_curve's ``sp500_price`` column —
+    already recorded at every cycle by ``runner._cycle``. Pure: never
+    trains, never writes, never has a path to ``_execute``.
+    """
+    try:
+        from .analytics.tape_fit_pl import build
+        st = get_store()
+        snap = build(st.recent_trades(5000),
+                     equity_curve=st.equity_curve(2000))
+        if not isinstance(snap, dict):
+            raise TypeError(f"builder returned {type(snap).__name__}")
+        return jsonify({
+            "service": "paper_trader",
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            **snap,
+        })
+    except Exception as e:
+        return jsonify({
+            "service": "paper_trader",
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "verdict": "ERROR",
+            "headline": f"tape-fit-pl endpoint error: {e}",
+            "error": str(e),
+            "buckets": {},
+            "n_round_trips": 0,
+            "n_directional": 0,
+            "min_for_verdict": 4,
+            "tape_band_pct": 0.30,
+        }), 500
+
+
 if __name__ == "__main__":
     run()
