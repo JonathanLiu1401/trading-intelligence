@@ -4685,6 +4685,59 @@ def _regime_leverage_fit_line(store) -> str:
         return ""
 
 
+def _last_real_decision_line(store) -> str:
+    """One-line "did the engine actually DECIDE something recently?" for the
+    hourly / daily Discord summary — the orthogonal companion to
+    ``_last_fill_line``.
+
+    ``_last_fill_line`` answers "when did the engine last EXECUTE?" (FILLED
+    only). This answers "when did the engine last produce ANY real decision
+    (FILLED / HOLD / BLOCKED)?". The two together split an actionable
+    diagnostic apart that NEITHER answers alone:
+
+      * ``_last_fill_line`` STATIC + this FRESH → engine is producing HOLD
+        decisions (intentional sit-out). A trader paged on a wedge but
+        looking at the hourly sees "engine deciding to wait", not
+        "engine wedged".
+      * ``_last_fill_line`` STATIC + this STALE → engine is producing only
+        NO_DECISION rows (claude wedge / quota / host-saturation). The
+        IDLE_STORM smoking gun documented in AGENTS.md — the loop is
+        cycling (the decisions table grows) but real decisions are NOT.
+
+    Composes ``analytics.last_real_decision.build_last_real_decision`` over
+    ``store.last_real_decision()`` **verbatim** (single source of truth,
+    AGENTS.md invariant #10 — the verdict/headline are the builder's, never
+    re-derived here, so this Discord line and ``/api/last-real-decision``
+    can never tell different stories about the same row).
+
+    Silence-when-nothing-actionable (the ``_last_fill_line`` precedent):
+    ``FRESH`` / ``DELAYED`` are suppressed; only ``NEVER`` / ``STALE``
+    surface. A book whose engine is actively deciding sees no extra hourly
+    noise; a wedge that the breaker hasn't yet caught (sub-threshold
+    consecutive NO_DECISION run) AND a true engine-never-decided book BOTH
+    become visible without the operator opening the dashboard.
+
+    Failure contract mirrors the rest of ``reporter``: any builder/store
+    fault degrades to ``""`` ("no last-real-decision line this report"),
+    **never** an exception ("no Discord summary this report")."""
+    try:
+        from .analytics.last_real_decision import build_last_real_decision
+        row = store.last_real_decision()
+        market_open = market.is_market_open()
+        result = build_last_real_decision(row, market_open=market_open)
+        if not isinstance(result, dict):
+            return ""
+        state = result.get("state")
+        headline = result.get("headline") or ""
+        if state not in ("NEVER", "STALE") or not headline:
+            return ""
+        prefix = "⚠️ " if state == "STALE" else ""
+        return f"**ENGINE DECIDING?** ◈ {state}\n> {prefix}{headline}"
+    except Exception as e:
+        print(f"[reporter] last-real-decision line skipped: {e}")
+        return ""
+
+
 def _last_fill_line(store) -> str:
     """One-line "when did the engine last *execute* a trade?" for the hourly
     / daily Discord summary.
@@ -5092,6 +5145,17 @@ def send_hourly_summary() -> bool:
     lf = _last_fill_line(store)
     if lf:
         body += "\n" + lf
+    # ENGINE DECIDING? sits right after LAST FILL — the orthogonal companion.
+    # LAST FILL says "engine last EXECUTED at …"; this says "engine last
+    # PRODUCED ANY real decision (HOLD/FILLED/BLOCKED) at …". Splits a
+    # critical operator-facing diagnostic apart: LAST FILL STATIC + this FRESH
+    # = engine deciding HOLDs (healthy); LAST FILL STATIC + this STALE =
+    # NO_DECISION storm (the IDLE_STORM wedge — sub-threshold consecutive
+    # NO_DECISION run the breaker hasn't caught yet). Silent on FRESH /
+    # DELAYED; only NEVER / STALE surface.
+    lrd = _last_real_decision_line(store)
+    if lrd:
+        body += "\n" + lrd
     return _send(body)
 
 
@@ -5348,4 +5412,12 @@ def send_daily_close() -> bool:
     lf = _last_fill_line(store)
     if lf:
         body += "\n" + lf
+    # ENGINE DECIDING? on daily close too — same rationale as the hourly:
+    # a frozen book over a closed-market night is the natural moment to ask
+    # "is the engine actually producing decisions, or just cycling?". Splits
+    # the LAST FILL diagnostic apart so a wedge that's been holding HOLD
+    # decisions vs one that's just cycling NO_DECISIONs is visible.
+    lrd = _last_real_decision_line(store)
+    if lrd:
+        body += "\n" + lrd
     return _send(body)
