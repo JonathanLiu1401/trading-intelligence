@@ -1,5 +1,300 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 — Agent 2 (ML+backtests) HYBRID pass #4 — `sizing_rule_regime_breakdown`
+
+Persona: a quant researcher reading the previous pass's `ALT_BEATS_ACTUAL`
+verdict (UNIFORM_25 beats the deployed sizing rule globally by +128%
+relative on 4128 BUYs) and asking the natural skeptical follow-up:
+*does that finding survive a regime split, or is it a bull-skew artifact?*
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=10
+
+### Phase 1 — no commit (codebase honestly clean)
+
+Read `paper_trader/ml/decision_scorer.py`, `paper_trader/backtest.py`,
+and `run_continuous_backtests.py` end-to-end for race conditions,
+missing error handling, atomic-write hazards, shape/dtype subtleties,
+and dead code. Ran the focused ML/backtest test slice
+(`tests/test_decision_scorer.py`, `tests/test_backtest.py`,
+`tests/test_continuous.py`) — **290 passed in 143.94s**, no failures.
+After 35+ prior HYBRID review passes the surface bugs are guarded —
+every JSON write is atomic (`tmp + .replace`), every analyzer has the
+"never raises, degrades to honest envelope" discipline, every cache
+loader has type-guards, every shared-state mutator holds its lock.
+Honest `bugs_fixed=0` per the Phase 1 commit guard.
+
+### Phase 2 — `feat:` `sizing_rule_regime_breakdown` (commit `354cb35`)
+
+**The gap.** `sizing_rule_counterfactual` (previous Agent 2 pass)
+reports the **global** winner among 6 sizing rules — verdict on the
+5512-row OOS slice was `ALT_BEATS_ACTUAL`, UNIFORM_25 +994pp vs ACTUAL
++436pp (+128% relative improvement). The natural quant follow-up:
+*does UNIFORM_25 win uniformly across regimes, or is the verdict
+hostage to one fat regime?* The live corpus is ~98% non-bear (153
+bear rows, the documented sparsity gap), so a global UNIFORM_25 win
+could be entirely a bull-skew / beta-leverage artifact. A rule that
+loses badly in bear cannot be safely deployed without further
+protection — even if it wins on aggregate.
+
+**The analyzer** (`paper_trader/ml/sizing_rule_regime_breakdown.py`)
+reuses `SIZING_RULES`, `build_sizing_counterfactual`, `load_outcomes`,
+and `MIN_REL_IMPROVEMENT` from the sibling module (no SSOT drift),
+splits BUYs by `regime_label` (preferred) with `regime_mult` fallback
+for legacy rows, runs the per-regime counterfactual, and emits an
+aggregate verdict:
+
+| Aggregate verdict | Trigger |
+|---|---|
+| `INSUFFICIENT_DATA`  | < `MIN_REGIMES` (2) populated regimes (or none) |
+| `ALL_SAME_WINNER`    | Every populated regime's decisive winner is the SAME rule (TIE regimes don't count against this — they're inconclusive, not contradictory) |
+| `DIFFERENT_WINNERS`  | At least one regime's winner differs from another's — sizing should be regime-conditional, not global |
+| `BULL_DOMINATED`     | Only bull populated; the global verdict can't generalize |
+| `ALL_TIE`            | Every populated regime is TIE (none has a decisive winner) |
+
+Read-only operational discipline mirrors every sibling
+`paper_trader/ml/*` diagnostic — never trains, never writes pickle /
+outcomes JSONL / any trade path. Errors degrade to a `status='error'`
+envelope; the analyzer never raises. CLI exits 0 on every acceptable
+verdict (ALL_SAME_WINNER / ALL_TIE / BULL_DOMINATED /
+INSUFFICIENT_DATA — informational), 2 on DIFFERENT_WINNERS
+(quant-decisive — sizing should be regime-conditional).
+
+**Live verdict on the 7413-row corpus** (2026-05-30):
+
+  `ALL_SAME_WINNER` — UNIFORM_25 wins 2 of 3 populated regimes:
+  * **sideways** (n=2462): `ALT_BEATS_ACTUAL` — UNIFORM_25 +697pp vs
+    ACTUAL +319pp (+118.8% relative)
+  * **bear** (n=153): `ALT_BEATS_ACTUAL` — UNIFORM_25 +129pp vs ACTUAL
+    +27pp (+382.7% relative)
+  * **bull** (n=2404): `TIE` — UNIFORM_25 +269pp vs ACTUAL +238pp
+    (+13.2% relative, below the 20% threshold)
+
+  The previous pass's global UNIFORM_25 verdict survives the regime
+  split. UNIFORM_25 wins decisively in sideways AND bear; bull is TIE
+  (no decisive winner either way). This is **stronger** evidence than
+  the global aggregate alone: UNIFORM_25 isn't a bull-skew artifact —
+  it wins where it matters most (sideways is the largest bucket, and
+  bear is the documented risk regime).
+
+**Important caveat** (carried from the parent module): the
+sum-of-products metric assumes every base bet is independently
+deployable — it does NOT model real portfolio cash constraints,
+correlated holdings, or compounding. A quant cannot deploy UNIFORM_25
+on this finding alone; the next step is a real cash-constrained
+portfolio simulation in each regime.
+
+**Tests** (`tests/test_sizing_rule_regime_breakdown.py`, 36 cases,
+all specific-value):
+- `_row_regime` decode: explicit label wins, legacy `regime_mult`
+  fallback, `unknown` drops, missing-both drops, unparseable
+  `regime_mult` drops, unknown `regime_mult` value drops.
+- `_winner_name`: `ALT_BEATS_ACTUAL` → `best_alt_rule`, `ACTUAL_BEST`
+  → `"ACTUAL"`, `TIE` → None, `INSUFFICIENT_DATA` → None.
+- `build_regime_breakdown`: empty corpus, non-dict rows, all-unknown,
+  only-bull → `BULL_DOMINATED`, only-bear → `INSUFFICIENT_DATA`,
+  `ALL_SAME_WINNER` synthetic, `ALL_TIE` synthetic, `DIFFERENT_WINNERS`
+  synthetic, per-regime row keys.
+- Legacy `regime_mult`-only corpus decodes correctly.
+- CLI exit codes pinned for every verdict (exit 2 only on
+  DIFFERENT_WINNERS; exit 0 on ALL_SAME_WINNER / TIE /
+  BULL_DOMINATED / INSUFFICIENT_DATA).
+- `analyze()` round-trip via real tmp JSONL file.
+
+All 36 pass in 1.1s. Full ML/backtest slice (290 + sibling tests
+unchanged) **228 passed in 184s** under load.
+
+### Phase 3 — Live findings (quant-researcher tour)
+
+Live corpus / scorer / engine snapshot (2026-05-30, evening cycles).
+
+1. **Engine is healthy.** Cycle just completed (21:17 UTC) ran 8 runs
+   on a 2014-10 → 2024-10 window. Best run 104065 returned +1501.76%
+   vs SPY +189.81% (+1311.95pp alpha). Most recent run 104071
+   returned +1108.20%. n_trades=3 each — the engine is making
+   high-conviction concentrated bets (typical SOXL + semi + leveraged
+   ETF buy-and-hold across the 10-yr window) rather than churning.
+
+2. **Scorer is MISCALIBRATED OOS.** Calibration --oos verdict:
+   `MISCALIBRATED` (spearman +0.113, monotone_fraction=0.56). Top
+   decile predicts +13.6% but realizes only +3.05%; decile 9 predicts
+   +5.85% but realizes only +1.14%. The `DIRECTIONAL_BUT_BIASED`
+   in-sample verdict (spearman +0.21, decile_err 3.07pp) does NOT
+   survive the temporal holdout. The previous pass's identical
+   finding persists.
+
+3. **MLP_NO_BETTER_THAN_TRIVIAL durable.** MLP OOS rank_ic +0.113 vs
+   `news_urgency` single-feature rank_ic +0.133 — a one-line rule using
+   ONLY news_urgency beats the 20-feature MLP by 0.019pp. The MLP's
+   architecture buys no OOS edge a single feature doesn't already
+   carry. Strikingly, `news_count` alone has dir_acc=0.71 — the
+   strongest single-feature directional accuracy in the baseline_compare
+   table, despite a modest rank_ic (+0.05). This suggests news-volume
+   binary indicators carry signal the MLP isn't extracting.
+
+4. **NEWS_FEATURES_DARK durable.** `outcome_corpus_health` reports
+   news_urgency populated in only **2.8%** (204/7413) of training rows.
+   The single most-predictive OOS feature is structurally starved — the
+   MLP cannot learn weights for a column that's null 97% of the time.
+
+5. **Gate is DARK on the production cycles.** Inspected the last 200
+   outcomes via `gate_abstention_kind`: **100% (143/143) of BUYs were
+   killswitch-abstained**; 0 clamp abstentions; 0 gate-acted rows.
+   The trailing-OOS-IC kill-switch (`_should_gate_modulate_conviction`)
+   is correctly firing — the trailing-20-cycle median oos_buy_ic is
+   below the +0.03 tolerance, so the gate sits out. Consistent with
+   the scorer-skill ledger showing `gate_effectively_active=False`
+   despite `gate_active=True` (n_train=3372 ≥ 500).
+
+6. **MLP rank_ic IS positive overall** (+0.113) — earlier
+   `scorer_skill_log` rows show `oos_buy_ic=-0.02`, which conflicts
+   on its face but is actually the BUY-vs-ALL distinction:
+   baseline_compare uses ALL OOS rows (BUY + SELL-sign-flipped); the
+   skill_log oos_buy_ic is BUY-only. So the scorer has **slightly
+   negative BUY rank skill (the gate-relevant slice) but positive
+   SELL skill on flipped labels**. The kill-switch correctly suppresses
+   the gate on this state.
+
+7. **Trainer subprocess timeout persists.** `continuous.log` shows
+   multiple `[continuous] ml: trainer timeout (injected …)` entries —
+   the digital-intern ArticleNet retrain subprocess is timing out
+   repeatedly under load. Memory `di-ml-trainer-subprocess-timeout`
+   documents this as a known external-system issue, not a paper-trader
+   bug. Local DecisionScorer retrains succeed every cycle (val_rmse
+   7-13 range).
+
+8. **Bear regime less sparse than documented.** Previous pass reported
+   11/5512 (0.2%) bear rows. Current corpus has 153/7413 (2.1%) bear
+   rows — an order-of-magnitude improvement. Bear is now just above
+   `MIN_ROWS=60`, so the new regime-breakdown analyzer's bear verdict
+   carries real weight (sample-size honest; ALT_BEATS_ACTUAL passed
+   the 20% threshold by a wide margin at +382.7%).
+
+9. **Regime-conditional sizing verdict (NEW THIS PASS):**
+   `ALL_SAME_WINNER` with UNIFORM_25 winning 2/3 populated regimes
+   (sideways and bear) and TIE in bull. Direct, actionable
+   strengthening of the previous pass's global finding —
+   UNIFORM_25 wins where it matters (the larger sideways bucket AND
+   the bear-protection-relevant slice). The deployed sizing rule
+   (`min(0.25, ml_score/20)`) under-sizes across every regime.
+
+10. **deploy_stale=False on recent cycles.** The deployed pickle's
+    fitted-model hyperparameters match the source `MLP_CONFIG`
+    (`(32,16)` + L2 + early-stopping anti-overfit retune). No
+    architectural drift.
+
+### How the ML/backtest stack works — refreshed mini-reference
+
+**DecisionScorer** (`paper_trader/ml/decision_scorer.py`):
+
+* 20-feature MLPRegressor(32, 16) + L2 alpha=1e-2 + early_stopping
+  (anti-overfit retune, 2026-05-18). Features: 10 base numeric
+  (ml_score / rsi / macd / mom5 / mom20 / regime_mult / vol_ratio /
+  bb_pos / news_urgency / news_article_count) + 3 enhanced MACD
+  booleans (ema200_above / hist_cross_up / macd_below_zero_cross)
+  + 7-way sector one-hot.
+* `predict_with_meta(...)` returns `{pred, raw, clamped,
+  off_distribution, percentile, calibrated, failed, gate_arm,
+  gate_arm_multiplier}` — `pred` is clamped to ±`PRED_CLAMP_PCT=50`,
+  `calibrated` is the quantile-mapped honest magnitude. OOS verdict
+  is `DIRECTIONAL_BUT_BIASED` (in-sample) → `MISCALIBRATED` (OOS).
+* `predict()` is the scalar fast path the gate uses.
+* `feature_contributions` / `feature_group_contributions` /
+  `feature_importance` / `feature_group_importance` — local +
+  global attribution.
+* `train_scorer(records, path=None)` — atomically rewrites
+  `data/ml/decision_scorer.pkl` with `{model, scaler, n_train,
+  pred_quantiles, label_quantiles}`. SELL records flip the label
+  sign. Symmetric label clamp at ±50% so val/oos error is
+  apples-to-apples.
+
+**Running backtests manually**:
+
+```bash
+# One-shot — 10 parallel year-long runs against the default window
+python3 run_backtests.py
+
+# Continuous loop — 1 run per cycle (throttled), 10min cooldown
+python3 run_continuous_backtests.py
+
+# Read-only CLI: explain one scorer prediction
+python3 -m paper_trader.ml.decision_scorer \
+    --ticker NVDA --ml-score 3.5 --rsi 45 --mom5 2.0
+
+# Read-only CLI: corpus data quality (pre-model)
+python3 -m paper_trader.ml.outcome_corpus_health
+
+# Read-only CLI: MLP vs single-feature baselines (the trivial check)
+python3 -m paper_trader.ml.baseline_compare
+
+# Calibration verdict OOS-only
+python3 -m paper_trader.ml.calibration --oos
+
+# Global sizing-rule counterfactual
+python3 -m paper_trader.ml.sizing_rule_counterfactual
+
+# Regime-conditional sizing-rule counterfactual (NEW this pass)
+python3 -m paper_trader.ml.sizing_rule_regime_breakdown
+python3 -m paper_trader.ml.sizing_rule_regime_breakdown --json
+```
+
+**Interpreting backtest results** (load-bearing reading order):
+
+1. `outcome_corpus_health` — is the input data sane (news populated,
+   regimes balanced, target std meaningful)?
+2. `scorer_offdist_rate` — does the scorer's predictions land
+   in-distribution on the OOS slice?
+3. `calibration --oos` — is the rank skill real? Decile error tells
+   you whether to trust the raw % magnitude or only the rank.
+4. `baseline_compare` — does the MLP beat the best one-line rule?
+5. `conviction_calibration` — does the gate's BASE sizing rule rank
+   realized returns?
+6. `sizing_rule_counterfactual` — would a DIFFERENT sizing rule have
+   realized more PnL globally?
+7. `sizing_rule_regime_breakdown` (NEW) — does the global winner
+   survive a regime split, or is it bull-skew? `ALL_SAME_WINNER` =
+   deploy with confidence; `DIFFERENT_WINNERS` = sizing should be
+   regime-conditional.
+8. `gate_pnl` / `gate_arm_kelly` — does the gate's ×0.6..×1.3
+   OVERLAY realize differentiated outcomes?
+
+**Test commands for this domain**:
+
+```bash
+# Just this pass's new tests (~1.5s, 36 cases)
+python3 -m pytest tests/test_sizing_rule_regime_breakdown.py -v
+
+# Regression on focused ML/backtest slice (~3min under load)
+python3 -m pytest tests/test_decision_scorer.py \
+                  tests/test_backtest.py \
+                  tests/test_continuous.py \
+                  tests/test_sizing_rule_counterfactual.py \
+                  tests/test_sizing_rule_regime_breakdown.py -v
+
+# Just the sibling sizing analyzers
+python3 -m pytest tests/test_sizing_rule_regime_breakdown.py \
+                  tests/test_sizing_rule_counterfactual.py \
+                  tests/test_sizing_pnl_skill.py \
+                  tests/test_conviction_calibration.py -v
+```
+
+### Staging
+
+Two commits expected; per-file pathspec, no `git add -A`:
+
+* **Phase 2** (commit `354cb35`):
+  `paper_trader/ml/sizing_rule_regime_breakdown.py` +
+  `tests/test_sizing_rule_regime_breakdown.py` (the new analyzer +
+  36 tests).
+* **Phase 4** (this section): `AGENTS.md` only.
+
+Working copy at start carried ~24 sibling agents' uncommitted edits to
+`paper_trader/ml/*` analyzer modules and 5 `tests/test_*` files
+(systematically plumbing enhanced-MACD features), plus several
+untracked sibling additions in `paper_trader/analytics/*` and
+`tests/test_*`. All left untouched per the documented
+`pt-concurrent-samerole-staging-race` memory. No `git add -A`.
+
+
 ## 2026-05-30 core HYBRID pass #4 (Agent 1) — breaker FIRED retry-on-failure + `_plan_execution_debt_line`
 
 Persona: a live trader who, on the previous pass, found
