@@ -638,6 +638,24 @@ def _maybe_daily_close():
 # loop wedged well past any legitimate cycle is force-killed.
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
+# Wall-clock cap for every ``git rev-parse`` the watcher fires. Without it, a
+# wedged git process — e.g. the work tree is mid-rebase with index.lock held
+# by a crashed editor, or the data dir's underlying filesystem stalled — would
+# block ``subprocess.check_output`` *forever*, freezing the watcher thread and
+# silently defeating the deferred-restart-on-new-commits feature (no
+# HEAD-change detection means a committed fix never deploys, even under the
+# RESTART_GRACE_S deadman, because the deadman path is only reached AFTER a
+# successful HEAD-change observation). git rev-parse is a sub-second op on a
+# healthy tree; 10s is generous slack for slow disk I/O without letting a
+# genuinely hung command stall the loop. A TimeoutExpired propagates through
+# the existing ``except Exception`` arm so the watcher degrades to the
+# "skip-this-iteration" no-op exactly like every other transient git failure.
+_GIT_PROBE_TIMEOUT_S = 10.0
+# Same bound for the ``pkill`` the circuit breaker fires. pkill is normally
+# microseconds; a hung pkill (e.g. a zombie subprocess wedging /proc) would
+# block ``_cycle`` for the entire run and defeat the breaker's whole point.
+_PKILL_TIMEOUT_S = 5.0
+
 
 def _deferred_restart_overdue(requested_monotonic: float | None,
                               now_monotonic: float,
@@ -668,7 +686,8 @@ def _git_watcher():
     """Daemon-thread body: restart the process when new commits land."""
     try:
         old_head = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT,
+            timeout=_GIT_PROBE_TIMEOUT_S,
         ).decode().strip()
     except Exception as e:
         # Can't establish a baseline → nothing to compare against ever.
@@ -680,7 +699,8 @@ def _git_watcher():
     while True:
         try:
             new_head = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT
+                ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT,
+                timeout=_GIT_PROBE_TIMEOUT_S,
             ).decode().strip()
         except Exception:
             # git transiently unavailable (mid-rebase, USB unmounted, …):
@@ -797,12 +817,19 @@ def _kill_stale_claude():
             killed = subprocess.run(
                 ["pkill", "-P", str(own_pid), "-f", pattern],
                 capture_output=True,
+                timeout=_PKILL_TIMEOUT_S,
             )
             # pkill rc: 0 = killed something, 1 = nothing matched, >1 = error.
             print(
                 f"[runner] circuit breaker: pkill -P {own_pid} -f "
                 f"{pattern!r} returned {killed.returncode}"
             )
+        except subprocess.TimeoutExpired:
+            # A wedged pkill would otherwise stall `_cycle` for the entire
+            # run; surface and continue so the next breaker fire (or operator
+            # bounce) still has a chance to recover.
+            print(f"[runner] circuit breaker: pkill {pattern!r} timed out "
+                  f"after {int(_PKILL_TIMEOUT_S)}s (skipped)")
         except Exception as e:
             print(f"[runner] circuit breaker: pkill {pattern!r} failed: {e}")
 
