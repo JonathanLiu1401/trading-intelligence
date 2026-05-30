@@ -1,5 +1,228 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 — Agent 4 (feature-dev, second pass) — `position_size_pl_fit` + `tape_fit_pl`
+
+Persona: a senior product engineer touring the live dashboard like a
+discretionary PM who wants to know *what shape the desk's edge actually
+has* — not just lifetime P&L, but conditional P&L across the axes that
+matter for risk allocation.
+
+**Counters:** features_added=2 · tests_added=50 (all passing)
+
+### The gaps
+
+Two axes the existing 184 analytics modules don't stratify the realized
+ledger across, both of which a discretionary PM asks within 30 seconds
+of opening the dashboard:
+
+1. **Are the desk's BIG bets paying?** `conviction_deployment` already
+   measures the *forward* sizing intent (catalyst-score → entry size).
+   Nothing measures the *backward* sizing outcome (entry size → realized
+   $). A book whose small bets pay and big bets bleed is structurally
+   anti-Kelly; a book whose big bets carry the desk is Kelly-coherent;
+   neither status is visible in the existing 184-endpoint surface.
+
+2. **Is the desk's edge real alpha, or pure beta?** `portfolio_beta` /
+   `portfolio_beta_drift` measure CURRENT SPY exposure (point-in-time);
+   `risk_adjusted_returns` / `benchmark` compare aggregate book return
+   to SPY (no per-trip stratification). Nothing stratifies the realized
+   ledger by what the tape did DURING each closed round-trip. A book
+   that profits only on TAILWIND days is the textbook beta-rider; a
+   book that profits during HEADWIND segments is the alpha-proof case.
+
+### New endpoints
+
+* **`/api/position-size-pl-fit`** — bucket every closed round-trip by
+  entry-side dollar cost expressed as a fraction of book-at-entry
+  (`SMALL` < 25%, `MEDIUM` 25-50%, `LARGE` 50-80%, `MAX` ≥ 80%). Per
+  bucket: `n`, `wins`, `losses`, `flat`, `win_rate_pct`, `total_pl_usd`,
+  `total_cost_usd`, `avg_pl_pct`, `avg_hold_days`, `median_hold_days`,
+  `avg_entry_book_pct`. Verdict ladder over big-bucket vs small-bucket
+  net $: `KELLY_COHERENT` (big-bet $ > 0 AND > small-bet $) /
+  `ANTI_KELLY` (big-bet $ < 0 AND small-bet $ > 0) / `BIG_BETS_NEUTRAL`
+  / `ALL_BLEED` (every populated bucket red) / `EMERGING`
+  (n < `min_for_verdict=4`) / `NO_DATA`. Book-at-entry comes from the
+  equity_curve sample at-or-before `opened_at`; missing-sample rows
+  fall back to the $1000 `INITIAL_CASH` canonical (matches store
+  bootstrap) so a fresh-DB caller still gets a meaningful bucketing.
+  Builder: `paper_trader/analytics/position_size_pl_fit.py`.
+
+* **`/api/tape-fit-pl`** — bucket every closed round-trip by SPY tape
+  direction during the holding period (`TAILWIND` SPY rose > 0.3% during
+  hold, `HEADWIND` SPY fell > 0.3%, `FLAT` ±0.3%, `UNKNOWN` SPY mark
+  missing at either end). Per bucket: same shape as position-size-pl-fit
+  plus `avg_spy_change_pct` (the average tape move actually digested in
+  that bucket). Verdict ladder: `ALPHA_VS_TAPE` (HEADWIND-bucket net
+  positive AND book net positive — alpha proof) / `RIDING_BETA`
+  (TAILWIND wins, HEADWIND loses — typical retail) / `FIGHTING_TAPE`
+  (HEADWIND positive, TAILWIND non-positive — rare counter-trend edge)
+  / `TAPE_TRAPPED` (both directional buckets red) / `TAPE_NEUTRAL` /
+  `EMERGING` / `NO_DATA`. SPY context comes from the equity_curve's
+  `sp500_price` column (already recorded every cycle by
+  `runner._cycle`); `UNKNOWN` is isolated from the verdict so a missing
+  SPY mark never poisons a directional read.
+  Builder: `paper_trader/analytics/tape_fit_pl.py`.
+
+### Live verdict on the deployed book (snapshot 2026-05-30, n=9 round-trips)
+
+* **position-size-pl-fit**: `KELLY_COHERENT`. Big-bet bucket (LARGE+MAX,
+  n=6) $+172.64; small-bet bucket (SMALL+MEDIUM, n=3) $-6.86. The bot's
+  larger entries are carrying the realized edge — its sizing model is
+  on the right side of Kelly, at least at this sample size. This is
+  the matched-pair backward read on `conviction_deployment`'s forward
+  intent: the bot's higher-conviction sizing is actually paying off.
+
+* **tape-fit-pl**: `RIDING_BETA`. TAILWIND 3 trips $+160.74; HEADWIND 0
+  trips; FLAT 6 trips $+5.04. **The desk has earned all its alpha on
+  TAILWIND segments and never closed a round-trip during a HEADWIND
+  segment** — the bot's edge is currently indistinguishable from market
+  beta. The verdict will flip toward `ALPHA_VS_TAPE` only once at least
+  one HEADWIND closure lands positive, or toward a clearer
+  `RIDING_BETA`/`TAPE_TRAPPED` once HEADWIND closures begin to lose.
+
+### Discipline
+
+Both modules: pure, never train, never write, never have a path to
+`_execute`. Errors degrade single rows (a missing equity sample → SMALL
+or UNKNOWN respectively), never the verdict; endpoints emit ERROR
+envelopes on builder fault rather than raw 500s (same contract as the
+surrounding operator panels).
+
+Tests (50 total, all specific-value, no "no crash" passes):
+
+* `tests/test_position_size_pl_fit.py` — 28 cases. Bucket boundaries
+  pinned at threshold ±one row (24.999% → SMALL, 25.0% → MEDIUM, 49.99%
+  → MEDIUM, 50.0% → LARGE, 79.99% → LARGE, 80.0% → MAX). Equity-curve
+  book lookup uses latest sample at-or-before entry — pinned with a
+  three-sample fixture. No-covering-sample / empty equity_curve fall
+  back to $1000 (constant pinned). Malformed equity rows (unparseable
+  ts, None total_value, garbage) skipped; the good sample still
+  classifies the trip. Verdict-ladder corners exercised: KELLY_COHERENT
+  / ANTI_KELLY / ALL_BLEED / BIG_BETS_NEUTRAL / EMERGING / NO_DATA.
+  Endpoint envelope via `app.test_client()` (per
+  `pt-analytics-verification` memory — never CLI smoke).
+
+* `tests/test_tape_fit_pl.py` — 22 cases. Band-constant pinned at 0.30,
+  classifier boundaries pinned at exactly ±0.30% → FLAT (inclusive of
+  FLAT), >0.30% → TAILWIND, <-0.30% → HEADWIND. NaN/None/garbage →
+  UNKNOWN. Missing-endpoint SPY mark → UNKNOWN (never poisons a
+  directional verdict). Verdict-ladder corners: ALPHA_VS_TAPE /
+  RIDING_BETA / TAPE_TRAPPED / EMERGING / NO_DATA. Endpoint envelope
+  via test client.
+
+### Test commands for the new features
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Just the new tests (~18s, 50 cases).
+python3 -m pytest tests/test_position_size_pl_fit.py \
+    tests/test_tape_fit_pl.py -v
+
+# Sibling-module regression — they import round_trips_derived (~9s).
+python3 -m pytest tests/test_sector_pl_history.py \
+    tests/test_exit_trigger_pl_mix.py tests/test_round_trips_derived.py \
+    tests/test_trade_asymmetry.py tests/test_track_record.py \
+    tests/test_loser_autopsy.py tests/test_winner_autopsy.py -q
+
+# Dashboard helpers regression (~11s).
+python3 -m pytest tests/test_core_dashboard_helpers.py \
+    tests/test_core_dashboard_portfolio.py \
+    tests/test_core_dashboard_articles_db.py -q
+```
+
+### Staging discipline
+
+Concurrent agent WIP edits in flight on `paper_trader/dashboard.py`
+(among many ml/* files) per `pt-concurrent-samerole-staging-race`.
+Staged only my new files by explicit pathspec; dashboard.py route
+additions staged via `git add -p` to isolate the two new route hunks.
+
+Files committed (mine only):
+
+* `paper_trader/analytics/position_size_pl_fit.py` — new builder (~250 LoC).
+* `paper_trader/analytics/tape_fit_pl.py` — new builder (~270 LoC).
+* `tests/test_position_size_pl_fit.py` — 28 cases.
+* `tests/test_tape_fit_pl.py` — 22 cases.
+* `paper_trader/dashboard.py` — 2 new routes via `git add -p`.
+* `AGENTS.md` — this entry.
+
+---
+
+## 2026-05-30 — Agent 4 (feature-dev) — `exit_trigger_pl_mix` + `sector_pl_history`
+
+Persona: a senior product engineer touring the live dashboard like a
+trader who wants to know *where the desk's edge actually is*.
+
+**Counters:** features_added=2 · tests_added=28 (all passing)
+
+### The gaps
+
+Both panels were ones a discretionary trader would expect to find on a
+modern dashboard, and weren't there:
+
+1. **Is the desk's discretionary edge actually beating the mechanical
+   exits?** `/api/hard-exit-summary` counts the SL/TP *events* and emits
+   a discipline ratio + last-of-each. `/api/exit-intent-audit` buckets
+   discretionary SELLs by Opus' intent label. Neither rolls up the
+   **realized P&L by trigger bucket** on a like-for-like ledger (n_trips,
+   win%, total $, hold-days mean+median).
+
+2. **Where did the money come from, by sector, over time?**
+   `/api/sector-exposure` shows where capital sits *today*.
+   `/api/sector-signal-fit` audits per-sector signal usage. Nothing
+   aggregates the realized P&L ledger by sector over time, so "which
+   sectors have actually paid me, and which have bled me, in the last
+   7d / 30d / lifetime?" had no panel.
+
+### New endpoints
+
+* **`/api/exit-trigger-pl-mix`** — bucket every closed round-trip by the
+  closing SELL's `reason` prefix: `HARD_SL` / `HARD_TP` / `DISCRETIONARY`.
+  Per bucket: `n`, `wins`, `losses`, `flat`, `win_rate_pct`,
+  `total_pl_usd`, `total_cost_usd`, `avg_pl_pct`, `avg_hold_days`,
+  `median_hold_days`. Verdict ladder over the *net* contributions:
+  `MECHANICAL_DOMINANT` / `DISCRETIONARY_DOMINANT` / `BOTH_POSITIVE` /
+  `BOTH_NEGATIVE` / `EMERGING` (under `min_for_verdict=4`).
+  Builder: `paper_trader/analytics/exit_trigger_pl_mix.py`.
+
+* **`/api/sector-pl-history`** — cumulative realized P&L by sector over
+  `last_7d` / `last_30d` / `all_time`. Per sector + window: `n_trips`,
+  `n_wins`, `n_losses`, `win_rate_pct`, `total_pl_usd`, `total_cost_usd`,
+  `avg_pl_pct`, `tickers`. Sectors within each window are sorted
+  descending by `total_pl_usd` so row 0 is the leader. Reuses
+  `round_trips_derived.derive_round_trips` and the drift-locked
+  `sector_exposure.classify` so the sector mapping never diverges from
+  the live decision-path block. Verdict ladder:
+  `MIXED` / `SINGLE_SECTOR` / `NO_CLOSED_TRIPS`.
+  Builder: `paper_trader/analytics/sector_pl_history.py`.
+
+### Live verdict on the deployed book (snapshot 2026-05-30)
+
+* **exit-trigger-pl-mix**: `MECHANICAL_DOMINANT`. HARD_TP nets +$212 over
+  2 trips (100% win); HARD_SL costs -$37 over 2 trips (100% loss);
+  discretionary -$10 over 5 trips at 60% win — **the auto take-profits
+  are carrying the desk's realized edge**, not Opus' rotations. The
+  HARD_TP avg hold is 0.27 days vs discretionary 1.36 days, so the
+  mechanical winners are also the quick ones.
+* **sector-pl-history**: `MIXED`. semis $+158 (8 trips, 50% win across
+  AMD/DRAM/MU/NVDA) is the entire ledger; broad_lev $+7 (1 trip, TQQQ).
+  Every other sector in `SECTOR_MAP` is untouched by closed round-trips
+  — the realized track record is 99% semis.
+
+### Discipline
+
+Both modules: pure, never train, never write, never have a path to
+`_execute`. Errors degrade to ERROR envelopes — endpoints never 500
+silently (same contract as the surrounding operator panels).
+
+Tests pin the verdict ladders at thresholds, the bucket math against
+hand-built trade slices, the time-window cutoffs deterministically (the
+`build()` functions accept `now=` injection for tests), and the Flask
+endpoint envelopes via the `app.test_client()` path.
+
+---
+
 ## 2026-05-30 core HYBRID pass (Agent 1, second cycle) — `win-rate-trend` recent-vs-prior trajectory line
 
 Persona: a live trader who reads the lifetime win rate but cannot tell
