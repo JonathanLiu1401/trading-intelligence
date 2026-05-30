@@ -2268,6 +2268,71 @@ def _idle_opportunity_line(store) -> str:
         return ""
 
 
+def _drought_alpha_bleed_line(store) -> str:
+    """One-line "are NO_DECISION storms costing us real alpha?" for the
+    hourly / daily Discord summary.
+
+    ``_idle_opportunity_line`` surfaces *which signals* arrived during the
+    current drought (the article-regret view). ``_heartbeat_line`` surfaces
+    the IDLE_STORM cause-code. Neither answers the trader's first
+    actionable question: **"how much alpha is being LOST to involuntary
+    droughts?"**. ``build_decision_drought`` already computes
+    ``involuntary_alpha_bleed_pct`` — aggregate alpha bled across every
+    PARALYSIS drought — and the ``BLEEDING`` / ``STUCK`` verdicts that key
+    off it. The dashboard sees this at ``/api/decision-drought`` but the
+    operator on Discord never did, and a -6.56% running aggregate bleed
+    (observed live 2026-05-30) deserves the surface the operator actually
+    reads. The hourly summary is where the bleed reckoning belongs.
+    Companion to ``_idle_opportunity_line``: regret answers "what
+    signals did I miss?", this answers "what did missing them cost?".
+
+    Composes ``build_decision_drought`` **verbatim** (single source of
+    truth, AGENTS.md invariant #10 — verdict / verdict_reason are the
+    builder's, never re-derived here, so this Discord line and
+    ``/api/decision-drought`` can never disagree on whether the desk is
+    bleeding or stuck).
+
+    Pure store reads — NO network (the Discord-path discipline; the
+    ``_idle_opportunity_line`` / ``_heartbeat_line`` precedent).
+    Observational only, no caps, never gates (invariants #2/#12). Failure
+    contract mirrors the rest of ``reporter``: any builder / store fault
+    degrades to ``""`` ("no alpha-bleed line this report"), **never** an
+    exception ("no Discord summary this report").
+
+    Suppression — surface ONLY the two actionable verdicts (the
+    ``_win_rate_trend_line`` / ``_heartbeat_line`` precedent):
+
+      * ``BLEEDING`` — ``involuntary_alpha_bleed_pct <= -1.0%`` aggregate
+        across PARALYSIS droughts; the operator should reduce concurrent
+        Opus jobs or otherwise unwedge the engine — real alpha is leaking.
+      * ``STUCK`` — current drought is PARALYSIS and ≥3h long; the engine
+        is paralyzed RIGHT NOW, separate from any cumulative bleed.
+
+    ``OK`` / ``NO_DATA`` / ``NEVER_TRADED`` (and any future verdict the
+    builder may add) stay silent — whitelist-only, so the hourly never
+    becomes its own lying green light.
+    """
+    try:
+        from .analytics.decision_drought import build_decision_drought
+        result = build_decision_drought(
+            store.recent_decisions(limit=3000),
+            store.equity_curve(limit=5000),
+        )
+        if not isinstance(result, dict):
+            return ""
+        verdict = result.get("verdict")
+        if verdict not in ("BLEEDING", "STUCK"):
+            return ""
+        reason = result.get("verdict_reason") or ""
+        if not isinstance(reason, str) or not reason.strip():
+            return ""
+        prefix = "🩸" if verdict == "BLEEDING" else "⚠️"
+        return f"{prefix} **ALPHA BLEED** ◈ {verdict}\n> {reason}"
+    except Exception as e:
+        print(f"[reporter] alpha-bleed line skipped: {e}")
+        return ""
+
+
 def _host_pulse_line() -> str:
     """One-line "is the desk frozen because the *box* is overloaded?" for the
     hourly / daily report — the **#1 documented live pathology's** missing
@@ -5056,6 +5121,18 @@ def send_hourly_summary() -> bool:
     iox = _idle_opportunity_line(store)
     if iox:
         body += "\n" + iox
+    # ALPHA BLEED sits right AFTER IDLE — both compose
+    # build_decision_drought.current_drought, one dimension over.
+    # IDLE names *which signals* arrived during the dark window (article
+    # regret); ALPHA BLEED names *what the dark windows cost in alpha
+    # vs SPY* (involuntary_alpha_bleed_pct over every PARALYSIS drought).
+    # Both can be silent independently (silence-when-nothing-actionable);
+    # neither suppresses the other (a fresh STUCK wedge can have arrived
+    # signals AND no aggregate bleed yet; a sustained BLEEDING aggregate
+    # can sit on a healthy article window).
+    abx = _drought_alpha_bleed_line(store)
+    if abx:
+        body += "\n" + abx
     # News-breadth warning — fires ONLY on ECHO (a SURGING velocity that
     # is actually one wire mirrored across many feeds). Sits right after
     # IDLE because both read articles.db and both are silence-by-default;
@@ -5391,6 +5468,12 @@ def send_daily_close() -> bool:
     iox = _idle_opportunity_line(store)
     if iox:
         body += "\n" + iox
+    # ALPHA BLEED follows IDLE on daily close too — see send_hourly_summary
+    # for the IDLE→ALPHA-BLEED rationale (article regret vs. alpha cost,
+    # both composing build_decision_drought, independent silence).
+    abx = _drought_alpha_bleed_line(store)
+    if abx:
+        body += "\n" + abx
     smx = _source_mix_line(store)
     if smx:
         body += "\n" + smx
