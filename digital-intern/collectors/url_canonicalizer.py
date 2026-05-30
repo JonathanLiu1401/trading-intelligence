@@ -62,6 +62,20 @@ _TRACKING_EXACT = frozenset({
     "at_campaign", "at_custom1", "at_custom2", "at_custom3", "at_custom4",
     "at_link_origin", "ns_campaign", "ns_mchannel", "ns_source",
     "wt_mc", "WT.mc_id", "sr_share", "smid", "smtyp",
+    # Yahoo Finance syndication referrer markers — pure source-tracking, never
+    # content-addressing. Live evidence (2026-05-29): the same Barron's
+    # article "Micron Faces New Threat From Samsung's Memory Chip for AI"
+    # fired a BREAKING push 3× in 24h via referrer-param variants
+    # (?siteid=yhoof2&ypt=1 from yfinance/Barrons.com vs ?mod=md_home_pan_m
+    # from scraped/www.barrons.com — same /articles/<slug>-ac9a8e59 path).
+    "siteid", "ypt",
+    # Dow Jones (Barron's, WSJ, MarketWatch) module-referrer marker — names
+    # the section / module the user clicked from (mod=djhpsi, mod=md_home_pan_m,
+    # mod=home, etc). Pure click-origin tracking; same content, same slug.
+    # Safe to strip globally — if a non-DJN site ever uses ?mod= as a content
+    # selector, the article title in the id hash already differs, so this
+    # cannot wrongly collapse two distinct articles into one id.
+    "mod",
 })
 _TRACKING_EXACT_LOWER = frozenset(n.lower() for n in _TRACKING_EXACT)
 _TRACKING_PREFIXES = (

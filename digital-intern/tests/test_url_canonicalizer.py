@@ -105,6 +105,27 @@ def test_idempotent():
     assert once == "https://example.com/Story?id=9"
 
 
+def test_strips_dow_jones_and_yahoo_referrer_params():
+    """Live regression (2026-05-29): the same Barron's article
+    'Micron Faces New Threat From Samsung's Memory Chip for AI' fired a
+    BREAKING push 3× in 24h via referrer-param variants. The yfinance feed
+    delivered the URL with ?siteid=yhoof2&ypt=1; the scraped/www.barrons.com
+    feed delivered the SAME slug (/articles/...-ac9a8e59) with
+    ?mod=md_home_pan_m. Without stripping these three referrer markers the
+    canonical id diverges → three rows → three pushes for one article."""
+    base = "https://www.barrons.com/articles/micron-stock-price-samsung-memorychip-ai-ac9a8e59"
+    yahoo_variant = f"{base}?siteid=yhoof2&ypt=1"
+    barrons_variant = f"{base}?mod=md_home_pan_m"
+    bare = f"https://barrons.com/articles/micron-stock-price-samsung-memorychip-ai-ac9a8e59"
+    assert canonicalize_url(yahoo_variant) == bare
+    assert canonicalize_url(barrons_variant) == bare
+    # Article id collapses across both variants — this is what stops the
+    # duplicate-push.
+    title = "Micron Faces New Threat From Samsung's Memory Chip for AI"
+    assert canonical_article_id(yahoo_variant, title) == \
+        canonical_article_id(barrons_variant, title)
+
+
 def test_canonical_article_id_collapses_variants_and_matches_store_scheme():
     title = "Fed holds rates steady"
     a = canonical_article_id(
