@@ -117,6 +117,12 @@ def _attribution_for(scorer, rec: dict) -> dict | None:
             vol_ratio=rec.get("vol_ratio"), bb_pos=rec.get("bb_position"),
             news_urgency=rec.get("news_urgency"),
             news_article_count=rec.get("news_article_count"),
+            # Pass #36 OOS-parity fix: the deployed pickle carries non-zero
+            # weights for these 3 enhanced MACD features; omitting them
+            # would attribute on a degraded vector vs the gate's predict.
+            ema200_above=rec.get("ema200_above"),
+            hist_cross_up=rec.get("hist_cross_up"),
+            macd_below_zero_cross=rec.get("macd_below_zero_cross"),
         )
     except Exception:
         return None
