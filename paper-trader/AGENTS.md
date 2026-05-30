@@ -33375,3 +33375,188 @@ agents' edits to `paper-trader/paper_trader/dashboard.py`,
 plus the sibling Agent 1's session-doc additions and various new
 untracked sibling files); all left untouched per the
 concurrent-agent footgun memory. No `git add -A`.
+
+
+## 2026-05-29 — Agent 1 (paper-trader core) HYBRID review pass #2
+
+Persona: a portfolio manager who paged on a 6h "no trades" stretch wants
+to know IMMEDIATELY whether the engine is producing HOLD decisions
+(intentional sit-out — healthy) or producing only NO_DECISION rows
+(claude wedge — needs intervention). The hourly Discord summary today
+cannot distinguish the two on a stale-fill book.
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=3
+
+### Phase 1 — `fix:` bound git-watcher + pkill with subprocess timeouts (commit `986a6c2`)
+
+The git-watcher (`runner._git_watcher`) calls `subprocess.check_output(
+["git", "rev-parse", "HEAD"], cwd=REPO_ROOT)` with NO `timeout=` kwarg.
+A wedged git (work-tree mid-rebase with a crashed editor still holding
+`index.lock`; the USB-backed `data/` mount transiently stalled under
+load — both observed live for the digital-intern side) would block
+`check_output` *forever*, freezing the watcher thread. The
+deferred-restart-on-new-commits feature then silently dies: HEAD-change
+is never observed, and the `RESTART_GRACE_S=600` deadman path is only
+reachable AFTER a successful HEAD-change observation — so a committed
+fix never deploys. The 24h+ "still on stale code" runner pattern
+documented in earlier passes is exactly this failure mode.
+
+Same hazard for the breaker's `pkill` (`runner._kill_stale_claude`) —
+a hung pkill (zombie subprocess wedging /proc; a corrupted procfs node)
+would stall `_cycle` for the whole run, defeating the circuit-breaker's
+entire purpose.
+
+Fix adds two module-level constants:
+
+  * `_GIT_PROBE_TIMEOUT_S = 10.0` — wired into BOTH `subprocess.check_output`
+    sites in `_git_watcher`. 10s is generous slack for a slow-disk
+    healthy probe (git rev-parse is sub-second normally) without
+    permitting an unbounded hang.
+  * `_PKILL_TIMEOUT_S = 5.0` — wired into the breaker's `pkill` call.
+    Explicit `except subprocess.TimeoutExpired` so the sonnet pattern is
+    still attempted after the opus pattern times out (the sibling-pattern
+    invariant — neither half can short-circuit the other).
+
+`TimeoutExpired` propagates through the existing `except Exception` arms
+in both helpers, so the watcher / breaker degrade to the documented
+"skip-this-iteration no-op" exactly like every other transient failure.
+
+Tests (`tests/test_runner_subprocess_timeouts.py`, 5 cases):
+constants finite + positive, pkill call carries `timeout=`,
+`_kill_stale_claude` survives a TimeoutExpired from one pkill and still
+attempts the other, source-level static check pinning the 2
+check_output sites in `_git_watcher` both pass
+`timeout=_GIT_PROBE_TIMEOUT_S`.
+
+### Phase 2 — `feat:` ENGINE DECIDING? Discord line (commit `13be94e`)
+
+**The gap.** Two indistinguishable-looking states are operationally
+critical to tell apart:
+
+  1. Engine producing HOLD decisions (e.g. "MU → HOLD" because RSI is
+     overbought and the existing book has hard SL/TP doing its job) —
+     intentional sit-out, healthy.
+  2. Engine producing only NO_DECISION rows (claude wedge / quota /
+     host-saturation) — the documented IDLE_STORM regime: the loop is
+     cycling (the decisions table grows) but real decisions are not.
+
+Both register as "no fills for 6h+" → `_last_fill_line` says STATIC for
+both. The dashboard endpoint `/api/last-real-decision` exposes the
+right verdict (NEVER / FRESH / DELAYED / STALE) — but the operator
+lives in Discord and never opens the dashboard panel. The exact
+dashboard→Discord gap `_host_pulse_line` / `_capital_pulse_line` /
+`_last_fill_line` each closed one dimension over.
+
+**The builder.** `paper_trader/analytics/last_real_decision.py` (the
+SSOT, alongside the dashboard endpoint) takes a
+`store.last_real_decision()` row + wall clock + market_open flag and
+returns a stable shape with `state` / `headline` / parsed
+`verb`/`ticker`/`status` / `secs_since` / humanised `age`.
+
+**The Discord wiring.** `reporter._last_real_decision_line` is appended
+right after `_last_fill_line` in BOTH `send_hourly_summary` and
+`send_daily_close`. Silence-when-nothing-actionable: only NEVER /
+STALE surface; FRESH (engine deciding normally) and DELAYED (quiet
+hour) are suppressed so a healthy book adds no extra hourly noise.
+
+**Constant lockstep.** The cadence baseline (`OPEN_INTERVAL_S` /
+`CLOSED_INTERVAL_S`) and multipliers (`LAGGING_MULT` / `STALLED_MULT`)
+MUST stay in sync with `analytics.runner_heartbeat`. The leaf module
+re-declares them (cycle-hazard-safe) and a regression test
+(`test_constants_match_runner_heartbeat`) pins the equality so a future
+heartbeat retune is caught before the Discord verdict drifts from the
+dashboard's verdict on the same row.
+
+Tests (`tests/test_last_real_decision.py`, 23 cases):
+
+  * verdict ladder across NEVER / FRESH / DELAYED / STALE (incl. the
+    LAGGING boundary pinning the `>` vs `>=` choice);
+  * market_open vs closed produces different cadence baselines;
+  * action_taken parsing for the 4 documented row shapes
+    (`BUY NVDA → FILLED`, `HOLD MU → HOLD`, `BUY LITE → BLOCKED`,
+    `BUY_CALL NVDA → FILLED`);
+  * degrade-safe envelopes: unparseable timestamp → STALE, missing
+    action_taken → None verb/ticker/status, naive `now` accepted,
+    wall-clock step-back clamps to 0;
+  * constants match `runner_heartbeat`;
+  * reporter suppression contract: FRESH and DELAYED return `""`;
+    STALE / NEVER fire with the `**ENGINE DECIDING?**` block; store
+    fault and builder fault both degrade to `""` (the reporter
+    additive contract — never raise from a notification helper).
+
+### Phase 3 — Live trader findings (PM tour)
+
+1. **Discord delivery is DEGRADED.** `/api/notify-health` reads
+   `DEGRADED — 2 consecutive send failures, last OK never; last error:
+   openclaw timeout (60s)`. The operator's primary monitoring surface
+   is dark right now — every hourly/trade-alert/breaker-fire post is
+   silently timing out at the 60s subprocess bound. `restart_recommended`
+   stays False until ≥3 consecutive failures, but the channel is
+   already invisible. This is an environmental issue (openclaw daemon
+   / node interpreter / auth token) outside the code path; documenting
+   it so the operator knows to investigate `openclaw` independently.
+
+2. **Decision efficacy DEGRADED at 55% NO_DECISION over the last 20 cycles.**
+   `/api/runner-heartbeat` reads `DEGRADED — 55% of the last 20 cycles
+   were NO_DECISION (latest still produced a decision); decision
+   throughput is impaired but the engine is not wedged.` Consistent
+   with the documented chronic host-saturation pattern (AGENTS.md +
+   the memory entry on PT NO_DECISION host saturation). Alarm latches
+   are all CLEAR (no breaker fire, no quota outage), so this is
+   mid-cycle saturation rather than a full freeze. The new
+   `_last_real_decision_line` correctly suppresses (FRESH — last real
+   decision 25m ago is HOLD MU, within the 60m closed-market cadence).
+
+3. **Phase 1 fix already deployed; Phase 2 staged.**
+   `/api/build-info` reads `boot_sha=986a6c2 head_sha=13be94e stale=true`
+   (1 commit behind). The runner restarted onto the Phase 1 commit
+   (the timeout fix is live) and the Phase 2 feature is committed but
+   inactive until the git-watcher's next deferred-restart cycle picks
+   it up. The new ENGINE DECIDING? line will fire on the next
+   hourly/daily-close post-restart.
+
+Live book at session: $1180.95 total ($209.40 cash = 17.7%), 1 open
+position (MU at +$15.18 / +1.29% unrealized), +18.1% from the $1000
+start. The MU HOLD reasoning Opus produced ("RSI 78 overbought, BB
++0.98 upper band, MACD hist still bullish but stretched … hard SL/TP
+envelope is doing its job. No fresh urgent catalyst justifying a
+weekend reposition") is exactly the FRESH-HOLD state this pass's
+ENGINE DECIDING? line is built to leave silent — the engine is
+producing real decisions, just choosing to wait.
+
+### Test commands for this domain
+
+```bash
+# Just this pass's new tests
+python3 -m pytest tests/test_runner_subprocess_timeouts.py \
+                  tests/test_last_real_decision.py -v
+
+# Regression on the reporter / alarm-latch surfaces this pass touches
+python3 -m pytest tests/test_alarm_latch_hourly.py \
+                  tests/test_alarm_latch_headline.py \
+                  tests/test_core_dashboard_alarm_latches.py \
+                  tests/test_runner_subprocess_timeouts.py \
+                  tests/test_last_real_decision.py -v
+```
+
+### Staging
+
+Per-file pathspec across two commits:
+
+* **Phase 1**: `paper-trader/paper_trader/runner.py` (subprocess
+  timeouts on git-watcher + pkill) +
+  `paper-trader/tests/test_runner_subprocess_timeouts.py`.
+* **Phase 2**: `paper-trader/paper_trader/analytics/last_real_decision.py`
+  (new SSOT builder) +
+  `paper-trader/paper_trader/reporter.py` (the `_last_real_decision_line`
+  helper + hourly/daily wiring) +
+  `paper-trader/tests/test_last_real_decision.py`.
+* **Phase 4 (this section)**: `paper-trader/AGENTS.md` only.
+
+Working copy at start carried sibling agents' uncommitted changes to
+`paper_trader/ml/*` analyzers, `tests/test_*_skill.py`, the
+`digital-intern/...` side, plus untracked sibling files
+(`paper_trader/analytics/plan_execution_debt.py`, the
+`test_continuous_outcome_corpus_health_ledger.py` /
+`test_plan_execution_debt.py` test files); all left untouched per the
+concurrent-agent footgun memory. No `git add -A`.
