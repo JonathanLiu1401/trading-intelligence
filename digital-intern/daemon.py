@@ -86,6 +86,7 @@ from collectors.appstore_finance_ranks import collect_appstore_finance_ranks
 from collectors.crypto_fear_greed_collector import collect_crypto_fear_greed
 from collectors.binance_funding_collector import collect_crypto_funding
 from collectors.coingecko_collector import collect_coingecko
+from collectors.crypto_news_rss_collector import collect_crypto_news
 from collectors.defillama_tvl_collector import collect_defillama_tvl
 from collectors.earnings_surprise_collector import collect_earnings_surprises
 from collectors.earnings_iv_move import collect_earnings_iv_move
@@ -248,6 +249,7 @@ FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
 CRYPTO_FEAR_GREED_INTERVAL = 1800  # Crypto Fear & Greed (alternative.me) every 30min
 CRYPTO_FUNDING_INTERVAL   = 1800  # OKX perpetual funding rates every 30min
 COINGECKO_INTERVAL        = 1800  # CoinGecko crypto market snapshot every 30min
+CRYPTO_NEWS_RSS_INTERVAL  = 600   # CoinTelegraph/CoinDesk/Decrypt RSS every 10min
 DEFILLAMA_TVL_INTERVAL    = 3600  # DeFiLlama DeFi TVL signals every 60min
 EARNINGS_SURPRISE_INTERVAL = 900  # EPS beat/miss scanner every 15min
 EARNINGS_IV_MOVE_INTERVAL  = 1800 # IV-implied expected move pre-earnings every 30min
@@ -1659,6 +1661,28 @@ def coingecko_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(COINGECKO_INTERVAL)
+
+
+# ── Worker: Crypto News RSS (CoinTelegraph/CoinDesk/Decrypt) — every 10min ───
+def crypto_news_rss_worker(store: ArticleStore):
+    log.info("[crypto_news_rss_worker] started")
+    bo = Backoff("crypto_news_rss", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_crypto_news()
+            _ingest(store, articles, "crypto_news_rss")
+            try:
+                source_health.record_result("crypto_news_rss", len(articles))
+            except Exception as he:
+                log.warning(f"[crypto_news_rss_worker] source_health error: {he}")
+            _worker_last_ok["crypto_news_rss"] = time.time()
+            log.debug(f"[crypto_news_rss] cycle ok ({len(articles)} fetched)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[crypto_news_rss_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(CRYPTO_NEWS_RSS_INTERVAL)
 
 
 # ── Worker: DeFiLlama TVL — every 60min ──────────────────────────────────────
@@ -5256,6 +5280,7 @@ def main():
         ("crypto_fear_greed", crypto_fear_greed_worker),
         ("crypto_funding",   crypto_funding_worker),
         ("coingecko",        coingecko_worker),
+        ("crypto_news_rss",  crypto_news_rss_worker),
         ("defillama_tvl",    defillama_tvl_worker),
         ("earnings_surprise", earnings_surprise_worker),
         ("earnings_iv_move", earnings_iv_move_worker),
