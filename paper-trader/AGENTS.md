@@ -1,5 +1,226 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 core HYBRID pass #3 (Agent 1) — `_drought_alpha_bleed_line`
+
+Persona: a live trader watching a dashboard that says BLEEDING -6.56%
+alpha across 8 involuntary droughts and getting NO Discord page about
+it, because the existing breaker alarm path (5 consecutive
+NO_DECISIONs → `send_breaker_fired_alert`) silently dropped on every
+fire. Concrete operational question: **how does an operator who lives
+in Discord ever learn the engine is BLEEDING when the breaker latch is
+stuck at 0?**
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=6
+
+### Phase 1 — no fresh bug surfaced (`bugs_fixed = 0`)
+
+Read the required core files in full (`runner.py`, `reporter.py`,
+`signals.py`, `strategy.py`, `dashboard.py`, `market.py`, `store.py`).
+Inspected each for race conditions, off-by-one comparators, timezone
+math, exception swallowing, atomic-write hazards, and stale comments.
+Ran the focused core test slice (`test_core_market.py`,
+`test_core_runner.py`, `test_core_strategy.py`, `test_core_signals.py`,
+`test_core_reporter.py`, `test_core_store.py`) — 876 pass + 1 skip.
+
+After 30+ prior HYBRID review passes the surface bugs are guarded.
+One genuine *behavioural* gap surfaced but is too risky to land in a
+short hot-pass: when `send_breaker_fired_alert` returns False, the
+runner resets `_consecutive_no_decisions = 0` and leaves
+`_breaker_alert_active = False`, so the breaker has to climb back to
+the 5-cycle threshold (~2.5h under dynamic_interval cadence) before
+retrying — observed live as `breaker_outage_count: 0` across 16k
+seconds of wedge despite `notify_health verdict=DEGRADED`. Surfaced
+in Phase 3 #3 below; landing a retry-on-failure path is the natural
+follow-up after openclaw is back to non-rc=13. Honest `bugs_fixed=0`
+per the Phase 1 commit guard.
+
+### Phase 2 — `feat:` `_drought_alpha_bleed_line` (commit `572b8ea`)
+
+**The gap.** `/api/decision-drought` already computes
+`involuntary_alpha_bleed_pct` (aggregate alpha bled across every
+PARALYSIS drought) and the `BLEEDING` / `STUCK` verdicts that key off
+it. The dashboard sees this; the operator who lives in Discord never
+did. Live state at session: `verdict=BLEEDING`, aggregate bleed
+`-6.563%`, 8 PARALYSIS droughts, current drought 19.99h ongoing — yet
+the hourly summary surfaces only IDLE_STORM cause-code (via
+`_heartbeat_line`) and article regret (`_idle_opportunity_line`).
+Neither surfaces *what the dark windows cost in alpha*.
+
+Adjacent surfaces tell different stories:
+
+* `_heartbeat_line` (IDLE_STORM / DEGRADED) — diagnoses *why* the
+  engine isn't deciding, not *what it costs*.
+* `_idle_opportunity_line` (OK/regret) — surfaces *which signals*
+  arrived during the dark window, not *what missing them cost*.
+* `_no_decision_reasons_line` — sub-buckets the cause-codes; orthogonal
+  to cost.
+
+**The new helper** (`paper_trader/reporter.py::_drought_alpha_bleed_line`)
+composes `build_decision_drought` **verbatim** (SSOT, invariant #10 —
+verdict / verdict_reason are the builder's, never re-derived) and
+surfaces:
+
+* `BLEEDING` — `involuntary_alpha_bleed_pct ≤ -1.0%` aggregate across
+  PARALYSIS droughts (the builder's own threshold); prefix `🩸`.
+* `STUCK` — current drought is PARALYSIS and ≥3h long (the builder's
+  own threshold); prefix `⚠️`.
+* `OK` / `NO_DATA` / `NEVER_TRADED` (and any future builder addition)
+  stay silent — whitelist-only suppression, so the hourly never
+  becomes its own lying green light.
+
+**Discord wiring** — placed right after `_idle_opportunity_line` in
+both `send_hourly_summary` and `send_daily_close` (same drought
+source, orthogonal questions: regret vs cost). Pure store reads only,
+NO network (the Discord-path discipline — the `_idle_opportunity_line`
+/ `_heartbeat_line` precedent). Observational only (invariants
+#2/#12); any builder/store fault degrades to `""` (the
+`_recovery_line` / `_streak_line` precedent).
+
+**Live verdict on the deployed book**: 🩸 BLEEDING — `6.56% of alpha
+lost across 8 involuntary (parse-failure) droughts — the NO_DECISION
+problem is costing real performance`. The line will appear on the
+next hourly summary (next fire after 14:55 UTC) and persist until
+either the involuntary bleed recovers below -1.0% (i.e. the gate
+recovers OR an FILLED drought closes one of the PARALYSIS rows out of
+the trailing window) OR the verdict downgrades to STUCK / OK.
+
+**Tests** (`tests/test_drought_alpha_bleed.py`, 19 cases): verdict
+whitelist (`BLEEDING` / `STUCK` surface; `OK` / `NO_DATA` /
+`NEVER_TRADED` / unknown silent), prefix mapping, builder / store
+fault → `""`, missing / empty / whitespace-only / non-string
+verdict_reason → `""`, unknown-verdict → `""` (defensive whitelist),
+store-read limit pinning (3000 decisions / 5000 equity points matches
+`_idle_opportunity_line`). Plus 5 end-to-end through the real
+`build_decision_drought` driving BLEEDING / STUCK / OK / NEVER_TRADED
+/ empty scenarios — so a future builder refactor still keeps the
+surface contract.
+
+Commit: `572b8ea`. Auto-deployed by the git-watcher mid-pass (boot
+SHA on `/api/healthz` advanced from `032a321` → `572b8ea` within
+~3 min of push, observed via the heartbeat).
+
+### Phase 3 — Live validation findings (`user_findings = 6`)
+
+1. **BLEEDING active right now.** `/api/decision-drought` at session:
+   `verdict=BLEEDING`, `involuntary_alpha_bleed_pct=-6.563`, 8
+   PARALYSIS droughts, current drought 19.99h with `kind=PARALYSIS`
+   but `alpha_pct=+1.223%` (weekend cadence — SPY is flat too). The
+   aggregate bleed is the real signal; the current-drought alpha is
+   noise during a closed market.
+
+2. **IDLE_STORM since boot.** `/api/runner-heartbeat` shows the last
+   20 cycles ALL NO_DECISION (100% rate over the window). Dominant
+   cause `host_saturated` — the documented
+   `pt-no-decision-host-saturation` memory in real-time play. Last
+   real (FILLED/HOLD/BLOCKED) decision was 10h 11m ago.
+
+3. **Breaker silent-fail bug.** `/api/alarm-latches` reports
+   `breaker_outage_count: 0` across ~16k seconds of confirmed wedge.
+   The send must have been attempted at the 5-cycle threshold (the
+   notify_health DEGRADED state confirms openclaw rejections) but
+   when it returns False the runner resets `_consecutive_no_decisions
+   = 0` and leaves `_breaker_alert_active = False` — the breaker
+   has to climb back to 5 to retry (~2.5h under dynamic_interval).
+   The fix is a 3rd latch state (`PENDING_SEND`) that retries every
+   cycle until delivered; deferred to a focused commit when openclaw
+   is back to non-rc=13.
+
+4. **Discord delivery DEGRADED on openclaw rc=13.** `/api/notify-health`
+   recorded `rc=13: Warning: Detected unsettled top-level await at
+   file:///.../openclaw.mjs:393` — a Node async-import warning that
+   exits non-zero. Two consecutive send failures observed mid-session
+   before the runner restart on my commit cleared it back to HEALTHY.
+   External (openclaw) failure, not a paper-trader bug; flagged so
+   the next operator knows the symptom.
+
+5. **Plan-execution-debt actionable signal.** New endpoint
+   `/api/plan-execution-debt` (sibling agent) reports `cash_available
+   = $209.40`, `deployable = $188.46`, status `UNEXECUTED` on
+   MSFU at scorer verdict `STRONG_HOLD` (pred_5d_return +7.35%). The
+   scorer wants $188 deployed into MSFU; the engine has been wedged
+   since boot and never deployed it. A real trader-actionable gap
+   the alpha bleed line now ALSO surfaces from the alpha side.
+
+6. **Concentration HIGH.** `/api/risk` reports
+   `concentration_severity=HIGH`. Book is 82.27% MU (1 share @
+   $956.37, mark $971.55, P/L +$15.18, corridor_pos 0.717 — 1.39%
+   from hard-TP). The engine is sitting on a near-TP single-name
+   bet while wedged — if MU pops above $985.06 in the next session
+   the HARD_TP fires unattended, which (per
+   `/api/exit-trigger-pl-mix` from the sibling pass) IS the desk's
+   actual edge mechanism.
+
+### How the alpha-bleed surface composes (canonical mini-reference)
+
+```
+                         build_decision_drought
+                                  │
+                                  ▼
+                  ┌───────────────┴───────────────┐
+                  ▼                               ▼
+        verdict ∈ {OK, NO_DATA,         verdict ∈ {BLEEDING, STUCK}
+                  NEVER_TRADED, ...}              │
+                  │                               ▼
+                  ▼                  _drought_alpha_bleed_line returns
+            (silent — "")             "🩸|⚠️ **ALPHA BLEED** ◈ {V}\n> {R}"
+                                                  │
+                                                  ▼
+                              send_hourly_summary + send_daily_close
+                                                  │
+                                                  ▼
+                                          operator Discord
+```
+
+The verdict ladder is the builder's; this surface is purely a
+whitelist-suppressed render. `OK` / `NO_DATA` / `NEVER_TRADED` (the
+"no actionable signal" set) stay silent. `BLEEDING` and `STUCK` ship
+the builder's `verdict_reason` verbatim — `/api/decision-drought` and
+the Discord line can never disagree on what the desk is doing.
+
+### Test commands for this domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Just this pass's new tests (~18s, 19 cases).
+python3 -m pytest tests/test_drought_alpha_bleed.py -v
+
+# Verify reporter wiring + sibling tests still pass (~2min).
+python3 -m pytest tests/test_core_reporter.py \
+                  tests/test_drought_alpha_bleed.py \
+                  tests/test_decision_drought.py \
+                  tests/test_idle_opportunity.py \
+                  tests/test_win_rate_trend.py -q
+
+# Focused core slice (~55s, ~876 cases).
+python3 -m pytest tests/test_core_runner.py tests/test_core_market.py \
+    tests/test_core_store.py tests/test_core_signals.py \
+    tests/test_core_strategy.py tests/test_core_reporter.py -q
+```
+
+### Staging
+
+Per-file pathspec, two commits expected:
+
+* **Phase 2**: `paper-trader/paper_trader/reporter.py` (the
+  `_drought_alpha_bleed_line` helper + the hourly / daily-close
+  wiring) + `paper-trader/tests/test_drought_alpha_bleed.py` (new
+  test file). Commit `572b8ea`.
+* **Phase 4 (this section)**: `paper-trader/AGENTS.md` only.
+
+Working copy at start carried ~30+ sibling agents' uncommitted edits
+to `paper_trader/dashboard.py`, `paper_trader/ml/*` analyzer modules,
+5 `tests/test_*` files, the `digital-intern/` side, plus several
+untracked sibling additions (`paper_trader/analytics/exit_trigger_pl_mix.py`,
+`paper_trader/analytics/plan_execution_debt.py`,
+`paper_trader/analytics/sector_pl_history.py`,
+`paper_trader/ml/gate_health_trend.py`, `tests/test_continuous_outcome_corpus_health_ledger.py`,
+`tests/test_exit_trigger_pl_mix.py`, `tests/test_gate_health_trend.py`,
+`tests/test_plan_execution_debt.py`, `tests/test_sector_pl_history.py`);
+all left untouched per the concurrent-agent footgun memory. No
+`git add -A`.
+
+
 ## 2026-05-30 — Agent 2 (ML+backtests) HYBRID pass #3 — `sizing_rule_counterfactual`
 
 Persona: a quant researcher staring at a deployed gate whose
