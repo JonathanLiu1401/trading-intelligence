@@ -1,5 +1,253 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 — Agent 2 (ML+backtests) HYBRID review pass — `scorer_offdist_rate` gate-relevant OOD audit
+
+Persona: a quant researcher who relies on this ML and backtest stack to
+decide whether a strategy is worth real capital and is skeptical of
+anything uncalibrated, leaky, or silently broken.
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=8
+
+### Phase 1 (debug+fix): no real bugs found
+
+Ran the focused ML/backtest test slice (`test_decision_scorer.py`,
+`test_backtest.py`, `test_feature_alignment.py`,
+`test_outcome_corpus_health.py`, and the new `test_scorer_offdist_rate.py`
+— 217 tests total in 146s). All passing. The codebase has been through
+8+ prior review passes — every JSON writer uses atomic `tmp+.replace`,
+every cache loader has a `isinstance(x, dict|list)` type guard, every
+analyzer has the "never raises, degrades to honest gap" discipline.
+Surface bugs are improbable at this maturity. **bugs_fixed=0**, no
+Phase 1 commit per the brief's commit guard.
+
+(I did find ONE counting bug in my own draft of the new analyzer —
+in_distribution was double-subtracting the failed-AND-off-dist overlap;
+caught by a test I wrote before the code. Same class of failure the
+prior agent passes caught throughout. Fixed before commit; counts in
+Phase 2, not Phase 1.)
+
+### Phase 2 — `feat(ml): scorer_offdist_rate` (commit `8ebb3e1`)
+
+**The gap**: ``predict_with_meta`` exposes three trust flags for every
+prediction — ``failed`` (predict raised / non-finite raw), ``clamped``
+(raw exceeded ±``PRED_CLAMP_PCT``), and ``off_distribution`` (used by
+the live gate to ABSTAIN — see ``_ml_decide``'s
+``not scorer_off_dist`` guard). Whenever ``off_distribution=True`` the
+conviction gate SKIPS arm modulation entirely, so the gate's economic
+effect depends on the OOD rate against realized OOS. But no existing
+diagnostic surfaces that rate:
+
+* ``oos_parity_audit`` measures bias between gate-aligned and biased
+  prediction paths — orthogonal to "how often is the prediction even
+  trustworthy?"
+* ``gate_realized`` / ``gate_arm_kelly`` filter OOD rows into an
+  ``abstained`` bucket but don't expose the rate.
+* ``feature_importance`` / ``feature_alignment`` describe what the
+  model relies on — not how often its output is usable.
+
+The textbook quant question — *what fraction of OOS predictions does
+the deployed scorer trust, and how extreme are the rest?* — was
+invisible.
+
+**The analyzer** (`paper_trader/ml/scorer_offdist_rate.py`) bucketizes
+each OOS row's ``predict_with_meta`` envelope into ``failed`` /
+``clamped`` / ``off_distribution`` / ``in_distribution`` and reports:
+
+* per-bucket counts AND rates
+* raw-prediction distribution stats (min/p5/mean/p95/max) — lets a
+  reader see how far the model extrapolates past ±``PRED_CLAMP_PCT``
+* verdict ladder driven by ``off_dist_rate``:
+  * ``HEALTHY``           ≤ 5%
+  * ``MILD_OOD``       5%..25%
+  * ``SEVERE_OOD``    25%..50%
+  * ``GATE_DARK``         > 50% (gate abstains on more than half)
+  * ``INSUFFICIENT_DATA`` < 30 OOS rows, or scorer untrained
+* a separate ``has_failures`` flag — ANY non-zero ``failed_rate`` is a
+  code/data-shape investigation cue distinct from clamping
+
+**Live verdict on the deployed pickle's 1442-row OOS slice**: HEALTHY
+(13/1442 = 0.9% off-distribution; raw distribution -48.7 .. +171.5,
+p5/p95 -8.6/+15.9). The deployed scorer rarely extrapolates on the
+held-out slice — distinct from synthetic-input behaviour where a
+hand-built NVDA vector extrapolates to +258% raw.
+
+**Mirrors every sibling analyzer's contract**: pure read-only / never
+trains / never writes the pickle / never raises in analyzer functions
+(every fault degrades to ``INSUFFICIENT_DATA``). CLI pattern matches
+``gate_arm_kelly``: ``--all`` / ``--json`` / shell-gateable exit code.
+
+**Tests** (`tests/test_scorer_offdist_rate.py`, 22 cases): HEALTHY /
+MILD / SEVERE / GATE_DARK verdict boundaries pinned at threshold ±
+one row; ``INSUFFICIENT_DATA`` envelopes pinned for untrained /
+no-predict-with-meta / missing-file paths; failed-AND-off-dist
+overlap counted correctly (the test that caught the in_distribution
+double-subtraction bug in the draft); NaN/Inf raw values filtered
+from distribution stats; CLI smoke tests pin --json / human / exit
+codes.
+
+### Phase 3 — Live findings (quant-researcher tour)
+
+1. **Scorer OOS OOD rate is HEALTHY** (0.9% on the 1442-row OOS
+   slice). The deployed scorer trusts essentially every OOS
+   prediction in magnitude — distinct from the documented
+   synthetic-input behaviour (a hand-built NVDA vector extrapolates
+   to +258% → clamped to +50). Real held-out outcome rows are
+   in-distribution; live-trader feature vectors may drift further.
+
+2. **Gate has been killed every cycle of the deployed era**. Latest
+   `scorer_skill_log.jsonl` cycles all show
+   `gate_effectively_active=false`. Trailing-20-cycle median
+   `oos_buy_ic ≈ 0.00`, below +0.03 tolerance — the kill switch
+   correctly suppresses modulation. Critically, `gate_arm_kelly`
+   reports n_acted=0, n_abstained=1133 — **100%** of recent
+   captured OOS predictions carry `gate_off_dist=True`. The
+   per-arm Sharpe/Kelly analysis is uncomputable because no rows
+   are in the acted buckets at all.
+
+3. **DIRECTIONAL_BUT_BIASED is the persistent OOS verdict**. OOS
+   Spearman = +0.184 — real rank skill — but decile 10
+   (top predictions ~+21%) realizes only +2.63%; decile 1
+   (predictions ~-11%) realizes only -1.91%. Magnitudes are 4-5×
+   overestimated. The deployed ``label_quantiles`` /
+   ``pred_quantiles`` calibration tables fix this; readers should
+   surface `predict_calibrated` over raw `predict`.
+
+4. **MLP_NO_BETTER_THAN_TRIVIAL is also persistent**. Recent
+   `baseline_skill_log` rows: `oos_rmse_ratio = 1.366` (RMSE is 37%
+   WORSE than constant-mean predictor) AND `news_urgency` alone has
+   higher OOS rank-IC (+0.162) than the 20-feature MLP (+0.184 —
+   marginal +0.022 gap). The MLP's complexity buys ~zero edge over
+   one rule. A quant deciding whether to ship would NOT, even with
+   the calibrated magnitude.
+
+5. **`_llm_annotate_outcomes` is DARK in production**. `continuous.log`
+   carries `LLM annotation failed: "Could not resolve authentication
+   method. Expected one of api_key, auth_token, or credentials to
+   be set"` — the Anthropic SDK can't find a credential, so the
+   entire ENDORSE/CONDEMN labeling pipeline that drives
+   `llm_quality_label` (and the 3×/0.1× sample-weight multipliers
+   in `train_scorer`) is silently inert. Every recent
+   `decision_outcomes.jsonl` row carries `llm_quality_label=0`
+   (unlabeled). The sample-weight machinery in the trainer is
+   building empty branches.
+
+6. **News features are 2% populated** in training (143/7214 rows;
+   verdict `NEWS_FEATURES_DARK` per outcome_corpus_health). Yet
+   news_urgency is the strongest one-line baseline — there is real
+   signal in the 2% it sees, just structurally undertrained.
+
+7. **Bear regime is sparse** (57/7214 rows; per
+   outcome_corpus_health hint). Regime-conditional skill in bear
+   markets is structurally untrained; the most-recent
+   `scorer_skill_log` rows even report `oos_bear_n=0` / `oos_bear_ic=null`.
+
+8. **ml_quant per-run dispersion is enormous** — last 10 ml_quant
+   runs span -23% to +2462% on different windows. Skill signal is
+   dominated by leveraged-ETF variance; AGENTS.md's per-run-as-
+   leverage-luck warning is still load-bearing. The
+   `vs_spy_pct=-220` outlier on run 103584 is a 3-trade monkey run,
+   not ml_quant — easy to misread without filtering `model_id`.
+
+### How the ML/backtest stack works — refreshed mini-reference
+
+**DecisionScorer** (`paper_trader/ml/decision_scorer.py`):
+
+* 20-feature MLPRegressor (32, 16) with L2 alpha=1e-2 + early
+  stopping (anti-overfit retune, 2026-05-18). Features are 10 base
+  numeric + 3 enhanced MACD booleans + 7-way sector one-hot.
+* `predict_with_meta(...)` returns `{pred, raw, clamped,
+  off_distribution, percentile, calibrated, failed, gate_arm,
+  gate_arm_multiplier}`. The OOS verdict is
+  ``DIRECTIONAL_BUT_BIASED`` — trust the rank/calibrated value, not
+  the raw % magnitude.
+* `predict()` is the scalar fast path the gate uses.
+* `feature_contributions()` / `feature_group_contributions()` —
+  per-prediction signed attribution.
+* `feature_importance()` / `feature_group_importance()` — global
+  mean(|first-layer weight|).
+* `train_scorer(records, path=None)` — atomically rewrites
+  `data/ml/decision_scorer.pkl` with model + scaler +
+  pred_quantiles + label_quantiles. SELL records flip the label
+  sign.
+
+**Running backtests + diagnostics manually**:
+
+```bash
+# One-shot — 10 parallel runs
+python3 run_backtests.py
+
+# Continuous loop — 1 run per cycle, 10min cooldown
+python3 run_continuous_backtests.py
+
+# Read-only CLI: explain one scorer prediction
+python3 -m paper_trader.ml.decision_scorer \
+    --ticker NVDA --ml-score 3.5 --rsi 45 --mom5 2.0
+
+# OOS off-distribution rate audit (NEW this pass)
+python3 -m paper_trader.ml.scorer_offdist_rate
+python3 -m paper_trader.ml.scorer_offdist_rate --all --json
+
+# Per-arm Kelly + Sharpe diagnostic
+python3 -m paper_trader.ml.gate_arm_kelly
+
+# Compare MLP vs single-feature baselines
+python3 -m paper_trader.ml.baseline_compare
+
+# Aggregate gate counterfactual
+python3 -m paper_trader.ml.gate_pnl
+
+# Calibration / decile realized
+python3 -m paper_trader.ml.calibration --oos
+```
+
+**Interpreting results** (load-bearing reading order for a skeptical quant):
+
+1. `outcome_corpus_health` — is the input data sane (news populated,
+   regimes balanced, target std > 1.0pp)?
+2. `scorer_offdist_rate` (NEW) — does the scorer's predictions land
+   in-distribution on the OOS slice? GATE_DARK means the gate
+   abstains on most rows; SEVERE_OOD means the model is extrapolating
+   beyond its training support; HEALTHY means raw predictions are
+   trustworthy in magnitude.
+3. `calibration --oos` — is the rank skill real? Decile error tells
+   you whether to trust the raw % magnitude or only the rank.
+4. `baseline_compare` — does the MLP beat the best one-line rule?
+5. `gate_arm_kelly` / `gate_pnl` — do the gate's arm multipliers
+   realize differentiated economic outcomes?
+
+**Test commands for this domain**:
+
+```bash
+# Just the new analyzer (~12s)
+python3 -m pytest tests/test_scorer_offdist_rate.py -v
+
+# All ML + scorer + backtest (~145s under load)
+python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+    tests/test_feature_alignment.py tests/test_outcome_corpus_health.py \
+    tests/test_scorer_offdist_rate.py -q
+
+# All continuous-loop ledger tests
+python3 -m pytest tests/ -v -k "continuous and (skill or ledger)"
+
+# Just the DecisionScorer (~8s)
+python3 -m pytest tests/test_decision_scorer.py -v
+```
+
+### Staging
+
+Per-file pathspec, two commits expected:
+
+* **Phase 2**: `paper-trader/paper_trader/ml/scorer_offdist_rate.py` +
+  `paper-trader/tests/test_scorer_offdist_rate.py` (the new analyzer
+  + tests).
+* **Phase 4 (this section)**: `paper-trader/AGENTS.md` only.
+
+Working copy at start carried foreign uncommitted changes (sibling
+agents' edits to `paper_trader/ml/*` analyzer modules, plus
+digital-intern siblings); all left untouched per the
+concurrent-agent footgun memory. No `git add -A`.
+
+
 ## 2026-05-30 ML+backtest HYBRID pass (Agent 2) — dashboard OOS-parity fix + `feature_alignment` univariate-IC-vs-model-weight diagnostic
 
 **Counters:** bugs_fixed=7 · features_added=1 · user_findings=5
