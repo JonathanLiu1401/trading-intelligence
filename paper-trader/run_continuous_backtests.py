@@ -384,6 +384,50 @@ BOOTSTRAP_CI_N = 1000
 SECTOR_SKILL_LOG = ROOT / "data" / "sector_skill_log.jsonl"
 SECTOR_SKILL_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
 
+# Per-cycle outcome-corpus-health ledger. ``outcome_corpus_health.analyze``
+# (pass #2 / 2026-05-29) answers the *pre-model* data-quality question every
+# downstream model verdict implicitly assumes: *what is the training corpus
+# actually made of?* A reading quant interpreting ``MLP_WORSE_THAN_TRIVIAL``
+# or ``gate_effectively_active=False`` needs to know whether the verdict
+# reflects model weakness or data sparsity (e.g. ``news_urgency`` populated
+# in 1% of training rows means the model's news weights are structurally
+# dead-trained regardless of model architecture). The analyzer landed in
+# pass #2 as a CLI-only tool — until this wiring landed, the verdict
+# (``NEWS_FEATURES_DARK`` / ``ACTION_IMBALANCED`` / ``REGIME_BUCKETS_SPARSE``
+# / ``TARGET_DEGENERATE`` / ``INSUFFICIENT_DATA`` / ``HEALTHY``) was only
+# available via manual ``python3 -m paper_trader.ml.outcome_corpus_health``
+# invocation, exactly the operator-blind state every sibling
+# ``_append_*_skill_log`` ledger closed. Same testability rule as every
+# sibling skill log path constant (module-level so tests can redirect),
+# same best-effort discipline (a ledger write must never break the loop),
+# same atomic tmp + ``.replace`` trim idiom every sibling ledger uses.
+OUTCOME_CORPUS_HEALTH_LOG = ROOT / "data" / "outcome_corpus_health_log.jsonl"
+OUTCOME_CORPUS_HEALTH_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
+# Per-cycle feature-alignment ledger. ``feature_alignment.analyze``
+# (pass #3 / 2026-05-29) answers the architectural question every existing
+# ML/backtest diagnostic structurally cannot: *is the scorer weighting the
+# RIGHT features?* ``baseline_compare`` flags MLP_WORSE_THAN_TRIVIAL,
+# ``feature_importance`` reports which features the MODEL relies on, but
+# neither cross-checks the model's weights against the RAW per-feature
+# univariate rank-IC vs realized 5d return. Two distinct verdicts hide in
+# MLP_WORSE_THAN_TRIVIAL:
+#   * WEIGHTED_NOISE  — model top-weights a feature that has no
+#                       univariate edge → architecture is overfitting.
+#   * IGNORED_SIGNAL  — model bottom-weights a feature with real
+#                       univariate edge → architecture is failing to
+#                       extract signal that's there.
+# These have OPPOSITE remediation paths (raise L2 / drop feature vs.
+# inspect scaler / depth / alpha). The diagnostic landed in pass #3 as a
+# CLI-only analyzer; this ledger makes the verdict trendable per cycle so
+# a researcher can see whether an architecture tweak shifts the
+# WEIGHTED_NOISE / IGNORED_SIGNAL state cycle-over-cycle.
+# Same testability rule as every sibling skill log (module-level so tests
+# can redirect), same best-effort discipline (a ledger write must never
+# break the loop), same atomic tmp + ``.replace`` trim idiom.
+FEATURE_ALIGNMENT_LOG = ROOT / "data" / "feature_alignment_log.jsonl"
+FEATURE_ALIGNMENT_LOG_KEEP = 2000  # cap file growth (≈ one row per cycle)
+
 EARLIEST_WINDOW_START = date(1993, 2, 1)  # SPY inception — ~30+ years of history
 WINDOW_END_BUFFER_DAYS = 180  # never end a window within 6 months of today
 MIN_WINDOW_YEARS = 1
@@ -3771,6 +3815,384 @@ def _append_sector_skill_log(cycle: int, win_start: date, win_end: date,
         return False
 
 
+def _append_outcome_corpus_health_log(
+    cycle: int, win_start: date, win_end: date,
+    outcomes_path: "Path | str | None" = None,
+) -> bool:
+    """Append one structured row to the per-cycle outcome-corpus-health ledger.
+
+    Answers, durably and per-cycle, the *pre-model* data-quality question
+    every downstream model verdict implicitly assumes: *what is the training
+    corpus actually made of?* Every existing ML/backtest analyzer measures
+    something the model OUTPUTS (rank-IC / RMSE / dir-acc / gate-arm
+    distribution / calibration spearman / etc.); none surface the data
+    state that PRECEDES those readings. Concretely, the live production
+    state of ``MLP_WORSE_THAN_TRIVIAL`` co-existing with ``news_urgency``
+    populated in only 1% of training rows means the model is being read
+    as "weak" when the actual culprit is data starvation — a reading the
+    headline ``oos_ic`` / ``baseline_skill`` ledger CANNOT surface.
+
+    Mirrors the sibling ``_append_sector_skill_log`` /
+    ``_append_persona_skill_log`` discipline exactly:
+
+    * SSOT no-drift — reuses ``outcome_corpus_health.analyze`` (the same
+      path the CLI uses), so the persisted verdict equals the read-only
+      CLI's by construction. Any future analyzer change is automatically
+      reflected in the ledger.
+    * Honest gap rows — on any analyzer fault we still emit a row with
+      ``status='error' verdict='INSUFFICIENT_DATA' corpus_dark=True`` so
+      a gap in the trend is visible, not silent. ``INSUFFICIENT_DATA``
+      (corpus < ``MIN_RECORDS``) is itself surfaced as ``corpus_dark=True``
+      — that mirrors the sibling ``*_dark`` flags so a quant queueing
+      ``corpus_dark`` queries a single boolean across every ledger.
+    * Bounded growth — when the file exceeds 2× ``OUTCOME_CORPUS_HEALTH_LOG_KEEP``
+      it is atomically rewritten via the tmp+``.replace`` idiom.
+    * Never raises — a ledger write must NEVER break the continuous loop.
+
+    The ``corpus_dark`` boolean mirrors every sibling ``*_dark`` flag
+    (``signal_dark`` / ``gate_dark`` / ``stop_dark`` / etc.): True when
+    the analyzer could not produce a stable corpus-level reading —
+    either the corpus had < ``MIN_RECORDS`` rows (``INSUFFICIENT_DATA``)
+    OR the analyzer raised. False means the analyzer produced a verdict
+    a quant can read (HEALTHY or one of the negative verdicts).
+
+    Captures flat top-line fields a JSON consumer can query without
+    parsing the nested ``feature_density`` / ``regime_counts`` /
+    ``sector_counts`` / ``target`` blocks. Specifically the actionable
+    quantities a reading quant skims first:
+
+      * ``n_with_news`` / ``fraction_with_news`` — the single most
+        directly operational data state (the news-feature pipeline is
+        currently dark at ~1% — see ``NEWS_FEATURES_DARK``).
+      * ``target_mean`` / ``target_std`` — the realized
+        ``forward_return_5d`` distribution stats. Low std ⇒ scorer has
+        no variance to learn from (``TARGET_DEGENERATE``).
+      * ``top_sector`` / ``top_sector_share`` — leading sector by row
+        count (live state is tech ~89%). A reading quant tracking
+        whether sector concentration is shifting needs this trended.
+      * ``dominant_action`` / ``dominant_action_share`` — BUY vs SELL
+        imbalance. The minority class is data-limited.
+      * ``n_hints`` — count of negative verdicts surfaced. Crisp
+        zero-vs-nonzero trend signal.
+
+    The full ``feature_density`` / ``regime_counts`` / ``sector_counts``
+    / ``persona_counts`` / ``target`` / ``hints`` payloads still ship as
+    nested fields for forensics (bounded by the analyzer's own caps).
+
+    Returns True on a successful append, False on any handled fault.
+    """
+    try:
+        if outcomes_path is None:
+            outcomes_path = ROOT / "data" / "decision_outcomes.jsonl"
+        outcomes_path = Path(outcomes_path)
+        try:
+            from paper_trader.ml.outcome_corpus_health import (
+                analyze as _och_analyze,
+                MIN_RECORDS as _OCH_MIN_RECORDS,
+            )
+            rep = _och_analyze(outcomes_path=outcomes_path)
+        except Exception as exc:
+            rep = {
+                "status": "error",
+                "verdict": "INSUFFICIENT_DATA",
+                "n_total": 0,
+                "n_buys": 0,
+                "n_sells": 0,
+                "n_other_action": 0,
+                "n_with_news": 0,
+                "fraction_with_news": 0.0,
+                "regime_counts": {},
+                "sector_counts": {},
+                "persona_counts": {},
+                "feature_density": {},
+                "target": {"n": 0, "mean": None, "std": None,
+                           "min": None, "max": None, "p5": None, "p95": None},
+                "date_range_start": None,
+                "date_range_end": None,
+                "hints": [f"outcome_corpus_health unavailable: "
+                          f"{type(exc).__name__}"],
+            }
+            _OCH_MIN_RECORDS = 100  # local fallback
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA",
+                   "n_total": 0, "n_buys": 0, "n_sells": 0,
+                   "n_other_action": 0, "n_with_news": 0,
+                   "fraction_with_news": 0.0,
+                   "regime_counts": {}, "sector_counts": {},
+                   "persona_counts": {}, "feature_density": {},
+                   "target": {"n": 0, "mean": None, "std": None,
+                              "min": None, "max": None,
+                              "p5": None, "p95": None},
+                   "date_range_start": None, "date_range_end": None,
+                   "hints": []}
+
+        # ``corpus_dark`` mirrors sibling ``*_dark`` flags: True when no
+        # stable reading was possible (INSUFFICIENT_DATA covers both
+        # genuinely-tiny corpora AND analyzer faults that degraded to
+        # the same verdict). A HEALTHY corpus or any of the negative
+        # verdicts (NEWS_FEATURES_DARK / ACTION_IMBALANCED / etc.) all
+        # mean the analyzer produced a verdict a quant can read.
+        verdict = str(rep.get("verdict") or "INSUFFICIENT_DATA")
+        n_total = int(rep.get("n_total") or 0)
+        corpus_dark = bool(
+            verdict == "INSUFFICIENT_DATA" or n_total < _OCH_MIN_RECORDS
+            or rep.get("status") == "error"
+        )
+
+        n_buys = int(rep.get("n_buys") or 0)
+        n_sells = int(rep.get("n_sells") or 0)
+        # Dominant action — BUY vs SELL imbalance is a verdict-driving
+        # condition (ACTION_IMBALANCED at > 85% threshold), and the
+        # share is the operationally-meaningful number a quant trends.
+        # When both are zero (empty corpus) we surface None for clarity
+        # rather than picking an arbitrary default.
+        if n_buys + n_sells > 0:
+            if n_buys >= n_sells:
+                dominant_action: str | None = "BUY"
+                dominant_action_share: float | None = round(
+                    n_buys / (n_buys + n_sells), 4)
+            else:
+                dominant_action = "SELL"
+                dominant_action_share = round(
+                    n_sells / (n_buys + n_sells), 4)
+        else:
+            dominant_action = None
+            dominant_action_share = None
+
+        # Top sector by row count — flat for trend queries.
+        # ``sector_counts`` is a {name: count} dict from the analyzer;
+        # the live state is tech ~89% but a future watchlist shift could
+        # change that, and a quant skimming the dashboard wants the
+        # number front-and-center, not buried in a nested dict.
+        sector_counts = rep.get("sector_counts") or {}
+        if not isinstance(sector_counts, dict):
+            sector_counts = {}
+        top_sector: str | None = None
+        top_sector_share: float | None = None
+        if sector_counts and n_total > 0:
+            try:
+                top_pair = max(sector_counts.items(), key=lambda kv: kv[1])
+                top_sector = str(top_pair[0])
+                top_sector_share = round(int(top_pair[1]) / n_total, 4)
+            except (TypeError, ValueError):
+                top_sector = None
+                top_sector_share = None
+
+        # Flat target stats — same trend-without-nested-parsing rationale.
+        target_block = rep.get("target") or {}
+        if not isinstance(target_block, dict):
+            target_block = {}
+        target_mean = target_block.get("mean")
+        target_std = target_block.get("std")
+
+        hints = rep.get("hints") or []
+        if not isinstance(hints, list):
+            hints = []
+
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": verdict,
+            "n_total": n_total,
+            "n_buys": n_buys,
+            "n_sells": n_sells,
+            "n_other_action": int(rep.get("n_other_action") or 0),
+            "n_with_news": int(rep.get("n_with_news") or 0),
+            "fraction_with_news": (
+                round(float(rep.get("fraction_with_news") or 0.0), 4)
+            ),
+            "target_mean": target_mean,
+            "target_std": target_std,
+            "top_sector": top_sector,
+            "top_sector_share": top_sector_share,
+            "dominant_action": dominant_action,
+            "dominant_action_share": dominant_action_share,
+            "n_hints": len(hints),
+            "corpus_dark": corpus_dark,
+            "date_range_start": rep.get("date_range_start"),
+            "date_range_end": rep.get("date_range_end"),
+            "regime_counts": rep.get("regime_counts") or {},
+            "sector_counts": sector_counts,
+            "persona_counts": rep.get("persona_counts") or {},
+            "feature_density": rep.get("feature_density") or {},
+            "target": target_block,
+            "hints": hints,
+        }
+        OUTCOME_CORPUS_HEALTH_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with OUTCOME_CORPUS_HEALTH_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in
+                     OUTCOME_CORPUS_HEALTH_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > OUTCOME_CORPUS_HEALTH_LOG_KEEP * 2:
+                kept = lines[-OUTCOME_CORPUS_HEALTH_LOG_KEEP:]
+                tmp = OUTCOME_CORPUS_HEALTH_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(OUTCOME_CORPUS_HEALTH_LOG)
+        except Exception as e:
+            print(f"[continuous] outcome-corpus-health-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] outcome-corpus-health-log append failed: {e}")
+        return False
+
+
+def _append_feature_alignment_log(cycle: int, win_start: date,
+                                  win_end: date) -> bool:
+    """Append one structured row to the per-cycle feature-alignment ledger.
+
+    Answers the architectural question every existing ML diagnostic
+    structurally cannot: *is the scorer weighting the RIGHT features?*
+    Cross-tabs each numeric feature's univariate Spearman rank-IC
+    against the realized 5d return with the model's mean-|w| importance,
+    and reports one of:
+
+    * ``WEIGHTED_NOISE``    — top-weighted feature has bottom-quartile IC
+    * ``IGNORED_SIGNAL``    — top-IC feature has bottom-quartile weight
+    * ``ALIGNED``           — top-IC = top-weighted
+    * ``DEGENERATE``        — no feature has |IC| ≥ MIN_IC
+    * ``INSUFFICIENT_DATA`` — corpus < MIN_RECORDS
+
+    Mirrors every sibling ``_append_*_skill_log`` discipline:
+
+      * SSOT no-drift — reuses ``feature_alignment.analyze`` (same path
+        the CLI uses); the persisted verdict equals the read-only CLI's.
+      * Honest-gap rows — on any analyzer fault we emit a row with
+        ``status='error' verdict='INSUFFICIENT_DATA' alignment_dark=True``
+        so a gap in the trend is visible, not silent.
+      * Bounded growth — when the file exceeds 2× the keep cap it is
+        atomically rewritten via the tmp+``.replace`` idiom.
+      * Never raises — a ledger write must NEVER break the loop.
+
+    Captures flat top-line fields a JSON consumer can query without
+    parsing the nested per-feature block — specifically the actionable
+    quantities a quant skims first:
+
+      * ``n_features_with_signal`` — count of features with |IC| ≥
+        ``MIN_IC``. Crisp zero-vs-nonzero signal that the raw inputs
+        carry edge at all (the corollary of the DEGENERATE verdict).
+      * ``top_weighted_noise``    — feature names the analyzer flagged as
+        WEIGHTED_NOISE. Front-of-card trend so a researcher can see the
+        set churn cycle-by-cycle.
+      * ``top_ignored_signal``    — same shape, IGNORED_SIGNAL side.
+      * ``top_ic_feature`` / ``top_ic_value``   — the strongest
+        univariate signal in the corpus this cycle; the trend tells a
+        researcher whether the model's "what should I rely on" target
+        is stable.
+      * ``top_weight_feature`` / ``top_weight_value`` — the strongest
+        learned weight; pairs with top_ic_feature to make the alignment
+        verdict legible without parsing the nested array.
+
+    The full ``features`` array still ships nested for forensics.
+    """
+    try:
+        try:
+            from paper_trader.ml.feature_alignment import analyze as _fa_analyze
+            rep = _fa_analyze(oos_only=True)
+        except Exception as exc:
+            rep = {
+                "status": "error",
+                "verdict": "INSUFFICIENT_DATA",
+                "n": 0,
+                "slice": "temporal_oos",
+                "features": [],
+                "n_features_with_signal": 0,
+                "top_weighted_noise": [],
+                "top_ignored_signal": [],
+                "hint": (f"feature_alignment unavailable: "
+                         f"{type(exc).__name__}"),
+            }
+        if not isinstance(rep, dict):
+            rep = {"status": "error", "verdict": "INSUFFICIENT_DATA",
+                   "n": 0, "slice": "temporal_oos", "features": [],
+                   "n_features_with_signal": 0, "top_weighted_noise": [],
+                   "top_ignored_signal": [], "hint": ""}
+
+        verdict = str(rep.get("verdict") or "INSUFFICIENT_DATA")
+        n = int(rep.get("n") or 0)
+        # ``alignment_dark`` mirrors every sibling ``*_dark`` flag: True
+        # when no stable alignment reading was possible (INSUFFICIENT_DATA
+        # / DEGENERATE / analyzer error). False when the verdict is one
+        # of ALIGNED / WEIGHTED_NOISE / IGNORED_SIGNAL (actionable).
+        alignment_dark = bool(
+            verdict in ("INSUFFICIENT_DATA", "DEGENERATE")
+            or rep.get("status") == "error"
+        )
+
+        # Flat top-IC / top-weight fields for trend queries without
+        # nested parsing. Both are picked from the ``features`` list:
+        # the entry with the highest |univariate_ic| / model_importance.
+        features = rep.get("features") or []
+        if not isinstance(features, list):
+            features = []
+        finite_ic = [f for f in features
+                     if isinstance(f, dict)
+                     and f.get("univariate_ic") is not None]
+        finite_w = [f for f in features
+                    if isinstance(f, dict)
+                    and f.get("model_importance") is not None]
+        top_ic_feature: str | None = None
+        top_ic_value: float | None = None
+        if finite_ic:
+            top = max(finite_ic, key=lambda r: abs(r["univariate_ic"]))
+            top_ic_feature = str(top.get("feature") or "")
+            top_ic_value = round(float(top["univariate_ic"]), 4)
+        top_weight_feature: str | None = None
+        top_weight_value: float | None = None
+        if finite_w:
+            top = max(finite_w, key=lambda r: float(r["model_importance"]))
+            top_weight_feature = str(top.get("feature") or "")
+            top_weight_value = round(float(top["model_importance"]), 6)
+
+        row = {
+            "cycle": cycle,
+            "timestamp": _now(),
+            "window_start": win_start.isoformat(),
+            "window_end": win_end.isoformat(),
+            "status": rep.get("status"),
+            "verdict": verdict,
+            "n": n,
+            "slice": rep.get("slice"),
+            "n_features_with_signal": int(
+                rep.get("n_features_with_signal") or 0),
+            "top_weighted_noise": rep.get("top_weighted_noise") or [],
+            "top_ignored_signal": rep.get("top_ignored_signal") or [],
+            "top_ic_feature": top_ic_feature,
+            "top_ic_value": top_ic_value,
+            "top_weight_feature": top_weight_feature,
+            "top_weight_value": top_weight_value,
+            "alignment_dark": alignment_dark,
+            "features": features,
+            "hint": rep.get("hint") or "",
+        }
+        FEATURE_ALIGNMENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with FEATURE_ALIGNMENT_LOG.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+        # Bounded growth — only pay the rewrite when well past the cap.
+        try:
+            lines = [ln for ln in
+                     FEATURE_ALIGNMENT_LOG.read_text().splitlines()
+                     if ln.strip()]
+            if len(lines) > FEATURE_ALIGNMENT_LOG_KEEP * 2:
+                kept = lines[-FEATURE_ALIGNMENT_LOG_KEEP:]
+                tmp = FEATURE_ALIGNMENT_LOG.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(kept) + "\n")
+                tmp.replace(FEATURE_ALIGNMENT_LOG)
+        except Exception as e:
+            print(f"[continuous] feature-alignment-log trim failed: {e}")
+        return True
+    except Exception as e:
+        print(f"[continuous] feature-alignment-log append failed: {e}")
+        return False
+
+
 def _append_dead_feature_audit_log(cycle: int, win_start: date,
                                     win_end: date) -> bool:
     """Append one structured row to the per-cycle dead-feature-audit ledger.
@@ -4940,6 +5362,44 @@ def main() -> None:
         # via ``_spearman``). Best-effort by construction; never breaks
         # the loop.
         _append_sector_skill_log(cycle, win_start, win_end)
+
+        # Durable per-cycle outcome-corpus-health ledger. Pass #2 (2026-05-29)
+        # shipped ``outcome_corpus_health`` — the pre-model data-quality
+        # diagnostic that answers *what is the training corpus actually made
+        # of?* (verdict ladder: ``INSUFFICIENT_DATA`` / ``NEWS_FEATURES_DARK``
+        # / ``ACTION_IMBALANCED`` / ``REGIME_BUCKETS_SPARSE`` /
+        # ``TARGET_DEGENERATE`` / ``HEALTHY``) — but landed it as a CLI-only
+        # analyzer. Without this ledger, an operator reading
+        # ``MLP_WORSE_THAN_TRIVIAL`` cycle after cycle could not tell whether
+        # the verdict reflects model weakness or data starvation (live
+        # production state: ``news_urgency`` populated in only 1% of training
+        # rows means the gate's news weights are structurally dead-trained
+        # regardless of architecture). This wiring closes the gap mirroring
+        # every sibling ``_append_*_skill_log`` pattern. Reads the SAME
+        # ``decision_outcomes.jsonl`` ``baseline_skill`` / ``persona_skill``
+        # / ``sector_skill`` consume, so a quant can join cycle-to-cycle
+        # across the suite and read the data-state row next to the model-
+        # state row. Best-effort by construction; never breaks the loop.
+        _append_outcome_corpus_health_log(cycle, win_start, win_end)
+
+        # Durable per-cycle feature-alignment ledger. Pass #3 (2026-05-29)
+        # shipped ``feature_alignment`` — the architectural diagnostic
+        # that answers *is the scorer weighting the right features?* by
+        # cross-tabbing each numeric feature's univariate Spearman IC
+        # against the realized return with the model's mean-|w|
+        # importance. Verdict ladder (``WEIGHTED_NOISE`` /
+        # ``IGNORED_SIGNAL`` / ``ALIGNED`` / ``DEGENERATE`` /
+        # ``INSUFFICIENT_DATA``) separates the two distinct
+        # architectural failure modes that hide inside
+        # ``MLP_WORSE_THAN_TRIVIAL`` — they have OPPOSITE remediation
+        # paths (raise L2 / drop feature vs. inspect scaler / depth /
+        # alpha tradeoff), so trending which one fires per cycle is the
+        # decisive signal a researcher tuning the model needs. Reads the
+        # SAME ``decision_outcomes.jsonl`` every sibling ledger does and
+        # the SAME deployed pickle ``dead_feature_audit`` does, so a
+        # quant can join across the suite. Best-effort by construction;
+        # never breaks the loop.
+        _append_feature_alignment_log(cycle, win_start, win_end)
 
         # Durable per-cycle dead-feature audit of the just-retrained model.
         # Catches the pass-#35 class of bug systematically: a feature added
