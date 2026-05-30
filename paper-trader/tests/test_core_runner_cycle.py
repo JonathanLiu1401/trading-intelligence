@@ -394,6 +394,11 @@ class TestCircuitBreakerAlert:
         monkeypatch.setattr(runner, "_quota_alert_active", False)
         # Reset wedge-elapsed tracker so prior tests can't leak a stale ts.
         monkeypatch.setattr(runner, "_no_decision_first_ts", None)
+        # Session outage counters — module globals tracked across the
+        # session. Reset so per-test assertions on the COUNT (the new
+        # "delivered-only" edge counter) are deterministic.
+        monkeypatch.setattr(runner, "_breaker_outage_count", 0)
+        monkeypatch.setattr(runner, "_quota_outage_count", 0)
         alerts = {"fired": [], "send": []}
         # Capture elapsed_s too — runner now passes it as a kwarg so the
         # Discord body carries the real wall-clock wedge duration.
@@ -623,6 +628,100 @@ class TestCircuitBreakerAlert:
         self._run_no_decision_cycles(
             runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
         assert runner._breaker_alert_active is False
+
+    def test_failed_send_keeps_counter_at_threshold_for_immediate_retry(
+            self, breaker_setup, monkeypatch):
+        """A failed delivery must leave the counter AT threshold so the
+        next NO_DECISION cycle re-fires the breaker path immediately.
+
+        Bug-fix regression: the runner previously reset
+        ``_consecutive_no_decisions = 0`` UNCONDITIONALLY before the
+        send attempt. So when openclaw rc=13 dropped the alert (the
+        live 2026-05-30 case — `notify_health DEGRADED`,
+        `breaker_outage_count: 0` across 16k seconds of confirmed
+        wedge), the counter went to 0 and the breaker had to climb
+        5 MORE NO_DECISION cycles (~2.5h under dynamic_interval)
+        before retrying delivery. Holding the counter at threshold
+        on a failed send lets the very next NO_DECISION cycle re-trip
+        the breaker path and retry delivery within one tick."""
+        monkeypatch.setattr(runner.reporter, "send_breaker_fired_alert",
+                            lambda n, cause="", *, elapsed_s=None,
+                            store=None: False)
+        self._run_no_decision_cycles(
+            runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch)
+        assert runner._breaker_alert_active is False
+        # Counter stayed AT (or above) threshold — the fix.
+        assert (runner._consecutive_no_decisions
+                >= runner.CONSECUTIVE_NO_DECISION_LIMIT)
+        # Outage count was NOT incremented on a silent fire — the operator
+        # was never told, the count must not lie about being told.
+        assert runner._breaker_outage_count == 0
+
+    def test_failed_send_then_success_delivers_alert_on_next_cycle(
+            self, breaker_setup, monkeypatch):
+        """End-to-end: send fails on the 5th NO_DECISION cycle (counter
+        reaches threshold, latch stays False). The 6th NO_DECISION cycle
+        re-trips the breaker condition immediately (because the counter
+        was NOT reset on the failed send) and the second delivery attempt
+        succeeds — the operator gets the alert one cycle late, not
+        ``CONSECUTIVE_NO_DECISION_LIMIT * dynamic_interval`` late.
+
+        Pins the contract that an openclaw blip costs the operator at most
+        ONE extra cycle of silence, not ~2.5 hours."""
+        delivered = {"calls": 0}
+
+        def _flaky_send(n, cause="", *, elapsed_s=None, store=None):
+            delivered["calls"] += 1
+            # First attempt fails, second succeeds.
+            ok = delivered["calls"] > 1
+            if ok:
+                # Append to the fired log so the existing assertion shape
+                # still applies (1 successful delivery).
+                breaker_setup["fired"].append((n, cause, elapsed_s))
+            return ok
+
+        monkeypatch.setattr(
+            runner.reporter, "send_breaker_fired_alert", _flaky_send
+        )
+        # First 5 cycles → threshold hit, send fails, latch stays False,
+        # counter stays at threshold.
+        self._run_no_decision_cycles(
+            runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch
+        )
+        assert delivered["calls"] == 1
+        assert runner._breaker_alert_active is False
+        assert (runner._consecutive_no_decisions
+                >= runner.CONSECUTIVE_NO_DECISION_LIMIT)
+        assert len(breaker_setup["fired"]) == 0
+        # 6th NO_DECISION cycle → counter still ≥ threshold, breaker re-trips,
+        # delivery succeeds, latch arms, counter resets.
+        self._run_no_decision_cycles(1, monkeypatch)
+        assert delivered["calls"] == 2
+        assert runner._breaker_alert_active is True
+        assert runner._consecutive_no_decisions == 0
+        # Outage count incremented exactly once (the delivered attempt).
+        assert runner._breaker_outage_count == 1
+        assert len(breaker_setup["fired"]) == 1
+
+    def test_already_latched_breaker_resets_counter(self, breaker_setup,
+                                                     monkeypatch):
+        """When the latch is ALREADY active (a previous outage delivered),
+        the counter still resets on breaker-trip — the dedupe path doesn't
+        attempt a second send, and the counter must not bleed across the
+        latched cycles. Pins that the new counter-reset discipline doesn't
+        break the established dedupe contract."""
+        # Arm the latch as if a prior outage already delivered.
+        monkeypatch.setattr(runner, "_breaker_alert_active", True)
+        monkeypatch.setattr(runner, "_breaker_outage_count", 1)
+        self._run_no_decision_cycles(
+            runner.CONSECUTIVE_NO_DECISION_LIMIT, monkeypatch
+        )
+        # No NEW alert (dedupe path) and counter reset to 0.
+        assert len(breaker_setup["fired"]) == 0
+        assert runner._consecutive_no_decisions == 0
+        assert runner._breaker_alert_active is True
+        # Outage count NOT incremented — we didn't send a new alert.
+        assert runner._breaker_outage_count == 1
 
     def test_alert_carries_cause_suffix(self, breaker_setup, monkeypatch):
         """The Discord alert body carries the cause code so the operator

@@ -991,7 +991,6 @@ def _cycle():
                     f"claude processes to auto-recover"
                 )
                 _kill_stale_claude()
-                _consecutive_no_decisions = 0  # reset after intervention
                 # The breaker historically fired silently — only operator
                 # signal was a stdout WARNING line nobody tails. Surface it
                 # to Discord (the documented "primary surface"). Dedupe
@@ -999,8 +998,29 @@ def _cycle():
                 # wedge, cleared on the next real decision. A latched
                 # second breaker fire inside the same outage stays silent
                 # so a long wedge doesn't flood the channel.
-                if not _breaker_alert_active:
+                #
+                # COUNTER-RESET DISCIPLINE: the counter is reset ONLY when
+                # the operator was actually told (alert delivered) OR the
+                # latch already says they were told. A delivery FAILURE
+                # (openclaw rc=13 on the unsettled top-level-await warning,
+                # `notify_health DEGRADED`) historically zeroed the counter
+                # before the send attempt — so a failed send forced the
+                # breaker to climb 5 more NO_DECISION cycles (~2.5h under
+                # dynamic_interval) before retrying delivery. Observed live
+                # 2026-05-30: `breaker_outage_count: 0` across ~16k seconds
+                # of confirmed wedge while `notify_health verdict=DEGRADED`.
+                # Holding the counter at threshold lets the NEXT NO_DECISION
+                # cycle re-trip the breaker condition and retry delivery
+                # immediately. ``_kill_stale_claude`` is idempotent (pkill
+                # against an already-empty match returns rc=1 and no-ops),
+                # so re-firing it next cycle is safe.
+                if _breaker_alert_active:
+                    # Already alerted this outage; standard dedupe path —
+                    # the operator was told, no retry needed.
+                    _consecutive_no_decisions = 0
+                else:
                     cause = _no_decision_cause(summary)
+                    alert_delivered = False
                     try:
                         # Pass the store so the alert body carries a
                         # one-line snapshot of what the unattended book
@@ -1010,19 +1030,25 @@ def _cycle():
                         # Store fetch is best-effort: any fault inside
                         # _book_exposure_line degrades to the legacy
                         # no-context body (helper returns ``""``).
-                        if reporter.send_breaker_fired_alert(
+                        alert_delivered = bool(reporter.send_breaker_fired_alert(
                             fired_at, cause, elapsed_s=elapsed_s,
                             store=get_store(),
-                        ):
-                            _breaker_alert_active = True
-                            # Same edge-counting discipline as
-                            # ``_quota_outage_count`` (runner.py quota arm):
-                            # only count delivered alerts so the operator-
-                            # visible count never disagrees with what they
-                            # actually saw on Discord.
-                            _breaker_outage_count += 1
+                        ))
                     except Exception as e:
                         print(f"[runner] breaker alert failed: {e}")
+                    if alert_delivered:
+                        _breaker_alert_active = True
+                        # Same edge-counting discipline as
+                        # ``_quota_outage_count`` (runner.py quota arm):
+                        # only count delivered alerts so the operator-
+                        # visible count never disagrees with what they
+                        # actually saw on Discord.
+                        _breaker_outage_count += 1
+                        _consecutive_no_decisions = 0
+                    # Else: leave counter at threshold so the next
+                    # NO_DECISION cycle re-fires the alert path. The
+                    # operator-visible outage count stays at the
+                    # delivered total — silent fires never inflate it.
             # Defensive cleanup of ``_quota_first_ts`` on the NON-quota
             # NO_DECISION branch. Symmetry gap with the recovery branch
             # (runner.py:1051): without this, an orphaned ``_quota_first_ts``
