@@ -11,6 +11,7 @@ Standalone:  python3 -m analytics.hourly_runner
 from __future__ import annotations
 
 import json
+import math
 import sys
 import time
 import traceback
@@ -19,7 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 OUT_PATH = Path("/home/zeph/logs/hourly_analytics_run.json")
-TASK_TIMEOUT = 60  # seconds per module
+TASK_TIMEOUT = 60   # seconds per individual module
+MAX_WORKERS = 4
 
 
 def _run_module(name: str, fn) -> tuple[str, bool, str]:
@@ -80,6 +82,9 @@ def main() -> int:
         ("active_ticker_dashboard",   "analytics.active_ticker_dashboard",   "main"),
         ("regulatory_entity_surge",   "analytics.regulatory_entity_surge",   "main"),
         ("triple_score_consensus",    "analytics.triple_score_consensus",    "main"),
+        ("recency_decay",             "analytics.recency_decay",             "main"),
+        ("portfolio_overlap_scorer",  "analytics.portfolio_overlap_scorer",  "main"),
+        ("ticker_resurrection",       "analytics.ticker_resurrection",       "main"),
     ]
 
     for short_name, mod_path, fn_name in module_specs:
@@ -93,33 +98,42 @@ def main() -> int:
     ok_count = 0
     fail_count = 0
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        future_map = {
-            pool.submit(_run_module, name, fn): name
-            for name, fn in tasks.items()
-            if fn is not None
-        }
+    runnable = {name: fn for name, fn in tasks.items() if fn is not None}
+    # Total wall-clock budget: ceil(n / workers) rounds × per-task timeout + 30s buffer
+    total_timeout = math.ceil(len(runnable) / MAX_WORKERS) * TASK_TIMEOUT + 30
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:  # noqa: SIM117
+        future_map = {pool.submit(_run_module, name, fn): name for name, fn in runnable.items()}
         # Record import failures immediately
         for name, fn in tasks.items():
             if fn is None:
                 results.append({"module": name, "ok": False, "detail": "import failed"})
                 fail_count += 1
 
-        for future in as_completed(future_map, timeout=TASK_TIMEOUT + 5):
-            try:
-                name, ok, detail = future.result(timeout=TASK_TIMEOUT)
-            except FutureTimeout:
-                name = future_map[future]
-                ok, detail = False, "timeout"
-            except Exception as exc:
-                name = future_map[future]
-                ok, detail = False, str(exc)[:120]
+        try:
+            for future in as_completed(future_map, timeout=total_timeout):
+                try:
+                    name, ok, detail = future.result(timeout=TASK_TIMEOUT)
+                except FutureTimeout:
+                    name = future_map[future]
+                    ok, detail = False, "timeout"
+                except Exception as exc:
+                    name = future_map[future]
+                    ok, detail = False, str(exc)[:120]
 
-            results.append({"module": name, "ok": ok, "detail": detail})
-            if ok:
-                ok_count += 1
-            else:
-                fail_count += 1
+                results.append({"module": name, "ok": ok, "detail": detail})
+                if ok:
+                    ok_count += 1
+                else:
+                    fail_count += 1
+        except FutureTimeout:
+            # Mark any futures that never completed
+            done_names = {r["module"] for r in results}
+            for fut, name in future_map.items():
+                if name not in done_names:
+                    results.append({"module": name, "ok": False, "detail": "outer-timeout"})
+                    fail_count += 1
+                    fut.cancel()
 
     results.sort(key=lambda r: r["module"])
 
