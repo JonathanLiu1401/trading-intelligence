@@ -5,6 +5,132 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-30 HYBRID pass (Agent 3 fourth rotation) — hackernews source-cred fix + non-English title pre-floor
+
+**Persona:** debugger + feature developer + news-analyst consumer.
+
+**Counters:** `bugs_fixed=1`, `features_added=1`, `user_findings=7`.
+
+### Phase 1 — fix (`ml/features.py`)
+
+`hackernews` had no entry in `SOURCE_CRED`, so it defaulted to `DEFAULT_SOURCE_CRED` (0.55) — above
+the 0.45 `ALERT_MIN_LONE_SOURCE_CRED` bar. Lone hackernews articles the ML urgency head
+over-scored fired full 🚨 BREAKING pushes to the analyst's Discord channel.
+
+**Live evidence** (`articles.db` urgency=2 set, 7d window):
+
+```
+2026-05-30 18:04Z  ml=9.23  "Microcode inside the Intel 8087 floating-point chip: register exchange"
+2026-05-26 04:15Z  ml=9.64  "Free PDF earnings method – PDFEARN.BLOGSPOT.COM"
+2026-05-25 21:59Z  ml=9.00  "Nvidia Rides Blistering Chip Sales to Another Record Quarter"
+```
+
+2 of 3 alerts were pure tech-curio / spammy noise (only the 3rd was legitimate news, and that one
+was independently corroborated by ~6 wire copies). Tier with `reddit`/`nitter` at 0.40 so lone noise
+is suppressed but corroborated stories (`dup_count > 1`) still pass.
+
+**Pinned by `tests/test_features.py::test_hackernews_below_lone_alert_cred_bar`** — asserts
+`_source_credibility("hackernews") < ALERT_MIN_LONE_SOURCE_CRED` AND that it tier-matches
+`reddit`, so any future SOURCE_CRED reshuffle that lifts hackernews back above the gate fails the
+test.
+
+### Phase 2 — feature (`watchers/non_english_filter.py`)
+
+PR Newswire / GlobeNewswire / GDELT fire multi-language press-release copies of the same
+corporate announcement (English + Spanish + French + Portuguese + German). The ML urgency head
+over-scores the foreign-language copies to `ml_score >= 9` because it has no language-ID prior.
+
+**Live evidence** (30d urgency>=2 audit on the consumer's `articles.db`): 5 of 8 PR Newswire
+BREAKING alerts that fired on Discord were non-English wire copies:
+
+```
+2026-05-29 14:32  ES  "Arasan Chip Systems anuncia la primera solución IP Sureboot™..."
+2026-05-29 14:19  DE  "Arasan Chip Systems kündigt branchenweit erste Sureboot™ Total..."
+2026-05-29 14:19  FR  "Arasan Chip Systems annonce la première solution IP Sureboot™..."
+2026-05-27 15:35  PT  "Nvidia gastará US$ 150 bilhões por ano em Taiwan, diz CEO"
+2026-05-27 11:30  FR  "CordenPharma acquiert AmbioPharm pour accroître sa capacité mondiale..."
+```
+
+Same retrospective-noise class as `_looks_like_quote_widget` / `_looks_like_recap_template` /
+`_looks_like_stocktwits_chatter`: pure title-fingerprint discriminator, defense-in-depth at the
+pre-floor stage.
+
+**New module** `watchers/non_english_filter.py` implements a two-signal AND discriminator
+(accent-anchored / non-English-unique stopword AND a Latin-extended diacritic anywhere in the
+title) so English headlines with one accented proper noun ("São Paulo", "Volkswagen Münster",
+"Beyoncé tour") survive — pinned by `tests/test_non_english_filter.py::TestEnglishHeadlinesSurvive`.
+
+Wired into `storage.article_store.prefloor_pseudo_articles` as a fourth pre-floor gate so
+foreign-language rows get `ml_score=0.01, urgency=0, score_source='ml'` before they can reach
+`urgency=1` — same code path the three existing gates use. The integration test
+`TestPrefloorWiresNonEnglish::test_non_english_row_is_prefloored` pins the wiring (drop the gate
+from `prefloor_pseudo_articles` and the test fails on the missing `n_pre == 1` assertion).
+
+**Single source of truth design**: the new module is intentionally NOT in `alert_agent.py` (which
+is being concurrently modified by another agent — same-role staging race per `MEMORY.md`
+`pt-concurrent-samerole-staging-race`). The alert-side mirror can be added later without a
+circular import; the pre-floor at the ML scoring stage is sufficient to keep these rows out of
+the alert queue entirely because urgency=0 is the terminal state.
+
+**Tests**: 15 in `tests/test_non_english_filter.py` — 5 live failure-class headlines as
+MUST-SUPPRESS, 7 must-survive English headlines (including accented proper nouns), 2 partition
+helpers, 1 integration test.
+
+### Phase 3 — analyst-perspective findings
+
+1. **ML-only alert dominance (72%)**: 23 of 32 `urgency=2` alerts in the last 24h had `ai_score=0`
+   and were ML-only (`score_source='ml'`). The LLM validates only 28% of alerts — the model is
+   firing more aggressively than the LLM would. A calibration tracking surface (cross-checking
+   `ml_score>=8 AND ai_score>=8` recovery rate per source) would surface drift before it leaks
+   into Discord pushes. Already partially covered by `analytics/alert_source_breakdown.py` —
+   the consumer-facing layer would be the right next step.
+
+2. **FRED API timeout storm (`fred.stlouisfed.org`)**: `yield_curve_collector` and
+   `fred_production_collector` both timing out on DGS10/DGS2/PCEPILFE within minutes of daemon
+   restart (`logs/daemon.log` 2026-05-30 21:40-21:45Z). Likely upstream rate-limit / network
+   issue; macro features will be stale until it recovers.
+
+3. **FINRA margin 403 Forbidden**: `finra.org/investors/learn-to-invest/...margin-statistics`
+   blocked — needs a real User-Agent string or the collector needs to swap to the BrokerCheck
+   API. Chronic; not fixed today.
+
+4. **BLS `REQUEST_NOT_PROCESSED` across CPI/unemployment/payrolls/PPI**: multiple BLS series
+   failing simultaneously. Suspect daily quota exhaustion or auth lapse. The macro feature
+   pipeline (`fred_collector`, `bls_collector`) is downstream of the same chronic outage class
+   as `polygon` / `newsapi` / `nitter` (`MEMORY.md` `di-chronic-dark-collectors`).
+
+5. **`aaii_sentiment` parse failure**: `[aaii_sentiment] failed to parse sentiment data` — the
+   AAII weekly survey scraper is broken. Not catastrophic (weekly cadence) but the weekly
+   trend feature is dark.
+
+6. **Long-form stocktwits multi-$TICKER posts firing BREAKING despite the chatter gate**: titles
+   like `"$QQQ $SPY $SOXX $SOXL $TQQQ\n\nAfter latest price cuts Deepseek..."` are >80 chars so
+   the `_looks_like_stocktwits_chatter` `_STOCKTWITS_CHATTER_TITLE_MAX = 50` ceiling misses them.
+   ML over-scores to 9.97 and the 0.30 stocktwits cred should suppress via the lone-source gate
+   but 2 such rows still reached `urgency=2` in the last 24h. Suggests the dup_count corroboration
+   path is admitting them — out of scope for this rotation, but a candidate for a future
+   "starts-with-3+-cashtags" pre-floor variant.
+
+7. **Soft analyst commentary firing as BREAKING**: e.g. `"Be pragmatic about chip investing,
+   'don't get greedy', says Requisite's Bryn Tal"` — opinion piece, ML over-scored 9.93,
+   alerted at 18:10Z. Not breaking news. No clean recap-template fingerprint catches it (it's
+   not a "Why X Stock Is Trading Down Today" pattern). Candidate for a future "X says ..."
+   opinion-piece-attribution gate.
+
+### Phase 4 — wider context
+
+Concurrent agents are editing `analysis/claude_analyst.py`, `dashboard/web_server.py`, and
+`watchers/alert_agent.py` (per `git status`); untracked WIP from siblings in
+`analysis/wire_stance.py`, `analytics/ml_ai_divergence.py`, `collectors/{earnings_transcript,
+financial_stress,treasury_auction_results}_collector.py`, `tests/test_{alert_fund_stake_delta,
+wire_stance}.py`. All left exactly as-is. No `git add -A` (concurrent-agent staging-race
+footgun per `MEMORY.md` `pt-concurrent-samerole-staging-race`). Staged my own two commits by
+explicit pathspec only: `b1b2234` (Phase 1, `ml/features.py` + `tests/test_features.py`) and
+`463db8d` (Phase 2, `storage/article_store.py` + `watchers/non_english_filter.py` +
+`tests/test_non_english_filter.py`). Both pushed.
+
+---
+
 ## 2026-05-30 HYBRID pass (Agent 3 third rotation) — un_news_worker bo.advance() fix + never_delivered_collector_audit
 
 **Persona:** debugger + feature developer + news-analyst consumer.
