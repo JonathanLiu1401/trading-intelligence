@@ -3217,7 +3217,7 @@ def worldbank_worker(store: ArticleStore):
 def un_news_worker(store: ArticleStore):
     log.info("[un_news_worker] started")
     bo = Backoff("un_news", base=60.0, cap=900.0)
-    while True:
+    while _running:
         try:
             articles = collect_un_news()
             _ingest(store, articles, "un_news")
@@ -3230,7 +3230,8 @@ def un_news_worker(store: ArticleStore):
             bo.reset()
         except Exception as e:
             log.warning(f"[un_news_worker] error: {e}; backing off {bo.peek():.0f}s")
-            bo.advance()
+            bo.sleep(lambda: _running)
+            continue
         _sleep(UN_NEWS_INTERVAL)
 
 
