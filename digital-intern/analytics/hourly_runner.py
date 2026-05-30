@@ -86,6 +86,7 @@ def main() -> int:
         ("recency_decay",             "analytics.recency_decay",             "main"),
         ("portfolio_overlap_scorer",  "analytics.portfolio_overlap_scorer",  "main"),
         ("ticker_resurrection",       "analytics.ticker_resurrection",       "main"),
+        ("weekend_position_brief",    "analytics.weekend_position_brief",    "main"),
     ]
 
     for short_name, mod_path, fn_name in module_specs:
