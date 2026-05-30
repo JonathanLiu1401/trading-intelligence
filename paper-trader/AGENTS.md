@@ -1,5 +1,253 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 core HYBRID pass #4 (Agent 1) — breaker FIRED retry-on-failure + `_plan_execution_debt_line`
+
+Persona: a live trader who, on the previous pass, found
+`/api/notify-health` DEGRADED (openclaw rc=13) AND
+`/api/alarm-latches` reporting `breaker_outage_count: 0` across ~16k
+seconds of confirmed wedge — the operator was being told NOTHING
+about a multi-hour silent NO_DECISION storm because the breaker
+FIRED-alert delivery kept failing and the counter zeroed before
+retry. AND now the engine is sitting on $209 cash while the gate's
+plan says deploy $188 into FNGD at +11.76% pred — the
+DISCONNECTED verdict is on `/api/plan-execution-debt`, invisible to
+the operator on Discord. Two distinct dashboard→Discord visibility
+gaps in one session.
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=6
+
+### Phase 1 — fix: breaker FIRED retry-on-failure (commit `98c4f26`)
+
+**The bug.** `runner._cycle`'s breaker arm zeroed
+`_consecutive_no_decisions` UNCONDITIONALLY before attempting
+`reporter.send_breaker_fired_alert`. So when openclaw rc=13
+dropped the alert (live evidence: `notify_health verdict=DEGRADED`
+on `rc=13: Warning: Detected unsettled top-level await at
+file:///.../openclaw.mjs:393`), the counter went to 0, the latch
+stayed False, and the breaker had to climb 5 MORE NO_DECISION
+cycles (~2.5h under `dynamic_interval`) before retrying delivery.
+The operator was silently blind during a wedge for hours — the
+exact pathology the breaker exists to PREVENT, defeated by its
+own delivery failure mode.
+
+**The fix.** Counter resets ONLY when:
+
+* The latch is ALREADY active (dedupe path — operator was told,
+  no retry needed), OR
+* The current send succeeded (alert delivered, latch flipped
+  True, count incremented).
+
+A failed send holds the counter at threshold so the NEXT
+`NO_DECISION` cycle re-trips the breaker condition and retries
+delivery within ONE tick (≤30 min instead of ≥2.5h).
+`_kill_stale_claude` is idempotent (`pkill` against an
+already-empty match returns rc=1 and no-ops), so re-firing it
+next cycle is safe.
+
+The outage count still increments only on the delivery edge —
+matches the existing `_quota_outage_count` discipline (delivered
+alerts only, never silent fires) so the operator-visible count
+never disagrees with what they actually saw on Discord.
+
+**Tests.** Added 3 tests + extended the `breaker_setup` fixture
+to reset `_breaker_outage_count` / `_quota_outage_count` so
+per-test count assertions are deterministic:
+
+* `test_failed_send_keeps_counter_at_threshold_for_immediate_retry`
+  — pins counter stays ≥ threshold on a False send.
+* `test_failed_send_then_success_delivers_alert_on_next_cycle`
+  — end-to-end: failed 5th cycle → 6th cycle re-fires path →
+  delivery succeeds → latch arms → counter resets.
+* `test_already_latched_breaker_resets_counter` — regression
+  guard for the dedupe-path branch (no second send, but counter
+  still resets so the wedge run terminates cleanly when latch is
+  already True from a prior cycle in the same outage).
+
+Commit `98c4f26`. Auto-deployed by the git-watcher mid-pass
+(boot_sha `7394e44` → `016633c` within ~3 min — verified via
+`/api/build-info`).
+
+### Phase 2 — feat: `_plan_execution_debt_line` (commit `016633c`)
+
+**The gap.** `/api/plan-execution-debt` produces the
+`DISCONNECTED` / `DRIFTING` / `TIGHTENING` / `ALIGNED` verdict
+ladder measuring whether the live trader has acted on the gate's
+own `/api/deployment-plan` recommendation. The dashboard sees this;
+the operator on Discord never has. Live state at session:
+
+```
+{ verdict: DISCONNECTED, unexecuted_usd: 188.46,
+  execution_pct: 0.0,
+  headline: "DISCONNECTED — 0% of recommended $188 deployed in
+  last 24h (0/1 fully filled). Largest miss: FNGD ($188 of $188
+  unexecuted)." }
+```
+
+The previous pass's Phase 3 finding #5 explicitly surfaced the
+same gap on MSFU; this pass the worst-gap ticker has rotated to
+FNGD but the gate's recommendation is still being ignored by the
+wedged engine. The previous `_drought_alpha_bleed_line` surfaces
+"the dark windows cost X% alpha"; this surface answers the
+orthogonal "and the gate WANTED to do something specific in
+those windows — here's what."
+
+**The new helper** (`paper_trader/reporter.py::_plan_execution_debt_line`)
+composes `/api/plan-execution-debt`'s own `headline` verbatim
+(SSOT, invariant #10) via the same localhost HTTP pattern as
+`_deployment_plan_line`. Suppression — whitelist-only, surface
+ONLY actionable verdicts:
+
+* `ALIGNED` / `NO_PLAN` / `ERROR` → silent (no actionable signal;
+  summary must never become its own lying green light — the
+  `_drought_alpha_bleed_line` whitelist precedent).
+* `DISCONNECTED` (⚠️) / `DRIFTING` (🔶) / `TIGHTENING` (🟡) → fire.
+* Dollar floor `unexecuted_usd >= $50` — Discord-side
+  actionability gate (the builder's verdict ladder is dollar-
+  blind so a $5 DISCONNECTED plan would otherwise pollute the
+  channel).
+
+**Discord wiring.** Placed right after `_deployment_plan_line` in
+BOTH `send_hourly_summary` and `send_daily_close`. Orthogonal
+complement to DEPLOY PLAN: DEPLOY PLAN says "here is the ask";
+PLAN DEBT says "and here is the unhonored gap from the prior
+window". Both whitelist-suppress and never silence each other —
+a fresh `READY` plan can fire DEPLOY PLAN while a prior 24h-old
+plan is DISCONNECTED, and the trader sees both signals at once.
+
+**Live verdict on the deployed book.** Confirmed via
+`reporter._plan_execution_debt_line()` against the live
+`/api/plan-execution-debt` endpoint immediately after the
+git-watcher deployed boot_sha `016633c`:
+
+```
+⚠️ **PLAN DEBT** ◈ DISCONNECTED
+> DISCONNECTED — 0% of recommended $188 deployed in last 24h
+  (0/1 fully filled). Largest miss: FNGD ($188 of $188
+  unexecuted).
+```
+
+The line will appear on the next hourly summary (currently quiet —
+weekend, market closed) and persist until either the gap closes
+(an FNGD fill of $50+) OR the deployment plan reshuffles below
+DISCONNECTED OR the unexecuted_usd drops below $50.
+
+**Tests** (`tests/test_plan_execution_debt_reporter.py`, 22 cases):
+verdict whitelist (DISCONNECTED / DRIFTING / TIGHTENING fire;
+ALIGNED / NO_PLAN / ERROR / unknown silent), dollar-floor
+boundary ($50 inclusive), verdict-icon ladder (⚠️ / 🔶 / 🟡),
+SSOT pinning (sentinel headline shipped verbatim), every failure
+mode (urlopen exception / 500 / malformed JSON / non-dict /
+empty headline / non-numeric unexecuted_usd), `never_raises`
+defensive pin, and wiring regression-locks for BOTH
+`send_hourly_summary` and `send_daily_close`.
+
+### Phase 3 — Live validation findings (`user_findings = 6`)
+
+1. **PLAN DEBT live fire confirmed.** Endpoint live state at
+   session: `DISCONNECTED, 0% of recommended $188 deployed in
+   last 24h, Largest miss: FNGD ($188 of $188 unexecuted)`.
+   The new helper returned the full PLAN DEBT block when
+   called directly against the post-deploy dashboard. Next
+   hourly fire surfaces it to the operator.
+
+2. **Deployment plan READY but engine wedged.**
+   `/api/deployment-plan` reports `READY, n_plan=1, Deploy $188
+   across 1 name(s) (90% of cash); blended pred 5d +11.76%`
+   into FNGD. The engine has $209 cash sitting unattended.
+   The alpha-actionable bleed surface (`_drought_alpha_bleed_line`)
+   AND the orthogonal plan-debt surface (`_plan_execution_debt_line`)
+   now both surface this from independent angles — alpha cost
+   AND specific name miss.
+
+3. **notify_health DEGRADED, openclaw rc=13 persists.**
+   `/api/notify-health` recorded `verdict=DEGRADED, headline:
+   "Discord channel DARK — 1 consecutive send failure, last OK
+   never; last error: openclaw timeout (60s)"` right after the
+   git-watcher deployed my commit. This is the exact failure
+   class my Phase 1 fix targets: an openclaw blip during a
+   breaker fire now retries on the NEXT cycle instead of
+   vanishing for 2.5h.
+
+4. **Breaker outage counter still 0.** `/api/alarm-latches`
+   reports `breaker_outage_count: 0` post-restart with
+   `consecutive_no_decisions: 1`. The counter is FRESH (a new
+   process has its own counter), so this is correct, not a
+   regression of the silent-fail bug — the next time the
+   breaker trips with openclaw dark, the fix's retry path
+   will fire on the *immediate* next cycle.
+
+5. **Decision drought still BLEEDING.** `/api/decision-drought`
+   confirms `verdict=BLEEDING, involuntary_alpha_bleed_pct=
+   -6.563, n_paralysis_droughts=8`. Persists from the previous
+   pass — the underlying parse-failure → drought pipeline has
+   not closed. The new PLAN DEBT line is downstream of THIS
+   problem: the engine can't execute the plan because it's
+   wedged in parse failures.
+
+6. **Concentration HIGH persists, exit corridor narrowed.**
+   `/api/risk` reports `concentration_severity=HIGH`. Book is
+   still 82% MU (1 share @ $956.37, mark $971.55, corridor_pos
+   0.7174 — 1.39% from hard-TP at $985.06).
+   `/api/exit-proximity` says `COMFORTABLE` (MID_BAND), but
+   the corridor is closer to TP than SL — a +1.5% Monday open
+   pop fires the HARD_TP unattended.
+
+### How the new PLAN DEBT surface composes (canonical mini-reference)
+
+```
+                  build_plan_execution_debt
+                 (dashboard /api/plan-execution-debt)
+                              │
+                              ▼
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+    verdict ∈ {ALIGNED, NO_PLAN,    verdict ∈ {DISCONNECTED,
+              ERROR, unknown}                  DRIFTING, TIGHTENING}
+              │                               AND unexecuted_usd ≥ $50
+              ▼                               │
+        (silent — "")                         ▼
+                              _plan_execution_debt_line returns
+                              "⚠️|🔶|🟡 **PLAN DEBT** ◈ {V}\n> {H}"
+                                              │
+                                              ▼
+                          send_hourly_summary + send_daily_close
+                                              │
+                                              ▼
+                                      operator Discord
+```
+
+The verdict ladder is the builder's; this surface is purely a
+whitelist-suppressed render with a Discord-side dollar floor.
+`ALIGNED` / `NO_PLAN` / `ERROR` / unknown (the "no actionable
+signal" set) stay silent. The dollar floor `$50` prevents a $5
+DISCONNECTED plan from polluting the channel — the builder's
+verdict ladder is dollar-blind by construction.
+
+### Test commands for this domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Just this pass's new tests (~5s, 25 cases).
+python3 -m pytest tests/test_plan_execution_debt_reporter.py \
+                  tests/test_core_runner_cycle.py::TestCircuitBreakerAlert -v
+
+# Verify reporter wiring + sibling tests still pass.
+python3 -m pytest tests/test_core_reporter.py \
+                  tests/test_plan_execution_debt_reporter.py \
+                  tests/test_deployment_plan_reporter.py \
+                  tests/test_drought_alpha_bleed.py -q
+
+# Focused core slice (~70s, ~1022 cases).
+python3 -m pytest tests/test_core_runner.py tests/test_core_runner_cycle.py \
+    tests/test_core_market.py tests/test_core_store.py \
+    tests/test_core_signals.py tests/test_core_strategy.py \
+    tests/test_core_reporter.py tests/test_deployment_plan_reporter.py \
+    tests/test_plan_execution_debt.py tests/test_plan_execution_debt_reporter.py -q
+```
+
+---
+
 ## 2026-05-30 core HYBRID pass #3 (Agent 1) — `_drought_alpha_bleed_line`
 
 Persona: a live trader watching a dashboard that says BLEEDING -6.56%
