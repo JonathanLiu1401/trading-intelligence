@@ -1,5 +1,247 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 ML+backtest HYBRID pass (Agent 2) — dashboard OOS-parity fix + `feature_alignment` univariate-IC-vs-model-weight diagnostic
+
+**Counters:** bugs_fixed=7 · features_added=1 · user_findings=5
+
+### Phase 1 — `bugs_fixed = 7` (dashboard + `attribution_audit` OOS-parity drift)
+
+The pass-#36 OOS-inference parity fix systematically wired the 3 enhanced
+MACD features (`ema200_above` / `hist_cross_up` / `macd_below_zero_cross`)
+through every diagnostic `scorer.predict` call site so the analyzers
+score on the SAME feature vector the live `_ml_decide` gate sees. But 6
+**dashboard** call sites (`/api/scorer-predictions`,
+`/api/scorer-attribution` ×2, `/api/scorer-opportunities`,
+`/api/conviction-cards`, the held-positions helper) and **1 ML-module**
+call site (`paper_trader/ml/attribution_audit.py::_attribution_for`)
+were silently passed over. So the dashboard's `pred_5d_return_pct` for
+every endpoint a quant reads predicted on a DEGRADED vector (defaults
+to `0.0` for the 3 new features) while the gate uses the populated
+values — `oos_parity_audit` measures the omission as `BIAS_LARGE`
+(delta_rank_ic≈+0.11 on the deployed pickle). A reading quant trusting
+the dashboard saw a different model than the gate sees on the same row.
+
+All 7 sites fixed; `get_quant_signals_live` (strategy.py) already emits
+the 3 fields so the dashboard inputs are populated by construction.
+
+Two AST-based regression tests pin the parity in place so a future
+`scorer.predict_with_meta` addition cannot silently regress:
+
+* `tests/test_dashboard_scorer_oos_parity.py` (3 tests) — walks
+  `paper_trader/dashboard.py` with `ast.parse`, asserts every scorer
+  call forwards all 3 required kwargs (resolves `**common` dict spreads).
+* `tests/test_ml_module_scorer_oos_parity.py` (1 test) — same audit
+  across every `paper_trader/ml/*.py` module with a small ALLOWLIST for
+  files that legitimately use synthetic probes (`scorer_smoke_test`,
+  `scorer_pickle_smoke`, `deploy_audit`) or measure the parity bias
+  itself (`oos_parity_audit`).
+
+Both tests are pure `ast.parse` — zero Flask init, zero model load, run
+in ~1 s combined. They resolve trivial kwargs-builder helpers
+(`_kwargs(r)` in `feature_importance.py`, `_base_kwargs(r)` in
+`response_audit.py`) by inspecting their literal-dict returns and
+propagating the kwarg set across `**kw` spreads — so a real call-site
+gap fails sharply while the existing helper-spread idiom passes.
+
+### Phase 2 — `features_added = 1` (per-feature univariate-IC vs model-weight alignment)
+
+**The single architectural question every existing ML diagnostic
+structurally cannot answer**: *is the scorer weighting the RIGHT
+features?* `baseline_compare` flags `MLP_WORSE_THAN_TRIVIAL`,
+`feature_importance` reports which features the MODEL relies on
+(permutation through `scorer.predict`), `linear_probe` compares the MLP
+to a linear baseline. **None cross-checks** the model's mean-|w|
+weights against each feature's RAW univariate Spearman rank-IC vs
+realized 5-day return — yet that cross-check is the only signal that
+separates two **distinct economic verdicts** hidden inside the same
+"`MLP_WORSE_THAN_TRIVIAL`" headline with **OPPOSITE** remediation paths:
+
+* `WEIGHTED_NOISE` — top-weighted feature has bottom-quartile univariate
+  IC. The MLP is learning spurious in-sample correlation. Action:
+  raise L2 `alpha`, reduce capacity, or drop the feature.
+* `IGNORED_SIGNAL` — top-IC feature has bottom-quartile model weight.
+  Real signal exists in the input but the architecture (StandardScaler +
+  ReLU MLP + L2) fails to extract it. Action: inspect the scaler / depth /
+  alpha tradeoff.
+
+These are not theoretical — they're the actionable next step a
+researcher tuning the model reaches for after seeing
+`MLP_WORSE_THAN_TRIVIAL` cycle after cycle. Until this analyzer existed
+there was no way to know WHICH state the loop was in.
+
+Verdict ladder (sorted by decreasing operational urgency):
+`WEIGHTED_NOISE` / `IGNORED_SIGNAL` / `ALIGNED` / `DEGENERATE` /
+`INSUFFICIENT_DATA`.
+
+`paper_trader/ml/feature_alignment.py`:
+
+* `analyze(outcomes_path, oos_only)` — returns a verdict + per-feature
+  table (`{"feature", "univariate_ic", "model_importance",
+  "univariate_rank", "importance_rank", "alignment_bucket", "n"}`).
+* Reuses `validation.split_outcomes_temporal` for the trustworthy OOS
+  slice (same default as `gate_audit` / `feature_importance`).
+* Reuses tie-aware Spearman (matches `feature_correlation_audit`).
+* CLI: `python3 -m paper_trader.ml.feature_alignment` (returns exit-1
+  on any non-`ALIGNED` verdict so shell callers can gate).
+* Read-only: zero train, zero pickle write, never raises on bad input.
+
+Wired into the per-cycle ledger pattern (sibling to
+`outcome_corpus_health` / `sector_skill` / `persona_skill`):
+
+* `run_continuous_backtests._append_feature_alignment_log` writes one
+  JSONL row per cycle to `data/feature_alignment_log.jsonl`.
+* Flat top-line fields (`verdict` / `n_features_with_signal` /
+  `top_weighted_noise` / `top_ignored_signal` / `top_ic_feature` /
+  `top_ic_value` / `top_weight_feature` / `top_weight_value` /
+  `alignment_dark`) so a JSON consumer can trend without nested
+  parsing.
+* Honest-gap rows on analyzer failure (`alignment_dark=True`) —
+  mirrors every sibling `*_dark` flag.
+* Atomic tmp + `.replace` trim at 2× the keep cap.
+
+Tests: 11 (`tests/test_feature_alignment.py`) + 7
+(`tests/test_continuous_feature_alignment_ledger.py`) = 18.
+
+### Phase 3 — `user_findings = 5` (live state on the deployed pickle + 6426-row outcomes corpus)
+
+Used the system as a quant researcher would. Concrete findings:
+
+1. **Backtest engine is healthy**. `backtest.db` carries 520 complete
+   runs at `MAX(run_id)=103458`, most recent completion
+   `2026-05-29T23:59:14Z`. Only 3/520 (0.6%) carry the
+   `benchmark_unavailable` note. Recent 20 runs all completed; returns
+   span +47% to +1890% (vs SPY +180% best, -267% worst — leveraged-ETF
+   dispersion, NOT strategy skill; persona_skill_log already trends
+   this and the leverage-luck disclaimer is in the §15 table below).
+
+2. **The deployed DecisionScorer pickle is current and loadable**.
+   `data/ml/decision_scorer.pkl` was last written 2026-05-29 16:52;
+   loads in <1s, reports `n_train=3776`, predicts cleanly on real OOS
+   rows. The feature-attribution surface (per-feature contributions,
+   percentile, calibrated reading, gate-arm decode) all return finite
+   values on the live corpus.
+
+3. **`feature_alignment` verdict on the live deployed scorer:
+   `ALIGNED`**. On the 1285-row temporal OOS slice, the top-univariate-
+   IC feature is `ml_score` (+0.092) and it is ALSO in the top-3 by
+   mean|w| (rank 2 behind `macd` and `mom20`, all in [0.36, 0.50]).
+   So the `MLP_WORSE_THAN_TRIVIAL` gap is NOT a feature-weighting bug
+   — the architecture and the data agree on what carries signal. The
+   architecture is the bottleneck, not the inputs. **Actionable:** the
+   next investigation should target the StandardScaler + ReLU + L2
+   tradeoff, NOT a feature-set rework. 8/13 numeric features carry
+   |IC|≥0.03; `news_urgency` / `news_article_count` show n/a IC
+   because of the next finding.
+
+4. **`NEWS_FEATURES_DARK` is the standing data-quality blocker**.
+   Live `outcome_corpus_health_log.jsonl` shows news features
+   populated in only 1.5% of training rows (94/6426). The scorer's
+   `news_urgency` / `news_article_count` weights are dead-trained on
+   ~null. ArticleNet was supposed to populate these but the
+   backtest-side pipeline only emits them for the small slice where
+   `_ml_decide`'s `news_count > 0`. This is the AGENTS.md / CLAUDE.md
+   documented "news pipeline is structurally dark" state. Already
+   surfaced by the corpus-health ledger; my new feature_alignment
+   ledger flags the same DEGENERATE alignment bucket for these two
+   features so a quant sees both signals together.
+
+5. **Live calibration is DIRECTIONAL_BUT_BIASED, exactly as documented**.
+   Quick spot-check on the most-recent 500 outcomes — quintile-bucketed
+   by `predict_with_meta.pred`:
+   ```
+     decile     n  mean_pred   mean_realized
+          1   100      -3.41          -0.86
+          2   100      -0.94          -0.60
+          3   100      +0.46          +0.69
+          4   100      +2.33          +0.81
+          5   100      +6.67          -0.21
+   ```
+   Decile-mean correlation +0.568 — DIRECTIONAL skill is real (Q1<Q3<Q4).
+   But MAGNITUDE bias is severe: Q5 predicts +6.67% mean and realizes
+   -0.21%; Q4 predicts +2.33% and realizes the highest +0.81%. **The
+   `predict_calibrated` quantile-mapping path is the right reading for
+   any operator-facing magnitude** — the raw `pred` is rank-trustworthy
+   but the inflation at the top quintile is real.
+
+### Phase 4 — docs + final verify
+
+```bash
+# Pass's new tests (offline, fast)
+python3 -m pytest tests/test_dashboard_scorer_oos_parity.py \
+                  tests/test_ml_module_scorer_oos_parity.py \
+                  tests/test_feature_alignment.py \
+                  tests/test_continuous_feature_alignment_ledger.py -v
+# → 22 passed
+
+# Focused ML/backtest slice (~1 min)
+python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+                  tests/test_oos_parity_audit.py \
+                  tests/test_attribution_audit.py \
+                  tests/test_dashboard_scorer_oos_parity.py \
+                  tests/test_ml_module_scorer_oos_parity.py \
+                  tests/test_feature_alignment.py \
+                  tests/test_continuous_feature_alignment_ledger.py \
+                  tests/test_continuous_outcome_corpus_health_ledger.py -q
+# → 228 passed
+```
+
+### How the ML/backtest stack actually works (for the next agent)
+
+* **Two independent models** (CLAUDE.md §6): ArticleNet
+  (TF-IDF→PyTorch text classifier, lives in `digital-intern/`) and the
+  DecisionScorer MLP (`paper_trader/ml/decision_scorer.py`). Don't
+  confuse them. Live trader reads ArticleNet's `ai_score` via
+  `signals.py`; the conviction gate reads the DecisionScorer's `pred`.
+* **Gate activation**: `_scorer.is_trained AND _scorer.n_train >= 500
+  AND not off_distribution AND _gate_modulate_active`. The kill-switch
+  (`_should_gate_modulate_conviction`) drops to False when trailing
+  OOS BUY rank-IC is at noise — gate then abstains via the
+  `(gate-killed,no-skill)` reasoning marker. `_parse_gate_decision`
+  detects both `(off-dist` and `(gate-killed` so downstream
+  `gate_pnl` / `gate_arm_historical` analyzers correctly drop both
+  abstention types.
+* **Per-cycle ledgers** (live state in `data/*_skill_log.jsonl`):
+  scorer_skill, baseline_skill, sector_skill, persona_skill,
+  persona_regime_skill, dead_feature_audit, llm_annotation_skill,
+  calibrated_reliability, bootstrap_ci_skill, stop_out_skill,
+  mfe_skill, stop_band_sweep, gate_arm_skill, gate_pnl_skill,
+  conviction_calibration, outcome_corpus_health, **feature_alignment**
+  (this pass). Each row is JSON, atomically trimmed.
+* **Running the analyzers manually**: every file in `paper_trader/ml/`
+  with a `main()` is runnable as `python3 -m paper_trader.ml.<name>`.
+  Most accept `--all` (full corpus instead of temporal OOS) and
+  `--json` flags. Read-only.
+
+### Staging
+
+* `paper-trader/paper_trader/dashboard.py` — 5 endpoint sites + 1
+  attribution helper updated (Phase 1).
+* `paper-trader/paper_trader/ml/attribution_audit.py` — `_attribution_for`
+  now forwards the 3 enhanced features.
+* `paper-trader/tests/test_dashboard_scorer_oos_parity.py` (new),
+  `paper-trader/tests/test_ml_module_scorer_oos_parity.py` (new) —
+  Phase 1 regression tests.
+* `paper-trader/paper_trader/ml/feature_alignment.py` (new) — Phase 2
+  analyzer.
+* `paper-trader/run_continuous_backtests.py` — Phase 2 wiring (also
+  includes the pre-existing `_append_outcome_corpus_health_log`
+  ledger from a prior agent's uncommitted state, committed alongside
+  the feature_alignment wiring since both belong to the same loop
+  ledger pattern).
+* `paper-trader/tests/test_feature_alignment.py` (new),
+  `paper-trader/tests/test_continuous_feature_alignment_ledger.py`
+  (new) — Phase 2 tests.
+* `paper-trader/AGENTS.md` (this section) — Phase 4.
+
+Per-file pathspec, no `git add -A`. Working copy at start carried foreign
+uncommitted changes (Agent 1 / Agent 4 dashboard + `digital-intern/...`,
+plus prior `paper_trader/ml/*.py` analyzer edits from sibling agents that
+were ALL also wiring the same 3 enhanced MACD features into their predict
+sites — that pre-existing work is left untouched for the sibling agents
+to commit on their own pass).
+
+---
+
 ## 2026-05-30 core HYBRID pass (Agent 1) — last-fill verdict line
 
 **Counters:** bugs_fixed=0 · features_added=1 · user_findings=3
