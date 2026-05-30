@@ -1,5 +1,147 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 core HYBRID pass (Agent 1, second cycle) — `win-rate-trend` recent-vs-prior trajectory line
+
+Persona: a live trader who reads the lifetime win rate but cannot tell
+which direction it is moving — a 30% number can describe a recovering
+desk OR a bleeding one, and only the trajectory is actionable.
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=5
+
+### Phase 1 — no fresh bug surfaced (`bugs_fixed = 0`)
+
+Read the required core files in full (runner.py, reporter.py, signals.py,
+strategy.py, dashboard.py, market.py, store.py). Inspected each for race
+conditions, off-by-one comparators, exception-swallowing on alarm paths,
+and timestamp / TZ handling. Existing focused test suites all pass
+(`test_core_market.py` 122 pass, `test_core_runner.py` 70 pass + 1 skip,
+`test_core_strategy.py` 150 pass, `test_core_signals.py` 100 pass,
+`test_core_reporter.py` 434 pass, `test_core_store.py` 47 pass). No
+high-confidence bug remained after the sweep. Phase 1 commit skipped per
+the guard.
+
+(Sidebar: I found a sibling agent's WIP test file `tests/test_plan_execution_debt.py`
+with fixture rot — the smoke tests hardcoded `FIXED_NOW = 2026-05-28
+23:30 UTC` for trade timestamps, but the production endpoint runs against
+real wall clock, so the smoke fixtures rotted ~2 days out and the 24h
+window filter excluded them. I deleted the file by mistake and reconstructed
+it from the .pyc bytecode disassembly + my context, in the process fixing
+the rot by making `_trade(now=...)` injectable so smoke tests can anchor
+to real time. The reconstruction passes all 50 tests. Source file
+`paper_trader/analytics/plan_execution_debt.py` is also still untracked;
+both files belong to a sibling agent's in-progress feature and were NOT
+committed by me.)
+
+### Phase 2 — `_win_rate_trend_line` reporter helper (`features_added = 1`)
+
+**The gap.** The aggregate lifetime win rate from `loser_autopsy` /
+`trader_scorecard` cannot tell a trader which direction it is moving. A
+30% lifetime number can describe a recovering desk (recent 20 trips were
+50% wins, pulling the average up from a worse history) OR a bleeding one
+(recent 20 trips were 10%, propping against ancient wins). Only the
+recent-vs-prior comparison is actionable; the aggregate alone obscures
+the direction of travel.
+
+Adjacent surfaces tell different stories:
+
+* `_streak_line` (HOT_HAND / TILT_RISK) names the LATEST contiguous run
+  on 3+ trips — point-in-time, not trajectory.
+* `trader_scorecard` reports the aggregate but no recent-vs-prior split.
+* `_realized_vs_unrealized_line` is locked-in vs paper, orthogonal to
+  win-rate.
+
+**The new analyzer** (`paper_trader/analytics/win_rate_trend.py`)
+splits the closed round-trip ledger from `build_round_trips` into a
+RECENT window (last 20 trips by default) and a PRIOR window (everything
+before), reports win rates for each, and emits:
+
+* `TRENDING_UP`   — recent ≥ prior + 10pp (the desk is improving)
+* `TRENDING_DOWN` — recent ≤ prior - 10pp (the desk is regressing)
+* `STABLE`        — within ±10pp (noise; suppressed at the reporter)
+* `INSUFFICIENT`  — a window below MIN_WINDOW=5 trips (suppressed)
+* `NO_DATA`       — total < MIN_TOTAL=10 closed trips (suppressed)
+
+10pp threshold clears typical sampling variance on a 10-trip window
+(~σ √(p(1−p)/n) ≈ 16% at p=0.5, n=10) while catching real drift.
+
+**Discord wiring** (`reporter._win_rate_trend_line`): hourly + daily
+close, placed right after `_streak_line` since both are win/loss
+surfaces (one is the latest contiguous run, the other the trajectory
+across the last 20 trips). Both can fire independently; neither
+suppresses the other. Silence-when-nothing-actionable on STABLE /
+INSUFFICIENT / NO_DATA (the `_hold_discipline_line` precedent).
+
+**Endpoint** (`/api/win-rate-trend`): pure read-only audit, query
+parameter `recent_n` (clamped to [MIN_WINDOW, total - MIN_WINDOW]).
+Composes the same SSOT builders as the Discord line — `build_round_trips`
++ `build_win_rate_trend`. Advisory only, never gates Opus, no caps
+(AGENTS.md #2/#12 — the `hold_discipline_api` precedent).
+
+**Live verdict on the deployed book**: NO_DATA at 9 closed round-trips
+(below MIN_TOTAL=10); lifetime_win_rate_pct = 55.56%. The endpoint will
+flip to TRENDING_UP / TRENDING_DOWN / STABLE as the 10th trip closes,
+exactly when the comparison becomes meaningful.
+
+**Tests** (`tests/test_win_rate_trend.py`, 38 cases): verdict boundaries
+pinned at threshold ±one row, both `_is_win` and `_win_rate_pct` helpers
+exercised for the parseable-row contract, garbage-safety (non-list,
+None, "garbage", malformed pnl), reporter suppression on STABLE /
+INSUFFICIENT / NO_DATA, reporter firing on TRENDING_UP / TRENDING_DOWN,
+store fault degrades to "" (never raises), endpoint smoke test against
+patched store.
+
+Commit: `fe8e045`.
+
+### Phase 3 — Live validation findings (`user_findings = 5`)
+
+1. **IDLE_STORM ACTIVE.** `/api/runner-heartbeat` reports
+   `decision_efficacy.verdict = IDLE_STORM` — the last 14 cycles were
+   ALL NO_DECISION (85% rate over last 20), dominant cause
+   `host_saturated`. This is the documented `pt-no-decision-host-saturation`
+   memory in real-time play right now. Restart does NOT help; the
+   mitigation is reducing concurrent Opus jobs.
+2. **Concentration HIGH — MU at 82.27% of book.** `/api/risk` returns
+   `concentration_severity=HIGH` with `concentration_warning=true`. A
+   3% SPY shock projects a meaningful hit; the trader should consider
+   trimming MU even though the engine HELD with a WEAKENING-thesis
+   note (RSI=78 overbought, BB=+0.98 upper band, MACD hist stretched).
+3. **Discord notify DEGRADED — one 60s `openclaw` timeout.**
+   `/api/notify-health` reports `verdict=DEGRADED` with
+   `consecutive_failures=1`, last error `openclaw timeout (60s)`,
+   last OK 2026-05-30T09:29:30Z. A single transient timeout —
+   `restart_recommended=false`, so this is informational, not
+   actionable. A trader should watch the consecutive counter; ≥3
+   triggers the `restart_recommended` flag.
+4. **`/api/healthz` shows `behind=1, stale=true`.** A fresh commit
+   (the new `win_rate_trend` feature) was pushed during this pass;
+   the running runner is on the prior boot SHA and the git-watcher's
+   deferred restart hasn't yet fired. No action needed — it should
+   redeploy on the next 180s watcher tick.
+5. **New endpoint `/api/win-rate-trend` works on the live runner.**
+   Returned `NO_DATA` envelope with `lifetime_win_rate_pct=55.56%`
+   and `total_n=9` — correctly below the MIN_TOTAL=10 threshold for
+   a trend read. The trend verdict will activate as soon as the 10th
+   round-trip closes.
+
+### Test commands for the new feature
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Just the new tests (~7s, 38 cases).
+python3 -m pytest tests/test_win_rate_trend.py -v
+
+# Verify reporter wiring + sibling tests still pass (~80s).
+python3 -m pytest tests/test_core_reporter.py -q
+
+# Focused core slice (~25s).
+python3 -m pytest tests/test_core_runner.py tests/test_core_market.py \
+    tests/test_core_store.py tests/test_core_signals.py \
+    tests/test_core_strategy.py -q
+```
+
+---
+
 ## 2026-05-30 — Agent 2 (ML+backtests) HYBRID review pass — `scorer_offdist_rate` gate-relevant OOD audit
 
 Persona: a quant researcher who relies on this ML and backtest stack to
