@@ -79,6 +79,7 @@ def main() -> int:
         ("keyword_surge",             "analytics.keyword_surge",             "main"),
         ("active_ticker_dashboard",   "analytics.active_ticker_dashboard",   "main"),
         ("regulatory_entity_surge",   "analytics.regulatory_entity_surge",   "main"),
+        ("triple_score_consensus",    "analytics.triple_score_consensus",    "main"),
     ]
 
     for short_name, mod_path, fn_name in module_specs:
