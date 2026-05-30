@@ -4685,6 +4685,69 @@ def _regime_leverage_fit_line(store) -> str:
         return ""
 
 
+def _win_rate_trend_line(store) -> str:
+    """One-line "is the desk's win rate improving or regressing?" for the
+    hourly / daily Discord summary.
+
+    The aggregate lifetime win rate (surfaced by ``trader_scorecard`` and
+    the ``loser_autopsy`` endpoint) cannot tell a trader which way the
+    rate is moving — a 30% lifetime number can describe a recovering desk
+    (the last 20 trips were 50% wins, pulling the average up from a worse
+    history) or a bleeding one (the last 20 trips were 10%, propping
+    against ancient wins). Only the recent-vs-prior comparison is
+    actionable.
+
+    Composes ``build_win_rate_trend`` over ``build_round_trips``
+    **verbatim** (single source of truth, AGENTS.md invariant #10 — the
+    verdict / win-rate fields are the builder's, never re-derived here,
+    so this Discord line and any future ``/api/win-rate-trend`` endpoint
+    can never disagree).
+
+    Pure store reads + the existing SSOT round-trip builder — NO network
+    (the Discord-path discipline; the ``_hold_discipline_line``
+    precedent). Observational only, no caps, never gates (invariants
+    #2/#12). Failure contract mirrors the rest of ``reporter``: any
+    builder / store fault degrades to ``""`` ("no win-rate-trend line
+    this report"), **never** an exception ("no Discord summary this
+    report").
+
+    Suppression — surface ONLY the two actionable verdicts:
+
+      * ``TRENDING_UP``   — recent win rate is ≥ +10pp above prior; the
+        desk is improving and the trader should hold their nerve.
+      * ``TRENDING_DOWN`` — recent win rate is ≤ -10pp below prior; a
+        recent regression that warrants a discipline review before
+        adding more capital.
+
+    ``STABLE`` (within noise band), ``INSUFFICIENT`` (a window too
+    short for signal), and ``NO_DATA`` (fewer than 10 closed
+    round-trips lifetime) all stay silent — the silence-when-nothing-
+    actionable precedent (the summary must never become its own lying
+    green light).
+    """
+    try:
+        from .analytics.round_trips import build_round_trips
+        from .analytics.win_rate_trend import build_win_rate_trend
+        # store.recent_trades returns newest-first; build_round_trips
+        # expects oldest-first.
+        trades_oldest_first = list(reversed(store.recent_trades(5000)))
+        rts = build_round_trips(trades_oldest_first)
+        result = build_win_rate_trend(rts)
+        if not isinstance(result, dict):
+            return ""
+        state = result.get("state")
+        if state not in ("TRENDING_UP", "TRENDING_DOWN"):
+            return ""
+        headline = result.get("headline") or ""
+        if not headline:
+            return ""
+        prefix = "📈" if state == "TRENDING_UP" else "⚠️"
+        return f"{prefix} **WIN-RATE TREND** ◈ {state}\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] win-rate-trend line skipped: {e}")
+        return ""
+
+
 def _last_real_decision_line(store) -> str:
     """One-line "did the engine actually DECIDE something recently?" for the
     hourly / daily Discord summary — the orthogonal companion to
@@ -5098,6 +5161,16 @@ def send_hourly_summary() -> bool:
     sk = _streak_line(store)
     if sk:
         body += "\n" + sk
+    # WIN-RATE TREND sits right after STREAK — same dimension (closed
+    # round-trip win/loss) one degree wider: STREAK names the latest
+    # contiguous run (HOT_HAND / TILT_RISK on a 3+ streak); WIN-RATE
+    # TREND names the trajectory across the last 20 trips vs everything
+    # before. A 3-loss streak inside a TRENDING_UP desk is noise; the
+    # same streak inside a TRENDING_DOWN desk is a discipline alarm. Both
+    # silence-by-default; neither suppresses the other.
+    wt = _win_rate_trend_line(store)
+    if wt:
+        body += "\n" + wt
     # EXIT-ONLY sits right after STREAK — the structural sibling. STREAK
     # reads W/L of *closed round-trips*; EXIT-ONLY reads *book-level
     # direction*: "the last N fills were all SELLs — engine is liquidating
@@ -5382,6 +5455,12 @@ def send_daily_close() -> bool:
     sk = _streak_line(store)
     if sk:
         body += "\n" + sk
+    # WIN-RATE TREND follows STREAK on daily close too — see
+    # send_hourly_summary for the placement rationale (latest contiguous
+    # run vs. trajectory across last 20 closed trips).
+    wt = _win_rate_trend_line(store)
+    if wt:
+        body += "\n" + wt
     # EXIT-ONLY follows STREAK on daily close too — same structural sibling
     # placement as the hourly. Silent unless DEFENSIVE_TRIM / LIQUIDATION
     # (the suppression precedent).

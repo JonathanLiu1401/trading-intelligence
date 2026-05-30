@@ -13773,6 +13773,45 @@ def repeat_loser_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/win-rate-trend")
+def win_rate_trend_api():
+    """Recent-vs-prior win-rate comparison — is the desk *trending*?
+
+    The aggregate lifetime win rate from /api/loser-autopsy /
+    /api/trader-scorecard cannot tell a trader which direction it is
+    moving — a 30% lifetime number can describe a recovering desk OR a
+    bleeding one; only the recent-vs-prior comparison is actionable.
+    This endpoint splits the closed round-trip ledger into a RECENT
+    window (last 20 trips by default) and a PRIOR window (everything
+    before), and reports the delta.
+
+    Query parameters:
+
+      * ``recent_n`` — size of the recent window (default 20, clamped
+        to [MIN_WINDOW, total - MIN_WINDOW]).
+
+    Single source of truth: composes ``build_win_rate_trend`` over
+    ``build_round_trips``, which the rest of the round-trip-derived
+    analytics already share (AGENTS.md #10). Advisory only — never
+    gates Opus, never injected into the decision prompt, adds no caps
+    (AGENTS.md #2/#12)."""
+    try:
+        from .analytics.round_trips import build_round_trips
+        from .analytics.win_rate_trend import (
+            DEFAULT_RECENT_N, build_win_rate_trend,
+        )
+        try:
+            recent_n = int(request.args.get("recent_n", DEFAULT_RECENT_N))
+        except (TypeError, ValueError):
+            recent_n = DEFAULT_RECENT_N
+        store = get_store()
+        trades_oldest_first = list(reversed(store.recent_trades(5000)))
+        rts = build_round_trips(trades_oldest_first)
+        return jsonify(build_win_rate_trend(rts, recent_n=recent_n))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/hold-discipline")
 def hold_discipline_api():
     """The disposition trap, caught *while it is still happening* on the
