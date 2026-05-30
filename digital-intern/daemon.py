@@ -77,6 +77,8 @@ from collectors.opex_calendar_collector import collect_opex_calendar
 from collectors.tic_foreign_holdings import collect_tic
 from collectors.congress_trades_collector import collect_congress_trades
 from collectors.finra_short_volume import collect_finra_short_volume
+from collectors.finra_margin_collector import collect as collect_finra_margin
+from collectors.cboe_volatility_indices import collect_cboe_volatility_indices
 from collectors.market_movers import collect_market_movers
 from collectors.yahoo_trending_tickers import collect_yahoo_trending
 from collectors.fear_greed_collector import collect_fear_greed
@@ -230,6 +232,8 @@ OPEX_CALENDAR_INTERVAL  = 3600    # Options expiration calendar — once per hou
 TIC_INTERVAL            = 21600   # TIC foreign Treasury holdings — 6h (monthly release)
 FOREX_FACTORY_CAL_INTERVAL = 3600  # Forex Factory economic calendar — once per hour
 FINRA_SHORT_INTERVAL    = 3600    # FINRA RegSHO short volume — once per hour (daily file)
+FINRA_MARGIN_INTERVAL   = 43200   # FINRA margin debt stats — every 12h (monthly release)
+CBOE_VOL_INDICES_INTERVAL = 3600  # CBOE OVX/GVZ/SKEW cross-asset vol indices — hourly
 CONGRESS_TRADES_INTERVAL = 3600   # Congressional trading disclosures — once per hour
 CBOE_UNUSUAL_OPTIONS_INTERVAL = 900  # CBOE unusual options flow — every 15min
 CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog — once per hour
@@ -2288,6 +2292,49 @@ def finra_short_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(FINRA_SHORT_INTERVAL)
+
+
+# ── Worker: FINRA margin debt statistics — every 12h (monthly release) ──────
+def finra_margin_worker(store: ArticleStore):
+    log.info("[finra_margin_worker] started")
+    bo = Backoff("finra_margin", base=120.0, cap=3600.0)
+    while _running:
+        try:
+            n = collect_finra_margin(store.conn)
+            try:
+                source_health.record_result("finra_margin", n)
+            except Exception as he:
+                log.warning(f"[finra_margin_worker] source_health error: {he}")
+            _worker_last_ok["finra_margin"] = time.time()
+            log.debug(f"[finra_margin] cycle ok ({n} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[finra_margin_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(FINRA_MARGIN_INTERVAL)
+
+
+# ── Worker: CBOE cross-asset volatility (OVX/GVZ/SKEW) — hourly ─────────────
+def cboe_vol_indices_worker(store: ArticleStore):
+    log.info("[cboe_vol_indices_worker] started")
+    bo = Backoff("cboe_vol_indices", base=60.0, cap=900.0)
+    while _running:
+        try:
+            articles = collect_cboe_volatility_indices()
+            _ingest(store, articles, "cboe_volatility_indices")
+            try:
+                source_health.record_result("cboe_volatility_indices", len(articles))
+            except Exception as he:
+                log.warning(f"[cboe_vol_indices_worker] source_health error: {he}")
+            _worker_last_ok["cboe_volatility_indices"] = time.time()
+            log.debug(f"[cboe_vol_indices] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[cboe_vol_indices_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(CBOE_VOL_INDICES_INTERVAL)
 
 
 # ── Worker: Congressional trading disclosures — every 1h ────────────────────
@@ -5117,6 +5164,8 @@ def main():
         ("tic",            tic_worker),
         ("forex_factory_cal", forex_factory_cal_worker),
         ("finra_short",   finra_short_worker),
+        ("finra_margin",  finra_margin_worker),
+        ("cboe_vol_indices", cboe_vol_indices_worker),
         ("nyfed_liquidity", nyfed_liquidity_worker),
         ("congress_trades", congress_trades_worker),
         ("cboe_unusual_options", cboe_unusual_options_worker),
