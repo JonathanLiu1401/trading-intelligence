@@ -1,5 +1,284 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 — Agent 2 (ML+backtests) HYBRID pass #3 — `sizing_rule_counterfactual`
+
+Persona: a quant researcher staring at a deployed gate whose
+`conviction_calibration` reads MISCALIBRATED and whose `gate_pnl` reads
+GATE_RETURN_NEUTRAL on every recent cycle. Concrete question: *the gate's
+deployed sizing rule (`min(0.25, ml_score/20)`) is provably not
+ranking realized return — would a different sizing rule have done
+better on the same corpus?*
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=10
+
+### Phase 1 — no commit (codebase honestly clean)
+
+Read `paper_trader/ml/decision_scorer.py`, `paper_trader/backtest.py`,
+and `run_continuous_backtests.py` end-to-end for race conditions,
+missing error handling, atomic-write hazards, shape/dtype subtleties,
+and dead code. Ran the focused ML/backtest test slice
+(`tests/test_decision_scorer.py` 77 pass, `tests/test_backtest.py` 88
+pass, `tests/test_continuous.py` 125 pass). After 8+ prior HYBRID
+review passes the surface bugs are guarded — every JSON write is atomic
+(`tmp + .replace`), every analyzer has the "never raises, degrades to
+honest envelope" discipline, every cache loader has type-guards. The
+only candidates were micro-issues whose fix would be churn (`_pick_window`'s
+`*365` ignores leap years — 2-3 day error on 10yr windows, immaterial
+for skill measurement). Honest `bugs_fixed=0` per the Phase 1 commit
+guard.
+
+### Phase 2 — `feat:` `sizing_rule_counterfactual` (commit `914e545`)
+
+**The gap.** The deployed conviction-sizing rule
+(`_ml_decide`'s `min(0.25, ml_score/20.0)` for regular, `min(0.40,
+ml_score/15.0)` for leveraged-ETF-in-bull/sideways) is the BASE rule
+the conviction gate's ×0.6..×1.3 overlay modulates. The existing
+analyzer suite extensively measures the OVERLAY's effect (`gate_pnl`,
+`gate_arm_kelly`, `gate_realized`, `gate_arm_historical`) and audits
+the BASE rule's CALIBRATION (`conviction_calibration` ranks BUYs by
+their actual `conviction_pct`, `sizing_pnl_skill` attributes dollars
+per bucket). None of them asks the natural quant question every
+documented MISCALIBRATED finding implies:
+
+  *On the same outcome corpus, would a DIFFERENT sizing rule have
+  generated more realized PnL than the rule the gate actually applied?*
+
+**The analyzer** (`paper_trader/ml/sizing_rule_counterfactual.py`)
+sums `Σ rule(r) × forward_return_5d_r` across BUY rows under six
+candidate rules:
+
+* `ACTUAL`         — uses each row's `conviction_pct` (the gate's
+                     then-applied sizing — the reference)
+* `UNIFORM_10`     — flat 10% on every BUY
+* `UNIFORM_25`     — flat 25% on every BUY (the regular cap)
+* `SCORE_BASED`    — reconstructed `min(0.25, max(0, ml_score/20))`
+                     (matches ACTUAL when the upstream parser succeeded
+                     and no leveraged-ETF cap kicked in)
+* `INVERSE_SCORE`  — `min(0.25, max(0.05, 0.25 - ml_score/100))` —
+                     explicit operationalization of the documented
+                     `CONVICTION-SIZING IS INVERTED` finding (SHRINK
+                     conviction as score rises)
+* `NEWS_DRIVEN`    — when `news_urgency` finite & positive, size by
+                     `min(0.25, news_urgency/100)`; else flat 0.10
+
+Verdict ladder (test-locked, exact-threshold):
+
+* `ALT_BEATS_ACTUAL`  — best alt beats ACTUAL by ≥ 20% relative
+* `ACTUAL_BEST`       — ACTUAL beats every alt by ≥ 20% relative
+* `TIE`               — best alt within ±20% of ACTUAL
+* `INSUFFICIENT_DATA` — < 60 valid BUY rows
+
+**Live verdict on the 5512-row corpus (4128 BUYs):**
+`ALT_BEATS_ACTUAL`. UNIFORM_25 total `+994.47` pp vs ACTUAL `+435.91`
+pp — a **+128.1% relative improvement**. The deployed sizing rule
+generates roughly *half* the per-trade pp-of-book PnL a flat 25%
+rule would have on the same trades. INVERSE_SCORE comes second at
+`+916.89` (+110.3% over ACTUAL). The documented `CONVICTION-SIZING
+IS INVERTED` finding now has a concrete dollar-magnitude attached:
+the deployed rule is leaving roughly 1.3× its own PnL on the table.
+
+**Important caveat** documented in the module docstring and CLI: the
+sum-of-products metric assumes every base bet is independently
+deployable — it does NOT model real portfolio cash constraints,
+correlated holdings, or compounding. The number is a RELATIVE ranking
+of sizing rules, not a real backtest. A quant cannot ship UNIFORM_25
+sizing on the basis of this analyzer alone; they need to confirm in
+a real cash-constrained portfolio simulation first.
+
+**Read-only operational discipline** — never trains, never writes the
+pickle / outcomes JSONL / any trade path. Errors degrade to a
+`status='error'` envelope; the analyzer never raises. CLI exits 0 on
+ACTUAL_BEST / TIE / INSUFFICIENT_DATA (informational), 2 on
+ALT_BEATS_ACTUAL (quant-decisive — same gate-discipline as
+`sizing_pnl_skill` / `conviction_calibration` / `gate_abstention`).
+
+**Tests** (`tests/test_sizing_rule_counterfactual.py`, 27 cases):
+each of the 6 sizing rule functions is pinned individually against
+hand-calculated expected outputs (cap/floor boundaries, bool-int
+exclusion, missing-field fallback); the analyzer arithmetic is pinned
+on synthetic 100-row corpora where ACTUAL's total is exactly
+`100 × conv × ret`; verdict-threshold boundaries pinned at the
+20%-improvement bar; corrupt-input / NaN-return drops; CLI exit
+codes 0/2 for ACTUAL_BEST / ALT_BEATS_ACTUAL; JSON-output shape.
+All 27 pass in 1.5s.
+
+### Phase 3 — Live findings (quant-researcher tour)
+
+Live corpus snapshot: 5512 outcome rows (BUY=4128, SELL=1384),
+date range 2002-02-25 → 2021-11-15.
+
+1. **Sizing rule is significantly underperforming alternatives.**
+   `sizing_rule_counterfactual` on the live corpus: UNIFORM_25
+   total `+994.47` pp vs ACTUAL `+435.91` pp — `ALT_BEATS_ACTUAL`,
+   +128.1% relative improvement. The deployed `min(0.25,
+   ml_score/20)` rule sizes too conservatively. (See module
+   docstring caveat: per-trade comparison, not a real portfolio
+   backtest.)
+
+2. **OOS scorer is MISCALIBRATED.** OOS Spearman `+0.017` on the
+   1102-row holdout (vs `+0.298` in-sample). Decile 1 predicts
+   `-8.92%` but realizes `+0.85%`; the top decile's `+5%+`
+   predictions realize anywhere from `+0.5%` to `+2.5%`. Magnitudes
+   are biased AND ordering is essentially at noise — the WEAK_SIGNAL
+   verdict that in-sample reports does NOT survive the temporal
+   holdout. Distinct from the in-sample monotonicity claim.
+
+3. **MLP_WORSE_THAN_TRIVIAL durable.** Latest `baseline_compare`:
+   `news_urgency` single-feature baseline OOS rank-IC `+0.078`
+   beats the 20-feature MLP at `+0.017` by 0.061 — same finding as
+   prior reviews. The MLP is sub-trivial vs a one-line rule that
+   ignores 19 of its 20 inputs, and `news_urgency` is present in
+   only 2.7% (147/5512) of training rows.
+
+4. **Gate is GATE_RETURN_NEUTRAL.** `gate_pnl` reports gate-on mean
+   `+1.036%` vs gate-off `+1.034%` — the ×0.6..×1.3 multiplier
+   overlay adds pure sizing variance with ~0 net realized effect
+   (+0.002pp equal-weight contribution, -0.033pp sized
+   contribution — both within the ±1.0pp `BALANCED` tolerance).
+
+5. **Conviction calibration MISCALIBRATED.** Spearman
+   conviction-vs-realized is `+0.042` (|·| < 0.05). The 5-bucket
+   spread is `+0.50pp` (top - bottom) on `mean_conv` ranging
+   0.056..0.184 — sizing is essentially uncorrelated with realized
+   return. Combined with finding #1, this is operationally decisive:
+   the BASE rule is non-predictive AND the overlay neutralizes its
+   own effect.
+
+6. **Off-distribution rate is HEALTHY.** Only 0.2% (2/1102) of OOS
+   predictions are off-distribution — distinct from the documented
+   synthetic-input behaviour where a hand-built NVDA vector
+   extrapolates to +258%. Real held-out outcomes are
+   in-distribution.
+
+7. **LLM annotation pipeline AUTH ERROR persists.** Confirmed via
+   `continuous.log`: `Could not resolve authentication method.
+   Expected one of api_key, auth_token, or credentials to be set.`
+   Every recent annotation cycle: `0 endorsed, 0 condemned`. The
+   sample-weight machinery in `train_scorer` has empty branches.
+
+8. **ML trainer subprocess timeout.** `continuous.log` shows
+   `[continuous] ml: trainer timeout (injected 309)` — the
+   digital-intern ArticleNet retrain subprocess timed out under
+   load (this is the documented `di-ml-trainer-subprocess-timeout`
+   memory). The local `DecisionScorer` retrain itself succeeded
+   (val_rmse=8.56 on n=3876).
+
+9. **Bear regime is essentially absent.** 11/5512 (0.2%) bear rows
+   in the corpus — `oos_bear_n=0` / `oos_bear_ic=null` on every
+   recent cycle. Per-regime skill in bear markets is structurally
+   untrained; the deployed gate's behaviour in a bear market is
+   uncalibrated.
+
+10. **Most recent best run is genuinely outperforming.** Cycle 1
+    finished run 103881 at `+24.97%` vs SPY `+7.15%` on a
+    2014-05→2016-05 window — that's a real `+17.82pp` alpha. Looking
+    at the run details, the engine is healthy and the random-window
+    sweep is producing reasonable runs. The systemic ML/sizing
+    issues do not appear to prevent the rule-based ML+quant signal
+    from finding profitable trades; they DO indicate room to
+    improve sizing for the trades that get picked.
+
+### How the ML/backtest stack works (canonical mini-reference)
+
+**DecisionScorer** (`paper_trader/ml/decision_scorer.py`):
+
+* 20-feature MLPRegressor(32, 16) + L2 alpha=1e-2 + early_stopping
+  (anti-overfit retune, 2026-05-18). Features: 10 base numeric
+  (ml_score / rsi / macd / mom5 / mom20 / regime_mult / vol_ratio /
+  bb_pos / news_urgency / news_article_count) + 3 enhanced MACD
+  booleans (ema200_above / hist_cross_up / macd_below_zero_cross)
+  + 7-way sector one-hot.
+* `predict_with_meta(...)` returns `{pred, raw, clamped,
+  off_distribution, percentile, calibrated, failed, gate_arm,
+  gate_arm_multiplier}` — `pred` is clamped to ±`PRED_CLAMP_PCT=50`,
+  `calibrated` is the quantile-mapped honest magnitude. OOS verdict
+  is `DIRECTIONAL_BUT_BIASED` (in-sample) → `MISCALIBRATED` (OOS).
+* `predict()` is the scalar fast path the gate uses.
+* `feature_contributions` / `feature_group_contributions` /
+  `feature_importance` / `feature_group_importance` — local +
+  global attribution.
+* `train_scorer(records, path=None)` — atomically rewrites
+  `data/ml/decision_scorer.pkl` with `{model, scaler, n_train,
+  pred_quantiles, label_quantiles}`. SELL records flip the label
+  sign. Symmetric label clamp at ±50% so val/oos error is
+  apples-to-apples.
+
+**Running backtests manually**:
+
+```bash
+# One-shot — 10 parallel year-long runs against the default window
+python3 run_backtests.py
+
+# Continuous loop — 1 run per cycle (throttled), 10min cooldown
+python3 run_continuous_backtests.py
+
+# Read-only CLI: explain one scorer prediction
+python3 -m paper_trader.ml.decision_scorer \
+    --ticker NVDA --ml-score 3.5 --rsi 45 --mom5 2.0
+
+# Read-only CLI: corpus data quality (pre-model)
+python3 -m paper_trader.ml.outcome_corpus_health
+
+# Read-only CLI: MLP vs single-feature baselines (the trivial check)
+python3 -m paper_trader.ml.baseline_compare
+
+# Sizing-rule counterfactual (NEW this pass)
+python3 -m paper_trader.ml.sizing_rule_counterfactual
+python3 -m paper_trader.ml.sizing_rule_counterfactual --json
+```
+
+**Interpreting backtest results** (load-bearing reading order):
+
+1. `outcome_corpus_health` — is the input data sane (news
+   populated, regimes balanced, target std meaningful)?
+2. `scorer_offdist_rate` — does the scorer's predictions land
+   in-distribution on the OOS slice?
+3. `calibration --oos` — is the rank skill real? Decile error
+   tells you whether to trust the raw % magnitude or only the
+   rank.
+4. `baseline_compare` — does the MLP beat the best one-line rule?
+5. `conviction_calibration` — does the gate's BASE sizing rule
+   rank realized returns?
+6. `sizing_rule_counterfactual` (NEW) — would a DIFFERENT sizing
+   rule have realized more PnL on this corpus?
+7. `gate_pnl` / `gate_arm_kelly` — does the gate's ×0.6..×1.3
+   OVERLAY realize differentiated outcomes?
+
+**Test commands for this domain**:
+
+```bash
+# Just this pass's new tests
+python3 -m pytest tests/test_sizing_rule_counterfactual.py -v
+
+# Regression on the full ML/backtest slice (~3min under load)
+python3 -m pytest tests/test_decision_scorer.py \
+                  tests/test_backtest.py \
+                  tests/test_continuous.py \
+                  tests/test_sizing_rule_counterfactual.py -v
+
+# Just the new diagnostic + sibling counterfactuals
+python3 -m pytest tests/test_sizing_rule_counterfactual.py \
+                  tests/test_sizing_pnl_skill.py \
+                  tests/test_conviction_calibration.py -v
+```
+
+### Staging
+
+Per-file pathspec, two commits expected:
+
+* **Phase 2**: `paper-trader/paper_trader/ml/sizing_rule_counterfactual.py`
+  + `paper-trader/tests/test_sizing_rule_counterfactual.py` (the new
+  analyzer + tests).
+* **Phase 4 (this section)**: `paper-trader/AGENTS.md` only.
+
+Working copy at start carried ~24 sibling agents' uncommitted edits to
+`paper_trader/ml/*` analyzer modules and 5 `tests/test_*` files
+(systematically plumbing enhanced-MACD features), plus several
+untracked sibling additions (`paper_trader/analytics/*`,
+`tests/test_continuous_outcome_corpus_health_ledger.py`, etc); all left
+untouched per the concurrent-agent footgun memory. No `git add -A`.
+
+
 ## 2026-05-30 — Agent 4 (feature-dev, second pass) — `position_size_pl_fit` + `tape_fit_pl`
 
 Persona: a senior product engineer touring the live dashboard like a
