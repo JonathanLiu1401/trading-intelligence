@@ -1945,6 +1945,18 @@ _DEPLOY_PLAN_HTTP_TIMEOUT_S = 3.0
 # rather than a real network hop. Centralising the URL here so a future
 # port change in dashboard.run() can update both surfaces.
 _DEPLOY_PLAN_URL = "http://localhost:8090/api/deployment-plan"
+_PLAN_EXECUTION_DEBT_URL = "http://localhost:8090/api/plan-execution-debt"
+
+# Suppression floor for ``_plan_execution_debt_line``. When the
+# total $-gap between the plan and what got executed is below this,
+# the line stays silent — a $4 miss on a $20 plan is noise, not a
+# missed action. The builder's own DISCONNECTED ladder doesn't have
+# a dollar floor (a $5 plan that's 0% filled is technically
+# DISCONNECTED), so this is the Discord-side actionability filter.
+# Distinct from ``_DEPLOY_PLAN_CASH_PCT_FLOOR`` (cash-share floor):
+# this is about how much DOLLAR damage the unexecuted plan
+# represents, not about how much cash is sidelined.
+_PLAN_EXECUTION_DEBT_MIN_USD = 50.0
 
 
 def _deployment_plan_line(store) -> str:
@@ -2037,6 +2049,105 @@ def _deployment_plan_line(store) -> str:
         return f"**DEPLOY PLAN** ◈ {verdict}\n> {headline}"
     except Exception as e:
         print(f"[reporter] deployment-plan line skipped: {e}")
+        return ""
+
+
+def _plan_execution_debt_line() -> str:
+    """One-line "is the plan being IGNORED?" for the hourly / daily report.
+
+    Orthogonal complement to ``_deployment_plan_line`` (which surfaces
+    "here's what to do"): this surface tells the operator whether the
+    live trader is actually DOING it. Closes a real dashboard→Discord
+    gap explicitly surfaced live 2026-05-30: the deployment planner
+    said deploy $188 into MSFU at scorer verdict STRONG_HOLD (+7.35%
+    pred_5d_return), but the engine has been wedged since boot and
+    never deployed it. ``/api/plan-execution-debt`` exposes the
+    `DISCONNECTED` verdict on the dashboard; the operator on Discord
+    only sees the IDLE_STORM cause-code and never learns the alpha-
+    actionable "your gate's plan is being ignored" signal.
+
+    Composes ``/api/plan-execution-debt``'s own ``headline`` verbatim
+    (single source of truth, AGENTS.md invariant #10 — never
+    re-derived, so this Discord line and the dashboard endpoint can
+    never disagree on "X% of recommended $Y deployed in last N
+    hours").
+
+    Suppression — whitelist-only, surface ONLY actionable verdicts:
+
+      * ``ALIGNED`` — the plan is being honored ≥80% (nothing to say;
+        a green light here would only train the operator to ignore the
+        line; the ``_drawdown_line`` at-high-water precedent).
+      * ``NO_PLAN`` — no plan rows means nothing to track. Silent.
+      * ``ERROR`` — the dashboard endpoint already surfaces the
+        diagnostic; don't pollute the summary with a recurring
+        "ERROR" alarm.
+      * ``TIGHTENING`` / ``DRIFTING`` / ``DISCONNECTED`` — the plan
+        is being IGNORED to a measurable degree → fires.
+      * Additional Discord-side actionability gate: only fire when
+        ``unexecuted_usd >= _PLAN_EXECUTION_DEBT_MIN_USD`` ($50). A
+        $4 miss on a $20 plan is technically DISCONNECTED but not
+        worth the Discord chatter — distinct from the builder's
+        verdict ladder which is dollar-blind.
+
+    Localhost HTTP to ``/api/plan-execution-debt`` is the deliberate
+    choice over inlining the deployment-plan computation: it shares
+    the dashboard's SWR cache (so the hourly summary doesn't trigger a
+    fresh scorer pass on the hot path) and degrades gracefully on a
+    wedged dashboard (timeout → ""). Observational only, never gates
+    Opus, adds no caps (invariants #2/#12 — the
+    ``_deployment_plan_line`` precedent). Failure contract mirrors the
+    rest of ``reporter``: any fault → ``""``, never an exception ("no
+    Discord summary this report").
+
+    Takes no ``store`` parameter — unlike ``_deployment_plan_line``,
+    this helper does NOT do a cash-share suppression (a fully-deployed
+    book can still have a plan being ignored on the remaining $50).
+    Mirrors the lean signature of ``_behavioural_block`` /
+    ``_benchmark_line`` (helpers that read entirely through the
+    localhost endpoint or get_store directly).
+    """
+    try:
+        import json
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen(
+                _PLAN_EXECUTION_DEBT_URL,
+                timeout=_DEPLOY_PLAN_HTTP_TIMEOUT_S,
+            ) as resp:
+                if getattr(resp, "status", 200) != 200:
+                    return ""
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            print(f"[reporter] plan-execution-debt endpoint unavailable: {e}")
+            return ""
+
+        if not isinstance(data, dict):
+            return ""
+        verdict = data.get("verdict")
+        if verdict not in ("TIGHTENING", "DRIFTING", "DISCONNECTED"):
+            return ""
+        try:
+            unexec = float(data.get("unexecuted_usd") or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        if unexec < _PLAN_EXECUTION_DEBT_MIN_USD:
+            return ""
+        headline = data.get("headline") or ""
+        if not headline:
+            return ""
+        # Verdict icon: DISCONNECTED is the most alarming (gate plan
+        # being almost entirely ignored), DRIFTING / TIGHTENING are
+        # progressive warnings. Mirrors the
+        # ``_realized_vs_unrealized_line`` ladder pattern.
+        icon = {
+            "DISCONNECTED": "⚠️",
+            "DRIFTING": "🔶",
+            "TIGHTENING": "🟡",
+        }.get(verdict, "⚠️")
+        return f"{icon} **PLAN DEBT** ◈ {verdict}\n> {headline}"
+    except Exception as e:
+        print(f"[reporter] plan-execution-debt line skipped: {e}")
         return ""
 
 
@@ -5182,6 +5293,20 @@ def send_hourly_summary() -> bool:
     dp = _deployment_plan_line(store)
     if dp:
         body += "\n" + dp
+    # PLAN DEBT sits right after DEPLOY PLAN — both are dashboard→Discord
+    # gate-plan surfaces. DEPLOY PLAN says "here is the gate's buy list
+    # to deploy idle cash"; PLAN DEBT says "and the live engine has been
+    # IGNORING that list for the last 24h" (the live 2026-05-30 gap:
+    # planner wants $188 in MSFU at STRONG_HOLD, engine wedged since
+    # boot, scorer-recommended capital sitting unfilled). Both
+    # whitelist-suppress and never silence each other (a fresh READY plan
+    # can fire DEPLOY PLAN while the prior 24h-old plan is DISCONNECTED;
+    # the trader sees both signals at once — the new ask AND the prior
+    # gap). ALIGNED / NO_PLAN / ERROR stay silent — the summary must
+    # never become its own lying green light.
+    ped = _plan_execution_debt_line()
+    if ped:
+        body += "\n" + ped
     cn = _concentration_line(store)
     if cn:
         body += "\n" + cn
@@ -5498,6 +5623,16 @@ def send_daily_close() -> bool:
     dp = _deployment_plan_line(store)
     if dp:
         body += "\n" + dp
+    # PLAN DEBT follows DEPLOY PLAN on daily close too — see
+    # send_hourly_summary for the DEPLOY-PLAN→PLAN-DEBT rationale
+    # (the ask vs. the unhonored gap). On the daily close cadence
+    # the 24h execution window aligns cleanly with the session
+    # report — a DRIFTING/DISCONNECTED verdict here means the
+    # gate's plan was largely ignored during the trading day that
+    # just ended.
+    ped = _plan_execution_debt_line()
+    if ped:
+        body += "\n" + ped
     cn = _concentration_line(store)
     if cn:
         body += "\n" + cn
