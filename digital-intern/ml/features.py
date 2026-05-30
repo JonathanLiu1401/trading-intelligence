@@ -53,6 +53,20 @@ SOURCE_CRED: dict[str, float] = {
     "nitter": 0.40, "substack": 0.65, "wikipedia": 0.60,
     "finnhub": 0.78, "polygon": 0.80, "newsapi": 0.65,
     "alphavantage": 0.72,
+    # Hacker News is a tech-curiosity community feed, NOT a market wire.
+    # Live evidence (2026-05-30, 7d window): 2 of 3 ``hackernews`` urgency=2
+    # 🚨 BREAKING alerts fired on the analyst's Discord channel were pure
+    # noise — "Microcode inside the Intel 8087 floating-point chip" (hardware
+    # nostalgia blog) and "Free PDF earnings method – PDFEARN.BLOGSPOT.COM"
+    # (spammy promo). The ML urgency head over-scores these to ml_score >= 9
+    # because the titles contain "chip" / "earnings" tokens the model has
+    # learned correlate with market relevance. Without an entry here, the tag
+    # defaulted to DEFAULT_SOURCE_CRED (0.55) — above the 0.45
+    # ALERT_MIN_LONE_SOURCE_CRED bar, so the lone-source authority gate
+    # didn't catch them. Tier with reddit/nitter (forum-class community
+    # feeds): legitimate corroborated news still fires (the dedup
+    # dup_count > 1 path bypasses the bar) but lone noise is suppressed.
+    "hackernews": 0.40,
 }
 DEFAULT_SOURCE_CRED = 0.55
 

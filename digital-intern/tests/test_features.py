@@ -154,6 +154,26 @@ def test_source_credibility_known_high():
     assert a[0] > b[0]
 
 
+def test_hackernews_below_lone_alert_cred_bar():
+    """Hacker News is a tech-curio community feed, NOT a market wire.
+
+    Without an explicit credibility entry the tag defaulted to
+    DEFAULT_SOURCE_CRED (0.55), above the 0.45 ALERT_MIN_LONE_SOURCE_CRED
+    bar — so lone hackernews articles the ML urgency head over-scored
+    (hardware nostalgia blogs, spammy promos) fired full 🚨 BREAKING
+    pushes. Pin the entry below the lone-alert gate so the same class of
+    noise is now suppressed unless corroborated (dup_count > 1 bypass).
+    """
+    from watchers.alert_agent import ALERT_MIN_LONE_SOURCE_CRED
+    assert features._source_credibility("hackernews") < ALERT_MIN_LONE_SOURCE_CRED, (
+        f"hackernews cred {features._source_credibility('hackernews')} "
+        f">= lone-alert bar {ALERT_MIN_LONE_SOURCE_CRED} — tech-curio "
+        f"articles will keep firing standalone BREAKING pushes"
+    )
+    # Tiered with reddit / nitter (forum-class community feeds).
+    assert features._source_credibility("hackernews") == features._source_credibility("reddit")
+
+
 # ── Portfolio-ticker config loading ─────────────────────────────────────────
 # LIVE_PORTFOLIO_TICKERS is the union of a hardcoded fallback with whatever
 # config/portfolio.json currently holds — the operator's source of truth.
