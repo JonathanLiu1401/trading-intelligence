@@ -10197,6 +10197,16 @@ def scorer_predictions_api():
                 ticker=tk,
                 vol_ratio=q.get("vol_ratio"),
                 bb_pos=q.get("bb_position"),
+                # OOS-parity fix: forward the 3 enhanced MACD features
+                # that `get_quant_signals_live` already populates and that
+                # the live `_ml_decide` gate now passes. Omitting them
+                # would silently predict on a degraded vector (defaults
+                # to 0.0) while every other consumer (gate, gate_audit,
+                # gate_pnl, baseline_compare, …) predicts with them —
+                # the same `oos_parity_audit` BIAS_LARGE class of bug.
+                ema200_above=q.get("ema200_above"),
+                hist_cross_up=q.get("hist_cross_up"),
+                macd_below_zero_cross=q.get("macd_below_zero_cross"),
             )
             pred = meta["pred"]
             row = {
@@ -10284,6 +10294,13 @@ def scorer_attribution_api():
             ticker=req_tk,
             vol_ratio=q.get("vol_ratio"),
             bb_pos=q.get("bb_position"),
+            # OOS-parity fix: attribution must compute on the same
+            # feature vector predict_with_meta sees (the deployed pickle
+            # carries non-zero weights for these 3 inputs — see
+            # /api/scorer-predictions for the full rationale).
+            ema200_above=q.get("ema200_above"),
+            hist_cross_up=q.get("hist_cross_up"),
+            macd_below_zero_cross=q.get("macd_below_zero_cross"),
         )
         result["regime_mult"] = round(regime_mult, 3)
         result["ml_news_score"] = round(ml_score, 2)
@@ -10350,6 +10367,13 @@ def scorer_portfolio_attribution_api():
                 mom5=q.get("mom_5d"), mom20=q.get("mom_20d"),
                 regime_mult=regime_mult, ticker=tk,
                 vol_ratio=q.get("vol_ratio"), bb_pos=q.get("bb_position"),
+                # OOS-parity fix: see /api/scorer-predictions for the full
+                # rationale. The 3 enhanced MACD features must be forwarded
+                # so this attribution endpoint scores on the same vector
+                # the live `_ml_decide` gate sees.
+                ema200_above=q.get("ema200_above"),
+                hist_cross_up=q.get("hist_cross_up"),
+                macd_below_zero_cross=q.get("macd_below_zero_cross"),
             )
             meta = scorer.predict_with_meta(**common)
             attr = scorer.feature_contributions(**common)
@@ -10445,6 +10469,11 @@ def scorer_opportunities_api():
                 ticker=tk,
                 vol_ratio=q.get("vol_ratio"),
                 bb_pos=q.get("bb_position"),
+                # OOS-parity fix: see /api/scorer-predictions for the full
+                # rationale.
+                ema200_above=q.get("ema200_above"),
+                hist_cross_up=q.get("hist_cross_up"),
+                macd_below_zero_cross=q.get("macd_below_zero_cross"),
             )
             pred = float(meta["pred"])
             row = {
@@ -10688,6 +10717,11 @@ def position_thesis_api():
                 mom5=q.get("mom_5d"), mom20=q.get("mom_20d"),
                 regime_mult=regime_mult, ticker=tk,
                 vol_ratio=q.get("vol_ratio"), bb_pos=q.get("bb_position"),
+                # OOS-parity fix: see /api/scorer-predictions for the full
+                # rationale.
+                ema200_above=q.get("ema200_above"),
+                hist_cross_up=q.get("hist_cross_up"),
+                macd_below_zero_cross=q.get("macd_below_zero_cross"),
             )
             row = {
                 "ticker": tk,
@@ -11695,6 +11729,10 @@ def _live_scorer_predictions(scorer) -> list[dict]:
             ml_score=ml_score, rsi=q.get("rsi"), macd=q.get("macd_signal"),
             mom5=q.get("mom_5d"), mom20=q.get("mom_20d"), regime_mult=regime_mult,
             ticker=tk, vol_ratio=q.get("vol_ratio"), bb_pos=q.get("bb_position"),
+            # OOS-parity fix: see /api/scorer-predictions for the rationale.
+            ema200_above=q.get("ema200_above"),
+            hist_cross_up=q.get("hist_cross_up"),
+            macd_below_zero_cross=q.get("macd_below_zero_cross"),
         )
         pred = meta["pred"]
         row = {
@@ -20983,6 +21021,89 @@ def deployment_plan_conflicts_api():
         result["planner_headline"] = plan_data.get("headline")
         result["regime"] = plan_data.get("regime")
         result["cash_available_usd"] = plan_data.get("cash_available_usd")
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e),
+                        "verdict": "ERROR",
+                        "headline": f"ERROR — {e}"}), 500
+
+
+@app.route("/api/plan-execution-debt")
+def plan_execution_debt_api():
+    """Quantify how much of the *current* /api/deployment-plan output
+    has actually been executed by the live runner in the last
+    ``window_hours`` of BUY trades.
+
+    The planner ranks STRONG_HOLD opportunities and emits a buy list
+    every cycle, but nothing on the existing dashboard measures whether
+    the live trader has *acted on* the recommendation. Adjacent
+    diagnostics cover orthogonal questions:
+
+      * ``/api/deployment-plan-conflicts`` audits internal pathology
+        (inverse-pair / directional-hedge) — the plan's correctness.
+      * ``/api/funded-suggestions`` measures funding feasibility of
+        intern-driven WATCH suggestions, not the quant plan.
+      * ``/api/intent-followthrough`` measures Opus's own next-cycle
+        declarations, not the deployment plan.
+      * ``/api/cash-redeployment-latency-skill`` measures time from
+        SELL to next BUY, not from plan-emit to filled.
+
+    This endpoint is the missing measurement: per-plan-ticker fill
+    status (UNEXECUTED / PARTIAL / EXECUTED), rollup verdict
+    (ALIGNED ≥80% executed, TIGHTENING ≥50%, DRIFTING ≥20%,
+    DISCONNECTED otherwise), and a headline naming the worst-gap
+    ticker so the operator's eye lands on the specific recommendation
+    that's been ignored.
+
+    Query parameters:
+
+      * ``window_hours`` — how far back to count BUY trades (default 24,
+        clamped 0.5..720)
+      * forwards all ``/api/deployment-plan`` params verbatim
+        (``reserve_cash_pct`` / ``per_name_cap_pct`` / …) so a
+        retuned plan is measured against the same execution window.
+
+    Advisory only — never gates Opus, never modifies the plan or the
+    portfolio (AGENTS.md #2/#12). Pure core / never raises —
+    degrades to ``ERROR`` envelope."""
+    try:
+        from .analytics.plan_execution_debt import (
+            build_plan_execution_debt,
+            DEFAULT_WINDOW_HOURS,
+        )
+
+        try:
+            window_hours = float(request.args.get("window_hours",
+                                                  DEFAULT_WINDOW_HOURS))
+        except (TypeError, ValueError):
+            window_hours = DEFAULT_WINDOW_HOURS
+
+        # Reuse the deployment-plan route handler so query-param parsing
+        # and SWR/caching stay identical (same SSOT precedent
+        # ``/api/deployment-plan-conflicts`` follows).
+        resp = deployment_plan_api()
+        plan_data = resp.get_json() if hasattr(resp, "get_json") else {}
+        if not isinstance(plan_data, dict):
+            plan_data = {}
+        plan_rows = list(plan_data.get("plan") or [])
+
+        # Live BUY trades — bounded fetch large enough that even a
+        # 720h window can see every BUY at the live ~hourly cadence.
+        store = get_store()
+        trades = list(store.recent_trades(2000))
+
+        result = build_plan_execution_debt(
+            plan=plan_rows,
+            trades=trades,
+            window_hours=window_hours,
+        )
+        # Surface the planner context so a single panel can show
+        # "plan says deploy $X, you executed Y, debt is Z".
+        result["planner_verdict"] = plan_data.get("verdict")
+        result["planner_headline"] = plan_data.get("headline")
+        result["regime"] = plan_data.get("regime")
+        result["cash_available_usd"] = plan_data.get("cash_available_usd")
+        result["deployable_usd"] = plan_data.get("deployable_usd")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e),
