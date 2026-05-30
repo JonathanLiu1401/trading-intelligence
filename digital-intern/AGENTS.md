@@ -5,6 +5,248 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-30 HYBRID pass (Agent 3 third rotation) — un_news_worker bo.advance() fix + never_delivered_collector_audit
+
+**Persona:** debugger + feature developer + news-analyst consumer.
+
+**Counters:** `bugs_fixed=1`, `features_added=1`, `user_findings=6`.
+
+### Phase 1 — debug & fix (1 bug)
+
+`daemon.py::un_news_worker` shipped in commit `71e9cd7` (2026-05-23) with
+`bo.advance()` in its except-branch — a method that has never existed on
+`core.backoff.Backoff` (the helper exposes `peek` / `reset` / `sleep`, and
+every other worker uses `bo.sleep(lambda: _running)` on failure). Every time
+`collect_un_news()` raised — frequent under DB write-lock contention,
+documented memory `di-insert-batch-lock-contention` — the worker
+`AttributeError`'d on the except-branch, the supervisor counted a crash, and
+the back-off window was never actually applied → the failing worker
+re-fired immediately at every cycle, burning supervisor crash budget for 7
+days straight.
+
+**Live evidence** (`logs/daemon.log.1:270`):
+
+```
+[un_news] thread exited with AttributeError: 'Backoff' object has no attribute 'advance'
+Traceback (most recent call last):
+  File "daemon.py", line 3136, in un_news_worker
+    bo.advance()
+AttributeError: 'Backoff' object has no attribute 'advance'
+```
+
+**Delivery evidence** (articles.db at audit time):
+
+```
+un_econ_dev:  29 rows, last_first_seen 2026-05-23T14:26:57Z
+un_climate:   30 rows, last_first_seen 2026-05-23T14:26:57Z
+un_americas:  26 rows, last_first_seen 2026-05-23T14:26:57Z
+un_africa:    29 rows, last_first_seen 2026-05-23T14:26:57Z
+un_europe:    28 rows, last_first_seen 2026-05-23T14:26:57Z
+un_health:    18 rows, last_first_seen 2026-05-23T14:26:57Z
+```
+
+Identical `last_first_seen` across all six feeds at `2026-05-23T14:26:57Z` —
+the very first cycle, the one moment the worker ran before `bo.advance()`
+took it out. Every subsequent cycle for 7 days delivered zero rows.
+
+**Fix** (two coupled, single-commit, isolated to the one broken worker):
+
+* `bo.advance()` → `bo.sleep(lambda: _running) ; continue` — the canonical
+  pattern every other worker uses.
+* `while True:` → `while _running:` — matches every other worker so the
+  daemon shutdown signal can stop the loop promptly.
+
+**Pinned by `tests/test_worker_backoff_contract.py`** (4 tests, AST-based —
+zero daemon-import side-effects):
+
+* `test_every_bo_method_resolves_to_backoff_attr` — static AST scan: every
+  `bo.<attr>(...)` call inside any function whose body declares
+  `bo = Backoff(...)` must resolve to a real Backoff attribute. Catches the
+  exact bug class — would have caught `bo.advance` on commit. Generic
+  enough to catch any future typo / rename.
+* `test_un_news_worker_uses_canonical_shape` — pins both `while _running:`
+  AND `bo.sleep(` in the function body; either drifting back to the broken
+  form fails the test.
+* `test_backoff_does_not_define_advance` — evidence lock; the
+  `daemon.log.1` evidence cited above stays meaningful only while
+  `Backoff.advance` is absent.
+* `test_backoff_exposes_canonical_methods` — Backoff API drift-lock
+  (`peek` / `reset` / `sleep` must exist & be callable; a rename forces
+  this test to update in lockstep).
+
+### Phase 2 — feature (`never_delivered_collector_audit`)
+
+The Phase-1 bug went undetected for 7 days even though
+`analytics/stale_source_alerter` is the documented freshness monitor.
+**Why the freshness monitor missed it:** its SQL pull groups `articles.db`
+rows by `source` over the last 3 days, so a collector that has NEVER
+written a row (or has been totally silent for >3 days) simply does NOT
+appear in the snapshot — silently invisible to the operator. The
+freshness monitor reads "169 stale of 233 collectors" every cycle but
+un_news is invisible.
+
+`analytics/never_delivered_collector_audit.py` closes that gap. Pure
+read-side builder + live entrypoint:
+
+**API.**
+
+```python
+audit(rows, registry=EXPECTED_COLLECTORS, *, now=None, window_h=24) -> dict
+audit_live(store, hours=24, **kwargs) -> dict   # applies _LIVE_ONLY_CLAUSE
+```
+
+Returns `{generated_at, window_h, n_pool_rows, by_worker,
+n_never_delivered, n_silent_24h, n_slow, n_delivering, verdict}`.
+Per-collector block: `{source_prefix, n_total, n_24h, min_rows_24h,
+last_first_seen, verdict}`.
+
+**Per-collector verdicts.**
+
+* `NEVER_DELIVERED` — zero rows ever (or zero in window): worker
+  crashes before the first `_ingest` call. The exact failure shape of
+  the un_news bug.
+* `SILENT_24H` — at least one row historically but zero in last 24h.
+* `SLOW` — rows in 24h but below the per-collector floor.
+* `DELIVERING` — at or above the floor (inclusive).
+
+**Aggregate verdict.** `NO_DATA` / `HEALTHY` / `FEW_DEGRADED` /
+`WIDESPREAD_SILENCE`. Any `NEVER_DELIVERED` hit unconditionally
+escalates to `WIDESPREAD_SILENCE` because the freshness monitor cannot
+see those collectors — the highest-severity case.
+
+**Curated registry (`EXPECTED_COLLECTORS`).** Intentionally small and
+extensible. Initial entries:
+
+```
+un_news     un_       floor=6    (the fixed worker — canonical NEVER_DELIVERED case)
+web         scraped/  floor=50   (web_scraper firehose)
+gdelt       GDELT/    floor=50   (GDELT collector — case-SENSITIVE prefix on purpose)
+google_news GN:       floor=100  (Google News topic feeds — sources.json)
+stocktwits  stocktwits floor=50  (StockTwits forum stream)
+```
+
+Source-prefix match is `startswith`, case-sensitive — collectors emit
+canonical-cased tags (`un_econ_dev`, `GDELT/host`, `scraped/host`,
+`GN: topic`). Adding a new worker = a new tuple. Inactive prefixes are
+DELIBERATELY excluded (registering them would false-positive
+NEVER_DELIVERED every 24h and devalue the verdict).
+
+**Live evidence (2026-05-30 14:28 UTC, post-Phase-1-fix).**
+
+```
+verdict=FEW_DEGRADED  n_pool=4674  never=0 silent=0 slow=1 delivering=4
+  un_news     SLOW         (n_24h=1, floor 6) — fix is taking effect; audit catches recovery in real time
+  web         DELIVERING   (n_24h=200)
+  gdelt       DELIVERING   (n_24h=220)
+  google_news DELIVERING   (n_24h=1790)
+  stocktwits  DELIVERING   (n_24h=493)
+```
+
+If the Phase-1 fix had not been applied, the same audit would have
+read `NEVER_DELIVERED + WIDESPREAD_SILENCE` — exactly the analyst-facing
+surface that should have flagged the bug 7 days ago. Verified by
+`test_un_news_bug_signature` which feeds the same shape (rss + web rows
+present, zero `un_` rows) into the builder and asserts the verdict.
+
+**Invariants intact (all four).**
+
+* **Backtest isolation:** live entrypoint applies `_LIVE_ONLY_CLAUSE`
+  verbatim; a test asserts the literal appears in the module source so
+  a future refactor cannot accidentally drop it. Synthetic
+  `backtest://` / `backtest_*` / `opus_annotation*` rows never reach
+  the verdict — pinned by an additional test that puts synthetic rows
+  in the pool and confirms they don't bump any worker's count.
+* **score_source separation:** audit reads only `source` + `first_seen`.
+  A test inspects the module source for any UPDATE/INSERT/score-
+  mutation surface as a drift-lock (forbidden substrings include
+  `update_ai_scores_batch`, `update_ml_scores_batch`, `mark_alerted`,
+  `UPDATE articles`, `INSERT INTO articles`).
+* **Read-only:** live entrypoint single-shot SELECT with bounded
+  window; no DB write.
+* **Pure builder:** `audit(...)` derives the verdict from inputs alone
+  — no DB, no clock (`now=` defaulted), no I/O. Re-run yields
+  identical output (deterministic).
+
+**Tests (29).** Specific-value assertions pin verdict ladder
+transitions per-collector AND aggregate, prefix-match semantics
+(startswith + case-sensitive), un_news bug signature reproduction,
+malformed-row defense, envelope-keys drift-lock (top-level + per-worker
+block), window_h thread-through, builder purity, naive-datetime UTC
+normalisation, and an end-to-end in-memory `ArticleStore` test that
+exercises `_LIVE_ONLY_CLAUSE` excluding a `backtest_` row.
+
+### Phase 3 — live news-analyst findings (6)
+
+Against `/media/zeph/projects/digital-intern/db/articles.db` at
+2026-05-30T14:28Z:
+
+1. **un_news_worker dead since 71e9cd7 / 2026-05-23** — exactly 7 days
+   of zero delivery from all six UN feeds (un_econ_dev / un_climate /
+   un_health / un_americas / un_africa / un_europe). The Phase-1 fix
+   restored it; the audit caught the recovery within minutes (1 row
+   landed at 2026-05-30T14:26:03Z, SLOW verdict).
+2. **69% of recent BREAKING pushes are model-only (ml_score, no LLM
+   ground truth)** — last 24h: 20 of 29 pushes carry `score_source='ml'`
+   vs 9 `score_source='llm'`. The alert prompt does hedge unverified
+   rows via the `_llm_vetted` flag, but the analyst-facing AGGREGATE
+   suggests Sonnet's urgency-scorer pass is under-resourced relative to
+   the ML model's urgency-head output. Recurring concern — well above
+   the desired ~50/50 LLM/ML mix for a calibrated push channel.
+3. **Two recent stocktwits-class urgent pushes slipped the chatter
+   gate** — `02:09:55 ml_score=9.94` `$IONQ $QBTS $QUBT $RGTI $XRP.X
+   nobody wants to buy your dumb shtcoin` and `02:11:38 ml_score=9.97`
+   `$QQQ $SPY $SOXX $SOXL $TQQQ After latest price cuts Deepseek...` —
+   both `score_source='ml'`, the ML urgency head over-scored the
+   $TICKER-density + capital-letter density. Pre-existing recurring
+   issue — `_looks_like_stocktwits_chatter` runs in the LLM path but
+   the ML scoring path can independently set `urgency=1` via
+   `update_ml_scores_batch`, then the alert path's
+   `_filter_low_authority_lone` requires `dup_count<=1` AND
+   `cred<0.45`; stocktwits cred is 0.30 (<0.45), so a LONE row should
+   be suppressed — but `dup_count` was apparently >1 for this batch
+   pair. Worth a dedicated audit pass in a future agent rotation
+   (out of scope here).
+4. **Briefing cadence one ~9h gap** — 04:56Z → 14:04Z = 9.1h (target
+   5h). `briefing_cadence_trend.SLIPPING` precedent — Opus quota
+   pressure during heavy retrain windows. Operator advisory; the
+   `briefing_health` audit already surfaces this.
+5. **173 stale collectors of ~233 right now** — `stale_source_alerter`
+   snapshot at 14:11:56Z (cached `/home/zeph/logs/source_freshness.json`).
+   Most are non-finance / Crypto / Asia / Europe wires whose RSS feeds
+   are >2h dormant — chronic-dark precedent (`di-chronic-dark-collectors`),
+   not a fresh issue. The `never_delivered_collector_audit` complements
+   this by catching collectors that are not stale-enumerable.
+6. **score_source mix 24h: 7751 ml / 216 llm / 70 NULL** — 1.4% LLM,
+   97% ML — the `di-training-pool-synthetic-skew` precedent. Strong
+   labels are vanishingly thin compared to model self-predictions
+   that the trainer-side `STRONG_LABEL_WHERE` exclusion correctly
+   ignores. Operational note, not a fresh bug.
+
+### Phase 4 — docs (this entry)
+
+No CLAUDE.md change (no new invariants — both Phase-1 and Phase-2 work
+inside the existing four-invariant frame).
+
+### Files staged + committed (only mine — explicit pathspec)
+
+* `daemon.py` (5-line surgical fix to un_news_worker) — commit 9814e3f.
+* `tests/test_worker_backoff_contract.py` (171 LoC, 4 tests) — commit 9814e3f.
+* `analytics/never_delivered_collector_audit.py` (332 LoC) — commit e21d439.
+* `tests/test_never_delivered_collector_audit.py` (441 LoC, 29 tests) — commit e21d439.
+
+### Files left untouched
+
+Many concurrent-agent WIP edits in flight
+(`analysis/claude_analyst.py`, `watchers/alert_agent.py`,
+`dashboard/web_server.py`, plus untracked `analysis/wire_stance.py`,
+`analytics/ml_ai_divergence.py`,
+`collectors/{earnings_transcript,financial_stress}_collector.py`,
+`tests/test_{alert_fund_stake_delta,wire_stance}.py`); all left exactly
+as-is. No `git add -A` (concurrent-agent staging-race footgun memory).
+Staged only my four files by explicit pathspec across two commits.
+
+---
+
 ## 2026-05-30 HYBRID pass (Agent 3 second rotation) — url-canonicalizer referrer-param fix + pushed_alert_title_duplicate_audit
 
 **Persona:** debugger + feature developer + news-analyst consumer.
