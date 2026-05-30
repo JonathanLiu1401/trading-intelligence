@@ -5,6 +5,165 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-30 HYBRID pass (Agent 3 second rotation) — url-canonicalizer referrer-param fix + pushed_alert_title_duplicate_audit
+
+**Persona:** debugger + feature developer + news-analyst consumer.
+
+**Counters:** `bugs_fixed=1`, `features_added=1`, `user_findings=5`.
+
+### Phase 1 — debug & fix (1 bug)
+
+`collectors/url_canonicalizer.py::_TRACKING_EXACT` was missing three referrer-tracking
+query params widely emitted by Dow Jones (Barron's / WSJ / MarketWatch) and Yahoo Finance
+syndication: `mod`, `siteid`, `ypt`.
+
+Live evidence (2026-05-29 24h pull on this DB): the same Barron's article
+"Micron Faces New Threat From Samsung's Memory Chip for AI" fired a 🚨 BREAKING push
+**3× in 24h** via referrer-param variants — the yfinance/Barrons.com feed delivered
+`?siteid=yhoof2&ypt=1`, the scraped/www.barrons.com feed delivered the SAME
+`/articles/...-ac9a8e59` slug with `?mod=md_home_pan_m`. The canonical id diverged
+across these variants, leading to three articles.db rows, three score_pending passes,
+and three Discord pushes for ONE article.
+
+Safety analysis (committed alongside the fix):
+  * `mod` is a Dow Jones module-referrer marker (mod=djhpsi, mod=home, etc); never
+    a content selector.
+  * `siteid` / `ypt` are Yahoo syndication source tags.
+  * Even if a non-DJN site ever uses `?mod=` as a content selector, the article
+    title is also part of the canonical id hash — so the strip cannot wrongly
+    collapse two semantically distinct articles into one id.
+
+Pinned by `tests/test_url_canonicalizer.py::test_strips_dow_jones_and_yahoo_referrer_params`
+(specific-value assertion: the two real Barron's variants must canonicalize to the
+same bare URL and same article_id).
+
+### Phase 2 — feature (`pushed_alert_title_duplicate_audit`)
+
+The URL canonicalizer fix closes ONE class of duplicate-push (referrer-param
+variants of the same URL). It does NOT close the broader class: same headline
+syndicated across MSN / YahooFinance / Google News with materially different URLs.
+The existing `pushed_alert_event_concentration` audit catches duplicates only when
+the title carries a recognised held-ticker token + an event-class keyword; rows
+that paraphrase the underlying event with a generic anchor ("MSN", "Reuters",
+"Bloomberg") fall outside its lens.
+
+`analytics/pushed_alert_title_duplicate_audit` is the missing read-side
+calibration view: groups urgency=2 rows in the recent window by normalized title,
+ranks by push-count, emits a verdict
+(`NO_DATA` / `NO_DUPLICATION` / `LIGHT_DUPLICATION` / `HEAVY_DUPLICATION`).
+
+**API.**
+
+```python
+build_audit(rows, *, window_h, min_pushes_for_verdict=8, max_groups=20,
+            max_source_examples=4) -> dict
+audit(store, hours=24, **kwargs) -> dict   # live entrypoint
+```
+
+Returns `{window_h, n_pushes, n_distinct_titles, n_duplicate_titles,
+n_redundant_pushes, duplication_rate_pct, duplicate_groups[], verdict}`. Each
+group surfaces `{title, push_count, first_seen_oldest, first_seen_newest, sources[]}`.
+
+**Live evidence (2026-05-30 ran against articles.db, 72h window).**
+
+```
+verdict=LIGHT_DUPLICATION  n_pushes=246  n_dup_titles=16  redundant=20  rate=8.13%
+  3x  micron faces new threat from samsung's memory chip for ai
+  3x  nvda shares fall premarket: ceo jensen huang announces taiwan headquarters...
+  3x  taiwan probes alleged nvidia chip exports
+  3x  3 reasons why nvidia just became more boring, and wall street doesn't like it
+  2x  after micron, nvidia-supplier sk hynix joins $1 trillion club...
+  ...
+```
+
+The Micron 3× row mix predates the URL-canonicalizer fix; the audit will confirm
+the fix is holding once a fresh window passes the older urgency=2 rows.
+
+**Invariants intact (all four).** Pure read-side over articles.db. `LIVE_ONLY_CLAUSE`
+applied (drift-locked equal to `storage.article_store._LIVE_ONLY_CLAUSE` via a
+specific-value test). No DB write — `ai_score` / `ml_score` / `score_source` /
+`urgency` untouched. Backtest isolation by construction.
+
+**Tests (18).** Specific-value assertions pin: verdict-ladder boundaries (HEAVY at
+60%, LIGHT at 5% mid-band, borderline 3% collapses to NO_DUPLICATION via strict
+`>`), normalization correctness (whitespace collapse, publisher-tag preservation,
+None/empty handling), deterministic ordering (push-count desc + alphabetical
+tie-break), `max_groups` and `max_source_examples` caps, `_LIVE_ONLY_CLAUSE`
+drift-lock, envelope-keys freeze, and an end-to-end in-memory-store test that
+exercises urgency-filter + backtest-exclusion + window cutoff.
+
+### Phase 3 — live news-analyst findings (5)
+
+Against `/media/zeph/projects/digital-intern/db/articles.db` at 2026-05-30T09:30Z:
+
+1. **8.13% exact-title duplication rate over 72h** (the new audit's live output).
+   16 of 246 BREAKING pushes were redundant copies of a title already pushed
+   earlier in the window. The fix landed by this session collapses one class
+   (URL referrer-param variants); the residual is paraphrase-Jaccard-misses
+   across MSN / YahooFinance / GN sources. LIGHT verdict — not catastrophic
+   but consistent with the analyst's standing duplicate-push complaint.
+
+2. **Ingest healthy at 913 articles/hour** (live-only filter applied). Top
+   sources last hour: stocktwits (110), GN: Nasdaq (72), GN: IPO (39),
+   GN: economy inflation (37), GN: Nvidia (36). Briefings firing on
+   cadence (last 5 spaced 5-6h apart, the 5h `HEARTBEAT_INTERVAL`).
+
+3. **70% ML-only urgent fraction in last 24h** — 21 of 30 urgent rows carry
+   `score_source='ml'` (`ai_score=0`, raw unverified ML urgency-head calls).
+   Same pattern as recent agent rotations; the
+   `[unverified — model-only urgent]` calibration tag hedges per-row but the
+   aggregate unverified-fraction has not improved.
+
+4. **103 chronic-dark collectors** (`source_health` line in daemon.log).
+   Standing external gap (`memory/di-chronic-dark-collectors`): polygon /
+   newsapi / nitter / sec_edgar etc. The supervisor correctly disabled them;
+   the 10-minute `benzinga_analyst` and `polymarket` recovered this cycle.
+
+5. **`fred_production` collector hitting read timeouts** on
+   INDPRO / TCU / PERMIT FRED endpoints (logs/daemon.log 09:02-09:03Z).
+   `fred.stlouisfed.org` is timing out at the 45s read budget; the worker's
+   per-series error-handling keeps the rest of the FRED pull alive, but
+   these three macro series are silently absent from briefings. Operational
+   note, not a fresh bug — would benefit from a per-series timeout retry
+   with backoff if it persists.
+
+### Phase 4 — docs & verify
+
+This AGENTS.md entry. No CLAUDE.md change (no new invariants).
+
+**Final verify.**
+
+```
+$ python3 -c "import sys; sys.path.insert(0,'.'); from storage import article_store; \
+              from ml import features, model; print('imports OK')"
+imports OK
+
+$ python3 -m pytest tests/test_pushed_alert_title_duplicate_audit.py \
+  tests/test_url_canonicalizer.py tests/test_article_store.py tests/test_features.py \
+  tests/test_alert_dedup.py tests/test_alert_recency.py tests/test_alert_agent.py -q
+125 passed in 3.96s
+```
+
+### Files committed (mine, explicit pathspec)
+
+* `collectors/url_canonicalizer.py` — added 3 referrer-tracking params (Phase 1).
+* `tests/test_url_canonicalizer.py` — `+test_strips_dow_jones_and_yahoo_referrer_params` (Phase 1).
+* `analytics/pushed_alert_title_duplicate_audit.py` — new 250-LoC builder + audit (Phase 2).
+* `tests/test_pushed_alert_title_duplicate_audit.py` — 18 specific-value tests (Phase 2).
+* `AGENTS.md` — this entry.
+
+**Staging discipline.** Per-commit explicit pathspec
+(`memory/di-shared-repo-concurrency` + `pt-concurrent-samerole-staging-race`). No
+`git add -A`; no `.json` / `config/` / `data/` / `logs/` staged. Concurrent WIP
+edits in flight on this tree (`analysis/claude_analyst.py`,
+`watchers/alert_agent.py`, `dashboard/web_server.py`, untracked
+`analysis/wire_stance.py`, `analytics/ml_ai_divergence.py`,
+`collectors/{earnings_transcript,financial_stress}_collector.py`,
+`tests/test_{alert_fund_stake_delta,wire_stance}.py`) deliberately left exactly
+as found.
+
+---
+
 ## 2026-05-30 Agent 3 (digital-intern) — stocktwits longform_chatter analytics
 
 **Persona:** debugger + feature developer + news-analyst consumer.
