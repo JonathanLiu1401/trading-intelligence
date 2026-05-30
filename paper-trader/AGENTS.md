@@ -1,5 +1,98 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 core HYBRID pass (Agent 1) — last-fill verdict line
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=3
+
+### Phase 1 — no fresh bug surfaced (`bugs_fixed = 0`)
+
+Read all required core files (runner.py, reporter.py, signals.py, strategy.py
+decide path, dashboard.py endpoint table, market.py, store.py). Inspected
+each for race conditions, off-by-one comparators, exception-swallowing,
+quota/breaker latch state, missing TZ handling, and dead branches.
+Re-grepped recent code paths (singleton lock recheck, alarm latch headlines,
+book exposure clamping, runner heartbeat verdict ladder, dead_tickers
+sweeping). Existing core test suites (`test_core_market.py` 122 pass,
+`test_core_runner.py` 70 pass + 1 skip, `test_core_reporter.py` 434 pass,
+`test_core_signals.py` 100 pass) cover every invariant I would have wanted
+to pin. No high-confidence bug remained after the sweep. Phase 1 commit
+skipped per the guard.
+
+### Phase 2 — `_last_fill_line` reporter helper (`features_added = 1`)
+
+The runner heartbeat answers *"is the decision loop alive?"* by tracking
+`decisions.timestamp` cadence; `/api/last-real-decision` answers *"did the
+engine produce a HOLD/FILLED/BLOCKED row recently?"*. Neither answers the
+trader's real question on a multi-hour static book:
+
+  *When did the engine last actually pull the trigger?*
+
+A string of HOLDs is a real decision but the book is unchanged. The hourly's
+"Recent trades" block prints the last 5 timestamps but leaves the operator
+to subtract by hand to learn the age of the newest. Live confirmation —
+verified before commit: the live book had been STATIC for 6h28m since the
+last MU BUY while `/api/runner-heartbeat` reported `HEALTHY · real_age=51m`
+(all HOLDs). This is the *orthogonal* "engine alive but not acting" signal.
+
+* `paper_trader/analytics/last_fill.py` — pure builder. Verdict ladder over
+  the most recent trade in `store.recent_trades(1)`:
+  `FRESH` (<6h) → silent · `STATIC` (6h-36h) → surfaced · `FROZEN` (>36h) →
+  surfaced with the ⚠️ marker. Returns a stable dict shape
+  (`state, headline, ticker, action, qty, price, value, last_fill_ts,
+  secs_since, age, reason`). Degrade-safe: empty ledger, missing/unparseable
+  ts, non-dict rows, garbage qty all collapse to `NO_DATA` without raising;
+  a wall-clock step-back clamps `secs_since` to 0.
+* `paper_trader/reporter.py` — `_last_fill_line(store)` composes the
+  builder verbatim (single source of truth, AGENTS.md invariant #10),
+  wired into both `send_hourly_summary` and `send_daily_close`. Suppresses
+  `FRESH` / `NO_DATA` per the silence-when-nothing-actionable precedent.
+* `tests/test_last_fill.py` — 33 tests covering verdict boundaries (FRESH
+  just-under-threshold, STATIC at FRESH_HOURS boundary, FROZEN at
+  FROZEN_HOURS threshold), shape fields, degrade-safe paths, the humanize
+  helper edge cases (sub-minute → `0m`, negative → `""`, garbage → `""`),
+  and the reporter wiring into both summaries.
+
+Commit: `23e4d44`.
+
+### Phase 3 — live validation findings (`user_findings = 3`)
+
+1. **`/api/runner-heartbeat` reports `HEALTHY · real_age=51m` while the
+   book has been STATIC for 6h28m.** This is the gap the new line closes —
+   "engine alive (Claude responds with HOLD)" is a different question from
+   "engine acting (book is moving)". A trader paged on the heartbeat
+   ALONE would conclude the desk is fine when in reality the engine has
+   been frozen on a single MU lot (82% of book) for over six hours.
+2. **`decision_efficacy = DEGRADED`, 55% NO_DECISION over last 20
+   cycles.** Documented chronic host-saturation pathology (memory:
+   `pt-no-decision-host-saturation`). The new feature does NOT address
+   this — it is the orthogonal "engine alive but quiet" signal. The host
+   guard / mid-call re-probe / circuit breaker already cover the wedge
+   surface.
+3. **`/api/healthz` shows `behind=1, stale=true`** — a new commit had
+   landed and the runner is on the older boot_sha. The git-watcher
+   thread should have force-restarted on the next deferred-restart tick
+   to deploy the new code; the live snapshot caught it mid-window. No
+   action needed.
+
+### Test commands for the core domain
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Focused: the new tests (~14s).
+python3 -m pytest tests/test_last_fill.py -v
+
+# Full reporter suite (~80s — verifies wiring + 434 sibling tests).
+python3 -m pytest tests/test_core_reporter.py -q
+
+# Core domain (runner, market, store, signals, reporter together — under load
+# this often hits the 60s test-watch timeout; run focused subsets above).
+python3 -m pytest tests/test_core_market.py tests/test_core_runner.py \
+    tests/test_core_store.py tests/test_core_signals.py -q
+```
+
+---
+
 ## 2026-05-29 ML+backtest HYBRID pass (Agent 2) — winner JSONL urgency invariant fix + per-arm Kelly diagnostic
 
 **Counters:** bugs_fixed=1 · features_added=1 · user_findings=5
