@@ -137,6 +137,7 @@ from collectors.short_seller_collector import collect_short_sellers
 from collectors.robinhood_popular_collector import collect_robinhood_popular
 from collectors.financial_blogs_collector import collect_financial_blogs
 from collectors.investment_research_blogs_collector import collect_investment_research_blogs
+from collectors.think_tank_research_collector import collect_think_tank_research
 from collectors.earnings_transcript_collector import collect_earnings_transcripts
 from collectors.hackernews_collector import collect_hackernews
 from collectors.clinical_trials_collector import collect_clinical_trials
@@ -316,6 +317,7 @@ SHORT_SELLER_INTERVAL      = 1800    # Short-seller research reports (rare, high
 ROBINHOOD_POPULAR_INTERVAL = 3600    # Robinhood 100 most-popular (retail sentiment) — hourly, deduped daily
 FINANCIAL_BLOGS_INTERVAL = 600    # InvestorPlace, Motley Fool, Nasdaq RSS — every 10min
 INVESTMENT_RESEARCH_BLOGS_INTERVAL = 900  # CMT/LynAlden/Felder/AWoCS/AlphaArchitect blogs — every 15min
+THINK_TANK_RESEARCH_INTERVAL = 1800   # ProMarket/Apricitas/EmployAmerica/VoxEU/PhenomenalWorld — every 30min
 EARNINGS_TRANSCRIPT_INTERVAL = 300  # Motley Fool earnings transcripts — every 5min
 HACKERNEWS_INTERVAL     = 300     # Hacker News front-page + finance/business stories — every 5min
 CLINICAL_TRIALS_INTERVAL = 3600   # ClinicalTrials.gov Phase 3 catalyst tracker (pharma/biotech) — hourly
@@ -459,6 +461,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "robinhood_popular": ROBINHOOD_POPULAR_INTERVAL,
     "financial_blogs": FINANCIAL_BLOGS_INTERVAL,
     "investment_research_blogs": INVESTMENT_RESEARCH_BLOGS_INTERVAL,
+    "think_tank_research": THINK_TANK_RESEARCH_INTERVAL,
     "hackernews": HACKERNEWS_INTERVAL,
     "clinical_trials": CLINICAL_TRIALS_INTERVAL,
     "usaspending": USASPENDING_INTERVAL,
@@ -3367,6 +3370,28 @@ def investment_research_blogs_worker(store: ArticleStore):
         _sleep(INVESTMENT_RESEARCH_BLOGS_INTERVAL)
 
 
+# ── Worker: Think tank & academic economics research — every 30min ────────────
+def think_tank_research_worker(store: ArticleStore):
+    log.info("[think_tank_research_worker] started")
+    bo = Backoff("think_tank_research", base=60.0, cap=1800.0)
+    while _running:
+        try:
+            articles = collect_think_tank_research()
+            _ingest(store, articles, "think_tank_research")
+            try:
+                source_health.record_result("think_tank_research", len(articles))
+            except Exception as he:
+                log.warning(f"[think_tank_research_worker] source_health error: {he}")
+            _worker_last_ok["think_tank_research"] = time.time()
+            log.debug(f"[think_tank_research] cycle ok ({len(articles)} new rows)")
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[think_tank_research_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(THINK_TANK_RESEARCH_INTERVAL)
+
+
 # ── Worker: Motley Fool earnings call transcripts — every 5min ───────────────
 def earnings_transcript_worker(store: ArticleStore):
     log.info("[earnings_transcript_worker] started")
@@ -5279,6 +5304,7 @@ def main():
         ("robinhood_popular", robinhood_popular_worker),
         ("financial_blogs", financial_blogs_worker),
         ("investment_research_blogs", investment_research_blogs_worker),
+        ("think_tank_research", think_tank_research_worker),
         ("hackernews",     hackernews_worker),
         ("clinical_trials", clinical_trials_worker),
         ("usaspending",    usaspending_worker),
