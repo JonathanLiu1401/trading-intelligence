@@ -1866,6 +1866,18 @@ class ArticleStore:
             _looks_like_recap_template,
             _looks_like_stocktwits_chatter,
         )
+        # Non-English title gate — separate module so the alert-side
+        # mirror can be added later without a circular import. The
+        # multi-language press-release noise (Spanish/French/German/
+        # Portuguese copies of the same corporate wire) is a distinct
+        # surface from the four sibling gates above; the ML urgency head
+        # over-scores foreign-language titles to ml_score >= 9 because
+        # it has no language-ID prior. Live evidence (2026-05-30 30d
+        # audit): 5 of 8 PR Newswire BREAKING alerts on the consumer's
+        # Discord were non-English wire copies. See
+        # ``watchers.non_english_filter`` docstring for the full
+        # discriminator + sample evidence.
+        from watchers.non_english_filter import looks_non_english
         pre_floor: list[tuple[str, float, int]] = []
         real: list[dict] = []
         for art in batch:
@@ -1887,6 +1899,13 @@ class ArticleStore:
             # threshold tweak engages across all three pre-floor surfaces
             # (this store helper + urgency_scorer + the alert-side gate).
             if _looks_like_stocktwits_chatter(art):
+                pre_floor.append((aid, 0.01, 0))
+                continue
+            # Non-English title — Spanish/French/German/Portuguese press-
+            # release copies that the urgency head over-scores. Two-signal
+            # AND (non-English stopword + diacritic) keeps precision against
+            # English headlines with one accented name ("São Paulo").
+            if looks_non_english(art):
                 pre_floor.append((aid, 0.01, 0))
                 continue
             real.append(art)
