@@ -33808,3 +33808,311 @@ Working copy at start carried sibling agents' uncommitted changes to
 `test_continuous_outcome_corpus_health_ledger.py` /
 `test_plan_execution_debt.py` test files); all left untouched per the
 concurrent-agent footgun memory. No `git add -A`.
+
+
+## 2026-05-30 — Agent 2 (paper-trader ML+backtests) HYBRID pass #2
+
+Persona: a quant researcher staring at a deployed scorer whose recent
+`baseline_skill_log` reads `verdict=MLP_WORSE_THAN_TRIVIAL` and a
+conviction gate whose `gate_effectively_active=False` on every recent
+cycle. Concrete operational question: when the gate abstains on a BUY,
+which guard fired — the off-distribution clamp (architectural) or the
+no-skill kill-switch (data-driven)? Today the legacy `gate_off_dist`
+column collapses both into one boolean, so the answer was unrecoverable
+from the persisted corpus.
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=8
+
+### Phase 1 — no commit (codebase honestly clean)
+
+Inspected `paper_trader/ml/decision_scorer.py`, `paper_trader/backtest.py`,
+and `run_continuous_backtests.py` end-to-end for bugs, dead code, races,
+missing error handling, atomic-write hazards, and shape/dtype subtleties.
+Cross-referenced against the live `decision_outcomes.jsonl`,
+`scorer_skill_log.jsonl`, `baseline_skill_log.jsonl`, and recent
+`continuous.log`. Audited the family of 17 `_append_*_skill_log`
+ledger functions for copy-paste constant cross-references — each one
+correctly references its own `_LOG` path and `_LOG_KEEP` cap. Memory
+`pt-test-suite-timing` honoured (focused `-k` runs only). After several
+hours of skeptical review the only candidates were micro-issues whose
+fix would be churn: `_pick_window`'s `*365` ignoring leap years, a
+`cycle_seed` `^...&` precedence that is immaterial for a seed XOR.
+Honest `bugs_fixed=0` per the Phase 1 commit guard.
+
+### Phase 2 — `feat:` `gate_abstention_kind` (commit `1807528`)
+
+**The gap.** `_parse_gate_decision` returns `(gate_scorer_pred,
+gate_off_dist)`, where the boolean is True for EITHER abstention
+marker:
+  * `(off-dist,gate-skipped)`  — the scorer's raw prediction exceeded
+    ±`PRED_CLAMP_PCT` (architectural guard, the scorer flagged low
+    trust itself)
+  * `(gate-killed,no-skill)`   — the per-cycle trailing-OOS-IC
+    kill-switch fired (data-driven guard, the gate sat out because
+    median trailing rank-IC was at noise / anti-predictive)
+
+The legacy collapse is correct for downstream analyzers that drop
+abstention rows (`gate_pnl`, `gate_arm_historical` correctly drop both
+kinds — neither carries an attributable gate action). But it loses the
+cause: a kill-switched cycle and an off-distribution clamp are
+operationally DIFFERENT signals — one says "the data says my recent
+predictions are at noise", the other says "this specific input is past
+the model's empirical label support". A future analyzer asking
+*counterfactual: would the kill-switch have helped or hurt on the rows
+where it fired?* needs the disambiguated cause, and that cause is
+recoverable from the reasoning string (the two markers are mutually
+exclusive in `_ml_decide`'s if/elif emission).
+
+Live audit on `data/decision_outcomes.jsonl` at session: 5114 of 5114
+BUYs (100%) carry `gate_off_dist=True`. The legacy field cannot tell
+us how many were kill-switched vs clamped, but the `scorer_skill_log`
+ledger shows `gate_killswitch_active=False` on every recent cycle —
+meaning the kill-switch IS firing — so almost certainly nearly all of
+those 5114 are kill-switched, not clamped. The new column makes that
+authoritative going forward.
+
+**The new parser.** `_parse_gate_abstention_kind` returns `"clamp"` /
+`"killswitch"` / `None` from the same reasoning string
+`_parse_gate_decision` reads. `"clamp"` takes precedence over
+`"killswitch"` if a future format ever emitted both markers (mirrors
+the `_ml_decide` if/elif emission order). Pure, total, never raises
+(the `_parse_gate_decision` / `_parse_conviction_pct` discipline —
+a ledger-feeding parser must not break the cycle).
+
+**The capture.** `_compute_decision_outcomes` writes the new column
+into every outcome row alongside the existing `gate_scorer_pred` and
+`gate_off_dist`. Backward compatible: the legacy boolean is unchanged
+(existing analyzers that drop `gate_off_dist=True` rows still work);
+new analyzers can read `gate_abstention_kind` to attribute the
+abstention to the specific guard that fired. Inert to training
+(`build_features` / `train_scorer` ignore unknown dict keys — the
+documented `forward_return_10d/20d` / `wk52_pos` / `conviction_pct`
+additive-keys precedent). The continuous loop's per-cycle outcome
+append picks up the new column on its next outcome write.
+
+**Cross-check invariant.** For every BUY where the gate emitted a
+`scorer=` token (`gate_scorer_pred is not None`):
+
+    gate_off_dist == (gate_abstention_kind is not None)
+
+Both parsers read the same reasoning string; the invariant pins them
+in lockstep so a future refactor cannot let the two columns drift
+silently.
+
+Tests (`tests/test_gate_abstention_kind.py`, 15 cases):
+  * pure parser contract — each marker returns its specific label;
+    sub-gate emission (no `scorer=`), empty reasoning, non-string
+    input, `clamp` precedence with both markers present; the
+    substring-in-trailing-text precedent;
+  * cross-check vs `_parse_gate_decision` on the same string — the
+    invariant holds for clamp / killswitch / active rows;
+  * integration: drive `_compute_decision_outcomes` against an offline
+    engine stub (no yfinance, no real backtest.db) for BUY-clamp,
+    BUY-killswitch, BUY-active, and SELL rows; verify the new column
+    is captured with the correct value AND the cross-check invariant
+    holds row-by-row.
+
+### Phase 3 — Live findings (quant-researcher tour)
+
+Live corpus snapshot at session: 6916 outcome rows, 5114 BUY / 1802
+SELL, 9 personas (GARP, Global Macro, Pure Speculator, ESG/Thematic,
+Small/Mid Cap, Value, Contrarian, Momentum, Quant/Event).
+
+1. **CONVICTION-SIZING IS INVERTED in live data.** Mean realized 5d
+   return by `conviction_pct` bucket (BUYs only):
+   `<5%: +1.82%` (n=71) · `5-10%: +0.88%` (n=2570) · `10-20%: +0.93%`
+   (n=2112) · `20-30%: +0.82%` (n=324) · `30-40%: +1.70%` (n=35) ·
+   `>40%: -13.59%` (n=2). The lowest-conviction trades realize the
+   highest mean return; high-conviction trades (>40%) crater on
+   leverage. This is the documented `MISCALIBRATED` `conviction_calibration`
+   verdict with concrete numbers — a quant should NOT deploy real
+   capital on the current sizing rule.
+
+2. **SELL realized 5d return is POSITIVE on average (+0.49%, n=1802).**
+   Since SELL trains on flipped labels, this means SELL actions tend to
+   be exit-too-soon — the bot sells things that subsequently go up.
+   `oos_sell_ic` consistently anti-skill in the ledger (cycle 1:
+   -0.16, cycle 2: -0.08). The SELL side has measurable anti-skill;
+   the gate is BUY-only so this doesn't propagate to sizing, but the
+   training corpus IS feeding sign-flipped labels into the model from
+   a side that is itself wrong.
+
+3. **3070 / 6916 = 44.4% of outcome rows have `regime_label='unknown'`.**
+   These are early-backtest-window decisions where SPY had <200 closes
+   so `_market_regime` returned "unknown" and `regime_mult` defaulted
+   to 1.0 (the documented neutral). The model is learning quant
+   patterns on a corpus where nearly half of the training has no real
+   regime signal. The 2026-05-19 `regime_label` field captures the
+   ambiguity faithfully (the legacy `regime_mult=1.0` ↔ bull confusion
+   is fixed — `_oos_rank_metrics` already prefers `regime_label` for
+   bucketing) but a quant deploying the gate needs to know the
+   per-regime IC numbers (`oos_bull_ic`, `oos_sideways_ic`) describe
+   only ~56% of the corpus.
+
+4. **`MLP_WORSE_THAN_TRIVIAL` durable.** Last 3 baseline ledger rows:
+   `mlp_rank_ic=-0.02 / -0.03 / +0.03` vs `news_urgency` single-feature
+   baseline at `+0.17 / +0.16 / +0.11` — `ic_gap` consistently around
+   `-0.18 / -0.19 / -0.08`. The 20-feature MLP is sub-trivial vs a
+   one-line baseline that ignores 19 of its 20 inputs — and the single
+   feature that DOES carry skill (`news_urgency`) is present in only
+   2.8% of training rows.
+
+5. **`gate_effectively_active=False` on every recent cycle.** Kill-switch
+   correctly suppressing the gate. The new
+   `gate_abstention_kind` column will make the kill-switch's per-row
+   coverage measurable going forward.
+
+6. **LLM-annotation pipeline AUTH ERROR in live logs.** Confirmed:
+   `Could not resolve authentication method. Expected one of api_key,
+   auth_token, or credentials to be set.` This is why
+   `llm_annotation_skill_log` reads `pipeline_dark=True` every cycle —
+   the documented dark-pipeline state has a specific recoverable
+   cause (env / config) the operator can investigate, not an
+   architectural inability.
+
+7. **`oos_rmse_ratio = 1.116..1.288` durably > 1.0.** Recent ledger
+   rows: `1.288` / `1.218` / `1.116` / `1.215` / `1.158`. The MLP's
+   OOS RMSE is consistently HIGHER than `σ(target) ≈ 7.0` — the
+   constant-mean predictor would do better than the regularized
+   MLP(32,16). Same architectural signal `MLP_WORSE_THAN_TRIVIAL`
+   reports, viewed through the L2-norm lens.
+
+8. **Transient `BacktestStore` init failures: `locking protocol`.**
+   `continuous.log` shows occasional `[continuous] engine init failed
+   for ...: locking protocol` followed by the `BacktestStore` /
+   `PRAGMA journal_mode=WAL` traceback. The cycle's exception guard
+   catches this, sleeps 30s, and continues. Likely USB-mount or
+   network-volume backed `backtest.db` flapping briefly. Not fatal,
+   no fix needed in this pass — flagged so the next maintainer knows
+   the symptom and root cause.
+
+### How the ML/backtest stack works (canonical mini-reference)
+
+**DecisionScorer** (`paper_trader/ml/decision_scorer.py`):
+
+* 20-feature MLPRegressor(32,16) + L2 alpha=1e-2 + early_stopping —
+  features: 10 base numeric (ml_score / rsi / macd / mom5 / mom20 /
+  regime_mult / vol_ratio / bb_pos / news_urgency /
+  news_article_count) + 3 enhanced MACD booleans (ema200_above /
+  hist_cross_up / macd_below_zero_cross) + 7-way sector one-hot.
+* `predict_with_meta(...)` returns `{pred, raw, clamped,
+  off_distribution, percentile, calibrated, failed, gate_arm,
+  gate_arm_multiplier}` — `pred` is clamped to ±`PRED_CLAMP_PCT=50`,
+  `calibrated` is the quantile-mapped honest magnitude (with the
+  collapsed-quantile and `MISCALIBRATED` honesty guards).
+* `predict()` is the scalar fast path (just `pred`); all live gate
+  callers consume this.
+* `feature_contributions` / `feature_group_contributions` /
+  `feature_importance` / `feature_group_importance` — local + global
+  attribution.
+* `train_scorer(records, path=None)` — atomically rewrites
+  `data/ml/decision_scorer.pkl` with `{model, scaler, n_train,
+  pred_quantiles, label_quantiles}`. SELL records flip the label
+  sign. Symmetric label clamp at ±50% so val/oos error is
+  apples-to-apples.
+
+**Backtest decision outcomes** (`_compute_decision_outcomes` in
+`run_continuous_backtests.py`): one row per FILLED BUY/SELL decision,
+written to `data/decision_outcomes.jsonl`. Schema (additive — every
+column documented inline):
+
+  `run_id, persona, regime_label, sim_date, ticker, action, ml_score,
+  rsi, macd, mom5, mom20, regime_mult, vol_ratio, bb_position,
+  news_urgency, news_article_count, forward_return_5d,
+  forward_return_10d, forward_return_20d, gate_scorer_pred,
+  gate_off_dist, gate_abstention_kind, conviction_pct, wk52_pos,
+  pct_from_52h, forward_intraperiod_{min,max}_{5,10,20}d,
+  ema200_above, hist_cross_up, macd_below_zero_cross, return_pct,
+  llm_quality_label`
+
+The `gate_abstention_kind` column (2026-05-30 — this pass) disambiguates
+the legacy `gate_off_dist` boolean into `"clamp"` / `"killswitch"` /
+`None`. Cross-check invariant for BUYs with a `scorer=` token:
+`gate_off_dist == (gate_abstention_kind is not None)`.
+
+**Running backtests manually**:
+
+```bash
+# One-shot — 10 parallel year-long runs against the default window
+python3 run_backtests.py
+
+# Continuous loop — 1 run per cycle (throttled), 10min cooldown
+python3 run_continuous_backtests.py
+
+# Read-only CLI: explain one scorer prediction
+python3 -m paper_trader.ml.decision_scorer \
+    --ticker NVDA --ml-score 3.5 --rsi 45 --mom5 2.0
+
+# Read-only CLI: corpus data quality (pre-model)
+python3 -m paper_trader.ml.outcome_corpus_health
+
+# Read-only CLI: MLP vs single-feature baselines (the trivial check)
+python3 -m paper_trader.ml.baseline_compare
+
+# Read-only CLI: per-sector OOS skill, per-persona OOS skill
+python3 -m paper_trader.ml.sector_skill
+python3 -m paper_trader.ml.persona_skill
+```
+
+**Interpreting backtest results**:
+
+* `total_return_pct` ⇒ raw run return. **Dispersion is huge** (a
+  single cycle of monkey runs spans -125% to +1428%); a single
+  good/bad run is leverage luck, not strategy skill.
+* `vs_spy_pct` ⇒ run return minus the SPY return for the same window.
+  The actual skill metric. Mind the `benchmark_unavailable` note in
+  `backtest_runs.notes` — when SPY returned 0 for the window
+  (yfinance fetch failed or degenerate walk-back), `vs_spy_pct` is
+  fabricated alpha.
+* `oos_ic` / `oos_buy_ic` in `scorer_skill_log.jsonl` ⇒ the scorer's
+  OOS rank-IC. Read with the `sector_skill` ledger's
+  `concentrated_sector` flag — if tech holds ≥70% of OOS rows (the
+  current state), the headline IC IS tech's IC.
+* `gate_effectively_active` ⇒ both guards (n_train≥500 AND kill-switch)
+  must say active for the gate to actually modulate conviction. False
+  means the gate did nothing this cycle.
+* `gate_abstention_kind` (per-row, new 2026-05-30) ⇒ when
+  `gate_off_dist=True`, which guard fired? `"clamp"` = off-distribution
+  (the prediction exceeded ±50%); `"killswitch"` = trailing-IC at
+  noise (the cycle's gate sat out).
+
+**Test commands for this domain**:
+
+```bash
+# Just this pass's new tests
+python3 -m pytest tests/test_gate_abstention_kind.py -v
+
+# Regression on the gate parser + continuous loop + scorer surfaces
+python3 -m pytest tests/test_gate_abstention_kind.py \
+                  tests/test_gate_decision_capture.py \
+                  tests/test_gate_kill_switch.py \
+                  tests/test_continuous.py \
+                  tests/test_backtest.py \
+                  tests/test_decision_scorer.py -v
+
+# Focused ML/backtest slice (~25s, ~340 tests)
+python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+                  tests/test_continuous.py \
+                  tests/test_gate_abstention_kind.py -v
+```
+
+### Staging
+
+Two commits, per-file pathspec only (sibling agent was mid-edit on
+~22 `paper_trader/ml/*.py` files and 5 `tests/test_*` files
+plumbing 3 enhanced-MACD features through every analyzer; none of
+my files overlapped):
+
+* **Phase 2**: `paper-trader/run_continuous_backtests.py` (the new
+  `_parse_gate_abstention_kind` parser + the
+  `_compute_decision_outcomes` capture) +
+  `paper-trader/tests/test_gate_abstention_kind.py` (new test file).
+* **Phase 4 (this section)**: `paper-trader/AGENTS.md` only.
+
+Working copy at start carried sibling agents' uncommitted changes to
+~22 `paper_trader/ml/*` files and 5 `tests/test_*` files plus
+`digital-intern/` files and several untracked sibling additions
+(`paper_trader/analytics/plan_execution_debt.py`,
+`tests/test_continuous_outcome_corpus_health_ledger.py`,
+`tests/test_plan_execution_debt.py`); all left untouched per the
+concurrent-agent footgun memory. No `git add -A`.
