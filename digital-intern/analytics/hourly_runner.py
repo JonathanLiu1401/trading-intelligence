@@ -59,6 +59,7 @@ def main() -> int:
         ("ingest_gap_detector",       "analytics.ingest_gap_detector",       "main"),
         ("stale_source_alerter",      "analytics.stale_source_alerter",      "main"),
         ("source_quality",            "analytics.source_quality",            "main"),
+        ("source_echo_detector",      "analytics.source_echo_detector",      "main"),
         ("collection_quality",        "analytics.collection_quality",        "main"),
         ("ticker_sentiment_momentum", "analytics.ticker_sentiment_momentum", "main"),
         ("earnings_preheat",          "analytics.earnings_preheat",          "main"),
