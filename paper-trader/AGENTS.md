@@ -1,5 +1,174 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 — Agent 1 (paper-trader core) HYBRID — quant negative cache + `/api/quant-cache-status`
+
+Persona: a live trader running this engine through a weekend
+host-saturation storm (9/20 cycles NO_DECISION since 20:47 NY), already
++18.1% on the $1000 book on a single MU lot 1.4% from TP. The decision
+prompt's TECHNICAL block and the `_ml_live_opinion` advisor both read
+from `strategy._QUANT_CACHE`; the cache had no negative arm and no
+operator surface. Two surgical changes close those gaps without
+touching the trading hot path.
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=5
+
+### Phase 1 — `fix(strategy)` (commit `7ac6f93`): zombie tickers re-hit yfinance every cycle
+
+**The bug.** `get_quant_signals_live` writes to `_QUANT_CACHE` only on
+success. A WATCHLIST entry that returns an empty history (the canonical
+delisted-ticker yfinance signature — GOOGU / METAU were removed for
+exactly this in 2026-05; future churn re-creates the gap), or a name
+with fewer than the 60 closes the indicator math needs, or a yfinance
+exception — all three `continue` out of the loop without ever stamping
+anything. Every subsequent call within the 5-min `_QUANT_TTL` re-hits
+yfinance for the same dead lookup. Live: at 50 WATCHLIST tickers, a
+single dead symbol burns one extra round-trip every cycle for 5
+minutes; multiple deads compound.
+
+**The fix.** Add `_QUANT_NEG_CACHE: dict[str, float]` with matching
+5-min `_QUANT_NEG_TTL` and two pure helpers (`_quant_neg_hit`,
+`_quant_neg_mark`). The loop stamps the negative cache on the three
+failure paths (`hist.empty`, `len(closes) < 60`, `except Exception`)
+and short-circuits on a fresh negative hit before the yfinance call.
+Recovery is preserved — a positive read after the TTL expires
+re-populates `_QUANT_CACHE` AND evicts the negative entry, so a
+transient outage never becomes a permanent ban. Mirrors
+`market._DEAD_CACHE`'s discipline one layer over (get_price's per-
+symbol negative cache).
+
+**Tests** (`tests/test_quant_negative_cache.py`, 13 cases, every
+assertion specific-value):
+- empty-history path: stamps neg cache, blocks re-fetch within TTL,
+  expired entry self-evicts on `_quant_neg_hit`.
+- short-history (<60 closes): same three-leg verification.
+- yfinance exception path: same three-leg verification.
+- recovery: after `_QUANT_NEG_TTL` expiry, a healthy frame populates
+  the positive cache and evicts the neg entry.
+- mixed-batch isolation: a dead ticker in a batch does NOT block the
+  healthy sibling's fetch / cache hit.
+- helper unit tests: `_quant_neg_hit` / `_quant_neg_mark` correctness
+  including TTL clamp, idempotent refresh.
+
+All 13 pass in 0.6s. Dependent strategy slice (`test_core_strategy`,
+`test_sector_pulse_swr`, `test_macd_breadth`, `test_decision_context_endpoint`,
+`test_regime_leverage_fit_reporter`, `test_parse_retry`, `test_quota_guard`)
+245 pass in 25s — no regressions.
+
+### Phase 2 — `feat(dashboard)` (commit `840fa53`): `/api/quant-cache-status` endpoint
+
+**The gap.** Both quant caches are INTERNAL to `strategy.py`. The
+decision prompt's TECHNICAL block and the `_ml_live_opinion` advisor
+both read from `_QUANT_CACHE`; the new `_QUANT_NEG_CACHE` tracks which
+symbols yfinance is being suppressed for. There is no operator surface
+that answers a live trader's question: *which of my 50 watchlist
+symbols are FRESH vs STALE vs DARK in the quant feed right now?* A
+symbol that just expired out of the neg cache and one whose positive
+entry is 4 min 30 s old behave very differently next cycle — invisible
+without parsing log lines.
+
+**The endpoint.** `/api/quant-cache-status` (with optional
+`?tickers=A,B,C`) composes a pure read-only builder
+(`paper_trader/analytics/quant_cache_status.py`) that scans both
+caches atomically (snapshot-copies — concurrent-safe with the runner-
+thread writer; mirrors `market.dead_tickers`'s discipline) and
+classifies each requested ticker as `FRESH` (in pos cache, age <
+`_QUANT_TTL`), `STALE` (in pos cache, age ≥ TTL), `DARK` (in neg
+cache, age < `_QUANT_NEG_TTL`), or `NEVER` (in neither). FRESH rows
+ship the key indicator fields (`RSI`, `MACD`, `mom_5d`, `mom_20d`,
+`macd_below_zero_cross` — the high-quality MACD entry signal the
+SYSTEM_PROMPT documents); DARK rows ship `neg_age_s` / `neg_ttl_remaining_s`.
+Verdict is `DEGRADED` iff any DARK rows present; `HEALTHY` otherwise
+(STALE alone does not trip it — STALE just means a refresh is due).
+
+DARK wins over STALE deliberately: if a ticker has both a stale
+positive entry AND a fresh negative entry, the next cycle WILL skip
+yfinance (the neg cache short-circuits it), so the positive entry
+won't refresh — surfacing the stale value would mislead an operator
+into thinking there's data to fall back on.
+
+Read-only operational discipline mirrors every sibling endpoint
+(`/api/dead-tickers`, `/api/alarm-latches`, `/api/notify-health`):
+never hits yfinance, never raises, degrades to an ERROR envelope on
+fault. Failure contract uses the same envelope shape as success so
+a future panel renders both paths with one branch.
+
+**Live verdict on the 2026-05-30 weekend cycle** (`curl ?tickers=NVDA,
+AMD,MU,GOOGU,METAU,LITE,LNOK,MUU`): `HEALTHY` — 6 FRESH (NVDA RSI=49.4
+MACD=bearish mom_5d=-3.81 mom_20d=5.8 / AMD / MU / LITE / LNOK / MUU
+all FRESH within 30 s), 2 NEVER (GOOGU / METAU — the documented
+2026-05 delistings, correctly classified as never-fetched), 0 STALE,
+0 DARK.
+
+**Tests** (`tests/test_quant_cache_status.py`, 16 cases, every
+assertion specific-value):
+- EMPTY state: empty caches → VERDICT_EMPTY, zero counts.
+- FRESH path: pos entry 60 s old → status=FRESH, age_s=60,
+  ttl_remaining_s=240, surfaced signal fields match source record.
+- STALE path: pos entry 400 s old → status=STALE, ttl_remaining_s=0,
+  verdict stays HEALTHY (STALE alone doesn't degrade).
+- DARK path: neg entry 90 s old → status=DARK, neg_age_s=90,
+  neg_ttl_remaining_s=210, verdict=DEGRADED.
+- DARK-wins-over-STALE: both entries present → DARK reported,
+  n_stale=0.
+- mixed-roll-up: 2 FRESH + 1 STALE + 1 DARK + 1 NEVER → exact counts.
+- unfiltered response: returns every ticker in either cache.
+- degrade-safe: missing module attrs, non-dict record, clock step-back
+  all degrade cleanly.
+- input hygiene: blanks, dupes, lowercase, non-strings normalized.
+- endpoint wiring: Flask test_client confirms the route builds a
+  proper envelope (HEALTHY, DEGRADED branches), filters by `?tickers=`.
+
+All 16 pass in 0.7s. Regression slice (`test_core_strategy`,
+`test_quant_negative_cache`, `test_quant_cache_status`,
+`test_sector_pulse_swr`, `test_macd_breadth`,
+`test_decision_context_endpoint`, `test_dashboard_dead_tickers_endpoint`,
+`test_core_dashboard_alarm_latches`) 224 pass in 2s — no regressions.
+
+### Phase 3 — Live findings (live-trader tour at 2026-05-30 20:32 ET)
+
+1. **IDLE_STORM in progress.** `/api/runner-heartbeat` reports the
+   last 9 of 20 decisions were NO_DECISION (80%), dominant cause
+   `host_saturated` (too many concurrent Opus jobs starving the box —
+   the documented `pt-no-decision-host-saturation` memory). Last
+   REAL (FILLED/HOLD/BLOCKED) decision was 3h 44m ago. Headline
+   correctly tells the operator a restart will NOT help, reduce
+   parallel Opus jobs or wait the storm out. The breaker latch is
+   *not* active (this runner has only seen 1 NO_DECISION since boot
+   ~10 min ago — the prior storm rows are pre-restart).
+
+2. **MU position MID_BAND on the exit corridor.** `/api/exit-proximity`:
+   1 stock open, qty=1, avg=956.37, mark=971.55, SL=937.24 (-3.53%),
+   TP=985.06 (+1.39%). `corridor_pos=0.7174` — 71.7% of the way from
+   SL to TP. The next +1.4% move locks the trade at +3% TP; the next
+   -3.5% triggers SL at -2%. Verdict COMFORTABLE.
+
+3. **Discord delivery HEALTHY.** `/api/notify-health`: 0 consecutive
+   failures, last successful send 4 min before the probe. No PATH /
+   shebang / openclaw regressions.
+
+4. **Singleton lock acquired.** `/api/runner-heartbeat`: PID
+   3171815 holds the flock (later cycled to 3178709 under systemd
+   Restart). No double-trade race.
+
+5. **New `/api/quant-cache-status` validated live.** After the
+   git-watcher detected commit `840fa53` (~3 min after push), systemd
+   bounced the runner and the endpoint went live. Real call returned
+   `HEALTHY` with 6 FRESH WATCHLIST symbols (NVDA / AMD / MU / LITE /
+   LNOK / MUU) and 2 NEVER (GOOGU / METAU correctly identified as
+   absent — the documented 2026-05 delistings that were stripped
+   from WATCHLIST). End-to-end Phase 1 fix + Phase 2 endpoint
+   delivered through the deploy pipeline.
+
+### Phase 4 — Docs / verify
+
+This `AGENTS.md` block. Final verify: `python3 -c "from paper_trader
+import signals, reporter, strategy; print('imports OK')"` succeeds;
+focused regression slice (245 + 224 = 469 tests across the touched
+modules) passes clean. Counters: bugs_fixed=1, features_added=1,
+user_findings=5.
+
+---
+
 ## 2026-05-30 — Agent 4 (feature-dev, third pass) — `parse_fail_windows` + `position_alpha_decomp`
 
 Persona: an operator validating a recent fix and a discretionary PM asking
