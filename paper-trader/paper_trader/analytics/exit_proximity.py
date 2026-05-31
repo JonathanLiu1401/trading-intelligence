@@ -84,6 +84,21 @@ NEAR_TP_MIN = 0.75
 _NDIGITS_PCT = 2
 _NDIGITS_POS = 4
 
+# Prompt-block rendering: cap how many position rows we surface to Opus
+# so a deep book never bloats the prompt. The builder sorts most-
+# actionable-first (AT_RISK bands before NEAR_*), so taking the head N
+# is the right slice — same discipline as ``_exit_proximity_line`` in
+# reporter.py (which uses 3 for the Discord hourly).
+PROMPT_BLOCK_MAX_ROWS = 5
+
+# Verdicts that produce a non-silent prompt block. Anything else returns
+# ``None`` — the silence-when-nothing-actionable precedent
+# (`thesis_drift._render_prompt_block` INTACT path, the chat-enrichment
+# silence precedent). A COMFORTABLE / NO_DATA / NO_SL_TP_SET book is
+# health and SHOULD add no prompt bloat: Opus already sees the rule in
+# the SYSTEM_PROMPT header.
+_PROMPT_BLOCK_VERDICTS = frozenset({"AT_RISK", "NEAR_THRESHOLD"})
+
 
 def _z(v, ndigits: int = _NDIGITS_PCT):
     """Round + fold -0.0 → 0.0 so the JSON never carries a signed zero
@@ -257,6 +272,74 @@ def _aggregate_verdict(rows: list[dict]) -> tuple[str, str]:
             f"with SL/TP set are MID_BAND{tail}")
 
 
+def _render_prompt_block(verdict: str, headline: str,
+                         rows: list[dict],
+                         max_rows: int = PROMPT_BLOCK_MAX_ROWS,
+                         ) -> str | None:
+    """Render the live-decision prompt section, or ``None`` for silence.
+
+    Returns ``None`` unless the verdict is actionable (AT_RISK or
+    NEAR_THRESHOLD). The actionable block carries:
+
+      * the SSOT headline verbatim (verdict + counts, single source of
+        truth with ``/api/exit-proximity`` and the Discord hourly line
+        in ``reporter._exit_proximity_line``);
+      * up to ``max_rows`` worst-first per-position lines, each with the
+        band + signed distance to the firing threshold (``+0.40% from
+        SL``) so Opus sees how close each lot is to a mechanical exit
+        without re-deriving it from mark/avg.
+
+    Observational only (AGENTS.md invariants #2/#12 — the
+    ``buying_power`` / ``sector_exposure`` prompt-block precedent). The
+    HARD EXITS section of ``SYSTEM_PROMPT`` already documents the rule;
+    this block makes the CURRENT-STATE diagnostic concrete so Opus can
+    triage at the moment of decision rather than re-computing thresholds
+    in its head against a maybe-blended avg_cost.
+    """
+    if verdict not in _PROMPT_BLOCK_VERDICTS:
+        return None
+    actionable_bands = ("AT_RISK_SL", "AT_RISK_TP", "NEAR_SL", "NEAR_TP")
+    head = [r for r in rows if r.get("proximity_band") in actionable_bands][:max_rows]
+    if not head:
+        # The verdict promised actionable rows but the filter caught none
+        # (shouldn't happen; defend against future band rename drift). A
+        # silent fallback is safer than an empty bullet list.
+        return None
+    lines: list[str] = [
+        f"EXIT PROXIMITY ({verdict}):",
+        f"  {headline}",
+    ]
+    for r in head:
+        ticker = r.get("ticker") or "?"
+        band = r.get("proximity_band") or "?"
+        d_sl = r.get("dist_to_sl_pct")
+        d_tp = r.get("dist_to_tp_pct")
+        closer = r.get("closer_target") or ""
+        cur = r.get("current_price")
+        sl = r.get("stop_loss_price")
+        tp = r.get("take_profit_price")
+        # Distance tag — show the closer side prominently, falling back
+        # to both sides when ``closer_target`` is unset (degenerate row).
+        # Mirrors ``_exit_proximity_line``'s Discord rendering so the two
+        # surfaces tell identical stories on the same data.
+        if closer == "SL" and d_sl is not None:
+            dist_tag = f"{d_sl:+.2f}% from SL"
+        elif closer == "TP" and d_tp is not None:
+            dist_tag = f"{d_tp:+.2f}% from TP"
+        elif d_sl is not None and d_tp is not None:
+            dist_tag = f"SL {d_sl:+.2f}% / TP {d_tp:+.2f}%"
+        else:
+            dist_tag = "thresholds unavailable"
+        thresh_tag = ""
+        if cur is not None and sl is not None and tp is not None:
+            thresh_tag = f" (mark ${cur:.2f}, SL ${sl:.2f}, TP ${tp:.2f})"
+        lines.append(f"  • {ticker} [{band}] {dist_tag}{thresh_tag}")
+    lines.append(
+        "  (advisory: hard SL/TP fire automatically before next prompt)"
+    )
+    return "\n".join(lines)
+
+
 def build_exit_proximity(
     positions: list[dict] | None,
     now: datetime | None = None,
@@ -347,6 +430,8 @@ def build_exit_proximity(
         if b in counts:
             counts[b] += 1
 
+    prompt_block = _render_prompt_block(verdict, headline, open_rows)
+
     return {
         "as_of": now.isoformat(),
         "verdict": verdict,
@@ -359,6 +444,12 @@ def build_exit_proximity(
             "near_sl_max": NEAR_SL_MAX,
             "near_tp_min": NEAR_TP_MIN,
         },
+        # ``None`` on a healthy / no-data / no-SL-TP book — the
+        # silence-when-nothing-actionable precedent (``thesis_drift``
+        # INTACT). Set to a rendered string only when verdict is
+        # AT_RISK or NEAR_THRESHOLD so a clean book adds zero prompt
+        # bloat. Observational only; never gates Opus.
+        "prompt_block": prompt_block,
     }
 
 
