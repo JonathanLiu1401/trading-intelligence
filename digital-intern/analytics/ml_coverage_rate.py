@@ -138,6 +138,9 @@ def run() -> dict:
     return result
 
 
+main = run
+
+
 if __name__ == "__main__":
     r = run()
     sys.exit(0)
