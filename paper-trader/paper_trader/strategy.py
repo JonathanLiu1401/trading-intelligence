@@ -393,6 +393,39 @@ def _macd_live(closes: list[float]) -> str | None:
 _QUANT_CACHE: dict[str, tuple[dict, float]] = {}
 _QUANT_TTL = 300.0  # 5 min — indicators change slowly intraday
 
+# Negative cache for tickers whose yfinance lookup returned empty, raised, or
+# came back with fewer than 60 closes (the floor get_quant_signals_live needs
+# for indicator math). A WATCHLIST entry that has been delisted (GOOGU/METAU
+# in 2026-05; future cleanups likewise) or a newly-IPO'd name without enough
+# history would otherwise re-hit yfinance every cycle for the next 5 minutes
+# of _QUANT_TTL — for each one. Bound by the same 5-min TTL as the positive
+# cache so a legitimately-transient outage (yfinance hiccup, brief network
+# blip) recovers cleanly on its next reload, while a stable-zombie never
+# generates more than one fetch per TTL window. Mirrors market._DEAD_CACHE's
+# discipline for the same problem one layer over (get_price's per-symbol
+# negative cache). Pure module-state; no persistence.
+_QUANT_NEG_CACHE: dict[str, float] = {}
+_QUANT_NEG_TTL = 300.0
+
+
+def _quant_neg_hit(ticker: str, now: float) -> bool:
+    """True iff ``ticker`` is currently held in the negative cache.
+    Expired entries self-evict on the next call. Pure helper — never raises."""
+    ts = _QUANT_NEG_CACHE.get(ticker)
+    if ts is None:
+        return False
+    if now - ts >= _QUANT_NEG_TTL:
+        # Expired — drop it so a future success on this symbol isn't masked
+        # by a stale negative entry.
+        _QUANT_NEG_CACHE.pop(ticker, None)
+        return False
+    return True
+
+
+def _quant_neg_mark(ticker: str, now: float) -> None:
+    """Stamp a negative-cache entry for ``ticker`` at ``now``. Idempotent."""
+    _QUANT_NEG_CACHE[ticker] = now
+
 
 def _stdev_live(values: list[float]) -> float:
     n = len(values)
@@ -412,15 +445,24 @@ def get_quant_signals_live(tickers: list[str]) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for t in tickers:
         cached = _QUANT_CACHE.get(t)
-        if cached and _time.time() - cached[1] < _QUANT_TTL:
+        now = _time.time()
+        if cached and now - cached[1] < _QUANT_TTL:
             out[t] = cached[0]
+            continue
+        # Skip yfinance entirely if this symbol is held in the negative cache —
+        # a recently-failed lookup (delisted ticker, empty history, network
+        # error) re-hitting yfinance every cycle would just re-fail and spam
+        # the log, the exact pathology market._DEAD_CACHE solved for get_price.
+        if _quant_neg_hit(t, now):
             continue
         try:
             hist = yf.Ticker(t).history(period="1y", auto_adjust=False)
             if hist is None or hist.empty:
+                _quant_neg_mark(t, now)
                 continue
             closes = [float(c) for c in hist["Close"].tolist() if c == c]
             if len(closes) < 60:
+                _quant_neg_mark(t, now)
                 continue
             last = closes[-1]
             rsi = _rsi_live(closes, 14)
@@ -560,6 +602,10 @@ def get_quant_signals_live(tickers: list[str]) -> dict[str, dict]:
             out[t] = rec
         except Exception as e:
             print(f"[strategy] quant signal fetch failed {t}: {e}")
+            # Stamp the negative cache so a wedged / consistently-failing
+            # symbol doesn't burn the next cycle's yfinance budget on the
+            # same dead lookup.
+            _quant_neg_mark(t, _time.time())
     return out
 
 
