@@ -2356,6 +2356,172 @@ class ArticleStore:
         }
 
     @_retry_on_lock
+    def urgent_source_breakdown(
+        self, hours: int = 24, top_n: int = 20
+    ) -> dict:
+        """Per-``source``-tag breakdown of alerted (urgency>=2) rows in the
+        last ``hours``, partitioned LLM-vetted vs ML-only.
+
+        The per-source decomposition that ``urgency_label_split`` is missing:
+        that method answers "what fraction of recent urgents carry an LLM
+        ground-truth label?" in aggregate but is silent on WHICH source tags
+        are dragging the verified fraction down. A persistent
+        ``llm_fraction`` near 0.3 on the top-line is operator-actionable only
+        if the analyst can see "GN: Nasdaq is 0/47 LLM-vetted, scraped/cnbc
+        is 18/18" — then the noisy source can be down-rated, gated, or
+        de-prioritised. Without the per-source split the alert channel just
+        looks generically degraded.
+
+        Live evidence (2026-05-31 24h pull, urgency=2 rows): the recent
+        alerted set was dominated by ml-only ``GN: SP500`` /
+        ``GN: Nvidia`` / ``hackernews`` / ``stocktwits`` /
+        ``GDELT/ibtimes.com.au`` / ``AlphaVantage/Seeking Alpha`` /
+        ``scraped/www.chinadaily.com.cn`` / ``market_valuation`` — the
+        analyst's standalone-push channel was being fed by single,
+        unverified ml head calls. ``urgency_label_split`` shows the
+        aggregate llm_fraction; this surfaces the per-source story.
+
+        ``llm_vetted`` counts rows with ``score_source IN ('llm',
+        'briefing_boost')`` — the trainer's STRONG_LABEL_WHERE ground-truth
+        tier. ``ml_only`` counts ``score_source = 'ml'`` AND legacy
+        ``score_source IS NULL`` rows where ``ai_score = 0`` (no LLM ever
+        labeled). Everything else is uncategorised — should always be 0 for
+        urgency>=2 rows in practice but kept as a defensive bucket.
+
+        Returns::
+
+            {
+              "window_h":  int,
+              "total":     int,                     # all urgency>=2 in window
+              "llm_vetted_total": int,
+              "ml_only_total":    int,
+              "llm_fraction":     float,            # vetted / total
+              "by_source": [                        # sorted by total DESC
+                {
+                  "source":       str,
+                  "total":        int,
+                  "llm_vetted":   int,
+                  "ml_only":      int,
+                  "llm_fraction": float,            # 0.0..1.0
+                },
+                ...
+              ],
+              "worst_offender": {                   # max ml_only with total>=2
+                "source":        str,
+                "ml_only":       int,
+                "total":         int,
+                "llm_fraction":  float,
+              } | None,
+            }
+
+        ``top_n`` caps the ``by_source`` list (sorted by ``total`` desc) so
+        long-tail one-offs don't dominate the dashboard tile. The
+        ``worst_offender`` slot is computed across ALL sources (not just the
+        top-N) but requires ``total >= 2`` so a lone ml-only outlier from an
+        unknown publisher doesn't read as the "worst" by accident.
+
+        Backtest isolation: ``_LIVE_ONLY_CLAUSE`` excludes synthetic rows.
+        Read-only — no ai_score / ml_score / score_source / urgency
+        mutation. All four load-bearing invariants intact by construction.
+        Decorated with ``@_retry_on_lock`` for the documented
+        shared-connection cursor-collision class — same as sibling readers.
+        """
+        hours = max(int(hours), 1)
+        top_n = max(int(top_n), 1)
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        # Single GROUP BY pass: (source, score_source, ai_score==0 flag) so the
+        # ml-only-via-NULL branch (legacy rows: score_source NULL AND ai_score=0)
+        # is captured in the same scan. ``ai_score = 0`` is the discriminator
+        # for "no LLM ever labeled" — invariant #2 says ml outputs go to
+        # ml_score and never ai_score, so ai_score=0 on a urgency>=2 row means
+        # the urgency tag came from a model call.
+        rows = self.conn.execute(
+            "SELECT source, score_source, "
+            "  CASE WHEN ai_score = 0 THEN 1 ELSE 0 END AS no_llm, "
+            "  COUNT(*) "
+            "FROM articles "
+            f"WHERE urgency>=2 AND first_seen >= ? AND {_LIVE_ONLY_CLAUSE} "
+            "GROUP BY source, score_source, no_llm",
+            (since,),
+        ).fetchall()
+
+        # Aggregate per-source.
+        per_src: dict[str, dict[str, int]] = {}
+        total = 0
+        vetted_total = 0
+        ml_total = 0
+        for src, score_src, no_llm, n in rows:
+            n = int(n or 0)
+            if not n:
+                continue
+            src_key = src or ""
+            bucket = per_src.setdefault(
+                src_key, {"total": 0, "llm_vetted": 0, "ml_only": 0}
+            )
+            bucket["total"] += n
+            total += n
+            if score_src in ("llm", "briefing_boost"):
+                bucket["llm_vetted"] += n
+                vetted_total += n
+            elif score_src == "ml" or (score_src is None and no_llm):
+                # Explicit ml tag, OR legacy null tag with no LLM label
+                # (ai_score=0) — both mean the urgency came from a model
+                # call without LLM ground truth.
+                bucket["ml_only"] += n
+                ml_total += n
+            # else: legacy null with non-zero ai_score (pre-migration integer
+            # LLM label) — counts toward total but not toward either tier.
+
+        # Materialise sorted output. Stable secondary sort on source name keeps
+        # ties deterministic for tests / dashboards.
+        by_source_full = sorted(
+            (
+                {
+                    "source": s,
+                    "total": d["total"],
+                    "llm_vetted": d["llm_vetted"],
+                    "ml_only": d["ml_only"],
+                    "llm_fraction": (
+                        round(d["llm_vetted"] / d["total"], 4)
+                        if d["total"] else 0.0
+                    ),
+                }
+                for s, d in per_src.items()
+            ),
+            key=lambda r: (-r["total"], r["source"]),
+        )
+        by_source = by_source_full[:top_n]
+
+        # Worst offender = source with the highest ml_only count, total>=2 so a
+        # single ml-only outlier from an unknown publisher does NOT read as the
+        # worst by accident. Same min-sample defensive pattern other dashboard
+        # tiles use against long-tail noise (briefing_health 60%-of-expected
+        # floor, urgent_source_breakdown's ``ml_only`` filter mirrors that).
+        candidates = [r for r in by_source_full if r["ml_only"] >= 1 and r["total"] >= 2]
+        if candidates:
+            worst = max(candidates, key=lambda r: (r["ml_only"], -ord(r["source"][:1] or "\x00")))
+            worst_offender = {
+                "source": worst["source"],
+                "ml_only": worst["ml_only"],
+                "total": worst["total"],
+                "llm_fraction": worst["llm_fraction"],
+            }
+        else:
+            worst_offender = None
+
+        return {
+            "window_h": hours,
+            "total": total,
+            "llm_vetted_total": vetted_total,
+            "ml_only_total": ml_total,
+            "llm_fraction": round(vetted_total / total, 4) if total else 0.0,
+            "by_source": by_source,
+            "worst_offender": worst_offender,
+        }
+
+    @_retry_on_lock
     def label_production_rate(self, window_min: int = 60) -> dict:
         """Per-``score_source`` label-production rate over the recent window.
 
