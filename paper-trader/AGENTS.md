@@ -1,5 +1,186 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 — Agent 2 (ML+backtests) HYBRID pass #6 — `scorer_buy_sell_skill`
+
+Persona: a quant researcher reading pass #5's observation that
+trailing-100 cycle BUY/SELL IC asymmetry is real (BUY median -0.010,
+SELL median +0.010), and asking the natural follow-up: *is there a
+durable per-cycle diagnostic that quantifies this asymmetry and flags
+the operationally decisive state — "the gate is BUY-only but skill is
+on the SELL side"?*
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=5
+
+### Phase 1 — Debug & fix
+
+No new code bugs surfaced. The pass-#5 commits cleaned up cosmetic
+indent issues; the cores of `decision_scorer.py`, `backtest.py`, and
+`run_continuous_backtests.py` are heavily tested (175 tests in
+`test_decision_scorer.py` + `test_backtest.py` alone, all passing in
+52s; full ML/backtest slice 319 passing). No `fix:` commit this pass.
+
+In-flight uncommitted changes by another agent are visible in
+`git diff` across ~17 ml/ files — they're plumbing the 3 enhanced
+MACD features (`ema200_above`, `hist_cross_up`,
+`macd_below_zero_cross`) through diagnostic consumers (pass-#36
+work). I deliberately did NOT touch those files to avoid a sibling
+staging race (memory: `pt-concurrent-samerole-staging-race`); my
+commit uses explicit pathspec only.
+
+### Phase 2 — `feat:` `scorer_buy_sell_skill` analyzer + tests
+
+**The gap.** `backtest._should_gate_modulate_conviction` reads
+`oos_buy_ic` ALONE — the gate is BUY-only, so a positive trailing
+median there enables conviction modulation. But `scorer_skill_log`
+captures BOTH `oos_buy_ic` AND `oos_sell_ic` per cycle, and pass #5
+observed asymmetry without a dedicated trendable diagnostic:
+trailing-20 BUY=-0.010, SELL=+0.010. The gate sits on the WRONG side
+of that asymmetry — structurally locked away from any skill the SELL
+side eventually demonstrates. Every existing gate diagnostic
+(`gate_health_trend`, `gate_pnl`, `gate_audit`, `gate_realized`)
+either reads BUY-only or is a gate-action-effect tool. None
+cross-checks per-direction OOS rank skill against where the gate
+modulates.
+
+**The analyzer** (`paper_trader/ml/scorer_buy_sell_skill.py`): sibling
+of `gate_health_trend` (same canonical pattern — reads the skill log,
+emits a verdict ladder, module-level constants for testability, never
+trains / writes pickle / touches trade path). Per row, requires BOTH
+ICs parseable (paired discipline — a "BUY has 30 valid / SELL has 15"
+mismatch would silently bias the comparison toward whichever cycles
+only one side recorded).
+
+**Metrics**:
+
+  - `n` — paired-row count
+  - `buy_trailing_median_20` / `sell_trailing_median_20` — median per
+    side over the last 20 cycles (matches `_GATE_SKILL_MIN_CYCLES`)
+  - `buy_trailing_median_50` / `sell_trailing_median_50` — smoother
+    50-cycle read
+  - `asymmetry_20` — `sell_t20 - buy_t20`. Positive ⇒ SELL has more
+    skill; negative ⇒ BUY has more skill.
+  - `buy_p5`/`buy_p95`/`sell_p5`/`sell_p95` — empirical distribution
+    tails
+  - `gate_misaligned` — `asymmetry_20 > MISALIGN_TOL` (0.02): SELL
+    side has meaningfully MORE skill than BUY, regardless of absolute
+    threshold
+
+**Verdict ladder** (orthogonal axes: buy≥SKILL_TOL, sell≥SKILL_TOL —
+`SKILL_TOL=0.03` matches `backtest._GATE_SKILL_IC_TOLERANCE` exactly):
+
+| Verdict | Trigger |
+|---|---|
+| `INSUFFICIENT_DATA` | < 20 paired rows |
+| `BUY_SKILLED_ONLY` | buy ≥ +SKILL_TOL AND sell < +SKILL_TOL — gate aligned |
+| `SELL_SKILLED_ONLY` | sell ≥ +SKILL_TOL AND buy < +SKILL_TOL — gate STRUCTURALLY MISALIGNED |
+| `BOTH_SKILLED` | both ≥ +SKILL_TOL |
+| `NEITHER_SKILLED` | both < +SKILL_TOL |
+
+`gate_misaligned` is INDEPENDENT of the verdict (orthogonal axes) so
+it fires under `NEITHER_SKILLED` too — the early-warning case where
+both sides are sub-threshold but SELL is meaningfully beating BUY (the
+state the live data shows at 50-cycle window: buy_t50=+0.010,
+sell_t50=+0.020, asymmetry=+0.010 — sub-MISALIGN_TOL but growing).
+
+CLI exit codes mirror `gate_health_trend` discipline: 0 on benign
+verdicts (`BUY_SKILLED_ONLY` / `BOTH_SKILLED` / `INSUFFICIENT_DATA` /
+plain `NEITHER_SKILLED`), 2 on operator-actionable verdicts
+(`SELL_SKILLED_ONLY` or `NEITHER_SKILLED` AND `gate_misaligned=True`).
+
+**Tests** (`tests/test_scorer_buy_sell_skill.py`, 37 specific-value
+cases): INSUFFICIENT_DATA boundary, paired-filter (BUY-only and
+SELL-only rows DROPPED), invalid-IC filtering (None/NaN/inf/string/
+bool/non-dict), all 5 verdict ladder steps at threshold boundaries,
+asymmetry sign + magnitude, MISALIGN_TOL strict-> boundary, trailing
+window correctness (last 20 only, not whole series), 50-window
+return-None below 50 rows, end-to-end JSONL round-trip + corrupt
+line skipping, every CLI exit code path. Full ML/backtest slice
+(scorer + backtest + new): **212 passed in 31.18s**. Adjacent
+diagnostics (gate_kill_switch + gate_arm_directional_consistency +
+scorer_learning_curve + gate_health_trend): **107 passed in 22.23s**.
+
+### Phase 3 — Live findings (quant-researcher tour)
+
+Live corpus / scorer / engine snapshot (2026-05-30, evening cycles).
+
+1. **My new analyzer pins the live state.** `scorer_buy_sell_skill`
+   on the 215-cycle log: `verdict=NEITHER_SKILLED`, `n=215`,
+   `buy_t20=+0.005`, `sell_t20=+0.010`, `buy_t50=+0.010`,
+   `sell_t50=+0.020`, `asymmetry_20=+0.005` (sub-MISALIGN_TOL),
+   `gate_misaligned=False`. Both sides at noise on the trailing-20
+   window. The 50-cycle window shows the asymmetry doubles to +0.010
+   — still sub-threshold but a TRENDING SELL-side excess.
+
+2. **SELL side distribution has wider tails than BUY**. `buy_p5=-0.090
+   p95=+0.110` (span 0.20) vs `sell_p5=-0.160 p95=+0.160` (span 0.32).
+   SELL skill is more volatile cycle-to-cycle — bigger upside cycles
+   and bigger downside cycles. A trader betting on SELL skill faces
+   higher per-cycle variance than BUY.
+
+3. **OOS calibration on 1554-row holdout reads MISCALIBRATED, not
+   DIRECTIONAL_BUT_BIASED.** Live `calibration --oos`: full-corpus
+   verdict is `DIRECTIONAL_BUT_BIASED` (spearman +0.21,
+   decile_err 3.66pp). **But the temporal-OOS holdout (train_n=6220
+   oos_n=1554)**: `MISCALIBRATED` (spearman +0.007 — effectively zero
+   rank-IC on the OOS slice). Decile 1 predicted mean -34.06%
+   realized +0.08%. Decile 2 predicted -15.47% realized +0.75%.
+   Predicted extremes realize at ~zero — magnitude bias is the OOS
+   pattern, but the rank itself doesn't survive temporal holdout.
+   This is consistent with `MLP_NO_BETTER_THAN_TRIVIAL` from prior
+   passes — in-sample looks good, OOS is noise.
+
+4. **`scorer_pickle_smoke` HEALTHY but every probe is BEARISH.**
+   `pred_quantiles_collapsed=False`, `label_quantiles_collapsed=
+   False`, `prediction_spread=45.90pp` — the verdict ladder says
+   HEALTHY. But the 5 probes return `[-12.63, -11.05, -1.69, -14.74,
+   -47.58]` — ALL negative, one near the -50 clamp. The deployed
+   model has a strong learned bearish bias: even probes labelled
+   `tech_neutral` / `financials_strong` predict negative 5d returns.
+   Combined with the OOS magnitude bias (predicted -34% realizes
+   ~0%), the model is over-predicting downside on the full input
+   space. Not a smoke-test failure (the bucket spread is real); a
+   real architectural finding for the OOS regression remediation
+   path.
+
+5. **News-feature dir_acc still beats the MLP** (pass-#5 finding
+   confirmed). `news_count` binary feature directional accuracy
+   ~0.778 vs MLP 0.549 — a one-line rule beats the 20-feature net by
+   23pp on direction. The asymmetry I added pairs cleanly with this:
+   the model's RANK SKILL is at noise on both BUY and SELL OOS, yet
+   a single binary feature carries real direction. The architecture
+   is failing to extract signal that's there.
+
+### How the ML/backtest stack works — refreshed (mini-reference)
+
+Carries the pass-#5 mini-reference forward unchanged. The
+`scorer_buy_sell_skill` analyzer is additive — `_should_gate_modulate_
+conviction` is unchanged (still BUY-only by design); this is a
+read-only research signal that surfaces when the BUY-only design is
+structurally on the wrong side of the model's per-direction skill.
+
+### Running ML / backtest diagnostics manually
+
+Carry-forward from pass #5, with the addition:
+
+```bash
+# BUY-vs-SELL OOS rank-IC asymmetry verdict (NEW this pass):
+python3 -m paper_trader.ml.scorer_buy_sell_skill
+python3 -m paper_trader.ml.scorer_buy_sell_skill --json
+```
+
+### Test commands for the ML/backtest domain
+
+```bash
+# BUY-vs-SELL skill asymmetry (NEW this pass, 37 tests):
+python3 -m pytest tests/test_scorer_buy_sell_skill.py -v
+
+# Full focused slice (this pass: 212 passed in 31.18s):
+python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+    tests/test_scorer_buy_sell_skill.py
+```
+
+---
+
 ## 2026-05-30 — Agent 1 (paper-trader core) HYBRID validation pass (post-Agent-2 #5)
 
 Persona: an experienced live trader / portfolio manager looking at the
