@@ -1,5 +1,335 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-31 — Agent 2 (ML+backtests) HYBRID pass #8 — `kill_switch_arm_breakdown`
+
+Persona: a quant researcher reading pass #7's `kill_switch_realized_effect`
+verdict (KILLSWITCH_HURTS, rank-IC +0.094 on n=4094) and asking the
+natural follow-up: *which arms drive the cost?*  The aggregate
+rank-IC has a known LEVEL blind spot — a slice where every arm carries the
+same +5% mean produces rank-IC ≈ 0 (NEUTRAL verdict) but firing the gate
+would still downweight profitable headwind arms. We need the per-arm
+decomposition rank-IC can't see.
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=7
+
+### Phase 1 — Debug & fix
+
+Read the four files in full (decision_scorer.py 1768L, backtest.py 3593L,
+run_continuous_backtests.py 5672L, scorer_buy_sell_skill.py for the
+canonical analyzer pattern; AGENTS.md is 36k lines — read structure +
+recent ML/backtest passes). Ran the focused baseline
+(`test_decision_scorer.py + test_backtest.py + test_continuous.py`):
+**300 passed in 54.28s**. No surgical bug surfaced without speculative
+churn — the codebase has been heavily worked over the prior seven HYBRID
+passes and the cores carry exhaustive defensive comments tied to past
+fixes. `bugs_fixed=0` honestly. No `fix:` commit this pass.
+
+Real observations worth noting (see user_findings) but not fix-actionable:
+
+  - **The `min(conv, 0.95)` clamp inside `_ml_decide`'s gate arms is dead
+    code.** Verified empirically against the live 4115-row corpus: max
+    captured `conviction_pct` = 0.40 (the leveraged-bull cap); the next
+    multiplier ×1.30 only reaches 0.52, ~43% below the 0.95 ceiling.
+    No production data path can ever hit this clamp. Harmless defensive
+    guard, not worth removing (would touch the gate's arithmetic for
+    zero behaviour change).
+
+### Phase 2 — `feat:` `kill_switch_arm_breakdown` analyzer + tests
+
+**The gap.** `kill_switch_realized_effect` (pass #7) aggregates one
+rank-IC across the killswitch bucket and verdicts on its sign/magnitude.
+That metric is BLIND to level effects: a configuration where every arm
+carries the same +5% realized mean produces rank-IC≈0 (NEUTRAL verdict)
+yet firing the gate would systematically REDUCE conviction on profitable
+headwind arms — a real economic cost the aggregate cannot see. The
+strong_tailwind arm's ×1.30 multiplier dominates the counterfactual P&L;
+an analyzer that doesn't isolate it from the noisy `neutral` bulk
+understates the cost of suppressing that arm specifically. The sibling
+`gate_arm_historical` does per-arm realized means BUT explicitly drops
+`gate_off_dist=True` rows (line 119) — so in a production where 4094/4094
+killswitch BUYs are abstained, that analyzer's output is structurally
+empty. Neither sibling fills the intersection.
+
+**The analyzer** (`paper_trader/ml/kill_switch_arm_breakdown.py`): same
+canonical pattern as `scorer_buy_sell_skill` / `kill_switch_realized_effect`
+(reads a persisted corpus, emits a verdict ladder, module-level constants
+for testability, never trains / writes pickle / touches trade path).
+Filters to BUYs with `gate_abstention_kind == "killswitch"` AND finite
+`gate_scorer_pred` AND finite `forward_return_5d`. Decodes each row's
+would-have-been arm via `gate_audit.gate_arm` (single source of truth — the
+arm boundaries match `_ml_decide`'s if/elif chain to the bit).
+
+**Metrics per arm** (strong_headwind ×0.60 / mild_headwind ×0.85 /
+neutral ×1.00 / mild_tailwind ×1.15 / strong_tailwind ×1.30):
+
+  - `n`, `mean_pred`, `mean_realized`, `median_realized`, `multiplier`
+  - `per_trade_tilt_pp` = `(multiplier - 1.0) × mean_realized` — the
+    per-dollar-IN-THIS-TRADE tilt the gate would have applied. **NOT a
+    portfolio P&L** (matches the gate_pnl reconstruction-residual
+    discipline — surfaced in a `unit_note` field every report carries).
+
+**Aggregate**: `Σ_i n_i × (mult_i - 1) × mean_realized_i / Σ_i n_i` — same
+per-trade unit as the arm-level reading.
+
+**Verdict ladder** (driven by the EXTREME arms — where the multiplier
+delta is largest):
+
+| Verdict | Trigger |
+|---|---|
+| `INSUFFICIENT_DATA` | killswitch n < `MIN_TOTAL_N` (200) |
+| `STRONG_TAILWIND_COSTLY` | strong_tailwind n ≥ `MIN_ARM_N` (50) AND mean_realized ≥ +`ARM_TOL_PCT` (1.0pp) — the kill-switch prevented a ×1.30 boost into demonstrable winners |
+| `STRONG_HEADWIND_COSTLY` | strong_headwind n ≥ `MIN_ARM_N` AND mean_realized ≤ -`ARM_TOL_PCT` — the kill-switch prevented a ×0.60 trim ahead of demonstrable losers |
+| `BOTH_TAILS_COSTLY` | both extremes above — maximum opportunity cost |
+| `ARMS_NEUTRAL` | neither extreme arm reaches ARM_TOL_PCT |
+
+`ARM_TOL_PCT=1.0` and `MIN_TOTAL_N=200` are pinned to
+`gate_audit.EDGE_TOL_PP` and `kill_switch_realized_effect.MIN_PAIRS`
+respectively for cross-tool coherence.
+
+**Live verdict** (2026-05-31, n_killswitched=4094): **`BOTH_TAILS_COSTLY`**.
+
+| Arm | mult | n | mean_pred | mean_realized | per_trade_tilt_pp |
+|---|---|---|---|---|---|
+| strong_headwind | 0.60 | 394 | -18.31 | **-1.18%** | +0.474 |
+| mild_headwind | 0.85 | 1643 | -3.35 | +0.69% | -0.104 |
+| neutral | 1.00 | 1308 | +2.03 | +0.60% | 0.000 |
+| mild_tailwind | 1.15 | 439 | +6.89 | +0.59% | +0.089 |
+| strong_tailwind | 1.30 | 310 | +19.18 | **+5.10%** | +1.530 |
+
+Aggregate per-trade tilt **+0.13pp**. Read: the extreme arms BOTH carry
+the right realized sign — strong_tailwind realized +5.10% would have been
+boosted by ×1.30 (real opportunity cost from abstaining), and
+strong_headwind realized -1.18% would have been trimmed by ×0.60 (avoidable
+loss). The aggregate sibling correctly verdicts HURTS but cannot tell you
+the +5.10% strong_tailwind / -1.18% strong_headwind decomposition is
+where the cost concentrates.
+
+**Tests** (`tests/test_kill_switch_arm_breakdown.py`, 44 specific-value
+cases): arm-boundary decode parametrized across all 11 boundary points,
+filter discipline (non-BUY drops, non-killswitch kinds drop, missing
+/ NaN / Inf / bool / unparseable-string pred or realized drops, non-dict
+rows drop, killswitch case-insensitive), per_trade_tilt arithmetic exact
+formula, aggregate formula, every verdict ladder step at threshold
+boundaries, MIN_ARM_N floor prevents tiny-arm flip, ARMS_NEUTRAL when
+extremes inside band, unit_note presence + content (per-trade NOT
+portfolio P&L), fixed top-level + per-arm key shapes, end-to-end JSONL
+round-trip + corrupt-line skipping, every CLI exit code path (0 benign /
+2 actionable), default-path monkeypatch, missing-file error. All 44 pass
+in 2.41s. Focused ML/backtest regression including this pass + sibling
+ledgers: **407 passed in 101.79s**.
+
+### Phase 3 — Live findings (quant-researcher tour)
+
+Persona: deciding whether the ML/backtest stack is worth real capital.
+
+**Finding 1 — The DecisionScorer→conviction-gate apparatus is OFF in
+production.** Across the 4115 captured BUY outcomes:
+0 `acted` / 21 `clamp` / 4094 `killswitch` (99.5%). Every live BUY runs
+at unmodulated conviction. *Current realized returns are persona /
+leverage beta, NOT ML-driven sizing edge.* From a "should this go live?"
+perspective the answer today is "the gate isn't sizing anything — only
+the persona policies are running."
+
+**Finding 2 — The MLP is worse than a one-liner baseline on every cycle
+of recorded history.** `python3 -m paper_trader.ml.baseline_compare`
+verdicts `MLP_NO_BETTER_THAN_TRIVIAL`: MLP rank-IC=-0.0001 vs the best
+single-feature baseline `news_urgency` rank-IC=+0.049 (gap -0.049 on
+n=1000 OOS). The 17-feature net's complexity is buying nothing the raw
+ArticleNet urgency signal doesn't already carry. Across 200 logged
+scorer-skill cycles the median `oos_rmse_ratio` is **1.31** with
+**100% of cycles ≥ 1.0** — the MLP is a strictly worse magnitude
+predictor than the constant-mean trivial baseline on every cycle.
+
+**Finding 3 — The kill-switch is concealing real economic edge on BOTH
+extremes.** New `kill_switch_arm_breakdown` verdict `BOTH_TAILS_COSTLY`
+(table above). The aggregate sibling already verdicts `KILLSWITCH_HURTS`
+(rank-IC +0.094 on n=4094); this pass quantifies it as a +5.10% mean
+realized return in the strong_tailwind arm (×1.30 would have boosted)
+AND a -1.18% mean realized return in the strong_headwind arm (×0.60
+would have trimmed). The per-cycle trailing-20 BUY-IC kill-switch the
+gate currently uses is **structurally unable to see this** because
+each cycle's IC sits at noise; the 4094-row cumulative IC carries
+signal the per-cycle reading dilutes away.
+
+**Finding 4 — `scorer_buy_sell_skill` (NEITHER_SKILLED) appears to
+contradict `kill_switch_realized_effect` (KILLSWITCH_HURTS).**
+Resolution: the trailing-20-cycle MEDIANS used by scorer_buy_sell_skill
+are at noise (buy_t20=+0.010, sell_t20=-0.005); the 4094-row CUMULATIVE
+IC used by kill_switch_realized_effect is +0.094. Aggregation across
+cycles surfaces signal the per-cycle median structurally cannot.
+**Operational implication**: the live kill-switch (which fires on the
+per-cycle trailing-20 BUY-IC, mirroring `scorer_buy_sell_skill`'s
+SKILL_TOL) is using the WRONG aggregation window — it sees noise where
+the longer-horizon read sees skill. A potential remedy is to inform
+the kill-switch from a longer-window rank-IC alongside the trailing-20.
+
+**Finding 5 — The backtest leaderboard is 95% monkey runs.** `backtest.db`
+contains 520 runs; 492 (94.6%) are `model='monkey_random'` (the per-cycle
+benchmark added by `N_MONKEY_BT_PER_CYCLE=20`); only 28 are `model='ml_quant'`.
+The 20 most-recent runs are ALL monkeys. The dashboard's run-ranking
+panels and any leaderboard-driven training feedback are reading mostly
+random-decision noise. The vs_spy_pct distribution across the 516
+complete runs has mean +694%, max +16333%, min -288% — that dispersion
+is pure 10-year leveraged-ETF luck, NOT signal skill. A reading quant
+would mistake the leaderboard for a results board; it is a noise floor.
+
+**Finding 6 — GDELT rate-limit spam dominates `continuous.log`.** Tail
+of the log is overwhelmingly `[gdelt] rate-limited <date> ... attempt
+N/3 — sleeping Ns` messages from the historical-window cache warmer
+(`GDELT_RATE_LIMIT_S=5.5`, weekly progress at 50/4969). This is
+best-effort cache-fill that does NOT block runs (Tier 1 = local
+articles DB) — but a real error in the loop would be invisible buried
+under the GDELT noise. The yfinance "$RIVN possibly delisted" lines
+similarly clutter; both are background-task expected behaviour, not
+fix-actionable, but worth knowing.
+
+**Finding 7 — The `min(conv, 0.95)` cap inside `_ml_decide`'s gate arms
+is dead code.** Verified empirically: across 4115 captured `conviction_pct`
+values max is 0.40 (the leveraged-bull cap); even after ×1.30 max post-gate
+is 0.52, well below the 0.95 ceiling. No production data path can hit it.
+Harmless defensive guard, but the ceiling could be either tightened
+toward the actual binding cap (0.40) for clarity OR removed entirely.
+Touching it is not worth the regression-test surface today; logging this
+so a future "why is `_ml_decide` capping at 0.95" question has an
+answer.
+
+### How the ML/backtest stack works — refreshed mini-reference
+
+```
+                         ┌───────────────────────────────────────────────┐
+                         │  run_continuous_backtests.py main()           │
+                         │  (cooldown=600s, runs_per_cycle=1 (throttled))│
+                         └───────────────────┬───────────────────────────┘
+                                             ▼
+   ┌──────────────────────────────────────────────────────────────────┐
+   │  per cycle:                                                       │
+   │    BacktestEngine.run_all(1) → 1 run × ~250 sampled days         │
+   │      each sampled day:                                            │
+   │        _enforce_risk_exits(SL/TP scan since prev sample)          │
+   │        signals = _fetch_signals(local DB → yfinance → GDELT)     │
+   │        for _ in range(MAX_DECISIONS_PER_DAY=10):                  │
+   │          decision = _ml_decide(...)                               │
+   │              ├─ ticker_scores from articles (sentiment×raw_score) │
+   │              ├─ quant adjustments (RSI/MACD/mom/BB/vol)           │
+   │              ├─ regime dampener (bull/sideways/bear/unknown)      │
+   │              ├─ persona boosts (10 personas mod run_id)           │
+   │              ├─ persona buy_threshold (0.85/1.0/1.15)             │
+   │              ├─ 52w-high gate (wk52_pos > 0.80 → suppress)        │
+   │              ├─ CONTRARIAN flip (overbought buy → sell)           │
+   │              ├─ conviction cap (0.25 reg / 0.40 leveraged-bull)   │
+   │              └─ DecisionScorer gate:                              │
+   │                    if scorer trained, n>=500, NOT off-dist,       │
+   │                       AND kill-switch OK → modulate conviction   │
+   │                       by ×0.6 / ×0.85 / ×1.0 / ×1.15 / ×1.3      │
+   │          status = _execute_decision(...)                          │
+   │          if HOLD or no fill: break                                │
+   │      finalize_run → backtest.db                                   │
+   │                                                                   │
+   │  + N_MONKEY_BT_PER_CYCLE=20 random-decision benchmark runs        │
+   │  (10-year window, n_decisions=1, pure leverage variance)          │
+   │                                                                   │
+   │  outcomes = _compute_decision_outcomes(top_runs)                  │
+   │    → forward 5d/10d/20d returns + intraperiod extremes             │
+   │    → gate_scorer_pred + gate_abstention_kind (clamp/killswitch)    │
+   │    → persona, regime_label, wk52_pos                              │
+   │    → append to data/decision_outcomes.jsonl (tail 5000 for train) │
+   │                                                                   │
+   │  _train_decision_scorer(outcomes)                                  │
+   │    → train_scorer (sklearn MLPRegressor 32→16, alpha=1e-2,        │
+   │       early_stopping=True) on 80% temporal split, OOS on 20%      │
+   │    → pickle data/ml/decision_scorer.pkl atomically                │
+   │    → status string with oos_rmse / oos_buy_ic / oos_sell_ic /     │
+   │       oos_rmse_ratio / per-regime IC / multi-horizon IC          │
+   │    → _append_scorer_skill_log → data/scorer_skill_log.jsonl       │
+   │    → ~20 other per-cycle ledgers (gate_arm, gate_pnl,             │
+   │       persona, sector, calibrated, bootstrap_ci, MFE, stop_band,  │
+   │       feature_alignment, dead_feature_audit, outcome_health, …)  │
+   │                                                                   │
+   │  _inject_and_train → digital-intern articles.db (ArticleNet)      │
+   └──────────────────────────────────────────────────────────────────┘
+```
+
+### Running ML / backtest diagnostics manually
+
+```bash
+# Per-arm killswitch breakdown (NEW this pass):
+python3 -m paper_trader.ml.kill_switch_arm_breakdown
+python3 -m paper_trader.ml.kill_switch_arm_breakdown --json
+
+# Aggregate kill-switch realized-effect verdict (sibling, pass #7):
+python3 -m paper_trader.ml.kill_switch_realized_effect
+
+# BUY-vs-SELL OOS rank-IC asymmetry verdict:
+python3 -m paper_trader.ml.scorer_buy_sell_skill
+
+# MLP vs single-feature baselines — the trivial-vs-net check:
+python3 -m paper_trader.ml.baseline_compare
+
+# Single prediction explainer:
+python3 -m paper_trader.ml.decision_scorer --ticker NVDA --ml-score 5 --rsi 50 --groups
+
+# Per-arm Kelly / Sharpe:
+python3 -m paper_trader.ml.gate_arm_kelly
+
+# Per-cycle scorer-skill trend:
+python3 -m paper_trader.ml.skill_trend
+
+# Continuous loop (the daemon):
+python3 run_continuous_backtests.py
+
+# One-shot 10-run ml_quant backtest:
+python3 run_backtests.py
+```
+
+### Test commands for the ML/backtest domain
+
+```bash
+# Just this pass's new tests (~2.4s, 44 cases):
+python3 -m pytest tests/test_kill_switch_arm_breakdown.py -q
+
+# Full focused slice (this pass: 407 passed in ~102s):
+python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+    tests/test_continuous.py tests/test_kill_switch_arm_breakdown.py \
+    tests/test_scorer_buy_sell_skill.py tests/test_continuous_gate_arm_ledger.py \
+    tests/test_continuous_gate_pnl_ledger.py -q
+
+# Decision scorer alone (~12s):
+python3 -m pytest tests/test_decision_scorer.py -q
+```
+
+### Interpreting backtest results
+
+A `BacktestRun` row in `backtest.db` carries:
+  - `total_return_pct` — raw 1-year (or window) return
+  - `spy_return_pct` — SPY benchmark over the same window
+  - `vs_spy_pct` — raw alpha = total - SPY
+  - `n_trades`, `n_decisions` — activity
+  - `model_id` — `ml_quant` (the live engine) or `monkey_random` (per-cycle
+    benchmark)
+  - `notes` — `benchmark_unavailable: ...` flag when SPY series empty for
+    the window (read this BEFORE trusting vs_spy_pct on any run)
+
+For an ml_quant run, n_decisions ≈ 250 × runs is the healthy range.
+n_decisions=1 with n_trades=3 is a monkey run. A monkey run leaderboard
+position is leverage luck, not strategy skill — sort/filter by model_id
+when reading the dashboard.
+
+### Staging
+
+Explicit pathspec, no `git add -A`:
+
+```bash
+git add paper_trader/ml/kill_switch_arm_breakdown.py \
+        tests/test_kill_switch_arm_breakdown.py
+git diff --staged  # verify only these two files
+git commit -m "feat(ml): kill_switch_arm_breakdown ..."
+```
+
+AGENTS.md edits are committed separately alongside the related code
+when the pass completes — see the next commit in the pass log.
+
+---
+
 ## 2026-05-31 — Agent 1 (paper-trader core) HYBRID pass — `exit_proximity` → live prompt
 
 Persona: an experienced live trader / portfolio manager. Goal: close one
