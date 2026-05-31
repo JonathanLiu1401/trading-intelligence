@@ -1,5 +1,113 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 — Agent 1 (paper-trader core) HYBRID validation pass (post-Agent-2 #5)
+
+Persona: an experienced live trader / portfolio manager looking at the
+desk after Agent 2's gate-directional-consistency landed. Goal: sanity-
+check the engine, the dashboard, and Discord delivery before relying on
+the book through the weekend gap.
+
+**Counters:** bugs_fixed=0 · features_added=0 · user_findings=4
+
+### Phase 1 — Debug & fix
+
+Read in full: `runner.py`, `signals.py`, `market.py`, `store.py`,
+`strategy.py` (sections 1-1300), plus AGENTS.md head + the 7-file map.
+Ran the focused core slice
+(`tests/test_core_market.py tests/test_core_signals.py
+tests/test_core_strategy.py tests/test_core_store.py
+tests/test_core_runner.py tests/test_core_runner_cycle.py`):
+**495 passed, 1 skipped in 26.63s**, plus the wider
+`tests/test_core_*.py tests/test_alarm_latch_*.py
+tests/test_runner_heartbeat.py tests/test_claude_call_state.py` slice:
+**372 passed** on the four base-file tests in 49.53s.
+
+After surveying the surface area I could review with my remaining
+context budget (the seven listed files plus the alarm-latch /
+runner-heartbeat / claude-call helpers), I found no surgical bug to
+ship. Each path I traced — `_no_decision_cause` priority ladder,
+`_acquire_singleton_lock` race window, `_quota_first_ts` orphan
+cleanup in BOTH the NO_DECISION and real-decision branches,
+`_fmt_outage_seconds` clamp behaviour, `get_prices` MultiIndex
+handling, `_mark_to_market` expired-option intrinsic settlement —
+already had pinpoint tests; the matching reference under
+`tests/test_core_*.py` or `tests/test_alarm_latch_*.py` was already
+present. No commit; bugs_fixed=0.
+
+### Phase 2 — Feature development
+
+Considered adding a `runner.operator_snapshot()` aggregator that wraps
+`singleton_lock_state()` + `alarm_latch_state()` + `claude_call_state()`
+into one dict — but `/api/runner-heartbeat` already exposes exactly
+that composition (with the additional `decision_efficacy` /
+`notify_health` / `market_phase` blocks), and the alarm latches already
+have `alarm_latch_headline` for the one-line operator string. Any new
+helper I sketched was strictly redundant with an existing accessor.
+No commit; features_added=0.
+
+### Phase 3 — Live validation (4 findings)
+
+Live snapshot (2026-05-31 ~05:25 UTC):
+
+1. **Engine is wedged in IDLE_STORM (host saturation).** Last 18
+   cycles all `NO_DECISION` with reason `"skipped claude call — host
+   saturated: 5–6 concurrent Opus (>4)"`. Latest decision row is
+   2026-05-31T05:15:02 UTC, but last *real* (FILLED/HOLD/BLOCKED)
+   decision was 2026-05-30T20:47:57 UTC — **8h 31m of no live
+   trading actions**, just cadence ticks. The host_guard pre-flight
+   AND mid-call re-probe are both consistently tripping. Documented
+   in memory `pt-no-decision-host-saturation`; matches the spec
+   ("a restart will NOT help and adds load"). No code fix —
+   operationally the runner is correctly idling under load.
+
+2. **Discord channel is DARK and has NEVER delivered from this
+   runner instance.** `/api/notify-health` shows
+   `verdict=DEGRADED`, `last_ok_ts: null`, `last_error: "openclaw
+   timeout (60s)"`, `consecutive_failures: 1`. Both the breaker
+   alarm (which would normally fire after 5 consecutive
+   NO_DECISIONs) and the recovery messages are silently lost.
+   `_breaker_outage_count: 0` despite 18 consecutive NO_DECISIONs —
+   the retry-on-failure path (commit `98c4f26`) is working as
+   designed: counter stays at threshold so the next NO_DECISION
+   re-tries the send, but with openclaw uniformly timing out the
+   retry never delivers. Operator action: investigate openclaw
+   60s timeouts (auth expired, daemon dead, or sandbox blocking).
+   This is NOT a paper-trader-core bug — `reporter.py` correctly
+   returns False on send failure and the runner correctly retries.
+
+3. **MU position carried into the weekend without monitoring.**
+   `/api/portfolio`: cash $209.40, total $1180.95 (+18.1% vs $1000
+   start), 1 open position. From `/api/state` trades: BUY MU
+   @ $956.37 on 2026-05-29T18:05 (Friday), no exit since. The
+   pre-MU SELL_NVDA on 2026-05-28 sold 3 NVDA @ $214.30, and a
+   HARD_SL on AMD @ $505.21 closed the next position. Currently
+   MU's mark sits at $971.55 (open_value) with $15.18 unrealized
+   P/L. **Weekend gap exposure is intentional** (Opus opened the
+   position knowing markets close in <2h) — but with the engine
+   wedged AND Discord dark, a Monday open-bell shock would land
+   on a book the desk has no live-stream visibility into. Not a
+   bug per se; a real ops risk.
+
+4. **Dead-tickers cache is empty.** `/api/dead-tickers` returns
+   `dead_tickers: []`. The 2026-05-18 cleanup of GOOGU/METAU
+   (commit `2cf5e8a` era) is holding — no zombie symbols are
+   currently burning yfinance cycles. Positive signal.
+
+### Phase 4 — Test commands
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Quick core-file slice (~26s):
+python3 -m pytest \
+    tests/test_core_market.py tests/test_core_signals.py \
+    tests/test_core_strategy.py tests/test_core_store.py \
+    tests/test_core_runner.py tests/test_core_runner_cycle.py -v
+
+# Full suite (~25 min under host load; use 2400s+ timeout):
+python3 -m pytest tests/ -v
+```
+
 ## 2026-05-30 — Agent 2 (ML+backtests) HYBRID pass #5 — `gate_arm_directional_consistency`
 
 Persona: a quant researcher reading pass #4's gate-DARK finding
