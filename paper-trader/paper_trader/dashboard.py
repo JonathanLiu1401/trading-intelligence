@@ -277,6 +277,60 @@ def dead_tickers_api():
         }), 500
 
 
+@app.route("/api/quant-cache-status")
+def quant_cache_status_api():
+    """Operator snapshot of `strategy._QUANT_CACHE` + `_QUANT_NEG_CACHE`.
+
+    The live decision prompt's TECHNICAL block and the
+    `_ml_live_opinion` advisor both read from the quant cache that
+    `get_quant_signals_live` populates. Today the positive cache state and
+    the new negative cache (added alongside this endpoint to stop a
+    delisted ticker from re-hitting yfinance every 5 min) are both
+    INTERNAL to `strategy.py` — there is no operator surface that
+    answers the live trader's question: *which of my 50 watchlist
+    symbols are FRESH vs STALE vs DARK in the quant feed right now?*
+
+    Composes `analytics.quant_cache_status.build_quant_cache_status`
+    verbatim — same single source of truth pattern as `/api/dead-tickers`
+    (which exposes `market._DEAD_CACHE` for the get_price layer). Pure
+    read; no yfinance, no store hop. Optional `?tickers=A,B,C` filters
+    the report to a specific set so a panel can query just the WATCHLIST
+    + held positions and avoid loading hundreds of historical entries.
+    Without the filter, returns every ticker currently in either cache.
+
+    Failure contract: any import / call fault degrades to an ERROR
+    envelope — never a raw 500. Same shape as the success envelope so
+    the panel renders both paths with one branch."""
+    try:
+        from . import strategy as _strat
+        from .analytics.quant_cache_status import build_quant_cache_status
+        req_arg = request.args.get("tickers")
+        requested: list[str] | None
+        if req_arg is None or req_arg.strip() == "":
+            requested = None
+        else:
+            requested = [
+                t.strip().upper() for t in req_arg.split(",") if t.strip()
+            ]
+        snap = build_quant_cache_status(_strat, requested=requested)
+        return jsonify({"service": "paper_trader", **snap})
+    except Exception as e:
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "verdict": "ERROR",
+            "headline": f"quant-cache-status endpoint error: {e}",
+            "n_total": 0,
+            "n_fresh": 0,
+            "n_stale": 0,
+            "n_dark": 0,
+            "n_never": 0,
+            "pos_ttl_s": 0,
+            "neg_ttl_s": 0,
+            "rows": [],
+        }), 500
+
+
 @app.route("/api/alarm-latches")
 def alarm_latches_api():
     """In-process silent-failure alarm-latch snapshot.
