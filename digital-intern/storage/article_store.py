@@ -1878,6 +1878,16 @@ class ArticleStore:
         # ``watchers.non_english_filter`` docstring for the full
         # discriminator + sample evidence.
         from watchers.non_english_filter import looks_non_english
+        # YouTube-share-card SEO-mill rows — GoogleNews/Mshale,
+        # GoogleNews/Fathom Journal, etc. emit page titles carrying a
+        # parenthesised opaque YouTube video ID at end-of-title. ML
+        # urgency head over-scores them to ml_score>=9 (held-ticker
+        # density + clickbait verbs). Live evidence (2026-05-30, 30d):
+        # 293 corpus matches, 6 reached urgency=2 (alerted). See
+        # ``watchers.youtube_mill_filter.looks_like_youtube_mill`` for
+        # the full discriminator + evidence — same defense-in-depth
+        # class as ``looks_non_english`` above.
+        from watchers.youtube_mill_filter import looks_like_youtube_mill
         pre_floor: list[tuple[str, float, int]] = []
         real: list[dict] = []
         for art in batch:
@@ -1906,6 +1916,14 @@ class ArticleStore:
             # AND (non-English stopword + diacritic) keeps precision against
             # English headlines with one accented name ("São Paulo").
             if looks_non_english(art):
+                pre_floor.append((aid, 0.01, 0))
+                continue
+            # YouTube-share-card SEO mill — parenthesised opaque
+            # 8-15 char alnum ID mixing lower+upper+digit, anchored
+            # at end-of-title before an optional ``- Publisher`` tail.
+            # 293 corpus matches in 30 days, 6 alerted; zero false
+            # positives on the curated must-survive corpus.
+            if looks_like_youtube_mill(art):
                 pre_floor.append((aid, 0.01, 0))
                 continue
             real.append(art)
