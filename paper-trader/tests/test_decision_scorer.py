@@ -20,6 +20,7 @@ from paper_trader.ml.decision_scorer import (
     PRED_CLAMP_PCT,
     SECTORS,
     SECTOR_MAP,
+    _bool_to_float,
     _to_float,
     build_features,
     train_scorer,
@@ -278,6 +279,48 @@ class TestToFloat:
         assert _to_float(np.bool_(False), 99.0) == 99.0
 
 
+# ─────────────────────── _bool_to_float ───────────────────────────
+
+class TestBoolToFloat:
+    """Pin the contract for the enhanced MACD boolean coercion.
+
+    ``build_features`` treats ``ema200_above`` / ``hist_cross_up`` /
+    ``macd_below_zero_cross`` as booleans encoded as 0.0/1.0 floats. The
+    coercion lives in ``_bool_to_float``. A regression here silently
+    poisons every feature row that carries these signals — the docstring
+    explicitly says "missing data is treated as 'signal not present'
+    rather than imputed positive", so the None → 0.0 path is load-bearing.
+    """
+
+    def test_true_returns_one(self):
+        assert _bool_to_float(True) == 1.0
+
+    def test_false_returns_zero(self):
+        assert _bool_to_float(False) == 0.0
+
+    def test_none_returns_zero(self):
+        # Missing data is "signal not present" — 0.0, NOT imputed True.
+        assert _bool_to_float(None) == 0.0
+
+    def test_int_one_returns_one(self):
+        # Tolerant of stringified bools / 0/1 ints by design.
+        assert _bool_to_float(1) == 1.0
+
+    def test_int_zero_returns_zero(self):
+        assert _bool_to_float(0) == 0.0
+
+    def test_string_true_returns_zero(self):
+        # Non-numeric strings cannot be coerced via float() — must fall
+        # through to safe-default 0.0, not raise.
+        assert _bool_to_float("true") == 0.0
+        assert _bool_to_float("nope") == 0.0
+
+    def test_negative_int_returns_zero(self):
+        # `float(v) > 0.0` is the discriminator — a negative value is
+        # NOT a positive signal.
+        assert _bool_to_float(-1) == 0.0
+
+
 # ─────────────────────── build_features ───────────────────────────
 
 class TestBuildFeatures:
@@ -330,6 +373,63 @@ class TestBuildFeatures:
         lo = build_features(0.5, 50, 0, 0, 0, 1.0, "NVDA")
         assert hi[0] > lo[0]
         assert hi != lo
+
+    def test_enhanced_macd_features_slotted_correctly(self):
+        """The 3 enhanced MACD boolean features must land in the slots that
+        ``FEATURE_NAMES`` says they do — between the 10 base numeric features
+        and the 7-way sector one-hot. A silent re-order would mislabel every
+        attribution panel and silently break inference parity between the
+        live ``_ml_decide`` gate and every sibling analyzer.
+        """
+        feats_all_true = build_features(
+            ml_score=0.0, rsi=50.0, macd=0.0, mom5=0.0, mom20=0.0,
+            regime_mult=1.0, ticker="NVDA",
+            vol_ratio=1.0, bb_pos=0.0,
+            news_urgency=50.0, news_article_count=1.0,
+            ema200_above=True, hist_cross_up=True,
+            macd_below_zero_cross=True,
+        )
+        by_name = dict(zip(FEATURE_NAMES, feats_all_true))
+        assert by_name["ema200_above"] == 1.0
+        assert by_name["hist_cross_up"] == 1.0
+        assert by_name["macd_below_zero_cross"] == 1.0
+
+    def test_enhanced_macd_features_none_defaults_to_zero(self):
+        """None (the 'signal not present' convention used by
+        ``_compute_decision_outcomes`` for tickers with insufficient
+        history) must map to 0.0 — NOT to the docstring's "signal present"
+        positive. This is the load-bearing path: if any of the 3 booleans
+        ever defaulted to 1.0 on missing-data input, the model would see
+        a spurious positive signal on every thin-history ticker."""
+        feats = build_features(
+            ml_score=0.0, rsi=50.0, macd=0.0, mom5=0.0, mom20=0.0,
+            regime_mult=1.0, ticker="NVDA",
+            ema200_above=None, hist_cross_up=None,
+            macd_below_zero_cross=None,
+        )
+        by_name = dict(zip(FEATURE_NAMES, feats))
+        assert by_name["ema200_above"] == 0.0
+        assert by_name["hist_cross_up"] == 0.0
+        assert by_name["macd_below_zero_cross"] == 0.0
+
+    def test_enhanced_macd_features_distinguish_true_from_false(self):
+        """A True / False pair for the same input must produce different
+        feature vectors — otherwise the model has nothing to learn from."""
+        f_true = build_features(
+            0.0, 50.0, 0.0, 0.0, 0.0, 1.0, "NVDA",
+            ema200_above=True, hist_cross_up=False,
+            macd_below_zero_cross=False,
+        )
+        f_false = build_features(
+            0.0, 50.0, 0.0, 0.0, 0.0, 1.0, "NVDA",
+            ema200_above=False, hist_cross_up=False,
+            macd_below_zero_cross=False,
+        )
+        assert f_true != f_false
+        # Specifically the ema200_above slot is the one that differs.
+        ema_idx = FEATURE_NAMES.index("ema200_above")
+        assert f_true[ema_idx] == 1.0
+        assert f_false[ema_idx] == 0.0
 
     def test_feature_names_order_matches_build_features(self):
         """``FEATURE_NAMES`` is the single source of truth that
