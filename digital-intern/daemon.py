@@ -60,6 +60,7 @@ from collectors.cboe_unusual_options import collect_cboe_unusual_options
 from collectors.portfolio_pnl import get_portfolio_pnl, format_pnl_block, write_pl_snapshot
 from collectors.sec_edgar import collect_sec_edgar, collect_sec_edgar_fulltext
 from collectors.sec_activist_collector import collect as collect_sec_activist
+from collectors.sec_prospectus_collector import collect_sec_prospectus
 from collectors.google_news import collect_google_news
 from collectors.nitter_collector import collect_nitter
 from collectors.substack_collector import collect_substack
@@ -220,6 +221,7 @@ WORKER_HEALTH_STALE_SECS = 15 * 60  # mark worker stale in heartbeat if no succe
 SEC_EDGAR_INTERVAL  = 300         # SEC 8-K RSS sweep every 5min
 SEC_EDGAR_FT_INTERVAL = 900       # SEC full-text per-ticker every 15min
 SEC_ACTIVIST_INTERVAL = 600       # SEC activist/M&A special filings every 10min
+SEC_PROSPECTUS_INTERVAL = 900     # SEC 424B/S-1 prospectus filings every 15min
 SEC_ENFORCEMENT_INTERVAL = 900    # SEC enforcement: litigation, admin proceedings, suspensions every 15min
 SEC_KEYWORD_INTERVAL  = 3600      # SEC 8-K keyword event scanner (layoffs/M&A/breach) once per hour
 GOOGLE_NEWS_INTERVAL = 120        # Google News per-ticker pass every 2min
@@ -409,6 +411,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "reddit": REDDIT_INTERVAL, "stocktwits": STOCKTWITS_INTERVAL, "ticker": TICKER_INTERVAL,
     "sec_edgar": SEC_EDGAR_INTERVAL, "sec_edgar_ft": SEC_EDGAR_FT_INTERVAL,
     "sec_activist": SEC_ACTIVIST_INTERVAL,
+    "sec_prospectus": SEC_PROSPECTUS_INTERVAL,
     "sec_enforcement": SEC_ENFORCEMENT_INTERVAL,
     "sec_keyword": SEC_KEYWORD_INTERVAL,
     "google_news": GOOGLE_NEWS_INTERVAL, "nitter": NITTER_INTERVAL,
@@ -1137,6 +1140,27 @@ def sec_activist_worker(store: ArticleStore):
             bo.sleep(lambda: _running)
             continue
         _sleep(SEC_ACTIVIST_INTERVAL)
+
+
+# ── Worker: SEC Prospectus Filings — every 15min ─────────────────────────────
+def sec_prospectus_worker(store: ArticleStore):
+    log.info("[sec_prospectus_worker] started")
+    bo = Backoff("sec_prospectus", base=10.0, cap=600.0)
+    while _running:
+        try:
+            articles = collect_sec_prospectus()
+            _ingest(store, articles, "sec_prospectus")
+            try:
+                source_health.record_result("sec_prospectus", len(articles))
+            except Exception as he:
+                log.warning(f"[sec_prospectus_worker] source_health error: {he}")
+            _worker_last_ok["sec_prospectus"] = time.time()
+            bo.reset()
+        except Exception as e:
+            log.warning(f"[sec_prospectus_worker] error: {e}; backing off {bo.peek():.0f}s")
+            bo.sleep(lambda: _running)
+            continue
+        _sleep(SEC_PROSPECTUS_INTERVAL)
 
 
 # ── Worker: SEC Enforcement Actions — every 15min ────────────────────────────
@@ -5259,6 +5283,7 @@ def main():
         ("sec_edgar",   sec_edgar_worker),
         ("sec_edgar_ft", sec_edgar_ft_worker),
         ("sec_activist", sec_activist_worker),
+        ("sec_prospectus", sec_prospectus_worker),
         ("sec_enforcement", sec_enforcement_worker),
         ("sec_keyword", sec_keyword_worker),
         ("google_news", google_news_worker),
