@@ -1,5 +1,339 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 — Agent 2 (ML+backtests) HYBRID pass #5 — `gate_arm_directional_consistency`
+
+Persona: a quant researcher reading pass #4's gate-DARK finding
+(100% killswitch-abstained on 143/143 BUYs) and the durable
+`MLP_NO_BETTER_THAN_TRIVIAL` verdict, asking the natural complementary
+question: *given the gate has never actually fired its arms in
+production, when it eventually does, will the per-arm spread be a
+mean-skew artifact or a real sign-only directional edge?*
+
+**Counters:** bugs_fixed=1 · features_added=1 · user_findings=10
+
+### Phase 1 — `fix:` indent normalisation + `_bool_to_float` test coverage (commit `be9a012`)
+
+**Bug 1 (cosmetic, real fix):**
+`paper_trader/ml/scorer_learning_curve.py::_predict_rank_ic` had the 3
+in-flight enhanced MACD kwargs (`ema200_above`, `hist_cross_up`,
+`macd_below_zero_cross`) added at 16-space indent inside a 20-space-indent
+call block in both the `predict_with_meta` and the `predict()` fallback
+paths. Valid Python (function-call kwarg indent is unstructured) but
+visually misaligned. Normalised to match surrounding kwargs.
+
+**Test coverage gap:** before this pass, NO direct tests existed for
+`paper_trader.ml.decision_scorer._bool_to_float` (the load-bearing
+True/False/None → 0.0/1.0/0.0 coercion for the 3 enhanced MACD boolean
+features) OR for the slotting of those 3 features in `build_features`.
+Added 10 specific-value tests:
+
+- `_bool_to_float`: True / False / None / int 1 / int 0 / non-numeric
+  string / negative int → all pinned to their documented outputs. The
+  None → 0.0 path is load-bearing — if any of the 3 booleans ever
+  defaulted to 1.0 on missing-data input the model would see spurious
+  positive signals on every thin-history ticker (the docstring's
+  "missing data is 'signal not present', NOT imputed positive" rule).
+- `build_features`: enhanced MACD slots land at the right
+  `FEATURE_NAMES` positions; None defaults to 0.0; True/False produce
+  distinct vectors (otherwise the model has nothing to learn from).
+
+ML/backtest test slice: **324 passed in 162.37s**.
+
+### Phase 2 — `feat:` `gate_arm_directional_consistency` (commit `cf0db6d`)
+
+**The gap.** `gate_realized` reports each gate arm's realized MEAN
+return; the verdict spread is `strong_tailwind.mean −
+strong_headwind.mean`. **Means are fragile to outliers**: a
+`strong_tailwind` arm with 40% positive realizations but two outsized
++80% winners can still post a positive mean while being SIGN-wrong on
+60% of trades. The 5-day-window leveraged-ETF tape (SOXL/TQQQ)
+documented in AGENTS.md is exactly this distribution shape — noisy
+weekly outcomes with rare big positive weeks. A reader of
+`gate_realized`'s mean-spread verdict cannot distinguish "the gate's
+sizing reallocation pays" from "the gate sizes UP arms with tail-driven
+mean but flip-a-coin sign hit rate".
+
+**The analyzer** (`paper_trader/ml/gate_arm_directional_consistency.py`):
+sign-only complement of `gate_realized`. For each captured-then-acted
+outcome row, bucket by `gate_arm` and record realized sign (SELL-flipped
+to the universal codebase convention). Per-arm output:
+
+  - `n`, `n_positive`, `n_negative`, `n_zero`
+  - `expected_sign` (+1 tailwind / -1 headwind / 0 neutral)
+  - `directional_consistency` — fraction of non-zero realized whose
+    sign matches `expected_sign`. None on the neutral arm (no expected
+    direction by construction).
+  - `balanced_fraction` = `max(n_pos, n_neg) / n_nonzero` (reported
+    for ALL arms — the only sign-only summary the neutral arm carries).
+
+**Verdict ladder** (threshold-driven on the two EXTREME arms, exactly
+testable):
+
+| Verdict | Trigger |
+|---|---|
+| `GATE_CAPTURE_NOT_YET_POPULATED` | 0 captured rows |
+| `INSUFFICIENT_DATA` | < `MIN_TOTAL=30` acted OR < `MIN_ARM_N=5` in either extreme arm |
+| `GATE_DIRECTIONALLY_INVERTED` | ≥1 extreme arm has consistency < `INVERTED_TOL=0.45` (the gate's biggest bet is sign-WRONG more often than right) |
+| `GATE_DIRECTIONALLY_NOISE` | both extreme arms in [0.45, 0.55] — coin-flip on the gate's biggest bets |
+| `GATE_DIRECTIONALLY_CONSISTENT` | both extreme arms ≥ `CONSISTENT_TOL=0.55` |
+| `GATE_DIRECTIONALLY_MIXED` | one extreme arm clears 0.55, the other in [0.45, 0.55] |
+
+Operational discipline mirrors every sibling `paper_trader/ml/*`
+diagnostic: never trains, never writes pickle / outcomes JSONL / any
+trade path. Errors degrade to a `status='error'` envelope; the
+analyzer never raises. CLI exits 0 on every passive verdict
+(`CONSISTENT` / `INSUFFICIENT_DATA` / `NOT_YET_POPULATED` — quant-clean
+states), 2 on the operator-actionable verdicts (`INVERTED` / `NOISE` /
+`MIXED`). Arm-bucketing helper `_arm_for_pred` pins via
+`TestSSOT.test_arm_for_pred_matches_gate_audit` (compares to
+`gate_audit.gate_arm` on a 15-point boundary table including non-finite
+to catch silent drift).
+
+**Live verdict on the 6056-row corpus** (2026-05-30):
+
+  `INSUFFICIENT_DATA` — **4734 captured rows, ALL 4734 abstained, 0
+  acted**. The gate has been completely DARK across the entire captured
+  history. Same finding as `gate_realized`'s captured-then-deployed
+  view, complementary discipline (sign-only vs mean-spread). The
+  analyzer correctly waits for the gate to engage; once it does, the
+  verdict becomes meaningful.
+
+**Tests** (`tests/test_gate_arm_directional_consistency.py`, 29 cases,
+all specific-value):
+
+- `_arm_for_pred` boundary table (-50 / -10.5 / -10 / -5 / -0.01 / 0 /
+  0.01 / 4.99 / 5 / 5.01 / 10 / 10.01 / 50 / ±inf) — matches the live
+  `_ml_decide` if/elif chain to the bit.
+- `_EXPECTED_SIGN` mapping pinned for every arm (regression guard
+  if a future arm rename silently changes the expected direction).
+- Synthetic per-verdict cases (CONSISTENT 0.8/0.8, INVERTED-tailwind
+  0.3, INVERTED-headwind 0.3, NOISE 0.5/0.5, MIXED 0.8/0.5).
+- SELL-flip pinned (a SELL with realized=-5 counts as `+5 → n_positive`
+  in the tailwind arm).
+- Off-distribution rows route to `n_abstained`, NOT a per-arm bucket
+  (verdict stays `INSUFFICIENT_DATA` because `n_acted=0`).
+- Non-dict / NaN / zero-realized edge cases — never raises, zeros
+  excluded from consistency denominator.
+- Neutral arm has `directional_consistency=None` by contract
+  (`balanced_fraction` is still reported).
+- `analyze()` end-to-end via real tmp JSONL file (CONSISTENT verdict),
+  missing-file path (`NOT_YET_POPULATED`), corrupt-line skipping.
+
+All 29 pass in 0.55s. Full ML/backtest slice (Phase 1 + Phase 2):
+**353 passed in 163.40s**.
+
+### Phase 3 — Live findings (quant-researcher tour)
+
+Live corpus / scorer / engine snapshot (2026-05-30, evening cycles).
+
+1. **Engine healthy.** Cycle 104137 currently running (+30.88% so
+   far). Last 10 completed runs all positive (+93.03% to +2147.09%),
+   n_trades=3 each — the leveraged-ETF concentrated-bet pattern
+   documented since pass #4 persists. Last cycle returned +1370.57%
+   on 3 trades.
+
+2. **OOS calibration upgraded from `MISCALIBRATED` to
+   `DIRECTIONAL_BUT_BIASED`.** Pass #4 reported `MISCALIBRATED`
+   (spearman +0.113). Current OOS verdict: `DIRECTIONAL_BUT_BIASED`
+   (spearman +0.1381, monotone=0.667, decile_err 4.29pp). Real
+   improvement — the rank ordering is now trustworthy. Magnitude
+   bias persists: d10 mean_pred=+16.30 vs realized=+3.59, d1
+   mean_pred=-11.20 vs realized=-1.56.
+
+3. **MLP rank_ic improved from +0.113 → +0.138 OOS** but the gap to
+   the best one-liner closed correspondingly:
+   `MLP_NO_BETTER_THAN_TRIVIAL` durable (gap +0.036, within the noise
+   band). The new MACD/EMA200 features (in-flight plumbing across the
+   sibling analyzers, see git log) appear to be contributing to the
+   MLP improvement.
+
+4. **`news_count` dir_acc still 0.778.** Same as pass #4. Single
+   binary feature predicts direction better than the 20-feature MLP
+   (0.549). The signal-extraction gap persists — a one-line rule
+   ("has news → expect positive") outperforms the net on directional
+   accuracy by 23 percentage points.
+
+5. **Gate is completely DARK and not trending toward recovery.**
+   `gate_health_trend`: `GATE_DARK_FLAT`. `has_never_been_active=True`
+   (the deployed pickle has NEVER fired the gate in the recorded
+   209-cycle skill log). Trailing-20 median `oos_buy_ic=+0.005`
+   (vs threshold +0.03). Slope_20 = -0.0011/cycle (at noise — no
+   directional recovery trend). The kill-switch (`#5` invariant) is
+   doing real work: the trailing BUY-only skill is statistically at
+   coin-flip.
+
+6. **Trailing-100 cycle BUY/SELL IC asymmetry.** BUY median=-0.010,
+   SELL median=+0.010. The model has slightly NEGATIVE BUY skill but
+   slightly POSITIVE SELL skill. The gate is BUY-only by construction
+   so the modulation cannot exploit the SELL skill — even if the gate
+   were re-enabled.
+
+7. **My new analyzer confirms gate-DARK from a different angle.**
+   `gate_arm_directional_consistency` on the OOS slice: 4734 captured
+   rows, 0 acted (all abstained — `gate_off_dist=True` on every
+   captured row, the killswitch + off-dist guard pair). The analyzer
+   waits cleanly for `n_acted ≥ 30` AND `extreme_arm_n ≥ 5` before
+   producing a meaningful verdict. Sibling `gate_realized` reports
+   the same condition with a different denominator (971 captured /
+   971 abstained on its slice — slight slice-size variance from the
+   shared analyzer using all rows vs gate_realized's OOS-only path).
+
+8. **LLM annotation auth failure.** `continuous.log` shows
+   `[continuous] LLM annotation failed: "Could not resolve
+   authentication method..."` (Anthropic SDK auth path).
+   `[continuous] LLM labels: 0 endorsed, 0 condemned`. The
+   per-cycle GOOD/NEUTRAL/BAD trade annotation feedback into
+   `winner_training.jsonl` is silently dropping rows. The
+   DecisionScorer training still runs — `llm_quality_label=0`
+   defaults to weight ×1.0 for unlabeled rows — but the 3×
+   ENDORSED multiplier and 0.1× CONDEMNED suppression are inert
+   for these cycles. Not a paper-trader bug per se but operationally
+   notable; the env auth issue needs operator attention.
+
+9. **`inject err: database locked`.** Recurring continuous-log entry:
+   `[continuous] ml: inject err: database locked after 4 attempts`.
+   The ArticleNet retrain subprocess fails on the digital-intern
+   articles.db write-lock. Documented as
+   memory `di-ml-trainer-subprocess-timeout` (external system
+   issue, not paper-trader). Paper-trader's DecisionScorer retrain
+   succeeds every cycle independent of this; only the digital-intern
+   ArticleNet retrain is affected.
+
+10. **GDELT 429 storm.** `continuous.log` shows recurring
+    `[gdelt] rate-limited` and `[gdelt] ConnectionError` entries.
+    The backtest historical news fetcher is being rate-limited
+    heavily — but the engine continues unaffected (the local
+    articles cache covers the live signal pipeline and quant
+    signals alone drive `_ml_decide`).
+
+### How the ML/backtest stack works — refreshed mini-reference
+
+**DecisionScorer** (`paper_trader/ml/decision_scorer.py`):
+
+* 20-feature MLPRegressor(32, 16) + L2 alpha=1e-2 + early_stopping
+  (anti-overfit retune, 2026-05-18). Features: 10 base numeric
+  (ml_score / rsi / macd / mom5 / mom20 / regime_mult / vol_ratio /
+  bb_pos / news_urgency / news_article_count) + 3 enhanced MACD
+  booleans (ema200_above / hist_cross_up / macd_below_zero_cross)
+  + 7-way sector one-hot. `_bool_to_float` (now test-pinned) is the
+  bool→{0.0,1.0} coercion; None → 0.0 ("signal not present", load-bearing).
+* `predict_with_meta(...)` returns
+  `{pred, raw, clamped, off_distribution, percentile, calibrated,
+  failed, gate_arm, gate_arm_multiplier}` — `pred` is clamped to
+  ±`PRED_CLAMP_PCT=50`, `calibrated` is the quantile-mapped honest
+  magnitude.
+* `predict()` is the scalar fast path the gate uses.
+* On-disk pickle ships `pred_quantiles` (101 IS prediction percentiles)
+  and `label_quantiles` (101 IS realized return percentiles). Current
+  deployed scorer: n_train=3409, pred_quantiles span [-53.97, +53.82],
+  label_quantiles span [-50, +50] (the clamp boundary).
+* OOS verdict (2026-05-30): `DIRECTIONAL_BUT_BIASED` (upgraded from
+  `MISCALIBRATED`) — ranking trustworthy, magnitude inflated at the
+  tails.
+
+**Backtest engine** (`paper_trader/backtest.py`):
+
+* `_ml_decide` is pure quant + sentiment, no Opus call. Score every
+  watchlist ticker via ML article scores * sentiment, adjust with
+  RSI/MACD/momentum/BB, apply regime multiplier, persona boost,
+  52-week-high gate, sector concentration guard.
+* The DecisionScorer modulates BUY conviction only via a 5-arm gate
+  (×0.6 / ×0.85 / ×1.0 / ×1.15 / ×1.3) when `is_trained AND n_train
+  ≥ 500 AND NOT scorer_off_dist AND kill-switch active`. Currently
+  all 4 conditions almost never co-occur: the kill-switch is firing
+  100% (gate has NEVER fired in 209 recorded cycles).
+
+**Continuous loop** (`run_continuous_backtests.py`):
+
+* Per cycle (60s cooldown): pick random window, run 5 backtests
+  in parallel, compute decision outcomes (5d forward returns via
+  PriceCache), append to `decision_outcomes.jsonl`, retrain
+  DecisionScorer on last 5000 outcomes (temporal 80/20 split),
+  write `scorer_skill_log.jsonl` row, inject winner JSONL to
+  ArticleNet, trim history.
+* Skill log row carries: `gate_active` (n_train ≥ 500),
+  `gate_killswitch_active` (trailing IC > threshold),
+  `gate_effectively_active` (BOTH must be True).
+
+### Running ML / backtest diagnostics manually
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Single prediction explainer:
+python3 -m paper_trader.ml.decision_scorer --ticker NVDA --ml-score 2.5 \
+    --rsi 55 --macd 0.5 --mom5 3.0 --mom20 7.0 --groups
+
+# OOS calibration:
+python3 -m paper_trader.ml.calibration --oos
+
+# Single-feature baseline comparison:
+python3 -m paper_trader.ml.baseline_compare --oos
+
+# Gate kill-switch trend:
+python3 -m paper_trader.ml.gate_health_trend
+
+# Gate captured-then-deployed mean-spread verdict:
+python3 -m paper_trader.ml.gate_realized
+
+# Gate captured-then-deployed sign-only directional verdict (NEW):
+python3 -m paper_trader.ml.gate_arm_directional_consistency
+
+# Per-arm Kelly fraction / Sharpe:
+python3 -m paper_trader.ml.gate_arm_kelly
+
+# Deployed pickle smoke:
+python3 -m paper_trader.ml.scorer_pickle_smoke
+
+# Continuous loop (the daemon):
+python3 run_continuous_backtests.py
+
+# One-shot 10-run backtest:
+python3 run_backtests.py
+```
+
+### Test commands for the ML/backtest domain
+
+```bash
+# Decision scorer (now incl. _bool_to_float + enhanced MACD slot tests):
+python3 -m pytest tests/test_decision_scorer.py -v
+
+# Gate directional consistency (NEW this pass):
+python3 -m pytest tests/test_gate_arm_directional_consistency.py -v
+
+# Backtest engine + outcome pipeline:
+python3 -m pytest tests/test_backtest.py tests/test_continuous.py -v
+
+# Scorer learning curve:
+python3 -m pytest tests/test_scorer_learning_curve.py -v
+
+# Full ML/backtest slice (this pass: 353 passed in 163.40s):
+python3 -m pytest tests/test_decision_scorer.py tests/test_backtest.py \
+    tests/test_continuous.py tests/test_gate_arm_directional_consistency.py \
+    tests/test_scorer_learning_curve.py
+```
+
+### Interpreting backtest results
+
+* Each run is a 1-yr (or random 1-5yr) historical simulation against a
+  10-persona watchlist. `total_return_pct > 0` is required for a run
+  to seed `winner_training.jsonl`. Current pattern: 3-trade
+  concentrated leveraged-ETF bets (SOXL/TQQQ/etc.) routinely return
+  >100% on bull windows.
+* Per-cycle `data/scorer_skill_log.jsonl` row carries the model's
+  OOS skill metrics (rank-IC / RMSE / dir-acc) PLUS the gate state
+  (`gate_active`, `gate_killswitch_active`, `gate_effectively_active`)
+  PLUS the kill-switch reason. Read this to answer "is the gate
+  doing anything right now?".
+* `_compute_decision_outcomes` walks every FILLED BUY/SELL in the
+  run's `backtest_decisions` table, computes 5d/10d/20d forward
+  returns, captures the gate's then-deployed prediction
+  (`gate_scorer_pred`), the abstention kind
+  (`gate_abstention_kind`: `clamp` / `killswitch` / None), persona,
+  regime label, conviction %, and intraperiod extremes.
+
+---
+
 ## 2026-05-30 — Agent 1 (paper-trader core) HYBRID — quant negative cache + `/api/quant-cache-status`
 
 Persona: a live trader running this engine through a weekend
