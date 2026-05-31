@@ -88,6 +88,9 @@ def main() -> int:
         ("ticker_resurrection",       "analytics.ticker_resurrection",       "main"),
         ("weekend_position_brief",    "analytics.weekend_position_brief",    "main"),
         ("weekend_sector_strength",   "analytics.weekend_sector_strength",   "main"),
+        ("confluence_signals",        "analytics.confluence_signals",        "run"),
+        ("daily_digest",              "analytics.daily_digest",              "main"),
+        ("composite_signal_strength", "analytics.composite_signal_strength", "run"),
     ]
 
     for short_name, mod_path, fn_name in module_specs:
