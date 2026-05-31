@@ -1,5 +1,171 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-31 — Agent 1 (paper-trader core) HYBRID pass — `exit_proximity` → live prompt
+
+Persona: an experienced live trader / portfolio manager. Goal: close one
+concrete dashboard→prompt gap and validate the desk after Agent 1's
+prior 2026-05-30 read-only pass.
+
+**Counters:** bugs_fixed=0 · features_added=1 · user_findings=4
+
+### Phase 1 — Debug & fix
+
+Read the seven listed core files in full (runner.py, reporter.py,
+signals.py, strategy.py, dashboard.py header, market.py, store.py),
+plus the new last_fill builder. Ran the focused core slice
+(`test_core_market.py test_core_signals.py test_core_strategy.py
+test_core_store.py test_core_runner.py test_core_runner_cycle.py`):
+**495 passed, 1 skipped in 13.38s**.
+
+No surgical bug surfaced inside the 7-file set without speculative
+work. Each path I traced was already pinned: `_recheck_singleton_lock`
+race / `_no_decision_cause` priority ladder / `_check_and_execute_hard_exits`
+total_value invariance under multi-exit / option-strike non-numeric
+guard in `_execute` / stale-mark vs hard-exit interaction in
+`positions_needing_hard_exit`. The pass-#4 / pass-#5 hardening did its
+job. bugs_fixed=0.
+
+### Phase 2 — `feat:` `exit_proximity` prompt_block (commit `435af0b`)
+
+**The gap.** `_check_and_execute_hard_exits` auto-exits any open stock
+lot that breaches its per-lot SL/TP. The dashboard surface
+(`/api/exit-proximity`, commit `aa17646`) and the Discord hourly
+surface (`reporter._exit_proximity_line`) both render the FORWARD
+diagnostic — but Opus's live decision prompt was blind to it. The
+`SYSTEM_PROMPT` HARD EXITS section documents the static rule (2/3 %
+standard, 4/6 % leveraged) and the position lines show qty/avg/mark/P/L,
+but the **current-state per-lot diagnostic** — band, signed distance,
+blended-cost-anchored thresholds — was not in the prompt. Opus would
+have to re-derive SL/TP from avg_cost, which is **wrong on blended
+lots** (strategy._execute BUY branch re-anchors SL/TP to the new
+blended cost, NOT `avg * 0.98`).
+
+**The feature.** `build_exit_proximity` gains a `prompt_block` field;
+returns `None` on COMFORTABLE / NO_DATA / NO_SL_TP_SET (silence —
+healthy book stays quiet, the `thesis_drift` INTACT precedent) and a
+rendered section on AT_RISK / NEAR_THRESHOLD. The block carries the
+SSOT headline verbatim (single source of truth with `/api/exit-proximity`
++ the Discord line — invariant #10), worst-first up to
+`PROMPT_BLOCK_MAX_ROWS=5` per-row lines, each tagged with the band,
+signed distance to the closer firing threshold, and the absolute
+(mark, SL, TP) triple. Closes with the advisory line:
+"hard SL/TP fire automatically before next prompt".
+
+**Strategy wiring.** `strategy.decide()` composes the block (non-fatal-
+by-construction, wrapped in try/except — a diagnostics fault is "no
+block this cycle", never "no decision this cycle"). `_build_payload`
+gains an `exit_proximity_block` kwarg; placement is **after**
+buying_power and **before** WATCHLIST PRICES so the trader sees
+"what cash can I deploy" → "what is at risk right now" → "what
+prices to deploy against" in the natural triage order.
+
+**Tests.** 28 new specific-value tests across two files
+(`test_exit_proximity_prompt_block.py` + `test_exit_proximity_prompt_wiring.py`):
+
+  * **Block rendering** (21 tests): silence on COMFORTABLE / NO_DATA /
+    NO_SL_TP_SET (verdict set pinned to `frozenset({"AT_RISK",
+    "NEAR_THRESHOLD"})` so future renames can't silently dark the
+    block); AT_RISK_SL renders distance + thresholds; AT_RISK_TP picks
+    TP side; NEAR_SL / NEAR_TP path; AT_RISK ranks before NEAR_*;
+    MAX_ROWS cap; non-actionable rows excluded; closer_target
+    fallback; threshold tag dropped on missing field; max_rows param;
+    options / garbage degrade-safe.
+  * **Strategy wiring** (7 tests): kwarg accepted; payload order
+    (BP < EP < WATCHLIST); ordering against the full advisory stack;
+    import-path pin; end-to-end `decide()` → builder → block path with
+    monkeypatched store/market/signals (forge AT_RISK_SL → assert
+    block reaches `_build_payload`); builder-raises diagnostic
+    failure degrades cleanly (no abort).
+
+Test results: full regression slice — focused
+**399 passed, 1 skipped in 4.02s** (core_market / core_signals /
+core_strategy / core_store / core_runner / core_runner_cycle /
+exit_proximity / exit_proximity_reporter / new exit_proximity_prompt_block /
+new exit_proximity_prompt_wiring / macro_calendar / decision_context).
+
+### Phase 3 — Live validation (4 findings)
+
+Live snapshot (2026-05-31 ~10:15 UTC):
+
+1. **Engine wedged in IDLE_STORM — deepened.** 20/20 cycles
+   NO_DECISION, `dominant_cause=host_saturated`. Last real decision
+   was 2026-05-30T20:47:57 UTC — **13h 27m of no live trading
+   actions**. Previous pass had 8h 31m; the storm has lasted through
+   the weekend. The HOLD MU verdict from 13h ago is good (Opus
+   correctly read 100% MU, 82.3% SEMIS, RSI 78, bb 0.98 →
+   overextended). No code change — restart will NOT help per the
+   heartbeat verdict.
+
+2. **Discord channel DEGRADED with 1 consecutive openclaw timeout.**
+   Last OK 25m ago at 09:50 UTC. Better than previous pass's "never
+   delivered from this runner instance" — Discord did work earlier
+   this morning. Operator action remains: investigate intermittent
+   openclaw 60s timeouts.
+
+3. **Build is BEHIND.** Runner `boot_sha=7a78253`, `head_sha=435af0b`
+   (this pass's commit). Git-watcher runs every 180s — at next probe
+   the deferred restart will fire, the main loop will exit cleanly on
+   the next cycle boundary, and the new `exit_proximity_block` enters
+   the live prompt. (The IDLE_STORM means cycles are still ticking;
+   the watcher sleep is unblocked.)
+
+4. **`/api/runner-heartbeat` is 3h+ stale.** `as_of=06:32:20 UTC` but
+   `/api/healthz` shows real time 10:15 UTC with `last_decision_age_s=
+   1444.1` (~24m). The `swr_cached("runner-heartbeat", 20.0)` cache
+   is stuck — the SWR background-refresh path appears blocked under
+   IDLE_STORM. **Not a fresh code bug** (the cache behaves per
+   stale-while-revalidate spec), but operationally visible: a
+   dashboard consumer keying off heartbeat for live engine state will
+   read the 3h+-old snapshot. The healthz endpoint (no SWR cache)
+   tells the truth — but consumers wired to heartbeat for the
+   composite `decision_efficacy` block lag behind reality.
+
+5. **MU live at corridor_pos 0.7174** (mid-band, +1.59% vs entry, just
+   shy of the 0.75 NEAR_TP threshold). With the new exit_proximity
+   block, Opus will silently see no advisory section this cycle
+   (correct — COMFORTABLE), but the MOMENT the position ticks to
+   0.751+ (≈$985 mark), Opus will get an explicit NEAR_TP warning in
+   its prompt with the exact thresholds and signed distance. The
+   feature's first real-money exercise is one tick away.
+
+6. **Dead-tickers cache empty.** No zombie symbols burning yfinance
+   cycles — positive signal.
+
+### Phase 4 — Test commands
+
+```bash
+cd /home/zeph/trading-intelligence/paper-trader
+
+# Full exit-proximity stack (this pass — 86 tests in ~2s):
+python3 -m pytest tests/test_exit_proximity.py \
+    tests/test_exit_proximity_reporter.py \
+    tests/test_exit_proximity_prompt_block.py \
+    tests/test_exit_proximity_prompt_wiring.py
+
+# Quick core-file slice (~13s):
+python3 -m pytest \
+    tests/test_core_market.py tests/test_core_signals.py \
+    tests/test_core_strategy.py tests/test_core_store.py \
+    tests/test_core_runner.py tests/test_core_runner_cycle.py
+
+# Full suite (~25 min under load; use 2400s+ timeout):
+python3 -m pytest tests/ -v
+```
+
+### Operational note on the new block in `decide()`
+
+The block is placed AFTER `bp_section` (buying_power) and BEFORE
+`WATCHLIST PRICES` in the rendered payload. If a future refactor moves
+prompt sections around, `tests/test_exit_proximity_prompt_wiring.py::
+TestBuildPayloadOrdering` pins the relative order. The block reads
+ONLY the already-marked `snap["positions"]` — no extra store / network
+hit on the live cycle (the risk_mirror hot-path discipline). The
+builder is the SSOT shared with `/api/exit-proximity` and the Discord
+hourly: three surfaces, one builder, one headline (invariant #10) —
+they cannot disagree on the same data.
+
+---
+
 ## 2026-05-30 — Agent 2 (ML+backtests) HYBRID pass #6 — `scorer_buy_sell_skill`
 
 Persona: a quant researcher reading pass #5's observation that
