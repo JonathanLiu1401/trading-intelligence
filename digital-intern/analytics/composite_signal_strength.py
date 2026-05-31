@@ -32,7 +32,7 @@ OUT_PATH = Path("/home/zeph/logs/composite_signal_strength.json")
 WINDOW_HOURS = 2        # recent window to score
 BASELINE_DAYS = 7       # days to compute hourly baseline
 FETCH_LIMIT = 4000
-BASELINE_LIMIT = 20000
+BASELINE_LIMIT = 8000
 TOP_N = 10
 
 TICKER_RE = re.compile(r"\b\$?([A-Z]{2,5})\b")
@@ -75,33 +75,33 @@ def run() -> list[dict]:
 
     con = sqlite3.connect(DB_PATH)
     try:
-        # Fetch recent articles (last 2h)
+        # Fetch recent articles (last 2h) — use ISO-T format to hit idx_first_seen
         rows_recent = con.execute(
             f"""
             SELECT first_seen, title, ml_score, urgency
             FROM articles
-            WHERE replace(first_seen,'T',' ') >= ?
+            WHERE first_seen >= ?
               AND {_LIVE_ONLY_CLAUSE}
             ORDER BY first_seen DESC
             LIMIT {FETCH_LIMIT}
             """,
-            (recent_cutoff.strftime("%Y-%m-%d %H:%M:%S"),),
+            (recent_cutoff.strftime("%Y-%m-%dT%H:%M:%S"),),
         ).fetchall()
 
-        # Fetch baseline articles (last 7d) — timestamps only for hourly counts
+        # Fetch baseline articles (last 7d) — use idx_first_seen directly
         rows_baseline = con.execute(
             f"""
             SELECT first_seen, title
             FROM articles
-            WHERE replace(first_seen,'T',' ') >= ?
-              AND replace(first_seen,'T',' ') < ?
+            WHERE first_seen >= ?
+              AND first_seen < ?
               AND {_LIVE_ONLY_CLAUSE}
             ORDER BY first_seen DESC
             LIMIT {BASELINE_LIMIT}
             """,
             (
-                baseline_cutoff.strftime("%Y-%m-%d %H:%M:%S"),
-                recent_cutoff.strftime("%Y-%m-%d %H:%M:%S"),
+                baseline_cutoff.strftime("%Y-%m-%dT%H:%M:%S"),
+                recent_cutoff.strftime("%Y-%m-%dT%H:%M:%S"),
             ),
         ).fetchall()
     finally:
