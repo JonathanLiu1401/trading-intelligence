@@ -1,5 +1,118 @@
 # AGENTS.md — paper-trader
 
+## 2026-05-30 — Agent 4 (feature-dev, third pass) — `parse_fail_windows` + `position_alpha_decomp`
+
+Persona: an operator validating a recent fix and a discretionary PM asking
+*which of my open positions actually earn their beta?* The 200+ endpoint
+surface answers neither cleanly: every parse-fail panel is all-time aggregate,
+and every alpha panel is portfolio-level (INSUFFICIENT until ≥20 paired daily
+returns — withheld for weeks on the live $1000 book).
+
+**Counters:** features_added=2 · tests_added=34 (all passing)
+
+### The gaps
+
+1. **"Did the last fix help?"** `decision_reliability` collapses parse-fails
+   into one current-regime number averaged over the entire post-restart
+   window — a fresh prompt / timeout / host-saturation tweak's effect is
+   diluted to invisibility for hours. None of the 200+ endpoints expose a
+   per-window trend (1h vs 6h vs 24h vs 7d) or the most-recent failures'
+   modes + excerpts, so the operator has to trawl the log to validate any
+   change to the parse-fail surface area.
+
+2. **"Which open position earns its beta?"** `portfolio-beta` is
+   portfolio-level + INSUFFICIENT until ≥20 paired daily returns (live book
+   was 12/20 at this pass, verdict withheld for weeks). `/api/risk` lists
+   per-position beta but never decomposes *realized* return. A 5%-up position
+   on a 4% SPY day at beta 1.5 is **negative alpha** (beta-implied 6.0%,
+   observed 5.0%, alpha -1.0pp) but every dashboard panel celebrates it as a
+   winner.
+
+### New endpoints
+
+* **`/api/parse-fail-windows`** — per-window (1h / 6h / 24h / 7d) parse-fail
+  rates with a 1h-vs-6h trend verdict (IMPROVING / STABLE / WORSENING when
+  both windows have ≥ `MIN_WIN_N=5` samples and the rate moved ≥ `TREND_PP=10`
+  pp; otherwise INSUFFICIENT). Each window also carries its own HEALTHY /
+  DEGRADED / CRITICAL state (same 25/50% bands as `decision_forensics`),
+  per-window mode mix, and a top-10 `recent_failures` list (newest-first,
+  with mode + excerpt) so the operator can read *what* the recent failures
+  looked like without grepping the log. Headline drives off the canonical 6h
+  window (falls back to 24h then 7d if 6h is thin). Pure composition of
+  `decision_forensics.classify_failure` / `_is_no_decision` / `_parse_ts` —
+  single source of truth, no metric re-derived. Live verdict on the deployed
+  runner: **CRITICAL — 6h parse-fail 71.4%** dominated by
+  HOST_SATURATED_SKIP, confirming the chronic out-of-band Opus host-pressure
+  pattern; 1h sample too thin so trend is honestly withheld.
+  Builder: `paper_trader/analytics/parse_fail_windows.py`.
+
+* **`/api/position-alpha-decomp`** — per open position: `pos_return_pct`,
+  `spy_return_pct` (SPY move from the first equity-curve point at-or-after
+  `opened_at` to now, max lag `MAX_OPEN_LAG_S=7200` s), `beta_est` (shared
+  `_LEVERAGE_BETA` sector→beta SSOT with `/api/risk` + `/api/stress-scenarios`;
+  options inherit ×3-capped-at-4, negated for puts — same contract as
+  `stress_scenarios._position_betas`), `pure_beta_pct = beta_est *
+  spy_return_pct`, and `alpha_pp = pos_return_pct - pure_beta_pct`.
+  Per-position verdict: `ALPHA_POS` / `ALPHA_NEG` / `PURE_BETA` (within
+  `ALPHA_BAND_PP=0.5`) / `INSUFFICIENT_SPY_DATA`. Aggregate verdict is the
+  *market-value-weighted* mean alpha: `ALPHA_ADDING` / `ALPHA_BLEEDING` /
+  `BETA_RIDING` / `NO_DATA`. Live verdict on the deployed book: **ALPHA_ADDING
+  +1.47pp** — MU semis (beta 1.5) up +1.59% while SPY was effectively flat
+  (+0.08% over the hold), so almost the entire move is residual alpha rather
+  than beta-riding. Median SPY return across judged positions is reported so
+  a single old position can't dominate the headline.
+  Builder: `paper_trader/analytics/position_alpha_decomp.py`.
+
+### Why these two (vs the 200+ that already exist)
+
+* Both fill a *type of question* the existing surface doesn't answer.
+  `decision_reliability` answers "how bad is it on average"; `parse-fail-windows`
+  answers "did the last fix help and what does the *recent* failure look
+  like." `portfolio-beta` / `risk-adjusted-returns` answer "is the book as a
+  whole alpha-positive *in expectation*"; `position-alpha-decomp` answers
+  "which specific open position is earning real alpha right now."
+* Both are *immediately judgeable* on a small book. The parse-fail panel
+  needs 5 cycles to call a window (vs `decision_reliability`'s 12 + the
+  20-cycle qualifying band on `risk_adjusted_returns`); the position-alpha
+  panel needs one position + one equity-curve point covering the open. No
+  multi-week "verdict withheld" wait that makes the existing panels useless
+  on a fresh book.
+* Both reuse the canonical SSoTs verbatim — the parse-fail taxonomy comes
+  from `decision_forensics`, the sector→beta table from the
+  `_LEVERAGE_BETA` SSoT. A sibling edit drifting either is caught by the
+  existing test pins.
+
+### Tests (34 new, all passing in 2.4s under load)
+
+* `tests/test_parse_fail_windows.py` (14 cases) — empty/no-data degrade,
+  window-order pin (so a future re-tune can't silently re-wire the trend
+  pointer), failure-rate math, MIN_WIN_N sample-honesty gate (a 1/1 = 100%
+  row can never name a window CRITICAL), trend WORSENING / IMPROVING /
+  STABLE / INSUFFICIENT branches at the TREND_PP boundary, mode-mix
+  ordering (by count then canonical MODES order), unparseable-timestamp
+  exclusion from every window, recent-failures cap + newest-first ordering,
+  headline canonical-window fallback (6h → 24h → 7d when thin).
+* `tests/test_position_alpha_decomp.py` (16 cases) — pos-return / spy-return /
+  pure-beta / alpha-pp arithmetic at multiple values, ALPHA_POS / ALPHA_NEG /
+  PURE_BETA verdict bands (with the boundary case pinned PURE_BETA so a >=
+  vs > slip can't flip a noise-floor reading), put-beta negation, call-beta
+  ×3 cap at 4 (not 4.5), INSUFFICIENT_SPY_DATA when no equity point covers
+  the open within MAX_OPEN_LAG_S, the boundary case at exactly
+  MAX_OPEN_LAG_S accepted, FIRST eq point at-or-after opened_at chosen
+  (NOT the latest), market-value-weighted aggregate alpha (specific
+  weighted-mean asserted at 4 dp), garbage-row resilience, zero-avg-cost
+  divide-by-zero guard, unknown-sector default-beta-1.0 fallback, judged-
+  before-insufficient ordering.
+* `tests/test_dashboard_new_endpoints.py` (4 cases) — Flask test-client
+  drives both routes against a fresh tmp_path Store (no network, no :8090
+  bind); proves the empty-store NO_DATA contract and that the position-alpha
+  handler is wired to the *dashboard's* `_classify` + `_LEVERAGE_BETA` SSoT
+  (a builder-local default beta-1.0 fallback would fail the
+  `assert row["beta_est"] == 1.5` for MU). Pattern follows
+  `test_capital_paralysis_swr.py`.
+
+---
+
 ## 2026-05-30 — Agent 2 (ML+backtests) HYBRID pass #4 — `sizing_rule_regime_breakdown`
 
 Persona: a quant researcher reading the previous pass's `ALT_BEATS_ACTUAL`

@@ -16018,6 +16018,65 @@ def decision_reliability_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/parse-fail-windows")
+def parse_fail_windows_api():
+    """Time-windowed parse-fail breakdown — *is the last fix actually helping?*
+
+    ``/api/decision-reliability`` collapses the rate into one current-regime
+    number averaged over the entire post-restart window — a fresh prompt /
+    timeout / host-saturation fix's effect is diluted to invisibility for
+    hours. This reports per-window (1h / 6h / 24h / 7d) failure rates with a
+    1h-vs-6h trend verdict (IMPROVING / STABLE / WORSENING when both windows
+    have ≥``MIN_WIN_N=5`` samples and the rate moved ≥``TREND_PP=10`` pp), plus
+    the most-recent ``_FORENSICS_N=10`` parse-fail rows with their mode +
+    excerpt so the operator can see *what* the recent failures looked like
+    without trawling the log. Pure composition of decision_forensics'
+    canonical taxonomy helpers — single source of truth. Advisory only — never
+    gates Opus (invariants #2/#12)."""
+    try:
+        from .analytics.parse_fail_windows import build_parse_fail_windows
+        store = get_store()
+        return jsonify(build_parse_fail_windows(
+            store.recent_decisions(limit=3000),
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/position-alpha-decomp")
+def position_alpha_decomp_api():
+    """Per-position alpha vs beta-implied SPY return — *which positions earn?*
+
+    ``/api/portfolio-beta`` is portfolio-level + INSUFFICIENT until ≥20 paired
+    daily returns (12/20 on the live book as of 2026-05-30 → verdict withheld
+    for weeks). ``/api/risk`` lists per-position beta but never decomposes
+    *realized* return. A 5%-up position on a 4% SPY day at beta 1.5 is
+    **negative alpha** (beta-implied 6.0%, observed 5.0%, alpha -1.0pp) but
+    every dashboard panel celebrates it as a 5% winner. This reports, per open
+    position: ``pos_return_pct``, ``spy_return_pct`` (SPY move from the first
+    equity-curve point at-or-after ``opened_at`` to now), ``pure_beta_pct =
+    beta_est * spy_return``, and ``alpha_pp = pos_return - pure_beta``.
+    Per-position verdict ALPHA_POS / ALPHA_NEG / PURE_BETA / INSUFFICIENT_SPY_DATA
+    (no equity point within ``MAX_OPEN_LAG_S=7200``s of open). Aggregate verdict
+    market-value-weighted: ALPHA_ADDING / ALPHA_BLEEDING / BETA_RIDING.
+    Uses the shared ``_classify`` (ticker→sector) + ``_LEVERAGE_BETA``
+    (sector→beta SSOT with /api/risk + /api/stress-scenarios). Advisory only —
+    never gates Opus, adds no caps (invariants #2/#12)."""
+    try:
+        from .analytics.position_alpha_decomp import (
+            build_position_alpha_decomp,
+        )
+        store = get_store()
+        return jsonify(build_position_alpha_decomp(
+            store.open_positions(),
+            store.equity_curve(limit=5000),
+            _classify,
+            _LEVERAGE_BETA,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/funded-suggestions")
 def funded_suggestions_api():
     """Pair each unfundable BUY/ADD idea with the sale that funds it.
