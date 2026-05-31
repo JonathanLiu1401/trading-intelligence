@@ -91,6 +91,8 @@ def main() -> int:
         ("confluence_signals",        "analytics.confluence_signals",        "run"),
         ("daily_digest",              "analytics.daily_digest",              "main"),
         ("composite_signal_strength", "analytics.composite_signal_strength", "run"),
+        ("urgency_drought",           "analytics.urgency_drought",           "main"),
+        ("weekend_catalyst_brief",    "analytics.weekend_catalyst_brief",    "main"),
     ]
 
     for short_name, mod_path, fn_name in module_specs:
