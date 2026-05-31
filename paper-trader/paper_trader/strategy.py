@@ -1105,7 +1105,8 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
                    stress_block: str | None = None,
                    event_calendar_block: str | None = None,
                    macro_calendar_block: str | None = None,
-                   buying_power_block: str | None = None) -> str:
+                   buying_power_block: str | None = None,
+                   exit_proximity_block: str | None = None) -> str:
     now = datetime.now(timezone.utc).isoformat()
     # Granular trading-day phase (see market.market_phase). The header
     # historically carried only the binary MARKET_OPEN — but a decision at
@@ -1259,6 +1260,20 @@ def _build_payload(snapshot: dict, top_signals: list[dict], sentiments: list[dic
     # WATCHLIST PRICES: the trader sees what its cash can actually fund right
     # before it sees the prices it would fund against. Observational only.
     bp_section = f"{buying_power_block}\n" if buying_power_block else ""
+    # Forward mechanical-exit proximity — observational only, same
+    # advisory contract as the blocks above (invariants #2/#12 — the
+    # ``buying_power`` precedent). Surfaces the CURRENT-STATE diagnostic
+    # for hard SL/TP (per-lot, signed-distance-to-firing) so Opus
+    # triages with concrete thresholds instead of re-deriving SL/TP from
+    # avg_cost (which is wrong on blended lots — see strategy.py BUY
+    # branch: SL/TP are re-anchored to blended cost). A COMFORTABLE
+    # book collapses to silence (the chat-enrichment silence
+    # precedent) — added BELOW buying_power because it answers
+    # "what is at risk on the current book?" right after
+    # "what cash can I add with?".
+    exit_proximity_section = (
+        f"{exit_proximity_block}\n" if exit_proximity_block else ""
+    )
 
     # Watchlist MACD breadth — one-line market-structure roll-up derived
     # from the same quant_signals the per-name TECHNICAL block renders.
@@ -1289,7 +1304,7 @@ PORTFOLIO:
   total value: ${snapshot['total_value']:.2f}
   positions:
 {chr(10).join(pos_lines) if pos_lines else '  (none)'}
-{review_section}{track_section}{repeat_loser_section}{thesis_drift_section}{risk_section}{sector_section}{stress_section}{event_section}{macro_section}{bp_section}
+{review_section}{track_section}{repeat_loser_section}{thesis_drift_section}{risk_section}{sector_section}{stress_section}{event_section}{macro_section}{bp_section}{exit_proximity_section}
 WATCHLIST PRICES:
 {chr(10).join(px_lines)}
 
@@ -2105,6 +2120,31 @@ def decide() -> dict:
     except Exception as e:
         print(f"[strategy] buying-power failed (non-fatal): {e}")
 
+    # Forward mechanical-exit proximity — surfaces "which open lot is
+    # within striking distance of its SL/TP this cycle". Today Opus reads
+    # the static SYSTEM_PROMPT rule (2%/3% — 4%/6% leveraged) and the
+    # current mark / P/L from the position lines and has to mentally
+    # threshold by re-deriving SL/TP from avg_cost — but on a blended lot
+    # the stored SL/TP is re-anchored to the new blended cost, NOT
+    # mark*0.98, so the live numbers are concretely useful. Pure builder
+    # over the already-marked snapshot positions (NO extra store read /
+    # NO network — the risk_mirror hot-path discipline). Identical SSOT
+    # used by ``/api/exit-proximity`` + the Discord hourly line
+    # ``reporter._exit_proximity_line`` so the three surfaces (dashboard,
+    # Discord, prompt) tell the same story on the same data (invariant
+    # #10). Returns ``None`` on a COMFORTABLE / NO_DATA / NO_SL_TP_SET
+    # book — the silence-when-nothing-actionable precedent — so a
+    # healthy book adds zero prompt bloat. Observational only (invariants
+    # #2/#12); wrapped so a diagnostics fault is "no exit-proximity
+    # block this cycle", never "no decision this cycle".
+    exit_proximity_block: str | None = None
+    try:
+        from .analytics.exit_proximity import build_exit_proximity
+        ep = build_exit_proximity(snap.get("positions") or [])
+        exit_proximity_block = ep.get("prompt_block")
+    except Exception as e:
+        print(f"[strategy] exit-proximity failed (non-fatal): {e}")
+
     # ML advisor: when model consistently beats SPY, include its opinion in prompt
     ml_opinion_block: str | None = None
     ml_qualified, ml_qual_reason = _ml_is_qualified()
@@ -2134,7 +2174,8 @@ def decide() -> dict:
                              stress_block=stress_block,
                              event_calendar_block=event_calendar_block,
                              macro_calendar_block=macro_calendar_block,
-                             buying_power_block=buying_power_block)
+                             buying_power_block=buying_power_block,
+                             exit_proximity_block=exit_proximity_block)
     prompt = f"{SYSTEM_PROMPT}\n\n---\nCONTEXT:\n{payload}"
     if ml_opinion_block:
         prompt += f"\n\n---\nML ADVISOR:\n{ml_opinion_block}"
