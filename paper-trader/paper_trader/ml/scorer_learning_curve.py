@@ -174,6 +174,9 @@ def _predict_rank_ic(scorer, oos: list[dict]) -> tuple[float | None, float | Non
                     vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
                     news_urgency=r.get("news_urgency"),
                     news_article_count=r.get("news_article_count"),
+                    ema200_above=r.get("ema200_above"),
+                    hist_cross_up=r.get("hist_cross_up"),
+                    macd_below_zero_cross=r.get("macd_below_zero_cross"),
                 )
                 if meta.get("failed"):
                     continue
@@ -188,6 +191,9 @@ def _predict_rank_ic(scorer, oos: list[dict]) -> tuple[float | None, float | Non
                     vol_ratio=r.get("vol_ratio"), bb_pos=r.get("bb_position"),
                     news_urgency=r.get("news_urgency"),
                     news_article_count=r.get("news_article_count"),
+                    ema200_above=r.get("ema200_above"),
+                    hist_cross_up=r.get("hist_cross_up"),
+                    macd_below_zero_cross=r.get("macd_below_zero_cross"),
                 ))
             if p != p:  # NaN
                 continue
