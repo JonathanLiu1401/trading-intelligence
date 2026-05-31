@@ -4723,6 +4723,232 @@ def _ticker_comentions_chat_lines(rep: Any) -> list[str]:
     return lines
 
 
+def _repeat_loser_chat_lines(rep: Any) -> list[str]:
+    """Render paper-trader's ``/api/repeat-loser`` (the chronic-pattern
+    behavioural read — tickers where the bot has lost the last
+    ``threshold`` closed round-trips in a row) into compact chat lines.
+
+    The chat already carries loser_autopsy, winner_autopsy, trade_asymmetry,
+    streak. Each grades the bot in aggregate: which class of trade loses,
+    payoff-trap, current W/L run. None answer the per-NAME chronic-pattern
+    question: *"have I lost the last N trips on ticker X in a row?"*. A
+    book that closes the same ticker for the third loss in a row is
+    grinding the same setup against the same outcome — a behavioural blind
+    spot every other surface aggregates away.
+
+    SSOT (paper-trader invariant #10): the builder's own top-level
+    ``headline`` is the chat headline — no chat-side re-derivation of
+    the verdict naming. The detail line restates the worst offender's
+    ``ticker`` / ``current_loss_streak`` / ``current_loss_usd`` /
+    ``last_loss_exit_ts`` verbatim. Threshold is restated from the
+    builder's own ``threshold`` field — never hardcoded chat-side.
+
+    Pure / total — exactly the ``_cash_conviction_fit_chat_lines``
+    contract:
+
+    - non-dict → ``[]``
+    - top-level ``state`` not equal to ``"REPEAT_LOSER"`` → ``[]``: OK
+      / NO_DATA collapse to silence (the silence-on-healthy precedent;
+      NO_DATA is a probe-side defect, OK means no offender).
+    - actionable → builder's verbatim ``headline`` + a detail line
+      restating the worst offender. Missing fields degrade silently.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("state") != "REPEAT_LOSER":
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    offenders = rep.get("offenders")
+    worst = None
+    if isinstance(offenders, list) and offenders:
+        # Builder sorts worst-first; take the first dict offender defensively.
+        for o in offenders:
+            if isinstance(o, dict):
+                worst = o
+                break
+
+    if worst is not None:
+        parts: list[str] = []
+        tkr = worst.get("ticker")
+        if isinstance(tkr, str) and tkr.strip():
+            parts.append(tkr.strip())
+        streak = worst.get("current_loss_streak")
+        if isinstance(streak, int) and not isinstance(streak, bool):
+            parts.append(f"{streak}L in a row")
+        loss_usd = _num(worst.get("current_loss_usd"))
+        if loss_usd is not None:
+            parts.append(f"${loss_usd:,.2f} bled")
+        last_exit = worst.get("last_loss_exit_ts")
+        if isinstance(last_exit, str) and last_exit.strip():
+            parts.append(f"last exit {last_exit}")
+        thr = rep.get("threshold")
+        if isinstance(thr, int) and not isinstance(thr, bool):
+            parts.append(f"threshold {thr}")
+        if parts:
+            lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
+def _exit_only_streak_chat_lines(rep: Any) -> list[str]:
+    """Render paper-trader's ``/api/exit-only-streak`` (consecutive SELLs
+    since the last entry at the book level) into compact chat lines.
+
+    The chat carries ``/api/streak`` (W/L on closed round-trips),
+    ``/api/churn`` (re-entry cadence), and ``/api/cash-drag`` (idle-cash
+    dollar cost). None surface the *trade-direction* sequence: "the last
+    6 fills were all SELLs — the engine is liquidating, not running the
+    strategy". A defensive-trim run preceding a market drop reads as
+    DISCIPLINED on every backward-looking block; the same run preceding
+    a rip reads as PANIC.  Only this block surfaces the structural fact.
+
+    SSOT (paper-trader invariant #10): the builder's own top-level
+    ``headline`` is the chat headline. The detail line restates only the
+    builder's own ``exit_run_length`` / ``exit_run_tickers`` /
+    ``hours_since_last_entry`` / ``most_recent_action`` fields verbatim.
+
+    Pure / total — silence precedent:
+
+    - non-dict → ``[]``
+    - ``state`` != ``"STABLE"`` → ``[]`` (NO_DATA is a probe-side defect)
+    - ``verdict`` not in {``DEFENSIVE_TRIM``, ``DEFENSIVE_LIQUIDATION``}
+      → ``[]``: MOST_RECENT_IS_ENTRY collapses to silence — never chat
+      filler when the newest fill is an entry.
+    - actionable → builder's verbatim ``headline`` + a detail line
+      restating book-level run fields. Missing fields degrade silently.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("state") != "STABLE":
+        return []
+    if rep.get("verdict") not in ("DEFENSIVE_TRIM", "DEFENSIVE_LIQUIDATION"):
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    parts: list[str] = []
+    run_len = rep.get("exit_run_length")
+    if isinstance(run_len, int) and not isinstance(run_len, bool):
+        parts.append(f"run={run_len} consec exits")
+    tickers = rep.get("exit_run_tickers")
+    if isinstance(tickers, list) and tickers:
+        sym_list: list[str] = []
+        for t in tickers:
+            if isinstance(t, str) and t.strip():
+                sym_list.append(t.strip())
+            if len(sym_list) >= 5:
+                break
+        if sym_list:
+            parts.append("→".join(sym_list))
+    hours = _num(rep.get("hours_since_last_entry"))
+    if hours is not None:
+        parts.append(f"{hours:.1f}h since last entry")
+    most_recent = rep.get("most_recent_action")
+    if isinstance(most_recent, str) and most_recent.strip():
+        parts.append(f"most recent={most_recent}")
+    if parts:
+        lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
+def _catalyst_class_autopsy_chat_lines(rep: Any) -> list[str]:
+    """Render paper-trader's ``/api/catalyst-class-autopsy`` (per-catalyst-
+    class win-rate / PnL leaderboard over closed round-trips) into compact
+    chat lines.
+
+    The chat carries trade_asymmetry (payoff trap), winner_autopsy /
+    loser_autopsy (entry-class breakdown), per_ticker_skill (per-name
+    edge). None answer the per-CATALYST-CLASS question:
+    *"which class of trade — ML_ADVISOR vs ANALYST_PT vs TECHNICALS vs
+    EARNINGS_PLAY vs MACRO vs BREAKING_NEWS vs PUNDIT vs SECTOR_SYMPATHY
+    vs CONCENTRATION — has biased my realised P&L up or down?"*. A book
+    that wins on ML_ADVISOR trips and bleeds on EARNINGS_PLAY trips is
+    structurally different from one with the reverse profile, and the
+    weight-allocation recommendation is opposite.
+
+    SSOT (paper-trader invariant #10): the builder's own top-level
+    ``headline`` is the chat headline. The detail line restates only
+    the builder's own ``top_biased_winner`` / ``top_biased_loser`` /
+    ``biased_wr_delta_pct`` / ``pool_win_rate_pct`` fields verbatim.
+
+    Pure / total — silence precedent:
+
+    - non-dict → ``[]``
+    - ``state`` != ``"STABLE"`` → ``[]`` (NO_DATA / EMERGING collapse:
+      no class has crossed the sample-size gate so no verdict yet).
+    - ``state == "STABLE"`` AND both ``top_biased_winner`` and
+      ``top_biased_loser`` are falsy → ``[]``: a STABLE-but-NEUTRAL
+      panel where no class has reached BIASED is correctly silent —
+      the leaderboard is interesting but not actionable.
+    - actionable → builder's verbatim ``headline`` + a detail line
+      restating the bias fields. Missing fields degrade silently.
+    """
+    if not isinstance(rep, dict):
+        return []
+    if rep.get("state") != "STABLE":
+        return []
+    winner = rep.get("top_biased_winner")
+    loser = rep.get("top_biased_loser")
+    has_winner = isinstance(winner, str) and winner.strip()
+    has_loser = isinstance(loser, str) and loser.strip()
+    if not (has_winner or has_loser):
+        return []
+
+    lines: list[str] = []
+    headline = rep.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        lines.append(headline)               # verbatim SSOT — invariant #10
+
+    def _num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    parts: list[str] = []
+    if has_winner:
+        parts.append(f"winner={winner}")
+    if has_loser:
+        parts.append(f"loser={loser}")
+    delta = _num(rep.get("biased_wr_delta_pct"))
+    if delta is not None:
+        parts.append(f"Δwr≥{delta:.0f}pp")
+    pool = _num(rep.get("pool_win_rate_pct"))
+    if pool is not None:
+        parts.append(f"pool wr={pool:.1f}%")
+    n_trips = rep.get("n_round_trips")
+    if isinstance(n_trips, int) and not isinstance(n_trips, bool):
+        parts.append(f"n={n_trips} trips")
+    if parts:
+        lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
 def build_portfolio_signals(articles: list, now: datetime | None = None) -> dict:
     """Deterministic, always-fresh per-held-ticker live-news digest.
 
@@ -5697,6 +5923,85 @@ def create_app(store=None) -> Flask:
             from analysis.held_wire_balance import build_held_wire_balance
             return jsonify(build_held_wire_balance(
                 arts, window_hours=hours))
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.get("/api/wire-stance")
+    def api_wire_stance():
+        """Per-ticker bull/bear wire stance on an ARBITRARY ticker
+        list — the cross-validation companion to ``/api/held-wire-balance``.
+
+        ``/api/held-wire-balance`` is locked to the held book (the
+        ``LIVE_PORTFOLIO_TICKERS`` universe) — it answers "is the wire
+        bearish on a name I'm long?". The trader's *next* decision
+        looks at scorer-driven candidates the desk has NOT yet bought
+        (e.g. the deployment_plan ranks MUU + KLAC for the next BUY).
+        Those names are not in the held book, so they don't appear in
+        ``/api/held-wire-balance``.
+
+        This endpoint accepts ``?tickers=MUU,KLAC,MRVL`` and returns
+        the same per-name bull/bear coherence verdict over that
+        arbitrary universe. SSOT classifier — taxonomy is shared with
+        ``/api/held-wire-balance`` (and through it,
+        ``/api/sector-coherence``), so a name's bull/bear verdict is
+        identical regardless of which lens called it.
+
+        Use cases:
+
+          * Cross-validate a scorer-driven candidate set against the
+            wire's directional read before fanning out cash.
+          * Read the wire on a single watchlist ticker without
+            standing it up as a held position first.
+
+        Query params:
+
+          * ``tickers`` — comma-separated, REQUIRED (1..40 names).
+            Empty / missing returns the empty-skeleton with
+            ``BOOK_INSUFFICIENT``.
+          * ``hours`` — lookback window, clamped 1..168 (default 24).
+
+        Pure SQL over the live-only article rows; honours
+        ``_LIVE_ONLY_SQL`` so backtest-injected rows are excluded.
+        Observational only — never gates Opus.
+        """
+        if not _check_api_key():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            hours = int(request.args.get("hours", 24))
+        except (TypeError, ValueError):
+            hours = 24
+        hours = max(1, min(168, hours))
+
+        raw = request.args.get("tickers") or ""
+        # Split + cap at 40 names to bound the SQL regex and avoid an
+        # operator pasting their entire watchlist into one URL — the
+        # held-book report has ~13 names total, 40 is comfortable
+        # headroom for plan-side + watchlist-side joint queries.
+        tickers_in = [
+            s.strip() for s in raw.split(",") if s.strip()
+        ][:40]
+
+        since = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        try:
+            rows = _ro_query(
+                "SELECT title, ai_score, first_seen FROM articles "
+                f"WHERE first_seen >= ? AND {_LIVE_ONLY_SQL} "
+                "ORDER BY first_seen DESC LIMIT 4000",
+                (since,),
+            )
+        except sqlite3.Error:
+            rows = []
+        arts = [
+            {"title": r[0] or "", "ai_score": float(r[1] or 0),
+             "first_seen": r[2]}
+            for r in rows
+        ]
+        try:
+            from analysis.wire_stance import build_wire_stance
+            return jsonify(build_wire_stance(
+                arts, tickers=tickers_in, window_hours=hours))
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
@@ -9495,6 +9800,80 @@ def create_app(store=None) -> Flask:
                 "chat: actionable-opportunities fetch failed: %s", e
             )
 
+        # Repeat-loser — chronic-pattern behavioural read: tickers where
+        # the bot has lost the last N closed round-trips in a row. Every
+        # other realised-P&L block aggregates by class or in total; this
+        # is the only block that names a specific ticker the bot keeps
+        # losing on. Fires ONLY on state=="REPEAT_LOSER" (OK / NO_DATA
+        # collapse to silence — never chat filler when there is no
+        # offender). Composed verbatim by the pure
+        # _repeat_loser_chat_lines helper (unit-tested; SSOT — the
+        # builder's own `headline` is the chat headline, no re-derived
+        # verdict). Guarded 3s read.
+        repeat_loser_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/repeat-loser",
+                    timeout=3) as resp:
+                _rl = json.loads(resp.read().decode("utf-8"))
+            repeat_loser_block = "\n".join(_repeat_loser_chat_lines(_rl))
+        except Exception as e:
+            _logger().warning("chat: repeat-loser fetch failed: %s", e)
+
+        # Exit-only-streak — consecutive SELLs since the last entry at
+        # the BOOK level. /api/streak grades W/L on closed round-trips;
+        # /api/churn measures re-entry cadence; cash-drag measures idle-
+        # cash dollar cost. None surface the trade-DIRECTION sequence
+        # that says "the last 6 fills were all SELLs — the engine is
+        # liquidating, not running the strategy". Fires ONLY on verdict
+        # DEFENSIVE_TRIM (≥3 consec exits) / DEFENSIVE_LIQUIDATION (≥6)
+        # (MOST_RECENT_IS_ENTRY collapses to silence). Composed verbatim
+        # by the pure _exit_only_streak_chat_lines helper (unit-tested;
+        # SSOT — the builder's own `headline` is the chat headline, no
+        # re-derived verdict). Guarded 3s read.
+        exit_only_streak_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/exit-only-streak",
+                    timeout=3) as resp:
+                _es = json.loads(resp.read().decode("utf-8"))
+            exit_only_streak_block = "\n".join(
+                _exit_only_streak_chat_lines(_es)
+            )
+        except Exception as e:
+            _logger().warning("chat: exit-only-streak fetch failed: %s", e)
+
+        # Catalyst-class autopsy — per-CATALYST-CLASS win-rate / PnL
+        # leaderboard. trade_asymmetry / winner_autopsy / loser_autopsy
+        # aggregate; per_ticker_skill is per-NAME edge. None answer the
+        # per-CLASS question: of the 9 catalyst classes (ML_ADVISOR,
+        # ANALYST_PT, TECHNICALS, EARNINGS_PLAY, MACRO, BREAKING_NEWS,
+        # PUNDIT, SECTOR_SYMPATHY, CONCENTRATION) which has biased my
+        # realised P&L up or down? Surfaces a structural weight-
+        # allocation recommendation invisible to every other surface.
+        # Fires ONLY when state==STABLE AND (top_biased_winner OR
+        # top_biased_loser) — NO_DATA / EMERGING / STABLE-but-no-bias
+        # all collapse to silence. Composed verbatim by the pure
+        # _catalyst_class_autopsy_chat_lines helper (unit-tested; SSOT —
+        # the builder's own `headline` is the chat headline, no re-
+        # derived verdict). Guarded 3s read.
+        catalyst_class_autopsy_block = ""
+        try:
+            import urllib.request as _urllib
+            with _urllib.urlopen(
+                    "http://127.0.0.1:8090/api/catalyst-class-autopsy",
+                    timeout=3) as resp:
+                _cc = json.loads(resp.read().decode("utf-8"))
+            catalyst_class_autopsy_block = "\n".join(
+                _catalyst_class_autopsy_chat_lines(_cc)
+            )
+        except Exception as e:
+            _logger().warning(
+                "chat: catalyst-class-autopsy fetch failed: %s", e
+            )
+
         now_iso = datetime.now(timezone.utc).isoformat()
         system_prompt = (
             "You are a market intelligence analyst with access to a real-time news feed, "
@@ -9569,6 +9948,9 @@ def create_app(store=None) -> Flask:
             + (f"PAPER TRADER — TRADE ASYMMETRY (the payoff-ratio / disposition-effect diagnostic — are we cutting winners short while letting losers run? Every other realised-P&L block reduces closed trips to an aggregate or a per-bucket count; none expose the classic payoff-trap pathology where a high win-rate hides a negative expectancy (small wins, big losses). Surfaced ONLY when PAYOFF_TRAP / DISPOSITION_BLEED, never filler when EDGE_POSITIVE / FLAT / EMERGING / NO_DATA — the builder's own n≥20 gate keeps thin samples silent. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{trade_asymmetry_block}\n\n" if trade_asymmetry_block else "")
             + (f"PAPER TRADER — REBUY REGRET (the DOLLAR question on sell-then-rebuy hops: did the bot sell low and buy back higher? reentry-velocity grades CADENCE (CHURN_RISK / STABLE); round-trip-postmortem grades whether the SELL was well-timed against the next drift; only this block grades whether the actual BUY that followed came at a materially worse price. Surfaced ONLY when REGRETTING, never filler when SAVINGS / NET_NEUTRAL / NO_DATA / NO_REBUYS — re-entries that save money or net flat are not chat filler. Headline carries verbatim from the trader endpoint — restate, never re-derive):\n{rebuy_regret_block}\n\n" if rebuy_regret_block else "")
             + (f"PAPER TRADER — SCORER vs BOOK DISAGREEMENT (the meta question — does the bot's OWN ML (the 17-feature DecisionScorer that ML-GATE-HONESTY grades for OOS skill) currently agree with what it's holding? A HIGH-severity row means the live decision loop is sitting on a position the scorer would EXIT/TRIM — the dashboard already surfaces this panel but the chat had been blind to it. Surfaced ONLY when ≥1 HIGH-severity row exists (clamped off-distribution rows pre-filtered to avoid misrepresenting extrapolation as a real fight); ALIGNED-only / MEDIUM-only / scorer_trained=False collapse to silence. Worst row's ticker / scorer_verdict / last_action / scorer_pred_5d_pct pass through verbatim from the trader endpoint — restate, never re-derive):\n{scorer_book_disagreement_block}\n\n" if scorer_book_disagreement_block else "")
+            + (f"PAPER TRADER — REPEAT-LOSER WATCH (chronic-pattern behavioural read — tickers where the bot has lost the last N closed round-trips IN A ROW on the same ticker. loser_autopsy / winner_autopsy / trade_asymmetry / streak each grade the bot in aggregate (which class of trade loses, payoff-trap, current W/L run); none answer the per-NAME chronic-pattern question 'have I lost the last N trips on ticker X in a row?'. A book that closes the same ticker for the third loss in a row is grinding the same setup against the same outcome — a behavioural blind spot every other surface aggregates away. Surfaced ONLY when state==REPEAT_LOSER, never filler when OK / NO_DATA. Headline + worst-offender fields carry verbatim from the trader endpoint — restate, never re-derive):\n{repeat_loser_block}\n\n" if repeat_loser_block else "")
+            + (f"PAPER TRADER — EXIT-ONLY STREAK (consecutive SELLs since the last entry at the BOOK level — 'the last 6 fills were all SELLs; the engine is liquidating, not running the strategy'. /api/streak grades W/L on closed round-trips; /api/churn measures re-entry cadence; cash-drag measures idle-cash dollar cost. None surface the trade-DIRECTION sequence. A defensive-trim run preceding a market drop reads as DISCIPLINED on every backward block; the same run preceding a rip reads as PANIC — only this block names the structural fact in real time. Surfaced ONLY when DEFENSIVE_TRIM (≥3 consec exits) / DEFENSIVE_LIQUIDATION (≥6), never filler when MOST_RECENT_IS_ENTRY. Headline + run fields carry verbatim from the trader endpoint — restate, never re-derive):\n{exit_only_streak_block}\n\n" if exit_only_streak_block else "")
+            + (f"PAPER TRADER — CATALYST-CLASS AUTOPSY (per-CATALYST-CLASS win-rate / PnL leaderboard over closed round-trips. trade_asymmetry surfaces the payoff trap; winner_autopsy / loser_autopsy bucket by ENTRY-class; per_ticker_skill is per-NAME edge. None answer the per-CLASS question: of the 9 catalyst classes (ML_ADVISOR, ANALYST_PT, TECHNICALS, EARNINGS_PLAY, MACRO, BREAKING_NEWS, PUNDIT, SECTOR_SYMPATHY, CONCENTRATION) which has biased my realised P&L UP (a class to weight INTO) or DOWN (a class to weight OUT OF)? Surfaces a structural class-level weight-allocation recommendation invisible to every other surface — answers 'should I lean more on the ML-advisor track and less on the pundit-takes track?' with realised-PnL data. Surfaced ONLY when state==STABLE AND (top_biased_winner OR top_biased_loser); NO_DATA / EMERGING / STABLE-but-no-bias collapse to silence (a class-leaderboard where no class has crossed both the sample-size gate AND the win-rate margin is interesting but not actionable). Headline + bias fields carry verbatim from the trader endpoint — restate, never re-derive):\n{catalyst_class_autopsy_block}\n\n" if catalyst_class_autopsy_block else "")
             + "Answer questions about current market conditions, global events, specific "
             "stocks, the user's real portfolio, or the paper trader's positions/decisions. "
             "Be concise and data-driven. Cite specific articles when relevant. When the user "
@@ -10323,12 +10705,12 @@ function renderEditRows(positions) {
   positions.forEach((p, i) => {
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td><input class="form-control form-control-sm p-1" style="font-size:11px;background:var(--bg-input);color:var(--text);border-color:var(--border-strong);width:70px" value="${p.ticker||""}" data-i="${i}" data-f="ticker"></td>
-      <td><select class="form-select form-select-sm p-1" style="font-size:11px;background:var(--bg-input);color:var(--text);border-color:var(--border-strong);width:90px" data-i="${i}" data-f="type">
+      <td><input aria-label="Ticker symbol for position ${i+1}" class="form-control form-control-sm p-1" style="font-size:11px;background:var(--bg-input);color:var(--text);border-color:var(--border-strong);width:70px" value="${p.ticker||""}" data-i="${i}" data-f="ticker"></td>
+      <td><select aria-label="Asset type for position ${i+1}" class="form-select form-select-sm p-1" style="font-size:11px;background:var(--bg-input);color:var(--text);border-color:var(--border-strong);width:90px" data-i="${i}" data-f="type">
         ${["stock","etf_leveraged","etf","option"].map(t=>`<option${p.type===t?" selected":""}>${t}</option>`).join("")}
       </select></td>
-      <td><input class="form-control form-control-sm p-1" style="font-size:11px;background:var(--bg-input);color:var(--text);border-color:var(--border-strong);width:70px" value="${p.qty??""}" data-i="${i}" data-f="qty"></td>
-      <td><input class="form-control form-control-sm p-1" style="font-size:11px;background:var(--bg-input);color:var(--text);border-color:var(--border-strong);width:80px" value="${p.avg_cost??""}" data-i="${i}" data-f="avg_cost"></td>
+      <td><input aria-label="Quantity for position ${i+1}" class="form-control form-control-sm p-1" style="font-size:11px;background:var(--bg-input);color:var(--text);border-color:var(--border-strong);width:70px" value="${p.qty??""}" data-i="${i}" data-f="qty"></td>
+      <td><input aria-label="Average cost for position ${i+1}" class="form-control form-control-sm p-1" style="font-size:11px;background:var(--bg-input);color:var(--text);border-color:var(--border-strong);width:80px" value="${p.avg_cost??""}" data-i="${i}" data-f="avg_cost"></td>
       <td><button class="btn btn-sm btn-outline-danger py-0 px-1" style="font-size:10px" onclick="removeEditRow(${i})">✕</button></td>`;
     tbody.appendChild(tr);
   });
