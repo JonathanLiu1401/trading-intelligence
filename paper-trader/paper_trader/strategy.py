@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover - stdlib-only module, import can't fail
     def host_saturated(*_a, **_k):
         return (False, "host_guard unavailable")
 
-MODEL = "claude-opus-4-7"
+MODEL = "claude-opus-4-8"
 FALLBACK_MODEL = "claude-sonnet-4-6"
 FALLBACK_TIMEOUT_S = None   # no timeout — wait as long as Opus needs
 DECISION_TIMEOUT_S = None   # no timeout — wait as long as Opus needs
