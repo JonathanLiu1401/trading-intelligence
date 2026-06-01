@@ -21,6 +21,7 @@ app = Flask(__name__)
 _MODEL_DISPLAY_NAMES = {
     "ml_quant": "ML+Quant (deterministic)",
     "claude-opus-4-7": "Claude Opus 4.7",
+    "claude-opus-4-8": "Claude Opus 4.8",
     "claude-sonnet-4-6": "Claude Sonnet 4.6",
     "hf/deepseek-ai/DeepSeek-R1": "DeepSeek R1",
     "hf/deepseek-ai/DeepSeek-V3.2": "DeepSeek V3.2",
@@ -2771,6 +2772,7 @@ TEMPLATE = r"""
             <select id="run-model-select" style="margin-left:8px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:3px;">
               <option value="ml_quant">ML+Quant (deterministic)</option>
               <option value="claude-opus-4-7">Claude Opus 4.7</option>
+              <option value="claude-opus-4-8" selected>Claude Opus 4.8</option>
               <option value="hf/deepseek-ai/DeepSeek-R1">DeepSeek R1</option>
               <option value="hf/meta-llama/Llama-3.3-70B-Instruct">Llama 3.3 70B</option>
               <option value="hf/Qwen/Qwen3-32B">Qwen3 32B</option>
@@ -15025,6 +15027,74 @@ def last_real_decision_api():
             "verdict": "ERROR",
             "headline": f"endpoint error: {e}",
             "row": None,
+        }), 500
+
+
+@app.route("/api/last-fill")
+def last_fill_api():
+    """When did the engine last actually *execute* a trade?
+
+    The orthogonal sibling of ``/api/last-real-decision``: that endpoint
+    answers "when did the engine last DECIDE?" (FILLED / HOLD / BLOCKED),
+    this one answers "when did it last PULL THE TRIGGER?" (a row in the
+    trades ledger). A book can produce HOLD decisions all day and look
+    decisive to the cadence heartbeat while the engine has not actually
+    moved a dollar — the static-book pathology this surface exposes.
+    Composes ``build_last_fill`` verbatim (single source of truth,
+    AGENTS.md invariant #10): the verdict / headline / age tokens are the
+    builder's, so this endpoint and the existing ``_last_fill_line``
+    Discord helper can never tell different stories about the freshest
+    fill. Same NO_DATA / FRESH / STATIC / FROZEN ladder the reporter
+    uses.
+
+    Useful surfaces today:
+      * the digital-intern dashboard's cross-port poll has no clean
+        single-purpose query for "last fill age" — it has to navigate
+        ``/api/capital-paralysis`` (cycles, not seconds) or
+        ``/api/decision-health`` (a bigger bundle);
+      * an operator script ("page me when no fill for 4h") has no clean
+        single-row JSON to alert on without scraping a multi-section
+        endpoint.
+
+    Pure store + builder read — no network — never raises (any fault
+    degrades to an ERROR envelope so the panel renders an honest
+    diagnostic rather than 500-ing). Trades fetched newest-first via
+    ``store.recent_trades(50)`` — the builder only needs index 0 but a
+    small headroom keeps the slice useful for any future per-window
+    extension without re-querying.
+    """
+    try:
+        from .analytics.last_fill import build_last_fill
+        store = get_store()
+        try:
+            trades = store.recent_trades(50)
+        except Exception as e:
+            return jsonify({
+                "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "service": "paper_trader",
+                "state": "ERROR",
+                "headline": f"store error: {e}",
+            }), 500
+        now_utc = datetime.now(timezone.utc)
+        result = build_last_fill(trades, now=now_utc)
+        if not isinstance(result, dict):
+            return jsonify({
+                "as_of": now_utc.isoformat(timespec="seconds"),
+                "service": "paper_trader",
+                "state": "ERROR",
+                "headline": "builder returned non-dict",
+            }), 500
+        return jsonify({
+            "as_of": now_utc.isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            **result,
+        })
+    except Exception as e:
+        return jsonify({
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "service": "paper_trader",
+            "state": "ERROR",
+            "headline": f"endpoint error: {e}",
         }), 500
 
 
