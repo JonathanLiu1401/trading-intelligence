@@ -36,11 +36,35 @@ _CACHE_DIR = _BASE / "data" / "backtest_cache"
 _CACHE_OUT = _BASE / "data" / "monkey_benchmark.json"
 
 # ── constants ──────────────────────────────────────────────────────────────
+CACHE_SCHEMA_VERSION = 2
+UNIVERSE_PROFILE = "cash_equity_unlevered"
 N_MONKEYS = 10_000
 RANDOM_SEED = 42
 INITIAL_CASH = 1_000.0
 
 _WINDOW_FILE_RE = re.compile(r"^prices_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.json$")
+
+# The monkey benchmark is supposed to answer "does the decision engine have
+# edge over naive stock selection/timing?" Letting random monkeys buy 2x/3x
+# ETFs, inverse products, crypto, futures, commodities, and VIX made the
+# baseline statistically noisy and visually absurd.
+_NON_BASELINE_TICKERS = {
+    # Crypto / futures / market-structure gauges
+    "BTC-USD", "GC=F", "^VIX",
+    # Commodity / rate ETFs where carry/roll dominates equity-selection edge
+    "TLT", "GLD", "SLV", "USO", "UNG",
+    # Leveraged bull products
+    "TQQQ", "UPRO", "SPXL", "UDOW", "URTY", "SOXL", "TECL", "FNGU",
+    "CURE", "LABU", "NAIL", "WANT", "DFEN", "MIDU", "TNA", "DPST",
+    "FAS", "HIBL", "UTSL", "QLD", "SSO", "MVV", "SAA", "UWM",
+    "NVDU", "NVDX", "MSFU", "AMZU", "GOOGU", "METAU", "TSLT",
+    "AAPLU", "CONL", "TSLL", "LNOK", "SMCI2X", "PLTU", "USD",
+    "ROM", "UXI", "UYG", "BITX", "BITU", "ETHU", "BOIL", "UCO",
+    "AGQ",
+    # Inverse / bear products
+    "SQQQ", "SPXS", "SDOW", "SRTY", "SOXS", "TECS", "FNGD", "TZA",
+    "FAZ", "HIBS",
+}
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -69,6 +93,47 @@ def default_window() -> tuple[str, str]:
         s, e, _ = windows[0]
         return s, e
     return "2025-05-01", "2026-05-13"
+
+
+def benchmark_tickers(tickers: list[str]) -> list[str]:
+    """Return the clean unlevered cash-equity/vanilla-ETF monkey universe.
+
+    The production watchlist intentionally contains leverage, inverse hedges,
+    crypto, futures, commodities, and gauges because the AI can express macro
+    views with them. Random monkeys should not get those instruments for the
+    baseline, otherwise the distribution measures product convexity more than
+    stock-selection or timing skill.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in tickers:
+        t = str(raw).upper().strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        if t in _NON_BASELINE_TICKERS:
+            continue
+        if t.startswith("^") or "=" in t or t.endswith("-USD"):
+            continue
+        out.append(t)
+    return out
+
+
+def cache_health(cached: dict | None) -> tuple[bool, str]:
+    """Validate cached monkey JSON against the current benchmark contract."""
+    if not isinstance(cached, dict):
+        return False, "missing cache"
+    if cached.get("schema_version") != CACHE_SCHEMA_VERSION:
+        return False, "old schema"
+    if cached.get("universe_profile") != UNIVERSE_PROFILE:
+        return False, "old universe"
+    if not cached.get("generated_at"):
+        return False, "missing generated_at"
+    if not isinstance(cached.get("window"), dict):
+        return False, "missing window"
+    if int(cached.get("n_tickers") or 0) < 5:
+        return False, "too few tickers"
+    return True, "ok"
 
 
 def _load_prices(
@@ -310,6 +375,7 @@ def run_and_cache(
     is responsible for filtering by (start, end).
     """
     t0 = time.time()
+    tickers = benchmark_tickers(tickers)
 
     print(f"[monkey] Loading prices for {len(tickers)} tickers "
           f"({start_date} → {end_date})...")
@@ -328,6 +394,8 @@ def run_and_cache(
     ar_stats = compute_stats(ar_returns)
 
     result = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "universe_profile": UNIVERSE_PROFILE,
         # ``datetime.utcnow()`` is deprecated in Python 3.12 and slated for
         # removal. Use a tz-aware UTC stamp and emit the same ``...Z`` shape
         # the consumer (``run_continuous_backtests`` cache-age check) already
@@ -344,7 +412,7 @@ def run_and_cache(
     }
 
     if ai_returns:
-        for ret in ai_returns:
+        for ret in ai_returns[:200]:
             result["ai_rankings"].append({
                 "ai_return_pct": ret,
                 "vs_random_portfolio": rank_ai_vs_monkeys(ret, rp_returns),
@@ -405,6 +473,7 @@ def run_monkey_backtests_to_db(
 
     Returns the number of rows inserted (0 if the window has too few tickers).
     """
+    tickers = benchmark_tickers(tickers)
     prices = _load_prices(start_date, end_date, tickers)
     if len(prices) < k_picks:
         print(f"[monkey_bt] too few tickers ({len(prices)}) — skipping")

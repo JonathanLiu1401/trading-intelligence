@@ -21366,11 +21366,13 @@ def plan_execution_debt_api():
 @app.route("/api/monkey-benchmark")
 def api_monkey_benchmark():
     """Return cached monkey-benchmark results."""
-    from .analytics.monkey_benchmark import load_cached
+    from .analytics.monkey_benchmark import cache_health, load_cached
     cached = load_cached()
-    if cached is None:
+    healthy, reason = cache_health(cached)
+    if cached is None or not healthy:
         return jsonify({
             "status": "not_computed",
+            "reason": reason,
             "message": "Run `python3 run_monkey_benchmark.py` to compute "
                        "(takes ~30s for 10k monkeys × 5y window).",
         }), 202
