@@ -72,6 +72,15 @@ class TestParseDecision:
         assert d["action"] == "SELL"
         assert d["ticker"] == "NVDA"
 
+    def test_skips_metadata_object_before_decision(self):
+        raw = (
+            '{"model":"gpt-5.5","latency_ms":1200}\n'
+            '{"action":"BUY", "ticker":"AMD", "qty":1}'
+        )
+        d = strategy._parse_decision(raw)
+        assert d["action"] == "BUY"
+        assert d["ticker"] == "AMD"
+
 
 # ─────────────────────────── _claude_call failure-cause tracking ───────────────────────────
 

@@ -912,7 +912,7 @@ def _parse_decision(raw: str) -> dict | None:
             obj, _ = decoder.raw_decode(text[i:])
         except json.JSONDecodeError:
             continue
-        if isinstance(obj, dict):
+        if isinstance(obj, dict) and "action" in obj:
             return obj
     print(f"[strategy] JSON parse failed; raw: {text[:300]}")
     return None
