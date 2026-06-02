@@ -1,5 +1,5 @@
 [Unit]
-Description=Digital Intern — Continuous Financial Intelligence Daemon
+Description=Digital Intern Public Dashboard
 After=network-online.target
 Wants=network-online.target
 
@@ -7,16 +7,17 @@ Wants=network-online.target
 Type=simple
 User=zeph
 WorkingDirectory=/home/zeph/trading-intelligence/digital-intern
-EnvironmentFile=/home/zeph/trading-intelligence/digital-intern/.env
+EnvironmentFile=-/home/zeph/trading-intelligence/digital-intern/.env
 Environment="PATH=/home/zeph/.local/bin:/home/zeph/.nvm/versions/node/v24.15.0/bin:/usr/local/bin:/usr/bin:/bin"
-Environment="DIGITAL_INTERN_EMBEDDED_WEB=0"
-ExecStart=/usr/bin/python3 /home/zeph/trading-intelligence/digital-intern/daemon.py
+Environment="WEB_SERVER_HOST=0.0.0.0"
+Environment="WEB_SERVER_PORT=8080"
+ExecStart=/usr/bin/python3 -m dashboard.web_server
 Restart=always
-RestartSec=30
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
 KillSignal=SIGTERM
-TimeoutStopSec=60
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

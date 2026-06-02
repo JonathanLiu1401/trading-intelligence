@@ -348,6 +348,10 @@ CATALYST_CYCLE_INTERVAL = 120     # AI catalyst/profit-taking cycle monitor ever
 EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
 WEB_SERVER_PORT     = int(os.environ.get("WEB_SERVER_PORT", "8080"))
 WEB_SERVER_HOST     = os.environ.get("WEB_SERVER_HOST", "0.0.0.0")
+EMBEDDED_WEB_SERVER_ENABLED = (
+    os.environ.get("DIGITAL_INTERN_EMBEDDED_WEB", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
 
 # Active portfolio + watchlist tickers used for price alerts and relevance boosts.
 # Keep in sync with config/portfolio.json (positions + sector_watchlist).
@@ -396,8 +400,10 @@ ALL_WORKERS = (
     "usgs_quake", "fda",
     "scorer", "alert", "heartbeat", "purge", "stats",
     "ml_trainer", "continuous_trainer", "recursive_labeler", "price_alert",
-    "portfolio_pl", "sentiment_trends", "catalyst_cycle", "export", "web_server",
+    "portfolio_pl", "sentiment_trends", "catalyst_cycle", "export",
 )
+if EMBEDDED_WEB_SERVER_ENABLED:
+    ALL_WORKERS += ("web_server",)
 # If all of these are stale at once the dashboard shows the CRITICAL banner.
 CORE_WORKERS = ("rss", "web", "reddit", "scorer")
 
@@ -5506,8 +5512,11 @@ def main():
         ("sentiment_trends", sentiment_trends_worker),
         ("catalyst_cycle", catalyst_cycle_worker),
         ("export",      export_worker),
-        ("web_server",  web_server_worker),
     ]
+    if EMBEDDED_WEB_SERVER_ENABLED:
+        workers.append(("web_server", web_server_worker))
+    else:
+        log.info("[daemon] Embedded web_server disabled; standalone dashboard owns port 8080")
 
     # Map name → fn for lookup during respawn
     worker_map = {name: fn for name, fn in workers}
