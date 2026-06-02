@@ -112,16 +112,17 @@ class TestNoHardRiskLimits:
         assert status == "FILLED"
         assert fresh_store.get_portfolio()["cash"] == 0.0
 
-    def test_buy_one_cent_over_cash_is_the_only_block(self, fresh_store, monkeypatch):
-        """The sole BUY constraint is "cash must not go negative" — a notional
-        strictly greater than cash is blocked; nothing else is."""
+    def test_buy_one_cent_over_buying_power_is_the_only_block(self, fresh_store, monkeypatch):
+        """The sole stock BUY constraint is buying power. Since the strategy
+        intentionally allows cash plus 50% margin on net worth, a notional
+        one cent above buying power is blocked; nothing else is."""
         monkeypatch.setattr(market, "get_price", lambda t: 10.0)
         snap = {"cash": 1000.0, "total_value": 1000.0, "positions": []}
         status, detail = strategy._execute(
-            {"action": "BUY", "ticker": "SOXL", "qty": 100.001, "reasoning": ""},
+            {"action": "BUY", "ticker": "SOXL", "qty": 150.001, "reasoning": ""},
             snap, fresh_store)
         assert status == "BLOCKED"
-        assert "insufficient cash" in detail
+        assert "insufficient cash/buying power" in detail
 
     def test_no_auto_exit_path_in_execute(self, fresh_store):
         """REBALANCE degrades to HOLD and there is no stop-loss / auto-exit
