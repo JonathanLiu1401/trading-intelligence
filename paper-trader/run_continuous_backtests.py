@@ -5566,6 +5566,7 @@ def main() -> None:
         # Always non-fatal: the continuous loop never depends on it.
         try:
             from paper_trader.analytics.monkey_benchmark import (
+                cache_health as _monkey_cache_health,
                 load_cached as _monkey_load_cached,
                 run_and_cache as _monkey_run_and_cache,
                 default_window as _monkey_default_window,
@@ -5576,7 +5577,8 @@ def main() -> None:
             )
             import datetime as _dt
             cached = _monkey_load_cached()
-            stale = cached is None
+            healthy, health_reason = _monkey_cache_health(cached)
+            stale = cached is None or not healthy
             if not stale:
                 try:
                     # `monkey_benchmark.run_and_cache` writes
@@ -5620,7 +5622,8 @@ def main() -> None:
                     daemon=True, name=f"monkey-{cycle}",
                 ).start()
                 print(f"[monkey] refresh triggered in background "
-                      f"({m_start} → {m_end}, {len(m_ai_returns)} matching AI runs)")
+                      f"({m_start} → {m_end}, {len(m_ai_returns)} matching AI runs; "
+                      f"reason={health_reason})")
         except Exception as e:
             print(f"[monkey] background refresh failed (non-fatal): {e}")
 
