@@ -96,3 +96,25 @@ def test_freeze_triage_panels_specifically_prewarmed():
             f"show 'computing — retry shortly' right when the operator needs "
             f"it during a freeze"
         )
+
+
+def test_backtests_model_filter_variants_are_prewarmed():
+    """The backtests chart has query-string-specific SWR keys.
+
+    The generic prewarm target only fills ``backtests-list?``; the monkey
+    graph hits ``backtests-list?model=monkey`` and used to cold-stall forever
+    under dashboard load. Lock the explicit variants the UI fetches.
+    """
+    src = inspect.getsource(d._swr_prewarm)
+    for qs in ("model=all", "model=ai", "model=monkey"):
+        assert qs in src
+
+
+def test_production_swr_pool_has_headroom_for_dashboard_burst():
+    """The dashboard fires dozens of SWR panels after restart.
+
+    Six workers let slow cold builds queue the monkey backtest key behind
+    unrelated panels; production should have enough headroom for the first
+    paint burst while tests remain free to monkeypatch a small executor.
+    """
+    assert getattr(d._SWR_EXEC, "_max_workers", 0) >= 16
