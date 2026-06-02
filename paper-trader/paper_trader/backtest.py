@@ -2850,7 +2850,7 @@ def _parse_yf_news_item(item: dict) -> tuple[str, str, float | None]:
 
 
 class BacktestEngine:
-    _VALID_MODEL_PREFIXES = ("ml_quant", "claude-", "hf/")
+    _VALID_MODEL_PREFIXES = ("ml_quant", "claude-", "gpt-", "hf/")
     # Class-level default so callers that bypass __init__ via
     # `BacktestEngine.__new__(...)` (the canonical no-network test pattern in
     # tests/test_integration_backtest.py and tests/test_model_rankings.py)

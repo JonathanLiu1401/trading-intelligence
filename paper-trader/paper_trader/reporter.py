@@ -3410,20 +3410,44 @@ def _singleton_lock_line() -> str:
         return ""
 
 
-def _systemctl_user(verb: str) -> str:
-    """``systemctl --user <verb> paper-trader`` → its one-word status, or
-    ``"unknown"`` on any failure (unreadable user bus, no systemctl, …).
-    Mirrors ``dashboard.supervision_api``'s probe exactly so the Discord line
-    and ``/api/supervision`` feed the SAME builder identical inputs."""
+def _systemctl_paper_trader(verb: str) -> str:
+    """Best-effort service state for the singleton trader.
+
+    Prefer the user unit when it is actually healthy, but also accept the root
+    systemd unit. This host has historically had both installed; requiring the
+    user unit while the root unit owns the runner creates a false
+    UNSUPERVISED alert and a duplicate-launcher crash loop.
+    """
+    out: list[str] = []
+    for cmd in (["systemctl", "--user", verb, "paper-trader"],
+                ["systemctl", verb, "paper-trader"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+            val = ((r.stdout or "").strip()
+                   or (r.stderr or "").strip() or "unknown")
+        except Exception:
+            val = "unknown"
+        out.append(val)
+        if verb == "is-active" and val == "active":
+            return val
+        if verb == "is-enabled" and val == "enabled":
+            return val
+    return out[0] if out else "unknown"
+
+
+_systemctl_user = _systemctl_paper_trader
+
+
+def _paper_trader_unit_scope() -> str | None:
     try:
-        r = subprocess.run(
-            ["systemctl", "--user", verb, "paper-trader"],
-            capture_output=True, text=True, timeout=3,
-        )
-        return ((r.stdout or "").strip()
-                or (r.stderr or "").strip() or "unknown")
+        cg = Path("/proc/self/cgroup").read_text(errors="ignore")
     except Exception:
-        return "unknown"
+        return None
+    if "/system.slice/paper-trader.service" in cg:
+        return "system"
+    if "/paper-trader.service" in cg:
+        return "user"
+    return None
 
 
 def _supervision_line() -> str:
@@ -3480,9 +3504,10 @@ def _supervision_line() -> str:
             print(f"[reporter] supervision git probe skipped: {e}")
         sup = build_supervision(
             pid=os.getpid(), ppid=ppid,
-            unit_active=_systemctl_user("is-active"),
-            unit_enabled=_systemctl_user("is-enabled"),
+            unit_active=_systemctl_paper_trader("is-active"),
+            unit_enabled=_systemctl_paper_trader("is-enabled"),
             boot_sha=boot_sha, head_sha=head_sha, behind=behind,
+            unit_scope=_paper_trader_unit_scope(),
         )
         if not isinstance(sup, dict) or not sup.get("actionable"):
             return ""
@@ -3926,10 +3951,14 @@ def _no_decision_reasons_line(store) -> str:
         from .analytics.no_decision_reasons import (
             DEFAULT_WINDOW, build_no_decision_reasons,
         )
-        nr = build_no_decision_reasons(
-            store.recent_decisions(DEFAULT_WINDOW),
-            window=DEFAULT_WINDOW,
-        )
+        rows = store.recent_decisions(DEFAULT_WINDOW)
+        recent = list(rows or [])[:5]
+        if recent and all(
+            (d.get("action_taken") or "").strip() not in ("", "NO_DECISION")
+            for d in recent
+        ):
+            return ""
+        nr = build_no_decision_reasons(rows, window=DEFAULT_WINDOW)
         if not isinstance(nr, dict) or nr.get("state") != "DOMINANT":
             return ""
         bucket = (nr.get("dominant_bucket") or "?").upper()

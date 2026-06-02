@@ -46,6 +46,8 @@ def stub_decide_inputs(monkeypatch):
     monkeypatch.setattr(strategy.market, "get_futures_price", lambda *a, **k: None)
     monkeypatch.setattr(strategy.market, "benchmark_sp500", lambda: 5000.0)
     monkeypatch.setattr(strategy, "get_quant_signals_live", lambda *a, **k: {})
+    monkeypatch.setattr(strategy, "_ml_is_qualified",
+                        lambda: (False, "test disabled"))
     return fake_store
 
 
@@ -119,6 +121,61 @@ def test_no_retry_when_first_response_is_none(stub_decide_inputs):
     args, _ = fake_store.record_decision.call_args
     reason = args[3]
     assert "timeout/empty" in reason or "no response" in reason
+
+
+def test_ml_drought_fallback_turns_llm_drought_into_hold(stub_decide_inputs,
+                                                          monkeypatch):
+    """When the LLM lane is down but the ML advisor is qualified, use the
+    ML opinion as the emergency decision instead of logging another
+    NO_DECISION."""
+    monkeypatch.setattr(strategy, "_ml_is_qualified",
+                        lambda: (True, "median alpha +10.0% over last 20 runs"))
+    monkeypatch.setattr(
+        strategy,
+        "_ml_live_opinion",
+        lambda *a, **k: {
+            "action": "HOLD",
+            "ticker": "",
+            "reasoning": "ML+quant: no high-conviction signal; regime=unknown",
+        },
+    )
+
+    with mock.patch.object(strategy, "_claude_call", return_value=None):
+        result = strategy.decide()
+
+    assert result["status"] == "HOLD"
+    assert result["ml_fallback_used"] is True
+    fake_store = stub_decide_inputs
+    args, _ = fake_store.record_decision.call_args
+    assert args[2] == "HOLD → HOLD"
+    payload = args[3]
+    assert "ml_fallback_used" in payload
+    assert "llm_drought_reason" in payload
+
+
+def test_ml_drought_buy_fallback_sizes_from_conviction(monkeypatch):
+    monkeypatch.setattr(strategy.market, "get_price", lambda t: 100.0)
+    decision = strategy._ml_drought_decision(
+        {
+            "action": "BUY",
+            "ticker": "AMD",
+            "reasoning": "ML+quant: AMD score=9.0 regime=bull conviction=20%",
+        },
+        {
+            "cash": 1000.0,
+            "total_value": 1000.0,
+            "stock_buying_power": 1500.0,
+            "positions": [],
+        },
+        {"AMD": 100.0},
+        "claude returned no response (timeout)",
+    )
+
+    assert decision["action"] == "BUY"
+    assert decision["ticker"] == "AMD"
+    # 20% conviction on a $1000 book => $200 notional => 2 shares.
+    assert decision["qty"] == 2.0
+    assert "ml-drought-fallback" in decision["reasoning"]
 
 
 def test_midcall_saturation_skips_doomed_sonnet_fallback(stub_decide_inputs,

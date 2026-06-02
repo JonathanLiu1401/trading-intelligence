@@ -75,7 +75,7 @@ _CATALYST_RULES: list[tuple[str, re.Pattern[str]]] = [
     ("PRODUCT", re.compile(
         r"\b(launch(ed|es|ing)?|new\s+product|partnership|contract|"
         r"collaborat(e|ion)|integrat(e|ion)|annonc(e|ed|ing)|"
-        r"introduc(e|ed|ing)|debuted?|release(d|s)?)\b",
+        r"introduc(e|ed|ing)|unveil(ed|s|ing)?|debuted?|release(d|s)?)\b",
         re.IGNORECASE,
     )),
     ("REGULATORY", re.compile(

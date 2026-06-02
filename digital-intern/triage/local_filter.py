@@ -1,7 +1,7 @@
 """Triage filter — heuristic pre-filter then Claude Sonnet 4.6 batch re-ranking."""
 import json
 
-from core.claude_cli import claude_call
+from core.claude_cli import DEFAULT_LLM_MODEL, claude_call
 from core.json_extract import extract_json_array
 from triage.heuristic_scorer import score_article, score_and_rank
 
@@ -9,7 +9,7 @@ KEYWORD_CANDIDATES = 200   # articles passed to Claude after heuristic pre-filte
 TOP_N = 50                 # final articles forwarded to Opus for the briefing
 MIN_HEURISTIC_SCORE = 1.5  # minimum heuristic score to be a candidate
 
-SONNET_MODEL = "claude-sonnet-4-6"
+SONNET_MODEL = DEFAULT_LLM_MODEL
 
 
 def _keyword_score(text: str) -> float:

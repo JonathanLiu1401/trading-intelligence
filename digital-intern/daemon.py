@@ -187,6 +187,7 @@ from collectors import source_health
 from core.backoff import Backoff
 from triage.heuristic_scorer import score_article as _heuristic_score_article
 from analysis.claude_analyst import analyze
+from analytics.catalyst_cycle_monitor import run_once as run_catalyst_cycle_monitor
 from notifier.discord_notifier import send as discord_send
 from storage.article_store import ArticleStore
 from watchers.urgency_scorer import score_batch, BATCH_SIZE as URGENCY_BATCH_SIZE
@@ -343,6 +344,7 @@ NASDAQ_HALTS_INTERVAL   = 120     # NASDAQ/UTP trading halt+resume feed every 2m
 FDA_INTERVAL            = 1800    # FDA press releases + MedWatch safety alerts — every 30min
 PORTFOLIO_PL_INTERVAL = 300       # rewrite portfolio_pl.json every 5min
 SENTIMENT_TRENDS_INTERVAL = 600   # rewrite sentiment_trends.json every 10min
+CATALYST_CYCLE_INTERVAL = 120     # AI catalyst/profit-taking cycle monitor every 2min
 EXPORT_INTERVAL     = 30 * 60     # training-data export to USB every 30min
 WEB_SERVER_PORT     = int(os.environ.get("WEB_SERVER_PORT", "8080"))
 WEB_SERVER_HOST     = os.environ.get("WEB_SERVER_HOST", "0.0.0.0")
@@ -394,7 +396,7 @@ ALL_WORKERS = (
     "usgs_quake", "fda",
     "scorer", "alert", "heartbeat", "purge", "stats",
     "ml_trainer", "continuous_trainer", "recursive_labeler", "price_alert",
-    "portfolio_pl", "sentiment_trends", "export", "web_server",
+    "portfolio_pl", "sentiment_trends", "catalyst_cycle", "export", "web_server",
 )
 # If all of these are stale at once the dashboard shows the CRITICAL banner.
 CORE_WORKERS = ("rss", "web", "reddit", "scorer")
@@ -502,6 +504,7 @@ WORKER_POLL_INTERVAL_SECS = {
     "price_alert": PRICE_ALERT_INTERVAL,
     "portfolio_pl": PORTFOLIO_PL_INTERVAL,
     "sentiment_trends": SENTIMENT_TRENDS_INTERVAL,
+    "catalyst_cycle": CATALYST_CYCLE_INTERVAL,
     "export": EXPORT_INTERVAL,
 }
 # A worker is DEAD only after missing well over one full cycle, so a single
@@ -3762,6 +3765,32 @@ def sentiment_trends_worker(store: ArticleStore):
         _sleep(SENTIMENT_TRENDS_INTERVAL)
 
 
+# ── Worker: AI catalyst/profit-taking cycle monitor — every 2min ───────────
+def catalyst_cycle_worker(store: ArticleStore):
+    """Run the AI catalyst-cycle monitor.
+
+    The standard BREAKING worker still handles single urgent articles. This
+    worker watches the narrative cycle Jonathan described in #chat: fresh AI
+    catalyst, chase, stale follow-up, profit-taking/dip risk, then next
+    catalyst. Urgent monitor posts mention Jonathan and Sao; watch-level posts
+    stay quiet in #claw.
+    """
+    log.info("[catalyst_cycle_worker] started")
+    while _running:
+        try:
+            report = run_catalyst_cycle_monitor(dry_run=False, min_level="watch")
+            urgent = sum(1 for e in report.get("events", []) if e.get("level") == "urgent")
+            selected = len(report.get("selected_for_send", []))
+            log.info(
+                f"[catalyst_cycle] scanned={report.get('scanned_rows', 0)} "
+                f"events={len(report.get('events', []))} urgent={urgent} sent={selected}"
+            )
+            _worker_last_ok["catalyst_cycle"] = time.time()
+        except Exception as e:
+            log.warning(f"[catalyst_cycle_worker] error: {e}")
+        _sleep(CATALYST_CYCLE_INTERVAL)
+
+
 # ── Worker: Periodic training-data export to USB drive ──────────────────────
 def export_worker(store: ArticleStore):
     log.info("[export_worker] started")
@@ -5212,43 +5241,102 @@ def _acquire_singleton_lock():
             holder = os.read(fd, 64).decode(errors="replace").strip() or "unknown"
         except Exception:
             holder = "unknown"
-        log.warning(
-            f"[daemon] Another daemon instance is already running (lock held by pid={holder}). "
-            f"Sending SIGTERM and waiting for it to exit."
-        )
-        # Actively terminate the holder so we don't block indefinitely.
-        # (systemd restart only kills its own MainPID; orphans from prior
-        # crash cycles are outside the cgroup and survive restart.)
+        holder_is_zombie = False
         try:
-            holder_pid = int(holder)
-            os.kill(holder_pid, signal.SIGTERM)
-        except (ValueError, ProcessLookupError, PermissionError):
-            pass  # already dead or not ours
-
-        # Poll the flock for up to 30s for the graceful release; if the
-        # holder is still alive after that, force-kill it then acquire.
-        acquired = False
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline:
+            stat = Path(f"/proc/{int(holder)}/stat").read_text(errors="ignore")
+            parts = stat.split()
+            holder_is_zombie = len(parts) >= 3 and parts[2] == "Z"
+        except Exception:
+            holder_is_zombie = False
+        if holder_is_zombie:
+            stale = lock_path.with_name(
+                f"{lock_path.name}.zombie-{holder}-{int(time.time())}")
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except BlockingIOError:
-                time.sleep(0.5)
-        if not acquired:
-            try:
-                os.kill(int(holder), signal.SIGKILL)
-                log.warning(f"[daemon] Holder pid={holder} did not exit in 30s; sent SIGKILL.")
-            except (ValueError, ProcessLookupError, PermissionError):
+                os.close(fd)
+            except Exception:
                 pass
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            except Exception as e:
-                os.close(fd)
-                log.error(f"[daemon] Blocking flock failed after SIGKILL: {e}; exiting.")
-                sys.exit(1)
-        log.info(f"[daemon] Previous holder pid={holder} exited; this instance is now primary.")
+                lock_path.rename(stale)
+                log.warning(
+                    f"[daemon] Lock holder pid={holder} is a zombie; "
+                    f"rotated stale lock to {stale.name}."
+                )
+            except FileNotFoundError:
+                pass
+            fd = os.open(
+                str(lock_path), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            holder = ""
+        if not holder:
+            pass
+        else:
+            log.warning(
+                f"[daemon] Another daemon instance is already running (lock held by pid={holder}). "
+                f"Sending SIGTERM and waiting for it to exit."
+            )
+            # Actively terminate the holder so we don't block indefinitely.
+            # (systemd restart only kills its own MainPID; orphans from prior
+            # crash cycles are outside the cgroup and survive restart.)
+            try:
+                holder_pid = int(holder)
+                os.kill(holder_pid, signal.SIGTERM)
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass  # already dead or not ours
+
+            # Poll the flock for up to 30s for the graceful release; if the
+            # holder is still alive after that, force-kill it then acquire.
+            acquired = False
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    try:
+                        stat = Path(f"/proc/{int(holder)}/stat").read_text(
+                            errors="ignore")
+                        parts = stat.split()
+                        holder_is_zombie = len(parts) >= 3 and parts[2] == "Z"
+                    except Exception:
+                        holder_is_zombie = False
+                    if holder_is_zombie:
+                        stale = lock_path.with_name(
+                            f"{lock_path.name}.zombie-{holder}-{int(time.time())}")
+                        try:
+                            os.close(fd)
+                        except Exception:
+                            pass
+                        try:
+                            lock_path.rename(stale)
+                            log.warning(
+                                f"[daemon] Holder pid={holder} became a zombie; "
+                                f"rotated stale lock to {stale.name}."
+                            )
+                        except FileNotFoundError:
+                            pass
+                        fd = os.open(
+                            str(lock_path),
+                            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
+                            0o644,
+                        )
+                        fcntl.flock(fd, fcntl.LOCK_EX)
+                        acquired = True
+                        break
+                    time.sleep(0.5)
+            if not acquired:
+                try:
+                    os.kill(int(holder), signal.SIGKILL)
+                    log.warning(f"[daemon] Holder pid={holder} did not exit in 30s; sent SIGKILL.")
+                except (ValueError, ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except Exception as e:
+                    os.close(fd)
+                    log.error(f"[daemon] Blocking flock failed after SIGKILL: {e}; exiting.")
+                    sys.exit(1)
+            log.info(f"[daemon] Previous holder pid={holder} exited; this instance is now primary.")
     # Seek to 0 before truncate+write: the diagnostic read above advances the
     # fd offset, and os.ftruncate does not reset it. Without this seek, the
     # subsequent write lands past the truncated end, leaving leading NUL bytes
@@ -5416,6 +5504,7 @@ def main():
         ("price_alert", price_alert_worker),
         ("portfolio_pl",    portfolio_pl_worker),
         ("sentiment_trends", sentiment_trends_worker),
+        ("catalyst_cycle", catalyst_cycle_worker),
         ("export",      export_worker),
         ("web_server",  web_server_worker),
     ]

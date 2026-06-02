@@ -90,7 +90,8 @@ class TestLastClaudeFail:
 
     def test_cli_missing_sets_cli_missing(self, monkeypatch):
         self._reset()
-        monkeypatch.setattr(strategy.shutil, "which", lambda _: None)
+        monkeypatch.setattr(strategy, "_cli_path", lambda _: None)
+        monkeypatch.setattr(strategy, "CODEX_AUTH_FALLBACK_MODEL", None)
         assert strategy._claude_call("p") is None
         assert strategy._last_claude_fail == "cli_missing"
 
@@ -286,6 +287,8 @@ class TestDecidePerCycleReset:
         monkeypatch.setattr(strategy.market, "benchmark_sp500", lambda: None)
         monkeypatch.setattr(strategy, "get_quant_signals_live",
                             lambda *a, **k: {})
+        monkeypatch.setattr(strategy, "_ml_is_qualified",
+                            lambda: (False, "test disabled"))
         class _FakeStore:
             def open_positions(self): return []
             def get_portfolio(self):
@@ -332,6 +335,8 @@ class TestDecidePerCycleReset:
         monkeypatch.setattr(strategy.market, "benchmark_sp500", lambda: None)
         monkeypatch.setattr(strategy, "get_quant_signals_live",
                             lambda *a, **k: {})
+        monkeypatch.setattr(strategy, "_ml_is_qualified",
+                            lambda: (False, "test disabled"))
         class _FakeStore:
             def open_positions(self): return []
             def get_portfolio(self):
@@ -801,6 +806,43 @@ class TestExecuteBuy:
         status, detail = strategy._execute(decision, snap, fresh_store)
         assert status == "BLOCKED"
         assert "insufficient cash" in detail
+
+    def test_stock_buy_can_use_margin_above_cash(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_price", lambda t: 100.0)
+        snap = {
+            "cash": 50.0,
+            "total_value": 1000.0,
+            "stock_buying_power": 550.0,
+            "positions": [],
+        }
+        decision = {"action": "BUY", "ticker": "AMD", "qty": 5, "reasoning": ""}
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        assert "BUY 5" in detail
+        assert fresh_store.get_portfolio()["cash"] == -450.0
+
+    def test_stock_buy_leverage_scales_effective_exposure(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(market, "get_price", lambda t: 100.0)
+        snap = {
+            "cash": 1000.0,
+            "total_value": 1000.0,
+            "stock_buying_power": 1500.0,
+            "positions": [],
+        }
+        decision = {
+            "action": "BUY",
+            "ticker": "AMD",
+            "qty": 2,
+            "leverage": 5,
+            "reasoning": "test",
+        }
+        status, detail = strategy._execute(decision, snap, fresh_store)
+        assert status == "FILLED"
+        assert "BUY 10" in detail
+        assert "5x leverage" in detail
+        pos = fresh_store.open_positions()[0]
+        assert pos["qty"] == 10
+        assert fresh_store.get_portfolio()["cash"] == 0.0
 
     def test_buy_blocked_when_no_price(self, fresh_store, monkeypatch):
         monkeypatch.setattr(market, "get_price", lambda t: None)

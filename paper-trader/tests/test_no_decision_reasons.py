@@ -288,6 +288,26 @@ class TestReporterIntegration:
 
         assert reporter._no_decision_reasons_line(Store()) == ""
 
+    def test_stale_dominant_cause_suppresses_line(self):
+        from paper_trader import reporter
+
+        class Store:
+            def recent_decisions(self, limit=20):
+                return (
+                    [{"action_taken": "HOLD",
+                      "reasoning": "engine is producing",
+                      "timestamp": "2026-05-19T10:00:00+00:00"}] * 5
+                    + [{"action_taken": "NO_DECISION",
+                        "reasoning": "claude returned no response "
+                                     "(cli_missing)",
+                        "timestamp": "2026-05-19T09:00:00+00:00"}] * 30
+                )
+
+        # The deep rolling window may still be dominated by an old outage
+        # after the live engine has recovered. Do not page the operator with
+        # a stale CLI_MISSING fix when the newest cycles are producing.
+        assert reporter._no_decision_reasons_line(Store()) == ""
+
     def test_mixed_suppresses_line(self):
         from paper_trader import reporter
 

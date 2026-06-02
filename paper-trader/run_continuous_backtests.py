@@ -4436,7 +4436,7 @@ def _query_news_context(ticker: str, sim_date_str: str, n: int = 4) -> list[str]
 
 def _opus_annotate(engine: "BacktestEngine", top_runs: list[BacktestRun],
                    cycle: int, outcome_records: list[dict] | None = None) -> int:
-    """Ask Opus 4.7 to annotate ALL decisions (BUY, SELL, HOLD) in the winner run.
+    """Ask gpt-5.5 to annotate ALL decisions (BUY, SELL, HOLD) in the winner run.
 
     Enhanced over previous version:
     - Covers every decision, not just trades, so HOLDs can also be critiqued
@@ -4446,8 +4446,8 @@ def _opus_annotate(engine: "BacktestEngine", top_runs: list[BacktestRun],
 
     Annotations are appended to WINNER_JSONL. Returns number of records written.
     """
-    if not shutil.which("claude"):
-        print("[opus_annotate] claude CLI not found — skipping annotation")
+    if not shutil.which("codex"):
+        print("[opus_annotate] codex CLI not found — skipping annotation")
         return 0
     if not top_runs:
         return 0
@@ -4551,10 +4551,25 @@ Respond as JSON with this schema (no markdown fences):
 
     try:
         r = subprocess.run(
-            ["claude", "--model", "claude-sonnet-4-6", "--print",
-             "--permission-mode", "bypassPermissions"],
+            [
+                "codex", "exec",
+                "--model", "gpt-5.5",
+                "-c", 'model_reasoning_effort="none"',
+                "--sandbox", "read-only",
+                "--cd", str(Path(__file__).resolve().parent),
+                "--ephemeral",
+                "--color", "never",
+                "-",
+            ],
             input=prompt, capture_output=True, text=True, timeout=240,
-            env={**os.environ, "HOME": "/home/zeph"},
+            env={
+                **os.environ,
+                "HOME": "/home/zeph",
+                "CODEX_HOME": os.environ.get(
+                    "PAPER_TRADER_CODEX_HOME",
+                    str(Path.home() / ".codex"),
+                ),
+            },
         )
     except subprocess.TimeoutExpired:
         print("[opus_annotate] timeout")
@@ -4564,7 +4579,7 @@ Respond as JSON with this schema (no markdown fences):
         return 0
 
     if r.returncode != 0 or not r.stdout.strip():
-        print(f"[opus_annotate] claude rc={r.returncode} stderr={r.stderr.strip()[:200]!r}")
+        print(f"[opus_annotate] codex rc={r.returncode} stderr={r.stderr.strip()[:200]!r}")
         return 0
 
     raw = r.stdout.strip()

@@ -268,6 +268,11 @@ def scorer_gate_audit(scorer, records, oos_only: bool = True) -> dict:
     pairs: list[tuple[float, float]] = []
     for r in recs:
         try:
+            # Forward the 3 enhanced MACD features (pass #36 OOS feature
+            # parity). Without them, this analyzer predicts on a degraded
+            # vector vs the live ``_ml_decide`` gate — ``oos_parity_audit``
+            # measures BIAS_LARGE (delta_rank_ic=+0.11) on the deployed
+            # pickle, biasing the per-arm verdict.
             pred = scorer.predict(
                 ml_score=r.get("ml_score", 0.0),
                 rsi=r.get("rsi"),
@@ -280,6 +285,9 @@ def scorer_gate_audit(scorer, records, oos_only: bool = True) -> dict:
                 bb_pos=r.get("bb_position"),
                 news_urgency=r.get("news_urgency"),
                 news_article_count=r.get("news_article_count"),
+                ema200_above=r.get("ema200_above"),
+                hist_cross_up=r.get("hist_cross_up"),
+                macd_below_zero_cross=r.get("macd_below_zero_cross"),
             )
         except Exception:
             continue

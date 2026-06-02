@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
-from core.claude_cli import claude_call
+from core.claude_cli import DEFAULT_LLM_MODEL, claude_call
 from core.json_extract import extract_json_array
 # Live held/watched ticker universe — the SAME single source of truth the
 # model's portfolio features and the alert path's ``book:`` tag already use
@@ -37,7 +37,7 @@ try:
 except Exception:
     _log = logging.getLogger("urgency_scorer")
 
-SONNET_MODEL = "claude-sonnet-4-6"
+SONNET_MODEL = DEFAULT_LLM_MODEL
 BATCH_SIZE = 100  # articles per Sonnet call
 URGENT_THRESHOLD = 8.0
 # Hard cap kicks in only for clearly stale articles (>48h).

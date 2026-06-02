@@ -26,14 +26,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from core.claude_cli import claude_call
+from core.claude_cli import DEFAULT_LLM_MODEL, claude_call
 from core.json_extract import extract_json_array
 from core.logger import get_logger
 
 log = get_logger("recursive_labeler")
 
-SONNET_MODEL = "claude-sonnet-4-6"
-OPUS_MODEL   = "claude-opus-4-7"
+SONNET_MODEL = DEFAULT_LLM_MODEL
+OPUS_MODEL   = DEFAULT_LLM_MODEL
 
 BATCH_SIZE   = 20            # per Claude call — keeps the JSON fits in stdout
 ROUND1_CAP   = 500           # articles labeled per run (round 1 only)

@@ -48,7 +48,7 @@ class _FakeScorer:
 
     def predict(self, *, ml_score=0.0, rsi=None, macd=None, mom5=None,
                 mom20=None, regime_mult=1.0, ticker="", vol_ratio=None,
-                bb_pos=None, news_urgency=None, news_article_count=None):
+                bb_pos=None, news_urgency=None, news_article_count=None, **_extra_kwargs):
         try:
             return float(mom20 or 0.0)
         except (TypeError, ValueError):

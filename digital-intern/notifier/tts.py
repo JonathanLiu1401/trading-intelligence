@@ -13,7 +13,7 @@ import threading
 import wave
 from pathlib import Path
 
-from core.claude_cli import claude_call
+from core.claude_cli import DEFAULT_LLM_MODEL, claude_call
 
 # ── Kokoro config ────────────────────────────────────────────────────────────
 KOKORO_MODEL  = Path(os.environ.get("KOKORO_MODEL",  "/home/zeph/whisper-server/kokoro-v1.0.onnx"))
@@ -24,7 +24,7 @@ KOKORO_SPEED  = 1.1         # slightly faster — DualAssets pacing
 MAX_SCRIPT_CHARS = 1400     # ~90-100 seconds of speech at 1.1x
 
 # ── Claude config ─────────────────────────────────────────────────────────────
-SONNET_MODEL = "claude-sonnet-4-6"
+SONNET_MODEL = DEFAULT_LLM_MODEL
 
 NARRATION_PROMPT_ALERT = """You are a confident financial markets narrator in the style of DualAssets — fast-paced, engaging, energetic American male voice. An urgent market event just happened.
 

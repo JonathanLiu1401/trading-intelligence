@@ -348,6 +348,9 @@ def analyze(outcomes_path: Path | str, oos_only: bool = True) -> dict:
                     bb_pos=r.get("bb_position"),
                     news_urgency=r.get("news_urgency"),
                     news_article_count=r.get("news_article_count"),
+                ema200_above=r.get("ema200_above"),
+                hist_cross_up=r.get("hist_cross_up"),
+                macd_below_zero_cross=r.get("macd_below_zero_cross"),
                 )
                 preds.append(float(p))
             except Exception:

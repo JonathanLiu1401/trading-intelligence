@@ -57,19 +57,22 @@ def is_actionable(verdict: str | None) -> bool:
 def build_supervision(*, pid: int | None, ppid: int | None,
                        unit_active: str, unit_enabled: str,
                        boot_sha: str | None, head_sha: str | None,
-                       behind: int, now: datetime | None = None) -> dict:
+                       behind: int, now: datetime | None = None,
+                       unit_scope: str | None = None) -> dict:
     """Compose the deployment-recovery verdict from already-probed inputs.
 
     Args (all probed by the caller — this function does NO IO):
       pid / ppid          — ``os.getpid()`` / ``os.getppid()`` of the trader
                             process (the dashboard runs inside the runner, so
                             ``ppid`` is the trader's own parent).
-      unit_active         — ``systemctl --user is-active paper-trader`` →
+      unit_active         — ``systemctl is-active paper-trader`` →
                             ``active|inactive|failed|unknown``.
-      unit_enabled        — ``systemctl --user is-enabled paper-trader`` →
+      unit_enabled        — ``systemctl is-enabled paper-trader`` →
                             ``enabled|disabled|static|unknown``.
       boot_sha            — git SHA captured at process import time.
       head_sha / behind   — current git HEAD + commit distance from boot.
+      unit_scope          — ``system`` / ``user`` when the caller can prove
+                            this process lives inside the matching unit cgroup.
       now                 — injectable clock for the ``as_of`` stamp.
 
     Returns the exact dict shape ``/api/supervision`` has always returned,
@@ -83,29 +86,27 @@ def build_supervision(*, pid: int | None, ppid: int | None,
       UNSUPERVISED_STALE — worst: unsupervised AND already on old code
       UNKNOWN            — could not determine (degrade-safe; never raises)
 
-    Primary signal is ``PPID==1`` (deterministic 'this process is orphaned
-    and nothing will revive it', independent of dbus/XDG state). The
-    ``systemctl --user`` strings are supplementary context only; an
-    unreadable user bus degrades to UNKNOWN WITHOUT flipping a confident
-    orphan verdict (orphan precedence is checked first)."""
+    A bare ``PPID==1`` is not enough to call the process orphaned: root
+    systemd services also have PID 1 as parent. Treat PPID 1 as orphaned only
+    when no active+enabled service owns the restart contract."""
     try:
         ts = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
-        # PPID==1 ⇒ reparented to init ⇒ not tracked by any service manager
-        # that would restart THIS process.
-        orphan = (ppid == 1)
+        unit_supervised = (unit_active == "active"
+                           and unit_enabled == "enabled"
+                           and (ppid != 1 or unit_scope in {"system", "user"}))
+        orphan = (ppid == 1 and not unit_supervised)
         stale = bool(boot_sha and head_sha and head_sha != boot_sha)
 
         # "supervised" = this process WILL be auto-restarted if it exits.
-        # An orphan (PPID 1) never will, whatever the unit says. Otherwise
-        # require the unit active AND enabled (Restart=always in force).
+        # A true orphan never will. Otherwise require an active+enabled unit
+        # (Restart=always in force).
         # Unreadable systemctl on a non-orphan ⇒ supervision indeterminate.
         if orphan:
             supervised: bool | None = False
         elif unit_active == "unknown" or unit_enabled == "unknown":
             supervised = None
         else:
-            supervised = (unit_active == "active"
-                          and unit_enabled == "enabled")
+            supervised = unit_supervised
 
         if supervised is None:
             verdict = "UNKNOWN"
@@ -150,6 +151,7 @@ def build_supervision(*, pid: int | None, ppid: int | None,
             "ppid": ppid,
             "orphan": orphan,
             "systemd": {"active": unit_active, "enabled": unit_enabled},
+            "unit_scope": unit_scope,
             "boot_sha": boot_sha,
             "head_sha": head_sha,
             "behind": behind,
@@ -176,6 +178,7 @@ def build_supervision(*, pid: int | None, ppid: int | None,
             "ppid": ppid,
             "orphan": None,
             "systemd": {"active": unit_active, "enabled": unit_enabled},
+            "unit_scope": unit_scope,
             "boot_sha": boot_sha,
             "head_sha": head_sha,
             "behind": behind,

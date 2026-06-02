@@ -11,10 +11,10 @@ discriminating asserts:
 * the cold call returns the builder's *exact* shape — cash, deployed_pct,
   affordable list with whole-share counts, cheapest name + price, unlock —
   not the SWR warming placeholder;
-* affordability is a strict ``int(cash // px)`` floor against the mocked
-  prices (so a 999 cash / 500 price reads 1 share, never 2);
-* the CASH_CONSTRAINED branch fires when cash is below every priced name's
-  price (the live $18.49-of-$972 pathology);
+* affordability is a strict floor against margin-backed stock buying power
+  (cash + 50% of current net worth);
+* the old $18.49-of-$972 cash-pinned shape is DEPLOYABLE once 50% margin is
+  counted;
 * the unlock fact names the most-underwater open position (the builder's
   biggest-loser-first cut-priority);
 * the SWR honesty keys ``cached`` / ``cache_age_s`` are present in
@@ -107,13 +107,17 @@ class TestBuyingPowerEndpoint:
                 j = r.get_json()
                 # Real builder payload, not the warming placeholder.
                 assert "warming" not in j
-                assert j["state"] == "CASH_CONSTRAINED"
+                assert j["state"] == "DEPLOYABLE"
                 # Cheapest in-play priced name is SOXL @ $30.
                 assert j["cheapest_name"] == "SOXL"
                 assert j["cheapest_price"] == 30.0
                 assert j["cash"] == 18.49
-                # Strict int floor: $18.49 // $30 == 0 ⇒ no name affordable.
-                assert all(a["whole_shares"] == 0 for a in j["affordable"])
+                assert j["margin_available"] > 0
+                assert j["buying_power"] > j["cash"]
+                # Margin-backed buying power covers at least one cheap in-play
+                # share even though raw cash does not.
+                by_t = {a["ticker"]: a["whole_shares"] for a in j["affordable"]}
+                assert by_t["SOXL"] >= 1
                 # Unlock = most-underwater open lot.
                 # LITE: 0.61 × (55.0 − 980.90) = −564.80
                 # MU:   0.5 × (92.0 − 724.12) = −316.06
@@ -136,17 +140,18 @@ class TestBuyingPowerEndpoint:
                 j = r.get_json()
                 assert j["state"] == "DEPLOYABLE"
                 assert j["cash"] == 500.0
-                # $500 // $30 SOXL = 16; $500 // $500 SPY = 1; $500 // $480
-                # QQQ = 1; $500 // $73 TQQQ = 6; $500 // $250 SMH = 2.
+                # Snapshot marks NVDA to $220, so total = $720 and buying
+                # power = $500 cash + $360 margin = $860.
                 by_t = {a["ticker"]: a["whole_shares"] for a in j["affordable"]}
-                assert by_t["SOXL"] == 16
+                assert j["buying_power"] == 860.0
+                assert by_t["SOXL"] == 28
                 assert by_t["SPY"] == 1
                 assert by_t["QQQ"] == 1
-                assert by_t["TQQQ"] == 6
-                assert by_t["SMH"] == 2
+                assert by_t["TQQQ"] == 11
+                assert by_t["SMH"] == 3
                 # NVDA is held but also in WATCHLIST — affordability is per
-                # in-play set so it's still listed: $500 // $220 = 2.
-                assert by_t["NVDA"] == 2
+                # in-play set so it's still listed: $860 // $220 = 3.
+                assert by_t["NVDA"] == 3
                 # portfolio_snapshot_readonly remarks open positions to live
                 # marks: 1 × $220 NVDA = $220 open_value, total = cash +
                 # open_value = 500 + 220 = 720. Deployed % = 220/720 ≈
@@ -157,7 +162,7 @@ class TestBuyingPowerEndpoint:
             s.close()
 
     def test_int_floor_is_strict_not_rounded(self, swr_client):
-        """A 999.99 cash / 500 price ⇒ exactly 1 share, never 2."""
+        """A 1499.985 buying-power / 500 price floors to 2, never 3."""
         _mp, db, _ = swr_client
         s = Store()
         s.update_portfolio(cash=999.99, total_value=999.99, positions=[])
@@ -167,10 +172,10 @@ class TestBuyingPowerEndpoint:
                 r = client.get("/api/buying-power")
                 j = r.get_json()
                 by_t = {a["ticker"]: a["whole_shares"] for a in j["affordable"]}
-                # 999.99 // 500 == 1, not 2.
-                assert by_t["SPY"] == 1
-                # 999.99 // 480 == 2.
-                assert by_t["QQQ"] == 2
+                # 1499.985 // 500 == 2, not 3.
+                assert by_t["SPY"] == 2
+                # 1499.985 // 480 == 3.
+                assert by_t["QQQ"] == 3
         finally:
             s.close()
 

@@ -39,6 +39,11 @@ import pytest
 from watchers import alert_agent
 
 
+@pytest.fixture(autouse=True)
+def _no_real_sao_breaking_dm(monkeypatch):
+    monkeypatch.setattr(alert_agent, "_send_sao_breaking_dm", lambda message: True)
+
+
 def _iso(hours_ago: float) -> str:
     return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
 
@@ -214,13 +219,35 @@ class TestHappyPathMarksAlerted:
         with patch.object(alert_agent, "claude_call",
                           return_value="🚨 BREAKING ◈ EARNINGS ◈ MU") as mock_claude, \
              patch("notifier.discord_notifier.send",
-                   return_value=True) as mock_send:
+                   return_value=True) as mock_send, \
+             patch.object(alert_agent, "_send_sao_breaking_dm",
+                          return_value=True) as mock_sao_dm:
             ok = alert_agent.send_urgent_alert(urgent, store)
 
         assert ok is True
         mock_claude.assert_called_once()
         mock_send.assert_called_once()
+        mock_sao_dm.assert_called_once_with("🚨 BREAKING ◈ EARNINGS ◈ MU")
         # Marked alerted (urgency 1 → 2) and now invisible to the alerter.
+        assert _urgency_of(store, "go") == 2
+        assert store.get_unalerted_urgent() == []
+
+    def test_sao_dm_failure_does_not_requeue_successful_discord_alert(
+        self, store, monkeypatch
+    ):
+        """Sao's DM copy is secondary fanout. If the main Discord alert
+        succeeds, a DM failure must not turn the article back into a retry."""
+        _insert_urgent(store, id="go", published=_iso(1), ai_score=9.0)
+        urgent = store.get_unalerted_urgent()
+        assert len(urgent) == 1
+
+        monkeypatch.setattr(alert_agent, "DISCORD_WEBHOOK", "https://x/webhook")
+        with patch.object(alert_agent, "claude_call", return_value="alert body"), \
+             patch("notifier.discord_notifier.send", return_value=True), \
+             patch.object(alert_agent, "_send_sao_breaking_dm", return_value=False):
+            ok = alert_agent.send_urgent_alert(urgent, store)
+
+        assert ok is True
         assert _urgency_of(store, "go") == 2
         assert store.get_unalerted_urgent() == []
 

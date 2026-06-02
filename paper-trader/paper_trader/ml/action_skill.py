@@ -120,6 +120,9 @@ def _aligned_pred(scorer, record: dict) -> tuple[float, float] | None:
             bb_pos=record.get("bb_position"),
             news_urgency=record.get("news_urgency"),
             news_article_count=record.get("news_article_count"),
+            ema200_above=record.get("ema200_above"),
+            hist_cross_up=record.get("hist_cross_up"),
+            macd_below_zero_cross=record.get("macd_below_zero_cross"),
         )
     except Exception:
         return None

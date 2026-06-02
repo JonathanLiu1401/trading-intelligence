@@ -375,6 +375,9 @@ def scorer_linear_probe(scorer, records, oos_only: bool = True) -> dict:
                 vol_ratio=rec.get("vol_ratio"), bb_pos=rec.get("bb_position"),
                 news_urgency=rec.get("news_urgency"),
                 news_article_count=rec.get("news_article_count"),
+                ema200_above=rec.get("ema200_above"),
+                hist_cross_up=rec.get("hist_cross_up"),
+                macd_below_zero_cross=rec.get("macd_below_zero_cross"),
             ))
         except Exception:
             continue

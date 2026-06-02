@@ -130,9 +130,13 @@ EXPECTED_SIGN: dict[str, int | None] = {
 
 
 def _base_kwargs(r: dict) -> dict:
-    """The 11-kwarg ``predict`` call for one record, constructed identically
+    """The 14-kwarg ``predict`` call for one record, constructed identically
     to ``feature_importance._kwargs`` / ``_oos_rank_metrics`` so this curve
-    reads on the SAME scale as every other OOS diagnostic."""
+    reads on the SAME scale as every other OOS diagnostic.
+
+    Forwards the 3 enhanced MACD features (pass #36 OOS parity fix) so the
+    response sweep baseline matches what the live ``_ml_decide`` gate
+    actually sees on the same row."""
     from paper_trader.ml.decision_scorer import _to_float
     return dict(
         ml_score=_to_float(r.get("ml_score"), 0.0),
@@ -146,6 +150,9 @@ def _base_kwargs(r: dict) -> dict:
         bb_pos=r.get("bb_position"),
         news_urgency=r.get("news_urgency"),
         news_article_count=r.get("news_article_count"),
+        ema200_above=r.get("ema200_above"),
+        hist_cross_up=r.get("hist_cross_up"),
+        macd_below_zero_cross=r.get("macd_below_zero_cross"),
     )
 
 
