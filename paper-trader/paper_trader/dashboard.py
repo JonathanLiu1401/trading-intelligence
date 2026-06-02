@@ -809,7 +809,7 @@ from functools import wraps as _wraps
 
 _SWR_LOCK = _threading.Lock()
 _SWR_STATE: dict = {}
-_SWR_EXEC = _ThreadPoolExecutor(max_workers=6, thread_name_prefix="dash-swr")
+_SWR_EXEC = _ThreadPoolExecutor(max_workers=16, thread_name_prefix="dash-swr")
 _SWR_COLD_BUDGET_S = 2.0
 _SWR_TEST_FORCE = False  # dedicated SWR tests flip this; never set in prod
 # A background rebuild that *raises* (vs. merely slow) used to vanish into
@@ -826,7 +826,7 @@ _SWR_FAIL_LOG_EVERY = 10
 # slow endpoint serves its last good payload instantly. But the SWR
 # background rebuild still calls yfinance, and yfinance/`requests` has **no
 # total timeout** — a stalled HTTPS socket blocks for minutes (or until the
-# OS TCP timeout). That hung call sits inside an `_SWR_EXEC` worker (only 6
+# OS TCP timeout). That hung call sits inside an `_SWR_EXEC` worker (bounded
 # of them); a handful of simultaneous hangs exhausts the pool and *every*
 # SWR panel goes permanently dark on `{"warming": true}` — the future never
 # completes, so the single-flight guard never kicks a fresh rebuild either.
@@ -16914,6 +16914,9 @@ def _swr_prewarm():
         try:
             raw = getattr(wrapper, "__wrapped__", wrapper)
             _swr_refresh(name + "?", raw, (), {}, "")
+            if name == "backtests-list":
+                for qs in ("model=all", "model=ai", "model=monkey"):
+                    _swr_refresh(name + "?" + qs, raw, (), {}, qs)
         except Exception as e:
             print(f"[dashboard] SWR prewarm enqueue {name} failed: {e}")
         _time.sleep(0.5)
