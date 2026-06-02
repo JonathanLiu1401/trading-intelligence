@@ -95,6 +95,13 @@ class TestAllRunsDerivedMetrics:
                              start=date(2025, 1, 1), end=date(2025, 6, 1))
         assert [r["run_id"] for r in store.all_runs()] == [2, 5, 8]
 
+    def test_model_id_is_preserved_without_curves_for_dashboard_filters(self, store):
+        store.upsert_run(6, seed=6, status="running",
+                         start=date(2025, 1, 1), end=date(2025, 6, 1),
+                         model_id="monkey_random")
+        run = store.all_runs(include_curves=False)[0]
+        assert run["model_id"] == "monkey_random"
+
     def test_include_curves_parses_json_and_bad_json_degrades(self, store):
         store.upsert_run(4, seed=4, status="running",
                          start=date(2025, 1, 1), end=date(2025, 2, 1))
