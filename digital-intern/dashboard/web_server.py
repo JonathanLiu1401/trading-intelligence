@@ -27,6 +27,11 @@ from flask import Flask, Response, jsonify, request
 from core.claude_cli import claude_call as _claude_cli_call
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+_LIVE_ONLY_SQL = (
+    "url NOT LIKE 'backtest://%' "
+    "AND source NOT LIKE 'backtest_%' "
+    "AND source NOT LIKE 'opus_annotation%'"
+)
 
 # Resolved lazily so importing this module doesn't require an instantiated store.
 _store = None
@@ -173,6 +178,46 @@ def _articles_from_db(limit: int = 50, min_score: float = 0.0) -> list[dict]:
             "first_seen": r[8],
         })
     return out
+
+
+def _stats_from_db() -> dict:
+    from storage.article_store import _get_db_path
+    db_file = _get_db_path()
+    conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=1.0)
+    try:
+        total = int(conn.execute(
+            "SELECT MAX(rowid) FROM articles"
+        ).fetchone()[0] or 0)
+        urgent = int(conn.execute(
+            "SELECT COUNT(*) FROM "
+            "(SELECT 1 FROM articles WHERE urgency>=1 LIMIT 10000)"
+        ).fetchone()[0] or 0)
+        last_hour = int(conn.execute(
+            "SELECT COUNT(*) FROM articles "
+            f"WHERE first_seen >= datetime('now','-1 hour') AND {_LIVE_ONLY_SQL}"
+        ).fetchone()[0] or 0)
+        last_24h = int(conn.execute(
+            "SELECT COUNT(*) FROM articles "
+            f"WHERE first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL}"
+        ).fetchone()[0] or 0)
+    finally:
+        conn.close()
+    size_bytes = 0
+    if db_file is not None:
+        for suffix in ("", "-wal", "-shm"):
+            p = db_file.with_name(db_file.name + suffix)
+            if p.exists():
+                size_bytes += p.stat().st_size
+    return {
+        "total": total,
+        "urgent": urgent,
+        "unscored": None,
+        "below_threshold": None,
+        "db_mb": round(size_bytes / 1024 / 1024, 1),
+        "last_hour": last_hour,
+        "last_24h": last_24h,
+        "standalone": True,
+    }
 
 
 def _tail_risk_chat_lines(an: dict) -> list[str]:
@@ -5730,10 +5775,10 @@ def create_app(store=None) -> Flask:
         if not _check_api_key():
             return jsonify({"error": "unauthorized"}), 401
         store = _store_handle()
-        if store is None:
-            return jsonify({"error": "store unavailable"}), 503
 
         def _build_stats():
+            if store is None:
+                return _stats_from_db()
             # ``store.stats()`` is the core gauge (total/urgent/backlog). If it
             # exhausts the @_retry_on_lock budget under a sustained writer-
             # contention / shared-conn cursor-collision storm it genuinely means
@@ -6843,6 +6888,7 @@ def create_app(store=None) -> Flask:
         training_set_size = None
         predictions_24h = None
         urgent_24h = None
+        standalone = _store_handle() is None
         conn = _ro_conn()
         if conn is not None:
             try:
@@ -6851,20 +6897,31 @@ def create_app(store=None) -> Flask:
                 # Articles scored in the past 24h are a reasonable proxy for
                 # inference throughput; there is no `score_source` column in
                 # this schema (see articles table definition).
-                row = conn.execute(
-                    "SELECT "
-                    "SUM(CASE WHEN ai_score > 0 THEN 1 ELSE 0 END), "
-                    "SUM(CASE WHEN ai_score > 0 "
-                    f"AND first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL} "
-                    "THEN 1 ELSE 0 END), "
-                    "SUM(CASE WHEN urgency >= 1 "
-                    f"AND first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL} "
-                    "THEN 1 ELSE 0 END) "
-                    "FROM articles"
-                ).fetchone()
-                training_set_size = int(row[0] or 0)
-                predictions_24h = int(row[1] or 0)
-                urgent_24h = int(row[2] or 0)
+                if standalone:
+                    row = conn.execute(
+                        "SELECT "
+                        "SUM(CASE WHEN ai_score > 0 THEN 1 ELSE 0 END), "
+                        "SUM(CASE WHEN urgency >= 1 THEN 1 ELSE 0 END) "
+                        "FROM articles "
+                        f"WHERE first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL}"
+                    ).fetchone()
+                    predictions_24h = int(row[0] or 0)
+                    urgent_24h = int(row[1] or 0)
+                else:
+                    row = conn.execute(
+                        "SELECT "
+                        "SUM(CASE WHEN ai_score > 0 THEN 1 ELSE 0 END), "
+                        "SUM(CASE WHEN ai_score > 0 "
+                        f"AND first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL} "
+                        "THEN 1 ELSE 0 END), "
+                        "SUM(CASE WHEN urgency >= 1 "
+                        f"AND first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL} "
+                        "THEN 1 ELSE 0 END) "
+                        "FROM articles"
+                    ).fetchone()
+                    training_set_size = int(row[0] or 0)
+                    predictions_24h = int(row[1] or 0)
+                    urgent_24h = int(row[2] or 0)
             except Exception:
                 pass
             finally:
@@ -7941,7 +7998,7 @@ def create_app(store=None) -> Flask:
         # badge (and any external probe using the conventional /api/health
         # path) stops silently 404'ing. Same body either way.
         store = _store_handle()
-        return jsonify({"ok": store is not None})
+        return jsonify({"ok": True, "store_attached": store is not None})
 
     @app.get("/chat")
     def chat_page() -> Response:
@@ -11383,8 +11440,7 @@ document.getElementById('suggestions').addEventListener('click', function(e) {
 
 
 if __name__ == "__main__":
-    # Standalone runtime: open the store directly and serve.
+    # Standalone runtime: serve via short-lived read-only DB connections.
     import sys
     sys.path.insert(0, str(BASE_DIR))
-    from storage.article_store import ArticleStore  # noqa: E402
-    run_server(ArticleStore())
+    run_server(None)
