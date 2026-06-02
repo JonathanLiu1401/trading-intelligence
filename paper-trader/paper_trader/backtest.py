@@ -523,7 +523,7 @@ class BacktestStore:
                     "SELECT run_id, seed, start_date, end_date, start_value,"
                     " final_value, total_return_pct, spy_return_pct,"
                     " vs_spy_pct, n_trades, n_decisions, status,"
-                    " started_at, completed_at, notes"
+                    " started_at, completed_at, notes, model_id"
                     " FROM backtest_runs ORDER BY run_id ASC"
                 ).fetchall()
         out = []
