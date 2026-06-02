@@ -379,7 +379,8 @@ CREATE TABLE IF NOT EXISTS articles (
     cycle       INTEGER DEFAULT 0,  -- collection cycle number
     time_sensitivity REAL DEFAULT NULL, -- 0..1, ML-predicted recency decay rate (NULL until scored)
     ml_score    REAL DEFAULT NULL,  -- model's own prediction (separate from ai_score to avoid training-feedback contamination)
-    score_source TEXT DEFAULT NULL  -- 'llm' (Sonnet/Opus ground truth), 'ml' (model), 'briefing_boost' (Opus curation nudge); NULL=unscored
+    score_source TEXT DEFAULT NULL, -- 'llm' (Sonnet/Opus ground truth), 'ml' (model), 'briefing_boost' (Opus curation nudge); NULL=unscored
+    breaking_news INTEGER DEFAULT 0 -- 1 when analytics.breaking_news_detector finds a same-ticker burst
 );
 CREATE INDEX IF NOT EXISTS idx_urgency   ON articles(urgency);
 CREATE INDEX IF NOT EXISTS idx_ai_score  ON articles(ai_score DESC);
@@ -591,6 +592,16 @@ class ArticleStore:
                     )
                     self.conn.commit()
                     _log.info("[article_store] migration: added articles.score_source column")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+            if "breaking_news" not in cols:
+                try:
+                    self.conn.execute(
+                        "ALTER TABLE articles ADD COLUMN breaking_news INTEGER DEFAULT 0"
+                    )
+                    self.conn.commit()
+                    _log.info("[article_store] migration: added articles.breaking_news column")
                 except sqlite3.OperationalError as e:
                     if "duplicate column" not in str(e).lower():
                         raise
