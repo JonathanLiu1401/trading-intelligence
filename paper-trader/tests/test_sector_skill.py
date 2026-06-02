@@ -29,7 +29,7 @@ class _FakeScorer:
 
     def predict(self, *, ml_score, rsi, macd, mom5, mom20, regime_mult,
                 ticker, vol_ratio=None, bb_pos=None, news_urgency=None,
-                news_article_count=None):
+                news_article_count=None, **_extra_kwargs):
         sec = ss._sector_of(ticker)
         fn = self._preds.get(sec)
         if fn is None:

@@ -8,10 +8,12 @@ import shutil
 import subprocess
 from datetime import datetime, timezone
 
+from core.claude_cli import DEFAULT_LLM_MODEL, claude_call
+
 from . import market, signals
 from .store import Store, get_store
 
-MODEL = "claude-opus-4-7"
+MODEL = DEFAULT_LLM_MODEL
 DECISION_TIMEOUT_S = 120
 
 WATCHLIST = [
@@ -61,28 +63,7 @@ Return JSON ONLY.
 
 
 def _claude_call(prompt: str) -> str | None:
-    if not shutil.which("claude"):
-        print("[strategy] claude CLI not found")
-        return None
-    try:
-        r = subprocess.run(
-            ["claude", "--model", MODEL, "--print",
-             "--permission-mode", "bypassPermissions"],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=DECISION_TIMEOUT_S,
-        )
-        if r.returncode != 0:
-            print(f"[strategy] claude err: {r.stderr.strip()[:300]}")
-            return None
-        return r.stdout.strip() or None
-    except subprocess.TimeoutExpired:
-        print(f"[strategy] claude timeout after {DECISION_TIMEOUT_S}s")
-        return None
-    except Exception as e:
-        print(f"[strategy] claude exception: {e}")
-        return None
+    return claude_call(prompt, model=MODEL, timeout=DECISION_TIMEOUT_S)
 
 
 def _parse_decision(raw: str) -> dict | None:

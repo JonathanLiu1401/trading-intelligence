@@ -89,6 +89,8 @@ def build_buying_power(snapshot: dict, watch_prices: dict,
     try:
         cash = _f((snapshot or {}).get("cash"))
         total = _f((snapshot or {}).get("total_value"))
+        deployable = _f((snapshot or {}).get("stock_buying_power"), cash)
+        margin = max(0.0, deployable - cash)
         positions = list((snapshot or {}).get("positions") or [])
         in_play = {str(t).upper() for t in (names_in_play or set())}
 
@@ -130,7 +132,9 @@ def build_buying_power(snapshot: dict, watch_prices: dict,
                 "prompt_block": (f"{_PREAMBLE}\n  (portfolio value "
                                  f"unavailable — no buying-power awareness "
                                  f"this cycle)"),
-                "cash": round(cash, 2), "deployed_pct": deployed_pct,
+                "cash": round(cash, 2), "buying_power": round(deployable, 2),
+                "margin_available": round(margin, 2),
+                "deployed_pct": deployed_pct,
                 "affordable": [], "cheapest_name": None,
                 "cheapest_price": None, "unlock": unlock,
             }
@@ -142,24 +146,27 @@ def build_buying_power(snapshot: dict, watch_prices: dict,
             # the in-play set). State the cash + deployed fact honestly.
             return {
                 "state": "NO_PRICED_NAMES",
-                "summary": f"${cash:.2f} free, {dep} deployed; no priced "
+                "summary": f"${deployable:.2f} stock buying power, {dep} deployed; no priced "
                            f"in-play names to size against",
-                "prompt_block": (f"{_PREAMBLE}\n  ${cash:.2f} free cash "
-                                 f"({dep} of the book deployed). No live "
+                "prompt_block": (f"{_PREAMBLE}\n  ${deployable:.2f} stock buying power "
+                                 f"(${cash:.2f} cash + ${margin:.2f} margin; "
+                                 f"{dep} of the book deployed). No live "
                                  f"price for any in-play name this cycle — "
                                  f"size with care."),
-                "cash": round(cash, 2), "deployed_pct": deployed_pct,
+                "cash": round(cash, 2), "buying_power": round(deployable, 2),
+                "margin_available": round(margin, 2),
+                "deployed_pct": deployed_pct,
                 "affordable": [], "cheapest_name": None,
                 "cheapest_price": None, "unlock": unlock,
             }
 
         affordable = [
             {"ticker": t, "price": round(px, 2),
-             "whole_shares": int(cash // px)}
+             "whole_shares": int(deployable // px)}
             for t, px in priced
         ]
         cheapest_name, cheapest_price = min(priced, key=lambda kv: kv[1])
-        constrained = cash < cheapest_price
+        constrained = deployable < cheapest_price
 
         unlock_line = ""
         if unlock and unlock["ticker"]:
@@ -177,11 +184,12 @@ def build_buying_power(snapshot: dict, watch_prices: dict,
 
         if constrained:
             state = "CASH_CONSTRAINED"
-            summary = (f"${cash:.2f} free, {dep} deployed — below the price "
+            summary = (f"${deployable:.2f} stock buying power, {dep} deployed — below the price "
                        f"of every in-play name (cheapest {cheapest_name} "
                        f"@ ${cheapest_price:.2f})")
             prompt_block = (
-                f"{_PREAMBLE}\n  ${cash:.2f} free cash ({dep} of the book "
+                f"{_PREAMBLE}\n  ${deployable:.2f} stock buying power "
+                f"(${cash:.2f} cash + ${margin:.2f} margin; {dep} of the book "
                 f"deployed). This is below the price of every in-play name "
                 f"(cheapest: {cheapest_name} @ ${cheapest_price:.2f}), so no "
                 f"new whole-share entry is fundable — only fractional buys, "
@@ -191,9 +199,10 @@ def build_buying_power(snapshot: dict, watch_prices: dict,
             top = affordable[:_MAX_AFFORDABLE_NAMES]
             shares_str = " · ".join(
                 f"{a['ticker']} {a['whole_shares']}" for a in top)
-            summary = f"${cash:.2f} free, {dep} deployed"
+            summary = f"${deployable:.2f} stock buying power, {dep} deployed"
             prompt_block = (
-                f"{_PREAMBLE}\n  ${cash:.2f} free cash ({dep} of the book "
+                f"{_PREAMBLE}\n  ${deployable:.2f} stock buying power "
+                f"(${cash:.2f} cash + ${margin:.2f} margin; {dep} of the book "
                 f"deployed). Whole shares affordable now at live prices: "
                 f"{shares_str}.{unlock_line}")
 
@@ -202,6 +211,8 @@ def build_buying_power(snapshot: dict, watch_prices: dict,
             "summary": summary,
             "prompt_block": prompt_block,
             "cash": round(cash, 2),
+            "buying_power": round(deployable, 2),
+            "margin_available": round(margin, 2),
             "deployed_pct": deployed_pct,
             "affordable": affordable,
             "cheapest_name": cheapest_name,

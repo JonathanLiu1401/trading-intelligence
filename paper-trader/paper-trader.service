@@ -1,5 +1,5 @@
 [Unit]
-Description=Paper Trader (Opus 4.7 driven)
+Description=Paper Trader (gpt-5.5 driven)
 After=network-online.target digital-intern.service
 Wants=network-online.target
 

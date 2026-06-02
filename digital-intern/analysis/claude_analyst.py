@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
-from core.claude_cli import claude_call
+from core.claude_cli import DEFAULT_LLM_MODEL, claude_call
 # Reuse the *single* well-tested headline-canonicalisation primitive
 # (tests/test_alert_dedup.py) instead of re-deriving a signature here — the
 # documented anti-drift discipline (same reason watchers.alert_recency imports
@@ -25,7 +25,7 @@ from watchers import alert_recency
 # "briefing pre-filter" as the intended integration); see _build_payload.
 from ml.dedup import dedupe_articles as _dedupe_near_duplicates
 
-MODEL = "claude-opus-4-7"
+MODEL = DEFAULT_LLM_MODEL
 
 
 def _recent_alert_signatures() -> set:
@@ -1646,6 +1646,34 @@ _BRIEFING_RT_FUND_MAKES_INVESTMENT = re.compile(
     r"(?:in|of)\b",
     re.IGNORECASE,
 )
+
+# Leading "<Fund> LLC (Has|Owns|Grows|Trims|Sells N Shares of) <stake> in <Co>"
+# — lockstep mirror of ``watchers.alert_agent._RT_FUND_STAKE_DELTA``. The 13F
+# QUARTERLY-CHANGE press-mill sibling of ``_BRIEFING_RT_FUND_MAKES_INVESTMENT``
+# — same leading-LLC shape with the closed set of delta-action verbs
+# (Grows/Trims/Sells/Buys/Has ...) instead of initial-position verbs
+# (Makes/Acquires/Takes). Without this mirror the per-domain cap admits these
+# 13F-recap rows into the briefing's top-50 digest as fresh TOP SIGNALS despite
+# being retrospective.
+#
+# Live evidence (2026-05-28..29 articles.db urgency>=1 scan): "Leeward Financial
+# Partners LLC Grows Stock Holdings in Oracle Corporation $ORCL" reached
+# urgency=2 from GoogleNews/MarketBeat (ml_score=9.82) — the canonical
+# fired-real-BREAKING-alert row this gate suppresses. See
+# ``alert_agent._RT_FUND_STAKE_DELTA`` for the full evidence + discriminator
+# rationale.
+_BRIEFING_RT_FUND_STAKE_DELTA = re.compile(
+    r"\S+(?:\s+\S+){0,5}\s+LLC\s+"
+    r"(?:Has|Have|Hold|Holds|Own|Owns|Grows|Grew|Trims|Trimmed|"
+    r"Boosts|Boosted|Cuts|Cut|Raises|Raised|Lowers|Lowered|"
+    r"Maintains|Increases|Increased|Decreases|Decreased|Reduces|Reduced|"
+    r"Hikes|Hiked|Slashes|Slashed|Sells|Sold|Buys|Bought|Purchases|Purchased|"
+    r"Adds|Added|Removes|Removed|Liquidates|Liquidated|Initiates|Initiated)\s+"
+    r"(?:(?:New\s+)?\$?[\d,.]+(?:\s*[KMB])?\s+(?:Million\s+|Billion\s+)?)?"
+    r"(?:Position|Investment|Stake|Shares?|(?:Stock\s+)?Holdings?)\s+"
+    r"(?:in|of)\b",
+    re.IGNORECASE,
+)
 # "[Wikipedia] <article title>" — lockstep mirror of
 # ``watchers.alert_agent._RT_WIKIPEDIA_REF``. The ``collectors.wikipedia_collector``
 # emits encyclopedic recent-changes rows with this exact prefix, and the ML
@@ -1938,6 +1966,11 @@ _BRIEFING_RECAP_TEMPLATE_PATTERNS = (
     # same-named gate. See ``_BRIEFING_RT_FUND_MAKES_INVESTMENT`` for live
     # evidence.
     ("fund_makes_investment", _BRIEFING_RT_FUND_MAKES_INVESTMENT),
+    # 13F press-mill holdings-CHANGE sibling — lockstep mirror of the alert-side
+    # ``fund_stake_delta`` gate. Mutually orthogonal verb set with
+    # ``fund_makes_investment`` (initial-position verbs vs delta-action verbs).
+    # See ``_BRIEFING_RT_FUND_STAKE_DELTA`` for live evidence.
+    ("fund_stake_delta", _BRIEFING_RT_FUND_STAKE_DELTA),
     ("wikipedia_ref", _BRIEFING_RT_WIKIPEDIA_REF),
     ("earnings_tomorrow_preview", _BRIEFING_RT_EARNINGS_TOMORROW),
     ("todays_movers_list", _BRIEFING_RT_TODAYS_MOVERS),

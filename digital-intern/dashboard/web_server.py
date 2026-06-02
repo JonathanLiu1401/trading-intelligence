@@ -15,6 +15,8 @@ import os
 import json
 import re
 import sqlite3
+import threading
+import time
 import zlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -29,6 +31,35 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Resolved lazily so importing this module doesn't require an instantiated store.
 _store = None
 _log = None
+_dashboard_cache: dict[str, tuple[float, Any]] = {}
+_dashboard_cache_lock = threading.Lock()
+
+
+def _ttl_cache(key: str, ttl_s: float, build):
+    now = time.monotonic()
+    with _dashboard_cache_lock:
+        hit = _dashboard_cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    value = build()
+    with _dashboard_cache_lock:
+        _dashboard_cache[key] = (now + ttl_s, value)
+    return value
+
+
+def _ttl_get(key: str):
+    now = time.monotonic()
+    with _dashboard_cache_lock:
+        hit = _dashboard_cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    return None
+
+
+def _ttl_set(key: str, ttl_s: float, value):
+    with _dashboard_cache_lock:
+        _dashboard_cache[key] = (time.monotonic() + ttl_s, value)
+    return value
 
 
 def _logger():
@@ -5617,7 +5648,11 @@ def create_app(store=None) -> Flask:
             return jsonify({"error": "unauthorized"}), 401
         limit = max(1, min(500, int(request.args.get("limit", 50))))
         min_score = float(request.args.get("min_score", 0.0))
-        return jsonify(_articles_from_db(limit, min_score))
+        return jsonify(_ttl_cache(
+            f"articles:{limit}:{min_score:.3f}",
+            5.0,
+            lambda: _articles_from_db(limit, min_score),
+        ))
 
     @app.get("/api/portfolio")
     def api_portfolio():
@@ -5656,6 +5691,40 @@ def create_app(store=None) -> Flask:
         CONFIG_PATH.write_text(_json.dumps(body, indent=2))
         return jsonify({"ok": True})
 
+    def _proxy_paper_trader(path: str, timeout: float = 2.5):
+        import urllib.error as _urlerror
+        import urllib.request as _urllib
+        try:
+            with _urllib.urlopen(
+                f"http://127.0.0.1:8090{path}",
+                timeout=timeout,
+            ) as resp:
+                body = resp.read()
+                content_type = resp.headers.get(
+                    "Content-Type", "application/json")
+                return Response(
+                    body,
+                    status=resp.status,
+                    mimetype=content_type.split(";", 1)[0],
+                )
+        except _urlerror.HTTPError as e:
+            body = e.read() or b'{"error":"paper trader error"}'
+            return Response(
+                body,
+                status=e.code,
+                mimetype="application/json",
+            )
+        except Exception as e:
+            return jsonify({"error": f"paper trader unreachable: {e}"}), 503
+
+    @app.get("/trader/api/portfolio")
+    def proxy_trader_portfolio():
+        return _proxy_paper_trader("/api/portfolio")
+
+    @app.get("/trader/api/source-edge")
+    def proxy_trader_source_edge():
+        return _proxy_paper_trader("/api/source-edge", timeout=4.0)
+
     @app.get("/api/stats")
     def api_stats():
         if not _check_api_key():
@@ -5663,37 +5732,46 @@ def create_app(store=None) -> Flask:
         store = _store_handle()
         if store is None:
             return jsonify({"error": "store unavailable"}), 503
+
+        def _build_stats():
+            # ``store.stats()`` is the core gauge (total/urgent/backlog). If it
+            # exhausts the @_retry_on_lock budget under a sustained writer-
+            # contention / shared-conn cursor-collision storm it genuinely means
+            # the store is unreachable this instant → 500.
+            s = dict(store.stats())
+            # ``last_hour``/``last_24h`` are SUPPLEMENTARY window tiles. Each is its
+            # own @_retry_on_lock call; before this split, a transient retry-
+            # exhaustion on EITHER of these blanked the entire /api/stats payload
+            # with a 500 — the whole dashboard went dark over a slow supplementary
+            # count while the core gauge was perfectly healthy. Degrade them
+            # independently: keep the keys present (so a client doing ``s.last_hour``
+            # gets null, never an undefined-property crash) and flag ``degraded``.
+            degraded = False
+            for key, hours in (("last_hour", 1), ("last_24h", 24)):
+                try:
+                    s[key] = store.stats_since(hours)
+                except Exception:
+                    s[key] = None
+                    degraded = True
+            if degraded:
+                s["degraded"] = True
+            try:
+                trends = _read_json(BASE_DIR / "data" / "sentiment_trends.json")
+                if trends:
+                    s["trends_as_of"] = trends.get("as_of")
+                    s["trends_tracked"] = len(trends.get("tickers", {}))
+            except Exception:
+                pass
+            return s
+
         # ``store.stats()`` is the core gauge (total/urgent/backlog). If it
         # exhausts the @_retry_on_lock budget under a sustained writer-
         # contention / shared-conn cursor-collision storm it genuinely means
         # the store is unreachable this instant → 500.
         try:
-            s = dict(store.stats())
+            s = _ttl_cache("stats", 5.0, _build_stats)
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-        # ``last_hour``/``last_24h`` are SUPPLEMENTARY window tiles. Each is its
-        # own @_retry_on_lock call; before this split, a transient retry-
-        # exhaustion on EITHER of these blanked the entire /api/stats payload
-        # with a 500 — the whole dashboard went dark over a slow supplementary
-        # count while the core gauge was perfectly healthy. Degrade them
-        # independently: keep the keys present (so a client doing ``s.last_hour``
-        # gets null, never an undefined-property crash) and flag ``degraded``.
-        degraded = False
-        for key, hours in (("last_hour", 1), ("last_24h", 24)):
-            try:
-                s[key] = store.stats_since(hours)
-            except Exception:
-                s[key] = None
-                degraded = True
-        if degraded:
-            s["degraded"] = True
-        try:
-            trends = _read_json(BASE_DIR / "data" / "sentiment_trends.json")
-            if trends:
-                s["trends_as_of"] = trends.get("as_of")
-                s["trends_tracked"] = len(trends.get("tickers", {}))
-        except Exception:
-            pass
         return jsonify(s)
 
     @app.get("/api/trends")
@@ -5709,7 +5787,11 @@ def create_app(store=None) -> Flask:
     def api_briefings():
         if not _check_api_key():
             return jsonify({"error": "unauthorized"}), 401
-        return jsonify(_briefings_from_log(10))
+        return jsonify(_ttl_cache(
+            "briefings:10",
+            30.0,
+            lambda: _briefings_from_log(10),
+        ))
 
     @app.get("/api/earnings")
     def api_earnings():
@@ -5767,7 +5849,7 @@ def create_app(store=None) -> Flask:
             snap["age_hours"] = None
         return jsonify(snap)
 
-    def _ro_conn():
+    def _ro_conn(timeout: float = 5.0, use_store: bool = True):
         """Open a fresh read-only sqlite connection to the daemon's articles.db.
 
         Mirrors the resolution logic used in /api/chat: prefer the path the
@@ -5775,7 +5857,7 @@ def create_app(store=None) -> Flask:
         paths. Returns ``None`` if no DB can be located.
         """
         db_path: Path | None = None
-        store = _store_handle()
+        store = _store_handle() if use_store else None
         if store is not None:
             try:
                 for _id, name, file in store.conn.execute("PRAGMA database_list").fetchall():
@@ -5797,7 +5879,7 @@ def create_app(store=None) -> Flask:
             return None
         try:
             uri = f"file:{db_path}?mode=ro"
-            return sqlite3.connect(uri, uri=True, timeout=5.0)
+            return sqlite3.connect(uri, uri=True, timeout=timeout)
         except sqlite3.Error:
             return None
 
@@ -6697,36 +6779,27 @@ def create_app(store=None) -> Flask:
         """
         if not _check_api_key():
             return jsonify({"error": "unauthorized"}), 401
-        conn = _ro_conn()
+        conn = _ro_conn(timeout=0.25, use_store=False)
         if conn is None:
             return jsonify({"sources": [], "error": "articles.db not reachable"})
         try:
-            rows_1h = conn.execute(
-                f"SELECT source, COUNT(*) FROM articles "
-                f"WHERE first_seen >= datetime('now','-1 hour') AND {_LIVE_ONLY_SQL} "
-                f"GROUP BY source"
-            ).fetchall()
-            rows_24h = conn.execute(
-                f"SELECT source, COUNT(*) FROM articles "
+            rows = conn.execute(
+                "SELECT source, "
+                "SUM(CASE WHEN first_seen >= datetime('now','-1 hour') THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN first_seen >= datetime('now','-2 hours') THEN 1 ELSE 0 END), "
+                "COUNT(*) "
+                "FROM articles "
                 f"WHERE first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL} "
-                f"GROUP BY source"
-            ).fetchall()
-            rows_2h = conn.execute(
-                f"SELECT source, COUNT(*) FROM articles "
-                f"WHERE first_seen >= datetime('now','-2 hours') AND {_LIVE_ONLY_SQL} "
-                f"GROUP BY source"
+                "GROUP BY source"
             ).fetchall()
         finally:
             conn.close()
-        c1h = {r[0] or "?": int(r[1] or 0) for r in rows_1h}
-        c2h = {r[0] or "?": int(r[1] or 0) for r in rows_2h}
-        c24 = {r[0] or "?": int(r[1] or 0) for r in rows_24h}
-        names = set(c1h) | set(c2h) | set(c24)
         out = []
-        for n in names:
-            h1 = c1h.get(n, 0)
-            h2 = c2h.get(n, 0)
-            h24 = c24.get(n, 0)
+        for n, h1_raw, h2_raw, h24_raw in rows:
+            h1 = int(h1_raw or 0)
+            h2 = int(h2_raw or 0)
+            h24 = int(h24_raw or 0)
+            name = n or "?"
             if h2 == 0:
                 status = "stale"
             elif h1 >= 10:
@@ -6736,7 +6809,7 @@ def create_app(store=None) -> Flask:
             else:
                 status = "idle"
             out.append({
-                "source": n,
+                "source": name,
                 "articles_1h": h1,
                 "articles_24h": h24,
                 "status": status,
@@ -6755,6 +6828,9 @@ def create_app(store=None) -> Flask:
         """
         if not _check_api_key():
             return jsonify({"error": "unauthorized"}), 401
+        cached = _ttl_get("ml-status")
+        if cached is not None:
+            return jsonify(cached)
         ckpt = BASE_DIR / "data" / "ml" / "model_gpu.pt"
         last_trained = None
         if ckpt.exists():
@@ -6772,20 +6848,23 @@ def create_app(store=None) -> Flask:
             try:
                 # ArticleNet trains on rows with any ML/LLM-assigned score;
                 # `kw_score` is the pure-heuristic fallback we exclude here.
-                training_set_size = int(conn.execute(
-                    "SELECT COUNT(*) FROM articles WHERE ai_score > 0"
-                ).fetchone()[0] or 0)
                 # Articles scored in the past 24h are a reasonable proxy for
                 # inference throughput; there is no `score_source` column in
                 # this schema (see articles table definition).
-                predictions_24h = int(conn.execute(
-                    "SELECT COUNT(*) FROM articles WHERE ai_score > 0 "
-                    f"AND first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL}"
-                ).fetchone()[0] or 0)
-                urgent_24h = int(conn.execute(
-                    "SELECT COUNT(*) FROM articles WHERE urgency >= 1 "
-                    f"AND first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL}"
-                ).fetchone()[0] or 0)
+                row = conn.execute(
+                    "SELECT "
+                    "SUM(CASE WHEN ai_score > 0 THEN 1 ELSE 0 END), "
+                    "SUM(CASE WHEN ai_score > 0 "
+                    f"AND first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL} "
+                    "THEN 1 ELSE 0 END), "
+                    "SUM(CASE WHEN urgency >= 1 "
+                    f"AND first_seen >= datetime('now','-24 hours') AND {_LIVE_ONLY_SQL} "
+                    "THEN 1 ELSE 0 END) "
+                    "FROM articles"
+                ).fetchone()
+                training_set_size = int(row[0] or 0)
+                predictions_24h = int(row[1] or 0)
+                urgent_24h = int(row[2] or 0)
             except Exception:
                 pass
             finally:
@@ -6816,14 +6895,15 @@ def create_app(store=None) -> Flask:
                                 pass
         except Exception:
             pass
-        return jsonify({
+        payload = {
             "last_trained": last_trained,
             "training_set_size": training_set_size,
             "predictions_24h": predictions_24h,
             "urgent_24h": urgent_24h,
             "val_loss": val_loss,
             "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        })
+        }
+        return jsonify(_ttl_set("ml-status", 60.0, payload))
 
     @app.get("/api/label-quality")
     def api_label_quality():
@@ -7084,6 +7164,9 @@ def create_app(store=None) -> Flask:
         """Hourly article ingest counts for the last 24 hours, live rows only."""
         if not _check_api_key():
             return jsonify({"error": "unauthorized"}), 401
+        cached = _ttl_get("volume-history")
+        if cached is not None:
+            return jsonify(cached)
         conn = _ro_conn()
         if conn is None:
             return jsonify({"hours": [], "error": "articles.db not reachable"})
@@ -7096,10 +7179,11 @@ def create_app(store=None) -> Flask:
             ).fetchall()
         finally:
             conn.close()
-        return jsonify({
+        payload = {
             "hours": [{"hour": r[0], "count": int(r[1] or 0)} for r in rows],
             "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        })
+        }
+        return jsonify(_ttl_set("volume-history", 60.0, payload))
 
     @app.get("/api/invariants")
     def api_invariants():
@@ -7111,29 +7195,32 @@ def create_app(store=None) -> Flask:
         """
         if not _check_api_key():
             return jsonify({"error": "unauthorized"}), 401
+        cached = _ttl_get("invariants")
+        if cached is not None:
+            return jsonify(cached)
         conn = _ro_conn()
         if conn is None:
             return jsonify({"backtest_isolation": "unknown", "error": "articles.db not reachable"})
         try:
-            breach = int(conn.execute(
-                "SELECT COUNT(*) FROM articles "
-                "WHERE (url LIKE 'backtest://%' OR source LIKE 'backtest_%' "
-                "      OR source LIKE 'opus_annotation%') "
-                "AND urgency >= 2"
-            ).fetchone()[0] or 0)
-            n_backtest_total = int(conn.execute(
-                "SELECT COUNT(*) FROM articles "
+            row = conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN urgency >= 2 THEN 1 ELSE 0 END), "
+                "COUNT(*) "
+                "FROM articles "
                 "WHERE url LIKE 'backtest://%' OR source LIKE 'backtest_%' "
                 "      OR source LIKE 'opus_annotation%'"
-            ).fetchone()[0] or 0)
+            ).fetchone()
+            breach = int(row[0] or 0)
+            n_backtest_total = int(row[1] or 0)
         finally:
             conn.close()
-        return jsonify({
+        payload = {
             "backtest_isolation": "breach" if breach > 0 else "active",
             "breach_count": breach,
             "backtest_rows_total": n_backtest_total,
             "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        })
+        }
+        return jsonify(_ttl_set("invariants", 60.0, payload))
 
     @app.get("/api/urgent-label-split")
     def api_urgent_label_split():
@@ -9971,14 +10058,14 @@ def create_app(store=None) -> Flask:
         msgs.append({"role": "user", "content": user_msg})
 
         # Build a single prompt: system block + conversation history + final user turn.
-        # Claude CLI (core.claude_cli) handles auth via its own login — no API key needed.
+        # core.claude_cli handles auth/routing for the configured LLM CLI.
         convo_parts = [system_prompt, "\n\n--- Conversation ---"]
         for m in msgs:
             convo_parts.append(f"{m['role'].upper()}: {m['content']}")
         convo_parts.append("ASSISTANT:")
         prompt = "\n\n".join(convo_parts)
 
-        response_text = _claude_cli_call(prompt, model="claude-opus-4-7", timeout=120) or ""
+        response_text = _claude_cli_call(prompt, timeout=120) or ""
 
         if not response_text:
             return jsonify({"error": "claude CLI returned no response"}), 502
@@ -10010,7 +10097,6 @@ _DASHBOARD_HTML = """<!doctype html>
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Outfit:wght@400;500;600;700&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap');
     :root {
       --bg: #0c0d0f;
       --bg-panel: #111316;
@@ -10035,9 +10121,9 @@ _DASHBOARD_HTML = """<!doctype html>
       --yellow: #fbbf24;
       --yellow-dim: rgba(251,191,36,0.12);
       --pink: #f472b6;
-      --font-sans: 'Outfit', system-ui, sans-serif;
-      --font-mono: 'DM Mono', 'JetBrains Mono', monospace;
-      --font-display: 'Syne', system-ui, sans-serif;
+      --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-mono: "SFMono-Regular", "Cascadia Mono", "JetBrains Mono", monospace;
+      --font-display: var(--font-sans);
       --radius: 8px;
       --radius-sm: 5px;
     }
@@ -10890,7 +10976,6 @@ _CHAT_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Market Intel — Digital Intern</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Outfit:wght@400;500;600;700&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap');
     :root {
       --bg: #0c0d0f;
       --bg-panel: #111316;
@@ -10915,9 +11000,9 @@ _CHAT_HTML = """<!doctype html>
       --yellow: #fbbf24;
       --yellow-dim: rgba(251,191,36,0.12);
       --pink: #f472b6;
-      --font-sans: 'Outfit', system-ui, sans-serif;
-      --font-mono: 'DM Mono', 'JetBrains Mono', monospace;
-      --font-display: 'Syne', system-ui, sans-serif;
+      --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-mono: "SFMono-Regular", "Cascadia Mono", "JetBrains Mono", monospace;
+      --font-display: var(--font-sans);
       --radius: 8px;
       --radius-sm: 5px;
     }

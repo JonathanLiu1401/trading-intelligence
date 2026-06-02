@@ -1,8 +1,10 @@
-"""Opus 4.7 trading strategy — packages context, asks Claude for a JSON decision,
-executes it through paper trade plumbing. No hard risk limits — Opus has full autonomy."""
+"""Trading strategy — packages context, asks an LLM for a JSON decision,
+executes it through paper trade plumbing. No hard risk limits; the model has
+full autonomy."""
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -29,8 +31,12 @@ except Exception:  # pragma: no cover - stdlib-only module, import can't fail
     def host_saturated(*_a, **_k):
         return (False, "host_guard unavailable")
 
-MODEL = "claude-opus-4-8"
-FALLBACK_MODEL = "claude-sonnet-4-6"
+MODEL = "gpt-5.5"
+FALLBACK_MODEL = "gpt-5.5"
+CODEX_AUTH_FALLBACK_MODEL = os.environ.get(
+    "PAPER_TRADER_CODEX_AUTH_FALLBACK_MODEL",
+    "claude-sonnet-4-6",
+)
 FALLBACK_TIMEOUT_S = None   # no timeout — wait as long as Opus needs
 DECISION_TIMEOUT_S = None   # no timeout — wait as long as Opus needs
 # Retry uses no timeout; Opus is given unlimited time to respond.
@@ -38,6 +44,14 @@ RETRY_TIMEOUT_S = None   # no timeout — wait as long as Opus needs
 # Cap the raw-response excerpt we write back into decisions.reasoning. Long
 # enough to diagnose JSON / prose / truncation, short enough to keep the DB lean.
 RAW_CAPTURE_CHARS = 1000
+
+# Margin/leverage model for live paper stock BUYs. The book may spend current
+# cash plus 50% of net worth, with regular-stock leverage requested per trade
+# as an exposure multiplier from 1x to 20x. Positions store economic exposure
+# as effective shares so the existing mark-to-market schema keeps working.
+STOCK_MARGIN_NET_WORTH_PCT = 0.50
+STOCK_BUY_MIN_LEVERAGE = 1.0
+STOCK_BUY_MAX_LEVERAGE = 20.0
 
 # ML advisor gate — when the backtest ML model's median alpha consistently
 # beats SPY, its (quant+news) recommendation is injected into the Opus prompt
@@ -48,7 +62,20 @@ ML_QUALIFY_TTL_S = 3600.0      # recheck every hour
 
 _ml_qualify_cache: tuple[bool, str, float] | None = None
 
-# Tracks the most recent claude subprocess so a new _claude_call can kill a
+
+def _cli_path(name: str) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in (
+        f"/home/zeph/.local/bin/{name}",
+        f"/home/zeph/.nvm/versions/node/v24.15.0/bin/{name}",
+    ):
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+# Tracks the most recent LLM subprocess so a new _claude_call can kill a
 # lingering one from a prior cycle. Overlapping calls compete for the same API
 # quota and cause *both* to time out. Process-local — does not guard against a
 # second orphaned runner process, but covers stacked calls within one process
@@ -271,6 +298,7 @@ Respond with a SINGLE JSON object — no prose, no markdown fences. Schema:
   "action": "BUY" | "SELL" | "BUY_CALL" | "BUY_PUT" | "SELL_CALL" | "SELL_PUT" | "HOLD" | "REBALANCE",
   "ticker": "NVDA",
   "qty": 0.5,
+  "leverage": 1,               // optional for BUY stock only, 1-20x; effective exposure = qty * leverage
   "strike": 900,             // only for option actions
   "expiry": "2026-05-30",    // only for option actions, YYYY-MM-DD
   "confidence": 0.85,
@@ -278,6 +306,10 @@ Respond with a SINGLE JSON object — no prose, no markdown fences. Schema:
 }
 
 Return JSON with your decision. No limits on qty, strike, or cash used.
+For BUY on regular stocks, you may set "leverage" from 1x to 20x. The paper
+trader applies the leverage to stock exposure only: qty=2, leverage=5 buys
+10 effective shares. Buying power includes cash plus 50% margin on current
+portfolio net worth.
 For SELL/SELL_CALL/SELL_PUT, ticker must match an open position (and strike/expiry for options).
 
 TECHNICAL SIGNAL INTERPRETATION (use alongside news, not in isolation):
@@ -715,11 +747,24 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
     # Reset per-call so a success after a failure cannot leak the stale code
     # into the next cycle's diagnostic reason text.
     _last_claude_fail = None
-    if not shutil.which("claude"):
-        print("[strategy] claude CLI not found")
+    use_codex = model.startswith("gpt-")
+    cli = "codex" if use_codex else "claude"
+    cli_bin = _cli_path(cli)
+    if not cli_bin:
+        if use_codex and CODEX_AUTH_FALLBACK_MODEL and CODEX_AUTH_FALLBACK_MODEL != model:
+            print(
+                "[strategy] codex CLI not found; retrying decision with "
+                f"{CODEX_AUTH_FALLBACK_MODEL}"
+            )
+            return _claude_call(
+                prompt,
+                timeout_s=timeout_s,
+                model=CODEX_AUTH_FALLBACK_MODEL,
+            )
+        print(f"[strategy] {cli} CLI not found")
         _last_claude_fail = "cli_missing"
         return None
-    # A claude call still alive from a prior cycle competes for the same API
+    # An LLM call still alive from a prior cycle competes for the same API
     # quota as this one and makes *both* time out. Kill the stale one first.
     if _active_claude_proc is not None and _active_claude_proc.poll() is None:
         print("[strategy] killing stale claude subprocess before new call")
@@ -732,12 +777,30 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
     _active_claude_started_at = None
     try:
         proc = subprocess.Popen(
-            ["claude", "--model", model, "--print",
-             "--permission-mode", "bypassPermissions"],
+            ([
+                cli_bin, "exec",
+                "--model", model,
+                "-c", 'model_reasoning_effort="none"',
+                "--sandbox", "read-only",
+                "--cd", str(Path(__file__).resolve().parents[1]),
+                "--ephemeral",
+                "--color", "never",
+                "-",
+            ] if use_codex else [
+                cli_bin, "--model", model, "--print",
+                "--permission-mode", "bypassPermissions",
+            ]),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=(
+                {**os.environ, "CODEX_HOME": os.environ.get(
+                    "PAPER_TRADER_CODEX_HOME",
+                    str(Path.home() / ".codex"),
+                )}
+                if use_codex else None
+            ),
         )
         _active_claude_proc = proc
         _active_claude_started_at = time.monotonic()
@@ -749,14 +812,14 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
                 proc.wait(timeout=5)
             except Exception:
                 pass
-            print(f"[strategy] claude timeout after {timeout_s}s")
+            print(f"[strategy] {cli} timeout after {timeout_s}s")
             _last_claude_fail = "timeout"
             return None
         finally:
             _active_claude_proc = None
             _active_claude_started_at = None
         if proc.returncode != 0:
-            # The claude CLI frequently exits non-zero with an EMPTY stderr and
+            # The model CLI may exit non-zero with an EMPTY stderr and
             # the real error written to stdout, which produced useless blank
             # "[strategy] claude err:" lines in runner.log (the operator could
             # not tell why decisions were being skipped). Log the returncode
@@ -767,13 +830,34 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
             # Quota / usage-limit rejection is a distinct, non-self-recovering
             # failure: flag it so decide() can surface it and runner._cycle
             # can alarm the operator once (the bot is silently frozen).
-            if _is_quota_exhausted(f"{stdout or ''}\n{stderr or ''}"):
+            combined = f"{stdout or ''}\n{stderr or ''}"
+            low_combined = combined.lower()
+            if (
+                use_codex
+                and CODEX_AUTH_FALLBACK_MODEL
+                and CODEX_AUTH_FALLBACK_MODEL != model
+                and (
+                    "401 unauthorized" in low_combined
+                    or "missing bearer" in low_combined
+                    or "authentication" in low_combined
+                )
+            ):
+                print(
+                    "[strategy] codex auth failed; retrying decision with "
+                    f"{CODEX_AUTH_FALLBACK_MODEL}"
+                )
+                return _claude_call(
+                    prompt,
+                    timeout_s=timeout_s,
+                    model=CODEX_AUTH_FALLBACK_MODEL,
+                )
+            if _is_quota_exhausted(combined):
                 _quota_exhausted = True
-                print(f"[strategy] claude QUOTA EXHAUSTED (rc={proc.returncode}): {err}")
+                print(f"[strategy] {cli} QUOTA EXHAUSTED (rc={proc.returncode}): {err}")
                 # Don't tag _last_claude_fail — decide() takes a dedicated
                 # branch on _quota_exhausted with its own reason text.
             else:
-                print(f"[strategy] claude err (rc={proc.returncode}): {err}")
+                print(f"[strategy] {cli} err (rc={proc.returncode}): {err}")
                 _last_claude_fail = "nonzero_rc"
             return None
         text = (stdout or "").strip()
@@ -784,7 +868,7 @@ def _claude_call(prompt: str, timeout_s: int = DECISION_TIMEOUT_S,
             return None
         return text
     except Exception as e:
-        print(f"[strategy] claude exception: {e}")
+        print(f"[strategy] {cli} exception: {e}")
         _active_claude_proc = None
         _active_claude_started_at = None
         _last_claude_fail = "exception"
@@ -1039,6 +1123,8 @@ def _portfolio_snapshot(store: Store) -> dict:
 
     pf = store.get_portfolio()
     total = pf["cash"] + open_value
+    margin_available = max(0.0, total) * STOCK_MARGIN_NET_WORTH_PCT
+    stock_buying_power = pf["cash"] + margin_available
     store.update_portfolio(pf["cash"], total, [
         {k: v for k, v in pos.items() if k != "opened_at"} for pos in enriched
     ])
@@ -1046,6 +1132,8 @@ def _portfolio_snapshot(store: Store) -> dict:
         "cash": pf["cash"],
         "total_value": total,
         "open_value": open_value,
+        "margin_available": margin_available,
+        "stock_buying_power": stock_buying_power,
         "positions": enriched,
     }
 
@@ -1065,10 +1153,14 @@ def portfolio_snapshot_readonly(store: Store) -> dict:
     positions = store.open_positions()
     enriched, open_value, _marks = _mark_to_market(positions)
     pf = store.get_portfolio()
+    total = pf["cash"] + open_value
+    margin_available = max(0.0, total) * STOCK_MARGIN_NET_WORTH_PCT
     return {
         "cash": pf["cash"],
-        "total_value": pf["cash"] + open_value,
+        "total_value": total,
         "open_value": open_value,
+        "margin_available": margin_available,
+        "stock_buying_power": pf["cash"] + margin_available,
         "positions": enriched,
     }
 
@@ -1300,6 +1392,8 @@ MARKET_OPEN: {market_open}
 
 PORTFOLIO:
   cash: ${snapshot['cash']:.2f}
+  margin available (50% net worth): ${snapshot.get('margin_available', 0.0):.2f}
+  stock buying power: ${snapshot.get('stock_buying_power', snapshot['cash']):.2f}
   open positions value: ${snapshot['open_value']:.2f}
   total value: ${snapshot['total_value']:.2f}
   positions:
@@ -1469,6 +1563,28 @@ def _enforce_risk_pre_trade(decision: dict, snapshot: dict) -> tuple[bool, str]:
     return True, ""
 
 
+def _stock_buy_leverage(decision: dict) -> float:
+    """Requested regular-stock leverage, clamped to the supported 1x-20x range."""
+    raw = decision.get("leverage", 1)
+    try:
+        lev = float(raw)
+    except (TypeError, ValueError):
+        return STOCK_BUY_MIN_LEVERAGE
+    return max(STOCK_BUY_MIN_LEVERAGE, min(STOCK_BUY_MAX_LEVERAGE, lev))
+
+
+def _stock_buying_power(snapshot: dict) -> float:
+    """Cash plus 50% margin on current net worth for regular-stock BUYs."""
+    if "stock_buying_power" in snapshot:
+        try:
+            return float(snapshot["stock_buying_power"])
+        except (TypeError, ValueError):
+            pass
+    cash = float(snapshot.get("cash") or 0.0)
+    total = float(snapshot.get("total_value") or 0.0)
+    return cash + max(0.0, total) * STOCK_MARGIN_NET_WORTH_PCT
+
+
 def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
     """Apply the decision against the paper book. Returns (status, detail)."""
     action = decision.get("action", "HOLD")
@@ -1496,12 +1612,26 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
         price = market.get_price(ticker)
         if not price:
             return "BLOCKED", f"no price for {ticker}"
-        notional = price * qty
         if action == "BUY":
-            if snapshot["cash"] - notional < 0:
-                return "BLOCKED", f"insufficient cash (have ${snapshot['cash']:.2f}, need ${notional:.2f})"
-            store.record_trade(ticker, "BUY", qty, price, reason)
-            store.upsert_position(ticker, "stock", qty, price)
+            leverage = _stock_buy_leverage(decision)
+            effective_qty = round(qty * leverage, 8)
+            notional = price * effective_qty
+            buying_power = _stock_buying_power(snapshot)
+            if buying_power - notional < -1e-6:
+                return (
+                    "BLOCKED",
+                    f"insufficient cash/buying power (cash ${snapshot['cash']:.2f}, "
+                    f"margin ${max(0.0, float(snapshot.get('total_value') or 0.0) * STOCK_MARGIN_NET_WORTH_PCT):.2f}, "
+                    f"available ${buying_power:.2f}, need ${notional:.2f})",
+                )
+            trade_reason = reason
+            if leverage != STOCK_BUY_MIN_LEVERAGE:
+                trade_reason = (
+                    f"{reason} [leverage={leverage:g}x; requested_qty={qty:g}; "
+                    f"effective_qty={effective_qty:g}]"
+                ).strip()
+            store.record_trade(ticker, "BUY", effective_qty, price, trade_reason)
+            store.upsert_position(ticker, "stock", effective_qty, price)
             # Stamp hard SL/TP on the just-opened (or blended) lot. Pass
             # qty=0 — metadata-only path — so the size is not touched, only
             # the SL/TP fields. Re-entries blend price into the avg_cost; the
@@ -1528,8 +1658,13 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
             # would desync portfolio.positions_json from the positions table
             # (a dashboard read would see the new cash but the pre-trade list).
             store.update_portfolio(snapshot["cash"] - notional, snapshot["total_value"])
-            return "FILLED", f"BUY {qty} {ticker} @ {price:.2f}"
+            suffix = (
+                f" ({leverage:g}x leverage from requested qty {qty:g})"
+                if leverage != STOCK_BUY_MIN_LEVERAGE else ""
+            )
+            return "FILLED", f"BUY {effective_qty:g} {ticker} @ {price:.2f}{suffix}"
         else:
+            notional = price * qty
             store.record_trade(ticker, "SELL", qty, price, reason)
             store.upsert_position(ticker, "stock", -qty, price)
             store.update_portfolio(snapshot["cash"] + notional, snapshot["total_value"])
@@ -1832,6 +1967,90 @@ def _ml_live_opinion(
     except Exception as e:
         print(f"[strategy] _ml_live_opinion error: {e}")
         return None
+
+
+def _ml_drought_decision(
+    ml_op: dict | None,
+    snap: dict,
+    watch_px: dict,
+    drought_reason: str,
+) -> dict | None:
+    """Convert the qualified ML advisor output into an emergency decision.
+
+    This is used only after the LLM path fails. It keeps the trader from
+    logging another inert NO_DECISION during a known LLM drought, while staying
+    conservative: HOLD stays HOLD, BUY sizing is capped by the ML-reported
+    conviction and available stock buying power, and malformed/no-price output
+    degrades to HOLD instead of guessing.
+    """
+    if not isinstance(ml_op, dict):
+        return None
+    action = (ml_op.get("action") or "HOLD").upper()
+    ticker = (ml_op.get("ticker") or "").upper()
+    base_reason = str(ml_op.get("reasoning") or "ML fallback")
+    reason = (
+        f"{base_reason} [ml-drought-fallback: LLM unavailable; "
+        f"{drought_reason}]"
+    )
+
+    if action != "BUY":
+        return {
+            "action": "HOLD",
+            "ticker": "",
+            "confidence": 0.50,
+            "reasoning": reason,
+        }
+    if not ticker:
+        return {
+            "action": "HOLD",
+            "ticker": "",
+            "confidence": 0.45,
+            "reasoning": reason + " (no ticker from ML advisor)",
+        }
+
+    try:
+        px = float(watch_px.get(ticker) or market.get_price(ticker) or 0.0)
+    except (TypeError, ValueError):
+        px = 0.0
+    if px <= 0:
+        return {
+            "action": "HOLD",
+            "ticker": "",
+            "confidence": 0.45,
+            "reasoning": reason + f" (no live price for {ticker})",
+        }
+
+    conviction = 0.10
+    m = re.search(r"conviction=([0-9]+)%", base_reason)
+    if m:
+        try:
+            conviction = max(0.05, min(0.40, float(m.group(1)) / 100.0))
+        except (TypeError, ValueError):
+            conviction = 0.10
+    buying_power = max(0.0, _stock_buying_power(snap))
+    total = max(0.0, float(snap.get("total_value") or 0.0))
+    # Emergency fallback should act, not overrun the book. Cap by both ML
+    # conviction and a hard 35% of book; still bounded by buying power.
+    notional = min(buying_power, total * min(conviction, 0.35))
+    qty = int(notional // px)
+    if qty <= 0 and buying_power >= px:
+        qty = 1
+    if qty <= 0:
+        return {
+            "action": "HOLD",
+            "ticker": "",
+            "confidence": 0.45,
+            "reasoning": (
+                reason + f" (insufficient buying power for 1 share of {ticker})"
+            ),
+        }
+    return {
+        "action": "BUY",
+        "ticker": ticker,
+        "qty": float(qty),
+        "confidence": round(max(0.50, min(0.80, 0.40 + conviction)), 2),
+        "reasoning": f"{reason}; emergency_qty={qty} px={px:.2f}",
+    }
 
 
 def decide() -> dict:
@@ -2147,6 +2366,7 @@ def decide() -> dict:
 
     # ML advisor: when model consistently beats SPY, include its opinion in prompt
     ml_opinion_block: str | None = None
+    ml_op: dict | None = None
     ml_qualified, ml_qual_reason = _ml_is_qualified()
     if ml_qualified:
         try:
@@ -2307,6 +2527,7 @@ def decide() -> dict:
         # empty_stdout / cli_missing / exception) in the breaker Discord alert
         # instead of degrading to ``""``. Single-cycle state, never sticky.
         "last_claude_fail": _last_claude_fail,
+        "ml_fallback_used": False,
     }
 
     if not decision:
@@ -2335,6 +2556,43 @@ def decide() -> dict:
             # The new analytics sub-buckets read the parenthesised suffix.
             cause = _last_claude_fail or "timeout/empty"
             reason_text = f"claude returned no response ({cause})"
+        if ml_qualified and ml_op:
+            ml_decision = _ml_drought_decision(
+                ml_op, snap, watch_px, reason_text,
+            )
+            if ml_decision:
+                print(
+                    "[strategy] ML drought fallback: "
+                    f"{ml_decision.get('action')} {ml_decision.get('ticker', '')}"
+                )
+                ml_status, ml_detail = _execute(ml_decision, snap, store)
+                summary["decision"] = ml_decision
+                summary["status"] = ml_status
+                summary["detail"] = ml_detail
+                summary["ml_fallback_used"] = True
+                action_label = (
+                    f"{ml_decision.get('action','?')} "
+                    f"{ml_decision.get('ticker','')}"
+                ).strip()
+                store.record_decision(
+                    market_open,
+                    len(merged),
+                    f"{action_label} → {ml_status}",
+                    json.dumps({
+                        "decision": ml_decision,
+                        "auto_exits": auto_exits,
+                        "detail": ml_detail,
+                        "fallback_used": fallback_used,
+                        "ml_fallback_used": True,
+                        "llm_drought_reason": reason_text,
+                    }),
+                    snap["total_value"],
+                    snap["cash"],
+                )
+                final = _portfolio_snapshot(store)
+                store.record_equity_point(final["total_value"], final["cash"], sp500)
+                summary["snapshot"] = final
+                return summary
         store.record_decision(market_open, len(merged), "NO_DECISION",
                               reason_text,
                               snap["total_value"], snap["cash"])

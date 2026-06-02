@@ -1,5 +1,5 @@
 """
-Safe Claude CLI wrapper — pipes prompt via stdin to avoid ARG_MAX limits.
+Safe LLM CLI wrapper — pipes prompt via stdin to avoid ARG_MAX limits.
 
 Usage:
     from core.claude_cli import claude_call
@@ -21,10 +21,13 @@ short block self-heals on the next cycle, a wrong long block would silence
 Claude for weeks if the limit string is ever misread or the limit resets on a
 different cadence.
 """
+import os
 import shutil
 import subprocess
 import time
 from pathlib import Path
+
+DEFAULT_LLM_MODEL = os.environ.get("DIGITAL_INTERN_LLM_MODEL", "gpt-5.5")
 
 # Substrings (matched case-insensitively against the CLI's failure text) that
 # mean "spawning again right now is pointless". Kept to the small set actually
@@ -58,7 +61,7 @@ def reset_quota_breaker() -> None:
 
 def claude_call(
     prompt: str,
-    model: str = "claude-sonnet-4-6",
+    model: str = DEFAULT_LLM_MODEL,
     timeout: int = 120,
 ) -> str | None:
     """
@@ -67,7 +70,9 @@ def claude_call(
     """
     global _quota_blocked_until
 
-    if not shutil.which("claude"):
+    use_codex = model.startswith("gpt-")
+    cli = "codex" if use_codex else "claude"
+    if not shutil.which(cli):
         return None
 
     # Breaker open: a quota error was seen recently. Don't spawn — every caller
@@ -78,13 +83,32 @@ def claude_call(
         return None
 
     try:
+        cmd = ([
+            "codex", "exec",
+            "--model", model,
+            "-c", 'model_reasoning_effort="none"',
+            "--sandbox", "read-only",
+            "--cd", str(Path.cwd()),
+            "--ephemeral",
+            "--color", "never",
+            prompt,
+        ] if use_codex else [
+            "claude", "--model", model, "--print",
+            "--permission-mode", "bypassPermissions",
+        ])
+        env = os.environ.copy()
+        if use_codex:
+            env["CODEX_HOME"] = os.environ.get(
+                "DIGITAL_INTERN_CODEX_HOME",
+                str(Path.home() / ".codex"),
+            )
         result = subprocess.run(
-            ["claude", "--model", model, "--print",
-             "--permission-mode", "bypassPermissions"],
-            input=prompt,
+            cmd,
+            input=None if use_codex else prompt,
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         if result.returncode != 0:
             err = result.stderr.strip()[:300]

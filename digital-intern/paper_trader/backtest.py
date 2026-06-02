@@ -25,6 +25,8 @@ from pathlib import Path
 
 import yfinance as yf
 
+from core.claude_cli import claude_call
+
 from .strategy import (
     MODEL,
     CASH_RESERVE,
@@ -587,25 +589,11 @@ Return JSON ONLY.
 
 
 def _claude_call(prompt: str, retries: int = 1) -> str | None:
-    if not shutil.which("claude"):
-        print("[backtest] claude CLI not found")
-        return None
     for attempt in range(retries + 1):
-        try:
-            r = subprocess.run(
-                ["claude", "--model", MODEL, "--print",
-                 "--permission-mode", "bypassPermissions"],
-                input=prompt, capture_output=True, text=True,
-                timeout=OPUS_TIMEOUT_S,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                return r.stdout.strip()
-            print(f"[backtest] claude attempt {attempt+1} returncode={r.returncode} "
-                  f"err={r.stderr.strip()[:200]!r}")
-        except subprocess.TimeoutExpired:
-            print(f"[backtest] claude timeout attempt {attempt+1}")
-        except Exception as e:
-            print(f"[backtest] claude exception attempt {attempt+1}: {e}")
+        result = claude_call(prompt, model=MODEL, timeout=OPUS_TIMEOUT_S)
+        if result:
+            return result
+        print(f"[backtest] llm attempt {attempt+1} returned no response")
         if attempt < retries:
             time.sleep(2)
     return None

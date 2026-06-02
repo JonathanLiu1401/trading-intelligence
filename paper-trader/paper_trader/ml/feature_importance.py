@@ -87,15 +87,27 @@ FEATURES: list[tuple[str, str, str]] = [
     ("bb_position", "bb_pos", "bb_position"),
     ("news_urgency", "news_urgency", "news_urgency"),
     ("news_article_count", "news_article_count", "news_article_count"),
+    # Enhanced MACD/EMA200 features — permute-importance must cover the
+    # same 14 inputs the live ``_ml_decide`` and ``_compute_decision_outcomes``
+    # plumb (pass #36 OOS parity fix). Omitting them silently understated
+    # the importance of features the deployed model actively learned on
+    # (mean|w|≈0.42 / 0.30 / 0.27 — non-zero by audit).
+    ("ema200_above", "ema200_above", "ema200_above"),
+    ("hist_cross_up", "hist_cross_up", "hist_cross_up"),
+    ("macd_below_zero_cross", "macd_below_zero_cross", "macd_below_zero_cross"),
     ("sector", "ticker", "ticker"),
 ]
 QUANT_FEATURES = frozenset(n for n, _, _ in FEATURES if n != "sector")
 
 
 def _kwargs(r: dict) -> dict:
-    """Build the 11-kwarg ``predict`` call for one record, constructed
+    """Build the 14-kwarg ``predict`` call for one record, constructed
     identically to ``_oos_rank_metrics`` (the ledger's ``oos_ic`` path) so
-    feature-importance baselines read on the same scale as the ledger."""
+    feature-importance baselines read on the same scale as the ledger.
+
+    Forwards the 3 enhanced MACD features (ema200_above / hist_cross_up /
+    macd_below_zero_cross) that the live ``_ml_decide`` and
+    ``_compute_decision_outcomes`` plumb — pass #36 OOS parity fix."""
     from paper_trader.ml.decision_scorer import _to_float
     return dict(
         ml_score=_to_float(r.get("ml_score"), 0.0),
@@ -109,6 +121,9 @@ def _kwargs(r: dict) -> dict:
         bb_pos=r.get("bb_position"),
         news_urgency=r.get("news_urgency"),
         news_article_count=r.get("news_article_count"),
+        ema200_above=r.get("ema200_above"),
+        hist_cross_up=r.get("hist_cross_up"),
+        macd_below_zero_cross=r.get("macd_below_zero_cross"),
     )
 
 

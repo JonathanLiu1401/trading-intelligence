@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# Legacy hourly parallel Opus pass.
+#
+# Disabled 2026-06-01: this script launches four heavyweight Opus agents with
+# huge prompts, which repeatedly starved the live trader and caused NO_DECISION
+# storms. Keep the file as a tombstone so old cron/systemd references exit
+# safely instead of resurrecting the load spike.
+echo "[hourly_review] disabled: use bounded Hermes/Codex review flows instead"
+exit 0
+
 # Hourly parallel Opus 4.7 pass — 4 agents in parallel.
 # Agents 1-3: hybrid agents — debug & fix + feature development + live user validation.
 # Agent 4: feature development, brainstorming, user-perspective testing.
@@ -20,7 +29,7 @@ notify "🔄 Hourly review cycle started ($TS) — 4 Opus 4.7 agents launching i
 # ── Agent 1: paper-trader core ────────────────────────────────────────────────
 (
 cd /home/zeph/trading-intelligence/paper-trader
-claude --model claude-opus-4-7 --permission-mode bypassPermissions --print \
+claude --model claude-opus-4-8 --permission-mode bypassPermissions --print \
 'BEFORE STARTING: Read AGENTS.md if it exists in /home/zeph/trading-intelligence/paper-trader. Read every file listed below in full before touching anything.
 
 You are a HYBRID agent for /home/zeph/trading-intelligence/paper-trader core. You wear three hats with EQUAL weight: (1) a debugger who fixes bugs, (2) a feature developer who ships improvements, (3) a live trader / portfolio manager who actually USES this system every day. Persona: an experienced live trader and portfolio manager who depends on this engine to make real money decisions and is frustrated by anything that is slow, unclear, or wrong.
@@ -104,7 +113,7 @@ A1=$!
 # ── Agent 2: paper-trader ML + backtests ─────────────────────────────────────
 (
 cd /home/zeph/trading-intelligence/paper-trader
-claude --model claude-opus-4-7 --permission-mode bypassPermissions --print \
+claude --model claude-opus-4-8 --permission-mode bypassPermissions --print \
 'BEFORE STARTING: Read AGENTS.md if it exists in /home/zeph/trading-intelligence/paper-trader. Read every file listed below in full before touching anything.
 
 You are a HYBRID agent for /home/zeph/trading-intelligence/paper-trader ML and backtest files. You wear three hats with EQUAL weight: (1) a debugger who fixes bugs, (2) a feature developer who ships improvements, (3) a quantitative researcher who actually USES this ML and backtest stack to evaluate strategies. Persona: a quant researcher who relies on these scores and backtests to decide whether a strategy is worth real capital and is skeptical of anything uncalibrated, leaky, or silently broken.
@@ -176,7 +185,7 @@ A2=$!
 # ── Agent 3: digital-intern full codebase ────────────────────────────────────
 (
 cd /home/zeph/trading-intelligence/digital-intern
-claude --model claude-opus-4-7 --permission-mode bypassPermissions --print \
+claude --model claude-opus-4-8 --permission-mode bypassPermissions --print \
 'BEFORE STARTING: Read AGENTS.md if it exists in /home/zeph/trading-intelligence/digital-intern. Read every file listed below in full before touching anything.
 
 You are a HYBRID agent for /home/zeph/trading-intelligence/digital-intern. You wear three hats with EQUAL weight: (1) a debugger who fixes bugs, (2) a feature developer who ships improvements, (3) a news analyst / intelligence consumer who actually USES this system to stay informed. Persona: a market news analyst who depends on these alerts and briefings to react to breaking events fast and is annoyed by noise, duplicates, missed urgent items, or stale sources.
@@ -266,7 +275,7 @@ A3=$!
 # ── Agent 4: feature development + user-perspective brainstorming ────────────
 (
 cd /home/zeph
-claude --model claude-opus-4-7 --permission-mode bypassPermissions --print \
+claude --model claude-opus-4-8 --permission-mode bypassPermissions --print \
 'BEFORE STARTING: Read AGENTS.md in both /home/zeph/trading-intelligence/paper-trader and /home/zeph/trading-intelligence/digital-intern if they exist. Then read the dashboards, strategy, and ML files to build a complete mental model of the system BEFORE implementing anything.
 
 You are a senior product engineer taking full ownership of this trading stack. Your job is creative feature development and user-perspective testing.

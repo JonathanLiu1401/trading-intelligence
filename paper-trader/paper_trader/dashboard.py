@@ -16987,18 +16987,34 @@ def supervision_api():
             ppid = None
 
         def _systemctl(verb: str) -> str:
-            try:
-                r = subprocess.run(
-                    ["systemctl", "--user", verb, "paper-trader"],
-                    capture_output=True, text=True, timeout=3,
-                )
-                return ((r.stdout or "").strip()
-                        or (r.stderr or "").strip() or "unknown")
-            except Exception:
-                return "unknown"
+            out = []
+            for cmd in (["systemctl", "--user", verb, "paper-trader"],
+                        ["systemctl", verb, "paper-trader"]):
+                try:
+                    r = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=3)
+                    val = ((r.stdout or "").strip()
+                           or (r.stderr or "").strip() or "unknown")
+                except Exception:
+                    val = "unknown"
+                out.append(val)
+                if verb == "is-active" and val == "active":
+                    return val
+                if verb == "is-enabled" and val == "enabled":
+                    return val
+            return out[0] if out else "unknown"
 
         unit_active = _systemctl("is-active")    # active|inactive|failed|unknown
         unit_enabled = _systemctl("is-enabled")  # enabled|disabled|static|unknown
+        unit_scope = None
+        try:
+            cg = Path("/proc/self/cgroup").read_text(errors="ignore")
+            if "/system.slice/paper-trader.service" in cg:
+                unit_scope = "system"
+            elif "/paper-trader.service" in cg:
+                unit_scope = "user"
+        except Exception:
+            unit_scope = None
 
         head, behind = _head_sha_and_behind()
 
@@ -17013,6 +17029,7 @@ def supervision_api():
             pid=pid, ppid=ppid,
             unit_active=unit_active, unit_enabled=unit_enabled,
             boot_sha=_BOOT_SHA, head_sha=head, behind=behind,
+            unit_scope=unit_scope,
         ))
     except Exception as e:
         return jsonify({"error": str(e), "verdict": "UNKNOWN"}), 500

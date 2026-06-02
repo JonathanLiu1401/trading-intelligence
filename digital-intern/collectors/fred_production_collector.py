@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
@@ -48,9 +49,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Mirrors the pattern used by macro_calendar_collector, earnings_calendar, etc.
 DB_PATH = BASE_DIR / "data" / "fred_production_seen.db"
 
-FREDGRAPH_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
+FREDGRAPH_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}&cosd={start}"
 RECENT_N = 2          # observations per series for article generation
-FETCH_TIMEOUT = 45    # seconds — FRED returns full history CSV; allow extra time
+FETCH_TIMEOUT = 20    # seconds — reduced; parallel fetching avoids sequential timeout pile-up
+MAX_WORKERS = 6       # parallel series fetches; FRED is fine with this fan-out
+# Full-history CSV fetches time out or get blocked; request 26 months to cover YoY + buffer.
+_HISTORY_MONTHS = 26
 SOURCE_PREFIX = "fred_production"
 
 _UA = (
@@ -170,7 +174,9 @@ def _fmt(x: float) -> str:
 
 def _fetch_series(series: str, n: int) -> list[tuple[str, float]]:
     """Return the last *n* valid observations as [(date, value), ...] oldest→newest."""
-    url = FREDGRAPH_CSV.format(series=series)
+    from datetime import timedelta
+    start_date = (datetime.now(timezone.utc) - timedelta(days=_HISTORY_MONTHS * 31)).strftime("%Y-%m-%d")
+    url = FREDGRAPH_CSV.format(series=series, start=start_date)
     resp = requests.get(url, timeout=FETCH_TIMEOUT, headers={"User-Agent": _UA})
     resp.raise_for_status()
     rows: list[tuple[str, float]] = []
@@ -247,20 +253,40 @@ def _yoy_pct(rows: list[tuple[str, float]]) -> float | None:
     return (current - year_ago) / abs(year_ago) * 100.0
 
 
+def _fetch_series_safe(series: str, cfg: dict) -> tuple[str, dict, list] | None:
+    """Fetch one series; returns (series, cfg, rows) or None on error."""
+    need_n = YOY_FETCH_N if cfg.get("yoy") else max(RECENT_N, 3)
+    try:
+        rows = _fetch_series(series, need_n)
+        return (series, cfg, rows)
+    except Exception as exc:
+        log.warning("fred_production: fetch failed %s: %s", series, exc)
+        return None
+
+
 def collect_fred_production() -> list[dict]:
-    """Fetch production/inflation series from FRED and return new article dicts."""
+    """Fetch production/inflation series from FRED in parallel and return new article dicts."""
     conn = _ensure_db()
     articles: list[dict] = []
 
-    for series, cfg in SERIES.items():
-        try:
-            # Fetch enough rows for YoY if needed
-            need_n = YOY_FETCH_N if cfg.get("yoy") else max(RECENT_N, 3)
-            rows = _fetch_series(series, need_n)
-        except Exception as exc:
-            log.warning("fred_production: fetch failed %s: %s", series, exc)
-            continue
+    # Fan out all series fetches in parallel to avoid sequential timeout pile-up.
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(_fetch_series_safe, series, cfg): series
+            for series, cfg in SERIES.items()
+        }
+        fetched: dict[str, tuple] = {}
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result is not None:
+                series, cfg, rows = result
+                fetched[series] = (cfg, rows)
 
+    # Process results in original series order for deterministic dedup.
+    for series in SERIES:
+        if series not in fetched:
+            continue
+        cfg, rows = fetched[series]
         if not rows:
             continue
 

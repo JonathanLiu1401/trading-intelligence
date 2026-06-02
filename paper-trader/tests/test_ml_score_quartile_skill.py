@@ -31,7 +31,7 @@ class _PerfectScorer:
 
     def predict(self, ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
                 vol_ratio=None, bb_pos=None,
-                news_urgency=None, news_article_count=None):
+                news_urgency=None, news_article_count=None, **_extra_kwargs):
         # Carry the "future" realized return as a side-channel via the
         # `mom5` field — the test records below pack the realized value
         # into that slot. This isolates the rank-IC math from training.
@@ -44,7 +44,7 @@ class _InverseScorer:
 
     def predict(self, ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
                 vol_ratio=None, bb_pos=None,
-                news_urgency=None, news_article_count=None):
+                news_urgency=None, news_article_count=None, **_extra_kwargs):
         return -float(mom5 or 0.0)
 
 
@@ -56,7 +56,7 @@ class _ConstantScorer:
 
     def predict(self, ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
                 vol_ratio=None, bb_pos=None,
-                news_urgency=None, news_article_count=None):
+                news_urgency=None, news_article_count=None, **_extra_kwargs):
         return 1.0
 
 
@@ -69,7 +69,7 @@ class _TopHeavyScorer:
 
     def predict(self, ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
                 vol_ratio=None, bb_pos=None,
-                news_urgency=None, news_article_count=None):
+                news_urgency=None, news_article_count=None, **_extra_kwargs):
         if (ml_score or 0.0) >= 3.0:   # top quartile of the 0..4 synthetic range
             return float(mom5 or 0.0)
         return 0.0
@@ -95,7 +95,7 @@ class _OnlyBottomBucketScorer:
 
     def predict(self, ml_score, rsi, macd, mom5, mom20, regime_mult, ticker,
                 vol_ratio=None, bb_pos=None,
-                news_urgency=None, news_article_count=None):
+                news_urgency=None, news_article_count=None, **_extra_kwargs):
         if (ml_score or 0.0) <= 1.0:
             return float(mom5 or 0.0)
         # Within-bucket noise: alternate predictions so rank-IC ≈ 0.

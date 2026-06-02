@@ -4,11 +4,13 @@ Urgent alert agent — Bloomberg BN newswire style, immediate Discord post.
 import logging
 import os
 import re
+import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
-from core.claude_cli import claude_call
+from core.claude_cli import DEFAULT_LLM_MODEL, claude_call
 # Reuse the *well-tested* word-boundary source-credibility lookup (pins the
 # "ap matched inside snap" class of bug — tests/test_features.py) rather than
 # duplicating the 40-entry SOURCE_CRED map here, which would silently drift
@@ -23,8 +25,14 @@ try:
 except Exception:
     _log = logging.getLogger("alert_agent")
 
-SONNET_MODEL = "claude-sonnet-4-6"
+SONNET_MODEL = DEFAULT_LLM_MODEL
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
+SAO_DISCORD_USER_ID = os.environ.get("SAO_DISCORD_USER_ID", "702863115276124211")
+SAO_BREAKING_DM_ENABLED = (
+    os.environ.get("SAO_BREAKING_DM_ENABLED", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+OPENCLAW_CLI = os.environ.get("OPENCLAW_CLI", "")
 
 ALERT_PROMPT = """You are a Bloomberg BN terminal newswire alert system. A high-urgency financial event has been detected.
 
@@ -69,6 +77,58 @@ Output ONLY the alert message."""
 
 
 ALERT_BATCH_SIZE = 5
+
+
+def _openclaw_cli_path() -> str | None:
+    if OPENCLAW_CLI:
+        return OPENCLAW_CLI
+    found = shutil.which("openclaw")
+    if found:
+        return found
+    fallback = "/home/zeph/.nvm/versions/node/v24.15.0/bin/openclaw"
+    return fallback if os.path.exists(fallback) else None
+
+
+def _send_sao_breaking_dm(message: str) -> bool:
+    """Best-effort fanout of successful BREAKING alerts to Sao's Discord DM."""
+    if not SAO_BREAKING_DM_ENABLED or not SAO_DISCORD_USER_ID:
+        return False
+    if not (message or "").strip():
+        return False
+    cli = _openclaw_cli_path()
+    if not cli:
+        _log.warning("[alert] Sao DM skipped: openclaw CLI not found")
+        return False
+
+    try:
+        proc = subprocess.run(
+            [
+                cli,
+                "message",
+                "send",
+                "--channel",
+                "discord",
+                "--target",
+                f"user:{SAO_DISCORD_USER_ID}",
+                "--message",
+                message,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        _log.exception("[alert] Sao DM delivery failed")
+        return False
+
+    if proc.returncode == 0:
+        _log.info("[alert] Sao DM sent for BREAKING alert")
+        return True
+
+    err = (proc.stderr or proc.stdout or "").strip()
+    _log.warning("[alert] Sao DM send failed rc=%s %s", proc.returncode, err[:500])
+    return False
 
 
 def _held_book_phrase() -> str:
@@ -986,6 +1046,74 @@ _RT_FUND_MAKES_INVESTMENT = re.compile(
     re.IGNORECASE,
 )
 
+# "<Fund> LLC (Has|Owns|Grows|Trims|Sells N Shares of|Buys N Shares of|...)
+# (Stock )?(Holdings|Shares|Position|Stake) in <Co>" — the 13F holdings-CHANGE
+# sibling family of ``_RT_FUND_MAKES_INVESTMENT``. The existing gate catches the
+# NEW-position template ("Makes/Acquires/Takes ... $X Investment/Position/Stake
+# in"); this catches the much larger volume of QUARTERLY-CHANGE templates that
+# the MarketBeat / AlphaVantage 13F press mill emits for every existing-position
+# delta. Same retrospective non-event as the existing gates: the SEC filing was
+# already public weeks before the press-mill headline was generated.
+#
+# Live evidence (2026-05-28..29, 24h articles.db urgency>=1 scan):
+#   - "Kingsview Wealth Management LLC Has $31.47 Million Stock Holdings in
+#      Oracle Corporation $O" (ml_score=9.0, urgency=1, GoogleNews/MarketBeat)
+#   - "Leeward Financial Partners LLC Grows Stock Holdings in Oracle
+#      Corporation $ORCL" (ml_score=9.82, urgency=2 — FIRED A REAL BREAKING
+#      ALERT, GoogleNews/MarketBeat)
+#   - "Jackson Creek Investment Advisors LLC Sells 3,338 Shares of Lam
+#      Research Corporation $LRCX" (ml_score=9.64, urgency=1,
+#      GoogleNews/MarketBeat)
+# The MarketBeat credibility tier (0.68) sits ABOVE the 0.45
+# ``ALERT_MIN_LONE_SOURCE_CRED`` bar so the source-authority gate doesn't catch
+# them; content type IS the failure, same class as the three sibling 13F-mill
+# gates (``_RT_FUND_MAKES_INVESTMENT`` / ``_RT_HOLDINGS_BY_FUND`` /
+# ``_RT_SHARES_BOUGHT_BY``).
+#
+# Discriminator: leading ``<Fund> LLC`` (up to 6 tokens) + a closed
+# delta-action verb list (distinct from ``_RT_FUND_MAKES_INVESTMENT``'s
+# initial-position verbs) + OPTIONAL dollar-magnitude figure + a stake-noun
+# (Position/Investment/Stake/Shares/Holdings/Stock Holdings) + in/of. The
+# dollar/magnitude middle is OPTIONAL so plain delta phrasings like "Grows
+# Stock Holdings in" / "Trims Position in" / "Buys 1,200 Shares of" all match,
+# while the leading-LLC anchor and the stake-noun + in/of terminator together
+# keep precision: real news doesn't combine all four pieces.
+#
+# Validated against the must-survive corpus (per
+# ``test_alert_and_briefing_gates_agree_on_must_survive_corpus`` plus the
+# ``test_alert_fund_makes_investment`` survivors): no LLC ("Berkshire takes
+# stake in Apple", "Saudi fund makes $5B investment in semis", "Tesla insiders
+# bought 100k shares"), LLC mid-sentence without a verb in the closed list
+# ("Apple Inc reports earnings beat; major LLC holders take note" — "holders"
+# not in verb list), and forward-looking ("Apple unveils $100B buyback
+# program" — no LLC). Mutually orthogonal with ``_RT_FUND_MAKES_INVESTMENT``:
+# the verb sets are disjoint, so a single title is fingerprinted by exactly
+# one of the two siblings.
+#
+# Defense-in-depth: byte-identical twin in
+# ``analysis.claude_analyst._BRIEFING_RT_FUND_STAKE_DELTA`` — same lockstep
+# discipline enforced by ``test_alert_and_briefing_recap_tuples_have_same_length``.
+_RT_FUND_STAKE_DELTA = re.compile(
+    r"\S+(?:\s+\S+){0,5}\s+LLC\s+"
+    r"(?:Has|Have|Hold|Holds|Own|Owns|Grows|Grew|Trims|Trimmed|"
+    r"Boosts|Boosted|Cuts|Cut|Raises|Raised|Lowers|Lowered|"
+    r"Maintains|Increases|Increased|Decreases|Decreased|Reduces|Reduced|"
+    r"Hikes|Hiked|Slashes|Slashed|Sells|Sold|Buys|Bought|Purchases|Purchased|"
+    r"Adds|Added|Removes|Removed|Liquidates|Liquidated|Initiates|Initiated)\s+"
+    r"(?:(?:New\s+)?\$?[\d,.]+(?:\s*[KMB])?\s+(?:Million\s+|Billion\s+)?)?"
+    r"(?:Position|Investment|Stake|Shares?|(?:Stock\s+)?Holdings?)\s+"
+    r"(?:in|of)\b",
+    re.IGNORECASE,
+)
+# Note: ``Disposes/Disposed`` is intentionally NOT in the verb set above —
+# the live press-mill template for it is "LLC Disposed of N Shares in <Co>"
+# (verb + ``of`` + number + Shares), which has a different syntactic shape
+# (the ``of`` precedes the number rather than terminating the phrase). The
+# existing ``_RT_SHARES_BOUGHT_BY`` already handles the trailing-LLC
+# "Shares ... disposed by <fund> LLC" form; the alternative leading-LLC
+# "disposed of" form is currently not observed in the live noise sample, so
+# adding it would be speculative widening rather than evidence-driven.
+
 # "[Wikipedia] <article title>" — the canonical title prefix emitted by
 # ``collectors.wikipedia_collector`` for recent-changes mainspace edits. By
 # definition encyclopedic reference content, NOT breaking news: a Wikipedia
@@ -1531,6 +1659,13 @@ _RECAP_TEMPLATE_PATTERNS = (
     # MarketBeat / AlphaVantage 13F press-mill — leading "<Fund> LLC Makes
     # New $X Investment in <Co>" sibling of holdings_by_fund / shares_bought_by.
     ("fund_makes_investment", _RT_FUND_MAKES_INVESTMENT),
+    # MarketBeat / AlphaVantage 13F press-mill holdings-CHANGE sibling — same
+    # leading-LLC shape as ``fund_makes_investment`` but with the closed set of
+    # delta-action verbs (Grows/Trims/Sells/Buys/Has ...) instead of the
+    # initial-position verbs (Makes/Acquires/Takes). The two are mutually
+    # orthogonal (disjoint verb sets), so a single title is fingerprinted by
+    # exactly one of them. Three live ml_score 9+ urgency=1/2 fires in 24h.
+    ("fund_stake_delta", _RT_FUND_STAKE_DELTA),
     ("wikipedia_ref", _RT_WIKIPEDIA_REF),
     ("earnings_tomorrow_preview", _RT_EARNINGS_TOMORROW),
     ("todays_movers_list", _RT_TODAYS_MOVERS),
@@ -2282,6 +2417,10 @@ def send_urgent_alert(urgent_articles: list, store) -> bool:
         ok = discord_send(message, is_alert=True)
 
         if ok:
+            try:
+                _send_sao_breaking_dm(message)
+            except Exception:
+                _log.exception("[alert] Sao DM fanout failed")
             # Bulk-mark in one transaction; previous code took the write lock
             # N times (5 round-trips for the default batch size). alerted_ids
             # includes the syndicated copies merged into the batch, so they

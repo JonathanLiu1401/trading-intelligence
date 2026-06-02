@@ -121,6 +121,9 @@ def _predict_one(scorer, r: dict) -> float | None:
                 bb_pos=r.get("bb_position"),
                 news_urgency=r.get("news_urgency"),
                 news_article_count=r.get("news_article_count"),
+                ema200_above=r.get("ema200_above"),
+                hist_cross_up=r.get("hist_cross_up"),
+                macd_below_zero_cross=r.get("macd_below_zero_cross"),
             )
             if meta.get("failed"):
                 return None
@@ -136,6 +139,9 @@ def _predict_one(scorer, r: dict) -> float | None:
                 bb_pos=r.get("bb_position"),
                 news_urgency=r.get("news_urgency"),
                 news_article_count=r.get("news_article_count"),
+                ema200_above=r.get("ema200_above"),
+                hist_cross_up=r.get("hist_cross_up"),
+                macd_below_zero_cross=r.get("macd_below_zero_cross"),
             ))
         if not np.isfinite(v):
             return None

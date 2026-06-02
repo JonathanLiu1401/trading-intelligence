@@ -5,6 +5,105 @@ reference; this file is the operational summary plus the invariants you can brea
 
 ---
 
+## 2026-05-31 HYBRID pass (Agent 3 fifth rotation) — YouTube-share-card SEO mill pre-floor
+
+**Persona:** debugger + feature developer + news-analyst consumer.
+
+**Counters:** `bugs_fixed=0`, `features_added=1`, `user_findings=5`.
+
+### Phase 1 — debug & test
+Read AGENTS.md history + 8 target files (daemon.py, storage/article_store.py, watchers/alert_agent.py,
+watchers/urgency_scorer.py, ml/{trainer,model,features}.py, collectors/web_scraper.py,
+analysis/claude_analyst.py). Existing test suite is comprehensive (44 test files passing, all
+load-bearing invariants pinned). No real bug found — set `bugs_fixed=0`.
+
+### Phase 2 — feature: YouTube-share-card SEO mill pre-floor
+
+**File:** `watchers/youtube_mill_filter.py` (new, pure-stdlib, mirrors `non_english_filter.py` shape).
+
+**Wire-in:** one chained gate in `storage/article_store.py::prefloor_pseudo_articles` after
+the four existing siblings (quote_widget, recap_template, stocktwits_chatter, non_english).
+
+**Discriminator** — parenthesised opaque alphanumeric token at end-of-title:
+- length 8-15 chars (lookahead-anchored alnum-only run);
+- mixes lowercase + uppercase + digit (three additional lookaheads);
+- followed by `\s*-\s*\S` (" - Publisher") or end-of-title.
+
+**Live evidence** (`articles.db` 2026-05-30 pull, last 30d, urgency≥1 scan):
+
+```
+6 reached urgency=2 (alerted):
+ 2026-05-31 05:15Z  ml=9.7  "S&P 500 - Quadruple Top Airdrie Fc (8KsWofaZjy) - Mshale"   [GN: SP500]
+ 2026-05-28 15:16Z  ml=9.8  "NVIDIA Stock Price Analysis ... Mortal Kombat (Tjm0z6tJEB) - Mshale"
+ 2026-05-28 02:06Z  ml=9.6  "CNBC Today On NVIDIA Stock ... Craig Berube (Jhb5fvrGZ8) - Mshale"
+ 2026-05-27 10:20Z  ml=9.2  "Nvidia Stock (NVDA) Earnings Call ... Max Angioni (GtRnFn9fD5) - Mshale"
+ 2026-05-27 07:51Z  ml=8.9  "Nvidia Rises, Elf Beauty Climbs ... (fF7scCMtmL) - Mshale"
+ 2026-05-24 06:10Z  ml=0.0  "Other AI Stocks Impacted ... Steve Irwin (6xGXSeyKSt) - fernandovasconcelos.com"
+```
+
+Corpus distribution: 293 matches, 146 Mshale + 144 Fathom Journal + 3 other YouTube mills.
+
+Publisher tiers sit at DEFAULT_SOURCE_CRED (0.55) — ABOVE the 0.45
+`ALERT_MIN_LONE_SOURCE_CRED` bar, so the source-authority gate does not catch them; content
+type IS the failure, same defense-in-depth class as the four existing pre-floor siblings.
+
+**Tests** — `tests/test_youtube_mill_filter.py` (44 new, all pass):
+- every live-noise sample is pinned-asserted to match
+- curated must-survive corpus (23 real headlines with parenthesised tickers/exchanges/quarters/
+  product names) byte-checked clean
+- token length floor (8) + ceiling (15) edge cases
+- character-class triple-AND verified (missing lowercase/uppercase/digit ⇒ no match)
+- non-alnum-inside-parens (`:` `.` ` `) breaks the match
+- end-of-title / publisher-tail anchor verified
+- end-to-end `prefloor_pseudo_articles` integration: insert YouTube-mill row → assert
+  `ai_score=0.0` / `ml_score=0.01` / `urgency=0` / `score_source='ml'` post-prefloor; real-news
+  row is byte-untouched.
+
+All four load-bearing invariants preserved: pure read-side regex, no DB write in the filter;
+the caller writes via `update_ml_scores_batch` (the existing `score_source='ml'` path); backtest
+rows already filtered upstream by `_LIVE_ONLY_CLAUSE`; ai_score=0 invariant preserved (only
+ml_score is touched).
+
+### Phase 3 — live news-analyst validation
+
+Live system inspected via `articles.db` and `logs/daemon.log` (2026-05-31 05:30Z snapshot):
+
+1. **Briefing pipeline HEALTHY** — last 5 briefings produced ~5h apart, 50 articles each,
+   2000-3200 chars text. Latest briefing (id=64, 05:22Z) carries a real fresh catalyst:
+   "MU rips +5.14% on UBS price-target upgrade — +19% call [fresh]".
+
+2. **YouTube-mill noise was actively firing as of this pass** — the "S&P 500 - Quadruple Top
+   Airdrie Fc (8KsWofaZjy) - Mshale" alert at 05:15Z is the *canonical evidence* row for the
+   gate landed in this pass. The Phase 2 commit suppresses future occurrences at pre-floor on
+   the next daemon restart.
+
+3. **Lock-contention storm in last 12h** — `mark_alerted_batch` exhausted its 5-retry
+   budget TWICE (05:05Z, 05:11Z) and the two `[alert] Error sending urgent alert` rows
+   immediately followed. Two BREAKING alerts may have been silently dropped from Discord push.
+   `reap_stale_urgent` also exhausted retries 4× (23:09, 23:16, 23:53, 01:37Z). Known systemic
+   load issue per memory; not addressed in this pass.
+
+4. **GoogleNews `GN:` topic feeds went dark 20:55Z → 04:55Z** (~8h). Per-topic subscriptions
+   (GN: Nvidia, GN: SP500, GN: Nasdaq, GN: earnings, GN: semiconductor, GN: stock market) all
+   silent in this window. Worker itself stayed alive (`+1 new articles` at 05:35Z, 05:38Z);
+   the gap is the per-topic round-robin slowing under upstream rate-limit pressure. Not yet a
+   `source_freshness` DEAD-flag because the per-topic subscriptions are not individually
+   tracked in `WORKER_POLL_INTERVAL_SECS`.
+
+5. **Recap-template noise miss**: `AlphaVantage/Seeking Alpha` "What To Do After Dell's
+   Breakout Boosted Hewlett-Packard Enterprise Stock (NYSE:HPE)" fired urgency=2 at 14:25Z
+   (ml=9.8). Post-event valuation question, retrospective by construction. The existing
+   `_RT_IS_BUY_AFTER` requires `^Is X a Buy/Sell/Hold` so this "What To Do After ..." sibling
+   was not caught. Candidate fingerprint for a future pass.
+
+### Files changed in this pass
+- `watchers/youtube_mill_filter.py` (NEW, 102 lines)
+- `tests/test_youtube_mill_filter.py` (NEW, 260 lines, 44 tests)
+- `storage/article_store.py` (+18 lines: 1 import + 1 chained gate, no touch to other agents' edits)
+- `AGENTS.md` (this section)
+
+---
+
 ## 2026-05-30 HYBRID pass (Agent 3 fourth rotation) — hackernews source-cred fix + non-English title pre-floor
 
 **Persona:** debugger + feature developer + news-analyst consumer.
@@ -15998,3 +16097,146 @@ as-is. No `git add -A` (concurrent-agent staging-race footgun memory).
 Staged only my two new files by explicit pathspec; commit pushed to remote
 (commit `9ce1909`). This AGENTS.md entry will be committed in the next
 code change if the AGENTS.md merge convention is enforced.
+
+## 2026-05-30 Agent 3 (digital-intern) — invariant test gap audit + honest no-op
+
+**Persona:** debugger + feature developer + news-analyst consumer.
+
+**Counters:** bugs_fixed=0 / features_added=0 / user_findings=5.
+
+### Phase 1 — debugger / invariant-test gap audit
+
+Read all listed files (`daemon.py`, `storage/article_store.py`,
+`watchers/{alert_agent,urgency_scorer}.py`, `ml/{trainer,model,features}.py`,
+`collectors/web_scraper.py`, `analysis/claude_analyst.py`) and the recent
+agent-rotation entries.
+
+The task prompt enumerates 13 specific invariant tests it wants present
+("get_unalerted_urgent never returns backtest URLs"; "score_source='ml' on
+update_ml_scores_batch"; "_fetch_training_data excludes score_source='ml'";
+"feature dim exactly 15"; "ticker density zero with no portfolio mentions";
+"days_since_published 0 just-published / ~1 at 24h"; "relevance ∈ [0,10],
+urgency ∈ [0,1], zero-input no NaN"; "sample weights heavier on high-rel";
+etc.). Targeted grep against `tests/` confirms **every one is already
+covered by a specific-value assertion** in the existing suite:
+
+| Invariant | Existing test |
+|-----------|---------------|
+| `get_unalerted_urgent` excludes `backtest://` | `test_article_store.test_get_unalerted_urgent_excludes_backtest_urls` |
+| Marking alerted prevents re-fetch | `test_article_store.test_mark_alerted_removes_from_unalerted` |
+| `update_ml_scores_batch` sets `score_source='ml'` | `test_article_store.test_update_ml_scores_batch_sets_ml` |
+| `update_ai_scores_batch` sets `score_source='llm'` | `test_article_store.test_update_ai_scores_batch_sets_llm` |
+| ML write never overwrites LLM/`briefing_boost` | `test_article_store.test_ml_does_not_overwrite_{llm,briefing_boost}` |
+| `kw_score=9.5` urgent / `kw_score=3.0` NOT urgent | `test_urgency_scorer.test_high_score_marked_urgent` + `_low_score_not_urgent` |
+| Scorer doesn't re-urgent already-alerted | `test_urgency_scorer.test_rescore_does_not_unalert` |
+| Feature dim exactly 15 | `test_features.test_feature_dim_is_exactly_15` |
+| Ticker density zero with no portfolio mentions | `test_features.test_ticker_density_zero_with_no_portfolio_mentions` |
+| `days_since_published` 0 / ~1 / clipped at 30 | `test_features.test_days_since_published_*` (3 tests) |
+| Relevance ∈ [0,10], urgency ∈ [0,1] | `test_model.test_relevance_in_zero_to_ten` + `test_urgency_in_zero_to_one` |
+| Zero-input no NaN | `test_model.test_zero_input_does_not_nan` |
+| `_fetch_training_data` excludes `score_source='ml'` | `test_integration_pipeline.test_fetch_training_data_excludes_ml_source` |
+| Sample weights heavier on high-relevance | `test_trainer.TestSampleWeights.test_high_relevance_weighs_more_than_low` |
+
+Focused suite (`test_article_store` + `test_urgency_scorer` + `test_features`
++ `test_model` + `test_trainer` + `test_alert_agent` + `test_alert_dedup` +
+`test_alert_recap_template` + `test_score_source_progression`) — **169
+passed in 171.5s.** No genuine bug found, no test gap exists, **no Phase 1
+commit (per the prompt's guard).** This is what the codebase looks like
+after four prior rotations + the running auto-commit daemon: the
+invariant-test surface is saturated; the surgical pass is to confirm and
+keep going.
+
+### Phase 2 — honest no-op
+
+Brainstormed two feature options:
+
+1. **`analyst_pick_recap` recap-template detector** — catch "What To Do
+   After X's Y Boosted Z Stock" Seeking Alpha analyst-pick mill content.
+   *Audit (30d urgency>=1 live scan): 1 fire of 1 candidate.* The only
+   wiring point not held by a concurrent-agent in-flight edit
+   (`watchers/alert_agent.py`, `analysis/claude_analyst.py`,
+   `dashboard/web_server.py` all show in `git status` as modified by
+   siblings, do not touch) is `storage.article_store.prefloor_pseudo_articles`
+   — the precedent that `watchers.non_english_filter` followed. **Rejected:**
+   a 1×/month pattern is too low-value to justify a new gate, and a
+   builder-only export would just be a second orphan next to
+   `analytics/emerging_press_mill` (last rotation's, with the predicates
+   STILL not wired in 1d later because the WIP `_RT_FUND_STAKE_DELTA` it
+   was waiting on is still in `git status` 24h on).
+
+2. **`<verb> Despite` retrospective price-attribution gate** — catch
+   "Nvidia Stock Slips Despite Taiwan Expansion" / "Nvidia Stock Trades
+   Flat Despite $1T Sales Target" patterns. *Audit (7d urgency>=1 live
+   scan, 638 rows): 3 matches.* Same low-value verdict.
+
+The advisor was direct: **manufacturing a feature to move a counter is
+worse than admitting the codebase has reached saturation in this domain.**
+The non-orphan high-value wiring slots have all been taken in the last
+four rotations (recap mill, fund-stake, quote-widget, image-credit,
+stocktwits-chatter, non-English). **features_added=0**, no Phase 2 commit.
+
+### Phase 3 — live validation (news-analyst lens)
+
+5 findings recorded as `user_findings`:
+
+1. **Daemon restart at 17:29 PT today** (2026-05-30, post-rotation). The
+   hackernews source-cred tier-down (commit `b1b2234`) was committed at
+   14:30:46 PT today — between the prior rotation and this one. Until the
+   17:29 PT restart the daemon ran on a stale build; a 11:54 PT lone
+   `hackernews` BREAKING push (Intel 8087 microcode, ml=9.23 urgency=2,
+   alert_recency hit) leaked through the old code path. **No fresh bug**
+   — memory item `di-stale-manual-daemon` precisely describes this.
+   The cred-tier fix is now live; future lone hackernews pushes will be
+   suppressed by `_filter_low_authority_lone` (cred 0.40 < 0.45 bar).
+2. **Briefing cadence healthy.** Latest briefing 2026-05-30T19:12:57Z,
+   63 briefings in the last 16 days (~3.95 per 5h slot — well within
+   the `HEARTBEAT_INTERVAL` budget). Quality high: the briefing's
+   **COVERAGE GAP** block correctly surfaces 8 dark/degraded collectors
+   (SEC full-text 36.5h, SEC 8-K 16.7h, Polygon 635.3h all-session,
+   NewsAPI 1240.8h all-session, AlphaVantage 39.0h, Reddit 5.3h, etc.).
+   The analyst sees their input gaps without having to ask. Working.
+3. **Discord push rate sanely low** (alert_recency.db, 24h): only 2
+   unique signatures actually pushed — Samsung HBM4E (legitimate semis
+   news, dup_count > 1 corroboration) and the stale-daemon hackernews
+   Intel 8087 noise (above). The 10 urgency=2 rows in `articles.db`
+   minus 2 actual pushes = the suppression gates (lone-source authority,
+   stale, cross-cycle dedup, recap, quote-widget, paraphrase) caught
+   80% of the candidate noise. The analyst's Discord channel is quiet.
+4. **Newly-dark collector cluster.** Comparing last-24h vs prior 7d
+   daily average (live DB): Bloomberg Markets 2 vs 26.3/d, Benzinga
+   Economics 8 vs 87.4/d, FXStreet 0 vs 31.1/d, SeekingAlpha BreakingNews
+   0 vs 26.7/d, reddit/r/wallstreetbets 0 vs 22.0/d, yfinance/StockStory
+   0 vs 20.9/d, reddit/r/buildapc 0 vs 92.1/d. Pattern is consistent
+   with an upstream RSS/scraper rate-limit event rather than an internal
+   bug (no traceback in `daemon.log`; the chronic dark set memory item
+   `di-chronic-dark-collectors` is unaffected — those four are still 0).
+   Observation, not a fix.
+5. **External-API error baseline.** Tail of `logs/daemon.log` shows
+   recurring transient errors that the backoff layer absorbs without
+   crashing a worker: FRED `fred.stlouisfed.org` connection timeouts,
+   BLS `REQUEST_NOT_PROCESSED`, FINRA 403 on the margin-statistics URL,
+   Quartz RSS 403, Quiverquant 401 (auth), forexfactory 429 (rate-limit),
+   one `[kalshi_worker] database is locked; backing off 60s` (the
+   sustained writer-contention story that motivates the
+   `_RETRYABLE_DB_ERRORS` set). All known classes, all handled.
+
+### Phase 4 — docs
+
+This AGENTS.md entry. No CLAUDE.md change (no new invariants).
+
+### Files created (mine) — none
+
+No `.py` change. No test added (every enumerated invariant already
+covered). No new feature wired or builder created. AGENTS.md update only
+— per the Phase 1 / Phase 2 commit guards, this rotation is honest at
+`bugs_fixed=0 / features_added=0 / user_findings=5`.
+
+### Files left untouched
+
+Many concurrent-agent WIP edits in flight (`analysis/claude_analyst.py`,
+`watchers/alert_agent.py` — sibling adding `_RT_FUND_STAKE_DELTA`,
+`dashboard/web_server.py`, plus untracked `analysis/wire_stance.py`,
+`analytics/ml_ai_divergence.py`, four new collectors, two new test files);
+all left exactly as-is. No `git add -A` (concurrent-agent staging-race
+footgun memory). This AGENTS.md entry will be committed in the next code
+change if the AGENTS.md merge convention is enforced.

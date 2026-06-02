@@ -108,6 +108,9 @@ def _build_aligned_arrays(
                 bb_pos=r.get("bb_position"),
                 news_urgency=r.get("news_urgency"),
                 news_article_count=r.get("news_article_count"),
+                ema200_above=r.get("ema200_above"),
+                hist_cross_up=r.get("hist_cross_up"),
+                macd_below_zero_cross=r.get("macd_below_zero_cross"),
             )
             a = _to_float(r.get("forward_return_5d"), float("nan"))
             if str(r.get("action") or "BUY").upper() == "SELL":
