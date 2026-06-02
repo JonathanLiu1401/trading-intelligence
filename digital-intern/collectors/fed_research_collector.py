@@ -20,7 +20,9 @@ Dedup layers identical to fed_press_collector:
   2. articles.db PRIMARY KEY = sha256(url||title) inside insert_batch.
 """
 import hashlib
+import random
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +33,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "seen_articles.db"
 
 FETCH_TIMEOUT = 12
+MAX_FETCH_ATTEMPTS = 3
+BACKOFF_BASE_SECONDS = 1.0
 _UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -65,13 +69,42 @@ def _article_id(link: str, title: str) -> str:
 def _fetch_feed(name: str, url: str) -> list[dict]:
     """Fetch and parse one Fed RSS feed. Any error returns [] — one bad feed
     never aborts the whole pass."""
-    try:
-        resp = requests.get(url, timeout=FETCH_TIMEOUT, headers={"User-Agent": _UA})
-        resp.raise_for_status()
-        parsed = feedparser.parse(resp.content)
-    except Exception as e:
-        print(f"[fed_research_collector] Error fetching {name}: {e}")
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+        try:
+            resp = requests.get(url, timeout=FETCH_TIMEOUT, headers={"User-Agent": _UA})
+            if resp.status_code == 429 and attempt < MAX_FETCH_ATTEMPTS:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after) if retry_after else BACKOFF_BASE_SECONDS
+                except ValueError:
+                    delay = BACKOFF_BASE_SECONDS
+                delay = min(delay, 30.0) + random.uniform(0.0, 0.5)
+                print(
+                    f"[fed_research_collector] rate-limited {name}; "
+                    f"retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+                continue
+            resp.raise_for_status()
+            parsed = feedparser.parse(resp.content)
+            break
+        except Exception as e:
+            last_error = e
+            if attempt >= MAX_FETCH_ATTEMPTS:
+                print(f"[fed_research_collector] Error fetching {name}: {e}")
+                return []
+            delay = min(BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)), 8.0)
+            delay += random.uniform(0.0, 0.5)
+            print(
+                f"[fed_research_collector] fetch failed {name} "
+                f"attempt {attempt}/{MAX_FETCH_ATTEMPTS}: {e}; retrying in {delay:.1f}s"
+            )
+            time.sleep(delay)
+    else:
+        print(f"[fed_research_collector] Error fetching {name}: {last_error}")
         return []
+
     out: list[dict] = []
     for entry in parsed.entries:
         title = (entry.get("title") or "").strip()
