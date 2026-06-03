@@ -129,7 +129,7 @@ class TestDecideWiresExitProximity:
         monkeypatch.setattr(strategy, "_portfolio_snapshot",
                             lambda store: forged_snap)
         monkeypatch.setattr(strategy, "_check_and_execute_hard_exits",
-                            lambda store, snap: [])
+                            lambda store, snap, **kwargs: [])
         monkeypatch.setattr(strategy.signals, "get_top_signals",
                             lambda n=20, hours=2, min_score=4.0: [])
         monkeypatch.setattr(strategy.signals, "get_urgent_articles",
@@ -239,7 +239,7 @@ class TestDecideWiresExitProximity:
         monkeypatch.setattr(strategy, "_portfolio_snapshot",
                             lambda store: forged_snap)
         monkeypatch.setattr(strategy, "_check_and_execute_hard_exits",
-                            lambda store, snap: [])
+                            lambda store, snap, **kwargs: [])
         monkeypatch.setattr(strategy.signals, "get_top_signals",
                             lambda n=20, hours=2, min_score=4.0: [])
         monkeypatch.setattr(strategy.signals, "get_urgent_articles",

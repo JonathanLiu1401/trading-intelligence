@@ -1,8 +1,9 @@
 r"""Hard-exit (mechanical SL/TP) visibility.
 
 The hard SL/TP enforcement (commit 3176d2f, 2026-05-24) silently
-auto-closes any stock position whose mark breaches the 2%/3% (standard)
-or 4%/6% (leveraged) threshold the BUY path stamped at entry. The
+auto-closes any stock position whose regular-session mark breaches the
+5%/15% (standard) or 10%/25% (leveraged) threshold the BUY path stamped
+at entry. The
 runner posts a one-line ``**AUTO RISK EXIT** \`TICKER\``` alert per
 event, but no surface aggregates the discipline:
 

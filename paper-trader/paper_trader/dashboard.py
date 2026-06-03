@@ -484,8 +484,8 @@ def hard_exit_slippage_api():
 
     ``/api/hard-exit-summary`` counts whether the mechanical discipline
     is firing; this endpoint answers whether the THRESHOLDS THEMSELVES
-    are well-calibrated. The bot stamps a fixed 2/3% (standard) or
-    4/6% (leveraged) trigger at entry, but when price gaps past the
+    are well-calibrated. The bot stamps a fixed 5/15% (standard) or
+    10/25% (leveraged) trigger at entry, but when price gaps past the
     threshold the actual fill can be materially away — live evidence
     2026-05-26: MU TP fired at threshold $773.31 with a fill of $889.50,
     +15% slippage past the trigger (the "lucky overshoot" — tape, not
@@ -540,7 +540,7 @@ def hard_exit_summary_api():
     3176d2f, 2026-05-24).
 
     The auto-exit feature silently closes any stock lot whose mark
-    breaches the 2%/3% (standard) or 4%/6% (leveraged) threshold
+    breaches the 5%/15% (standard) or 10%/25% (leveraged) threshold
     stamped at entry. The runner posts a one-line trade alert per
     event but no surface aggregates the discipline. This endpoint
     answers:
