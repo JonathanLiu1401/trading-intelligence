@@ -1609,6 +1609,8 @@ TEMPLATE = r"""
       <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
         <h2 style="margin:0;">Live portfolio</h2>
         <div style="display:flex;gap:3px;font-size:11px;flex-wrap:wrap;">
+          <button class="bt-filter-chip active" id="eq-mode-value" onclick="setEqMode('value')">$ net worth</button>
+          <button class="bt-filter-chip" id="eq-mode-return" onclick="setEqMode('return')">% return</button>
           <button class="bt-filter-chip" id="eq-range-1d" onclick="setEqRange('1d')">1d</button>
           <button class="bt-filter-chip" id="eq-range-5d" onclick="setEqRange('5d')">5d</button>
           <button class="bt-filter-chip active" id="eq-range-1m" onclick="setEqRange('1m')">1m</button>
@@ -1634,8 +1636,9 @@ TEMPLATE = r"""
         </div>
       </div>
       <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">
-        <span style="color:#0acdff;">●</span> Portfolio (% vs capital basis) &nbsp;
-        <span style="border-top:2px dashed rgba(255,183,77,0.7);display:inline-block;width:16px;vertical-align:middle;"></span> SPY (% from same start) &nbsp;
+        <span id="eq-legend-main"><span style="color:#0acdff;">●</span> Net worth ($ total value) &nbsp;</span>
+        <span id="eq-legend-basis"><span style="border-top:2px dotted rgba(139,146,157,0.8);display:inline-block;width:16px;vertical-align:middle;"></span> Capital basis (deposits) &nbsp;</span>
+        <span id="eq-legend-spy"><span style="border-top:2px dashed rgba(255,183,77,0.7);display:inline-block;width:16px;vertical-align:middle;"></span> SPY (% from same start) &nbsp;</span>
         <span style="color:var(--text-muted);">↑ buy &nbsp; ↓ sell</span>
       </div>
       <div style="position:relative;height:280px;"><canvas id="eq"></canvas></div>
@@ -3078,6 +3081,7 @@ function filterByModel(modelId) {
 // ───────── Trader pane ─────────
 let chart;
 let ddChart;
+let eqChartMode = "value";
 // Supported ranges: "1d","5d","1m","3m","ytd","1y","3y","5y","all". Legacy
 // "24h" and "7d" callers (if any external links remain) are aliased to "1d"
 // and "5d" in setEqRange so they keep working without 404'ing the UI.
@@ -3086,6 +3090,15 @@ let _lastEquity = [];  // cache for range filtering
 let _lastTrades = [];
 
 const EQ_RANGES = ["1d","5d","1m","3m","ytd","1y","3y","5y","all"];
+
+function setEqMode(mode) {
+  eqChartMode = mode === "return" ? "return" : "value";
+  ["value", "return"].forEach(k => {
+    const el = document.getElementById("eq-mode-"+k);
+    if (el) el.classList.toggle("active", k === eqChartMode);
+  });
+  drawEquityChart(_lastEquity, _lastTrades);
+}
 
 function _cutoffMsForRange(r) {
   // Returns the cutoff (ms since epoch) for the given range, or null for "all".
@@ -3254,16 +3267,39 @@ function drawEquityChart(eq, trades) {
   const filtered = _filterEqByRange(eq);
   if (!filtered.length) return;
 
-  // Normalize: portfolio is deposit-adjusted return vs capital basis; SPY is
-  // still shown from the same visible start for quick tape comparison.
+  // Keep the default chart as the operator's actual net worth. The separate
+  // capital-basis line makes deposits visible without counting them as gain.
+  // The % mode remains deposit-adjusted performance vs capital basis.
   const baseVal = filtered[0].total_value || 1000;
   const baseSpy = filtered[0].sp500_price || 1;
   const labels = filtered.map(p => p.timestamp.replace("T"," ").slice(0,16));
+  const totalValues = filtered.map(p => Number.isFinite(+p.total_value) ? +p.total_value : null);
+  const capitalBasis = filtered.map(p => Number.isFinite(+p.capital_basis) ? +p.capital_basis : null);
   const portPct = filtered.map(p => Number.isFinite(+p.deposit_adjusted_return_pct)
     ? +p.deposit_adjusted_return_pct
     : ((p.total_value / baseVal) - 1) * 100);
   const spyPct  = filtered.map(p => p.sp500_price ? ((p.sp500_price / baseSpy) - 1) * 100 : null);
   const cashPct = filtered.map(p => p.cash != null ? (p.cash / p.total_value) * 100 : null);
+  const isValueMode = eqChartMode !== "return";
+  const primarySeries = isValueMode ? totalValues : portPct;
+  const markerOffset = isValueMode ? 35 : 0.5;
+  const yTickFmt = v => isValueMode ? dollar(v) : (v>=0?"+":"")+v.toFixed(1)+"%";
+  const tooltipFmt = v => isValueMode ? dollar(v) : (v>=0?"+":"")+v.toFixed(2)+"%";
+
+  const mainLegend = document.getElementById("eq-legend-main");
+  const basisLegend = document.getElementById("eq-legend-basis");
+  const spyLegend = document.getElementById("eq-legend-spy");
+  if (mainLegend) {
+    mainLegend.innerHTML = isValueMode
+      ? '<span style="color:#0acdff;">●</span> Net worth ($ total value) &nbsp;'
+      : '<span style="color:#0acdff;">●</span> Portfolio (% vs capital basis) &nbsp;';
+  }
+  if (basisLegend) basisLegend.style.display = isValueMode ? "inline" : "none";
+  if (spyLegend) {
+    spyLegend.innerHTML = isValueMode
+      ? '<span style="border-top:2px dashed rgba(255,183,77,0.7);display:inline-block;width:16px;vertical-align:middle;"></span> SPY (% from same start, right axis) &nbsp;'
+      : '<span style="border-top:2px dashed rgba(255,183,77,0.7);display:inline-block;width:16px;vertical-align:middle;"></span> SPY (% from same start) &nbsp;';
+  }
 
   // Rolling drawdown from peak
   let peak = 0;
@@ -3298,9 +3334,9 @@ function drawEquityChart(eq, trades) {
       }
       idx = best;
     }
-    const base = portPct[idx] ?? 0;
-    if (tr.action && tr.action.startsWith("BUY")) buyMarks[idx]  = base + 0.5;
-    else                                          sellMarks[idx] = base - 0.5;
+    const base = primarySeries[idx] ?? 0;
+    if (tr.action && tr.action.startsWith("BUY")) buyMarks[idx]  = base + markerOffset;
+    else                                          sellMarks[idx] = base - markerOffset;
   });
 
   // Summary stats
@@ -3335,22 +3371,35 @@ function drawEquityChart(eq, trades) {
 
   const datasets = [
     {
-      label: "Portfolio %",
-      data: portPct,
+      label: isValueMode ? "Net worth $" : "Portfolio %",
+      data: primarySeries,
       borderColor: "#0acdff",
       backgroundColor: "rgba(10,205,255,0.07)",
+      yAxisID: "y",
       fill: true, tension: 0.15, borderWidth: 2,
       pointRadius: 0, pointHoverRadius: 4, order: 2,
     },
-    {
-      label: "SPY %",
-      data: spyPct,
-      borderColor: "rgba(255,183,77,0.7)",
-      backgroundColor: "transparent",
-      borderDash: [5,4], borderWidth: 1.5,
-      pointRadius: 0, fill: false, order: 3,
-    },
   ];
+  if (isValueMode) {
+    datasets.push({
+      label: "Capital basis $",
+      data: capitalBasis,
+      borderColor: "rgba(139,146,157,0.8)",
+      backgroundColor: "transparent",
+      yAxisID: "y",
+      borderDash: [2,4], borderWidth: 1.4,
+      pointRadius: 0, fill: false, order: 4,
+    });
+  }
+  datasets.push({
+    label: "SPY %",
+    data: spyPct,
+    borderColor: "rgba(255,183,77,0.7)",
+    backgroundColor: "transparent",
+    yAxisID: isValueMode ? "y1" : "y",
+    borderDash: [5,4], borderWidth: 1.5,
+    pointRadius: 0, fill: false, order: 3,
+  });
   if (buyMarks.some(v => v != null))  datasets.push(mkMarkers(buyMarks,  "#00c896", "Buy ↑", false));
   if (sellMarks.some(v => v != null)) datasets.push(mkMarkers(sellMarks, "#ff4455", "Sell ↓", true));
 
@@ -3371,7 +3420,8 @@ function drawEquityChart(eq, trades) {
               label: ctx => {
                 if (ctx.dataset.type === "scatter" || ctx.dataset.showLine === false) return null;
                 const v = ctx.parsed.y;
-                return `${ctx.dataset.label}: ${v>=0?"+":""}${v.toFixed(2)}%`;
+                const isPct = (ctx.dataset.yAxisID === "y1") || ctx.dataset.label.includes("%");
+                return `${ctx.dataset.label}: ${isPct ? ((v>=0?"+":"")+v.toFixed(2)+"%") : tooltipFmt(v)}`;
               },
             },
           },
@@ -3379,8 +3429,14 @@ function drawEquityChart(eq, trades) {
         scales: {
           x: { ticks: { color: "#8b929d", maxTicksLimit: 8 }, grid: { color: "#1f2126" }},
           y: {
-            ticks: { color: "#dde1e7", callback: v => (v>=0?"+":"")+v.toFixed(1)+"%" },
+            ticks: { color: "#dde1e7", callback: yTickFmt },
             grid: { color: "#1f2126" },
+          },
+          y1: {
+            display: isValueMode,
+            position: "right",
+            ticks: { color: "rgba(255,183,77,0.8)", callback: v => (v>=0?"+":"")+v.toFixed(1)+"%" },
+            grid: { drawOnChartArea: false },
           },
         },
       },
@@ -3388,6 +3444,8 @@ function drawEquityChart(eq, trades) {
   } else {
     chart.data.labels = labels;
     chart.data.datasets = datasets;
+    chart.options.scales.y.ticks.callback = yTickFmt;
+    chart.options.scales.y1.display = isValueMode;
     chart.update("none");
   }
 
