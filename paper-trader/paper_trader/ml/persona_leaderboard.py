@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import statistics
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -200,24 +201,57 @@ def _median_opt(xs):
     return round(float(statistics.median(clean)), 4) if clean else None
 
 
+def _years_between(start_date, end_date) -> float | None:
+    """Backtest duration in years, or None when dates are missing/bad."""
+    try:
+        start = date.fromisoformat(str(start_date)[:10])
+        end = date.fromisoformat(str(end_date)[:10])
+    except (TypeError, ValueError):
+        return None
+    days = (end - start).days
+    if days <= 0:
+        return None
+    return days / 365.25
+
+
+def _annualized_return_pct(total_return_pct, years: float | None) -> float | None:
+    """Compounded annualized return %, with raw fallback for undated rows."""
+    ret = _finite(total_return_pct)
+    if ret is None:
+        return None
+    if years is None:
+        return round(ret, 4)
+    growth = 1.0 + ret / 100.0
+    if growth <= 0.0:
+        return None
+    ann = growth ** (1.0 / years) - 1.0
+    return round(float(ann * 100.0), 4) if np.isfinite(ann) else None
+
+
 def persona_leaderboard(runs) -> dict:
     """Aggregate ``complete`` backtest runs by trading persona.
 
     ``runs`` is any iterable of dicts. Recognised keys:
     ``run_id`` (int, required — maps to a persona), ``vs_spy_pct``
     (required — the alpha metric), ``total_return_pct`` (optional),
+    ``spy_return_pct`` / ``start_date`` / ``end_date`` (optional — used
+    to compute annualized return and annualized alpha),
     ``status`` (optional — non-``"complete"`` rows are ignored so the
     raw ``backtest_runs`` table can be passed straight through),
     ``equity_curve`` (optional list of ``{"value": ...}`` points for the
     risk metrics).
 
     Returns a JSON-safe dict:
-    ``{status, verdict, n_runs, n_personas, leaderboard:[{persona, n,
-       median_vs_spy, mean_vs_spy, median_return, win_rate, median_sharpe,
-       median_sortino, median_max_drawdown_pct, median_calmar,
-       median_pct_time_underwater, verdict}],
+    ``{status, verdict, n_runs, n_personas, sort_metric,
+       leaderboard:[{persona, n, median_vs_spy, mean_vs_spy,
+       median_vs_spy_annualized, mean_vs_spy_annualized, median_return,
+       median_return_annualized, win_rate, median_sharpe, median_sortino,
+       median_max_drawdown_pct, median_calmar, median_pct_time_underwater,
+       verdict}],
        drag_personas:[...], hint}``. The ``leaderboard`` is sorted by
-    ``median_vs_spy`` descending (``INSUFFICIENT`` personas last).
+    ``median_vs_spy_annualized`` descending (``INSUFFICIENT`` personas
+    last), so multi-year backtests do not dominate the persona page with
+    huge raw "beating S&P by 1400pp" lifetime totals.
     """
     buckets: dict[str, dict] = {}
     n_qualifying = 0
@@ -237,12 +271,19 @@ def persona_leaderboard(runs) -> dict:
         b = buckets.setdefault(
             persona,
             {"vs": [], "ret": [], "sharpe": [], "mdd": [], "uw": [],
-             "sortino": [], "calmar": []},
+             "sortino": [], "calmar": [], "ann_vs": [], "ann_ret": []},
         )
         b["vs"].append(vs)
         tr = _finite(r.get("total_return_pct"))
         if tr is not None:
             b["ret"].append(tr)
+        years = _years_between(r.get("start_date"), r.get("end_date"))
+        ann_ret = _annualized_return_pct(tr, years)
+        ann_spy = _annualized_return_pct(r.get("spy_return_pct"), years)
+        if ann_ret is not None:
+            b["ann_ret"].append(ann_ret)
+        if ann_ret is not None and ann_spy is not None:
+            b["ann_vs"].append(round(ann_ret - ann_spy, 4))
         risk = _equity_risk(r.get("equity_curve"))
         if risk["sharpe"] is not None:
             b["sharpe"].append(risk["sharpe"])
@@ -288,7 +329,13 @@ def persona_leaderboard(runs) -> dict:
             "n": n,
             "median_vs_spy": med_vs,
             "mean_vs_spy": mean_vs,
+            "median_vs_spy_annualized": _median_opt(b["ann_vs"]),
+            "mean_vs_spy_annualized": (
+                round(float(statistics.fmean(b["ann_vs"])), 4)
+                if b["ann_vs"] else None
+            ),
             "median_return": _median_opt(b["ret"]),
+            "median_return_annualized": _median_opt(b["ann_ret"]),
             "win_rate": win_rate,
             "median_sharpe": _median_opt(b["sharpe"]),
             "median_sortino": _median_opt(b["sortino"]),
@@ -298,10 +345,15 @@ def persona_leaderboard(runs) -> dict:
             "verdict": verdict,
         })
 
-    # Sort by median_vs_spy desc; INSUFFICIENT personas always sink last
-    # regardless of their (unstable, small-n) median.
+    # Sort by annualized median alpha desc; INSUFFICIENT personas always
+    # sink last regardless of their (unstable, small-n) median.
     leaderboard.sort(
-        key=lambda d: (d["verdict"] != "INSUFFICIENT", d["median_vs_spy"]),
+        key=lambda d: (
+            d["verdict"] != "INSUFFICIENT",
+            d["median_vs_spy_annualized"]
+            if d["median_vs_spy_annualized"] is not None
+            else d["median_vs_spy"],
+        ),
         reverse=True,
     )
 
@@ -324,6 +376,7 @@ def persona_leaderboard(runs) -> dict:
         "verdict": verdict,
         "n_runs": n_qualifying,
         "n_personas": len(buckets),
+        "sort_metric": "median_vs_spy_annualized",
         "leaderboard": leaderboard,
         "drag_personas": sorted(drag_personas),
         "hint": hint,
@@ -340,8 +393,19 @@ def _load_runs(db_path: Path) -> list[dict]:
     runs: list[dict] = []
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10.0)
     try:
+        cols = {
+            str(row[1]) for row in
+            conn.execute("PRAGMA table_info(backtest_runs)").fetchall()
+        }
+        start_expr = "start_date" if "start_date" in cols else "NULL AS start_date"
+        end_expr = "end_date" if "end_date" in cols else "NULL AS end_date"
+        spy_expr = (
+            "spy_return_pct" if "spy_return_pct" in cols
+            else "NULL AS spy_return_pct"
+        )
         rows = conn.execute(
-            "SELECT run_id, total_return_pct, vs_spy_pct, status, "
+            f"SELECT run_id, {start_expr}, {end_expr}, total_return_pct, "
+            f"{spy_expr}, vs_spy_pct, status, "
             "equity_curve_json FROM backtest_runs WHERE status='complete'"
         ).fetchall()
     finally:
@@ -349,14 +413,17 @@ def _load_runs(db_path: Path) -> list[dict]:
             conn.close()
         except Exception:
             pass
-    for run_id, tr, vs, status, eq_json in rows:
+    for run_id, start_date, end_date, tr, spy, vs, status, eq_json in rows:
         try:
             curve = json.loads(eq_json or "[]")
         except Exception:
             curve = []
         runs.append({
             "run_id": run_id,
+            "start_date": start_date,
+            "end_date": end_date,
             "total_return_pct": tr,
+            "spy_return_pct": spy,
             "vs_spy_pct": vs,
             "status": status,
             "equity_curve": curve,
@@ -381,15 +448,18 @@ def _cli() -> int:
     print(f"complete_runs={rep['n_runs']}  personas={rep['n_personas']}")
     print(f"VERDICT: {rep['verdict']}  ({rep['hint']})")
     if rep["leaderboard"]:
-        print(f"  {'persona':<34} {'n':>3} {'med_vs':>8} {'mean_vs':>9} "
-              f"{'win%':>6} {'med_ret':>9} {'sharpe':>7} {'sortino':>8} "
+        print(f"  {'persona':<34} {'n':>3} {'med_vs/yr':>9} "
+              f"{'med_vs':>8} {'win%':>6} {'med_ret/yr':>10} "
+              f"{'sharpe':>7} {'sortino':>8} "
               f"{'maxDD%':>7} {'calmar':>7} {'uw%':>6}  verdict")
         for e in rep["leaderboard"]:
             def _f(v, w=8, p=1):
                 return f"{'n/a':>{w}}" if v is None else f"{v:>{w}.{p}f}"
             print(f"  {e['persona']:<34} {e['n']:>3} "
-                  f"{_f(e['median_vs_spy'])} {_f(e['mean_vs_spy'],9)} "
-                  f"{e['win_rate']*100:>5.0f}% {_f(e['median_return'],9)} "
+                  f"{_f(e['median_vs_spy_annualized'],9)} "
+                  f"{_f(e['median_vs_spy'])} "
+                  f"{e['win_rate']*100:>5.0f}% "
+                  f"{_f(e['median_return_annualized'],10)} "
                   f"{_f(e['median_sharpe'],7,2)} "
                   f"{_f(e['median_sortino'],8,2)} "
                   f"{_f(e['median_max_drawdown_pct'],7)} "
