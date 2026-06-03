@@ -31,7 +31,7 @@ _HF_SEM = threading.Semaphore(3)       # max 3 concurrent HF API calls
 def call_llm(model_id: str, prompt: str, timeout: int = None) -> str | None:
     """Route prompt to the right LLM backend. Returns raw response string or None."""
     if model_id.startswith("hf/"):
-        return _hf_call(model_id[3:], prompt, timeout)
+        return _hf_call(model_id[3:], prompt, HF_TIMEOUT_S if timeout is None else timeout)
     elif model_id.startswith("claude-"):
         return _claude_call(model_id, prompt)
     raise ValueError(f"Unknown model_id: {model_id!r}. Must start with 'hf/' or 'claude-'.")
