@@ -22016,6 +22016,37 @@ def monkey_benchmark_page():
     return render_template_string(_MONKEY_TEMPLATE, api_prefix=_api_prefix())
 
 
+@app.route("/api/exit-trigger-pl-mix")
+def exit_trigger_pl_mix_api():
+    """Realized P&L bucketed by exit trigger: HARD_SL, HARD_TP, discretionary."""
+    try:
+        from .analytics.exit_trigger_pl_mix import build
+        st = get_store()
+        snap = build(st.recent_trades(5000))
+        if not isinstance(snap, dict):
+            raise TypeError(f"builder returned {type(snap).__name__}")
+        return jsonify({
+            "service": "paper_trader",
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            **snap,
+        })
+    except Exception as e:
+        return jsonify({
+            "service": "paper_trader",
+            "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "verdict": "ERROR",
+            "headline": f"exit-trigger-pl-mix endpoint error: {e}",
+            "error": str(e),
+            "buckets": {
+                "HARD_SL": {},
+                "HARD_TP": {},
+                "DISCRETIONARY": {},
+            },
+            "n_round_trips": 0,
+            "min_for_verdict": 4,
+        }), 500
+
+
 @app.route("/api/position-size-pl-fit")
 def position_size_pl_fit_api():
     """Realized P&L bucketed by entry size as a fraction of book-at-entry —
