@@ -34,7 +34,54 @@ def _avg(values: list[float]) -> float | None:
     return round(sum(values) / len(values), 4) if values else None
 
 
-def compute() -> dict:
+def _delta(current: int | float | None, previous: int | float | None) -> int | float | None:
+    """Rounded delta when both values exist; otherwise None."""
+    if current is None or previous is None:
+        return None
+    return round(current - previous, 4)
+
+
+def _load_previous(path: Path = OUT_PATH) -> dict:
+    """Best-effort load of the prior snapshot's per-source block."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    sources = payload.get("sources")
+    return sources if isinstance(sources, dict) else {}
+
+
+def _attach_deltas(sources: dict[str, dict], previous: dict[str, dict]) -> None:
+    """Mutate ``sources`` in place with per-source deltas from ``previous``."""
+    for source, current in sources.items():
+        prior = previous.get(source)
+        if not isinstance(prior, dict):
+            current.update({
+                "count_delta": None,
+                "avg_ai_score_delta": None,
+                "avg_ml_score_delta": None,
+                "avg_kw_score_delta": None,
+                "pct_urgent_delta": None,
+            })
+            continue
+        current.update({
+            "count_delta": _delta(current.get("count"), prior.get("count")),
+            "avg_ai_score_delta": _delta(
+                current.get("avg_ai_score"), prior.get("avg_ai_score")
+            ),
+            "avg_ml_score_delta": _delta(
+                current.get("avg_ml_score"), prior.get("avg_ml_score")
+            ),
+            "avg_kw_score_delta": _delta(
+                current.get("avg_kw_score"), prior.get("avg_kw_score")
+            ),
+            "pct_urgent_delta": _delta(
+                current.get("pct_urgent"), prior.get("pct_urgent")
+            ),
+        })
+
+
+def compute(previous_sources: dict[str, dict] | None = None) -> dict:
     """Scan the most recent SCAN_LIMIT live rows and roll up per source."""
     conn = sqlite3.connect(
         f"file:{DB_PATH}?mode=ro", uri=True, timeout=10
@@ -94,6 +141,9 @@ def compute() -> dict:
             "avg_kw_score": _avg(b["kw_scores"]),
             "pct_urgent": round(b["urgent"] / cnt, 4) if cnt else 0.0,
         }
+
+    previous_sources = previous_sources if previous_sources is not None else _load_previous()
+    _attach_deltas(sources, previous_sources)
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
