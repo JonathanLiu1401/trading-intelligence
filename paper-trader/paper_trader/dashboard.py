@@ -23,6 +23,211 @@ from .backtest import BACKTEST_DB  # re-exported so tests can monkeypatch dash.B
 app = Flask(__name__)
 
 
+_CLEAN_UI_MARKER = "clean-ui-global-v2"
+_CLEAN_UI_CSS = r"""
+/* clean-ui-global-v2: readable operator dashboard baseline */
+:root {
+  color-scheme: dark;
+  --bg: #0f1115;
+  --bg-panel: #171a21;
+  --bg-elevated: #20242d;
+  --bg-hover: #252a34;
+  --bg-input: #11141a;
+  --border: #303642;
+  --border-strong: #434b59;
+  --border-bright: #4b5563;
+  --text: #eef2f7;
+  --text-secondary: #c5ccd6;
+  --text-muted: #9aa3b2;
+  --muted: var(--text-secondary);
+  --amber: #facc15;
+  --amber-dim: rgba(250,204,21,0.12);
+  --cyan: #38bdf8;
+  --cyan-dim: rgba(56,189,248,0.14);
+  --cyan-glow: rgba(56,189,248,0);
+  --blue: #60a5fa;
+  --blue-dim: rgba(96,165,250,0.14);
+  --green: #4ade80;
+  --green-dim: rgba(74,222,128,0.14);
+  --red: #fb7185;
+  --red-dim: rgba(251,113,133,0.14);
+  --yellow: #facc15;
+  --yellow-dim: rgba(250,204,21,0.12);
+  --gold: #facc15;
+  --gold-dim: rgba(250,204,21,0.12);
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-body: var(--font-sans);
+  --font-display: var(--font-sans);
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  --radius: 8px;
+  --radius-sm: 6px;
+}
+html, body {
+  background: var(--bg) !important;
+  color: var(--text) !important;
+  font-family: var(--font-sans) !important;
+  font-size: 16px !important;
+  line-height: 1.45 !important;
+  letter-spacing: 0 !important;
+}
+body::before { display: none !important; }
+.brand, .section-title, h1, h2, h3,
+.topbar, .topbar a, .topnav, .topnav a,
+.nav-drawer-header, .nav-drawer a,
+nav.tabs a, .bt-tabs a,
+th, td, .stat .num, .stat .lbl, .stat .v, .stat .l,
+.pill, button, .btn, label, select, input,
+.bt-filter-chip, .bt-btn, .compute-mini-btn {
+  font-family: var(--font-sans) !important;
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+  text-shadow: none !important;
+}
+.topbar, .topnav {
+  height: 52px !important;
+  background: #141820 !important;
+  border-bottom: 1px solid var(--border) !important;
+  padding: 0 24px !important;
+}
+.brand {
+  color: var(--text) !important;
+  font-size: 17px !important;
+  font-weight: 750 !important;
+  margin-right: 22px !important;
+}
+.topbar a, .topnav a {
+  color: var(--text-secondary) !important;
+  font-size: 14px !important;
+  padding: 15px 12px 14px !important;
+  border-radius: 0 !important;
+  border-bottom: 3px solid transparent !important;
+}
+.topbar a:hover, .topnav a:hover {
+  color: #fff !important;
+  background: var(--bg-hover) !important;
+}
+.topbar a.active, .topnav a.active {
+  color: #fff !important;
+  background: rgba(56,189,248,0.08) !important;
+  border-bottom-color: var(--cyan) !important;
+}
+.page-content {
+  max-width: 1500px !important;
+  padding: 24px !important;
+}
+h1 {
+  color: #fff !important;
+  font-size: 32px !important;
+  font-weight: 750 !important;
+  line-height: 1.15 !important;
+}
+h2, .section-title, .card h2 {
+  color: var(--text) !important;
+  font-size: 17px !important;
+  font-weight: 700 !important;
+  border-left: 0 !important;
+  padding-left: 0 !important;
+}
+.card, .chart-wrap, .holding-tile, .portfolio-strip {
+  background: var(--bg-panel) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: none !important;
+}
+.card {
+  padding: 18px 20px !important;
+}
+.stat .num, .stat .value, .stat .v {
+  color: #fff !important;
+  font-size: 26px !important;
+  font-weight: 750 !important;
+}
+.stat .lbl, .stat .label, .stat .l, th {
+  color: var(--text-muted) !important;
+  font-size: 13px !important;
+  font-weight: 650 !important;
+}
+table {
+  color: var(--text) !important;
+  font-size: 14px !important;
+}
+td {
+  color: var(--text) !important;
+  font-size: 14px !important;
+  padding: 9px 10px !important;
+}
+td.num, .ticker, .stat .num, .stat .value, .stat .v {
+  font-family: var(--font-mono) !important;
+  font-variant-numeric: tabular-nums;
+}
+.pill, button, .btn, select, input,
+.bt-filter-chip, .bt-btn, .compute-mini-btn {
+  border-radius: var(--radius-sm) !important;
+  font-size: 13px !important;
+}
+button, .btn, .bt-filter-chip, .bt-btn, .compute-mini-btn {
+  background: var(--bg-elevated) !important;
+  color: var(--text-secondary) !important;
+  border: 1px solid var(--border-strong) !important;
+}
+button:hover, .btn:hover, .bt-filter-chip:hover, .bt-btn:hover, .compute-mini-btn:hover {
+  color: #fff !important;
+  background: rgba(56,189,248,0.12) !important;
+  border-color: var(--cyan) !important;
+}
+.bt-filter-chip.active, button.primary, .btn-primary {
+  background: var(--cyan) !important;
+  color: #071018 !important;
+  border-color: var(--cyan) !important;
+}
+.empty, .muted {
+  color: var(--text-muted) !important;
+}
+@media (max-width: 480px) {
+  body { font-size: 15px !important; }
+  .page-content { padding: 16px !important; }
+  h1 { font-size: 28px !important; }
+  .card { padding: 16px !important; }
+  .stat .num, .stat .value, .stat .v { font-size: 22px !important; }
+}
+"""
+
+
+def _inject_clean_ui(resp):
+    try:
+        if resp.status_code != 200:
+            return resp
+        if resp.direct_passthrough or resp.is_streamed:
+            return resp
+        if resp.headers.get("Content-Encoding"):
+            return resp
+        if not resp.headers.get("Content-Type", "").startswith("text/html"):
+            return resp
+        body = resp.get_data(as_text=True)
+        if _CLEAN_UI_MARKER in body:
+            return resp
+        block = f"\n<style id=\"{_CLEAN_UI_MARKER}\">{_CLEAN_UI_CSS}</style>\n"
+        idx = body.lower().find("</head>")
+        if idx >= 0:
+            body = body[:idx] + block + body[idx:]
+        else:
+            idx = body.lower().find("</style>")
+            if idx < 0:
+                return resp
+            idx += len("</style>")
+            body = body[:idx] + block + body[idx:]
+        resp.set_data(body)
+        resp.headers["Content-Length"] = str(len(resp.get_data()))
+    except Exception:
+        pass
+    return resp
+
+
+@app.after_request
+def _clean_ui_global(resp):
+    return _inject_clean_ui(resp)
+
+
 _MODEL_DISPLAY_NAMES = {
     "ml_quant": "ML+Quant (deterministic)",
     "claude-opus-4-7": "Claude Opus 4.7",
@@ -1208,6 +1413,69 @@ TEMPLATE = r"""
       text-transform: uppercase; letter-spacing: 0.16em;
       font-family: var(--font-mono); margin-bottom: 3px;
     }
+    .portfolio-strip {
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 0 12px;
+      margin: 0 0 12px;
+    }
+    .book-line {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; flex-wrap: wrap; margin-bottom: 8px;
+      font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary);
+      letter-spacing: 0.08em; text-transform: uppercase;
+    }
+    .book-line strong { color: var(--text); font-weight: 600; }
+    .exposure-bar {
+      display: flex;
+      height: 8px; border: 1px solid var(--border-strong);
+      background: var(--bg-elevated); margin-bottom: 10px;
+    }
+    .exposure-invested { background: var(--cyan); box-shadow: 0 0 10px var(--cyan-glow); }
+    .exposure-cash { background: var(--bg-input); }
+    .holding-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 8px;
+    }
+    .holding-tile {
+      border: 1px solid var(--border);
+      background: rgba(17,20,26,0.72);
+      padding: 9px 10px;
+      min-width: 0;
+    }
+    .holding-head {
+      display: flex; justify-content: space-between; gap: 8px;
+      align-items: baseline; margin-bottom: 6px;
+      font-family: var(--font-mono);
+    }
+    .holding-symbol {
+      color: #fff; font-size: 15px; font-weight: 700;
+      letter-spacing: 0.12em; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .holding-weight {
+      color: var(--cyan); font-size: 12px; white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .holding-metrics {
+      display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+    }
+    .holding-metric .k {
+      color: var(--text-muted); font-size: 9px;
+      text-transform: uppercase; letter-spacing: 0.12em;
+      font-family: var(--font-mono);
+    }
+    .holding-metric .v {
+      font-family: var(--font-mono); font-size: 12px;
+      color: var(--text); font-variant-numeric: tabular-nums;
+      overflow-wrap: anywhere;
+    }
+    .holding-empty {
+      color: var(--text-muted); font-family: var(--font-mono);
+      font-size: 12px; padding: 8px 0;
+    }
     .pos, .pl { color: var(--green); }
     .neg { color: var(--red); }
     .pos.v, .neg.v { text-shadow: 0 0 14px currentColor; opacity: 0.95; }
@@ -1522,6 +1790,330 @@ TEMPLATE = r"""
       table { font-size: 12px; }
       th, td { padding: 8px 10px; }
     }
+
+    /* Clean operator UI override.
+       The original theme was intentionally terminal-like: tiny mono text,
+       all-caps tracking, glow, and scanlines. That made the live trader hard
+       to read on the tailnet page. Keep the dark dashboard, but make it a
+       normal information surface. */
+    :root {
+      --bg: #0f1115;
+      --bg-panel: #171a21;
+      --bg-elevated: #20242d;
+      --bg-hover: #252a34;
+      --bg-input: #11141a;
+      --border: #303642;
+      --border-strong: #434b59;
+      --border-bright: #4b5563;
+      --text: #eef2f7;
+      --text-secondary: #c5ccd6;
+      --text-muted: #9aa3b2;
+      --cyan: #38bdf8;
+      --cyan-dim: rgba(56,189,248,0.14);
+      --cyan-glow: rgba(56,189,248,0);
+      --green: #4ade80;
+      --green-dim: rgba(74,222,128,0.14);
+      --red: #fb7185;
+      --red-dim: rgba(251,113,133,0.14);
+      --gold: #facc15;
+      --gold-dim: rgba(250,204,21,0.12);
+      --amber: #facc15;
+      --amber-dim: rgba(250,204,21,0.12);
+      --font-body: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      --font-display: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --radius: 8px;
+      --radius-sm: 6px;
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-size: 16px;
+      line-height: 1.45;
+      letter-spacing: 0;
+    }
+    body::before { display: none; }
+    .brand, h1, h2, h3,
+    .topbar, .topbar a, nav.tabs a, .card h2,
+    .stat .v, .stat .l, .book-line,
+    th, td, .pill, button, .btn,
+    .bt-filter-chip, .bt-tabs a, .bt-btn,
+    .holding-head, .holding-metric .k, .holding-metric .v,
+    .progress-label, .sl-label, .tp-label,
+    .nav-drawer-header, .nav-drawer a {
+      letter-spacing: 0;
+      text-transform: none;
+      text-shadow: none !important;
+    }
+    .topbar {
+      height: 52px;
+      padding: 0 24px;
+      background: #141820;
+      border-bottom: 1px solid var(--border);
+      font-family: var(--font-body);
+    }
+    .brand {
+      font-family: var(--font-body);
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--text);
+      margin-right: 24px;
+    }
+    .topbar a {
+      font-family: var(--font-body);
+      font-size: 14px;
+      color: var(--text-secondary);
+      padding: 15px 12px 14px;
+      border-bottom-width: 3px;
+    }
+    .topbar a.active {
+      color: #fff;
+      border-bottom-color: var(--cyan);
+      background: rgba(56,189,248,0.08);
+    }
+    .topbar a:hover { color: #fff; background: var(--bg-hover); }
+    .page-content {
+      padding: 24px;
+      max-width: 1500px;
+    }
+    h1 {
+      font-family: var(--font-body);
+      font-size: 32px;
+      font-weight: 750;
+      line-height: 1.15;
+      margin-bottom: 6px;
+      color: #fff;
+    }
+    .sub {
+      font-family: var(--font-body);
+      font-size: 14px;
+      color: var(--text-muted);
+      margin-bottom: 18px;
+    }
+    .card {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+      box-shadow: none;
+    }
+    .card h2 {
+      font-family: var(--font-body);
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--text);
+      border-left: 0;
+      padding-left: 0;
+      line-height: 1.3;
+      margin-bottom: 16px;
+    }
+    nav.tabs {
+      margin-bottom: 18px;
+      border-bottom-color: var(--border);
+    }
+    nav.tabs a {
+      font-family: var(--font-body);
+      font-size: 15px;
+      padding: 12px 18px;
+      color: var(--text-secondary);
+      border-bottom-width: 3px;
+    }
+    nav.tabs a.active {
+      color: #fff;
+      border-bottom-color: var(--cyan);
+    }
+    .stat-row {
+      gap: 16px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    }
+    .stat {
+      flex: 1 1 150px;
+      min-width: 0;
+    }
+    .stat .l {
+      font-family: var(--font-body);
+      color: var(--text-muted);
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 5px;
+    }
+    .stat .v {
+      font-family: var(--font-body);
+      font-size: 26px;
+      font-weight: 750;
+      color: #fff;
+      line-height: 1.15;
+    }
+    .stat.monkey-rank {
+      border-left: 0;
+      padding-left: 0;
+      background: transparent;
+    }
+    .stat.monkey-rank .v {
+      color: var(--gold);
+      text-shadow: none;
+    }
+    .portfolio-strip {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px;
+      background: #12161d;
+      margin: 4px 0 14px;
+    }
+    .book-line {
+      font-family: var(--font-body);
+      font-size: 15px;
+      color: var(--text-secondary);
+      margin-bottom: 10px;
+    }
+    .book-line strong {
+      color: #fff;
+      font-weight: 750;
+    }
+    .exposure-bar {
+      height: 12px;
+      border-radius: 999px;
+      border-color: var(--border);
+      overflow: hidden;
+      background: #2a303a;
+      margin-bottom: 12px;
+    }
+    .exposure-invested {
+      background: var(--cyan);
+      box-shadow: none;
+    }
+    .holding-grid {
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+    }
+    .holding-tile {
+      background: var(--bg-panel);
+      border-color: var(--border);
+      border-radius: var(--radius-sm);
+      padding: 14px;
+    }
+    .holding-head {
+      font-family: var(--font-body);
+      margin-bottom: 10px;
+    }
+    .holding-symbol {
+      font-size: 18px;
+      letter-spacing: 0;
+      color: #fff;
+    }
+    .holding-weight {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--cyan);
+    }
+    .holding-metrics {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px 12px;
+    }
+    .holding-metric .k {
+      font-family: var(--font-body);
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 2px;
+    }
+    .holding-metric .v {
+      font-family: var(--font-mono);
+      color: var(--text);
+      font-size: 15px;
+    }
+    .holding-kind {
+      margin-top: 8px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    table {
+      font-size: 14px;
+      font-family: var(--font-body);
+    }
+    th {
+      font-family: var(--font-body);
+      font-size: 13px;
+      color: var(--text-muted);
+      padding: 0 10px 10px;
+      border-bottom-color: var(--border-strong);
+    }
+    td {
+      font-family: var(--font-body);
+      font-size: 14px;
+      color: var(--text);
+      padding: 9px 10px;
+    }
+    td.num {
+      font-family: var(--font-mono);
+    }
+    .pill {
+      border-radius: 999px;
+      font-family: var(--font-body);
+      font-size: 12px;
+      font-weight: 650;
+      padding: 3px 9px;
+    }
+    button, .btn, .bt-filter-chip, .bt-btn {
+      border-radius: var(--radius-sm);
+      font-family: var(--font-body);
+      font-size: 13px;
+      font-weight: 650;
+      padding: 7px 12px;
+      color: var(--text-secondary);
+      border-color: var(--border-strong);
+      background: var(--bg-elevated);
+    }
+    button:hover, .btn:hover, .bt-filter-chip:hover, .bt-btn:hover {
+      color: #fff;
+      border-color: var(--cyan);
+      background: rgba(56,189,248,0.12);
+    }
+    button.primary, .btn-primary, .bt-filter-chip.active {
+      background: var(--cyan);
+      color: #071018;
+      border-color: var(--cyan);
+      box-shadow: none;
+    }
+    select, input[type="text"], input[type="number"] {
+      font-family: var(--font-body);
+      font-size: 14px;
+      border-radius: var(--radius-sm);
+      padding: 8px 10px;
+    }
+    canvas { max-height: 340px; }
+    .pos, .pl { color: var(--green); }
+    .neg { color: var(--red); }
+    .pos.v, .neg.v { text-shadow: none; opacity: 1; }
+    .muted { color: var(--text-muted); }
+    #data-feed-widget {
+      background: var(--bg-panel) !important;
+      border-color: var(--border) !important;
+      border-radius: var(--radius) !important;
+      color: var(--text-secondary) !important;
+      font-size: 14px !important;
+    }
+    #signal-feed {
+      font-size: 14px !important;
+    }
+    #eq-legend-main, #eq-legend-basis, #eq-legend-spy {
+      color: var(--text-secondary);
+      font-size: 13px;
+    }
+    @media (max-width: 480px) {
+      body { font-size: 15px; }
+      .page-content { padding: 16px; }
+      .card { padding: 16px; }
+      h1 { font-size: 28px; }
+      .stat-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .stat .v { font-size: 22px; }
+      .stat .l { font-size: 12px; }
+      .holding-grid { grid-template-columns: 1fr; }
+      .holding-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      table, th, td { font-size: 13px; }
+    }
   </style>
 </head>
 <body>
@@ -1633,6 +2225,19 @@ TEMPLATE = r"""
           <div class="l">🐒 monkey rank</div>
           <div class="v" id="monkey-pct">—</div>
           <div class="muted" id="monkey-sub" style="font-size:10px;font-family:var(--font-mono);letter-spacing:0.06em;margin-top:1px;">active rnd</div>
+        </div>
+      </div>
+      <div class="portfolio-strip" id="portfolio-strip">
+        <div class="book-line">
+          <span>Book <strong id="book-summary">loading…</strong></span>
+          <span id="book-top-risk">—</span>
+        </div>
+        <div class="exposure-bar" aria-label="portfolio exposure split">
+          <div class="exposure-invested" id="exposure-invested" style="width:0%;"></div>
+          <div class="exposure-cash" id="exposure-cash" style="width:100%;"></div>
+        </div>
+        <div class="holding-grid" id="holding-grid">
+          <div class="holding-empty">loading positions…</div>
         </div>
       </div>
       <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">
@@ -2885,6 +3490,9 @@ function fmtTs(s, mode) {
   return d.toLocaleString(undefined, {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit", hour12:false});
 }
 const dt = s => fmtTs(s);
+const html = s => String(s ?? "").replace(/[&<>"']/g, c => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+}[c]));
 
 const INITIAL_TAB = "{{ initial_tab }}";
 const API_PREFIX = "{{ api_prefix }}";
@@ -3090,6 +3698,81 @@ let _lastEquity = [];  // cache for range filtering
 let _lastTrades = [];
 
 const EQ_RANGES = ["1d","5d","1m","3m","ytd","1y","3y","5y","all"];
+
+function holdAgeLabel(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s) || s < 0) return "—";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  return Math.floor(s / 86400) + "d";
+}
+
+function positionMarketValue(p) {
+  const mult = (p.type === "call" || p.type === "put") ? 100 : 1;
+  if (p.market_value != null && Number.isFinite(+p.market_value)) return +p.market_value;
+  return (+p.current_price || 0) * (+p.qty || 0) * mult;
+}
+
+function renderPortfolioStrip(portfolio, positions) {
+  const total = +((portfolio || {}).total_value || 0);
+  const cash = +((portfolio || {}).cash || 0);
+  const rows = Array.isArray(positions) ? positions.slice() : [];
+  const invested = rows.reduce((sum, p) => sum + Math.max(0, positionMarketValue(p)), 0);
+  const cashPct = total > 0 ? Math.max(0, Math.min(100, cash / total * 100)) : 0;
+  const investedPct = total > 0 ? Math.max(0, Math.min(100, invested / total * 100)) : 0;
+  const sorted = rows.sort((a, b) => positionMarketValue(b) - positionMarketValue(a));
+  const top = sorted[0];
+  const bookSummary = document.getElementById("book-summary");
+  const topRisk = document.getElementById("book-top-risk");
+  const invBar = document.getElementById("exposure-invested");
+  const cashBar = document.getElementById("exposure-cash");
+  const grid = document.getElementById("holding-grid");
+  if (bookSummary) {
+    bookSummary.textContent =
+      `${fmt(investedPct, 1)}% invested / ${fmt(cashPct, 1)}% cash · ` +
+      `${rows.length} position${rows.length === 1 ? "" : "s"}`;
+  }
+  if (topRisk) {
+    if (top && total > 0) {
+      topRisk.textContent = `top ${top.ticker || "?"} ${fmt(positionMarketValue(top) / total * 100, 1)}%`;
+    } else {
+      topRisk.textContent = "all cash";
+    }
+  }
+  if (invBar) invBar.style.width = `${investedPct.toFixed(1)}%`;
+  if (cashBar) cashBar.style.width = `${Math.max(0, 100 - investedPct).toFixed(1)}%`;
+  if (!grid) return;
+  if (!sorted.length) {
+    grid.innerHTML = `<div class="holding-empty">no open positions · ${dollar(cash)} cash</div>`;
+    return;
+  }
+  grid.innerHTML = sorted.map(p => {
+    const mv = positionMarketValue(p);
+    const weight = total > 0 ? mv / total * 100 : 0;
+    const pl = +(p.unrealized_pl || 0);
+    const plCls = pl >= 0 ? "pos" : "neg";
+    const plPct = p.pl_pct;
+    const plPctTxt = plPct == null ? "—" : `${plPct >= 0 ? "+" : ""}${fmt(plPct, 2)}%`;
+    const label = p.type === "stock"
+      ? "stock"
+      : `${String(p.type || "").toUpperCase()} ${p.strike || ""}/${p.expiry || ""}`;
+    return `<div class="holding-tile">
+      <div class="holding-head">
+        <span class="holding-symbol">${html(p.ticker || "?")}</span>
+        <span class="holding-weight">${fmt(weight, 1)}%</span>
+      </div>
+      <div class="holding-metrics">
+        <div class="holding-metric"><div class="k">value</div><div class="v">${dollar(mv)}</div></div>
+        <div class="holding-metric"><div class="k">P/L</div><div class="v ${plCls}">${pl >= 0 ? "+" : ""}${fmt(pl)}</div></div>
+        <div class="holding-metric"><div class="k">return</div><div class="v ${plPct == null ? "" : plCls}">${plPctTxt}</div></div>
+        <div class="holding-metric"><div class="k">qty</div><div class="v">${fmt(p.qty, 4)}</div></div>
+        <div class="holding-metric"><div class="k">mark</div><div class="v">${fmt(p.current_price)}</div></div>
+        <div class="holding-metric"><div class="k">held</div><div class="v">${holdAgeLabel(p.hold_seconds)}</div></div>
+      </div>
+      <div class="muted holding-kind">${html(label)}</div>
+    </div>`;
+  }).join("");
+}
 
 function setEqMode(mode) {
   eqChartMode = mode === "return" ? "return" : "value";
@@ -3527,6 +4210,7 @@ async function refresh() {
 
   const posBody = document.querySelector("#pos-tbl tbody");
   const portTotal = r.portfolio.total_value || 0;
+  renderPortfolioStrip(r.portfolio, r.positions);
   posBody.innerHTML = r.positions.map(p => {
     const cls = (p.unrealized_pl || 0) >= 0 ? "pos" : "neg";
     const label = p.type === "stock" ? p.type :

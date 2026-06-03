@@ -1,83 +1,93 @@
 {
   "_account": {
-    "last_updated": "2026-05-21T11:11 PDT (fills confirmed via Futubull)"
+    "broker": "Futu Securities International (Hong Kong)",
+    "account": "Margin Universal Account(7883)",
+    "last_updated": "2026-06-02T13:37 PDT (screenshot from Futubull)",
+    "total_assets_usd": 11331.14,
+    "net_assets_usd": 11331.14,
+    "market_value_usd": 8980.38,
+    "cash_usd": 2350.76,
+    "excess_liquidity_usd": 3533.31,
+    "max_buying_power_usd": 6458.94,
+    "today_pl_usd": 1727.96,
+    "total_position_pl_usd": 137.86,
+    "risk_status": "Safe"
   },
-  "_note": "Sao's trading portfolio - updated via UI",
+  "_note": "Sao's trading portfolio - updated from Futubull screenshot",
   "options": [
     {
-      "avg_cost": 2.236,
-      "expiry": "2026-05-29",
-      "notes": "DRAM sector call, exp 260529, strike 59",
-      "qty": 21,
-      "strike": 59,
-      "symbol": "DRAM CALL",
+      "avg_cost": 2.29,
+      "expiry": "2026-08-21",
+      "market_value": 4355.0,
+      "notes": "NOK call, exp 260821, strike 15; today's P/L +1280.50",
+      "price": 3.35,
+      "qty": 13,
+      "strike": 15,
+      "symbol": "NOK CALL",
+      "today_pl": 1280.5,
       "type": "call",
-      "underlying": "DRAM"
+      "underlying": "NOK"
+    },
+    {
+      "avg_cost": 2.31,
+      "expiry": "2026-06-18",
+      "market_value": 0.0,
+      "notes": "GRID call, exp 260618, strike 200; zero quantity shown in screenshot",
+      "price": 1.63,
+      "qty": 0,
+      "strike": 200,
+      "symbol": "GRID CALL",
+      "today_pl": 44.4,
+      "type": "call",
+      "underlying": "GRID"
     }
   ],
   "positions": [
     {
-      "avg_cost": 72.48,
-      "notes": "Defiance Daily leveraged - 14 shares",
-      "qty": 14,
-      "ticker": "LNOK",
-      "type": "stock"
-    },
-    {
-      "avg_cost": 125.07,
-      "notes": "GraniteShares 2x Long NVDA Daily ETF",
-      "qty": 38,
-      "ticker": "NVDL",
-      "type": "etf_leveraged"
-    },
-    {
-      "avg_cost": 876.681,
-      "notes": "Lumentum - photonics/semis; 3.615 shares @ 876.681 avg (blended, filled 2026-05-21)",
-      "qty": 3.615,
-      "ticker": "LITE",
-      "type": "stock"
-    },
-    {
-      "avg_cost": 514.54,
-      "notes": "Direxion Daily MU Bull 2X - 5 shares @ 514.54, filled 2026-05-21",
-      "qty": 5,
+      "avg_cost": 800.0,
+      "market_value": 2950.96,
+      "notes": "Direxion Daily MU Bull 2X ETF; today's P/L +351.04",
+      "price": 983.655,
+      "qty": 3,
       "ticker": "MUU",
+      "today_pl": 351.04,
       "type": "etf_leveraged"
     },
     {
-      "avg_cost": 424.665,
-      "notes": "Microsoft - 4.7095 shares @ 424.665, filled 2026-05-21 ($2,000)",
-      "qty": 4.7095,
-      "ticker": "MSFT",
-      "type": "stock"
+      "avg_cost": 5.46,
+      "market_value": 1674.42,
+      "notes": "Leverage Shares 2X Long ADBE Daily ETF; today's P/L +9.11",
+      "price": 5.49,
+      "qty": 305,
+      "ticker": "ADBG",
+      "today_pl": 9.11,
+      "type": "etf_leveraged"
     },
     {
-      "avg_cost": 381.93,
-      "notes": "Alphabet-C - 7.8548 shares @ 381.93, filled 2026-05-21 ($3,000)",
-      "qty": 7.8548,
-      "ticker": "GOOG",
-      "type": "stock"
-    },
-    {
-      "avg_cost": 362.631,
-      "notes": "Coherent - 5.5152 shares @ 362.631, filled 2026-05-21 ($2,000)",
-      "qty": 5.5152,
-      "ticker": "COHR",
-      "type": "stock"
+      "avg_cost": 104.406,
+      "market_value": 0.0,
+      "notes": "Defiance Daily Target 2X Long NOK ETF; zero quantity shown in screenshot",
+      "price": 106.385,
+      "qty": 0,
+      "ticker": "LNOK",
+      "today_pl": 42.9,
+      "type": "etf_leveraged"
     }
   ],
   "sector_watchlist": [
-    "LRCX",
-    "AMAT",
-    "KLAC",
+    "NOK",
+    "LNOK",
+    "MU",
+    "MUU",
+    "ADBE",
+    "ADBG",
+    "GRID",
+    "SPY",
+    "QQQ",
+    "DIA",
     "NVDA",
     "AMD",
-    "WDC",
-    "STX",
     "SMH",
-    "SOXX",
-    "MU",
-    "AXTI",
-    "NVDL"
+    "SOXX"
   ]
 }

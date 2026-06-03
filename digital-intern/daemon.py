@@ -204,15 +204,15 @@ from core.retrain_guard import is_retrain_failure as _ml_retrain_is_failure
 
 # ── Config ──────────────────────────────────────────────────────────────────
 HEARTBEAT_INTERVAL  = 5 * 3600   # 5h
-RSS_INTERVAL        = 30          # re-poll RSS every 30s (collector is parallelized)
-WEB_INTERVAL        = 60          # scrape web every 60s
-REDDIT_INTERVAL     = 45          # re-poll Reddit every 45s
-STOCKTWITS_INTERVAL = 90          # re-poll StockTwits trending every 90s
-TICKER_INTERVAL     = 60          # re-fetch ticker news every 60s
-SCORE_INTERVAL      = 30          # run scoring pass every 30s
-ALERT_CHECK         = 20          # check for urgent alerts every 20s
+RSS_INTERVAL        = 5           # high-throughput mode: re-poll RSS every 5s
+WEB_INTERVAL        = 5           # high-throughput mode: scrape web as soon as prior pass cools down
+REDDIT_INTERVAL     = 10          # high-throughput mode: re-poll Reddit every 10s
+STOCKTWITS_INTERVAL = 15          # high-throughput mode: re-poll StockTwits every 15s
+TICKER_INTERVAL     = 10          # high-throughput mode: re-fetch ticker news every 10s
+SCORE_INTERVAL      = 5           # high-throughput mode: run scoring pass every 5s
+ALERT_CHECK         = 10          # high-throughput mode: check urgent alerts every 10s
 PURGE_INTERVAL      = 6 * 3600   # purge old data every 6h
-GDELT_INTERVAL      = 600         # full GDELT sweep every 10min
+GDELT_INTERVAL      = 120         # high-throughput mode: full GDELT sweep every 2min
 ML_TRAIN_INTERVAL   = 1800        # full ArticleNet retrain every 30 min (GPU)
 CONTINUOUS_TRAIN_INTERVAL = 600   # lightweight GPU pass every 10 min
 RECURSIVE_LABEL_INTERVAL = 4 * 3600  # recursive Claude labeling every 4h
@@ -225,15 +225,15 @@ SEC_ACTIVIST_INTERVAL = 600       # SEC activist/M&A special filings every 10min
 SEC_PROSPECTUS_INTERVAL = 900     # SEC 424B/S-1 prospectus filings every 15min
 SEC_ENFORCEMENT_INTERVAL = 900    # SEC enforcement: litigation, admin proceedings, suspensions every 15min
 SEC_KEYWORD_INTERVAL  = 3600      # SEC 8-K keyword event scanner (layoffs/M&A/breach) once per hour
-GOOGLE_NEWS_INTERVAL = 120        # Google News per-ticker pass every 2min
-NITTER_INTERVAL     = 180         # Nitter twitter mirror every 3min
+GOOGLE_NEWS_INTERVAL = 10         # high-throughput mode: Google News ticker pass every 10s
+NITTER_INTERVAL     = 60          # high-throughput mode: Nitter twitter mirror every 1min
 SUBSTACK_INTERVAL   = 600         # Substack newsletters every 10min
-FINNHUB_INTERVAL    = 300         # Finnhub per-ticker company news every 5min
+FINNHUB_INTERVAL    = 120         # Finnhub per-ticker company news every 2min
 ALPHAVANTAGE_INTERVAL = 1800      # AlphaVantage NEWS_SENTIMENT every 30min (free=25/day)
-POLYGON_INTERVAL    = 600         # Polygon news per-ticker every 10min (free=5/min)
-MASSIVE_INTERVAL    = 600         # Massive.com news per-ticker every 10min
+POLYGON_INTERVAL    = 300         # Polygon news per-ticker every 5min (free=5/min)
+MASSIVE_INTERVAL    = 180         # Massive.com news per-ticker every 3min
 NEWSAPI_INTERVAL    = 1500        # NewsAPI keyword search every 25min (free=100/day)
-YAHOO_TICKER_RSS_INTERVAL = 240   # Yahoo per-ticker RSS every 4min
+YAHOO_TICKER_RSS_INTERVAL = 60    # high-throughput mode: Yahoo per-ticker RSS every 1min
 WIKIPEDIA_INTERVAL  = 600         # Wikipedia recent-changes filter every 10min
 WIKI_PAGEVIEWS_INTERVAL = 3600    # Wikipedia pageview z-score surge alerts once per hour
 MACRO_CALENDAR_INTERVAL = 3600    # FOMC/BLS macro event calendar — once per hour
@@ -246,13 +246,13 @@ CBOE_VOL_INDICES_INTERVAL = 3600  # CBOE OVX/GVZ/SKEW cross-asset vol indices �
 CONGRESS_TRADES_INTERVAL = 3600   # Congressional trading disclosures — once per hour
 CBOE_UNUSUAL_OPTIONS_INTERVAL = 900  # CBOE unusual options flow — every 15min
 CISA_KEV_INTERVAL       = 3600    # CISA Known Exploited Vulnerabilities catalog — once per hour
-MARKET_MOVERS_INTERVAL  = 300     # Yahoo Finance gainers/losers/most-active every 5min
-YAHOO_TRENDING_INTERVAL = 300     # Yahoo Finance trending tickers (retail attention) every 5min
+MARKET_MOVERS_INTERVAL  = 60      # high-throughput mode: Yahoo gainers/losers/most-active every 1min
+YAHOO_TRENDING_INTERVAL = 60      # high-throughput mode: Yahoo trending tickers every 1min
 FEAR_GREED_INTERVAL     = 600     # CNN Fear & Greed Index every 10min
 CRYPTO_FEAR_GREED_INTERVAL = 1800  # Crypto Fear & Greed (alternative.me) every 30min
 CRYPTO_FUNDING_INTERVAL   = 1800  # OKX perpetual funding rates every 30min
 COINGECKO_INTERVAL        = 1800  # CoinGecko crypto market snapshot every 30min
-CRYPTO_NEWS_RSS_INTERVAL  = 600   # CoinTelegraph/CoinDesk/Decrypt RSS every 10min
+CRYPTO_NEWS_RSS_INTERVAL  = 120   # crypto RSS every 2min
 DEFILLAMA_TVL_INTERVAL    = 3600  # DeFiLlama DeFi TVL signals every 60min
 EARNINGS_SURPRISE_INTERVAL = 900  # EPS beat/miss scanner every 15min
 EARNINGS_IV_MOVE_INTERVAL  = 1800 # IV-implied expected move pre-earnings every 30min
@@ -284,7 +284,7 @@ DXY_INTERVAL            = 600     # DXY + major-pair FX snapshot every 10min
 INSIDER_CLUSTER_INTERVAL = 600    # EDGAR Form 4 cluster-buy scan every 10min
 SECTOR_ETF_INTERVAL     = 600     # Sector ETF momentum snapshot every 10min
 COMMODITY_FUTURES_INTERVAL = 600  # Commodity futures price monitor every 10min
-BENZINGA_INTERVAL       = 300     # Benzinga analyst-ratings RSS sweep every 5min
+BENZINGA_INTERVAL       = 60      # Benzinga analyst-ratings RSS sweep every 1min
 LAYOFF_TRACKER_INTERVAL = 600     # Layoff tracker (TechCrunch + Google News) every 10min
 CREDIT_RATING_INTERVAL  = 600     # Moody's/S&P/Fitch rating actions — every 10min
 NYFED_LIQUIDITY_INTERVAL = 3600  # NY Fed RRP + SOMA (Fed balance sheet) — every 60min
@@ -313,20 +313,20 @@ TREASURY_AUCTIONS_INTERVAL = 1800  # UST auction announcements from TreasuryDire
 ARXIV_QFIN_INTERVAL    = 3600     # arXiv q-fin + econ new papers (weekday evenings) — hourly
 QUANT_RESEARCH_INTERVAL = 3600   # quant blogs: Quantocracy, Alpha Architect, Newfound, Predicting Alpha
 CFTC_PRESS_INTERVAL    = 1800     # CFTC press + enforcement releases — every 30min
-FINVIZ_INTERVAL        = 300      # Finviz per-ticker news table (round-robin batch) — every 5min
-SEEKINGALPHA_INTERVAL  = 300      # Seeking Alpha breaking-news RSS — every 5min
+FINVIZ_INTERVAL        = 60       # Finviz per-ticker news table round-robin every 1min
+SEEKINGALPHA_INTERVAL  = 60       # Seeking Alpha breaking-news RSS every 1min
 RSI_EXTREMES_INTERVAL  = 900      # RSI overbought/oversold signals — every 15min
 AAII_SENTIMENT_INTERVAL = 3600 * 6  # AAII weekly survey — re-check every 6h (deduped by date)
 DTCC_FTD_INTERVAL       = 3600 * 4  # DTCC fails-to-deliver (bi-monthly, deduped by period) — every 4h
-GLOBENEWSWIRE_INTERVAL  = 600     # GlobeNewswire financial press releases (8 subject feeds) — every 10min
-PRNEWSWIRE_INTERVAL     = 600     # PR Newswire press releases (general + financial feeds) — every 10min
+GLOBENEWSWIRE_INTERVAL  = 120     # GlobeNewswire financial press releases every 2min
+PRNEWSWIRE_INTERVAL     = 120     # PR Newswire press releases every 2min
 SHORT_SELLER_INTERVAL      = 1800    # Short-seller research reports (rare, high-priority) — every 30min
 ROBINHOOD_POPULAR_INTERVAL = 3600    # Robinhood 100 most-popular (retail sentiment) — hourly, deduped daily
-FINANCIAL_BLOGS_INTERVAL = 600    # InvestorPlace, Motley Fool, Nasdaq RSS — every 10min
-INVESTMENT_RESEARCH_BLOGS_INTERVAL = 900  # CMT/LynAlden/Felder/AWoCS/AlphaArchitect blogs — every 15min
-THINK_TANK_RESEARCH_INTERVAL = 1800   # ProMarket/Apricitas/EmployAmerica/VoxEU/PhenomenalWorld — every 30min
-EARNINGS_TRANSCRIPT_INTERVAL = 300  # Motley Fool earnings transcripts — every 5min
-HACKERNEWS_INTERVAL     = 300     # Hacker News front-page + finance/business stories — every 5min
+FINANCIAL_BLOGS_INTERVAL = 120    # InvestorPlace, Motley Fool, Nasdaq RSS every 2min
+INVESTMENT_RESEARCH_BLOGS_INTERVAL = 180  # investment research blogs every 3min
+THINK_TANK_RESEARCH_INTERVAL = 300   # policy/econ research feeds every 5min
+EARNINGS_TRANSCRIPT_INTERVAL = 60  # Motley Fool earnings transcripts every 1min
+HACKERNEWS_INTERVAL     = 60      # Hacker News front-page + finance/business stories every 1min
 CLINICAL_TRIALS_INTERVAL = 3600   # ClinicalTrials.gov Phase 3 catalyst tracker (pharma/biotech) — hourly
 MARKET_BREADTH_INTERVAL = 3600    # Finviz market breadth (% above MAs, new highs/lows) — hourly
 MARKET_VALUATION_INTERVAL = 3600 * 4  # S&P 500 P/E, CAPE, earnings yield — every 4h (multpl.com)
@@ -3778,13 +3778,13 @@ def catalyst_cycle_worker(store: ArticleStore):
     The standard BREAKING worker still handles single urgent articles. This
     worker watches the narrative cycle Jonathan described in #chat: fresh AI
     catalyst, chase, stale follow-up, profit-taking/dip risk, then next
-    catalyst. Urgent monitor posts mention Jonathan and Sao; watch-level posts
-    stay quiet in #claw.
+    catalyst. Only urgent events are posted to #claw; watch-level cycle notes
+    stay in the JSON report to avoid noisy "everyone knows this" alerts.
     """
     log.info("[catalyst_cycle_worker] started")
     while _running:
         try:
-            report = run_catalyst_cycle_monitor(dry_run=False, min_level="watch")
+            report = run_catalyst_cycle_monitor(dry_run=False, min_level="urgent")
             urgent = sum(1 for e in report.get("events", []) if e.get("level") == "urgent")
             selected = len(report.get("selected_for_send", []))
             log.info(

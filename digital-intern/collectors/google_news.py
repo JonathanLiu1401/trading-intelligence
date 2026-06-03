@@ -23,9 +23,9 @@ CURSOR_PATH = BASE_DIR / "data" / "google_news_cursor.json"
 DB_PATH = BASE_DIR / "data" / "seen_articles.db"
 
 # How many tickers to fetch per call.
-BATCH_PER_PASS = 8
+BATCH_PER_PASS = 64
 # Skip a ticker if we polled it within this many seconds (prevents thrash on restart).
-PER_TICKER_COOLDOWN_SEC = 120
+PER_TICKER_COOLDOWN_SEC = 10
 USER_AGENT = "Mozilla/5.0 (Digital Intern Daemon)"
 
 
@@ -55,7 +55,14 @@ def _load_tickers() -> list[str]:
     try:
         with open(WATCHLIST_PATH, "r") as f:
             wl = json.load(f)
-        for key in ("memory_core", "semis_equipment", "portfolio"):
+        for key in (
+            "memory_core",
+            "semis_equipment",
+            "broader_semis",
+            "memory_options_focus",
+            "korean",
+            "portfolio",
+        ):
             for t in wl.get(key, []):
                 _add(t)
     except Exception:

@@ -12,7 +12,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=12)
-MAX_CONCURRENT = 80
+MAX_CONCURRENT = 180
 USER_AGENT = "Mozilla/5.0 (compatible; FinancialIntelBot/1.0)"
 
 # Direct article list pages to scrape (HTML, not RSS)
@@ -35,6 +35,16 @@ SCRAPE_TARGETS = [
     "https://www.reuters.com/technology/",
     "https://www.reuters.com/markets/",
     "https://www.reuters.com/business/",
+    "https://www.reuters.com/markets/asia/",
+    "https://www.reuters.com/markets/europe/",
+    "https://www.reuters.com/markets/global-market-data/",
+    "https://www.reuters.com/business/aerospace-defense/",
+    "https://www.reuters.com/business/autos-transportation/",
+    "https://www.reuters.com/business/energy/",
+    "https://www.reuters.com/business/finance/",
+    "https://www.reuters.com/business/healthcare-pharmaceuticals/",
+    "https://www.reuters.com/business/media-telecom/",
+    "https://www.reuters.com/business/retail-consumer/",
     "https://www.bloomberg.com/markets",
     "https://www.bloomberg.com/technology",
     "https://www.bloomberg.com/economics",
@@ -156,6 +166,21 @@ SCRAPE_TARGETS = [
     "https://asia.nikkei.com/Business/Technology",
     "https://asia.nikkei.com/Business/Semiconductors",
     "https://asia.nikkei.com/Economy",
+    "https://www.digitimes.com/",
+    "https://www.digitimes.com/news/",
+    "https://www.taipeitimes.com/News/biz",
+    "https://focustaiwan.tw/business",
+    "https://www.straitstimes.com/business",
+    "https://www.channelnewsasia.com/business",
+    "https://www.thestar.com.my/business",
+    "https://www.bangkokpost.com/business",
+    "https://www.theedgemalaysia.com/section/business",
+    "https://www.businesstimes.com.sg/",
+    "https://www.businesstimes.com.sg/companies-markets",
+    "https://www.thehindubusinessline.com/markets/",
+    "https://www.livemint.com/market",
+    "https://economictimes.indiatimes.com/markets",
+    "https://www.moneycontrol.com/news/business/markets/",
     "https://www.scmp.com/business/markets",
     "https://www.scmp.com/tech",
     "https://www.scmp.com/business",
@@ -169,10 +194,26 @@ SCRAPE_TARGETS = [
     # ── Europe ────────────────────────────────────────────────────────────
     "https://www.euronews.com/business",
     "https://www.dw.com/en/economy-and-business/s-1440",
+    "https://www.france24.com/en/business-tech/",
+    "https://www.lemonde.fr/en/economy/",
+    "https://www.politico.eu/section/economy/",
+    "https://www.euractiv.com/sections/economy-jobs/",
+    "https://www.thelocal.de/business",
     "https://www.theguardian.com/business/economics",
     "https://www.theguardian.com/business",
     "https://www.theguardian.com/business/stock-markets",
     "https://www.independent.co.uk/topic/business",
+    # ── Middle East / Africa / LatAm ─────────────────────────────────────
+    "https://www.aljazeera.com/economy/",
+    "https://www.thenationalnews.com/business/",
+    "https://www.arabnews.com/business-economy",
+    "https://www.zawya.com/en/markets",
+    "https://www.arabianbusiness.com/markets",
+    "https://www.businesslive.co.za/bd/",
+    "https://www.moneyweb.co.za/",
+    "https://www.reuters.com/world/africa/",
+    "https://www.reuters.com/world/middle-east/",
+    "https://www.reuters.com/world/americas/",
     # ── Supply chain ─────────────────────────────────────────────────────
     "https://www.supplychaindive.com/news/",
     "https://www.logisticsmgmt.com/news/",

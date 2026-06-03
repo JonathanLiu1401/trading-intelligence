@@ -5099,6 +5099,169 @@ def _last_fill_line(store) -> str:
         return ""
 
 
+def _portfolio_exposure_line(
+    positions: list[dict],
+    total_value: float,
+    cash: float,
+) -> str:
+    """Compact book composition line for the top of Discord reports."""
+    try:
+        total = float(total_value or 0.0)
+        cash_f = float(cash or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    if total <= 0:
+        return ""
+    cash_pct = max(0.0, min(100.0, cash_f / total * 100.0))
+    held: list[tuple[str, float]] = []
+    for p in positions or []:
+        try:
+            qty = float(p.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty <= 0:
+            continue
+        ptype = (p.get("type") or "stock").lower()
+        mult = 100.0 if ptype in ("call", "put") else 1.0
+        cur = 0.0
+        for key in ("current_price", "avg_cost"):
+            try:
+                v = float(p.get(key) or 0.0)
+            except (TypeError, ValueError):
+                v = 0.0
+            if v > 0:
+                cur = v
+                break
+        label = (p.get("ticker") or "?").upper()
+        held.append((label, qty * cur * mult))
+    held = [(tk, mv) for tk, mv in held if mv > 0]
+    if not held:
+        return f"**Exposure** ◈ cash {cash_pct:.1f}% · 0 positions"
+    held.sort(key=lambda item: item[1], reverse=True)
+    top = held[0]
+    top_pct = top[1] / total * 100.0
+    invested_pct = max(0.0, min(100.0, 100.0 - cash_pct))
+    return (
+        f"**Exposure** ◈ invested {invested_pct:.1f}% · cash {cash_pct:.1f}% "
+        f"· {len(held)} position{'' if len(held) == 1 else 's'} "
+        f"· top {top[0]} {top_pct:.1f}%"
+    )
+
+
+_COMPACT_KEEP_BLOCKS = 12
+_COMPACT_KEEP_FULL = {"SESSION", "BEHAVIOURAL"}
+_COMPACT_PRIORITY = {
+    "MARKET": 10,
+    "MARK INTEGRITY": 20,
+    "ENGINE LATCH": 21,
+    "FEED HEALTH": 22,
+    "DEAD TICKERS": 23,
+    "SUPERVISION": 24,
+    "EQUITY INTEGRITY": 25,
+    "EQUITY FRESHNESS": 26,
+    "SESSION": 30,
+    "TODAY": 31,
+    "BENCHMARK": 32,
+    "DRAWDOWN": 33,
+    "TODAY P/L": 34,
+    "BEHAVIOURAL": 40,
+    "FORWARD STRESS": 41,
+    "CAPITAL": 42,
+    "PLAN DEBT": 43,
+    "CONCENTRATION": 44,
+    "LAST FILL": 45,
+    "ENGINE DECIDING?": 46,
+}
+
+
+def _diagnostic_name(block: str) -> str:
+    first = (block.splitlines() or [""])[0]
+    if "**" not in first:
+        return first.strip()
+    parts = first.split("**")
+    return parts[1].strip() if len(parts) >= 3 else first.strip()
+
+
+def _compact_diagnostic_block(block: str) -> str:
+    lines = [ln.rstrip() for ln in block.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    name = _diagnostic_name(block)
+    if name in _COMPACT_KEEP_FULL:
+        return "\n".join(lines)
+    header = lines[0]
+    detail = ""
+    for ln in lines[1:]:
+        if ln == "```":
+            continue
+        if ln.startswith("> "):
+            detail = ln
+            break
+        if ln.startswith("`") and ln.endswith("`"):
+            detail = ln
+            break
+        if not detail:
+            detail = "> " + ln.lstrip("> ").strip()
+            break
+    return header if not detail else f"{header}\n{detail[:260]}"
+
+
+def _compact_report_body(body: str) -> str:
+    """Keep the book readable by collapsing and capping diagnostic blocks."""
+    try:
+        lines = body.splitlines()
+        fence_count = 0
+        top_end = len(lines)
+        for i, ln in enumerate(lines):
+            if ln.strip() == "```":
+                fence_count += 1
+                if fence_count >= 6:
+                    top_end = i + 1
+                    break
+        top = "\n".join(lines[:top_end])
+        rest = "\n".join(lines[top_end:]).strip()
+        if not rest:
+            return body
+        raw_blocks: list[str] = []
+        cur: list[str] = []
+        for ln in rest.splitlines():
+            starts = (
+                ("**" in ln and "◈" in ln)
+                or ln.startswith(("⚠️ **", "✅ **", "📉 **", "🩸 **", "🟡 **"))
+            )
+            if starts and cur:
+                raw_blocks.append("\n".join(cur).strip())
+                cur = [ln]
+            else:
+                cur.append(ln)
+        if cur:
+            raw_blocks.append("\n".join(cur).strip())
+        ranked = sorted(
+            enumerate(raw_blocks),
+            key=lambda item: (
+                _COMPACT_PRIORITY.get(_diagnostic_name(item[1]), 1000),
+                item[0],
+            ),
+        )
+        kept_idx = {idx for idx, _ in ranked[:_COMPACT_KEEP_BLOCKS]}
+        omitted = len(raw_blocks) - len(kept_idx)
+        # Restore original ordering among the kept blocks.
+        kept_ordered = [
+            _compact_diagnostic_block(b)
+            for i, b in enumerate(raw_blocks)
+            if i in kept_idx
+        ]
+        out = top + "\n**Diagnostics**"
+        if kept_ordered:
+            out += "\n" + "\n".join(k for k in kept_ordered if k)
+        if omitted > 0:
+            out += f"\n… {omitted} lower-priority diagnostic block(s) hidden"
+        return out
+    except Exception as e:
+        print(f"[reporter] compact report skipped: {e}")
+        return body
+
+
 def _alarm_latch_line() -> str:
     """One-line "is the engine silently latched?" surface for the hourly
     Discord summary.
@@ -5176,6 +5339,7 @@ def send_hourly_summary() -> bool:
         f"P/L         ${pl:+.2f} ({pl_pct:+.2f}%)\n"
         f"{sp_line}\n"
         f"```\n"
+        f"{_portfolio_exposure_line(positions, pf['total_value'], pf['cash'])}\n"
         f"**Positions**\n```\n"
         + ("\n".join(_portfolio_lines(positions, pf["total_value"],
                                        events_by_ticker=events_by_ticker,
@@ -5519,7 +5683,7 @@ def send_hourly_summary() -> bool:
     lrd = _last_real_decision_line(store)
     if lrd:
         body += "\n" + lrd
-    return _send(body)
+    return _send(_compact_report_body(body))
 
 
 def send_daily_close() -> bool:
@@ -5540,13 +5704,9 @@ def send_daily_close() -> bool:
     today = datetime.now(timezone.utc).date().isoformat()
     todays_trades = [t for t in store.recent_trades(200) if t["timestamp"].startswith(today)]
     n_trades = len(todays_trades)
-    pnl_real = sum(
-        t["value"] if t["action"].startswith("SELL") else -t["value"]
-        for t in todays_trades
-    )
-
     # True realized P/L from round-trips closed today (additive — the
-    # cash-flow line above stays). Deep window so an old-open/today-close
+    # old cash-flow line is intentionally not rendered: open buys made it
+    # look like the desk had realized huge losses. Deep window so an old-open/today-close
     # trip pairs correctly inside build_round_trips.
     rt = _realized_pl_today(store.recent_trades(5000), today)
     if rt is not None:
@@ -5575,11 +5735,11 @@ def send_daily_close() -> bool:
         f"Equity         ${pf['total_value']:.2f}\n"
         f"Cash           ${pf['cash']:.2f}\n"
         f"Total P/L      ${pl:+.2f} ({pl_pct:+.2f}%)  {basis_note}\n"
-        f"Realized P/L (today, cash flow basis)  ${pnl_real:+.2f}\n"
         f"{realized_rt_line}"
         f"Trades today   {n_trades}\n"
         f"{sp_line}\n"
         f"```\n"
+        f"{_portfolio_exposure_line(positions, pf['total_value'], pf['cash'])}\n"
         f"**Open positions**\n```\n"
         + ("\n".join(_portfolio_lines(positions, pf["total_value"],
                                        events_by_ticker=events_by_ticker,
@@ -5808,4 +5968,4 @@ def send_daily_close() -> bool:
     lrd = _last_real_decision_line(store)
     if lrd:
         body += "\n" + lrd
-    return _send(body)
+    return _send(_compact_report_body(body))

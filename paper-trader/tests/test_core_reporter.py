@@ -1252,6 +1252,60 @@ class TestBookExposureLine:
         assert "biggest NVDA 50.0%" in line
 
 
+class TestPortfolioReportCompactness:
+    def test_portfolio_exposure_line_names_cash_positions_and_top(self):
+        line = reporter._portfolio_exposure_line(
+            [
+                {
+                    "ticker": "MU",
+                    "type": "stock",
+                    "qty": 10,
+                    "current_price": 90.0,
+                    "avg_cost": 80.0,
+                },
+                {
+                    "ticker": "NOK",
+                    "type": "stock",
+                    "qty": 20,
+                    "current_price": 5.0,
+                    "avg_cost": 4.0,
+                },
+            ],
+            1200.0,
+            200.0,
+        )
+        assert line == (
+            "**Exposure** ◈ invested 83.3% · cash 16.7% · "
+            "2 positions · top MU 75.0%"
+        )
+
+    def test_compact_report_body_caps_and_shortens_diagnostics(self):
+        top = "\n".join([
+            "**HOURLY** ◈ now",
+            "```",
+            "Equity      $1000.00",
+            "```",
+            "**Exposure** ◈ cash 100.0% · 0 positions",
+            "**Positions**",
+            "```",
+            "  (none)",
+            "```",
+            "**Recent trades**",
+            "```",
+            "  (no trades yet)",
+            "```",
+        ])
+        blocks = [
+            f"**EXTRA {i}** ◈ VERDICT\n> long detail {i} " + ("x" * 400)
+            for i in range(20)
+        ]
+        body = reporter._compact_report_body(top + "\n" + "\n".join(blocks))
+        assert "**Diagnostics**" in body
+        assert "lower-priority diagnostic block(s) hidden" in body
+        assert "x" * 300 not in body
+        assert body.count("**EXTRA") == reporter._COMPACT_KEEP_BLOCKS
+
+
 class TestBreakerFiredAlertWithBookExposure:
     """The book exposure line is appended to ``send_breaker_fired_alert``
     when a store is supplied — the trader paged about a wedged engine
@@ -1450,15 +1504,12 @@ class TestSendDailyCloseBaseline:
 
 
 class TestSendDailyClosePnlReal:
-    """`send_daily_close` reports a same-day realized P/L on a *cash-flow*
-    basis: every SELL* adds its trade `value`, every other action (BUY*)
-    subtracts it. The trade `value` itself is written by `store.record_trade`
-    with the option ×100 contract multiplier. Both halves of that contract
-    were unlocked — only the baseline-label was tested. A sign flip
-    (`.startswith("SELL")` → `"BUY"`) or a dropped ×100 in `record_trade`
-    would ship green without this. One exact-value assertion pins both:
-    if ×100 were missing on options the total would be -449.50, not -400.00;
-    if the sign were inverted it would be +400.00.
+    """The daily close should not surface cash-flow pseudo-P/L as realized.
+
+    Same-day BUY values are cash deployment, not realized losses. The report
+    should keep the true round-trip realized line and the trade count, but
+    omit the old "cash flow basis" line that made open buys look like huge
+    realized drawdowns.
     """
 
     def _run(self, fresh_store, monkeypatch):
@@ -1483,13 +1534,11 @@ class TestSendDailyClosePnlReal:
     def test_realized_pl_cash_flow_sign_and_option_multiplier(
             self, fresh_store, monkeypatch):
         body = self._run(fresh_store, monkeypatch)
-        # -1000 + 550 - 250 + 300 = -400.00 exactly.
-        assert "Realized P/L (today, cash flow basis)  $-400.00" in body
+        assert "Realized P/L (today, cash flow basis)" not in body
         # Both option legs are buy/sell-classified; all four count as "today".
         assert "Trades today   4" in body
-        # Guard against the two regressions explicitly.
-        assert "$+400.00" not in body      # sign not inverted
-        assert "$-449.50" not in body      # option ×100 not dropped
+        assert "$-400.00" not in body
+        assert "$-449.50" not in body
 
 
 class TestSendDailyCloseRealizedRoundTrips:
@@ -1527,8 +1576,7 @@ class TestSendDailyCloseRealizedRoundTrips:
         body = captured[0]
         assert ("Realized P/L (today, 2 round-trips closed, 1W/1L)  "
                 "$+70.00") in body
-        # The cash-flow line is untouched and still present alongside it.
-        assert "Realized P/L (today, cash flow basis)" in body
+        assert "Realized P/L (today, cash flow basis)" not in body
 
     def test_no_line_when_nothing_closed_today(
             self, fresh_store, monkeypatch):
@@ -1538,8 +1586,7 @@ class TestSendDailyCloseRealizedRoundTrips:
         assert reporter.send_daily_close() is True
         body = captured[0]
         assert "round-trip" not in body
-        # Cash-flow line still renders (it counts opens too).
-        assert "Realized P/L (today, cash flow basis)" in body
+        assert "Realized P/L (today, cash flow basis)" not in body
 
     def test_singular_round_trip_grammar(self, fresh_store, monkeypatch):
         captured = self._wire(fresh_store, monkeypatch)

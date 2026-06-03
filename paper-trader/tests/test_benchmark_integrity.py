@@ -13,11 +13,22 @@ test isolation pattern documented in AGENTS.md).
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+
+_PAPER_TRADER_ROOT = str(Path(__file__).resolve().parent.parent)
+
+
+def _subprocess_env() -> dict:
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (_PAPER_TRADER_ROOT + os.pathsep + existing
+                         if existing else _PAPER_TRADER_ROOT)
+    return env
 
 import pytest
 
@@ -379,6 +390,7 @@ class TestCli:
             [sys.executable, "-m", "paper_trader.ml.benchmark_integrity",
              "--json", "--db", str(synthetic_backtest_db)],
             capture_output=True, text=True, timeout=30,
+            env=_subprocess_env(),
         )
         # Exit code 2 = ACTIVE_LEAK (synthetic db has recent unflagged rows).
         assert r.returncode == 2, r.stderr
@@ -406,6 +418,7 @@ class TestCli:
             [sys.executable, "-m", "paper_trader.ml.benchmark_integrity",
              "--json", "--db", str(db)],
             capture_output=True, text=True, timeout=30,
+            env=_subprocess_env(),
         )
         assert r.returncode == 0  # CLEAN
         payload = json.loads(r.stdout)
@@ -416,5 +429,6 @@ class TestCli:
             [sys.executable, "-m", "paper_trader.ml.benchmark_integrity",
              "--json", "--db", str(tmp_path / "nope.db")],
             capture_output=True, text=True, timeout=30,
+            env=_subprocess_env(),
         )
         assert r.returncode == 3  # INSUFFICIENT_DATA

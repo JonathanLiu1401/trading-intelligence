@@ -15,27 +15,7 @@ from pathlib import Path
 import pytest
 
 from analytics import alert_source_breakdown as mod
-
-
-_SCHEMA = """
-CREATE TABLE articles (
-    id           TEXT PRIMARY KEY,
-    url          TEXT NOT NULL,
-    title        TEXT NOT NULL,
-    source       TEXT,
-    published    TEXT,
-    kw_score     REAL DEFAULT 0,
-    ai_score     REAL DEFAULT 0,
-    urgency      INTEGER DEFAULT 0,
-    full_text    BLOB,
-    first_seen   TEXT NOT NULL,
-    cycle        INTEGER DEFAULT 0,
-    time_sensitivity REAL DEFAULT NULL,
-    ml_score     REAL DEFAULT NULL,
-    score_source TEXT DEFAULT NULL
-);
-CREATE INDEX idx_first_seen ON articles(first_seen);
-"""
+from storage.article_store import SCHEMA as _SCHEMA
 
 
 # ── Pure compute_breakdown contract ─────────────────────────────────────
