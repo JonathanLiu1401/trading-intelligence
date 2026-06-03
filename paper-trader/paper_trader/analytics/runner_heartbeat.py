@@ -59,7 +59,7 @@ from datetime import datetime, timezone
 # operator's JSON shape is stable across runs).
 _UNSET = object()
 
-OPEN_INTERVAL_S = 1800.0    # mirrors runner.OPEN_INTERVAL_S   (market open)
+OPEN_INTERVAL_S = 300.0     # mirrors runner.OPEN_INTERVAL_S   (market open)
 CLOSED_INTERVAL_S = 3600.0  # mirrors runner.CLOSED_INTERVAL_S (market closed)
 LAGGING_MULT = 1.25
 STALLED_MULT = 2.0

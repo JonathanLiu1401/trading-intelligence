@@ -66,7 +66,7 @@ class TestTierMirroring:
             now=now, calendar_path=_EMPTY_CAL,
         )
         assert r["tier"] == "MARKET_OPEN"
-        assert r["sleep_s"] == _di._MARKET_OPEN_S  # 1800
+        assert r["sleep_s"] == _di._MARKET_OPEN_S  # 300
         assert r["market_open"] is True
 
     def test_market_closed_weekend_with_position(self):
@@ -98,7 +98,7 @@ class TestTierMirroring:
             now=now, calendar_path=_EMPTY_CAL,
         )
         assert r["tier"] == "SESSION_OPEN"
-        assert r["sleep_s"] == _di._SESSION_OPEN_S  # 300
+        assert r["sleep_s"] == _di._SESSION_OPEN_S  # 180
 
 
 # ── Verdict ladder ─────────────────────────────────────────────────────
@@ -121,7 +121,7 @@ class TestVerdictLadder:
         assert r["is_overdue"] is False
 
     def test_recent_decision_is_on_schedule(self):
-        # MARKET_OPEN tier (1800s). 60s since last decision → ON_SCHEDULE.
+        # MARKET_OPEN tier (300s). 60s since last decision → ON_SCHEDULE.
         now = _utc(2026, 5, 18, 18, 0)
         last = (now - timedelta(seconds=60)).isoformat()
         r = build_decision_cadence(
@@ -130,8 +130,8 @@ class TestVerdictLadder:
         )
         assert r["verdict"] == "ON_SCHEDULE"
         assert r["since_last_decision_s"] == 60
-        # ETA = (last + 1800) - now = 1740s.
-        assert r["next_decision_eta_s"] == 1740
+        # ETA = (last + 300) - now = 240s.
+        assert r["next_decision_eta_s"] == 240
         assert r["is_overdue"] is False
 
     def test_at_sleep_boundary_stays_on_schedule(self):

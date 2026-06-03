@@ -2,9 +2,9 @@
 duration that replaces the hardcoded OPEN_INTERVAL_S / CLOSED_INTERVAL_S.
 
 Discriminating regressions locked here:
-* an earnings-window scenario falling back to MARKET_OPEN because the
-  earnings calendar wasn't consulted,
-* normal market hours not returning the documented 1800s,
+* after-close earnings monitoring running faster than regular-session cadence,
+* normal market hours not returning the documented 300s,
+* held-name earnings days using fast cadence while the market is closed,
 * a Saturday with no positions losing the QUIET_CLOSED optimisation and
   reverting to the MARKET_CLOSED default.
 """
@@ -42,12 +42,12 @@ def _write_calendar(path: Path, events: list[dict]) -> None:
     path.write_text(json.dumps(snap))
 
 
-# ─────────────────────── EARNINGS_WINDOW tier ───────────────────────
+# ─────────────────────── EARNINGS tiers ───────────────────────
 
-def test_earnings_window_held_name_today_returns_60_to_180s(tmp_path):
+def test_after_close_earnings_window_is_slower_than_market_open(tmp_path):
     """NVDA held + earnings today + it is 16:00 ET (inside the
-    15:45-18:30 ET reaction window) → must pick EARNINGS_WINDOW, NOT
-    fall back to MARKET_OPEN."""
+    15:45-18:30 ET reaction window) → use the after-close monitor cadence,
+    not a frantic loop faster than tradable market hours."""
     cal = tmp_path / "earnings_calendar.json"
     # 2026-05-19 (Tuesday) 16:00 ET — same date in ET as the earnings stamp.
     now_utc = _et(2026, 5, 19, 16, 0)
@@ -64,16 +64,58 @@ def test_earnings_window_held_name_today_returns_60_to_180s(tmp_path):
         now=now_utc,
         calendar_path=cal,
     )
-    assert 60 <= sleep_s <= 180, (
-        f"earnings-window tier should return 60-180s, got {sleep_s}"
+    assert sleep_s == 1800, (
+        f"after-close earnings monitor should return 1800s, got {sleep_s}"
+    )
+
+
+def test_held_earnings_today_regular_session_returns_fast_open_cadence(tmp_path):
+    """Held-name earnings day during regular NYSE hours → fast market-open
+    cadence. This keeps actual tradable sessions more closely watched than
+    closed-market monitoring."""
+    cal = tmp_path / "earnings_calendar.json"
+    now_utc = _et(2026, 5, 19, 14, 0)  # Tuesday, regular session
+    earnings_dt = datetime(2026, 5, 19, 0, 0, tzinfo=_NY)
+    _write_calendar(cal, [
+        {"ticker": "NVDA", "earnings_date": earnings_dt.isoformat()},
+    ])
+
+    sleep_s = compute_interval(
+        positions=[{"ticker": "NVDA"}],
+        now=now_utc,
+        calendar_path=cal,
+    )
+    assert sleep_s == 300, (
+        f"regular-session earnings day should return 300s, got {sleep_s}"
+    )
+
+
+def test_held_earnings_today_premarket_uses_closed_cadence(tmp_path):
+    """Held-name earnings day before the regular session must not use the
+    fast earnings-day tier. This was the bug behind frequent closed-market
+    cycles and sparse open-market cycles."""
+    cal = tmp_path / "earnings_calendar.json"
+    now_utc = _et(2026, 5, 19, 8, 0)  # Tuesday, premarket closed
+    earnings_dt = datetime(2026, 5, 19, 0, 0, tzinfo=_NY)
+    _write_calendar(cal, [
+        {"ticker": "NVDA", "earnings_date": earnings_dt.isoformat()},
+    ])
+
+    sleep_s = compute_interval(
+        positions=[{"ticker": "NVDA"}],
+        now=now_utc,
+        calendar_path=cal,
+    )
+    assert sleep_s == 3600, (
+        f"premarket earnings day should use closed cadence, got {sleep_s}"
     )
 
 
 # ─────────────────────── MARKET_OPEN tier ───────────────────────
 
-def test_normal_market_hours_no_earnings_returns_1800s(tmp_path):
+def test_normal_market_hours_no_earnings_returns_300s(tmp_path):
     """10:30 ET Tuesday, AAPL held, no earnings event for AAPL today
-    → MARKET_OPEN tier (1800s). Confirms the session-open window
+    → MARKET_OPEN tier (300s). Confirms the session-open window
     (9:30-10:00) is correctly exited at 10:00 and the empty calendar
     doesn't accidentally promote a tier."""
     cal = tmp_path / "earnings_calendar.json"
@@ -86,8 +128,8 @@ def test_normal_market_hours_no_earnings_returns_1800s(tmp_path):
         now=now_utc,
         calendar_path=cal,
     )
-    assert sleep_s == 1800, (
-        f"normal market hours should return 1800s, got {sleep_s}"
+    assert sleep_s == 300, (
+        f"normal market hours should return 300s, got {sleep_s}"
     )
 
 
@@ -128,7 +170,7 @@ def test_missing_calendar_path_does_not_raise(tmp_path):
     )
     # Missing file → no earnings tier — falls through to MARKET_OPEN
     # for a weekday 10:30 ET.
-    assert sleep_s == 1800
+    assert sleep_s == 300
 
 
 # ─────────────────────── half-day / holiday correctness ───────────────────────
@@ -136,7 +178,7 @@ def test_missing_calendar_path_does_not_raise(tmp_path):
 def test_half_day_afternoon_after_early_close_is_closed_cadence(tmp_path):
     """Day after Thanksgiving 2026 (2026-11-27) closes at 13:00 ET. At 14:30
     ET — three-quarters of an hour past the early bell — the trader must NOT
-    still be on the 30-min MARKET_OPEN cadence; the bug was the simple
+    still be on the fast MARKET_OPEN cadence; the bug was the simple
     9:30-16:00 rule kept firing OPEN-tier cycles for three hours on a closed
     market, doubling Opus subprocess load against a frozen book."""
     cal = tmp_path / "earnings_calendar.json"
@@ -147,7 +189,7 @@ def test_half_day_afternoon_after_early_close_is_closed_cadence(tmp_path):
         now=now_utc,
         calendar_path=cal,
     )
-    # Held position → MARKET_CLOSED (3600s), not MARKET_OPEN (1800s)
+    # Held position → MARKET_CLOSED (3600s), not MARKET_OPEN (300s)
     assert sleep_s == 3600, (
         f"half-day post-close should use closed cadence, got {sleep_s}s"
     )
@@ -155,7 +197,7 @@ def test_half_day_afternoon_after_early_close_is_closed_cadence(tmp_path):
 
 def test_half_day_before_early_close_still_open_cadence(tmp_path):
     """Day after Thanksgiving 2026 at 11:00 ET — pre-13:00 close, market IS
-    open. Cadence must remain MARKET_OPEN (1800s) so the fix does not over-
+    open. Cadence must remain MARKET_OPEN (300s) so the fix does not over-
     correct and starve the genuine half-day morning session."""
     cal = tmp_path / "earnings_calendar.json"
     _write_calendar(cal, [])
@@ -165,7 +207,7 @@ def test_half_day_before_early_close_still_open_cadence(tmp_path):
         now=now_utc,
         calendar_path=cal,
     )
-    assert sleep_s == 1800, (
+    assert sleep_s == 300, (
         f"half-day morning should still be open cadence, got {sleep_s}s"
     )
 
