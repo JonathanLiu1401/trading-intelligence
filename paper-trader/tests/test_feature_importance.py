@@ -307,20 +307,19 @@ class TestDegenerateFlag:
                                     oos_only=False, n_repeats=2)
         assert rep["verdict"] == "FLAT"
         assert "degenerate" in rep["hint"]
-        assert rep["n_degenerate_features"] == 11
+        assert rep["n_degenerate_features"] == len(fi.FEATURES)
+        assert set(rep["degenerate_features"]) == {
+            name for name, _, _ in fi.FEATURES
+        }
 
 
 class TestFeatureCoverage:
-    def test_all_eleven_logical_features_reported(self):
+    def test_all_logical_features_reported(self):
         rep = fi.feature_importance(_EchoScorer(), _buy_records(80),
                                     oos_only=False, n_repeats=2)
         names = {f["feature"] for f in rep["features"]}
-        assert names == {
-            "ml_score", "rsi", "macd", "mom5", "mom20", "regime_mult",
-            "vol_ratio", "bb_position", "news_urgency",
-            "news_article_count", "sector",
-        }
-        assert len(rep["features"]) == 11
+        assert names == {name for name, _, _ in fi.FEATURES}
+        assert len(rep["features"]) == len(fi.FEATURES)
         # sorted descending by rmse_increase
         incs = [f["rmse_increase"] for f in rep["features"]]
         assert incs == sorted(incs, reverse=True)
