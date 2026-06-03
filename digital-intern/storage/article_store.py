@@ -380,12 +380,16 @@ CREATE TABLE IF NOT EXISTS articles (
     time_sensitivity REAL DEFAULT NULL, -- 0..1, ML-predicted recency decay rate (NULL until scored)
     ml_score    REAL DEFAULT NULL,  -- model's own prediction (separate from ai_score to avoid training-feedback contamination)
     score_source TEXT DEFAULT NULL, -- 'llm' (Sonnet/Opus ground truth), 'ml' (model), 'briefing_boost' (Opus curation nudge); NULL=unscored
-    breaking_news INTEGER DEFAULT 0 -- 1 when analytics.breaking_news_detector finds a same-ticker burst
+    breaking_news INTEGER DEFAULT 0, -- 1 when analytics.breaking_news_detector finds a same-ticker burst
+    title_source_fingerprint TEXT DEFAULT NULL -- sha256(normalized title + source), live insert dedup gate
 );
 CREATE INDEX IF NOT EXISTS idx_urgency   ON articles(urgency);
 CREATE INDEX IF NOT EXISTS idx_ai_score  ON articles(ai_score DESC);
 CREATE INDEX IF NOT EXISTS idx_first_seen ON articles(first_seen);
 CREATE INDEX IF NOT EXISTS idx_cycle     ON articles(cycle);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_title_source_fingerprint
+    ON articles(title_source_fingerprint)
+    WHERE title_source_fingerprint IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS briefings (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -450,6 +454,37 @@ def _connect() -> sqlite3.Connection:
 
 def article_id(url: str, title: str) -> str:
     return hashlib.sha256(f"{url}||{title}".encode()).hexdigest()
+
+
+def _fingerprint_part(value: str | None) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).lower()
+
+
+def title_source_fingerprint(title: str | None, source: str | None) -> str:
+    """Stable same-publisher headline fingerprint for insertion-time dedup."""
+    return hashlib.sha256(
+        f"{_fingerprint_part(title)}||{_fingerprint_part(source)}".encode("utf-8")
+    ).hexdigest()
+
+
+def _is_live_insert_row(url: str | None, source: str | None) -> bool:
+    url_l = (url or "").strip().lower()
+    source_l = (source or "").strip().lower()
+    return (
+        not url_l.startswith("backtest://")
+        and not source_l.startswith("backtest_")
+        and not source_l.startswith("opus_annotation")
+    )
+
+
+def _live_title_source_fingerprint(
+    title: str | None, source: str | None, url: str | None
+) -> str | None:
+    if not title or not title.strip():
+        return None
+    if not _is_live_insert_row(url, source):
+        return None
+    return title_source_fingerprint(title, source)
 
 
 def _published_older_than(published: str, cutoff: datetime) -> bool:
@@ -605,6 +640,27 @@ class ArticleStore:
                 except sqlite3.OperationalError as e:
                     if "duplicate column" not in str(e).lower():
                         raise
+            if "title_source_fingerprint" not in cols:
+                try:
+                    self.conn.execute(
+                        "ALTER TABLE articles ADD COLUMN title_source_fingerprint TEXT DEFAULT NULL"
+                    )
+                    self.conn.commit()
+                    _log.info("[article_store] migration: added articles.title_source_fingerprint column")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+            try:
+                self.conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_title_source_fingerprint "
+                    "ON articles(title_source_fingerprint) "
+                    "WHERE title_source_fingerprint IS NOT NULL"
+                )
+                self.conn.commit()
+            except sqlite3.OperationalError as e:
+                _log.warning(
+                    f"[article_store] title_source_fingerprint index migration skipped: {e}"
+                )
             # One-time cleanup of training-label contamination: model predictions
             # that were written into ai_score (the column the trainer reads as
             # ground truth) created a feedback loop where the model trained on
@@ -726,6 +782,26 @@ class ArticleStore:
                 existing_urls = {r[0] for r in rows}
 
             skipped_url_dup = 0
+            candidate_fps = [
+                fp for fp in (
+                    _live_title_source_fingerprint(
+                        a.get("title", ""), a.get("source", ""), a.get("link", "")
+                    )
+                    for a in articles
+                )
+                if fp
+            ]
+            existing_title_source_fps: set[str] = set()
+            if candidate_fps:
+                placeholders = ",".join("?" * len(candidate_fps))
+                rows = self.conn.execute(
+                    "SELECT title_source_fingerprint FROM articles "
+                    f"WHERE title_source_fingerprint IN ({placeholders})",
+                    candidate_fps,
+                ).fetchall()
+                existing_title_source_fps = {r[0] for r in rows if r[0]}
+
+            skipped_title_source_dup = 0
             for art in articles:
                 url = art.get("link", "")
                 title = art.get("title", "")
@@ -734,22 +810,35 @@ class ArticleStore:
                 if url in existing_urls:
                     skipped_url_dup += 1
                     continue
+                source = art.get("source", "")
+                ts_fp = _live_title_source_fingerprint(title, source, url)
+                if ts_fp and ts_fp in existing_title_source_fps:
+                    skipped_title_source_dup += 1
+                    continue
                 aid = _canonical_article_id(url, title) if _CANON_AVAILABLE else article_id(url, title)
                 summary = art.get("summary", "")
                 self.conn.execute(
                     "INSERT OR IGNORE INTO articles "
-                    "(id, url, title, source, published, kw_score, first_seen, cycle, full_text) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    (aid, url, title, art.get("source", ""), art.get("published", ""),
+                    "(id, url, title, source, published, kw_score, first_seen, cycle, "
+                    "full_text, title_source_fingerprint) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (aid, url, title, source, art.get("published", ""),
                      art.get("_relevance_score", 0), now, cycle,
-                     compress(summary) if summary else None),
+                     compress(summary) if summary else None, ts_fp),
                 )
                 if self.conn.execute("SELECT changes()").fetchone()[0]:
                     inserted += 1
                     existing_urls.add(url)  # prevent within-batch dups after first insert
+                    if ts_fp:
+                        existing_title_source_fps.add(ts_fp)
             self.conn.commit()
             if skipped_url_dup:
                 _log.debug("[insert_batch] url-dedup skipped %d articles", skipped_url_dup)
+            if skipped_title_source_dup:
+                _log.debug(
+                    "[insert_batch] title-source-dedup skipped %d articles",
+                    skipped_title_source_dup,
+                )
 
         if skipped_dedup:
             self._dedup_skipped += skipped_dedup
