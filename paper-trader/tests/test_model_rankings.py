@@ -110,12 +110,37 @@ def test_backtest_engine_rejects_invalid_model_id(tmp_path):
                               model_id="gpt-4")
 
 
-def _insert_run(store, run_id, model_id, total_return_pct, vs_spy_pct=5.0, n_trades=10, n_decisions=100):
+def _insert_run(
+    store,
+    run_id,
+    model_id,
+    total_return_pct,
+    vs_spy_pct=5.0,
+    n_trades=10,
+    n_decisions=100,
+    annualized_return_pct=None,
+    spy_return_pct=10.0,
+    start_date="2025-01-01",
+    end_date="2026-01-01",
+):
+    final_value = 1000.0 * (1.0 + float(total_return_pct) / 100.0)
     store.conn.execute(
         "INSERT INTO backtest_runs (run_id, seed, start_date, end_date, start_value, "
-        "final_value, total_return_pct, spy_return_pct, vs_spy_pct, n_trades, n_decisions, "
-        "status, started_at, model_id) VALUES (?,1,'2025-01-01','2026-01-01',1000,1000,?,10.0,?,?,?,'complete','2026-01-01T00:00:00Z',?)",
-        (run_id, total_return_pct, vs_spy_pct, n_trades, n_decisions, model_id),
+        "final_value, total_return_pct, spy_return_pct, vs_spy_pct, "
+        "n_trades, n_decisions, status, started_at, model_id) "
+        "VALUES (?,1,?,?,1000,?,?,?,?,?,?,'complete','2026-01-01T00:00:00Z',?)",
+        (
+            run_id,
+            start_date,
+            end_date,
+            final_value,
+            total_return_pct,
+            spy_return_pct,
+            vs_spy_pct,
+            n_trades,
+            n_decisions,
+            model_id,
+        ),
     )
     store.conn.commit()
 
@@ -128,12 +153,12 @@ def test_model_rankings_api(tmp_path):
     store = bt.BacktestStore(path=tmp_path / "bt.db")
 
     # ml_quant: 3 runs with returns 10, 30, 50 → avg=30, median=30, best=50, win_rate=100%
-    _insert_run(store, 1, "ml_quant", 10.0, n_trades=20, n_decisions=100)
-    _insert_run(store, 2, "ml_quant", 30.0, n_trades=40, n_decisions=200)
-    _insert_run(store, 3, "ml_quant", 50.0, n_trades=60, n_decisions=300)
+    _insert_run(store, 1, "ml_quant", 10.0, annualized_return_pct=10.0, n_trades=20, n_decisions=100)
+    _insert_run(store, 2, "ml_quant", 30.0, annualized_return_pct=30.0, n_trades=40, n_decisions=200)
+    _insert_run(store, 3, "ml_quant", 50.0, annualized_return_pct=50.0, n_trades=60, n_decisions=300)
     # hf model: 2 runs: 60 (win) and -10 (loss) → avg=25, median=25, win_rate=50%
-    _insert_run(store, 4, "hf/deepseek-ai/DeepSeek-R1", 60.0)
-    _insert_run(store, 5, "hf/deepseek-ai/DeepSeek-R1", -10.0)
+    _insert_run(store, 4, "hf/deepseek-ai/DeepSeek-R1", 60.0, annualized_return_pct=60.0)
+    _insert_run(store, 5, "hf/deepseek-ai/DeepSeek-R1", -10.0, annualized_return_pct=-10.0)
     # one incomplete run — must be excluded
     store.conn.execute(
         "INSERT INTO backtest_runs (run_id, seed, start_date, end_date, start_value, "
@@ -162,6 +187,10 @@ def test_model_rankings_api(tmp_path):
     # AVG is computed correctly (not MAX/MIN)
     assert ml["avg_return_pct"] == pytest.approx(30.0)
     assert hf["avg_return_pct"] == pytest.approx(25.0)
+    assert ml["avg_annualized_return_pct"] == pytest.approx(30.0, abs=0.05)
+    assert hf["avg_annualized_return_pct"] == pytest.approx(25.0, abs=0.05)
+    assert ml["avg_annualized_vs_spy_pct"] == pytest.approx(20.0, abs=0.1)
+    assert hf["avg_annualized_vs_spy_pct"] == pytest.approx(15.0, abs=0.1)
 
     # Median
     assert ml["median_return_pct"] == pytest.approx(30.0)
@@ -181,8 +210,68 @@ def test_model_rankings_api(tmp_path):
 
     # display_name from static dict
     assert ml["display_name"] == "ML+Quant (deterministic)"
-    # unknown model_id falls back to raw string
+    # unknown model_id falls back to static display name when present
     assert hf["display_name"] == "DeepSeek R1"
 
-    # ml_quant has higher avg (30 > 25) → should appear first (sorted desc)
+    # ml_quant has higher avg yearly alpha → should appear first (sorted desc)
     assert data["models"][0]["model_id"] == "ml_quant"
+
+
+def test_model_rankings_sort_by_yearly_alpha_not_raw_total(tmp_path):
+    """A giant long-run total return must not outrank better yearly alpha."""
+    import json
+    import paper_trader.backtest as bt
+    bt.BACKTEST_DB = tmp_path / "bt.db"
+    store = bt.BacktestStore(path=tmp_path / "bt.db")
+
+    _insert_run(
+        store, 1, "raw_moonshot", 1500.0, vs_spy_pct=1400.0,
+        annualized_return_pct=14.0, spy_return_pct=10.0,
+        start_date="2006-01-01", end_date="2026-01-01",
+    )
+    _insert_run(
+        store, 2, "yearly_edge", 80.0, vs_spy_pct=60.0,
+        annualized_return_pct=80.0, spy_return_pct=10.0,
+        start_date="2025-01-01", end_date="2026-01-01",
+    )
+
+    import paper_trader.dashboard as dash
+    dash.BACKTEST_DB = tmp_path / "bt.db"
+
+    client = dash.app.test_client()
+    data = json.loads(client.get("/api/model-rankings").data)
+
+    assert [m["model_id"] for m in data["models"][:2]] == [
+        "yearly_edge",
+        "raw_moonshot",
+    ]
+    assert data["models"][0]["avg_annualized_vs_spy_pct"] > data["models"][1]["avg_annualized_vs_spy_pct"]
+
+
+def test_backtests_leaderboard_defaults_to_yearly_alpha(tmp_path):
+    """Default backtest leaderboard ranks annualized vs-SPY, not raw alpha."""
+    import json
+    import paper_trader.backtest as bt
+    bt.BACKTEST_DB = tmp_path / "bt.db"
+    store = bt.BacktestStore(path=tmp_path / "bt.db")
+
+    _insert_run(
+        store, 1, "raw_moonshot", 1500.0, vs_spy_pct=1400.0,
+        annualized_return_pct=14.0, spy_return_pct=10.0,
+        start_date="2006-01-01", end_date="2026-01-01",
+    )
+    _insert_run(
+        store, 2, "yearly_edge", 80.0, vs_spy_pct=60.0,
+        annualized_return_pct=80.0, spy_return_pct=10.0,
+        start_date="2025-01-01", end_date="2026-01-01",
+    )
+
+    import paper_trader.dashboard as dash
+    dash.BACKTEST_DB = tmp_path / "bt.db"
+
+    client = dash.app.test_client()
+    data = json.loads(client.get("/api/backtests/leaderboard").data)
+
+    assert data["metric"] == "annualized_vs_spy_pct"
+    assert data["runs"][0]["run_id"] == 2
+    assert data["runs"][0]["metric"] > data["runs"][1]["metric"]
