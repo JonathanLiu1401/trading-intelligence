@@ -212,6 +212,187 @@ class TestInsertCrud:
         assert s["total"] == 1
         assert "urgent" in s and "unscored" in s
 
+    def test_title_source_fingerprint_skips_duplicate_after_restart(
+        self, tmp_path, monkeypatch
+    ):
+        """A same-source headline with a new URL must not survive a daemon
+        restart. The in-memory Jaccard cache is empty in the second store; the
+        persisted title+source fingerprint is the only gate that can catch it."""
+        from storage import article_store as A
+
+        db_path = tmp_path / "articles.db"
+        monkeypatch.setattr(A, "_get_db_path", lambda: db_path)
+        monkeypatch.setattr(A, "_schema_ready_path", None)
+
+        first = A.ArticleStore()
+        title = "Micron Raises Revenue Outlook After AI Memory Demand Jumps"
+        source = "Reuters"
+        assert first.insert_batch([{
+            "title": title,
+            "link": "https://reuters.com/markets/micron-ai-memory-a",
+            "source": source,
+            "published": "",
+            "summary": "",
+            "_relevance_score": 4.0,
+        }]) == 1
+        stored_fp = first.conn.execute(
+            "SELECT title_source_fingerprint FROM articles WHERE title=?",
+            (title,),
+        ).fetchone()[0]
+        assert stored_fp == A.title_source_fingerprint(title, source)
+        first.conn.close()
+
+        second = A.ArticleStore()
+        inserted = second.insert_batch([{
+            "title": "  micron raises  revenue outlook after ai memory demand jumps  ",
+            "link": "https://reuters.com/world/new-syndicated-url",
+            "source": " reuters ",
+            "published": "",
+            "summary": "",
+            "_relevance_score": 4.0,
+        }])
+
+        assert inserted == 0
+        total = second.conn.execute(
+            "SELECT COUNT(*) FROM articles"
+        ).fetchone()[0]
+        assert total == 1
+
+    def test_title_source_fingerprint_keeps_same_title_from_different_source(
+        self, tmp_path, monkeypatch
+    ):
+        """The fingerprint includes source, so a second publisher carrying the
+        same exact title still gets its own row after a restart."""
+        from storage import article_store as A
+
+        db_path = tmp_path / "articles.db"
+        monkeypatch.setattr(A, "_get_db_path", lambda: db_path)
+        monkeypatch.setattr(A, "_schema_ready_path", None)
+
+        first = A.ArticleStore()
+        title = "Nvidia Shares Rise After Analyst Raises Price Target"
+        assert first.insert_batch([{
+            "title": title,
+            "link": "https://example.com/reuters/nvidia-target",
+            "source": "Reuters",
+            "published": "",
+            "summary": "",
+            "_relevance_score": 4.0,
+        }]) == 1
+        first.conn.close()
+
+        second = A.ArticleStore()
+        assert second.insert_batch([{
+            "title": title,
+            "link": "https://example.com/bloomberg/nvidia-target",
+            "source": "Bloomberg",
+            "published": "",
+            "summary": "",
+            "_relevance_score": 4.0,
+        }]) == 1
+        rows = second.conn.execute(
+            "SELECT source, title_source_fingerprint FROM articles "
+            "ORDER BY source"
+        ).fetchall()
+
+        assert [r[0] for r in rows] == ["Bloomberg", "Reuters"]
+        assert len({r[1] for r in rows}) == 2
+
+    def test_title_source_fingerprint_migrates_existing_db(
+        self, tmp_path, monkeypatch
+    ):
+        """Existing article DBs must get the additive column and lookup index
+        even though CREATE TABLE IF NOT EXISTS is skipped for present tables."""
+        from storage import article_store as A
+
+        db_path = tmp_path / "old_articles.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE articles (
+                id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                source TEXT,
+                published TEXT,
+                kw_score REAL DEFAULT 0,
+                ai_score REAL DEFAULT 0,
+                urgency INTEGER DEFAULT 0,
+                full_text BLOB,
+                first_seen TEXT NOT NULL,
+                cycle INTEGER DEFAULT 0,
+                time_sensitivity REAL DEFAULT NULL,
+                ml_score REAL DEFAULT NULL,
+                score_source TEXT DEFAULT NULL,
+                breaking_news INTEGER DEFAULT 0
+            );
+            CREATE TABLE briefings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                text TEXT NOT NULL,
+                article_count INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(A, "_get_db_path", lambda: db_path)
+        monkeypatch.setattr(A, "_schema_ready_path", None)
+        store = A.ArticleStore()
+
+        cols = {r[1] for r in store.conn.execute(
+            "PRAGMA table_info(articles)"
+        ).fetchall()}
+        indexes = {r[1] for r in store.conn.execute(
+            "PRAGMA index_list(articles)"
+        ).fetchall()}
+
+        assert "title_source_fingerprint" in cols
+        assert "idx_title_source_fingerprint" in indexes
+
+    def test_title_source_fingerprint_does_not_gate_backtest_rows(
+        self, tmp_path, monkeypatch
+    ):
+        """Synthetic rows are valid training data. The new live-news
+        fingerprint must not create a persisted backtest collapse rule."""
+        from storage import article_store as A
+
+        db_path = tmp_path / "articles.db"
+        monkeypatch.setattr(A, "_get_db_path", lambda: db_path)
+        monkeypatch.setattr(A, "_schema_ready_path", None)
+
+        first = A.ArticleStore()
+        title = "Backtest synthetic MU event label"
+        source = "backtest_run_42"
+        assert first.insert_batch([{
+            "title": title,
+            "link": "backtest://run_42/2026-01-01/BUY/MU",
+            "source": source,
+            "published": "",
+            "summary": "",
+            "_relevance_score": 4.0,
+        }]) == 1
+        fp = first.conn.execute(
+            "SELECT title_source_fingerprint FROM articles"
+        ).fetchone()[0]
+        assert fp is None
+        first.conn.close()
+
+        second = A.ArticleStore()
+        assert second.insert_batch([{
+            "title": title,
+            "link": "backtest://run_43/2026-01-02/BUY/MU",
+            "source": source,
+            "published": "",
+            "summary": "",
+            "_relevance_score": 4.0,
+        }]) == 1
+        total = second.conn.execute(
+            "SELECT COUNT(*) FROM articles"
+        ).fetchone()[0]
+        assert total == 2
+
 
 # ── shared-connection cursor-collision retry ─────────────────────────────────
 class _FlakyConn:
