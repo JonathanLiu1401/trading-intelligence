@@ -751,6 +751,23 @@ class TestEnforceRiskPreTrade:
             {"action": "BUY", "ticker": "NVDA", "qty": 5}, snap)
         assert ok is True
 
+    @pytest.mark.parametrize("qty", [float("nan"), float("inf"), float("-inf")])
+    @pytest.mark.parametrize("action", ["BUY", "SELL"])
+    def test_non_finite_qty_blocks_cleanly_for_buy_and_sell(self, action, qty):
+        snap = {"positions": [{"ticker": "NVDA", "type": "stock", "qty": 5}]}
+        ok, why = strategy._enforce_risk_pre_trade(
+            {"action": action, "ticker": "NVDA", "qty": qty}, snap)
+        assert ok is False
+        assert why == f"qty not finite: {qty!r}"
+
+    @pytest.mark.parametrize("action", ["BUY", "SELL"])
+    def test_positive_finite_qty_uses_existing_validation_path(self, action):
+        snap = {"positions": [{"ticker": "NVDA", "type": "stock", "qty": 5}]}
+        ok, why = strategy._enforce_risk_pre_trade(
+            {"action": action, "ticker": "NVDA", "qty": 1.5}, snap)
+        assert ok is True
+        assert why == ""
+
     def test_sell_without_position_blocked(self):
         snap = {"positions": []}
         ok, why = strategy._enforce_risk_pre_trade(
