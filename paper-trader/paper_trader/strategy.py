@@ -4,6 +4,7 @@ full autonomy."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -1563,6 +1564,8 @@ def _stock_buy_leverage(decision: dict) -> float:
         lev = float(raw)
     except (TypeError, ValueError):
         return STOCK_BUY_MIN_LEVERAGE
+    if not math.isfinite(lev):
+        return STOCK_BUY_MIN_LEVERAGE
     return max(STOCK_BUY_MIN_LEVERAGE, min(STOCK_BUY_MAX_LEVERAGE, lev))
 
 
@@ -1595,6 +1598,8 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
         qty = float(decision.get("qty") or 0)
     except (TypeError, ValueError):
         return "BLOCKED", f"qty not numeric: {decision.get('qty')!r}"
+    if not math.isfinite(qty):
+        return "BLOCKED", f"qty not finite: {decision.get('qty')!r}"
     reason = decision.get("reasoning", "")
 
     ok, why = _enforce_risk_pre_trade(decision, snapshot)
@@ -1603,7 +1608,11 @@ def _execute(decision: dict, snapshot: dict, store: Store) -> tuple[str, str]:
 
     if action in ("BUY", "SELL"):
         price = market.get_price(ticker)
-        if not price:
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            return "BLOCKED", f"no price for {ticker}"
+        if price <= 0 or not math.isfinite(price):
             return "BLOCKED", f"no price for {ticker}"
         if action == "BUY":
             leverage = _stock_buy_leverage(decision)
