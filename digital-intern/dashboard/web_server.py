@@ -5656,6 +5656,181 @@ def build_event_threads(
     }
 
 
+# ── chat-suggestions builder ─────────────────────────────────────────
+# Drives the 4 click-friendly question chips above the chat input on
+# /intern/chat. Re-runs at most every 10 min (`_CHAT_SUGGESTIONS_TTL_S`)
+# so the buttons don't flicker on every page load. Pure heuristic, no
+# LLM, no full_text BLOB read — must stay <300ms even when the USB
+# articles.db is under writer contention.
+_CHAT_SUGGESTIONS_TTL_S = 600.0
+_CHAT_SUGGESTIONS_FALLBACK = [
+    "What's moving markets today?",
+    "Nokia surge analysis",
+    "Best opportunities right now?",
+    "What should I watch in Asia overnight?",
+]
+_CHAT_SUGGESTIONS_FILLERS = [
+    "What's hot in tech?",
+    "What's happening in macro?",
+    "Asia overnight setup?",
+]
+_CHAT_LLM_FALLBACK_MODELS = ("gpt-5.5", "claude-sonnet-4-6")
+_CHAT_LLM_TIMEOUT_S = max(
+    2,
+    int(os.environ.get("DIGITAL_INTERN_CHAT_LLM_TIMEOUT", "4")),
+)
+_CHAT_DEEP_KEYWORDS = (
+    "paper trader",
+    "paper-trader",
+    "trading bot",
+    "bot",
+    "decision",
+    "decisions",
+    "position",
+    "positions",
+    "cash",
+    "p/l",
+    "pnl",
+    "why did",
+    "what did",
+    "diagnose",
+    "diagnosis",
+    "deep",
+)
+
+
+def _chat_needs_deep_context(message: str) -> bool:
+    low = (message or "").lower()
+    return any(k in low for k in _CHAT_DEEP_KEYWORDS)
+
+
+def _chat_model_candidates(env: dict[str, str] | None = None) -> list[str]:
+    """Ordered chat LLM backends.
+
+    ``DIGITAL_INTERN_CHAT_MODELS`` may name a comma-separated override. If it is
+    absent, keep the daemon-wide default first, then append both supported
+    runtimes so a Codex outage can fall through to Claude and a Claude outage
+    can fall through to Codex.
+    """
+    env = env or os.environ
+    configured = (
+        env.get("DIGITAL_INTERN_CHAT_MODELS")
+        or env.get("DIGITAL_INTERN_LLM_MODEL")
+        or ""
+    )
+    raw = [m.strip() for m in configured.split(",") if m.strip()]
+    raw.extend(_CHAT_LLM_FALLBACK_MODELS)
+    out: list[str] = []
+    seen: set[str] = set()
+    for model in raw:
+        if model not in seen:
+            seen.add(model)
+            out.append(model)
+    return out
+
+
+def _call_chat_llm(prompt: str, timeout: int = 120) -> tuple[str, str, list[str]]:
+    failures: list[str] = []
+    for model in _chat_model_candidates():
+        try:
+            text = (_claude_cli_call(prompt, model=model, timeout=timeout) or "").strip()
+        except Exception as exc:  # noqa: BLE001 - chat must degrade, not 500
+            _logger().warning("chat llm backend %s raised: %s", model, exc)
+            failures.append(model)
+            continue
+        if text:
+            return text, model, failures
+        failures.append(model)
+    return "", "", failures
+
+
+def _chat_backend_unavailable_response(
+    user_msg: str,
+    articles_ctx: list[dict],
+    paper_trader_block: str,
+    failed_models: list[str],
+) -> str:
+    lines = [
+        "LLM backends are unavailable right now, so I cannot run the full chat reasoning pass.",
+        "",
+        "I can still read the live feed context:",
+    ]
+    if articles_ctx:
+        for art in articles_ctx[:5]:
+            title = str(art.get("title") or "").strip()
+            source = str(art.get("source") or "").strip()
+            score = art.get("ai_score")
+            if title:
+                suffix = (
+                    f" ({source}, score {score:.1f})"
+                    if source and isinstance(score, (int, float))
+                    else (f" ({source})" if source else "")
+                )
+                lines.append(f"- {title[:160]}{suffix}")
+    else:
+        lines.append("- No fresh article context was available from the local feed.")
+
+    pt_lines = [
+        ln.strip()
+        for ln in (paper_trader_block or "").splitlines()
+        if ln.strip()
+    ][:8]
+    if pt_lines:
+        lines.extend(["", "Paper trader snapshot:"])
+        lines.extend(f"- {ln[:180]}" for ln in pt_lines)
+
+    failed = ", ".join(failed_models) if failed_models else "configured models"
+    lines.extend([
+        "",
+        f"Backend status: tried {failed}; all returned empty/unavailable.",
+        "Retry in a minute. This route now tries both Codex and Claude automatically.",
+    ])
+    if user_msg:
+        lines.append(f"Question queued context: {user_msg[:180]}")
+    return "\n".join(lines)
+
+
+def _build_chat_suggestions() -> list[str]:
+    """Top-3 watchlist tickers in the last 24h → 3 ticker-anchored
+    questions + the always-on 4th. <3 tickers → fill with static
+    fillers. Any exception → caller substitutes ``_CHAT_SUGGESTIONS_FALLBACK``.
+    """
+    from storage.article_store import _get_db_path
+    db = _get_db_path()
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    try:
+        rows = conn.execute(
+            "SELECT title FROM articles "
+            f"WHERE first_seen >= datetime('now','-1 day') AND {_LIVE_ONLY_SQL}"
+            " ORDER BY first_seen DESC LIMIT 1000"
+        ).fetchall()
+    finally:
+        conn.close()
+    counts: dict[str, int] = {}
+    for (title,) in rows:
+        for tk in _extract_tickers(title):
+            counts[tk] = counts.get(tk, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    top = [tk for tk, _ in ranked[:3]]
+    templates = [
+        "Why is ${tk} moving today?",
+        "What's the latest on ${tk}?",
+        "${tk} — buy, hold, or trim?",
+    ]
+    out: list[str] = []
+    for tk, tpl in zip(top, templates):
+        out.append(tpl.replace("${tk}", tk))
+    if len(out) < 3:
+        for f in _CHAT_SUGGESTIONS_FILLERS:
+            if len(out) >= 3:
+                break
+            out.append(f)
+    out.append("What's moving markets today?")
+    # Hard ≤60-char cap defensively (templates + watchlist tickers are
+    # already short, but never trust the wire).
+    return [s if len(s) <= 60 else s[:60] for s in out[:4]]
+
+
 def create_app(store=None) -> Flask:
     """Build the Flask app. ``store`` is the shared ArticleStore from daemon.py."""
     global _store
@@ -5765,6 +5940,12 @@ def create_app(store=None) -> Flask:
     @app.get("/trader/api/portfolio")
     def proxy_trader_portfolio():
         return _proxy_paper_trader("/api/portfolio")
+
+    @app.get("/trader/api/equity-tail")
+    def proxy_trader_equity_tail():
+        qs = request.query_string.decode("utf-8", errors="ignore")
+        path = "/api/equity-tail" + (f"?{qs}" if qs else "")
+        return _proxy_paper_trader(path, timeout=5.0)
 
     @app.get("/trader/api/source-edge")
     def proxy_trader_source_edge():
@@ -8000,6 +8181,21 @@ def create_app(store=None) -> Flask:
         store = _store_handle()
         return jsonify({"ok": True, "store_attached": store is not None})
 
+    @app.get("/api/chat-suggestions")
+    def api_chat_suggestions():
+        # Public — the chat page JS has no API key. Matches /api/chat's
+        # public surface (it's intentionally ungated; the page is public).
+        cached = _ttl_get("chat_suggestions")
+        if cached is not None:
+            return jsonify({"suggestions": cached})
+        try:
+            suggestions = _build_chat_suggestions()
+        except Exception as exc:  # noqa: BLE001
+            _logger().warning("chat_suggestions build failed: %s", exc)
+            return jsonify({"suggestions": list(_CHAT_SUGGESTIONS_FALLBACK)})
+        _ttl_set("chat_suggestions", _CHAT_SUGGESTIONS_TTL_S, suggestions)
+        return jsonify({"suggestions": suggestions})
+
     @app.get("/chat")
     def chat_page() -> Response:
         return Response(_CHAT_HTML, mimetype="text/html",
@@ -8393,6 +8589,95 @@ def create_app(store=None) -> Flask:
                 f"{a['ai_score']:.2f} | {a['source']} | {a['title']}\n    {a['summary']}"
                 for a in thesis_ctx
             )
+
+        deep_chat = bool(payload.get("deep")) or _chat_needs_deep_context(user_msg)
+        if not deep_chat:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            fast_prompt = (
+                "You are a market intelligence analyst with access to a live "
+                "news feed and the user's portfolio snapshot.\n"
+                f"Current date: {now_iso}\n\n"
+                "TOP NEWS SIGNALS (last 6h, recency-decayed ML ranking):\n"
+                f"{articles_block}\n\n"
+                + (
+                    "THESIS CONTEXT (last 48h, deduped vs 6h set):\n"
+                    f"{thesis_block}\n\n"
+                    if thesis_block else ""
+                )
+                + (
+                    "NEWS COVERAGE GAP:\n"
+                    f"{coverage_gap_block}\n\n"
+                    if coverage_gap_block else ""
+                )
+                + "USER'S REAL PORTFOLIO SNAPSHOT:\n"
+                f"{portfolio_block}\n\n"
+                + (
+                    "NEWS SECTOR PULSE:\n"
+                    f"{sector_pulse_block}\n\n"
+                    if sector_pulse_block else ""
+                )
+                + (
+                    "NEWS SECTOR COHERENCE:\n"
+                    f"{sector_coherence_block}\n\n"
+                    if sector_coherence_block else ""
+                )
+                + (
+                    "NEWS SENTIMENT REVERSAL:\n"
+                    f"{sentiment_reversal_block}\n\n"
+                    if sentiment_reversal_block else ""
+                )
+                + (
+                    "NEWS TICKER VELOCITY:\n"
+                    f"{ticker_velocity_block}\n\n"
+                    if ticker_velocity_block else ""
+                )
+                + (
+                    "NEWS TICKER COMENTIONS:\n"
+                    f"{ticker_comentions_block}\n\n"
+                    if ticker_comentions_block else ""
+                )
+                + "Answer concisely and data-driven. If the user asks for "
+                "paper-trader internals, tell them to ask for a deep bot "
+                "diagnosis so the heavy trader diagnostics are fetched."
+            )
+            msgs: list[dict] = []
+            for h in history[-20:]:
+                role = h.get("role")
+                content = (h.get("content") or "").strip()
+                if role in ("user", "assistant") and content:
+                    msgs.append({"role": role, "content": content})
+            msgs.append({"role": "user", "content": user_msg})
+
+            convo_parts = [fast_prompt, "\n\n--- Conversation ---"]
+            for m in msgs:
+                convo_parts.append(f"{m['role'].upper()}: {m['content']}")
+            convo_parts.append("ASSISTANT:")
+            prompt = "\n\n".join(convo_parts)
+
+            response_text, llm_model, failed_models = _call_chat_llm(
+                prompt, timeout=_CHAT_LLM_TIMEOUT_S
+            )
+            if not response_text:
+                _logger().warning(
+                    "chat fast-path: all LLM backends unavailable; tried=%s",
+                    ",".join(failed_models) or "<none>",
+                )
+                return jsonify({
+                    "response": _chat_backend_unavailable_response(
+                        user_msg, articles_ctx, "", failed_models
+                    ),
+                    "sources": [a["title"] for a in articles_ctx],
+                    "degraded": True,
+                    "failed_models": failed_models,
+                    "mode": "fast",
+                })
+
+            return jsonify({
+                "response": response_text,
+                "sources": [a["title"] for a in articles_ctx],
+                "model": llm_model,
+                "mode": "fast",
+            })
 
         # Live paper-trader state — fetch from :8090/api/state. Adds positions,
         # recent trades, recent decisions so the chat can answer "what did the
@@ -10122,14 +10407,28 @@ def create_app(store=None) -> Flask:
         convo_parts.append("ASSISTANT:")
         prompt = "\n\n".join(convo_parts)
 
-        response_text = _claude_cli_call(prompt, timeout=120) or ""
+        response_text, llm_model, failed_models = _call_chat_llm(
+            prompt, timeout=_CHAT_LLM_TIMEOUT_S
+        )
 
         if not response_text:
-            return jsonify({"error": "claude CLI returned no response"}), 502
+            _logger().warning(
+                "chat: all LLM backends unavailable; tried=%s",
+                ",".join(failed_models) or "<none>",
+            )
+            return jsonify({
+                "response": _chat_backend_unavailable_response(
+                    user_msg, articles_ctx, paper_trader_block, failed_models
+                ),
+                "sources": [a["title"] for a in articles_ctx],
+                "degraded": True,
+                "failed_models": failed_models,
+            })
 
         return jsonify({
             "response": response_text,
             "sources": [a["title"] for a in articles_ctx],
+            "model": llm_model,
         })
 
     return app
@@ -10642,12 +10941,13 @@ async function refreshPaperTrader() {
     if (!r.ok) { sumDiv.textContent = "paper trader unavailable (HTTP " + r.status + ")"; return; }
     const j = await r.json();
     const tv = j.total_value;
-    const pl = tv - 1000;
-    const plPct = (pl / 1000) * 100;
+    const basis = j.capital_basis ?? j.starting_value ?? 1000;
+    const pl = j.deposit_adjusted_pnl ?? (tv - basis);
+    const plPct = j.deposit_adjusted_return_pct ?? ((pl / basis) * 100);
     const cls = pl >= 0 ? "pl-pos" : "pl-neg";
     sumDiv.innerHTML = `<span class="ticker">Portfolio</span> $${fmt(tv)} ` +
       `<span class="${cls}">${(pl>=0?'+':'')}${fmt(pl)} (${(pl>=0?'+':'')}${fmt(plPct)}%)</span> ` +
-      `<span class="small-muted">vs $1000 start · cash $${fmt(j.cash)}</span>`;
+      `<span class="small-muted">vs $${fmt(basis)} capital basis · cash $${fmt(j.cash)}</span>`;
   } catch (e) {
     sumDiv.textContent = "paper trader unreachable";
   }
@@ -10956,7 +11256,14 @@ async function savePortfolioConfig() {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({message:m, history: convo.slice()})
       });
-      const j = await r.json();
+      const raw = await r.text();
+      let j = {};
+      try {
+        j = raw ? JSON.parse(raw) : {};
+      } catch (parseErr) {
+        const preview = (raw || '').slice(0, 160) || '<empty body>';
+        throw new Error('upstream returned non-JSON: ' + preview);
+      }
       tmp.remove();
       if (!r.ok || j.error) {
         bubble('error', 'Error: ' + (j.error || ('HTTP '+r.status)));
@@ -11146,6 +11453,39 @@ _CHAT_HTML = """<!doctype html>
       font-family: var(--font-sans);
     }
     .suggestion:hover { background: var(--bg-hover); color: var(--text); }
+    .return-panel {
+      margin: 12px 24px 0;
+      padding: 12px 14px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      flex-shrink: 0;
+    }
+    .return-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 8px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .return-title {
+      color: var(--text);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .return-stats {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-family: var(--font-mono);
+      font-size: 12px;
+    }
+    .return-pos { color: var(--green); }
+    .return-neg { color: var(--red); }
+    .return-chart { position: relative; height: 180px; }
     .input-bar {
       display: flex; gap: 10px; padding: 14px 24px; border-top: 1px solid var(--border); background: var(--bg-panel);
     }
@@ -11243,6 +11583,9 @@ _CHAT_HTML = """<!doctype html>
       .bottom-nav { display: grid; }
       .topbar { padding: 0 16px; }
       .msg { max-width: 90%; }
+      .return-panel { margin: 10px 16px 0; padding: 10px 12px; }
+      .return-chart { height: 150px; }
+      .return-head { align-items: flex-start; flex-direction: column; gap: 4px; }
       .chat-wrap { padding: 14px 16px 88px; }
       .input-bar { padding: 12px 16px; margin-bottom: 64px; }
       .suggestions { padding: 12px 16px 4px; }
@@ -11252,6 +11595,7 @@ _CHAT_HTML = """<!doctype html>
     }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js" async></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <nav class="topbar">
@@ -11289,12 +11633,18 @@ _CHAT_HTML = """<!doctype html>
   <h1>Market Intel</h1>
   <div class="sub">Powered by Claude Opus 4.7 + Live News Feed</div>
 </header>
-<div class="suggestions" id="suggestions">
-  <button class="suggestion" data-q="What's moving markets today?">What's moving markets today?</button>
-  <button class="suggestion" data-q="Nokia surge analysis">Nokia surge analysis</button>
-  <button class="suggestion" data-q="Best opportunities right now?">Best opportunities right now?</button>
-  <button class="suggestion" data-q="What should I watch in Asia overnight?">What should I watch in Asia overnight?</button>
-</div>
+<section class="return-panel">
+  <div class="return-head">
+    <span class="return-title">Paper Trader Return Graph</span>
+    <span class="return-stats">
+      <span id="return-total">value —</span>
+      <span id="return-basis">basis —</span>
+      <span id="return-pct">return —</span>
+    </span>
+  </div>
+  <div class="return-chart"><canvas id="return-chart"></canvas></div>
+</section>
+<div class="suggestions" id="suggestions"></div>
 <div class="chat-wrap" id="chat"></div>
 <div class="input-bar">
   <input class="msg-input" id="input" type="text" placeholder="Ask about markets, news, or your portfolio…" autocomplete="off" autofocus>
@@ -11306,6 +11656,7 @@ const chat = document.getElementById('chat');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 const msgs = [];
+let returnChart = null;
 
 function sendMsg() { ask(input.value.trim()); }
 input.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); } });
@@ -11367,7 +11718,14 @@ async function ask(message) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({message: message, history: msgs.slice(0, -1)}),
     });
-    const j = await r.json();
+    const raw = await r.text();
+    let j = {};
+    try {
+      j = raw ? JSON.parse(raw) : {};
+    } catch (parseErr) {
+      const preview = (raw || '').slice(0, 160) || '<empty body>';
+      throw new Error('upstream returned non-JSON: ' + preview);
+    }
     loader.remove();
     if (!r.ok || j.error) {
       addMsg('error', 'Error: ' + (j.error || ('HTTP ' + r.status)));
@@ -11388,6 +11746,121 @@ document.getElementById('suggestions').addEventListener('click', function(e) {
   var b = e.target.closest('.suggestion');
   if (b) ask(b.dataset.q);
 });
+
+const SUGGESTIONS_FALLBACK = [
+  "What's moving markets today?",
+  "Nokia surge analysis",
+  "Best opportunities right now?",
+  "What should I watch in Asia overnight?"
+];
+function renderSuggestions(list) {
+  const box = document.getElementById('suggestions');
+  if (!box) return;
+  const items = (Array.isArray(list) && list.length) ? list.slice(0, 4) : SUGGESTIONS_FALLBACK;
+  box.innerHTML = '';
+  for (const q of items) {
+    const b = document.createElement('button');
+    b.className = 'suggestion';
+    b.dataset.q = q;
+    b.textContent = q;
+    box.appendChild(b);
+  }
+}
+
+function money(n) {
+  if (n === null || n === undefined || Number.isNaN(Number(n))) return '—';
+  const x = Number(n);
+  return (x < 0 ? '-$' : '$') + Math.abs(x).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+}
+function signedPct(n) {
+  if (n === null || n === undefined || Number.isNaN(Number(n))) return '—';
+  const x = Number(n);
+  return (x >= 0 ? '+' : '') + x.toFixed(2) + '%';
+}
+async function refreshReturnGraph() {
+  const canvas = document.getElementById('return-chart');
+  if (!canvas || typeof Chart === 'undefined') return;
+  let j;
+  try {
+    const r = await fetch('/trader/api/equity-tail?limit=500', {cache: 'no-store'});
+    if (!r.ok) return;
+    j = await r.json();
+  } catch (e) { return; }
+  const rows = Array.isArray(j.equity) ? j.equity : [];
+  if (rows.length < 2) return;
+  const labels = rows.map(p => (p.timestamp || '').replace('T', ' ').slice(0, 16));
+  const values = rows.map(p => {
+    const pct = Number(p.deposit_adjusted_return_pct);
+    if (Number.isFinite(pct)) return pct;
+    const tv = Number(p.total_value), basis = Number(p.capital_basis || 1000);
+    return basis > 0 ? (tv / basis - 1) * 100 : null;
+  });
+  const last = j.portfolio || rows[rows.length - 1] || {};
+  const pct = Number(last.deposit_adjusted_return_pct);
+  const pnl = Number(last.deposit_adjusted_pnl);
+  const pctEl = document.getElementById('return-pct');
+  document.getElementById('return-total').textContent = 'value ' + money(last.total_value);
+  document.getElementById('return-basis').textContent = 'basis ' + money(last.capital_basis);
+  pctEl.textContent = 'return ' + signedPct(pct);
+  pctEl.className = (pct >= 0 ? 'return-pos' : 'return-neg');
+  if (Number.isFinite(pnl)) pctEl.title = 'Deposit-adjusted P/L ' + money(pnl);
+  if (returnChart) returnChart.destroy();
+  returnChart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Deposit-adjusted return %',
+        data: values,
+        borderColor: '#0acdff',
+        backgroundColor: 'rgba(10,205,255,0.12)',
+        pointRadius: 0,
+        pointHoverRadius: 3,
+        borderWidth: 2,
+        tension: 0.25,
+        fill: true,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => 'return ' + signedPct(ctx.parsed.y),
+          },
+        },
+      },
+      scales: {
+        x: {
+          ticks: { color: '#8b929d', maxRotation: 0, autoSkip: true, maxTicksLimit: 7 },
+          grid: { display: false },
+        },
+        y: {
+          ticks: { color: '#8b929d', callback: v => signedPct(Number(v)) },
+          grid: { color: 'rgba(255,255,255,0.05)' },
+        },
+      },
+    },
+  });
+}
+async function loadSuggestions() {
+  try {
+    const r = await fetch('/api/chat-suggestions', {cache: 'no-store'});
+    const j = await r.json();
+    renderSuggestions(j && j.suggestions);
+  } catch (e) {
+    renderSuggestions(null);
+  }
+}
+renderSuggestions(SUGGESTIONS_FALLBACK);
+document.addEventListener('DOMContentLoaded', loadSuggestions);
+if (document.readyState !== 'loading') loadSuggestions();
+document.addEventListener('DOMContentLoaded', refreshReturnGraph);
+if (document.readyState !== 'loading') refreshReturnGraph();
+setInterval(loadSuggestions, 10 * 60 * 1000);
+setInterval(refreshReturnGraph, 15000);
 </script>
 
 <nav class="bottom-nav" id="bottomNav">
