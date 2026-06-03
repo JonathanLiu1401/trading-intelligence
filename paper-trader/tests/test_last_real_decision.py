@@ -66,9 +66,9 @@ def test_fresh_when_within_one_lagging_window():
 
 def test_delayed_between_lagging_and_stalled():
     now = datetime(2026, 5, 29, 14, 0, 0, tzinfo=timezone.utc)
-    # OPEN_INTERVAL=1800, LAGGING=1.25 → 2250s; STALLED=2.0 → 3600s.
-    # 3000s = between LAGGING (2250) and STALLED (3600).
-    ts = (now - timedelta(seconds=3000)).isoformat()
+    # OPEN_INTERVAL=300, LAGGING=1.25 → 375s; STALLED=2.0 → 600s.
+    # 450s = between LAGGING (375) and STALLED (600).
+    ts = (now - timedelta(seconds=450)).isoformat()
     out = build_last_real_decision(_row(ts), now=now, market_open=True)
     assert out["state"] == "DELAYED"
 
@@ -84,10 +84,10 @@ def test_stale_past_stalled_window():
 
 
 def test_closed_market_uses_longer_baseline():
-    """When market is closed, expected interval is 3600s — so a 3000s gap
+    """When market is closed, expected interval is 3600s — so a 450s gap
     under closed market is FRESH but DELAYED under open."""
     now = datetime(2026, 5, 29, 22, 0, 0, tzinfo=timezone.utc)
-    ts = (now - timedelta(seconds=3000)).isoformat()
+    ts = (now - timedelta(seconds=450)).isoformat()
     closed = build_last_real_decision(_row(ts), now=now, market_open=False)
     opened = build_last_real_decision(_row(ts), now=now, market_open=True)
     assert closed["state"] == "FRESH"
@@ -260,7 +260,7 @@ def test_reporter_line_suppresses_delayed():
     """DELAYED is suppressed too — a quiet hour is not actionable yet."""
     from paper_trader import reporter
     now = datetime.now(timezone.utc)
-    delayed_ts = (now - timedelta(seconds=2500)).isoformat()  # past 1.25*1800
+    delayed_ts = (now - timedelta(seconds=450)).isoformat()  # past 1.25*300
     store = _FakeStore(
         {"timestamp": delayed_ts, "action_taken": "HOLD NVDA → HOLD"}
     )
@@ -273,7 +273,7 @@ def test_reporter_line_surfaces_stale():
     """STALE fires — this is the actionable wedge signal."""
     from paper_trader import reporter
     now = datetime.now(timezone.utc)
-    stale_ts = (now - timedelta(hours=5)).isoformat()  # past 2*1800 = 3600s
+    stale_ts = (now - timedelta(hours=5)).isoformat()  # past 2*300 = 600s
     store = _FakeStore(
         {"timestamp": stale_ts, "action_taken": "HOLD NVDA → HOLD"}
     )

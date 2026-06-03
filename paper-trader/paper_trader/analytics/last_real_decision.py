@@ -62,7 +62,7 @@ from datetime import datetime, timezone
 # ``LAGGING_MULT`` / ``STALLED_MULT`` — a divergence here would silently
 # desync the Discord verdict from the dashboard's. The regression test
 # in ``tests/test_last_real_decision.py`` pins the equality.
-OPEN_INTERVAL_S = 1800.0   # mirrors runner.OPEN_INTERVAL_S (market open)
+OPEN_INTERVAL_S = 300.0    # mirrors runner.OPEN_INTERVAL_S (market open)
 CLOSED_INTERVAL_S = 3600.0  # mirrors runner.CLOSED_INTERVAL_S (market closed)
 LAGGING_MULT = 1.25
 STALLED_MULT = 2.0

@@ -109,15 +109,15 @@ def test_route_exists_and_returns_required_keys(client):
 
 
 def test_recent_decision_reports_on_schedule(client):
-    """60s after the last decision in MARKET_OPEN (1800s tier) → ON_SCHEDULE,
-    ETA ~1740s, is_overdue False."""
+    """60s after the last decision in MARKET_OPEN (300s tier) → ON_SCHEDULE,
+    ETA ~240s, is_overdue False."""
     c, _now, _last = client
     j = c.get("/api/decision-cadence").get_json()
     assert j["verdict"] == "ON_SCHEDULE"
     assert j["tier"] == "MARKET_OPEN"
-    assert j["sleep_s"] == 1800
+    assert j["sleep_s"] == 300
     assert j["since_last_decision_s"] == 60
-    assert j["next_decision_eta_s"] == 1740
+    assert j["next_decision_eta_s"] == 240
     assert j["is_overdue"] is False
     assert j["n_positions"] == 1
 

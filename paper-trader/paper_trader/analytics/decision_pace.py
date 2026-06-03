@@ -16,7 +16,7 @@ Closes a gap between three existing surfaces:
 This module computes the **rolling p50 / p95 / max** of the gap (in seconds)
 between consecutive ``decisions`` rows over standard windows, separately for
 market-open and market-closed cycles. The split matters: runner cadence is
-bimodal — ``OPEN_INTERVAL_S = 1800`` vs ``CLOSED_INTERVAL_S = 3600`` — so a
+bimodal — ``OPEN_INTERVAL_S = 300`` vs ``CLOSED_INTERVAL_S = 3600`` — so a
 merged distribution is the wrong unit. Each gap is classified by the
 ``market_open`` value of its **trailing** (later) decision row, which is the
 cycle that "should have fired ``CADENCE_S`` ago".
@@ -55,7 +55,7 @@ from datetime import datetime, timedelta, timezone
 # imported (the runner_heartbeat precedent: keep this leaf pure and
 # import-cycle-free; the test reads these constants so a retune cannot
 # false-fail the suite).
-OPEN_INTERVAL_S = 1800.0
+OPEN_INTERVAL_S = 300.0
 CLOSED_INTERVAL_S = 3600.0
 
 # A gap inside this multiple of its cadence is "on schedule".

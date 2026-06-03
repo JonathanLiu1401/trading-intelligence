@@ -19,7 +19,7 @@ from .analytics.dynamic_interval import compute_interval
 from .store import DB_PATH, get_store
 
 NY = ZoneInfo("America/New_York")
-OPEN_INTERVAL_S = 1800      # decide every 30 min when market is open
+OPEN_INTERVAL_S = 300       # fallback only; dynamic_interval owns live cadence
 CLOSED_INTERVAL_S = 3600    # every 1 hour when closed
 # Grace after the NYSE session close before the daily-close report fires. The
 # trigger is anchored to the *actual* session close (market.close_minute):

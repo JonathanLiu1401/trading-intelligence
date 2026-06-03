@@ -3,7 +3,7 @@ RIGHT NOW, and when is the bot's next decision cycle expected?
 
 The runner's sleep cadence is computed dynamically by
 ``analytics.dynamic_interval.compute_interval``: six tiers from
-``EARNINGS_WINDOW`` (120s) at the top through ``QUIET_CLOSED`` (5400s) at
+``SESSION_OPEN`` (180s) at the top through ``QUIET_CLOSED`` (5400s) at
 the bottom, picked from the held book + earnings calendar + NY clock. The
 tier is logged to stdout but is NOT structurally exposed anywhere — a
 trader watching the dashboard sees ``/api/state`` (cash + positions) and
@@ -31,8 +31,8 @@ gap by surfacing:
                                 well past the cadence window — the same
                                 stallness signal ``/api/runner-heartbeat``
                                 / ``/api/last-real-decision`` use, but
-                                tier-aware so an EARNINGS_WINDOW cadence
-                                is correctly tight and a QUIET_CLOSED is
+                                tier-aware so regular-session cadence is
+                                correctly tight and closed/quiet cadence is
                                 correctly loose)
   * ``verdict``               — single-bucket panel signal:
                                 ``NO_DATA`` (no decisions row),
@@ -105,14 +105,15 @@ def _compute_tier(now_et, positions, events) -> tuple[str, int]:
             now_utc=now_et.astimezone(timezone.utc),
             now_et=now_et,
         )
+        market_open = _di._is_market_hours(now_et)
+        if market_open and _di._is_session_open_window(now_et):
+            return "SESSION_OPEN", _di._SESSION_OPEN_S
+        if market_open and held_earnings_today:
+            return "EARNINGS_DAY", _di._EARNINGS_DAY_S
+        if market_open:
+            return "MARKET_OPEN", _di._MARKET_OPEN_S
         if held_earnings_today and _di._is_earnings_window(now_et):
             return "EARNINGS_WINDOW", _di._EARNINGS_WINDOW_S
-        if _di._is_session_open_window(now_et):
-            return "SESSION_OPEN", _di._SESSION_OPEN_S
-        if held_earnings_today:
-            return "EARNINGS_DAY", _di._EARNINGS_DAY_S
-        if _di._is_market_hours(now_et):
-            return "MARKET_OPEN", _di._MARKET_OPEN_S
         if not positions:
             return "QUIET_CLOSED", _di._QUIET_CLOSED_S
         return "MARKET_CLOSED", _di._MARKET_CLOSED_S

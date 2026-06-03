@@ -7,7 +7,7 @@ SHA / article age (build-info). None close a verdict on
 ``now - max(decisions.timestamp)`` vs the runner's expected cadence, so a
 dead/wedged `paper_trader.runner` is invisible — the panels show
 frozen-but-plausible state. These pin the exact cadence arithmetic, the
-market-open (1800s) vs market-closed (3600s) threshold selection, the
+market-open (300s) vs market-closed (3600s) threshold selection, the
 NO_DATA / STALLED / LAGGING / HEALTHY verdict precedence + boundaries, the
 future-skew clamp, the constant echo (retune-proof), and the endpoint
 behaviour through the Flask test client on a real temp Store (per the
@@ -45,14 +45,14 @@ def _ago(seconds: float) -> str:
 # ─────────────────────── constant echo (retune-proof) ───────────────────────
 
 def test_module_constants_are_the_spec():
-    assert OPEN_INTERVAL_S == 1800.0
+    assert OPEN_INTERVAL_S == 300.0
     assert CLOSED_INTERVAL_S == 3600.0
     assert LAGGING_MULT == 1.25
     assert STALLED_MULT == 2.0
 
 
 def test_output_echoes_constants_and_inputs():
-    out = build_runner_heartbeat(_ago(600), market_open=True, now=NOW)
+    out = build_runner_heartbeat(_ago(60), market_open=True, now=NOW)
     assert out["expected_interval_s"] == OPEN_INTERVAL_S
     assert out["lagging_mult"] == LAGGING_MULT
     assert out["stalled_mult"] == STALLED_MULT
@@ -63,11 +63,11 @@ def test_output_echoes_constants_and_inputs():
 # ─────────────────────────── HEALTHY ───────────────────────────
 
 def test_recent_decision_market_open_is_healthy():
-    out = build_runner_heartbeat(_ago(600), market_open=True, now=NOW)
+    out = build_runner_heartbeat(_ago(60), market_open=True, now=NOW)
     assert out["verdict"] == "HEALTHY"
     assert out["restart_recommended"] is False
-    assert out["secs_since_last_decision"] == pytest.approx(600.0)
-    assert out["intervals_elapsed"] == round(600.0 / OPEN_INTERVAL_S, 3)
+    assert out["secs_since_last_decision"] == pytest.approx(60.0)
+    assert out["intervals_elapsed"] == round(60.0 / OPEN_INTERVAL_S, 3)
     assert "HEALTHY" in out["headline"]
 
 
@@ -108,10 +108,10 @@ def test_just_over_stalled_is_stalled_and_recommends_restart():
 # ─────────────────── market-open vs market-closed cadence ───────────────────
 
 def test_same_gap_different_verdict_by_market_state():
-    """A 70-min (4200s) silence: STALLED while open (4200/1800=2.33), but
-    HEALTHY while closed (4200/3600=1.17 < 1.25). This is the whole reason
+    """An 11-min (660s) silence: STALLED while open (>2x 300s), but
+    HEALTHY while closed (660/3600=0.18 < 1.25). This is the whole reason
     the cadence selector exists — pin it with one elapsed gap."""
-    gap = 70 * 60
+    gap = 11 * 60
     open_out = build_runner_heartbeat(_ago(gap), market_open=True, now=NOW)
     closed_out = build_runner_heartbeat(_ago(gap), market_open=False, now=NOW)
     assert open_out["verdict"] == "STALLED"
@@ -177,7 +177,7 @@ def test_endpoint_no_data_on_empty_decisions(client):
 
 
 def test_endpoint_stalled_on_old_decision(client):
-    """A 5h-old decision is STALLED whether the market is open (18000/1800=10)
+    """A 5h-old decision is STALLED whether the market is open (18000/300=60)
     or closed (18000/3600=5) — both > STALLED_MULT — so the assertion is
     deterministic regardless of when the suite runs."""
     c, s = client
@@ -325,18 +325,18 @@ def test_recent_actions_omitted_is_byte_identical():
     """The additive contract: with recent_actions omitted the output is
     exactly what it was before the parameter existed — no decision_efficacy
     key, headline/verdict/restart untouched."""
-    base = build_runner_heartbeat(_ago(600), market_open=True, now=NOW)
+    base = build_runner_heartbeat(_ago(60), market_open=True, now=NOW)
     assert "decision_efficacy" not in base
     assert base["verdict"] == "HEALTHY"
     assert base["restart_recommended"] is False
     # Passing recent_actions=None is identical to omitting it.
     assert build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW, recent_actions=None) == base
+        _ago(60), market_open=True, now=NOW, recent_actions=None) == base
 
 
 def test_idle_storm_folds_restart_and_headline_not_verdict():
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * 5 + ["BUY NVDA → FILLED"])
     # liveness verdict enum untouched (the separation contract)
     assert out["verdict"] == "HEALTHY"
@@ -355,12 +355,12 @@ def test_storm_threshold_boundary_off_by_one():
     the `>=` against a `>` regression that would mute a real 5-run wedge."""
     k = NO_DECISION_STORM_THRESHOLD
     just_under = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * (k - 1) + ["HOLD MU → HOLD"])
     assert just_under["decision_efficacy"]["verdict"] != "IDLE_STORM"
     assert just_under["restart_recommended"] is False
     exactly = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW, recent_actions=[ND] * k)
+        _ago(60), market_open=True, now=NOW, recent_actions=[ND] * k)
     assert exactly["decision_efficacy"]["verdict"] == "IDLE_STORM"
     assert exactly["restart_recommended"] is True
 
@@ -370,7 +370,7 @@ def test_elevated_but_not_storm_is_degraded_no_restart():
     NO_DECISION → DEGRADED: informational, NO restart, verdict/headline of
     the liveness layer untouched."""
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=["BUY NVDA → FILLED"] + [ND] * 3)  # 75% ND, consec=0
     assert out["verdict"] == "HEALTHY"
     assert out["restart_recommended"] is False
@@ -383,7 +383,7 @@ def test_elevated_but_not_storm_is_degraded_no_restart():
 
 def test_producing_when_engine_actually_decides():
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=["BUY NVDA → FILLED", "HOLD MU → HOLD",
                         ND, "SELL MU → FILLED"])  # 25% ND, consec=0
     assert out["restart_recommended"] is False
@@ -393,7 +393,7 @@ def test_producing_when_engine_actually_decides():
 
 def test_empty_recent_actions_is_no_data_efficacy():
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW, recent_actions=[])
+        _ago(60), market_open=True, now=NOW, recent_actions=[])
     assert out["decision_efficacy"]["verdict"] == "NO_DATA"
     assert out["restart_recommended"] is False
     assert out["verdict"] == "HEALTHY"
@@ -476,7 +476,7 @@ def test_dominant_cause_majority_and_tiebreak():
 
 def test_idle_storm_host_saturation_does_not_recommend_restart():
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * 6,
         recent_reasons=[_HOST_SAT] * 6)
     eff = out["decision_efficacy"]
@@ -492,7 +492,7 @@ def test_idle_storm_host_saturation_does_not_recommend_restart():
 
 def test_idle_storm_quota_does_not_recommend_restart():
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * 5,
         recent_reasons=[_QUOTA] * 5)
     eff = out["decision_efficacy"]
@@ -505,7 +505,7 @@ def test_idle_storm_quota_does_not_recommend_restart():
 
 def test_idle_storm_wedged_cli_still_recommends_restart():
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * 5,
         recent_reasons=[_TIMEOUT] * 5)
     eff = out["decision_efficacy"]
@@ -521,7 +521,7 @@ def test_idle_storm_only_leading_run_diagnosed():
     # The leading consec run (newest 5) is all host-saturated; an older
     # timeout sits past a real decision and must not dilute the diagnosis.
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * 5 + ["BUY NVDA → FILLED", ND],
         recent_reasons=[_HOST_SAT] * 5 + ["{}", _TIMEOUT])
     eff = out["decision_efficacy"]
@@ -535,7 +535,7 @@ def test_idle_storm_omitting_reasons_is_byte_identical():
     byte-identical to before the cause-aware feature — restart still
     recommended, the legacy 'wedged Claude CLI' headline, no new keys."""
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW, recent_actions=[ND] * 5)
+        _ago(60), market_open=True, now=NOW, recent_actions=[ND] * 5)
     assert out["restart_recommended"] is True
     assert "wedged Claude CLI" in out["headline"]
     eff = out["decision_efficacy"]
@@ -576,7 +576,7 @@ def test_real_decision_overlay_omitted_is_byte_identical():
     byte-identical to before the parameter existed — no new keys at all.
     (Explicit None is distinct: it means "the caller asked but the engine has
     no real decision in history" — those callers DO see the keys, as None.)"""
-    out = build_runner_heartbeat(_ago(600), market_open=True, now=NOW)
+    out = build_runner_heartbeat(_ago(60), market_open=True, now=NOW)
     for k in ("last_real_decision_ts", "secs_since_real_decision",
               "real_decision_age"):
         assert k not in out
@@ -585,7 +585,7 @@ def test_real_decision_overlay_omitted_is_byte_identical():
 def test_real_decision_overlay_emits_fields_when_supplied():
     real_ts = _ago(7200)  # 2h ago, parseable
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         last_real_decision_ts=real_ts)
     assert out["secs_since_real_decision"] == pytest.approx(7200.0)
     assert out["real_decision_age"] == "2h"
@@ -596,7 +596,7 @@ def test_real_decision_overlay_emits_fields_when_supplied():
 
 def test_real_decision_overlay_unparseable_degrades_to_none():
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         last_real_decision_ts="not-a-timestamp")
     assert out["last_real_decision_ts"] is None
     assert out["secs_since_real_decision"] is None
@@ -609,7 +609,7 @@ def test_idle_storm_headline_carries_real_decision_age():
     that advances every NO_DECISION row."""
     real_ts = _ago(4 * 3600)  # 4h since the engine last actually decided
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * 6,
         last_real_decision_ts=real_ts)
     assert out["decision_efficacy"]["verdict"] == "IDLE_STORM"
@@ -623,7 +623,7 @@ def test_idle_storm_headline_says_never_when_no_real_decision_ever():
     None means the caller asked store.last_real_decision() and got None back)
     instead of pretending a recent NO_DECISION counts."""
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * 5,
         last_real_decision_ts=None)
     assert "NEVER produced a real decision" in out["headline"]
@@ -639,12 +639,12 @@ def test_real_decision_overlay_no_clause_outside_idle_storm():
     a HEALTHY+PRODUCING loop never carries it (no need to clutter the
     operator's read with a number that's not actionable)."""
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=["BUY NVDA → FILLED"],
-        last_real_decision_ts=_ago(600))
+        last_real_decision_ts=_ago(60))
     # Fields are still emitted (the operator can read them out of the JSON)
     # but the headline carries no IDLE_STORM clause.
-    assert out["secs_since_real_decision"] == pytest.approx(600.0)
+    assert out["secs_since_real_decision"] == pytest.approx(60.0)
     assert "real (FILLED/HOLD/BLOCKED)" not in out["headline"]
 
 
@@ -719,7 +719,7 @@ def test_pre_storm_fires_at_threshold_minus_one():
     NOT IDLE_STORM (consec < threshold), NOT PRODUCING (the early warning is
     the whole point), no restart recommendation (next real decision clears it)."""
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * 4 + ["HOLD MU → HOLD"])  # consec=4, k=5
     eff = out["decision_efficacy"]
     assert eff["verdict"] == "PRE_STORM"
@@ -742,13 +742,13 @@ def test_pre_storm_to_idle_storm_boundary_is_exact():
     ``test_storm_threshold_boundary_off_by_one``."""
     k = NO_DECISION_STORM_THRESHOLD
     pre = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * (k - 1) + ["HOLD"])
     assert pre["decision_efficacy"]["verdict"] == "PRE_STORM"
     assert pre["restart_recommended"] is False
 
     storm = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * k)
     assert storm["decision_efficacy"]["verdict"] == "IDLE_STORM"
     assert storm["restart_recommended"] is True
@@ -761,7 +761,7 @@ def test_pre_storm_takes_precedence_over_degraded_at_consec_threshold_minus_one(
     missed. Verdict ladder ordering pin: PRE_STORM check must run BEFORE the
     pct >= 50% check in ``_decision_efficacy``."""
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * 4 + ["HOLD"])  # consec=4, pct=80%
     eff = out["decision_efficacy"]
     assert eff["verdict"] == "PRE_STORM"      # not DEGRADED
@@ -776,13 +776,13 @@ def test_below_pre_storm_threshold_falls_through_to_existing_arms():
     the trader would see PRE_STORM on benign 3-in-a-row blips."""
     # consec=3 with pct=60% → DEGRADED (existing behaviour)
     out_deg = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * 3 + ["HOLD", "HOLD"])  # consec=3, pct=60%
     assert out_deg["decision_efficacy"]["verdict"] == "DEGRADED"
 
     # consec=3 with pct=30% → PRODUCING (existing behaviour)
     out_prod = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * 3 + ["HOLD"] * 7)  # consec=3, pct=30%
     assert out_prod["decision_efficacy"]["verdict"] == "PRODUCING"
 
@@ -793,7 +793,7 @@ def test_pre_storm_headline_warning_visible_without_restart_directive():
     liveness verdict reads HEALTHY. PRE_STORM appends a ⚠ clause but never
     a 'restart' directive (next real decision clears it)."""
     out = build_runner_heartbeat(
-        _ago(600), market_open=True, now=NOW,
+        _ago(60), market_open=True, now=NOW,
         recent_actions=[ND] * 4 + ["HOLD"])
     head = out["headline"]
     # The cadence portion ("HEALTHY — last decision …") still leads — the

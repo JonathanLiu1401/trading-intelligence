@@ -105,8 +105,8 @@ class TestPercentileBuilder:
 
 class TestDistributionAndSplit:
     def test_evenly_spaced_open_cycles_exact_percentiles(self):
-        # 11 decisions, 1800s apart, all market_open → 10 gaps of 1800s each.
-        # All inside the 6h window (10*1800s = 18000s = 5h).
+        # 11 decisions, OPEN_INTERVAL_S apart, all market_open → 10 open gaps.
+        # All inside the 6h window with the current 5-minute open cadence.
         rows = _evenly_spaced(11, OPEN_INTERVAL_S, market_open=1)
         r = build_decision_pace(rows, now=_NOW)
         assert r["n_decisions"] == 11
@@ -123,7 +123,7 @@ class TestDistributionAndSplit:
         assert r["verdict"] == "HEALTHY"
 
     def test_open_and_closed_split_independently(self):
-        # 6 open-market decisions (1800s cadence) BEFORE the close transition,
+        # 6 open-market decisions (OPEN_INTERVAL_S cadence) BEFORE the close transition,
         # then 6 market-closed decisions (3600s cadence) AFTER. Both sit fully
         # inside the 24h window. Gap classification key: the *trailing*
         # cycle's market_open decides which bucket the gap lands in.
@@ -183,8 +183,11 @@ class TestVerdictLadder:
         # Freshest row at offset 0; one gap of `lag_gap` to the next row;
         # then a long tail of evenly-spaced rows on cadence (these supply
         # the STABLE-gate samples in the wider windows).
-        lag_gap = OPEN_INTERVAL_S * (
-            (CADENCE_TOLERANCE_FACTOR + CADENCE_STALL_FACTOR) / 2.0)
+        # With 5-minute open cadence, the 1h window contains enough normal
+        # cadence tail gaps that the single large gap is diluted by p95's
+        # interpolation. Keep it above tolerance after interpolation while
+        # still below the stall boundary.
+        lag_gap = OPEN_INTERVAL_S * 2.35
         tail = _evenly_spaced(STABLE_MIN_GAPS + 5, OPEN_INTERVAL_S,
                               market_open=1, start_offset_s=lag_gap)
         rows = [_row(0.0, market_open=1)] + tail
@@ -201,7 +204,9 @@ class TestVerdictLadder:
 
     def test_stalled_when_fresh_window_p95_exceeds_stall(self):
         # Same shape, gap large enough to trip the STALL threshold.
-        stall_gap = OPEN_INTERVAL_S * (CADENCE_STALL_FACTOR + 1.0)
+        # Make the single fresh large gap big enough to remain above the
+        # stall boundary after p95 interpolation with normal cadence tails.
+        stall_gap = OPEN_INTERVAL_S * (CADENCE_STALL_FACTOR + 2.0)
         tail = _evenly_spaced(STABLE_MIN_GAPS + 5, OPEN_INTERVAL_S,
                               market_open=1, start_offset_s=stall_gap)
         rows = [_row(0.0, market_open=1)] + tail

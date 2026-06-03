@@ -4,12 +4,11 @@ Returns the recommended sleep duration in seconds based on current market
 context. Designed for hot-path use: never raises, never does network I/O.
 
 Tiers (highest-priority first):
-  EARNINGS_WINDOW  60-180s   Held name has same-day earnings AND
-                             it is 3:45pm-6:30pm ET (captures after-close
-                             announcement + initial reaction window)
-  SESSION_OPEN     300s      First 30 min of regular session (9:30-10:00 ET)
-  EARNINGS_DAY     600s      Held name has earnings today (all day)
-  MARKET_OPEN      1800s     Normal market hours
+  SESSION_OPEN     180s      First 30 min of regular session (9:30-10:00 ET)
+  EARNINGS_DAY     300s      Held name has earnings today during regular hours
+  MARKET_OPEN      300s      Normal market hours
+  EARNINGS_WINDOW  1800s     Held name has same-day earnings AND
+                             it is 3:45pm-6:30pm ET (after-close monitor)
   MARKET_CLOSED    3600s     No special event, market closed
   QUIET_CLOSED     5400s     Market closed + no positions + no imminent events
 
@@ -38,11 +37,13 @@ _CANDIDATE_PATHS = (
 
 _NY = ZoneInfo("America/New_York")
 
-# Tier sleep durations (seconds).
-_EARNINGS_WINDOW_S = 120   # midpoint of 60-180 — single int per spec
-_SESSION_OPEN_S = 300
-_EARNINGS_DAY_S = 600
-_MARKET_OPEN_S = 1800
+# Tier sleep durations (seconds). Regular-session tiers must stay faster
+# than closed-market monitoring; otherwise the bot watches a frozen book more
+# aggressively than tradable tape.
+_SESSION_OPEN_S = 180
+_EARNINGS_DAY_S = 300
+_MARKET_OPEN_S = 300
+_EARNINGS_WINDOW_S = 1800
 _MARKET_CLOSED_S = 3600
 _QUIET_CLOSED_S = 5400
 
@@ -209,19 +210,22 @@ def compute_interval(
         held_earnings_today = _held_has_earnings_today(
             positions, events, now_utc, now_et,
         )
+        market_open = _is_market_hours(now_et)
 
-        # Tier 1 (highest priority): earnings window on a held name.
-        if held_earnings_today and _is_earnings_window(now_et):
-            tier, sleep_s = "EARNINGS_WINDOW", _EARNINGS_WINDOW_S
-        # Tier 2: first 30 min of the regular session.
-        elif _is_session_open_window(now_et):
+        # Tier 1: first 30 min of the regular session.
+        if market_open and _is_session_open_window(now_et):
             tier, sleep_s = "SESSION_OPEN", _SESSION_OPEN_S
-        # Tier 3: held name has earnings today (all day).
-        elif held_earnings_today:
+        # Tier 2: held name has earnings today, but only while tradable.
+        elif market_open and held_earnings_today:
             tier, sleep_s = "EARNINGS_DAY", _EARNINGS_DAY_S
-        # Tier 4: normal market hours.
-        elif _is_market_hours(now_et):
+        # Tier 3: normal market hours.
+        elif market_open:
             tier, sleep_s = "MARKET_OPEN", _MARKET_OPEN_S
+        # Tier 4: after-close earnings monitor on a held name. This is
+        # intentionally slower than regular-session cadence because normal
+        # paper trades cannot execute against a closed NYSE book.
+        elif held_earnings_today and _is_earnings_window(now_et):
+            tier, sleep_s = "EARNINGS_WINDOW", _EARNINGS_WINDOW_S
         # Tier 6 (before tier 5): quiet closed — no positions, closed.
         elif not positions:
             tier, sleep_s = "QUIET_CLOSED", _QUIET_CLOSED_S
