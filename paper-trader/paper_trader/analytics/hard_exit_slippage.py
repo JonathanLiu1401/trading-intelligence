@@ -7,11 +7,11 @@ many SL/TP fires hit and which tickers are repeat-offenders. It answers
 *thresholds themselves* well-calibrated?".
 
 The bot's hard SL/TP machinery stamps a fixed percentage threshold at
-entry (2/3% standard, 4/6% leveraged — see
+entry (5/15% standard, 10/25% leveraged — see
 ``strategy._check_and_execute_hard_exits``). When price gaps past that
 threshold, the fill is whatever the next mark reports — which can be
 materially away from the threshold itself. Live evidence (2026-05-26):
-MU TP fired at threshold $773.31 (a +3% TP off the $750.79 entry) with
+MU TP fired at threshold $773.31 (an old +3% TP off the $750.79 entry) with
 an actual fill of $889.50 — the threshold captured +3% but the tape
 gave +18%. The "lucky overshoot" cost the bot ~+15 pp it would have
 captured by simply staying in the position another hour.
@@ -31,7 +31,7 @@ and compute the slippage magnitude:
     ≥ 0 by construction (fill is guaranteed ≤ threshold).
 
 Slippage of ≈ 0 means the threshold caught the move at-the-tick — the
-threshold was working as designed, the bot got the +/-3% it stamped in.
+threshold was working as designed, the bot got the stamped bracket move.
 Material slippage means the tape gapped past the trigger, and the
 threshold setting did NOT capture what the move actually paid (or cost).
 
@@ -41,7 +41,7 @@ Top-level verdict ladder:
   * ``INSUFFICIENT``       — fewer than ``MIN_FOR_VERDICT`` hard exits.
   * ``LUCKY_OVERSHOOTS``   — median TP slippage ≥ ``LUCKY_TP_THRESHOLD_PCT``.
     TPs are routinely gapping past the trigger by a wide margin — the
-    bot is being saved by the tape. Means the +3% TP is materially
+    bot is being saved by the tape. Means the advisory TP is materially
     *under-calibrated* for the realized volatility of these names.
   * ``UNLUCKY_GAPS``       — median SL slippage ≥ ``UNLUCKY_SL_THRESHOLD_PCT``.
     SLs are routinely getting blown through by gap-downs; realized
@@ -96,8 +96,8 @@ _REASON_RE = re.compile(
 # gap moves like the live MU +15% case fire decisively.
 #
 # 2.0% picked from the live data: the MU TP fire was +15.0% slippage
-# (manifestly material); a 3% TP stamped at entry with a 0.5% mark-to-
-# mark drift between cycles never produces 2% slippage. So 2% sits well
+# (manifestly material); an advisory TP with a 0.5% mark-to-mark drift
+# between cycles never produces 2% slippage. So 2% sits well
 # below the live evidence and well above mark noise.
 LUCKY_TP_THRESHOLD_PCT = 2.0
 UNLUCKY_SL_THRESHOLD_PCT = 2.0
@@ -209,7 +209,7 @@ def _verdict(*, n_tp, n_sl, tp_slip_median, sl_slip_median):
     if lucky:
         return ("LUCKY_OVERSHOOTS",
                 f"TPs gapping past the trigger: median +{tp_slip_median:.1f}% "
-                f"slippage over {n_tp} fire(s) — the +3% TP threshold is "
+                f"slippage over {n_tp} fire(s) — the advisory TP threshold is "
                 "materially under-calibrated for these names' realized "
                 "volatility. Tape, not the threshold, is capturing the move.")
     if unlucky:

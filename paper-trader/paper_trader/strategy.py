@@ -236,13 +236,13 @@ QUANT_TICKERS_LIVE = [
 
 FUTURES = ["ES=F", "NQ=F", "CL=F", "GC=F"]
 
-# Hard stop-loss / take-profit configuration (MACD-strategy 1.5:1 R:R).
-# Stocks: 2% SL / 3% TP. Leveraged ETFs: 4% SL / 6% TP (wider because
-# leveraged ETF intraday volatility is 2-3x the underlying — a 2% stop on
-# SOXL is the equivalent of ~0.7% on SOXX and would scalp out on noise).
+# Hard stop-loss / advisory take-profit configuration.
+# Stocks: 5% SL / 15% advisory TP. Leveraged ETFs: 10% SL / 25% advisory TP
+# (wider because leveraged ETF intraday volatility is 2-3x the underlying).
 # Stop-loss is documented in SYSTEM_PROMPT ("HARD EXITS" section) so Opus is
 # aware of the autonomy carve-out. Take-profit remains a per-position context
-# target, but it is not mechanically enforced.
+# target, but it is not mechanically enforced. The older 2/3 stock bracket
+# repeatedly chopped momentum names like MU before the thesis had time to play.
 _LEVERAGED_ETFS_SL = frozenset({
     "TQQQ", "SOXL", "UPRO", "SPXL", "UDOW", "URTY", "TECL", "FNGU",
     "LABU", "NAIL", "CURE", "DFEN", "HIBL", "MIDU", "TNA", "WANT",
@@ -250,10 +250,10 @@ _LEVERAGED_ETFS_SL = frozenset({
     "QLD", "SSO", "NVDU", "MSFU", "AMZU", "TSLL", "CONL", "BITU", "ETHU",
     "SOXS", "TECS", "SPXU", "SQQQ", "SPXS", "FNGD",
 })
-_SL_PCT_STANDARD = 0.02
-_TP_PCT_STANDARD = 0.03
-_SL_PCT_LEVERAGED = 0.04
-_TP_PCT_LEVERAGED = 0.06
+_SL_PCT_STANDARD = 0.05
+_TP_PCT_STANDARD = 0.15
+_SL_PCT_LEVERAGED = 0.10
+_TP_PCT_LEVERAGED = 0.25
 
 SYSTEM_PROMPT = """You are managing a paper trading portfolio with $1000 starting capital.
 Your ONLY goal is maximum profit. You have complete freedom over position sizing,
@@ -283,11 +283,12 @@ Small, safe trades will not outperform. Take calculated risks.
 High conviction = large size. Low conviction = stay cash.
 
 HARD EXITS (AUTOMATIC — CANNOT BE OVERRIDDEN): New stock positions you open
-are automatically sold only when price falls 2% below entry price (4% for
-leveraged ETFs) → stop-loss. The old 3% / 6% take-profit level is now advisory
-context only: when a position reaches that level, decide dynamically from the
-stock's thesis, momentum, news, and prior trade history whether to hold, trim,
-or sell. Do not dump winners just because a static take-profit marker was hit.
+are automatically sold only during the regular market session when price falls
+5% below entry price (10% for leveraged ETFs) → stop-loss. The 15% / 25%
+take-profit level is advisory context only: when a position reaches that level,
+decide dynamically from the stock's thesis, momentum, news, and prior trade
+history whether to hold, trim, or sell. Do not dump winners just because a
+static take-profit marker was hit.
 
 Respond with a SINGLE JSON object — no prose, no markdown fences. Schema:
 
@@ -1474,7 +1475,12 @@ QUANT (held positions — RSI + MACD direction):
 Return JSON only."""
 
 
-def _check_and_execute_hard_exits(store: "Store", snap: dict) -> list[str]:
+def _check_and_execute_hard_exits(
+    store: "Store",
+    snap: dict,
+    *,
+    market_open: bool | None = None,
+) -> list[str]:
     """Execute mandatory stop-loss exits BEFORE Opus sees the prompt this cycle.
 
     Surveys ``store.positions_needing_hard_exit()`` (open stock lots whose
@@ -1491,9 +1497,15 @@ def _check_and_execute_hard_exits(store: "Store", snap: dict) -> list[str]:
     Discord notification + the runner's auto_exits tag). Non-fatal by
     construction — any failure logs and returns whatever exits succeeded
     before the fault, so a single bad row never blocks the cycle's decision.
+    Hard stop automation is regular-session only; premarket/after-hours marks
+    are too noisy to use as mandatory sell prices.
     """
     exits: list[str] = []
     try:
+        if market_open is None:
+            market_open = bool(market.is_market_open())
+        if not market_open:
+            return []
         positions = store.positions_needing_hard_exit()
         for pos in positions:
             ticker = pos["ticker"]
@@ -2035,7 +2047,11 @@ def decide() -> dict:
     # SYSTEM_PROMPT ("HARD EXITS" section) so Opus knows the autonomy carve-out.
     # prompt must teach them). Re-snapshot when something fired so cash +
     # positions + total_value all reflect the post-exit book.
-    auto_exits: list[str] = _check_and_execute_hard_exits(store, snap)
+    auto_exits: list[str] = _check_and_execute_hard_exits(
+        store,
+        snap,
+        market_open=market_open,
+    )
     if auto_exits:
         snap = _portfolio_snapshot(store)
 
@@ -2301,11 +2317,11 @@ def decide() -> dict:
 
     # Forward mechanical-exit proximity — surfaces "which open lot is
     # within striking distance of its SL/TP this cycle". Today Opus reads
-    # the static SYSTEM_PROMPT rule (2%/3% — 4%/6% leveraged) and the
+    # the static SYSTEM_PROMPT rule (5%/15% — 10%/25% leveraged) and the
     # current mark / P/L from the position lines and has to mentally
     # threshold by re-deriving SL/TP from avg_cost — but on a blended lot
     # the stored SL/TP is re-anchored to the new blended cost, NOT
-    # mark*0.98, so the live numbers are concretely useful. Pure builder
+    # static entry bracket, so the live numbers are concretely useful. Pure builder
     # over the already-marked snapshot positions (NO extra store read /
     # NO network — the risk_mirror hot-path discipline). Identical SSOT
     # used by ``/api/exit-proximity`` + the Discord hourly line
