@@ -328,6 +328,45 @@ class TestBuyStampsSLTP:
         assert pos[0]["stop_loss_price"] == pytest.approx(98.0)
         assert pos[0]["take_profit_price"] == pytest.approx(103.0)
 
+    def test_buy_blocks_nan_price(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy.market, "get_price",
+                            lambda *a, **k: float("nan"))
+        snap = {"cash": 1000.0, "total_value": 1000.0, "positions": []}
+        status, detail = strategy._execute(
+            {"action": "BUY", "ticker": "NVDA", "qty": 1.0, "reasoning": "bad mark"},
+            snap,
+            fresh_store,
+        )
+        assert status == "BLOCKED"
+        assert detail == "no price for NVDA"
+        assert fresh_store.recent_trades(10) == []
+
+    def test_buy_blocks_infinite_price(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy.market, "get_price",
+                            lambda *a, **k: float("inf"))
+        snap = {"cash": 1000.0, "total_value": 1000.0, "positions": []}
+        status, detail = strategy._execute(
+            {"action": "BUY", "ticker": "NVDA", "qty": 1.0, "reasoning": "bad mark"},
+            snap,
+            fresh_store,
+        )
+        assert status == "BLOCKED"
+        assert detail == "no price for NVDA"
+        assert fresh_store.recent_trades(10) == []
+
+    def test_buy_blocks_nan_qty(self, fresh_store, monkeypatch):
+        monkeypatch.setattr(strategy.market, "get_price",
+                            lambda *a, **k: 100.0)
+        snap = {"cash": 1000.0, "total_value": 1000.0, "positions": []}
+        status, detail = strategy._execute(
+            {"action": "BUY", "ticker": "NVDA", "qty": float("nan"), "reasoning": "bad qty"},
+            snap,
+            fresh_store,
+        )
+        assert status == "BLOCKED"
+        assert detail == "qty not finite: nan"
+        assert fresh_store.recent_trades(10) == []
+
     def test_buy_leveraged_etf_stamps_4_6_pct(self, fresh_store, monkeypatch):
         monkeypatch.setattr(strategy.market, "get_price",
                             lambda *a, **k: 50.0)
