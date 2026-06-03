@@ -1540,6 +1540,8 @@ def _enforce_risk_pre_trade(decision: dict, snapshot: dict) -> tuple[bool, str]:
         # cycle. Mirror _execute's BLOCKED-tuple shape ("ok=False") so the
         # caller logs a clean decision row instead.
         return False, f"qty not numeric: {decision.get('qty')!r}"
+    if not math.isfinite(qty):
+        return False, f"qty not finite: {decision.get('qty')!r}"
     if qty <= 0 and action != "REBALANCE":
         return False, "qty must be > 0"
 
