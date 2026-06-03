@@ -2570,7 +2570,7 @@ TEMPLATE = r"""
     <div class="card" id="lb-card" style="margin-bottom:18px;">
       <h2 style="display:flex;justify-content:space-between;align-items:center;">
         <span>Model leaderboard
-          <span class="muted" style="font-size:10px;text-transform:none;letter-spacing:normal;font-weight:normal;border-left:none;padding-left:6px;">— ranked by avg total return % · 🐒 random baseline anchored at the bottom</span>
+          <span class="muted" style="font-size:10px;text-transform:none;letter-spacing:normal;font-weight:normal;border-left:none;padding-left:6px;">— ranked by avg yearly vs-SPY % · 🐒 random baseline anchored at the bottom</span>
         </span>
         <span class="muted" id="lb-meta" style="font-size:11px;font-family:var(--font-mono);text-transform:none;letter-spacing:0.04em;">—</span>
       </h2>
@@ -2580,10 +2580,10 @@ TEMPLATE = r"""
             <th style="width:42px;">#</th>
             <th>model</th>
             <th class="num">n runs</th>
-            <th class="num">avg %</th>
+            <th class="num">vs SPY / yr</th>
             <th class="num">best %</th>
             <th class="num">worst %</th>
-            <th class="num">vs SPY</th>
+            <th class="num">vs SPY total</th>
             <th class="num">beats 🐒</th>
           </tr></thead>
           <tbody><tr><td colspan="8" class="muted">loading leaderboard…</td></tr></tbody>
@@ -2943,10 +2943,12 @@ async function loadModelRankings() {
       {h: "Rank",        fn: (m, i) => medals[i] || (i + 1) + ".",   colored: false},
       {h: "Model",       fn: (m) => m.display_name || m.model_id,     colored: false},
       {h: "Runs",        fn: (m) => m.runs,                           colored: false},
-      {h: "Avg Return",  fn: (m) => pctFmt(m.avg_return_pct),         colored: true, raw: (m) => m.avg_return_pct},
+      {h: "vs SPY / yr", fn: (m) => pctFmt(m.avg_annualized_vs_spy_pct), colored: true, raw: (m) => m.avg_annualized_vs_spy_pct},
+      {h: "Avg / yr",    fn: (m) => pctFmt(m.avg_annualized_return_pct), colored: true, raw: (m) => m.avg_annualized_return_pct},
+      {h: "Avg Total",   fn: (m) => pctFmt(m.avg_return_pct),         colored: true, raw: (m) => m.avg_return_pct},
       {h: "Best Return", fn: (m) => pctFmt(m.best_return_pct),        colored: true, raw: (m) => m.best_return_pct},
       {h: "Median",      fn: (m) => pctFmt(m.median_return_pct),      colored: true, raw: (m) => m.median_return_pct},
-      {h: "vs SPY",      fn: (m) => pctFmt(m.avg_vs_spy_pct),         colored: true, raw: (m) => m.avg_vs_spy_pct},
+      {h: "vs SPY Total", fn: (m) => pctFmt(m.avg_vs_spy_pct),        colored: true, raw: (m) => m.avg_vs_spy_pct},
       {h: "Win Rate",    fn: (m) => (m.win_rate_pct == null ? "—" : m.win_rate_pct + "%"), colored: false},
       {h: "Avg Trades",  fn: (m) => (m.avg_trades == null ? "—" : m.avg_trades),           colored: false},
     ];
@@ -6941,12 +6943,12 @@ async function refreshLeaderboard() {
     const monkey = models.filter(m => /monkey/i.test(m.model_id));
     const ai = models.filter(m => !/monkey/i.test(m.model_id));
     const monkeyAvg = monkey.length
-      ? monkey.reduce((a,m) => a + (m.avg_return_pct||0), 0) / monkey.length
+      ? monkey.reduce((a,m) => a + (m.avg_annualized_vs_spy_pct||0), 0) / monkey.length
       : null;
 
-    // Sort AI by avg_return_pct desc; append monkeys at the bottom (italic baseline).
-    ai.sort((a,b) => (b.avg_return_pct||0) - (a.avg_return_pct||0));
-    monkey.sort((a,b) => (b.avg_return_pct||0) - (a.avg_return_pct||0));
+    // Sort AI by yearly vs-SPY edge; append monkeys at the bottom (italic baseline).
+    ai.sort((a,b) => (b.avg_annualized_vs_spy_pct||0) - (a.avg_annualized_vs_spy_pct||0));
+    monkey.sort((a,b) => (b.avg_annualized_vs_spy_pct||0) - (a.avg_annualized_vs_spy_pct||0));
     const ordered = [...ai, ...monkey];
 
     const fmtPct = v => (v == null ? "—" : (v>0?"+":"") + Number(v).toFixed(2) + "%");
@@ -6960,13 +6962,13 @@ async function refreshLeaderboard() {
       const display = (m.display_name || m.model_id || "—")
         + (isMonkey ? ` <span class="lb-badge baseline">RANDOM BASELINE</span>` : "");
       const beatsMonkey = (monkeyAvg != null && !isMonkey)
-        ? ((m.avg_return_pct||0) > monkeyAvg ? "✓" : "—") : "—";
+        ? ((m.avg_annualized_vs_spy_pct||0) > monkeyAvg ? "✓" : "—") : "—";
       const beatsCls = beatsMonkey === "✓" ? "pos" : "muted";
       return `<tr class="${rowCls.join(' ')}">
         <td>${rank}</td>
         <td>${display}</td>
         <td class="num">${m.runs || 0}</td>
-        <td class="num ${clsFor(m.avg_return_pct)}">${fmtPct(m.avg_return_pct)}</td>
+        <td class="num ${clsFor(m.avg_annualized_vs_spy_pct)}">${fmtPct(m.avg_annualized_vs_spy_pct)}</td>
         <td class="num ${clsFor(m.best_return_pct)}">${fmtPct(m.best_return_pct)}</td>
         <td class="num ${clsFor(m.median_return_pct)}">${fmtPct(m.median_return_pct)}</td>
         <td class="num ${clsFor(m.avg_vs_spy_pct)}">${fmtPct(m.avg_vs_spy_pct)}</td>
@@ -8260,18 +8262,19 @@ def backtest_leaderboard_api():
     """Top backtest runs ranked by a selectable metric.
 
     Query:
-      ?metric=vs_spy_pct|total_return_pct|annualized_return_pct|final_value|n_trades
+      ?metric=annualized_vs_spy_pct|annualized_return_pct|vs_spy_pct|total_return_pct|final_value|n_trades
       ?limit=N            (default 20, capped at 200)
       ?min_trades=N       (default 1 — excludes runs that never traded)
     Returns: {"metric": ..., "count": N, "runs": [ {run_id, metric, ...}, ... ]}
-    Ranked descending; the strategy's edge over SPY (vs_spy_pct) is the default.
+    Ranked descending; annualized alpha vs SPY is the default so long
+    backtests do not masquerade as current-year skill.
     """
     ALLOWED = {
-        "vs_spy_pct", "total_return_pct", "annualized_return_pct",
-        "final_value", "n_trades",
+        "annualized_vs_spy_pct", "vs_spy_pct", "total_return_pct",
+        "annualized_return_pct", "final_value", "n_trades",
     }
     try:
-        metric = (request.args.get("metric") or "vs_spy_pct").strip()
+        metric = (request.args.get("metric") or "annualized_vs_spy_pct").strip()
         if metric not in ALLOWED:
             return jsonify({"error": f"metric must be one of {sorted(ALLOWED)}"}), 400
         try:
@@ -8286,6 +8289,8 @@ def backtest_leaderboard_api():
         from .backtest import BacktestStore
         store = BacktestStore()
         runs = store.all_runs(include_curves=False)
+        for r in runs:
+            r["annualized_vs_spy_pct"] = _annualized_vs_spy_pct(r)
         completed = [
             r for r in runs
             if r.get("status") == "complete"
@@ -8306,6 +8311,7 @@ def backtest_leaderboard_api():
                     "metric": r.get(metric),
                     "total_return_pct": r.get("total_return_pct"),
                     "vs_spy_pct": r.get("vs_spy_pct"),
+                    "annualized_vs_spy_pct": r.get("annualized_vs_spy_pct"),
                     "annualized_return_pct": r.get("annualized_return_pct"),
                     "final_value": r.get("final_value"),
                     "n_trades": r.get("n_trades"),
@@ -8320,59 +8326,119 @@ def backtest_leaderboard_api():
         return jsonify({"error": str(e)}), 500
 
 
+def _annualized_total_pct(total_return_pct, duration_days) -> float | None:
+    """Compounded yearly return %, falling back to None when dates are unusable."""
+    try:
+        if total_return_pct is None or not duration_days or duration_days <= 0:
+            return None
+        growth = 1.0 + float(total_return_pct) / 100.0
+        if growth <= 0:
+            return None
+        years = float(duration_days) / 365.25
+        if years <= 0:
+            return None
+        return (growth ** (1.0 / years) - 1.0) * 100.0
+    except Exception:
+        return None
+
+
+def _annualized_vs_spy_pct(run: dict) -> float | None:
+    """Annualized strategy alpha over SPY for a backtest run."""
+    ann = run.get("annualized_return_pct")
+    if ann is None:
+        ann = _annualized_total_pct(
+            run.get("total_return_pct"), run.get("duration_days"))
+    spy_ann = _annualized_total_pct(
+        run.get("spy_return_pct"), run.get("duration_days"))
+    if ann is None or spy_ann is None:
+        return None
+    return round(float(ann) - float(spy_ann), 3)
+
+
 @app.route("/api/model-rankings")
 def api_model_rankings():
-    """Aggregated backtest stats per model_id, ranked by avg_return_pct desc.
+    """Aggregated backtest stats per model_id, ranked by yearly alpha desc.
 
     Reads from the module-level BACKTEST_DB so tests can monkeypatch the path.
     """
     try:
-        conn = sqlite3.connect(str(BACKTEST_DB), timeout=10)
-        try:
-            rows = conn.execute("""
-                SELECT
-                    model_id,
-                    COUNT(*) AS runs,
-                    ROUND(AVG(total_return_pct), 2) AS avg_return_pct,
-                    ROUND(MAX(total_return_pct), 2) AS best_return_pct,
-                    ROUND(AVG(vs_spy_pct), 2) AS avg_vs_spy_pct,
-                    ROUND(AVG(n_trades), 1) AS avg_trades,
-                    ROUND(
-                        100.0 * SUM(CASE WHEN total_return_pct > 0 THEN 1 ELSE 0 END)
-                        / COUNT(*), 1
-                    ) AS win_rate_pct,
-                    SUM(n_decisions) AS total_decisions,
-                    GROUP_CONCAT(total_return_pct ORDER BY total_return_pct) AS sorted_returns
-                FROM backtest_runs
-                WHERE status = 'complete'
-                GROUP BY model_id
-                ORDER BY avg_return_pct DESC
-            """).fetchall()
-        finally:
-            conn.close()
+        def _avg(vals):
+            vals = [float(v) for v in vals if v is not None]
+            return round(sum(vals) / len(vals), 2) if vals else None
+
+        def _median(vals):
+            vals = sorted(float(v) for v in vals if v is not None)
+            if not vals:
+                return None
+            n = len(vals)
+            return round(
+                vals[n // 2] if n % 2
+                else (vals[n // 2 - 1] + vals[n // 2]) / 2,
+                2,
+            )
+
+        buckets = {}
+        from .backtest import BacktestStore
+        store = BacktestStore(path=BACKTEST_DB)
+        for r in store.all_runs(include_curves=False):
+            if r.get("status") != "complete":
+                continue
+            mid = r.get("model_id") or "ml_quant"
+            ann = r.get("annualized_return_pct")
+            if ann is None:
+                ann = _annualized_total_pct(
+                    r.get("total_return_pct"), r.get("duration_days"))
+            ann_vs = _annualized_vs_spy_pct(r)
+            b = buckets.setdefault(mid, {
+                "returns": [],
+                "annualized": [],
+                "annualized_vs_spy": [],
+                "vs_spy": [],
+                "trades": [],
+                "wins": 0,
+                "decisions": 0,
+            })
+            b["returns"].append(r.get("total_return_pct"))
+            b["annualized"].append(ann)
+            b["annualized_vs_spy"].append(ann_vs)
+            b["vs_spy"].append(r.get("vs_spy_pct"))
+            b["trades"].append(r.get("n_trades"))
+            total = r.get("total_return_pct")
+            b["wins"] += 1 if (total is not None and float(total) > 0) else 0
+            b["decisions"] += int(r.get("n_decisions") or 0)
+
         models = []
-        for r in rows:
-            mid = r[0] or "ml_quant"
-            # Compute median from the sorted comma-separated returns string
-            raw_returns = r[8]
-            if raw_returns:
-                vals = [float(x) for x in raw_returns.split(",") if x]
-                n = len(vals)
-                median_pct = round((vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2), 2)
+        for mid, b in buckets.items():
+            runs = len(b["returns"])
+            return_vals = [v for v in b["returns"] if v is not None]
+            if return_vals:
+                best_return_pct = round(max(float(v) for v in return_vals), 2)
             else:
-                median_pct = None
+                best_return_pct = None
             models.append({
                 "model_id": mid,
                 "display_name": _MODEL_DISPLAY_NAMES.get(mid, mid),
-                "runs": r[1],
-                "avg_return_pct": r[2],
-                "best_return_pct": r[3],
-                "median_return_pct": median_pct,
-                "avg_vs_spy_pct": r[4],
-                "avg_trades": r[5],
-                "win_rate_pct": r[6],
-                "total_decisions": r[7],
+                "runs": runs,
+                "avg_return_pct": _avg(b["returns"]),
+                "avg_annualized_return_pct": _avg(b["annualized"]),
+                "avg_annualized_vs_spy_pct": _avg(b["annualized_vs_spy"]),
+                "best_return_pct": best_return_pct,
+                "median_return_pct": _median(b["returns"]),
+                "avg_vs_spy_pct": _avg(b["vs_spy"]),
+                "avg_trades": _avg(b["trades"]),
+                "win_rate_pct": round(100.0 * b["wins"] / runs, 1) if runs else None,
+                "total_decisions": b["decisions"],
             })
+        models.sort(
+            key=lambda m: (
+                m["avg_annualized_vs_spy_pct"]
+                if m["avg_annualized_vs_spy_pct"] is not None
+                else m["avg_annualized_return_pct"]
+                if m["avg_annualized_return_pct"] is not None
+                else float("-inf")
+            ),
+            reverse=True,
+        )
         return jsonify({"models": models, "as_of": datetime.now(timezone.utc).isoformat()})
     except Exception as e:
         return jsonify({"error": str(e), "models": []}), 500
