@@ -8821,7 +8821,8 @@ def analytics_api():
         positions = store.open_positions()
         # Pull a generous trades sample for round-trip accounting.
         trades = list(reversed(store.recent_trades(2000)))  # oldest → newest
-        eq = _with_capital_basis(store.equity_curve(5000))  # ascending
+        raw_eq = store.equity_curve(5000)  # ascending
+        eq = _with_capital_basis(raw_eq)
         perf_eq = _deposit_adjusted_equity_values(eq)
 
         total_value = pf.get("total_value") or 0.0
@@ -8846,11 +8847,11 @@ def analytics_api():
         # `== null` branch fires and renders "—" instead of "-0.00 (0.00%)".
         max_dd_usd: float | None = None
         max_dd_pct: float | None = None
-        if perf_eq:
+        if raw_eq:
             max_dd_usd = 0.0
             max_dd_pct = 0.0
-            peak = perf_eq[0]["total_value"]
-            for p in perf_eq:
+            peak = raw_eq[0]["total_value"]
+            for p in raw_eq:
                 v = p["total_value"]
                 if v > peak:
                     peak = v
